@@ -1,0 +1,15 @@
+export { createContext, type AppContext } from './context.js';
+export { loadConfig, saveConfig, defaultConfig, resolveDataDir, type KnodeConfig } from './config.js';
+export { initDataDir, appendLog } from './fs/datadir.js';
+export { Store } from './store/db.js';
+export { runIngest } from './ingest/pipeline.js';
+export { createEmbeddingProvider, type EmbeddingProvider } from './ingest/embeddings.js';
+export { search, vectorSearch, keywordSearch } from './search/search.js';
+export { ask } from './search/ask.js';
+export { graphSearch, graphOverview, graphInsights } from './graph/query.js';
+export { syncTraces } from './traces/sync.js';
+export { runDream } from './dream/dream.js';
+export { generateWiki } from './wiki/generate.js';
+export { createApp } from './server/app.js';
+export { startServer } from './server/serve.js';
+export * from './types.js';

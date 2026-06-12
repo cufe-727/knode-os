@@ -18,3 +18,10 @@ coverage/
 .env.*
 tmp/
 temp/
+
+# Local data directories
+.dev-data/
+knode-data/
+
+# Local preview config
+.claude/launch.json

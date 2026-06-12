@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>knode-os</title>
+  <link rel="stylesheet" href="/style.css" />
+  <script src="/vendor/marked.js"></script>
+</head>
+<body>
+  <header>
+    <div class="brand">⌬ knode-os</div>
+    <nav id="tabs">
+      <button data-tab="files" class="active">Files</button>
+      <button data-tab="search">Search</button>
+      <button data-tab="ask">Ask</button>
+      <button data-tab="graph">Graph</button>
+      <button data-tab="traces">Traces</button>
+      <button data-tab="dream">Dream</button>
+    </nav>
+    <div id="statsbar" title="documents / chunks / entities / relations"></div>
+  </header>
+
+  <main>
+    <!-- Files -->
+    <section id="tab-files" class="tab active">
+      <aside id="filetree-pane">
+        <div class="pane-actions">
+          <button id="btn-refresh-tree" title="refresh">⟳</button>
+          <button id="btn-new-file" title="new file">＋</button>
+          <label class="upload-btn" title="upload to raw/docs">⇪<input type="file" id="file-upload" multiple hidden /></label>
+          <button id="btn-ingest" title="reindex (chunk + embed + graph)">⛁ ingest</button>
+        </div>
+        <div id="filetree"></div>
+      </aside>
+      <div id="file-pane">
+        <div class="file-toolbar">
+          <span id="file-path" class="mono"></span>
+          <span class="spacer"></span>
+          <button id="btn-edit" disabled>edit</button>
+          <button id="btn-save" disabled>save</button>
+          <button id="btn-delete" disabled>delete</button>
+        </div>
+        <article id="file-view" class="markdown"></article>
+        <textarea id="file-editor" class="mono" spellcheck="false" hidden></textarea>
+      </div>
+    </section>
+
+    <!-- Search -->
+    <section id="tab-search" class="tab">
+      <div class="searchbar">
+        <input id="search-q" placeholder="search the knowledge base…" />
+        <select id="search-mode">
+          <option value="hybrid">hybrid</option>
+          <option value="vector">vector</option>
+          <option value="keyword">keyword</option>
+        </select>
+        <button id="btn-search">search</button>
+      </div>
+      <div id="search-results"></div>
+    </section>
+
+    <!-- Ask -->
+    <section id="tab-ask" class="tab">
+      <div class="searchbar">
+        <input id="ask-q" placeholder="ask a question — answered from your knowledge base with citations…" />
+        <button id="btn-ask">ask</button>
+      </div>
+      <div id="ask-result"></div>
+    </section>
+
+    <!-- Graph -->
+    <section id="tab-graph" class="tab">
+      <div class="searchbar">
+        <input id="graph-q" placeholder="graph search, e.g. an entity name… (empty = overview)" />
+        <select id="graph-depth"><option value="1">1 hop</option><option value="2" selected>2 hops</option><option value="3">3 hops</option></select>
+        <button id="btn-graph">explore</button>
+        <button id="btn-graph-insights">insights</button>
+      </div>
+      <div id="graph-wrap">
+        <canvas id="graph-canvas"></canvas>
+        <div id="graph-side"></div>
+      </div>
+    </section>
+
+    <!-- Traces -->
+    <section id="tab-traces" class="tab">
+      <div class="searchbar">
+        <button id="btn-trace-sync">sync now</button>
+        <span class="hint">Claude Code + Codex session transcripts are mirrored into <span class="mono">raw/traces/</span></span>
+      </div>
+      <table id="traces-table"><thead><tr><th>source</th><th>project</th><th>session</th><th>started</th><th>size</th><th>analyzed</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <!-- Dream -->
+    <section id="tab-dream" class="tab">
+      <div class="searchbar">
+        <button id="btn-dream">☾ dream now</button>
+        <span class="hint" id="dream-info">analyzes recent traces → suggestions for skills, memory and knowledge</span>
+      </div>
+      <div id="suggestions"></div>
+    </section>
+  </main>
+
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
