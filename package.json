@@ -24,20 +24,27 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@duckdb/node-api": "1.5.5-r.4",
     "@electric-sql/pglite": "^0.5.2",
     "@electric-sql/pglite-pgvector": "^0.0.3",
     "@hono/node-server": "^2.0.4",
     "@langchain/textsplitters": "^1.0.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@napi-rs/canvas": "0.1.80",
     "chokidar": "^5.0.0",
     "commander": "^15.0.0",
     "gray-matter": "^4.0.3",
     "hono": "^4.12.25",
     "marked": "^18.0.5",
+    "mysql2": "^3.24.2",
+    "pdfjs-dist": "4.10.38",
+    "pg": "^8.23.0",
+    "sharp": "0.35.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"

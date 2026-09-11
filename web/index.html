@@ -4,24 +4,128 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>knode-os</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/style.css" />
   <script src="/vendor/marked.js"></script>
 </head>
 <body>
-  <header>
-    <div class="brand">⌬ knode-os</div>
-    <nav id="tabs">
-      <button data-tab="files" class="active">Files</button>
-      <button data-tab="search">Search</button>
-      <button data-tab="ask">Ask</button>
-      <button data-tab="graph">Graph</button>
-      <button data-tab="traces">Traces</button>
-      <button data-tab="dream">Dream</button>
-    </nav>
-    <div id="statsbar" title="documents / chunks / entities / relations"></div>
-  </header>
+  <section id="auth-view" class="auth-shell" aria-label="Sign in to knode-os">
+    <div class="auth-frame">
+      <div class="auth-intro">
+        <div class="auth-brand"><img src="/favicon.svg" alt="" />knode-os</div>
+        <div class="auth-copy">
+          <p class="eyebrow">YOUR KNOWLEDGE, IN CONTEXT</p>
+          <h1>Build a memory that works the way you do.</h1>
+          <p>Keep private research in your personal space, then bring the right knowledge into a shared Team when collaboration starts.</p>
+        </div>
+        <div class="auth-benefits" aria-label="Product benefits">
+          <div><span>01</span><p><b>Local by default</b>Your files remain the source of truth.</p></div>
+          <div><span>02</span><p><b>Ready for teams</b>Move between private and shared context.</p></div>
+          <div><span>03</span><p><b>Built for agents</b>Search, graph and recall stay connected.</p></div>
+        </div>
+        <p class="auth-footnote">One knowledge layer for you and the agents you work with.</p>
+      </div>
 
-  <main>
+      <div class="auth-panel">
+        <div id="auth-login" class="auth-step active">
+          <div class="auth-step-head">
+            <p class="eyebrow">WELCOME BACK</p>
+            <h2>Sign in to knode-os</h2>
+            <p>Continue to your personal knowledge workspace and Teams.</p>
+          </div>
+          <form id="login-form" class="auth-form" novalidate>
+            <label for="login-username">Username</label>
+            <input id="login-username" name="username" autocomplete="username" placeholder="admin or test" required />
+            <div class="password-label"><label for="login-password">Password</label><button id="btn-toggle-password" type="button">Show</button></div>
+            <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required />
+            <div class="form-row"><label class="check-row"><input id="login-remember" type="checkbox" checked /> Keep me signed in</label></div>
+            <p id="login-error" class="form-error" role="alert"></p>
+            <button class="auth-primary" type="submit">Continue</button>
+          </form>
+          <p class="auth-switch">New here? <button id="btn-show-register" class="text-button" type="button">Create a local account</button></p>
+          <p class="auth-demo-note">Mock accounts: <span class="mono">admin / admin</span> or <span class="mono">test / test</span>.</p>
+        </div>
+
+        <div id="auth-register" class="auth-step">
+          <button id="btn-register-back" class="auth-back" type="button">Back to sign in</button>
+          <div class="auth-step-head">
+            <p class="eyebrow">LOCAL ACCOUNT</p>
+            <h2>Create an account</h2>
+            <p>Choose a simple username and password for this browser.</p>
+          </div>
+          <form id="register-form" class="auth-form" novalidate>
+            <label for="register-username">Username</label>
+            <input id="register-username" name="username" autocomplete="username" placeholder="3–32 letters or numbers" required />
+            <label for="register-password" class="register-field-label">Password</label>
+            <input id="register-password" name="password" type="password" autocomplete="new-password" placeholder="At least 4 characters" minlength="4" required />
+            <label for="register-confirm" class="register-field-label">Confirm password</label>
+            <input id="register-confirm" name="confirm" type="password" autocomplete="new-password" placeholder="Enter it again" minlength="4" required />
+            <p id="register-error" class="form-error" role="alert"></p>
+            <button class="auth-primary" type="submit">Create account</button>
+          </form>
+          <p class="auth-demo-note">Mock only: this account is stored locally in the current browser.</p>
+        </div>
+
+        <div id="auth-workspaces" class="auth-step">
+          <button id="btn-auth-back" class="auth-back" type="button">Back to sign in</button>
+          <div class="auth-step-head">
+            <p class="eyebrow">CHOOSE A WORKSPACE</p>
+            <h2>Where do you want to start?</h2>
+            <p>Personal knowledge stays private. Join a Team to work from shared context.</p>
+          </div>
+          <button id="btn-use-personal" class="workspace-choice" type="button">
+            <span class="workspace-choice-avatar" id="personal-choice-avatar">Y</span>
+            <span><b>Default workspace</b><small>Private files, traces and agent memory</small></span>
+            <span class="choice-action">Open workspace</span>
+          </button>
+          <div class="choice-divider"><span>or join a Team</span></div>
+          <form id="onboarding-team-form" class="team-join-card" novalidate>
+            <label for="onboarding-team-code">Invite link or Team code</label>
+            <div class="team-code-row"><input id="onboarding-team-code" placeholder="e.g. KNODE-LABS" required /><button type="submit">Join Team</button></div>
+            <p id="onboarding-team-error" class="form-error" role="alert"></p>
+            <p class="hint">You can also join or create another Team later.</p>
+          </form>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id="app-shell" hidden>
+    <header>
+      <div class="brand"><img src="/favicon.svg" alt="" />knode-os</div>
+      <nav id="tabs" aria-label="Primary navigation">
+        <button data-tab="files" class="active">Files</button>
+        <button data-tab="search">Search</button>
+        <button data-tab="ask">Ask</button>
+        <button data-tab="graph">Graph</button>
+        <button data-tab="traces">Traces</button>
+        <button data-tab="dream">Dream</button>
+        <button data-tab="settings">Settings</button>
+      </nav>
+      <div id="statsbar" title="documents / chunks / entities / relations"></div>
+      <div class="account-area">
+        <button id="workspace-trigger" class="workspace-trigger" type="button" aria-haspopup="menu" aria-expanded="false">
+          <span id="workspace-avatar" class="workspace-avatar">Y</span>
+          <span class="workspace-trigger-copy"><b id="workspace-name">Default</b><small id="workspace-kind">Private workspace</small></span>
+          <span class="switch-label">Switch</span>
+        </button>
+        <div id="workspace-menu" class="workspace-menu" role="menu" hidden>
+          <div class="workspace-menu-account"><span id="account-avatar">Y</span><p><b id="account-name">Your account</b><small id="account-email"></small></p></div>
+          <p class="menu-label">WORKSPACES</p>
+          <div id="workspace-options"></div>
+          <button id="btn-open-create-workspace" class="menu-action" type="button">Create workspace</button>
+          <button id="btn-open-join-team" class="menu-action" type="button">Join another Team</button>
+          <button id="btn-sign-out" class="menu-action danger" type="button">Sign out</button>
+        </div>
+      </div>
+    </header>
+
+    <div id="workspace-context" class="workspace-context">
+      <span id="context-name">Default</span>
+      <span id="context-description">Only you can access this knowledge.</span>
+    </div>
+
+    <main>
     <!-- Files -->
     <section id="tab-files" class="tab active">
       <aside id="filetree-pane">
@@ -52,6 +156,7 @@
         <input id="search-q" placeholder="search the knowledge base…" />
         <select id="search-mode">
           <option value="hybrid">hybrid</option>
+          <option value="sag">SAG multi-hop</option>
           <option value="vector">vector</option>
           <option value="keyword">keyword</option>
         </select>
@@ -64,6 +169,10 @@
     <section id="tab-ask" class="tab">
       <div class="searchbar">
         <input id="ask-q" placeholder="ask a question — answered from your knowledge base with citations…" />
+        <select id="ask-mode">
+          <option value="hybrid">hybrid</option>
+          <option value="sag">SAG multi-hop</option>
+        </select>
         <button id="btn-ask">ask</button>
       </div>
       <div id="ask-result"></div>
@@ -100,7 +209,144 @@
       </div>
       <div id="suggestions"></div>
     </section>
-  </main>
+
+    <!-- Settings -->
+    <section id="tab-settings" class="tab">
+      <div class="settings-wrap">
+        <div class="settings-hero">
+          <div><p class="eyebrow">MODEL ROUTING</p><h2 class="settings-title">Give each knowledge job the right model.</h2><p>Configure retrieval, document vision, entity extraction and concept synthesis independently for <strong id="cfg-workspace-name">this workspace</strong>. Use an API model or reuse an authenticated local CLI Agent.</p></div>
+          <div class="cfg-actions"><button id="btn-cfg-test">Test routes</button><button id="btn-cfg-save" class="primary">Save &amp; apply</button></div>
+        </div>
+
+        <div class="route-summary" aria-label="Active model routes">
+          <div><span>RETRIEVAL</span><b id="summary-embedding">Loading…</b><small>Embedding</small></div>
+          <div><span>STRUCTURE</span><b id="summary-entity">Loading…</b><small>Entity extraction</small></div>
+          <div><span>SYNTHESIS</span><b id="summary-concept">Loading…</b><small>Concept model</small></div>
+          <div><span>VISION</span><b id="summary-document">Loading…</b><small>PDF &amp; image conversion</small></div>
+        </div>
+
+        <section class="settings-section" aria-labelledby="retrieval-model-title">
+          <div class="settings-section-head"><div><p class="section-index">01 · RETRIEVAL</p><h3 id="retrieval-model-title">Embedding model</h3><p>Turns every chunk into vectors for semantic and hybrid recall.</p></div><span class="section-badge">Required</span></div>
+          <fieldset class="cfg-card cfg-card-wide">
+            <div class="cfg-grid cfg-grid-2">
+              <label>Provider<select id="cfg-emb-provider"><option value="local">Local hashing · offline</option><option value="openai">OpenAI-compatible API</option></select></label>
+              <label>Model<input id="cfg-emb-model" placeholder="text-embedding-3-small" /></label>
+              <label class="cfg-span-2">Base URL<input id="cfg-emb-baseurl" placeholder="https://api.openai.com/v1" /></label>
+              <label>API key<input id="cfg-emb-key" placeholder="env:OPENAI_API_KEY" /></label>
+              <label>Dimensions<input id="cfg-emb-dim" type="number" min="1" step="1" placeholder="1536" /></label>
+            </div>
+            <label class="cfg-check"><input id="cfg-emb-senddim" type="checkbox" /> Send the <span class="mono">dimensions</span> parameter with API requests</label>
+            <p class="cfg-callout" id="cfg-emb-note">The local provider is private and ready immediately. Switching model or dimensions re-embeds the corpus after saving.</p>
+          </fieldset>
+        </section>
+
+        <section class="settings-section" aria-labelledby="knowledge-models-title">
+          <div class="settings-section-head"><div><p class="section-index">02 · KNOWLEDGE PIPELINE</p><h3 id="knowledge-models-title">Conversion, extraction &amp; synthesis</h3><p>Route document vision, fast structure work and deeper concept writing to different models.</p></div><span class="section-badge accent2">Independent</span></div>
+          <div class="route-grid">
+            <div class="route-card" data-route="entity">
+              <div class="route-card-head"><span class="route-number">A</span><div><h4>Entity extraction</h4><p>Names entities, relations and factual claims from changed documents.</p></div></div>
+              <label>Run with<select id="cfg-entity-provider" class="cfg-route-provider"><option value="inherit">Default reasoning model</option><option value="openai">OpenAI-compatible API</option><option value="codex-cli">Codex CLI</option><option value="claude-cli">Claude Code CLI</option><option value="cursor-cli">Cursor Agent CLI</option></select></label>
+              <label>Model<input id="cfg-entity-model" placeholder="Use provider default" /></label>
+              <div class="route-api-fields">
+                <label>Base URL<input id="cfg-entity-baseurl" placeholder="Inherit default endpoint" /></label>
+                <label>API key<input id="cfg-entity-key" placeholder="Inherit default key" /></label>
+              </div>
+              <div class="route-cli-fields"><label>CLI executable<input id="cfg-entity-clipath" placeholder="Use command from PATH" /></label></div>
+              <p class="route-note" id="cfg-entity-note"></p>
+            </div>
+
+            <div class="route-card" data-route="concept">
+              <div class="route-card-head"><span class="route-number">B</span><div><h4>Concept synthesis</h4><p>Turns hot entity clusters into readable, linked Concept pages.</p></div></div>
+              <label>Run with<select id="cfg-concept-provider" class="cfg-route-provider"><option value="inherit">Default reasoning model</option><option value="openai">OpenAI-compatible API</option><option value="codex-cli">Codex CLI</option><option value="claude-cli">Claude Code CLI</option><option value="cursor-cli">Cursor Agent CLI</option></select></label>
+              <label>Model<input id="cfg-concept-model" placeholder="Use provider default" /></label>
+              <div class="route-api-fields">
+                <label>Base URL<input id="cfg-concept-baseurl" placeholder="Inherit default endpoint" /></label>
+                <label>API key<input id="cfg-concept-key" placeholder="Inherit default key" /></label>
+              </div>
+              <div class="route-cli-fields"><label>CLI executable<input id="cfg-concept-clipath" placeholder="Use command from PATH" /></label></div>
+              <p class="route-note" id="cfg-concept-note"></p>
+            </div>
+
+            <div class="route-card" data-route="document">
+              <div class="route-card-head"><span class="route-number">C</span><div><h4>Document vision</h4><p>Converts images and scanned PDF pages into searchable Markdown.</p></div></div>
+              <label>Run with<select id="cfg-document-provider" class="cfg-route-provider"><option value="inherit">Default reasoning model</option><option value="openai">OpenAI-compatible API</option><option value="codex-cli">Codex CLI</option><option value="claude-cli">Claude Code CLI</option></select></label>
+              <label>Vision model<input id="cfg-document-model" placeholder="Use provider default" /></label>
+              <div class="route-api-fields">
+                <label>Base URL<input id="cfg-document-baseurl" placeholder="Inherit default endpoint" /></label>
+                <label>API key<input id="cfg-document-key" placeholder="Inherit default key" /></label>
+              </div>
+              <div class="route-cli-fields"><label>CLI executable<input id="cfg-document-clipath" placeholder="Use command from PATH" /></label></div>
+              <p class="route-note" id="cfg-document-note"></p>
+            </div>
+          </div>
+
+          <div class="pipeline-controls">
+            <div><h4>Pipeline controls</h4><p>Bound background work without changing the selected models.</p></div>
+            <label>Daily token budget<input id="cfg-extraction-budget" type="number" min="0" step="1000" /></label>
+            <label>Documents per pass<input id="cfg-extraction-batch" type="number" min="1" step="1" /></label>
+            <label>Parallel calls<input id="cfg-extraction-concurrency" type="number" min="1" step="1" /></label>
+            <label class="cfg-check"><input id="cfg-extraction-claims" type="checkbox" /> Extract factual claims alongside entities</label>
+          </div>
+        </section>
+
+        <details class="cfg-defaults">
+          <summary><span><b>Default reasoning model</b><small>Fallback for inherited routes, Ask, Wiki summaries and Dream analysis</small></span><span id="summary-default-llm">Not configured</span></summary>
+          <div class="cfg-defaults-body">
+            <div class="cfg-grid cfg-grid-2">
+              <label>Provider<select id="cfg-llm-provider"><option value="openai">OpenAI-compatible API</option><option value="codex-cli">Codex CLI</option><option value="claude-cli">Claude Code CLI</option><option value="cursor-cli">Cursor Agent CLI</option></select></label>
+              <label>Model<input id="cfg-llm-model" placeholder="gpt-4.1-mini or provider default" /></label>
+              <label class="cfg-span-2 cfg-llm-api">Base URL<input id="cfg-llm-baseurl" placeholder="https://api.openai.com/v1" /></label>
+              <label class="cfg-llm-api">API key<input id="cfg-llm-key" placeholder="env:OPENAI_API_KEY" /></label>
+              <label class="cfg-llm-cli">CLI executable<input id="cfg-llm-clipath" placeholder="Use command from PATH" /></label>
+            </div>
+            <p class="cfg-callout" id="cfg-llm-note"></p>
+          </div>
+        </details>
+
+        <div id="cfg-status" aria-live="polite"></div>
+
+        <section class="settings-section danger-zone" aria-labelledby="clear-workspace-title">
+          <div>
+            <p class="section-index">DANGER ZONE</p>
+            <h3 id="clear-workspace-title">Clear <span id="clear-workspace-name">this workspace</span></h3>
+            <p>Remove every file, index, graph, trace, suggestion, and model setting in this workspace. The empty workspace itself remains available.</p>
+          </div>
+          <button id="btn-clear-workspace" class="danger-button" type="button">Clear workspace</button>
+        </section>
+      </div>
+    </section>
+    </main>
+  </div>
+
+  <dialog id="join-team-dialog" class="team-dialog">
+    <form id="join-team-form" novalidate>
+      <div class="dialog-head"><p class="eyebrow">SHARED CONTEXT</p><h2>Join a Team</h2><p>Enter the invite code your teammate shared with you.</p></div>
+      <label for="join-team-code">Team code</label>
+      <input id="join-team-code" placeholder="e.g. KNODE-LABS" required />
+      <p id="join-team-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="btn-cancel-join-team" type="button">Cancel</button><button class="primary" type="submit">Join Team</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="create-workspace-dialog" class="team-dialog">
+    <form id="create-workspace-form" novalidate>
+      <div class="dialog-head"><p class="eyebrow">NEW CONTEXT</p><h2>Create a workspace</h2><p>Each workspace has its own complete directory tree, index, graph, and model settings.</p></div>
+      <label for="create-workspace-name">Workspace name</label>
+      <input id="create-workspace-name" maxlength="128" placeholder="e.g. Product research" required />
+      <p id="create-workspace-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="btn-cancel-create-workspace" type="button">Cancel</button><button class="primary" type="submit">Create workspace</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="clear-workspace-dialog" class="team-dialog danger-dialog">
+    <form id="clear-workspace-form" novalidate>
+      <div class="dialog-head"><p class="eyebrow">IRREVERSIBLE</p><h2>Clear <span id="clear-dialog-workspace-name">this workspace</span>?</h2><p>This permanently deletes all files, indexes, graphs, traces, suggestions, and settings in the workspace.</p></div>
+      <label for="clear-workspace-confirm">Type <span class="mono">CLEAR</span> to confirm</label>
+      <input id="clear-workspace-confirm" autocomplete="off" placeholder="CLEAR" required />
+      <p id="clear-workspace-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="btn-cancel-clear-workspace" type="button">Cancel</button><button id="btn-confirm-clear-workspace" class="danger-button" type="submit" disabled>Clear workspace</button></div>
+    </form>
+  </dialog>
 
   <div id="toast"></div>
   <script src="/app.js"></script>

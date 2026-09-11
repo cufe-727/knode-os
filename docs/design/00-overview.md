@@ -2,6 +2,13 @@
 
 > Local-first knowledge OS for coding agents. One TypeScript process, one data
 > directory, one embedded Postgres.
+>
+> **v2 direction — Agent Context Database.** Every source is a scope whose
+> effects can be reverted (Cordis-style temporal composability), wiki pages are
+> materialized views with declared inputs, every fact is bitemporal, and the
+> next step is a Context Compiler that hands agents a ready context pack plus a
+> plan for what to query next. See [05 — Agent Context Database](05-agent-context-db.md)
+> ([中文](05-agent-context-db.zh-CN.md)).
 
 ## Lineage
 
@@ -12,6 +19,7 @@ knode-os combines three ideas:
 | [knode-os (cloud design)](../../../knode-os-bak) | `raw / wiki` knowledge filesystem, chunk/embedding schema, MCP tool surface, trace-driven optimization loop |
 | [nashsu/llm_wiki](https://github.com/nashsu/llm_wiki) | wiki as the persistent product of ingestion (entities/concepts/sources pages, `purpose.md`/`schema.md`/`index.md`/`log.md` anchors), graph derived from `[[wikilinks]]`, hybrid retrieval with graph expansion |
 | [garrytan/gbrain](https://github.com/garrytan/gbrain) | **markdown is the system of record, the DB is a disposable derived index** (PGlite), deterministic zero-LLM graph wiring on every write, nightly "dream cycle", CLI + MCP-first surface |
+| [Zleap-AI/SAG](https://github.com/Zleap-AI/SAG) | event/entity bipartite retrieval: seed events, SQL multi-hop expansion through shared entities, vector coarse ranking, and direct-route fallback |
 
 ## Architecture
 
@@ -26,17 +34,27 @@ knode-os combines three ideas:
 │            │                  │                  │         │
 │            └────────────┬─────┴──────────────────┘         │
 │                         ▼                                  │
-│   ingest pipeline: scan → sha256 diff → LangChain chunk    │
-│       → embed (OpenAI-compatible | local hash) → pgvector  │
-│       → tsvector FTS → graph wiring (wikilinks + LLM)      │
+│   sync (tier 0): cook (raw→cooked + sidecar) → declared    │
+│       vs running scopes diff → per source: chunk → embed   │
+│       (reusing unchanged chunks) → pgvector + tsvector →   │
+│       tier-0 graph evidence (wikilinks + NLP concepts +    │
+│       frontmatter) → enqueue for tier 1; removed sources   │
+│       are disposed (every effect reverted) → dependent     │
+│       wiki views regenerate or archive                     │
 │                         │                                  │
-│                 PGlite (.knode/db)                         │
+│   background (serve): tier-1 LLM extraction (child scopes) │
+│       · usage-stats flush → sidecars · nightly dream       │
+│       · tier-2 refinement · view reconciliation            │
+│                         │                                  │
+│                 PGlite (.knode/db) — rebuildable           │
+│   scopes · effects · evidence · deps · pages               │
 │   documents · chunks · embeddings · entities · relations   │
-│   entity_mentions · traces · suggestions · meta            │
+│   entity_mentions · claims · datasets · stats · queue      │
 └────────────────────────────────────────────────────────────┘
-            ▲                                ▲
-   data dir (markdown = truth)      ~/.claude/projects, ~/.codex/sessions
-   raw/{docs,traces,skills} wiki/   (mirrored by trace sync)
+            ▲                  ▲                 ▲
+   data dir (files = truth)   ledger/ (events,   ~/.claude/projects,
+   raw/{docs,traces,skills}   attic = machine    ~/.codex/sessions
+   wiki/ packs/               truth)             (mirrored by trace sync)
 ```
 
 ## Data directory
@@ -46,18 +64,25 @@ knode-os combines three ideas:
 ├── knode.config.json   embedding/llm/server/dream settings
 ├── purpose.md          what this KB is for (steers generation)
 ├── schema.md           wiki structure rules
-├── raw/
+├── raw/                originals, never rewritten (L0)
 │   ├── docs/           user uploads
 │   ├── traces/         agent sessions (claude/, codex/), auto-synced
 │   └── skills/         skills/prompts agents have used, auto-synced
-├── wiki/               curated, interlinked knowledge
+├── cooked/             normalized layer, system-managed (L1)
+│   └── docs/           normalized copies + <name>.knode.json sidecars
+│                       (metadata, tier-0/1 extraction results, usage/heat)
+├── wiki/               curated knowledge (L3); OKF v0.1 + Obsidian Vault
+│   ├── .obsidian/      vault-local settings
+│   ├── attachments/    Obsidian attachments
 │   ├── index.md  log.md  overview.md
 │   ├── entities/  concepts/  sources/  dreams/
-└── .knode/             PGlite database — delete + `ingest` to rebuild
+└── .knode/             PGlite database (L2) — delete + `ingest` to rebuild
 ```
 
 Everything under `.knode/` is derived. `documents.sha256` makes ingestion
-incremental and idempotent.
+incremental and idempotent; sidecars let a rebuild replay paid LLM extractions
+and usage history for free. Ingest indexes `cooked/docs`, `raw/skills` and
+`wiki/` — traces are *not* indexed for search; they feed the dream cycle only.
 
 ## Retrieval
 
@@ -66,31 +91,49 @@ incremental and idempotent.
    OpenAI-compatible endpoint for real quality).
 2. **keyword** — Postgres `tsvector`('simple') + ILIKE fallback for CJK.
 3. **graph** — chunks mentioning entities whose name/alias matches the query.
-4. Fused with reciprocal-rank fusion (RRF, k=60; graph weighted 0.6).
-5. `graph search` does seeded BFS over `relations` with per-hop decay 0.5 and
+4. **sag** — opt-in query-time event retrieval. A chunk is the phase-one event
+   unit and `entity_mentions` is the event/entity join. Direct hits seed up to
+   two `chunk → entity → chunk` rounds; rare/shared entities score the structural
+   pool, embeddings coarse-rank it, and RRF merges it with a reserved direct route.
+5. Hybrid signals are fused with reciprocal-rank fusion (RRF, k=60; graph weighted 0.6).
+6. `graph search` does seeded BFS over persistent `relations` with per-hop decay 0.5 and
    `co_occurs` edges discounted ×0.5.
-6. `ask` = hybrid + graph retrieval → budgeted context → cited answer with an
-   explicit `gaps` list.
+7. `ask` defaults to hybrid + graph retrieval; `--mode sag` swaps in the SAG
+   route without changing existing defaults. SAG results expose hop count,
+   seed chunk, bridge entities, and direct/SAG/both provenance.
+
+See [04 — SAG query-time event retrieval](04-sag-query-time-events.md) for the
+mapping, scoring, configuration, and phase-two event model.
 
 ## Knowledge graph
 
-Two extraction passes per document:
+Tiered extraction (details in [01](01-doc-processing-graph-wiki.md)):
 
-- **Deterministic** (always): `[[wikilinks]]` → entities + `mentions` edges;
-  wiki pages under `entities|concepts/` are themselves entities (path = type,
-  like gbrain schema packs); co-occurring links get weak `co_occurs` edges
-  whose weight accumulates on re-mention.
-- **LLM** (when `llm.model` configured): typed entities (10 types) + typed
-  relations (8 types), grounded to chunks by name/alias matching.
+- **Tier 0 — deterministic, at ingest** (always): `[[wikilinks]]` → entities +
+  `mentions` edges; wiki pages under `entities|concepts/` are themselves
+  entities (path = type, like gbrain schema packs); NLP concept mining
+  (capitalized phrases, acronyms, CJK n-grams) → concept entities; co-occurring
+  entities get weak `co_occurs` edges whose weight accumulates on re-mention.
+- **Tier 1 — LLM, asynchronous** (when `llm.model` configured): changed docs
+  are queued; a background pass (while `serve` runs, or `knode-os extract`)
+  drains the queue by priority (heat × freshness × root importance) within a
+  daily token budget, extracting typed entities (10 types), typed relations
+  (7 LLM types + deterministic `co_occurs`) and claims, grounded to chunks by
+  name/alias matching. Results persist in the document sidecar for free replay.
+- **Tier 2 — nightly refinement**: label-propagation community detection over
+  the hot subgraph → LLM community concept pages, plus a zero-LLM claim audit
+  (contradictions, expired facts) feeding the suggestions queue.
 
 `wiki generate` writes `wiki/sources/<slug>.md` summaries (LLM) and entity
-stub pages, which the next ingest indexes — the wiki feeds the graph feeds the
-wiki.
+stub pages as materialized views with declared inputs: they regenerate when
+the entities/claims/documents they depend on change, and are archived when a
+required input is disposed. Human prose outside the managed regions survives
+regeneration and is itself a source.
 
 ## Dream cycle
 
 `knode-os dream` (CLI, `POST /api/dream`, or nightly at `dream.schedule` while
-`serve` runs):
+`serve` runs). Every trigger path syncs traces first, then:
 
 1. digest traces from the lookback window — user requests, per-tool call and
    error counts, error samples; parses both Claude Code transcripts and Codex
@@ -103,5 +146,40 @@ wiki.
 ## Non-goals (v0.1)
 
 - No auth/multi-tenancy — bind to 127.0.0.1.
-- No OCR — text/markdown files only (PDF etc. registered but skipped).
+- PDF/image sources are normalized to Markdown; scanned pages require a configured vision route.
 - No A/B routing of optimizations — suggestions end at human review.
+
+## Further design docs
+
+- [01 — 文档处理系统：面向海量文本的 Graph Wiki 方案](01-doc-processing-graph-wiki.md)
+  — tiered extraction pipeline (Tier 0/1/2), sidecar metadata + heat tracking,
+  `raw → cooked → wiki` directory layers, 100k–1M document scaling plan.
+  The core of this design (cooked layer, sidecars, tiers, heat) is implemented.
+- [02 — Google Open Knowledge Format (OKF) v0.1 兼容设计](02-okf-compatibility.md)
+  — specification summary, native bundle mapping, validation/import/export,
+  permissive consumption, and ordinary markdown-link graph wiring.
+- [03 — Obsidian Vault 原生兼容设计](03-obsidian-vault.md)
+  — Vault boundaries, non-destructive settings, Properties and internal-link
+  compatibility, attachments, and OKF coexistence.
+- [04 — SAG 查询时事件检索](04-sag-query-time-events.md)
+  — maps chunks and entity mentions onto SAG's event/entity retrieval model,
+  including multi-hop expansion, dual-route fusion, provenance, and next steps.
+- [05 — Agent Context Database](05-agent-context-db.md) ([中文](05-agent-context-db.zh-CN.md))
+  — the v2 redesign: Cordis-style effect ledger (scopes / evidence / deps /
+  pages, dispose reverts everything a source produced), bitemporal `as_of` /
+  `valid_at`, wiki pages as views, one logical multimodal database, and the
+  Context Compiler roadmap (intent specs, agent-executed plans, receipts).
+  All six phases are implemented: the ledger; a Temporal Resolver keeping
+  system time, world time and freshness apart, with `kinds` / `sources` scoping
+  on every retrieval surface, a structured `knode_claims` and read-only `v_*`
+  catalog views; a Capability Graph (what can be asked of which source, how to
+  bind an entity to it, and the written semantics over both) with http-json /
+  prometheus / object connectors; the Context Compiler — `knode_resolve` turns
+  a question into filled slots plus a plan the agent executes, and
+  `knode_feedback` closes the loop into receipts; a learning loop that ranks
+  capabilities by what callers actually kept and distils repeatedly-successful
+  plan shapes into recipe proposals for human approval; and the agent-database
+  features around them — negative knowledge with an expiry, worksets that pin a
+  consistent view, quarantined agent writes that open disputes instead of
+  overwriting, ACLs intersected down the derivation chain, and change
+  subscriptions cursored on system time.

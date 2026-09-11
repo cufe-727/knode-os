@@ -3,82 +3,233 @@ import chokidar from 'chokidar';
 import path from 'node:path';
 import { AppContext } from '../context.js';
 import { startDreamScheduler } from '../dream/dream.js';
-import { runIngest } from '../ingest/pipeline.js';
+import { runTier1Pass } from '../graph/tier1.js';
+import { sync } from '../ingest/sync.js';
+import { flushUsageToSidecars } from '../stats/heat.js';
 import { syncTraces } from '../traces/sync.js';
+import { reconcileViews } from '../wiki/pages.js';
+import { refineWiki } from '../wiki/refine.js';
 import { createApp } from './app.js';
+import { WorkspaceContextRegistry } from './workspaces.js';
 
 /**
  * `knode-os serve` — HTTP API + web UI, plus the background loops:
- * file watcher → incremental ingest, periodic trace sync, nightly dream.
+ * file watcher → scoped sync (apply changed, dispose removed), periodic
+ * tier-1 extraction (budgeted, heat-prioritized) followed by view
+ * reconciliation, hourly usage-stats flush to sidecars, periodic trace sync,
+ * datasource re-sync, nightly dream + tier-2 hot-subgraph refinement.
  */
 export async function startServer(ctx: AppContext): Promise<void> {
   const log = (msg: string) => console.log(`[knode-os] ${msg}`);
-  const app = createApp(ctx, log);
+  const workspaceContexts = new WorkspaceContextRegistry(ctx.dataDir, {
+    templateConfig: ctx.config,
+    onCreate: (workspaceCtx, scope) => {
+      const workspaceLog = (msg: string) => log(`[${scope.relativeDir}] ${msg}`);
+      return startWorkspaceServices(workspaceCtx, workspaceLog);
+    },
+  });
+  const app = createApp(ctx, log, workspaceContexts);
   const { port, host } = ctx.config.server;
 
   serve({ fetch: app.fetch, port, hostname: host }, (info) => {
-    log(`serving http://${host}:${info.port}  (data: ${ctx.dataDir})`);
+    log(`serving http://${host}:${info.port}  (workspace root: ${ctx.dataDir})`);
   });
+}
 
-  // initial sync + ingest (async, doesn't block startup)
-  (async () => {
+const WATCH_FULL_SYNC_THRESHOLD = 200;
+
+function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void): () => Promise<void> {
+  let disposed = false;
+  const activeJobs = new Set<Promise<unknown>>();
+  const track = <T>(job: Promise<T>): Promise<T> => {
+    activeJobs.add(job);
+    void job.then(
+      () => activeJobs.delete(job),
+      () => activeJobs.delete(job),
+    );
+    return job;
+  };
+  const summarize = (label: string, s: Awaited<ReturnType<typeof sync>>) =>
+    log(`${label}: ${s.indexed} applied, ${s.unchanged} unchanged, ${s.disposed} disposed, ${s.chunks} chunks, ${s.pagesRegenerated} pages regenerated${s.pagesArchived ? `, ${s.pagesArchived} archived` : ''}${s.datasourceErrors.length ? `, datasource errors: ${s.datasourceErrors.length}` : ''}`);
+
+  // initial trace sync + full reconciliation (async, doesn't block startup)
+  void track((async () => {
     try {
       const ts = await syncTraces(ctx.store, ctx.config);
+      if (disposed) return;
       if (ts.copied || ts.skills) log(`trace sync: ${ts.copied} traces, ${ts.skills} skill files`);
-      const stats = await runIngest(ctx.store, ctx.config, ctx.embedder, ctx.llm, { onProgress: (m) => log(m) });
-      log(`ingest: ${stats.indexed} indexed, ${stats.unchanged} unchanged, ${stats.chunks} chunks, ${stats.entities} entity refs`);
+      summarize('sync', await sync(ctx, { onProgress: (m) => log(m) }));
     } catch (err) {
-      log(`startup ingest failed: ${err instanceof Error ? err.message : err}`);
+      log(`startup sync failed: ${err instanceof Error ? err.message : err}`);
     }
-  })();
+  })());
 
-  // periodic trace sync
-  const interval = Math.max(1, ctx.config.trace.syncIntervalMinutes) * 60_000;
-  const syncTimer = setInterval(async () => {
-    try {
-      const ts = await syncTraces(ctx.store, ctx.config);
-      if (ts.copied || ts.skills) {
-        log(`trace sync: ${ts.copied} traces, ${ts.skills} skill files`);
-        await runIngest(ctx.store, ctx.config, ctx.embedder, ctx.llm, { only: ['raw/skills'] });
+  // periodic live-schema refresh: keeps dataset pages / entity links / freshness current
+  const dsTimer = setInterval(() => {
+    if (disposed || ctx.config.datasources.length === 0) return;
+    void track((async () => {
+      try {
+        const s = await sync(ctx, { only: ['datasources'], onProgress: log });
+        if (s.pagesRegenerated > 0) log(`datasource sync: ${s.pagesRegenerated} wiki pages refreshed`);
+      } catch (err) {
+        log(`datasource sync failed: ${err instanceof Error ? err.message : err}`);
       }
-    } catch (err) {
-      log(`trace sync failed: ${err instanceof Error ? err.message : err}`);
-    }
+    })());
+  }, 30 * 60_000);
+  dsTimer.unref?.();
+
+  // periodic trace sync (skills are sources: removed skills get disposed)
+  const interval = Math.max(1, ctx.config.trace.syncIntervalMinutes) * 60_000;
+  const syncTimer = setInterval(() => {
+    if (disposed) return;
+    void track((async () => {
+      try {
+        const ts = await syncTraces(ctx.store, ctx.config);
+        if (ts.copied || ts.skills) {
+          log(`trace sync: ${ts.copied} traces, ${ts.skills} skill files`);
+          await sync(ctx, { only: ['raw/skills'] });
+        }
+      } catch (err) {
+        log(`trace sync failed: ${err instanceof Error ? err.message : err}`);
+      }
+    })());
   }, interval);
   syncTimer.unref?.();
 
-  // nightly dream
-  startDreamScheduler(ctx.store, ctx.config, ctx.llm, log);
-  log(`dream scheduled daily at ${ctx.config.dream.schedule} (lookback ${ctx.config.dream.lookbackDays}d)`);
-
-  // watch docs + wiki for changes → debounced incremental ingest
-  if (ctx.config.ingest.watch) {
-    let timer: NodeJS.Timeout | null = null;
-    let running = false;
-    const trigger = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(async () => {
-        if (running) return trigger();
-        running = true;
-        try {
-          const stats = await runIngest(ctx.store, ctx.config, ctx.embedder, ctx.llm);
-          if (stats.indexed || stats.removed) log(`watch ingest: ${stats.indexed} indexed, ${stats.removed} removed`);
-        } catch (err) {
-          log(`watch ingest failed: ${err instanceof Error ? err.message : err}`);
-        } finally {
-          running = false;
+  // tier-1 extraction loop: drain the priority queue within the daily budget,
+  // then let pages that depend on the new evidence regenerate
+  const tier1Interval = Math.max(1, ctx.config.extraction.intervalMinutes) * 60_000;
+  let tier1Running = false;
+  const tier1Timer = setInterval(() => {
+    if (disposed || tier1Running) return;
+    tier1Running = true;
+    void track((async () => {
+      try {
+        const t1 = await runTier1Pass(ctx.store, ctx.config, ctx.llm, { onProgress: log });
+        if (t1.processed || t1.failed) {
+          log(`tier1: ${t1.processed} extracted, ${t1.failed} failed, ${t1.queued} queued, ~${t1.tokensUsed} tokens (budget left ${t1.budgetLeft})`);
+          const views = await reconcileViews(ctx, { actor: 'tier1', llm: false, onProgress: log });
+          if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
         }
+      } catch (err) {
+        log(`tier1 pass failed: ${err instanceof Error ? err.message : err}`);
+      } finally {
+        tier1Running = false;
+      }
+    })());
+  }, tier1Interval);
+  tier1Timer.unref?.();
+
+  // usage stats → sidecar flush
+  const flushInterval = Math.max(1, ctx.config.heat.flushIntervalMinutes) * 60_000;
+  const flushTimer = setInterval(() => {
+    if (disposed) return;
+    void track((async () => {
+      try {
+        const n = await flushUsageToSidecars(ctx.store, ctx.config.heat);
+        if (n) log(`usage stats flushed to ${n} sidecars`);
+      } catch (err) {
+        log(`stats flush failed: ${err instanceof Error ? err.message : err}`);
+      }
+    })());
+  }, flushInterval);
+  flushTimer.unref?.();
+
+  // nightly dream + tier-2 hot-subgraph refinement
+  const dreamTimer = startDreamScheduler(ctx, log);
+  log(`dream scheduled daily at ${ctx.config.dream.schedule} (lookback ${ctx.config.dream.lookbackDays}d)`);
+  const tier2Timer = startTier2Scheduler(ctx, log);
+
+  // watch docs + wiki for changes → debounced scoped sync (unlink events dispose)
+  let watchTimer: NodeJS.Timeout | null = null;
+  let watcher: ReturnType<typeof chokidar.watch> | null = null;
+  if (ctx.config.ingest.watch) {
+    let running = false;
+    const pending = new Set<string>();
+    let fullSync = false;
+    const trigger = (event: string, absPath: string) => {
+      if (disposed) return;
+      const rel = path.relative(ctx.dataDir, absPath).split(path.sep).join('/');
+      if (event === 'addDir' || event === 'unlinkDir' || !rel || rel.startsWith('..')) fullSync = true;
+      else pending.add(rel);
+      if (pending.size > WATCH_FULL_SYNC_THRESHOLD) fullSync = true;
+      if (watchTimer) clearTimeout(watchTimer);
+      watchTimer = setTimeout(() => {
+        if (disposed) return;
+        if (running) {
+          trigger('retry', absPath);
+          return;
+        }
+        running = true;
+        const only = fullSync ? undefined : [...pending];
+        pending.clear();
+        fullSync = false;
+        void track((async () => {
+          try {
+            const stats = await sync(ctx, { only });
+            if (stats.indexed || stats.disposed || stats.pagesRegenerated) summarize('watch sync', stats);
+          } catch (err) {
+            log(`watch sync failed: ${err instanceof Error ? err.message : err}`);
+          } finally {
+            running = false;
+          }
+        })());
       }, 1500);
     };
-    chokidar
-      .watch([
+    watcher = chokidar.watch([
         path.join(ctx.dataDir, 'raw/docs'),
         path.join(ctx.dataDir, 'raw/skills'),
         path.join(ctx.dataDir, 'wiki'),
         path.join(ctx.dataDir, 'purpose.md'),
         path.join(ctx.dataDir, 'schema.md'),
-      ], { ignoreInitial: true })
+      ], {
+        ignoreInitial: true,
+        // Obsidian rewrites workspace/cache state during normal navigation;
+        // those Vault settings are not knowledge and must not trigger a sync.
+        // wiki/.archive holds disposed pages and is never a source.
+        ignored: /(^|[/\\])\.(obsidian|archive)([/\\]|$)/,
+      })
       .on('all', trigger);
     log('watching raw/docs, raw/skills, wiki for changes');
   }
+
+  return async () => {
+    disposed = true;
+    clearInterval(syncTimer);
+    clearInterval(tier1Timer);
+    clearInterval(flushTimer);
+    clearInterval(dreamTimer);
+    clearInterval(tier2Timer);
+    clearInterval(dsTimer);
+    if (watchTimer) clearTimeout(watchTimer);
+    if (watcher) await watcher.close();
+    await Promise.allSettled([...activeJobs]);
+    await ctx.datasources.closeAll();
+  };
+}
+
+/** Run tier-2 refinement daily, a few minutes after the dream schedule. */
+function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void): NodeJS.Timeout {
+  const [h, m] = ctx.config.dream.schedule.split(':').map(Number);
+  const target = `${String(h).padStart(2, '0')}:${String((m + 10) % 60).padStart(2, '0')}`;
+  let lastRun = '';
+  const timer = setInterval(async () => {
+    const now = new Date();
+    const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const today = now.toISOString().slice(0, 10);
+    if (hhmm === target && lastRun !== today) {
+      lastRun = today;
+      try {
+        const res = await refineWiki(ctx.store, ctx.config, ctx.llm, { onProgress: log, embedder: ctx.embedder });
+        log(`tier2 done: ${res.pagesWritten} community pages from ${res.communities} hot communities`);
+        const views = await reconcileViews(ctx, { actor: 'tier2', llm: true, onProgress: log });
+        if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
+      } catch (err) {
+        log(`tier2 failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }, 30 * 1000);
+  timer.unref?.();
+  log(`tier2 refinement scheduled daily at ${target}`);
+  return timer;
 }

@@ -2,12 +2,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { defaultConfig, loadConfig, resolveSecret, saveConfig } from '../src/config.js';
+import { defaultConfig, loadConfig, resolveRoutedLlmConfig, resolveSecret, saveConfig } from '../src/config.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { safePath, walkFiles } from '../src/fs/files.js';
-import { chunkText, estimateTokens } from '../src/ingest/chunker.js';
+import { chunkText } from '../src/ingest/chunker.js';
+import { estimateTokens } from '../src/llm/tokens.js';
 import { LocalHashEmbeddingProvider } from '../src/ingest/embeddings.js';
-import { extractWikilinks, slugify } from '../src/graph/extract.js';
+import { slugify } from '../src/graph/store.js';
+import { extractWikilinks } from '../src/graph/wire.js';
+import { completeViaCli, renderCliPrompt } from '../src/llm/cli.js';
+import { LlmClient } from '../src/llm/client.js';
+import { queryTerms } from '../src/search/search.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-test-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -22,12 +27,25 @@ describe('config', () => {
     const loaded = loadConfig(dir);
     expect(loaded.server.port).toBe(1234);
     expect(loaded.embedding.dimensions).toBe(384);
+    expect(loaded.retrieval.sag.maxHops).toBe(2);
   });
 
   it('resolves env: secrets', () => {
     process.env.KNODE_TEST_KEY = 'abc';
     expect(resolveSecret('env:KNODE_TEST_KEY')).toBe('abc');
     expect(resolveSecret('plain')).toBe('plain');
+  });
+
+  it('routes extraction jobs to an independent CLI provider', () => {
+    const cfg = defaultConfig();
+    const routed = resolveRoutedLlmConfig(cfg.llm, {
+      ...cfg.extraction.entityLlm,
+      provider: 'cursor-cli',
+      model: 'composer-1.5',
+    });
+    expect(routed.provider).toBe('cursor-cli');
+    expect(routed.model).toBe('composer-1.5');
+    expect(routed.baseUrl).toBe(cfg.llm.baseUrl);
   });
 });
 
@@ -63,6 +81,23 @@ describe('chunker', () => {
   });
 });
 
+describe('queryTerms', () => {
+  it('splits CJK questions into salient bigrams, dropping question words', () => {
+    const terms = queryTerms('印度扩建战略石油储备的影响是什么？');
+    expect(terms.length).toBeGreaterThan(2);
+    expect(terms).toContain('印度');
+    expect(terms.some((t) => t.includes('石油') || t.includes('储备'))).toBe(true);
+    expect(terms).not.toContain('什么');
+  });
+
+  it('keeps latin tokens and short CJK runs whole', () => {
+    const terms = queryTerms('LME 铜价 squeeze');
+    expect(terms).toContain('LME');
+    expect(terms).toContain('铜价');
+    expect(terms).toContain('squeeze');
+  });
+});
+
 describe('local embedding', () => {
   it('is deterministic, normalized, and ranks related text higher', async () => {
     const e = new LocalHashEmbeddingProvider(256);
@@ -87,6 +122,100 @@ describe('graph extraction', () => {
     expect(slugify('知识图谱')).toBe('知识图谱');
     expect(slugify('  PGlite!! ')).toBe('pglite');
   });
+});
+
+describe('llm cli providers', () => {
+  const llmCfg = (overrides: object) => ({
+    provider: 'openai' as const, baseUrl: '', apiKey: '', model: '', cliPath: '', cliTimeoutMs: 30_000, ...overrides,
+  });
+  const writeStub = (name: string, script: string) => {
+    const p = path.join(tmp, name);
+    fs.writeFileSync(p, `#!/bin/bash\n${script}`, { mode: 0o755 });
+    return p;
+  };
+
+  it('flattens messages into a one-shot prompt with a JSON directive', () => {
+    const prompt = renderCliPrompt([
+      { role: 'system', content: 'extract entities' },
+      { role: 'user', content: 'Document: x' },
+    ], true);
+    expect(prompt).toContain('extract entities');
+    expect(prompt).toContain('Document: x');
+    expect(prompt).toMatch(/single JSON object only/);
+  });
+
+  it('codex-cli: reads the final message from --output-last-message', async () => {
+    // stub emulating `codex exec ... --output-last-message <file> -`
+    const stub = writeStub('codex-stub.sh', `
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "--output-last-message" ] && out="$a"; prev="$a"; done
+cat > /dev/null  # consume the stdin prompt
+echo -n '{"entities":[{"name":"PGlite","type":"technology"}]}' > "$out"
+`);
+    const cfg = llmCfg({ provider: 'codex-cli', cliPath: stub });
+    const client = new LlmClient(cfg);
+    expect(client.enabled).toBe(true);
+    expect(client.label).toBe('codex-cli');
+    const res = await client.completeJson<{ entities: { name: string }[] }>([{ role: 'user', content: 'x' }]);
+    expect(res.entities[0].name).toBe('PGlite');
+  });
+
+  it('claude-cli: unwraps the --output-format json result field', async () => {
+    const stub = writeStub('claude-stub.sh', `
+cat > /dev/null
+echo '{"type":"result","is_error":false,"result":"pong"}'
+`);
+    const out = await completeViaCli(llmCfg({ provider: 'claude-cli', cliPath: stub }), [{ role: 'user', content: 'ping' }]);
+    expect(out).toBe('pong');
+  });
+
+  it('claude-cli: grants Read access and identifies attached images', async () => {
+    const image = path.join(tmp, 'claude-image.png');
+    fs.writeFileSync(image, 'fixture');
+    const stub = writeStub('claude-image-stub.sh', `
+args="$*"
+prompt="$(cat)"
+[[ "$args" == *"--tools Read"* ]] || exit 7
+[[ "$args" == *"--add-dir ${tmp}"* ]] || exit 8
+[[ "$prompt" == *"${image}"* ]] || exit 9
+echo '{"type":"result","is_error":false,"result":"# Image text"}'
+`);
+    const out = await completeViaCli(
+      llmCfg({ provider: 'claude-cli', cliPath: stub }),
+      [{ role: 'user', content: 'transcribe' }],
+      { images: [image] },
+    );
+    expect(out).toBe('# Image text');
+  });
+
+  it('claude-cli: surfaces is_error results as errors', async () => {
+    const stub = writeStub('claude-err-stub.sh', `
+cat > /dev/null
+echo '{"type":"result","is_error":true,"result":"Failed to authenticate"}'
+exit 1
+`);
+    await expect(completeViaCli(llmCfg({ provider: 'claude-cli', cliPath: stub }), [{ role: 'user', content: 'ping' }]))
+      .rejects.toThrow(/Failed to authenticate/);
+  });
+
+  it('cursor-cli: unwraps the headless JSON result', async () => {
+    const stub = writeStub('cursor-stub.sh', `
+echo '{"type":"result","subtype":"success","is_error":false,"result":"pong"}'
+`);
+    const out = await completeViaCli(llmCfg({ provider: 'cursor-cli', cliPath: stub }), [{ role: 'user', content: 'ping' }]);
+    expect(out).toBe('pong');
+  });
+
+  it('reports a missing CLI executable clearly', async () => {
+    await expect(completeViaCli(llmCfg({ provider: 'codex-cli', cliPath: path.join(tmp, 'nope-cli') }), [{ role: 'user', content: 'x' }]))
+      .rejects.toThrow(/not found/);
+  });
+
+  it('kills a hung CLI after cliTimeoutMs', async () => {
+    const stub = writeStub('hang-stub.sh', 'sleep 30');
+    await expect(completeViaCli(llmCfg({ provider: 'claude-cli', cliPath: stub, cliTimeoutMs: 1000 }), [{ role: 'user', content: 'x' }]))
+      .rejects.toThrow(/timed out/);
+  }, 10_000);
 });
 
 describe('walkFiles', () => {

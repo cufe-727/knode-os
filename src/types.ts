@@ -1,6 +1,6 @@
 /** Shared domain types for knode-os. */
 
-export type DocRoot = 'docs' | 'wiki' | 'skills' | 'traces';
+export type DocRoot = 'docs' | 'wiki' | 'skills' | 'traces' | 'capabilities';
 
 export interface DocumentRow {
   id: string;
@@ -10,19 +10,14 @@ export interface DocumentRow {
   sha256: string;
   mime: string | null;
   bytes: number;
-  status: 'pending' | 'indexed' | 'error' | 'skipped';
+  status: 'pending' | 'indexed' | 'error' | 'skipped' | 'disposed';
   error: string | null;
   created_at: string;
   updated_at: string;
-}
-
-export interface ChunkRow {
-  id: string;
-  document_id: string;
-  seq: number;
-  content: string;
-  token_count: number;
-  metadata: Record<string, unknown>;
+  /** Live scope that produced this projection (null once disposed). */
+  scope_id?: string | null;
+  /** 'source' contributes to the graph; 'view' (generated page) is indexed for search only. */
+  kind?: 'source' | 'view';
 }
 
 export interface EntityRow {
@@ -33,6 +28,10 @@ export interface EntityRow {
   aliases: string[];
   wiki_path: string | null;
   mention_count: number;
+  evidence_count?: number;
+  /** System-time window; tx_to set = tombstoned (no live evidence). */
+  tx_from?: string;
+  tx_to?: string | null;
 }
 
 export interface RelationRow {
@@ -42,7 +41,27 @@ export interface RelationRow {
   type: string;
   description: string;
   weight: number;
-  document_id: string | null;
+  document_id?: string | null;
+  evidence_count?: number;
+  tx_from?: string;
+  tx_to?: string | null;
+}
+
+/** Claim projected for query results / the web UI. */
+export interface ClaimItem {
+  id: string;
+  subject: string;
+  object: string | null;
+  type: string;
+  statement: string;
+  status: string;
+  /** Validity window (world time), date-only. */
+  startDate: string | null;
+  endDate: string | null;
+  /** Source that first asserted the claim (scope key); see knode_lineage for all supporters. */
+  path: string | null;
+  /** Number of live sources supporting the claim. */
+  evidenceCount?: number;
 }
 
 export interface TraceRow {
@@ -59,13 +78,32 @@ export interface TraceRow {
 
 export interface SuggestionRow {
   id: string;
-  kind: 'skill' | 'memory' | 'knowledge';
+  kind: 'skill' | 'memory' | 'knowledge' | 'pack' | 'recipe';
   title: string;
   body: string;
-  evidence: string[];
-  status: 'pending' | 'accepted' | 'rejected';
+  evidence: (string | { kind: string; id?: string; path?: string; text?: string })[];
+  /** 'stale' = an input the suggestion depended on was tombstoned. */
+  status: 'pending' | 'accepted' | 'rejected' | 'stale';
   report_path: string | null;
+  /** Machine-applicable change; for kind 'pack' / 'recipe': { path, content } of the file to write. */
+  payload?: { path: string; content: string; [key: string]: unknown } | null;
   created_at: string;
+}
+
+/** External live table registered in the index (schema only, no rows). */
+export interface DatasetRow {
+  id: string;
+  source_id: string;
+  table_name: string;
+  kind: string;
+  columns: { name: string; type: string }[];
+  row_count: number | null;
+  schema_sha: string;
+  description: string;
+  entity_count: number;
+  refreshed_at: string | null;
+  scope_id?: string | null;
+  tx_to?: string | null;
 }
 
 export interface SearchResult {
@@ -75,7 +113,17 @@ export interface SearchResult {
   title: string | null;
   content: string;
   score: number;
-  signals: { vector?: number; keyword?: number; graph?: number };
+  signals: { vector?: number; keyword?: number; graph?: number; structural?: number };
+  /** Retrieval provenance. Present for SAG results and omitted by legacy modes. */
+  trace?: {
+    route: 'direct' | 'sag' | 'both';
+    /** Number of chunk -> entity -> chunk expansion rounds. */
+    hop?: number;
+    /** Direct chunk from which structural expansion started. */
+    seedChunkId?: string;
+    /** Entity bridge chain followed to reach this chunk. */
+    bridgeEntities?: string[];
+  };
 }
 
 export interface GraphNode {
@@ -99,6 +147,7 @@ export interface GraphSearchResult {
   nodes: GraphNode[];
   edges: GraphEdge[];
   chunks: SearchResult[];
+  claims?: ClaimItem[];
 }
 
 export interface IngestStats {

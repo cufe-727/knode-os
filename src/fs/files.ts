@@ -86,10 +86,85 @@ export function pathExists(dataDir: string, rel: string): boolean {
   return fs.existsSync(safePath(dataDir, rel));
 }
 
+/** Roots that external interfaces (HTTP / MCP) may write to. Everything else is read-only. */
+const WRITABLE_ROOTS_RE = /^(wiki|raw\/docs|packs)(\/|$)/;
+
+export function isWritablePath(rel: string): boolean {
+  return WRITABLE_ROOTS_RE.test(rel.replace(/\\/g, '/').replace(/^\/+/, ''));
+}
+
+export function assertWritablePath(rel: string): void {
+  if (!isWritablePath(rel)) throw new Error('writes are restricted to wiki/, raw/docs/ and packs/');
+}
+
 const TEXT_EXT = new Set(['.md', '.markdown', '.txt', '.text', '.json', '.jsonl', '.yaml', '.yml', '.csv', '.tsv', '.html', '.htm', '.xml', '.rst', '.org']);
 
 export function isTextFile(file: string): boolean {
   return TEXT_EXT.has(path.extname(file).toLowerCase());
+}
+
+/** Recursively list files (absolute paths) under any directory, skipping dotfiles. */
+export function walkAbsolute(root: string): string[] {
+  const out: string[] = [];
+  const visit = (dir: string) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      const abs = path.join(dir, e.name);
+      if (e.isDirectory()) visit(abs);
+      else if (e.isFile()) out.push(abs);
+    }
+  };
+  visit(root);
+  return out;
+}
+
+export interface GrepMatch {
+  path: string;
+  line: number;
+  text: string;
+}
+
+const GREP_ROOTS = ['cooked/docs', 'wiki', 'raw/docs', 'raw/skills', 'packs'];
+const MAX_GREP_FILE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * grep-style regex search over the knowledge files (agents get grep/ls/read
+ * alongside native SQL — the "filesystem view" of the logical database).
+ */
+export function grepFiles(
+  dataDir: string,
+  pattern: string,
+  opts: { path?: string; maxMatches?: number; ignoreCase?: boolean } = {},
+): GrepMatch[] {
+  const maxMatches = Math.min(opts.maxMatches ?? 100, 500);
+  const re = new RegExp(pattern, opts.ignoreCase === false ? '' : 'i');
+  const roots = opts.path ? [opts.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')] : GREP_ROOTS;
+  const out: GrepMatch[] = [];
+
+  for (const root of roots) {
+    const rootAbs = safePath(dataDir, root);
+    if (!fs.existsSync(rootAbs)) continue;
+    const files = fs.statSync(rootAbs).isFile() ? [root] : walkFiles(dataDir, root);
+    for (const file of files) {
+      if (!isTextFile(file)) continue;
+      const abs = safePath(dataDir, file);
+      if (fs.statSync(abs).size > MAX_GREP_FILE_BYTES) continue;
+      const lines = fs.readFileSync(abs, 'utf8').split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (re.test(lines[i])) {
+          out.push({ path: file, line: i + 1, text: lines[i].trim().slice(0, 300) });
+          if (out.length >= maxMatches) return out;
+        }
+      }
+    }
+  }
+  return out;
 }
 
 /** Recursively list files (relative posix paths) under a directory inside dataDir. */

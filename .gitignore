@@ -21,7 +21,12 @@ temp/
 
 # Local data directories
 .dev-data/
+.demo/
+.demo-data/
 knode-data/
+
+# Swift build output (macos/)
+.build/
 
 # Local preview config
 .claude/launch.json

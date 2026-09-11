@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { EmbeddingConfig, resolveSecret } from '../config.js';
+import { EMBED_INPUT_CHARS } from '../constants.js';
 
 export interface EmbeddingProvider {
   readonly model: string;
@@ -11,12 +12,13 @@ export interface EmbeddingProvider {
  * Calls any OpenAI-compatible `/embeddings` endpoint (OpenAI, Azure, Ollama,
  * vLLM, SiliconFlow, …). Configure baseUrl/model/dimensions in knode.config.json.
  */
-export class OpenAIEmbeddingProvider implements EmbeddingProvider {
+class OpenAIEmbeddingProvider implements EmbeddingProvider {
   readonly model: string;
   readonly dimensions: number;
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly batchSize: number;
+  private readonly sendDimensions: boolean;
 
   constructor(cfg: EmbeddingConfig) {
     this.model = cfg.model;
@@ -24,29 +26,40 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.baseUrl = cfg.baseUrl.replace(/\/+$/, '');
     this.apiKey = resolveSecret(cfg.apiKey);
     this.batchSize = Math.max(1, cfg.batchSize);
+    this.sendDimensions = Boolean(cfg.sendDimensions);
   }
 
   async embed(texts: string[]): Promise<number[][]> {
     const out: number[][] = [];
     for (let i = 0; i < texts.length; i += this.batchSize) {
-      const batch = texts.slice(i, i + this.batchSize).map((t) => t.slice(0, 8000) || ' ');
+      const batch = texts.slice(i, i + this.batchSize).map((t) => t.slice(0, EMBED_INPUT_CHARS) || ' ');
+      const json = await this.embedBatch(batch);
+      const sorted = [...json.data].sort((a, b) => a.index - b.index);
+      for (const d of sorted) out.push(d.embedding);
+    }
+    return out;
+  }
+
+  /** One batch request, with exponential backoff on rate limits / transient 5xx. */
+  private async embedBatch(batch: string[]): Promise<{ data: { index: number; embedding: number[] }[] }> {
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 1; ; attempt++) {
       const res = await fetch(`${this.baseUrl}/embeddings`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
           ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
         },
-        body: JSON.stringify({ model: this.model, input: batch, dimensions: this.dimensions }),
+        body: JSON.stringify({ model: this.model, input: batch, ...(this.sendDimensions ? { dimensions: this.dimensions } : {}) }),
       });
-      if (!res.ok) {
-        const body = await res.text();
+      if (res.ok) return (await res.json()) as { data: { index: number; embedding: number[] }[] };
+      const body = await res.text();
+      const retryable = res.status === 429 || res.status >= 500;
+      if (!retryable || attempt >= MAX_ATTEMPTS) {
         throw new Error(`embedding request failed (${res.status}): ${body.slice(0, 300)}`);
       }
-      const json = (await res.json()) as { data: { index: number; embedding: number[] }[] };
-      const sorted = [...json.data].sort((a, b) => a.index - b.index);
-      for (const d of sorted) out.push(d.embedding);
+      await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt)));
     }
-    return out;
   }
 }
 

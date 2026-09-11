@@ -1,11 +1,19 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import path from 'node:path';
 import { KnodeConfig } from '../config.js';
+import { AppContext } from '../context.js';
 import { appendLog } from '../fs/datadir.js';
 import { safePath, walkFiles } from '../fs/files.js';
+import { applyDocScope } from '../ingest/apply.js';
+import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
+import { applyScope } from '../lineage/scope.js';
 import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
+import { optimizePacks } from '../pack/learn.js';
+import { distillRecipes, staleOrphanedRecipeSuggestions } from '../compiler/distill.js';
+import { evaluatePacks, writeEvalReport } from '../compiler/evaluate.js';
+import { writeRankerReport } from '../compiler/ranker.js';
+import { syncTraces } from '../traces/sync.js';
 import { SuggestionRow, TraceRow } from '../types.js';
 
 /**
@@ -18,6 +26,10 @@ import { SuggestionRow, TraceRow } from '../types.js';
  *      knowledge base should improve.
  *   4. Write a dream report to wiki/dreams/YYYY-MM-DD.md and queue suggestions
  *      for review in the UI / MCP.
+ *
+ * Each day's dream is one scope keyed by the date and fingerprinted by the
+ * traces it saw: re-running with the same traces is a no-op, new traces
+ * dispose the previous report and its pending suggestions before re-applying.
  */
 
 export interface SessionDigest {
@@ -42,11 +54,20 @@ export async function runDream(
   store: Store,
   config: KnodeConfig,
   llm: LlmClient,
-  opts: { lookbackDays?: number; onProgress?: (msg: string) => void } = {},
+  opts: { lookbackDays?: number; onProgress?: (msg: string) => void; embedder?: EmbeddingProvider } = {},
 ): Promise<DreamResult> {
   const progress = opts.onProgress ?? (() => {});
   const lookback = opts.lookbackDays ?? config.dream.lookbackDays;
   const since = new Date(Date.now() - lookback * 24 * 3600 * 1000).toISOString();
+
+  // Pull in the latest traces first so every trigger path (CLI, HTTP, nightly
+  // scheduler) dreams over the same up-to-date session set.
+  try {
+    const ts = await syncTraces(store, config);
+    if (ts.copied || ts.skills) progress(`trace sync: ${ts.copied} traces, ${ts.skills} skill files`);
+  } catch (err) {
+    progress(`trace sync failed (continuing with existing traces): ${err instanceof Error ? err.message : err}`);
+  }
 
   const traces = await store.query<TraceRow>(
     `SELECT * FROM traces WHERE started_at >= $1 ORDER BY started_at DESC LIMIT 200`,
@@ -71,7 +92,7 @@ export async function runDream(
   if (llm.enabled && digests.length > 0) {
     try {
       suggestions = await llmSuggestions(llm, config, aggregate, digests, skillsOnDisk);
-      analysisNote = `LLM analysis via ${llm.model}.`;
+      analysisNote = `LLM analysis via ${llm.label}.`;
     } catch (err) {
       analysisNote = `LLM analysis failed (${err instanceof Error ? err.message : err}); heuristic fallback used.`;
       suggestions = heuristicSuggestions(aggregate, skillsOnDisk);
@@ -83,27 +104,63 @@ export async function runDream(
 
   const today = new Date().toISOString().slice(0, 10);
   const reportPath = `wiki/dreams/${today}.md`;
-  const report = renderReport(today, since, digests, aggregate, suggestions, analysisNote);
-  const abs = safePath(store.dataDir, reportPath);
-  fs.mkdirSync(path.dirname(abs), { recursive: true });
-  fs.writeFileSync(abs, report);
+  const report = renderReport(today, since, digests, aggregate, suggestions, analysisNote, traces.map((t) => t.id));
+  const inputsSha = crypto.createHash('sha256')
+    .update(JSON.stringify(traces.map((t) => [t.id, t.sha256]).sort()))
+    .digest('hex').slice(0, 24);
 
   const rows: SuggestionRow[] = [];
-  for (const s of suggestions) {
-    const id = crypto.createHash('sha256').update(`${s.kind}|${s.title}`).digest('hex').slice(0, 16);
-    await store.query(
-      `INSERT INTO suggestions (id, kind, title, body, evidence, status, report_path)
-       VALUES ($1, $2, $3, $4, $5::jsonb, 'pending', $6)
-       ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body, evidence = EXCLUDED.evidence, report_path = EXCLUDED.report_path`,
-      [id, s.kind, s.title, s.body, JSON.stringify(s.evidence ?? []), reportPath],
-    );
-    rows.push({ id, status: 'pending', created_at: new Date().toISOString(), report_path: reportPath, ...s });
+  const res = await applyScope(store, { kind: 'dream', key: today }, inputsSha, { actor: 'dream', meta: { sessions: digests.length } }, async (w) => {
+    await w.writeFile(reportPath, report);
+    await w.page({
+      path: reportPath,
+      kind: 'dream',
+      generator: 'dream@2',
+      inputs_sha: inputsSha,
+      file_sha: crypto.createHash('sha256').update(report).digest('hex'),
+      regions: [],
+    });
+    await w.deps({ kind: 'page', id: reportPath }, traces.map((t) => ({ kind: 'trace' as const, id: t.id })));
+    for (const s of suggestions) {
+      const id = await w.suggestion({ kind: s.kind, title: s.title, body: s.body, evidence: s.evidence ?? [], reportPath });
+      rows.push({ id, status: 'pending', created_at: new Date().toISOString(), report_path: reportPath, ...s });
+    }
+  });
+  if (res.outcome === 'unchanged') {
+    rows.push(...await store.query<SuggestionRow>(`SELECT * FROM suggestions WHERE report_path = $1 ORDER BY created_at DESC`, [reportPath]));
+  } else if (fs.existsSync(safePath(store.dataDir, reportPath))) {
+    // search projection of the report (indexed as a view)
+    const embedder = opts.embedder ?? createEmbeddingProvider(config.embedding);
+    await applyDocScope({ store, config, embedder }, reportPath, 'wiki', { queueTier1: false, actor: 'dream' });
   }
 
   if (traces.length > 0) {
     const ids = traces.map((t) => t.id);
     const ph = ids.map((_, i) => `$${i + 1}`).join(',');
     await store.query(`UPDATE traces SET analyzed_at = now() WHERE id IN (${ph})`, ids);
+  }
+
+  // context-pack learning: turn recent pack_events into playbook revisions
+  try {
+    const packOpt = await optimizePacks(store, config, llm, { lookbackDays: lookback, onProgress: progress });
+    rows.push(...packOpt.suggestions);
+  } catch (err) {
+    progress(`pack optimization failed: ${err instanceof Error ? err.message : err}`);
+  }
+
+  // the learning loop proper: rank capabilities from receipts, propose recipes
+  // for the plan shapes that keep working, and publish both as readable pages
+  try {
+    const ranking = await writeRankerReport(store);
+    progress(`ranker: ${ranking.rows.length} (slot, capability) pairs → ${ranking.path}`);
+    const evaluation = await evaluatePacks(store, { lookbackDays: lookback });
+    const evalPath = writeEvalReport(store.dataDir, evaluation);
+    progress(`evaluation: precision ${(evaluation.totals.precision * 100).toFixed(0)}% over ${evaluation.totals.reported} reported resolves → ${evalPath}`);
+    const distilled = await distillRecipes(store, { lookbackDays: lookback, onProgress: progress });
+    rows.push(...distilled.suggestions);
+    await staleOrphanedRecipeSuggestions(store);
+  } catch (err) {
+    progress(`learning loop failed: ${err instanceof Error ? err.message : err}`);
   }
 
   await store.setMeta('last_dream', { at: new Date().toISOString(), report: reportPath, sessions: digests.length });
@@ -277,7 +334,7 @@ ${excerpt}`;
   return (res.suggestions ?? [])
     .filter((s) => s && s.title && s.body)
     .map((s) => ({
-      kind: (['skill', 'memory', 'knowledge'] as const).includes(s.kind) ? s.kind : 'knowledge',
+      kind: (['skill', 'memory', 'knowledge'] as string[]).includes(s.kind) ? s.kind : 'knowledge',
       title: String(s.title).slice(0, 200),
       body: String(s.body),
       evidence: Array.isArray(s.evidence) ? s.evidence.map(String).slice(0, 6) : [],
@@ -338,11 +395,16 @@ function renderReport(
   agg: Aggregate,
   suggestions: NewSuggestion[],
   note: string,
+  traceIds: string[] = [],
 ): string {
   const lines = [
     '---',
     `title: Dream ${today}`,
     'type: dream',
+    `description: Agent trace analysis and knowledge-maintenance suggestions for ${today}.`,
+    `timestamp: ${new Date().toISOString()}`,
+    'generated: true',
+    `knode: ${JSON.stringify({ view: 'dream', inputs: { traces: traceIds.slice(0, 200) } })}`,
     '---',
     '',
     `# Dream report — ${today}`,
@@ -363,7 +425,7 @@ function renderReport(
   for (const s of suggestions) {
     lines.push(`### [${s.kind}] ${s.title}`, '', s.body, '');
     if (s.evidence?.length) {
-      lines.push(...s.evidence.map((e) => `> ${e.replace(/\n/g, ' ')}`), '');
+      lines.push(...s.evidence.map((e) => `> ${(typeof e === 'string' ? e : e.text ?? e.path ?? e.id ?? '').replace(/\n/g, ' ')}`), '');
     }
   }
   lines.push('## Sessions', '');
@@ -374,22 +436,21 @@ function renderReport(
   return lines.join('\n');
 }
 
-/** Minute-resolution scheduler: fires runDream once per day at config.dream.schedule. */
-export function startDreamScheduler(
-  store: Store,
-  config: KnodeConfig,
-  llm: LlmClient,
-  log: (msg: string) => void,
-): NodeJS.Timeout {
+/**
+ * Minute-resolution scheduler: fires runDream once per day at the configured
+ * time. Reads `ctx.config`/`ctx.llm` on every tick so runtime config changes
+ * (e.g. from the Settings UI) take effect without a restart.
+ */
+export function startDreamScheduler(ctx: AppContext, log: (msg: string) => void): NodeJS.Timeout {
   let lastRun = '';
   const tick = async () => {
     const now = new Date();
     const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     const today = now.toISOString().slice(0, 10);
-    if (hhmm === config.dream.schedule && lastRun !== today) {
+    if (hhmm === ctx.config.dream.schedule && lastRun !== today) {
       lastRun = today;
       try {
-        const res = await runDream(store, config, llm, { onProgress: log });
+        const res = await runDream(ctx.store, ctx.config, ctx.llm, { onProgress: log });
         log(`nightly dream done: ${res.suggestions.length} suggestions`);
       } catch (err) {
         log(`nightly dream failed: ${err instanceof Error ? err.message : err}`);

@@ -1,4 +1,5 @@
 import { KnodeConfig, loadConfig } from './config.js';
+import { DataSourceRegistry } from './datasource/registry.js';
 import { initDataDir } from './fs/datadir.js';
 import { createEmbeddingProvider, EmbeddingProvider } from './ingest/embeddings.js';
 import { LlmClient } from './llm/client.js';
@@ -11,6 +12,8 @@ export interface AppContext {
   store: Store;
   embedder: EmbeddingProvider;
   llm: LlmClient;
+  /** Lazily-connected external live data sources (mysql / timescale / duckdb). */
+  datasources: DataSourceRegistry;
 }
 
 export async function createContext(dataDir: string): Promise<AppContext> {
@@ -19,5 +22,6 @@ export async function createContext(dataDir: string): Promise<AppContext> {
   const store = await Store.open(dataDir, config.embedding.dimensions);
   const embedder = createEmbeddingProvider(config.embedding);
   const llm = new LlmClient(config.llm);
-  return { dataDir, config, store, embedder, llm };
+  const datasources = new DataSourceRegistry(dataDir, config.datasources);
+  return { dataDir, config, store, embedder, llm, datasources };
 }

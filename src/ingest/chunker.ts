@@ -1,16 +1,10 @@
 import path from 'node:path';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
+import { estimateTokens } from '../llm/tokens.js';
 
 export interface ChunkPiece {
   content: string;
   tokenCount: number;
-}
-
-/** Rough token estimate (≈4 chars/token for English, ~1.6 for CJK — good enough for budgeting). */
-export function estimateTokens(text: string): number {
-  const cjk = (text.match(/[一-鿿぀-ヿ가-힯]/g) ?? []).length;
-  const rest = text.length - cjk;
-  return Math.ceil(rest / 4 + cjk / 1.6);
 }
 
 /**

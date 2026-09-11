@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { KnodeConfig } from '../config.js';
 import { appendLog } from '../fs/datadir.js';
+import { walkAbsolute } from '../fs/files.js';
 import { Store } from '../store/db.js';
 
 /**
@@ -20,10 +21,19 @@ export interface SyncStats {
   skills: number;
 }
 
-const MAX_TRACE_BYTES = 64 * 1024 * 1024;
+export interface SyncTracesOptions {
+  /** Explicit user syncs may import history that predates a workspace reset. */
+  ignoreSince?: boolean;
+}
 
-export async function syncTraces(store: Store, config: KnodeConfig): Promise<SyncStats> {
+const MAX_TRACE_BYTES = 64 * 1024 * 1024;
+const TRACE_SYNC_SINCE_FILE = '.knode/trace-sync-since';
+
+export async function syncTraces(store: Store, config: KnodeConfig, options: SyncTracesOptions = {}): Promise<SyncStats> {
   const stats: SyncStats = { copied: 0, unchanged: 0, skills: 0 };
+  const pauseFile = path.join(store.dataDir, TRACE_SYNC_SINCE_FILE);
+  if (!options.ignoreSince && fs.existsSync(pauseFile)) return stats;
+  if (options.ignoreSince) fs.rmSync(pauseFile, { force: true });
 
   await syncTree(store, config.trace.claudeProjectsDir, path.join(store.dataDir, 'raw/traces/claude'), 'claude', stats);
   await syncTree(store, config.trace.codexSessionsDir, path.join(store.dataDir, 'raw/traces/codex'), 'codex', stats);
@@ -41,9 +51,15 @@ export async function syncTraces(store: Store, config: KnodeConfig): Promise<Syn
   return stats;
 }
 
-async function syncTree(store: Store, srcRoot: string, destRoot: string, source: 'claude' | 'codex', stats: SyncStats): Promise<void> {
+async function syncTree(
+  store: Store,
+  srcRoot: string,
+  destRoot: string,
+  source: 'claude' | 'codex',
+  stats: SyncStats,
+): Promise<void> {
   if (!fs.existsSync(srcRoot)) return;
-  const files = walk(srcRoot).filter((f) => f.endsWith('.jsonl'));
+  const files = walkAbsolute(srcRoot).filter((f) => f.endsWith('.jsonl'));
   for (const absSrc of files) {
     const rel = path.relative(srcRoot, absSrc);
     const absDest = path.join(destRoot, rel);
@@ -109,29 +125,9 @@ function firstTimestamp(file: string): string | null {
   return null;
 }
 
-function walk(root: string): string[] {
-  const out: string[] = [];
-  const visit = (dir: string) => {
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      if (e.name.startsWith('.')) continue;
-      const abs = path.join(dir, e.name);
-      if (e.isDirectory()) visit(abs);
-      else if (e.isFile()) out.push(abs);
-    }
-  };
-  visit(root);
-  return out;
-}
-
 function copyNewer(srcRoot: string, destRoot: string, filter: (f: string) => boolean): number {
   let copied = 0;
-  for (const absSrc of walk(srcRoot)) {
+  for (const absSrc of walkAbsolute(srcRoot)) {
     if (!filter(absSrc)) continue;
     const rel = path.relative(srcRoot, absSrc);
     const absDest = path.join(destRoot, rel);
