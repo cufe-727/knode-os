@@ -1,0 +1,33 @@
+name: knode-stock-demo
+
+services:
+  mysql:
+    image: mysql:8
+    container_name: knode-demo-mysql
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: knode-root
+      MYSQL_DATABASE: market
+      MYSQL_USER: knode
+      MYSQL_PASSWORD: knode
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uknode", "-pknode"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: knode-demo-timescaledb
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: knode
+      POSTGRES_PASSWORD: knode
+      POSTGRES_DB: market
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U knode -d market"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

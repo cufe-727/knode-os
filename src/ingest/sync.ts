@@ -1,0 +1,280 @@
+import fs from 'node:fs';
+import { KnodeConfig, resolveRoutedLlmConfig } from '../config.js';
+import { DataSourceRegistry } from '../datasource/registry.js';
+import { applyDatasourceScopes } from '../datasource/sync.js';
+import { safePath, walkFiles } from '../fs/files.js';
+import { isSidecarPath, removeSidecar } from '../fs/sidecar.js';
+import { buildWikiIndex } from '../graph/wire.js';
+import { DATASOURCES_PREFIX, declaredKey, enumerateDeclared, matchesPrefixes, normalizePrefixes } from '../lineage/declared.js';
+import { recountAll } from '../lineage/fold.js';
+import { appendLedger, nextLedgerSeq, readLedger } from '../lineage/ledger.js';
+import { disposeScope } from '../lineage/scope.js';
+import { ScopeKind, ScopeRow } from '../lineage/types.js';
+import { LlmClient } from '../llm/client.js';
+import { Store } from '../store/db.js';
+import { IngestStats } from '../types.js';
+import { reconcileViews } from '../wiki/pages.js';
+import { applyDocScope } from './apply.js';
+import { cookDocs, cookedRoot } from './cook.js';
+import { COOKED_TRACES, cookEpisodes } from './episode.js';
+import { EmbeddingProvider } from './embeddings.js';
+
+/**
+ * `sync` — configuration reconciliation for knowledge.
+ *
+ *   declared state = files under raw/ (via cooked/), raw/skills, wiki/,
+ *                    purpose.md / schema.md, datasource configs
+ *   running state  = live root scopes
+ *
+ * Diff them and apply / dispose only the delta, then let dependent views
+ * (generated wiki pages) regenerate or archive. Replaces the old full-scan
+ * orphan sweeps: incremental runs (`only`) and watcher-triggered runs dispose
+ * removed sources exactly like a full run does.
+ */
+
+export interface SyncContext {
+  dataDir: string;
+  config: KnodeConfig;
+  store: Store;
+  embedder: EmbeddingProvider;
+  llm: LlmClient;
+  datasources?: DataSourceRegistry;
+}
+
+export interface SyncOptions {
+  /** Restrict to keys under these prefixes (raw/docs/… maps to the cooked twin; 'datasources' selects live sources). */
+  only?: string[];
+  /** Queue changed docs for tier-1 LLM extraction (default: true when llm configured). */
+  llmGraph?: boolean;
+  /** Include datasource scopes (default: full syncs only). */
+  datasources?: boolean;
+  /** Run consistency checks (fold recount, ledger/scopes agreement). */
+  verify?: boolean;
+  actor?: string;
+  /** Transaction time override per source (rebuild replays original apply times when the sha still matches). */
+  at?: (kind: ScopeKind, key: string, sha?: string) => string | undefined;
+  onProgress?: (msg: string) => void;
+}
+
+/** Back-compat options of the former `runIngest`. */
+export interface IngestOptions {
+  only?: string[];
+  llmGraph?: boolean;
+  onProgress?: (msg: string) => void;
+}
+
+export interface SyncVerifyReport {
+  recount: { entities: number; relations: number; claims: number; changed: number };
+  ledgerRepaired: number;
+  pagesMissingFile: string[];
+}
+
+export interface SyncStats extends IngestStats {
+  disposed: number;
+  applied: number;
+  pagesRegenerated: number;
+  pagesArchived: number;
+  pagesDeferred: number;
+  datasourceErrors: string[];
+  verify?: SyncVerifyReport;
+}
+
+// Global sync mutex: startup, watcher, HTTP API, MCP and trace-sync triggered
+// runs serialize here instead of racing on the same sources.
+let syncChain: Promise<unknown> = Promise.resolve();
+
+export async function sync(ctx: SyncContext, opts: SyncOptions = {}): Promise<SyncStats> {
+  const run = syncChain.then(() => syncAll(ctx, opts));
+  syncChain = run.catch(() => {});
+  return run;
+}
+
+/** Former entry point; kept so existing callers and tests keep working. Does not touch datasources. */
+export async function runIngest(
+  store: Store,
+  config: KnodeConfig,
+  embedder: EmbeddingProvider,
+  llm: LlmClient,
+  opts: IngestOptions = {},
+): Promise<SyncStats> {
+  return sync({ dataDir: store.dataDir, config, store, embedder, llm }, {
+    only: opts.only,
+    llmGraph: opts.llmGraph,
+    datasources: false,
+    onProgress: opts.onProgress,
+  });
+}
+
+async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> {
+  const { store, config } = ctx;
+  const stats: SyncStats = {
+    scanned: 0, indexed: 0, unchanged: 0, removed: 0, skipped: 0, errors: 0, chunks: 0, entities: 0, relations: 0,
+    disposed: 0, applied: 0, pagesRegenerated: 0, pagesArchived: 0, pagesDeferred: 0, datasourceErrors: [],
+  };
+  const progress = opts.onProgress ?? (() => {});
+  const actor = opts.actor ?? 'sync';
+  const prefixes = normalizePrefixes(opts.only);
+  const touchesDocs = !prefixes || prefixes.some((p) => p.startsWith('raw/docs') || p.startsWith(cookedRoot()));
+  const touchesTraces = !prefixes || prefixes.some((p) => p.startsWith('raw/traces') || p.startsWith(COOKED_TRACES));
+  const includeDatasources = Boolean(ctx.datasources) && (opts.datasources ?? (!prefixes || prefixes.includes(DATASOURCES_PREFIX)));
+
+  const entityLlm = config.extraction.entityLlm
+    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, config.extraction.tier1Model))
+    : ctx.llm;
+  const queueTier1 = (opts.llmGraph ?? true) && entityLlm.enabled;
+  const documentLlm = new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.documentLlm));
+
+  // L0 → L1: normalize raw/docs into cooked/docs (+ sidecars) before scanning
+  let cookedWanted: Set<string> | undefined;
+  let failedCooked = new Set<string>();
+  if (touchesDocs) {
+    const cook = await cookDocs(ctx.dataDir, store, { vision: documentLlm, onProgress: progress });
+    stats.skipped += cook.skipped;
+    stats.errors += cook.errors;
+    failedCooked = new Set(cook.failed);
+    cookedWanted = new Set(cook.wanted);
+    if (cook.cooked) progress(`cook: ${cook.cooked} normalized`);
+  }
+
+  // L0 → L1 for transcripts: turn-segmented episodes, opt-in per config.
+  // Sweeping stale episodes here rather than after enumeration matters: the
+  // declared set is what sync reconciles against, so the files on disk have to
+  // be final before it is built — otherwise switching `episodes` off would
+  // re-apply the very episodes this pass just deleted.
+  let episodeWanted: Set<string> | undefined;
+  if (touchesTraces) {
+    if (config.trace.episodes) {
+      const episodes = cookEpisodes(ctx.dataDir, { onProgress: progress });
+      stats.skipped += episodes.skipped;
+      episodeWanted = new Set(episodes.wanted);
+      if (episodes.cooked) progress(`episodes: ${episodes.cooked} cooked`);
+    } else {
+      episodeWanted = new Set();
+    }
+    for (const cooked of walkFiles(ctx.dataDir, COOKED_TRACES)) {
+      if (isSidecarPath(cooked) || episodeWanted.has(cooked) || !matchesPrefixes(cooked, prefixes)) continue;
+      fs.rmSync(safePath(ctx.dataDir, cooked), { force: true });
+    }
+  }
+
+  const declared = enumerateDeclared(ctx.dataDir, config, {
+    prefixes: opts.only,
+    includeDatasources,
+    cookedWanted,
+    failedCooked,
+  });
+
+  const runningRows = await store.query<ScopeRow>(
+    `SELECT * FROM scopes WHERE status = 'active' AND parent_id IS NULL AND kind IN ('doc', 'datasource')`,
+  );
+  const running = new Map<string, ScopeRow>();
+  for (const s of runningRows) {
+    if (s.kind === 'doc' && !matchesPrefixes(s.key, prefixes)) continue;
+    if (s.kind === 'datasource' && !includeDatasources) continue;
+    running.set(declaredKey(s.kind, s.key), s);
+  }
+
+  // removed: running but no longer declared → dispose (cascades children, pages)
+  for (const [k, s] of running) {
+    if (declared.has(k)) continue;
+    if (s.kind === 'doc' && failedCooked.has(s.key)) continue; // conversion failed this run — keep the last good state
+    progress(`dispose ${s.kind} ${s.key}`);
+    await disposeScope(store, s.id, { actor, reason: 'removed', at: opts.at?.(s.kind, s.key) });
+    stats.removed++;
+    stats.disposed++;
+  }
+
+  // stale cooked files with neither a raw original nor a live scope
+  if (touchesDocs && cookedWanted) {
+    for (const cooked of walkFiles(ctx.dataDir, cookedRoot())) {
+      if (isSidecarPath(cooked)) continue;
+      if (cookedWanted.has(cooked) || running.has(declaredKey('doc', cooked)) || !matchesPrefixes(cooked, prefixes)) continue;
+      fs.rmSync(safePath(ctx.dataDir, cooked), { force: true });
+      removeSidecar(ctx.dataDir, cooked);
+    }
+  }
+
+  // added / replaced documents
+  const wikiIndex = buildWikiIndex(ctx.dataDir, 'wiki');
+  const docs = [...declared.values()].filter((d) => d.kind === 'doc');
+  const processOne = async (d: (typeof docs)[number]) => {
+    stats.scanned++;
+    try {
+      const r = await applyDocScope(ctx, d.key, d.root ?? 'docs', {
+        queueTier1,
+        actor,
+        at: opts.at?.('doc', d.key, d.sha),
+        wikiIndex,
+        onProgress: progress,
+      });
+      if (r.outcome === 'applied') {
+        stats.indexed++;
+        stats.applied++;
+      } else if (r.outcome === 'unchanged') stats.unchanged++;
+      else stats.skipped++;
+      stats.chunks += r.chunks;
+      stats.entities += r.entities;
+      stats.relations += r.relations;
+    } catch (err) {
+      stats.errors++;
+      const msg = err instanceof Error ? err.message : String(err);
+      progress(`error ${d.key}: ${msg}`);
+      await store.query(
+        `UPDATE documents SET status = 'error', error = $2, updated_at = now() WHERE path = $1`,
+        [d.key, msg.slice(0, 500)],
+      );
+    }
+  };
+  // embedding round-trips dominate; fan files out while scope transactions
+  // serialize on the single PGlite connection underneath
+  const concurrency = Math.max(1, config.ingest.concurrency ?? 1);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, docs.length) }, async () => {
+      while (next < docs.length) await processOne(docs[next++]);
+    }),
+  );
+
+  // live datasources (after documents, so alias resolution sees the doc entities)
+  if (includeDatasources && ctx.datasources) {
+    const ds = await applyDatasourceScopes(ctx, ctx.datasources, { actor, onProgress: progress, at: opts.at });
+    stats.datasourceErrors = ds.errors;
+    stats.pagesRegenerated += ds.wikiPages;
+  }
+
+  // views: archive / regenerate dependents, repair drift
+  const views = await reconcileViews(ctx, { actor, llm: false, onProgress: progress, prefixes });
+  stats.pagesRegenerated += views.regenerated;
+  stats.pagesArchived += views.archived;
+  stats.pagesDeferred += views.deferred;
+
+  if (opts.verify) stats.verify = await verify(ctx, progress);
+  return stats;
+}
+
+async function verify(ctx: SyncContext, progress: (m: string) => void): Promise<SyncVerifyReport> {
+  const recount = await ctx.store.tx((q) => recountAll(q));
+  if (recount.changed) progress(`verify: fold drift repaired on ${recount.changed} rows`);
+
+  // every live scope should have an apply line; backfill missing ones
+  const logged = new Set(readLedger(ctx.dataDir).filter((e) => e.ev === 'apply').map((e) => (e as { scope: { id: string } }).scope.id));
+  const live = await ctx.store.query<ScopeRow>(`SELECT * FROM scopes WHERE status = 'active'`);
+  let repaired = 0;
+  for (const s of live) {
+    if (logged.has(s.id)) continue;
+    const seq = await nextLedgerSeq(ctx.store);
+    appendLedger(ctx.dataDir, {
+      seq,
+      ts: new Date().toISOString(),
+      ev: 'apply',
+      actor: 'verify',
+      scope: { id: s.id, kind: s.kind, key: s.key, sha: s.sha, parent: s.parent_id },
+      stats: { repair: 1 },
+    });
+    repaired++;
+  }
+
+  const pages = await ctx.store.query<{ path: string }>(`SELECT path FROM pages WHERE status <> 'archived'`);
+  const missing = pages.map((p) => p.path.split('#')[0]).filter((p) => !fs.existsSync(safePath(ctx.dataDir, p)));
+  return { recount, ledgerRepaired: repaired, pagesMissingFile: [...new Set(missing)] };
+}
