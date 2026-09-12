@@ -180,8 +180,9 @@ export async function writeRankerReport(store: Store, opts: { intent?: string } 
   const rel = 'wiki/learning/capability-ranking.md';
   const body = [
     '---',
+    'type: report',
     'title: Capability ranking',
-    'generated: true',
+    `generated: { by: "knode-os/capability_ranking", at: "${new Date().toISOString()}" }`,
     '---',
     '',
     '# Capability ranking',

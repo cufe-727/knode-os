@@ -923,7 +923,7 @@ okf
   });
 okf
   .command('migrate')
-  .description('upgrade the native wiki structure to OKF v0.1 while preserving content and extension fields')
+  .description('upgrade the native wiki structure to OKF v0.2 while preserving content and extension fields')
   .option('--dry-run', 'report files that would change without writing them')
   .action((opts) => {
     const dir = dataDir();

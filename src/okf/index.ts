@@ -4,8 +4,70 @@ import matter from 'gray-matter';
 import { safePath } from '../fs/files.js';
 import { initObsidianVault } from '../obsidian/vault.js';
 
-/** Google Cloud Open Knowledge Format version implemented by knode-os. */
-export const OKF_VERSION = '0.1';
+/** Google Open Knowledge Format version implemented by knode-os. */
+export const OKF_VERSION = '0.2';
+
+/**
+ * How a declared bundle version relates to the version we implement (SPEC §12).
+ * Minor bumps are additive, so an older minor is consumable through the §13
+ * fallbacks and a newer minor is consumable by ignoring what we do not know.
+ * Only a major bump may rename required fields, and even then §12 asks us to
+ * try rather than refuse.
+ */
+export type OkfVersionSupport = 'undeclared' | 'current' | 'legacy-minor' | 'newer-minor' | 'unknown-major';
+
+export function classifyOkfVersion(declared: string | null): OkfVersionSupport {
+  if (declared === null) return 'undeclared';
+  if (declared === OKF_VERSION) return 'current';
+  const parsed = /^(\d+)\.(\d+)$/.exec(declared.trim());
+  if (!parsed) return 'unknown-major';
+  const [major, minor] = [Number(parsed[1]), Number(parsed[2])];
+  const [ourMajor, ourMinor] = OKF_VERSION.split('.').map(Number);
+  if (major !== ourMajor) return 'unknown-major';
+  return minor < ourMinor ? 'legacy-minor' : 'newer-minor';
+}
+
+/**
+ * SPEC §5.2 `generated`. v0.1 recorded a concept's last content change as a
+ * bare `timestamp`; v0.2 records who produced it and when. `by` is an actor
+ * (§7): `<producer>/<version>` for tools, `human:<id>`, or `process:<id>`.
+ */
+export interface OkfGenerated {
+  by: string;
+  at: string;
+}
+
+export function okfGenerated(by: string, at: string = new Date().toISOString()): OkfGenerated {
+  return { by, at };
+}
+
+/**
+ * True when a concept records machine authorship. Accepts the v0.2 mapping and
+ * the legacy knode-os boolean `generated: true`, which v0.2 supersedes but
+ * which is still sitting in every data directory written before the upgrade.
+ */
+export function isGeneratedConcept(frontmatter: Record<string, unknown> | undefined | null): boolean {
+  const value = frontmatter?.generated;
+  if (value === true) return true;
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    && typeof (value as Record<string, unknown>).by === 'string';
+}
+
+/**
+ * A concept's last meaningful content change: `generated.at`, falling back to
+ * a legacy v0.1 `timestamp` as SPEC §13.1 permits. Returns null when neither
+ * is present or parseable.
+ */
+export function readGeneratedAt(frontmatter: Record<string, unknown> | undefined | null): string | null {
+  const generated = frontmatter?.generated;
+  if (typeof generated === 'object' && generated !== null && !Array.isArray(generated)) {
+    const at = (generated as Record<string, unknown>).at;
+    if (isIsoDateTime(at)) return at instanceof Date ? at.toISOString() : String(at);
+  }
+  const legacy = frontmatter?.timestamp;
+  if (isIsoDateTime(legacy)) return legacy instanceof Date ? legacy.toISOString() : String(legacy);
+  return null;
+}
 
 export type OkfDiagnosticLevel = 'error' | 'warning';
 
@@ -92,7 +154,7 @@ export function resolveOkfLink(sourceRel: string, href: string): string | null {
   return normalized;
 }
 
-/** Validate a directory against OKF v0.1's three conformance rules. */
+/** Validate a directory against OKF v0.2's three conformance rules (SPEC §11). */
 export function validateOkfBundle(bundleDir: string): OkfValidationResult {
   const root = path.resolve(bundleDir);
   const diagnostics: OkfDiagnostic[] = [];
@@ -155,18 +217,23 @@ export function validateOkfBundle(bundleDir: string): OkfValidationResult {
     if (typeof type !== 'string' || !type.trim()) {
       add('error', 'missing_type', rel, 'Concept frontmatter must contain a non-empty string type.');
     }
-    if (parsed.frontmatter.tags !== undefined && !Array.isArray(parsed.frontmatter.tags)) {
-      add('warning', 'tags_not_list', rel, 'The optional tags field should be a YAML list.');
-    }
-    if (parsed.frontmatter.timestamp !== undefined && !isIsoDateTime(parsed.frontmatter.timestamp)) {
-      add('warning', 'timestamp_not_iso8601', rel, 'The optional timestamp field should be an ISO 8601 datetime.');
-    }
+    validateTrustFields(parsed.frontmatter, rel, add);
   }
 
-  if (known.has('index.md') && version === null) {
-    add('warning', 'version_undeclared', 'index.md', `Bundle does not declare optional okf_version: "${OKF_VERSION}".`);
-  } else if (version !== null && version !== OKF_VERSION) {
-    add('warning', 'unknown_version', 'index.md', `Bundle declares OKF ${version}; this build implements ${OKF_VERSION} and will consume it best-effort.`);
+  const support = classifyOkfVersion(version);
+  if (support === 'undeclared') {
+    if (known.has('index.md')) {
+      add('warning', 'version_undeclared', 'index.md', `Bundle does not declare optional okf_version: "${OKF_VERSION}".`);
+    }
+  } else if (support === 'legacy-minor') {
+    add('warning', 'legacy_version', 'index.md',
+      `Bundle declares OKF ${version}; this build implements ${OKF_VERSION} and reads it through the v0.1 fallbacks (legacy timestamp, body # Citations).`);
+  } else if (support === 'newer-minor') {
+    add('warning', 'newer_minor_version', 'index.md',
+      `Bundle declares OKF ${version}; this build implements ${OKF_VERSION}. Minor versions are additive, so unknown fields are preserved and ignored.`);
+  } else if (support === 'unknown-major') {
+    add('warning', 'unknown_version', 'index.md',
+      `Bundle declares OKF ${version}; this build implements ${OKF_VERSION} and will consume it best-effort.`);
   }
 
   // Broken and out-of-bundle links are deliberately warnings: OKF consumers
@@ -291,7 +358,9 @@ export interface OkfMigrationResult {
 }
 
 /**
- * Upgrade an existing knode-os wiki to the OKF v0.1 structural conventions.
+ * Upgrade an existing knode-os wiki to the OKF v0.2 conventions: declare the
+ * version, give every concept a type, convert the legacy log, and fold the
+ * v0.1 `generated: true` + `timestamp` pair into `generated: { by, at }`.
  * Content and unknown frontmatter keys are preserved; malformed YAML is left
  * untouched and reported in skipped so a human can repair it safely.
  */
@@ -313,10 +382,14 @@ export function migrateWikiToOkf(dataDir: string, dryRun = false): OkfMigrationR
         skipped.push(rel);
         continue;
       }
+      const declared = parsed.frontmatter.okf_version;
       if (!parsed.hasFrontmatter) {
         next = `---\nokf_version: "${OKF_VERSION}"\n---\n\n${raw}`;
-      } else if (parsed.frontmatter.okf_version === undefined) {
+      } else if (declared === undefined) {
         next = injectFrontmatterField(raw, `okf_version: "${OKF_VERSION}"`);
+      } else if (classifyOkfVersion(String(declared)) === 'legacy-minor') {
+        next = replaceInFrontmatter(raw, (block) => block.replace(
+          /^okf_version:[ \t]*.*$/m, `okf_version: "${OKF_VERSION}"`));
       }
     } else if (name === 'index.md') {
       if (parsed.parseError) {
@@ -342,8 +415,11 @@ export function migrateWikiToOkf(dataDir: string, dryRun = false): OkfMigrationR
       }
       if (!parsed.hasFrontmatter) {
         next = `---\ntype: ${JSON.stringify(inferType(rel))}\ntitle: ${JSON.stringify(titleFromBody(raw, rel))}\n---\n\n${raw}`;
-      } else if (typeof parsed.frontmatter.type !== 'string' || !parsed.frontmatter.type.trim()) {
-        next = injectFrontmatterField(raw, `type: ${JSON.stringify(inferType(rel))}`);
+      } else {
+        if (typeof parsed.frontmatter.type !== 'string' || !parsed.frontmatter.type.trim()) {
+          next = injectFrontmatterField(next, `type: ${JSON.stringify(inferType(rel))}`);
+        }
+        next = upgradeGeneratedFrontmatter(next, parsed.frontmatter);
       }
     }
 
@@ -443,6 +519,65 @@ function validateLog(
   }
 }
 
+/**
+ * Soft checks for the v0.2 trust family (SPEC §5.2). None of these can fail a
+ * bundle: §11 forbids rejecting a concept over an optional family.
+ */
+function validateTrustFields(
+  frontmatter: Record<string, unknown>,
+  rel: string,
+  add: (level: OkfDiagnosticLevel, code: string, rel: string, message: string) => void,
+): void {
+  const generated = frontmatter.generated;
+  if (generated === true || generated === false) {
+    add('warning', 'legacy_generated_flag', rel,
+      'generated is a boolean; OKF v0.2 reserves it for { by, at }. Run `knode-os okf migrate` to convert it.');
+  } else if (typeof generated === 'object' && generated !== null && !Array.isArray(generated)) {
+    const { by, at } = generated as Record<string, unknown>;
+    if (typeof by !== 'string' || !by.trim()) {
+      add('warning', 'generated_by_missing', rel, 'generated.by is required within generated and must be an actor string.');
+    }
+    if (at !== undefined && !isIsoDateTime(at)) {
+      add('warning', 'generated_at_not_iso8601', rel, 'generated.at should be an ISO 8601 datetime.');
+    }
+  }
+
+  for (const entry of verifiedEntries(frontmatter.verified)) {
+    if (typeof entry.by !== 'string' || !entry.by.trim()) {
+      add('warning', 'verified_by_missing', rel, 'Each verified entry needs a by actor.');
+    }
+    if (entry.at !== undefined && !isIsoDateTime(entry.at)) {
+      add('warning', 'verified_at_not_iso8601', rel, 'verified[].at should be an ISO 8601 datetime.');
+    }
+  }
+
+  if (frontmatter.status !== undefined && !['draft', 'stable', 'deprecated'].includes(String(frontmatter.status))) {
+    add('warning', 'unknown_status', rel, 'status should be one of draft, stable, deprecated.');
+  }
+  if (frontmatter.stale_after !== undefined && !isIsoDateTime(frontmatter.stale_after)) {
+    add('warning', 'stale_after_not_iso8601', rel, 'stale_after should be an absolute ISO 8601 datetime.');
+  }
+  if (frontmatter.tags !== undefined && !Array.isArray(frontmatter.tags)) {
+    add('warning', 'tags_not_list', rel, 'The optional tags field should be a YAML list.');
+  }
+  if (frontmatter.timestamp !== undefined) {
+    if (!isIsoDateTime(frontmatter.timestamp)) {
+      add('warning', 'timestamp_not_iso8601', rel, 'The optional timestamp field should be an ISO 8601 datetime.');
+    }
+    if (frontmatter.generated === undefined) {
+      add('warning', 'legacy_timestamp', rel,
+        'timestamp is a v0.1 field superseded by generated.at (SPEC §13.1); it is still read as a fallback.');
+    }
+  }
+}
+
+/** SPEC §5.2: a bare verified mapping MUST be read as a one-element list. */
+function verifiedEntries(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) return value.filter((v): v is Record<string, unknown> => typeof v === 'object' && v !== null);
+  if (typeof value === 'object' && value !== null) return [value as Record<string, unknown>];
+  return [];
+}
+
 function finishValidation(
   root: string,
   version: string | null,
@@ -467,6 +602,35 @@ function safeBundleName(value: string): string {
   const name = value.normalize('NFKC').trim().replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^-+|-+$/g, '');
   if (!name || name === '.' || name === '..' || name.startsWith('.')) throw new Error(`Invalid OKF bundle name: ${value}`);
   return name;
+}
+
+/** Rewrite the frontmatter block in place, leaving the body byte-for-byte. */
+function replaceInFrontmatter(raw: string, edit: (block: string) => string): string {
+  const match = /^(---\r?\n)([\s\S]*?)(\r?\n---(?:\r?\n|$))/.exec(raw);
+  if (!match) return raw;
+  const edited = edit(match[2]);
+  if (edited === match[2]) return raw;
+  return match[1] + edited + match[3] + raw.slice(match[0].length);
+}
+
+/**
+ * SPEC §13.1: v0.1 recorded machine authorship as knode-os's `generated: true`
+ * plus a `timestamp`; v0.2 records it as `generated: { by, at }`. The actor is
+ * `knode-os/migrated` because the original producer is no longer recoverable.
+ * A `timestamp` we cannot parse is left alone rather than silently dropped.
+ */
+function upgradeGeneratedFrontmatter(raw: string, frontmatter: Record<string, unknown>): string {
+  if (frontmatter.generated !== true) return raw;
+  const at = readGeneratedAt(frontmatter);
+  const value = at ? `{ by: "knode-os/migrated", at: "${at}" }` : '{ by: "knode-os/migrated" }';
+  return replaceInFrontmatter(raw, (block) => {
+    const eol = block.includes('\r\n') ? '\r\n' : '\n';
+    return block
+      .split(/\r?\n/)
+      .filter((line) => at === null || !/^timestamp:[ \t]/.test(line))
+      .map((line) => (/^generated:[ \t]*true[ \t]*$/.test(line) ? `generated: ${value}` : line))
+      .join(eol);
+  });
 }
 
 function injectFrontmatterField(raw: string, line: string): string {

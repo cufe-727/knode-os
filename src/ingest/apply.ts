@@ -15,6 +15,7 @@ import { applyWirePlan, extractWikilinks, planWireFromMarkdown, WikiIndex } from
 import { isReservedWikiFile } from '../lineage/declared.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
 import { ParsedMarkdown, parseFrontmatter, titleFromMarkdown } from '../markdown.js';
+import { isGeneratedConcept } from '../okf/index.js';
 import { restoreUsageFromSidecar } from '../stats/heat.js';
 import { Store } from '../store/db.js';
 import { DocRoot } from '../types.js';
@@ -81,7 +82,7 @@ async function classify(store: Store, file: string, root: DocRoot, parsed: Parse
   if (root !== 'wiki') return { kind: 'source', graph: true, selfEntity: undefined, humanBody: parsed.body };
   if (isReservedWikiFile(file)) return { kind: 'source', graph: false, selfEntity: false, humanBody: parsed.body };
   const [pageRow] = await store.query<{ status: string }>(`SELECT status FROM pages WHERE path = $1 AND tx_to IS NULL`, [file]);
-  const generated = pageRow !== undefined || parsed.frontmatter.generated === true;
+  const generated = pageRow !== undefined || isGeneratedConcept(parsed.frontmatter);
   if (generated) {
     // legacy generated pages without markers are fully managed
     const humanBody = hasRegions(parsed.body) ? stripRegions(parsed.body) : '';

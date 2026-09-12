@@ -36,14 +36,20 @@ export { live, validAt, entitiesAsOf, relationsAsOf, claimsAsOf, type Temporal }
 export { buildContextPack, type ContextPack } from './pack/pack.js';
 export {
   OKF_VERSION,
+  classifyOkfVersion,
   validateOkfBundle,
   migrateWikiToOkf,
   importOkfBundle,
   exportOkfBundle,
   extractMarkdownLinks,
   resolveOkfLink,
+  okfGenerated,
+  isGeneratedConcept,
+  readGeneratedAt,
   type OkfDiagnostic,
+  type OkfGenerated,
   type OkfValidationResult,
+  type OkfVersionSupport,
 } from './okf/index.js';
 export {
   OBSIDIAN_APP_CONFIG,
