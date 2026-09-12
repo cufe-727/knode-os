@@ -150,8 +150,9 @@ export function writeEvalReport(dataDir: string, report: EvalReport): string {
   const pct = (n: number) => `${(n * 100).toFixed(0)}%`;
   const body = [
     '---',
+    'type: report',
     'title: Context pack evaluation',
-    'generated: true',
+    `generated: { by: "knode-os/pack_evaluation", at: "${report.generatedAt}" }`,
     '---',
     '',
     '# Context pack evaluation',

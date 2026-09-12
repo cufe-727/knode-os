@@ -5,7 +5,7 @@
 ## 1. 目标
 
 每个由 knode-os 创建的知识 bundle 都可以直接作为 Obsidian Vault 打开，
-同时继续满足 OKF v0.1，并保持 knode-os 的摄入、检索和知识图谱语义。
+同时继续满足 OKF v0.2，并保持 knode-os 的摄入、检索和知识图谱语义。
 
 Obsidian 的存储模型非常适合这一目标：Vault 就是包含子目录的本地文件夹，笔记
 是普通 Markdown，Vault 根的 `.obsidian/` 保存该 Vault 的设置。Obsidian 会监测
@@ -68,12 +68,13 @@ cache；Obsidian 官方也建议 Git Vault 忽略 workspace 布局状态。
 ### Properties
 
 OKF frontmatter 同时就是 Obsidian Properties。`type`、`title`、`description`、
-`resource`、`tags`、`timestamp`、`aliases` 以及生产者扩展字段均可保留。生成器
-使用现代复数字段 `tags`、`aliases`，不使用 Obsidian 已弃用的 `tag`、`alias`、
-`cssclass`。
+`resource`、`tags`、`aliases` 以及生产者扩展字段均可保留。生成器使用现代复数
+字段 `tags`、`aliases`，不使用 Obsidian 已弃用的 `tag`、`alias`、`cssclass`。
 
-Obsidian 不在可视化 Properties 编辑器中完整支持嵌套属性；遇到外部 OKF bundle
-的嵌套扩展字段时，文件仍然有效，可在 Source mode 编辑，knode-os 不会压平它。
+Obsidian 不在可视化 Properties 编辑器中完整支持嵌套属性。OKF v0.2 的
+`generated: { by, at }`、`verified`、`sources` 都是嵌套结构，因此生成器统一写成
+单行 flow mapping：文件仍然有效，在 Properties 面板中折叠显示，可在 Source mode
+直接编辑，knode-os 不会压平它。
 
 ### 内部链接
 

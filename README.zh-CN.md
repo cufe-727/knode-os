@@ -18,7 +18,7 @@ knode-os 结合了两个项目的核心思想:[llm_wiki](https://github.com/nash
 - **Context Pack。** `knode-os pack "<语句>"`(或 MCP 工具 `knode_context_pack`)自动匹配语句中的实体,沿图谱展开(文档 chunk、带 `STALE`/`CONFLICT` 标记的时效断言、关联的实时表),按 playbook 执行实时探针查询(带 asOf 时间戳、短 TTL 缓存、绝不落库),并输出缺口分析和可直接执行的后续 SQL。
 - **会学习的 playbook。** Context pack 由 agent 可编辑的 `packs/*.md` 工作流驱动;每次构建记录到 `pack_events`,`knode-os pack-optimize`(也随夜间 dream 运行)把失败/缺口模式转化为完整的 playbook 修订建议——接受后直接写回 `packs/`,下一次查询就跑在更好的脚本上。
 - **MCP 服务**:Claude Code / Codex(命令行或 App)可直接搜索、提问、读写、grep、对实时数据源执行原生 SQL、构建 context pack。
-- **Google OKF v0.1 原生兼容**:`wiki/` 本身就是一个可移植的 Open Knowledge Format bundle；支持规范校验、旧库迁移、外部 bundle 无损导入/导出，OKF 普通 Markdown 链接会进入知识图谱。未知类型、扩展 frontmatter 和断链按规范宽容处理。
+- **Google OKF v0.2 原生兼容**:`wiki/` 本身就是一个可移植的 Open Knowledge Format bundle；支持规范校验、版本路由、旧库迁移、外部 bundle 无损导入/导出，OKF 普通 Markdown 链接会进入知识图谱。v0.2 的溯源/信任/生命周期字段(`generated`、`verified`、`status`、`stale_after`)会被识别,v0.1 bundle 仍按规范给出的回退路径读取。未知类型、扩展 frontmatter 和断链按规范宽容处理。
 - **原生 Obsidian Vault**:`wiki/` 可直接在 Obsidian 中作为 Vault 打开，内置 Vault 配置与附件目录；支持 Properties、别名、标签、`[[Wikilink]]`、路径链接、标题/块引用和 `![[嵌入]]`。OKF 导入和导出的每个知识 bundle 也自动是独立 Vault。
 - **`ask`**:基于知识库的带引用问答,并显式列出"知识库还缺什么"。
 
@@ -55,7 +55,7 @@ node dist/cli.js serve --data ~/knode-data
 │   └── docs/           # 文本、PDF、图片统一转换出的 Markdown(实际索引层),以及
 │                       # <name>.knode.json sidecar(元数据、LLM 抽取结果、
 │                       # 使用热度),重建数据库也不会丢失
-├── wiki/                 # 原生 OKF v0.1 bundle + Obsidian Vault
+├── wiki/                 # 原生 OKF v0.2 bundle + Obsidian Vault
 │   ├── .obsidian/        # Vault 配置(已有设置绝不覆盖)
 │   ├── attachments/      # Obsidian 附件
 │   ├── index.md  overview.md  log.md
@@ -145,8 +145,8 @@ knode-os graph [q] [--depth n] [--as-of iso] [--valid-at iso] [--insights] [--js
                               (无查询时输出高频实体概览;--as-of 从 evidence 现算当时的图)
 knode-os obsidian init [dir]           初始化/修复 Obsidian Vault(默认 <data>/wiki)
 knode-os obsidian status [dir]         检查 Vault 是否可直接打开
-knode-os okf validate [bundle] [--json]  校验 OKF v0.1(默认校验 <data>/wiki)
-knode-os okf migrate [--dry-run]         将旧版 wiki 结构迁移到 OKF v0.1
+knode-os okf validate [bundle] [--json]  校验 OKF v0.2(默认校验 <data>/wiki)
+knode-os okf migrate [--dry-run]         将旧版 wiki 结构迁移到 OKF v0.2
 knode-os okf import <bundle> [--name n]  无损导入到 raw/docs/okf/<name>
 knode-os okf export <dir>                校验并导出原生 wiki bundle
 knode-os wiki generate        生成文档摘要页与实体页

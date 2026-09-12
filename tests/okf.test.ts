@@ -7,10 +7,13 @@ import { createContext } from '../src/context.js';
 import { runIngest } from '../src/ingest/pipeline.js';
 import { getObsidianVaultStatus } from '../src/obsidian/vault.js';
 import {
+  classifyOkfVersion,
   exportOkfBundle,
   extractMarkdownLinks,
   importOkfBundle,
+  isGeneratedConcept,
   migrateWikiToOkf,
+  readGeneratedAt,
   resolveOkfLink,
   validateOkfBundle,
 } from '../src/okf/index.js';
@@ -39,6 +42,46 @@ describe('OKF validation', () => {
     expect(result.valid).toBe(true);
     expect(result.version).toBe('0.1');
     expect(result).toMatchObject({ files: 4, concepts: 2, indexes: 1, logs: 1, errors: 0 });
+    // a v0.1 bundle stays consumable; the older minor is a warning, not an error
+    expect(result.diagnostics.map((d) => d.code)).toContain('legacy_version');
+  });
+
+  it('routes declared versions by major and minor (SPEC §12)', () => {
+    expect(classifyOkfVersion(null)).toBe('undeclared');
+    expect(classifyOkfVersion('0.2')).toBe('current');
+    expect(classifyOkfVersion('0.1')).toBe('legacy-minor');
+    expect(classifyOkfVersion('0.7')).toBe('newer-minor');
+    expect(classifyOkfVersion('1.0')).toBe('unknown-major');
+    expect(classifyOkfVersion('draft')).toBe('unknown-major');
+
+    const root = path.join(tmp, 'future');
+    write(root, 'index.md', '---\nokf_version: "9.0"\n---\n\n# Index\n');
+    write(root, 'thing.md', '---\ntype: Concept\n---\n\n# Thing\n');
+    const result = validateOkfBundle(root);
+    expect(result.valid).toBe(true);
+    expect(result.diagnostics.map((d) => d.code)).toContain('unknown_version');
+  });
+
+  it('warns on the v0.1 trust shapes it still accepts', () => {
+    const root = path.join(tmp, 'trust');
+    write(root, 'legacy.md', '---\ntype: Concept\ngenerated: true\ntimestamp: 2026-07-18T10:00:00Z\n---\n\n# Legacy\n');
+    write(root, 'modern.md', '---\ntype: Concept\ngenerated: { at: 2026-07-18T10:00:00Z }\nstatus: retired\nverified: { by: human:me, at: nope }\n---\n\n# Modern\n');
+    const result = validateOkfBundle(root);
+    expect(result.valid).toBe(true);
+    expect(result.diagnostics.map((d) => d.code)).toEqual(expect.arrayContaining([
+      'legacy_generated_flag', 'generated_by_missing', 'verified_at_not_iso8601', 'unknown_status',
+    ]));
+  });
+
+  it('reads generated.at with a legacy timestamp fallback (SPEC §13.1)', () => {
+    expect(readGeneratedAt({ generated: { by: 'knode-os/dream', at: '2026-09-01T00:00:00Z' } }))
+      .toBe('2026-09-01T00:00:00Z');
+    expect(readGeneratedAt({ timestamp: '2026-07-18T10:00:00Z' })).toBe('2026-07-18T10:00:00Z');
+    expect(readGeneratedAt({ generated: true, timestamp: 'someday' })).toBeNull();
+    expect(isGeneratedConcept({ generated: true })).toBe(true);
+    expect(isGeneratedConcept({ generated: { by: 'human:me' } })).toBe(true);
+    expect(isGeneratedConcept({ generated: { at: '2026-09-01T00:00:00Z' } })).toBe(false);
+    expect(isGeneratedConcept({})).toBe(false);
   });
 
   it('rejects missing type/frontmatter and malformed reserved files', () => {
@@ -84,7 +127,7 @@ describe('native wiki OKF compatibility', () => {
     appendLog(data, 'wiki', 'created a concept');
     const result = validateOkfBundle(path.join(data, 'wiki'));
     expect(result.valid).toBe(true);
-    expect(result.version).toBe('0.1');
+    expect(result.version).toBe('0.2');
     const log = fs.readFileSync(path.join(data, 'wiki/log.md'), 'utf8');
     expect(log).toMatch(/^## \d{4}-\d{2}-\d{2}$/m);
     expect(log).toContain('* **wiki**: created a concept');
@@ -97,11 +140,24 @@ describe('native wiki OKF compatibility', () => {
     write(data, 'wiki/overview.md', '# Overview\n\nLegacy text.\n');
     write(data, 'wiki/sources/index.md', '---\ntitle: Sources\ntype: source\ngenerated: true\n---\n\n# Sources\n');
     write(data, 'wiki/log.md', '# Operation log\n\n- 2026-07-18T10:00:00.000Z dream: kept detail\n');
+    write(data, 'wiki/entities/acme.md', '---\ntype: entity\ntitle: Acme\ntimestamp: 2026-07-18T10:00:00.000Z\ngenerated: true\naliases: [acme-corp]\n---\n\n# Acme\n');
+    write(data, 'wiki/entities/hand-written.md', '---\ntype: entity\ntimestamp: 2026-07-18T10:00:00.000Z\n---\n\n# Hand written\n');
     const migrated = migrateWikiToOkf(data);
-    expect(migrated.changed).toEqual(expect.arrayContaining(['index.md', 'overview.md', 'sources/index.md', 'log.md']));
+    expect(migrated.changed).toEqual(expect.arrayContaining(['index.md', 'overview.md', 'sources/index.md', 'log.md', 'entities/acme.md']));
     expect(migrated.validation.valid).toBe(true);
     expect(fs.readFileSync(path.join(data, 'wiki/sources/index.md'), 'utf8')).not.toContain('generated: true');
     expect(fs.readFileSync(path.join(data, 'wiki/log.md'), 'utf8')).toContain('* **dream**: kept detail');
+
+    // the root index moves to the version this build implements
+    expect(fs.readFileSync(path.join(data, 'wiki/index.md'), 'utf8')).toContain('okf_version: "0.2"');
+    // generated: true + timestamp folds into generated: { by, at }, extensions intact
+    const acme = fs.readFileSync(path.join(data, 'wiki/entities/acme.md'), 'utf8');
+    expect(acme).toContain('generated: { by: "knode-os/migrated", at: "2026-07-18T10:00:00.000Z" }');
+    expect(acme).not.toContain('timestamp:');
+    expect(acme).toContain('aliases: [acme-corp]');
+    // a page nobody claimed to generate keeps its timestamp; we do not invent provenance
+    expect(fs.readFileSync(path.join(data, 'wiki/entities/hand-written.md'), 'utf8')).toContain('timestamp: 2026-07-18T10:00:00.000Z');
+    expect(migrated.changed).not.toContain('entities/hand-written.md');
   });
 });
 

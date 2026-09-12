@@ -128,6 +128,9 @@ struct TreeNode: Decodable, Identifiable, Hashable {
 struct FileResponse: Decodable {
     var path: String
     var content: String
+    /// Size on disk, which is larger than `content` when the read was capped.
+    var bytes: Int?
+    var truncated: Bool?
 }
 
 struct ResolvedLinkResponse: Decodable {
@@ -278,6 +281,13 @@ struct IngestStats: Codable {
 struct UploadResponse: Decodable {
     var ok: Bool
     var saved: [String]
+}
+
+/// One file in a multipart upload. `name` is the path relative to the
+/// destination directory, so a folder upload keeps its subtree ("notes/2026/kickoff.md").
+struct UploadItem {
+    var name: String
+    var url: URL
 }
 
 struct ActionResponse: Decodable {

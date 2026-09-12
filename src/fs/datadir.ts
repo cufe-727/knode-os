@@ -77,13 +77,17 @@ Structural rules the wiki follows. Edit freely — generators respect this file.
 
 ## Conventions
 
-- The \`wiki/\` directory is an OKF v0.1 knowledge bundle and a standalone
+- The \`wiki/\` directory is an OKF v0.2 knowledge bundle and a standalone
   Obsidian Vault. Open that folder directly in Obsidian; Vault settings live
   in \`wiki/.obsidian/\`, and attachments go to \`wiki/attachments/\`.
 - Every concept page starts with YAML frontmatter; \`type\` is required, while
-  \`title\`, \`description\`, \`resource\`, \`tags\`, and \`timestamp\` are recommended.
+  \`title\`, \`description\`, \`resource\`, and \`tags\` are recommended.
+- Provenance and trust are optional frontmatter families: \`sources\`,
+  \`generated: { by, at }\`, \`verified\`, \`status\`, \`stale_after\`. \`by\` is an
+  actor: \`human:<id>\`, \`process:<id>\`, or \`<producer>/<version>\`. Generated
+  pages carry \`generated\`; v0.1's bare \`timestamp\` is still read as a fallback.
 - \`index.md\` and \`log.md\` are reserved OKF files. Only the root index may
-  carry frontmatter, where it declares \`okf_version: "0.1"\`.
+  carry frontmatter, where it declares \`okf_version: "0.2"\`.
 - Cross-reference with ordinary markdown links (OKF + Obsidian) or Obsidian
   \`[[wikilinks]]\`, aliases, heading/block links and embeds; all are understood
   by the knowledge graph.
@@ -92,7 +96,7 @@ Structural rules the wiki follows. Edit freely — generators respect this file.
 `;
 
 const INDEX_TEMPLATE = `---
-okf_version: "0.1"
+okf_version: "0.2"
 ---
 
 # Index
@@ -174,7 +178,7 @@ export function initDataDir(dataDir: string): InitResult {
   return { created, dataDir };
 }
 
-/** Append an OKF v0.1 date-grouped entry to wiki/log.md, newest first. */
+/** Append an OKF date-grouped entry to wiki/log.md, newest first. */
 export function appendLog(dataDir: string, op: string, detail: string): void {
   const file = path.join(dataDir, 'wiki', 'log.md');
   const now = new Date();

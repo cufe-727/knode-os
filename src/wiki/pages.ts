@@ -19,6 +19,7 @@ import { addBudgetUse, budgetUsedToday } from '../llm/budget.js';
 import { LlmClient } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { applyScope } from '../lineage/scope.js';
+import { isGeneratedConcept, okfGenerated } from '../okf/index.js';
 import { getDocHeat } from '../stats/heat.js';
 import { Store } from '../store/db.js';
 import { toDateString } from '../store/temporal.js';
@@ -137,8 +138,7 @@ const entityStub: PageGenerator = {
         title: e.name,
         type: e.type,
         aliases: Array.isArray(e.aliases) ? e.aliases : [],
-        timestamp: new Date().toISOString(),
-        generated: true,
+        generated: okfGenerated('knode-os/entity_stub'),
         knode: knodeMeta('entity_stub', { entities: [e.id], claims: claims.map((c) => c.id) }),
       },
       regions: { body: lines.join('\n') },
@@ -179,9 +179,15 @@ const sourceSummary: PageGenerator = {
     const sidecar = readSidecar(ctx.dataDir, doc.path);
     const cached = sidecar?.views?.sourceSummary;
     let body: string;
+    // generated.by/at describe the body we are about to write, so a cache hit
+    // reports the model and instant that produced it, not this regeneration.
+    let by: string;
+    let at: string;
     const llm = documentSummaryLlm(ctx);
     if (cached && cached.contentSha === doc.sha256) {
       body = cached.body;
+      by = cached.model;
+      at = cached.generatedAt;
     } else {
       if (!llm.enabled) return null;
       const abs = safePath(ctx.dataDir, doc.path);
@@ -195,8 +201,10 @@ const sourceSummary: PageGenerator = {
         { role: 'user', content: `Source file: ${doc.path}\n\n${content}` },
       ], { maxTokens: 1200 });
       await addBudgetUse(ctx.store, cost);
+      by = llm.label;
+      at = new Date().toISOString();
       updateSidecar(ctx.dataDir, doc.path, (s) => {
-        s.views = { ...(s.views ?? {}), sourceSummary: { contentSha: doc.sha256, model: llm.label, body, generatedAt: new Date().toISOString() } };
+        s.views = { ...(s.views ?? {}), sourceSummary: { contentSha: doc.sha256, model: llm.label, body, generatedAt: at } };
       });
     }
     const heat = (await getDocHeat(ctx.store, [doc.id], ctx.config.heat)).get(doc.id) ?? 0;
@@ -206,10 +214,9 @@ const sourceSummary: PageGenerator = {
         title,
         type: 'source',
         description: `Summary of ${doc.path}.`,
-        timestamp: new Date().toISOString(),
         source: doc.path,
         heat: Number(heat.toFixed(3)),
-        generated: true,
+        generated: okfGenerated(`knode-os/${by}`, at),
         knode: knodeMeta('source_summary', { documents: [doc.path] }),
       },
       regions: { body: body.trim() },
@@ -267,7 +274,7 @@ const dataset: PageGenerator = {
         source_kind: d.kind,
         row_count: d.row_count ?? 'unknown',
         refreshed,
-        generated: true,
+        generated: okfGenerated('knode-os/dataset'),
         knode: knodeMeta('dataset', { datasets: [d.id], entities: linked.map((e) => e.id) }),
       },
       regions: { body: renderDatasetBody({ ...d, refreshed_at: refreshed }, linked.map((e) => e.name), sample) },
@@ -455,9 +462,13 @@ const conceptCluster: PageGenerator = {
     const all = [a, ...members];
     const cached = readPageCache(ctx.dataDir, pagePath);
     let body: string;
+    let by: string;
+    let at: string;
     const llm = conceptLlm(ctx);
     if (cached && cached.inputsSha === plan.inputsSha) {
       body = cached.body;
+      by = cached.model;
+      at = cached.generatedAt;
     } else {
       if (!llm.enabled) return null;
       const ids = all.map((e) => e.id);
@@ -483,15 +494,16 @@ const conceptCluster: PageGenerator = {
       if (cost > budgetLeft) return null;
       body = await llm.complete([{ role: 'system', content: COMMUNITY_SYSTEM }, { role: 'user', content: prompt }], { maxTokens: 800 });
       await addBudgetUse(ctx.store, cost);
-      writePageCache(ctx.dataDir, pagePath, { inputsSha: plan.inputsSha, model: llm.label, body, generatedAt: new Date().toISOString() });
+      by = llm.label;
+      at = new Date().toISOString();
+      writePageCache(ctx.dataDir, pagePath, { inputsSha: plan.inputsSha, model: llm.label, body, generatedAt: at });
     }
     return {
       frontmatter: {
         title: `${a.name} cluster`,
         type: 'concept',
         entities: all.slice(0, 15).map((e) => e.name),
-        generated: true,
-        timestamp: new Date().toISOString(),
+        generated: okfGenerated(`knode-os/${by}`, at),
         knode: knodeMeta('concept_cluster', { entities: all.map((e) => e.id) }),
       },
       regions: { body: body.trim() },
@@ -559,7 +571,7 @@ export function composePage(existing: string | null, frontmatter: Record<string,
   }
   let body = parsed.content;
   // a legacy fully-generated page (no markers) is managed wholesale
-  if (!hasRegions(body) && data.generated === true && Object.keys(regions).length > 0) body = '';
+  if (!hasRegions(body) && isGeneratedConcept(data) && Object.keys(regions).length > 0) body = '';
   for (const [id, c] of Object.entries(regions)) body = replaceRegion(body, id, c);
   body = body.replace(/^\n+/, '').replace(/\n{3,}/g, '\n\n').trimEnd();
   const hadFrontmatter = FRONTMATTER_RE.test(existing);
@@ -608,7 +620,7 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
   if (gen.mode === 'file' && existing && !row) {
     let generated = false;
     try {
-      generated = matter(existing).data.generated === true;
+      generated = isGeneratedConcept(matter(existing).data as Record<string, unknown>);
     } catch {
       generated = false;
     }

@@ -16,7 +16,8 @@ import {
   saveConfig,
 } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
-import { assertWritablePath, grepFiles, listTree, makeDir, movePath, pathExists, readFileText, removePath, safePath, writeFileBytes, writeFileText } from '../fs/files.js';
+import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
+import { assertWritablePath, grepFiles, listTree, makeDir, movePath, pathExists, readFileTextCapped, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
 import { graphInsights, graphOverview, graphSearch } from '../graph/query.js';
 import { buildContextPack } from '../pack/pack.js';
 import { applySuggestion } from '../pack/learn.js';
@@ -375,7 +376,10 @@ export function createApp(
     try {
       const p = c.req.query('path');
       if (!p) return c.json({ error: 'path required' }, 400);
-      return c.json({ path: p, content: readFileText(ctx.dataDir, p) });
+      const asked = Number(c.req.query('maxBytes'));
+      const cap = Number.isFinite(asked) && asked > 0 ? Math.min(asked, MAX_FILE_BYTES) : MAX_PREVIEW_BYTES;
+      const file = readFileTextCapped(ctx.dataDir, p, cap);
+      return c.json({ path: p, content: file.content, bytes: file.bytes, truncated: file.truncated });
     } catch (e) {
       return c.json(err(e), 404);
     }
@@ -431,22 +435,37 @@ export function createApp(
     const ctx = requestCtx(c);
     try {
       const { path: p } = await c.req.json<{ path: string }>();
-      assertWritablePath(p);
-      makeDir(ctx.dataDir, p);
-      return c.json({ ok: true });
+      const rel = sanitizeRelativePath(p ?? '');
+      if (!rel) return c.json({ error: 'path required' }, 400);
+      assertWritablePath(rel);
+      makeDir(ctx.dataDir, rel);
+      return c.json({ ok: true, path: rel });
     } catch (e) {
       return c.json(err(e), 400);
     }
   });
 
+  // A move is a pure filesystem operation: the doc's scope key is its path, so
+  // the knowledge only follows once an ingest reconciles the old key away and
+  // applies the new one. Batch callers move everything first and ingest once,
+  // the way uploads do — syncing per file would re-cook raw/docs each time.
   app.post('/api/mv', async (c) => {
     const ctx = requestCtx(c);
     try {
       const { from, to } = await c.req.json<{ from: string; to: string }>();
-      assertWritablePath(from);
-      assertWritablePath(to);
-      movePath(ctx.dataDir, from, to);
-      return c.json({ ok: true });
+      if (!from || !to) return c.json({ error: 'from and to required' }, 400);
+      const src = sanitizeRelativePath(from);
+      const dst = sanitizeRelativePath(to);
+      if (!src || !dst) return c.json({ error: 'from and to required' }, 400);
+      assertWritablePath(src);
+      assertWritablePath(dst);
+      if (src === dst) return c.json({ ok: true, from: src, to: dst });
+      // renameSync replaces the destination without a word, which in a batch
+      // move would silently destroy a same-named file already sitting there
+      if (pathExists(ctx.dataDir, dst)) return c.json({ error: `already exists: ${dst}` }, 409);
+      if (!pathExists(ctx.dataDir, src)) return c.json({ error: `no such path: ${src}` }, 404);
+      movePath(ctx.dataDir, src, dst);
+      return c.json({ ok: true, from: src, to: dst });
     } catch (e) {
       return c.json(err(e), 400);
     }
@@ -456,22 +475,26 @@ export function createApp(
     const ctx = requestCtx(c);
     try {
       const form = await c.req.formData();
-      const dir = (form.get('dir') as string) || 'raw/docs';
+      // sanitize before the prefix check: "raw/docs/../../x" would pass it
+      const dir = sanitizeRelativePath((form.get('dir') as string) || '') || 'raw/docs';
       if (!/^(raw\/docs|wiki)(\/|$)/.test(dir)) return c.json({ error: 'uploads go to raw/docs or wiki' }, 400);
       const saved: string[] = [];
       for (const [, v] of form.entries()) {
-        if (v instanceof File) {
-          const rel = `${dir}/${v.name}`.replace(/\/+/g, '/');
-          if (pathExists(ctx.dataDir, rel)) {
-            const ext = path.extname(v.name);
-            const stem = v.name.slice(0, v.name.length - ext.length);
-            const alt = `${dir}/${stem}-${Date.now()}${ext}`;
-            writeFileBytes(ctx.dataDir, alt, new Uint8Array(await v.arrayBuffer()));
-            saved.push(alt);
-          } else {
-            writeFileBytes(ctx.dataDir, rel, new Uint8Array(await v.arrayBuffer()));
-            saved.push(rel);
-          }
+        if (!(v instanceof File)) continue;
+        // folder uploads carry the path inside the dropped folder as the
+        // filename ("notes/2026/kickoff.md"), so the subtree is recreated
+        const name = sanitizeRelativePath(v.name);
+        if (!name) continue;
+        const rel = `${dir}/${name}`.replace(/\/+/g, '/');
+        if (pathExists(ctx.dataDir, rel)) {
+          const ext = path.extname(name);
+          const stem = name.slice(0, name.length - ext.length);
+          const alt = `${dir}/${stem}-${Date.now()}${ext}`;
+          writeFileBytes(ctx.dataDir, alt, new Uint8Array(await v.arrayBuffer()));
+          saved.push(alt);
+        } else {
+          writeFileBytes(ctx.dataDir, rel, new Uint8Array(await v.arrayBuffer()));
+          saved.push(rel);
         }
       }
       return c.json({ ok: true, saved });

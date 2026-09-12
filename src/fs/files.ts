@@ -54,6 +54,39 @@ export function readFileText(dataDir: string, rel: string): string {
   return fs.readFileSync(safePath(dataDir, rel), 'utf8');
 }
 
+export interface CappedText {
+  content: string;
+  /** Size of the file on disk, not of `content`. */
+  bytes: number;
+  truncated: boolean;
+}
+
+/**
+ * Read at most `maxBytes` of a text file. Preview surfaces must never pull a
+ * multi-megabyte document into memory (and then into a single text view), so
+ * they read through here and render `truncated` as read-only.
+ */
+export function readFileTextCapped(dataDir: string, rel: string, maxBytes: number): CappedText {
+  const abs = safePath(dataDir, rel);
+  const bytes = fs.statSync(abs).size;
+  if (bytes <= maxBytes) return { content: fs.readFileSync(abs, 'utf8'), bytes, truncated: false };
+
+  const buf = Buffer.alloc(maxBytes);
+  const fd = fs.openSync(abs, 'r');
+  let read: number;
+  try {
+    read = fs.readSync(fd, buf, 0, maxBytes, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  // The cut lands at an arbitrary byte, so drop the partial trailing rune and
+  // then the partial trailing line.
+  let content = buf.subarray(0, read).toString('utf8').replace(/\uFFFD+$/, '');
+  const lastNewline = content.lastIndexOf('\n');
+  if (lastNewline > 0) content = content.slice(0, lastNewline);
+  return { content, bytes, truncated: true };
+}
+
 export function writeFileText(dataDir: string, rel: string, content: string): void {
   const abs = safePath(dataDir, rel);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
@@ -84,6 +117,24 @@ export function makeDir(dataDir: string, rel: string): void {
 
 export function pathExists(dataDir: string, rel: string): boolean {
   return fs.existsSync(safePath(dataDir, rel));
+}
+
+/**
+ * Normalize a client-supplied name into a relative posix path.
+ *
+ * Folder uploads send each file's path inside the dropped folder as its
+ * multipart filename, so nested names are expected — but `..` must never
+ * escape the destination directory. `safePath` alone is not enough here:
+ * `raw/docs/../../purpose.md` still resolves inside the data directory and
+ * would overwrite a root file. Returns '' when nothing usable is left.
+ */
+export function sanitizeRelativePath(name: string): string {
+  return name
+    .replace(/\\/g, '/')
+    .split('/')
+    .map((segment) => segment.trim())
+    .filter((segment) => segment && segment !== '.' && segment !== '..')
+    .join('/');
 }
 
 /** Roots that external interfaces (HTTP / MCP) may write to. Everything else is read-only. */

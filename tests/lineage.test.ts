@@ -305,7 +305,7 @@ title: 比亚迪观察
     expect(created).toContain(pagePath);
     const file = fs.readFileSync(path.join(dataDir, pagePath), 'utf8');
     expect(file).toContain('<!-- knode:begin body -->');
-    expect(file).toContain('generated: true');
+    expect(file).toContain('by: knode-os/entity_stub');
     const [page] = await store.query<{ status: string; kind: string }>(`SELECT status, kind FROM pages WHERE path = $1`, [pagePath]);
     expect(page).toMatchObject({ status: 'active', kind: 'entity_stub' });
     const deps = await store.query<{ input_kind: string; input_id: string; required: boolean }>(`SELECT input_kind, input_id, required FROM deps WHERE artifact_id = $1`, [pagePath]);

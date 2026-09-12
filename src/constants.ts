@@ -14,3 +14,6 @@ export const LLM_WIKI_INPUT_CHARS = 14_000;
 
 /** Per-chunk text sent to the embeddings endpoint is truncated here. */
 export const EMBED_INPUT_CHARS = 8_000;
+
+/** Preview reads (`GET /api/file`) stop here; larger files come back truncated and read-only. */
+export const MAX_PREVIEW_BYTES = 256 * 1024;

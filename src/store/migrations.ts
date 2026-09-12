@@ -615,6 +615,10 @@ export const MIGRATIONS: Migration[] = [
     version: 2,
     name: 'lineage',
     up: async (q, ctx) => {
+      // Early pre-lineage builds are treated as v1 but did not yet include
+      // datasets, pack_events, or suggestions.payload. Complete that baseline
+      // inside this migration's transaction before altering those objects.
+      if (ctx.from >= 1) await execScript(q, V1_BASELINE);
       await execScript(q, V2_LINEAGE);
       if (ctx.from >= 1) {
         await q.query(

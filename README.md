@@ -19,7 +19,7 @@ knode-os combines two ideas — [llm_wiki](https://github.com/nashsu/llm_wiki)'s
 - **Context packs.** `knode-os pack "<utterance>"` (or the `knode_context_pack` MCP tool) matches entities in the utterance, expands the graph (doc chunks, time-bound claims flagged `STALE`/`CONFLICT`, linked live tables), executes playbook-declared probe queries against the live sources (asOf-stamped, short-TTL cached, never persisted), and returns gap analysis with ready-to-run follow-up SQL.
 - **Playbooks that learn.** Context packs are driven by agent-editable `packs/*.md` workflows. Every build is logged to `pack_events`; `knode-os pack-optimize` (also part of the nightly dream) turns failure/gap patterns into full playbook revisions — accepted suggestions are written back to `packs/`, so the next query runs a better script.
 - **MCP server** so Claude Code / Codex (CLI or app) can search, ask, read, write, grep, run native SQL against live sources, and build context packs directly.
-- **Native Google OKF v0.1 compatibility**: `wiki/` is itself a portable Open Knowledge Format bundle, with validation, legacy migration, lossless bundle import/export, and graph wiring for ordinary OKF markdown links. Unknown types, extension frontmatter and broken links are consumed permissively as the specification requires.
+- **Native Google OKF v0.2 compatibility**: `wiki/` is itself a portable Open Knowledge Format bundle, with validation, version routing, legacy migration, lossless bundle import/export, and graph wiring for ordinary OKF markdown links. The v0.2 provenance/trust/lifecycle families (`generated`, `verified`, `status`, `stale_after`) are understood, and v0.1 bundles are still read through the spec's documented fallbacks. Unknown types, extension frontmatter and broken links are consumed permissively as the specification requires.
 - **Native Obsidian Vault**: open `wiki/` directly in Obsidian. Vault-local settings and an attachment directory are preconfigured; Properties, aliases, tags, `[[wikilinks]]`, vault paths, heading/block references and `![[embeds]]` work natively. Every imported or exported OKF knowledge bundle is also initialized as its own Vault.
 - **`ask`**: cited answers from your knowledge base with an explicit "what's missing" gap list.
 
@@ -56,7 +56,7 @@ Install globally (`npm link` or `pnpm add -g .`) to use the `knode-os` binary di
 │   └── docs/           # normalized Markdown from text, PDF and image sources — indexed —
 │                       # plus <name>.knode.json sidecars (metadata, LLM extraction
 │                       # results, usage/heat stats) that survive a DB rebuild
-├── wiki/                 # native OKF v0.1 bundle + Obsidian Vault
+├── wiki/                 # native OKF v0.2 bundle + Obsidian Vault
 │   ├── .obsidian/        # vault settings (never overwrites existing settings)
 │   ├── attachments/      # Obsidian attachments
 │   ├── index.md  overview.md  log.md
@@ -175,8 +175,8 @@ knode-os graph [q] [--depth n] [--as-of iso] [--valid-at iso] [--insights] [--js
                               (no query: top-entity overview; --as-of recomputes from evidence)
 knode-os obsidian init [dir]           initialize/repair a Vault (default: <data>/wiki)
 knode-os obsidian status [dir]         check whether a Vault is ready to open
-knode-os okf validate [bundle] [--json]  validate OKF v0.1 (defaults to <data>/wiki)
-knode-os okf migrate [--dry-run]         migrate a legacy wiki structure to OKF v0.1
+knode-os okf validate [bundle] [--json]  validate OKF v0.2 (defaults to <data>/wiki)
+knode-os okf migrate [--dry-run]         migrate a legacy wiki structure to OKF v0.2
 knode-os okf import <bundle> [--name n]  losslessly import under raw/docs/okf/<name>
 knode-os okf export <dir>                validate and export the native wiki bundle
 knode-os wiki generate        source summary pages + entity stubs

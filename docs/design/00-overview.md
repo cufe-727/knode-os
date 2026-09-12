@@ -71,7 +71,7 @@ knode-os combines three ideas:
 ├── cooked/             normalized layer, system-managed (L1)
 │   └── docs/           normalized copies + <name>.knode.json sidecars
 │                       (metadata, tier-0/1 extraction results, usage/heat)
-├── wiki/               curated knowledge (L3); OKF v0.1 + Obsidian Vault
+├── wiki/               curated knowledge (L3); OKF v0.2 + Obsidian Vault
 │   ├── .obsidian/      vault-local settings
 │   ├── attachments/    Obsidian attachments
 │   ├── index.md  log.md  overview.md
@@ -155,7 +155,7 @@ regeneration and is itself a source.
   — tiered extraction pipeline (Tier 0/1/2), sidecar metadata + heat tracking,
   `raw → cooked → wiki` directory layers, 100k–1M document scaling plan.
   The core of this design (cooked layer, sidecars, tiers, heat) is implemented.
-- [02 — Google Open Knowledge Format (OKF) v0.1 兼容设计](02-okf-compatibility.md)
+- [02 — Google Open Knowledge Format (OKF) v0.2 兼容设计](02-okf-compatibility.md)
   — specification summary, native bundle mapping, validation/import/export,
   permissive consumption, and ordinary markdown-link graph wiring.
 - [03 — Obsidian Vault 原生兼容设计](03-obsidian-vault.md)
