@@ -97,9 +97,29 @@ struct EmptyState: View {
     }
 }
 
+/// Renders Markdown as native views.
+///
+/// Three things keep a large document from stalling the window, and all three
+/// matter — a 260 KB preview parses into ~2,000 blocks:
+///
+///   * The parse (and the `AttributedString` conversion of every inline run)
+///     happens once per document in `.task`, not on every body pass. It used to
+///     sit inside `body`, so each unrelated state change — an upload's progress
+///     ticking, expanding a tree row, a toast — paid ~40 ms to redo it.
+///   * Big documents parse off the main actor, so the window keeps drawing.
+///   * `LazyVStack` lays out only what the viewport shows. A plain `VStack`
+///     inside a `ScrollView` is eager: it forced Core Text through all ~2,000
+///     blocks (~230 ms, a 43,000 pt tall stack) before the first frame, and
+///     again on every rebuild.
 struct MarkdownText: View {
     let markdown: String
     var onOpenKnowledgeLink: ((String) -> Void)?
+
+    /// Documents this short parse inline on the main actor: the work is under a
+    /// millisecond and a detached hop would flash an empty answer.
+    private static let asyncParseThreshold = 20_000
+
+    @State private var document = MarkdownDocument.empty
 
     init(markdown: String, onOpenKnowledgeLink: ((String) -> Void)? = nil) {
         self.markdown = markdown
@@ -107,8 +127,8 @@ struct MarkdownText: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 13) {
-            ForEach(parseMarkdown(markdown)) { block in
+        LazyVStack(alignment: .leading, spacing: 13) {
+            ForEach(document.blocks) { block in
                 blockView(block)
             }
         }
@@ -121,17 +141,32 @@ struct MarkdownText: View {
             onOpenKnowledgeLink(target)
             return .handled
         })
+        .task(id: markdown) { await parse() }
+    }
+
+    private func parse() async {
+        guard document.source != markdown else { return }
+        guard markdown.count > Self.asyncParseThreshold else {
+            document = MarkdownDocument(source: markdown)
+            return
+        }
+        let source = markdown
+        let parsed = await Task.detached(priority: .userInitiated) {
+            MarkdownDocument(source: source)
+        }.value
+        guard !Task.isCancelled else { return }
+        document = parsed
     }
 
     @ViewBuilder
     private func blockView(_ block: MarkdownBlock) -> some View {
         switch block.kind {
         case .heading(let level, let text):
-            Text(inlineMarkdown(text))
+            Text(text)
                 .font(headingFont(level))
                 .padding(.top, level <= 2 ? 8 : 3)
         case .paragraph(let text):
-            Text(inlineMarkdown(text))
+            Text(text)
                 .lineSpacing(4)
                 .frame(maxWidth: .infinity, alignment: .leading)
         case .unordered(let items):
@@ -139,7 +174,7 @@ struct MarkdownText: View {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
                     HStack(alignment: .firstTextBaseline, spacing: 9) {
                         Circle().fill(Color.secondary).frame(width: 5, height: 5)
-                        Text(inlineMarkdown(item)).frame(maxWidth: .infinity, alignment: .leading)
+                        Text(item).frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
             }
@@ -152,12 +187,12 @@ struct MarkdownText: View {
                             .font(.system(.body, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .frame(width: 24, alignment: .trailing)
-                        Text(inlineMarkdown(item)).frame(maxWidth: .infinity, alignment: .leading)
+                        Text(item).frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
             }
         case .quote(let text):
-            Text(inlineMarkdown(text))
+            Text(text)
                 .foregroundStyle(.secondary)
                 .italic()
                 .padding(.leading, 12)
@@ -202,13 +237,6 @@ struct MarkdownText: View {
         case 3: .system(size: 18, weight: .semibold)
         default: .system(size: 15, weight: .semibold)
         }
-    }
-
-    private func inlineMarkdown(_ text: String) -> AttributedString {
-        (try? AttributedString(
-            markdown: markdownWithWikiLinks(text),
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace, failurePolicy: .returnPartiallyParsedIfPossible)
-        )) ?? AttributedString(text)
     }
 
     private func inAppTarget(from url: URL) -> String? {
@@ -300,13 +328,35 @@ private func wikiMarkdownLink(destination: String, customLabel: String?) -> Stri
     return "[\(escapedLabel)](\(url))"
 }
 
+/// A parsed document, kept whole so a view can tell at a glance whether the
+/// blocks it holds still belong to the Markdown it was handed.
+private struct MarkdownDocument {
+    let source: String
+    let blocks: [MarkdownBlock]
+
+    static let empty = MarkdownDocument(source: "", blocks: [])
+
+    init(source: String) {
+        self.source = source
+        blocks = parseMarkdown(source)
+    }
+
+    private init(source: String, blocks: [MarkdownBlock]) {
+        self.source = source
+        self.blocks = blocks
+    }
+}
+
 private struct MarkdownBlock: Identifiable {
+    /// Inline runs arrive already converted: `AttributedString(markdown:)` is
+    /// the costliest step per block, and doing it in `body` meant redoing it
+    /// for the whole document on every render.
     enum Kind {
-        case heading(Int, String)
-        case paragraph(String)
-        case unordered([String])
-        case ordered([String])
-        case quote(String)
+        case heading(Int, AttributedString)
+        case paragraph(AttributedString)
+        case unordered([AttributedString])
+        case ordered([AttributedString])
+        case quote(AttributedString)
         case code(String, String?)
         case frontmatter(String)
         case rule
@@ -314,6 +364,13 @@ private struct MarkdownBlock: Identifiable {
 
     let id: Int
     let kind: Kind
+}
+
+private func inlineMarkdown(_ text: String) -> AttributedString {
+    (try? AttributedString(
+        markdown: markdownWithWikiLinks(text),
+        options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace, failurePolicy: .returnPartiallyParsedIfPossible)
+    )) ?? AttributedString(text)
 }
 
 private func parseMarkdown(_ source: String) -> [MarkdownBlock] {
@@ -357,17 +414,17 @@ private func parseMarkdown(_ source: String) -> [MarkdownBlock] {
 
         let hashes = trimmed.prefix(while: { $0 == "#" }).count
         if hashes > 0, hashes <= 6, trimmed.dropFirst(hashes).first == " " {
-            append(.heading(hashes, String(trimmed.dropFirst(hashes + 1))))
+            append(.heading(hashes, inlineMarkdown(String(trimmed.dropFirst(hashes + 1)))))
             index += 1
             continue
         }
 
         if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
-            var items: [String] = []
+            var items: [AttributedString] = []
             while index < lines.count {
                 let item = lines[index].trimmingCharacters(in: .whitespaces)
                 guard item.hasPrefix("- ") || item.hasPrefix("* ") else { break }
-                items.append(String(item.dropFirst(2)))
+                items.append(inlineMarkdown(String(item.dropFirst(2))))
                 index += 1
             }
             append(.unordered(items))
@@ -375,11 +432,11 @@ private func parseMarkdown(_ source: String) -> [MarkdownBlock] {
         }
 
         if trimmed.range(of: "^[0-9]+[.)] ", options: .regularExpression) != nil {
-            var items: [String] = []
+            var items: [AttributedString] = []
             while index < lines.count {
                 let item = lines[index].trimmingCharacters(in: .whitespaces)
                 guard let range = item.range(of: "^[0-9]+[.)] ", options: .regularExpression) else { break }
-                items.append(String(item[range.upperBound...]))
+                items.append(inlineMarkdown(String(item[range.upperBound...])))
                 index += 1
             }
             append(.ordered(items))
@@ -394,7 +451,7 @@ private func parseMarkdown(_ source: String) -> [MarkdownBlock] {
                 quote.append(String(item.dropFirst(2)))
                 index += 1
             }
-            append(.quote(quote.joined(separator: " ")))
+            append(.quote(inlineMarkdown(quote.joined(separator: " "))))
             continue
         }
 
@@ -408,7 +465,7 @@ private func parseMarkdown(_ source: String) -> [MarkdownBlock] {
             paragraph.append(next)
             index += 1
         }
-        append(.paragraph(paragraph.joined(separator: " ")))
+        append(.paragraph(inlineMarkdown(paragraph.joined(separator: " "))))
     }
 
     return blocks

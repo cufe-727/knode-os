@@ -85,6 +85,15 @@ struct APIClient {
         try encoder.encode(value)
     }
 
+    /// A quote or line break in a multipart filename would end the header
+    /// early, so neither ever reaches the wire.
+    private func headerSafe(_ name: String) -> String {
+        name
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\"", with: "%22")
+    }
+
     private func path(_ endpoint: String, query: [URLQueryItem]) -> String {
         var components = URLComponents()
         components.path = endpoint
@@ -152,6 +161,13 @@ struct APIClient {
     }
 
     func upload(files: [URL], directory: String = "raw/docs") async throws -> UploadResponse {
+        try await upload(items: files.map { UploadItem(name: $0.lastPathComponent, url: $0) }, directory: directory)
+    }
+
+    /// Multipart upload. Each item's `name` is sent as the multipart filename,
+    /// which the service joins onto `directory` — that is how a folder upload
+    /// recreates its subtree instead of flattening it.
+    func upload(items: [UploadItem], directory: String = "raw/docs") async throws -> UploadResponse {
         let boundary = "KnodeBoundary-\(UUID().uuidString)"
         var body = Data()
 
@@ -162,12 +178,12 @@ struct APIClient {
         append("--\(boundary)\r\n")
         append("Content-Disposition: form-data; name=\"dir\"\r\n\r\n")
         append("\(directory)\r\n")
-        for file in files {
-            let accessing = file.startAccessingSecurityScopedResource()
-            defer { if accessing { file.stopAccessingSecurityScopedResource() } }
-            let data = try Data(contentsOf: file)
+        for item in items {
+            let accessing = item.url.startAccessingSecurityScopedResource()
+            defer { if accessing { item.url.stopAccessingSecurityScopedResource() } }
+            let data = try Data(contentsOf: item.url)
             append("--\(boundary)\r\n")
-            append("Content-Disposition: form-data; name=\"files\"; filename=\"\(file.lastPathComponent)\"\r\n")
+            append("Content-Disposition: form-data; name=\"files\"; filename=\"\(headerSafe(item.name))\"\r\n")
             append("Content-Type: application/octet-stream\r\n\r\n")
             body.append(data)
             append("\r\n")
