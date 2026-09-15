@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import matter from 'gray-matter';
 import { afterAll, describe, expect, it } from 'vitest';
 import { appendLog, initDataDir } from '../src/fs/datadir.js';
 import { createContext } from '../src/context.js';
@@ -17,6 +18,7 @@ import {
   resolveOkfLink,
   validateOkfBundle,
 } from '../src/okf/index.js';
+import { normalizeCookedFrontmatter } from '../src/okf/normalize.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-okf-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -44,6 +46,16 @@ describe('OKF validation', () => {
     expect(result).toMatchObject({ files: 4, concepts: 2, indexes: 1, logs: 1, errors: 0 });
     // a v0.1 bundle stays consumable; the older minor is a warning, not an error
     expect(result.diagnostics.map((d) => d.code)).toContain('legacy_version');
+  });
+
+  it('validates the indexed view of an unannotated raw/docs subtree with asIndexed', () => {
+    const root = path.join(tmp, 'as-indexed');
+    write(root, 'notes/one.md', '# One\n\nPlain note without frontmatter.\n');
+    write(root, 'notes/two.md', '---\ntype: Note\ntitle: Two\n---\n\n# Two\n');
+    expect(validateOkfBundle(root).errors).toBe(1);
+    const asIndexed = validateOkfBundle(root, { asIndexed: true });
+    expect(asIndexed.errors).toBe(0);
+    expect(asIndexed.valid).toBe(true);
   });
 
   it('routes declared versions by major and minor (SPEC §12)', () => {
@@ -211,3 +223,103 @@ describe('OKF exchange', () => {
     }
   });
 });
+
+describe('cooked frontmatter normalization', () => {
+  const at = '2026-09-13T04:05:24.000Z';
+
+  it('gives an unannotated document the one field OKF requires', () => {
+    const out = normalizeCookedFrontmatter('raw/docs/shujiu/2025-05.md', '# 2025 年 5 月\n\n正文。\n');
+    expect(out).toMatch(/^---\ntype: "Document"\ntitle: "2025 年 5 月"\n---\n\n# 2025 年 5 月\n/);
+    expect(validateFrontmatterOnly(out)).toBe(true);
+  });
+
+  it('falls back to the filename when there is no heading', () => {
+    const out = normalizeCookedFrontmatter('raw/docs/a/2025-05.md', '正文。\n');
+    expect(out).toContain('title: "2025-05"');
+  });
+
+  it('adds only what is missing and never respells existing keys', () => {
+    const raw = '---\nplatform: "zsxq"\ntitle: "唯有业绩永恒 · 2025-05"\nposts: 228\n---\n\n正文。\n';
+    const out = normalizeCookedFrontmatter('raw/docs/shujiu/2025-05.md', raw);
+    expect(out).toBe('---\ntype: "Document"\nplatform: "zsxq"\ntitle: "唯有业绩永恒 · 2025-05"\nposts: 228\n---\n\n正文。\n');
+  });
+
+  it('leaves a document that already declares a type untouched', () => {
+    const raw = '---\ntype: Archive\ntitle: Kept\n---\n\n正文。\n';
+    expect(normalizeCookedFrontmatter('raw/docs/a/x.md', raw)).toBe(raw);
+  });
+
+  it('translates a private generated spelling without dropping the original keys', () => {
+    const raw = '---\ntype: Archive\ntitle: X\ngenerator: "crawler/archive-markdown.mjs"\ngenerated_at: "2026-09-11T14:43:45.915Z"\n---\n\n正文。\n';
+    const out = normalizeCookedFrontmatter('raw/docs/a/x.md', raw);
+    expect(out).toContain('generated: { by: "crawler/archive-markdown.mjs", at: "2026-09-11T14:43:45.915Z" }');
+    expect(out).toContain('generator: "crawler/archive-markdown.mjs"');
+    expect(isGeneratedConcept(matter(out).data)).toBe(true);
+    expect(readGeneratedAt(matter(out).data)).toBe('2026-09-11T14:43:45.915Z');
+  });
+
+  it('records knode-os as the actor when knode-os produced the copy', () => {
+    const out = normalizeCookedFrontmatter('raw/docs/a/scan.pdf.md', '# Scan\n', { producedBy: 'knode-os/doubao-vision', at });
+    expect(out).toContain(`generated: { by: "knode-os/doubao-vision", at: "${at}" }`);
+  });
+
+  it('does not invent provenance for a document nobody claimed', () => {
+    const out = normalizeCookedFrontmatter('raw/docs/a/note.md', '# Note\n', { at });
+    expect(out).not.toContain('generated');
+  });
+
+  it('respects an existing generated mapping', () => {
+    const raw = '---\ntype: Archive\ntitle: X\ngenerated: { by: "someone/1.0", at: "2026-01-01T00:00:00Z" }\n---\n\nx\n';
+    expect(normalizeCookedFrontmatter('raw/docs/a/x.md', raw, { producedBy: 'knode-os/x', at })).toBe(raw);
+  });
+
+  it('skips reserved files, which must not carry frontmatter', () => {
+    for (const rel of ['raw/docs/okf/b/index.md', 'raw/docs/okf/b/sub/log.md']) {
+      expect(normalizeCookedFrontmatter(rel, '# Index\n\n* [x](x.md)\n')).toBe('# Index\n\n* [x](x.md)\n');
+    }
+  });
+
+  it('skips non-markdown, where a YAML header would corrupt the content', () => {
+    for (const rel of ['raw/docs/a/data.csv', 'raw/docs/a/notes.txt', 'raw/docs/a/x.json']) {
+      expect(normalizeCookedFrontmatter(rel, 'a,b\n1,2\n')).toBe('a,b\n1,2\n');
+    }
+  });
+
+  it('leaves unparseable frontmatter for a human instead of rewriting it', () => {
+    const broken = '---\ntitle: "unterminated\n  bad: [\n---\n\nbody\n';
+    expect(normalizeCookedFrontmatter('raw/docs/a/x.md', broken)).toBe(broken);
+  });
+
+  it('is idempotent, so re-cooking unchanged bytes does not churn the hash', () => {
+    for (const raw of [
+      '# Heading\n\nbody\n',
+      '---\nplatform: "zsxq"\n---\n\nbody\n',
+      '---\ntype: Archive\ngenerator: "x/1.0"\ngenerated_at: "2026-01-01T00:00:00Z"\n---\n\nbody\n',
+    ]) {
+      const once = normalizeCookedFrontmatter('raw/docs/a/x.md', raw, { producedBy: 'knode-os/v', at });
+      const twice = normalizeCookedFrontmatter('raw/docs/a/x.md', once, { producedBy: 'knode-os/v', at });
+      expect(twice).toBe(once);
+    }
+  });
+
+  it('turns a directory of unannotated notes into a conformant bundle', () => {
+    const root = path.join(tmp, 'normalized');
+    write(root, 'a/one.md', '# One\n\nSee [two](../b/two.md).\n');
+    write(root, 'b/two.md', '---\nplatform: "zsxq"\n---\n\n# Two\n');
+    expect(validateOkfBundle(root).errors).toBe(2);
+
+    for (const rel of ['a/one.md', 'b/two.md']) {
+      const abs = path.join(root, rel);
+      fs.writeFileSync(abs, normalizeCookedFrontmatter(rel, fs.readFileSync(abs, 'utf8')));
+    }
+    const after = validateOkfBundle(root);
+    expect(after.errors).toBe(0);
+    expect(after.valid).toBe(true);
+  });
+});
+
+/** A single concept is conformant when its frontmatter parses and types itself. */
+function validateFrontmatterOnly(markdown: string): boolean {
+  const fm = matter(markdown).data as Record<string, unknown>;
+  return typeof fm.type === 'string' && fm.type.trim().length > 0;
+}

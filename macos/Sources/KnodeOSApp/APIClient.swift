@@ -126,8 +126,12 @@ struct APIClient {
         try await send("/api/tree")
     }
 
-    func file(at filePath: String) async throws -> FileResponse {
-        try await send(path("/api/file", query: [.init(name: "path", value: filePath)]))
+    /// Reads a file. Without `maxBytes` the service caps the read at its preview
+    /// limit and answers `truncated`; pass a cap to pull the whole file for editing.
+    func file(at filePath: String, maxBytes: Int? = nil) async throws -> FileResponse {
+        var query = [URLQueryItem(name: "path", value: filePath)]
+        if let maxBytes { query.append(.init(name: "maxBytes", value: String(maxBytes))) }
+        return try await send(path("/api/file", query: query))
     }
 
     func resolveLink(_ target: String, from sourcePath: String) async throws -> ResolvedLinkResponse {
@@ -261,5 +265,17 @@ struct APIClient {
 
     func saveConfig(_ config: KnodeConfig) async throws -> ConfigSaveResponse {
         try await send("/api/config", method: "PUT", body: encoded(config))
+    }
+
+    /// Models the draft config's provider offers for one route ("embedding",
+    /// "llm", "entityLlm", "conceptLlm", "documentLlm"). Inherited routes are
+    /// resolved against the draft default provider server-side.
+    func listModels(route: String, config: KnodeConfig) async throws -> ModelListResponse {
+        struct Body: Encodable { var route: String; var config: KnodeConfig }
+        return try await send("/api/config/models", method: "POST", body: encoded(Body(route: route, config: config)))
+    }
+
+    func cliTools() async throws -> CliToolsResponse {
+        try await send("/api/config/cli-tools")
     }
 }

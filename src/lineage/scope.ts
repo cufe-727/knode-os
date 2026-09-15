@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { safePath } from '../fs/files.js';
+import { RAW_DOCS } from '../fs/layout.js';
 import { Store } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
 import { moveSidecarToAttic, readBlob, removeAtticSidecar, removeBlob } from './attic.js';
@@ -264,10 +265,10 @@ export async function disposeScope(store: Store, scopeId: string, opts: DisposeO
   });
 
   runInverseFsOps(store.dataDir, fsInverses, opts.reason);
+  // a removed document's sidecar (paid extraction, usage history) goes to the
+  // attic; the raw file itself is the user's and is never touched here
   let attic: string | null = null;
-  if (scope.kind === 'doc' && opts.reason === 'removed' && scope.key.startsWith('cooked/docs/')) {
-    const abs = safePath(store.dataDir, scope.key);
-    if (fs.existsSync(abs)) fs.rmSync(abs, { force: true });
+  if (scope.kind === 'doc' && opts.reason === 'removed' && scope.key.startsWith(`${RAW_DOCS}/`)) {
     if (moveSidecarToAttic(store.dataDir, scope.key, scopeId)) attic = scopeId;
   }
   if (opts.log ?? true) {

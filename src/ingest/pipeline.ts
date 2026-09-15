@@ -5,3 +5,5 @@
  */
 export { runIngest, sync, type IngestOptions, type SyncOptions, type SyncStats, type SyncContext } from './sync.js';
 export { applyDocScope, documentIdFor, chunkIdFor } from './apply.js';
+export { prepareDocs } from './prepare.js';
+export { loadSourceText, readSourceTextCapped } from './source.js';

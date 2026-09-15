@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
+import { PACKS_DIR } from '../fs/layout.js';
 import { assertReadOnlySql } from '../datasource/guard.js';
 import { assertWritablePath } from '../fs/files.js';
 import { Store } from '../store/db.js';
@@ -256,7 +257,7 @@ export async function distillRecipes(
     }
 
     const content = renderRecipe(shape, result);
-    const relPath = `packs/${shape.intent.replace(/[^A-Za-z0-9_-]/g, '-')}-distilled.md`;
+    const relPath = `${PACKS_DIR}/${shape.intent.replace(/[^A-Za-z0-9_-]/g, '-')}-distilled.md`;
     if (!parseRecipe(content, relPath)) {
       progress(`distilled recipe for ${shape.intent} does not parse — skipped`);
       continue;

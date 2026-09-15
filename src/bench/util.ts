@@ -89,7 +89,7 @@ export function summarizeLatency(ms: number[]): { avg: number; p50: number; p95:
 
 /** Platform from an imported finance doc path, or the top-level root otherwise. */
 export function platformOfPath(p: string): string {
-  const m = /^(?:cooked|raw)\/docs\/finance\/([^/]+)\//.exec(p);
+  const m = /^raw\/docs\/finance\/([^/]+)\//.exec(p);
   return m ? m[1] : p.split('/')[0];
 }
 

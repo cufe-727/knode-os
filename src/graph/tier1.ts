@@ -1,8 +1,7 @@
-import fs from 'node:fs';
 import { KnodeConfig, resolveRoutedLlmConfig } from '../config.js';
 import { LLM_EXTRACT_INPUT_CHARS } from '../constants.js';
-import { safePath } from '../fs/files.js';
-import { readSidecar, replayableTier1, updateSidecar } from '../fs/sidecar.js';
+import { readSidecarPart, replayableTier1, updateSidecarPart } from '../fs/sidecar.js';
+import { loadSourceText } from '../ingest/source.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
 import { addBudgetUse, budgetUsedToday } from '../llm/budget.js';
 import { LlmClient } from '../llm/client.js';
@@ -103,7 +102,7 @@ export async function runTier1Pass(
   const progress = opts.onProgress ?? (() => {});
   const stats: Tier1Stats = { processed: 0, failed: 0, entities: 0, relations: 0, tokensUsed: 0, budgetLeft: 0, queued: 0 };
   const entityLlm = config.extraction.entityLlm
-    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, config.extraction.tier1Model))
+    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, config.connections, config.extraction.tier1Model))
     : llm;
 
   const countQueue = async () => {
@@ -130,12 +129,12 @@ export async function runTier1Pass(
     if (stats.budgetLeft <= 0) return;
     const dequeue = () => store.query(`DELETE FROM extraction_queue WHERE document_id = $1`, [doc.document_id]);
     try {
-      const abs = safePath(store.dataDir, doc.path);
-      if (!fs.existsSync(abs)) {
+      const source = loadSourceText(store.dataDir, doc.path, 'docs');
+      if (!source) {
         await dequeue();
         return;
       }
-      const content = fs.readFileSync(abs, 'utf8');
+      const content = source.text;
       const chunks = await store.query<{ id: string; content: string }>(
         `SELECT id, content FROM chunks WHERE document_id = $1 ORDER BY seq`,
         [doc.document_id],
@@ -148,7 +147,7 @@ export async function runTier1Pass(
       };
 
       // replay for free when the sidecar already has a matching extraction
-      const tier1 = replayableTier1(readSidecar(store.dataDir, doc.path), doc.sha256);
+      const tier1 = replayableTier1(readSidecarPart(store.dataDir, doc.path, 'tier1'), doc.sha256);
       if (tier1) {
         const g = await applyTier1Scope(store, doc, page, tier1, { model: tier1.model });
         stats.entities += g.entities;
@@ -167,17 +166,15 @@ export async function runTier1Pass(
       const extracted = await llmExtract(entityLlm, page, content, { claims: config.extraction.claims });
       const g = await applyTier1Scope(store, doc, page, extracted, { model: entityLlm.label });
 
-      updateSidecar(store.dataDir, doc.path, (s) => {
-        s.extraction.tier1 = {
-          status: 'done',
-          entities: extracted.entities,
-          relations: extracted.relations,
-          claims: extracted.claims,
-          model: entityLlm.label,
-          contentSha: doc.sha256,
-          extractedAt: new Date().toISOString(),
-        };
-      });
+      updateSidecarPart(store.dataDir, doc.path, 'tier1', () => ({
+        status: 'done',
+        entities: extracted.entities,
+        relations: extracted.relations,
+        claims: extracted.claims,
+        model: entityLlm.label,
+        contentSha: doc.sha256,
+        extractedAt: new Date().toISOString(),
+      }));
 
       await addBudgetUse(store, cost);
       stats.tokensUsed += cost;
@@ -190,17 +187,15 @@ export async function runTier1Pass(
       progress(`tier1 failed for ${doc.path}: ${msg}`);
       if (doc.attempts + 1 >= MAX_ATTEMPTS) {
         await dequeue();
-        updateSidecar(store.dataDir, doc.path, (s) => {
-          s.extraction.tier1 = {
-            status: 'failed',
-            entities: s.extraction.tier1?.entities ?? [],
-            relations: s.extraction.tier1?.relations ?? [],
-            model: entityLlm.label,
-            contentSha: doc.sha256,
-            extractedAt: new Date().toISOString(),
-            error: msg.slice(0, 300),
-          };
-        });
+        updateSidecarPart(store.dataDir, doc.path, 'tier1', (prev) => ({
+          status: 'failed',
+          entities: prev?.entities ?? [],
+          relations: prev?.relations ?? [],
+          model: entityLlm.label,
+          contentSha: doc.sha256,
+          extractedAt: new Date().toISOString(),
+          error: msg.slice(0, 300),
+        }));
         stats.failed++;
       } else {
         await store.query(`UPDATE extraction_queue SET attempts = attempts + 1 WHERE document_id = $1`, [doc.document_id]);

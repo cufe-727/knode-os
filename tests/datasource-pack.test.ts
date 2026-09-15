@@ -184,7 +184,7 @@ claims:
 `);
 
     // playbook probing the parquet table
-    fs.writeFileSync(path.join(dataDir, 'packs/organization.md'), `---
+    fs.writeFileSync(path.join(dataDir, 'playbooks/packs/organization.md'), `---
 type: playbook
 appliesTo: organization
 retrieval: { k: 4, mode: keyword }
@@ -230,7 +230,7 @@ Guidance here.
       const broken = pack.liveData.find((p) => p.id === 'broken');
       expect(broken?.ok).toBe(false);
 
-      expect(pack.playbooksUsed).toContain('packs/organization.md');
+      expect(pack.playbooksUsed).toContain('playbooks/packs/organization.md');
       expect(pack.suggestions.some((s) => s.kind === 'freshness')).toBe(true);
       expect(pack.gaps.some((g) => g.includes('broken'))).toBe(true);
 
@@ -240,11 +240,11 @@ Guidance here.
       expect(opt.events).toBe(2);
       const revision = opt.suggestions.find((s) => s.kind === 'pack');
       expect(revision).toBeTruthy();
-      expect(revision!.payload?.path).toBe('packs/organization.md');
+      expect(revision!.payload?.path).toBe('playbooks/packs/organization.md');
 
       const applied = await applySuggestion(ctx.store, dataDir, revision!.id);
       expect(applied.applied).toBe(true);
-      const revised = fs.readFileSync(path.join(dataDir, 'packs/organization.md'), 'utf8');
+      const revised = fs.readFileSync(path.join(dataDir, 'playbooks/packs/organization.md'), 'utf8');
       expect(revised).toContain('id: bars');
       expect(revised).not.toContain('id: broken');
     } finally {

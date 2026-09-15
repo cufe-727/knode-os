@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { rawToCookedPath } from '../ingest/cook.js';
 import { sync, SyncContext } from '../ingest/sync.js';
 import { safePath } from '../fs/files.js';
 import { Store } from '../store/db.js';
@@ -30,7 +29,7 @@ export async function forgetSource(ctx: SyncContext, target: string): Promise<Fo
     fs.rmSync(abs, { recursive: true, force: true });
     removedFile = true;
   }
-  const key = rel.startsWith('raw/docs/') ? rawToCookedPath(rel) : rel;
+  const key = rel;
   const stats = await sync(ctx, { only: [rel], actor: 'forget' });
   const purged: string[] = [];
   for (const s of await scopesForKey(ctx.store, 'doc', key)) {

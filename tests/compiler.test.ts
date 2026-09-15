@@ -244,7 +244,7 @@ describe('resolve: end to end', () => {
       tables: [{ name: 'quotes', description: '日行情', entityColumns: [{ column: 'symbol', entityType: 'organization' }] }],
     }];
     saveConfig(dataDir, config);
-    write(dataDir, 'intents/stock.yaml', INTENT_YAML);
+    write(dataDir, 'playbooks/intents/stock.yaml', INTENT_YAML);
     write(dataDir, 'raw/docs/catl.md', `---
 title: 宁德时代研报
 entities:

@@ -174,7 +174,7 @@ claims:
 
 宁德时代动力电池出货量全球第一。
 `);
-    write(dataDir, 'capabilities/daily-quotes.md', `---
+    write(dataDir, 'playbooks/capabilities/daily-quotes.md', `---
 capability: lake.daily_quotes
 cost: 2
 freshness: 30s
@@ -199,7 +199,7 @@ pitfalls:
     expect(quotes!.freshnessSeconds).toBe(30);
     expect(quotes!.pitfalls).toEqual(['close 是未复权价']);
     expect(quotes!.semantics).toContain('T+1 落库');
-    expect(quotes!.notes[0].sourcePath).toBe('capabilities/daily-quotes.md');
+    expect(quotes!.notes[0].sourcePath).toBe('playbooks/capabilities/daily-quotes.md');
 
     // the doc's alias is what binds the entity to the table
     const locators = await locatorsForEntities(ctx.store, ['宁德时代']);

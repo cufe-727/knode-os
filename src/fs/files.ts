@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { hasSidecarSegment, listSidecarKeys, PACKS_DIR, RAW_DOCS, RAW_SKILLS, SIDECAR_ROOT_SEGMENT, sidecarRelFor } from './layout.js';
 
 /** Path-safe file operations confined to the data directory. */
 
@@ -12,7 +13,7 @@ export interface TreeNode {
   children?: TreeNode[];
 }
 
-const HIDDEN = new Set(['.knode', '.git', 'node_modules', '.DS_Store', '.obsidian']);
+const HIDDEN = new Set(['.knode', SIDECAR_ROOT_SEGMENT, '.git', 'node_modules', '.DS_Store', '.obsidian']);
 
 /** Resolve a user-supplied relative path inside dataDir, rejecting traversal. */
 export function safePath(dataDir: string, rel: string): string {
@@ -138,14 +139,17 @@ export function sanitizeRelativePath(name: string): string {
 }
 
 /** Roots that external interfaces (HTTP / MCP) may write to. Everything else is read-only. */
-const WRITABLE_ROOTS_RE = /^(wiki|raw\/docs|packs)(\/|$)/;
+const WRITABLE_ROOTS = ['wiki', RAW_DOCS, PACKS_DIR];
+const WRITABLE_ROOTS_RE = new RegExp(`^(${WRITABLE_ROOTS.map((r) => r.replace(/\//g, '\\/')).join('|')})(\\/|$)`);
 
+/** The sidecar tree is system-owned: no external write may land there, whatever root it is under. */
 export function isWritablePath(rel: string): boolean {
-  return WRITABLE_ROOTS_RE.test(rel.replace(/\\/g, '/').replace(/^\/+/, ''));
+  const clean = rel.replace(/\\/g, '/').replace(/^\/+/, '');
+  return !hasSidecarSegment(clean) && WRITABLE_ROOTS_RE.test(clean);
 }
 
 export function assertWritablePath(rel: string): void {
-  if (!isWritablePath(rel)) throw new Error('writes are restricted to wiki/, raw/docs/ and packs/');
+  if (!isWritablePath(rel)) throw new Error(`writes are restricted to ${WRITABLE_ROOTS.map((r) => `${r}/`).join(', ')}`);
 }
 
 const TEXT_EXT = new Set(['.md', '.markdown', '.txt', '.text', '.json', '.jsonl', '.yaml', '.yml', '.csv', '.tsv', '.html', '.htm', '.xml', '.rst', '.org']);
@@ -181,12 +185,16 @@ export interface GrepMatch {
   text: string;
 }
 
-const GREP_ROOTS = ['cooked/docs', 'wiki', 'raw/docs', 'raw/skills', 'packs'];
+const GREP_ROOTS = ['wiki', RAW_DOCS, RAW_SKILLS, PACKS_DIR];
 const MAX_GREP_FILE_BYTES = 2 * 1024 * 1024;
 
 /**
  * grep-style regex search over the knowledge files (agents get grep/ls/read
  * alongside native SQL — the "filesystem view" of the logical database).
+ *
+ * Originals whose text knode-os derived (PDFs, images) are searched through
+ * the Markdown in their sidecar and reported under the original's path; the
+ * rest of the sidecar tree (extraction JSON, usage stats) is never a target.
  */
 export function grepFiles(
   dataDir: string,
@@ -195,21 +203,30 @@ export function grepFiles(
 ): GrepMatch[] {
   const maxMatches = Math.min(opts.maxMatches ?? 100, 500);
   const re = new RegExp(pattern, opts.ignoreCase === false ? '' : 'i');
-  const roots = opts.path ? [opts.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')] : GREP_ROOTS;
+  const explicit = opts.path ? opts.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') : undefined;
+  if (explicit !== undefined && hasSidecarSegment(explicit)) return [];
+  const roots = explicit !== undefined ? [explicit] : GREP_ROOTS;
   const out: GrepMatch[] = [];
 
   for (const root of roots) {
     const rootAbs = safePath(dataDir, root);
     if (!fs.existsSync(rootAbs)) continue;
-    const files = fs.statSync(rootAbs).isFile() ? [root] : walkFiles(dataDir, root);
-    for (const file of files) {
-      if (!isTextFile(file)) continue;
-      const abs = safePath(dataDir, file);
+    const single = fs.statSync(rootAbs).isFile();
+    const targets: { read: string; report: string }[] = [];
+    for (const file of single ? [root] : walkFiles(dataDir, root)) {
+      if (isTextFile(file)) targets.push({ read: file, report: file });
+    }
+    for (const key of single ? [root] : listSidecarKeys(dataDir, root)) {
+      const derived = `${sidecarRelFor(key)}/content.md`;
+      if (!isTextFile(key) && fs.existsSync(safePath(dataDir, derived))) targets.push({ read: derived, report: key });
+    }
+    for (const target of targets) {
+      const abs = safePath(dataDir, target.read);
       if (fs.statSync(abs).size > MAX_GREP_FILE_BYTES) continue;
       const lines = fs.readFileSync(abs, 'utf8').split('\n');
       for (let i = 0; i < lines.length; i++) {
         if (re.test(lines[i])) {
-          out.push({ path: file, line: i + 1, text: lines[i].trim().slice(0, 300) });
+          out.push({ path: target.report, line: i + 1, text: lines[i].trim().slice(0, 300) });
           if (out.length >= maxMatches) return out;
         }
       }

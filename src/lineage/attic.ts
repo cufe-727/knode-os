@@ -1,44 +1,38 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { readSidecar, Sidecar } from '../fs/sidecar.js';
 import { safePath } from '../fs/files.js';
+import { ATTIC_DIR } from '../fs/layout.js';
+import { hasSidecar, readSidecarFromDir, Sidecar, sidecarDir } from '../fs/sidecar.js';
 
 /**
  * The attic keeps what a dispose would otherwise destroy but a later rebuild
- * or restore may need: the sidecar of a removed document (paid LLM
- * extraction) and the previous bytes of files a scope overwrote. `purge`
- * deletes attic entries; nothing else does.
+ * or restore may need: the sidecar directory of a removed document (paid LLM
+ * extraction, usage history) and the previous bytes of files a scope
+ * overwrote. `purge` deletes attic entries; nothing else does.
  */
 
-const ATTIC_DIR = 'ledger/attic';
-
+/** Attic location of a disposed scope's sidecar directory. */
 export function atticSidecarRel(scopeId: string): string {
-  return `${ATTIC_DIR}/${scopeId}.knode.json`;
+  return `${ATTIC_DIR}/${scopeId}`;
 }
 
-export function moveSidecarToAttic(dataDir: string, cookedRel: string, scopeId: string): boolean {
-  const src = safePath(dataDir, `${cookedRel}.knode.json`);
-  if (!fs.existsSync(src)) return false;
+/** Move a source's whole sidecar directory into the attic. */
+export function moveSidecarToAttic(dataDir: string, key: string, scopeId: string): boolean {
+  if (!hasSidecar(dataDir, key)) return false;
   const dst = safePath(dataDir, atticSidecarRel(scopeId));
+  fs.rmSync(dst, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(dst), { recursive: true });
-  fs.renameSync(src, dst);
+  fs.renameSync(sidecarDir(dataDir, key), dst);
   return true;
 }
 
 export function readAtticSidecar(dataDir: string, scopeId: string): Sidecar | null {
-  const abs = safePath(dataDir, atticSidecarRel(scopeId));
-  if (!fs.existsSync(abs)) return null;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(abs, 'utf8')) as Sidecar;
-    return parsed?.version === 1 && parsed.meta ? parsed : null;
-  } catch {
-    return null;
-  }
+  return readSidecarFromDir(safePath(dataDir, atticSidecarRel(scopeId)));
 }
 
 export function removeAtticSidecar(dataDir: string, scopeId: string): void {
-  fs.rmSync(safePath(dataDir, atticSidecarRel(scopeId)), { force: true });
+  fs.rmSync(safePath(dataDir, atticSidecarRel(scopeId)), { recursive: true, force: true });
 }
 
 /** Content-addressed blob store for previous file versions. Returns the blob id. */
@@ -59,9 +53,4 @@ export function readBlob(dataDir: string, sha: string): string | null {
 
 export function removeBlob(dataDir: string, sha: string): void {
   fs.rmSync(safePath(dataDir, `${ATTIC_DIR}/blobs/${sha}`), { force: true });
-}
-
-/** Sidecar of a live cooked document, or null. Re-exported for rebuild convenience. */
-export function liveSidecar(dataDir: string, cookedRel: string): Sidecar | null {
-  return readSidecar(dataDir, cookedRel);
 }

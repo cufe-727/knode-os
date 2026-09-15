@@ -42,24 +42,91 @@ class OpenAIEmbeddingProvider implements EmbeddingProvider {
 
   /** One batch request, with exponential backoff on rate limits / transient 5xx. */
   private async embedBatch(batch: string[]): Promise<{ data: { index: number; embedding: number[] }[] }> {
-    const MAX_ATTEMPTS = 5;
-    for (let attempt = 1; ; attempt++) {
-      const res = await fetch(`${this.baseUrl}/embeddings`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
-        },
-        body: JSON.stringify({ model: this.model, input: batch, ...(this.sendDimensions ? { dimensions: this.dimensions } : {}) }),
-      });
-      if (res.ok) return (await res.json()) as { data: { index: number; embedding: number[] }[] };
-      const body = await res.text();
-      const retryable = res.status === 429 || res.status >= 500;
-      if (!retryable || attempt >= MAX_ATTEMPTS) {
-        throw new Error(`embedding request failed (${res.status}): ${body.slice(0, 300)}`);
-      }
-      await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt)));
+    return (await postWithRetry(`${this.baseUrl}/embeddings`, this.apiKey, {
+      model: this.model,
+      input: batch,
+      ...(this.sendDimensions ? { dimensions: this.dimensions } : {}),
+    })) as { data: { index: number; embedding: number[] }[] };
+  }
+}
+
+/**
+ * Volcengine Ark's multimodal embedding endpoint (doubao-embedding-vision-*).
+ *
+ * Despite the family resemblance this is not an OpenAI-compatible batch API:
+ *   - the path is `/embeddings/multimodal`, and the vision models are rejected
+ *     by the plain `/embeddings` route;
+ *   - `input` is a list of content parts (text and images) belonging to ONE
+ *     item, and they are FUSED into a single vector — passing N texts returns
+ *     one vector, not N;
+ *   - the response carries `data.embedding`, not `data[].embedding`.
+ *
+ * So each text costs one request, and `batchSize` is reused as the concurrency
+ * window over those requests. Keeping the same contract as the OpenAI provider
+ * means images can later be embedded into the same space by sending an
+ * `image_url` part instead.
+ */
+class ArkMultimodalEmbeddingProvider implements EmbeddingProvider {
+  readonly model: string;
+  readonly dimensions: number;
+  private readonly url: string;
+  private readonly apiKey: string;
+  private readonly concurrency: number;
+  private readonly sendDimensions: boolean;
+
+  constructor(cfg: EmbeddingConfig) {
+    this.model = cfg.model;
+    this.dimensions = cfg.dimensions;
+    this.url = `${cfg.baseUrl.replace(/\/+$/, '')}/embeddings/multimodal`;
+    this.apiKey = resolveSecret(cfg.apiKey);
+    this.concurrency = Math.max(1, cfg.batchSize);
+    this.sendDimensions = Boolean(cfg.sendDimensions);
+  }
+
+  async embed(texts: string[]): Promise<number[][]> {
+    const out = new Array<number[]>(texts.length);
+    let cursor = 0;
+    // `cursor++` is atomic between awaits on the single JS thread, so these
+    // workers hand out each index exactly once.
+    const worker = async () => {
+      for (let i = cursor++; i < texts.length; i = cursor++) out[i] = await this.embedOne(texts[i]);
+    };
+    const workers = Math.min(this.concurrency, texts.length);
+    await Promise.all(Array.from({ length: workers }, worker));
+    return out;
+  }
+
+  private async embedOne(text: string): Promise<number[]> {
+    const json = (await postWithRetry(this.url, this.apiKey, {
+      model: this.model,
+      input: [{ type: 'text', text: text.slice(0, EMBED_INPUT_CHARS) || ' ' }],
+      ...(this.sendDimensions ? { dimensions: this.dimensions } : {}),
+    })) as { data?: { embedding?: number[] } };
+    const vec = json.data?.embedding;
+    if (!Array.isArray(vec)) throw new Error('embedding response had no data.embedding array');
+    return vec;
+  }
+}
+
+/** POST JSON with exponential backoff on rate limits / transient 5xx. */
+async function postWithRetry(url: string, apiKey: string, body: unknown): Promise<unknown> {
+  const MAX_ATTEMPTS = 5;
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) return await res.json();
+    const text = await res.text();
+    const retryable = res.status === 429 || res.status >= 500;
+    if (!retryable || attempt >= MAX_ATTEMPTS) {
+      throw new Error(`embedding request failed (${res.status}): ${text.slice(0, 300)}`);
     }
+    await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt)));
   }
 }
 
@@ -107,5 +174,6 @@ export class LocalHashEmbeddingProvider implements EmbeddingProvider {
 
 export function createEmbeddingProvider(cfg: EmbeddingConfig): EmbeddingProvider {
   if (cfg.provider === 'openai') return new OpenAIEmbeddingProvider(cfg);
+  if (cfg.provider === 'ark-multimodal') return new ArkMultimodalEmbeddingProvider(cfg);
   return new LocalHashEmbeddingProvider(cfg.dimensions);
 }

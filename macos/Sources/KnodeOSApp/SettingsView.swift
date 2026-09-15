@@ -8,8 +8,8 @@ struct SettingsView: View {
     @State private var statusIsError = false
     @State private var isLoading = true
     @State private var isWorking = false
-    @State private var defaultExpanded = false
     @State private var showingClearConfirmation = false
+    @State private var cliTools: [String: CliTool] = [:]
 
     var body: some View {
         ScrollView {
@@ -20,10 +20,9 @@ struct SettingsView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 80)
                 } else if config != nil {
-                    routeSummary
-                    embeddingSection
-                    extractionSection
-                    defaultModelSection
+                    pipelineSummary
+                    providersSection
+                    pipelineSection
                     if let testResult { testResults(testResult) }
                     if !statusMessage.isEmpty {
                         Label(statusMessage, systemImage: statusIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
@@ -66,11 +65,11 @@ struct SettingsView: View {
                 Text("Give each knowledge job the right model.")
                     .font(.system(size: 34, weight: .bold))
                     .tracking(-0.8)
-                Text("Configure retrieval, document vision, entity extraction, and concept synthesis independently for \(model.activeWorkspace?.displayName ?? "this workspace").")
+                Text("Configure each provider once for \(model.activeWorkspace?.displayName ?? "this workspace"), then point every pipeline stage at one of them. Test stages sends one real request per configured stage before you save.")
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Test routes") { Task { await test() } }
+            Button("Test stages") { Task { await test() } }
                 .disabled(config == nil || isWorking)
             Button("Save & apply") { Task { await save() } }
                 .buttonStyle(.borderedProminent)
@@ -80,168 +79,292 @@ struct SettingsView: View {
         }
     }
 
-    private var routeSummary: some View {
+    /// The pipeline at a glance, in the order a document actually moves through it.
+    private var pipelineSummary: some View {
         HStack(spacing: 0) {
-            SummaryRoute(label: "Retrieval", value: embeddingSummary, detail: "Embedding", color: .knodeCyan)
+            SummaryRoute(label: "Convert", value: routeSummary(\.extraction.documentLlm), detail: "Images & scanned PDFs", color: .knodeViolet)
             Divider().frame(height: 54)
-            SummaryRoute(label: "Structure", value: routeSummary(\.extraction.entityLlm), detail: "Entity extraction", color: .knodeViolet)
+            SummaryRoute(label: "Index", value: embeddingSummary, detail: "Embedding", color: .knodeCyan)
             Divider().frame(height: 54)
-            SummaryRoute(label: "Synthesis", value: routeSummary(\.extraction.conceptLlm), detail: "Concept model", color: .knodeViolet)
+            SummaryRoute(label: "Extract", value: routeSummary(\.extraction.entityLlm), detail: "Entities & relations", color: .knodeViolet)
             Divider().frame(height: 54)
-            SummaryRoute(label: "Vision", value: routeSummary(\.extraction.documentLlm), detail: "PDF & image conversion", color: .knodeViolet)
+            SummaryRoute(label: "Synthesize", value: routeSummary(\.extraction.conceptLlm), detail: "Concept pages", color: .knodeViolet)
+            Divider().frame(height: 54)
+            SummaryRoute(label: "Answer", value: defaultModelSummary, detail: "Ask, Wiki & Dream", color: .knodeViolet)
         }
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
         .overlay { RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.08)) }
     }
 
-    private var embeddingSection: some View {
+    // MARK: - 01 · Providers
+
+    /// Every endpoint and credential lives here, once. Section 02 only points at them.
+    private var providersSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            sectionHeader(index: "01 · Retrieval", title: "Embedding model", detail: "Turns every chunk into vectors for semantic and hybrid recall.", badge: "Required", color: .knodeCyan)
-            VStack(alignment: .leading, spacing: 14) {
-                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-                    GridRow {
-                        FieldLabel("Provider") {
-                            Picker("Provider", selection: binding(\.embedding.provider)) {
-                                Text("Local hashing · offline").tag("local")
-                                Text("OpenAI-compatible API").tag("openai")
-                            }
-                            .labelsHidden()
+            sectionHeader(
+                index: "01 · Providers",
+                title: "Endpoints and credentials",
+                detail: "Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice.",
+                badge: "Configure once",
+                color: .knodeCyan
+            )
+            embeddingCard
+            defaultProviderCard
+            connectionsEditor
+        }
+    }
+
+    private var embeddingCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            cardHeader(
+                title: "Embedding provider",
+                detail: "One per workspace — the Index stage always uses it.",
+                badge: "Required",
+                color: .knodeCyan
+            )
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+                GridRow {
+                    FieldLabel("Provider") {
+                        Picker("Provider", selection: binding(\.embedding.provider)) {
+                            Text("Local hashing · offline").tag("local")
+                            Text("OpenAI-compatible API").tag("openai")
+                            Text("Volcengine Ark · multimodal").tag("ark-multimodal")
                         }
-                        FieldLabel("Model") {
-                            TextField("text-embedding-3-small", text: binding(\.embedding.model))
-                                .disabled(config?.embedding.provider == "local")
-                        }
+                        .labelsHidden()
                     }
-                    GridRow {
-                        FieldLabel("Base URL") {
-                            TextField("https://api.openai.com/v1", text: binding(\.embedding.baseUrl))
-                                .disabled(config?.embedding.provider == "local")
-                        }
-                        FieldLabel("API key") {
-                            SecureField("env:OPENAI_API_KEY", text: binding(\.embedding.apiKey))
-                                .disabled(config?.embedding.provider == "local")
-                        }
+                    ModelField(
+                        placeholder: config?.embedding.provider == "ark-multimodal" ? "ep-…" : "text-embedding-3-small",
+                        text: binding(\.embedding.model),
+                        providerKey: config?.embedding.provider ?? "",
+                        disabled: config?.embedding.provider == "local",
+                        load: { try await modelList(route: "embedding") }
+                    )
+                }
+                GridRow {
+                    FieldLabel("Base URL") {
+                        TextField("https://api.openai.com/v1", text: binding(\.embedding.baseUrl))
+                            .disabled(config?.embedding.provider == "local")
                     }
-                    GridRow {
-                        FieldLabel("Dimensions") {
-                            TextField("Dimensions", value: binding(\.embedding.dimensions), format: .number)
-                        }
-                        Toggle("Send dimensions with API requests", isOn: binding(\.embedding.sendDimensions))
-                            .toggleStyle(.checkbox)
+                    FieldLabel("API key") {
+                        SecureField("env:OPENAI_API_KEY", text: binding(\.embedding.apiKey))
                             .disabled(config?.embedding.provider == "local")
                     }
                 }
-                Text(config?.embedding.provider == "local"
-                    ? "The local hashing embedder is private, offline, and ready immediately."
-                    : "Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep keys out of the config file.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                GridRow {
+                    FieldLabel("Dimensions") {
+                        TextField("Dimensions", value: binding(\.embedding.dimensions), format: .number)
+                    }
+                    Toggle("Send dimensions with API requests", isOn: binding(\.embedding.sendDimensions))
+                        .toggleStyle(.checkbox)
+                        .disabled(config?.embedding.provider == "local")
+                }
             }
-            .knodeCard(padding: 18)
+            Text(embeddingNote)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
+        .knodeCard(padding: 18)
     }
 
-    private var extractionSection: some View {
+    private var defaultProviderCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            sectionHeader(index: "02 · Knowledge pipeline", title: "Conversion, extraction & synthesis", detail: "Route document vision, fast structure work and deeper concept writing to different models.", badge: "Independent", color: .knodeViolet)
-            HStack(alignment: .top, spacing: 14) {
-                RouteCard(
-                    marker: "A",
-                    title: "Entity extraction",
-                    detail: "Names entities, relations, and factual claims from changed documents.",
-                    route: binding(\.extraction.entityLlm)
-                )
-                RouteCard(
-                    marker: "B",
-                    title: "Concept synthesis",
-                    detail: "Turns hot entity clusters into readable, linked Concept pages.",
-                    route: binding(\.extraction.conceptLlm)
-                )
-                RouteCard(
-                    marker: "C",
-                    title: "Document vision",
-                    detail: "Converts images and scanned PDF pages into searchable Markdown.",
-                    route: binding(\.extraction.documentLlm),
-                    allowCursor: false
-                )
-            }
-
-            VStack(alignment: .leading, spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Pipeline controls").font(.headline)
-                    Text("Bound background work without changing the selected models.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            cardHeader(
+                title: "Default LLM provider",
+                detail: "What a stage runs on unless it picks another connection, and what answers Ask, Wiki and Dream.",
+                badge: "Default",
+                color: .knodeViolet
+            )
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+                GridRow {
+                    FieldLabel("Provider") {
+                        Picker("Provider", selection: binding(\.llm.provider)) {
+                            Text("OpenAI-compatible API").tag("openai")
+                            Text("Codex CLI").tag("codex-cli")
+                            Text("Claude Code CLI").tag("claude-cli")
+                            Text("Cursor Agent CLI").tag("cursor-cli")
+                        }
+                        .labelsHidden()
+                    }
+                    ModelField(
+                        placeholder: config?.llm.provider == "openai" ? "gpt-4.1-mini" : "Use CLI default",
+                        text: binding(\.llm.model),
+                        providerKey: config?.llm.provider ?? "",
+                        load: { try await modelList(route: "llm") }
+                    )
                 }
-                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
+                if config?.llm.provider == "openai" {
                     GridRow {
-                        FieldLabel("Daily token budget") {
-                            TextField("Budget", value: binding(\.extraction.dailyTokenBudget), format: .number)
-                        }
-                        FieldLabel("Documents per pass") {
-                            TextField("Batch", value: binding(\.extraction.batchSize), format: .number)
-                        }
-                        FieldLabel("Parallel calls") {
-                            TextField("Concurrency", value: binding(\.extraction.concurrency), format: .number)
-                        }
+                        FieldLabel("Base URL") { TextField("https://api.openai.com/v1", text: binding(\.llm.baseUrl)) }
+                        FieldLabel("API key") { SecureField("env:OPENAI_API_KEY", text: binding(\.llm.apiKey)) }
+                    }
+                } else {
+                    GridRow {
+                        CliExecutableField(tool: cliTools[config?.llm.provider ?? ""], path: binding(\.llm.cliPath))
+                            .gridCellColumns(2)
                     }
                 }
-                Toggle("Extract factual claims alongside entities", isOn: binding(\.extraction.claims))
-                    .toggleStyle(.checkbox)
             }
-            .knodeCard(padding: 18)
+            Text(defaultModelNote)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
+        .knodeCard(padding: 18)
     }
 
-    private var defaultModelSection: some View {
-        DisclosureGroup(isExpanded: $defaultExpanded) {
-            VStack(alignment: .leading, spacing: 14) {
-                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-                    GridRow {
-                        FieldLabel("Provider") {
-                            Picker("Provider", selection: binding(\.llm.provider)) {
-                                Text("OpenAI-compatible API").tag("openai")
-                                Text("Codex CLI").tag("codex-cli")
-                                Text("Claude Code CLI").tag("claude-cli")
-                                Text("Cursor Agent CLI").tag("cursor-cli")
-                            }
-                            .labelsHidden()
-                        }
-                        FieldLabel("Model") {
-                            TextField(config?.llm.provider == "openai" ? "gpt-4.1-mini" : "Use CLI default", text: binding(\.llm.model))
-                        }
-                    }
-                    if config?.llm.provider == "openai" {
-                        GridRow {
-                            FieldLabel("Base URL") { TextField("https://api.openai.com/v1", text: binding(\.llm.baseUrl)) }
-                            FieldLabel("API key") { SecureField("env:OPENAI_API_KEY", text: binding(\.llm.apiKey)) }
-                        }
-                    } else {
-                        GridRow {
-                            FieldLabel("CLI executable") { TextField("Use command from PATH", text: binding(\.llm.cliPath)) }
-                        }
-                    }
-                }
-                Text(defaultModelNote)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.top, 14)
-        } label: {
-            HStack {
+    /// Extra endpoints beyond the default, named so a stage can pick one by name.
+    private var connectionsEditor: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Default reasoning model").font(.headline)
-                    Text("Fallback for inherited routes, Ask, Wiki summaries, and Dream analysis")
+                    Text("Other connections").font(.headline)
+                    Text("Add one when a stage needs a different endpoint — a vision-capable API, a cheaper model, a second key.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text(defaultModelSummary)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
+                Button("Add connection", systemImage: "plus") { addConnection() }
+                    .buttonStyle(.bordered)
+                    .disabled(config == nil)
+            }
+            ForEach(Array((config?.connections ?? []).enumerated()), id: \.element.id) { index, connection in
+                ConnectionCard(
+                    connection: binding(\.connections)[index],
+                    cliTools: cliTools,
+                    load: { try await modelList(route: "connection:\(connection.id)") },
+                    remove: { removeConnection(id: connection.id) }
+                )
             }
         }
+    }
+
+    // MARK: - 02 · Pipeline
+
+    /// The stages in the order a document passes through them, each with what it
+    /// asks of a model and a picker over section 01.
+    private var pipelineSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            sectionHeader(
+                index: "02 · Pipeline",
+                title: "What each stage needs",
+                detail: "A document moves down this list. The stages ask different things of a model, which is why each one can run somewhere else.",
+                badge: "Per stage",
+                color: .knodeViolet
+            )
+            VStack(spacing: 0) {
+                StageRow(
+                    step: 1,
+                    title: "Convert",
+                    detail: "Images and scanned PDF pages become searchable Markdown.",
+                    requirement: "Vision",
+                    requirementDetail: "The model has to see pixels: an API provider gets the image inline, codex takes --image, and claude and cursor read the file with their own tools. A text-only model fails here. Changing this re-converts every image and scanned page.",
+                    color: .knodeViolet
+                ) {
+                    StagePicker(
+                        route: binding(\.extraction.documentLlm),
+                        connections: config?.connections ?? [],
+                        defaultProvider: config?.llm.provider ?? "",
+                        load: { try await modelList(route: "documentLlm") }
+                    )
+                }
+                Divider()
+                StageRow(
+                    step: 2,
+                    title: "Index",
+                    detail: "Every chunk becomes a vector for semantic and hybrid recall.",
+                    requirement: "Embedding",
+                    requirementDetail: "Not an LLM — it uses the embedding provider from section 01, one per workspace. Changing its model or dimensions re-embeds the whole corpus.",
+                    color: .knodeCyan
+                ) {
+                    StagePin(value: embeddingSummary, hint: "Set in section 01 · Embedding provider")
+                }
+                Divider()
+                StageRow(
+                    step: 3,
+                    title: "Extract",
+                    detail: "Names entities, relations and factual claims in changed documents.",
+                    requirement: "Volume",
+                    requirementDetail: "The busiest stage — it runs on every changed document, bounded by the daily budget and batch size below. A fast, cheap model that returns clean JSON is usually the right trade.",
+                    color: .knodeViolet
+                ) {
+                    StagePicker(
+                        route: binding(\.extraction.entityLlm),
+                        connections: config?.connections ?? [],
+                        defaultProvider: config?.llm.provider ?? "",
+                        load: { try await modelList(route: "entityLlm") }
+                    )
+                }
+                Divider()
+                StageRow(
+                    step: 4,
+                    title: "Synthesize",
+                    detail: "Turns hot entity clusters into readable, linked Concept pages.",
+                    requirement: "Quality",
+                    requirementDetail: "Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.",
+                    color: .knodeViolet
+                ) {
+                    StagePicker(
+                        route: binding(\.extraction.conceptLlm),
+                        connections: config?.connections ?? [],
+                        defaultProvider: config?.llm.provider ?? "",
+                        load: { try await modelList(route: "conceptLlm") }
+                    )
+                }
+                Divider()
+                StageRow(
+                    step: 5,
+                    title: "Answer",
+                    detail: "Ask, wiki summaries and the nightly Dream analysis.",
+                    requirement: "Interactive",
+                    requirementDetail: "Always the default provider. Latency lands straight in the Ask box, so prefer something responsive.",
+                    color: .knodeViolet
+                ) {
+                    StagePin(value: defaultModelSummary, hint: "Set in section 01 · Default LLM provider")
+                }
+            }
+            .knodeCard(padding: 0)
+            pipelineControls
+        }
+    }
+
+    private var pipelineControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Pipeline controls").font(.headline)
+                Text("Bound background work without changing the selected models.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
+                GridRow {
+                    FieldLabel("Daily token budget") {
+                        TextField("Budget", value: binding(\.extraction.dailyTokenBudget), format: .number)
+                    }
+                    FieldLabel("Documents per pass") {
+                        TextField("Batch", value: binding(\.extraction.batchSize), format: .number)
+                    }
+                    FieldLabel("Parallel calls") {
+                        TextField("Concurrency", value: binding(\.extraction.concurrency), format: .number)
+                    }
+                }
+            }
+            Toggle("Extract factual claims alongside entities", isOn: binding(\.extraction.claims))
+                .toggleStyle(.checkbox)
+        }
         .knodeCard(padding: 18)
+    }
+
+    private func cardHeader(title: String, detail: String, badge: String, color: Color) -> some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.headline)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 12)
+            RouteBadge(label: badge, color: color)
+        }
     }
 
     private var workspaceDangerSection: some View {
@@ -267,12 +390,12 @@ struct SettingsView: View {
 
     private func testResults(_ result: ConfigTestResponse) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Route test results").font(.headline)
-            TestResultRow(label: "Embedding", result: result.embedding)
-            TestResultRow(label: "Default model", result: result.llm)
-            TestResultRow(label: "Entity route", result: result.entityLlm)
-            TestResultRow(label: "Concept route", result: result.conceptLlm)
-            TestResultRow(label: "Document vision", result: result.documentLlm)
+            Text("Stage test results").font(.headline)
+            TestResultRow(label: "1 · Convert", result: result.documentLlm)
+            TestResultRow(label: "2 · Index", result: result.embedding)
+            TestResultRow(label: "3 · Extract", result: result.entityLlm)
+            TestResultRow(label: "4 · Synthesize", result: result.conceptLlm)
+            TestResultRow(label: "5 · Answer", result: result.llm)
         }
         .knodeCard()
     }
@@ -296,6 +419,17 @@ struct SettingsView: View {
         )
     }
 
+    private var embeddingNote: String {
+        switch config?.embedding.provider {
+        case "local":
+            return "The local hashing embedder is private, offline, and ready immediately."
+        case "ark-multimodal":
+            return "Ark posts to /embeddings/multimodal and returns one vector per request, so Base URL ends at /api/v3 and Model is the endpoint id (ep-…). Dimensions must match the model — doubao-embedding-vision is 2048, or 1024 when the dimensions parameter is sent."
+        default:
+            return "Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep keys out of the config file."
+        }
+    }
+
     private var embeddingSummary: String {
         guard let config else { return "Loading…" }
         return config.embedding.provider == "local"
@@ -304,9 +438,11 @@ struct SettingsView: View {
     }
 
     private func routeSummary(_ keyPath: KeyPath<KnodeConfig, RoutedLLMConfig>) -> String {
-        guard let route = config?[keyPath: keyPath] else { return "Loading…" }
-        let provider = providerName(route.provider)
-        return route.model.isEmpty ? provider : "\(provider) · \(route.model)"
+        guard let config, let route = config[keyPath: keyPath] as RoutedLLMConfig? else { return "Loading…" }
+        let connection = config.connections.first { $0.id == route.use }
+        let name = connection?.label ?? (route.use.isEmpty ? "Default model" : providerName(route.provider))
+        let model = route.model.isEmpty ? (connection?.model ?? "") : route.model
+        return model.isEmpty ? name : "\(name) · \(model)"
     }
 
     private var defaultModelSummary: String {
@@ -320,7 +456,41 @@ struct SettingsView: View {
         case "codex-cli": "Uses your existing Codex login for a read-only one-shot request."
         case "claude-cli": "Uses your existing Claude Code login for one non-interactive turn."
         case "cursor-cli": "Uses your existing Cursor Agent login in headless print mode."
-        default: "An empty model disables general LLM features while deterministic features remain available."
+        default: "Any OpenAI-compatible chat endpoint works (OpenAI, DeepSeek, Ollama, vLLM, SiliconFlow…). Use env:VAR_NAME to keep the key out of the config file. An empty model disables LLM features; the deterministic pipeline keeps running."
+        }
+    }
+
+    /// Models the service reports for one route, using the on-screen draft so a
+    /// key or endpoint typed but not yet saved is the one that gets queried.
+    private func modelList(route: String) async throws -> ModelListResponse {
+        guard let config else { throw APIError(message: "Settings are still loading") }
+        return try await model.client().listModels(route: route, config: config)
+    }
+
+    /// The service writes 'default' for a migrated route; the picker uses '' for
+    /// the same thing, so settle on one spelling as the config comes in.
+    private func normalized(_ incoming: KnodeConfig) -> KnodeConfig {
+        var config = incoming
+        for keyPath in [\KnodeConfig.extraction.entityLlm, \KnodeConfig.extraction.conceptLlm, \KnodeConfig.extraction.documentLlm] {
+            if config[keyPath: keyPath].use == "default" { config[keyPath: keyPath].use = "" }
+        }
+        return config
+    }
+
+    private func addConnection() {
+        guard config != nil else { return }
+        var suffix = config!.connections.count + 1
+        while config!.connections.contains(where: { $0.id == "connection-\(suffix)" }) { suffix += 1 }
+        config!.connections.append(LLMConnection(id: "connection-\(suffix)", label: "Connection \(suffix)"))
+    }
+
+    private func removeConnection(id: String) {
+        guard config != nil else { return }
+        config!.connections.removeAll { $0.id == id }
+        // A route left pointing at a deleted connection would silently fall back
+        // to the default; say so by moving it there explicitly.
+        for keyPath in [\KnodeConfig.extraction.entityLlm, \KnodeConfig.extraction.conceptLlm, \KnodeConfig.extraction.documentLlm] {
+            if config![keyPath: keyPath].use == id { config![keyPath: keyPath].use = "" }
         }
     }
 
@@ -328,7 +498,10 @@ struct SettingsView: View {
         isLoading = true
         defer { isLoading = false }
         do {
-            config = try await model.client().config()
+            config = normalized(try await model.client().config())
+            if let tools = try? await model.client().cliTools() {
+                cliTools = Dictionary(tools.tools.map { ($0.provider, $0) }, uniquingKeysWith: { first, _ in first })
+            }
             statusMessage = ""
             testResult = nil
         } catch {
@@ -345,12 +518,12 @@ struct SettingsView: View {
     private func test() async {
         guard let config else { return }
         isWorking = true
-        statusMessage = "Testing configured routes…"
+        statusMessage = "Testing each configured stage…"
         statusIsError = false
         defer { isWorking = false }
         do {
             testResult = try await model.client().testConfig(config)
-            statusMessage = "Route tests complete"
+            statusMessage = "Stage tests complete"
         } catch {
             statusMessage = "Test failed: \(error.localizedDescription)"
             statusIsError = true
@@ -369,13 +542,13 @@ struct SettingsView: View {
         }
         do {
             let response = try await model.client().saveConfig(config)
-            self.config = response.config
+            self.config = normalized(response.config)
             if response.reembedded, let reindex = response.reindex {
                 statusMessage = "Configuration saved · re-embedded \(reindex.indexed) docs and \(reindex.chunks) chunks"
             } else if response.reconverted == true, let reindex = response.reindex {
                 statusMessage = "Configuration saved · refreshed document conversion for \(reindex.indexed) docs"
             } else {
-                statusMessage = "Configuration saved and routes applied"
+                statusMessage = "Configuration saved and stages applied"
             }
             model.showToast("Configuration saved for \(model.activeWorkspace?.displayName ?? "workspace")")
             await model.refreshStats()
@@ -392,13 +565,292 @@ struct SettingsView: View {
         defer { isWorking = false }
         do {
             try await model.clearActiveWorkspace()
-            config = try await model.client().config()
+            config = normalized(try await model.client().config())
             testResult = nil
             statusMessage = "Workspace cleared. A fresh empty directory tree is ready."
         } catch {
             statusMessage = "Clear failed: \(error.localizedDescription)"
             statusIsError = true
         }
+    }
+}
+
+/// A model name stays free text — any id the provider accepts — with a list of
+/// what the configured provider actually offers: its own `/models`, the CLI's
+/// own list, or the aliases a CLI documents when it has no list at all.
+private struct ModelField: View {
+    let placeholder: String
+    @Binding var text: String
+    /// Changing provider invalidates a fetched list, since it came from the old one.
+    var providerKey: String = ""
+    var disabled = false
+    let load: () async throws -> ModelListResponse
+
+    @State private var isShowing = false
+    @State private var isLoading = false
+    @State private var result: ModelListResponse?
+    @State private var failure: String?
+    @State private var filter = ""
+
+    var body: some View {
+        FieldLabel("Model") {
+            HStack(spacing: 6) {
+                TextField(placeholder, text: $text)
+                Button {
+                    isShowing = true
+                    Task { await reload() }
+                } label: {
+                    Image(systemName: "chevron.down").font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.borderless)
+                .help("List the models this provider offers")
+                .popover(isPresented: $isShowing, arrowEdge: .bottom) { picker }
+            }
+            .disabled(disabled)
+            .onChange(of: providerKey) { _, _ in
+                result = nil
+                failure = nil
+                filter = ""
+            }
+        }
+    }
+
+    private var picker: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Text("Models").font(.headline)
+                if let source = result?.source { RouteBadge(label: sourceLabel(source), color: source == "builtin" ? .knodeViolet : .knodeCyan) }
+                Spacer()
+                if isLoading { ProgressView().controlSize(.small) }
+                Button { Task { await reload(force: true) } } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless)
+                    .disabled(isLoading)
+                    .help("Ask the provider again")
+            }
+            if !options.isEmpty {
+                TextField("Filter \(options.count) models", text: $filter)
+                    .textFieldStyle(.roundedBorder)
+                // An explicit height: a ScrollView has no ideal height of its
+                // own, and a popover sizes itself to its content, so a
+                // maxHeight alone collapses the list to nothing.
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 1) {
+                        ForEach(filtered) { option in row(option) }
+                    }
+                    .padding(.trailing, 2)
+                }
+                .frame(height: listHeight)
+                if filtered.isEmpty {
+                    Text("Nothing matches “\(filter)”.").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if isLoading {
+                Text("Asking the provider…").font(.caption).foregroundStyle(.secondary)
+            } else if result != nil, failure == nil, result?.error == nil {
+                Text("This provider lists no models — type the id you want.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let message = failure ?? result?.error {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(Color.knodeBad)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let note = result?.note {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Divider()
+            HStack {
+                Text("Picking one fills the field — Save & apply writes it to the workspace config.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                if !text.isEmpty {
+                    Button("Clear") { text = ""; isShowing = false }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
+            }
+        }
+        .padding(14)
+        .frame(width: 430)
+    }
+
+    private func row(_ option: ModelOption) -> some View {
+        Button {
+            text = option.id
+            isShowing = false
+        } label: {
+            HStack(spacing: 8) {
+                Text(option.id).font(.system(size: 12, design: .monospaced))
+                if let label = option.label {
+                    Text(label).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer()
+                if option.id == text { Image(systemName: "checkmark").font(.caption).foregroundStyle(Color.knodeCyan) }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(option.id == text ? Color.knodeCyan.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var options: [ModelOption] { result?.models ?? [] }
+
+    /// Tall enough to read, short enough to stay a dropdown: one row is 25pt.
+    private var listHeight: CGFloat {
+        min(max(CGFloat(filtered.count) * 25, 25), 260)
+    }
+
+    private var filtered: [ModelOption] {
+        let needle = filter.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !needle.isEmpty else { return options }
+        return options.filter { $0.id.lowercased().contains(needle) || ($0.label ?? "").lowercased().contains(needle) }
+    }
+
+    private func reload(force: Bool = false) async {
+        if isLoading || (result != nil && !force) { return }
+        isLoading = true
+        failure = nil
+        defer { isLoading = false }
+        do {
+            result = try await load()
+        } catch {
+            failure = error.localizedDescription
+        }
+    }
+
+    private func sourceLabel(_ source: String) -> String {
+        switch source {
+        case "api": "from the endpoint"
+        case "cli": "from the CLI"
+        default: "suggestions"
+        }
+    }
+}
+
+/// The CLI executable is an override: the service resolves the command on its
+/// own PATH first — which the desktop app augments with the usual install
+/// directories — so the field only earns space when that lookup fails or the
+/// user wants to pin one specific binary.
+private struct CliExecutableField: View {
+    let tool: CliTool?
+    @Binding var path: String
+    @State private var editing = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if let tool {
+                if let found = tool.path, path.isEmpty, !editing {
+                    resolvedRow(tool, found)
+                } else {
+                    overrideField(tool)
+                }
+            } else {
+                FieldLabel("CLI executable") { TextField("Use command from PATH", text: $path) }
+            }
+        }
+    }
+
+    private func resolvedRow(_ tool: CliTool, _ found: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.knodeGood)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Runs \(tool.command) from PATH — nothing to fill in")
+                    .font(.caption.weight(.semibold))
+                Text(found)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            Button("Pin a path…") { editing = true }
+                .buttonStyle(.link)
+                .font(.caption)
+        }
+    }
+
+    @ViewBuilder
+    private func overrideField(_ tool: CliTool) -> some View {
+        FieldLabel("CLI executable") {
+            TextField(tool.path ?? "/full/path/to/\(tool.command)", text: $path)
+        }
+        if tool.path == nil {
+            Label("\(tool.command) is not on the service PATH — enter its full path.", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(Color.knodeBad)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if !path.isEmpty || editing {
+            Button("Use \(tool.command) from PATH instead") {
+                path = ""
+                editing = false
+            }
+            .buttonStyle(.link)
+            .font(.caption)
+        }
+    }
+}
+
+/// One named connection: the endpoint and credentials a route points at by id.
+private struct ConnectionCard: View {
+    @Binding var connection: LLMConnection
+    let cliTools: [String: CliTool]
+    let load: () async throws -> ModelListResponse
+    let remove: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                TextField("Name this connection", text: $connection.label)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 240)
+                Text(connection.id)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Button(role: .destructive) { remove() } label: { Image(systemName: "trash") }
+                    .buttonStyle(.borderless)
+                    .help("Remove this connection")
+            }
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+                GridRow {
+                    FieldLabel("Provider") {
+                        Picker("Provider", selection: $connection.provider) {
+                            Text("OpenAI-compatible API").tag("openai")
+                            Text("Codex CLI").tag("codex-cli")
+                            Text("Claude Code CLI").tag("claude-cli")
+                            Text("Cursor Agent CLI").tag("cursor-cli")
+                        }
+                        .labelsHidden()
+                    }
+                    ModelField(
+                        placeholder: connection.provider == "openai" ? "gpt-4.1-mini" : "Use CLI default",
+                        text: $connection.model,
+                        providerKey: connection.provider,
+                        load: load
+                    )
+                }
+                if connection.provider == "openai" {
+                    GridRow {
+                        FieldLabel("Base URL") { TextField("https://api.openai.com/v1", text: $connection.baseUrl) }
+                        FieldLabel("API key") { SecureField("env:OPENAI_API_KEY", text: $connection.apiKey) }
+                    }
+                } else {
+                    GridRow {
+                        CliExecutableField(tool: cliTools[connection.provider], path: $connection.cliPath)
+                            .gridCellColumns(2)
+                    }
+                }
+            }
+        }
+        .knodeCard(padding: 18)
     }
 }
 
@@ -438,61 +890,109 @@ private struct FieldLabel<Content: View>: View {
     }
 }
 
-private struct RouteCard: View {
-    let marker: String
+/// One pipeline stage: what it does, what it asks of a model, and the control
+/// that points it at a provider from section 01.
+private struct StageRow<Control: View>: View {
+    let step: Int
     let title: String
     let detail: String
-    @Binding var route: RoutedLLMConfig
-    var allowCursor = true
+    let requirement: String
+    let requirementDetail: String
+    let color: Color
+    @ViewBuilder let control: Control
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 13) {
-            HStack(alignment: .top, spacing: 10) {
-                Text(marker)
-                    .font(.caption.monospaced().bold())
-                    .foregroundStyle(Color.knodeViolet)
-                    .frame(width: 28, height: 28)
-                    .background(Color.knodeViolet.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
-                    .overlay { RoundedRectangle(cornerRadius: 7).stroke(Color.knodeViolet.opacity(0.28)) }
-                VStack(alignment: .leading, spacing: 3) {
+        HStack(alignment: .top, spacing: 16) {
+            Text("\(step)")
+                .font(.caption.monospaced().bold())
+                .foregroundStyle(color)
+                .frame(width: 26, height: 26)
+                .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                .overlay { RoundedRectangle(cornerRadius: 7).stroke(color.opacity(0.28)) }
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
                     Text(title).font(.headline)
-                    Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    RouteBadge(label: requirement, color: color)
                 }
+                Text(detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(requirementDetail)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            Spacer(minLength: 16)
+            control.frame(width: 300)
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Picks which configured provider runs a stage, plus an optional model override.
+private struct StagePicker: View {
+    @Binding var route: RoutedLLMConfig
+    let connections: [LLMConnection]
+    let defaultProvider: String
+    let load: () async throws -> ModelListResponse
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
             FieldLabel("Run with") {
-                Picker("Run with", selection: $route.provider) {
-                    Text("Default reasoning model").tag("inherit")
-                    Text("OpenAI-compatible API").tag("openai")
-                    Text("Codex CLI").tag("codex-cli")
-                    Text("Claude Code CLI").tag("claude-cli")
-                    if allowCursor { Text("Cursor Agent CLI").tag("cursor-cli") }
+                Picker("Run with", selection: $route.use) {
+                    Text("Default LLM provider").tag("")
+                    ForEach(connections) { connection in
+                        Text(connection.label).tag(connection.id)
+                    }
                 }
                 .labelsHidden()
             }
-            FieldLabel("Model") { TextField(route.provider == "openai" ? "Model name" : "Optional · use provider default", text: $route.model) }
-            if route.provider == "openai" {
-                FieldLabel("Base URL") { TextField("Inherit default endpoint", text: $route.baseUrl) }
-                FieldLabel("API key") { SecureField("Inherit default key", text: $route.apiKey) }
-            } else if route.provider != "inherit" {
-                FieldLabel("CLI executable") { TextField("Use command from PATH", text: $route.cliPath) }
-            }
-            Text(routeNote)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(minHeight: 32, alignment: .topLeading)
+            ModelField(
+                placeholder: "Optional · use its model",
+                text: $route.model,
+                providerKey: route.use,
+                load: load
+            )
+            Text(runningOn)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .knodeCard(padding: 18)
     }
 
-    private var routeNote: String {
-        switch route.provider {
-        case "inherit": "Uses the default provider, endpoint, credentials, and model unless overridden here."
-        case "openai": "Endpoint and key may stay empty to reuse the default API connection."
-        case "codex-cli": "Runs codex exec with your existing Codex login."
-        case "claude-cli": "Runs claude -p with your existing Claude Code login."
-        default: "Runs cursor-agent -p with your existing Cursor Agent login."
+    private var runningOn: String {
+        guard let connection = connections.first(where: { $0.id == route.use }) else {
+            return "Runs on the default provider (\(providerName(defaultProvider)))."
         }
+        let endpoint = connection.provider == "openai"
+            ? (connection.baseUrl.isEmpty ? "no endpoint set" : connection.baseUrl)
+            : providerName(connection.provider)
+        return "Runs on \(endpoint)."
+    }
+}
+
+/// A stage whose provider is not chosen here — it follows section 01.
+private struct StagePin: View {
+    let value: String
+    let hint: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("Runs on")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.callout.weight(.medium))
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(hint)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -504,7 +1004,7 @@ private struct TestResultRow: View {
         HStack(spacing: 10) {
             Image(systemName: icon)
                 .foregroundStyle(color)
-            Text(label).fontWeight(.semibold).frame(width: 120, alignment: .leading)
+            Text(label).fontWeight(.semibold).frame(width: 132, alignment: .leading)
             Text(detail).foregroundStyle(.secondary)
             Spacer()
         }
@@ -531,6 +1031,7 @@ private struct TestResultRow: View {
         if let model = result.model { parts.append(model) }
         if let dimensions = result.dimensions { parts.append("\(dimensions)d") }
         if let ms = result.ms { parts.append("\(ms)ms") }
+        if let sample = result.sample?.trimmingCharacters(in: .whitespacesAndNewlines), !sample.isEmpty { parts.append("replied “\(sample)”") }
         return parts.isEmpty ? "Connected" : parts.joined(separator: " · ")
     }
 }

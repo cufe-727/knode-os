@@ -10,7 +10,7 @@ import {
   relationId,
   slugify,
 } from '../graph/store.js';
-import { toVectorLiteral } from '../store/db.js';
+import { toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
 import { toIso } from '../store/temporal.js';
 import { DocRoot, SuggestionRow } from '../types.js';
@@ -306,7 +306,7 @@ export class ScopeWriter {
     }
     for (const [chunkId, vec] of vectors) {
       await this.q.query(
-        `INSERT INTO embeddings (chunk_id, model, embedding) VALUES ($1, $2, $3::vector)
+        `INSERT INTO embeddings (chunk_id, model, embedding) VALUES ($1, $2, $3::${VECTOR_TYPE})
          ON CONFLICT (chunk_id) DO UPDATE SET model = EXCLUDED.model, embedding = EXCLUDED.embedding`,
         [chunkId, model, toVectorLiteral(vec)],
       );

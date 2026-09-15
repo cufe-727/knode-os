@@ -3,21 +3,56 @@ import os from 'node:os';
 import path from 'node:path';
 
 export interface EmbeddingConfig {
-  /** 'openai' = any OpenAI-compatible /v1/embeddings endpoint; 'local' = built-in hashing embedder (offline, no key needed). */
-  provider: 'openai' | 'local';
+  /**
+   * 'openai'         = any OpenAI-compatible /v1/embeddings endpoint;
+   * 'ark-multimodal' = Volcengine Ark's /embeddings/multimodal endpoint
+   *                    (doubao-embedding-vision-*), which fuses one input into
+   *                    a single vector and therefore embeds one text per call;
+   * 'local'          = built-in hashing embedder (offline, no key needed).
+   */
+  provider: 'openai' | 'ark-multimodal' | 'local';
   baseUrl: string;
   /** Plain key, or "env:VAR_NAME" to read from the environment. */
   apiKey: string;
   model: string;
   dimensions: number;
+  /** openai: texts per request. ark-multimodal: parallel single-text requests. */
   batchSize: number;
   /**
-   * Send the OpenAI-only `dimensions` request param (text-embedding-3+). Many
-   * OpenAI-compatible routers (litellm/volcengine, Ollama, …) reject unknown
-   * params — leave false unless your endpoint truncates via `dimensions`. When
-   * false, `dimensions` must match the model's native output size.
+   * Send the `dimensions` request param (OpenAI text-embedding-3+, and Ark's
+   * multimodal endpoint). Many OpenAI-compatible routers (litellm, Ollama, …)
+   * reject unknown params — leave false unless your endpoint truncates via
+   * `dimensions`. When false, `dimensions` must match the model's native
+   * output size.
    */
   sendDimensions: boolean;
+}
+
+/**
+ * Where the derived index lives.
+ *
+ * 'pglite' keeps the zero-setup default: an embedded Postgres per workspace
+ * under `<workspace>/.knode/db`, nothing to install or run. 'postgres' points
+ * the same schema at an external server — worth it once a workspace outgrows
+ * PGlite's single-process 32-bit WASM build (roughly a million chunks), or when
+ * several processes must read one index concurrently. There, all workspaces
+ * share one database and are isolated by schema: a schema is free where a
+ * database carries its own ~8 MB catalog, one pool serves every workspace, and
+ * each schema keeps a private HNSW index (a shared table keyed by workspace
+ * could not — HNSW walks a distance-ordered graph, so an equality predicate on
+ * a scalar column cannot be pushed into the walk).
+ */
+export interface DatabaseConfig {
+  kind: 'pglite' | 'postgres';
+  host: string;
+  port: number;
+  user: string;
+  /** Plain key, or "env:VAR_NAME". Empty when the server uses trust/peer auth. */
+  password: string;
+  /** The single database every workspace shares. Created on first open. */
+  database: string;
+  /** Schemas are named `<prefix>_<workspace slug>_<hash of the data dir>`. */
+  schemaPrefix: string;
 }
 
 export type LlmProvider = 'openai' | 'codex-cli' | 'claude-cli' | 'cursor-cli';
@@ -47,7 +82,29 @@ export interface LlmConfig {
 
 /** Per-job LLM routing. `inherit` keeps using the default `llm` connection. */
 export interface RoutedLlmConfig extends Omit<LlmConfig, 'provider'> {
+  /**
+   * Legacy per-route provider. Kept so configs written before named
+   * connections keep resolving; `loadConfig` migrates these into `use`.
+   */
   provider: 'inherit' | LlmProvider;
+  /**
+   * Which connection runs this route: '' or 'default' for the default LLM
+   * provider, otherwise an `LlmConnection.id`. `model` still overrides the
+   * connection's own model, so one endpoint can serve several routes at
+   * different price points.
+   */
+  use: string;
+}
+
+/**
+ * A named LLM connection. Endpoint and credentials live here once; routes
+ * point at one by id instead of repeating them.
+ */
+export interface LlmConnection extends LlmConfig {
+  /** Stable key routes reference. Never reused for a different endpoint. */
+  id: string;
+  /** Shown in the UI. */
+  label: string;
 }
 
 export interface ExtractionConfig {
@@ -211,7 +268,11 @@ export interface PackConfig {
 
 export interface KnodeConfig {
   embedding: EmbeddingConfig;
+  database: DatabaseConfig;
+  /** The default connection every route inherits unless it names another. */
   llm: LlmConfig;
+  /** Extra named connections routes can be pointed at. */
+  connections: LlmConnection[];
   server: { port: number; host: string };
   ingest: { chunkSize: number; chunkOverlap: number; watch: boolean; concurrency?: number };
   extraction: ExtractionConfig;
@@ -228,7 +289,7 @@ export interface KnodeConfig {
     skillDirs: string[];
     syncIntervalMinutes: number;
     /**
-     * Cook synced transcripts into searchable episodes under cooked/traces.
+     * Prepare synced transcripts as searchable episodes (Markdown in their sidecars).
      * Off by default: a machine with months of agent history would otherwise
      * turn one sync into thousands of embedding calls.
      */
@@ -257,6 +318,15 @@ export function defaultConfig(): KnodeConfig {
       batchSize: 32,
       sendDimensions: false,
     },
+    database: {
+      kind: 'pglite',
+      host: '127.0.0.1',
+      port: 5432,
+      user: '',
+      password: '',
+      database: 'knode',
+      schemaPrefix: 'ws',
+    },
     llm: {
       provider: 'openai',
       baseUrl: 'https://api.openai.com/v1',
@@ -265,6 +335,7 @@ export function defaultConfig(): KnodeConfig {
       cliPath: '',
       cliTimeoutMs: 300_000,
     },
+    connections: [],
     server: { port: 9100, host: '127.0.0.1' },
     ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4 },
     extraction: {
@@ -319,6 +390,7 @@ export function defaultConfig(): KnodeConfig {
 
 export function defaultRoutedLlmConfig(): RoutedLlmConfig {
   return {
+    use: '',
     provider: 'inherit',
     baseUrl: '',
     apiKey: '',
@@ -328,8 +400,35 @@ export function defaultRoutedLlmConfig(): RoutedLlmConfig {
   };
 }
 
-/** Resolve a per-job route into a concrete client configuration. */
-export function resolveRoutedLlmConfig(base: LlmConfig, route: RoutedLlmConfig, legacyModel = ''): LlmConfig {
+/**
+ * Resolve a per-job route into a concrete client configuration.
+ *
+ * A route that names a connection takes that connection whole, with its own
+ * `model` as an override. Anything else falls back to the pre-connections
+ * behaviour: inherit the default provider, or use the fields the route carries
+ * itself. An unknown id resolves to the default rather than failing a pipeline
+ * pass — deleting a connection degrades a route, it does not break it.
+ */
+export function resolveRoutedLlmConfig(
+  base: LlmConfig,
+  route: RoutedLlmConfig,
+  connections: LlmConnection[],
+  legacyModel = '',
+): LlmConfig {
+  const connection = route.use && route.use !== 'default' ? connections.find((c) => c.id === route.use) : undefined;
+  if (connection) {
+    return {
+      provider: connection.provider,
+      baseUrl: connection.baseUrl,
+      apiKey: connection.apiKey,
+      model: route.model || connection.model,
+      cliPath: connection.cliPath,
+      cliTimeoutMs: route.cliTimeoutMs || connection.cliTimeoutMs,
+    };
+  }
+  if (route.use) {
+    return { ...base, model: route.model || legacyModel || base.model };
+  }
   const provider = route.provider === 'inherit' ? base.provider : route.provider;
   const inheritedProvider = route.provider === 'inherit';
   return {
@@ -362,7 +461,60 @@ export function loadConfig(dataDir: string): KnodeConfig {
   const base = defaultConfig();
   if (!fs.existsSync(file)) return base;
   const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<KnodeConfig>;
-  return deepMerge(base, raw);
+  return migrateRouteConnections(deepMerge(base, raw));
+}
+
+const ROUTE_KEYS = ['entityLlm', 'conceptLlm', 'documentLlm'] as const;
+
+/**
+ * Lift pre-connections route overrides into named connections, in memory, so
+ * everything downstream only has to understand `use`. A route whose resolved
+ * endpoint matches the default just points at the default; the rest get a
+ * connection each, deduplicated so routes sharing an endpoint share one. The
+ * route keeps its own `model`, which stays an override on top.
+ */
+export function migrateRouteConnections(config: KnodeConfig): KnodeConfig {
+  const connections = [...(config.connections ?? [])];
+  for (const key of ROUTE_KEYS) {
+    const route = config.extraction[key];
+    if (!route || route.use || route.provider === 'inherit') continue;
+    const resolved = resolveRoutedLlmConfig(config.llm, route, []);
+    if (sameEndpoint(resolved, config.llm)) {
+      config.extraction[key] = { ...route, use: 'default' };
+      continue;
+    }
+    const existing = connections.find((c) => sameEndpoint(c, resolved));
+    const connection = existing ?? {
+      ...resolved,
+      model: '',
+      id: uniqueConnectionId(resolved.provider, connections),
+      label: llmProviderLabel(resolved.provider),
+    };
+    if (!existing) connections.push(connection);
+    config.extraction[key] = { ...route, use: connection.id };
+  }
+  return { ...config, connections };
+}
+
+function sameEndpoint(a: LlmConfig, b: LlmConfig): boolean {
+  return a.provider === b.provider && a.baseUrl === b.baseUrl && a.apiKey === b.apiKey && a.cliPath === b.cliPath;
+}
+
+function uniqueConnectionId(provider: LlmProvider, connections: LlmConnection[]): string {
+  for (let n = 1; ; n++) {
+    const id = `${provider}-${n}`;
+    if (!connections.some((c) => c.id === id)) return id;
+  }
+}
+
+export function llmProviderLabel(provider: LlmProvider): string {
+  switch (provider) {
+    case 'openai': return 'OpenAI-compatible API';
+    case 'codex-cli': return 'Codex CLI';
+    case 'claude-cli': return 'Claude Code CLI';
+    case 'cursor-cli': return 'Cursor Agent CLI';
+    default: return provider;
+  }
 }
 
 export function saveConfig(dataDir: string, config: KnodeConfig): void {
@@ -385,11 +537,13 @@ export function resolveDataDir(flag?: string): string {
 /** Redact secrets for API exposure. */
 export function redactConfig(config: KnodeConfig): KnodeConfig {
   const clone = JSON.parse(JSON.stringify(config)) as KnodeConfig;
-  for (const c of [clone.embedding, clone.llm, clone.extraction.entityLlm, clone.extraction.conceptLlm, clone.extraction.documentLlm]) {
+  const secretHolders = [clone.embedding, clone.llm, clone.extraction.entityLlm, clone.extraction.conceptLlm, clone.extraction.documentLlm, ...(clone.connections ?? [])];
+  for (const c of secretHolders) {
     if (c.apiKey && !c.apiKey.startsWith('env:')) c.apiKey = '***';
   }
   for (const ds of clone.datasources ?? []) {
     if (ds.password && !ds.password.startsWith('env:')) ds.password = '***';
   }
+  if (clone.database?.password && !clone.database.password.startsWith('env:')) clone.database.password = '***';
   return clone;
 }

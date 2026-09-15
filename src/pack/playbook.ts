@@ -1,10 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
+import { PACKS_DIR } from '../fs/layout.js';
 
 /**
  * Playbooks are the "script" form of a context pack: agent-readable,
- * agent-editable markdown files under <data>/packs/. The frontmatter declares
+ * agent-editable markdown files under <data>/playbooks/packs/. The frontmatter declares
  * which entities the playbook applies to, how to retrieve documents, and
  * which live probe queries to run; the body is guidance handed to the agent
  * verbatim. The learning loop (src/pack/learn.ts) revises these files based
@@ -37,7 +38,7 @@ export interface PlaybookProbe {
 }
 
 export interface Playbook {
-  /** Path relative to the data dir, e.g. packs/organization.md. */
+  /** Path relative to the data dir, e.g. playbooks/packs/organization.md. */
   path: string;
   appliesTo: string;
   retrieval: { k: number; mode: 'hybrid' | 'vector' | 'keyword' | 'sag' };
@@ -48,11 +49,11 @@ export interface Playbook {
 }
 
 export function loadPlaybooks(dataDir: string): Playbook[] {
-  const dir = path.join(dataDir, 'packs');
+  const dir = path.join(dataDir, PACKS_DIR);
   if (!fs.existsSync(dir)) return [];
   const out: Playbook[] = [];
   for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.md')).sort()) {
-    const parsed = parsePlaybook(fs.readFileSync(path.join(dir, file), 'utf8'), `packs/${file}`);
+    const parsed = parsePlaybook(fs.readFileSync(path.join(dir, file), 'utf8'), `${PACKS_DIR}/${file}`);
     if (parsed) out.push(parsed);
   }
   return out;
@@ -155,11 +156,11 @@ Applies to any matched entity without a more specific playbook.
 /** Write the generic fallback playbook once (never overwrites user edits). */
 export function ensureDefaultPlaybooks(dataDir: string): string[] {
   const created: string[] = [];
-  const file = path.join(dataDir, 'packs', 'default.md');
+  const file = path.join(dataDir, PACKS_DIR, 'default.md');
   if (!fs.existsSync(file)) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, DEFAULT_PLAYBOOK);
-    created.push('packs/default.md');
+    created.push(`${PACKS_DIR}/default.md`);
   }
   return created;
 }

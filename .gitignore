@@ -19,11 +19,14 @@ coverage/
 tmp/
 temp/
 
-# Local data directories
+# Local data directories (and the pre-v3 layouts moved aside as *.old-<date>)
 .dev-data/
 .demo/
 .demo-data/
 knode-data/
+.dev-data.old-*/
+.demo.old-*/
+.demo-data.old-*/
 
 # Swift build output (macos/)
 .build/

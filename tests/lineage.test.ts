@@ -8,7 +8,7 @@ import { DuckDBInstance } from '@duckdb/node-api';
 import { loadConfig, saveConfig } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
-import { readSidecar, updateSidecar } from '../src/fs/sidecar.js';
+import { readSidecarPart, updateSidecarPart } from '../src/fs/sidecar.js';
 import { claimsForEntities, graphSearch } from '../src/graph/query.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import { sync } from '../src/ingest/sync.js';
@@ -124,16 +124,16 @@ describe('lineage: temporal composability of sources', () => {
     expect(first.applied).toBeGreaterThanOrEqual(1); // the report plus the wiki anchor pages
     expect(first.errors).toBe(0);
 
-    const scope = await findLiveScope(store, 'doc', 'cooked/docs/a.md');
+    const scope = await findLiveScope(store, 'doc', 'raw/docs/a.md');
     expect(scope).not.toBeNull();
-    expect(await count(store, `chunks c JOIN documents d ON d.id = c.document_id WHERE d.path = 'cooked/docs/a.md'`)).toBeGreaterThan(0);
+    expect(await count(store, `chunks c JOIN documents d ON d.id = c.document_id WHERE d.path = 'raw/docs/a.md'`)).toBeGreaterThan(0);
     const ev = await liveEvidence(store, 'entity', '宁德时代');
     expect(ev.map((e) => e.extractor)).toEqual(expect.arrayContaining(['tier0.frontmatter']));
     expect((await entityRow(store, '比亚迪')).tx_to).toBeNull();
     expect(await count(store, `claims WHERE subject_id = '宁德时代' AND tx_to IS NULL`)).toBe(1);
     expect(await count(store, `relations WHERE type = 'co_occurs' AND tx_to IS NULL`)).toBeGreaterThan(0);
     const forDoc = (events: ReturnType<typeof readLedger>) =>
-      events.filter((e) => (e.ev === 'apply' || e.ev === 'dispose') && e.scope.key === 'cooked/docs/a.md');
+      events.filter((e) => (e.ev === 'apply' || e.ev === 'dispose') && e.scope.key === 'raw/docs/a.md');
     expect(forDoc(readLedger(dataDir)).map((e) => e.ev)).toEqual(['apply']);
 
     // remove the source
@@ -147,20 +147,22 @@ describe('lineage: temporal composability of sources', () => {
     expect((await entityRow(store, '动力电池')).tx_to).not.toBeNull();
     expect(await count(store, `claims WHERE tx_to IS NULL`)).toBe(0);
     expect(await count(store, `relations WHERE tx_to IS NULL`)).toBe(0);
-    expect(await count(store, `chunks c JOIN documents d ON d.id = c.document_id WHERE d.path = 'cooked/docs/a.md'`)).toBe(0);
+    expect(await count(store, `chunks c JOIN documents d ON d.id = c.document_id WHERE d.path = 'raw/docs/a.md'`)).toBe(0);
     expect(await count(store, `entity_mentions WHERE scope_id = $1`, [scope!.id])).toBe(0);
     expect(await count(store, `extraction_queue`)).toBe(0);
-    const [doc] = await store.query<{ status: string; scope_id: string | null }>(`SELECT status, scope_id FROM documents WHERE path = 'cooked/docs/a.md'`);
+    const [doc] = await store.query<{ status: string; scope_id: string | null }>(`SELECT status, scope_id FROM documents WHERE path = 'raw/docs/a.md'`);
     expect(doc).toMatchObject({ status: 'disposed', scope_id: null });
-    expect(fs.existsSync(path.join(dataDir, 'cooked/docs/a.md'))).toBe(false);
-    expect(fs.existsSync(path.join(dataDir, `ledger/attic/${scope!.id}.knode.json`))).toBe(true);
+    // the sidecar directory left with the source: everything paid is in the attic now
+    expect(fs.existsSync(path.join(dataDir, '.sidecar/raw/docs/a.md'))).toBe(false);
+    expect(fs.existsSync(path.join(dataDir, `ledger/attic/${scope!.id}/meta.json`))).toBe(true);
+    expect(fs.existsSync(path.join(dataDir, `ledger/attic/${scope!.id}/tier0.json`))).toBe(true);
     const events = forDoc(readLedger(dataDir));
     expect(events.map((e) => e.ev)).toEqual(['apply', 'dispose']);
     expect(events[1]).toMatchObject({ ev: 'dispose', reason: 'removed', attic: scope!.id });
 
     // search no longer sees it (vector recall still returns other pages); history still does
     const hits = await search(store, ctx.embedder, '宁德时代 动力电池', { k: 5, track: false });
-    expect(hits.map((h) => h.path)).not.toContain('cooked/docs/a.md');
+    expect(hits.map((h) => h.path)).not.toContain('raw/docs/a.md');
     const history = await historyOf(store, dataDir, 'raw/docs/a.md');
     expect(history.scopes[0].status).toBe('disposed');
   });
@@ -177,7 +179,7 @@ describe('lineage: temporal composability of sources', () => {
     expect(claims).toHaveLength(1);
     expect(claims[0]).toMatchObject({ evidence_count: 2, status: 'disputed' });
     expect((await entityRow(store, '宁德时代')).tx_to).toBeNull();
-    expect((await liveEvidence(store, 'entity', '比亚迪')).map((e) => e.scope_key).sort()).toEqual(['cooked/docs/a.md', 'cooked/docs/b.md']);
+    expect((await liveEvidence(store, 'entity', '比亚迪')).map((e) => e.scope_key).sort()).toEqual(['raw/docs/a.md', 'raw/docs/b.md']);
 
     fs.rmSync(path.join(dataDir, 'raw/docs/b.md'));
     await sync(ctx, { llmGraph: false });
@@ -188,13 +190,13 @@ describe('lineage: temporal composability of sources', () => {
     expect(after[0]).toMatchObject({ evidence_count: 1, status: 'fact', tx_to: null });
     const projected = await claimsForEntities(store, ['宁德时代']);
     expect(projected).toHaveLength(1);
-    expect(projected[0].path).toBe('cooked/docs/a.md');
+    expect(projected[0].path).toBe('raw/docs/a.md');
     expect(projected[0].startDate).toBe('2026-08-10');
     expect((await entityRow(store, '比亚迪')).tx_to).toBeNull();
     const lineage = await lineageOf(store, 'claim', claims[0].id);
-    expect(lineage.evidence.filter((e) => e.live).map((e) => e.scopeKey)).toEqual(['cooked/docs/a.md']);
+    expect(lineage.evidence.filter((e) => e.live).map((e) => e.scopeKey)).toEqual(['raw/docs/a.md']);
     // history keeps b.md's contribution (and a.md's from the earlier removal) as closed evidence
-    expect(lineage.evidence.filter((e) => !e.live && e.scopeKey === 'cooked/docs/b.md')).toHaveLength(1);
+    expect(lineage.evidence.filter((e) => !e.live && e.scopeKey === 'raw/docs/b.md')).toHaveLength(1);
   });
 
   it('re-applies idempotently: unchanged sources write nothing and weights never inflate', async () => {
@@ -230,10 +232,10 @@ describe('lineage: temporal composability of sources', () => {
     fs.appendFileSync(path.join(dataDir, 'raw/docs/a.md'), '\n补充：产能持续扩张。\n');
     const s = await sync(ctx, { llmGraph: false });
     expect(s.applied).toBe(1);
-    expect(await count(store, `scopes WHERE kind = 'doc' AND key = 'cooked/docs/a.md' AND status = 'disposed'`)).toBeGreaterThanOrEqual(1);
-    expect(await count(store, `scopes WHERE kind = 'doc' AND key = 'cooked/docs/a.md' AND status = 'active'`)).toBe(1);
+    expect(await count(store, `scopes WHERE kind = 'doc' AND key = 'raw/docs/a.md' AND status = 'disposed'`)).toBeGreaterThanOrEqual(1);
+    expect(await count(store, `scopes WHERE kind = 'doc' AND key = 'raw/docs/a.md' AND status = 'active'`)).toBe(1);
     expect(await weightOf()).toBe(before.weight);
-    const events = readLedger(dataDir).slice(before.ledger).filter((e) => (e.ev === 'apply' || e.ev === 'dispose') && e.scope.key === 'cooked/docs/a.md');
+    const events = readLedger(dataDir).slice(before.ledger).filter((e) => (e.ev === 'apply' || e.ev === 'dispose') && e.scope.key === 'raw/docs/a.md');
     expect(events.map((e) => e.ev)).toEqual(['dispose', 'apply']);
   });
 
@@ -262,16 +264,16 @@ describe('lineage: temporal composability of sources', () => {
     // documents live at t1 are searchable as_of t1 only while their chunks exist;
     // the removed doc keeps no chunks, so its text is gone from the index
     const asOfHits = await search(store, ctx.embedder, '宁德时代', { k: 5, track: false, asOf: t1 });
-    expect(asOfHits.map((h) => h.path)).not.toContain('cooked/docs/a.md');
+    expect(asOfHits.map((h) => h.path)).not.toContain('raw/docs/a.md');
 
     // forget = dispose (already done) + purge history
-    const disposed = await store.query<{ id: string }>(`SELECT id FROM scopes WHERE key = 'cooked/docs/a.md' AND status = 'disposed'`);
+    const disposed = await store.query<{ id: string }>(`SELECT id FROM scopes WHERE key = 'raw/docs/a.md' AND status = 'disposed'`);
     expect(disposed.length).toBeGreaterThan(0);
     const res = await forgetSource(ctx, 'raw/docs/a.md');
     expect(res.purged.length).toBeGreaterThan(0);
-    expect(await count(store, `scopes WHERE key = 'cooked/docs/a.md'`)).toBe(0);
-    expect(await count(store, `evidence ev JOIN scopes s ON s.id = ev.scope_id WHERE s.key = 'cooked/docs/a.md'`)).toBe(0);
-    for (const id of disposed) expect(fs.existsSync(path.join(dataDir, `ledger/attic/${id.id}.knode.json`))).toBe(false);
+    expect(await count(store, `scopes WHERE key = 'raw/docs/a.md'`)).toBe(0);
+    expect(await count(store, `evidence ev JOIN scopes s ON s.id = ev.scope_id WHERE s.key = 'raw/docs/a.md'`)).toBe(0);
+    for (const id of disposed) expect(fs.existsSync(path.join(dataDir, `ledger/attic/${id.id}`))).toBe(false);
     expect(await claimsForEntities(store, ['宁德时代'], 12, { asOf: t1 })).toHaveLength(0);
     expect(readLedger(dataDir).some((e) => e.ev === 'purge')).toBe(true);
   });
@@ -380,11 +382,11 @@ describe('lineage: scoped sync, rebuild and migration', () => {
       fs.rmSync(path.join(dataDir, 'raw/docs/y.md'));
       const partial = await sync(ctx, { llmGraph: false, only: ['raw/docs/sub'] });
       expect(partial.disposed).toBe(1);
-      expect(await findLiveScope(ctx.store, 'doc', 'cooked/docs/sub/x.md')).toBeNull();
-      expect(await findLiveScope(ctx.store, 'doc', 'cooked/docs/y.md')).not.toBeNull();
+      expect(await findLiveScope(ctx.store, 'doc', 'raw/docs/sub/x.md')).toBeNull();
+      expect(await findLiveScope(ctx.store, 'doc', 'raw/docs/y.md')).not.toBeNull();
       const full = await sync(ctx, { llmGraph: false });
       expect(full.disposed).toBe(1);
-      expect(await findLiveScope(ctx.store, 'doc', 'cooked/docs/y.md')).toBeNull();
+      expect(await findLiveScope(ctx.store, 'doc', 'raw/docs/y.md')).toBeNull();
     } finally {
       await ctx.store.close();
     }
@@ -398,18 +400,16 @@ describe('lineage: scoped sync, rebuild and migration', () => {
     let ctx = await createContext(dataDir);
     try {
       await sync(ctx, { llmGraph: false });
-      const cooked = readSidecar(dataDir, 'cooked/docs/a.md')!;
-      updateSidecar(dataDir, 'cooked/docs/a.md', (s) => {
-        s.extraction.tier1 = {
-          status: 'done',
-          entities: [{ name: '宁德时代', type: 'organization' }, { name: '曾毓群', type: 'person', description: '董事长' }],
-          relations: [{ source: '曾毓群', target: '宁德时代', type: 'works_at' }],
-          claims: [{ subject: '宁德时代', type: 'capacity', statement: '产能规划超过 1TWh', status: 'suspected' }],
-          model: 'test-model',
-          contentSha: cooked.meta.sha256,
-          extractedAt: new Date().toISOString(),
-        };
-      });
+      const meta = readSidecarPart(dataDir, 'raw/docs/a.md', 'meta')!;
+      updateSidecarPart(dataDir, 'raw/docs/a.md', 'tier1', () => ({
+        status: 'done',
+        entities: [{ name: '宁德时代', type: 'organization' }, { name: '曾毓群', type: 'person', description: '董事长' }],
+        relations: [{ source: '曾毓群', target: '宁德时代', type: 'works_at' }],
+        claims: [{ subject: '宁德时代', type: 'capacity', statement: '产能规划超过 1TWh', status: 'suspected' }],
+        model: 'test-model',
+        contentSha: meta.contentSha256,
+        extractedAt: new Date().toISOString(),
+      }));
       // an unchanged document picks up the new sidecar extraction as a child scope
       await sync(ctx, { llmGraph: false });
       expect((await liveEvidence(ctx.store, 'entity', '曾毓群')).map((e) => e.extractor)).toEqual(['tier1.llm:test-model']);
@@ -417,7 +417,7 @@ describe('lineage: scoped sync, rebuild and migration', () => {
 
       const s1 = await snapshotGraph(ctx.store);
       const ledgerBefore = readLedger(dataDir);
-      const scopeBefore = await findLiveScope(ctx.store, 'doc', 'cooked/docs/a.md');
+      const scopeBefore = await findLiveScope(ctx.store, 'doc', 'raw/docs/a.md');
 
       const report = await rebuild(ctx, {});
       expect(report.sync.applied).toBeGreaterThanOrEqual(2);
@@ -428,7 +428,7 @@ describe('lineage: scoped sync, rebuild and migration', () => {
       expect(ledgerAfter.length).toBeGreaterThan(ledgerBefore.length);
       expect(ledgerAfter.slice(ledgerBefore.length).every((e) => e.ev === 'apply' || e.ev === 'rebuild')).toBe(true);
       expect(ledgerAfter[ledgerAfter.length - 1].seq).toBe(ledgerAfter.length);
-      const scopeAfter = await findLiveScope(ctx.store, 'doc', 'cooked/docs/a.md');
+      const scopeAfter = await findLiveScope(ctx.store, 'doc', 'raw/docs/a.md');
       expect(scopeAfter!.applied_at).toBe(scopeBefore!.applied_at);
     } finally {
       await ctx.store.close();
@@ -471,7 +471,7 @@ describe('lineage: scoped sync, rebuild and migration', () => {
     await MIGRATIONS[0].up(q, { from: 0 });
     await db.exec(`CREATE TABLE embeddings (chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE, model TEXT NOT NULL, embedding vector(384) NOT NULL);`);
     await db.query(`INSERT INTO meta (key, value) VALUES ('embedding', '{"dim":384}'), ('schema_version', '{"v":1}')`);
-    await db.query(`INSERT INTO documents (id, path, root, title, sha256, bytes, status) VALUES ('legacydoc', 'cooked/docs/a.md', 'docs', 'old', 'sha', 10, 'indexed')`);
+    await db.query(`INSERT INTO documents (id, path, root, title, sha256, bytes, status) VALUES ('legacydoc', 'raw/docs/a.md', 'docs', 'old', 'sha', 10, 'indexed')`);
     await db.query(`INSERT INTO entities (id, name, type, mention_count) VALUES ('legacy-entity', 'Legacy', 'concept', 5)`);
     await db.query(`INSERT INTO relations (id, source_id, target_id, type, weight, document_id) VALUES ('r1', 'legacy-entity', 'legacy-entity', 'related_to', 9, 'legacydoc')`);
     await db.close();

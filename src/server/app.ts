@@ -8,21 +8,27 @@ import {
   EmbeddingConfig,
   KnodeConfig,
   LlmConfig,
+  LlmConnection,
   LlmProvider,
   RoutedLlmConfig,
   SagSearchConfig,
   redactConfig,
   resolveRoutedLlmConfig,
+  llmProviderLabel,
   saveConfig,
 } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
-import { assertWritablePath, grepFiles, listTree, makeDir, movePath, pathExists, readFileTextCapped, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
+import { assertWritablePath, grepFiles, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
+import { hasSidecarSegment, SIDECAR_ROOT } from '../fs/layout.js';
+import { moveSidecar } from '../fs/sidecar.js';
+import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
 import { graphInsights, graphOverview, graphSearch } from '../graph/query.js';
 import { buildContextPack } from '../pack/pack.js';
 import { applySuggestion } from '../pack/learn.js';
 import { createEmbeddingProvider } from '../ingest/embeddings.js';
 import { LlmClient } from '../llm/client.js';
+import { cliToolStatus, listChatModels, listEmbeddingModels } from '../llm/models.js';
 import { sync } from '../ingest/sync.js';
 import { historyOf, lineageOf } from '../lineage/inspect.js';
 import { forgetSource, purgeArchived, purgeDisposed } from '../lineage/purge.js';
@@ -83,11 +89,30 @@ type ExtractionConfigDraft = {
 type ModelConfigDraft = {
   embedding?: Partial<EmbeddingConfig>;
   llm?: Partial<LlmConfig>;
+  connections?: Partial<LlmConnection>[];
   extraction?: ExtractionConfigDraft;
   retrieval?: { sag?: Partial<SagSearchConfig> };
 };
 
+/**
+ * Paths the workspace is built from: a client may create and delete things
+ * inside them, but never rename, move or remove the roots themselves.
+ */
+const PROTECTED_PATHS = new Set([
+  '',
+  '.',
+  'wiki',
+  'raw',
+  'raw/docs',
+  'playbooks',
+  'playbooks/packs',
+  'purpose.md',
+  'schema.md',
+  'knode.config.json',
+]);
+
 const LLM_PROVIDERS: LlmProvider[] = ['openai', 'codex-cli', 'claude-cli', 'cursor-cli'];
+const EMBEDDING_PROVIDERS: EmbeddingConfig['provider'][] = ['openai', 'ark-multimodal', 'local'];
 
 type AppEnv = {
   Variables: {
@@ -112,6 +137,7 @@ function mergeRoutedLlmConfig(current: RoutedLlmConfig, incoming: Partial<Routed
   const cliTimeout = Number(incoming.cliTimeoutMs);
   const provider = incoming.provider;
   return {
+    use: typeof incoming.use === 'string' ? incoming.use.trim() : current.use,
     provider: provider === 'inherit' || (provider && LLM_PROVIDERS.includes(provider)) ? provider : current.provider,
     baseUrl: typeof incoming.baseUrl === 'string' ? incoming.baseUrl.trim() : current.baseUrl,
     apiKey: incoming.apiKey === '***' || incoming.apiKey === undefined ? current.apiKey : String(incoming.apiKey),
@@ -119,6 +145,33 @@ function mergeRoutedLlmConfig(current: RoutedLlmConfig, incoming: Partial<Routed
     cliPath: typeof incoming.cliPath === 'string' ? incoming.cliPath.trim() : current.cliPath,
     cliTimeoutMs: Number.isFinite(cliTimeout) && cliTimeout >= 1000 ? Math.floor(cliTimeout) : current.cliTimeoutMs,
   };
+}
+
+/**
+ * Connections replace wholesale — the client owns the list, including order and
+ * deletions — but each one keeps its stored secret when the client echoes back
+ * the redacted '***', and anything without a usable id is dropped rather than
+ * saved as an unreferenceable row.
+ */
+function mergeConnections(current: LlmConnection[], incoming: Partial<LlmConnection>[] | undefined): LlmConnection[] {
+  if (!incoming) return current;
+  const out: LlmConnection[] = [];
+  for (const draft of incoming) {
+    const id = typeof draft.id === 'string' ? draft.id.trim() : '';
+    if (!id || id === 'default' || out.some((c) => c.id === id)) continue;
+    const previous = current.find((c) => c.id === id);
+    const merged = mergeLlmConfig(previous ?? defaultConnectionConfig(), draft);
+    out.push({
+      ...merged,
+      id,
+      label: typeof draft.label === 'string' && draft.label.trim() ? draft.label.trim() : previous?.label || llmProviderLabel(merged.provider),
+    });
+  }
+  return out;
+}
+
+function defaultConnectionConfig(): LlmConfig {
+  return { provider: 'openai', baseUrl: '', apiKey: '', model: '', cliPath: '', cliTimeoutMs: 300_000 };
 }
 
 async function testLlmConfig(config: LlmConfig): Promise<unknown> {
@@ -226,6 +279,7 @@ export function createApp(
     }
 
     const baseLlm = mergeLlmConfig(ctx.config.llm, draft.llm);
+    const connections = mergeConnections(ctx.config.connections, draft.connections);
     const entityRoute = mergeRoutedLlmConfig(ctx.config.extraction.entityLlm, draft.extraction?.entityLlm);
     const conceptRoute = mergeRoutedLlmConfig(ctx.config.extraction.conceptLlm, draft.extraction?.conceptLlm);
     const documentRoute = mergeRoutedLlmConfig(ctx.config.extraction.documentLlm, draft.extraction?.documentLlm);
@@ -240,19 +294,57 @@ export function createApp(
       ['documentLlm', documentRoute, ''],
     ];
     for (const [key, route, legacyModel] of routedTests) {
-      const fullyInherited = route.provider === 'inherit' && !route.baseUrl && !route.apiKey && !route.model && !route.cliPath;
+      const fullyInherited =
+        !route.use && route.provider === 'inherit' && !route.baseUrl && !route.apiKey && !route.model && !route.cliPath;
       if (fullyInherited && !legacyModel) {
         out[key] = { ...(out.llm as Record<string, unknown>), inherited: true };
         continue;
       }
       try {
-        out[key] = await testLlmConfig(resolveRoutedLlmConfig(baseLlm, route, legacyModel));
+        out[key] = await testLlmConfig(resolveRoutedLlmConfig(baseLlm, route, connections, legacyModel));
       } catch (e) {
         out[key] = { ok: false, error: e instanceof Error ? e.message : String(e) };
       }
     }
     return c.json(out);
   });
+
+  // Which models a draft route can actually be pointed at. Same '***' apiKey
+  // convention as /api/config/test; a route that inherits is resolved against
+  // the draft default provider first, so the list matches what would run.
+  app.post('/api/config/models', async (c) => {
+    const ctx = requestCtx(c);
+    const body = (await c.req.json().catch(() => ({}))) as { route?: string; config?: ModelConfigDraft };
+    const draft = body.config ?? {};
+    const route = body.route ?? 'llm';
+
+    if (route === 'embedding') {
+      const e: EmbeddingConfig = { ...ctx.config.embedding, ...(draft.embedding ?? {}) };
+      if (e.apiKey === '***') e.apiKey = ctx.config.embedding.apiKey;
+      return c.json(await listEmbeddingModels(e));
+    }
+
+    const baseLlm = mergeLlmConfig(ctx.config.llm, draft.llm);
+    const connections = mergeConnections(ctx.config.connections, draft.connections);
+    if (route === 'llm') return c.json(await listChatModels(baseLlm));
+
+    // A named connection can be listed on its own, before any route uses it.
+    if (route.startsWith('connection:')) {
+      const connection = connections.find((c) => c.id === route.slice('connection:'.length));
+      if (!connection) return c.json({ error: `unknown connection: ${route}` }, 400);
+      return c.json(await listChatModels(connection));
+    }
+
+    if (route !== 'entityLlm' && route !== 'conceptLlm' && route !== 'documentLlm') {
+      return c.json({ error: `unknown route: ${route}` }, 400);
+    }
+    const merged = mergeRoutedLlmConfig(ctx.config.extraction[route], draft.extraction?.[route]);
+    return c.json(await listChatModels(resolveRoutedLlmConfig(baseLlm, merged, connections)));
+  });
+
+  // Where each coding-agent CLI resolved to on the service PATH — Settings uses
+  // this to keep the executable field out of the way when it is redundant.
+  app.get('/api/config/cli-tools', (c) => c.json({ tools: cliToolStatus() }));
 
   // Persist + hot-apply embedding/llm config. Re-embeds the corpus when the
   // embedding provider/model/dimensions changed.
@@ -267,7 +359,7 @@ export function createApp(
         const e = incoming.embedding;
         const dims = Number(e.dimensions);
         next.embedding = {
-          provider: e.provider === 'openai' ? 'openai' : 'local',
+          provider: e.provider && EMBEDDING_PROVIDERS.includes(e.provider) ? e.provider : 'local',
           baseUrl: typeof e.baseUrl === 'string' ? e.baseUrl.trim() : next.embedding.baseUrl,
           apiKey: e.apiKey === '***' || e.apiKey === undefined ? next.embedding.apiKey : String(e.apiKey),
           model: typeof e.model === 'string' ? e.model.trim() : next.embedding.model,
@@ -278,6 +370,9 @@ export function createApp(
       }
       if (incoming.llm) {
         next.llm = mergeLlmConfig(next.llm, incoming.llm);
+      }
+      if (incoming.connections) {
+        next.connections = mergeConnections(next.connections, incoming.connections);
       }
       if (incoming.extraction) {
         const x = incoming.extraction;
@@ -321,8 +416,8 @@ export function createApp(
         next.embedding.dimensions !== ctx.config.embedding.dimensions ||
         next.embedding.sendDimensions !== ctx.config.embedding.sendDimensions;
       const dimChanged = next.embedding.dimensions !== ctx.config.embedding.dimensions;
-      const previousDocumentLlm = resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.documentLlm);
-      const nextDocumentLlm = resolveRoutedLlmConfig(next.llm, next.extraction.documentLlm);
+      const previousDocumentLlm = resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.documentLlm, ctx.config.connections);
+      const nextDocumentLlm = resolveRoutedLlmConfig(next.llm, next.extraction.documentLlm, next.connections);
       const reconvert =
         previousDocumentLlm.provider !== nextDocumentLlm.provider ||
         previousDocumentLlm.model !== nextDocumentLlm.model ||
@@ -378,8 +473,10 @@ export function createApp(
       if (!p) return c.json({ error: 'path required' }, 400);
       const asked = Number(c.req.query('maxBytes'));
       const cap = Number.isFinite(asked) && asked > 0 ? Math.min(asked, MAX_FILE_BYTES) : MAX_PREVIEW_BYTES;
-      const file = readFileTextCapped(ctx.dataDir, p, cap);
-      return c.json({ path: p, content: file.content, bytes: file.bytes, truncated: file.truncated });
+      // a PDF / image original answers with the Markdown knode-os derived from it
+      const file = readSourceTextCapped(ctx.dataDir, p, cap);
+      if (!file) return c.json({ error: `no derived text for ${p} yet — run a sync first` }, 404);
+      return c.json({ path: p, content: file.content, bytes: file.bytes, truncated: file.truncated, derived: file.derived });
     } catch (e) {
       return c.json(err(e), 404);
     }
@@ -405,6 +502,7 @@ export function createApp(
       const { path: p, content } = await c.req.json<{ path: string; content: string }>();
       if (!p || typeof content !== 'string') return c.json({ error: 'path and content required' }, 400);
       assertWritablePath(p);
+      assertNotConvertedOriginal(p);
       writeFileText(ctx.dataDir, p, content);
       return c.json({ ok: true });
     } catch (e) {
@@ -417,9 +515,7 @@ export function createApp(
     try {
       const p = c.req.query('path');
       if (!p) return c.json({ error: 'path required' }, 400);
-      if (['wiki', 'raw', 'raw/docs', '.', '', 'purpose.md', 'schema.md', 'knode.config.json'].includes(p)) {
-        return c.json({ error: 'refusing to delete a root path' }, 400);
-      }
+      if (PROTECTED_PATHS.has(p)) return c.json({ error: 'refusing to delete a root path' }, 400);
       assertWritablePath(p);
       removePath(ctx.dataDir, p);
       // deleting a source is a dispose: everything it produced is reverted,
@@ -459,12 +555,19 @@ export function createApp(
       if (!src || !dst) return c.json({ error: 'from and to required' }, 400);
       assertWritablePath(src);
       assertWritablePath(dst);
+      // wiki/ and raw/docs/ are writable, which alone would let a rename walk
+      // the whole tree away from under the workspace
+      if (PROTECTED_PATHS.has(src) || PROTECTED_PATHS.has(dst)) {
+        return c.json({ error: 'refusing to move a root path' }, 400);
+      }
       if (src === dst) return c.json({ ok: true, from: src, to: dst });
       // renameSync replaces the destination without a word, which in a batch
       // move would silently destroy a same-named file already sitting there
       if (pathExists(ctx.dataDir, dst)) return c.json({ error: `already exists: ${dst}` }, 409);
       if (!pathExists(ctx.dataDir, src)) return c.json({ error: `no such path: ${src}` }, 404);
       movePath(ctx.dataDir, src, dst);
+      // the sidecar follows, so a moved PDF is not converted again and keeps its tier-1 result
+      moveSidecar(ctx.dataDir, src, dst);
       return c.json({ ok: true, from: src, to: dst });
     } catch (e) {
       return c.json(err(e), 400);
@@ -478,13 +581,21 @@ export function createApp(
       // sanitize before the prefix check: "raw/docs/../../x" would pass it
       const dir = sanitizeRelativePath((form.get('dir') as string) || '') || 'raw/docs';
       if (!/^(raw\/docs|wiki)(\/|$)/.test(dir)) return c.json({ error: 'uploads go to raw/docs or wiki' }, 400);
+      if (hasSidecarSegment(dir)) return c.json({ error: `${SIDECAR_ROOT}/ is system-owned` }, 400);
       const saved: string[] = [];
+      const skipped: string[] = [];
       for (const [, v] of form.entries()) {
         if (!(v instanceof File)) continue;
         // folder uploads carry the path inside the dropped folder as the
         // filename ("notes/2026/kickoff.md"), so the subtree is recreated
         const name = sanitizeRelativePath(v.name);
         if (!name) continue;
+        // a dropped folder copied from another workspace may carry its old
+        // sidecar tree along: that is knode-os's state, never an upload
+        if (hasSidecarSegment(name)) {
+          skipped.push(name);
+          continue;
+        }
         const rel = `${dir}/${name}`.replace(/\/+/g, '/');
         if (pathExists(ctx.dataDir, rel)) {
           const ext = path.extname(name);
@@ -497,7 +608,7 @@ export function createApp(
           saved.push(rel);
         }
       }
-      return c.json({ ok: true, saved });
+      return c.json({ ok: true, saved, ...(skipped.length ? { skipped } : {}) });
     } catch (e) {
       return c.json(err(e), 400);
     }
@@ -697,7 +808,8 @@ export function createApp(
   app.get('/api/okf/validate', (c) => {
     const ctx = requestCtx(c);
     try {
-      return c.json(validateOkfBundle(safePath(ctx.dataDir, c.req.query('path') ?? 'wiki')));
+      const asIndexed = ['1', 'true'].includes(c.req.query('asIndexed') ?? '');
+      return c.json(validateOkfBundle(safePath(ctx.dataDir, c.req.query('path') ?? 'wiki'), { asIndexed }));
     } catch (e) {
       return c.json(err(e), 400);
     }

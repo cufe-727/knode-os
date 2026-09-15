@@ -3,8 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { KnodeConfig } from '../config.js';
 import { MAX_FILE_BYTES } from '../constants.js';
-import { isTextFile, safePath } from '../fs/files.js';
-import { readSidecar, replayableTier1, updateSidecar } from '../fs/sidecar.js';
+import { readSidecarPart, replayableTier1, updateSidecarPart } from '../fs/sidecar.js';
 import { extractConcepts, wireConcepts } from '../graph/concepts.js';
 import { frontmatterExtraction } from '../graph/frontmatter.js';
 import { parseCapabilityNotes } from '../capability/notes.js';
@@ -22,6 +21,7 @@ import { DocRoot } from '../types.js';
 import { hasProse, hasRegions, stripRegions } from '../wiki/regions.js';
 import { chunkText } from './chunker.js';
 import { EmbeddingProvider } from './embeddings.js';
+import { loadSourceText, sha256 } from './source.js';
 
 /**
  * Apply one file as a document scope: chunk → embed (reusing unchanged
@@ -29,8 +29,11 @@ import { EmbeddingProvider } from './embeddings.js';
  * inside one scope transaction. Tier-1 sidecar replays and the human-written
  * parts of generated pages become child scopes of the document's scope.
  *
+ * The text comes from src/ingest/source.ts: raw text normalized in memory, or
+ * the sidecar's content.md for converted originals and trace episodes.
+ *
  * Sources vs views:
- *   - sources (cooked docs, skills, human wiki pages, anchors) contribute
+ *   - sources (raw docs, skills, human wiki pages, anchors) contribute
  *     entities / relations / claims;
  *   - views (generated pages, recognised by a live `pages` row or
  *     `generated: true`) are indexed for search only. Only prose a human wrote
@@ -97,12 +100,12 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const progress = opts.onProgress ?? (() => {});
   const actor = opts.actor ?? 'sync';
   const none = { chunks: 0, entities: 0, relations: 0, scopeId: null };
-  const abs = safePath(store.dataDir, file);
-  const stat = fs.statSync(abs);
-  if (!isTextFile(file) || stat.size > MAX_FILE_BYTES) return { outcome: 'skipped', ...none };
-
-  const raw = fs.readFileSync(abs, 'utf8');
-  const sha = crypto.createHash('sha256').update(raw).digest('hex');
+  const source = loadSourceText(store.dataDir, file, root);
+  if (!source) return { outcome: 'skipped', ...none };
+  const raw = source.text;
+  const bytes = Buffer.byteLength(raw);
+  if (bytes > MAX_FILE_BYTES) return { outcome: 'skipped', ...none };
+  const sha = sha256(raw);
   const docId = documentIdFor(file);
 
   const live = await findLiveScope(store, 'doc', file);
@@ -121,7 +124,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const cls = await classify(store, file, root, parsed);
 
   /* ── pure preparation: chunking, embeddings (network), tier-0 plans ── */
-  const pieces = await chunkText(file, parsed.body, config.ingest);
+  const pieces = await chunkText(file, parsed.body, config.ingest, { markdown: source.derived || undefined });
   const chunkRows = pieces.map((p, i) => ({ id: chunkIdFor(docId, i, p.content), seq: i, content: p.content, tokenCount: p.tokenCount }));
   const vectors = new Map<string, number[]>();
   if (chunkRows.length > 0) {
@@ -157,8 +160,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
       ? tierForActor(parsed.frontmatter.actor)
       : undefined;
   const declaredAcl = Array.isArray(parsed.frontmatter.acl) ? parsed.frontmatter.acl.map(String) : undefined;
-  const sidecar = root === 'docs' ? readSidecar(store.dataDir, file) : null;
-  const tier1 = root === 'docs' && isSource ? replayableTier1(sidecar, sha) : null;
+  const tier1 = root === 'docs' && isSource ? replayableTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha) : null;
 
   /* ── the document scope ── */
   let g = { entities: 0, relations: 0 };
@@ -177,7 +179,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     },
     async (w) => {
       await w.document(
-        { id: docId, path: file, root, title, sha256: sha, mime: guessMime(file), bytes: stat.size, kind: cls.kind },
+        { id: docId, path: file, root, title, sha256: sha, mime: guessMime(file), bytes, kind: cls.kind },
         chunkRows,
         vectors,
         embedder.model,
@@ -223,19 +225,24 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
 
   if (root === 'docs' && isSource) {
     // sidecar: chunk map + tier-0 extraction results; restore usage on rebuild
-    const updated = updateSidecar(store.dataDir, file, (s) => {
-      s.meta.title = title;
-      s.meta.sha256 = sha;
-      s.meta.ingestedAt = new Date().toISOString();
-      s.meta.chunks = chunkRows.map((c) => ({ id: c.id, seq: c.seq, tokenCount: c.tokenCount }));
-      s.extraction.tier0 = {
+    const now = new Date().toISOString();
+    const meta = updateSidecarPart(store.dataDir, file, 'meta', (m) => ({
+      ...m!,
+      title,
+      contentSha256: sha,
+      ingestedAt: now,
+      chunks: chunkRows.map((c) => ({ id: c.id, seq: c.seq, tokenCount: c.tokenCount })),
+    }));
+    if (meta) {
+      updateSidecarPart(store.dataDir, file, 'tier0', () => ({
+        contentSha: sha,
         concepts,
         wikilinks: extractWikilinks(parsed.body),
-        extractedAt: new Date().toISOString(),
+        extractedAt: now,
         declared: declared ? { entities: declared.entities, claims: declared.claims } : null,
-      };
-    });
-    if (updated) await restoreUsageFromSidecar(store, docId, updated);
+      }));
+      await restoreUsageFromSidecar(store, docId, readSidecarPart(store.dataDir, file, 'usage'));
+    }
 
     if (tier1) {
       await applyScope(
@@ -255,7 +262,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
 }
 
 async function ensureTier1Replay(store: Store, file: string, sha: string, docId: string, parentId: string, opts: ApplyDocOptions): Promise<void> {
-  const tier1 = replayableTier1(readSidecar(store.dataDir, file), sha);
+  const tier1 = replayableTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha);
   if (!tier1) return;
   const child = await findLiveScope(store, 'tier1', file);
   if (child && child.sha === sha) return;

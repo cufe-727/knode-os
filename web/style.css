@@ -205,20 +205,54 @@ main { flex: 1; min-height: 0; overflow: hidden; display: flex; }
   overflow: auto;
   padding: 10px;
 }
-.pane-actions { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
-.pane-actions button, .upload-btn {
+.pane-actions { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.pane-actions button {
   background: var(--bg3); border: 1px solid var(--border); color: var(--fg);
   border-radius: 6px; padding: 4px 9px; cursor: pointer; font-size: 12px;
 }
-.pane-actions button:hover, .upload-btn:hover { border-color: var(--accent); }
+.pane-actions button:hover { border-color: var(--accent); }
+.tree-destination {
+  display: flex; align-items: center; gap: 5px; margin-bottom: 10px;
+  font-size: 11px; color: var(--muted);
+}
+.tree-destination b {
+  min-width: 0; font-weight: 500; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tree-destination .tag {
+  border-radius: 999px; padding: 0 6px;
+  background: rgba(255, 122, 144, 0.14); color: var(--bad);
+}
+.tree-destination button {
+  margin-left: auto; border: 0; background: transparent;
+  color: var(--muted); cursor: pointer; font-size: 11px; padding: 0 2px;
+}
+.tree-destination button:hover { color: var(--accent); }
 #filetree { font-size: 13px; }
 .tree-dir > .tree-label { color: var(--accent2); cursor: pointer; }
+.tree-dir > .tree-label.picked { background: var(--accent2-soft); color: var(--accent2); }
 .tree-file > .tree-label { cursor: pointer; color: var(--fg); }
 .tree-label { display: block; padding: 1.5px 4px; border-radius: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tree-label:hover { background: var(--bg3); }
 .tree-label.selected { background: var(--bg3); color: var(--accent); }
 .tree-children { margin-left: 14px; border-left: 1px dashed var(--border); padding-left: 4px; }
 .tree-dir.collapsed > .tree-children { display: none; }
+
+/* right-click menu, shared by the tree rows and the pane's own menu buttons */
+.popup-menu {
+  position: fixed; z-index: 60; min-width: 172px; padding: 5px;
+  display: flex; flex-direction: column;
+  background: var(--bg2); border: 1px solid var(--border-strong); border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.popup-menu button {
+  border: 0; background: transparent; color: var(--fg); cursor: pointer;
+  border-radius: 5px; padding: 5px 9px; font-size: 12.5px; text-align: left; white-space: nowrap;
+}
+.popup-menu button:hover:not(:disabled) { background: var(--bg3); color: var(--accent); }
+.popup-menu button:disabled { color: var(--muted); cursor: default; }
+.popup-menu button.danger:hover:not(:disabled) { color: var(--bad); }
+.popup-menu hr { width: 100%; border: 0; border-top: 1px solid var(--border); margin: 4px 0; }
 
 #file-pane { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .file-toolbar {
@@ -231,6 +265,17 @@ main { flex: 1; min-height: 0; overflow: hidden; display: flex; }
 }
 .file-toolbar button:disabled { opacity: 0.4; cursor: default; }
 .file-toolbar button:not(:disabled):hover { border-color: var(--accent); }
+.file-notice {
+  display: flex; align-items: center; gap: 10px;
+  margin: 0; padding: 7px 14px; font-size: 12.5px; color: var(--muted);
+  border-bottom: 1px solid var(--border); background: var(--bg2);
+}
+.file-notice button {
+  margin-left: auto; flex: none;
+  background: var(--bg3); border: 1px solid var(--border); color: var(--fg);
+  border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer;
+}
+.file-notice button:hover { border-color: var(--accent); }
 #file-view { flex: 1; overflow: auto; padding: 18px 26px; max-width: 920px; }
 #file-editor {
   flex: 1; resize: none; border: none; outline: none;
@@ -358,6 +403,28 @@ td.mono { font-size: 12px; }
 .route-card-head p { margin: 3px 0 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
 .route-api-fields { display: grid; grid-template-columns: 1.3fr 1fr; gap: 10px; }
 .route-cli-fields[hidden], .route-api-fields[hidden] { display: none !important; }
+.cfg-connections-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; }
+.cfg-card-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 16px 0 8px; }
+.cfg-card-title small { display: block; color: var(--muted); font-size: 11px; font-weight: 400; }
+.stage-list { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--panel); }
+.stage-row { display: grid; grid-template-columns: 26px minmax(0, 1fr) 300px; gap: 16px; padding: 18px; align-items: start; }
+.stage-row + .stage-row { border-top: 1px solid var(--line); }
+.stage-step { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 7px; background: var(--accent2-soft, rgba(139,122,255,0.12)); color: var(--accent2, #8b7aff); font: 600 11px/1 ui-monospace, monospace; }
+.stage-title { display: flex; align-items: center; gap: 8px; }
+.stage-title h4 { margin: 0; }
+.stage-body p { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+.stage-body .stage-req { color: var(--dim, #6b7280); font-size: 11px; line-height: 1.5; }
+.stage-control { display: flex; flex-direction: column; gap: 10px; }
+.stage-pin { gap: 4px; }
+.stage-pin-label { color: var(--muted); font-size: 10px; font-weight: 600; }
+.stage-pin b { font-size: 13px; }
+.stage-pin small { color: var(--dim, #6b7280); font-size: 10px; }
+.cfg-connections-head small { display: block; color: var(--muted); font-size: 11px; font-weight: 400; }
+.cfg-connections { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.cfg-connection-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.cfg-connection-head .cfg-conn-label { flex: 0 1 240px; }
+.cfg-connection-head .mono { color: var(--muted); font-size: 10px; }
+.cfg-connection-head .cfg-conn-remove { margin-left: auto; }
 .route-note { min-height: 31px; margin: 0; border-top: 1px solid var(--border); padding-top: 10px; color: var(--muted); font-size: 10px; }
 .route-note b { color: var(--fg); }
 .pipeline-controls { display: grid; grid-template-columns: 1.4fr repeat(3, minmax(110px, 0.7fr)); gap: 13px; align-items: end; margin-top: 12px; border: 1px solid var(--border); border-radius: 12px; padding: 15px 17px; background: rgba(22, 26, 33, 0.65); }

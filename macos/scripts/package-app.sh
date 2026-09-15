@@ -36,6 +36,15 @@ cp "$MACOS_DIR/App/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$APP_ICON" "$RESOURCES_DIR/AppIcon.icns"
 ditto "$RESOURCE_BUNDLE" "$APP_DIR/KnodeOS_KnodeOSApp.bundle"
 (cd "$REPO_DIR" && pnpm --filter knode-os deploy --prod --legacy --force "$DEPLOY_DIR")
+# Legacy deploy only copies the published files — since pnpm 11 it installs
+# nothing ("Already up to date"), which ships a service that cannot resolve its
+# own imports. Install the production tree here, hoisted so the bundle carries
+# plain directories instead of links into the developer's store.
+(cd "$DEPLOY_DIR" && pnpm install --prod --ignore-workspace --node-linker=hoisted --no-frozen-lockfile)
+if [[ ! -d "$DEPLOY_DIR/node_modules/commander" ]]; then
+  echo "Service dependencies missing from $DEPLOY_DIR — refusing to package a bundle that cannot start." >&2
+  exit 1
+fi
 ditto "$DEPLOY_DIR" "$SERVICE_DIR/app"
 cp "$NODE_BIN" "$SERVICE_DIR/bin/node"
 chmod +x "$BIN_DIR/KnodeOS"

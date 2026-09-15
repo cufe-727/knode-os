@@ -67,20 +67,43 @@ private struct MainWorkspaceView: View {
         }
     }
 
+    private var sectionTitleItem: some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            HStack(spacing: 7) {
+                Image(systemName: model.selectedSection.symbol)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.knodeCyan)
+                Text(model.selectedSection.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .fixedSize()
+                if let activity = model.globalActivity {
+                    Divider().frame(height: 11)
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.75)
+                        .frame(width: 12, height: 12)
+                    Text(activity)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+            }
+            .animation(.easeInOut(duration: 0.18), value: model.globalActivity)
+        }
+    }
+
     @ToolbarContentBuilder
     private var workspaceToolbar: some ToolbarContent {
         ToolbarItem(placement: .navigation) {
             WorkspaceMenu()
         }
-        ToolbarItem(placement: .principal) {
-            HStack(spacing: 10) {
-                Text(model.selectedSection.title)
-                    .font(.headline)
-                if let activity = model.globalActivity {
-                    ProgressView().controlSize(.small)
-                    Text(activity).font(.caption).foregroundStyle(.secondary)
-                }
-            }
+        // A window title, not a control: macOS 26 gives every toolbar item a glass
+        // background, and around a bare word it reads as a stray pill.
+        if #available(macOS 26.0, *) {
+            sectionTitleItem.sharedBackgroundVisibility(.hidden)
+        } else {
+            sectionTitleItem
         }
         ToolbarItemGroup(placement: .primaryAction) {
             if let stats = model.stats {

@@ -38,7 +38,7 @@ export function resolveKnowledgeLink(
 
   // Explicit workspace-root paths remain workspace-root paths. Everything else
   // first follows ordinary Markdown's source-relative resolution.
-  if (/^(wiki|raw|cooked)(\/|$)/.test(clean)) candidates.push(clean);
+  if (/^(wiki|raw)(\/|$)/.test(clean)) candidates.push(clean);
   else candidates.push(path.posix.join(sourceDir, clean));
   if (vaultRoot && clean !== vaultRoot && !clean.startsWith(`${vaultRoot}/`)) {
     candidates.push(path.posix.join(vaultRoot, clean));

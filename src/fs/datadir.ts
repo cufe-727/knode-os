@@ -4,6 +4,7 @@ import { CONFIG_FILE, defaultConfig, saveConfig } from '../config.js';
 import { initObsidianVault } from '../obsidian/vault.js';
 import { ensureDefaultPlaybooks } from '../pack/playbook.js';
 import { ensureDefaultIntents } from '../compiler/intents.js';
+import { CAPABILITIES_DIR, DB_DIR, INTENTS_DIR, LEGACY_TOP_LEVEL, PACKS_DIR } from './layout.js';
 
 /**
  * Data directory layout (markdown is the system of record; the database is a
@@ -19,9 +20,9 @@ import { ensureDefaultIntents } from '../compiler/intents.js';
  *   │   │   ├── claude/       Claude Code session transcripts (~/.claude/projects)
  *   │   │   └── codex/        Codex CLI session rollouts (~/.codex/sessions)
  *   │   └── skills/           skills/prompts the agents have used
- *   ├── cooked/               normalized layer (L1 — system-managed)
- *   │   └── docs/             normalized markdown + <name>.knode.json sidecars
- *   │                         (metadata, extraction results, usage/heat)
+ *   ├── .sidecar/             derived layer (L1 — system-managed, keep it): one directory per
+ *   │                         source key mirroring the tree above — content.md for converted
+ *   │                         originals, meta / tier0 / tier1 / usage JSON, cached LLM views
  *   ├── wiki/                 LLM-curated, interlinked knowledge (L3)
  *   │   ├── .obsidian/        vault-local Obsidian configuration
  *   │   ├── attachments/      Obsidian-managed attachments
@@ -32,25 +33,22 @@ import { ensureDefaultIntents } from '../compiler/intents.js';
  *   │   ├── concepts/         theories, methods, designs
  *   │   ├── sources/          per-source summaries
  *   │   └── dreams/           nightly dream reports
- *   ├── capabilities/         semantic layer over live sources (metric definitions, joins, pitfalls)
- *   ├── intents/              intent specs: the slots an answer needs (Context Compiler)
+ *   ├── playbooks/            agent-editable configuration (Markdown / YAML)
+ *   │   ├── packs/            context-pack playbooks, revised by the learning loop
+ *   │   ├── capabilities/     semantic layer over live sources (metric definitions, joins, pitfalls)
+ *   │   └── intents/          intent specs: the slots an answer needs (Context Compiler)
  *   ├── ledger/               machine truth: events.jsonl (apply/dispose/purge/feedback)
  *   │   └── attic/            sidecars + previous file versions of disposed sources
  *   └── .knode/               derived state (L2 — PGlite database) — safe to delete & rebuild
  */
 
 const RAW_DIRS = ['raw/docs', 'raw/traces/claude', 'raw/traces/codex', 'raw/skills'];
-const COOKED_DIRS = ['cooked/docs'];
 const WIKI_DIRS = ['wiki/entities', 'wiki/concepts', 'wiki/sources', 'wiki/dreams', 'wiki/datasets'];
-/** Context-pack playbooks: agent-editable retrieval workflows (see src/pack). */
-const PACK_DIRS = ['packs'];
-/** Semantic layer over live sources: metric definitions, join paths, pitfalls (see src/capability). */
-const CAPABILITY_DIRS = ['capabilities'];
-/** Intent specs: what an answer to a kind of question needs (see src/compiler). */
-const INTENT_DIRS = ['intents'];
+/** Agent-editable configuration: playbooks, capability notes, intent specs (see src/fs/layout.ts). */
+const CONFIG_DIRS = [PACKS_DIR, CAPABILITIES_DIR, INTENTS_DIR];
 /** Lineage ledger (append-only events + attic). Not derived — it is how the DB is rebuilt with history. */
 const LEDGER_DIRS = ['ledger', 'ledger/attic'];
-export const DB_DIR = '.knode/db';
+export { DB_DIR };
 
 const PURPOSE_TEMPLATE = `# Purpose
 
@@ -139,8 +137,29 @@ export interface InitResult {
   dataDir: string;
 }
 
+/** A data directory laid out the pre-v3 way (cooked/ copies, top-level packs/ capabilities/ intents/). */
+export class LegacyLayoutError extends Error {
+  constructor(dataDir: string, found: string[]) {
+    super([
+      `${dataDir} uses the pre-v3 data layout (found ${found.map((f) => `${f}/`).join(', ')}).`,
+      'knode-os no longer reads cooked/ copies or the top-level packs/, capabilities/ and intents/ directories, and there is no automatic migration.',
+      'Move the directory aside (e.g. rename it to <dir>.old), run `knode-os init` for a fresh layout, then re-import your originals from <dir>.old/raw/docs.',
+      'Local development directories such as .dev-data or .demo-data are affected in the same way.',
+    ].join(' '));
+    this.name = 'LegacyLayoutError';
+  }
+}
+
+/** Refuse a pre-v3 directory outright rather than mixing two layouts in one tree. */
+export function assertSupportedLayout(dataDir: string): void {
+  if (!fs.existsSync(dataDir)) return;
+  const found = LEGACY_TOP_LEVEL.filter((name) => fs.existsSync(path.join(dataDir, name)));
+  if (found.length > 0) throw new LegacyLayoutError(dataDir, found);
+}
+
 /** Create the data directory layout. Idempotent — never overwrites existing files. */
 export function initDataDir(dataDir: string): InitResult {
+  assertSupportedLayout(dataDir);
   const created: string[] = [];
   const ensureDir = (rel: string) => {
     const abs = path.join(dataDir, rel);
@@ -159,7 +178,7 @@ export function initDataDir(dataDir: string): InitResult {
   };
 
   fs.mkdirSync(dataDir, { recursive: true });
-  for (const d of [...RAW_DIRS, ...COOKED_DIRS, ...WIKI_DIRS, ...PACK_DIRS, ...CAPABILITY_DIRS, ...INTENT_DIRS, ...LEDGER_DIRS, '.knode']) ensureDir(d);
+  for (const d of [...RAW_DIRS, ...WIKI_DIRS, ...CONFIG_DIRS, ...LEDGER_DIRS, '.knode']) ensureDir(d);
   ensureFile('purpose.md', PURPOSE_TEMPLATE);
   ensureFile('schema.md', SCHEMA_TEMPLATE);
   ensureFile('wiki/index.md', INDEX_TEMPLATE);

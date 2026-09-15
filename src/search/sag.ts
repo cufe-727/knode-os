@@ -1,7 +1,7 @@
 import { SagSearchConfig, defaultConfig } from '../config.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { getDocHeat, recordChunkHits } from '../stats/heat.js';
-import { Store, toVectorLiteral } from '../store/db.js';
+import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { NO_FILTER, ResolvedScopeFilter, evidenceFilterSql } from '../store/resolver.js';
 import { Params, TimeInput, rowLiveAt, toIso } from '../store/temporal.js';
 import { SearchResult } from '../types.js';
@@ -227,10 +227,10 @@ async function coarseVectorRank(
   if (chunkIds.length === 0) return [];
   const placeholders = chunkIds.map((_, i) => `$${i + 2}`).join(',');
   return store.query<VectorRankRow>(
-    `SELECT e.chunk_id, 1 - (e.embedding <=> $1::vector) AS raw
+    `SELECT e.chunk_id, 1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw
      FROM embeddings e
      WHERE e.chunk_id IN (${placeholders})
-     ORDER BY e.embedding <=> $1::vector`,
+     ORDER BY e.embedding <=> $1::${VECTOR_TYPE}`,
     [toVectorLiteral(queryVector), ...chunkIds],
   );
 }

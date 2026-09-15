@@ -16,10 +16,49 @@ import type { ChatMessage } from './client.js';
  * touch the workspace:
  *   - codex:  `codex exec --sandbox read-only --output-last-message <f> -`
  *   - claude: `claude -p --output-format json --max-turns 1`
- *   - cursor: `cursor-agent -p --output-format json <prompt>`
+ *   - cursor: `cursor-agent -p --output-format json --trust <prompt>` (`--trust` answers the
+ *             workspace-trust prompt newer CLIs raise for the temp cwd; the model still
+ *             gets no tool grants beyond that directory)
+ *
+ * Images reach each one differently: codex takes `--image`, while claude and
+ * cursor have no such flag and instead read the paths listed in the prompt with
+ * their own file tools.
  */
 
 const DEFAULT_TIMEOUT_MS = 300_000;
+
+/** Executable each CLI provider runs when no explicit `cliPath` is configured. */
+export const CLI_COMMANDS: Record<string, string> = {
+  'codex-cli': 'codex',
+  'claude-cli': 'claude',
+  'cursor-cli': 'cursor-agent',
+};
+
+/** The command a CLI provider spawns: an explicit `cliPath`, else the default name looked up on PATH. */
+export function cliCommand(provider: string, cliPath = ''): string {
+  return cliPath.trim() || CLI_COMMANDS[provider] || '';
+}
+
+/**
+ * Absolute path of `command`, or null when nothing executable answers to that
+ * name. A bare name is searched on PATH — which for the desktop app is the
+ * augmented one its launcher sets, not the shell's.
+ */
+export function resolveExecutable(command: string): string | null {
+  if (!command) return null;
+  const candidates = command.includes('/')
+    ? [path.resolve(command)]
+    : (process.env.PATH ?? '').split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, command));
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      // keep looking
+    }
+  }
+  return null;
+}
 
 /** Flatten chat messages into a single prompt for one-shot CLI runs. */
 export function renderCliPrompt(messages: ChatMessage[], json: boolean): string {
@@ -50,14 +89,16 @@ export async function completeViaCli(
     return runClaude(cfg, prompt, model, images);
   }
   if (cfg.provider === 'cursor-cli') {
-    if (images.length) throw new Error('cursor-cli does not support image attachments; use an OpenAI vision model, codex-cli, or claude-cli');
+    if (images.length) {
+      prompt += `\n\nRead these image files before answering:\n${images.map((image) => `- ${image}`).join('\n')}`;
+    }
     return runCursor(cfg, prompt, model);
   }
   throw new Error(`not a CLI provider: ${cfg.provider}`);
 }
 
 async function runCodex(cfg: LlmConfig, prompt: string, model?: string, images: string[] = []): Promise<string> {
-  const cmd = cfg.cliPath || 'codex';
+  const cmd = cliCommand('codex-cli', cfg.cliPath);
   // --output-last-message gives the bare final message without parsing JSONL events
   const outFile = path.join(os.tmpdir(), `knode-codex-${crypto.randomUUID()}.txt`);
   const args = ['exec', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', os.tmpdir(), '--output-last-message', outFile];
@@ -76,7 +117,7 @@ async function runCodex(cfg: LlmConfig, prompt: string, model?: string, images: 
 }
 
 async function runClaude(cfg: LlmConfig, prompt: string, model?: string, images: string[] = []): Promise<string> {
-  const cmd = cfg.cliPath || 'claude';
+  const cmd = cliCommand('claude-cli', cfg.cliPath);
   const args = ['-p', '--output-format', 'json', '--max-turns', images.length ? '3' : '1'];
   if (model) args.push('--model', model);
   if (images.length) {
@@ -102,30 +143,59 @@ async function runClaude(cfg: LlmConfig, prompt: string, model?: string, images:
 }
 
 async function runCursor(cfg: LlmConfig, prompt: string, model?: string): Promise<string> {
-  const cmd = cfg.cliPath || 'cursor-agent';
-  const args = ['-p', '--output-format', 'json'];
+  const cmd = cliCommand('cursor-cli', cfg.cliPath);
+  // --trust: since the 2026.09 CLI, print mode refuses to run in a directory
+  // the user has not trusted interactively; the cwd here is the OS temp dir
+  const args = ['-p', '--output-format', 'stream-json', '--trust'];
   if (model) args.push('--model', model);
   args.push(prompt);
   const { code, stdout, stderr } = await runProcess(cmd, args, '', cfg.cliTimeoutMs);
-  let wrapper: unknown;
-  try {
-    wrapper = JSON.parse(stdout);
-  } catch {
-    wrapper = null;
+  const { text, error } = readCursorStream(stdout);
+  if (error || code !== 0) {
+    throw new Error(`cursor CLI error: ${(error || stderr || stdout).trim().slice(0, 300)}`);
   }
-  if (wrapper && typeof wrapper === 'object' && 'result' in wrapper) {
-    const w = wrapper as { result?: unknown; is_error?: boolean; subtype?: string };
-    if (w.is_error || w.subtype === 'error' || code !== 0) {
-      throw new Error(`cursor CLI error: ${String(w.result ?? stderr ?? 'unknown').slice(0, 300)}`);
-    }
-    return String(w.result ?? '').trim();
-  }
-  if (code !== 0) throw new Error(`cursor-agent exited with code ${code}: ${(stderr || stdout).trim().slice(0, 300)}`);
-  if (!stdout.trim()) throw new Error('cursor-agent finished but produced no message');
-  return stdout.trim();
+  if (!text) throw new Error('cursor-agent finished but produced no message');
+  return text;
 }
 
-function runProcess(cmd: string, args: string[], stdin: string, timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string }> {
+/**
+ * Pull the answer out of cursor-agent's NDJSON stream.
+ *
+ * The CLI narrates what it is about to do in assistant messages of its own
+ * ("I'll read the file first, then…"), and `--output-format json` hands all of
+ * that back glued to the answer — commentary that would land in a converted
+ * document or break a JSON route's parse. The stream keeps the messages apart,
+ * so the answer is what it says after its last tool call, or its last message
+ * when it used no tools.
+ */
+export function readCursorStream(stdout: string): { text: string; error?: string } {
+  const chunks: string[] = [];
+  let result = '';
+  let error: string | undefined;
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue;
+    let event: { type?: string; subtype?: string; is_error?: boolean; result?: unknown; message?: { content?: unknown } };
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue; // the CLI also prints plain progress lines
+    }
+    if (event.type === 'assistant') {
+      const parts = Array.isArray(event.message?.content) ? event.message.content : [];
+      const text = parts.map((part) => (part && typeof part === 'object' && 'text' in part ? String((part as { text?: unknown }).text ?? '') : '')).join('');
+      if (text.trim()) chunks.push(text);
+    } else if (event.type === 'tool_call' && event.subtype === 'started') {
+      chunks.length = 0; // anything said before a tool call was narration
+    } else if (event.type === 'result') {
+      if (event.is_error || event.subtype === 'error') error = String(event.result ?? 'unknown');
+      else result = String(event.result ?? '');
+    }
+  }
+  const text = chunks.join('\n').trim() || result.trim();
+  return { text, error };
+}
+
+export function runProcess(cmd: string, args: string[], stdin: string, timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string }> {
   const limit = timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd: os.tmpdir(), env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });

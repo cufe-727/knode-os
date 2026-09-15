@@ -131,6 +131,9 @@ struct FileResponse: Decodable {
     /// Size on disk, which is larger than `content` when the read was capped.
     var bytes: Int?
     var truncated: Bool?
+    /// True when the text is Markdown knode-os derived from a PDF or image
+    /// rather than the file's own bytes — readable, never editable.
+    var derived: Bool?
 }
 
 struct ResolvedLinkResponse: Decodable {
@@ -313,13 +316,63 @@ struct LLMConfig: Codable, Equatable {
     var cliTimeoutMs: Int?
 }
 
+/// A pipeline route. `use` names the connection it runs on — empty for the
+/// default provider — and `model` overrides that connection's own model. The
+/// remaining fields only carry pre-connections configs the service migrates.
 struct RoutedLLMConfig: Codable, Equatable {
+    var use: String
     var provider: String
     var baseUrl: String
     var apiKey: String
     var model: String
     var cliPath: String
     var cliTimeoutMs: Int?
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        use = try container.decodeIfPresent(String.self, forKey: .use) ?? ""
+        provider = try container.decodeIfPresent(String.self, forKey: .provider) ?? "inherit"
+        baseUrl = try container.decodeIfPresent(String.self, forKey: .baseUrl) ?? ""
+        apiKey = try container.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
+        model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
+        cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? ""
+        cliTimeoutMs = try container.decodeIfPresent(Int.self, forKey: .cliTimeoutMs)
+    }
+}
+
+/// A named endpoint plus credentials that any number of routes can point at.
+struct LLMConnection: Codable, Equatable, Identifiable {
+    var id: String
+    var label: String
+    var provider: String
+    var baseUrl: String
+    var apiKey: String
+    var model: String
+    var cliPath: String
+    var cliTimeoutMs: Int?
+
+    init(id: String, label: String, provider: String = "openai") {
+        self.id = id
+        self.label = label
+        self.provider = provider
+        baseUrl = provider == "openai" ? "https://api.openai.com/v1" : ""
+        apiKey = ""
+        model = ""
+        cliPath = ""
+        cliTimeoutMs = nil
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        label = try container.decodeIfPresent(String.self, forKey: .label) ?? id
+        provider = try container.decodeIfPresent(String.self, forKey: .provider) ?? "openai"
+        baseUrl = try container.decodeIfPresent(String.self, forKey: .baseUrl) ?? ""
+        apiKey = try container.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
+        model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
+        cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? ""
+        cliTimeoutMs = try container.decodeIfPresent(Int.self, forKey: .cliTimeoutMs)
+    }
 }
 
 struct ExtractionConfig: Codable, Equatable {
@@ -335,7 +388,16 @@ struct ExtractionConfig: Codable, Equatable {
 struct KnodeConfig: Codable, Equatable {
     var embedding: EmbeddingConfig
     var llm: LLMConfig
+    var connections: [LLMConnection]
     var extraction: ExtractionConfig
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        embedding = try container.decode(EmbeddingConfig.self, forKey: .embedding)
+        llm = try container.decode(LLMConfig.self, forKey: .llm)
+        connections = try container.decodeIfPresent([LLMConnection].self, forKey: .connections) ?? []
+        extraction = try container.decode(ExtractionConfig.self, forKey: .extraction)
+    }
 }
 
 struct RouteTestResult: Decodable {
@@ -357,6 +419,36 @@ struct ConfigTestResponse: Decodable {
     var entityLlm: RouteTestResult?
     var conceptLlm: RouteTestResult?
     var documentLlm: RouteTestResult?
+}
+
+/// One entry of what a provider offers for a `model` field. The field itself
+/// stays free text — this is a shortcut, not a closed set.
+struct ModelOption: Decodable, Identifiable, Hashable {
+    var id: String
+    var label: String?
+}
+
+struct ModelListResponse: Decodable {
+    /// "api" — the provider listed them; "cli" — the CLI did; "builtin" — knode's own hints.
+    var source: String
+    var ok: Bool
+    var models: [ModelOption]
+    var command: String?
+    var resolvedPath: String?
+    var note: String?
+    var error: String?
+}
+
+/// Where a coding-agent CLI resolved to on the service's PATH.
+struct CliTool: Decodable, Identifiable {
+    var provider: String
+    var command: String
+    var path: String?
+    var id: String { provider }
+}
+
+struct CliToolsResponse: Decodable {
+    var tools: [CliTool]
 }
 
 struct ConfigSaveResponse: Decodable {

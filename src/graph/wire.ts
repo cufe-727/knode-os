@@ -205,9 +205,9 @@ interface BundleContext {
 /** Identify the native wiki bundle or a bundle imported via `okf import`. */
 export function bundleContext(pagePath: string): BundleContext | null {
   if (pagePath.startsWith('wiki/')) return { rootRel: 'wiki', sourceRel: pagePath.slice('wiki/'.length) };
-  const match = /^cooked\/docs\/okf\/([^/]+)\/(.+)$/.exec(pagePath);
+  const match = /^raw\/docs\/okf\/([^/]+)\/(.+)$/.exec(pagePath);
   if (!match) return null;
-  return { rootRel: `cooked/docs/okf/${match[1]}`, sourceRel: match[2] };
+  return { rootRel: `raw/docs/okf/${match[1]}`, sourceRel: match[2] };
 }
 
 function resolveLocalTarget(

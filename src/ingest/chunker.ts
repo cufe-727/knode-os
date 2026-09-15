@@ -9,16 +9,19 @@ export interface ChunkPiece {
 
 /**
  * Split a document into chunks using LangChain's RecursiveCharacterTextSplitter.
- * Markdown files use the markdown-aware separator set so headings stay intact.
+ * Markdown files use the markdown-aware separator set so headings stay intact;
+ * `markdown` overrides the extension check for derived Markdown whose source
+ * key ends in .pdf / .png / .jsonl.
  */
 export async function chunkText(
   filePath: string,
   content: string,
   opts: { chunkSize: number; chunkOverlap: number },
+  extra: { markdown?: boolean } = {},
 ): Promise<ChunkPiece[]> {
   const ext = path.extname(filePath).toLowerCase();
   const splitter =
-    ext === '.md' || ext === '.markdown'
+    (extra.markdown ?? (ext === '.md' || ext === '.markdown'))
       ? RecursiveCharacterTextSplitter.fromLanguage('markdown', opts)
       : new RecursiveCharacterTextSplitter(opts);
   const pieces = await splitter.splitText(content);

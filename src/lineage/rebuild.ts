@@ -33,7 +33,7 @@ export async function rebuild(ctx: AppContext, opts: { history?: boolean; onProg
   const dataDir = ctx.dataDir;
   await ctx.store.close();
   fs.rmSync(path.join(dataDir, DB_DIR), { recursive: true, force: true });
-  ctx.store = await Store.open(dataDir, ctx.config.embedding.dimensions);
+  ctx.store = await Store.open(dataDir, ctx.config.embedding.dimensions, ctx.config.database);
   const store = ctx.store;
   await seedLedgerSeq(store, dataDir);
 
@@ -92,7 +92,7 @@ async function applyAtticScope(store: Store, key: string, sidecar: Sidecar, opts
   const res = await applyScope(
     store,
     { kind: 'doc', key },
-    sidecar.meta.sha256,
+    sidecar.meta.contentSha256,
     { actor: 'rebuild', at: opts.at, log: false, replace: false, meta: { documentId: docId, historical: true, embedModel: '' } },
     async (w) => {
       for (const term of sidecar.extraction.tier0?.concepts ?? []) {
@@ -107,7 +107,7 @@ async function applyAtticScope(store: Store, key: string, sidecar: Sidecar, opts
       const declared = sidecar.extraction.tier0?.declared;
       if (declared) await applyExtraction(w, page, declared.entities, [], declared.claims, 'tier0.frontmatter');
       const t1 = sidecar.extraction.tier1;
-      if (t1 && t1.status === 'done' && t1.contentSha === sidecar.meta.sha256) {
+      if (t1 && t1.status === 'done' && t1.contentSha === sidecar.meta.contentSha256) {
         await applyExtraction(w, page, t1.entities, t1.relations, t1.claims ?? [], `tier1.llm:${t1.model}`);
       }
     },

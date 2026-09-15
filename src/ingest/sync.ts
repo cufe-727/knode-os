@@ -2,8 +2,9 @@ import fs from 'node:fs';
 import { KnodeConfig, resolveRoutedLlmConfig } from '../config.js';
 import { DataSourceRegistry } from '../datasource/registry.js';
 import { applyDatasourceScopes } from '../datasource/sync.js';
-import { safePath, walkFiles } from '../fs/files.js';
-import { isSidecarPath, removeSidecar } from '../fs/sidecar.js';
+import { safePath } from '../fs/files.js';
+import { listSidecarKeys, RAW_DOCS, RAW_TRACES } from '../fs/layout.js';
+import { removeSidecar } from '../fs/sidecar.js';
 import { buildWikiIndex } from '../graph/wire.js';
 import { DATASOURCES_PREFIX, declaredKey, enumerateDeclared, matchesPrefixes, normalizePrefixes } from '../lineage/declared.js';
 import { recountAll } from '../lineage/fold.js';
@@ -15,15 +16,15 @@ import { Store } from '../store/db.js';
 import { IngestStats } from '../types.js';
 import { reconcileViews } from '../wiki/pages.js';
 import { applyDocScope } from './apply.js';
-import { cookDocs, cookedRoot } from './cook.js';
-import { COOKED_TRACES, cookEpisodes } from './episode.js';
+import { prepareEpisodes } from './episode.js';
 import { EmbeddingProvider } from './embeddings.js';
+import { prepareDocs } from './prepare.js';
 
 /**
  * `sync` — configuration reconciliation for knowledge.
  *
- *   declared state = files under raw/ (via cooked/), raw/skills, wiki/,
- *                    purpose.md / schema.md, datasource configs
+ *   declared state = files under raw/docs (prepared), raw/traces (episodes),
+ *                    raw/skills, wiki/, purpose.md / schema.md, datasource configs
  *   running state  = live root scopes
  *
  * Diff them and apply / dispose only the delta, then let dependent views
@@ -42,7 +43,7 @@ export interface SyncContext {
 }
 
 export interface SyncOptions {
-  /** Restrict to keys under these prefixes (raw/docs/… maps to the cooked twin; 'datasources' selects live sources). */
+  /** Restrict to keys under these prefixes ('datasources' selects live sources). */
   only?: string[];
   /** Queue changed docs for tier-1 LLM extraction (default: true when llm configured). */
   llmGraph?: boolean;
@@ -114,54 +115,56 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   const progress = opts.onProgress ?? (() => {});
   const actor = opts.actor ?? 'sync';
   const prefixes = normalizePrefixes(opts.only);
-  const touchesDocs = !prefixes || prefixes.some((p) => p.startsWith('raw/docs') || p.startsWith(cookedRoot()));
-  const touchesTraces = !prefixes || prefixes.some((p) => p.startsWith('raw/traces') || p.startsWith(COOKED_TRACES));
+  const touches = (root: string) => !prefixes || prefixes.some((p) => p === root || p.startsWith(`${root}/`) || root.startsWith(`${p}/`));
+  const touchesDocs = touches(RAW_DOCS);
+  const touchesTraces = touches(RAW_TRACES);
   const includeDatasources = Boolean(ctx.datasources) && (opts.datasources ?? (!prefixes || prefixes.includes(DATASOURCES_PREFIX)));
 
   const entityLlm = config.extraction.entityLlm
-    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, config.extraction.tier1Model))
+    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, config.connections, config.extraction.tier1Model))
     : ctx.llm;
   const queueTier1 = (opts.llmGraph ?? true) && entityLlm.enabled;
-  const documentLlm = new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.documentLlm));
+  const documentLlm = new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.documentLlm, config.connections));
 
-  // L0 → L1: normalize raw/docs into cooked/docs (+ sidecars) before scanning
-  let cookedWanted: Set<string> | undefined;
-  let failedCooked = new Set<string>();
+  // L0 → L1: describe (and where needed convert) raw/docs before scanning
+  let preparedDocs: Map<string, string> | undefined;
+  let failed = new Set<string>();
   if (touchesDocs) {
-    const cook = await cookDocs(ctx.dataDir, store, { vision: documentLlm, onProgress: progress });
-    stats.skipped += cook.skipped;
-    stats.errors += cook.errors;
-    failedCooked = new Set(cook.failed);
-    cookedWanted = new Set(cook.wanted);
-    if (cook.cooked) progress(`cook: ${cook.cooked} normalized`);
+    const prep = await prepareDocs(ctx.dataDir, { vision: documentLlm, onProgress: progress });
+    stats.skipped += prep.stats.skipped;
+    stats.errors += prep.stats.errors;
+    failed = prep.failed;
+    preparedDocs = prep.wanted;
+    if (prep.stats.prepared) progress(`prepare: ${prep.stats.prepared} sources`);
   }
 
   // L0 → L1 for transcripts: turn-segmented episodes, opt-in per config.
-  // Sweeping stale episodes here rather than after enumeration matters: the
-  // declared set is what sync reconciles against, so the files on disk have to
-  // be final before it is built — otherwise switching `episodes` off would
-  // re-apply the very episodes this pass just deleted.
-  let episodeWanted: Set<string> | undefined;
+  // Sweeping stale episode sidecars here rather than after enumeration
+  // matters: the declared set is what sync reconciles against, so the files
+  // on disk have to be final before it is built — otherwise switching
+  // `episodes` off would re-apply the very episodes this pass just deleted.
+  let preparedTraces: Map<string, string> | undefined;
   if (touchesTraces) {
     if (config.trace.episodes) {
-      const episodes = cookEpisodes(ctx.dataDir, { onProgress: progress });
+      const episodes = prepareEpisodes(ctx.dataDir, { onProgress: progress });
       stats.skipped += episodes.skipped;
-      episodeWanted = new Set(episodes.wanted);
-      if (episodes.cooked) progress(`episodes: ${episodes.cooked} cooked`);
+      preparedTraces = episodes.wanted;
+      if (episodes.prepared) progress(`episodes: ${episodes.prepared} prepared`);
     } else {
-      episodeWanted = new Set();
+      preparedTraces = new Map();
     }
-    for (const cooked of walkFiles(ctx.dataDir, COOKED_TRACES)) {
-      if (isSidecarPath(cooked) || episodeWanted.has(cooked) || !matchesPrefixes(cooked, prefixes)) continue;
-      fs.rmSync(safePath(ctx.dataDir, cooked), { force: true });
+    for (const key of listSidecarKeys(ctx.dataDir, RAW_TRACES)) {
+      if (preparedTraces.has(key) || !matchesPrefixes(key, prefixes)) continue;
+      removeSidecar(ctx.dataDir, key);
     }
   }
 
   const declared = enumerateDeclared(ctx.dataDir, config, {
     prefixes: opts.only,
     includeDatasources,
-    cookedWanted,
-    failedCooked,
+    docs: preparedDocs,
+    traces: preparedTraces,
+    failed,
   });
 
   const runningRows = await store.query<ScopeRow>(
@@ -177,20 +180,19 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   // removed: running but no longer declared → dispose (cascades children, pages)
   for (const [k, s] of running) {
     if (declared.has(k)) continue;
-    if (s.kind === 'doc' && failedCooked.has(s.key)) continue; // conversion failed this run — keep the last good state
+    if (s.kind === 'doc' && failed.has(s.key)) continue; // conversion failed this run — keep the last good state
     progress(`dispose ${s.kind} ${s.key}`);
     await disposeScope(store, s.id, { actor, reason: 'removed', at: opts.at?.(s.kind, s.key) });
     stats.removed++;
     stats.disposed++;
   }
 
-  // stale cooked files with neither a raw original nor a live scope
-  if (touchesDocs && cookedWanted) {
-    for (const cooked of walkFiles(ctx.dataDir, cookedRoot())) {
-      if (isSidecarPath(cooked)) continue;
-      if (cookedWanted.has(cooked) || running.has(declaredKey('doc', cooked)) || !matchesPrefixes(cooked, prefixes)) continue;
-      fs.rmSync(safePath(ctx.dataDir, cooked), { force: true });
-      removeSidecar(ctx.dataDir, cooked);
+  // orphan sidecars: neither a raw original nor a live scope (disposed
+  // sources moved theirs to the attic a moment ago, so nothing paid is lost)
+  if (touchesDocs && preparedDocs) {
+    for (const key of listSidecarKeys(ctx.dataDir, RAW_DOCS)) {
+      if (preparedDocs.has(key) || failed.has(key) || running.has(declaredKey('doc', key)) || !matchesPrefixes(key, prefixes)) continue;
+      removeSidecar(ctx.dataDir, key);
     }
   }
 

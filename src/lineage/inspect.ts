@@ -1,5 +1,5 @@
 import { LedgerEvent, readLedger } from './ledger.js';
-import { rawToCookedPath } from '../ingest/cook.js';
+
 import { readDeps } from './deps.js';
 import { scopesForKey, scopeById } from './scope.js';
 import { Store } from '../store/db.js';
@@ -45,7 +45,7 @@ export async function lineageOf(store: Store, kind: LineageReport['kind'], id: s
     return { kind, id, current: current ?? null, evidence: [], deps, scopes };
   }
   if (kind === 'document') {
-    const key = id.startsWith('raw/docs/') ? rawToCookedPath(id) : id;
+    const key = id;
     const [current] = await store.query<Record<string, unknown>>(`SELECT * FROM documents WHERE path = $1`, [key]);
     const scopes = await scopesForKey(store, 'doc', key);
     const children: ScopeRow[] = [];
@@ -93,7 +93,7 @@ export interface HistoryReport {
 
 /** Apply / dispose history of a source (document path, datasource id, page path). */
 export async function historyOf(store: Store, dataDir: string, target: string): Promise<HistoryReport> {
-  const key = target.startsWith('raw/docs/') ? rawToCookedPath(target) : target;
+  const key = target.replace(/\\/g, '/').replace(/^\/+/, '');
   const scopes = (await store.query<ScopeRow>(`SELECT * FROM scopes WHERE key = $1 ORDER BY applied_at DESC`, [key])).map(normalizeScope);
   const ids = new Set(scopes.map((s) => s.id));
   const events = readLedger(dataDir).filter((e) => {
