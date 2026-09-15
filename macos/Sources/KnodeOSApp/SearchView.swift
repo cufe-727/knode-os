@@ -31,7 +31,7 @@ struct SearchView: View {
                 EmptyState(
                     symbol: "magnifyingglass",
                     title: "No matching knowledge",
-                    message: "Try broader terms, another retrieval mode, or ingest more documents."
+                    message: "Try broader terms, another retrieval mode, or index more documents."
                 )
             } else {
                 HSplitView {

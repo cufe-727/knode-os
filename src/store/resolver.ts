@@ -204,7 +204,7 @@ export type SourceKind = (typeof SOURCE_KINDS)[number];
 export interface ScopeFilterRequest {
   /** Restrict to these source kinds. */
   kinds?: string[] | null;
-  /** Restrict to these path prefixes (`raw/docs/reports` maps to its cooked twin). */
+  /** Restrict to these path prefixes, e.g. `raw/docs/reports`. */
   sources?: string[] | null;
   /** `trusted` hides quarantined agent writes; `any` includes them (default). */
   trust?: string | null;

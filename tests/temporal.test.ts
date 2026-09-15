@@ -112,9 +112,8 @@ describe('temporal resolver', () => {
     expect(() => parseDuration('soon')).toThrow(TemporalError);
     expect(resolveScopeFilter({ kinds: ['docs', 'Skill'] }).kinds).toEqual(['doc', 'skill']);
     expect(() => resolveScopeFilter({ kinds: ['dataset'] })).toThrow(/unknown source kind/);
-    // user-facing raw/docs prefixes reach the cooked twins the pipeline indexes
-    expect(resolveScopeFilter({ sources: ['raw/docs/reports'] }).sources)
-      .toEqual(expect.arrayContaining(['cooked/docs/reports']));
+    // raw paths are the keys the pipeline indexes: prefixes pass through cleaned, nothing is added
+    expect(resolveScopeFilter({ sources: ['/raw/docs/reports/'] }).sources).toEqual(['raw/docs/reports']);
   });
 });
 
@@ -196,7 +195,7 @@ describe('phase 2: temporal and scope filters across the query surfaces', () => 
     const q2 = res.claims.find((c) => c.statement.includes('Q2'))!;
     expect(q1).toMatchObject({ stale: true, validFrom: '2026-01-01', validTo: '2026-03-31' });
     expect(q2).toMatchObject({ stale: false, validTo: null });
-    expect(q1.sourcePath).toBe('cooked/docs/reports/q1.md');
+    expect(q1.sourcePath).toBe('raw/docs/reports/q1.md');
     expect(q1.evidenceCount).toBeGreaterThan(0);
   });
 
@@ -212,7 +211,7 @@ describe('phase 2: temporal and scope filters across the query surfaces', () => 
       filter: resolveScopeFilter({ kinds: ['skill'] }),
     });
     expect(fromSkills.claims).toHaveLength(0);
-    expect(fromReports.applied).toContain('sources under raw/docs/reports, cooked/docs/reports');
+    expect(fromReports.applied).toContain('sources under raw/docs/reports');
   });
 
   it('restricts search recall by source kind and path prefix', async () => {
@@ -234,7 +233,7 @@ describe('phase 2: temporal and scope filters across the query surfaces', () => 
       filter: resolveScopeFilter({ sources: ['raw/docs/news'] }),
     });
     expect(onlyNews.length).toBeGreaterThan(0);
-    expect(onlyNews.every((r) => r.path.startsWith('cooked/docs/news/'))).toBe(true);
+    expect(onlyNews.every((r) => r.path.startsWith('raw/docs/news/'))).toBe(true);
   });
 
   it('keeps the sag expansion inside the filter instead of escaping through a shared entity', async () => {
@@ -249,7 +248,7 @@ describe('phase 2: temporal and scope filters across the query surfaces', () => 
       filter: resolveScopeFilter({ sources: ['raw/docs/news'] }),
     });
     expect(scoped.length).toBeGreaterThan(0);
-    expect(scoped.every((r) => r.path.startsWith('cooked/docs/news/'))).toBe(true);
+    expect(scoped.every((r) => r.path.startsWith('raw/docs/news/'))).toBe(true);
   });
 
   it('applies the filter to graph nodes and to the claims hanging off them', async () => {
@@ -262,7 +261,7 @@ describe('phase 2: temporal and scope filters across the query surfaces', () => 
     });
     // 比亚迪 is only mentioned by the Q2 news report, so it is out of scope here
     expect(scoped.nodes.map((n) => n.id)).not.toContain('比亚迪');
-    expect(scoped.chunks.every((c) => c.path.startsWith('cooked/docs/reports/'))).toBe(true);
+    expect(scoped.chunks.every((c) => c.path.startsWith('raw/docs/reports/'))).toBe(true);
     expect((scoped.claims ?? []).map((c) => c.statement)).toEqual(['2026Q1 净利润 90 亿元']);
   });
 
@@ -285,7 +284,7 @@ describe('phase 2: temporal and scope filters across the query surfaces', () => 
       filter: resolveScopeFilter({ kinds: ['doc'] }),
     });
     expect(pack.evidence.claims.map((c) => c.statement)).toEqual(['2026Q1 净利润 90 亿元']);
-    expect(pack.evidence.docs.every((d) => d.path.startsWith('cooked/docs/'))).toBe(true);
+    expect(pack.evidence.docs.every((d) => d.path.startsWith('raw/docs/'))).toBe(true);
     expect(pack.validRange).toEqual({ from: '2026-01-01T00:00:00.000Z', to: '2026-03-31T23:59:59.999Z' });
     expect(pack.validAt).toBeNull();
     expect(pack.applied.join(' ')).toMatch(/freshness ≤ 900s/);
@@ -306,8 +305,8 @@ describe('phase 2: temporal and scope filters across the query surfaces', () => 
       `SELECT source_path, count(*)::int AS n FROM v_evidence WHERE kind = 'claim' GROUP BY source_path ORDER BY source_path`,
     );
     expect(perSource.rows.map((r) => r.source_path)).toEqual([
-      'cooked/docs/news/q2.md',
-      'cooked/docs/reports/q1.md',
+      'raw/docs/news/q2.md',
+      'raw/docs/reports/q1.md',
     ]);
 
     await expect(catalogQuery(ctx.store, `SELECT * FROM claims`)).rejects.toThrow(/not readable/);
@@ -336,7 +335,7 @@ describe('phase 2: temporal and scope filters across the query surfaces', () => 
       filter: resolveScopeFilter({ sources: ['raw/docs/reports'] }),
     });
     expect(asOfScoped.claims.map((c) => c.statement)).toEqual(['2026Q1 净利润 90 亿元']);
-    expect(asOfScoped.claims[0].sourcePath).toBe('cooked/docs/reports/q1.md');
+    expect(asOfScoped.claims[0].sourcePath).toBe('raw/docs/reports/q1.md');
 
     // and the two axes compose: believed then, holding in Q2
     const composed = await queryClaims(ctx.store, {

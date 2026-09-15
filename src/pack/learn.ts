@@ -16,7 +16,7 @@ import { parsePlaybook } from './playbook.js';
  * failed, how much evidence came back and what gaps remained. This module
  * turns that stream into *concrete playbook revisions* (kind 'pack'
  * suggestions carrying the full revised file), which are written back to
- * packs/*.md on accept — so the next query runs a better script.
+ * playbooks/packs/*.md on accept — so the next query runs a better script.
  */
 
 interface PackEventRow {
@@ -124,7 +124,7 @@ export async function optimizePacks(
 
 /**
  * Apply a machine-actionable suggestion. Kinds 'pack' and 'recipe' write a
- * file back under packs/ — the "accept" that actually changes what the next
+ * file back under playbooks/packs/ — the "accept" that actually changes what the next
  * query does (plain dream suggestions remain advisory). A distilled recipe
  * goes through exactly this gate, which is why nothing distillation proposes
  * takes effect until a person says so.

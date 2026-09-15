@@ -3,7 +3,7 @@
 > 文档上传后的处理管线设计：切块、实体/关系抽取、sidecar 元信息与热度追踪、
 > 目录层次。目标规模：十万至百万级文档。
 >
-> 状态：**核心已实现**（cooked 层 + sidecar：`src/ingest/cook.ts`、`src/fs/sidecar.ts`；
+> 状态：**核心已实现**（prepare 层 + sidecar：`src/ingest/prepare.ts`、`src/ingest/source.ts`、`src/fs/sidecar.ts`；
 > Tier 0 概念图：`src/graph/concepts.ts`；Tier 1 队列：`src/graph/tier1.ts`；
 > Tier 2 精炼：`src/wiki/refine.ts`；热度：`src/stats/heat.ts`）。
 > 本文保留原始设计动机与规模化路线，供理解取舍。
@@ -11,6 +11,11 @@
 > lineage 运行时（scope / evidence / fold），wiki 页面成为带依赖声明的视图；
 > 本文中关于 `clearDocumentGraph`、`upsertRelation` 权重累加、生成页反哺图谱
 > 的描述已被 [05 — Agent Context Database](05-agent-context-db.zh-CN.md) 取代。
+> **v3 布局（2026-09-13）**：`cooked/` 已取消。文档键就是 raw 路径；文本源不再落盘
+> 副本（索引时在内存中归一化）；PDF/图片的转换结果与 meta / tier0 / tier1 / usage /
+> 摘要缓存拆成独立文件，放在镜像整个数据目录的 `.sidecar/<key>/` 下；被删源的整个
+> sidecar 目录进入 `ledger/attic/<scopeId>/`；`packs/`、`capabilities/`、`intents/`
+> 合并为 `playbooks/`。本文 §3–§4 里的 `cooked/docs/<name>.md.knode.json` 描述的是 v2 布局。
 
 ## 0. 背景与目标
 
@@ -206,7 +211,10 @@ sequenceDiagram
 
 ### 3.1 定位与格式
 
-每个 cooked 文档旁放一个 sidecar：`<name>.md` → `<name>.md.knode.json`。
+每个源一个 sidecar 目录（v3）：`raw/docs/<name>.md` →
+`.sidecar/raw/docs/<name>.md/{meta,tier0,tier1,usage}.json`，PDF/图片另有 `content.md`，
+LLM 摘要缓存在 `views/`；每个文件由各自的写入方独立 tmp+rename。v2 时期是单个
+`cooked/docs/<name>.md.knode.json`，下文 3.2 的 JSON 结构仍按 v2 记录。
 
 它是 gbrain "文件为真"哲学的延伸：**凡是重建成本高的派生物（LLM 抽取结果、
 使用统计）都必须落在文件层**；`.knode/` DB 里只放重建成本低的东西（embedding
@@ -331,18 +339,25 @@ sidecar 的 `usage` 字段。DB 与 sidecar 之间，DB 是实时账本、sideca
 <data>/
 ├── knode.config.json
 ├── purpose.md  schema.md
-├── raw/                 # L0 原始层：上传原件（含 PDF 等二进制），只读不改
+├── raw/                 # L0 原始层：上传原件（含 PDF 等二进制），只读不改；raw 路径 = 文档键
 │   ├── docs/  traces/{claude,codex}/  skills/
-├── cooked/              # L1 归一化层：规范 Markdown + sidecar（系统管理）
-│   └── docs/
-│       ├── foo.md               # 归一化文本（raw 为 .md 时硬链接/直引）
-│       └── foo.md.knode.json    # sidecar：元信息 + 抽取结果 + 热度
+├── .sidecar/            # L1 派生层（v3）：镜像整个数据目录，每个源一个目录（系统管理，需保留）
+│   └── raw/docs/foo.pdf/
+│       ├── content.md           # 仅 PDF/图片/episode：转换出的 Markdown；文本源不落盘副本
+│       ├── meta.json            # sourceSha256 / contentSha256 / normalizer / conversion / chunks
+│       ├── tier0.json  tier1.json  usage.json
+│       └── views/source-summary.md
 ├── wiki/                # L3 精炼层：策展的知识产品（现有结构不变）
 │   ├── index.md  log.md  overview.md
 │   ├── entities/  concepts/  sources/  dreams/
+├── playbooks/           # packs/ capabilities/ intents/：agent 可编辑的配置
+├── ledger/              # events.jsonl + attic/<scopeId>/（被删源的整个 sidecar 目录）
 └── .knode/              # L2 派生索引：PGlite（chunks/embeddings/graph/stats）
-    └── db/                       随时可删，从 cooked+sidecar 重建
+    └── db/                       随时可删，从 raw + .sidecar 重建
 ```
+
+> v2 时期这一层叫 `cooked/docs/`，文本文件也复制一份、sidecar 是单个 `<name>.md.knode.json`；
+> 下文 4.2–4.4 的论证与迁移步骤保留为历史记录。
 
 四个层次的职责与可弃性：
 

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
+import { INTENTS_DIR } from '../fs/layout.js';
 
 /**
  * Intent specs — the configurable half of the Context Compiler.
@@ -11,7 +12,7 @@ import matter from 'gray-matter';
  * honest gap ("I have no quote") instead of returning six documents and
  * letting the agent discover the hole itself.
  *
- * Specs live in `<data>/intents/*.yaml`. The learnable half (which capability
+ * Specs live in `<data>/playbooks/intents/*.yaml`. The learnable half (which capability
  * actually fills a slot best) comes from receipts, not from here.
  */
 
@@ -147,11 +148,11 @@ export function parseIntent(text: string, relPath: string): IntentSpec | null {
 }
 
 export function loadIntents(dataDir: string): IntentSpec[] {
-  const dir = path.join(dataDir, 'intents');
+  const dir = path.join(dataDir, INTENTS_DIR);
   if (!fs.existsSync(dir)) return [];
   const out: IntentSpec[] = [];
   for (const file of fs.readdirSync(dir).filter((f) => /\.ya?ml$/i.test(f)).sort()) {
-    const parsed = parseIntent(fs.readFileSync(path.join(dir, file), 'utf8'), `intents/${file}`);
+    const parsed = parseIntent(fs.readFileSync(path.join(dir, file), 'utf8'), `${INTENTS_DIR}/${file}`);
     if (parsed) out.push(parsed);
   }
   return out;
@@ -243,9 +244,9 @@ guidance: |
 
 /** Write the starter intent once (never overwrites user edits). */
 export function ensureDefaultIntents(dataDir: string): string[] {
-  const file = path.join(dataDir, 'intents', 'entity-overview.yaml');
+  const file = path.join(dataDir, INTENTS_DIR, 'entity-overview.yaml');
   if (fs.existsSync(file)) return [];
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, DEFAULT_INTENT_YAML);
-  return ['intents/entity-overview.yaml'];
+  return [`${INTENTS_DIR}/entity-overview.yaml`];
 }

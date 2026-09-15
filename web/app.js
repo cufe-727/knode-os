@@ -270,6 +270,10 @@ function joinTeam(code, fromOnboarding = false) {
 function loadWorkspaceData() {
   currentFile = null;
   editing = false;
+  treeData = null;
+  selectedDir = null;
+  expandedDirs.clear();
+  expandedDirs.add('wiki');
   loadedConfig = null;
   if (graphState.anim) cancelAnimationFrame(graphState.anim);
   graphState.nodes = [];
@@ -533,10 +537,114 @@ async function loadStats() {
   } catch { /* server still starting */ }
 }
 
+/* ------------------------------- menus --------------------------------- */
+
+/** One floating menu at a time — the tree's right-click and the pane's own buttons share it. */
+function showMenu(x, y, items) {
+  closeMenu();
+  const menu = document.createElement('div');
+  menu.className = 'popup-menu';
+  // a click inside must reach its own button, never the dismisser on document
+  menu.addEventListener('mousedown', (ev) => ev.stopPropagation());
+  for (const item of items) {
+    if (item === '-') {
+      menu.appendChild(document.createElement('hr'));
+      continue;
+    }
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = item.label;
+    if (item.danger) button.classList.add('danger');
+    if (item.disabled) button.disabled = true;
+    else button.addEventListener('click', () => { closeMenu(); item.run(); });
+    menu.appendChild(button);
+  }
+  document.body.appendChild(menu);
+  const box = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(6, Math.min(x, window.innerWidth - box.width - 6))}px`;
+  menu.style.top = `${Math.max(6, Math.min(y, window.innerHeight - box.height - 6))}px`;
+  // registered a tick later, so the click that opened the menu cannot close it
+  setTimeout(() => {
+    document.addEventListener('click', closeMenu);
+    document.addEventListener('contextmenu', closeMenu);
+    window.addEventListener('keydown', onMenuKey);
+    window.addEventListener('resize', closeMenu);
+  }, 0);
+}
+
+function closeMenu() {
+  document.querySelector('.popup-menu')?.remove();
+  document.removeEventListener('click', closeMenu);
+  document.removeEventListener('contextmenu', closeMenu);
+  window.removeEventListener('keydown', onMenuKey);
+  window.removeEventListener('resize', closeMenu);
+}
+
+function onMenuKey(ev) {
+  if (ev.key === 'Escape') closeMenu();
+}
+
+function showMenuUnder(anchor, items) {
+  const box = anchor.getBoundingClientRect();
+  showMenu(box.left, box.bottom + 4, items);
+}
+
 /* ------------------------------- files --------------------------------- */
 
 let currentFile = null;
 let editing = false;
+let treeData = null;
+/** The folder clicked in the tree — where new items and uploads land. */
+let selectedDir = null;
+/** Folders left open, kept across reloads so something just created stays in view. */
+const expandedDirs = new Set(['wiki']);
+
+/** How many files and bytes go into one upload request — a folder can hold thousands. */
+const UPLOAD_BATCH_FILES = 40;
+const UPLOAD_BATCH_BYTES = 24 * 1024 * 1024;
+
+const isWritable = (path) => /^(wiki|raw\/docs)(\/|$)/.test(path);
+const parentDir = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
+const baseName = (path) => path.split('/').pop();
+
+/** Where a create or an upload goes: the picked folder, else the open file's folder, else wiki. */
+function targetDir() {
+  if (selectedDir) return selectedDir;
+  if (currentFile && parentDir(currentFile)) return parentDir(currentFile);
+  return 'wiki';
+}
+
+/** The same folder, kept to one an upload may actually land in. */
+const uploadTarget = () => (isWritable(targetDir()) ? targetDir() : 'raw/docs');
+
+function nodeAt(path) {
+  const find = (node) => {
+    if (node.path === path) return node;
+    if (node.path && !path.startsWith(`${node.path}/`)) return null;
+    for (const child of node.children || []) {
+      const hit = find(child);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  return treeData ? find(treeData) : null;
+}
+
+/** A default name nothing in the folder uses yet, so two creates cannot collide. */
+function freeName(dir, base, ext = '') {
+  const taken = new Set((nodeAt(dir)?.children || []).map((c) => c.name));
+  let name = base + ext;
+  for (let i = 2; taken.has(name); i += 1) name = `${base}-${i}${ext}`;
+  return name;
+}
+
+const fileCount = (node) => (node.kind === 'file' ? 1 : (node.children || []).reduce((n, c) => n + fileCount(c), 0));
+
+/** Reveal a path by opening it and every folder above it. */
+function reveal(path) {
+  const parts = path.split('/').filter(Boolean);
+  for (let i = 1; i <= parts.length; i += 1) expandedDirs.add(parts.slice(0, i).join('/'));
+}
 
 function renderTree(node, container) {
   if (!node.children) return;
@@ -545,7 +653,6 @@ function renderTree(node, container) {
     div.className = child.kind === 'dir' ? 'tree-dir' : 'tree-file';
     const label = document.createElement('span');
     label.className = 'tree-label';
-    label.textContent = (child.kind === 'dir' ? '▸ ' : '· ') + child.name;
     label.dataset.path = child.path;
     div.appendChild(label);
     if (child.kind === 'dir') {
@@ -553,41 +660,330 @@ function renderTree(node, container) {
       kids.className = 'tree-children';
       renderTree(child, kids);
       div.appendChild(kids);
-      const topLevel = !child.path.includes('/');
-      if (!topLevel) div.classList.add('collapsed');
-      label.textContent = (div.classList.contains('collapsed') ? '▸ ' : '▾ ') + child.name;
+      if (!expandedDirs.has(child.path)) div.classList.add('collapsed');
+      if (child.path === selectedDir) label.classList.add('picked');
+      const paint = () => {
+        label.textContent = `${div.classList.contains('collapsed') ? '▸' : '▾'} ${child.name}`;
+      };
+      paint();
       label.addEventListener('click', () => {
+        // one click both picks the folder new items go into and opens it
+        pickDir(child.path);
         div.classList.toggle('collapsed');
-        label.textContent = (div.classList.contains('collapsed') ? '▸ ' : '▾ ') + child.name;
+        if (div.classList.contains('collapsed')) expandedDirs.delete(child.path);
+        else expandedDirs.add(child.path);
+        paint();
       });
     } else {
+      label.textContent = `· ${child.name}`;
+      if (child.path === currentFile) label.classList.add('selected');
       label.addEventListener('click', () => openFile(child.path, label));
     }
+    label.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      // the dismisser on document would otherwise close the menu we just opened
+      ev.stopPropagation();
+      showMenu(ev.clientX, ev.clientY, nodeMenu(child));
+    });
     container.appendChild(div);
   }
 }
 
+/** What a right-click on a row offers, for that row — never for what is selected elsewhere. */
+function nodeMenu(node) {
+  const dir = node.kind === 'dir';
+  const movable = isWritable(node.path) && node.path !== 'wiki' && node.path !== 'raw/docs';
+  const items = [];
+  if (dir && isWritable(node.path)) {
+    items.push({ label: 'New file here…', run: () => { pickDir(node.path); newFile(node.path); } });
+    items.push({ label: 'New folder here…', run: () => { pickDir(node.path); newFolder(node.path); } });
+    items.push('-');
+    items.push({ label: 'Upload files here…', run: () => { pickDir(node.path); pickUpload('files', node.path); } });
+    items.push({ label: 'Upload folder here…', run: () => { pickDir(node.path); pickUpload('folder', node.path); } });
+    items.push('-');
+  }
+  if (!dir) items.push({ label: 'Open', run: () => openFile(node.path) });
+  items.push({ label: 'Copy path', run: () => copyPath(node.path) });
+  if (movable) {
+    items.push('-');
+    items.push({ label: dir ? 'Rename folder…' : 'Rename…', run: () => renameNode(node) });
+    items.push({ label: dir ? 'Move folder to…' : 'Move to…', run: () => moveNode(node) });
+    items.push({ label: dir ? 'Delete folder…' : 'Delete…', danger: true, run: () => deleteNode(node) });
+  }
+  return items;
+}
+
+function pickDir(path) {
+  selectedDir = path;
+  document.querySelectorAll('#filetree .tree-label').forEach((el) => {
+    el.classList.toggle('picked', el.parentElement.classList.contains('tree-dir') && el.dataset.path === path);
+  });
+  paintDestination();
+}
+
+function paintDestination() {
+  const dir = targetDir();
+  $('#tree-destination-path').textContent = `${dir}/`;
+  $('#tree-destination-lock').hidden = isWritable(dir);
+  $('#btn-clear-dir').hidden = !selectedDir;
+}
+
 async function loadTree() {
-  const tree = await api('/api/tree');
+  treeData = await api('/api/tree');
   const el = $('#filetree');
   el.innerHTML = '';
-  renderTree(tree, el);
+  renderTree(treeData, el);
+  paintDestination();
+}
+
+async function copyPath(path) {
+  try {
+    await navigator.clipboard.writeText(path);
+    toast(`copied ${path}`);
+  } catch {
+    toast(path);
+  }
+}
+
+async function newFile(dir) {
+  const folder = isWritable(dir) ? dir : 'wiki';
+  const suggested = `${folder}/${freeName(folder, 'new-note', '.md')}`;
+  const path = prompt('New file path (under wiki/ or raw/docs/):', suggested);
+  if (!path) return;
+  if (!isWritable(path)) {
+    toast('only wiki/ and raw/docs/ take new files');
+    return;
+  }
+  try {
+    const title = baseName(path).replace(/\.md$/, '').replace(/-/g, ' ');
+    await api('/api/file', { method: 'PUT', body: JSON.stringify({ path, content: `# ${title}\n\n` }) });
+    reveal(parentDir(path));
+    await loadTree();
+    openFile(path);
+  } catch (e) {
+    toast(`create failed: ${e.message}`);
+  }
+}
+
+async function newFolder(dir) {
+  const folder = isWritable(dir) ? dir : 'wiki';
+  const suggested = `${folder}/${freeName(folder, 'new-folder')}`;
+  const path = prompt('New folder path (under wiki/ or raw/docs/):', suggested);
+  if (!path) return;
+  if (!isWritable(path)) {
+    toast('only wiki/ and raw/docs/ take new folders');
+    return;
+  }
+  try {
+    const created = await api('/api/mkdir', { method: 'POST', body: JSON.stringify({ path }) });
+    reveal(created.path);
+    await loadTree();
+    pickDir(created.path);
+    toast(`created ${created.path}/`);
+  } catch (e) {
+    toast(`create folder failed: ${e.message}`);
+  }
+}
+
+async function renameNode(node) {
+  const name = prompt(`Rename ${node.kind === 'dir' ? 'folder' : 'file'}:`, baseName(node.path));
+  if (name === null) return;
+  const clean = name.trim();
+  if (!clean || clean === baseName(node.path)) return;
+  if (clean.includes('/')) {
+    toast('a name cannot contain "/" — use "move to…" instead');
+    return;
+  }
+  const parent = parentDir(node.path);
+  await moveSubtree(node.path, parent ? `${parent}/${clean}` : clean);
+}
+
+async function moveNode(node) {
+  const answer = prompt(`Move ${baseName(node.path)} into which folder? (under wiki/ or raw/docs/)`, parentDir(node.path));
+  if (answer === null) return;
+  const dest = answer.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  if (!isWritable(dest)) {
+    toast('moves land under wiki/ or raw/docs/');
+    return;
+  }
+  if (dest === parentDir(node.path)) {
+    toast(`${baseName(node.path)} is already in ${dest}`);
+    return;
+  }
+  // rename would fail halfway through a folder moved into itself
+  if (node.kind === 'dir' && (dest === node.path || dest.startsWith(`${node.path}/`))) {
+    toast('a folder cannot move inside itself');
+    return;
+  }
+  await moveSubtree(node.path, `${dest}/${baseName(node.path)}`);
+}
+
+/**
+ * The one path change behind rename and move.
+ *
+ * A path is the document's identity in the graph, so the knowledge only
+ * catches up on the ingest that follows.
+ */
+async function moveSubtree(from, to) {
+  try {
+    await api('/api/mv', { method: 'POST', body: JSON.stringify({ from, to }) });
+    const moved = (path) => (path === from || path.startsWith(`${from}/`) ? to + path.slice(from.length) : path);
+    if (currentFile) {
+      currentFile = moved(currentFile);
+      $('#file-path').textContent = currentFile;
+    }
+    if (selectedDir) selectedDir = moved(selectedDir);
+    for (const dir of [...expandedDirs]) {
+      if (dir !== moved(dir)) {
+        expandedDirs.delete(dir);
+        expandedDirs.add(moved(dir));
+      }
+    }
+    reveal(parentDir(to));
+    await loadTree();
+  } catch (e) {
+    toast(`move failed: ${e.message}`);
+    return;
+  }
+  // the files are already where they belong — a failed re-index must not read
+  // as a failed move
+  toast(`moved to ${to} — re-indexing…`, 60000);
+  try {
+    const stats = await api('/api/ingest', { method: 'POST' });
+    await loadTree();
+    loadStats();
+    toast(`move complete — ${stats.indexed} docs · ${stats.chunks} chunks re-indexed`);
+  } catch (e) {
+    toast(`moved to ${to}, re-index failed: ${e.message}`);
+  }
+}
+
+async function deleteNode(node) {
+  const files = fileCount(node);
+  const question = node.kind === 'dir'
+    ? `Delete ${node.path}/ and the ${files} file${files === 1 ? '' : 's'} inside it?`
+    : `Delete ${node.path}?`;
+  if (!confirm(question)) return;
+  try {
+    await api(`/api/file?path=${encodeURIComponent(node.path)}`, { method: 'DELETE' });
+    forget(node.path);
+    await loadTree();
+    loadStats();
+    toast(node.kind === 'dir' ? `deleted ${node.path}/ — ${files} file${files === 1 ? '' : 's'}` : `deleted ${node.path}`);
+  } catch (e) {
+    toast(`delete failed: ${e.message}`);
+  }
+}
+
+/** Drop every reference to a path that is no longer on disk. */
+function forget(path) {
+  const gone = (candidate) => candidate === path || candidate.startsWith(`${path}/`);
+  if (currentFile && gone(currentFile)) clearOpenFile();
+  if (selectedDir && gone(selectedDir)) selectedDir = null;
+  for (const dir of [...expandedDirs]) if (gone(dir)) expandedDirs.delete(dir);
+}
+
+function clearOpenFile() {
+  currentFile = null;
+  editing = false;
+  $('#file-path').textContent = '';
+  $('#file-view').innerHTML = '';
+  $('#file-view').hidden = false;
+  $('#file-editor').value = '';
+  $('#file-editor').hidden = true;
+  setFileNotice(null);
+  $('#btn-edit').textContent = 'edit';
+  $('#btn-edit').disabled = true;
+  $('#btn-save').disabled = true;
+  $('#btn-delete').disabled = true;
+}
+
+/** Mirrors MAX_PREVIEW_BYTES in the service — the cap on an unqualified read. */
+const PREVIEW_BYTE_CAP = 256 * 1024;
+/** Mirrors MAX_FILE_BYTES: the largest read the service serves, so the largest editable file. */
+const EDIT_BYTE_CAP = 4 * 1024 * 1024;
+
+/** Decimal units, matching what the macOS app's ByteCountFormatter prints. */
+const fmtBytes = (bytes) => (bytes >= 1e6 ? `${(bytes / 1e6).toFixed(1)} MB` : `${Math.round(bytes / 1e3)} KB`);
+
+/**
+ * Why the open file cannot be edited — `{ text, canLoadFull }`, or null when it
+ * can. A truncated preview must stay read-only: PUT /api/file overwrites the
+ * whole file, so saving what the editor holds would silently drop everything
+ * past the cap. `canLoadFull` says the whole file still fits in one read, so
+ * the user can promote the preview to a real edit.
+ */
+function readOnlyNotice(derived, truncated, bytes) {
+  // Derived text is knode-os's rendering of a PDF or image. It is read-only
+  // whatever its size: writing it back would replace the original's bytes, so
+  // this is checked before the size rule and never offers a full load.
+  if (derived) {
+    return {
+      text: 'Derived Markdown — knode-os produced this from the original, so it is read-only. Replace the original by uploading a new copy.',
+      canLoadFull: false,
+    };
+  }
+  if (truncated) {
+    const total = Number.isFinite(bytes) ? ` of ${fmtBytes(bytes)}` : '';
+    const head = `Preview only — showing the first ${fmtBytes(PREVIEW_BYTE_CAP)}${total}.`;
+    if (Number.isFinite(bytes) && bytes <= EDIT_BYTE_CAP) {
+      return { text: `${head} Load the full file to edit it.`, canLoadFull: true };
+    }
+    return { text: `${head} Files over ${fmtBytes(EDIT_BYTE_CAP)} cannot be edited here.`, canLoadFull: false };
+  }
+  return null;
+}
+
+function setFileNotice(notice) {
+  $('#file-notice').hidden = !notice;
+  $('#file-notice-text').textContent = notice?.text ?? '';
+  $('#btn-load-full').hidden = !notice?.canLoadFull;
+}
+
+/**
+ * Re-read the open file without the preview cap so it can be edited. The
+ * editor only ever holds a complete file — that is what makes a save safe.
+ */
+async function loadFullFile() {
+  if (!currentFile) return;
+  const path = currentFile;
+  try {
+    const { content, derived, truncated, bytes } = await api(`/api/file?path=${encodeURIComponent(path)}&maxBytes=${EDIT_BYTE_CAP}`);
+    if (currentFile !== path) return; // the user moved on while this was in flight
+    renderFileContent(path, content, derived, truncated, bytes);
+    if (truncated) toast(`${path} is too large to edit here`);
+  } catch (e) {
+    toast(`load failed: ${e.message}`);
+  }
+}
+
+/** Paint the file pane and decide, from this read alone, whether editing is allowed. */
+function renderFileContent(path, content, derived, truncated, bytes) {
+  // derived text (a PDF / image's Markdown) is knode-os's, not the user's: readable, never editable here
+  $('#file-view').innerHTML = path.endsWith('.md') || derived ? renderMd(content) : `<pre>${esc(content)}</pre>`;
+  $('#file-editor').value = content;
+  const notice = readOnlyNotice(derived, truncated, bytes);
+  setFileNotice(notice);
+  $('#btn-edit').textContent = 'edit';
+  $('#btn-edit').disabled = Boolean(notice);
+  $('#btn-save').disabled = true;
 }
 
 async function openFile(path, labelEl) {
   try {
-    const { content } = await api(`/api/file?path=${encodeURIComponent(path)}`);
+    const { content, derived, truncated, bytes } = await api(`/api/file?path=${encodeURIComponent(path)}`);
     currentFile = path;
     editing = false;
-    document.querySelectorAll('.tree-label.selected').forEach((x) => x.classList.remove('selected'));
-    if (labelEl) labelEl.classList.add('selected');
+    // the create target follows the last thing clicked: a file hands it back
+    // to the file's own folder
+    selectedDir = null;
+    document.querySelectorAll('.tree-label.selected, .tree-label.picked').forEach((x) => x.classList.remove('selected', 'picked'));
+    (labelEl || document.querySelector(`#filetree .tree-file > .tree-label[data-path="${CSS.escape(path)}"]`))?.classList.add('selected');
+    paintDestination();
     $('#file-path').textContent = path;
     $('#file-view').hidden = false;
     $('#file-editor').hidden = true;
-    $('#file-view').innerHTML = path.endsWith('.md') ? renderMd(content) : `<pre>${esc(content)}</pre>`;
-    $('#file-editor').value = content;
-    $('#btn-edit').disabled = false;
-    $('#btn-save').disabled = true;
+    renderFileContent(path, content, derived, truncated, bytes);
     $('#btn-delete').disabled = false;
   } catch (e) {
     toast(`open failed: ${e.message}`);
@@ -605,11 +1001,15 @@ $('#file-view').addEventListener('click', async (event) => {
   event.preventDefault();
   try {
     const resolved = await api(`/api/link/resolve?target=${encodeURIComponent(target)}&from=${encodeURIComponent(currentFile)}`);
+    reveal(parentDir(resolved.path));
+    await loadTree();
     await openFile(resolved.path);
   } catch (e) {
     toast(`link unavailable: ${e.message}`);
   }
 });
+
+$('#btn-load-full').addEventListener('click', loadFullFile);
 
 $('#btn-edit').addEventListener('click', () => {
   editing = !editing;
@@ -630,63 +1030,103 @@ $('#btn-save').addEventListener('click', async () => {
   }
 });
 
-$('#btn-delete').addEventListener('click', async () => {
-  if (!currentFile || !confirm(`Delete ${currentFile}?`)) return;
-  try {
-    await api(`/api/file?path=${encodeURIComponent(currentFile)}`, { method: 'DELETE' });
-    toast(`deleted ${currentFile}`);
-    currentFile = null;
-    $('#file-path').textContent = '';
-    $('#file-view').innerHTML = '';
-    $('#btn-edit').disabled = $('#btn-save').disabled = $('#btn-delete').disabled = true;
-    loadTree();
-  } catch (e) {
-    toast(`delete failed: ${e.message}`);
-  }
+$('#btn-delete').addEventListener('click', () => {
+  if (currentFile) deleteNode({ path: currentFile, kind: 'file' });
 });
 
-$('#btn-new-file').addEventListener('click', async () => {
-  const path = prompt('New file path (under wiki/ or raw/docs/):', 'wiki/concepts/new-note.md');
-  if (!path) return;
-  try {
-    await api('/api/file', { method: 'PUT', body: JSON.stringify({ path, content: `# ${path.split('/').pop().replace(/\.md$/, '')}\n\n` }) });
-    await loadTree();
-    openFile(path);
-  } catch (e) {
-    toast(`create failed: ${e.message}`);
-  }
+// creating and uploading are the same intent — "put something in this folder"
+// — so they share one menu instead of two buttons
+$('#btn-add').addEventListener('click', (ev) => {
+  const dir = targetDir();
+  showMenuUnder(ev.currentTarget, [
+    { label: 'New file…', run: () => newFile(dir) },
+    { label: 'New folder…', run: () => newFolder(dir) },
+    '-',
+    { label: 'Upload files…', run: () => pickUpload('files') },
+    { label: 'Upload folder…', run: () => pickUpload('folder') },
+  ]);
+});
+
+$('#btn-clear-dir').addEventListener('click', () => {
+  selectedDir = null;
+  document.querySelectorAll('#filetree .tree-label.picked').forEach((x) => x.classList.remove('picked'));
+  paintDestination();
 });
 
 $('#btn-refresh-tree').addEventListener('click', loadTree);
 
-$('#file-upload').addEventListener('change', async (ev) => {
-  const files = ev.target.files;
-  if (!files.length) return;
-  const form = new FormData();
-  for (const f of files) form.append('files', f);
+function pickUpload(kind, dir) {
+  const input = kind === 'folder' ? $('#folder-upload') : $('#file-upload');
+  input.dataset.dir = dir || uploadTarget();
+  input.click();
+}
+
+for (const id of ['#file-upload', '#folder-upload']) {
+  $(id).addEventListener('change', async (ev) => {
+    const dir = ev.target.dataset.dir || uploadTarget();
+    // a picked folder carries its whole subtree, dot-directories included
+    const files = [...ev.target.files].filter((f) => !(f.webkitRelativePath || f.name).split('/').some((seg) => seg.startsWith('.')));
+    ev.target.value = '';
+    await uploadFiles(files, dir);
+  });
+}
+
+/** Split an import into requests small enough for the service to hold in memory. */
+function uploadBatches(files) {
+  const batches = [];
+  let current = [];
+  let bytes = 0;
+  for (const file of files) {
+    if (current.length && (current.length >= UPLOAD_BATCH_FILES || bytes + file.size > UPLOAD_BATCH_BYTES)) {
+      batches.push(current);
+      current = [];
+      bytes = 0;
+    }
+    current.push(file);
+    bytes += file.size;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+async function uploadFiles(files, dir) {
+  if (!files.length) {
+    toast('nothing to upload — no readable files there');
+    return;
+  }
   try {
-    const res = await fetch('/api/upload', { method: 'POST', headers: workspaceRequestHeaders(), body: form });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
-    toast(`uploaded: ${data.saved.join(', ')} — ingesting…`);
+    let saved = 0;
+    for (const batch of uploadBatches(files)) {
+      const form = new FormData();
+      form.set('dir', dir);
+      // a folder upload sends each file's path inside it, so the subtree is recreated
+      for (const file of batch) form.append('files', file, file.webkitRelativePath || file.name);
+      const res = await fetch('/api/upload', { method: 'POST', headers: workspaceRequestHeaders(), body: form });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      saved += data.saved.length;
+      toast(`uploading ${saved}/${files.length} files into ${dir}…`, 60000);
+    }
+    toast(`uploaded ${saved} file${saved === 1 ? '' : 's'} into ${dir} — indexing…`, 60000);
     await api('/api/ingest', { method: 'POST' });
-    toast('ingest complete');
-    loadTree();
+    reveal(dir);
+    await loadTree();
     loadStats();
+    toast('upload and index complete');
   } catch (e) {
     toast(`upload failed: ${e.message}`);
   }
-  ev.target.value = '';
-});
+}
 
 $('#btn-ingest').addEventListener('click', async () => {
-  toast('ingesting…', 60000);
+  toast('indexing…', 60000);
   try {
     const s = await api('/api/ingest', { method: 'POST' });
-    toast(`ingest: ${s.indexed} indexed, ${s.unchanged} unchanged, ${s.chunks} chunks`);
+    toast(`indexed ${s.indexed} docs, ${s.unchanged} unchanged, ${s.chunks} chunks`);
+    await loadTree();
     loadStats();
   } catch (e) {
-    toast(`ingest failed: ${e.message}`);
+    toast(`index failed: ${e.message}`);
   }
 });
 
@@ -700,7 +1140,7 @@ async function doSearch() {
   el.innerHTML = '<p class="hint">searching…</p>';
   try {
     const results = await api(`/api/search?q=${encodeURIComponent(q)}&mode=${mode}&k=12`);
-    el.innerHTML = results.length ? '' : '<p class="hint">no results — upload docs and run ingest first.</p>';
+    el.innerHTML = results.length ? '' : '<p class="hint">no results — upload docs and index them first.</p>';
     for (const r of results) {
       const div = document.createElement('div');
       div.className = 'result';
@@ -759,7 +1199,7 @@ async function loadGraph(q) {
     graphState.loaded = true;
     startGraph(res.nodes, res.edges);
     const side = $('#graph-side');
-    side.innerHTML = res.nodes.length === 0 ? '<p class="hint">graph is empty — ingest docs first (entities come from [[wikilinks]] and LLM extraction).</p>' : '';
+    side.innerHTML = res.nodes.length === 0 ? '<p class="hint">graph is empty — index docs first (entities come from [[wikilinks]] and LLM extraction).</p>' : '';
     const claimsBySubject = new Map();
     for (const cl of res.claims ?? []) {
       if (!claimsBySubject.has(cl.subject)) claimsBySubject.set(cl.subject, []);
@@ -997,32 +1437,68 @@ const cliMeta = {
   'cursor-cli': { command: 'cursor-agent -p', path: 'cursor-agent', note: 'Uses your existing Cursor Agent login in headless print mode.' },
 };
 
+/**
+ * Named LLM connections. Endpoint and credentials are configured once here and
+ * routes reference one by id, so `connectionDrafts` is the edit buffer the
+ * route selects and the save payload both read from.
+ */
+let connectionDrafts = [];
+
+function connectionById(id) {
+  return connectionDrafts.find((c) => c.id === id);
+}
+
 function routeSummary(prefix) {
-  const provider = $(`#cfg-${prefix}-provider`).value;
+  const use = $(`#cfg-${prefix}-use`).value;
   const model = $(`#cfg-${prefix}-model`).value.trim();
-  if (provider === 'inherit') return model ? `Default · ${model}` : 'Default model';
-  return model ? `${providerNames[provider]} · ${model}` : providerNames[provider];
+  const connection = connectionById(use);
+  const name = connection ? connection.label || connection.id : 'Default model';
+  const effective = model || connection?.model?.trim() || '';
+  return effective ? `${name} · ${effective}` : name;
+}
+
+/** Rebuild the per-route pickers from the current connection list. */
+function fillRouteOptions() {
+  for (const prefix of ['entity', 'concept', 'document']) {
+    const select = $(`#cfg-${prefix}-use`);
+    const previous = select.value;
+    select.innerHTML = ['<option value="">Default reasoning model</option>']
+      .concat(connectionDrafts.map((c) => `<option value="${esc(c.id)}">${esc(c.label || c.id)}</option>`))
+      .join('');
+    select.value = connectionDrafts.some((c) => c.id === previous) ? previous : '';
+  }
 }
 
 function updateConfigSummaries() {
   const embLocal = $('#cfg-emb-provider').value === 'local';
   const embModel = $('#cfg-emb-model').value.trim();
   const dims = $('#cfg-emb-dim').value;
-  $('#summary-embedding').textContent = embLocal ? `Local hashing · ${dims || 384}d` : (embModel || 'API model not set');
+  const embedding = embLocal ? `Local hashing · ${dims || 384}d` : (embModel || 'API model not set');
+  const llmProvider = $('#cfg-llm-provider').value;
+  const llmModel = $('#cfg-llm-model').value.trim();
+  const defaultLlm = llmModel ? `${providerNames[llmProvider]} · ${llmModel}` : providerNames[llmProvider];
+
+  $('#summary-embedding').textContent = embedding;
   $('#summary-entity').textContent = routeSummary('entity');
   $('#summary-concept').textContent = routeSummary('concept');
   $('#summary-document').textContent = routeSummary('document');
-  const llmProvider = $('#cfg-llm-provider').value;
-  const llmModel = $('#cfg-llm-model').value.trim();
-  $('#summary-default-llm').textContent = llmModel ? `${providerNames[llmProvider]} · ${llmModel}` : providerNames[llmProvider];
+  $('#summary-default-llm').textContent = defaultLlm;
+  // the two stages that are not chosen per stage follow section 01
+  $('#pin-index').textContent = embedding;
+  $('#pin-answer').textContent = defaultLlm;
 }
 
+const EMB_NOTES = {
+  local: 'The local hashing embedder is private, offline and ready immediately. Dimensions can be tuned before the first index.',
+  openai: 'Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep the key out of the config file.',
+  'ark-multimodal': 'Ark posts to /embeddings/multimodal and returns one vector per request, so Base URL ends at /api/v3 and Model is the endpoint id (ep-…). Dimensions must match the model (doubao-embedding-vision: 2048, or 1024 with the dimensions parameter sent).',
+};
+
 function embProviderToggle() {
-  const local = $('#cfg-emb-provider').value === 'local';
+  const provider = $('#cfg-emb-provider').value;
+  const local = provider === 'local';
   ['#cfg-emb-baseurl', '#cfg-emb-key', '#cfg-emb-model', '#cfg-emb-senddim'].forEach((s) => { $(s).disabled = local; });
-  $('#cfg-emb-note').textContent = local
-    ? 'The local hashing embedder is private, offline and ready immediately. Dimensions can be tuned before the first index.'
-    : 'Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep the key out of the config file.';
+  $('#cfg-emb-note').textContent = EMB_NOTES[provider] ?? EMB_NOTES.openai;
   updateConfigSummaries();
 }
 
@@ -1045,36 +1521,75 @@ function llmProviderToggle() {
 }
 
 function routeProviderToggle(prefix) {
-  const card = document.querySelector(`.route-card[data-route="${prefix}"]`);
-  const provider = $(`#cfg-${prefix}-provider`).value;
-  const apiFields = card.querySelector('.route-api-fields');
-  const cliFields = card.querySelector('.route-cli-fields');
   const note = $(`#cfg-${prefix}-note`);
-  apiFields.hidden = provider !== 'openai';
-  cliFields.hidden = !cliMeta[provider];
-  const model = $(`#cfg-${prefix}-model`);
-  if (provider === 'inherit') {
-    model.placeholder = 'Optional model override';
-    note.innerHTML = '<b>Inherited route.</b> Uses the default Provider, endpoint and credentials above.';
-  } else if (provider === 'openai') {
-    model.placeholder = 'Model name required';
-    note.innerHTML = '<b>API route.</b> Endpoint and key may be left empty to reuse the default API connection.';
+  const connection = connectionById($(`#cfg-${prefix}-use`).value);
+  if (!connection) {
+    const provider = $('#cfg-llm-provider').value;
+    note.innerHTML = `<b>Inherited route.</b> Runs on the default provider (${esc(providerNames[provider] ?? provider)}).`;
+  } else if (connection.provider === 'openai') {
+    note.innerHTML = `<b>${esc(connection.label || connection.id)}</b> · ${esc(connection.baseUrl.trim() || 'no endpoint set')}`;
   } else {
-    const meta = cliMeta[provider];
-    model.placeholder = 'Optional · use the CLI default';
-    $(`#cfg-${prefix}-clipath`).placeholder = `Default: ${meta.path}`;
-    note.innerHTML = `<b>${esc(meta.command)}</b> · ${esc(meta.note)}`;
+    const meta = cliMeta[connection.provider];
+    note.innerHTML = `<b>${esc(connection.label || connection.id)}</b> · ${esc(meta ? meta.command : connection.provider)}`;
   }
   updateConfigSummaries();
 }
 
 function fillRoute(prefix, route = {}) {
-  $(`#cfg-${prefix}-provider`).value = route.provider || 'inherit';
+  const use = route.use === 'default' ? '' : route.use || '';
+  const select = $(`#cfg-${prefix}-use`);
+  select.value = connectionById(use) ? use : '';
   $(`#cfg-${prefix}-model`).value = route.model || '';
-  $(`#cfg-${prefix}-baseurl`).value = route.baseUrl || '';
-  $(`#cfg-${prefix}-key`).value = route.apiKey || '';
-  $(`#cfg-${prefix}-clipath`).value = route.cliPath || '';
   routeProviderToggle(prefix);
+}
+
+const PROVIDER_OPTIONS = ['openai', 'codex-cli', 'claude-cli', 'cursor-cli'];
+
+function renderConnections() {
+  const host = $('#cfg-connections');
+  if (!connectionDrafts.length) {
+    host.innerHTML = '<p class="cfg-callout">No extra connections yet — every route runs on the default provider above.</p>';
+    return;
+  }
+  host.innerHTML = connectionDrafts
+    .map((c, index) => {
+      const api = c.provider === 'openai';
+      const options = PROVIDER_OPTIONS.map(
+        (p) => `<option value="${p}"${p === c.provider ? ' selected' : ''}>${esc(providerNames[p] ?? p)}</option>`,
+      ).join('');
+      return `<fieldset class="cfg-card cfg-connection" data-index="${index}">
+        <div class="cfg-connection-head">
+          <input class="cfg-conn-label" data-field="label" value="${esc(c.label || '')}" placeholder="Name this connection" />
+          <span class="mono">${esc(c.id)}</span>
+          <button type="button" class="ghost cfg-conn-remove" title="Remove this connection">Remove</button>
+        </div>
+        <div class="cfg-grid cfg-grid-2">
+          <label>Provider<select class="cfg-conn-provider" data-field="provider">${options}</select></label>
+          <label>Model<input data-field="model" value="${esc(c.model || '')}" placeholder="${api ? 'gpt-4.1-mini' : 'Use CLI default'}" /></label>
+          ${api ? `<label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(c.baseUrl || '')}" placeholder="https://api.openai.com/v1" /></label>
+          <label>API key<input data-field="apiKey" value="${esc(c.apiKey || '')}" placeholder="env:OPENAI_API_KEY" /></label>`
+        : `<label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(c.cliPath || '')}" placeholder="Default: ${esc(cliMeta[c.provider]?.path ?? '')}" /></label>`}
+        </div>
+      </fieldset>`;
+    })
+    .join('');
+}
+
+function addConnection() {
+  let suffix = connectionDrafts.length + 1;
+  while (connectionDrafts.some((c) => c.id === `connection-${suffix}`)) suffix += 1;
+  connectionDrafts.push({
+    id: `connection-${suffix}`,
+    label: `Connection ${suffix}`,
+    provider: 'openai',
+    baseUrl: 'https://api.openai.com/v1',
+    apiKey: '',
+    model: '',
+    cliPath: '',
+  });
+  renderConnections();
+  fillRouteOptions();
+  updateConfigSummaries();
 }
 
 async function loadConfigForm({ preserveStatus = false } = {}) {
@@ -1097,6 +1612,9 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-llm-key').value = cfg.llm.apiKey || '';
     $('#cfg-llm-model').value = cfg.llm.model || '';
     $('#cfg-llm-clipath').value = cfg.llm.cliPath || '';
+    connectionDrafts = (cfg.connections ?? []).map((c) => ({ ...c }));
+    renderConnections();
+    fillRouteOptions();
     fillRoute('entity', cfg.extraction?.entityLlm);
     fillRoute('concept', cfg.extraction?.conceptLlm);
     fillRoute('document', cfg.extraction?.documentLlm);
@@ -1115,13 +1633,14 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
 }
 
 function gatherRoute(prefix) {
-  const provider = $(`#cfg-${prefix}-provider`).value;
   return {
-    provider,
+    use: $(`#cfg-${prefix}-use`).value,
     model: $(`#cfg-${prefix}-model`).value.trim(),
-    baseUrl: provider === 'openai' ? $(`#cfg-${prefix}-baseurl`).value.trim() : '',
-    apiKey: provider === 'openai' ? $(`#cfg-${prefix}-key`).value.trim() : '',
-    cliPath: cliMeta[provider] ? $(`#cfg-${prefix}-clipath`).value.trim() : '',
+    // the endpoint now lives on the connection; clear any pre-connections leftovers
+    provider: 'inherit',
+    baseUrl: '',
+    apiKey: '',
+    cliPath: '',
     cliTimeoutMs: loadedConfig?.extraction?.[`${prefix}Llm`]?.cliTimeoutMs || 300000,
   };
 }
@@ -1144,6 +1663,7 @@ function gatherConfig() {
       model: $('#cfg-llm-model').value.trim(),
       cliPath: $('#cfg-llm-clipath').value.trim(),
     },
+    connections: connectionDrafts.map((c) => ({ ...c, label: c.label.trim() || c.id })),
     extraction: {
       entityLlm: gatherRoute('entity'),
       conceptLlm: gatherRoute('concept'),
@@ -1157,20 +1677,22 @@ function gatherConfig() {
 }
 
 function renderCfgResult(r) {
+  // same order and names as the pipeline section
   const items = [
-    ['Embedding', r.embedding],
-    ['Default model', r.llm],
-    ['Entity route', r.entityLlm],
-    ['Concept route', r.conceptLlm],
-    ['Document vision', r.documentLlm],
+    ['1 · Convert', r.documentLlm],
+    ['2 · Index', r.embedding],
+    ['3 · Extract', r.entityLlm],
+    ['4 · Synthesize', r.conceptLlm],
+    ['5 · Answer', r.llm],
   ];
   $('#cfg-status').innerHTML = items.map(([label, result]) => {
     if (!result) return '';
     if (result.ok === false) return `<div class="cfg-line bad"><b>${label}</b> · ${esc(result.error)}</div>`;
-    if (!result.enabled && label !== 'Embedding') return `<div class="cfg-line warn"><b>${label}</b> · ${esc(result.note)}</div>`;
-    if (label === 'Embedding') return `<div class="cfg-line good"><b>${label}</b> · ${esc(result.model)} · ${result.dimensions}d · ${result.ms}ms</div>`;
+    if (!result.enabled && !label.startsWith('2 ·')) return `<div class="cfg-line warn"><b>${label}</b> · ${esc(result.note)}</div>`;
+    if (label.startsWith('2 ·')) return `<div class="cfg-line good"><b>${label}</b> · ${esc(result.model)} · ${result.dimensions}d · ${result.ms}ms</div>`;
     const inherited = result.inherited ? 'inherited · ' : '';
-    return `<div class="cfg-line good"><b>${label}</b> · ${inherited}${esc(result.model)} · ${result.ms ?? 0}ms</div>`;
+    const sample = result.sample ? ` · replied “${esc(String(result.sample).trim())}”` : '';
+    return `<div class="cfg-line good"><b>${label}</b> · ${inherited}${esc(result.model)} · ${result.ms ?? 0}ms${sample}</div>`;
   }).join('');
 }
 
@@ -1180,9 +1702,46 @@ $('#cfg-emb-model').addEventListener('input', updateConfigSummaries);
 $('#cfg-emb-dim').addEventListener('input', updateConfigSummaries);
 $('#cfg-llm-model').addEventListener('input', updateConfigSummaries);
 for (const prefix of ['entity', 'concept', 'document']) {
-  $(`#cfg-${prefix}-provider`).addEventListener('change', () => routeProviderToggle(prefix));
+  $(`#cfg-${prefix}-use`).addEventListener('change', () => routeProviderToggle(prefix));
   $(`#cfg-${prefix}-model`).addEventListener('input', updateConfigSummaries);
 }
+
+$('#cfg-add-connection').addEventListener('click', addConnection);
+
+// Typing edits the draft in place; only a provider change or a removal redraws,
+// so an input never loses focus mid-edit.
+$('#cfg-connections').addEventListener('input', (event) => {
+  const field = event.target.dataset?.field;
+  const card = event.target.closest('.cfg-connection');
+  if (!field || !card) return;
+  connectionDrafts[Number(card.dataset.index)][field] = event.target.value;
+  if (field === 'label') fillRouteOptions();
+  updateConfigSummaries();
+});
+
+$('#cfg-connections').addEventListener('change', (event) => {
+  const card = event.target.closest('.cfg-connection');
+  if (!card || event.target.dataset?.field !== 'provider') return;
+  const draft = connectionDrafts[Number(card.dataset.index)];
+  draft.provider = event.target.value;
+  if (draft.provider !== 'openai') { draft.baseUrl = ''; draft.apiKey = ''; }
+  renderConnections();
+  fillRouteOptions();
+  updateConfigSummaries();
+});
+
+$('#cfg-connections').addEventListener('click', (event) => {
+  const card = event.target.closest('.cfg-connection');
+  if (!card || !event.target.classList.contains('cfg-conn-remove')) return;
+  const [removed] = connectionDrafts.splice(Number(card.dataset.index), 1);
+  renderConnections();
+  fillRouteOptions();
+  // a route pointing at the removed connection falls back to the default
+  for (const prefix of ['entity', 'concept', 'document']) {
+    if ($(`#cfg-${prefix}-use`).value === removed.id) $(`#cfg-${prefix}-use`).value = '';
+    routeProviderToggle(prefix);
+  }
+});
 
 function setConfigBusy(busy) {
   $('#btn-cfg-test').disabled = busy;
@@ -1191,7 +1750,7 @@ function setConfigBusy(busy) {
 
 $('#btn-cfg-test').addEventListener('click', async () => {
   setConfigBusy(true);
-  $('#cfg-status').innerHTML = '<div class="cfg-line">Testing the configured routes…</div>';
+  $('#cfg-status').innerHTML = '<div class="cfg-line">Testing each configured stage…</div>';
   try {
     renderCfgResult(await api('/api/config/test', { method: 'POST', body: JSON.stringify(gatherConfig()) }));
   } catch (e) {

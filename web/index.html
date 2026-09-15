@@ -130,10 +130,17 @@
     <section id="tab-files" class="tab active">
       <aside id="filetree-pane">
         <div class="pane-actions">
-          <button id="btn-refresh-tree" title="refresh">⟳</button>
-          <button id="btn-new-file" title="new file">＋</button>
-          <label class="upload-btn" title="upload to raw/docs">⇪<input type="file" id="file-upload" multiple hidden /></label>
-          <button id="btn-ingest" title="reindex (chunk + embed + graph)">⛁ ingest</button>
+          <button id="btn-refresh-tree" title="Refresh — reread the workspace tree from disk">⟳</button>
+          <button id="btn-add" title="Add — a new file or folder, or documents uploaded from disk, into the folder shown below">＋ add</button>
+          <button id="btn-ingest" title="Index — turn new and changed files into knowledge: chunk, embed, extract entities and refresh the wiki. The CLI calls this ingest / sync.">⛁ index</button>
+          <input type="file" id="file-upload" multiple hidden />
+          <input type="file" id="folder-upload" webkitdirectory hidden />
+        </div>
+        <div class="tree-destination" title="Click a folder in the tree to send new files, new folders and uploads there">
+          <span>new items →</span>
+          <b id="tree-destination-path" class="mono">wiki/</b>
+          <span id="tree-destination-lock" class="tag" hidden>read-only</span>
+          <button id="btn-clear-dir" title="Clear the picked folder — new items follow the open file again" hidden>✕</button>
         </div>
         <div id="filetree"></div>
       </aside>
@@ -144,6 +151,10 @@
           <button id="btn-edit" disabled>edit</button>
           <button id="btn-save" disabled>save</button>
           <button id="btn-delete" disabled>delete</button>
+        </div>
+        <div id="file-notice" class="file-notice" hidden>
+          <span id="file-notice-text"></span>
+          <button id="btn-load-full" hidden>load full file</button>
         </div>
         <article id="file-view" class="markdown"></article>
         <textarea id="file-editor" class="mono" spellcheck="false" hidden></textarea>
@@ -214,22 +225,25 @@
     <section id="tab-settings" class="tab">
       <div class="settings-wrap">
         <div class="settings-hero">
-          <div><p class="eyebrow">MODEL ROUTING</p><h2 class="settings-title">Give each knowledge job the right model.</h2><p>Configure retrieval, document vision, entity extraction and concept synthesis independently for <strong id="cfg-workspace-name">this workspace</strong>. Use an API model or reuse an authenticated local CLI Agent.</p></div>
-          <div class="cfg-actions"><button id="btn-cfg-test">Test routes</button><button id="btn-cfg-save" class="primary">Save &amp; apply</button></div>
+          <div><p class="eyebrow">MODEL ROUTING</p><h2 class="settings-title">Give each knowledge job the right model.</h2><p>Configure each provider once for <strong id="cfg-workspace-name">this workspace</strong>, then point every pipeline stage at one of them.</p></div>
+          <div class="cfg-actions"><button id="btn-cfg-test">Test stages</button><button id="btn-cfg-save" class="primary">Save &amp; apply</button></div>
         </div>
 
-        <div class="route-summary" aria-label="Active model routes">
-          <div><span>RETRIEVAL</span><b id="summary-embedding">Loading…</b><small>Embedding</small></div>
-          <div><span>STRUCTURE</span><b id="summary-entity">Loading…</b><small>Entity extraction</small></div>
-          <div><span>SYNTHESIS</span><b id="summary-concept">Loading…</b><small>Concept model</small></div>
-          <div><span>VISION</span><b id="summary-document">Loading…</b><small>PDF &amp; image conversion</small></div>
+        <div class="route-summary" aria-label="Pipeline stages">
+          <div><span>CONVERT</span><b id="summary-document">Loading…</b><small>Images &amp; scanned PDFs</small></div>
+          <div><span>INDEX</span><b id="summary-embedding">Loading…</b><small>Embedding</small></div>
+          <div><span>EXTRACT</span><b id="summary-entity">Loading…</b><small>Entities &amp; relations</small></div>
+          <div><span>SYNTHESIZE</span><b id="summary-concept">Loading…</b><small>Concept pages</small></div>
+          <div><span>ANSWER</span><b id="summary-default-llm">Loading…</b><small>Ask, Wiki &amp; Dream</small></div>
         </div>
 
-        <section class="settings-section" aria-labelledby="retrieval-model-title">
-          <div class="settings-section-head"><div><p class="section-index">01 · RETRIEVAL</p><h3 id="retrieval-model-title">Embedding model</h3><p>Turns every chunk into vectors for semantic and hybrid recall.</p></div><span class="section-badge">Required</span></div>
+        <section class="settings-section" aria-labelledby="providers-title">
+          <div class="settings-section-head"><div><p class="section-index">01 · PROVIDERS</p><h3 id="providers-title">Endpoints and credentials</h3><p>Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice.</p></div><span class="section-badge">Configure once</span></div>
+
+          <div class="cfg-card-title"><div><b>Embedding provider</b><small>One per workspace — the Index stage always uses it.</small></div><span class="section-badge">Required</span></div>
           <fieldset class="cfg-card cfg-card-wide">
             <div class="cfg-grid cfg-grid-2">
-              <label>Provider<select id="cfg-emb-provider"><option value="local">Local hashing · offline</option><option value="openai">OpenAI-compatible API</option></select></label>
+              <label>Provider<select id="cfg-emb-provider"><option value="local">Local hashing · offline</option><option value="openai">OpenAI-compatible API</option><option value="ark-multimodal">Volcengine Ark · multimodal</option></select></label>
               <label>Model<input id="cfg-emb-model" placeholder="text-embedding-3-small" /></label>
               <label class="cfg-span-2">Base URL<input id="cfg-emb-baseurl" placeholder="https://api.openai.com/v1" /></label>
               <label>API key<input id="cfg-emb-key" placeholder="env:OPENAI_API_KEY" /></label>
@@ -238,45 +252,98 @@
             <label class="cfg-check"><input id="cfg-emb-senddim" type="checkbox" /> Send the <span class="mono">dimensions</span> parameter with API requests</label>
             <p class="cfg-callout" id="cfg-emb-note">The local provider is private and ready immediately. Switching model or dimensions re-embeds the corpus after saving.</p>
           </fieldset>
+
+          <div class="cfg-card-title"><div><b>Default LLM provider</b><small>What a stage runs on unless it picks another connection, and what answers Ask, Wiki and Dream.</small></div><span class="section-badge accent2">Default</span></div>
+          <fieldset class="cfg-card cfg-card-wide">
+            <div class="cfg-grid cfg-grid-2">
+              <label>Provider<select id="cfg-llm-provider"><option value="openai">OpenAI-compatible API</option><option value="codex-cli">Codex CLI</option><option value="claude-cli">Claude Code CLI</option><option value="cursor-cli">Cursor Agent CLI</option></select></label>
+              <label>Model<input id="cfg-llm-model" placeholder="gpt-4.1-mini or provider default" /></label>
+              <label class="cfg-span-2 cfg-llm-api">Base URL<input id="cfg-llm-baseurl" placeholder="https://api.openai.com/v1" /></label>
+              <label class="cfg-llm-api">API key<input id="cfg-llm-key" placeholder="env:OPENAI_API_KEY" /></label>
+              <label class="cfg-llm-cli">CLI executable<input id="cfg-llm-clipath" placeholder="Use command from PATH" /></label>
+            </div>
+            <p class="cfg-callout" id="cfg-llm-note"></p>
+          </fieldset>
+
+          <div class="cfg-connections-head">
+            <div><b>Other connections</b><small>Add one when a stage needs a different endpoint — a vision-capable API, a cheaper model, a second key.</small></div>
+            <button type="button" id="cfg-add-connection" class="ghost">Add connection</button>
+          </div>
+          <div id="cfg-connections" class="cfg-connections"></div>
         </section>
 
-        <section class="settings-section" aria-labelledby="knowledge-models-title">
-          <div class="settings-section-head"><div><p class="section-index">02 · KNOWLEDGE PIPELINE</p><h3 id="knowledge-models-title">Conversion, extraction &amp; synthesis</h3><p>Route document vision, fast structure work and deeper concept writing to different models.</p></div><span class="section-badge accent2">Independent</span></div>
-          <div class="route-grid">
-            <div class="route-card" data-route="entity">
-              <div class="route-card-head"><span class="route-number">A</span><div><h4>Entity extraction</h4><p>Names entities, relations and factual claims from changed documents.</p></div></div>
-              <label>Run with<select id="cfg-entity-provider" class="cfg-route-provider"><option value="inherit">Default reasoning model</option><option value="openai">OpenAI-compatible API</option><option value="codex-cli">Codex CLI</option><option value="claude-cli">Claude Code CLI</option><option value="cursor-cli">Cursor Agent CLI</option></select></label>
-              <label>Model<input id="cfg-entity-model" placeholder="Use provider default" /></label>
-              <div class="route-api-fields">
-                <label>Base URL<input id="cfg-entity-baseurl" placeholder="Inherit default endpoint" /></label>
-                <label>API key<input id="cfg-entity-key" placeholder="Inherit default key" /></label>
+        <section class="settings-section" aria-labelledby="pipeline-title">
+          <div class="settings-section-head"><div><p class="section-index">02 · PIPELINE</p><h3 id="pipeline-title">What each stage needs</h3><p>A document moves down this list. The stages ask different things of a model, which is why each one can run somewhere else.</p></div><span class="section-badge accent2">Per stage</span></div>
+
+          <div class="stage-list">
+            <div class="stage-row" data-route="document">
+              <span class="stage-step">1</span>
+              <div class="stage-body">
+                <div class="stage-title"><h4>Convert</h4><span class="section-badge accent2">Vision</span></div>
+                <p>Images and scanned PDF pages become searchable Markdown.</p>
+                <p class="stage-req">The model has to see pixels: an API provider gets the image inline, codex takes <span class="mono">--image</span>, and claude and cursor read the file with their own tools. A text-only model fails here. Changing this re-converts every image and scanned page.</p>
               </div>
-              <div class="route-cli-fields"><label>CLI executable<input id="cfg-entity-clipath" placeholder="Use command from PATH" /></label></div>
-              <p class="route-note" id="cfg-entity-note"></p>
+              <div class="stage-control">
+                <label>Run with<select id="cfg-document-use" class="cfg-route-use"></select></label>
+                <label>Model<input id="cfg-document-model" placeholder="Optional · use its model" /></label>
+                <p class="route-note" id="cfg-document-note"></p>
+              </div>
             </div>
 
-            <div class="route-card" data-route="concept">
-              <div class="route-card-head"><span class="route-number">B</span><div><h4>Concept synthesis</h4><p>Turns hot entity clusters into readable, linked Concept pages.</p></div></div>
-              <label>Run with<select id="cfg-concept-provider" class="cfg-route-provider"><option value="inherit">Default reasoning model</option><option value="openai">OpenAI-compatible API</option><option value="codex-cli">Codex CLI</option><option value="claude-cli">Claude Code CLI</option><option value="cursor-cli">Cursor Agent CLI</option></select></label>
-              <label>Model<input id="cfg-concept-model" placeholder="Use provider default" /></label>
-              <div class="route-api-fields">
-                <label>Base URL<input id="cfg-concept-baseurl" placeholder="Inherit default endpoint" /></label>
-                <label>API key<input id="cfg-concept-key" placeholder="Inherit default key" /></label>
+            <div class="stage-row">
+              <span class="stage-step accent">2</span>
+              <div class="stage-body">
+                <div class="stage-title"><h4>Index</h4><span class="section-badge">Embedding</span></div>
+                <p>Every chunk becomes a vector for semantic and hybrid recall.</p>
+                <p class="stage-req">Not an LLM — it uses the embedding provider from section 01, one per workspace. Changing its model or dimensions re-embeds the whole corpus.</p>
               </div>
-              <div class="route-cli-fields"><label>CLI executable<input id="cfg-concept-clipath" placeholder="Use command from PATH" /></label></div>
-              <p class="route-note" id="cfg-concept-note"></p>
+              <div class="stage-control stage-pin">
+                <span class="stage-pin-label">Runs on</span>
+                <b id="pin-index">Loading…</b>
+                <small>Set in section 01 · Embedding provider</small>
+              </div>
             </div>
 
-            <div class="route-card" data-route="document">
-              <div class="route-card-head"><span class="route-number">C</span><div><h4>Document vision</h4><p>Converts images and scanned PDF pages into searchable Markdown.</p></div></div>
-              <label>Run with<select id="cfg-document-provider" class="cfg-route-provider"><option value="inherit">Default reasoning model</option><option value="openai">OpenAI-compatible API</option><option value="codex-cli">Codex CLI</option><option value="claude-cli">Claude Code CLI</option></select></label>
-              <label>Vision model<input id="cfg-document-model" placeholder="Use provider default" /></label>
-              <div class="route-api-fields">
-                <label>Base URL<input id="cfg-document-baseurl" placeholder="Inherit default endpoint" /></label>
-                <label>API key<input id="cfg-document-key" placeholder="Inherit default key" /></label>
+            <div class="stage-row" data-route="entity">
+              <span class="stage-step">3</span>
+              <div class="stage-body">
+                <div class="stage-title"><h4>Extract</h4><span class="section-badge accent2">Volume</span></div>
+                <p>Names entities, relations and factual claims in changed documents.</p>
+                <p class="stage-req">The busiest stage — it runs on every changed document, bounded by the daily budget and batch size below. A fast, cheap model that returns clean JSON is usually the right trade.</p>
               </div>
-              <div class="route-cli-fields"><label>CLI executable<input id="cfg-document-clipath" placeholder="Use command from PATH" /></label></div>
-              <p class="route-note" id="cfg-document-note"></p>
+              <div class="stage-control">
+                <label>Run with<select id="cfg-entity-use" class="cfg-route-use"></select></label>
+                <label>Model<input id="cfg-entity-model" placeholder="Optional · use its model" /></label>
+                <p class="route-note" id="cfg-entity-note"></p>
+              </div>
+            </div>
+
+            <div class="stage-row" data-route="concept">
+              <span class="stage-step">4</span>
+              <div class="stage-body">
+                <div class="stage-title"><h4>Synthesize</h4><span class="section-badge accent2">Quality</span></div>
+                <p>Turns hot entity clusters into readable, linked Concept pages.</p>
+                <p class="stage-req">Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.</p>
+              </div>
+              <div class="stage-control">
+                <label>Run with<select id="cfg-concept-use" class="cfg-route-use"></select></label>
+                <label>Model<input id="cfg-concept-model" placeholder="Optional · use its model" /></label>
+                <p class="route-note" id="cfg-concept-note"></p>
+              </div>
+            </div>
+
+            <div class="stage-row">
+              <span class="stage-step">5</span>
+              <div class="stage-body">
+                <div class="stage-title"><h4>Answer</h4><span class="section-badge accent2">Interactive</span></div>
+                <p>Ask, wiki summaries and the nightly Dream analysis.</p>
+                <p class="stage-req">Always the default provider. Latency lands straight in the Ask box, so prefer something responsive.</p>
+              </div>
+              <div class="stage-control stage-pin">
+                <span class="stage-pin-label">Runs on</span>
+                <b id="pin-answer">Loading…</b>
+                <small>Set in section 01 · Default LLM provider</small>
+              </div>
             </div>
           </div>
 
@@ -288,20 +355,6 @@
             <label class="cfg-check"><input id="cfg-extraction-claims" type="checkbox" /> Extract factual claims alongside entities</label>
           </div>
         </section>
-
-        <details class="cfg-defaults">
-          <summary><span><b>Default reasoning model</b><small>Fallback for inherited routes, Ask, Wiki summaries and Dream analysis</small></span><span id="summary-default-llm">Not configured</span></summary>
-          <div class="cfg-defaults-body">
-            <div class="cfg-grid cfg-grid-2">
-              <label>Provider<select id="cfg-llm-provider"><option value="openai">OpenAI-compatible API</option><option value="codex-cli">Codex CLI</option><option value="claude-cli">Claude Code CLI</option><option value="cursor-cli">Cursor Agent CLI</option></select></label>
-              <label>Model<input id="cfg-llm-model" placeholder="gpt-4.1-mini or provider default" /></label>
-              <label class="cfg-span-2 cfg-llm-api">Base URL<input id="cfg-llm-baseurl" placeholder="https://api.openai.com/v1" /></label>
-              <label class="cfg-llm-api">API key<input id="cfg-llm-key" placeholder="env:OPENAI_API_KEY" /></label>
-              <label class="cfg-llm-cli">CLI executable<input id="cfg-llm-clipath" placeholder="Use command from PATH" /></label>
-            </div>
-            <p class="cfg-callout" id="cfg-llm-note"></p>
-          </div>
-        </details>
 
         <div id="cfg-status" aria-live="polite"></div>
 

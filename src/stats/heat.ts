@@ -1,5 +1,5 @@
 import { HeatConfig, defaultConfig } from '../config.js';
-import { readSidecar, Sidecar, writeSidecar } from '../fs/sidecar.js';
+import { hasSidecar, SidecarUsage, updateSidecarPart } from '../fs/sidecar.js';
 import { Store } from '../store/db.js';
 
 /**
@@ -83,8 +83,8 @@ export async function getDocHeat(store: Store, docIds: string[], heatCfg?: HeatC
 }
 
 /** Seed DB stats from a sidecar's usage snapshot (DB rebuild path). */
-export async function restoreUsageFromSidecar(store: Store, docId: string, sidecar: Sidecar): Promise<void> {
-  const u = sidecar.usage;
+export async function restoreUsageFromSidecar(store: Store, docId: string, usage: SidecarUsage | null | undefined): Promise<void> {
+  const u = usage;
   if (!u || (u.accessCount === 0 && u.heat === 0)) return;
   const [existing] = await store.query<{ document_id: string }>(
     `SELECT document_id FROM doc_stats WHERE document_id = $1`,
@@ -108,7 +108,7 @@ export async function restoreUsageFromSidecar(store: Store, docId: string, sidec
   }
 }
 
-/** Flush DB usage stats back into the sidecars of cooked documents. */
+/** Flush DB usage stats back into the sidecars of raw/docs sources. */
 export async function flushUsageToSidecars(store: Store, heatCfg?: HeatConfig): Promise<number> {
   const cfg = heatCfg ?? defaultConfig().heat;
   const rows = await store.query<{
@@ -117,13 +117,12 @@ export async function flushUsageToSidecars(store: Store, heatCfg?: HeatConfig): 
   }>(
     `SELECT s.document_id, d.path, s.hit_count, s.last_hit_at, s.heat, s.heat_updated
      FROM doc_stats s JOIN documents d ON d.id = s.document_id
-     WHERE d.path LIKE 'cooked/%'`,
+     WHERE d.root = 'docs'`,
   );
   let flushed = 0;
   const now = new Date().toISOString();
   for (const r of rows) {
-    const sidecar = readSidecar(store.dataDir, r.path);
-    if (!sidecar) continue;
+    if (!hasSidecar(store.dataDir, r.path)) continue;
     const chunkRows = await store.query<{ chunk_id: string; hit_count: number; last_hit_at: string }>(
       `SELECT cs.chunk_id, cs.hit_count, cs.last_hit_at
        FROM chunk_stats cs JOIN chunks c ON c.id = cs.chunk_id
@@ -131,16 +130,16 @@ export async function flushUsageToSidecars(store: Store, heatCfg?: HeatConfig): 
       [r.document_id],
     );
     const dt = r.heat_updated ? Date.now() - new Date(r.heat_updated).getTime() : 0;
-    sidecar.usage = {
-      firstSeenAt: sidecar.usage?.firstSeenAt ?? now,
+    // only usage.json is rewritten — extraction results and cached views are untouched
+    const updated = updateSidecarPart(store.dataDir, r.path, 'usage', (cur) => ({
+      firstSeenAt: cur?.firstSeenAt ?? now,
       lastAccessedAt: r.last_hit_at,
       accessCount: r.hit_count,
       heat: Number((r.heat * decayFactor(cfg.halfLifeDays, dt)).toFixed(4)),
       chunkHits: Object.fromEntries(chunkRows.map((c) => [c.chunk_id, { count: c.hit_count, lastAt: c.last_hit_at }])),
       flushedAt: now,
-    };
-    writeSidecar(store.dataDir, r.path, sidecar);
-    flushed++;
+    }));
+    if (updated) flushed++;
   }
   return flushed;
 }

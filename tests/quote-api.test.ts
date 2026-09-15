@@ -114,8 +114,8 @@ beforeAll(async () => {
   fs.writeFileSync(path.join(dataDir, 'raw/docs/report.md'), REPORT);
   fs.mkdirSync(path.join(dataDir, 'datasets/quotes'), { recursive: true });
   fs.writeFileSync(path.join(dataDir, 'datasets/quotes/daily_bars.csv'), 'symbol,trade_date,close\n300750,2026-08-27,243.68\n300750,2026-08-28,245.10\n600519,2026-08-28,1500.00\n');
-  fs.mkdirSync(path.join(dataDir, 'intents'), { recursive: true });
-  fs.writeFileSync(path.join(dataDir, 'intents/stock_analysis.yaml'), INTENT);
+  fs.mkdirSync(path.join(dataDir, 'playbooks/intents'), { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'playbooks/intents/stock_analysis.yaml'), INTENT);
   // the API is listed first on purpose: bindings must not depend on config order
   configWith([quoteApi(), histCsv()]);
   ctx = await createContext(dataDir);
@@ -195,7 +195,7 @@ describe('quote API + CSV history + research report around one entity', () => {
   });
 
   it('runs playbook probes in each source dialect and suggests the unprobed endpoint as a ready request', async () => {
-    fs.writeFileSync(path.join(dataDir, 'packs/organization.md'), `---
+    fs.writeFileSync(path.join(dataDir, 'playbooks/packs/organization.md'), `---
 type: playbook
 appliesTo: organization
 retrieval: { k: 4, mode: keyword }
@@ -225,7 +225,7 @@ probes:
     expect(pack.suggestions.filter((s) => s.kind === 'query')).toEqual([]);
 
     // drop the quote probe: the pack now hands the endpoint over as a next query in its own dialect
-    fs.writeFileSync(path.join(dataDir, 'packs/organization.md'), `---
+    fs.writeFileSync(path.join(dataDir, 'playbooks/packs/organization.md'), `---
 type: playbook
 appliesTo: organization
 probes:

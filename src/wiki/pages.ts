@@ -8,10 +8,11 @@ import { DataSourceRegistry } from '../datasource/registry.js';
 import { QueryResult } from '../datasource/types.js';
 import { safePath } from '../fs/files.js';
 import { readPageCache, writePageCache } from '../fs/page-sidecar.js';
-import { readSidecar, updateSidecar } from '../fs/sidecar.js';
+import { readSourceSummary, writeSourceSummary } from '../fs/sidecar.js';
 import { slugify } from '../graph/store.js';
 import { applyDocScope } from '../ingest/apply.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
+import { loadSourceText } from '../ingest/source.js';
 import { readDeps } from '../lineage/deps.js';
 import { archivedPath, disposeScope, findLiveScope } from '../lineage/scope.js';
 import { DepDecl } from '../lineage/types.js';
@@ -176,8 +177,7 @@ const sourceSummary: PageGenerator = {
   },
   async render(ctx, _pagePath, plan) {
     const doc = plan.data.doc as DocumentRow;
-    const sidecar = readSidecar(ctx.dataDir, doc.path);
-    const cached = sidecar?.views?.sourceSummary;
+    const cached = readSourceSummary(ctx.dataDir, doc.path);
     let body: string;
     // generated.by/at describe the body we are about to write, so a cache hit
     // reports the model and instant that produced it, not this regeneration.
@@ -190,9 +190,9 @@ const sourceSummary: PageGenerator = {
       at = cached.generatedAt;
     } else {
       if (!llm.enabled) return null;
-      const abs = safePath(ctx.dataDir, doc.path);
-      if (!fs.existsSync(abs)) return null;
-      const content = fs.readFileSync(abs, 'utf8').slice(0, LLM_WIKI_INPUT_CHARS);
+      const source = loadSourceText(ctx.dataDir, doc.path, doc.root);
+      if (!source) return null;
+      const content = source.text.slice(0, LLM_WIKI_INPUT_CHARS);
       const cost = estimateTokens(content) + 1200;
       const budgetLeft = Math.max(0, ctx.config.extraction.dailyTokenBudget - (await budgetUsedToday(ctx.store)));
       if (cost > budgetLeft) return null;
@@ -203,9 +203,7 @@ const sourceSummary: PageGenerator = {
       await addBudgetUse(ctx.store, cost);
       by = llm.label;
       at = new Date().toISOString();
-      updateSidecar(ctx.dataDir, doc.path, (s) => {
-        s.views = { ...(s.views ?? {}), sourceSummary: { contentSha: doc.sha256, model: llm.label, body, generatedAt: at } };
-      });
+      writeSourceSummary(ctx.dataDir, doc.path, { contentSha: doc.sha256, model: llm.label, body, generatedAt: at });
     }
     const heat = (await getDocHeat(ctx.store, [doc.id], ctx.config.heat)).get(doc.id) ?? 0;
     const title = doc.title ?? path.basename(doc.path);
@@ -530,7 +528,7 @@ function documentSummaryLlm(ctx: PagesContext): LlmClient {
 
 function conceptLlm(ctx: PagesContext): LlmClient {
   return ctx.config.extraction.conceptLlm
-    ? new LlmClient(resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.conceptLlm, ctx.config.extraction.tier2Model))
+    ? new LlmClient(resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.conceptLlm, ctx.config.connections, ctx.config.extraction.tier2Model))
     : ctx.llm;
 }
 
@@ -656,7 +654,7 @@ async function cachedRenderAvailable(ctx: PagesContext, gen: PageGenerator, page
   if (gen.kind === 'source_summary') {
     const doc = plan.data.doc as DocumentRow | undefined;
     if (!doc) return false;
-    return readSidecar(ctx.dataDir, doc.path)?.views?.sourceSummary?.contentSha === doc.sha256;
+    return readSourceSummary(ctx.dataDir, doc.path)?.contentSha === doc.sha256;
   }
   return false;
 }

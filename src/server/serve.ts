@@ -2,6 +2,7 @@ import { serve } from '@hono/node-server';
 import chokidar from 'chokidar';
 import path from 'node:path';
 import { AppContext } from '../context.js';
+import { SIDECAR_ROOT_SEGMENT } from '../fs/layout.js';
 import { startDreamScheduler } from '../dream/dream.js';
 import { runTier1Pass } from '../graph/tier1.js';
 import { sync } from '../ingest/sync.js';
@@ -186,8 +187,9 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void): ()
         ignoreInitial: true,
         // Obsidian rewrites workspace/cache state during normal navigation;
         // those Vault settings are not knowledge and must not trigger a sync.
-        // wiki/.archive holds disposed pages and is never a source.
-        ignored: /(^|[/\\])\.(obsidian|archive)([/\\]|$)/,
+        // wiki/.archive holds disposed pages and is never a source, and the
+        // sidecar tree is written by the pipeline itself.
+        ignored: new RegExp(`(^|[/\\\\])(\\.obsidian|\\.archive|${SIDECAR_ROOT_SEGMENT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})([/\\\\]|$)`),
       })
       .on('all', trigger);
     log('watching raw/docs, raw/skills, wiki for changes');

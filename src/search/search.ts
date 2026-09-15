@@ -1,5 +1,5 @@
 import { HeatConfig, SagSearchConfig, defaultConfig } from '../config.js';
-import { Store, toVectorLiteral } from '../store/db.js';
+import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { NO_FILTER, ResolvedScopeFilter, documentFilterSql } from '../store/resolver.js';
 import { Params, TimeInput, toIso } from '../store/temporal.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
@@ -110,12 +110,12 @@ async function vectorSearch(
   const lim = p.add(k);
   return store.query<RankedChunk>(
     `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, c.content,
-            1 - (e.embedding <=> $1::vector) AS raw
+            1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw
      FROM embeddings e
      JOIN chunks c ON c.id = e.chunk_id
      JOIN documents d ON d.id = c.document_id
      WHERE ${cond}
-     ORDER BY e.embedding <=> $1::vector
+     ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
      LIMIT ${lim}`,
     p.list,
   );

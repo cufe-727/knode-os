@@ -149,10 +149,10 @@ knode-os 还有一处自身的冲突需要处理：它一直用布尔 `generated
 外部 OKF bundle
       │  okf import（先校验，Markdown 字节不改写）
       ▼
-raw/docs/okf/<bundle>/          L0 原件
-      │  cook
+raw/docs/okf/<bundle>/          L0 原件 = 文档键
+      │  prepare / apply（索引时在内存中补齐 OKF frontmatter；派生状态落 .sidecar/raw/docs/okf/<bundle>/…）
       ▼
-cooked/docs/okf/<bundle>/       L1 检索输入 + sidecar
+索引视图                         okf validate --as-indexed 校验的就是它
       │  ingest
       ├── chunks / embeddings / FTS
       └── Concept 节点 + links_to 有向边
@@ -166,6 +166,7 @@ wiki/                            knode-os 原生 OKF v0.2 bundle
 | OKF 能力 | knode-os 支持 |
 | --- | --- |
 | 原生生产 | `init`、wiki generator、dream、tier-2 页面均产生合规 Concept，带 `generated: { by, at }`；根索引声明 `0.2` |
+| 索引视图归一化 | 每份 Markdown 在索引时于内存中补齐 `type` 与 `title`，并把 `generator` + `generated_at` 这类私有拼写翻译成 `generated: { by, at }`。只加不改、不编造溯源、跳过 reserved 与非 Markdown；文本源不传 mtime（否则 `touch` 就会改哈希），PDF/图片的转换结果落盘时才以 raw 的 mtime 记 `generated.at` 以保证幂等 |
 | 校验 | CLI、REST、MCP 共用同一校验器；错误与 soft warning 分开，信任族问题一律是 warning |
 | 版本路由 | 按 `<major>.<minor>` 分流：`legacy-minor` 走 v0.1 回退，`newer-minor` 保留并忽略未知字段，`unknown-major` 仅告警后 best-effort |
 | 宽容消费 | 未知类型/字段被保留；断链、未知版本只警告；`--allow-invalid` 可显式 best-effort 导入 |
@@ -215,7 +216,12 @@ knode-os okf export ./knode-okf-export --data ~/knode-data
   `stale_after` 是 ISO 8601 datetime，但还没有强制“必须带显式偏移”这一条
   （§11 要求消费者忽略纯日期值）。原生产出走 `toISOString()`，天然带 `Z`。
 - **`sources` 尚未原生生产**。knode-os 的溯源目前在 lineage/scope 体系里，
-  还没有投影成 OKF frontmatter；这是把内部血缘对外交换的下一步。
+  还没有投影成 OKF frontmatter；这是把内部血缘对外交换的下一步。索引视图归一化同样
+  不生产它——`sources` 无法从一份没有声明的文档里推断出来，编造出处比缺字段更糟。
+- **归一化只存在于索引视图**。`raw/` 保持上传时的字节，文本源连副本都不落盘，所以一份
+  外部文档的 `type` 只存在于 knode-os 索引的内容里（`okf validate --as-indexed` 校验的
+  就是这个视图）；PDF/图片的转换结果带着补齐的字段落在 `.sidecar/` 的 `content.md`。
+  合规性因此是摄入的产物，不是上传的前提；想让原件本身也合规，仍然要在生产端写对。
 - Attested Computation 只做保留式消费，不执行、不生产。
 - OKF 不定义固定类型体系。knode-os 保留生产者的 `type`，图查询中未知类型作为
   普通概念使用，不做中心注册表。

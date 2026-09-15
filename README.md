@@ -17,7 +17,7 @@ knode-os combines two ideas — [llm_wiki](https://github.com/nashsu/llm_wiki)'s
 - **`/dream`**: every night (or on demand) it digests recent agent sessions — what was asked, which tools failed, what repeats — and proposes improvements to your **skills**, **memory**, and **knowledge base**, queued for one-click accept/reject.
 - **Live data sources — one logical database.** Register MySQL, TimescaleDB, parquet/CSV directories (DuckDB, an HDFS stand-in), JSON-over-HTTP endpoints, Prometheus metrics and object stores; knode-os introspects them into the knowledge graph as capabilities (`datasource` / `dataset` entities, `appears_in` links and locators from sampled entity columns — endpoints and metrics get theirs derived from the tables and aliases already known) and generates `wiki/datasets/` pages — while the rows stay in their source systems and are fetched live. Mention a company and the graph knows *which documents*, *which tables* and *which API endpoints* can answer for it.
 - **Context packs.** `knode-os pack "<utterance>"` (or the `knode_context_pack` MCP tool) matches entities in the utterance, expands the graph (doc chunks, time-bound claims flagged `STALE`/`CONFLICT`, linked live tables), executes playbook-declared probe queries against the live sources (asOf-stamped, short-TTL cached, never persisted), and returns gap analysis with ready-to-run follow-up SQL.
-- **Playbooks that learn.** Context packs are driven by agent-editable `packs/*.md` workflows. Every build is logged to `pack_events`; `knode-os pack-optimize` (also part of the nightly dream) turns failure/gap patterns into full playbook revisions — accepted suggestions are written back to `packs/`, so the next query runs a better script.
+- **Playbooks that learn.** Context packs are driven by agent-editable `playbooks/packs/*.md` workflows. Every build is logged to `pack_events`; `knode-os pack-optimize` (also part of the nightly dream) turns failure/gap patterns into full playbook revisions — accepted suggestions are written back to `playbooks/packs/`, so the next query runs a better script.
 - **MCP server** so Claude Code / Codex (CLI or app) can search, ask, read, write, grep, run native SQL against live sources, and build context packs directly.
 - **Native Google OKF v0.2 compatibility**: `wiki/` is itself a portable Open Knowledge Format bundle, with validation, version routing, legacy migration, lossless bundle import/export, and graph wiring for ordinary OKF markdown links. The v0.2 provenance/trust/lifecycle families (`generated`, `verified`, `status`, `stale_after`) are understood, and v0.1 bundles are still read through the spec's documented fallbacks. Unknown types, extension frontmatter and broken links are consumed permissively as the specification requires.
 - **Native Obsidian Vault**: open `wiki/` directly in Obsidian. Vault-local settings and an attachment directory are preconfigured; Properties, aliases, tags, `[[wikilinks]]`, vault paths, heading/block references and `![[embeds]]` work natively. Every imported or exported OKF knowledge bundle is also initialized as its own Vault.
@@ -48,24 +48,27 @@ Install globally (`npm link` or `pnpm add -g .`) to use the `knode-os` binary di
 ├── knode.config.json   # embedding / llm / server / dream settings
 ├── purpose.md          # what this knowledge base is for
 ├── schema.md           # wiki structure rules
-├── raw/                # originals, never rewritten
-│   ├── docs/           # your uploads
+├── raw/                # originals, never rewritten; the raw path is the key of every source
+│   ├── docs/           # your uploads (text, PDF, images)
 │   ├── traces/         # claude/ + codex/ session transcripts (auto-synced)
 │   └── skills/         # skills & prompts your agents used (auto-synced)
-├── cooked/
-│   └── docs/           # normalized Markdown from text, PDF and image sources — indexed —
-│                       # plus <name>.knode.json sidecars (metadata, LLM extraction
-│                       # results, usage/heat stats) that survive a DB rebuild
+├── .sidecar/           # derived state, one directory per source, mirroring the tree above — keep it
+│   └── raw/docs/<file>/  # content.md (Markdown converted from a PDF/image), meta.json (hashes, chunk map),
+│                         # tier0.json / tier1.json (extraction), usage.json (heat), views/ (cached LLM summaries)
 ├── wiki/                 # native OKF v0.2 bundle + Obsidian Vault
 │   ├── .obsidian/        # vault settings (never overwrites existing settings)
 │   ├── attachments/      # Obsidian attachments
 │   ├── index.md  overview.md  log.md
 │   ├── entities/  concepts/  sources/  dreams/  datasets/
-├── packs/              # context-pack playbooks (agent-editable, revised by the learning loop)
+├── playbooks/          # agent-editable configuration
+│   ├── packs/          # context-pack playbooks (revised by the learning loop)
+│   ├── capabilities/   # semantic notes over live datasource capabilities
+│   └── intents/        # intent specs: the slots an answer needs
+├── ledger/             # events.jsonl (machine truth) + attic/ (sidecars of removed sources)
 └── .knode/             # derived PGlite index — safe to delete & reindex
 ```
 
-Search results cite `cooked/docs/...` paths — the normalized twin of what you put in `raw/docs/`.
+Search results cite `raw/docs/...` paths — exactly what you uploaded. Text files are indexed from `raw/` directly (no copies); a PDF or image is converted once into `.sidecar/raw/docs/<file>/content.md`, and opening such a hit in the UI or through `knode_read` shows that Markdown. Unlike `.knode/`, the `.sidecar/` tree is not disposable: it holds paid LLM extraction results and usage history, and a rebuild replays them for free.
 
 When `serve` is used with the web UI, `--data` is the workspace root. A user can own multiple workspaces; every workspace is a complete independent data directory with the layout above:
 
@@ -97,6 +100,13 @@ CLI-only data directories continue to use `<data>/knode.config.json`:
     "apiKey": "env:OPENAI_API_KEY",  // or a literal key
     "model": "text-embedding-3-small",
     "dimensions": 1536
+  },
+  "database": {                      // where the derived index lives
+    "kind": "pglite",                // "pglite" = embedded, zero setup; "postgres" = external server
+    "host": "127.0.0.1", "port": 5432,
+    "user": "", "password": "",      // password also takes "env:VAR"; empty for trust/peer auth
+    "database": "knode",             // one shared database, created on first open
+    "schemaPrefix": "ws"             // one schema per workspace: <prefix>_<workspace>_<hash>
   },
   "llm": {
     "provider": "openai",            // also: "codex-cli" / "claude-cli" / "cursor-cli"
@@ -133,7 +143,9 @@ CLI-only data directories continue to use `<data>/knode.config.json`:
 }
 ```
 
-Any OpenAI-compatible endpoint works (Ollama, vLLM, SiliconFlow, …). Entity extraction, concept synthesis and document vision can independently inherit the default LLM or use their own route. Image/scanned-PDF conversion supports a vision-capable OpenAI-compatible model, Codex CLI or Claude Code CLI. Text PDFs are extracted locally without an LLM. Changing `dimensions` drops and rebuilds the embedding table on next start. Everything can also be edited from the web UI's **Settings** tab (with route tests).
+Any OpenAI-compatible endpoint works (Ollama, vLLM, SiliconFlow, …). For embeddings, `"provider": "ark-multimodal"` additionally targets Volcengine Ark's `/embeddings/multimodal` route (`doubao-embedding-vision-*`), which is not OpenAI-shaped: it returns one fused vector per request, so `baseUrl` ends at `/api/v3`, `model` is the endpoint id (`ep-…`), and `batchSize` becomes the concurrency window over single-text calls. Entity extraction, concept synthesis and document vision can independently inherit the default LLM or use their own route. Image/scanned-PDF conversion supports a vision-capable OpenAI-compatible model, Codex CLI or Claude Code CLI. Text PDFs are extracted locally without an LLM. Changing `dimensions` drops and rebuilds the embedding table on next start. Everything can also be edited from the web UI's **Settings** tab (with route tests).
+
+The index is an embedded PGlite database per workspace by default — nothing to install. Point `database.kind` at `postgres` to put the same schema on an external server instead: all workspaces share one database and are isolated by schema, each created on first open. That is worth doing once a workspace outgrows PGlite's single-process 32-bit WASM build (roughly a million chunks) or when several processes must read one index at once. Schema-level isolation is deliberate — a database would carry its own ~8 MB catalog per workspace, while folding every workspace into shared tables keyed by a workspace column would cost the vector index outright: HNSW walks a distance-ordered neighbour graph, so an equality predicate on a scalar column cannot be pushed into the walk and the planner falls back to a sequential scan. Embedding vectors are stored as `halfvec`: pgvector caps an index entry at one 8 KB page, which is 2000 dims for `vector` but 4000 for `halfvec`, so half precision is what keeps the HNSW index reachable at 1536/2048 dims — and halves the table. Switching an existing database between the two column types converts in place without re-embedding.
 
 Further config blocks (see `knode-os config` for the full active set with defaults): `ingest` (chunk size/overlap, file watching), `extraction` (daily token budget, batch size, interval, tier-1/2 models, claims on/off), `retrieval.sag` (seed/frontier/candidate limits, hop count, direct-route ratio), `heat` (usage-heat half-life, search boost weight, cold threshold), `trace` (Claude/Codex trace directories, skill dirs, sync interval), `server` (host/port).
 
@@ -197,9 +209,9 @@ knode-os connect claude   # runs: claude mcp add --scope user knode-os -- node <
 knode-os connect codex    # appends [mcp_servers.knode-os] to ~/.codex/config.toml
 ```
 
-MCP tools exposed: `knode_resolve` (the one to call first — see below), `knode_plan`, `knode_feedback`, `knode_capabilities`, `knode_checkout` / `knode_commit` / `knode_worksets` (pin a consistent view for a long task, then write conclusions back as a source), `knode_absences` (what we looked for and did not find), `knode_disputes` / `knode_trust` (contradictions, and promoting a quarantined write), `knode_subscribe` (watch an entity, source or intent), `knode_learning` (what the planner has learned), `knode_search`, `knode_graph_search`, `knode_claims`, `knode_ask`, `knode_ls`, `knode_read` (a path starting with `/` reads the virtual filesystem), `knode_write` (wiki/, raw/docs and packs/ only), `knode_grep`, `knode_ingest` / `knode_sync`, `knode_lineage`, `knode_history`, `knode_forget`, `knode_okf_validate`, `knode_graph_insights`, `knode_suggestions`, `knode_context_pack`, `knode_datasources`, `knode_query` (read-only native SQL; `source="catalog"` queries the knowledge base's own `v_*` views). Three independent time axes: `as_of` (system time — what was believed then), `valid_at` / `valid_range` (world time — when a claim holds), and `freshness` (how old a live read may be); `kinds` / `sources` bound which sources may answer.
+MCP tools exposed: `knode_resolve` (the one to call first — see below), `knode_plan`, `knode_feedback`, `knode_capabilities`, `knode_checkout` / `knode_commit` / `knode_worksets` (pin a consistent view for a long task, then write conclusions back as a source), `knode_absences` (what we looked for and did not find), `knode_disputes` / `knode_trust` (contradictions, and promoting a quarantined write), `knode_subscribe` (watch an entity, source or intent), `knode_learning` (what the planner has learned), `knode_search`, `knode_graph_search`, `knode_claims`, `knode_ask`, `knode_ls`, `knode_read` (a path starting with `/` reads the virtual filesystem; a PDF or image under raw/docs returns its derived Markdown), `knode_write` (wiki/, raw/docs and playbooks/packs/ only), `knode_grep`, `knode_ingest` / `knode_sync`, `knode_lineage`, `knode_history`, `knode_forget`, `knode_okf_validate`, `knode_graph_insights`, `knode_suggestions`, `knode_context_pack`, `knode_datasources`, `knode_query` (read-only native SQL; `source="catalog"` queries the knowledge base's own `v_*` views). Three independent time axes: `as_of` (system time — what was believed then), `valid_at` / `valid_range` (world time — when a claim holds), and `freshness` (how old a live read may be); `kinds` / `sources` bound which sources may answer.
 
-**`knode_resolve` instead of search.** Search returns whatever text matches. `resolve` works out what an answer to this *kind* of question needs — the slots declared in `intents/*.yaml` — fills everything the local index can answer, and compiles what is left into a plan of tool calls the agent executes. A required slot nothing can fill comes back in `unknowns` rather than being papered over with plausible documents. Report back with `knode_feedback` and the receipt id, and the next resolve for that kind of question is better.
+**`knode_resolve` instead of search.** Search returns whatever text matches. `resolve` works out what an answer to this *kind* of question needs — the slots declared in `playbooks/intents/*.yaml` — fills everything the local index can answer, and compiles what is left into a plan of tool calls the agent executes. A required slot nothing can fill comes back in `unknowns` rather than being papered over with plausible documents. Report back with `knode_feedback` and the receipt id, and the next resolve for that kind of question is better.
 
 **The loop actually closes.** Feedback feeds a ranker that learns which capability answers which slot — scored on what the caller *kept*, not on what returned rows — and explores with Thompson sampling so a source that lost one coin flip still gets tried again. Plan shapes that keep working are distilled into recipe proposals, replayed offline against the receipts they came from and checked for read-only safety, then held for human approval; nothing is published automatically. `knode-os learning` prints all of it, and `wiki/learning/` keeps it reviewable.
 
@@ -211,7 +223,7 @@ Typical loop: your agent searches before re-deriving project knowledge, writes n
 
 `knode-os serve` → http://127.0.0.1:9100
 
-- **Files** — browse the tree, edit markdown with preview, upload text/PDF/images to `raw/docs` (auto-converts and ingests)
+- **Files** — browse the tree, edit markdown with preview, upload text/PDF/images to `raw/docs` (auto-converts and ingests; PDF and image hits open as the Markdown derived from them)
 - **Search** — hybrid/vector/keyword plus SAG query-time multi-hop retrieval with score and path breakdown
 - **Ask** — cited Q&A with gap analysis
 - **Graph** — force-directed graph explorer + insights (hubs / isolated / types)
@@ -235,7 +247,7 @@ pnpm typecheck && pnpm test            # tsc + vitest
 
 ## Security notes
 
-The server binds to `127.0.0.1` and still uses mock browser authentication — the workspace headers provide storage routing, not trusted authorization. Don't expose it. API keys can be referenced as `env:VAR` so the config file stays secret-free. File APIs are confined to the selected workspace directory (path-traversal guarded); write/move/delete operations — both HTTP and MCP — are restricted to `wiki/`, `raw/docs/` and `packs/`. Native SQL against configured datasources passes a read-only guard (single statement, SELECT/SHOW/DESCRIBE/EXPLAIN only, banned-keyword scan, row caps); still, point knode-os at read-only database credentials.
+The server binds to `127.0.0.1` and still uses mock browser authentication — the workspace headers provide storage routing, not trusted authorization. Don't expose it. API keys can be referenced as `env:VAR` so the config file stays secret-free. File APIs are confined to the selected workspace directory (path-traversal guarded); write/move/delete operations — both HTTP and MCP — are restricted to `wiki/`, `raw/docs/` and `playbooks/packs/`, and never reach the system-owned `.sidecar/` tree. Native SQL against configured datasources passes a read-only guard (single statement, SELECT/SHOW/DESCRIBE/EXPLAIN only, banned-keyword scan, row caps); still, point knode-os at read-only database credentials.
 
 ## License
 

@@ -3,7 +3,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { AppContext } from '../context.js';
 import { runSourceQuery } from '../datasource/execute.js';
-import { assertWritablePath, grepFiles, listTree, readFileText, safePath, writeFileText } from '../fs/files.js';
+import { MAX_FILE_BYTES } from '../constants.js';
+import { assertWritablePath, grepFiles, listTree, safePath, writeFileText } from '../fs/files.js';
+import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
 import { graphInsights, graphSearch } from '../graph/query.js';
 import { sync } from '../ingest/sync.js';
 import { historyOf, lineageOf } from '../lineage/inspect.js';
@@ -43,7 +45,7 @@ export async function startMcpServer(ctx: AppContext): Promise<void> {
   const kindsSchema = z.array(z.enum(['doc', 'wiki', 'view', 'skill'])).optional()
     .describe('Restrict to source kinds: doc = raw/docs, wiki = human-written wiki prose, view = generated wiki page, skill = raw/skills');
   const sourcesSchema = z.array(z.string()).optional()
-    .describe('Restrict to path prefixes, e.g. ["raw/docs/reports"] (raw/docs paths map to their cooked twins)');
+    .describe('Restrict to path prefixes, e.g. ["raw/docs/reports"]');
   const freshnessSchema = z.string().optional().describe('Max age of live/federated reads: "30s", "15m", "2h", "7d". Cached probe answers older than this are re-run.');
   const actorSchema = z.string().optional().describe('Who is asking — restricted sources answer only to actors named on their ACL');
   const trustSchema = z.enum(['trusted', 'quarantined', 'any']).optional()
@@ -131,7 +133,7 @@ export async function startMcpServer(ctx: AppContext): Promise<void> {
     'knode_ls',
     {
       title: 'List knowledge files',
-      description: 'List the data directory tree (raw/docs, raw/traces, raw/skills, wiki, ledger).',
+      description: 'List the data directory tree (raw/docs, raw/traces, raw/skills, wiki, playbooks, ledger).',
       inputSchema: { path: z.string().optional().describe('Subdirectory, e.g. "wiki" (default: root)') },
     },
     async ({ path: p }) => json(listTree(ctx.dataDir, p ?? '.')),
@@ -141,23 +143,27 @@ export async function startMcpServer(ctx: AppContext): Promise<void> {
     'knode_read',
     {
       title: 'Read a knowledge file',
-      description: 'Read a file by its path relative to the data directory, e.g. "wiki/index.md". A path starting with "/" reads the virtual filesystem instead — /entities/<id>.md, /claims/<subject>.md, /capabilities/<source>/<name>.md, /live/<capability>?<param>=<value> — rendered on read, and every one of them accepts ?as_of=<iso>. Read "/" for the roots.',
+      description: 'Read a file by its path relative to the data directory, e.g. "wiki/index.md". A PDF or image under raw/docs returns the Markdown knode-os derived from it. A path starting with "/" reads the virtual filesystem instead — /entities/<id>.md, /claims/<subject>.md, /capabilities/<source>/<name>.md, /live/<capability>?<param>=<value> — rendered on read, and every one of them accepts ?as_of=<iso>. Read "/" for the roots.',
       inputSchema: { path: z.string() },
     },
-    async ({ path: p }) => ({
-      content: [{ type: 'text' as const, text: isVirtualPath(p) ? await readVirtual(ctx, p) : readFileText(ctx.dataDir, p) }],
-    }),
+    async ({ path: p }) => {
+      if (isVirtualPath(p)) return { content: [{ type: 'text' as const, text: await readVirtual(ctx, p) }] };
+      const file = readSourceTextCapped(ctx.dataDir, p, MAX_FILE_BYTES);
+      if (!file) throw new Error(`no derived text for ${p} yet — run knode_sync first`);
+      return { content: [{ type: 'text' as const, text: file.content }] };
+    },
   );
 
   server.registerTool(
     'knode_write',
     {
       title: 'Write a knowledge file',
-      description: 'Create or overwrite a file under wiki/, raw/docs/ or packs/ (other roots are read-only). The change is applied as a new source scope on the next sync.',
+      description: 'Create or overwrite a file under wiki/, raw/docs/ or playbooks/packs/ (other roots are read-only). The change is applied as a new source scope on the next sync.',
       inputSchema: { path: z.string(), content: z.string() },
     },
     async ({ path: p, content }) => {
       assertWritablePath(p);
+      assertNotConvertedOriginal(p);
       writeFileText(ctx.dataDir, p, content);
       return json({ ok: true, path: p });
     },
@@ -226,10 +232,13 @@ export async function startMcpServer(ctx: AppContext): Promise<void> {
     'knode_okf_validate',
     {
       title: 'Validate an OKF knowledge bundle',
-      description: 'Validate Google Open Knowledge Format v0.1 conformance. Defaults to the native wiki/ bundle; path must be relative to the data directory.',
-      inputSchema: { path: z.string().optional().describe('Bundle directory, e.g. "wiki" or "cooked/docs/okf/team"') },
+      description: 'Validate Google Open Knowledge Format conformance. Defaults to the native wiki/ bundle; path must be relative to the data directory. as_indexed validates the view knode-os indexes (frontmatter normalizer applied in memory) — what an unannotated raw/docs subtree looks like to the pipeline.',
+      inputSchema: {
+        path: z.string().optional().describe('Bundle directory, e.g. "wiki" or "raw/docs/okf/team"'),
+        as_indexed: z.boolean().optional(),
+      },
     },
-    async ({ path: p }) => json(validateOkfBundle(safePath(ctx.dataDir, p ?? 'wiki'))),
+    async ({ path: p, as_indexed }) => json(validateOkfBundle(safePath(ctx.dataDir, p ?? 'wiki'), { asIndexed: Boolean(as_indexed) })),
   );
 
   server.registerTool(
@@ -510,7 +519,7 @@ export async function startMcpServer(ctx: AppContext): Promise<void> {
       description:
         'Move a source between trust tiers. Agent writes start quarantined — visible and attributable, but excluded when a caller asks for trusted-only, and unable to override a trusted claim. Promoting resolves the disputes that source opened, because the review is what the quarantine was waiting for.',
       inputSchema: {
-        path: z.string().describe('Source key, e.g. "cooked/docs/notes/w_ab12.md"'),
+        path: z.string().describe('Source key, e.g. "raw/docs/notes/w_ab12.md"'),
         to: z.enum(['trusted', 'quarantined']),
         actor: z.string().optional(),
       },
@@ -627,7 +636,7 @@ export async function startMcpServer(ctx: AppContext): Promise<void> {
     'knode_grep',
     {
       title: 'Grep the knowledge files',
-      description: 'Regex search across cooked/docs, wiki, raw/docs, raw/skills and packs (like grep -rn). Complements knode_search for exact strings, symbols and tickers.',
+      description: 'Regex search across wiki, raw/docs (including the Markdown derived from PDFs and images), raw/skills and playbooks/packs (like grep -rn). Complements knode_search for exact strings, symbols and tickers.',
       inputSchema: {
         pattern: z.string().describe('JavaScript regular expression'),
         path: z.string().optional().describe('Restrict to a subtree, e.g. "wiki/datasets"'),

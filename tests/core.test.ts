@@ -1,13 +1,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { defaultConfig, loadConfig, resolveRoutedLlmConfig, resolveSecret, saveConfig } from '../src/config.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { safePath, walkFiles } from '../src/fs/files.js';
 import { chunkText } from '../src/ingest/chunker.js';
 import { estimateTokens } from '../src/llm/tokens.js';
-import { LocalHashEmbeddingProvider } from '../src/ingest/embeddings.js';
+import { createEmbeddingProvider, LocalHashEmbeddingProvider } from '../src/ingest/embeddings.js';
 import { slugify } from '../src/graph/store.js';
 import { extractWikilinks } from '../src/graph/wire.js';
 import { completeViaCli, renderCliPrompt } from '../src/llm/cli.js';
@@ -55,6 +55,9 @@ describe('datadir', () => {
     const first = initDataDir(dir);
     expect(first.created).toContain('raw/docs/');
     expect(first.created).toContain('wiki/index.md');
+    expect(first.created).toContain('playbooks/packs/default.md');
+    expect(first.created).toContain('playbooks/intents/entity-overview.yaml');
+    expect(first.created).toContain('playbooks/capabilities/');
     const second = initDataDir(dir);
     expect(second.created).toHaveLength(0);
   });
@@ -108,6 +111,83 @@ describe('local embedding', () => {
     expect(norm).toBeCloseTo(1, 5);
     const cos = (x: number[], y: number[]) => x.reduce((s, v, i) => s + v * y[i], 0);
     expect(cos(a1, a2)).toBeGreaterThan(cos(a1, b));
+  });
+});
+
+describe('ark multimodal embedding', () => {
+  const cfg = {
+    provider: 'ark-multimodal' as const,
+    baseUrl: 'https://ark-cn-beijing.example/api/v3/',
+    apiKey: 'test-key',
+    model: 'ep-test',
+    dimensions: 4,
+    batchSize: 3,
+    sendDimensions: false,
+  };
+
+  /** Ark answers with a single fused vector per call, under `data.embedding`. */
+  function mockArk(onCall: (body: Record<string, any>, url: string) => number[]) {
+    return vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init: any) => {
+      const body = JSON.parse(init.body as string);
+      const embedding = onCall(body, String(url));
+      return new Response(JSON.stringify({ data: { embedding }, usage: {} }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+  }
+
+  it('posts one text part per request and keeps input order despite concurrency', async () => {
+    const seen: string[] = [];
+    const fetchSpy = mockArk((body, url) => {
+      expect(url).toBe('https://ark-cn-beijing.example/api/v3/embeddings/multimodal');
+      expect(body.model).toBe('ep-test');
+      expect(body.dimensions).toBeUndefined();
+      // One item per call: the parts of one `input` are fused into one vector.
+      expect(body.input).toHaveLength(1);
+      expect(body.input[0].type).toBe('text');
+      const text = body.input[0].text as string;
+      seen.push(text);
+      return [Number(text), 0, 0, 0];
+    });
+    try {
+      const provider = createEmbeddingProvider(cfg);
+      const vectors = await provider.embed(['0', '1', '2', '3', '4']);
+      expect(fetchSpy).toHaveBeenCalledTimes(5);
+      expect(seen.sort()).toEqual(['0', '1', '2', '3', '4']);
+      expect(vectors.map((v) => v[0])).toEqual([0, 1, 2, 3, 4]);
+      expect(provider.dimensions).toBe(4);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('sends the dimensions parameter only when configured', async () => {
+    const fetchSpy = mockArk((body) => {
+      expect(body.dimensions).toBe(4);
+      return [1, 0, 0, 0];
+    });
+    try {
+      await createEmbeddingProvider({ ...cfg, sendDimensions: true }).embed(['x']);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('fails loudly when the response is not in Ark multimodal shape', async () => {
+    // An OpenAI-shaped `data: [{embedding}]` body must not silently yield junk.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 0, 0, 0] }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    try {
+      await expect(createEmbeddingProvider(cfg).embed(['x'])).rejects.toThrow(/data\.embedding/);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
 

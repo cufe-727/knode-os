@@ -46,7 +46,7 @@ Agent (Claude / Codex / DeepSeek Harness / custom)
 │ chunks · entities · claims · pages · memories · episodes   │ datasets(✅) · capabilities · locators
 └───────────────────────────────────────────────────────────┘
    ▲ files = human truth                ▲ ledger/events.jsonl = machine truth
-   raw/ cooked/ wiki/ packs/               .knode/db = rebuildable projection
+   raw/ .sidecar/ wiki/ playbooks/              .knode/db = rebuildable projection
    ▲ physical stores: MySQL · TimescaleDB · parquet/DuckDB (✅) · S3 · HTTP APIs · Prometheus (Phase 3)
 ```
 
@@ -65,7 +65,7 @@ Principles:
 
 | Cordis | ACD implementation |
 |---|---|
-| component | **Source**: a file (cooked document, skill, human wiki page, purpose/schema), a datasource config, one dream. One apply = one `scopes` row; tier-1 extraction, human prose on a generated page (`wiki-human`) and every live table (`dataset`) are child scopes |
+| component | **Source**: a file (raw document, skill, human wiki page, purpose/schema), a datasource config, one dream. One apply = one `scopes` row; tier-1 extraction, human prose on a generated page (`wiki-human`) and every live table (`dataset`) are child scopes |
 | `ctx.effect(() => inverse)` | Graph evidence (entity/relation/claim), mentions and chunks/embeddings have an **implicit** inverse (closed or deleted by `scope_id`); file writes, managed regions, queue entries, suggestions, deps, page rows and dataset rows are **explicit** effects recorded in `effects(scope_id, seq, kind, target, inverse)` |
 | dispose stack | `disposeScope`: children first, then close evidence, delete mentions and the projection, then replay `effects` in `seq DESC` order |
 | `inject` (coeffect) | `deps(artifact ← input, required)`; inputs are only `entity / relation / claim / document / dataset / trace / set` — **a page can never depend on a page** |
@@ -108,7 +108,7 @@ Why neither views nor delta counters: a whole-table `GROUP BY evidence` on every
 
 Three paths used to resurrect entities whose sources were gone: `wiki/entities/*.md` stubs re-ingested as concept nodes; the hot-topics block in `wiki/index.md` with `[[entity]]` links; `[[links]]` inside `wiki/sources/*.md` summaries. The new classification (`src/ingest/apply.ts`):
 
-- **Sources**: `cooked/docs/**`, `raw/skills/**`, `purpose.md`/`schema.md`, human pages under `wiki/**` that are neither reserved nor views (with a self-entity, as before), datasource configs.
+- **Sources**: `raw/docs/**` (prepared: text normalized in memory, converted originals through their sidecar `content.md`), `raw/skills/**`, `purpose.md`/`schema.md`, human pages under `wiki/**` that are neither reserved nor views (with a self-entity, as before), datasource configs.
 - **Views** (wiki files with a live `pages` row or `generated: true`): chunked and embedded for search only, **no entity evidence**; only prose written outside the managed regions counts as evidence (`extractor: human` — a human writing on a stub asserts the entity), recorded as a `wiki-human` child scope.
 - **Reserved**: `index.md` at any level is searchable but never wired; `wiki/log.md`, `wiki/.archive/**`, `attachments/**`, `*.knode.json`, `ledger/**`, `raw/traces/**` are never sources. `ledger/events.jsonl` supersedes `log.md` as the machine log; `appendLog` stays the human-readable OKF log.
 
@@ -149,7 +149,7 @@ Three applies of the same `(kind, key, sha)` write nothing; a content change is 
 | `dataset` | `wiki/datasets/<id>.md` | **dataset** (schema sha), linked entities | no | — |
 | `sources_index` | region `wiki/sources/index.md#sources` | `set:docs`, documents | no | — |
 | `hot_topics` | region `wiki/index.md#hot-topics` | `set:hot-entities`, entities | no | — |
-| `concept_cluster` | `wiki/concepts/<slug>-cluster.md` | **anchor entity**, members | yes | `cooked/wiki/….knode.json` |
+| `concept_cluster` | `wiki/concepts/<slug>-cluster.md` | **anchor entity**, members | yes | `.sidecar/wiki/…/render.md` |
 | `dream` | `wiki/dreams/<date>.md` | traces | yes | one-shot scope |
 
 - Managed regions: `<!-- knode:begin <id> --> … <!-- knode:end <id> -->`. Human prose outside them survives every regeneration and is itself a knowledge source. Legacy `generated: true` pages without markers are managed wholesale; the old `<!-- hot-topics:start -->` block is rewritten on first regeneration.
@@ -205,7 +205,7 @@ A claim can be believed today (tx), be about last quarter (valid), while the liv
 ### 7.2 `kinds` / `sources` filters (Phase 2, implemented)
 
 - `kinds`: `doc` (raw/docs), `wiki` (human-written wiki prose), `view` (a generated wiki page), `skill` (raw/skills). `wiki` and `view` share a directory, but only the first is a knowledge source.
-- `sources`: path prefixes, reusing `normalizePrefixes`, so `raw/docs/reports` maps to its cooked twin.
+- `sources`: path prefixes, reusing `normalizePrefixes`, so `raw/docs/reports` selects that subtree.
 - For chunk retrieval the filter is a `documents` predicate funnelled through `docLiveAt`, so no recall route can silently drop it. For graph rows (entities, relations, claims) it means "**supported by evidence from a scope that passes the filter**" — the lineage-faithful reading, and one that composes with `as_of` by looking only at evidence live at that time.
 - The SAG bipartite expansion carries the same predicates: an `as_of` walk must not bridge through an entity that did not exist then, and a scoped walk must not escape its sources through a shared entity.
 
@@ -362,18 +362,25 @@ Targets are `entity` (evidence + claims), `source` (scope applies/disposes) and 
 
 Budgets and cut reports (Phase 4's `budget_report.cut`), receipts and feedback (Phase 4 receipts + Phase 5 precision), capability cost/freshness labels (Phase 3), explainable plans (Phase 4's `node.why`).
 
-## 10. Data directory after Phase 1
+## 10. Data directory (layout v3)
+
+Layout v3 (2026-09-13) removed the `cooked/` copy layer: the raw path is every
+source's key, text sources are normalized in memory, and everything derived
+lives in `.sidecar/<key>/` split by lifecycle. Mentions of `cooked/` elsewhere
+in this document describe the v2 implementation.
 
 ```
 <data>/
-├── raw/            originals (L0); cooked/  normalized + sidecars (L1; sidecars now hold view caches and tier-0.5 declarations)
-│                   cooked/traces/  turn-segmented episodes (needs trace.episodes: true)
+├── raw/            originals (L0) and the key space: raw/docs, raw/traces, raw/skills
+├── .sidecar/       derived state (L1), one directory per source key, mirroring the tree:
+│                   content.md (converted PDF/image, trace episode), meta.json, tier0.json, tier1.json,
+│                   usage.json, views/source-summary.md; .sidecar/wiki/…/render.md caches concept pages
 ├── wiki/           views + human pages (L3); wiki/.archive/  archived generated pages
 │                   wiki/learning/  capability ranking and pack evaluation (reviewable)
-├── packs/          playbooks / recipes (how to retrieve)
-├── capabilities/   the semantic layer over live sources: metric definitions, joins, pitfalls (itself a Source)
-├── intents/        intent specs: the slots an answer needs (how to know it is answered)
-├── ledger/         events.jsonl (machine truth); receipts.jsonl (one per resolve); attic/ (sidecars of removed sources, previous file versions)
+├── playbooks/      packs/ (playbooks / recipes), capabilities/ (semantic layer over live sources, itself a Source),
+│                   intents/ (intent specs: the slots an answer needs)
+├── ledger/         events.jsonl (machine truth); receipts.jsonl (one per resolve); attic/<scopeId>/ (whole sidecar
+│                   directories of removed sources); attic/blobs/ (previous file versions)
 └── .knode/db       PGlite projection (`rebuild` reconstructs it)
 ```
 

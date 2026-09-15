@@ -4,6 +4,7 @@ import mysql from 'mysql2/promise';
 import pg from 'pg';
 import { DuckDBInstance } from '@duckdb/node-api';
 import { DataSourceConfig, loadConfig, saveConfig } from '../config.js';
+import { PACKS_DIR } from '../fs/layout.js';
 
 /**
  * Stock-analysis demo seed — the minimal end-to-end scenario for the
@@ -99,7 +100,7 @@ export async function seedStockDemo(dataDir: string, opts: SeedStockOptions = {}
   result.configUpdated = true;
   progress('knode.config.json: datasources block written');
 
-  const playbookRel = 'packs/organization.md';
+  const playbookRel = `${PACKS_DIR}/organization.md`;
   const playbookAbs = path.join(dataDir, playbookRel);
   fs.mkdirSync(path.dirname(playbookAbs), { recursive: true });
   fs.writeFileSync(playbookAbs, ORGANIZATION_PLAYBOOK);

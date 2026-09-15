@@ -34,7 +34,7 @@ knode-os combines three ideas:
 │            │                  │                  │         │
 │            └────────────┬─────┴──────────────────┘         │
 │                         ▼                                  │
-│   sync (tier 0): cook (raw→cooked + sidecar) → declared    │
+│   sync (tier 0): prepare (raw → sidecar) → declared        │
 │       vs running scopes diff → per source: chunk → embed   │
 │       (reusing unchanged chunks) → pgvector + tsvector →   │
 │       tier-0 graph evidence (wikilinks + NLP concepts +    │
@@ -54,7 +54,7 @@ knode-os combines three ideas:
             ▲                  ▲                 ▲
    data dir (files = truth)   ledger/ (events,   ~/.claude/projects,
    raw/{docs,traces,skills}   attic = machine    ~/.codex/sessions
-   wiki/ packs/               truth)             (mirrored by trace sync)
+   wiki/ playbooks/           truth)             (mirrored by trace sync)
 ```
 
 ## Data directory
@@ -64,25 +64,29 @@ knode-os combines three ideas:
 ├── knode.config.json   embedding/llm/server/dream settings
 ├── purpose.md          what this KB is for (steers generation)
 ├── schema.md           wiki structure rules
-├── raw/                originals, never rewritten (L0)
-│   ├── docs/           user uploads
+├── raw/                originals, never rewritten (L0); the raw path is every source's key
+│   ├── docs/           user uploads (text, PDF, images)
 │   ├── traces/         agent sessions (claude/, codex/), auto-synced
 │   └── skills/         skills/prompts agents have used, auto-synced
-├── cooked/             normalized layer, system-managed (L1)
-│   └── docs/           normalized copies + <name>.knode.json sidecars
-│                       (metadata, tier-0/1 extraction results, usage/heat)
+├── .sidecar/           derived layer, system-managed (L1), one directory per source key
+│   └── raw/docs/<f>/   content.md (Markdown converted from a PDF/image), meta.json,
+│                       tier0.json / tier1.json, usage.json, views/ (cached LLM summaries)
 ├── wiki/               curated knowledge (L3); OKF v0.2 + Obsidian Vault
 │   ├── .obsidian/      vault-local settings
 │   ├── attachments/    Obsidian attachments
 │   ├── index.md  log.md  overview.md
-│   ├── entities/  concepts/  sources/  dreams/
+│   ├── entities/  concepts/  sources/  dreams/  datasets/
+├── playbooks/          agent-editable configuration: packs/ capabilities/ intents/
+├── ledger/             events.jsonl (machine truth) + attic/ (sidecars of removed sources)
 └── .knode/             PGlite database (L2) — delete + `ingest` to rebuild
 ```
 
 Everything under `.knode/` is derived. `documents.sha256` makes ingestion
 incremental and idempotent; sidecars let a rebuild replay paid LLM extractions
-and usage history for free. Ingest indexes `cooked/docs`, `raw/skills` and
-`wiki/` — traces are *not* indexed for search; they feed the dream cycle only.
+and usage history for free. Ingest indexes `raw/docs` (text sources straight
+from the file, normalized in memory; PDFs and images through the Markdown in
+their sidecar), `raw/skills` and `wiki/` — traces are indexed only when
+`trace.episodes` is on; otherwise they feed the dream cycle only.
 
 ## Retrieval
 
@@ -153,8 +157,9 @@ regeneration and is itself a source.
 
 - [01 — 文档处理系统：面向海量文本的 Graph Wiki 方案](01-doc-processing-graph-wiki.md)
   — tiered extraction pipeline (Tier 0/1/2), sidecar metadata + heat tracking,
-  `raw → cooked → wiki` directory layers, 100k–1M document scaling plan.
-  The core of this design (cooked layer, sidecars, tiers, heat) is implemented.
+  `raw → sidecar → wiki` directory layers, 100k–1M document scaling plan.
+  The core of this design (sidecars, tiers, heat) is implemented; layout v3
+  replaced the cooked copy layer with per-source sidecar directories.
 - [02 — Google Open Knowledge Format (OKF) v0.2 兼容设计](02-okf-compatibility.md)
   — specification summary, native bundle mapping, validation/import/export,
   permissive consumption, and ordinary markdown-link graph wiring.

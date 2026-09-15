@@ -721,7 +721,7 @@ program
   .command('pack-optimize')
   .description('analyze recent pack_events and propose playbook revisions as suggestions (kind "pack")')
   .option('--lookback <days>', 'analysis window in days', '14')
-  .option('--apply', 'immediately accept + write every proposed revision to packs/')
+  .option('--apply', 'immediately accept + write every proposed revision to playbooks/packs/')
   .action(async (opts) => {
     const ctx = await createContext(dataDir());
     const res = await optimizePacks(ctx.store, ctx.config, ctx.llm, {
@@ -909,9 +909,10 @@ okf
   .command('validate [bundle]')
   .description('validate an OKF bundle (default: the native <data>/wiki bundle)')
   .option('--json', 'print the complete machine-readable report')
+  .option('--as-indexed', 'validate the view knode-os indexes (frontmatter normalizer applied in memory) — what a raw/docs subtree looks like to the pipeline')
   .action((bundle, opts) => {
     const root = bundle ? path.resolve(bundle) : path.join(dataDir(), 'wiki');
-    const result = validateOkfBundle(root);
+    const result = validateOkfBundle(root, { asIndexed: Boolean(opts.asIndexed) });
     if (opts.json) {
       console.log(JSON.stringify(result, null, 2));
     } else {

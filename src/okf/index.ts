@@ -3,6 +3,7 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import { safePath } from '../fs/files.js';
 import { initObsidianVault } from '../obsidian/vault.js';
+import { normalizeCookedFrontmatter } from './normalize.js';
 
 /** Google Open Knowledge Format version implemented by knode-os. */
 export const OKF_VERSION = '0.2';
@@ -154,9 +155,22 @@ export function resolveOkfLink(sourceRel: string, href: string): string | null {
   return normalized;
 }
 
+export interface OkfValidateOptions {
+  /**
+   * Validate the view knode-os indexes rather than the bytes on disk: the
+   * frontmatter normalizer (src/okf/normalize.ts) is applied in memory first,
+   * which is what an unannotated raw/docs subtree looks like to the pipeline.
+   */
+  asIndexed?: boolean;
+}
+
 /** Validate a directory against OKF v0.2's three conformance rules (SPEC §11). */
-export function validateOkfBundle(bundleDir: string): OkfValidationResult {
+export function validateOkfBundle(bundleDir: string, opts: OkfValidateOptions = {}): OkfValidationResult {
   const root = path.resolve(bundleDir);
+  const readConcept = (rel: string): string => {
+    const text = fs.readFileSync(path.join(root, ...rel.split('/')), 'utf8');
+    return opts.asIndexed ? normalizeCookedFrontmatter(rel, text) : text;
+  };
   const diagnostics: OkfDiagnostic[] = [];
   const add = (level: OkfDiagnosticLevel, code: string, rel: string, message: string) => {
     diagnostics.push({ level, code, path: rel || '.', message });
@@ -175,7 +189,7 @@ export function validateOkfBundle(bundleDir: string): OkfValidationResult {
   let logs = 0;
 
   for (const rel of files) {
-    const raw = fs.readFileSync(path.join(root, ...rel.split('/')), 'utf8');
+    const raw = readConcept(rel);
     const parsed = parseOkfFile(raw);
     const name = path.posix.basename(rel);
 
@@ -239,8 +253,7 @@ export function validateOkfBundle(bundleDir: string): OkfValidationResult {
   // Broken and out-of-bundle links are deliberately warnings: OKF consumers
   // must tolerate them while bundles are being grown or refactored.
   for (const rel of files) {
-    const raw = fs.readFileSync(path.join(root, ...rel.split('/')), 'utf8');
-    const body = parseOkfFile(raw).body;
+    const body = parseOkfFile(readConcept(rel)).body;
     for (const link of extractMarkdownLinks(body)) {
       const target = resolveOkfLink(rel, link.href);
       if (target === null) continue;

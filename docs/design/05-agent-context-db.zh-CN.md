@@ -45,7 +45,7 @@ Agent (Claude / Codex / DeepSeek Harness / 自研)
 │ chunks · entities · claims · pages · memories · episodes   │ datasets(✅) · capabilities · locators
 └───────────────────────────────────────────────────────────┘
    ▲ files = 人类真相                    ▲ ledger/events.jsonl = 机器真相
-   raw/ cooked/ wiki/ packs/                .knode/db = 可重建投影
+   raw/ .sidecar/ wiki/ playbooks/              .knode/db = 可重建投影
    ▲ 物理存储：MySQL · TimescaleDB · parquet/DuckDB（✅）· S3 · HTTP API · Prometheus（Phase 3）
 ```
 
@@ -64,7 +64,7 @@ Agent (Claude / Codex / DeepSeek Harness / 自研)
 
 | Cordis | ACD 实现 |
 |---|---|
-| component | **Source**：一个文件（cooked 文档、skill、人工 wiki 页、purpose/schema）、一个 datasource 配置、一次 dream。一次 apply = `scopes` 一行；tier-1 抽取、生成页上的人工散文（`wiki-human`）、每张数据表（`dataset`）是子 scope |
+| component | **Source**：一个文件（raw 文档、skill、人工 wiki 页、purpose/schema）、一个 datasource 配置、一次 dream。一次 apply = `scopes` 一行；tier-1 抽取、生成页上的人工散文（`wiki-human`）、每张数据表（`dataset`）是子 scope |
 | `ctx.effect(() => inverse)` | 图证据（entity/relation/claim）、mention、chunk/embedding 的逆是**隐式**的（按 `scope_id` 关闭或删除）；文件写入、托管区块、队列、建议、依赖、页面行、dataset 行等**显式** effect 记在 `effects(scope_id, seq, kind, target, inverse)` |
 | dispose stack | `disposeScope`：子 scope 先，再关闭 evidence、删 mention、删投影，然后 `effects` 按 `seq DESC` 执行逆操作 |
 | `inject`（coeffect） | `deps(artifact ← input, required)`；input 只能是 `entity / relation / claim / document / dataset / trace / set`，**page 永远不能依赖 page** |
@@ -107,7 +107,7 @@ datasets  + scope_id, tx_from, tx_to ；documents + scope_id, kind: source|view�
 
 旧版有三条路径让已删除来源的实体复活：`wiki/entities/*.md` stub 被当作 concept 节点重新 ingest；`wiki/index.md` 的 hot-topics 区块带 `[[实体]]`；`wiki/sources/*.md` 摘要带 `[[链接]]`。新的分类（`src/ingest/apply.ts`）：
 
-- **Sources**：`cooked/docs/**`、`raw/skills/**`、`purpose.md`/`schema.md`、`wiki/**` 中既非保留页也非视图的人工页（含 self-entity，与今天一致）、datasource 配置。
+- **Sources**：`raw/docs/**`（prepare 后：文本源在内存中归一化，PDF/图片经 sidecar 的 `content.md`）、`raw/skills/**`、`purpose.md`/`schema.md`、`wiki/**` 中既非保留页也非视图的人工页（含 self-entity，与今天一致）、datasource 配置。
 - **Views**（有活跃 `pages` 行或 `generated: true` 的 wiki 文件）：只做 chunk/embedding 供检索，**不产生实体证据**；仅当托管区块外有非标题正文时，才作为 `extractor: human` 的证据来源（人在 stub 上写了散文 = 人在断言这个实体），并以 `wiki-human` 子 scope 记录。
 - **Reserved**：`index.md`（任何层级）只进检索不接图；`wiki/log.md`、`wiki/.archive/**`、`attachments/**`、`*.knode.json`、`ledger/**`、`raw/traces/**` 永远不是来源。`ledger/events.jsonl` 取代 `log.md` 作为机器日志，`appendLog` 仍是人类可读的 OKF 日志。
 
@@ -148,7 +148,7 @@ datasets  + scope_id, tx_from, tx_to ；documents + scope_id, kind: source|view�
 | `dataset` | `wiki/datasets/<id>.md` | **dataset**(schema sha), 关联实体 | 否 | — |
 | `sources_index` | `wiki/sources/index.md#sources` 区块 | `set:docs`, documents | 否 | — |
 | `hot_topics` | `wiki/index.md#hot-topics` 区块 | `set:hot-entities`, entities | 否 | — |
-| `concept_cluster` | `wiki/concepts/<slug>-cluster.md` | **anchor entity**, members | 是 | `cooked/wiki/…knode.json` |
+| `concept_cluster` | `wiki/concepts/<slug>-cluster.md` | **anchor entity**, members | 是 | `.sidecar/wiki/…/render.md` |
 | `dream` | `wiki/dreams/<date>.md` | traces | 是 | 一次性 scope |
 
 - 托管区块 `<!-- knode:begin <id> --> … <!-- knode:end <id> -->`；区块外的人工散文在每次再生中保留，并且是知识来源。旧的 `generated: true` 无标记页视为整体托管；旧 `<!-- hot-topics:start -->` 首次再生时改写。
@@ -195,7 +195,7 @@ datasets  + scope_id, tx_from, tx_to ；documents + scope_id, kind: source|view�
 ### 6.3 多模态 cook（Phase 3，部分实现）
 
 - 图片 → caption/OCR 已由 Phase 1 的 `convert.ts`（vision 路由）覆盖。
-- **trace → episode**：`raw/traces/**.jsonl` cook 成 `cooked/traces/**.md`，按 turn 分段（用户请求、tool call、observation），于是一份没法检索的会话记录变成了普通 source——分块、嵌入、连图、可回滚。**默认关闭**（`trace.episodes: true` 开启）：一台存了几个月 agent 历史的机器，否则一次 sync 就是几千次 embedding 调用。
+- **trace → episode**：`raw/traces/**.jsonl` prepare 成 `.sidecar/raw/traces/**.jsonl/content.md`，按 turn 分段（用户请求、tool call、observation），于是一份没法检索的会话记录变成了普通 source——分块、嵌入、连图、可回滚。**默认关闭**（`trace.episodes: true` 开启）：一台存了几个月 agent 历史的机器，否则一次 sync 就是几千次 embedding 调用。
 - 音视频 transcript **未实现**：需要引入 ASR 依赖，与其塞一个假的占位实现，不如留出接口等真正接入时再做。
 
 ### 6.4 放置策略
@@ -232,7 +232,7 @@ materialize（文档与解析文本、媒体元数据/描述/embedding、trace�
 ### 7.2 `kinds` / `sources` 过滤（Phase 2，已实现）
 
 - `kinds`：`doc`（raw/docs）、`wiki`（人写的 wiki 散文）、`view`（生成的 wiki 页）、`skill`（raw/skills）。`wiki` 与 `view` 同处一个目录，但只有前者是知识来源。
-- `sources`：路径前缀，复用 `normalizePrefixes`，所以 `raw/docs/reports` 会自动映射到 cooked 孪生路径。
+- `sources`：路径前缀，复用 `normalizePrefixes`，所以 `raw/docs/reports` 就选中这棵子树。
 - 对 chunk 检索，过滤走 `documents` 谓词（`docLiveAt` 统一收口，任何一条召回路径都不可能漏掉它）；对图行（实体/关系/断言），过滤的含义是"**有一条通过过滤的 scope 提供的 evidence**"——这才是血缘上正确的语义，并且与 `as_of` 组合时只看当时活跃的 evidence。
 - SAG 的二部图扩展同样带上这两个谓词：一次带 `as_of` 的游走不能穿过当时还不存在的实体，一次带 `sources` 的游走也不能借共享实体逃出范围。
 
@@ -398,18 +398,23 @@ ACL 挂在 scope 上，向下走时**取交集**：一个由公开文档和受�
 
 预算与裁剪报告（Phase 4 的 `budget_report.cut`）、回执与 feedback（Phase 4 receipts + Phase 5 precision）、capability 的 cost/freshness 标签（Phase 3）、plan 可解释（Phase 4 的 `node.why`）。
 
-## 10. 数据目录（Phase 1 之后）
+## 10. 数据目录（布局 v3）
+
+v3 布局（2026-09-13）取消了 `cooked/` 副本层：raw 路径就是每个源的键，文本源在内存中归一化，
+所有派生物按生命周期拆开放在 `.sidecar/<key>/`。本文其他地方提到的 `cooked/` 描述的是 v2 实现。
 
 ```
 <data>/
-├── raw/            原件（L0）；cooked/  归一化 + sidecar（L1，sidecar 现含 views 缓存与 tier-0.5 声明）
-│                   cooked/traces/  turn 分段的 episode（需 trace.episodes: true）
+├── raw/            原件（L0），也是键空间：raw/docs、raw/traces、raw/skills
+├── .sidecar/       派生状态（L1），每个源一个目录，镜像整棵树：content.md（PDF/图片转换结果、trace episode）、
+│                   meta.json、tier0.json、tier1.json、usage.json、views/source-summary.md；
+│                   .sidecar/wiki/…/render.md 缓存社区页
 ├── wiki/           视图 + 人工页（L3）；wiki/.archive/  被归档的生成页
 │                   wiki/learning/  ranker 排名与 pack 评测（可复核的学习产物）
-├── packs/          playbook / recipe（怎么取）
-├── capabilities/   实时源的语义层：指标口径、join 路径、坑（本身就是 Source）
-├── intents/        intent spec：一个答案需要哪些槽位（怎么算答完了）
-├── ledger/         events.jsonl（机器真相）；receipts.jsonl（每次 resolve）；attic/（被删源的 sidecar、旧文件版本）
+├── playbooks/      packs/（playbook / recipe）、capabilities/（实时源的语义层，本身就是 Source）、
+│                   intents/（intent spec：一个答案需要哪些槽位）
+├── ledger/         events.jsonl（机器真相）；receipts.jsonl（每次 resolve）；attic/<scopeId>/（被删源的整个 sidecar 目录）；
+│                   attic/blobs/（旧文件版本）
 └── .knode/db       PGlite 投影（可 `rebuild`）
 ```
 

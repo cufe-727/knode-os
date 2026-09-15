@@ -1,5 +1,5 @@
 import { AppContext } from '../context.js';
-import { readSidecar, replayableTier1 } from '../fs/sidecar.js';
+import { readSidecarPart, replayableTier1 } from '../fs/sidecar.js';
 import { enqueueTier1, runTier1Pass, Tier1Stats } from '../graph/tier1.js';
 import { runIngest } from '../ingest/pipeline.js';
 import { generateWiki } from '../wiki/generate.js';
@@ -115,7 +115,7 @@ async function requeueMissingTier1(ctx: AppContext): Promise<number> {
   );
   let requeued = 0;
   for (const doc of docs) {
-    const done = replayableTier1(readSidecar(ctx.dataDir, doc.path), doc.sha256);
+    const done = replayableTier1(readSidecarPart(ctx.dataDir, doc.path, 'tier1'), doc.sha256);
     if (done) continue;
     await enqueueTier1(ctx.store, doc.id);
     requeued++;

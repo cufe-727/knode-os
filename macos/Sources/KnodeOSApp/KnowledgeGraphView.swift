@@ -38,7 +38,7 @@ struct KnowledgeGraphView: View {
                 EmptyState(
                     symbol: "point.3.connected.trianglepath.dotted",
                     title: "The graph is empty",
-                    message: "Ingest documents with wikilinks or configure entity extraction to create nodes and relations.",
+                    message: "Index documents with wikilinks or configure entity extraction to create nodes and relations.",
                     actionTitle: "Go to Files",
                     action: { model.selectedSection = .files }
                 )

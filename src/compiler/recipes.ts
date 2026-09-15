@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { sqlStringLiteral } from '../datasource/guard.js';
+import { PACKS_DIR } from '../fs/layout.js';
 import { Locator } from '../capability/store.js';
 import { Playbook, entitySymbol, loadPlaybooks, renderProbeSql } from '../pack/playbook.js';
 import { PlanNode } from './plan.js';
@@ -129,13 +130,13 @@ export function upgradePlaybook(pb: Playbook): Recipe {
   };
 }
 
-/** Recipes from `packs/*.md`, including playbooks upgraded on the fly. */
+/** Recipes from `playbooks/packs/*.md`, including playbooks upgraded on the fly. */
 export function loadRecipes(dataDir: string): Recipe[] {
-  const dir = path.join(dataDir, 'packs');
+  const dir = path.join(dataDir, PACKS_DIR);
   const out: Recipe[] = [];
   if (fs.existsSync(dir)) {
     for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.md')).sort()) {
-      const parsed = parseRecipe(fs.readFileSync(path.join(dir, file), 'utf8'), `packs/${file}`);
+      const parsed = parseRecipe(fs.readFileSync(path.join(dir, file), 'utf8'), `${PACKS_DIR}/${file}`);
       if (parsed) out.push(parsed);
     }
   }

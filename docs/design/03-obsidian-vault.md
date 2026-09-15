@@ -17,7 +17,7 @@ Obsidian 的存储模型非常适合这一目标：Vault 就是包含子目录�
 ```text
 <data>/                         不是 Vault：运行时和原始数据容器
 ├── raw/
-├── cooked/
+├── .sidecar/
 ├── .knode/
 └── wiki/                      唯一的原生知识 Vault
     ├── .obsidian/
@@ -32,7 +32,7 @@ Obsidian 的存储模型非常适合这一目标：Vault 就是包含子目录�
 ```
 
 用户应在 Obsidian 中选择“Open folder as vault”，打开 `<data>/wiki`，而不是
-`<data>`。这样不会把原始文档、cooked 副本、sidecar 和数据库暴露为重复笔记，
+`<data>`。这样不会把原始文档、sidecar 派生层和数据库暴露为重复笔记，
 也避免 Obsidian 官方不建议的 Vault-in-Vault 结构。
 
 通过 `okf import` 创建的 `raw/docs/okf/<name>/` 和 `okf export` 创建的目标目录

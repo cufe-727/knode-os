@@ -6,6 +6,7 @@ import { AppContext, createContext } from '../src/context.js';
 import { sanitizeRelativePath } from '../src/fs/files.js';
 import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
+import { textPdf } from './helpers/pdf.js';
 
 /** Folder creation and folder upload — the file-tree surface of the app. */
 
@@ -65,8 +66,10 @@ describe('POST /api/mkdir', () => {
     );
   });
 
-  it('rejects read-only roots and empty paths', async () => {
-    expect((await mkdir('cooked/docs/mine')).status).toBe(400);
+  it('rejects read-only roots, the sidecar tree and empty paths', async () => {
+    expect((await mkdir('ledger/mine')).status).toBe(400);
+    expect((await mkdir('.sidecar/raw/docs/mine')).status).toBe(400);
+    expect((await mkdir('raw/docs/.sidecar/mine')).status).toBe(400);
     expect((await mkdir('../escaped')).status).toBe(400);
     expect((await mkdir('  ')).status).toBe(400);
     expect((await mkdir(undefined)).status).toBe(400);
@@ -108,9 +111,15 @@ describe('POST /api/upload', () => {
     expect(fs.readFileSync(path.join(workspaceDir, 'purpose.md'), 'utf8')).not.toBe('overwritten');
   });
 
-  it('refuses destinations outside raw/docs and wiki', async () => {
-    const response = await upload('cooked/docs', [['x.md', 'x']]);
-    expect(response.status).toBe(400);
+  it('refuses destinations outside raw/docs and wiki, and never lands inside the sidecar tree', async () => {
+    expect((await upload('ledger', [['x.md', 'x']])).status).toBe(400);
+    expect((await upload('.sidecar/raw/docs', [['x.md', 'x']])).status).toBe(400);
+    expect((await upload('raw/docs/.sidecar', [['x.md', 'x']])).status).toBe(400);
+    // a dropped folder that carries another workspace's sidecar tree: those entries are skipped, not written
+    const response = await upload('raw/docs', [['.sidecar/raw/docs/a.md/tier1.json', '{}'], ['carried.md', '# Carried']]);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, saved: ['raw/docs/carried.md'], skipped: ['.sidecar/raw/docs/a.md/tier1.json'] });
+    expect(fs.existsSync(path.join(workspaceDir, 'raw', 'docs', '.sidecar'))).toBe(false);
   });
 
   it('never overwrites an existing file', async () => {
@@ -149,9 +158,20 @@ describe('POST /api/mv', () => {
   });
 
   it('refuses read-only roots on either end', async () => {
-    expect((await mv('raw/docs/clash.md', 'cooked/docs/clash.md')).status).toBe(400);
+    expect((await mv('raw/docs/clash.md', 'ledger/clash.md')).status).toBe(400);
+    expect((await mv('raw/docs/clash.md', '.sidecar/raw/docs/clash.md')).status).toBe(400);
     expect((await mv('purpose.md', 'raw/docs/purpose.md')).status).toBe(400);
     expect(fs.existsSync(path.join(workspaceDir, 'raw', 'docs', 'clash.md'))).toBe(true);
+  });
+
+  it('refuses to move the writable roots themselves', async () => {
+    // `wiki` and `raw/docs` pass the writable-path check, so only the root
+    // guard keeps a rename from walking the whole tree away
+    expect((await mv('wiki', 'raw/docs/wiki')).status).toBe(400);
+    expect((await mv('raw/docs', 'wiki/docs')).status).toBe(400);
+    expect((await mv('raw/docs/clash.md', 'purpose.md')).status).toBe(400);
+    expect(fs.existsSync(path.join(workspaceDir, 'wiki'))).toBe(true);
+    expect(fs.existsSync(path.join(workspaceDir, 'raw', 'docs'))).toBe(true);
   });
 
   it('keeps traversal inside the writable root instead of escaping it', async () => {
@@ -159,6 +179,87 @@ describe('POST /api/mv', () => {
     expect(response.status).toBe(200);
     expect(fs.existsSync(path.join(workspaceDir, 'raw', 'docs', 'escaped.md'))).toBe(true);
     expect(fs.existsSync(path.join(workspaceDir, 'escaped.md'))).toBe(false);
+  });
+});
+
+describe('derived text of converted originals', () => {
+  const get = (url: string) => app.request(url, { headers });
+
+  it('serves a PDF as the Markdown derived from it, keeps the sidecar tree out of the tree and grep', async () => {
+    const form = new FormData();
+    form.set('dir', 'raw/docs');
+    form.append('files', new File([textPdf('Quarterly revenue increased by 42 percent.')], 'hello.pdf'));
+    expect((await app.request('/api/upload', { method: 'POST', headers, body: form })).status).toBe(200);
+
+    // nothing derived yet: the original is binary, so there is no text to show
+    expect((await get('/api/file?path=raw/docs/hello.pdf')).status).toBe(404);
+
+    const ingest = await app.request('/api/ingest', { method: 'POST', headers });
+    expect(ingest.status).toBe(200);
+    expect(fs.existsSync(path.join(workspaceDir, '.sidecar', 'raw', 'docs', 'hello.pdf', 'content.md'))).toBe(true);
+
+    const file = await (await get('/api/file?path=raw/docs/hello.pdf')).json();
+    expect(file).toMatchObject({ path: 'raw/docs/hello.pdf', derived: true });
+    expect(file.content).toContain('Quarterly revenue increased by 42 percent.');
+    const text = await (await get('/api/file?path=raw/docs/carried.md')).json();
+    expect(text).toMatchObject({ derived: false, content: '# Carried' });
+
+    const tree = await (await get('/api/tree')).json();
+    expect(JSON.stringify(tree)).not.toContain('.sidecar');
+    expect(JSON.stringify(tree)).not.toContain('cooked');
+
+    const hits = await (await get('/api/grep?pattern=Quarterly')).json();
+    expect(hits.map((h: { path: string }) => h.path)).toEqual(['raw/docs/hello.pdf']);
+    expect(await (await get('/api/grep?pattern=contentSha256')).json()).toEqual([]);
+    expect(await (await get('/api/grep?pattern=Quarterly&path=.sidecar')).json()).toEqual([]);
+    expect((await (await get('/api/grep?pattern=Quarterly&path=raw/docs/hello.pdf')).json()).length).toBe(1);
+  });
+
+  it('refuses to write derived text back over the original, whatever the caller', async () => {
+    const pdf = path.join(workspaceDir, 'raw', 'docs', 'hello.pdf');
+    const before = fs.readFileSync(pdf);
+    expect(before.subarray(0, 5).toString()).toBe('%PDF-');
+
+    // the editor shows this file's derived Markdown; saving it would replace
+    // the original's bytes with that text and lose the only copy
+    const res = await app.request('/api/file', {
+      method: 'PUT',
+      headers: jsonHeaders,
+      body: JSON.stringify({ path: 'raw/docs/hello.pdf', content: '# not a pdf\n' }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/converted original/);
+    expect(fs.readFileSync(pdf).equals(before)).toBe(true);
+
+    // an ordinary text file under the same root is still writable
+    const ok = await app.request('/api/file', {
+      method: 'PUT',
+      headers: jsonHeaders,
+      body: JSON.stringify({ path: 'raw/docs/carried.md', content: '# Carried\n\nedited\n' }),
+    });
+    expect(ok.status).toBe(200);
+  });
+});
+
+describe('preview cap', () => {
+  const get = (url: string) => app.request(url, { headers });
+  const big = `# Big\n\n${'x'.repeat(300 * 1024)}\n`;
+
+  it('caps an unqualified read and serves the whole file when asked', async () => {
+    fs.writeFileSync(path.join(workspaceDir, 'raw', 'docs', 'big.md'), big);
+    const onDisk = Buffer.byteLength(big);
+
+    // default read stops at the preview cap and says so, so a client knows not
+    // to round-trip it through an editor
+    const capped = await (await get('/api/file?path=raw/docs/big.md')).json();
+    expect(capped.truncated).toBe(true);
+    expect(capped.bytes).toBe(onDisk);
+    expect(Buffer.byteLength(capped.content)).toBeLessThan(onDisk);
+
+    // asking for the whole file is what makes editing safe
+    const full = await (await get('/api/file?path=raw/docs/big.md&maxBytes=4194304')).json();
+    expect(full.truncated).toBe(false);
+    expect(Buffer.byteLength(full.content)).toBe(onDisk);
   });
 });
 

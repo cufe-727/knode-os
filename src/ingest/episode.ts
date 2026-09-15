@@ -1,5 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { RAW_TRACES } from '../fs/layout.js';
+import { hasContent, readSidecarPart, removeSidecar, writeContent, writeSidecarPart } from '../fs/sidecar.js';
+import { NORMALIZER_VERSION } from '../okf/normalize.js';
+import { sha256 } from './source.js';
 
 /**
  * Agent transcripts as episodes (L0 → L1 for `raw/traces`).
@@ -175,30 +179,29 @@ export function renderEpisode(episode: Episode, rel: string): string {
   return `${front}# ${title}\n\n${body}\n`;
 }
 
-export const RAW_TRACES = 'raw/traces';
-export const COOKED_TRACES = 'cooked/traces';
+/** Version of the episode renderer; part of the sidecar conversion key so a renderer change re-prepares. */
+const EPISODE_VERSION = 1;
+export const EPISODE_CONVERSION_KEY = `episode@${EPISODE_VERSION}`;
 
-export function tracesCookedPath(rawRel: string): string {
-  return `${COOKED_TRACES}${rawRel.slice(RAW_TRACES.length)}.md`;
-}
-
-export interface EpisodeCookStats {
-  cooked: number;
+export interface EpisodePrepareStats {
+  prepared: number;
   unchanged: number;
   skipped: number;
-  /** Cooked paths whose raw transcript still exists — the declared episode set. */
-  wanted: string[];
+  /** Transcript keys with a rendered episode → sha256 of that Markdown — the declared trace set. */
+  wanted: Map<string, string>;
 }
 
 /**
- * Cook every synced transcript into `cooked/traces/**.md`.
+ * Prepare every synced transcript as an episode: `raw/traces/<…>/<session>.jsonl`
+ * stays the source key, the rendered Markdown lives in its sidecar as
+ * `content.md` next to a `meta.json`.
  *
  * Off by default: a machine with months of agent history would otherwise turn
  * one `sync` into thousands of embedding calls. `trace.episodes: true` in the
  * config opts in.
  */
-export function cookEpisodes(dataDir: string, opts: { maxBytes?: number; onProgress?: (m: string) => void } = {}): EpisodeCookStats {
-  const stats: EpisodeCookStats = { cooked: 0, unchanged: 0, skipped: 0, wanted: [] };
+export function prepareEpisodes(dataDir: string, opts: { maxBytes?: number; onProgress?: (m: string) => void } = {}): EpisodePrepareStats {
+  const stats: EpisodePrepareStats = { prepared: 0, unchanged: 0, skipped: 0, wanted: new Map() };
   const root = path.join(dataDir, RAW_TRACES);
   if (!fs.existsSync(root)) return stats;
   const maxBytes = opts.maxBytes ?? 16 * 1024 * 1024;
@@ -217,24 +220,39 @@ export function cookEpisodes(dataDir: string, opts: { maxBytes?: number; onProgr
         stats.skipped++;
         continue;
       }
-      const cookedRel = tracesCookedPath(child);
+      const bytes = fs.readFileSync(abs);
+      const sourceSha = sha256(bytes);
+      const meta = readSidecarPart(dataDir, child, 'meta');
+      if (meta && meta.sourceSha256 === sourceSha && meta.conversion?.key === EPISODE_CONVERSION_KEY && hasContent(dataDir, child)) {
+        stats.unchanged++;
+        stats.wanted.set(child, meta.contentSha256);
+        continue;
+      }
       const source: Episode['source'] = child.includes('/claude/') ? 'claude' : child.includes('/codex/') ? 'codex' : 'unknown';
-      const episode = parseEpisode(fs.readFileSync(abs, 'utf8'), { source });
+      const episode = parseEpisode(bytes.toString('utf8'), { source });
       if (episode.turns.length === 0) {
         stats.skipped++;
+        if (meta) removeSidecar(dataDir, child);
         continue;
       }
-      stats.wanted.push(cookedRel);
       const markdown = renderEpisode(episode, child);
-      const cookedAbs = path.join(dataDir, cookedRel);
-      if (fs.existsSync(cookedAbs) && fs.readFileSync(cookedAbs, 'utf8') === markdown) {
-        stats.unchanged++;
-        continue;
-      }
-      fs.mkdirSync(path.dirname(cookedAbs), { recursive: true });
-      fs.writeFileSync(cookedAbs, markdown);
-      stats.cooked++;
-      progress(`episode ${cookedRel}`);
+      writeContent(dataDir, child, markdown);
+      writeSidecarPart(dataDir, child, 'meta', {
+        version: 2,
+        rawPath: child,
+        sourceType: 'jsonl',
+        sourceSha256: sourceSha,
+        contentSha256: sha256(markdown),
+        contentBytes: Buffer.byteLength(markdown),
+        normalizer: NORMALIZER_VERSION,
+        conversion: { key: EPISODE_CONVERSION_KEY, kind: 'episode', model: '' },
+        title: episode.sessionId ? `Session ${episode.sessionId}` : path.basename(child),
+        ingestedAt: new Date().toISOString(),
+        chunks: [],
+      });
+      stats.wanted.set(child, sha256(markdown));
+      stats.prepared++;
+      progress(`episode ${child}`);
     }
   };
   walk(RAW_TRACES);

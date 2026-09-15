@@ -100,7 +100,7 @@ claims:
     expect((await sync(ctx, { llmGraph: false })).errors).toBe(0);
 
     const [trusted] = await ctx.store.query<{ trust: string }>(
-      `SELECT trust FROM scopes WHERE key = 'cooked/docs/report.md' AND status = 'active'`,
+      `SELECT trust FROM scopes WHERE key = 'raw/docs/report.md' AND status = 'active'`,
     );
     expect(trusted.trust).toBe('trusted');
 
@@ -118,7 +118,7 @@ claims:
 `);
     await sync(ctx, { llmGraph: false, actor: 'agent' });
     const [note] = await ctx.store.query<{ trust: string }>(
-      `SELECT trust FROM scopes WHERE key = 'cooked/docs/notes/agent.md' AND status = 'active'`,
+      `SELECT trust FROM scopes WHERE key = 'raw/docs/notes/agent.md' AND status = 'active'`,
     );
     expect(note.trust).toBe('quarantined');
   });
@@ -151,7 +151,7 @@ claims:
     const before = await listDisputes(ctx.store, { status: 'open' });
     expect(before.length).toBeGreaterThan(0);
 
-    const res = await setScopeTrust(ctx.store, { key: 'cooked/docs/notes/agent.md', to: 'trusted', actor: 'user' });
+    const res = await setScopeTrust(ctx.store, { key: 'raw/docs/notes/agent.md', to: 'trusted', actor: 'user' });
     expect(res).toMatchObject({ from: 'quarantined', to: 'trusted' });
     expect(res.evidenceRows).toBeGreaterThan(0);
     expect(res.disputesResolved).toBe(before.length);
@@ -262,7 +262,7 @@ describe('worksets', () => {
     await sync(ctx, { llmGraph: false, actor: 'agent' });
     const [scope] = await ctx.store.query<{ trust: string }>(
       `SELECT trust FROM scopes WHERE key = $1 AND status = 'active'`,
-      [`cooked/docs/notes/${ws.id}.md`],
+      [`raw/docs/notes/${ws.id}.md`],
     );
     expect(scope.trust).toBe('quarantined');
 
@@ -316,7 +316,7 @@ claims:
   });
 
   it('watches a source prefix for applies and disposes', async () => {
-    const sub = await subscribe(ctx.store, { kind: 'source', target: 'cooked/docs', actor: 'ops' });
+    const sub = await subscribe(ctx.store, { kind: 'source', target: 'raw/docs', actor: 'ops' });
     await new Promise((r) => setTimeout(r, 20));
     fs.rmSync(path.join(dataDir, 'raw/docs/new.md'));
     await sync(ctx, { llmGraph: false });

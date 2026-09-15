@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { AppContext } from '../context.js';
+import { loadSourceText } from '../ingest/source.js';
 import { LlmProvider } from '../config.js';
 import { safePath } from '../fs/files.js';
 import { llmExtract } from '../graph/llm-extract.js';
@@ -56,15 +57,13 @@ export async function benchExtractCompare(
 
   const docs = await ctx.store.query<{ id: string; path: string; title: string | null }>(
     `SELECT id, path, title FROM documents
-     WHERE root = 'docs' AND status = 'indexed' AND path LIKE 'cooked/docs/%'`,
+     WHERE root = 'docs' AND status = 'indexed'`,
   );
   const sample = docs
     .sort((a, b) => shuffleKey(a.id).localeCompare(shuffleKey(b.id)))
     .slice(0, Math.min(n, docs.length))
-    .map((d) => {
-      const content = fs.readFileSync(safePath(ctx.dataDir, d.path), 'utf8');
-      return { ...d, content };
-    });
+    .map((d) => ({ ...d, content: loadSourceText(ctx.dataDir, d.path, 'docs')?.text ?? '' }))
+    .filter((d) => d.content);
   progress(`comparing ${backends.map((b) => b.name).join(' vs ')} on ${sample.length} documents`);
 
   const report: ExtractCompareReport = { startedAt: new Date().toISOString(), docCount: sample.length, backends: [] };
