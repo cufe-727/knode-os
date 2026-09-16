@@ -31,13 +31,13 @@ struct WikiView: View {
                         if let errorMessage {
                             Text(errorMessage).font(.callout).foregroundStyle(.red)
                         }
-                        section("Recommended pages", empty: "Nothing to recommend yet — recommendations come from hot entities, repeated questions and pages whose facts changed.", isEmpty: recommendations.isEmpty) {
+                        section("Recommended pages", empty: L("Nothing to recommend yet — recommendations come from hot entities, repeated questions and pages whose facts changed."), isEmpty: recommendations.isEmpty) {
                             ForEach(recommendations) { rec in recommendationRow(rec) }
                         }
-                        section("Jobs", empty: "No research jobs yet. Queue one above or accept a recommendation.", isEmpty: jobs.isEmpty) {
+                        section("Jobs", empty: L("No research jobs yet. Queue one above or accept a recommendation."), isEmpty: jobs.isEmpty) {
                             ForEach(jobs) { job in jobRow(job) }
                         }
-                        section("Research pages", empty: "No research pages yet.", isEmpty: pages.isEmpty) {
+                        section("Research pages", empty: L("No research pages yet."), isEmpty: pages.isEmpty) {
                             ForEach(pages) { page in pageRow(page) }
                         }
                     }
@@ -53,12 +53,12 @@ struct WikiView: View {
 
     private var queueBar: some View {
         HStack(spacing: 10) {
-            Picker("Kind", selection: $kind) {
+            Picker(L("Kind"), selection: $kind) {
                 ForEach(kinds, id: \.0) { Text($0.1).tag($0.0) }
             }
             .labelsHidden()
             .frame(width: 190)
-            TextField("entity / concept name, “A vs B”, a question, or wiki/… path", text: $target)
+            TextField(L("entity / concept name, “A vs B”, a question, or wiki/… path"), text: $target)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit { Task { await queue() } }
             Button { Task { await queue() } } label: { Label("Queue research", systemImage: "checkmark.square") }
@@ -66,7 +66,7 @@ struct WikiView: View {
                 .tint(.knodeCyan)
                 .disabled(target.trimmingCharacters(in: .whitespaces).isEmpty)
             Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }
-                .help("Reload jobs, pages and recommendations")
+                .help(L("Reload jobs, pages and recommendations"))
         }
         .padding(.horizontal, 18)
         .frame(height: 66)
@@ -123,9 +123,9 @@ struct WikiView: View {
                     Text(rec.target).font(.callout.weight(.semibold)).lineLimit(1)
                     Spacer()
                     Text(String(format: "%.2f", rec.score)).font(.caption.monospaced()).foregroundStyle(.secondary)
-                    Button("Queue") { Task { await accept(rec) } }.controlSize(.small)
+                    Button(L("Queue")) { Task { await accept(rec) } }.controlSize(.small)
                     if rec.suggestionId != nil {
-                        Button("Dismiss") { Task { await dismiss(rec) } }.controlSize(.small)
+                        Button(L("Dismiss")) { Task { await dismiss(rec) } }.controlSize(.small)
                     }
                 }
                 Text(rec.reasons.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
@@ -143,12 +143,12 @@ struct WikiView: View {
                         Button(out) { model.openFile(out) }.buttonStyle(.link).font(.caption.monospaced())
                     }
                     Spacer()
-                    if let turns = job.turns { Text("\(turns) turns").font(.caption).foregroundStyle(.secondary) }
+                    if let turns = job.turns { Text(L("%@ turns", String(turns))).font(.caption).foregroundStyle(.secondary) }
                     if job.status == "queued" || job.status == "running" {
-                        Button("Cancel") { Task { await cancel(job) } }.controlSize(.small)
+                        Button(L("Cancel")) { Task { await cancel(job) } }.controlSize(.small)
                     }
                     if job.status == "failed" || job.status == "cancelled" {
-                        Button("Retry") { Task { await retry(job) } }.controlSize(.small)
+                        Button(L("Retry")) { Task { await retry(job) } }.controlSize(.small)
                     }
                 }
                 if let error = job.error {
@@ -166,11 +166,11 @@ struct WikiView: View {
                 Spacer()
                 badge(page.trust ?? (page.exists ? "unsynced" : "missing"), color: statusColor(page.trust ?? ""))
                 if page.trust == "quarantined" {
-                    Button("Promote") { Task { await setTrust(page, to: "trusted") } }.controlSize(.small)
+                    Button(L("Promote")) { Task { await setTrust(page, to: "trusted") } }.controlSize(.small)
                 } else if page.trust == "trusted" {
-                    Button("Demote") { Task { await setTrust(page, to: "quarantined") } }.controlSize(.small)
+                    Button(L("Demote")) { Task { await setTrust(page, to: "quarantined") } }.controlSize(.small)
                 }
-                Button("Refresh") { Task { await queueRefresh(page) } }.controlSize(.small)
+                Button(L("Refresh")) { Task { await queueRefresh(page) } }.controlSize(.small)
             }
         }
     }

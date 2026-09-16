@@ -24,14 +24,14 @@ struct SearchView: View {
             } else if !hasSearched {
                 EmptyState(
                     symbol: "magnifyingglass",
-                    title: "Recall anything",
-                    message: "Search across documents, skills, and the generated wiki. Hybrid mode combines semantic, keyword, graph, and usage signals."
+                    title: L("Recall anything"),
+                    message: L("Search across documents, skills, and the generated wiki. Hybrid mode combines semantic, keyword, graph, and usage signals.")
                 )
             } else if results.isEmpty {
                 EmptyState(
                     symbol: "magnifyingglass",
-                    title: "No matching knowledge",
-                    message: "Try broader terms, another retrieval mode, or index more documents."
+                    title: L("No matching knowledge"),
+                    message: L("Try broader terms, another retrieval mode, or index more documents.")
                 )
             } else {
                 HSplitView {
@@ -49,17 +49,17 @@ struct SearchView: View {
     private var searchBar: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField("Search the knowledge base…", text: $query)
+            TextField(L("Search the knowledge base…"), text: $query)
                 .textFieldStyle(.plain)
                 .font(.title3)
                 .focused($searchFocused)
                 .onSubmit { Task { await search() } }
-            Picker("Mode", selection: $mode) {
+            Picker(L("Mode"), selection: $mode) {
                 ForEach(SearchMode.allCases) { mode in Text(mode.rawValue.capitalized).tag(mode) }
             }
             .pickerStyle(.segmented)
             .frame(width: 250)
-            Button("Search") { Task { await search() } }
+            Button(L("Search")) { Task { await search() } }
                 .buttonStyle(.borderedProminent)
                 .tint(.knodeCyan)
                 .disabled(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSearching)
@@ -127,7 +127,7 @@ struct SearchView: View {
                     VStack(alignment: .leading, spacing: 18) {
                         HStack(spacing: 12) {
                             VStack(alignment: .leading, spacing: 3) {
-                                Eyebrow(text: "Relevance")
+                                Eyebrow(text: L("Relevance"))
                                 Text(result.score, format: .number.precision(.fractionLength(4)))
                                     .font(.title2.monospacedDigit().bold())
                             }
@@ -153,7 +153,7 @@ struct SearchView: View {
                 }
             }
         } else {
-            EmptyState(symbol: "doc.text.magnifyingglass", title: "Choose a result", message: "Inspect its retrieval signals and open the source file.")
+            EmptyState(symbol: "doc.text.magnifyingglass", title: L("Choose a result"), message: L("Inspect its retrieval signals and open the source file."))
         }
     }
 

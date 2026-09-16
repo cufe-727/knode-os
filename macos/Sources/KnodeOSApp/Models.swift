@@ -13,29 +13,29 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
 
     var id: String { rawValue }
 
-    var title: String {
+    @MainActor var title: String {
         switch self {
-        case .files: "Files"
-        case .search: "Search"
-        case .ask: "Ask"
-        case .graph: "Graph"
-        case .wiki: "Wiki"
-        case .traces: "Traces"
-        case .dream: "Dream"
-        case .settings: "Settings"
+        case .files: L("Files")
+        case .search: L("Search")
+        case .ask: L("Ask")
+        case .graph: L("Graph")
+        case .wiki: L("Wiki")
+        case .traces: L("Traces")
+        case .dream: L("Dream")
+        case .settings: L("Settings")
         }
     }
 
-    var subtitle: String {
+    @MainActor var subtitle: String {
         switch self {
-        case .files: "Browse and edit knowledge"
-        case .search: "Hybrid, vector, and keyword recall"
-        case .ask: "Cited answers from your workspace"
-        case .graph: "Entities, relations, and claims"
-        case .wiki: "Pages researched by agent CLIs"
-        case .traces: "Claude Code and Codex sessions"
-        case .dream: "Review agent improvement ideas"
-        case .settings: "Model routes and pipeline limits"
+        case .files: L("Browse and edit knowledge")
+        case .search: L("Hybrid, vector, and keyword recall")
+        case .ask: L("Cited answers from your workspace")
+        case .graph: L("Entities, relations, and claims")
+        case .wiki: L("Pages researched by agent CLIs")
+        case .traces: L("Claude Code and Codex sessions")
+        case .dream: L("Review agent improvement ideas")
+        case .settings: L("Model routes and pipeline limits")
         }
     }
 
@@ -803,17 +803,19 @@ struct ResearchProfilePayload: Encodable {
 struct ResearchProfileSummary: Decodable, Identifiable, Hashable {
     var name: String
     var title: String
+    var description: String
     var builtin: Bool
     var id: String { name }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, builtin
+        case name, title, description, builtin
     }
 
     init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         name = try c.decode(String.self, forKey: .name)
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? name
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
         builtin = try c.decodeIfPresent(Bool.self, forKey: .builtin) ?? false
     }
 }

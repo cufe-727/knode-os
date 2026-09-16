@@ -3,11 +3,13 @@ import SwiftUI
 /// Settings · 03 · Deep research. The runner card says which coding-agent CLI
 /// writes wiki pages, how many jobs run at once and which profile they follow;
 /// the profile below it sets how hard they think, what they may read from the
-/// web and the bar a page has to clear, and lists the sub-agents that do the
-/// work — each with its own CLI, model, tools and prompt.
+/// web and the bar a page has to clear, and the sub-agents that do the work sit
+/// behind one tab each — with its own CLI, model, tools and prompt.
 ///
 /// A profile is a file (`playbooks/research/profiles/<name>.yaml`), so what is
-/// edited here can equally be edited by hand; the role prompts travel with it.
+/// edited here can equally be edited by hand; the role prompts travel with it
+/// and stay in the language they are written in, because that text is what the
+/// agent actually receives.
 struct ResearchSettingsSection: View {
     @Binding var research: ResearchConfig
     @Binding var profile: ResearchProfileDetail?
@@ -19,13 +21,18 @@ struct ResearchSettingsSection: View {
     let connections: [LLMConnection]
     let defaultProvider: String
     let isWorking: Bool
+    /// Models the CLI behind an agent key offers ("" = the default provider).
+    let loadModels: (String) async throws -> ModelListResponse
     let duplicate: () -> Void
     let remove: () -> Void
+
+    @State private var selectedRoleID: String?
 
     /// The providers that can run a research job: a job is a CLI session, not
     /// a chat completion, so an OpenAI-compatible endpoint cannot take one.
     static let cliProviders = ["claude-cli", "codex-cli", "cursor-cli"]
 
+    /// value → English label; the label goes through `L` at render time.
     static let efforts: [(String, String)] = [
         ("default", "CLI default"),
         ("low", "Low"),
@@ -51,7 +58,7 @@ struct ResearchSettingsSection: View {
                 profileCard
                 rolesEditor
             } else {
-                Text("No research profile loaded. Save the settings once, or check that the service is new enough to serve /api/research/profiles.")
+                Text(L("No research profile loaded. Save the settings once, or check that the service is new enough to serve /api/research/profiles."))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .knodeCard()
@@ -62,15 +69,15 @@ struct ResearchSettingsSection: View {
     private var header: some View {
         HStack(alignment: .bottom) {
             VStack(alignment: .leading, spacing: 3) {
-                Eyebrow(text: "03 · Deep research", color: .knodeViolet)
-                Text("Who writes the wiki, and how hard they think").font(.title3.bold())
-                Text("A coding-agent CLI researches a topic through the MCP endpoint and writes the page. A profile sets the reasoning effort, web access and verification bar, and lists the sub-agents — each with its own CLI, model, tools and prompt.")
+                Eyebrow(text: L("03 · Deep research"), color: .knodeViolet)
+                Text(L("Who writes the wiki, and how hard they think")).font(.title3.bold())
+                Text(L("A coding-agent CLI researches a topic through the MCP endpoint and writes the page. A profile sets the reasoning effort, web access and verification bar, and lists the sub-agents — each with its own CLI, model, tools and prompt."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 12)
-            RouteBadge(label: "Agents", color: .knodeViolet)
+            RouteBadge(label: L("Agents"), color: .knodeViolet)
         }
     }
 
@@ -80,69 +87,83 @@ struct ResearchSettingsSection: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Research agent").font(.headline)
-                    Text("Which CLI runs jobs, how many at once, and which profile it follows. Roles below may override the CLI per phase.")
+                    Text(L("Research agent")).font(.headline)
+                    Text(L("Which CLI runs jobs, how many at once, and which profile it follows. Roles below may override the CLI per phase."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 12)
-                RouteBadge(label: "Runner", color: .knodeCyan)
+                RouteBadge(label: L("Runner"), color: .knodeCyan)
             }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
-                    FieldLabel("Agent") {
+                    FieldLabel(L("Agent")) {
                         AgentPicker(selection: $research.agent, connections: connections, inheritLabel: inheritLabel)
                     }
-                    FieldLabel("Model") {
-                        TextField("CLI default", text: $research.model)
-                    }
-                    FieldLabel("Profile") {
-                        Picker("Profile", selection: $profileSelection) {
+                    ModelField(
+                        placeholder: L("CLI default"),
+                        text: $research.model,
+                        providerKey: research.agent,
+                        load: { try await loadModels(research.agent) }
+                    )
+                    FieldLabel(L("Profile")) {
+                        Picker(L("Profile"), selection: $profileSelection) {
                             ForEach(summaries) { summary in
-                                Text(summary.title == summary.name ? summary.name : "\(summary.name) · \(summary.title)")
-                                    .tag(summary.name)
+                                Text(profileLabel(summary)).tag(summary.name)
                             }
                         }
                         .labelsHidden()
+                        .help(BuiltinNames.profileDescription(
+                            summaries.first { $0.name == profileSelection }?.description ?? ""
+                        ))
                     }
                 }
                 GridRow {
-                    FieldLabel("Pipeline") {
-                        Picker("Pipeline", selection: $research.pipeline) {
-                            Text("Team · plan, research, synthesize, review, revise").tag("team")
-                            Text("Native sub-agents · one session").tag("native")
-                            Text("Single session").tag("single")
+                    FieldLabel(L("Pipeline")) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Picker(L("Pipeline"), selection: pipelineSelection) {
+                                Text(L("Team · plan, research, synthesize, review, revise")).tag("team")
+                                Text(L("Native sub-agents · one session")).tag("native")
+                                Text(L("Single session")).tag("single")
+                            }
+                            .labelsHidden()
+                            .disabled(!pinnedPipeline.isEmpty)
+                            if !pinnedPipeline.isEmpty {
+                                Text(L("Pinned by the profile “%@”. Change it in Pipeline override below, or pick a profile that does not pin one.", profileSelection))
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
-                        .labelsHidden()
                     }
-                    FieldLabel("Parallel jobs") {
+                    FieldLabel(L("Parallel jobs")) {
                         TextField("1", value: $research.concurrency, format: .number)
                     }
-                    FieldLabel("Turns per session") {
+                    FieldLabel(L("Turns per session")) {
                         TextField("40", value: $research.maxTurns, format: .number)
                     }
                 }
                 GridRow {
-                    FieldLabel("Timeout (minutes)") {
+                    FieldLabel(L("Timeout (minutes)")) {
                         TextField("20", value: timeoutMinutes, format: .number)
                     }
-                    FieldLabel("Researchers (default fan-out)") {
+                    FieldLabel(L("Researchers (default fan-out)")) {
                         TextField("3", value: $research.researchers, format: .number)
                     }
-                    FieldLabel("Review rounds (default)") {
+                    FieldLabel(L("Review rounds (default)")) {
                         TextField("1", value: $research.reviewRounds, format: .number)
                     }
                 }
             }
             HStack(spacing: 8) {
-                Toggle("Accept the top recommendations automatically, up to", isOn: $research.auto.enabled)
+                Toggle(L("Accept the top recommendations automatically, up to"), isOn: $research.auto.enabled)
                     .toggleStyle(.checkbox)
                 TextField("3", value: $research.auto.dailyJobs, format: .number)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 64)
                     .disabled(!research.auto.enabled)
-                Text("jobs a day").font(.callout).foregroundStyle(.secondary)
+                Text(L("jobs a day")).font(.callout).foregroundStyle(.secondary)
             }
             Text(note)
                 .font(.caption)
@@ -156,8 +177,13 @@ struct ResearchSettingsSection: View {
     /// that provider is itself a CLI — say so rather than failing at run time.
     private var inheritLabel: String {
         Self.cliProviders.contains(defaultProvider)
-            ? "Default LLM provider · \(providerName(defaultProvider))"
-            : "Default LLM provider (not a CLI — pick one)"
+            ? L("Default LLM provider · %@", providerName(defaultProvider))
+            : L("Default LLM provider (not a CLI — pick one)")
+    }
+
+    private func profileLabel(_ summary: ResearchProfileSummary) -> String {
+        let title = BuiltinNames.profileTitle(summary.title)
+        return title == summary.name ? summary.name : "\(summary.name) · \(title)"
     }
 
     private var timeoutMinutes: Binding<Int> {
@@ -167,28 +193,40 @@ struct ResearchSettingsSection: View {
         )
     }
 
-    /// What a job will actually do, assembled from the runner and the profile —
-    /// the profile may pin its own pipeline, so the two can disagree.
+    /// A profile may pin the pipeline; when it does, the runner's own setting
+    /// has no effect, so the picker shows what will actually run and locks.
+    private var pinnedPipeline: String { profile?.pipeline ?? "" }
+
+    private var pipelineSelection: Binding<String> {
+        Binding(
+            get: { pinnedPipeline.isEmpty ? research.pipeline : pinnedPipeline },
+            set: { if pinnedPipeline.isEmpty { research.pipeline = $0 } }
+        )
+    }
+
+    /// What a job will actually do, assembled from the runner and the profile.
     private var note: String {
         let agentLabel = research.agent.isEmpty
             ? inheritLabel
             : (connections.first { $0.id == research.agent }?.label ?? providerName(research.agent))
-        let pinned = profile?.pipeline ?? ""
-        let pipeline = pinned.isEmpty ? research.pipeline : pinned
-        var parts = ["Agent: \(agentLabel)", "pipeline: \(pipeline)\(pinned.isEmpty ? "" : " (pinned by profile)")"]
+        let pipeline = pinnedPipeline.isEmpty ? research.pipeline : pinnedPipeline
+        var parts = [
+            L("Agent: %@", agentLabel),
+            L("pipeline: %@", pipeline + (pinnedPipeline.isEmpty ? "" : " (\(L("pinned by profile")))")),
+        ]
         if let profile {
-            parts.append("effort: \(profile.reasoning.effort)")
-            parts.append("web: \(profile.search.web) / \(profile.search.freshness)")
-            parts.append("sources per fact: \(profile.verification.minSourcesPerClaim)")
+            parts.append(L("effort: %@", profile.reasoning.effort))
+            parts.append(L("web: %@ / %@", profile.search.web, profile.search.freshness))
+            parts.append(L("sources per fact: %@", String(profile.verification.minSourcesPerClaim)))
         }
         if pipeline != "single" {
             let roles = (profile?.roles ?? []).filter(\.enabled).map { role -> String in
                 let fanout = role.phase == "research" ? (role.parallel == 0 ? research.researchers : role.parallel) : 0
                 return role.id + (fanout > 1 ? " ×\(fanout)" : "") + (role.agent.isEmpty ? "" : " @\(role.agent)")
             }
-            parts.append("roles: \(roles.isEmpty ? "none" : roles.joined(separator: ", "))")
+            parts.append(L("roles: %@", roles.isEmpty ? L("none") : roles.joined(separator: ", ")))
         }
-        return parts.joined(separator: " · ") + ". Web tools never exceed what review.external allows."
+        return parts.joined(separator: " · ") + ". " + L("Web tools never exceed what review.external allows.")
     }
 
     // MARK: - Profile
@@ -198,92 +236,93 @@ struct ResearchSettingsSection: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
-                        Text("Profile").font(.headline)
+                        Text(L("Profile")).font(.headline)
                         Text(profile?.name ?? "")
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.secondary)
                     }
-                    Text("Stored as \(profile?.path.isEmpty == false ? profile!.path : "playbooks/research/profiles/<name>.yaml") — edit here or in the file. The profile may pin its own pipeline.")
+                    Text(L("Stored as %@ — edit here or in the file. The profile may pin its own pipeline.",
+                           profile?.path.isEmpty == false ? profile!.path : "playbooks/research/profiles/<name>.yaml"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 12)
-                Button("Duplicate…") { duplicate() }
+                Button(L("Duplicate…")) { duplicate() }
                     .disabled(isWorking)
-                Button(profile?.builtin == true ? "Reset to built-in" : "Delete", role: .destructive) { remove() }
+                Button(profile?.builtin == true ? L("Reset to built-in") : L("Delete"), role: .destructive) { remove() }
                     .disabled(isWorking)
             }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
-                    FieldLabel("Title") {
-                        TextField("Shown in lists", text: bind(\.title))
+                    FieldLabel(L("Title")) {
+                        TextField(L("Shown in lists"), text: bind(\.title))
                     }
-                    FieldLabel("Description") {
-                        TextField("When to pick this profile", text: bind(\.description))
+                    FieldLabel(L("Description")) {
+                        TextField(L("When to pick this profile"), text: bind(\.description))
                     }
                     .gridCellColumns(2)
                 }
                 GridRow {
-                    FieldLabel("Pipeline override") {
-                        Picker("Pipeline override", selection: bind(\.pipeline)) {
-                            Text("Use the runner's pipeline").tag("")
-                            Text("Team").tag("team")
-                            Text("Native sub-agents").tag("native")
-                            Text("Single session").tag("single")
+                    FieldLabel(L("Pipeline override")) {
+                        Picker(L("Pipeline override"), selection: bind(\.pipeline)) {
+                            Text(L("Use the runner's pipeline")).tag("")
+                            Text(L("Team")).tag("team")
+                            Text(L("Native sub-agents")).tag("native")
+                            Text(L("Single session")).tag("single")
                         }
                         .labelsHidden()
                     }
-                    FieldLabel("Reasoning effort") {
-                        Picker("Reasoning effort", selection: bind(\.reasoning.effort)) {
-                            ForEach(Self.efforts, id: \.0) { Text($0.1).tag($0.0) }
+                    FieldLabel(L("Reasoning effort")) {
+                        Picker(L("Reasoning effort"), selection: bind(\.reasoning.effort)) {
+                            ForEach(Self.efforts, id: \.0) { Text(L($0.1)).tag($0.0) }
                         }
                         .labelsHidden()
                     }
-                    FieldLabel("Web access") {
-                        Picker("Web access", selection: bind(\.search.web)) {
-                            Text("Follow review.external").tag("inherit")
-                            Text("On for every job").tag("on")
-                            Text("Off").tag("off")
+                    FieldLabel(L("Web access")) {
+                        Picker(L("Web access"), selection: bind(\.search.web)) {
+                            Text(L("Follow review.external")).tag("inherit")
+                            Text(L("On for every job")).tag("on")
+                            Text(L("Off")).tag("off")
                         }
                         .labelsHidden()
                     }
                 }
                 GridRow {
-                    FieldLabel("Search freshness") {
-                        Picker("Search freshness", selection: bind(\.search.freshness)) {
-                            Text("Live web search").tag("live")
-                            Text("Cached search index (codex)").tag("cached")
+                    FieldLabel(L("Search freshness")) {
+                        Picker(L("Search freshness"), selection: bind(\.search.freshness)) {
+                            Text(L("Live web search")).tag("live")
+                            Text(L("Cached search index (codex)")).tag("cached")
                         }
                         .labelsHidden()
                     }
-                    FieldLabel("Search rounds per section") {
+                    FieldLabel(L("Search rounds per section")) {
                         TextField("3", value: bind(\.search.maxRounds), format: .number)
                     }
-                    FieldLabel("Sources per fact") {
+                    FieldLabel(L("Sources per fact")) {
                         TextField("1", value: bind(\.verification.minSourcesPerClaim), format: .number)
                     }
                 }
                 GridRow {
-                    FieldLabel("Conflicting sources") {
-                        Picker("Conflicting sources", selection: bind(\.verification.resolveConflicts)) {
-                            Text("Flag both sides as disputed").tag("flag")
-                            Text("Prefer the primary source").tag("prefer_primary")
-                            Text("Prefer the most recent").tag("prefer_recent")
+                    FieldLabel(L("Conflicting sources")) {
+                        Picker(L("Conflicting sources"), selection: bind(\.verification.resolveConflicts)) {
+                            Text(L("Flag both sides as disputed")).tag("flag")
+                            Text(L("Prefer the primary source")).tag("prefer_primary")
+                            Text(L("Prefer the most recent")).tag("prefer_recent")
                         }
                         .labelsHidden()
                     }
-                    FieldLabel("Max sections") {
+                    FieldLabel(L("Max sections")) {
                         TextField("8", value: bind(\.stop.maxSections), format: .number)
                     }
                 }
             }
             VStack(alignment: .leading, spacing: 6) {
-                Toggle("Prefer primary sources", isOn: bind(\.verification.preferPrimarySources))
-                Toggle("Stop a section when a search round adds nothing new", isOn: bind(\.stop.marginalGain))
-                Toggle("Cite a source on every fact", isOn: bind(\.output.citations))
-                Toggle("Mark uncertain claims as suspected", isOn: bind(\.output.uncertainty))
-                Toggle("Require an evidence table section", isOn: bind(\.output.evidenceTable))
+                Toggle(L("Prefer primary sources"), isOn: bind(\.verification.preferPrimarySources))
+                Toggle(L("Stop a section when a search round adds nothing new"), isOn: bind(\.stop.marginalGain))
+                Toggle(L("Cite a source on every fact"), isOn: bind(\.output.citations))
+                Toggle(L("Mark uncertain claims as suspected"), isOn: bind(\.output.uncertainty))
+                Toggle(L("Require an evidence table section"), isOn: bind(\.output.evidenceTable))
             }
             .toggleStyle(.checkbox)
         }
@@ -292,35 +331,104 @@ struct ResearchSettingsSection: View {
 
     // MARK: - Roles
 
+    private var roles: [ResearchRole] { profile?.roles ?? [] }
+
+    /// The tab that is open, kept valid as roles are added and removed.
+    private var selectedIndex: Int {
+        if let id = selectedRoleID, let index = roles.firstIndex(where: { $0.id == id }) { return index }
+        return roles.isEmpty ? 0 : 0
+    }
+
     private var rolesEditor: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Sub-agents").font(.headline)
-                    Text("One card per role. Each has its own CLI, model, effort, tools and prompt; turn a role off to skip its phase. Several roles may share a phase — review roles all run, research roles split the sections.")
+                    Text(L("Sub-agents")).font(.headline)
+                    Text(L("One card per role. Each has its own CLI, model, effort, tools and prompt; turn a role off to skip its phase. Several roles may share a phase — review roles all run, research roles split the sections."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 12)
-                Button("Add role") { addRole() }
+                Button(L("Add role")) { addRole() }
             }
-            if profile?.roles.isEmpty == true {
-                Text("No roles. The team pipeline needs at least a synthesize role; single-session mode ignores roles.")
+            if roles.isEmpty {
+                Text(L("No roles. The team pipeline needs at least a synthesize role; single-session mode ignores roles."))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .knodeCard()
-            }
-            ForEach(Array((profile?.roles ?? []).enumerated()), id: \.element.id) { index, role in
+            } else {
+                roleTabs
                 RoleCard(
-                    role: roleBinding(index),
+                    role: roleBinding(selectedIndex),
                     phaseDefaults: profile?.phaseDefaults ?? [:],
                     connections: connections,
+                    researchAgent: research.agent,
                     researchers: research.researchers,
                     reviewRounds: research.reviewRounds,
-                    remove: { removeRole(id: role.id) }
+                    loadModels: loadModels,
+                    remove: { removeRole(id: roles[selectedIndex].id) }
                 )
+                .id(roles[selectedIndex].id)
             }
+        }
+    }
+
+    /// One tab per role, so five sub-agents fit on a screen instead of five
+    /// full-height cards stacked down the page.
+    private var roleTabs: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Array(roles.enumerated()), id: \.element.id) { index, role in
+                    let selected = index == selectedIndex
+                    Button {
+                        selectedRoleID = role.id
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 5) {
+                                Circle()
+                                    .fill(role.enabled ? Color.knodeGood : Color.secondary.opacity(0.45))
+                                    .frame(width: 6, height: 6)
+                                Text(BuiltinNames.roleTitle(id: role.id, title: role.title))
+                                    .font(.callout.weight(selected ? .semibold : .regular))
+                                    .lineLimit(1)
+                            }
+                            Text(phaseLabel(role) + (role.enabled ? "" : " · \(L("off"))"))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(
+                            selected ? Color.knodeViolet.opacity(0.16) : Color.secondary.opacity(0.08),
+                            in: RoundedRectangle(cornerRadius: 9)
+                        )
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 9)
+                                .stroke(selected ? Color.knodeViolet.opacity(0.55) : Color.white.opacity(0.06))
+                        }
+                        .opacity(role.enabled ? 1 : 0.6)
+                    }
+                    .buttonStyle(.plain)
+                    .help(BuiltinNames.roleDescription(role.description))
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
+    /// The tab's second line: the phase, plus the fan-out that phase will use.
+    private func phaseLabel(_ role: ResearchRole) -> String {
+        switch role.phase {
+        case "research":
+            let fanout = role.parallel == 0 ? research.researchers : role.parallel
+            return fanout > 1 ? "research ×\(fanout)" : "research"
+        case "review", "revise":
+            let rounds = role.rounds == 0 ? research.reviewRounds : role.rounds
+            return rounds > 1 ? "\(role.phase) ×\(rounds)" : role.phase
+        default:
+            return role.phase
         }
     }
 
@@ -336,6 +444,7 @@ struct ResearchSettingsSection: View {
         draft.roles.append(ResearchRole(id: id, phase: "research", promptDefault: draft.phaseDefaults["research"] ?? ""))
         profile = draft
         dirty = true
+        selectedRoleID = id
     }
 
     private func removeRole(id: String) {
@@ -343,6 +452,7 @@ struct ResearchSettingsSection: View {
         draft.roles.removeAll { $0.id == id }
         profile = draft
         dirty = true
+        selectedRoleID = draft.roles.first?.id
     }
 
     private func roleBinding(_ index: Int) -> Binding<ResearchRole> {
@@ -378,13 +488,13 @@ struct AgentPicker: View {
     let inheritLabel: String
 
     var body: some View {
-        Picker("Agent", selection: $selection) {
+        Picker(L("Agent"), selection: $selection) {
             Text(inheritLabel).tag("")
             ForEach(cliConnections) { connection in
                 Text("\(connection.label) · \(providerName(connection.provider))").tag(connection.id)
             }
             ForEach(ResearchSettingsSection.cliProviders, id: \.self) { provider in
-                Text("\(providerName(provider)) · from PATH").tag(provider)
+                Text(L("%@ · from PATH", providerName(provider))).tag(provider)
             }
         }
         .labelsHidden()
@@ -402,8 +512,12 @@ private struct RoleCard: View {
     @Binding var role: ResearchRole
     let phaseDefaults: [String: String]
     let connections: [LLMConnection]
+    /// What an empty `role.agent` falls back to, so the model list is the one
+    /// this role will really be asking.
+    let researchAgent: String
     let researchers: Int
     let reviewRounds: Int
+    let loadModels: (String) async throws -> ModelListResponse
     let remove: () -> Void
 
     var body: some View {
@@ -411,9 +525,9 @@ private struct RoleCard: View {
             head
             grid
             VStack(alignment: .leading, spacing: 6) {
-                Toggle("Writes pages (knode_write / knode_commit)", isOn: $role.tools.write)
-                Toggle("Reads files (Read / Grep / Glob)", isOn: $role.tools.files)
-                Toggle("Native sub-agent (pipeline: native)", isOn: $role.native)
+                Toggle(L("Writes pages (knode_write / knode_commit)"), isOn: $role.tools.write)
+                Toggle(L("Reads files (Read / Grep / Glob)"), isOn: $role.tools.files)
+                Toggle(L("Native sub-agent (pipeline: native)"), isOn: $role.native)
             }
             .toggleStyle(.checkbox)
             prompt
@@ -422,71 +536,76 @@ private struct RoleCard: View {
         .opacity(role.enabled ? 1 : 0.55)
     }
 
+    private var effectiveAgent: String { role.agent.isEmpty ? researchAgent : role.agent }
+
     private var head: some View {
         HStack(spacing: 10) {
-            Toggle("On", isOn: $role.enabled)
+            Toggle(L("On"), isOn: $role.enabled)
                 .toggleStyle(.checkbox)
-            TextField("Role title", text: $role.title)
+            TextField(L("Role title"), text: $role.title)
                 .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: 240)
-            Text("\(role.id) · \(role.phase)\(role.native ? " · native" : "")")
+            Text("\(role.id) · \(role.phase)\(role.native ? " · \(L("native"))" : "")")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.tertiary)
             Spacer()
             Button(role: .destructive) { remove() } label: { Image(systemName: "trash") }
                 .buttonStyle(.borderless)
-                .help("Remove this role")
+                .help(L("Remove this role"))
         }
     }
 
     private var grid: some View {
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
             GridRow {
-                FieldLabel("Phase") {
-                    Picker("Phase", selection: phaseBinding) {
-                        ForEach(ResearchSettingsSection.phases, id: \.0) { Text($0.1).tag($0.0) }
+                FieldLabel(L("Phase")) {
+                    Picker(L("Phase"), selection: phaseBinding) {
+                        ForEach(ResearchSettingsSection.phases, id: \.0) { Text(L($0.1)).tag($0.0) }
                     }
                     .labelsHidden()
                 }
-                FieldLabel("Runs on") {
-                    AgentPicker(selection: $role.agent, connections: connections, inheritLabel: "The research agent above")
+                FieldLabel(L("Runs on")) {
+                    AgentPicker(selection: $role.agent, connections: connections, inheritLabel: L("The research agent above"))
                 }
-                FieldLabel("Model") {
-                    TextField("Agent's model", text: $role.model)
-                }
+                ModelField(
+                    placeholder: L("Agent's model"),
+                    text: $role.model,
+                    providerKey: effectiveAgent,
+                    load: { try await loadModels(effectiveAgent) }
+                )
             }
             GridRow {
-                FieldLabel("Effort") {
-                    Picker("Effort", selection: $role.effort) {
-                        Text("Profile default").tag("default")
-                        ForEach(ResearchSettingsSection.efforts.dropFirst(), id: \.0) { Text($0.1).tag($0.0) }
+                FieldLabel(L("Effort")) {
+                    Picker(L("Effort"), selection: $role.effort) {
+                        Text(L("Profile default")).tag("default")
+                        ForEach(ResearchSettingsSection.efforts.dropFirst(), id: \.0) { Text(L($0.1)).tag($0.0) }
                     }
                     .labelsHidden()
                 }
-                FieldLabel("Web tools") {
-                    Picker("Web tools", selection: $role.tools.web) {
-                        Text("Profile setting").tag("inherit")
-                        Text("On (within review.external)").tag("on")
-                        Text("Off").tag("off")
+                FieldLabel(L("Web tools")) {
+                    Picker(L("Web tools"), selection: $role.tools.web) {
+                        Text(L("Profile setting")).tag("inherit")
+                        Text(L("On (within review.external)")).tag("on")
+                        Text(L("Off")).tag("off")
                     }
                     .labelsHidden()
                 }
-                FieldLabel("Turns per session") {
-                    TextField("Default", value: $role.maxTurns, format: .number)
+                FieldLabel(L("Turns per session")) {
+                    TextField(L("Default"), value: $role.maxTurns, format: .number)
                 }
             }
             GridRow {
                 if role.phase == "research" {
-                    FieldLabel("Parallel sessions") {
+                    FieldLabel(L("Parallel sessions")) {
                         TextField("\(researchers)", value: $role.parallel, format: .number)
                     }
                 } else if role.phase == "review" || role.phase == "revise" {
-                    FieldLabel("Rounds") {
+                    FieldLabel(L("Rounds")) {
                         TextField("\(reviewRounds)", value: $role.rounds, format: .number)
                     }
                 }
-                FieldLabel("Description") {
-                    TextField("One line the orchestrator reads when picking this sub-agent", text: $role.description)
+                FieldLabel(L("Description")) {
+                    TextField(L("One line the orchestrator reads when picking this sub-agent"), text: $role.description)
                 }
                 .gridCellColumns(role.phase == "plan" || role.phase == "synthesize" ? 3 : 2)
             }
@@ -496,13 +615,13 @@ private struct RoleCard: View {
     private var prompt: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("Prompt").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Text("\(role.promptPath)\(role.promptIsDefault ? " · built-in" : "")")
+                Text(L("Prompt")).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Text("\(role.promptPath)\(role.promptIsDefault ? " · \(L("built-in"))" : "")")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                 Spacer()
-                Button("Reset to built-in") { resetPrompt() }
+                Button(L("Reset to built-in")) { resetPrompt() }
                     .buttonStyle(.borderless)
                     .disabled(role.promptIsDefault)
             }
@@ -512,6 +631,9 @@ private struct RoleCard: View {
                 .padding(6)
                 .background(Color(nsColor: .textBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
                 .overlay { RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)) }
+            Text(L("The prompt stays in the language it is written in — it is what the agent actually receives."))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
     }
 

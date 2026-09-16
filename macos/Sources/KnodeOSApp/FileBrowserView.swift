@@ -138,23 +138,23 @@ struct FileBrowserView: View {
             isPresented: Binding(get: { deleteTarget != nil }, set: { if !$0 { deleteTarget = nil } }),
             presenting: deleteTarget
         ) { target in
-            Button("Cancel", role: .cancel) {}
-            Button("Delete", role: .destructive) { Task { await delete(target) } }
+            Button(L("Cancel"), role: .cancel) {}
+            Button(L("Delete"), role: .destructive) { Task { await delete(target) } }
         } message: { target in
             Text(deleteMessage(target))
         }
         .alert("Delete \(checkedPaths.count) files?", isPresented: $showingBatchDelete) {
-            Button("Cancel", role: .cancel) {}
-            Button("Delete", role: .destructive) { Task { await batchDelete() } }
+            Button(L("Cancel"), role: .cancel) {}
+            Button(L("Delete"), role: .destructive) { Task { await batchDelete() } }
         } message: {
-            Text("This removes the selected files from the current workspace. The knowledge extracted from them is disposed; history stays queryable.")
+            Text(L("This removes the selected files from the current workspace. The knowledge extracted from them is disposed; history stays queryable."))
         }
     }
 
     private var defaultToolbar: some View {
         HStack(spacing: 6) {
             Button { Task { await loadTree() } } label: { Image(systemName: "arrow.clockwise") }
-                .help("Refresh — reread the workspace tree from disk")
+                .help(L("Refresh — reread the workspace tree from disk"))
                 .accessibilityLabel("Refresh files")
             // creating and uploading are the same intent — "put something in
             // this folder" — so they share one menu instead of two buttons
@@ -170,10 +170,10 @@ struct FileBrowserView: View {
             .menuStyle(.button)
             .menuIndicator(.hidden)
             .fixedSize()
-            .help("Add — a new file or folder, or documents uploaded from disk, into \(targetDirectory)/")
-            .accessibilityLabel("Add a file or folder")
+            .help(L("Add — a new file or folder, or documents uploaded from disk, into %@/", targetDirectory))
+            .accessibilityLabel(L("Add a file or folder"))
             Button { selectionMode = true } label: { Image(systemName: "checklist") }
-                .help("Select — tick several files to move or delete them in one go")
+                .help(L("Select — tick several files to move or delete them in one go"))
                 .accessibilityLabel("Select multiple files")
             Spacer(minLength: 4)
             Button { Task { await ingest() } } label: {
@@ -182,7 +182,7 @@ struct FileBrowserView: View {
             }
             .disabled(isWorking)
             .fixedSize()
-            .help("Index — turn new and changed files into knowledge: chunk, embed, extract entities and refresh the wiki. The CLI calls this `ingest` / `sync`.")
+            .help(L("Index — turn new and changed files into knowledge: chunk, embed, extract entities and refresh the wiki. The CLI calls this `ingest` / `sync`."))
         }
     }
 
@@ -192,14 +192,14 @@ struct FileBrowserView: View {
         HStack(spacing: 5) {
             Image(systemName: "folder.fill")
                 .foregroundStyle(Color.knodeViolet)
-            Text("New items →")
+            Text(L("New items →"))
             Text(targetDirectory.isEmpty ? "workspace root" : "\(targetDirectory)/")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.head)
             if !isWritable(targetDirectory) {
-                Text("read-only")
+                Text(L("read-only"))
                     .padding(.horizontal, 4)
                     .padding(.vertical, 1)
                     .background(Color.orange.opacity(0.18), in: Capsule())
@@ -209,19 +209,19 @@ struct FileBrowserView: View {
             if selectedDirectory != nil {
                 Button { selectedDirectory = nil } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.plain)
-                    .help("Clear the picked folder — new items follow the open file again")
+                    .help(L("Clear the picked folder — new items follow the open file again"))
             }
         }
         .font(.system(size: 10))
         .foregroundStyle(.secondary)
         .padding(.horizontal, 12)
         .padding(.bottom, 9)
-        .help("Click a folder in the tree to send new files, new folders and uploads there")
+        .help(L("Click a folder in the tree to send new files, new folders and uploads there"))
     }
 
     private var selectionToolbar: some View {
         HStack(spacing: 7) {
-            Text("\(checkedPaths.count) selected")
+            Text(L("%@ selected", String(checkedPaths.count)))
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
             if isWorking { ProgressView().controlSize(.small) }
@@ -230,13 +230,13 @@ struct FileBrowserView: View {
                 Label("Move", systemImage: "folder")
             }
             .disabled(checkedPaths.isEmpty || isWorking)
-            .help("Move every selected file into another folder")
+            .help(L("Move every selected file into another folder"))
             Button(role: .destructive) { showingBatchDelete = true } label: {
                 Label("Delete", systemImage: "trash")
             }
             .disabled(checkedPaths.isEmpty || isWorking)
-            .help("Delete every selected file")
-            Button("Done") {
+            .help(L("Delete every selected file"))
+            Button(L("Done")) {
                 selectionMode = false
                 checkedPaths.removeAll()
             }
@@ -289,7 +289,7 @@ struct FileBrowserView: View {
                     if targeted { model.showToast("Drop files or folders to upload into \(uploadTarget)") }
                 }
             } else {
-                EmptyState(symbol: "folder", title: "No files", message: "Connect to the local service or initialize a workspace.")
+                EmptyState(symbol: "folder", title: L("No files"), message: L("Connect to the local service or initialize a workspace."))
             }
         }
         .background(.ultraThinMaterial)
@@ -316,7 +316,7 @@ struct FileBrowserView: View {
                     if isWorking { ProgressView().controlSize(.small) }
                     Button(isEditing ? "Preview" : "Edit") { isEditing.toggle() }
                         .disabled(!isWritable(selectedPath) || isWorking || !isEditable)
-                    Button("Save") { Task { await save() } }
+                    Button(L("Save")) { Task { await save() } }
                         .buttonStyle(.borderedProminent)
                         .tint(.knodeCyan)
                         .disabled(!isEditing || isWorking || !isEditable)
@@ -341,7 +341,7 @@ struct FileBrowserView: View {
                             .foregroundStyle(.secondary)
                         Spacer(minLength: 0)
                         if canLoadFullFile {
-                            Button("Load full file") { Task { await loadFullFile() } }
+                            Button(L("Load full file")) { Task { await loadFullFile() } }
                                 .controlSize(.small)
                                 .disabled(isWorking)
                         }
@@ -380,8 +380,8 @@ struct FileBrowserView: View {
         } else {
             EmptyState(
                 symbol: "doc.text.magnifyingglass",
-                title: "Select a file",
-                message: "Browse the workspace tree, or drag documents and folders onto it to upload and index them."
+                title: L("Select a file"),
+                message: L("Browse the workspace tree, or drag documents and folders onto it to upload and index them.")
             )
         }
     }
@@ -389,9 +389,9 @@ struct FileBrowserView: View {
     private var newFileSheet: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 5) {
-                Eyebrow(text: "Workspace file")
-                Text("Create a new note").font(.title2.bold())
-                Text("Writable paths must live under wiki/ or raw/docs/.")
+                Eyebrow(text: L("Workspace file"))
+                Text(L("Create a new note")).font(.title2.bold())
+                Text(L("Writable paths must live under wiki/ or raw/docs/."))
                     .foregroundStyle(.secondary)
             }
             TextField("wiki/concepts/new-note.md", text: $newFilePath)
@@ -400,8 +400,8 @@ struct FileBrowserView: View {
             pathNote(newFilePath, noun: "files")
             HStack {
                 Spacer()
-                Button("Cancel") { activeSheet = nil }
-                Button("Create") { Task { await createFile() } }
+                Button(L("Cancel")) { activeSheet = nil }
+                Button(L("Create")) { Task { await createFile() } }
                     .buttonStyle(.borderedProminent)
                     .tint(.knodeCyan)
                     .keyboardShortcut(.defaultAction)
@@ -415,9 +415,9 @@ struct FileBrowserView: View {
     private var newFolderSheet: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 5) {
-                Eyebrow(text: "Workspace folder")
-                Text("Create a new folder").font(.title2.bold())
-                Text("Writable paths must live under wiki/ or raw/docs/. Intermediate folders are created too.")
+                Eyebrow(text: L("Workspace folder"))
+                Text(L("Create a new folder")).font(.title2.bold())
+                Text(L("Writable paths must live under wiki/ or raw/docs/. Intermediate folders are created too."))
                     .foregroundStyle(.secondary)
             }
             TextField("wiki/concepts/pricing", text: $newFolderPath)
@@ -426,8 +426,8 @@ struct FileBrowserView: View {
             pathNote(newFolderPath, noun: "folders")
             HStack {
                 Spacer()
-                Button("Cancel") { activeSheet = nil }
-                Button("Create") { Task { await createFolder() } }
+                Button(L("Cancel")) { activeSheet = nil }
+                Button(L("Create")) { Task { await createFolder() } }
                     .buttonStyle(.borderedProminent)
                     .tint(.knodeCyan)
                     .keyboardShortcut(.defaultAction)
@@ -444,7 +444,7 @@ struct FileBrowserView: View {
         return VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 5) {
                 Eyebrow(text: isDirectory ? "Workspace folder" : "Workspace file")
-                Text("Rename").font(.title2.bold())
+                Text(L("Rename")).font(.title2.bold())
                 Text(isDirectory
                      ? "Everything inside the folder moves with it. A path is a document's identity in the graph, so the subtree is re-indexed right after."
                      : "A path is the document's identity in the graph, so the file is re-indexed right after.")
@@ -461,8 +461,8 @@ struct FileBrowserView: View {
                 .truncationMode(.head)
             HStack {
                 Spacer()
-                Button("Cancel") { activeSheet = nil }
-                Button("Rename") { Task { await moveSubtree(from: path, to: target) } }
+                Button(L("Cancel")) { activeSheet = nil }
+                Button(L("Rename")) { Task { await moveSubtree(from: path, to: target) } }
                     .buttonStyle(.borderedProminent)
                     .tint(.knodeCyan)
                     .keyboardShortcut(.defaultAction)
@@ -480,11 +480,11 @@ struct FileBrowserView: View {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         if isWritable(trimmed) {
             let parent = parentDirectory(of: trimmed)
-            Label("Lands in \(parent.isEmpty ? "the workspace root" : parent + "/")", systemImage: "arrow.turn.down.right")
+            Label(L("Lands in %@", parent.isEmpty ? L("the workspace root") : parent + "/"), systemImage: "arrow.turn.down.right")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         } else {
-            Label("Only wiki/ and raw/docs/ take new \(noun) — edit the path above", systemImage: "exclamationmark.triangle.fill")
+            Label(L("Only wiki/ and raw/docs/ take new %@ — edit the path above", noun), systemImage: "exclamationmark.triangle.fill")
                 .font(.system(size: 11))
                 .foregroundStyle(.orange)
         }
@@ -522,7 +522,7 @@ struct FileBrowserView: View {
                 .font(.system(size: 12, design: .monospaced))
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Existing folders")
+                Text(L("Existing folders"))
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
                 ScrollView {
@@ -559,12 +559,12 @@ struct FileBrowserView: View {
 
             HStack {
                 if !destinationExists && isWritable(trimmedDestination) {
-                    Label("Creates \(trimmedDestination)/", systemImage: "folder.badge.plus")
+                    Label(L("Creates %@/", trimmedDestination), systemImage: "folder.badge.plus")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Cancel") { activeSheet = nil }
+                Button(L("Cancel")) { activeSheet = nil }
                 Button(purpose.isMove ? "Move" : "Choose…") { confirmDestination(purpose) }
                     .buttonStyle(.borderedProminent)
                     .tint(.knodeCyan)
@@ -1376,37 +1376,37 @@ private struct FileTreeNodeView: View {
     @ViewBuilder
     private var directoryMenu: some View {
         if node.isWritable {
-            Button("New file here…") { perform(.newFile, node) }
-            Button("New folder here…") { perform(.newFolder, node) }
+            Button(L("New file here…")) { perform(.newFile, node) }
+            Button(L("New folder here…")) { perform(.newFolder, node) }
             Divider()
-            Button("Upload files here…") { perform(.uploadFiles, node) }
-            Button("Upload folder here…") { perform(.uploadFolder, node) }
+            Button(L("Upload files here…")) { perform(.uploadFiles, node) }
+            Button(L("Upload folder here…")) { perform(.uploadFolder, node) }
             Divider()
         }
         let writable = node.writableFilePaths
-        Button("Select \(writable.count) file\(writable.count == 1 ? "" : "s") here") { perform(.select, node) }
+        Button(writable.count == 1 ? L("Select 1 file here") : L("Select %@ files here", String(writable.count))) { perform(.select, node) }
             .disabled(writable.isEmpty)
-        Button("Copy path") { perform(.copyPath, node) }
+        Button(L("Copy path")) { perform(.copyPath, node) }
         if node.isMovable {
             Divider()
-            Button("Rename folder…") { perform(.rename, node) }
-            Button("Move folder to…") { perform(.move, node) }
-            Button("Delete folder…", role: .destructive) { perform(.delete, node) }
+            Button(L("Rename folder…")) { perform(.rename, node) }
+            Button(L("Move folder to…")) { perform(.move, node) }
+            Button(L("Delete folder…"), role: .destructive) { perform(.delete, node) }
         }
     }
 
     @ViewBuilder
     private var fileMenu: some View {
-        Button("Open") { openFile(node.path) }
-        Button("Select this file") { perform(.select, node) }
+        Button(L("Open")) { openFile(node.path) }
+        Button(L("Select this file")) { perform(.select, node) }
             .disabled(!node.isWritable || isChecked)
-        Button("Copy path") { perform(.copyPath, node) }
+        Button(L("Copy path")) { perform(.copyPath, node) }
         if node.isMovable {
             Divider()
-            Button("Rename…") { perform(.rename, node) }
-            Button("Move to…") { perform(.move, node) }
+            Button(L("Rename…")) { perform(.rename, node) }
+            Button(L("Move to…")) { perform(.move, node) }
             Divider()
-            Button("Delete…", role: .destructive) { perform(.delete, node) }
+            Button(L("Delete…"), role: .destructive) { perform(.delete, node) }
         }
     }
 

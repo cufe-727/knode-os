@@ -109,10 +109,10 @@ private struct MainWorkspaceView: View {
         ToolbarItemGroup(placement: .primaryAction) {
             if let stats = model.stats {
                 HStack(spacing: 9) {
-                    MetricPill(value: stats.documents, label: "docs")
-                    MetricPill(value: stats.chunks, label: "chunks")
-                    MetricPill(value: stats.entities, label: "entities")
-                    MetricPill(value: stats.relations, label: "rels")
+                    MetricPill(value: stats.documents, label: L("docs"))
+                    MetricPill(value: stats.chunks, label: L("chunks"))
+                    MetricPill(value: stats.entities, label: L("entities"))
+                    MetricPill(value: stats.relations, label: L("rels"))
                 }
                 .padding(.horizontal, 9)
                 .padding(.vertical, 6)
@@ -218,8 +218,8 @@ private struct ConnectionPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 3) {
-                Text("Knode service").font(.headline)
-                Text("The app starts its bundled local service automatically. Enter another URL only when connecting to an externally managed service.")
+                Text(L("Knode service")).font(.headline)
+                Text(L("The app starts its bundled local service automatically. Enter another URL only when connecting to an externally managed service."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -229,7 +229,7 @@ private struct ConnectionPanel: View {
                 switch model.connectionState {
                 case .checking:
                     ProgressView().controlSize(.small)
-                    Text("Checking…")
+                    Text(L("Checking…"))
                 case .connected(let root):
                     Label("Connected", systemImage: "checkmark.circle.fill").foregroundStyle(Color.knodeGood)
                     if let root { Text(root).lineLimit(1).help(root).foregroundStyle(.secondary) }
@@ -243,7 +243,7 @@ private struct ConnectionPanel: View {
             .font(.caption)
             HStack {
                 Spacer()
-                Button("Connect") { model.applyServerURL() }
+                Button(L("Connect")) { model.applyServerURL() }
                     .buttonStyle(.borderedProminent)
                     .tint(.knodeCyan)
             }
@@ -278,7 +278,7 @@ private struct WorkspaceMenu: View {
                     Text(model.activeWorkspace?.displayName ?? "Default")
                         .font(.callout.weight(.semibold))
                         .lineLimit(1)
-                    Text("Workspace")
+                    Text(L("Workspace"))
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
@@ -298,18 +298,18 @@ private struct WorkspaceMenu: View {
         .sheet(isPresented: $showingCreateWorkspace) {
             VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Eyebrow(text: "New context")
-                    Text("Create a workspace").font(.title.bold())
-                    Text("Each workspace has its own complete directory tree, index, graph, and model settings.")
+                    Eyebrow(text: L("New context"))
+                    Text(L("Create a workspace")).font(.title.bold())
+                    Text(L("Each workspace has its own complete directory tree, index, graph, and model settings."))
                         .foregroundStyle(.secondary)
                 }
-                TextField("e.g. Product research", text: $workspaceName)
+                TextField(L("e.g. Product research"), text: $workspaceName)
                     .textFieldStyle(.roundedBorder)
                 if !createError.isEmpty { Text(createError).foregroundStyle(Color.knodeBad) }
                 HStack {
                     Spacer()
-                    Button("Cancel") { showingCreateWorkspace = false }
-                    Button("Create workspace") {
+                    Button(L("Cancel")) { showingCreateWorkspace = false }
+                    Button(L("Create workspace")) {
                         isCreating = true
                         Task {
                             do {
@@ -335,18 +335,18 @@ private struct WorkspaceMenu: View {
         .sheet(isPresented: $showingJoinTeam) {
             VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Eyebrow(text: "Shared context", color: .knodeViolet)
-                    Text("Join a Team").font(.title.bold())
-                    Text("Enter an invite code to create or open an isolated Team workspace.")
+                    Eyebrow(text: L("Shared context"), color: .knodeViolet)
+                    Text(L("Join a Team")).font(.title.bold())
+                    Text(L("Enter an invite code to create or open an isolated Team workspace."))
                         .foregroundStyle(.secondary)
                 }
-                TextField("e.g. KNODE-LABS", text: $teamCode)
+                TextField(L("e.g. KNODE-LABS"), text: $teamCode)
                     .textFieldStyle(.roundedBorder)
                 if !joinError.isEmpty { Text(joinError).foregroundStyle(Color.knodeBad) }
                 HStack {
                     Spacer()
-                    Button("Cancel") { showingJoinTeam = false }
-                    Button("Join Team") {
+                    Button(L("Cancel")) { showingJoinTeam = false }
+                    Button(L("Join Team")) {
                         joinError = model.joinTeam(code: teamCode) ?? ""
                         if joinError.isEmpty { showingJoinTeam = false }
                     }
@@ -362,7 +362,7 @@ private struct WorkspaceMenu: View {
 
     private var workspacePicker: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("WORKSPACES")
+            Text(L("WORKSPACES"))
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
                 .tracking(1.1)
                 .foregroundStyle(.secondary)

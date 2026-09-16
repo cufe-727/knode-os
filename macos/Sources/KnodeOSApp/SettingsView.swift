@@ -41,7 +41,7 @@ struct SettingsView: View {
                     }
                     workspaceDangerSection
                 } else {
-                    EmptyState(symbol: "slider.horizontal.3", title: "Could not load settings", message: "The local service is unavailable. Retry to start it and reload this workspace's routes.", actionTitle: "Retry", action: { Task { await retry() } })
+                    EmptyState(symbol: "slider.horizontal.3", title: L("Could not load settings"), message: L("The local service is unavailable. Retry to start it and reload this workspace's routes."), actionTitle: L("Retry"), action: { Task { await retry() } })
                 }
             }
             .padding(28)
@@ -56,43 +56,43 @@ struct SettingsView: View {
             }
         }
         .confirmationDialog(
-            "Clear \(model.activeWorkspace?.displayName ?? "this workspace")?",
+            L("Clear %@?", model.activeWorkspace?.displayName ?? L("this workspace")),
             isPresented: $showingClearConfirmation,
             titleVisibility: .visible
         ) {
-            Button("Clear workspace", role: .destructive) { Task { await clearWorkspace() } }
-            Button("Cancel", role: .cancel) {}
+            Button(L("Clear workspace"), role: .destructive) { Task { await clearWorkspace() } }
+            Button(L("Cancel"), role: .cancel) {}
         } message: {
-            Text("This permanently deletes every file, index, graph, trace, suggestion, and model setting in the workspace. The empty workspace itself remains available.")
+            Text(L("This permanently deletes every file, index, graph, trace, suggestion, and model setting in the workspace. The empty workspace itself remains available."))
         }
         .confirmationDialog(
-            "Discard unsaved changes to \(profileDraft?.name ?? "this profile")?",
+            L("Discard unsaved changes to %@?", profileDraft?.name ?? L("this profile")),
             isPresented: Binding(get: { pendingProfile != nil }, set: { if !$0 { pendingProfile = nil } }),
             titleVisibility: .visible
         ) {
-            Button("Discard and switch", role: .destructive) {
+            Button(L("Discard and switch"), role: .destructive) {
                 guard let name = pendingProfile else { return }
                 pendingProfile = nil
                 config?.research.profile = name
                 Task { await loadProfileDetail(name) }
             }
-            Button("Keep editing", role: .cancel) { pendingProfile = nil }
+            Button(L("Keep editing"), role: .cancel) { pendingProfile = nil }
         }
         .confirmationDialog(
             profileDraft?.builtin == true
-                ? "Reset \(profileDraft?.name ?? "") to the built-in defaults?"
-                : "Delete profile \(profileDraft?.name ?? "")?",
+                ? L("Reset %@ to the built-in defaults?", profileDraft?.name ?? "")
+                : L("Delete profile %@?", profileDraft?.name ?? ""),
             isPresented: $showingProfileDelete,
             titleVisibility: .visible
         ) {
-            Button(profileDraft?.builtin == true ? "Reset" : "Delete", role: .destructive) {
+            Button(profileDraft?.builtin == true ? L("Reset") : L("Delete"), role: .destructive) {
                 Task { await deleteProfile() }
             }
-            Button("Cancel", role: .cancel) {}
+            Button(L("Cancel"), role: .cancel) {}
         } message: {
             Text(profileDraft?.builtin == true
-                ? "Its file goes back to the built-in profile, including every role prompt."
-                : "The profile file and the roles defined in it are removed.")
+                ? L("Its file goes back to the built-in profile, including every role prompt.")
+                : L("The profile file and the roles defined in it are removed."))
         }
         .sheet(isPresented: $showingDuplicate) { duplicateSheet }
     }
@@ -100,17 +100,23 @@ struct SettingsView: View {
     private var hero: some View {
         HStack(alignment: .bottom, spacing: 24) {
             VStack(alignment: .leading, spacing: 8) {
-                Eyebrow(text: "Model routing")
-                Text("Give each knowledge job the right model.")
+                Eyebrow(text: L("Model routing"))
+                Text(L("Give each knowledge job the right model."))
                     .font(.system(size: 34, weight: .bold))
                     .tracking(-0.8)
-                Text("Configure each provider once for \(model.activeWorkspace?.displayName ?? "this workspace"), then point every pipeline stage at one of them. Test stages sends one real request per configured stage before you save.")
+                Text(L("Configure each provider once for %@, then point every pipeline stage at one of them. Test stages sends one real request per configured stage before you save.", model.activeWorkspace?.displayName ?? L("this workspace")))
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Test stages") { Task { await test() } }
+            Picker(L("Language"), selection: $model.language) {
+                ForEach(AppLanguage.allCases) { Text($0.label).tag($0) }
+            }
+            .labelsHidden()
+            .frame(width: 148)
+            .help(L("Interface language — prompts and pages keep the language they are written in"))
+            Button(L("Test stages")) { Task { await test() } }
                 .disabled(config == nil || isWorking)
-            Button("Save & apply") { Task { await save() } }
+            Button(L("Save & apply")) { Task { await save() } }
                 .buttonStyle(.borderedProminent)
                 .tint(.knodeCyan)
                 .disabled(config == nil || isWorking)
@@ -121,15 +127,15 @@ struct SettingsView: View {
     /// The pipeline at a glance, in the order a document actually moves through it.
     private var pipelineSummary: some View {
         HStack(spacing: 0) {
-            SummaryRoute(label: "Convert", value: routeSummary(\.extraction.documentLlm), detail: "Images & scanned PDFs", color: .knodeViolet)
+            SummaryRoute(label: L("Convert"), value: routeSummary(\.extraction.documentLlm), detail: L("Images & scanned PDFs"), color: .knodeViolet)
             Divider().frame(height: 54)
-            SummaryRoute(label: "Index", value: embeddingSummary, detail: "Embedding", color: .knodeCyan)
+            SummaryRoute(label: L("Index"), value: embeddingSummary, detail: L("Embedding"), color: .knodeCyan)
             Divider().frame(height: 54)
-            SummaryRoute(label: "Extract", value: routeSummary(\.extraction.entityLlm), detail: "Entities & relations", color: .knodeViolet)
+            SummaryRoute(label: L("Extract"), value: routeSummary(\.extraction.entityLlm), detail: L("Entities & relations"), color: .knodeViolet)
             Divider().frame(height: 54)
-            SummaryRoute(label: "Synthesize", value: routeSummary(\.extraction.conceptLlm), detail: "Concept pages", color: .knodeViolet)
+            SummaryRoute(label: L("Synthesize"), value: routeSummary(\.extraction.conceptLlm), detail: L("Concept pages"), color: .knodeViolet)
             Divider().frame(height: 54)
-            SummaryRoute(label: "Answer", value: defaultModelSummary, detail: "Ask, Wiki & Dream", color: .knodeViolet)
+            SummaryRoute(label: L("Answer"), value: defaultModelSummary, detail: L("Ask, Wiki & Dream"), color: .knodeViolet)
         }
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
         .overlay { RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.08)) }
@@ -141,10 +147,10 @@ struct SettingsView: View {
     private var providersSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             sectionHeader(
-                index: "01 · Providers",
-                title: "Endpoints and credentials",
-                detail: "Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice.",
-                badge: "Configure once",
+                index: L("01 · Providers"),
+                title: L("Endpoints and credentials"),
+                detail: L("Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice."),
+                badge: L("Configure once"),
                 color: .knodeCyan
             )
             embeddingCard
@@ -156,18 +162,18 @@ struct SettingsView: View {
     private var embeddingCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             cardHeader(
-                title: "Embedding provider",
-                detail: "One per workspace — the Index stage always uses it.",
-                badge: "Required",
+                title: L("Embedding provider"),
+                detail: L("One per workspace — the Index stage always uses it."),
+                badge: L("Required"),
                 color: .knodeCyan
             )
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
-                    FieldLabel("Provider") {
-                        Picker("Provider", selection: binding(\.embedding.provider)) {
-                            Text("Local hashing · offline").tag("local")
-                            Text("OpenAI-compatible API").tag("openai")
-                            Text("Volcengine Ark · multimodal").tag("ark-multimodal")
+                    FieldLabel(L("Provider")) {
+                        Picker(L("Provider"), selection: binding(\.embedding.provider)) {
+                            Text(L("Local hashing · offline")).tag("local")
+                            Text(L("OpenAI-compatible API")).tag("openai")
+                            Text(L("Volcengine Ark · multimodal")).tag("ark-multimodal")
                         }
                         .labelsHidden()
                     }
@@ -180,20 +186,20 @@ struct SettingsView: View {
                     )
                 }
                 GridRow {
-                    FieldLabel("Base URL") {
+                    FieldLabel(L("Base URL")) {
                         TextField("https://api.openai.com/v1", text: binding(\.embedding.baseUrl))
                             .disabled(config?.embedding.provider == "local")
                     }
-                    FieldLabel("API key") {
+                    FieldLabel(L("API key")) {
                         SecureField("env:OPENAI_API_KEY", text: binding(\.embedding.apiKey))
                             .disabled(config?.embedding.provider == "local")
                     }
                 }
                 GridRow {
-                    FieldLabel("Dimensions") {
-                        TextField("Dimensions", value: binding(\.embedding.dimensions), format: .number)
+                    FieldLabel(L("Dimensions")) {
+                        TextField(L("Dimensions"), value: binding(\.embedding.dimensions), format: .number)
                     }
-                    Toggle("Send dimensions with API requests", isOn: binding(\.embedding.sendDimensions))
+                    Toggle(L("Send dimensions with API requests"), isOn: binding(\.embedding.sendDimensions))
                         .toggleStyle(.checkbox)
                         .disabled(config?.embedding.provider == "local")
                 }
@@ -208,19 +214,19 @@ struct SettingsView: View {
     private var defaultProviderCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             cardHeader(
-                title: "Default LLM provider",
-                detail: "What a stage runs on unless it picks another connection, and what answers Ask, Wiki and Dream.",
-                badge: "Default",
+                title: L("Default LLM provider"),
+                detail: L("What a stage runs on unless it picks another connection, and what answers Ask, Wiki and Dream."),
+                badge: L("Default"),
                 color: .knodeViolet
             )
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
-                    FieldLabel("Provider") {
-                        Picker("Provider", selection: binding(\.llm.provider)) {
-                            Text("OpenAI-compatible API").tag("openai")
-                            Text("Codex CLI").tag("codex-cli")
-                            Text("Claude Code CLI").tag("claude-cli")
-                            Text("Cursor Agent CLI").tag("cursor-cli")
+                    FieldLabel(L("Provider")) {
+                        Picker(L("Provider"), selection: binding(\.llm.provider)) {
+                            Text(L("OpenAI-compatible API")).tag("openai")
+                            Text(L("Codex CLI")).tag("codex-cli")
+                            Text(L("Claude Code CLI")).tag("claude-cli")
+                            Text(L("Cursor Agent CLI")).tag("cursor-cli")
                         }
                         .labelsHidden()
                     }
@@ -233,8 +239,8 @@ struct SettingsView: View {
                 }
                 if config?.llm.provider == "openai" {
                     GridRow {
-                        FieldLabel("Base URL") { TextField("https://api.openai.com/v1", text: binding(\.llm.baseUrl)) }
-                        FieldLabel("API key") { SecureField("env:OPENAI_API_KEY", text: binding(\.llm.apiKey)) }
+                        FieldLabel(L("Base URL")) { TextField("https://api.openai.com/v1", text: binding(\.llm.baseUrl)) }
+                        FieldLabel(L("API key")) { SecureField("env:OPENAI_API_KEY", text: binding(\.llm.apiKey)) }
                     }
                 } else {
                     GridRow {
@@ -255,8 +261,8 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Other connections").font(.headline)
-                    Text("Add one when a stage needs a different endpoint — a vision-capable API, a cheaper model, a second key.")
+                    Text(L("Other connections")).font(.headline)
+                    Text(L("Add one when a stage needs a different endpoint — a vision-capable API, a cheaper model, a second key."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -283,19 +289,19 @@ struct SettingsView: View {
     private var pipelineSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             sectionHeader(
-                index: "02 · Pipeline",
-                title: "What each stage needs",
-                detail: "A document moves down this list. The stages ask different things of a model, which is why each one can run somewhere else.",
-                badge: "Per stage",
+                index: L("02 · Pipeline"),
+                title: L("What each stage needs"),
+                detail: L("A document moves down this list. The stages ask different things of a model, which is why each one can run somewhere else."),
+                badge: L("Per stage"),
                 color: .knodeViolet
             )
             VStack(spacing: 0) {
                 StageRow(
                     step: 1,
-                    title: "Convert",
-                    detail: "Images and scanned PDF pages become searchable Markdown.",
-                    requirement: "Vision",
-                    requirementDetail: "The model has to see pixels: an API provider gets the image inline, codex takes --image, and claude and cursor read the file with their own tools. A text-only model fails here. Changing this re-converts every image and scanned page.",
+                    title: L("Convert"),
+                    detail: L("Images and scanned PDF pages become searchable Markdown."),
+                    requirement: L("Vision"),
+                    requirementDetail: L("The model has to see pixels: an API provider gets the image inline, codex takes --image, and claude and cursor read the file with their own tools. A text-only model fails here. Changing this re-converts every image and scanned page."),
                     color: .knodeViolet
                 ) {
                     StagePicker(
@@ -308,21 +314,21 @@ struct SettingsView: View {
                 Divider()
                 StageRow(
                     step: 2,
-                    title: "Index",
-                    detail: "Every chunk becomes a vector for semantic and hybrid recall.",
-                    requirement: "Embedding",
-                    requirementDetail: "Not an LLM — it uses the embedding provider from section 01, one per workspace. Changing its model or dimensions re-embeds the whole corpus.",
+                    title: L("Index"),
+                    detail: L("Every chunk becomes a vector for semantic and hybrid recall."),
+                    requirement: L("Embedding"),
+                    requirementDetail: L("Not an LLM — it uses the embedding provider from section 01, one per workspace. Changing its model or dimensions re-embeds the whole corpus."),
                     color: .knodeCyan
                 ) {
-                    StagePin(value: embeddingSummary, hint: "Set in section 01 · Embedding provider")
+                    StagePin(value: embeddingSummary, hint: L("Set in section 01 · Embedding provider"))
                 }
                 Divider()
                 StageRow(
                     step: 3,
-                    title: "Extract",
-                    detail: "Names entities, relations and factual claims in changed documents.",
-                    requirement: "Volume",
-                    requirementDetail: "The busiest stage — it runs on every changed document, bounded by the daily budget and batch size below. A fast, cheap model that returns clean JSON is usually the right trade.",
+                    title: L("Extract"),
+                    detail: L("Names entities, relations and factual claims in changed documents."),
+                    requirement: L("Volume"),
+                    requirementDetail: L("The busiest stage — it runs on every changed document, bounded by the daily budget and batch size below. A fast, cheap model that returns clean JSON is usually the right trade."),
                     color: .knodeViolet
                 ) {
                     StagePicker(
@@ -335,10 +341,10 @@ struct SettingsView: View {
                 Divider()
                 StageRow(
                     step: 4,
-                    title: "Synthesize",
-                    detail: "Turns hot entity clusters into readable, linked Concept pages.",
-                    requirement: "Quality",
-                    requirementDetail: "Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.",
+                    title: L("Synthesize"),
+                    detail: L("Turns hot entity clusters into readable, linked Concept pages."),
+                    requirement: L("Quality"),
+                    requirementDetail: L("Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here."),
                     color: .knodeViolet
                 ) {
                     StagePicker(
@@ -351,13 +357,13 @@ struct SettingsView: View {
                 Divider()
                 StageRow(
                     step: 5,
-                    title: "Answer",
-                    detail: "Ask, wiki summaries and the nightly Dream analysis.",
-                    requirement: "Interactive",
-                    requirementDetail: "Always the default provider. Latency lands straight in the Ask box, so prefer something responsive.",
+                    title: L("Answer"),
+                    detail: L("Ask, wiki summaries and the nightly Dream analysis."),
+                    requirement: L("Interactive"),
+                    requirementDetail: L("Always the default provider. Latency lands straight in the Ask box, so prefer something responsive."),
                     color: .knodeViolet
                 ) {
-                    StagePin(value: defaultModelSummary, hint: "Set in section 01 · Default LLM provider")
+                    StagePin(value: defaultModelSummary, hint: L("Set in section 01 · Default LLM provider"))
                 }
             }
             .knodeCard(padding: 0)
@@ -368,25 +374,25 @@ struct SettingsView: View {
     private var pipelineControls: some View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text("Pipeline controls").font(.headline)
-                Text("Bound background work without changing the selected models.")
+                Text(L("Pipeline controls")).font(.headline)
+                Text(L("Bound background work without changing the selected models."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
                 GridRow {
-                    FieldLabel("Daily token budget") {
-                        TextField("Budget", value: binding(\.extraction.dailyTokenBudget), format: .number)
+                    FieldLabel(L("Daily token budget")) {
+                        TextField(L("Budget"), value: binding(\.extraction.dailyTokenBudget), format: .number)
                     }
-                    FieldLabel("Documents per pass") {
-                        TextField("Batch", value: binding(\.extraction.batchSize), format: .number)
+                    FieldLabel(L("Documents per pass")) {
+                        TextField(L("Batch"), value: binding(\.extraction.batchSize), format: .number)
                     }
-                    FieldLabel("Parallel calls") {
-                        TextField("Concurrency", value: binding(\.extraction.concurrency), format: .number)
+                    FieldLabel(L("Parallel calls")) {
+                        TextField(L("Concurrency"), value: binding(\.extraction.concurrency), format: .number)
                     }
                 }
             }
-            Toggle("Extract factual claims alongside entities", isOn: binding(\.extraction.claims))
+            Toggle(L("Extract factual claims alongside entities"), isOn: binding(\.extraction.claims))
                 .toggleStyle(.checkbox)
         }
         .knodeCard(padding: 18)
@@ -409,6 +415,7 @@ struct SettingsView: View {
                 connections: config?.connections ?? [],
                 defaultProvider: config?.llm.provider ?? "",
                 isWorking: isWorking,
+                loadModels: { agent in try await researchModelList(agent: agent) },
                 duplicate: {
                     duplicateName = "\(profileDraft?.name ?? "profile")-copy"
                     showingDuplicate = true
@@ -420,20 +427,20 @@ struct SettingsView: View {
 
     private var duplicateSheet: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Duplicate profile").font(.headline)
-            Text("The copy starts from what is on screen, including unsaved edits. Select it above and save to make it the active profile.")
+            Text(L("Duplicate profile")).font(.headline)
+            Text(L("The copy starts from what is on screen, including unsaved edits. Select it above and save to make it the active profile."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             TextField("new-profile", text: $duplicateName)
                 .textFieldStyle(.roundedBorder)
-            Text("Letters, digits, - and _, up to 41 characters.")
+            Text(L("Letters, digits, - and _, up to 41 characters."))
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             HStack {
                 Spacer()
-                Button("Cancel") { showingDuplicate = false }
-                Button("Create") {
+                Button(L("Cancel")) { showingDuplicate = false }
+                Button(L("Create")) {
                     showingDuplicate = false
                     Task { await duplicateProfile(as: duplicateName) }
                 }
@@ -489,7 +496,7 @@ struct SettingsView: View {
             profileDirty = false
         } catch {
             profileDraft = nil
-            statusMessage = "Research profile \(name) could not be loaded: \(error.localizedDescription)"
+            statusMessage = L("Research profile %@ could not be loaded: %@", name, error.localizedDescription)
             statusIsError = true
         }
     }
@@ -511,10 +518,10 @@ struct SettingsView: View {
         do {
             _ = try await model.client().saveResearchProfile(draft.payload(name: name), prompts: draft.prompts)
             await loadProfiles(preferred: name)
-            statusMessage = "Profile \(name) created — save to make it the active profile"
+            statusMessage = L("Profile %@ created — save to make it the active profile", name)
             statusIsError = false
         } catch {
-            statusMessage = "Duplicate failed: \(error.localizedDescription)"
+            statusMessage = L("Duplicate failed: %@", error.localizedDescription)
             statusIsError = true
         }
     }
@@ -528,10 +535,14 @@ struct SettingsView: View {
             // A built-in comes back as its defaults, so stay on it; a deleted
             // one is gone and the list decides where to land.
             await loadProfiles(preferred: response.reset == true ? draft.name : nil)
-            statusMessage = response.reset == true ? "Profile \(draft.name) reset to the built-in" : "Profile \(draft.name) deleted"
+            statusMessage = response.reset == true
+                ? L("Profile %@ reset to the built-in", draft.name)
+                : L("Profile %@ deleted", draft.name)
             statusIsError = false
         } catch {
-            statusMessage = "\(draft.builtin ? "Reset" : "Delete") failed: \(error.localizedDescription)"
+            statusMessage = draft.builtin
+                ? L("Reset failed: %@", error.localizedDescription)
+                : L("Delete failed: %@", error.localizedDescription)
             statusIsError = true
         }
     }
@@ -553,15 +564,15 @@ struct SettingsView: View {
     private var workspaceDangerSection: some View {
         HStack(spacing: 24) {
             VStack(alignment: .leading, spacing: 5) {
-                Eyebrow(text: "Danger zone", color: .knodeBad)
-                Text("Clear \(model.activeWorkspace?.displayName ?? "this workspace")")
+                Eyebrow(text: L("Danger zone"), color: .knodeBad)
+                Text(L("Clear %@", model.activeWorkspace?.displayName ?? L("this workspace")))
                     .font(.headline)
-                Text("Remove all workspace content and derived data, then leave behind a fresh empty directory tree.")
+                Text(L("Remove all workspace content and derived data, then leave behind a fresh empty directory tree."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Clear workspace", role: .destructive) { showingClearConfirmation = true }
+            Button(L("Clear workspace"), role: .destructive) { showingClearConfirmation = true }
                 .buttonStyle(.bordered)
                 .tint(.knodeBad)
                 .disabled(isWorking)
@@ -573,12 +584,12 @@ struct SettingsView: View {
 
     private func testResults(_ result: ConfigTestResponse) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Stage test results").font(.headline)
-            TestResultRow(label: "1 · Convert", result: result.documentLlm)
-            TestResultRow(label: "2 · Index", result: result.embedding)
-            TestResultRow(label: "3 · Extract", result: result.entityLlm)
-            TestResultRow(label: "4 · Synthesize", result: result.conceptLlm)
-            TestResultRow(label: "5 · Answer", result: result.llm)
+            Text(L("Stage test results")).font(.headline)
+            TestResultRow(label: L("1 · Convert"), result: result.documentLlm)
+            TestResultRow(label: L("2 · Index"), result: result.embedding)
+            TestResultRow(label: L("3 · Extract"), result: result.entityLlm)
+            TestResultRow(label: L("4 · Synthesize"), result: result.conceptLlm)
+            TestResultRow(label: L("5 · Answer"), result: result.llm)
         }
         .knodeCard()
     }
@@ -605,49 +616,66 @@ struct SettingsView: View {
     private var embeddingNote: String {
         switch config?.embedding.provider {
         case "local":
-            return "The local hashing embedder is private, offline, and ready immediately."
+            return L("The local hashing embedder is private, offline, and ready immediately.")
         case "ark-multimodal":
-            return "Ark posts to /embeddings/multimodal and returns one vector per request, so Base URL ends at /api/v3 and Model is the endpoint id (ep-…). Dimensions must match the model — doubao-embedding-vision is 2048, or 1024 when the dimensions parameter is sent."
+            return L("Ark posts to /embeddings/multimodal and returns one vector per request, so Base URL ends at /api/v3 and Model is the endpoint id (ep-…). Dimensions must match the model — doubao-embedding-vision is 2048, or 1024 when the dimensions parameter is sent.")
         default:
-            return "Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep keys out of the config file."
+            return L("Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep keys out of the config file.")
         }
     }
 
     private var embeddingSummary: String {
-        guard let config else { return "Loading…" }
+        guard let config else { return L("Loading…") }
         return config.embedding.provider == "local"
-            ? "Local hashing · \(config.embedding.dimensions)d"
-            : (config.embedding.model.isEmpty ? "API model not set" : config.embedding.model)
+            ? L("Local hashing · %@d", String(config.embedding.dimensions))
+            : (config.embedding.model.isEmpty ? L("API model not set") : config.embedding.model)
     }
 
     private func routeSummary(_ keyPath: KeyPath<KnodeConfig, RoutedLLMConfig>) -> String {
-        guard let config, let route = config[keyPath: keyPath] as RoutedLLMConfig? else { return "Loading…" }
+        guard let config, let route = config[keyPath: keyPath] as RoutedLLMConfig? else { return L("Loading…") }
         let connection = config.connections.first { $0.id == route.use }
-        let name = connection?.label ?? (route.use.isEmpty ? "Default model" : providerName(route.provider))
+        let name = connection?.label ?? (route.use.isEmpty ? L("Default model") : providerName(route.provider))
         let model = route.model.isEmpty ? (connection?.model ?? "") : route.model
         return model.isEmpty ? name : "\(name) · \(model)"
     }
 
     private var defaultModelSummary: String {
-        guard let config else { return "Not configured" }
+        guard let config else { return L("Not configured") }
         return config.llm.model.isEmpty ? providerName(config.llm.provider) : "\(providerName(config.llm.provider)) · \(config.llm.model)"
     }
 
     private var defaultModelNote: String {
         guard let provider = config?.llm.provider else { return "" }
         return switch provider {
-        case "codex-cli": "Uses your existing Codex login for a read-only one-shot request."
-        case "claude-cli": "Uses your existing Claude Code login for one non-interactive turn."
-        case "cursor-cli": "Uses your existing Cursor Agent login in headless print mode."
-        default: "Any OpenAI-compatible chat endpoint works (OpenAI, DeepSeek, Ollama, vLLM, SiliconFlow…). Use env:VAR_NAME to keep the key out of the config file. An empty model disables LLM features; the deterministic pipeline keeps running."
+        case "codex-cli": L("Uses your existing Codex login for a read-only one-shot request.")
+        case "claude-cli": L("Uses your existing Claude Code login for one non-interactive turn.")
+        case "cursor-cli": L("Uses your existing Cursor Agent login in headless print mode.")
+        default: L("Any OpenAI-compatible chat endpoint works (OpenAI, DeepSeek, Ollama, vLLM, SiliconFlow…). Use env:VAR_NAME to keep the key out of the config file. An empty model disables LLM features; the deterministic pipeline keeps running.")
         }
     }
 
     /// Models the service reports for one route, using the on-screen draft so a
     /// key or endpoint typed but not yet saved is the one that gets queried.
     private func modelList(route: String) async throws -> ModelListResponse {
-        guard let config else { throw APIError(message: "Settings are still loading") }
+        guard let config else { throw APIError(message: L("Settings are still loading")) }
         return try await model.client().listModels(route: route, config: config)
+    }
+
+    /// Models for a research agent. A named connection lists on its own route;
+    /// a CLI picked straight off PATH has no connection, so ask the default
+    /// route with that provider swapped into a copy of the draft.
+    private func researchModelList(agent: String) async throws -> ModelListResponse {
+        guard let config else { throw APIError(message: L("Settings are still loading")) }
+        if !agent.isEmpty, config.connections.contains(where: { $0.id == agent }) {
+            return try await model.client().listModels(route: "connection:\(agent)", config: config)
+        }
+        var draft = config
+        if !agent.isEmpty {
+            draft.llm.provider = agent
+            draft.llm.cliPath = ""
+            draft.llm.model = ""
+        }
+        return try await model.client().listModels(route: "llm", config: draft)
     }
 
     /// The service writes 'default' for a migrated route; the picker uses '' for
@@ -702,14 +730,14 @@ struct SettingsView: View {
     private func test() async {
         guard let config else { return }
         isWorking = true
-        statusMessage = "Testing each configured stage…"
+        statusMessage = L("Testing each configured stage…")
         statusIsError = false
         defer { isWorking = false }
         do {
             testResult = try await model.client().testConfig(config)
-            statusMessage = "Stage tests complete"
+            statusMessage = L("Stage tests complete")
         } catch {
-            statusMessage = "Test failed: \(error.localizedDescription)"
+            statusMessage = L("Test failed: %@", error.localizedDescription)
             statusIsError = true
         }
     }
@@ -718,7 +746,7 @@ struct SettingsView: View {
         guard let config else { return }
         isWorking = true
         model.globalActivity = "Applying model routes…"
-        statusMessage = "Saving routes… re-embedding if retrieval changed."
+        statusMessage = L("Saving routes… re-embedding if retrieval changed.")
         statusIsError = false
         defer {
             isWorking = false
@@ -728,33 +756,33 @@ struct SettingsView: View {
             let response = try await model.client().saveConfig(config)
             self.config = normalized(response.config)
             if response.reembedded, let reindex = response.reindex {
-                statusMessage = "Configuration saved · re-embedded \(reindex.indexed) docs and \(reindex.chunks) chunks"
+                statusMessage = L("Configuration saved · re-embedded %@ docs and %@ chunks", String(reindex.indexed), String(reindex.chunks))
             } else if response.reconverted == true, let reindex = response.reindex {
-                statusMessage = "Configuration saved · refreshed document conversion for \(reindex.indexed) docs"
+                statusMessage = L("Configuration saved · refreshed document conversion for %@ docs", String(reindex.indexed))
             } else {
-                statusMessage = "Configuration saved and stages applied"
+                statusMessage = L("Configuration saved and stages applied")
             }
             // The research profile is a file of its own; a failure there must
             // not read as though the routes failed to save.
             do {
                 if let saved = try await saveProfileDraft() {
-                    statusMessage += " · research profile \(saved.name) saved"
+                    statusMessage += L(" · research profile %@ saved", saved.name)
                 }
             } catch {
-                statusMessage += " · research profile not saved: \(error.localizedDescription)"
+                statusMessage += L(" · research profile not saved: %@", error.localizedDescription)
                 statusIsError = true
             }
-            model.showToast("Configuration saved for \(model.activeWorkspace?.displayName ?? "workspace")")
+            model.showToast(L("Configuration saved for %@", model.activeWorkspace?.displayName ?? L("this workspace")))
             await model.refreshStats()
         } catch {
-            statusMessage = "Save failed: \(error.localizedDescription)"
+            statusMessage = L("Save failed: %@", error.localizedDescription)
             statusIsError = true
         }
     }
 
     private func clearWorkspace() async {
         isWorking = true
-        statusMessage = "Clearing workspace…"
+        statusMessage = L("Clearing workspace…")
         statusIsError = false
         defer { isWorking = false }
         do {
@@ -762,9 +790,9 @@ struct SettingsView: View {
             config = normalized(try await model.client().config())
             await loadProfiles()
             testResult = nil
-            statusMessage = "Workspace cleared. A fresh empty directory tree is ready."
+            statusMessage = L("Workspace cleared. A fresh empty directory tree is ready.")
         } catch {
-            statusMessage = "Clear failed: \(error.localizedDescription)"
+            statusMessage = L("Clear failed: %@", error.localizedDescription)
             statusIsError = true
         }
     }
@@ -773,7 +801,8 @@ struct SettingsView: View {
 /// A model name stays free text — any id the provider accepts — with a list of
 /// what the configured provider actually offers: its own `/models`, the CLI's
 /// own list, or the aliases a CLI documents when it has no list at all.
-private struct ModelField: View {
+/// A model id stays free text, with a list of what the provider offers.
+struct ModelField: View {
     let placeholder: String
     @Binding var text: String
     /// Changing provider invalidates a fetched list, since it came from the old one.
@@ -788,7 +817,7 @@ private struct ModelField: View {
     @State private var filter = ""
 
     var body: some View {
-        FieldLabel("Model") {
+        FieldLabel(L("Model")) {
             HStack(spacing: 6) {
                 TextField(placeholder, text: $text)
                 Button {
@@ -798,7 +827,7 @@ private struct ModelField: View {
                     Image(systemName: "chevron.down").font(.caption.weight(.semibold))
                 }
                 .buttonStyle(.borderless)
-                .help("List the models this provider offers")
+                .help(L("List the models this provider offers"))
                 .popover(isPresented: $isShowing, arrowEdge: .bottom) { picker }
             }
             .disabled(disabled)
@@ -813,14 +842,14 @@ private struct ModelField: View {
     private var picker: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 8) {
-                Text("Models").font(.headline)
+                Text(L("Models")).font(.headline)
                 if let source = result?.source { RouteBadge(label: sourceLabel(source), color: source == "builtin" ? .knodeViolet : .knodeCyan) }
                 Spacer()
                 if isLoading { ProgressView().controlSize(.small) }
                 Button { Task { await reload(force: true) } } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless)
                     .disabled(isLoading)
-                    .help("Ask the provider again")
+                    .help(L("Ask the provider again"))
             }
             if !options.isEmpty {
                 TextField("Filter \(options.count) models", text: $filter)
@@ -836,12 +865,12 @@ private struct ModelField: View {
                 }
                 .frame(height: listHeight)
                 if filtered.isEmpty {
-                    Text("Nothing matches “\(filter)”.").font(.caption).foregroundStyle(.secondary)
+                    Text(L("Nothing matches “%@”.", filter)).font(.caption).foregroundStyle(.secondary)
                 }
             } else if isLoading {
-                Text("Asking the provider…").font(.caption).foregroundStyle(.secondary)
+                Text(L("Asking the provider…")).font(.caption).foregroundStyle(.secondary)
             } else if result != nil, failure == nil, result?.error == nil {
-                Text("This provider lists no models — type the id you want.")
+                Text(L("This provider lists no models — type the id you want."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -859,12 +888,12 @@ private struct ModelField: View {
             }
             Divider()
             HStack {
-                Text("Picking one fills the field — Save & apply writes it to the workspace config.")
+                Text(L("Picking one fills the field — Save & apply writes it to the workspace config."))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                 Spacer()
                 if !text.isEmpty {
-                    Button("Clear") { text = ""; isShowing = false }
+                    Button(L("Clear")) { text = ""; isShowing = false }
                         .buttonStyle(.link)
                         .font(.caption)
                 }
@@ -923,8 +952,8 @@ private struct ModelField: View {
 
     private func sourceLabel(_ source: String) -> String {
         switch source {
-        case "api": "from the endpoint"
-        case "cli": "from the CLI"
+        case "api": L("from the endpoint")
+        case "cli": L("from the CLI")
         default: "suggestions"
         }
     }
@@ -948,7 +977,7 @@ private struct CliExecutableField: View {
                     overrideField(tool)
                 }
             } else {
-                FieldLabel("CLI executable") { TextField("Use command from PATH", text: $path) }
+                FieldLabel(L("CLI executable")) { TextField(L("Use command from PATH"), text: $path) }
             }
         }
     }
@@ -957,7 +986,7 @@ private struct CliExecutableField: View {
         HStack(spacing: 8) {
             Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.knodeGood)
             VStack(alignment: .leading, spacing: 1) {
-                Text("Runs \(tool.command) from PATH — nothing to fill in")
+                Text(L("Runs %@ from PATH — nothing to fill in", tool.command))
                     .font(.caption.weight(.semibold))
                 Text(found)
                     .font(.system(size: 10, design: .monospaced))
@@ -966,7 +995,7 @@ private struct CliExecutableField: View {
                     .truncationMode(.middle)
             }
             Spacer()
-            Button("Pin a path…") { editing = true }
+            Button(L("Pin a path…")) { editing = true }
                 .buttonStyle(.link)
                 .font(.caption)
         }
@@ -974,7 +1003,7 @@ private struct CliExecutableField: View {
 
     @ViewBuilder
     private func overrideField(_ tool: CliTool) -> some View {
-        FieldLabel("CLI executable") {
+        FieldLabel(L("CLI executable")) {
             TextField(tool.path ?? "/full/path/to/\(tool.command)", text: $path)
         }
         if tool.path == nil {
@@ -1003,7 +1032,7 @@ private struct ConnectionCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
-                TextField("Name this connection", text: $connection.label)
+                TextField(L("Name this connection"), text: $connection.label)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 240)
                 Text(connection.id)
@@ -1012,16 +1041,16 @@ private struct ConnectionCard: View {
                 Spacer()
                 Button(role: .destructive) { remove() } label: { Image(systemName: "trash") }
                     .buttonStyle(.borderless)
-                    .help("Remove this connection")
+                    .help(L("Remove this connection"))
             }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
-                    FieldLabel("Provider") {
-                        Picker("Provider", selection: $connection.provider) {
-                            Text("OpenAI-compatible API").tag("openai")
-                            Text("Codex CLI").tag("codex-cli")
-                            Text("Claude Code CLI").tag("claude-cli")
-                            Text("Cursor Agent CLI").tag("cursor-cli")
+                    FieldLabel(L("Provider")) {
+                        Picker(L("Provider"), selection: $connection.provider) {
+                            Text(L("OpenAI-compatible API")).tag("openai")
+                            Text(L("Codex CLI")).tag("codex-cli")
+                            Text(L("Claude Code CLI")).tag("claude-cli")
+                            Text(L("Cursor Agent CLI")).tag("cursor-cli")
                         }
                         .labelsHidden()
                     }
@@ -1034,8 +1063,8 @@ private struct ConnectionCard: View {
                 }
                 if connection.provider == "openai" {
                     GridRow {
-                        FieldLabel("Base URL") { TextField("https://api.openai.com/v1", text: $connection.baseUrl) }
-                        FieldLabel("API key") { SecureField("env:OPENAI_API_KEY", text: $connection.apiKey) }
+                        FieldLabel(L("Base URL")) { TextField("https://api.openai.com/v1", text: $connection.baseUrl) }
+                        FieldLabel(L("API key")) { SecureField("env:OPENAI_API_KEY", text: $connection.apiKey) }
                     }
                 } else {
                     GridRow {
@@ -1136,9 +1165,9 @@ private struct StagePicker: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            FieldLabel("Run with") {
-                Picker("Run with", selection: $route.use) {
-                    Text("Default LLM provider").tag("")
+            FieldLabel(L("Run with")) {
+                Picker(L("Run with"), selection: $route.use) {
+                    Text(L("Default LLM provider")).tag("")
                     ForEach(connections) { connection in
                         Text(connection.label).tag(connection.id)
                     }
@@ -1146,7 +1175,7 @@ private struct StagePicker: View {
                 .labelsHidden()
             }
             ModelField(
-                placeholder: "Optional · use its model",
+                placeholder: L("Optional · use its model"),
                 text: $route.model,
                 providerKey: route.use,
                 load: load
@@ -1176,7 +1205,7 @@ private struct StagePin: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("Runs on")
+            Text(L("Runs on"))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
             Text(value)
@@ -1232,13 +1261,14 @@ private struct TestResultRow: View {
     }
 }
 
+@MainActor
 func providerName(_ provider: String) -> String {
     switch provider {
-    case "inherit": "Default model"
-    case "openai": "OpenAI-compatible API"
-    case "codex-cli": "Codex CLI"
-    case "claude-cli": "Claude Code CLI"
-    case "cursor-cli": "Cursor Agent CLI"
+    case "inherit": L("Default model")
+    case "openai": L("OpenAI-compatible API")
+    case "codex-cli": L("Codex CLI")
+    case "claude-cli": L("Claude Code CLI")
+    case "cursor-cli": L("Cursor Agent CLI")
     default: provider
     }
 }

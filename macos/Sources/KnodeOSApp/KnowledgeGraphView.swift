@@ -37,9 +37,9 @@ struct KnowledgeGraphView: View {
             } else {
                 EmptyState(
                     symbol: "point.3.connected.trianglepath.dotted",
-                    title: "The graph is empty",
-                    message: "Index documents with wikilinks or configure entity extraction to create nodes and relations.",
-                    actionTitle: "Go to Files",
+                    title: L("The graph is empty"),
+                    message: L("Index documents with wikilinks or configure entity extraction to create nodes and relations."),
+                    actionTitle: L("Go to Files"),
                     action: { model.selectedSection = .files }
                 )
             }
@@ -55,17 +55,17 @@ struct KnowledgeGraphView: View {
         HStack(spacing: 10) {
             Image(systemName: "point.3.connected.trianglepath.dotted")
                 .foregroundStyle(Color.knodeViolet)
-            TextField("Graph search — entity, product, concept…", text: $query)
+            TextField(L("Graph search — entity, product, concept…"), text: $query)
                 .textFieldStyle(.plain)
                 .font(.title3)
                 .onSubmit { Task { await loadGraph() } }
-            Picker("Depth", selection: $depth) {
-                Text("1 hop").tag(1)
-                Text("2 hops").tag(2)
-                Text("3 hops").tag(3)
+            Picker(L("Depth"), selection: $depth) {
+                Text(L("1 hop")).tag(1)
+                Text(L("2 hops")).tag(2)
+                Text(L("3 hops")).tag(3)
             }
             .frame(width: 110)
-            Button("Explore") { Task { await loadGraph() } }
+            Button(L("Explore")) { Task { await loadGraph() } }
                 .buttonStyle(.borderedProminent)
                 .tint(.knodeViolet)
                 .disabled(isLoading)
@@ -99,7 +99,7 @@ struct KnowledgeGraphView: View {
                     HStack {
                         RouteBadge(label: selectedNode.type, color: nodeColor(selectedNode.type))
                         Spacer()
-                        Text("\(selectedNode.mentionCount) mentions")
+                        Text(L("%@ mentions", String(selectedNode.mentionCount)))
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
                     }
@@ -123,9 +123,9 @@ struct KnowledgeGraphView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     HStack {
-                        Text("Entities").font(.headline)
+                        Text(L("Entities")).font(.headline)
                         Spacer()
-                        Text("\(graph.nodes.count) nodes · \(graph.edges.count) relations")
+                        Text(L("%@ nodes · %@ relations", String(graph.nodes.count), String(graph.edges.count)))
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
                     }
@@ -160,7 +160,7 @@ struct KnowledgeGraphView: View {
 
                     if !graph.chunks.isEmpty {
                         Divider().padding(.vertical, 8)
-                        Text("Grounded in").font(.headline)
+                        Text(L("Grounded in")).font(.headline)
                         ForEach(graph.chunks) { chunk in
                             Button { model.openFile(chunk.path) } label: {
                                 Label(chunk.path, systemImage: "doc.text")
@@ -290,28 +290,28 @@ private struct InsightsSheet: View {
         VStack(alignment: .leading, spacing: 18) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Eyebrow(text: "Graph health", color: .knodeViolet)
-                    Text("Knowledge graph insights").font(.title.bold())
+                    Eyebrow(text: L("Graph health"), color: .knodeViolet)
+                    Text(L("Knowledge graph insights")).font(.title.bold())
                 }
                 Spacer()
-                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+                Button(L("Done")) { dismiss() }.keyboardShortcut(.defaultAction)
             }
             if let insights {
                 HStack(spacing: 12) {
-                    InsightMetric(value: insights.totals.entities, label: "Entities")
-                    InsightMetric(value: insights.totals.relations, label: "Relations")
-                    InsightMetric(value: insights.totals.mentions, label: "Mentions")
+                    InsightMetric(value: insights.totals.entities, label: L("Entities"))
+                    InsightMetric(value: insights.totals.relations, label: L("Relations"))
+                    InsightMetric(value: insights.totals.mentions, label: L("Mentions"))
                 }
                 HStack(alignment: .top, spacing: 18) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Hubs").font(.headline)
+                        Text(L("Hubs")).font(.headline)
                         ForEach(insights.hubs) { hub in
-                            HStack { Text(hub.name); Spacer(); Text("degree \(hub.degree)").font(.caption.monospaced()).foregroundStyle(.secondary) }
+                            HStack { Text(hub.name); Spacer(); Text(L("degree %@", String(hub.degree))).font(.caption.monospaced()).foregroundStyle(.secondary) }
                         }
                     }
                     .knodeCard()
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Entity types").font(.headline)
+                        Text(L("Entity types")).font(.headline)
                         ForEach(insights.typeCounts) { item in
                             HStack { RouteBadge(label: item.type, color: nodeColor(item.type)); Spacer(); Text(item.n.formatted()).monospacedDigit() }
                         }
@@ -320,7 +320,7 @@ private struct InsightsSheet: View {
                 }
                 if !insights.isolated.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Isolated entities").font(.headline)
+                        Text(L("Isolated entities")).font(.headline)
                         Text(insights.isolated.map(\.name).joined(separator: " · "))
                             .font(.callout)
                             .foregroundStyle(.secondary)

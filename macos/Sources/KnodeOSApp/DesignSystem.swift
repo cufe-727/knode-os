@@ -217,7 +217,7 @@ struct MarkdownText: View {
             }
         case .frontmatter(let text):
             VStack(alignment: .leading, spacing: 5) {
-                Eyebrow(text: "Metadata", color: .knodeViolet)
+                Eyebrow(text: L("Metadata"), color: .knodeViolet)
                 Text(text)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)

@@ -28,6 +28,11 @@ final class AppModel: ObservableObject {
     @Published var workspaceRevision = 0
     @Published var toastMessage: String?
     @Published var globalActivity: String?
+    /// Interface language. Every view observes this model, so setting it
+    /// redraws the whole app in the new language.
+    @Published var language: AppLanguage = L10n.current {
+        didSet { L10n.set(language) }
+    }
 
     private let defaults = UserDefaults.standard
     private let sessionKey = "knode-os.macos.session.v1"

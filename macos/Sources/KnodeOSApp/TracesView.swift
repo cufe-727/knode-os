@@ -27,14 +27,14 @@ struct TracesView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.knodeCyan)
                 .disabled(isSyncing)
-                Text("Claude Code and Codex transcripts are mirrored into raw/traces/")
+                Text(L("Claude Code and Codex transcripts are mirrored into raw/traces/"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                TextField("Filter traces", text: $filter)
+                TextField(L("Filter traces"), text: $filter)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 220)
-                Text("\(filtered.count) sessions")
+                Text(L("%@ sessions", String(filtered.count)))
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
@@ -101,12 +101,12 @@ struct TracesView: View {
 private struct TraceHeaderRow: View {
     var body: some View {
         HStack(spacing: 12) {
-            Text("Source").frame(width: 90, alignment: .leading)
-            Text("Project").frame(minWidth: 170, maxWidth: .infinity, alignment: .leading)
-            Text("Session").frame(width: 220, alignment: .leading)
-            Text("Started").frame(width: 150, alignment: .leading)
-            Text("Size").frame(width: 75, alignment: .leading)
-            Text("Analyzed").frame(width: 70, alignment: .center)
+            Text(L("Source")).frame(width: 90, alignment: .leading)
+            Text(L("Project")).frame(minWidth: 170, maxWidth: .infinity, alignment: .leading)
+            Text(L("Session")).frame(width: 220, alignment: .leading)
+            Text(L("Started")).frame(width: 150, alignment: .leading)
+            Text(L("Size")).frame(width: 75, alignment: .leading)
+            Text(L("Analyzed")).frame(width: 70, alignment: .center)
         }
         .font(.caption.weight(.semibold))
         .foregroundStyle(.secondary)

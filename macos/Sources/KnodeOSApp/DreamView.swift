@@ -22,7 +22,7 @@ struct DreamView: View {
                 EmptyState(
                     symbol: "moon.stars",
                     title: statusFilter == "all" ? "No suggestions yet" : "No \(statusFilter) suggestions",
-                    message: "Dream analyzes recent agent sessions and proposes grounded improvements to skills, memory, and knowledge."
+                    message: L("Dream analyzes recent agent sessions and proposes grounded improvements to skills, memory, and knowledge.")
                 )
             } else {
                 ScrollView {
@@ -55,16 +55,16 @@ struct DreamView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(lastDreamTitle).font(.callout.weight(.semibold))
-                Text("Recent traces → suggestions for skills, memory, and knowledge")
+                Text(L("Recent traces → suggestions for skills, memory, and knowledge"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Picker("Status", selection: $statusFilter) {
-                Text("All").tag("all")
-                Text("Pending").tag("pending")
-                Text("Accepted").tag("accepted")
-                Text("Rejected").tag("rejected")
+            Picker(L("Status"), selection: $statusFilter) {
+                Text(L("All")).tag("all")
+                Text(L("Pending")).tag("pending")
+                Text(L("Accepted")).tag("accepted")
+                Text(L("Rejected")).tag("rejected")
             }
             .pickerStyle(.segmented)
             .frame(width: 330)
@@ -153,7 +153,7 @@ private struct SuggestionCard: View {
                     }
                     .padding(.top, 6)
                 } label: {
-                    Text("Evidence · \(suggestion.evidence.count)")
+                    Text(L("Evidence · %@", String(suggestion.evidence.count)))
                         .font(.caption.weight(.semibold))
                 }
             }

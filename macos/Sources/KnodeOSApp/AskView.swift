@@ -16,19 +16,19 @@ struct AskView: View {
                 VStack(spacing: 14) {
                     ProgressView()
                         .controlSize(.large)
-                    Text("Searching context, following the graph, and composing a cited answer…")
+                    Text(L("Searching context, following the graph, and composing a cited answer…"))
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let response {
                 answer(response)
             } else if hasAsked {
-                EmptyState(symbol: "exclamationmark.bubble", title: "No answer returned", message: "Check the local service and your default reasoning model route.")
+                EmptyState(symbol: "exclamationmark.bubble", title: L("No answer returned"), message: L("Check the local service and your default reasoning model route."))
             } else {
                 EmptyState(
                     symbol: "sparkles",
-                    title: "Ask your knowledge base",
-                    message: "Answers are grounded in retrieved chunks and extracted claims. Citations link straight back to the source files."
+                    title: L("Ask your knowledge base"),
+                    message: L("Answers are grounded in retrieved chunks and extracted claims. Citations link straight back to the source files.")
                 )
             }
         }
@@ -39,12 +39,12 @@ struct AskView: View {
     private var askBar: some View {
         HStack(spacing: 10) {
             Image(systemName: "sparkles").foregroundStyle(Color.knodeViolet)
-            TextField("Ask a question — answered from your workspace with citations…", text: $question)
+            TextField(L("Ask a question — answered from your workspace with citations…"), text: $question)
                 .textFieldStyle(.plain)
                 .font(.title3)
                 .focused($questionFocused)
                 .onSubmit { Task { await ask() } }
-            Button("Ask") { Task { await ask() } }
+            Button(L("Ask")) { Task { await ask() } }
                 .buttonStyle(.borderedProminent)
                 .tint(.knodeViolet)
                 .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isAsking)
@@ -59,7 +59,7 @@ struct AskView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 VStack(alignment: .leading, spacing: 12) {
-                    Eyebrow(text: "Answer", color: .knodeViolet)
+                    Eyebrow(text: L("Answer"), color: .knodeViolet)
                     MarkdownText(markdown: response.answer)
                         .font(.system(size: 16))
                         .lineSpacing(5)
