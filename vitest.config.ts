@@ -6,5 +6,7 @@ export default defineConfig({
   test: {
     testTimeout: 60_000,
     hookTimeout: 60_000,
+    // the suite opens throwaway embedded PGlite indexes; the product default is PostgreSQL
+    env: { KNODE_DATABASE_KIND: 'pglite' },
   },
 });

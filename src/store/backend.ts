@@ -141,14 +141,26 @@ class PostgresBackend implements Backend {
 }
 
 /**
- * Open the backend for one workspace. Defaults to the embedded PGlite database
- * so an absent `database` config behaves exactly as before.
+ * Open the backend for one workspace: PostgreSQL when the config says so
+ * (the default since 2026-09), the embedded PGlite database otherwise — an
+ * absent `database` block still opens PGlite so old data dirs keep working.
  */
 export async function openBackend(dataDir: string, cfg?: DatabaseConfig): Promise<Backend> {
   if (cfg?.kind === 'postgres') {
     const database = cfg.database || 'knode';
     const schema = schemaNameFor(dataDir, cfg.schemaPrefix || 'ws');
-    await ensureDatabase(cfg, database);
+    try {
+      await ensureDatabase(cfg, database);
+    } catch (err) {
+      const e = err as { code?: string; errors?: { code?: string }[]; message?: string };
+      const code = e.code ?? e.errors?.[0]?.code ?? '';
+      if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EHOSTUNREACH|ECONNRESET/.test(code) || /ECONNREFUSED|connect/i.test(String(e.message))) {
+        throw new Error(
+          `cannot reach PostgreSQL at ${cfg.host}:${cfg.port} — database.kind is "postgres" by default. Start the server, fix database.host/port/user/password in knode.config.json, or set database.kind to "pglite" for an embedded index (${e.message ?? code})`,
+        );
+      }
+      throw err;
+    }
     await ensureSchema(cfg, database, schema);
     // Set on the connection itself so every pooled client starts in the right
     // schema — no per-checkout SET, and no race with `pool.on('connect')`.

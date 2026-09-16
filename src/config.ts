@@ -266,6 +266,104 @@ export interface PackConfig {
   staleNewsDays: number;
 }
 
+/**
+ * MCP over Streamable HTTP, hosted by `serve` at `path`. Agents share the
+ * running index through it instead of opening a second (PGlite: exclusive)
+ * copy of the workspace.
+ */
+export interface McpServerConfig {
+  enabled: boolean;
+  path: string;
+}
+
+/**
+ * How deep-research jobs are run. A job launches the configured coding-agent
+ * CLI headlessly with the knode MCP endpoint attached; the agent researches a
+ * topic and writes the resulting wiki page back through `knode_write`.
+ */
+export interface ResearchConfig {
+  /**
+   * Which CLI runs jobs: a connection id from `connections`, or a provider
+   * name ('claude-cli' | 'codex-cli' | 'cursor-cli'). Empty = the default `llm`
+   * connection when that is a CLI provider; otherwise research is disabled.
+   */
+  agent: string;
+  /** Model passed to the CLI (--model). Empty = the CLI's own default. */
+  model: string;
+  /** Turn cap per job (claude --max-turns; advisory for CLIs without one). */
+  maxTurns: number;
+  /** Kill a job after this long. */
+  timeoutMs: number;
+  /** Concurrent CLI runs per workspace. */
+  concurrency: number;
+  /** Where run workspaces live, relative to the data dir. */
+  runsDir: string;
+  /** Finished run directories kept before the oldest are pruned. */
+  keepRuns: number;
+  /** Data-dir subtrees exposed read-only to the agent (add-dir). Writes never go through the filesystem. */
+  readDirs: string[];
+  /** Accept the top recommendations automatically, up to `dailyJobs` per day. */
+  auto: { enabled: boolean; dailyJobs: number };
+  /**
+   * 'single': one agent session does everything. 'team': a plan session
+   * outlines the page, parallel researcher sessions each take one section,
+   * a synthesis session writes the page, a review session critiques it and a
+   * revision session fixes what it found (deep-research pipeline). 'native':
+   * one orchestrator session with the profile's native roles registered as
+   * the CLI's own sub-agents (claude --agents, codex agents.enabled). The
+   * active profile may override this.
+   */
+  pipeline: 'single' | 'team' | 'native';
+  /**
+   * Research profile under playbooks/research/profiles/<name>.yaml: reasoning
+   * effort, web search freshness, verification bar and the sub-agent roles
+   * (each with its own CLI, model, tools and prompt). Built-ins: default,
+   * quick, thorough, native.
+   */
+  profile: string;
+  /** Parallel researcher sessions in 'team' mode. */
+  researchers: number;
+  /** Critique → revise rounds in 'team' mode before the page is accepted or rejected. */
+  reviewRounds: number;
+}
+
+export interface GraphConfig {
+  /** Ontology packs under playbooks/ontology/<pack>.yaml, merged in order; later packs may extend earlier ones. */
+  ontologyPacks: string[];
+}
+
+export type ReviewResolution = 'exact' | 'suffix';
+export type ReviewLlmMode = 'off' | 'suggest' | 'auto';
+export type ReviewExternal = 'off' | 'verify' | 'research';
+
+/**
+ * How much checking sits between extraction and the graph. Three layers, each
+ * with its own knob, so a workspace can be strict (nothing merges without a
+ * person) or hands-off (the LLM judge merges what it is sure about).
+ */
+export interface ReviewConfig {
+  /**
+   * Write-time auto-merge rule. 'exact': a mention merges into a known entity
+   * only when its spelling equals a known name or alias (after NFKC / width /
+   * case folding). 'suffix': names that differ only by a corporate suffix
+   * (股份有限公司, Inc., Co., Ltd. …) merge too. Anything fuzzier is always a
+   * suggestion a person accepts.
+   */
+  resolution: ReviewResolution;
+  /** LLM judge over duplicate-entity candidates: off / annotate suggestions with a verdict / also merge above autoMergeMinConfidence. */
+  llmJudge: ReviewLlmMode;
+  /** Candidates the judge rejects with at least this confidence are dropped (and remembered) instead of filed. */
+  llmMinConfidence: number;
+  /** 'auto' merges without a person at or above this confidence. */
+  autoMergeMinConfidence: number;
+  /** Candidates judged per nightly run (one LLM call each, within the daily token budget). */
+  maxJudgedPerRun: number;
+  /** LLM review of disputed / suspected claims, filed as knowledge suggestions with a verdict. */
+  claims: 'off' | 'suggest';
+  /** External (web) verification by research agents: off / only `verify` jobs get web tools / every research job may use them. */
+  external: ReviewExternal;
+}
+
 export interface KnodeConfig {
   embedding: EmbeddingConfig;
   database: DatabaseConfig;
@@ -273,13 +371,19 @@ export interface KnodeConfig {
   llm: LlmConfig;
   /** Extra named connections routes can be pointed at. */
   connections: LlmConnection[];
-  server: { port: number; host: string };
+  server: { port: number; host: string; mcp: McpServerConfig };
   ingest: { chunkSize: number; chunkOverlap: number; watch: boolean; concurrency?: number };
   extraction: ExtractionConfig;
   retrieval: { sag: SagSearchConfig };
   heat: HeatConfig;
   datasources: DataSourceConfig[];
   pack: PackConfig;
+  /** Deep-research jobs run by an external coding-agent CLI (see src/research). */
+  research: ResearchConfig;
+  /** Knowledge-graph vocabulary: which ontology packs define entity and relation types. */
+  graph: GraphConfig;
+  /** Review strength between extraction and the graph (entity merges, claims, external verification). */
+  review: ReviewConfig;
   trace: {
     /** Where Claude Code stores session transcripts. */
     claudeProjectsDir: string;
@@ -319,7 +423,11 @@ export function defaultConfig(): KnodeConfig {
       sendDimensions: false,
     },
     database: {
-      kind: 'pglite',
+      // PostgreSQL by default: one shared database, one schema per workspace. The
+      // embedded PGlite index stays available for offline / zero-setup use and
+      // is what the test suite runs on — set database.kind to "pglite", or
+      // KNODE_DATABASE_KIND=pglite before the config file exists.
+      kind: process.env.KNODE_DATABASE_KIND === 'pglite' ? 'pglite' : 'postgres',
       host: '127.0.0.1',
       port: 5432,
       user: '',
@@ -336,7 +444,7 @@ export function defaultConfig(): KnodeConfig {
       cliTimeoutMs: 300_000,
     },
     connections: [],
-    server: { port: 9100, host: '127.0.0.1' },
+    server: { port: 9100, host: '127.0.0.1', mcp: { enabled: true, path: '/mcp' } },
     ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4 },
     extraction: {
       dailyTokenBudget: 2_000_000,
@@ -377,6 +485,31 @@ export function defaultConfig(): KnodeConfig {
       probeRows: 10,
       liveTtlSeconds: 30,
       staleNewsDays: 7,
+    },
+    research: {
+      agent: '',
+      model: '',
+      maxTurns: 40,
+      timeoutMs: 1_200_000,
+      concurrency: 1,
+      runsDir: '.runs',
+      keepRuns: 20,
+      readDirs: ['raw/docs', 'wiki', '.sidecar'],
+      auto: { enabled: false, dailyJobs: 3 },
+      pipeline: 'team',
+      profile: 'default',
+      researchers: 3,
+      reviewRounds: 1,
+    },
+    graph: { ontologyPacks: ['core', 'organization'] },
+    review: {
+      resolution: 'exact',
+      llmJudge: 'suggest',
+      llmMinConfidence: 0.6,
+      autoMergeMinConfidence: 0.95,
+      maxJudgedPerRun: 30,
+      claims: 'suggest',
+      external: 'verify',
     },
     trace: {
       claudeProjectsDir: path.join(home, '.claude', 'projects'),

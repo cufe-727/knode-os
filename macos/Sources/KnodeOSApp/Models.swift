@@ -6,6 +6,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
     case search
     case ask
     case graph
+    case wiki
     case traces
     case dream
     case settings
@@ -18,6 +19,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .search: "Search"
         case .ask: "Ask"
         case .graph: "Graph"
+        case .wiki: "Wiki"
         case .traces: "Traces"
         case .dream: "Dream"
         case .settings: "Settings"
@@ -30,6 +32,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .search: "Hybrid, vector, and keyword recall"
         case .ask: "Cited answers from your workspace"
         case .graph: "Entities, relations, and claims"
+        case .wiki: "Pages researched by agent CLIs"
         case .traces: "Claude Code and Codex sessions"
         case .dream: "Review agent improvement ideas"
         case .settings: "Model routes and pipeline limits"
@@ -42,6 +45,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .search: "magnifyingglass"
         case .ask: "sparkles"
         case .graph: "point.3.connected.trianglepath.dotted"
+        case .wiki: "book.closed"
         case .traces: "terminal"
         case .dream: "moon.stars"
         case .settings: "slider.horizontal.3"
@@ -295,6 +299,56 @@ struct UploadItem {
 
 struct ActionResponse: Decodable {
     var ok: Bool
+}
+
+struct ResearchJob: Decodable, Identifiable, Hashable {
+    var id: String
+    var kind: String
+    var target: String?
+    var query: String?
+    var status: String
+    var agent: String?
+    var outputPath: String?
+    var error: String?
+    var turns: Int?
+    var createdAt: String
+    var startedAt: String?
+    var finishedAt: String?
+
+    var subject: String { target ?? query ?? "" }
+}
+
+struct ResearchPage: Decodable, Identifiable, Hashable {
+    var id: String { path }
+    var path: String
+    var exists: Bool
+    var job: String
+    var kind: String
+    var target: String?
+    var agent: String?
+    var finishedAt: String?
+    var trust: String?
+    var warnings: [String]?
+}
+
+struct ResearchRecommendation: Decodable, Identifiable, Hashable {
+    var id: String { "\(kind)|\(target)" }
+    var kind: String
+    var target: String
+    var score: Double
+    var reasons: [String]
+    var suggestionId: String?
+}
+
+struct QueueResearchResponse: Decodable {
+    var job: ResearchJob
+    var created: Bool
+}
+
+struct TrustResponse: Decodable {
+    var key: String
+    var from: String
+    var to: String
 }
 
 struct EmbeddingConfig: Codable, Equatable {

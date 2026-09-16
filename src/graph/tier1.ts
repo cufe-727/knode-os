@@ -7,7 +7,9 @@ import { addBudgetUse, budgetUsedToday } from '../llm/budget.js';
 import { LlmClient } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { Store } from '../store/db.js';
-import { applyExtraction, llmExtract } from './llm-extract.js';
+import { toIso } from '../store/temporal.js';
+import { applyExtraction, knownEntitiesIn, llmExtract } from './llm-extract.js';
+import { loadOntology } from './ontology.js';
 import { ExtractedClaim, ExtractedEntity, ExtractedRelation, PageContext } from './store.js';
 
 /**
@@ -72,7 +74,7 @@ export async function applyTier1Scope(
   doc: { path: string; sha256: string },
   page: PageContext,
   extracted: { entities: ExtractedEntity[]; relations: ExtractedRelation[]; claims?: ExtractedClaim[] },
-  opts: { model: string; actor?: string; at?: string },
+  opts: { model: string; actor?: string; at?: string; docDate?: string | null },
 ): Promise<{ entities: number; relations: number; claims: number; outcome: 'applied' | 'unchanged' | 'orphan' }> {
   const parent = await findLiveScope(store, 'doc', doc.path);
   if (!parent) return { entities: 0, relations: 0, claims: 0, outcome: 'orphan' };
@@ -83,7 +85,7 @@ export async function applyTier1Scope(
     doc.sha256,
     { parentId: parent.id, actor: opts.actor ?? 'tier1', at: opts.at, meta: { documentId: page.documentId, model: opts.model } },
     async (w) => {
-      g = await applyExtraction(w, page, extracted.entities, extracted.relations, extracted.claims ?? [], `tier1.llm:${opts.model}`);
+      g = await applyExtraction(w, page, extracted.entities, extracted.relations, extracted.claims ?? [], `tier1.llm:${opts.model}`, { docDate: opts.docDate ?? null });
     },
   );
   return { ...g, outcome: res.outcome };
@@ -116,9 +118,9 @@ export async function runTier1Pass(
 
   await recomputePriorities(store, config);
   const batch = await store.query<{
-    document_id: string; attempts: number; path: string; title: string | null; sha256: string;
+    document_id: string; attempts: number; path: string; title: string | null; sha256: string; doc_date: string | Date | null;
   }>(
-    `SELECT q.document_id, q.attempts, d.path, d.title, d.sha256
+    `SELECT q.document_id, q.attempts, d.path, d.title, d.sha256, d.doc_date
      FROM extraction_queue q JOIN documents d ON d.id = q.document_id
      WHERE q.tier = 1 AND d.status = 'indexed'
      ORDER BY q.priority DESC
@@ -148,8 +150,9 @@ export async function runTier1Pass(
 
       // replay for free when the sidecar already has a matching extraction
       const tier1 = replayableTier1(readSidecarPart(store.dataDir, doc.path, 'tier1'), doc.sha256);
+      const docDate = toIso(doc.doc_date);
       if (tier1) {
-        const g = await applyTier1Scope(store, doc, page, tier1, { model: tier1.model });
+        const g = await applyTier1Scope(store, doc, page, tier1, { model: tier1.model, docDate });
         stats.entities += g.entities;
         stats.relations += g.relations;
         stats.processed++;
@@ -163,8 +166,9 @@ export async function runTier1Pass(
       stats.budgetLeft -= cost; // claim budget up-front so parallel workers can't overshoot
 
       progress(`tier1 extract ${doc.path}`);
-      const extracted = await llmExtract(entityLlm, page, content, { claims: config.extraction.claims });
-      const g = await applyTier1Scope(store, doc, page, extracted, { model: entityLlm.label });
+      const knownEntities = await knownEntitiesIn(store, content.slice(0, LLM_EXTRACT_INPUT_CHARS));
+      const extracted = await llmExtract(entityLlm, page, content, { claims: config.extraction.claims, ontology: loadOntology(store.dataDir, config.graph?.ontologyPacks), knownEntities, docDate });
+      const g = await applyTier1Scope(store, doc, page, extracted, { model: entityLlm.label, docDate });
 
       updateSidecarPart(store.dataDir, doc.path, 'tier1', () => ({
         status: 'done',

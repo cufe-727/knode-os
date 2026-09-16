@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { canonicalMap } from '../graph/resolve.js';
 import { AppContext } from '../context.js';
 import { boundStatement, dialectForKind, escapeForDialect, runSourceQuery } from '../datasource/execute.js';
 import { SourceDialect } from '../config.js';
@@ -256,6 +257,22 @@ export async function matchEntities(
     // "宁德时代" beats its substrings; skip entities shadowed by an accepted one
     if (kept.some((k) => k.name.toLowerCase().includes(e.name.toLowerCase()))) continue;
     kept.push(e);
+  }
+  // an entity merged into another answers as the survivor
+  const canon = await canonicalMap(ctx.store, kept.map((e) => e.id));
+  if (canon.size > 0) {
+    const targets = [...new Set(canon.values())];
+    const ph = targets.map((_, i) => `$${i + 1}`).join(',');
+    const survivors = new Map((await ctx.store.query<EntityRow>(`SELECT * FROM entities WHERE id IN (${ph}) AND tx_to IS NULL`, targets)).map((s) => [s.id, s]));
+    const seen = new Set<string>();
+    const merged: EntityRow[] = [];
+    for (const e of kept) {
+      const row = canon.has(e.id) ? survivors.get(canon.get(e.id)!) : e;
+      if (!row || seen.has(row.id)) continue;
+      seen.add(row.id);
+      merged.push(row);
+    }
+    kept.splice(0, kept.length, ...merged);
   }
   return kept.map((e) => ({
     id: e.id,

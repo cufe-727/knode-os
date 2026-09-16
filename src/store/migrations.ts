@@ -609,6 +609,117 @@ CREATE OR REPLACE VIEW v_capability_stats AS
   GROUP BY r.intent, call ->> 'slot', call ->> 'capability';
 `;
 
+const V7_WIKI_RESEARCH = `
+-- Relations gain a world-time window like claims already have: "A supplies B"
+-- is true of a period, not forever. Folded from evidence attrs (MIN valid_from,
+-- MAX valid_to unless any supporter leaves it open).
+ALTER TABLE relations ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ;
+ALTER TABLE relations ADD COLUMN IF NOT EXISTS valid_to TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS relations_valid_window_idx ON relations (valid_from, valid_to) WHERE tx_to IS NULL;
+
+-- Claims separate the time an event happened (event_at) from the window the
+-- statement holds for (valid_from / valid_to) and the date of the document
+-- that reported it (observed_at). superseded_by is system-maintained by the
+-- claim audit: an older fact replaced by a newer one is kept, not deleted.
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS event_at TIMESTAMPTZ;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS observed_at TIMESTAMPTZ;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS superseded_by TEXT;
+
+-- The reference date of a source (frontmatter date, or a date in its path).
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS doc_date TIMESTAMPTZ;
+
+-- Entity resolution: name_key / entity_alias_keys are the normalized lookup
+-- keys the writer resolves new mentions against; canonical_id points a merged
+-- entity at the one it was folded into (reversible through entity_links).
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS canonical_id TEXT;
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS name_key TEXT;
+CREATE INDEX IF NOT EXISTS entities_name_key_idx ON entities (name_key) WHERE tx_to IS NULL;
+CREATE TABLE IF NOT EXISTS entity_alias_keys (
+  entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  alias_key TEXT NOT NULL,
+  PRIMARY KEY (entity_id, alias_key)
+);
+CREATE INDEX IF NOT EXISTS entity_alias_keys_key_idx ON entity_alias_keys (alias_key);
+CREATE TABLE IF NOT EXISTS entity_links (
+  id           TEXT PRIMARY KEY,
+  entity_id    TEXT NOT NULL,
+  canonical_id TEXT NOT NULL,
+  kind         TEXT NOT NULL DEFAULT 'same_as',
+  scope_id     TEXT,
+  actor        TEXT,
+  reason       TEXT NOT NULL DEFAULT '',
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  tx_to        TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS entity_links_entity_idx ON entity_links (entity_id) WHERE tx_to IS NULL;
+
+-- Deep-research jobs: one row per page an external agent is asked to write.
+CREATE TABLE IF NOT EXISTS research_jobs (
+  id           TEXT PRIMARY KEY,
+  kind         TEXT NOT NULL,
+  target       TEXT,
+  query        TEXT,
+  template     TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'queued',
+  agent        TEXT,
+  model        TEXT,
+  workset_id   TEXT,
+  output_path  TEXT,
+  error        TEXT,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  turns        INTEGER,
+  cost_usd     REAL,
+  payload      JSONB NOT NULL DEFAULT '{}',
+  requested_by TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  started_at   TIMESTAMPTZ,
+  finished_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS research_jobs_status_idx ON research_jobs (status, created_at);
+
+-- Catalog views: CREATE OR REPLACE may only append columns, so the new ones go last.
+CREATE OR REPLACE VIEW v_documents AS
+  SELECT d.id, d.path, d.root, d.kind, d.title, d.sha256, d.mime, d.bytes, d.status,
+         d.scope_id, d.created_at, d.updated_at, d.doc_date
+  FROM documents d;
+
+CREATE OR REPLACE VIEW v_entities AS
+  SELECT e.id, e.name, e.type, e.description, e.aliases, e.wiki_path,
+         e.mention_count, e.evidence_count, e.tx_from, e.canonical_id
+  FROM entities e WHERE e.tx_to IS NULL;
+
+CREATE OR REPLACE VIEW v_relations AS
+  SELECT r.id, r.source_id, r.target_id, r.type, r.description, r.weight,
+         r.evidence_count, r.tx_from, r.valid_from, r.valid_to
+  FROM relations r WHERE r.tx_to IS NULL;
+
+CREATE OR REPLACE VIEW v_claims AS
+  SELECT cl.id, cl.subject_id, cl.object_id, cl.type, cl.statement, cl.status,
+         cl.valid_from, cl.valid_to, cl.evidence_count, cl.tx_from,
+         s.key AS source_path, cl.event_at, cl.observed_at, cl.superseded_by
+  FROM claims cl
+  LEFT JOIN scopes s ON s.id = cl.primary_scope_id
+  WHERE cl.tx_to IS NULL;
+
+CREATE OR REPLACE VIEW v_entity_links AS
+  SELECT l.id, l.entity_id, l.canonical_id, l.kind, l.actor, l.reason, l.created_at
+  FROM entity_links l WHERE l.tx_to IS NULL;
+
+CREATE OR REPLACE VIEW v_research_jobs AS
+  SELECT j.id, j.kind, j.target, j.query, j.template, j.status, j.agent, j.model,
+         j.output_path, j.error, j.attempts, j.turns, j.cost_usd, j.requested_by,
+         j.created_at, j.started_at, j.finished_at
+  FROM research_jobs j;
+`;
+
+const V8_REVIEW = `
+-- Lookup keys carry their kind so the resolver can be told to merge only on an
+-- identical spelling ('exact') while suffix-stripped keys ('bare') stay
+-- available to the duplicate audit. Keys written before this column are
+-- retagged the next time their entity folds (\`knode-os sync --verify\` does all).
+ALTER TABLE entity_alias_keys ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'exact';
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -633,6 +744,8 @@ export const MIGRATIONS: Migration[] = [
   { version: 4, name: 'capability', up: async (q) => execScript(q, V4_CAPABILITY) },
   { version: 5, name: 'receipts', up: async (q) => execScript(q, V5_RECEIPTS) },
   { version: 6, name: 'agent-db', up: async (q) => execScript(q, V6_AGENT_DB) },
+  { version: 7, name: 'wiki-research', up: async (q) => execScript(q, V7_WIKI_RESEARCH) },
+  { version: 8, name: 'review', up: async (q) => execScript(q, V8_REVIEW) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

@@ -170,6 +170,7 @@ regeneration and is itself a source.
   — maps chunks and entity mentions onto SAG's event/entity retrieval model,
   including multi-hop expansion, dual-route fusion, provenance, and next steps.
 - [05 — Agent Context Database](05-agent-context-db.md) ([中文](05-agent-context-db.zh-CN.md))
+- [06 — Wiki research agents and graph upgrades](06-wiki-research-agent.md) ([中文](06-wiki-research-agent.zh-CN.md))
   — the v2 redesign: Cordis-style effect ledger (scopes / evidence / deps /
   pages, dispose reverts everything a source produced), bitemporal `as_of` /
   `valid_at`, wiki pages as views, one logical multimodal database, and the

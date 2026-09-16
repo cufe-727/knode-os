@@ -80,7 +80,12 @@ wiki/entities/x.md                               bundle=wiki       self=Archive 
 
 | 键 | 在哪生效 | 作用 |
 | --- | --- | --- |
-| `entities` / `claims` | 仅 `raw/docs/**` | tier-0 声明式抽取——不配 LLM 也能建图，是这批键里最值钱的 |
+| `entities` / `claims` | `raw/docs/**` 与 bundle 页 | tier-0 声明式抽取——不配 LLM 也能建图，是这批键里最值钱的。claims 可带 `eventDate`（事件时间）与 `startDate/endDate`（有效期），日期支持 `2026Q2`、`2026年上半年`、`去年`（按文档日期折算）等写法；bundle 页里 `subject` 缺省为页面自身实体 |
+| `relations` | `raw/docs/**` 与 bundle 页 | 类型化关系：列表 `- { source?, target, type, from?, to? }` 或映射 `supplies_to: ["[[特斯拉]]"]`；谓词按 `playbooks/ontology/*.yaml` 归一（同义词、反向拼写自动翻转、未知降级为 `related_to` 并计数）；bundle 页缺省 source 为页面自身实体 |
+| `date` / `published` / `as_of` | 全部 | 文档参考日期（`documents.doc_date`）；缺省从路径里的日期推断，永不用 mtime |
+| `sameAs`（entities 内） | 全部 | 声明该实体与已知实体相同，写入时直接落到规范实体 |
+| `actor: agent/<cli>` + `research: {…}` | `wiki/**` | 研究 agent 写的页面：显式 `actor` 使其成为 **Source**（即使带 `generated`），以 quarantined 入库；`research` 记录 job / 模版 / 时间，runner 会盖章 |
+| `sameAs` / `notSameAs` | `wiki/reviews/**`（verify 任务） | 核实页的身份结论：`sameAs` 里的已知实体变成待审的 `merge` 建议，`notSameAs` 记为已拒绝的合并对，夜间审计不再提出 |
 | `trust` / `actor` | 全部 | 信任分档 |
 | `acl` | 全部 | 访问控制 |
 | `aliases` | 仅 bundle 内 | 实体别名 |

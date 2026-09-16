@@ -1,4 +1,5 @@
 import { normalizePrefixes } from '../lineage/declared.js';
+import { normalizeDateExpr } from './dates.js';
 import { Queryable } from './migrations.js';
 import { Params, TimeInput, toIso } from './temporal.js';
 
@@ -95,6 +96,9 @@ function calendarSpan(token: string): { from: string; to: string } | null {
   }
   m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t);
   if (m) return { from: `${t}T00:00:00.000Z`, to: `${t}T23:59:59.999Z` };
+  // quarters, halves, fiscal years and Chinese forms (2026Q2, 2026年上半年, FY2025 …)
+  const span = normalizeDateExpr(t);
+  if (span && span.precision !== 'instant' && span.from && span.to) return { from: span.from, to: span.to };
   return null;
 }
 

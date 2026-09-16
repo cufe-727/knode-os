@@ -251,6 +251,36 @@ struct APIClient {
         return try await send("/api/suggestions/\(id)/status", method: "POST", body: encoded(Body(status: status)))
     }
 
+    func researchJobs() async throws -> [ResearchJob] {
+        try await send("/api/research/jobs?limit=40")
+    }
+
+    func researchPages() async throws -> [ResearchPage] {
+        try await send("/api/research/pages")
+    }
+
+    func researchRecommendations() async throws -> [ResearchRecommendation] {
+        try await send("/api/research/recommendations")
+    }
+
+    func queueResearch(kind: String, target: String?, query: String?) async throws -> QueueResearchResponse {
+        struct Body: Encodable { var kind: String; var target: String?; var query: String? }
+        return try await send("/api/research/jobs", method: "POST", body: encoded(Body(kind: kind, target: target, query: query)))
+    }
+
+    func cancelResearch(id: String) async throws -> [String: Bool] {
+        try await send("/api/research/jobs/\(id)/cancel", method: "POST", body: Data("{}".utf8))
+    }
+
+    func retryResearch(id: String) async throws -> ResearchJob {
+        try await send("/api/research/jobs/\(id)/retry", method: "POST", body: Data("{}".utf8))
+    }
+
+    func setTrust(path filePath: String, to: String) async throws -> TrustResponse {
+        struct Body: Encodable { var path: String; var to: String }
+        return try await send("/api/trust", method: "POST", body: encoded(Body(path: filePath, to: to)))
+    }
+
     func dream() async throws -> DreamResponse {
         try await send("/api/dream", method: "POST", body: Data("{}".utf8))
     }

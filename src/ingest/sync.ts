@@ -5,6 +5,7 @@ import { applyDatasourceScopes } from '../datasource/sync.js';
 import { safePath } from '../fs/files.js';
 import { listSidecarKeys, RAW_DOCS, RAW_TRACES } from '../fs/layout.js';
 import { removeSidecar } from '../fs/sidecar.js';
+import { loadOntology, typePrecedence } from '../graph/ontology.js';
 import { buildWikiIndex } from '../graph/wire.js';
 import { DATASOURCES_PREFIX, declaredKey, enumerateDeclared, matchesPrefixes, normalizePrefixes } from '../lineage/declared.js';
 import { recountAll } from '../lineage/fold.js';
@@ -255,7 +256,7 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
 }
 
 async function verify(ctx: SyncContext, progress: (m: string) => void): Promise<SyncVerifyReport> {
-  const recount = await ctx.store.tx((q) => recountAll(q));
+  const recount = await ctx.store.tx((q) => recountAll(q, undefined, { typePrecedence: typePrecedence(loadOntology(ctx.dataDir)) }));
   if (recount.changed) progress(`verify: fold drift repaired on ${recount.changed} rows`);
 
   // every live scope should have an apply line; backfill missing ones

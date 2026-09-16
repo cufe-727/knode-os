@@ -521,6 +521,7 @@ document.querySelectorAll('#tabs button').forEach((b) => {
     $(`#tab-${b.dataset.tab}`).classList.add('active');
     if (b.dataset.tab === 'traces') loadTraces();
     if (b.dataset.tab === 'dream') loadSuggestions();
+    if (b.dataset.tab === 'wiki') loadResearch();
     if (b.dataset.tab === 'settings') loadConfigForm();
     if (b.dataset.tab === 'graph' && !graphState.loaded) loadGraph('');
   });
@@ -1407,6 +1408,157 @@ async function loadSuggestions() {
   }
 }
 
+/* -------------------------------- wiki (research) ---------------------- */
+
+const pageLink = (p) => `<a href="#" data-open="${esc(p)}" class="mono">${esc(p)}</a>`;
+
+function wireOpenLinks(root) {
+  root.querySelectorAll('a[data-open]').forEach((a) =>
+    a.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      document.querySelector('#tabs button[data-tab="files"]').click();
+      openFile(a.dataset.open);
+    }),
+  );
+}
+
+async function loadResearch() {
+  await Promise.all([loadResearchJobs(), loadResearchPages(), loadResearchRecommendations()]);
+}
+
+async function loadResearchJobs() {
+  const el = $('#research-jobs');
+  try {
+    const jobs = await api('/api/research/jobs?limit=40');
+    if (!jobs.length) {
+      el.innerHTML = '<p class="hint">no research jobs yet — queue one above, or accept a recommendation.</p>';
+      return;
+    }
+    el.innerHTML = '';
+    for (const j of jobs) {
+      const div = document.createElement('div');
+      div.className = 'job';
+      const what = `${j.kind} · ${esc(j.target ?? j.query ?? '')}`;
+      const when = new Date(j.finishedAt ?? j.startedAt ?? j.createdAt).toLocaleString();
+      const actions = [];
+      if (j.status === 'queued' || j.status === 'running') actions.push(`<button data-cancel="${j.id}">cancel</button>`);
+      if (j.status === 'failed' || j.status === 'cancelled') actions.push(`<button data-retry="${j.id}">retry</button>`);
+      actions.push(`<button data-log="${j.id}">log</button>`);
+      div.innerHTML = `<span class="jstatus ${j.status}">${j.status}</span>
+        <span>${what}${j.outputPath ? ` → ${pageLink(j.outputPath)}` : ''} <span class="hint mono">${when}${j.turns ? ` · ${j.turns} turns` : ''}${j.agent ? ` · ${esc(j.agent)}` : ''}</span></span>
+        <span class="jactions">${actions.join('')}</span>
+        ${j.error ? `<div class="jerr">${esc(j.error)}</div>` : ''}`;
+      div.querySelector('button[data-cancel]')?.addEventListener('click', async () => { await api(`/api/research/jobs/${j.id}/cancel`, { method: 'POST' }); loadResearchJobs(); });
+      div.querySelector('button[data-retry]')?.addEventListener('click', async () => { await api(`/api/research/jobs/${j.id}/retry`, { method: 'POST' }); loadResearchJobs(); });
+      div.querySelector('button[data-log]')?.addEventListener('click', async () => {
+        const full = await api(`/api/research/jobs/${j.id}?log=1`);
+        const pre = document.createElement('pre');
+        pre.className = 'mono';
+        pre.style.whiteSpace = 'pre-wrap';
+        pre.style.maxHeight = '320px';
+        pre.style.overflow = 'auto';
+        pre.textContent = full.log ?? '(no transcript yet)';
+        const old = div.querySelector('pre');
+        if (old) old.remove(); else div.appendChild(pre);
+      });
+      wireOpenLinks(div);
+      el.appendChild(div);
+    }
+  } catch (e) {
+    el.innerHTML = `<p class="hint">failed: ${esc(e.message)}</p>`;
+  }
+}
+
+async function loadResearchPages() {
+  const el = $('#research-pages');
+  try {
+    const pages = await api('/api/research/pages');
+    if (!pages.length) {
+      el.innerHTML = '<p class="hint">no research pages yet.</p>';
+      return;
+    }
+    el.innerHTML = '';
+    for (const p of pages) {
+      const div = document.createElement('div');
+      div.className = 'rpage';
+      const trust = p.trust ?? (p.exists ? 'unsynced' : 'missing');
+      div.innerHTML = `<span>${pageLink(p.path)} <span class="hint">${esc(p.kind)} · ${esc(p.target ?? '')}${p.warnings?.length ? ` · ${p.warnings.length} warnings` : ''}</span></span>
+        <span class="trust ${trust}">${trust}</span>
+        <span class="ractions">
+          ${p.trust === 'quarantined' ? `<button data-trust="trusted">promote</button>` : ''}
+          ${p.trust === 'trusted' ? `<button data-trust="quarantined">demote</button>` : ''}
+          <button data-refresh="${esc(p.path)}">refresh</button>
+        </span>`;
+      div.querySelector('button[data-trust]')?.addEventListener('click', async (ev) => {
+        try {
+          await api('/api/trust', { method: 'POST', body: JSON.stringify({ path: p.path, to: ev.target.dataset.trust }) });
+          toast(`${p.path}: ${ev.target.dataset.trust}`);
+          loadResearchPages();
+        } catch (e) {
+          toast(`trust change failed: ${e.message}`);
+        }
+      });
+      div.querySelector('button[data-refresh]')?.addEventListener('click', async () => {
+        await api('/api/research/jobs', { method: 'POST', body: JSON.stringify({ kind: 'refresh', target: p.path }) });
+        toast('refresh queued');
+        loadResearchJobs();
+      });
+      wireOpenLinks(div);
+      el.appendChild(div);
+    }
+  } catch (e) {
+    el.innerHTML = `<p class="hint">failed: ${esc(e.message)}</p>`;
+  }
+}
+
+async function loadResearchRecommendations() {
+  const el = $('#research-recommendations');
+  try {
+    const recs = await api('/api/research/recommendations');
+    if (!recs.length) {
+      el.innerHTML = '<p class="hint">nothing to recommend yet — recommendations come from hot entities, repeated questions and pages whose facts changed.</p>';
+      return;
+    }
+    el.innerHTML = '';
+    for (const r of recs) {
+      const div = document.createElement('div');
+      div.className = 'rec';
+      div.innerHTML = `<div><b>${esc(r.kind)}</b> · ${esc(r.target)} <span class="hint mono">score ${Number(r.score).toFixed(2)}</span></div>
+        <div class="recwhy">${(r.reasons ?? []).map(esc).join(' · ')}</div>
+        <div class="recactions"><button data-queue>queue</button>${r.suggestionId ? `<button data-dismiss>dismiss</button>` : ''}</div>`;
+      div.querySelector('button[data-queue]').addEventListener('click', async () => {
+        if (r.suggestionId) await api(`/api/suggestions/${r.suggestionId}/status`, { method: 'POST', body: JSON.stringify({ status: 'accepted' }) });
+        else await api('/api/research/jobs', { method: 'POST', body: JSON.stringify({ kind: r.kind, target: r.kind === 'question' ? undefined : r.target, query: r.kind === 'question' ? r.target : undefined }) });
+        toast('research queued');
+        loadResearch();
+      });
+      div.querySelector('button[data-dismiss]')?.addEventListener('click', async () => {
+        await api(`/api/suggestions/${r.suggestionId}/status`, { method: 'POST', body: JSON.stringify({ status: 'rejected' }) });
+        loadResearchRecommendations();
+      });
+      el.appendChild(div);
+    }
+  } catch (e) {
+    el.innerHTML = `<p class="hint">failed: ${esc(e.message)}</p>`;
+  }
+}
+
+$('#btn-research-queue').addEventListener('click', async () => {
+  const kind = $('#research-kind').value;
+  const text = $('#research-target').value.trim();
+  if (!text) return toast('type an entity, concept, question or page path first');
+  try {
+    const body = kind === 'question' ? { kind, query: text } : { kind, target: text };
+    const res = await api('/api/research/jobs', { method: 'POST', body: JSON.stringify(body) });
+    toast(res.created ? `queued ${res.job.id}` : `already queued: ${res.job.id}`);
+    $('#research-target').value = '';
+    loadResearchJobs();
+  } catch (e) {
+    toast(`queue failed: ${e.message}`);
+  }
+});
+$('#btn-research-refresh').addEventListener('click', loadResearch);
+
 $('#btn-dream').addEventListener('click', async () => {
   toast('dreaming… this can take a minute', 90000);
   try {
@@ -1467,6 +1619,7 @@ function fillRouteOptions() {
       .join('');
     select.value = connectionDrafts.some((c) => c.id === previous) ? previous : '';
   }
+  refreshResearchAgentOptions();
 }
 
 function updateConfigSummaries() {
@@ -1622,9 +1775,15 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-extraction-batch').value = cfg.extraction?.batchSize ?? 8;
     $('#cfg-extraction-concurrency').value = cfg.extraction?.concurrency ?? 1;
     $('#cfg-extraction-claims').checked = cfg.extraction?.claims !== false;
+    fillResearchForm(cfg.research ?? {});
     embProviderToggle();
     llmProviderToggle();
     updateConfigSummaries();
+    try {
+      await loadResearchProfiles(cfg.research?.profile);
+    } catch (e) {
+      $('#cfg-roles').innerHTML = `<p class="cfg-callout">research profiles unavailable: ${esc(e.message)}</p>`;
+    }
     if (!preserveStatus) $('#cfg-status').innerHTML = '';
   } catch (e) {
     if (activeWorkspace()?.id !== workspaceId) return;
@@ -1673,8 +1832,349 @@ function gatherConfig() {
       concurrency: Number($('#cfg-extraction-concurrency').value),
       claims: $('#cfg-extraction-claims').checked,
     },
+    research: gatherResearchConfig(),
   };
 }
+
+/* ---------- Settings · 03 deep research: runner config + profile editor ---------- */
+const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli'];
+const EFFORT_OPTIONS = [
+  ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (claude; codex → xhigh, cursor → high)'],
+];
+const ROLE_PHASES = [
+  ['plan', 'Plan · outline the page'], ['research', 'Research · one section'], ['synthesize', 'Synthesize · write the page'], ['review', 'Review · critique'], ['revise', 'Revise · fix issues'],
+];
+const ROLE_WEB = [['inherit', 'Profile setting'], ['on', 'On (within review.external)'], ['off', 'Off']];
+let researchProfiles = [];
+let profileDraft = null;
+let profileDirty = false;
+
+function optionList(pairs, selected) {
+  return pairs.map(([v, l]) => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(l)}</option>`).join('');
+}
+
+function agentOptions(selected, inheritLabel) {
+  const opts = [`<option value="">${esc(inheritLabel)}</option>`];
+  for (const c of connectionDrafts.filter((c) => CLI_PROVIDERS.includes(c.provider))) {
+    opts.push(`<option value="${esc(c.id)}"${c.id === selected ? ' selected' : ''}>${esc(c.label || c.id)} · ${esc(providerNames[c.provider])}</option>`);
+  }
+  for (const p of CLI_PROVIDERS) opts.push(`<option value="${p}"${p === selected ? ' selected' : ''}>${esc(providerNames[p])} · from PATH</option>`);
+  return opts.join('');
+}
+
+function researchInheritLabel() {
+  const provider = $('#cfg-llm-provider').value;
+  return CLI_PROVIDERS.includes(provider) ? `Default LLM provider · ${providerNames[provider]}` : 'Default LLM provider (not a CLI — pick one)';
+}
+
+function refreshResearchAgentOptions() {
+  const select = $('#cfg-research-agent');
+  if (!select) return;
+  const current = select.value;
+  select.innerHTML = agentOptions(current, researchInheritLabel());
+  select.value = current;
+  if (select.value !== current) select.value = '';
+  for (const roleSelect of document.querySelectorAll('#cfg-roles select[data-field="agent"]')) {
+    const value = roleSelect.value;
+    roleSelect.innerHTML = agentOptions(value, 'The research agent above');
+    roleSelect.value = value;
+  }
+  updateResearchNote();
+}
+
+function fillResearchForm(research) {
+  $('#cfg-research-agent').innerHTML = agentOptions(research.agent || '', researchInheritLabel());
+  $('#cfg-research-agent').value = research.agent || '';
+  $('#cfg-research-model').value = research.model || '';
+  $('#cfg-research-pipeline').value = research.pipeline || 'team';
+  $('#cfg-research-concurrency').value = research.concurrency ?? 1;
+  $('#cfg-research-maxturns').value = research.maxTurns ?? 40;
+  $('#cfg-research-timeout').value = Math.max(1, Math.round((research.timeoutMs ?? 1200000) / 60000));
+  $('#cfg-research-researchers').value = research.researchers ?? 3;
+  $('#cfg-research-rounds').value = research.reviewRounds ?? 1;
+  $('#cfg-research-auto').checked = !!research.auto?.enabled;
+  $('#cfg-research-daily').value = research.auto?.dailyJobs ?? 3;
+  if (!$('#cfg-profile-effort').options.length) $('#cfg-profile-effort').innerHTML = optionList(EFFORT_OPTIONS, 'default');
+}
+
+async function loadResearchProfiles(preferred) {
+  const r = await api('/api/research/profiles');
+  researchProfiles = r.profiles ?? [];
+  const select = $('#cfg-research-profile');
+  select.innerHTML = researchProfiles.map((p) => `<option value="${esc(p.name)}">${esc(p.name)}${p.title && p.title !== p.name ? ` · ${esc(p.title)}` : ''}</option>`).join('');
+  const want = preferred && researchProfiles.some((p) => p.name === preferred) ? preferred : r.active;
+  select.value = want;
+  await loadProfileDetail(select.value || r.active);
+}
+
+async function loadProfileDetail(name) {
+  profileDraft = await api(`/api/research/profiles/${encodeURIComponent(name)}`);
+  profileDirty = false;
+  renderProfileForm();
+}
+
+function renderProfileForm() {
+  const p = profileDraft;
+  if (!p) return;
+  $('#cfg-profile-name').textContent = p.name;
+  $('#cfg-profile-title').value = p.title || '';
+  $('#cfg-profile-desc').value = p.description || '';
+  $('#cfg-profile-pipeline').value = p.pipeline || '';
+  $('#cfg-profile-effort').innerHTML = optionList(EFFORT_OPTIONS, p.reasoning.effort);
+  $('#cfg-profile-web').value = p.search.web;
+  $('#cfg-profile-freshness').value = p.search.freshness;
+  $('#cfg-profile-rounds').value = p.search.maxRounds;
+  $('#cfg-profile-minsources').value = p.verification.minSourcesPerClaim;
+  $('#cfg-profile-conflicts').value = p.verification.resolveConflicts;
+  $('#cfg-profile-maxsections').value = p.stop.maxSections;
+  $('#cfg-profile-primary').checked = !!p.verification.preferPrimarySources;
+  $('#cfg-profile-marginal').checked = !!p.stop.marginalGain;
+  $('#cfg-profile-citations').checked = !!p.output.citations;
+  $('#cfg-profile-uncertainty').checked = !!p.output.uncertainty;
+  $('#cfg-profile-evidence').checked = !!p.output.evidenceTable;
+  $('#cfg-profile-delete').textContent = p.builtin ? 'Reset to built-in' : 'Delete';
+  renderRoles();
+  updateResearchNote();
+}
+
+function renderRoles() {
+  const host = $('#cfg-roles');
+  const roles = profileDraft?.roles ?? [];
+  if (!roles.length) {
+    host.innerHTML = '<p class="cfg-callout">No roles. The team pipeline needs at least a synthesize role; single-session mode ignores roles.</p>';
+    return;
+  }
+  host.innerHTML = roles.map((r, index) => `<fieldset class="cfg-card cfg-role${r.enabled ? '' : ' cfg-role-off'}" data-index="${index}">
+      <div class="cfg-connection-head">
+        <label class="cfg-check cfg-role-enabled"><input type="checkbox" data-field="enabled"${r.enabled ? ' checked' : ''} /> On</label>
+        <input class="cfg-conn-label" data-field="title" value="${esc(r.title || '')}" placeholder="Role title" />
+        <span class="mono">${esc(r.id)} · ${esc(r.phase)}${r.native ? ' · native' : ''}</span>
+        <button type="button" class="ghost cfg-role-remove" title="Remove this role">Remove</button>
+      </div>
+      <div class="cfg-grid cfg-grid-3">
+        <label>Phase<select data-field="phase">${optionList(ROLE_PHASES, r.phase)}</select></label>
+        <label>Runs on<select data-field="agent">${agentOptions(r.agent || '', 'The research agent above')}</select></label>
+        <label>Model<input data-field="model" value="${esc(r.model || '')}" placeholder="Agent's model" /></label>
+        <label>Effort<select data-field="effort">${optionList([['default', 'Profile default'], ...EFFORT_OPTIONS.slice(1)], r.effort)}</select></label>
+        <label>Web tools<select data-field="web">${optionList(ROLE_WEB, r.tools.web)}</select></label>
+        <label>Turns per session<input data-field="maxTurns" type="number" min="0" step="1" value="${r.maxTurns || ''}" placeholder="Default" /></label>
+        ${r.phase === 'research' ? `<label>Parallel sessions<input data-field="parallel" type="number" min="0" max="16" step="1" value="${r.parallel || ''}" placeholder="Researchers default" /></label>` : ''}
+        ${r.phase === 'review' || r.phase === 'revise' ? `<label>Rounds<input data-field="rounds" type="number" min="0" max="6" step="1" value="${r.rounds || ''}" placeholder="Review rounds default" /></label>` : ''}
+        <label class="cfg-span-2">Description<input data-field="description" value="${esc(r.description || '')}" placeholder="One line the orchestrator reads when picking this sub-agent" /></label>
+      </div>
+      <div class="cfg-checks">
+        <label class="cfg-check"><input type="checkbox" data-field="write"${r.tools.write ? ' checked' : ''} /> Writes pages (knode_write / knode_commit)</label>
+        <label class="cfg-check"><input type="checkbox" data-field="files"${r.tools.files ? ' checked' : ''} /> Reads files (Read / Grep / Glob)</label>
+        <label class="cfg-check"><input type="checkbox" data-field="native"${r.native ? ' checked' : ''} /> Native sub-agent (pipeline: native)</label>
+      </div>
+      <div class="cfg-prompt">
+        <div class="cfg-prompt-head"><span>Prompt</span><span class="mono">${esc(r.promptPath || '')}${r.promptIsDefault ? ' · built-in' : ''}</span><button type="button" class="ghost cfg-role-reset">Reset to built-in</button></div>
+        <textarea data-field="promptText" rows="9" spellcheck="false">${esc(r.promptText || '')}</textarea>
+      </div>
+    </fieldset>`).join('');
+}
+
+function updateResearchNote() {
+  const note = $('#cfg-research-note');
+  if (!note) return;
+  const p = profileDraft;
+  const agentValue = $('#cfg-research-agent').value;
+  const agentLabel = agentValue ? (connectionById(agentValue)?.label || providerNames[agentValue] || agentValue) : researchInheritLabel();
+  const pipeline = (p && p.pipeline) || $('#cfg-research-pipeline').value;
+  const fanout = Number($('#cfg-research-researchers').value) || 1;
+  const roles = p
+    ? p.roles.filter((r) => r.enabled).map((r) => {
+      const n = r.phase === 'research' ? (r.parallel || fanout) : 0;
+      return `${r.id}${n > 1 ? ` ×${n}` : ''}${r.agent ? ` @${r.agent}` : ''}`;
+    })
+    : [];
+  const parts = [`Agent: ${agentLabel}`, `pipeline: ${pipeline}${p && p.pipeline ? ' (pinned by profile)' : ''}`];
+  if (p) parts.push(`effort: ${p.reasoning.effort}`, `web: ${p.search.web} / ${p.search.freshness}`, `sources per fact: ${p.verification.minSourcesPerClaim}`);
+  if (pipeline !== 'single') parts.push(`roles: ${roles.join(', ') || 'none'}`);
+  note.textContent = `${parts.join(' · ')}. Web tools never exceed what review.external allows.`;
+}
+
+function gatherResearchConfig() {
+  return {
+    agent: $('#cfg-research-agent').value,
+    model: $('#cfg-research-model').value.trim(),
+    profile: $('#cfg-research-profile').value,
+    pipeline: $('#cfg-research-pipeline').value,
+    concurrency: Number($('#cfg-research-concurrency').value) || 1,
+    maxTurns: Number($('#cfg-research-maxturns').value) || 40,
+    timeoutMs: (Number($('#cfg-research-timeout').value) || 20) * 60000,
+    researchers: Number($('#cfg-research-researchers').value) || 3,
+    reviewRounds: Math.max(0, Number($('#cfg-research-rounds').value) || 0),
+    auto: { enabled: $('#cfg-research-auto').checked, dailyJobs: Number($('#cfg-research-daily').value) || 3 },
+  };
+}
+
+function gatherProfile(name) {
+  const p = profileDraft;
+  const roles = p.roles.map(({ promptText, promptPath, promptIsDefault, promptDefault, ...role }) => role);
+  return {
+    profile: {
+      name: name || p.name,
+      title: $('#cfg-profile-title').value.trim(),
+      description: $('#cfg-profile-desc').value.trim(),
+      pipeline: $('#cfg-profile-pipeline').value,
+      reasoning: { effort: $('#cfg-profile-effort').value },
+      search: { web: $('#cfg-profile-web').value, freshness: $('#cfg-profile-freshness').value, maxRounds: Number($('#cfg-profile-rounds').value) || 3 },
+      verification: {
+        minSourcesPerClaim: Number($('#cfg-profile-minsources').value) || 1,
+        preferPrimarySources: $('#cfg-profile-primary').checked,
+        resolveConflicts: $('#cfg-profile-conflicts').value,
+      },
+      stop: { maxSections: Number($('#cfg-profile-maxsections').value) || 8, marginalGain: $('#cfg-profile-marginal').checked },
+      output: { citations: $('#cfg-profile-citations').checked, uncertainty: $('#cfg-profile-uncertainty').checked, evidenceTable: $('#cfg-profile-evidence').checked },
+      roles,
+    },
+    prompts: Object.fromEntries(p.roles.map((r) => [r.id, r.promptText ?? ''])),
+  };
+}
+
+async function saveResearchProfile() {
+  if (!profileDraft) return null;
+  const saved = await api(`/api/research/profiles/${encodeURIComponent(profileDraft.name)}`, { method: 'PUT', body: JSON.stringify(gatherProfile()) });
+  profileDraft = saved;
+  profileDirty = false;
+  renderProfileForm();
+  return saved;
+}
+
+function newRoleId(base) {
+  const ids = new Set((profileDraft?.roles ?? []).map((r) => r.id));
+  let id = base;
+  let n = 2;
+  while (ids.has(id)) id = `${base}-${n++}`;
+  return id;
+}
+
+$('#cfg-research-profile').addEventListener('change', async (event) => {
+  if (profileDirty && !window.confirm('Discard unsaved changes to the current profile?')) {
+    event.target.value = profileDraft?.name ?? event.target.value;
+    return;
+  }
+  try {
+    await loadProfileDetail(event.target.value);
+  } catch (e) {
+    toast(`profile load failed: ${e.message}`);
+  }
+});
+$('#cfg-research-agent').addEventListener('change', updateResearchNote);
+$('#cfg-research-pipeline').addEventListener('change', updateResearchNote);
+$('#cfg-research-researchers').addEventListener('input', updateResearchNote);
+$('#cfg-llm-provider').addEventListener('change', refreshResearchAgentOptions);
+
+$('#cfg-profile-card').addEventListener('input', () => { profileDirty = true; });
+$('#cfg-profile-card').addEventListener('change', (event) => {
+  profileDirty = true;
+  if (profileDraft && ['cfg-profile-effort', 'cfg-profile-web', 'cfg-profile-freshness', 'cfg-profile-pipeline', 'cfg-profile-minsources'].includes(event.target.id)) {
+    const g = gatherProfile().profile;
+    Object.assign(profileDraft, { pipeline: g.pipeline, reasoning: g.reasoning, search: g.search, verification: g.verification });
+    updateResearchNote();
+  }
+});
+
+$('#cfg-role-add').addEventListener('click', () => {
+  if (!profileDraft) return;
+  const phase = 'research';
+  const id = newRoleId('role');
+  const promptDefault = profileDraft.phaseDefaults?.[phase] ?? '';
+  profileDraft.roles.push({
+    id, title: 'New role', phase, enabled: true, agent: '', model: '', effort: 'default',
+    tools: { write: false, files: true, web: 'inherit' }, parallel: 0, rounds: 0, maxTurns: 0, prompt: '', native: false, description: '',
+    promptPath: `playbooks/research/roles/${id}.md`, promptText: promptDefault, promptIsDefault: true, promptDefault,
+  });
+  profileDirty = true;
+  renderRoles();
+  updateResearchNote();
+});
+
+// Typing edits the role draft in place; phase / native / enabled changes redraw the card.
+$('#cfg-roles').addEventListener('input', (event) => {
+  const field = event.target.dataset?.field;
+  const card = event.target.closest('.cfg-role');
+  if (!field || !card || !profileDraft) return;
+  const role = profileDraft.roles[Number(card.dataset.index)];
+  profileDirty = true;
+  if (field === 'write' || field === 'files') role.tools[field] = event.target.checked;
+  else if (field === 'web') role.tools.web = event.target.value;
+  else if (field === 'enabled' || field === 'native') role[field] = event.target.checked;
+  else if (['parallel', 'rounds', 'maxTurns'].includes(field)) role[field] = Math.max(0, Number(event.target.value) || 0);
+  else if (field === 'promptText') {
+    role.promptText = event.target.value;
+    role.promptIsDefault = role.promptText.trim() === (role.promptDefault || '').trim();
+  } else role[field] = event.target.value;
+  if (field === 'title' || field === 'agent') updateResearchNote();
+});
+$('#cfg-roles').addEventListener('change', (event) => {
+  const field = event.target.dataset?.field;
+  const card = event.target.closest('.cfg-role');
+  if (!field || !card || !profileDraft) return;
+  const role = profileDraft.roles[Number(card.dataset.index)];
+  if (field === 'phase') {
+    const wasDefault = role.promptIsDefault || !role.promptText?.trim();
+    role.phase = event.target.value;
+    role.promptDefault = profileDraft.phaseDefaults?.[role.phase] ?? '';
+    if (wasDefault) {
+      role.promptText = role.promptDefault;
+      role.promptIsDefault = true;
+    }
+    if (role.phase === 'synthesize' || role.phase === 'revise') role.tools.write = true;
+  }
+  if (['phase', 'native', 'enabled'].includes(field)) {
+    renderRoles();
+    updateResearchNote();
+  }
+});
+$('#cfg-roles').addEventListener('click', (event) => {
+  const card = event.target.closest('.cfg-role');
+  if (!card || !profileDraft) return;
+  const index = Number(card.dataset.index);
+  if (event.target.classList.contains('cfg-role-remove')) {
+    profileDraft.roles.splice(index, 1);
+    profileDirty = true;
+    renderRoles();
+    updateResearchNote();
+  } else if (event.target.classList.contains('cfg-role-reset')) {
+    const role = profileDraft.roles[index];
+    role.promptText = role.promptDefault || profileDraft.phaseDefaults?.[role.phase] || '';
+    role.promptIsDefault = true;
+    profileDirty = true;
+    renderRoles();
+  }
+});
+
+$('#cfg-profile-duplicate').addEventListener('click', async () => {
+  if (!profileDraft) return;
+  const name = window.prompt('Name for the new profile (letters, digits, - and _):', `${profileDraft.name}-copy`);
+  if (!name) return;
+  if (!/^[a-z0-9][a-z0-9_-]{0,40}$/i.test(name)) {
+    toast('invalid profile name');
+    return;
+  }
+  try {
+    await api(`/api/research/profiles/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify(gatherProfile(name)) });
+    await loadResearchProfiles(name);
+    toast(`profile ${name} created — it is selected above; Save & apply makes it active`);
+  } catch (e) {
+    toast(`duplicate failed: ${e.message}`);
+  }
+});
+
+$('#cfg-profile-delete').addEventListener('click', async () => {
+  if (!profileDraft) return;
+  const verb = profileDraft.builtin ? 'Reset' : 'Delete';
+  if (!window.confirm(`${verb} profile "${profileDraft.name}"?${profileDraft.builtin ? ' Its file goes back to the built-in defaults.' : ''}`)) return;
+  try {
+    await api(`/api/research/profiles/${encodeURIComponent(profileDraft.name)}`, { method: 'DELETE' });
+    await loadResearchProfiles(profileDraft.builtin ? profileDraft.name : undefined);
+    toast(`profile ${verb.toLowerCase()}${verb === 'Reset' ? '' : 'd'}`);
+  } catch (e) {
+    toast(`${verb.toLowerCase()} failed: ${e.message}`);
+  }
+});
 
 function renderCfgResult(r) {
   // same order and names as the pipeline section
@@ -1768,6 +2268,13 @@ $('#btn-cfg-save').addEventListener('click', async () => {
   $('#cfg-status').innerHTML = '<div class="cfg-line">Saving routes… re-embedding if retrieval changed.</div>';
   try {
     const r = await api('/api/config', { method: 'PUT', body: JSON.stringify(gatherConfig()) });
+    let profileLine = '';
+    try {
+      const saved = await saveResearchProfile();
+      if (saved) profileLine = `<div class="cfg-line good">research profile <b>${esc(saved.name)}</b> saved · ${esc(saved.path)}</div>`;
+    } catch (e) {
+      profileLine = `<div class="cfg-line bad">research profile not saved: ${esc(e.message)}</div>`;
+    }
     if (activeWorkspace()?.id !== workspaceId) {
       toast(`configuration saved for ${selectedWorkspaceLabel}`);
       return;
@@ -1775,6 +2282,7 @@ $('#btn-cfg-save').addEventListener('click', async () => {
     let html = `<div class="cfg-line good"><b>Configuration saved for ${esc(selectedWorkspaceLabel)}</b> · routes applied</div>`;
     if (r.reembedded && r.reindex) html += `<div class="cfg-line">re-embedded: ${r.reindex.indexed} docs · ${r.reindex.chunks} chunks</div>`;
     else if (r.reconverted && r.reindex) html += `<div class="cfg-line">document conversion refreshed: ${r.reindex.indexed} docs · ${r.reindex.errors} errors</div>`;
+    html += profileLine;
     $('#cfg-status').innerHTML = html;
     toast(`configuration saved for ${selectedWorkspaceLabel}`);
     await loadConfigForm({ preserveStatus: true });

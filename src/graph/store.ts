@@ -13,13 +13,19 @@ export interface ExtractedEntity {
   type: string;
   description?: string;
   aliases?: string[];
+  /** Name of a known entity this one is the same as (extraction-time linking); resolved before an id is assigned. */
+  sameAs?: string | null;
 }
 
 export interface ExtractedRelation {
   source: string;
   target: string;
+  /** Predicate spelling; normalized against the ontology on write (synonyms, inverse readings). */
   type: string;
   description?: string;
+  /** World-time window the edge holds for, when the source states one. */
+  validFrom?: string | null;
+  validTo?: string | null;
 }
 
 /**
@@ -35,6 +41,8 @@ export interface ExtractedClaim {
   status: 'fact' | 'suspected' | 'disputed' | 'absent';
   startDate?: string | null;
   endDate?: string | null;
+  /** When the asserted event happened, if the statement is about a dated event. */
+  eventDate?: string | null;
 }
 
 /** A document being wired into the graph: identity plus its indexed chunks. */

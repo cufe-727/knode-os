@@ -29,6 +29,9 @@ export interface EntityRow {
   wiki_path: string | null;
   mention_count: number;
   evidence_count?: number;
+  /** Set when this entity was merged into another (graph/merge.ts); reads redirect to it. */
+  canonical_id?: string | null;
+  name_key?: string | null;
   /** System-time window; tx_to set = tombstoned (no live evidence). */
   tx_from?: string;
   tx_to?: string | null;
@@ -43,6 +46,9 @@ export interface RelationRow {
   weight: number;
   document_id?: string | null;
   evidence_count?: number;
+  /** World-time window the edge holds for (null = unbounded / unknown). */
+  valid_from?: string | null;
+  valid_to?: string | null;
   tx_from?: string;
   tx_to?: string | null;
 }
@@ -58,6 +64,8 @@ export interface ClaimItem {
   /** Validity window (world time), date-only. */
   startDate: string | null;
   endDate: string | null;
+  /** When the asserted event happened, date-only, if the source said. */
+  eventDate?: string | null;
   /** Source that first asserted the claim (scope key); see knode_lineage for all supporters. */
   path: string | null;
   /** Number of live sources supporting the claim. */
@@ -78,15 +86,18 @@ export interface TraceRow {
 
 export interface SuggestionRow {
   id: string;
-  kind: 'skill' | 'memory' | 'knowledge' | 'pack' | 'recipe';
+  kind: 'skill' | 'memory' | 'knowledge' | 'pack' | 'recipe' | 'merge' | 'wiki';
   title: string;
   body: string;
   evidence: (string | { kind: string; id?: string; path?: string; text?: string })[];
   /** 'stale' = an input the suggestion depended on was tombstoned. */
   status: 'pending' | 'accepted' | 'rejected' | 'stale';
   report_path: string | null;
-  /** Machine-applicable change; for kind 'pack' / 'recipe': { path, content } of the file to write. */
-  payload?: { path: string; content: string; [key: string]: unknown } | null;
+  /**
+   * Machine-applicable change: for kind 'pack' / 'recipe' the { path, content } of the file to write;
+   * for 'merge' { entityId, canonicalId, reason }; for 'wiki' the research job spec.
+   */
+  payload?: ({ path?: string; content?: string } & Record<string, unknown>) | null;
   created_at: string;
 }
 
@@ -112,6 +123,8 @@ export interface SearchResult {
   path: string;
   title: string | null;
   content: string;
+  /** The source's reference date (date-only), when one was found. */
+  docDate?: string | null;
   score: number;
   signals: { vector?: number; keyword?: number; graph?: number; structural?: number };
   /** Retrieval provenance. Present for SAG results and omitted by legacy modes. */
@@ -141,6 +154,9 @@ export interface GraphEdge {
   type: string;
   description: string;
   weight: number;
+  /** Date-only world-time window, when the edge carries one. */
+  validFrom?: string | null;
+  validTo?: string | null;
 }
 
 export interface GraphSearchResult {

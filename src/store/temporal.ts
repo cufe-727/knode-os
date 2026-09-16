@@ -110,10 +110,16 @@ export interface EntityAsOf {
   evidence_count: number;
 }
 
-const TYPE_PRECEDENCE = ['person', 'organization', 'product', 'project', 'component', 'technology', 'event', 'location', 'datasource', 'dataset', 'other', 'concept'];
+export const TYPE_PRECEDENCE = ['person', 'organization', 'product', 'project', 'component', 'technology', 'event', 'location', 'datasource', 'dataset', 'other', 'concept'];
 
 /** Fold entity evidence into the row shape (shared by current-state folds and as_of reads). */
-export function foldEntityEvidence(id: string, rows: EvidenceAtRow[], mentionCount: number, fallback?: { name: string; type: string; description: string; aliases: string[] }): EntityAsOf | null {
+export function foldEntityEvidence(
+  id: string,
+  rows: EvidenceAtRow[],
+  mentionCount: number,
+  fallback?: { name: string; type: string; description: string; aliases: string[] },
+  precedence: readonly string[] = TYPE_PRECEDENCE,
+): EntityAsOf | null {
   if (rows.length === 0) return null;
   const sorted = [...rows].sort((a, b) =>
     b.weight - a.weight
@@ -128,9 +134,9 @@ export function foldEntityEvidence(id: string, rows: EvidenceAtRow[], mentionCou
   let type = fallback?.type ?? 'concept';
   if (typeVotes.size > 0) {
     type = [...typeVotes.entries()].sort((a, b) => {
-      const pa = TYPE_PRECEDENCE.indexOf(a[0]);
-      const pb = TYPE_PRECEDENCE.indexOf(b[0]);
-      return (pa === -1 ? TYPE_PRECEDENCE.length : pa) - (pb === -1 ? TYPE_PRECEDENCE.length : pb) || b[1] - a[1] || a[0].localeCompare(b[0]);
+      const pa = precedence.indexOf(a[0]);
+      const pb = precedence.indexOf(b[0]);
+      return (pa === -1 ? precedence.length : pa) - (pb === -1 ? precedence.length : pb) || b[1] - a[1] || a[0].localeCompare(b[0]);
     })[0][0];
   }
   let description = '';
@@ -159,6 +165,9 @@ export interface RelationAsOf {
   type: string;
   description: string;
   weight: number;
+  /** World-time window (folded like a claim's: MIN start, MAX end unless any supporter leaves it open). */
+  valid_from: string | null;
+  valid_to: string | null;
   evidence_count: number;
 }
 
@@ -171,7 +180,17 @@ export function foldRelationEvidence(row: { id: string; source_id: string; targe
     const d = str(r.attrs.description) ?? '';
     if (d.length > description.length || (d.length === description.length && d < description)) description = d;
   }
-  return { ...row, description, weight: Number(weight.toFixed(4)), evidence_count: rows.length };
+  const froms = rows.map((r) => toIso(str(r.attrs.valid_from))).filter((x): x is string => Boolean(x)).sort();
+  const openEnded = rows.some((r) => !toIso(str(r.attrs.valid_to)));
+  const tos = rows.map((r) => toIso(str(r.attrs.valid_to))).filter((x): x is string => Boolean(x)).sort();
+  return {
+    ...row,
+    description,
+    weight: Number(weight.toFixed(4)),
+    valid_from: froms[0] ?? null,
+    valid_to: openEnded ? null : tos[tos.length - 1] ?? null,
+    evidence_count: rows.length,
+  };
 }
 
 export interface ClaimAsOf {
@@ -183,6 +202,10 @@ export interface ClaimAsOf {
   status: string;
   valid_from: string | null;
   valid_to: string | null;
+  /** When the event happened (highest-weight supporter's statement). */
+  event_at: string | null;
+  /** Earliest source date among supporters. */
+  observed_at: string | null;
   primary_scope_id: string | null;
   segment_id: string | null;
   evidence_count: number;
@@ -205,6 +228,8 @@ export function foldClaimEvidence(row: { id: string; subject_id: string; stateme
   const openEnded = rows.some((r) => !toIso(str(r.attrs.valid_to)));
   const tos = rows.map((r) => toIso(str(r.attrs.valid_to))).filter((x): x is string => Boolean(x)).sort();
   const objectId = byWeight.map((r) => str(r.attrs.object_id)).find(Boolean) ?? null;
+  const eventAt = byWeight.map((r) => toIso(str(r.attrs.event_at))).find(Boolean) ?? null;
+  const observed = rows.map((r) => toIso(str(r.attrs.observed_at))).filter((x): x is string => Boolean(x)).sort();
   return {
     id: row.id,
     subject_id: row.subject_id,
@@ -214,6 +239,8 @@ export function foldClaimEvidence(row: { id: string; subject_id: string; stateme
     status,
     valid_from: froms[0] ?? null,
     valid_to: openEnded ? null : tos[tos.length - 1] ?? null,
+    event_at: eventAt,
+    observed_at: observed[0] ?? null,
     primary_scope_id: earliest.scope_id,
     segment_id: earliest.segment_id,
     evidence_count: rows.length,

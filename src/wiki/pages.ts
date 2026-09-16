@@ -23,7 +23,7 @@ import { applyScope } from '../lineage/scope.js';
 import { isGeneratedConcept, okfGenerated } from '../okf/index.js';
 import { getDocHeat } from '../stats/heat.js';
 import { Store } from '../store/db.js';
-import { toDateString } from '../store/temporal.js';
+import { toDateString, toIso } from '../store/temporal.js';
 import { DocumentRow } from '../types.js';
 import { hasRegions, renderRegion, replaceRegion, splitRegions } from './regions.js';
 
@@ -41,7 +41,7 @@ import { hasRegions, renderRegion, replaceRegion, splitRegions } from './regions
  * so regeneration cannot loop.
  */
 
-export type PageKind = 'entity_stub' | 'source_summary' | 'dataset' | 'sources_index' | 'hot_topics' | 'concept_cluster' | 'dream';
+export type PageKind = 'entity_stub' | 'source_summary' | 'dataset' | 'sources_index' | 'hot_topics' | 'concept_cluster' | 'dream' | 'research_index';
 
 export interface PagesContext {
   store: Store;
@@ -102,14 +102,24 @@ const entityStub: PageGenerator = {
   mode: 'file',
   async plan(ctx, pagePath) {
     const id = path.posix.basename(pagePath, '.md');
-    const [e] = await ctx.store.query<{ id: string; name: string; type: string; description: string; aliases: string[]; fold_sha: string }>(
-      `SELECT id, name, type, description, aliases, fold_sha FROM entities WHERE id = $1 AND tx_to IS NULL`,
+    const [e] = await ctx.store.query<{ id: string; name: string; type: string; description: string; aliases: string[]; fold_sha: string; canonical_id: string | null }>(
+      `SELECT id, name, type, description, aliases, fold_sha, canonical_id FROM entities WHERE id = $1 AND tx_to IS NULL`,
       [id],
     );
     if (!e) return null;
-    const claims = await ctx.store.query<{ id: string; statement: string; status: string; valid_from: string | null; valid_to: string | null; fold_sha: string }>(
-      `SELECT id, statement, status, valid_from, valid_to, fold_sha FROM claims
-       WHERE subject_id = $1 AND tx_to IS NULL ORDER BY tx_from DESC, id LIMIT 10`,
+    if (e.canonical_id) {
+      // merged into another entity: the page becomes a redirect to the survivor
+      const [c] = await ctx.store.query<{ id: string; name: string; fold_sha: string }>(`SELECT id, name, fold_sha FROM entities WHERE id = $1 AND tx_to IS NULL`, [e.canonical_id]);
+      if (!c) return null;
+      return {
+        deps: [{ kind: 'entity', id, required: true, sha: e.fold_sha }, { kind: 'entity', id: c.id, sha: c.fold_sha }],
+        inputsSha: sha16(['entity_stub@2', 'redirect', e.fold_sha, c.id]),
+        data: { entity: e, claims: [], redirect: { id: c.id, name: c.name } },
+      };
+    }
+    const claims = await ctx.store.query<{ id: string; statement: string; status: string; valid_from: string | null; valid_to: string | null; event_at: string | null; superseded_by: string | null; fold_sha: string }>(
+      `SELECT id, statement, status, valid_from, valid_to, event_at, superseded_by, fold_sha FROM claims
+       WHERE subject_id = $1 AND tx_to IS NULL ORDER BY COALESCE(event_at, valid_from) DESC NULLS LAST, tx_from DESC, id LIMIT 30`,
       [id],
     );
     return {
@@ -117,21 +127,37 @@ const entityStub: PageGenerator = {
         { kind: 'entity', id, required: true, sha: e.fold_sha },
         ...claims.map((c) => ({ kind: 'claim' as const, id: c.id, sha: c.fold_sha })),
       ],
-      inputsSha: sha16(['entity_stub@2', e.fold_sha, claims.map((c) => c.fold_sha)]),
+      inputsSha: sha16(['entity_stub@3', e.fold_sha, claims.map((c) => [c.fold_sha, c.superseded_by])]),
       data: { entity: e, claims },
     };
   },
   async render(_ctx, _pagePath, plan) {
     const e = plan.data.entity as { id: string; name: string; type: string; description: string; aliases: string[] };
-    const claims = plan.data.claims as { id: string; statement: string; status: string; valid_from: string | null; valid_to: string | null }[];
-    const lines = [`# ${e.name}`, '', e.description || '_No description yet — fill me in._'];
-    if (claims.length > 0) {
-      lines.push('', '## Facts', '');
-      for (const c of claims) {
+    const claims = plan.data.claims as { id: string; statement: string; status: string; valid_from: string | null; valid_to: string | null; event_at?: string | null; superseded_by?: string | null }[];
+    const redirect = plan.data.redirect as { id: string; name: string } | undefined;
+    const lines = redirect
+      ? [`# ${e.name}`, '', `→ 已合并到 [[${redirect.name}]]（merged into; \`knode-os entities unmerge ${e.id}\` reverts it）`]
+      : [`# ${e.name}`, '', e.description || '_No description yet — fill me in._'];
+    // gbrain's split: the compiled truth (what holds now) above, the dated history below
+    const now = new Date().toISOString();
+    const current = claims.filter((c) => !c.superseded_by && !(toIso(c.valid_to) && toIso(c.valid_to)! < now));
+    if (current.length > 0) {
+      lines.push('', '## Facts (current)', '');
+      for (const c of current) {
         const from = toDateString(c.valid_from);
         const to = toDateString(c.valid_to);
         const period = from || to ? ` \`${from ?? '?'} ~ ${to ?? ''}\`` : '';
         lines.push(`- ${c.statement} \`${c.status}\`${period}`);
+      }
+    }
+    const dated = claims
+      .filter((c) => toIso(c.event_at ?? null) || toIso(c.valid_from))
+      .sort((a, b) => (toIso(a.event_at ?? null) ?? toIso(a.valid_from)!).localeCompare(toIso(b.event_at ?? null) ?? toIso(b.valid_from)!));
+    if (dated.length > 0) {
+      lines.push('', '## Timeline', '');
+      for (const c of dated) {
+        const when = toDateString(c.event_at ?? null) ?? toDateString(c.valid_from);
+        lines.push(`- ${when} · ${c.statement} \`${c.status}\`${c.superseded_by ? ' _(superseded)_' : ''}`);
       }
     }
     return {
@@ -380,7 +406,7 @@ export async function hotEntities(store: Store, limit: number): Promise<HotEntit
      FROM entities e
      JOIN entity_mentions m ON m.entity_id = e.id
      LEFT JOIN doc_stats ds ON ds.document_id = m.document_id
-     WHERE e.tx_to IS NULL
+     WHERE e.tx_to IS NULL AND e.canonical_id IS NULL
      GROUP BY e.id, e.name, e.type, e.description, e.mention_count, e.fold_sha
      ORDER BY (e.mention_count + COALESCE(sum(ds.heat), 0) * 5) DESC, e.name ASC
      LIMIT $1`,
@@ -532,8 +558,55 @@ function conceptLlm(ctx: PagesContext): LlmClient {
     : ctx.llm;
 }
 
+/** `wiki/index.md#recent-research`: the pages research agents wrote, newest first, with their review state. */
+const researchIndex: PageGenerator = {
+  kind: 'research_index',
+  version: 1,
+  llm: false,
+  mode: 'region',
+  async plan(ctx) {
+    const rows = await ctx.store.query<{ output_path: string; kind: string; target: string | null; query: string | null; finished_at: string | Date | null; trust: string | null }>(
+      `SELECT DISTINCT ON (j.output_path) j.output_path, j.kind, j.target, j.query, j.finished_at,
+              (SELECT s.trust FROM scopes s WHERE s.kind = 'doc' AND s.key = j.output_path AND s.status = 'active' ORDER BY s.applied_at DESC LIMIT 1) AS trust
+       FROM research_jobs j WHERE j.status = 'done' AND j.output_path IS NOT NULL
+       ORDER BY j.output_path, j.finished_at DESC`,
+    );
+    if (rows.length === 0) return null;
+    const list = rows
+      .filter((r) => fs.existsSync(safePath(ctx.dataDir, r.output_path)))
+      .sort((a, b) => String(toIso(b.finished_at) ?? '').localeCompare(String(toIso(a.finished_at) ?? '')))
+      .slice(0, 30);
+    const setSha = sha16(list.map((r) => [r.output_path, r.trust, toIso(r.finished_at)]));
+    return {
+      deps: [{ kind: 'set', id: 'research-pages', sha: setSha }],
+      inputsSha: sha16(['research_index@1', setSha]),
+      data: { list: list.map((r) => ({ ...r, finished_at: toIso(r.finished_at) })) },
+    };
+  },
+  async render(_ctx, _pagePath, plan) {
+    const list = plan.data.list as { output_path: string; kind: string; target: string | null; query: string | null; finished_at: string | null; trust: string | null }[];
+    const pending = list.filter((r) => r.trust === 'quarantined').length;
+    const lines = [
+      '## Recent research',
+      '',
+      `Pages written by research agents, newest first${pending ? ` — ${pending} awaiting review (quarantined)` : ''}.`,
+      '',
+      ...list.map((r) => {
+        const name = path.posix.basename(r.output_path, '.md');
+        return `- [[${name}]] — ${r.kind} ${r.target ?? r.query ?? ''} \`${r.trust ?? 'unsynced'}\`${r.finished_at ? ` ${r.finished_at.slice(0, 10)}` : ''}`;
+      }),
+    ];
+    return { frontmatter: {}, regions: { 'recent-research': lines.join('\n') } };
+  },
+};
+
+export async function ensureRecentResearch(ctx: PagesContext, opts: { actor?: string } = {}): Promise<RegenerateOutcome> {
+  return regeneratePage(ctx, 'wiki/index.md#recent-research', 'research_index', { actor: opts.actor ?? 'research', force: true });
+}
+
 export const GENERATORS: Partial<Record<PageKind, PageGenerator>> = {
   entity_stub: entityStub,
+  research_index: researchIndex,
   source_summary: sourceSummary,
   dataset,
   sources_index: sourcesIndex,
@@ -777,7 +850,7 @@ export async function reconcileViews(
 /** Create stub pages for high-mention live entities that don't have a wiki page yet. */
 export async function ensureEntityStubs(ctx: PagesContext, opts: { minMentions?: number; max?: number; actor?: string } = {}): Promise<string[]> {
   const entities = await ctx.store.query<{ id: string }>(
-    `SELECT id FROM entities WHERE wiki_path IS NULL AND mention_count >= $1 AND tx_to IS NULL ORDER BY mention_count DESC LIMIT $2`,
+    `SELECT id FROM entities WHERE wiki_path IS NULL AND mention_count >= $1 AND tx_to IS NULL AND canonical_id IS NULL ORDER BY mention_count DESC LIMIT $2`,
     [opts.minMentions ?? 2, opts.max ?? 30],
   );
   const created: string[] = [];

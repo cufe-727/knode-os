@@ -1,15 +1,21 @@
-import { CLAIM_STATUS, ExtractedClaim, ExtractedEntity } from './store.js';
+import { normalizePredicate, Ontology } from './ontology.js';
+import { CLAIM_STATUS, ExtractedClaim, ExtractedEntity, ExtractedRelation } from './store.js';
 
 /**
- * Tier-0 declarative extraction: documents may carry explicit `entities:` and
- * `claims:` lists in their YAML frontmatter (news feeds, imported facts, seed
- * data). They are applied through the same path as tier-1 LLM extraction, so
- * time-bound validity (startDate/endDate) and status (fact/disputed) work
- * without any LLM configured.
+ * Tier-0 declarative extraction: documents may carry explicit `entities:`,
+ * `relations:` and `claims:` lists in their YAML frontmatter (news feeds,
+ * imported facts, seed data, agent-written wiki pages). They are applied
+ * through the same path as tier-1 LLM extraction, so typed / time-bound
+ * relations and claim status work without any LLM configured.
  *
  * ```yaml
  * entities:
- *   - { name: 宁德时代, type: organization, aliases: ["300750"] }
+ *   - { name: 宁德时代, type: organization, aliases: ["300750", "CATL"] }
+ * relations:                         # list form: explicit source
+ *   - { source: 宁德时代, target: 时代上汽, type: parent_of, from: "2017-01-01" }
+ * relations:                         # map form (gbrain style): the page's own entity is the source
+ *   supplies_to: ["[[特斯拉]]", "蔚来"]
+ *   competes_with: [比亚迪]
  * claims:
  *   - subject: 宁德时代
  *     statement: 2026Q2 净利润 120 亿元
@@ -17,10 +23,40 @@ import { CLAIM_STATUS, ExtractedClaim, ExtractedEntity } from './store.js';
  *     startDate: "2026-08-10"
  * ```
  */
-export function frontmatterExtraction(fm: Record<string, unknown>): { entities: ExtractedEntity[]; claims: ExtractedClaim[] } | null {
+
+export interface DeclaredExtraction {
+  entities: ExtractedEntity[];
+  relations: ExtractedRelation[];
+  claims: ExtractedClaim[];
+}
+
+export interface DeclaredOptions {
+  /** Source of map-form relations and of list entries without `source` (the page's own entity). */
+  defaultSource?: string;
+  /** When given, relation predicates are checked against the ontology and unknown ones reported. */
+  ontology?: Ontology;
+}
+
+/** `[[Name|label]]` → `Name`; plain strings pass through. */
+export function wikilinkName(v: unknown): string {
+  if (typeof v !== 'string') return '';
+  const m = /^\s*\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]\s*$/.exec(v);
+  return (m ? m[1] : v).trim();
+}
+
+function dateStr(v: unknown): string | null {
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  if (typeof v === 'string' && v.trim()) return v.trim();
+  return null;
+}
+
+export function frontmatterExtraction(fm: Record<string, unknown>, opts: DeclaredOptions = {}): DeclaredExtraction | null {
   const rawClaims = Array.isArray(fm.claims) ? fm.claims : [];
   const rawEntities = Array.isArray(fm.entities) ? fm.entities : [];
-  if (rawClaims.length === 0 && rawEntities.length === 0) return null;
+  const rawRelations = fm.relations;
+  const hasRelations = Array.isArray(rawRelations) ? rawRelations.length > 0 : Boolean(rawRelations && typeof rawRelations === 'object');
+  if (rawClaims.length === 0 && rawEntities.length === 0 && !hasRelations) return null;
 
   const entities: ExtractedEntity[] = [];
   const known = new Set<string>();
@@ -33,10 +69,10 @@ export function frontmatterExtraction(fm: Record<string, unknown>): { entities: 
 
   for (const raw of rawEntities) {
     if (typeof raw === 'string' && raw.trim()) {
-      addEntity({ name: raw.trim(), type: 'concept' });
+      addEntity({ name: wikilinkName(raw), type: 'concept' });
     } else if (raw && typeof raw === 'object') {
       const o = raw as Record<string, unknown>;
-      const name = typeof o.name === 'string' ? o.name.trim() : '';
+      const name = typeof o.name === 'string' ? wikilinkName(o.name) : '';
       if (!name) continue;
       addEntity({
         name,
@@ -47,34 +83,72 @@ export function frontmatterExtraction(fm: Record<string, unknown>): { entities: 
     }
   }
 
+  const relations: ExtractedRelation[] = [];
+  const addRelation = (source: string, target: string, type: string, extra: Record<string, unknown> = {}) => {
+    const s = wikilinkName(source);
+    const t = wikilinkName(target);
+    const ty = typeof type === 'string' ? type.trim() : '';
+    if (!s || !t || !ty || s.toLowerCase() === t.toLowerCase()) return;
+    if (opts.ontology && normalizePredicate(opts.ontology, ty).unknown) {
+      // still recorded — the writer keeps the raw spelling and counts it
+    }
+    relations.push({
+      source: s,
+      target: t,
+      type: ty,
+      description: typeof extra.description === 'string' ? extra.description : undefined,
+      validFrom: dateStr(extra.validFrom ?? extra.valid_from ?? extra.from ?? extra.since),
+      validTo: dateStr(extra.validTo ?? extra.valid_to ?? extra.to ?? extra.until),
+    });
+    // endpoints must exist as entities for the edge to be written
+    addEntity({ name: s, type: 'concept' });
+    addEntity({ name: t, type: 'concept' });
+  };
+  if (Array.isArray(rawRelations)) {
+    for (const raw of rawRelations) {
+      if (!raw || typeof raw !== 'object') continue;
+      const o = raw as Record<string, unknown>;
+      const source = typeof o.source === 'string' ? o.source : opts.defaultSource ?? '';
+      const target = typeof o.target === 'string' ? o.target : '';
+      const type = typeof o.type === 'string' ? o.type : typeof o.predicate === 'string' ? o.predicate : '';
+      addRelation(source, target, type, o);
+    }
+  } else if (rawRelations && typeof rawRelations === 'object') {
+    for (const [type, targets] of Object.entries(rawRelations as Record<string, unknown>)) {
+      const list = Array.isArray(targets) ? targets : [targets];
+      for (const t of list) {
+        if (typeof t === 'string') addRelation(opts.defaultSource ?? '', t, type);
+        else if (t && typeof t === 'object') {
+          const o = t as Record<string, unknown>;
+          addRelation(typeof o.source === 'string' ? o.source : opts.defaultSource ?? '', typeof o.target === 'string' ? o.target : '', type, o);
+        }
+      }
+    }
+  }
+
   const claims: ExtractedClaim[] = [];
   for (const raw of rawClaims) {
     if (!raw || typeof raw !== 'object') continue;
     const o = raw as Record<string, unknown>;
-    const subject = typeof o.subject === 'string' ? o.subject.trim() : '';
+    const subject = typeof o.subject === 'string' ? wikilinkName(o.subject) : opts.defaultSource ?? '';
     const statement = typeof o.statement === 'string' ? o.statement.trim() : '';
     if (!subject || !statement) continue;
     const status = typeof o.status === 'string' && (CLAIM_STATUS as readonly string[]).includes(o.status) ? o.status : 'fact';
     claims.push({
       subject,
-      object: typeof o.object === 'string' ? o.object : null,
+      object: typeof o.object === 'string' ? wikilinkName(o.object) : null,
       type: typeof o.type === 'string' && o.type.trim() ? o.type.trim() : 'fact',
       statement,
       status: status as ExtractedClaim['status'],
-      startDate: dateStr(o.startDate ?? o.start_date),
-      endDate: dateStr(o.endDate ?? o.end_date),
+      startDate: dateStr(o.startDate ?? o.start_date ?? o.validFrom ?? o.valid_from),
+      endDate: dateStr(o.endDate ?? o.end_date ?? o.validTo ?? o.valid_to),
+      eventDate: dateStr(o.eventDate ?? o.event_date ?? o.date),
     });
     // claim subjects must resolve to an extracted entity, so ensure one exists
     addEntity({ name: subject, type: 'concept' });
-    if (typeof o.object === 'string' && o.object.trim()) addEntity({ name: o.object.trim(), type: 'concept' });
+    if (typeof o.object === 'string' && wikilinkName(o.object)) addEntity({ name: wikilinkName(o.object), type: 'concept' });
   }
 
-  if (entities.length === 0 && claims.length === 0) return null;
-  return { entities, claims };
-}
-
-function dateStr(v: unknown): string | null {
-  if (v instanceof Date) return v.toISOString().slice(0, 10);
-  if (typeof v === 'string' && v.trim()) return v.trim();
-  return null;
+  if (entities.length === 0 && claims.length === 0 && relations.length === 0) return null;
+  return { entities, relations, claims };
 }

@@ -20,6 +20,7 @@ import { Store } from '../store/db.js';
 import { DocRoot } from '../types.js';
 import { hasProse, hasRegions, stripRegions } from '../wiki/regions.js';
 import { chunkText } from './chunker.js';
+import { docDateOf } from './docdate.js';
 import { EmbeddingProvider } from './embeddings.js';
 import { loadSourceText, sha256 } from './source.js';
 
@@ -36,7 +37,9 @@ import { loadSourceText, sha256 } from './source.js';
  *   - sources (raw docs, skills, human wiki pages, anchors) contribute
  *     entities / relations / claims;
  *   - views (generated pages, recognised by a live `pages` row or
- *     `generated: true`) are indexed for search only. Only prose a human wrote
+ *     `generated: true` without an explicit `actor`) are indexed for search only.
+ *     A page that names its author (`actor: agent/…`, a research page) is a
+ *     Source whatever its `generated` key says — trust follows that actor. Only prose a human wrote
  *     outside the managed regions counts as evidence (`extractor: human`) —
  *     that is what stops a stub page from resurrecting the entity it describes.
  *   - reserved files (index.md / log.md) never touch the graph.
@@ -85,7 +88,8 @@ async function classify(store: Store, file: string, root: DocRoot, parsed: Parse
   if (root !== 'wiki') return { kind: 'source', graph: true, selfEntity: undefined, humanBody: parsed.body };
   if (isReservedWikiFile(file)) return { kind: 'source', graph: false, selfEntity: false, humanBody: parsed.body };
   const [pageRow] = await store.query<{ status: string }>(`SELECT status FROM pages WHERE path = $1 AND tx_to IS NULL`, [file]);
-  const generated = pageRow !== undefined || isGeneratedConcept(parsed.frontmatter);
+  const authored = typeof parsed.frontmatter.actor === 'string' && parsed.frontmatter.actor.trim() !== '';
+  const generated = pageRow !== undefined || (isGeneratedConcept(parsed.frontmatter) && !authored);
   if (generated) {
     // legacy generated pages without markers are fully managed
     const humanBody = hasRegions(parsed.body) ? stripRegions(parsed.body) : '';
@@ -122,6 +126,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const parsed = parseFrontmatter(raw);
   const title = titleFromMarkdown(file, parsed);
   const cls = await classify(store, file, root, parsed);
+  const docDate = docDateOf(file, parsed.frontmatter);
 
   /* ── pure preparation: chunking, embeddings (network), tier-0 plans ── */
   const pieces = await chunkText(file, parsed.body, config.ingest, { markdown: source.derived || undefined });
@@ -142,8 +147,11 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
 
   const page: PageContext = { documentId: docId, path: file, title: title ?? path.basename(file), chunkIds: chunkRows.map((c) => ({ id: c.id, content: c.content })) };
   const isSource = cls.kind === 'source';
+  // a source wiki page may carry machine-maintained regions (a timeline the
+  // page generator refreshes); only its prose is evidence, the regions are not
+  const sourceBody = root === 'wiki' && hasRegions(parsed.body) ? stripRegions(parsed.body) : parsed.body;
   const wirePlan = isSource && cls.graph
-    ? planWireFromMarkdown(store.dataDir, page, parsed, { selfEntity: cls.selfEntity, wikiIndex: opts.wikiIndex })
+    ? planWireFromMarkdown(store.dataDir, page, parsed, { selfEntity: cls.selfEntity, wikiIndex: opts.wikiIndex, body: sourceBody })
     : null;
   const humanPlan = !isSource && cls.graph
     ? planWireFromMarkdown(store.dataDir, page, { frontmatter: parsed.frontmatter, body: cls.humanBody }, { selfEntity: true, body: cls.humanBody, wikiIndex: opts.wikiIndex })
@@ -179,7 +187,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     },
     async (w) => {
       await w.document(
-        { id: docId, path: file, root, title, sha256: sha, mime: guessMime(file), bytes, kind: cls.kind },
+        { id: docId, path: file, root, title, sha256: sha, mime: guessMime(file), bytes, kind: cls.kind, docDate },
         chunkRows,
         vectors,
         embedder.model,
@@ -187,14 +195,28 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
       if (wirePlan) {
         const s = await applyWirePlan(w, page, wirePlan, { extractor: 'tier0.wikilink' });
         g = { entities: g.entities + s.entities, relations: g.relations + s.relations };
+        // a bundle page may declare entities, typed relations and claims in its
+        // frontmatter (research pages do); its own entity is the default subject
+        if (wirePlan.self && (parsed.frontmatter.relations || parsed.frontmatter.claims || parsed.frontmatter.entities)) {
+          const declaredWiki = frontmatterExtraction(
+            { relations: parsed.frontmatter.relations, claims: parsed.frontmatter.claims, entities: parsed.frontmatter.entities },
+            { defaultSource: wirePlan.self.name },
+          );
+          if (declaredWiki) {
+            const dg = await applyExtraction(w, page, declaredWiki.entities, declaredWiki.relations, declaredWiki.claims, 'tier0.frontmatter', { docDate });
+            g = { entities: g.entities, relations: g.relations + dg.relations };
+          }
+        }
       }
       if (root === 'docs' && isSource) {
-        const cg = await wireConcepts(w, page, concepts);
-        g = { entities: g.entities + cg.entities, relations: g.relations + cg.relations };
+        // declared facts first: they carry names, types and aliases the concept
+        // miner's bare terms then resolve onto instead of minting duplicates
         if (declared) {
-          const dg = await applyExtraction(w, page, declared.entities, [], declared.claims, 'tier0.frontmatter');
+          const dg = await applyExtraction(w, page, declared.entities, declared.relations, declared.claims, 'tier0.frontmatter', { docDate });
           g = { entities: g.entities + dg.entities, relations: g.relations + dg.relations };
         }
+        const cg = await wireConcepts(w, page, concepts);
+        g = { entities: g.entities + cg.entities, relations: g.relations + cg.relations };
         if (!tier1 && opts.queueTier1) await w.enqueueTier1(docId);
       }
       // a capabilities/*.md file is an ordinary source *and* the semantic layer
@@ -229,6 +251,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     const meta = updateSidecarPart(store.dataDir, file, 'meta', (m) => ({
       ...m!,
       title,
+      docDate,
       contentSha256: sha,
       ingestedAt: now,
       chunks: chunkRows.map((c) => ({ id: c.id, seq: c.seq, tokenCount: c.tokenCount })),
@@ -239,7 +262,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
         concepts,
         wikilinks: extractWikilinks(parsed.body),
         extractedAt: now,
-        declared: declared ? { entities: declared.entities, claims: declared.claims } : null,
+        declared: declared ? { entities: declared.entities, relations: declared.relations, claims: declared.claims } : null,
       }));
       await restoreUsageFromSidecar(store, docId, readSidecarPart(store.dataDir, file, 'usage'));
     }
@@ -251,7 +274,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
         sha,
         { parentId: res.scope.id, actor: 'tier1', at: opts.at, meta: { documentId: docId, model: tier1.model } },
         async (w) => {
-          const lg = await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`);
+          const lg = await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`, { docDate });
           g = { entities: g.entities + lg.entities, relations: g.relations + lg.relations };
         },
       );
@@ -267,6 +290,8 @@ async function ensureTier1Replay(store: Store, file: string, sha: string, docId:
   const child = await findLiveScope(store, 'tier1', file);
   if (child && child.sha === sha) return;
   const chunks = await store.query<{ id: string; content: string }>(`SELECT id, content FROM chunks WHERE document_id = $1 ORDER BY seq`, [docId]);
+  const [docRow] = await store.query<{ doc_date: string | Date | null }>(`SELECT doc_date FROM documents WHERE id = $1`, [docId]);
+  const docDate = docRow?.doc_date ? new Date(docRow.doc_date).toISOString() : null;
   const page: PageContext = { documentId: docId, path: file, title: path.basename(file), chunkIds: chunks };
   await applyScope(
     store,
@@ -274,7 +299,7 @@ async function ensureTier1Replay(store: Store, file: string, sha: string, docId:
     sha,
     { parentId, actor: 'tier1', at: opts.at, meta: { documentId: docId, model: tier1.model } },
     async (w) => {
-      await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`);
+      await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`, { docDate });
     },
   );
 }

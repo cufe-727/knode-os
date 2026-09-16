@@ -102,7 +102,7 @@ CLI-only data directories continue to use `<data>/knode.config.json`:
     "dimensions": 1536
   },
   "database": {                      // where the derived index lives
-    "kind": "pglite",                // "pglite" = embedded, zero setup; "postgres" = external server
+    "kind": "postgres",              // default: PostgreSQL (one shared database, a schema per workspace); "pglite" = embedded, zero setup
     "host": "127.0.0.1", "port": 5432,
     "user": "", "password": "",      // password also takes "env:VAR"; empty for trust/peer auth
     "database": "knode",             // one shared database, created on first open
@@ -145,9 +145,9 @@ CLI-only data directories continue to use `<data>/knode.config.json`:
 
 Any OpenAI-compatible endpoint works (Ollama, vLLM, SiliconFlow, …). For embeddings, `"provider": "ark-multimodal"` additionally targets Volcengine Ark's `/embeddings/multimodal` route (`doubao-embedding-vision-*`), which is not OpenAI-shaped: it returns one fused vector per request, so `baseUrl` ends at `/api/v3`, `model` is the endpoint id (`ep-…`), and `batchSize` becomes the concurrency window over single-text calls. Entity extraction, concept synthesis and document vision can independently inherit the default LLM or use their own route. Image/scanned-PDF conversion supports a vision-capable OpenAI-compatible model, Codex CLI or Claude Code CLI. Text PDFs are extracted locally without an LLM. Changing `dimensions` drops and rebuilds the embedding table on next start. Everything can also be edited from the web UI's **Settings** tab (with route tests).
 
-The index is an embedded PGlite database per workspace by default — nothing to install. Point `database.kind` at `postgres` to put the same schema on an external server instead: all workspaces share one database and are isolated by schema, each created on first open. That is worth doing once a workspace outgrows PGlite's single-process 32-bit WASM build (roughly a million chunks) or when several processes must read one index at once. Schema-level isolation is deliberate — a database would carry its own ~8 MB catalog per workspace, while folding every workspace into shared tables keyed by a workspace column would cost the vector index outright: HNSW walks a distance-ordered neighbour graph, so an equality predicate on a scalar column cannot be pushed into the walk and the planner falls back to a sequential scan. Embedding vectors are stored as `halfvec`: pgvector caps an index entry at one 8 KB page, which is 2000 dims for `vector` but 4000 for `halfvec`, so half precision is what keeps the HNSW index reachable at 1536/2048 dims — and halves the table. Switching an existing database between the two column types converts in place without re-embedding.
+The index lives in PostgreSQL by default (set `KNODE_DATABASE_KIND=pglite` before the first run, or `database.kind: "pglite"`, for the embedded zero-setup index that the test suite also uses). With `postgres` the same schema sits on the server: all workspaces share one database and are isolated by schema, each created on first open. That is worth doing once a workspace outgrows PGlite's single-process 32-bit WASM build (roughly a million chunks) or when several processes must read one index at once. Schema-level isolation is deliberate — a database would carry its own ~8 MB catalog per workspace, while folding every workspace into shared tables keyed by a workspace column would cost the vector index outright: HNSW walks a distance-ordered neighbour graph, so an equality predicate on a scalar column cannot be pushed into the walk and the planner falls back to a sequential scan. Embedding vectors are stored as `halfvec`: pgvector caps an index entry at one 8 KB page, which is 2000 dims for `vector` but 4000 for `halfvec`, so half precision is what keeps the HNSW index reachable at 1536/2048 dims — and halves the table. Switching an existing database between the two column types converts in place without re-embedding.
 
-Further config blocks (see `knode-os config` for the full active set with defaults): `ingest` (chunk size/overlap, file watching), `extraction` (daily token budget, batch size, interval, tier-1/2 models, claims on/off), `retrieval.sag` (seed/frontier/candidate limits, hop count, direct-route ratio), `heat` (usage-heat half-life, search boost weight, cold threshold), `trace` (Claude/Codex trace directories, skill dirs, sync interval), `server` (host/port).
+Further config blocks (see `knode-os config` for the full active set with defaults): `ingest` (chunk size/overlap, file watching), `extraction` (daily token budget, batch size, interval, tier-1/2 models, claims on/off), `retrieval.sag` (seed/frontier/candidate limits, hop count, direct-route ratio), `heat` (usage-heat half-life, search boost weight, cold threshold), `trace` (Claude/Codex trace directories, skill dirs, sync interval), `server` (host/port, and `server.mcp` — the Streamable HTTP MCP endpoint `serve` hosts at `/mcp`), `graph.ontologyPacks` (which `playbooks/ontology/*.yaml` packs define entity and relation types), `research` (which coding-agent CLI writes deep-research wiki pages: `agent` = `claude-cli` / `codex-cli` / `cursor-cli` or a connection id, `model`, `profile` = a research profile under `playbooks/research/profiles/` (reasoning effort, web search freshness, verification bar and the sub-agent roles, each with its own CLI, model, tools and prompt — built-ins `default` / `quick` / `thorough` / `native`, editable in Settings → Deep research), `pipeline` = `team` (plan, parallel research, synthesize, review, revise), `native` (one session with the roles as the CLI's own sub-agents) or `single`, `maxTurns`, `timeoutMs`, `concurrency`, `readDirs`, `researchers`, `reviewRounds`, `auto.enabled` / `auto.dailyJobs`) and `review` (how much checking sits between extraction and the graph: `resolution` = `exact` | `suffix` for write-time merges, `llmJudge` = `off` | `suggest` | `auto` with `llmMinConfidence` / `autoMergeMinConfidence`, `claims` = `off` | `suggest`, `external` = `off` | `verify` | `research` for the agent's web tools). See [docs/design/06](docs/design/06-wiki-research-agent.md).
 
 The LLM unlocks: tier-1 entity/relation/claim extraction into the graph, `ask` answers, `wiki generate` source summaries, tier-2 community pages, and LLM-grade dream analysis. Without it, everything still runs on deterministic/heuristic paths.
 
@@ -195,8 +195,15 @@ knode-os wiki generate        source summary pages + entity stubs
 knode-os wiki refine          tier-2: hot-community concept pages + claim audit + hot topics
 knode-os trace sync           pull new Claude Code / Codex traces + skills
 knode-os dream [--lookback d] sync traces, then analyze → skills/memory/knowledge suggestions
-knode-os mcp                  MCP server on stdio
-knode-os connect claude|codex register the MCP server with your agent CLI
+knode-os mcp                  MCP server on stdio (standalone; next to a running serve use --http below)
+knode-os connect claude|codex|cursor [--stdio]  register the MCP endpoint serve hosts (Streamable HTTP; --stdio for a standalone process)
+knode-os research queue <kind> <target> [--now]   have a coding-agent CLI write a wiki page (entity|concept|comparison|timeline|question|refresh)
+knode-os research ask "<question>"   answer a question and file it as wiki/questions/<slug>.md
+knode-os research list|show|run|cancel|retry|recommend|templates|export|reclaim
+knode-os research profiles | profile <name> [--use]   research profiles: effort, web search, verification, sub-agent roles and prompts
+knode-os entities merge|unmerge|merges|dedupe|resolve   entity resolution: reversible merges and the duplicate audit
+knode-os review entities|claims   the review passes (LLM judge over duplicate candidates; verdicts on disputed / suspected claims)
+knode-os wiki lint             orphans, broken links, stale / unreviewed research pages, expired and superseded text
 knode-os config               show active config (redacted)
 ```
 
@@ -205,8 +212,10 @@ Every command takes `--data <path>` (or set `KNODE_OS_DATA`).
 ## Use from Claude Code / Codex
 
 ```bash
-knode-os connect claude   # runs: claude mcp add --scope user knode-os -- node <cli> mcp --data <dir>
-knode-os connect codex    # appends [mcp_servers.knode-os] to ~/.codex/config.toml
+knode-os connect claude   # registers http://127.0.0.1:9100/mcp (Streamable HTTP; bearer token in <data>/.knode/mcp-token) with claude mcp add
+knode-os connect codex    # codex mcp add --url … --bearer-token-env-var KNODE_MCP_TOKEN (export the token in your shell)
+knode-os connect cursor   # writes the endpoint into ~/.cursor/mcp.json
+knode-os connect claude --stdio   # without a running serve: a standalone `knode-os mcp` process (opens the index itself)
 ```
 
 MCP tools exposed: `knode_resolve` (the one to call first — see below), `knode_plan`, `knode_feedback`, `knode_capabilities`, `knode_checkout` / `knode_commit` / `knode_worksets` (pin a consistent view for a long task, then write conclusions back as a source), `knode_absences` (what we looked for and did not find), `knode_disputes` / `knode_trust` (contradictions, and promoting a quarantined write), `knode_subscribe` (watch an entity, source or intent), `knode_learning` (what the planner has learned), `knode_search`, `knode_graph_search`, `knode_claims`, `knode_ask`, `knode_ls`, `knode_read` (a path starting with `/` reads the virtual filesystem; a PDF or image under raw/docs returns its derived Markdown), `knode_write` (wiki/, raw/docs and playbooks/packs/ only), `knode_grep`, `knode_ingest` / `knode_sync`, `knode_lineage`, `knode_history`, `knode_forget`, `knode_okf_validate`, `knode_graph_insights`, `knode_suggestions`, `knode_context_pack`, `knode_datasources`, `knode_query` (read-only native SQL; `source="catalog"` queries the knowledge base's own `v_*` views). Three independent time axes: `as_of` (system time — what was believed then), `valid_at` / `valid_range` (world time — when a claim holds), and `freshness` (how old a live read may be); `kinds` / `sources` bound which sources may answer.

@@ -1,7 +1,7 @@
 import { HeatConfig, SagSearchConfig, defaultConfig } from '../config.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { NO_FILTER, ResolvedScopeFilter, documentFilterSql } from '../store/resolver.js';
-import { Params, TimeInput, toIso } from '../store/temporal.js';
+import { Params, TimeInput, toIso, toDateString } from '../store/temporal.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { getDocHeat, recordChunkHits } from '../stats/heat.js';
 import { SearchResult } from '../types.js';
@@ -26,6 +26,7 @@ export interface SearchOptions {
 }
 
 interface RankedChunk {
+  doc_date?: string | Date | null;
   chunk_id: string;
   document_id: string;
   path: string;
@@ -109,7 +110,7 @@ async function vectorSearch(
   const cond = docLiveAt('d', p, asOf, filter);
   const lim = p.add(k);
   return store.query<RankedChunk>(
-    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, c.content,
+    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
             1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw
      FROM embeddings e
      JOIN chunks c ON c.id = e.chunk_id
@@ -127,7 +128,7 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
   const cond = docLiveAt('d', p, asOf, filter);
   const lim = p.add(k);
   const fts = await store.query<RankedChunk>(
-    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, c.content,
+    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
             ts_rank(c.tsv, websearch_to_tsquery('simple', $1)) AS raw
      FROM chunks c
      JOIN documents d ON d.id = c.document_id
@@ -148,7 +149,7 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
   const lcond = docLiveAt('d', lp, asOf, filter);
   const llim = lp.add(k);
   const like = await store.query<RankedChunk>(
-    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, c.content, (${hitCount})::float AS raw
+    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, (${hitCount})::float AS raw
      FROM chunks c JOIN documents d ON d.id = c.document_id
      WHERE (${conds}) AND ${lcond}
      ORDER BY raw DESC
@@ -171,7 +172,7 @@ async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput
   const cond = docLiveAt('d', p, asOf, filter);
   const lim = p.add(k);
   return store.query<RankedChunk>(
-    `SELECT DISTINCT c.id AS chunk_id, c.document_id, d.path, d.title, c.content,
+    `SELECT DISTINCT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
             e.mention_count::float AS raw
      FROM entities e
      JOIN entity_mentions m ON m.entity_id = e.id
@@ -227,6 +228,7 @@ export async function search(
           path: r.path,
           title: r.title,
           content: r.content,
+          docDate: toDateString(r.doc_date ?? null),
           score,
           signals: { [signal]: r.raw },
         });

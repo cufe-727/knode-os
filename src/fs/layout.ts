@@ -8,7 +8,7 @@ import path from 'node:path';
  *   ├── raw/{docs,traces,skills}   originals; the raw path is the canonical key of every source
  *   ├── .sidecar/<key>/            derived, system-owned state mirroring the data dir (keep it)
  *   ├── wiki/                      curated knowledge (OKF bundle + Obsidian vault)
- *   ├── playbooks/{packs,capabilities,intents}   agent-editable configuration
+ *   ├── playbooks/{packs,capabilities,intents,ontology,research}   agent-editable configuration
  *   ├── ledger/                    events.jsonl + attic (machine truth)
  *   └── .knode/db                  PGlite index (disposable)
  *
@@ -29,6 +29,10 @@ export const PACKS_DIR = `${CONFIG_DIR}/packs`;
 export const CAPABILITIES_DIR = `${CONFIG_DIR}/capabilities`;
 /** Intent specs: the slots an answer needs (see src/compiler). */
 export const INTENTS_DIR = `${CONFIG_DIR}/intents`;
+/** Ontology packs: the entity and relation vocabulary the graph is written in (see src/graph/ontology). */
+export const ONTOLOGY_DIR = `${CONFIG_DIR}/ontology`;
+/** Deep-research templates: what an external agent is told when asked to write a wiki page (see src/research). */
+export const RESEARCH_DIR = `${CONFIG_DIR}/research`;
 
 export const LEDGER_DIR = 'ledger';
 export const ATTIC_DIR = `${LEDGER_DIR}/attic`;

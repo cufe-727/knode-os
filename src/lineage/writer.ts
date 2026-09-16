@@ -4,12 +4,14 @@ import { safePath } from '../fs/files.js';
 import {
   CLAIM_STATUS,
   claimId,
-  ENTITY_TYPES,
   ExtractedEntity,
-  RELATION_TYPES,
   relationId,
   slugify,
 } from '../graph/store.js';
+import { entityTypeIds, loadOntology, normalizePredicate, Ontology, relationSpec } from '../graph/ontology.js';
+import { resolutionMode, resolveEntityId, ResolvedEntity } from '../graph/resolve.js';
+import { entityKeyKinds, KeyKind, mentionKeys, typesCompatible } from '../graph/normalize.js';
+import { ReviewResolution } from '../config.js';
 import { toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
 import { toIso } from '../store/temporal.js';
@@ -50,6 +52,8 @@ export interface DocumentProjection {
   mime: string;
   bytes: number;
   kind: 'source' | 'view';
+  /** Reference date of the source (ISO), when one was found. */
+  docDate?: string | null;
 }
 
 export interface ChunkRow {
@@ -124,7 +128,15 @@ export interface NewSuggestion {
 export class ScopeWriter {
   readonly touched: TouchedSet = emptyTouched();
   readonly fsOps: FsOp[] = [];
-  readonly stats: WriterStats = { entities: 0, relations: 0, claims: 0, mentions: 0, chunks: 0, effects: 0, capabilities: 0, locators: 0 };
+  readonly stats: WriterStats = { entities: 0, relations: 0, claims: 0, mentions: 0, chunks: 0, effects: 0, capabilities: 0, locators: 0, unknownPredicates: 0 };
+  private readonly entityTypes: Set<string>;
+  private readonly resolveCache = new Map<string, ResolvedEntity>();
+  /** Lookup keys of entities written by this scope body — the fold publishes them only after commit. */
+  private readonly localKeys = new Map<string, { id: string; name: string; type: string; kind: KeyKind }>();
+  /** review.resolution: 'exact' (spelling must match) or 'suffix' (corporate suffixes ignored). */
+  private readonly resolution: ReviewResolution;
+  /** Ids this body has written outright (a later mention with that slug is the same entity, not a redirect). */
+  private readonly localIds = new Set<string>();
   private readonly seenEvidence = new Set<string>();
   /** Entity ids known to exist in this transaction (created here or verified once). */
   private readonly knownEntities = new Set<string>();
@@ -136,29 +148,63 @@ export class ScopeWriter {
     readonly dataDir: string,
     /** Tier every evidence row this scope writes is stamped with. */
     readonly trust: TrustTier = 'trusted',
-  ) {}
+    /** Vocabulary the writes are validated against (the data dir's packs by default). */
+    readonly ontology: Ontology = loadOntology(dataDir),
+  ) {
+    this.entityTypes = entityTypeIds(ontology);
+    this.resolution = resolutionMode(dataDir);
+  }
 
   /* ------------------------------ evidence ------------------------------ */
 
-  /** Entity evidence. `id` overrides slugify(name) when the value resolved to an existing entity via alias. */
-  async entity(e: ExtractedEntity, o: { extractor: string; weight?: number; segmentId?: string | null; id?: string }): Promise<string> {
+  /**
+   * Entity evidence. Without an explicit `id` the mention is resolved first
+   * (graph/resolve.ts): an entity already known under another spelling, or one
+   * merged into a survivor, receives the evidence instead of a new row, and
+   * the mention's own spelling is kept as an alias so the fold surfaces it.
+   */
+  async entity(e: ExtractedEntity, o: { extractor: string; weight?: number; segmentId?: string | null; id?: string; sameAs?: string | null }): Promise<string> {
     const name = e.name.trim();
-    const id = o.id ?? slugify(name);
-    const type = ENTITY_TYPES.includes(e.type) ? e.type : 'concept';
+    let id = o.id;
+    let resolved: ResolvedEntity | null = null;
+    if (!id) {
+      const slug = slugify(name);
+      const local = this.localIds.has(slug) ? null : this.findLocal(name, e.aliases ?? [], e.type);
+      if (local && local.id !== slug) resolved = { id: local.id, name: local.name, resolvedFrom: name };
+      else resolved = await resolveEntityId(this.q, { name, type: e.type, aliases: e.aliases, sameAs: o.sameAs ?? e.sameAs ?? null }, this.resolveCache, { mode: this.resolution });
+      id = resolved.id;
+    }
+    const type = this.entityTypes.has(e.type) ? e.type : 'concept';
+    const aliases = (e.aliases ?? []).map(String);
+    const redirected = Boolean(resolved?.resolvedFrom);
+    if (redirected && name && !aliases.some((a) => a.toLowerCase() === name.toLowerCase())) aliases.push(name);
+    const evidenceName = (redirected ? resolved?.name : undefined) ?? name ?? id;
     await this.q.query(
       `INSERT INTO entities (id, name, type, description, aliases, tx_from)
        VALUES ($1, $2, $3, $4, $5::jsonb, $6::timestamptz) ON CONFLICT (id) DO NOTHING`,
-      [id, name || id, type, e.description ?? '', JSON.stringify(e.aliases ?? []), this.txTime],
+      [id, evidenceName || id, type, e.description ?? '', JSON.stringify(aliases), this.txTime],
     );
     await this.addEvidence('entity', id, o.extractor, o.weight ?? 1, o.segmentId ?? null, {
-      name: name || id,
+      name: evidenceName || id,
       type,
       description: e.description ?? '',
-      aliases: (e.aliases ?? []).map(String),
+      aliases,
+      ...(redirected ? { resolved_from: resolved!.resolvedFrom } : {}),
     });
+    for (const [k, kind] of entityKeyKinds(evidenceName, aliases)) if (!this.localKeys.has(k)) this.localKeys.set(k, { id, name: evidenceName || id, type, kind });
+    this.localIds.add(id);
     this.knownEntities.add(id);
     this.touched.entities.add(id);
     return id;
+  }
+
+  /** An entity this body already wrote that answers to one of the mention's keys (same type, or an untyped placeholder on either side). */
+  private findLocal(name: string, aliases: string[], type: string): { id: string; name: string; type: string } | null {
+    for (const k of mentionKeys(name, aliases, this.resolution)) {
+      const hit = this.localKeys.get(k);
+      if (hit && (this.resolution === 'suffix' || hit.kind === 'exact') && typesCompatible(type, hit.type)) return hit;
+    }
+    return null;
   }
 
   private async entitiesExist(ids: string[]): Promise<boolean> {
@@ -170,23 +216,39 @@ export class ScopeWriter {
     return rows.length === unknown.length;
   }
 
+  /**
+   * A typed edge. The predicate is normalized against the ontology: a synonym
+   * becomes the canonical id, an inverse reading (`parent_of`) becomes the
+   * canonical id with the endpoints swapped, a symmetric predicate is stored
+   * once with ordered endpoints, and an unknown spelling falls back to
+   * `related_to` while keeping the original in `attrs.raw_type` and counting
+   * it in `stats.unknownPredicates`.
+   */
   async relation(
     sourceId: string,
     targetId: string,
-    r: { type: string; description?: string; weight?: number; extractor: string; segmentId?: string | null },
+    r: { type: string; description?: string; weight?: number; extractor: string; segmentId?: string | null; validFrom?: string | null; validTo?: string | null },
   ): Promise<string | null> {
     if (sourceId === targetId) return null;
     if (!(await this.entitiesExist([sourceId, targetId]))) return null;
-    const type = RELATION_TYPES.includes(r.type) ? r.type : 'related_to';
-    const id = relationId(sourceId, type, targetId);
+    const norm = normalizePredicate(this.ontology, r.type);
+    const type = norm.type;
+    let [a, b] = norm.flip ? [targetId, sourceId] : [sourceId, targetId];
+    const spec = relationSpec(this.ontology, type);
+    if (spec?.symmetric && !spec.system && a > b) [a, b] = [b, a];
+    if (norm.unknown) this.stats.unknownPredicates++;
+    const id = relationId(a, type, b);
     await this.q.query(
       `INSERT INTO relations (id, source_id, target_id, type, description, weight, tx_from)
        VALUES ($1, $2, $3, $4, $5, 0, $6::timestamptz) ON CONFLICT (id) DO NOTHING`,
-      [id, sourceId, targetId, type, r.description ?? '', this.txTime],
+      [id, a, b, type, r.description ?? '', this.txTime],
     );
     const added = await this.addEvidence('relation', id, r.extractor, r.weight ?? 1, r.segmentId ?? null, {
       type,
       description: r.description ?? '',
+      valid_from: toIso(r.validFrom),
+      valid_to: toIso(r.validTo),
+      ...(norm.unknown ? { raw_type: norm.unknown } : {}),
     });
     if (added) this.stats.relations++;
     this.touched.relations.add(id);
@@ -202,6 +264,10 @@ export class ScopeWriter {
       status: string;
       validFrom?: string | null;
       validTo?: string | null;
+      /** When the asserted event happened (world time), if distinct from the validity window. */
+      eventAt?: string | null;
+      /** Reference date of the source that made the assertion. */
+      observedAt?: string | null;
       extractor: string;
       segmentId?: string | null;
       weight?: number;
@@ -224,6 +290,8 @@ export class ScopeWriter {
       statement,
       valid_from: validFrom,
       valid_to: validTo,
+      event_at: toIso(c.eventAt),
+      observed_at: toIso(c.observedAt),
       object_id: c.objectId ?? null,
     });
     if (added) this.stats.claims++;
@@ -282,12 +350,12 @@ export class ScopeWriter {
     // a pre-lineage row may hold this path under another id: it is replaced wholesale
     await this.q.query(`DELETE FROM documents WHERE path = $1 AND id <> $2`, [row.path, row.id]);
     await this.q.query(
-      `INSERT INTO documents (id, path, root, title, sha256, mime, bytes, status, scope_id, kind)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'indexed', $8, $9)
+      `INSERT INTO documents (id, path, root, title, sha256, mime, bytes, status, scope_id, kind, doc_date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'indexed', $8, $9, $10::timestamptz)
        ON CONFLICT (id) DO UPDATE SET
          path = EXCLUDED.path, root = EXCLUDED.root, title = EXCLUDED.title, sha256 = EXCLUDED.sha256, mime = EXCLUDED.mime,
-         bytes = EXCLUDED.bytes, status = 'indexed', error = NULL, scope_id = EXCLUDED.scope_id, kind = EXCLUDED.kind, updated_at = now()`,
-      [row.id, row.path, row.root, row.title, row.sha256, row.mime, row.bytes, this.scope.id, row.kind],
+         bytes = EXCLUDED.bytes, status = 'indexed', error = NULL, scope_id = EXCLUDED.scope_id, kind = EXCLUDED.kind, doc_date = EXCLUDED.doc_date, updated_at = now()`,
+      [row.id, row.path, row.root, row.title, row.sha256, row.mime, row.bytes, this.scope.id, row.kind, toIso(row.docDate)],
     );
     if (chunks.length === 0) {
       await this.q.query(`DELETE FROM chunks WHERE document_id = $1`, [row.id]);
@@ -333,6 +401,32 @@ export class ScopeWriter {
     await this.effect('wiki_path', entityId, { op: 'wiki_path.restore', entityId, prev: cur.wiki_path }, async () => {
       await this.q.query(`UPDATE entities SET wiki_path = $2 WHERE id = $1`, [entityId, wikiPath]);
     });
+  }
+
+  /**
+   * Record "entity is the same as canonical" (graph/merge.ts). An explicit
+   * effect with an inverse, so disposing the merge scope restores the previous
+   * canonical pointer; chains are flattened so nothing ever points at a merged
+   * entity. Both entities are touched: the survivor's lookup keys are rebuilt
+   * by the fold to include the merged entity's names.
+   */
+  async linkEntity(l: { entityId: string; canonicalId: string; reason?: string; actor?: string }): Promise<string> {
+    const linkId = crypto.createHash('sha256').update(`link|${l.entityId}|${l.canonicalId}`).digest('hex').slice(0, 16);
+    const [cur] = await this.q.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM entities WHERE id = $1`, [l.entityId]);
+    await this.effect('entity_link', l.entityId, { op: 'entity_link.remove', linkId, entityId: l.entityId, prevCanonical: cur?.canonical_id ?? null }, async () => {
+      await this.q.query(
+        `INSERT INTO entity_links (id, entity_id, canonical_id, kind, scope_id, actor, reason, created_at, tx_to)
+         VALUES ($1, $2, $3, 'same_as', $4, $5, $6, $7::timestamptz, NULL)
+         ON CONFLICT (id) DO UPDATE SET scope_id = EXCLUDED.scope_id, actor = EXCLUDED.actor, reason = EXCLUDED.reason,
+           created_at = EXCLUDED.created_at, tx_to = NULL`,
+        [linkId, l.entityId, l.canonicalId, this.scope.id, l.actor ?? this.scope.actor, l.reason ?? '', this.txTime],
+      );
+      await this.q.query(`UPDATE entities SET canonical_id = $2 WHERE id = $1`, [l.entityId, l.canonicalId]);
+      await this.q.query(`UPDATE entities SET canonical_id = $2 WHERE canonical_id = $1`, [l.entityId, l.canonicalId]);
+    });
+    this.touched.entities.add(l.entityId);
+    this.touched.entities.add(l.canonicalId);
+    return linkId;
   }
 
   async upsertDataset(row: DatasetUpsert): Promise<void> {

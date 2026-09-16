@@ -1,4 +1,7 @@
 import crypto from 'node:crypto';
+import { applyMerge } from '../graph/merge.js';
+import { queueJob } from '../research/jobs.js';
+import { ResearchKind } from '../research/templates.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
@@ -129,10 +132,30 @@ export async function optimizePacks(
  * goes through exactly this gate, which is why nothing distillation proposes
  * takes effect until a person says so.
  */
-export async function applySuggestion(store: Store, dataDir: string, id: string): Promise<{ applied: boolean; path?: string }> {
+export async function applySuggestion(
+  store: Store,
+  dataDir: string,
+  id: string,
+): Promise<{ applied: boolean; path?: string; merged?: { entityId: string; canonicalId: string }; job?: { id: string; kind: string } }> {
   const s = await getSuggestion(store, id);
-  const writable = s?.kind === 'pack' || s?.kind === 'recipe';
-  if (!s || !writable || !s.payload?.path || typeof s.payload.content !== 'string') return { applied: false };
+  if (!s) return { applied: false };
+  if (s.kind === 'wiki') {
+    // a recommended page: accepting queues the research job
+    const p = s.payload as { kind?: string; target?: string } | null;
+    if (!p?.target) return { applied: false };
+    const kind = (p.kind ?? 'entity') as ResearchKind;
+    const { job } = await queueJob(store, kind === 'question' ? { kind, query: p.target, requestedBy: 'suggestion' } : { kind, target: p.target, requestedBy: 'suggestion' });
+    return { applied: true, job: { id: job.id, kind: job.kind } };
+  }
+  if (s.kind === 'merge') {
+    // a duplicate-entity proposal: accepting records the reversible link
+    const p = s.payload as { entityId?: string; canonicalId?: string; reason?: string } | null;
+    if (!p?.entityId || !p?.canonicalId) return { applied: false };
+    const r = await applyMerge(store, { entityId: p.entityId, canonicalId: p.canonicalId, reason: p.reason ?? `suggestion ${id}`, actor: 'user' });
+    return { applied: true, merged: { entityId: r.entityId, canonicalId: r.canonicalId } };
+  }
+  const writable = s.kind === 'pack' || s.kind === 'recipe';
+  if (!writable || !s.payload?.path || typeof s.payload.content !== 'string') return { applied: false };
   assertWritablePath(s.payload.path);
   writeFileText(dataDir, s.payload.path, s.payload.content);
   return { applied: true, path: s.payload.path };

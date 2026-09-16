@@ -1,13 +1,16 @@
 import crypto from 'node:crypto';
 import { KnodeConfig } from '../config.js';
 import { appendLog } from '../fs/datadir.js';
+import { auditDuplicateEntities } from '../graph/dedupe.js';
+import { refreshRecommendations } from '../research/recommend.js';
+import { reviewClaims } from '../graph/claim-review.js';
 import { slugify } from '../graph/store.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { writeDeps } from '../lineage/deps.js';
 import { budgetUsedToday } from '../llm/budget.js';
 import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
-import { toDateString } from '../store/temporal.js';
+import { toDateString, toIso } from '../store/temporal.js';
 import { ensureHotTopics, hotEntities, HotEntity, PagesContext, regeneratePage } from './pages.js';
 
 /**
@@ -24,6 +27,12 @@ export interface Tier2Stats {
   pagesWritten: number;
   tokensUsed: number;
   claimIssues: number;
+  /** Duplicate-entity pairs queued as merge suggestions. */
+  mergeCandidates: number;
+  /** Pages recommended for research (filed as wiki suggestions). */
+  recommendations: number;
+  /** Disputed / suspected claims reviewed by the LLM (review.claims). */
+  claimReviews: number;
 }
 
 /**
@@ -75,7 +84,7 @@ export async function refineWiki(
   opts: { onProgress?: (msg: string) => void; topEntities?: number; maxCommunities?: number; embedder?: EmbeddingProvider } = {},
 ): Promise<Tier2Stats> {
   const progress = opts.onProgress ?? (() => {});
-  const stats: Tier2Stats = { communities: 0, pagesWritten: 0, tokensUsed: 0, claimIssues: 0 };
+  const stats: Tier2Stats = { communities: 0, pagesWritten: 0, tokensUsed: 0, claimIssues: 0, mergeCandidates: 0, recommendations: 0, claimReviews: 0 };
   const ctx: PagesContext = {
     store,
     dataDir: store.dataDir,
@@ -85,6 +94,16 @@ export async function refineWiki(
   };
 
   stats.claimIssues = await auditClaims(store, progress);
+  try {
+    stats.mergeCandidates = (await auditDuplicateEntities({ store, embedder: ctx.embedder, config, llm }, { onProgress: progress })).suggested;
+  } catch (err) {
+    progress(`dedupe audit failed: ${err instanceof Error ? err.message : err}`);
+  }
+  try {
+    stats.claimReviews = (await reviewClaims({ store, llm, config }, { onProgress: progress })).suggested;
+  } catch (err) {
+    progress(`claim review failed: ${err instanceof Error ? err.message : err}`);
+  }
 
   const ents = await hotEntities(store, opts.topEntities ?? 60);
   if (ents.length < 3) {
@@ -125,6 +144,11 @@ export async function refineWiki(
   stats.tokensUsed = Math.max(0, (await budgetUsedToday(store)) - before);
 
   await ensureHotTopics(ctx, { actor: 'tier2', force: true });
+  try {
+    stats.recommendations = (await refreshRecommendations({ ...ctx, datasources: ctx.datasources! } as never)).suggested;
+  } catch (err) {
+    progress(`recommendations failed: ${err instanceof Error ? err.message : err}`);
+  }
   if (stats.pagesWritten > 0) {
     appendLog(store.dataDir, 'tier2', `${stats.pagesWritten} community pages from ${stats.communities} hot communities`);
   }
@@ -139,7 +163,49 @@ export async function refineWiki(
  * claim that disappears marks its suggestion stale instead of leaving it
  * dangling.
  */
+/**
+ * Supersession: among facts of one subject and type, an older one whose window
+ * ended by the time a newer one began (or never closed) is marked superseded
+ * by it. System-maintained, not evidence — the old fact stays for history and
+ * timelines but stops being quoted as current. Marks whose superseder is gone
+ * are cleared.
+ */
+export async function markSupersededClaims(store: Store): Promise<number> {
+  const rows = await store.query<{ id: string; subject_id: string; type: string; valid_from: string | Date; valid_to: string | Date | null; superseded_by: string | null }>(
+    `SELECT id, subject_id, type, valid_from, valid_to, superseded_by FROM claims
+     WHERE tx_to IS NULL AND status = 'fact' AND valid_from IS NOT NULL
+     ORDER BY subject_id, type, valid_from ASC, tx_from ASC`,
+  );
+  const groups = new Map<string, typeof rows>();
+  for (const r of rows) {
+    const key = `${r.subject_id}|${r.type}`;
+    (groups.get(key) ?? groups.set(key, []).get(key)!).push(r);
+  }
+  let changed = 0;
+  for (const group of groups.values()) {
+    for (let i = 0; i + 1 < group.length; i++) {
+      const older = group[i];
+      const newer = group[i + 1];
+      const olderFrom = toIso(older.valid_from)!;
+      const newerFrom = toIso(newer.valid_from)!;
+      const olderTo = toIso(older.valid_to);
+      if (olderFrom >= newerFrom || (olderTo && olderTo > newerFrom)) continue;
+      if (older.superseded_by === newer.id) continue;
+      await store.query(`UPDATE claims SET superseded_by = $2 WHERE id = $1`, [older.id, newer.id]);
+      changed++;
+    }
+  }
+  const cleared = await store.query<{ id: string }>(
+    `UPDATE claims c SET superseded_by = NULL
+     WHERE superseded_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM claims n WHERE n.id = c.superseded_by AND n.tx_to IS NULL)
+     RETURNING id`,
+  );
+  return changed + cleared.length;
+}
+
 async function auditClaims(store: Store, progress: (msg: string) => void): Promise<number> {
+  const superseded = await markSupersededClaims(store);
+  if (superseded) progress(`claim audit: ${superseded} supersession marks updated`);
   const rows = await store.query<{
     id: string; subject_id: string; subject: string; type: string; statement: string;
     status: string; valid_to: string | null; primary_scope_id: string | null; path: string | null;

@@ -40,6 +40,12 @@ export interface ClaimQuery {
   statuses?: string[];
   /** Substring of the statement text. */
   text?: string;
+  /** Only claims whose event time falls in this window (ISO instants; open sides null). */
+  eventRange?: { from?: string | null; to?: string | null };
+  /** Also return facts a newer fact of the same subject and type replaced (default: hidden). */
+  includeSuperseded?: boolean;
+  /** `timeline` orders by event time (then validity start) ascending; default is newest belief first. */
+  order?: 'recent' | 'timeline';
   limit?: number;
   temporal?: ResolvedTemporal;
   filter?: ResolvedScopeFilter;
@@ -60,6 +66,13 @@ export interface ClaimRecord {
   validTo: string | null;
   /** The validity window closed before `now` — do not quote it as current. */
   stale: boolean;
+  /** When the asserted event happened (date-only), if the source said. */
+  eventAt: string | null;
+  /** Date of the earliest source reporting it. */
+  observedAt: string | null;
+  /** A newer fact of the same subject and type replaced this one (kept for history, hidden by default). */
+  supersededBy: string | null;
+  superseded: boolean;
   /** Path of the scope that first supported the claim. */
   sourcePath: string | null;
   evidenceCount: number;
@@ -89,6 +102,9 @@ interface Row {
   // the driver hands back Date objects for timestamptz; normalize before comparing
   valid_from: string | Date | null;
   valid_to: string | Date | null;
+  event_at?: string | Date | null;
+  observed_at?: string | Date | null;
+  superseded_by?: string | null;
   source_path: string | null;
   evidence_count: number;
   tx_from: string | null;
@@ -96,12 +112,16 @@ interface Row {
 
 /** Entity-reference predicate: id, exact name/alias, else a name substring. */
 function entityRefSql(column: string, p: Params, ref: string): string {
-  const exact = p.add(ref);
-  const like = p.add(`%${ref}%`);
+  const match = () => {
+    const exact = p.add(ref);
+    const like = p.add(`%${ref}%`);
+    return `(er.id = ${exact} OR lower(er.name) = lower(${exact}) OR er.aliases::text ILIKE ${like} OR er.name ILIKE ${like})`;
+  };
+  // an entity merged into the referenced one answers as well
   return `${column} IN (
-    SELECT er.id FROM entities er
-    WHERE er.id = ${exact} OR lower(er.name) = lower(${exact})
-       OR er.aliases::text ILIKE ${like} OR er.name ILIKE ${like})`;
+    SELECT er.id FROM entities er WHERE ${match()}
+    UNION
+    SELECT em.id FROM entities em WHERE em.canonical_id IN (SELECT er.id FROM entities er WHERE ${match()}))`;
 }
 
 export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<ClaimQueryResult> {
@@ -121,6 +141,9 @@ export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<Cla
     where.push(`cl.status IN (${valid.map((x) => p.add(x.toLowerCase())).join(',')})`);
   }
   if (q.text) where.push(`cl.statement ILIKE ${p.add(`%${q.text}%`)}`);
+  if (!q.includeSuperseded) where.push('cl.superseded_by IS NULL');
+  if (q.eventRange?.from) where.push(`cl.event_at >= ${p.add(q.eventRange.from)}::timestamptz`);
+  if (q.eventRange?.to) where.push(`cl.event_at <= ${p.add(q.eventRange.to)}::timestamptz`);
 
   // `as_of` reads fold from evidence, so the tx window and the scope filter are
   // applied after the candidate scan rather than inside it.
@@ -131,13 +154,14 @@ export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<Cla
   const rows = await store.query<Row>(
     `SELECT cl.id, cl.subject_id, se.name AS subject, cl.object_id, oe.name AS object,
             cl.type, cl.statement, cl.status, cl.valid_from, cl.valid_to,
+            cl.event_at, cl.observed_at, cl.superseded_by,
             s.key AS source_path, cl.evidence_count, cl.tx_from
      FROM claims cl
      JOIN entities se ON se.id = cl.subject_id
      LEFT JOIN entities oe ON oe.id = cl.object_id
      LEFT JOIN scopes s ON s.id = cl.primary_scope_id
      ${scan.length ? `WHERE ${scan.join(' AND ')}` : ''}
-     ORDER BY cl.valid_from DESC NULLS LAST, cl.tx_from DESC`,
+     ORDER BY ${q.order === 'timeline' ? 'COALESCE(cl.event_at, cl.valid_from) ASC NULLS LAST, cl.tx_from ASC' : 'cl.valid_from DESC NULLS LAST, cl.tx_from DESC'}`,
     p.list,
   );
 
@@ -172,6 +196,8 @@ async function foldAsOf(store: Store, rows: Row[], t: ResolvedTemporal, f: Resol
         object_id: fold.object_id,
         valid_from: fold.valid_from,
         valid_to: fold.valid_to,
+        event_at: fold.event_at,
+        observed_at: fold.observed_at,
         evidence_count: fold.evidence_count,
         tx_from: (grouped.get(row.id) ?? []).map((e) => e.tx_from).sort()[0] ?? row.tx_from,
       },
@@ -205,6 +231,10 @@ function project(r: Row, now: string): ClaimRecord {
     validFrom: toDateString(r.valid_from),
     validTo: toDateString(validTo),
     stale: Boolean(validTo && validTo < now),
+    eventAt: toDateString(r.event_at ?? null),
+    observedAt: toDateString(r.observed_at ?? null),
+    supersededBy: r.superseded_by ?? null,
+    superseded: Boolean(r.superseded_by),
     sourcePath: r.source_path,
     evidenceCount: r.evidence_count,
     txFrom: r.tx_from,

@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { ChildProcess, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -195,10 +195,22 @@ export function readCursorStream(stdout: string): { text: string; error?: string
   return { text, error };
 }
 
-export function runProcess(cmd: string, args: string[], stdin: string, timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string }> {
+export interface RunProcessOptions {
+  /** Working directory (default: the OS temp dir, so repo instructions are not picked up). */
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  /** Streaming taps — the research runner writes a transcript while the agent runs. */
+  onStdout?: (chunk: string) => void;
+  onStderr?: (chunk: string) => void;
+  /** Called with the child so a caller can kill it on shutdown. */
+  onSpawn?: (child: ChildProcess) => void;
+}
+
+export function runProcess(cmd: string, args: string[], stdin: string, timeoutMs: number, opts: RunProcessOptions = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   const limit = timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd: os.tmpdir(), env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(cmd, args, { cwd: opts.cwd ?? os.tmpdir(), env: opts.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    opts.onSpawn?.(child);
     let stdout = '';
     let stderr = '';
     let settled = false;
@@ -215,8 +227,16 @@ export function runProcess(cmd: string, args: string[], stdin: string, timeoutMs
       finish(() => reject(new Error(`${cmd} timed out after ${Math.round(limit / 1000)}s`)));
     }, limit);
 
-    child.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')));
-    child.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')));
+    child.stdout.on('data', (d: Buffer) => {
+      const text = d.toString('utf8');
+      stdout += text;
+      opts.onStdout?.(text);
+    });
+    child.stderr.on('data', (d: Buffer) => {
+      const text = d.toString('utf8');
+      stderr += text;
+      opts.onStderr?.(text);
+    });
     child.on('error', (err: NodeJS.ErrnoException) => {
       finish(() => {
         if (err.code === 'ENOENT') reject(new Error(`${cmd} CLI not found — install it or set a CLI path in knode.config.json`));

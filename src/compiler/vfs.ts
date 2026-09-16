@@ -89,8 +89,8 @@ async function renderEntity(ctx: AppContext, id: string, asOf: string | null): P
 
   const [entity] = asOf
     ? await entitiesAsOf(ctx.store, [id], asOf)
-    : await ctx.store.query<{ id: string; name: string; type: string; description: string; aliases: string[]; mention_count: number; evidence_count: number; wiki_path: string | null }>(
-      `SELECT id, name, type, description, aliases, mention_count, evidence_count, wiki_path FROM entities WHERE id = $1 AND tx_to IS NULL`, [id],
+    : await ctx.store.query<{ id: string; name: string; type: string; description: string; aliases: string[]; mention_count: number; evidence_count: number; wiki_path: string | null; canonical_id?: string | null }>(
+      `SELECT id, name, type, description, aliases, mention_count, evidence_count, wiki_path, canonical_id FROM entities WHERE id = $1 AND tx_to IS NULL`, [id],
     );
   if (!entity) throw new Error(`no entity "${id}"${asOf ? ` as of ${asOf}` : ''}`);
 
@@ -105,6 +105,9 @@ async function renderEntity(ctx: AppContext, id: string, asOf: string | null): P
     `# ${entity.name}`,
     '',
     `- type: ${entity.type}`,
+    (entity as { canonical_id?: string | null }).canonical_id
+      ? `- merged into: [${(entity as { canonical_id?: string | null }).canonical_id}](/entities/${encodeURIComponent((entity as { canonical_id?: string | null }).canonical_id!)}.md)`
+      : null,
     aliases.length ? `- aliases: ${aliases.join(', ')}` : null,
     `- mentions: ${entity.mention_count}, evidence: ${entity.evidence_count}`,
     asOf ? `- as of: ${asOf}` : null,

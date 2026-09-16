@@ -5,7 +5,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
-import { redactConfig, resolveDataDir, CONFIG_FILE } from './config.js';
+import { redactConfig, resolveDataDir, CONFIG_FILE, loadConfig, saveConfig } from './config.js';
 import { createContext } from './context.js';
 import { initDataDir } from './fs/datadir.js';
 import { benchAnswer } from './bench/answer.js';
@@ -14,6 +14,17 @@ import { benchExtractCompare } from './bench/extract-compare.js';
 import { benchQaGen, benchRetrieval, RetrievalMode } from './bench/qa.js';
 import { runSourceQuery } from './datasource/execute.js';
 import { graphInsights, graphOverview, graphSearch } from './graph/query.js';
+import { applyMerge, listMerges, unmergeEntity } from './graph/merge.js';
+import { auditDuplicateEntities } from './graph/dedupe.js';
+import { reviewClaims } from './graph/claim-review.js';
+import { resolveEntityId } from './graph/resolve.js';
+import { cancelJob, getJob, listJobs, queueJob, retryJob, ResearchJob, ResearchStatus } from './research/jobs.js';
+import { finalizeResearchJob, resolveResearchAgent, runResearchJob, workspaceFromJob } from './research/runner.js';
+import { loadResearchTemplates, RESEARCH_KINDS, ResearchKind } from './research/templates.js';
+import { prepareRunWorkspace, runsRoot } from './research/workspace.js';
+import { recommendWikiTopics, refreshRecommendations } from './research/recommend.js';
+import { launchArgs } from './research/launch.js';
+import { loadProfile, loadProfiles, profileYaml } from './research/profile.js';
 import { importArchive } from './importers/archive.js';
 import { runTier1Pass } from './graph/tier1.js';
 import { sync } from './ingest/sync.js';
@@ -26,6 +37,7 @@ import { applySuggestion, optimizePacks } from './pack/learn.js';
 import { listSuggestions, setSuggestionStatus } from './store/queries.js';
 import { seedStockDemo } from './demo/stock.js';
 import { refineWiki } from './wiki/refine.js';
+import { lintWiki } from './wiki/lint.js';
 import { startMcpServer } from './mcp/server.js';
 import { ask } from './search/ask.js';
 import { search, SearchMode } from './search/search.js';
@@ -995,6 +1007,21 @@ trace
     console.log(JSON.stringify(stats, null, 2));
     await ctx.store.close();
   });
+wiki
+  .command('lint')
+  .description('health check of the wiki (orphans, broken links, stale / unreviewed research pages, expired and superseded text); writes wiki/lint/<date>.md and files refresh suggestions')
+  .option('--no-report', 'print findings only, write nothing')
+  .action(async (opts: { report: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const r = await lintWiki(ctx, { report: opts.report, file: opts.report, onProgress: (m) => console.log(`  ${m}`) });
+      for (const i of r.issues) console.log(`${i.kind.padEnd(16)} ${i.path}  ${i.detail}`);
+      console.log(JSON.stringify({ pages: r.pages, counts: r.counts, report: r.reportPath, suggestions: r.suggestions }, null, 2));
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
 
 program
   .command('dream')
@@ -1084,10 +1111,69 @@ program
 
 program
   .command('connect <client>')
-  .description('register the MCP server with a client: claude | codex')
-  .action(async (client: string) => {
+  .description('register the MCP server with a client: claude | codex | cursor (the Streamable HTTP endpoint `knode-os serve` hosts; --stdio for a standalone process)')
+  .option('--stdio', 'register a stdio process (`knode-os mcp`) instead of the HTTP endpoint — for use without a running serve')
+  .option('--http', 'register the HTTP endpoint (the default; kept for scripts)')
+  .option('--url <url>', 'MCP endpoint URL (default: http://<server.host>:<server.port><server.mcp.path>)')
+  .option('--user <user>', 'workspace owner the agent acts as', 'admin')
+  .option('--workspace <id>', 'workspace id under users/<user>/workspaces', 'default')
+  .action(async (client: string, opts: { http?: boolean; stdio?: boolean; url?: string; user: string; workspace: string }) => {
     const dir = dataDir();
     initDataDir(dir);
+    if (!opts.stdio) {
+      const { loadConfig } = await import('./config.js');
+      const { loadOrCreateMcpToken } = await import('./server/mcp-http.js');
+      const config = loadConfig(dir);
+      const token = loadOrCreateMcpToken(dir);
+      const url = opts.url ?? `http://${config.server.host}:${config.server.port}${config.server.mcp?.path || '/mcp'}`;
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${token}`,
+        'x-knode-user': opts.user,
+        'x-knode-workspace-kind': 'personal',
+        'x-knode-workspace-id': opts.workspace,
+        'x-knode-workspace-name': opts.workspace,
+      };
+      if (client === 'claude') {
+        const args = ['mcp', 'add', '--scope', 'user', '--transport', 'http', 'knode-os', url];
+        for (const [k, v] of Object.entries(headers)) args.push('--header', `${k}: ${v}`);
+        try {
+          execFileSync('claude', args, { stdio: 'inherit' });
+          console.log('registered with Claude Code (user scope, http).');
+        } catch {
+          console.log('`claude` CLI not found or registration failed. Add manually:');
+          console.log(`  claude ${args.map((a) => (a.includes(' ') ? JSON.stringify(a) : a)).join(' ')}`);
+        }
+      } else if (client === 'codex') {
+        // codex takes a URL and a bearer-token env var; the workspace rides in the query string
+        const q = new URLSearchParams({ user: opts.user, kind: 'personal', id: opts.workspace, name: opts.workspace });
+        const full = `${url}?${q.toString()}`;
+        try {
+          execFileSync('codex', ['mcp', 'add', 'knode-os', '--url', full, '--bearer-token-env-var', 'KNODE_MCP_TOKEN'], { stdio: 'inherit' });
+          console.log('registered with Codex (http).');
+        } catch {
+          console.log('`codex` CLI not found or registration failed. Add to ~/.codex/config.toml:');
+          console.log(`\n[mcp_servers.knode-os]\nurl = ${JSON.stringify(full)}\nbearer_token_env_var = "KNODE_MCP_TOKEN"\n`);
+        }
+        console.log(`export KNODE_MCP_TOKEN=${token}   # add to your shell profile; codex reads the token from this variable`);
+      } else if (client === 'cursor') {
+        const file = path.join(os.homedir(), '.cursor', 'mcp.json');
+        let json: { mcpServers?: Record<string, unknown> } = {};
+        try {
+          json = JSON.parse(fs.readFileSync(file, 'utf8')) as typeof json;
+        } catch {
+          json = {};
+        }
+        json.mcpServers = { ...(json.mcpServers ?? {}), 'knode-os': { url, headers } };
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify(json, null, 2) + '\n');
+        console.log(`registered in ${file} (http).`);
+      } else {
+        console.error('unknown client; use `claude`, `codex` or `cursor`');
+        process.exitCode = 1;
+      }
+      return;
+    }
+
     const cliPath = fileURLToPath(import.meta.url);
     const cmd = process.execPath;
     const args = [cliPath, 'mcp', '--data', dir];
@@ -1111,9 +1197,348 @@ program
         fs.appendFileSync(tomlPath, block);
         console.log(`registered in ${tomlPath}`);
       }
+    } else if (client === 'cursor') {
+      const file = path.join(os.homedir(), '.cursor', 'mcp.json');
+      let json: { mcpServers?: Record<string, unknown> } = {};
+      try {
+        json = JSON.parse(fs.readFileSync(file, 'utf8')) as typeof json;
+      } catch {
+        json = {};
+      }
+      json.mcpServers = { ...(json.mcpServers ?? {}), 'knode-os': { command: cmd, args } };
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(json, null, 2) + '\n');
+      console.log(`registered in ${file}`);
     } else {
-      console.error('unknown client; use `claude` or `codex`');
+      console.error('unknown client; use `claude`, `codex` or `cursor`');
       process.exitCode = 1;
+    }
+  });
+
+const entities = program.command('entities').description('entity resolution: merge duplicates, undo merges, run the duplicate audit');
+entities
+  .command('merge <entity> <into>')
+  .description('record that <entity> is the same as <into>; reads redirect to <into>, evidence is untouched, reversible with unmerge')
+  .option('--reason <text>', 'why (kept on the link and in the ledger)')
+  .option('--actor <name>', 'who decided', 'user')
+  .action(async (entity: string, into: string, opts: { reason?: string; actor: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log(JSON.stringify(await applyMerge(ctx.store, { entityId: entity, canonicalId: into, reason: opts.reason, actor: opts.actor }), null, 2));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+entities
+  .command('unmerge <entity>')
+  .description('undo a merge (disposes the merge scope; the entity stands on its own again)')
+  .option('--actor <name>', 'who decided', 'user')
+  .action(async (entity: string, opts: { actor: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log((await unmergeEntity(ctx.store, entity, { actor: opts.actor })) ? 'unmerged' : 'no live merge for that entity');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+entities
+  .command('merges')
+  .description('list live merges')
+  .action(async () => {
+    const ctx = await createContext(dataDir());
+    try {
+      for (const m of await listMerges(ctx.store)) console.log(`${m.entityId} → ${m.canonicalId}  (${m.entityName} → ${m.canonicalName}; ${m.actor ?? '?'}: ${m.reason || '-'})`);
+    } finally {
+      await ctx.store.close();
+    }
+  });
+entities
+  .command('dedupe')
+  .description('find probable duplicate entities now and queue them as merge suggestions (normally nightly)')
+  .action(async () => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log(JSON.stringify(await auditDuplicateEntities(ctx, { onProgress: (m) => console.log(`  ${m}`) }), null, 2));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+const reviewCmd = program.command('review').description('review passes normally run nightly: duplicate entities (LLM judge per review.llmJudge) and disputed / suspected claims');
+reviewCmd
+  .command('entities')
+  .description('same as `entities dedupe`: score duplicate candidates, ask the LLM judge, file merge suggestions')
+  .action(async () => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log(JSON.stringify(await auditDuplicateEntities(ctx, { onProgress: (m) => console.log(`  ${m}`) }), null, 2));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+reviewCmd
+  .command('claims')
+  .description('LLM review of open disputes and suspected claims → knowledge suggestions with a verdict')
+  .option('--limit <n>', 'claims per run', '20')
+  .action(async (opts: { limit: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log(JSON.stringify(await reviewClaims(ctx, { onProgress: (m) => console.log(`  ${m}`), limit: Number(opts.limit) }), null, 2));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+
+entities
+  .command('resolve <name>')
+  .description('show which entity a mention of <name> would land on')
+  .option('--type <type>', 'entity type of the mention')
+  .action(async (name: string, opts: { type?: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log(JSON.stringify(await resolveEntityId(ctx.store, { name, type: opts.type }), null, 2));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+
+/** Run one job right here: host a temporary MCP endpoint for this context, launch the agent, validate, sync. */
+async function runResearchNow(ctx: Awaited<ReturnType<typeof createContext>>, job: ResearchJob, log: (m: string) => void): Promise<ResearchJob> {
+  const { Hono } = await import('hono');
+  const { serve } = await import('@hono/node-server');
+  const { mountMcp, loadOrCreateMcpToken } = await import('./server/mcp-http.js');
+  const token = loadOrCreateMcpToken(ctx.dataDir);
+  const app = new Hono();
+  mountMcp(app, { path: '/mcp', token, context: ctx });
+  const server = await new Promise<{ close: () => void; port: number }>((resolve) => {
+    const srv = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' }, (info) => resolve({ close: () => srv.close(), port: info.port }));
+  });
+  try {
+    return await runResearchJob(ctx, job, { mcp: { url: `http://127.0.0.1:${server.port}/mcp`, token, headers: {} }, log });
+  } finally {
+    server.close();
+  }
+}
+
+const research = program.command('research').description('deep-research wiki pages written by a coding-agent CLI (claude / codex / cursor) through the knode MCP endpoint');
+research
+  .command('queue <kind> [target...]')
+  .description(`queue a page: kind = ${RESEARCH_KINDS.join(' | ')}; target = entity / concept name, "A vs B", or a wiki path for refresh`)
+  .option('--query <question>', 'for kind question: the question to answer and file')
+  .option('--template <name>', 'template file stem under playbooks/research (default: the kind)')
+  .option('--now', 'run it right now in this process instead of waiting for serve')
+  .action(async (kind: string, targetParts: string[], opts: { query?: string; template?: string; now?: boolean }) => {
+    if (!RESEARCH_KINDS.includes(kind as ResearchKind)) {
+      console.error(`kind must be one of ${RESEARCH_KINDS.join(', ')}`);
+      process.exitCode = 1;
+      return;
+    }
+    const ctx = await createContext(dataDir());
+    try {
+      const { job, created } = await queueJob(ctx.store, { kind: kind as ResearchKind, target: targetParts.join(' ') || null, query: opts.query ?? null, template: opts.template ?? null, requestedBy: 'cli' });
+      console.log(`${created ? 'queued' : 'already queued'} ${job.id} (${job.kind} ${job.target ?? job.query ?? ''})`);
+      if (opts.now) {
+        const done = await runResearchNow(ctx, job, (m) => console.log(`  ${m}`));
+        console.log(JSON.stringify({ id: done.id, status: done.status, outputPath: done.outputPath, error: done.error, turns: done.turns, warnings: done.payload.warnings }, null, 2));
+      }
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+research
+  .command('ask <query...>')
+  .description('answer a question and file the answer as wiki/questions/<slug>.md')
+  .option('--now', 'run it right now in this process')
+  .action(async (parts: string[], opts: { now?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const { job, created } = await queueJob(ctx.store, { kind: 'question', query: parts.join(' '), requestedBy: 'cli' });
+      console.log(`${created ? 'queued' : 'already queued'} ${job.id}`);
+      if (opts.now) {
+        const done = await runResearchNow(ctx, job, (m) => console.log(`  ${m}`));
+        console.log(JSON.stringify({ id: done.id, status: done.status, outputPath: done.outputPath, error: done.error }, null, 2));
+      }
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+research
+  .command('run <id>')
+  .description('run a queued / failed job now (hosts a temporary MCP endpoint for this data dir)')
+  .action(async (id: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const job = (await retryJob(ctx.store, id)) ?? (await getJob(ctx.store, id));
+      if (!job) throw new Error(`no job ${id}`);
+      const done = await runResearchNow(ctx, job, (m) => console.log(`  ${m}`));
+      console.log(JSON.stringify({ id: done.id, status: done.status, outputPath: done.outputPath, error: done.error, turns: done.turns, warnings: done.payload.warnings }, null, 2));
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+research
+  .command('list')
+  .option('--status <status>', 'queued | running | validating | done | failed | cancelled (comma-separated)')
+  .action(async (opts: { status?: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const jobs = await listJobs(ctx.store, { status: opts.status ? (opts.status.split(',') as ResearchStatus[]) : undefined });
+      for (const j of jobs) console.log(`${j.id}  ${j.status.padEnd(10)} ${j.kind.padEnd(10)} ${(j.target ?? j.query ?? '').slice(0, 40).padEnd(40)} ${j.outputPath ?? ''}${j.error ? `  ✗ ${j.error.slice(0, 80)}` : ''}`);
+      if (jobs.length === 0) console.log('(no research jobs)');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+research
+  .command('show <id>')
+  .option('--log', 'also print the tail of the agent transcript')
+  .action(async (id: string, opts: { log?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const job = await getJob(ctx.store, id);
+      if (!job) throw new Error(`no job ${id}`);
+      console.log(JSON.stringify(job, null, 2));
+      if (opts.log) {
+        const file = path.join(runsRoot(ctx.dataDir, ctx.config.research?.runsDir ?? '.runs'), job.id, 'transcript.jsonl');
+        if (fs.existsSync(file)) console.log(fs.readFileSync(file, 'utf8').split('\n').slice(-200).join('\n'));
+        else console.log('(no transcript yet)');
+      }
+    } finally {
+      await ctx.store.close();
+    }
+  });
+research
+  .command('cancel <id>')
+  .action(async (id: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log((await cancelJob(ctx.store, id)) ? 'cancelled' : 'not cancellable');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+research
+  .command('retry <id>')
+  .action(async (id: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log((await retryJob(ctx.store, id)) ? 'queued again' : 'not retryable');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+research
+  .command('recommend')
+  .description('rank the pages worth researching next (hot / demanded entities without pages, stale research pages, recurring questions)')
+  .option('--file', 'also file them as wiki suggestions (what the nightly pass does)')
+  .action(async (opts: { file?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const recs = opts.file ? (await refreshRecommendations(ctx)).recommendations : await recommendWikiTopics(ctx);
+      for (const r of recs) console.log(`${r.score.toFixed(2)}  ${r.kind.padEnd(9)} ${r.target}  — ${r.reasons.join('; ')}${r.suggestionId ? `  [suggestion ${r.suggestionId}]` : ''}`);
+      if (recs.length === 0) console.log('(nothing to recommend yet)');
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+research
+  .command('templates')
+  .description('list the page templates under playbooks/research')
+  .action(async () => {
+    const dir = dataDir();
+    initDataDir(dir);
+    for (const t of loadResearchTemplates(dir).values()) console.log(`${t.name.padEnd(12)} kind=${t.kind.padEnd(11)} output=${t.output || '(target path)'}  sections=${t.requires.sections.length}  ${t.path}`);
+  });
+research
+  .command('profiles')
+  .description('list research profiles under playbooks/research/profiles (* = active, research.profile)')
+  .action(async () => {
+    const dir = dataDir();
+    initDataDir(dir);
+    const config = loadConfig(dir);
+    const active = config.research?.profile || 'default';
+    for (const p of loadProfiles(dir).values()) {
+      const roles = p.roles.filter((r) => r.enabled).map((r) => r.id).join(',') || '(none)';
+      console.log(`${p.name === active ? '*' : ' '} ${p.name.padEnd(12)} pipeline=${(p.pipeline || config.research.pipeline).padEnd(7)} effort=${p.reasoning.effort.padEnd(8)} web=${p.search.web.padEnd(8)} roles=${roles}  ${p.title}`);
+    }
+  });
+research
+  .command('profile <name>')
+  .description('show a research profile as YAML; --use makes it the active one')
+  .option('--use', 'set research.profile to this profile')
+  .action(async (name: string, opts: { use?: boolean }) => {
+    const dir = dataDir();
+    initDataDir(dir);
+    const profile = loadProfile(dir, name);
+    if (!profile) {
+      console.error(`no profile "${name}" — see \`knode-os research profiles\``);
+      process.exitCode = 1;
+      return;
+    }
+    if (opts.use) {
+      const config = loadConfig(dir);
+      config.research.profile = name;
+      saveConfig(dir, config);
+      console.log(`research.profile = ${name}`);
+    }
+    process.stdout.write(`# ${profile.path}\n${profileYaml(profile)}`);
+  });
+research
+  .command('export <id>')
+  .description('write the run workspace (brief, schema, MCP config) somewhere you can run the agent by hand; finish with `research reclaim <id>`')
+  .requiredOption('--dir <path>', 'directory to write the workspace into')
+  .option('--url <mcpUrl>', 'MCP endpoint of a running serve (default: from server config)')
+  .option('--user <user>', 'workspace owner the agent acts as', 'admin')
+  .option('--workspace <id>', 'workspace id under users/<user>/workspaces', 'default')
+  .action(async (id: string, opts: { dir: string; url?: string; user: string; workspace: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const job = await getJob(ctx.store, id);
+      if (!job) throw new Error(`no job ${id}`);
+      const { loadOrCreateMcpToken } = await import('./server/mcp-http.js');
+      const { templateFor } = await import('./research/templates.js');
+      const agent = resolveResearchAgent(ctx.config) ?? { provider: 'claude-cli' as const, cliPath: '', model: ctx.config.research?.model ?? '' };
+      const token = loadOrCreateMcpToken(ctx.dataDir);
+      const url = opts.url ?? `http://${ctx.config.server.host}:${ctx.config.server.port}${ctx.config.server.mcp?.path || '/mcp'}`;
+      const mcp = { url, token, headers: { 'x-knode-user': opts.user, 'x-knode-workspace-kind': 'personal', 'x-knode-workspace-id': opts.workspace, 'x-knode-workspace-name': opts.workspace } };
+      const dir = path.resolve(opts.dir);
+      const template = templateFor(ctx.dataDir, job.kind, job.template);
+      const readDirs = (ctx.config.research?.readDirs ?? ['raw/docs', 'wiki', '.sidecar']).map((d) => path.join(ctx.dataDir, d)).filter((d) => fs.existsSync(d));
+      const ws = await prepareRunWorkspace(ctx, job, template, { runsDir: ctx.config.research?.runsDir ?? '.runs', provider: agent.provider, mcp, readDirs, dir });
+      await (await import('./research/jobs.js')).updateJob(ctx.store, job.id, { worksetId: ws.worksetId, outputPath: ws.outputPath, payload: { ...job.payload, actor: ws.actor, research: ws.research, humanParagraphs: ws.humanParagraphs, exportedTo: dir } });
+      const lines = [`# How to run research job ${job.id} by hand`, '', `Workspace: ${dir}`, `Output page: ${ws.outputPath} (write it with knode_write through the MCP server \`knode-os\` at ${url})`, ''];
+      for (const provider of ['claude-cli', 'codex-cli', 'cursor-cli'] as const) {
+        const { cmd, args } = launchArgs({ provider, cliPath: '', model: agent.model, maxTurns: template.maxTurns ?? ctx.config.research?.maxTurns ?? 40, timeoutMs: 0, ws, mcp, readDirs, jobId: job.id });
+        const shown = provider === 'cursor-cli' ? [...args.slice(0, -1), '"$(cat brief.md)"'] : args;
+        lines.push(`## ${provider}`, '', '```bash', `cd ${JSON.stringify(dir)}`, provider === 'cursor-cli' ? '' : 'export KNODE_MCP_TOKEN=' + token, `${cmd} ${shown.map((a) => (/[\s"]/.test(a) ? JSON.stringify(a) : a)).join(' ')}${provider === 'cursor-cli' ? '' : ' < brief.md'}`, '```', '');
+      }
+      lines.push('When the agent has finished, validate and index the page:', '', '```bash', `knode-os research reclaim ${job.id}`, '```', '');
+      fs.writeFileSync(path.join(dir, 'RUN.md'), lines.join('\n'));
+      console.log(`exported to ${dir} — see RUN.md`);
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+research
+  .command('reclaim <id>')
+  .description('validate and index the page an exported (hand-run) job wrote')
+  .action(async (id: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const job = await getJob(ctx.store, id);
+      if (!job) throw new Error(`no job ${id}`);
+      const agent = resolveResearchAgent(ctx.config) ?? { provider: 'claude-cli' as const, cliPath: '', model: '' };
+      const ws = workspaceFromJob(ctx, job, agent);
+      if (typeof job.payload.exportedTo === 'string') ws.dir = job.payload.exportedTo;
+      const done = await finalizeResearchJob(ctx, job, ws, { exitCode: 0, turns: null, costUsd: null, resultText: '', error: null, transcriptPath: '' }, { mcp: { url: '', token: '', headers: {} }, agent, log: (m) => console.log(`  ${m}`) });
+      console.log(JSON.stringify({ id: done.id, status: done.status, outputPath: done.outputPath, error: done.error, warnings: done.payload.warnings }, null, 2));
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
     }
   });
 

@@ -53,6 +53,8 @@ export interface SidecarMeta {
   normalizer: number;
   conversion?: SidecarConversion;
   title: string | null;
+  /** The source's reference date (frontmatter date or a date in the path), ISO; null when none was found. */
+  docDate?: string | null;
   ingestedAt: string;
   chunks: SidecarChunkMeta[];
 }
@@ -62,6 +64,7 @@ export interface SidecarEntity {
   type: string;
   description?: string;
   aliases?: string[];
+  sameAs?: string | null;
 }
 
 export interface SidecarRelation {
@@ -69,6 +72,8 @@ export interface SidecarRelation {
   target: string;
   type: string;
   description?: string;
+  validFrom?: string | null;
+  validTo?: string | null;
 }
 
 export interface SidecarClaim {
@@ -79,6 +84,8 @@ export interface SidecarClaim {
   status: 'fact' | 'suspected' | 'disputed' | 'absent';
   startDate?: string | null;
   endDate?: string | null;
+  /** When the asserted event happened (as opposed to the window the statement holds for). */
+  eventDate?: string | null;
 }
 
 export interface SidecarTier0 {
@@ -88,7 +95,7 @@ export interface SidecarTier0 {
   wikilinks: string[];
   extractedAt: string;
   /** Frontmatter-declared entities / claims (tier 0.5), kept so a removed source can be replayed from the attic. */
-  declared?: { entities: SidecarEntity[]; claims: SidecarClaim[] } | null;
+  declared?: { entities: SidecarEntity[]; relations?: SidecarRelation[]; claims: SidecarClaim[] } | null;
 }
 
 export interface SidecarTier1 {

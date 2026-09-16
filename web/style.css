@@ -343,6 +343,26 @@ td.mono { font-size: 12px; }
 .suggestion .skind.skill { color: var(--good); }
 .suggestion .skind.memory { color: var(--accent); }
 .suggestion .skind.knowledge { color: var(--accent2); }
+.suggestion .skind.merge { color: var(--warn, #d08a1d); }
+.suggestion .skind.wiki { color: var(--accent); }
+.wiki-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.wiki-grid .wiki-span { grid-column: 1 / -1; }
+.wiki-h { margin: 0 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.job { display: grid; grid-template-columns: 96px 1fr auto; gap: 8px; align-items: baseline; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px; background: var(--bg2); font-size: 13px; }
+.job .jstatus { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--bg3); }
+.job .jstatus.done { color: var(--good); }
+.job .jstatus.failed { color: var(--bad, #c0392b); }
+.job .jstatus.running, .job .jstatus.validating { color: var(--accent); }
+.job .jerr { color: var(--muted); font-size: 12px; grid-column: 2 / -1; }
+.job .jactions { display: flex; gap: 6px; }
+.job .jactions button, .rpage .ractions button, .rec .recactions button { padding: 2px 8px; font-size: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); cursor: pointer; }
+.rpage { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px; background: var(--bg2); font-size: 13px; }
+.rpage .trust { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--bg3); }
+.rpage .trust.trusted { color: var(--good); }
+.rpage .trust.quarantined { color: var(--warn, #d08a1d); }
+.rec { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px; background: var(--bg2); font-size: 13px; }
+.rec .recwhy { color: var(--muted); font-size: 12px; margin: 4px 0; }
+@media (max-width: 900px) { .wiki-grid { grid-template-columns: 1fr; } }
 .suggestion .stitle { font-weight: 600; margin: 6px 0; }
 .suggestion .sbody { color: var(--fg); font-size: 13px; }
 .suggestion .sactions { margin-top: 8px; display: flex; gap: 8px; }
@@ -553,3 +573,20 @@ td.mono { font-size: 12px; }
   .cfg-defaults summary { align-items: flex-start; flex-direction: column; gap: 8px; }
   #cfg-status { grid-template-columns: 1fr; }
 }
+
+/* Settings · 03 deep research */
+.cfg-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.cfg-checks { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 12px; }
+.cfg-inline-num { width: 64px !important; min-height: 0 !important; padding: 2px 6px !important; margin: 0 4px; display: inline-block; }
+.cfg-actions-inline { display: flex; gap: 8px; }
+.cfg-role-off { opacity: 0.55; }
+.cfg-role-off:focus-within { opacity: 1; }
+.cfg-role-enabled { flex: 0 0 auto; }
+.cfg-prompt { margin-top: 12px; }
+.cfg-prompt-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; color: var(--muted); font-size: 10px; font-weight: 600; }
+.cfg-prompt-head .mono { color: var(--muted); font-weight: 400; }
+.cfg-prompt-head button { margin-left: auto; }
+.cfg-prompt textarea { width: 100%; box-sizing: border-box; min-height: 150px; resize: vertical; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--fg); font-family: var(--mono); font-size: 11px; line-height: 1.5; padding: 10px; }
+.cfg-prompt textarea:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+@media (max-width: 900px) { .cfg-grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.cfg-connections-head > button { flex: 0 0 auto; white-space: nowrap; }

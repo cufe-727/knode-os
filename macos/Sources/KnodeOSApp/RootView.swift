@@ -61,6 +61,7 @@ private struct MainWorkspaceView: View {
         case .search: SearchView()
         case .ask: AskView()
         case .graph: KnowledgeGraphView()
+        case .wiki: WikiView()
         case .traces: TracesView()
         case .dream: DreamView()
         case .settings: SettingsView()

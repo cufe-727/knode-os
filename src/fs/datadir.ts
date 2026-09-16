@@ -4,6 +4,9 @@ import { CONFIG_FILE, defaultConfig, saveConfig } from '../config.js';
 import { initObsidianVault } from '../obsidian/vault.js';
 import { ensureDefaultPlaybooks } from '../pack/playbook.js';
 import { ensureDefaultIntents } from '../compiler/intents.js';
+import { ensureDefaultOntology } from '../graph/ontology.js';
+import { ensureDefaultResearchTemplates } from '../research/templates.js';
+import { ensureDefaultProfiles } from '../research/profile.js';
 import { CAPABILITIES_DIR, DB_DIR, INTENTS_DIR, LEGACY_TOP_LEVEL, PACKS_DIR } from './layout.js';
 
 /**
@@ -189,7 +192,7 @@ export function initDataDir(dataDir: string): InitResult {
   created.push(...obsidian.created.map((rel) => `wiki/${rel}`));
   // starters for the two configurable layers: how to retrieve (playbook) and
   // what an answer needs (intent). Both are examples to edit, never overwritten.
-  created.push(...ensureDefaultPlaybooks(dataDir), ...ensureDefaultIntents(dataDir));
+  created.push(...ensureDefaultPlaybooks(dataDir), ...ensureDefaultIntents(dataDir), ...ensureDefaultOntology(dataDir), ...ensureDefaultResearchTemplates(dataDir), ...ensureDefaultProfiles(dataDir));
   if (!fs.existsSync(path.join(dataDir, CONFIG_FILE))) {
     saveConfig(dataDir, defaultConfig());
     created.push(CONFIG_FILE);

@@ -23,6 +23,7 @@ import {
   toDateString,
 } from '../store/temporal.js';
 import { ClaimItem, EntityRow, GraphEdge, GraphNode, GraphSearchResult, RelationRow, SearchResult } from '../types.js';
+import { canonicalMap, expandGroups } from './resolve.js';
 
 /**
  * Scope of a graph read: which times to answer from, and which sources may
@@ -48,8 +49,10 @@ function scopeOf(opts: GraphScope): { t: ResolvedTemporal; f: ResolvedScopeFilte
  * then — recomputed from evidence, since the aggregate columns only hold the
  * current state. `filter` restricts which sources may support a claim.
  */
-export async function claimsForEntities(store: Store, entityIds: string[], limit = 12, opts: GraphScope = {}): Promise<ClaimItem[]> {
-  if (entityIds.length === 0) return [];
+export async function claimsForEntities(store: Store, subjectIds: string[], limit = 12, opts: GraphScope = {}): Promise<ClaimItem[]> {
+  if (subjectIds.length === 0) return [];
+  // claims about an entity merged into one of the subjects belong to the survivor
+  const entityIds = await expandGroups(store, subjectIds);
   const { t, f } = scopeOf(opts);
   const asOf = t.txTime;
   if (asOf) {
@@ -69,6 +72,7 @@ export async function claimsForEntities(store: Store, entityIds: string[], limit
       status: c.status,
       startDate: toDateString(c.valid_from),
       endDate: toDateString(c.valid_to),
+      eventDate: toDateString(c.event_at),
       path: c.primary_scope_id ? paths.get(c.primary_scope_id) ?? null : null,
       evidenceCount: c.evidence_count,
     }));
@@ -78,15 +82,15 @@ export async function claimsForEntities(store: Store, entityIds: string[], limit
   const lim = p.add(limit);
   const rows = await store.query<{
     id: string; subject: string; object: string | null; type: string; statement: string;
-    status: string; valid_from: string | null; valid_to: string | null; path: string | null; evidence_count: number;
+    status: string; valid_from: string | null; valid_to: string | null; event_at: string | null; path: string | null; evidence_count: number;
   }>(
     `SELECT cl.id, se.name AS subject, oe.name AS object, cl.type, cl.statement, cl.status,
-            cl.valid_from, cl.valid_to, s.key AS path, cl.evidence_count
+            cl.valid_from, cl.valid_to, cl.event_at, s.key AS path, cl.evidence_count
      FROM claims cl
      JOIN entities se ON se.id = cl.subject_id
      LEFT JOIN entities oe ON oe.id = cl.object_id
      LEFT JOIN scopes s ON s.id = cl.primary_scope_id
-     WHERE cl.subject_id IN (${ph}) AND ${live('cl', p)} AND ${validOverlap('cl', p, t)}
+     WHERE cl.subject_id IN (${ph}) AND ${live('cl', p)} AND ${validOverlap('cl', p, t)} AND cl.superseded_by IS NULL
        AND ${evidenceFilterSql('cl.id', 'claim', p, f, null)}
      ORDER BY cl.tx_from DESC
      LIMIT ${lim}`,
@@ -94,7 +98,7 @@ export async function claimsForEntities(store: Store, entityIds: string[], limit
   );
   return rows.map((r) => ({
     id: r.id, subject: r.subject, object: r.object, type: r.type, statement: r.statement,
-    status: r.status, startDate: toDateString(r.valid_from), endDate: toDateString(r.valid_to), path: r.path,
+    status: r.status, startDate: toDateString(r.valid_from), endDate: toDateString(r.valid_to), eventDate: toDateString(r.event_at), path: r.path,
     evidenceCount: r.evidence_count,
   }));
 }
@@ -143,6 +147,7 @@ export async function graphSearch(
     p.list,
   );
   if (asOf) seeds = await asOfRows(store, seeds.map((seed) => seed.id), asOf, seeds);
+  seeds = await canonicalSeeds(store, seeds, asOf);
 
   const score = new Map<string, number>();
   const nodeById = new Map<string, EntityRow>();
@@ -158,22 +163,35 @@ export async function graphSearch(
   const HOP_DECAY = 0.5;
 
   for (let hop = 0; hop < depth && frontier.length > 0; hop++) {
+    // a merged entity's edges count for its survivor: expand the frontier to whole merge groups
+    const frontierAll = await expandGroups(store, frontier);
     const rels = asOf
-      ? await relationsAsOf(store, frontier, asOf)
+      ? (await relationsAsOf(store, frontierAll, asOf)).filter((r) => overlapsValidWindow(r, t))
       : await (async () => {
           const rp = new Params();
-          const placeholders = frontier.map((id) => rp.add(id)).join(',');
+          const placeholders = frontierAll.map((id) => rp.add(id)).join(',');
           return store.query<RelationRow>(
-            `SELECT * FROM relations r WHERE (source_id IN (${placeholders}) OR target_id IN (${placeholders})) AND ${live('r', rp)}`,
+            `SELECT * FROM relations r WHERE (source_id IN (${placeholders}) OR target_id IN (${placeholders})) AND ${live('r', rp)} AND ${validOverlap('r', rp, t)}`,
             rp.list,
           );
         })();
+    const canon = await canonicalMap(store, rels.flatMap((r) => [r.source_id, r.target_id]));
+    const c = (id: string) => canon.get(id) ?? id;
     const next = new Set<string>();
     for (const r of rels) {
-      if (!edges.has(r.id)) {
-        edges.set(r.id, { source: r.source_id, target: r.target_id, type: r.type, description: r.description, weight: r.weight });
+      const sId = c(r.source_id);
+      const tId = c(r.target_id);
+      if (sId === tId) continue;
+      const key = `${sId}|${r.type}|${tId}`;
+      const existing = edges.get(key);
+      if (existing) existing.weight = Number((existing.weight + r.weight).toFixed(4));
+      else {
+        edges.set(key, {
+          source: sId, target: tId, type: r.type, description: r.description, weight: r.weight,
+          validFrom: toDateString(r.valid_from ?? null), validTo: toDateString(r.valid_to ?? null),
+        });
       }
-      for (const [from, to] of [[r.source_id, r.target_id], [r.target_id, r.source_id]] as const) {
+      for (const [from, to] of [[sId, tId], [tId, sId]] as const) {
         const base = score.get(from);
         if (base === undefined) continue;
         const gain = base * HOP_DECAY * Math.min(1, r.weight / 2 + 0.5) * (r.type === 'co_occurs' ? 0.5 : 1);
@@ -246,6 +264,17 @@ export async function graphSearch(
   return { nodes, edges: keptEdges, chunks, claims };
 }
 
+/** Replace seeds that were merged into another entity with the survivor's row (deduplicated). */
+async function canonicalSeeds(store: Store, seeds: EntityRow[], asOf: string | null): Promise<EntityRow[]> {
+  const canon = await canonicalMap(store, seeds.map((s) => s.id));
+  if (canon.size === 0) return seeds;
+  const targets = [...new Set(canon.values())].filter((id) => !seeds.some((s) => s.id === id));
+  const extra = targets.length ? (asOf ? await asOfRows(store, targets, asOf) : await liveRows(store, targets)) : [];
+  const byId = new Map<string, EntityRow>();
+  for (const s of [...seeds.filter((s) => !canon.has(s.id)), ...extra]) if (!byId.has(s.id)) byId.set(s.id, s);
+  return [...byId.values()];
+}
+
 async function liveRows(store: Store, ids: string[]): Promise<EntityRow[]> {
   if (ids.length === 0) return [];
   const p = new Params();
@@ -283,7 +312,7 @@ export async function graphOverview(store: Store, limit = 120): Promise<GraphSea
   );
   return {
     nodes: ents.map((e) => ({ id: e.id, name: e.name, type: e.type, description: e.description, score: e.mention_count, mentionCount: e.mention_count })),
-    edges: rels.map((r) => ({ source: r.source_id, target: r.target_id, type: r.type, description: r.description, weight: r.weight })),
+    edges: rels.map((r) => ({ source: r.source_id, target: r.target_id, type: r.type, description: r.description, weight: r.weight, validFrom: toDateString(r.valid_from ?? null), validTo: toDateString(r.valid_to ?? null) })),
     chunks: [],
   };
 }
@@ -293,6 +322,12 @@ export interface GraphInsights {
   hubs: { id: string; name: string; degree: number }[];
   isolated: { id: string; name: string }[];
   typeCounts: { type: string; n: number }[];
+  relationTypeCounts: { type: string; n: number }[];
+  /** Predicate spellings that matched nothing in the ontology (stored as related_to); a hint to extend a pack. */
+  unknownPredicates: { raw: string; n: number }[];
+  /** Entities folded into a survivor, and merge proposals awaiting a decision. */
+  merged: number;
+  mergeCandidates: number;
 }
 
 /** Simple graph health insights (llm_wiki's "Graph Insights" idea, minimal version). */
@@ -318,5 +353,17 @@ export async function graphInsights(store: Store): Promise<GraphInsights> {
   const typeCounts = await store.query<{ type: string; n: number }>(
     `SELECT type, count(*)::int AS n FROM entities WHERE tx_to IS NULL GROUP BY type ORDER BY n DESC`,
   );
-  return { totals: tot, hubs, isolated, typeCounts };
+  const relationTypeCounts = await store.query<{ type: string; n: number }>(
+    `SELECT type, count(*)::int AS n FROM relations WHERE tx_to IS NULL GROUP BY type ORDER BY n DESC`,
+  );
+  const unknownPredicates = await store.query<{ raw: string; n: number }>(
+    `SELECT attrs ->> 'raw_type' AS raw, count(*)::int AS n FROM evidence
+     WHERE kind = 'relation' AND tx_to IS NULL AND attrs ? 'raw_type'
+     GROUP BY attrs ->> 'raw_type' ORDER BY n DESC LIMIT 20`,
+  );
+  const [merges] = await store.query<{ merged: number; candidates: number }>(
+    `SELECT (SELECT count(*)::int FROM entities WHERE tx_to IS NULL AND canonical_id IS NOT NULL) AS merged,
+            (SELECT count(*)::int FROM suggestions WHERE kind = 'merge' AND status = 'pending') AS candidates`,
+  );
+  return { totals: tot, hubs, isolated, typeCounts, relationTypeCounts, unknownPredicates, merged: merges?.merged ?? 0, mergeCandidates: merges?.candidates ?? 0 };
 }

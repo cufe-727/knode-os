@@ -5,7 +5,7 @@
  * explicit *effect* carrying its own inverse.
  */
 
-export type ScopeKind = 'doc' | 'wiki-human' | 'tier1' | 'page' | 'datasource' | 'dataset' | 'dream' | 'absence';
+export type ScopeKind = 'doc' | 'wiki-human' | 'tier1' | 'page' | 'datasource' | 'dataset' | 'dream' | 'absence' | 'merge' | 'lint';
 export type ScopeStatus = 'applying' | 'active' | 'disposed';
 export type DisposeReason = 'removed' | 'replaced' | 'archived' | 'purge';
 
@@ -79,13 +79,14 @@ export type InverseSpec =
   | { op: 'file.delete'; path: string }
   | { op: 'file.restore'; path: string; blob: string }
   | { op: 'region.restore'; path: string; region: string; prev: string | null }
+  | { op: 'entity_link.remove'; linkId: string; entityId: string; prevCanonical: string | null }
   | { op: 'noop' };
 
 export type FsOp =
   | { op: 'write'; path: string; content: string }
   | { op: 'region'; path: string; region: string; content: string };
 
-export type EffectKind = 'wiki_path' | 'row_upsert' | 'enqueue' | 'suggestion' | 'dep' | 'page' | 'file_write' | 'region_write';
+export type EffectKind = 'wiki_path' | 'row_upsert' | 'enqueue' | 'suggestion' | 'dep' | 'page' | 'file_write' | 'region_write' | 'entity_link';
 
 /** Structured provenance reference carried by suggestions / pages instead of verbatim copies. */
 export interface EvidenceRef {
@@ -104,4 +105,6 @@ export interface WriterStats {
   effects: number;
   capabilities: number;
   locators: number;
+  /** Relation predicates that matched nothing in the ontology and fell back to related_to. */
+  unknownPredicates: number;
 }

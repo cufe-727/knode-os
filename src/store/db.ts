@@ -35,6 +35,14 @@ function embeddingsDdl(dim: number): string {
         embedding ${VECTOR_TYPE}(${dim}) NOT NULL
       );
       ${index}
+      -- entity name+description vectors for the duplicate audit; keyed by fold_sha so
+      -- an entity is only re-embedded when its folded row changed
+      CREATE TABLE IF NOT EXISTS entity_embeddings (
+        entity_id TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
+        fold_sha  TEXT NOT NULL,
+        model     TEXT NOT NULL,
+        embedding ${VECTOR_TYPE}(${dim}) NOT NULL
+      );
   `;
 }
 
@@ -82,7 +90,7 @@ export class Store implements Queryable {
     if (prevDim !== undefined && prevDim !== embeddingDim) {
       // A new dimension invalidates the stored vectors themselves — drop them
       // and let the next sync regenerate.
-      await db.exec(`DROP TABLE IF EXISTS embeddings;`);
+      await db.exec(`DROP TABLE IF EXISTS embeddings; DROP TABLE IF EXISTS entity_embeddings;`);
       await db.exec(`UPDATE documents SET status = 'pending' WHERE status = 'indexed';`);
       console.warn(`[knode-os] embedding dimension changed ${prevDim} -> ${embeddingDim}; embeddings dropped, re-run sync.`);
     } else if (prevDim !== undefined && prevType !== VECTOR_TYPE) {
@@ -139,7 +147,7 @@ export class Store implements Queryable {
    */
   async setEmbeddingDimension(dim: number): Promise<void> {
     if (dim === this.embeddingDim) return;
-    await this.db.exec(`DROP TABLE IF EXISTS embeddings;`);
+    await this.db.exec(`DROP TABLE IF EXISTS embeddings; DROP TABLE IF EXISTS entity_embeddings;`);
     await this.db.exec(embeddingsDdl(dim));
     await this.db.exec(`UPDATE documents SET status = 'pending' WHERE status = 'indexed';`);
     await this.setMeta('embedding', { dim, type: VECTOR_TYPE });

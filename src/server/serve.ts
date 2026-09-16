@@ -10,7 +10,11 @@ import { flushUsageToSidecars } from '../stats/heat.js';
 import { syncTraces } from '../traces/sync.js';
 import { reconcileViews } from '../wiki/pages.js';
 import { refineWiki } from '../wiki/refine.js';
+import { lintWiki } from '../wiki/lint.js';
 import { createApp } from './app.js';
+import { loadOrCreateMcpToken, MCP_TOKEN_FILE } from './mcp-http.js';
+import { startResearchLoop } from '../research/service.js';
+import { McpEndpoint } from '../research/workspace.js';
 import { WorkspaceContextRegistry } from './workspaces.js';
 
 /**
@@ -22,11 +26,20 @@ import { WorkspaceContextRegistry } from './workspaces.js';
  */
 export async function startServer(ctx: AppContext): Promise<void> {
   const log = (msg: string) => console.log(`[knode-os] ${msg}`);
+  const mcpBase: { url: string | null } = { url: null };
+  const mcpToken = loadOrCreateMcpToken(ctx.dataDir);
   const workspaceContexts = new WorkspaceContextRegistry(ctx.dataDir, {
     templateConfig: ctx.config,
     onCreate: (workspaceCtx, scope) => {
       const workspaceLog = (msg: string) => log(`[${scope.relativeDir}] ${msg}`);
-      return startWorkspaceServices(workspaceCtx, workspaceLog);
+      const mcp = (): McpEndpoint | null => mcpBase.url
+        ? {
+          url: mcpBase.url,
+          token: mcpToken,
+          headers: { 'x-knode-user': scope.user, 'x-knode-workspace-kind': scope.kind, 'x-knode-workspace-id': scope.id, 'x-knode-workspace-name': scope.name },
+        }
+        : null;
+      return startWorkspaceServices(workspaceCtx, workspaceLog, { mcp });
     },
   });
   const app = createApp(ctx, log, workspaceContexts);
@@ -34,13 +47,21 @@ export async function startServer(ctx: AppContext): Promise<void> {
 
   serve({ fetch: app.fetch, port, hostname: host }, (info) => {
     log(`serving http://${host}:${info.port}  (workspace root: ${ctx.dataDir})`);
+    const mcp = ctx.config.server.mcp;
+    if (!mcp || mcp.enabled !== false) {
+      const localHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+      mcpBase.url = `http://${localHost}:${info.port}${mcp?.path || '/mcp'}`;
+      log(`mcp endpoint ${mcpBase.url}  (bearer token: ${MCP_TOKEN_FILE}; register with \`knode-os connect <claude|codex|cursor> --http\`)`);
+    }
   });
 }
 
 const WATCH_FULL_SYNC_THRESHOLD = 200;
 
-function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void): () => Promise<void> {
+function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null } = {}): () => Promise<void> {
   let disposed = false;
+  // deep-research jobs: an external CLI writes wiki pages through the MCP endpoint serve hosts
+  const research = opts.mcp ? startResearchLoop(ctx, { mcp: opts.mcp, log }) : null;
   const activeJobs = new Set<Promise<unknown>>();
   const track = <T>(job: Promise<T>): Promise<T> => {
     activeJobs.add(job);
@@ -197,6 +218,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void): ()
 
   return async () => {
     disposed = true;
+    await research?.stop();
     clearInterval(syncTimer);
     clearInterval(tier1Timer);
     clearInterval(flushTimer);
@@ -226,6 +248,8 @@ function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void): NodeJ
         log(`tier2 done: ${res.pagesWritten} community pages from ${res.communities} hot communities`);
         const views = await reconcileViews(ctx, { actor: 'tier2', llm: true, onProgress: log });
         if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
+        const lint = await lintWiki(ctx, { onProgress: log });
+        log(`wiki lint: ${lint.issues.length} findings → ${lint.reportPath}`);
       } catch (err) {
         log(`tier2 failed: ${err instanceof Error ? err.message : err}`);
       }

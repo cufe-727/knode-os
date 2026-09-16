@@ -15,8 +15,7 @@ import {
   redactConfig,
   resolveRoutedLlmConfig,
   llmProviderLabel,
-  saveConfig,
-} from '../config.js';
+  saveConfig, ResearchConfig } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
 import { assertWritablePath, grepFiles, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
@@ -66,6 +65,16 @@ import {
   setSuggestionStatus,
 } from '../store/queries.js';
 import { WorkspaceContextRegistry, WorkspaceScope, resolveWorkspaceScope, workspaceDataDir } from './workspaces.js';
+import { loadOrCreateMcpToken, mountMcp } from './mcp-http.js';
+import { applyMerge, listMerges, unmergeEntity } from '../graph/merge.js';
+import { auditDuplicateEntities } from '../graph/dedupe.js';
+import { reviewClaims } from '../graph/claim-review.js';
+import { cancelJob, getJob, listJobs, queueJob, retryJob, ResearchStatus } from '../research/jobs.js';
+import { loadResearchTemplates, PHASES, RESEARCH_KINDS, ResearchKind } from '../research/templates.js';
+import { activeProfile, BUILTIN_PROFILES, deleteProfile, effectivePipeline, isValidProfileName, loadProfile, loadProfiles, PIPELINE_MODES, profileSummary, ResearchProfile, rolePromptText, saveProfile, writeRolePrompt } from '../research/profile.js';
+import { runsRoot } from '../research/workspace.js';
+import { recommendWikiTopics, refreshRecommendations } from '../research/recommend.js';
+import { lintWiki } from '../wiki/lint.js';
 
 /** Comma-separated query parameter → array (absent/empty stays undefined). */
 function csv(value: string | undefined): string[] | undefined {
@@ -92,6 +101,7 @@ type ModelConfigDraft = {
   connections?: Partial<LlmConnection>[];
   extraction?: ExtractionConfigDraft;
   retrieval?: { sag?: Partial<SagSearchConfig> };
+  research?: Partial<Omit<ResearchConfig, 'auto'>> & { auto?: Partial<ResearchConfig['auto']> };
 };
 
 /**
@@ -215,6 +225,17 @@ export function createApp(
       return c.json(err(e), 401);
     }
   });
+
+  // MCP over Streamable HTTP shares the workspace registry (and therefore the
+  // one open index per workspace) with the REST routes; see mcp-http.ts.
+  const mcpConfig = rootCtx.config.server.mcp;
+  if (!mcpConfig || mcpConfig.enabled !== false) {
+    mountMcp(app, {
+      path: mcpConfig?.path || '/mcp',
+      token: loadOrCreateMcpToken(rootCtx.dataDir),
+      registry: workspaceContexts,
+    });
+  }
 
   /* ------------------------------- system ------------------------------- */
 
@@ -394,6 +415,29 @@ export function createApp(
         if (Number.isFinite(budget) && budget >= 0) next.extraction.dailyTokenBudget = Math.floor(budget);
         if (Number.isFinite(batchSize) && batchSize >= 1) next.extraction.batchSize = Math.floor(batchSize);
         if (Number.isFinite(concurrency) && concurrency >= 1) next.extraction.concurrency = Math.floor(concurrency);
+      }
+      if (incoming.research) {
+        const r = incoming.research;
+        const cur = next.research;
+        if (typeof r.agent === 'string') cur.agent = r.agent.trim();
+        if (typeof r.model === 'string') cur.model = r.model.trim();
+        if (typeof r.profile === 'string' && isValidProfileName(r.profile.trim())) cur.profile = r.profile.trim();
+        if (typeof r.pipeline === 'string' && (PIPELINE_MODES as readonly string[]).includes(r.pipeline)) cur.pipeline = r.pipeline as ResearchConfig['pipeline'];
+        const setInt = (key: 'maxTurns' | 'timeoutMs' | 'concurrency' | 'researchers' | 'reviewRounds' | 'keepRuns', min: number, max: number) => {
+          const value = Number(r[key]);
+          if (r[key] !== undefined && Number.isFinite(value)) cur[key] = Math.min(max, Math.max(min, Math.floor(value)));
+        };
+        setInt('maxTurns', 1, 500);
+        setInt('timeoutMs', 60_000, 24 * 3_600_000);
+        setInt('concurrency', 1, 8);
+        setInt('researchers', 1, 16);
+        setInt('reviewRounds', 0, 6);
+        setInt('keepRuns', 1, 500);
+        if (r.auto) {
+          if (typeof r.auto.enabled === 'boolean') cur.auto.enabled = r.auto.enabled;
+          const daily = Number(r.auto.dailyJobs);
+          if (r.auto.dailyJobs !== undefined && Number.isFinite(daily)) cur.auto.dailyJobs = Math.min(50, Math.max(1, Math.floor(daily)));
+        }
       }
       if (incoming.retrieval?.sag) {
         const sag = incoming.retrieval.sag;
@@ -778,6 +822,11 @@ export function createApp(
         statuses: csv(c.req.query('status')),
         text: c.req.query('text') || undefined,
         limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+        eventRange: c.req.query('event_range')
+          ? (({ validFrom, validTo }) => ({ from: validFrom, to: validTo }))(resolveTemporal({ validRange: c.req.query('event_range') }))
+          : undefined,
+        includeSuperseded: c.req.query('include_superseded') === '1' || c.req.query('include_superseded') === 'true',
+        order: c.req.query('order') === 'timeline' ? 'timeline' : undefined,
         temporal: resolveTemporal({
           asOf: c.req.query('as_of') || undefined,
           validAt: c.req.query('valid_at') || undefined,
@@ -1115,9 +1164,230 @@ export function createApp(
     let applied: { applied: boolean; path?: string } = { applied: false };
     if (status === 'accepted') {
       const s = await getSuggestion(ctx.store, id);
-      if (s?.kind === 'pack') applied = await applySuggestion(ctx.store, ctx.dataDir, id);
+      if (s && (s.kind === 'pack' || s.kind === 'recipe' || s.kind === 'merge' || s.kind === 'wiki')) {
+        try {
+          applied = await applySuggestion(ctx.store, ctx.dataDir, id);
+        } catch (e) {
+          await setSuggestionStatus(ctx.store, id, 'pending');
+          return c.json(err(e), 400);
+        }
+      }
     }
     return c.json({ ok: true, ...applied });
+  });
+
+  /* ------------------------------ entities -------------------------------- */
+
+  app.get('/api/entities/merges', async (c) => c.json(await listMerges(requestCtx(c).store)));
+
+  app.post('/api/entities/merge', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const { entityId, canonicalId, reason } = await c.req.json<{ entityId: string; canonicalId: string; reason?: string }>();
+      return c.json(await applyMerge(ctx.store, { entityId, canonicalId, reason, actor: 'user' }));
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.post('/api/entities/unmerge', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const { entityId } = await c.req.json<{ entityId: string }>();
+      return c.json({ ok: await unmergeEntity(ctx.store, entityId, { actor: 'user' }) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.post('/api/review/claims', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      return c.json(await reviewClaims(ctx, { onProgress: log }));
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
+  });
+
+  app.post('/api/entities/dedupe', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      return c.json(await auditDuplicateEntities({ store: ctx.store, embedder: ctx.embedder, config: ctx.config, llm: ctx.llm }, { onProgress: log }));
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
+  });
+
+  app.post('/api/wiki/lint', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      return c.json(await lintWiki(ctx, { onProgress: log }));
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
+  });
+
+  /* ------------------------------ research -------------------------------- */
+
+  app.get('/api/research/jobs', async (c) => {
+    const ctx = requestCtx(c);
+    const status = c.req.query('status');
+    return c.json(await listJobs(ctx.store, {
+      status: status ? (status.split(',').map((s) => s.trim()).filter(Boolean) as ResearchStatus[]) : undefined,
+      limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+    }));
+  });
+
+  app.post('/api/research/jobs', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = await c.req.json<{ kind?: string; target?: string; query?: string; template?: string }>();
+      const kind = (body.kind ?? (body.query && !body.target ? 'question' : 'entity')) as ResearchKind;
+      if (!RESEARCH_KINDS.includes(kind)) return c.json({ error: `kind must be one of ${RESEARCH_KINDS.join(', ')}` }, 400);
+      const res = await queueJob(ctx.store, { kind, target: body.target, query: body.query, template: body.template, requestedBy: 'web' });
+      return c.json(res, res.created ? 201 : 200);
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.post('/api/research/ask', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const { query } = await c.req.json<{ query: string }>();
+      if (!query?.trim()) return c.json({ error: 'query is required' }, 400);
+      return c.json(await queueJob(ctx.store, { kind: 'question', query, requestedBy: 'web' }), 201);
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.get('/api/research/recommendations', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      if (c.req.query('refresh')) return c.json((await refreshRecommendations(ctx)).recommendations);
+      // pending wiki suggestions are the filed recommendations; recompute on demand otherwise
+      const pending = await ctx.store.query<{ id: string; payload: Record<string, unknown> }>(
+        `SELECT id, payload FROM suggestions WHERE kind = 'wiki' AND status = 'pending' ORDER BY (payload ->> 'score')::float DESC NULLS LAST LIMIT 30`,
+      );
+      if (pending.length > 0) return c.json(pending.map((s) => ({ ...s.payload, suggestionId: s.id })));
+      return c.json(await recommendWikiTopics(ctx));
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
+  });
+
+  // Research profiles: how a job runs (effort, search, verification, sub-agent roles with their own prompts).
+  const profileDetail = (dataDir: string, profile: ResearchProfile) => ({
+    ...profile,
+    builtin: Boolean(BUILTIN_PROFILES[profile.name]),
+    phaseDefaults: PHASES,
+    roles: profile.roles.map((r) => {
+      const p = rolePromptText(dataDir, r);
+      return { ...r, promptPath: p.path, promptText: p.text, promptIsDefault: p.isDefault, promptDefault: PHASES[r.phase] };
+    }),
+  });
+
+  app.get('/api/research/profiles', (c) => {
+    const ctx = requestCtx(c);
+    const active = activeProfile(ctx.dataDir, ctx.config);
+    return c.json({ active: active.name, pipeline: effectivePipeline(active, ctx.config), profiles: [...loadProfiles(ctx.dataDir).values()].map(profileSummary) });
+  });
+
+  app.get('/api/research/profiles/:name', (c) => {
+    const ctx = requestCtx(c);
+    const profile = loadProfile(ctx.dataDir, c.req.param('name'));
+    if (!profile) return c.json({ error: 'no such profile' }, 404);
+    return c.json(profileDetail(ctx.dataDir, profile));
+  });
+
+  app.put('/api/research/profiles/:name', async (c) => {
+    const ctx = requestCtx(c);
+    const name = c.req.param('name');
+    if (!isValidProfileName(name)) return c.json({ error: 'profile names use letters, digits, - and _ (max 41 chars)' }, 400);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { profile?: Record<string, unknown>; prompts?: Record<string, string>; activate?: boolean };
+      let saved = saveProfile(ctx.dataDir, { ...(body.profile ?? {}), name } as Partial<ResearchProfile> & { name: string });
+      // role prompts: only a text that differs from what the role currently runs with is written (built-ins stay built-in)
+      let changed = false;
+      const roles = saved.roles.map((role) => {
+        const text = body.prompts?.[role.id];
+        if (typeof text !== 'string') return role;
+        const current = rolePromptText(ctx.dataDir, role);
+        if (text.trim() === current.text.trim()) return role;
+        changed = true;
+        return { ...role, prompt: writeRolePrompt(ctx.dataDir, role, text) };
+      });
+      if (changed) saved = saveProfile(ctx.dataDir, { ...saved, roles });
+      if (body.activate && ctx.config.research.profile !== name) {
+        ctx.config.research.profile = name;
+        saveConfig(ctx.dataDir, ctx.config);
+      }
+      return c.json(profileDetail(ctx.dataDir, saved));
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.delete('/api/research/profiles/:name', (c) => {
+    const ctx = requestCtx(c);
+    const name = c.req.param('name');
+    if (!isValidProfileName(name)) return c.json({ error: 'invalid profile name' }, 400);
+    if ((ctx.config.research?.profile || 'default') === name && !BUILTIN_PROFILES[name]) return c.json({ error: 'select another profile before deleting the active one' }, 400);
+    const removed = deleteProfile(ctx.dataDir, name);
+    if (!removed) return c.json({ error: 'no such profile' }, 404);
+    // a built-in comes back as its default on the next load (delete = reset)
+    return c.json({ ok: true, reset: Boolean(BUILTIN_PROFILES[name]) });
+  });
+
+  app.get('/api/research/templates', (c) => {
+    const ctx = requestCtx(c);
+    return c.json([...loadResearchTemplates(ctx.dataDir).values()].map((t) => ({ name: t.name, kind: t.kind, output: t.output, maxTurns: t.maxTurns, requires: t.requires, path: t.path })));
+  });
+
+  app.get('/api/research/pages', async (c) => {
+    const ctx = requestCtx(c);
+    const jobs = await listJobs(ctx.store, { status: 'done', limit: 200 });
+    const out: unknown[] = [];
+    const seen = new Set<string>();
+    for (const job of jobs) {
+      if (!job.outputPath || seen.has(job.outputPath)) continue;
+      seen.add(job.outputPath);
+      let exists = false;
+      try {
+        exists = fs.existsSync(safePath(ctx.dataDir, job.outputPath));
+      } catch {
+        exists = false;
+      }
+      const [scope] = await ctx.store.query<{ trust: string; actor: string; applied_at: string }>(
+        `SELECT trust, actor, applied_at FROM scopes WHERE kind = 'doc' AND key = $1 AND status = 'active' ORDER BY applied_at DESC LIMIT 1`,
+        [job.outputPath],
+      );
+      out.push({ path: job.outputPath, exists, job: job.id, kind: job.kind, target: job.target ?? job.query, agent: job.agent, finishedAt: job.finishedAt, trust: scope?.trust ?? null, warnings: Array.isArray(job.payload.warnings) ? job.payload.warnings : [] });
+    }
+    return c.json(out);
+  });
+
+  app.get('/api/research/jobs/:id', async (c) => {
+    const ctx = requestCtx(c);
+    const job = await getJob(ctx.store, c.req.param('id'));
+    if (!job) return c.json({ error: 'no such job' }, 404);
+    let log: string | null = null;
+    if (c.req.query('log')) {
+      const file = path.join(runsRoot(ctx.dataDir, ctx.config.research?.runsDir ?? '.runs'), job.id, 'transcript.jsonl');
+      if (fs.existsSync(file)) {
+        const lines = fs.readFileSync(file, 'utf8').split('\n');
+        log = lines.slice(-200).join('\n');
+      }
+    }
+    return c.json({ ...job, log });
+  });
+
+  app.post('/api/research/jobs/:id/cancel', async (c) => c.json({ cancelled: await cancelJob(requestCtx(c).store, c.req.param('id')) }));
+
+  app.post('/api/research/jobs/:id/retry', async (c) => {
+    const job = await retryJob(requestCtx(c).store, c.req.param('id'));
+    return job ? c.json(job) : c.json({ error: 'job is not in a retryable state' }, 400);
   });
 
   app.post('/api/dream', async (c) => {

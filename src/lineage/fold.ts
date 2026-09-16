@@ -8,6 +8,7 @@ import {
   groupBy,
   Params,
 } from '../store/temporal.js';
+import { entityKeyKinds, KeyKind, nameKey } from '../graph/normalize.js';
 import { emptyTouched, TouchedSet } from './types.js';
 
 /**
@@ -33,12 +34,17 @@ export interface FoldResult {
   reopened: TouchedSet;
 }
 
-export async function foldTouched(q: Queryable, touched: TouchedSet, txTime: string): Promise<FoldResult> {
+export interface FoldOptions {
+  /** Entity type precedence (from the ontology); defaults to the built-in order. */
+  typePrecedence?: readonly string[];
+}
+
+export async function foldTouched(q: Queryable, touched: TouchedSet, txTime: string, opts: FoldOptions = {}): Promise<FoldResult> {
   const result: FoldResult = { changed: emptyTouched(), tombstoned: emptyTouched(), reopened: emptyTouched() };
   const relationIds = new Set(touched.relations);
   const claimIds = new Set(touched.claims);
 
-  await foldEntities(q, [...touched.entities], txTime, result);
+  await foldEntities(q, [...touched.entities], txTime, result, opts.typePrecedence);
 
   // liveness flips cascade to the edges and claims that hang off the entity
   const flipped = [...result.tombstoned.entities, ...result.reopened.entities];
@@ -77,7 +83,7 @@ async function liveEvidence(q: Queryable, kind: string, ids: string[]): Promise<
   return groupBy(rows, (r) => r.target_id);
 }
 
-async function foldEntities(q: Queryable, ids: string[], txTime: string, result: FoldResult): Promise<void> {
+async function foldEntities(q: Queryable, ids: string[], txTime: string, result: FoldResult, precedence?: readonly string[]): Promise<void> {
   if (ids.length === 0) return;
   const evidence = await liveEvidence(q, 'entity', ids);
   const p = new Params();
@@ -98,13 +104,14 @@ async function foldEntities(q: Queryable, ids: string[], txTime: string, result:
     const rows = evidence.get(cur.id) ?? [];
     const mentionCount = mentions.get(cur.id) ?? 0;
     const wasLive = cur.tx_to === null;
-    const folded = foldEntityEvidence(cur.id, rows, mentionCount, cur);
+    const folded = foldEntityEvidence(cur.id, rows, mentionCount, cur, precedence);
     if (!folded) {
       if (wasLive) {
         await q.query(
           `UPDATE entities SET tx_to = $2, evidence_count = 0, mention_count = $3, fold_sha = '', updated_at = now() WHERE id = $1`,
           [cur.id, txTime, mentionCount],
         );
+        await q.query(`DELETE FROM entity_alias_keys WHERE entity_id = $1`, [cur.id]);
         result.tombstoned.entities.add(cur.id);
         result.changed.entities.add(cur.id);
       } else if (mentionCount !== cur.mention_count) {
@@ -123,7 +130,30 @@ async function foldEntities(q: Queryable, ids: string[], txTime: string, result:
        WHERE id = $1`,
       [cur.id, folded.name, folded.type, folded.description, JSON.stringify(folded.aliases), mentionCount, folded.evidence_count, foldSha, txTime],
     );
+    await refreshEntityKeys(q, cur.id, folded.name, folded.aliases);
   }
+}
+
+/**
+ * The lookup keys an entity answers to (graph/resolve.ts): its own folded
+ * name and aliases plus those of every entity merged into it, with and
+ * without corporate suffixes. Rebuilt whenever the entity's fold runs.
+ */
+async function refreshEntityKeys(q: Queryable, id: string, name: string, aliases: string[]): Promise<void> {
+  const keys = entityKeyKinds(name, aliases);
+  const members = await q.query<{ name: string; aliases: string[] }>(`SELECT name, aliases FROM entities WHERE canonical_id = $1 AND tx_to IS NULL`, [id]);
+  for (const m of members) {
+    for (const [k, kind] of entityKeyKinds(m.name, Array.isArray(m.aliases) ? m.aliases : [])) {
+      if (!keys.has(k) || (kind === 'exact' && keys.get(k) === 'bare')) keys.set(k, kind);
+    }
+  }
+  await q.query(`DELETE FROM entity_alias_keys WHERE entity_id = $1`, [id]);
+  const list = [...keys.entries()] as [string, KeyKind][];
+  if (list.length > 0) {
+    const values = list.map((_, i) => `($1, $${i * 2 + 2}, $${i * 2 + 3})`).join(',');
+    await q.query(`INSERT INTO entity_alias_keys (entity_id, alias_key, kind) VALUES ${values} ON CONFLICT DO NOTHING`, [id, ...list.flat()]);
+  }
+  await q.query(`UPDATE entities SET name_key = $2 WHERE id = $1`, [id, nameKey(name).bare || null]);
 }
 
 async function entityLiveness(q: Queryable, ids: string[]): Promise<Map<string, boolean>> {
@@ -161,14 +191,15 @@ async function foldRelations(q: Queryable, ids: string[], txTime: string, result
       }
       continue;
     }
-    const foldSha = sha16([Number(folded!.weight.toFixed(3)), folded!.description]);
+    const foldSha = sha16([Number(folded!.weight.toFixed(3)), folded!.description, folded!.valid_from, folded!.valid_to]);
     if (!wasLive) result.reopened.relations.add(cur.id);
     if (!wasLive || foldSha !== cur.fold_sha) result.changed.relations.add(cur.id);
     await q.query(
       `UPDATE relations SET weight = $2, description = $3, evidence_count = $4, fold_sha = $5,
+              valid_from = $7::timestamptz, valid_to = $8::timestamptz,
               tx_from = CASE WHEN tx_to IS NOT NULL THEN $6::timestamptz ELSE tx_from END, tx_to = NULL
        WHERE id = $1`,
-      [cur.id, folded!.weight, folded!.description, folded!.evidence_count, foldSha, txTime],
+      [cur.id, folded!.weight, folded!.description, folded!.evidence_count, foldSha, txTime, folded!.valid_from, folded!.valid_to],
     );
   }
 }
@@ -197,7 +228,7 @@ async function foldClaims(q: Queryable, ids: string[], txTime: string, result: F
       continue;
     }
     const f = folded!;
-    const foldSha = sha16([f.status, f.type, f.valid_from, f.valid_to, f.object_id, f.primary_scope_id]);
+    const foldSha = sha16([f.status, f.type, f.valid_from, f.valid_to, f.object_id, f.primary_scope_id, f.event_at, f.observed_at]);
     if (!wasLive) result.reopened.claims.add(cur.id);
     if (!wasLive || foldSha !== cur.fold_sha) result.changed.claims.add(cur.id);
     await q.query(
@@ -206,23 +237,25 @@ async function foldClaims(q: Queryable, ids: string[], txTime: string, result: F
               object_id = (SELECT id FROM entities WHERE id = $7),
               chunk_id = (SELECT id FROM chunks WHERE id = $8),
               evidence_count = $9, fold_sha = $10,
+              event_at = $12::timestamptz, observed_at = $13::timestamptz,
               tx_from = CASE WHEN tx_to IS NOT NULL THEN $11::timestamptz ELSE tx_from END, tx_to = NULL
        WHERE id = $1`,
       [
         cur.id, f.status, f.type, f.valid_from, f.valid_to,
         f.primary_scope_id, f.object_id, f.segment_id, f.evidence_count, foldSha, txTime,
+        f.event_at, f.observed_at,
       ],
     );
   }
 }
 
 /** Full recompute (verification / repair). Returns how many rows changed. */
-export async function recountAll(q: Queryable, txTime = new Date().toISOString()): Promise<{ entities: number; relations: number; claims: number; changed: number }> {
+export async function recountAll(q: Queryable, txTime = new Date().toISOString(), opts: FoldOptions = {}): Promise<{ entities: number; relations: number; claims: number; changed: number }> {
   const touched = emptyTouched();
   for (const r of await q.query<{ id: string }>(`SELECT id FROM entities`)) touched.entities.add(r.id);
   for (const r of await q.query<{ id: string }>(`SELECT id FROM relations`)) touched.relations.add(r.id);
   for (const r of await q.query<{ id: string }>(`SELECT id FROM claims`)) touched.claims.add(r.id);
-  const res = await foldTouched(q, touched, txTime);
+  const res = await foldTouched(q, touched, txTime, opts);
   return {
     entities: touched.entities.size,
     relations: touched.relations.size,

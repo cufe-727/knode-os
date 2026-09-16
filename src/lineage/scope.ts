@@ -12,6 +12,7 @@ import { appendLedger, LedgerScopeRef, nextLedgerSeq } from './ledger.js';
 import { TrustTier, tierForActor } from './trust.js';
 import { DisposeReason, emptyTouched, InverseSpec, ScopeKind, ScopeRow, TouchedSet, WriterStats } from './types.js';
 import { runFsOps, ScopeWriter } from './writer.js';
+import { loadOntology, typePrecedence } from '../graph/ontology.js';
 import { replaceRegion } from '../wiki/regions.js';
 
 /**
@@ -174,7 +175,7 @@ export async function applyScope(
     seq = await nextLedgerSeq(q);
     writer = new ScopeWriter(q, scope, txTime, store.dataDir, trust);
     await body(writer);
-    const fold = await foldTouched(q, writer.touched, txTime);
+    const fold = await foldTouched(q, writer.touched, txTime, { typePrecedence: typePrecedence(writer.ontology) });
     const propagation = await propagate(q, fold.changed, fold.tombstoned, txTime);
     await q.query(`UPDATE scopes SET status = 'active' WHERE id = $1`, [id]);
     scope.status = 'active';
@@ -210,6 +211,7 @@ export async function disposeScope(store: Store, scopeId: string, opts: DisposeO
   let seq = 0;
   let result!: DisposeResult;
   const documentId = typeof scope.meta.documentId === 'string' ? scope.meta.documentId : null;
+  const precedence = typePrecedence(loadOntology(store.dataDir));
 
   await store.tx(async (q) => {
     const touched = emptyTouched();
@@ -249,7 +251,7 @@ export async function disposeScope(store: Store, scopeId: string, opts: DisposeO
       await q.query(`UPDATE effects SET reverted_at = $2::timestamptz WHERE seq = $1`, [e.seq, txTime]);
     }
 
-    const fold = await foldTouched(q, touched, txTime);
+    const fold = await foldTouched(q, touched, txTime, { typePrecedence: precedence });
     for (const d of tombstoned.documents) fold.tombstoned.documents.add(d);
     for (const d of tombstoned.datasets) fold.tombstoned.datasets.add(d);
     for (const d of touched.documents) fold.changed.documents.add(d);
@@ -318,6 +320,14 @@ async function revertEffect(
     case 'deps.restore':
       await writeDeps(q, { kind: inv.artifactKind, id: inv.artifactId }, inv.prev);
       return;
+    case 'entity_link.remove': {
+      const [link] = await q.query<{ canonical_id: string }>(`SELECT canonical_id FROM entity_links WHERE id = $1`, [inv.linkId]);
+      await q.query(`UPDATE entity_links SET tx_to = $2::timestamptz WHERE id = $1 AND tx_to IS NULL`, [inv.linkId, txTime]);
+      await q.query(`UPDATE entities SET canonical_id = $2 WHERE id = $1`, [inv.entityId, inv.prevCanonical]);
+      touched.entities.add(inv.entityId);
+      if (link?.canonical_id) touched.entities.add(link.canonical_id);
+      return;
+    }
     case 'page.restore': {
       if (reason === 'archived' || !inv.prev) {
         await q.query(
@@ -448,5 +458,5 @@ export async function gcOrphanRows(q: Queryable): Promise<{ claims: number; rela
 }
 
 function zeroStats(): WriterStats {
-  return { entities: 0, relations: 0, claims: 0, mentions: 0, chunks: 0, effects: 0, capabilities: 0, locators: 0 };
+  return { entities: 0, relations: 0, claims: 0, mentions: 0, chunks: 0, effects: 0, capabilities: 0, locators: 0, unknownPredicates: 0 };
 }

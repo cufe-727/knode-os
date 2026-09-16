@@ -32,6 +32,8 @@ export const CATALOG_VIEWS: { name: string; description: string }[] = [
   { name: 'v_capability_stats', description: 'per (intent, slot, capability): attempts, successes, usage, latency' },
   { name: 'v_disputes', description: 'open contradictions between claims, and how they were resolved' },
   { name: 'v_worksets', description: 'pinned views for long-running tasks' },
+  { name: 'v_entity_links', description: 'entities merged into a canonical one (same_as), with who decided and why' },
+  { name: 'v_research_jobs', description: 'deep-research jobs: what page was requested, which agent ran it, outcome' },
 ];
 
 const VIEW_NAMES = new Set(CATALOG_VIEWS.map((v) => v.name));

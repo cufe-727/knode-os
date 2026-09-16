@@ -98,6 +98,7 @@
         <button data-tab="search">Search</button>
         <button data-tab="ask">Ask</button>
         <button data-tab="graph">Graph</button>
+        <button data-tab="wiki">Wiki</button>
         <button data-tab="traces">Traces</button>
         <button data-tab="dream">Dream</button>
         <button data-tab="settings">Settings</button>
@@ -219,6 +220,39 @@
         <span class="hint" id="dream-info">analyzes recent traces → suggestions for skills, memory and knowledge</span>
       </div>
       <div id="suggestions"></div>
+    </section>
+
+    <!-- Wiki: deep-research pages -->
+    <section id="tab-wiki" class="tab">
+      <div class="searchbar">
+        <select id="research-kind">
+          <option value="entity">entity page</option>
+          <option value="concept">concept page</option>
+          <option value="comparison">comparison</option>
+          <option value="timeline">timeline</option>
+          <option value="question">question → answer page</option>
+          <option value="refresh">refresh a page (path)</option>
+          <option value="verify">verify an entity (web)</option>
+        </select>
+        <input id="research-target" placeholder="entity / concept name, “A vs B”, a question, or wiki/… path for refresh" />
+        <button id="btn-research-queue">☑ queue research</button>
+        <button id="btn-research-refresh" title="reload jobs, pages and recommendations">⟳</button>
+        <span class="hint" id="research-info">an external coding-agent CLI (research.agent in settings) writes the page through the MCP endpoint; pages land quarantined until you promote them</span>
+      </div>
+      <div class="wiki-grid">
+        <div>
+          <h3 class="wiki-h">Recommended pages</h3>
+          <div id="research-recommendations" class="hint">loading…</div>
+        </div>
+        <div>
+          <h3 class="wiki-h">Jobs</h3>
+          <div id="research-jobs" class="hint">loading…</div>
+        </div>
+        <div class="wiki-span">
+          <h3 class="wiki-h">Research pages</h3>
+          <div id="research-pages" class="hint">loading…</div>
+        </div>
+      </div>
     </section>
 
     <!-- Settings -->
@@ -354,6 +388,56 @@
             <label>Parallel calls<input id="cfg-extraction-concurrency" type="number" min="1" step="1" /></label>
             <label class="cfg-check"><input id="cfg-extraction-claims" type="checkbox" /> Extract factual claims alongside entities</label>
           </div>
+        </section>
+
+        <section class="settings-section" aria-labelledby="research-title">
+          <div class="settings-section-head"><div><p class="section-index">03 · DEEP RESEARCH</p><h3 id="research-title">Who writes the wiki, and how hard they think</h3><p>A coding-agent CLI researches a topic through the MCP endpoint and writes the page. A profile sets the reasoning effort, web access and verification bar, and lists the sub-agents — each with its own CLI, model, tools and prompt.</p></div><span class="section-badge">Agents</span></div>
+
+          <div class="cfg-card-title"><div><b>Research agent</b><small>Which CLI runs jobs, how many at once, and which profile it follows. Roles below may override the CLI per phase.</small></div><span class="section-badge accent2">Runner</span></div>
+          <fieldset class="cfg-card cfg-card-wide">
+            <div class="cfg-grid cfg-grid-3">
+              <label>Agent<select id="cfg-research-agent"></select></label>
+              <label>Model<input id="cfg-research-model" placeholder="CLI default" /></label>
+              <label>Profile<select id="cfg-research-profile"></select></label>
+              <label>Pipeline<select id="cfg-research-pipeline"><option value="team">Team · plan, parallel research, synthesize, review, revise</option><option value="native">Native sub-agents · one session with --agents / agents.enabled</option><option value="single">Single session</option></select></label>
+              <label>Parallel jobs<input id="cfg-research-concurrency" type="number" min="1" max="8" step="1" /></label>
+              <label>Turns per session<input id="cfg-research-maxturns" type="number" min="1" step="1" /></label>
+              <label>Timeout (minutes)<input id="cfg-research-timeout" type="number" min="1" step="1" /></label>
+              <label>Researchers (default fan-out)<input id="cfg-research-researchers" type="number" min="1" max="16" step="1" /></label>
+              <label>Review rounds (default)<input id="cfg-research-rounds" type="number" min="0" max="6" step="1" /></label>
+            </div>
+            <label class="cfg-check"><input id="cfg-research-auto" type="checkbox" /> Accept the top recommendations automatically, up to <input id="cfg-research-daily" type="number" min="1" max="50" step="1" class="cfg-inline-num" /> jobs a day</label>
+            <p class="cfg-callout" id="cfg-research-note"></p>
+          </fieldset>
+
+          <div class="cfg-card-title"><div><b>Profile <span id="cfg-profile-name" class="mono"></span></b><small>Stored as <span class="mono">playbooks/research/profiles/&lt;name&gt;.yaml</span> — edit here or in the file. The profile may pin its own pipeline.</small></div><div class="cfg-actions-inline"><button type="button" id="cfg-profile-duplicate" class="ghost">Duplicate…</button><button type="button" id="cfg-profile-delete" class="ghost">Delete</button></div></div>
+          <fieldset class="cfg-card cfg-card-wide" id="cfg-profile-card">
+            <div class="cfg-grid cfg-grid-3">
+              <label>Title<input id="cfg-profile-title" placeholder="Shown in lists" /></label>
+              <label class="cfg-span-2">Description<input id="cfg-profile-desc" placeholder="When to pick this profile" /></label>
+              <label>Pipeline override<select id="cfg-profile-pipeline"><option value="">Use the runner's pipeline</option><option value="team">Team</option><option value="native">Native sub-agents</option><option value="single">Single session</option></select></label>
+              <label>Reasoning effort<select id="cfg-profile-effort"></select></label>
+              <label>Web access<select id="cfg-profile-web"><option value="inherit">Follow review.external</option><option value="on">On for every job (within review.external)</option><option value="off">Off</option></select></label>
+              <label>Search freshness<select id="cfg-profile-freshness"><option value="live">Live web search</option><option value="cached">Cached search index (codex)</option></select></label>
+              <label>Search rounds per section<input id="cfg-profile-rounds" type="number" min="1" max="20" step="1" /></label>
+              <label>Sources per fact<input id="cfg-profile-minsources" type="number" min="1" max="5" step="1" /></label>
+              <label>Conflicting sources<select id="cfg-profile-conflicts"><option value="flag">Flag both sides as disputed</option><option value="prefer_primary">Prefer the primary source</option><option value="prefer_recent">Prefer the most recent</option></select></label>
+              <label>Max sections<input id="cfg-profile-maxsections" type="number" min="1" max="12" step="1" /></label>
+            </div>
+            <div class="cfg-checks">
+              <label class="cfg-check"><input id="cfg-profile-primary" type="checkbox" /> Prefer primary sources</label>
+              <label class="cfg-check"><input id="cfg-profile-marginal" type="checkbox" /> Stop a section when a search round adds nothing new</label>
+              <label class="cfg-check"><input id="cfg-profile-citations" type="checkbox" /> Cite a source on every fact</label>
+              <label class="cfg-check"><input id="cfg-profile-uncertainty" type="checkbox" /> Mark uncertain claims as suspected</label>
+              <label class="cfg-check"><input id="cfg-profile-evidence" type="checkbox" /> Require an evidence table section</label>
+            </div>
+          </fieldset>
+
+          <div class="cfg-connections-head">
+            <div><b>Sub-agents</b><small>One card per role. Each has its own CLI, model, effort, tools and prompt; turn a role off to skip its phase. Several roles may share a phase (review roles all run; research roles split the sections).</small></div>
+            <button type="button" id="cfg-role-add" class="ghost">Add role</button>
+          </div>
+          <div id="cfg-roles" class="cfg-connections"></div>
         </section>
 
         <div id="cfg-status" aria-live="polite"></div>

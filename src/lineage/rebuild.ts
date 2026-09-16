@@ -4,6 +4,7 @@ import { AppContext } from '../context.js';
 import { DB_DIR } from '../fs/datadir.js';
 import { Sidecar } from '../fs/sidecar.js';
 import { applyExtraction } from '../graph/llm-extract.js';
+import { applyMerge, unmergeEntity } from '../graph/merge.js';
 import { PageContext } from '../graph/store.js';
 import { documentIdFor } from '../ingest/apply.js';
 import { sync, SyncStats } from '../ingest/sync.js';
@@ -50,11 +51,25 @@ export async function rebuild(ctx: AppContext, opts: { history?: boolean; onProg
   // human decisions recorded as feedback
   let feedbackReplayed = 0;
   for (const ev of readLedger(dataDir)) {
-    if (ev.ev !== 'feedback' || ev.kind !== 'suggestion.status') continue;
-    const status = (ev.payload as { status?: string } | undefined)?.status;
-    if (!status) continue;
-    const r = await store.query<{ id: string }>(`UPDATE suggestions SET status = $2 WHERE id = $1 RETURNING id`, [ev.id, status]);
-    if (r.length) feedbackReplayed++;
+    if (ev.ev !== 'feedback') continue;
+    if (ev.kind === 'suggestion.status') {
+      const status = (ev.payload as { status?: string } | undefined)?.status;
+      if (!status) continue;
+      const r = await store.query<{ id: string }>(`UPDATE suggestions SET status = $2 WHERE id = $1 RETURNING id`, [ev.id, status]);
+      if (r.length) feedbackReplayed++;
+    } else if (ev.kind === 'entity.merge') {
+      // entity merges are decisions, not derivations: replayed in ledger order
+      const p = ev.payload as { canonicalId?: string; reason?: string } | undefined;
+      if (!p?.canonicalId) continue;
+      try {
+        await applyMerge(store, { entityId: ev.id, canonicalId: p.canonicalId, reason: p.reason, actor: ev.actor, log: false });
+        feedbackReplayed++;
+      } catch (err) {
+        progress(`merge replay skipped for ${ev.id}: ${err instanceof Error ? err.message : err}`);
+      }
+    } else if (ev.kind === 'entity.unmerge') {
+      if (await unmergeEntity(store, ev.id, { actor: ev.actor, log: false })) feedbackReplayed++;
+    }
   }
 
   // removed sources with an attic sidecar: replay their graph contribution on the original timeline
@@ -105,10 +120,11 @@ async function applyAtticScope(store: Store, key: string, sidecar: Sidecar, opts
       }
       await w.coOccurrence(linked, { weight: 0.3, window: 12, extractor: 'tier0.wikilink' });
       const declared = sidecar.extraction.tier0?.declared;
-      if (declared) await applyExtraction(w, page, declared.entities, [], declared.claims, 'tier0.frontmatter');
+      const docDate = sidecar.meta.docDate ?? null;
+      if (declared) await applyExtraction(w, page, declared.entities, declared.relations ?? [], declared.claims, 'tier0.frontmatter', { docDate });
       const t1 = sidecar.extraction.tier1;
       if (t1 && t1.status === 'done' && t1.contentSha === sidecar.meta.contentSha256) {
-        await applyExtraction(w, page, t1.entities, t1.relations, t1.claims ?? [], `tier1.llm:${t1.model}`);
+        await applyExtraction(w, page, t1.entities, t1.relations, t1.claims ?? [], `tier1.llm:${t1.model}`, { docDate });
       }
     },
   );
