@@ -276,6 +276,43 @@ struct APIClient {
         try await send("/api/research/jobs/\(id)/retry", method: "POST", body: Data("{}".utf8))
     }
 
+    func researchProfiles() async throws -> ResearchProfilesResponse {
+        try await send("/api/research/profiles")
+    }
+
+    func researchProfile(_ name: String) async throws -> ResearchProfileDetail {
+        try await send("/api/research/profiles/\(profileSegment(name))")
+    }
+
+    /// Stores the profile and, with `activate`, points `research.profile` at it.
+    func saveResearchProfile(
+        _ profile: ResearchProfilePayload,
+        prompts: [String: String],
+        activate: Bool = false
+    ) async throws -> ResearchProfileDetail {
+        struct Body: Encodable {
+            var profile: ResearchProfilePayload
+            var prompts: [String: String]
+            var activate: Bool
+        }
+        return try await send(
+            "/api/research/profiles/\(profileSegment(profile.name))",
+            method: "PUT",
+            body: encoded(Body(profile: profile, prompts: prompts, activate: activate))
+        )
+    }
+
+    /// Removes a profile — a built-in one comes back as its defaults.
+    func deleteResearchProfile(_ name: String) async throws -> DeleteProfileResponse {
+        try await send("/api/research/profiles/\(profileSegment(name))", method: "DELETE")
+    }
+
+    /// Profile names are letters, digits, - and _, but never trust a name that
+    /// came back from a file someone edited by hand.
+    private func profileSegment(_ name: String) -> String {
+        name.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-_"))) ?? name
+    }
+
     func setTrust(path filePath: String, to: String) async throws -> TrustResponse {
         struct Body: Encodable { var path: String; var to: String }
         return try await send("/api/trust", method: "POST", body: encoded(Body(path: filePath, to: to)))

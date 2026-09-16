@@ -10,6 +10,14 @@ struct SettingsView: View {
     @State private var isWorking = false
     @State private var showingClearConfirmation = false
     @State private var cliTools: [String: CliTool] = [:]
+    @State private var profiles: [ResearchProfileSummary] = []
+    @State private var profileDraft: ResearchProfileDetail?
+    @State private var profileDirty = false
+    /// A profile the user picked while the current one has unsaved edits.
+    @State private var pendingProfile: String?
+    @State private var showingDuplicate = false
+    @State private var duplicateName = ""
+    @State private var showingProfileDelete = false
 
     var body: some View {
         ScrollView {
@@ -23,6 +31,7 @@ struct SettingsView: View {
                     pipelineSummary
                     providersSection
                     pipelineSection
+                    researchSection
                     if let testResult { testResults(testResult) }
                     if !statusMessage.isEmpty {
                         Label(statusMessage, systemImage: statusIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
@@ -56,6 +65,36 @@ struct SettingsView: View {
         } message: {
             Text("This permanently deletes every file, index, graph, trace, suggestion, and model setting in the workspace. The empty workspace itself remains available.")
         }
+        .confirmationDialog(
+            "Discard unsaved changes to \(profileDraft?.name ?? "this profile")?",
+            isPresented: Binding(get: { pendingProfile != nil }, set: { if !$0 { pendingProfile = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Discard and switch", role: .destructive) {
+                guard let name = pendingProfile else { return }
+                pendingProfile = nil
+                config?.research.profile = name
+                Task { await loadProfileDetail(name) }
+            }
+            Button("Keep editing", role: .cancel) { pendingProfile = nil }
+        }
+        .confirmationDialog(
+            profileDraft?.builtin == true
+                ? "Reset \(profileDraft?.name ?? "") to the built-in defaults?"
+                : "Delete profile \(profileDraft?.name ?? "")?",
+            isPresented: $showingProfileDelete,
+            titleVisibility: .visible
+        ) {
+            Button(profileDraft?.builtin == true ? "Reset" : "Delete", role: .destructive) {
+                Task { await deleteProfile() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(profileDraft?.builtin == true
+                ? "Its file goes back to the built-in profile, including every role prompt."
+                : "The profile file and the roles defined in it are removed.")
+        }
+        .sheet(isPresented: $showingDuplicate) { duplicateSheet }
     }
 
     private var hero: some View {
@@ -353,6 +392,150 @@ struct SettingsView: View {
         .knodeCard(padding: 18)
     }
 
+    // MARK: - 03 · Deep research
+
+    /// The research runner and the profile it follows. Both live in files the
+    /// service owns — the runner in the workspace config, the profile in
+    /// `playbooks/research/profiles/` — so "Save & apply" writes both.
+    @ViewBuilder
+    private var researchSection: some View {
+        if config != nil {
+            ResearchSettingsSection(
+                research: binding(\.research),
+                profile: $profileDraft,
+                dirty: $profileDirty,
+                profileSelection: researchProfileBinding,
+                summaries: profiles,
+                connections: config?.connections ?? [],
+                defaultProvider: config?.llm.provider ?? "",
+                isWorking: isWorking,
+                duplicate: {
+                    duplicateName = "\(profileDraft?.name ?? "profile")-copy"
+                    showingDuplicate = true
+                },
+                remove: { showingProfileDelete = true }
+            )
+        }
+    }
+
+    private var duplicateSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Duplicate profile").font(.headline)
+            Text("The copy starts from what is on screen, including unsaved edits. Select it above and save to make it the active profile.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextField("new-profile", text: $duplicateName)
+                .textFieldStyle(.roundedBorder)
+            Text("Letters, digits, - and _, up to 41 characters.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            HStack {
+                Spacer()
+                Button("Cancel") { showingDuplicate = false }
+                Button("Create") {
+                    showingDuplicate = false
+                    Task { await duplicateProfile(as: duplicateName) }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.knodeCyan)
+                .disabled(!isValidProfileName(duplicateName))
+            }
+        }
+        .padding(22)
+        .frame(width: 420)
+    }
+
+    /// Picking another profile loads its file. Unsaved edits are not thrown
+    /// away silently — the picker stays put until the dialog says otherwise.
+    private var researchProfileBinding: Binding<String> {
+        Binding(
+            get: { config?.research.profile ?? "" },
+            set: { name in
+                guard !name.isEmpty, name != config?.research.profile else { return }
+                if profileDirty {
+                    pendingProfile = name
+                    return
+                }
+                config?.research.profile = name
+                Task { await loadProfileDetail(name) }
+            }
+        )
+    }
+
+    private func isValidProfileName(_ name: String) -> Bool {
+        name.range(of: "^[a-z0-9][a-z0-9_-]{0,40}$", options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    private func loadProfiles(preferred: String? = nil) async {
+        guard config != nil else { return }
+        do {
+            let response = try await model.client().researchProfiles()
+            profiles = response.profiles
+            let names = Set(profiles.map(\.name))
+            var name = preferred ?? config?.research.profile ?? response.active
+            if !names.contains(name) { name = response.active }
+            config?.research.profile = name
+            await loadProfileDetail(name)
+        } catch {
+            profiles = []
+            profileDraft = nil
+        }
+    }
+
+    private func loadProfileDetail(_ name: String) async {
+        do {
+            profileDraft = try await model.client().researchProfile(name)
+            profileDirty = false
+        } catch {
+            profileDraft = nil
+            statusMessage = "Research profile \(name) could not be loaded: \(error.localizedDescription)"
+            statusIsError = true
+        }
+    }
+
+    /// Writes the profile YAML and the role prompts that differ from the
+    /// built-ins. Returns what it saved, or nil when there is nothing to save.
+    private func saveProfileDraft() async throws -> ResearchProfileDetail? {
+        guard let draft = profileDraft else { return nil }
+        let saved = try await model.client().saveResearchProfile(draft.payload(), prompts: draft.prompts)
+        profileDraft = saved
+        profileDirty = false
+        return saved
+    }
+
+    private func duplicateProfile(as name: String) async {
+        guard let draft = profileDraft, isValidProfileName(name) else { return }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            _ = try await model.client().saveResearchProfile(draft.payload(name: name), prompts: draft.prompts)
+            await loadProfiles(preferred: name)
+            statusMessage = "Profile \(name) created — save to make it the active profile"
+            statusIsError = false
+        } catch {
+            statusMessage = "Duplicate failed: \(error.localizedDescription)"
+            statusIsError = true
+        }
+    }
+
+    private func deleteProfile() async {
+        guard let draft = profileDraft else { return }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let response = try await model.client().deleteResearchProfile(draft.name)
+            // A built-in comes back as its defaults, so stay on it; a deleted
+            // one is gone and the list decides where to land.
+            await loadProfiles(preferred: response.reset == true ? draft.name : nil)
+            statusMessage = response.reset == true ? "Profile \(draft.name) reset to the built-in" : "Profile \(draft.name) deleted"
+            statusIsError = false
+        } catch {
+            statusMessage = "\(draft.builtin ? "Reset" : "Delete") failed: \(error.localizedDescription)"
+            statusIsError = true
+        }
+    }
+
     private func cardHeader(title: String, detail: String, badge: String, color: Color) -> some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 3) {
@@ -502,6 +685,7 @@ struct SettingsView: View {
             if let tools = try? await model.client().cliTools() {
                 cliTools = Dictionary(tools.tools.map { ($0.provider, $0) }, uniquingKeysWith: { first, _ in first })
             }
+            await loadProfiles()
             statusMessage = ""
             testResult = nil
         } catch {
@@ -550,6 +734,16 @@ struct SettingsView: View {
             } else {
                 statusMessage = "Configuration saved and stages applied"
             }
+            // The research profile is a file of its own; a failure there must
+            // not read as though the routes failed to save.
+            do {
+                if let saved = try await saveProfileDraft() {
+                    statusMessage += " · research profile \(saved.name) saved"
+                }
+            } catch {
+                statusMessage += " · research profile not saved: \(error.localizedDescription)"
+                statusIsError = true
+            }
             model.showToast("Configuration saved for \(model.activeWorkspace?.displayName ?? "workspace")")
             await model.refreshStats()
         } catch {
@@ -566,6 +760,7 @@ struct SettingsView: View {
         do {
             try await model.clearActiveWorkspace()
             config = normalized(try await model.client().config())
+            await loadProfiles()
             testResult = nil
             statusMessage = "Workspace cleared. A fresh empty directory tree is ready."
         } catch {
@@ -871,7 +1066,8 @@ private struct SummaryRoute: View {
     }
 }
 
-private struct FieldLabel<Content: View>: View {
+/// A caption above a control, shared by every settings card.
+struct FieldLabel<Content: View>: View {
     let label: String
     @ViewBuilder let content: Content
 
@@ -1036,7 +1232,7 @@ private struct TestResultRow: View {
     }
 }
 
-private func providerName(_ provider: String) -> String {
+func providerName(_ provider: String) -> String {
     switch provider {
     case "inherit": "Default model"
     case "openai": "OpenAI-compatible API"

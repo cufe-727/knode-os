@@ -439,11 +439,76 @@ struct ExtractionConfig: Codable, Equatable {
     var concurrency: Int
 }
 
+/// The runner half of the service's `research` block: which coding-agent CLI
+/// writes wiki pages, how many run at once, and which profile they follow. The
+/// service merges what it receives into its own block, so the fields this
+/// client does not model (runsDir, keepRuns, readDirs) keep their values.
+struct ResearchConfig: Codable, Equatable {
+    struct Auto: Codable, Equatable {
+        var enabled: Bool
+        var dailyJobs: Int
+    }
+
+    /// A connection id or a CLI provider name; empty follows the default LLM
+    /// provider when that is itself a CLI.
+    var agent: String
+    var model: String
+    var profile: String
+    /// "team" | "native" | "single" — a profile may pin its own.
+    var pipeline: String
+    var maxTurns: Int
+    var timeoutMs: Int
+    var concurrency: Int
+    var researchers: Int
+    var reviewRounds: Int
+    var auto: Auto
+
+    init(
+        agent: String = "",
+        model: String = "",
+        profile: String = "default",
+        pipeline: String = "team",
+        maxTurns: Int = 40,
+        timeoutMs: Int = 1_200_000,
+        concurrency: Int = 1,
+        researchers: Int = 3,
+        reviewRounds: Int = 1,
+        auto: Auto = Auto(enabled: false, dailyJobs: 3)
+    ) {
+        self.agent = agent
+        self.model = model
+        self.profile = profile
+        self.pipeline = pipeline
+        self.maxTurns = maxTurns
+        self.timeoutMs = timeoutMs
+        self.concurrency = concurrency
+        self.researchers = researchers
+        self.reviewRounds = reviewRounds
+        self.auto = auto
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = ResearchConfig()
+        agent = try container.decodeIfPresent(String.self, forKey: .agent) ?? fallback.agent
+        model = try container.decodeIfPresent(String.self, forKey: .model) ?? fallback.model
+        profile = try container.decodeIfPresent(String.self, forKey: .profile) ?? fallback.profile
+        pipeline = try container.decodeIfPresent(String.self, forKey: .pipeline) ?? fallback.pipeline
+        maxTurns = try container.decodeIfPresent(Int.self, forKey: .maxTurns) ?? fallback.maxTurns
+        timeoutMs = try container.decodeIfPresent(Int.self, forKey: .timeoutMs) ?? fallback.timeoutMs
+        concurrency = try container.decodeIfPresent(Int.self, forKey: .concurrency) ?? fallback.concurrency
+        researchers = try container.decodeIfPresent(Int.self, forKey: .researchers) ?? fallback.researchers
+        reviewRounds = try container.decodeIfPresent(Int.self, forKey: .reviewRounds) ?? fallback.reviewRounds
+        auto = try container.decodeIfPresent(Auto.self, forKey: .auto) ?? fallback.auto
+    }
+}
+
 struct KnodeConfig: Codable, Equatable {
     var embedding: EmbeddingConfig
     var llm: LLMConfig
     var connections: [LLMConnection]
     var extraction: ExtractionConfig
+    var research: ResearchConfig
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -451,6 +516,7 @@ struct KnodeConfig: Codable, Equatable {
         llm = try container.decode(LLMConfig.self, forKey: .llm)
         connections = try container.decodeIfPresent([LLMConnection].self, forKey: .connections) ?? []
         extraction = try container.decode(ExtractionConfig.self, forKey: .extraction)
+        research = try container.decodeIfPresent(ResearchConfig.self, forKey: .research) ?? ResearchConfig()
     }
 }
 
@@ -511,6 +577,256 @@ struct ConfigSaveResponse: Decodable {
     var reembedded: Bool
     var reconverted: Bool?
     var reindex: IngestStats?
+}
+
+/* ------------------------- deep research profiles ------------------------ */
+
+/// A sub-agent inside a profile: which phase it covers, the CLI and model it
+/// runs on, the tools it may use and the prompt it is given. `prompt*` fields
+/// are what the service resolved for display — they are sent back in the PUT's
+/// own `prompts` map, never inside the profile, so `encode` leaves them out.
+struct ResearchRole: Codable, Equatable, Identifiable {
+    struct Tools: Codable, Equatable {
+        /// knode_write / knode_commit — the role writes pages.
+        var write: Bool
+        /// Read / Grep / Glob over the read-only add-dirs.
+        var files: Bool
+        /// "inherit" (the profile's search.web) | "on" | "off"; review.external still caps it.
+        var web: String
+    }
+
+    var id: String
+    var title: String
+    /// plan | research | synthesize | review | revise
+    var phase: String
+    var enabled: Bool
+    /// Connection id or provider name; empty = the research agent.
+    var agent: String
+    var model: String
+    /// "default" = the profile's reasoning effort.
+    var effort: String
+    var tools: Tools
+    /// research phase: parallel sessions (0 = the runner's fan-out).
+    var parallel: Int
+    /// review / revise: rounds (0 = the runner's review rounds).
+    var rounds: Int
+    /// 0 = derived from the template and the runner's turn cap.
+    var maxTurns: Int
+    /// Prompt file relative to playbooks/research/ ("" = the phase default).
+    var prompt: String
+    /// Offered to the orchestrator as a native sub-agent when pipeline = native.
+    var native: Bool
+    var description: String
+
+    var promptPath: String
+    var promptText: String
+    var promptIsDefault: Bool
+    var promptDefault: String
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, phase, enabled, agent, model, effort, tools, parallel, rounds, maxTurns, prompt, native, description
+        case promptPath, promptText, promptIsDefault, promptDefault
+    }
+
+    init(id: String, phase: String, promptDefault: String) {
+        self.id = id
+        title = "New role"
+        self.phase = phase
+        enabled = true
+        agent = ""
+        model = ""
+        effort = "default"
+        tools = Tools(write: phase == "synthesize" || phase == "revise", files: true, web: "inherit")
+        parallel = 0
+        rounds = 0
+        maxTurns = 0
+        prompt = ""
+        native = false
+        description = ""
+        promptPath = "playbooks/research/roles/\(id).md"
+        promptText = promptDefault
+        promptIsDefault = true
+        self.promptDefault = promptDefault
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? id
+        phase = try c.decodeIfPresent(String.self, forKey: .phase) ?? "research"
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        agent = try c.decodeIfPresent(String.self, forKey: .agent) ?? ""
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
+        effort = try c.decodeIfPresent(String.self, forKey: .effort) ?? "default"
+        tools = try c.decodeIfPresent(Tools.self, forKey: .tools) ?? Tools(write: false, files: true, web: "inherit")
+        parallel = try c.decodeIfPresent(Int.self, forKey: .parallel) ?? 0
+        rounds = try c.decodeIfPresent(Int.self, forKey: .rounds) ?? 0
+        maxTurns = try c.decodeIfPresent(Int.self, forKey: .maxTurns) ?? 0
+        prompt = try c.decodeIfPresent(String.self, forKey: .prompt) ?? ""
+        native = try c.decodeIfPresent(Bool.self, forKey: .native) ?? false
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        promptPath = try c.decodeIfPresent(String.self, forKey: .promptPath) ?? ""
+        promptText = try c.decodeIfPresent(String.self, forKey: .promptText) ?? ""
+        promptIsDefault = try c.decodeIfPresent(Bool.self, forKey: .promptIsDefault) ?? true
+        promptDefault = try c.decodeIfPresent(String.self, forKey: .promptDefault) ?? ""
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(title, forKey: .title)
+        try c.encode(phase, forKey: .phase)
+        try c.encode(enabled, forKey: .enabled)
+        try c.encode(agent, forKey: .agent)
+        try c.encode(model, forKey: .model)
+        try c.encode(effort, forKey: .effort)
+        try c.encode(tools, forKey: .tools)
+        try c.encode(parallel, forKey: .parallel)
+        try c.encode(rounds, forKey: .rounds)
+        try c.encode(maxTurns, forKey: .maxTurns)
+        try c.encode(prompt, forKey: .prompt)
+        try c.encode(native, forKey: .native)
+        try c.encode(description, forKey: .description)
+    }
+}
+
+/// `playbooks/research/profiles/<name>.yaml` as the service resolved it.
+struct ResearchProfileDetail: Codable, Equatable {
+    struct Reasoning: Codable, Equatable {
+        /// default | low | medium | high | xhigh | max
+        var effort: String
+    }
+
+    struct Search: Codable, Equatable {
+        var web: String
+        /// live | cached
+        var freshness: String
+        var maxRounds: Int
+    }
+
+    struct Verification: Codable, Equatable {
+        var minSourcesPerClaim: Int
+        var preferPrimarySources: Bool
+        /// flag | prefer_primary | prefer_recent
+        var resolveConflicts: String
+    }
+
+    struct Stop: Codable, Equatable {
+        var maxSections: Int
+        var marginalGain: Bool
+    }
+
+    struct Output: Codable, Equatable {
+        var citations: Bool
+        var uncertainty: Bool
+        var evidenceTable: Bool
+    }
+
+    var name: String
+    var title: String
+    var description: String
+    /// "" = the runner's pipeline.
+    var pipeline: String
+    var reasoning: Reasoning
+    var search: Search
+    var verification: Verification
+    var stop: Stop
+    var output: Output
+    var roles: [ResearchRole]
+    var path: String
+    /// A built-in profile deletes back to its defaults instead of disappearing.
+    var builtin: Bool
+    /// The prompt each phase falls back to, for "Reset to built-in".
+    var phaseDefaults: [String: String]
+
+    private enum CodingKeys: String, CodingKey {
+        case name, title, description, pipeline, reasoning, search, verification, stop, output, roles
+        case path, builtin, phaseDefaults
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? name
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        pipeline = try c.decodeIfPresent(String.self, forKey: .pipeline) ?? ""
+        reasoning = try c.decodeIfPresent(Reasoning.self, forKey: .reasoning) ?? Reasoning(effort: "default")
+        search = try c.decodeIfPresent(Search.self, forKey: .search) ?? Search(web: "inherit", freshness: "live", maxRounds: 3)
+        verification = try c.decodeIfPresent(Verification.self, forKey: .verification)
+            ?? Verification(minSourcesPerClaim: 1, preferPrimarySources: true, resolveConflicts: "flag")
+        stop = try c.decodeIfPresent(Stop.self, forKey: .stop) ?? Stop(maxSections: 8, marginalGain: true)
+        output = try c.decodeIfPresent(Output.self, forKey: .output) ?? Output(citations: true, uncertainty: true, evidenceTable: false)
+        roles = try c.decodeIfPresent([ResearchRole].self, forKey: .roles) ?? []
+        path = try c.decodeIfPresent(String.self, forKey: .path) ?? ""
+        builtin = try c.decodeIfPresent(Bool.self, forKey: .builtin) ?? false
+        phaseDefaults = try c.decodeIfPresent([String: String].self, forKey: .phaseDefaults) ?? [:]
+    }
+
+    /// What `PUT /api/research/profiles/:name` stores: the profile itself,
+    /// without the read-only fields the service derives.
+    func payload(name: String? = nil) -> ResearchProfilePayload {
+        ResearchProfilePayload(
+            name: name ?? self.name,
+            title: title,
+            description: description,
+            pipeline: pipeline,
+            reasoning: reasoning,
+            search: search,
+            verification: verification,
+            stop: stop,
+            output: output,
+            roles: roles
+        )
+    }
+
+    /// Role prompts travel next to the profile; the service only writes a text
+    /// that differs from what the role runs with today.
+    var prompts: [String: String] {
+        Dictionary(roles.map { ($0.id, $0.promptText) }, uniquingKeysWith: { _, last in last })
+    }
+}
+
+struct ResearchProfilePayload: Encodable {
+    var name: String
+    var title: String
+    var description: String
+    var pipeline: String
+    var reasoning: ResearchProfileDetail.Reasoning
+    var search: ResearchProfileDetail.Search
+    var verification: ResearchProfileDetail.Verification
+    var stop: ResearchProfileDetail.Stop
+    var output: ResearchProfileDetail.Output
+    var roles: [ResearchRole]
+}
+
+/// One row of `GET /api/research/profiles`.
+struct ResearchProfileSummary: Decodable, Identifiable, Hashable {
+    var name: String
+    var title: String
+    var builtin: Bool
+    var id: String { name }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, title, builtin
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? name
+        builtin = try c.decodeIfPresent(Bool.self, forKey: .builtin) ?? false
+    }
+}
+
+struct ResearchProfilesResponse: Decodable {
+    var active: String
+    var profiles: [ResearchProfileSummary]
+}
+
+struct DeleteProfileResponse: Decodable {
+    var ok: Bool
+    /// A built-in came back as its defaults rather than being removed.
+    var reset: Bool?
 }
 
 enum SearchMode: String, CaseIterable, Identifiable {
