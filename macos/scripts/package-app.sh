@@ -36,6 +36,12 @@ cp "$MACOS_DIR/App/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$APP_ICON" "$RESOURCES_DIR/AppIcon.icns"
 ditto "$RESOURCE_BUNDLE" "$APP_DIR/KnodeOS_KnodeOSApp.bundle"
 (cd "$REPO_DIR" && pnpm --filter knode-os deploy --prod --legacy --force "$DEPLOY_DIR")
+# --prod skips *installing* devDependencies, but pnpm still resolves them, so a
+# dev-only package whose build script is not approved outside the workspace
+# (esbuild, pulled in by tsx and vitest) aborts the install under pnpm 11's
+# strict dep builds. The service runs plain `node dist/cli.js` and needs none of
+# them, so drop them from the deployed manifest before installing.
+node -e 'const fs=require("fs"); const p=process.argv[1]+"/package.json"; const j=JSON.parse(fs.readFileSync(p,"utf8")); delete j.devDependencies; fs.writeFileSync(p, JSON.stringify(j,null,2)+"\n")' "$DEPLOY_DIR"
 # Legacy deploy only copies the published files — since pnpm 11 it installs
 # nothing ("Already up to date"), which ships a service that cannot resolve its
 # own imports. Install the production tree here, hoisted so the bundle carries
