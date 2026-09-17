@@ -508,6 +508,71 @@ struct AgentPicker: View {
 /// One sub-agent: the phase it covers, where it runs, what it may touch, and
 /// the prompt it is handed. An untouched prompt stays the built-in one — the
 /// service only writes a role prompt file once its text actually differs.
+/// What a phase asks of a model — the same idea as the stage rows in 02, one
+/// step down: how often this sub-agent runs, what it produces, and the effort
+/// that usually pays for itself there.
+private struct PhaseGuidance {
+    let badge: String
+    let detail: String
+    /// The effort this phase is usually worth; marked in the picker.
+    let effort: String
+    let color: Color
+
+    static func of(_ phase: String) -> PhaseGuidance {
+        switch phase {
+        case "plan":
+            PhaseGuidance(
+                badge: "Judgment",
+                detail: "One short session: it reads the brief, scouts the index and returns a JSON outline — no prose. A mid-tier model is enough, as long as it returns valid JSON; effort buys a better split into sections, not better writing.",
+                effort: "medium",
+                color: .knodeCyan
+            )
+        case "research":
+            PhaseGuidance(
+                badge: "Volume",
+                detail: "One session per section, all at once — this is where most of the tokens go. A fast, cheap model is the right trade; raise effort only for sections that need real reasoning rather than retrieval.",
+                effort: "medium",
+                color: .knodeViolet
+            )
+        case "synthesize":
+            PhaseGuidance(
+                badge: "Quality",
+                detail: "One session turns everyone's findings into the page people will actually read, and it is the only role that writes. Use the strongest model you have, at high effort — this is the output.",
+                effort: "high",
+                color: .knodeViolet
+            )
+        case "review":
+            PhaseGuidance(
+                badge: "Scrutiny",
+                detail: "Reads the finished page against the contract, spot-checks sources and returns a JSON verdict. A strong model at high effort catches more, and the session is short, so it stays cheap.",
+                effort: "high",
+                color: .knodeCyan
+            )
+        case "revise":
+            PhaseGuidance(
+                badge: "Precision",
+                detail: "Applies the review's notes to a page that already exists. Same class of model as the writer, but it edits rather than composes, so medium effort is usually enough.",
+                effort: "medium",
+                color: .knodeViolet
+            )
+        default:
+            PhaseGuidance(
+                badge: "Custom",
+                detail: "A role of your own. Match the model and effort to what its prompt asks for — cheap and fast for gathering, strong and careful for writing or judging.",
+                effort: "default",
+                color: .knodeViolet
+            )
+        }
+    }
+}
+
+/// One sub-agent: what its phase asks of a model, where it runs, what it may
+/// touch, and the prompt it is handed. An untouched prompt stays the built-in
+/// one — the service only writes a role prompt file once its text differs.
+///
+/// The CLI is not chosen here. A job runs on one coding agent, picked once in
+/// the runner card above; a role that pins its own (by hand, in the YAML) says
+/// so below and can be put back.
 private struct RoleCard: View {
     @Binding var role: ResearchRole
     let phaseDefaults: [String: String]
@@ -523,6 +588,7 @@ private struct RoleCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             head
+            guidance
             grid
             VStack(alignment: .leading, spacing: 6) {
                 Toggle(L("Writes pages (knode_write / knode_commit)"), isOn: $role.tools.write)
@@ -536,7 +602,15 @@ private struct RoleCard: View {
         .opacity(role.enabled ? 1 : 0.55)
     }
 
+    private var advice: PhaseGuidance { .of(role.phase) }
+
+    /// A role the service seeded covers exactly one phase, so it is stated
+    /// rather than chosen; a role you add picks its own.
+    private var isSeeded: Bool { BuiltinNames.isSeededRole(role.id) }
+
     private var effectiveAgent: String { role.agent.isEmpty ? researchAgent : role.agent }
+
+    private var hasFanout: Bool { role.phase == "research" || role.phase == "review" || role.phase == "revise" }
 
     private var head: some View {
         HStack(spacing: 10) {
@@ -555,60 +629,137 @@ private struct RoleCard: View {
         }
     }
 
+    private var guidance: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 8) {
+                RouteBadge(label: L(advice.badge), color: advice.color)
+                Text(L(advice.detail))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 6) {
+                Text(role.agent.isEmpty
+                     ? L("Runs on %@, like every other role.", runsOnLabel)
+                     : L("Pinned to %@ instead of the research agent.", runsOnLabel))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                if !role.agent.isEmpty {
+                    Button(L("Use the research agent")) { role.agent = "" }
+                        .buttonStyle(.borderless)
+                        .font(.caption2)
+                }
+            }
+        }
+    }
+
+    /// The CLI this role will really run on, named the way the runner names it.
+    private var runsOnLabel: String {
+        let key = effectiveAgent
+        if key.isEmpty { return L("the research agent") }
+        return connections.first { $0.id == key }?.label ?? providerName(key)
+    }
+
     private var grid: some View {
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-            GridRow {
-                FieldLabel(L("Phase")) {
-                    Picker(L("Phase"), selection: phaseBinding) {
-                        ForEach(ResearchSettingsSection.phases, id: \.0) { Text(L($0.1)).tag($0.0) }
+            if isSeeded {
+                GridRow {
+                    modelField
+                    effortField
+                    webField
+                }
+                GridRow {
+                    turnsField
+                    if hasFanout {
+                        fanoutField
+                        descriptionField
+                    } else {
+                        descriptionField.gridCellColumns(2)
                     }
-                    .labelsHidden()
                 }
-                FieldLabel(L("Runs on")) {
-                    AgentPicker(selection: $role.agent, connections: connections, inheritLabel: L("The research agent above"))
+            } else {
+                GridRow {
+                    phaseField
+                    modelField
+                    effortField
                 }
-                ModelField(
-                    placeholder: L("Agent's model"),
-                    text: $role.model,
-                    providerKey: effectiveAgent,
-                    load: { try await loadModels(effectiveAgent) }
-                )
-            }
-            GridRow {
-                FieldLabel(L("Effort")) {
-                    Picker(L("Effort"), selection: $role.effort) {
-                        Text(L("Profile default")).tag("default")
-                        ForEach(ResearchSettingsSection.efforts.dropFirst(), id: \.0) { Text(L($0.1)).tag($0.0) }
-                    }
-                    .labelsHidden()
+                GridRow {
+                    webField
+                    turnsField
+                    if hasFanout { fanoutField }
                 }
-                FieldLabel(L("Web tools")) {
-                    Picker(L("Web tools"), selection: $role.tools.web) {
-                        Text(L("Profile setting")).tag("inherit")
-                        Text(L("On (within review.external)")).tag("on")
-                        Text(L("Off")).tag("off")
-                    }
-                    .labelsHidden()
-                }
-                FieldLabel(L("Turns per session")) {
-                    TextField(L("Default"), value: $role.maxTurns, format: .number)
+                GridRow {
+                    descriptionField.gridCellColumns(3)
                 }
             }
-            GridRow {
-                if role.phase == "research" {
-                    FieldLabel(L("Parallel sessions")) {
-                        TextField("\(researchers)", value: $role.parallel, format: .number)
-                    }
-                } else if role.phase == "review" || role.phase == "revise" {
-                    FieldLabel(L("Rounds")) {
-                        TextField("\(reviewRounds)", value: $role.rounds, format: .number)
-                    }
-                }
-                FieldLabel(L("Description")) {
-                    TextField(L("One line the orchestrator reads when picking this sub-agent"), text: $role.description)
-                }
-                .gridCellColumns(role.phase == "plan" || role.phase == "synthesize" ? 3 : 2)
+        }
+    }
+
+    private var phaseField: some View {
+        FieldLabel(L("Phase")) {
+            Picker(L("Phase"), selection: phaseBinding) {
+                ForEach(ResearchSettingsSection.phases, id: \.0) { Text(L($0.1)).tag($0.0) }
             }
+            .labelsHidden()
+        }
+    }
+
+    private var modelField: some View {
+        ModelField(
+            placeholder: L("Agent's model"),
+            text: $role.model,
+            providerKey: effectiveAgent,
+            load: { try await loadModels(effectiveAgent) }
+        )
+    }
+
+    /// The effort the phase is usually worth is marked in the list, so the
+    /// recommendation sits where the choice is made.
+    private var effortField: some View {
+        FieldLabel(L("Effort")) {
+            Picker(L("Effort"), selection: $role.effort) {
+                Text(L("Profile default")).tag("default")
+                ForEach(ResearchSettingsSection.efforts.dropFirst(), id: \.0) { value, label in
+                    Text(value == advice.effort ? "\(L(label)) · \(L("recommended"))" : L(label)).tag(value)
+                }
+            }
+            .labelsHidden()
+        }
+    }
+
+    private var webField: some View {
+        FieldLabel(L("Web tools")) {
+            Picker(L("Web tools"), selection: $role.tools.web) {
+                Text(L("Profile setting")).tag("inherit")
+                Text(L("On (within review.external)")).tag("on")
+                Text(L("Off")).tag("off")
+            }
+            .labelsHidden()
+        }
+    }
+
+    private var turnsField: some View {
+        FieldLabel(L("Turns per session")) {
+            TextField(L("Default"), value: $role.maxTurns, format: .number)
+        }
+    }
+
+    @ViewBuilder
+    private var fanoutField: some View {
+        if role.phase == "research" {
+            FieldLabel(L("Parallel sessions")) {
+                TextField("\(researchers)", value: $role.parallel, format: .number)
+            }
+        } else {
+            FieldLabel(L("Rounds")) {
+                TextField("\(reviewRounds)", value: $role.rounds, format: .number)
+            }
+        }
+    }
+
+    private var descriptionField: some View {
+        FieldLabel(L("Description")) {
+            TextField(L("One line the orchestrator reads when picking this sub-agent"), text: $role.description)
         }
     }
 
