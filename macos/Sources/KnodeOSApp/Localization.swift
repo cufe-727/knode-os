@@ -633,4 +633,13 @@ private let zhHansPairs: [(String, String)] = [
     ("Pinned to %@ instead of the research agent.", "被固定在 %@，没有跟随研究 agent。"),
     ("Use the research agent", "改回研究 agent"),
     ("the research agent", "研究 agent"),
+
+    // MARK: - Fan-out and delegation
+    ("research · %@ at a time", "research · 最多 %@ 并行"),
+    ("%@ · %@ rounds", "%@ · %@ 轮"),
+    ("Offer to the orchestrator as a native sub-agent", "作为原生子代理交给主管调用"),
+    ("The orchestrator writes the page itself, so this phase is never delegated.", "页面由主管会话自己写，这个阶段不会被委派出去。"),
+    ("With pipeline = native, one session writes the page and calls this role through the CLI's own sub-agents (claude --agents, codex agents.<id>) instead of knode starting a session for it. Sub-agents never write pages.", "流水线为 native 时，由一个会话写页面，并通过 CLI 自己的子代理机制（claude --agents、codex agents.<id>）调用这个角色，而不是由 knode 单独起一个会话。子代理永远不能写页面。"),
+    ("The pipeline is %@ right now, so this switch changes nothing.", "当前流水线是 %@，所以这个开关暂时不起作用。"),
+    ("How many sections are researched at the same time. One session per section either way — the outline decides how many there are; 0 follows the runner.", "同时调查几个章节。无论如何都是一个章节一个会话 —— 会话总数由提纲的章节数决定；填 0 表示跟随执行器的设置。"),
 ]

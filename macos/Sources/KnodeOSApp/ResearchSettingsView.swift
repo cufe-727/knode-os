@@ -363,6 +363,7 @@ struct ResearchSettingsSection: View {
                     role: roleBinding(selectedIndex),
                     phaseDefaults: profile?.phaseDefaults ?? [:],
                     connections: connections,
+                    pipeline: pinnedPipeline.isEmpty ? research.pipeline : pinnedPipeline,
                     researchAgent: research.agent,
                     researchers: research.researchers,
                     reviewRounds: research.reviewRounds,
@@ -418,15 +419,16 @@ struct ResearchSettingsSection: View {
         }
     }
 
-    /// The tab's second line: the phase, plus the fan-out that phase will use.
+    /// The tab's second line: the phase, plus how this one role is multiplied —
+    /// sessions running at once for research, critique rounds for review.
     private func phaseLabel(_ role: ResearchRole) -> String {
         switch role.phase {
         case "research":
             let fanout = role.parallel == 0 ? research.researchers : role.parallel
-            return fanout > 1 ? "research ×\(fanout)" : "research"
+            return fanout > 1 ? L("research · %@ at a time", String(fanout)) : role.phase
         case "review", "revise":
             let rounds = role.rounds == 0 ? research.reviewRounds : role.rounds
-            return rounds > 1 ? "\(role.phase) ×\(rounds)" : role.phase
+            return rounds > 1 ? L("%@ · %@ rounds", role.phase, String(rounds)) : role.phase
         default:
             return role.phase
         }
@@ -577,6 +579,9 @@ private struct RoleCard: View {
     @Binding var role: ResearchRole
     let phaseDefaults: [String: String]
     let connections: [LLMConnection]
+    /// The pipeline a job will really run, so the card can say whether the
+    /// native sub-agent switch means anything right now.
+    let pipeline: String
     /// What an empty `role.agent` falls back to, so the model list is the one
     /// this role will really be asking.
     let researchAgent: String
@@ -590,16 +595,40 @@ private struct RoleCard: View {
             head
             guidance
             grid
-            VStack(alignment: .leading, spacing: 6) {
-                Toggle(L("Writes pages (knode_write / knode_commit)"), isOn: $role.tools.write)
-                Toggle(L("Reads files (Read / Grep / Glob)"), isOn: $role.tools.files)
-                Toggle(L("Native sub-agent (pipeline: native)"), isOn: $role.native)
-            }
-            .toggleStyle(.checkbox)
+            tools
             prompt
         }
         .knodeCard(padding: 18)
         .opacity(role.enabled ? 1 : 0.55)
+    }
+
+    /// What the role may touch. `native` is not a tool but a delegation: in the
+    /// native pipeline one orchestrator session writes the page and calls the
+    /// roles marked here as the CLI's own sub-agents, so the two roles that
+    /// write — synthesize and revise — are never among them.
+    private var tools: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(L("Writes pages (knode_write / knode_commit)"), isOn: $role.tools.write)
+            Toggle(L("Reads files (Read / Grep / Glob)"), isOn: $role.tools.files)
+            Toggle(L("Offer to the orchestrator as a native sub-agent"), isOn: $role.native)
+                .disabled(!canBeNative)
+            Text(nativeNote)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.leading, 20)
+        }
+        .toggleStyle(.checkbox)
+    }
+
+    private var canBeNative: Bool { role.phase != "synthesize" && role.phase != "revise" }
+
+    private var nativeNote: String {
+        if !canBeNative {
+            return L("The orchestrator writes the page itself, so this phase is never delegated.")
+        }
+        let what = L("With pipeline = native, one session writes the page and calls this role through the CLI's own sub-agents (claude --agents, codex agents.<id>) instead of knode starting a session for it. Sub-agents never write pages.")
+        return pipeline == "native" ? what : what + " " + L("The pipeline is %@ right now, so this switch changes nothing.", pipeline)
     }
 
     private var advice: PhaseGuidance { .of(role.phase) }
@@ -749,6 +778,7 @@ private struct RoleCard: View {
         if role.phase == "research" {
             FieldLabel(L("Parallel sessions")) {
                 TextField("\(researchers)", value: $role.parallel, format: .number)
+                    .help(L("How many sections are researched at the same time. One session per section either way — the outline decides how many there are; 0 follows the runner."))
             }
         } else {
             FieldLabel(L("Rounds")) {
