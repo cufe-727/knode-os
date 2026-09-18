@@ -5,6 +5,7 @@ import type { Hono } from 'hono';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { MCP_SERVER_INFO } from '../mcp/server.js';
+import { mcpInstructions } from '../mcp/instructions.js';
 import { registerKnodeTools } from '../mcp/tools.js';
 import { AppContext } from '../context.js';
 import { resolveWorkspaceScope, WorkspaceContextRegistry } from './workspaces.js';
@@ -105,7 +106,8 @@ export function mountMcp(app: Hono<any>, opts: MountMcpOptions): void {
       return c.json({ error: 'mcp: no workspace registry or context mounted' }, 500);
     }
 
-    const server = new McpServer(MCP_SERVER_INFO);
+    // the base's own guide rides along as server instructions (cached by the file's mtime)
+    const server = new McpServer(MCP_SERVER_INFO, { instructions: mcpInstructions(ctx.dataDir) });
     registerKnodeTools(server, ctx);
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

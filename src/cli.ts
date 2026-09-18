@@ -19,6 +19,10 @@ import { auditDuplicateEntities } from './graph/dedupe.js';
 import { reviewClaims } from './graph/claim-review.js';
 import { resolveEntityId } from './graph/resolve.js';
 import { cancelJob, getJob, listJobs, queueJob, retryJob, ResearchJob, ResearchStatus } from './research/jobs.js';
+import { killAgentsFor } from './research/launch.js';
+import { McpEndpoint } from './research/workspace.js';
+import { runChatTurn } from './chat/runner.js';
+import { createConversation, getConversation, listConversations } from './chat/store.js';
 import { finalizeResearchJob, resolveResearchAgent, runResearchJob, workspaceFromJob } from './research/runner.js';
 import { loadResearchTemplates, RESEARCH_KINDS, ResearchKind } from './research/templates.js';
 import { prepareRunWorkspace, runsRoot } from './research/workspace.js';
@@ -1301,8 +1305,8 @@ entities
     }
   });
 
-/** Run one job right here: host a temporary MCP endpoint for this context, launch the agent, validate, sync. */
-async function runResearchNow(ctx: Awaited<ReturnType<typeof createContext>>, job: ResearchJob, log: (m: string) => void): Promise<ResearchJob> {
+/** Host a temporary MCP endpoint for this context (no `serve` needed) while `fn` runs an agent against it. */
+export async function withTemporaryMcp<T>(ctx: Awaited<ReturnType<typeof createContext>>, fn: (mcp: McpEndpoint) => Promise<T>): Promise<T> {
   const { Hono } = await import('hono');
   const { serve } = await import('@hono/node-server');
   const { mountMcp, loadOrCreateMcpToken } = await import('./server/mcp-http.js');
@@ -1313,10 +1317,15 @@ async function runResearchNow(ctx: Awaited<ReturnType<typeof createContext>>, jo
     const srv = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' }, (info) => resolve({ close: () => srv.close(), port: info.port }));
   });
   try {
-    return await runResearchJob(ctx, job, { mcp: { url: `http://127.0.0.1:${server.port}/mcp`, token, headers: {} }, log });
+    return await fn({ url: `http://127.0.0.1:${server.port}/mcp`, token, headers: {} });
   } finally {
     server.close();
   }
+}
+
+/** Run one job right here: host a temporary MCP endpoint for this context, launch the agent, validate, sync. */
+async function runResearchNow(ctx: Awaited<ReturnType<typeof createContext>>, job: ResearchJob, log: (m: string) => void): Promise<ResearchJob> {
+  return withTemporaryMcp(ctx, (mcp) => runResearchJob(ctx, job, { mcp, log }));
 }
 
 const research = program.command('research').description('deep-research wiki pages written by a coding-agent CLI (claude / codex / cursor) through the knode MCP endpoint');
@@ -1339,6 +1348,24 @@ research
       if (opts.now) {
         const done = await runResearchNow(ctx, job, (m) => console.log(`  ${m}`));
         console.log(JSON.stringify({ id: done.id, status: done.status, outputPath: done.outputPath, error: done.error, turns: done.turns, warnings: done.payload.warnings }, null, 2));
+      }
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+research
+  .command('init')
+  .description('initialize the knowledge base: sync + extraction, then the agent writes wiki/overview.md and the AGENTS.md / CLAUDE.md guide and queues topic pages')
+  .option('--now', 'run it right now in this process instead of waiting for serve')
+  .action(async (opts: { now?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const { job, created } = await queueJob(ctx.store, { kind: 'init', requestedBy: 'cli' });
+      console.log(`${created ? 'queued' : 'already queued'} ${job.id} (init)`);
+      if (opts.now) {
+        const done = await runResearchNow(ctx, job, (m) => console.log(`  ${m}`));
+        console.log(JSON.stringify({ id: done.id, status: done.status, outputPath: done.outputPath, error: done.error, turns: done.turns, steps: done.payload.steps, topics: done.payload.topics, followUps: done.payload.followUps, warnings: done.payload.warnings }, null, 2));
       }
     } finally {
       await ctx.datasources.closeAll();
@@ -1414,7 +1441,9 @@ research
   .action(async (id: string) => {
     const ctx = await createContext(dataDir());
     try {
-      console.log((await cancelJob(ctx.store, id)) ? 'cancelled' : 'not cancellable');
+      const cancelled = await cancelJob(ctx.store, id);
+      if (cancelled) killAgentsFor(id);
+      console.log(cancelled ? 'cancelled' : 'not cancellable');
     } finally {
       await ctx.store.close();
     }
@@ -1500,7 +1529,7 @@ research
       if (!job) throw new Error(`no job ${id}`);
       const { loadOrCreateMcpToken } = await import('./server/mcp-http.js');
       const { templateFor } = await import('./research/templates.js');
-      const agent = resolveResearchAgent(ctx.config) ?? { provider: 'claude-cli' as const, cliPath: '', model: ctx.config.research?.model ?? '' };
+      const agent = resolveResearchAgent(ctx.config) ?? { kind: 'cli' as const, provider: 'claude-cli' as const, cliPath: '', model: ctx.config.research?.model ?? '' };
       const token = loadOrCreateMcpToken(ctx.dataDir);
       const url = opts.url ?? `http://${ctx.config.server.host}:${ctx.config.server.port}${ctx.config.server.mcp?.path || '/mcp'}`;
       const mcp = { url, token, headers: { 'x-knode-user': opts.user, 'x-knode-workspace-kind': 'personal', 'x-knode-workspace-id': opts.workspace, 'x-knode-workspace-name': opts.workspace } };
@@ -1511,7 +1540,7 @@ research
       await (await import('./research/jobs.js')).updateJob(ctx.store, job.id, { worksetId: ws.worksetId, outputPath: ws.outputPath, payload: { ...job.payload, actor: ws.actor, research: ws.research, humanParagraphs: ws.humanParagraphs, exportedTo: dir } });
       const lines = [`# How to run research job ${job.id} by hand`, '', `Workspace: ${dir}`, `Output page: ${ws.outputPath} (write it with knode_write through the MCP server \`knode-os\` at ${url})`, ''];
       for (const provider of ['claude-cli', 'codex-cli', 'cursor-cli'] as const) {
-        const { cmd, args } = launchArgs({ provider, cliPath: '', model: agent.model, maxTurns: template.maxTurns ?? ctx.config.research?.maxTurns ?? 40, timeoutMs: 0, ws, mcp, readDirs, jobId: job.id });
+        const { cmd, args } = launchArgs({ agent: { kind: 'cli', provider, cliPath: '', model: agent.model }, maxTurns: template.maxTurns ?? ctx.config.research?.maxTurns ?? 40, timeoutMs: 0, ws, mcp, readDirs, jobId: job.id });
         const shown = provider === 'cursor-cli' ? [...args.slice(0, -1), '"$(cat brief.md)"'] : args;
         lines.push(`## ${provider}`, '', '```bash', `cd ${JSON.stringify(dir)}`, provider === 'cursor-cli' ? '' : 'export KNODE_MCP_TOKEN=' + token, `${cmd} ${shown.map((a) => (/[\s"]/.test(a) ? JSON.stringify(a) : a)).join(' ')}${provider === 'cursor-cli' ? '' : ' < brief.md'}`, '```', '');
       }
@@ -1531,13 +1560,53 @@ research
     try {
       const job = await getJob(ctx.store, id);
       if (!job) throw new Error(`no job ${id}`);
-      const agent = resolveResearchAgent(ctx.config) ?? { provider: 'claude-cli' as const, cliPath: '', model: '' };
+      const agent = resolveResearchAgent(ctx.config) ?? { kind: 'cli' as const, provider: 'claude-cli' as const, cliPath: '', model: '' };
       const ws = workspaceFromJob(ctx, job, agent);
       if (typeof job.payload.exportedTo === 'string') ws.dir = job.payload.exportedTo;
       const done = await finalizeResearchJob(ctx, job, ws, { exitCode: 0, turns: null, costUsd: null, resultText: '', error: null, transcriptPath: '' }, { mcp: { url: '', token: '', headers: {} }, agent, log: (m) => console.log(`  ${m}`) });
       console.log(JSON.stringify({ id: done.id, status: done.status, outputPath: done.outputPath, error: done.error, warnings: done.payload.warnings }, null, 2));
     } finally {
       await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+const chat = program.command('chat').description('talk to the configured coding-agent CLI about the knowledge base (it answers over MCP and may write what it is taught as quarantined notes)');
+chat
+  .command('send <message...>', { isDefault: true })
+  .description('send one message (a new conversation unless --conversation) and print the reply; hosts a temporary MCP endpoint')
+  .option('-c, --conversation <id>', 'continue an existing conversation')
+  .option('--json', 'print the assistant message as JSON')
+  .action(async (parts: string[], opts: { conversation?: string; json?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const text = parts.join(' ');
+      const conversation = opts.conversation ? await getConversation(ctx.store, opts.conversation) : await createConversation(ctx.store, { createdBy: 'cli' });
+      if (!conversation) throw new Error(`no conversation ${opts.conversation}`);
+      const res = await withTemporaryMcp(ctx, (mcp) => runChatTurn(ctx, conversation.id, text, { mcp, log: (m) => console.error(`  ${m}`) }));
+      if (opts.json) {
+        console.log(JSON.stringify({ conversation: conversation.id, ...res.message }, null, 2));
+      } else {
+        console.log(res.message.content || (res.message.error ? `(no reply: ${res.message.error})` : '(empty reply)'));
+        const tools = res.message.events.filter((e) => e.tool !== 'wrote');
+        if (tools.length) console.error(`\n[${tools.map((e) => `${e.tool}${e.summary ? `: ${e.summary}` : ''}`).join(' · ')}]`);
+        console.error(`conversation ${conversation.id} — continue with: knode-os chat -c ${conversation.id} "…"`);
+      }
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+chat
+  .command('list')
+  .description('recent conversations')
+  .action(async () => {
+    const ctx = await createContext(dataDir());
+    try {
+      const rows = await listConversations(ctx.store, { limit: 50 });
+      for (const r of rows) console.log(`${r.id}  ${r.status.padEnd(8)} ${r.updatedAt.slice(0, 16)}  ${r.title || '(untitled)'}`);
+      if (rows.length === 0) console.log('(no conversations)');
+    } finally {
       await ctx.store.close();
     }
   });

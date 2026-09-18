@@ -15,9 +15,9 @@
 
 | 决策 | 结论 |
 | --- | --- |
-| D1 执行方式 | knode‑os 内置 runner：`serve` 内的持久化任务队列无头拉起用户配置的 claude / codex / cursor CLI；同时提供"导出任务包 → 手动跑 → reclaim"的模式 |
+| D1 执行方式 | knode‑os 内置 runner：`serve` 内的持久化任务队列拉起配置好的 agent —— 无头的 claude / codex / cursor CLI，或者跑在 OpenAI 兼容连接上的**内置 agent**（`serve` 进程内的 LangChain `deepagents` 循环），供没装任何 CLI 的机器使用；同时提供"导出任务包 → 手动跑 → reclaim"的模式。`research.agent` 必须显式指定，不再回退到默认 LLM 提供方（2026‑09‑18 改） |
 | D1a agent 怎么接 knode | **MCP 为主，由 `serve` 以 Streamable HTTP 提供**（`POST /mcp`）；`raw/docs`、`wiki`、`.sidecar` 只读挂给 agent；**所有写入只经 `knode_write`**。不采用"agent 调 knode‑os CLI"（每次重开库、非结构化输出、shell 权限面） |
-| D2 页面地位 | agent 写的 wiki 页是 **Source**：frontmatter `actor: agent/<cli>` → quarantined；`aliases / relations / claims` 进图，与 trusted 冲突自动开 dispute；人工 promote 后升 trusted |
+| D2 页面地位 | agent 写的 wiki 页是 **Source**：frontmatter `actor: agent/<cli>`（内置 agent 为 `agent/deep-agents`）→ quarantined；`aliases / relations / claims` 进图，与 trusted 冲突自动开 dispute；人工 promote 后升 trusted |
 | D3 实体消歧 | 写入时**确定性**解析（NFKC / 全半角 / 公司后缀归一 + name/alias 精确键匹配）；模糊候选交给夜间审计 → `merge` 建议 → 人工确认 → 可撤销链接 |
 | D4 关系本体 | 可配置本体（`playbooks/ontology/*.yaml`）+ 内置 `core` / `organization` 两个包 |
 
@@ -184,6 +184,6 @@ profile 把「怎么研究」从 harness 里抽出来：一份 YAML 同时回答
 1. codex 对 HTTP MCP 的鉴权用 `bearer_token_env_var`（已按其 CLI 帮助实现），工作区字段走 query；未实测 codex 会否忽略 `-c` 里的 `mcp_servers.*`。
 2. cursor‑agent 的 `--add-dir` 是否只读、`--mode ask` 是否阻断 MCP 写工具未实测；默认不用 `--mode`。
 3. Postgres 后端下多进程并发 apply 可能产生短暂重复实体（PGlite 串行化事务不会）；夜间审计会提出合并。
-4. macOS App 尚无 Wiki 标签页与 Deep research 设置（Web UI 已有）；服务端改动需 `macos/scripts/package-app.sh` 重新打包。
+4. 服务端改动需 `macos/scripts/package-app.sh` 重新打包 macOS App。初始化（kind = `init`）、对话入口与研究 agent 的后续改进见 [07 — 初始化与对话](07-init-and-chat.zh-CN.md)。
 5. 原生子代理模式按官方配置参考实现（claude `--agents` 的 description / prompt / tools / model；codex `agents.*` 与子代理层里的 `developer_instructions`），尚未用真 CLI 跑过；cursor-agent 的 `effort` 只见过 `high` 的示例，`xhigh` / `max` 都映射成 `high`。
 6. `claude --effort` 需要较新的 CLI（老版本会因未知参数退出），所以内置 `default` profile 的强度是 `default`（不传参数）；要用 `max` 请选 `thorough` 或自建 profile。

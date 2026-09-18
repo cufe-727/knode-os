@@ -6,13 +6,15 @@ import { AppContext } from '../context.js';
 import { appendLog } from '../fs/datadir.js';
 import { safePath } from '../fs/files.js';
 import { sync } from '../ingest/sync.js';
-import { agentForSpec, ResearchAgent, resolveResearchAgent } from './agent.js';
-import { launchAgent, LaunchResult } from './launch.js';
+import { agentForSpec, agentWebCapable, ResearchAgent, resolveResearchAgent } from './agent.js';
+import { finalizeInit, prepareInit, topicsFrom } from './init.js';
+import { clearCancelled, isCancelled, JobCancelledError, launchAgent, LaunchResult } from './launch.js';
 import { runNativePipeline, runTeamPipeline } from './pipeline.js';
 import { getJob, ResearchJob, updateJob } from './jobs.js';
 import { activeProfile, effectivePipeline, ResearchProfile, webAllowed } from './profile.js';
+import { renderSurvey } from './survey.js';
 import { ResearchTemplate, templateFor } from './templates.js';
-import { validateResearchPage } from './validate.js';
+import { validateCompanions, validateResearchPage } from './validate.js';
 import { McpEndpoint, prepareRunWorkspace, pruneRuns, runsRoot, RunWorkspace } from './workspace.js';
 import { ensureRecentResearch } from '../wiki/pages.js';
 import { fileMergeCandidate } from '../graph/dedupe.js';
@@ -44,11 +46,25 @@ export interface RunOptions {
 
 const MAX_ATTEMPTS = 2;
 
+/** True when the row was cancelled (by this process or another) while the job ran. */
+async function wasCancelled(ctx: AppContext, jobId: string): Promise<boolean> {
+  if (isCancelled(jobId)) return true;
+  return (await getJob(ctx.store, jobId))?.status === 'cancelled';
+}
+
+async function markCancelled(ctx: AppContext, jobId: string, log: (m: string) => void): Promise<ResearchJob> {
+  log(`research ${jobId}: cancelled`);
+  const row = (await updateJob(ctx.store, jobId, { status: 'cancelled', finishedAt: new Date().toISOString() }))!;
+  clearCancelled(jobId);
+  return row;
+}
+
 export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: RunOptions): Promise<ResearchJob> {
   const log = opts.log ?? (() => {});
   const research = ctx.config.research;
   const agent = opts.agent ?? resolveResearchAgent(ctx.config);
-  if (!agent) throw new Error('no research agent configured: set research.agent to claude-cli / codex-cli / cursor-cli (or a connection id)');
+  if (!agent) throw new Error(`no research agent configured: set research.agent to a CLI (claude-cli / codex-cli / cursor-cli), a connection id, or 'default' to run the built-in agent on the default LLM connection (Settings → Deep research)`);
+  clearCancelled(jobIn.id); // a job that starts (or restarts) is not cancelled, whatever an earlier attempt was
   let job = (await updateJob(ctx.store, jobIn.id, {
     status: 'running',
     agent: agent.provider,
@@ -62,6 +78,7 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
     .filter((d) => fs.existsSync(d));
 
   const fail = async (error: string, retry: boolean): Promise<ResearchJob> => {
+    if (await wasCancelled(ctx, job.id)) return markCancelled(ctx, job.id, log);
     const rejections = [...(Array.isArray(job.payload.rejections) ? (job.payload.rejections as string[]) : []), error];
     if (retry && job.attempts < MAX_ATTEMPTS) {
       log(`research ${job.id}: rejected (${error.slice(0, 160)}) — requeued for one more attempt`);
@@ -73,15 +90,31 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
 
   const profile = opts.profile ?? activeProfile(ctx.dataDir, ctx.config);
   const webGate = ctx.config.review?.external ?? 'verify';
-  const allowNetwork = webAllowed({ gate: webGate, kind: job.kind, profile });
+  const allowNetwork = webAllowed({ gate: webGate, kind: job.kind, profile, agent });
   const pipeline = effectivePipeline(profile, ctx.config);
+
+  // an initialization first brings the base up to date and surveys it; the survey replaces the resolve seed in the brief
+  let seed: string | undefined;
+  if (job.kind === 'init') {
+    try {
+      const prep = await prepareInit(ctx, job, { log });
+      job = prep.job;
+      seed = renderSurvey(prep.survey);
+    } catch (err) {
+      return fail(`init: ${err instanceof Error ? err.message : err}`, false);
+    }
+  }
+
   let ws;
   try {
-    ws = await prepareRunWorkspace(ctx, job, template, { runsDir: research?.runsDir ?? '.runs', provider: agent.provider, mcp: opts.mcp, readDirs, allowNetwork, profile });
+    ws = await prepareRunWorkspace(ctx, job, template, {
+      runsDir: research?.runsDir ?? '.runs', provider: agent.provider, mcp: opts.mcp, readDirs, allowNetwork, profile,
+      seed, guide: job.kind === 'init' ? null : undefined,
+    });
     job = (await updateJob(ctx.store, job.id, {
       worksetId: ws.worksetId,
       outputPath: ws.outputPath,
-      payload: { ...job.payload, actor: ws.actor, research: ws.research, humanParagraphs: ws.humanParagraphs, profile: profile.name, pipeline },
+      payload: { ...job.payload, actor: ws.actor, research: ws.research, humanParagraphs: ws.humanParagraphs, profile: profile.name, pipeline, companions: ws.companions.map((c) => c.path) },
     }))!;
   } catch (err) {
     return fail(`workspace: ${err instanceof Error ? err.message : err}`, false);
@@ -94,12 +127,11 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
       const pipelineInput = { job, template, ws, agent, mcp: opts.mcp, readDirs, profile, webGate, log, agentFor: (spec: string, model: string) => agentForSpec(ctx.config, spec, model) };
       const team = pipeline === 'team' ? await runTeamPipeline(ctx, pipelineInput) : await runNativePipeline(ctx, pipelineInput);
       launched = team;
-      job = (await updateJob(ctx.store, job.id, { payload: { ...job.payload, phases: team.phases, sections: team.sections, reviewRounds: team.reviewRounds } }))!;
+      const topics = job.kind === 'init' ? topicsFrom(team.planText || team.resultText) : undefined;
+      job = (await updateJob(ctx.store, job.id, { payload: { ...job.payload, phases: team.phases, sections: team.sections, reviewRounds: team.reviewRounds, ...(topics ? { topics } : {}) } }))!;
     } else {
       launched = await launchAgent({
-        provider: agent.provider,
-        cliPath: agent.cliPath,
-        model: agent.model,
+        agent,
         maxTurns: template.maxTurns ?? research?.maxTurns ?? 40,
         timeoutMs: research?.timeoutMs ?? 1_200_000,
         ws,
@@ -110,11 +142,15 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
         effort: profile.reasoning.effort,
         webFreshness: profile.search.freshness,
       });
+      if (job.kind === 'init') job = (await updateJob(ctx.store, job.id, { payload: { ...job.payload, topics: topicsFrom(launched.resultText) } }))!;
     }
   } catch (err) {
+    if (err instanceof JobCancelledError) return markCancelled(ctx, job.id, log);
     return fail(`launch: ${err instanceof Error ? err.message : err}`, false);
   }
-  return finalizeResearchJob(ctx, job, ws, launched, { ...opts, agent, template, profile });
+  const done = await finalizeResearchJob(ctx, job, ws, launched, { ...opts, agent, template, profile });
+  clearCancelled(job.id);
+  return done;
 }
 
 /**
@@ -135,6 +171,7 @@ export async function finalizeResearchJob(
   const profile = opts.profile ?? activeProfile(ctx.dataDir, ctx.config);
   let job = jobIn;
   const fail = async (error: string, retry: boolean): Promise<ResearchJob> => {
+    if (await wasCancelled(ctx, job.id)) return markCancelled(ctx, job.id, log);
     const rejections = [...(Array.isArray(job.payload.rejections) ? (job.payload.rejections as string[]) : []), error];
     if (retry && job.attempts < MAX_ATTEMPTS) {
       log(`research ${job.id}: rejected (${error.slice(0, 160)}) — requeued for one more attempt`);
@@ -144,11 +181,19 @@ export async function finalizeResearchJob(
     return (await updateJob(ctx.store, job.id, { status: 'failed', error, finishedAt: new Date().toISOString(), payload: { ...job.payload, rejections } }))!;
   };
 
+  if (await wasCancelled(ctx, job.id)) return markCancelled(ctx, job.id, log);
   const usage = { turns: launched.turns, costUsd: launched.costUsd };
   job = (await updateJob(ctx.store, job.id, { status: 'validating', ...usage }))!;
   if (fs.existsSync(ws.dir)) fs.writeFileSync(path.join(ws.dir, 'result.json'), JSON.stringify({ ...launched, usage }, null, 2) + '\n');
 
   const report = await validateResearchPage(ctx, { job, template, ws, profile });
+  const companions = validateCompanions(ctx, ws);
+  report.errors.push(...companions.errors);
+  report.warnings.push(...companions.warnings);
+  report.ok = report.errors.length === 0;
+  if (job.kind === 'verify' && !agentWebCapable(opts.agent)) {
+    report.warnings.push('the built-in agent has no web tool — this verification checked the knowledge base only, not external sources');
+  }
   if (fs.existsSync(ws.dir)) fs.writeFileSync(path.join(ws.dir, 'validation.json'), JSON.stringify(report, null, 2) + '\n');
   if (!report.ok) {
     const abs = safePath(ctx.dataDir, ws.outputPath);
@@ -161,10 +206,18 @@ export async function finalizeResearchJob(
     // the page that was there before the agent overwrote it comes back
     const backup = path.join(ws.dir, 'existing.md');
     if (fs.existsSync(backup)) fs.copyFileSync(backup, abs);
+    // companion files likewise: the previous version returns, a first draft is kept for inspection only
+    for (const c of ws.companions ?? []) {
+      const absC = safePath(ctx.dataDir, c.path);
+      if (fs.existsSync(absC) && fs.existsSync(ws.dir)) fs.renameSync(absC, path.join(ws.dir, `rejected-${path.posix.basename(c.path)}`));
+      else if (fs.existsSync(absC)) fs.rmSync(absC);
+      if (c.backupPath && fs.existsSync(c.backupPath)) fs.copyFileSync(c.backupPath, absC);
+    }
     const reason = [launched.error, ...report.errors].filter(Boolean).join('; ');
     return fail(reason || 'validation failed', true);
   }
 
+  if (await wasCancelled(ctx, job.id)) return markCancelled(ctx, job.id, log);
   try {
     const stats = await sync(ctx, { only: [ws.outputPath], actor: 'research', onProgress: log });
     log(`research ${job.id}: synced ${ws.outputPath} (${stats.indexed} applied)`);
@@ -182,12 +235,29 @@ export async function finalizeResearchJob(
   } catch (err) {
     log(`research index region failed: ${err instanceof Error ? err.message : err}`);
   }
-  appendLog(ctx.dataDir, 'research', `${job.kind} ${job.target ?? job.query ?? ''} → ${ws.outputPath} (${opts.agent.provider}${usage.turns ? `, ${usage.turns} turns` : ''}${report.warnings.length ? `, ${report.warnings.length} warnings` : ''})`);
+  // a cancel that landed while the page was being validated and synced still wins:
+  // the page stays, but nothing is logged as done and no follow-up work is queued
+  if (await wasCancelled(ctx, job.id)) return markCancelled(ctx, job.id, log);
+  let initPayload: Record<string, unknown> = {};
+  if (job.kind === 'init') {
+    try {
+      const fresh = (await getJob(ctx.store, job.id)) ?? job;
+      const r = await finalizeInit(ctx, fresh, ws, { agent: opts.agent.provider, log });
+      initPayload = { topics: r.topics, followUps: r.queued };
+      log(`init ${job.id}: guide written, ${r.queued.length} follow-up page(s) queued`);
+      appendLog(ctx.dataDir, 'init', `overview → ${ws.outputPath}, guide → AGENTS.md / CLAUDE.md, ${r.queued.length} follow-up job(s) queued (${opts.agent.provider})`);
+    } catch (err) {
+      log(`init ${job.id}: finalize failed: ${err instanceof Error ? err.message : err}`);
+      report.warnings.push(`finalize: ${err instanceof Error ? err.message : err}`);
+    }
+  } else {
+    appendLog(ctx.dataDir, 'research', `${job.kind} ${job.target ?? job.query ?? ''} → ${ws.outputPath} (${opts.agent.provider}${usage.turns ? `, ${usage.turns} turns` : ''}${report.warnings.length ? `, ${report.warnings.length} warnings` : ''})`);
+  }
   const done = (await updateJob(ctx.store, job.id, {
     status: 'done',
     error: launched.error,
     finishedAt: new Date().toISOString(),
-    payload: { ...job.payload, warnings: report.warnings, resultText: launched.resultText.slice(0, 2000) },
+    payload: { ...job.payload, ...initPayload, warnings: report.warnings, resultText: launched.resultText.slice(0, 2000) },
   }))!;
   try {
     pruneRuns(ctx.dataDir, research?.runsDir ?? '.runs', research?.keepRuns ?? 20);
@@ -257,5 +327,6 @@ export function workspaceFromJob(ctx: AppContext, job: ResearchJob, agent: Resea
     worksetId: job.worksetId,
     existingPage: null,
     humanParagraphs: Array.isArray(job.payload.humanParagraphs) ? (job.payload.humanParagraphs as string[]) : [],
+    companions: [],
   };
 }

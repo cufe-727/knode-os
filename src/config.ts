@@ -277,18 +277,22 @@ export interface McpServerConfig {
 }
 
 /**
- * How deep-research jobs are run. A job launches the configured coding-agent
- * CLI headlessly with the knode MCP endpoint attached; the agent researches a
- * topic and writes the resulting wiki page back through `knode_write`.
+ * How deep-research jobs are run. A job launches the configured agent with the
+ * knode MCP endpoint attached — either a coding-agent CLI headlessly, or the
+ * built-in agent loop on an OpenAI-compatible connection — and the agent
+ * researches a topic and writes the wiki page back through `knode_write`.
  */
 export interface ResearchConfig {
   /**
-   * Which CLI runs jobs: a connection id from `connections`, or a provider
-   * name ('claude-cli' | 'codex-cli' | 'cursor-cli'). Empty = the default `llm`
-   * connection when that is a CLI provider; otherwise research is disabled.
+   * Which agent runs jobs: a connection id from `connections`, a CLI provider
+   * name ('claude-cli' | 'codex-cli' | 'cursor-cli'), or 'default' for the
+   * section-01 connection. An OpenAI-compatible connection runs the built-in
+   * agent. Empty = not configured, and research is disabled — there is no
+   * fallback, because one that only worked when the default provider happened
+   * to be a CLI made the same config silently have research or not.
    */
   agent: string;
-  /** Model passed to the CLI (--model). Empty = the CLI's own default. */
+  /** Model for the agent. Empty = the CLI's own default / the connection's model. */
   model: string;
   /** Turn cap per job (claude --max-turns; advisory for CLIs without one). */
   maxTurns: number;
@@ -325,6 +329,42 @@ export interface ResearchConfig {
   researchers: number;
   /** Critique → revise rounds in 'team' mode before the page is accepted or rejected. */
   reviewRounds: number;
+  /** Knowledge-base initialization (kind = init): what the pre-flight does and how many topic pages it queues. */
+  init: ResearchInitConfig;
+}
+
+export interface ResearchInitConfig {
+  /** Topic pages (from the plan) queued as follow-up research jobs after an initialization. */
+  followUps: number;
+  /** 'drain': run tier-1 extraction to the end of the queue / budget before the agent starts; 'skip': leave the queue to the background loop. */
+  extraction: 'drain' | 'skip';
+  /** Cap on the pre-flight extraction time. */
+  extractionMaxMs: number;
+}
+
+export type ChatWebAccess = 'inherit' | 'on' | 'off';
+
+/**
+ * The chat entry: a person talks to the configured coding-agent CLI, which
+ * answers from the knowledge base over MCP and may write what it is taught
+ * (quarantined notes under raw/docs/notes/). Every turn is a fresh session
+ * that replays recent history — no CLI session persistence (see docs/design/07).
+ */
+export interface ChatConfig {
+  /** Connection id or provider; '' = research.agent. */
+  agent: string;
+  /** Model override ('' = the agent's own). */
+  model: string;
+  effort: 'default' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  /** Turn cap per reply. */
+  maxTurns: number;
+  timeoutMs: number;
+  /** Web tools: 'inherit' follows review.external (on only when it is 'research'); 'on' still requires review.external ≠ off. */
+  web: ChatWebAccess;
+  /** Messages replayed into each turn's prompt (user + assistant, most recent). */
+  historyTurns: number;
+  /** Conversations kept per workspace; older ones are pruned. */
+  keep: number;
 }
 
 export interface GraphConfig {
@@ -384,6 +424,8 @@ export interface KnodeConfig {
   graph: GraphConfig;
   /** Review strength between extraction and the graph (entity merges, claims, external verification). */
   review: ReviewConfig;
+  /** The chat entry (see src/chat). */
+  chat: ChatConfig;
   trace: {
     /** Where Claude Code stores session transcripts. */
     claudeProjectsDir: string;
@@ -500,6 +542,7 @@ export function defaultConfig(): KnodeConfig {
       profile: 'default',
       researchers: 3,
       reviewRounds: 1,
+      init: { followUps: 6, extraction: 'drain', extractionMaxMs: 900_000 },
     },
     graph: { ontologyPacks: ['core', 'organization'] },
     review: {
@@ -511,6 +554,7 @@ export function defaultConfig(): KnodeConfig {
       claims: 'suggest',
       external: 'verify',
     },
+    chat: { agent: '', model: '', effort: 'default', maxTurns: 30, timeoutMs: 600_000, web: 'inherit', historyTurns: 12, keep: 50 },
     trace: {
       claudeProjectsDir: path.join(home, '.claude', 'projects'),
       codexSessionsDir: path.join(home, '.codex', 'sessions'),

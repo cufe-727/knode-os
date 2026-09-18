@@ -96,7 +96,8 @@ async function classify(store: Store, file: string, root: DocRoot, parsed: Parse
     const graph = hasProse(humanBody);
     return { kind: 'view', graph, selfEntity: graph, humanBody };
   }
-  return { kind: 'source', graph: true, selfEntity: undefined, humanBody: parsed.body };
+  // `selfEntity: false` in frontmatter: a hub page (the overview) that is about the whole base, not one entity
+  return { kind: 'source', graph: true, selfEntity: parsed.frontmatter.selfEntity === false ? false : undefined, humanBody: parsed.body };
 }
 
 export async function applyDocScope(ctx: ApplyDocContext, file: string, root: DocRoot, opts: ApplyDocOptions = {}): Promise<DocOutcome> {

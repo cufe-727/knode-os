@@ -7,6 +7,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
     case ask
     case graph
     case wiki
+    case chat
     case traces
     case dream
     case settings
@@ -20,6 +21,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .ask: L("Ask")
         case .graph: L("Graph")
         case .wiki: L("Wiki")
+        case .chat: L("Chat")
         case .traces: L("Traces")
         case .dream: L("Dream")
         case .settings: L("Settings")
@@ -33,6 +35,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .ask: L("Cited answers from your workspace")
         case .graph: L("Entities, relations, and claims")
         case .wiki: L("Pages researched by agent CLIs")
+        case .chat: L("Talk to the knowledge base agent")
         case .traces: L("Claude Code and Codex sessions")
         case .dream: L("Review agent improvement ideas")
         case .settings: L("Model routes and pipeline limits")
@@ -46,6 +49,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .ask: "sparkles"
         case .graph: "point.3.connected.trianglepath.dotted"
         case .wiki: "book.closed"
+        case .chat: "bubble.left.and.bubble.right"
         case .traces: "terminal"
         case .dream: "moon.stars"
         case .settings: "slider.horizontal.3"
@@ -301,6 +305,46 @@ struct ActionResponse: Decodable {
     var ok: Bool
 }
 
+/// One pre-flight step of an initialization (index, extract, regenerate, survey).
+struct InitStep: Decodable, Identifiable, Hashable {
+    var name: String
+    var status: String
+    var detail: String?
+
+    var id: String { name }
+}
+
+/// One agent session of a team run, as the runner recorded it.
+struct PhaseRecord: Decodable, Identifiable, Hashable {
+    var name: String
+    var label: String
+    var role: String?
+    var agent: String?
+    var turns: Int?
+    var error: String?
+
+    var id: String { label }
+}
+
+/// A page an initialization decided is worth its own research job.
+struct InitTopic: Decodable, Identifiable, Hashable {
+    var kind: String
+    var target: String
+    var why: String?
+    var queued: String?
+
+    var id: String { "\(kind):\(target)" }
+}
+
+/// The parts of a job's payload the client shows.
+struct ResearchJobPayload: Decodable, Hashable {
+    var steps: [InitStep]?
+    var phases: [PhaseRecord]?
+    var topics: [InitTopic]?
+    var followUps: [String]?
+    var warnings: [String]?
+}
+
 struct ResearchJob: Decodable, Identifiable, Hashable {
     var id: String
     var kind: String
@@ -314,8 +358,58 @@ struct ResearchJob: Decodable, Identifiable, Hashable {
     var createdAt: String
     var startedAt: String?
     var finishedAt: String?
+    var payload: ResearchJobPayload?
+    /// Present on the job-detail route, which also reads the run directory.
+    var steps: [InitStep]?
+    var phases: [PhaseRecord]?
 
     var subject: String { target ?? query ?? "" }
+    /// Queued, running or validating — the UI keeps polling.
+    var isLive: Bool { status == "queued" || status == "running" || status == "validating" }
+    var initSteps: [InitStep] { steps?.isEmpty == false ? steps! : payload?.steps ?? [] }
+    var initPhases: [PhaseRecord] { phases?.isEmpty == false ? phases! : payload?.phases ?? [] }
+    var initTopics: [InitTopic] { payload?.topics ?? [] }
+}
+
+/// What `GET /api/survey` reports, narrowed to what the initialization card shows.
+struct KbSurvey: Decodable, Hashable {
+    struct Stats: Decodable, Hashable {
+        var documents: Int
+        var chunks: Int
+        var entities: Int
+        var relations: Int
+        var claims: Int
+    }
+
+    struct Extraction: Decodable, Hashable {
+        var queued: Int
+        var llmEnabled: Bool
+    }
+
+    struct Guide: Decodable, Hashable {
+        struct Stamp: Decodable, Hashable {
+            var job: String
+            var at: String
+            var agent: String
+        }
+
+        var exists: Bool
+        var path: String
+        var bytes: Int
+        var updatedAt: String?
+        var stamp: Stamp?
+    }
+
+    var stats: Stats
+    var extraction: Extraction
+    var guide: Guide
+}
+
+struct InitStatus: Decodable {
+    var survey: KbSurvey
+    var guide: KbSurvey.Guide
+    var job: ResearchJob?
+    var followUps: [ResearchJob]
 }
 
 struct ResearchPage: Decodable, Identifiable, Hashable {
@@ -449,6 +543,29 @@ struct ResearchConfig: Codable, Equatable {
         var dailyJobs: Int
     }
 
+    /// What the Wiki tab's initialize button does before the agent starts.
+    struct Initialization: Codable, Equatable {
+        /// Topic pages queued as follow-up research jobs.
+        var followUps: Int
+        /// "drain" runs tier-1 extraction to the end of the queue first; "skip" leaves it to the background loop.
+        var extraction: String
+        var extractionMaxMs: Int
+
+        init(followUps: Int = 6, extraction: String = "drain", extractionMaxMs: Int = 900_000) {
+            self.followUps = followUps
+            self.extraction = extraction
+            self.extractionMaxMs = extractionMaxMs
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let fallback = Initialization()
+            followUps = try container.decodeIfPresent(Int.self, forKey: .followUps) ?? fallback.followUps
+            extraction = try container.decodeIfPresent(String.self, forKey: .extraction) ?? fallback.extraction
+            extractionMaxMs = try container.decodeIfPresent(Int.self, forKey: .extractionMaxMs) ?? fallback.extractionMaxMs
+        }
+    }
+
     /// A connection id or a CLI provider name; empty follows the default LLM
     /// provider when that is itself a CLI.
     var agent: String
@@ -462,6 +579,12 @@ struct ResearchConfig: Codable, Equatable {
     var researchers: Int
     var reviewRounds: Int
     var auto: Auto
+    var initialization: Initialization
+
+    enum CodingKeys: String, CodingKey {
+        case agent, model, profile, pipeline, maxTurns, timeoutMs, concurrency, researchers, reviewRounds, auto
+        case initialization = "init"
+    }
 
     init(
         agent: String = "",
@@ -473,7 +596,8 @@ struct ResearchConfig: Codable, Equatable {
         concurrency: Int = 1,
         researchers: Int = 3,
         reviewRounds: Int = 1,
-        auto: Auto = Auto(enabled: false, dailyJobs: 3)
+        auto: Auto = Auto(enabled: false, dailyJobs: 3),
+        initialization: Initialization = Initialization()
     ) {
         self.agent = agent
         self.model = model
@@ -485,6 +609,7 @@ struct ResearchConfig: Codable, Equatable {
         self.researchers = researchers
         self.reviewRounds = reviewRounds
         self.auto = auto
+        self.initialization = initialization
     }
 
     init(from decoder: any Decoder) throws {
@@ -500,6 +625,54 @@ struct ResearchConfig: Codable, Equatable {
         researchers = try container.decodeIfPresent(Int.self, forKey: .researchers) ?? fallback.researchers
         reviewRounds = try container.decodeIfPresent(Int.self, forKey: .reviewRounds) ?? fallback.reviewRounds
         auto = try container.decodeIfPresent(Auto.self, forKey: .auto) ?? fallback.auto
+        initialization = try container.decodeIfPresent(Initialization.self, forKey: .initialization) ?? fallback.initialization
+    }
+}
+
+/// The chat entry's settings (`chat` in knode.config.json).
+struct ChatConfig: Codable, Equatable {
+    /// Connection id or CLI provider; empty follows the research agent.
+    var agent: String
+    var model: String
+    var effort: String
+    var maxTurns: Int
+    var timeoutMs: Int
+    /// "inherit" | "on" | "off" — narrower than review.external, never wider.
+    var web: String
+    var historyTurns: Int
+    var keep: Int
+
+    init(
+        agent: String = "",
+        model: String = "",
+        effort: String = "default",
+        maxTurns: Int = 30,
+        timeoutMs: Int = 600_000,
+        web: String = "inherit",
+        historyTurns: Int = 12,
+        keep: Int = 50
+    ) {
+        self.agent = agent
+        self.model = model
+        self.effort = effort
+        self.maxTurns = maxTurns
+        self.timeoutMs = timeoutMs
+        self.web = web
+        self.historyTurns = historyTurns
+        self.keep = keep
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = ChatConfig()
+        agent = try container.decodeIfPresent(String.self, forKey: .agent) ?? fallback.agent
+        model = try container.decodeIfPresent(String.self, forKey: .model) ?? fallback.model
+        effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? fallback.effort
+        maxTurns = try container.decodeIfPresent(Int.self, forKey: .maxTurns) ?? fallback.maxTurns
+        timeoutMs = try container.decodeIfPresent(Int.self, forKey: .timeoutMs) ?? fallback.timeoutMs
+        web = try container.decodeIfPresent(String.self, forKey: .web) ?? fallback.web
+        historyTurns = try container.decodeIfPresent(Int.self, forKey: .historyTurns) ?? fallback.historyTurns
+        keep = try container.decodeIfPresent(Int.self, forKey: .keep) ?? fallback.keep
     }
 }
 
@@ -509,6 +682,7 @@ struct KnodeConfig: Codable, Equatable {
     var connections: [LLMConnection]
     var extraction: ExtractionConfig
     var research: ResearchConfig
+    var chat: ChatConfig
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -517,7 +691,63 @@ struct KnodeConfig: Codable, Equatable {
         connections = try container.decodeIfPresent([LLMConnection].self, forKey: .connections) ?? []
         extraction = try container.decode(ExtractionConfig.self, forKey: .extraction)
         research = try container.decodeIfPresent(ResearchConfig.self, forKey: .research) ?? ResearchConfig()
+        chat = try container.decodeIfPresent(ChatConfig.self, forKey: .chat) ?? ChatConfig()
     }
+}
+
+/* ------------------------------ chat ---------------------------------- */
+
+/// One tool call a chat turn made, or a file the reply wrote.
+struct ChatEvent: Decodable, Hashable, Identifiable {
+    var tool: String
+    var summary: String
+    var path: String?
+    var ok: Bool?
+
+    var id: String { "\(tool)|\(summary)|\(path ?? "")" }
+    var label: String { tool == "wrote" ? "wrote \(summary)" : summary.isEmpty ? tool : "\(tool): \(summary)" }
+}
+
+struct ChatMessage: Decodable, Identifiable, Hashable {
+    var id: String
+    var seq: Int
+    var role: String
+    var content: String
+    var events: [ChatEvent]
+    var turns: Int?
+    var error: String?
+    var createdAt: String
+
+    var isUser: Bool { role == "user" }
+}
+
+struct ChatConversation: Decodable, Identifiable, Hashable {
+    var id: String
+    var title: String
+    var status: String
+    var agent: String?
+    var updatedAt: String
+    var messages: [ChatMessage]?
+    var running: Bool?
+
+    @MainActor var displayTitle: String { title.isEmpty ? L("(untitled)") : title }
+}
+
+struct ChatStatusResponse: Decodable {
+    var status: String
+    var seq: Int?
+    var activity: [ChatEvent]
+}
+
+struct ChatSendResponse: Decodable {
+    var ok: Bool
+    var seq: Int
+    var status: String
+}
+
+struct ChatProtocolResponse: Decodable {
+    var path: String
+    var text: String
 }
 
 struct RouteTestResult: Decodable {
@@ -569,6 +799,20 @@ struct CliTool: Decodable, Identifiable {
 
 struct CliToolsResponse: Decodable {
     var tools: [CliTool]
+}
+
+/// What can run a session here, and what to preselect when nothing is set.
+struct AvailableAgent: Decodable, Identifiable {
+    var id: String
+    var kind: String
+    var label: String
+    var available: Bool
+    var reason: String?
+}
+
+struct AvailableAgentsResponse: Decodable {
+    var agents: [AvailableAgent]
+    var suggested: String?
 }
 
 struct ConfigSaveResponse: Decodable {

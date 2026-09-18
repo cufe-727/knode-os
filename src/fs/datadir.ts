@@ -6,6 +6,7 @@ import { ensureDefaultPlaybooks } from '../pack/playbook.js';
 import { ensureDefaultIntents } from '../compiler/intents.js';
 import { ensureDefaultOntology } from '../graph/ontology.js';
 import { ensureDefaultResearchTemplates } from '../research/templates.js';
+import { ensureDefaultChatPlaybooks } from '../chat/templates.js';
 import { ensureDefaultProfiles } from '../research/profile.js';
 import { CAPABILITIES_DIR, DB_DIR, INTENTS_DIR, LEGACY_TOP_LEVEL, PACKS_DIR } from './layout.js';
 
@@ -127,6 +128,43 @@ content grows; safe to edit.
 const LOG_TEMPLATE = `# Directory Update Log
 `;
 
+/** Files initDataDir seeds with a template; a file that still equals its template was never edited. */
+export const SEED_FILES: Record<string, string> = {
+  'purpose.md': PURPOSE_TEMPLATE,
+  'schema.md': SCHEMA_TEMPLATE,
+  'wiki/overview.md': OVERVIEW_TEMPLATE,
+};
+
+function squashTemplate(text: string): string {
+  return text.replace(/\r\n/g, '\n').split('\n').map((l) => l.trimEnd()).join('\n').trim();
+}
+
+/** True when `text` is still the template `initDataDir` wrote at `rel` (line endings and trailing whitespace ignored). */
+export function isSeedTemplate(rel: string, text: string): boolean {
+  const template = SEED_FILES[rel.replace(/\\/g, '/').replace(/^\/+/, '')];
+  return template !== undefined && squashTemplate(template) === squashTemplate(text);
+}
+
+/**
+ * The knowledge-base guide an initialization job writes at the data root:
+ * what this base holds, how to query it, how to write into it. `CLAUDE.md`
+ * is an identical copy so Claude Code picks it up when started in the data
+ * directory; every research / chat workspace and the MCP server's
+ * `instructions` carry the same text. Never indexed as a source.
+ */
+export const GUIDE_FILE = 'AGENTS.md';
+export const GUIDE_COPY = 'CLAUDE.md';
+
+export function readGuide(dataDir: string): string | null {
+  const file = path.join(dataDir, GUIDE_FILE);
+  try {
+    const text = fs.readFileSync(file, 'utf8');
+    return text.trim() ? text : null;
+  } catch {
+    return null;
+  }
+}
+
 const DIRECTORY_INDEXES: Record<string, string> = {
   'wiki/entities/index.md': '# Entities\n\nPeople, organizations, products, components, and other named entities.\n',
   'wiki/concepts/index.md': '# Concepts\n\nTheories, methods, designs, conventions, and generated topic clusters.\n',
@@ -192,7 +230,7 @@ export function initDataDir(dataDir: string): InitResult {
   created.push(...obsidian.created.map((rel) => `wiki/${rel}`));
   // starters for the two configurable layers: how to retrieve (playbook) and
   // what an answer needs (intent). Both are examples to edit, never overwritten.
-  created.push(...ensureDefaultPlaybooks(dataDir), ...ensureDefaultIntents(dataDir), ...ensureDefaultOntology(dataDir), ...ensureDefaultResearchTemplates(dataDir), ...ensureDefaultProfiles(dataDir));
+  created.push(...ensureDefaultPlaybooks(dataDir), ...ensureDefaultIntents(dataDir), ...ensureDefaultOntology(dataDir), ...ensureDefaultResearchTemplates(dataDir), ...ensureDefaultProfiles(dataDir), ...ensureDefaultChatPlaybooks(dataDir));
   if (!fs.existsSync(path.join(dataDir, CONFIG_FILE))) {
     saveConfig(dataDir, defaultConfig());
     created.push(CONFIG_FILE);

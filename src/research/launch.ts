@@ -2,6 +2,7 @@ import { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { cliCommand, readCursorStream, resolveExecutable, runProcess } from '../llm/cli.js';
+import { AgentProvider, CliAgent, ResearchAgent } from './agent.js';
 import { Effort, Freshness, NativeAgentSpec } from './profile.js';
 import { McpEndpoint, RunWorkspace } from './workspace.js';
 
@@ -13,16 +14,18 @@ import { McpEndpoint, RunWorkspace } from './workspace.js';
  * (pages travel back through `knode_write`). Kept in one place because CLI
  * flags drift between releases; `GET /api/config/cli-tools` reports what is
  * installed.
+ *
+ * The built-in agent is not a process, so its recipe lives in `deepagents.ts`
+ * and is loaded lazily; `launchSession` dispatches on the agent kind. Both
+ * kinds honour the same contract, including the transcript and cancellation.
  */
 
-export type AgentProvider = 'claude-cli' | 'codex-cli' | 'cursor-cli';
-
-export const AGENT_PROVIDERS: AgentProvider[] = ['claude-cli', 'codex-cli', 'cursor-cli'];
+/** The provider vocabulary lives in `agent.ts`; re-exported here for the callers that grew up importing it from the launcher. */
+export { AGENT_PROVIDERS, BUILTIN_AGENT } from './agent.js';
+export type { AgentProvider, BuiltinAgent, CliAgent, ResearchAgent } from './agent.js';
 
 export interface LaunchInput {
-  provider: AgentProvider;
-  cliPath: string;
-  model: string;
+  agent: ResearchAgent;
   maxTurns: number;
   timeoutMs: number;
   ws: RunWorkspace;
@@ -50,21 +53,98 @@ export interface LaunchResult {
   transcriptPath: string;
 }
 
-const active = new Set<ChildProcess>();
+/**
+ * A session that can be stopped: a spawned CLI process, or an in-process agent
+ * loop behind an AbortController. One registry for both, so `activeSessions`
+ * cannot undercount and serve shutdown cannot miss a kind.
+ */
+export interface RunningSession {
+  stop(): boolean;
+}
+
+/** Live sessions per job id (a research job id, or `chat:<conversation>`). */
+const byJob = new Map<string, Set<RunningSession>>();
+/** Jobs whose sessions were killed: nothing more is launched for them until the runner clears the flag. */
+const cancelledJobs = new Set<string>();
+
+export class JobCancelledError extends Error {
+  constructor(public readonly jobId: string) {
+    super(`job ${jobId} was cancelled`);
+    this.name = 'JobCancelledError';
+  }
+}
+
+export function processSession(child: ChildProcess): RunningSession {
+  return {
+    stop() {
+      try {
+        child.kill('SIGKILL');
+        return true;
+      } catch {
+        return false; /* already gone */
+      }
+    },
+  };
+}
+
+export function abortSession(controller: AbortController): RunningSession {
+  return {
+    stop() {
+      if (controller.signal.aborted) return false; // already stopped; counts once, like a dead process
+      controller.abort();
+      return true;
+    },
+  };
+}
+
+/** Register a running session so it can be cancelled; the returned function unregisters it. */
+export function registerSession(jobId: string, session: RunningSession): () => void {
+  let set = byJob.get(jobId);
+  if (!set) byJob.set(jobId, (set = new Set()));
+  set.add(session);
+  return () => {
+    const current = byJob.get(jobId);
+    current?.delete(session);
+    if (current && current.size === 0) byJob.delete(jobId);
+  };
+}
 
 /** Kill every agent this process launched (serve shutdown). */
 export function killActiveAgents(): number {
   let n = 0;
-  for (const child of active) {
-    try {
-      child.kill('SIGKILL');
-      n++;
-    } catch {
-      /* already gone */
-    }
-  }
-  active.clear();
+  for (const set of byJob.values()) for (const session of set) if (session.stop()) n++;
+  byJob.clear();
   return n;
+}
+
+/**
+ * Cancel one job: kill its running sessions and refuse to launch more until
+ * `clearCancelled`. A killed session resolves like any other exit, so
+ * `launchSession` re-checks the flag and throws `JobCancelledError` — the
+ * pipeline stops instead of carrying an error into the next phase.
+ */
+export function killAgentsFor(jobId: string): number {
+  cancelledJobs.add(jobId);
+  let n = 0;
+  const set = byJob.get(jobId);
+  if (set) {
+    for (const session of set) if (session.stop()) n++;
+    byJob.delete(jobId);
+  }
+  return n;
+}
+
+export function clearCancelled(jobId: string): void {
+  cancelledJobs.delete(jobId);
+}
+
+export function isCancelled(jobId: string): boolean {
+  return cancelledJobs.has(jobId);
+}
+
+/** Sessions currently running for a job (0 when none). */
+export function activeSessions(jobId: string): number {
+  return byJob.get(jobId)?.size ?? 0;
 }
 
 /** URL-only clients (codex) get the workspace fields in the query string. */
@@ -83,12 +163,11 @@ export const READ_TOOLS = [
   'knode_search', 'knode_graph_search', 'knode_ask', 'knode_ls', 'knode_read', 'knode_grep', 'knode_context_pack', 'knode_claims',
   'knode_resolve', 'knode_plan', 'knode_feedback', 'knode_lineage', 'knode_history', 'knode_graph_insights', 'knode_suggestions',
   'knode_absences', 'knode_disputes', 'knode_capabilities', 'knode_datasources', 'knode_query', 'knode_worksets', 'knode_okf_validate',
+  'knode_survey',
 ].map((t) => `mcp__knode-os__${t}`);
 
 export interface SessionInput {
-  provider: AgentProvider;
-  cliPath: string;
-  model: string;
+  agent: ResearchAgent;
   maxTurns: number;
   timeoutMs: number;
   /** Run workspace (cwd): holds .mcp.json / .cursor/mcp.json and the schema files. */
@@ -216,14 +295,18 @@ export function writeCodexAgentLayers(cwd: string, agents: NativeAgentSpec[], fr
   return written;
 }
 
+/** A session that is going to be spawned as a process — the only kind `sessionArgs` can describe. */
+export type CliSessionInput = Omit<SessionInput, 'agent'> & { agent: CliAgent };
+
 /** The argv a session is launched with (exported so tests and `research export` can print it). */
-export function sessionArgs(input: SessionInput): { cmd: string; args: string[]; stdin: string; outFile?: string } {
-  const cmd = cliCommand(input.provider, input.cliPath);
+export function sessionArgs(input: CliSessionInput): { cmd: string; args: string[]; stdin: string; outFile?: string } {
+  const { provider, cliPath, model } = input.agent;
+  const cmd = cliCommand(provider, cliPath);
   const files = input.files !== false;
   const web = Boolean(input.allowNetwork);
   const agents = input.agents?.length ? input.agents : null;
-  const effort = effortFor(input.provider, input.effort);
-  if (input.provider === 'claude-cli') {
+  const effort = effortFor(provider, input.effort);
+  if (provider === 'claude-cli') {
     const allowed = [
       ...(input.tools === 'write' ? ['mcp__knode-os__*'] : READ_TOOLS),
       ...(files ? ['Read', 'Grep', 'Glob'] : []),
@@ -243,12 +326,12 @@ export function sessionArgs(input: SessionInput): { cmd: string; args: string[];
         ...(effort ? ['--effort', effort] : []),
         ...(agents ? ['--agents', claudeAgentsJson(agents)] : []),
         ...input.readDirs.flatMap((d) => ['--add-dir', d]),
-        ...(input.model ? ['--model', input.model] : []),
+        ...(model ? ['--model', model] : []),
       ],
       stdin: input.prompt,
     };
   }
-  if (input.provider === 'codex-cli') {
+  if (provider === 'codex-cli') {
     const outFile = path.join(input.cwd, `result-${input.label}.txt`);
     const agentArgs = agents
       ? [
@@ -271,36 +354,89 @@ export function sessionArgs(input: SessionInput): { cmd: string; args: string[];
         ...(effort ? ['-c', `model_reasoning_effort=${tomlString(effort)}`] : []),
         ...agentArgs,
         '--output-last-message', outFile,
-        ...(input.model ? ['-m', input.model] : []),
+        ...(model ? ['-m', model] : []),
       ],
       stdin: input.prompt,
       outFile,
     };
   }
-  const model = cursorModel(input.model, input.effort);
-  return {
-    cmd,
-    args: [
-      '-p', '--output-format', 'stream-json', '--trust', '--approve-mcps',
-      '--workspace', input.cwd,
-      ...input.readDirs.flatMap((d) => ['--add-dir', d]),
-      ...(model ? ['--model', model] : []),
-      input.prompt,
-    ],
-    stdin: '',
-  };
+  if (provider === 'cursor-cli') {
+    const withEffort = cursorModel(model, input.effort);
+    return {
+      cmd,
+      args: [
+        '-p', '--output-format', 'stream-json', '--trust', '--approve-mcps',
+        '--workspace', input.cwd,
+        ...input.readDirs.flatMap((d) => ['--add-dir', d]),
+        ...(withEffort ? ['--model', withEffort] : []),
+        input.prompt,
+      ],
+      stdin: '',
+    };
+  }
+  // every CLI is spelled out above, so a new one is a compile error rather than a cursor session
+  throw new Error(`no launch recipe for ${String(provider satisfies never)}`);
 }
 
-/** One CLI session: prompt in, final message out, transcript on disk. */
+/** Transcript and stderr paths for a session — shared so the executors and the chat poller cannot drift. */
+export function transcriptPathFor(cwd: string, label: string): string {
+  return path.join(cwd, label === 'agent' ? 'transcript.jsonl' : `transcript-${label}.jsonl`);
+}
+
+export function stderrPathFor(cwd: string, label: string): string {
+  return path.join(cwd, label === 'agent' ? 'stderr.log' : `stderr-${label}.log`);
+}
+
+/**
+ * One session: prompt in, final message out, transcript on disk. Dispatches on
+ * the agent kind — a CLI is spawned as a process, the built-in agent runs an
+ * agent loop in this process.
+ */
 export async function launchSession(input: SessionInput): Promise<SessionResult> {
+  if (cancelledJobs.has(input.jobId)) throw new JobCancelledError(input.jobId);
+  if (input.agent.kind === 'builtin') {
+    const { runBuiltinSession } = await loadBuiltin();
+    return runBuiltinSession({ ...input, agent: input.agent });
+  }
+  return launchCliSession({ ...input, agent: input.agent });
+}
+
+/**
+ * The LangChain stack is loaded only when a built-in session actually runs, so
+ * a CLI-only install never pays for it at startup. It is a regular dependency,
+ * so a failure here means a pruned or broken install — say which module and
+ * what to do, rather than surfacing a bare module specifier.
+ */
+async function loadBuiltin(): Promise<typeof import('./deepagents.js')> {
+  try {
+    return await import('./deepagents.js');
+  } catch (err) {
+    const missing = /Cannot find (?:package|module) '([^']+)'/.exec(err instanceof Error ? err.message : '')?.[1];
+    throw new Error(
+      `the built-in research agent is unavailable${missing ? ` — ${missing} is not installed` : ''}: reinstall dependencies, or pick a CLI agent in Settings → Deep research`,
+    );
+  }
+}
+
+/** Whether the built-in executor can run here (its packages are installed). */
+export async function builtinAvailable(): Promise<boolean> {
+  if (builtinOk === null) builtinOk = loadBuiltin().then(() => true, () => false);
+  return builtinOk;
+}
+
+let builtinOk: Promise<boolean> | null = null;
+
+async function launchCliSession(input: CliSessionInput): Promise<SessionResult> {
+  const { provider } = input.agent;
   const { cmd, args, stdin, outFile } = sessionArgs(input);
   if (!resolveExecutable(cmd)) throw new Error(`${cmd} CLI not found — install it or set cliPath for the research agent`);
-  if (input.provider === 'codex-cli' && input.agents?.length) writeCodexAgentLayers(input.cwd, input.agents, input.webFreshness);
-  const transcriptPath = path.join(input.cwd, input.label === 'agent' ? 'transcript.jsonl' : `transcript-${input.label}.jsonl`);
-  const stderrPath = path.join(input.cwd, input.label === 'agent' ? 'stderr.log' : `stderr-${input.label}.log`);
+  if (provider === 'codex-cli' && input.agents?.length) writeCodexAgentLayers(input.cwd, input.agents, input.webFreshness);
+  const transcriptPath = transcriptPathFor(input.cwd, input.label);
+  const stderrPath = stderrPathFor(input.cwd, input.label);
   const out = fs.openSync(transcriptPath, 'w');
   const errOut = fs.openSync(stderrPath, 'w');
-  let child: ChildProcess | null = null;
+  // a no-op default: the assignment happens inside onSpawn, which TS's flow analysis cannot see
+  let unregister = () => {};
   let res: { code: number; stdout: string; stderr: string };
   try {
     res = await runProcess(cmd, args, stdin, input.timeoutMs, {
@@ -309,18 +445,19 @@ export async function launchSession(input: SessionInput): Promise<SessionResult>
       onStdout: (chunk) => fs.writeSync(out, chunk),
       onStderr: (chunk) => fs.writeSync(errOut, chunk),
       onSpawn: (c) => {
-        child = c;
-        active.add(c);
+        unregister = registerSession(input.jobId, processSession(c));
       },
     });
   } finally {
     fs.closeSync(out);
     fs.closeSync(errOut);
-    if (child) active.delete(child);
+    unregister();
   }
+  // a killed session exits like any other; the flag says why
+  if (cancelledJobs.has(input.jobId)) throw new JobCancelledError(input.jobId);
 
   const result: SessionResult = { text: '', turns: null, costUsd: null, error: null, exitCode: res.code, transcriptPath };
-  if (input.provider === 'claude-cli') {
+  if (provider === 'claude-cli') {
     for (const line of res.stdout.split('\n')) {
       if (!line.trim()) continue;
       try {
@@ -336,7 +473,7 @@ export async function launchSession(input: SessionInput): Promise<SessionResult>
       }
     }
     if (res.code !== 0 && !result.error) result.error = `claude exited with code ${res.code}: ${(res.stderr || res.stdout).trim().slice(0, 300)}`;
-  } else if (input.provider === 'codex-cli') {
+  } else if (provider === 'codex-cli') {
     result.text = outFile && fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8').trim() : '';
     if (res.code !== 0) result.error = `codex exec exited with code ${res.code}: ${(res.stderr || res.stdout).trim().slice(0, 300)}`;
   } else {
@@ -348,13 +485,13 @@ export async function launchSession(input: SessionInput): Promise<SessionResult>
 }
 
 /** The argv of the single-session run (kept for `research export`). */
-export function launchArgs(input: LaunchInput): { cmd: string; args: string[]; stdin: string; outFile?: string } {
-  return sessionArgs({ ...sessionFrom(input), prompt: fs.readFileSync(input.ws.briefPath, 'utf8') });
+export function launchArgs(input: LaunchInput & { agent: CliAgent }): { cmd: string; args: string[]; stdin: string; outFile?: string } {
+  return sessionArgs({ ...sessionFrom(input), agent: input.agent, prompt: fs.readFileSync(input.ws.briefPath, 'utf8') });
 }
 
 function sessionFrom(input: LaunchInput): Omit<SessionInput, 'prompt'> {
   return {
-    provider: input.provider, cliPath: input.cliPath, model: input.model, maxTurns: input.maxTurns, timeoutMs: input.timeoutMs,
+    agent: input.agent, maxTurns: input.maxTurns, timeoutMs: input.timeoutMs,
     cwd: input.ws.dir, mcp: input.mcp, readDirs: input.readDirs, jobId: input.jobId, outputPath: input.ws.outputPath,
     worksetId: input.ws.worksetId, allowNetwork: input.allowNetwork, tools: 'write', label: 'agent',
     effort: input.effort, webFreshness: input.webFreshness, agents: input.agents,

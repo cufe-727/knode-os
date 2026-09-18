@@ -408,6 +408,7 @@ struct SettingsView: View {
         if config != nil {
             ResearchSettingsSection(
                 research: binding(\.research),
+                chat: binding(\.chat),
                 profile: $profileDraft,
                 dirty: $profileDirty,
                 profileSelection: researchProfileBinding,
@@ -712,6 +713,13 @@ struct SettingsView: View {
             config = normalized(try await model.client().config())
             if let tools = try? await model.client().cliTools() {
                 cliTools = Dictionary(tools.tools.map { ($0.provider, $0) }, uniquingKeysWith: { first, _ in first })
+            }
+            // With no agent configured, pre-fill what the service says can run
+            // here. Only a pre-fill — nothing is saved until Save is pressed, so
+            // "not configured" never quietly becomes a setting nobody chose.
+            if config?.research.agent.isEmpty == true,
+               let suggested = (try? await model.client().availableAgents())?.suggested {
+                config?.research.agent = suggested
             }
             await loadProfiles()
             statusMessage = ""

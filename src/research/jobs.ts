@@ -80,7 +80,8 @@ export interface QueueJobInput {
 export async function queueJob(store: Store, input: QueueJobInput): Promise<{ job: ResearchJob; created: boolean }> {
   const target = input.target?.trim() || null;
   const query = input.query?.trim() || null;
-  if (!target && !query) throw new Error('a research job needs a target (entity / concept / page) or a query');
+  // an initialization is about the whole base: no target, one at a time
+  if (!target && !query && input.kind !== 'init') throw new Error('a research job needs a target (entity / concept / page) or a query');
   const template = input.template?.trim() || input.kind;
   const [dup] = await store.query<Row>(
     `SELECT ${COLS} FROM research_jobs
@@ -103,16 +104,31 @@ export async function getJob(store: Store, id: string): Promise<ResearchJob | nu
   return row ? project(row) : null;
 }
 
-export async function listJobs(store: Store, opts: { status?: ResearchStatus | ResearchStatus[]; limit?: number } = {}): Promise<ResearchJob[]> {
+export async function listJobs(store: Store, opts: { status?: ResearchStatus | ResearchStatus[]; kind?: ResearchKind; requestedBy?: string; limit?: number } = {}): Promise<ResearchJob[]> {
   const statuses = opts.status ? (Array.isArray(opts.status) ? opts.status : [opts.status]) : null;
   const params: unknown[] = [];
-  let where = '';
+  const conds: string[] = [];
   if (statuses?.length) {
-    where = `WHERE status IN (${statuses.map((s) => { params.push(s); return `$${params.length}`; }).join(',')})`;
+    conds.push(`status IN (${statuses.map((s) => { params.push(s); return `$${params.length}`; }).join(',')})`);
+  }
+  if (opts.kind) {
+    params.push(opts.kind);
+    conds.push(`kind = $${params.length}`);
+  }
+  if (opts.requestedBy) {
+    params.push(opts.requestedBy);
+    conds.push(`requested_by = $${params.length}`);
   }
   params.push(opts.limit ?? 100);
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const rows = await store.query<Row>(`SELECT ${COLS} FROM research_jobs ${where} ORDER BY created_at DESC LIMIT $${params.length}`, params);
   return rows.map(project);
+}
+
+/** The newest job of a kind, whatever its status (the initialization card shows it). */
+export async function latestJob(store: Store, kind: ResearchKind): Promise<ResearchJob | null> {
+  const [row] = await store.query<Row>(`SELECT ${COLS} FROM research_jobs WHERE kind = $1 ORDER BY created_at DESC LIMIT 1`, [kind]);
+  return row ? project(row) : null;
 }
 
 export async function updateJob(store: Store, id: string, patch: Partial<{

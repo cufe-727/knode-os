@@ -2,13 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { AppContext } from '../context.js';
 import { safePath } from '../fs/files.js';
-import { ResearchAgent } from './agent.js';
-import { ResearchJob } from './jobs.js';
-import { LaunchResult, launchSession, SessionResult } from './launch.js';
+import { ResearchAgent, withModel } from './agent.js';
+import { getJob, ResearchJob } from './jobs.js';
+import { isCancelled, JobCancelledError, LaunchResult, launchSession, SessionResult } from './launch.js';
 import { effectiveEffort, NativeAgentSpec, requiredSections, ResearchProfile, ResearchRole, rolePrompt, rolesFor, webAllowed } from './profile.js';
-import { loadPhasePrompt, PhaseName, ResearchTemplate, researchSlug } from './templates.js';
+import { loadPhasePrompt, PhaseName, ResearchTemplate, researchSlug, subjectOf } from './templates.js';
 import { McpEndpoint, RunWorkspace } from './workspace.js';
-import { validateResearchPage } from './validate.js';
+import { validateCompanions, validateResearchPage } from './validate.js';
 
 /**
  * The team pipeline (pipeline = "team") — deep research as a small
@@ -49,6 +49,8 @@ export interface PipelineResult extends LaunchResult {
   phases: PhaseRecord[];
   sections: string[];
   reviewRounds: number;
+  /** The planner's raw reply (an init job's topics are read from it). */
+  planText: string;
 }
 
 export interface PipelineInput {
@@ -121,6 +123,24 @@ export function outlineFrom(text: string, required: string[], subject: string, m
   return sections.slice(0, Math.max(1, maxSections));
 }
 
+/** A cancelled job (in this process, or by another process flipping the row) launches nothing more. */
+async function assertNotCancelled(ctx: AppContext, jobId: string): Promise<void> {
+  if (isCancelled(jobId)) throw new JobCancelledError(jobId);
+  const row = await getJob(ctx.store, jobId);
+  if (row?.status === 'cancelled') throw new JobCancelledError(jobId);
+}
+
+/** The template's companion files (an init job's guide), for a critic's or reviser's prompt. */
+function companionsText(ctx: AppContext, ws: RunWorkspace, cap = 20_000): string {
+  const parts: string[] = [];
+  for (const c of ws.companions ?? []) {
+    const abs = safePath(ctx.dataDir, c.path);
+    const text = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
+    parts.push(`# 当前附加输出（${c.path}）\n\n${text ? text.slice(0, cap) : `（尚未写入 ${c.path}）`}`);
+  }
+  return parts.join('\n\n');
+}
+
 async function pool<T, R>(items: T[], size: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length);
   let next = 0;
@@ -139,8 +159,7 @@ async function pool<T, R>(items: T[], size: number, fn: (item: T, index: number)
 export function roleAgent(role: ResearchRole, input: Pick<PipelineInput, 'agent' | 'agentFor' | 'log' | 'job'>): ResearchAgent {
   const own = role.agent ? input.agentFor(role.agent, role.model) : null;
   if (role.agent && !own) input.log(`research ${input.job.id}: role ${role.id} names unknown agent "${role.agent}" — using ${input.agent.provider}`);
-  const agent = own ?? input.agent;
-  return role.model ? { ...agent, model: role.model } : agent;
+  return withModel(own ?? input.agent, role.model);
 }
 
 interface Sessions {
@@ -157,14 +176,13 @@ function sessions(ctx: AppContext, input: PipelineInput): Sessions {
   const phases: PhaseRecord[] = [];
   const totals = { turns: 0, cost: 0 };
   const run: Sessions['run'] = async (role, name, label, prompt, opts = {}) => {
+    await assertNotCancelled(ctx, job.id);
     const agent = roleAgent(role, input);
     const turns = opts.turns ?? (role.maxTurns || defaultTurns);
     const t0 = Date.now();
     log(`research ${job.id}: ${label} (${role.id} on ${agent.provider}${agent.model ? ` ${agent.model}` : ''}, ≤${turns} turns)`);
     const r = await launchSession({
-      provider: agent.provider,
-      cliPath: agent.cliPath,
-      model: agent.model,
+      agent,
       maxTurns: turns,
       timeoutMs: research?.timeoutMs ?? 1_200_000,
       cwd: ws.dir,
@@ -174,7 +192,7 @@ function sessions(ctx: AppContext, input: PipelineInput): Sessions {
       jobId: job.id,
       outputPath: ws.outputPath,
       worksetId: ws.worksetId,
-      allowNetwork: webAllowed({ gate: input.webGate, kind: job.kind, profile, role }),
+      allowNetwork: webAllowed({ gate: input.webGate, kind: job.kind, profile, role, agent }),
       tools: role.tools.write ? 'write' : 'read',
       files: role.tools.files,
       effort: effectiveEffort(profile, role),
@@ -196,7 +214,7 @@ function baseVars(input: PipelineInput, defaultTurns: number): Record<string, st
   return {
     output: ws.outputPath,
     workset: ws.worksetId,
-    target: job.target ?? job.query ?? '',
+    target: subjectOf(job),
     maxTurns: String(Math.min(12, defaultTurns)),
     searchRounds: String(profile.search.maxRounds),
     maxSections: String(profile.stop.maxSections),
@@ -207,16 +225,17 @@ export async function runTeamPipeline(ctx: AppContext, input: PipelineInput): Pr
   const { job, template, ws, profile, log } = input;
   const research = ctx.config.research;
   const brief = fs.readFileSync(ws.briefPath, 'utf8');
-  const subject = job.target ?? job.query ?? '';
+  const subject = subjectOf(job);
   const S = sessions(ctx, input);
   const vars = baseVars(input, S.defaultTurns);
   const required = requiredSections(template, profile);
+  const phasePrompt = template.phases ?? {};
 
   /* ---- 1. plan ---- */
   const planner = rolesFor(profile, 'plan')[0] ?? null;
   let planText = '';
   if (planner) {
-    const plan = await S.run(planner, 'plan', 'plan', `${rolePrompt(ctx.dataDir, planner, vars)}\n\n---\n\n${brief}`, { turns: planner.maxTurns || Math.min(12, S.defaultTurns) });
+    const plan = await S.run(planner, 'plan', 'plan', `${rolePrompt(ctx.dataDir, planner, vars, phasePrompt.plan)}\n\n---\n\n${brief}`, { turns: planner.maxTurns || Math.min(12, S.defaultTurns) });
     planText = plan.text;
   } else {
     log(`research ${job.id}: no planner role in profile "${profile.name}" — outline is the template's required sections`);
@@ -238,7 +257,7 @@ export async function runTeamPipeline(ctx: AppContext, input: PipelineInput): Pr
         section: heading(section.title),
         questions: section.questions.map((q) => `- ${q}`).join('\n') || '- （按章节标题自行确定）',
         queries: section.queries.join('、') || subject,
-      });
+      }, phasePrompt.research);
       const r = await S.run(researcher, 'research', `research-${i + 1}`, `${prompt}\n\n---\n\n## 任务简报（供参考）\n\n${brief}`);
       const text = r.text.trim() || `（研究员 ${i + 1} 没有返回内容${r.error ? `：${r.error}` : ''}）`;
       const file = path.join(findingsDir, `${String(i + 1).padStart(2, '0')}-${researchSlug(heading(section.title)) || 'section'}.md`);
@@ -257,7 +276,7 @@ export async function runTeamPipeline(ctx: AppContext, input: PipelineInput): Pr
     ? findings.map((f) => `### 研究员发现（${f.role}）：${heading(f.section.title)}\n\n${f.text}`).join('\n\n')
     : `（本 profile 没有研究员：请自行用 knode_search / knode_graph_search / knode_claims 逐节取证——章节：${sections.map((s) => heading(s.title)).join('、')}——然后写页）`;
   if (findingsText.length > budget) findingsText = findingsText.slice(0, budget) + '\n\n（发现过长，已截断）';
-  const synthRes = await S.run(synth, 'synthesize', 'synthesize', `${rolePrompt(ctx.dataDir, synth, vars)}\n\n---\n\n${brief}\n\n---\n\n# 研究员发现\n\n${findingsText}`);
+  const synthRes = await S.run(synth, 'synthesize', 'synthesize', `${rolePrompt(ctx.dataDir, synth, vars, phasePrompt.synthesize)}\n\n---\n\n${brief}\n\n---\n\n# 研究员发现\n\n${findingsText}`);
   let lastError = synthRes.error;
 
   /* ---- 4/5. review → revise ---- */
@@ -271,11 +290,13 @@ export async function runTeamPipeline(ctx: AppContext, input: PipelineInput): Pr
     const abs = safePath(ctx.dataDir, ws.outputPath);
     const pageText = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
     const report = await validateResearchPage(ctx, { job, template, ws, profile });
-    const issues: string[] = [...report.errors];
+    const companionReport = validateCompanions(ctx, ws);
+    const issues: string[] = [...report.errors, ...companionReport.errors];
+    const extra = (ws.companions ?? []).length ? `\n\n---\n\n${companionsText(ctx, ws)}` : '';
     if (pageText) {
       for (const critic of critics) {
         const label = critics.length > 1 ? `review-${round + 1}-${critic.id}` : `review-${round + 1}`;
-        const review = await S.run(critic, 'review', label, `${rolePrompt(ctx.dataDir, critic, vars)}\n\n---\n\n${brief}\n\n---\n\n# 当前页面\n\n${pageText.slice(0, 40_000)}`, {
+        const review = await S.run(critic, 'review', label, `${rolePrompt(ctx.dataDir, critic, vars, phasePrompt.review)}\n\n---\n\n${brief}\n\n---\n\n# 当前页面\n\n${pageText.slice(0, 40_000)}${extra}`, {
           turns: critic.maxTurns || Math.min(12, S.defaultTurns),
         });
         const verdict = extractJson<{ pass?: unknown; issues?: unknown; summary?: unknown }>(review.text);
@@ -297,7 +318,10 @@ export async function runTeamPipeline(ctx: AppContext, input: PipelineInput): Pr
       break;
     }
     const reviser = revisers[0];
-    const revise = await S.run(reviser, 'revise', `revise-${round + 1}`, `${rolePrompt(ctx.dataDir, reviser, { ...vars, issues: issues.map((x) => `- ${x}`).join('\n') })}\n\n---\n\n${brief}`);
+    const companionNote = (ws.companions ?? []).length
+      ? `\n\n本任务还有附加输出文件：${ws.companions.map((c) => `\`${c.path}\``).join('、')}（用 knode_read 读取当前内容；涉及它们的问题同样用 knode_write 写回同一路径）。`
+      : '';
+    const revise = await S.run(reviser, 'revise', `revise-${round + 1}`, `${rolePrompt(ctx.dataDir, reviser, { ...vars, issues: issues.map((x) => `- ${x}`).join('\n') }, phasePrompt.revise)}${companionNote}\n\n---\n\n${brief}`);
     if (revise.error) lastError = revise.error;
   }
 
@@ -311,12 +335,13 @@ export async function runTeamPipeline(ctx: AppContext, input: PipelineInput): Pr
     phases: S.phases,
     sections: sections.map((s) => s.title),
     reviewRounds,
+    planText,
   };
 }
 
 /** The sub-agent definitions handed to the CLI in native mode: enabled roles marked `native`, never the writer itself. */
 export function nativeAgentSpecs(ctx: AppContext, input: PipelineInput, vars: Record<string, string>): NativeAgentSpec[] {
-  const { profile } = input;
+  const { profile, template } = input;
   const delegated = '（由主管在任务中给出）';
   return profile.roles
     .filter((r) => r.enabled && r.native && r.phase !== 'synthesize' && r.phase !== 'revise')
@@ -324,10 +349,10 @@ export function nativeAgentSpecs(ctx: AppContext, input: PipelineInput, vars: Re
       id: r.id,
       title: r.title,
       description: r.description || r.title,
-      prompt: rolePrompt(ctx.dataDir, r, { ...vars, section: delegated, questions: delegated, queries: delegated, issues: delegated }),
+      prompt: rolePrompt(ctx.dataDir, r, { ...vars, section: delegated, questions: delegated, queries: delegated, issues: delegated }, template.phases?.[r.phase]),
       write: false,
       files: r.tools.files,
-      web: webAllowed({ gate: input.webGate, kind: input.job.kind, profile, role: r }),
+      web: webAllowed({ gate: input.webGate, kind: input.job.kind, profile, role: r, agent: input.agent }),
       model: r.model,
       effort: effectiveEffort(profile, r),
     }));
@@ -346,7 +371,7 @@ export async function runNativePipeline(ctx: AppContext, input: PipelineInput): 
   const agent = roleAgent(orchestrator, input);
   let agents = nativeAgentSpecs(ctx, input, vars);
   let prompt = brief;
-  if (agent.provider === 'cursor-cli') {
+  if (agent.kind === 'cli' && agent.provider === 'cursor-cli') {
     log(`research ${job.id}: cursor-agent has no sub-agent definitions — running one session`);
     agents = [];
   } else if (agents.length === 0) {
@@ -366,5 +391,6 @@ export async function runNativePipeline(ctx: AppContext, input: PipelineInput): 
     phases: S.phases,
     sections: [],
     reviewRounds: 0,
+    planText: '',
   };
 }

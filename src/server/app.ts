@@ -15,10 +15,10 @@ import {
   redactConfig,
   resolveRoutedLlmConfig,
   llmProviderLabel,
-  saveConfig, ResearchConfig } from '../config.js';
+  saveConfig, ResearchConfig, ChatConfig } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
-import { assertWritablePath, grepFiles, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
+import { assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
 import { hasSidecarSegment, SIDECAR_ROOT } from '../fs/layout.js';
 import { moveSidecar } from '../fs/sidecar.js';
 import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
@@ -28,6 +28,8 @@ import { applySuggestion } from '../pack/learn.js';
 import { createEmbeddingProvider } from '../ingest/embeddings.js';
 import { LlmClient } from '../llm/client.js';
 import { cliToolStatus, listChatModels, listEmbeddingModels } from '../llm/models.js';
+import { agentForSpec } from '../research/agent.js';
+import { availableAgents, suggestResearchAgent } from '../research/executors.js';
 import { sync } from '../ingest/sync.js';
 import { historyOf, lineageOf } from '../lineage/inspect.js';
 import { forgetSource, purgeArchived, purgeDisposed } from '../lineage/purge.js';
@@ -69,10 +71,16 @@ import { loadOrCreateMcpToken, mountMcp } from './mcp-http.js';
 import { applyMerge, listMerges, unmergeEntity } from '../graph/merge.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { reviewClaims } from '../graph/claim-review.js';
-import { cancelJob, getJob, listJobs, queueJob, retryJob, ResearchStatus } from '../research/jobs.js';
+import { cancelJob, getJob, latestJob, listJobs, queueJob, retryJob, ResearchStatus } from '../research/jobs.js';
+import { killAgentsFor } from '../research/launch.js';
 import { loadResearchTemplates, PHASES, RESEARCH_KINDS, ResearchKind } from '../research/templates.js';
-import { activeProfile, BUILTIN_PROFILES, deleteProfile, effectivePipeline, isValidProfileName, loadProfile, loadProfiles, PIPELINE_MODES, profileSummary, ResearchProfile, rolePromptText, saveProfile, writeRolePrompt } from '../research/profile.js';
-import { runsRoot } from '../research/workspace.js';
+import { activeProfile, BUILTIN_PROFILES, deleteProfile, EFFORTS, effectivePipeline, isValidProfileName, loadProfile, loadProfiles, PIPELINE_MODES, profileSummary, ResearchProfile, rolePromptText, saveProfile, writeRolePrompt } from '../research/profile.js';
+import { surveyKnowledgeBase } from '../research/survey.js';
+import { cancelChatTurn, chatActivity, ChatBusyError, isChatRunning, removeChatWorkspace, resolveChatAgent, startChatTurn } from '../chat/runner.js';
+import { createConversation, deleteConversation, getConversation, listConversations } from '../chat/store.js';
+import { CHAT_PROTOCOL_FILE, loadChatProtocol, saveChatProtocol } from '../chat/templates.js';
+import { CHAT_DIR } from '../fs/layout.js';
+import { McpEndpoint, runsRoot } from '../research/workspace.js';
 import { recommendWikiTopics, refreshRecommendations } from '../research/recommend.js';
 import { lintWiki } from '../wiki/lint.js';
 
@@ -101,8 +109,19 @@ type ModelConfigDraft = {
   connections?: Partial<LlmConnection>[];
   extraction?: ExtractionConfigDraft;
   retrieval?: { sag?: Partial<SagSearchConfig> };
-  research?: Partial<Omit<ResearchConfig, 'auto'>> & { auto?: Partial<ResearchConfig['auto']> };
+  research?: Partial<Omit<ResearchConfig, 'auto' | 'init'>> & { auto?: Partial<ResearchConfig['auto']>; init?: Partial<ResearchConfig['init']> };
+  chat?: Partial<ChatConfig>;
 };
+
+/** What `serve` runs per workspace beside the routes; absent in tests and CLI-hosted apps. */
+export interface WorkspaceServices {
+  /** The MCP endpoint agents launched for this workspace attach to (null until the server listens). */
+  mcp: () => McpEndpoint | null;
+  /** Claim queued research now instead of at the next tick. */
+  kickResearch: () => void;
+  /** Register a background promise so shutdown waits for it. */
+  track: <T>(job: Promise<T>) => Promise<T>;
+}
 
 /**
  * Paths the workspace is built from: a client may create and delete things
@@ -119,7 +138,14 @@ const PROTECTED_PATHS = new Set([
   'purpose.md',
   'schema.md',
   'knode.config.json',
+  'AGENTS.md',
+  'CLAUDE.md',
 ]);
+
+/** A root path is protected however it is spelled (`wiki/..` resolves to the root too). */
+function isProtectedPath(rel: string): boolean {
+  return PROTECTED_PATHS.has(cleanRelPath(rel)) || PROTECTED_PATHS.has(rel);
+}
 
 const LLM_PROVIDERS: LlmProvider[] = ['openai', 'codex-cli', 'claude-cli', 'cursor-cli'];
 const EMBEDDING_PROVIDERS: EmbeddingConfig['provider'][] = ['openai', 'ark-multimodal', 'local'];
@@ -196,9 +222,11 @@ export function createApp(
   rootCtx: AppContext,
   log: (msg: string) => void = console.log,
   workspaceContexts = new WorkspaceContextRegistry(rootCtx.dataDir, { templateConfig: rootCtx.config }),
+  opts: { services?: (ctx: AppContext) => WorkspaceServices | null } = {},
 ) {
   const app = new Hono<AppEnv>();
   const ingestRunning = new Set<string>();
+  const servicesFor = (ctx: AppContext): WorkspaceServices | null => opts.services?.(ctx) ?? null;
 
   const err = (e: unknown) => ({ error: e instanceof Error ? e.message : String(e) });
   /** 400 for a request the caller can fix (a bad time window, an unknown kind), 500 otherwise. */
@@ -367,6 +395,15 @@ export function createApp(
   // this to keep the executable field out of the way when it is redundant.
   app.get('/api/config/cli-tools', (c) => c.json({ tools: cliToolStatus() }));
 
+  // Which executors can actually run here, and which one to preselect when
+  // `research.agent` is still empty. Both clients read this instead of each
+  // working out its own preference order.
+  app.get('/api/config/agents', async (c) => {
+    const ctx = requestCtx(c);
+    const agents = await availableAgents(ctx.config);
+    return c.json({ agents, suggested: suggestResearchAgent(ctx.config, agents) });
+  });
+
   // Persist + hot-apply embedding/llm config. Re-embeds the corpus when the
   // embedding provider/model/dimensions changed.
   app.put('/api/config', async (c) => {
@@ -419,7 +456,13 @@ export function createApp(
       if (incoming.research) {
         const r = incoming.research;
         const cur = next.research;
-        if (typeof r.agent === 'string') cur.agent = r.agent.trim();
+        if (typeof r.agent === 'string') {
+          const spec = r.agent.trim();
+          // '' is legal (not configured); anything else has to resolve, or the
+          // queue would stall with nothing but a log line to show for it
+          if (spec && !agentForSpec(next, spec)) return c.json({ error: `unknown research agent "${spec}"` }, 400);
+          cur.agent = spec;
+        }
         if (typeof r.model === 'string') cur.model = r.model.trim();
         if (typeof r.profile === 'string' && isValidProfileName(r.profile.trim())) cur.profile = r.profile.trim();
         if (typeof r.pipeline === 'string' && (PIPELINE_MODES as readonly string[]).includes(r.pipeline)) cur.pipeline = r.pipeline as ResearchConfig['pipeline'];
@@ -438,6 +481,34 @@ export function createApp(
           const daily = Number(r.auto.dailyJobs);
           if (r.auto.dailyJobs !== undefined && Number.isFinite(daily)) cur.auto.dailyJobs = Math.min(50, Math.max(1, Math.floor(daily)));
         }
+        if (r.init) {
+          cur.init = { ...cur.init };
+          const followUps = Number(r.init.followUps);
+          if (r.init.followUps !== undefined && Number.isFinite(followUps)) cur.init.followUps = Math.min(20, Math.max(0, Math.floor(followUps)));
+          if (r.init.extraction === 'drain' || r.init.extraction === 'skip') cur.init.extraction = r.init.extraction;
+          const maxMs = Number(r.init.extractionMaxMs);
+          if (r.init.extractionMaxMs !== undefined && Number.isFinite(maxMs)) cur.init.extractionMaxMs = Math.min(3_600_000, Math.max(60_000, Math.floor(maxMs)));
+        }
+      }
+      if (incoming.chat) {
+        const ch = incoming.chat;
+        const cur = next.chat;
+        if (typeof ch.agent === 'string') {
+          const spec = ch.agent.trim();
+          if (spec && !agentForSpec(next, spec)) return c.json({ error: `unknown chat agent "${spec}"` }, 400);
+          cur.agent = spec;
+        }
+        if (typeof ch.model === 'string') cur.model = ch.model.trim();
+        if (typeof ch.effort === 'string' && (EFFORTS as readonly string[]).includes(ch.effort)) cur.effort = ch.effort as ChatConfig['effort'];
+        if (ch.web === 'inherit' || ch.web === 'on' || ch.web === 'off') cur.web = ch.web;
+        const setInt = (key: 'maxTurns' | 'timeoutMs' | 'historyTurns' | 'keep', min: number, max: number) => {
+          const value = Number(ch[key]);
+          if (ch[key] !== undefined && Number.isFinite(value)) cur[key] = Math.min(max, Math.max(min, Math.floor(value)));
+        };
+        setInt('maxTurns', 1, 200);
+        setInt('timeoutMs', 60_000, 2 * 3_600_000);
+        setInt('historyTurns', 0, 50);
+        setInt('keep', 1, 500);
       }
       if (incoming.retrieval?.sag) {
         const sag = incoming.retrieval.sag;
@@ -497,6 +568,16 @@ export function createApp(
     const row = await knowledgeStats(ctx.store);
     const lastDream = await ctx.store.getMeta('last_dream');
     return c.json({ ...row, lastDream: lastDream ?? null, embeddingModel: ctx.embedder.model, llmModel: ctx.llm.enabled ? ctx.llm.label : null });
+  });
+
+  // the whole base in numbers: documents by folder, entities by type, predicates, claims, wiki pages, the guide
+  app.get('/api/survey', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      return c.json(await surveyKnowledgeBase(ctx));
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
   });
 
   /* ------------------------------- files -------------------------------- */
@@ -559,7 +640,7 @@ export function createApp(
     try {
       const p = c.req.query('path');
       if (!p) return c.json({ error: 'path required' }, 400);
-      if (PROTECTED_PATHS.has(p)) return c.json({ error: 'refusing to delete a root path' }, 400);
+      if (isProtectedPath(p)) return c.json({ error: 'refusing to delete a root path' }, 400);
       assertWritablePath(p);
       removePath(ctx.dataDir, p);
       // deleting a source is a dispose: everything it produced is reverted,
@@ -577,6 +658,8 @@ export function createApp(
       const { path: p } = await c.req.json<{ path: string }>();
       const rel = sanitizeRelativePath(p ?? '');
       if (!rel) return c.json({ error: 'path required' }, 400);
+      // a directory where the guide belongs would break every later read of it
+      if (isProtectedPath(rel) || isRootWritableFile(rel)) return c.json({ error: `${rel} is a file this workspace owns, not a directory` }, 400);
       assertWritablePath(rel);
       makeDir(ctx.dataDir, rel);
       return c.json({ ok: true, path: rel });
@@ -601,7 +684,7 @@ export function createApp(
       assertWritablePath(dst);
       // wiki/ and raw/docs/ are writable, which alone would let a rename walk
       // the whole tree away from under the workspace
-      if (PROTECTED_PATHS.has(src) || PROTECTED_PATHS.has(dst)) {
+      if (isProtectedPath(src) || isProtectedPath(dst)) {
         return c.json({ error: 'refusing to move a root path' }, 400);
       }
       if (src === dst) return c.json({ ok: true, from: src, to: dst });
@@ -717,7 +800,7 @@ export function createApp(
     try {
       const { path: p } = await c.req.json<{ path: string }>();
       if (!p) return c.json({ error: 'path required' }, 400);
-      assertWritablePath(p);
+      assertSourcePath(p);
       return c.json(await forgetSource(ctx, p));
     } catch (e) {
       return c.json(err(e), 400);
@@ -1245,6 +1328,33 @@ export function createApp(
       const kind = (body.kind ?? (body.query && !body.target ? 'question' : 'entity')) as ResearchKind;
       if (!RESEARCH_KINDS.includes(kind)) return c.json({ error: `kind must be one of ${RESEARCH_KINDS.join(', ')}` }, 400);
       const res = await queueJob(ctx.store, { kind, target: body.target, query: body.query, template: body.template, requestedBy: 'web' });
+      if (res.created) servicesFor(ctx)?.kickResearch();
+      return c.json(res, res.created ? 201 : 200);
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // Knowledge-base initialization: the survey, the guide, the newest init job and the pages it queued.
+  app.get('/api/research/init', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const [survey, job, followUps] = await Promise.all([
+        surveyKnowledgeBase(ctx),
+        latestJob(ctx.store, 'init'),
+        listJobs(ctx.store, { requestedBy: 'init', limit: 10 }),
+      ]);
+      return c.json({ survey, guide: survey.guide, job, followUps });
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
+  });
+
+  app.post('/api/research/init', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const res = await queueJob(ctx.store, { kind: 'init', requestedBy: 'web' });
+      if (res.created) servicesFor(ctx)?.kickResearch();
       return c.json(res, res.created ? 201 : 200);
     } catch (e) {
       return c.json(err(e), 400);
@@ -1368,26 +1478,137 @@ export function createApp(
     return c.json(out);
   });
 
+  // One job, with what the run directory knows while it is still running: phases so far, the plan (and an
+  // init job's topics), and — on request — the tail of one session's transcript (`log=1` = the main one,
+  // `log=<label>` = transcript-<label>.jsonl of a team phase).
   app.get('/api/research/jobs/:id', async (c) => {
     const ctx = requestCtx(c);
     const job = await getJob(ctx.store, c.req.param('id'));
     if (!job) return c.json({ error: 'no such job' }, 404);
-    let log: string | null = null;
-    if (c.req.query('log')) {
-      const file = path.join(runsRoot(ctx.dataDir, ctx.config.research?.runsDir ?? '.runs'), job.id, 'transcript.jsonl');
-      if (fs.existsSync(file)) {
-        const lines = fs.readFileSync(file, 'utf8').split('\n');
-        log = lines.slice(-200).join('\n');
+    const runDir = path.join(runsRoot(ctx.dataDir, ctx.config.research?.runsDir ?? '.runs'), job.id);
+    const readJson = (name: string): unknown => {
+      try {
+        return JSON.parse(fs.readFileSync(path.join(runDir, name), 'utf8'));
+      } catch {
+        return null;
       }
+    };
+    let log: string | null = null;
+    const wanted = c.req.query('log');
+    if (wanted) {
+      const label = wanted === '1' || wanted === 'agent' ? '' : /^[a-z0-9-]{1,40}$/i.test(wanted) ? wanted : null;
+      if (label === null) return c.json({ error: 'log must be 1 or a phase label (letters, digits, -)' }, 400);
+      const file = path.join(runDir, label ? `transcript-${label}.jsonl` : 'transcript.jsonl');
+      if (fs.existsSync(file)) log = fs.readFileSync(file, 'utf8').split('\n').slice(-200).join('\n');
     }
-    return c.json({ ...job, log });
+    const phases = Array.isArray(job.payload.phases) ? job.payload.phases : readJson('phases.json');
+    const plan = readJson('plan.json');
+    const transcripts = fs.existsSync(runDir)
+      ? fs.readdirSync(runDir).filter((f) => /^transcript(-.+)?\.jsonl$/.test(f)).map((f) => f.replace(/^transcript-?/, '').replace(/\.jsonl$/, '') || 'agent').sort()
+      : [];
+    return c.json({ ...job, log, phases: phases ?? [], plan, steps: Array.isArray(job.payload.steps) ? job.payload.steps : [], transcripts });
   });
 
-  app.post('/api/research/jobs/:id/cancel', async (c) => c.json({ cancelled: await cancelJob(requestCtx(c).store, c.req.param('id')) }));
+  // cancel flips the row and kills the job's running sessions in this process
+  app.post('/api/research/jobs/:id/cancel', async (c) => {
+    const id = c.req.param('id');
+    const cancelled = await cancelJob(requestCtx(c).store, id);
+    return c.json({ cancelled, killed: cancelled ? killAgentsFor(id) : 0 });
+  });
 
   app.post('/api/research/jobs/:id/retry', async (c) => {
     const job = await retryJob(requestCtx(c).store, c.req.param('id'));
     return job ? c.json(job) : c.json({ error: 'job is not in a retryable state' }, 400);
+  });
+
+  /* ------------------------------ chat ------------------------------------ */
+
+  app.get('/api/chat/conversations', async (c) => {
+    const ctx = requestCtx(c);
+    const limit = Number(c.req.query('limit'));
+    return c.json(await listConversations(ctx.store, { limit: Number.isFinite(limit) && limit > 0 ? Math.min(200, Math.floor(limit)) : undefined }));
+  });
+
+  app.post('/api/chat/conversations', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { title?: string };
+      const scope = c.get('workspaceScope');
+      return c.json(await createConversation(ctx.store, { title: body.title, createdBy: scope?.user ?? null }), 201);
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.get('/api/chat/conversations/:id', async (c) => {
+    const ctx = requestCtx(c);
+    const conversation = await getConversation(ctx.store, c.req.param('id'), { messages: true });
+    if (!conversation) return c.json({ error: 'no such conversation' }, 404);
+    return c.json({ ...conversation, running: isChatRunning(ctx, conversation.id) });
+  });
+
+  // A message starts a turn in the background: 202 with the user message's seq; poll /status until idle.
+  app.post('/api/chat/conversations/:id/messages', async (c) => {
+    const ctx = requestCtx(c);
+    const id = c.req.param('id');
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { text?: string };
+      const text = typeof body.text === 'string' ? body.text.trim() : '';
+      if (!text) return c.json({ error: 'text is required' }, 400);
+      if (!(await getConversation(ctx.store, id))) return c.json({ error: 'no such conversation' }, 404);
+      const services = servicesFor(ctx);
+      const mcp = services?.mcp() ?? null;
+      if (!mcp) return c.json({ error: 'chat needs the MCP endpoint `serve` hosts — start knode-os serve' }, 503);
+      if (!resolveChatAgent(ctx.config)) return c.json({ error: 'no chat agent configured: set chat.agent or research.agent (Settings → Deep research)' }, 503);
+      const { seq, turn } = await startChatTurn(ctx, id, text, { mcp, log });
+      const tracked = services ? services.track(turn) : turn;
+      tracked.catch((e) => log(`chat ${id}: turn failed: ${e instanceof Error ? e.message : e}`));
+      return c.json({ ok: true, seq, status: 'running' }, 202);
+    } catch (e) {
+      if (e instanceof ChatBusyError) return c.json({ error: e.message }, 409);
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.get('/api/chat/conversations/:id/status', async (c) => {
+    const ctx = requestCtx(c);
+    const id = c.req.param('id');
+    const conversation = await getConversation(ctx.store, id);
+    if (!conversation) return c.json({ error: 'no such conversation' }, 404);
+    const activity = chatActivity(ctx, id);
+    // the row says running until the turn's message lands; the in-process registry is the truth in this process
+    return c.json({ ...activity, status: activity.status === 'running' ? 'running' : conversation.status === 'running' && activity.status === 'idle' && !isChatRunning(ctx, id) ? 'idle' : activity.status, updatedAt: conversation.updatedAt });
+  });
+
+  app.post('/api/chat/conversations/:id/cancel', (c) => {
+    const ctx = requestCtx(c);
+    return c.json({ cancelled: cancelChatTurn(ctx, c.req.param('id')) });
+  });
+
+  app.delete('/api/chat/conversations/:id', async (c) => {
+    const ctx = requestCtx(c);
+    const id = c.req.param('id');
+    if (isChatRunning(ctx, id)) return c.json({ error: 'the conversation is answering — cancel it first' }, 409);
+    const removed = await deleteConversation(ctx.store, id);
+    if (!removed) return c.json({ error: 'no such conversation' }, 404);
+    removeChatWorkspace(ctx, id);
+    return c.json({ ok: true });
+  });
+
+  app.get('/api/chat/protocol', (c) => {
+    const ctx = requestCtx(c);
+    return c.json({ path: `${CHAT_DIR}/${CHAT_PROTOCOL_FILE}`, text: loadChatProtocol(ctx.dataDir) });
+  });
+
+  app.put('/api/chat/protocol', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { text?: string };
+      if (typeof body.text !== 'string' || !body.text.trim()) return c.json({ error: 'text is required' }, 400);
+      return c.json({ path: saveChatProtocol(ctx.dataDir, body.text), text: loadChatProtocol(ctx.dataDir) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
   });
 
   app.post('/api/dream', async (c) => {

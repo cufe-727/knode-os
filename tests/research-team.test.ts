@@ -33,7 +33,7 @@ let registry: WorkspaceContextRegistry;
 let ctx: AppContext;
 let httpServer: Server;
 let mcp: { url: string; token: string; headers: Record<string, string> };
-const agent = { provider: 'claude-cli' as const, cliPath: fakeClaude, model: '' };
+const agent = { kind: 'cli' as const, provider: 'claude-cli' as const, cliPath: fakeClaude, model: '' };
 
 beforeAll(async () => {
   rootCtx = await createContext(root);

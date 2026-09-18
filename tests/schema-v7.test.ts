@@ -14,8 +14,8 @@ describe('schema v7/v8 (wiki research + review)', () => {
     fs.mkdirSync(path.join(tmp, 'ws', '.knode'), { recursive: true });
     const store = await Store.open(path.join(tmp, 'ws'), 3);
     try {
-      expect(SCHEMA_VERSION).toBe(8);
-      expect(store.migration.to).toBe(8);
+      expect(SCHEMA_VERSION).toBe(9);
+      expect(store.migration.to).toBe(9);
       const columns = async (table: string) =>
         (await store.query<{ column_name: string }>(
           `SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1`,
@@ -29,6 +29,8 @@ describe('schema v7/v8 (wiki research + review)', () => {
       expect(await columns('entity_links')).toEqual(expect.arrayContaining(['entity_id', 'canonical_id', 'scope_id']));
       expect(await columns('entity_embeddings')).toEqual(expect.arrayContaining(['entity_id', 'fold_sha', 'embedding']));
       expect(await columns('research_jobs')).toEqual(expect.arrayContaining(['kind', 'template', 'status', 'output_path']));
+      expect(await columns('chat_conversations')).toEqual(expect.arrayContaining(['title', 'agent', 'status', 'payload']));
+      expect(await columns('chat_messages')).toEqual(expect.arrayContaining(['conversation_id', 'seq', 'role', 'content', 'events', 'turns', 'cost_usd', 'error']));
       for (const view of CATALOG_VIEWS) {
         await expect(store.query(`SELECT * FROM ${view.name} LIMIT 1`)).resolves.toBeDefined();
       }

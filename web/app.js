@@ -522,6 +522,8 @@ document.querySelectorAll('#tabs button').forEach((b) => {
     if (b.dataset.tab === 'traces') loadTraces();
     if (b.dataset.tab === 'dream') loadSuggestions();
     if (b.dataset.tab === 'wiki') loadResearch();
+    if (b.dataset.tab === 'chat') loadChat();
+    else stopChatPolling();
     if (b.dataset.tab === 'settings') loadConfigForm();
     if (b.dataset.tab === 'graph' && !graphState.loaded) loadGraph('');
   });
@@ -1423,7 +1425,7 @@ function wireOpenLinks(root) {
 }
 
 async function loadResearch() {
-  await Promise.all([loadResearchJobs(), loadResearchPages(), loadResearchRecommendations()]);
+  await Promise.all([loadInitCard(), loadResearchJobs(), loadResearchPages(), loadResearchRecommendations()]);
 }
 
 async function loadResearchJobs() {
@@ -1568,6 +1570,320 @@ $('#btn-dream').addEventListener('click', async () => {
     loadStats();
   } catch (e) {
     toast(`dream failed: ${e.message}`);
+  }
+});
+
+/* --------------------- wiki · initialize the knowledge base ------------- */
+
+const STEP_LABELS = { sync: 'Index the files', extract: 'Extract entities & claims', views: 'Regenerate stub pages', survey: 'Survey the base' };
+let initJobTimer = null;
+let initJobId = null;
+
+function stopInitPolling() {
+  clearTimeout(initJobTimer);
+  initJobTimer = null;
+}
+
+const jobIsLive = (status) => status === 'queued' || status === 'running' || status === 'validating';
+
+async function loadInitCard() {
+  const summary = $('#init-summary');
+  const button = $('#btn-init-kb');
+  try {
+    const { survey, guide, job } = await api('/api/research/init');
+    const s = survey.stats;
+    summary.textContent = `${s.documents} docs · ${survey.entities.total} entities · ${survey.relations.total} relations · ${s.claims} claims`
+      + (survey.extraction.queued ? ` · ${survey.extraction.queued} awaiting extraction` : '');
+    $('#init-guide').innerHTML = guide.exists
+      ? `guide <a href="#" data-open="AGENTS.md" class="mono">AGENTS.md</a>${guide.stamp?.at ? ` · ${esc(guide.stamp.at.slice(0, 10))}` : ''}`
+      : '<span class="muted">no guide yet</span>';
+    wireOpenLinks($('#init-guide'));
+    $('#init-title').textContent = guide.exists ? 'Re-initialize knowledge base' : 'Initialize knowledge base';
+    button.textContent = guide.exists ? '⟳ re-initialize' : '⚙ initialize';
+    button.disabled = Boolean(job && jobIsLive(job.status));
+    if (job) renderInitJob(job);
+    else $('#init-progress').hidden = true;
+    if (job && jobIsLive(job.status)) watchInitJob(job.id);
+    else stopInitPolling();
+    if (s.documents === 0) summary.textContent += ' — add documents under raw/docs first';
+  } catch (e) {
+    summary.textContent = `unavailable: ${e.message}`;
+  }
+}
+
+function renderInitJob(job) {
+  $('#init-progress').hidden = false;
+  const steps = job.steps ?? job.payload?.steps ?? [];
+  $('#init-steps').innerHTML = steps.map((s) => `<li data-status="${esc(s.status)}"><b>${esc(STEP_LABELS[s.name] ?? s.name)}</b><span>${esc(s.detail ?? s.status)}</span></li>`).join('')
+    || `<li data-status="running"><b>Starting…</b><span>${esc(job.status)}</span></li>`;
+  const phases = job.phases?.length ? job.phases : job.payload?.phases ?? [];
+  $('#init-phases').innerHTML = phases.length
+    ? `<span class="hint">agent</span>${phases.map((p) => `<span class="jstatus ${p.error ? 'failed' : 'done'}" title="${esc(p.role ?? '')}${p.error ? ` · ${esc(p.error)}` : ''}">${esc(p.label)}${p.turns ? ` · ${p.turns}t` : ''}</span>`).join('')}`
+    : '';
+  const topics = job.payload?.topics ?? [];
+  $('#init-topics').innerHTML = topics.length
+    ? `<span class="hint">follow-up pages</span>${topics.map((t) => `<span class="chat-chip">${esc(t.kind)} · ${esc(t.target)}${t.queued ? '' : ' (not queued)'}</span>`).join('')}`
+    : '';
+  $('#init-error').textContent = job.error ?? '';
+}
+
+function watchInitJob(id) {
+  stopInitPolling();
+  initJobId = id;
+  const tick = async () => {
+    if (initJobId !== id || !$('#tab-wiki').classList.contains('active')) return;
+    try {
+      const job = await api(`/api/research/jobs/${id}`);
+      renderInitJob(job);
+      if (jobIsLive(job.status)) {
+        initJobTimer = setTimeout(tick, 3000);
+      } else {
+        $('#btn-init-kb').disabled = false;
+        toast(job.status === 'done' ? 'knowledge base initialized' : `initialization ${job.status}`);
+        loadInitCard();
+        loadResearchJobs();
+        loadResearchPages();
+      }
+    } catch {
+      initJobTimer = setTimeout(tick, 5000);
+    }
+  };
+  initJobTimer = setTimeout(tick, 1500);
+}
+
+$('#btn-init-kb').addEventListener('click', async () => {
+  const button = $('#btn-init-kb');
+  button.disabled = true;
+  try {
+    const res = await api('/api/research/init', { method: 'POST' });
+    toast(res.created ? 'initialization queued' : `already queued: ${res.job.id}`);
+    $('#init-progress').hidden = false;
+    renderInitJob(res.job);
+    watchInitJob(res.job.id);
+    loadResearchJobs();
+  } catch (e) {
+    button.disabled = false;
+    toast(`could not start: ${e.message}`);
+  }
+});
+
+/* --------------------------------- chat -------------------------------- */
+
+let chatConversations = [];
+let chatActiveId = null;
+let chatPollTimer = null;
+
+function stopChatPolling() {
+  clearTimeout(chatPollTimer);
+  chatPollTimer = null;
+}
+
+async function loadChat() {
+  try {
+    chatConversations = await api('/api/chat/conversations?limit=50');
+  } catch (e) {
+    $('#chat-list').innerHTML = `<p class="hint">failed: ${esc(e.message)}</p>`;
+    return;
+  }
+  renderChatList();
+  if (!chatActiveId || !chatConversations.some((c) => c.id === chatActiveId)) {
+    if (chatConversations.length) await openConversation(chatConversations[0].id);
+    else renderChatThread(null);
+  } else {
+    await openConversation(chatActiveId);
+  }
+}
+
+function renderChatList() {
+  const el = $('#chat-list');
+  if (!chatConversations.length) {
+    el.innerHTML = '<p class="hint">no conversations yet</p>';
+    return;
+  }
+  el.innerHTML = '';
+  for (const c of chatConversations) {
+    const div = document.createElement('div');
+    div.className = `chat-item${c.id === chatActiveId ? ' active' : ''}`;
+    div.innerHTML = `<span class="chat-item-title">${esc(c.title || '(untitled)')}</span>
+      <span class="hint">${esc(new Date(c.updatedAt).toLocaleString())}</span>
+      <button data-del title="Delete this conversation">✕</button>`;
+    div.addEventListener('click', (ev) => { if (!ev.target.hasAttribute('data-del')) openConversation(c.id); });
+    div.querySelector('button[data-del]').addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      try {
+        await api(`/api/chat/conversations/${c.id}`, { method: 'DELETE' });
+        if (chatActiveId === c.id) chatActiveId = null;
+        loadChat();
+      } catch (e) {
+        toast(`delete failed: ${e.message}`);
+      }
+    });
+    el.appendChild(div);
+  }
+}
+
+async function openConversation(id) {
+  chatActiveId = id;
+  renderChatList();
+  try {
+    const conversation = await api(`/api/chat/conversations/${id}`);
+    renderChatThread(conversation);
+    // the turn may have finished while another tab was open: the composer follows the server, not the last poll
+    if (conversation.running) startChatPolling();
+    else setChatBusy(false);
+  } catch (e) {
+    $('#chat-thread').innerHTML = `<p class="hint">failed: ${esc(e.message)}</p>`;
+  }
+}
+
+function renderChatThread(conversation) {
+  const el = $('#chat-thread');
+  if (!conversation) {
+    el.innerHTML = '<p class="hint">Start a new chat to ask about the knowledge base, or to teach it something.</p>';
+    return;
+  }
+  el.innerHTML = '';
+  for (const m of conversation.messages ?? []) {
+    const div = document.createElement('div');
+    div.className = `chat-msg ${m.role}`;
+    const body = m.content ? renderMd(m.content) : `<p class="hint">${esc(m.error ? `(${m.error})` : '(empty reply)')}</p>`;
+    div.innerHTML = `<div class="markdown">${body}</div>`;
+    if (m.role === 'assistant') {
+      const chips = document.createElement('div');
+      chips.className = 'chat-chips';
+      for (const ev of m.events ?? []) {
+        const chip = document.createElement('span');
+        chip.className = `chat-chip${ev.ok === false ? ' bad' : ''}`;
+        chip.textContent = ev.tool === 'wrote' ? `wrote ${ev.summary}` : `${ev.tool}${ev.summary ? `: ${ev.summary}` : ''}`;
+        chips.appendChild(chip);
+        if (ev.tool === 'wrote' && ev.path) {
+          const open = document.createElement('button');
+          open.textContent = 'open';
+          open.addEventListener('click', () => {
+            document.querySelector('#tabs button[data-tab="files"]').click();
+            openFile(ev.path);
+          });
+          const promote = document.createElement('button');
+          promote.textContent = 'adopt';
+          promote.title = 'Promote this note from quarantined to trusted';
+          promote.addEventListener('click', async () => {
+            try {
+              await api('/api/trust', { method: 'POST', body: JSON.stringify({ path: ev.path, to: 'trusted' }) });
+              toast(`${ev.path}: trusted`);
+            } catch (e) {
+              toast(`adopt failed: ${e.message}`);
+            }
+          });
+          chips.append(open, promote);
+        }
+      }
+      if (m.error && m.content) chips.insertAdjacentHTML('beforeend', `<span class="chat-chip bad">${esc(m.error)}</span>`);
+      if (chips.childElementCount) div.appendChild(chips);
+    }
+    el.appendChild(div);
+  }
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderChatActivity(activity) {
+  const el = $('#chat-activity');
+  el.hidden = false;
+  el.innerHTML = `<span class="chat-chip working">answering…</span>${(activity ?? []).map((ev) => `<span class="chat-chip${ev.ok === false ? ' bad' : ''}">${esc(ev.tool)}${ev.summary ? `: ${esc(ev.summary)}` : ''}</span>`).join('')}`;
+}
+
+function setChatBusy(busy) {
+  $('#btn-chat-send').disabled = busy;
+  $('#btn-chat-cancel').hidden = !busy;
+  $('#chat-activity').hidden = !busy;
+}
+
+function startChatPolling() {
+  stopChatPolling();
+  setChatBusy(true);
+  renderChatActivity([]);
+  const id = chatActiveId;
+  const tick = async () => {
+    if (chatActiveId !== id) return;
+    try {
+      const status = await api(`/api/chat/conversations/${id}/status`);
+      if (status.status === 'running') {
+        renderChatActivity(status.activity);
+        chatPollTimer = setTimeout(tick, 1500);
+        return;
+      }
+    } catch {
+      /* transient */
+    }
+    setChatBusy(false);
+    stopChatPolling();
+    if (chatActiveId === id) {
+      await openConversation(id);
+      loadChat();
+    }
+  };
+  chatPollTimer = setTimeout(tick, 900);
+}
+
+async function sendChat() {
+  const input = $('#chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  if (!chatActiveId) {
+    try {
+      const conversation = await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({}) });
+      chatConversations.unshift(conversation);
+      chatActiveId = conversation.id;
+      renderChatList();
+      renderChatThread(conversation);
+    } catch (e) {
+      input.value = text;
+      toast(`could not start a conversation: ${e.message}`);
+      return;
+    }
+  }
+  const thread = $('#chat-thread');
+  const mine = document.createElement('div');
+  mine.className = 'chat-msg user';
+  mine.innerHTML = `<div class="markdown">${renderMd(text)}</div>`;
+  thread.appendChild(mine);
+  thread.scrollTop = thread.scrollHeight;
+  try {
+    await api(`/api/chat/conversations/${chatActiveId}/messages`, { method: 'POST', body: JSON.stringify({ text }) });
+    startChatPolling();
+  } catch (e) {
+    toast(`send failed: ${e.message}`);
+    // 409 means another client is already answering — resync and follow that turn instead
+    await openConversation(chatActiveId);
+  }
+}
+
+$('#btn-chat-new').addEventListener('click', async () => {
+  try {
+    const conversation = await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({}) });
+    chatConversations.unshift(conversation);
+    chatActiveId = conversation.id;
+    renderChatList();
+    renderChatThread(conversation);
+    $('#chat-input').focus();
+  } catch (e) {
+    toast(`could not start a conversation: ${e.message}`);
+  }
+});
+$('#chat-composer').addEventListener('submit', (ev) => { ev.preventDefault(); sendChat(); });
+$('#chat-input').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter' && !ev.shiftKey) {
+    ev.preventDefault();
+    sendChat();
+  }
+});
+$('#btn-chat-cancel').addEventListener('click', async () => {
+  if (!chatActiveId) return;
+  try {
+    await api(`/api/chat/conversations/${chatActiveId}/cancel`, { method: 'POST' });
+    toast('stopping…');
+  } catch (e) {
+    toast(`cancel failed: ${e.message}`);
   }
 });
 
@@ -1776,6 +2092,18 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-extraction-concurrency').value = cfg.extraction?.concurrency ?? 1;
     $('#cfg-extraction-claims').checked = cfg.extraction?.claims !== false;
     fillResearchForm(cfg.research ?? {});
+    fillChatForm(cfg.chat ?? {});
+    // With no agent configured, pre-fill what the service says can run here. It
+    // is only a pre-fill: nothing is saved until the person presses Save, so
+    // "not configured" never quietly becomes a setting nobody chose.
+    if (!cfg.research?.agent) {
+      try {
+        const { suggested } = await api('/api/config/agents');
+        if (suggested && activeWorkspace()?.id === workspaceId) $('#cfg-research-agent').value = suggested;
+      } catch {
+        /* the picker still works; it just starts empty */
+      }
+    }
     embProviderToggle();
     llmProviderToggle();
     updateConfigSummaries();
@@ -1833,6 +2161,7 @@ function gatherConfig() {
       claims: $('#cfg-extraction-claims').checked,
     },
     research: gatherResearchConfig(),
+    chat: gatherChatConfig(),
   };
 }
 
@@ -1853,27 +2182,46 @@ function optionList(pairs, selected) {
   return pairs.map(([v, l]) => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(l)}</option>`).join('');
 }
 
-function agentOptions(selected, inheritLabel) {
-  const opts = [`<option value="">${esc(inheritLabel)}</option>`];
-  for (const c of connectionDrafts.filter((c) => CLI_PROVIDERS.includes(c.provider))) {
-    opts.push(`<option value="${esc(c.id)}"${c.id === selected ? ' selected' : ''}>${esc(c.label || c.id)} · ${esc(providerNames[c.provider])}</option>`);
-  }
+// `fallbackLabel` is the meaning of the empty value: "follow the one above" for
+// chat and roles. The research agent has no such fallback any more — it gets
+// null, and an empty value is shown as the unconfigured state it is.
+function agentOptions(selected, fallbackLabel) {
+  const opts = fallbackLabel
+    ? [`<option value="">${esc(fallbackLabel)}</option>`]
+    : [`<option value=""${selected ? ' disabled' : ' selected'}>Not configured — pick an agent</option>`];
   for (const p of CLI_PROVIDERS) opts.push(`<option value="${p}"${p === selected ? ' selected' : ''}>${esc(providerNames[p])} · from PATH</option>`);
+  // 'default' is the section-01 connection named explicitly; a CLI there runs as
+  // a CLI, an OpenAI-compatible endpoint runs the built-in agent
+  const provider = $('#cfg-llm-provider')?.value;
+  opts.push(`<option value="default"${selected === 'default' ? ' selected' : ''}>Default LLM provider${provider ? ` · ${esc(providerNames[provider] || provider)}` : ''}</option>`);
+  for (const c of connectionDrafts) {
+    const how = CLI_PROVIDERS.includes(c.provider) ? providerNames[c.provider] : 'built-in agent';
+    opts.push(`<option value="${esc(c.id)}"${c.id === selected ? ' selected' : ''}>${esc(c.label || c.id)} · ${esc(how)}</option>`);
+  }
   return opts.join('');
 }
 
-function researchInheritLabel() {
-  const provider = $('#cfg-llm-provider').value;
-  return CLI_PROVIDERS.includes(provider) ? `Default LLM provider · ${providerNames[provider]}` : 'Default LLM provider (not a CLI — pick one)';
+/** Only the CLIs ship a web tool; the built-in agent searches the base only. */
+function agentWebCapable(spec) {
+  if (CLI_PROVIDERS.includes(spec)) return true;
+  const provider = spec === 'default' ? $('#cfg-llm-provider')?.value : connectionById(spec)?.provider;
+  return CLI_PROVIDERS.includes(provider);
 }
 
 function refreshResearchAgentOptions() {
   const select = $('#cfg-research-agent');
   if (!select) return;
   const current = select.value;
-  select.innerHTML = agentOptions(current, researchInheritLabel());
+  select.innerHTML = agentOptions(current, null);
   select.value = current;
   if (select.value !== current) select.value = '';
+  const chatSelect = $('#cfg-chat-agent');
+  if (chatSelect) {
+    const chatCurrent = chatSelect.value;
+    chatSelect.innerHTML = agentOptions(chatCurrent, 'The research agent above');
+    chatSelect.value = chatCurrent;
+    if (chatSelect.value !== chatCurrent) chatSelect.value = '';
+  }
   for (const roleSelect of document.querySelectorAll('#cfg-roles select[data-field="agent"]')) {
     const value = roleSelect.value;
     roleSelect.innerHTML = agentOptions(value, 'The research agent above');
@@ -1883,7 +2231,7 @@ function refreshResearchAgentOptions() {
 }
 
 function fillResearchForm(research) {
-  $('#cfg-research-agent').innerHTML = agentOptions(research.agent || '', researchInheritLabel());
+  $('#cfg-research-agent').innerHTML = agentOptions(research.agent || '', null);
   $('#cfg-research-agent').value = research.agent || '';
   $('#cfg-research-model').value = research.model || '';
   $('#cfg-research-pipeline').value = research.pipeline || 'team';
@@ -1894,6 +2242,9 @@ function fillResearchForm(research) {
   $('#cfg-research-rounds').value = research.reviewRounds ?? 1;
   $('#cfg-research-auto').checked = !!research.auto?.enabled;
   $('#cfg-research-daily').value = research.auto?.dailyJobs ?? 3;
+  $('#cfg-init-extraction').value = research.init?.extraction || 'drain';
+  $('#cfg-init-maxms').value = Math.max(1, Math.round((research.init?.extractionMaxMs ?? 900000) / 60000));
+  $('#cfg-init-followups').value = research.init?.followUps ?? 6;
   if (!$('#cfg-profile-effort').options.length) $('#cfg-profile-effort').innerHTML = optionList(EFFORT_OPTIONS, 'default');
 }
 
@@ -1979,7 +2330,8 @@ function updateResearchNote() {
   if (!note) return;
   const p = profileDraft;
   const agentValue = $('#cfg-research-agent').value;
-  const agentLabel = agentValue ? (connectionById(agentValue)?.label || providerNames[agentValue] || agentValue) : researchInheritLabel();
+  // the selected option already reads the way the picker shows it
+  const agentLabel = agentValue ? ($('#cfg-research-agent').selectedOptions[0]?.textContent || agentValue) : 'not configured';
   const pipeline = (p && p.pipeline) || $('#cfg-research-pipeline').value;
   const fanout = Number($('#cfg-research-researchers').value) || 1;
   const roles = p
@@ -1989,9 +2341,15 @@ function updateResearchNote() {
     })
     : [];
   const parts = [`Agent: ${agentLabel}`, `pipeline: ${pipeline}${p && p.pipeline ? ' (pinned by profile)' : ''}`];
-  if (p) parts.push(`effort: ${p.reasoning.effort}`, `web: ${p.search.web} / ${p.search.freshness}`, `sources per fact: ${p.verification.minSourcesPerClaim}`);
+  const web = agentValue && !agentWebCapable(agentValue) ? 'none (built-in agent)' : p ? `${p.search.web} / ${p.search.freshness}` : null;
+  if (p) parts.push(`effort: ${p.reasoning.effort}`);
+  if (web) parts.push(`web: ${web}`);
+  if (p) parts.push(`sources per fact: ${p.verification.minSourcesPerClaim}`);
   if (pipeline !== 'single') parts.push(`roles: ${roles.join(', ') || 'none'}`);
-  note.textContent = `${parts.join(' · ')}. Web tools never exceed what review.external allows.`;
+  const caveat = agentValue && !agentWebCapable(agentValue)
+    ? ' The built-in agent has no web tool — it verifies against the knowledge base only.'
+    : ' Web tools never exceed what review.external allows.';
+  note.textContent = `${parts.join(' · ')}.${caveat}`;
 }
 
 function gatherResearchConfig() {
@@ -2006,6 +2364,36 @@ function gatherResearchConfig() {
     researchers: Number($('#cfg-research-researchers').value) || 3,
     reviewRounds: Math.max(0, Number($('#cfg-research-rounds').value) || 0),
     auto: { enabled: $('#cfg-research-auto').checked, dailyJobs: Number($('#cfg-research-daily').value) || 3 },
+    init: {
+      followUps: Math.max(0, Number($('#cfg-init-followups').value) || 0),
+      extraction: $('#cfg-init-extraction').value,
+      extractionMaxMs: (Number($('#cfg-init-maxms').value) || 15) * 60000,
+    },
+  };
+}
+
+function fillChatForm(chat) {
+  $('#cfg-chat-agent').innerHTML = agentOptions(chat.agent || '', 'The research agent above');
+  $('#cfg-chat-agent').value = chat.agent || '';
+  $('#cfg-chat-model').value = chat.model || '';
+  $('#cfg-chat-effort').innerHTML = optionList(EFFORT_OPTIONS, chat.effort || 'default');
+  $('#cfg-chat-web').value = chat.web || 'inherit';
+  $('#cfg-chat-maxturns').value = chat.maxTurns ?? 30;
+  $('#cfg-chat-timeout').value = Math.max(1, Math.round((chat.timeoutMs ?? 600000) / 60000));
+  $('#cfg-chat-history').value = chat.historyTurns ?? 12;
+  $('#cfg-chat-keep').value = chat.keep ?? 50;
+}
+
+function gatherChatConfig() {
+  return {
+    agent: $('#cfg-chat-agent').value,
+    model: $('#cfg-chat-model').value.trim(),
+    effort: $('#cfg-chat-effort').value,
+    web: $('#cfg-chat-web').value,
+    maxTurns: Number($('#cfg-chat-maxturns').value) || 30,
+    timeoutMs: (Number($('#cfg-chat-timeout').value) || 10) * 60000,
+    historyTurns: Math.max(0, Number($('#cfg-chat-history').value) || 0),
+    keep: Number($('#cfg-chat-keep').value) || 50,
   };
 }
 

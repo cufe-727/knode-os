@@ -3,13 +3,14 @@ import path from 'node:path';
 import { AppContext } from '../context.js';
 import { resolve } from '../compiler/resolve.js';
 import { checkout } from '../compiler/workset.js';
+import { GUIDE_FILE, isSeedTemplate, readGuide } from '../fs/datadir.js';
 import { safePath } from '../fs/files.js';
 import { loadOntology, promptFragment } from '../graph/ontology.js';
 import { parseFrontmatter } from '../markdown.js';
 import { archivePage } from '../wiki/pages.js';
 import { stripRegions } from '../wiki/regions.js';
 import { ResearchJob } from './jobs.js';
-import { loadResearchProtocol, renderOutputPath, ResearchTemplate } from './templates.js';
+import { loadResearchProtocol, renderOutputPath, ResearchTemplate, subjectOf } from './templates.js';
 import { profileBrief, requiredSections, ResearchProfile } from './profile.js';
 
 /**
@@ -34,6 +35,14 @@ export interface McpEndpoint {
   headers: Record<string, string>;
 }
 
+/** A second output file the template asks for (the guide of an init job), with its pre-run backup. */
+export interface RunCompanion {
+  path: string;
+  sections: string[];
+  /** Copy of the file as it was before the run (`.runs/<id>/existing-<name>`), null when it did not exist. */
+  backupPath: string | null;
+}
+
 export interface RunWorkspace {
   dir: string;
   briefPath: string;
@@ -45,7 +54,11 @@ export interface RunWorkspace {
   worksetId: string;
   existingPage: string | null;
   humanParagraphs: string[];
+  companions: RunCompanion[];
 }
+
+/** The guide section a person owns: the runner carries it over verbatim when the guide is regenerated. */
+export const HUMAN_NOTES_HEADING = '## 人工备注';
 
 export function runsRoot(dataDir: string, runsDir: string): string {
   return safePath(dataDir, runsDir || '.runs');
@@ -108,12 +121,50 @@ function fill(text: string, vars: Record<string, string>): string {
   return text.replace(/\{(target|query|output|actor|research|slug)\}/g, (m, key: string) => vars[key] ?? m);
 }
 
-export async function prepareRunWorkspace(
-  ctx: AppContext,
-  job: ResearchJob,
-  template: ResearchTemplate,
-  opts: { runsDir: string; provider: string; mcp: McpEndpoint; readDirs: string[]; dir?: string; allowNetwork?: boolean; profile?: ResearchProfile | null },
-): Promise<RunWorkspace> {
+/**
+ * The `# 知识库自述` block every agent session gets: the base's own guide
+ * (AGENTS.md at the data root, when one exists), then purpose.md and schema.md.
+ * `guide: null` leaves the guide out (an init job sees it in its brief instead).
+ */
+export function knowledgeNotes(dataDir: string, opts: { guide?: string | null } = {}): string {
+  const notes: string[] = [];
+  const guide = opts.guide === undefined ? readGuide(dataDir) : opts.guide;
+  if (guide) notes.push(`## ${GUIDE_FILE}（知识库指南）\n\n${guide.trim()}`);
+  for (const f of ['purpose.md', 'schema.md']) {
+    const p = path.join(dataDir, f);
+    if (fs.existsSync(p)) notes.push(`## ${f}\n\n${fs.readFileSync(p, 'utf8').trim()}`);
+  }
+  return notes.length ? `# 知识库自述\n\n${notes.join('\n\n')}` : '';
+}
+
+/** The files a CLI session reads from its cwd: the schema, the MCP endpoint (Claude Code and Cursor forms), a README. */
+export function writeAgentFiles(dir: string, input: { schema: string; mcp: McpEndpoint; readme: string }): void {
+  fs.mkdirSync(path.join(dir, '.cursor'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'CLAUDE.md'), input.schema);
+  fs.writeFileSync(path.join(dir, 'AGENTS.md'), input.schema);
+  const server = { type: 'http', url: input.mcp.url, headers: { Authorization: `Bearer ${input.mcp.token}`, ...input.mcp.headers } };
+  fs.writeFileSync(path.join(dir, '.mcp.json'), JSON.stringify({ mcpServers: { 'knode-os': server } }, null, 2) + '\n');
+  fs.writeFileSync(path.join(dir, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { 'knode-os': { url: input.mcp.url, headers: server.headers } } }, null, 2) + '\n');
+  fs.writeFileSync(path.join(dir, 'README.md'), input.readme);
+}
+
+export interface PrepareRunOptions {
+  runsDir: string;
+  provider: string;
+  mcp: McpEndpoint;
+  readDirs: string[];
+  dir?: string;
+  allowNetwork?: boolean;
+  profile?: ResearchProfile | null;
+  /** Replaces the knode_resolve context seed in the brief (init: the rendered survey). */
+  seed?: string;
+  /** Guide text for the schema; undefined = the data root's AGENTS.md, null = none. */
+  guide?: string | null;
+  /** Extra brief sections appended before the closing line. */
+  extraBrief?: string[];
+}
+
+export async function prepareRunWorkspace(ctx: AppContext, job: ResearchJob, template: ResearchTemplate, opts: PrepareRunOptions): Promise<RunWorkspace> {
   const dir = opts.dir ?? path.join(runsRoot(ctx.dataDir, opts.runsDir), job.id);
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(path.join(dir, '.cursor'), { recursive: true });
@@ -122,7 +173,7 @@ export async function prepareRunWorkspace(
   const actor = `agent/${opts.provider}`;
   const worksetId = job.worksetId ?? (await checkout(ctx.store, { actor, note: `research ${job.id}: ${job.kind} ${job.target ?? job.query ?? ''}` })).id;
   const research = { job: job.id, kind: job.kind, template: template.name, at: new Date().toISOString(), agent: opts.provider, workset: worksetId };
-  const subject = job.kind === 'question' ? job.query ?? job.target ?? '' : job.target ?? job.query ?? '';
+  const subject = subjectOf(job);
   const vars = { target: job.target ?? subject, query: job.query ?? subject, output: outputPath, actor, research: JSON.stringify(research), slug: path.posix.basename(outputPath, '.md') };
 
   const abs = safePath(ctx.dataDir, outputPath);
@@ -138,16 +189,22 @@ export async function prepareRunWorkspace(
     // kept here so a rejected draft can be rolled back to it
     fs.writeFileSync(path.join(dir, 'existing.md'), existingPage);
   }
-  // prose to protect: what a person wrote. A page an agent authored is rewritten wholesale on refresh.
-  const humanParagraphs = existingPage && !isAgentAuthored(existingPage) ? humanParagraphsOf(existingPage) : [];
+  // prose to protect: what a person wrote. A page an agent authored is rewritten wholesale on
+  // refresh, and a file that is still the seed template holds nothing of anyone's.
+  const humanParagraphs = existingPage && !isAgentAuthored(existingPage) && !isSeedTemplate(outputPath, existingPage) ? humanParagraphsOf(existingPage) : [];
+  // companion outputs (the guide of an init job): backed up so a rejected run restores them
+  const companions: RunCompanion[] = (template.companions ?? []).map((c) => {
+    const absC = safePath(ctx.dataDir, c.path);
+    let backupPath: string | null = null;
+    if (fs.existsSync(absC)) {
+      backupPath = path.join(dir, `existing-${path.posix.basename(c.path)}`);
+      fs.copyFileSync(absC, backupPath);
+    }
+    return { path: c.path, sections: c.sections, backupPath };
+  });
   const ontology = loadOntology(ctx.dataDir);
   const vocab = promptFragment(ontology);
 
-  const notes: string[] = [];
-  for (const f of ['purpose.md', 'schema.md']) {
-    const p = path.join(ctx.dataDir, f);
-    if (fs.existsSync(p)) notes.push(`## ${f}\n\n${fs.readFileSync(p, 'utf8').trim()}`);
-  }
   const schema = [
     loadResearchProtocol(ctx.dataDir).trim(),
     '',
@@ -155,19 +212,21 @@ export async function prepareRunWorkspace(
     '',
     fill(template.body, vars),
     '',
-    notes.length ? `# 知识库自述\n\n${notes.join('\n\n')}` : '',
+    knowledgeNotes(ctx.dataDir, { guide: opts.guide }),
   ].filter(Boolean).join('\n');
-  fs.writeFileSync(path.join(dir, 'CLAUDE.md'), schema);
-  fs.writeFileSync(path.join(dir, 'AGENTS.md'), schema);
 
   const previous = Array.isArray(job.payload.rejections) ? (job.payload.rejections as string[]) : [];
+  const closing = job.kind === 'init'
+    ? '开始吧：先按「知识库概况」摸底（knode_survey / knode_ls / knode_graph_insights），然后按模版逐节取证，最后 knode_write 总览与指南 → knode_feedback → knode_commit。'
+    : '开始吧：先 knode_resolve，然后按模版逐节取证，最后 knode_write → knode_feedback → knode_commit。';
   const brief = [
     `# 研究任务 ${job.id}`,
     '',
     `- 类型：${job.kind}`,
-    job.target ? `- 目标：${job.target}` : null,
+    `- 目标：${subject}`,
     job.query ? `- 问题：${job.query}` : null,
     `- 输出路径（只写这里，用 knode_write）：\`${outputPath}\``,
+    ...companions.map((c) => `- 附加输出（也用 knode_write 写，path 就是 \`${c.path}\`）：\`${c.path}\`；必需章节：${c.sections.join(' / ') || '（无固定章节）'}`),
     `- workset：\`${worksetId}\`（所有 knode_* 读取都带上它）`,
     `- frontmatter 必需键：${template.requires.frontmatter.join(', ') || '（无额外要求）'}`,
     `- 必需章节：${requiredSections(template, opts.profile).join(' / ') || '（无固定章节）'}`,
@@ -184,21 +243,17 @@ export async function prepareRunWorkspace(
     '',
     previous.length ? `## 上一次提交被退回，原因\n\n${previous.map((r) => `- ${r}`).join('\n')}\n` : '',
     existingPage ? `## 输出路径上已有页面（${humanParagraphs.length} 段人写内容必须原样保留）\n\n\`\`\`markdown\n${existingPage.trim()}\n\`\`\`\n` : '',
-    '## 知识库预整理',
-    '',
-    await contextSeed(ctx, subject, worksetId),
-    '',
-    '开始吧：先 knode_resolve，然后按模版逐节取证，最后 knode_write → knode_feedback → knode_commit。',
+    ...companions.filter((c) => c.backupPath).map((c) => `## ${c.path} 上一版（可以重写；「${HUMAN_NOTES_HEADING.replace(/^#+\s*/, '')}」段由系统原样保留，你只需保留该标题）\n\n\`\`\`markdown\n${fs.readFileSync(c.backupPath!, 'utf8').trim()}\n\`\`\`\n`),
+    ...(opts.seed !== undefined ? [opts.seed.trim(), ''] : ['## 知识库预整理', '', await contextSeed(ctx, subject, worksetId), '']),
+    ...(opts.extraBrief ?? []),
+    closing,
   ].filter((l) => l !== null && l !== '').join('\n');
   const briefPath = path.join(dir, 'brief.md');
   fs.writeFileSync(briefPath, brief);
 
-  const server = { type: 'http', url: opts.mcp.url, headers: { Authorization: `Bearer ${opts.mcp.token}`, ...opts.mcp.headers } };
-  fs.writeFileSync(path.join(dir, '.mcp.json'), JSON.stringify({ mcpServers: { 'knode-os': server } }, null, 2) + '\n');
-  fs.writeFileSync(path.join(dir, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { 'knode-os': { url: opts.mcp.url, headers: server.headers } } }, null, 2) + '\n');
-  fs.writeFileSync(path.join(dir, 'README.md'), `Run workspace for research job ${job.id}. brief.md is the prompt; CLAUDE.md / AGENTS.md the schema; transcript.jsonl the agent's output.\n`);
+  writeAgentFiles(dir, { schema, mcp: opts.mcp, readme: `Run workspace for research job ${job.id}. brief.md is the prompt; CLAUDE.md / AGENTS.md the schema; transcript.jsonl the agent's output.\n` });
 
-  return { dir, briefPath, outputPath, actor, research, worksetId, existingPage, humanParagraphs };
+  return { dir, briefPath, outputPath, actor, research, worksetId, existingPage, humanParagraphs, companions };
 }
 
 /** Keep only the newest `keep` run directories. */
@@ -206,7 +261,7 @@ export function pruneRuns(dataDir: string, runsDir: string, keep: number): numbe
   const root = runsRoot(dataDir, runsDir);
   if (!fs.existsSync(root)) return 0;
   const entries = fs.readdirSync(root, { withFileTypes: true })
-    .filter((e) => e.isDirectory())
+    .filter((e) => e.isDirectory() && e.name !== 'chat') // .runs/chat holds conversation workspaces, pruned by the chat store
     .map((e) => ({ name: e.name, mtime: fs.statSync(path.join(root, e.name)).mtimeMs }))
     .sort((a, b) => b.mtime - a.mtime);
   let removed = 0;

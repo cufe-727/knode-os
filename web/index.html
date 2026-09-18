@@ -99,6 +99,7 @@
         <button data-tab="ask">Ask</button>
         <button data-tab="graph">Graph</button>
         <button data-tab="wiki">Wiki</button>
+        <button data-tab="chat">Chat</button>
         <button data-tab="traces">Traces</button>
         <button data-tab="dream">Dream</button>
         <button data-tab="settings">Settings</button>
@@ -224,6 +225,26 @@
 
     <!-- Wiki: deep-research pages -->
     <section id="tab-wiki" class="tab">
+      <div id="init-card" class="init-card">
+        <div class="init-head">
+          <div>
+            <p class="section-index">KNOWLEDGE BASE</p>
+            <b id="init-title">Initialize knowledge base</b>
+            <small id="init-summary">loading…</small>
+          </div>
+          <div class="init-actions">
+            <span id="init-guide" class="tag"></span>
+            <button id="btn-init-kb" class="primary" type="button">⚙ initialize</button>
+          </div>
+        </div>
+        <p class="hint init-note">The research agent surveys everything (indexing and extracting first), writes <span class="mono">wiki/overview.md</span> and the <span class="mono">AGENTS.md</span> / <span class="mono">CLAUDE.md</span> guide every later agent reads, and queues the topic pages worth writing next.</p>
+        <div id="init-progress" hidden>
+          <ol id="init-steps" class="init-steps"></ol>
+          <div id="init-phases" class="init-phases"></div>
+          <div id="init-topics" class="init-topics"></div>
+          <div id="init-error" class="jerr"></div>
+        </div>
+      </div>
       <div class="searchbar">
         <select id="research-kind">
           <option value="entity">entity page</option>
@@ -251,6 +272,27 @@
         <div class="wiki-span">
           <h3 class="wiki-h">Research pages</h3>
           <div id="research-pages" class="hint">loading…</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Chat: talk to the configured agent -->
+    <section id="tab-chat" class="tab">
+      <div class="chat-layout">
+        <aside id="chat-side">
+          <button id="btn-chat-new" type="button" class="primary">＋ new chat</button>
+          <div id="chat-list"></div>
+        </aside>
+        <div id="chat-main">
+          <div id="chat-thread"><p class="hint">Ask about the knowledge base, or teach it something — what you teach is written as a quarantined note you can adopt.</p></div>
+          <div id="chat-activity" class="chat-activity" hidden></div>
+          <form id="chat-composer" class="chat-composer">
+            <textarea id="chat-input" rows="2" placeholder="ask a question, or “记住：…” to teach the knowledge base — Enter sends, Shift+Enter adds a line"></textarea>
+            <div class="chat-composer-actions">
+              <button id="btn-chat-send" type="submit" class="primary">send</button>
+              <button id="btn-chat-cancel" type="button" hidden>cancel</button>
+            </div>
+          </form>
         </div>
       </div>
     </section>
@@ -391,9 +433,9 @@
         </section>
 
         <section class="settings-section" aria-labelledby="research-title">
-          <div class="settings-section-head"><div><p class="section-index">03 · DEEP RESEARCH</p><h3 id="research-title">Who writes the wiki, and how hard they think</h3><p>A coding-agent CLI researches a topic through the MCP endpoint and writes the page. A profile sets the reasoning effort, web access and verification bar, and lists the sub-agents — each with its own CLI, model, tools and prompt.</p></div><span class="section-badge">Agents</span></div>
+          <div class="settings-section-head"><div><p class="section-index">03 · DEEP RESEARCH</p><h3 id="research-title">Who writes the wiki, and how hard they think</h3><p>An agent researches a topic through the MCP endpoint and writes the page — either a coding-agent CLI on this machine, or the built-in agent running on an OpenAI-compatible connection. A profile sets the reasoning effort, web access and verification bar, and lists the sub-agents — each with its own CLI, model, tools and prompt.</p></div><span class="section-badge">Agents</span></div>
 
-          <div class="cfg-card-title"><div><b>Research agent</b><small>Which CLI runs jobs, how many at once, and which profile it follows. Roles below may override the CLI per phase.</small></div><span class="section-badge accent2">Runner</span></div>
+          <div class="cfg-card-title"><div><b>Research agent</b><small>Which agent runs jobs, how many at once, and which profile it follows. Roles below may override the agent per phase.</small></div><span class="section-badge accent2">Runner</span></div>
           <fieldset class="cfg-card cfg-card-wide">
             <div class="cfg-grid cfg-grid-3">
               <label>Agent<select id="cfg-research-agent"></select></label>
@@ -408,6 +450,29 @@
             </div>
             <label class="cfg-check"><input id="cfg-research-auto" type="checkbox" /> Accept the top recommendations automatically, up to <input id="cfg-research-daily" type="number" min="1" max="50" step="1" class="cfg-inline-num" /> jobs a day</label>
             <p class="cfg-callout" id="cfg-research-note"></p>
+          </fieldset>
+
+          <div class="cfg-card-title"><div><b>Initialization</b><small>What the Wiki tab's initialize button does before the agent starts, and how many topic pages it queues afterwards.</small></div><span class="section-badge">Init</span></div>
+          <fieldset class="cfg-card cfg-card-wide">
+            <div class="cfg-grid cfg-grid-3">
+              <label>Extraction first<select id="cfg-init-extraction"><option value="drain">Drain the tier-1 queue (within the daily budget)</option><option value="skip">Skip — leave it to the background loop</option></select></label>
+              <label>Extraction time cap (minutes)<input id="cfg-init-maxms" type="number" min="1" max="60" step="1" /></label>
+              <label>Follow-up pages queued<input id="cfg-init-followups" type="number" min="0" max="20" step="1" /></label>
+            </div>
+          </fieldset>
+
+          <div class="cfg-card-title"><div><b>Chat</b><small>The Chat tab uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note.</small></div><span class="section-badge accent2">Chat</span></div>
+          <fieldset class="cfg-card cfg-card-wide">
+            <div class="cfg-grid cfg-grid-3">
+              <label>Agent<select id="cfg-chat-agent"></select></label>
+              <label>Model<input id="cfg-chat-model" placeholder="Agent's model" /></label>
+              <label>Reasoning effort<select id="cfg-chat-effort"></select></label>
+              <label>Web access<select id="cfg-chat-web"><option value="inherit">Follow review.external (on only when it is “research”)</option><option value="on">On (within review.external)</option><option value="off">Off</option></select></label>
+              <label>Turns per reply<input id="cfg-chat-maxturns" type="number" min="1" max="200" step="1" /></label>
+              <label>Timeout (minutes)<input id="cfg-chat-timeout" type="number" min="1" max="120" step="1" /></label>
+              <label>Messages replayed<input id="cfg-chat-history" type="number" min="0" max="50" step="1" /></label>
+              <label>Conversations kept<input id="cfg-chat-keep" type="number" min="1" max="500" step="1" /></label>
+            </div>
           </fieldset>
 
           <div class="cfg-card-title"><div><b>Profile <span id="cfg-profile-name" class="mono"></span></b><small>Stored as <span class="mono">playbooks/research/profiles/&lt;name&gt;.yaml</span> — edit here or in the file. The profile may pin its own pipeline.</small></div><div class="cfg-actions-inline"><button type="button" id="cfg-profile-duplicate" class="ghost">Duplicate…</button><button type="button" id="cfg-profile-delete" class="ghost">Delete</button></div></div>

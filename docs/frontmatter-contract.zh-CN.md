@@ -86,6 +86,7 @@ wiki/entities/x.md                               bundle=wiki       self=Archive 
 | `sameAs`（entities 内） | 全部 | 声明该实体与已知实体相同，写入时直接落到规范实体 |
 | `actor: agent/<cli>` + `research: {…}` | `wiki/**` | 研究 agent 写的页面：显式 `actor` 使其成为 **Source**（即使带 `generated`），以 quarantined 入库；`research` 记录 job / 模版 / 时间，runner 会盖章 |
 | `sameAs` / `notSameAs` | `wiki/reviews/**`（verify 任务） | 核实页的身份结论：`sameAs` 里的已知实体变成待审的 `merge` 建议，`notSameAs` 记为已拒绝的合并对，夜间审计不再提出 |
+| `selfEntity: false` | bundle 页 | 这一页讲的不是某个实体（总览 / 枢纽页），不要为它生成"页面自身实体" |
 | `trust` / `actor` | 全部 | 信任分档 |
 | `acl` | 全部 | 访问控制 |
 | `aliases` | 仅 bundle 内 | 实体别名 |

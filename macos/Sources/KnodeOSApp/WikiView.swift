@@ -10,6 +10,10 @@ struct WikiView: View {
     @State private var jobs: [ResearchJob] = []
     @State private var pages: [ResearchPage] = []
     @State private var recommendations: [ResearchRecommendation] = []
+    @State private var initStatus: InitStatus?
+    @State private var initJob: ResearchJob?
+    @State private var isInitializing = false
+    @State private var initWatcher: Task<Void, Never>?
     @State private var isLoading = true
     @State private var errorMessage: String?
 
@@ -31,6 +35,7 @@ struct WikiView: View {
                         if let errorMessage {
                             Text(errorMessage).font(.callout).foregroundStyle(.red)
                         }
+                        initializationCard
                         section("Recommended pages", empty: L("Nothing to recommend yet — recommendations come from hot entities, repeated questions and pages whose facts changed."), isEmpty: recommendations.isEmpty) {
                             ForEach(recommendations) { rec in recommendationRow(rec) }
                         }
@@ -49,6 +54,118 @@ struct WikiView: View {
         }
         .background(Color(nsColor: .textBackgroundColor).opacity(0.22))
         .task { await load() }
+        .onDisappear { initWatcher?.cancel() }
+    }
+
+    /// One button that brings a fresh knowledge base up to speed: index and
+    /// extract everything, then have the research agent write the overview page
+    /// and the AGENTS.md guide every later agent reads, and queue the topic
+    /// pages worth writing next.
+    private var initializationCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Eyebrow(text: L("Knowledge base"))
+                    Text(initStatus?.guide.exists == true ? L("Re-initialize knowledge base") : L("Initialize knowledge base"))
+                        .font(.system(size: 16, weight: .semibold))
+                    if let survey = initStatus?.survey {
+                        HStack(spacing: 10) {
+                            MetricPill(value: survey.stats.documents, label: L("docs"))
+                            MetricPill(value: survey.stats.entities, label: L("entities"))
+                            MetricPill(value: survey.stats.relations, label: L("relations"))
+                            MetricPill(value: survey.stats.claims, label: L("claims"))
+                            if survey.extraction.queued > 0 {
+                                MetricPill(value: survey.extraction.queued, label: L("awaiting extraction"))
+                            }
+                        }
+                    }
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 6) {
+                    if let guide = initStatus?.guide, guide.exists {
+                        Button {
+                            model.openFile(guide.path)
+                        } label: {
+                            Text(L("guide %@", guide.path) + (guide.stamp.map { " · \(String($0.at.prefix(10)))" } ?? ""))
+                                .font(.caption.monospaced())
+                        }
+                        .buttonStyle(.link)
+                    } else {
+                        Text(L("no guide yet")).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Button {
+                        Task { await startInitialization() }
+                    } label: {
+                        Label(initStatus?.guide.exists == true ? L("Re-initialize") : L("Initialize"), systemImage: "gearshape.2")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.knodeCyan)
+                    .disabled(isInitializing || initJob?.isLive == true)
+                }
+            }
+            Text(L("The research agent surveys everything (indexing and extracting first), writes wiki/overview.md and the AGENTS.md / CLAUDE.md guide every later agent reads, and queues the topic pages worth writing next."))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let job = initJob {
+                initProgress(job)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .knodeCard()
+    }
+
+    @ViewBuilder
+    private func initProgress(_ job: ResearchJob) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(job.initSteps) { step in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    StatusDot(color: stepColor(step.status))
+                    Text(stepTitle(step.name)).font(.caption.weight(.semibold)).frame(width: 170, alignment: .leading)
+                    Text(step.detail ?? step.status).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    Spacer(minLength: 0)
+                }
+            }
+            if !job.initPhases.isEmpty {
+                HStack(spacing: 6) {
+                    Text(L("agent")).font(.caption2).foregroundStyle(.secondary)
+                    ForEach(job.initPhases) { phase in
+                        badge(phase.turns.map { "\(phase.label) · \($0)t" } ?? phase.label, color: phase.error == nil ? Color.knodeGood : Color.knodeBad)
+                    }
+                }
+            }
+            if !job.initTopics.isEmpty {
+                HStack(spacing: 6) {
+                    Text(L("follow-up pages")).font(.caption2).foregroundStyle(.secondary)
+                    ForEach(job.initTopics) { topic in
+                        badge("\(topic.kind) · \(topic.target)", color: topic.queued == nil ? .secondary : Color.knodeCyan)
+                    }
+                }
+            }
+            if let error = job.error {
+                Text(error).font(.caption).foregroundStyle(.red).lineLimit(3)
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private func stepTitle(_ name: String) -> String {
+        switch name {
+        case "sync": L("Index the files")
+        case "extract": L("Extract entities & claims")
+        case "views": L("Regenerate stub pages")
+        case "survey": L("Survey the base")
+        default: name
+        }
+    }
+
+    private func stepColor(_ status: String) -> Color {
+        switch status {
+        case "done": .knodeGood
+        case "running": .knodeCyan
+        case "failed": .knodeBad
+        default: .secondary
+        }
     }
 
     private var queueBar: some View {
@@ -185,12 +302,55 @@ struct WikiView: View {
             async let j = api.researchJobs()
             async let p = api.researchPages()
             async let r = api.researchRecommendations()
+            async let i = api.initStatus()
             jobs = try await j
             pages = try await p
             recommendations = try await r
+            let status = try await i
+            initStatus = status
+            initJob = status.job
             errorMessage = nil
+            if status.job?.isLive == true, let id = status.job?.id { watchInitialization(id) }
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func startInitialization() async {
+        guard let api = try? model.client() else { return }
+        isInitializing = true
+        do {
+            let res = try await api.queueInit()
+            initJob = res.job
+            model.showToast(res.created ? L("Initialization queued") : L("Already queued: %@", res.job.id))
+            watchInitialization(res.job.id)
+        } catch {
+            isInitializing = false
+            model.showToast(L("Could not start: %@", error.localizedDescription))
+        }
+    }
+
+    /// Poll the job while it runs: the steps and phases come from its run directory.
+    private func watchInitialization(_ id: String) {
+        initWatcher?.cancel()
+        isInitializing = true
+        model.globalActivity = L("Initializing the knowledge base…")
+        initWatcher = Task {
+            defer {
+                isInitializing = false
+                model.globalActivity = nil
+            }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if Task.isCancelled { return }
+                guard let api = try? model.client(), let job = try? await api.researchJob(id: id) else { continue }
+                initJob = job
+                if job.isLive { continue }
+                model.showToast(job.status == "done" ? L("Knowledge base initialized") : L("Initialization %@", job.status))
+                await load()
+                await model.refreshStats()
+                return
+            }
         }
     }
 

@@ -720,6 +720,37 @@ const V8_REVIEW = `
 ALTER TABLE entity_alias_keys ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'exact';
 `;
 
+const V9_CHAT = `
+-- The chat entry: a person talks to the configured coding-agent CLI. One row
+-- per conversation, one per message; an assistant message keeps the tool
+-- activity parsed from the session transcript and what the turn cost.
+CREATE TABLE IF NOT EXISTS chat_conversations (
+  id         TEXT PRIMARY KEY,
+  title      TEXT NOT NULL DEFAULT '',
+  agent      TEXT,
+  model      TEXT,
+  status     TEXT NOT NULL DEFAULT 'idle',
+  created_by TEXT,
+  payload    JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id              TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+  seq             INTEGER NOT NULL,
+  role            TEXT NOT NULL,
+  content         TEXT NOT NULL DEFAULT '',
+  events          JSONB NOT NULL DEFAULT '[]',
+  turns           INTEGER,
+  cost_usd        REAL,
+  error           TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (conversation_id, seq)
+);
+CREATE INDEX IF NOT EXISTS chat_messages_conv_idx ON chat_messages (conversation_id, seq);
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -746,6 +777,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 6, name: 'agent-db', up: async (q) => execScript(q, V6_AGENT_DB) },
   { version: 7, name: 'wiki-research', up: async (q) => execScript(q, V7_WIKI_RESEARCH) },
   { version: 8, name: 'review', up: async (q) => execScript(q, V8_REVIEW) },
+  { version: 9, name: 'chat', up: async (q) => execScript(q, V9_CHAT) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

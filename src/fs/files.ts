@@ -141,15 +141,43 @@ export function sanitizeRelativePath(name: string): string {
 /** Roots that external interfaces (HTTP / MCP) may write to. Everything else is read-only. */
 const WRITABLE_ROOTS = ['wiki', RAW_DOCS, PACKS_DIR];
 const WRITABLE_ROOTS_RE = new RegExp(`^(${WRITABLE_ROOTS.map((r) => r.replace(/\//g, '\\/')).join('|')})(\\/|$)`);
+/** Root-level files an agent may (re)write: the knowledge-base guide and its Claude Code copy. Never sources. */
+export const ROOT_WRITABLE_FILES = new Set(['AGENTS.md', 'CLAUDE.md']);
+
+/**
+ * The canonical form of a data-dir-relative path: posix separators, no leading
+ * slash, no `.` / `..` segments. Every permission check runs on this, never on
+ * the caller's spelling — `wiki/../knode.config.json` stays inside the data
+ * directory, so `safePath` alone would let it through a `wiki/`-prefix test.
+ * Returns '' for a path that is empty, is the root itself, or climbs out.
+ */
+export function cleanRelPath(rel: string): string {
+  const raw = rel.replace(/\\/g, '/').replace(/^\/+/, '').trim();
+  if (!raw) return '';
+  const norm = path.posix.normalize(raw).replace(/\/+$/, '');
+  if (!norm || norm === '.' || norm.startsWith('/') || norm === '..' || norm.startsWith('../')) return '';
+  return norm;
+}
+
+export function isRootWritableFile(rel: string): boolean {
+  return ROOT_WRITABLE_FILES.has(cleanRelPath(rel));
+}
 
 /** The sidecar tree is system-owned: no external write may land there, whatever root it is under. */
 export function isWritablePath(rel: string): boolean {
-  const clean = rel.replace(/\\/g, '/').replace(/^\/+/, '');
-  return !hasSidecarSegment(clean) && WRITABLE_ROOTS_RE.test(clean);
+  const clean = cleanRelPath(rel);
+  if (!clean) return false;
+  return ROOT_WRITABLE_FILES.has(clean) || (!hasSidecarSegment(clean) && WRITABLE_ROOTS_RE.test(clean));
 }
 
 export function assertWritablePath(rel: string): void {
-  if (!isWritablePath(rel)) throw new Error(`writes are restricted to ${WRITABLE_ROOTS.map((r) => `${r}/`).join(', ')}`);
+  if (!isWritablePath(rel)) throw new Error(`writes are restricted to ${WRITABLE_ROOTS.map((r) => `${r}/`).join(', ')} and the root ${[...ROOT_WRITABLE_FILES].join(' / ')}`);
+}
+
+/** A source path: writable, but not one of the root guide files (which are never indexed). */
+export function assertSourcePath(rel: string): void {
+  assertWritablePath(rel);
+  if (isRootWritableFile(rel)) throw new Error(`${rel} is the knowledge-base guide, not a source`);
 }
 
 const TEXT_EXT = new Set(['.md', '.markdown', '.txt', '.text', '.json', '.jsonl', '.yaml', '.yml', '.csv', '.tsv', '.html', '.htm', '.xml', '.rst', '.org']);

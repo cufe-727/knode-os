@@ -33,6 +33,8 @@ export const INTENTS_DIR = `${CONFIG_DIR}/intents`;
 export const ONTOLOGY_DIR = `${CONFIG_DIR}/ontology`;
 /** Deep-research templates: what an external agent is told when asked to write a wiki page (see src/research). */
 export const RESEARCH_DIR = `${CONFIG_DIR}/research`;
+/** The chat entry's protocol and per-turn prompt (src/chat). */
+export const CHAT_DIR = `${CONFIG_DIR}/chat`;
 
 export const LEDGER_DIR = 'ledger';
 export const ATTIC_DIR = `${LEDGER_DIR}/attic`;

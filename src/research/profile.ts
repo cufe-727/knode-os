@@ -4,7 +4,8 @@ import matter from 'gray-matter';
 import { parseYaml } from '../compiler/intents.js';
 import { KnodeConfig } from '../config.js';
 import { RESEARCH_DIR } from '../fs/layout.js';
-import { PHASES, ResearchTemplate } from './templates.js';
+import { agentWebCapable, ResearchAgent } from './agent.js';
+import { PHASES, PhaseName, ResearchTemplate } from './templates.js';
 
 /**
  * Research profiles — the harness-independent description of *how* a deep
@@ -395,8 +396,18 @@ export function rolePromptPath(role: ResearchRole): string {
   return role.prompt || `phases/${role.phase}.md`;
 }
 
-/** The prompt text a role runs with: its file when present, else the built-in phase prompt. */
-export function rolePromptText(dataDir: string, role: ResearchRole): { text: string; path: string; isDefault: boolean; exists: boolean } {
+/**
+ * The prompt text a role runs with: the template's own phase prompt when the
+ * kind declares one (`override`, e.g. init), else the role's file when
+ * present, else the built-in phase prompt.
+ */
+export function rolePromptText(dataDir: string, role: ResearchRole, override?: string): { text: string; path: string; isDefault: boolean; exists: boolean } {
+  if (override) {
+    const abs = path.join(dataDir, RESEARCH_DIR, override);
+    if (fs.existsSync(abs)) return { text: fs.readFileSync(abs, 'utf8'), path: `${RESEARCH_DIR}/${override}`, isDefault: false, exists: true };
+    const builtin = PHASES[override.replace(/^phases\//, '').replace(/\.md$/, '') as PhaseName];
+    if (builtin) return { text: builtin, path: `${RESEARCH_DIR}/${override}`, isDefault: false, exists: false };
+  }
   const rel = rolePromptPath(role);
   const abs = path.join(dataDir, RESEARCH_DIR, rel);
   const builtin = PHASES[role.phase];
@@ -425,8 +436,8 @@ export function withPhaseMarker(text: string, phase: string): string {
   return /^\s*<!--\s*knode-phase:/.test(text) ? text : `<!-- knode-phase: ${phase} -->\n${text}`;
 }
 
-export function rolePrompt(dataDir: string, role: ResearchRole, vars: Record<string, string>): string {
-  return withPhaseMarker(fillPrompt(rolePromptText(dataDir, role).text, vars), role.phase);
+export function rolePrompt(dataDir: string, role: ResearchRole, vars: Record<string, string>, override?: string): string {
+  return withPhaseMarker(fillPrompt(rolePromptText(dataDir, role, override).text, vars), role.phase);
 }
 
 /* ------------------------------------------------------------------ effective settings */
@@ -449,10 +460,15 @@ export function effectivePipeline(profile: ResearchProfile, config: KnodeConfig)
  * never, `research` always, `verify` only for verify jobs — unless the profile
  * or the role says `on`, which widens `verify` to every kind (never `off`).
  * A role or profile saying `off` always wins.
+ *
+ * The agent has the final say: only the CLIs ship a web tool, so a built-in
+ * session is masked to `false` here rather than being handed a brief that
+ * promises external verification it cannot perform.
  */
-export function webAllowed(input: { gate: 'off' | 'verify' | 'research'; kind: string; profile: ResearchProfile; role?: ResearchRole | null }): boolean {
+export function webAllowed(input: { gate: 'off' | 'verify' | 'research'; kind: string; profile: ResearchProfile; role?: ResearchRole | null; agent?: ResearchAgent | null }): boolean {
   const { gate, kind, profile, role } = input;
   if (gate === 'off') return false;
+  if (input.agent !== undefined && !agentWebCapable(input.agent)) return false;
   const roleWeb = role?.tools.web ?? 'inherit';
   if (roleWeb === 'off' || (roleWeb === 'inherit' && profile.search.web === 'off')) return false;
   if (gate === 'research') return true;

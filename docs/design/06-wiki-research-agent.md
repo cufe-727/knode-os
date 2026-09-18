@@ -15,9 +15,9 @@ materialized views (stubs, source summaries, community pages) — nothing "deepl
 
 | Decision | Outcome |
 | --- | --- |
-| D1 runner | built into knode‑os: a persistent job queue inside `serve` launches the user's claude / codex / cursor CLI headlessly; an export‑bundle → run by hand → `reclaim` mode also exists |
+| D1 runner | built into knode‑os: a persistent job queue inside `serve` launches the configured agent — the user's claude / codex / cursor CLI headlessly, or the **built‑in agent** (a LangChain `deepagents` loop in the `serve` process) on an OpenAI‑compatible connection, for machines with no CLI installed; an export‑bundle → run by hand → `reclaim` mode also exists. `research.agent` names one explicitly; there is no fallback to the default LLM provider (see 2026‑09‑18) |
 | D1a how the agent reaches knode | **MCP first, hosted by `serve` over Streamable HTTP** (`POST /mcp`); `raw/docs`, `wiki`, `.sidecar` mounted read‑only; **every write goes through `knode_write`**. Not "the agent shells out to the knode‑os CLI" (reopens the index per call, unstructured output, shell permissions) |
-| D2 page status | an agent‑written page is a **Source**: `actor: agent/<cli>` → quarantined; its `aliases / relations / claims` enter the graph, disputes open where it contradicts trusted facts; a person promotes it |
+| D2 page status | an agent‑written page is a **Source**: `actor: agent/<cli>` (or `agent/deep-agents`) → quarantined; its `aliases / relations / claims` enter the graph, disputes open where it contradicts trusted facts; a person promotes it |
 | D3 entity resolution | deterministic at write time (NFKC / width / corporate‑suffix folding + exact name/alias key match); fuzzy candidates go to a nightly audit → `merge` suggestions → a person → reversible link |
 | D4 relation ontology | configurable packs (`playbooks/ontology/*.yaml`) with built‑in `core` and `organization` |
 
@@ -139,7 +139,7 @@ A profile lifts *how* to research out of the harness: one YAML answers how hard 
 | `stop` | `maxSections`; `marginalGain` | outline cap (enforced in code); "stop a section when a search round adds nothing new" (in the brief) |
 | `output` | `citations`; `uncertainty`; `evidenceTable` | in the brief; `evidenceTable` makes `## 证据表` a required section (validator and outline) |
 | `pipeline` | `'' / single / team / native` | empty = follow `research.pipeline` |
-| `roles[]` | `id, title, phase, enabled, agent, model, effort, tools{write, files, web}, parallel, rounds, maxTurns, prompt, native, description` | the sub-agents (see 5b); empty `agent` = `research.agent`, empty `prompt` = `phases/<phase>.md` |
+| `roles[]` | `id, title, phase, enabled, agent, model, effort, tools{write, files, web}, parallel, rounds, maxTurns, prompt, native, description` | the sub-agents (see 5b); empty `agent` = `research.agent`, empty `prompt` = `phases/<phase>.md`. The built-in agent supports `native` roles too — they become deepagents sub-agents |
 
 Four built-ins (deleting one resets it): `default` (team; effort and web follow the CLI and review defaults), `quick` (single session, medium, cached, at most 4 sections), `thorough` (max, 5 parallel researchers, 2 review rounds, 2 sources per fact, evidence table), `native` (native sub-agents, high). The brief gains a "研究规范 (profile: …)" block that states these as rules the agent reads.
 
@@ -176,6 +176,6 @@ still in a page, pages in open disputes. Report page `wiki/lint/<date>.md`; nigh
 1. Codex HTTP‑MCP auth uses `bearer_token_env_var` per its CLI help; workspace fields travel in the query string.
 2. Whether cursor‑agent's `--add-dir` is read‑only and whether `--mode ask` blocks MCP writes is untested.
 3. Concurrent applies on the Postgres backend may create transient duplicate entities (PGlite serializes transactions); the audit proposes the merge.
-4. The macOS app has no Wiki tab or Deep research settings yet (the web UI does); server changes need `macos/scripts/package-app.sh`.
+4. Server changes need `macos/scripts/package-app.sh` to repackage the macOS app. Initialization (kind = `init`), the chat entry and the later runner improvements are in [07 — Initialization and chat](07-init-and-chat.md).
 5. Native sub-agent mode follows the official configuration references (claude `--agents` description / prompt / tools / model; codex `agents.*` and `developer_instructions` in the per-role layer) but has not been run against real CLIs; cursor-agent's `effort` has only been seen as `high`, so `xhigh` / `max` map to `high`.
 6. `claude --effort` needs a recent CLI (older ones exit on the unknown flag), which is why the built-in `default` profile uses effort `default` (no flag); pick `thorough` or your own profile for `max`.

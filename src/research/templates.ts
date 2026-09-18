@@ -3,6 +3,7 @@ import path from 'node:path';
 import { RESEARCH_DIR } from '../fs/layout.js';
 import { parseFrontmatter } from '../markdown.js';
 import { slugify } from '../graph/store.js';
+import type { RolePhase } from './profile.js';
 
 /**
  * Research templates — what an external agent is told when knode-os asks it
@@ -16,9 +17,17 @@ import { slugify } from '../graph/store.js';
  * frontmatter keys and sections) the validator enforces.
  */
 
-export type ResearchKind = 'entity' | 'concept' | 'comparison' | 'timeline' | 'question' | 'refresh' | 'verify';
+export type ResearchKind = 'entity' | 'concept' | 'comparison' | 'timeline' | 'question' | 'refresh' | 'verify' | 'init';
 
-export const RESEARCH_KINDS: ResearchKind[] = ['entity', 'concept', 'comparison', 'timeline', 'question', 'refresh', 'verify'];
+export const RESEARCH_KINDS: ResearchKind[] = ['entity', 'concept', 'comparison', 'timeline', 'question', 'refresh', 'verify', 'init'];
+
+/** A second file a template asks the agent to write next to the page (the knowledge-base guide for `init`). */
+export interface TemplateCompanion {
+  /** Relative to the data dir; must be a writable path (see fs/files isWritablePath). */
+  path: string;
+  /** Headings the file must carry. */
+  sections: string[];
+}
 
 export interface ResearchTemplate {
   /** File stem under playbooks/research/. */
@@ -31,6 +40,10 @@ export interface ResearchTemplate {
   /** The instructions the agent reads, with `{target}` `{query}` `{output}` `{actor}` `{research}` placeholders. */
   body: string;
   path: string;
+  /** Extra output files with their own required sections (validated like the page's sections). */
+  companions: TemplateCompanion[];
+  /** Phase prompts this kind runs instead of the profile's (relative to playbooks/research/). */
+  phases: Partial<Record<RolePhase, string>>;
 }
 
 export const PROTOCOL_FILE = 'AGENTS.md';
@@ -41,6 +54,7 @@ const PROTOCOL = `# knode-os 研究协议（所有研究任务共用）
 
 ## 工作流程
 
+0. 不熟悉这个知识库时先看它的自述：\`knode_read\` 读数据目录根的 \`AGENTS.md\`（知识库指南：有什么、怎么命名、哪类问题先调哪个工具；本文件末尾也附有一份），再 \`knode_survey\` 看当前的目录、实体类型、谓词与时间范围。
 1. 先读 \`brief.md\`：目标、输出路径、必需的 frontmatter 键与章节、可用的关系谓词、已有页面（如有）、上一次被退回的原因（如有）。
 2. 起步：调用 \`knode_resolve\`（query 用 brief 的目标，带上 brief 给的 \`workset\`），拿到匹配实体、已知事实（facts）、相关文档、缺口（unknowns）和 receiptId；必要时再 \`knode_context_pack\`。
 3. 深挖，直到每个章节都有依据：
@@ -267,9 +281,90 @@ requires:
 frontmatter：\`type: review\`，\`title: 核实：{target}\`，另有 \`sameAs\`、\`notSameAs\`、\`relations\`、\`claims\`、\`sources\`。
 `;
 
-const BUILTIN: Record<ResearchKind, string> = { entity: ENTITY, concept: CONCEPT, comparison: COMPARISON, timeline: TIMELINE, question: QUESTION, refresh: REFRESH, verify: VERIFY };
 
-export type PhaseName = 'plan' | 'research' | 'synthesize' | 'review' | 'revise' | 'orchestrate';
+const INIT = `---
+type: research-template
+kind: init
+output: wiki/overview.md
+maxTurns: 60
+requires:
+  frontmatter: [type, title, sources, actor, research]
+  sections: ["## 知识库是什么", "## 主题地图", "## 核心实体", "## 资料概况", "## 时间范围与时效", "## 缺口与建议", "## 来源"]
+companions:
+  - path: AGENTS.md
+    sections: ["## 知识库是什么", "## 资料与目录", "## 本体与命名", "## 如何查询", "## 如何写入与学习", "## 已知缺口", "## 人工备注"]
+phases:
+  plan: phases/init-plan.md
+  research: phases/init-research.md
+  synthesize: phases/init-synthesize.md
+---
+# 知识库初始化
+
+这不是研究某个实体，而是给**整个知识库**做一次初始化：写一页总览（\`{output}\`）和一份给后来 agent 看的指南（数据目录根的 \`AGENTS.md\`）。目标是：一个从没见过这个知识库的 agent，读完这两份文件就知道库里有什么、按什么规范组织、遇到什么问题先调哪个工具、怎么把新知识写回来。
+
+## 步骤
+
+1. **摸底**：brief 附有系统预先整理的「知识库概况」（文档目录、实体类型与谓词、claims、时间范围、已有 wiki 页、本体包）。用 \`knode_survey\` 取最新数字，\`knode_ls\` / \`knode_read\` 看目录与代表性文档，\`knode_graph_insights\` / \`knode_graph_search\` 看实体簇与枢纽，\`knode_claims\`（order=timeline）看时间跨度，\`knode_query\`（source=catalog）在需要精确计数时写 SQL。
+2. **主题地图**：把资料按主题分成 3–8 块，每块写清代表文档、涉及实体、时间范围。值得单独成页的主题在规划阶段列成 topics（系统会把它们作为后续研究任务排队）；总览里用 \`[[页面名]]\` 链接已有页面，未成页的写"（待研究）"。
+3. **核心实体**：按类型列出提及最多、关系最密的实体（用规范名，附别名），说明它们之间最重要的关系。
+4. **资料概况**：目录含义、文件类型、数量、来源渠道、更新节奏；PDF / 图片的转换文本在 \`.sidecar/<路径>/content.md\`。
+5. **时间范围与时效**：资料覆盖的时段、最新资料日期、哪些内容可能过期。
+6. **缺口与建议**：没有资料的时段 / 主题、抽取明显缺失（extraction_queue 未清空、未知谓词、待合并实体）、互相矛盾的地方、建议下一步研究什么。
+7. **指南**：按下面的骨架写 \`AGENTS.md\`，每节 3–12 行，只写可操作、可核查的内容（路径、工具名、谓词 id、命名规范），不写泛泛的工具说明；\`## 人工备注\` 只写标题，正文由系统从上一版原样保留。
+
+## 总览页骨架
+
+\`\`\`markdown
+---
+type: overview
+title: 知识库总览
+description: 一句话说明这个知识库是什么
+selfEntity: false
+sources: []
+actor: {actor}
+research: {research}
+---
+# 知识库总览
+
+## 知识库是什么
+## 主题地图
+## 核心实体
+## 资料概况
+## 时间范围与时效
+## 缺口与建议
+## 来源
+\`\`\`
+
+## 指南骨架（AGENTS.md，数据目录根）
+
+\`\`\`markdown
+# 知识库指南
+
+## 知识库是什么
+领域、用途、规模（文档 / 实体 / claims 数）、更新节奏。
+
+## 资料与目录
+raw/docs 各子目录放什么、时间范围、代表文档路径；wiki 各目录；.sidecar 的用法。
+
+## 本体与命名
+实体类型与关系谓词 id（来自本体包）、规范名与别名习惯、容易混淆的实体。
+
+## 如何查询
+按问题类型给出工具顺序（knode_resolve → knode_search mode=sag / knode_claims / knode_graph_search / knode_query source=catalog）、好用的关键词、workset 用法。
+
+## 如何写入与学习
+knode_write 的路径约定、必需 frontmatter、quarantine 与 promote、dispute。
+
+## 已知缺口
+没有资料的时段 / 主题、抽取缺失、未知谓词、待合并实体。
+
+## 人工备注
+\`\`\`
+`;
+
+const BUILTIN: Record<ResearchKind, string> = { entity: ENTITY, concept: CONCEPT, comparison: COMPARISON, timeline: TIMELINE, question: QUESTION, refresh: REFRESH, verify: VERIFY, init: INIT };
+
+export type PhaseName = 'plan' | 'research' | 'synthesize' | 'review' | 'revise' | 'orchestrate' | 'init-plan' | 'init-research' | 'init-synthesize';
 
 /**
  * The team pipeline's phase prompts (research.pipeline = "team"). Each is a
@@ -348,6 +443,52 @@ export const PHASES: Record<PhaseName, string> = {
 
 子代理没有 knode_write；只有你写页。子代理返回的内容没有来源就不要采用。
 `,
+  'init-plan': `<!-- knode-phase: plan -->
+# 阶段 1：规划知识库初始化
+
+你是研究团队的负责人。这个任务不是研究某个实体，而是给**整个知识库**写一页总览（{output}）和一份给后来 agent 看的指南（数据目录根的 AGENTS.md）。先读后面附上的简报——「知识库概况」里有文档目录、实体类型与谓词、claims、时间范围、已有页面与缺口——再用 knode_survey / knode_ls / knode_graph_insights / knode_search（mode=sag）快速摸底，不超过 {maxTurns} 轮。
+
+只输出一个 JSON 对象，不要其他文字：
+{"sections":[{"title":"## 主题地图","questions":["资料按主题能分成哪几块？每块的代表文档是什么？"],"queries":["…"],"entities":["…"]}],"topics":[{"kind":"concept|entity|timeline|comparison","target":"…","why":"为什么值得单独写一页"}],"notes":"整体判断，一两句"}
+
+规则：
+- sections 必须覆盖简报列出的必需章节（可以增加，不能遗漏）；「来源」由主笔汇总，不必单列。每个 section 是一个可以独立调查的领域：questions 写清要回答什么，queries 给检索词，entities 列涉及的实体。
+- topics 给 4–12 条，按"读者最先需要懂什么"排序：一组文档共同讨论的主题 → concept；提及多、关系密但还没有研究页的实体 → entity；有连续事件的对象 → timeline；总被放在一起比较的对象 → comparison。target 用知识库里的规范名。
+`,
+  'init-research': `<!-- knode-phase: research -->
+# 阶段 2：调查「{section}」（知识库初始化）
+
+你是研究团队的一名研究员，只负责总览页的这一节。调查对象是整个知识库，不是某个实体：用 knode_survey 看总体数字，knode_ls / knode_read 看目录与代表性文档，knode_graph_search / knode_graph_insights 看实体簇与枢纽，knode_claims（order=timeline）看时间跨度，knode_query（source=catalog）在需要精确计数时写 SQL；所有读取都带 workset \`{workset}\`。**不要写任何页面**（不要调用 knode_write / knode_commit）。
+
+要回答的问题：
+{questions}
+
+建议检索词：{queries}
+
+输出 Markdown（不要 frontmatter），固定结构：
+
+## 发现
+- 每条一行：结论 · 依据（路径，或工具名 + 参数）
+
+## 值得单独成页的主题
+- {"kind":"concept|entity|timeline|comparison","target":"…","why":"…"}
+
+## 给指南的提示
+- 后来的 agent 查这一块该先用什么工具、什么关键词、哪些目录最有用、有什么坑
+
+## 缺口
+- 没有资料 / 资料互相矛盾 / 抽取明显缺失的地方
+`,
+  'init-synthesize': `<!-- knode-phase: synthesize -->
+# 阶段 3：写总览与指南
+
+你是主笔。后面附上任务简报（含「知识库概况」与上一版指南，如有）和各研究员的发现。用 knode_write 写**两个文件**，然后收尾：
+
+1. \`{output}\`：知识库总览页，按简报的输出契约与模版骨架写；frontmatter 保留 \`selfEntity: false\`；主题地图用 \`[[页面名]]\` 链接已有页面，尚未成页的主题写"（待研究）"；每条判断给依据（来源路径或工具）；sources 列出引用过的路径。
+2. \`AGENTS.md\`（数据目录根，knode_write 的 path 就是 \`AGENTS.md\`）：给后来 agent 的指南，章节固定为简报列出的指南必需章节。每节 3–12 行，只写可操作的内容——目录路径、实体类型与谓词 id、规范名 / 别名习惯、按问题类型该先调哪个 knode_* 工具、写页与写笔记的路径约定与 frontmatter、明确的空白与陷阱。\`## 人工备注\` 只写标题，正文由系统从上一版原样保留。
+
+规则：发现里没有依据的事实不写；矛盾与缺口写进「缺口与建议」/「已知缺口」；简报里标注为人写的段落原样保留。写完后 knode_feedback（receipt 见简报，若有）并 knode_commit（workset \`{workset}\`，content 写一段初始化日志：看了什么、总览与指南各写了什么、还缺什么）。
+`,
 };
 
 /** Seed the phase prompts once (never overwrites user edits). */
@@ -399,6 +540,40 @@ function strings(v: unknown): string[] {
   return v.map(String).map((s) => s.trim()).filter(Boolean);
 }
 
+/** A path inside the data dir / playbooks/research: posix, no `..`, no absolute paths; '' when unusable. */
+function cleanRelPath(v: unknown): string {
+  const s = typeof v === 'string' ? v.trim().replace(/\\/g, '/') : '';
+  if (!s) return '';
+  const norm = path.posix.normalize(s);
+  if (norm.startsWith('/') || norm.startsWith('..') || norm === '.' || /(^|\/)\.\.(\/|$)/.test(norm)) return '';
+  return norm;
+}
+
+function parseCompanions(v: unknown): TemplateCompanion[] {
+  if (!Array.isArray(v)) return [];
+  const out: TemplateCompanion[] = [];
+  for (const raw of v) {
+    if (!raw || typeof raw !== 'object') continue;
+    const o = raw as Record<string, unknown>;
+    const p = cleanRelPath(o.path);
+    if (!p) continue;
+    out.push({ path: p, sections: strings(o.sections) });
+  }
+  return out;
+}
+
+const TEMPLATE_PHASE_KEYS = ['plan', 'research', 'synthesize', 'review', 'revise'] as const;
+
+function parsePhases(v: unknown): Partial<Record<RolePhase, string>> {
+  const out: Partial<Record<RolePhase, string>> = {};
+  if (!v || typeof v !== 'object') return out;
+  for (const phase of TEMPLATE_PHASE_KEYS) {
+    const p = cleanRelPath((v as Record<string, unknown>)[phase]);
+    if (p) out[phase] = p;
+  }
+  return out;
+}
+
 export function parseResearchTemplate(text: string, name: string, filePath: string): ResearchTemplate | null {
   const { frontmatter: fm, body } = parseFrontmatter(text);
   if (fm.type !== 'research-template') return null;
@@ -414,7 +589,15 @@ export function parseResearchTemplate(text: string, name: string, filePath: stri
     requires: { frontmatter: strings(requires.frontmatter), sections: strings(requires.sections) },
     body: body.trim(),
     path: filePath,
+    companions: parseCompanions(fm.companions),
+    phases: parsePhases(fm.phases),
   };
+}
+
+/** What a job is about, for prompts and the brief: an init job is about the whole base. */
+export function subjectOf(job: { kind: ResearchKind; target: string | null; query: string | null }): string {
+  if (job.kind === 'init') return job.target ?? '本知识库';
+  return job.kind === 'question' ? job.query ?? job.target ?? '' : job.target ?? job.query ?? '';
 }
 
 /** Every template under playbooks/research (built-ins seeded if missing), keyed by file stem. */
@@ -461,7 +644,7 @@ export function renderOutputPath(template: ResearchTemplate, job: { kind: Resear
     if (!job.target) throw new Error('a refresh job needs the page path as its target');
     return job.target.replace(/\\/g, '/').replace(/^\/+/, '');
   }
-  const subject = job.kind === 'question' ? job.query ?? job.target ?? '' : job.target ?? job.query ?? '';
+  const subject = subjectOf(job);
   const date = new Date().toISOString().slice(0, 10);
   return template.output
     .replace(/\{slug\}/g, researchSlug(subject) || 'untitled')

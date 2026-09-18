@@ -31,7 +31,7 @@ export interface ValidationReport {
   normalized: boolean;
 }
 
-function headingPresent(body: string, heading: string): boolean {
+export function headingPresent(body: string, heading: string): boolean {
   const want = heading.replace(/^#+\s*/, '').trim().toLowerCase();
   return body.split('\n').some((line) => {
     const m = /^(#{1,6})\s+(.*?)\s*$/.exec(line.trim());
@@ -176,4 +176,46 @@ export async function validateResearchPage(
   }
 
   return { ok: errors.length === 0, errors, warnings, frontmatter: fm, normalized };
+}
+
+/**
+ * The template's companion files (an init job's AGENTS.md guide): present,
+ * substantial, carrying every required heading. Errors block like page
+ * errors; dangling wikilinks and a stray frontmatter are warnings.
+ */
+export function validateCompanions(ctx: AppContext, ws: RunWorkspace): { errors: string[]; warnings: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const companions = ws.companions ?? [];
+  if (companions.length === 0) return { errors, warnings };
+  const index = buildWikiIndex(ctx.dataDir, 'wiki');
+  for (const c of companions) {
+    let abs: string;
+    try {
+      abs = safePath(ctx.dataDir, c.path);
+    } catch {
+      errors.push(`${c.path}: not a path inside the data directory`);
+      continue;
+    }
+    if (!fs.existsSync(abs)) {
+      errors.push(`no file at ${c.path} — the agent must write it with knode_write (path "${c.path}")`);
+      continue;
+    }
+    const text = fs.readFileSync(abs, 'utf8');
+    // the runner stamps and merges afterwards, so an unchanged file means the agent never wrote it
+    if (c.backupPath && fs.existsSync(c.backupPath) && fs.readFileSync(c.backupPath, 'utf8') === text) {
+      errors.push(`${c.path} was not rewritten — write it with knode_write (path "${c.path}"), it still holds the previous version`);
+      continue;
+    }
+    if (text.trim().length < 400) errors.push(`${c.path} is too short (${text.trim().length} chars) — write the whole guide`);
+    if (/^---\r?\n/.test(text)) warnings.push(`${c.path} starts with YAML frontmatter; the guide is plain Markdown`);
+    for (const heading of c.sections) {
+      if (!headingPresent(text, heading)) errors.push(`${c.path}: missing section ${heading}`);
+    }
+    for (const link of extractObsidianLinks(text)) {
+      const base = `${path.posix.basename(link.target.replace(/\.md$/i, ''))}.md`.toLowerCase();
+      if (!index.byBasename.has(base)) warnings.push(`${c.path}: wikilink [[${link.target}]] has no page yet`);
+    }
+  }
+  return { errors, warnings };
 }

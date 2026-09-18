@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { AppContext } from '../context.js';
+import { mcpInstructions } from './instructions.js';
 import { registerKnodeTools } from './tools.js';
 
 export const MCP_SERVER_INFO = { name: 'knode-os', version: '0.2.0' } as const;
@@ -15,7 +16,7 @@ export const MCP_SERVER_INFO = { name: 'knode-os', version: '0.2.0' } as const;
  * serve mounts instead (`knode-os connect <client> --http`).
  */
 export async function startMcpServer(ctx: AppContext): Promise<void> {
-  const server = new McpServer(MCP_SERVER_INFO);
+  const server = new McpServer(MCP_SERVER_INFO, { instructions: mcpInstructions(ctx.dataDir) });
   registerKnodeTools(server, ctx);
   const transport = new StdioServerTransport();
   await server.connect(transport);

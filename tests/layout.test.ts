@@ -6,7 +6,7 @@ import { loadIntents } from '../src/compiler/intents.js';
 import { loadRecipes } from '../src/compiler/recipes.js';
 import { createContext } from '../src/context.js';
 import { assertSupportedLayout, initDataDir, LegacyLayoutError } from '../src/fs/datadir.js';
-import { isWritablePath } from '../src/fs/files.js';
+import { assertSourcePath, cleanRelPath, isRootWritableFile, isWritablePath } from '../src/fs/files.js';
 import { loadPlaybooks } from '../src/pack/playbook.js';
 
 /** Data layout v3: playbooks/ holds the configuration, .sidecar/ the derived state, no cooked/ copies. */
@@ -83,5 +83,26 @@ describe('data layout v3', () => {
     expect(isWritablePath('raw/docs/.sidecar/a.md')).toBe(false);
     expect(isWritablePath('cooked/docs/a.md')).toBe(false);
     expect(isWritablePath('ledger/events.jsonl')).toBe(false);
+  });
+
+  it('judges a path by where it lands, not how it is spelled', () => {
+    // `wiki/../knode.config.json` stays inside the data dir, so safePath alone would allow it
+    expect(isWritablePath('wiki/../knode.config.json')).toBe(false);
+    expect(isWritablePath('wiki/../purpose.md')).toBe(false);
+    expect(isWritablePath('raw/docs/../../ledger/events.jsonl')).toBe(false);
+    expect(isWritablePath('wiki/concepts/../notes/x.md')).toBe(true);
+    expect(isWritablePath('./wiki/x.md')).toBe(true);
+    expect(isWritablePath('/wiki/x.md')).toBe(true);
+    expect(isWritablePath('')).toBe(false);
+    expect(isWritablePath('..')).toBe(false);
+    // the guide is writable at the root, under any spelling, and is never a source
+    expect(isWritablePath('AGENTS.md')).toBe(true);
+    expect(isWritablePath('./CLAUDE.md')).toBe(true);
+    expect(isRootWritableFile('wiki/../AGENTS.md')).toBe(true);
+    expect(isRootWritableFile('wiki/AGENTS.md')).toBe(false);
+    expect(() => assertSourcePath('wiki/../AGENTS.md')).toThrow(/guide, not a source/);
+    expect(() => assertSourcePath('wiki/entities/x.md')).not.toThrow();
+    expect(cleanRelPath('wiki/../AGENTS.md')).toBe('AGENTS.md');
+    expect(cleanRelPath('wiki/')).toBe('wiki');
   });
 });

@@ -95,7 +95,23 @@ export async function applyTier1Scope(
  * Drain one batch from the extraction queue, respecting the daily token
  * budget. Called periodically while `serve` runs, or manually via the CLI.
  */
-export async function runTier1Pass(
+// One pass at a time per data dir: serve's timer, `knode-os extract` and an
+// initialization job draining the queue must never pick the same batch twice.
+const tier1Chains = new Map<string, Promise<unknown>>();
+
+export function runTier1Pass(
+  store: Store,
+  config: KnodeConfig,
+  llm: LlmClient,
+  opts: { onProgress?: (msg: string) => void; batchSize?: number; concurrency?: number } = {},
+): Promise<Tier1Stats> {
+  const previous = tier1Chains.get(store.dataDir) ?? Promise.resolve();
+  const run = previous.then(() => runTier1PassUnlocked(store, config, llm, opts));
+  tier1Chains.set(store.dataDir, run.catch(() => {}));
+  return run;
+}
+
+async function runTier1PassUnlocked(
   store: Store,
   config: KnodeConfig,
   llm: LlmClient,

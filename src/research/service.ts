@@ -13,7 +13,7 @@ import { McpEndpoint } from './workspace.js';
 export function startResearchLoop(
   ctx: AppContext,
   opts: { mcp: () => McpEndpoint | null; log: (msg: string) => void; intervalMs?: number },
-): { stop: () => Promise<void> } {
+): { stop: () => Promise<void>; kick: () => void } {
   let disposed = false;
   let running = 0;
   const inflight = new Set<Promise<unknown>>();
@@ -30,7 +30,7 @@ export function startResearchLoop(
       const agent = resolveResearchAgent(ctx.config);
       if (!agent) {
         if (!warnedNoAgent) {
-          opts.log('research: no agent configured (research.agent) — queued jobs wait');
+          opts.log(`research: no agent configured — queued jobs wait. Set research.agent in knode.config.json to a CLI (claude-cli / codex-cli / cursor-cli), a connection id, or 'default' to run the built-in agent on the default LLM connection`);
           warnedNoAgent = true;
         }
         return;
@@ -67,5 +67,7 @@ export function startResearchLoop(
       killActiveAgents();
       await Promise.allSettled([...inflight]);
     },
+    /** Claim queued work now instead of at the next tick (a job was just queued from the UI). */
+    kick: () => void tick(),
   };
 }

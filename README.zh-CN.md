@@ -166,6 +166,10 @@ knode-os wiki generate        生成文档摘要页与实体页
 knode-os wiki refine          tier-2:热点社区概念页 + 断言审计 + 热门话题块
 knode-os trace sync           拉取新的 Claude Code / Codex trace 与 skills
 knode-os dream [--lookback d] 先同步 trace,再分析 → skills/memory/知识库建议
+knode-os research init [--now]  初始化知识库:先索引与抽取,再由 agent 写出 wiki/overview.md 与
+                              AGENTS.md / CLAUDE.md 指南,并把值得单独成页的主题排进队列
+knode-os chat "<消息>" [-c <会话>]  和配置好的 CLI 聊知识库(它经 MCP 回答,并把你教的内容写成隔离笔记);
+                              chat list 查看最近的会话
 knode-os mcp                  在 stdio 上运行 MCP 服务
 knode-os connect claude|codex 把 MCP 服务注册到 agent CLI
 knode-os config               查看当前配置(密钥已脱敏)
@@ -176,15 +180,16 @@ knode-os config               查看当前配置(密钥已脱敏)
 ## 在 Claude Code / Codex 中使用
 
 > `serve` 运行时会在 `/mcp` 提供 Streamable HTTP 的 MCP 端点（token 在 `<data>/.knode/mcp-token`），`knode-os connect claude|codex|cursor` 默认注册它（`--stdio` 才是独立进程）；`review` 配置块控制审核强度（写入时只按精确拼写合并、LLM 复核合并候选与争议断言、`verify` 任务可联网核实）；`research.pipeline: team` 让研究任务按「规划、并行调查、综合、评审、修订」五个阶段跑（`native` 则把角色注册为 CLI 的原生子代理）；`research.profile` 选一份研究 profile（`playbooks/research/profiles/*.yaml`：推理强度、联网新鲜度、核实门槛，以及每个子代理的 CLI、模型、工具与提示词，内置 default / quick / thorough / native，可在 Settings → Deep research 里编辑）；
-> `knode-os research queue entity 宁德时代 --now` 让配置好的 coding-agent CLI（`research.agent`）研究并写出 wiki 页，页面以隔离状态入库，审核后提升；
-> `knode-os entities dedupe|merge|unmerge`、`knode-os wiki lint`、`knode-os research recommend`、`knode-os research profiles` 见 [docs/design/06](docs/design/06-wiki-research-agent.zh-CN.md)。
+> `knode-os research queue entity 宁德时代 --now` 让配置好的 agent（`research.agent`：一个 coding-agent CLI，或跑在 OpenAI 兼容连接上的内置 agent）研究并写出 wiki 页，页面以隔离状态入库，审核后提升；
+> `knode-os entities dedupe|merge|unmerge`、`knode-os wiki lint`、`knode-os research recommend`、`knode-os research profiles` 见 [docs/design/06](docs/design/06-wiki-research-agent.zh-CN.md);
+> 知识库初始化(`research init`)、对话入口(`chat`)与研究 agent 的后续改进见 [docs/design/07](docs/design/07-init-and-chat.zh-CN.md)。
 
 ```bash
 knode-os connect claude   # 执行 claude mcp add --scope user knode-os -- node <cli> mcp --data <dir>
 knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-os]
 ```
 
-暴露的 MCP 工具:`knode_resolve`(优先调这个,见下)、`knode_plan`、`knode_feedback`、`knode_capabilities`、`knode_checkout` / `knode_commit` / `knode_worksets`(为长任务锚定一致视图,结束时把结论写回为 Source)、`knode_absences`(查过但没找到的东西)、`knode_disputes` / `knode_trust`(矛盾,以及提升被隔离的写入)、`knode_subscribe`(订阅实体/源/意图的变化)、`knode_learning`(planner 学到了什么)、`knode_search`、`knode_graph_search`、`knode_claims`、`knode_ask`、`knode_ls`、`knode_read`(路径以 `/` 开头则读虚拟文件系统;raw/docs 下的 PDF/图片返回其派生 Markdown)、`knode_write`(仅限 wiki/、raw/docs 与 playbooks/packs/)、`knode_grep`、`knode_ingest` / `knode_sync`、`knode_lineage`、`knode_history`、`knode_forget`、`knode_okf_validate`、`knode_graph_insights`、`knode_suggestions`、`knode_context_pack`、`knode_datasources`、`knode_query`(只读原生 SQL,`source="catalog"` 可查知识库自身的 `v_*` 视图)。三条时间轴互相独立:`as_of`(系统时间:当时相信什么)、`valid_at` / `valid_range`(世界时间:断言何时成立)、`freshness`(实时读最多可以多旧);`kinds` / `sources` 限定哪些源可以作答。
+暴露的 MCP 工具:`knode_resolve`(优先调这个,见下)、`knode_plan`、`knode_feedback`、`knode_capabilities`、`knode_checkout` / `knode_commit` / `knode_worksets`(为长任务锚定一致视图,结束时把结论写回为 Source)、`knode_absences`(查过但没找到的东西)、`knode_disputes` / `knode_trust`(矛盾,以及提升被隔离的写入)、`knode_subscribe`(订阅实体/源/意图的变化)、`knode_learning`(planner 学到了什么)、`knode_search`、`knode_graph_search`、`knode_claims`、`knode_ask`、`knode_ls`、`knode_read`(路径以 `/` 开头则读虚拟文件系统;raw/docs 下的 PDF/图片返回其派生 Markdown)、`knode_write`(仅限 wiki/、raw/docs 与 playbooks/packs/)、`knode_grep`、`knode_ingest` / `knode_sync`、`knode_lineage`、`knode_history`、`knode_forget`、`knode_okf_validate`、`knode_graph_insights`、`knode_survey`(这个库里有什么,全是数字——陌生工作区的第一个调用)、`knode_suggestions`、`knode_context_pack`、`knode_datasources`、`knode_query`(只读原生 SQL,`source="catalog"` 可查知识库自身的 `v_*` 视图)。三条时间轴互相独立:`as_of`(系统时间:当时相信什么)、`valid_at` / `valid_range`(世界时间:断言何时成立)、`freshness`(实时读最多可以多旧);`kinds` / `sources` 限定哪些源可以作答。
 
 **用 `knode_resolve` 取代 search。** search 返回的是「文本长得像」的东西;resolve 会先算出这**类**问题的答案需要哪些槽位(`playbooks/intents/*.yaml` 里声明),把本地索引能答的部分直接答掉,剩下的编译成一份 plan 交给 agent 执行。填不上的必需槽位会出现在 `unknowns` 里,而不是用几篇看起来相关的文档糊过去。执行完用 `knode_feedback` 带上 receipt id 回报,下一次同类问题就会更准。
 
@@ -203,6 +208,8 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
 - **Ask** —— 带引用的问答与缺口分析
 - **Graph** —— 力导向图谱浏览 + 洞察(枢纽/孤立节点/类型分布)
 - **Traces** —— 已收集的 agent 会话
+- **Wiki** —— 一个按钮完成知识库初始化(通读 → 总览页 + AGENTS.md 指南 + 排队的主题页),并在此发起与审阅深度研究页
+- **Chat** —— 和配置好的 agent CLI 对话:问知识库知道什么,或把新知识教给它(以隔离笔记落库,确认后采纳)
 - **Dream** —— 手动触发 dream,审阅并接受/拒绝建议
 - **Settings** —— embedding 与独立的 Entity / Concept / 文档视觉模型路由；保存后按需重建 embedding 或刷新转换
 

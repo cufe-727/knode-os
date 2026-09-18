@@ -32,7 +32,7 @@ const helpers = path.join(path.dirname(fileURLToPath(import.meta.url)), 'helpers
 const fakeClaude = path.join(helpers, 'fake-claude.sh');
 const mcpStub = { url: 'http://127.0.0.1:1/mcp', token: 'tok', headers: { 'x-knode-user': 'admin' } };
 const baseSession = {
-  provider: 'claude-cli' as const, cliPath: '', model: '', maxTurns: 10, timeoutMs: 1000, cwd: '/tmp/run', prompt: 'hi', mcp: mcpStub,
+  agent: { kind: 'cli' as const, provider: 'claude-cli' as const, cliPath: '', model: '' }, maxTurns: 10, timeoutMs: 1000, cwd: '/tmp/run', prompt: 'hi', mcp: mcpStub,
   readDirs: ['/data/raw/docs'], jobId: 'j1', outputPath: 'wiki/entities/x.md', worksetId: 'ws1', tools: 'read' as const, label: 'research-1',
 };
 
@@ -174,17 +174,17 @@ describe('research profiles · CLI adapters', () => {
   });
 
   it('codex: live/cached/disabled web_search, reasoning effort and agent layers', () => {
-    const live = sessionArgs({ ...baseSession, provider: 'codex-cli', effort: 'max', allowNetwork: true, webFreshness: 'live' }).args;
+    const live = sessionArgs({ ...baseSession, agent: { ...baseSession.agent, provider: 'codex-cli' as const }, effort: 'max', allowNetwork: true, webFreshness: 'live' }).args;
     expect(live).toContain('web_search="live"');
     expect(live).toContain('model_reasoning_effort="xhigh"');
     expect(live).not.toContain('tools.web_search=true');
-    const cached = sessionArgs({ ...baseSession, provider: 'codex-cli', allowNetwork: true, webFreshness: 'cached' }).args;
+    const cached = sessionArgs({ ...baseSession, agent: { ...baseSession.agent, provider: 'codex-cli' as const }, allowNetwork: true, webFreshness: 'cached' }).args;
     expect(cached).toContain('web_search="cached"');
-    const off = sessionArgs({ ...baseSession, provider: 'codex-cli' }).args;
+    const off = sessionArgs({ ...baseSession, agent: { ...baseSession.agent, provider: 'codex-cli' as const } }).args;
     expect(off).toContain('web_search="disabled"');
     expect(off.some((a) => a.startsWith('model_reasoning_effort'))).toBe(false);
     const agents = [{ id: 'critic', title: '评审', description: '评审页面', prompt: "检查 '''页面'''", write: false, files: true, web: false, model: '', effort: 'high' as const }];
-    const native = sessionArgs({ ...baseSession, provider: 'codex-cli', agents, effort: 'high' }).args;
+    const native = sessionArgs({ ...baseSession, agent: { ...baseSession.agent, provider: 'codex-cli' as const }, agents, effort: 'high' }).args;
     expect(native).toContain('agents.enabled=true');
     expect(native).toContain('agents.critic.description="评审页面"');
     expect(native.some((a) => a.startsWith('agents.critic.config_file=') && a.includes('agents/critic.toml'))).toBe(true);
@@ -197,9 +197,9 @@ describe('research profiles · CLI adapters', () => {
   });
 
   it('cursor: effort rides in the model name; no effort without a model', () => {
-    const withModel = sessionArgs({ ...baseSession, provider: 'cursor-cli', model: 'gpt-5', effort: 'high' }).args;
+    const withModel = sessionArgs({ ...baseSession, agent: { ...baseSession.agent, provider: 'cursor-cli' as const, model: 'gpt-5' }, effort: 'high' }).args;
     expect(withModel[withModel.indexOf('--model') + 1]).toBe('gpt-5[effort=high]');
-    const noModel = sessionArgs({ ...baseSession, provider: 'cursor-cli', effort: 'high' }).args;
+    const noModel = sessionArgs({ ...baseSession, agent: { ...baseSession.agent, provider: 'cursor-cli' as const }, effort: 'high' }).args;
     expect(noModel).not.toContain('--model');
   });
 });
@@ -217,7 +217,7 @@ describe('research profiles · pipeline and API', () => {
   let app: ReturnType<typeof createApp>;
   let httpServer: Server;
   let mcp: { url: string; token: string; headers: Record<string, string> };
-  const agent = { provider: 'claude-cli' as const, cliPath: fakeClaude, model: '' };
+  const agent = { kind: 'cli' as const, provider: 'claude-cli' as const, cliPath: fakeClaude, model: '' };
 
   beforeAll(async () => {
     rootCtx = await createContext(root);

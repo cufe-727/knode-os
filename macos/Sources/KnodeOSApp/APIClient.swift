@@ -276,6 +276,50 @@ struct APIClient {
         try await send("/api/research/jobs/\(id)/retry", method: "POST", body: Data("{}".utf8))
     }
 
+    /// The initialization card: the survey, the guide and the newest init job.
+    func initStatus() async throws -> InitStatus {
+        try await send("/api/research/init")
+    }
+
+    func queueInit() async throws -> QueueResearchResponse {
+        try await send("/api/research/init", method: "POST", body: Data("{}".utf8))
+    }
+
+    /// One job with what its run directory knows (steps, phases) while it runs.
+    func researchJob(id: String) async throws -> ResearchJob {
+        try await send("/api/research/jobs/\(id)")
+    }
+
+    func chatConversations() async throws -> [ChatConversation] {
+        try await send("/api/chat/conversations?limit=50")
+    }
+
+    func createConversation() async throws -> ChatConversation {
+        try await send("/api/chat/conversations", method: "POST", body: Data("{}".utf8))
+    }
+
+    func conversation(id: String) async throws -> ChatConversation {
+        try await send("/api/chat/conversations/\(id)")
+    }
+
+    /// Starts a turn in the background; poll `chatStatus` until it is idle.
+    func sendChat(id: String, text: String) async throws -> ChatSendResponse {
+        struct Body: Encodable { var text: String }
+        return try await send("/api/chat/conversations/\(id)/messages", method: "POST", body: encoded(Body(text: text)))
+    }
+
+    func chatStatus(id: String) async throws -> ChatStatusResponse {
+        try await send("/api/chat/conversations/\(id)/status")
+    }
+
+    func cancelChat(id: String) async throws -> [String: Bool] {
+        try await send("/api/chat/conversations/\(id)/cancel", method: "POST", body: Data("{}".utf8))
+    }
+
+    func deleteConversation(id: String) async throws -> ActionResponse {
+        try await send("/api/chat/conversations/\(id)", method: "DELETE")
+    }
+
     func researchProfiles() async throws -> ResearchProfilesResponse {
         try await send("/api/research/profiles")
     }
@@ -344,5 +388,9 @@ struct APIClient {
 
     func cliTools() async throws -> CliToolsResponse {
         try await send("/api/config/cli-tools")
+    }
+
+    func availableAgents() async throws -> AvailableAgentsResponse {
+        try await send("/api/config/agents")
     }
 }

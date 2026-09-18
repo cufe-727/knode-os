@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { AppContext } from '../context.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES } from '../constants.js';
-import { assertWritablePath, grepFiles, listTree, safePath, writeFileText } from '../fs/files.js';
+import { assertSourcePath, assertWritablePath, grepFiles, listTree, safePath, writeFileText } from '../fs/files.js';
 import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
 import { graphInsights, graphSearch } from '../graph/query.js';
 import { sync } from '../ingest/sync.js';
@@ -30,6 +30,8 @@ import { resolveScopeFilter, resolveTemporal } from '../store/resolver.js';
 import { listDatasets, listSuggestions } from '../store/queries.js';
 import { validateOkfBundle } from '../okf/index.js';
 import { cancelJob, getJob, listJobs, queueJob } from '../research/jobs.js';
+import { killAgentsFor } from '../research/launch.js';
+import { surveyKnowledgeBase } from '../research/survey.js';
 import { loadResearchTemplates, RESEARCH_KINDS, ResearchKind } from '../research/templates.js';
 
 /**
@@ -159,7 +161,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
     'knode_write',
     {
       title: 'Write a knowledge file',
-      description: 'Create or overwrite a file under wiki/, raw/docs/ or playbooks/packs/ (other roots are read-only). The change is applied as a new source scope on the next sync.',
+      description: 'Create or overwrite a file under wiki/, raw/docs/ or playbooks/packs/, or the root AGENTS.md / CLAUDE.md knowledge-base guide (other roots are read-only). A source file is applied as a new scope on the next sync; the guide is never indexed.',
       inputSchema: { path: z.string(), content: z.string() },
     },
     async ({ path: p, content }) => {
@@ -224,7 +226,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
       inputSchema: { path: z.string() },
     },
     async ({ path: p }) => {
-      assertWritablePath(p);
+      assertSourcePath(p);
       return json(await forgetSource(ctx, p));
     },
   );
@@ -250,6 +252,16 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
       inputSchema: {},
     },
     async () => json(await graphInsights(ctx.store)),
+  );
+
+  server.registerTool(
+    'knode_survey',
+    {
+      title: 'Survey the knowledge base',
+      description: 'What this knowledge base holds, in numbers: documents by folder and date range, entities by type with the top ones, relation predicates (and unknown ones), claims by status, wiki pages (generated / written / researched), the ontology packs in force, live datasources, the extraction backlog, and whether an AGENTS.md guide exists. The orientation call for an agent that has not seen this base before; read the guide itself with knode_read "AGENTS.md".',
+      inputSchema: {},
+    },
+    async () => json(await surveyKnowledgeBase(ctx)),
   );
 
   server.registerTool(
@@ -567,9 +579,9 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
     {
       title: 'Deep-research wiki pages',
       description:
-        'Ask knode-os to have a coding-agent CLI research a topic and write a wiki page (entity / concept / comparison / timeline / question / refresh). action=queue adds a job (deduplicated; runs while `serve` is up and research.agent is configured), list shows recent jobs, status shows one job with its outcome and warnings, templates lists the page templates under playbooks/research. Pages written this way land quarantined until a person promotes them.',
+        'Ask knode-os to have a coding-agent CLI research a topic and write a wiki page (entity / concept / comparison / timeline / question / refresh). action=queue adds a job (deduplicated; runs while `serve` is up and research.agent is configured), init queues a knowledge-base initialization (extraction, then an overview page plus the AGENTS.md guide, with follow-up topic pages queued), list shows recent jobs, status shows one job with its outcome and warnings, cancel stops a job and kills its running sessions, templates lists the page templates under playbooks/research. Pages written this way land quarantined until a person promotes them.',
       inputSchema: {
-        action: z.enum(['queue', 'list', 'status', 'cancel', 'templates']),
+        action: z.enum(['queue', 'init', 'list', 'status', 'cancel', 'templates']),
         kind: z.enum(RESEARCH_KINDS as [ResearchKind, ...ResearchKind[]]).optional().describe('For queue (default entity; question uses `query`)'),
         target: z.string().optional().describe('Entity / concept name, "A vs B" for comparison, or a wiki page path for refresh'),
         query: z.string().optional().describe('For kind=question: the question to answer and file as a page'),
@@ -583,13 +595,17 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
         const k = kind ?? (query && !target ? 'question' : 'entity');
         return json(await queueJob(ctx.store, { kind: k, target, query, template, requestedBy: 'mcp' }));
       }
+      if (action === 'init') {
+        return json(await queueJob(ctx.store, { kind: 'init', requestedBy: 'mcp' }));
+      }
       if (action === 'status') {
         if (!id) throw new Error('status needs id');
         return json(await getJob(ctx.store, id));
       }
       if (action === 'cancel') {
         if (!id) throw new Error('cancel needs id');
-        return json({ cancelled: await cancelJob(ctx.store, id) });
+        const cancelled = await cancelJob(ctx.store, id);
+        return json({ cancelled, killed: cancelled ? killAgentsFor(id) : 0 });
       }
       if (action === 'templates') {
         return json([...loadResearchTemplates(ctx.dataDir).values()].map((t) => ({ name: t.name, kind: t.kind, output: t.output, requires: t.requires, path: t.path })));

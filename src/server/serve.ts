@@ -11,9 +11,10 @@ import { syncTraces } from '../traces/sync.js';
 import { reconcileViews } from '../wiki/pages.js';
 import { refineWiki } from '../wiki/refine.js';
 import { lintWiki } from '../wiki/lint.js';
-import { createApp } from './app.js';
+import { createApp, WorkspaceServices } from './app.js';
 import { loadOrCreateMcpToken, MCP_TOKEN_FILE } from './mcp-http.js';
 import { startResearchLoop } from '../research/service.js';
+import { resetRunningConversations } from '../chat/store.js';
 import { McpEndpoint } from '../research/workspace.js';
 import { WorkspaceContextRegistry } from './workspaces.js';
 
@@ -28,6 +29,8 @@ export async function startServer(ctx: AppContext): Promise<void> {
   const log = (msg: string) => console.log(`[knode-os] ${msg}`);
   const mcpBase: { url: string | null } = { url: null };
   const mcpToken = loadOrCreateMcpToken(ctx.dataDir);
+  // per-workspace background services the routes may poke (queue a job and run it now; the MCP endpoint a chat turn attaches to)
+  const services = new Map<string, WorkspaceServices>();
   const workspaceContexts = new WorkspaceContextRegistry(ctx.dataDir, {
     templateConfig: ctx.config,
     onCreate: (workspaceCtx, scope) => {
@@ -39,10 +42,15 @@ export async function startServer(ctx: AppContext): Promise<void> {
           headers: { 'x-knode-user': scope.user, 'x-knode-workspace-kind': scope.kind, 'x-knode-workspace-id': scope.id, 'x-knode-workspace-name': scope.name },
         }
         : null;
-      return startWorkspaceServices(workspaceCtx, workspaceLog, { mcp });
+      const started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp });
+      services.set(workspaceCtx.dataDir, { mcp, kickResearch: started.kickResearch, track: started.track });
+      return async () => {
+        services.delete(workspaceCtx.dataDir);
+        await started.stop();
+      };
     },
   });
-  const app = createApp(ctx, log, workspaceContexts);
+  const app = createApp(ctx, log, workspaceContexts, { services: (workspaceCtx) => services.get(workspaceCtx.dataDir) ?? null });
   const { port, host } = ctx.config.server;
 
   serve({ fetch: app.fetch, port, hostname: host }, (info) => {
@@ -58,10 +66,20 @@ export async function startServer(ctx: AppContext): Promise<void> {
 
 const WATCH_FULL_SYNC_THRESHOLD = 200;
 
-function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null } = {}): () => Promise<void> {
+interface StartedServices {
+  stop: () => Promise<void>;
+  kickResearch: () => void;
+  track: <T>(job: Promise<T>) => Promise<T>;
+}
+
+function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null } = {}): StartedServices {
   let disposed = false;
   // deep-research jobs: an external CLI writes wiki pages through the MCP endpoint serve hosts
   const research = opts.mcp ? startResearchLoop(ctx, { mcp: opts.mcp, log }) : null;
+  // a chat turn only lives in one process: whatever a previous serve left mid-answer is idle now
+  void resetRunningConversations(ctx.store)
+    .then((n) => n && log(`chat: ${n} conversation(s) left answering by a previous run are idle again`))
+    .catch(() => {});
   const activeJobs = new Set<Promise<unknown>>();
   const track = <T>(job: Promise<T>): Promise<T> => {
     activeJobs.add(job);
@@ -216,19 +234,23 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     log('watching raw/docs, raw/skills, wiki for changes');
   }
 
-  return async () => {
-    disposed = true;
-    await research?.stop();
-    clearInterval(syncTimer);
-    clearInterval(tier1Timer);
-    clearInterval(flushTimer);
-    clearInterval(dreamTimer);
-    clearInterval(tier2Timer);
-    clearInterval(dsTimer);
-    if (watchTimer) clearTimeout(watchTimer);
-    if (watcher) await watcher.close();
-    await Promise.allSettled([...activeJobs]);
-    await ctx.datasources.closeAll();
+  return {
+    stop: async () => {
+      disposed = true;
+      await research?.stop();
+      clearInterval(syncTimer);
+      clearInterval(tier1Timer);
+      clearInterval(flushTimer);
+      clearInterval(dreamTimer);
+      clearInterval(tier2Timer);
+      clearInterval(dsTimer);
+      if (watchTimer) clearTimeout(watchTimer);
+      if (watcher) await watcher.close();
+      await Promise.allSettled([...activeJobs]);
+      await ctx.datasources.closeAll();
+    },
+    kickResearch: () => research?.kick(),
+    track,
   };
 }
 
