@@ -51,6 +51,12 @@ if [[ ! -d "$DEPLOY_DIR/node_modules/commander" ]]; then
   echo "Service dependencies missing from $DEPLOY_DIR — refusing to package a bundle that cannot start." >&2
   exit 1
 fi
+# The hoisted install leaves its own store behind in node_modules/.pnpm. Inside
+# the deploy directory those are hard links, so pnpm reports nothing unusual —
+# but `ditto` writes each one out again, which is how the bundle grew to 1.7 GB
+# once the agent dependencies arrived. Nothing links into it (every package,
+# nested ones included, is a real directory at this point), so it is dead weight.
+rm -rf "$DEPLOY_DIR/node_modules/.pnpm"
 ditto "$DEPLOY_DIR" "$SERVICE_DIR/app"
 cp "$NODE_BIN" "$SERVICE_DIR/bin/node"
 chmod +x "$BIN_DIR/KnodeOS"
