@@ -324,16 +324,9 @@ main { flex: 1; min-height: 0; overflow: hidden; display: flex; }
 .result .rscore { float: right; color: var(--muted); font-size: 11px; font-family: var(--mono); }
 .result .rsnippet { margin-top: 6px; color: var(--fg); font-size: 13px; white-space: pre-wrap; word-break: break-word; }
 
-/* the footer of a quick (retrieval) answer inside an Ask thread */
-.quick-foot { display: flex; flex-direction: column; gap: 4px; padding: 0 0 10px; }
-.quick-foot .citation { display: flex; gap: 7px; align-items: baseline; font-family: var(--mono); font-size: 11px; color: var(--muted); cursor: pointer; padding: 2px 7px; border-radius: 6px; background: var(--accent-soft); }
-.quick-foot .citation:hover { color: var(--fg); }
-.quick-foot .citation b { color: var(--accent); font-weight: 600; }
-.quick-foot .citation span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.quick-foot .fact { font-size: 11px; color: var(--muted); }
-.quick-foot .gap { color: var(--accent2); font-size: 11px; margin: 0; }
-.quick-foot .deepen { align-self: flex-start; margin-top: 4px; padding: 2px 9px; font-size: 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--accent2); cursor: pointer; }
-.quick-foot .deepen:hover { border-color: var(--accent2); }
+/* the one action a hint may carry, e.g. "Ask has nothing to run on" */
+.hint-action { margin-left: 6px; padding: 2px 9px; font-size: 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--accent2); cursor: pointer; }
+.hint-action:hover { border-color: var(--accent2); }
 
 /* graph */
 #graph-wrap { flex: 1; display: flex; gap: 12px; min-height: 0; }

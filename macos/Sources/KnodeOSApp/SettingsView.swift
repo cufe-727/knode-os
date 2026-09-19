@@ -1699,7 +1699,7 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .index: L("Every chunk becomes a vector for semantic and hybrid recall.")
         case .extract: L("Names entities, relations and factual claims in changed documents.")
         case .synthesize: L("Turns hot entity clusters into readable, linked Concept pages.")
-        case .answer: L("Ask, wiki summaries and the nightly Dream analysis.")
+        case .answer: L("Document summaries in the wiki, and the nightly Dream analysis.")
         }
     }
 
@@ -1714,7 +1714,7 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .synthesize:
             L("Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.")
         case .answer:
-            L("Always the default provider. Latency lands straight in the Ask box, so prefer something responsive.")
+            L("Always the default provider — these are the jobs that never picked one of their own. Ask no longer runs here: every question is an agent session, configured under Providers & Agents.")
         }
     }
 }

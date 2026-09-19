@@ -6,7 +6,13 @@ const api = async (path, opts = {}) => {
   const headers = { 'content-type': 'application/json', ...workspaceRequestHeaders(), ...(opts.headers || {}) };
   const res = await fetch(path, { ...opts, headers });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  if (!res.ok) {
+    const error = new Error(data.error || res.statusText);
+    // the machine-readable cause, when a route sends one: a screen can act on
+    // it instead of parsing the prose
+    if (data.reason) error.reason = data.reason;
+    throw error;
+  }
   return data;
 };
 const toast = (msg, ms = 2600) => {
@@ -524,7 +530,7 @@ const NAV = [
     { id: 'search', title: 'Search', hint: 'Hybrid, vector, and keyword recall' },
     { id: 'traces', title: 'Traces', hint: 'Claude Code and Codex sessions' },
   ] },
-  { id: 'ask', title: 'Ask', tabs: [{ id: 'ask', title: 'Ask', hint: 'Quick cited answers, or a working agent' }] },
+  { id: 'ask', title: 'Ask', tabs: [{ id: 'ask', title: 'Ask', hint: 'An agent that answers from your workspace' }] },
   { id: 'knowledge', title: 'Knowledge', tabs: [
     { id: 'graph', title: 'Graph', hint: 'Entities, relations, and claims' },
     { id: 'wiki', title: 'Wiki', hint: 'Pages researched by agent CLIs' },
@@ -1772,7 +1778,12 @@ function stopChatPolling() {
   chatPollTimer = null;
 }
 
+/** Whether a question asked now would be answered, and if not, what to fix. */
+let chatReadiness = null;
+
 async function loadChat() {
+  chatReadiness = await api('/api/chat/readiness').catch(() => null);
+  paintChatReadiness();
   try {
     chatConversations = await api('/api/chat/conversations?limit=50');
   } catch (e) {
@@ -1799,7 +1810,7 @@ function renderChatList() {
     const div = document.createElement('div');
     div.className = `chat-item${c.id === chatActiveId ? ' active' : ''}`;
     div.innerHTML = `<span class="chat-item-title">${esc(c.title || '(untitled)')}</span>
-      <span class="hint"><span class="chat-item-mode">${esc(modeOfConversation(c))}</span> · ${esc(new Date(c.updatedAt).toLocaleString())}</span>
+      <span class="hint">${esc(new Date(c.updatedAt).toLocaleString())}</span>
       <button data-del title="Delete this conversation">✕</button>`;
     div.addEventListener('click', (ev) => { if (!ev.target.hasAttribute('data-del')) openConversation(c.id); });
     div.querySelector('button[data-del]').addEventListener('click', async (ev) => {
@@ -1821,9 +1832,6 @@ async function openConversation(id) {
   renderChatList();
   try {
     const conversation = await api(`/api/chat/conversations/${id}`);
-    // a follow-up continues the thread the way it was started
-    $('#ask-mode').value = modeOfConversation(conversation);
-    paintAskMode();
     renderChatThread(conversation);
     // the turn may have finished while another tab was open: the composer follows the server, not the last poll
     if (conversation.running) startChatPolling();
@@ -1836,7 +1844,11 @@ async function openConversation(id) {
 function renderChatThread(conversation) {
   const el = $('#chat-thread');
   if (!conversation) {
-    el.innerHTML = '<p class="hint">Ask a question. <b>quick</b> answers in one retrieval pass, with citations; <b>agent</b> runs the configured CLI, which can follow leads and write what you teach it.</p>';
+    el.innerHTML = chatReadiness && chatReadiness.ready === false
+      ? `<p class="hint"><b>Ask has nothing to run on.</b> ${esc(chatReadiness.hint ?? '')}
+         <button type="button" class="hint-action" data-open-providers>open Providers &amp; Agents</button></p>`
+      : '<p class="hint">Ask a question. An agent answers over your files, graph and wiki — it can follow leads across several turns, and writes what you teach it as a quarantined note you can adopt.</p>';
+    el.querySelector('[data-open-providers]')?.addEventListener('click', () => navigate('providers'));
     return;
   }
   el.innerHTML = '';
@@ -1876,50 +1888,10 @@ function renderChatThread(conversation) {
       }
       if (m.error && m.content) chips.insertAdjacentHTML('beforeend', `<span class="chat-chip bad">${esc(m.error)}</span>`);
       if (chips.childElementCount) div.appendChild(chips);
-      // a retrieval answer describes itself by what it cited, an agent by what it did
-      const quick = quickFooter(m, conversation);
-      if (quick) div.appendChild(quick);
     }
     el.appendChild(div);
   }
   el.scrollTop = el.scrollHeight;
-}
-
-/**
- * Citations, the claims the answer leaned on, what the base is missing, and the
- * way out when one retrieval pass was not enough.
- */
-function quickFooter(message, conversation) {
-  const payload = message.payload;
-  if (!payload || payload.mode !== 'quick') return null;
-  const foot = document.createElement('div');
-  foot.className = 'quick-foot';
-  for (const c of payload.citations ?? []) {
-    const cite = document.createElement('div');
-    cite.className = 'citation';
-    cite.title = `open ${c.path}`;
-    cite.innerHTML = `<b>[${c.ref}]</b><span>${esc(c.path)}</span>`;
-    cite.addEventListener('click', () => { navigate('files'); openFile(c.path); });
-    foot.appendChild(cite);
-  }
-  const facts = payload.facts ?? [];
-  if (facts.length) {
-    foot.insertAdjacentHTML('beforeend', `<p class="fact">known facts: ${facts.slice(0, 5)
-      .map((f) => `${esc(f.statement.slice(0, 100))} <span class="mono">[${esc(f.status ?? 'claim')}]</span>`).join(' · ')}</p>`);
-  }
-  if (payload.gaps?.length) foot.insertAdjacentHTML('beforeend', `<p class="gap">gaps: ${payload.gaps.map(esc).join(' · ')}</p>`);
-
-  const question = (conversation?.messages ?? []).filter((x) => x.role === 'user' && x.seq < message.seq).pop();
-  if (question) {
-    const deepen = document.createElement('button');
-    deepen.className = 'deepen';
-    deepen.type = 'button';
-    deepen.textContent = '✦ dig deeper with the agent';
-    deepen.title = 'Re-ask this in a new agent conversation';
-    deepen.addEventListener('click', () => deepenWithAgent(question.content));
-    foot.appendChild(deepen);
-  }
-  return foot.childElementCount ? foot : null;
 }
 
 function renderChatActivity(activity) {
@@ -1929,7 +1901,8 @@ function renderChatActivity(activity) {
 }
 
 function setChatBusy(busy) {
-  $('#btn-chat-send').disabled = busy;
+  // an unready composer stays disabled when the turn ends
+  $('#btn-chat-send').disabled = busy || Boolean(chatReadiness && chatReadiness.ready === false);
   $('#btn-chat-cancel').hidden = !busy;
   $('#chat-activity').hidden = !busy;
 }
@@ -1961,33 +1934,23 @@ function startChatPolling() {
   chatPollTimer = setTimeout(tick, 900);
 }
 
-/** Conversations written before quick mode existed are agent conversations. */
-function modeOfConversation(conversation) {
-  return conversation?.payload?.mode === 'quick' ? 'quick' : 'agent';
-}
-
-async function newConversation(mode) {
-  const conversation = await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({ mode }) });
+async function newConversation() {
+  const conversation = await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({}) });
   chatConversations.unshift(conversation);
   chatActiveId = conversation.id;
-  $('#ask-mode').value = mode;
-  paintAskMode();
   renderChatList();
   renderChatThread(conversation);
   return conversation;
 }
 
-async function askQuestion(text, mode) {
+async function askQuestion(text) {
   const thread = $('#chat-thread');
   const mine = document.createElement('div');
   mine.className = 'chat-msg user';
   mine.innerHTML = `<div class="markdown">${renderMd(text)}</div>`;
   thread.appendChild(mine);
   thread.scrollTop = thread.scrollHeight;
-  if (mode === 'quick') $('#chat-activity').hidden = false, renderChatActivity([]);
-  const res = await api(`/api/chat/conversations/${chatActiveId}/messages`, { method: 'POST', body: JSON.stringify({ text, mode }) });
-  // the server says whether there is a session to watch: a quick answer is
-  // already written by the time this returns, so there is nothing to poll
+  const res = await api(`/api/chat/conversations/${chatActiveId}/messages`, { method: 'POST', body: JSON.stringify({ text }) });
   if (res.status === 'running') {
     startChatPolling();
   } else {
@@ -2002,53 +1965,46 @@ async function sendChat() {
   const input = $('#chat-input');
   const text = input.value.trim();
   if (!text) return;
-  const mode = $('#ask-mode').value;
   input.value = '';
-  // Quick asks are one question each, and a mode never changes what an existing
-  // thread means — either way that means a fresh conversation.
-  const current = chatConversations.find((c) => c.id === chatActiveId);
   try {
-    if (!chatActiveId || mode === 'quick' || modeOfConversation(current) !== mode) await newConversation(mode);
+    if (!chatActiveId) await newConversation();
   } catch (e) {
     input.value = text;
     toast(`could not start a conversation: ${e.message}`);
     return;
   }
   try {
-    await askQuestion(text, mode);
+    await askQuestion(text);
   } catch (e) {
+    // a 503 is a configuration answer, not a failed send: show the screen that
+    // says what to fix rather than a toast that scrolls away
+    if (e.reason) {
+      chatReadiness = { ready: false, reason: e.reason, hint: e.message };
+      paintChatReadiness();
+      renderChatThread(null);
+      return;
+    }
     toast(`send failed: ${e.message}`);
     // 409 means another client is already answering — resync and follow that turn instead
     await openConversation(chatActiveId);
   }
 }
 
-/** Re-ask a quick question in a fresh agent conversation. */
-async function deepenWithAgent(question) {
-  try {
-    await newConversation('agent');
-    await askQuestion(question, 'agent');
-  } catch (e) {
-    toast(`send failed: ${e.message}`);
-  }
-}
-
 $('#btn-chat-new').addEventListener('click', async () => {
   try {
-    await newConversation($('#ask-mode').value);
+    await newConversation();
     $('#chat-input').focus();
   } catch (e) {
     toast(`could not start a conversation: ${e.message}`);
   }
 });
-const ASK_PLACEHOLDER = {
-  quick: 'ask a question — answered from your knowledge base with citations… Enter sends, Shift+Enter adds a line',
-  agent: 'ask a question, or “记住：…” to teach the knowledge base — Enter sends, Shift+Enter adds a line',
-};
-function paintAskMode() {
-  $('#chat-input').placeholder = ASK_PLACEHOLDER[$('#ask-mode').value] ?? ASK_PLACEHOLDER.quick;
+
+/** A composer that cannot answer says so on the button rather than on send. */
+function paintChatReadiness() {
+  const blocked = Boolean(chatReadiness && chatReadiness.ready === false);
+  $('#btn-chat-send').disabled = blocked;
+  $('#btn-chat-send').title = blocked ? (chatReadiness.hint ?? '') : 'a reply runs an agent session, which can take minutes';
 }
-$('#ask-mode').addEventListener('change', paintAskMode);
 
 $('#chat-composer').addEventListener('submit', (ev) => { ev.preventDefault(); sendChat(); });
 $('#chat-input').addEventListener('keydown', (ev) => {

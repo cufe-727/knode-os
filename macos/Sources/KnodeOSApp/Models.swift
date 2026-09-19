@@ -38,7 +38,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
     @MainActor var subtitle: String {
         switch self {
         case .library: L("Files, search, and agent traces")
-        case .ask: L("Quick cited answers, or a working agent")
+        case .ask: L("An agent that answers from your workspace")
         case .knowledge: L("Graph, wiki, and nightly review")
         case .settings: L("Model routes and pipeline limits")
         }
@@ -112,7 +112,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .files: L("Browse and edit knowledge")
         case .search: L("Hybrid, vector, and keyword recall")
         case .traces: L("Claude Code and Codex sessions")
-        case .ask: L("Quick cited answers, or a working agent")
+        case .ask: L("An agent that answers from your workspace")
         case .graph: L("Entities, relations, and claims")
         case .wiki: L("Pages researched by agent CLIs")
         case .dream: L("Review agent improvement ideas")
@@ -244,13 +244,6 @@ struct SearchResult: Decodable, Identifiable, Hashable {
     var signals: [String: Double]
 
     var id: String { chunkId }
-}
-
-struct Citation: Decodable, Hashable, Identifiable {
-    var ref: Int
-    var path: String
-    var chunkId: String
-    var id: String { "\(ref)-\(chunkId)" }
 }
 
 struct Claim: Decodable, Hashable, Identifiable {
@@ -995,34 +988,14 @@ struct ChatEvent: Decodable, Hashable, Identifiable {
     var label: String { tool == "wrote" ? "wrote \(summary)" : summary.isEmpty ? tool : "\(tool): \(summary)" }
 }
 
-/// How a turn was answered. A conversation carries the mode it was started in;
-/// a reply carries the mode that produced it.
-enum AskMode: String, Codable, CaseIterable, Identifiable {
-    case quick
-    case agent
-
-    var id: String { rawValue }
-
-    @MainActor var title: String { self == .quick ? L("Quick") : L("Agent") }
-}
-
-/// What a quick (retrieval) answer knows about itself. Agent replies leave this
-/// empty and describe themselves through `events` instead.
-struct ChatAnswerPayload: Decodable, Hashable {
-    var mode: String?
-    var citations: [Citation]?
-    var gaps: [String]?
-    var facts: [QuickFact]?
-}
-
-/// A claim the answer leaned on. `Claim` is a superset the quick payload does
-/// not carry, so this stays a slim struct rather than reusing it.
-struct QuickFact: Decodable, Hashable, Identifiable {
-    var statement: String
-    var subject: String?
-    var status: String?
-
-    var id: String { "\(subject ?? "")|\(statement)" }
+/// Whether a question asked now would be answered, and if not, why. `reason`
+/// matches the one the send path returns, so both land on the same screen.
+struct ChatReadiness: Decodable {
+    var ready: Bool
+    var reason: String?
+    var hint: String?
+    var provider: String?
+    var model: String?
 }
 
 struct ChatMessage: Decodable, Identifiable, Hashable {
@@ -1031,17 +1004,11 @@ struct ChatMessage: Decodable, Identifiable, Hashable {
     var role: String
     var content: String
     var events: [ChatEvent]
-    var payload: ChatAnswerPayload?
     var turns: Int?
     var error: String?
     var createdAt: String
 
     var isUser: Bool { role == "user" }
-    /// Older rows carry no payload; a reply with tool activity came from an agent.
-    var mode: AskMode {
-        if let mode = payload?.mode { return AskMode(rawValue: mode) ?? .agent }
-        return events.isEmpty && payload?.citations != nil ? .quick : .agent
-    }
 }
 
 struct ChatConversation: Decodable, Identifiable, Hashable {
@@ -1049,13 +1016,9 @@ struct ChatConversation: Decodable, Identifiable, Hashable {
     var title: String
     var status: String
     var agent: String?
-    var payload: ChatAnswerPayload?
     var updatedAt: String
     var messages: [ChatMessage]?
     var running: Bool?
-
-    /// Conversations written before quick mode existed are agent conversations.
-    var mode: AskMode { AskMode(rawValue: payload?.mode ?? "") ?? .agent }
 
     @MainActor var displayTitle: String { title.isEmpty ? L("(untitled)") : title }
 }
@@ -1069,10 +1032,8 @@ struct ChatStatusResponse: Decodable {
 struct ChatSendResponse: Decodable {
     var ok: Bool
     var seq: Int
-    /// `running` means an agent session started and must be polled; a quick
-    /// answer is already written and comes back `idle`.
+    /// `running` means a session started and must be polled until it is idle.
     var status: String
-    var mode: String?
 }
 
 struct ChatProtocolResponse: Decodable {

@@ -133,49 +133,54 @@ describe('chat', () => {
     expect(list.map((c) => c.id)).toContain(id);
   }, 60_000);
 
-  it('answers in quick mode inside the request, cited, with no agent CLI configured', async () => {
+  /**
+   * The gate a machine with nothing configured hits. This used to be one
+   * assertion inside the quick-mode test; quick mode is gone, and the gate it
+   * happened to exercise is now the only thing standing between a typed
+   * question and a confusing silence, so it gets a test of its own.
+   */
+  it('refuses a turn when nothing can run it, and says which', async () => {
     const savedChat = ctx.config.chat.agent;
     const savedResearch = ctx.config.research.agent;
     ctx.config.chat.agent = '';
     ctx.config.research.agent = '';
     try {
-      const created = await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({ mode: 'quick' }) });
-      expect(created.status).toBe(201);
-      const { id } = await created.json() as { id: string };
-      const question = '宁德时代 2025 年营收是多少？';
+      // the default connection is OpenAI-compatible with no model, so the
+      // last-resort arm cannot resolve it either
+      expect(ctx.config.llm.provider).toBe('openai');
+      expect(ctx.config.llm.model).toBe('');
+      expect(resolveChatAgent(ctx.config)).toBeNull();
 
-      // the agent path needs a CLI and says so; the quick path is checked before that gate
-      const refused = await api(`/api/chat/conversations/${id}/messages`, { method: 'POST', body: JSON.stringify({ text: question }) });
+      const ready = await (await api('/api/chat/readiness')).json() as { ready: boolean; reason?: string; hint?: string };
+      expect(ready).toMatchObject({ ready: false, reason: 'no-agent' });
+      expect(ready.hint).toContain('Providers & Agents');
+
+      const { id } = await (await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({}) })).json() as { id: string };
+      const refused = await api(`/api/chat/conversations/${id}/messages`, { method: 'POST', body: JSON.stringify({ text: '宁德时代 2025 年营收是多少？' }) });
       expect(refused.status).toBe(503);
-
-      const sent = await api(`/api/chat/conversations/${id}/messages`, { method: 'POST', body: JSON.stringify({ text: question, mode: 'quick' }) });
-      expect(sent.status).toBe(200); // finished in the request: nothing to poll
-      expect(await sent.json()).toMatchObject({ ok: true, seq: 2, status: 'idle', mode: 'quick' });
-
-      const conv = await (await api(`/api/chat/conversations/${id}`)).json() as {
-        title: string; status: string; payload: { mode?: string };
-        messages: { role: string; content: string; events: unknown[]; payload: { mode?: string; citations?: { path: string }[]; facts?: { statement: string }[] } }[];
-      };
-      expect(conv.status).toBe('idle');
-      expect(conv.title).toBe(question);
-      expect(conv.payload.mode).toBe('quick');
-      expect(conv.messages.map((m) => m.role)).toEqual(['user', 'assistant']);
-
-      const reply = conv.messages[1];
-      expect(reply.payload.mode).toBe('quick');
-      expect(reply.payload.citations?.map((c) => c.path)).toContain('raw/docs/trusted.md');
-      expect(reply.events).toEqual([]); // no agent ran, so no tool activity
-      // this workspace has no LLM connection, so the answer is the retrieval fallback
-      expect(reply.content).toContain('LLM is not configured');
-
-      // both kinds of conversation come back from the one list the merged Ask shows
-      const list = await (await api('/api/chat/conversations')).json() as { id: string }[];
-      expect(list.map((c) => c.id)).toContain(id);
+      expect(await refused.json()).toMatchObject({ reason: 'no-agent' });
     } finally {
       ctx.config.chat.agent = savedChat;
       ctx.config.research.agent = savedResearch;
     }
-  }, 30_000);
+  });
+
+  it('falls back to the default connection when nothing names an agent', async () => {
+    const savedChat = ctx.config.chat.agent;
+    const savedResearch = ctx.config.research.agent;
+    const savedLlm = ctx.config.llm;
+    ctx.config.chat.agent = '';
+    ctx.config.research.agent = '';
+    ctx.config.llm = { ...savedLlm, provider: 'claude-cli', cliPath: fakeClaude };
+    try {
+      expect(resolveChatAgent(ctx.config)).toEqual({ kind: 'cli', provider: 'claude-cli', cliPath: fakeClaude, model: '' });
+      expect(await (await api('/api/chat/readiness')).json()).toMatchObject({ ready: true, provider: 'claude-cli' });
+    } finally {
+      ctx.config.chat.agent = savedChat;
+      ctx.config.research.agent = savedResearch;
+      ctx.config.llm = savedLlm;
+    }
+  });
 
   it('replays recent history into the next turn, bounded by chat.historyTurns', async () => {
     const conversation = await createConversation(ctx.store, { createdBy: 'test' });
@@ -271,7 +276,7 @@ describe('chat', () => {
     const { config } = await cfg.json() as { config: { chat: Record<string, unknown> } };
     expect(config.chat).toMatchObject({ agent: 'fake', model: 'sonnet', effort: 'high', maxTurns: 200, timeoutMs: 60_000, web: 'on', historyTurns: 3, keep: 7 });
     expect(ctx.config.chat.keep).toBe(7);
-    ctx.config.chat = { ...ctx.config.chat, model: '', effort: 'default', maxTurns: 30, timeoutMs: 600_000, web: 'inherit', historyTurns: 12, keep: 50 };
+    ctx.config.chat = { ...ctx.config.chat, model: '', effort: 'default', maxTurns: 30, timeoutMs: 600_000, web: 'inherit', historyTurns: 12, keep: 200 };
   }, 60_000);
 
   it('frees a conversation a crashed serve left answering', async () => {

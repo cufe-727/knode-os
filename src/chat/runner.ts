@@ -3,7 +3,7 @@ import path from 'node:path';
 import { KnodeConfig } from '../config.js';
 import { AppContext } from '../context.js';
 import { safePath } from '../fs/files.js';
-import { agentForSpec, agentWebCapable, ExecutorId, ResearchAgent, resolveResearchAgent, withModel } from '../research/agent.js';
+import { agentForSpec, agentWebCapable, DEFAULT_CONNECTION, ExecutorId, ResearchAgent, resolveResearchAgent, withModel } from '../research/agent.js';
 import { clearCancelled, JobCancelledError, killAgentsFor, launchSession, SessionResult, transcriptPathFor } from '../research/launch.js';
 import { McpEndpoint } from '../research/workspace.js';
 import { appendMessage, ChatConversation, ChatEvent, ChatMessage, ChatStatus, getConversation, pruneConversations, recentMessages, setConversationStatus, titleFrom } from './store.js';
@@ -54,13 +54,23 @@ const running = new Map<string, RunningTurn>();
 const key = (ctx: AppContext, conversationId: string) => `${ctx.dataDir}::${conversationId}`;
 const jobIdOf = (conversationId: string) => `chat:${conversationId}`;
 
-/** Which CLI answers chat: chat.agent (connection id / provider), else the research agent; chat.model overrides. */
+/**
+ * Which agent answers Ask: `chat.agent`, else the research agent, else the
+ * default LLM connection.
+ *
+ * That last arm is what makes Ask work on a machine that has configured a
+ * model and nothing else. It is deliberately unlike research, which refuses to
+ * guess (see `resolveResearchAgent`): research is a background spend a person
+ * opts into, while Ask is a question someone just typed, and answering it on
+ * whatever section 01 is set to is the obvious reading. A CLI provider runs
+ * that CLI; an OpenAI-compatible one runs the built-in agent.
+ */
 export function resolveChatAgent(config: KnodeConfig, dataDir?: string): ResearchAgent | null {
   const chat = config.chat;
   if (chat?.agent?.trim()) return agentForSpec(config, chat.agent, chat.model, dataDir);
   const base = resolveResearchAgent(config, dataDir);
-  if (!base) return null;
-  return withModel(base, chat?.model ?? '');
+  if (base) return withModel(base, chat?.model ?? '');
+  return agentForSpec(config, DEFAULT_CONNECTION, chat?.model ?? '', dataDir);
 }
 
 /**
@@ -244,7 +254,7 @@ export async function startChatTurn(ctx: AppContext, conversationId: string, tex
     running.delete(k);
     log(`chat ${conversationId}: turn ${seq} ${error ? `ended with ${error}` : 'answered'}${result?.turns ? ` (${result.turns} turns)` : ''}`);
     try {
-      for (const removed of await pruneConversations(ctx.store, chat?.keep ?? 50)) {
+      for (const removed of await pruneConversations(ctx.store, chat?.keep ?? 200)) {
         fs.rmSync(path.join(chatRunsRoot(ctx), removed), { recursive: true, force: true });
       }
     } catch {

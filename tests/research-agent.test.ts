@@ -184,7 +184,23 @@ describe('resolveChatAgent', () => {
     expect(resolveChatAgent(config)).toEqual({ kind: 'cli', provider: 'claude-cli', cliPath: '/opt/bin/claude', model: 'sonnet' });
   });
 
-  it('returns null when neither chat nor research names an agent', () => {
-    expect(resolveChatAgent(defaultConfig())).toBeNull();
+  it('falls back to the default connection when neither chat nor research names an agent', () => {
+    const config = configWith((c) => {
+      c.chat.agent = '';
+      c.research.agent = '';
+      c.llm = { ...c.llm, provider: 'claude-cli', cliPath: '/opt/bin/claude' };
+    });
+    expect(resolveChatAgent(config)).toEqual({ kind: 'cli', provider: 'claude-cli', cliPath: '/opt/bin/claude', model: '' });
+  });
+
+  it('returns null only when the default connection cannot run a session either', () => {
+    const config = defaultConfig();
+    // the shipped default is an OpenAI-compatible endpoint with no model, and
+    // an endpoint with no model is not an executor — this is the fresh-install
+    // state, and the reason the assertion spells the premise out
+    expect(config.llm.provider).toBe('openai');
+    expect(config.llm.model).toBe('');
+    config.chat.agent = '';
+    expect(resolveChatAgent(config)).toBeNull();
   });
 });

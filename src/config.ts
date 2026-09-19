@@ -421,7 +421,7 @@ export type ChatWebAccess = 'inherit' | 'on' | 'off';
  * that replays recent history — no CLI session persistence (see docs/design/07).
  */
 export interface ChatConfig {
-  /** Connection id or provider; '' = research.agent. */
+  /** Agent name, connection id or provider; '' falls back to research.agent, then the default connection. */
   agent: string;
   /** Model override ('' = the agent's own). */
   model: string;
@@ -641,7 +641,7 @@ export function defaultConfig(): KnodeConfig {
       claims: 'suggest',
       external: 'verify',
     },
-    chat: { agent: '', model: '', effort: 'default', maxTurns: 30, timeoutMs: 600_000, web: 'inherit', historyTurns: 12, keep: 200 },
+    chat: { agent: 'default', model: '', effort: 'default', maxTurns: 30, timeoutMs: 600_000, web: 'inherit', historyTurns: 12, keep: 200 },
     trace: {
       claudeProjectsDir: path.join(home, '.claude', 'projects'),
       codexSessionsDir: path.join(home, '.codex', 'sessions'),

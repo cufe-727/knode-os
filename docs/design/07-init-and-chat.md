@@ -108,33 +108,42 @@ the files the reply marked with `<!-- knode:wrote <path> -->`.
   `knode_sync only:[path]`, and to say that it is quarantined.
 - **Web**: `chatWebAllowed` only narrows or widens *within* what `review.external` allows, never past it.
 
-### 4.1 Merged with Ask (2026-09-19)
+### 4.1 Merged with Ask, then down to one cost (2026-09-19)
 
 Ask (`POST /api/ask` — one retrieval pass and one LLM call, stateless) and Chat used to be two top-level
-entries, but to a person they are the same intent at two costs. The UI now has one **Ask**, with the mode
-switch beside the composer:
+entries, but to a person they are the same intent. They were merged into one **Ask** with a mode switch
+beside the composer — quick or agent — and the switch was then removed: **every question is one agent
+session**.
 
-| | Quick | Agent |
-| --- | --- | --- |
-| How it answers | `ask()` (`src/search/ask.ts`): one retrieval pass, one LLM call | one agent CLI session over MCP |
-| The route returns | **200**, with the reply already written — nothing to poll | 202, then poll `…/status` |
-| What it needs | nothing — **no MCP endpoint, no agent CLI installed** | both, or it answers 503 |
-| How a reply describes itself | `payload`: citations / gaps / facts | `events`: tool-activity chips |
-| Can it write | no | yes (a quarantined note you can adopt) |
+Why the switch went: the two modes differed by roughly two orders of magnitude in latency and cost, and a
+segmented control beside a text box is the worst possible place to put that choice. It defaulted to quick, so
+the cheap answer was the one people got without deciding; it started a fresh conversation on every quick ask
+and on every mode change, so the thread list read as two interleaved histories; and "dig deeper with the
+agent" existed precisely because the default was usually not what the question needed. One mode that always
+works beats two the reader has to arbitrate between.
 
-- **Where the mode lives**: per conversation in `chat_conversations.payload.mode` (that column already
-  existed); per reply in the new `chat_messages.payload` (**migration v10**). `contexts` are deliberately not
-  stored — whole chunks are large and re-derivable.
-- **The route**: `POST …/messages` takes an optional `mode` (default `agent`, so older clients are unchanged).
-  The quick branch returns *before* the two 503 gates, which is what makes Ask work on a machine with no
-  coding agent installed. It lives in `src/chat/quick.ts`.
-- **One question, one conversation**: each quick ask starts its own, so the list reads as a history of
-  questions; "dig deeper with the agent" re-asks the same question in a fresh agent conversation. A mode never
-  changes what an existing thread means.
-- **`POST /api/ask` is untouched**: MCP's `knode_ask` and the CLI depend on it, and `quick.ts` calls it.
-- **Config keys are untouched**: still `chat.*` in `knode.config.json` (renaming them would rewrite users'
-  config files); only the UI copy became "Ask · Agent mode". `chat.keep` rose from 50 to 200 — one
-  conversation per question fills 50 in about a day.
+- **What replaced quick's safety net.** Quick mode was what made Ask usable with no coding agent installed.
+  `resolveChatAgent` now ends with `agentForSpec(config, 'default')`: with nothing named, Ask runs on the
+  section-01 default connection — a CLI provider as that CLI, an OpenAI-compatible one as the built-in agent.
+  The shipped `chat.agent` is `'default'` for the same reason. Research deliberately keeps refusing to guess
+  (`resolveResearchAgent`): it is a background spend someone opts into, while Ask is a question just typed.
+- **When even that cannot resolve** — an OpenAI-compatible default with no model, which is the fresh-install
+  state — `GET /api/chat/readiness` says so *before* the person types, and both clients render a screen that
+  opens Settings → Providers & Agents. `POST …/messages` returns the same `reason` (`no-mcp` / `no-agent` /
+  `no-builtin`) so a race lands on that screen instead of a toast.
+- **`chat_messages.payload` and migration v10 stay.** Nothing writes the column; historical quick answers
+  still hold their citations, and deleting the migration would lower `SCHEMA_VERSION` below what every
+  existing database reports. Stored `payload.mode = 'quick'` values are inert — both clients read any
+  conversation as an agent conversation. Old quick replies keep their prose and lose their citation list,
+  which was the price of deleting the footer that rendered it.
+- **`ask()` survives; only its UI caller went.** `src/search/ask.ts` is still called by MCP's `knode_ask`
+  (`src/mcp/tools.ts`), the `knode-os ask` CLI, `bench answer`, and `POST /api/ask` — all as a *function*,
+  which is what an earlier version of this section got wrong. After the deletion `POST /api/ask` has no
+  in-repo caller and stays as a documented public endpoint. The agent can still reach the cheap path itself:
+  `knode_ask` is in the tool set a chat session is launched with.
+- **Config keys are untouched**: still `chat.*` in `knode.config.json`. `chat.keep` is 200 — one conversation
+  per question filled the old 50 in about a day, and `runner.ts` now uses that same default instead of its own
+  stale 50.
 
 ## 5. Runner improvements
 

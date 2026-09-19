@@ -95,7 +95,7 @@
       <div class="brand"><img src="/favicon.svg" alt="" />knode-os</div>
       <nav id="tabs" aria-label="Primary navigation">
         <button data-section="library" class="active" title="Files, search, and agent traces">Library</button>
-        <button data-section="ask" title="Quick cited answers, or a working agent">Ask</button>
+        <button data-section="ask" title="An agent that answers from your workspace">Ask</button>
         <button data-section="knowledge" title="Graph, wiki, and nightly review">Knowledge</button>
         <button data-section="settings" title="Model routes and pipeline limits">Settings</button>
       </nav>
@@ -180,8 +180,7 @@
       <div id="search-results"></div>
     </section>
 
-    <!-- Ask: one question, two costs. Quick answers in one retrieval pass
-         (cited, no agent CLI needed); Agent runs the configured CLI over MCP. -->
+    <!-- Ask: every question is one session of the configured agent over MCP. -->
     <section id="tab-ask" class="tab">
       <div class="chat-layout">
         <aside id="chat-side">
@@ -189,15 +188,11 @@
           <div id="chat-list"></div>
         </aside>
         <div id="chat-main">
-          <div id="chat-thread"><p class="hint">Ask a question. <b>quick</b> answers in one retrieval pass, with citations; <b>agent</b> runs the configured CLI, which can follow leads and write what you teach it.</p></div>
+          <div id="chat-thread"><p class="hint">Ask a question. An agent answers over your files, graph and wiki — it can follow leads across several turns, and writes what you teach it as a quarantined note you can adopt.</p></div>
           <div id="chat-activity" class="chat-activity" hidden></div>
           <form id="chat-composer" class="chat-composer">
-            <textarea id="chat-input" rows="2" placeholder="ask a question — answered from your knowledge base with citations… Enter sends, Shift+Enter adds a line"></textarea>
+            <textarea id="chat-input" rows="2" placeholder="ask a question, or “记住：…” to teach the knowledge base — Enter sends, Shift+Enter adds a line"></textarea>
             <div class="chat-composer-actions">
-              <select id="ask-mode" title="Quick answers in one retrieval pass. Agent runs the configured CLI, which can take minutes.">
-                <option value="quick">quick</option>
-                <option value="agent">agent</option>
-              </select>
               <button id="btn-chat-send" type="submit" class="primary">send</button>
               <button id="btn-chat-cancel" type="button" hidden>cancel</button>
             </div>
@@ -383,8 +378,8 @@
               <div class="stage-panel" data-stage="answer" hidden>
                 <div class="stage-panel-copy">
                   <div class="stage-title"><h4>Answer</h4><span class="section-badge accent2">Interactive</span></div>
-                  <p>Ask, wiki summaries and the nightly Dream analysis.</p>
-                  <p class="stage-req">Always the default provider. Latency lands straight in the Ask box, so prefer something responsive.</p>
+                  <p>Document summaries in the wiki, and the nightly Dream analysis.</p>
+                  <p class="stage-req">Always the default provider — these are the jobs that never picked one of their own. Ask no longer runs here: every question is an agent session, configured under Providers & Agents.</p>
                 </div>
                 <div class="stage-control stage-pin">
                   <span class="stage-pin-label">Runs on</span>

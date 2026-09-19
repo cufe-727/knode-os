@@ -86,29 +86,31 @@ import { applyMerge, listMerges, unmergeEntity } from '../graph/merge.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { reviewClaims } from '../graph/claim-review.js';
 import { cancelJob, getJob, latestJob, listJobs, queueJob, retryJob, ResearchStatus } from '../research/jobs.js';
-import { killAgentsFor } from '../research/launch.js';
+import { builtinAvailable, killAgentsFor } from '../research/launch.js';
 import { loadResearchTemplates, PHASES, RESEARCH_KINDS, ResearchKind } from '../research/templates.js';
 import { activeProfile, BUILTIN_PROFILES, deleteProfile, EFFORTS, effectivePipeline, isValidProfileName, loadProfile, loadProfiles, PIPELINE_MODES, profileSummary, ResearchProfile, rolePromptText, saveProfile, writeRolePrompt } from '../research/profile.js';
 import { surveyKnowledgeBase } from '../research/survey.js';
 import { cancelChatTurn, chatActivity, ChatBusyError, isChatRunning, removeChatWorkspace, resolveChatAgent, startChatTurn } from '../chat/runner.js';
-import { ChatMode, createConversation, deleteConversation, getConversation, listConversations } from '../chat/store.js';
-import { runQuickTurn } from '../chat/quick.js';
+import { createConversation, deleteConversation, getConversation, listConversations } from '../chat/store.js';
 import { CHAT_PROTOCOL_FILE, loadChatProtocol, saveChatProtocol } from '../chat/templates.js';
 import { CHAT_DIR } from '../fs/layout.js';
 import { McpEndpoint, runsRoot } from '../research/workspace.js';
 import { recommendWikiTopics, refreshRecommendations } from '../research/recommend.js';
 import { lintWiki } from '../wiki/lint.js';
 
+/**
+ * What Ask cannot answer without. Both are states a person fixes in Settings,
+ * so the text names the screen rather than the config key.
+ */
+const NO_MCP_HINT = 'Ask needs the MCP endpoint `serve` hosts — start knode-os serve';
+const NO_AGENT_HINT = 'Ask has no agent to run: configure an LLM provider, or name an agent, under Settings → Providers & Agents';
+const NO_BUILTIN_HINT = 'the built-in agent is not installed in this build — point Ask at a coding-agent CLI under Settings → Providers & Agents';
+
 /** Comma-separated query parameter → array (absent/empty stays undefined). */
 function csv(value: string | undefined): string[] | undefined {
   if (!value) return undefined;
   const out = value.split(',').map((x) => x.trim()).filter(Boolean);
   return out.length > 0 ? out : undefined;
-}
-
-/** Ask's answering mode; anything unrecognised (and every older client) means `agent`. */
-function modeOf(value: unknown): ChatMode {
-  return value === 'quick' ? 'quick' : 'agent';
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1682,6 +1684,24 @@ export function createApp(
 
   /* ------------------------------ chat ------------------------------------ */
 
+  /**
+   * Whether a question typed now would be answered, and if not, what to fix.
+   * The send path returns the same `reason` values, so a race that slips past
+   * this check lands on the same screen rather than a toast.
+   */
+  app.get('/api/chat/readiness', async (c) => {
+    const ctx = requestCtx(c);
+    if (!(servicesFor(ctx)?.mcp() ?? null)) return c.json({ ready: false, reason: 'no-mcp', hint: NO_MCP_HINT });
+    const agent = resolveChatAgent(ctx.config, ctx.dataDir);
+    if (!agent) return c.json({ ready: false, reason: 'no-agent', hint: NO_AGENT_HINT });
+    // a packaged build may have been pruned of the built-in agent's packages;
+    // saying so here beats looking ready and failing every turn
+    if (agent.kind === 'builtin' && !(await builtinAvailable())) {
+      return c.json({ ready: false, reason: 'no-builtin', hint: NO_BUILTIN_HINT });
+    }
+    return c.json({ ready: true, provider: agent.provider, model: agent.model });
+  });
+
   app.get('/api/chat/conversations', async (c) => {
     const ctx = requestCtx(c);
     const limit = Number(c.req.query('limit'));
@@ -1691,9 +1711,9 @@ export function createApp(
   app.post('/api/chat/conversations', async (c) => {
     const ctx = requestCtx(c);
     try {
-      const body = (await c.req.json().catch(() => ({}))) as { title?: string; mode?: ChatMode };
+      const body = (await c.req.json().catch(() => ({}))) as { title?: string };
       const scope = c.get('workspaceScope');
-      return c.json(await createConversation(ctx.store, { title: body.title, mode: modeOf(body.mode), createdBy: scope?.user ?? null }), 201);
+      return c.json(await createConversation(ctx.store, { title: body.title, createdBy: scope?.user ?? null }), 201);
     } catch (e) {
       return c.json(err(e), 400);
     }
@@ -1707,29 +1727,23 @@ export function createApp(
   });
 
   /**
-   * A message answers in one of two modes. `quick` is one retrieval pass: it
-   * finishes inside this request and answers 200, and it needs neither the MCP
-   * endpoint nor an installed agent CLI — so it is checked before those gates.
-   * `agent` (the default, and what older clients send) starts a session in the
-   * background: 202 with the user message's seq; poll /status until idle.
+   * A message starts an agent session in the background: 202 with the user
+   * message's seq, then poll /status until idle. Both gates answer 503 with a
+   * `reason` the client turns into a screen that says what to configure — a
+   * question typed into a box deserves better than a toast.
    */
   app.post('/api/chat/conversations/:id/messages', async (c) => {
     const ctx = requestCtx(c);
     const id = c.req.param('id');
     try {
-      const body = (await c.req.json().catch(() => ({}))) as { text?: string; mode?: ChatMode };
+      const body = (await c.req.json().catch(() => ({}))) as { text?: string };
       const text = typeof body.text === 'string' ? body.text.trim() : '';
       if (!text) return c.json({ error: 'text is required' }, 400);
       if (!(await getConversation(ctx.store, id))) return c.json({ error: 'no such conversation' }, 404);
-      if (modeOf(body.mode) === 'quick') {
-        if (isChatRunning(ctx, id)) return c.json({ error: `conversation ${id} is already answering` }, 409);
-        const { user, assistant } = await runQuickTurn(ctx, id, text);
-        return c.json({ ok: true, seq: assistant.seq, status: 'idle', mode: 'quick', messages: [user, assistant] });
-      }
       const services = servicesFor(ctx);
       const mcp = services?.mcp() ?? null;
-      if (!mcp) return c.json({ error: 'chat needs the MCP endpoint `serve` hosts — start knode-os serve' }, 503);
-      if (!resolveChatAgent(ctx.config, ctx.dataDir)) return c.json({ error: 'no chat agent configured: set chat.agent or research.agent (Settings → Agents)' }, 503);
+      if (!mcp) return c.json({ error: NO_MCP_HINT, reason: 'no-mcp' }, 503);
+      if (!resolveChatAgent(ctx.config, ctx.dataDir)) return c.json({ error: NO_AGENT_HINT, reason: 'no-agent' }, 503);
       const { seq, turn } = await startChatTurn(ctx, id, text, { mcp, log });
       const tracked = services ? services.track(turn) : turn;
       tracked.catch((e) => log(`chat ${id}: turn failed: ${e instanceof Error ? e.message : e}`));
