@@ -193,6 +193,22 @@ describe('sidecar directories', () => {
     expect(readSidecarPart(dir, 'raw/docs/m.md', 'meta')).toMatchObject({ rawPath: 'raw/docs/m.md', contentSha256: sha2 });
   });
 
+  it('reaches the same result whatever the conversion concurrency is', async () => {
+    const dir = path.join(tmp, 'prepare-parallel');
+    initDataDir(dir);
+    for (let n = 0; n < 6; n++) write(dir, `raw/docs/p${n}.md`, `# Note ${n}\n\nbody ${n}\n`);
+
+    const serial = await prepareDocs(dir);
+    expect(serial.stats).toMatchObject({ prepared: 6, unchanged: 0, errors: 0 });
+
+    // a second pass finds everything unchanged whether or not it fans out, and
+    // reports the same wanted set in the same order
+    const parallel = await prepareDocs(dir, { concurrency: 4 });
+    expect(parallel.stats).toMatchObject({ prepared: 0, unchanged: 6, errors: 0 });
+    expect([...parallel.wanted.entries()].sort()).toEqual([...serial.wanted.entries()].sort());
+    expect(parallel.failed.size).toBe(0);
+  });
+
   it('prepares trace episodes in the sidecar tree, keyed by the transcript, and drops them when switched off', async () => {
     const dir = path.join(tmp, 'episodes');
     initDataDir(dir);

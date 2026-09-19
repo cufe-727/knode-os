@@ -153,7 +153,7 @@ profile 把「怎么研究」从 harness 里抽出来：一份 YAML 同时回答
 | 读文件 | `Read` / `Grep` / `Glob` 进白名单或黑名单 | 沙箱只读，总是可读 | `--add-dir`，总是可读 |
 | 原生子代理 | `--agents <json>`，并放开 `Agent` / `Task` | `agents.enabled`、`agents.max_concurrent_threads_per_session`、`agents.default_subagent_reasoning_effort`、`agents.<id>.description`、`agents.<id>.config_file` | 不支持（退回单会话） |
 
-入口：Settings 页「03 · Deep research」——选运行任务的 CLI、并发与超时、profile，编辑 profile 的强度 / 联网 / 核实 / 停止 / 输出，以及每个角色的 CLI、模型、强度、工具与提示词（另存为新 profile、重置内置）；`GET /api/research/profiles`、`GET/PUT/DELETE /api/research/profiles/:name`（PUT 带 `prompts: {roleId: text}` 会把改动的提示词写成文件，`activate: true` 顺带切换）；`PUT /api/config` 的 `research` 块（agent / model / profile / pipeline / 并发 / 轮数 / 超时 / auto）；`knode-os research profiles`、`knode-os research profile <name> [--use]`。
+入口：Settings 页，自 2026‑09‑19 起拆成两节。「03 · Agents」是**具名 agent** 列表——每个一份 `playbooks/agents/<name>.yaml`（`kind` = `general` | `deep-research`，`executor` = 连接 id / CLI 名 / `default`，外加 `model`、`effort`、`tools`、`maxTurns`、`timeoutMs`、`prompt`），内置两个模板：`deep-agent`（进程内的 LangChain `deepagents` 循环）与 `deep-research`。`GET /api/agents`、`GET/PUT/DELETE /api/agents/:name`；删内置等于重置，删其他会把 `research.agent` / `chat.agent` 移走。「04 · Research」管研究本身——选运行任务的 agent、并发与超时、profile，编辑 profile 的强度 / 联网 / 核实 / 停止 / 输出，以及每个角色的 CLI、模型、强度、工具与提示词（另存为新 profile、重置内置）；`GET /api/research/profiles`、`GET/PUT/DELETE /api/research/profiles/:name`（PUT 带 `prompts: {roleId: text}` 会把改动的提示词写成文件，`activate: true` 顺带切换）；`PUT /api/config` 的 `research` 块（agent / model / profile / pipeline / 并发 / 轮数 / 超时 / auto）；`knode-os research profiles`、`knode-os research profile <name> [--use]`。
 
 ## 6. 推荐与问答归档（`src/research/recommend.ts`）
 

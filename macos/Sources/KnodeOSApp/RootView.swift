@@ -26,10 +26,18 @@ private struct MainWorkspaceView: View {
             AppSidebar()
                 .navigationSplitViewColumnWidth(min: 210, ideal: 238, max: 280)
         } detail: {
-            destination
-                .id("\(model.activeWorkspace?.id ?? "none")-\(model.workspaceRevision)-\(model.selectedSection.rawValue)")
-                .navigationTitle("")
-                .toolbar { workspaceToolbar }
+            VStack(spacing: 0) {
+                // outside the .id below: the strip is stateless and should not
+                // flicker as the screen under it is rebuilt
+                if model.selectedSection.tabs.count > 1 {
+                    SectionTabs(section: model.selectedSection)
+                    Divider()
+                }
+                destination
+                    .id("\(model.activeWorkspace?.id ?? "none")-\(model.workspaceRevision)-\(model.selectedTab.host)")
+            }
+            .navigationTitle("")
+            .toolbar { workspaceToolbar }
         }
         .navigationSplitViewStyle(.balanced)
         .tint(.knodeCyan)
@@ -56,16 +64,15 @@ private struct MainWorkspaceView: View {
 
     @ViewBuilder
     private var destination: some View {
-        switch model.selectedSection {
+        switch model.selectedTab {
         case .files: FileBrowserView()
         case .search: SearchView()
+        case .traces: TracesView()
         case .ask: AskView()
         case .graph: KnowledgeGraphView()
         case .wiki: WikiView()
-        case .chat: ChatView()
-        case .traces: TracesView()
         case .dream: DreamView()
-        case .settings: SettingsView()
+        case .providers, .pipeline, .agents, .research, .workspace: SettingsView()
         }
     }
 
@@ -78,6 +85,15 @@ private struct MainWorkspaceView: View {
                 Text(model.selectedSection.title)
                     .font(.system(size: 13, weight: .semibold))
                     .fixedSize()
+                if model.selectedSection.tabs.count > 1 {
+                    Text("›")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.tertiary)
+                    Text(model.selectedTab.title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                }
                 if let activity = model.globalActivity {
                     Divider().frame(height: 11)
                     ProgressView()
@@ -123,6 +139,49 @@ private struct MainWorkspaceView: View {
     }
 }
 
+/// The second navigation level: the tabs of the selected section, as a pill
+/// strip over the screen. Rendered only when a section has more than one tab.
+private struct SectionTabs: View {
+    @EnvironmentObject private var model: AppModel
+    let section: AppSection
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(section.tabs) { tab in
+                let selected = tab == model.selectedTab
+                Button {
+                    model.select(tab)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: tab.symbol)
+                            .font(.system(size: 11, weight: .medium))
+                        Text(tab.title)
+                            .font(.callout.weight(selected ? .semibold : .regular))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(
+                        selected ? Color.knodeCyan.opacity(0.16) : Color.secondary.opacity(0.08),
+                        in: RoundedRectangle(cornerRadius: 9)
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 9)
+                            .stroke(selected ? Color.knodeCyan.opacity(0.55) : Color.white.opacity(0.06))
+                    }
+                    .foregroundStyle(selected ? Color.knodeCyan : Color.secondary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(tab.subtitle)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+}
+
 private struct AppSidebar: View {
     @EnvironmentObject private var model: AppModel
     @State private var showingConnection = false
@@ -144,7 +203,7 @@ private struct AppSidebar: View {
 
             List(AppSection.allCases) { section in
                 Button {
-                    model.selectedSection = section
+                    model.select(section: section)
                 } label: {
                     Label {
                         VStack(alignment: .leading, spacing: 1) {

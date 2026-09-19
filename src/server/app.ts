@@ -15,6 +15,11 @@ import {
   redactConfig,
   resolveRoutedLlmConfig,
   llmProviderLabel,
+  EmbeddingConnection,
+  embeddingProviderLabel,
+  embeddingIdentity,
+  activeEmbedding,
+  syncActiveEmbedding,
   saveConfig, ResearchConfig, ChatConfig } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
@@ -27,8 +32,17 @@ import { buildContextPack } from '../pack/pack.js';
 import { applySuggestion } from '../pack/learn.js';
 import { createEmbeddingProvider } from '../ingest/embeddings.js';
 import { LlmClient } from '../llm/client.js';
-import { cliToolStatus, listChatModels, listEmbeddingModels } from '../llm/models.js';
+import { cachedCliToolStatus, listModelsCached, warmModelCache } from '../llm/model-cache.js';
 import { agentForSpec } from '../research/agent.js';
+import {
+  AgentDefinition,
+  BUILTIN_AGENTS,
+  deleteAgent,
+  isValidAgentName,
+  loadAgent,
+  loadAgents,
+  saveAgent,
+} from '../research/agents.js';
 import { availableAgents, suggestResearchAgent } from '../research/executors.js';
 import { sync } from '../ingest/sync.js';
 import { historyOf, lineageOf } from '../lineage/inspect.js';
@@ -77,7 +91,8 @@ import { loadResearchTemplates, PHASES, RESEARCH_KINDS, ResearchKind } from '../
 import { activeProfile, BUILTIN_PROFILES, deleteProfile, EFFORTS, effectivePipeline, isValidProfileName, loadProfile, loadProfiles, PIPELINE_MODES, profileSummary, ResearchProfile, rolePromptText, saveProfile, writeRolePrompt } from '../research/profile.js';
 import { surveyKnowledgeBase } from '../research/survey.js';
 import { cancelChatTurn, chatActivity, ChatBusyError, isChatRunning, removeChatWorkspace, resolveChatAgent, startChatTurn } from '../chat/runner.js';
-import { createConversation, deleteConversation, getConversation, listConversations } from '../chat/store.js';
+import { ChatMode, createConversation, deleteConversation, getConversation, listConversations } from '../chat/store.js';
+import { runQuickTurn } from '../chat/quick.js';
 import { CHAT_PROTOCOL_FILE, loadChatProtocol, saveChatProtocol } from '../chat/templates.js';
 import { CHAT_DIR } from '../fs/layout.js';
 import { McpEndpoint, runsRoot } from '../research/workspace.js';
@@ -89,6 +104,11 @@ function csv(value: string | undefined): string[] | undefined {
   if (!value) return undefined;
   const out = value.split(',').map((x) => x.trim()).filter(Boolean);
   return out.length > 0 ? out : undefined;
+}
+
+/** Ask's answering mode; anything unrecognised (and every older client) means `agent`. */
+function modeOf(value: unknown): ChatMode {
+  return value === 'quick' ? 'quick' : 'agent';
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -104,7 +124,11 @@ type ExtractionConfigDraft = {
 };
 
 type ModelConfigDraft = {
+  /** Legacy single-provider shape. A client that sends it is editing the active provider. */
   embedding?: Partial<EmbeddingConfig>;
+  embeddingProviders?: Partial<EmbeddingConnection>[];
+  embeddingUse?: string;
+  ingest?: { concurrency?: number; convertConcurrency?: number };
   llm?: Partial<LlmConfig>;
   connections?: Partial<LlmConnection>[];
   extraction?: ExtractionConfigDraft;
@@ -166,6 +190,7 @@ function mergeLlmConfig(current: LlmConfig, incoming: Partial<LlmConfig> = {}): 
     model: typeof incoming.model === 'string' ? incoming.model.trim() : current.model,
     cliPath: typeof incoming.cliPath === 'string' ? incoming.cliPath.trim() : current.cliPath,
     cliTimeoutMs: Number.isFinite(cliTimeout) && cliTimeout >= 1000 ? Math.floor(cliTimeout) : current.cliTimeoutMs,
+    label: typeof incoming.label === 'string' ? incoming.label.trim() : current.label,
   };
 }
 
@@ -204,6 +229,74 @@ function mergeConnections(current: LlmConnection[], incoming: Partial<LlmConnect
     });
   }
   return out;
+}
+
+/** One embedding entry, merged onto what is stored so '***' keeps the real key. */
+function mergeEmbeddingConfig(current: EmbeddingConfig, incoming: Partial<EmbeddingConfig> = {}): EmbeddingConfig {
+  const dims = Number(incoming.dimensions);
+  const batch = Number(incoming.batchSize);
+  return {
+    provider: incoming.provider && EMBEDDING_PROVIDERS.includes(incoming.provider) ? incoming.provider : current.provider,
+    baseUrl: typeof incoming.baseUrl === 'string' ? incoming.baseUrl.trim() : current.baseUrl,
+    apiKey: incoming.apiKey === '***' || incoming.apiKey === undefined ? current.apiKey : String(incoming.apiKey),
+    model: typeof incoming.model === 'string' ? incoming.model.trim() : current.model,
+    dimensions: Number.isFinite(dims) && dims >= 1 ? Math.floor(dims) : current.dimensions,
+    batchSize: Number.isFinite(batch) && batch >= 1 ? Math.floor(batch) : current.batchSize,
+    sendDimensions: typeof incoming.sendDimensions === 'boolean' ? incoming.sendDimensions : current.sendDimensions,
+  };
+}
+
+/**
+ * The embedding library replaces wholesale, like `connections`: the client owns
+ * the order and the deletions. An absent list means the client does not model
+ * them yet, so the stored ones stay.
+ */
+function mergeEmbeddings(
+  current: EmbeddingConnection[],
+  incoming: Partial<EmbeddingConnection>[] | undefined,
+): EmbeddingConnection[] {
+  if (!incoming) return current;
+  const out: EmbeddingConnection[] = [];
+  for (const draft of incoming) {
+    const id = typeof draft.id === 'string' ? draft.id.trim() : '';
+    if (!id || out.some((e) => e.id === id)) continue;
+    const previous = current.find((e) => e.id === id);
+    const merged = mergeEmbeddingConfig(previous ?? defaultEmbeddingConfig(), draft);
+    out.push({
+      ...merged,
+      id,
+      label: typeof draft.label === 'string' && draft.label.trim() ? draft.label.trim() : previous?.label || embeddingProviderLabel(merged.provider),
+    });
+  }
+  // Something has to embed, so a list that would end up empty keeps the current one.
+  return out.length ? out : current;
+}
+
+function defaultEmbeddingConfig(): EmbeddingConfig {
+  return { provider: 'openai', baseUrl: '', apiKey: '', model: '', dimensions: 1536, batchSize: 32, sendDimensions: false };
+}
+
+/**
+ * Fold a draft's embedding sections into one answer, so /test, /models and PUT
+ * can never disagree about which provider a draft would actually run on. The
+ * library is the authority; a draft carrying only the legacy `embedding` block
+ * — the pre-library web UI — is a patch to the active entry, which is also how
+ * its echoed '***' finds the right stored key.
+ */
+function mergeEmbeddingSection(
+  current: KnodeConfig,
+  draft: ModelConfigDraft,
+): Pick<KnodeConfig, 'embedding' | 'embeddingProviders' | 'embeddingUse'> {
+  const next: KnodeConfig = { ...current };
+  next.embeddingProviders = mergeEmbeddings(current.embeddingProviders, draft.embeddingProviders);
+  if (typeof draft.embeddingUse === 'string') next.embeddingUse = draft.embeddingUse.trim();
+  if (draft.embedding && !draft.embeddingProviders) {
+    const active = activeEmbedding(next);
+    next.embeddingProviders = next.embeddingProviders.map((e) =>
+      (e.id === active.id ? { ...e, ...mergeEmbeddingConfig(e, draft.embedding) } : e));
+  }
+  syncActiveEmbedding(next);
+  return { embedding: next.embedding, embeddingProviders: next.embeddingProviders, embeddingUse: next.embeddingUse };
 }
 
 function defaultConnectionConfig(): LlmConfig {
@@ -304,6 +397,10 @@ export function createApp(
 
   app.get('/api/config', (c) => {
     const ctx = requestCtx(c);
+    // The settings screen always starts here and asks for models a moment
+    // later, so warm them now rather than making the first dropdown wait.
+    // Never awaited: a slow endpoint must not hold up reading the config.
+    warmModelCache(ctx.config);
     return c.json(redactConfig(ctx.config));
   });
 
@@ -317,8 +414,7 @@ export function createApp(
     };
 
     try {
-      const e: EmbeddingConfig = { ...ctx.config.embedding, ...(draft.embedding ?? {}) };
-      if (e.apiKey === '***') e.apiKey = ctx.config.embedding.apiKey;
+      const e = mergeEmbeddingSection(ctx.config, draft).embedding;
       const provider = createEmbeddingProvider(e);
       const t0 = Date.now();
       const [vec] = await provider.embed(['knode-os configuration connectivity test']);
@@ -363,37 +459,44 @@ export function createApp(
   // the draft default provider first, so the list matches what would run.
   app.post('/api/config/models', async (c) => {
     const ctx = requestCtx(c);
-    const body = (await c.req.json().catch(() => ({}))) as { route?: string; config?: ModelConfigDraft };
+    const body = (await c.req.json().catch(() => ({}))) as { route?: string; config?: ModelConfigDraft; refresh?: boolean };
     const draft = body.config ?? {};
     const route = body.route ?? 'llm';
+    const opts = { refresh: body.refresh === true };
 
     if (route === 'embedding') {
-      const e: EmbeddingConfig = { ...ctx.config.embedding, ...(draft.embedding ?? {}) };
-      if (e.apiKey === '***') e.apiKey = ctx.config.embedding.apiKey;
-      return c.json(await listEmbeddingModels(e));
+      return c.json(await listModelsCached('embedding', mergeEmbeddingSection(ctx.config, draft).embedding, opts));
+    }
+
+    // A named embedding provider lists on its own, before Index points at it.
+    if (route.startsWith('embedding:')) {
+      const id = route.slice('embedding:'.length);
+      const entry = mergeEmbeddingSection(ctx.config, draft).embeddingProviders.find((e) => e.id === id);
+      if (!entry) return c.json({ error: `unknown embedding provider: ${route}` }, 400);
+      return c.json(await listModelsCached('embedding', entry, opts));
     }
 
     const baseLlm = mergeLlmConfig(ctx.config.llm, draft.llm);
     const connections = mergeConnections(ctx.config.connections, draft.connections);
-    if (route === 'llm') return c.json(await listChatModels(baseLlm));
+    if (route === 'llm') return c.json(await listModelsCached('chat', baseLlm, opts));
 
     // A named connection can be listed on its own, before any route uses it.
     if (route.startsWith('connection:')) {
       const connection = connections.find((c) => c.id === route.slice('connection:'.length));
       if (!connection) return c.json({ error: `unknown connection: ${route}` }, 400);
-      return c.json(await listChatModels(connection));
+      return c.json(await listModelsCached('chat', connection, opts));
     }
 
     if (route !== 'entityLlm' && route !== 'conceptLlm' && route !== 'documentLlm') {
       return c.json({ error: `unknown route: ${route}` }, 400);
     }
     const merged = mergeRoutedLlmConfig(ctx.config.extraction[route], draft.extraction?.[route]);
-    return c.json(await listChatModels(resolveRoutedLlmConfig(baseLlm, merged, connections)));
+    return c.json(await listModelsCached('chat', resolveRoutedLlmConfig(baseLlm, merged, connections), opts));
   });
 
   // Where each coding-agent CLI resolved to on the service PATH — Settings uses
   // this to keep the executable field out of the way when it is redundant.
-  app.get('/api/config/cli-tools', (c) => c.json({ tools: cliToolStatus() }));
+  app.get('/api/config/cli-tools', (c) => c.json({ tools: cachedCliToolStatus({ refresh: c.req.query('refresh') === '1' }) }));
 
   // Which executors can actually run here, and which one to preselect when
   // `research.agent` is still empty. Both clients read this instead of each
@@ -413,19 +516,9 @@ export function createApp(
       const incoming = (await c.req.json()) as ModelConfigDraft;
       const next: KnodeConfig = JSON.parse(JSON.stringify(ctx.config));
 
-      if (incoming.embedding) {
-        const e = incoming.embedding;
-        const dims = Number(e.dimensions);
-        next.embedding = {
-          provider: e.provider && EMBEDDING_PROVIDERS.includes(e.provider) ? e.provider : 'local',
-          baseUrl: typeof e.baseUrl === 'string' ? e.baseUrl.trim() : next.embedding.baseUrl,
-          apiKey: e.apiKey === '***' || e.apiKey === undefined ? next.embedding.apiKey : String(e.apiKey),
-          model: typeof e.model === 'string' ? e.model.trim() : next.embedding.model,
-          dimensions: Number.isFinite(dims) && dims >= 1 ? Math.floor(dims) : next.embedding.dimensions,
-          batchSize: next.embedding.batchSize,
-          sendDimensions: typeof e.sendDimensions === 'boolean' ? e.sendDimensions : next.embedding.sendDimensions,
-        };
-      }
+      // Unconditional: this is also what repairs a dangling embeddingUse, and
+      // it flattens the mirror before the re-embed diff below reads it.
+      Object.assign(next, mergeEmbeddingSection(next, incoming));
       if (incoming.llm) {
         next.llm = mergeLlmConfig(next.llm, incoming.llm);
       }
@@ -453,6 +546,16 @@ export function createApp(
         if (Number.isFinite(batchSize) && batchSize >= 1) next.extraction.batchSize = Math.floor(batchSize);
         if (Number.isFinite(concurrency) && concurrency >= 1) next.extraction.concurrency = Math.floor(concurrency);
       }
+      if (incoming.ingest) {
+        const setInt = (key: 'concurrency' | 'convertConcurrency', min: number, max: number) => {
+          const value = Number(incoming.ingest![key]);
+          if (incoming.ingest![key] !== undefined && Number.isFinite(value)) {
+            next.ingest[key] = Math.min(max, Math.max(min, Math.floor(value)));
+          }
+        };
+        setInt('concurrency', 1, 32);
+        setInt('convertConcurrency', 1, 16);
+      }
       if (incoming.research) {
         const r = incoming.research;
         const cur = next.research;
@@ -460,7 +563,7 @@ export function createApp(
           const spec = r.agent.trim();
           // '' is legal (not configured); anything else has to resolve, or the
           // queue would stall with nothing but a log line to show for it
-          if (spec && !agentForSpec(next, spec)) return c.json({ error: `unknown research agent "${spec}"` }, 400);
+          if (spec && !agentForSpec(next, spec, '', ctx.dataDir)) return c.json({ error: `unknown research agent "${spec}"` }, 400);
           cur.agent = spec;
         }
         if (typeof r.model === 'string') cur.model = r.model.trim();
@@ -495,7 +598,7 @@ export function createApp(
         const cur = next.chat;
         if (typeof ch.agent === 'string') {
           const spec = ch.agent.trim();
-          if (spec && !agentForSpec(next, spec)) return c.json({ error: `unknown chat agent "${spec}"` }, 400);
+          if (spec && !agentForSpec(next, spec, '', ctx.dataDir)) return c.json({ error: `unknown chat agent "${spec}"` }, 400);
           cur.agent = spec;
         }
         if (typeof ch.model === 'string') cur.model = ch.model.trim();
@@ -525,11 +628,7 @@ export function createApp(
         if (Number.isFinite(directRatio)) next.retrieval.sag.directRatio = Math.min(1, Math.max(0, directRatio));
       }
 
-      const reembed =
-        next.embedding.provider !== ctx.config.embedding.provider ||
-        next.embedding.model !== ctx.config.embedding.model ||
-        next.embedding.dimensions !== ctx.config.embedding.dimensions ||
-        next.embedding.sendDimensions !== ctx.config.embedding.sendDimensions;
+      const reembed = embeddingIdentity(next.embedding) !== embeddingIdentity(ctx.config.embedding);
       const dimChanged = next.embedding.dimensions !== ctx.config.embedding.dimensions;
       const previousDocumentLlm = resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.documentLlm, ctx.config.connections);
       const nextDocumentLlm = resolveRoutedLlmConfig(next.llm, next.extraction.documentLlm, next.connections);
@@ -1387,6 +1486,62 @@ export function createApp(
     }
   });
 
+  // Named agents: who runs a job or a chat turn, and how hard they think.
+  // The research *policy* — phases, roles, verification — stays in profiles.
+  const agentDetail = (config: KnodeConfig, definition: AgentDefinition) => ({
+    ...definition,
+    builtin: Boolean(BUILTIN_AGENTS[definition.name]),
+    /** Whether the executor it names can actually run here right now. */
+    runnable: Boolean(agentForSpec(config, definition.executor)),
+  });
+
+  app.get('/api/agents', (c) => {
+    const ctx = requestCtx(c);
+    return c.json({
+      active: ctx.config.research?.agent ?? '',
+      chat: ctx.config.chat?.agent ?? '',
+      agents: [...loadAgents(ctx.dataDir).values()].map((a) => agentDetail(ctx.config, a)),
+    });
+  });
+
+  app.get('/api/agents/:name', (c) => {
+    const ctx = requestCtx(c);
+    const definition = loadAgent(ctx.dataDir, c.req.param('name'));
+    if (!definition) return c.json({ error: 'no such agent' }, 404);
+    return c.json(agentDetail(ctx.config, definition));
+  });
+
+  app.put('/api/agents/:name', async (c) => {
+    const ctx = requestCtx(c);
+    const name = c.req.param('name');
+    if (!isValidAgentName(name)) return c.json({ error: 'agent names use letters, digits, - and _ (max 41 chars)' }, 400);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { agent?: Record<string, unknown> };
+      return c.json(agentDetail(ctx.config, saveAgent(ctx.dataDir, { ...(body.agent ?? {}), name })));
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // Deleting a built-in resets it, the way a built-in profile behaves.
+  app.delete('/api/agents/:name', (c) => {
+    const ctx = requestCtx(c);
+    const name = c.req.param('name');
+    if (!deleteAgent(ctx.dataDir, name)) return c.json({ error: 'no such agent' }, 404);
+    const reset = Boolean(BUILTIN_AGENTS[name]);
+    // A config still naming a deleted agent would stall the queue with an
+    // unresolvable spec, so move it off explicitly.
+    if (!reset) {
+      for (const key of ['research', 'chat'] as const) {
+        if (ctx.config[key]?.agent === name) {
+          ctx.config[key].agent = '';
+          saveConfig(ctx.dataDir, ctx.config);
+        }
+      }
+    }
+    return c.json({ ok: true, reset });
+  });
+
   // Research profiles: how a job runs (effort, search, verification, sub-agent roles with their own prompts).
   const profileDetail = (dataDir: string, profile: ResearchProfile) => ({
     ...profile,
@@ -1532,9 +1687,9 @@ export function createApp(
   app.post('/api/chat/conversations', async (c) => {
     const ctx = requestCtx(c);
     try {
-      const body = (await c.req.json().catch(() => ({}))) as { title?: string };
+      const body = (await c.req.json().catch(() => ({}))) as { title?: string; mode?: ChatMode };
       const scope = c.get('workspaceScope');
-      return c.json(await createConversation(ctx.store, { title: body.title, createdBy: scope?.user ?? null }), 201);
+      return c.json(await createConversation(ctx.store, { title: body.title, mode: modeOf(body.mode), createdBy: scope?.user ?? null }), 201);
     } catch (e) {
       return c.json(err(e), 400);
     }
@@ -1547,19 +1702,30 @@ export function createApp(
     return c.json({ ...conversation, running: isChatRunning(ctx, conversation.id) });
   });
 
-  // A message starts a turn in the background: 202 with the user message's seq; poll /status until idle.
+  /**
+   * A message answers in one of two modes. `quick` is one retrieval pass: it
+   * finishes inside this request and answers 200, and it needs neither the MCP
+   * endpoint nor an installed agent CLI — so it is checked before those gates.
+   * `agent` (the default, and what older clients send) starts a session in the
+   * background: 202 with the user message's seq; poll /status until idle.
+   */
   app.post('/api/chat/conversations/:id/messages', async (c) => {
     const ctx = requestCtx(c);
     const id = c.req.param('id');
     try {
-      const body = (await c.req.json().catch(() => ({}))) as { text?: string };
+      const body = (await c.req.json().catch(() => ({}))) as { text?: string; mode?: ChatMode };
       const text = typeof body.text === 'string' ? body.text.trim() : '';
       if (!text) return c.json({ error: 'text is required' }, 400);
       if (!(await getConversation(ctx.store, id))) return c.json({ error: 'no such conversation' }, 404);
+      if (modeOf(body.mode) === 'quick') {
+        if (isChatRunning(ctx, id)) return c.json({ error: `conversation ${id} is already answering` }, 409);
+        const { user, assistant } = await runQuickTurn(ctx, id, text);
+        return c.json({ ok: true, seq: assistant.seq, status: 'idle', mode: 'quick', messages: [user, assistant] });
+      }
       const services = servicesFor(ctx);
       const mcp = services?.mcp() ?? null;
       if (!mcp) return c.json({ error: 'chat needs the MCP endpoint `serve` hosts — start knode-os serve' }, 503);
-      if (!resolveChatAgent(ctx.config)) return c.json({ error: 'no chat agent configured: set chat.agent or research.agent (Settings → Deep research)' }, 503);
+      if (!resolveChatAgent(ctx.config, ctx.dataDir)) return c.json({ error: 'no chat agent configured: set chat.agent or research.agent (Settings → Agents)' }, 503);
       const { seq, turn } = await startChatTurn(ctx, id, text, { mcp, log });
       const tracked = services ? services.track(turn) : turn;
       tracked.catch((e) => log(`chat ${id}: turn failed: ${e instanceof Error ? e.message : e}`));

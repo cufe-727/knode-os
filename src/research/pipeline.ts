@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { AppContext } from '../context.js';
 import { safePath } from '../fs/files.js';
+import { pool } from '../pool.js';
 import { ResearchAgent, withModel } from './agent.js';
 import { getJob, ResearchJob } from './jobs.js';
 import { isCancelled, JobCancelledError, LaunchResult, launchSession, SessionResult } from './launch.js';
@@ -139,20 +140,6 @@ function companionsText(ctx: AppContext, ws: RunWorkspace, cap = 20_000): string
     parts.push(`# 当前附加输出（${c.path}）\n\n${text ? text.slice(0, cap) : `（尚未写入 ${c.path}）`}`);
   }
   return parts.join('\n\n');
-}
-
-async function pool<T, R>(items: T[], size: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let next = 0;
-  await Promise.all(
-    Array.from({ length: Math.max(1, Math.min(size, items.length)) }, async () => {
-      while (next < items.length) {
-        const i = next++;
-        out[i] = await fn(items[i], i);
-      }
-    }),
-  );
-  return out;
 }
 
 /** The CLI a role runs on: its own `agent` (connection id / provider) when resolvable, else the job's. */

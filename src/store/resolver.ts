@@ -200,9 +200,10 @@ export function overlapsValidWindow(claim: { valid_from: string | null; valid_to
 /**
  * What a retrieved row came from. `wiki` is human-authored wiki prose, `view`
  * is a generated page — they live in the same directory but only one of them
- * is a knowledge source.
+ * is a knowledge source. `trace` only ever matches when `trace.episodes` is on:
+ * without it synced transcripts are never prepared into searchable episodes.
  */
-export const SOURCE_KINDS = ['doc', 'wiki', 'view', 'skill'] as const;
+export const SOURCE_KINDS = ['doc', 'wiki', 'view', 'skill', 'trace'] as const;
 export type SourceKind = (typeof SOURCE_KINDS)[number];
 
 export interface ScopeFilterRequest {
@@ -288,6 +289,7 @@ const KIND_SQL: Record<SourceKind, (a: string) => string> = {
   wiki: (a) => `(${a}.root = 'wiki' AND ${a}.kind <> 'view')`,
   view: (a) => `${a}.kind = 'view'`,
   skill: (a) => `${a}.root = 'skills'`,
+  trace: (a) => `${a}.root = 'traces'`,
 };
 
 /** Path-prefix predicate over any column holding a source path (document path or scope key). */

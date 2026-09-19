@@ -29,6 +29,20 @@ export interface EmbeddingConfig {
 }
 
 /**
+ * One named embedding provider. Structurally the mirror of `LlmConnection`:
+ * the endpoint lives here once, and `embedding.use` points at it.
+ *
+ * Only one can be active at a time. Vectors are comparable only within one
+ * model, and the embeddings table has a single column width per workspace, so
+ * switching re-embeds the corpus rather than letting two sets coexist.
+ */
+export interface EmbeddingConnection extends EmbeddingConfig {
+  /** Stable key `embedding.use` references. Never reused for a different endpoint. */
+  id: string;
+  label: string;
+}
+
+/**
  * Where the derived index lives.
  *
  * 'pglite' keeps the zero-setup default: an embedded Postgres per workspace
@@ -78,6 +92,8 @@ export interface LlmConfig {
   cliPath: string;
   /** Kill a CLI completion after this long. */
   cliTimeoutMs: number;
+  /** Shown in the UI. Empty = llmProviderLabel(provider). */
+  label?: string;
 }
 
 /** Per-job LLM routing. `inherit` keeps using the default `llm` connection. */
@@ -132,6 +148,22 @@ export interface ExtractionConfig {
   concurrency: number;
   /** Minutes between background tier-1 queue passes while `serve` runs. */
   intervalMinutes: number;
+}
+
+export interface IngestConfig {
+  chunkSize: number;
+  chunkOverlap: number;
+  /** Re-sync automatically when files under the data dir change. */
+  watch: boolean;
+  /** Parallel documents in flight during the index pass; embedding round-trips dominate. */
+  concurrency?: number;
+  /**
+   * Parallel document conversions in the prepare pass. Each conversion is one
+   * or more vision calls, so this is the Convert stage's rate against the
+   * document model. Pages inside one PDF stay sequential — two limits that
+   * multiplied would blow a rate limit on a single scanned book.
+   */
+  convertConcurrency?: number;
 }
 
 export interface HeatConfig {
@@ -363,7 +395,7 @@ export interface ChatConfig {
   web: ChatWebAccess;
   /** Messages replayed into each turn's prompt (user + assistant, most recent). */
   historyTurns: number;
-  /** Conversations kept per workspace; older ones are pruned. */
+  /** Conversations kept per workspace; older ones are pruned. Quick asks are one conversation each, so this fills faster than turns do. */
   keep: number;
 }
 
@@ -405,14 +437,24 @@ export interface ReviewConfig {
 }
 
 export interface KnodeConfig {
+  /**
+   * The active embedding provider, flattened. Derived from `embeddingProviders`
+   * on every load and every save, never edited on its own, so that every reader
+   * — the store's vector width, `ctx.embedder`, wiki, dream, the dedupe audit —
+   * keeps taking one plain endpoint and never has to know the library exists.
+   */
   embedding: EmbeddingConfig;
+  /** Every configured embedding provider. The Index stage runs on exactly one. */
+  embeddingProviders: EmbeddingConnection[];
+  /** Which `embeddingProviders` entry the Index stage runs on. */
+  embeddingUse: string;
   database: DatabaseConfig;
   /** The default connection every route inherits unless it names another. */
   llm: LlmConfig;
   /** Extra named connections routes can be pointed at. */
   connections: LlmConnection[];
   server: { port: number; host: string; mcp: McpServerConfig };
-  ingest: { chunkSize: number; chunkOverlap: number; watch: boolean; concurrency?: number };
+  ingest: IngestConfig;
   extraction: ExtractionConfig;
   retrieval: { sag: SagSearchConfig };
   heat: HeatConfig;
@@ -464,6 +506,11 @@ export function defaultConfig(): KnodeConfig {
       batchSize: 32,
       sendDimensions: false,
     },
+    // Empty, not a seeded row: `deepMerge` keeps a default the saved file does
+    // not mention, so a seeded row would survive the merge of a pre-library
+    // config and then overwrite that config's real embedding settings.
+    embeddingProviders: [],
+    embeddingUse: '',
     database: {
       // PostgreSQL by default: one shared database, one schema per workspace. The
       // embedded PGlite index stays available for offline / zero-setup use and
@@ -487,7 +534,7 @@ export function defaultConfig(): KnodeConfig {
     },
     connections: [],
     server: { port: 9100, host: '127.0.0.1', mcp: { enabled: true, path: '/mcp' } },
-    ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4 },
+    ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4, convertConcurrency: 2 },
     extraction: {
       dailyTokenBudget: 2_000_000,
       claims: true,
@@ -554,7 +601,7 @@ export function defaultConfig(): KnodeConfig {
       claims: 'suggest',
       external: 'verify',
     },
-    chat: { agent: '', model: '', effort: 'default', maxTurns: 30, timeoutMs: 600_000, web: 'inherit', historyTurns: 12, keep: 50 },
+    chat: { agent: '', model: '', effort: 'default', maxTurns: 30, timeoutMs: 600_000, web: 'inherit', historyTurns: 12, keep: 200 },
     trace: {
       claudeProjectsDir: path.join(home, '.claude', 'projects'),
       codexSessionsDir: path.join(home, '.codex', 'sessions'),
@@ -636,9 +683,9 @@ function deepMerge<T>(base: T, override: Partial<T>): T {
 export function loadConfig(dataDir: string): KnodeConfig {
   const file = path.join(dataDir, CONFIG_FILE);
   const base = defaultConfig();
-  if (!fs.existsSync(file)) return base;
+  if (!fs.existsSync(file)) return migrateEmbeddingProviders(base);
   const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<KnodeConfig>;
-  return migrateRouteConnections(deepMerge(base, raw));
+  return migrateEmbeddingProviders(migrateRouteConnections(deepMerge(base, raw)));
 }
 
 const ROUTE_KEYS = ['entityLlm', 'conceptLlm', 'documentLlm'] as const;
@@ -684,6 +731,86 @@ function uniqueConnectionId(provider: LlmProvider, connections: LlmConnection[])
   }
 }
 
+/**
+ * Lift the single `embedding` block into the named library, in memory, so the
+ * UI only has to understand a list. A config written before the library had
+ * exactly one embedding provider; it becomes the first entry and stays active,
+ * which is why nothing re-embeds on the upgrade.
+ *
+ * A `use` naming an entry that no longer exists falls back to the first one
+ * rather than failing: deleting a provider degrades the workspace the way an
+ * unknown route id does, it does not break indexing.
+ */
+export function migrateEmbeddingProviders(config: KnodeConfig): KnodeConfig {
+  if (!config.embeddingProviders?.length) {
+    const id = uniqueEmbeddingId(config.embedding.provider, []);
+    config.embeddingProviders = [{ ...config.embedding, id, label: embeddingProviderLabel(config.embedding.provider) }];
+    config.embeddingUse = id;
+  }
+  return syncActiveEmbedding(config);
+}
+
+/**
+ * The entry the Index stage runs on. Unlike an LLM route there is no `inherit`
+ * case — one entry simply is the active one. A `use` naming an entry that no
+ * longer exists falls back to the first rather than failing an ingest pass:
+ * deleting the active provider re-embeds on the next save, it does not break.
+ */
+export function activeEmbedding(
+  config: Pick<KnodeConfig, 'embedding' | 'embeddingProviders' | 'embeddingUse'>,
+): EmbeddingConnection {
+  const providers = config.embeddingProviders ?? [];
+  return (
+    providers.find((e) => e.id === config.embeddingUse) ??
+    providers[0] ?? {
+      ...config.embedding,
+      id: config.embeddingUse || uniqueEmbeddingId(config.embedding.provider, []),
+      label: embeddingProviderLabel(config.embedding.provider),
+    }
+  );
+}
+
+/**
+ * Rewrite the `embedding` mirror from the active entry, repairing a dangling
+ * `embeddingUse` on the way. The save path calls this before the re-embed diff
+ * runs, so that diff keeps comparing two plain endpoints.
+ */
+export function syncActiveEmbedding(config: KnodeConfig): KnodeConfig {
+  const { id, label, ...endpoint } = activeEmbedding(config);
+  config.embedding = endpoint;
+  config.embeddingUse = id;
+  return config;
+}
+
+/**
+ * What makes two embedding configurations produce comparable vectors: every
+ * field that changes the vector space and nothing that does not, so rotating a
+ * key or widening a batch never costs a re-embed — and repointing one model
+ * name at a different vendor does.
+ */
+export function embeddingIdentity(cfg: EmbeddingConfig): string {
+  // the local hashing embedder reads nothing but the dimension, so its unused
+  // endpoint fields must not be able to trigger a re-embed
+  if (cfg.provider === 'local') return `local|${cfg.dimensions}`;
+  return [cfg.provider, cfg.baseUrl.replace(/\/+$/, ''), cfg.model, cfg.dimensions, cfg.sendDimensions].join('|');
+}
+
+function uniqueEmbeddingId(provider: EmbeddingConfig['provider'], providers: EmbeddingConnection[]): string {
+  for (let n = 1; ; n++) {
+    const id = `${provider}-${n}`;
+    if (!providers.some((e) => e.id === id)) return id;
+  }
+}
+
+export function embeddingProviderLabel(provider: EmbeddingConfig['provider']): string {
+  switch (provider) {
+    case 'openai': return 'OpenAI-compatible API';
+    case 'ark-multimodal': return 'Volcengine Ark · multimodal';
+    case 'local': return 'Local hashing · offline';
+    default: return provider;
+  }
+}
+
 export function llmProviderLabel(provider: LlmProvider): string {
   switch (provider) {
     case 'openai': return 'OpenAI-compatible API';
@@ -714,7 +841,15 @@ export function resolveDataDir(flag?: string): string {
 /** Redact secrets for API exposure. */
 export function redactConfig(config: KnodeConfig): KnodeConfig {
   const clone = JSON.parse(JSON.stringify(config)) as KnodeConfig;
-  const secretHolders = [clone.embedding, clone.llm, clone.extraction.entityLlm, clone.extraction.conceptLlm, clone.extraction.documentLlm, ...(clone.connections ?? [])];
+  const secretHolders = [
+    clone.embedding,
+    clone.llm,
+    clone.extraction.entityLlm,
+    clone.extraction.conceptLlm,
+    clone.extraction.documentLlm,
+    ...(clone.connections ?? []),
+    ...(clone.embeddingProviders ?? []),
+  ];
   for (const c of secretHolders) {
     if (c.apiKey && !c.apiKey.startsWith('env:')) c.apiKey = '***';
   }

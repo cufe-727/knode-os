@@ -27,7 +27,7 @@ export function startResearchLoop(
     while (!disposed && running < concurrency) {
       const mcp = opts.mcp();
       if (!mcp) return;
-      const agent = resolveResearchAgent(ctx.config);
+      const agent = resolveResearchAgent(ctx.config, ctx.dataDir);
       if (!agent) {
         if (!warnedNoAgent) {
           opts.log(`research: no agent configured — queued jobs wait. Set research.agent in knode.config.json to a CLI (claude-cli / codex-cli / cursor-cli), a connection id, or 'default' to run the built-in agent on the default LLM connection`);

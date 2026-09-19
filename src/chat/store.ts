@@ -12,6 +12,8 @@ import { toIso } from '../store/temporal.js';
 
 export type ChatStatus = 'idle' | 'running';
 export type ChatRole = 'user' | 'assistant';
+/** How a turn is answered: one retrieval pass, or a session of the agent CLI. */
+export type ChatMode = 'quick' | 'agent';
 
 export interface ChatEvent {
   /** knode tool name without the mcp prefix, or `wrote` for a file the reply says it wrote. */
@@ -21,6 +23,17 @@ export interface ChatEvent {
   ok?: boolean;
 }
 
+/**
+ * What a quick (retrieval) answer knows about itself. Agent replies leave it
+ * empty and carry their tool activity in `events` instead.
+ */
+export interface ChatAnswerPayload {
+  mode?: ChatMode;
+  citations?: { ref: number; path: string; chunkId?: string }[];
+  gaps?: string[];
+  facts?: { statement: string; subject?: string; status?: string }[];
+}
+
 export interface ChatMessage {
   id: string;
   conversationId: string;
@@ -28,6 +41,7 @@ export interface ChatMessage {
   role: ChatRole;
   content: string;
   events: ChatEvent[];
+  payload: ChatAnswerPayload;
   turns: number | null;
   costUsd: number | null;
   error: string | null;
@@ -54,11 +68,11 @@ interface ConversationRow {
 
 interface MessageRow {
   id: string; conversation_id: string; seq: number; role: string; content: string; events: ChatEvent[] | null;
-  turns: number | null; cost_usd: number | null; error: string | null; created_at: string | Date;
+  payload: ChatAnswerPayload | null; turns: number | null; cost_usd: number | null; error: string | null; created_at: string | Date;
 }
 
 const CONV_COLS = 'id, title, agent, model, status, created_by, payload, created_at, updated_at';
-const MSG_COLS = 'id, conversation_id, seq, role, content, events, turns, cost_usd, error, created_at';
+const MSG_COLS = 'id, conversation_id, seq, role, content, events, payload, turns, cost_usd, error, created_at';
 
 function conversation(r: ConversationRow): ChatConversation {
   return {
@@ -82,6 +96,7 @@ function message(r: MessageRow): ChatMessage {
     role: r.role === 'assistant' ? 'assistant' : 'user',
     content: r.content,
     events: Array.isArray(r.events) ? r.events : [],
+    payload: r.payload ?? {},
     turns: r.turns,
     costUsd: r.cost_usd,
     error: r.error,
@@ -95,11 +110,14 @@ export function titleFrom(text: string): string {
   return line.length > 60 ? `${line.slice(0, 59)}…` : line;
 }
 
-export async function createConversation(store: Store, input: { title?: string; createdBy?: string | null } = {}): Promise<ChatConversation> {
+export async function createConversation(
+  store: Store,
+  input: { title?: string; createdBy?: string | null; mode?: ChatMode } = {},
+): Promise<ChatConversation> {
   const id = `c_${crypto.randomBytes(5).toString('hex')}`;
   const [row] = await store.query<ConversationRow>(
-    `INSERT INTO chat_conversations (id, title, created_by) VALUES ($1, $2, $3) RETURNING ${CONV_COLS}`,
-    [id, (input.title ?? '').trim().slice(0, 120), input.createdBy ?? null],
+    `INSERT INTO chat_conversations (id, title, created_by, payload) VALUES ($1, $2, $3, $4::jsonb) RETURNING ${CONV_COLS}`,
+    [id, (input.title ?? '').trim().slice(0, 120), input.createdBy ?? null, JSON.stringify(input.mode ? { mode: input.mode } : {})],
   );
   return conversation(row);
 }
@@ -127,13 +145,16 @@ export async function recentMessages(store: Store, id: string, limit: number): P
   return rows.map(message).reverse();
 }
 
-export async function appendMessage(store: Store, input: Omit<ChatMessage, 'id' | 'seq' | 'createdAt'>): Promise<ChatMessage> {
+export async function appendMessage(
+  store: Store,
+  input: Omit<ChatMessage, 'id' | 'seq' | 'createdAt' | 'payload'> & { payload?: ChatAnswerPayload },
+): Promise<ChatMessage> {
   const id = `m_${crypto.randomBytes(6).toString('hex')}`;
   const [row] = await store.query<MessageRow>(
-    `INSERT INTO chat_messages (id, conversation_id, seq, role, content, events, turns, cost_usd, error)
-     VALUES ($1, $2, (SELECT COALESCE(max(seq), 0) + 1 FROM chat_messages WHERE conversation_id = $2), $3, $4, $5::jsonb, $6, $7, $8)
+    `INSERT INTO chat_messages (id, conversation_id, seq, role, content, events, payload, turns, cost_usd, error)
+     VALUES ($1, $2, (SELECT COALESCE(max(seq), 0) + 1 FROM chat_messages WHERE conversation_id = $2), $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9)
      RETURNING ${MSG_COLS}`,
-    [id, input.conversationId, input.role, input.content, JSON.stringify(input.events ?? []), input.turns, input.costUsd, input.error],
+    [id, input.conversationId, input.role, input.content, JSON.stringify(input.events ?? []), JSON.stringify(input.payload ?? {}), input.turns, input.costUsd, input.error],
   );
   await store.query(`UPDATE chat_conversations SET updated_at = now() WHERE id = $1`, [input.conversationId]);
   return message(row);
@@ -143,7 +164,7 @@ export async function setConversationStatus(
   store: Store,
   id: string,
   status: ChatStatus,
-  patch: { title?: string; agent?: string | null; model?: string | null } = {},
+  patch: { title?: string; agent?: string | null; model?: string | null; payload?: Record<string, unknown> } = {},
 ): Promise<void> {
   const sets = ['status = $2', 'updated_at = now()'];
   const params: unknown[] = [id, status];
@@ -158,6 +179,10 @@ export async function setConversationStatus(
   if (patch.model !== undefined) {
     params.push(patch.model);
     sets.push(`model = $${params.length}`);
+  }
+  if (patch.payload !== undefined) {
+    params.push(JSON.stringify(patch.payload));
+    sets.push(`payload = $${params.length}::jsonb`);
   }
   await store.query(`UPDATE chat_conversations SET ${sets.join(', ')} WHERE id = $1`, params);
 }

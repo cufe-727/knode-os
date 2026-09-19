@@ -133,6 +133,50 @@ describe('chat', () => {
     expect(list.map((c) => c.id)).toContain(id);
   }, 60_000);
 
+  it('answers in quick mode inside the request, cited, with no agent CLI configured', async () => {
+    const savedChat = ctx.config.chat.agent;
+    const savedResearch = ctx.config.research.agent;
+    ctx.config.chat.agent = '';
+    ctx.config.research.agent = '';
+    try {
+      const created = await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({ mode: 'quick' }) });
+      expect(created.status).toBe(201);
+      const { id } = await created.json() as { id: string };
+      const question = '宁德时代 2025 年营收是多少？';
+
+      // the agent path needs a CLI and says so; the quick path is checked before that gate
+      const refused = await api(`/api/chat/conversations/${id}/messages`, { method: 'POST', body: JSON.stringify({ text: question }) });
+      expect(refused.status).toBe(503);
+
+      const sent = await api(`/api/chat/conversations/${id}/messages`, { method: 'POST', body: JSON.stringify({ text: question, mode: 'quick' }) });
+      expect(sent.status).toBe(200); // finished in the request: nothing to poll
+      expect(await sent.json()).toMatchObject({ ok: true, seq: 2, status: 'idle', mode: 'quick' });
+
+      const conv = await (await api(`/api/chat/conversations/${id}`)).json() as {
+        title: string; status: string; payload: { mode?: string };
+        messages: { role: string; content: string; events: unknown[]; payload: { mode?: string; citations?: { path: string }[]; facts?: { statement: string }[] } }[];
+      };
+      expect(conv.status).toBe('idle');
+      expect(conv.title).toBe(question);
+      expect(conv.payload.mode).toBe('quick');
+      expect(conv.messages.map((m) => m.role)).toEqual(['user', 'assistant']);
+
+      const reply = conv.messages[1];
+      expect(reply.payload.mode).toBe('quick');
+      expect(reply.payload.citations?.map((c) => c.path)).toContain('raw/docs/trusted.md');
+      expect(reply.events).toEqual([]); // no agent ran, so no tool activity
+      // this workspace has no LLM connection, so the answer is the retrieval fallback
+      expect(reply.content).toContain('LLM is not configured');
+
+      // both kinds of conversation come back from the one list the merged Ask shows
+      const list = await (await api('/api/chat/conversations')).json() as { id: string }[];
+      expect(list.map((c) => c.id)).toContain(id);
+    } finally {
+      ctx.config.chat.agent = savedChat;
+      ctx.config.research.agent = savedResearch;
+    }
+  }, 30_000);
+
   it('replays recent history into the next turn, bounded by chat.historyTurns', async () => {
     const conversation = await createConversation(ctx.store, { createdBy: 'test' });
     process.env.FAKE_AGENT_MODE = 'good';

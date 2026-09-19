@@ -27,7 +27,7 @@ import { TranscriptWriter } from './transcript.js';
  * It honours the same contract as a CLI session (see `launchSession`): the
  * prompt is the whole instruction, the page travels back through `knode_write`
  * over the same HTTP MCP endpoint the CLIs use, the transcript is written
- * incrementally in claude's stream-json shape so the Chat tab's live activity
+ * incrementally in claude's stream-json shape so Ask's live activity
  * view needs no special case, and the session is registered for cancellation
  * under its job id.
  *

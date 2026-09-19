@@ -82,7 +82,7 @@ POST /api/research/init ─▶ research_jobs(kind=init) ─kick─▶ service �
 | 表 | 说明 |
 | --- | --- |
 | `chat_conversations` | id / title / agent / model / status(`idle`\|`running`) / created_by / payload |
-| `chat_messages` | conversation_id + seq 唯一；role、content、events(jsonb)、turns、cost_usd、error |
+| `chat_messages` | conversation_id + seq 唯一；role、content、events(jsonb)、payload(jsonb，v10)、turns、cost_usd、error |
 
 一轮 = 一次 agent 会话（无头 CLI，或 `serve` 进程内的内置 agent），cwd 是 `.runs/chat/<会话 id>/`（每轮重写 schema 文件，协议与指南的改动立刻生效）。
 提示由 `playbooks/chat/turn.md` 渲染：最近 `chat.historyTurns` 条历史（助手消息各截 2 000 字符、总量 40 000 字符封顶）、
@@ -93,6 +93,29 @@ stream-json `tool_use` + `tool_result`；codex 没有事件流则为空），外
 - **取消**：`killAgentsFor('chat:<id>')`，该轮助手消息记 `error: cancelled`，会话回到 idle。
 - **教学**：协议要求先复述确认，再 `knode_write` 笔记 + `knode_sync only:[路径]`，并告诉用户它是 quarantined。
 - **联网**：`chatWebAllowed` 只在 `review.external` 允许的范围内收紧或放开，从不越过主开关。
+
+### 4.1 与 Ask 合并（2026‑09‑19）
+
+原来 Ask（`POST /api/ask`，一次检索 + 一次 LLM 调用、无状态）与 Chat 是两个一级入口，但对人来说是同一个意图的
+两种成本档。现在界面上只剩一个 **Ask**，模式开关在输入框旁：
+
+| | 快速（quick） | Agent |
+| --- | --- | --- |
+| 怎么答 | `ask()`（`src/search/ask.ts`）一次检索 + 一次 LLM 调用 | 一次 agent CLI 会话，走 MCP |
+| 路由返回 | **200**，回复已写库，无需轮询 | 202 + 轮询 `…/status` |
+| 前置条件 | 无 —— **不需要 MCP 端点，也不需要装 agent CLI** | 两者都要，否则 503 |
+| 回复怎么自述 | `payload`：citations / gaps / facts | `events`：工具调用芯片 |
+| 能否写入 | 否 | 能（隔离笔记，可采纳） |
+
+- **模式落在哪**：会话级在 `chat_conversations.payload.mode`（该列本来就有）；回复级在新增的
+  `chat_messages.payload`（**migration v10**）。`contexts` 故意不存——整块 chunk 太大且可重算。
+- **路由**：`POST …/messages` 增加可选 `mode`（缺省 `agent`，老客户端行为不变）。quick 分支在两处 503 检查
+  **之前**返回，这是「没装 Claude Code 也能用 Ask」的关键。实现在 `src/chat/quick.ts`。
+- **一问一会话**：每次快速提问新建一条会话，列表读起来就是一部提问史；快速回答下方的「交给 agent 深入」
+  会用同一个问题另开一条 agent 会话。模式从不改写已有会话的含义。
+- **`POST /api/ask` 原样保留**：MCP 的 `knode_ask` 与 CLI 都依赖它，`quick.ts` 也是调它。
+- **配置键不动**：`knode.config.json` 里仍是 `chat.*`（改键等于动用户的配置文件），只有 UI 文案改成
+  「Ask · Agent 模式」。`chat.keep` 默认从 50 提到 200 —— 一问一会话把 50 条大约一天就填满了。
 
 ## 5. 研究 agent 的改进
 

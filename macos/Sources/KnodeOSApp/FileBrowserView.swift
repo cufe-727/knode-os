@@ -98,7 +98,14 @@ struct FileBrowserView: View {
     @State private var expandedPaths: Set<String> = ["wiki"]
     /// The folder clicked in the tree. New files, new folders and uploads
     /// default into it until another row is clicked.
-    @State private var selectedDirectory: String?
+    ///
+    /// Held on the model, not in `@State`: Search scopes to it (the reason the
+    /// two share a section), and this screen is rebuilt on every tab switch, so
+    /// a local pick would be lost the moment you went to look something up.
+    private var selectedDirectory: String? {
+        get { model.pickedDirectory }
+        nonmutating set { model.pickedDirectory = newValue }
+    }
     @State private var isTruncated = false
     /// The open text is Markdown knode-os derived from a PDF or image. Saving it
     /// would write that Markdown over the original's bytes, so editing stays shut.

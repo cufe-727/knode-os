@@ -10,6 +10,15 @@ struct SettingsView: View {
     @State private var isWorking = false
     @State private var showingClearConfirmation = false
     @State private var cliTools: [String: CliTool] = [:]
+    /// Provider ids whose row is open. Survives a save, unlike a per-row @State.
+    @State private var expandedProviders: Set<String> = []
+    /// Which pipeline node the inspector below the flow is showing.
+    @State private var selectedStage: PipelineStage = .convert
+    /// Model lists, shared by every picker on the screen.
+    @StateObject private var catalog = ModelCatalog()
+    /// The named agents Research and Chat point at (section 03).
+    @State private var agents: [AgentDefinition] = []
+    @State private var agentToRemove: AgentDefinition?
     @State private var profiles: [ResearchProfileSummary] = []
     @State private var profileDraft: ResearchProfileDetail?
     @State private var profileDirty = false
@@ -28,10 +37,15 @@ struct SettingsView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 80)
                 } else if config != nil {
-                    pipelineSummary
-                    providersSection
-                    pipelineSection
-                    researchSection
+                    // one section per sub-tab; the hero above and the results
+                    // below stay put, because `Test stages` tests every stage
+                    switch model.selectedTab {
+                    case .pipeline: pipelineSection
+                    case .agents: agentsSection
+                    case .research: researchSection
+                    case .workspace: workspaceDangerSection
+                    default: providersSection
+                    }
                     if let testResult { testResults(testResult) }
                     if !statusMessage.isEmpty {
                         Label(statusMessage, systemImage: statusIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
@@ -39,7 +53,6 @@ struct SettingsView: View {
                             .foregroundStyle(statusIsError ? Color.knodeBad : Color.knodeGood)
                             .knodeCard()
                     }
-                    workspaceDangerSection
                 } else {
                     EmptyState(symbol: "slider.horizontal.3", title: L("Could not load settings"), message: L("The local service is unavailable. Retry to start it and reload this workspace's routes."), actionTitle: L("Retry"), action: { Task { await retry() } })
                 }
@@ -49,6 +62,7 @@ struct SettingsView: View {
             .frame(maxWidth: .infinity)
         }
         .background(Color(nsColor: .textBackgroundColor).opacity(0.22))
+        .environmentObject(catalog)
         .task { await load() }
         .onChange(of: model.connectionState) { _, state in
             if case .connected = state, config == nil {
@@ -95,6 +109,24 @@ struct SettingsView: View {
                 : L("The profile file and the roles defined in it are removed."))
         }
         .sheet(isPresented: $showingDuplicate) { duplicateSheet }
+        .confirmationDialog(
+            agentToRemove?.builtin == true
+                ? L("Reset %@ to the built-in template?", agentToRemove?.title ?? "")
+                : L("Remove agent %@?", agentToRemove?.title ?? ""),
+            isPresented: Binding(get: { agentToRemove != nil }, set: { if !$0 { agentToRemove = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button(agentToRemove?.builtin == true ? L("Reset") : L("Remove"), role: .destructive) {
+                guard let agent = agentToRemove else { return }
+                agentToRemove = nil
+                Task { await removeAgent(agent) }
+            }
+            Button(L("Cancel"), role: .cancel) { agentToRemove = nil }
+        } message: {
+            Text(agentToRemove?.builtin == true
+                ? L("Its file goes back to the template, including the prompt.")
+                : L("Anything pointing at it falls back to nothing configured."))
+        }
     }
 
     private var hero: some View {
@@ -124,26 +156,12 @@ struct SettingsView: View {
         }
     }
 
-    /// The pipeline at a glance, in the order a document actually moves through it.
-    private var pipelineSummary: some View {
-        HStack(spacing: 0) {
-            SummaryRoute(label: L("Convert"), value: routeSummary(\.extraction.documentLlm), detail: L("Images & scanned PDFs"), color: .knodeViolet)
-            Divider().frame(height: 54)
-            SummaryRoute(label: L("Index"), value: embeddingSummary, detail: L("Embedding"), color: .knodeCyan)
-            Divider().frame(height: 54)
-            SummaryRoute(label: L("Extract"), value: routeSummary(\.extraction.entityLlm), detail: L("Entities & relations"), color: .knodeViolet)
-            Divider().frame(height: 54)
-            SummaryRoute(label: L("Synthesize"), value: routeSummary(\.extraction.conceptLlm), detail: L("Concept pages"), color: .knodeViolet)
-            Divider().frame(height: 54)
-            SummaryRoute(label: L("Answer"), value: defaultModelSummary, detail: L("Ask, Wiki & Dream"), color: .knodeViolet)
-        }
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .overlay { RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.08)) }
-    }
-
     // MARK: - 01 · Providers
 
-    /// Every endpoint and credential lives here, once. Section 02 only points at them.
+    /// Every endpoint and credential lives here, once, as one table: which
+    /// embedding providers exist, which LLM providers exist, and which of each
+    /// is the default. A row opens to its own form, so the page stays scannable
+    /// however many are configured.
     private var providersSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             sectionHeader(
@@ -153,139 +171,157 @@ struct SettingsView: View {
                 badge: L("Configure once"),
                 color: .knodeCyan
             )
-            embeddingCard
-            defaultProviderCard
-            connectionsEditor
+            VStack(spacing: 0) {
+                providerTableHeader
+                ForEach(Array((config?.embeddingProviders ?? []).enumerated()), id: \.element.id) { index, entry in
+                    Divider()
+                    embeddingRow(index: index, entry: entry)
+                }
+                Divider()
+                defaultLlmRow
+                ForEach(Array((config?.connections ?? []).enumerated()), id: \.element.id) { index, connection in
+                    Divider()
+                    connectionRow(index: index, connection: connection)
+                }
+            }
+            .knodeCard(padding: 0)
         }
     }
 
-    private var embeddingCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            cardHeader(
-                title: L("Embedding provider"),
-                detail: L("One per workspace — the Index stage always uses it."),
-                badge: L("Required"),
-                color: .knodeCyan
+    private var providerTableHeader: some View {
+        HStack(spacing: 12) {
+            Text(L("Kind"))
+                .frame(width: 74, alignment: .leading)
+            Text(L("Name"))
+                .frame(width: 210, alignment: .leading)
+            Text(L("Provider"))
+                .frame(width: 170, alignment: .leading)
+            Text(L("Model"))
+            Spacer(minLength: 8)
+            Menu {
+                Button(L("LLM provider")) { addConnection() }
+                Button(L("Embedding provider")) { addEmbeddingProvider() }
+            } label: {
+                Label(L("Add provider"), systemImage: "plus")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled(config == nil)
+        }
+        .font(.system(size: 9, weight: .bold, design: .monospaced))
+        .tracking(0.8)
+        .foregroundStyle(.tertiary)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private func embeddingRow(index: Int, entry: EmbeddingConnection) -> some View {
+        ProviderRow(
+            kind: L("Embed"),
+            color: .knodeCyan,
+            isDefault: entry.id == config?.embeddingUse,
+            label: binding(\.embeddingProviders)[index].label,
+            providerName: embeddingProviderName(entry.provider),
+            summary: embeddingRowSummary(entry),
+            id: entry.id,
+            expanded: expandedBinding(entry.id),
+            // Something has to embed, so the last one cannot be removed.
+            remove: (config?.embeddingProviders.count ?? 0) > 1 ? { removeEmbeddingProvider(id: entry.id) } : nil
+        ) {
+            EmbeddingProviderFields(
+                entry: binding(\.embeddingProviders)[index],
+                route: "embedding:\(entry.id)",
+                load: { refresh in try await modelList(route: "embedding:\(entry.id)", refresh: refresh) }
             )
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-                GridRow {
-                    FieldLabel(L("Provider")) {
-                        Picker(L("Provider"), selection: binding(\.embedding.provider)) {
-                            Text(L("Local hashing · offline")).tag("local")
-                            Text(L("OpenAI-compatible API")).tag("openai")
-                            Text(L("Volcengine Ark · multimodal")).tag("ark-multimodal")
-                        }
-                        .labelsHidden()
-                    }
-                    ModelField(
-                        placeholder: config?.embedding.provider == "ark-multimodal" ? "ep-…" : "text-embedding-3-small",
-                        text: binding(\.embedding.model),
-                        providerKey: config?.embedding.provider ?? "",
-                        disabled: config?.embedding.provider == "local",
-                        load: { try await modelList(route: "embedding") }
-                    )
-                }
-                GridRow {
-                    FieldLabel(L("Base URL")) {
-                        TextField("https://api.openai.com/v1", text: binding(\.embedding.baseUrl))
-                            .disabled(config?.embedding.provider == "local")
-                    }
-                    FieldLabel(L("API key")) {
-                        SecureField("env:OPENAI_API_KEY", text: binding(\.embedding.apiKey))
-                            .disabled(config?.embedding.provider == "local")
-                    }
-                }
-                GridRow {
-                    FieldLabel(L("Dimensions")) {
-                        TextField(L("Dimensions"), value: binding(\.embedding.dimensions), format: .number)
-                    }
-                    Toggle(L("Send dimensions with API requests"), isOn: binding(\.embedding.sendDimensions))
-                        .toggleStyle(.checkbox)
-                        .disabled(config?.embedding.provider == "local")
-                }
-            }
-            Text(embeddingNote)
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
-        .knodeCard(padding: 18)
     }
 
-    private var defaultProviderCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            cardHeader(
-                title: L("Default LLM provider"),
-                detail: L("What a stage runs on unless it picks another connection, and what answers Ask, Wiki and Dream."),
-                badge: L("Default"),
-                color: .knodeViolet
-            )
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-                GridRow {
-                    FieldLabel(L("Provider")) {
-                        Picker(L("Provider"), selection: binding(\.llm.provider)) {
-                            Text(L("OpenAI-compatible API")).tag("openai")
-                            Text(L("Codex CLI")).tag("codex-cli")
-                            Text(L("Claude Code CLI")).tag("claude-cli")
-                            Text(L("Cursor Agent CLI")).tag("cursor-cli")
-                        }
-                        .labelsHidden()
-                    }
-                    ModelField(
-                        placeholder: config?.llm.provider == "openai" ? "gpt-4.1-mini" : "Use CLI default",
-                        text: binding(\.llm.model),
-                        providerKey: config?.llm.provider ?? "",
-                        load: { try await modelList(route: "llm") }
-                    )
-                }
-                if config?.llm.provider == "openai" {
-                    GridRow {
-                        FieldLabel(L("Base URL")) { TextField("https://api.openai.com/v1", text: binding(\.llm.baseUrl)) }
-                        FieldLabel(L("API key")) { SecureField("env:OPENAI_API_KEY", text: binding(\.llm.apiKey)) }
-                    }
-                } else {
-                    GridRow {
-                        CliExecutableField(tool: cliTools[config?.llm.provider ?? ""], path: binding(\.llm.cliPath))
-                            .gridCellColumns(2)
-                    }
-                }
-            }
-            Text(defaultModelNote)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .knodeCard(padding: 18)
-    }
-
-    /// Extra endpoints beyond the default, named so a stage can pick one by name.
-    private var connectionsEditor: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(L("Other connections")).font(.headline)
-                    Text(L("Add one when a stage needs a different endpoint — a vision-capable API, a cheaper model, a second key."))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("Add connection", systemImage: "plus") { addConnection() }
-                    .buttonStyle(.bordered)
-                    .disabled(config == nil)
-            }
-            ForEach(Array((config?.connections ?? []).enumerated()), id: \.element.id) { index, connection in
-                ConnectionCard(
-                    connection: binding(\.connections)[index],
+    private var defaultLlmRow: some View {
+        ProviderRow(
+            kind: L("LLM"),
+            color: .knodeViolet,
+            isDefault: true,
+            label: defaultLlmLabel,
+            providerName: providerName(config?.llm.provider ?? ""),
+            summary: config?.llm.model ?? "",
+            id: "default",
+            expanded: expandedBinding("default"),
+            remove: nil
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                LlmProviderFields(
+                    provider: binding(\.llm.provider),
+                    model: binding(\.llm.model),
+                    baseUrl: binding(\.llm.baseUrl),
+                    apiKey: binding(\.llm.apiKey),
+                    cliPath: binding(\.llm.cliPath),
                     cliTools: cliTools,
-                    load: { try await modelList(route: "connection:\(connection.id)") },
-                    remove: { removeConnection(id: connection.id) }
+                    route: "llm",
+                    load: { refresh in try await modelList(route: "llm", refresh: refresh) }
                 )
+                Text(defaultModelNote)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    private func connectionRow(index: Int, connection: LLMConnection) -> some View {
+        ProviderRow(
+            kind: L("LLM"),
+            color: .knodeViolet,
+            isDefault: false,
+            label: binding(\.connections)[index].label,
+            providerName: providerName(connection.provider),
+            summary: connection.model,
+            id: connection.id,
+            expanded: expandedBinding(connection.id),
+            remove: { removeConnection(id: connection.id) }
+        ) {
+            LlmProviderFields(
+                provider: binding(\.connections)[index].provider,
+                model: binding(\.connections)[index].model,
+                baseUrl: binding(\.connections)[index].baseUrl,
+                apiKey: binding(\.connections)[index].apiKey,
+                cliPath: binding(\.connections)[index].cliPath,
+                cliTools: cliTools,
+                route: "connection:\(connection.id)",
+                load: { refresh in try await modelList(route: "connection:\(connection.id)", refresh: refresh) }
+            )
+        }
+    }
+
+    /// The default LLM's name is optional in the config — an empty one means
+    /// "call it whatever the provider is called" — but the field is a plain
+    /// text field like every other name.
+    private var defaultLlmLabel: Binding<String> {
+        Binding(
+            get: { config?.llm.label ?? "" },
+            set: { config?.llm.label = $0 }
+        )
+    }
+
+    private func expandedBinding(_ id: String) -> Binding<Bool> {
+        Binding(
+            get: { expandedProviders.contains(id) },
+            set: { isOpen in
+                if isOpen { expandedProviders.insert(id) } else { expandedProviders.remove(id) }
+            }
+        )
+    }
+
+    private func embeddingRowSummary(_ entry: EmbeddingConnection) -> String {
+        let model = entry.provider == "local" ? L("Hashing") : entry.model
+        return model.isEmpty ? L("%@d", String(entry.dimensions)) : "\(model) · \(entry.dimensions)d"
     }
 
     // MARK: - 02 · Pipeline
 
-    /// The stages in the order a document passes through them, each with what it
-    /// asks of a model and a picker over section 01.
+    /// The five stages as a flow, in the order a document passes through them.
+    /// A node carries what a person checks at a glance — where it runs and how
+    /// fast — and opens the inspector below for everything else, so the whole
+    /// pipeline fits on one screen instead of two.
     private var pipelineSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             sectionHeader(
@@ -295,114 +331,344 @@ struct SettingsView: View {
                 badge: L("Per stage"),
                 color: .knodeViolet
             )
-            VStack(spacing: 0) {
-                StageRow(
-                    step: 1,
-                    title: L("Convert"),
-                    detail: L("Images and scanned PDF pages become searchable Markdown."),
-                    requirement: L("Vision"),
-                    requirementDetail: L("The model has to see pixels: an API provider gets the image inline, codex takes --image, and claude and cursor read the file with their own tools. A text-only model fails here. Changing this re-converts every image and scanned page."),
-                    color: .knodeViolet
-                ) {
-                    StagePicker(
-                        route: binding(\.extraction.documentLlm),
-                        connections: config?.connections ?? [],
-                        defaultProvider: config?.llm.provider ?? "",
-                        load: { try await modelList(route: "documentLlm") }
-                    )
-                }
+            VStack(alignment: .leading, spacing: 0) {
+                stageFlow
                 Divider()
-                StageRow(
-                    step: 2,
-                    title: L("Index"),
-                    detail: L("Every chunk becomes a vector for semantic and hybrid recall."),
-                    requirement: L("Embedding"),
-                    requirementDetail: L("Not an LLM — it uses the embedding provider from section 01, one per workspace. Changing its model or dimensions re-embeds the whole corpus."),
-                    color: .knodeCyan
-                ) {
-                    StagePin(value: embeddingSummary, hint: L("Set in section 01 · Embedding provider"))
-                }
+                stageInspector
                 Divider()
-                StageRow(
-                    step: 3,
-                    title: L("Extract"),
-                    detail: L("Names entities, relations and factual claims in changed documents."),
-                    requirement: L("Volume"),
-                    requirementDetail: L("The busiest stage — it runs on every changed document, bounded by the daily budget and batch size below. A fast, cheap model that returns clean JSON is usually the right trade."),
-                    color: .knodeViolet
-                ) {
-                    StagePicker(
-                        route: binding(\.extraction.entityLlm),
-                        connections: config?.connections ?? [],
-                        defaultProvider: config?.llm.provider ?? "",
-                        load: { try await modelList(route: "entityLlm") }
-                    )
-                }
-                Divider()
-                StageRow(
-                    step: 4,
-                    title: L("Synthesize"),
-                    detail: L("Turns hot entity clusters into readable, linked Concept pages."),
-                    requirement: L("Quality"),
-                    requirementDetail: L("Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here."),
-                    color: .knodeViolet
-                ) {
-                    StagePicker(
-                        route: binding(\.extraction.conceptLlm),
-                        connections: config?.connections ?? [],
-                        defaultProvider: config?.llm.provider ?? "",
-                        load: { try await modelList(route: "conceptLlm") }
-                    )
-                }
-                Divider()
-                StageRow(
-                    step: 5,
-                    title: L("Answer"),
-                    detail: L("Ask, wiki summaries and the nightly Dream analysis."),
-                    requirement: L("Interactive"),
-                    requirementDetail: L("Always the default provider. Latency lands straight in the Ask box, so prefer something responsive."),
-                    color: .knodeViolet
-                ) {
-                    StagePin(value: defaultModelSummary, hint: L("Set in section 01 · Default LLM provider"))
-                }
+                budgetFooter
             }
             .knodeCard(padding: 0)
-            pipelineControls
         }
     }
 
-    private var pipelineControls: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(L("Pipeline controls")).font(.headline)
-                Text(L("Bound background work without changing the selected models."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+    private var stageFlow: some View {
+        let stages = PipelineStage.allCases
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                ForEach(stages) { stage in
+                    if stage != stages.first { stageArrow }
+                    stageNode(stage)
+                }
             }
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
-                GridRow {
-                    FieldLabel(L("Daily token budget")) {
-                        TextField(L("Budget"), value: binding(\.extraction.dailyTokenBudget), format: .number)
+            // A narrow window wraps rather than clipping the last stages.
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    ForEach(stages.prefix(3)) { stage in
+                        if stage != stages.first { stageArrow }
+                        stageNode(stage)
                     }
-                    FieldLabel(L("Documents per pass")) {
-                        TextField(L("Batch"), value: binding(\.extraction.batchSize), format: .number)
-                    }
-                    FieldLabel(L("Parallel calls")) {
-                        TextField(L("Concurrency"), value: binding(\.extraction.concurrency), format: .number)
+                }
+                HStack(spacing: 8) {
+                    ForEach(stages.suffix(2)) { stage in
+                        if stage != stages.suffix(2).first { stageArrow }
+                        stageNode(stage)
                     }
                 }
             }
-            Toggle(L("Extract factual claims alongside entities"), isOn: binding(\.extraction.claims))
-                .toggleStyle(.checkbox)
         }
-        .knodeCard(padding: 18)
+        .padding(16)
+    }
+
+    private var stageArrow: some View {
+        Image(systemName: "arrow.right")
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+    }
+
+    private func stageNode(_ stage: PipelineStage) -> some View {
+        let selected = selectedStage == stage
+        return Button {
+            selectedStage = stage
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text("\(stage.step)")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundStyle(stage.color)
+                        .frame(width: 16, height: 16)
+                        .background(stage.color.opacity(0.14), in: RoundedRectangle(cornerRadius: 5))
+                    Text(stage.title).font(.system(size: 12, weight: .semibold))
+                    Spacer(minLength: 0)
+                }
+                RouteBadge(label: stage.requirement, color: stage.color)
+                Text(stageTarget(stage))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(stageRate(stage))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            .frame(width: 148, alignment: .leading)
+            .padding(11)
+            .background(selected ? stage.color.opacity(0.1) : Color.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(selected ? stage.color.opacity(0.55) : Color.white.opacity(0.07), lineWidth: selected ? 1.5 : 1)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+    }
+
+    /// Where the selected stage runs, and the knobs that belong to it alone.
+    @ViewBuilder
+    private var stageInspector: some View {
+        let stage = selectedStage
+        HStack(alignment: .top, spacing: 20) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Text(stage.title).font(.headline)
+                    RouteBadge(label: stage.requirement, color: stage.color)
+                }
+                Text(stage.detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(stage.requirementDetail)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                stageRates(stage)
+            }
+            Spacer(minLength: 16)
+            stageControl(stage).frame(width: 300)
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func stageControl(_ stage: PipelineStage) -> some View {
+        switch stage {
+        case .convert:
+            StagePicker(
+                route: binding(\.extraction.documentLlm),
+                connections: config?.connections ?? [],
+                defaultProvider: config?.llm.provider ?? "",
+                routeKey: "documentLlm",
+                load: { refresh in try await modelList(route: "documentLlm", refresh: refresh) }
+            )
+        case .index:
+            VStack(alignment: .leading, spacing: 10) {
+                FieldLabel(L("Run with")) {
+                    Picker(L("Run with"), selection: binding(\.embeddingUse)) {
+                        ForEach(config?.embeddingProviders ?? []) { entry in
+                            Text(entry.label).tag(entry.id)
+                        }
+                    }
+                    .labelsHidden()
+                }
+                Text(L("One provider at a time — vectors from two models are not comparable. Switching re-embeds the whole corpus when you save."))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        case .extract:
+            StagePicker(
+                route: binding(\.extraction.entityLlm),
+                connections: config?.connections ?? [],
+                defaultProvider: config?.llm.provider ?? "",
+                routeKey: "entityLlm",
+                load: { refresh in try await modelList(route: "entityLlm", refresh: refresh) }
+            )
+        case .synthesize:
+            StagePicker(
+                route: binding(\.extraction.conceptLlm),
+                connections: config?.connections ?? [],
+                defaultProvider: config?.llm.provider ?? "",
+                routeKey: "conceptLlm",
+                load: { refresh in try await modelList(route: "conceptLlm", refresh: refresh) }
+            )
+        case .answer:
+            StagePin(value: defaultModelSummary, hint: L("Set in section 01 · Default LLM provider"))
+        }
+    }
+
+    /// The rates that belong to this stage. They used to sit in one row below
+    /// the whole pipeline, which read as global — "Parallel calls" only ever
+    /// bounded Extract.
+    @ViewBuilder
+    private func stageRates(_ stage: PipelineStage) -> some View {
+        switch stage {
+        case .convert:
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
+                GridRow {
+                    FieldLabel(L("Parallel conversions")) {
+                        TextField(L("Parallel conversions"), value: binding(\.ingest.convertConcurrency), format: .number)
+                    }
+                    Color.clear.frame(height: 1)
+                }
+            }
+            .padding(.top, 6)
+        case .index:
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
+                GridRow {
+                    FieldLabel(L("Parallel documents")) {
+                        TextField(L("Parallel documents"), value: binding(\.ingest.concurrency), format: .number)
+                    }
+                    FieldLabel(L("Texts per request")) {
+                        TextField(L("Texts per request"), value: embeddingBatchSize, format: .number)
+                    }
+                }
+            }
+            .padding(.top, 6)
+        case .extract:
+            VStack(alignment: .leading, spacing: 10) {
+                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
+                    GridRow {
+                        FieldLabel(L("Parallel calls")) {
+                            TextField(L("Parallel calls"), value: binding(\.extraction.concurrency), format: .number)
+                        }
+                        FieldLabel(L("Documents per pass")) {
+                            TextField(L("Documents per pass"), value: binding(\.extraction.batchSize), format: .number)
+                        }
+                    }
+                }
+                Toggle(L("Extract factual claims alongside entities"), isOn: binding(\.extraction.claims))
+                    .toggleStyle(.checkbox)
+            }
+            .padding(.top, 6)
+        case .synthesize, .answer:
+            EmptyView()
+        }
+    }
+
+    /// The one control that is genuinely not a stage's own.
+    private var budgetFooter: some View {
+        HStack(alignment: .bottom, spacing: 16) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(L("Daily token budget")).font(.subheadline.weight(.semibold))
+                Text(L("Shared by Extract and Synthesize — the two stages that run in the background."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            TextField(L("Budget"), value: binding(\.extraction.dailyTokenBudget), format: .number)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 160)
+        }
+        .padding(18)
+    }
+
+    /// `batchSize` is optional in the mirror, but the field is a plain number.
+    private var embeddingBatchSize: Binding<Int> {
+        Binding(
+            get: { config?.embedding.batchSize ?? 32 },
+            set: { size in
+                guard config != nil, let index = config!.embeddingProviders.firstIndex(where: { $0.id == config!.embeddingUse }) else { return }
+                config!.embeddingProviders[index].batchSize = size
+            }
+        )
+    }
+
+    private func stageTarget(_ stage: PipelineStage) -> String {
+        switch stage {
+        case .convert: routeSummary(\.extraction.documentLlm)
+        case .index: embeddingSummary
+        case .extract: routeSummary(\.extraction.entityLlm)
+        case .synthesize: routeSummary(\.extraction.conceptLlm)
+        case .answer: defaultModelSummary
+        }
+    }
+
+    private func stageRate(_ stage: PipelineStage) -> String {
+        guard let config else { return "" }
+        return switch stage {
+        case .convert: "×\(config.ingest.convertConcurrency)"
+        case .index: "×\(config.ingest.concurrency) · \(config.embedding.batchSize ?? 32)/req"
+        case .extract: "×\(config.extraction.concurrency) · \(config.extraction.batchSize)/pass"
+        case .synthesize, .answer: ""
+        }
     }
 
     // MARK: - 03 · Deep research
 
+
     /// The research runner and the profile it follows. Both live in files the
     /// service owns — the runner in the workspace config, the profile in
     /// `playbooks/research/profiles/` — so "Save & apply" writes both.
+    // MARK: - 03 · Agents
+
+    @ViewBuilder
+    private var agentsSection: some View {
+        if config != nil {
+            AgentsSettingsSection(
+                agents: $agents,
+                researchAgent: config?.research.agent ?? "",
+                chatAgent: config?.chat.agent ?? "",
+                connections: config?.connections ?? [],
+                cliTools: cliTools,
+                isWorking: isWorking,
+                add: { kind in Task { await addAgent(kind: kind) } },
+                remove: { agentToRemove = $0 },
+                loadModels: { executor, refresh in try await researchModelList(agent: executor, refresh: refresh) }
+            )
+        }
+    }
+
+    private func loadAgents() async {
+        guard let response = try? await model.client().agents() else { return }
+        agents = response.agents
+    }
+
+    /// A new agent is written immediately — it is its own file, not part of
+    /// the config draft — and its name has to exist before Research can name it.
+    private func addAgent(kind: String) async {
+        isWorking = true
+        defer { isWorking = false }
+        let base = kind == "deep-research" ? "research" : "agent"
+        var suffix = agents.count + 1
+        while agents.contains(where: { $0.name == "\(base)-\(suffix)" }) { suffix += 1 }
+        let name = "\(base)-\(suffix)"
+        var draft = AgentDefinition(name: name, kind: kind)
+        draft.title = kind == "deep-research" ? L("New research agent") : L("New agent")
+        do {
+            _ = try await model.client().saveAgent(name, draft.payload)
+            await loadAgents()
+            statusMessage = L("Agent %@ created", name)
+            statusIsError = false
+        } catch {
+            statusMessage = L("Could not create the agent: %@", error.localizedDescription)
+            statusIsError = true
+        }
+    }
+
+    private func removeAgent(_ agent: AgentDefinition) async {
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let response = try await model.client().deleteAgent(agent.name)
+            await loadAgents()
+            // The service moves research/chat off a deleted agent, so read the
+            // config back rather than leaving a name on screen that is gone.
+            if response.reset != true, let fresh = try? await model.client().config() {
+                config?.research.agent = fresh.research.agent
+                config?.chat.agent = fresh.chat.agent
+            }
+            statusMessage = response.reset == true
+                ? L("Agent %@ reset to the built-in", agent.name)
+                : L("Agent %@ removed", agent.name)
+            statusIsError = false
+        } catch {
+            statusMessage = L("Could not remove the agent: %@", error.localizedDescription)
+            statusIsError = true
+        }
+    }
+
+    /// Agents are files of their own, so "Save & apply" writes each edited one
+    /// beside the config. A failure here must not read as a failed config save.
+    private func saveAgents() async throws {
+        for agent in agents {
+            _ = try await model.client().saveAgent(agent.name, agent.payload)
+        }
+    }
+
+    // MARK: - 04 · Research
+
     @ViewBuilder
     private var researchSection: some View {
         if config != nil {
@@ -414,9 +680,10 @@ struct SettingsView: View {
                 profileSelection: researchProfileBinding,
                 summaries: profiles,
                 connections: config?.connections ?? [],
+                agents: agents,
                 defaultProvider: config?.llm.provider ?? "",
                 isWorking: isWorking,
-                loadModels: { agent in try await researchModelList(agent: agent) },
+                loadModels: { agent, refresh in try await researchModelList(agent: agent, refresh: refresh) },
                 duplicate: {
                     duplicateName = "\(profileDraft?.name ?? "profile")-copy"
                     showingDuplicate = true
@@ -548,20 +815,6 @@ struct SettingsView: View {
         }
     }
 
-    private func cardHeader(title: String, detail: String, badge: String, color: Color) -> some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.headline)
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 12)
-            RouteBadge(label: badge, color: color)
-        }
-    }
-
     private var workspaceDangerSection: some View {
         HStack(spacing: 24) {
             VStack(alignment: .leading, spacing: 5) {
@@ -614,28 +867,20 @@ struct SettingsView: View {
         )
     }
 
-    private var embeddingNote: String {
-        switch config?.embedding.provider {
-        case "local":
-            return L("The local hashing embedder is private, offline, and ready immediately.")
-        case "ark-multimodal":
-            return L("Ark posts to /embeddings/multimodal and returns one vector per request, so Base URL ends at /api/v3 and Model is the endpoint id (ep-…). Dimensions must match the model — doubao-embedding-vision is 2048, or 1024 when the dimensions parameter is sent.")
-        default:
-            return L("Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep keys out of the config file.")
-        }
-    }
-
     private var embeddingSummary: String {
         guard let config else { return L("Loading…") }
-        return config.embedding.provider == "local"
-            ? L("Local hashing · %@d", String(config.embedding.dimensions))
-            : (config.embedding.model.isEmpty ? L("API model not set") : config.embedding.model)
+        guard let active = config.activeEmbedding else {
+            return config.embedding.model.isEmpty ? L("API model not set") : config.embedding.model
+        }
+        if active.provider == "local" { return L("%@ · %@d", active.label, String(active.dimensions)) }
+        return active.model.isEmpty ? L("API model not set") : "\(active.label) · \(active.model)"
     }
 
     private func routeSummary(_ keyPath: KeyPath<KnodeConfig, RoutedLLMConfig>) -> String {
         guard let config, let route = config[keyPath: keyPath] as RoutedLLMConfig? else { return L("Loading…") }
         let connection = config.connections.first { $0.id == route.use }
-        let name = connection?.label ?? (route.use.isEmpty ? L("Default model") : providerName(route.provider))
+        let defaultName = config.llm.label?.isEmpty == false ? config.llm.label! : L("Default model")
+        let name = connection?.label ?? (route.use.isEmpty ? defaultName : providerName(route.provider))
         let model = route.model.isEmpty ? (connection?.model ?? "") : route.model
         return model.isEmpty ? name : "\(name) · \(model)"
     }
@@ -657,18 +902,20 @@ struct SettingsView: View {
 
     /// Models the service reports for one route, using the on-screen draft so a
     /// key or endpoint typed but not yet saved is the one that gets queried.
-    private func modelList(route: String) async throws -> ModelListResponse {
+    private func modelList(route: String, refresh: Bool = false) async throws -> ModelListResponse {
         guard let config else { throw APIError(message: L("Settings are still loading")) }
-        return try await model.client().listModels(route: route, config: config)
+        return try await model.client().listModels(route: route, config: config, refresh: refresh)
     }
 
     /// Models for a research agent. A named connection lists on its own route;
     /// a CLI picked straight off PATH has no connection, so ask the default
     /// route with that provider swapped into a copy of the draft.
-    private func researchModelList(agent: String) async throws -> ModelListResponse {
+    private func researchModelList(agent spec: String, refresh: Bool = false) async throws -> ModelListResponse {
         guard let config else { throw APIError(message: L("Settings are still loading")) }
+        // A named agent is not an endpoint; what its executor points at is.
+        let agent = agents.first { $0.name == spec }?.executor ?? spec
         if !agent.isEmpty, config.connections.contains(where: { $0.id == agent }) {
-            return try await model.client().listModels(route: "connection:\(agent)", config: config)
+            return try await model.client().listModels(route: "connection:\(agent)", config: config, refresh: refresh)
         }
         var draft = config
         if !agent.isEmpty {
@@ -676,7 +923,7 @@ struct SettingsView: View {
             draft.llm.cliPath = ""
             draft.llm.model = ""
         }
-        return try await model.client().listModels(route: "llm", config: draft)
+        return try await model.client().listModels(route: "llm", config: draft, refresh: refresh)
     }
 
     /// The service writes 'default' for a migrated route; the picker uses '' for
@@ -693,12 +940,37 @@ struct SettingsView: View {
         guard config != nil else { return }
         var suffix = config!.connections.count + 1
         while config!.connections.contains(where: { $0.id == "connection-\(suffix)" }) { suffix += 1 }
-        config!.connections.append(LLMConnection(id: "connection-\(suffix)", label: "Connection \(suffix)"))
+        let connection = LLMConnection(id: "connection-\(suffix)", label: "Connection \(suffix)")
+        config!.connections.append(connection)
+        expandedProviders.insert(connection.id)
+    }
+
+    private func addEmbeddingProvider() {
+        guard config != nil else { return }
+        var suffix = config!.embeddingProviders.count + 1
+        while config!.embeddingProviders.contains(where: { $0.id == "embedding-\(suffix)" }) { suffix += 1 }
+        let entry = EmbeddingConnection(id: "embedding-\(suffix)", label: "Embedding \(suffix)")
+        config!.embeddingProviders.append(entry)
+        expandedProviders.insert(entry.id)
+    }
+
+    /// Removing the active provider moves Index to the first one left, which
+    /// re-embeds on save — so say it in the status line rather than let the
+    /// corpus change underneath a person who only meant to tidy the list.
+    private func removeEmbeddingProvider(id: String) {
+        guard config != nil, config!.embeddingProviders.count > 1 else { return }
+        config!.embeddingProviders.removeAll { $0.id == id }
+        expandedProviders.remove(id)
+        guard config!.embeddingUse == id, let next = config!.embeddingProviders.first else { return }
+        config!.embeddingUse = next.id
+        statusMessage = L("Index now runs on %@ — saving re-embeds the corpus.", next.label)
+        statusIsError = false
     }
 
     private func removeConnection(id: String) {
         guard config != nil else { return }
         config!.connections.removeAll { $0.id == id }
+        expandedProviders.remove(id)
         // A route left pointing at a deleted connection would silently fall back
         // to the default; say so by moving it there explicitly.
         for keyPath in [\KnodeConfig.extraction.entityLlm, \KnodeConfig.extraction.conceptLlm, \KnodeConfig.extraction.documentLlm] {
@@ -721,6 +993,7 @@ struct SettingsView: View {
                let suggested = (try? await model.client().availableAgents())?.suggested {
                 config?.research.agent = suggested
             }
+            await loadAgents()
             await loadProfiles()
             statusMessage = ""
             testResult = nil
@@ -770,9 +1043,10 @@ struct SettingsView: View {
             } else {
                 statusMessage = L("Configuration saved and stages applied")
             }
-            // The research profile is a file of its own; a failure there must
-            // not read as though the routes failed to save.
+            // The agents and the research profile are files of their own; a
+            // failure there must not read as though the routes failed to save.
             do {
+                try await saveAgents()
                 if let saved = try await saveProfileDraft() {
                     statusMessage += L(" · research profile %@ saved", saved.name)
                 }
@@ -816,13 +1090,19 @@ struct ModelField: View {
     /// Changing provider invalidates a fetched list, since it came from the old one.
     var providerKey: String = ""
     var disabled = false
-    let load: () async throws -> ModelListResponse
+    /// Which entry of the shared catalog this field reads. Two fields pointed
+    /// at the same route share one list instead of each asking.
+    let route: String
+    let load: (Bool) async throws -> ModelListResponse
 
+    @EnvironmentObject private var catalog: ModelCatalog
     @State private var isShowing = false
-    @State private var isLoading = false
-    @State private var result: ModelListResponse?
-    @State private var failure: String?
     @State private var filter = ""
+
+    private var key: String { "\(route)|\(providerKey)" }
+    private var result: ModelListResponse? { catalog.list(key) }
+    private var failure: String? { catalog.failure(key) }
+    private var isLoading: Bool { catalog.isLoading(key) }
 
     var body: some View {
         FieldLabel(L("Model")) {
@@ -839,11 +1119,7 @@ struct ModelField: View {
                 .popover(isPresented: $isShowing, arrowEdge: .bottom) { picker }
             }
             .disabled(disabled)
-            .onChange(of: providerKey) { _, _ in
-                result = nil
-                failure = nil
-                filter = ""
-            }
+            .onChange(of: providerKey) { _, _ in filter = "" }
         }
     }
 
@@ -887,6 +1163,11 @@ struct ModelField: View {
                     .font(.caption)
                     .foregroundStyle(Color.knodeBad)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            if result?.cached == true, let at = result?.cachedAt {
+                Text(L("Cached — the service last asked at %@.", shortTime(at)))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
             if let note = result?.note {
                 Text(note)
@@ -947,15 +1228,13 @@ struct ModelField: View {
     }
 
     private func reload(force: Bool = false) async {
-        if isLoading || (result != nil && !force) { return }
-        isLoading = true
-        failure = nil
-        defer { isLoading = false }
-        do {
-            result = try await load()
-        } catch {
-            failure = error.localizedDescription
-        }
+        await catalog.load(key, refresh: force, using: load)
+    }
+
+    /// Just the clock time: the date is never useful for a list minutes old.
+    private func shortTime(_ iso: String) -> String {
+        guard let date = ISO8601DateFormatter().date(from: iso) else { return iso }
+        return date.formatted(date: .omitted, time: .standard)
     }
 
     private func sourceLabel(_ source: String) -> String {
@@ -1015,12 +1294,12 @@ private struct CliExecutableField: View {
             TextField(tool.path ?? "/full/path/to/\(tool.command)", text: $path)
         }
         if tool.path == nil {
-            Label("\(tool.command) is not on the service PATH — enter its full path.", systemImage: "exclamationmark.triangle.fill")
+            Label(L("%@ is not on the service PATH — enter its full path.", tool.command), systemImage: "exclamationmark.triangle.fill")
                 .font(.caption)
                 .foregroundStyle(Color.knodeBad)
                 .fixedSize(horizontal: false, vertical: true)
         } else if !path.isEmpty || editing {
-            Button("Use \(tool.command) from PATH instead") {
+            Button(L("Use %@ from PATH instead", tool.command)) {
                 path = ""
                 editing = false
             }
@@ -1030,76 +1309,203 @@ private struct CliExecutableField: View {
     }
 }
 
-/// One named connection: the endpoint and credentials a route points at by id.
-private struct ConnectionCard: View {
-    @Binding var connection: LLMConnection
-    let cliTools: [String: CliTool]
-    let load: () async throws -> ModelListResponse
-    let remove: () -> Void
+/// One row of the providers table: a scannable line that opens to the form for
+/// that provider. Rows stay closed by default, so the section costs one line
+/// per provider however many are configured.
+private struct ProviderRow<Detail: View>: View {
+    let kind: String
+    let color: Color
+    let isDefault: Bool
+    @Binding var label: String
+    let providerName: String
+    let summary: String
+    let id: String
+    @Binding var expanded: Bool
+    /// nil for a row that must not be removed — the default LLM, and the last
+    /// embedding provider, since something has to embed.
+    let remove: (() -> Void)?
+    @ViewBuilder let detail: Detail
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                Button {
+                    withAnimation(.easeOut(duration: 0.14)) { expanded.toggle() }
+                } label: {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 14)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(expanded ? L("Collapse %@", label) : L("Expand %@", label))
+
+                RouteBadge(label: kind, color: color)
+                    .frame(width: 56, alignment: .leading)
+
+                TextField(L("Name this provider"), text: $label)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 210)
+
+                if isDefault { RouteBadge(label: L("Default"), color: color) }
+
+                Text(providerName)
+                    .font(.callout)
+                    .frame(width: 170, alignment: .leading)
+                    .lineLimit(1)
+
+                Text(summary.isEmpty ? L("No model set") : summary)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(summary.isEmpty ? .tertiary : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Spacer(minLength: 8)
+
+                Text(id)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+
+                Button(role: .destructive) { remove?() } label: { Image(systemName: "trash") }
+                    .buttonStyle(.borderless)
+                    .disabled(remove == nil)
+                    .opacity(remove == nil ? 0.25 : 1)
+                    .help(remove == nil ? L("This provider cannot be removed") : L("Remove this provider"))
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+
+            if expanded {
+                detail
+                    .padding(.horizontal, 16)
+                    .padding(.top, 2)
+                    .padding(.bottom, 16)
+            }
+        }
+        .background(expanded ? color.opacity(0.04) : Color.clear)
+    }
+}
+
+/// The endpoint and credentials of one embedding provider.
+private struct EmbeddingProviderFields: View {
+    @Binding var entry: EmbeddingConnection
+    let route: String
+    let load: (Bool) async throws -> ModelListResponse
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                TextField(L("Name this connection"), text: $connection.label)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 240)
-                Text(connection.id)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                Spacer()
-                Button(role: .destructive) { remove() } label: { Image(systemName: "trash") }
-                    .buttonStyle(.borderless)
-                    .help(L("Remove this connection"))
-            }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
                     FieldLabel(L("Provider")) {
-                        Picker(L("Provider"), selection: $connection.provider) {
+                        Picker(L("Provider"), selection: $entry.provider) {
+                            Text(L("Local hashing · offline")).tag("local")
                             Text(L("OpenAI-compatible API")).tag("openai")
-                            Text(L("Codex CLI")).tag("codex-cli")
-                            Text(L("Claude Code CLI")).tag("claude-cli")
-                            Text(L("Cursor Agent CLI")).tag("cursor-cli")
+                            Text(L("Volcengine Ark · multimodal")).tag("ark-multimodal")
                         }
                         .labelsHidden()
                     }
                     ModelField(
-                        placeholder: connection.provider == "openai" ? "gpt-4.1-mini" : "Use CLI default",
-                        text: $connection.model,
-                        providerKey: connection.provider,
+                        placeholder: entry.provider == "ark-multimodal" ? "ep-…" : "text-embedding-3-small",
+                        text: $entry.model,
+                        providerKey: entry.provider,
+                        disabled: entry.provider == "local",
+                        route: route,
                         load: load
                     )
                 }
-                if connection.provider == "openai" {
-                    GridRow {
-                        FieldLabel(L("Base URL")) { TextField("https://api.openai.com/v1", text: $connection.baseUrl) }
-                        FieldLabel(L("API key")) { SecureField("env:OPENAI_API_KEY", text: $connection.apiKey) }
+                GridRow {
+                    FieldLabel(L("Base URL")) {
+                        TextField("https://api.openai.com/v1", text: $entry.baseUrl)
+                            .disabled(entry.provider == "local")
                     }
-                } else {
-                    GridRow {
-                        CliExecutableField(tool: cliTools[connection.provider], path: $connection.cliPath)
-                            .gridCellColumns(2)
+                    FieldLabel(L("API key")) {
+                        SecureField("env:OPENAI_API_KEY", text: $entry.apiKey)
+                            .disabled(entry.provider == "local")
                     }
                 }
+                GridRow {
+                    FieldLabel(L("Dimensions")) {
+                        TextField(L("Dimensions"), value: $entry.dimensions, format: .number)
+                    }
+                    Toggle(L("Send dimensions with API requests"), isOn: $entry.sendDimensions)
+                        .toggleStyle(.checkbox)
+                        .disabled(entry.provider == "local")
+                }
             }
+            Text(embeddingNote(entry.provider))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .knodeCard(padding: 18)
     }
 }
 
-private struct SummaryRoute: View {
-    let label: String
-    let value: String
-    let detail: String
-    let color: Color
+/// The endpoint and credentials of one LLM provider — the default one and every
+/// extra connection are the same form.
+private struct LlmProviderFields: View {
+    @Binding var provider: String
+    @Binding var model: String
+    @Binding var baseUrl: String
+    @Binding var apiKey: String
+    @Binding var cliPath: String
+    let cliTools: [String: CliTool]
+    let route: String
+    let load: (Bool) async throws -> ModelListResponse
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Eyebrow(text: label, color: color)
-            Text(value).font(.callout.weight(.semibold)).lineLimit(1)
-            Text(detail).font(.caption2).foregroundStyle(.secondary)
+        Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+            GridRow {
+                FieldLabel(L("Provider")) {
+                    Picker(L("Provider"), selection: $provider) {
+                        Text(L("OpenAI-compatible API")).tag("openai")
+                        Text(L("Codex CLI")).tag("codex-cli")
+                        Text(L("Claude Code CLI")).tag("claude-cli")
+                        Text(L("Cursor Agent CLI")).tag("cursor-cli")
+                    }
+                    .labelsHidden()
+                }
+                ModelField(
+                    placeholder: provider == "openai" ? "gpt-4.1-mini" : L("Use CLI default"),
+                    text: $model,
+                    providerKey: provider,
+                    route: route,
+                    load: load
+                )
+            }
+            if provider == "openai" {
+                GridRow {
+                    FieldLabel(L("Base URL")) { TextField("https://api.openai.com/v1", text: $baseUrl) }
+                    FieldLabel(L("API key")) { SecureField("env:OPENAI_API_KEY", text: $apiKey) }
+                }
+            } else {
+                GridRow {
+                    CliExecutableField(tool: cliTools[provider], path: $cliPath)
+                        .gridCellColumns(2)
+                }
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
+    }
+}
+
+@MainActor
+func embeddingProviderName(_ provider: String) -> String {
+    switch provider {
+    case "local": L("Local hashing · offline")
+    case "openai": L("OpenAI-compatible API")
+    case "ark-multimodal": L("Volcengine Ark · multimodal")
+    default: provider
+    }
+}
+
+@MainActor
+func embeddingNote(_ provider: String) -> String {
+    switch provider {
+    case "local":
+        return L("The local hashing embedder is private, offline, and ready immediately.")
+    case "ark-multimodal":
+        return L("Ark posts to /embeddings/multimodal and returns one vector per request, so Base URL ends at /api/v3 and Model is the endpoint id (ep-…). Dimensions must match the model — doubao-embedding-vision is 2048, or 1024 when the dimensions parameter is sent.")
+    default:
+        return L("Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep keys out of the config file.")
     }
 }
 
@@ -1123,53 +1529,13 @@ struct FieldLabel<Content: View>: View {
     }
 }
 
-/// One pipeline stage: what it does, what it asks of a model, and the control
-/// that points it at a provider from section 01.
-private struct StageRow<Control: View>: View {
-    let step: Int
-    let title: String
-    let detail: String
-    let requirement: String
-    let requirementDetail: String
-    let color: Color
-    @ViewBuilder let control: Control
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 16) {
-            Text("\(step)")
-                .font(.caption.monospaced().bold())
-                .foregroundStyle(color)
-                .frame(width: 26, height: 26)
-                .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
-                .overlay { RoundedRectangle(cornerRadius: 7).stroke(color.opacity(0.28)) }
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    Text(title).font(.headline)
-                    RouteBadge(label: requirement, color: color)
-                }
-                Text(detail)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(requirementDetail)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 16)
-            control.frame(width: 300)
-        }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
 /// Picks which configured provider runs a stage, plus an optional model override.
 private struct StagePicker: View {
     @Binding var route: RoutedLLMConfig
     let connections: [LLMConnection]
     let defaultProvider: String
-    let load: () async throws -> ModelListResponse
+    let routeKey: String
+    let load: (Bool) async throws -> ModelListResponse
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1186,6 +1552,7 @@ private struct StagePicker: View {
                 placeholder: L("Optional · use its model"),
                 text: $route.model,
                 providerKey: route.use,
+                route: routeKey,
                 load: load
             )
             Text(runningOn)
@@ -1197,12 +1564,12 @@ private struct StagePicker: View {
 
     private var runningOn: String {
         guard let connection = connections.first(where: { $0.id == route.use }) else {
-            return "Runs on the default provider (\(providerName(defaultProvider)))."
+            return L("Runs on the default provider (%@).", providerName(defaultProvider))
         }
         let endpoint = connection.provider == "openai"
-            ? (connection.baseUrl.isEmpty ? "no endpoint set" : connection.baseUrl)
+            ? (connection.baseUrl.isEmpty ? L("no endpoint set") : connection.baseUrl)
             : providerName(connection.provider)
-        return "Runs on \(endpoint)."
+        return L("Runs on %@.", endpoint)
     }
 }
 
@@ -1266,6 +1633,64 @@ private struct TestResultRow: View {
         if let ms = result.ms { parts.append("\(ms)ms") }
         if let sample = result.sample?.trimmingCharacters(in: .whitespacesAndNewlines), !sample.isEmpty { parts.append("replied “\(sample)”") }
         return parts.isEmpty ? "Connected" : parts.joined(separator: " · ")
+    }
+}
+
+/// The five stages a document passes through, in order. Declaring them once
+/// keeps the flow nodes, the inspector and the per-stage rates from drifting
+/// apart — they used to be five hand-written blocks.
+enum PipelineStage: Int, CaseIterable, Identifiable {
+    case convert = 1, index, extract, synthesize, answer
+
+    var id: Int { rawValue }
+    var step: Int { rawValue }
+
+    @MainActor var title: String {
+        switch self {
+        case .convert: L("Convert")
+        case .index: L("Index")
+        case .extract: L("Extract")
+        case .synthesize: L("Synthesize")
+        case .answer: L("Answer")
+        }
+    }
+
+    @MainActor var requirement: String {
+        switch self {
+        case .convert: L("Vision")
+        case .index: L("Embedding")
+        case .extract: L("Volume")
+        case .synthesize: L("Quality")
+        case .answer: L("Interactive")
+        }
+    }
+
+    /// Cyan is the index and its embeddings; violet is everything an LLM runs.
+    var color: Color { self == .index ? .knodeCyan : .knodeViolet }
+
+    @MainActor var detail: String {
+        switch self {
+        case .convert: L("Images and scanned PDF pages become searchable Markdown.")
+        case .index: L("Every chunk becomes a vector for semantic and hybrid recall.")
+        case .extract: L("Names entities, relations and factual claims in changed documents.")
+        case .synthesize: L("Turns hot entity clusters into readable, linked Concept pages.")
+        case .answer: L("Ask, wiki summaries and the nightly Dream analysis.")
+        }
+    }
+
+    @MainActor var requirementDetail: String {
+        switch self {
+        case .convert:
+            L("The model has to see pixels: an API provider gets the image inline, codex takes --image, and claude and cursor read the file with their own tools. A text-only model fails here. Changing this re-converts every image and scanned page.")
+        case .index:
+            L("Not an LLM — it uses one of the embedding providers from section 01. Changing which one, or its model or dimensions, re-embeds the whole corpus.")
+        case .extract:
+            L("The busiest stage — it runs on every changed document, bounded by the daily budget and the batch size here. A fast, cheap model that returns clean JSON is usually the right trade.")
+        case .synthesize:
+            L("Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.")
+        case .answer:
+            L("Always the default provider. Latency lands straight in the Ask box, so prefer something responsive.")
+        }
     }
 }
 

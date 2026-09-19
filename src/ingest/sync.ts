@@ -131,7 +131,11 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   let preparedDocs: Map<string, string> | undefined;
   let failed = new Set<string>();
   if (touchesDocs) {
-    const prep = await prepareDocs(ctx.dataDir, { vision: documentLlm, onProgress: progress });
+    const prep = await prepareDocs(ctx.dataDir, {
+      vision: documentLlm,
+      concurrency: config.ingest.convertConcurrency,
+      onProgress: progress,
+    });
     stats.skipped += prep.stats.skipped;
     stats.errors += prep.stats.errors;
     failed = prep.failed;

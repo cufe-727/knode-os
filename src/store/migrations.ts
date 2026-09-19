@@ -751,6 +751,15 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE INDEX IF NOT EXISTS chat_messages_conv_idx ON chat_messages (conversation_id, seq);
 `;
 
+const V10_CHAT_QUICK = `
+-- Ask's quick mode: a one-shot cited answer lands as an ordinary assistant
+-- message, so both kinds of reply share one conversation list. \`events\` is the
+-- agent's tool activity; \`payload\` carries what the retrieval answer knows
+-- about itself (citations, gaps, the claims it leaned on). The contexts are
+-- deliberately not stored: whole chunks are large and re-derivable.
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}';
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -778,6 +787,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 7, name: 'wiki-research', up: async (q) => execScript(q, V7_WIKI_RESEARCH) },
   { version: 8, name: 'review', up: async (q) => execScript(q, V8_REVIEW) },
   { version: 9, name: 'chat', up: async (q) => execScript(q, V9_CHAT) },
+  { version: 10, name: 'chat-quick', up: async (q) => execScript(q, V10_CHAT_QUICK) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

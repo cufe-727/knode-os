@@ -157,7 +157,7 @@ program
   .option('-k <n>', 'number of results', '8')
   .option('-m, --mode <mode>', 'hybrid | vector | keyword | sag', 'hybrid')
   .option('--as-of <iso>', 'system time: only documents that were live at that instant')
-  .option('--kinds <list>', 'restrict to source kinds: doc,wiki,view,skill')
+  .option('--kinds <list>', 'restrict to source kinds: doc,wiki,view,skill,trace')
   .option('--sources <list>', 'restrict to path prefixes, e.g. raw/docs/reports')
   .option('--trust <tier>', 'trusted | quarantined | any (default any)')
   .option('--actor <name>', 'who is asking — restricted sources answer only to actors on their ACL')
@@ -208,7 +208,7 @@ program
   .option('--as-of <iso>', 'system time: recompute nodes/edges from evidence as of that instant')
   .option('--valid-at <iso>', 'world time: only claims valid at that instant')
   .option('--valid-range <window>', 'world time window: 2026-01-01..2026-06-30 | 2026-08 | 2026')
-  .option('--kinds <list>', 'restrict to source kinds: doc,wiki,view,skill')
+  .option('--kinds <list>', 'restrict to source kinds: doc,wiki,view,skill,trace')
   .option('--sources <list>', 'restrict to path prefixes, e.g. raw/docs/reports')
   .option('--trust <tier>', 'trusted | quarantined | any (default any)')
   .option('--actor <name>', 'who is asking (ACL)')
@@ -296,7 +296,7 @@ program
   .option('--valid-at <iso>', 'world time: only claims valid at that instant')
   .option('--valid-range <window>', 'world time window: 2026-01-01..2026-06-30 | 2026-08 | 2026')
   .option('--freshness <duration>', 'max age of live probe answers: 30s | 15m | 2h')
-  .option('--kinds <list>', 'restrict to source kinds: doc,wiki,view,skill')
+  .option('--kinds <list>', 'restrict to source kinds: doc,wiki,view,skill,trace')
   .option('--sources <list>', 'restrict to path prefixes, e.g. raw/docs/reports')
   .action(async (utterance, opts) => {
     const ctx = await createContext(dataDir());
@@ -700,7 +700,7 @@ program
   .option('--as-of <iso>', 'system time: what the knowledge base believed then')
   .option('--valid-at <iso>', 'world time: only claims valid at that instant')
   .option('--valid-range <window>', 'world time window: 2026-01-01..2026-06-30 | 2026-08 | 2026')
-  .option('--kinds <list>', 'restrict to source kinds: doc,wiki,view,skill')
+  .option('--kinds <list>', 'restrict to source kinds: doc,wiki,view,skill,trace')
   .option('--sources <list>', 'restrict to path prefixes, e.g. raw/docs/reports')
   .option('--trust <tier>', 'trusted | quarantined | any (default any)')
   .option('--actor <name>', 'who is asking (ACL)')
@@ -1529,7 +1529,7 @@ research
       if (!job) throw new Error(`no job ${id}`);
       const { loadOrCreateMcpToken } = await import('./server/mcp-http.js');
       const { templateFor } = await import('./research/templates.js');
-      const agent = resolveResearchAgent(ctx.config) ?? { kind: 'cli' as const, provider: 'claude-cli' as const, cliPath: '', model: ctx.config.research?.model ?? '' };
+      const agent = resolveResearchAgent(ctx.config, ctx.dataDir) ?? { kind: 'cli' as const, provider: 'claude-cli' as const, cliPath: '', model: ctx.config.research?.model ?? '' };
       const token = loadOrCreateMcpToken(ctx.dataDir);
       const url = opts.url ?? `http://${ctx.config.server.host}:${ctx.config.server.port}${ctx.config.server.mcp?.path || '/mcp'}`;
       const mcp = { url, token, headers: { 'x-knode-user': opts.user, 'x-knode-workspace-kind': 'personal', 'x-knode-workspace-id': opts.workspace, 'x-knode-workspace-name': opts.workspace } };
@@ -1560,7 +1560,7 @@ research
     try {
       const job = await getJob(ctx.store, id);
       if (!job) throw new Error(`no job ${id}`);
-      const agent = resolveResearchAgent(ctx.config) ?? { kind: 'cli' as const, provider: 'claude-cli' as const, cliPath: '', model: '' };
+      const agent = resolveResearchAgent(ctx.config, ctx.dataDir) ?? { kind: 'cli' as const, provider: 'claude-cli' as const, cliPath: '', model: '' };
       const ws = workspaceFromJob(ctx, job, agent);
       if (typeof job.payload.exportedTo === 'string') ws.dir = job.payload.exportedTo;
       const done = await finalizeResearchJob(ctx, job, ws, { exitCode: 0, turns: null, costUsd: null, resultText: '', error: null, transcriptPath: '' }, { mcp: { url: '', token: '', headers: {} }, agent, log: (m) => console.log(`  ${m}`) });

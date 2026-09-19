@@ -20,11 +20,15 @@ final class AppModel: ObservableObject {
     @Published var session: StoredSession?
     @Published var pendingUser: UserProfile?
     @Published var rememberSession = true
-    @Published var selectedSection: AppSection = .files
+    /// The single source of navigation truth; the sidebar's section is derived
+    /// from it. Set it through `select(_:)` so the section's last tab is kept.
+    @Published private(set) var selectedTab: AppTab = .files
     @Published var stats: KnowledgeStats?
     @Published var connectionState: ConnectionState = .checking
     @Published var serverURLString: String
     @Published var pendingFilePath: String?
+    /// The folder picked in the Files tree. Shared so Search can scope to it.
+    @Published var pickedDirectory: String?
     @Published var workspaceRevision = 0
     @Published var toastMessage: String?
     @Published var globalActivity: String?
@@ -38,11 +42,20 @@ final class AppModel: ObservableObject {
     private let sessionKey = "knode-os.macos.session.v1"
     private let accountsKey = "knode-os.macos.accounts.v1"
     private let serverKey = "knode-os.macos.server-url.v1"
+    private let navKey = "knode-os.macos.nav.v1"
     private let localService = LocalServiceManager()
     private var toastTask: Task<Void, Never>?
+    /// Where each section was left, so switching away and back does not lose your place.
+    private var lastTab: [AppSection: AppTab] = [:]
 
     init() {
         serverURLString = defaults.string(forKey: serverKey) ?? "http://127.0.0.1:9100"
+        if let data = defaults.data(forKey: navKey), let nav = try? JSONDecoder().decode(NavState.self, from: data) {
+            lastTab = nav.last.reduce(into: [:]) { out, pair in
+                if let section = AppSection(rawValue: pair.key), let tab = AppTab(rawValue: pair.value) { out[section] = tab }
+            }
+            if let tab = AppTab(rawValue: nav.tab) { selectedTab = tab }
+        }
         if let data = defaults.data(forKey: sessionKey),
            let stored = try? JSONDecoder().decode(StoredSession.self, from: data) {
             session = stored
@@ -242,9 +255,36 @@ final class AppModel: ObservableObject {
         phase = .signIn
     }
 
+    /* --------------------------- navigation ------------------------------ */
+
+    /// Which sidebar row is lit; there is no separate stored section.
+    var selectedSection: AppSection { selectedTab.section }
+
+    func select(_ tab: AppTab) {
+        guard tab != selectedTab else { return }
+        selectedTab = tab
+        lastTab[tab.section] = tab
+        persistNav()
+    }
+
+    /// Picking a section returns to the tab last used there, not to its first one.
+    func select(section: AppSection) {
+        select(lastTab[section] ?? section.tabs.first ?? .files)
+    }
+
+    private struct NavState: Codable {
+        var tab: String
+        var last: [String: String]
+    }
+
+    private func persistNav() {
+        let nav = NavState(tab: selectedTab.rawValue, last: lastTab.reduce(into: [:]) { out, pair in out[pair.key.rawValue] = pair.value.rawValue })
+        if let data = try? JSONEncoder().encode(nav) { defaults.set(data, forKey: navKey) }
+    }
+
     func openFile(_ path: String) {
         pendingFilePath = path
-        selectedSection = .files
+        select(.files)
     }
 
     func consumePendingFile() -> String? {

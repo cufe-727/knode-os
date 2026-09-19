@@ -18,10 +18,18 @@ struct KnodeOSApp: App {
         .defaultSize(width: 1320, height: 820)
         .commands {
             CommandMenu("Navigate") {
+                // ⌘1…⌘4 pick a section (landing on the tab it was left at);
+                // ⌘⇧1… pick a tab inside the section already showing.
                 ForEach(Array(AppSection.allCases.enumerated()), id: \.element.id) { index, section in
-                    Button(section.title) { model.selectedSection = section }
+                    Button(section.title) { model.select(section: section) }
                         .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
                         .disabled(model.phase != .app)
+                }
+                Divider()
+                ForEach(Array(model.selectedSection.tabs.enumerated()), id: \.element.id) { index, tab in
+                    Button(tab.title) { model.select(tab) }
+                        .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: [.command, .shift])
+                        .disabled(model.phase != .app || model.selectedSection.tabs.count < 2)
                 }
             }
             CommandGroup(after: .sidebar) {

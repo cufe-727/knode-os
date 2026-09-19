@@ -12,6 +12,7 @@ import {
   convertedPathForRaw,
   isConvertibleFile,
 } from './convert.js';
+import { pool } from '../pool.js';
 import { loadSourceText, sha256 } from './source.js';
 
 /**
@@ -52,6 +53,12 @@ export interface PrepareResult {
 
 export interface PrepareOptions extends ConversionOptions {
   onProgress?: (message: string) => void;
+  /**
+   * Conversions in flight at once. Each one is a vision call or more, so this
+   * is the Convert stage's rate against the document model. Default 1, which
+   * is also the order the progress messages come out in.
+   */
+  concurrency?: number;
   /** Test hook: pretend the normalizer is at this version. */
   normalizerVersion?: number;
 }
@@ -67,7 +74,12 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
   const progress = opts.onProgress ?? (() => {});
   const normalizer = opts.normalizerVersion ?? NORMALIZER_VERSION;
 
-  for (const rawRel of walkFiles(dataDir, RAW_DOCS)) {
+  // The whole per-file job, so the pool below can hold several conversions
+  // open at once. Sharing the counters is safe: each `stats.x++` is a
+  // read-modify-write with no await between the halves, which on the single JS
+  // thread makes it atomic, and every sidecar write is keyed by its own
+  // rawRel, so two workers never touch one file.
+  const prepareOne = async (rawRel: string): Promise<void> => {
     const abs = safePath(dataDir, rawRel);
     const st = fs.statSync(abs);
     const text = isTextFile(rawRel);
@@ -75,7 +87,7 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
     const maxBytes = convertible ? MAX_CONVERTIBLE_FILE_BYTES : MAX_FILE_BYTES;
     if ((!text && !convertible) || st.size > maxBytes) {
       stats.skipped++;
-      continue;
+      return;
     }
 
     const sourceSha = sha256(fs.readFileSync(abs));
@@ -89,11 +101,11 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
       if (meta.rawPath !== rawRel) writeSidecarPart(dataDir, rawRel, 'meta', { ...meta, rawPath: rawRel });
       if (meta.contentBytes > MAX_FILE_BYTES) {
         stats.skipped++;
-        continue;
+        return;
       }
       stats.unchanged++;
       wanted.set(rawRel, meta.contentSha256);
-      continue;
+      return;
     }
 
     let content: string;
@@ -124,7 +136,7 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
       stats.errors++;
       failed.add(rawRel);
       progress(`conversion error ${rawRel}: ${message}`);
-      continue;
+      return;
     }
 
     const contentSha = sha256(content);
@@ -144,11 +156,15 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
     });
     if (contentBytes > MAX_FILE_BYTES) {
       stats.skipped++; // converted text too large to index; the conversion is kept so it is not paid again
-      continue;
+      return;
     }
     wanted.set(rawRel, contentSha);
     stats.prepared++;
-  }
+  };
+
+  // Drained first: walkFiles is a generator, and pooled workers would race it.
+  const raws = [...walkFiles(dataDir, RAW_DOCS)];
+  await pool(raws, Math.max(1, opts.concurrency ?? 1), prepareOne);
 
   return { stats, wanted, failed };
 }

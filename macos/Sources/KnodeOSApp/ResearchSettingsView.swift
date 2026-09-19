@@ -20,10 +20,12 @@ struct ResearchSettingsSection: View {
     @Binding var profileSelection: String
     let summaries: [ResearchProfileSummary]
     let connections: [LLMConnection]
+    /// The named agents from section 03, so the pickers can offer them.
+    let agents: [AgentDefinition]
     let defaultProvider: String
     let isWorking: Bool
     /// Models the CLI behind an agent key offers ("" = the default provider).
-    let loadModels: (String) async throws -> ModelListResponse
+    let loadModels: (String, Bool) async throws -> ModelListResponse
     let duplicate: () -> Void
     let remove: () -> Void
 
@@ -75,15 +77,15 @@ struct ResearchSettingsSection: View {
     private var header: some View {
         HStack(alignment: .bottom) {
             VStack(alignment: .leading, spacing: 3) {
-                Eyebrow(text: L("03 · Deep research"), color: .knodeViolet)
-                Text(L("Who writes the wiki, and how hard they think")).font(.title3.bold())
-                Text(L("An agent researches a topic through the MCP endpoint and writes the page — a coding-agent CLI on this machine, or the built-in agent on an OpenAI-compatible connection. A profile sets the reasoning effort, web access and verification bar, and lists the sub-agents — each with its own agent, model, tools and prompt."))
+                Eyebrow(text: L("04 · Research"), color: .knodeViolet)
+                Text(L("How the wiki gets written")).font(.title3.bold())
+                Text(L("What initialization does, how Chat behaves, and how a deep-research job runs: which agent from section 03 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 12)
-            RouteBadge(label: L("Agents"), color: .knodeViolet)
+            RouteBadge(label: L("Pipeline"), color: .knodeViolet)
         }
     }
 
@@ -93,7 +95,7 @@ struct ResearchSettingsSection: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(L("Research agent")).font(.headline)
+                    Text(L("Deep research pipeline")).font(.headline)
                     Text(L("Which agent runs jobs, how many at once, and which profile it follows. Roles below may override the agent per phase."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -105,13 +107,14 @@ struct ResearchSettingsSection: View {
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
                     FieldLabel(L("Agent")) {
-                        AgentPicker(selection: $research.agent, connections: connections, fallbackLabel: nil, defaultProvider: defaultProvider)
+                        AgentPicker(selection: $research.agent, agents: agents, kind: "deep-research", connections: connections, fallbackLabel: nil, defaultProvider: defaultProvider)
                     }
                     ModelField(
                         placeholder: L("CLI default"),
                         text: $research.model,
                         providerKey: research.agent,
-                        load: { try await loadModels(research.agent) }
+                        route: "agent:\(research.agent)",
+                        load: { refresh in try await loadModels(research.agent, refresh) }
                     )
                     FieldLabel(L("Profile")) {
                         Picker(L("Profile"), selection: $profileSelection) {
@@ -220,30 +223,32 @@ struct ResearchSettingsSection: View {
         .knodeCard(padding: 18)
     }
 
-    /// The Chat tab's own CLI settings — it answers over the same MCP endpoint.
+    /// Ask's Agent mode — its own CLI settings, answering over the same MCP
+    /// endpoint. (The config keys are still `chat.*`.)
     private var chatCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(L("Chat")).font(.headline)
-                    Text(L("The Chat tab uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note."))
+                    Text(L("Ask · Agent mode")).font(.headline)
+                    Text(L("Ask's Agent mode uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note. Quick mode needs none of this — it answers from retrieval."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 12)
-                RouteBadge(label: L("Chat"), color: .knodeViolet)
+                RouteBadge(label: L("Ask"), color: .knodeViolet)
             }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
                     FieldLabel(L("Agent")) {
-                        AgentPicker(selection: $chat.agent, connections: connections, fallbackLabel: L("The research agent above"), defaultProvider: defaultProvider)
+                        AgentPicker(selection: $chat.agent, agents: agents, kind: "general", connections: connections, fallbackLabel: L("The research agent above"), defaultProvider: defaultProvider)
                     }
                     ModelField(
                         placeholder: L("Agent's model"),
                         text: $chat.model,
                         providerKey: chat.agent.isEmpty ? research.agent : chat.agent,
-                        load: { try await loadModels(chat.agent.isEmpty ? research.agent : chat.agent) }
+                        route: "agent:\(chat.agent.isEmpty ? research.agent : chat.agent)",
+                        load: { refresh in try await loadModels(chat.agent.isEmpty ? research.agent : chat.agent, refresh) }
                     )
                     FieldLabel(L("Reasoning effort")) {
                         Picker(L("Reasoning effort"), selection: $chat.effort) {
@@ -624,10 +629,16 @@ struct ResearchSettingsSection: View {
 /// fallback any more, so an empty value is shown as the unconfigured state.
 struct AgentPicker: View {
     @Binding var selection: String
+    /// The named agents from section 03; the kind this picker is for comes first.
+    var agents: [AgentDefinition] = []
+    var kind: String = ""
     let connections: [LLMConnection]
     var fallbackLabel: String?
     /// Section 01's provider, so the `default` row can say what it points at.
     var defaultProvider: String = ""
+
+    private var preferred: [AgentDefinition] { kind.isEmpty ? agents : agents.filter { $0.kind == kind } }
+    private var other: [AgentDefinition] { kind.isEmpty ? [] : agents.filter { $0.kind != kind } }
 
     var body: some View {
         Picker(L("Agent"), selection: $selection) {
@@ -636,6 +647,15 @@ struct AgentPicker: View {
             } else if selection.isEmpty {
                 Text(L("Not configured — pick an agent")).tag("")
             }
+            ForEach(preferred) { agent in
+                Text(agent.title).tag(agent.name)
+            }
+            ForEach(other) { agent in
+                Text(agent.title).tag(agent.name)
+            }
+            // A config written before named agents points straight at an
+            // executor, and those keep resolving — so they stay selectable.
+            Divider()
             ForEach(ResearchSettingsSection.cliProviders, id: \.self) { provider in
                 Text(L("%@ · from PATH", providerName(provider))).tag(provider)
             }
@@ -735,7 +755,7 @@ private struct RoleCard: View {
     let researchAgent: String
     let researchers: Int
     let reviewRounds: Int
-    let loadModels: (String) async throws -> ModelListResponse
+    let loadModels: (String, Bool) async throws -> ModelListResponse
     let remove: () -> Void
 
     var body: some View {
@@ -886,7 +906,8 @@ private struct RoleCard: View {
             placeholder: L("Agent's model"),
             text: $role.model,
             providerKey: effectiveAgent,
-            load: { try await loadModels(effectiveAgent) }
+            route: "agent:\(effectiveAgent)",
+            load: { refresh in try await loadModels(effectiveAgent, refresh) }
         )
     }
 

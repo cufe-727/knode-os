@@ -62,7 +62,7 @@ async function markCancelled(ctx: AppContext, jobId: string, log: (m: string) =>
 export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: RunOptions): Promise<ResearchJob> {
   const log = opts.log ?? (() => {});
   const research = ctx.config.research;
-  const agent = opts.agent ?? resolveResearchAgent(ctx.config);
+  const agent = opts.agent ?? resolveResearchAgent(ctx.config, ctx.dataDir);
   if (!agent) throw new Error(`no research agent configured: set research.agent to a CLI (claude-cli / codex-cli / cursor-cli), a connection id, or 'default' to run the built-in agent on the default LLM connection (Settings → Deep research)`);
   clearCancelled(jobIn.id); // a job that starts (or restarts) is not cancelled, whatever an earlier attempt was
   let job = (await updateJob(ctx.store, jobIn.id, {
@@ -124,7 +124,7 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
   let launched: LaunchResult;
   try {
     if (pipeline === 'team' || pipeline === 'native') {
-      const pipelineInput = { job, template, ws, agent, mcp: opts.mcp, readDirs, profile, webGate, log, agentFor: (spec: string, model: string) => agentForSpec(ctx.config, spec, model) };
+      const pipelineInput = { job, template, ws, agent, mcp: opts.mcp, readDirs, profile, webGate, log, agentFor: (spec: string, model: string) => agentForSpec(ctx.config, spec, model, ctx.dataDir) };
       const team = pipeline === 'team' ? await runTeamPipeline(ctx, pipelineInput) : await runNativePipeline(ctx, pipelineInput);
       launched = team;
       const topics = job.kind === 'init' ? topicsFrom(team.planText || team.resultText) : undefined;

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 /**
  * The transcript an executor leaves behind, in the shape claude's
  * `--output-format stream-json` produces. `parseActivity` (src/chat/runner.ts)
- * and the Chat tab's live activity view read this, and `chatActivity` re-reads
+ * and Ask's live activity view read this, and `chatActivity` re-reads
  * the file *while the session runs* — so every line is flushed as it happens
  * rather than buffered to the end.
  *

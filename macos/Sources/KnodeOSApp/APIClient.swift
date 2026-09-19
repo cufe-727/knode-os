@@ -209,17 +209,16 @@ struct APIClient {
         return try decoder.decode(UploadResponse.self, from: data)
     }
 
-    func search(_ query: String, mode: SearchMode, limit: Int = 12) async throws -> [SearchResult] {
-        try await send(path("/api/search", query: [
+    /// `sources` is a path prefix, e.g. `raw/docs/reports` — the same vocabulary
+    /// the file tree speaks, which is what lets Search scope to a picked folder.
+    func search(_ query: String, mode: SearchMode, limit: Int = 12, sources: String? = nil) async throws -> [SearchResult] {
+        var items: [URLQueryItem] = [
             .init(name: "q", value: query),
             .init(name: "mode", value: mode.rawValue),
             .init(name: "k", value: String(limit)),
-        ]))
-    }
-
-    func ask(_ question: String) async throws -> AskResponse {
-        struct Body: Encodable { var question: String }
-        return try await send("/api/ask", method: "POST", body: encoded(Body(question: question)))
+        ]
+        if let sources, !sources.isEmpty { items.append(.init(name: "sources", value: sources)) }
+        return try await send(path("/api/search", query: items))
     }
 
     func graph(query: String, depth: Int) async throws -> GraphResponse {
@@ -294,18 +293,21 @@ struct APIClient {
         try await send("/api/chat/conversations?limit=50")
     }
 
-    func createConversation() async throws -> ChatConversation {
-        try await send("/api/chat/conversations", method: "POST", body: Data("{}".utf8))
+    func createConversation(mode: AskMode) async throws -> ChatConversation {
+        struct Body: Encodable { var mode: String }
+        return try await send("/api/chat/conversations", method: "POST", body: encoded(Body(mode: mode.rawValue)))
     }
 
     func conversation(id: String) async throws -> ChatConversation {
         try await send("/api/chat/conversations/\(id)")
     }
 
-    /// Starts a turn in the background; poll `chatStatus` until it is idle.
-    func sendChat(id: String, text: String) async throws -> ChatSendResponse {
-        struct Body: Encodable { var text: String }
-        return try await send("/api/chat/conversations/\(id)/messages", method: "POST", body: encoded(Body(text: text)))
+    /// `agent` starts a session in the background and answers `running` — poll
+    /// `chatStatus` until it is idle. `quick` answers in the same request and
+    /// comes back `idle`, with the reply already written.
+    func sendChat(id: String, text: String, mode: AskMode) async throws -> ChatSendResponse {
+        struct Body: Encodable { var text: String; var mode: String }
+        return try await send("/api/chat/conversations/\(id)/messages", method: "POST", body: encoded(Body(text: text, mode: mode.rawValue)))
     }
 
     func chatStatus(id: String) async throws -> ChatStatusResponse {
@@ -381,9 +383,25 @@ struct APIClient {
     /// Models the draft config's provider offers for one route ("embedding",
     /// "llm", "entityLlm", "conceptLlm", "documentLlm"). Inherited routes are
     /// resolved against the draft default provider server-side.
-    func listModels(route: String, config: KnodeConfig) async throws -> ModelListResponse {
-        struct Body: Encodable { var route: String; var config: KnodeConfig }
-        return try await send("/api/config/models", method: "POST", body: encoded(Body(route: route, config: config)))
+    /// `refresh` asks the provider again instead of taking the service's
+    /// cached answer — what the refresh button in the picker sends.
+    func listModels(route: String, config: KnodeConfig, refresh: Bool = false) async throws -> ModelListResponse {
+        struct Body: Encodable { var route: String; var config: KnodeConfig; var refresh: Bool }
+        return try await send("/api/config/models", method: "POST", body: encoded(Body(route: route, config: config, refresh: refresh)))
+    }
+
+    func agents() async throws -> AgentsResponse {
+        try await send("/api/agents")
+    }
+
+    func saveAgent(_ name: String, _ payload: AgentDefinition.Payload) async throws -> AgentDefinition {
+        struct Body: Encodable { var agent: AgentDefinition.Payload }
+        return try await send("/api/agents/\(name)", method: "PUT", body: encoded(Body(agent: payload)))
+    }
+
+    /// Deleting a built-in resets it to the template rather than removing it.
+    func deleteAgent(_ name: String) async throws -> DeleteAgentResponse {
+        try await send("/api/agents/\(name)", method: "DELETE")
     }
 
     func cliTools() async throws -> CliToolsResponse {

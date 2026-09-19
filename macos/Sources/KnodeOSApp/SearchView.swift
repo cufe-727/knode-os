@@ -8,7 +8,16 @@ struct SearchView: View {
     @State private var selectedID: String?
     @State private var isSearching = false
     @State private var hasSearched = false
+    /// Empty means the whole base. Otherwise a path prefix, offered from the
+    /// roots plus whatever folder is picked in Files.
+    @State private var scope = ""
     @FocusState private var searchFocused: Bool
+
+    private var scopeChoices: [String] {
+        let roots = ["raw/docs", "raw/traces", "wiki"]
+        guard let picked = model.pickedDirectory, !picked.isEmpty, !roots.contains(picked) else { return roots }
+        return roots + [picked]
+    }
 
     private var selectedResult: SearchResult? {
         results.first(where: { $0.id == selectedID })
@@ -58,7 +67,15 @@ struct SearchView: View {
                 ForEach(SearchMode.allCases) { mode in Text(mode.rawValue.capitalized).tag(mode) }
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .frame(width: 250)
+            Picker(L("Scope"), selection: $scope) {
+                Text(L("Whole base")).tag("")
+                ForEach(scopeChoices, id: \.self) { dir in Text("\(dir)/").tag(dir) }
+            }
+            .labelsHidden()
+            .frame(width: 150)
+            .help(L("Limit the search to a folder — the one picked in Files is offered here."))
             Button(L("Search")) { Task { await search() } }
                 .buttonStyle(.borderedProminent)
                 .tint(.knodeCyan)
@@ -164,7 +181,7 @@ struct SearchView: View {
         hasSearched = true
         defer { isSearching = false }
         do {
-            results = try await model.client().search(query, mode: mode)
+            results = try await model.client().search(query, mode: mode, sources: scope)
             selectedID = results.first?.id
             await model.refreshStats()
         } catch {

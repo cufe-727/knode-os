@@ -1,4 +1,5 @@
 import { KnodeConfig, LlmConfig } from '../config.js';
+import { executorForAgent } from './agents.js';
 
 /** The coding-agent CLIs a session can be launched on. */
 export type AgentProvider = 'claude-cli' | 'codex-cli' | 'cursor-cli';
@@ -64,6 +65,7 @@ function fromLlm(cfg: LlmConfig, model: string): ResearchAgent | null {
  * Resolve an agent spec to a launchable agent:
  *
  *   ''                 → null (not configured)
+ *   <agent name>       → that agent's executor and model (needs `dataDir`)
  *   'default'          → the section-01 connection, whatever kind it is
  *   <connection id>    → that connection: a CLI, or the built-in agent for an
  *                        OpenAI-compatible endpoint
@@ -72,10 +74,17 @@ function fromLlm(cfg: LlmConfig, model: string): ResearchAgent | null {
  * There is deliberately no bare 'deep-agents' spec: a CLI name is meaningful on
  * its own, but a built-in agent without an endpoint is not an executor.
  * Anything else returns null so the caller can say so instead of guessing.
+ *
+ * `dataDir` is optional so a caller with only a config keeps resolving the
+ * bare specs, which is also what a config written before named agents holds.
  */
-export function agentForSpec(config: KnodeConfig, spec: string, model = ''): ResearchAgent | null {
+export function agentForSpec(config: KnodeConfig, spec: string, model = '', dataDir?: string): ResearchAgent | null {
   const wanted = spec.trim();
   if (!wanted) return null;
+  if (dataDir) {
+    const named = executorForAgent(dataDir, wanted);
+    if (named) return agentForSpec(config, named.executor, model || named.model);
+  }
   if (wanted === DEFAULT_CONNECTION) return fromLlm(config.llm, model);
   const connection = config.connections.find((c) => c.id === wanted);
   if (connection) return fromLlm(connection, model);
@@ -94,10 +103,10 @@ export function agentForSpec(config: KnodeConfig, spec: string, model = ''): Res
  * silently did or did not have research depending on an unrelated setting.
  * An empty spec now means "not configured", which the UI states plainly.
  */
-export function resolveResearchAgent(config: KnodeConfig): ResearchAgent | null {
+export function resolveResearchAgent(config: KnodeConfig, dataDir?: string): ResearchAgent | null {
   const research = config.research;
   const wanted = research?.agent?.trim();
-  return wanted ? agentForSpec(config, wanted, research.model) : null;
+  return wanted ? agentForSpec(config, wanted, research.model, dataDir) : null;
 }
 
 /**

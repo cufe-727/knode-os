@@ -7,6 +7,7 @@ import { createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { readSidecarPart } from '../src/fs/sidecar.js';
 import { convertDocumentToMarkdown } from '../src/ingest/convert.js';
+import { prepareDocs } from '../src/ingest/prepare.js';
 import { runIngest } from '../src/ingest/pipeline.js';
 import { textPdf } from './helpers/pdf.js';
 
@@ -51,6 +52,18 @@ describe('PDF and image conversion', () => {
     expect(receivedImage).toBe(true);
     expect(result.kind).toBe('pdf-vision');
     expect(result.markdown).toContain('Invoice total: $123.00');
+  });
+
+  it('does not re-convert when only the conversion concurrency changed', async () => {
+    // The knob is a rate, not part of what a conversion *is*. If it ever leaked
+    // into conversionCacheKey, every existing PDF and image on every machine
+    // would be converted a second time on upgrade — at vision-model prices.
+    const dir = path.join(tmp, 'concurrency-key');
+    initDataDir(dir);
+    fs.writeFileSync(path.join(dir, 'raw/docs/report.pdf'), textPdf('Quarterly revenue increased by 42 percent.'));
+
+    expect((await prepareDocs(dir)).stats).toMatchObject({ prepared: 1, unchanged: 0 });
+    expect((await prepareDocs(dir, { concurrency: 8 })).stats).toMatchObject({ prepared: 0, unchanged: 1 });
   });
 
   it('converts an image through codex-cli and indexes the generated Markdown', async () => {

@@ -4,13 +4,18 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import {
+  EmbeddingConfig,
   KnodeConfig,
+  activeEmbedding,
   defaultConfig,
   defaultRoutedLlmConfig,
+  embeddingIdentity,
+  migrateEmbeddingProviders,
   migrateRouteConnections,
   resolveRoutedLlmConfig,
 } from '../src/config.js';
 import { cliCommand, readCursorStream, resolveExecutable } from '../src/llm/cli.js';
+import { clearModelCache } from '../src/llm/model-cache.js';
 import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 
@@ -100,6 +105,47 @@ describe('GET /api/config/cli-tools', () => {
   });
 });
 
+describe('the model list cache', () => {
+  // Every case here uses a cliPath that cannot resolve, so the answer comes
+  // from the PATH probe in listChatModels — no network, no subprocess.
+  const missing = (path: string) => ({
+    route: 'llm',
+    config: { llm: { provider: 'claude-cli', cliPath: path } },
+  });
+
+  it('serves the second ask from cache, and refresh goes back to the provider', async () => {
+    clearModelCache();
+    const first = (await models(missing('/nope/claude')).then((r) => r.json())) as { cached: boolean; cachedAt: string };
+    expect(first.cached).toBe(false);
+
+    const second = (await models(missing('/nope/claude')).then((r) => r.json())) as { cached: boolean; cachedAt: string };
+    expect(second.cached).toBe(true);
+    expect(second.cachedAt).toBe(first.cachedAt);
+
+    // refresh bypasses the entry and replaces it, so the ask after it is a hit
+    // on the *new* answer. The timestamps can match: a PATH probe is instant.
+    const forced = (await models({ ...missing('/nope/claude'), refresh: true }).then((r) => r.json())) as { cached: boolean; cachedAt: string };
+    expect(forced.cached).toBe(false);
+    const after = (await models(missing('/nope/claude')).then((r) => r.json())) as { cached: boolean; cachedAt: string };
+    expect(after).toMatchObject({ cached: true, cachedAt: forced.cachedAt });
+  });
+
+  it('keys on the endpoint, so a different one is a different entry', async () => {
+    clearModelCache();
+    await models(missing('/nope/claude'));
+    const other = (await models(missing('/elsewhere/claude')).then((r) => r.json())) as { cached: boolean };
+    expect(other.cached).toBe(false);
+    expect(((await models(missing('/elsewhere/claude')).then((r) => r.json())) as { cached: boolean }).cached).toBe(true);
+  });
+
+  it('collapses simultaneous asks for one endpoint into a single answer', async () => {
+    clearModelCache();
+    const both = await Promise.all([models(missing('/nope/claude')), models(missing('/nope/claude'))]);
+    const stamps = await Promise.all(both.map(async (r) => ((await r.json()) as { cachedAt: string }).cachedAt));
+    expect(stamps[0]).toBe(stamps[1]);
+  });
+});
+
 describe('named connections', () => {
   const base = { provider: 'openai' as const, baseUrl: 'https://api.openai.com/v1', apiKey: 'sk-default', model: 'gpt-4.1-mini', cliPath: '', cliTimeoutMs: 300_000 };
   const ark = { ...base, id: 'ark', label: 'Ark', baseUrl: 'https://ark.example/api/v3', apiKey: 'sk-ark', model: 'doubao-vision' };
@@ -161,6 +207,152 @@ describe('migrateRouteConnections', () => {
     const config = defaultConfig();
     expect(migrateRouteConnections(config).connections).toEqual([]);
     expect(migrateRouteConnections(config).extraction.entityLlm.use).toBe('');
+  });
+});
+
+describe('migrateEmbeddingProviders', () => {
+  /** What every config file written before the provider library looks like. */
+  const legacy = (): KnodeConfig => {
+    const config = defaultConfig();
+    config.embedding = { provider: 'openai', baseUrl: 'https://api.openai.com/v1', apiKey: 'sk-emb', model: 'text-embedding-3-small', dimensions: 1536, batchSize: 32, sendDimensions: false };
+    return config;
+  };
+
+  it('lifts the single block into one named provider without changing what runs', () => {
+    const before = legacy();
+    const migrated = migrateEmbeddingProviders(legacy());
+    expect(migrated.embeddingProviders).toHaveLength(1);
+    expect(migrated.embeddingProviders[0]).toMatchObject({ id: 'openai-1', label: 'OpenAI-compatible API', model: 'text-embedding-3-small' });
+    expect(migrated.embeddingUse).toBe('openai-1');
+    // the mirror must be byte-identical, or the upgrade would re-embed
+    expect(migrated.embedding).toEqual(before.embedding);
+  });
+
+  it('lets the library win over a stale mirror, and repairs a dangling pointer', () => {
+    const config = migrateEmbeddingProviders(legacy());
+    config.embeddingProviders.push({ ...config.embeddingProviders[0], id: 'ark-1', label: 'Ark', provider: 'ark-multimodal', model: 'ep-1', dimensions: 2048 });
+    config.embeddingUse = 'ark-1';
+    config.embedding = { ...config.embedding, model: 'whatever-was-left-on-disk' };
+    expect(migrateEmbeddingProviders(config).embedding).toMatchObject({ model: 'ep-1', dimensions: 2048 });
+
+    config.embeddingUse = 'deleted';
+    const repaired = migrateEmbeddingProviders(config);
+    expect(repaired.embeddingUse).toBe('openai-1');
+    expect(repaired.embedding.model).toBe('text-embedding-3-small');
+  });
+
+  it('synthesizes an entry rather than throwing when the library is empty', () => {
+    const config = defaultConfig();
+    expect(activeEmbedding(config)).toMatchObject({ id: 'local-1', provider: 'local' });
+  });
+});
+
+describe('embeddingIdentity', () => {
+  const base: EmbeddingConfig = { provider: 'openai', baseUrl: 'https://a.example/v1', apiKey: 'sk-1', model: 'text-embedding-3-small', dimensions: 1536, batchSize: 32, sendDimensions: false };
+
+  it('changes when the vectors would stop being comparable', () => {
+    expect(embeddingIdentity({ ...base, baseUrl: 'https://b.example/v1' })).not.toBe(embeddingIdentity(base));
+    expect(embeddingIdentity({ ...base, model: 'text-embedding-3-large' })).not.toBe(embeddingIdentity(base));
+    expect(embeddingIdentity({ ...base, dimensions: 1024 })).not.toBe(embeddingIdentity(base));
+    expect(embeddingIdentity({ ...base, sendDimensions: true })).not.toBe(embeddingIdentity(base));
+  });
+
+  it('ignores what does not touch the vector space', () => {
+    expect(embeddingIdentity({ ...base, apiKey: 'sk-2' })).toBe(embeddingIdentity(base));
+    expect(embeddingIdentity({ ...base, batchSize: 8 })).toBe(embeddingIdentity(base));
+    expect(embeddingIdentity({ ...base, baseUrl: 'https://a.example/v1/' })).toBe(embeddingIdentity(base));
+    // the local embedder reads nothing but the dimension
+    const local: EmbeddingConfig = { ...base, provider: 'local' };
+    expect(embeddingIdentity({ ...local, baseUrl: '', model: '', apiKey: '' })).toBe(embeddingIdentity(local));
+  });
+});
+
+describe('PUT /api/config with embedding providers', () => {
+  const save = async (body: unknown) =>
+    app.request('/api/config', { method: 'PUT', headers, body: JSON.stringify(body) });
+  const read = async () => (await app.request('/api/config', { headers }).then((r) => r.json())) as KnodeConfig;
+  const saved = async (r: Response) => (await r.json()) as { config: KnodeConfig; reembedded: boolean };
+
+  // Every provider these tests activate is the offline hashing embedder: a
+  // switch re-embeds for real, and an API endpoint would make that a network
+  // call. The API provider they do configure is deliberately never activated.
+
+  it('starts every workspace with one named provider', async () => {
+    const current = await read();
+    expect(current.embeddingProviders).toHaveLength(1);
+    expect(current.embeddingProviders[0]).toMatchObject({ id: 'local-1', provider: 'local', label: 'Local hashing · offline' });
+    expect(current.embeddingUse).toBe('local-1');
+    // the macOS client decodes `embedding` non-optionally, so the flat mirror
+    // has to keep coming back whole
+    expect(Object.keys(current.embedding).sort()).toEqual(
+      ['apiKey', 'baseUrl', 'batchSize', 'dimensions', 'model', 'provider', 'sendDimensions'],
+    );
+  });
+
+  it('treats a legacy flat patch as an edit to the active provider', async () => {
+    const before = await read();
+    const result = await saved(await save({ embedding: { provider: 'local', dimensions: 16 } }));
+    expect(result.config.embeddingProviders).toHaveLength(1);
+    expect(result.config.embeddingProviders[0]).toMatchObject({ id: 'local-1', dimensions: 16 });
+    expect(result.config.embedding.dimensions).toBe(16);
+    expect(result.reembedded).toBe(true);
+
+    await save({ embedding: { provider: 'local', dimensions: before.embedding.dimensions } });
+  });
+
+  it('keeps a provider it was not told about, and its stored key', async () => {
+    const before = await read();
+    const added = await saved(await save({
+      embeddingProviders: [
+        ...before.embeddingProviders.map((e) => ({ ...e })),
+        { id: 'openai-alt', label: 'OpenAI small', provider: 'openai', baseUrl: 'https://api.openai.com/v1', apiKey: 'sk-emb', model: 'text-embedding-3-small', dimensions: 1536 },
+        { id: 'local-alt', label: '本地哈希', provider: 'local', dimensions: 8 },
+      ],
+    }));
+    // none of them is active, so nothing re-embeds
+    expect(added.reembedded).toBe(false);
+    expect(added.config.embeddingProviders).toHaveLength(3);
+    expect(added.config.embeddingProviders[1]).toMatchObject({ id: 'openai-alt', apiKey: '***' });
+
+    // omitting `provider` used to silently reset it to 'local' and re-embed
+    const patched = await saved(await save({
+      embeddingProviders: added.config.embeddingProviders.map((e) =>
+        (e.id === 'openai-alt' ? { id: e.id, label: e.label, model: 'text-embedding-3-large', apiKey: '***' } : { ...e })),
+    }));
+    expect(patched.config.embeddingProviders[1]).toMatchObject({ provider: 'openai', model: 'text-embedding-3-large', baseUrl: 'https://api.openai.com/v1' });
+    expect(patched.reembedded).toBe(false);
+
+    // a client that models no providers at all keeps the stored ones
+    expect((await saved(await save({ llm: { label: '工作密钥' } }))).config.embeddingProviders).toHaveLength(3);
+  });
+
+  it('re-embeds when the active provider changes, and not when a label does', async () => {
+    const switched = await saved(await save({ embeddingUse: 'local-alt' }));
+    expect(switched.reembedded).toBe(true);
+    expect(switched.config.embeddingUse).toBe('local-alt');
+    expect(switched.config.embedding).toMatchObject({ provider: 'local', dimensions: 8 });
+
+    const renamed = await saved(await save({
+      embeddingProviders: switched.config.embeddingProviders.map((e) => (e.id === 'local-alt' ? { ...e, label: 'renamed' } : { ...e })),
+    }));
+    expect(renamed.reembedded).toBe(false);
+    expect(renamed.config.embeddingProviders.find((e) => e.id === 'local-alt')?.label).toBe('renamed');
+
+    const back = await saved(await save({ embeddingUse: 'local-1' }));
+    expect(back.reembedded).toBe(true);
+  });
+
+  it('lists a named provider on its own route and refuses an unknown one', async () => {
+    const ok = await models({ route: 'embedding:local-alt', config: {} });
+    expect(ok.status).toBe(200);
+    expect((await ok.json()) as { ok: boolean }).toMatchObject({ ok: true });
+    expect((await models({ route: 'embedding:nope', config: {} })).status).toBe(400);
+  });
+
+  it('names the default LLM and keeps that name through a later patch', async () => {
+    expect((await read()).llm.label).toBe('工作密钥');
+    await save({ llm: { model: '' } });
+    expect((await read()).llm.label).toBe('工作密钥');
   });
 });
 

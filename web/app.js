@@ -292,7 +292,6 @@ function loadWorkspaceData() {
   $('#btn-save').disabled = true;
   $('#btn-delete').disabled = true;
   $('#search-results').innerHTML = '';
-  $('#ask-result').innerHTML = '';
   $('#graph-side').innerHTML = '';
   $('#traces-table tbody').innerHTML = '';
   $('#suggestions').innerHTML = '';
@@ -300,11 +299,9 @@ function loadWorkspaceData() {
   loadStats();
   loadTree().then(() => openFile('wiki/index.md')).catch(() => {});
 
-  const activeTab = document.querySelector('#tabs button.active')?.dataset.tab;
-  if (activeTab === 'traces') loadTraces();
-  if (activeTab === 'dream') loadSuggestions();
-  if (activeTab === 'settings') loadConfigForm();
-  if (activeTab === 'graph') loadGraph('');
+  // reload whatever the current host view shows — one list, so it cannot drift
+  // out of sync with what navigate() loads on arrival
+  TAB_LOAD[hostOf(currentTab)]?.();
 }
 
 function startAppData() {
@@ -315,6 +312,8 @@ function startAppData() {
 function enterApp() {
   $('#auth-view').hidden = true;
   $('#app-shell').hidden = false;
+  // paints the header, the strip and the visible section from one source
+  navigate(restoreNav());
   renderWorkspaceUI();
   syncUserWorkspaces()
     .catch((error) => toast(`Could not sync workspaces: ${error.message}`, 5000))
@@ -511,22 +510,136 @@ function bootAuth() {
   else showLogin();
 }
 
-/* ------------------------------- tabs ---------------------------------- */
+/* ----------------------------- navigation ------------------------------- */
 
-document.querySelectorAll('#tabs button').forEach((b) => {
-  b.addEventListener('click', () => {
-    document.querySelectorAll('#tabs button').forEach((x) => x.classList.remove('active'));
-    document.querySelectorAll('.tab').forEach((x) => x.classList.remove('active'));
-    b.classList.add('active');
-    $(`#tab-${b.dataset.tab}`).classList.add('active');
-    if (b.dataset.tab === 'traces') loadTraces();
-    if (b.dataset.tab === 'dream') loadSuggestions();
-    if (b.dataset.tab === 'wiki') loadResearch();
-    if (b.dataset.tab === 'chat') loadChat();
-    else stopChatPolling();
-    if (b.dataset.tab === 'settings') loadConfigForm();
-    if (b.dataset.tab === 'graph' && !graphState.loaded) loadGraph('');
-  });
+/**
+ * Two levels: a section in the header, its tabs in the strip below. The
+ * grouping follows what you do with a file rather than what the service
+ * implements — material comes in (Library), you ask about it (Ask), knowledge
+ * grows out of it (Knowledge).
+ */
+const NAV = [
+  { id: 'library', title: 'Library', tabs: [
+    { id: 'files', title: 'Files', hint: 'Browse and edit knowledge' },
+    { id: 'search', title: 'Search', hint: 'Hybrid, vector, and keyword recall' },
+    { id: 'traces', title: 'Traces', hint: 'Claude Code and Codex sessions' },
+  ] },
+  { id: 'ask', title: 'Ask', tabs: [{ id: 'ask', title: 'Ask', hint: 'Quick cited answers, or a working agent' }] },
+  { id: 'knowledge', title: 'Knowledge', tabs: [
+    { id: 'graph', title: 'Graph', hint: 'Entities, relations, and claims' },
+    { id: 'wiki', title: 'Wiki', hint: 'Pages researched by agent CLIs' },
+    { id: 'dream', title: 'Dream', hint: 'Review agent improvement ideas' },
+  ] },
+  { id: 'settings', title: 'Settings', tabs: [
+    { id: 'providers', title: 'Providers', hint: 'Endpoints and credentials' },
+    { id: 'pipeline', title: 'Pipeline', hint: 'What each stage needs' },
+    { id: 'agents', title: 'Agents', hint: 'Who does the work' },
+    { id: 'research', title: 'Research', hint: 'How the wiki gets written' },
+    { id: 'workspace', title: 'Workspace', hint: 'Clear this workspace' },
+  ] },
+];
+
+/**
+ * Which `<section class="tab">` shows a tab. Settings' five tabs share one
+ * host: keying identity and loaders on the leaf instead would re-run
+ * `loadConfigForm()` on every sub-tab click and throw away unsaved routes.
+ */
+const TAB_HOST = { providers: 'settings', pipeline: 'settings', agents: 'settings', research: 'settings', workspace: 'settings' };
+const hostOf = (tab) => TAB_HOST[tab] ?? tab;
+
+/** What a host view loads when you arrive at it. */
+const TAB_LOAD = {
+  search: () => paintSearchScope(),
+  traces: () => loadTraces(),
+  dream: () => loadSuggestions(),
+  wiki: () => loadResearch(),
+  ask: () => loadChat(),
+  settings: () => loadConfigForm(),
+  graph: () => { if (!graphState.loaded) loadGraph(''); },
+};
+
+const NAV_KEY = 'knode-os.nav.v1';
+const sectionOf = (tab) => NAV.find((s) => s.tabs.some((t) => t.id === tab));
+let currentTab = 'files';
+const lastTab = Object.fromEntries(NAV.map((s) => [s.id, s.tabs[0].id]));
+
+function restoreNav() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(NAV_KEY) ?? '{}');
+    for (const [section, tab] of Object.entries(saved.lastTab ?? {})) {
+      if (sectionOf(tab)?.id === section) lastTab[section] = tab;
+    }
+    // these ids will move again; an unknown one just means the default
+    return sectionOf(saved.tab) ? saved.tab : currentTab;
+  } catch {
+    return currentTab;
+  }
+}
+
+function persistNav() {
+  try {
+    localStorage.setItem(NAV_KEY, JSON.stringify({ tab: currentTab, lastTab }));
+  } catch {
+    /* private window, blocked storage — navigation still works, it just forgets */
+  }
+}
+
+function renderSubtabs(section) {
+  const el = $('#subtabs');
+  // one tab is not a choice: Ask renders no strip at all
+  el.innerHTML = section.tabs.length < 2 ? '' : section.tabs
+    .map((t) => `<button type="button" data-tab="${t.id}" title="${esc(t.hint)}"${t.id === currentTab ? ' class="active"' : ''}>${esc(t.title)}</button>`)
+    .join('');
+}
+
+/**
+ * Search's scope follows the folder picked in the file tree — the reason the
+ * two live in the same section. `sources` is a path prefix the API already
+ * takes, so this is a filter, not a second kind of search.
+ */
+function paintSearchScope() {
+  const select = $('#search-scope');
+  const dir = selectedDir;
+  const previous = select.value;
+  select.innerHTML = '<option value="">whole base</option>'
+    + ['raw/docs', 'raw/traces', 'wiki', ...(dir && !['raw/docs', 'raw/traces', 'wiki'].includes(dir) ? [dir] : [])]
+      .map((d) => `<option value="${esc(d)}">${esc(d)}/</option>`).join('');
+  select.value = [...select.options].some((o) => o.value === previous) ? previous : '';
+}
+
+/** The only way to change tabs. */
+function navigate(tab) {
+  const section = sectionOf(tab);
+  if (!section) return;
+  const previousHost = hostOf(currentTab);
+  const host = hostOf(tab);
+  currentTab = tab;
+  lastTab[section.id] = tab;
+  persistNav();
+
+  for (const b of document.querySelectorAll('#tabs button')) b.classList.toggle('active', b.dataset.section === section.id);
+  renderSubtabs(section);
+  for (const el of document.querySelectorAll('.tab')) el.classList.toggle('active', el.id === `tab-${host}`);
+  for (const el of document.querySelectorAll('.settings-section[data-subtab]')) el.hidden = el.dataset.subtab !== tab;
+
+  // leaving Ask stops its polling — as its own statement, not as the `else` of
+  // an unrelated `if`, which is how this used to silently fire everywhere
+  if (previousHost === 'ask' && host !== 'ask') stopChatPolling();
+  if (host !== previousHost) TAB_LOAD[host]?.();
+}
+
+/** Picking a section returns to the tab it was left at, not to its first one. */
+function navigateSection(id) {
+  navigate(lastTab[id] ?? NAV.find((s) => s.id === id)?.tabs[0].id);
+}
+
+$('#tabs').addEventListener('click', (event) => {
+  const button = event.target.closest?.('button[data-section]');
+  if (button) navigateSection(button.dataset.section);
+});
+$('#subtabs').addEventListener('click', (event) => {
+  const button = event.target.closest?.('button[data-tab]');
+  if (button) navigate(button.dataset.tab);
 });
 
 /* ------------------------------- stats --------------------------------- */
@@ -718,6 +831,7 @@ function nodeMenu(node) {
 
 function pickDir(path) {
   selectedDir = path;
+  paintSearchScope();
   document.querySelectorAll('#filetree .tree-label').forEach((el) => {
     el.classList.toggle('picked', el.parentElement.classList.contains('tree-dir') && el.dataset.path === path);
   });
@@ -1142,7 +1256,8 @@ async function doSearch() {
   const el = $('#search-results');
   el.innerHTML = '<p class="hint">searching…</p>';
   try {
-    const results = await api(`/api/search?q=${encodeURIComponent(q)}&mode=${mode}&k=12`);
+    const scope = $('#search-scope').value;
+    const results = await api(`/api/search?q=${encodeURIComponent(q)}&mode=${mode}&k=12${scope ? `&sources=${encodeURIComponent(scope)}` : ''}`);
     el.innerHTML = results.length ? '' : '<p class="hint">no results — upload docs and index them first.</p>';
     for (const r of results) {
       const div = document.createElement('div');
@@ -1154,7 +1269,7 @@ async function doSearch() {
         <div class="rpath">${esc(r.path)}</div>
         <div class="rsnippet">${esc(r.content.slice(0, 360))}</div>`;
       div.addEventListener('click', () => {
-        document.querySelector('#tabs button[data-tab="files"]').click();
+        navigate('files');
         openFile(r.path);
       });
       el.appendChild(div);
@@ -1165,30 +1280,6 @@ async function doSearch() {
 }
 $('#btn-search').addEventListener('click', doSearch);
 $('#search-q').addEventListener('keydown', (e) => e.key === 'Enter' && doSearch());
-
-/* -------------------------------- ask ---------------------------------- */
-
-async function doAsk() {
-  const q = $('#ask-q').value.trim();
-  if (!q) return;
-  const mode = $('#ask-mode').value;
-  const el = $('#ask-result');
-  el.innerHTML = '<p class="hint">thinking…</p>';
-  try {
-    const res = await api('/api/ask', { method: 'POST', body: JSON.stringify({ question: q, mode }) });
-    let html = `<div class="answer markdown">${renderMd(res.answer)}</div>`;
-    for (const c of res.citations) html += `<div class="citation">[${c.ref}] ${esc(c.path)}</div>`;
-    if (res.facts?.length) {
-      html += `<p class="hint">known facts: ${res.facts.slice(0, 5).map((f) => `${esc(f.statement.slice(0, 100))} <span class="mono">[${esc(f.status)}]</span>`).join(' · ')}</p>`;
-    }
-    if (res.gaps?.length) html += `<p class="gap">gaps: ${res.gaps.map(esc).join(' · ')}</p>`;
-    el.innerHTML = html;
-  } catch (e) {
-    el.innerHTML = `<p class="hint">ask failed: ${esc(e.message)}</p>`;
-  }
-}
-$('#btn-ask').addEventListener('click', doAsk);
-$('#ask-q').addEventListener('keydown', (e) => e.key === 'Enter' && doAsk());
 
 /* ------------------------------- graph --------------------------------- */
 
@@ -1346,6 +1437,9 @@ async function loadTraces() {
         <td class="mono">${t.started_at ? new Date(t.started_at).toLocaleString() : '-'}</td>
         <td class="mono">${(t.bytes / 1024).toFixed(0)} KB</td>
         <td>${t.analyzed_at ? '✓' : ''}</td>`;
+      // a trace is a file under raw/, so it opens where every other file does
+      tr.title = `open ${t.path}`;
+      tr.addEventListener('click', () => { navigate('files'); openFile(t.path); });
       tbody.appendChild(tr);
     }
     if (!traces.length) tbody.innerHTML = '<tr><td colspan="6" class="hint">no traces yet — run a Claude Code / Codex session, then sync.</td></tr>';
@@ -1400,7 +1494,7 @@ async function loadSuggestions() {
       );
       const rb = div.querySelector('button[data-report]');
       if (rb) rb.addEventListener('click', () => {
-        document.querySelector('#tabs button[data-tab="files"]').click();
+        navigate('files');
         openFile(rb.dataset.report);
       });
       el.appendChild(div);
@@ -1418,7 +1512,7 @@ function wireOpenLinks(root) {
   root.querySelectorAll('a[data-open]').forEach((a) =>
     a.addEventListener('click', (ev) => {
       ev.preventDefault();
-      document.querySelector('#tabs button[data-tab="files"]').click();
+      navigate('files');
       openFile(a.dataset.open);
     }),
   );
@@ -1631,7 +1725,7 @@ function watchInitJob(id) {
   stopInitPolling();
   initJobId = id;
   const tick = async () => {
-    if (initJobId !== id || !$('#tab-wiki').classList.contains('active')) return;
+    if (initJobId !== id || currentTab !== 'wiki') return;
     try {
       const job = await api(`/api/research/jobs/${id}`);
       renderInitJob(job);
@@ -1705,7 +1799,7 @@ function renderChatList() {
     const div = document.createElement('div');
     div.className = `chat-item${c.id === chatActiveId ? ' active' : ''}`;
     div.innerHTML = `<span class="chat-item-title">${esc(c.title || '(untitled)')}</span>
-      <span class="hint">${esc(new Date(c.updatedAt).toLocaleString())}</span>
+      <span class="hint"><span class="chat-item-mode">${esc(modeOfConversation(c))}</span> · ${esc(new Date(c.updatedAt).toLocaleString())}</span>
       <button data-del title="Delete this conversation">✕</button>`;
     div.addEventListener('click', (ev) => { if (!ev.target.hasAttribute('data-del')) openConversation(c.id); });
     div.querySelector('button[data-del]').addEventListener('click', async (ev) => {
@@ -1727,6 +1821,9 @@ async function openConversation(id) {
   renderChatList();
   try {
     const conversation = await api(`/api/chat/conversations/${id}`);
+    // a follow-up continues the thread the way it was started
+    $('#ask-mode').value = modeOfConversation(conversation);
+    paintAskMode();
     renderChatThread(conversation);
     // the turn may have finished while another tab was open: the composer follows the server, not the last poll
     if (conversation.running) startChatPolling();
@@ -1739,7 +1836,7 @@ async function openConversation(id) {
 function renderChatThread(conversation) {
   const el = $('#chat-thread');
   if (!conversation) {
-    el.innerHTML = '<p class="hint">Start a new chat to ask about the knowledge base, or to teach it something.</p>';
+    el.innerHTML = '<p class="hint">Ask a question. <b>quick</b> answers in one retrieval pass, with citations; <b>agent</b> runs the configured CLI, which can follow leads and write what you teach it.</p>';
     return;
   }
   el.innerHTML = '';
@@ -1760,7 +1857,7 @@ function renderChatThread(conversation) {
           const open = document.createElement('button');
           open.textContent = 'open';
           open.addEventListener('click', () => {
-            document.querySelector('#tabs button[data-tab="files"]').click();
+            navigate('files');
             openFile(ev.path);
           });
           const promote = document.createElement('button');
@@ -1779,10 +1876,50 @@ function renderChatThread(conversation) {
       }
       if (m.error && m.content) chips.insertAdjacentHTML('beforeend', `<span class="chat-chip bad">${esc(m.error)}</span>`);
       if (chips.childElementCount) div.appendChild(chips);
+      // a retrieval answer describes itself by what it cited, an agent by what it did
+      const quick = quickFooter(m, conversation);
+      if (quick) div.appendChild(quick);
     }
     el.appendChild(div);
   }
   el.scrollTop = el.scrollHeight;
+}
+
+/**
+ * Citations, the claims the answer leaned on, what the base is missing, and the
+ * way out when one retrieval pass was not enough.
+ */
+function quickFooter(message, conversation) {
+  const payload = message.payload;
+  if (!payload || payload.mode !== 'quick') return null;
+  const foot = document.createElement('div');
+  foot.className = 'quick-foot';
+  for (const c of payload.citations ?? []) {
+    const cite = document.createElement('div');
+    cite.className = 'citation';
+    cite.title = `open ${c.path}`;
+    cite.innerHTML = `<b>[${c.ref}]</b><span>${esc(c.path)}</span>`;
+    cite.addEventListener('click', () => { navigate('files'); openFile(c.path); });
+    foot.appendChild(cite);
+  }
+  const facts = payload.facts ?? [];
+  if (facts.length) {
+    foot.insertAdjacentHTML('beforeend', `<p class="fact">known facts: ${facts.slice(0, 5)
+      .map((f) => `${esc(f.statement.slice(0, 100))} <span class="mono">[${esc(f.status ?? 'claim')}]</span>`).join(' · ')}</p>`);
+  }
+  if (payload.gaps?.length) foot.insertAdjacentHTML('beforeend', `<p class="gap">gaps: ${payload.gaps.map(esc).join(' · ')}</p>`);
+
+  const question = (conversation?.messages ?? []).filter((x) => x.role === 'user' && x.seq < message.seq).pop();
+  if (question) {
+    const deepen = document.createElement('button');
+    deepen.className = 'deepen';
+    deepen.type = 'button';
+    deepen.textContent = '✦ dig deeper with the agent';
+    deepen.title = 'Re-ask this in a new agent conversation';
+    deepen.addEventListener('click', () => deepenWithAgent(question.content));
+    foot.appendChild(deepen);
+  }
+  return foot.childElementCount ? foot : null;
 }
 
 function renderChatActivity(activity) {
@@ -1824,33 +1961,61 @@ function startChatPolling() {
   chatPollTimer = setTimeout(tick, 900);
 }
 
-async function sendChat() {
-  const input = $('#chat-input');
-  const text = input.value.trim();
-  if (!text) return;
-  input.value = '';
-  if (!chatActiveId) {
-    try {
-      const conversation = await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({}) });
-      chatConversations.unshift(conversation);
-      chatActiveId = conversation.id;
-      renderChatList();
-      renderChatThread(conversation);
-    } catch (e) {
-      input.value = text;
-      toast(`could not start a conversation: ${e.message}`);
-      return;
-    }
-  }
+/** Conversations written before quick mode existed are agent conversations. */
+function modeOfConversation(conversation) {
+  return conversation?.payload?.mode === 'quick' ? 'quick' : 'agent';
+}
+
+async function newConversation(mode) {
+  const conversation = await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({ mode }) });
+  chatConversations.unshift(conversation);
+  chatActiveId = conversation.id;
+  $('#ask-mode').value = mode;
+  paintAskMode();
+  renderChatList();
+  renderChatThread(conversation);
+  return conversation;
+}
+
+async function askQuestion(text, mode) {
   const thread = $('#chat-thread');
   const mine = document.createElement('div');
   mine.className = 'chat-msg user';
   mine.innerHTML = `<div class="markdown">${renderMd(text)}</div>`;
   thread.appendChild(mine);
   thread.scrollTop = thread.scrollHeight;
-  try {
-    await api(`/api/chat/conversations/${chatActiveId}/messages`, { method: 'POST', body: JSON.stringify({ text }) });
+  if (mode === 'quick') $('#chat-activity').hidden = false, renderChatActivity([]);
+  const res = await api(`/api/chat/conversations/${chatActiveId}/messages`, { method: 'POST', body: JSON.stringify({ text, mode }) });
+  // the server says whether there is a session to watch: a quick answer is
+  // already written by the time this returns, so there is nothing to poll
+  if (res.status === 'running') {
     startChatPolling();
+  } else {
+    $('#chat-activity').hidden = true;
+    await openConversation(chatActiveId);
+    chatConversations = await api('/api/chat/conversations?limit=50');
+    renderChatList();
+  }
+}
+
+async function sendChat() {
+  const input = $('#chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+  const mode = $('#ask-mode').value;
+  input.value = '';
+  // Quick asks are one question each, and a mode never changes what an existing
+  // thread means — either way that means a fresh conversation.
+  const current = chatConversations.find((c) => c.id === chatActiveId);
+  try {
+    if (!chatActiveId || mode === 'quick' || modeOfConversation(current) !== mode) await newConversation(mode);
+  } catch (e) {
+    input.value = text;
+    toast(`could not start a conversation: ${e.message}`);
+    return;
+  }
+  try {
+    await askQuestion(text, mode);
   } catch (e) {
     toast(`send failed: ${e.message}`);
     // 409 means another client is already answering — resync and follow that turn instead
@@ -1858,18 +2023,33 @@ async function sendChat() {
   }
 }
 
+/** Re-ask a quick question in a fresh agent conversation. */
+async function deepenWithAgent(question) {
+  try {
+    await newConversation('agent');
+    await askQuestion(question, 'agent');
+  } catch (e) {
+    toast(`send failed: ${e.message}`);
+  }
+}
+
 $('#btn-chat-new').addEventListener('click', async () => {
   try {
-    const conversation = await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({}) });
-    chatConversations.unshift(conversation);
-    chatActiveId = conversation.id;
-    renderChatList();
-    renderChatThread(conversation);
+    await newConversation($('#ask-mode').value);
     $('#chat-input').focus();
   } catch (e) {
     toast(`could not start a conversation: ${e.message}`);
   }
 });
+const ASK_PLACEHOLDER = {
+  quick: 'ask a question — answered from your knowledge base with citations… Enter sends, Shift+Enter adds a line',
+  agent: 'ask a question, or “记住：…” to teach the knowledge base — Enter sends, Shift+Enter adds a line',
+};
+function paintAskMode() {
+  $('#chat-input').placeholder = ASK_PLACEHOLDER[$('#ask-mode').value] ?? ASK_PLACEHOLDER.quick;
+}
+$('#ask-mode').addEventListener('change', paintAskMode);
+
 $('#chat-composer').addEventListener('submit', (ev) => { ev.preventDefault(); sendChat(); });
 $('#chat-input').addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter' && !ev.shiftKey) {
@@ -1905,24 +2085,197 @@ const cliMeta = {
   'cursor-cli': { command: 'cursor-agent -p', path: 'cursor-agent', note: 'Uses your existing Cursor Agent login in headless print mode.' },
 };
 
+/* ---------- the model picker, shared by every model field ---------- */
+
 /**
- * Named LLM connections. Endpoint and credentials are configured once here and
- * routes reference one by id, so `connectionDrafts` is the edit buffer the
- * route selects and the save payload both read from.
+ * Model lists the settings screen has already fetched, keyed by route. The
+ * service caches by endpoint underneath, so this only saves the round trip —
+ * but that is what makes reopening a dropdown instant.
+ */
+const modelLists = new Map();
+
+function closeModelPicker() {
+  document.querySelector('.model-picker')?.remove();
+  document.removeEventListener('click', onModelPickerOutside, true);
+  window.removeEventListener('keydown', onModelPickerKey);
+  window.removeEventListener('resize', closeModelPicker);
+}
+
+function onModelPickerOutside(event) {
+  const picker = document.querySelector('.model-picker');
+  if (picker && !picker.contains(event.target) && !event.target.closest('.model-chevron')) closeModelPicker();
+}
+
+function onModelPickerKey(event) {
+  if (event.key === 'Escape') closeModelPicker();
+}
+
+function renderModelPicker(picker, route, input) {
+  const state = modelLists.get(route);
+  const filter = picker.querySelector('.model-filter')?.value?.trim().toLowerCase() ?? '';
+  const models = state?.result?.models ?? [];
+  const shown = filter
+    ? models.filter((m) => m.id.toLowerCase().includes(filter) || (m.label ?? '').toLowerCase().includes(filter))
+    : models;
+  const sourceLabel = { api: 'from the endpoint', cli: 'from the CLI' }[state?.result?.source] ?? 'suggestions';
+
+  picker.innerHTML = `
+    <div class="model-picker-head">
+      <b>Models</b>
+      ${state?.result ? `<span class="section-badge${state.result.source === 'builtin' ? ' accent2' : ''}">${esc(sourceLabel)}</span>` : ''}
+      ${state?.loading ? '<span class="hint">asking…</span>' : ''}
+      <button type="button" class="ghost model-refresh" title="Ask the provider again">⟳</button>
+    </div>
+    ${models.length ? `<input class="model-filter" placeholder="Filter ${models.length} models" value="${esc(filter)}" />` : ''}
+    ${models.length ? `<div class="model-list">${shown
+      .map((m) => `<button type="button" class="model-option${m.id === input.value ? ' selected' : ''}" data-model="${esc(m.id)}"><span class="mono">${esc(m.id)}</span>${m.label ? `<small>${esc(m.label)}</small>` : ''}</button>`)
+      .join('') || '<p class="hint">Nothing matches.</p>'}</div>` : ''}
+    ${!models.length && state?.loading ? '<p class="hint">Asking the provider…</p>' : ''}
+    ${!models.length && state?.result && !state.result.error ? '<p class="hint">This provider lists no models — type the id you want.</p>' : ''}
+    ${state?.error || state?.result?.error ? `<p class="jerr">${esc(state.error ?? state.result.error)}</p>` : ''}
+    ${state?.result?.note ? `<p class="hint">${esc(state.result.note)}</p>` : ''}
+    ${state?.result?.cached && state.result.cachedAt ? `<p class="hint">Cached — the service last asked at ${esc(new Date(state.result.cachedAt).toLocaleTimeString())}.</p>` : ''}
+    <p class="model-picker-foot">Picking one fills the field — Save &amp; apply writes it to the workspace config.</p>`;
+}
+
+async function loadModelList(route, picker, input, refresh = false) {
+  const state = modelLists.get(route) ?? {};
+  if (state.loading) return;
+  if (state.result && !refresh) return;
+  modelLists.set(route, { ...state, loading: true, error: null });
+  renderModelPicker(picker, route, input);
+  try {
+    const result = await api('/api/config/models', {
+      method: 'POST',
+      body: JSON.stringify({ route, refresh, config: gatherConfig() }),
+    });
+    modelLists.set(route, { loading: false, result, error: result.error ?? null });
+  } catch (e) {
+    modelLists.set(route, { loading: false, result: state.result, error: e.message });
+  }
+  if (document.body.contains(picker)) renderModelPicker(picker, route, input);
+}
+
+function openModelPicker(anchor, input, route) {
+  closeModelPicker();
+  const picker = document.createElement('div');
+  picker.className = 'model-picker';
+  document.body.appendChild(picker);
+  renderModelPicker(picker, route, input);
+
+  const box = anchor.getBoundingClientRect();
+  const size = picker.getBoundingClientRect();
+  picker.style.left = `${Math.max(6, Math.min(box.right - 430, window.innerWidth - 436))}px`;
+  picker.style.top = `${Math.min(box.bottom + 4, window.innerHeight - size.height - 6)}px`;
+
+  picker.addEventListener('click', (event) => {
+    const option = event.target.closest('.model-option');
+    if (option) {
+      input.value = option.dataset.model;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      closeModelPicker();
+      return;
+    }
+    if (event.target.closest('.model-refresh')) loadModelList(route, picker, input, true);
+  });
+  picker.addEventListener('input', (event) => {
+    if (event.target.classList.contains('model-filter')) renderModelPicker(picker, route, input);
+  });
+
+  setTimeout(() => {
+    document.addEventListener('click', onModelPickerOutside, true);
+    window.addEventListener('keydown', onModelPickerKey);
+    window.addEventListener('resize', closeModelPicker);
+  }, 0);
+
+  loadModelList(route, picker, input);
+}
+
+/** A model input keeps its free text and gains a chevron that lists what the provider offers. */
+function modelChevron(route) {
+  return `<button type="button" class="model-chevron" data-route="${esc(route)}" title="List the models this provider offers">⌄</button>`;
+}
+
+document.addEventListener('click', (event) => {
+  const chevron = event.target.closest?.('.model-chevron');
+  if (!chevron) return;
+  const input = chevron.parentElement.querySelector('input');
+  if (input) openModelPicker(chevron, input, chevron.dataset.route);
+});
+
+/**
+ * Every endpoint and credential, as one table. Embedding providers, the
+ * default LLM and the extra LLM connections are three shapes of the same row,
+ * so the drafts below are the edit buffer that the rows, the stage pickers and
+ * the save payload all read from.
  */
 let connectionDrafts = [];
+let embeddingDrafts = [];
+let embeddingUse = '';
+let defaultLlmDraft = null;
+/** Provider ids whose row is open, kept across a redraw. */
+const expandedProviders = new Set();
 
 function connectionById(id) {
   return connectionDrafts.find((c) => c.id === id);
+}
+
+const EMBEDDING_PROVIDER_OPTIONS = [
+  ['local', 'Local hashing · offline'],
+  ['openai', 'OpenAI-compatible API'],
+  ['ark-multimodal', 'Volcengine Ark · multimodal'],
+];
+
+const EMB_NOTES = {
+  local: 'The local hashing embedder is private, offline and ready immediately. Dimensions can be tuned before the first index.',
+  openai: 'Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep the key out of the config file.',
+  'ark-multimodal': 'Ark posts to /embeddings/multimodal and returns one vector per request, so Base URL ends at /api/v3 and Model is the endpoint id (ep-…). Dimensions must match the model (doubao-embedding-vision: 2048, or 1024 with the dimensions parameter sent).',
+};
+
+const LLM_NOTES = {
+  openai: 'Any OpenAI-compatible chat endpoint works. An empty model disables the general LLM features; the deterministic pipeline keeps running.',
+  'codex-cli': 'Uses your existing Codex login for a read-only one-shot request.',
+  'claude-cli': 'Uses your existing Claude Code login for one non-interactive turn.',
+  'cursor-cli': 'Uses your existing Cursor Agent login in headless print mode.',
+};
+
+const embeddingProviderLabel = (provider) =>
+  EMBEDDING_PROVIDER_OPTIONS.find(([v]) => v === provider)?.[1] ?? provider;
+
+const activeEmbedding = () =>
+  embeddingDrafts.find((e) => e.id === embeddingUse) ?? embeddingDrafts[0] ?? null;
+
+function embeddingSummaryText() {
+  const active = activeEmbedding();
+  if (!active) return 'Loading…';
+  if (active.provider === 'local') return `${active.label || active.id} · ${active.dimensions || 384}d`;
+  return active.model ? `${active.label || active.id} · ${active.model}` : 'API model not set';
+}
+
+function defaultLlmSummaryText() {
+  if (!defaultLlmDraft) return 'Loading…';
+  const name = defaultLlmDraft.label?.trim() || providerNames[defaultLlmDraft.provider] || defaultLlmDraft.provider;
+  return defaultLlmDraft.model ? `${name} · ${defaultLlmDraft.model}` : name;
 }
 
 function routeSummary(prefix) {
   const use = $(`#cfg-${prefix}-use`).value;
   const model = $(`#cfg-${prefix}-model`).value.trim();
   const connection = connectionById(use);
-  const name = connection ? connection.label || connection.id : 'Default model';
+  const fallback = defaultLlmDraft?.label?.trim() || 'Default model';
+  const name = connection ? connection.label || connection.id : fallback;
   const effective = model || connection?.model?.trim() || '';
   return effective ? `${name} · ${effective}` : name;
+}
+
+/** Rebuild the Index picker from the configured embedding providers. */
+function fillEmbeddingOptions() {
+  const select = $('#cfg-embedding-use');
+  select.innerHTML = embeddingDrafts
+    .map((e) => `<option value="${esc(e.id)}">${esc(e.label || e.id)}</option>`)
+    .join('');
+  select.value = embeddingDrafts.some((e) => e.id === embeddingUse) ? embeddingUse : (embeddingDrafts[0]?.id ?? '');
+  embeddingUse = select.value;
 }
 
 /** Rebuild the per-route pickers from the current connection list. */
@@ -1938,62 +2291,62 @@ function fillRouteOptions() {
   refreshResearchAgentOptions();
 }
 
-function updateConfigSummaries() {
-  const embLocal = $('#cfg-emb-provider').value === 'local';
-  const embModel = $('#cfg-emb-model').value.trim();
-  const dims = $('#cfg-emb-dim').value;
-  const embedding = embLocal ? `Local hashing · ${dims || 384}d` : (embModel || 'API model not set');
-  const llmProvider = $('#cfg-llm-provider').value;
-  const llmModel = $('#cfg-llm-model').value.trim();
-  const defaultLlm = llmModel ? `${providerNames[llmProvider]} · ${llmModel}` : providerNames[llmProvider];
+/**
+ * The five stages a document passes through. The flow draws one node each, and
+ * the inspector below shows the panel of whichever is selected — the long
+ * explanations used to be stacked five deep and cost two screens.
+ */
+const PIPELINE_STAGES = [
+  { key: 'document', step: 1, title: 'Convert', badge: 'vision', accent: 'accent2' },
+  { key: 'index', step: 2, title: 'Index', badge: 'embedding', accent: 'accent' },
+  { key: 'entity', step: 3, title: 'Extract', badge: 'volume', accent: 'accent2' },
+  { key: 'concept', step: 4, title: 'Synthesize', badge: 'quality', accent: 'accent2' },
+  { key: 'answer', step: 5, title: 'Answer', badge: 'interactive', accent: 'accent2' },
+];
+let selectedStage = 'document';
 
-  $('#summary-embedding').textContent = embedding;
-  $('#summary-entity').textContent = routeSummary('entity');
-  $('#summary-concept').textContent = routeSummary('concept');
-  $('#summary-document').textContent = routeSummary('document');
-  $('#summary-default-llm').textContent = defaultLlm;
-  // the two stages that are not chosen per stage follow section 01
-  $('#pin-index').textContent = embedding;
-  $('#pin-answer').textContent = defaultLlm;
+function stageTarget(key) {
+  if (key === 'index') return embeddingSummaryText();
+  if (key === 'answer') return defaultLlmSummaryText();
+  return routeSummary(key);
 }
 
-const EMB_NOTES = {
-  local: 'The local hashing embedder is private, offline and ready immediately. Dimensions can be tuned before the first index.',
-  openai: 'Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep the key out of the config file.',
-  'ark-multimodal': 'Ark posts to /embeddings/multimodal and returns one vector per request, so Base URL ends at /api/v3 and Model is the endpoint id (ep-…). Dimensions must match the model (doubao-embedding-vision: 2048, or 1024 with the dimensions parameter sent).',
-};
-
-function embProviderToggle() {
-  const provider = $('#cfg-emb-provider').value;
-  const local = provider === 'local';
-  ['#cfg-emb-baseurl', '#cfg-emb-key', '#cfg-emb-model', '#cfg-emb-senddim'].forEach((s) => { $(s).disabled = local; });
-  $('#cfg-emb-note').textContent = EMB_NOTES[provider] ?? EMB_NOTES.openai;
-  updateConfigSummaries();
+/** The rate a node reports: only the stages that have one show anything. */
+function stageRate(key) {
+  const int = (sel, fallback) => Number($(sel)?.value) || fallback;
+  if (key === 'document') return `×${int('#cfg-ingest-convert', 2)}`;
+  if (key === 'index') return `×${int('#cfg-ingest-concurrency', 4)} · ${int('#cfg-emb-batch', 32)}/req`;
+  if (key === 'entity') return `×${int('#cfg-extraction-concurrency', 1)} · ${int('#cfg-extraction-batch', 8)}/pass`;
+  return '';
 }
 
-function llmProviderToggle() {
-  const provider = $('#cfg-llm-provider').value;
-  const cli = provider !== 'openai';
-  document.querySelectorAll('.cfg-llm-api').forEach((el) => { el.hidden = cli; });
-  document.querySelectorAll('.cfg-llm-cli').forEach((el) => { el.hidden = !cli; });
-  $('#cfg-llm-model').placeholder = cli
-    ? 'Optional · use the CLI default when empty'
-    : 'gpt-4.1-mini';
-  if (cli) {
-    const meta = cliMeta[provider];
-    $('#cfg-llm-clipath').placeholder = `Default: ${meta.path}`;
-    $('#cfg-llm-note').innerHTML = `<b>${esc(meta.command)}</b> · ${esc(meta.note)}`;
-  } else {
-    $('#cfg-llm-note').textContent = 'Used by Ask, Wiki summaries and Dream analysis. An empty model disables these general LLM features.';
+function renderStageFlow() {
+  $('#stage-flow').innerHTML = PIPELINE_STAGES
+    .map((stage, index) => {
+      const node = `<button type="button" class="stage-node${stage.key === selectedStage ? ' selected' : ''}" data-stage="${stage.key}">
+        <span class="stage-node-head"><i class="stage-step ${stage.accent}">${stage.step}</i>${esc(stage.title)}</span>
+        <span class="section-badge ${stage.accent === 'accent2' ? 'accent2' : ''}">${esc(stage.badge)}</span>
+        <span class="stage-node-target mono">${esc(stageTarget(stage.key))}</span>
+        <span class="stage-node-rate mono">${esc(stageRate(stage.key))}</span>
+      </button>`;
+      return index ? `<span class="stage-arrow">→</span>${node}` : node;
+    })
+    .join('');
+  for (const panel of document.querySelectorAll('.stage-panel')) {
+    panel.hidden = panel.dataset.stage !== selectedStage;
   }
-  updateConfigSummaries();
+}
+
+function updateConfigSummaries() {
+  $('#pin-answer').textContent = defaultLlmSummaryText();
+  renderStageFlow();
 }
 
 function routeProviderToggle(prefix) {
   const note = $(`#cfg-${prefix}-note`);
   const connection = connectionById($(`#cfg-${prefix}-use`).value);
   if (!connection) {
-    const provider = $('#cfg-llm-provider').value;
+    const provider = defaultLlmDraft?.provider ?? 'openai';
     note.innerHTML = `<b>Inherited route.</b> Runs on the default provider (${esc(providerNames[provider] ?? provider)}).`;
   } else if (connection.provider === 'openai') {
     note.innerHTML = `<b>${esc(connection.label || connection.id)}</b> · ${esc(connection.baseUrl.trim() || 'no endpoint set')}`;
@@ -2014,41 +2367,114 @@ function fillRoute(prefix, route = {}) {
 
 const PROVIDER_OPTIONS = ['openai', 'codex-cli', 'claude-cli', 'cursor-cli'];
 
-function renderConnections() {
-  const host = $('#cfg-connections');
-  if (!connectionDrafts.length) {
-    host.innerHTML = '<p class="cfg-callout">No extra connections yet — every route runs on the default provider above.</p>';
-    return;
+const optionsFor = (pairs, selected) =>
+  pairs.map(([v, l]) => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(l)}</option>`).join('');
+
+/** The shared row chrome; `fields` is the form the chevron opens. */
+function providerRow({ kind, accent, id, label, placeholder, providerLabel, summary, isDefault, removable, fields }) {
+  const open = expandedProviders.has(id);
+  return `<div class="provider-row${open ? ' open' : ''}" data-id="${esc(id)}" data-kind="${kind}">
+    <div class="provider-line">
+      <button type="button" class="provider-toggle" aria-expanded="${open}" title="${open ? 'Collapse' : 'Expand'}">${open ? '▾' : '▸'}</button>
+      <span class="section-badge ${accent === 'accent2' ? 'accent2' : ''}">${esc(kind === 'embedding' ? 'embed' : 'llm')}</span>
+      <input class="provider-name" data-field="label" value="${esc(label || '')}" placeholder="${esc(placeholder)}" />
+      <span>${isDefault ? `<span class="section-badge ${accent === 'accent2' ? 'accent2' : ''}">default</span>` : ''}</span>
+      <span class="provider-kind">${esc(providerLabel)}</span>
+      <span class="provider-model mono">${esc(summary || 'no model set')}</span>
+      <span class="provider-id mono">${esc(id)}</span>
+      <button type="button" class="ghost provider-remove"${removable ? '' : ' disabled'} title="${removable ? 'Remove this provider' : 'This provider cannot be removed'}">✕</button>
+    </div>
+    ${open ? `<div class="provider-detail">${fields}</div>` : ''}
+  </div>`;
+}
+
+function embeddingFields(entry) {
+  const api = entry.provider !== 'local';
+  return `<div class="cfg-grid cfg-grid-2">
+      <label>Provider<select data-field="provider">${optionsFor(EMBEDDING_PROVIDER_OPTIONS, entry.provider)}</select></label>
+      <label>Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="${entry.provider === 'ark-multimodal' ? 'ep-…' : 'text-embedding-3-small'}"${api ? '' : ' disabled'} />${api ? modelChevron(`embedding:${entry.id}`) : ''}</span></label>
+      <label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1"${api ? '' : ' disabled'} /></label>
+      <label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY"${api ? '' : ' disabled'} /></label>
+      <label>Dimensions<input data-field="dimensions" type="number" min="1" step="1" value="${esc(entry.dimensions ?? '')}" /></label>
+    </div>
+    <label class="cfg-check"><input data-field="sendDimensions" type="checkbox"${entry.sendDimensions ? ' checked' : ''}${api ? '' : ' disabled'} /> Send the <span class="mono">dimensions</span> parameter with API requests</label>
+    <p class="cfg-callout">${esc(EMB_NOTES[entry.provider] ?? EMB_NOTES.openai)}</p>`;
+}
+
+function llmFields(entry, route) {
+  const api = entry.provider === 'openai';
+  return `<div class="cfg-grid cfg-grid-2">
+      <label>Provider<select data-field="provider">${optionsFor(PROVIDER_OPTIONS.map((p) => [p, providerNames[p] ?? p]), entry.provider)}</select></label>
+      <label>Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="${api ? 'gpt-4.1-mini' : 'Use CLI default'}" />${modelChevron(route)}</span></label>
+      ${api ? `<label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1" /></label>
+      <label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY" /></label>`
+    : `<label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(entry.cliPath || '')}" placeholder="Default: ${esc(cliMeta[entry.provider]?.path ?? '')}" /></label>`}
+    </div>
+    <p class="cfg-callout">${esc(LLM_NOTES[entry.provider] ?? LLM_NOTES.openai)}</p>`;
+}
+
+function renderProviders() {
+  const rows = embeddingDrafts.map((e) =>
+    providerRow({
+      kind: 'embedding',
+      accent: 'accent',
+      id: e.id,
+      label: e.label,
+      placeholder: 'Name this provider',
+      providerLabel: embeddingProviderLabel(e.provider),
+      summary: e.provider === 'local' ? `hashing · ${e.dimensions || 384}d` : (e.model ? `${e.model} · ${e.dimensions || ''}d` : ''),
+      isDefault: e.id === embeddingUse,
+      // something has to embed, so the last one stays
+      removable: embeddingDrafts.length > 1,
+      fields: embeddingFields(e),
+    }));
+
+  if (defaultLlmDraft) {
+    rows.push(providerRow({
+      kind: 'llm',
+      accent: 'accent2',
+      id: 'default',
+      label: defaultLlmDraft.label,
+      placeholder: providerNames[defaultLlmDraft.provider] ?? 'Name this provider',
+      providerLabel: providerNames[defaultLlmDraft.provider] ?? defaultLlmDraft.provider,
+      summary: defaultLlmDraft.model,
+      isDefault: true,
+      removable: false,
+      fields: llmFields(defaultLlmDraft, 'llm'),
+    }));
   }
-  host.innerHTML = connectionDrafts
-    .map((c, index) => {
-      const api = c.provider === 'openai';
-      const options = PROVIDER_OPTIONS.map(
-        (p) => `<option value="${p}"${p === c.provider ? ' selected' : ''}>${esc(providerNames[p] ?? p)}</option>`,
-      ).join('');
-      return `<fieldset class="cfg-card cfg-connection" data-index="${index}">
-        <div class="cfg-connection-head">
-          <input class="cfg-conn-label" data-field="label" value="${esc(c.label || '')}" placeholder="Name this connection" />
-          <span class="mono">${esc(c.id)}</span>
-          <button type="button" class="ghost cfg-conn-remove" title="Remove this connection">Remove</button>
-        </div>
-        <div class="cfg-grid cfg-grid-2">
-          <label>Provider<select class="cfg-conn-provider" data-field="provider">${options}</select></label>
-          <label>Model<input data-field="model" value="${esc(c.model || '')}" placeholder="${api ? 'gpt-4.1-mini' : 'Use CLI default'}" /></label>
-          ${api ? `<label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(c.baseUrl || '')}" placeholder="https://api.openai.com/v1" /></label>
-          <label>API key<input data-field="apiKey" value="${esc(c.apiKey || '')}" placeholder="env:OPENAI_API_KEY" /></label>`
-        : `<label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(c.cliPath || '')}" placeholder="Default: ${esc(cliMeta[c.provider]?.path ?? '')}" /></label>`}
-        </div>
-      </fieldset>`;
-    })
-    .join('');
+
+  for (const c of connectionDrafts) {
+    rows.push(providerRow({
+      kind: 'llm',
+      accent: 'accent2',
+      id: c.id,
+      label: c.label,
+      placeholder: 'Name this provider',
+      providerLabel: providerNames[c.provider] ?? c.provider,
+      summary: c.model,
+      isDefault: false,
+      removable: true,
+      fields: llmFields(c, `connection:${c.id}`),
+    }));
+  }
+
+  $('#cfg-providers').innerHTML = rows.join('');
+  fillEmbeddingOptions();
+}
+
+/** The draft one row edits, whichever of the three lists it came from. */
+function providerDraft(id) {
+  if (id === 'default') return defaultLlmDraft;
+  return embeddingDrafts.find((e) => e.id === id) ?? connectionById(id);
 }
 
 function addConnection() {
   let suffix = connectionDrafts.length + 1;
   while (connectionDrafts.some((c) => c.id === `connection-${suffix}`)) suffix += 1;
+  const id = `connection-${suffix}`;
   connectionDrafts.push({
-    id: `connection-${suffix}`,
+    id,
     label: `Connection ${suffix}`,
     provider: 'openai',
     baseUrl: 'https://api.openai.com/v1',
@@ -2056,8 +2482,28 @@ function addConnection() {
     model: '',
     cliPath: '',
   });
-  renderConnections();
+  expandedProviders.add(id);
+  renderProviders();
   fillRouteOptions();
+  updateConfigSummaries();
+}
+
+function addEmbeddingProvider() {
+  let suffix = embeddingDrafts.length + 1;
+  while (embeddingDrafts.some((e) => e.id === `embedding-${suffix}`)) suffix += 1;
+  const id = `embedding-${suffix}`;
+  embeddingDrafts.push({
+    id,
+    label: `Embedding ${suffix}`,
+    provider: 'local',
+    baseUrl: '',
+    apiKey: '',
+    model: '',
+    dimensions: 384,
+    sendDimensions: false,
+  });
+  expandedProviders.add(id);
+  renderProviders();
   updateConfigSummaries();
 }
 
@@ -2070,19 +2516,11 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     const cfg = await api('/api/config');
     if (activeWorkspace()?.id !== workspaceId) return;
     loadedConfig = cfg;
-    $('#cfg-emb-provider').value = cfg.embedding.provider;
-    $('#cfg-emb-baseurl').value = cfg.embedding.baseUrl || '';
-    $('#cfg-emb-key').value = cfg.embedding.apiKey || '';
-    $('#cfg-emb-model').value = cfg.embedding.model || '';
-    $('#cfg-emb-dim').value = cfg.embedding.dimensions || '';
-    $('#cfg-emb-senddim').checked = !!cfg.embedding.sendDimensions;
-    $('#cfg-llm-provider').value = cfg.llm.provider || 'openai';
-    $('#cfg-llm-baseurl').value = cfg.llm.baseUrl || '';
-    $('#cfg-llm-key').value = cfg.llm.apiKey || '';
-    $('#cfg-llm-model').value = cfg.llm.model || '';
-    $('#cfg-llm-clipath').value = cfg.llm.cliPath || '';
+    embeddingDrafts = (cfg.embeddingProviders ?? []).map((e) => ({ ...e }));
+    embeddingUse = cfg.embeddingUse || embeddingDrafts[0]?.id || '';
+    defaultLlmDraft = { ...cfg.llm };
     connectionDrafts = (cfg.connections ?? []).map((c) => ({ ...c }));
-    renderConnections();
+    renderProviders();
     fillRouteOptions();
     fillRoute('entity', cfg.extraction?.entityLlm);
     fillRoute('concept', cfg.extraction?.conceptLlm);
@@ -2091,8 +2529,13 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-extraction-batch').value = cfg.extraction?.batchSize ?? 8;
     $('#cfg-extraction-concurrency').value = cfg.extraction?.concurrency ?? 1;
     $('#cfg-extraction-claims').checked = cfg.extraction?.claims !== false;
+    $('#cfg-ingest-concurrency').value = cfg.ingest?.concurrency ?? 4;
+    $('#cfg-ingest-convert').value = cfg.ingest?.convertConcurrency ?? 2;
+    $('#cfg-emb-batch').value = activeEmbedding()?.batchSize ?? 32;
+    await loadAgentsList();
     fillResearchForm(cfg.research ?? {});
     fillChatForm(cfg.chat ?? {});
+    renderAgents();
     // With no agent configured, pre-fill what the service says can run here. It
     // is only a pre-fill: nothing is saved until the person presses Save, so
     // "not configured" never quietly becomes a setting nobody chose.
@@ -2104,8 +2547,6 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
         /* the picker still works; it just starts empty */
       }
     }
-    embProviderToggle();
-    llmProviderToggle();
     updateConfigSummaries();
     try {
       await loadResearchProfiles(cfg.research?.profile);
@@ -2135,21 +2576,18 @@ function gatherRoute(prefix) {
 // '***' / 'env:…' are passed through verbatim; the server keeps the real secret.
 function gatherConfig() {
   return {
-    embedding: {
-      provider: $('#cfg-emb-provider').value,
-      baseUrl: $('#cfg-emb-baseurl').value.trim(),
-      apiKey: $('#cfg-emb-key').value.trim(),
-      model: $('#cfg-emb-model').value.trim(),
-      dimensions: Number($('#cfg-emb-dim').value) || undefined,
-      sendDimensions: $('#cfg-emb-senddim').checked,
+    embeddingProviders: embeddingDrafts.map((e) => ({
+      ...e,
+      label: (e.label || '').trim() || e.id,
+      // the request size is edited on the Index node, not in the provider row
+      batchSize: e.id === embeddingUse ? Number($('#cfg-emb-batch').value) || e.batchSize : e.batchSize,
+    })),
+    embeddingUse,
+    ingest: {
+      concurrency: Number($('#cfg-ingest-concurrency').value) || undefined,
+      convertConcurrency: Number($('#cfg-ingest-convert').value) || undefined,
     },
-    llm: {
-      provider: $('#cfg-llm-provider').value,
-      baseUrl: $('#cfg-llm-baseurl').value.trim(),
-      apiKey: $('#cfg-llm-key').value.trim(),
-      model: $('#cfg-llm-model').value.trim(),
-      cliPath: $('#cfg-llm-clipath').value.trim(),
-    },
+    llm: { ...defaultLlmDraft, label: (defaultLlmDraft?.label || '').trim() },
     connections: connectionDrafts.map((c) => ({ ...c, label: c.label.trim() || c.id })),
     extraction: {
       entityLlm: gatherRoute('entity'),
@@ -2165,7 +2603,223 @@ function gatherConfig() {
   };
 }
 
-/* ---------- Settings · 03 deep research: runner config + profile editor ---------- */
+/* ---------- 03 · agents: who runs a research job or a chat turn ---------- */
+
+/**
+ * Named agents. Each is its own file under `playbooks/agents/`, so unlike the
+ * rest of this screen they are written the moment one is added or removed —
+ * Research cannot point at a name that does not exist yet. Field edits still
+ * wait for Save & apply, along with everything else.
+ */
+let agentDrafts = [];
+const expandedAgents = new Set();
+
+const AGENT_EFFORTS = [
+  ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'],
+  ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max'],
+];
+const AGENT_WEB = [['inherit', 'Follow review.external'], ['on', 'On (within review.external)'], ['off', 'Off']];
+
+function agentById(name) {
+  return agentDrafts.find((a) => a.name === name);
+}
+
+function executorLabel(executor) {
+  if (executor === 'default') return 'Default LLM provider';
+  const connection = connectionById(executor);
+  if (connection) return connection.label || connection.id;
+  return providerNames[executor] ?? executor;
+}
+
+function executorOptions(selected) {
+  const opts = [`<option value="default"${selected === 'default' ? ' selected' : ''}>Default LLM provider</option>`];
+  for (const p of CLI_PROVIDERS) {
+    opts.push(`<option value="${p}"${p === selected ? ' selected' : ''}>${esc(providerNames[p])} · from PATH</option>`);
+  }
+  for (const c of connectionDrafts) {
+    opts.push(`<option value="${esc(c.id)}"${c.id === selected ? ' selected' : ''}>${esc(c.label || c.id)}</option>`);
+  }
+  return opts.join('');
+}
+
+function agentFields(agent) {
+  return `<div class="cfg-grid cfg-grid-2">
+      <label>Runs on<select data-field="executor">${executorOptions(agent.executor)}</select></label>
+      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="Its own default" />${modelChevron(agent.executor === 'default' ? 'llm' : `connection:${agent.executor}`)}</span></label>
+      <label>Reasoning effort<select data-field="effort">${optionList(AGENT_EFFORTS, agent.effort)}</select></label>
+      <label>Web access<select data-field="web">${optionList(AGENT_WEB, agent.tools?.web ?? 'inherit')}</select></label>
+      <label>Turns per session<input data-field="maxTurns" type="number" min="0" step="1" value="${esc(agent.maxTurns ?? 0)}" placeholder="0 = the caller's default" /></label>
+      <label>Timeout (minutes)<input data-field="timeoutMinutes" type="number" min="0" step="1" value="${esc(Math.round((agent.timeoutMs ?? 0) / 60000))}" placeholder="0 = the caller's default" /></label>
+      <label class="cfg-span-2">Description<input data-field="description" value="${esc(agent.description || '')}" placeholder="When to pick this agent" /></label>
+    </div>
+    <div class="cfg-checks">
+      <label class="cfg-check"><input data-field="write" type="checkbox"${agent.tools?.write ? ' checked' : ''} /> Writes pages (knode_write / knode_commit)</label>
+      <label class="cfg-check"><input data-field="files" type="checkbox"${agent.tools?.files ? ' checked' : ''} /> Reads files (Read / Grep / Glob)</label>
+    </div>
+    <label class="agent-prompt">System prompt<textarea data-field="prompt" rows="6" class="mono" spellcheck="false" placeholder="Empty = the research protocol the run workspace already carries">${esc(agent.prompt || '')}</textarea></label>
+    <p class="cfg-callout">Stored at <span class="mono">${esc(agent.path || '')}</span>.</p>`;
+}
+
+function renderAgents() {
+  const host = $('#cfg-agents');
+  if (!agentDrafts.length) {
+    host.innerHTML = '<p class="cfg-callout">No agents yet — add one from a template: a general deep agent for Chat, or a deep-research agent that writes wiki pages.</p>';
+    return;
+  }
+  host.innerHTML = agentDrafts
+    .map((agent) => {
+      const deep = agent.kind === 'deep-research';
+      const open = expandedAgents.has(agent.name);
+      const uses = [
+        $('#cfg-research-agent')?.value === agent.name ? '<span class="section-badge accent2">research</span>' : '',
+        $('#cfg-chat-agent')?.value === agent.name ? '<span class="section-badge">chat</span>' : '',
+      ].join('');
+      return `<div class="provider-row${open ? ' open' : ''}" data-agent="${esc(agent.name)}">
+        <div class="provider-line">
+          <button type="button" class="provider-toggle agent-toggle" aria-expanded="${open}">${open ? '▾' : '▸'}</button>
+          <span class="section-badge${deep ? ' accent2' : ''}">${deep ? 'deep research' : 'general'}</span>
+          <input class="provider-name" data-field="title" value="${esc(agent.title || '')}" placeholder="Name this agent" />
+          <span>${uses}</span>
+          <span class="provider-kind">${esc(executorLabel(agent.executor))}</span>
+          <span class="provider-model mono">${esc(agent.model || 'its own default')}</span>
+          <span class="provider-id mono">${agent.runnable ? '' : '⚠ '}${esc(agent.name)}</span>
+          <button type="button" class="ghost agent-remove" title="${agent.builtin ? 'Reset this template to its built-in' : 'Remove this agent'}">${agent.builtin ? '⟲' : '✕'}</button>
+        </div>
+        ${open ? `<div class="provider-detail">${agentFields(agent)}</div>` : ''}
+      </div>`;
+    })
+    .join('');
+}
+
+async function loadAgentsList() {
+  try {
+    const body = await api('/api/agents');
+    agentDrafts = body.agents.map((a) => ({ ...a }));
+  } catch {
+    agentDrafts = [];
+  }
+  renderAgents();
+  refreshResearchAgentOptions();
+}
+
+/** A new agent is written straight away: Research cannot name what has no file. */
+async function addAgent(kind) {
+  const base = kind === 'deep-research' ? 'research' : 'agent';
+  let suffix = agentDrafts.length + 1;
+  while (agentDrafts.some((a) => a.name === `${base}-${suffix}`)) suffix += 1;
+  const name = `${base}-${suffix}`;
+  try {
+    await api(`/api/agents/${name}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        agent: {
+          kind,
+          title: kind === 'deep-research' ? 'New research agent' : 'New agent',
+          executor: 'default',
+          tools: { write: kind === 'deep-research', files: true, web: 'inherit' },
+        },
+      }),
+    });
+    expandedAgents.add(name);
+    await loadAgentsList();
+  } catch (e) {
+    $('#cfg-status').innerHTML = `<div class="cfg-line bad">could not create the agent: ${esc(e.message)}</div>`;
+  }
+}
+
+async function removeAgent(name) {
+  try {
+    const { reset } = await api(`/api/agents/${name}`, { method: 'DELETE' });
+    expandedAgents.delete(name);
+    await loadAgentsList();
+    // the service moves research/chat off a deleted agent, so read them back
+    if (!reset) {
+      const cfg = await api('/api/config');
+      $('#cfg-research-agent').value = cfg.research?.agent ?? '';
+      $('#cfg-chat-agent').value = cfg.chat?.agent ?? '';
+      refreshResearchAgentOptions();
+    }
+  } catch (e) {
+    $('#cfg-status').innerHTML = `<div class="cfg-line bad">could not remove the agent: ${esc(e.message)}</div>`;
+  }
+}
+
+/** Each agent is its own file, so Save & apply writes them beside the config. */
+async function saveAgents() {
+  for (const agent of agentDrafts) {
+    await api(`/api/agents/${agent.name}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        agent: {
+          title: (agent.title || '').trim() || agent.name,
+          description: agent.description ?? '',
+          kind: agent.kind,
+          executor: agent.executor,
+          model: agent.model ?? '',
+          effort: agent.effort ?? 'default',
+          tools: agent.tools ?? { write: false, files: true, web: 'inherit' },
+          maxTurns: Number(agent.maxTurns) || 0,
+          timeoutMs: Number(agent.timeoutMs) || 0,
+          prompt: agent.prompt ?? '',
+        },
+      }),
+    });
+  }
+}
+
+for (const id of ['#cfg-research-agent', '#cfg-chat-agent']) {
+  $(id).addEventListener('change', renderAgents);
+}
+
+$('#cfg-add-agent').addEventListener('click', (event) => {
+  showMenuUnder(event.currentTarget, [
+    { label: 'General agent', run: () => addAgent('general') },
+    { label: 'Deep research agent', run: () => addAgent('deep-research') },
+  ]);
+});
+
+$('#cfg-agents').addEventListener('input', (event) => {
+  const row = event.target.closest?.('.provider-row');
+  const field = event.target.dataset?.field;
+  const agent = row && agentById(row.dataset.agent);
+  if (!agent || !field) return;
+  if (field === 'timeoutMinutes') agent.timeoutMs = (Number(event.target.value) || 0) * 60000;
+  else if (field === 'maxTurns') agent.maxTurns = Number(event.target.value) || 0;
+  else agent[field] = event.target.value;
+  if (field === 'title') refreshResearchAgentOptions();
+});
+
+$('#cfg-agents').addEventListener('change', (event) => {
+  const row = event.target.closest?.('.provider-row');
+  const field = event.target.dataset?.field;
+  const agent = row && agentById(row.dataset.agent);
+  if (!agent || !field) return;
+  if (field === 'write' || field === 'files') {
+    agent.tools = { ...agent.tools, [field]: event.target.checked };
+    return;
+  }
+  if (field === 'web') {
+    agent.tools = { ...agent.tools, web: event.target.value };
+    return;
+  }
+  if (field !== 'executor' && field !== 'effort') return;
+  agent[field] = event.target.value;
+  if (field === 'executor') renderAgents();
+});
+
+$('#cfg-agents').addEventListener('click', (event) => {
+  const row = event.target.closest?.('.provider-row');
+  if (!row) return;
+  const name = row.dataset.agent;
+  if (event.target.classList.contains('agent-toggle')) {
+    if (expandedAgents.has(name)) expandedAgents.delete(name); else expandedAgents.add(name);
+    renderAgents();
+    return;
+  }
+  if (event.target.classList.contains('agent-remove')) removeAgent(name);
+});
+
+/* ---------- Settings · 04 research: pipeline, initialization, chat, profile ---------- */
 const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli'];
 const EFFORT_OPTIONS = [
   ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (claude; codex → xhigh, cursor → high)'],
@@ -2185,14 +2839,20 @@ function optionList(pairs, selected) {
 // `fallbackLabel` is the meaning of the empty value: "follow the one above" for
 // chat and roles. The research agent has no such fallback any more — it gets
 // null, and an empty value is shown as the unconfigured state it is.
-function agentOptions(selected, fallbackLabel) {
+function agentOptions(selected, fallbackLabel, kind = '') {
   const opts = fallbackLabel
     ? [`<option value="">${esc(fallbackLabel)}</option>`]
     : [`<option value=""${selected ? ' disabled' : ' selected'}>Not configured — pick an agent</option>`];
+  // the named agents from section 03 first, the kind this picker is for on top
+  const named = [...agentDrafts].sort((a, b) => Number(b.kind === kind) - Number(a.kind === kind));
+  for (const a of named) {
+    opts.push(`<option value="${esc(a.name)}"${a.name === selected ? ' selected' : ''}>${esc(a.title || a.name)}</option>`);
+  }
+  // a config written before named agents points straight at an executor
   for (const p of CLI_PROVIDERS) opts.push(`<option value="${p}"${p === selected ? ' selected' : ''}>${esc(providerNames[p])} · from PATH</option>`);
   // 'default' is the section-01 connection named explicitly; a CLI there runs as
   // a CLI, an OpenAI-compatible endpoint runs the built-in agent
-  const provider = $('#cfg-llm-provider')?.value;
+  const provider = defaultLlmDraft?.provider;
   opts.push(`<option value="default"${selected === 'default' ? ' selected' : ''}>Default LLM provider${provider ? ` · ${esc(providerNames[provider] || provider)}` : ''}</option>`);
   for (const c of connectionDrafts) {
     const how = CLI_PROVIDERS.includes(c.provider) ? providerNames[c.provider] : 'built-in agent';
@@ -2204,7 +2864,7 @@ function agentOptions(selected, fallbackLabel) {
 /** Only the CLIs ship a web tool; the built-in agent searches the base only. */
 function agentWebCapable(spec) {
   if (CLI_PROVIDERS.includes(spec)) return true;
-  const provider = spec === 'default' ? $('#cfg-llm-provider')?.value : connectionById(spec)?.provider;
+  const provider = spec === 'default' ? defaultLlmDraft?.provider : connectionById(spec)?.provider;
   return CLI_PROVIDERS.includes(provider);
 }
 
@@ -2212,13 +2872,13 @@ function refreshResearchAgentOptions() {
   const select = $('#cfg-research-agent');
   if (!select) return;
   const current = select.value;
-  select.innerHTML = agentOptions(current, null);
+  select.innerHTML = agentOptions(current, null, 'deep-research');
   select.value = current;
   if (select.value !== current) select.value = '';
   const chatSelect = $('#cfg-chat-agent');
   if (chatSelect) {
     const chatCurrent = chatSelect.value;
-    chatSelect.innerHTML = agentOptions(chatCurrent, 'The research agent above');
+    chatSelect.innerHTML = agentOptions(chatCurrent, 'The research agent above', 'general');
     chatSelect.value = chatCurrent;
     if (chatSelect.value !== chatCurrent) chatSelect.value = '';
   }
@@ -2231,7 +2891,7 @@ function refreshResearchAgentOptions() {
 }
 
 function fillResearchForm(research) {
-  $('#cfg-research-agent').innerHTML = agentOptions(research.agent || '', null);
+  $('#cfg-research-agent').innerHTML = agentOptions(research.agent || '', null, 'deep-research');
   $('#cfg-research-agent').value = research.agent || '';
   $('#cfg-research-model').value = research.model || '';
   $('#cfg-research-pipeline').value = research.pipeline || 'team';
@@ -2373,7 +3033,7 @@ function gatherResearchConfig() {
 }
 
 function fillChatForm(chat) {
-  $('#cfg-chat-agent').innerHTML = agentOptions(chat.agent || '', 'The research agent above');
+  $('#cfg-chat-agent').innerHTML = agentOptions(chat.agent || '', 'The research agent above', 'general');
   $('#cfg-chat-agent').value = chat.agent || '';
   $('#cfg-chat-model').value = chat.model || '';
   $('#cfg-chat-effort').innerHTML = optionList(EFFORT_OPTIONS, chat.effort || 'default');
@@ -2452,7 +3112,6 @@ $('#cfg-research-profile').addEventListener('change', async (event) => {
 $('#cfg-research-agent').addEventListener('change', updateResearchNote);
 $('#cfg-research-pipeline').addEventListener('change', updateResearchNote);
 $('#cfg-research-researchers').addEventListener('input', updateResearchNote);
-$('#cfg-llm-provider').addEventListener('change', refreshResearchAgentOptions);
 
 $('#cfg-profile-card').addEventListener('input', () => { profileDirty = true; });
 $('#cfg-profile-card').addEventListener('change', (event) => {
@@ -2584,49 +3243,116 @@ function renderCfgResult(r) {
   }).join('');
 }
 
-$('#cfg-emb-provider').addEventListener('change', embProviderToggle);
-$('#cfg-llm-provider').addEventListener('change', llmProviderToggle);
-$('#cfg-emb-model').addEventListener('input', updateConfigSummaries);
-$('#cfg-emb-dim').addEventListener('input', updateConfigSummaries);
-$('#cfg-llm-model').addEventListener('input', updateConfigSummaries);
 for (const prefix of ['entity', 'concept', 'document']) {
   $(`#cfg-${prefix}-use`).addEventListener('change', () => routeProviderToggle(prefix));
   $(`#cfg-${prefix}-model`).addEventListener('input', updateConfigSummaries);
 }
 
-$('#cfg-add-connection').addEventListener('click', addConnection);
+$('#stage-flow').addEventListener('click', (event) => {
+  const node = event.target.closest?.('.stage-node');
+  if (!node) return;
+  selectedStage = node.dataset.stage;
+  renderStageFlow();
+});
 
-// Typing edits the draft in place; only a provider change or a removal redraws,
-// so an input never loses focus mid-edit.
-$('#cfg-connections').addEventListener('input', (event) => {
-  const field = event.target.dataset?.field;
-  const card = event.target.closest('.cfg-connection');
-  if (!field || !card) return;
-  connectionDrafts[Number(card.dataset.index)][field] = event.target.value;
-  if (field === 'label') fillRouteOptions();
+$('#cfg-embedding-use').addEventListener('change', (event) => {
+  embeddingUse = event.target.value;
+  $('#cfg-emb-batch').value = activeEmbedding()?.batchSize ?? 32;
+  renderProviders();
   updateConfigSummaries();
 });
 
-$('#cfg-connections').addEventListener('change', (event) => {
-  const card = event.target.closest('.cfg-connection');
-  if (!card || event.target.dataset?.field !== 'provider') return;
-  const draft = connectionDrafts[Number(card.dataset.index)];
-  draft.provider = event.target.value;
-  if (draft.provider !== 'openai') { draft.baseUrl = ''; draft.apiKey = ''; }
-  renderConnections();
+for (const id of ['#cfg-ingest-convert', '#cfg-ingest-concurrency', '#cfg-emb-batch', '#cfg-extraction-concurrency', '#cfg-extraction-batch']) {
+  $(id).addEventListener('input', renderStageFlow);
+}
+
+$('#cfg-add-provider').addEventListener('click', (event) => {
+  showMenuUnder(event.currentTarget, [
+    { label: 'LLM provider', run: addConnection },
+    { label: 'Embedding provider', run: addEmbeddingProvider },
+  ]);
+});
+
+/** The row a DOM event happened in, and the draft object behind it. */
+function rowDraft(target) {
+  const row = target.closest?.('.provider-row');
+  if (!row) return null;
+  const draft = providerDraft(row.dataset.id);
+  return draft ? { row, draft } : null;
+}
+
+// Typing edits the draft in place; only a provider change, a removal or the
+// chevron redraws, so an input never loses focus mid-edit.
+$('#cfg-providers').addEventListener('input', (event) => {
+  const field = event.target.dataset?.field;
+  const found = rowDraft(event.target);
+  if (!field || !found) return;
+  found.draft[field] = field === 'dimensions' ? Number(event.target.value) || undefined : event.target.value;
+  if (field === 'label') {
+    fillRouteOptions();
+    found.row.querySelector('.provider-model').textContent = found.draft.model || 'no model set';
+  }
+  updateConfigSummaries();
+});
+
+$('#cfg-providers').addEventListener('change', (event) => {
+  const found = rowDraft(event.target);
+  if (!found) return;
+  const field = event.target.dataset?.field;
+  if (field === 'sendDimensions') {
+    found.draft.sendDimensions = event.target.checked;
+    return;
+  }
+  if (field !== 'provider') return;
+  found.draft.provider = event.target.value;
+  // the list came from the provider that is no longer selected
+  modelLists.delete(found.row.dataset.kind === 'embedding' ? `embedding:${found.row.dataset.id}` : (found.row.dataset.id === 'default' ? 'llm' : `connection:${found.row.dataset.id}`));
+  // an endpoint that no longer applies would otherwise be saved and tested
+  if (found.row.dataset.kind === 'embedding' && found.draft.provider === 'local') {
+    found.draft.baseUrl = '';
+    found.draft.apiKey = '';
+    found.draft.model = '';
+  } else if (found.row.dataset.kind === 'llm' && found.draft.provider !== 'openai') {
+    found.draft.baseUrl = '';
+    found.draft.apiKey = '';
+  }
+  renderProviders();
   fillRouteOptions();
   updateConfigSummaries();
 });
 
-$('#cfg-connections').addEventListener('click', (event) => {
-  const card = event.target.closest('.cfg-connection');
-  if (!card || !event.target.classList.contains('cfg-conn-remove')) return;
-  const [removed] = connectionDrafts.splice(Number(card.dataset.index), 1);
-  renderConnections();
+$('#cfg-providers').addEventListener('click', (event) => {
+  const row = event.target.closest?.('.provider-row');
+  if (!row) return;
+  const id = row.dataset.id;
+
+  if (event.target.classList.contains('provider-toggle')) {
+    if (expandedProviders.has(id)) expandedProviders.delete(id); else expandedProviders.add(id);
+    renderProviders();
+    return;
+  }
+
+  if (!event.target.classList.contains('provider-remove') || event.target.disabled) return;
+  expandedProviders.delete(id);
+  if (row.dataset.kind === 'embedding') {
+    embeddingDrafts = embeddingDrafts.filter((e) => e.id !== id);
+    // removing the active provider moves Index to the first one left, which
+    // re-embeds on save — say so rather than let the corpus change quietly
+    if (embeddingUse === id && embeddingDrafts[0]) {
+      embeddingUse = embeddingDrafts[0].id;
+      $('#cfg-status').innerHTML = `<div class="cfg-line">Index now runs on ${esc(embeddingDrafts[0].label || embeddingUse)} — saving re-embeds the corpus.</div>`;
+    }
+    renderProviders();
+    updateConfigSummaries();
+    return;
+  }
+
+  connectionDrafts = connectionDrafts.filter((c) => c.id !== id);
+  renderProviders();
   fillRouteOptions();
   // a route pointing at the removed connection falls back to the default
   for (const prefix of ['entity', 'concept', 'document']) {
-    if ($(`#cfg-${prefix}-use`).value === removed.id) $(`#cfg-${prefix}-use`).value = '';
+    if ($(`#cfg-${prefix}-use`).value === id) $(`#cfg-${prefix}-use`).value = '';
     routeProviderToggle(prefix);
   }
 });
@@ -2655,6 +3381,13 @@ $('#btn-cfg-save').addEventListener('click', async () => {
   setConfigBusy(true);
   $('#cfg-status').innerHTML = '<div class="cfg-line">Saving routes… re-embedding if retrieval changed.</div>';
   try {
+    // the agents have to be on disk before the config may name one
+    let agentLine = '';
+    try {
+      await saveAgents();
+    } catch (e) {
+      agentLine = `<div class="cfg-line bad">agents not saved: ${esc(e.message)}</div>`;
+    }
     const r = await api('/api/config', { method: 'PUT', body: JSON.stringify(gatherConfig()) });
     let profileLine = '';
     try {
@@ -2670,7 +3403,7 @@ $('#btn-cfg-save').addEventListener('click', async () => {
     let html = `<div class="cfg-line good"><b>Configuration saved for ${esc(selectedWorkspaceLabel)}</b> · routes applied</div>`;
     if (r.reembedded && r.reindex) html += `<div class="cfg-line">re-embedded: ${r.reindex.indexed} docs · ${r.reindex.chunks} chunks</div>`;
     else if (r.reconverted && r.reindex) html += `<div class="cfg-line">document conversion refreshed: ${r.reindex.indexed} docs · ${r.reindex.errors} errors</div>`;
-    html += profileLine;
+    html += agentLine + profileLine;
     $('#cfg-status').innerHTML = html;
     toast(`configuration saved for ${selectedWorkspaceLabel}`);
     await loadConfigForm({ preserveStatus: true });

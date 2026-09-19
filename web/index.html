@@ -94,15 +94,10 @@
     <header>
       <div class="brand"><img src="/favicon.svg" alt="" />knode-os</div>
       <nav id="tabs" aria-label="Primary navigation">
-        <button data-tab="files" class="active">Files</button>
-        <button data-tab="search">Search</button>
-        <button data-tab="ask">Ask</button>
-        <button data-tab="graph">Graph</button>
-        <button data-tab="wiki">Wiki</button>
-        <button data-tab="chat">Chat</button>
-        <button data-tab="traces">Traces</button>
-        <button data-tab="dream">Dream</button>
-        <button data-tab="settings">Settings</button>
+        <button data-section="library" class="active" title="Files, search, and agent traces">Library</button>
+        <button data-section="ask" title="Quick cited answers, or a working agent">Ask</button>
+        <button data-section="knowledge" title="Graph, wiki, and nightly review">Knowledge</button>
+        <button data-section="settings" title="Model routes and pipeline limits">Settings</button>
       </nav>
       <div id="statsbar" title="documents / chunks / entities / relations"></div>
       <div class="account-area">
@@ -126,6 +121,10 @@
       <span id="context-name">Default</span>
       <span id="context-description">Only you can access this knowledge.</span>
     </div>
+
+    <!-- Second level: the tabs of the selected section, rendered by navigate().
+         A section with one tab renders nothing (#subtabs:empty is hidden). -->
+    <nav id="subtabs" aria-label="Section navigation"></nav>
 
     <main>
     <!-- Files -->
@@ -173,22 +172,38 @@
           <option value="vector">vector</option>
           <option value="keyword">keyword</option>
         </select>
+        <select id="search-scope" title="Limit the search to the folder picked in Files">
+          <option value="">whole base</option>
+        </select>
         <button id="btn-search">search</button>
       </div>
       <div id="search-results"></div>
     </section>
 
-    <!-- Ask -->
+    <!-- Ask: one question, two costs. Quick answers in one retrieval pass
+         (cited, no agent CLI needed); Agent runs the configured CLI over MCP. -->
     <section id="tab-ask" class="tab">
-      <div class="searchbar">
-        <input id="ask-q" placeholder="ask a question — answered from your knowledge base with citations…" />
-        <select id="ask-mode">
-          <option value="hybrid">hybrid</option>
-          <option value="sag">SAG multi-hop</option>
-        </select>
-        <button id="btn-ask">ask</button>
+      <div class="chat-layout">
+        <aside id="chat-side">
+          <button id="btn-chat-new" type="button" class="primary">＋ new question</button>
+          <div id="chat-list"></div>
+        </aside>
+        <div id="chat-main">
+          <div id="chat-thread"><p class="hint">Ask a question. <b>quick</b> answers in one retrieval pass, with citations; <b>agent</b> runs the configured CLI, which can follow leads and write what you teach it.</p></div>
+          <div id="chat-activity" class="chat-activity" hidden></div>
+          <form id="chat-composer" class="chat-composer">
+            <textarea id="chat-input" rows="2" placeholder="ask a question — answered from your knowledge base with citations… Enter sends, Shift+Enter adds a line"></textarea>
+            <div class="chat-composer-actions">
+              <select id="ask-mode" title="Quick answers in one retrieval pass. Agent runs the configured CLI, which can take minutes.">
+                <option value="quick">quick</option>
+                <option value="agent">agent</option>
+              </select>
+              <button id="btn-chat-send" type="submit" class="primary">send</button>
+              <button id="btn-chat-cancel" type="button" hidden>cancel</button>
+            </div>
+          </form>
+        </div>
       </div>
-      <div id="ask-result"></div>
     </section>
 
     <!-- Graph -->
@@ -209,7 +224,7 @@
     <section id="tab-traces" class="tab">
       <div class="searchbar">
         <button id="btn-trace-sync">sync now</button>
-        <span class="hint">Claude Code + Codex session transcripts are mirrored into <span class="mono">raw/traces/</span></span>
+        <span class="hint">Claude Code + Codex session transcripts are mirrored into <span class="mono">raw/traces/</span> — click a row to open it. They feed the nightly dream; turn on <span class="mono">trace.episodes</span> in Settings → Pipeline to make them searchable too.</span>
       </div>
       <table id="traces-table"><thead><tr><th>source</th><th>project</th><th>session</th><th>started</th><th>size</th><th>analyzed</th></tr></thead><tbody></tbody></table>
     </section>
@@ -276,27 +291,6 @@
       </div>
     </section>
 
-    <!-- Chat: talk to the configured agent -->
-    <section id="tab-chat" class="tab">
-      <div class="chat-layout">
-        <aside id="chat-side">
-          <button id="btn-chat-new" type="button" class="primary">＋ new chat</button>
-          <div id="chat-list"></div>
-        </aside>
-        <div id="chat-main">
-          <div id="chat-thread"><p class="hint">Ask about the knowledge base, or teach it something — what you teach is written as a quarantined note you can adopt.</p></div>
-          <div id="chat-activity" class="chat-activity" hidden></div>
-          <form id="chat-composer" class="chat-composer">
-            <textarea id="chat-input" rows="2" placeholder="ask a question, or “记住：…” to teach the knowledge base — Enter sends, Shift+Enter adds a line"></textarea>
-            <div class="chat-composer-actions">
-              <button id="btn-chat-send" type="submit" class="primary">send</button>
-              <button id="btn-chat-cancel" type="button" hidden>cancel</button>
-            </div>
-          </form>
-        </div>
-      </div>
-    </section>
-
     <!-- Settings -->
     <section id="tab-settings" class="tab">
       <div class="settings-wrap">
@@ -305,137 +299,124 @@
           <div class="cfg-actions"><button id="btn-cfg-test">Test stages</button><button id="btn-cfg-save" class="primary">Save &amp; apply</button></div>
         </div>
 
-        <div class="route-summary" aria-label="Pipeline stages">
-          <div><span>CONVERT</span><b id="summary-document">Loading…</b><small>Images &amp; scanned PDFs</small></div>
-          <div><span>INDEX</span><b id="summary-embedding">Loading…</b><small>Embedding</small></div>
-          <div><span>EXTRACT</span><b id="summary-entity">Loading…</b><small>Entities &amp; relations</small></div>
-          <div><span>SYNTHESIZE</span><b id="summary-concept">Loading…</b><small>Concept pages</small></div>
-          <div><span>ANSWER</span><b id="summary-default-llm">Loading…</b><small>Ask, Wiki &amp; Dream</small></div>
-        </div>
-
-        <section class="settings-section" aria-labelledby="providers-title">
+        <section class="settings-section" data-subtab="providers" aria-labelledby="providers-title">
           <div class="settings-section-head"><div><p class="section-index">01 · PROVIDERS</p><h3 id="providers-title">Endpoints and credentials</h3><p>Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice.</p></div><span class="section-badge">Configure once</span></div>
 
-          <div class="cfg-card-title"><div><b>Embedding provider</b><small>One per workspace — the Index stage always uses it.</small></div><span class="section-badge">Required</span></div>
-          <fieldset class="cfg-card cfg-card-wide">
-            <div class="cfg-grid cfg-grid-2">
-              <label>Provider<select id="cfg-emb-provider"><option value="local">Local hashing · offline</option><option value="openai">OpenAI-compatible API</option><option value="ark-multimodal">Volcengine Ark · multimodal</option></select></label>
-              <label>Model<input id="cfg-emb-model" placeholder="text-embedding-3-small" /></label>
-              <label class="cfg-span-2">Base URL<input id="cfg-emb-baseurl" placeholder="https://api.openai.com/v1" /></label>
-              <label>API key<input id="cfg-emb-key" placeholder="env:OPENAI_API_KEY" /></label>
-              <label>Dimensions<input id="cfg-emb-dim" type="number" min="1" step="1" placeholder="1536" /></label>
+          <div class="provider-table">
+            <div class="provider-head">
+              <span></span><span>kind</span><span>name</span><span></span><span>provider</span><span>model</span>
+              <button type="button" id="cfg-add-provider" class="ghost">＋ Add provider</button>
             </div>
-            <label class="cfg-check"><input id="cfg-emb-senddim" type="checkbox" /> Send the <span class="mono">dimensions</span> parameter with API requests</label>
-            <p class="cfg-callout" id="cfg-emb-note">The local provider is private and ready immediately. Switching model or dimensions re-embeds the corpus after saving.</p>
-          </fieldset>
-
-          <div class="cfg-card-title"><div><b>Default LLM provider</b><small>What a stage runs on unless it picks another connection, and what answers Ask, Wiki and Dream.</small></div><span class="section-badge accent2">Default</span></div>
-          <fieldset class="cfg-card cfg-card-wide">
-            <div class="cfg-grid cfg-grid-2">
-              <label>Provider<select id="cfg-llm-provider"><option value="openai">OpenAI-compatible API</option><option value="codex-cli">Codex CLI</option><option value="claude-cli">Claude Code CLI</option><option value="cursor-cli">Cursor Agent CLI</option></select></label>
-              <label>Model<input id="cfg-llm-model" placeholder="gpt-4.1-mini or provider default" /></label>
-              <label class="cfg-span-2 cfg-llm-api">Base URL<input id="cfg-llm-baseurl" placeholder="https://api.openai.com/v1" /></label>
-              <label class="cfg-llm-api">API key<input id="cfg-llm-key" placeholder="env:OPENAI_API_KEY" /></label>
-              <label class="cfg-llm-cli">CLI executable<input id="cfg-llm-clipath" placeholder="Use command from PATH" /></label>
-            </div>
-            <p class="cfg-callout" id="cfg-llm-note"></p>
-          </fieldset>
-
-          <div class="cfg-connections-head">
-            <div><b>Other connections</b><small>Add one when a stage needs a different endpoint — a vision-capable API, a cheaper model, a second key.</small></div>
-            <button type="button" id="cfg-add-connection" class="ghost">Add connection</button>
+            <div id="cfg-providers"></div>
           </div>
-          <div id="cfg-connections" class="cfg-connections"></div>
         </section>
 
-        <section class="settings-section" aria-labelledby="pipeline-title">
+        <section class="settings-section" data-subtab="pipeline" aria-labelledby="pipeline-title">
           <div class="settings-section-head"><div><p class="section-index">02 · PIPELINE</p><h3 id="pipeline-title">What each stage needs</h3><p>A document moves down this list. The stages ask different things of a model, which is why each one can run somewhere else.</p></div><span class="section-badge accent2">Per stage</span></div>
 
-          <div class="stage-list">
-            <div class="stage-row" data-route="document">
-              <span class="stage-step">1</span>
-              <div class="stage-body">
-                <div class="stage-title"><h4>Convert</h4><span class="section-badge accent2">Vision</span></div>
-                <p>Images and scanned PDF pages become searchable Markdown.</p>
-                <p class="stage-req">The model has to see pixels: an API provider gets the image inline, codex takes <span class="mono">--image</span>, and claude and cursor read the file with their own tools. A text-only model fails here. Changing this re-converts every image and scanned page.</p>
+          <div class="stage-board">
+            <div id="stage-flow" class="stage-flow"></div>
+            <div class="stage-inspector">
+              <div class="stage-panel" data-stage="document">
+                <div class="stage-panel-copy">
+                  <div class="stage-title"><h4>Convert</h4><span class="section-badge accent2">Vision</span></div>
+                  <p>Images and scanned PDF pages become searchable Markdown.</p>
+                  <p class="stage-req">The model has to see pixels: an API provider gets the image inline, codex takes <span class="mono">--image</span>, and claude and cursor read the file with their own tools. A text-only model fails here. Changing this re-converts every image and scanned page.</p>
+                  <div class="stage-rates">
+                    <label>Parallel conversions<input id="cfg-ingest-convert" type="number" min="1" max="16" step="1" /></label>
+                  </div>
+                </div>
+                <div class="stage-control">
+                  <label>Run with<select id="cfg-document-use" class="cfg-route-use"></select></label>
+                  <label>Model<span class="model-field"><input id="cfg-document-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="documentLlm" title="List the models this provider offers">⌄</button></span></label>
+                  <p class="route-note" id="cfg-document-note"></p>
+                </div>
               </div>
-              <div class="stage-control">
-                <label>Run with<select id="cfg-document-use" class="cfg-route-use"></select></label>
-                <label>Model<input id="cfg-document-model" placeholder="Optional · use its model" /></label>
-                <p class="route-note" id="cfg-document-note"></p>
+
+              <div class="stage-panel" data-stage="index" hidden>
+                <div class="stage-panel-copy">
+                  <div class="stage-title"><h4>Index</h4><span class="section-badge">Embedding</span></div>
+                  <p>Every chunk becomes a vector for semantic and hybrid recall.</p>
+                  <p class="stage-req">Not an LLM — it uses one of the embedding providers from section 01. Changing which one, or its model or dimensions, re-embeds the whole corpus.</p>
+                  <div class="stage-rates">
+                    <label>Parallel documents<input id="cfg-ingest-concurrency" type="number" min="1" max="32" step="1" /></label>
+                    <label>Texts per request<input id="cfg-emb-batch" type="number" min="1" max="256" step="1" /></label>
+                  </div>
+                </div>
+                <div class="stage-control">
+                  <label>Run with<select id="cfg-embedding-use"></select></label>
+                  <p class="route-note">One provider at a time — vectors from two models are not comparable. Switching re-embeds the whole corpus when you save.</p>
+                </div>
+              </div>
+
+              <div class="stage-panel" data-stage="entity" hidden>
+                <div class="stage-panel-copy">
+                  <div class="stage-title"><h4>Extract</h4><span class="section-badge accent2">Volume</span></div>
+                  <p>Names entities, relations and factual claims in changed documents.</p>
+                  <p class="stage-req">The busiest stage — it runs on every changed document, bounded by the daily budget and the batch size here. A fast, cheap model that returns clean JSON is usually the right trade.</p>
+                  <div class="stage-rates">
+                    <label>Parallel calls<input id="cfg-extraction-concurrency" type="number" min="1" step="1" /></label>
+                    <label>Documents per pass<input id="cfg-extraction-batch" type="number" min="1" step="1" /></label>
+                  </div>
+                  <label class="cfg-check"><input id="cfg-extraction-claims" type="checkbox" /> Extract factual claims alongside entities</label>
+                </div>
+                <div class="stage-control">
+                  <label>Run with<select id="cfg-entity-use" class="cfg-route-use"></select></label>
+                  <label>Model<span class="model-field"><input id="cfg-entity-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="entityLlm" title="List the models this provider offers">⌄</button></span></label>
+                  <p class="route-note" id="cfg-entity-note"></p>
+                </div>
+              </div>
+
+              <div class="stage-panel" data-stage="concept" hidden>
+                <div class="stage-panel-copy">
+                  <div class="stage-title"><h4>Synthesize</h4><span class="section-badge accent2">Quality</span></div>
+                  <p>Turns hot entity clusters into readable, linked Concept pages.</p>
+                  <p class="stage-req">Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.</p>
+                </div>
+                <div class="stage-control">
+                  <label>Run with<select id="cfg-concept-use" class="cfg-route-use"></select></label>
+                  <label>Model<span class="model-field"><input id="cfg-concept-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="conceptLlm" title="List the models this provider offers">⌄</button></span></label>
+                  <p class="route-note" id="cfg-concept-note"></p>
+                </div>
+              </div>
+
+              <div class="stage-panel" data-stage="answer" hidden>
+                <div class="stage-panel-copy">
+                  <div class="stage-title"><h4>Answer</h4><span class="section-badge accent2">Interactive</span></div>
+                  <p>Ask, wiki summaries and the nightly Dream analysis.</p>
+                  <p class="stage-req">Always the default provider. Latency lands straight in the Ask box, so prefer something responsive.</p>
+                </div>
+                <div class="stage-control stage-pin">
+                  <span class="stage-pin-label">Runs on</span>
+                  <b id="pin-answer">Loading…</b>
+                  <small>Set in section 01 · Default LLM provider</small>
+                </div>
               </div>
             </div>
 
-            <div class="stage-row">
-              <span class="stage-step accent">2</span>
-              <div class="stage-body">
-                <div class="stage-title"><h4>Index</h4><span class="section-badge">Embedding</span></div>
-                <p>Every chunk becomes a vector for semantic and hybrid recall.</p>
-                <p class="stage-req">Not an LLM — it uses the embedding provider from section 01, one per workspace. Changing its model or dimensions re-embeds the whole corpus.</p>
-              </div>
-              <div class="stage-control stage-pin">
-                <span class="stage-pin-label">Runs on</span>
-                <b id="pin-index">Loading…</b>
-                <small>Set in section 01 · Embedding provider</small>
-              </div>
+            <div class="stage-budget">
+              <div><b>Daily token budget</b><p>Shared by Extract and Synthesize — the two stages that run in the background.</p></div>
+              <input id="cfg-extraction-budget" type="number" min="0" step="1000" />
             </div>
-
-            <div class="stage-row" data-route="entity">
-              <span class="stage-step">3</span>
-              <div class="stage-body">
-                <div class="stage-title"><h4>Extract</h4><span class="section-badge accent2">Volume</span></div>
-                <p>Names entities, relations and factual claims in changed documents.</p>
-                <p class="stage-req">The busiest stage — it runs on every changed document, bounded by the daily budget and batch size below. A fast, cheap model that returns clean JSON is usually the right trade.</p>
-              </div>
-              <div class="stage-control">
-                <label>Run with<select id="cfg-entity-use" class="cfg-route-use"></select></label>
-                <label>Model<input id="cfg-entity-model" placeholder="Optional · use its model" /></label>
-                <p class="route-note" id="cfg-entity-note"></p>
-              </div>
-            </div>
-
-            <div class="stage-row" data-route="concept">
-              <span class="stage-step">4</span>
-              <div class="stage-body">
-                <div class="stage-title"><h4>Synthesize</h4><span class="section-badge accent2">Quality</span></div>
-                <p>Turns hot entity clusters into readable, linked Concept pages.</p>
-                <p class="stage-req">Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.</p>
-              </div>
-              <div class="stage-control">
-                <label>Run with<select id="cfg-concept-use" class="cfg-route-use"></select></label>
-                <label>Model<input id="cfg-concept-model" placeholder="Optional · use its model" /></label>
-                <p class="route-note" id="cfg-concept-note"></p>
-              </div>
-            </div>
-
-            <div class="stage-row">
-              <span class="stage-step">5</span>
-              <div class="stage-body">
-                <div class="stage-title"><h4>Answer</h4><span class="section-badge accent2">Interactive</span></div>
-                <p>Ask, wiki summaries and the nightly Dream analysis.</p>
-                <p class="stage-req">Always the default provider. Latency lands straight in the Ask box, so prefer something responsive.</p>
-              </div>
-              <div class="stage-control stage-pin">
-                <span class="stage-pin-label">Runs on</span>
-                <b id="pin-answer">Loading…</b>
-                <small>Set in section 01 · Default LLM provider</small>
-              </div>
-            </div>
-          </div>
-
-          <div class="pipeline-controls">
-            <div><h4>Pipeline controls</h4><p>Bound background work without changing the selected models.</p></div>
-            <label>Daily token budget<input id="cfg-extraction-budget" type="number" min="0" step="1000" /></label>
-            <label>Documents per pass<input id="cfg-extraction-batch" type="number" min="1" step="1" /></label>
-            <label>Parallel calls<input id="cfg-extraction-concurrency" type="number" min="1" step="1" /></label>
-            <label class="cfg-check"><input id="cfg-extraction-claims" type="checkbox" /> Extract factual claims alongside entities</label>
           </div>
         </section>
 
-        <section class="settings-section" aria-labelledby="research-title">
-          <div class="settings-section-head"><div><p class="section-index">03 · DEEP RESEARCH</p><h3 id="research-title">Who writes the wiki, and how hard they think</h3><p>An agent researches a topic through the MCP endpoint and writes the page — either a coding-agent CLI on this machine, or the built-in agent running on an OpenAI-compatible connection. A profile sets the reasoning effort, web access and verification bar, and lists the sub-agents — each with its own CLI, model, tools and prompt.</p></div><span class="section-badge">Agents</span></div>
+        <section class="settings-section" data-subtab="agents" aria-labelledby="agents-title">
+          <div class="settings-section-head"><div><p class="section-index">03 · AGENTS</p><h3 id="agents-title">Who does the work</h3><p>An agent is an executor with a name: a coding-agent CLI on this machine, or an OpenAI-compatible connection running the built-in deep agent. Research and Ask below point at one.</p></div><span class="section-badge accent2">Add agent</span></div>
 
-          <div class="cfg-card-title"><div><b>Research agent</b><small>Which agent runs jobs, how many at once, and which profile it follows. Roles below may override the agent per phase.</small></div><span class="section-badge accent2">Runner</span></div>
+          <div class="provider-table">
+            <div class="provider-head">
+              <span></span><span>kind</span><span>name</span><span></span><span>runs on</span><span>model</span>
+              <button type="button" id="cfg-add-agent" class="ghost">＋ Add agent</button>
+            </div>
+            <div id="cfg-agents"></div>
+          </div>
+        </section>
+
+        <section class="settings-section" data-subtab="research" aria-labelledby="research-title">
+          <div class="settings-section-head"><div><p class="section-index">04 · RESEARCH</p><h3 id="research-title">How the wiki gets written</h3><p>What initialization does, how Ask's Agent mode behaves, and how a deep-research job runs: which agent from section 03 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents.</p></div><span class="section-badge accent2">Pipeline</span></div>
+
+          <div class="cfg-card-title"><div><b>Deep research pipeline</b><small>Which agent runs jobs, how many at once, and which profile it follows. Roles below may override the agent per phase.</small></div><span class="section-badge accent2">Runner</span></div>
           <fieldset class="cfg-card cfg-card-wide">
             <div class="cfg-grid cfg-grid-3">
               <label>Agent<select id="cfg-research-agent"></select></label>
@@ -461,7 +442,7 @@
             </div>
           </fieldset>
 
-          <div class="cfg-card-title"><div><b>Chat</b><small>The Chat tab uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note.</small></div><span class="section-badge accent2">Chat</span></div>
+          <div class="cfg-card-title"><div><b>Ask · Agent mode</b><small>Ask's Agent mode uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note. Quick mode needs none of this — it answers from retrieval.</small></div><span class="section-badge accent2">Ask</span></div>
           <fieldset class="cfg-card cfg-card-wide">
             <div class="cfg-grid cfg-grid-3">
               <label>Agent<select id="cfg-chat-agent"></select></label>
@@ -507,7 +488,7 @@
 
         <div id="cfg-status" aria-live="polite"></div>
 
-        <section class="settings-section danger-zone" aria-labelledby="clear-workspace-title">
+        <section class="settings-section danger-zone" data-subtab="workspace" aria-labelledby="clear-workspace-title">
           <div>
             <p class="section-index">DANGER ZONE</p>
             <h3 id="clear-workspace-title">Clear <span id="clear-workspace-name">this workspace</span></h3>

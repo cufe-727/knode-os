@@ -63,6 +63,10 @@ describe('upgrading early desktop databases', () => {
       ]);
       expect(await store.query(`SELECT scope_id, tx_from, tx_to FROM datasets`)).toEqual([]);
       expect(await store.query(`SELECT * FROM receipts`)).toEqual([]);
+      // v10: a chat message carries what a quick (retrieval) answer knows about itself
+      await store.query(`INSERT INTO chat_conversations (id) VALUES ('c_x')`);
+      await store.query(`INSERT INTO chat_messages (id, conversation_id, seq, role, content) VALUES ('m_x', 'c_x', 1, 'user', 'hi')`);
+      expect(await store.query(`SELECT payload FROM chat_messages WHERE id = 'm_x'`)).toEqual([{ payload: {} }]);
     } finally {
       await store.close();
     }

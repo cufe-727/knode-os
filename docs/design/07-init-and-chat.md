@@ -93,7 +93,7 @@ templates. `renderSurvey` turns it into the brief's `## 知识库概况`; the in
 | Table | What it holds |
 | --- | --- |
 | `chat_conversations` | id / title / agent / model / status (`idle`\|`running`) / created_by / payload |
-| `chat_messages` | conversation_id + seq unique; role, content, events (jsonb), turns, cost_usd, error |
+| `chat_messages` | conversation_id + seq unique; role, content, events (jsonb), payload (jsonb, v10), turns, cost_usd, error |
 
 One turn is one agent session — a headless CLI, or the built-in agent in the `serve` process — whose cwd is `.runs/chat/<conversation>/` (the schema files are rewritten
 every turn, so protocol and guide edits apply at once). The prompt comes from `playbooks/chat/turn.md`: the
@@ -107,6 +107,34 @@ the files the reply marked with `<!-- knode:wrote <path> -->`.
 - **Teaching**: the protocol asks the agent to confirm its understanding, then `knode_write` the note and
   `knode_sync only:[path]`, and to say that it is quarantined.
 - **Web**: `chatWebAllowed` only narrows or widens *within* what `review.external` allows, never past it.
+
+### 4.1 Merged with Ask (2026-09-19)
+
+Ask (`POST /api/ask` — one retrieval pass and one LLM call, stateless) and Chat used to be two top-level
+entries, but to a person they are the same intent at two costs. The UI now has one **Ask**, with the mode
+switch beside the composer:
+
+| | Quick | Agent |
+| --- | --- | --- |
+| How it answers | `ask()` (`src/search/ask.ts`): one retrieval pass, one LLM call | one agent CLI session over MCP |
+| The route returns | **200**, with the reply already written — nothing to poll | 202, then poll `…/status` |
+| What it needs | nothing — **no MCP endpoint, no agent CLI installed** | both, or it answers 503 |
+| How a reply describes itself | `payload`: citations / gaps / facts | `events`: tool-activity chips |
+| Can it write | no | yes (a quarantined note you can adopt) |
+
+- **Where the mode lives**: per conversation in `chat_conversations.payload.mode` (that column already
+  existed); per reply in the new `chat_messages.payload` (**migration v10**). `contexts` are deliberately not
+  stored — whole chunks are large and re-derivable.
+- **The route**: `POST …/messages` takes an optional `mode` (default `agent`, so older clients are unchanged).
+  The quick branch returns *before* the two 503 gates, which is what makes Ask work on a machine with no
+  coding agent installed. It lives in `src/chat/quick.ts`.
+- **One question, one conversation**: each quick ask starts its own, so the list reads as a history of
+  questions; "dig deeper with the agent" re-asks the same question in a fresh agent conversation. A mode never
+  changes what an existing thread means.
+- **`POST /api/ask` is untouched**: MCP's `knode_ask` and the CLI depend on it, and `quick.ts` calls it.
+- **Config keys are untouched**: still `chat.*` in `knode.config.json` (renaming them would rewrite users'
+  config files); only the UI copy became "Ask · Agent mode". `chat.keep` rose from 50 to 200 — one
+  conversation per question fills 50 in about a day.
 
 ## 5. Runner improvements
 

@@ -22,14 +22,16 @@ struct TracesView: View {
             HStack(spacing: 10) {
                 Button { Task { await sync() } } label: {
                     if isSyncing { ProgressView().controlSize(.small) }
-                    else { Label("Sync now", systemImage: "arrow.triangle.2.circlepath") }
+                    else { Label(L("Sync now"), systemImage: "arrow.triangle.2.circlepath") }
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.knodeCyan)
                 .disabled(isSyncing)
-                Text(L("Claude Code and Codex transcripts are mirrored into raw/traces/"))
+                Text(L("Mirrored into raw/traces/ — click a row to open one. They feed the nightly dream; turn on trace.episodes in Settings → Pipeline to make them searchable too."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 TextField(L("Filter traces"), text: $filter)
                     .textFieldStyle(.roundedBorder)
@@ -44,13 +46,13 @@ struct TracesView: View {
             Divider()
 
             if isLoading && traces.isEmpty {
-                ProgressView("Loading traces…")
+                ProgressView(L("Loading traces…"))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if filtered.isEmpty {
                 EmptyState(
                     symbol: "terminal",
-                    title: traces.isEmpty ? "No traces yet" : "No matching traces",
-                    message: traces.isEmpty ? "Run a Claude Code or Codex session, then sync it into this workspace." : "Try another project, source, or session ID."
+                    title: traces.isEmpty ? L("No traces yet") : L("No matching traces"),
+                    message: traces.isEmpty ? L("Run a Claude Code or Codex session, then sync it into this workspace.") : L("Try another project, source, or session ID.")
                 )
             } else {
                 VStack(spacing: 0) {
@@ -59,7 +61,10 @@ struct TracesView: View {
                     ScrollView {
                         LazyVStack(spacing: 0) {
                             ForEach(filtered) { trace in
+                                // a trace is a file under raw/, so it opens where every other file does
                                 TraceDataRow(trace: trace)
+                                    .onTapGesture { model.openFile(trace.path) }
+                                    .help(L("Open %@", trace.path))
                                 Divider().padding(.leading, 16)
                             }
                         }

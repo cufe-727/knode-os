@@ -40,7 +40,7 @@ struct KnowledgeGraphView: View {
                     title: L("The graph is empty"),
                     message: L("Index documents with wikilinks or configure entity extraction to create nodes and relations."),
                     actionTitle: L("Go to Files"),
-                    action: { model.selectedSection = .files }
+                    action: { model.select(.files) }
                 )
             }
         }

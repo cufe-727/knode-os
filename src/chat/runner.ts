@@ -55,10 +55,10 @@ const key = (ctx: AppContext, conversationId: string) => `${ctx.dataDir}::${conv
 const jobIdOf = (conversationId: string) => `chat:${conversationId}`;
 
 /** Which CLI answers chat: chat.agent (connection id / provider), else the research agent; chat.model overrides. */
-export function resolveChatAgent(config: KnodeConfig): ResearchAgent | null {
+export function resolveChatAgent(config: KnodeConfig, dataDir?: string): ResearchAgent | null {
   const chat = config.chat;
-  if (chat?.agent?.trim()) return agentForSpec(config, chat.agent, chat.model);
-  const base = resolveResearchAgent(config);
+  if (chat?.agent?.trim()) return agentForSpec(config, chat.agent, chat.model, dataDir);
+  const base = resolveResearchAgent(config, dataDir);
   if (!base) return null;
   return withModel(base, chat?.model ?? '');
 }
@@ -171,7 +171,7 @@ export async function startChatTurn(ctx: AppContext, conversationId: string, tex
   try {
     const existing = await getConversation(ctx.store, conversationId);
     if (!existing) throw new Error(`no conversation ${conversationId}`);
-    const resolved = opts.agent ?? resolveChatAgent(ctx.config);
+    const resolved = opts.agent ?? resolveChatAgent(ctx.config, ctx.dataDir);
     if (!resolved) throw new Error(`no chat agent configured: set chat.agent or research.agent to a CLI (claude-cli / codex-cli / cursor-cli), a connection id, or 'default' to run the built-in agent on the default LLM connection`);
     agent = resolved;
     const content = text.trim();

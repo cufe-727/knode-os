@@ -26,7 +26,7 @@ import { renderCapabilityDts } from '../capability/dts.js';
 import { listCapabilities, locatorsForEntities } from '../capability/store.js';
 import { queryClaims } from '../store/claims.js';
 import { CATALOG_SOURCE, CATALOG_VIEWS, catalogQuery } from '../store/catalog.js';
-import { resolveScopeFilter, resolveTemporal } from '../store/resolver.js';
+import { resolveScopeFilter, resolveTemporal, SOURCE_KINDS } from '../store/resolver.js';
 import { listDatasets, listSuggestions } from '../store/queries.js';
 import { validateOkfBundle } from '../okf/index.js';
 import { cancelJob, getJob, listJobs, queueJob } from '../research/jobs.js';
@@ -45,8 +45,8 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
   const asOfSchema = z.string().optional().describe('System time (ISO 8601): answer from what the knowledge base contained at that instant');
   const validAtSchema = z.string().optional().describe('World time (ISO 8601): only claims whose validity window contains this instant');
   const validRangeSchema = z.string().optional().describe('World time window instead of an instant: "2026-01-01..2026-06-30", "2026-08" (that month), "2026" (that year), or "2026-03-01.." (open ended). Mutually exclusive with valid_at.');
-  const kindsSchema = z.array(z.enum(['doc', 'wiki', 'view', 'skill'])).optional()
-    .describe('Restrict to source kinds: doc = raw/docs, wiki = human-written wiki prose, view = generated wiki page, skill = raw/skills');
+  const kindsSchema = z.array(z.enum(SOURCE_KINDS)).optional()
+    .describe('Restrict to source kinds: doc = raw/docs, wiki = human-written wiki prose, view = generated wiki page, skill = raw/skills, trace = raw/traces (only present when trace.episodes is on)');
   const sourcesSchema = z.array(z.string()).optional()
     .describe('Restrict to path prefixes, e.g. ["raw/docs/reports"]');
   const freshnessSchema = z.string().optional().describe('Max age of live/federated reads: "30s", "15m", "2h", "7d". Cached probe answers older than this are re-run.');
