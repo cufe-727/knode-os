@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,13 +13,26 @@ import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
  * wholesale when no Postgres is reachable, so the suite still runs on a machine
  * (or CI box) that only has the embedded PGlite path.
  */
+
+/**
+ * One throwaway database per run, never a fixed name. Two runs can overlap on
+ * the same server — a second `vitest run` started while the first is finishing,
+ * a watcher, a second checkout or worktree — and a shared name makes them share
+ * state: one run's `DROP DATABASE ... WITH (FORCE)` lands while the other is
+ * still opening stores, and that run fails with `database "..." does not exist`.
+ * The seconds stamp in the name is what lets a later run tell an abandoned
+ * database from a live one (see the sweep below).
+ */
+const DB_PREFIX = 'knode_backend_test_';
+const runDatabase = `${DB_PREFIX}${Math.floor(Date.now() / 1000)}_${crypto.randomBytes(4).toString('hex')}`;
+
 const dbConfig: DatabaseConfig = {
   kind: 'postgres',
   host: process.env.KNODE_TEST_PG_HOST ?? '127.0.0.1',
   port: Number(process.env.KNODE_TEST_PG_PORT ?? 5432),
   user: process.env.KNODE_TEST_PG_USER ?? os.userInfo().username,
   password: process.env.KNODE_TEST_PG_PASSWORD ?? '',
-  database: 'knode_backend_test',
+  database: runDatabase,
   schemaPrefix: 'ws_test',
 };
 
@@ -56,6 +70,27 @@ function workspaceDir(): string {
   return dir;
 }
 
+/** A run interrupted before its afterAll leaves its database behind; clear those out. */
+const STALE_AFTER_SECONDS = 3600;
+
+async function dropAbandonedDatabases(pool: pg.Pool): Promise<void> {
+  const cutoff = Math.floor(Date.now() / 1000) - STALE_AFTER_SECONDS;
+  // Nobody connected is not enough on its own: a live run sits with zero
+  // connections between two `Store.open` calls. The age is what makes this
+  // safe, since a run still going carries a name minutes old at most.
+  const { rows } = await pool.query<{ datname: string }>(
+    `SELECT d.datname FROM pg_database d
+      WHERE NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)`,
+  );
+  for (const { datname } of rows) {
+    if (!datname.startsWith(DB_PREFIX)) continue;
+    const stamp = Number(datname.slice(DB_PREFIX.length).split('_')[0]);
+    if (!Number.isFinite(stamp) || stamp > cutoff) continue;
+    // A leftover another user owns is not ours to drop; skip it quietly.
+    await pool.query(`DROP DATABASE IF EXISTS "${datname}" WITH (FORCE)`).catch(() => {});
+  }
+}
+
 afterAll(async () => {
   for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
   if (!ready) return;
@@ -64,6 +99,7 @@ afterAll(async () => {
   const pool = adminPool();
   try {
     await pool.query(`DROP DATABASE IF EXISTS "${dbConfig.database}" WITH (FORCE)`);
+    await dropAbandonedDatabases(pool);
   } finally {
     await pool.end().catch(() => {});
   }
