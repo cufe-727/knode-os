@@ -80,6 +80,24 @@ export type LlmProvider = 'openai' | 'codex-cli' | 'claude-cli' | 'cursor-cli';
 export const LLM_EFFORTS = ['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type LlmEffort = (typeof LLM_EFFORTS)[number];
 
+/**
+ * Which wire an OpenAI-compatible endpoint is spoken to on.
+ *
+ * 'auto'      = prefer `/responses`, fall back to `/chat/completions` when the
+ *               endpoint has no such route. Reasoning models return their
+ *               thinking as a first-class output item on the Responses API and
+ *               as a non-standard `message.reasoning_content` on Chat
+ *               Completions, so preferring Responses loses less.
+ * 'responses' = pin the Responses API; a missing route is an error, not a
+ *               silent downgrade.
+ * 'chat'      = pin Chat Completions, for an endpoint that answers `/responses`
+ *               with a lossy shim, or to skip the one-request probe.
+ *
+ * CLI providers ignore it: they are processes, not endpoints.
+ */
+export const LLM_PROTOCOLS = ['auto', 'responses', 'chat'] as const;
+export type LlmProtocol = (typeof LLM_PROTOCOLS)[number];
+
 export interface LlmConfig {
   /**
    * 'openai'     = any OpenAI-compatible /v1/chat/completions endpoint (needs baseUrl/apiKey);
@@ -92,6 +110,11 @@ export interface LlmConfig {
   baseUrl: string;
   /** Ignored by CLI providers. */
   apiKey: string;
+  /**
+   * Which wire to speak to an OpenAI-compatible endpoint on. Absent = 'auto'.
+   * Ignored by CLI providers.
+   */
+  protocol?: LlmProtocol;
   /**
    * openai: empty model disables LLM features (graph falls back to heuristics).
    * CLI providers: empty = the CLI's own default model; otherwise passed as --model.
@@ -543,6 +566,7 @@ export function defaultConfig(): KnodeConfig {
       provider: 'openai',
       baseUrl: 'https://api.openai.com/v1',
       apiKey: 'env:OPENAI_API_KEY',
+      protocol: 'auto',
       model: '',
       cliPath: '',
       effort: 'default',
@@ -634,6 +658,7 @@ export function defaultRoutedLlmConfig(): RoutedLlmConfig {
     provider: 'inherit',
     baseUrl: '',
     apiKey: '',
+    protocol: 'auto',
     model: '',
     cliPath: '',
     effort: 'default',
@@ -662,6 +687,9 @@ export function resolveRoutedLlmConfig(
       provider: connection.provider,
       baseUrl: connection.baseUrl,
       apiKey: connection.apiKey,
+      // the wire belongs to the endpoint, so a route rides the connection's
+      // choice rather than overriding it
+      protocol: connection.protocol,
       model: route.model || connection.model,
       cliPath: connection.cliPath,
       effort: routeEffort(route.effort) ?? connection.effort,
@@ -677,6 +705,9 @@ export function resolveRoutedLlmConfig(
     provider,
     baseUrl: route.baseUrl || base.baseUrl,
     apiKey: route.apiKey || base.apiKey,
+    // a route that brings its own endpoint brings its own wire; one that
+    // inherits the endpoint inherits the wire with it
+    protocol: (route.baseUrl ? route.protocol : undefined) ?? base.protocol,
     model: route.model || legacyModel || (inheritedProvider ? base.model : ''),
     cliPath: route.cliPath || (provider === base.provider ? base.cliPath : ''),
     effort: routeEffort(route.effort) ?? base.effort,

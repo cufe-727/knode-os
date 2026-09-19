@@ -1,4 +1,4 @@
-import { KnodeConfig, LlmConfig } from '../config.js';
+import { KnodeConfig, LlmConfig, LlmProtocol } from '../config.js';
 import { executorForAgent } from './agents.js';
 
 /** The coding-agent CLIs a session can be launched on. */
@@ -27,6 +27,8 @@ export interface BuiltinAgent {
   baseUrl: string;
   /** Kept in its raw `env:VAR` form; resolved inside the executor, never logged. */
   apiKey: string;
+  /** Which wire to speak on. Absent = 'auto' (prefer Responses, fall back). */
+  protocol?: LlmProtocol;
   model: string;
 }
 
@@ -56,7 +58,7 @@ function fromLlm(cfg: LlmConfig, model: string): ResearchAgent | null {
     // makes that a visible "not configured" rather than a queue that stalls
     const chosen = model || cfg.model;
     if (!chosen || !cfg.baseUrl) return null;
-    return { kind: 'builtin', provider: BUILTIN_AGENT, baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: chosen };
+    return { kind: 'builtin', provider: BUILTIN_AGENT, baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, protocol: cfg.protocol, model: chosen };
   }
   return null;
 }

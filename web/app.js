@@ -2233,7 +2233,7 @@ const EMB_NOTES = {
 };
 
 const LLM_NOTES = {
-  openai: 'Any OpenAI-compatible chat endpoint works. An empty model disables the general LLM features; the deterministic pipeline keeps running.',
+  openai: 'Any OpenAI-compatible endpoint works. Auto prefers the Responses API and falls back to Chat Completions when the endpoint has no such route — reasoning models lose less that way. An empty model disables the general LLM features; the deterministic pipeline keeps running.',
   'codex-cli': 'Uses your existing Codex login for a read-only one-shot request.',
   'claude-cli': 'Uses your existing Claude Code login for one non-interactive turn.',
   'cursor-cli': 'Uses your existing Cursor Agent login in headless print mode.',
@@ -2407,7 +2407,8 @@ function llmFields(entry, route) {
       <label>Provider<select data-field="provider">${optionsFor(PROVIDER_OPTIONS.map((p) => [p, providerNames[p] ?? p]), entry.provider)}</select></label>
       <label>Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="${api ? 'gpt-4.1-mini' : 'Use CLI default'}" />${modelChevron(route)}</span></label>
       ${api ? `<label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1" /></label>
-      <label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY" /></label>`
+      <label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY" /></label>
+      <label>Protocol<select data-field="protocol">${optionList(PROTOCOL_OPTIONS, entry.protocol || 'auto')}</select></label>`
     : `<label>Reasoning effort<select data-field="effort">${optionList(EFFORT_OPTIONS, entry.effort || 'default')}</select></label>
       <label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(entry.cliPath || '')}" placeholder="Default: ${esc(cliMeta[entry.provider]?.path ?? '')}" /></label>`}
     </div>
@@ -2480,6 +2481,7 @@ function addConnection() {
     provider: 'openai',
     baseUrl: 'https://api.openai.com/v1',
     apiKey: '',
+    protocol: 'auto',
     model: '',
     cliPath: '',
     effort: 'default',
@@ -2823,6 +2825,9 @@ $('#cfg-agents').addEventListener('click', (event) => {
 
 /* ---------- Settings · 04 research: pipeline, initialization, chat, profile ---------- */
 const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli'];
+const PROTOCOL_OPTIONS = [
+  ['auto', 'Auto (Responses, else Chat)'], ['responses', 'Responses only'], ['chat', 'Chat Completions only'],
+];
 const EFFORT_OPTIONS = [
   ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (claude & codex; cursor → high)'],
 ];

@@ -20,7 +20,7 @@ import {
   embeddingIdentity,
   activeEmbedding,
   syncActiveEmbedding,
-  saveConfig, ResearchConfig, ChatConfig, LLM_EFFORTS } from '../config.js';
+  saveConfig, ResearchConfig, ChatConfig, LLM_EFFORTS, LLM_PROTOCOLS } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
 import { assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
@@ -190,6 +190,7 @@ function mergeLlmConfig(current: LlmConfig, incoming: Partial<LlmConfig> = {}): 
     model: typeof incoming.model === 'string' ? incoming.model.trim() : current.model,
     cliPath: typeof incoming.cliPath === 'string' ? incoming.cliPath.trim() : current.cliPath,
     effort: incoming.effort && LLM_EFFORTS.includes(incoming.effort) ? incoming.effort : current.effort,
+    protocol: incoming.protocol && LLM_PROTOCOLS.includes(incoming.protocol) ? incoming.protocol : current.protocol,
     cliTimeoutMs: Number.isFinite(cliTimeout) && cliTimeout >= 1000 ? Math.floor(cliTimeout) : current.cliTimeoutMs,
     label: typeof incoming.label === 'string' ? incoming.label.trim() : current.label,
   };
@@ -206,6 +207,7 @@ function mergeRoutedLlmConfig(current: RoutedLlmConfig, incoming: Partial<Routed
     model: typeof incoming.model === 'string' ? incoming.model.trim() : current.model,
     cliPath: typeof incoming.cliPath === 'string' ? incoming.cliPath.trim() : current.cliPath,
     effort: incoming.effort && LLM_EFFORTS.includes(incoming.effort) ? incoming.effort : current.effort,
+    protocol: incoming.protocol && LLM_PROTOCOLS.includes(incoming.protocol) ? incoming.protocol : current.protocol,
     cliTimeoutMs: Number.isFinite(cliTimeout) && cliTimeout >= 1000 ? Math.floor(cliTimeout) : current.cliTimeoutMs,
   };
 }
@@ -302,7 +304,7 @@ function mergeEmbeddingSection(
 }
 
 function defaultConnectionConfig(): LlmConfig {
-  return { provider: 'openai', baseUrl: '', apiKey: '', model: '', cliPath: '', effort: 'default', cliTimeoutMs: 300_000 };
+  return { provider: 'openai', baseUrl: '', apiKey: '', protocol: 'auto', model: '', cliPath: '', effort: 'default', cliTimeoutMs: 300_000 };
 }
 
 async function testLlmConfig(config: LlmConfig): Promise<unknown> {
