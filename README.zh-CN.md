@@ -180,7 +180,7 @@ knode-os config               查看当前配置(密钥已脱敏)
 
 ## 在 Claude Code / Codex 中使用
 
-> `serve` 运行时会在 `/mcp` 提供 Streamable HTTP 的 MCP 端点（token 在 `<data>/.knode/mcp-token`），`knode-os connect claude|codex|cursor` 默认注册它（`--stdio` 才是独立进程）；`review` 配置块控制审核强度（写入时只按精确拼写合并、LLM 复核合并候选与争议断言、`verify` 任务可联网核实）；`research.pipeline: team` 让研究任务按「规划、并行调查、综合、评审、修订」五个阶段跑（`native` 则把角色注册为 CLI 的原生子代理）；`research.profile` 选一份研究 profile（`playbooks/research/profiles/*.yaml`：推理强度、联网新鲜度、核实门槛，以及每个子代理的 CLI、模型、工具与提示词，内置 default / quick / thorough / native，可在 Settings → Research 里编辑）；`research.agent` / `chat.agent` 现在指向 `playbooks/agents/` 下的具名 agent（Settings → Agents，内置 `deep-agent` 与 `deep-research` 两个模板），改动前那种直接写 CLI 名或连接 id 的配置继续可用；
+> `serve` 运行时会在 `/mcp` 提供 Streamable HTTP 的 MCP 端点（token 在 `<data>/.knode/mcp-token`），`knode-os connect claude|codex|cursor` 默认注册它（`--stdio` 才是独立进程）；`review` 配置块控制审核强度（写入时只按精确拼写合并、LLM 复核合并候选与争议断言、`verify` 任务可联网核实）；`research.pipeline: team` 让研究任务按「规划、并行调查、综合、评审、修订」五个阶段跑（`native` 则把角色注册为 CLI 的原生子代理）；`research.profile` 选一份研究 profile（`playbooks/research/profiles/*.yaml`：推理强度、联网新鲜度、核实门槛，以及每个子代理的 CLI、模型、工具与提示词，内置 default / quick / thorough / native，可在 Settings → Research 里编辑）；`research.agent` / `chat.agent` 现在指向 `playbooks/agents/` 下的具名 agent（Settings → Providers & Agents，内置 `deep-agent` 与 `deep-research` 两个模板），改动前那种直接写 CLI 名或连接 id 的配置继续可用；
 > `knode-os research queue entity 宁德时代 --now` 让配置好的 agent（`research.agent`：一个 coding-agent CLI，或跑在 OpenAI 兼容连接上的内置 agent）研究并写出 wiki 页，页面以隔离状态入库，审核后提升；
 > `knode-os entities dedupe|merge|unmerge`、`knode-os wiki lint`、`knode-os research recommend`、`knode-os research profiles` 见 [docs/design/06](docs/design/06-wiki-research-agent.zh-CN.md);
 > 知识库初始化(`research init`)、对话入口(`chat`)与研究 agent 的后续改进见 [docs/design/07](docs/design/07-init-and-chat.zh-CN.md)。
@@ -215,7 +215,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
   - **Graph / 图谱** —— 力导向图谱浏览 + 洞察(枢纽/孤立节点/类型分布)
   - **Wiki** —— 一个按钮完成知识库初始化(通读 → 总览页 + AGENTS.md 指南 + 排队的主题页),并在此发起与审阅深度研究页
   - **Dream / 夜间分析** —— 手动触发 dream,审阅并接受/拒绝建议
-- **Settings / 设置** —— **Providers**（每个端点与密钥只配一次，embedding 与 LLM 同在一张表；`llmUse` 标出哪条 LLM 连接是默认，所有没有自己指定 provider 的任务都跟着它走）、**Pipeline**（独立的 Entity / Concept / 文档视觉模型路由；保存后按需重建 embedding 或刷新转换）、**Agents**、**Research**、**Workspace**
+- **Settings / 设置** —— **Providers & Agents**（每个端点与密钥只配一次，embedding 与 LLM 同在一张表，下面第二张表是跑在它们之上的具名 agent；`llmUse` 标出哪条 LLM 连接是默认，所有没有自己指定 provider 的任务都跟着它走）、**Pipeline**（独立的 Entity / Concept / 文档视觉模型路由；保存后按需重建 embedding 或刷新转换）、**Research**、**Workspace**
 
 ## REST API(仅 localhost)
 

@@ -22,7 +22,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .library: [.files, .search, .traces]
         case .ask: [.ask]
         case .knowledge: [.graph, .wiki, .dream]
-        case .settings: [.providers, .pipeline, .agents, .research, .workspace]
+        case .settings: [.providers, .pipeline, .research, .workspace]
         }
     }
 
@@ -66,23 +66,32 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
     case dream
     case providers
     case pipeline
-    case agents
     case research
     case workspace
 
     var id: String { rawValue }
+
+    /**
+     * A tab that used to exist, so a stored navigation still lands somewhere.
+     * `agents` was folded into `providers` in 2026-09-19: an agent runs on a
+     * provider from the table above it, and the two were never separable in
+     * anything but the tab strip.
+     */
+    static func named(_ raw: String) -> AppTab? {
+        AppTab(rawValue: raw) ?? (raw == "agents" ? .providers : nil)
+    }
 
     var section: AppSection {
         switch self {
         case .files, .search, .traces: .library
         case .ask: .ask
         case .graph, .wiki, .dream: .knowledge
-        case .providers, .pipeline, .agents, .research, .workspace: .settings
+        case .providers, .pipeline, .research, .workspace: .settings
         }
     }
 
     /**
-     * Which screen shows this tab. Settings' five tabs share one host: keying
+     * Which screen shows this tab. Settings' four tabs share one host: keying
      * view identity on the leaf instead would rebuild `SettingsView` on every
      * sub-tab click, refetching the config and discarding unsaved routes.
      */
@@ -99,9 +108,8 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .graph: L("Graph")
         case .wiki: L("Wiki")
         case .dream: L("Dream")
-        case .providers: L("Providers")
+        case .providers: L("Providers & Agents")
         case .pipeline: L("Pipeline")
-        case .agents: L("Agents")
         case .research: L("Research")
         case .workspace: L("Workspace")
         }
@@ -116,9 +124,8 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .graph: L("Entities, relations, and claims")
         case .wiki: L("Pages researched by agent CLIs")
         case .dream: L("Review agent improvement ideas")
-        case .providers: L("Endpoints and credentials")
+        case .providers: L("Endpoints, credentials, and who does the work")
         case .pipeline: L("What each stage needs")
-        case .agents: L("Who does the work")
         case .research: L("How the wiki gets written")
         case .workspace: L("Clear this workspace")
         }
@@ -135,7 +142,6 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .dream: "moon.stars"
         case .providers: "cable.connector"
         case .pipeline: "arrow.triangle.branch"
-        case .agents: "person.2.badge.gearshape"
         case .research: "book.and.wrench"
         case .workspace: "exclamationmark.triangle"
         }

@@ -1,13 +1,14 @@
 import SwiftUI
 
 /**
- * 03 · Agents — who runs a research job or a chat turn.
+ * Who runs a research job or an Ask turn — the second table on 01, under the
+ * providers its agents run on.
  *
  * One row per agent, opening to its own form, the same shape as the providers
- * table above. Two templates ship: a general deep agent (the in-process
+ * table above it. Two templates ship: a general deep agent (the in-process
  * LangChain deepagents loop) and a deep-research agent (the phases and
  * sub-agents a wiki page is written by). What the research itself does —
- * effort bar, verification, roles — stays in section 04, because that is a
+ * effort bar, verification, roles — stays in section 03 · Research, because that is a
  * property of the research and not of who runs it.
  */
 struct AgentsSettingsSection: View {
@@ -52,9 +53,8 @@ struct AgentsSettingsSection: View {
     private var header: some View {
         HStack(alignment: .bottom) {
             VStack(alignment: .leading, spacing: 3) {
-                Eyebrow(text: L("03 · Agents"), color: .knodeViolet)
                 Text(L("Who does the work")).font(.title3.bold())
-                Text(L("An agent is an executor with a name: a coding-agent CLI on this machine, or an OpenAI-compatible connection running the built-in deep agent. Research and Chat below point at one."))
+                Text(L("An agent is an executor with a name: a coding-agent CLI on this machine, or one of the providers above running the built-in deep agent. Ask and Research point at one."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

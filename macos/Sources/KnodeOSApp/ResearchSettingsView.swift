@@ -20,7 +20,7 @@ struct ResearchSettingsSection: View {
     @Binding var profileSelection: String
     let summaries: [ResearchProfileSummary]
     let connections: [LLMConnection]
-    /// The named agents from section 03, so the pickers can offer them.
+    /// The named agents from section 01, so the pickers can offer them.
     let agents: [AgentDefinition]
     let defaultProvider: String
     let isWorking: Bool
@@ -67,9 +67,9 @@ struct ResearchSettingsSection: View {
     private var header: some View {
         HStack(alignment: .bottom) {
             VStack(alignment: .leading, spacing: 3) {
-                Eyebrow(text: L("04 · Research"), color: .knodeViolet)
+                Eyebrow(text: L("03 · Research"), color: .knodeViolet)
                 Text(L("How the wiki gets written")).font(.title3.bold())
-                Text(L("What initialization does, how Chat behaves, and how a deep-research job runs: which agent from section 03 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents."))
+                Text(L("What initialization does, how Ask behaves, and how a deep-research job runs: which agent from section 01 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

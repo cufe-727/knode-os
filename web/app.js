@@ -537,21 +537,28 @@ const NAV = [
     { id: 'dream', title: 'Dream', hint: 'Review agent improvement ideas' },
   ] },
   { id: 'settings', title: 'Settings', tabs: [
-    { id: 'providers', title: 'Providers', hint: 'Endpoints and credentials' },
+    { id: 'providers', title: 'Providers & Agents', hint: 'Endpoints, credentials, and who does the work' },
     { id: 'pipeline', title: 'Pipeline', hint: 'What each stage needs' },
-    { id: 'agents', title: 'Agents', hint: 'Who does the work' },
     { id: 'research', title: 'Research', hint: 'How the wiki gets written' },
     { id: 'workspace', title: 'Workspace', hint: 'Clear this workspace' },
   ] },
 ];
 
 /**
- * Which `<section class="tab">` shows a tab. Settings' five tabs share one
+ * Which `<section class="tab">` shows a tab. Settings' four tabs share one
  * host: keying identity and loaders on the leaf instead would re-run
  * `loadConfigForm()` on every sub-tab click and throw away unsaved routes.
  */
-const TAB_HOST = { providers: 'settings', pipeline: 'settings', agents: 'settings', research: 'settings', workspace: 'settings' };
+const TAB_HOST = { providers: 'settings', pipeline: 'settings', research: 'settings', workspace: 'settings' };
 const hostOf = (tab) => TAB_HOST[tab] ?? tab;
+
+/**
+ * Tabs that used to exist, so a stored navigation still lands somewhere.
+ * `agents` was folded into `providers`: an agent runs on a provider from the
+ * table above it, and the two were never separable but in the tab strip.
+ */
+const NAV_ALIAS = { agents: 'providers' };
+const aliasOf = (tab) => NAV_ALIAS[tab] ?? tab;
 
 /** What a host view loads when you arrive at it. */
 const TAB_LOAD = {
@@ -572,11 +579,13 @@ const lastTab = Object.fromEntries(NAV.map((s) => [s.id, s.tabs[0].id]));
 function restoreNav() {
   try {
     const saved = JSON.parse(localStorage.getItem(NAV_KEY) ?? '{}');
-    for (const [section, tab] of Object.entries(saved.lastTab ?? {})) {
+    for (const [section, raw] of Object.entries(saved.lastTab ?? {})) {
+      const tab = aliasOf(raw);
       if (sectionOf(tab)?.id === section) lastTab[section] = tab;
     }
     // these ids will move again; an unknown one just means the default
-    return sectionOf(saved.tab) ? saved.tab : currentTab;
+    const tab = aliasOf(saved.tab);
+    return sectionOf(tab) ? tab : currentTab;
   } catch {
     return currentTab;
   }
@@ -2066,8 +2075,8 @@ function onModelPickerKey(event) {
   if (event.key === 'Escape') closeModelPicker();
 }
 
-function renderModelPicker(picker, route, input) {
-  const state = modelLists.get(route);
+function renderModelPicker(picker, spec, input) {
+  const state = modelLists.get(modelListKey(spec));
   const filter = picker.querySelector('.model-filter')?.value?.trim().toLowerCase() ?? '';
   const models = state?.result?.models ?? [];
   const shown = filter
@@ -2094,30 +2103,34 @@ function renderModelPicker(picker, route, input) {
     <p class="model-picker-foot">Picking one fills the field — Save &amp; apply writes it to the workspace config.</p>`;
 }
 
-async function loadModelList(route, picker, input, refresh = false) {
-  const state = modelLists.get(route) ?? {};
+async function loadModelList(spec, picker, input, refresh = false) {
+  const key = modelListKey(spec);
+  const state = modelLists.get(key) ?? {};
   if (state.loading) return;
   if (state.result && !refresh) return;
-  modelLists.set(route, { ...state, loading: true, error: null });
-  renderModelPicker(picker, route, input);
+  modelLists.set(key, { ...state, loading: true, error: null });
+  renderModelPicker(picker, spec, input);
   try {
+    const config = gatherConfig();
+    // a provider override asks the default route as if that CLI were selected
+    if (spec.provider) config.llm = { ...config.llm, provider: spec.provider, baseUrl: '', apiKey: '', model: '', cliPath: '' };
     const result = await api('/api/config/models', {
       method: 'POST',
-      body: JSON.stringify({ route, refresh, config: gatherConfig() }),
+      body: JSON.stringify({ route: spec.route, refresh, config }),
     });
-    modelLists.set(route, { loading: false, result, error: result.error ?? null });
+    modelLists.set(key, { loading: false, result, error: result.error ?? null });
   } catch (e) {
-    modelLists.set(route, { loading: false, result: state.result, error: e.message });
+    modelLists.set(key, { loading: false, result: state.result, error: e.message });
   }
-  if (document.body.contains(picker)) renderModelPicker(picker, route, input);
+  if (document.body.contains(picker)) renderModelPicker(picker, spec, input);
 }
 
-function openModelPicker(anchor, input, route) {
+function openModelPicker(anchor, input, spec) {
   closeModelPicker();
   const picker = document.createElement('div');
   picker.className = 'model-picker';
   document.body.appendChild(picker);
-  renderModelPicker(picker, route, input);
+  renderModelPicker(picker, spec, input);
 
   const box = anchor.getBoundingClientRect();
   const size = picker.getBoundingClientRect();
@@ -2132,10 +2145,10 @@ function openModelPicker(anchor, input, route) {
       closeModelPicker();
       return;
     }
-    if (event.target.closest('.model-refresh')) loadModelList(route, picker, input, true);
+    if (event.target.closest('.model-refresh')) loadModelList(spec, picker, input, true);
   });
   picker.addEventListener('input', (event) => {
-    if (event.target.classList.contains('model-filter')) renderModelPicker(picker, route, input);
+    if (event.target.classList.contains('model-filter')) renderModelPicker(picker, spec, input);
   });
 
   setTimeout(() => {
@@ -2144,19 +2157,37 @@ function openModelPicker(anchor, input, route) {
     window.addEventListener('resize', closeModelPicker);
   }, 0);
 
-  loadModelList(route, picker, input);
+  loadModelList(spec, picker, input);
 }
 
 /** A model input keeps its free text and gains a chevron that lists what the provider offers. */
-function modelChevron(route) {
-  return `<button type="button" class="model-chevron" data-route="${esc(route)}" title="List the models this provider offers">⌄</button>`;
+/**
+ * Which `/api/config/models` route lists what an executor offers, and the
+ * draft to list it against.
+ *
+ * A bare CLI name is not an endpoint, so `connection:cursor-cli` is a 400.
+ * Ask the default route with that provider swapped into the draft instead —
+ * the same thing the macOS client does.
+ */
+function executorModelRoute(executor) {
+  if (!executor || executor === 'default') return { route: 'llm' };
+  if (connectionById(executor)) return { route: `connection:${executor}` };
+  return { route: 'llm', provider: executor };
+}
+
+/** The cache key: two chevrons on one route but different providers are two lists. */
+const modelListKey = ({ route, provider }) => `${route}|${provider ?? ''}`;
+
+function modelChevron(spec) {
+  const { route, provider } = typeof spec === 'string' ? { route: spec } : spec;
+  return `<button type="button" class="model-chevron" data-route="${esc(route)}"${provider ? ` data-provider="${esc(provider)}"` : ''} title="List the models this provider offers">⌄</button>`;
 }
 
 document.addEventListener('click', (event) => {
   const chevron = event.target.closest?.('.model-chevron');
   if (!chevron) return;
   const input = chevron.parentElement.querySelector('input');
-  if (input) openModelPicker(chevron, input, chevron.dataset.route);
+  if (input) openModelPicker(chevron, input, { route: chevron.dataset.route, provider: chevron.dataset.provider });
 });
 
 /**
@@ -2611,7 +2642,7 @@ function agentFields(agent) {
     : 'These apply when this agent answers directly, which today means Ask.';
   return `<div class="cfg-grid cfg-grid-2">
       <label>Runs on<select data-field="executor">${executorOptions(agent.executor)}</select></label>
-      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="Its own default" />${modelChevron(agent.executor === 'default' ? 'llm' : `connection:${agent.executor}`)}</span></label>
+      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="Its own default" />${modelChevron(executorModelRoute(agent.executor))}</span></label>
       <label class="cfg-span-2">Description<input data-field="description" value="${esc(agent.description || '')}" placeholder="When to pick this agent" /></label>
     </div>
     <p class="cfg-callout${deep ? ' bad' : ''}">${esc(note)}</p>
@@ -3270,7 +3301,9 @@ $('#cfg-providers').addEventListener('change', (event) => {
   if (field !== 'provider') return;
   found.draft.provider = event.target.value;
   // the list came from the provider that is no longer selected
-  modelLists.delete(found.row.dataset.kind === 'embedding' ? `embedding:${found.row.dataset.id}` : (found.row.dataset.id === 'default' ? 'llm' : `connection:${found.row.dataset.id}`));
+  modelLists.delete(modelListKey(found.row.dataset.kind === 'embedding'
+    ? { route: `embedding:${found.row.dataset.id}` }
+    : { route: `connection:${found.row.dataset.id}` }));
   // an endpoint that no longer applies would otherwise be saved and tested
   if (found.row.dataset.kind === 'embedding' && found.draft.provider === 'local') {
     found.draft.baseUrl = '';

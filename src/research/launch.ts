@@ -398,7 +398,7 @@ async function loadBuiltin(): Promise<typeof import('./deepagents.js')> {
   } catch (err) {
     const missing = /Cannot find (?:package|module) '([^']+)'/.exec(err instanceof Error ? err.message : '')?.[1];
     throw new Error(
-      `the built-in research agent is unavailable${missing ? ` — ${missing} is not installed` : ''}: reinstall dependencies, or pick a CLI agent in Settings → Deep research`,
+      `the built-in research agent is unavailable${missing ? ` — ${missing} is not installed` : ''}: reinstall dependencies, or pick a CLI agent in Settings → Providers & Agents`,
     );
   }
 }

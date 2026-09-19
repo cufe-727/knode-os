@@ -63,7 +63,7 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
   const log = opts.log ?? (() => {});
   const research = ctx.config.research;
   const agent = opts.agent ?? resolveResearchAgent(ctx.config, ctx.dataDir);
-  if (!agent) throw new Error(`no research agent configured: set research.agent to a CLI (claude-cli / codex-cli / cursor-cli), a connection id, or 'default' to run the built-in agent on the default LLM connection (Settings → Deep research)`);
+  if (!agent) throw new Error(`no research agent configured: set research.agent to a CLI (claude-cli / codex-cli / cursor-cli), a connection id, or 'default' to run the built-in agent on the default LLM connection (Settings → Providers & Agents)`);
   clearCancelled(jobIn.id); // a job that starts (or restarts) is not cancelled, whatever an earlier attempt was
   let job = (await updateJob(ctx.store, jobIn.id, {
     status: 'running',

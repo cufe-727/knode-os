@@ -295,7 +295,7 @@
         </div>
 
         <section class="settings-section" data-subtab="providers" aria-labelledby="providers-title">
-          <div class="settings-section-head"><div><p class="section-index">01 · PROVIDERS</p><h3 id="providers-title">Endpoints and credentials</h3><p>Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice.</p></div><span class="section-badge">Configure once</span></div>
+          <div class="settings-section-head"><div><p class="section-index">01 · PROVIDERS &amp; AGENTS</p><h3 id="providers-title">Endpoints, credentials, and who does the work</h3><p>Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice — and every agent runs on one of them.</p></div><span class="section-badge">Configure once</span></div>
 
           <div class="provider-table">
             <div class="provider-head">
@@ -303,6 +303,16 @@
               <button type="button" id="cfg-add-provider" class="ghost">＋ Add provider</button>
             </div>
             <div id="cfg-providers"></div>
+          </div>
+
+          <div class="settings-section-head"><div><h3 id="agents-title">Who does the work</h3><p>An agent is an executor with a name: a coding-agent CLI on this machine, or one of the providers above running the built-in deep agent. Ask and Research point at one.</p></div><span class="section-badge accent2">Add agent</span></div>
+
+          <div class="provider-table">
+            <div class="provider-head">
+              <span></span><span>kind</span><span>name</span><span></span><span>runs on</span><span>model</span>
+              <button type="button" id="cfg-add-agent" class="ghost">＋ Add agent</button>
+            </div>
+            <div id="cfg-agents"></div>
           </div>
         </section>
 
@@ -396,20 +406,8 @@
           </div>
         </section>
 
-        <section class="settings-section" data-subtab="agents" aria-labelledby="agents-title">
-          <div class="settings-section-head"><div><p class="section-index">03 · AGENTS</p><h3 id="agents-title">Who does the work</h3><p>An agent is an executor with a name: a coding-agent CLI on this machine, or an OpenAI-compatible connection running the built-in deep agent. Research and Ask below point at one.</p></div><span class="section-badge accent2">Add agent</span></div>
-
-          <div class="provider-table">
-            <div class="provider-head">
-              <span></span><span>kind</span><span>name</span><span></span><span>runs on</span><span>model</span>
-              <button type="button" id="cfg-add-agent" class="ghost">＋ Add agent</button>
-            </div>
-            <div id="cfg-agents"></div>
-          </div>
-        </section>
-
         <section class="settings-section" data-subtab="research" aria-labelledby="research-title">
-          <div class="settings-section-head"><div><p class="section-index">04 · RESEARCH</p><h3 id="research-title">How the wiki gets written</h3><p>What initialization does, how Ask's Agent mode behaves, and how a deep-research job runs: which agent from section 03 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents.</p></div><span class="section-badge accent2">Pipeline</span></div>
+          <div class="settings-section-head"><div><p class="section-index">03 · RESEARCH</p><h3 id="research-title">How the wiki gets written</h3><p>What initialization does, how Ask behaves, and how a deep-research job runs: which agent from section 01 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents.</p></div><span class="section-badge accent2">Pipeline</span></div>
 
           <div class="cfg-card-title"><div><b>Deep research pipeline</b><small>Which agent runs jobs, how many at once, and which profile it follows. Roles below may override the agent per phase.</small></div><span class="section-badge accent2">Runner</span></div>
           <fieldset class="cfg-card cfg-card-wide">

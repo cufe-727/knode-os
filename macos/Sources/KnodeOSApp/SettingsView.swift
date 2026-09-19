@@ -16,7 +16,7 @@ struct SettingsView: View {
     @State private var selectedStage: PipelineStage = .convert
     /// Model lists, shared by every picker on the screen.
     @StateObject private var catalog = ModelCatalog()
-    /// The named agents Research and Chat point at (section 03).
+    /// The named agents Ask and Research point at (the second table on 01).
     @State private var agents: [AgentDefinition] = []
     @State private var agentToRemove: AgentDefinition?
     @State private var profiles: [ResearchProfileSummary] = []
@@ -41,7 +41,6 @@ struct SettingsView: View {
                     // below stay put, because `Test stages` tests every stage
                     switch model.selectedTab {
                     case .pipeline: pipelineSection
-                    case .agents: agentsSection
                     case .research: researchSection
                     case .workspace: workspaceDangerSection
                     default: providersSection
@@ -165,9 +164,9 @@ struct SettingsView: View {
     private var providersSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             sectionHeader(
-                index: L("01 · Providers"),
-                title: L("Endpoints and credentials"),
-                detail: L("Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice."),
+                index: L("01 · Providers & agents"),
+                title: L("Endpoints, credentials, and who does the work"),
+                detail: L("Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice — and every agent runs on one of them."),
                 badge: L("Configure once"),
                 color: .knodeCyan
             )
@@ -183,6 +182,9 @@ struct SettingsView: View {
                 }
             }
             .knodeCard(padding: 0)
+            // an agent runs on one of the providers above, so it belongs under
+            // them rather than behind a tab of its own
+            agentsSection.padding(.top, 10)
         }
     }
 
@@ -549,11 +551,9 @@ struct SettingsView: View {
     // MARK: - 03 · Deep research
 
 
-    /// The research runner and the profile it follows. Both live in files the
-    /// service owns — the runner in the workspace config, the profile in
-    /// `playbooks/research/profiles/` — so "Save & apply" writes both.
-    // MARK: - 03 · Agents
-
+    /// The second table on the Providers tab: who does the work, running on
+    /// one of the providers above. Its own view since before the merge, so
+    /// hosting it here is a call site and nothing else.
     @ViewBuilder
     private var agentsSection: some View {
         if config != nil {
@@ -628,7 +628,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 04 · Research
+    // MARK: - 03 · Research
 
     @ViewBuilder
     private var researchSection: some View {
@@ -992,6 +992,16 @@ struct SettingsView: View {
             isWorking = false
             model.globalActivity = nil
         }
+        // Agents are files of their own and the config may name one, so they
+        // go first: `PUT /api/config` rejects an unknown chat/research agent,
+        // which made "create an agent and point at it" fail in one Save.
+        var agentNote = ""
+        do {
+            try await saveAgents()
+        } catch {
+            agentNote = L(" · agents not saved: %@", error.localizedDescription)
+            statusIsError = true
+        }
         do {
             let response = try await model.client().saveConfig(config)
             self.config = normalized(response.config)
@@ -1002,10 +1012,9 @@ struct SettingsView: View {
             } else {
                 statusMessage = L("Configuration saved and stages applied")
             }
-            // The agents and the research profile are files of their own; a
-            // failure there must not read as though the routes failed to save.
+            // The research profile is a file of its own; a failure there must
+            // not read as though the routes failed to save.
             do {
-                try await saveAgents()
                 if let saved = try await saveProfileDraft() {
                     statusMessage += L(" · research profile %@ saved", saved.name)
                 }
@@ -1013,6 +1022,7 @@ struct SettingsView: View {
                 statusMessage += L(" · research profile not saved: %@", error.localizedDescription)
                 statusIsError = true
             }
+            statusMessage += agentNote
             model.showToast(L("Configuration saved for %@", model.activeWorkspace?.displayName ?? L("this workspace")))
             await model.refreshStats()
         } catch {

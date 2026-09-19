@@ -173,7 +173,7 @@ private let zhHansPairs: [(String, String)] = [
     ("Pages researched by agent CLIs", "由 agent CLI 研究产出的页面"),
     ("Dream", "夜间分析"),
     ("Review agent improvement ideas", "查看 agent 改进建议"),
-    ("Providers", "服务商"),
+    ("Providers & Agents", "提供方与智能体"),
     ("Sync now", "立即同步"),
     ("Loading traces…", "正在加载轨迹…"),
     ("No traces yet", "还没有轨迹"),
@@ -211,8 +211,8 @@ private let zhHansPairs: [(String, String)] = [
 
     // MARK: - Settings · 01 providers
     ("01 · Providers", "01 · 提供方"),
-    ("Endpoints and credentials", "端点与凭据"),
-    ("Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice.", "每个提供方只配一次。下面每个阶段都从这个列表里选，端点和密钥不会填第二遍。"),
+    ("Endpoints, credentials, and who does the work", "端点、凭据，以及谁来干活"),
+    ("Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice — and every agent runs on one of them.", "每个提供方只配一次。下面每个阶段都从这个列表里选，端点和密钥不会填第二遍——每个 agent 也都跑在其中之一上。"),
     ("Configure once", "只配一次"),
     ("Embedding provider", "向量化提供方"),
     ("One per workspace — the Index stage always uses it.", "每个工作区一个 —— 索引阶段固定用它。"),
@@ -354,10 +354,10 @@ private let zhHansPairs: [(String, String)] = [
     ("Use %@ from PATH instead", "改用 PATH 里的 %@"),
 
     // MARK: - Settings · 03 agents
-    ("03 · Agents", "03 · 智能体"),
-    ("04 · Research", "04 · 研究"),
+    ("01 · Providers & agents", "01 · 提供方与智能体"),
+    ("03 · Research", "03 · 研究"),
     ("Who does the work", "谁来干活"),
-    ("An agent is an executor with a name: a coding-agent CLI on this machine, or an OpenAI-compatible connection running the built-in deep agent. Research and Chat below point at one.", "一个 agent 就是起了名字的执行器：本机的编码 agent CLI，或者跑内置 deep agent 的 OpenAI 兼容连接。下面的研究与对话各指向其中一个。"),
+    ("An agent is an executor with a name: a coding-agent CLI on this machine, or one of the providers above running the built-in deep agent. Ask and Research point at one.", "一个 agent 就是起了名字的执行器：本机的编码 agent CLI，或者上面某个提供方跑内置 deep agent。问答与研究各指向其中一个。"),
     ("Add agent", "新增 agent"),
     ("Named", "具名"),
     ("General agent", "通用 agent"),
@@ -390,7 +390,7 @@ private let zhHansPairs: [(String, String)] = [
     ("Its file goes back to the template, including the prompt.", "它的文件会回到模板状态，提示词也一并恢复。"),
     ("Anything pointing at it falls back to nothing configured.", "指向它的地方会退回未配置状态。"),
     ("How the wiki gets written", "wiki 是怎么写出来的"),
-    ("What initialization does, how Chat behaves, and how a deep-research job runs: which agent from section 03 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents.", "初始化做什么、对话怎么表现，以及一个深度研究任务怎么跑：由 03 里的哪个 agent 接手、各阶段怎么并行、profile 给子代理设了多高的核实门槛。"),
+    ("What initialization does, how Ask behaves, and how a deep-research job runs: which agent from section 01 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents.", "初始化做什么、问答怎么表现，以及一个深度研究任务怎么跑：由 01 里的哪个 agent 接手、各阶段怎么并行、profile 给子代理设了多高的核实门槛。"),
     ("Deep research pipeline", "深度研究流水线"),
 
     // MARK: - Settings · profile card
