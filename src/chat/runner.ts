@@ -3,7 +3,9 @@ import path from 'node:path';
 import { KnodeConfig } from '../config.js';
 import { AppContext } from '../context.js';
 import { safePath } from '../fs/files.js';
-import { agentForSpec, agentWebCapable, DEFAULT_CONNECTION, ExecutorId, ResearchAgent, resolveResearchAgent, withModel } from '../research/agent.js';
+import { agentWebCapable, DEFAULT_CONNECTION, ExecutorId, ResearchAgent, resolveAgentSpec, withModel } from '../research/agent.js';
+import { AgentDefinition } from '../research/agents.js';
+import { Effort, RoleTools, WebAccess } from '../research/profile.js';
 import { clearCancelled, JobCancelledError, killAgentsFor, launchSession, SessionResult, transcriptPathFor } from '../research/launch.js';
 import { McpEndpoint } from '../research/workspace.js';
 import { appendMessage, ChatConversation, ChatEvent, ChatMessage, ChatStatus, getConversation, pruneConversations, recentMessages, setConversationStatus, titleFrom } from './store.js';
@@ -55,32 +57,82 @@ const key = (ctx: AppContext, conversationId: string) => `${ctx.dataDir}::${conv
 const jobIdOf = (conversationId: string) => `chat:${conversationId}`;
 
 /**
- * Which agent answers Ask: `chat.agent`, else the research agent, else the
+ * Everything a turn needs to launch, resolved once.
+ *
+ * The launch parameters come from the agent's own definition, which is the
+ * point of naming an agent at all: `playbooks/agents/*.yaml` carried `effort`,
+ * `tools`, `maxTurns`, `timeoutMs` and `prompt` for a while while nothing read
+ * them, because the resolver handed on only an executor. A bare spec — a CLI
+ * name, a connection id, `default` — has no definition, so it falls back to
+ * what chat hard-coded before, which keeps the shipped `deep-agent` behaving
+ * exactly as it did.
+ */
+export interface ChatRuntime {
+  agent: ResearchAgent;
+  definition: AgentDefinition | null;
+  maxTurns: number;
+  timeoutMs: number;
+  effort: Effort;
+  tools: 'read' | 'write';
+  files: boolean;
+  /** Extra instructions for the run workspace's schema. '' = the protocol alone. */
+  prompt: string;
+  allowNetwork: boolean;
+}
+
+/** What chat launches with when nothing named an agent that could say otherwise. */
+const BARE_TOOLS: RoleTools = { write: true, files: true, web: 'inherit' };
+
+/**
+ * Which spec answers Ask: `chat.agent`, else the research agent, else the
  * default LLM connection.
  *
  * That last arm is what makes Ask work on a machine that has configured a
  * model and nothing else. It is deliberately unlike research, which refuses to
  * guess (see `resolveResearchAgent`): research is a background spend a person
  * opts into, while Ask is a question someone just typed, and answering it on
- * whatever section 01 is set to is the obvious reading. A CLI provider runs
- * that CLI; an OpenAI-compatible one runs the built-in agent.
+ * whatever section 01 is set to is the obvious reading.
  */
+function chatSpec(config: KnodeConfig): string {
+  return config.chat?.agent?.trim() || config.research?.agent?.trim() || DEFAULT_CONNECTION;
+}
+
+/** The agent that answers Ask, or null when nothing can. */
 export function resolveChatAgent(config: KnodeConfig, dataDir?: string): ResearchAgent | null {
-  const chat = config.chat;
-  if (chat?.agent?.trim()) return agentForSpec(config, chat.agent, chat.model, dataDir);
-  const base = resolveResearchAgent(config, dataDir);
-  if (base) return withModel(base, chat?.model ?? '');
-  return agentForSpec(config, DEFAULT_CONNECTION, chat?.model ?? '', dataDir);
+  return resolveChatRuntime(config, dataDir)?.agent ?? null;
+}
+
+export function resolveChatRuntime(config: KnodeConfig, dataDir?: string): ChatRuntime | null {
+  const resolved = resolveAgentSpec(config, chatSpec(config), config.chat?.model ?? '', dataDir);
+  if (!resolved) return null;
+  return chatRuntimeFor(config, resolved.agent, resolved.definition);
+}
+
+/** The runtime for an already-resolved agent — the seam tests launch through. */
+export function chatRuntimeFor(config: KnodeConfig, agent: ResearchAgent, definition: AgentDefinition | null): ChatRuntime {
+  const tools = definition?.tools ?? BARE_TOOLS;
+  return {
+    agent,
+    definition,
+    // 0 is already documented as "the caller's own default"
+    maxTurns: definition?.maxTurns || 30,
+    timeoutMs: definition?.timeoutMs || 600_000,
+    effort: definition?.effort ?? 'default',
+    tools: tools.write ? 'write' : 'read',
+    files: tools.files,
+    prompt: definition?.prompt ?? '',
+    allowNetwork: chatWebAllowed(config, agent, tools.web),
+  };
 }
 
 /**
- * Web tools for chat: review.external stays the master switch; chat.web only
- * narrows or, within it, widens. The agent has the final say — the built-in
- * agent has no web tool, so no setting can give it one.
+ * Web tools for a chat turn: `review.external` stays the master switch, and
+ * the agent's own `web` only narrows or, within it, widens. The executor has
+ * the final say — the built-in agent has no web tool, so no setting can give
+ * it one.
  */
-export function chatWebAllowed(config: KnodeConfig, agent?: ResearchAgent | null): boolean {
+export function chatWebAllowed(config: KnodeConfig, agent?: ResearchAgent | null, web: WebAccess = 'inherit'): boolean {
   const gate = config.review?.external ?? 'verify';
-  const web = config.chat?.web ?? 'inherit';
   if (gate === 'off' || web === 'off') return false;
   if (agent !== undefined && !agentWebCapable(agent)) return false;
   if (web === 'on') return true;
@@ -175,15 +227,18 @@ export async function startChatTurn(ctx: AppContext, conversationId: string, tex
   const entry: RunningTurn = { seq: 0, startedAt: new Date().toISOString(), transcriptPath: '', provider: 'claude-cli' };
   running.set(k, entry);
 
-  let agent: ResearchAgent;
+  let runtime: ChatRuntime;
   let history: ChatMessage[];
   let seq: number;
   try {
     const existing = await getConversation(ctx.store, conversationId);
     if (!existing) throw new Error(`no conversation ${conversationId}`);
-    const resolved = opts.agent ?? resolveChatAgent(ctx.config, ctx.dataDir);
-    if (!resolved) throw new Error(`no chat agent configured: set chat.agent or research.agent to a CLI (claude-cli / codex-cli / cursor-cli), a connection id, or 'default' to run the built-in agent on the default LLM connection`);
-    agent = resolved;
+    // an overridden agent has no definition behind it, so it launches on the
+    // bare defaults the way any unnamed spec does
+    const resolved = opts.agent ? chatRuntimeFor(ctx.config, opts.agent, null) : resolveChatRuntime(ctx.config, ctx.dataDir);
+    if (!resolved) throw new Error(`no chat agent configured: set chat.agent or research.agent to an agent name, a CLI (claude-cli / codex-cli / cursor-cli), a connection id, or 'default' to run on the default LLM connection`);
+    runtime = resolved;
+    const agent = runtime.agent;
     const content = text.trim();
     if (!content) throw new Error('an empty message');
     history = await recentMessages(ctx.store, conversationId, chat?.historyTurns ?? 12);
@@ -209,17 +264,16 @@ export async function startChatTurn(ctx: AppContext, conversationId: string, tex
     let result: SessionResult | null = null;
     let error: string | null = null;
     try {
-      const ws = await prepareChatWorkspace(ctx, conversationId, { mcp: opts.mcp });
+      const ws = await prepareChatWorkspace(ctx, conversationId, { mcp: opts.mcp, prompt: runtime.prompt });
       entry.transcriptPath = transcriptPathFor(ws.dir, label);
-      const allowNetwork = chatWebAllowed(ctx.config, agent);
-      const prompt = renderChatPrompt(ctx.dataDir, { conversationId, history, message: content, allowNetwork });
+      const prompt = renderChatPrompt(ctx.dataDir, { conversationId, history, message: content, allowNetwork: runtime.allowNetwork });
       fs.writeFileSync(path.join(ws.dir, `prompt-${label}.md`), prompt);
       const readDirs = (ctx.config.research?.readDirs ?? ['raw/docs', 'wiki', '.sidecar']).map((d) => safePath(ctx.dataDir, d)).filter((d) => fs.existsSync(d));
-      log(`chat ${conversationId}: turn ${seq} on ${agent.provider}${agent.model ? ` ${agent.model}` : ''}`);
+      log(`chat ${conversationId}: turn ${seq} on ${runtime.agent.provider}${runtime.agent.model ? ` ${runtime.agent.model}` : ''}${runtime.definition ? ` (${runtime.definition.name})` : ''}`);
       result = await launchSession({
-        agent,
-        maxTurns: chat?.maxTurns ?? 30,
-        timeoutMs: chat?.timeoutMs ?? 600_000,
+        agent: runtime.agent,
+        maxTurns: runtime.maxTurns,
+        timeoutMs: runtime.timeoutMs,
         cwd: ws.dir,
         prompt,
         mcp: opts.mcp,
@@ -227,17 +281,17 @@ export async function startChatTurn(ctx: AppContext, conversationId: string, tex
         jobId,
         outputPath: '',
         worksetId: '',
-        allowNetwork,
-        tools: 'write',
-        files: true,
-        effort: chat?.effort ?? 'default',
+        allowNetwork: runtime.allowNetwork,
+        tools: runtime.tools,
+        files: runtime.files,
+        effort: runtime.effort,
         label,
       });
       error = result.error;
     } catch (err) {
       error = err instanceof JobCancelledError ? 'cancelled' : err instanceof Error ? err.message : String(err);
     }
-    const events = entry.transcriptPath ? parseActivity(entry.transcriptPath, agent.provider) : [];
+    const events = entry.transcriptPath ? parseActivity(entry.transcriptPath, runtime.agent.provider) : [];
     const reply = result?.text ?? '';
     for (const p of writtenPaths(reply)) events.push({ tool: 'wrote', summary: p, path: p, ok: true });
     const assistant = await appendMessage(ctx.store, {

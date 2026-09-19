@@ -167,20 +167,6 @@ export function deleteAgent(dataDir: string, name: string): boolean {
   return true;
 }
 
-/**
- * The executor spec behind an agent name, or the spec itself when it is not a
- * name. Configs written before agents existed put a CLI name or a connection
- * id straight into `research.agent`, and those keep working — the resolver
- * simply finds no agent file and hands the value on unchanged.
- */
-export function executorForAgent(dataDir: string, spec: string): { executor: string; model: string } | null {
-  const wanted = spec.trim();
-  if (!wanted) return null;
-  const definition = isValidAgentName(wanted) ? loadAgent(dataDir, wanted) : null;
-  if (!definition) return null;
-  return { executor: definition.executor, model: definition.model };
-}
-
 /** The agent `research.agent` names, if it is a name at all. */
 export function activeAgent(dataDir: string, config: KnodeConfig): AgentDefinition | null {
   const name = config.research?.agent?.trim();

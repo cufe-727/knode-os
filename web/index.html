@@ -437,15 +437,10 @@
             </div>
           </fieldset>
 
-          <div class="cfg-card-title"><div><b>Ask · Agent mode</b><small>Ask's Agent mode uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note. Quick mode needs none of this — it answers from retrieval.</small></div><span class="section-badge accent2">Ask</span></div>
+          <div class="cfg-card-title"><div><b>Ask</b><small>Ask uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note. Effort, turns, timeout, tool grants and any extra prompt come from the agent — edit them where the agent is defined, in section 01.</small></div><span class="section-badge accent2">Ask</span></div>
           <fieldset class="cfg-card cfg-card-wide">
             <div class="cfg-grid cfg-grid-3">
               <label>Agent<select id="cfg-chat-agent"></select></label>
-              <label>Model<input id="cfg-chat-model" placeholder="Agent's model" /></label>
-              <label>Reasoning effort<select id="cfg-chat-effort"></select></label>
-              <label>Web access<select id="cfg-chat-web"><option value="inherit">Follow review.external (on only when it is “research”)</option><option value="on">On (within review.external)</option><option value="off">Off</option></select></label>
-              <label>Turns per reply<input id="cfg-chat-maxturns" type="number" min="1" max="200" step="1" /></label>
-              <label>Timeout (minutes)<input id="cfg-chat-timeout" type="number" min="1" max="120" step="1" /></label>
               <label>Messages replayed<input id="cfg-chat-history" type="number" min="0" max="50" step="1" /></label>
               <label>Conversations kept<input id="cfg-chat-keep" type="number" min="1" max="500" step="1" /></label>
             </div>

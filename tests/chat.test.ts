@@ -7,7 +7,8 @@ import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { sync } from '../src/ingest/sync.js';
-import { chatWebAllowed, parseActivity, resolveChatAgent, runChatTurn } from '../src/chat/runner.js';
+import { chatWebAllowed, parseActivity, resolveChatAgent, resolveChatRuntime, runChatTurn } from '../src/chat/runner.js';
+import { saveAgent } from '../src/research/agents.js';
 import { createConversation, getConversation, recentMessages, resetRunningConversations, setConversationStatus } from '../src/chat/store.js';
 import { writtenPaths } from '../src/chat/templates.js';
 import { createApp } from '../src/server/app.js';
@@ -97,11 +98,55 @@ describe('chat', () => {
   it('resolves the chat agent from config and gates web access on review.external', () => {
     expect(resolveChatAgent(ctx.config)).toEqual({ kind: 'cli', provider: 'claude-cli', cliPath: fakeClaude, model: '' });
     expect(resolveChatAgent({ ...ctx.config, chat: { ...ctx.config.chat, agent: '', model: 'm' }, research: { ...ctx.config.research, agent: 'fake' } })).toMatchObject({ provider: 'claude-cli', model: 'm' });
+    // review.external is the master gate; the agent's own `web` narrows or, within it, widens
     expect(chatWebAllowed(ctx.config)).toBe(false); // verify + inherit
     expect(chatWebAllowed({ ...ctx.config, review: { ...ctx.config.review, external: 'research' } })).toBe(true);
-    expect(chatWebAllowed({ ...ctx.config, chat: { ...ctx.config.chat, web: 'on' } })).toBe(true);
-    expect(chatWebAllowed({ ...ctx.config, chat: { ...ctx.config.chat, web: 'on' }, review: { ...ctx.config.review, external: 'off' } })).toBe(false);
+    expect(chatWebAllowed(ctx.config, undefined, 'on')).toBe(true);
+    expect(chatWebAllowed({ ...ctx.config, review: { ...ctx.config.review, external: 'off' } }, undefined, 'on')).toBe(false);
+    expect(chatWebAllowed({ ...ctx.config, review: { ...ctx.config.review, external: 'research' } }, undefined, 'off')).toBe(false);
   });
+
+  /**
+   * The bug this whole change exists for: `playbooks/agents/*.yaml` carried
+   * `effort`, `tools`, `maxTurns` and `prompt`, the UI edited them, and the
+   * resolver handed on only an executor — so none of them ever reached a
+   * session. Assert on the artefacts the launch actually produced.
+   */
+  it('takes turns, tools and prompt from the agent definition', async () => {
+    process.env.FAKE_AGENT_MODE = 'good';
+    const saved = ctx.config.chat.agent;
+    saveAgent(wsDir, {
+      name: 'tuned',
+      kind: 'general',
+      executor: 'fake',
+      effort: 'high',
+      maxTurns: 7,
+      tools: { write: false, files: false, web: 'off' },
+      prompt: '只用一句话回答。',
+    });
+    ctx.config.chat.agent = 'tuned';
+    try {
+      const runtime = resolveChatRuntime(ctx.config, wsDir);
+      expect(runtime).toMatchObject({ maxTurns: 7, effort: 'high', tools: 'read', files: false, allowNetwork: false });
+      expect(runtime?.definition?.name).toBe('tuned');
+
+      const { id } = await (await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({}) })).json() as { id: string };
+      const sent = await api(`/api/chat/conversations/${id}/messages`, { method: 'POST', body: JSON.stringify({ text: '宁德时代 2025 年营收是多少？' }) });
+      expect(sent.status).toBe(202);
+      await untilIdle(id);
+
+      const dir = path.join(wsDir, '.runs', 'chat', id);
+      const argv = JSON.parse(fs.readFileSync(path.join(dir, 'argv-chat.json'), 'utf8')) as string[];
+      expect(argv[argv.indexOf('--max-turns') + 1]).toBe('7');
+      // tools: read hands over the read-only list instead of the write wildcard
+      expect(argv).not.toContain('mcp__knode-os__*');
+      expect(argv).toContain('mcp__knode-os__knode_search');
+      expect(fs.readFileSync(path.join(dir, 'CLAUDE.md'), 'utf8')).toContain('只用一句话回答。');
+    } finally {
+      ctx.config.chat.agent = saved;
+      fs.rmSync(path.join(wsDir, 'playbooks', 'agents', 'tuned.yaml'), { force: true });
+    }
+  }, 60_000);
 
   it('answers a question over HTTP: 202, polled status, the reply with its tool activity', async () => {
     process.env.FAKE_AGENT_MODE = 'good';
@@ -271,12 +316,13 @@ describe('chat', () => {
     expect(saved.status).toBe(200);
     expect(fs.readFileSync(path.join(wsDir, 'playbooks', 'chat', 'AGENTS.md'), 'utf8')).toContain('只用中文回答');
 
-    const cfg = await api('/api/config', { method: 'PUT', body: JSON.stringify({ chat: { agent: 'fake', model: 'sonnet', effort: 'high', maxTurns: 999, timeoutMs: 1, web: 'on', historyTurns: 3, keep: 7 } }) });
+    // effort / maxTurns / timeoutMs / web moved to the agent: sending them is not an error, they are simply not settings here any more
+    const cfg = await api('/api/config', { method: 'PUT', body: JSON.stringify({ chat: { agent: 'fake', model: 'sonnet', effort: 'high', maxTurns: 999, historyTurns: 3, keep: 7 } }) });
     expect(cfg.status).toBe(200);
     const { config } = await cfg.json() as { config: { chat: Record<string, unknown> } };
-    expect(config.chat).toMatchObject({ agent: 'fake', model: 'sonnet', effort: 'high', maxTurns: 200, timeoutMs: 60_000, web: 'on', historyTurns: 3, keep: 7 });
+    expect(config.chat).toEqual({ agent: 'fake', model: 'sonnet', historyTurns: 3, keep: 7 });
     expect(ctx.config.chat.keep).toBe(7);
-    ctx.config.chat = { ...ctx.config.chat, model: '', effort: 'default', maxTurns: 30, timeoutMs: 600_000, web: 'inherit', historyTurns: 12, keep: 200 };
+    ctx.config.chat = { ...ctx.config.chat, model: '', historyTurns: 12, keep: 200 };
   }, 60_000);
 
   it('frees a conversation a crashed serve left answering', async () => {

@@ -10,6 +10,7 @@ import {
   defaultConfig,
   defaultRoutedLlmConfig,
   embeddingIdentity,
+  loadConfig,
   migrateEmbeddingProviders,
   migrateRouteConnections,
   resolveRoutedLlmConfig,
@@ -452,5 +453,22 @@ describe('readCursorStream', () => {
 
   it('ignores progress lines that are not JSON', () => {
     expect(readCursorStream(`Connecting…\n${assistant('done')}`).text).toBe('done');
+  });
+});
+
+describe('migrateChatConfig', () => {
+  it('drops the chat keys the agent definition now owns, and keeps the conversation ones', () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'chat-config-'));
+    const stored = {
+      ...defaultConfig(),
+      chat: { agent: 'writer', model: 'sonnet', effort: 'high', maxTurns: 100, timeoutMs: 1_200_000, web: 'on', historyTurns: 4, keep: 9 },
+    };
+    fs.writeFileSync(path.join(dir, 'knode.config.json'), JSON.stringify(stored));
+
+    const loaded = loadConfig(dir);
+    expect(loaded.chat).toEqual({ agent: 'writer', model: 'sonnet', historyTurns: 4, keep: 9 });
+    // the keys are gone from the object, not merely ignored, so the next save cleans the file
+    expect(Object.keys(loaded.chat)).not.toContain('effort');
+    expect(Object.keys(loaded.chat)).not.toContain('maxTurns');
   });
 });

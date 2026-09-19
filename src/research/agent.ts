@@ -1,5 +1,5 @@
 import { KnodeConfig, LlmConfig, LlmProtocol } from '../config.js';
-import { executorForAgent } from './agents.js';
+import { AgentDefinition, loadAgent } from './agents.js';
 
 /** The coding-agent CLIs a session can be launched on. */
 export type AgentProvider = 'claude-cli' | 'codex-cli' | 'cursor-cli';
@@ -81,12 +81,46 @@ function fromLlm(cfg: LlmConfig, model: string): ResearchAgent | null {
  * bare specs, which is also what a config written before named agents holds.
  */
 export function agentForSpec(config: KnodeConfig, spec: string, model = '', dataDir?: string): ResearchAgent | null {
+  return resolveAgentSpec(config, spec, model, dataDir)?.agent ?? null;
+}
+
+/** What will launch, and the definition it was named through (null for a bare spec). */
+export interface ResolvedAgent {
+  agent: ResearchAgent;
+  /** The `playbooks/agents/` entry behind the spec, when the spec was a name. */
+  definition: AgentDefinition | null;
+}
+
+/**
+ * `agentForSpec`, keeping the definition a name resolved through.
+ *
+ * The recursion in `agentForSpec` used to throw the definition away and hand
+ * on only `{ executor, model }`, which is why an agent's effort, tools, turn
+ * cap and prompt were edited, saved, and then never read by anything. A caller
+ * that wants to honour them asks for the whole thing.
+ *
+ * The executor is resolved **without** `dataDir`, so an executor that happens
+ * to share a name with an agent file still means the bare spec — one level of
+ * naming, as before.
+ */
+export function resolveAgentSpec(config: KnodeConfig, spec: string, model = '', dataDir?: string): ResolvedAgent | null {
   const wanted = spec.trim();
   if (!wanted) return null;
   if (dataDir) {
-    const named = executorForAgent(dataDir, wanted);
-    if (named) return agentForSpec(config, named.executor, model || named.model);
+    const definition = loadAgent(dataDir, wanted);
+    if (definition) {
+      const agent = bareAgentFor(config, definition.executor, model || definition.model);
+      return agent ? { agent, definition } : null;
+    }
   }
+  const agent = bareAgentFor(config, wanted, model);
+  return agent ? { agent, definition: null } : null;
+}
+
+/** A spec that is not an agent name: 'default', a connection id, or a CLI. */
+function bareAgentFor(config: KnodeConfig, spec: string, model: string): ResearchAgent | null {
+  const wanted = spec.trim();
+  if (!wanted) return null;
   if (wanted === DEFAULT_CONNECTION) return fromLlm(config.llm, model);
   const connection = config.connections.find((c) => c.id === wanted);
   if (connection) return fromLlm(connection, model);

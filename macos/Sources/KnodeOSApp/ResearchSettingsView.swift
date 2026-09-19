@@ -213,14 +213,15 @@ struct ResearchSettingsSection: View {
         .knodeCard(padding: 18)
     }
 
-    /// Ask's Agent mode — its own CLI settings, answering over the same MCP
-    /// endpoint. (The config keys are still `chat.*`.)
+    /// Which agent answers Ask, and the two things about a conversation that
+    /// are not properties of the agent. Everything else — effort, tools, turn
+    /// cap, timeout, extra prompt — belongs to the agent itself, in section 01.
     private var chatCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(L("Ask · Agent mode")).font(.headline)
-                    Text(L("Ask's Agent mode uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note. Quick mode needs none of this — it answers from retrieval."))
+                    Text(L("Ask")).font(.headline)
+                    Text(L("Ask uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -231,48 +232,20 @@ struct ResearchSettingsSection: View {
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
                     FieldLabel(L("Agent")) {
-                        AgentPicker(selection: $chat.agent, agents: agents, kind: "general", connections: connections, fallbackLabel: L("The research agent above"), defaultProvider: defaultProvider)
+                        AgentPicker(selection: $chat.agent, agents: agents, kind: "general", connections: connections, fallbackLabel: L("The research agent, else the default provider"), defaultProvider: defaultProvider)
                     }
-                    ModelField(
-                        placeholder: L("Agent's model"),
-                        text: $chat.model,
-                        providerKey: chat.agent.isEmpty ? research.agent : chat.agent,
-                        route: "agent:\(chat.agent.isEmpty ? research.agent : chat.agent)",
-                        load: { refresh in try await loadModels(chat.agent.isEmpty ? research.agent : chat.agent, refresh) }
-                    )
-                    FieldLabel(L("Reasoning effort")) {
-                        Picker(L("Reasoning effort"), selection: $chat.effort) {
-                            ForEach(EffortLevel.all, id: \.0) { Text(L($0.1)).tag($0.0) }
-                        }
-                        .labelsHidden()
-                    }
-                }
-                GridRow {
-                    FieldLabel(L("Web access")) {
-                        Picker(L("Web access"), selection: $chat.web) {
-                            Text(L("Follow review.external")).tag("inherit")
-                            Text(L("On (within review.external)")).tag("on")
-                            Text(L("Off")).tag("off")
-                        }
-                        .labelsHidden()
-                    }
-                    FieldLabel(L("Turns per reply")) {
-                        TextField("30", value: $chat.maxTurns, format: .number)
-                    }
-                    FieldLabel(L("Timeout (minutes)")) {
-                        TextField("10", value: chatTimeoutMinutes, format: .number)
-                    }
-                }
-                GridRow {
                     FieldLabel(L("Messages replayed")) {
                         TextField("12", value: $chat.historyTurns, format: .number)
                     }
                     FieldLabel(L("Conversations kept")) {
-                        TextField("50", value: $chat.keep, format: .number)
+                        TextField("200", value: $chat.keep, format: .number)
                     }
-                    Color.clear.frame(height: 1)
                 }
             }
+            Text(L("Effort, turns, timeout, tool grants and any extra prompt come from the agent — edit them where the agent is defined, in section 01."))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Text(L("Every reply is a fresh session that replays the recent messages — there is no CLI session to resume, so a long conversation costs more input each turn."))
                 .font(.caption)
                 .foregroundStyle(.tertiary)
@@ -285,13 +258,6 @@ struct ResearchSettingsSection: View {
         Binding(
             get: { max(1, research.initialization.extractionMaxMs / 60_000) },
             set: { research.initialization.extractionMaxMs = max(1, $0) * 60_000 }
-        )
-    }
-
-    private var chatTimeoutMinutes: Binding<Int> {
-        Binding(
-            get: { max(1, chat.timeoutMs / 60_000) },
-            set: { chat.timeoutMs = max(1, $0) * 60_000 }
         )
     }
 

@@ -187,3 +187,4 @@ profile 把「怎么研究」从 harness 里抽出来：一份 YAML 同时回答
 4. 服务端改动需 `macos/scripts/package-app.sh` 重新打包 macOS App。初始化（kind = `init`）、对话入口与研究 agent 的后续改进见 [07 — 初始化与对话](07-init-and-chat.zh-CN.md)。
 5. 原生子代理模式按官方配置参考实现（claude `--agents` 的 description / prompt / tools / model；codex `agents.*` 与子代理层里的 `developer_instructions`），尚未用真 CLI 跑过；cursor-agent 的 `effort` 只见过 `high` 的示例，`xhigh` / `max` 都映射成 `high`。
 6. `claude --effort` 需要较新的 CLI（老版本会因未知参数退出），所以内置 `default` profile 的强度是 `default`（不传参数）；要用 `max` 请选 `thorough` 或自建 profile。
+7. **agent 定义里的运行时字段目前只对问答生效。** 2026‑09‑19 起 `resolveChatRuntime` 会读具名 agent 的 `effort` / `tools` / `maxTurns` / `timeoutMs` / `prompt`；但 `pipeline.ts` 仍从 profile、role 与 `research.*` 取这些值，所以在 `deep-research` agent 上它们依旧不生效。agents 表已把这些字段禁用并写明原因——让这个缺口可见而非隐形；真正补上需要让 `sessions()` 读定义，并保留 role 的覆盖权。

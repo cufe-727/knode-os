@@ -789,30 +789,17 @@ struct ChatConfig: Codable, Equatable {
     /// Connection id or CLI provider; empty follows the research agent.
     var agent: String
     var model: String
-    var effort: String
-    var maxTurns: Int
-    var timeoutMs: Int
-    /// "inherit" | "on" | "off" — narrower than review.external, never wider.
-    var web: String
     var historyTurns: Int
     var keep: Int
 
     init(
-        agent: String = "",
+        agent: String = "default",
         model: String = "",
-        effort: String = "default",
-        maxTurns: Int = 30,
-        timeoutMs: Int = 600_000,
-        web: String = "inherit",
         historyTurns: Int = 12,
-        keep: Int = 50
+        keep: Int = 200
     ) {
         self.agent = agent
         self.model = model
-        self.effort = effort
-        self.maxTurns = maxTurns
-        self.timeoutMs = timeoutMs
-        self.web = web
         self.historyTurns = historyTurns
         self.keep = keep
     }
@@ -822,10 +809,6 @@ struct ChatConfig: Codable, Equatable {
         let fallback = ChatConfig()
         agent = try container.decodeIfPresent(String.self, forKey: .agent) ?? fallback.agent
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? fallback.model
-        effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? fallback.effort
-        maxTurns = try container.decodeIfPresent(Int.self, forKey: .maxTurns) ?? fallback.maxTurns
-        timeoutMs = try container.decodeIfPresent(Int.self, forKey: .timeoutMs) ?? fallback.timeoutMs
-        web = try container.decodeIfPresent(String.self, forKey: .web) ?? fallback.web
         historyTurns = try container.decodeIfPresent(Int.self, forKey: .historyTurns) ?? fallback.historyTurns
         keep = try container.decodeIfPresent(Int.self, forKey: .keep) ?? fallback.keep
     }

@@ -180,6 +180,13 @@ struct AgentsSettingsSection: View {
                     )
                 }
                 GridRow {
+                    Text(runtimeNote(agent))
+                        .font(.caption)
+                        .foregroundStyle(deep(agent) ? Color.knodeBad.opacity(0.85) : .secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .gridCellColumns(2)
+                }
+                GridRow {
                     FieldLabel(L("Reasoning effort")) {
                         Picker(L("Reasoning effort"), selection: $agents[index].effort) {
                             ForEach(EffortLevel.all, id: \.0) { Text(L($0.1)).tag($0.0) }
@@ -195,6 +202,7 @@ struct AgentsSettingsSection: View {
                         .labelsHidden()
                     }
                 }
+                .disabled(deep(agent))
                 GridRow {
                     FieldLabel(L("Turns per session")) {
                         TextField(L("0 = the caller's default"), value: $agents[index].maxTurns, format: .number)
@@ -203,6 +211,7 @@ struct AgentsSettingsSection: View {
                         TextField(L("0 = the caller's default"), value: timeoutMinutes(index), format: .number)
                     }
                 }
+                .disabled(deep(agent))
                 GridRow {
                     FieldLabel(L("Description")) {
                         TextField(L("When to pick this agent"), text: $agents[index].description)
@@ -216,6 +225,7 @@ struct AgentsSettingsSection: View {
                 Toggle(L("Reads files (Read / Grep / Glob)"), isOn: $agents[index].tools.files)
                     .toggleStyle(.checkbox)
             }
+            .disabled(deep(agent))
             VStack(alignment: .leading, spacing: 5) {
                 Text(L("System prompt")).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 TextEditor(text: $agents[index].prompt)
@@ -224,11 +234,24 @@ struct AgentsSettingsSection: View {
                     .padding(6)
                     .background(Color.black.opacity(0.22), in: RoundedRectangle(cornerRadius: 8))
                     .overlay { RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)) }
-                Text(L("Empty = the research protocol the run workspace already carries. Stored at %@.", agent.path))
+                Text(L("Empty = the protocol the run workspace already carries. Stored at %@.", agent.path))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
+            .disabled(deep(agent))
         }
+    }
+
+    private func deep(_ agent: AgentDefinition) -> Bool { agent.kind == "deep-research" }
+
+    /// Who actually reads the settings below. A deep-research agent contributes
+    /// only its executor and model: the runner takes everything else from the
+    /// profile, which is a property of the research and not of who runs it.
+    /// Saying so is better than a form that silently does nothing.
+    private func runtimeNote(_ agent: AgentDefinition) -> String {
+        deep(agent)
+            ? L("A research run takes effort, turns, timeout, tools and prompt from its profile in section 03 — these do not apply to a deep-research agent yet.")
+            : L("These apply when this agent answers directly, which today means Ask.")
     }
 
     /// The config stores milliseconds; nobody thinks in them.

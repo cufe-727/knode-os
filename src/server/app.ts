@@ -608,14 +608,12 @@ export function createApp(
           cur.agent = spec;
         }
         if (typeof ch.model === 'string') cur.model = ch.model.trim();
-        if (typeof ch.effort === 'string' && (EFFORTS as readonly string[]).includes(ch.effort)) cur.effort = ch.effort as ChatConfig['effort'];
-        if (ch.web === 'inherit' || ch.web === 'on' || ch.web === 'off') cur.web = ch.web;
-        const setInt = (key: 'maxTurns' | 'timeoutMs' | 'historyTurns' | 'keep', min: number, max: number) => {
+        // effort, tools, turn cap, timeout and the extra prompt belong to the
+        // agent now — see `playbooks/agents/` and `resolveChatRuntime`
+        const setInt = (key: 'historyTurns' | 'keep', min: number, max: number) => {
           const value = Number(ch[key]);
           if (ch[key] !== undefined && Number.isFinite(value)) cur[key] = Math.min(max, Math.max(min, Math.floor(value)));
         };
-        setInt('maxTurns', 1, 200);
-        setInt('timeoutMs', 60_000, 2 * 3_600_000);
         setInt('historyTurns', 0, 50);
         setInt('keep', 1, 500);
       }

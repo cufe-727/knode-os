@@ -2603,20 +2603,32 @@ function executorOptions(selected) {
 }
 
 function agentFields(agent) {
+  // A deep-research agent contributes only its executor and model: the runner
+  // takes everything else from the profile in section 03, which is a property
+  // of the research rather than of who runs it. A dead form that says so beats
+  // a live-looking one that changes nothing.
+  const deep = agent.kind === 'deep-research';
+  const off = deep ? ' disabled' : '';
+  const note = deep
+    ? 'A research run takes effort, turns, timeout, tools and prompt from its profile in section 03 — these do not apply to a deep-research agent yet.'
+    : 'These apply when this agent answers directly, which today means Ask.';
   return `<div class="cfg-grid cfg-grid-2">
       <label>Runs on<select data-field="executor">${executorOptions(agent.executor)}</select></label>
       <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="Its own default" />${modelChevron(agent.executor === 'default' ? 'llm' : `connection:${agent.executor}`)}</span></label>
-      <label>Reasoning effort<select data-field="effort">${optionList(AGENT_EFFORTS, agent.effort)}</select></label>
-      <label>Web access<select data-field="web">${optionList(AGENT_WEB, agent.tools?.web ?? 'inherit')}</select></label>
-      <label>Turns per session<input data-field="maxTurns" type="number" min="0" step="1" value="${esc(agent.maxTurns ?? 0)}" placeholder="0 = the caller's default" /></label>
-      <label>Timeout (minutes)<input data-field="timeoutMinutes" type="number" min="0" step="1" value="${esc(Math.round((agent.timeoutMs ?? 0) / 60000))}" placeholder="0 = the caller's default" /></label>
       <label class="cfg-span-2">Description<input data-field="description" value="${esc(agent.description || '')}" placeholder="When to pick this agent" /></label>
     </div>
-    <div class="cfg-checks">
-      <label class="cfg-check"><input data-field="write" type="checkbox"${agent.tools?.write ? ' checked' : ''} /> Writes pages (knode_write / knode_commit)</label>
-      <label class="cfg-check"><input data-field="files" type="checkbox"${agent.tools?.files ? ' checked' : ''} /> Reads files (Read / Grep / Glob)</label>
+    <p class="cfg-callout${deep ? ' bad' : ''}">${esc(note)}</p>
+    <div class="cfg-grid cfg-grid-2">
+      <label>Reasoning effort<select data-field="effort"${off}>${optionList(AGENT_EFFORTS, agent.effort)}</select></label>
+      <label>Web access<select data-field="web"${off}>${optionList(AGENT_WEB, agent.tools?.web ?? 'inherit')}</select></label>
+      <label>Turns per session<input data-field="maxTurns" type="number" min="0" step="1" value="${esc(agent.maxTurns ?? 0)}" placeholder="0 = the caller's default"${off} /></label>
+      <label>Timeout (minutes)<input data-field="timeoutMinutes" type="number" min="0" step="1" value="${esc(Math.round((agent.timeoutMs ?? 0) / 60000))}" placeholder="0 = the caller's default"${off} /></label>
     </div>
-    <label class="agent-prompt">System prompt<textarea data-field="prompt" rows="6" class="mono" spellcheck="false" placeholder="Empty = the research protocol the run workspace already carries">${esc(agent.prompt || '')}</textarea></label>
+    <div class="cfg-checks">
+      <label class="cfg-check"><input data-field="write" type="checkbox"${agent.tools?.write ? ' checked' : ''}${off} /> Writes pages (knode_write / knode_commit)</label>
+      <label class="cfg-check"><input data-field="files" type="checkbox"${agent.tools?.files ? ' checked' : ''}${off} /> Reads files (Read / Grep / Glob)</label>
+    </div>
+    <label class="agent-prompt">System prompt<textarea data-field="prompt" rows="6" class="mono" spellcheck="false" placeholder="Empty = the protocol the run workspace already carries"${off}>${esc(agent.prompt || '')}</textarea></label>
     <p class="cfg-callout">Stored at <span class="mono">${esc(agent.path || '')}</span>.</p>`;
 }
 
@@ -2841,7 +2853,7 @@ function refreshResearchAgentOptions() {
   const chatSelect = $('#cfg-chat-agent');
   if (chatSelect) {
     const chatCurrent = chatSelect.value;
-    chatSelect.innerHTML = agentOptions(chatCurrent, 'The research agent above', 'general');
+    chatSelect.innerHTML = agentOptions(chatCurrent, 'The research agent, else the default provider', 'general');
     chatSelect.value = chatCurrent;
     if (chatSelect.value !== chatCurrent) chatSelect.value = '';
   }
@@ -2995,28 +3007,20 @@ function gatherResearchConfig() {
   };
 }
 
+// effort, tools, turn cap, timeout and the extra prompt belong to the agent
+// definition now; what is left here is a property of the conversation.
 function fillChatForm(chat) {
-  $('#cfg-chat-agent').innerHTML = agentOptions(chat.agent || '', 'The research agent above', 'general');
+  $('#cfg-chat-agent').innerHTML = agentOptions(chat.agent || '', 'The research agent, else the default provider', 'general');
   $('#cfg-chat-agent').value = chat.agent || '';
-  $('#cfg-chat-model').value = chat.model || '';
-  $('#cfg-chat-effort').innerHTML = optionList(EFFORT_OPTIONS, chat.effort || 'default');
-  $('#cfg-chat-web').value = chat.web || 'inherit';
-  $('#cfg-chat-maxturns').value = chat.maxTurns ?? 30;
-  $('#cfg-chat-timeout').value = Math.max(1, Math.round((chat.timeoutMs ?? 600000) / 60000));
   $('#cfg-chat-history').value = chat.historyTurns ?? 12;
-  $('#cfg-chat-keep').value = chat.keep ?? 50;
+  $('#cfg-chat-keep').value = chat.keep ?? 200;
 }
 
 function gatherChatConfig() {
   return {
     agent: $('#cfg-chat-agent').value,
-    model: $('#cfg-chat-model').value.trim(),
-    effort: $('#cfg-chat-effort').value,
-    web: $('#cfg-chat-web').value,
-    maxTurns: Number($('#cfg-chat-maxturns').value) || 30,
-    timeoutMs: (Number($('#cfg-chat-timeout').value) || 10) * 60000,
     historyTurns: Math.max(0, Number($('#cfg-chat-history').value) || 0),
-    keep: Number($('#cfg-chat-keep').value) || 50,
+    keep: Number($('#cfg-chat-keep').value) || 200,
   };
 }
 

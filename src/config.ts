@@ -412,28 +412,26 @@ export interface ResearchInitConfig {
   extractionMaxMs: number;
 }
 
-export type ChatWebAccess = 'inherit' | 'on' | 'off';
-
 /**
- * The chat entry: a person talks to the configured coding-agent CLI, which
- * answers from the knowledge base over MCP and may write what it is taught
- * (quarantined notes under raw/docs/notes/). Every turn is a fresh session
- * that replays recent history — no CLI session persistence (see docs/design/07).
+ * Ask: a person talks to the configured agent, which answers from the
+ * knowledge base over MCP and may write what it is taught (quarantined notes
+ * under raw/docs/notes/). Every turn is a fresh session that replays recent
+ * history — no CLI session persistence (see docs/design/07).
+ *
+ * *How* that agent runs — effort, tool grants, turn cap, timeout, extra
+ * prompt — belongs to the agent, in `playbooks/agents/<name>.yaml`. This block
+ * used to keep a second copy of all of it that nothing read; what is left is
+ * the three things that are properties of the conversation rather than of who
+ * answers it.
  */
 export interface ChatConfig {
   /** Agent name, connection id or provider; '' falls back to research.agent, then the default connection. */
   agent: string;
   /** Model override ('' = the agent's own). */
   model: string;
-  effort: LlmEffort;
-  /** Turn cap per reply. */
-  maxTurns: number;
-  timeoutMs: number;
-  /** Web tools: 'inherit' follows review.external (on only when it is 'research'); 'on' still requires review.external ≠ off. */
-  web: ChatWebAccess;
   /** Messages replayed into each turn's prompt (user + assistant, most recent). */
   historyTurns: number;
-  /** Conversations kept per workspace; older ones are pruned. Quick asks are one conversation each, so this fills faster than turns do. */
+  /** Conversations kept per workspace; older ones are pruned. One conversation per question fills this faster than turns do. */
   keep: number;
 }
 
@@ -641,7 +639,7 @@ export function defaultConfig(): KnodeConfig {
       claims: 'suggest',
       external: 'verify',
     },
-    chat: { agent: 'default', model: '', effort: 'default', maxTurns: 30, timeoutMs: 600_000, web: 'inherit', historyTurns: 12, keep: 200 },
+    chat: { agent: 'default', model: '', historyTurns: 12, keep: 200 },
     trace: {
       claudeProjectsDir: path.join(home, '.claude', 'projects'),
       codexSessionsDir: path.join(home, '.codex', 'sessions'),
@@ -740,7 +738,32 @@ export function loadConfig(dataDir: string): KnodeConfig {
   const base = defaultConfig();
   if (!fs.existsSync(file)) return migrateEmbeddingProviders(base);
   const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<KnodeConfig>;
-  return migrateEmbeddingProviders(migrateRouteConnections(deepMerge(base, raw)));
+  return migrateEmbeddingProviders(migrateRouteConnections(migrateChatConfig(deepMerge(base, raw))));
+}
+
+/**
+ * Drop the `chat.*` keys the agent definition now owns.
+ *
+ * `deepMerge` keeps unknown keys, so without this a file written before the
+ * move would carry them forever, looking like settings. Anything that was not
+ * the old default is announced once: `chat.maxTurns: 100` vanishing in silence
+ * is the kind of thing that becomes a bug report.
+ */
+const MOVED_CHAT_KEYS: Record<string, unknown> = { effort: 'default', maxTurns: 30, timeoutMs: 600_000, web: 'inherit' };
+
+export function migrateChatConfig(config: KnodeConfig): KnodeConfig {
+  const chat = config.chat as unknown as Record<string, unknown> | undefined;
+  if (!chat) return config;
+  const carried: string[] = [];
+  for (const [key, wasDefault] of Object.entries(MOVED_CHAT_KEYS)) {
+    if (!(key in chat)) continue;
+    if (chat[key] !== wasDefault) carried.push(`${key}=${JSON.stringify(chat[key])}`);
+    delete chat[key];
+  }
+  if (carried.length > 0) {
+    console.warn(`knode: chat.${carried.join(', chat.')} no longer applies — how an agent runs now lives in playbooks/agents/<name>.yaml (Settings → Providers & Agents)`);
+  }
+  return config;
 }
 
 const ROUTE_KEYS = ['entityLlm', 'conceptLlm', 'documentLlm'] as const;
