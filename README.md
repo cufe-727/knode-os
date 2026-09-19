@@ -247,7 +247,7 @@ Four sections, each with its own tabs.
   - **Graph** — force-directed graph explorer + insights (hubs / isolated / types)
   - **Wiki** — one button initializes the knowledge base (survey → overview page + `AGENTS.md` guide + queued topic pages), then queue and review deep-research pages
   - **Dream** — run dreams, review and accept/reject suggestions
-- **Settings** — **Providers**, **Pipeline** (embedding plus independently routed entity/concept/document-vision models; saving re-embeds or refreshes conversions when needed), **Agents**, **Research**, **Workspace**
+- **Settings** — **Providers** (every endpoint and key once, embedding and LLM in one table; `llmUse` marks which LLM connection is the default, and every job that names no provider of its own follows it), **Pipeline** (independently routed entity/concept/document-vision models; saving re-embeds or refreshes conversions when needed), **Agents**, **Research**, **Workspace**
 
 ## REST API (localhost)
 

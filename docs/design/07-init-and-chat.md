@@ -162,20 +162,52 @@ works beats two the reader has to arbitrate between.
    MCP endpoint in `createApp`'s `services`, so a queued job starts at once instead of at the next 30 s tick.
    The chat routes take the MCP endpoint from the same place.
 
+### 4.2 The default model is an ordinary connection (2026-09-19)
+
+`config.llm` used to *be* the default: a field beside `connections[]`, not a row in it. That made the providers
+table need two LLM row builders for one visible kind, reserved `'default'` as an id the server had to reject,
+and meant promoting an existing connection to default was retyping its endpoint and key rather than clicking it.
+
+`embeddingProviders[]` + `embeddingUse` had already solved this. LLMs now match it:
+
+| | before | after |
+| --- | --- | --- |
+| Where the default lives | `config.llm`, a field | a row in `connections[]` |
+| Which one is default | implicit — it was the field | `llmUse`, a pointer |
+| `config.llm` | the default itself | a **mirror** of the row, rewritten by `syncActiveLlm` |
+
+The mirror is what makes this cheap: `ctx.llm`, `resolveRoutedLlmConfig`'s base and `agentForSpec('default')`
+all keep reading `config.llm` unchanged. `migrateDefaultLlm` runs in `loadConfig` after `migrateRouteConnections`
+— which may already have minted a row for the same endpoint, and `sameEndpoint` reuses it rather than adding a
+twin — and again inside `PUT /api/config`, where it also repairs a client that sent a list without the default's
+row. `'default'` stays a reserved **spec** word (`RoutedLlmConfig.use`, `agentForSpec`), so `mergeConnections`
+still refuses it as a connection id.
+
+The rule that must not bend: a route storing `use: ''` or `'default'` keeps meaning *whatever is the default*.
+Rewriting those to the new id during migration would pin them to one endpoint and kill the propagation that
+named connections exist for. There is a test for exactly that.
+
+The last LLM connection cannot be removed, the way the last embedding provider cannot: something has to answer.
+Removing the default demotes it to the first row left and says so in the status line.
+
 ## 6. Config and migration
 
 ```jsonc
+"llmUse": "openai-1",          // which connections[] entry is the default
 "research": {
   "init": { "followUps": 6, "extraction": "drain", "extractionMaxMs": 900000 }
 },
 "chat": {
-  "agent": "", "model": "", "effort": "default", "maxTurns": 30, "timeoutMs": 600000,
-  "web": "inherit", "historyTurns": 12, "keep": 50
+  "agent": "default", "model": "", "historyTurns": 12, "keep": 200
 }
 ```
 
-Migration **v9** adds `chat_conversations` / `chat_messages`. New seeded files: `playbooks/research/init.md`,
-`playbooks/research/phases/init-*.md`, `playbooks/chat/AGENTS.md`, `playbooks/chat/turn.md` — none overwrite an edit.
+Migration **v9** adds `chat_conversations` / `chat_messages`; **v10** added `chat_messages.payload` and is kept
+though nothing writes it (§4.1). In-memory config migrations, in `loadConfig` order: `migrateChatConfig` drops
+the `chat.*` keys the agent definition now owns, `migrateRouteConnections` lifts pre-connections route endpoints
+into named rows, `migrateDefaultLlm` lifts the default LLM into one (§4.2), `migrateEmbeddingProviders` does the
+same for embeddings. New seeded files: `playbooks/research/init.md`, `playbooks/research/phases/init-*.md`,
+`playbooks/chat/AGENTS.md`, `playbooks/chat/turn.md` — none overwrite an edit.
 
 ## 7. Open items
 

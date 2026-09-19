@@ -485,10 +485,18 @@ export interface KnodeConfig {
   /** Which `embeddingProviders` entry the Index stage runs on. */
   embeddingUse: string;
   database: DatabaseConfig;
-  /** The default connection every route inherits unless it names another. */
+  /**
+   * A mirror of the connection `llmUse` names, flattened by `syncActiveLlm`.
+   *
+   * Everything that needs "the default model" — `ctx.llm`, a route that names
+   * no connection, `agentForSpec('default')` — reads this, so the default can
+   * become an ordinary row without touching any of them.
+   */
   llm: LlmConfig;
-  /** Extra named connections routes can be pointed at. */
+  /** Every configured LLM connection, including whichever one is the default. */
   connections: LlmConnection[];
+  /** Which `connections` entry is the default. */
+  llmUse: string;
   server: { port: number; host: string; mcp: McpServerConfig };
   ingest: IngestConfig;
   extraction: ExtractionConfig;
@@ -570,7 +578,11 @@ export function defaultConfig(): KnodeConfig {
       effort: 'default',
       cliTimeoutMs: 300_000,
     },
+    // seeded empty, like `embeddingProviders`: a row here would survive
+    // `deepMerge` and clobber a real saved list. `migrateDefaultLlm` mints the
+    // default's row on load instead.
     connections: [],
+    llmUse: '',
     server: { port: 9100, host: '127.0.0.1', mcp: { enabled: true, path: '/mcp' } },
     ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4, convertConcurrency: 2 },
     extraction: {
@@ -736,9 +748,11 @@ function deepMerge<T>(base: T, override: Partial<T>): T {
 export function loadConfig(dataDir: string): KnodeConfig {
   const file = path.join(dataDir, CONFIG_FILE);
   const base = defaultConfig();
-  if (!fs.existsSync(file)) return migrateEmbeddingProviders(base);
+  if (!fs.existsSync(file)) return migrateEmbeddingProviders(migrateDefaultLlm(base));
   const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<KnodeConfig>;
-  return migrateEmbeddingProviders(migrateRouteConnections(migrateChatConfig(deepMerge(base, raw))));
+  // routes first: it may already have minted a connection for this endpoint,
+  // and the default must reuse that row rather than add a twin
+  return migrateEmbeddingProviders(migrateDefaultLlm(migrateRouteConnections(migrateChatConfig(deepMerge(base, raw)))));
 }
 
 /**
@@ -796,6 +810,59 @@ export function migrateRouteConnections(config: KnodeConfig): KnodeConfig {
     config.extraction[key] = { ...route, use: connection.id };
   }
   return { ...config, connections };
+}
+
+/**
+ * Put the default LLM in `connections` as an ordinary row and point `llmUse`
+ * at it, the way `embeddingUse` has always pointed into `embeddingProviders`.
+ *
+ * `config.llm` used to be the default *itself*: a field beside the list, which
+ * meant two row builders in one table, and meant that making an existing
+ * connection the default was retyping its endpoint and key rather than
+ * clicking it. It is now a mirror of the named row.
+ *
+ * Routes keep `use: ''` / `'default'`, which still means "whatever is the
+ * default" — rewriting them to the new id would freeze them to one endpoint
+ * and break the propagation that named connections exist for.
+ */
+export function migrateDefaultLlm(config: KnodeConfig): KnodeConfig {
+  const connections = [...(config.connections ?? [])];
+  if (!connections.some((c) => c.id === config.llmUse)) {
+    const existing = connections.find((c) => sameEndpoint(c, config.llm) && c.model === config.llm.model);
+    if (existing) {
+      config.llmUse = existing.id;
+    } else {
+      const id = uniqueConnectionId(config.llm.provider, connections);
+      connections.unshift({ ...config.llm, id, label: config.llm.label?.trim() || llmProviderLabel(config.llm.provider) });
+      config.llmUse = id;
+    }
+  }
+  return syncActiveLlm({ ...config, connections });
+}
+
+/**
+ * The connection the default points at. A dangling `llmUse` falls back to the
+ * first rather than failing — deleting the default demotes it, it does not
+ * leave the workspace without a model.
+ */
+export function activeLlm(config: Pick<KnodeConfig, 'llm' | 'connections' | 'llmUse'>): LlmConnection {
+  const connections = config.connections ?? [];
+  return (
+    connections.find((c) => c.id === config.llmUse) ??
+    connections[0] ?? {
+      ...config.llm,
+      id: config.llmUse || 'default-1',
+      label: config.llm.label?.trim() || llmProviderLabel(config.llm.provider),
+    }
+  );
+}
+
+/** Rewrite the `llm` mirror from the active row, repairing a dangling `llmUse`. */
+export function syncActiveLlm(config: KnodeConfig): KnodeConfig {
+  const { id, ...endpoint } = activeLlm(config);
+  config.llm = endpoint;
+  config.llmUse = id;
+  return config;
 }
 
 function sameEndpoint(a: LlmConfig, b: LlmConfig): boolean {

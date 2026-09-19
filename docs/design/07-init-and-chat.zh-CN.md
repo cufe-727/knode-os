@@ -137,20 +137,50 @@ stream-json `tool_use` + `tool_result`；codex 没有事件流则为空），外
 4. **立即认领**：`startResearchLoop` 返回 `kick()`，`serve` 把它连同该工作区的 MCP 端点登记到 `createApp` 的
    `services`，入队后立刻开跑，不等 30 s 定时器。聊天路由也从这里取 MCP 端点。
 
+### 4.2 默认模型变成一条普通连接（2026‑09‑19）
+
+`config.llm` 过去**就是**默认：一个与 `connections[]` 并列的字段，而不是列表里的一行。于是同一种可见类型要写
+两个 LLM row builder，`'default'` 被迫成为服务端必须拒绝的保留 id，而把某条已有连接设为默认要重新抄一遍它的
+端点和密钥，而不是点一下。
+
+`embeddingProviders[]` + `embeddingUse` 早就解决过这件事。LLM 侧现在对齐：
+
+| | 之前 | 之后 |
+| --- | --- | --- |
+| 默认存在哪 | `config.llm` 字段 | `connections[]` 里的一行 |
+| 谁是默认 | 隐含——它就是那个字段 | `llmUse` 指针 |
+| `config.llm` | 默认本身 | 那一行的**镜像**，由 `syncActiveLlm` 回写 |
+
+镜像是这件事成本低的原因：`ctx.llm`、`resolveRoutedLlmConfig` 的 base、`agentForSpec('default')` 全都照旧读
+`config.llm`，一行都不用改。`migrateDefaultLlm` 在 `loadConfig` 里排在 `migrateRouteConnections` 之后——后者
+可能已经为同一个端点建过行，`sameEndpoint` 会复用它而不是再建一个孪生行——并在 `PUT /api/config` 里再跑一次，
+顺带修复"客户端提交的列表里没有默认那一行"的情况。`'default'` 仍是保留的 **spec** 关键字
+（`RoutedLlmConfig.use`、`agentForSpec`），所以 `mergeConnections` 依旧拒绝把它当连接 id。
+
+不能弯的那条规则：路由里存的 `use: ''` / `'default'` 继续表示*当前的默认是谁*。迁移时把它们改写成新 id 会把
+路由钉死在一个端点上，毁掉命名连接存在的意义——传导。为此专门有一条测试。
+
+最后一条 LLM 连接不能删，和最后一个 embedding provider 一样：总得有人作答。删掉默认会把它降级到剩下的第一行，
+并在状态栏里说出来。
+
 ## 6. 配置与迁移
 
 ```jsonc
+"llmUse": "openai-1",          // connections[] 里哪一条是默认
 "research": {
   "init": { "followUps": 6, "extraction": "drain", "extractionMaxMs": 900000 }
 },
 "chat": {
-  "agent": "", "model": "", "effort": "default", "maxTurns": 30, "timeoutMs": 600000,
-  "web": "inherit", "historyTurns": 12, "keep": 50
+  "agent": "default", "model": "", "historyTurns": 12, "keep": 200
 }
 ```
 
-迁移 **v9**：`chat_conversations` / `chat_messages` 两张表。种子文件新增 `playbooks/research/init.md`、
-`playbooks/research/phases/init-*.md`、`playbooks/chat/AGENTS.md`、`playbooks/chat/turn.md`（都不覆盖已有文件）。
+迁移 **v9**：`chat_conversations` / `chat_messages` 两张表；**v10** 增加了 `chat_messages.payload`，虽然已无人
+写入但保留（见 §4.1）。内存里的配置迁移，按 `loadConfig` 的顺序：`migrateChatConfig` 删掉已归 agent 定义所有的
+`chat.*` 键，`migrateRouteConnections` 把前命名连接时代的路由端点提取成具名行，`migrateDefaultLlm` 把默认 LLM
+也提取成一行（见 §4.2），`migrateEmbeddingProviders` 对 embedding 做同样的事。种子文件新增
+`playbooks/research/init.md`、`playbooks/research/phases/init-*.md`、`playbooks/chat/AGENTS.md`、
+`playbooks/chat/turn.md`（都不覆盖已有文件）。
 
 ## 7. 未决 / 已知限制
 

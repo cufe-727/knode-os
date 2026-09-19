@@ -215,7 +215,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
   - **Graph / 图谱** —— 力导向图谱浏览 + 洞察(枢纽/孤立节点/类型分布)
   - **Wiki** —— 一个按钮完成知识库初始化(通读 → 总览页 + AGENTS.md 指南 + 排队的主题页),并在此发起与审阅深度研究页
   - **Dream / 夜间分析** —— 手动触发 dream,审阅并接受/拒绝建议
-- **Settings / 设置** —— **Providers**、**Pipeline**(embedding 与独立的 Entity / Concept / 文档视觉模型路由；保存后按需重建 embedding 或刷新转换)、**Agents**、**Research**、**Workspace**
+- **Settings / 设置** —— **Providers**（每个端点与密钥只配一次，embedding 与 LLM 同在一张表；`llmUse` 标出哪条 LLM 连接是默认，所有没有自己指定 provider 的任务都跟着它走）、**Pipeline**（独立的 Entity / Concept / 文档视觉模型路由；保存后按需重建 embedding 或刷新转换）、**Agents**、**Research**、**Workspace**
 
 ## REST API(仅 localhost)
 

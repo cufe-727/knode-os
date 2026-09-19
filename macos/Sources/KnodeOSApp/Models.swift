@@ -821,8 +821,12 @@ struct KnodeConfig: Codable, Equatable {
     var embeddingProviders: [EmbeddingConnection]
     /// Which `embeddingProviders` entry the Index stage runs on.
     var embeddingUse: String
+    /// A mirror of the connection `llmUse` names, flattened by the service.
+    /// Read-only here: the table edits the list, like the embedding one.
     var llm: LLMConfig
     var connections: [LLMConnection]
+    /// Which `connections` entry every job inherits unless it names another.
+    var llmUse: String
     var ingest: IngestConfig
     var extraction: ExtractionConfig
     var research: ResearchConfig
@@ -835,6 +839,7 @@ struct KnodeConfig: Codable, Equatable {
         embeddingUse = try container.decodeIfPresent(String.self, forKey: .embeddingUse) ?? ""
         llm = try container.decode(LLMConfig.self, forKey: .llm)
         connections = try container.decodeIfPresent([LLMConnection].self, forKey: .connections) ?? []
+        llmUse = try container.decodeIfPresent(String.self, forKey: .llmUse) ?? ""
         ingest = try container.decodeIfPresent(IngestConfig.self, forKey: .ingest) ?? IngestConfig()
         extraction = try container.decode(ExtractionConfig.self, forKey: .extraction)
         research = try container.decodeIfPresent(ResearchConfig.self, forKey: .research) ?? ResearchConfig()
@@ -844,6 +849,11 @@ struct KnodeConfig: Codable, Equatable {
     /// The entry the Index stage runs on, or nil while the list is still loading.
     var activeEmbedding: EmbeddingConnection? {
         embeddingProviders.first { $0.id == embeddingUse } ?? embeddingProviders.first
+    }
+
+    /// The connection every job inherits, or nil while the list is still loading.
+    var activeLlm: LLMConnection? {
+        connections.first { $0.id == llmUse } ?? connections.first
     }
 }
 

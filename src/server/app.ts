@@ -20,6 +20,7 @@ import {
   embeddingIdentity,
   activeEmbedding,
   syncActiveEmbedding,
+  migrateDefaultLlm,
   saveConfig, ResearchConfig, ChatConfig, LLM_EFFORTS, LLM_PROTOCOLS } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
@@ -133,6 +134,7 @@ type ModelConfigDraft = {
   ingest?: { concurrency?: number; convertConcurrency?: number };
   llm?: Partial<LlmConfig>;
   connections?: Partial<LlmConnection>[];
+  llmUse?: string;
   extraction?: ExtractionConfigDraft;
   retrieval?: { sag?: Partial<SagSearchConfig> };
   research?: Partial<Omit<ResearchConfig, 'auto' | 'init'>> & { auto?: Partial<ResearchConfig['auto']>; init?: Partial<ResearchConfig['init']> };
@@ -482,8 +484,13 @@ export function createApp(
       return c.json(await listModelsCached('embedding', entry, opts));
     }
 
-    const baseLlm = mergeLlmConfig(ctx.config.llm, draft.llm);
     const connections = mergeConnections(ctx.config.connections, draft.connections);
+    // the default is an ordinary row, so 'llm' means whichever one `llmUse`
+    // names in the draft — with an explicit `llm` block still winning, for a
+    // client that edits the mirror
+    const llmUse = typeof draft.llmUse === 'string' && draft.llmUse.trim() ? draft.llmUse.trim() : ctx.config.llmUse;
+    const active = connections.find((c) => c.id === llmUse) ?? ctx.config.llm;
+    const baseLlm = mergeLlmConfig(active, draft.llm);
     if (route === 'llm') return c.json(await listModelsCached('chat', baseLlm, opts));
 
     // A named connection can be listed on its own, before any route uses it.
@@ -525,12 +532,23 @@ export function createApp(
       // Unconditional: this is also what repairs a dangling embeddingUse, and
       // it flattens the mirror before the re-embed diff below reads it.
       Object.assign(next, mergeEmbeddingSection(next, incoming));
-      if (incoming.llm) {
-        next.llm = mergeLlmConfig(next.llm, incoming.llm);
-      }
       if (incoming.connections) {
         next.connections = mergeConnections(next.connections, incoming.connections);
       }
+      if (typeof incoming.llmUse === 'string' && incoming.llmUse.trim()) {
+        next.llmUse = incoming.llmUse.trim();
+      }
+      if (incoming.llm) {
+        // `llm` is the flattened mirror, so a client that edits it — an older
+        // one, or `knode-os config set` — is editing the default's row
+        const index = next.connections.findIndex((c) => c.id === next.llmUse);
+        if (index >= 0) next.connections[index] = { ...next.connections[index], ...mergeLlmConfig(next.connections[index], incoming.llm) };
+        else next.llm = mergeLlmConfig(next.llm, incoming.llm);
+      }
+      // repairs a dangling `llmUse` — including a client that sent a list
+      // without the default's row — and flattens the mirror before the
+      // reconvert diff below reads it
+      Object.assign(next, migrateDefaultLlm(next));
       if (incoming.extraction) {
         const x = incoming.extraction;
         if (x.entityLlm) {

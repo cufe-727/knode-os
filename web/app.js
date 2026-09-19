@@ -2168,12 +2168,18 @@ document.addEventListener('click', (event) => {
 let connectionDrafts = [];
 let embeddingDrafts = [];
 let embeddingUse = '';
-let defaultLlmDraft = null;
+/** Which connection is the default — the mirror of `embeddingUse`. */
+let llmUse = '';
 /** Provider ids whose row is open, kept across a redraw. */
 const expandedProviders = new Set();
 
 function connectionById(id) {
   return connectionDrafts.find((c) => c.id === id);
+}
+
+/** The connection every job inherits, or null while the list is loading. */
+function defaultConnection() {
+  return connectionDrafts.find((c) => c.id === llmUse) ?? connectionDrafts[0] ?? null;
 }
 
 const EMBEDDING_PROVIDER_OPTIONS = [
@@ -2209,16 +2215,17 @@ function embeddingSummaryText() {
 }
 
 function defaultLlmSummaryText() {
-  if (!defaultLlmDraft) return 'Loading…';
-  const name = defaultLlmDraft.label?.trim() || providerNames[defaultLlmDraft.provider] || defaultLlmDraft.provider;
-  return defaultLlmDraft.model ? `${name} · ${defaultLlmDraft.model}` : name;
+  const entry = defaultConnection();
+  if (!entry) return 'Loading…';
+  const name = entry.label?.trim() || providerNames[entry.provider] || entry.provider;
+  return entry.model ? `${name} · ${entry.model}` : name;
 }
 
 function routeSummary(prefix) {
   const use = $(`#cfg-${prefix}-use`).value;
   const model = $(`#cfg-${prefix}-model`).value.trim();
   const connection = connectionById(use);
-  const fallback = defaultLlmDraft?.label?.trim() || 'Default model';
+  const fallback = defaultConnection()?.label?.trim() || 'Default model';
   const name = connection ? connection.label || connection.id : fallback;
   const effective = model || connection?.model?.trim() || '';
   return effective ? `${name} · ${effective}` : name;
@@ -2302,7 +2309,7 @@ function routeProviderToggle(prefix) {
   const note = $(`#cfg-${prefix}-note`);
   const connection = connectionById($(`#cfg-${prefix}-use`).value);
   if (!connection) {
-    const provider = defaultLlmDraft?.provider ?? 'openai';
+    const provider = defaultConnection()?.provider ?? 'openai';
     note.innerHTML = `<b>Inherited route.</b> Runs on the default provider (${esc(providerNames[provider] ?? provider)}).`;
   } else if (connection.provider === 'openai') {
     note.innerHTML = `<b>${esc(connection.label || connection.id)}</b> · ${esc(connection.baseUrl.trim() || 'no endpoint set')}`;
@@ -2327,14 +2334,16 @@ const optionsFor = (pairs, selected) =>
   pairs.map(([v, l]) => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(l)}</option>`).join('');
 
 /** The shared row chrome; `fields` is the form the chevron opens. */
-function providerRow({ kind, accent, id, label, placeholder, providerLabel, summary, isDefault, removable, fields }) {
+function providerRow({ kind, accent, id, label, placeholder, providerLabel, summary, isDefault, removable, promotable, fields }) {
   const open = expandedProviders.has(id);
   return `<div class="provider-row${open ? ' open' : ''}" data-id="${esc(id)}" data-kind="${kind}">
     <div class="provider-line">
       <button type="button" class="provider-toggle" aria-expanded="${open}" title="${open ? 'Collapse' : 'Expand'}">${open ? '▾' : '▸'}</button>
       <span class="section-badge ${accent === 'accent2' ? 'accent2' : ''}">${esc(kind === 'embedding' ? 'embed' : 'llm')}</span>
       <input class="provider-name" data-field="label" value="${esc(label || '')}" placeholder="${esc(placeholder)}" />
-      <span>${isDefault ? `<span class="section-badge ${accent === 'accent2' ? 'accent2' : ''}">default</span>` : ''}</span>
+      <span>${isDefault
+        ? `<span class="section-badge ${accent === 'accent2' ? 'accent2' : ''}">default</span>`
+        : promotable ? '<button type="button" class="hint-action provider-default" title="Every job that names no provider of its own moves here">make default</button>' : ''}</span>
       <span class="provider-kind">${esc(providerLabel)}</span>
       <span class="provider-model mono">${esc(summary || 'no model set')}</span>
       <span class="provider-id mono">${esc(id)}</span>
@@ -2387,21 +2396,8 @@ function renderProviders() {
       fields: embeddingFields(e),
     }));
 
-  if (defaultLlmDraft) {
-    rows.push(providerRow({
-      kind: 'llm',
-      accent: 'accent2',
-      id: 'default',
-      label: defaultLlmDraft.label,
-      placeholder: providerNames[defaultLlmDraft.provider] ?? 'Name this provider',
-      providerLabel: providerNames[defaultLlmDraft.provider] ?? defaultLlmDraft.provider,
-      summary: defaultLlmDraft.model,
-      isDefault: true,
-      removable: false,
-      fields: llmFields(defaultLlmDraft, 'llm'),
-    }));
-  }
-
+  // the default is an ordinary row that `llmUse` points at, so there is one
+  // LLM row builder rather than one for the default and one for the rest
   for (const c of connectionDrafts) {
     rows.push(providerRow({
       kind: 'llm',
@@ -2411,8 +2407,10 @@ function renderProviders() {
       placeholder: 'Name this provider',
       providerLabel: providerNames[c.provider] ?? c.provider,
       summary: c.model,
-      isDefault: false,
-      removable: true,
+      isDefault: c.id === (defaultConnection()?.id ?? ''),
+      // something has to answer, so the last one stays
+      removable: connectionDrafts.length > 1,
+      promotable: true,
       fields: llmFields(c, `connection:${c.id}`),
     }));
   }
@@ -2423,7 +2421,6 @@ function renderProviders() {
 
 /** The draft one row edits, whichever of the three lists it came from. */
 function providerDraft(id) {
-  if (id === 'default') return defaultLlmDraft;
   return embeddingDrafts.find((e) => e.id === id) ?? connectionById(id);
 }
 
@@ -2478,8 +2475,8 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     loadedConfig = cfg;
     embeddingDrafts = (cfg.embeddingProviders ?? []).map((e) => ({ ...e }));
     embeddingUse = cfg.embeddingUse || embeddingDrafts[0]?.id || '';
-    defaultLlmDraft = { ...cfg.llm };
     connectionDrafts = (cfg.connections ?? []).map((c) => ({ ...c }));
+    llmUse = cfg.llmUse || connectionDrafts[0]?.id || '';
     renderProviders();
     fillRouteOptions();
     fillRoute('entity', cfg.extraction?.entityLlm);
@@ -2547,8 +2544,8 @@ function gatherConfig() {
       concurrency: Number($('#cfg-ingest-concurrency').value) || undefined,
       convertConcurrency: Number($('#cfg-ingest-convert').value) || undefined,
     },
-    llm: { ...defaultLlmDraft, label: (defaultLlmDraft?.label || '').trim() },
     connections: connectionDrafts.map((c) => ({ ...c, label: c.label.trim() || c.id })),
+    llmUse,
     extraction: {
       entityLlm: gatherRoute('entity'),
       conceptLlm: gatherRoute('concept'),
@@ -2827,7 +2824,7 @@ function agentOptions(selected, fallbackLabel, kind = '') {
   for (const p of CLI_PROVIDERS) opts.push(`<option value="${p}"${p === selected ? ' selected' : ''}>${esc(providerNames[p])} · from PATH</option>`);
   // 'default' is the section-01 connection named explicitly; a CLI there runs as
   // a CLI, an OpenAI-compatible endpoint runs the built-in agent
-  const provider = defaultLlmDraft?.provider;
+  const provider = defaultConnection()?.provider;
   opts.push(`<option value="default"${selected === 'default' ? ' selected' : ''}>Default LLM provider${provider ? ` · ${esc(providerNames[provider] || provider)}` : ''}</option>`);
   for (const c of connectionDrafts) {
     const how = CLI_PROVIDERS.includes(c.provider) ? providerNames[c.provider] : 'built-in agent';
@@ -2839,7 +2836,7 @@ function agentOptions(selected, fallbackLabel, kind = '') {
 /** Only the CLIs ship a web tool; the built-in agent searches the base only. */
 function agentWebCapable(spec) {
   if (CLI_PROVIDERS.includes(spec)) return true;
-  const provider = spec === 'default' ? defaultLlmDraft?.provider : connectionById(spec)?.provider;
+  const provider = spec === 'default' ? defaultConnection()?.provider : connectionById(spec)?.provider;
   return CLI_PROVIDERS.includes(provider);
 }
 
@@ -3299,6 +3296,13 @@ $('#cfg-providers').addEventListener('click', (event) => {
     return;
   }
 
+  if (event.target.classList.contains('provider-default')) {
+    llmUse = id;
+    renderProviders();
+    updateConfigSummaries();
+    return;
+  }
+
   if (!event.target.classList.contains('provider-remove') || event.target.disabled) return;
   expandedProviders.delete(id);
   if (row.dataset.kind === 'embedding') {
@@ -3315,8 +3319,15 @@ $('#cfg-providers').addEventListener('click', (event) => {
   }
 
   connectionDrafts = connectionDrafts.filter((c) => c.id !== id);
+  // removing the default moves it to the first row left — say so, because
+  // every job that names no provider of its own moves with it
+  if (llmUse === id && connectionDrafts[0]) {
+    llmUse = connectionDrafts[0].id;
+    $('#cfg-status').innerHTML = `<div class="cfg-line">The default provider is now ${esc(connectionDrafts[0].label || llmUse)} — every job that names no provider of its own follows it.</div>`;
+  }
   renderProviders();
   fillRouteOptions();
+  updateConfigSummaries();
   // a route pointing at the removed connection falls back to the default
   for (const prefix of ['entity', 'concept', 'document']) {
     if ($(`#cfg-${prefix}-use`).value === id) $(`#cfg-${prefix}-use`).value = '';

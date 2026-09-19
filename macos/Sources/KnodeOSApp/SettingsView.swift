@@ -177,8 +177,6 @@ struct SettingsView: View {
                     Divider()
                     embeddingRow(index: index, entry: entry)
                 }
-                Divider()
-                defaultLlmRow
                 ForEach(Array((config?.connections ?? []).enumerated()), id: \.element.id) { index, connection in
                     Divider()
                     connectionRow(index: index, connection: connection)
@@ -236,49 +234,20 @@ struct SettingsView: View {
         }
     }
 
-    private var defaultLlmRow: some View {
-        ProviderRow(
-            kind: L("LLM"),
-            color: .knodeViolet,
-            isDefault: true,
-            label: defaultLlmLabel,
-            providerName: providerName(config?.llm.provider ?? ""),
-            summary: config?.llm.model ?? "",
-            id: "default",
-            expanded: expandedBinding("default"),
-            remove: nil
-        ) {
-            VStack(alignment: .leading, spacing: 12) {
-                LlmProviderFields(
-                    provider: binding(\.llm.provider),
-                    model: binding(\.llm.model),
-                    baseUrl: binding(\.llm.baseUrl),
-                    apiKey: binding(\.llm.apiKey),
-                    cliPath: binding(\.llm.cliPath),
-                    effort: binding(\.llm.effort),
-                    cliTools: cliTools,
-                    route: "llm",
-                    load: { refresh in try await modelList(route: "llm", refresh: refresh) }
-                )
-                Text(defaultModelNote)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
     private func connectionRow(index: Int, connection: LLMConnection) -> some View {
-        ProviderRow(
+        let isDefault = connection.id == config?.llmUse
+        return ProviderRow(
             kind: L("LLM"),
             color: .knodeViolet,
-            isDefault: false,
+            isDefault: isDefault,
             label: binding(\.connections)[index].label,
             providerName: providerName(connection.provider),
             summary: connection.model,
             id: connection.id,
             expanded: expandedBinding(connection.id),
-            remove: { removeConnection(id: connection.id) }
+            // something has to answer, so the last one cannot go
+            remove: (config?.connections.count ?? 0) > 1 ? { removeConnection(id: connection.id) } : nil,
+            makeDefault: isDefault ? nil : { config?.llmUse = connection.id }
         ) {
             LlmProviderFields(
                 provider: binding(\.connections)[index].provider,
@@ -292,16 +261,6 @@ struct SettingsView: View {
                 load: { refresh in try await modelList(route: "connection:\(connection.id)", refresh: refresh) }
             )
         }
-    }
-
-    /// The default LLM's name is optional in the config — an empty one means
-    /// "call it whatever the provider is called" — but the field is a plain
-    /// text field like every other name.
-    private var defaultLlmLabel: Binding<String> {
-        Binding(
-            get: { config?.llm.label ?? "" },
-            set: { config?.llm.label = $0 }
-        )
     }
 
     private func expandedBinding(_ id: String) -> Binding<Bool> {
@@ -892,16 +851,6 @@ struct SettingsView: View {
         return config.llm.model.isEmpty ? providerName(config.llm.provider) : "\(providerName(config.llm.provider)) · \(config.llm.model)"
     }
 
-    private var defaultModelNote: String {
-        guard let provider = config?.llm.provider else { return "" }
-        return switch provider {
-        case "codex-cli": L("Uses your existing Codex login for a read-only one-shot request.")
-        case "claude-cli": L("Uses your existing Claude Code login for one non-interactive turn.")
-        case "cursor-cli": L("Uses your existing Cursor Agent login in headless print mode.")
-        default: L("Any OpenAI-compatible chat endpoint works (OpenAI, DeepSeek, Ollama, vLLM, SiliconFlow…). Use env:VAR_NAME to keep the key out of the config file. An empty model disables LLM features; the deterministic pipeline keeps running.")
-        }
-    }
-
     /// Models the service reports for one route, using the on-screen draft so a
     /// key or endpoint typed but not yet saved is the one that gets queried.
     private func modelList(route: String, refresh: Bool = false) async throws -> ModelListResponse {
@@ -969,10 +918,18 @@ struct SettingsView: View {
         statusIsError = false
     }
 
+    /// Removing the default moves it to the first row left — the same shape as
+    /// removing the active embedding provider, and said out loud for the same
+    /// reason: every inheriting job moves with it.
     private func removeConnection(id: String) {
-        guard config != nil else { return }
+        guard config != nil, config!.connections.count > 1 else { return }
         config!.connections.removeAll { $0.id == id }
         expandedProviders.remove(id)
+        if config!.llmUse == id, let next = config!.connections.first {
+            config!.llmUse = next.id
+            statusMessage = L("The default provider is now %@ — every job that names no provider of its own follows it.", next.label)
+            statusIsError = false
+        }
         // A route left pointing at a deleted connection would silently fall back
         // to the default; say so by moving it there explicitly.
         for keyPath in [\KnodeConfig.extraction.entityLlm, \KnodeConfig.extraction.conceptLlm, \KnodeConfig.extraction.documentLlm] {
@@ -1323,9 +1280,12 @@ private struct ProviderRow<Detail: View>: View {
     let summary: String
     let id: String
     @Binding var expanded: Bool
-    /// nil for a row that must not be removed — the default LLM, and the last
-    /// embedding provider, since something has to embed.
+    /// nil for a row that must not be removed — the last LLM connection, and
+    /// the last embedding provider, since something has to answer and embed.
     let remove: (() -> Void)?
+    /// nil when this row cannot be made the default: it already is, or its
+    /// kind picks its default another way.
+    var makeDefault: (() -> Void)? = nil
     @ViewBuilder let detail: Detail
 
     var body: some View {
@@ -1349,7 +1309,14 @@ private struct ProviderRow<Detail: View>: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 210)
 
-                if isDefault { RouteBadge(label: L("Default"), color: color) }
+                if isDefault {
+                    RouteBadge(label: L("Default"), color: color)
+                } else if let makeDefault {
+                    Button(L("Make default"), action: makeDefault)
+                        .buttonStyle(.link)
+                        .font(.system(size: 10))
+                        .help(L("Every job that names no provider of its own moves here"))
+                }
 
                 Text(providerName)
                     .font(.callout)
@@ -1494,7 +1461,26 @@ private struct LlmProviderFields: View {
                         .gridCellColumns(2)
                 }
             }
+            GridRow {
+                Text(llmProviderNote(provider))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .gridCellColumns(2)
+            }
         }
+    }
+}
+
+/// What this provider needs, and what an empty model means for it. Used to sit
+/// on the default's row alone; every row can be the default now.
+@MainActor
+func llmProviderNote(_ provider: String) -> String {
+    switch provider {
+    case "codex-cli": L("Uses your existing Codex login for a read-only one-shot request.")
+    case "claude-cli": L("Uses your existing Claude Code login for one non-interactive turn.")
+    case "cursor-cli": L("Uses your existing Cursor Agent login in headless print mode.")
+    default: L("Any OpenAI-compatible chat endpoint works (OpenAI, DeepSeek, Ollama, vLLM, SiliconFlow…). Use env:VAR_NAME to keep the key out of the config file. An empty model disables LLM features; the deterministic pipeline keeps running.")
     }
 }
 
