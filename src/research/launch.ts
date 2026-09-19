@@ -1,7 +1,7 @@
 import { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { cliCommand, readCursorStream, resolveExecutable, runProcess } from '../llm/cli.js';
+import { cliCommand, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess } from '../llm/cli.js';
 import { AgentProvider, CliAgent, ResearchAgent } from './agent.js';
 import { Effort, Freshness, NativeAgentSpec } from './profile.js';
 import { McpEndpoint, RunWorkspace } from './workspace.js';
@@ -225,24 +225,9 @@ export function agentEnv(input: LaunchInput): NodeJS.ProcessEnv {
 
 /* ------------------------------------------------------------------ adapters */
 
-/** codex has no `max`; cursor's bracket syntax is documented up to `high`. */
-export function effortFor(provider: AgentProvider, effort: Effort | undefined): string | null {
-  if (!effort || effort === 'default') return null;
-  if (provider === 'codex-cli') return effort === 'max' ? 'xhigh' : effort;
-  if (provider === 'cursor-cli') return effort === 'max' || effort === 'xhigh' ? 'high' : effort;
-  return effort;
-}
-
-/** cursor takes effort inside the model name: `claude-opus-4-8[context=1m,effort=high]`. */
-export function cursorModel(model: string, effort: Effort | undefined): string {
-  const level = effortFor('cursor-cli', effort);
-  if (!model || !level) return model;
-  if (/\[.*\]$/.test(model)) {
-    if (/effort=/.test(model)) return model.replace(/effort=[a-z]+/, `effort=${level}`);
-    return model.replace(/\]$/, `,effort=${level}]`);
-  }
-  return `${model}[effort=${level}]`;
-}
+// Both adapters live with the CLI runners, so a one-shot completion and a
+// research session ask for the same level in the same way.
+export { cursorModel, effortFor };
 
 function agentToolNames(a: NativeAgentSpec): string[] {
   return [

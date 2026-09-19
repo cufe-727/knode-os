@@ -15,6 +15,7 @@ import {
   resolveRoutedLlmConfig,
 } from '../src/config.js';
 import { cliCommand, readCursorStream, resolveExecutable } from '../src/llm/cli.js';
+import { parseClaudeAliases, parseCodexCatalog } from '../src/llm/models.js';
 import { clearModelCache } from '../src/llm/model-cache.js';
 import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
@@ -385,6 +386,43 @@ describe('PUT /api/config with connections', () => {
 
     const dropped = await save({ connections: [] });
     expect(((await dropped.json()) as { config: KnodeConfig }).config.connections).toEqual([]);
+  });
+});
+
+describe('what a CLI says it offers', () => {
+  it('reads the listable models out of a codex catalog, best first', () => {
+    const catalog = JSON.stringify({
+      models: [
+        { slug: 'gpt-5.5', display_name: 'GPT-5.5', visibility: 'list', priority: 12, supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }, { effort: 'xhigh' }] },
+        { slug: 'gpt-6-astra', display_name: 'GPT-6-Astra', visibility: 'list', priority: 1, supported_reasoning_levels: [{ effort: 'low' }, { effort: 'max' }, { effort: 'ultra' }] },
+        { slug: 'gpt-reserve', display_name: 'GPT-Reserve', visibility: 'hide', priority: 3 },
+        { slug: '', display_name: 'nameless', visibility: 'list' },
+      ],
+    });
+    expect(parseCodexCatalog(catalog)).toEqual([
+      { id: 'gpt-6-astra', label: 'GPT-6-Astra · effort low–ultra' },
+      { id: 'gpt-5.5', label: 'GPT-5.5 · effort low–xhigh' },
+    ]);
+  });
+
+  it('tolerates a catalog with noise around it, and refuses one that is not JSON', () => {
+    expect(parseCodexCatalog('warning: stale cache\n{"models":[{"slug":"gpt-6-astra"}]}\n')).toEqual([
+      { id: 'gpt-6-astra', label: 'gpt-6-astra' },
+    ]);
+    expect(() => parseCodexCatalog('command not found')).toThrow();
+  });
+
+  it('reads the aliases claude names as examples, and drops the full ids', () => {
+    const help = [
+      '  --model <model>                       Model for the current session. Provide',
+      "                                        an alias for the latest model (e.g.",
+      "                                        'fable', 'opus', or 'sonnet') or a",
+      "                                        model's full name (e.g.",
+      "                                        'claude-fable-5').",
+      '  -n, --name <name>                     Set a display name for this session',
+    ].join('\n');
+    expect(parseClaudeAliases(help)).toEqual(['fable', 'opus', 'sonnet']);
+    expect(parseClaudeAliases('nothing to see here')).toEqual([]);
   });
 });
 

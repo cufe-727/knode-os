@@ -71,6 +71,15 @@ export interface DatabaseConfig {
 
 export type LlmProvider = 'openai' | 'codex-cli' | 'claude-cli' | 'cursor-cli';
 
+/**
+ * Reasoning effort a CLI provider runs at. `default` leaves the CLI's own
+ * setting alone; everything else is passed through (see `effortFor` for the
+ * one CLI that cannot take the whole ladder). Research profiles read the same
+ * list as `EFFORTS`, so a level means one thing everywhere.
+ */
+export const LLM_EFFORTS = ['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type LlmEffort = (typeof LLM_EFFORTS)[number];
+
 export interface LlmConfig {
   /**
    * 'openai'     = any OpenAI-compatible /v1/chat/completions endpoint (needs baseUrl/apiKey);
@@ -90,6 +99,12 @@ export interface LlmConfig {
   model: string;
   /** Override the CLI executable (path or name). Empty = provider default from PATH. */
   cliPath: string;
+  /**
+   * How hard a CLI provider thinks: claude `--effort`, codex
+   * `model_reasoning_effort`, cursor `model[effort=…]`. Absent or 'default'
+   * leaves the CLI's own setting alone. OpenAI-compatible endpoints ignore it.
+   */
+  effort?: LlmEffort;
   /** Kill a CLI completion after this long. */
   cliTimeoutMs: number;
   /** Shown in the UI. Empty = llmProviderLabel(provider). */
@@ -387,7 +402,7 @@ export interface ChatConfig {
   agent: string;
   /** Model override ('' = the agent's own). */
   model: string;
-  effort: 'default' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  effort: LlmEffort;
   /** Turn cap per reply. */
   maxTurns: number;
   timeoutMs: number;
@@ -530,6 +545,7 @@ export function defaultConfig(): KnodeConfig {
       apiKey: 'env:OPENAI_API_KEY',
       model: '',
       cliPath: '',
+      effort: 'default',
       cliTimeoutMs: 300_000,
     },
     connections: [],
@@ -620,6 +636,7 @@ export function defaultRoutedLlmConfig(): RoutedLlmConfig {
     apiKey: '',
     model: '',
     cliPath: '',
+    effort: 'default',
     cliTimeoutMs: 300_000,
   };
 }
@@ -647,6 +664,7 @@ export function resolveRoutedLlmConfig(
       apiKey: connection.apiKey,
       model: route.model || connection.model,
       cliPath: connection.cliPath,
+      effort: routeEffort(route.effort) ?? connection.effort,
       cliTimeoutMs: route.cliTimeoutMs || connection.cliTimeoutMs,
     };
   }
@@ -661,8 +679,14 @@ export function resolveRoutedLlmConfig(
     apiKey: route.apiKey || base.apiKey,
     model: route.model || legacyModel || (inheritedProvider ? base.model : ''),
     cliPath: route.cliPath || (provider === base.provider ? base.cliPath : ''),
+    effort: routeEffort(route.effort) ?? base.effort,
     cliTimeoutMs: route.cliTimeoutMs || base.cliTimeoutMs,
   };
+}
+
+/** A route only overrides the effort when it names a real level, the way an empty `model` inherits. */
+function routeEffort(effort: LlmEffort | undefined): LlmEffort | undefined {
+  return effort && effort !== 'default' ? effort : undefined;
 }
 
 function deepMerge<T>(base: T, override: Partial<T>): T {

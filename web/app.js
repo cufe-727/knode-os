@@ -2408,7 +2408,8 @@ function llmFields(entry, route) {
       <label>Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="${api ? 'gpt-4.1-mini' : 'Use CLI default'}" />${modelChevron(route)}</span></label>
       ${api ? `<label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1" /></label>
       <label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY" /></label>`
-    : `<label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(entry.cliPath || '')}" placeholder="Default: ${esc(cliMeta[entry.provider]?.path ?? '')}" /></label>`}
+    : `<label>Reasoning effort<select data-field="effort">${optionList(EFFORT_OPTIONS, entry.effort || 'default')}</select></label>
+      <label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(entry.cliPath || '')}" placeholder="Default: ${esc(cliMeta[entry.provider]?.path ?? '')}" /></label>`}
     </div>
     <p class="cfg-callout">${esc(LLM_NOTES[entry.provider] ?? LLM_NOTES.openai)}</p>`;
 }
@@ -2481,6 +2482,7 @@ function addConnection() {
     apiKey: '',
     model: '',
     cliPath: '',
+    effort: 'default',
   });
   expandedProviders.add(id);
   renderProviders();
@@ -2822,7 +2824,7 @@ $('#cfg-agents').addEventListener('click', (event) => {
 /* ---------- Settings · 04 research: pipeline, initialization, chat, profile ---------- */
 const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli'];
 const EFFORT_OPTIONS = [
-  ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (claude; codex → xhigh, cursor → high)'],
+  ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (claude & codex; cursor → high)'],
 ];
 const ROLE_PHASES = [
   ['plan', 'Plan · outline the page'], ['research', 'Research · one section'], ['synthesize', 'Synthesize · write the page'], ['review', 'Review · critique'], ['revise', 'Revise · fix issues'],

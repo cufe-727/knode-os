@@ -255,6 +255,7 @@ struct SettingsView: View {
                     baseUrl: binding(\.llm.baseUrl),
                     apiKey: binding(\.llm.apiKey),
                     cliPath: binding(\.llm.cliPath),
+                    effort: binding(\.llm.effort),
                     cliTools: cliTools,
                     route: "llm",
                     load: { refresh in try await modelList(route: "llm", refresh: refresh) }
@@ -285,6 +286,7 @@ struct SettingsView: View {
                 baseUrl: binding(\.connections)[index].baseUrl,
                 apiKey: binding(\.connections)[index].apiKey,
                 cliPath: binding(\.connections)[index].cliPath,
+                effort: binding(\.connections)[index].effort,
                 cliTools: cliTools,
                 route: "connection:\(connection.id)",
                 load: { refresh in try await modelList(route: "connection:\(connection.id)", refresh: refresh) }
@@ -1448,6 +1450,7 @@ private struct LlmProviderFields: View {
     @Binding var baseUrl: String
     @Binding var apiKey: String
     @Binding var cliPath: String
+    @Binding var effort: String
     let cliTools: [String: CliTool]
     let route: String
     let load: (Bool) async throws -> ModelListResponse
@@ -1479,6 +1482,14 @@ private struct LlmProviderFields: View {
                 }
             } else {
                 GridRow {
+                    FieldLabel(L("Reasoning effort")) {
+                        Picker(L("Reasoning effort"), selection: $effort) {
+                            ForEach(EffortLevel.all, id: \.0) { Text(L($0.1)).tag($0.0) }
+                        }
+                        .labelsHidden()
+                    }
+                }
+                GridRow {
                     CliExecutableField(tool: cliTools[provider], path: $cliPath)
                         .gridCellColumns(2)
                 }
@@ -1507,6 +1518,20 @@ func embeddingNote(_ provider: String) -> String {
     default:
         return L("Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep keys out of the config file.")
     }
+}
+
+/// The reasoning-effort ladder, shared by every control that offers one: a
+/// provider row here, a research profile, a role, a chat. value → English
+/// label; the label goes through `L` at render time.
+enum EffortLevel {
+    static let all: [(String, String)] = [
+        ("default", "CLI default"),
+        ("low", "Low"),
+        ("medium", "Medium"),
+        ("high", "High"),
+        ("xhigh", "Extra high"),
+        ("max", "Max (claude & codex; cursor → high)"),
+    ]
 }
 
 /// A caption above a control, shared by every settings card.

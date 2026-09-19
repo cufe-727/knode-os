@@ -144,7 +144,7 @@ describe('research profiles · files and normalization', () => {
 describe('research profiles · CLI adapters', () => {
   it('maps effort per CLI', () => {
     expect(effortFor('claude-cli', 'max')).toBe('max');
-    expect(effortFor('codex-cli', 'max')).toBe('xhigh');
+    expect(effortFor('codex-cli', 'max')).toBe('max');
     expect(effortFor('cursor-cli', 'xhigh')).toBe('high');
     expect(effortFor('claude-cli', 'default')).toBeNull();
     expect(cursorModel('gpt-5', 'high')).toBe('gpt-5[effort=high]');
@@ -176,7 +176,7 @@ describe('research profiles · CLI adapters', () => {
   it('codex: live/cached/disabled web_search, reasoning effort and agent layers', () => {
     const live = sessionArgs({ ...baseSession, agent: { ...baseSession.agent, provider: 'codex-cli' as const }, effort: 'max', allowNetwork: true, webFreshness: 'live' }).args;
     expect(live).toContain('web_search="live"');
-    expect(live).toContain('model_reasoning_effort="xhigh"');
+    expect(live).toContain('model_reasoning_effort="max"');
     expect(live).not.toContain('tools.web_search=true');
     const cached = sessionArgs({ ...baseSession, agent: { ...baseSession.agent, provider: 'codex-cli' as const }, allowNetwork: true, webFreshness: 'cached' }).args;
     expect(cached).toContain('web_search="cached"');

@@ -144,11 +144,11 @@ profile 把「怎么研究」从 harness 里抽出来：一份 YAML 同时回答
 
 内置四个（删除即重置为内置内容）：`default`（团队；强度与联网跟随 CLI 与 review 的默认值）、`quick`（单会话、medium、cached、最多 4 章节）、`thorough`（max、5 个并行研究员、2 轮评审、每条 fact 至少 2 个来源、证据表）、`native`（原生子代理、high）。简报里多出一段「研究规范（profile: …）」，把上面这些写成 agent 能读的规则。
 
-每个 CLI 的适配集中在 `src/research/launch.ts` 的 `sessionArgs`（`research export` 打印的命令行同样带上）：
+每个 CLI 的适配集中在 `src/research/launch.ts` 的 `sessionArgs`（`research export` 打印的命令行同样带上）。推理强度的两个适配器（`effortFor`、`cursorModel`）放在 `src/llm/cli.ts`，于是 LLM 连接上的一次性补全（它自己也带 `effort`）与研究会话用同一套写法：
 
 | | claude | codex | cursor-agent |
 | --- | --- | --- | --- |
-| 推理强度 | `--effort <level>` | `-c model_reasoning_effort="…"`（`max` → `xhigh`） | 模型名括号 `model[effort=high]`（`xhigh`/`max` → `high`；没填模型就设不了） |
+| 推理强度 | `--effort <level>` | `-c model_reasoning_effort="…"` | 模型名括号 `model[effort=high]`（`xhigh`/`max` → `high`；没填模型就设不了） |
 | 联网 | `WebSearch` / `WebFetch` 进 `--allowedTools` 或 `--disallowedTools` | `-c web_search="live" | "cached" | "disabled"`（不再用 `tools.web_search`） | 只能靠提示 |
 | 读文件 | `Read` / `Grep` / `Glob` 进白名单或黑名单 | 沙箱只读，总是可读 | `--add-dir`，总是可读 |
 | 原生子代理 | `--agents <json>`，并放开 `Agent` / `Task` | `agents.enabled`、`agents.max_concurrent_threads_per_session`、`agents.default_subagent_reasoning_effort`、`agents.<id>.description`、`agents.<id>.config_file` | 不支持（退回单会话） |

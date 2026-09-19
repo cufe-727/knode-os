@@ -24,11 +24,6 @@ struct AgentsSettingsSection: View {
 
     @State private var expanded: Set<String> = []
 
-    static let efforts: [(String, String)] = [
-        ("default", "CLI default"), ("low", "Low"), ("medium", "Medium"),
-        ("high", "High"), ("xhigh", "Extra high"), ("max", "Max"),
-    ]
-
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
@@ -187,7 +182,7 @@ struct AgentsSettingsSection: View {
                 GridRow {
                     FieldLabel(L("Reasoning effort")) {
                         Picker(L("Reasoning effort"), selection: $agents[index].effort) {
-                            ForEach(Self.efforts, id: \.0) { Text(L($0.1)).tag($0.0) }
+                            ForEach(EffortLevel.all, id: \.0) { Text(L($0.1)).tag($0.0) }
                         }
                         .labelsHidden()
                     }

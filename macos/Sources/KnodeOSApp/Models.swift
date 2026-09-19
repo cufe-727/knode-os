@@ -578,9 +578,26 @@ struct LLMConfig: Codable, Equatable {
     var apiKey: String
     var model: String
     var cliPath: String
+    /// How hard a CLI provider thinks. "default" leaves the CLI's own setting
+    /// alone, and an OpenAI-compatible endpoint ignores it.
+    var effort: String
     var cliTimeoutMs: Int?
     /// Shown in the providers table. Empty = the provider's own name.
     var label: String?
+
+    /// Decoded field by field so a service that predates one of them — `effort`
+    /// arrived after the rest — still yields a usable config instead of failing.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decodeIfPresent(String.self, forKey: .provider) ?? "openai"
+        baseUrl = try container.decodeIfPresent(String.self, forKey: .baseUrl) ?? ""
+        apiKey = try container.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
+        model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
+        cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? ""
+        effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? "default"
+        cliTimeoutMs = try container.decodeIfPresent(Int.self, forKey: .cliTimeoutMs)
+        label = try container.decodeIfPresent(String.self, forKey: .label)
+    }
 }
 
 /// A pipeline route. `use` names the connection it runs on — empty for the
@@ -616,6 +633,8 @@ struct LLMConnection: Codable, Equatable, Identifiable {
     var apiKey: String
     var model: String
     var cliPath: String
+    /// See `LLMConfig.effort`.
+    var effort: String
     var cliTimeoutMs: Int?
 
     init(id: String, label: String, provider: String = "openai") {
@@ -626,6 +645,7 @@ struct LLMConnection: Codable, Equatable, Identifiable {
         apiKey = ""
         model = ""
         cliPath = ""
+        effort = "default"
         cliTimeoutMs = nil
     }
 
@@ -638,6 +658,7 @@ struct LLMConnection: Codable, Equatable, Identifiable {
         apiKey = try container.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
         cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? ""
+        effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? "default"
         cliTimeoutMs = try container.decodeIfPresent(Int.self, forKey: .cliTimeoutMs)
     }
 }

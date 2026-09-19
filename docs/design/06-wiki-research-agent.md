@@ -143,11 +143,11 @@ A profile lifts *how* to research out of the harness: one YAML answers how hard 
 
 Four built-ins (deleting one resets it): `default` (team; effort and web follow the CLI and review defaults), `quick` (single session, medium, cached, at most 4 sections), `thorough` (max, 5 parallel researchers, 2 review rounds, 2 sources per fact, evidence table), `native` (native sub-agents, high). The brief gains a "研究规范 (profile: …)" block that states these as rules the agent reads.
 
-Per-CLI adapters live in `sessionArgs` (`src/research/launch.ts`; `research export` prints the same command lines):
+Per-CLI adapters live in `sessionArgs` (`src/research/launch.ts`; `research export` prints the same command lines). The effort adapters (`effortFor`, `cursorModel`) sit in `src/llm/cli.ts`, so a one-shot completion on an LLM connection — which carries its own `effort` — asks for a level the same way a research session does:
 
 | | claude | codex | cursor-agent |
 | --- | --- | --- | --- |
-| reasoning effort | `--effort <level>` | `-c model_reasoning_effort="…"` (`max` → `xhigh`) | bracket syntax on the model name, `model[effort=high]` (`xhigh`/`max` → `high`; impossible without a model) |
+| reasoning effort | `--effort <level>` | `-c model_reasoning_effort="…"` | bracket syntax on the model name, `model[effort=high]` (`xhigh`/`max` → `high`; impossible without a model) |
 | web | `WebSearch` / `WebFetch` in `--allowedTools` or `--disallowedTools` | `-c web_search="live" | "cached" | "disabled"` (no longer `tools.web_search`) | prompt only |
 | files | `Read` / `Grep` / `Glob` allowed or disallowed | read-only sandbox, always readable | `--add-dir`, always readable |
 | native sub-agents | `--agents <json>`, `Agent` / `Task` allowed | `agents.enabled`, `agents.max_concurrent_threads_per_session`, `agents.default_subagent_reasoning_effort`, `agents.<id>.description`, `agents.<id>.config_file` | unsupported (single session) |

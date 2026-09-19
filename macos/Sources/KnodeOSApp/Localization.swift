@@ -469,7 +469,7 @@ private let zhHansPairs: [(String, String)] = [
     ("Medium", "中"),
     ("High", "高"),
     ("Extra high", "很高"),
-    ("Max (claude; codex → xhigh, cursor → high)", "最高（claude；codex → xhigh，cursor → high）"),
+    ("Max (claude & codex; cursor → high)", "最高（claude 与 codex；cursor → high）"),
     ("Web tools", "联网工具"),
     ("Profile setting", "跟随 profile"),
     ("On (within review.external)", "开启（不超出 review.external）"),

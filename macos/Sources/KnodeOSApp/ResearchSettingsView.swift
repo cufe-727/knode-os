@@ -38,16 +38,6 @@ struct ResearchSettingsSection: View {
     /// The spec that names the section-01 connection rather than a named one.
     static let defaultConnection = "default"
 
-    /// value → English label; the label goes through `L` at render time.
-    static let efforts: [(String, String)] = [
-        ("default", "CLI default"),
-        ("low", "Low"),
-        ("medium", "Medium"),
-        ("high", "High"),
-        ("xhigh", "Extra high"),
-        ("max", "Max (claude; codex → xhigh, cursor → high)"),
-    ]
-
     static let phases: [(String, String)] = [
         ("plan", "Plan · outline the page"),
         ("research", "Research · one section"),
@@ -252,7 +242,7 @@ struct ResearchSettingsSection: View {
                     )
                     FieldLabel(L("Reasoning effort")) {
                         Picker(L("Reasoning effort"), selection: $chat.effort) {
-                            ForEach(Self.efforts, id: \.0) { Text(L($0.1)).tag($0.0) }
+                            ForEach(EffortLevel.all, id: \.0) { Text(L($0.1)).tag($0.0) }
                         }
                         .labelsHidden()
                     }
@@ -412,7 +402,7 @@ struct ResearchSettingsSection: View {
                     }
                     FieldLabel(L("Reasoning effort")) {
                         Picker(L("Reasoning effort"), selection: bind(\.reasoning.effort)) {
-                            ForEach(Self.efforts, id: \.0) { Text(L($0.1)).tag($0.0) }
+                            ForEach(EffortLevel.all, id: \.0) { Text(L($0.1)).tag($0.0) }
                         }
                         .labelsHidden()
                     }
@@ -917,7 +907,7 @@ private struct RoleCard: View {
         FieldLabel(L("Effort")) {
             Picker(L("Effort"), selection: $role.effort) {
                 Text(L("Profile default")).tag("default")
-                ForEach(ResearchSettingsSection.efforts.dropFirst(), id: \.0) { value, label in
+                ForEach(EffortLevel.all.dropFirst(), id: \.0) { value, label in
                     Text(value == advice.effort ? "\(L(label)) · \(L("recommended"))" : L(label)).tag(value)
                 }
             }
