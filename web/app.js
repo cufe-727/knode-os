@@ -2265,18 +2265,25 @@ const embeddingProviderLabel = (provider) =>
 const activeEmbedding = () =>
   embeddingDrafts.find((e) => e.id === embeddingUse) ?? embeddingDrafts[0] ?? null;
 
+/**
+ * Where a stage runs, as the two things a person reads separately: who runs
+ * it, and which model. They used to share one ellipsised line, which turned
+ * "super-relay · ark/seed-evolving" into "super-relay…ed-evolving".
+ */
+const summaryLine = (t) => (t.model ? `${t.provider} · ${t.model}` : t.provider);
+
 function embeddingSummaryText() {
   const active = activeEmbedding();
-  if (!active) return 'Loading…';
-  if (active.provider === 'local') return `${active.label || active.id} · ${active.dimensions || 384}d`;
-  return active.model ? `${active.label || active.id} · ${active.model}` : 'API model not set';
+  if (!active) return { provider: 'Loading…', model: '' };
+  const name = active.label || active.id;
+  if (active.provider === 'local') return { provider: name, model: `${active.dimensions || 384}d` };
+  return { provider: name, model: active.model || 'API model not set' };
 }
 
 function defaultLlmSummaryText() {
   const entry = defaultConnection();
-  if (!entry) return 'Loading…';
-  const name = entry.label?.trim() || providerNames[entry.provider] || entry.provider;
-  return entry.model ? `${name} · ${entry.model}` : name;
+  if (!entry) return { provider: 'Loading…', model: '' };
+  return { provider: entry.label?.trim() || providerNames[entry.provider] || entry.provider, model: entry.model || '' };
 }
 
 function routeSummary(prefix) {
@@ -2284,10 +2291,11 @@ function routeSummary(prefix) {
   const model = $(`#cfg-${prefix}-model`).value.trim();
   const connection = connectionById(use);
   const fallback = defaultConnection()?.label?.trim() || 'Default model';
-  const name = connection ? connection.label || connection.id : fallback;
-  // an inheriting route prints what it inherits, not a blank
-  const effective = model || inheritedModelFor(use);
-  return effective ? `${name} · ${effective}` : name;
+  return {
+    provider: connection ? connection.label || connection.id : fallback,
+    // an inheriting route prints what it inherits, not a blank
+    model: model || inheritedModelFor(use),
+  };
 }
 
 /** Rebuild the Index picker from the configured embedding providers. */
@@ -2345,10 +2353,12 @@ function stageRate(key) {
 function renderStageFlow() {
   $('#stage-flow').innerHTML = PIPELINE_STAGES
     .map((stage, index) => {
+      const target = stageTarget(stage.key);
       const node = `<button type="button" class="stage-node${stage.key === selectedStage ? ' selected' : ''}" data-stage="${stage.key}">
         <span class="stage-node-head"><i class="stage-step ${stage.accent}">${stage.step}</i>${esc(stage.title)}</span>
         <span class="section-badge ${stage.accent === 'accent2' ? 'accent2' : ''}">${esc(stage.badge)}</span>
-        <span class="stage-node-target mono">${esc(stageTarget(stage.key))}</span>
+        <span class="stage-node-target mono" title="${esc(summaryLine(target))}">${esc(target.provider)}</span>
+        <span class="stage-node-model mono" title="${esc(summaryLine(target))}">${esc(target.model || 'its own model')}</span>
         <span class="stage-node-rate mono">${esc(stageRate(stage.key))}</span>
       </button>`;
       return index ? `<span class="stage-arrow">→</span>${node}` : node;
@@ -2360,7 +2370,7 @@ function renderStageFlow() {
 }
 
 function updateConfigSummaries() {
-  $('#pin-answer').textContent = defaultLlmSummaryText();
+  $('#pin-answer').textContent = summaryLine(defaultLlmSummaryText());
   renderStageFlow();
   paintInheritedPlaceholders();
 }
@@ -2419,7 +2429,7 @@ function providerRow({ kind, accent, id, label, placeholder, providerLabel, summ
         ? `<span class="section-badge ${accent === 'accent2' ? 'accent2' : ''}">default</span>`
         : promotable ? '<button type="button" class="hint-action provider-default" title="Every job that names no provider of its own moves here">make default</button>' : ''}</span>
       <span class="provider-kind">${esc(providerLabel)}</span>
-      <span class="provider-model mono">${esc(summary || 'no model set')}</span>
+      <span class="provider-model mono" title="${esc(summary || '')}">${esc(summary || 'no model set')}</span>
       <span class="provider-id mono">${esc(id)}</span>
       <button type="button" class="ghost provider-remove"${removable ? '' : ' disabled'} title="${removable ? 'Remove this provider' : 'This provider cannot be removed'}">✕</button>
     </div>
@@ -2724,7 +2734,7 @@ function renderAgents() {
           <input class="provider-name" data-field="title" value="${esc(agent.title || '')}" placeholder="Name this agent" />
           <span>${uses}</span>
           <span class="provider-kind">${esc(executorLabel(agent.executor))}</span>
-          <span class="provider-model mono">${esc(agent.model || 'its own default')}</span>
+          <span class="provider-model mono" title="${esc(agent.model || '')}">${esc(agent.model || 'its own default')}</span>
           <span class="provider-id mono">${agent.runnable ? '' : '⚠ '}${esc(agent.name)}</span>
           <button type="button" class="ghost agent-remove" title="${agent.builtin ? 'Reset this template to its built-in' : 'Remove this agent'}">${agent.builtin ? '⟲' : '✕'}</button>
         </div>
@@ -3330,9 +3340,13 @@ $('#cfg-providers').addEventListener('input', (event) => {
   const found = rowDraft(event.target);
   if (!field || !found) return;
   found.draft[field] = field === 'dimensions' ? Number(event.target.value) || undefined : event.target.value;
-  if (field === 'label') {
-    fillRouteOptions();
-    found.row.querySelector('.provider-model').textContent = found.draft.model || 'no model set';
+  if (field === 'label') fillRouteOptions();
+  // the row's own summary column used to refresh on a label edit and never on
+  // a model one, so a typed model stayed invisible until the next redraw
+  if (field === 'label' || field === 'model') {
+    const cell = found.row.querySelector('.provider-model');
+    cell.textContent = found.draft.model || 'no model set';
+    cell.title = found.draft.model || '';
   }
   updateConfigSummaries();
 });

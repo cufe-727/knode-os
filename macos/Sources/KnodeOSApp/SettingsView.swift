@@ -341,6 +341,7 @@ struct SettingsView: View {
 
     private func stageNode(_ stage: PipelineStage) -> some View {
         let selected = selectedStage == stage
+        let target = stageTarget(stage)
         return Button {
             selectedStage = stage
         } label: {
@@ -355,16 +356,24 @@ struct SettingsView: View {
                     Spacer(minLength: 0)
                 }
                 RouteBadge(label: stage.requirement, color: stage.color)
-                Text(stageTarget(stage))
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                // two lines, because they truncate differently: a provider's
+                // name identifies itself by its head, a model id by both ends
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(target.provider)
+                        .foregroundStyle(.secondary)
+                        .truncationMode(.tail)
+                    Text(target.model.isEmpty ? L("its own model") : target.model)
+                        .foregroundStyle(.tertiary)
+                        .truncationMode(.middle)
+                }
+                .font(.system(size: 10, design: .monospaced))
+                .lineLimit(1)
                 Text(stageRate(stage))
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.tertiary)
             }
             .frame(width: 148, alignment: .leading)
+            .help(target.line)
             .padding(11)
             .background(selected ? stage.color.opacity(0.1) : Color.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
             .overlay {
@@ -450,7 +459,7 @@ struct SettingsView: View {
                 load: { refresh in try await modelList(route: "conceptLlm", refresh: refresh) }
             )
         case .answer:
-            StagePin(value: defaultModelSummary, hint: L("Set in section 01 · Default LLM provider"))
+            StagePin(value: defaultModelSummary.line, hint: L("Set in section 01 · Default LLM provider"))
         }
     }
 
@@ -531,7 +540,7 @@ struct SettingsView: View {
         )
     }
 
-    private func stageTarget(_ stage: PipelineStage) -> String {
+    private func stageTarget(_ stage: PipelineStage) -> RouteTarget {
         switch stage {
         case .convert: routeSummary(\.extraction.documentLlm)
         case .index: embeddingSummary
@@ -834,23 +843,22 @@ struct SettingsView: View {
         )
     }
 
-    private var embeddingSummary: String {
-        guard let config else { return L("Loading…") }
+    private var embeddingSummary: RouteTarget {
+        guard let config else { return RouteTarget(provider: L("Loading…")) }
         guard let active = config.activeEmbedding else {
-            return config.embedding.model.isEmpty ? L("API model not set") : config.embedding.model
+            return RouteTarget(provider: L("Embedding"), model: config.embedding.model.isEmpty ? L("API model not set") : config.embedding.model)
         }
-        if active.provider == "local" { return L("%@ · %@d", active.label, String(active.dimensions)) }
-        return active.model.isEmpty ? L("API model not set") : "\(active.label) · \(active.model)"
+        if active.provider == "local" { return RouteTarget(provider: active.label, model: L("%@d", String(active.dimensions))) }
+        return RouteTarget(provider: active.label, model: active.model.isEmpty ? L("API model not set") : active.model)
     }
 
-    private func routeSummary(_ keyPath: KeyPath<KnodeConfig, RoutedLLMConfig>) -> String {
-        guard let config, let route = config[keyPath: keyPath] as RoutedLLMConfig? else { return L("Loading…") }
+    private func routeSummary(_ keyPath: KeyPath<KnodeConfig, RoutedLLMConfig>) -> RouteTarget {
+        guard let config, let route = config[keyPath: keyPath] as RoutedLLMConfig? else { return RouteTarget(provider: L("Loading…")) }
         let connection = config.connections.first { $0.id == route.use }
         let defaultName = config.llm.label?.isEmpty == false ? config.llm.label! : L("Default model")
         let name = connection?.label ?? (route.use.isEmpty ? defaultName : providerName(route.provider))
         // an inheriting route prints what it inherits, not a blank
-        let model = route.model.isEmpty ? inheritedModel(route.use) : route.model
-        return model.isEmpty ? name : "\(name) · \(model)"
+        return RouteTarget(provider: name, model: route.model.isEmpty ? inheritedModel(route.use) : route.model)
     }
 
     /// What a route or agent spec inherits, against the on-screen draft.
@@ -862,9 +870,9 @@ struct SettingsView: View {
         inheritedAgentModel(spec, agents: agents, connections: config?.connections ?? [], defaultModel: config?.llm.model ?? "")
     }
 
-    private var defaultModelSummary: String {
-        guard let config else { return L("Not configured") }
-        return config.llm.model.isEmpty ? providerName(config.llm.provider) : "\(providerName(config.llm.provider)) · \(config.llm.model)"
+    private var defaultModelSummary: RouteTarget {
+        guard let config else { return RouteTarget(provider: L("Not configured")) }
+        return RouteTarget(provider: providerName(config.llm.provider), model: config.llm.model)
     }
 
     /// Models the service reports for one route, using the on-screen draft so a
@@ -1361,11 +1369,14 @@ private struct ProviderRow<Detail: View>: View {
                     .frame(width: 170, alignment: .leading)
                     .lineLimit(1)
 
+                // one line is the point of a table row; the untruncated value
+                // is a hover away rather than a second line per provider
                 Text(summary.isEmpty ? L("No model set") : summary)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(summary.isEmpty ? .tertiary : .secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .help(summary)
 
                 Spacer(minLength: 8)
 
@@ -1654,6 +1665,21 @@ private struct StagePicker: View {
             : providerName(connection.provider)
         return L("Runs on %@.", endpoint)
     }
+}
+
+/**
+ * Where a stage runs, as the two things a person reads separately: who runs
+ * it, and which model. They used to share one middle-truncated line, which
+ * turned "super-relay · ark/seed-evolving" into "super-relay…ed-evolving" —
+ * both ends of both facts lost at once.
+ *
+ * `line` is the joined form, for the places that still want one string.
+ */
+struct RouteTarget {
+    var provider: String
+    var model: String = ""
+
+    var line: String { model.isEmpty ? provider : "\(provider) · \(model)" }
 }
 
 /// A stage whose provider is not chosen here — it follows section 01.

@@ -562,8 +562,11 @@ td.mono { font-size: 12px; }
 .stage-node-head { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; }
 .stage-step { width: 16px; height: 16px; display: grid; place-items: center; border-radius: 5px; background: var(--accent2-soft); color: #c7adff; font-family: var(--mono); font-size: 9px; font-style: normal; font-weight: 700; }
 .stage-step.accent { background: var(--accent-soft); color: var(--accent); }
-.stage-node-target, .stage-node-rate { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.stage-node-target, .stage-node-model, .stage-node-rate { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .stage-node-target { color: var(--muted); }
+/* the model gets its own line: CSS has no middle ellipsis, so the full value
+   lives in the title attribute rather than in a direction: rtl hack */
+.stage-node-model { color: #687486; margin-top: -2px; }
 .stage-node-rate { color: #687486; }
 .stage-inspector { border-top: 1px solid var(--border); }
 .stage-panel { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; padding: 18px; align-items: start; }

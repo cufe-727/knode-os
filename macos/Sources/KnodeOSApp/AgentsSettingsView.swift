@@ -126,6 +126,7 @@ struct AgentsSettingsSection: View {
                     .foregroundStyle(agent.model.isEmpty ? .tertiary : .secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .help(agent.model)
 
                 Spacer(minLength: 8)
 
