@@ -19,6 +19,8 @@ struct AgentsSettingsSection: View {
     let connections: [LLMConnection]
     let cliTools: [String: CliTool]
     let isWorking: Bool
+    /// What an executor's Model field inherits when it is left empty.
+    let inheritedModel: (String) -> String
     let add: (String) -> Void
     let remove: (AgentDefinition) -> Void
     let loadModels: (String, Bool) async throws -> ModelListResponse
@@ -174,6 +176,7 @@ struct AgentsSettingsSection: View {
                     ModelField(
                         placeholder: L("Its own default"),
                         text: $agents[index].model,
+                        inherited: inheritedModel(agent.executor),
                         providerKey: agent.executor,
                         route: "agent:\(agent.executor)",
                         load: { refresh in try await loadModels(agent.executor, refresh) }

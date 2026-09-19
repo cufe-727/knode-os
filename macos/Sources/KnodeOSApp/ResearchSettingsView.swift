@@ -24,6 +24,9 @@ struct ResearchSettingsSection: View {
     let agents: [AgentDefinition]
     let defaultProvider: String
     let isWorking: Bool
+    /// What a spec's Model field inherits when it is left empty. A closure
+    /// because the rule needs the whole config, which only SettingsView holds.
+    let inheritedModel: (String) -> String
     /// Models the CLI behind an agent key offers ("" = the default provider).
     let loadModels: (String, Bool) async throws -> ModelListResponse
     let duplicate: () -> Void
@@ -102,6 +105,7 @@ struct ResearchSettingsSection: View {
                     ModelField(
                         placeholder: L("CLI default"),
                         text: $research.model,
+                        inherited: inheritedModel(research.agent),
                         providerKey: research.agent,
                         route: "agent:\(research.agent)",
                         load: { refresh in try await loadModels(research.agent, refresh) }
@@ -460,6 +464,7 @@ struct ResearchSettingsSection: View {
                     researchAgent: research.agent,
                     researchers: research.researchers,
                     reviewRounds: research.reviewRounds,
+                    inheritedModel: inheritedModel,
                     loadModels: loadModels,
                     remove: { removeRole(id: roles[selectedIndex].id) }
                 )
@@ -711,6 +716,7 @@ private struct RoleCard: View {
     let researchAgent: String
     let researchers: Int
     let reviewRounds: Int
+    let inheritedModel: (String) -> String
     let loadModels: (String, Bool) async throws -> ModelListResponse
     let remove: () -> Void
 
@@ -861,6 +867,7 @@ private struct RoleCard: View {
         ModelField(
             placeholder: L("Agent's model"),
             text: $role.model,
+            inherited: inheritedModel(effectiveAgent),
             providerKey: effectiveAgent,
             route: "agent:\(effectiveAgent)",
             load: { refresh in try await loadModels(effectiveAgent, refresh) }

@@ -412,6 +412,7 @@ struct SettingsView: View {
                 route: binding(\.extraction.documentLlm),
                 connections: config?.connections ?? [],
                 defaultProvider: config?.llm.provider ?? "",
+                defaultModel: config?.llm.model ?? "",
                 routeKey: "documentLlm",
                 load: { refresh in try await modelList(route: "documentLlm", refresh: refresh) }
             )
@@ -435,6 +436,7 @@ struct SettingsView: View {
                 route: binding(\.extraction.entityLlm),
                 connections: config?.connections ?? [],
                 defaultProvider: config?.llm.provider ?? "",
+                defaultModel: config?.llm.model ?? "",
                 routeKey: "entityLlm",
                 load: { refresh in try await modelList(route: "entityLlm", refresh: refresh) }
             )
@@ -443,6 +445,7 @@ struct SettingsView: View {
                 route: binding(\.extraction.conceptLlm),
                 connections: config?.connections ?? [],
                 defaultProvider: config?.llm.provider ?? "",
+                defaultModel: config?.llm.model ?? "",
                 routeKey: "conceptLlm",
                 load: { refresh in try await modelList(route: "conceptLlm", refresh: refresh) }
             )
@@ -564,6 +567,8 @@ struct SettingsView: View {
                 connections: config?.connections ?? [],
                 cliTools: cliTools,
                 isWorking: isWorking,
+                // an executor is a connection or a CLI, never an agent name
+                inheritedModel: { inheritedModel($0) },
                 add: { kind in Task { await addAgent(kind: kind) } },
                 remove: { agentToRemove = $0 },
                 loadModels: { executor, refresh in try await researchModelList(agent: executor, refresh: refresh) }
@@ -644,6 +649,7 @@ struct SettingsView: View {
                 agents: agents,
                 defaultProvider: config?.llm.provider ?? "",
                 isWorking: isWorking,
+                inheritedModel: { inheritedAgentSpecModel($0) },
                 loadModels: { agent, refresh in try await researchModelList(agent: agent, refresh: refresh) },
                 duplicate: {
                     duplicateName = "\(profileDraft?.name ?? "profile")-copy"
@@ -842,8 +848,18 @@ struct SettingsView: View {
         let connection = config.connections.first { $0.id == route.use }
         let defaultName = config.llm.label?.isEmpty == false ? config.llm.label! : L("Default model")
         let name = connection?.label ?? (route.use.isEmpty ? defaultName : providerName(route.provider))
-        let model = route.model.isEmpty ? (connection?.model ?? "") : route.model
+        // an inheriting route prints what it inherits, not a blank
+        let model = route.model.isEmpty ? inheritedModel(route.use) : route.model
         return model.isEmpty ? name : "\(name) · \(model)"
+    }
+
+    /// What a route or agent spec inherits, against the on-screen draft.
+    private func inheritedModel(_ use: String) -> String {
+        inheritedRouteModel(use, connections: config?.connections ?? [], defaultModel: config?.llm.model ?? "")
+    }
+
+    private func inheritedAgentSpecModel(_ spec: String) -> String {
+        inheritedAgentModel(spec, agents: agents, connections: config?.connections ?? [], defaultModel: config?.llm.model ?? "")
     }
 
     private var defaultModelSummary: String {
@@ -1056,6 +1072,15 @@ struct SettingsView: View {
 struct ModelField: View {
     let placeholder: String
     @Binding var text: String
+    /**
+     * The model that runs when this field is empty, shown greyed in its place.
+     *
+     * Never written. An empty `model` means "follow the provider", and pinning
+     * the inherited string would stop the route tracking a later change to the
+     * provider's own model — the propagation named connections exist for. The
+     * popover's Clear link is how you get back to inheriting.
+     */
+    var inherited: String = ""
     /// Changing provider invalidates a fetched list, since it came from the old one.
     var providerKey: String = ""
     var disabled = false
@@ -1076,7 +1101,7 @@ struct ModelField: View {
     var body: some View {
         FieldLabel(L("Model")) {
             HStack(spacing: 6) {
-                TextField(placeholder, text: $text)
+                TextField(inherited.isEmpty ? placeholder : inherited, text: $text)
                 Button {
                     isShowing = true
                     Task { await reload() }
@@ -1146,9 +1171,12 @@ struct ModelField: View {
             }
             Divider()
             HStack {
-                Text(L("Picking one fills the field — Save & apply writes it to the workspace config."))
+                Text(inherited.isEmpty
+                    ? L("Picking one fills the field — Save & apply writes it to the workspace config.")
+                    : L("Empty follows the provider (%@). Picking one pins it instead.", inherited))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 if !text.isEmpty {
                     Button(L("Clear")) { text = ""; isShowing = false }
@@ -1482,6 +1510,37 @@ private struct LlmProviderFields: View {
     }
 }
 
+/**
+ * The model a route runs with when it names none of its own — the client-side
+ * mirror of the service's `resolveRoutedLlmConfig`.
+ *
+ * Shown as a Model field's placeholder and never written: an empty `model`
+ * means "follow this provider", so pinning the string would stop the route
+ * tracking the provider's own model, which is what named connections are for.
+ */
+@MainActor
+func inheritedRouteModel(_ use: String, connections: [LLMConnection], defaultModel: String) -> String {
+    if let connection = connections.first(where: { $0.id == use }) { return connection.model }
+    // '' and 'default' follow whichever connection is the default; a bare CLI
+    // name brings its own default, which is not a string we can name
+    return (use.isEmpty || use == "default") ? defaultModel : ""
+}
+
+/**
+ * The same for an agent spec, which may be an agent *name* — and a name can
+ * legitimately be `default`, so this never shares a lookup with the route rule.
+ */
+@MainActor
+func inheritedAgentModel(_ spec: String, agents: [AgentDefinition], connections: [LLMConnection], defaultModel: String) -> String {
+    let wanted = spec.trimmingCharacters(in: .whitespaces)
+    if let agent = agents.first(where: { $0.name == wanted }) {
+        return agent.model.isEmpty
+            ? inheritedRouteModel(agent.executor, connections: connections, defaultModel: defaultModel)
+            : agent.model
+    }
+    return inheritedRouteModel(wanted, connections: connections, defaultModel: defaultModel)
+}
+
 /// What this provider needs, and what an empty model means for it. Used to sit
 /// on the default's row alone; every row can be the default now.
 @MainActor
@@ -1555,6 +1614,8 @@ private struct StagePicker: View {
     @Binding var route: RoutedLLMConfig
     let connections: [LLMConnection]
     let defaultProvider: String
+    /// The default connection's model, for the field's inherited placeholder.
+    let defaultModel: String
     let routeKey: String
     let load: (Bool) async throws -> ModelListResponse
 
@@ -1572,6 +1633,7 @@ private struct StagePicker: View {
             ModelField(
                 placeholder: L("Optional · use its model"),
                 text: $route.model,
+                inherited: inheritedRouteModel(route.use, connections: connections, defaultModel: defaultModel),
                 providerKey: route.use,
                 route: routeKey,
                 load: load

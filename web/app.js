@@ -2213,6 +2213,33 @@ function defaultConnection() {
   return connectionDrafts.find((c) => c.id === llmUse) ?? connectionDrafts[0] ?? null;
 }
 
+/**
+ * The model a route runs with when it names none of its own — the mirror of
+ * the service's `resolveRoutedLlmConfig`.
+ *
+ * Shown as a Model field's placeholder and never written: an empty `model`
+ * means "follow this provider", so pinning the string would stop the route
+ * tracking the provider's own model.
+ */
+function inheritedModelFor(use) {
+  const connection = connectionById(use);
+  if (connection) return connection.model || '';
+  // '' and 'default' follow whichever connection is the default; a bare CLI
+  // name brings its own default, which is not a string we can name
+  return (!use || use === 'default') ? (defaultConnection()?.model || '') : '';
+}
+
+/**
+ * The same for an agent spec, which may be an agent *name* — and a name can
+ * legitimately be `default`, so this never shares a lookup with the route rule.
+ */
+function inheritedAgentModelFor(spec) {
+  const wanted = (spec || '').trim();
+  const agent = agentDrafts.find((a) => a.name === wanted);
+  if (agent) return agent.model || inheritedModelFor(agent.executor);
+  return inheritedModelFor(wanted);
+}
+
 const EMBEDDING_PROVIDER_OPTIONS = [
   ['local', 'Local hashing · offline'],
   ['openai', 'OpenAI-compatible API'],
@@ -2258,7 +2285,8 @@ function routeSummary(prefix) {
   const connection = connectionById(use);
   const fallback = defaultConnection()?.label?.trim() || 'Default model';
   const name = connection ? connection.label || connection.id : fallback;
-  const effective = model || connection?.model?.trim() || '';
+  // an inheriting route prints what it inherits, not a blank
+  const effective = model || inheritedModelFor(use);
   return effective ? `${name} · ${effective}` : name;
 }
 
@@ -2334,6 +2362,21 @@ function renderStageFlow() {
 function updateConfigSummaries() {
   $('#pin-answer').textContent = defaultLlmSummaryText();
   renderStageFlow();
+  paintInheritedPlaceholders();
+}
+
+/**
+ * The greyed text in every Model field that is inheriting. Repainted from
+ * here rather than only on a provider-picker change, because editing the
+ * default connection's own model changes what three stages will run.
+ */
+function paintInheritedPlaceholders() {
+  for (const prefix of ['entity', 'concept', 'document']) {
+    const input = $(`#cfg-${prefix}-model`);
+    if (input) input.placeholder = inheritedModelFor($(`#cfg-${prefix}-use`).value) || 'Optional · use its model';
+  }
+  const research = $('#cfg-research-model');
+  if (research) research.placeholder = inheritedAgentModelFor($('#cfg-research-agent').value) || 'CLI default';
 }
 
 function routeProviderToggle(prefix) {
@@ -2642,7 +2685,7 @@ function agentFields(agent) {
     : 'These apply when this agent answers directly, which today means Ask.';
   return `<div class="cfg-grid cfg-grid-2">
       <label>Runs on<select data-field="executor">${executorOptions(agent.executor)}</select></label>
-      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="Its own default" />${modelChevron(executorModelRoute(agent.executor))}</span></label>
+      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="${esc(inheritedModelFor(agent.executor) || 'Its own default')}" />${modelChevron(executorModelRoute(agent.executor))}</span></label>
       <label class="cfg-span-2">Description<input data-field="description" value="${esc(agent.description || '')}" placeholder="When to pick this agent" /></label>
     </div>
     <p class="cfg-callout${deep ? ' bad' : ''}">${esc(note)}</p>
@@ -2768,7 +2811,10 @@ async function saveAgents() {
 }
 
 for (const id of ['#cfg-research-agent', '#cfg-chat-agent']) {
-  $(id).addEventListener('change', renderAgents);
+  $(id).addEventListener('change', () => {
+    renderAgents();
+    paintInheritedPlaceholders();
+  });
 }
 
 $('#cfg-add-agent').addEventListener('click', (event) => {
@@ -2897,6 +2943,7 @@ function fillResearchForm(research) {
   $('#cfg-research-agent').innerHTML = agentOptions(research.agent || '', null, 'deep-research');
   $('#cfg-research-agent').value = research.agent || '';
   $('#cfg-research-model').value = research.model || '';
+  paintInheritedPlaceholders();
   $('#cfg-research-pipeline').value = research.pipeline || 'team';
   $('#cfg-research-concurrency').value = research.concurrency ?? 1;
   $('#cfg-research-maxturns').value = research.maxTurns ?? 40;
@@ -2968,7 +3015,7 @@ function renderRoles() {
       <div class="cfg-grid cfg-grid-3">
         <label>Phase<select data-field="phase">${optionList(ROLE_PHASES, r.phase)}</select></label>
         <label>Runs on<select data-field="agent">${agentOptions(r.agent || '', 'The research agent above')}</select></label>
-        <label>Model<input data-field="model" value="${esc(r.model || '')}" placeholder="Agent's model" /></label>
+        <label>Model<input data-field="model" value="${esc(r.model || '')}" placeholder="${esc(inheritedAgentModelFor(r.agent || $('#cfg-research-agent').value) || "Agent's model")}" /></label>
         <label>Effort<select data-field="effort">${optionList([['default', 'Profile default'], ...EFFORT_OPTIONS.slice(1)], r.effort)}</select></label>
         <label>Web tools<select data-field="web">${optionList(ROLE_WEB, r.tools.web)}</select></label>
         <label>Turns per session<input data-field="maxTurns" type="number" min="0" step="1" value="${r.maxTurns || ''}" placeholder="Default" /></label>
