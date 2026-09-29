@@ -46,13 +46,16 @@ node -e 'const fs=require("fs"); const p=process.argv[1]+"/package.json"; const 
 # nothing ("Already up to date"), which ships a service that cannot resolve its
 # own imports. Install the production tree here, hoisted so the bundle carries
 # plain directories instead of links into the developer's store.
-# The deploy directory has no lockfile, so this resolves every dependency from
-# registry metadata — 233 packuments, one of them 2 MB. On a slow or flaky
-# registry each fetch runs into pnpm's own timeout and the packaging stalls for
-# hours. KNODE_OS_PNPM_FLAGS=--prefer-offline then makes it use the metadata
-# already cached from the last install and download only what the store lacks.
-# Only the CLI flag works for this; `prefer-offline` in .npmrc or npm_config_*
-# is ignored here.
+# The workspace lockfile comes along, so the bundle carries the versions the
+# tests ran against. Without it this resolved every range afresh from registry
+# metadata: what shipped drifted as soon as the cached metadata did — dozens of
+# untested upgrades, langchain and zod among them — and on a slow or flaky
+# registry the 233 packument fetches, one of them 2 MB, stalled for hours. Its
+# one importer, `.`, is this package, and --no-frozen-lockfile lets it drop the
+# devDependencies removed above. Only tarballs the store lacks are fetched now,
+# so KNODE_OS_PNPM_FLAGS=--offline packages from the local store alone. Pass
+# flags there: `prefer-offline` in .npmrc or npm_config_* is ignored here.
+cp "$REPO_DIR/pnpm-lock.yaml" "$DEPLOY_DIR/pnpm-lock.yaml"
 (cd "$DEPLOY_DIR" && pnpm install --prod --ignore-workspace --node-linker=hoisted --no-frozen-lockfile ${KNODE_OS_PNPM_FLAGS:-})
 if [[ ! -d "$DEPLOY_DIR/node_modules/commander" ]]; then
   echo "Service dependencies missing from $DEPLOY_DIR — refusing to package a bundle that cannot start." >&2
