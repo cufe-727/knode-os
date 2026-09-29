@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { LlmConfig } from '../config.js';
+import { LlmConfig, LlmEffort } from '../config.js';
 import type { ChatMessage } from './client.js';
 
 /**
@@ -22,7 +22,8 @@ import type { ChatMessage } from './client.js';
  *
  * Images reach each one differently: codex takes `--image`, while claude and
  * cursor have no such flag and instead read the paths listed in the prompt with
- * their own file tools.
+ * their own file tools. A configured reasoning effort rides along too, each CLI
+ * in its own syntax — see `effortFor`.
  */
 
 const DEFAULT_TIMEOUT_MS = 300_000;
@@ -58,6 +59,28 @@ export function resolveExecutable(command: string): string | null {
     }
   }
   return null;
+}
+
+/**
+ * The level a CLI is actually told to think at, or null to leave its own
+ * setting alone. claude and codex both take the whole ladder up to `max`;
+ * cursor's bracket syntax is only documented as far as `high`.
+ */
+export function effortFor(provider: string, effort: LlmEffort | undefined): string | null {
+  if (!effort || effort === 'default') return null;
+  if (provider === 'cursor-cli') return effort === 'max' || effort === 'xhigh' ? 'high' : effort;
+  return effort;
+}
+
+/** cursor takes effort inside the model name: `claude-opus-4-8[context=1m,effort=high]`. */
+export function cursorModel(model: string, effort: LlmEffort | undefined): string {
+  const level = effortFor('cursor-cli', effort);
+  if (!model || !level) return model;
+  if (/\[.*\]$/.test(model)) {
+    if (/effort=/.test(model)) return model.replace(/effort=[a-z]+/, `effort=${level}`);
+    return model.replace(/\]$/, `,effort=${level}]`);
+  }
+  return `${model}[effort=${level}]`;
 }
 
 /** Flatten chat messages into a single prompt for one-shot CLI runs. */
@@ -103,6 +126,8 @@ async function runCodex(cfg: LlmConfig, prompt: string, model?: string, images: 
   const outFile = path.join(os.tmpdir(), `knode-codex-${crypto.randomUUID()}.txt`);
   const args = ['exec', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', os.tmpdir(), '--output-last-message', outFile];
   if (model) args.push('--model', model);
+  const effort = effortFor('codex-cli', cfg.effort);
+  if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);
   for (const image of images) args.push('--image', image);
   args.push('-'); // read the prompt from stdin
   try {
@@ -120,6 +145,8 @@ async function runClaude(cfg: LlmConfig, prompt: string, model?: string, images:
   const cmd = cliCommand('claude-cli', cfg.cliPath);
   const args = ['-p', '--output-format', 'json', '--max-turns', images.length ? '3' : '1'];
   if (model) args.push('--model', model);
+  const effort = effortFor('claude-cli', cfg.effort);
+  if (effort) args.push('--effort', effort);
   if (images.length) {
     args.push('--tools', 'Read', '--permission-mode', 'dontAsk', '--no-session-persistence');
     const dirs = [...new Set(images.map((image) => path.dirname(path.resolve(image))))];
@@ -147,7 +174,9 @@ async function runCursor(cfg: LlmConfig, prompt: string, model?: string): Promis
   // --trust: since the 2026.09 CLI, print mode refuses to run in a directory
   // the user has not trusted interactively; the cwd here is the OS temp dir
   const args = ['-p', '--output-format', 'stream-json', '--trust'];
-  if (model) args.push('--model', model);
+  // cursor has no effort flag, and no way to set one without naming a model
+  const named = cursorModel(model ?? '', cfg.effort);
+  if (named) args.push('--model', named);
   args.push(prompt);
   const { code, stdout, stderr } = await runProcess(cmd, args, '', cfg.cliTimeoutMs);
   const { text, error } = readCursorStream(stdout);

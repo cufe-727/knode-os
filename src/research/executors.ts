@@ -1,4 +1,4 @@
-import { KnodeConfig, llmProviderLabel } from '../config.js';
+import { isCliProvider, KnodeConfig, llmProviderLabel } from '../config.js';
 import { cliToolStatus } from '../llm/models.js';
 import { AGENT_PROVIDERS, agentForSpec, DEFAULT_CONNECTION } from './agent.js';
 import { builtinAvailable } from './launch.js';
@@ -56,22 +56,22 @@ export async function availableAgents(config: KnodeConfig): Promise<AvailableAge
     agents.push(asBuiltin(DEFAULT_CONNECTION, 'Default LLM provider', Boolean(config.llm.model && config.llm.baseUrl)));
   }
   for (const connection of config.connections) {
-    const label = connection.label || connection.id;
-    if (connection.provider === 'openai') {
-      agents.push(asBuiltin(connection.id, label, Boolean(connection.model && connection.baseUrl)));
-    } else {
-      const tool = onPath.get(connection.provider);
-      const resolved = connection.cliPath || tool?.path;
-      agents.push({
-        id: connection.id,
-        kind: 'cli',
-        label: `${label} · ${llmProviderLabel(connection.provider)}`,
-        available: Boolean(resolved),
-        command: connection.cliPath || tool?.command,
-        path: resolved ?? null,
-        ...(resolved ? {} : { reason: `${tool?.command ?? connection.provider} was not found on the service PATH` }),
-      });
-    }
+    if (connection.provider !== 'openai') continue;
+    agents.push(asBuiltin(connection.id, connection.label || connection.id, Boolean(connection.model && connection.baseUrl)));
+  }
+  // the CLI agents in playbooks/agents/, each with the path it pins, if any
+  for (const cli of config.agentLlms ?? []) {
+    const tool = onPath.get(cli.provider);
+    const resolved = cli.cliPath || tool?.path;
+    agents.push({
+      id: cli.id,
+      kind: 'cli',
+      label: `${cli.label || cli.id} · ${llmProviderLabel(cli.provider)}`,
+      available: Boolean(resolved),
+      command: cli.cliPath || tool?.command,
+      path: resolved ?? null,
+      ...(resolved ? {} : { reason: `${tool?.command ?? cli.provider} was not found on the service PATH` }),
+    });
   }
   return agents;
 }
@@ -81,15 +81,18 @@ export async function availableAgents(config: KnodeConfig): Promise<AvailableAge
  * the form; the user still has to save, so "not configured" never turns into a
  * setting nobody chose.
  *
- * The second rule is the migration: someone running on the old inherit-from-llm
- * fallback gets their current effective behaviour written down explicitly, and
- * nothing changes for them.
+ * The first rule is the migration: someone running on the old inherit-from-llm
+ * fallback, with a CLI as the default, gets that CLI agent written down
+ * explicitly, and nothing changes for them.
  */
 export function suggestResearchAgent(config: KnodeConfig, agents: AvailableAgent[]): string | null {
   if (config.research?.agent?.trim()) return null; // already configured
   const usable = (id: string) => agents.find((a) => a.id === id && a.available) && agentForSpec(config, id);
 
-  if ((AGENT_PROVIDERS as string[]).includes(config.llm.provider) && usable(config.llm.provider)) return config.llm.provider;
+  // an agent someone already set up beats a bare CLI: the default first, when
+  // it is one, then any other
+  if (isCliProvider(config.llm.provider) && usable(config.llmUse)) return config.llmUse;
+  for (const cli of config.agentLlms ?? []) if (usable(cli.id)) return cli.id;
   for (const provider of AGENT_PROVIDERS) if (usable(provider)) return provider;
   if (usable(DEFAULT_CONNECTION)) return DEFAULT_CONNECTION;
   for (const connection of config.connections) if (usable(connection.id)) return connection.id;

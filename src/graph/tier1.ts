@@ -1,4 +1,4 @@
-import { KnodeConfig, resolveRoutedLlmConfig } from '../config.js';
+import { KnodeConfig, llmTargets, resolveRoutedLlmConfig } from '../config.js';
 import { LLM_EXTRACT_INPUT_CHARS } from '../constants.js';
 import { readSidecarPart, replayableTier1, updateSidecarPart } from '../fs/sidecar.js';
 import { loadSourceText } from '../ingest/source.js';
@@ -120,7 +120,7 @@ async function runTier1PassUnlocked(
   const progress = opts.onProgress ?? (() => {});
   const stats: Tier1Stats = { processed: 0, failed: 0, entities: 0, relations: 0, tokensUsed: 0, budgetLeft: 0, queued: 0 };
   const entityLlm = config.extraction.entityLlm
-    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, config.connections, config.extraction.tier1Model))
+    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, llmTargets(config), config.extraction.tier1Model))
     : llm;
 
   const countQueue = async () => {

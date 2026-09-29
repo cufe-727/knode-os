@@ -1,5 +1,5 @@
-import { KnodeConfig, LlmConfig } from '../config.js';
-import { executorForAgent } from './agents.js';
+import { isCliProvider, KnodeConfig, LlmConfig, llmTargets, LlmProtocol } from '../config.js';
+import { AgentDefinition, loadAgent } from './agents.js';
 
 /** The coding-agent CLIs a session can be launched on. */
 export type AgentProvider = 'claude-cli' | 'codex-cli' | 'cursor-cli';
@@ -27,6 +27,8 @@ export interface BuiltinAgent {
   baseUrl: string;
   /** Kept in its raw `env:VAR` form; resolved inside the executor, never logged. */
   apiKey: string;
+  /** Which wire to speak on. Absent = 'auto' (prefer Responses, fall back). */
+  protocol?: LlmProtocol;
   model: string;
 }
 
@@ -56,7 +58,7 @@ function fromLlm(cfg: LlmConfig, model: string): ResearchAgent | null {
     // makes that a visible "not configured" rather than a queue that stalls
     const chosen = model || cfg.model;
     if (!chosen || !cfg.baseUrl) return null;
-    return { kind: 'builtin', provider: BUILTIN_AGENT, baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: chosen };
+    return { kind: 'builtin', provider: BUILTIN_AGENT, baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, protocol: cfg.protocol, model: chosen };
   }
   return null;
 }
@@ -65,10 +67,12 @@ function fromLlm(cfg: LlmConfig, model: string): ResearchAgent | null {
  * Resolve an agent spec to a launchable agent:
  *
  *   ''                 → null (not configured)
- *   <agent name>       → that agent's executor and model (needs `dataDir`)
- *   'default'          → the section-01 connection, whatever kind it is
- *   <connection id>    → that connection: a CLI, or the built-in agent for an
- *                        OpenAI-compatible endpoint
+ *   <agent name>       → that agent: its CLI with its own path and model, or
+ *                        the built-in agent on the model its executor names
+ *                        (needs `dataDir`; without it a CLI agent still
+ *                        resolves, through `llmTargets`)
+ *   'default'          → the default LLM, whatever kind it is
+ *   <connection id>    → the built-in agent on that model endpoint
  *   'claude-cli' | 'codex-cli' | 'cursor-cli' → that CLI, found on PATH
  *
  * There is deliberately no bare 'deep-agents' spec: a CLI name is meaningful on
@@ -79,17 +83,69 @@ function fromLlm(cfg: LlmConfig, model: string): ResearchAgent | null {
  * bare specs, which is also what a config written before named agents holds.
  */
 export function agentForSpec(config: KnodeConfig, spec: string, model = '', dataDir?: string): ResearchAgent | null {
+  return resolveAgentSpec(config, spec, model, dataDir)?.agent ?? null;
+}
+
+/** What will launch, and the definition it was named through (null for a bare spec). */
+export interface ResolvedAgent {
+  agent: ResearchAgent;
+  /** The `playbooks/agents/` entry behind the spec, when the spec was a name. */
+  definition: AgentDefinition | null;
+}
+
+/**
+ * `agentForSpec`, keeping the definition a name resolved through.
+ *
+ * The recursion in `agentForSpec` used to throw the definition away and hand
+ * on only `{ executor, model }`, which is why an agent's effort, tools, turn
+ * cap and prompt were edited, saved, and then never read by anything. A caller
+ * that wants to honour them asks for the whole thing.
+ *
+ * The executor is resolved **without** `dataDir`, so an executor that happens
+ * to share a name with an agent file still means the bare spec — one level of
+ * naming, as before.
+ */
+export function resolveAgentSpec(config: KnodeConfig, spec: string, model = '', dataDir?: string): ResolvedAgent | null {
   const wanted = spec.trim();
   if (!wanted) return null;
   if (dataDir) {
-    const named = executorForAgent(dataDir, wanted);
-    if (named) return agentForSpec(config, named.executor, model || named.model);
+    const definition = loadAgent(dataDir, wanted);
+    if (definition) {
+      const agent = isCliProvider(definition.executor)
+        ? // a CLI agent carries its own path; it borrows nothing from anyone
+          { kind: 'cli' as const, provider: definition.executor, cliPath: definition.cliPath, model: model || definition.model }
+        : builtinOnly(bareAgentFor(config, definition.executor, model || definition.model));
+      return agent ? { agent, definition } : null;
+    }
   }
+  const agent = bareAgentFor(config, wanted, model);
+  return agent ? { agent, definition: null } : null;
+}
+
+/**
+ * A deepagents definition runs the built-in loop or nothing. When the model it
+ * follows turns out to be a CLI agent — a default that is one — running that
+ * CLI under this agent's name is exactly the confusion named agents exist to
+ * end, so it is not runnable until it names a model.
+ */
+function builtinOnly(agent: ResearchAgent | null): BuiltinAgent | null {
+  return agent?.kind === 'builtin' ? agent : null;
+}
+
+/**
+ * A spec that is not an agent name: 'default', a model endpoint, a CLI agent
+ * (by the id `llmTargets` gives it), or a bare CLI — which borrows the path and
+ * model of a CLI agent running that CLI, the default's first.
+ */
+function bareAgentFor(config: KnodeConfig, spec: string, model: string): ResearchAgent | null {
+  const wanted = spec.trim();
+  if (!wanted) return null;
   if (wanted === DEFAULT_CONNECTION) return fromLlm(config.llm, model);
-  const connection = config.connections.find((c) => c.id === wanted);
+  const targets = llmTargets(config);
+  const connection = targets.find((c) => c.id === wanted);
   if (connection) return fromLlm(connection, model);
   if ((AGENT_PROVIDERS as string[]).includes(wanted)) {
-    const same = config.llm.provider === wanted ? config.llm : config.connections.find((c) => c.provider === wanted);
+    const same = config.llm.provider === wanted ? config.llm : targets.find((c) => c.provider === wanted);
     return { kind: 'cli', provider: wanted as AgentProvider, cliPath: same?.cliPath ?? '', model: model || same?.model || '' };
   }
   return null;

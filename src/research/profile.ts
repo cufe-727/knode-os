@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { parseYaml } from '../compiler/intents.js';
-import { KnodeConfig } from '../config.js';
+import { KnodeConfig, LLM_EFFORTS, LlmEffort } from '../config.js';
 import { RESEARCH_DIR } from '../fs/layout.js';
 import { agentWebCapable, ResearchAgent } from './agent.js';
 import { PHASES, PhaseName, ResearchTemplate } from './templates.js';
@@ -32,8 +32,9 @@ export const PROFILES_DIR = `${RESEARCH_DIR}/profiles`;
 /** Where prompts of roles created in the UI are written (relative to playbooks/research/). */
 export const ROLE_PROMPTS_DIR = 'roles';
 
-export const EFFORTS = ['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
-export type Effort = (typeof EFFORTS)[number];
+/** The ladder is defined with the LLM config, so a profile and a connection mean the same thing by `high`. */
+export const EFFORTS = LLM_EFFORTS;
+export type Effort = LlmEffort;
 export const ROLE_PHASES = ['plan', 'research', 'synthesize', 'review', 'revise'] as const;
 export type RolePhase = (typeof ROLE_PHASES)[number];
 export const WEB_ACCESS = ['inherit', 'on', 'off'] as const;

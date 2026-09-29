@@ -286,6 +286,34 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"pong"}'
     expect(out).toBe('pong');
   });
 
+  it('passes the configured reasoning effort to each CLI in its own syntax', async () => {
+    const claude = writeStub('claude-effort-stub.sh', `
+cat > /dev/null
+echo '{"type":"result","is_error":false,"result":"'"$*"'"}'
+`);
+    const args = await completeViaCli(llmCfg({ provider: 'claude-cli', cliPath: claude, effort: 'high' }), [{ role: 'user', content: 'x' }]);
+    expect(args).toContain('--effort high');
+    // 'default' means "leave the CLI's own setting alone", so nothing is sent
+    const plain = await completeViaCli(llmCfg({ provider: 'claude-cli', cliPath: claude, effort: 'default' }), [{ role: 'user', content: 'x' }]);
+    expect(plain).not.toContain('--effort');
+
+    const codex = writeStub('codex-effort-stub.sh', `
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "--output-last-message" ] && out="$a"; prev="$a"; done
+cat > /dev/null
+echo -n "$*" > "$out"
+`);
+    expect(await completeViaCli(llmCfg({ provider: 'codex-cli', cliPath: codex, effort: 'max' }), [{ role: 'user', content: 'x' }]))
+      .toContain('model_reasoning_effort="max"');
+
+    // cursor has no flag: the level rides in the model name, and only as far as high
+    const cursor = writeStub('cursor-effort-stub.sh', `
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"'"$*"'"}]}}'
+`);
+    expect(await completeViaCli(llmCfg({ provider: 'cursor-cli', cliPath: cursor, model: 'gpt-5', effort: 'max' }), [{ role: 'user', content: 'x' }]))
+      .toContain('--model gpt-5[effort=high]');
+  });
+
   it('reports a missing CLI executable clearly', async () => {
     await expect(completeViaCli(llmCfg({ provider: 'codex-cli', cliPath: path.join(tmp, 'nope-cli') }), [{ role: 'user', content: 'x' }]))
       .rejects.toThrow(/not found/);

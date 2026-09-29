@@ -95,7 +95,7 @@
       <div class="brand"><img src="/favicon.svg" alt="" />knode-os</div>
       <nav id="tabs" aria-label="Primary navigation">
         <button data-section="library" class="active" title="Files, search, and agent traces">Library</button>
-        <button data-section="ask" title="Quick cited answers, or a working agent">Ask</button>
+        <button data-section="ask" title="An agent that answers from your workspace">Ask</button>
         <button data-section="knowledge" title="Graph, wiki, and nightly review">Knowledge</button>
         <button data-section="settings" title="Model routes and pipeline limits">Settings</button>
       </nav>
@@ -180,8 +180,7 @@
       <div id="search-results"></div>
     </section>
 
-    <!-- Ask: one question, two costs. Quick answers in one retrieval pass
-         (cited, no agent CLI needed); Agent runs the configured CLI over MCP. -->
+    <!-- Ask: every question is one session of the configured agent over MCP. -->
     <section id="tab-ask" class="tab">
       <div class="chat-layout">
         <aside id="chat-side">
@@ -189,15 +188,11 @@
           <div id="chat-list"></div>
         </aside>
         <div id="chat-main">
-          <div id="chat-thread"><p class="hint">Ask a question. <b>quick</b> answers in one retrieval pass, with citations; <b>agent</b> runs the configured CLI, which can follow leads and write what you teach it.</p></div>
+          <div id="chat-thread"><p class="hint">Ask a question. An agent answers over your files, graph and wiki — it can follow leads across several turns, and writes what you teach it as a quarantined note you can adopt.</p></div>
           <div id="chat-activity" class="chat-activity" hidden></div>
           <form id="chat-composer" class="chat-composer">
-            <textarea id="chat-input" rows="2" placeholder="ask a question — answered from your knowledge base with citations… Enter sends, Shift+Enter adds a line"></textarea>
+            <textarea id="chat-input" rows="2" placeholder="ask a question, or “记住：…” to teach the knowledge base — Enter sends, Shift+Enter adds a line"></textarea>
             <div class="chat-composer-actions">
-              <select id="ask-mode" title="Quick answers in one retrieval pass. Agent runs the configured CLI, which can take minutes.">
-                <option value="quick">quick</option>
-                <option value="agent">agent</option>
-              </select>
               <button id="btn-chat-send" type="submit" class="primary">send</button>
               <button id="btn-chat-cancel" type="button" hidden>cancel</button>
             </div>
@@ -300,14 +295,24 @@
         </div>
 
         <section class="settings-section" data-subtab="providers" aria-labelledby="providers-title">
-          <div class="settings-section-head"><div><p class="section-index">01 · PROVIDERS</p><h3 id="providers-title">Endpoints and credentials</h3><p>Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice.</p></div><span class="section-badge">Configure once</span></div>
+          <div class="settings-section-head"><div><p class="section-index">01 · PROVIDERS &amp; AGENTS</p><h3 id="providers-title">Models</h3><p>Each model endpoint and its key, once. Pipeline stages pick from this list, and a deepagents agent below runs on one of them.</p></div><span class="section-badge">Configure once</span></div>
 
           <div class="provider-table">
             <div class="provider-head">
               <span></span><span>kind</span><span>name</span><span></span><span>provider</span><span>model</span>
-              <button type="button" id="cfg-add-provider" class="ghost">＋ Add provider</button>
+              <button type="button" id="cfg-add-provider" class="ghost">＋ Add model</button>
             </div>
             <div id="cfg-providers"></div>
+          </div>
+
+          <div class="settings-section-head"><div><h3 id="agents-title">Agents</h3><p>Who does the work for Ask and Research: the built-in deepagents loop on one of the models above, or a coding-agent CLI on this machine that brings its own.</p></div><span class="section-badge accent2">Named</span></div>
+
+          <div class="provider-table agent-table">
+            <div class="provider-head">
+              <span></span><span>type</span><span>name</span><span></span><span>runs on</span><span>model</span>
+              <button type="button" id="cfg-add-agent" class="ghost">＋ Add agent</button>
+            </div>
+            <div id="cfg-agents"></div>
           </div>
         </section>
 
@@ -383,8 +388,8 @@
               <div class="stage-panel" data-stage="answer" hidden>
                 <div class="stage-panel-copy">
                   <div class="stage-title"><h4>Answer</h4><span class="section-badge accent2">Interactive</span></div>
-                  <p>Ask, wiki summaries and the nightly Dream analysis.</p>
-                  <p class="stage-req">Always the default provider. Latency lands straight in the Ask box, so prefer something responsive.</p>
+                  <p>Document summaries in the wiki, and the nightly Dream analysis.</p>
+                  <p class="stage-req">Always the default provider — these are the jobs that never picked one of their own. Ask no longer runs here: every question is an agent session, configured under Providers & Agents.</p>
                 </div>
                 <div class="stage-control stage-pin">
                   <span class="stage-pin-label">Runs on</span>
@@ -401,20 +406,8 @@
           </div>
         </section>
 
-        <section class="settings-section" data-subtab="agents" aria-labelledby="agents-title">
-          <div class="settings-section-head"><div><p class="section-index">03 · AGENTS</p><h3 id="agents-title">Who does the work</h3><p>An agent is an executor with a name: a coding-agent CLI on this machine, or an OpenAI-compatible connection running the built-in deep agent. Research and Ask below point at one.</p></div><span class="section-badge accent2">Add agent</span></div>
-
-          <div class="provider-table">
-            <div class="provider-head">
-              <span></span><span>kind</span><span>name</span><span></span><span>runs on</span><span>model</span>
-              <button type="button" id="cfg-add-agent" class="ghost">＋ Add agent</button>
-            </div>
-            <div id="cfg-agents"></div>
-          </div>
-        </section>
-
         <section class="settings-section" data-subtab="research" aria-labelledby="research-title">
-          <div class="settings-section-head"><div><p class="section-index">04 · RESEARCH</p><h3 id="research-title">How the wiki gets written</h3><p>What initialization does, how Ask's Agent mode behaves, and how a deep-research job runs: which agent from section 03 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents.</p></div><span class="section-badge accent2">Pipeline</span></div>
+          <div class="settings-section-head"><div><p class="section-index">03 · RESEARCH</p><h3 id="research-title">How the wiki gets written</h3><p>What initialization does, how Ask behaves, and how a deep-research job runs: which agent from section 01 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents.</p></div><span class="section-badge accent2">Pipeline</span></div>
 
           <div class="cfg-card-title"><div><b>Deep research pipeline</b><small>Which agent runs jobs, how many at once, and which profile it follows. Roles below may override the agent per phase.</small></div><span class="section-badge accent2">Runner</span></div>
           <fieldset class="cfg-card cfg-card-wide">
@@ -442,15 +435,10 @@
             </div>
           </fieldset>
 
-          <div class="cfg-card-title"><div><b>Ask · Agent mode</b><small>Ask's Agent mode uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note. Quick mode needs none of this — it answers from retrieval.</small></div><span class="section-badge accent2">Ask</span></div>
+          <div class="cfg-card-title"><div><b>Ask</b><small>Ask uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note. Effort, turns, timeout, tool grants and any extra prompt come from the agent — edit them where the agent is defined, in section 01.</small></div><span class="section-badge accent2">Ask</span></div>
           <fieldset class="cfg-card cfg-card-wide">
             <div class="cfg-grid cfg-grid-3">
               <label>Agent<select id="cfg-chat-agent"></select></label>
-              <label>Model<input id="cfg-chat-model" placeholder="Agent's model" /></label>
-              <label>Reasoning effort<select id="cfg-chat-effort"></select></label>
-              <label>Web access<select id="cfg-chat-web"><option value="inherit">Follow review.external (on only when it is “research”)</option><option value="on">On (within review.external)</option><option value="off">Off</option></select></label>
-              <label>Turns per reply<input id="cfg-chat-maxturns" type="number" min="1" max="200" step="1" /></label>
-              <label>Timeout (minutes)<input id="cfg-chat-timeout" type="number" min="1" max="120" step="1" /></label>
               <label>Messages replayed<input id="cfg-chat-history" type="number" min="0" max="50" step="1" /></label>
               <label>Conversations kept<input id="cfg-chat-keep" type="number" min="1" max="500" step="1" /></label>
             </div>

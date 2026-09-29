@@ -1,17 +1,13 @@
 import SwiftUI
 
 /**
- * Ask: one place to put a question to the workspace, in either of the two
- * costs it can be answered at.
+ * Ask: one place to put a question to the workspace.
  *
- * **Quick** is one retrieval pass — cited, cheap, and available with no agent
- * CLI installed. **Agent** runs a session of the configured CLI over MCP: it
- * can follow leads across several turns and write what you teach it as a
- * quarantined note you can adopt. Both land in the same conversation list, so
- * asking the cheap way first costs nothing.
- *
- * A conversation keeps the mode it was started in; switching the picker starts
- * a new one rather than changing what an existing thread means.
+ * Every question runs a session of the configured agent over MCP, so it can
+ * follow leads across several turns and write what you teach it as a
+ * quarantined note you can adopt. That costs more than a single retrieval
+ * pass, which is why `readiness` is checked before the composer is usable —
+ * a question typed into a box that cannot answer it is a wasted minute.
  */
 struct AskView: View {
     @EnvironmentObject private var model: AppModel
@@ -19,8 +15,10 @@ struct AskView: View {
     @State private var activeId: String?
     @State private var thread: ChatConversation?
     @State private var draft = ""
-    @State private var mode: AskMode = .quick
     @State private var activity: [ChatEvent] = []
+    /// nil until the first check; `ready == false` replaces the composer's job
+    /// with a screen that names what to configure.
+    @State private var readiness: ChatReadiness?
     @State private var isAnswering = false
     @State private var isLoading = true
     @State private var errorMessage: String?
@@ -42,7 +40,7 @@ struct AskView: View {
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 8) {
             Button {
-                Task { await newConversation(mode: mode) }
+                Task { await newConversation() }
             } label: {
                 Label(L("New question"), systemImage: "square.and.pencil").frame(maxWidth: .infinity)
             }
@@ -76,13 +74,9 @@ struct AskView: View {
                 Text(conversation.displayTitle)
                     .lineLimit(1)
                     .font(.system(size: 12))
-                HStack(spacing: 5) {
-                    // which of the two answered it, at a glance in a mixed list
-                    RouteBadge(label: conversation.mode.title, color: conversation.mode == .quick ? .knodeCyan : .knodeViolet)
-                    Text(shortTime(conversation.updatedAt))
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
+                Text(shortTime(conversation.updatedAt))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
             Button {
@@ -116,13 +110,9 @@ struct AskView: View {
                                 messageRow(message).id(message.id)
                             }
                         } else {
-                            EmptyState(
-                                symbol: "sparkles",
-                                title: L("Ask your knowledge base"),
-                                message: L("Quick answers are grounded in retrieved chunks and extracted claims, with citations back to the source files. Agent mode can dig further, and writes what you teach it as a quarantined note you can adopt.")
-                            )
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 60)
+                            emptyState
+                                .frame(maxWidth: .infinity)
+                                .padding(.top, 60)
                         }
                     }
                     .padding(20)
@@ -161,14 +151,8 @@ struct AskView: View {
                 } else {
                     MarkdownText(markdown: message.content)
                 }
-                // the two kinds of reply describe themselves differently: a
-                // retrieval answer by what it cited, an agent by what it did
-                if !message.isUser {
-                    if let payload = message.payload, message.mode == .quick {
-                        quickFooter(payload, question: question(before: message))
-                    }
-                    if !message.events.isEmpty { agentFooter(message) }
-                }
+                // a reply describes itself by what it did
+                if !message.isUser, !message.events.isEmpty { agentFooter(message) }
                 if let error = message.error, !message.content.isEmpty {
                     Text(error).font(.system(size: 10, design: .monospaced)).foregroundStyle(.red)
                 }
@@ -201,88 +185,6 @@ struct AskView: View {
         }
     }
 
-    @ViewBuilder
-    private func quickFooter(_ payload: ChatAnswerPayload, question: String?) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let citations = payload.citations, !citations.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label(L("Citations"), systemImage: "quote.opening")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    ForEach(citations) { citation in
-                        Button { model.openFile(citation.path) } label: {
-                            HStack(spacing: 6) {
-                                Text("[\(citation.ref)]")
-                                    .font(.system(size: 10, design: .monospaced).bold())
-                                    .foregroundStyle(Color.knodeCyan)
-                                Text(citation.path)
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .lineLimit(1)
-                                Spacer(minLength: 0)
-                                Image(systemName: "arrow.up.forward.app").foregroundStyle(.tertiary)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .background(Color.knodeCyan.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
-                    }
-                }
-            }
-
-            if let facts = payload.facts, !facts.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label(L("Known facts"), systemImage: "checkmark.seal")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    ForEach(facts.prefix(8)) { fact in
-                        HStack(alignment: .top, spacing: 8) {
-                            RouteBadge(label: fact.status ?? "claim", color: fact.status == "verified" ? .knodeGood : .knodeViolet)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(fact.statement).font(.system(size: 11))
-                                if let subject = fact.subject, !subject.isEmpty {
-                                    Text(subject)
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let gaps = payload.gaps, !gaps.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label(L("Knowledge gaps"), systemImage: "exclamationmark.triangle")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(Color.knodeBad)
-                    ForEach(gaps, id: \.self) { gap in
-                        HStack(alignment: .top, spacing: 6) {
-                            Image(systemName: "circle.fill").font(.system(size: 4)).padding(.top, 5)
-                            Text(gap).font(.system(size: 11))
-                        }
-                    }
-                }
-                .padding(10)
-                .background(Color.knodeBad.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
-                .overlay { RoundedRectangle(cornerRadius: 9).stroke(Color.knodeBad.opacity(0.2)) }
-            }
-
-            // the escape hatch: one retrieval pass was not enough, hand the same
-            // question to the agent without retyping it
-            if let question {
-                Button {
-                    Task { await deepen(question) }
-                } label: {
-                    Label(L("Dig deeper with the agent"), systemImage: "sparkles")
-                        .font(.system(size: 11))
-                }
-                .buttonStyle(.link)
-            }
-        }
-    }
-
     private func chip(_ event: ChatEvent) -> some View {
         Text(event.label)
             .font(.system(size: 10, design: .monospaced))
@@ -291,12 +193,6 @@ struct AskView: View {
             .padding(.vertical, 2)
             .background(Color.primary.opacity(0.08), in: Capsule())
             .foregroundStyle(event.ok == false ? Color.knodeBad : .secondary)
-    }
-
-    /// The question a reply answered — what "dig deeper" re-asks.
-    private func question(before message: ChatMessage) -> String? {
-        guard let messages = thread?.messages else { return nil }
-        return messages.last { $0.isUser && $0.seq < message.seq }?.content
     }
 
     private var composer: some View {
@@ -319,18 +215,12 @@ struct AskView: View {
                 }
                 .focused($composerFocused)
             VStack(alignment: .trailing, spacing: 6) {
-                Picker(L("Mode"), selection: $mode) {
-                    ForEach(AskMode.allCases) { mode in Text(mode.title).tag(mode) }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 150)
-                .help(L("Quick answers in one retrieval pass. Agent runs the configured CLI, which can take minutes."))
                 Button(L("Send")) { Task { await send() } }
                     .buttonStyle(.borderedProminent)
-                    .tint(mode == .quick ? .knodeCyan : .knodeViolet)
+                    .tint(.knodeViolet)
                     .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(isAnswering || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(isAnswering || !isReady || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .help(readiness?.hint ?? L("A reply runs an agent session, which can take minutes."))
                 if isAnswering {
                     Button(L("Cancel")) { Task { await cancel() } }
                         .font(.system(size: 11))
@@ -342,9 +232,31 @@ struct AskView: View {
     }
 
     @MainActor private var placeholder: String {
-        mode == .quick
-            ? L("Ask a question — answered from your workspace with citations…")
-            : L("Ask a question, or “remember: …” to teach the knowledge base")
+        L("Ask a question, or “remember: …” to teach the knowledge base")
+    }
+
+    /// Nothing checked yet reads as ready: the check is a courtesy, and a send
+    /// that races it still gets the same answer from the server.
+    private var isReady: Bool { readiness?.ready ?? true }
+
+    /// Either the invitation to ask, or what to configure before asking.
+    @ViewBuilder
+    private var emptyState: some View {
+        if let readiness, readiness.ready == false {
+            EmptyState(
+                symbol: "exclamationmark.triangle",
+                title: L("Ask has nothing to run on"),
+                message: readiness.hint ?? L("Configure an LLM provider, or name an agent, before asking."),
+                actionTitle: L("Open Providers & Agents"),
+                action: { model.select(.providers) }
+            )
+        } else {
+            EmptyState(
+                symbol: "sparkles",
+                title: L("Ask your knowledge base"),
+                message: L("An agent answers over your files, graph and wiki — it can follow leads across several turns, and writes what you teach it as a quarantined note you can adopt.")
+            )
+        }
     }
 
     /* ----------------------------- data ---------------------------------- */
@@ -352,6 +264,7 @@ struct AskView: View {
     private func load() async {
         isLoading = true
         defer { isLoading = false }
+        readiness = try? await model.client().chatReadiness()
         do {
             conversations = try await model.client().chatConversations()
             errorMessage = nil
@@ -366,8 +279,6 @@ struct AskView: View {
         do {
             let conversation = try await model.client().conversation(id: id)
             thread = conversation
-            // a follow-up continues the thread the way it was started
-            mode = conversation.mode
             errorMessage = nil
             if conversation.running == true { startPolling(id) }
         } catch {
@@ -376,13 +287,12 @@ struct AskView: View {
     }
 
     @discardableResult
-    private func newConversation(mode: AskMode) async -> String? {
+    private func newConversation() async -> String? {
         do {
-            let conversation = try await model.client().createConversation(mode: mode)
+            let conversation = try await model.client().createConversation()
             conversations.insert(conversation, at: 0)
             thread = conversation
             activeId = conversation.id
-            self.mode = mode
             composerFocused = true
             return conversation.id
         } catch {
@@ -394,37 +304,24 @@ struct AskView: View {
     private func send() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        let asked = mode
-        // Quick asks are one question each, and a mode never changes what an
-        // existing thread means — either way that means a fresh conversation.
         var id = activeId
-        if id == nil || asked == .quick || thread?.mode != asked {
-            id = await newConversation(mode: asked)
-        }
+        if id == nil { id = await newConversation() }
         guard let id else { return }
         draft = ""
         do {
-            let response = try await model.client().sendChat(id: id, text: text, mode: asked)
+            let response = try await model.client().sendChat(id: id, text: text)
             await open(id)
-            // the server, not the mode we asked in, says whether there is a session to watch
             if response.status == "running" { startPolling(id) }
             conversations = (try? await model.client().chatConversations()) ?? conversations
         } catch {
             draft = text
-            model.showToast(L("Send failed: %@", error.localizedDescription))
-        }
-    }
-
-    /// Re-ask a quick question in a fresh agent conversation.
-    private func deepen(_ question: String) async {
-        guard let id = await newConversation(mode: .agent) else { return }
-        do {
-            let response = try await model.client().sendChat(id: id, text: question, mode: .agent)
-            await open(id)
-            if response.status == "running" { startPolling(id) }
-            conversations = (try? await model.client().chatConversations()) ?? conversations
-        } catch {
-            model.showToast(L("Send failed: %@", error.localizedDescription))
+            // a 503 is a configuration answer, not a failed send: show the
+            // screen that says what to fix rather than a toast that scrolls away
+            if let api = error as? APIError, let reason = api.reason {
+                readiness = ChatReadiness(ready: false, reason: reason, hint: api.message)
+            } else {
+                model.showToast(L("Send failed: %@", error.localizedDescription))
+            }
         }
     }
 

@@ -10,11 +10,14 @@ import {
   defaultConfig,
   defaultRoutedLlmConfig,
   embeddingIdentity,
+  loadConfig,
+  migrateDefaultLlm,
   migrateEmbeddingProviders,
   migrateRouteConnections,
   resolveRoutedLlmConfig,
 } from '../src/config.js';
 import { cliCommand, readCursorStream, resolveExecutable } from '../src/llm/cli.js';
+import { parseClaudeAliases, parseCodexCatalog } from '../src/llm/models.js';
 import { clearModelCache } from '../src/llm/model-cache.js';
 import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
@@ -367,13 +370,18 @@ describe('PUT /api/config with connections', () => {
     });
     expect(created.status).toBe(200);
     const body = (await created.json()) as { config: KnodeConfig };
-    expect(body.config.connections[0]).toMatchObject({ id: 'ark', label: 'Ark vision', apiKey: '***' });
+    const ark = (cfg: KnodeConfig) => cfg.connections.find((c) => c.id === 'ark')!;
+    expect(ark(body.config)).toMatchObject({ id: 'ark', label: 'Ark vision', apiKey: '***' });
     expect(body.config.extraction.documentLlm.use).toBe('ark');
+    // the default is an ordinary row in the same list, and a client that did
+    // not send it gets it back rather than losing it
+    expect(body.config.connections.some((c) => c.id === body.config.llmUse)).toBe(true);
+    expect(body.config.llm.label).toBe('工作密钥');
 
     // echoing the redacted key back must not overwrite the stored one
     const kept = await save({ connections: [{ id: 'ark', label: 'Ark vision', provider: 'openai', baseUrl: 'https://ark.example/api/v3', apiKey: '***', model: 'doubao-pro' }] });
     const keptBody = (await kept.json()) as { config: KnodeConfig };
-    expect(keptBody.config.connections[0].model).toBe('doubao-pro');
+    expect(ark(keptBody.config).model).toBe('doubao-pro');
 
     const models = await app.request('/api/config/models', {
       method: 'POST',
@@ -383,8 +391,66 @@ describe('PUT /api/config with connections', () => {
     expect(models.status).toBe(200);
     expect((await models.json()) as { source: string }).toMatchObject({ source: 'api' });
 
-    const dropped = await save({ connections: [] });
-    expect(((await dropped.json()) as { config: KnodeConfig }).config.connections).toEqual([]);
+    // clearing the list drops the extras but never the default: something has
+    // to answer, so the row `llmUse` names comes back from the mirror
+    const dropped = ((await (await save({ connections: [] })).json()) as { config: KnodeConfig }).config;
+    expect(dropped.connections.map((c) => c.id)).toEqual([dropped.llmUse]);
+    expect(dropped.llm.label).toBe('工作密钥');
+  });
+
+  it('makes another connection the default by pointing at it, without retyping the endpoint', async () => {
+    const save = async (body: unknown) =>
+      app.request('/api/config', { method: 'PUT', headers, body: JSON.stringify(body) });
+
+    const before = ((await (await save({
+      connections: [{ id: 'ark2', label: 'Ark', provider: 'openai', baseUrl: 'https://ark.example/api/v3', apiKey: 'sk-ark', model: 'doubao-pro' }],
+    })).json()) as { config: KnodeConfig }).config;
+    const previousDefault = before.llmUse;
+    expect(previousDefault).not.toBe('ark2');
+
+    const after = ((await (await save({ llmUse: 'ark2' })).json()) as { config: KnodeConfig }).config;
+    expect(after.llmUse).toBe('ark2');
+    // the mirror follows the row, so ctx.llm and every inheriting route move with it
+    expect(after.llm).toMatchObject({ baseUrl: 'https://ark.example/api/v3', model: 'doubao-pro', apiKey: '***' });
+    // and the one that used to be the default is still on the list, just no longer default
+    expect(after.connections.some((c) => c.id === previousDefault)).toBe(true);
+  });
+});
+
+describe('what a CLI says it offers', () => {
+  it('reads the listable models out of a codex catalog, best first', () => {
+    const catalog = JSON.stringify({
+      models: [
+        { slug: 'gpt-5.5', display_name: 'GPT-5.5', visibility: 'list', priority: 12, supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }, { effort: 'xhigh' }] },
+        { slug: 'gpt-6-astra', display_name: 'GPT-6-Astra', visibility: 'list', priority: 1, supported_reasoning_levels: [{ effort: 'low' }, { effort: 'max' }, { effort: 'ultra' }] },
+        { slug: 'gpt-reserve', display_name: 'GPT-Reserve', visibility: 'hide', priority: 3 },
+        { slug: '', display_name: 'nameless', visibility: 'list' },
+      ],
+    });
+    expect(parseCodexCatalog(catalog)).toEqual([
+      { id: 'gpt-6-astra', label: 'GPT-6-Astra · effort low–ultra' },
+      { id: 'gpt-5.5', label: 'GPT-5.5 · effort low–xhigh' },
+    ]);
+  });
+
+  it('tolerates a catalog with noise around it, and refuses one that is not JSON', () => {
+    expect(parseCodexCatalog('warning: stale cache\n{"models":[{"slug":"gpt-6-astra"}]}\n')).toEqual([
+      { id: 'gpt-6-astra', label: 'gpt-6-astra' },
+    ]);
+    expect(() => parseCodexCatalog('command not found')).toThrow();
+  });
+
+  it('reads the aliases claude names as examples, and drops the full ids', () => {
+    const help = [
+      '  --model <model>                       Model for the current session. Provide',
+      "                                        an alias for the latest model (e.g.",
+      "                                        'fable', 'opus', or 'sonnet') or a",
+      "                                        model's full name (e.g.",
+      "                                        'claude-fable-5').",
+      '  -n, --name <name>                     Set a display name for this session',
+    ].join('\n');
+    expect(parseClaudeAliases(help)).toEqual(['fable', 'opus', 'sonnet']);
+    expect(parseClaudeAliases('nothing to see here')).toEqual([]);
   });
 });
 
@@ -414,5 +480,82 @@ describe('readCursorStream', () => {
 
   it('ignores progress lines that are not JSON', () => {
     expect(readCursorStream(`Connecting…\n${assistant('done')}`).text).toBe('done');
+  });
+});
+
+describe('migrateChatConfig', () => {
+  it('drops the chat keys the agent definition now owns, and keeps the conversation ones', () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'chat-config-'));
+    const stored = {
+      ...defaultConfig(),
+      chat: { agent: 'writer', model: 'sonnet', effort: 'high', maxTurns: 100, timeoutMs: 1_200_000, web: 'on', historyTurns: 4, keep: 9 },
+    };
+    fs.writeFileSync(path.join(dir, 'knode.config.json'), JSON.stringify(stored));
+
+    const loaded = loadConfig(dir);
+    expect(loaded.chat).toEqual({ agent: 'writer', model: 'sonnet', historyTurns: 4, keep: 9 });
+    // the keys are gone from the object, not merely ignored, so the next save cleans the file
+    expect(Object.keys(loaded.chat)).not.toContain('effort');
+    expect(Object.keys(loaded.chat)).not.toContain('maxTurns');
+  });
+});
+
+describe('migrateDefaultLlm', () => {
+  const write = (config: unknown) => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'default-llm-'));
+    fs.writeFileSync(path.join(dir, 'knode.config.json'), JSON.stringify(config));
+    return dir;
+  };
+
+  it('lifts a lone `llm` into the connection list and points at it', () => {
+    const base = defaultConfig();
+    const dir = write({
+      ...base,
+      llm: { ...base.llm, provider: 'openai', baseUrl: 'https://one.example/v1', apiKey: 'sk', model: 'm-1', label: '主力' },
+      connections: [],
+    });
+
+    const loaded = loadConfig(dir);
+    const row = loaded.connections.find((c) => c.id === loaded.llmUse);
+    expect(row).toMatchObject({ baseUrl: 'https://one.example/v1', model: 'm-1', label: '主力' });
+    // the mirror is the row, so nothing that reads config.llm has to change
+    expect(loaded.llm).toMatchObject({ baseUrl: 'https://one.example/v1', model: 'm-1' });
+  });
+
+  it('reuses a connection with the same endpoint instead of adding a twin', () => {
+    const base = defaultConfig();
+    const endpoint = { provider: 'openai' as const, baseUrl: 'https://two.example/v1', apiKey: 'sk', model: 'm-2', cliPath: '', cliTimeoutMs: 300_000 };
+    const dir = write({
+      ...base,
+      llm: { ...base.llm, ...endpoint },
+      connections: [{ ...endpoint, id: 'already', label: 'Already there' }],
+    });
+
+    const loaded = loadConfig(dir);
+    expect(loaded.llmUse).toBe('already');
+    expect(loaded.connections).toHaveLength(1);
+  });
+
+  it('leaves an inheriting route inheriting, so changing the default still propagates', () => {
+    const base = defaultConfig();
+    const dir = write({
+      ...base,
+      llm: { ...base.llm, provider: 'openai', baseUrl: 'https://three.example/v1', apiKey: 'sk', model: 'm-3' },
+      connections: [],
+      extraction: { ...base.extraction, entityLlm: { ...defaultRoutedLlmConfig(), use: '' } },
+    });
+
+    const loaded = loadConfig(dir);
+    // NOT rewritten to loaded.llmUse: an inheriting route means "whatever is
+    // the default", which is the whole point of the pointer
+    expect(loaded.extraction.entityLlm.use).toBe('');
+    expect(resolveRoutedLlmConfig(loaded.llm, loaded.extraction.entityLlm, loaded.connections).model).toBe('m-3');
+  });
+
+  it('is idempotent', () => {
+    const once = migrateDefaultLlm(defaultConfig());
+    const twice = migrateDefaultLlm(JSON.parse(JSON.stringify(once)) as KnodeConfig);
+    expect(twice.llmUse).toBe(once.llmUse);
+    expect(twice.connections).toHaveLength(once.connections.length);
   });
 });

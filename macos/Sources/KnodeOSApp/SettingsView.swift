@@ -16,7 +16,7 @@ struct SettingsView: View {
     @State private var selectedStage: PipelineStage = .convert
     /// Model lists, shared by every picker on the screen.
     @StateObject private var catalog = ModelCatalog()
-    /// The named agents Research and Chat point at (section 03).
+    /// The named agents Ask and Research point at (the second table on 01).
     @State private var agents: [AgentDefinition] = []
     @State private var agentToRemove: AgentDefinition?
     @State private var profiles: [ResearchProfileSummary] = []
@@ -41,7 +41,6 @@ struct SettingsView: View {
                     // below stay put, because `Test stages` tests every stage
                     switch model.selectedTab {
                     case .pipeline: pipelineSection
-                    case .agents: agentsSection
                     case .research: researchSection
                     case .workspace: workspaceDangerSection
                     default: providersSection
@@ -158,16 +157,17 @@ struct SettingsView: View {
 
     // MARK: - 01 · Providers
 
-    /// Every endpoint and credential lives here, once, as one table: which
-    /// embedding providers exist, which LLM providers exist, and which of each
-    /// is the default. A row opens to its own form, so the page stays scannable
-    /// however many are configured.
+    /// Every model endpoint and credential lives here, once, as one table:
+    /// which embedding models exist, which LLMs exist, and which of each is the
+    /// default. A row opens to its own form, so the page stays scannable
+    /// however many are configured. The agents that run on them — and the
+    /// coding-agent CLIs, which are agents and not models — get the table below.
     private var providersSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             sectionHeader(
-                index: L("01 · Providers"),
-                title: L("Endpoints and credentials"),
-                detail: L("Configure each provider once. Every stage below picks from this list, so no endpoint or key is ever entered twice."),
+                index: L("01 · Providers & agents"),
+                title: L("Models"),
+                detail: L("Each model endpoint and its key, once. Pipeline stages pick from this list, and a deepagents agent below runs on one of them."),
                 badge: L("Configure once"),
                 color: .knodeCyan
             )
@@ -177,14 +177,15 @@ struct SettingsView: View {
                     Divider()
                     embeddingRow(index: index, entry: entry)
                 }
-                Divider()
-                defaultLlmRow
                 ForEach(Array((config?.connections ?? []).enumerated()), id: \.element.id) { index, connection in
                     Divider()
                     connectionRow(index: index, connection: connection)
                 }
             }
             .knodeCard(padding: 0)
+            // an agent runs on one of the providers above, so it belongs under
+            // them rather than behind a tab of its own
+            agentsSection.padding(.top, 10)
         }
     }
 
@@ -199,10 +200,10 @@ struct SettingsView: View {
             Text(L("Model"))
             Spacer(minLength: 8)
             Menu {
-                Button(L("LLM provider")) { addConnection() }
-                Button(L("Embedding provider")) { addEmbeddingProvider() }
+                Button(L("LLM · OpenAI-compatible API")) { addConnection() }
+                Button(L("Embedding")) { addEmbeddingProvider() }
             } label: {
-                Label(L("Add provider"), systemImage: "plus")
+                Label(L("Add model"), systemImage: "plus")
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
@@ -236,70 +237,29 @@ struct SettingsView: View {
         }
     }
 
-    private var defaultLlmRow: some View {
-        ProviderRow(
-            kind: L("LLM"),
-            color: .knodeViolet,
-            isDefault: true,
-            label: defaultLlmLabel,
-            providerName: providerName(config?.llm.provider ?? ""),
-            summary: config?.llm.model ?? "",
-            id: "default",
-            expanded: expandedBinding("default"),
-            remove: nil
-        ) {
-            VStack(alignment: .leading, spacing: 12) {
-                LlmProviderFields(
-                    provider: binding(\.llm.provider),
-                    model: binding(\.llm.model),
-                    baseUrl: binding(\.llm.baseUrl),
-                    apiKey: binding(\.llm.apiKey),
-                    cliPath: binding(\.llm.cliPath),
-                    cliTools: cliTools,
-                    route: "llm",
-                    load: { refresh in try await modelList(route: "llm", refresh: refresh) }
-                )
-                Text(defaultModelNote)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
     private func connectionRow(index: Int, connection: LLMConnection) -> some View {
-        ProviderRow(
+        let isDefault = connection.id == config?.llmUse
+        return ProviderRow(
             kind: L("LLM"),
             color: .knodeViolet,
-            isDefault: false,
+            isDefault: isDefault,
             label: binding(\.connections)[index].label,
             providerName: providerName(connection.provider),
             summary: connection.model,
             id: connection.id,
             expanded: expandedBinding(connection.id),
-            remove: { removeConnection(id: connection.id) }
+            // something has to answer, so the last one cannot go
+            remove: (config?.connections.count ?? 0) > 1 ? { removeConnection(id: connection.id) } : nil,
+            makeDefault: isDefault ? nil : { config?.llmUse = connection.id }
         ) {
             LlmProviderFields(
-                provider: binding(\.connections)[index].provider,
                 model: binding(\.connections)[index].model,
                 baseUrl: binding(\.connections)[index].baseUrl,
                 apiKey: binding(\.connections)[index].apiKey,
-                cliPath: binding(\.connections)[index].cliPath,
-                cliTools: cliTools,
                 route: "connection:\(connection.id)",
                 load: { refresh in try await modelList(route: "connection:\(connection.id)", refresh: refresh) }
             )
         }
-    }
-
-    /// The default LLM's name is optional in the config — an empty one means
-    /// "call it whatever the provider is called" — but the field is a plain
-    /// text field like every other name.
-    private var defaultLlmLabel: Binding<String> {
-        Binding(
-            get: { config?.llm.label ?? "" },
-            set: { config?.llm.label = $0 }
-        )
     }
 
     private func expandedBinding(_ id: String) -> Binding<Bool> {
@@ -378,6 +338,7 @@ struct SettingsView: View {
 
     private func stageNode(_ stage: PipelineStage) -> some View {
         let selected = selectedStage == stage
+        let target = stageTarget(stage)
         return Button {
             selectedStage = stage
         } label: {
@@ -392,16 +353,24 @@ struct SettingsView: View {
                     Spacer(minLength: 0)
                 }
                 RouteBadge(label: stage.requirement, color: stage.color)
-                Text(stageTarget(stage))
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                // two lines, because they truncate differently: a provider's
+                // name identifies itself by its head, a model id by both ends
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(target.provider)
+                        .foregroundStyle(.secondary)
+                        .truncationMode(.tail)
+                    Text(target.model.isEmpty ? L("its own model") : target.model)
+                        .foregroundStyle(.tertiary)
+                        .truncationMode(.middle)
+                }
+                .font(.system(size: 10, design: .monospaced))
+                .lineLimit(1)
                 Text(stageRate(stage))
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.tertiary)
             }
             .frame(width: 148, alignment: .leading)
+            .help(target.line)
             .padding(11)
             .background(selected ? stage.color.opacity(0.1) : Color.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
             .overlay {
@@ -447,8 +416,8 @@ struct SettingsView: View {
         case .convert:
             StagePicker(
                 route: binding(\.extraction.documentLlm),
-                connections: config?.connections ?? [],
-                defaultProvider: config?.llm.provider ?? "",
+                connections: llmTargets,
+                defaultTarget: defaultTarget,
                 routeKey: "documentLlm",
                 load: { refresh in try await modelList(route: "documentLlm", refresh: refresh) }
             )
@@ -470,21 +439,21 @@ struct SettingsView: View {
         case .extract:
             StagePicker(
                 route: binding(\.extraction.entityLlm),
-                connections: config?.connections ?? [],
-                defaultProvider: config?.llm.provider ?? "",
+                connections: llmTargets,
+                defaultTarget: defaultTarget,
                 routeKey: "entityLlm",
                 load: { refresh in try await modelList(route: "entityLlm", refresh: refresh) }
             )
         case .synthesize:
             StagePicker(
                 route: binding(\.extraction.conceptLlm),
-                connections: config?.connections ?? [],
-                defaultProvider: config?.llm.provider ?? "",
+                connections: llmTargets,
+                defaultTarget: defaultTarget,
                 routeKey: "conceptLlm",
                 load: { refresh in try await modelList(route: "conceptLlm", refresh: refresh) }
             )
         case .answer:
-            StagePin(value: defaultModelSummary, hint: L("Set in section 01 · Default LLM provider"))
+            StagePin(value: defaultModelSummary.line, hint: L("Set in section 01 · Default LLM provider"))
         }
     }
 
@@ -565,7 +534,7 @@ struct SettingsView: View {
         )
     }
 
-    private func stageTarget(_ stage: PipelineStage) -> String {
+    private func stageTarget(_ stage: PipelineStage) -> RouteTarget {
         switch stage {
         case .convert: routeSummary(\.extraction.documentLlm)
         case .index: embeddingSummary
@@ -588,11 +557,9 @@ struct SettingsView: View {
     // MARK: - 03 · Deep research
 
 
-    /// The research runner and the profile it follows. Both live in files the
-    /// service owns — the runner in the workspace config, the profile in
-    /// `playbooks/research/profiles/` — so "Save & apply" writes both.
-    // MARK: - 03 · Agents
-
+    /// The second table on the Providers tab: who does the work, running on
+    /// one of the providers above. Its own view since before the merge, so
+    /// hosting it here is a call site and nothing else.
     @ViewBuilder
     private var agentsSection: some View {
         if config != nil {
@@ -601,11 +568,14 @@ struct SettingsView: View {
                 researchAgent: config?.research.agent ?? "",
                 chatAgent: config?.chat.agent ?? "",
                 connections: config?.connections ?? [],
+                defaultTarget: defaultTarget,
+                llmUse: config?.llmUse ?? "",
                 cliTools: cliTools,
                 isWorking: isWorking,
-                add: { kind in Task { await addAgent(kind: kind) } },
+                add: { runtime in Task { await addAgent(runtime: runtime) } },
                 remove: { agentToRemove = $0 },
-                loadModels: { executor, refresh in try await researchModelList(agent: executor, refresh: refresh) }
+                makeDefault: { name in config?.llmUse = name },
+                loadModels: { agent, refresh in try await agentModelList(agent, refresh: refresh) }
             )
         }
     }
@@ -617,15 +587,23 @@ struct SettingsView: View {
 
     /// A new agent is written immediately — it is its own file, not part of
     /// the config draft — and its name has to exist before Research can name it.
-    private func addAgent(kind: String) async {
+    ///
+    /// deepagents follows the default LLM when the default is a model; when it
+    /// is a CLI agent there is nothing to follow, so the first model is pinned.
+    private func addAgent(runtime: String) async {
         isWorking = true
         defer { isWorking = false }
-        let base = kind == "deep-research" ? "research" : "agent"
-        var suffix = agents.count + 1
-        while agents.contains(where: { $0.name == "\(base)-\(suffix)" }) { suffix += 1 }
+        let cli = cliProviderNames.contains(runtime)
+        let base = cli ? runtime.replacingOccurrences(of: "-cli", with: "") : "agent"
+        var suffix = 1
+        let taken = Set(agents.map(\.name) + (config?.connections ?? []).map(\.id))
+        while taken.contains("\(base)-\(suffix)") { suffix += 1 }
         let name = "\(base)-\(suffix)"
-        var draft = AgentDefinition(name: name, kind: kind)
-        draft.title = kind == "deep-research" ? L("New research agent") : L("New agent")
+        let executor = cli
+            ? runtime
+            : defaultTarget?.provider == "openai" ? ResearchSettingsSection.defaultConnection : (config?.connections.first?.id ?? ResearchSettingsSection.defaultConnection)
+        var draft = AgentDefinition(name: name, executor: executor)
+        draft.title = cli ? providerName(runtime) : L("New deepagents agent")
         do {
             _ = try await model.client().saveAgent(name, draft.payload)
             await loadAgents()
@@ -643,11 +621,17 @@ struct SettingsView: View {
         do {
             let response = try await model.client().deleteAgent(agent.name)
             await loadAgents()
-            // The service moves research/chat off a deleted agent, so read the
-            // config back rather than leaving a name on screen that is gone.
+            // The service moves research, Ask, a pipeline route and the default
+            // off a deleted agent, so read those back rather than leaving a
+            // name on screen that is gone.
             if response.reset != true, let fresh = try? await model.client().config() {
                 config?.research.agent = fresh.research.agent
                 config?.chat.agent = fresh.chat.agent
+                config?.llmUse = fresh.llmUse
+                config?.llm = fresh.llm
+                config?.extraction.entityLlm.use = fresh.extraction.entityLlm.use
+                config?.extraction.conceptLlm.use = fresh.extraction.conceptLlm.use
+                config?.extraction.documentLlm.use = fresh.extraction.documentLlm.use
             }
             statusMessage = response.reset == true
                 ? L("Agent %@ reset to the built-in", agent.name)
@@ -667,7 +651,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 04 · Research
+    // MARK: - 03 · Research
 
     @ViewBuilder
     private var researchSection: some View {
@@ -679,10 +663,11 @@ struct SettingsView: View {
                 dirty: $profileDirty,
                 profileSelection: researchProfileBinding,
                 summaries: profiles,
-                connections: config?.connections ?? [],
+                connections: llmTargets,
                 agents: agents,
-                defaultProvider: config?.llm.provider ?? "",
+                defaultTarget: defaultTarget,
                 isWorking: isWorking,
+                inheritedModel: { inheritedAgentSpecModel($0) },
                 loadModels: { agent, refresh in try await researchModelList(agent: agent, refresh: refresh) },
                 duplicate: {
                     duplicateName = "\(profileDraft?.name ?? "profile")-copy"
@@ -867,37 +852,50 @@ struct SettingsView: View {
         )
     }
 
-    private var embeddingSummary: String {
-        guard let config else { return L("Loading…") }
+    private var embeddingSummary: RouteTarget {
+        guard let config else { return RouteTarget(provider: L("Loading…")) }
         guard let active = config.activeEmbedding else {
-            return config.embedding.model.isEmpty ? L("API model not set") : config.embedding.model
+            return RouteTarget(provider: L("Embedding"), model: config.embedding.model.isEmpty ? L("API model not set") : config.embedding.model)
         }
-        if active.provider == "local" { return L("%@ · %@d", active.label, String(active.dimensions)) }
-        return active.model.isEmpty ? L("API model not set") : "\(active.label) · \(active.model)"
+        if active.provider == "local" { return RouteTarget(provider: active.label, model: L("%@d", String(active.dimensions))) }
+        return RouteTarget(provider: active.label, model: active.model.isEmpty ? L("API model not set") : active.model)
     }
 
-    private func routeSummary(_ keyPath: KeyPath<KnodeConfig, RoutedLLMConfig>) -> String {
-        guard let config, let route = config[keyPath: keyPath] as RoutedLLMConfig? else { return L("Loading…") }
-        let connection = config.connections.first { $0.id == route.use }
-        let defaultName = config.llm.label?.isEmpty == false ? config.llm.label! : L("Default model")
-        let name = connection?.label ?? (route.use.isEmpty ? defaultName : providerName(route.provider))
-        let model = route.model.isEmpty ? (connection?.model ?? "") : route.model
-        return model.isEmpty ? name : "\(name) · \(model)"
+    private func routeSummary(_ keyPath: KeyPath<KnodeConfig, RoutedLLMConfig>) -> RouteTarget {
+        guard let config, let route = config[keyPath: keyPath] as RoutedLLMConfig? else { return RouteTarget(provider: L("Loading…")) }
+        let target = llmTargets.first { $0.id == route.use }
+        let defaultName = defaultTarget.map { $0.label.isEmpty ? providerName($0.provider) : $0.label } ?? L("Default model")
+        let name = target?.label ?? (route.use.isEmpty || route.use == "default" ? defaultName : providerName(route.provider))
+        // an inheriting route prints what it inherits, not a blank
+        return RouteTarget(provider: name, model: route.model.isEmpty ? inheritedModel(route.use) : route.model)
     }
 
-    private var defaultModelSummary: String {
-        guard let config else { return L("Not configured") }
-        return config.llm.model.isEmpty ? providerName(config.llm.provider) : "\(providerName(config.llm.provider)) · \(config.llm.model)"
+    /// Everything a stage or the default can run on, against the on-screen
+    /// draft: the models, then the CLI agents, called one-shot. The client
+    /// mirror of the service's `llmTargets`; a model wins an id clash.
+    private var llmTargets: [LLMConnection] {
+        let connections = config?.connections ?? []
+        return connections + agents.compactMap(\.asLlmTarget).filter { agent in !connections.contains { $0.id == agent.id } }
     }
 
-    private var defaultModelNote: String {
-        guard let provider = config?.llm.provider else { return "" }
-        return switch provider {
-        case "codex-cli": L("Uses your existing Codex login for a read-only one-shot request.")
-        case "claude-cli": L("Uses your existing Claude Code login for one non-interactive turn.")
-        case "cursor-cli": L("Uses your existing Cursor Agent login in headless print mode.")
-        default: L("Any OpenAI-compatible chat endpoint works (OpenAI, DeepSeek, Ollama, vLLM, SiliconFlow…). Use env:VAR_NAME to keep the key out of the config file. An empty model disables LLM features; the deterministic pipeline keeps running.")
-        }
+    /// What the default is in the draft — a model, or a CLI agent — so
+    /// pressing "Make default" shows its effect before a save.
+    private var defaultTarget: LLMConnection? {
+        llmTargets.first { $0.id == config?.llmUse } ?? llmTargets.first
+    }
+
+    /// What a route inherits, against the on-screen draft.
+    private func inheritedModel(_ use: String) -> String {
+        inheritedRouteModel(use, connections: llmTargets, defaultModel: defaultTarget?.model ?? "")
+    }
+
+    private func inheritedAgentSpecModel(_ spec: String) -> String {
+        inheritedAgentModel(spec, agents: agents, targets: llmTargets, defaultTarget: defaultTarget)
+    }
+
+    private var defaultModelSummary: RouteTarget {
+        guard let target = defaultTarget else { return RouteTarget(provider: L("Not configured")) }
+        return RouteTarget(provider: target.label.isEmpty ? providerName(target.provider) : target.label, model: target.model)
     }
 
     /// Models the service reports for one route, using the on-screen draft so a
@@ -907,22 +905,32 @@ struct SettingsView: View {
         return try await model.client().listModels(route: route, config: config, refresh: refresh)
     }
 
-    /// Models for a research agent. A named connection lists on its own route;
-    /// a CLI picked straight off PATH has no connection, so ask the default
-    /// route with that provider swapped into a copy of the draft.
+    /// Models for what a research or Ask spec names: an agent lists through
+    /// its runtime, a model on its own route, and a bare CLI as a CLI.
     private func researchModelList(agent spec: String, refresh: Bool = false) async throws -> ModelListResponse {
+        if let agent = agents.first(where: { $0.name == spec }) { return try await agentModelList(agent, refresh: refresh) }
+        var bare = AgentDefinition(name: spec, executor: spec.isEmpty ? ResearchSettingsSection.defaultConnection : spec)
+        // a bare CLI borrows the path of a CLI agent running it, as it runs
+        bare.cliPath = llmTargets.first { $0.provider == spec }?.cliPath ?? ""
+        return try await agentModelList(bare, refresh: refresh)
+    }
+
+    /// Models for one agent, from the on-screen draft: a deepagents agent's
+    /// model lists on its own route; a CLI has no endpoint, so ask the default
+    /// route with that CLI and its path swapped into a copy of the draft.
+    private func agentModelList(_ agent: AgentDefinition, refresh: Bool = false) async throws -> ModelListResponse {
         guard let config else { throw APIError(message: L("Settings are still loading")) }
-        // A named agent is not an endpoint; what its executor points at is.
-        let agent = agents.first { $0.name == spec }?.executor ?? spec
-        if !agent.isEmpty, config.connections.contains(where: { $0.id == agent }) {
-            return try await model.client().listModels(route: "connection:\(agent)", config: config, refresh: refresh)
+        if !agent.isCli {
+            let id = agent.executor == ResearchSettingsSection.defaultConnection ? (defaultTarget?.id ?? "") : agent.executor
+            if config.connections.contains(where: { $0.id == id }) {
+                return try await model.client().listModels(route: "connection:\(id)", config: config, refresh: refresh)
+            }
+            return try await model.client().listModels(route: "llm", config: config, refresh: refresh)
         }
         var draft = config
-        if !agent.isEmpty {
-            draft.llm.provider = agent
-            draft.llm.cliPath = ""
-            draft.llm.model = ""
-        }
+        draft.llm.provider = agent.executor
+        draft.llm.cliPath = agent.cliPath
+        draft.llm.model = ""
         return try await model.client().listModels(route: "llm", config: draft, refresh: refresh)
     }
 
@@ -967,10 +975,18 @@ struct SettingsView: View {
         statusIsError = false
     }
 
+    /// Removing the default moves it to the first row left — the same shape as
+    /// removing the active embedding provider, and said out loud for the same
+    /// reason: every inheriting job moves with it.
     private func removeConnection(id: String) {
-        guard config != nil else { return }
+        guard config != nil, config!.connections.count > 1 else { return }
         config!.connections.removeAll { $0.id == id }
         expandedProviders.remove(id)
+        if config!.llmUse == id, let next = config!.connections.first {
+            config!.llmUse = next.id
+            statusMessage = L("The default provider is now %@ — every job that names no provider of its own follows it.", next.label)
+            statusIsError = false
+        }
         // A route left pointing at a deleted connection would silently fall back
         // to the default; say so by moving it there explicitly.
         for keyPath in [\KnodeConfig.extraction.entityLlm, \KnodeConfig.extraction.conceptLlm, \KnodeConfig.extraction.documentLlm] {
@@ -1033,6 +1049,16 @@ struct SettingsView: View {
             isWorking = false
             model.globalActivity = nil
         }
+        // Agents are files of their own and the config may name one, so they
+        // go first: `PUT /api/config` rejects an unknown chat/research agent,
+        // which made "create an agent and point at it" fail in one Save.
+        var agentNote = ""
+        do {
+            try await saveAgents()
+        } catch {
+            agentNote = L(" · agents not saved: %@", error.localizedDescription)
+            statusIsError = true
+        }
         do {
             let response = try await model.client().saveConfig(config)
             self.config = normalized(response.config)
@@ -1043,10 +1069,9 @@ struct SettingsView: View {
             } else {
                 statusMessage = L("Configuration saved and stages applied")
             }
-            // The agents and the research profile are files of their own; a
-            // failure there must not read as though the routes failed to save.
+            // The research profile is a file of its own; a failure there must
+            // not read as though the routes failed to save.
             do {
-                try await saveAgents()
                 if let saved = try await saveProfileDraft() {
                     statusMessage += L(" · research profile %@ saved", saved.name)
                 }
@@ -1054,6 +1079,7 @@ struct SettingsView: View {
                 statusMessage += L(" · research profile not saved: %@", error.localizedDescription)
                 statusIsError = true
             }
+            statusMessage += agentNote
             model.showToast(L("Configuration saved for %@", model.activeWorkspace?.displayName ?? L("this workspace")))
             await model.refreshStats()
         } catch {
@@ -1087,6 +1113,15 @@ struct SettingsView: View {
 struct ModelField: View {
     let placeholder: String
     @Binding var text: String
+    /**
+     * The model that runs when this field is empty, shown greyed in its place.
+     *
+     * Never written. An empty `model` means "follow the provider", and pinning
+     * the inherited string would stop the route tracking a later change to the
+     * provider's own model — the propagation named connections exist for. The
+     * popover's Clear link is how you get back to inheriting.
+     */
+    var inherited: String = ""
     /// Changing provider invalidates a fetched list, since it came from the old one.
     var providerKey: String = ""
     var disabled = false
@@ -1107,7 +1142,7 @@ struct ModelField: View {
     var body: some View {
         FieldLabel(L("Model")) {
             HStack(spacing: 6) {
-                TextField(placeholder, text: $text)
+                TextField(inherited.isEmpty ? placeholder : inherited, text: $text)
                 Button {
                     isShowing = true
                     Task { await reload() }
@@ -1126,7 +1161,7 @@ struct ModelField: View {
     private var picker: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 8) {
-                Text(L("Models")).font(.headline)
+                Text(L("Available models")).font(.headline)
                 if let source = result?.source { RouteBadge(label: sourceLabel(source), color: source == "builtin" ? .knodeViolet : .knodeCyan) }
                 Spacer()
                 if isLoading { ProgressView().controlSize(.small) }
@@ -1177,9 +1212,12 @@ struct ModelField: View {
             }
             Divider()
             HStack {
-                Text(L("Picking one fills the field — Save & apply writes it to the workspace config."))
+                Text(inherited.isEmpty
+                    ? L("Picking one fills the field — Save & apply writes it to the workspace config.")
+                    : L("Empty follows the provider (%@). Picking one pins it instead.", inherited))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 if !text.isEmpty {
                     Button(L("Clear")) { text = ""; isShowing = false }
@@ -1250,7 +1288,7 @@ struct ModelField: View {
 /// own PATH first — which the desktop app augments with the usual install
 /// directories — so the field only earns space when that lookup fails or the
 /// user wants to pin one specific binary.
-private struct CliExecutableField: View {
+struct CliExecutableField: View {
     let tool: CliTool?
     @Binding var path: String
     @State private var editing = false
@@ -1321,9 +1359,12 @@ private struct ProviderRow<Detail: View>: View {
     let summary: String
     let id: String
     @Binding var expanded: Bool
-    /// nil for a row that must not be removed — the default LLM, and the last
-    /// embedding provider, since something has to embed.
+    /// nil for a row that must not be removed — the last LLM connection, and
+    /// the last embedding provider, since something has to answer and embed.
     let remove: (() -> Void)?
+    /// nil when this row cannot be made the default: it already is, or its
+    /// kind picks its default another way.
+    var makeDefault: (() -> Void)? = nil
     @ViewBuilder let detail: Detail
 
     var body: some View {
@@ -1347,18 +1388,28 @@ private struct ProviderRow<Detail: View>: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 210)
 
-                if isDefault { RouteBadge(label: L("Default"), color: color) }
+                if isDefault {
+                    RouteBadge(label: L("Default"), color: color)
+                } else if let makeDefault {
+                    Button(L("Make default"), action: makeDefault)
+                        .buttonStyle(.link)
+                        .font(.system(size: 10))
+                        .help(L("Every job that names no provider of its own moves here"))
+                }
 
                 Text(providerName)
                     .font(.callout)
                     .frame(width: 170, alignment: .leading)
                     .lineLimit(1)
 
+                // one line is the point of a table row; the untruncated value
+                // is a hover away rather than a second line per provider
                 Text(summary.isEmpty ? L("No model set") : summary)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(summary.isEmpty ? .tertiary : .secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .help(summary)
 
                 Spacer(minLength: 8)
 
@@ -1442,48 +1493,95 @@ private struct EmbeddingProviderFields: View {
 
 /// The endpoint and credentials of one LLM provider — the default one and every
 /// extra connection are the same form.
+/// An LLM row is a model endpoint: where it is, its key, and which model. The
+/// coding-agent CLIs that used to be picked here are agents now, in the table
+/// below, with their path and effort.
 private struct LlmProviderFields: View {
-    @Binding var provider: String
     @Binding var model: String
     @Binding var baseUrl: String
     @Binding var apiKey: String
-    @Binding var cliPath: String
-    let cliTools: [String: CliTool]
     let route: String
     let load: (Bool) async throws -> ModelListResponse
 
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
             GridRow {
-                FieldLabel(L("Provider")) {
-                    Picker(L("Provider"), selection: $provider) {
-                        Text(L("OpenAI-compatible API")).tag("openai")
-                        Text(L("Codex CLI")).tag("codex-cli")
-                        Text(L("Claude Code CLI")).tag("claude-cli")
-                        Text(L("Cursor Agent CLI")).tag("cursor-cli")
-                    }
-                    .labelsHidden()
-                }
+                FieldLabel(L("Base URL")) { TextField("https://api.openai.com/v1", text: $baseUrl) }
+                FieldLabel(L("API key")) { SecureField("env:OPENAI_API_KEY", text: $apiKey) }
+            }
+            GridRow {
                 ModelField(
-                    placeholder: provider == "openai" ? "gpt-4.1-mini" : L("Use CLI default"),
+                    placeholder: "gpt-4.1-mini",
                     text: $model,
-                    providerKey: provider,
+                    providerKey: baseUrl,
                     route: route,
                     load: load
                 )
+                .gridCellColumns(2)
             }
-            if provider == "openai" {
-                GridRow {
-                    FieldLabel(L("Base URL")) { TextField("https://api.openai.com/v1", text: $baseUrl) }
-                    FieldLabel(L("API key")) { SecureField("env:OPENAI_API_KEY", text: $apiKey) }
-                }
-            } else {
-                GridRow {
-                    CliExecutableField(tool: cliTools[provider], path: $cliPath)
-                        .gridCellColumns(2)
-                }
+            GridRow {
+                Text(llmProviderNote("openai"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .gridCellColumns(2)
             }
         }
+    }
+}
+
+/**
+ * The model a route runs with when it names none of its own — the client-side
+ * mirror of the service's `resolveRoutedLlmConfig`.
+ *
+ * Shown as a Model field's placeholder and never written: an empty `model`
+ * means "follow this provider", so pinning the string would stop the route
+ * tracking the provider's own model, which is what named connections are for.
+ */
+@MainActor
+func inheritedRouteModel(_ use: String, connections: [LLMConnection], defaultModel: String) -> String {
+    if let connection = connections.first(where: { $0.id == use }) { return connection.model }
+    // '' and 'default' follow whichever connection is the default; a bare CLI
+    // name brings its own default, which is not a string we can name
+    return (use.isEmpty || use == "default") ? defaultModel : ""
+}
+
+/**
+ * The same for an agent spec, which may be an agent *name* — and a name can
+ * legitimately be `default`, so this never shares a lookup with the route rule.
+ * The client-side mirror of the service's `resolveAgentSpec`.
+ *
+ * A CLI agent carries its own model and inherits nothing; a deepagents agent
+ * takes the model of the endpoint it runs on — the default only while the
+ * default is a model. A bare spec is resolved against `targets` (models and
+ * CLI agents): a bare CLI borrows the model of a CLI agent running it, the
+ * default's first.
+ */
+@MainActor
+func inheritedAgentModel(_ spec: String, agents: [AgentDefinition], targets: [LLMConnection], defaultTarget: LLMConnection?) -> String {
+    let wanted = spec.trimmingCharacters(in: .whitespaces)
+    if let agent = agents.first(where: { $0.name == wanted }) {
+        if !agent.model.isEmpty || agent.isCli { return agent.model }
+        if agent.executor == ResearchSettingsSection.defaultConnection {
+            return defaultTarget?.provider == "openai" ? defaultTarget?.model ?? "" : ""
+        }
+        return targets.first { $0.id == agent.executor && $0.provider == "openai" }?.model ?? ""
+    }
+    if wanted == ResearchSettingsSection.defaultConnection { return defaultTarget?.model ?? "" }
+    if let target = targets.first(where: { $0.id == wanted }) { return target.model }
+    guard cliProviderNames.contains(wanted) else { return "" }
+    return (defaultTarget?.provider == wanted ? defaultTarget : targets.first { $0.provider == wanted })?.model ?? ""
+}
+
+/// What this provider needs, and what an empty model means for it. Used to sit
+/// on the default's row alone; every row can be the default now.
+@MainActor
+func llmProviderNote(_ provider: String) -> String {
+    switch provider {
+    case "codex-cli": L("Uses your existing Codex login for a read-only one-shot request.")
+    case "claude-cli": L("Uses your existing Claude Code login for one non-interactive turn.")
+    case "cursor-cli": L("Uses your existing Cursor Agent login in headless print mode.")
+    default: L("Any OpenAI-compatible chat endpoint works (OpenAI, DeepSeek, Ollama, vLLM, SiliconFlow…). Use env:VAR_NAME to keep the key out of the config file. An empty model disables LLM features; the deterministic pipeline keeps running.")
     }
 }
 
@@ -1509,6 +1607,20 @@ func embeddingNote(_ provider: String) -> String {
     }
 }
 
+/// The reasoning-effort ladder, shared by every control that offers one: a
+/// provider row here, a research profile, a role, a chat. value → English
+/// label; the label goes through `L` at render time.
+enum EffortLevel {
+    static let all: [(String, String)] = [
+        ("default", "CLI default"),
+        ("low", "Low"),
+        ("medium", "Medium"),
+        ("high", "High"),
+        ("xhigh", "Extra high"),
+        ("max", "Max (claude & codex; cursor → high)"),
+    ]
+}
+
 /// A caption above a control, shared by every settings card.
 struct FieldLabel<Content: View>: View {
     let label: String
@@ -1529,11 +1641,14 @@ struct FieldLabel<Content: View>: View {
     }
 }
 
-/// Picks which configured provider runs a stage, plus an optional model override.
+/// Picks what runs a stage — a model, or a CLI agent called one-shot — plus
+/// an optional model override.
 private struct StagePicker: View {
     @Binding var route: RoutedLLMConfig
+    /// The models, then the CLI agents (see `llmTargets`).
     let connections: [LLMConnection]
-    let defaultProvider: String
+    /// What the default is, for the first option and the inherited model.
+    let defaultTarget: LLMConnection?
     let routeKey: String
     let load: (Bool) async throws -> ModelListResponse
 
@@ -1541,9 +1656,15 @@ private struct StagePicker: View {
         VStack(alignment: .leading, spacing: 10) {
             FieldLabel(L("Run with")) {
                 Picker(L("Run with"), selection: $route.use) {
-                    Text(L("Default LLM provider")).tag("")
-                    ForEach(connections) { connection in
-                        Text(connection.label).tag(connection.id)
+                    Text(defaultTarget.map { L("Default LLM provider · %@", name($0)) } ?? L("Default LLM provider")).tag("")
+                    ForEach(models) { connection in
+                        Text(name(connection)).tag(connection.id)
+                    }
+                    if !cliAgents.isEmpty {
+                        Divider()
+                        ForEach(cliAgents) { agent in
+                            Text(L("%@ · agent, one-shot", name(agent))).tag(agent.id)
+                        }
                     }
                 }
                 .labelsHidden()
@@ -1551,6 +1672,7 @@ private struct StagePicker: View {
             ModelField(
                 placeholder: L("Optional · use its model"),
                 text: $route.model,
+                inherited: inheritedRouteModel(route.use, connections: connections, defaultModel: defaultTarget?.model ?? ""),
                 providerKey: route.use,
                 route: routeKey,
                 load: load
@@ -1562,15 +1684,37 @@ private struct StagePicker: View {
         }
     }
 
+    private var models: [LLMConnection] { connections.filter { !cliProviderNames.contains($0.provider) } }
+    private var cliAgents: [LLMConnection] { connections.filter { cliProviderNames.contains($0.provider) } }
+
+    private func name(_ connection: LLMConnection) -> String {
+        connection.label.isEmpty ? providerName(connection.provider) : connection.label
+    }
+
     private var runningOn: String {
-        guard let connection = connections.first(where: { $0.id == route.use }) else {
-            return L("Runs on the default provider (%@).", providerName(defaultProvider))
+        guard let connection = connections.first(where: { $0.id == route.use }) ?? defaultTarget else {
+            return L("Nothing to run on yet — add a model in section 01.")
         }
         let endpoint = connection.provider == "openai"
             ? (connection.baseUrl.isEmpty ? L("no endpoint set") : connection.baseUrl)
-            : providerName(connection.provider)
+            : L("the %@ agent, one call at a time", providerName(connection.provider))
         return L("Runs on %@.", endpoint)
     }
+}
+
+/**
+ * Where a stage runs, as the two things a person reads separately: who runs
+ * it, and which model. They used to share one middle-truncated line, which
+ * turned "super-relay · ark/seed-evolving" into "super-relay…ed-evolving" —
+ * both ends of both facts lost at once.
+ *
+ * `line` is the joined form, for the places that still want one string.
+ */
+struct RouteTarget {
+    var provider: String
+    var model: String = ""
+
+    var line: String { model.isEmpty ? provider : "\(provider) · \(model)" }
 }
 
 /// A stage whose provider is not chosen here — it follows section 01.
@@ -1674,7 +1818,7 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .index: L("Every chunk becomes a vector for semantic and hybrid recall.")
         case .extract: L("Names entities, relations and factual claims in changed documents.")
         case .synthesize: L("Turns hot entity clusters into readable, linked Concept pages.")
-        case .answer: L("Ask, wiki summaries and the nightly Dream analysis.")
+        case .answer: L("Document summaries in the wiki, and the nightly Dream analysis.")
         }
     }
 
@@ -1689,7 +1833,7 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .synthesize:
             L("Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.")
         case .answer:
-            L("Always the default provider. Latency lands straight in the Ask box, so prefer something responsive.")
+            L("Always the default provider — these are the jobs that never picked one of their own. Ask no longer runs here: every question is an agent session, configured under Providers & Agents.")
         }
     }
 }

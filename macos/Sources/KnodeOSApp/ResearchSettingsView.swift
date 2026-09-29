@@ -19,11 +19,16 @@ struct ResearchSettingsSection: View {
     /// parent rather than straight into `research.profile`.
     @Binding var profileSelection: String
     let summaries: [ResearchProfileSummary]
+    /// The models and the CLI agents (see `llmTargets`), for naming a spec.
     let connections: [LLMConnection]
-    /// The named agents from section 03, so the pickers can offer them.
+    /// The named agents from section 01, so the pickers can offer them.
     let agents: [AgentDefinition]
-    let defaultProvider: String
+    /// What the default is in the draft: a model, or a CLI agent.
+    let defaultTarget: LLMConnection?
     let isWorking: Bool
+    /// What a spec's Model field inherits when it is left empty. A closure
+    /// because the rule needs the whole config, which only SettingsView holds.
+    let inheritedModel: (String) -> String
     /// Models the CLI behind an agent key offers ("" = the default provider).
     let loadModels: (String, Bool) async throws -> ModelListResponse
     let duplicate: () -> Void
@@ -37,16 +42,6 @@ struct ResearchSettingsSection: View {
 
     /// The spec that names the section-01 connection rather than a named one.
     static let defaultConnection = "default"
-
-    /// value → English label; the label goes through `L` at render time.
-    static let efforts: [(String, String)] = [
-        ("default", "CLI default"),
-        ("low", "Low"),
-        ("medium", "Medium"),
-        ("high", "High"),
-        ("xhigh", "Extra high"),
-        ("max", "Max (claude; codex → xhigh, cursor → high)"),
-    ]
 
     static let phases: [(String, String)] = [
         ("plan", "Plan · outline the page"),
@@ -77,9 +72,9 @@ struct ResearchSettingsSection: View {
     private var header: some View {
         HStack(alignment: .bottom) {
             VStack(alignment: .leading, spacing: 3) {
-                Eyebrow(text: L("04 · Research"), color: .knodeViolet)
+                Eyebrow(text: L("03 · Research"), color: .knodeViolet)
                 Text(L("How the wiki gets written")).font(.title3.bold())
-                Text(L("What initialization does, how Chat behaves, and how a deep-research job runs: which agent from section 03 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents."))
+                Text(L("What initialization does, how Ask behaves, and how a deep-research job runs: which agent from section 01 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -107,11 +102,12 @@ struct ResearchSettingsSection: View {
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
                     FieldLabel(L("Agent")) {
-                        AgentPicker(selection: $research.agent, agents: agents, kind: "deep-research", connections: connections, fallbackLabel: nil, defaultProvider: defaultProvider)
+                        AgentPicker(selection: $research.agent, agents: agents, kind: "deep-research", connections: connections, fallbackLabel: nil, defaultName: defaultTarget?.label ?? "")
                     }
                     ModelField(
                         placeholder: L("CLI default"),
                         text: $research.model,
+                        inherited: inheritedModel(research.agent),
                         providerKey: research.agent,
                         route: "agent:\(research.agent)",
                         load: { refresh in try await loadModels(research.agent, refresh) }
@@ -223,14 +219,15 @@ struct ResearchSettingsSection: View {
         .knodeCard(padding: 18)
     }
 
-    /// Ask's Agent mode — its own CLI settings, answering over the same MCP
-    /// endpoint. (The config keys are still `chat.*`.)
+    /// Which agent answers Ask, and the two things about a conversation that
+    /// are not properties of the agent. Everything else — effort, tools, turn
+    /// cap, timeout, extra prompt — belongs to the agent itself, in section 01.
     private var chatCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(L("Ask · Agent mode")).font(.headline)
-                    Text(L("Ask's Agent mode uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note. Quick mode needs none of this — it answers from retrieval."))
+                    Text(L("Ask")).font(.headline)
+                    Text(L("Ask uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -241,48 +238,20 @@ struct ResearchSettingsSection: View {
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
                     FieldLabel(L("Agent")) {
-                        AgentPicker(selection: $chat.agent, agents: agents, kind: "general", connections: connections, fallbackLabel: L("The research agent above"), defaultProvider: defaultProvider)
+                        AgentPicker(selection: $chat.agent, agents: agents, kind: "general", connections: connections, fallbackLabel: L("The research agent, else the default provider"), defaultName: defaultTarget?.label ?? "")
                     }
-                    ModelField(
-                        placeholder: L("Agent's model"),
-                        text: $chat.model,
-                        providerKey: chat.agent.isEmpty ? research.agent : chat.agent,
-                        route: "agent:\(chat.agent.isEmpty ? research.agent : chat.agent)",
-                        load: { refresh in try await loadModels(chat.agent.isEmpty ? research.agent : chat.agent, refresh) }
-                    )
-                    FieldLabel(L("Reasoning effort")) {
-                        Picker(L("Reasoning effort"), selection: $chat.effort) {
-                            ForEach(Self.efforts, id: \.0) { Text(L($0.1)).tag($0.0) }
-                        }
-                        .labelsHidden()
-                    }
-                }
-                GridRow {
-                    FieldLabel(L("Web access")) {
-                        Picker(L("Web access"), selection: $chat.web) {
-                            Text(L("Follow review.external")).tag("inherit")
-                            Text(L("On (within review.external)")).tag("on")
-                            Text(L("Off")).tag("off")
-                        }
-                        .labelsHidden()
-                    }
-                    FieldLabel(L("Turns per reply")) {
-                        TextField("30", value: $chat.maxTurns, format: .number)
-                    }
-                    FieldLabel(L("Timeout (minutes)")) {
-                        TextField("10", value: chatTimeoutMinutes, format: .number)
-                    }
-                }
-                GridRow {
                     FieldLabel(L("Messages replayed")) {
                         TextField("12", value: $chat.historyTurns, format: .number)
                     }
                     FieldLabel(L("Conversations kept")) {
-                        TextField("50", value: $chat.keep, format: .number)
+                        TextField("200", value: $chat.keep, format: .number)
                     }
-                    Color.clear.frame(height: 1)
                 }
             }
+            Text(L("Effort, turns, timeout, tool grants and any extra prompt come from the agent — edit them where the agent is defined, in section 01."))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Text(L("Every reply is a fresh session that replays the recent messages — there is no CLI session to resume, so a long conversation costs more input each turn."))
                 .font(.caption)
                 .foregroundStyle(.tertiary)
@@ -295,13 +264,6 @@ struct ResearchSettingsSection: View {
         Binding(
             get: { max(1, research.initialization.extractionMaxMs / 60_000) },
             set: { research.initialization.extractionMaxMs = max(1, $0) * 60_000 }
-        )
-    }
-
-    private var chatTimeoutMinutes: Binding<Int> {
-        Binding(
-            get: { max(1, chat.timeoutMs / 60_000) },
-            set: { chat.timeoutMs = max(1, $0) * 60_000 }
         )
     }
 
@@ -323,25 +285,29 @@ struct ResearchSettingsSection: View {
         )
     }
 
-    /// Only the CLIs ship a web tool; an OpenAI-compatible endpoint has none.
+    /// Only the CLIs ship a web tool; deepagents on a model has none.
     private func agentWebCapable(_ spec: String) -> Bool {
-        if Self.cliProviders.contains(spec) { return true }
+        if let agent = agents.first(where: { $0.name == spec }) { return agent.isCli }
+        if cliProviderNames.contains(spec) { return true }
         let provider = spec == Self.defaultConnection
-            ? defaultProvider
+            ? (defaultTarget?.provider ?? "")
             : (connections.first { $0.id == spec }?.provider ?? "")
-        return Self.cliProviders.contains(provider)
+        return cliProviderNames.contains(provider)
+    }
+
+    /// A spec by the name the tables give it: an agent's title, the default
+    /// with what it is now, or a model or CLI agent by its label.
+    private func specLabel(_ spec: String) -> String {
+        if let agent = agents.first(where: { $0.name == spec }) { return agent.title }
+        if spec == Self.defaultConnection {
+            return defaultTarget.map { L("Default LLM provider · %@", $0.label) } ?? L("Default LLM provider")
+        }
+        return connections.first { $0.id == spec }?.label ?? providerName(spec)
     }
 
     /// What a job will actually do, assembled from the runner and the profile.
     private var note: String {
-        let agentLabel: String
-        if research.agent.isEmpty {
-            agentLabel = L("not configured")
-        } else if research.agent == Self.defaultConnection {
-            agentLabel = defaultProvider.isEmpty ? L("Default LLM provider") : L("Default LLM provider · %@", providerName(defaultProvider))
-        } else {
-            agentLabel = connections.first { $0.id == research.agent }?.label ?? providerName(research.agent)
-        }
+        let agentLabel = research.agent.isEmpty ? L("not configured") : specLabel(research.agent)
         let webCapable = agentWebCapable(research.agent)
         let pipeline = pinnedPipeline.isEmpty ? research.pipeline : pinnedPipeline
         var parts = [
@@ -412,7 +378,7 @@ struct ResearchSettingsSection: View {
                     }
                     FieldLabel(L("Reasoning effort")) {
                         Picker(L("Reasoning effort"), selection: bind(\.reasoning.effort)) {
-                            ForEach(Self.efforts, id: \.0) { Text(L($0.1)).tag($0.0) }
+                            ForEach(EffortLevel.all, id: \.0) { Text(L($0.1)).tag($0.0) }
                         }
                         .labelsHidden()
                     }
@@ -499,11 +465,12 @@ struct ResearchSettingsSection: View {
                 RoleCard(
                     role: roleBinding(selectedIndex),
                     phaseDefaults: profile?.phaseDefaults ?? [:],
-                    connections: connections,
+                    label: specLabel,
                     pipeline: pinnedPipeline.isEmpty ? research.pipeline : pinnedPipeline,
                     researchAgent: research.agent,
                     researchers: research.researchers,
                     reviewRounds: research.reviewRounds,
+                    inheritedModel: inheritedModel,
                     loadModels: loadModels,
                     remove: { removeRole(id: roles[selectedIndex].id) }
                 )
@@ -619,26 +586,29 @@ struct ResearchSettingsSection: View {
     }
 }
 
-/// Which CLI runs a job: one of the configured CLI connections, one of the
-/// Every executor that can take a session: the CLIs from PATH, the section-01
-/// connection, and each named connection — an OpenAI-compatible one running on
-/// the built-in agent.
+/// Which agent runs a job or answers Ask: one of the agents in section 01 —
+/// deepagents on a model, or a coding-agent CLI — each saying which it is.
+///
+/// A config written before agents may name a bare CLI, the default provider
+/// or a model straight. Those keep resolving, so the one in use stays on the
+/// list — only that one: a new choice is an agent.
 ///
 /// `fallbackLabel` is what an empty selection means ("the research agent
 /// above") for chat and roles. The research agent itself passes nil: it has no
 /// fallback any more, so an empty value is shown as the unconfigured state.
 struct AgentPicker: View {
     @Binding var selection: String
-    /// The named agents from section 03; the kind this picker is for comes first.
+    /// The agents from section 01; the kind this picker is for comes first.
     var agents: [AgentDefinition] = []
     var kind: String = ""
     let connections: [LLMConnection]
     var fallbackLabel: String?
-    /// Section 01's provider, so the `default` row can say what it points at.
-    var defaultProvider: String = ""
+    /// What the default is called now, for a legacy `default` selection.
+    var defaultName: String = ""
 
-    private var preferred: [AgentDefinition] { kind.isEmpty ? agents : agents.filter { $0.kind == kind } }
-    private var other: [AgentDefinition] { kind.isEmpty ? [] : agents.filter { $0.kind != kind } }
+    private var ordered: [AgentDefinition] {
+        kind.isEmpty ? agents : agents.filter { $0.kind == kind } + agents.filter { $0.kind != kind }
+    }
 
     var body: some View {
         Picker(L("Agent"), selection: $selection) {
@@ -647,31 +617,24 @@ struct AgentPicker: View {
             } else if selection.isEmpty {
                 Text(L("Not configured — pick an agent")).tag("")
             }
-            ForEach(preferred) { agent in
-                Text(agent.title).tag(agent.name)
+            ForEach(ordered) { agent in
+                Text("\(agent.title) · \(agent.isCli ? providerName(agent.executor) : "deepagents")").tag(agent.name)
             }
-            ForEach(other) { agent in
-                Text(agent.title).tag(agent.name)
-            }
-            // A config written before named agents points straight at an
-            // executor, and those keep resolving — so they stay selectable.
-            Divider()
-            ForEach(ResearchSettingsSection.cliProviders, id: \.self) { provider in
-                Text(L("%@ · from PATH", providerName(provider))).tag(provider)
-            }
-            Text(defaultProvider.isEmpty
-                 ? L("Default LLM provider")
-                 : L("Default LLM provider · %@", providerName(defaultProvider)))
-                .tag(ResearchSettingsSection.defaultConnection)
-            ForEach(connections) { connection in
-                Text("\(connection.label) · \(runsOn(connection.provider))").tag(connection.id)
+            if !selection.isEmpty && !agents.contains(where: { $0.name == selection }) {
+                Divider()
+                Text(legacyLabel).tag(selection)
             }
         }
         .labelsHidden()
     }
 
-    private func runsOn(_ provider: String) -> String {
-        ResearchSettingsSection.cliProviders.contains(provider) ? providerName(provider) : L("built-in agent")
+    private var legacyLabel: String {
+        if selection == ResearchSettingsSection.defaultConnection {
+            return defaultName.isEmpty ? L("Default LLM provider") : L("Default LLM provider · %@", defaultName)
+        }
+        if cliProviderNames.contains(selection) { return L("%@ · from PATH", providerName(selection)) }
+        if let connection = connections.first(where: { $0.id == selection }) { return "\(connection.label) · deepagents" }
+        return selection
     }
 }
 
@@ -746,7 +709,8 @@ private struct PhaseGuidance {
 private struct RoleCard: View {
     @Binding var role: ResearchRole
     let phaseDefaults: [String: String]
-    let connections: [LLMConnection]
+    /// A spec by the name the tables give it.
+    let label: (String) -> String
     /// The pipeline a job will really run, so the card can say whether the
     /// native sub-agent switch means anything right now.
     let pipeline: String
@@ -755,6 +719,7 @@ private struct RoleCard: View {
     let researchAgent: String
     let researchers: Int
     let reviewRounds: Int
+    let inheritedModel: (String) -> String
     let loadModels: (String, Bool) async throws -> ModelListResponse
     let remove: () -> Void
 
@@ -854,7 +819,7 @@ private struct RoleCard: View {
     private var runsOnLabel: String {
         let key = effectiveAgent
         if key.isEmpty { return L("the research agent") }
-        return connections.first { $0.id == key }?.label ?? providerName(key)
+        return label(key)
     }
 
     private var grid: some View {
@@ -905,6 +870,7 @@ private struct RoleCard: View {
         ModelField(
             placeholder: L("Agent's model"),
             text: $role.model,
+            inherited: inheritedModel(effectiveAgent),
             providerKey: effectiveAgent,
             route: "agent:\(effectiveAgent)",
             load: { refresh in try await loadModels(effectiveAgent, refresh) }
@@ -917,7 +883,7 @@ private struct RoleCard: View {
         FieldLabel(L("Effort")) {
             Picker(L("Effort"), selection: $role.effort) {
                 Text(L("Profile default")).tag("default")
-                ForEach(ResearchSettingsSection.efforts.dropFirst(), id: \.0) { value, label in
+                ForEach(EffortLevel.all.dropFirst(), id: \.0) { value, label in
                     Text(value == advice.effort ? "\(L(label)) · \(L("recommended"))" : L(label)).tag(value)
                 }
             }

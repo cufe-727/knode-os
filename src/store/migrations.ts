@@ -751,12 +751,12 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE INDEX IF NOT EXISTS chat_messages_conv_idx ON chat_messages (conversation_id, seq);
 `;
 
+// Ask's quick mode carried its citations, gaps and claims here. Quick mode is
+// gone (2026-09-19) and nothing writes this column any more, but it is kept,
+// and so is this migration: historical answers still hold their citations, and
+// deleting the entry would lower SCHEMA_VERSION so every existing database
+// would read as newer than the code.
 const V10_CHAT_QUICK = `
--- Ask's quick mode: a one-shot cited answer lands as an ordinary assistant
--- message, so both kinds of reply share one conversation list. \`events\` is the
--- agent's tool activity; \`payload\` carries what the retrieval answer knows
--- about itself (citations, gaps, the claims it leaned on). The contexts are
--- deliberately not stored: whole chunks are large and re-derivable.
 ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}';
 `;
 

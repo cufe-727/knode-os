@@ -22,7 +22,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .library: [.files, .search, .traces]
         case .ask: [.ask]
         case .knowledge: [.graph, .wiki, .dream]
-        case .settings: [.providers, .pipeline, .agents, .research, .workspace]
+        case .settings: [.providers, .pipeline, .research, .workspace]
         }
     }
 
@@ -38,7 +38,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
     @MainActor var subtitle: String {
         switch self {
         case .library: L("Files, search, and agent traces")
-        case .ask: L("Quick cited answers, or a working agent")
+        case .ask: L("An agent that answers from your workspace")
         case .knowledge: L("Graph, wiki, and nightly review")
         case .settings: L("Model routes and pipeline limits")
         }
@@ -66,23 +66,32 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
     case dream
     case providers
     case pipeline
-    case agents
     case research
     case workspace
 
     var id: String { rawValue }
+
+    /**
+     * A tab that used to exist, so a stored navigation still lands somewhere.
+     * `agents` was folded into `providers` in 2026-09-19: an agent runs on a
+     * provider from the table above it, and the two were never separable in
+     * anything but the tab strip.
+     */
+    static func named(_ raw: String) -> AppTab? {
+        AppTab(rawValue: raw) ?? (raw == "agents" ? .providers : nil)
+    }
 
     var section: AppSection {
         switch self {
         case .files, .search, .traces: .library
         case .ask: .ask
         case .graph, .wiki, .dream: .knowledge
-        case .providers, .pipeline, .agents, .research, .workspace: .settings
+        case .providers, .pipeline, .research, .workspace: .settings
         }
     }
 
     /**
-     * Which screen shows this tab. Settings' five tabs share one host: keying
+     * Which screen shows this tab. Settings' four tabs share one host: keying
      * view identity on the leaf instead would rebuild `SettingsView` on every
      * sub-tab click, refetching the config and discarding unsaved routes.
      */
@@ -99,9 +108,8 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .graph: L("Graph")
         case .wiki: L("Wiki")
         case .dream: L("Dream")
-        case .providers: L("Providers")
+        case .providers: L("Providers & Agents")
         case .pipeline: L("Pipeline")
-        case .agents: L("Agents")
         case .research: L("Research")
         case .workspace: L("Workspace")
         }
@@ -112,13 +120,12 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .files: L("Browse and edit knowledge")
         case .search: L("Hybrid, vector, and keyword recall")
         case .traces: L("Claude Code and Codex sessions")
-        case .ask: L("Quick cited answers, or a working agent")
+        case .ask: L("An agent that answers from your workspace")
         case .graph: L("Entities, relations, and claims")
         case .wiki: L("Pages researched by agent CLIs")
         case .dream: L("Review agent improvement ideas")
-        case .providers: L("Endpoints and credentials")
+        case .providers: L("Endpoints, credentials, and who does the work")
         case .pipeline: L("What each stage needs")
-        case .agents: L("Who does the work")
         case .research: L("How the wiki gets written")
         case .workspace: L("Clear this workspace")
         }
@@ -135,7 +142,6 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .dream: "moon.stars"
         case .providers: "cable.connector"
         case .pipeline: "arrow.triangle.branch"
-        case .agents: "person.2.badge.gearshape"
         case .research: "book.and.wrench"
         case .workspace: "exclamationmark.triangle"
         }
@@ -244,13 +250,6 @@ struct SearchResult: Decodable, Identifiable, Hashable {
     var signals: [String: Double]
 
     var id: String { chunkId }
-}
-
-struct Citation: Decodable, Hashable, Identifiable {
-    var ref: Int
-    var path: String
-    var chunkId: String
-    var id: String { "\(ref)-\(chunkId)" }
 }
 
 struct Claim: Decodable, Hashable, Identifiable {
@@ -578,9 +577,26 @@ struct LLMConfig: Codable, Equatable {
     var apiKey: String
     var model: String
     var cliPath: String
+    /// How hard a CLI provider thinks. "default" leaves the CLI's own setting
+    /// alone, and an OpenAI-compatible endpoint ignores it.
+    var effort: String
     var cliTimeoutMs: Int?
     /// Shown in the providers table. Empty = the provider's own name.
     var label: String?
+
+    /// Decoded field by field so a service that predates one of them — `effort`
+    /// arrived after the rest — still yields a usable config instead of failing.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decodeIfPresent(String.self, forKey: .provider) ?? "openai"
+        baseUrl = try container.decodeIfPresent(String.self, forKey: .baseUrl) ?? ""
+        apiKey = try container.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
+        model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
+        cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? ""
+        effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? "default"
+        cliTimeoutMs = try container.decodeIfPresent(Int.self, forKey: .cliTimeoutMs)
+        label = try container.decodeIfPresent(String.self, forKey: .label)
+    }
 }
 
 /// A pipeline route. `use` names the connection it runs on — empty for the
@@ -616,6 +632,8 @@ struct LLMConnection: Codable, Equatable, Identifiable {
     var apiKey: String
     var model: String
     var cliPath: String
+    /// See `LLMConfig.effort`.
+    var effort: String
     var cliTimeoutMs: Int?
 
     init(id: String, label: String, provider: String = "openai") {
@@ -626,6 +644,7 @@ struct LLMConnection: Codable, Equatable, Identifiable {
         apiKey = ""
         model = ""
         cliPath = ""
+        effort = "default"
         cliTimeoutMs = nil
     }
 
@@ -638,6 +657,7 @@ struct LLMConnection: Codable, Equatable, Identifiable {
         apiKey = try container.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
         cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? ""
+        effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? "default"
         cliTimeoutMs = try container.decodeIfPresent(Int.self, forKey: .cliTimeoutMs)
     }
 }
@@ -775,30 +795,17 @@ struct ChatConfig: Codable, Equatable {
     /// Connection id or CLI provider; empty follows the research agent.
     var agent: String
     var model: String
-    var effort: String
-    var maxTurns: Int
-    var timeoutMs: Int
-    /// "inherit" | "on" | "off" — narrower than review.external, never wider.
-    var web: String
     var historyTurns: Int
     var keep: Int
 
     init(
-        agent: String = "",
+        agent: String = "default",
         model: String = "",
-        effort: String = "default",
-        maxTurns: Int = 30,
-        timeoutMs: Int = 600_000,
-        web: String = "inherit",
         historyTurns: Int = 12,
-        keep: Int = 50
+        keep: Int = 200
     ) {
         self.agent = agent
         self.model = model
-        self.effort = effort
-        self.maxTurns = maxTurns
-        self.timeoutMs = timeoutMs
-        self.web = web
         self.historyTurns = historyTurns
         self.keep = keep
     }
@@ -808,10 +815,6 @@ struct ChatConfig: Codable, Equatable {
         let fallback = ChatConfig()
         agent = try container.decodeIfPresent(String.self, forKey: .agent) ?? fallback.agent
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? fallback.model
-        effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? fallback.effort
-        maxTurns = try container.decodeIfPresent(Int.self, forKey: .maxTurns) ?? fallback.maxTurns
-        timeoutMs = try container.decodeIfPresent(Int.self, forKey: .timeoutMs) ?? fallback.timeoutMs
-        web = try container.decodeIfPresent(String.self, forKey: .web) ?? fallback.web
         historyTurns = try container.decodeIfPresent(Int.self, forKey: .historyTurns) ?? fallback.historyTurns
         keep = try container.decodeIfPresent(Int.self, forKey: .keep) ?? fallback.keep
     }
@@ -824,8 +827,12 @@ struct KnodeConfig: Codable, Equatable {
     var embeddingProviders: [EmbeddingConnection]
     /// Which `embeddingProviders` entry the Index stage runs on.
     var embeddingUse: String
+    /// A mirror of the connection `llmUse` names, flattened by the service.
+    /// Read-only here: the table edits the list, like the embedding one.
     var llm: LLMConfig
     var connections: [LLMConnection]
+    /// Which `connections` entry every job inherits unless it names another.
+    var llmUse: String
     var ingest: IngestConfig
     var extraction: ExtractionConfig
     var research: ResearchConfig
@@ -838,6 +845,7 @@ struct KnodeConfig: Codable, Equatable {
         embeddingUse = try container.decodeIfPresent(String.self, forKey: .embeddingUse) ?? ""
         llm = try container.decode(LLMConfig.self, forKey: .llm)
         connections = try container.decodeIfPresent([LLMConnection].self, forKey: .connections) ?? []
+        llmUse = try container.decodeIfPresent(String.self, forKey: .llmUse) ?? ""
         ingest = try container.decodeIfPresent(IngestConfig.self, forKey: .ingest) ?? IngestConfig()
         extraction = try container.decode(ExtractionConfig.self, forKey: .extraction)
         research = try container.decodeIfPresent(ResearchConfig.self, forKey: .research) ?? ResearchConfig()
@@ -848,7 +856,16 @@ struct KnodeConfig: Codable, Equatable {
     var activeEmbedding: EmbeddingConnection? {
         embeddingProviders.first { $0.id == embeddingUse } ?? embeddingProviders.first
     }
+
+    /// The connection every job inherits, or nil while the list is still loading.
+    var activeLlm: LLMConnection? {
+        connections.first { $0.id == llmUse } ?? connections.first
+    }
 }
+
+/// The coding-agent CLIs. They are agents that bring their own loop, so they
+/// live in the agents table, not among the models.
+let cliProviderNames = ["claude-cli", "codex-cli", "cursor-cli"]
 
 /// A named agent: who runs a research job or a chat turn, and how hard they
 /// think. How the research itself is conducted stays in the profile.
@@ -877,10 +894,13 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
     var name: String
     var title: String
     var description: String
-    /// "general" | "deep-research"
+    /// "general" | "deep-research" — only orders the pickers now.
     var kind: String
-    /// A connection id, a CLI provider name, or "default".
+    /// A CLI provider name runs that CLI; "default" or a connection id runs
+    /// the built-in deepagents loop on that model.
     var executor: String
+    /// A CLI agent's executable; "" = the CLI's own name on PATH.
+    var cliPath: String
     var model: String
     var effort: String
     var tools: Tools
@@ -895,15 +915,17 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
 
     var id: String { name }
 
-    init(name: String, kind: String) {
+    init(name: String, kind: String = "general", executor: String = "default") {
         self.name = name
         title = name
         description = ""
         self.kind = kind
-        executor = "default"
+        self.executor = executor
+        cliPath = ""
         model = ""
         effort = "default"
-        tools = Tools(write: kind == "deep-research", files: true, web: "inherit")
+        // what Ask needs to take notes; a CLI answers with its own tools anyway
+        tools = Tools(write: true, files: true, web: "inherit")
         maxTurns = 0
         timeoutMs = 0
         prompt = ""
@@ -919,6 +941,7 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? name
         description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
         executor = try container.decodeIfPresent(String.self, forKey: .executor) ?? ""
+        cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? ""
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
         effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? "default"
         tools = try container.decodeIfPresent(Tools.self, forKey: .tools) ?? Tools()
@@ -936,6 +959,7 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
         var description: String
         var kind: String
         var executor: String
+        var cliPath: String
         var model: String
         var effort: String
         var tools: Tools
@@ -945,8 +969,22 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
     }
 
     var payload: Payload {
-        Payload(title: title, description: description, kind: kind, executor: executor, model: model,
+        Payload(title: title, description: description, kind: kind, executor: executor, cliPath: cliPath, model: model,
                 effort: effort, tools: tools, maxTurns: maxTurns, timeoutMs: timeoutMs, prompt: prompt)
+    }
+
+    /// Runs a coding-agent CLI, rather than deepagents on a model.
+    var isCli: Bool { cliProviderNames.contains(executor) }
+
+    /// A CLI agent as a pipeline stage or the default sees it: a one-shot LLM.
+    /// The client-side mirror of the service's `readAgentLlms`.
+    var asLlmTarget: LLMConnection? {
+        guard isCli else { return nil }
+        var target = LLMConnection(id: name, label: title.trimmingCharacters(in: .whitespaces).isEmpty ? name : title, provider: executor)
+        target.model = model
+        target.cliPath = cliPath
+        target.effort = effort
+        return target
     }
 }
 
@@ -974,34 +1012,14 @@ struct ChatEvent: Decodable, Hashable, Identifiable {
     var label: String { tool == "wrote" ? "wrote \(summary)" : summary.isEmpty ? tool : "\(tool): \(summary)" }
 }
 
-/// How a turn was answered. A conversation carries the mode it was started in;
-/// a reply carries the mode that produced it.
-enum AskMode: String, Codable, CaseIterable, Identifiable {
-    case quick
-    case agent
-
-    var id: String { rawValue }
-
-    @MainActor var title: String { self == .quick ? L("Quick") : L("Agent") }
-}
-
-/// What a quick (retrieval) answer knows about itself. Agent replies leave this
-/// empty and describe themselves through `events` instead.
-struct ChatAnswerPayload: Decodable, Hashable {
-    var mode: String?
-    var citations: [Citation]?
-    var gaps: [String]?
-    var facts: [QuickFact]?
-}
-
-/// A claim the answer leaned on. `Claim` is a superset the quick payload does
-/// not carry, so this stays a slim struct rather than reusing it.
-struct QuickFact: Decodable, Hashable, Identifiable {
-    var statement: String
-    var subject: String?
-    var status: String?
-
-    var id: String { "\(subject ?? "")|\(statement)" }
+/// Whether a question asked now would be answered, and if not, why. `reason`
+/// matches the one the send path returns, so both land on the same screen.
+struct ChatReadiness: Decodable {
+    var ready: Bool
+    var reason: String?
+    var hint: String?
+    var provider: String?
+    var model: String?
 }
 
 struct ChatMessage: Decodable, Identifiable, Hashable {
@@ -1010,17 +1028,11 @@ struct ChatMessage: Decodable, Identifiable, Hashable {
     var role: String
     var content: String
     var events: [ChatEvent]
-    var payload: ChatAnswerPayload?
     var turns: Int?
     var error: String?
     var createdAt: String
 
     var isUser: Bool { role == "user" }
-    /// Older rows carry no payload; a reply with tool activity came from an agent.
-    var mode: AskMode {
-        if let mode = payload?.mode { return AskMode(rawValue: mode) ?? .agent }
-        return events.isEmpty && payload?.citations != nil ? .quick : .agent
-    }
 }
 
 struct ChatConversation: Decodable, Identifiable, Hashable {
@@ -1028,13 +1040,9 @@ struct ChatConversation: Decodable, Identifiable, Hashable {
     var title: String
     var status: String
     var agent: String?
-    var payload: ChatAnswerPayload?
     var updatedAt: String
     var messages: [ChatMessage]?
     var running: Bool?
-
-    /// Conversations written before quick mode existed are agent conversations.
-    var mode: AskMode { AskMode(rawValue: payload?.mode ?? "") ?? .agent }
 
     @MainActor var displayTitle: String { title.isEmpty ? L("(untitled)") : title }
 }
@@ -1048,10 +1056,8 @@ struct ChatStatusResponse: Decodable {
 struct ChatSendResponse: Decodable {
     var ok: Bool
     var seq: Int
-    /// `running` means an agent session started and must be polled; a quick
-    /// answer is already written and comes back `idle`.
+    /// `running` means a session started and must be polled until it is idle.
     var status: String
-    var mode: String?
 }
 
 struct ChatProtocolResponse: Decodable {

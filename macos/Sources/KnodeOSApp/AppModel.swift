@@ -52,9 +52,9 @@ final class AppModel: ObservableObject {
         serverURLString = defaults.string(forKey: serverKey) ?? "http://127.0.0.1:9100"
         if let data = defaults.data(forKey: navKey), let nav = try? JSONDecoder().decode(NavState.self, from: data) {
             lastTab = nav.last.reduce(into: [:]) { out, pair in
-                if let section = AppSection(rawValue: pair.key), let tab = AppTab(rawValue: pair.value) { out[section] = tab }
+                if let section = AppSection(rawValue: pair.key), let tab = AppTab.named(pair.value) { out[section] = tab }
             }
-            if let tab = AppTab(rawValue: nav.tab) { selectedTab = tab }
+            if let tab = AppTab.named(nav.tab) { selectedTab = tab }
         }
         if let data = defaults.data(forKey: sessionKey),
            let stored = try? JSONDecoder().decode(StoredSession.self, from: data) {

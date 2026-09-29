@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultConfig, saveConfig } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
 import { AGENTS_DIR } from '../src/fs/layout.js';
-import { agentForSpec } from '../src/research/agent.js';
+import { agentForSpec, resolveAgentSpec } from '../src/research/agent.js';
 import { AgentDefinition, ensureDefaultAgents, loadAgent, loadAgents, saveAgent, deleteAgent } from '../src/research/agents.js';
 import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
@@ -93,6 +93,26 @@ describe('agent definitions', () => {
     expect(agentForSpec(config, 'ark', '', dir)).toMatchObject({ kind: 'builtin', model: 'doubao' });
     expect(agentForSpec(config, 'cursor-cli', '', dir)).toMatchObject({ kind: 'cli', provider: 'cursor-cli' });
     expect(agentForSpec(config, 'nobody', '', dir)).toBeNull();
+  });
+
+  it('hands back the definition a name resolved through, so its settings can be read', () => {
+    const dir = path.join(tmp, 'resolve-definition');
+    fs.mkdirSync(dir, { recursive: true });
+    const config = defaultConfig();
+    config.connections = [{ id: 'ark', label: 'Ark', provider: 'openai', baseUrl: 'https://ark.example/v1', apiKey: 'sk', model: 'doubao', cliPath: '', cliTimeoutMs: 300_000 }];
+    saveAgent(dir, { name: 'writer', kind: 'general', executor: 'ark', model: 'doubao-pro', maxTurns: 7, effort: 'high' });
+
+    const named = resolveAgentSpec(config, 'writer', '', dir);
+    expect(named?.agent).toMatchObject({ kind: 'builtin', model: 'doubao-pro' });
+    expect(named?.definition).toMatchObject({ name: 'writer', maxTurns: 7, effort: 'high' });
+
+    // a bare spec has no definition to read settings from, by construction
+    expect(resolveAgentSpec(config, 'ark', '', dir)?.definition).toBeNull();
+    expect(resolveAgentSpec(config, 'cursor-cli', '', dir)?.definition).toBeNull();
+    expect(resolveAgentSpec({ ...config, llm: { ...config.llm, model: 'gpt-4.1-mini' } }, 'default', '', dir)?.definition).toBeNull();
+    // 'default' is only resolvable when the section-01 connection can run a session
+    expect(resolveAgentSpec(config, 'default', '', dir)).toBeNull();
+    expect(resolveAgentSpec(config, 'nobody', '', dir)).toBeNull();
   });
 });
 

@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Replace /Applications/KnodeOS.app with a fresh build, following the local
+# installation workflow in AGENTS.md: one installed copy at a fixed path, no
+# loose .app bundles left behind for LaunchServices or Spotlight to list.
+#
+#   ./macos/scripts/install-app.sh              build, then install
+#   ./macos/scripts/install-app.sh --no-build   install macos/build/KnodeOS.app as is
+#   ./macos/scripts/install-app.sh --backup     also keep the old bundle as
+#                                               install-backups/previous.zip
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MACOS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+BUILD_APP="$MACOS_DIR/build/KnodeOS.app"
+TARGET="/Applications/KnodeOS.app"
+BUNDLE_ID="dev.knode.os"
+HEALTH_URL="${KNODE_OS_HEALTH_URL:-http://127.0.0.1:9100/api/health}"
+BACKUP_ZIP="$HOME/Library/Application Support/KnodeOS/install-backups/previous.zip"
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+build=1
+backup=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-build) build=0 ;;
+    --backup) backup=1 ;;
+    *) echo "Unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+log() { echo "[install] $*"; }
+
+if [[ $build == 1 ]]; then
+  if ! "$SCRIPT_DIR/package-app.sh"; then
+    # A half-built bundle is useless and would show up as another app.
+    "$LSREGISTER" -u "$BUILD_APP" >/dev/null 2>&1 || true
+    rm -rf "$BUILD_APP"
+    echo "Build failed; $TARGET was left untouched." >&2
+    exit 1
+  fi
+fi
+
+# --- Validate the new bundle before touching the installed one.
+[[ -d "$BUILD_APP" ]] || { echo "No build at $BUILD_APP" >&2; exit 1; }
+id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$BUILD_APP/Contents/Info.plist")"
+[[ "$id" == "$BUNDLE_ID" ]] || { echo "Bundle identifier is $id, expected $BUNDLE_ID" >&2; exit 1; }
+for f in Contents/MacOS/KnodeOS Contents/Resources/KnodeService/bin/node; do
+  [[ -x "$BUILD_APP/$f" ]] || { echo "Missing executable $f in build" >&2; exit 1; }
+done
+[[ -f "$BUILD_APP/Contents/Resources/KnodeService/app/dist/cli.js" ]] \
+  || { echo "Missing bundled service in build" >&2; exit 1; }
+
+# --- Stage the complete new bundle in a hidden directory beside the target.
+STAGE="$(mktemp -d /Applications/.KnodeOS-install.XXXXXX)"
+ditto "$BUILD_APP" "$STAGE/new.app"
+# Keep the staged copies out of LaunchServices while they exist.
+"$LSREGISTER" -u "$STAGE/new.app" >/dev/null 2>&1 || true
+
+swapped=0
+restore() {
+  local status=$?
+  if [[ $swapped == 1 && -d "$STAGE/old.app" ]]; then
+    log "installation failed — restoring the previous bundle"
+    stop_app || true
+    rm -rf "$TARGET"
+    mv "$STAGE/old.app" "$TARGET"
+    "$LSREGISTER" -f "$TARGET" >/dev/null 2>&1 || true
+    open "$TARGET" || true
+  fi
+  "$LSREGISTER" -u "$STAGE/new.app" >/dev/null 2>&1 || true
+  "$LSREGISTER" -u "$STAGE/old.app" >/dev/null 2>&1 || true
+  rm -rf "$STAGE"
+  exit "$status"
+}
+trap restore ERR INT TERM
+
+# --- Gracefully stop the app, then its bundled service.
+app_pids() { pgrep -f "^$TARGET/Contents/MacOS/KnodeOS" || true; }
+service_pids() { pgrep -f "$TARGET/Contents/Resources/KnodeService/" || true; }
+wait_gone() { # $1 = function listing pids, $2 = seconds
+  local i
+  for ((i = 0; i < $2 * 4; i++)); do
+    [[ -z "$($1)" ]] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+stop_app() {
+  if [[ -n "$(app_pids)" ]]; then
+    osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
+    wait_gone app_pids 20 || { kill -TERM $(app_pids) 2>/dev/null || true; wait_gone app_pids 10; }
+  fi
+  if [[ -n "$(service_pids)" ]]; then
+    kill -TERM $(service_pids) 2>/dev/null || true
+    wait_gone service_pids 15 || { echo "Bundled service did not stop" >&2; return 1; }
+  fi
+}
+log "stopping the running app"
+stop_app
+
+# --- Swap the whole bundle; the old one stays in the stage until health passes.
+if [[ -d "$TARGET" ]]; then
+  mv "$TARGET" "$STAGE/old.app"
+  swapped=1
+  "$LSREGISTER" -u "$STAGE/old.app" >/dev/null 2>&1 || true
+fi
+mv "$STAGE/new.app" "$TARGET"
+"$LSREGISTER" -f "$TARGET"
+
+# --- Launch the fixed path and check that it actually came up.
+log "launching $TARGET"
+open "$TARGET"
+healthy=0
+for ((i = 0; i < 120; i++)); do
+  if [[ -n "$(app_pids)" ]] && curl -fsS --noproxy '*' -m 2 "$HEALTH_URL" >/dev/null 2>&1; then
+    healthy=1
+    break
+  fi
+  sleep 0.5
+done
+if [[ $healthy != 1 ]]; then
+  echo "App did not become healthy (process from $TARGET + $HEALTH_URL)" >&2
+  false
+fi
+if [[ -z "$(service_pids)" ]]; then
+  log "note: $HEALTH_URL is answered by a service outside the app bundle"
+fi
+trap - ERR INT TERM
+
+# --- Success: keep at most one rollback archive, then clean up.
+if [[ $backup == 1 && -d "$STAGE/old.app" ]]; then
+  mkdir -p "$(dirname "$BACKUP_ZIP")"
+  rm -f "$BACKUP_ZIP"
+  ditto -c -k --keepParent "$STAGE/old.app" "$BACKUP_ZIP"
+  log "previous bundle archived to $BACKUP_ZIP"
+fi
+"$LSREGISTER" -u "$STAGE/old.app" >/dev/null 2>&1 || true
+rm -rf "$STAGE"
+"$LSREGISTER" -u "$BUILD_APP" >/dev/null 2>&1 || true
+rm -rf "$BUILD_APP"
+"$LSREGISTER" -f "$TARGET"
+
+# --- Verify a single registered copy.
+paths="$("$LSREGISTER" -dump 2>/dev/null | grep -E '^path:.*KnodeOS[^/]*\.app' | sed -E 's/^path: *//; s/ \(0x[0-9a-f]+\)$//' | sort -u)"
+if [[ "$paths" != "$TARGET" ]]; then
+  echo "Warning: LaunchServices lists other KnodeOS bundles:" >&2
+  echo "$paths" >&2
+fi
+log "installed and running from $TARGET"

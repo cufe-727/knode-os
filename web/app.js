@@ -6,7 +6,13 @@ const api = async (path, opts = {}) => {
   const headers = { 'content-type': 'application/json', ...workspaceRequestHeaders(), ...(opts.headers || {}) };
   const res = await fetch(path, { ...opts, headers });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  if (!res.ok) {
+    const error = new Error(data.error || res.statusText);
+    // the machine-readable cause, when a route sends one: a screen can act on
+    // it instead of parsing the prose
+    if (data.reason) error.reason = data.reason;
+    throw error;
+  }
   return data;
 };
 const toast = (msg, ms = 2600) => {
@@ -524,28 +530,35 @@ const NAV = [
     { id: 'search', title: 'Search', hint: 'Hybrid, vector, and keyword recall' },
     { id: 'traces', title: 'Traces', hint: 'Claude Code and Codex sessions' },
   ] },
-  { id: 'ask', title: 'Ask', tabs: [{ id: 'ask', title: 'Ask', hint: 'Quick cited answers, or a working agent' }] },
+  { id: 'ask', title: 'Ask', tabs: [{ id: 'ask', title: 'Ask', hint: 'An agent that answers from your workspace' }] },
   { id: 'knowledge', title: 'Knowledge', tabs: [
     { id: 'graph', title: 'Graph', hint: 'Entities, relations, and claims' },
     { id: 'wiki', title: 'Wiki', hint: 'Pages researched by agent CLIs' },
     { id: 'dream', title: 'Dream', hint: 'Review agent improvement ideas' },
   ] },
   { id: 'settings', title: 'Settings', tabs: [
-    { id: 'providers', title: 'Providers', hint: 'Endpoints and credentials' },
+    { id: 'providers', title: 'Providers & Agents', hint: 'Endpoints, credentials, and who does the work' },
     { id: 'pipeline', title: 'Pipeline', hint: 'What each stage needs' },
-    { id: 'agents', title: 'Agents', hint: 'Who does the work' },
     { id: 'research', title: 'Research', hint: 'How the wiki gets written' },
     { id: 'workspace', title: 'Workspace', hint: 'Clear this workspace' },
   ] },
 ];
 
 /**
- * Which `<section class="tab">` shows a tab. Settings' five tabs share one
+ * Which `<section class="tab">` shows a tab. Settings' four tabs share one
  * host: keying identity and loaders on the leaf instead would re-run
  * `loadConfigForm()` on every sub-tab click and throw away unsaved routes.
  */
-const TAB_HOST = { providers: 'settings', pipeline: 'settings', agents: 'settings', research: 'settings', workspace: 'settings' };
+const TAB_HOST = { providers: 'settings', pipeline: 'settings', research: 'settings', workspace: 'settings' };
 const hostOf = (tab) => TAB_HOST[tab] ?? tab;
+
+/**
+ * Tabs that used to exist, so a stored navigation still lands somewhere.
+ * `agents` was folded into `providers`: an agent runs on a provider from the
+ * table above it, and the two were never separable but in the tab strip.
+ */
+const NAV_ALIAS = { agents: 'providers' };
+const aliasOf = (tab) => NAV_ALIAS[tab] ?? tab;
 
 /** What a host view loads when you arrive at it. */
 const TAB_LOAD = {
@@ -566,11 +579,13 @@ const lastTab = Object.fromEntries(NAV.map((s) => [s.id, s.tabs[0].id]));
 function restoreNav() {
   try {
     const saved = JSON.parse(localStorage.getItem(NAV_KEY) ?? '{}');
-    for (const [section, tab] of Object.entries(saved.lastTab ?? {})) {
+    for (const [section, raw] of Object.entries(saved.lastTab ?? {})) {
+      const tab = aliasOf(raw);
       if (sectionOf(tab)?.id === section) lastTab[section] = tab;
     }
     // these ids will move again; an unknown one just means the default
-    return sectionOf(saved.tab) ? saved.tab : currentTab;
+    const tab = aliasOf(saved.tab);
+    return sectionOf(tab) ? tab : currentTab;
   } catch {
     return currentTab;
   }
@@ -1772,7 +1787,12 @@ function stopChatPolling() {
   chatPollTimer = null;
 }
 
+/** Whether a question asked now would be answered, and if not, what to fix. */
+let chatReadiness = null;
+
 async function loadChat() {
+  chatReadiness = await api('/api/chat/readiness').catch(() => null);
+  paintChatReadiness();
   try {
     chatConversations = await api('/api/chat/conversations?limit=50');
   } catch (e) {
@@ -1799,7 +1819,7 @@ function renderChatList() {
     const div = document.createElement('div');
     div.className = `chat-item${c.id === chatActiveId ? ' active' : ''}`;
     div.innerHTML = `<span class="chat-item-title">${esc(c.title || '(untitled)')}</span>
-      <span class="hint"><span class="chat-item-mode">${esc(modeOfConversation(c))}</span> · ${esc(new Date(c.updatedAt).toLocaleString())}</span>
+      <span class="hint">${esc(new Date(c.updatedAt).toLocaleString())}</span>
       <button data-del title="Delete this conversation">✕</button>`;
     div.addEventListener('click', (ev) => { if (!ev.target.hasAttribute('data-del')) openConversation(c.id); });
     div.querySelector('button[data-del]').addEventListener('click', async (ev) => {
@@ -1821,9 +1841,6 @@ async function openConversation(id) {
   renderChatList();
   try {
     const conversation = await api(`/api/chat/conversations/${id}`);
-    // a follow-up continues the thread the way it was started
-    $('#ask-mode').value = modeOfConversation(conversation);
-    paintAskMode();
     renderChatThread(conversation);
     // the turn may have finished while another tab was open: the composer follows the server, not the last poll
     if (conversation.running) startChatPolling();
@@ -1836,7 +1853,11 @@ async function openConversation(id) {
 function renderChatThread(conversation) {
   const el = $('#chat-thread');
   if (!conversation) {
-    el.innerHTML = '<p class="hint">Ask a question. <b>quick</b> answers in one retrieval pass, with citations; <b>agent</b> runs the configured CLI, which can follow leads and write what you teach it.</p>';
+    el.innerHTML = chatReadiness && chatReadiness.ready === false
+      ? `<p class="hint"><b>Ask has nothing to run on.</b> ${esc(chatReadiness.hint ?? '')}
+         <button type="button" class="hint-action" data-open-providers>open Providers &amp; Agents</button></p>`
+      : '<p class="hint">Ask a question. An agent answers over your files, graph and wiki — it can follow leads across several turns, and writes what you teach it as a quarantined note you can adopt.</p>';
+    el.querySelector('[data-open-providers]')?.addEventListener('click', () => navigate('providers'));
     return;
   }
   el.innerHTML = '';
@@ -1876,50 +1897,10 @@ function renderChatThread(conversation) {
       }
       if (m.error && m.content) chips.insertAdjacentHTML('beforeend', `<span class="chat-chip bad">${esc(m.error)}</span>`);
       if (chips.childElementCount) div.appendChild(chips);
-      // a retrieval answer describes itself by what it cited, an agent by what it did
-      const quick = quickFooter(m, conversation);
-      if (quick) div.appendChild(quick);
     }
     el.appendChild(div);
   }
   el.scrollTop = el.scrollHeight;
-}
-
-/**
- * Citations, the claims the answer leaned on, what the base is missing, and the
- * way out when one retrieval pass was not enough.
- */
-function quickFooter(message, conversation) {
-  const payload = message.payload;
-  if (!payload || payload.mode !== 'quick') return null;
-  const foot = document.createElement('div');
-  foot.className = 'quick-foot';
-  for (const c of payload.citations ?? []) {
-    const cite = document.createElement('div');
-    cite.className = 'citation';
-    cite.title = `open ${c.path}`;
-    cite.innerHTML = `<b>[${c.ref}]</b><span>${esc(c.path)}</span>`;
-    cite.addEventListener('click', () => { navigate('files'); openFile(c.path); });
-    foot.appendChild(cite);
-  }
-  const facts = payload.facts ?? [];
-  if (facts.length) {
-    foot.insertAdjacentHTML('beforeend', `<p class="fact">known facts: ${facts.slice(0, 5)
-      .map((f) => `${esc(f.statement.slice(0, 100))} <span class="mono">[${esc(f.status ?? 'claim')}]</span>`).join(' · ')}</p>`);
-  }
-  if (payload.gaps?.length) foot.insertAdjacentHTML('beforeend', `<p class="gap">gaps: ${payload.gaps.map(esc).join(' · ')}</p>`);
-
-  const question = (conversation?.messages ?? []).filter((x) => x.role === 'user' && x.seq < message.seq).pop();
-  if (question) {
-    const deepen = document.createElement('button');
-    deepen.className = 'deepen';
-    deepen.type = 'button';
-    deepen.textContent = '✦ dig deeper with the agent';
-    deepen.title = 'Re-ask this in a new agent conversation';
-    deepen.addEventListener('click', () => deepenWithAgent(question.content));
-    foot.appendChild(deepen);
-  }
-  return foot.childElementCount ? foot : null;
 }
 
 function renderChatActivity(activity) {
@@ -1929,7 +1910,8 @@ function renderChatActivity(activity) {
 }
 
 function setChatBusy(busy) {
-  $('#btn-chat-send').disabled = busy;
+  // an unready composer stays disabled when the turn ends
+  $('#btn-chat-send').disabled = busy || Boolean(chatReadiness && chatReadiness.ready === false);
   $('#btn-chat-cancel').hidden = !busy;
   $('#chat-activity').hidden = !busy;
 }
@@ -1961,33 +1943,23 @@ function startChatPolling() {
   chatPollTimer = setTimeout(tick, 900);
 }
 
-/** Conversations written before quick mode existed are agent conversations. */
-function modeOfConversation(conversation) {
-  return conversation?.payload?.mode === 'quick' ? 'quick' : 'agent';
-}
-
-async function newConversation(mode) {
-  const conversation = await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({ mode }) });
+async function newConversation() {
+  const conversation = await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({}) });
   chatConversations.unshift(conversation);
   chatActiveId = conversation.id;
-  $('#ask-mode').value = mode;
-  paintAskMode();
   renderChatList();
   renderChatThread(conversation);
   return conversation;
 }
 
-async function askQuestion(text, mode) {
+async function askQuestion(text) {
   const thread = $('#chat-thread');
   const mine = document.createElement('div');
   mine.className = 'chat-msg user';
   mine.innerHTML = `<div class="markdown">${renderMd(text)}</div>`;
   thread.appendChild(mine);
   thread.scrollTop = thread.scrollHeight;
-  if (mode === 'quick') $('#chat-activity').hidden = false, renderChatActivity([]);
-  const res = await api(`/api/chat/conversations/${chatActiveId}/messages`, { method: 'POST', body: JSON.stringify({ text, mode }) });
-  // the server says whether there is a session to watch: a quick answer is
-  // already written by the time this returns, so there is nothing to poll
+  const res = await api(`/api/chat/conversations/${chatActiveId}/messages`, { method: 'POST', body: JSON.stringify({ text }) });
   if (res.status === 'running') {
     startChatPolling();
   } else {
@@ -2002,53 +1974,46 @@ async function sendChat() {
   const input = $('#chat-input');
   const text = input.value.trim();
   if (!text) return;
-  const mode = $('#ask-mode').value;
   input.value = '';
-  // Quick asks are one question each, and a mode never changes what an existing
-  // thread means — either way that means a fresh conversation.
-  const current = chatConversations.find((c) => c.id === chatActiveId);
   try {
-    if (!chatActiveId || mode === 'quick' || modeOfConversation(current) !== mode) await newConversation(mode);
+    if (!chatActiveId) await newConversation();
   } catch (e) {
     input.value = text;
     toast(`could not start a conversation: ${e.message}`);
     return;
   }
   try {
-    await askQuestion(text, mode);
+    await askQuestion(text);
   } catch (e) {
+    // a 503 is a configuration answer, not a failed send: show the screen that
+    // says what to fix rather than a toast that scrolls away
+    if (e.reason) {
+      chatReadiness = { ready: false, reason: e.reason, hint: e.message };
+      paintChatReadiness();
+      renderChatThread(null);
+      return;
+    }
     toast(`send failed: ${e.message}`);
     // 409 means another client is already answering — resync and follow that turn instead
     await openConversation(chatActiveId);
   }
 }
 
-/** Re-ask a quick question in a fresh agent conversation. */
-async function deepenWithAgent(question) {
-  try {
-    await newConversation('agent');
-    await askQuestion(question, 'agent');
-  } catch (e) {
-    toast(`send failed: ${e.message}`);
-  }
-}
-
 $('#btn-chat-new').addEventListener('click', async () => {
   try {
-    await newConversation($('#ask-mode').value);
+    await newConversation();
     $('#chat-input').focus();
   } catch (e) {
     toast(`could not start a conversation: ${e.message}`);
   }
 });
-const ASK_PLACEHOLDER = {
-  quick: 'ask a question — answered from your knowledge base with citations… Enter sends, Shift+Enter adds a line',
-  agent: 'ask a question, or “记住：…” to teach the knowledge base — Enter sends, Shift+Enter adds a line',
-};
-function paintAskMode() {
-  $('#chat-input').placeholder = ASK_PLACEHOLDER[$('#ask-mode').value] ?? ASK_PLACEHOLDER.quick;
+
+/** A composer that cannot answer says so on the button rather than on send. */
+function paintChatReadiness() {
+  const blocked = Boolean(chatReadiness && chatReadiness.ready === false);
+  $('#btn-chat-send').disabled = blocked;
+  $('#btn-chat-send').title = blocked ? (chatReadiness.hint ?? '') : 'a reply runs an agent session, which can take minutes';
 }
-$('#ask-mode').addEventListener('change', paintAskMode);
 
 $('#chat-composer').addEventListener('submit', (ev) => { ev.preventDefault(); sendChat(); });
 $('#chat-input').addEventListener('keydown', (ev) => {
@@ -2110,8 +2075,8 @@ function onModelPickerKey(event) {
   if (event.key === 'Escape') closeModelPicker();
 }
 
-function renderModelPicker(picker, route, input) {
-  const state = modelLists.get(route);
+function renderModelPicker(picker, spec, input) {
+  const state = modelLists.get(modelListKey(spec));
   const filter = picker.querySelector('.model-filter')?.value?.trim().toLowerCase() ?? '';
   const models = state?.result?.models ?? [];
   const shown = filter
@@ -2138,30 +2103,35 @@ function renderModelPicker(picker, route, input) {
     <p class="model-picker-foot">Picking one fills the field — Save &amp; apply writes it to the workspace config.</p>`;
 }
 
-async function loadModelList(route, picker, input, refresh = false) {
-  const state = modelLists.get(route) ?? {};
+async function loadModelList(spec, picker, input, refresh = false) {
+  const key = modelListKey(spec);
+  const state = modelLists.get(key) ?? {};
   if (state.loading) return;
   if (state.result && !refresh) return;
-  modelLists.set(route, { ...state, loading: true, error: null });
-  renderModelPicker(picker, route, input);
+  modelLists.set(key, { ...state, loading: true, error: null });
+  renderModelPicker(picker, spec, input);
   try {
+    const config = gatherConfig();
+    // a provider override asks the default route as if that CLI — at that
+    // path — were selected
+    if (spec.provider) config.llm = { ...config.llm, provider: spec.provider, baseUrl: '', apiKey: '', model: '', cliPath: spec.cliPath || '' };
     const result = await api('/api/config/models', {
       method: 'POST',
-      body: JSON.stringify({ route, refresh, config: gatherConfig() }),
+      body: JSON.stringify({ route: spec.route, refresh, config }),
     });
-    modelLists.set(route, { loading: false, result, error: result.error ?? null });
+    modelLists.set(key, { loading: false, result, error: result.error ?? null });
   } catch (e) {
-    modelLists.set(route, { loading: false, result: state.result, error: e.message });
+    modelLists.set(key, { loading: false, result: state.result, error: e.message });
   }
-  if (document.body.contains(picker)) renderModelPicker(picker, route, input);
+  if (document.body.contains(picker)) renderModelPicker(picker, spec, input);
 }
 
-function openModelPicker(anchor, input, route) {
+function openModelPicker(anchor, input, spec) {
   closeModelPicker();
   const picker = document.createElement('div');
   picker.className = 'model-picker';
   document.body.appendChild(picker);
-  renderModelPicker(picker, route, input);
+  renderModelPicker(picker, spec, input);
 
   const box = anchor.getBoundingClientRect();
   const size = picker.getBoundingClientRect();
@@ -2176,10 +2146,10 @@ function openModelPicker(anchor, input, route) {
       closeModelPicker();
       return;
     }
-    if (event.target.closest('.model-refresh')) loadModelList(route, picker, input, true);
+    if (event.target.closest('.model-refresh')) loadModelList(spec, picker, input, true);
   });
   picker.addEventListener('input', (event) => {
-    if (event.target.classList.contains('model-filter')) renderModelPicker(picker, route, input);
+    if (event.target.classList.contains('model-filter')) renderModelPicker(picker, spec, input);
   });
 
   setTimeout(() => {
@@ -2188,19 +2158,45 @@ function openModelPicker(anchor, input, route) {
     window.addEventListener('resize', closeModelPicker);
   }, 0);
 
-  loadModelList(route, picker, input);
+  loadModelList(spec, picker, input);
 }
 
 /** A model input keeps its free text and gains a chevron that lists what the provider offers. */
-function modelChevron(route) {
-  return `<button type="button" class="model-chevron" data-route="${esc(route)}" title="List the models this provider offers">⌄</button>`;
+/**
+ * Which `/api/config/models` route lists what a spec offers, and the draft to
+ * list it against.
+ *
+ * An agent lists through its runtime: a deepagents agent on the model it runs
+ * on, a CLI agent as that CLI at its own path. A CLI is not an endpoint, so
+ * ask the default route with it swapped into the draft instead — the same
+ * thing the macOS client does.
+ */
+function executorModelRoute(spec) {
+  const agent = agentDrafts.find((a) => a.name === spec);
+  if (agent) {
+    if (CLI_PROVIDERS.includes(agent.executor)) return { route: 'llm', provider: agent.executor, cliPath: agent.cliPath || '' };
+    const endpoint = modelEndpoint(agent);
+    return endpoint ? { route: `connection:${endpoint.id}` } : { route: 'llm' };
+  }
+  if (!spec || spec === 'default') return { route: 'llm' };
+  if (connectionById(spec)) return { route: `connection:${spec}` };
+  // a bare CLI borrows the path of a CLI agent running it, as it runs
+  return { route: 'llm', provider: spec, cliPath: llmTargets().find((t) => t.provider === spec)?.cliPath || '' };
+}
+
+/** The cache key: two chevrons on one route but different CLIs or paths are two lists. */
+const modelListKey = ({ route, provider, cliPath }) => `${route}|${provider ?? ''}|${cliPath ?? ''}`;
+
+function modelChevron(spec) {
+  const { route, provider, cliPath } = typeof spec === 'string' ? { route: spec } : spec;
+  return `<button type="button" class="model-chevron" data-route="${esc(route)}"${provider ? ` data-provider="${esc(provider)}"` : ''}${cliPath ? ` data-cli-path="${esc(cliPath)}"` : ''} title="List the models this provider offers">⌄</button>`;
 }
 
 document.addEventListener('click', (event) => {
   const chevron = event.target.closest?.('.model-chevron');
   if (!chevron) return;
   const input = chevron.parentElement.querySelector('input');
-  if (input) openModelPicker(chevron, input, chevron.dataset.route);
+  if (input) openModelPicker(chevron, input, { route: chevron.dataset.route, provider: chevron.dataset.provider, cliPath: chevron.dataset.cliPath });
 });
 
 /**
@@ -2212,12 +2208,100 @@ document.addEventListener('click', (event) => {
 let connectionDrafts = [];
 let embeddingDrafts = [];
 let embeddingUse = '';
-let defaultLlmDraft = null;
+/** Which connection is the default — the mirror of `embeddingUse`. */
+let llmUse = '';
 /** Provider ids whose row is open, kept across a redraw. */
 const expandedProviders = new Set();
 
 function connectionById(id) {
   return connectionDrafts.find((c) => c.id === id);
+}
+
+/**
+ * A CLI agent as a stage or the default sees it: a one-shot LLM — the mirror
+ * of the service's `readAgentLlms`. The agent itself lives in `agentDrafts`.
+ */
+function agentTarget(agent) {
+  return {
+    id: agent.name,
+    label: (agent.title || '').trim() || agent.name,
+    provider: agent.executor,
+    model: agent.model || '',
+    cliPath: agent.cliPath || '',
+    effort: agent.effort || 'default',
+    agent: true,
+  };
+}
+
+/**
+ * Everything a stage or the default can run on: the models, then the CLI
+ * agents, called one-shot — the mirror of the service's `llmTargets`. A model
+ * wins an id clash, since it is what the config itself names.
+ */
+function llmTargets() {
+  const agents = agentDrafts.filter((a) => CLI_PROVIDERS.includes(a.executor) && !connectionById(a.name)).map(agentTarget);
+  return [...connectionDrafts, ...agents];
+}
+
+function targetById(id) {
+  return llmTargets().find((t) => t.id === id);
+}
+
+/**
+ * What the default is — a model, or on a machine with none a CLI agent — or
+ * null while the lists are loading. A dangling `llmUse` falls back the way the
+ * service's `activeLlm` does.
+ */
+function defaultConnection() {
+  const targets = llmTargets();
+  return targets.find((c) => c.id === llmUse) ?? targets[0] ?? null;
+}
+
+/** The model a deepagents agent runs on: the one it pins, or the default while that is a model. */
+function modelEndpoint(agent) {
+  if (CLI_PROVIDERS.includes(agent.executor)) return null;
+  if (agent.executor === 'default') {
+    const def = defaultConnection();
+    return def?.provider === 'openai' ? def : null;
+  }
+  return connectionById(agent.executor) ?? null;
+}
+
+/**
+ * The model a route runs with when it names none of its own — the mirror of
+ * the service's `resolveRoutedLlmConfig`, over the models and the CLI agents.
+ *
+ * Shown as a Model field's placeholder and never written: an empty `model`
+ * means "follow this provider", so pinning the string would stop the route
+ * tracking the provider's own model.
+ */
+function inheritedModelFor(use) {
+  const target = targetById(use);
+  if (target) return target.model || '';
+  // '' and 'default' follow whatever the default is
+  return (!use || use === 'default') ? (defaultConnection()?.model || '') : '';
+}
+
+/**
+ * The same for an agent spec, which may be an agent *name* — and a name can
+ * legitimately be `default`, so this never shares a lookup with the route rule.
+ * The mirror of the service's `resolveAgentSpec`: a CLI agent carries its own
+ * model and inherits nothing; a deepagents agent takes its model endpoint's; a
+ * bare CLI borrows the model of a CLI agent running it, the default's first.
+ */
+function inheritedAgentModelFor(spec) {
+  const wanted = (spec || '').trim();
+  const agent = agentDrafts.find((a) => a.name === wanted);
+  if (agent) {
+    if (agent.model || CLI_PROVIDERS.includes(agent.executor)) return agent.model || '';
+    return modelEndpoint(agent)?.model || '';
+  }
+  if (wanted === 'default') return defaultConnection()?.model || '';
+  const target = targetById(wanted);
+  if (target) return target.model || '';
+  if (!CLI_PROVIDERS.includes(wanted)) return '';
+  const def = defaultConnection();
+  return ((def?.provider === wanted ? def : llmTargets().find((t) => t.provider === wanted))?.model) || '';
 }
 
 const EMBEDDING_PROVIDER_OPTIONS = [
@@ -2233,7 +2317,7 @@ const EMB_NOTES = {
 };
 
 const LLM_NOTES = {
-  openai: 'Any OpenAI-compatible chat endpoint works. An empty model disables the general LLM features; the deterministic pipeline keeps running.',
+  openai: 'Any OpenAI-compatible endpoint works. Auto prefers the Responses API and falls back to Chat Completions when the endpoint has no such route — reasoning models lose less that way. An empty model disables the general LLM features; the deterministic pipeline keeps running.',
   'codex-cli': 'Uses your existing Codex login for a read-only one-shot request.',
   'claude-cli': 'Uses your existing Claude Code login for one non-interactive turn.',
   'cursor-cli': 'Uses your existing Cursor Agent login in headless print mode.',
@@ -2245,27 +2329,37 @@ const embeddingProviderLabel = (provider) =>
 const activeEmbedding = () =>
   embeddingDrafts.find((e) => e.id === embeddingUse) ?? embeddingDrafts[0] ?? null;
 
+/**
+ * Where a stage runs, as the two things a person reads separately: who runs
+ * it, and which model. They used to share one ellipsised line, which turned
+ * "super-relay · ark/seed-evolving" into "super-relay…ed-evolving".
+ */
+const summaryLine = (t) => (t.model ? `${t.provider} · ${t.model}` : t.provider);
+
 function embeddingSummaryText() {
   const active = activeEmbedding();
-  if (!active) return 'Loading…';
-  if (active.provider === 'local') return `${active.label || active.id} · ${active.dimensions || 384}d`;
-  return active.model ? `${active.label || active.id} · ${active.model}` : 'API model not set';
+  if (!active) return { provider: 'Loading…', model: '' };
+  const name = active.label || active.id;
+  if (active.provider === 'local') return { provider: name, model: `${active.dimensions || 384}d` };
+  return { provider: name, model: active.model || 'API model not set' };
 }
 
 function defaultLlmSummaryText() {
-  if (!defaultLlmDraft) return 'Loading…';
-  const name = defaultLlmDraft.label?.trim() || providerNames[defaultLlmDraft.provider] || defaultLlmDraft.provider;
-  return defaultLlmDraft.model ? `${name} · ${defaultLlmDraft.model}` : name;
+  const entry = defaultConnection();
+  if (!entry) return { provider: 'Loading…', model: '' };
+  return { provider: entry.label?.trim() || providerNames[entry.provider] || entry.provider, model: entry.model || '' };
 }
 
 function routeSummary(prefix) {
   const use = $(`#cfg-${prefix}-use`).value;
   const model = $(`#cfg-${prefix}-model`).value.trim();
-  const connection = connectionById(use);
-  const fallback = defaultLlmDraft?.label?.trim() || 'Default model';
-  const name = connection ? connection.label || connection.id : fallback;
-  const effective = model || connection?.model?.trim() || '';
-  return effective ? `${name} · ${effective}` : name;
+  const target = targetById(use);
+  const fallback = defaultConnection()?.label?.trim() || 'Default model';
+  return {
+    provider: target ? target.label || target.id : fallback,
+    // an inheriting route prints what it inherits, not a blank
+    model: model || inheritedModelFor(use),
+  };
 }
 
 /** Rebuild the Index picker from the configured embedding providers. */
@@ -2278,15 +2372,23 @@ function fillEmbeddingOptions() {
   embeddingUse = select.value;
 }
 
-/** Rebuild the per-route pickers from the current connection list. */
+/**
+ * Rebuild the per-route pickers: the default, the models, then the CLI agents
+ * a stage can call one-shot. Keeps a selection that still exists.
+ */
 function fillRouteOptions() {
+  const def = defaultConnection();
+  const agents = llmTargets().filter((t) => t.agent);
   for (const prefix of ['entity', 'concept', 'document']) {
     const select = $(`#cfg-${prefix}-use`);
     const previous = select.value;
-    select.innerHTML = ['<option value="">Default reasoning model</option>']
+    select.innerHTML = [`<option value="">Default LLM${def ? ` · ${esc(def.label || def.id)}` : ''}</option>`]
       .concat(connectionDrafts.map((c) => `<option value="${esc(c.id)}">${esc(c.label || c.id)}</option>`))
+      .concat(agents.length
+        ? [`<optgroup label="Agents, one call at a time">${agents.map((a) => `<option value="${esc(a.id)}">${esc(a.label)} · ${esc(providerNames[a.provider] ?? a.provider)}</option>`).join('')}</optgroup>`]
+        : [])
       .join('');
-    select.value = connectionDrafts.some((c) => c.id === previous) ? previous : '';
+    select.value = targetById(previous) ? previous : '';
   }
   refreshResearchAgentOptions();
 }
@@ -2323,10 +2425,12 @@ function stageRate(key) {
 function renderStageFlow() {
   $('#stage-flow').innerHTML = PIPELINE_STAGES
     .map((stage, index) => {
+      const target = stageTarget(stage.key);
       const node = `<button type="button" class="stage-node${stage.key === selectedStage ? ' selected' : ''}" data-stage="${stage.key}">
         <span class="stage-node-head"><i class="stage-step ${stage.accent}">${stage.step}</i>${esc(stage.title)}</span>
         <span class="section-badge ${stage.accent === 'accent2' ? 'accent2' : ''}">${esc(stage.badge)}</span>
-        <span class="stage-node-target mono">${esc(stageTarget(stage.key))}</span>
+        <span class="stage-node-target mono" title="${esc(summaryLine(target))}">${esc(target.provider)}</span>
+        <span class="stage-node-model mono" title="${esc(summaryLine(target))}">${esc(target.model || 'its own model')}</span>
         <span class="stage-node-rate mono">${esc(stageRate(stage.key))}</span>
       </button>`;
       return index ? `<span class="stage-arrow">→</span>${node}` : node;
@@ -2338,21 +2442,39 @@ function renderStageFlow() {
 }
 
 function updateConfigSummaries() {
-  $('#pin-answer').textContent = defaultLlmSummaryText();
+  $('#pin-answer').textContent = summaryLine(defaultLlmSummaryText());
   renderStageFlow();
+  paintInheritedPlaceholders();
+}
+
+/**
+ * The greyed text in every Model field that is inheriting. Repainted from
+ * here rather than only on a provider-picker change, because editing the
+ * default connection's own model changes what three stages will run.
+ */
+function paintInheritedPlaceholders() {
+  for (const prefix of ['entity', 'concept', 'document']) {
+    const input = $(`#cfg-${prefix}-model`);
+    if (input) input.placeholder = inheritedModelFor($(`#cfg-${prefix}-use`).value) || 'Optional · use its model';
+  }
+  const research = $('#cfg-research-model');
+  if (research) research.placeholder = inheritedAgentModelFor($('#cfg-research-agent').value) || 'CLI default';
 }
 
 function routeProviderToggle(prefix) {
   const note = $(`#cfg-${prefix}-note`);
-  const connection = connectionById($(`#cfg-${prefix}-use`).value);
-  if (!connection) {
-    const provider = defaultLlmDraft?.provider ?? 'openai';
-    note.innerHTML = `<b>Inherited route.</b> Runs on the default provider (${esc(providerNames[provider] ?? provider)}).`;
-  } else if (connection.provider === 'openai') {
-    note.innerHTML = `<b>${esc(connection.label || connection.id)}</b> · ${esc(connection.baseUrl.trim() || 'no endpoint set')}`;
+  const target = targetById($(`#cfg-${prefix}-use`).value);
+  if (!target) {
+    const def = defaultConnection();
+    note.innerHTML = def
+      ? `<b>Inherited route.</b> Runs on the default LLM (${esc(def.label || def.id)}).`
+      : '<b>Inherited route.</b> Nothing to run on yet — add a model in section 01.';
+  } else if (target.provider === 'openai') {
+    note.innerHTML = `<b>${esc(target.label || target.id)}</b> · ${esc((target.baseUrl || '').trim() || 'no endpoint set')}`;
   } else {
-    const meta = cliMeta[connection.provider];
-    note.innerHTML = `<b>${esc(connection.label || connection.id)}</b> · ${esc(meta ? meta.command : connection.provider)}`;
+    // a CLI agent, called one-shot with its own path
+    const meta = cliMeta[target.provider];
+    note.innerHTML = `<b>${esc(target.label || target.id)}</b> · agent, one call at a time · ${esc(target.cliPath || (meta ? meta.command : target.provider))}`;
   }
   updateConfigSummaries();
 }
@@ -2360,27 +2482,27 @@ function routeProviderToggle(prefix) {
 function fillRoute(prefix, route = {}) {
   const use = route.use === 'default' ? '' : route.use || '';
   const select = $(`#cfg-${prefix}-use`);
-  select.value = connectionById(use) ? use : '';
+  select.value = targetById(use) ? use : '';
   $(`#cfg-${prefix}-model`).value = route.model || '';
   routeProviderToggle(prefix);
 }
-
-const PROVIDER_OPTIONS = ['openai', 'codex-cli', 'claude-cli', 'cursor-cli'];
 
 const optionsFor = (pairs, selected) =>
   pairs.map(([v, l]) => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(l)}</option>`).join('');
 
 /** The shared row chrome; `fields` is the form the chevron opens. */
-function providerRow({ kind, accent, id, label, placeholder, providerLabel, summary, isDefault, removable, fields }) {
+function providerRow({ kind, accent, id, label, placeholder, providerLabel, summary, isDefault, removable, promotable, fields }) {
   const open = expandedProviders.has(id);
   return `<div class="provider-row${open ? ' open' : ''}" data-id="${esc(id)}" data-kind="${kind}">
     <div class="provider-line">
       <button type="button" class="provider-toggle" aria-expanded="${open}" title="${open ? 'Collapse' : 'Expand'}">${open ? '▾' : '▸'}</button>
       <span class="section-badge ${accent === 'accent2' ? 'accent2' : ''}">${esc(kind === 'embedding' ? 'embed' : 'llm')}</span>
       <input class="provider-name" data-field="label" value="${esc(label || '')}" placeholder="${esc(placeholder)}" />
-      <span>${isDefault ? `<span class="section-badge ${accent === 'accent2' ? 'accent2' : ''}">default</span>` : ''}</span>
+      <span>${isDefault
+        ? `<span class="section-badge ${accent === 'accent2' ? 'accent2' : ''}">default</span>`
+        : promotable ? '<button type="button" class="hint-action provider-default" title="Every job that names no provider of its own moves here">make default</button>' : ''}</span>
       <span class="provider-kind">${esc(providerLabel)}</span>
-      <span class="provider-model mono">${esc(summary || 'no model set')}</span>
+      <span class="provider-model mono" title="${esc(summary || '')}">${esc(summary || 'no model set')}</span>
       <span class="provider-id mono">${esc(id)}</span>
       <button type="button" class="ghost provider-remove"${removable ? '' : ' disabled'} title="${removable ? 'Remove this provider' : 'This provider cannot be removed'}">✕</button>
     </div>
@@ -2401,16 +2523,19 @@ function embeddingFields(entry) {
     <p class="cfg-callout">${esc(EMB_NOTES[entry.provider] ?? EMB_NOTES.openai)}</p>`;
 }
 
+/**
+ * An LLM row is a model endpoint: where it is, its key, its wire and which
+ * model. The coding-agent CLIs that used to be picked here are agents now, in
+ * the table below, with their path and effort.
+ */
 function llmFields(entry, route) {
-  const api = entry.provider === 'openai';
   return `<div class="cfg-grid cfg-grid-2">
-      <label>Provider<select data-field="provider">${optionsFor(PROVIDER_OPTIONS.map((p) => [p, providerNames[p] ?? p]), entry.provider)}</select></label>
-      <label>Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="${api ? 'gpt-4.1-mini' : 'Use CLI default'}" />${modelChevron(route)}</span></label>
-      ${api ? `<label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1" /></label>
-      <label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY" /></label>`
-    : `<label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(entry.cliPath || '')}" placeholder="Default: ${esc(cliMeta[entry.provider]?.path ?? '')}" /></label>`}
+      <label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1" /></label>
+      <label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY" /></label>
+      <label>Protocol<select data-field="protocol">${optionList(PROTOCOL_OPTIONS, entry.protocol || 'auto')}</select></label>
+      <label class="cfg-span-2">Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="gpt-4.1-mini" />${modelChevron(route)}</span></label>
     </div>
-    <p class="cfg-callout">${esc(LLM_NOTES[entry.provider] ?? LLM_NOTES.openai)}</p>`;
+    <p class="cfg-callout">${esc(LLM_NOTES.openai)}</p>`;
 }
 
 function renderProviders() {
@@ -2429,21 +2554,8 @@ function renderProviders() {
       fields: embeddingFields(e),
     }));
 
-  if (defaultLlmDraft) {
-    rows.push(providerRow({
-      kind: 'llm',
-      accent: 'accent2',
-      id: 'default',
-      label: defaultLlmDraft.label,
-      placeholder: providerNames[defaultLlmDraft.provider] ?? 'Name this provider',
-      providerLabel: providerNames[defaultLlmDraft.provider] ?? defaultLlmDraft.provider,
-      summary: defaultLlmDraft.model,
-      isDefault: true,
-      removable: false,
-      fields: llmFields(defaultLlmDraft, 'llm'),
-    }));
-  }
-
+  // the default is an ordinary row that `llmUse` points at, so there is one
+  // LLM row builder rather than one for the default and one for the rest
   for (const c of connectionDrafts) {
     rows.push(providerRow({
       kind: 'llm',
@@ -2453,8 +2565,10 @@ function renderProviders() {
       placeholder: 'Name this provider',
       providerLabel: providerNames[c.provider] ?? c.provider,
       summary: c.model,
-      isDefault: false,
-      removable: true,
+      isDefault: c.id === (defaultConnection()?.id ?? ''),
+      // something has to answer, so the last one stays
+      removable: connectionDrafts.length > 1,
+      promotable: true,
       fields: llmFields(c, `connection:${c.id}`),
     }));
   }
@@ -2465,7 +2579,6 @@ function renderProviders() {
 
 /** The draft one row edits, whichever of the three lists it came from. */
 function providerDraft(id) {
-  if (id === 'default') return defaultLlmDraft;
   return embeddingDrafts.find((e) => e.id === id) ?? connectionById(id);
 }
 
@@ -2479,8 +2592,10 @@ function addConnection() {
     provider: 'openai',
     baseUrl: 'https://api.openai.com/v1',
     apiKey: '',
+    protocol: 'auto',
     model: '',
     cliPath: '',
+    effort: 'default',
   });
   expandedProviders.add(id);
   renderProviders();
@@ -2518,8 +2633,12 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     loadedConfig = cfg;
     embeddingDrafts = (cfg.embeddingProviders ?? []).map((e) => ({ ...e }));
     embeddingUse = cfg.embeddingUse || embeddingDrafts[0]?.id || '';
-    defaultLlmDraft = { ...cfg.llm };
     connectionDrafts = (cfg.connections ?? []).map((c) => ({ ...c }));
+    llmUse = cfg.llmUse || connectionDrafts[0]?.id || '';
+    // agents before routes: a stage may run on a CLI agent, and a route
+    // filled before its agent exists would read — and then save — as the default
+    await loadAgentsList();
+    if (activeWorkspace()?.id !== workspaceId) return;
     renderProviders();
     fillRouteOptions();
     fillRoute('entity', cfg.extraction?.entityLlm);
@@ -2532,7 +2651,6 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-ingest-concurrency').value = cfg.ingest?.concurrency ?? 4;
     $('#cfg-ingest-convert').value = cfg.ingest?.convertConcurrency ?? 2;
     $('#cfg-emb-batch').value = activeEmbedding()?.batchSize ?? 32;
-    await loadAgentsList();
     fillResearchForm(cfg.research ?? {});
     fillChatForm(cfg.chat ?? {});
     renderAgents();
@@ -2587,8 +2705,8 @@ function gatherConfig() {
       concurrency: Number($('#cfg-ingest-concurrency').value) || undefined,
       convertConcurrency: Number($('#cfg-ingest-convert').value) || undefined,
     },
-    llm: { ...defaultLlmDraft, label: (defaultLlmDraft?.label || '').trim() },
     connections: connectionDrafts.map((c) => ({ ...c, label: c.label.trim() || c.id })),
+    llmUse,
     extraction: {
       entityLlm: gatherRoute('entity'),
       conceptLlm: gatherRoute('concept'),
@@ -2606,10 +2724,15 @@ function gatherConfig() {
 /* ---------- 03 · agents: who runs a research job or a chat turn ---------- */
 
 /**
- * Named agents. Each is its own file under `playbooks/agents/`, so unlike the
- * rest of this screen they are written the moment one is added or removed —
- * Research cannot point at a name that does not exist yet. Field edits still
- * wait for Save & apply, along with everything else.
+ * Agents, one row each whichever runtime they have: the built-in deepagents
+ * loop on one of the models above, or a coding-agent CLI that brings its own
+ * loop, path and model. The CLIs used to sit among the models, which made
+ * "cursor" the default *LLM* and let the deep agent quietly run Cursor.
+ *
+ * Each agent is its own file under `playbooks/agents/`, so unlike the rest of
+ * this screen they are written the moment one is added or removed — Research
+ * cannot point at a name that does not exist yet. Field edits still wait for
+ * Save & apply, along with everything else.
  */
 let agentDrafts = [];
 const expandedAgents = new Set();
@@ -2619,73 +2742,120 @@ const AGENT_EFFORTS = [
   ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max'],
 ];
 const AGENT_WEB = [['inherit', 'Follow review.external'], ['on', 'On (within review.external)'], ['off', 'Off']];
+const AGENT_TYPES = { 'claude-cli': 'Claude Code', 'codex-cli': 'Codex', 'cursor-cli': 'Cursor' };
+
+const isCliAgent = (agent) => CLI_PROVIDERS.includes(agent.executor);
 
 function agentById(name) {
   return agentDrafts.find((a) => a.name === name);
 }
 
-function executorLabel(executor) {
-  if (executor === 'default') return 'Default LLM provider';
-  const connection = connectionById(executor);
-  if (connection) return connection.label || connection.id;
-  return providerNames[executor] ?? executor;
+/** Where an agent runs, by the names the tables use. */
+function agentRunsOn(agent) {
+  if (isCliAgent(agent)) {
+    const command = cliMeta[agent.executor]?.path ?? agent.executor;
+    return agent.cliPath ? { name: agent.cliPath, help: agent.cliPath } : { name: 'From PATH', help: `${command}, found on the service PATH` };
+  }
+  if (agent.executor === 'default') {
+    const def = defaultConnection();
+    const name = def ? def.label || def.id : 'Default LLM';
+    return { name, note: 'follows default', help: `Follows the default LLM — ${name} for now. Make another model the default and this agent moves with it.` };
+  }
+  const connection = connectionById(agent.executor);
+  return connection ? { name: connection.label || connection.id, help: connection.baseUrl || '' } : { name: agent.executor || 'Not configured', help: '' };
 }
 
-function executorOptions(selected) {
-  const opts = [`<option value="default"${selected === 'default' ? ' selected' : ''}>Default LLM provider</option>`];
-  for (const p of CLI_PROVIDERS) {
-    opts.push(`<option value="${p}"${p === selected ? ' selected' : ''}>${esc(providerNames[p])} · from PATH</option>`);
-  }
-  for (const c of connectionDrafts) {
-    opts.push(`<option value="${esc(c.id)}"${c.id === selected ? ' selected' : ''}>${esc(c.label || c.id)}</option>`);
-  }
-  return opts.join('');
+/** The model a row runs: its own, else what its model endpoint brings. */
+function agentModelSummary(agent) {
+  if (agent.model) return { text: agent.model, help: agent.model, pinned: true };
+  const endpoint = modelEndpoint(agent);
+  if (endpoint?.model) return { text: endpoint.model, help: `Inherited from ${endpoint.label || endpoint.id}` };
+  return { text: isCliAgent(agent) ? 'CLI default' : 'its own default', help: '' };
 }
 
-function agentFields(agent) {
+/** Why an agent cannot run, in words that say what to change; '' when it can. */
+function agentProblem(agent) {
+  if (isCliAgent(agent)) return '';
+  const endpoint = modelEndpoint(agent);
+  if (agent.executor === 'default' && !endpoint) return 'deepagents runs on a model, and the default is a CLI agent — pick a model for it.';
+  if (!endpoint) return 'Its executor cannot run here — pick another one.';
+  if (!endpoint.model && !agent.model) return `${endpoint.label || endpoint.id} has no model set.`;
+  return '';
+}
+
+function deepagentsFields(agent) {
+  const def = defaultConnection();
+  const options = [`<option value="default"${agent.executor === 'default' ? ' selected' : ''}>Follow the default LLM${def ? ` · ${esc(def.label || def.id)}` : ''}</option>`]
+    .concat(connectionDrafts.map((c) => `<option value="${esc(c.id)}"${c.id === agent.executor ? ' selected' : ''}>${esc(c.label || c.id)}</option>`))
+    .join('');
   return `<div class="cfg-grid cfg-grid-2">
-      <label>Runs on<select data-field="executor">${executorOptions(agent.executor)}</select></label>
-      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="Its own default" />${modelChevron(agent.executor === 'default' ? 'llm' : `connection:${agent.executor}`)}</span></label>
-      <label>Reasoning effort<select data-field="effort">${optionList(AGENT_EFFORTS, agent.effort)}</select></label>
+      <label>Runs on<select data-field="executor">${options}</select></label>
+      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="${esc(modelEndpoint(agent)?.model || 'Its own default')}" />${modelChevron(executorModelRoute(agent.name))}</span></label>
+      <label class="cfg-span-2">Description<input data-field="description" value="${esc(agent.description || '')}" placeholder="When to pick this agent" /></label>
+    </div>
+    <p class="cfg-callout">The built-in deepagents loop runs inside the service on this model. It has no reasoning-effort switch and no web tool.</p>
+    ${agentLimits(agent)}`;
+}
+
+function cliFields(agent) {
+  const cliOptions = CLI_PROVIDERS.map((p) => `<option value="${p}"${p === agent.executor ? ' selected' : ''}>${esc(providerNames[p])}</option>`).join('');
+  return `<div class="cfg-grid cfg-grid-2">
+      <label>CLI<select data-field="executor">${cliOptions}</select></label>
+      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="Use CLI default" />${modelChevron(executorModelRoute(agent.name))}</span></label>
+      <label>Reasoning effort<select data-field="effort">${optionList(AGENT_EFFORTS, agent.effort || 'default')}</select></label>
       <label>Web access<select data-field="web">${optionList(AGENT_WEB, agent.tools?.web ?? 'inherit')}</select></label>
+      <label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(agent.cliPath || '')}" placeholder="Default: ${esc(cliMeta[agent.executor]?.path ?? '')} from PATH" /></label>
+      <label class="cfg-span-2">Description<input data-field="description" value="${esc(agent.description || '')}" placeholder="When to pick this agent" /></label>
+    </div>
+    <p class="cfg-callout">${esc(LLM_NOTES[agent.executor] ?? '')}</p>
+    ${agentLimits(agent)}
+    ${agent.name === llmUse ? '' : '<p class="cfg-callout"><button type="button" class="hint-action agent-default">make default</button> Jobs that name no model run on this CLI instead, one call at a time — for a machine with no model endpoint.</p>'}`;
+}
+
+/** What every agent has, whichever runtime: limits, tool grants, the prompt, and who reads them. */
+function agentLimits(agent) {
+  return `<div class="cfg-grid cfg-grid-2">
       <label>Turns per session<input data-field="maxTurns" type="number" min="0" step="1" value="${esc(agent.maxTurns ?? 0)}" placeholder="0 = the caller's default" /></label>
       <label>Timeout (minutes)<input data-field="timeoutMinutes" type="number" min="0" step="1" value="${esc(Math.round((agent.timeoutMs ?? 0) / 60000))}" placeholder="0 = the caller's default" /></label>
-      <label class="cfg-span-2">Description<input data-field="description" value="${esc(agent.description || '')}" placeholder="When to pick this agent" /></label>
     </div>
     <div class="cfg-checks">
       <label class="cfg-check"><input data-field="write" type="checkbox"${agent.tools?.write ? ' checked' : ''} /> Writes pages (knode_write / knode_commit)</label>
       <label class="cfg-check"><input data-field="files" type="checkbox"${agent.tools?.files ? ' checked' : ''} /> Reads files (Read / Grep / Glob)</label>
     </div>
-    <label class="agent-prompt">System prompt<textarea data-field="prompt" rows="6" class="mono" spellcheck="false" placeholder="Empty = the research protocol the run workspace already carries">${esc(agent.prompt || '')}</textarea></label>
-    <p class="cfg-callout">Stored at <span class="mono">${esc(agent.path || '')}</span>.</p>`;
+    <label class="agent-prompt">System prompt<textarea data-field="prompt" rows="6" class="mono" spellcheck="false" placeholder="Empty = the protocol the run workspace already carries">${esc(agent.prompt || '')}</textarea></label>
+    <p class="cfg-callout">Stored at <span class="mono">${esc(agent.path || '')}</span>. Ask runs with these settings; a research run takes effort, turns, timeout, tools and prompt from its profile in section 03 instead.</p>`;
 }
 
 function renderAgents() {
   const host = $('#cfg-agents');
   if (!agentDrafts.length) {
-    host.innerHTML = '<p class="cfg-callout">No agents yet — add one from a template: a general deep agent for Chat, or a deep-research agent that writes wiki pages.</p>';
+    host.innerHTML = '<p class="cfg-callout">No agents yet — add one: deepagents on one of the models above, or a coding-agent CLI on this machine.</p>';
     return;
   }
   host.innerHTML = agentDrafts
     .map((agent) => {
-      const deep = agent.kind === 'deep-research';
+      const cli = isCliAgent(agent);
       const open = expandedAgents.has(agent.name);
+      const where = agentRunsOn(agent);
+      const model = agentModelSummary(agent);
+      const problem = agentProblem(agent);
       const uses = [
+        cli && agent.name === llmUse ? '<span class="section-badge">default</span>' : '',
         $('#cfg-research-agent')?.value === agent.name ? '<span class="section-badge accent2">research</span>' : '',
-        $('#cfg-chat-agent')?.value === agent.name ? '<span class="section-badge">chat</span>' : '',
+        $('#cfg-chat-agent')?.value === agent.name ? '<span class="section-badge">ask</span>' : '',
       ].join('');
       return `<div class="provider-row${open ? ' open' : ''}" data-agent="${esc(agent.name)}">
         <div class="provider-line">
           <button type="button" class="provider-toggle agent-toggle" aria-expanded="${open}">${open ? '▾' : '▸'}</button>
-          <span class="section-badge${deep ? ' accent2' : ''}">${deep ? 'deep research' : 'general'}</span>
+          <span class="section-badge${cli ? '' : ' accent2'}">${esc(cli ? AGENT_TYPES[agent.executor] : 'deepagents')}</span>
           <input class="provider-name" data-field="title" value="${esc(agent.title || '')}" placeholder="Name this agent" />
           <span>${uses}</span>
-          <span class="provider-kind">${esc(executorLabel(agent.executor))}</span>
-          <span class="provider-model mono">${esc(agent.model || 'its own default')}</span>
-          <span class="provider-id mono">${agent.runnable ? '' : '⚠ '}${esc(agent.name)}</span>
+          <span class="provider-kind" title="${esc(where.help)}">${esc(where.name)}${where.note ? ` <span class="soft">· ${esc(where.note)}</span>` : ''}</span>
+          <span class="provider-model mono${model.pinned ? ' pinned' : ''}" title="${esc(model.help)}">${esc(model.text)}</span>
+          <span class="provider-id mono">${problem ? `<span title="${esc(problem)}">⚠</span> ` : ''}${esc(agent.name)}</span>
           <button type="button" class="ghost agent-remove" title="${agent.builtin ? 'Reset this template to its built-in' : 'Remove this agent'}">${agent.builtin ? '⟲' : '✕'}</button>
         </div>
-        ${open ? `<div class="provider-detail">${agentFields(agent)}</div>` : ''}
+        ${open ? `<div class="provider-detail">${cli ? cliFields(agent) : deepagentsFields(agent)}</div>` : ''}
       </div>`;
     })
     .join('');
@@ -2699,24 +2869,34 @@ async function loadAgentsList() {
     agentDrafts = [];
   }
   renderAgents();
-  refreshResearchAgentOptions();
+  // a stage and the research pickers may name a CLI agent
+  fillRouteOptions();
 }
 
-/** A new agent is written straight away: Research cannot name what has no file. */
-async function addAgent(kind) {
-  const base = kind === 'deep-research' ? 'research' : 'agent';
-  let suffix = agentDrafts.length + 1;
-  while (agentDrafts.some((a) => a.name === `${base}-${suffix}`)) suffix += 1;
+/**
+ * A new agent is written straight away: Research cannot name what has no file.
+ * deepagents follows the default LLM while the default is a model; when it is
+ * a CLI agent there is nothing to follow, so the first model is pinned.
+ */
+async function addAgent(runtime) {
+  const cli = CLI_PROVIDERS.includes(runtime);
+  const base = cli ? runtime.replace(/-cli$/, '') : 'agent';
+  const taken = new Set([...agentDrafts.map((a) => a.name), ...connectionDrafts.map((c) => c.id)]);
+  let suffix = 1;
+  while (taken.has(`${base}-${suffix}`)) suffix += 1;
   const name = `${base}-${suffix}`;
+  const def = defaultConnection();
+  const executor = cli ? runtime : def?.provider === 'openai' ? 'default' : (connectionDrafts[0]?.id ?? 'default');
   try {
     await api(`/api/agents/${name}`, {
       method: 'PUT',
       body: JSON.stringify({
         agent: {
-          kind,
-          title: kind === 'deep-research' ? 'New research agent' : 'New agent',
-          executor: 'default',
-          tools: { write: kind === 'deep-research', files: true, web: 'inherit' },
+          kind: 'general',
+          title: cli ? providerNames[runtime] : 'New deepagents agent',
+          executor,
+          // what Ask needs to take notes; a CLI answers with its own tools anyway
+          tools: { write: true, files: true, web: 'inherit' },
         },
       }),
     });
@@ -2731,13 +2911,22 @@ async function removeAgent(name) {
   try {
     const { reset } = await api(`/api/agents/${name}`, { method: 'DELETE' });
     expandedAgents.delete(name);
+    // the service moves research, Ask, a pipeline route and the default off a
+    // deleted agent, so read those back rather than keep a name that is gone
+    const cfg = reset ? null : await api('/api/config');
+    if (cfg) llmUse = cfg.llmUse || llmUse;
     await loadAgentsList();
-    // the service moves research/chat off a deleted agent, so read them back
-    if (!reset) {
-      const cfg = await api('/api/config');
+    if (cfg) {
       $('#cfg-research-agent').value = cfg.research?.agent ?? '';
       $('#cfg-chat-agent').value = cfg.chat?.agent ?? '';
+      for (const prefix of ['entity', 'concept', 'document']) {
+        const use = cfg.extraction?.[`${prefix}Llm`]?.use ?? '';
+        $(`#cfg-${prefix}-use`).value = targetById(use) ? use : '';
+        routeProviderToggle(prefix);
+      }
+      renderProviders();
       refreshResearchAgentOptions();
+      renderAgents();
     }
   } catch (e) {
     $('#cfg-status').innerHTML = `<div class="cfg-line bad">could not remove the agent: ${esc(e.message)}</div>`;
@@ -2755,6 +2944,7 @@ async function saveAgents() {
           description: agent.description ?? '',
           kind: agent.kind,
           executor: agent.executor,
+          cliPath: agent.cliPath ?? '',
           model: agent.model ?? '',
           effort: agent.effort ?? 'default',
           tools: agent.tools ?? { write: false, files: true, web: 'inherit' },
@@ -2768,13 +2958,16 @@ async function saveAgents() {
 }
 
 for (const id of ['#cfg-research-agent', '#cfg-chat-agent']) {
-  $(id).addEventListener('change', renderAgents);
+  $(id).addEventListener('change', () => {
+    renderAgents();
+    paintInheritedPlaceholders();
+  });
 }
 
 $('#cfg-add-agent').addEventListener('click', (event) => {
   showMenuUnder(event.currentTarget, [
-    { label: 'General agent', run: () => addAgent('general') },
-    { label: 'Deep research agent', run: () => addAgent('deep-research') },
+    { label: 'deepagents · on the default LLM', run: () => addAgent('deepagents') },
+    ...CLI_PROVIDERS.map((p) => ({ label: providerNames[p], run: () => addAgent(p) })),
   ]);
 });
 
@@ -2782,11 +2975,22 @@ $('#cfg-agents').addEventListener('input', (event) => {
   const row = event.target.closest?.('.provider-row');
   const field = event.target.dataset?.field;
   const agent = row && agentById(row.dataset.agent);
-  if (!agent || !field) return;
+  if (!agent || !field || event.target.type === 'checkbox' || event.target.tagName === 'SELECT') return;
   if (field === 'timeoutMinutes') agent.timeoutMs = (Number(event.target.value) || 0) * 60000;
   else if (field === 'maxTurns') agent.maxTurns = Number(event.target.value) || 0;
   else agent[field] = event.target.value;
-  if (field === 'title') refreshResearchAgentOptions();
+  // the model list is the CLI's at this path, not at the one it was drawn with
+  if (field === 'cliPath') row.querySelector('.model-chevron')?.setAttribute('data-cli-path', agent.cliPath);
+  // a CLI agent's name and model are what a stage or the default shows
+  if (field === 'title') fillRouteOptions();
+  if (field === 'model' || field === 'title') {
+    const cell = row.querySelector('.provider-model');
+    const summary = agentModelSummary(agent);
+    cell.textContent = summary.text;
+    cell.title = summary.help;
+    cell.classList.toggle('pinned', Boolean(summary.pinned));
+    updateConfigSummaries();
+  }
 });
 
 $('#cfg-agents').addEventListener('change', (event) => {
@@ -2804,7 +3008,11 @@ $('#cfg-agents').addEventListener('change', (event) => {
   }
   if (field !== 'executor' && field !== 'effort') return;
   agent[field] = event.target.value;
-  if (field === 'executor') renderAgents();
+  if (field === 'executor') {
+    renderAgents();
+    fillRouteOptions();
+    updateConfigSummaries();
+  }
 });
 
 $('#cfg-agents').addEventListener('click', (event) => {
@@ -2816,13 +3024,25 @@ $('#cfg-agents').addEventListener('click', (event) => {
     renderAgents();
     return;
   }
+  if (event.target.classList.contains('agent-default')) {
+    // jobs that name no model run on this CLI agent now
+    llmUse = name;
+    renderProviders();
+    renderAgents();
+    fillRouteOptions();
+    updateConfigSummaries();
+    return;
+  }
   if (event.target.classList.contains('agent-remove')) removeAgent(name);
 });
 
 /* ---------- Settings · 04 research: pipeline, initialization, chat, profile ---------- */
 const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli'];
+const PROTOCOL_OPTIONS = [
+  ['auto', 'Auto (Responses, else Chat)'], ['responses', 'Responses only'], ['chat', 'Chat Completions only'],
+];
 const EFFORT_OPTIONS = [
-  ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (claude; codex → xhigh, cursor → high)'],
+  ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (claude & codex; cursor → high)'],
 ];
 const ROLE_PHASES = [
   ['plan', 'Plan · outline the page'], ['research', 'Research · one section'], ['synthesize', 'Synthesize · write the page'], ['review', 'Review · critique'], ['revise', 'Revise · fix issues'],
@@ -2839,32 +3059,41 @@ function optionList(pairs, selected) {
 // `fallbackLabel` is the meaning of the empty value: "follow the one above" for
 // chat and roles. The research agent has no such fallback any more — it gets
 // null, and an empty value is shown as the unconfigured state it is.
+//
+// The choices are the agents in section 01, each saying which runtime it is. A
+// config written before agents may name a bare CLI, the default or a model
+// straight; those keep resolving, so the one in use stays listed — only that one.
 function agentOptions(selected, fallbackLabel, kind = '') {
   const opts = fallbackLabel
     ? [`<option value="">${esc(fallbackLabel)}</option>`]
     : [`<option value=""${selected ? ' disabled' : ' selected'}>Not configured — pick an agent</option>`];
-  // the named agents from section 03 first, the kind this picker is for on top
+  // the kind this picker is for on top
   const named = [...agentDrafts].sort((a, b) => Number(b.kind === kind) - Number(a.kind === kind));
   for (const a of named) {
-    opts.push(`<option value="${esc(a.name)}"${a.name === selected ? ' selected' : ''}>${esc(a.title || a.name)}</option>`);
+    const runtime = isCliAgent(a) ? providerNames[a.executor] : 'deepagents';
+    opts.push(`<option value="${esc(a.name)}"${a.name === selected ? ' selected' : ''}>${esc(a.title || a.name)} · ${esc(runtime)}</option>`);
   }
-  // a config written before named agents points straight at an executor
-  for (const p of CLI_PROVIDERS) opts.push(`<option value="${p}"${p === selected ? ' selected' : ''}>${esc(providerNames[p])} · from PATH</option>`);
-  // 'default' is the section-01 connection named explicitly; a CLI there runs as
-  // a CLI, an OpenAI-compatible endpoint runs the built-in agent
-  const provider = defaultLlmDraft?.provider;
-  opts.push(`<option value="default"${selected === 'default' ? ' selected' : ''}>Default LLM provider${provider ? ` · ${esc(providerNames[provider] || provider)}` : ''}</option>`);
-  for (const c of connectionDrafts) {
-    const how = CLI_PROVIDERS.includes(c.provider) ? providerNames[c.provider] : 'built-in agent';
-    opts.push(`<option value="${esc(c.id)}"${c.id === selected ? ' selected' : ''}>${esc(c.label || c.id)} · ${esc(how)}</option>`);
+  if (selected && !agentById(selected)) {
+    let legacy = selected;
+    if (selected === 'default') {
+      const def = defaultConnection();
+      legacy = `Default LLM${def ? ` · ${def.label || def.id}` : ''}`;
+    } else if (CLI_PROVIDERS.includes(selected)) {
+      legacy = `${providerNames[selected]} · from PATH`;
+    } else if (connectionById(selected)) {
+      legacy = `${connectionById(selected).label || selected} · deepagents`;
+    }
+    opts.push(`<option value="${esc(selected)}" selected>${esc(legacy)}</option>`);
   }
   return opts.join('');
 }
 
-/** Only the CLIs ship a web tool; the built-in agent searches the base only. */
+/** Only the CLIs ship a web tool; deepagents on a model searches the base only. */
 function agentWebCapable(spec) {
+  const agent = agentById(spec);
+  if (agent) return isCliAgent(agent);
   if (CLI_PROVIDERS.includes(spec)) return true;
-  const provider = spec === 'default' ? defaultLlmDraft?.provider : connectionById(spec)?.provider;
+  const provider = spec === 'default' ? defaultConnection()?.provider : targetById(spec)?.provider;
   return CLI_PROVIDERS.includes(provider);
 }
 
@@ -2878,7 +3107,7 @@ function refreshResearchAgentOptions() {
   const chatSelect = $('#cfg-chat-agent');
   if (chatSelect) {
     const chatCurrent = chatSelect.value;
-    chatSelect.innerHTML = agentOptions(chatCurrent, 'The research agent above', 'general');
+    chatSelect.innerHTML = agentOptions(chatCurrent, 'The research agent, else the default provider', 'general');
     chatSelect.value = chatCurrent;
     if (chatSelect.value !== chatCurrent) chatSelect.value = '';
   }
@@ -2894,6 +3123,7 @@ function fillResearchForm(research) {
   $('#cfg-research-agent').innerHTML = agentOptions(research.agent || '', null, 'deep-research');
   $('#cfg-research-agent').value = research.agent || '';
   $('#cfg-research-model').value = research.model || '';
+  paintInheritedPlaceholders();
   $('#cfg-research-pipeline').value = research.pipeline || 'team';
   $('#cfg-research-concurrency').value = research.concurrency ?? 1;
   $('#cfg-research-maxturns').value = research.maxTurns ?? 40;
@@ -2965,7 +3195,7 @@ function renderRoles() {
       <div class="cfg-grid cfg-grid-3">
         <label>Phase<select data-field="phase">${optionList(ROLE_PHASES, r.phase)}</select></label>
         <label>Runs on<select data-field="agent">${agentOptions(r.agent || '', 'The research agent above')}</select></label>
-        <label>Model<input data-field="model" value="${esc(r.model || '')}" placeholder="Agent's model" /></label>
+        <label>Model<input data-field="model" value="${esc(r.model || '')}" placeholder="${esc(inheritedAgentModelFor(r.agent || $('#cfg-research-agent').value) || "Agent's model")}" /></label>
         <label>Effort<select data-field="effort">${optionList([['default', 'Profile default'], ...EFFORT_OPTIONS.slice(1)], r.effort)}</select></label>
         <label>Web tools<select data-field="web">${optionList(ROLE_WEB, r.tools.web)}</select></label>
         <label>Turns per session<input data-field="maxTurns" type="number" min="0" step="1" value="${r.maxTurns || ''}" placeholder="Default" /></label>
@@ -3032,28 +3262,20 @@ function gatherResearchConfig() {
   };
 }
 
+// effort, tools, turn cap, timeout and the extra prompt belong to the agent
+// definition now; what is left here is a property of the conversation.
 function fillChatForm(chat) {
-  $('#cfg-chat-agent').innerHTML = agentOptions(chat.agent || '', 'The research agent above', 'general');
+  $('#cfg-chat-agent').innerHTML = agentOptions(chat.agent || '', 'The research agent, else the default provider', 'general');
   $('#cfg-chat-agent').value = chat.agent || '';
-  $('#cfg-chat-model').value = chat.model || '';
-  $('#cfg-chat-effort').innerHTML = optionList(EFFORT_OPTIONS, chat.effort || 'default');
-  $('#cfg-chat-web').value = chat.web || 'inherit';
-  $('#cfg-chat-maxturns').value = chat.maxTurns ?? 30;
-  $('#cfg-chat-timeout').value = Math.max(1, Math.round((chat.timeoutMs ?? 600000) / 60000));
   $('#cfg-chat-history').value = chat.historyTurns ?? 12;
-  $('#cfg-chat-keep').value = chat.keep ?? 50;
+  $('#cfg-chat-keep').value = chat.keep ?? 200;
 }
 
 function gatherChatConfig() {
   return {
     agent: $('#cfg-chat-agent').value,
-    model: $('#cfg-chat-model').value.trim(),
-    effort: $('#cfg-chat-effort').value,
-    web: $('#cfg-chat-web').value,
-    maxTurns: Number($('#cfg-chat-maxturns').value) || 30,
-    timeoutMs: (Number($('#cfg-chat-timeout').value) || 10) * 60000,
     historyTurns: Math.max(0, Number($('#cfg-chat-history').value) || 0),
-    keep: Number($('#cfg-chat-keep').value) || 50,
+    keep: Number($('#cfg-chat-keep').value) || 200,
   };
 }
 
@@ -3268,8 +3490,8 @@ for (const id of ['#cfg-ingest-convert', '#cfg-ingest-concurrency', '#cfg-emb-ba
 
 $('#cfg-add-provider').addEventListener('click', (event) => {
   showMenuUnder(event.currentTarget, [
-    { label: 'LLM provider', run: addConnection },
-    { label: 'Embedding provider', run: addEmbeddingProvider },
+    { label: 'LLM · OpenAI-compatible API', run: addConnection },
+    { label: 'Embedding', run: addEmbeddingProvider },
   ]);
 });
 
@@ -3288,9 +3510,13 @@ $('#cfg-providers').addEventListener('input', (event) => {
   const found = rowDraft(event.target);
   if (!field || !found) return;
   found.draft[field] = field === 'dimensions' ? Number(event.target.value) || undefined : event.target.value;
-  if (field === 'label') {
-    fillRouteOptions();
-    found.row.querySelector('.provider-model').textContent = found.draft.model || 'no model set';
+  if (field === 'label') fillRouteOptions();
+  // the row's own summary column used to refresh on a label edit and never on
+  // a model one, so a typed model stayed invisible until the next redraw
+  if (field === 'label' || field === 'model') {
+    const cell = found.row.querySelector('.provider-model');
+    cell.textContent = found.draft.model || 'no model set';
+    cell.title = found.draft.model || '';
   }
   updateConfigSummaries();
 });
@@ -3306,7 +3532,9 @@ $('#cfg-providers').addEventListener('change', (event) => {
   if (field !== 'provider') return;
   found.draft.provider = event.target.value;
   // the list came from the provider that is no longer selected
-  modelLists.delete(found.row.dataset.kind === 'embedding' ? `embedding:${found.row.dataset.id}` : (found.row.dataset.id === 'default' ? 'llm' : `connection:${found.row.dataset.id}`));
+  modelLists.delete(modelListKey(found.row.dataset.kind === 'embedding'
+    ? { route: `embedding:${found.row.dataset.id}` }
+    : { route: `connection:${found.row.dataset.id}` }));
   // an endpoint that no longer applies would otherwise be saved and tested
   if (found.row.dataset.kind === 'embedding' && found.draft.provider === 'local') {
     found.draft.baseUrl = '';
@@ -3332,6 +3560,13 @@ $('#cfg-providers').addEventListener('click', (event) => {
     return;
   }
 
+  if (event.target.classList.contains('provider-default')) {
+    llmUse = id;
+    renderProviders();
+    updateConfigSummaries();
+    return;
+  }
+
   if (!event.target.classList.contains('provider-remove') || event.target.disabled) return;
   expandedProviders.delete(id);
   if (row.dataset.kind === 'embedding') {
@@ -3348,8 +3583,15 @@ $('#cfg-providers').addEventListener('click', (event) => {
   }
 
   connectionDrafts = connectionDrafts.filter((c) => c.id !== id);
+  // removing the default moves it to the first row left — say so, because
+  // every job that names no provider of its own moves with it
+  if (llmUse === id && connectionDrafts[0]) {
+    llmUse = connectionDrafts[0].id;
+    $('#cfg-status').innerHTML = `<div class="cfg-line">The default provider is now ${esc(connectionDrafts[0].label || llmUse)} — every job that names no provider of its own follows it.</div>`;
+  }
   renderProviders();
   fillRouteOptions();
+  updateConfigSummaries();
   // a route pointing at the removed connection falls back to the default
   for (const prefix of ['entity', 'concept', 'document']) {
     if ($(`#cfg-${prefix}-use`).value === id) $(`#cfg-${prefix}-use`).value = '';

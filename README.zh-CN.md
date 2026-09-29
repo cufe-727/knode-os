@@ -110,6 +110,7 @@ node dist/cli.js serve --data ~/knode-data
     "provider": "openai",            // 也可用 "codex-cli" / "claude-cli" / "cursor-cli"
     "baseUrl": "https://api.openai.com/v1",
     "apiKey": "env:OPENAI_API_KEY",
+    "protocol": "auto",              // auto = 优先 Responses,端点没有该路由则退回 Chat Completions
     "model": "gpt-4.1-mini"          // 留空 = 关闭 LLM 功能,走启发式
   },
   "extraction": {
@@ -123,7 +124,7 @@ node dist/cli.js serve --data ~/knode-data
 
 索引默认放在 PostgreSQL(首次运行前设 `KNODE_DATABASE_KIND=pglite`,或把 `database.kind` 改成 `pglite`,即可用内嵌的零配置索引,测试套件用的就是它)。`postgres` 模式下同一套 schema 放在服务器上:所有工作区共用一个库,按 schema 隔离,各自在首次打开时创建。当单个工作区超出 PGlite 单进程 32 位 WASM 的承载力(约百万 chunk),或需要多个进程同时读同一份索引时,才值得这么做。用 schema 而非独立库来隔离是刻意的:独立库会给每个工作区带上一份约 8 MB 的系统目录;而把所有工作区塞进同一张表、用 workspace 列区分,则会直接失去向量索引 —— HNSW 沿着按距离排序的邻居图游走,标量列上的等值条件无法下推进这次游走,优化器只能退回顺序扫描。向量列使用 `halfvec` 存储:pgvector 的索引条目上限是一个 8 KB 页,`vector` 对应 2000 维而 `halfvec` 对应 4000 维,所以半精度正是 1536/2048 维下 HNSW 索引仍然可用的前提,同时表体积减半。已有库在两种列类型之间切换会原地转换,不需要重新嵌入。
 
-任何 OpenAI 兼容端点都可以(Ollama、vLLM、硅基流动等)。embedding 另外支持 `"provider": "ark-multimodal"`,对接火山方舟的 `/embeddings/multimodal`(`doubao-embedding-vision-*`)。该接口不是 OpenAI 形态:每次请求只返回一个融合后的向量,因此 `baseUrl` 写到 `/api/v3` 为止,`model` 填接入点 id(`ep-…`),`batchSize` 的含义变为单条请求的并发数。实体提取、Concept 综合和文档视觉转换都可以独立路由。文本型 PDF 在本地提取；图片和扫描型 PDF 可使用支持视觉的 OpenAI 兼容模型、Codex CLI 或 Claude Code CLI 转成 Markdown。修改 `dimensions` 会在下次启动时重建 embedding 表。也可以在 Web 页面的 **Settings** 标签里编辑并测试各条模型路由。
+任何 OpenAI 兼容端点都可以(Ollama、vLLM、硅基流动等)。`protocol` 决定用哪条线路说话:默认 `auto` 先探测端点有没有 `/responses`,有就走 Responses(推理模型在这条线上把思考作为独立的 output item 返回,而 Chat Completions 只能塞进各家拼写不一的 `message.reasoning_content`),没有则退回 `/chat/completions`;探测每个端点每进程只做一次,且不消耗 token。也可以钉成 `responses` 或 `chat`。embedding 另外支持 `"provider": "ark-multimodal"`,对接火山方舟的 `/embeddings/multimodal`(`doubao-embedding-vision-*`)。该接口不是 OpenAI 形态:每次请求只返回一个融合后的向量,因此 `baseUrl` 写到 `/api/v3` 为止,`model` 填接入点 id(`ep-…`),`batchSize` 的含义变为单条请求的并发数。实体提取、Concept 综合和文档视觉转换都可以独立路由。文本型 PDF 在本地提取；图片和扫描型 PDF 可使用支持视觉的 OpenAI 兼容模型、Codex CLI 或 Claude Code CLI 转成 Markdown。修改 `dimensions` 会在下次启动时重建 embedding 表。也可以在 Web 页面的 **Settings** 标签里编辑并测试各条模型路由。
 
 其他配置块(用 `knode-os config` 查看完整默认值):`ingest`(分块大小/重叠、文件监听)、`extraction`(每日 token 预算、批大小、间隔、tier-1/2 模型、是否抽取断言)、`heat`(热度半衰期、搜索加权、冷判定阈值)、`trace`(Claude/Codex trace 目录、skill 目录、同步间隔)、`server`(host/port)。
 
@@ -179,7 +180,7 @@ knode-os config               查看当前配置(密钥已脱敏)
 
 ## 在 Claude Code / Codex 中使用
 
-> `serve` 运行时会在 `/mcp` 提供 Streamable HTTP 的 MCP 端点（token 在 `<data>/.knode/mcp-token`），`knode-os connect claude|codex|cursor` 默认注册它（`--stdio` 才是独立进程）；`review` 配置块控制审核强度（写入时只按精确拼写合并、LLM 复核合并候选与争议断言、`verify` 任务可联网核实）；`research.pipeline: team` 让研究任务按「规划、并行调查、综合、评审、修订」五个阶段跑（`native` 则把角色注册为 CLI 的原生子代理）；`research.profile` 选一份研究 profile（`playbooks/research/profiles/*.yaml`：推理强度、联网新鲜度、核实门槛，以及每个子代理的 CLI、模型、工具与提示词，内置 default / quick / thorough / native，可在 Settings → Research 里编辑）；`research.agent` / `chat.agent` 现在指向 `playbooks/agents/` 下的具名 agent（Settings → Agents，内置 `deep-agent` 与 `deep-research` 两个模板），改动前那种直接写 CLI 名或连接 id 的配置继续可用；
+> `serve` 运行时会在 `/mcp` 提供 Streamable HTTP 的 MCP 端点（token 在 `<data>/.knode/mcp-token`），`knode-os connect claude|codex|cursor` 默认注册它（`--stdio` 才是独立进程）；`review` 配置块控制审核强度（写入时只按精确拼写合并、LLM 复核合并候选与争议断言、`verify` 任务可联网核实）；`research.pipeline: team` 让研究任务按「规划、并行调查、综合、评审、修订」五个阶段跑（`native` 则把角色注册为 CLI 的原生子代理）；`research.profile` 选一份研究 profile（`playbooks/research/profiles/*.yaml`：推理强度、联网新鲜度、核实门槛，以及每个子代理的 CLI、模型、工具与提示词，内置 default / quick / thorough / native，可在 Settings → Research 里编辑）；`research.agent` / `chat.agent` 现在指向 `playbooks/agents/` 下的具名 agent（Settings → Providers & Agents，内置 `deep-agent` 与 `deep-research` 两个模板）——跑在某个模型上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI；改动前那种直接写 CLI 名或连接 id 的配置继续可用；
 > `knode-os research queue entity 宁德时代 --now` 让配置好的 agent（`research.agent`：一个 coding-agent CLI，或跑在 OpenAI 兼容连接上的内置 agent）研究并写出 wiki 页，页面以隔离状态入库，审核后提升；
 > `knode-os entities dedupe|merge|unmerge`、`knode-os wiki lint`、`knode-os research recommend`、`knode-os research profiles` 见 [docs/design/06](docs/design/06-wiki-research-agent.zh-CN.md);
 > 知识库初始化(`research init`)、对话入口(`chat`)与研究 agent 的后续改进见 [docs/design/07](docs/design/07-init-and-chat.zh-CN.md)。
@@ -209,12 +210,12 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
   - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown)
   - **Search / 检索** —— hybrid/vector/keyword 检索,展示分数构成;可限定在「文件」里选中的目录
   - **Traces / 轨迹** —— 已收集的 agent 会话;点一行即可打开 `raw/traces/` 下对应的镜像文件
-- **Ask / 问答** —— 一个问题，两种成本。**快速**一次检索给出带引用的答案并做缺口分析，不需要装 agent CLI;**Agent** 跑配置好的 CLI，通过 MCP 多轮追查，并把你教它的内容写成隔离笔记(确认后采纳)。两种都进同一个会话列表，所以先用便宜的问一次不吃亏。
+- **Ask / 问答** —— 一个问题，一次 agent 会话。配置好的 agent 通过 MCP 作答，跨多轮追查线索，并把你教它的内容写成隔离笔记（确认后采纳）。没有指定 agent 时跑 01 区的默认连接，所以只要配了模型 Ask 就能用；连这个也没配时，界面会直接说清楚要去配什么。
 - **Knowledge / 知识** —— 从资料里长出来的东西
   - **Graph / 图谱** —— 力导向图谱浏览 + 洞察(枢纽/孤立节点/类型分布)
   - **Wiki** —— 一个按钮完成知识库初始化(通读 → 总览页 + AGENTS.md 指南 + 排队的主题页),并在此发起与审阅深度研究页
   - **Dream / 夜间分析** —— 手动触发 dream,审阅并接受/拒绝建议
-- **Settings / 设置** —— **Providers**、**Pipeline**(embedding 与独立的 Entity / Concept / 文档视觉模型路由；保存后按需重建 embedding 或刷新转换)、**Agents**、**Research**、**Workspace**
+- **Settings / 设置** —— **Providers & Agents**（每个模型端点与密钥只配一次，embedding 与 LLM 同在一张表——`llmUse` 标出哪个 LLM 是默认，所有没有自己指定 provider 的任务都跟着它走；下面第二张表是 agent：跑在这些模型之一上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI（Claude Code / Codex / Cursor）。CLI 是 agent 而不是模型；流水线阶段仍可以单次调用某个 CLI agent）、**Pipeline**（独立的 Entity / Concept / 文档视觉模型路由；保存后按需重建 embedding 或刷新转换）、**Research**、**Workspace**
 
 ## REST API(仅 localhost)
 

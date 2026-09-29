@@ -10,7 +10,8 @@ import { CLI_COMMANDS, cliCommand, resolveExecutable, runProcess } from './cli.j
  *
  * Three sources, in descending order of truth:
  *   - `api`     — the provider's own `GET /models` (OpenAI-compatible endpoints)
- *   - `cli`     — the coding-agent CLI listed them (`cursor-agent --list-models`)
+ *   - `cli`     — the coding-agent CLI listed them (`cursor-agent --list-models`,
+ *                 `codex debug models`)
  *   - `builtin` — neither exists, so these are hints knode reads off the CLI's
  *                 own help text or config file. The field stays free text.
  */
@@ -34,8 +35,8 @@ export interface ModelListResult {
 const LIST_TIMEOUT_MS = 60_000;
 const FETCH_TIMEOUT_MS = 20_000;
 
-/** Documented `claude --model` aliases, used when its help text can't be parsed. */
-const CLAUDE_FALLBACK_ALIASES = ['fable', 'opus', 'sonnet', 'haiku'];
+/** The `claude --model` family aliases. Its help text names two or three of them as examples. */
+const CLAUDE_ALIASES = ['fable', 'opus', 'sonnet', 'haiku'];
 
 export async function listChatModels(cfg: LlmConfig): Promise<ModelListResult> {
   if (cfg.provider === 'openai') {
@@ -62,7 +63,7 @@ export async function listChatModels(cfg: LlmConfig): Promise<ModelListResult> {
   try {
     if (cfg.provider === 'cursor-cli') return { ...base, ...(await listCursorModels(resolvedPath)) };
     if (cfg.provider === 'claude-cli') return { ...base, ...(await listClaudeAliases(resolvedPath)) };
-    if (cfg.provider === 'codex-cli') return { ...base, ...codexConfiguredModels() };
+    if (cfg.provider === 'codex-cli') return { ...base, ...(await listCodexModels(resolvedPath)) };
     return { ...base, ok: false, source: 'builtin', models: [], error: `unknown provider: ${cfg.provider}` };
   } catch (e) {
     return { ...base, ok: false, source: 'cli', models: [], error: message(e) };
@@ -140,18 +141,22 @@ async function listCursorModels(command: string): Promise<ModelListResult> {
 
 /**
  * Claude Code has no list command; its `--model` help documents the family
- * aliases, so read them from there and fall back to the known set.
+ * aliases, so read them from there.
+ *
+ * What that text carries is examples — "an alias for the latest model (e.g.
+ * 'fable', 'opus', or 'sonnet')" — not the catalog, so the families knode
+ * knows about are merged in behind whatever it named rather than replaced by
+ * them. The CLI's own order comes first, since it reflects that CLI.
  */
 async function listClaudeAliases(command: string): Promise<ModelListResult> {
   let aliases: string[] = [];
   try {
     const { stdout } = await runProcess(command, ['--help'], '', LIST_TIMEOUT_MS);
-    const description = /--model <model>([\s\S]*?)\n\s*(?:-\w,|--\w)/.exec(stdout)?.[1] ?? '';
-    aliases = [...description.matchAll(/'([a-z][a-z0-9.\-]*)'/g)].map((m) => m[1]).filter((a) => !a.includes('-'));
+    aliases = parseClaudeAliases(stdout);
   } catch {
     // fall through to the documented set
   }
-  const unique = [...new Set(aliases.length ? aliases : CLAUDE_FALLBACK_ALIASES)];
+  const unique = [...new Set([...aliases, ...CLAUDE_ALIASES])];
   return {
     ok: true,
     source: aliases.length ? 'cli' : 'builtin',
@@ -160,8 +165,70 @@ async function listClaudeAliases(command: string): Promise<ModelListResult> {
   };
 }
 
-/** Codex has no list command either — surface what its own config file selects. */
-function codexConfiguredModels(): ModelListResult {
+/** The quoted aliases in `claude --help`, minus the full model ids it also shows. */
+export function parseClaudeAliases(help: string): string[] {
+  const description = /--model <model>([\s\S]*?)\n\s*(?:-\w,|--\w)/.exec(help)?.[1] ?? '';
+  return [...description.matchAll(/'([a-z][a-z0-9.\-]*)'/g)].map((m) => m[1]).filter((a) => !a.includes('-'));
+}
+
+/**
+ * `codex debug models` renders the catalog the CLI itself picks from, which is
+ * the whole answer when it is there. It arrived in a 2026 release, so an older
+ * CLI (or one that cannot reach its catalog) still falls back to the models
+ * `~/.codex/config.toml` names — which is all knode could ever see before.
+ */
+async function listCodexModels(command: string): Promise<ModelListResult> {
+  try {
+    const { code, stdout, stderr } = await runProcess(command, ['debug', 'models'], '', LIST_TIMEOUT_MS);
+    if (code !== 0) throw new Error((stderr || stdout).trim().slice(0, 200) || `exited with code ${code}`);
+    const models = parseCodexCatalog(stdout);
+    if (!models.length) throw new Error('the catalog listed no model this CLI offers');
+    return {
+      ok: true,
+      source: 'cli',
+      models,
+      note: 'From `codex debug models`. The second column is the reasoning effort each model accepts. Leave the field empty to use the CLI default.',
+    };
+  } catch (e) {
+    return codexConfiguredModels(message(e));
+  }
+}
+
+/**
+ * The listable models in a `codex debug models` payload, in the order the CLI
+ * ranks them. `hide` covers the catalog's internal entries — a reserve model,
+ * the one auto-review runs on — which the CLI does not offer either.
+ */
+export function parseCodexCatalog(stdout: string): ModelOption[] {
+  const start = stdout.indexOf('{');
+  const end = stdout.lastIndexOf('}');
+  if (start < 0 || end < start) throw new Error('no JSON object in the output');
+  const body = JSON.parse(stdout.slice(start, end + 1)) as { models?: unknown };
+  const rows = Array.isArray(body.models) ? body.models : [];
+  const ranked: Array<{ option: ModelOption; priority: number }> = [];
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const model = row as Record<string, unknown>;
+    const id = typeof model.slug === 'string' ? model.slug : '';
+    if (!id || model.visibility === 'hide') continue;
+    const name = typeof model.display_name === 'string' && model.display_name ? model.display_name : id;
+    const efforts = Array.isArray(model.supported_reasoning_levels)
+      ? model.supported_reasoning_levels.flatMap((level) => {
+        const effort = level && typeof level === 'object' ? (level as { effort?: unknown }).effort : undefined;
+        return typeof effort === 'string' && effort ? [effort] : [];
+      })
+      : [];
+    // The levels ride in the label because the model list and the effort field
+    // are two separate controls: this is how picking one tells you the other.
+    const label = efforts.length ? `${name} · effort ${efforts[0]}–${efforts[efforts.length - 1]}` : name;
+    ranked.push({ option: { id, label }, priority: typeof model.priority === 'number' ? model.priority : Number.MAX_SAFE_INTEGER });
+  }
+  ranked.sort((a, b) => a.priority - b.priority || a.option.id.localeCompare(b.option.id));
+  return ranked.map((r) => r.option);
+}
+
+/** What `~/.codex/config.toml` selects: the default model and any per-profile one. */
+function codexConfiguredModels(reason: string): ModelListResult {
   const file = path.join(os.homedir(), '.codex', 'config.toml');
   const models: ModelOption[] = [];
   try {
@@ -184,8 +251,8 @@ function codexConfiguredModels(): ModelListResult {
     source: 'builtin',
     models,
     note: models.length
-      ? 'Codex CLI has no list command; these are the models its own config selects. Leave the field empty to use the CLI default.'
-      : 'Codex CLI has no list command and ~/.codex/config.toml sets no model. Leave the field empty to use the CLI default.',
+      ? `\`codex debug models\` did not answer (${reason}), so these are the models ~/.codex/config.toml selects. Leave the field empty to use the CLI default.`
+      : `\`codex debug models\` did not answer (${reason}) and ~/.codex/config.toml sets no model. Leave the field empty to use the CLI default.`,
   };
 }
 

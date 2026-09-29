@@ -5,6 +5,7 @@ import { ChatOpenAI } from '@langchain/openai';
 import { createDeepAgent, createFilesystemMiddleware, type SubAgent } from 'deepagents';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import { resolveSecret } from '../config.js';
+import { negotiateProtocol } from '../llm/protocol.js';
 import { BuiltinAgent } from './agent.js';
 import {
   abortSession,
@@ -52,12 +53,20 @@ function pinTracingOff(): void {
   }
 }
 
-/** A model handle on the session's endpoint; `model` overrides the agent's own. */
-function chatModel(agent: BuiltinAgent, model?: string): ChatOpenAI {
+/**
+ * A model handle on the session's endpoint; `model` overrides the agent's own.
+ *
+ * The wire is decided once per session and passed in rather than left to
+ * `ChatOpenAI`, which otherwise picks Chat Completions for everything but a
+ * handful of model names it recognises — a rule that says nothing about what
+ * the endpoint in front of it actually implements.
+ */
+function chatModel(agent: BuiltinAgent, useResponsesApi: boolean, model?: string): ChatOpenAI {
   return new ChatOpenAI({
     model: model || agent.model,
     apiKey: resolveSecret(agent.apiKey) || 'unused', // some local endpoints want no key; the client still wants a string
     configuration: { baseURL: agent.baseUrl },
+    useResponsesApi,
   });
 }
 
@@ -73,14 +82,14 @@ export function allowedTools(tools: StructuredToolInterface[], scope: 'read' | '
 }
 
 /** A profile role marked `native` becomes one of the agent's own sub-agents. */
-function toSubAgent(spec: NativeAgentSpec, agent: BuiltinAgent, tools: StructuredToolInterface[]): SubAgent {
+function toSubAgent(spec: NativeAgentSpec, agent: BuiltinAgent, tools: StructuredToolInterface[], useResponsesApi: boolean): SubAgent {
   return {
     name: spec.id,
     description: spec.description || spec.title || spec.id,
     systemPrompt: spec.prompt,
     // sub-agents never write the page: the orchestrator does, through knode_write
     tools: allowedTools(tools, 'read') as SubAgent['tools'],
-    ...(spec.model ? { model: chatModel(agent, spec.model) } : {}),
+    ...(spec.model ? { model: chatModel(agent, useResponsesApi, spec.model) } : {}),
   };
 }
 
@@ -130,10 +139,20 @@ export async function runBuiltinSession(input: BuiltinSessionInput): Promise<Ses
 
     const schemaFile = path.join(input.cwd, 'AGENTS.md');
     const systemPrompt = fs.existsSync(schemaFile) ? fs.readFileSync(schemaFile, 'utf8') : '';
-    const subagents = input.agents?.length ? input.agents.map((a) => toSubAgent(a, input.agent, all)) : undefined;
+    // Settled before the graph starts: a mid-run switch of wires would lose the
+    // messages already on it. The probe costs one tokenless round-trip, cached
+    // per endpoint, and a session that finds the route gone gets the honest
+    // error rather than a second run on a different wire.
+    const wire = await negotiateProtocol(
+      { baseUrl: input.agent.baseUrl, apiKey: resolveSecret(input.agent.apiKey), model: input.agent.model },
+      input.agent.protocol ?? 'auto',
+    );
+    const useResponsesApi = wire === 'responses';
+    note(`wire: ${wire}`);
+    const subagents = input.agents?.length ? input.agents.map((a) => toSubAgent(a, input.agent, all, useResponsesApi)) : undefined;
 
     const agent = createDeepAgent({
-      model: chatModel(input.agent),
+      model: chatModel(input.agent, useResponsesApi),
       tools,
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(subagents ? { subagents } : {}),

@@ -94,28 +94,34 @@ stream-json `tool_use` + `tool_result`；codex 没有事件流则为空），外
 - **教学**：协议要求先复述确认，再 `knode_write` 笔记 + `knode_sync only:[路径]`，并告诉用户它是 quarantined。
 - **联网**：`chatWebAllowed` 只在 `review.external` 允许的范围内收紧或放开，从不越过主开关。
 
-### 4.1 与 Ask 合并（2026‑09‑19）
+### 4.1 与 Ask 合并，再收敛到单一成本（2026‑09‑19）
 
-原来 Ask（`POST /api/ask`，一次检索 + 一次 LLM 调用、无状态）与 Chat 是两个一级入口，但对人来说是同一个意图的
-两种成本档。现在界面上只剩一个 **Ask**，模式开关在输入框旁：
+原来 Ask（`POST /api/ask`，一次检索 + 一次 LLM 调用、无状态）与 Chat 是两个一级入口，但对人来说是同一个
+意图。它们先被合成一个 **Ask**，输入框旁带一个快速 / Agent 的模式开关；随后这个开关也被去掉了：**每一次
+提问都是一次 agent 会话**。
 
-| | 快速（quick） | Agent |
-| --- | --- | --- |
-| 怎么答 | `ask()`（`src/search/ask.ts`）一次检索 + 一次 LLM 调用 | 一次 agent CLI 会话，走 MCP |
-| 路由返回 | **200**，回复已写库，无需轮询 | 202 + 轮询 `…/status` |
-| 前置条件 | 无 —— **不需要 MCP 端点，也不需要装 agent CLI** | 两者都要，否则 503 |
-| 回复怎么自述 | `payload`：citations / gaps / facts | `events`：工具调用芯片 |
-| 能否写入 | 否 | 能（隔离笔记，可采纳） |
+开关为什么要去：两种模式在延迟和花费上差了约两个数量级，而输入框旁的分段控件是承载这种选择最糟的位置。
+它默认落在"快速"，于是人们在没做决定的情况下拿到的总是便宜那档；每次快速提问、每次切模式都会新开会话，
+会话列表读起来像两段交错的历史；而"交给 agent 深入"这个按钮之所以存在，恰恰说明默认那档常常不是问题需要
+的。一个总能用的模式，胜过两个要读者自己仲裁的模式。
 
-- **模式落在哪**：会话级在 `chat_conversations.payload.mode`（该列本来就有）；回复级在新增的
-  `chat_messages.payload`（**migration v10**）。`contexts` 故意不存——整块 chunk 太大且可重算。
-- **路由**：`POST …/messages` 增加可选 `mode`（缺省 `agent`，老客户端行为不变）。quick 分支在两处 503 检查
-  **之前**返回，这是「没装 Claude Code 也能用 Ask」的关键。实现在 `src/chat/quick.ts`。
-- **一问一会话**：每次快速提问新建一条会话，列表读起来就是一部提问史；快速回答下方的「交给 agent 深入」
-  会用同一个问题另开一条 agent 会话。模式从不改写已有会话的含义。
-- **`POST /api/ask` 原样保留**：MCP 的 `knode_ask` 与 CLI 都依赖它，`quick.ts` 也是调它。
-- **配置键不动**：`knode.config.json` 里仍是 `chat.*`（改键等于动用户的配置文件），只有 UI 文案改成
-  「Ask · Agent 模式」。`chat.keep` 默认从 50 提到 200 —— 一问一会话把 50 条大约一天就填满了。
+- **快速模式那张安全网换成了什么。** 快速模式是"没装 coding agent 也能用 Ask"的依据。`resolveChatAgent`
+  现在最后一档兜底到 `agentForSpec(config, 'default')`：什么都没指定时，Ask 跑 01 区的默认连接——CLI
+  provider 就是那个 CLI，OpenAI 兼容端点就是内置 agent。出厂的 `chat.agent` 也因此是 `'default'`。研究侧
+  仍然刻意拒绝猜（`resolveResearchAgent`）：那是有人主动开启的后台开销，而 Ask 是刚刚敲下的一个问题。
+- **连兜底都解析不出来时**（OpenAI 兼容默认连接且没填 model，也就是全新安装的状态），
+  `GET /api/chat/readiness` 会在人开始打字**之前**说清楚，两端都渲染一个直达 Settings → Providers &
+  Agents 的界面。`POST …/messages` 返回同样的 `reason`（`no-mcp` / `no-agent` / `no-builtin`），所以抢跑的
+  请求落到同一个界面，而不是一个滚走的 toast。
+- **`chat_messages.payload` 与 migration v10 保留。** 没人再写这一列；历史快速回答的 citations 还在里面，
+  而删掉这条迁移会让 `SCHEMA_VERSION` 低于所有既有数据库自报的版本。存量的 `payload.mode = 'quick'` 成了
+  惰性数据——两端都把任何会话读作 agent 会话。旧的快速回答保留正文，失去引用列表，这是删掉那段页脚的代价。
+- **`ask()` 活着，走的只是它的界面入口。** `src/search/ask.ts` 仍被 MCP 的 `knode_ask`（`src/mcp/tools.ts`）、
+  `knode-os ask` CLI、`bench answer` 和 `POST /api/ask` 调用——都是**直接调函数**，本节早先的说法在这一点上
+  写错了。删除之后 `POST /api/ask` 在仓库内没有调用者，作为公开 REST 端点保留。agent 自己仍能走便宜那条
+  路：`knode_ask` 就在对话会话启动时给它的工具集里。
+- **配置键不动**：`knode.config.json` 里仍是 `chat.*`。`chat.keep` 为 200——一问一会话把旧的 50 条大约一天
+  就填满了，`runner.ts` 现在也用这个默认值，不再用它自己那个过时的 50。
 
 ## 5. 研究 agent 的改进
 
@@ -131,20 +137,50 @@ stream-json `tool_use` + `tool_result`；codex 没有事件流则为空），外
 4. **立即认领**：`startResearchLoop` 返回 `kick()`，`serve` 把它连同该工作区的 MCP 端点登记到 `createApp` 的
    `services`，入队后立刻开跑，不等 30 s 定时器。聊天路由也从这里取 MCP 端点。
 
+### 4.2 默认模型变成一条普通连接（2026‑09‑19）
+
+`config.llm` 过去**就是**默认：一个与 `connections[]` 并列的字段，而不是列表里的一行。于是同一种可见类型要写
+两个 LLM row builder，`'default'` 被迫成为服务端必须拒绝的保留 id，而把某条已有连接设为默认要重新抄一遍它的
+端点和密钥，而不是点一下。
+
+`embeddingProviders[]` + `embeddingUse` 早就解决过这件事。LLM 侧现在对齐：
+
+| | 之前 | 之后 |
+| --- | --- | --- |
+| 默认存在哪 | `config.llm` 字段 | `connections[]` 里的一行 |
+| 谁是默认 | 隐含——它就是那个字段 | `llmUse` 指针 |
+| `config.llm` | 默认本身 | 那一行的**镜像**，由 `syncActiveLlm` 回写 |
+
+镜像是这件事成本低的原因：`ctx.llm`、`resolveRoutedLlmConfig` 的 base、`agentForSpec('default')` 全都照旧读
+`config.llm`，一行都不用改。`migrateDefaultLlm` 在 `loadConfig` 里排在 `migrateRouteConnections` 之后——后者
+可能已经为同一个端点建过行，`sameEndpoint` 会复用它而不是再建一个孪生行——并在 `PUT /api/config` 里再跑一次，
+顺带修复"客户端提交的列表里没有默认那一行"的情况。`'default'` 仍是保留的 **spec** 关键字
+（`RoutedLlmConfig.use`、`agentForSpec`），所以 `mergeConnections` 依旧拒绝把它当连接 id。
+
+不能弯的那条规则：路由里存的 `use: ''` / `'default'` 继续表示*当前的默认是谁*。迁移时把它们改写成新 id 会把
+路由钉死在一个端点上，毁掉命名连接存在的意义——传导。为此专门有一条测试。
+
+最后一条 LLM 连接不能删，和最后一个 embedding provider 一样：总得有人作答。删掉默认会把它降级到剩下的第一行，
+并在状态栏里说出来。
+
 ## 6. 配置与迁移
 
 ```jsonc
+"llmUse": "openai-1",          // connections[] 里哪一条是默认
 "research": {
   "init": { "followUps": 6, "extraction": "drain", "extractionMaxMs": 900000 }
 },
 "chat": {
-  "agent": "", "model": "", "effort": "default", "maxTurns": 30, "timeoutMs": 600000,
-  "web": "inherit", "historyTurns": 12, "keep": 50
+  "agent": "default", "model": "", "historyTurns": 12, "keep": 200
 }
 ```
 
-迁移 **v9**：`chat_conversations` / `chat_messages` 两张表。种子文件新增 `playbooks/research/init.md`、
-`playbooks/research/phases/init-*.md`、`playbooks/chat/AGENTS.md`、`playbooks/chat/turn.md`（都不覆盖已有文件）。
+迁移 **v9**：`chat_conversations` / `chat_messages` 两张表；**v10** 增加了 `chat_messages.payload`，虽然已无人
+写入但保留（见 §4.1）。内存里的配置迁移，按 `loadConfig` 的顺序：`migrateChatConfig` 删掉已归 agent 定义所有的
+`chat.*` 键，`migrateRouteConnections` 把前命名连接时代的路由端点提取成具名行，`migrateDefaultLlm` 把默认 LLM
+也提取成一行（见 §4.2），`migrateEmbeddingProviders` 对 embedding 做同样的事。种子文件新增
+`playbooks/research/init.md`、`playbooks/research/phases/init-*.md`、`playbooks/chat/AGENTS.md`、
+`playbooks/chat/turn.md`（都不覆盖已有文件）。
 
 ## 7. 未决 / 已知限制
 

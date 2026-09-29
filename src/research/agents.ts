@@ -1,25 +1,29 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { parseYaml } from '../compiler/intents.js';
-import { KnodeConfig } from '../config.js';
+import { isCliProvider, KnodeConfig, LlmProvider } from '../config.js';
 import { AGENTS_DIR } from '../fs/layout.js';
+import { agentFilePath, agentYamlText, isValidAgentName } from './agent-file.js';
 import { Effort, EFFORTS, RoleTools, WEB_ACCESS, WebAccess } from './profile.js';
+
+export { isValidAgentName } from './agent-file.js';
 
 /**
  * Named agents — the thing a person adds, names and points research or chat
  * at, instead of picking a bare CLI name every time.
  *
- * An agent answers "who runs this and how hard do they think": the executor
- * (a CLI on this machine, or an OpenAI-compatible connection running the
- * in-process deepagents loop), the model, the reasoning effort, which tools
- * it may use, and its system prompt. What a *research run* looks like —
- * pipeline mode, sub-agent roles, verification bar — stays in the research
- * profile, because that is what the runner already reads, and because it is a
- * property of the research, not of who runs it.
+ * An agent answers "who runs this and how hard do they think". It is one of
+ * two runtimes: the in-process deepagents loop on one of the models in
+ * `connections`, or a coding-agent CLI on this machine that brings its own
+ * loop (and its own path, model and effort — a CLI is an agent, not a model
+ * endpoint, so it lives here and not in `connections`). On top of either sit
+ * the reasoning effort, which tools it may use, and its system prompt. What a
+ * *research run* looks like — pipeline mode, sub-agent roles, verification
+ * bar — stays in the research profile, because that is what the runner already
+ * reads, and because it is a property of the research, not of who runs it.
  *
- * `kind` is what a picker filters on: Research offers the deep-research ones,
- * Chat the general ones.
+ * `kind` only orders the pickers now: Research lists the deep-research ones
+ * first, Ask the general ones.
  *
  * Stored one YAML file each under `playbooks/agents/`, like profiles, so an
  * agent can be edited in the UI or in the file and diffed like any playbook.
@@ -39,11 +43,14 @@ export interface AgentDefinition {
    */
   kind: AgentKind;
   /**
-   * What actually runs it: a connection id from `connections`, a CLI provider
-   * name ('claude-cli' | 'codex-cli' | 'cursor-cli'), or 'default' for the
-   * section-01 connection. Empty = not runnable, which the UI states.
+   * What actually runs it. 'claude-cli' | 'codex-cli' | 'cursor-cli': that CLI,
+   * from `cliPath`. Anything else runs the built-in deepagents loop on a model:
+   * 'default' follows the default LLM, a connection id pins one. Empty = not
+   * runnable, which the UI states.
    */
   executor: string;
+  /** A CLI agent's executable, path or name. Empty = the CLI's own name on PATH. */
+  cliPath: string;
   /** Empty = the CLI's own default, or the connection's model. */
   model: string;
   effort: Effort;
@@ -64,6 +71,7 @@ function agent(patch: Partial<AgentDefinition> & Pick<AgentDefinition, 'name' | 
     title: patch.name,
     description: '',
     executor: 'default',
+    cliPath: '',
     model: '',
     effort: 'default',
     tools: { write: false, files: true, web: 'inherit' },
@@ -98,17 +106,18 @@ export const BUILTIN_AGENTS: Record<string, AgentDefinition> = {
   }),
 };
 
-export function isValidAgentName(name: string): boolean {
-  return /^[a-z0-9][a-z0-9_-]{0,40}$/i.test(name);
+/** Which runtime a definition runs on: a coding-agent CLI, or the built-in deepagents loop. */
+export function agentRuntime(definition: Pick<AgentDefinition, 'executor'>): LlmProvider | 'deepagents' {
+  return isCliProvider(definition.executor) ? definition.executor : 'deepagents';
 }
 
 function agentFile(dataDir: string, name: string): string {
-  return path.join(dataDir, AGENTS_DIR, `${name}.yaml`);
+  return agentFilePath(dataDir, name);
 }
 
 export function agentYaml(definition: AgentDefinition): string {
   const { path: _path, ...data } = definition;
-  return matter.stringify('', data).replace(/^---\n/, '').replace(/---\n*$/, '');
+  return agentYamlText(data);
 }
 
 /** Seed the built-ins once; a user edit is never overwritten. */
@@ -167,20 +176,6 @@ export function deleteAgent(dataDir: string, name: string): boolean {
   return true;
 }
 
-/**
- * The executor spec behind an agent name, or the spec itself when it is not a
- * name. Configs written before agents existed put a CLI name or a connection
- * id straight into `research.agent`, and those keep working — the resolver
- * simply finds no agent file and hands the value on unchanged.
- */
-export function executorForAgent(dataDir: string, spec: string): { executor: string; model: string } | null {
-  const wanted = spec.trim();
-  if (!wanted) return null;
-  const definition = isValidAgentName(wanted) ? loadAgent(dataDir, wanted) : null;
-  if (!definition) return null;
-  return { executor: definition.executor, model: definition.model };
-}
-
 /** The agent `research.agent` names, if it is a name at all. */
 export function activeAgent(dataDir: string, config: KnodeConfig): AgentDefinition | null {
   const name = config.research?.agent?.trim();
@@ -213,6 +208,7 @@ export function normalizeAgent(raw: Record<string, unknown>, name: string, fileP
     description: str(raw.description, base.description),
     kind,
     executor: str(raw.executor, base.executor).trim(),
+    cliPath: str(raw.cliPath, base.cliPath).trim(),
     model: str(raw.model, base.model).trim(),
     effort: oneOf(raw.effort, EFFORTS, base.effort),
     tools: {

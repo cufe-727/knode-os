@@ -2,6 +2,9 @@ import Foundation
 
 struct APIError: LocalizedError {
     var message: String
+    /// The machine-readable `reason` a route sends alongside `error`, when it
+    /// sends one — a screen can then act on the cause rather than the prose.
+    var reason: String?
     var errorDescription: String? { message }
 }
 
@@ -72,7 +75,7 @@ struct APIClient {
         guard (200..<300).contains(http.statusCode) else {
             let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let message = payload?["error"] as? String ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
-            throw APIError(message: message)
+            throw APIError(message: message, reason: payload?["reason"] as? String)
         }
         do {
             return try decoder.decode(T.self, from: data)
@@ -293,21 +296,24 @@ struct APIClient {
         try await send("/api/chat/conversations?limit=50")
     }
 
-    func createConversation(mode: AskMode) async throws -> ChatConversation {
-        struct Body: Encodable { var mode: String }
-        return try await send("/api/chat/conversations", method: "POST", body: encoded(Body(mode: mode.rawValue)))
+    /// Whether a question asked now would be answered, and if not, what to fix.
+    func chatReadiness() async throws -> ChatReadiness {
+        try await send("/api/chat/readiness")
+    }
+
+    func createConversation() async throws -> ChatConversation {
+        try await send("/api/chat/conversations", method: "POST", body: Data("{}".utf8))
     }
 
     func conversation(id: String) async throws -> ChatConversation {
         try await send("/api/chat/conversations/\(id)")
     }
 
-    /// `agent` starts a session in the background and answers `running` — poll
-    /// `chatStatus` until it is idle. `quick` answers in the same request and
-    /// comes back `idle`, with the reply already written.
-    func sendChat(id: String, text: String, mode: AskMode) async throws -> ChatSendResponse {
-        struct Body: Encodable { var text: String; var mode: String }
-        return try await send("/api/chat/conversations/\(id)/messages", method: "POST", body: encoded(Body(text: text, mode: mode.rawValue)))
+    /// Starts a session in the background and answers `running` — poll
+    /// `chatStatus` until it is idle.
+    func sendChat(id: String, text: String) async throws -> ChatSendResponse {
+        struct Body: Encodable { var text: String }
+        return try await send("/api/chat/conversations/\(id)/messages", method: "POST", body: encoded(Body(text: text)))
     }
 
     func chatStatus(id: String) async throws -> ChatStatusResponse {

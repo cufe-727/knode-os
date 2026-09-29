@@ -144,16 +144,16 @@ profile 把「怎么研究」从 harness 里抽出来：一份 YAML 同时回答
 
 内置四个（删除即重置为内置内容）：`default`（团队；强度与联网跟随 CLI 与 review 的默认值）、`quick`（单会话、medium、cached、最多 4 章节）、`thorough`（max、5 个并行研究员、2 轮评审、每条 fact 至少 2 个来源、证据表）、`native`（原生子代理、high）。简报里多出一段「研究规范（profile: …）」，把上面这些写成 agent 能读的规则。
 
-每个 CLI 的适配集中在 `src/research/launch.ts` 的 `sessionArgs`（`research export` 打印的命令行同样带上）：
+每个 CLI 的适配集中在 `src/research/launch.ts` 的 `sessionArgs`（`research export` 打印的命令行同样带上）。推理强度的两个适配器（`effortFor`、`cursorModel`）放在 `src/llm/cli.ts`，于是 LLM 连接上的一次性补全（它自己也带 `effort`）与研究会话用同一套写法：
 
 | | claude | codex | cursor-agent |
 | --- | --- | --- | --- |
-| 推理强度 | `--effort <level>` | `-c model_reasoning_effort="…"`（`max` → `xhigh`） | 模型名括号 `model[effort=high]`（`xhigh`/`max` → `high`；没填模型就设不了） |
+| 推理强度 | `--effort <level>` | `-c model_reasoning_effort="…"` | 模型名括号 `model[effort=high]`（`xhigh`/`max` → `high`；没填模型就设不了） |
 | 联网 | `WebSearch` / `WebFetch` 进 `--allowedTools` 或 `--disallowedTools` | `-c web_search="live" | "cached" | "disabled"`（不再用 `tools.web_search`） | 只能靠提示 |
 | 读文件 | `Read` / `Grep` / `Glob` 进白名单或黑名单 | 沙箱只读，总是可读 | `--add-dir`，总是可读 |
 | 原生子代理 | `--agents <json>`，并放开 `Agent` / `Task` | `agents.enabled`、`agents.max_concurrent_threads_per_session`、`agents.default_subagent_reasoning_effort`、`agents.<id>.description`、`agents.<id>.config_file` | 不支持（退回单会话） |
 
-入口：Settings 页，自 2026‑09‑19 起拆成两节。「03 · Agents」是**具名 agent** 列表——每个一份 `playbooks/agents/<name>.yaml`（`kind` = `general` | `deep-research`，`executor` = 连接 id / CLI 名 / `default`，外加 `model`、`effort`、`tools`、`maxTurns`、`timeoutMs`、`prompt`），内置两个模板：`deep-agent`（进程内的 LangChain `deepagents` 循环）与 `deep-research`。`GET /api/agents`、`GET/PUT/DELETE /api/agents/:name`；删内置等于重置，删其他会把 `research.agent` / `chat.agent` 移走。「04 · Research」管研究本身——选运行任务的 agent、并发与超时、profile，编辑 profile 的强度 / 联网 / 核实 / 停止 / 输出，以及每个角色的 CLI、模型、强度、工具与提示词（另存为新 profile、重置内置）；`GET /api/research/profiles`、`GET/PUT/DELETE /api/research/profiles/:name`（PUT 带 `prompts: {roleId: text}` 会把改动的提示词写成文件，`activate: true` 顺带切换）；`PUT /api/config` 的 `research` 块（agent / model / profile / pipeline / 并发 / 轮数 / 超时 / auto）；`knode-os research profiles`、`knode-os research profile <name> [--use]`。
+入口：Settings 页。「01 · Providers & agents」一页两张表：上面是**模型**——embedding 与 LLM 端点，`connections` 里只放模型端点；下面是 **agent**，每个一份 `playbooks/agents/<name>.yaml`。agent 有两种运行时：`executor` = `claude-cli` | `codex-cli` | `cursor-cli` 时运行那个编码 agent CLI，带自己的 `cliPath`（留空 = 从 PATH 找）、`model` 与 `effort`；其他值则在某个模型上运行进程内的 LangChain `deepagents` 循环——`default` 跟随默认 LLM，连接 id 则固定一个；它跟随的若是 CLI agent，就标为不可运行，而不是顶着自己的名字悄悄去跑那个 CLI。两种之上都有：`kind`（`general` | `deep-research`，现在只决定选择器里的排序）、`tools`、`maxTurns`、`timeoutMs`、`prompt`。内置两个模板：`deep-agent` 与 `deep-research`。CLI 是 agent，不是模型端点：2026‑09‑28 之前 CLI 是 `connections` 里的行，结果「cursor」成了默认 *LLM*，deep agent 也悄悄跑成了 Cursor。`loadConfig` 会把 CLI 行按原 id 挪成 agent 文件——所以引用过它的路由、`llmUse`、`research.agent` 与角色都照常解析——并回写一次配置；默认若是 CLI，就改到第一个设了模型的模型端点（一个都没有的工作区保留 CLI）。流水线路由与默认仍可以指向 CLI agent：`llmTargets` 把 CLI agent 当作单次调用的 LLM 交给它们。运行时字段在问答运行 agent 时生效（见 07 §4.1）；研究运行则从 profile 取，表单上写明了这一点。`GET /api/agents`、`GET/PUT/DELETE /api/agents/:name`；删内置等于重置，删其他会把 `research.agent` / `chat.agent`、流水线路由与默认从它身上移走。「03 · Research」管研究本身——选运行任务的 agent、并发与超时、profile，编辑 profile 的强度 / 联网 / 核实 / 停止 / 输出，以及每个角色的 CLI、模型、强度、工具与提示词（另存为新 profile、重置内置）；`GET /api/research/profiles`、`GET/PUT/DELETE /api/research/profiles/:name`（PUT 带 `prompts: {roleId: text}` 会把改动的提示词写成文件，`activate: true` 顺带切换）；`PUT /api/config` 的 `research` 块（agent / model / profile / pipeline / 并发 / 轮数 / 超时 / auto）；`knode-os research profiles`、`knode-os research profile <name> [--use]`。
 
 ## 6. 推荐与问答归档（`src/research/recommend.ts`）
 
@@ -187,3 +187,4 @@ profile 把「怎么研究」从 harness 里抽出来：一份 YAML 同时回答
 4. 服务端改动需 `macos/scripts/package-app.sh` 重新打包 macOS App。初始化（kind = `init`）、对话入口与研究 agent 的后续改进见 [07 — 初始化与对话](07-init-and-chat.zh-CN.md)。
 5. 原生子代理模式按官方配置参考实现（claude `--agents` 的 description / prompt / tools / model；codex `agents.*` 与子代理层里的 `developer_instructions`），尚未用真 CLI 跑过；cursor-agent 的 `effort` 只见过 `high` 的示例，`xhigh` / `max` 都映射成 `high`。
 6. `claude --effort` 需要较新的 CLI（老版本会因未知参数退出），所以内置 `default` profile 的强度是 `default`（不传参数）；要用 `max` 请选 `thorough` 或自建 profile。
+7. **agent 定义里的运行时字段目前只对问答生效。** 2026‑09‑19 起 `resolveChatRuntime` 会读具名 agent 的 `effort` / `tools` / `maxTurns` / `timeoutMs` / `prompt`；但 `pipeline.ts` 仍从 profile、role 与 `research.*` 取这些值，所以对研究运行它们依旧不生效。agent 表单在这些字段旁写明了原因——让这个缺口可见而非隐形；真正补上需要让 `sessions()` 读定义，并保留 role 的覆盖权。

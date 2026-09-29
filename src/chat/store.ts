@@ -12,8 +12,6 @@ import { toIso } from '../store/temporal.js';
 
 export type ChatStatus = 'idle' | 'running';
 export type ChatRole = 'user' | 'assistant';
-/** How a turn is answered: one retrieval pass, or a session of the agent CLI. */
-export type ChatMode = 'quick' | 'agent';
 
 export interface ChatEvent {
   /** knode tool name without the mcp prefix, or `wrote` for a file the reply says it wrote. */
@@ -23,17 +21,6 @@ export interface ChatEvent {
   ok?: boolean;
 }
 
-/**
- * What a quick (retrieval) answer knows about itself. Agent replies leave it
- * empty and carry their tool activity in `events` instead.
- */
-export interface ChatAnswerPayload {
-  mode?: ChatMode;
-  citations?: { ref: number; path: string; chunkId?: string }[];
-  gaps?: string[];
-  facts?: { statement: string; subject?: string; status?: string }[];
-}
-
 export interface ChatMessage {
   id: string;
   conversationId: string;
@@ -41,7 +28,13 @@ export interface ChatMessage {
   role: ChatRole;
   content: string;
   events: ChatEvent[];
-  payload: ChatAnswerPayload;
+  /**
+   * Nothing writes this any more. The column is migration v10's, from when a
+   * retrieval answer carried its own citations; it is kept so those historical
+   * rows survive, and because dropping the migration would make every existing
+   * database read as newer than the code.
+   */
+  payload: Record<string, unknown>;
   turns: number | null;
   costUsd: number | null;
   error: string | null;
@@ -68,7 +61,7 @@ interface ConversationRow {
 
 interface MessageRow {
   id: string; conversation_id: string; seq: number; role: string; content: string; events: ChatEvent[] | null;
-  payload: ChatAnswerPayload | null; turns: number | null; cost_usd: number | null; error: string | null; created_at: string | Date;
+  payload: Record<string, unknown> | null; turns: number | null; cost_usd: number | null; error: string | null; created_at: string | Date;
 }
 
 const CONV_COLS = 'id, title, agent, model, status, created_by, payload, created_at, updated_at';
@@ -112,12 +105,12 @@ export function titleFrom(text: string): string {
 
 export async function createConversation(
   store: Store,
-  input: { title?: string; createdBy?: string | null; mode?: ChatMode } = {},
+  input: { title?: string; createdBy?: string | null } = {},
 ): Promise<ChatConversation> {
   const id = `c_${crypto.randomBytes(5).toString('hex')}`;
   const [row] = await store.query<ConversationRow>(
-    `INSERT INTO chat_conversations (id, title, created_by, payload) VALUES ($1, $2, $3, $4::jsonb) RETURNING ${CONV_COLS}`,
-    [id, (input.title ?? '').trim().slice(0, 120), input.createdBy ?? null, JSON.stringify(input.mode ? { mode: input.mode } : {})],
+    `INSERT INTO chat_conversations (id, title, created_by, payload) VALUES ($1, $2, $3, '{}'::jsonb) RETURNING ${CONV_COLS}`,
+    [id, (input.title ?? '').trim().slice(0, 120), input.createdBy ?? null],
   );
   return conversation(row);
 }
@@ -147,14 +140,15 @@ export async function recentMessages(store: Store, id: string, limit: number): P
 
 export async function appendMessage(
   store: Store,
-  input: Omit<ChatMessage, 'id' | 'seq' | 'createdAt' | 'payload'> & { payload?: ChatAnswerPayload },
+  input: Omit<ChatMessage, 'id' | 'seq' | 'createdAt' | 'payload'>,
 ): Promise<ChatMessage> {
   const id = `m_${crypto.randomBytes(6).toString('hex')}`;
+  // `payload` is left to its column default: nothing writes it any more.
   const [row] = await store.query<MessageRow>(
-    `INSERT INTO chat_messages (id, conversation_id, seq, role, content, events, payload, turns, cost_usd, error)
-     VALUES ($1, $2, (SELECT COALESCE(max(seq), 0) + 1 FROM chat_messages WHERE conversation_id = $2), $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9)
+    `INSERT INTO chat_messages (id, conversation_id, seq, role, content, events, turns, cost_usd, error)
+     VALUES ($1, $2, (SELECT COALESCE(max(seq), 0) + 1 FROM chat_messages WHERE conversation_id = $2), $3, $4, $5::jsonb, $6, $7, $8)
      RETURNING ${MSG_COLS}`,
-    [id, input.conversationId, input.role, input.content, JSON.stringify(input.events ?? []), JSON.stringify(input.payload ?? {}), input.turns, input.costUsd, input.error],
+    [id, input.conversationId, input.role, input.content, JSON.stringify(input.events ?? []), input.turns, input.costUsd, input.error],
   );
   await store.query(`UPDATE chat_conversations SET updated_at = now() WHERE id = $1`, [input.conversationId]);
   return message(row);

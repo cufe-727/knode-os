@@ -22,7 +22,11 @@ export function chatWorkspaceDir(ctx: AppContext, conversationId: string): strin
   return path.join(chatRunsRoot(ctx), conversationId);
 }
 
-export async function prepareChatWorkspace(ctx: AppContext, conversationId: string, opts: { mcp: McpEndpoint }): Promise<{ dir: string }> {
+export async function prepareChatWorkspace(
+  ctx: AppContext,
+  conversationId: string,
+  opts: { mcp: McpEndpoint; prompt?: string },
+): Promise<{ dir: string }> {
   const dir = chatWorkspaceDir(ctx, conversationId);
   fs.mkdirSync(dir, { recursive: true });
   let survey = '';
@@ -31,7 +35,17 @@ export async function prepareChatWorkspace(ctx: AppContext, conversationId: stri
   } catch {
     survey = '';
   }
-  const schema = [loadChatProtocol(ctx.dataDir).trim(), '', knowledgeNotes(ctx.dataDir), '', survey].filter(Boolean).join('\n');
+  // the agent's own prompt sits after the protocol and before the notes, so it
+  // reads as an amendment to how this workspace answers, not a replacement
+  const schema = [
+    loadChatProtocol(ctx.dataDir).trim(),
+    '',
+    opts.prompt?.trim() ?? '',
+    '',
+    knowledgeNotes(ctx.dataDir),
+    '',
+    survey,
+  ].filter(Boolean).join('\n');
   writeAgentFiles(dir, { schema, mcp: opts.mcp, readme: `Chat workspace for conversation ${conversationId}. CLAUDE.md / AGENTS.md is the schema; prompt-turn-<n>.md and transcript-turn-<n>.jsonl are one turn each.\n` });
   return { dir };
 }
