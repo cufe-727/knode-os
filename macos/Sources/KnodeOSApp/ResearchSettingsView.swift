@@ -322,7 +322,7 @@ struct ResearchSettingsSection: View {
         if pipeline != "single" {
             let roles = (profile?.roles ?? []).filter(\.enabled).map { role -> String in
                 let fanout = role.phase == "research" ? (role.parallel == 0 ? research.researchers : role.parallel) : 0
-                return role.id + (fanout > 1 ? " ×\(fanout)" : "") + (role.agent.isEmpty ? "" : " @\(role.agent)")
+                return role.id + (fanout > 1 ? " ×\(fanout)" : "") + (role.agent.isEmpty ? "" : " @\(specLabel(role.agent))")
             }
             parts.append(L("roles: %@", roles.isEmpty ? L("none") : roles.joined(separator: ", ")))
         }

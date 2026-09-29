@@ -17,6 +17,7 @@ struct AgentsSettingsSection: View {
     @Binding var agents: [AgentDefinition]
     /// Which agent research runs on, so a row can show it is the active one.
     let researchAgent: String
+    /// Which agent Ask names; empty follows the research agent.
     let chatAgent: String
     /// The model endpoints a deepagents agent can run on.
     let connections: [LLMConnection]
@@ -144,15 +145,15 @@ struct AgentsSettingsSection: View {
                 // what points at it, on the right so the columns stay lined up
                 if agent.isCli && agent.name == llmUse { RouteBadge(label: L("Default"), color: .knodeCyan) }
                 if agent.name == researchAgent { RouteBadge(label: L("Research"), color: .knodeViolet) }
-                if agent.name == chatAgent { RouteBadge(label: L("Ask"), color: .knodeCyan) }
+                if agent.name == askAgent {
+                    RouteBadge(label: L("Ask"), color: .knodeCyan)
+                        .help(askFollowsResearch ? L("Ask names no agent of its own, so it follows the research agent — give it one in 03 · Research.") : "")
+                }
                 if let problem = problem(agent) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(Color.knodeBad)
                         .help(problem)
                 }
-                Text(agent.name)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.tertiary)
                 Button(role: .destructive) { remove(agent) } label: {
                     Image(systemName: agent.builtin ? "arrow.counterclockwise" : "trash")
                 }
@@ -410,6 +411,16 @@ struct AgentsSettingsSection: View {
         if endpoint.model.isEmpty && agent.model.isEmpty { return L("%@ has no model set.", connectionName(endpoint)) }
         return nil
     }
+
+    /// Who answers Ask: its own agent, else the research agent — the order the
+    /// service resolves it in (`chatSpec`), so the badge sits where Ask really
+    /// runs. Past those two Ask runs on the default model directly, which is
+    /// no row here.
+    private var askAgent: String {
+        askFollowsResearch ? researchAgent.trimmingCharacters(in: .whitespaces) : chatAgent.trimmingCharacters(in: .whitespaces)
+    }
+
+    private var askFollowsResearch: Bool { chatAgent.trimmingCharacters(in: .whitespaces).isEmpty }
 
     private var defaultOption: String {
         guard let target = defaultTarget else { return L("Follow the default LLM") }
