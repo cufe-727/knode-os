@@ -19,8 +19,14 @@ Build an ordinary `.app` bundle in `macos/build/`:
 
 ```bash
 ./scripts/package-app.sh
-open build/KnodeOS.app
 ```
+
+For local installation and debugging, run `./scripts/install-app.sh`. It builds,
+replaces `/Applications/KnodeOS.app` following the
+[local installation workflow](../AGENTS.md), and launches that fixed path.
+Keep any persistent rollback backup as a single ZIP archive, and clean up the
+reproducible build bundle after the installed app is verified. Leaving multiple
+loose `.app` bundles lets macOS list each copy as another application.
 
 The packaged app needs no separate Terminal process. Its default service URL
 is `http://127.0.0.1:9100`; the connection control in the sidebar can still be

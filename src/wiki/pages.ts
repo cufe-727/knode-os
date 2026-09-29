@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
-import { KnodeConfig, resolveRoutedLlmConfig } from '../config.js';
+import { KnodeConfig, llmTargets, resolveRoutedLlmConfig } from '../config.js';
 import { LLM_WIKI_INPUT_CHARS } from '../constants.js';
 import { DataSourceRegistry } from '../datasource/registry.js';
 import { QueryResult } from '../datasource/types.js';
@@ -554,7 +554,7 @@ function documentSummaryLlm(ctx: PagesContext): LlmClient {
 
 function conceptLlm(ctx: PagesContext): LlmClient {
   return ctx.config.extraction.conceptLlm
-    ? new LlmClient(resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.conceptLlm, ctx.config.connections, ctx.config.extraction.tier2Model))
+    ? new LlmClient(resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.conceptLlm, llmTargets(ctx.config), ctx.config.extraction.tier2Model))
     : ctx.llm;
 }
 

@@ -21,6 +21,12 @@ import {
   activeEmbedding,
   syncActiveEmbedding,
   migrateDefaultLlm,
+  migrateCliConnections,
+  llmTargets,
+  readAgentLlms,
+  syncActiveLlm,
+  defaultConfig,
+  isCliProvider,
   saveConfig, ResearchConfig, ChatConfig, LLM_EFFORTS, LLM_PROTOCOLS } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
@@ -34,7 +40,7 @@ import { applySuggestion } from '../pack/learn.js';
 import { createEmbeddingProvider } from '../ingest/embeddings.js';
 import { LlmClient } from '../llm/client.js';
 import { cachedCliToolStatus, listModelsCached, warmModelCache } from '../llm/model-cache.js';
-import { agentForSpec } from '../research/agent.js';
+import { agentForSpec, resolveAgentSpec } from '../research/agent.js';
 import {
   AgentDefinition,
   BUILTIN_AGENTS,
@@ -432,7 +438,8 @@ export function createApp(
     }
 
     const baseLlm = mergeLlmConfig(ctx.config.llm, draft.llm);
-    const connections = mergeConnections(ctx.config.connections, draft.connections);
+    // a route may name a CLI agent, which the pipeline calls one-shot
+    const connections = llmTargets({ connections: mergeConnections(ctx.config.connections, draft.connections), agentLlms: ctx.config.agentLlms });
     const entityRoute = mergeRoutedLlmConfig(ctx.config.extraction.entityLlm, draft.extraction?.entityLlm);
     const conceptRoute = mergeRoutedLlmConfig(ctx.config.extraction.conceptLlm, draft.extraction?.conceptLlm);
     const documentRoute = mergeRoutedLlmConfig(ctx.config.extraction.documentLlm, draft.extraction?.documentLlm);
@@ -484,7 +491,9 @@ export function createApp(
       return c.json(await listModelsCached('embedding', entry, opts));
     }
 
-    const connections = mergeConnections(ctx.config.connections, draft.connections);
+    // the models the draft lists, and the CLI agents a route or the default
+    // may name as well
+    const connections = llmTargets({ connections: mergeConnections(ctx.config.connections, draft.connections), agentLlms: ctx.config.agentLlms });
     // the default is an ordinary row, so 'llm' means whichever one `llmUse`
     // names in the draft — with an explicit `llm` block still winning, for a
     // client that edits the mirror
@@ -549,6 +558,8 @@ export function createApp(
       // without the default's row — and flattens the mirror before the
       // reconvert diff below reads it
       Object.assign(next, migrateDefaultLlm(next));
+      // a client written before CLIs became agents still sends them as rows
+      Object.assign(next, migrateCliConnections(next, ctx.dataDir));
       if (incoming.extraction) {
         const x = incoming.extraction;
         if (x.entityLlm) {
@@ -652,8 +663,8 @@ export function createApp(
 
       const reembed = embeddingIdentity(next.embedding) !== embeddingIdentity(ctx.config.embedding);
       const dimChanged = next.embedding.dimensions !== ctx.config.embedding.dimensions;
-      const previousDocumentLlm = resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.documentLlm, ctx.config.connections);
-      const nextDocumentLlm = resolveRoutedLlmConfig(next.llm, next.extraction.documentLlm, next.connections);
+      const previousDocumentLlm = resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.documentLlm, llmTargets(ctx.config));
+      const nextDocumentLlm = resolveRoutedLlmConfig(next.llm, next.extraction.documentLlm, llmTargets(next));
       const reconvert =
         previousDocumentLlm.provider !== nextDocumentLlm.provider ||
         previousDocumentLlm.model !== nextDocumentLlm.model ||
@@ -1510,19 +1521,43 @@ export function createApp(
 
   // Named agents: who runs a job or a chat turn, and how hard they think.
   // The research *policy* — phases, roles, verification — stays in profiles.
-  const agentDetail = (config: KnodeConfig, definition: AgentDefinition) => ({
+  const agentDetail = (ctx: AppContext, definition: AgentDefinition) => ({
     ...definition,
     builtin: Boolean(BUILTIN_AGENTS[definition.name]),
-    /** Whether the executor it names can actually run here right now. */
-    runnable: Boolean(agentForSpec(config, definition.executor)),
+    /** Whether what it names can actually run here right now. */
+    runnable: Boolean(resolveAgentSpec(ctx.config, definition.name, '', ctx.dataDir)),
   });
+
+  /**
+   * An agent file changed. The pipeline and the default may run on a CLI
+   * agent, so re-read those, and re-flatten the default in case it is one —
+   * saving, and swapping the default client, only when that moved something.
+   */
+  const refreshAgentLlms = (ctx: AppContext, moved = false) => {
+    const before = JSON.stringify([ctx.config.llmUse, ctx.config.llm]);
+    ctx.config.agentLlms = readAgentLlms(ctx.dataDir);
+    const targets = llmTargets(ctx.config);
+    if (targets.length === 0 && isCliProvider(ctx.config.llm.provider)) {
+      // the default was the last CLI agent, and it is gone: leave an empty
+      // endpoint, as a new workspace has, rather than a mirror of an agent the
+      // next load would rebuild as a row
+      ctx.config.llm = { ...defaultConfig().llm };
+    }
+    // a default that no longer resolves falls back to the first model, then
+    // the first CLI agent
+    syncActiveLlm(ctx.config);
+    if (moved || JSON.stringify([ctx.config.llmUse, ctx.config.llm]) !== before) {
+      saveConfig(ctx.dataDir, ctx.config);
+      ctx.llm = new LlmClient(ctx.config.llm);
+    }
+  };
 
   app.get('/api/agents', (c) => {
     const ctx = requestCtx(c);
     return c.json({
       active: ctx.config.research?.agent ?? '',
       chat: ctx.config.chat?.agent ?? '',
-      agents: [...loadAgents(ctx.dataDir).values()].map((a) => agentDetail(ctx.config, a)),
+      agents: [...loadAgents(ctx.dataDir).values()].map((a) => agentDetail(ctx, a)),
     });
   });
 
@@ -1530,7 +1565,7 @@ export function createApp(
     const ctx = requestCtx(c);
     const definition = loadAgent(ctx.dataDir, c.req.param('name'));
     if (!definition) return c.json({ error: 'no such agent' }, 404);
-    return c.json(agentDetail(ctx.config, definition));
+    return c.json(agentDetail(ctx, definition));
   });
 
   app.put('/api/agents/:name', async (c) => {
@@ -1539,7 +1574,9 @@ export function createApp(
     if (!isValidAgentName(name)) return c.json({ error: 'agent names use letters, digits, - and _ (max 41 chars)' }, 400);
     try {
       const body = (await c.req.json().catch(() => ({}))) as { agent?: Record<string, unknown> };
-      return c.json(agentDetail(ctx.config, saveAgent(ctx.dataDir, { ...(body.agent ?? {}), name })));
+      const saved = saveAgent(ctx.dataDir, { ...(body.agent ?? {}), name });
+      refreshAgentLlms(ctx);
+      return c.json(agentDetail(ctx, saved));
     } catch (e) {
       return c.json(err(e), 400);
     }
@@ -1552,15 +1589,25 @@ export function createApp(
     if (!deleteAgent(ctx.dataDir, name)) return c.json({ error: 'no such agent' }, 404);
     const reset = Boolean(BUILTIN_AGENTS[name]);
     // A config still naming a deleted agent would stall the queue with an
-    // unresolvable spec, so move it off explicitly.
+    // unresolvable spec, so move it off explicitly: research and Ask to "not
+    // set", a pipeline route back to the default. A default that was this
+    // agent falls back on its own when the default is re-flattened.
+    let moved = false;
     if (!reset) {
       for (const key of ['research', 'chat'] as const) {
         if (ctx.config[key]?.agent === name) {
           ctx.config[key].agent = '';
-          saveConfig(ctx.dataDir, ctx.config);
+          moved = true;
+        }
+      }
+      for (const key of ['entityLlm', 'conceptLlm', 'documentLlm'] as const) {
+        if (ctx.config.extraction[key]?.use === name) {
+          ctx.config.extraction[key].use = '';
+          moved = true;
         }
       }
     }
+    refreshAgentLlms(ctx, moved);
     return c.json({ ok: true, reset });
   });
 

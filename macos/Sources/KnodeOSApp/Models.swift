@@ -863,6 +863,10 @@ struct KnodeConfig: Codable, Equatable {
     }
 }
 
+/// The coding-agent CLIs. They are agents that bring their own loop, so they
+/// live in the agents table, not among the models.
+let cliProviderNames = ["claude-cli", "codex-cli", "cursor-cli"]
+
 /// A named agent: who runs a research job or a chat turn, and how hard they
 /// think. How the research itself is conducted stays in the profile.
 struct AgentDefinition: Codable, Equatable, Identifiable {
@@ -890,10 +894,13 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
     var name: String
     var title: String
     var description: String
-    /// "general" | "deep-research"
+    /// "general" | "deep-research" — only orders the pickers now.
     var kind: String
-    /// A connection id, a CLI provider name, or "default".
+    /// A CLI provider name runs that CLI; "default" or a connection id runs
+    /// the built-in deepagents loop on that model.
     var executor: String
+    /// A CLI agent's executable; "" = the CLI's own name on PATH.
+    var cliPath: String
     var model: String
     var effort: String
     var tools: Tools
@@ -908,15 +915,17 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
 
     var id: String { name }
 
-    init(name: String, kind: String) {
+    init(name: String, kind: String = "general", executor: String = "default") {
         self.name = name
         title = name
         description = ""
         self.kind = kind
-        executor = "default"
+        self.executor = executor
+        cliPath = ""
         model = ""
         effort = "default"
-        tools = Tools(write: kind == "deep-research", files: true, web: "inherit")
+        // what Ask needs to take notes; a CLI answers with its own tools anyway
+        tools = Tools(write: true, files: true, web: "inherit")
         maxTurns = 0
         timeoutMs = 0
         prompt = ""
@@ -932,6 +941,7 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? name
         description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
         executor = try container.decodeIfPresent(String.self, forKey: .executor) ?? ""
+        cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? ""
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
         effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? "default"
         tools = try container.decodeIfPresent(Tools.self, forKey: .tools) ?? Tools()
@@ -949,6 +959,7 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
         var description: String
         var kind: String
         var executor: String
+        var cliPath: String
         var model: String
         var effort: String
         var tools: Tools
@@ -958,8 +969,22 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
     }
 
     var payload: Payload {
-        Payload(title: title, description: description, kind: kind, executor: executor, model: model,
+        Payload(title: title, description: description, kind: kind, executor: executor, cliPath: cliPath, model: model,
                 effort: effort, tools: tools, maxTurns: maxTurns, timeoutMs: timeoutMs, prompt: prompt)
+    }
+
+    /// Runs a coding-agent CLI, rather than deepagents on a model.
+    var isCli: Bool { cliProviderNames.contains(executor) }
+
+    /// A CLI agent as a pipeline stage or the default sees it: a one-shot LLM.
+    /// The client-side mirror of the service's `readAgentLlms`.
+    var asLlmTarget: LLMConnection? {
+        guard isCli else { return nil }
+        var target = LLMConnection(id: name, label: title.trimmingCharacters(in: .whitespaces).isEmpty ? name : title, provider: executor)
+        target.model = model
+        target.cliPath = cliPath
+        target.effort = effort
+        return target
     }
 }
 

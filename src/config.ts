@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { agentFileNames, isValidAgentName, readAgentFile, writeAgentFile } from './research/agent-file.js';
 
 export interface EmbeddingConfig {
   /**
@@ -70,6 +71,14 @@ export interface DatabaseConfig {
 }
 
 export type LlmProvider = 'openai' | 'codex-cli' | 'claude-cli' | 'cursor-cli';
+
+/** The coding-agent CLIs: agents that bring their own loop, kept in `playbooks/agents/`. */
+export const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli'] as const;
+export type CliProvider = (typeof CLI_PROVIDERS)[number];
+
+export function isCliProvider(provider: unknown): provider is CliProvider {
+  return (CLI_PROVIDERS as readonly unknown[]).includes(provider);
+}
 
 /**
  * Reasoning effort a CLI provider runs at. `default` leaves the CLI's own
@@ -153,6 +162,10 @@ export interface RoutedLlmConfig extends Omit<LlmConfig, 'provider'> {
 /**
  * A named LLM connection. Endpoint and credentials live here once; routes
  * point at one by id instead of repeating them.
+ *
+ * In `connections` this is a model endpoint. The same shape also carries a CLI
+ * agent to the places that call it one-shot (see `llmTargets`), which is why
+ * `provider` still admits the CLIs.
  */
 export interface LlmConnection extends LlmConfig {
   /** Stable key routes reference. Never reused for a different endpoint. */
@@ -493,10 +506,23 @@ export interface KnodeConfig {
    * become an ordinary row without touching any of them.
    */
   llm: LlmConfig;
-  /** Every configured LLM connection, including whichever one is the default. */
+  /**
+   * Every configured model endpoint, including whichever one is the default.
+   * Coding-agent CLIs are agents and live in `playbooks/agents/` —
+   * `migrateCliConnections` moves any left here.
+   */
   connections: LlmConnection[];
-  /** Which `connections` entry is the default. */
+  /**
+   * What the default is: a `connections` entry, or — on a machine with no model
+   * endpoint — a CLI agent's name.
+   */
   llmUse: string;
+  /**
+   * The CLI agents under `playbooks/agents/`, as the one-shot LLMs a pipeline
+   * route or the default can run on. Read from the files on load and whenever
+   * an agent is saved; never written to the config file.
+   */
+  agentLlms?: LlmConnection[];
   server: { port: number; host: string; mcp: McpServerConfig };
   ingest: IngestConfig;
   extraction: ExtractionConfig;
@@ -748,11 +774,22 @@ function deepMerge<T>(base: T, override: Partial<T>): T {
 export function loadConfig(dataDir: string): KnodeConfig {
   const file = path.join(dataDir, CONFIG_FILE);
   const base = defaultConfig();
-  if (!fs.existsSync(file)) return migrateEmbeddingProviders(migrateDefaultLlm(base));
+  // before the default is resolved: it may name a CLI agent
+  base.agentLlms = readAgentLlms(dataDir);
+  if (!fs.existsSync(file)) return migrateEmbeddingProviders(migrateCliConnections(migrateDefaultLlm(base), dataDir));
   const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<KnodeConfig>;
+  const merged = migrateChatConfig(deepMerge(base, raw));
+  merged.agentLlms = base.agentLlms;
   // routes first: it may already have minted a connection for this endpoint,
-  // and the default must reuse that row rather than add a twin
-  return migrateEmbeddingProviders(migrateDefaultLlm(migrateRouteConnections(migrateChatConfig(deepMerge(base, raw)))));
+  // and the default must reuse that row rather than add a twin; CLI rows move
+  // out last, once both have had their say about which rows exist
+  const routed = migrateDefaultLlm(migrateRouteConnections(merged));
+  const movesCli = routed.connections.some((c) => isCliProvider(c.provider));
+  const config = migrateEmbeddingProviders(migrateCliConnections(routed, dataDir));
+  // the move wrote agent files, so the config that no longer names those rows
+  // is written too — otherwise every load would move them again
+  if (movesCli) saveConfig(dataDir, config);
+  return config;
 }
 
 /**
@@ -827,8 +864,9 @@ export function migrateRouteConnections(config: KnodeConfig): KnodeConfig {
  */
 export function migrateDefaultLlm(config: KnodeConfig): KnodeConfig {
   const connections = [...(config.connections ?? [])];
-  if (!connections.some((c) => c.id === config.llmUse)) {
-    const existing = connections.find((c) => sameEndpoint(c, config.llm) && c.model === config.llm.model);
+  const targets = llmTargets({ ...config, connections });
+  if (!targets.some((c) => c.id === config.llmUse)) {
+    const existing = targets.find((c) => sameEndpoint(c, config.llm) && c.model === config.llm.model);
     if (existing) {
       config.llmUse = existing.id;
     } else {
@@ -842,14 +880,15 @@ export function migrateDefaultLlm(config: KnodeConfig): KnodeConfig {
 
 /**
  * The connection the default points at. A dangling `llmUse` falls back to the
- * first rather than failing — deleting the default demotes it, it does not
- * leave the workspace without a model.
+ * first model endpoint, then the first CLI agent, rather than failing —
+ * deleting the default demotes it, it does not leave the workspace without a
+ * model.
  */
-export function activeLlm(config: Pick<KnodeConfig, 'llm' | 'connections' | 'llmUse'>): LlmConnection {
-  const connections = config.connections ?? [];
+export function activeLlm(config: Pick<KnodeConfig, 'llm' | 'connections' | 'llmUse' | 'agentLlms'>): LlmConnection {
+  const targets = llmTargets(config);
   return (
-    connections.find((c) => c.id === config.llmUse) ??
-    connections[0] ?? {
+    targets.find((c) => c.id === config.llmUse) ??
+    targets[0] ?? {
       ...config.llm,
       id: config.llmUse || 'default-1',
       label: config.llm.label?.trim() || llmProviderLabel(config.llm.provider),
@@ -863,6 +902,144 @@ export function syncActiveLlm(config: KnodeConfig): KnodeConfig {
   config.llm = endpoint;
   config.llmUse = id;
   return config;
+}
+
+/**
+ * Everything a pipeline route or the default can run on: the model endpoints,
+ * then the CLI agents, called one-shot. An endpoint wins an id clash, since it
+ * is what the config itself names.
+ */
+export function llmTargets(config: Pick<KnodeConfig, 'connections' | 'agentLlms'>): LlmConnection[] {
+  const connections = config.connections ?? [];
+  const agents = (config.agentLlms ?? []).filter((a) => !connections.some((c) => c.id === a.id));
+  return [...connections, ...agents];
+}
+
+/** How long a CLI agent's one-shot call may take; agent files carry no timeout of their own for it. */
+const CLI_ONE_SHOT_TIMEOUT_MS = 300_000;
+
+/** The CLI agents under `playbooks/agents/`, shaped as the connections `llmTargets` hands on. */
+export function readAgentLlms(dataDir: string): LlmConnection[] {
+  const out: LlmConnection[] = [];
+  for (const name of agentFileNames(dataDir)) {
+    const raw = readAgentFile(dataDir, name);
+    const executor = typeof raw?.executor === 'string' ? raw.executor.trim() : '';
+    if (!raw || !isCliProvider(executor)) continue;
+    const text = (key: string) => (typeof raw[key] === 'string' ? (raw[key] as string).trim() : '');
+    out.push({
+      id: name,
+      label: text('title') || name,
+      provider: executor,
+      baseUrl: '',
+      apiKey: '',
+      model: text('model'),
+      cliPath: text('cliPath'),
+      effort: LLM_EFFORTS.includes(raw.effort as LlmEffort) ? (raw.effort as LlmEffort) : 'default',
+      cliTimeoutMs: CLI_ONE_SHOT_TIMEOUT_MS,
+    });
+  }
+  return out;
+}
+
+/**
+ * Move coding-agent CLIs out of `connections` and into `playbooks/agents/`.
+ *
+ * A CLI is an agent that brings its own loop, not a model endpoint. Keeping it
+ * among the models made "cursor" the default *LLM*, and made the built-in deep
+ * agent — which follows the default — quietly run Cursor instead of deepagents.
+ *
+ * Each row becomes an agent file under its own id, so every route, `llmUse`,
+ * research role and agent spec that named it keeps resolving; `llmTargets`
+ * hands CLI agents back to the pipeline as one-shot LLMs. Agents that ran on a
+ * row — by its id, or as a bare CLI name borrowing its model — take its path
+ * and model into their own file, and a bare `research.agent` / `chat.agent`
+ * becomes the agent it was borrowing from, so nothing runs differently.
+ *
+ * The one deliberate change: a default that was a CLI moves to the first model
+ * endpoint that has a model, because deepagents follows the default and
+ * cannot run on a CLI. A workspace with no such endpoint keeps the CLI.
+ *
+ * Idempotent: once the rows are gone there is nothing left to move.
+ */
+export function migrateCliConnections(config: KnodeConfig, dataDir: string): KnodeConfig {
+  const cli = (config.connections ?? []).filter((c) => isCliProvider(c.provider));
+  if (cli.length === 0) return config;
+
+  const before = new Set(agentFileNames(dataDir));
+  const names = new Map<string, string>();
+  for (const connection of cli) {
+    const existing = readAgentFile(dataDir, connection.id);
+    // a rerun finds its own file; a different agent under that name keeps it
+    const reuse = isValidAgentName(connection.id) && (!existing || existing.executor === connection.provider);
+    const name = reuse ? connection.id : uniqueAgentName(dataDir, connection.id, connection.provider);
+    if (!readAgentFile(dataDir, name)) {
+      writeAgentFile(dataDir, name, {
+        name,
+        title: connection.label?.trim() || llmProviderLabel(connection.provider),
+        description: '',
+        kind: 'general',
+        executor: connection.provider,
+        cliPath: connection.cliPath ?? '',
+        model: connection.model ?? '',
+        effort: connection.effort ?? 'default',
+        // what a bare spec used to launch with, so Ask on it behaves the same
+        tools: { write: true, files: true, web: 'inherit' },
+        maxTurns: 0,
+        timeoutMs: 0,
+        prompt: '',
+      });
+    }
+    names.set(connection.id, name);
+  }
+
+  // the row a bare CLI name borrowed its path and model from: the default's
+  // when it runs that CLI, else the first that does (see `bareAgentFor`)
+  const lender = (provider: string) =>
+    cli.find((c) => c.id === config.llmUse && c.provider === provider) ?? cli.find((c) => c.provider === provider);
+
+  const created = new Set(names.values());
+  for (const name of before) {
+    if (created.has(name)) continue;
+    const raw = readAgentFile(dataDir, name);
+    const executor = typeof raw?.executor === 'string' ? raw.executor.trim() : '';
+    if (!raw || !executor) continue;
+    const source = cli.find((c) => c.id === executor) ?? (isCliProvider(executor) && !raw.model && !raw.cliPath ? lender(executor) : undefined);
+    if (!source) continue;
+    writeAgentFile(dataDir, name, {
+      ...raw,
+      executor: source.provider,
+      cliPath: (typeof raw.cliPath === 'string' && raw.cliPath.trim()) || source.cliPath || '',
+      model: (typeof raw.model === 'string' && raw.model.trim()) || source.model || '',
+    });
+  }
+
+  for (const key of ROUTE_KEYS) {
+    const route = config.extraction[key];
+    if (route?.use && names.has(route.use)) route.use = names.get(route.use)!;
+  }
+  for (const key of ['research', 'chat'] as const) {
+    const spec = config[key]?.agent?.trim();
+    if (!spec) continue;
+    const source = names.has(spec) ? cli.find((c) => c.id === spec) : isCliProvider(spec) ? lender(spec) : undefined;
+    if (source) config[key].agent = names.get(source.id)!;
+  }
+
+  config.connections = config.connections.filter((c) => !isCliProvider(c.provider));
+  if (names.has(config.llmUse)) {
+    const model = config.connections.find((c) => c.model && c.baseUrl);
+    config.llmUse = model?.id ?? names.get(config.llmUse)!;
+  }
+  config.agentLlms = readAgentLlms(dataDir);
+  console.warn(`knode: ${[...names.values()].join(', ')} moved from connections to playbooks/agents/ — a coding-agent CLI is an agent now (Settings → Providers & Agents)`);
+  return syncActiveLlm(config);
+}
+
+function uniqueAgentName(dataDir: string, id: string, provider: string): string {
+  const base = isValidAgentName(`${id}-agent`) ? `${id}-agent` : provider;
+  for (let n = 1; ; n++) {
+    const name = n === 1 ? base : `${base}-${n}`;
+    if (!readAgentFile(dataDir, name)) return name;
+  }
 }
 
 function sameEndpoint(a: LlmConfig, b: LlmConfig): boolean {
@@ -968,7 +1145,9 @@ export function llmProviderLabel(provider: LlmProvider): string {
 
 export function saveConfig(dataDir: string, config: KnodeConfig): void {
   const file = path.join(dataDir, CONFIG_FILE);
-  fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
+  // derived from the agent files; writing it would make two copies to disagree
+  const { agentLlms: _derived, ...persisted } = config;
+  fs.writeFileSync(file, JSON.stringify(persisted, null, 2) + '\n');
 }
 
 /** Resolve "env:VAR" indirection in API keys. */
@@ -986,6 +1165,8 @@ export function resolveDataDir(flag?: string): string {
 /** Redact secrets for API exposure. */
 export function redactConfig(config: KnodeConfig): KnodeConfig {
   const clone = JSON.parse(JSON.stringify(config)) as KnodeConfig;
+  // clients read agents from /api/agents; this copy is the service's own
+  delete clone.agentLlms;
   const secretHolders = [
     clone.embedding,
     clone.llm,

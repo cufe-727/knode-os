@@ -2112,8 +2112,9 @@ async function loadModelList(spec, picker, input, refresh = false) {
   renderModelPicker(picker, spec, input);
   try {
     const config = gatherConfig();
-    // a provider override asks the default route as if that CLI were selected
-    if (spec.provider) config.llm = { ...config.llm, provider: spec.provider, baseUrl: '', apiKey: '', model: '', cliPath: '' };
+    // a provider override asks the default route as if that CLI — at that
+    // path — were selected
+    if (spec.provider) config.llm = { ...config.llm, provider: spec.provider, baseUrl: '', apiKey: '', model: '', cliPath: spec.cliPath || '' };
     const result = await api('/api/config/models', {
       method: 'POST',
       body: JSON.stringify({ route: spec.route, refresh, config }),
@@ -2162,32 +2163,40 @@ function openModelPicker(anchor, input, spec) {
 
 /** A model input keeps its free text and gains a chevron that lists what the provider offers. */
 /**
- * Which `/api/config/models` route lists what an executor offers, and the
- * draft to list it against.
+ * Which `/api/config/models` route lists what a spec offers, and the draft to
+ * list it against.
  *
- * A bare CLI name is not an endpoint, so `connection:cursor-cli` is a 400.
- * Ask the default route with that provider swapped into the draft instead —
- * the same thing the macOS client does.
+ * An agent lists through its runtime: a deepagents agent on the model it runs
+ * on, a CLI agent as that CLI at its own path. A CLI is not an endpoint, so
+ * ask the default route with it swapped into the draft instead — the same
+ * thing the macOS client does.
  */
-function executorModelRoute(executor) {
-  if (!executor || executor === 'default') return { route: 'llm' };
-  if (connectionById(executor)) return { route: `connection:${executor}` };
-  return { route: 'llm', provider: executor };
+function executorModelRoute(spec) {
+  const agent = agentDrafts.find((a) => a.name === spec);
+  if (agent) {
+    if (CLI_PROVIDERS.includes(agent.executor)) return { route: 'llm', provider: agent.executor, cliPath: agent.cliPath || '' };
+    const endpoint = modelEndpoint(agent);
+    return endpoint ? { route: `connection:${endpoint.id}` } : { route: 'llm' };
+  }
+  if (!spec || spec === 'default') return { route: 'llm' };
+  if (connectionById(spec)) return { route: `connection:${spec}` };
+  // a bare CLI borrows the path of a CLI agent running it, as it runs
+  return { route: 'llm', provider: spec, cliPath: llmTargets().find((t) => t.provider === spec)?.cliPath || '' };
 }
 
-/** The cache key: two chevrons on one route but different providers are two lists. */
-const modelListKey = ({ route, provider }) => `${route}|${provider ?? ''}`;
+/** The cache key: two chevrons on one route but different CLIs or paths are two lists. */
+const modelListKey = ({ route, provider, cliPath }) => `${route}|${provider ?? ''}|${cliPath ?? ''}`;
 
 function modelChevron(spec) {
-  const { route, provider } = typeof spec === 'string' ? { route: spec } : spec;
-  return `<button type="button" class="model-chevron" data-route="${esc(route)}"${provider ? ` data-provider="${esc(provider)}"` : ''} title="List the models this provider offers">⌄</button>`;
+  const { route, provider, cliPath } = typeof spec === 'string' ? { route: spec } : spec;
+  return `<button type="button" class="model-chevron" data-route="${esc(route)}"${provider ? ` data-provider="${esc(provider)}"` : ''}${cliPath ? ` data-cli-path="${esc(cliPath)}"` : ''} title="List the models this provider offers">⌄</button>`;
 }
 
 document.addEventListener('click', (event) => {
   const chevron = event.target.closest?.('.model-chevron');
   if (!chevron) return;
   const input = chevron.parentElement.querySelector('input');
-  if (input) openModelPicker(chevron, input, { route: chevron.dataset.route, provider: chevron.dataset.provider });
+  if (input) openModelPicker(chevron, input, { route: chevron.dataset.route, provider: chevron.dataset.provider, cliPath: chevron.dataset.cliPath });
 });
 
 /**
@@ -2208,36 +2217,91 @@ function connectionById(id) {
   return connectionDrafts.find((c) => c.id === id);
 }
 
-/** The connection every job inherits, or null while the list is loading. */
+/**
+ * A CLI agent as a stage or the default sees it: a one-shot LLM — the mirror
+ * of the service's `readAgentLlms`. The agent itself lives in `agentDrafts`.
+ */
+function agentTarget(agent) {
+  return {
+    id: agent.name,
+    label: (agent.title || '').trim() || agent.name,
+    provider: agent.executor,
+    model: agent.model || '',
+    cliPath: agent.cliPath || '',
+    effort: agent.effort || 'default',
+    agent: true,
+  };
+}
+
+/**
+ * Everything a stage or the default can run on: the models, then the CLI
+ * agents, called one-shot — the mirror of the service's `llmTargets`. A model
+ * wins an id clash, since it is what the config itself names.
+ */
+function llmTargets() {
+  const agents = agentDrafts.filter((a) => CLI_PROVIDERS.includes(a.executor) && !connectionById(a.name)).map(agentTarget);
+  return [...connectionDrafts, ...agents];
+}
+
+function targetById(id) {
+  return llmTargets().find((t) => t.id === id);
+}
+
+/**
+ * What the default is — a model, or on a machine with none a CLI agent — or
+ * null while the lists are loading. A dangling `llmUse` falls back the way the
+ * service's `activeLlm` does.
+ */
 function defaultConnection() {
-  return connectionDrafts.find((c) => c.id === llmUse) ?? connectionDrafts[0] ?? null;
+  const targets = llmTargets();
+  return targets.find((c) => c.id === llmUse) ?? targets[0] ?? null;
+}
+
+/** The model a deepagents agent runs on: the one it pins, or the default while that is a model. */
+function modelEndpoint(agent) {
+  if (CLI_PROVIDERS.includes(agent.executor)) return null;
+  if (agent.executor === 'default') {
+    const def = defaultConnection();
+    return def?.provider === 'openai' ? def : null;
+  }
+  return connectionById(agent.executor) ?? null;
 }
 
 /**
  * The model a route runs with when it names none of its own — the mirror of
- * the service's `resolveRoutedLlmConfig`.
+ * the service's `resolveRoutedLlmConfig`, over the models and the CLI agents.
  *
  * Shown as a Model field's placeholder and never written: an empty `model`
  * means "follow this provider", so pinning the string would stop the route
  * tracking the provider's own model.
  */
 function inheritedModelFor(use) {
-  const connection = connectionById(use);
-  if (connection) return connection.model || '';
-  // '' and 'default' follow whichever connection is the default; a bare CLI
-  // name brings its own default, which is not a string we can name
+  const target = targetById(use);
+  if (target) return target.model || '';
+  // '' and 'default' follow whatever the default is
   return (!use || use === 'default') ? (defaultConnection()?.model || '') : '';
 }
 
 /**
  * The same for an agent spec, which may be an agent *name* — and a name can
  * legitimately be `default`, so this never shares a lookup with the route rule.
+ * The mirror of the service's `resolveAgentSpec`: a CLI agent carries its own
+ * model and inherits nothing; a deepagents agent takes its model endpoint's; a
+ * bare CLI borrows the model of a CLI agent running it, the default's first.
  */
 function inheritedAgentModelFor(spec) {
   const wanted = (spec || '').trim();
   const agent = agentDrafts.find((a) => a.name === wanted);
-  if (agent) return agent.model || inheritedModelFor(agent.executor);
-  return inheritedModelFor(wanted);
+  if (agent) {
+    if (agent.model || CLI_PROVIDERS.includes(agent.executor)) return agent.model || '';
+    return modelEndpoint(agent)?.model || '';
+  }
+  if (wanted === 'default') return defaultConnection()?.model || '';
+  const target = targetById(wanted);
+  if (target) return target.model || '';
+  if (!CLI_PROVIDERS.includes(wanted)) return '';
+  const def = defaultConnection();
+  return ((def?.provider === wanted ? def : llmTargets().find((t) => t.provider === wanted))?.model) || '';
 }
 
 const EMBEDDING_PROVIDER_OPTIONS = [
@@ -2289,10 +2353,10 @@ function defaultLlmSummaryText() {
 function routeSummary(prefix) {
   const use = $(`#cfg-${prefix}-use`).value;
   const model = $(`#cfg-${prefix}-model`).value.trim();
-  const connection = connectionById(use);
+  const target = targetById(use);
   const fallback = defaultConnection()?.label?.trim() || 'Default model';
   return {
-    provider: connection ? connection.label || connection.id : fallback,
+    provider: target ? target.label || target.id : fallback,
     // an inheriting route prints what it inherits, not a blank
     model: model || inheritedModelFor(use),
   };
@@ -2308,15 +2372,23 @@ function fillEmbeddingOptions() {
   embeddingUse = select.value;
 }
 
-/** Rebuild the per-route pickers from the current connection list. */
+/**
+ * Rebuild the per-route pickers: the default, the models, then the CLI agents
+ * a stage can call one-shot. Keeps a selection that still exists.
+ */
 function fillRouteOptions() {
+  const def = defaultConnection();
+  const agents = llmTargets().filter((t) => t.agent);
   for (const prefix of ['entity', 'concept', 'document']) {
     const select = $(`#cfg-${prefix}-use`);
     const previous = select.value;
-    select.innerHTML = ['<option value="">Default reasoning model</option>']
+    select.innerHTML = [`<option value="">Default LLM${def ? ` · ${esc(def.label || def.id)}` : ''}</option>`]
       .concat(connectionDrafts.map((c) => `<option value="${esc(c.id)}">${esc(c.label || c.id)}</option>`))
+      .concat(agents.length
+        ? [`<optgroup label="Agents, one call at a time">${agents.map((a) => `<option value="${esc(a.id)}">${esc(a.label)} · ${esc(providerNames[a.provider] ?? a.provider)}</option>`).join('')}</optgroup>`]
+        : [])
       .join('');
-    select.value = connectionDrafts.some((c) => c.id === previous) ? previous : '';
+    select.value = targetById(previous) ? previous : '';
   }
   refreshResearchAgentOptions();
 }
@@ -2391,15 +2463,18 @@ function paintInheritedPlaceholders() {
 
 function routeProviderToggle(prefix) {
   const note = $(`#cfg-${prefix}-note`);
-  const connection = connectionById($(`#cfg-${prefix}-use`).value);
-  if (!connection) {
-    const provider = defaultConnection()?.provider ?? 'openai';
-    note.innerHTML = `<b>Inherited route.</b> Runs on the default provider (${esc(providerNames[provider] ?? provider)}).`;
-  } else if (connection.provider === 'openai') {
-    note.innerHTML = `<b>${esc(connection.label || connection.id)}</b> · ${esc(connection.baseUrl.trim() || 'no endpoint set')}`;
+  const target = targetById($(`#cfg-${prefix}-use`).value);
+  if (!target) {
+    const def = defaultConnection();
+    note.innerHTML = def
+      ? `<b>Inherited route.</b> Runs on the default LLM (${esc(def.label || def.id)}).`
+      : '<b>Inherited route.</b> Nothing to run on yet — add a model in section 01.';
+  } else if (target.provider === 'openai') {
+    note.innerHTML = `<b>${esc(target.label || target.id)}</b> · ${esc((target.baseUrl || '').trim() || 'no endpoint set')}`;
   } else {
-    const meta = cliMeta[connection.provider];
-    note.innerHTML = `<b>${esc(connection.label || connection.id)}</b> · ${esc(meta ? meta.command : connection.provider)}`;
+    // a CLI agent, called one-shot with its own path
+    const meta = cliMeta[target.provider];
+    note.innerHTML = `<b>${esc(target.label || target.id)}</b> · agent, one call at a time · ${esc(target.cliPath || (meta ? meta.command : target.provider))}`;
   }
   updateConfigSummaries();
 }
@@ -2407,12 +2482,10 @@ function routeProviderToggle(prefix) {
 function fillRoute(prefix, route = {}) {
   const use = route.use === 'default' ? '' : route.use || '';
   const select = $(`#cfg-${prefix}-use`);
-  select.value = connectionById(use) ? use : '';
+  select.value = targetById(use) ? use : '';
   $(`#cfg-${prefix}-model`).value = route.model || '';
   routeProviderToggle(prefix);
 }
-
-const PROVIDER_OPTIONS = ['openai', 'codex-cli', 'claude-cli', 'cursor-cli'];
 
 const optionsFor = (pairs, selected) =>
   pairs.map(([v, l]) => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(l)}</option>`).join('');
@@ -2450,18 +2523,19 @@ function embeddingFields(entry) {
     <p class="cfg-callout">${esc(EMB_NOTES[entry.provider] ?? EMB_NOTES.openai)}</p>`;
 }
 
+/**
+ * An LLM row is a model endpoint: where it is, its key, its wire and which
+ * model. The coding-agent CLIs that used to be picked here are agents now, in
+ * the table below, with their path and effort.
+ */
 function llmFields(entry, route) {
-  const api = entry.provider === 'openai';
   return `<div class="cfg-grid cfg-grid-2">
-      <label>Provider<select data-field="provider">${optionsFor(PROVIDER_OPTIONS.map((p) => [p, providerNames[p] ?? p]), entry.provider)}</select></label>
-      <label>Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="${api ? 'gpt-4.1-mini' : 'Use CLI default'}" />${modelChevron(route)}</span></label>
-      ${api ? `<label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1" /></label>
+      <label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1" /></label>
       <label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY" /></label>
-      <label>Protocol<select data-field="protocol">${optionList(PROTOCOL_OPTIONS, entry.protocol || 'auto')}</select></label>`
-    : `<label>Reasoning effort<select data-field="effort">${optionList(EFFORT_OPTIONS, entry.effort || 'default')}</select></label>
-      <label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(entry.cliPath || '')}" placeholder="Default: ${esc(cliMeta[entry.provider]?.path ?? '')}" /></label>`}
+      <label>Protocol<select data-field="protocol">${optionList(PROTOCOL_OPTIONS, entry.protocol || 'auto')}</select></label>
+      <label class="cfg-span-2">Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="gpt-4.1-mini" />${modelChevron(route)}</span></label>
     </div>
-    <p class="cfg-callout">${esc(LLM_NOTES[entry.provider] ?? LLM_NOTES.openai)}</p>`;
+    <p class="cfg-callout">${esc(LLM_NOTES.openai)}</p>`;
 }
 
 function renderProviders() {
@@ -2561,6 +2635,10 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     embeddingUse = cfg.embeddingUse || embeddingDrafts[0]?.id || '';
     connectionDrafts = (cfg.connections ?? []).map((c) => ({ ...c }));
     llmUse = cfg.llmUse || connectionDrafts[0]?.id || '';
+    // agents before routes: a stage may run on a CLI agent, and a route
+    // filled before its agent exists would read — and then save — as the default
+    await loadAgentsList();
+    if (activeWorkspace()?.id !== workspaceId) return;
     renderProviders();
     fillRouteOptions();
     fillRoute('entity', cfg.extraction?.entityLlm);
@@ -2573,7 +2651,6 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-ingest-concurrency').value = cfg.ingest?.concurrency ?? 4;
     $('#cfg-ingest-convert').value = cfg.ingest?.convertConcurrency ?? 2;
     $('#cfg-emb-batch').value = activeEmbedding()?.batchSize ?? 32;
-    await loadAgentsList();
     fillResearchForm(cfg.research ?? {});
     fillChatForm(cfg.chat ?? {});
     renderAgents();
@@ -2647,10 +2724,15 @@ function gatherConfig() {
 /* ---------- 03 · agents: who runs a research job or a chat turn ---------- */
 
 /**
- * Named agents. Each is its own file under `playbooks/agents/`, so unlike the
- * rest of this screen they are written the moment one is added or removed —
- * Research cannot point at a name that does not exist yet. Field edits still
- * wait for Save & apply, along with everything else.
+ * Agents, one row each whichever runtime they have: the built-in deepagents
+ * loop on one of the models above, or a coding-agent CLI that brings its own
+ * loop, path and model. The CLIs used to sit among the models, which made
+ * "cursor" the default *LLM* and let the deep agent quietly run Cursor.
+ *
+ * Each agent is its own file under `playbooks/agents/`, so unlike the rest of
+ * this screen they are written the moment one is added or removed — Research
+ * cannot point at a name that does not exist yet. Field edits still wait for
+ * Save & apply, along with everything else.
  */
 let agentDrafts = [];
 const expandedAgents = new Set();
@@ -2660,85 +2742,120 @@ const AGENT_EFFORTS = [
   ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max'],
 ];
 const AGENT_WEB = [['inherit', 'Follow review.external'], ['on', 'On (within review.external)'], ['off', 'Off']];
+const AGENT_TYPES = { 'claude-cli': 'Claude Code', 'codex-cli': 'Codex', 'cursor-cli': 'Cursor' };
+
+const isCliAgent = (agent) => CLI_PROVIDERS.includes(agent.executor);
 
 function agentById(name) {
   return agentDrafts.find((a) => a.name === name);
 }
 
-function executorLabel(executor) {
-  if (executor === 'default') return 'Default LLM provider';
-  const connection = connectionById(executor);
-  if (connection) return connection.label || connection.id;
-  return providerNames[executor] ?? executor;
+/** Where an agent runs, by the names the tables use. */
+function agentRunsOn(agent) {
+  if (isCliAgent(agent)) {
+    const command = cliMeta[agent.executor]?.path ?? agent.executor;
+    return agent.cliPath ? { name: agent.cliPath, help: agent.cliPath } : { name: 'From PATH', help: `${command}, found on the service PATH` };
+  }
+  if (agent.executor === 'default') {
+    const def = defaultConnection();
+    const name = def ? def.label || def.id : 'Default LLM';
+    return { name, note: 'follows default', help: `Follows the default LLM — ${name} for now. Make another model the default and this agent moves with it.` };
+  }
+  const connection = connectionById(agent.executor);
+  return connection ? { name: connection.label || connection.id, help: connection.baseUrl || '' } : { name: agent.executor || 'Not configured', help: '' };
 }
 
-function executorOptions(selected) {
-  const opts = [`<option value="default"${selected === 'default' ? ' selected' : ''}>Default LLM provider</option>`];
-  for (const p of CLI_PROVIDERS) {
-    opts.push(`<option value="${p}"${p === selected ? ' selected' : ''}>${esc(providerNames[p])} · from PATH</option>`);
-  }
-  for (const c of connectionDrafts) {
-    opts.push(`<option value="${esc(c.id)}"${c.id === selected ? ' selected' : ''}>${esc(c.label || c.id)}</option>`);
-  }
-  return opts.join('');
+/** The model a row runs: its own, else what its model endpoint brings. */
+function agentModelSummary(agent) {
+  if (agent.model) return { text: agent.model, help: agent.model, pinned: true };
+  const endpoint = modelEndpoint(agent);
+  if (endpoint?.model) return { text: endpoint.model, help: `Inherited from ${endpoint.label || endpoint.id}` };
+  return { text: isCliAgent(agent) ? 'CLI default' : 'its own default', help: '' };
 }
 
-function agentFields(agent) {
-  // A deep-research agent contributes only its executor and model: the runner
-  // takes everything else from the profile in section 03, which is a property
-  // of the research rather than of who runs it. A dead form that says so beats
-  // a live-looking one that changes nothing.
-  const deep = agent.kind === 'deep-research';
-  const off = deep ? ' disabled' : '';
-  const note = deep
-    ? 'A research run takes effort, turns, timeout, tools and prompt from its profile in section 03 — these do not apply to a deep-research agent yet.'
-    : 'These apply when this agent answers directly, which today means Ask.';
+/** Why an agent cannot run, in words that say what to change; '' when it can. */
+function agentProblem(agent) {
+  if (isCliAgent(agent)) return '';
+  const endpoint = modelEndpoint(agent);
+  if (agent.executor === 'default' && !endpoint) return 'deepagents runs on a model, and the default is a CLI agent — pick a model for it.';
+  if (!endpoint) return 'Its executor cannot run here — pick another one.';
+  if (!endpoint.model && !agent.model) return `${endpoint.label || endpoint.id} has no model set.`;
+  return '';
+}
+
+function deepagentsFields(agent) {
+  const def = defaultConnection();
+  const options = [`<option value="default"${agent.executor === 'default' ? ' selected' : ''}>Follow the default LLM${def ? ` · ${esc(def.label || def.id)}` : ''}</option>`]
+    .concat(connectionDrafts.map((c) => `<option value="${esc(c.id)}"${c.id === agent.executor ? ' selected' : ''}>${esc(c.label || c.id)}</option>`))
+    .join('');
   return `<div class="cfg-grid cfg-grid-2">
-      <label>Runs on<select data-field="executor">${executorOptions(agent.executor)}</select></label>
-      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="${esc(inheritedModelFor(agent.executor) || 'Its own default')}" />${modelChevron(executorModelRoute(agent.executor))}</span></label>
+      <label>Runs on<select data-field="executor">${options}</select></label>
+      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="${esc(modelEndpoint(agent)?.model || 'Its own default')}" />${modelChevron(executorModelRoute(agent.name))}</span></label>
       <label class="cfg-span-2">Description<input data-field="description" value="${esc(agent.description || '')}" placeholder="When to pick this agent" /></label>
     </div>
-    <p class="cfg-callout${deep ? ' bad' : ''}">${esc(note)}</p>
-    <div class="cfg-grid cfg-grid-2">
-      <label>Reasoning effort<select data-field="effort"${off}>${optionList(AGENT_EFFORTS, agent.effort)}</select></label>
-      <label>Web access<select data-field="web"${off}>${optionList(AGENT_WEB, agent.tools?.web ?? 'inherit')}</select></label>
-      <label>Turns per session<input data-field="maxTurns" type="number" min="0" step="1" value="${esc(agent.maxTurns ?? 0)}" placeholder="0 = the caller's default"${off} /></label>
-      <label>Timeout (minutes)<input data-field="timeoutMinutes" type="number" min="0" step="1" value="${esc(Math.round((agent.timeoutMs ?? 0) / 60000))}" placeholder="0 = the caller's default"${off} /></label>
+    <p class="cfg-callout">The built-in deepagents loop runs inside the service on this model. It has no reasoning-effort switch and no web tool.</p>
+    ${agentLimits(agent)}`;
+}
+
+function cliFields(agent) {
+  const cliOptions = CLI_PROVIDERS.map((p) => `<option value="${p}"${p === agent.executor ? ' selected' : ''}>${esc(providerNames[p])}</option>`).join('');
+  return `<div class="cfg-grid cfg-grid-2">
+      <label>CLI<select data-field="executor">${cliOptions}</select></label>
+      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="Use CLI default" />${modelChevron(executorModelRoute(agent.name))}</span></label>
+      <label>Reasoning effort<select data-field="effort">${optionList(AGENT_EFFORTS, agent.effort || 'default')}</select></label>
+      <label>Web access<select data-field="web">${optionList(AGENT_WEB, agent.tools?.web ?? 'inherit')}</select></label>
+      <label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(agent.cliPath || '')}" placeholder="Default: ${esc(cliMeta[agent.executor]?.path ?? '')} from PATH" /></label>
+      <label class="cfg-span-2">Description<input data-field="description" value="${esc(agent.description || '')}" placeholder="When to pick this agent" /></label>
+    </div>
+    <p class="cfg-callout">${esc(LLM_NOTES[agent.executor] ?? '')}</p>
+    ${agentLimits(agent)}
+    ${agent.name === llmUse ? '' : '<p class="cfg-callout"><button type="button" class="hint-action agent-default">make default</button> Jobs that name no model run on this CLI instead, one call at a time — for a machine with no model endpoint.</p>'}`;
+}
+
+/** What every agent has, whichever runtime: limits, tool grants, the prompt, and who reads them. */
+function agentLimits(agent) {
+  return `<div class="cfg-grid cfg-grid-2">
+      <label>Turns per session<input data-field="maxTurns" type="number" min="0" step="1" value="${esc(agent.maxTurns ?? 0)}" placeholder="0 = the caller's default" /></label>
+      <label>Timeout (minutes)<input data-field="timeoutMinutes" type="number" min="0" step="1" value="${esc(Math.round((agent.timeoutMs ?? 0) / 60000))}" placeholder="0 = the caller's default" /></label>
     </div>
     <div class="cfg-checks">
-      <label class="cfg-check"><input data-field="write" type="checkbox"${agent.tools?.write ? ' checked' : ''}${off} /> Writes pages (knode_write / knode_commit)</label>
-      <label class="cfg-check"><input data-field="files" type="checkbox"${agent.tools?.files ? ' checked' : ''}${off} /> Reads files (Read / Grep / Glob)</label>
+      <label class="cfg-check"><input data-field="write" type="checkbox"${agent.tools?.write ? ' checked' : ''} /> Writes pages (knode_write / knode_commit)</label>
+      <label class="cfg-check"><input data-field="files" type="checkbox"${agent.tools?.files ? ' checked' : ''} /> Reads files (Read / Grep / Glob)</label>
     </div>
-    <label class="agent-prompt">System prompt<textarea data-field="prompt" rows="6" class="mono" spellcheck="false" placeholder="Empty = the protocol the run workspace already carries"${off}>${esc(agent.prompt || '')}</textarea></label>
-    <p class="cfg-callout">Stored at <span class="mono">${esc(agent.path || '')}</span>.</p>`;
+    <label class="agent-prompt">System prompt<textarea data-field="prompt" rows="6" class="mono" spellcheck="false" placeholder="Empty = the protocol the run workspace already carries">${esc(agent.prompt || '')}</textarea></label>
+    <p class="cfg-callout">Stored at <span class="mono">${esc(agent.path || '')}</span>. Ask runs with these settings; a research run takes effort, turns, timeout, tools and prompt from its profile in section 03 instead.</p>`;
 }
 
 function renderAgents() {
   const host = $('#cfg-agents');
   if (!agentDrafts.length) {
-    host.innerHTML = '<p class="cfg-callout">No agents yet — add one from a template: a general deep agent for Chat, or a deep-research agent that writes wiki pages.</p>';
+    host.innerHTML = '<p class="cfg-callout">No agents yet — add one: deepagents on one of the models above, or a coding-agent CLI on this machine.</p>';
     return;
   }
   host.innerHTML = agentDrafts
     .map((agent) => {
-      const deep = agent.kind === 'deep-research';
+      const cli = isCliAgent(agent);
       const open = expandedAgents.has(agent.name);
+      const where = agentRunsOn(agent);
+      const model = agentModelSummary(agent);
+      const problem = agentProblem(agent);
       const uses = [
+        cli && agent.name === llmUse ? '<span class="section-badge">default</span>' : '',
         $('#cfg-research-agent')?.value === agent.name ? '<span class="section-badge accent2">research</span>' : '',
-        $('#cfg-chat-agent')?.value === agent.name ? '<span class="section-badge">chat</span>' : '',
+        $('#cfg-chat-agent')?.value === agent.name ? '<span class="section-badge">ask</span>' : '',
       ].join('');
       return `<div class="provider-row${open ? ' open' : ''}" data-agent="${esc(agent.name)}">
         <div class="provider-line">
           <button type="button" class="provider-toggle agent-toggle" aria-expanded="${open}">${open ? '▾' : '▸'}</button>
-          <span class="section-badge${deep ? ' accent2' : ''}">${deep ? 'deep research' : 'general'}</span>
+          <span class="section-badge${cli ? '' : ' accent2'}">${esc(cli ? AGENT_TYPES[agent.executor] : 'deepagents')}</span>
           <input class="provider-name" data-field="title" value="${esc(agent.title || '')}" placeholder="Name this agent" />
           <span>${uses}</span>
-          <span class="provider-kind">${esc(executorLabel(agent.executor))}</span>
-          <span class="provider-model mono" title="${esc(agent.model || '')}">${esc(agent.model || 'its own default')}</span>
-          <span class="provider-id mono">${agent.runnable ? '' : '⚠ '}${esc(agent.name)}</span>
+          <span class="provider-kind" title="${esc(where.help)}">${esc(where.name)}${where.note ? ` <span class="soft">· ${esc(where.note)}</span>` : ''}</span>
+          <span class="provider-model mono${model.pinned ? ' pinned' : ''}" title="${esc(model.help)}">${esc(model.text)}</span>
+          <span class="provider-id mono">${problem ? `<span title="${esc(problem)}">⚠</span> ` : ''}${esc(agent.name)}</span>
           <button type="button" class="ghost agent-remove" title="${agent.builtin ? 'Reset this template to its built-in' : 'Remove this agent'}">${agent.builtin ? '⟲' : '✕'}</button>
         </div>
-        ${open ? `<div class="provider-detail">${agentFields(agent)}</div>` : ''}
+        ${open ? `<div class="provider-detail">${cli ? cliFields(agent) : deepagentsFields(agent)}</div>` : ''}
       </div>`;
     })
     .join('');
@@ -2752,24 +2869,34 @@ async function loadAgentsList() {
     agentDrafts = [];
   }
   renderAgents();
-  refreshResearchAgentOptions();
+  // a stage and the research pickers may name a CLI agent
+  fillRouteOptions();
 }
 
-/** A new agent is written straight away: Research cannot name what has no file. */
-async function addAgent(kind) {
-  const base = kind === 'deep-research' ? 'research' : 'agent';
-  let suffix = agentDrafts.length + 1;
-  while (agentDrafts.some((a) => a.name === `${base}-${suffix}`)) suffix += 1;
+/**
+ * A new agent is written straight away: Research cannot name what has no file.
+ * deepagents follows the default LLM while the default is a model; when it is
+ * a CLI agent there is nothing to follow, so the first model is pinned.
+ */
+async function addAgent(runtime) {
+  const cli = CLI_PROVIDERS.includes(runtime);
+  const base = cli ? runtime.replace(/-cli$/, '') : 'agent';
+  const taken = new Set([...agentDrafts.map((a) => a.name), ...connectionDrafts.map((c) => c.id)]);
+  let suffix = 1;
+  while (taken.has(`${base}-${suffix}`)) suffix += 1;
   const name = `${base}-${suffix}`;
+  const def = defaultConnection();
+  const executor = cli ? runtime : def?.provider === 'openai' ? 'default' : (connectionDrafts[0]?.id ?? 'default');
   try {
     await api(`/api/agents/${name}`, {
       method: 'PUT',
       body: JSON.stringify({
         agent: {
-          kind,
-          title: kind === 'deep-research' ? 'New research agent' : 'New agent',
-          executor: 'default',
-          tools: { write: kind === 'deep-research', files: true, web: 'inherit' },
+          kind: 'general',
+          title: cli ? providerNames[runtime] : 'New deepagents agent',
+          executor,
+          // what Ask needs to take notes; a CLI answers with its own tools anyway
+          tools: { write: true, files: true, web: 'inherit' },
         },
       }),
     });
@@ -2784,13 +2911,22 @@ async function removeAgent(name) {
   try {
     const { reset } = await api(`/api/agents/${name}`, { method: 'DELETE' });
     expandedAgents.delete(name);
+    // the service moves research, Ask, a pipeline route and the default off a
+    // deleted agent, so read those back rather than keep a name that is gone
+    const cfg = reset ? null : await api('/api/config');
+    if (cfg) llmUse = cfg.llmUse || llmUse;
     await loadAgentsList();
-    // the service moves research/chat off a deleted agent, so read them back
-    if (!reset) {
-      const cfg = await api('/api/config');
+    if (cfg) {
       $('#cfg-research-agent').value = cfg.research?.agent ?? '';
       $('#cfg-chat-agent').value = cfg.chat?.agent ?? '';
+      for (const prefix of ['entity', 'concept', 'document']) {
+        const use = cfg.extraction?.[`${prefix}Llm`]?.use ?? '';
+        $(`#cfg-${prefix}-use`).value = targetById(use) ? use : '';
+        routeProviderToggle(prefix);
+      }
+      renderProviders();
       refreshResearchAgentOptions();
+      renderAgents();
     }
   } catch (e) {
     $('#cfg-status').innerHTML = `<div class="cfg-line bad">could not remove the agent: ${esc(e.message)}</div>`;
@@ -2808,6 +2944,7 @@ async function saveAgents() {
           description: agent.description ?? '',
           kind: agent.kind,
           executor: agent.executor,
+          cliPath: agent.cliPath ?? '',
           model: agent.model ?? '',
           effort: agent.effort ?? 'default',
           tools: agent.tools ?? { write: false, files: true, web: 'inherit' },
@@ -2829,8 +2966,8 @@ for (const id of ['#cfg-research-agent', '#cfg-chat-agent']) {
 
 $('#cfg-add-agent').addEventListener('click', (event) => {
   showMenuUnder(event.currentTarget, [
-    { label: 'General agent', run: () => addAgent('general') },
-    { label: 'Deep research agent', run: () => addAgent('deep-research') },
+    { label: 'deepagents · on the default LLM', run: () => addAgent('deepagents') },
+    ...CLI_PROVIDERS.map((p) => ({ label: providerNames[p], run: () => addAgent(p) })),
   ]);
 });
 
@@ -2838,11 +2975,22 @@ $('#cfg-agents').addEventListener('input', (event) => {
   const row = event.target.closest?.('.provider-row');
   const field = event.target.dataset?.field;
   const agent = row && agentById(row.dataset.agent);
-  if (!agent || !field) return;
+  if (!agent || !field || event.target.type === 'checkbox' || event.target.tagName === 'SELECT') return;
   if (field === 'timeoutMinutes') agent.timeoutMs = (Number(event.target.value) || 0) * 60000;
   else if (field === 'maxTurns') agent.maxTurns = Number(event.target.value) || 0;
   else agent[field] = event.target.value;
-  if (field === 'title') refreshResearchAgentOptions();
+  // the model list is the CLI's at this path, not at the one it was drawn with
+  if (field === 'cliPath') row.querySelector('.model-chevron')?.setAttribute('data-cli-path', agent.cliPath);
+  // a CLI agent's name and model are what a stage or the default shows
+  if (field === 'title') fillRouteOptions();
+  if (field === 'model' || field === 'title') {
+    const cell = row.querySelector('.provider-model');
+    const summary = agentModelSummary(agent);
+    cell.textContent = summary.text;
+    cell.title = summary.help;
+    cell.classList.toggle('pinned', Boolean(summary.pinned));
+    updateConfigSummaries();
+  }
 });
 
 $('#cfg-agents').addEventListener('change', (event) => {
@@ -2860,7 +3008,11 @@ $('#cfg-agents').addEventListener('change', (event) => {
   }
   if (field !== 'executor' && field !== 'effort') return;
   agent[field] = event.target.value;
-  if (field === 'executor') renderAgents();
+  if (field === 'executor') {
+    renderAgents();
+    fillRouteOptions();
+    updateConfigSummaries();
+  }
 });
 
 $('#cfg-agents').addEventListener('click', (event) => {
@@ -2870,6 +3022,15 @@ $('#cfg-agents').addEventListener('click', (event) => {
   if (event.target.classList.contains('agent-toggle')) {
     if (expandedAgents.has(name)) expandedAgents.delete(name); else expandedAgents.add(name);
     renderAgents();
+    return;
+  }
+  if (event.target.classList.contains('agent-default')) {
+    // jobs that name no model run on this CLI agent now
+    llmUse = name;
+    renderProviders();
+    renderAgents();
+    fillRouteOptions();
+    updateConfigSummaries();
     return;
   }
   if (event.target.classList.contains('agent-remove')) removeAgent(name);
@@ -2898,32 +3059,41 @@ function optionList(pairs, selected) {
 // `fallbackLabel` is the meaning of the empty value: "follow the one above" for
 // chat and roles. The research agent has no such fallback any more — it gets
 // null, and an empty value is shown as the unconfigured state it is.
+//
+// The choices are the agents in section 01, each saying which runtime it is. A
+// config written before agents may name a bare CLI, the default or a model
+// straight; those keep resolving, so the one in use stays listed — only that one.
 function agentOptions(selected, fallbackLabel, kind = '') {
   const opts = fallbackLabel
     ? [`<option value="">${esc(fallbackLabel)}</option>`]
     : [`<option value=""${selected ? ' disabled' : ' selected'}>Not configured — pick an agent</option>`];
-  // the named agents from section 03 first, the kind this picker is for on top
+  // the kind this picker is for on top
   const named = [...agentDrafts].sort((a, b) => Number(b.kind === kind) - Number(a.kind === kind));
   for (const a of named) {
-    opts.push(`<option value="${esc(a.name)}"${a.name === selected ? ' selected' : ''}>${esc(a.title || a.name)}</option>`);
+    const runtime = isCliAgent(a) ? providerNames[a.executor] : 'deepagents';
+    opts.push(`<option value="${esc(a.name)}"${a.name === selected ? ' selected' : ''}>${esc(a.title || a.name)} · ${esc(runtime)}</option>`);
   }
-  // a config written before named agents points straight at an executor
-  for (const p of CLI_PROVIDERS) opts.push(`<option value="${p}"${p === selected ? ' selected' : ''}>${esc(providerNames[p])} · from PATH</option>`);
-  // 'default' is the section-01 connection named explicitly; a CLI there runs as
-  // a CLI, an OpenAI-compatible endpoint runs the built-in agent
-  const provider = defaultConnection()?.provider;
-  opts.push(`<option value="default"${selected === 'default' ? ' selected' : ''}>Default LLM provider${provider ? ` · ${esc(providerNames[provider] || provider)}` : ''}</option>`);
-  for (const c of connectionDrafts) {
-    const how = CLI_PROVIDERS.includes(c.provider) ? providerNames[c.provider] : 'built-in agent';
-    opts.push(`<option value="${esc(c.id)}"${c.id === selected ? ' selected' : ''}>${esc(c.label || c.id)} · ${esc(how)}</option>`);
+  if (selected && !agentById(selected)) {
+    let legacy = selected;
+    if (selected === 'default') {
+      const def = defaultConnection();
+      legacy = `Default LLM${def ? ` · ${def.label || def.id}` : ''}`;
+    } else if (CLI_PROVIDERS.includes(selected)) {
+      legacy = `${providerNames[selected]} · from PATH`;
+    } else if (connectionById(selected)) {
+      legacy = `${connectionById(selected).label || selected} · deepagents`;
+    }
+    opts.push(`<option value="${esc(selected)}" selected>${esc(legacy)}</option>`);
   }
   return opts.join('');
 }
 
-/** Only the CLIs ship a web tool; the built-in agent searches the base only. */
+/** Only the CLIs ship a web tool; deepagents on a model searches the base only. */
 function agentWebCapable(spec) {
+  const agent = agentById(spec);
+  if (agent) return isCliAgent(agent);
   if (CLI_PROVIDERS.includes(spec)) return true;
-  const provider = spec === 'default' ? defaultConnection()?.provider : connectionById(spec)?.provider;
+  const provider = spec === 'default' ? defaultConnection()?.provider : targetById(spec)?.provider;
   return CLI_PROVIDERS.includes(provider);
 }
 
@@ -3320,8 +3490,8 @@ for (const id of ['#cfg-ingest-convert', '#cfg-ingest-concurrency', '#cfg-emb-ba
 
 $('#cfg-add-provider').addEventListener('click', (event) => {
   showMenuUnder(event.currentTarget, [
-    { label: 'LLM provider', run: addConnection },
-    { label: 'Embedding provider', run: addEmbeddingProvider },
+    { label: 'LLM · OpenAI-compatible API', run: addConnection },
+    { label: 'Embedding', run: addEmbeddingProvider },
   ]);
 });
 

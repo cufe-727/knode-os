@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { KnodeConfig, resolveRoutedLlmConfig } from '../config.js';
+import { KnodeConfig, llmTargets, resolveRoutedLlmConfig } from '../config.js';
 import { DataSourceRegistry } from '../datasource/registry.js';
 import { applyDatasourceScopes } from '../datasource/sync.js';
 import { safePath } from '../fs/files.js';
@@ -122,10 +122,10 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   const includeDatasources = Boolean(ctx.datasources) && (opts.datasources ?? (!prefixes || prefixes.includes(DATASOURCES_PREFIX)));
 
   const entityLlm = config.extraction.entityLlm
-    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, config.connections, config.extraction.tier1Model))
+    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, llmTargets(config), config.extraction.tier1Model))
     : ctx.llm;
   const queueTier1 = (opts.llmGraph ?? true) && entityLlm.enabled;
-  const documentLlm = new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.documentLlm, config.connections));
+  const documentLlm = new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.documentLlm, llmTargets(config)));
 
   // L0 → L1: describe (and where needed convert) raw/docs before scanning
   let preparedDocs: Map<string, string> | undefined;

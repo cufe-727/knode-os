@@ -118,7 +118,9 @@ describe('chat', () => {
     saveAgent(wsDir, {
       name: 'tuned',
       kind: 'general',
-      executor: 'fake',
+      // a CLI agent names its CLI and carries its own path
+      executor: 'claude-cli',
+      cliPath: fakeClaude,
       effort: 'high',
       maxTurns: 7,
       tools: { write: false, files: false, web: 'off' },
