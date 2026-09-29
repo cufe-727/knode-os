@@ -224,7 +224,6 @@ struct SettingsView: View {
             label: binding(\.embeddingProviders)[index].label,
             providerName: embeddingProviderName(entry.provider),
             summary: embeddingRowSummary(entry),
-            id: entry.id,
             expanded: expandedBinding(entry.id),
             // Something has to embed, so the last one cannot be removed.
             remove: (config?.embeddingProviders.count ?? 0) > 1 ? { removeEmbeddingProvider(id: entry.id) } : nil
@@ -246,7 +245,6 @@ struct SettingsView: View {
             label: binding(\.connections)[index].label,
             providerName: providerName(connection.provider),
             summary: connection.model,
-            id: connection.id,
             expanded: expandedBinding(connection.id),
             // something has to answer, so the last one cannot go
             remove: (config?.connections.count ?? 0) > 1 ? { removeConnection(id: connection.id) } : nil,
@@ -607,7 +605,7 @@ struct SettingsView: View {
         do {
             _ = try await model.client().saveAgent(name, draft.payload)
             await loadAgents()
-            statusMessage = L("Agent %@ created", name)
+            statusMessage = L("Agent %@ created", draft.title)
             statusIsError = false
         } catch {
             statusMessage = L("Could not create the agent: %@", error.localizedDescription)
@@ -634,8 +632,8 @@ struct SettingsView: View {
                 config?.extraction.documentLlm.use = fresh.extraction.documentLlm.use
             }
             statusMessage = response.reset == true
-                ? L("Agent %@ reset to the built-in", agent.name)
-                : L("Agent %@ removed", agent.name)
+                ? L("Agent %@ reset to the built-in", agent.title)
+                : L("Agent %@ removed", agent.title)
             statusIsError = false
         } catch {
             statusMessage = L("Could not remove the agent: %@", error.localizedDescription)
@@ -1357,7 +1355,6 @@ private struct ProviderRow<Detail: View>: View {
     @Binding var label: String
     let providerName: String
     let summary: String
-    let id: String
     @Binding var expanded: Bool
     /// nil for a row that must not be removed — the last LLM connection, and
     /// the last embedding provider, since something has to answer and embed.
@@ -1412,10 +1409,6 @@ private struct ProviderRow<Detail: View>: View {
                     .help(summary)
 
                 Spacer(minLength: 8)
-
-                Text(id)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.tertiary)
 
                 Button(role: .destructive) { remove?() } label: { Image(systemName: "trash") }
                     .buttonStyle(.borderless)

@@ -413,6 +413,7 @@ private let zhHansPairs: [(String, String)] = [
     ("Its executor cannot run here — pick another one.", "它的执行器在这台机器上跑不起来 —— 换一个。"),
     ("Reset this template to its built-in", "把这个模板恢复成内置版本"),
     ("Remove this agent", "删除这个 agent"),
+    ("Ask names no agent of its own, so it follows the research agent — give it one in 03 · Research.", "问答没有单独指定 agent，所以跟随研究 agent —— 可以在「03 · 研究」里给它单独选一个。"),
     ("0 = the caller's default", "0 = 用调用方的默认值"),
     ("When to pick this agent", "什么时候选这个 agent"),
     ("System prompt", "系统提示词"),
