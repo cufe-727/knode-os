@@ -14,7 +14,7 @@
 | D4 | frontmatter | OKF 兼容 + knode-os 键：`type` `title` **`date`** `generated` `sources` `tags`，生产者扩展 `platform` `channel` `origin` `window` `items` `span`，可选 `entities` / `claims` | 只写 OKF 最小集（丢掉时间轴与观点层） |
 | D5 | 时间 | 每条碎片两枚时间戳：`event_at`（原发时间）与 `observed_at`（中转/抓取时间），带时区；文档 `date` 取 `event_at` 的日期 | 只记抓取时间（现状：`generated.at` 会劫持 doc_date） |
 | D6 | 正文规范 | 每个单元一个 `##`，标题自带时间+说话人+主题；正文每行自描述；模板词用 ASCII 标签；单元下一行"语境句"（contextual retrieval） | 现状：中文模板行每帖重复，污染 tier0 概念 |
-| D7 | 抽取分工 | **观点/事实抽取放生产端**，写进 frontmatter `claims`（无条数上限、不花 tier1 预算、可重跑）；tier1 只做按天小文档的兜底 | 全靠 tier1（每文档 ≤10 条 claim，且只看前 12k 字符） |
+| D7 | 抽取分工 | **观点/事实抽取放生产端**，写进 frontmatter `claims`（无条数上限、不占 tier1 的 LLM 调用、可重跑）；tier1 只做按天小文档的兜底 | 全靠 tier1（每文档 ≤10 条 claim，且只看前 12k 字符） |
 | D8 | 职责边界 | 生产端（rookie-trade crawler 加 `feishu` 平台）负责拉取/去重/分类/切窗/OCR/渲染；knode-os 只做通用改进（§6），不加聊天专用解析器 | 在 knode-os 里加 IM 解析（把平台细节带进内核） |
 
 ## 1. 为什么不能照搬"一月一个 markdown"

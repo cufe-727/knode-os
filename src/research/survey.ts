@@ -7,7 +7,6 @@ import { loadOntology } from '../graph/ontology.js';
 import { graphInsights } from '../graph/query.js';
 import { isReservedWikiFile } from '../lineage/declared.js';
 import { listDisputes } from '../lineage/trust.js';
-import { budgetUsedToday } from '../llm/budget.js';
 import { LlmClient } from '../llm/client.js';
 import { parseFrontmatter } from '../markdown.js';
 import { knowledgeStats, KnowledgeStats, listDatasets } from '../store/queries.js';
@@ -31,7 +30,7 @@ export interface GuideStamp {
 export interface KbSurvey {
   at: string;
   stats: KnowledgeStats;
-  extraction: { queued: number; budgetLeft: number; llmEnabled: boolean };
+  extraction: { queued: number; llmEnabled: boolean };
   documents: {
     total: number;
     byFolder: { folder: string; n: number; latest: string | null }[];
@@ -163,7 +162,6 @@ export async function surveyKnowledgeBase(ctx: AppContext): Promise<KbSurvey> {
   const entityLlm = config.extraction.entityLlm
     ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, routeTargets(config), config.extraction.tier1Model))
     : ctx.llm;
-  const used = await budgetUsedToday(store).catch(() => 0);
 
   const [lastInit] = await store.query<{ id: string; status: string; started_at: string | Date | null; finished_at: string | Date | null }>(
     `SELECT id, status, started_at, finished_at FROM research_jobs WHERE kind = 'init' ORDER BY created_at DESC LIMIT 1`,
@@ -177,7 +175,7 @@ export async function surveyKnowledgeBase(ctx: AppContext): Promise<KbSurvey> {
   return {
     at: new Date().toISOString(),
     stats,
-    extraction: { queued: stats.extraction_queue, budgetLeft: Math.max(0, config.extraction.dailyTokenBudget - used), llmEnabled: entityLlm.enabled },
+    extraction: { queued: stats.extraction_queue, llmEnabled: entityLlm.enabled },
     documents: { total: docRange?.n ?? 0, byFolder, dateRange: { from: day(docRange?.lo), to: day(docRange?.hi) }, recent },
     entities: {
       total: insights.totals.entities,
@@ -207,7 +205,7 @@ export function renderSurvey(s: KbSurvey): string {
   const lines: string[] = ['## 知识库概况', ''];
   lines.push(`- 文档 ${s.documents.total}（分块 ${s.stats.chunks}）· 实体 ${s.entities.total} · 关系 ${s.relations.total} · claims ${s.claims.total} · 生成页 ${s.wiki.views} · 人写 wiki 页 ${s.wiki.humanPages} · 研究页 ${s.wiki.researchPages}`);
   lines.push(`- 资料日期范围：${s.documents.dateRange.from ?? '未知'} → ${s.documents.dateRange.to ?? '未知'}；claims 事件范围：${s.claims.eventRange.from ?? '未知'} → ${s.claims.eventRange.to ?? '未知'}`);
-  lines.push(`- 抽取：${s.extraction.llmEnabled ? `LLM 已配置，待抽取 ${s.extraction.queued} 篇，今日预算剩余 ${s.extraction.budgetLeft}` : `未配置抽取 LLM（图谱只有 tier-0 的 frontmatter / 概念挖掘 / wikilink 证据），待抽取 ${s.extraction.queued} 篇`}`);
+  lines.push(`- 抽取：${s.extraction.llmEnabled ? `LLM 已配置，待抽取 ${s.extraction.queued} 篇` : `未配置抽取 LLM（图谱只有 tier-0 的 frontmatter / 概念挖掘 / wikilink 证据），待抽取 ${s.extraction.queued} 篇`}`);
   lines.push(`- 指南 AGENTS.md：${s.guide.exists ? `已有（${s.guide.bytes} 字节${s.guide.stamp ? `，${s.guide.stamp.at.slice(0, 10)} 由 ${s.guide.stamp.agent} 生成` : ''}）` : '尚未生成'}；总览 wiki/overview.md：${s.wiki.overview.exists ? (s.wiki.overview.seeded ? '仍是初始模板' : `已有（${s.wiki.overview.actor ?? '人写'}）`) : '不存在'}`);
   lines.push(`- purpose.md ${s.notes.purposeIsTemplate ? '仍是模板' : '已填写'}；schema.md ${s.notes.schemaIsTemplate ? '仍是模板' : '已填写'}；本体包：${s.ontology.packs.join(', ') || '（无）'}`);
   lines.push('');

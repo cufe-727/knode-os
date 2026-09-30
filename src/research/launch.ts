@@ -1,9 +1,9 @@
 import { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { cliCommand, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess } from '../llm/cli.js';
+import { cliCommand, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess, speedFor } from '../llm/cli.js';
 import { AgentProvider, CliAgent, ResearchAgent } from './agent.js';
-import { Effort, Freshness, NativeAgentSpec } from './profile.js';
+import { Effort, Freshness, NativeAgentSpec, Speed } from './profile.js';
 import { McpEndpoint, RunWorkspace } from './workspace.js';
 
 /**
@@ -37,6 +37,8 @@ export interface LaunchInput {
   allowNetwork?: boolean;
   /** Reasoning effort (profile): claude --effort, codex model_reasoning_effort, cursor model[effort=…]. */
   effort?: Effort;
+  /** Speed (profile): codex service_tier; the other CLIs have none. */
+  speed?: Speed;
   /** codex web_search freshness when web tools are on. */
   webFreshness?: Freshness;
   /** Native sub-agents for the orchestrator session (pipeline = native). */
@@ -185,6 +187,8 @@ export interface SessionInput {
   files?: boolean;
   /** Reasoning effort; 'default' / undefined leaves the CLI's own setting alone. */
   effort?: Effort;
+  /** Speed tier; 'default' / undefined leaves the CLI's own setting alone. */
+  speed?: Speed;
   /** codex `web_search` freshness when web tools are on (default live). */
   webFreshness?: Freshness;
   /** Native sub-agents registered with the CLI (claude --agents, codex agents.<id>). */
@@ -227,7 +231,7 @@ export function agentEnv(input: LaunchInput): NodeJS.ProcessEnv {
 
 // Both adapters live with the CLI runners, so a one-shot completion and a
 // research session ask for the same level in the same way.
-export { cursorModel, effortFor };
+export { cursorModel, effortFor, speedFor };
 
 function agentToolNames(a: NativeAgentSpec): string[] {
   return [
@@ -258,6 +262,8 @@ export function codexAgentLayer(a: NativeAgentSpec, freshness: Freshness | undef
   if (a.model) lines.push(`model = ${tomlString(a.model)}`);
   const effort = effortFor('codex-cli', a.effort);
   if (effort) lines.push(`model_reasoning_effort = ${tomlString(effort)}`);
+  const tier = speedFor('codex-cli', a.speed);
+  if (tier) lines.push(`service_tier = ${tomlString(tier)}`);
   lines.push(`web_search = ${tomlString(a.web ? freshness ?? 'live' : 'disabled')}`);
   const prompt = a.prompt.split(TOML_LITERAL_FENCE).join("'' '");
   lines.push(`developer_instructions = ${TOML_LITERAL_FENCE}\n${prompt}\n${TOML_LITERAL_FENCE}`);
@@ -291,6 +297,7 @@ export function sessionArgs(input: CliSessionInput): { cmd: string; args: string
   const web = Boolean(input.allowNetwork);
   const agents = input.agents?.length ? input.agents : null;
   const effort = effortFor(provider, input.effort);
+  const tier = speedFor(provider, input.speed);
   if (provider === 'claude-cli') {
     const allowed = [
       ...(input.tools === 'write' ? ['mcp__knode-os__*'] : READ_TOOLS),
@@ -337,6 +344,7 @@ export function sessionArgs(input: CliSessionInput): { cmd: string; args: string
         '-c', 'mcp_servers.knode-os.bearer_token_env_var="KNODE_MCP_TOKEN"',
         '-c', `web_search=${tomlString(web ? input.webFreshness ?? 'live' : 'disabled')}`,
         ...(effort ? ['-c', `model_reasoning_effort=${tomlString(effort)}`] : []),
+        ...(tier ? ['-c', `service_tier=${tomlString(tier)}`] : []),
         ...agentArgs,
         '--output-last-message', outFile,
         ...(model ? ['-m', model] : []),
@@ -479,7 +487,7 @@ function sessionFrom(input: LaunchInput): Omit<SessionInput, 'prompt'> {
     agent: input.agent, maxTurns: input.maxTurns, timeoutMs: input.timeoutMs,
     cwd: input.ws.dir, mcp: input.mcp, readDirs: input.readDirs, jobId: input.jobId, outputPath: input.ws.outputPath,
     worksetId: input.ws.worksetId, allowNetwork: input.allowNetwork, tools: 'write', label: 'agent',
-    effort: input.effort, webFreshness: input.webFreshness, agents: input.agents,
+    effort: input.effort, speed: input.speed, webFreshness: input.webFreshness, agents: input.agents,
   };
 }
 

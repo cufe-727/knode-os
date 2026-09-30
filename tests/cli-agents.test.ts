@@ -308,3 +308,27 @@ describe('deepagents agents as pipeline stages', () => {
     expect(loaded.extraction.entityLlm.use).toBe('claude-cli-1');
   });
 });
+
+describe('effort and speed on a stage', () => {
+  it('lets a stage set its own effort and speed, and otherwise runs at its target\'s', () => {
+    const base = defaultConfig().llm;
+    const fast = { ...codex, speed: 'fast' as const };
+    const route = { ...defaultRoutedLlmConfig(), use: fast.id };
+    // 'default' on the route is the agent's own setting
+    expect(resolveRoutedLlmConfig(base, route, [fast])).toMatchObject({ provider: 'codex-cli', effort: 'high', speed: 'fast' });
+    // a level of its own wins, one field at a time
+    expect(resolveRoutedLlmConfig(base, { ...route, effort: 'ultra' }, [fast])).toMatchObject({ effort: 'ultra', speed: 'fast' });
+    expect(resolveRoutedLlmConfig(base, { ...route, speed: 'fast' }, [codex])).toMatchObject({ effort: 'high', speed: 'fast' });
+  });
+
+  it('reads a CLI agent\'s speed from its file, as the stages see it', () => {
+    const dir = workspace('agent-speed', {});
+    saveAgent(dir, { name: 'quick', executor: 'codex-cli', model: 'gpt-6.1-sol', speed: 'fast' });
+    saveAgent(dir, { name: 'odd', executor: 'codex-cli', speed: 'warp' as never });
+    expect(loadAgent(dir, 'quick')).toMatchObject({ speed: 'fast' });
+    const targets = llmTargets(loadConfig(dir));
+    expect(targets.find((t) => t.id === 'quick')).toMatchObject({ provider: 'codex-cli', speed: 'fast' });
+    // an unknown tier is no tier
+    expect(targets.find((t) => t.id === 'odd')).toMatchObject({ speed: 'default' });
+  });
+});

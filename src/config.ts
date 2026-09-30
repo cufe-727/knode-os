@@ -83,11 +83,21 @@ export function isCliProvider(provider: unknown): provider is CliProvider {
 /**
  * Reasoning effort a CLI provider runs at. `default` leaves the CLI's own
  * setting alone; everything else is passed through (see `effortFor` for the
- * one CLI that cannot take the whole ladder). Research profiles read the same
- * list as `EFFORTS`, so a level means one thing everywhere.
+ * CLIs that cannot take the whole ladder). Research profiles read the same
+ * list as `EFFORTS`, so a level means one thing everywhere. `ultra` is the
+ * rung codex lists above `max`: maximum reasoning that delegates on its own.
  */
-export const LLM_EFFORTS = ['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export const LLM_EFFORTS = ['default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 export type LlmEffort = (typeof LLM_EFFORTS)[number];
+
+/**
+ * How fast a CLI provider answers. `default` leaves the CLI's own setting
+ * alone; `fast` asks for the priority tier the codex catalog lists as "Fast"
+ * (quicker, at higher usage). The other CLIs have no such switch and ignore
+ * it — see `speedFor`.
+ */
+export const LLM_SPEEDS = ['default', 'fast'] as const;
+export type LlmSpeed = (typeof LLM_SPEEDS)[number];
 
 /**
  * Which wire an OpenAI-compatible endpoint is spoken to on.
@@ -137,6 +147,8 @@ export interface LlmConfig {
    * leaves the CLI's own setting alone. OpenAI-compatible endpoints ignore it.
    */
   effort?: LlmEffort;
+  /** How fast, see `LLM_SPEEDS`. Absent or 'default' leaves the CLI's own tier alone. */
+  speed?: LlmSpeed;
   /** Kill a CLI completion after this long. */
   cliTimeoutMs: number;
   /** Shown in the UI. Empty = llmProviderLabel(provider). */
@@ -177,8 +189,6 @@ export interface LlmConnection extends LlmConfig {
 }
 
 export interface ExtractionConfig {
-  /** Daily LLM token budget shared by tier-1 extraction and tier-2 refinement. */
-  dailyTokenBudget: number;
   /** Also extract time-bound claims (GraphRAG covariates) in the tier-1 call. */
   claims: boolean;
   /** Model for tier-1 entity/relation extraction. Empty = use llm.model. */
@@ -421,7 +431,7 @@ export interface ResearchConfig {
 export interface ResearchInitConfig {
   /** Topic pages (from the plan) queued as follow-up research jobs after an initialization. */
   followUps: number;
-  /** 'drain': run tier-1 extraction to the end of the queue / budget before the agent starts; 'skip': leave the queue to the background loop. */
+  /** 'drain': run tier-1 extraction to the end of the queue before the agent starts; 'skip': leave the queue to the background loop. */
   extraction: 'drain' | 'skip';
   /** Cap on the pre-flight extraction time. */
   extractionMaxMs: number;
@@ -479,7 +489,7 @@ export interface ReviewConfig {
   llmMinConfidence: number;
   /** 'auto' merges without a person at or above this confidence. */
   autoMergeMinConfidence: number;
-  /** Candidates judged per nightly run (one LLM call each, within the daily token budget). */
+  /** Candidates judged per nightly run (one LLM call each). */
   maxJudgedPerRun: number;
   /** LLM review of disputed / suspected claims, filed as knowledge suggestions with a verdict. */
   claims: 'off' | 'suggest';
@@ -620,7 +630,6 @@ export function defaultConfig(): KnodeConfig {
     server: { port: 9100, host: '127.0.0.1', mcp: { enabled: true, path: '/mcp' } },
     ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4, convertConcurrency: 2 },
     extraction: {
-      dailyTokenBudget: 2_000_000,
       claims: true,
       tier1Model: '',
       tier2Model: '',
@@ -706,6 +715,7 @@ export function defaultRoutedLlmConfig(): RoutedLlmConfig {
     model: '',
     cliPath: '',
     effort: 'default',
+    speed: 'default',
     cliTimeoutMs: 300_000,
   };
 }
@@ -737,6 +747,7 @@ export function resolveRoutedLlmConfig(
       model: route.model || connection.model,
       cliPath: connection.cliPath,
       effort: routeEffort(route.effort) ?? connection.effort,
+      speed: routeSpeed(route.speed) ?? connection.speed,
       cliTimeoutMs: route.cliTimeoutMs || connection.cliTimeoutMs,
     };
   }
@@ -755,6 +766,7 @@ export function resolveRoutedLlmConfig(
     model: route.model || legacyModel || (inheritedProvider ? base.model : ''),
     cliPath: route.cliPath || (provider === base.provider ? base.cliPath : ''),
     effort: routeEffort(route.effort) ?? base.effort,
+    speed: routeSpeed(route.speed) ?? base.speed,
     cliTimeoutMs: route.cliTimeoutMs || base.cliTimeoutMs,
   };
 }
@@ -762,6 +774,11 @@ export function resolveRoutedLlmConfig(
 /** A route only overrides the effort when it names a real level, the way an empty `model` inherits. */
 function routeEffort(effort: LlmEffort | undefined): LlmEffort | undefined {
   return effort && effort !== 'default' ? effort : undefined;
+}
+
+/** The same for speed: a route's 'default' is its target's own. */
+function routeSpeed(speed: LlmSpeed | undefined): LlmSpeed | undefined {
+  return speed && speed !== 'default' ? speed : undefined;
 }
 
 function deepMerge<T>(base: T, override: Partial<T>): T {
@@ -797,6 +814,7 @@ export function loadConfig(dataDir: string): KnodeConfig {
   }
   const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<KnodeConfig>;
   const merged = migrateChatConfig(deepMerge(base, raw));
+  const unbudgeted = dropTokenBudget(merged);
   merged.agentLlms = base.agentLlms;
   merged.modelAgents = base.modelAgents;
   const renamed = renameRetiredAgents(merged, dataDir, retired);
@@ -810,8 +828,9 @@ export function loadConfig(dataDir: string): KnodeConfig {
   const pinned = pinRoutes(config);
   // the move wrote agent files, so the config that no longer names those rows
   // is written too — otherwise every load would move them again; a pinned
-  // stage, and a spec renamed off a retired agent, are written for the same reason
-  if (movesCli || pinned || renamed) saveConfig(dataDir, config);
+  // stage, a spec renamed off a retired agent and a dropped token budget are
+  // written for the same reason
+  if (movesCli || pinned || renamed || unbudgeted) saveConfig(dataDir, config);
   return config;
 }
 
@@ -841,7 +860,8 @@ export function renameRetiredAgents(config: KnodeConfig, dataDir: string, rename
 }
 
 /**
- * Drop the `chat.*` keys the agent definition now owns.
+ * Drop the `chat.*` keys that left chat: effort and web access went to the
+ * agent definition, and Ask's turn cap and timeout are fixed now.
  *
  * `deepMerge` keeps unknown keys, so without this a file written before the
  * move would carry them forever, looking like settings. Anything that was not
@@ -860,9 +880,23 @@ export function migrateChatConfig(config: KnodeConfig): KnodeConfig {
     delete chat[key];
   }
   if (carried.length > 0) {
-    console.warn(`knode: chat.${carried.join(', chat.')} no longer applies — how an agent runs now lives in playbooks/agents/<name>.yaml (Settings → Providers & Agents)`);
+    console.warn(`knode: chat.${carried.join(', chat.')} no longer applies — Ask runs every agent with the same turn cap and timeout; an agent's effort and web access live in playbooks/agents/<name>.yaml (Settings → Providers & Agents)`);
   }
   return config;
+}
+
+/**
+ * Drop `extraction.dailyTokenBudget`. Nothing caps background LLM work by a
+ * daily token count any more — tier-1 extraction is paced by its batch size
+ * and interval — and `deepMerge` keeps unknown keys, so a file written before
+ * would otherwise carry it forever, looking like a setting. Returns whether
+ * there was one to drop.
+ */
+export function dropTokenBudget(config: KnodeConfig): boolean {
+  const extraction = config.extraction as unknown as Record<string, unknown> | undefined;
+  if (!extraction || !('dailyTokenBudget' in extraction)) return false;
+  delete extraction.dailyTokenBudget;
+  return true;
 }
 
 const ROUTE_KEYS = ['entityLlm', 'conceptLlm', 'documentLlm'] as const;
@@ -1054,6 +1088,7 @@ export function readAgentLlms(dataDir: string): LlmConnection[] {
       model: text('model'),
       cliPath: text('cliPath'),
       effort: LLM_EFFORTS.includes(raw.effort as LlmEffort) ? (raw.effort as LlmEffort) : 'default',
+      speed: LLM_SPEEDS.includes(raw.speed as LlmSpeed) ? (raw.speed as LlmSpeed) : 'default',
       cliTimeoutMs: CLI_ONE_SHOT_TIMEOUT_MS,
     });
   }

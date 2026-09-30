@@ -3,7 +3,6 @@ import { LLM_EXTRACT_INPUT_CHARS } from '../constants.js';
 import { readSidecarPart, replayableTier1, updateSidecarPart } from '../fs/sidecar.js';
 import { loadSourceText } from '../ingest/source.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
-import { addBudgetUse, budgetUsedToday } from '../llm/budget.js';
 import { LlmClient } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { Store } from '../store/db.js';
@@ -17,8 +16,8 @@ import { ExtractedClaim, ExtractedEntity, ExtractedRelation, PageContext } from 
  * graph merging), driven by a priority queue instead of the ingest hot path.
  *
  * - priority = (1 + heat) × freshness boost × per-root importance
- * - a daily token budget caps spend; the queue drains in priority order, so
- *   with a large corpus the graph densifies in the order knowledge is used
+ * - the queue drains in priority order, one batch per pass, so with a large
+ *   corpus the graph densifies in the order knowledge is used
  * - results are persisted to the document sidecar (`extraction.tier1`); a DB
  *   rebuild replays them for free when contentSha still matches
  * - every extraction is applied as a child scope of the document's scope, so
@@ -31,7 +30,6 @@ export interface Tier1Stats {
   entities: number;
   relations: number;
   tokensUsed: number;
-  budgetLeft: number;
   queued: number;
 }
 
@@ -92,8 +90,8 @@ export async function applyTier1Scope(
 }
 
 /**
- * Drain one batch from the extraction queue, respecting the daily token
- * budget. Called periodically while `serve` runs, or manually via the CLI.
+ * Drain one batch from the extraction queue. Called periodically while
+ * `serve` runs, or manually via the CLI.
  */
 // One pass at a time per data dir: serve's timer, `knode-os extract` and an
 // initialization job draining the queue must never pick the same batch twice.
@@ -118,7 +116,7 @@ async function runTier1PassUnlocked(
   opts: { onProgress?: (msg: string) => void; batchSize?: number; concurrency?: number } = {},
 ): Promise<Tier1Stats> {
   const progress = opts.onProgress ?? (() => {});
-  const stats: Tier1Stats = { processed: 0, failed: 0, entities: 0, relations: 0, tokensUsed: 0, budgetLeft: 0, queued: 0 };
+  const stats: Tier1Stats = { processed: 0, failed: 0, entities: 0, relations: 0, tokensUsed: 0, queued: 0 };
   const entityLlm = config.extraction.entityLlm
     ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, routeTargets(config), config.extraction.tier1Model))
     : llm;
@@ -128,9 +126,7 @@ async function runTier1PassUnlocked(
     return row?.n ?? 0;
   };
   stats.queued = await countQueue();
-  const used = await budgetUsedToday(store);
-  stats.budgetLeft = Math.max(0, config.extraction.dailyTokenBudget - used);
-  if (!entityLlm.enabled || stats.queued === 0 || stats.budgetLeft <= 0) return stats;
+  if (!entityLlm.enabled || stats.queued === 0) return stats;
 
   await recomputePriorities(store, config);
   const batch = await store.query<{
@@ -144,7 +140,6 @@ async function runTier1PassUnlocked(
     [opts.batchSize ?? config.extraction.batchSize],
   );
   const processDoc = async (doc: (typeof batch)[number]): Promise<void> => {
-    if (stats.budgetLeft <= 0) return;
     const dequeue = () => store.query(`DELETE FROM extraction_queue WHERE document_id = $1`, [doc.document_id]);
     try {
       const source = loadSourceText(store.dataDir, doc.path, 'docs');
@@ -177,10 +172,6 @@ async function runTier1PassUnlocked(
         return;
       }
 
-      const cost = estimateTokens(content.slice(0, LLM_EXTRACT_INPUT_CHARS)) + OUTPUT_TOKEN_ESTIMATE;
-      if (cost > stats.budgetLeft) return; // try again next pass (or tomorrow)
-      stats.budgetLeft -= cost; // claim budget up-front so parallel workers can't overshoot
-
       progress(`tier1 extract ${doc.path}`);
       const knownEntities = await knownEntitiesIn(store, content.slice(0, LLM_EXTRACT_INPUT_CHARS));
       const extracted = await llmExtract(entityLlm, page, content, { claims: config.extraction.claims, ontology: loadOntology(store.dataDir, config.graph?.ontologyPacks), knownEntities, docDate });
@@ -196,8 +187,7 @@ async function runTier1PassUnlocked(
         extractedAt: new Date().toISOString(),
       }));
 
-      await addBudgetUse(store, cost);
-      stats.tokensUsed += cost;
+      stats.tokensUsed += estimateTokens(content.slice(0, LLM_EXTRACT_INPUT_CHARS)) + OUTPUT_TOKEN_ESTIMATE;
       stats.entities += g.entities;
       stats.relations += g.relations;
       stats.processed++;
@@ -229,7 +219,7 @@ async function runTier1PassUnlocked(
   let next = 0;
   await Promise.all(
     Array.from({ length: Math.min(concurrency, batch.length) }, async () => {
-      while (next < batch.length && stats.budgetLeft > 0) {
+      while (next < batch.length) {
         const doc = batch[next++];
         await processDoc(doc);
       }

@@ -7,7 +7,7 @@ import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { sync } from '../src/ingest/sync.js';
-import { chatWebAllowed, parseActivity, resolveChatAgent, resolveChatRuntime, runChatTurn } from '../src/chat/runner.js';
+import { ASK_MAX_TURNS, chatWebAllowed, parseActivity, resolveChatAgent, resolveChatRuntime, runChatTurn } from '../src/chat/runner.js';
 import { saveAgent } from '../src/research/agents.js';
 import { createConversation, getConversation, recentMessages, resetRunningConversations, setConversationStatus } from '../src/chat/store.js';
 import { writtenPaths } from '../src/chat/templates.js';
@@ -107,12 +107,11 @@ describe('chat', () => {
   });
 
   /**
-   * The bug this whole change exists for: `playbooks/agents/*.yaml` carried
-   * `effort`, `tools`, `maxTurns` and `prompt`, the UI edited them, and the
-   * resolver handed on only an executor — so none of them ever reached a
-   * session. Assert on the artefacts the launch actually produced.
+   * An agent brings its effort and web access to Ask; the turn cap and the
+   * tools are Ask's own, the same whichever agent answers. Assert on the
+   * artefacts the launch actually produced.
    */
-  it('takes turns, tools and prompt from the agent definition', async () => {
+  it('takes effort and web access from the agent definition, and the rest from Ask', async () => {
     process.env.FAKE_AGENT_MODE = 'good';
     const saved = ctx.config.chat.agent;
     saveAgent(wsDir, {
@@ -121,14 +120,13 @@ describe('chat', () => {
       executor: 'claude-cli',
       cliPath: fakeClaude,
       effort: 'high',
-      maxTurns: 7,
-      tools: { write: false, files: false, web: 'off' },
-      prompt: '只用一句话回答。',
+      tools: { web: 'on' },
     });
     ctx.config.chat.agent = 'tuned';
     try {
       const runtime = resolveChatRuntime(ctx.config, wsDir);
-      expect(runtime).toMatchObject({ maxTurns: 7, effort: 'high', tools: 'read', files: false, allowNetwork: false });
+      // `on` widens within review.external, which is `verify` here
+      expect(runtime).toMatchObject({ effort: 'high', allowNetwork: true });
       expect(runtime?.definition?.name).toBe('tuned');
 
       const { id } = await (await api('/api/chat/conversations', { method: 'POST', body: JSON.stringify({}) })).json() as { id: string };
@@ -138,11 +136,9 @@ describe('chat', () => {
 
       const dir = path.join(wsDir, '.runs', 'chat', id);
       const argv = JSON.parse(fs.readFileSync(path.join(dir, 'argv-chat.json'), 'utf8')) as string[];
-      expect(argv[argv.indexOf('--max-turns') + 1]).toBe('7');
-      // tools: read hands over the read-only list instead of the write wildcard
-      expect(argv).not.toContain('mcp__knode-os__*');
-      expect(argv).toContain('mcp__knode-os__knode_search');
-      expect(fs.readFileSync(path.join(dir, 'CLAUDE.md'), 'utf8')).toContain('只用一句话回答。');
+      expect(argv[argv.indexOf('--max-turns') + 1]).toBe(String(ASK_MAX_TURNS));
+      // Ask takes notes whichever agent answers: the write wildcard, not the read-only list
+      expect(argv).toContain('mcp__knode-os__*');
     } finally {
       ctx.config.chat.agent = saved;
       fs.rmSync(path.join(wsDir, 'playbooks', 'agents', 'tuned.yaml'), { force: true });

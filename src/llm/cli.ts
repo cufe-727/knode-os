@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { LlmConfig, LlmEffort } from '../config.js';
+import { LlmConfig, LlmEffort, LlmSpeed } from '../config.js';
 import type { ChatMessage } from './client.js';
 
 /**
@@ -22,8 +22,8 @@ import type { ChatMessage } from './client.js';
  *
  * Images reach each one differently: codex takes `--image`, while claude and
  * cursor have no such flag and instead read the paths listed in the prompt with
- * their own file tools. A configured reasoning effort rides along too, each CLI
- * in its own syntax — see `effortFor`.
+ * their own file tools. A configured reasoning effort and speed ride along too,
+ * each CLI in its own syntax — see `effortFor` and `speedFor`.
  */
 
 const DEFAULT_TIMEOUT_MS = 300_000;
@@ -63,13 +63,26 @@ export function resolveExecutable(command: string): string | null {
 
 /**
  * The level a CLI is actually told to think at, or null to leave its own
- * setting alone. claude and codex both take the whole ladder up to `max`;
- * cursor's bracket syntax is only documented as far as `high`.
+ * setting alone. codex takes the whole ladder, `ultra` included; claude stops
+ * at `max`; cursor's bracket syntax is only documented as far as `high`.
  */
 export function effortFor(provider: string, effort: LlmEffort | undefined): string | null {
   if (!effort || effort === 'default') return null;
-  if (provider === 'cursor-cli') return effort === 'max' || effort === 'xhigh' ? 'high' : effort;
+  if (provider === 'cursor-cli') return effort === 'max' || effort === 'xhigh' || effort === 'ultra' ? 'high' : effort;
+  if (provider === 'claude-cli' && effort === 'ultra') return 'max';
   return effort;
+}
+
+/**
+ * The service tier a CLI is asked for, or null to leave its own setting
+ * alone. Only codex has one per call (`service_tier`), named the way its
+ * catalog's `additional_speed_tiers` names it; a tier the model does not
+ * advertise is dropped by codex itself, with a warning. claude and cursor
+ * have no such switch — cursor lists its fast variants as models of their own.
+ */
+export function speedFor(provider: string, speed: LlmSpeed | undefined): string | null {
+  if (!speed || speed === 'default') return null;
+  return provider === 'codex-cli' ? speed : null;
 }
 
 /** cursor takes effort inside the model name: `claude-opus-4-8[context=1m,effort=high]`. */
@@ -128,6 +141,8 @@ async function runCodex(cfg: LlmConfig, prompt: string, model?: string, images: 
   if (model) args.push('--model', model);
   const effort = effortFor('codex-cli', cfg.effort);
   if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);
+  const tier = speedFor('codex-cli', cfg.speed);
+  if (tier) args.push('-c', `service_tier="${tier}"`);
   for (const image of images) args.push('--image', image);
   args.push('-'); // read the prompt from stdin
   try {

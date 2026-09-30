@@ -2360,9 +2360,6 @@ const EMB_NOTES = {
 
 const LLM_NOTES = {
   openai: 'Any OpenAI-compatible endpoint works. Auto prefers the Responses API and falls back to Chat Completions when the endpoint has no such route — reasoning models lose less that way. An empty model disables the general LLM features; the deterministic pipeline keeps running.',
-  'codex-cli': 'Uses your existing Codex login for a read-only one-shot request.',
-  'claude-cli': 'Uses your existing Claude Code login for one non-interactive turn.',
-  'cursor-cli': 'Uses your existing Cursor Agent login in headless print mode.',
 };
 
 const embeddingProviderLabel = (provider) =>
@@ -2683,7 +2680,6 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     fillRoute('entity', cfg.extraction?.entityLlm);
     fillRoute('concept', cfg.extraction?.conceptLlm);
     fillRoute('document', cfg.extraction?.documentLlm);
-    $('#cfg-extraction-budget').value = cfg.extraction?.dailyTokenBudget ?? 2000000;
     $('#cfg-extraction-batch').value = cfg.extraction?.batchSize ?? 8;
     $('#cfg-extraction-concurrency').value = cfg.extraction?.concurrency ?? 1;
     $('#cfg-extraction-claims').checked = cfg.extraction?.claims !== false;
@@ -2750,7 +2746,6 @@ function gatherConfig() {
       entityLlm: gatherRoute('entity'),
       conceptLlm: gatherRoute('concept'),
       documentLlm: gatherRoute('document'),
-      dailyTokenBudget: Number($('#cfg-extraction-budget').value),
       batchSize: Number($('#cfg-extraction-batch').value),
       concurrency: Number($('#cfg-extraction-concurrency').value),
       claims: $('#cfg-extraction-claims').checked,
@@ -2778,7 +2773,7 @@ const expandedAgents = new Set();
 
 const AGENT_EFFORTS = [
   ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'],
-  ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max'],
+  ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max'], ['ultra', 'Ultra (codex)'],
 ];
 const AGENT_WEB = [['inherit', 'Follow review.external'], ['on', 'On (within review.external)'], ['off', 'Off']];
 const AGENT_TYPES = { 'claude-cli': 'Claude Code', 'codex-cli': 'Codex', 'cursor-cli': 'Cursor' };
@@ -2830,10 +2825,7 @@ function deepagentsFields(agent) {
   return `<div class="cfg-grid cfg-grid-2">
       <label>Runs on<select data-field="executor">${options}</select></label>
       <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="${esc(modelEndpoint(agent)?.model || 'Its own default')}" />${modelChevron(executorModelRoute(agent.name))}</span></label>
-      <label class="cfg-span-2">Description<input data-field="description" value="${esc(agent.description || '')}" placeholder="When to pick this agent" /></label>
-    </div>
-    <p class="cfg-callout">The built-in deepagents loop runs inside the service on this model. It has no reasoning-effort switch and no web tool.</p>
-    ${agentLimits(agent)}`;
+    </div>`;
 }
 
 function cliFields(agent) {
@@ -2844,25 +2836,7 @@ function cliFields(agent) {
       <label>Reasoning effort<select data-field="effort">${optionList(AGENT_EFFORTS, agent.effort || 'default')}</select></label>
       <label>Web access<select data-field="web">${optionList(AGENT_WEB, agent.tools?.web ?? 'inherit')}</select></label>
       <label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(agent.cliPath || '')}" placeholder="Default: ${esc(cliMeta[agent.executor]?.path ?? '')} from PATH" /></label>
-      <label class="cfg-span-2">Description<input data-field="description" value="${esc(agent.description || '')}" placeholder="When to pick this agent" /></label>
-    </div>
-    <p class="cfg-callout">${esc(LLM_NOTES[agent.executor] ?? '')}</p>
-    ${agentLimits(agent)}
-    ${agent.name === llmUse ? '' : '<p class="cfg-callout"><button type="button" class="hint-action agent-default">make default</button> Jobs that name no model run on this CLI instead, one call at a time — for a machine with no model endpoint.</p>'}`;
-}
-
-/** What every agent has, whichever runtime: limits, tool grants, the prompt, and who reads them. */
-function agentLimits(agent) {
-  return `<div class="cfg-grid cfg-grid-2">
-      <label>Turns per session<input data-field="maxTurns" type="number" min="0" step="1" value="${esc(agent.maxTurns ?? 0)}" placeholder="0 = the caller's default" /></label>
-      <label>Timeout (minutes)<input data-field="timeoutMinutes" type="number" min="0" step="1" value="${esc(Math.round((agent.timeoutMs ?? 0) / 60000))}" placeholder="0 = the caller's default" /></label>
-    </div>
-    <div class="cfg-checks">
-      <label class="cfg-check"><input data-field="write" type="checkbox"${agent.tools?.write ? ' checked' : ''} /> Writes pages (knode_write / knode_commit)</label>
-      <label class="cfg-check"><input data-field="files" type="checkbox"${agent.tools?.files ? ' checked' : ''} /> Reads files (Read / Grep / Glob)</label>
-    </div>
-    <label class="agent-prompt">System prompt<textarea data-field="prompt" rows="6" class="mono" spellcheck="false" placeholder="Empty = the protocol the run workspace already carries">${esc(agent.prompt || '')}</textarea></label>
-    <p class="cfg-callout">Stored at <span class="mono">${esc(agent.path || '')}</span>. Ask runs with these settings; a research run takes effort, turns, timeout, tools and prompt from its profile in section 03 instead.</p>`;
+    </div>`;
 }
 
 function renderAgents() {
@@ -2933,8 +2907,6 @@ async function addAgent(runtime) {
         agent: {
           title: cli ? providerNames[runtime] : 'New deepagents agent',
           executor,
-          // what Ask needs to take notes; a CLI answers with its own tools anyway
-          tools: { write: true, files: true, web: 'inherit' },
         },
       }),
     });
@@ -2978,15 +2950,13 @@ async function saveAgents() {
       body: JSON.stringify({
         agent: {
           title: (agent.title || '').trim() || agent.name,
-          description: agent.description ?? '',
           executor: agent.executor,
           cliPath: agent.cliPath ?? '',
           model: agent.model ?? '',
           effort: agent.effort ?? 'default',
-          tools: agent.tools ?? { write: false, files: true, web: 'inherit' },
-          maxTurns: Number(agent.maxTurns) || 0,
-          timeoutMs: Number(agent.timeoutMs) || 0,
-          prompt: agent.prompt ?? '',
+          // set in the macOS app's effort chip; kept, not edited, here
+          speed: agent.speed ?? 'default',
+          tools: { web: agent.tools?.web ?? 'inherit' },
         },
       }),
     });
@@ -3011,10 +2981,8 @@ $('#cfg-agents').addEventListener('input', (event) => {
   const row = event.target.closest?.('.provider-row');
   const field = event.target.dataset?.field;
   const agent = row && agentById(row.dataset.agent);
-  if (!agent || !field || event.target.type === 'checkbox' || event.target.tagName === 'SELECT') return;
-  if (field === 'timeoutMinutes') agent.timeoutMs = (Number(event.target.value) || 0) * 60000;
-  else if (field === 'maxTurns') agent.maxTurns = Number(event.target.value) || 0;
-  else agent[field] = event.target.value;
+  if (!agent || !field || event.target.tagName === 'SELECT') return;
+  agent[field] = event.target.value;
   // the model list is the CLI's at this path, not at the one it was drawn with
   if (field === 'cliPath') row.querySelector('.model-chevron')?.setAttribute('data-cli-path', agent.cliPath);
   // a CLI agent's name and model are what a stage or the default shows
@@ -3034,10 +3002,6 @@ $('#cfg-agents').addEventListener('change', (event) => {
   const field = event.target.dataset?.field;
   const agent = row && agentById(row.dataset.agent);
   if (!agent || !field) return;
-  if (field === 'write' || field === 'files') {
-    agent.tools = { ...agent.tools, [field]: event.target.checked };
-    return;
-  }
   if (field === 'web') {
     agent.tools = { ...agent.tools, web: event.target.value };
     return;
@@ -3060,15 +3024,6 @@ $('#cfg-agents').addEventListener('click', (event) => {
     renderAgents();
     return;
   }
-  if (event.target.classList.contains('agent-default')) {
-    // jobs that name no model run on this CLI agent now
-    llmUse = name;
-    renderProviders();
-    renderAgents();
-    fillRouteOptions();
-    updateConfigSummaries();
-    return;
-  }
   if (event.target.classList.contains('agent-remove')) removeAgent(name);
 });
 
@@ -3078,7 +3033,7 @@ const PROTOCOL_OPTIONS = [
   ['auto', 'Auto (Responses, else Chat)'], ['responses', 'Responses only'], ['chat', 'Chat Completions only'],
 ];
 const EFFORT_OPTIONS = [
-  ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (claude & codex; cursor → high)'],
+  ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (claude & codex; cursor → high)'], ['ultra', 'Ultra (codex; claude → max)'],
 ];
 const ROLE_PHASES = [
   ['plan', 'Plan · outline the page'], ['research', 'Research · one section'], ['synthesize', 'Synthesize · write the page'], ['review', 'Review · critique'], ['revise', 'Revise · fix issues'],
@@ -3323,7 +3278,8 @@ function gatherProfile(name) {
       title: $('#cfg-profile-title').value.trim(),
       description: $('#cfg-profile-desc').value.trim(),
       pipeline: $('#cfg-profile-pipeline').value,
-      reasoning: { effort: $('#cfg-profile-effort').value },
+      // speed is set in the macOS app's effort chip; kept, not edited, here
+      reasoning: { effort: $('#cfg-profile-effort').value, speed: p.reasoning?.speed ?? 'default' },
       search: { web: $('#cfg-profile-web').value, freshness: $('#cfg-profile-freshness').value, maxRounds: Number($('#cfg-profile-rounds').value) || 3 },
       verification: {
         minSourcesPerClaim: Number($('#cfg-profile-minsources').value) || 1,

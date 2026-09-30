@@ -25,7 +25,7 @@ export function chatWorkspaceDir(ctx: AppContext, conversationId: string): strin
 export async function prepareChatWorkspace(
   ctx: AppContext,
   conversationId: string,
-  opts: { mcp: McpEndpoint; prompt?: string },
+  opts: { mcp: McpEndpoint },
 ): Promise<{ dir: string }> {
   const dir = chatWorkspaceDir(ctx, conversationId);
   fs.mkdirSync(dir, { recursive: true });
@@ -35,12 +35,8 @@ export async function prepareChatWorkspace(
   } catch {
     survey = '';
   }
-  // the agent's own prompt sits after the protocol and before the notes, so it
-  // reads as an amendment to how this workspace answers, not a replacement
   const schema = [
     loadChatProtocol(ctx.dataDir).trim(),
-    '',
-    opts.prompt?.trim() ?? '',
     '',
     knowledgeNotes(ctx.dataDir),
     '',

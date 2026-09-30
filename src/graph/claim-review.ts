@@ -1,9 +1,7 @@
 import crypto from 'node:crypto';
 import { KnodeConfig } from '../config.js';
 import { writeDeps } from '../lineage/deps.js';
-import { addBudgetUse, budgetUsedToday } from '../llm/budget.js';
 import { LlmClient } from '../llm/client.js';
-import { estimateTokens } from '../llm/tokens.js';
 import { Store } from '../store/db.js';
 import { toDateString } from '../store/temporal.js';
 
@@ -99,7 +97,6 @@ export async function reviewClaims(
     `SELECT id FROM claims WHERE status = 'suspected' AND tx_to IS NULL AND superseded_by IS NULL ORDER BY tx_from DESC LIMIT $1`, [limit],
   )) pairs.push({ claimId: c.id, againstId: null, disputeId: null });
 
-  let budgetLeft = Math.max(0, config.extraction.dailyTokenBudget - (await budgetUsedToday(store)));
   for (const pair of pairs.slice(0, limit)) {
     const id = claimReviewId(pair.claimId, pair.againstId);
     const [existing] = await store.query<{ id: string }>(`SELECT id FROM suggestions WHERE id = $1`, [id]);
@@ -111,11 +108,6 @@ export async function reviewClaims(
     const b = pair.againstId ? await detail(store, pair.againstId) : null;
     if (!a) continue;
     const user = [describe('A', a), b ? describe('B', b) : 'There is no claim B: judge whether the excerpt supports claim A.'].join('\n\n');
-    const cost = estimateTokens(SYSTEM + user) + 300;
-    if (cost > budgetLeft) {
-      progress('claim review: daily token budget exhausted');
-      break;
-    }
     let verdict: ClaimVerdict;
     try {
       const raw = await llm.completeJson<Partial<ClaimVerdict>>([{ role: 'system', content: SYSTEM }, { role: 'user', content: user }], { maxTokens: 400 });
@@ -126,8 +118,6 @@ export async function reviewClaims(
       progress(`claim review failed for ${pair.claimId}: ${err instanceof Error ? err.message : err}`);
       continue;
     }
-    await addBudgetUse(store, cost);
-    budgetLeft -= cost;
     stats.reviewed++;
 
     const label = { a: '支持 A', b: '支持 B', both: '两者可同时成立（不同时期）', neither: '两者都缺乏依据', unclear: '无法判断' }[verdict.verdict];

@@ -31,7 +31,7 @@ import {
   syncActiveLlm,
   defaultConfig,
   isCliProvider,
-  saveConfig, ResearchConfig, ChatConfig, LLM_EFFORTS, LLM_PROTOCOLS } from '../config.js';
+  saveConfig, ResearchConfig, ChatConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
 import { assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
@@ -132,7 +132,6 @@ type ExtractionConfigDraft = {
   conceptLlm?: Partial<RoutedLlmConfig>;
   documentLlm?: Partial<RoutedLlmConfig>;
   claims?: boolean;
-  dailyTokenBudget?: number;
   batchSize?: number;
   concurrency?: number;
 };
@@ -205,6 +204,7 @@ function mergeLlmConfig(current: LlmConfig, incoming: Partial<LlmConfig> = {}): 
     model: typeof incoming.model === 'string' ? incoming.model.trim() : current.model,
     cliPath: typeof incoming.cliPath === 'string' ? incoming.cliPath.trim() : current.cliPath,
     effort: incoming.effort && LLM_EFFORTS.includes(incoming.effort) ? incoming.effort : current.effort,
+    speed: incoming.speed && LLM_SPEEDS.includes(incoming.speed) ? incoming.speed : current.speed,
     protocol: incoming.protocol && LLM_PROTOCOLS.includes(incoming.protocol) ? incoming.protocol : current.protocol,
     cliTimeoutMs: Number.isFinite(cliTimeout) && cliTimeout >= 1000 ? Math.floor(cliTimeout) : current.cliTimeoutMs,
     label: typeof incoming.label === 'string' ? incoming.label.trim() : current.label,
@@ -222,6 +222,7 @@ function mergeRoutedLlmConfig(current: RoutedLlmConfig, incoming: Partial<Routed
     model: typeof incoming.model === 'string' ? incoming.model.trim() : current.model,
     cliPath: typeof incoming.cliPath === 'string' ? incoming.cliPath.trim() : current.cliPath,
     effort: incoming.effort && LLM_EFFORTS.includes(incoming.effort) ? incoming.effort : current.effort,
+    speed: incoming.speed && LLM_SPEEDS.includes(incoming.speed) ? incoming.speed : current.speed,
     protocol: incoming.protocol && LLM_PROTOCOLS.includes(incoming.protocol) ? incoming.protocol : current.protocol,
     cliTimeoutMs: Number.isFinite(cliTimeout) && cliTimeout >= 1000 ? Math.floor(cliTimeout) : current.cliTimeoutMs,
   };
@@ -589,10 +590,8 @@ export function createApp(
           next.extraction.documentLlm = mergeRoutedLlmConfig(next.extraction.documentLlm, x.documentLlm);
         }
         if (typeof x.claims === 'boolean') next.extraction.claims = x.claims;
-        const budget = Number(x.dailyTokenBudget);
         const batchSize = Number(x.batchSize);
         const concurrency = Number(x.concurrency);
-        if (Number.isFinite(budget) && budget >= 0) next.extraction.dailyTokenBudget = Math.floor(budget);
         if (Number.isFinite(batchSize) && batchSize >= 1) next.extraction.batchSize = Math.floor(batchSize);
         if (Number.isFinite(concurrency) && concurrency >= 1) next.extraction.concurrency = Math.floor(concurrency);
       }

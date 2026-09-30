@@ -74,7 +74,7 @@ POST /api/research/init ─▶ research_jobs(kind=init) ─kick─▶ service �
 
 `src/research/survey.ts`，确定性、无 LLM、约十条查询：文档按目录与日期范围、实体按类型与提及排名、
 关系谓词（含 `unknownPredicates`）、claims 按状态与事件范围、wiki 页（生成 / 人写 / 研究）、本体包、
-外部数据源、抽取积压与预算、指南与总览的状态、`purpose.md` / `schema.md` 是否仍是模板。
+外部数据源、抽取积压、指南与总览的状态、`purpose.md` / `schema.md` 是否仍是模板。
 `renderSurvey` 把它渲染成 brief 里的 `## 知识库概况`，UI 的初始化卡片直接用数字部分。
 
 ## 4. 对话入口（`src/chat/`）

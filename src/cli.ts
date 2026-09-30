@@ -136,7 +136,7 @@ program
 
 program
   .command('extract')
-  .description('run one tier-1 extraction pass: drain the priority queue (heat × freshness × importance) within the daily token budget')
+  .description('run one tier-1 extraction pass: drain a batch from the priority queue (heat × freshness × importance)')
   .option('--batch <n>', 'max documents this pass')
   .option('--concurrency <n>', 'parallel LLM extraction calls')
   .action(async (opts) => {

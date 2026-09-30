@@ -4,7 +4,7 @@ import { parseYaml } from '../compiler/intents.js';
 import { isCliProvider, KnodeConfig, LlmProvider } from '../config.js';
 import { AGENTS_DIR } from '../fs/layout.js';
 import { agentFilePath, agentYamlText, DEEP_AGENT, isValidAgentName } from './agent-file.js';
-import { Effort, EFFORTS, RoleTools, WEB_ACCESS, WebAccess } from './profile.js';
+import { Effort, EFFORTS, Speed, SPEEDS, WEB_ACCESS, WebAccess } from './profile.js';
 
 export { isValidAgentName } from './agent-file.js';
 
@@ -17,14 +17,18 @@ export { isValidAgentName } from './agent-file.js';
  * `connections`, or a coding-agent CLI on this machine that brings its own
  * loop (and its own path, model and effort — a CLI is an agent, not a model
  * endpoint, so it lives here and not in `connections`). On top of either sit
- * the reasoning effort, which tools it may use, and its system prompt. What a
+ * the reasoning effort and whether Ask may give it web tools. What a
  * *research run* looks like — pipeline mode, sub-agent roles, verification
  * bar — stays in the research profile, because that is what the runner already
  * reads, and because it is a property of the research, not of who runs it.
  *
  * There is no kind of agent: the same one can answer Ask and run research.
  * The `kind` agents used to carry only ordered the pickers, and loading the
- * config drops it from the files (`upgradeAgentFiles`).
+ * config drops it from the files (`upgradeAgentFiles`). So does what only Ask
+ * read — a turn cap, a timeout, page and file tools, a system prompt — and a
+ * description nothing read: Ask runs every agent the same way (see
+ * `chatRuntimeFor`), and the workspace's chat protocol is where its
+ * instructions live.
  *
  * Stored one YAML file each under `playbooks/agents/`, like profiles, so an
  * agent can be edited in the UI or in the file and diffed like any playbook.
@@ -34,7 +38,6 @@ export interface AgentDefinition {
   /** File stem, and the id `research.agent` / `chat.agent` reference. */
   name: string;
   title: string;
-  description: string;
   /**
    * What actually runs it. 'claude-cli' | 'codex-cli' | 'cursor-cli': that CLI,
    * from `cliPath`. Anything else runs the built-in deepagents loop on a model:
@@ -47,13 +50,10 @@ export interface AgentDefinition {
   /** Empty = the CLI's own default, or the connection's model. */
   model: string;
   effort: Effort;
-  tools: RoleTools;
-  /** Turn cap per session. 0 = the caller's own default. */
-  maxTurns: number;
-  /** 0 = the caller's own default. */
-  timeoutMs: number;
-  /** System prompt. Empty = the protocol the run workspace already carries. */
-  prompt: string;
+  /** `fast` = a codex agent's priority tier (`service_tier`); the other CLIs ignore it. */
+  speed: Speed;
+  /** Web tools in Ask, within `review.external`. Research takes its own from the profile. */
+  tools: { web: WebAccess };
   path: string;
 }
 
@@ -62,15 +62,12 @@ export const BUILTIN_AGENT_NAMES = [DEEP_AGENT.name] as const;
 function agent(patch: Partial<AgentDefinition> & Pick<AgentDefinition, 'name'>): AgentDefinition {
   return {
     title: patch.name,
-    description: '',
     executor: 'default',
     cliPath: '',
     model: '',
     effort: 'default',
-    tools: { write: false, files: true, web: 'inherit' },
-    maxTurns: 0,
-    timeoutMs: 0,
-    prompt: '',
+    speed: 'default',
+    tools: { web: 'inherit' },
     path: '',
     ...patch,
   };
@@ -85,12 +82,7 @@ function agent(patch: Partial<AgentDefinition> & Pick<AgentDefinition, 'name'>):
  * profile behaves.
  */
 export const BUILTIN_AGENTS: Record<string, AgentDefinition> = {
-  [DEEP_AGENT.name]: agent({
-    name: DEEP_AGENT.name,
-    title: DEEP_AGENT.title,
-    description: DEEP_AGENT.description,
-    tools: { write: true, files: true, web: 'inherit' },
-  }),
+  [DEEP_AGENT.name]: agent({ name: DEEP_AGENT.name, title: DEEP_AGENT.title }),
 };
 
 /** Which runtime a definition runs on: a coding-agent CLI, or the built-in deepagents loop. */
@@ -175,11 +167,6 @@ function str(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback;
 }
 
-function int(v: unknown, fallback: number, min = 0, max = Number.MAX_SAFE_INTEGER): number {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.floor(n))) : fallback;
-}
-
 function oneOf<T extends string>(v: unknown, allowed: readonly T[], fallback: T): T {
   return allowed.includes(v as T) ? (v as T) : fallback;
 }
@@ -190,19 +177,12 @@ export function normalizeAgent(raw: Record<string, unknown>, name: string, fileP
   return {
     name,
     title: str(raw.title, base.title),
-    description: str(raw.description, base.description),
     executor: str(raw.executor, base.executor).trim(),
     cliPath: str(raw.cliPath, base.cliPath).trim(),
     model: str(raw.model, base.model).trim(),
     effort: oneOf(raw.effort, EFFORTS, base.effort),
-    tools: {
-      write: typeof tools.write === 'boolean' ? tools.write : base.tools.write,
-      files: typeof tools.files === 'boolean' ? tools.files : base.tools.files,
-      web: oneOf(tools.web, WEB_ACCESS, base.tools.web) as WebAccess,
-    },
-    maxTurns: int(raw.maxTurns, base.maxTurns, 0, 500),
-    timeoutMs: int(raw.timeoutMs, base.timeoutMs, 0, 24 * 3600_000),
-    prompt: str(raw.prompt, base.prompt),
+    speed: oneOf(raw.speed, SPEEDS, base.speed),
+    tools: { web: oneOf(tools.web, WEB_ACCESS, base.tools.web) as WebAccess },
     path: filePath,
   };
 }

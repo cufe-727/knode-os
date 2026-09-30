@@ -17,7 +17,7 @@ import {
   resolveRoutedLlmConfig,
 } from '../src/config.js';
 import { cliCommand, readCursorStream, resolveExecutable } from '../src/llm/cli.js';
-import { parseClaudeAliases, parseCodexCatalog } from '../src/llm/models.js';
+import { parseClaudeAliases, parseCodexCatalog, parseCodexDefaults } from '../src/llm/models.js';
 import { clearModelCache } from '../src/llm/model-cache.js';
 import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
@@ -428,9 +428,58 @@ describe('what a CLI says it offers', () => {
       ],
     });
     expect(parseCodexCatalog(catalog)).toEqual([
-      { id: 'gpt-6-astra', label: 'GPT-6-Astra · effort low–ultra' },
-      { id: 'gpt-5.5', label: 'GPT-5.5 · effort low–xhigh' },
+      { id: 'gpt-6-astra', label: 'GPT-6-Astra', efforts: [{ id: 'low' }, { id: 'max' }, { id: 'ultra' }] },
+      { id: 'gpt-5.5', label: 'GPT-5.5', efforts: [{ id: 'low' }, { id: 'high' }, { id: 'xhigh' }] },
     ]);
+  });
+
+  it('keeps what the effort control needs: the levels, the default, and the Fast tier', () => {
+    const catalog = JSON.stringify({
+      models: [{
+        slug: 'gpt-6.1-sol',
+        display_name: 'GPT-6.1-Sol',
+        visibility: 'list',
+        priority: 1,
+        default_reasoning_level: 'low',
+        supported_reasoning_levels: [
+          { effort: 'low', description: 'Fast responses with lighter reasoning' },
+          { effort: 'ultra', description: 'Maximum reasoning with automatic task delegation' },
+          'not a level',
+        ],
+        // the tier is named here the way service_tier takes it…
+        additional_speed_tiers: ['fast'],
+        // …and described here, under an id of its own
+        service_tiers: [{ id: 'priority', name: 'Fast', description: '2x speed, increased usage' }],
+      }],
+    });
+    expect(parseCodexCatalog(catalog)).toEqual([{
+      id: 'gpt-6.1-sol',
+      label: 'GPT-6.1-Sol',
+      efforts: [
+        { id: 'low', description: 'Fast responses with lighter reasoning' },
+        { id: 'ultra', description: 'Maximum reasoning with automatic task delegation' },
+      ],
+      defaultEffort: 'low',
+      speeds: [{ id: 'fast', name: 'Fast', description: '2x speed, increased usage' }],
+    }]);
+  });
+
+  it('reads what codex runs when nothing is named, profile first', () => {
+    const toml = [
+      'model = "gpt-6-astra"',
+      'model_reasoning_effort = "xhigh"',
+      'service_tier = "default"',
+      '',
+      '[mcp_servers.docs]',
+      'model = "not a codex setting"',
+      '',
+      '[profiles.quick]',
+      'model_reasoning_effort = "low"',
+      'service_tier = "fast"',
+    ].join('\n');
+    expect(parseCodexDefaults(toml)).toEqual({ model: 'gpt-6-astra', effort: 'xhigh' });
+    expect(parseCodexDefaults(`profile = "quick"\n${toml}`)).toEqual({ model: 'gpt-6-astra', effort: 'low', speed: 'fast' });
+    expect(parseCodexDefaults('# nothing set\n[tui]\ntheme = "dark"\n')).toBeUndefined();
   });
 
   it('tolerates a catalog with noise around it, and refuses one that is not JSON', () => {
@@ -497,6 +546,23 @@ describe('migrateChatConfig', () => {
     // the keys are gone from the object, not merely ignored, so the next save cleans the file
     expect(Object.keys(loaded.chat)).not.toContain('effort');
     expect(Object.keys(loaded.chat)).not.toContain('maxTurns');
+  });
+});
+
+describe('dropTokenBudget', () => {
+  it('drops the retired daily token budget, and writes the file without it', () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'budget-config-'));
+    const file = path.join(dir, 'knode.config.json');
+    fs.writeFileSync(file, JSON.stringify(loadConfig(dir)));
+    loadConfig(dir); // settles whatever else a first load writes down
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, JSON.stringify({ ...stored, extraction: { ...stored.extraction, dailyTokenBudget: 5_000_000 } }));
+
+    const loaded = loadConfig(dir);
+    expect(loaded.extraction).not.toHaveProperty('dailyTokenBudget');
+    expect(loaded.extraction.batchSize).toBe(stored.extraction.batchSize);
+    // written down at once, so the file stops showing a setting nothing reads
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).extraction).not.toHaveProperty('dailyTokenBudget');
   });
 });
 

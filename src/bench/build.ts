@@ -62,7 +62,7 @@ export async function benchBuild(ctx: AppContext, opts: BuildBenchOptions = {}):
     tier1Total.relations += pass.relations;
     tier1Total.tokensUsed += pass.tokensUsed;
     tier1Total.queuedLeft = pass.queued;
-    progress(`tier1 pass ${tier1Total.passes}: processed=${pass.processed} failed=${pass.failed} tokens=${pass.tokensUsed} queued=${pass.queued} budgetLeft=${pass.budgetLeft}`);
+    progress(`tier1 pass ${tier1Total.passes}: processed=${pass.processed} failed=${pass.failed} tokens=${pass.tokensUsed} queued=${pass.queued}`);
     if (pass.queued === 0 || (pass.processed === 0 && pass.failed === 0)) break;
   }
   const tier1Ms = Date.now() - tTier1;
@@ -142,6 +142,6 @@ ${mdTable(['stage', 'duration', 'output', 'throughput'], rows)}
 ${mdTable(['documents', 'chunks', 'entities', 'relations', 'claims'],
   [[r.corpus.documents, r.corpus.chunks, r.corpus.entities, r.corpus.relations, r.corpus.claims]])}
 
-Tier-1 queue left: ${s.tier1.queuedLeft} (0 = fully drained; >0 = budget/passes exhausted)
+Tier-1 queue left: ${s.tier1.queuedLeft} (0 = fully drained; >0 = passes exhausted or stalled)
 `;
 }

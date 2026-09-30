@@ -21,7 +21,7 @@ import { WorkspaceContextRegistry } from './workspaces.js';
 /**
  * `knode-os serve` — HTTP API + web UI, plus the background loops:
  * file watcher → scoped sync (apply changed, dispose removed), periodic
- * tier-1 extraction (budgeted, heat-prioritized) followed by view
+ * tier-1 extraction (heat-prioritized) followed by view
  * reconciliation, hourly usage-stats flush to sidecars, periodic trace sync,
  * datasource re-sync, nightly dream + tier-2 hot-subgraph refinement.
  */
@@ -136,8 +136,8 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   }, interval);
   syncTimer.unref?.();
 
-  // tier-1 extraction loop: drain the priority queue within the daily budget,
-  // then let pages that depend on the new evidence regenerate
+  // tier-1 extraction loop: drain the priority queue a batch at a time, then
+  // let pages that depend on the new evidence regenerate
   const tier1Interval = Math.max(1, ctx.config.extraction.intervalMinutes) * 60_000;
   let tier1Running = false;
   const tier1Timer = setInterval(() => {
@@ -147,7 +147,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       try {
         const t1 = await runTier1Pass(ctx.store, ctx.config, ctx.llm, { onProgress: log });
         if (t1.processed || t1.failed) {
-          log(`tier1: ${t1.processed} extracted, ${t1.failed} failed, ${t1.queued} queued, ~${t1.tokensUsed} tokens (budget left ${t1.budgetLeft})`);
+          log(`tier1: ${t1.processed} extracted, ${t1.failed} failed, ${t1.queued} queued, ~${t1.tokensUsed} tokens`);
           const views = await reconcileViews(ctx, { actor: 'tier1', llm: false, onProgress: log });
           if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
         }

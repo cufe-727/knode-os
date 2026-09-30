@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { parseYaml } from '../compiler/intents.js';
-import { KnodeConfig, LLM_EFFORTS, LlmEffort } from '../config.js';
+import { KnodeConfig, LLM_EFFORTS, LLM_SPEEDS, LlmEffort, LlmSpeed } from '../config.js';
 import { RESEARCH_DIR } from '../fs/layout.js';
 import { agentWebCapable, ResearchAgent } from './agent.js';
 import { PHASES, PhaseName, ResearchTemplate } from './templates.js';
@@ -14,6 +14,8 @@ import { PHASES, PhaseName, ResearchTemplate } from './templates.js';
  *
  *   reasoning.effort      how hard the model thinks (claude --effort, codex
  *                         model_reasoning_effort, cursor model[effort=…])
+ *   reasoning.speed       `fast` = codex's priority tier (service_tier);
+ *                         the other CLIs ignore it
  *   search                whether web tools are on, how fresh (codex
  *                         web_search = live | cached) and how many rounds
  *   verification / stop / output
@@ -35,6 +37,9 @@ export const ROLE_PROMPTS_DIR = 'roles';
 /** The ladder is defined with the LLM config, so a profile and a connection mean the same thing by `high`. */
 export const EFFORTS = LLM_EFFORTS;
 export type Effort = LlmEffort;
+/** The same for speed: `fast` is codex's priority tier, and the other CLIs ignore it. */
+export const SPEEDS = LLM_SPEEDS;
+export type Speed = LlmSpeed;
 export const ROLE_PHASES = ['plan', 'research', 'synthesize', 'review', 'revise'] as const;
 export type RolePhase = (typeof ROLE_PHASES)[number];
 export const WEB_ACCESS = ['inherit', 'on', 'off'] as const;
@@ -66,6 +71,8 @@ export interface ResearchRole {
   model: string;
   /** 'default' = the profile's reasoning.effort. */
   effort: Effort;
+  /** 'default' = the profile's reasoning.speed. */
+  speed: Speed;
   tools: RoleTools;
   /** research phase: parallel sessions (0 = research.researchers). */
   parallel: number;
@@ -87,7 +94,7 @@ export interface ResearchProfile {
   description: string;
   /** '' = research.pipeline. */
   pipeline: PipelineMode | '';
-  reasoning: { effort: Effort };
+  reasoning: { effort: Effort; speed: Speed };
   search: { web: WebAccess; freshness: Freshness; maxRounds: number };
   verification: { minSourcesPerClaim: number; preferPrimarySources: boolean; resolveConflicts: ConflictPolicy };
   stop: { maxSections: number; marginalGain: boolean };
@@ -108,6 +115,7 @@ export interface NativeAgentSpec {
   web: boolean;
   model: string;
   effort: Effort;
+  speed: Speed;
 }
 
 export const EVIDENCE_TABLE_SECTION = '## 证据表';
@@ -121,6 +129,7 @@ function role(patch: Partial<ResearchRole> & Pick<ResearchRole, 'id' | 'phase'>)
     agent: '',
     model: '',
     effort: 'default',
+    speed: 'default',
     tools: { write: false, files: true, web: 'inherit' },
     parallel: 0,
     rounds: 0,
@@ -149,7 +158,7 @@ function baseProfile(name: string, patch: Partial<Omit<ResearchProfile, 'name' |
     title: name,
     description: '',
     pipeline: '',
-    reasoning: { effort: 'default' },
+    reasoning: { effort: 'default', speed: 'default' },
     search: { web: 'inherit', freshness: 'live', maxRounds: 3 },
     verification: { minSourcesPerClaim: 1, preferPrimarySources: true, resolveConflicts: 'flag' },
     stop: { maxSections: 8, marginalGain: true },
@@ -171,7 +180,7 @@ export const BUILTIN_PROFILES: Record<string, ResearchProfile> = {
     title: '快速 · 单会话',
     description: '一个会话独立完成，适合刷新已有页面或小问题；章节少、检索轮次少。',
     pipeline: 'single',
-    reasoning: { effort: 'medium' },
+    reasoning: { effort: 'medium', speed: 'default' },
     search: { web: 'inherit', freshness: 'cached', maxRounds: 2 },
     stop: { maxSections: 4, marginalGain: true },
   }),
@@ -179,7 +188,7 @@ export const BUILTIN_PROFILES: Record<string, ResearchProfile> = {
     title: '深度 · 高强度核实',
     description: '最高推理强度、更多研究员与评审轮次、每条事实至少两个来源、附证据表；成本最高。',
     pipeline: 'team',
-    reasoning: { effort: 'max' },
+    reasoning: { effort: 'max', speed: 'default' },
     search: { web: 'inherit', freshness: 'live', maxRounds: 6 },
     verification: { minSourcesPerClaim: 2, preferPrimarySources: true, resolveConflicts: 'prefer_primary' },
     stop: { maxSections: 8, marginalGain: true },
@@ -190,7 +199,7 @@ export const BUILTIN_PROFILES: Record<string, ResearchProfile> = {
     title: '原生子代理',
     description: '一个主管会话，研究员与评审作为 CLI 原生子代理（claude --agents / codex agents.enabled）；cursor 退回单会话。',
     pipeline: 'native',
-    reasoning: { effort: 'high' },
+    reasoning: { effort: 'high', speed: 'default' },
   }),
 };
 
@@ -325,6 +334,7 @@ export function normalizeRole(raw: unknown, index: number): ResearchRole | null 
     agent: str(o.agent),
     model: str(o.model),
     effort: oneOf(o.effort, EFFORTS, 'default'),
+    speed: oneOf(o.speed, SPEEDS, 'default'),
     tools: {
       write: bool(tools.write, defaults.tools.write),
       files: bool(tools.files, true),
@@ -365,7 +375,10 @@ export function normalizeProfile(raw: Record<string, unknown>, name: string, fil
     title: str(raw.title, builtin ? builtin.title : name),
     description: str(raw.description, builtin ? builtin.description : ''),
     pipeline: oneOf(raw.pipeline, [...PIPELINE_MODES, ''] as const, base.pipeline),
-    reasoning: { effort: oneOf(reasoning.effort, EFFORTS, base.reasoning.effort) },
+    reasoning: {
+      effort: oneOf(reasoning.effort, EFFORTS, base.reasoning.effort),
+      speed: oneOf(reasoning.speed, SPEEDS, base.reasoning.speed),
+    },
     search: {
       web: oneOf(search.web ?? (typeof search.enabled === 'boolean' ? (search.enabled ? 'on' : 'off') : undefined), WEB_ACCESS, base.search.web),
       freshness: oneOf(search.freshness, FRESHNESS, base.search.freshness),
@@ -451,6 +464,10 @@ export function effectiveEffort(profile: ResearchProfile, role?: ResearchRole | 
   return role && role.effort !== 'default' ? role.effort : profile.reasoning.effort;
 }
 
+export function effectiveSpeed(profile: ResearchProfile, role?: ResearchRole | null): Speed {
+  return role && role.speed !== 'default' ? role.speed : profile.reasoning.speed;
+}
+
 export function effectivePipeline(profile: ResearchProfile, config: KnodeConfig): PipelineMode {
   const fromConfig = config.research?.pipeline;
   return profile.pipeline || (fromConfig && (PIPELINE_MODES as readonly string[]).includes(fromConfig) ? (fromConfig as PipelineMode) : 'team');
@@ -497,6 +514,7 @@ const EFFORT_TEXT: Record<Effort, string> = {
   high: '高（多轮交叉验证）',
   xhigh: '极高',
   max: '最高（不惜成本）',
+  ultra: '极限（最深推理，自动分派子任务）',
 };
 
 /** The brief's "research rules" block — the profile as instructions the agent reads. */
@@ -529,6 +547,7 @@ export function profileSummary(p: ResearchProfile): Record<string, unknown> {
     description: p.description,
     pipeline: p.pipeline,
     effort: p.reasoning.effort,
+    speed: p.reasoning.speed,
     web: p.search.web,
     freshness: p.search.freshness,
     roles: p.roles.filter((r) => r.enabled).map((r) => r.id),

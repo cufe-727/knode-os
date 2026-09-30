@@ -5,7 +5,7 @@ import { AppContext } from '../context.js';
 import { safePath } from '../fs/files.js';
 import { agentWebCapable, DEFAULT_CONNECTION, ExecutorId, ResearchAgent, resolveAgentSpec, withModel } from '../research/agent.js';
 import { AgentDefinition } from '../research/agents.js';
-import { Effort, RoleTools, WebAccess } from '../research/profile.js';
+import { Effort, Speed, WebAccess } from '../research/profile.js';
 import { clearCancelled, JobCancelledError, killAgentsFor, launchSession, SessionResult, transcriptPathFor } from '../research/launch.js';
 import { McpEndpoint } from '../research/workspace.js';
 import { appendMessage, ChatConversation, ChatEvent, ChatMessage, ChatStatus, getConversation, pruneConversations, recentMessages, setConversationStatus, titleFrom } from './store.js';
@@ -59,29 +59,25 @@ const jobIdOf = (conversationId: string) => `chat:${conversationId}`;
 /**
  * Everything a turn needs to launch, resolved once.
  *
- * The launch parameters come from the agent's own definition, which is the
- * point of naming an agent at all: `playbooks/agents/*.yaml` carried `effort`,
- * `tools`, `maxTurns`, `timeoutMs` and `prompt` for a while while nothing read
- * them, because the resolver handed on only an executor. A bare spec — a CLI
- * name, a connection id, `default` — has no definition, so it falls back to
- * what chat hard-coded before, which keeps the shipped `deep-agent` behaving
- * exactly as it did.
+ * An agent's definition brings its effort, speed and web access; a bare spec — a
+ * CLI name, a connection id, `default` — has none, so it runs on the defaults.
+ * Agents used to carry a turn cap, a timeout, page and file tools and a
+ * system prompt as well. Only Ask read them, and they made every agent a long
+ * form, so Ask now runs every agent the same way (`ASK_MAX_TURNS`,
+ * `ASK_TIMEOUT_MS`, both tools), with its instructions in the workspace's
+ * chat protocol.
  */
 export interface ChatRuntime {
   agent: ResearchAgent;
   definition: AgentDefinition | null;
-  maxTurns: number;
-  timeoutMs: number;
   effort: Effort;
-  tools: 'read' | 'write';
-  files: boolean;
-  /** Extra instructions for the run workspace's schema. '' = the protocol alone. */
-  prompt: string;
+  speed: Speed;
   allowNetwork: boolean;
 }
 
-/** What chat launches with when nothing named an agent that could say otherwise. */
-const BARE_TOOLS: RoleTools = { write: true, files: true, web: 'inherit' };
+/** One Ask turn's limits, whichever agent answers. */
+export const ASK_MAX_TURNS = 30;
+export const ASK_TIMEOUT_MS = 600_000;
 
 /**
  * Which spec answers Ask: `chat.agent`, else the research agent, else the
@@ -110,18 +106,12 @@ export function resolveChatRuntime(config: KnodeConfig, dataDir?: string): ChatR
 
 /** The runtime for an already-resolved agent — the seam tests launch through. */
 export function chatRuntimeFor(config: KnodeConfig, agent: ResearchAgent, definition: AgentDefinition | null): ChatRuntime {
-  const tools = definition?.tools ?? BARE_TOOLS;
   return {
     agent,
     definition,
-    // 0 is already documented as "the caller's own default"
-    maxTurns: definition?.maxTurns || 30,
-    timeoutMs: definition?.timeoutMs || 600_000,
     effort: definition?.effort ?? 'default',
-    tools: tools.write ? 'write' : 'read',
-    files: tools.files,
-    prompt: definition?.prompt ?? '',
-    allowNetwork: chatWebAllowed(config, agent, tools.web),
+    speed: definition?.speed ?? 'default',
+    allowNetwork: chatWebAllowed(config, agent, definition?.tools.web),
   };
 }
 
@@ -264,7 +254,7 @@ export async function startChatTurn(ctx: AppContext, conversationId: string, tex
     let result: SessionResult | null = null;
     let error: string | null = null;
     try {
-      const ws = await prepareChatWorkspace(ctx, conversationId, { mcp: opts.mcp, prompt: runtime.prompt });
+      const ws = await prepareChatWorkspace(ctx, conversationId, { mcp: opts.mcp });
       entry.transcriptPath = transcriptPathFor(ws.dir, label);
       const prompt = renderChatPrompt(ctx.dataDir, { conversationId, history, message: content, allowNetwork: runtime.allowNetwork });
       fs.writeFileSync(path.join(ws.dir, `prompt-${label}.md`), prompt);
@@ -272,8 +262,8 @@ export async function startChatTurn(ctx: AppContext, conversationId: string, tex
       log(`chat ${conversationId}: turn ${seq} on ${runtime.agent.provider}${runtime.agent.model ? ` ${runtime.agent.model}` : ''}${runtime.definition ? ` (${runtime.definition.name})` : ''}`);
       result = await launchSession({
         agent: runtime.agent,
-        maxTurns: runtime.maxTurns,
-        timeoutMs: runtime.timeoutMs,
+        maxTurns: ASK_MAX_TURNS,
+        timeoutMs: ASK_TIMEOUT_MS,
         cwd: ws.dir,
         prompt,
         mcp: opts.mcp,
@@ -282,9 +272,11 @@ export async function startChatTurn(ctx: AppContext, conversationId: string, tex
         outputPath: '',
         worksetId: '',
         allowNetwork: runtime.allowNetwork,
-        tools: runtime.tools,
-        files: runtime.files,
+        // Ask may take notes and read the raw files, whichever agent answers
+        tools: 'write',
+        files: true,
         effort: runtime.effort,
+        speed: runtime.speed,
         label,
       });
       error = result.error;

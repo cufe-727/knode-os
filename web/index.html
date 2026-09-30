@@ -358,7 +358,7 @@
                 <div class="stage-panel-copy">
                   <div class="stage-title"><h4>Extract</h4><span class="section-badge accent2">Volume</span></div>
                   <p>Names entities, relations and factual claims in changed documents.</p>
-                  <p class="stage-req">The busiest stage — it runs on every changed document, bounded by the daily budget and the batch size here. A fast, cheap model that returns clean JSON is usually the right trade.</p>
+                  <p class="stage-req">The busiest stage — it runs on every changed document, bounded by the batch size here. A fast, cheap model that returns clean JSON is usually the right trade.</p>
                   <div class="stage-rates">
                     <label>Parallel calls<input id="cfg-extraction-concurrency" type="number" min="1" step="1" /></label>
                     <label>Documents per pass<input id="cfg-extraction-batch" type="number" min="1" step="1" /></label>
@@ -398,11 +398,6 @@
                 </div>
               </div>
             </div>
-
-            <div class="stage-budget">
-              <div><b>Daily token budget</b><p>Shared by Extract and Synthesize — the two stages that run in the background.</p></div>
-              <input id="cfg-extraction-budget" type="number" min="0" step="1000" />
-            </div>
           </div>
         </section>
 
@@ -429,7 +424,7 @@
           <div class="cfg-card-title"><div><b>Initialization</b><small>What the Wiki tab's initialize button does before the agent starts, and how many topic pages it queues afterwards.</small></div><span class="section-badge">Init</span></div>
           <fieldset class="cfg-card cfg-card-wide">
             <div class="cfg-grid cfg-grid-3">
-              <label>Extraction first<select id="cfg-init-extraction"><option value="drain">Drain the tier-1 queue (within the daily budget)</option><option value="skip">Skip — leave it to the background loop</option></select></label>
+              <label>Extraction first<select id="cfg-init-extraction"><option value="drain">Drain the tier-1 queue</option><option value="skip">Skip — leave it to the background loop</option></select></label>
               <label>Extraction time cap (minutes)<input id="cfg-init-maxms" type="number" min="1" max="60" step="1" /></label>
               <label>Follow-up pages queued<input id="cfg-init-followups" type="number" min="0" max="20" step="1" /></label>
             </div>
