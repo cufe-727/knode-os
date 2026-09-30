@@ -46,6 +46,14 @@ ditto "$RESOURCE_BUNDLE" "$APP_DIR/KnodeOS_KnodeOSApp.bundle"
 # registry — offline or not, since KNODE_OS_PNPM_FLAGS never reached it.
 (cd "$REPO_DIR" && pnpm pack --pack-destination "$PACK_DIR" >/dev/null)
 tar -xzf "$PACK_DIR"/*.tgz -C "$DEPLOY_DIR" --strip-components=1
+# tsc never deletes an output whose source is gone, and `files` ships all of
+# dist/, so a deleted module would ship on as dead code, the way
+# dist/llm/budget.js outlived src/llm/budget.ts. Drop every compiled file that
+# no longer has a source, in this copy only.
+(cd "$DEPLOY_DIR/dist" && find . -name '*.js' | while read -r out; do
+  rel="${out#./}"
+  [[ -f "$REPO_DIR/src/${rel%.js}.ts" ]] || rm -f "$out"
+done)
 # --prod skips *installing* devDependencies, but pnpm still resolves them, so a
 # dev-only package whose build script is not approved outside the workspace
 # (esbuild, pulled in by tsx and vitest) aborts the install under pnpm 11's
