@@ -15,7 +15,7 @@
 
 ## 语料
 
-`knode-os import archive <dir> --since 2026-04 --until 2026-07 --relevant-only`：
+当时用 `knode-os import archive --since 2026-04 --until 2026-07 --relevant-only` 把归档按月拼成分卷（该命令已于 2026-09-29 移除，归档转 markdown 改由 rookie-trade 的 `crawler/archive-markdown.mjs` 负责）：
 
 - 89 个 NDJSON 文件 → 6228 条帖子（过滤掉 905 条 investment_relevant=false），0 解析失败
 - 产出 641 个 markdown 分卷（约 9000 字符/卷，与 tier-1 的 12000 字符截断上限对齐），共 8.9 MB
@@ -86,11 +86,12 @@
 
 ## 复现步骤
 
+当时导入语料用的 `import archive` 已移除。改用 rookie-trade 渲染的 markdown 时，文件是按月整份而不是约 9000 字符的分卷，上面的数字不会原样复现。
+
 ```bash
 pnpm install && pnpm build
 node dist/cli.js init --data ~/knode-finance          # 然后写入 Router 配置（见上表）
-node dist/cli.js --data ~/knode-finance import archive <crawler/archive> \
-  --since 2026-04 --until 2026-07 --relevant-only
+# 语料：把 rookie-trade crawler/archive-markdown.mjs 渲染的 markdown 放进 ~/knode-finance/raw/docs/finance/
 node dist/cli.js --data ~/knode-finance bench build   # 全量构建 + 性能报告
 node dist/cli.js --data ~/knode-finance bench qa-gen --n 100
 node dist/cli.js --data ~/knode-finance bench retrieval --k 5,10
@@ -102,6 +103,6 @@ node dist/cli.js --data ~/knode-finance connect codex   # / connect claude
 ## 后续改进建议
 
 1. tier-1 换非 thinking 模型（如 doubao-1.6-flash）做首轮抽取，thinking 模型只精炼热点文档，构建时长可从 3.4h 压到 <1h。
-2. 雪球/淘股吧评论楼层碎片召回差：导入时可按「主帖+评论」聚合为语义单元而非按大小分卷，或对评论卷做去重。
+2. 雪球/淘股吧评论楼层碎片召回差：渲染 markdown 时可按「主帖+评论」聚合为语义单元而非按大小分卷，或对评论卷做去重。
 3. graph 信号在 hybrid 中权重（0.6）可用 QA 集网格搜索调优。
 4. `bench retrieval` 已固定 QA 集（eval/qa.jsonl），后续改动检索管线时直接重跑即可回归对比。
