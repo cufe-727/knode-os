@@ -187,6 +187,15 @@ The rule that must not bend: a route storing `use: ''` or `'default'` keeps mean
 Rewriting those to the new id during migration would pin them to one endpoint and kill the propagation that
 named connections exist for. There is a test for exactly that.
 
+> Both have since changed. On 2026‑09‑29 the rule above was reversed: a stage's picker offered "Default · X"
+> beside X's own row, so `pinRoutes` now writes an inheriting route down as the default it ran on, and moving
+> the default moves no stage (06 §5d). On 2026‑09‑30 `ctx.llm` stopped reading the mirror. Document summaries,
+> Dream, the nightly merge and claim reviews and `knode_ask` were the jobs that ran on the default because none
+> of them picked a model, and Settings showed them as a fifth stage, "Answer", that could not be set. They are
+> the **Summarize** stage now, with a route of its own (`extraction.summaryLlm`, a model or an agent like any
+> stage); `ctx.llm` is that route's client (`summaryLlmClient`), and a config from before is pinned to the
+> default it ran on.
+
 The last LLM connection cannot be removed, the way the last embedding provider cannot: something has to answer.
 Removing the default demotes it to the first row left and says so in the status line.
 

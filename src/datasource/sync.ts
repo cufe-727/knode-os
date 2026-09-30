@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { DataSourceConfig, DataSourceKind, EntityColumnConfig, KnodeConfig, SourceDialect } from '../config.js';
+import { summaryLlmClient } from '../context.js';
 import { resolveEntityIdByNameOrAlias, slugify } from '../graph/store.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { applyScope } from '../lineage/scope.js';
@@ -173,7 +174,7 @@ export async function applyDatasourceScopes(
     store,
     dataDir: ctx.dataDir,
     config: ctx.config,
-    llm: ctx.llm ?? new LlmClient(ctx.config.llm),
+    llm: ctx.llm ?? summaryLlmClient(ctx.config),
     embedder: ctx.embedder ?? createEmbeddingProvider(ctx.config.embedding),
     datasources: registry,
   };

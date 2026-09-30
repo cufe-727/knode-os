@@ -699,6 +699,9 @@ struct ExtractionConfig: Codable, Equatable {
     var entityLlm: RoutedLLMConfig
     var conceptLlm: RoutedLLMConfig
     var documentLlm: RoutedLLMConfig
+    /// The Summarize stage: document summaries, Dream, the nightly reviews
+    /// and knode_ask. They ran on the default LLM before it had a route.
+    var summaryLlm: RoutedLLMConfig
     var batchSize: Int
     var concurrency: Int
 }
@@ -973,22 +976,20 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
         return target
     }
 
-    /// An agent as a pipeline stage sees it, called one-shot: a CLI agent as
-    /// `asLlmTarget`, a deepagents agent as its own model on the endpoint it
-    /// runs on. Nil for a deepagents agent that names no model — it would be
-    /// that endpoint's row again under another name, which is why the stage
-    /// picker listed both deep agents beside the model they run on — and for
-    /// one that runs on nothing: it follows a default that is a CLI agent, or
-    /// pins a model that is gone. The client-side mirror of the service's
-    /// `routeTargets`.
+    /// An agent as a pipeline stage sees it, run once through its own loop: a
+    /// CLI agent as `asLlmTarget`, a deepagents agent as the endpoint it runs
+    /// on, with its own model or else the endpoint's — the service runs the
+    /// deepagents loop there, which is what sets it apart from that endpoint's
+    /// row. Nil for one that runs on nothing: it follows a default that is a
+    /// CLI agent, or names a model endpoint that is gone. The client-side
+    /// mirror of the service's `routeTargets`.
     func asRouteTarget(connections: [LLMConnection], defaultTarget: LLMConnection?) -> LLMConnection? {
         if isCli { return asLlmTarget }
-        guard !model.isEmpty else { return nil }
         let endpoint = executor == "default" ? defaultTarget : connections.first { $0.id == executor }
         guard var target = endpoint, !cliProviderNames.contains(target.provider) else { return nil }
         target.id = name
         target.label = title.trimmingCharacters(in: .whitespaces).isEmpty ? name : title
-        target.model = model
+        if !model.isEmpty { target.model = model }
         return target
     }
 }
@@ -1089,6 +1090,7 @@ struct ConfigTestResponse: Decodable {
     var entityLlm: RouteTestResult?
     var conceptLlm: RouteTestResult?
     var documentLlm: RouteTestResult?
+    var summaryLlm: RouteTestResult?
 }
 
 /// One entry of what a provider offers for a `model` field. The field itself

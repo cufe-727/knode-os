@@ -385,16 +385,16 @@
                 </div>
               </div>
 
-              <div class="stage-panel" data-stage="answer" hidden>
+              <div class="stage-panel" data-stage="summary" hidden>
                 <div class="stage-panel-copy">
-                  <div class="stage-title"><h4>Answer</h4><span class="section-badge accent2">Interactive</span></div>
-                  <p>Document summaries in the wiki, and the nightly Dream analysis.</p>
-                  <p class="stage-req">Always the default provider — these are the jobs that never picked one of their own. Ask no longer runs here: every question is an agent session, configured under Providers & Agents.</p>
+                  <div class="stage-title"><h4>Summarize</h4><span class="section-badge accent2">Judgment</span></div>
+                  <p>Writes each document's summary page and answers <span class="mono">knode_ask</span>; overnight it runs Dream and reviews duplicate entities and disputed claims.</p>
+                  <p class="stage-req">Every job here reads the text it is handed and makes a call on it — what a document is about, whether two entities are one, which of two claims holds, what a week of agent sessions says. Nobody waits on most of them: summaries are written when the wiki is generated and refreshed overnight, beside Dream and the reviews, so a slower model or a CLI subscription only costs time. <span class="mono">knode_ask</span> is the exception — an agent is waiting on its answer.</p>
                 </div>
-                <div class="stage-control stage-pin">
-                  <span class="stage-pin-label">Runs on</span>
-                  <b id="pin-answer">Loading…</b>
-                  <small>Set in section 01 · Default LLM provider</small>
+                <div class="stage-control">
+                  <label>Run with<select id="cfg-summary-use" class="cfg-route-use"></select></label>
+                  <label>Model<span class="model-field"><input id="cfg-summary-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="summaryLlm" title="List the models this provider offers">⌄</button></span></label>
+                  <p class="route-note" id="cfg-summary-note"></p>
                 </div>
               </div>
             </div>

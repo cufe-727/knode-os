@@ -538,6 +538,7 @@ async function groundingExcerpts(store: Store, entityIds: string[]): Promise<str
   return rows.map((r) => r.content.replace(/\s+/g, ' ').slice(0, 300));
 }
 
+/** The Summarize stage, which is what `ctx.llm` runs on (`summaryLlmClient`). */
 function documentSummaryLlm(ctx: PagesContext): LlmClient {
   return ctx.llm;
 }

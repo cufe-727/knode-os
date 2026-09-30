@@ -96,6 +96,9 @@ export function cursorModel(model: string, effort: LlmEffort | undefined): strin
   return `${model}[effort=${level}]`;
 }
 
+/** What a JSON request adds to the prompt where the wire has no JSON mode: an agent's loop. */
+export const JSON_DIRECTIVE = 'Respond with a single JSON object only — no prose, no markdown code fences.';
+
 /** Flatten chat messages into a single prompt for one-shot CLI runs. */
 export function renderCliPrompt(messages: ChatMessage[], json: boolean): string {
   const nonSystem = messages.filter((m) => m.role !== 'system');
@@ -105,7 +108,7 @@ export function renderCliPrompt(messages: ChatMessage[], json: boolean): string 
     else parts.push(`[${m.role}]\n${m.content}`);
   }
   let prompt = parts.join('\n\n');
-  if (json) prompt += '\n\nRespond with a single JSON object only — no prose, no markdown code fences.';
+  if (json) prompt += `\n\n${JSON_DIRECTIVE}`;
   return prompt;
 }
 

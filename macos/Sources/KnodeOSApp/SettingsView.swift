@@ -12,8 +12,9 @@ struct SettingsView: View {
     @State private var cliTools: [String: CliTool] = [:]
     /// Provider ids whose row is open. Survives a save, unlike a per-row @State.
     @State private var expandedProviders: Set<String> = []
-    /// Which pipeline node the inspector below the flow is showing.
+    /// Which stage the form beside the pipeline rail is showing.
     @State private var selectedStage: PipelineStage = .convert
+    @State private var hoveredStage: PipelineStage?
     /// Model lists, shared by every picker on the screen.
     @StateObject private var catalog = ModelCatalog()
     /// The named agents Ask and Research point at (the second table on 01).
@@ -286,18 +287,20 @@ struct SettingsView: View {
 
     // MARK: - 02 · Pipeline
 
-    /// The five stages as a flow, in the order a document passes through them.
-    /// A node carries what a person checks at a glance — where it runs and how
-    /// fast — and opens the inspector below for everything else, so the whole
-    /// pipeline fits on one screen instead of two.
+    /// The five stages as a rail, top to bottom in the order a document passes
+    /// through them, with the selected stage's form beside it. A node carries
+    /// what a person checks at a glance — where it runs and how fast — and the
+    /// form holds everything else. The nodes used to be a row over the form,
+    /// which an ordinary window wrapped to three and two, and which put every
+    /// control well below the node that opened it.
     private var pipelineSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             sectionHeader(
                 title: L("What each stage needs"),
                 detail: L("A document moves down this list. The stages ask different things of a model, which is why each one can run somewhere else.")
             )
-            VStack(alignment: .leading, spacing: 0) {
-                stageFlow
+            HStack(alignment: .top, spacing: 0) {
+                stageRail.frame(width: 256)
                 Divider()
                 stageInspector
             }
@@ -305,38 +308,25 @@ struct SettingsView: View {
         }
     }
 
-    private var stageFlow: some View {
+    private var stageRail: some View {
         let stages = PipelineStage.allCases
-        return ViewThatFits(in: .horizontal) {
-            HStack(spacing: 8) {
-                ForEach(stages) { stage in
-                    if stage != stages.first { stageArrow }
-                    stageNode(stage)
-                }
-            }
-            // A narrow window wraps rather than clipping the last stages.
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    ForEach(stages.prefix(3)) { stage in
-                        if stage != stages.first { stageArrow }
-                        stageNode(stage)
-                    }
-                }
-                HStack(spacing: 8) {
-                    ForEach(stages.suffix(2)) { stage in
-                        if stage != stages.suffix(2).first { stageArrow }
-                        stageNode(stage)
-                    }
-                }
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(stages) { stage in
+                if stage != stages.first { stageArrow }
+                stageNode(stage)
             }
         }
-        .padding(16)
+        .padding(12)
     }
 
+    /// Under the step numbers, so the five read down one column.
     private var stageArrow: some View {
-        Image(systemName: "arrow.right")
-            .font(.caption2)
+        Image(systemName: "arrow.down")
+            .font(.system(size: 8, weight: .semibold))
             .foregroundStyle(.tertiary)
+            .frame(width: 16, height: 14)
+            // a node's padding, which is where its step number starts
+            .padding(.leading, 11)
     }
 
     private func stageNode(_ stage: PipelineStage) -> some View {
@@ -345,63 +335,73 @@ struct SettingsView: View {
         return Button {
             selectedStage = stage
         } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Text("\(stage.step)")
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .foregroundStyle(stage.color)
-                        .frame(width: 16, height: 16)
-                        .background(stage.color.opacity(0.14), in: RoundedRectangle(cornerRadius: 5))
-                    Text(stage.title).font(.system(size: 12, weight: .semibold))
-                    Spacer(minLength: 0)
-                }
-                RouteBadge(label: stage.requirement, color: stage.color)
-                // two lines, because they truncate differently: a provider's
-                // name identifies itself by its head, a model id by both ends
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(target.provider)
-                        .foregroundStyle(.secondary)
-                        .truncationMode(.tail)
-                    Text(target.model.isEmpty ? L("its own model") : target.model)
-                        .foregroundStyle(.tertiary)
-                        .truncationMode(.middle)
-                }
-                .font(.system(size: 10, design: .monospaced))
-                .lineLimit(1)
-                HStack(spacing: 4) {
-                    // an empty rate keeps the line's height, but takes no
-                    // gap before an effort
-                    if !stageRate(stage).isEmpty || stageTuning(stage) == nil { Text(stageRate(stage)) }
-                    // the effort and Fast the model field's chip sets, at a glance
-                    if let tuning = stageTuning(stage) {
-                        if !stageRate(stage).isEmpty, !tuning.effort.isEmpty { Text("·") }
-                        if tuning.fast { Image(systemName: "bolt.fill").font(.system(size: 8, weight: .bold)) }
-                        if !tuning.effort.isEmpty { Text(tuning.effort) }
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("\(stage.step)")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(stage.color)
+                    .frame(width: 16, height: 16)
+                    .background(stage.color.opacity(0.14), in: RoundedRectangle(cornerRadius: 5))
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(stage.title).font(.system(size: 12, weight: .semibold))
+                        Spacer(minLength: 4)
+                        RouteBadge(label: stage.requirement, color: stage.color)
                     }
+                    // two lines, because they truncate differently: a provider's
+                    // name identifies itself by its head, a model id by both ends
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(target.provider)
+                            .foregroundStyle(.secondary)
+                            .truncationMode(.tail)
+                        Text(target.model.isEmpty ? L("its own model") : target.model)
+                            .foregroundStyle(.tertiary)
+                            .truncationMode(.middle)
+                    }
+                    .font(.system(size: 10, design: .monospaced))
+                    .lineLimit(1)
+                    HStack(spacing: 4) {
+                        // an empty rate keeps the line's height, so the nodes
+                        // stay one size, but takes no gap before an effort
+                        if !stageRate(stage).isEmpty || stageTuning(stage) == nil { Text(stageRate(stage)) }
+                        // the effort and Fast the model field's chip sets, at a glance
+                        if let tuning = stageTuning(stage) {
+                            if !stageRate(stage).isEmpty, !tuning.effort.isEmpty { Text("·") }
+                            if tuning.fast { Image(systemName: "bolt.fill").font(.system(size: 8, weight: .bold)) }
+                            if !tuning.effort.isEmpty { Text(tuning.effort) }
+                        }
+                    }
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
                 }
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
             }
-            .frame(width: 148, alignment: .leading)
             .help(target.line)
             .padding(11)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(selected ? stage.color.opacity(0.1) : Color.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
             .overlay {
                 RoundedRectangle(cornerRadius: 10)
-                    .stroke(selected ? stage.color.opacity(0.55) : Color.white.opacity(0.07), lineWidth: selected ? 1.5 : 1)
+                    .stroke(
+                        selected ? stage.color.opacity(0.55) : Color.white.opacity(hoveredStage == stage ? 0.18 : 0.07),
+                        lineWidth: selected ? 1.5 : 1
+                    )
             }
             .contentShape(RoundedRectangle(cornerRadius: 10))
         }
         .buttonStyle(.plain)
+        .onHover { inside in
+            if inside { hoveredStage = stage } else if hoveredStage == stage { hoveredStage = nil }
+        }
         .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 
-    /// Where the selected stage runs, and the knobs that belong to it alone.
-    @ViewBuilder
+    /// The selected stage: what it does, then where it runs and how fast, and
+    /// last what changing it costs. The controls come straight after the
+    /// one-line summary, level with the rail — they used to sit under a long
+    /// caveat, split between the far left and the far right of the card.
     private var stageInspector: some View {
         let stage = selectedStage
-        HStack(alignment: .top, spacing: 20) {
+        return VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
                     Text(stage.title).font(.headline)
@@ -411,17 +411,25 @@ struct SettingsView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                Text(stage.requirementDetail)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
+            }
+            VStack(alignment: .leading, spacing: 18) {
+                stageControl(stage)
                 stageRates(stage)
             }
-            Spacer(minLength: 16)
-            stageControl(stage).frame(width: 300)
+            // a form's width, not the pane's: a picker and a count read badly
+            // stretched across a wide window
+            .frame(maxWidth: 440, alignment: .leading)
+            Label {
+                Text(stage.requirementDetail).fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "info.circle")
+            }
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            .frame(maxWidth: 560, alignment: .leading)
         }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     @ViewBuilder
@@ -469,8 +477,15 @@ struct SettingsView: View {
                 routeKey: "conceptLlm",
                 load: { refresh in try await modelList(route: "conceptLlm", refresh: refresh) }
             )
-        case .answer:
-            StagePin(value: defaultModelSummary.line, hint: L("The default LLM, set under Providers & Agents"))
+        case .summarize:
+            StagePicker(
+                route: binding(\.extraction.summaryLlm),
+                models: config?.connections ?? [],
+                agents: routeAgents,
+                defaultTarget: defaultTarget,
+                routeKey: "summaryLlm",
+                load: { refresh in try await modelList(route: "summaryLlm", refresh: refresh) }
+            )
         }
     }
 
@@ -489,7 +504,6 @@ struct SettingsView: View {
                     Color.clear.frame(height: 1)
                 }
             }
-            .padding(.top, 6)
         case .index:
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
                 GridRow {
@@ -501,7 +515,6 @@ struct SettingsView: View {
                     }
                 }
             }
-            .padding(.top, 6)
         case .extract:
             VStack(alignment: .leading, spacing: 10) {
                 Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
@@ -517,8 +530,7 @@ struct SettingsView: View {
                 Toggle(L("Extract factual claims alongside entities"), isOn: binding(\.extraction.claims))
                     .toggleStyle(.checkbox)
             }
-            .padding(.top, 6)
-        case .synthesize, .answer:
+        case .synthesize, .summarize:
             EmptyView()
         }
     }
@@ -540,7 +552,7 @@ struct SettingsView: View {
         case .index: embeddingSummary
         case .extract: routeSummary(\.extraction.entityLlm)
         case .synthesize: routeSummary(\.extraction.conceptLlm)
-        case .answer: defaultModelSummary
+        case .summarize: routeSummary(\.extraction.summaryLlm)
         }
     }
 
@@ -553,7 +565,8 @@ struct SettingsView: View {
         case .convert: route = config.extraction.documentLlm
         case .extract: route = config.extraction.entityLlm
         case .synthesize: route = config.extraction.conceptLlm
-        case .index, .answer: return nil
+        case .summarize: route = config.extraction.summaryLlm
+        case .index: return nil
         }
         guard let target = routeTargets.first(where: { $0.id == route.use }), cliProviderNames.contains(target.provider) else { return nil }
         let effort = route.effort != "default" ? route.effort : target.effort
@@ -568,7 +581,7 @@ struct SettingsView: View {
         case .convert: "×\(config.ingest.convertConcurrency)"
         case .index: "×\(config.ingest.concurrency) · \(config.embedding.batchSize ?? 32)/req"
         case .extract: "×\(config.extraction.concurrency) · \(config.extraction.batchSize)/pass"
-        case .synthesize, .answer: ""
+        case .synthesize, .summarize: ""
         }
     }
 
@@ -647,6 +660,7 @@ struct SettingsView: View {
                 config?.extraction.entityLlm.use = fresh.extraction.entityLlm.use
                 config?.extraction.conceptLlm.use = fresh.extraction.conceptLlm.use
                 config?.extraction.documentLlm.use = fresh.extraction.documentLlm.use
+                config?.extraction.summaryLlm.use = fresh.extraction.summaryLlm.use
             }
             statusMessage = response.reset == true
                 ? L("Agent %@ reset to the built-in", agent.title)
@@ -715,7 +729,7 @@ struct SettingsView: View {
     /// The stages that run on a row, in the order a document meets them. A
     /// route names what it runs on; one naming nothing a stage can run on
     /// falls back to the default, as the service's `resolveRoutedLlmConfig`
-    /// does. Answer always runs on the default; Index is an embedding's.
+    /// does. Index is an embedding's.
     private func stages(on row: TableRow) -> [PipelineStage] {
         guard let config else { return [] }
         let fallback = defaultTarget.map { tableRow($0.id) }
@@ -731,7 +745,7 @@ struct SettingsView: View {
             case .index: false
             case .extract: routed(config.extraction.entityLlm) == row
             case .synthesize: routed(config.extraction.conceptLlm) == row
-            case .answer: fallback == row
+            case .summarize: routed(config.extraction.summaryLlm) == row
             }
         }
     }
@@ -970,7 +984,7 @@ struct SettingsView: View {
             TestResultRow(label: L("2 · Index"), result: result.embedding)
             TestResultRow(label: L("3 · Extract"), result: result.entityLlm)
             TestResultRow(label: L("4 · Synthesize"), result: result.conceptLlm)
-            TestResultRow(label: L("5 · Answer"), result: result.llm)
+            TestResultRow(label: L("5 · Summarize"), result: result.summaryLlm)
         }
         .knodeCard()
     }
@@ -1048,11 +1062,6 @@ struct SettingsView: View {
 
     private func inheritedAgentSpecModel(_ spec: String) -> String {
         inheritedAgentModel(spec, agents: agents, targets: llmTargets, defaultTarget: defaultTarget)
-    }
-
-    private var defaultModelSummary: RouteTarget {
-        guard let target = defaultTarget else { return RouteTarget(provider: L("Not configured")) }
-        return RouteTarget(provider: target.label.isEmpty ? providerName(target.provider) : target.label, model: target.model)
     }
 
     /// Models the service reports for one route, using the on-screen draft so a
@@ -1582,15 +1591,18 @@ struct FieldLabel<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(label).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            // a text field fills the width either way; a pop-up keeps its
+            // own, and centred it floated away from the caption above it
             content
                 .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
-/// Picks what runs a stage — a model, or an agent called one-shot — plus an
-/// optional model override.
+/// Picks what runs a stage — a model called directly, or an agent run once
+/// through its own loop — plus an optional model override. The menu groups
+/// them under LLM and Agent, so each entry is just its name.
 ///
 /// A stage names exactly one of them. There used to be a "Default LLM
 /// provider · X" entry as well, which sat beside X's own row: two entries for
@@ -1598,7 +1610,7 @@ struct FieldLabel<Content: View>: View {
 private struct StagePicker: View {
     @Binding var route: RoutedLLMConfig
     let models: [LLMConnection]
-    /// Every agent a stage can call one-shot (see `routeAgents`).
+    /// Every agent a stage can run (see `routeAgents`).
     let agents: [LLMConnection]
     /// Where a stage that names nothing known runs, as the service resolves it.
     let defaultTarget: LLMConnection?
@@ -1608,15 +1620,17 @@ private struct StagePicker: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             FieldLabel(L("Run with")) {
-                // each entry says what kind it is, so the closed picker does too
                 Picker(L("Run with"), selection: selection) {
-                    ForEach(models) { connection in
-                        Text(L("LLM: %@", name(connection))).tag(connection.id)
+                    Section(L("LLM")) {
+                        ForEach(models) { connection in
+                            Text(name(connection)).tag(connection.id)
+                        }
                     }
                     if !agents.isEmpty {
-                        Divider()
-                        ForEach(agents) { agent in
-                            Text(L("Agent: %@", name(agent))).tag(agent.id)
+                        Section(L("Agent")) {
+                            ForEach(agents) { agent in
+                                Text(name(agent)).tag(agent.id)
+                            }
                         }
                     }
                 }
@@ -1678,7 +1692,12 @@ private struct StagePicker: View {
             // a CLI agent spends its own login, as its row under Providers & Agents says
             return L("Runs on your %@ subscription.", cliProductName(connection.provider) ?? providerName(connection.provider))
         }
-        return L("Runs on %@.", connection.baseUrl.isEmpty ? L("no endpoint set") : connection.baseUrl)
+        let endpoint = connection.baseUrl.isEmpty ? L("no endpoint set") : connection.baseUrl
+        // a deepagents agent is its endpoint's model, reached through the loop
+        if agents.contains(where: { $0.id == connection.id }) {
+            return L("Runs the deepagents loop on %@.", endpoint)
+        }
+        return L("Runs on %@.", endpoint)
     }
 }
 
@@ -1729,29 +1748,6 @@ struct RowUseBadges: View {
     }
 }
 
-/// A stage whose provider is not chosen here — it follows section 01.
-private struct StagePin: View {
-    let value: String
-    let hint: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(L("Runs on"))
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.callout.weight(.medium))
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(hint)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
 private struct TestResultRow: View {
     let label: String
     let result: RouteTestResult?
@@ -1796,7 +1792,7 @@ private struct TestResultRow: View {
 /// keeps the flow nodes, the inspector and the per-stage rates from drifting
 /// apart — they used to be five hand-written blocks.
 enum PipelineStage: Int, CaseIterable, Identifiable {
-    case convert = 1, index, extract, synthesize, answer
+    case convert = 1, index, extract, synthesize, summarize
 
     var id: Int { rawValue }
     var step: Int { rawValue }
@@ -1807,7 +1803,7 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .index: L("Index")
         case .extract: L("Extract")
         case .synthesize: L("Synthesize")
-        case .answer: L("Answer")
+        case .summarize: L("Summarize")
         }
     }
 
@@ -1817,7 +1813,7 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .index: L("Embedding")
         case .extract: L("Volume")
         case .synthesize: L("Quality")
-        case .answer: L("Interactive")
+        case .summarize: L("Judgment")
         }
     }
 
@@ -1830,7 +1826,7 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .index: L("Every chunk becomes a vector for semantic and hybrid recall.")
         case .extract: L("Names entities, relations and factual claims in changed documents.")
         case .synthesize: L("Turns hot entity clusters into readable, linked Concept pages.")
-        case .answer: L("Document summaries in the wiki, and the nightly Dream analysis.")
+        case .summarize: L("Writes each document's summary page and answers knode_ask; overnight it runs Dream and reviews duplicate entities and disputed claims.")
         }
     }
 
@@ -1844,8 +1840,8 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
             L("The busiest stage — it runs on every changed document, bounded by the batch size here. A fast, cheap model that returns clean JSON is usually the right trade.")
         case .synthesize:
             L("Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.")
-        case .answer:
-            L("Always the default provider — these are the jobs that never picked one of their own. Ask no longer runs here: every question is an agent session, configured under Providers & Agents.")
+        case .summarize:
+            L("Every job here reads the text it is handed and makes a call on it — what a document is about, whether two entities are one, which of two claims holds, what a week of agent sessions says. Nobody waits on most of them: summaries are written when the wiki is generated and refreshed overnight, beside Dream and the reviews, so a slower model or a CLI subscription only costs time. knode_ask is the exception — an agent is waiting on its answer.")
         }
     }
 }

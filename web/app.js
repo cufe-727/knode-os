@@ -2269,20 +2269,20 @@ function modelEndpoint(agent) {
 }
 
 /**
- * An agent as a stage sees it, called one-shot: a CLI agent as itself, a
- * deepagents agent as its own model on the endpoint it runs on. null for a
- * deepagents agent that names no model — it would be that endpoint's row again
- * under another name — and for one that runs on nothing.
+ * An agent as a stage sees it, run once through its own loop: a CLI agent as
+ * itself, a deepagents agent as the endpoint it runs on with its own model or
+ * else the endpoint's — the service runs the deepagents loop there. null for
+ * one that runs on nothing.
  */
 function agentRouteTarget(agent) {
   if (CLI_PROVIDERS.includes(agent.executor)) return { ...agentTarget(agent), runtime: providerNames[agent.executor] ?? agent.executor };
-  const endpoint = (agent.model || '').trim() ? modelEndpoint(agent) : null;
+  const endpoint = modelEndpoint(agent);
   if (!endpoint) return null;
   return {
     ...endpoint,
     id: agent.name,
     label: (agent.title || '').trim() || agent.name,
-    model: agent.model.trim(),
+    model: (agent.model || '').trim() || endpoint.model,
     agent: true,
     runtime: 'deepagents',
   };
@@ -2290,9 +2290,9 @@ function agentRouteTarget(agent) {
 
 /**
  * Everything a stage can name: the models, then the CLI agents and the
- * deepagents agents that pin a model — the mirror of the service's
- * `routeTargets`. Not `llmTargets`, because the default cannot
- * be a deepagents agent: it may follow the default.
+ * deepagents agents — the mirror of the service's `routeTargets`. Not
+ * `llmTargets`, because the default cannot be a deepagents agent: it may
+ * follow the default.
  */
 function routeTargets() {
   const agents = agentDrafts.filter((a) => !connectionById(a.name)).map(agentRouteTarget).filter(Boolean);
@@ -2383,12 +2383,6 @@ function embeddingSummaryText() {
   return { provider: name, model: active.model || 'API model not set' };
 }
 
-function defaultLlmSummaryText() {
-  const entry = defaultConnection();
-  if (!entry) return { provider: 'Loading…', model: '' };
-  return { provider: entry.label?.trim() || providerNames[entry.provider] || entry.provider, model: entry.model || '' };
-}
-
 function routeSummary(prefix) {
   const use = $(`#cfg-${prefix}-use`).value;
   const model = $(`#cfg-${prefix}-model`).value.trim();
@@ -2411,22 +2405,24 @@ function fillEmbeddingOptions() {
   embeddingUse = select.value;
 }
 
+/** The stages that name a model or an agent, by their fields' prefix (`#cfg-<prefix>-use`, `<prefix>Llm`). */
+const ROUTE_PREFIXES = ['entity', 'concept', 'document', 'summary'];
+
 /**
- * Rebuild the per-route pickers: the models, then every agent a stage can
- * call one-shot. A stage names one of them — there is no "Default LLM" entry,
- * which sat beside the default's own row as a second copy of it. Keeps a
- * selection that still exists, else lands on the default.
+ * Rebuild the per-route pickers: the models under LLM, then every agent a
+ * stage can run under Agent, each by its name alone. A stage names one of
+ * them — there is no "Default LLM" entry, which sat beside the default's own
+ * row as a second copy of it. Keeps a selection that still exists, else lands
+ * on the default.
  */
 function fillRouteOptions() {
   const agents = routeTargets().filter((t) => t.agent);
-  for (const prefix of ['entity', 'concept', 'document']) {
+  const option = (t) => `<option value="${esc(t.id)}">${esc(t.label || t.id)}</option>`;
+  for (const prefix of ROUTE_PREFIXES) {
     const select = $(`#cfg-${prefix}-use`);
     const previous = select.value;
-    select.innerHTML = connectionDrafts.map((c) => `<option value="${esc(c.id)}">${esc(c.label || c.id)}</option>`)
-      .concat(agents.length
-        ? [`<optgroup label="Agents, one call at a time">${agents.map((a) => `<option value="${esc(a.id)}">${esc(a.label)} · ${esc(a.runtime)}</option>`).join('')}</optgroup>`]
-        : [])
-      .join('');
+    select.innerHTML = `<optgroup label="LLM">${connectionDrafts.map(option).join('')}</optgroup>`
+      + (agents.length ? `<optgroup label="Agent">${agents.map(option).join('')}</optgroup>` : '');
     select.value = stageUse(previous);
   }
   refreshResearchAgentOptions();
@@ -2442,13 +2438,12 @@ const PIPELINE_STAGES = [
   { key: 'index', step: 2, title: 'Index', badge: 'embedding', accent: 'accent' },
   { key: 'entity', step: 3, title: 'Extract', badge: 'volume', accent: 'accent2' },
   { key: 'concept', step: 4, title: 'Synthesize', badge: 'quality', accent: 'accent2' },
-  { key: 'answer', step: 5, title: 'Answer', badge: 'interactive', accent: 'accent2' },
+  { key: 'summary', step: 5, title: 'Summarize', badge: 'judgment', accent: 'accent2' },
 ];
 let selectedStage = 'document';
 
 function stageTarget(key) {
   if (key === 'index') return embeddingSummaryText();
-  if (key === 'answer') return defaultLlmSummaryText();
   return routeSummary(key);
 }
 
@@ -2481,18 +2476,17 @@ function renderStageFlow() {
 }
 
 function updateConfigSummaries() {
-  $('#pin-answer').textContent = summaryLine(defaultLlmSummaryText());
   renderStageFlow();
   paintInheritedPlaceholders();
 }
 
 /**
  * The greyed text in every Model field that is inheriting. Repainted from
- * here rather than only on a provider-picker change, because editing the
- * default connection's own model changes what three stages will run.
+ * here rather than only on a provider-picker change, because editing a
+ * connection's own model changes what every stage on it will run.
  */
 function paintInheritedPlaceholders() {
-  for (const prefix of ['entity', 'concept', 'document']) {
+  for (const prefix of ROUTE_PREFIXES) {
     const input = $(`#cfg-${prefix}-model`);
     if (input) input.placeholder = inheritedModelFor($(`#cfg-${prefix}-use`).value) || 'Optional · use its model';
   }
@@ -2506,13 +2500,13 @@ function routeProviderToggle(prefix) {
   if (!target) {
     note.innerHTML = 'Nothing to run on yet — add a model in section 01.';
   } else if (target.provider === 'openai') {
-    // a model, or a deepagents agent called one-shot on its model
-    const how = target.agent ? ' · agent, one call at a time' : '';
+    // a model called directly, or a deepagents agent: the loop on that model
+    const how = target.agent ? ' · runs the deepagents loop' : '';
     note.innerHTML = `<b>${esc(target.label || target.id)}</b>${how} · ${esc((target.baseUrl || '').trim() || 'no endpoint set')}`;
   } else {
-    // a CLI agent, called one-shot with its own path
+    // a CLI agent, run with its own path
     const meta = cliMeta[target.provider];
-    note.innerHTML = `<b>${esc(target.label || target.id)}</b> · agent, one call at a time · ${esc(target.cliPath || (meta ? meta.command : target.provider))}`;
+    note.innerHTML = `<b>${esc(target.label || target.id)}</b> · ${esc(target.cliPath || (meta ? meta.command : target.provider))}`;
   }
   updateConfigSummaries();
 }
@@ -2677,9 +2671,7 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     if (activeWorkspace()?.id !== workspaceId) return;
     renderProviders();
     fillRouteOptions();
-    fillRoute('entity', cfg.extraction?.entityLlm);
-    fillRoute('concept', cfg.extraction?.conceptLlm);
-    fillRoute('document', cfg.extraction?.documentLlm);
+    for (const prefix of ROUTE_PREFIXES) fillRoute(prefix, cfg.extraction?.[`${prefix}Llm`]);
     $('#cfg-extraction-batch').value = cfg.extraction?.batchSize ?? 8;
     $('#cfg-extraction-concurrency').value = cfg.extraction?.concurrency ?? 1;
     $('#cfg-extraction-claims').checked = cfg.extraction?.claims !== false;
@@ -2746,6 +2738,7 @@ function gatherConfig() {
       entityLlm: gatherRoute('entity'),
       conceptLlm: gatherRoute('concept'),
       documentLlm: gatherRoute('document'),
+      summaryLlm: gatherRoute('summary'),
       batchSize: Number($('#cfg-extraction-batch').value),
       concurrency: Number($('#cfg-extraction-concurrency').value),
       claims: $('#cfg-extraction-claims').checked,
@@ -2929,7 +2922,7 @@ async function removeAgent(name) {
     if (cfg) {
       $('#cfg-research-agent').value = cfg.research?.agent ?? '';
       $('#cfg-chat-agent').value = cfg.chat?.agent ?? '';
-      for (const prefix of ['entity', 'concept', 'document']) {
+      for (const prefix of ROUTE_PREFIXES) {
         $(`#cfg-${prefix}-use`).value = stageUse(cfg.extraction?.[`${prefix}Llm`]?.use ?? '');
         routeProviderToggle(prefix);
       }
@@ -3443,7 +3436,7 @@ function renderCfgResult(r) {
     ['2 · Index', r.embedding],
     ['3 · Extract', r.entityLlm],
     ['4 · Synthesize', r.conceptLlm],
-    ['5 · Answer', r.llm],
+    ['5 · Summarize', r.summaryLlm],
   ];
   $('#cfg-status').innerHTML = items.map(([label, result]) => {
     if (!result) return '';
@@ -3456,7 +3449,7 @@ function renderCfgResult(r) {
   }).join('');
 }
 
-for (const prefix of ['entity', 'concept', 'document']) {
+for (const prefix of ROUTE_PREFIXES) {
   $(`#cfg-${prefix}-use`).addEventListener('change', () => routeProviderToggle(prefix));
   $(`#cfg-${prefix}-model`).addEventListener('input', updateConfigSummaries);
 }
@@ -3584,7 +3577,7 @@ $('#cfg-providers').addEventListener('click', (event) => {
   // a stage on the removed connection lands on the default, by name
   fillRouteOptions();
   updateConfigSummaries();
-  for (const prefix of ['entity', 'concept', 'document']) routeProviderToggle(prefix);
+  for (const prefix of ROUTE_PREFIXES) routeProviderToggle(prefix);
 });
 
 function setConfigBusy(busy) {

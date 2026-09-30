@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { Hono } from 'hono';
-import { AppContext } from '../context.js';
+import { AppContext, summaryLlmClient } from '../context.js';
 import {
   EmbeddingConfig,
   KnodeConfig,
@@ -131,6 +131,7 @@ type ExtractionConfigDraft = {
   entityLlm?: Partial<RoutedLlmConfig>;
   conceptLlm?: Partial<RoutedLlmConfig>;
   documentLlm?: Partial<RoutedLlmConfig>;
+  summaryLlm?: Partial<RoutedLlmConfig>;
   claims?: boolean;
   batchSize?: number;
   concurrency?: number;
@@ -445,8 +446,8 @@ export function createApp(
   app.post('/api/config/test', async (c) => {
     const ctx = requestCtx(c);
     const draft = (await c.req.json().catch(() => ({}))) as ModelConfigDraft;
-    const out: { embedding: unknown; llm: unknown; entityLlm: unknown; conceptLlm: unknown; documentLlm: unknown } = {
-      embedding: null, llm: null, entityLlm: null, conceptLlm: null, documentLlm: null,
+    const out: { embedding: unknown; llm: unknown; entityLlm: unknown; conceptLlm: unknown; documentLlm: unknown; summaryLlm: unknown } = {
+      embedding: null, llm: null, entityLlm: null, conceptLlm: null, documentLlm: null, summaryLlm: null,
     };
 
     try {
@@ -465,15 +466,17 @@ export function createApp(
     const entityRoute = mergeRoutedLlmConfig(ctx.config.extraction.entityLlm, draft.extraction?.entityLlm);
     const conceptRoute = mergeRoutedLlmConfig(ctx.config.extraction.conceptLlm, draft.extraction?.conceptLlm);
     const documentRoute = mergeRoutedLlmConfig(ctx.config.extraction.documentLlm, draft.extraction?.documentLlm);
+    const summaryRoute = mergeRoutedLlmConfig(ctx.config.extraction.summaryLlm, draft.extraction?.summaryLlm);
     try {
       out.llm = await testLlmConfig(baseLlm);
     } catch (e) {
       out.llm = { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
-    const routedTests: Array<[keyof Pick<typeof out, 'entityLlm' | 'conceptLlm' | 'documentLlm'>, RoutedLlmConfig, string]> = [
+    const routedTests: Array<[keyof Pick<typeof out, 'entityLlm' | 'conceptLlm' | 'documentLlm' | 'summaryLlm'>, RoutedLlmConfig, string]> = [
       ['entityLlm', entityRoute, ctx.config.extraction.tier1Model],
       ['conceptLlm', conceptRoute, ctx.config.extraction.tier2Model],
       ['documentLlm', documentRoute, ''],
+      ['summaryLlm', summaryRoute, ''],
     ];
     for (const [key, route, legacyModel] of routedTests) {
       const fullyInherited =
@@ -530,7 +533,7 @@ export function createApp(
       return c.json(await listModelsCached('chat', connection, opts));
     }
 
-    if (route !== 'entityLlm' && route !== 'conceptLlm' && route !== 'documentLlm') {
+    if (route !== 'entityLlm' && route !== 'conceptLlm' && route !== 'documentLlm' && route !== 'summaryLlm') {
       return c.json({ error: `unknown route: ${route}` }, 400);
     }
     const merged = mergeRoutedLlmConfig(ctx.config.extraction[route], draft.extraction?.[route]);
@@ -588,6 +591,9 @@ export function createApp(
         }
         if (x.documentLlm) {
           next.extraction.documentLlm = mergeRoutedLlmConfig(next.extraction.documentLlm, x.documentLlm);
+        }
+        if (x.summaryLlm) {
+          next.extraction.summaryLlm = mergeRoutedLlmConfig(next.extraction.summaryLlm, x.summaryLlm);
         }
         if (typeof x.claims === 'boolean') next.extraction.claims = x.claims;
         const batchSize = Number(x.batchSize);
@@ -699,7 +705,7 @@ export function createApp(
 
       saveConfig(ctx.dataDir, next);
       ctx.config = next;
-      ctx.llm = new LlmClient(next.llm);
+      ctx.llm = summaryLlmClient(next);
       ctx.embedder = createEmbeddingProvider(next.embedding);
 
       let reindex: Awaited<ReturnType<typeof sync>> | null = null;
@@ -1557,8 +1563,9 @@ export function createApp(
   /**
    * An agent file changed. The pipeline may run on any agent and the default
    * on a CLI agent, so re-read them, re-flatten the default in case it is one,
-   * and move a stage whose agent is gone to the default — saving, and swapping
-   * the default client, only when that moved something.
+   * and move a stage whose agent is gone to the default — saving only when
+   * that moved something. `ctx.llm` is rebuilt either way: Summarize may run
+   * on the very agent that changed.
    */
   const refreshAgentLlms = (ctx: AppContext, moved = false) => {
     const before = JSON.stringify([ctx.config.llmUse, ctx.config.llm]);
@@ -1577,8 +1584,8 @@ export function createApp(
     const pinned = pinRoutes(ctx.config);
     if (moved || pinned || JSON.stringify([ctx.config.llmUse, ctx.config.llm]) !== before) {
       saveConfig(ctx.dataDir, ctx.config);
-      ctx.llm = new LlmClient(ctx.config.llm);
     }
+    ctx.llm = summaryLlmClient(ctx.config);
   };
 
   app.get('/api/agents', (c) => {

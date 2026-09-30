@@ -3,8 +3,11 @@ import path from 'node:path';
 import { MultiServerMCPClient } from '@langchain/mcp-adapters';
 import { ChatOpenAI } from '@langchain/openai';
 import { createDeepAgent, createFilesystemMiddleware, type SubAgent } from 'deepagents';
+import { AIMessage, type BaseMessage, HumanMessage, type MessageContent } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
-import { resolveSecret } from '../config.js';
+import { LlmConfig, resolveSecret } from '../config.js';
+import { JSON_DIRECTIVE } from '../llm/cli.js';
+import { ChatMessage, ImageAttachment, withOpenAiImages } from '../llm/client.js';
 import { negotiateProtocol } from '../llm/protocol.js';
 import { BuiltinAgent } from './agent.js';
 import {
@@ -61,7 +64,7 @@ function pinTracingOff(): void {
  * handful of model names it recognises — a rule that says nothing about what
  * the endpoint in front of it actually implements.
  */
-function chatModel(agent: BuiltinAgent, useResponsesApi: boolean, model?: string): ChatOpenAI {
+function chatModel(agent: Pick<BuiltinAgent, 'baseUrl' | 'apiKey' | 'model'>, useResponsesApi: boolean, model?: string): ChatOpenAI {
   return new ChatOpenAI({
     model: model || agent.model,
     apiKey: resolveSecret(agent.apiKey) || 'unused', // some local endpoints want no key; the client still wants a string
@@ -230,6 +233,74 @@ export async function runBuiltinSession(input: BuiltinSessionInput): Promise<Ses
 }
 
 let toolSeq = 0;
+
+/**
+ * Turns a stage call may take. A stage asks for one answer, so the loop needs
+ * few — perhaps a sub-agent, then the answer — and a cap keeps a model that
+ * will not stop from spending a whole pipeline pass.
+ */
+const STAGE_TURNS = 12;
+
+/**
+ * One pipeline-stage call through the deepagents loop: the stage's messages
+ * go in, the loop's final answer comes back — `completeViaCli`'s counterpart
+ * for a stage that names a deepagents agent (see `routeTargets`).
+ *
+ * The loop keeps deepagents' own sub-agents (`task`) and a read-only view of
+ * its scratch files, and gets nothing of the knowledge base: the stage's
+ * prompt already carries what it needs, and its answer is parsed rather than
+ * written anywhere, so there is nothing for a tool to land. JSON is asked for
+ * in words, as on the CLIs, because a tool-calling loop has no JSON mode.
+ */
+export async function completeViaDeepagents(
+  cfg: LlmConfig,
+  messages: ChatMessage[],
+  opts: { json?: boolean; model?: string; images?: ImageAttachment[] } = {},
+): Promise<string> {
+  pinTracingOff();
+  const model = opts.model || cfg.model;
+  const wire = await negotiateProtocol({ baseUrl: cfg.baseUrl, apiKey: resolveSecret(cfg.apiKey), model }, cfg.protocol ?? 'auto');
+  const systemPrompt = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n\n');
+  const turns = messages.filter((m) => m.role !== 'system');
+  if (opts.json && turns.length) {
+    const last = turns.length - 1;
+    turns[last] = { ...turns[last], content: `${turns[last].content}\n\n${JSON_DIRECTIVE}` };
+  }
+  const agent = createDeepAgent({
+    model: chatModel({ baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model }, wire === 'responses'),
+    tools: [],
+    ...(systemPrompt ? { systemPrompt } : {}),
+    // as in a session: no write_file / edit_file to "finish" into
+    middleware: [createFilesystemMiddleware({ tools: ['read_file'] })],
+  });
+
+  // a route always carries one (the endpoint's, 5 min by default); 0 would abort at once
+  const timeoutMs = cfg.cliTimeoutMs > 0 ? cfg.cliTimeoutMs : 300_000;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const output = await agent.invoke(
+      { messages: asLangChain(withOpenAiImages(turns, opts.images ?? [])) },
+      { signal: ac.signal, recursionLimit: 2 * STAGE_TURNS + 1 },
+    );
+    const text = finalText(output);
+    if (!text) throw new Error('deepagents finished without an answer');
+    return text;
+  } catch (err) {
+    if (ac.signal.aborted) throw new Error(`deepagents timed out after ${Math.round(timeoutMs / 1000)}s`);
+    if (isRecursionLimit(err)) throw new Error(`deepagents reached the turn cap (${STAGE_TURNS}) before answering`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Chat-wire messages as LangChain's; an image rides in the last user turn's content parts. */
+function asLangChain(messages: unknown[]): BaseMessage[] {
+  return (messages as { role: string; content: MessageContent }[]).map((m) =>
+    m.role === 'assistant' ? new AIMessage({ content: m.content }) : new HumanMessage({ content: m.content }),
+  );
+}
 
 /** The agent's last message, as text. */
 function finalText(output: unknown): string {

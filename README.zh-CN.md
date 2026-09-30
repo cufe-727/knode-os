@@ -116,7 +116,8 @@ node dist/cli.js serve --data ~/knode-data
   "extraction": {
     "entityLlm": { "provider": "codex-cli", "model": "" },
     "conceptLlm": { "provider": "cursor-cli", "model": "" },
-    "documentLlm": { "provider": "codex-cli", "model": "" } // 视觉模型/API/Codex/Claude Code
+    "documentLlm": { "provider": "codex-cli", "model": "" }, // 视觉模型/API/Codex/Claude Code
+    "summaryLlm": { "provider": "claude-cli", "model": "" }  // 文档摘要、Dream、夜间复核、knode_ask
   },
   "dream": { "schedule": "03:00", "lookbackDays": 7 }
 }
@@ -124,7 +125,7 @@ node dist/cli.js serve --data ~/knode-data
 
 索引默认放在 PostgreSQL(首次运行前设 `KNODE_DATABASE_KIND=pglite`,或把 `database.kind` 改成 `pglite`,即可用内嵌的零配置索引,测试套件用的就是它)。`postgres` 模式下同一套 schema 放在服务器上:所有工作区共用一个库,按 schema 隔离,各自在首次打开时创建。当单个工作区超出 PGlite 单进程 32 位 WASM 的承载力(约百万 chunk),或需要多个进程同时读同一份索引时,才值得这么做。用 schema 而非独立库来隔离是刻意的:独立库会给每个工作区带上一份约 8 MB 的系统目录;而把所有工作区塞进同一张表、用 workspace 列区分,则会直接失去向量索引 —— HNSW 沿着按距离排序的邻居图游走,标量列上的等值条件无法下推进这次游走,优化器只能退回顺序扫描。向量列使用 `halfvec` 存储:pgvector 的索引条目上限是一个 8 KB 页,`vector` 对应 2000 维而 `halfvec` 对应 4000 维,所以半精度正是 1536/2048 维下 HNSW 索引仍然可用的前提,同时表体积减半。已有库在两种列类型之间切换会原地转换,不需要重新嵌入。
 
-任何 OpenAI 兼容端点都可以(Ollama、vLLM、硅基流动等)。`protocol` 决定用哪条线路说话:默认 `auto` 先探测端点有没有 `/responses`,有就走 Responses(推理模型在这条线上把思考作为独立的 output item 返回,而 Chat Completions 只能塞进各家拼写不一的 `message.reasoning_content`),没有则退回 `/chat/completions`;探测每个端点每进程只做一次,且不消耗 token。也可以钉成 `responses` 或 `chat`。embedding 另外支持 `"provider": "ark-multimodal"`,对接火山方舟的 `/embeddings/multimodal`(`doubao-embedding-vision-*`)。该接口不是 OpenAI 形态:每次请求只返回一个融合后的向量,因此 `baseUrl` 写到 `/api/v3` 为止,`model` 填接入点 id(`ep-…`),`batchSize` 的含义变为单条请求的并发数。实体提取、Concept 综合和文档视觉转换都可以独立路由。文本型 PDF 在本地提取；图片和扫描型 PDF 可使用支持视觉的 OpenAI 兼容模型、Codex CLI 或 Claude Code CLI 转成 Markdown。修改 `dimensions` 会在下次启动时重建 embedding 表。也可以在 Web 页面的 **Settings** 标签里编辑并测试各条模型路由。
+任何 OpenAI 兼容端点都可以(Ollama、vLLM、硅基流动等)。`protocol` 决定用哪条线路说话:默认 `auto` 先探测端点有没有 `/responses`,有就走 Responses(推理模型在这条线上把思考作为独立的 output item 返回,而 Chat Completions 只能塞进各家拼写不一的 `message.reasoning_content`),没有则退回 `/chat/completions`;探测每个端点每进程只做一次,且不消耗 token。也可以钉成 `responses` 或 `chat`。embedding 另外支持 `"provider": "ark-multimodal"`,对接火山方舟的 `/embeddings/multimodal`(`doubao-embedding-vision-*`)。该接口不是 OpenAI 形态:每次请求只返回一个融合后的向量,因此 `baseUrl` 写到 `/api/v3` 为止,`model` 填接入点 id(`ep-…`),`batchSize` 的含义变为单条请求的并发数。实体提取、Concept 综合、文档视觉转换和摘要（文档摘要、Dream、夜间的实体合并与 claim 复核、`knode_ask`）各有独立路由，可以指向一个模型或一个 agent；留空的路由会被写成它原本会跑的默认。文本型 PDF 在本地提取；图片和扫描型 PDF 可使用支持视觉的 OpenAI 兼容模型、Codex CLI 或 Claude Code CLI 转成 Markdown。修改 `dimensions` 会在下次启动时重建 embedding 表。也可以在 Web 页面的 **Settings** 标签里编辑并测试各条模型路由。
 
 其他配置块(用 `knode-os config` 查看完整默认值):`ingest`(分块大小/重叠、文件监听)、`extraction`(批大小、间隔、tier-1/2 模型、是否抽取断言)、`heat`(热度半衰期、搜索加权、冷判定阈值)、`trace`(Claude/Codex trace 目录、skill 目录、同步间隔)、`server`(host/port)。
 

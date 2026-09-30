@@ -24,7 +24,8 @@ export interface CompletionOptions {
 /**
  * Chat client used by all LLM features (entity extraction, ask, wiki
  * summaries, dream analysis). Providers:
- * - 'openai': minimal OpenAI-compatible HTTP client
+ * - 'openai': minimal OpenAI-compatible HTTP client, or — with `loop:
+ *   'deepagents'` — the deepagents loop on that endpoint
  * - 'codex-cli' / 'claude-cli' / 'cursor-cli': shell out to a local agent CLI
  * LLM features are optional — when not enabled, callers fall back to
  * heuristics.
@@ -51,9 +52,9 @@ export class LlmClient {
     return this.provider === 'openai' ? Boolean(this.model) : true;
   }
 
-  /** Display identity, e.g. "gpt-4.1-mini", "codex-cli" or "claude-cli:opus". */
+  /** Display identity, e.g. "gpt-4.1-mini", "deepagents:gpt-4.1-mini", "codex-cli" or "claude-cli:opus". */
   get label(): string {
-    if (this.provider === 'openai') return this.model;
+    if (this.provider === 'openai') return this.cfg.loop ? `${this.cfg.loop}:${this.model}` : this.model;
     return this.model ? `${this.provider}:${this.model}` : this.provider;
   }
 
@@ -67,6 +68,12 @@ export class LlmClient {
     if (this.provider !== 'openai') {
       // maxTokens is not controllable through the CLIs; the prompts already bound output size
       return completeViaCli(this.cfg, messages, { json: opts.json, model: opts.model, images: opts.images?.map((image) => image.path) });
+    }
+    if (this.cfg.loop === 'deepagents') {
+      // loaded on first use, as a built-in session does (see `loadBuiltin`):
+      // an install that never runs the loop never pays for LangChain
+      const { completeViaDeepagents } = await import('../research/deepagents.js');
+      return completeViaDeepagents(this.cfg, messages, { json: opts.json, model: opts.model, images: opts.images });
     }
     const model = opts.model || this.model;
     const wire = await negotiateProtocol({ baseUrl: this.baseUrl, apiKey: this.apiKey, model }, this.protocol);
@@ -215,7 +222,7 @@ function lastUserIndex(messages: ChatMessage[]): number {
   return -1;
 }
 
-function withOpenAiImages(messages: ChatMessage[], images: ImageAttachment[]): unknown[] {
+export function withOpenAiImages(messages: ChatMessage[], images: ImageAttachment[]): unknown[] {
   if (images.length === 0) return messages;
   const lastUser = lastUserIndex(messages);
   if (lastUser < 0) throw new Error('image completion requires a user message');

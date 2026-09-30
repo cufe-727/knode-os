@@ -170,8 +170,8 @@ describe('retiring the deep-research template', () => {
     expect(fs.existsSync(path.join(dir, AGENTS_DIR, 'deep-research.yaml'))).toBe(false);
     expect(loaded.research.agent).toBe('deep-agent');
     expect(loaded.chat.agent).toBe('deep-agent');
-    // deep-agent pins no model, so a stage on it is its endpoint's row: it lands there
-    expect(loaded.extraction.entityLlm.use).toBe('relay');
+    // a stage runs a deepagents agent through its loop, so it stays on deep-agent
+    expect(loaded.extraction.entityLlm.use).toBe('deep-agent');
     expect(loadProfile(dir, 'mine')?.roles.map((r) => r.agent)).toEqual(['deep-agent', '']);
 
     // the built-in that stays takes its current wording, and no file keeps a
