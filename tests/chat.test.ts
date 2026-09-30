@@ -117,7 +117,6 @@ describe('chat', () => {
     const saved = ctx.config.chat.agent;
     saveAgent(wsDir, {
       name: 'tuned',
-      kind: 'general',
       // a CLI agent names its CLI and carries its own path
       executor: 'claude-cli',
       cliPath: fakeClaude,

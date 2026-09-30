@@ -1,24 +1,24 @@
 import SwiftUI
 
 /**
- * Who runs a research job or an Ask turn — the second table on 01, under the
- * models its deepagents agents run on.
+ * Who runs a research job or an Ask turn — the second table on Providers &
+ * Agents, under the models its deepagents agents run on.
  *
  * Every agent is one row, whichever runtime it has: the built-in deepagents
  * loop on one of the models above, or a coding-agent CLI on this machine that
  * brings its own loop, path and model. The CLIs used to sit among the models,
  * which made "cursor" the default *LLM* and let the deep agent quietly run
  * Cursor; an agent is not a model endpoint, so they live here now. What the
- * research itself does — effort bar, verification, roles — stays in section
- * 03 · Research, because that is a property of the research and not of who
+ * research itself does — effort bar, verification, roles — stays on the
+ * Research tab, because that is a property of the research and not of who
  * runs it.
  */
 struct AgentsSettingsSection: View {
     @Binding var agents: [AgentDefinition]
-    /// Which agent research runs on, so a row can show it is the active one.
-    let researchAgent: String
-    /// Which agent Ask names; empty follows the research agent.
-    let chatAgent: String
+    /// What runs on each agent — Default, Pipeline, Research, Ask — by agent
+    /// name. SettingsView works it out, because the models table needs the
+    /// same resolution for its own badges.
+    let uses: [String: [RowUse]]
     /// The model endpoints a deepagents agent can run on.
     let connections: [LLMConnection]
     /// What the default is right now in the draft: a model, or a CLI agent.
@@ -63,24 +63,21 @@ struct AgentsSettingsSection: View {
     static let deepagents = "deepagents"
 
     private var header: some View {
-        HStack(alignment: .bottom) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(L("Agents")).font(.title3.bold())
-                Text(L("Who does the work for Ask and Research: the built-in deepagents loop on one of the models above, or a coding-agent CLI on this machine that brings its own."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            RouteBadge(label: L("Named"), color: .knodeViolet)
+        VStack(alignment: .leading, spacing: 3) {
+            Text(L("Agents")).font(.title3.bold())
+            Text(L("Who does the work for Ask and Research: the built-in deepagents loop on one of the models above, or a coding-agent CLI on this machine that brings its own."))
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
     private var tableHeader: some View {
         HStack(spacing: 12) {
+            // the same give as the rows below (see `row`)
             Text(L("Type")).frame(width: 126, alignment: .leading)
-            Text(L("Name")).frame(width: 210, alignment: .leading)
-            Text(L("Runs on")).frame(width: 200, alignment: .leading)
-            Text(L("Model"))
+            Text(L("Name")).frame(minWidth: 150, maxWidth: 210, alignment: .leading).layoutPriority(1)
+            Text(L("Runs on")).frame(minWidth: 120, maxWidth: 200, alignment: .leading)
+            Text(L("Model")).lineLimit(1)
             Spacer(minLength: 8)
             // the button itself adds the common case; the arrow offers the CLIs
             Menu {
@@ -123,19 +120,23 @@ struct AgentsSettingsSection: View {
                 RouteBadge(label: typeName(agent), color: color)
                     .frame(width: 100, alignment: .leading)
 
+                // the name and "runs on" give way first in a narrow window,
+                // as they do in the models table, so the badges and the
+                // trash button stay whole
                 TextField(L("Name this agent"), text: $agents[index].title)
                     .textFieldStyle(.roundedBorder)
-                    .frame(width: 210)
+                    .frame(minWidth: 150, maxWidth: 210)
+                    .layoutPriority(1)
 
                 let target = runsOn(agent)
                 HStack(spacing: 4) {
-                    Text(target.name).lineLimit(1).truncationMode(.middle)
+                    Text(target.name).lineLimit(1)
                     if let note = target.note {
                         Text("· \(note)").foregroundStyle(.tertiary).lineLimit(1).fixedSize()
                     }
                 }
                 .font(.callout)
-                .frame(width: 200, alignment: .leading)
+                .frame(minWidth: 120, maxWidth: 200, alignment: .leading)
                 .help(target.help)
 
                 modelSummary(agent)
@@ -143,12 +144,7 @@ struct AgentsSettingsSection: View {
                 Spacer(minLength: 8)
 
                 // what points at it, on the right so the columns stay lined up
-                if agent.isCli && agent.name == llmUse { RouteBadge(label: L("Default"), color: .knodeCyan) }
-                if agent.name == researchAgent { RouteBadge(label: L("Research"), color: .knodeViolet) }
-                if agent.name == askAgent {
-                    RouteBadge(label: L("Ask"), color: .knodeCyan)
-                        .help(askFollowsResearch ? L("Ask names no agent of its own, so it follows the research agent — give it one in 03 · Research.") : "")
-                }
+                RowUseBadges(uses: uses[agent.name] ?? [])
                 if let problem = problem(agent) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(Color.knodeBad)
@@ -325,7 +321,7 @@ struct AgentsSettingsSection: View {
                 .foregroundStyle(.tertiary)
             // who reads the settings above: saying so beats a form that
             // silently does nothing for one of its two callers
-            Text(L("Ask runs with these settings. A research run takes effort, turns, timeout, tools and prompt from its profile in section 03 instead."))
+            Text(L("Ask runs with these settings. A research run takes effort, turns, timeout, tools and prompt from its profile under Research instead."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -343,26 +339,22 @@ struct AgentsSettingsSection: View {
         }
     }
 
-    /// The model endpoint a deepagents agent runs on: the one it pins, or
-    /// whatever the default is — which may be a CLI agent, and then is not one.
     private func modelEndpoint(_ agent: AgentDefinition) -> LLMConnection? {
-        guard !agent.isCli else { return nil }
-        if agent.executor == ResearchSettingsSection.defaultConnection {
-            return defaultTarget?.provider == "openai" ? defaultTarget : nil
-        }
-        return connections.first { $0.id == agent.executor }
+        agentEndpoint(agent, connections: connections, defaultTarget: defaultTarget)
     }
 
     /// Where an agent runs, by the names the tables use: the model a
-    /// deepagents agent is on — saying when that is just "the default" — or
-    /// where a CLI comes from.
+    /// deepagents agent is on — saying when that is just "the default" — or,
+    /// for a CLI, the account it is signed in with. A CLI brings its own
+    /// login, so what it spends is that account's subscription, not a model
+    /// above; where its binary lives is a hover away, and in the form.
     private func runsOn(_ agent: AgentDefinition) -> (name: String, note: String?, help: String) {
         if agent.isCli {
-            if agent.cliPath.isEmpty {
-                let found = cliTools[agent.executor]?.path
-                return (L("From PATH"), nil, found ?? L("%@ was not found on the service PATH", providerName(agent.executor)))
+            let name = L("Your %@ subscription", typeName(agent))
+            guard let path = agent.cliPath.isEmpty ? cliTools[agent.executor]?.path : agent.cliPath else {
+                return (name, nil, L("%@ was not found on the service PATH", providerName(agent.executor)))
             }
-            return (agent.cliPath, nil, agent.cliPath)
+            return (name, nil, L("Uses the account %@ is signed in to, so usage counts against that subscription rather than a model above.", path))
         }
         if agent.executor == ResearchSettingsSection.defaultConnection {
             let name = defaultTarget.map(connectionName) ?? L("Default LLM provider")
@@ -412,16 +404,6 @@ struct AgentsSettingsSection: View {
         return nil
     }
 
-    /// Who answers Ask: its own agent, else the research agent — the order the
-    /// service resolves it in (`chatSpec`), so the badge sits where Ask really
-    /// runs. Past those two Ask runs on the default model directly, which is
-    /// no row here.
-    private var askAgent: String {
-        askFollowsResearch ? researchAgent.trimmingCharacters(in: .whitespaces) : chatAgent.trimmingCharacters(in: .whitespaces)
-    }
-
-    private var askFollowsResearch: Bool { chatAgent.trimmingCharacters(in: .whitespaces).isEmpty }
-
     private var defaultOption: String {
         guard let target = defaultTarget else { return L("Follow the default LLM") }
         return L("Follow the default LLM · %@", connectionName(target))
@@ -443,4 +425,17 @@ struct AgentsSettingsSection: View {
     private func toggle(_ name: String) {
         if expanded.contains(name) { expanded.remove(name) } else { expanded.insert(name) }
     }
+}
+
+/// The model endpoint a deepagents agent runs on: the one it pins, or the
+/// default while the default is a model. nil for a CLI agent — it brings its
+/// own — and for one following a default that is a CLI agent, which cannot
+/// run until it names a model (the service's `builtinOnly`).
+@MainActor
+func agentEndpoint(_ agent: AgentDefinition, connections: [LLMConnection], defaultTarget: LLMConnection?) -> LLMConnection? {
+    guard !agent.isCli else { return nil }
+    if agent.executor == ResearchSettingsSection.defaultConnection {
+        return defaultTarget?.provider == "openai" ? defaultTarget : nil
+    }
+    return connections.first { $0.id == agent.executor }
 }

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { llmTargets, resolveRoutedLlmConfig } from '../config.js';
+import { resolveRoutedLlmConfig, routeTargets } from '../config.js';
 import { AppContext } from '../context.js';
 import { GUIDE_COPY, GUIDE_FILE } from '../fs/datadir.js';
 import { runTier1Pass } from '../graph/tier1.js';
@@ -61,7 +61,7 @@ function message(err: unknown): string {
 export async function drainTier1(ctx: AppContext, opts: { maxMs: number; log: (m: string) => void }): Promise<StepOutcome<void>> {
   const { config, store } = ctx;
   const entityLlm = config.extraction.entityLlm
-    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, llmTargets(config), config.extraction.tier1Model))
+    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, routeTargets(config), config.extraction.tier1Model))
     : ctx.llm;
   const count = async () => (await store.query<{ n: number }>(`SELECT count(*)::int AS n FROM extraction_queue`))[0]?.n ?? 0;
   if (!entityLlm.enabled) {

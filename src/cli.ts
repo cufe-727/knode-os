@@ -29,7 +29,6 @@ import { prepareRunWorkspace, runsRoot } from './research/workspace.js';
 import { recommendWikiTopics, refreshRecommendations } from './research/recommend.js';
 import { launchArgs } from './research/launch.js';
 import { loadProfile, loadProfiles, profileYaml } from './research/profile.js';
-import { importArchive } from './importers/archive.js';
 import { runTier1Pass } from './graph/tier1.js';
 import { sync } from './ingest/sync.js';
 import { historyOf, lineageOf } from './lineage/inspect.js';
@@ -865,32 +864,6 @@ bench
     }
     console.log(`\nreport: ${report.reportPaths?.mdPath}`);
     await ctx.store.close();
-  });
-
-const importCmd = program.command('import').description('import external corpora into raw/docs');
-importCmd
-  .command('archive <dir>')
-  .description('import rookie-trade crawler archive (envelope NDJSON) into raw/docs/finance, grouped into per-month markdown volumes')
-  .option('--since <YYYY-MM>', 'inclusive month lower bound')
-  .option('--until <YYYY-MM>', 'inclusive month upper bound')
-  .option('--platform <list>', 'comma-separated platform filter (e.g. fenchuan,xueqiu)')
-  .option('--target <list>', 'comma-separated target id filter')
-  .option('--relevant-only', 'drop posts marked investment_relevant=false')
-  .option('--volume-chars <n>', 'max characters of content per volume')
-  .action(async (dir, opts) => {
-    const dataRoot = dataDir();
-    initDataDir(dataRoot);
-    const stats = importArchive(dataRoot, dir, {
-      since: opts.since,
-      until: opts.until,
-      platforms: opts.platform ? String(opts.platform).split(',').filter(Boolean) : undefined,
-      targets: opts.target ? String(opts.target).split(',').filter(Boolean) : undefined,
-      relevantOnly: opts.relevantOnly,
-      volumeChars: opts.volumeChars ? Number(opts.volumeChars) : undefined,
-      onProgress: (m) => console.log(`  ${m}`),
-    });
-    console.log(JSON.stringify(stats, null, 2));
-    console.log('\nnext: run `knode-os ingest` to index the imported volumes');
   });
 
 const obsidian = program.command('obsidian').description('Obsidian Vault compatibility');

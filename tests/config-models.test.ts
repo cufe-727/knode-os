@@ -536,20 +536,33 @@ describe('migrateDefaultLlm', () => {
     expect(loaded.connections).toHaveLength(1);
   });
 
-  it('leaves an inheriting route inheriting, so changing the default still propagates', () => {
+  it('pins an inheriting route to the default it ran on, and writes that down', () => {
     const base = defaultConfig();
     const dir = write({
       ...base,
       llm: { ...base.llm, provider: 'openai', baseUrl: 'https://three.example/v1', apiKey: 'sk', model: 'm-3' },
       connections: [],
-      extraction: { ...base.extraction, entityLlm: { ...defaultRoutedLlmConfig(), use: '' } },
+      extraction: {
+        ...base.extraction,
+        tier2Model: 'legacy-concept',
+        entityLlm: { ...defaultRoutedLlmConfig(), use: '' },
+        conceptLlm: { ...defaultRoutedLlmConfig(), use: 'default' },
+      },
     });
 
     const loaded = loadConfig(dir);
-    // NOT rewritten to loaded.llmUse: an inheriting route means "whatever is
-    // the default", which is the whole point of the pointer
-    expect(loaded.extraction.entityLlm.use).toBe('');
+    // a stage names what it runs on: there is no "whatever the default is"
+    for (const key of ['entityLlm', 'conceptLlm', 'documentLlm'] as const) {
+      expect(loaded.extraction[key].use).toBe(loaded.llmUse);
+    }
     expect(resolveRoutedLlmConfig(loaded.llm, loaded.extraction.entityLlm, loaded.connections).model).toBe('m-3');
+    // the legacy tier model the route was running is carried onto it
+    expect(loaded.extraction.conceptLlm.model).toBe('legacy-concept');
+    expect(loaded.extraction.tier2Model).toBe('');
+
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 'knode.config.json'), 'utf8')) as KnodeConfig;
+    expect(onDisk.extraction.entityLlm.use).toBe(loaded.llmUse);
+    expect(onDisk.modelAgents).toBeUndefined();
   });
 
   it('is idempotent', () => {

@@ -174,8 +174,6 @@ knode-os pack <utterance> [--json] [--as-of iso] [--valid-at iso]
 knode-os pack-optimize [--apply]          learn from pack_events → playbook revision suggestions
 knode-os demo seed-stock                  stock-analysis demo data (see demo/stock/README.md)
 knode-os extract [--batch n] [--concurrency n]  drain the tier-1 LLM extraction queue within the daily budget
-knode-os import archive <dir> [--since YYYY-MM] [--until YYYY-MM] [--platform p,..] [--relevant-only]
-                              import crawler-archive envelope NDJSON into raw/docs/finance volumes
 knode-os bench build          full build (ingest → tier-1 drain → wiki) with per-stage timing report
 knode-os bench qa-gen [--n]   generate a QA eval set (eval/qa.jsonl) from stratified chunk samples
 knode-os bench retrieval      recall@k / MRR / NDCG@10 for vector|keyword|hybrid|sag|graph over the QA set
@@ -247,7 +245,7 @@ Four sections, each with its own tabs.
   - **Graph** — force-directed graph explorer + insights (hubs / isolated / types)
   - **Wiki** — one button initializes the knowledge base (survey → overview page + `AGENTS.md` guide + queued topic pages), then queue and review deep-research pages
   - **Dream** — run dreams, review and accept/reject suggestions
-- **Settings** — **Providers & Agents** (every model endpoint and key once, embedding and LLM in one table — `llmUse` marks which LLM is the default, and every job that names no provider of its own follows it — and the agents in a second table below: deepagents on one of those models, or a coding-agent CLI (Claude Code / Codex / Cursor) with its own path, model and effort. A CLI is an agent, not a model; a pipeline stage can still call a CLI agent one-shot), **Pipeline** (independently routed entity/concept/document-vision models; saving re-embeds or refreshes conversions when needed), **Research**, **Workspace**
+- **Settings** — **Providers & Agents** (every model endpoint and key once, embedding and LLM in one table — `llmUse` marks which LLM is the default, and every job that names no provider of its own follows it — and the agents in a second table below: deepagents on one of those models, or a coding-agent CLI (Claude Code / Codex / Cursor) with its own path, model and effort. A CLI is an agent, not a model), **Pipeline** (independently routed entity/concept/document-vision stages, each naming the model or agent it runs on — any agent is called one-shot, and a stage no longer follows the default; saving re-embeds or refreshes conversions when needed), **Research**, **Workspace**
 
 ## REST API (localhost)
 

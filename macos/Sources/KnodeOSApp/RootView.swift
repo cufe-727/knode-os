@@ -28,8 +28,10 @@ private struct MainWorkspaceView: View {
         } detail: {
             VStack(spacing: 0) {
                 // outside the .id below: the strip is stateless and should not
-                // flicker as the screen under it is rebuilt
-                if model.selectedSection.tabs.count > 1 {
+                // flicker as the screen under it is rebuilt. Settings draws its
+                // own, because Save sits at its right end; its four tabs share
+                // one host, so a sub-tab click never rebuilds it.
+                if model.selectedSection.tabs.count > 1, model.selectedSection != .settings {
                     SectionTabs(section: model.selectedSection)
                     Divider()
                 }
@@ -141,11 +143,41 @@ private struct MainWorkspaceView: View {
 
 /// The second navigation level: the tabs of the selected section, as a pill
 /// strip over the screen. Rendered only when a section has more than one tab.
-private struct SectionTabs: View {
+///
+/// `accessory` is what the screen does as a whole — Settings' Save — at the
+/// strip's right end. When the window is too narrow for both, it drops to a
+/// second line rather than squeezing the tab titles.
+struct SectionTabs<Accessory: View>: View {
     @EnvironmentObject private var model: AppModel
     let section: AppSection
+    let accessory: Accessory
+
+    init(section: AppSection, @ViewBuilder accessory: () -> Accessory) {
+        self.section = section
+        self.accessory = accessory()
+    }
 
     var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                tabs
+                Spacer(minLength: 16)
+                accessory
+            }
+            VStack(alignment: .trailing, spacing: 8) {
+                HStack(spacing: 8) {
+                    tabs
+                    Spacer(minLength: 0)
+                }
+                accessory
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    private var tabs: some View {
         HStack(spacing: 8) {
             ForEach(section.tabs) { tab in
                 let selected = tab == model.selectedTab
@@ -174,11 +206,13 @@ private struct SectionTabs: View {
                 .buttonStyle(.plain)
                 .help(tab.subtitle)
             }
-            Spacer(minLength: 0)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(.bar)
+    }
+}
+
+extension SectionTabs where Accessory == EmptyView {
+    init(section: AppSection) {
+        self.init(section: section) { EmptyView() }
     }
 }
 

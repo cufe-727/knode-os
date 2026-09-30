@@ -894,8 +894,6 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
     var name: String
     var title: String
     var description: String
-    /// "general" | "deep-research" — only orders the pickers now.
-    var kind: String
     /// A CLI provider name runs that CLI; "default" or a connection id runs
     /// the built-in deepagents loop on that model.
     var executor: String
@@ -915,11 +913,10 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
 
     var id: String { name }
 
-    init(name: String, kind: String = "general", executor: String = "default") {
+    init(name: String, executor: String = "default") {
         self.name = name
         title = name
         description = ""
-        self.kind = kind
         self.executor = executor
         cliPath = ""
         model = ""
@@ -937,7 +934,6 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         name = try container.decode(String.self, forKey: .name)
-        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? "general"
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? name
         description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
         executor = try container.decodeIfPresent(String.self, forKey: .executor) ?? ""
@@ -957,7 +953,6 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
     struct Payload: Encodable {
         var title: String
         var description: String
-        var kind: String
         var executor: String
         var cliPath: String
         var model: String
@@ -969,7 +964,7 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
     }
 
     var payload: Payload {
-        Payload(title: title, description: description, kind: kind, executor: executor, cliPath: cliPath, model: model,
+        Payload(title: title, description: description, executor: executor, cliPath: cliPath, model: model,
                 effort: effort, tools: tools, maxTurns: maxTurns, timeoutMs: timeoutMs, prompt: prompt)
     }
 
@@ -984,6 +979,25 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
         target.model = model
         target.cliPath = cliPath
         target.effort = effort
+        return target
+    }
+
+    /// An agent as a pipeline stage sees it, called one-shot: a CLI agent as
+    /// `asLlmTarget`, a deepagents agent as its own model on the endpoint it
+    /// runs on. Nil for a deepagents agent that names no model — it would be
+    /// that endpoint's row again under another name, which is why the stage
+    /// picker listed both deep agents beside the model they run on — and for
+    /// one that runs on nothing: it follows a default that is a CLI agent, or
+    /// pins a model that is gone. The client-side mirror of the service's
+    /// `routeTargets`.
+    func asRouteTarget(connections: [LLMConnection], defaultTarget: LLMConnection?) -> LLMConnection? {
+        if isCli { return asLlmTarget }
+        guard !model.isEmpty else { return nil }
+        let endpoint = executor == "default" ? defaultTarget : connections.first { $0.id == executor }
+        guard var target = endpoint, !cliProviderNames.contains(target.provider) else { return nil }
+        target.id = name
+        target.label = title.trimmingCharacters(in: .whitespaces).isEmpty ? name : title
+        target.model = model
         return target
     }
 }

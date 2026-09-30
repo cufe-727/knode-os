@@ -3,7 +3,7 @@ import path from 'node:path';
 import { parseYaml } from '../compiler/intents.js';
 import { isCliProvider, KnodeConfig, LlmProvider } from '../config.js';
 import { AGENTS_DIR } from '../fs/layout.js';
-import { agentFilePath, agentYamlText, isValidAgentName } from './agent-file.js';
+import { agentFilePath, agentYamlText, DEEP_AGENT, isValidAgentName } from './agent-file.js';
 import { Effort, EFFORTS, RoleTools, WEB_ACCESS, WebAccess } from './profile.js';
 
 export { isValidAgentName } from './agent-file.js';
@@ -22,26 +22,19 @@ export { isValidAgentName } from './agent-file.js';
  * bar — stays in the research profile, because that is what the runner already
  * reads, and because it is a property of the research, not of who runs it.
  *
- * `kind` only orders the pickers now: Research lists the deep-research ones
- * first, Ask the general ones.
+ * There is no kind of agent: the same one can answer Ask and run research.
+ * The `kind` agents used to carry only ordered the pickers, and loading the
+ * config drops it from the files (`upgradeAgentFiles`).
  *
  * Stored one YAML file each under `playbooks/agents/`, like profiles, so an
  * agent can be edited in the UI or in the file and diffed like any playbook.
  */
-
-export const AGENT_KINDS = ['general', 'deep-research'] as const;
-export type AgentKind = (typeof AGENT_KINDS)[number];
 
 export interface AgentDefinition {
   /** File stem, and the id `research.agent` / `chat.agent` reference. */
   name: string;
   title: string;
   description: string;
-  /**
-   * 'general': one session answers, the way Chat uses it. 'deep-research':
-   * the research runner drives it through a profile's phases and roles.
-   */
-  kind: AgentKind;
   /**
    * What actually runs it. 'claude-cli' | 'codex-cli' | 'cursor-cli': that CLI,
    * from `cliPath`. Anything else runs the built-in deepagents loop on a model:
@@ -64,9 +57,9 @@ export interface AgentDefinition {
   path: string;
 }
 
-export const BUILTIN_AGENT_NAMES = ['deep-agent', 'deep-research'] as const;
+export const BUILTIN_AGENT_NAMES = [DEEP_AGENT.name] as const;
 
-function agent(patch: Partial<AgentDefinition> & Pick<AgentDefinition, 'name' | 'kind'>): AgentDefinition {
+function agent(patch: Partial<AgentDefinition> & Pick<AgentDefinition, 'name'>): AgentDefinition {
   return {
     title: patch.name,
     description: '',
@@ -84,24 +77,18 @@ function agent(patch: Partial<AgentDefinition> & Pick<AgentDefinition, 'name' | 
 }
 
 /**
- * The two starting points. `deep-agent` is the LangChain `deepagents` loop
- * knode already runs in-process on an OpenAI-compatible connection; it is
- * modelled here so it can be copied and tuned like anything else. Deleting a
- * built-in resets it, the way a built-in profile behaves.
+ * The starting point: the LangChain `deepagents` loop knode runs in-process on
+ * an OpenAI-compatible connection, modelled here so it can be copied and tuned
+ * like anything else. One is enough — Ask and research both run it, and a
+ * second template, `deep-research`, differed from it in nothing but its name
+ * (see `upgradeAgentFiles`). Deleting a built-in resets it, the way a built-in
+ * profile behaves.
  */
 export const BUILTIN_AGENTS: Record<string, AgentDefinition> = {
-  'deep-agent': agent({
-    name: 'deep-agent',
-    kind: 'general',
-    title: '通用 deep agent',
-    description: 'LangChain deepagents 循环，跑在 OpenAI 兼容连接上；单会话回答，可读知识库、可写隔离笔记。没装任何 CLI 的机器用它。',
-    tools: { write: true, files: true, web: 'inherit' },
-  }),
-  'deep-research': agent({
-    name: 'deep-research',
-    kind: 'deep-research',
-    title: '深度研究 agent',
-    description: '按 research profile 的阶段与子代理跑：规划 → 并行调查 → 综合 → 评审 → 修订，把页面写回 wiki。',
+  [DEEP_AGENT.name]: agent({
+    name: DEEP_AGENT.name,
+    title: DEEP_AGENT.title,
+    description: DEEP_AGENT.description,
     tools: { write: true, files: true, web: 'inherit' },
   }),
 };
@@ -198,15 +185,12 @@ function oneOf<T extends string>(v: unknown, allowed: readonly T[], fallback: T)
 }
 
 export function normalizeAgent(raw: Record<string, unknown>, name: string, filePath: string): AgentDefinition {
-  const builtin = BUILTIN_AGENTS[name];
-  const kind = oneOf(raw.kind, AGENT_KINDS, builtin?.kind ?? 'general');
-  const base = builtin ?? agent({ name, kind });
+  const base = BUILTIN_AGENTS[name] ?? agent({ name });
   const tools = (raw.tools ?? {}) as Record<string, unknown>;
   return {
     name,
     title: str(raw.title, base.title),
     description: str(raw.description, base.description),
-    kind,
     executor: str(raw.executor, base.executor).trim(),
     cliPath: str(raw.cliPath, base.cliPath).trim(),
     model: str(raw.model, base.model).trim(),

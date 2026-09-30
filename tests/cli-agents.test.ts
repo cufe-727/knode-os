@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { defaultConfig, defaultRoutedLlmConfig, KnodeConfig, LlmConnection, llmTargets, loadConfig, resolveRoutedLlmConfig } from '../src/config.js';
+import { defaultConfig, defaultRoutedLlmConfig, KnodeConfig, LlmConnection, llmTargets, loadConfig, resolveRoutedLlmConfig, routeTargets } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
 import { resolveAgentSpec } from '../src/research/agent.js';
 import { ensureDefaultAgents, loadAgent, saveAgent } from '../src/research/agents.js';
@@ -56,8 +56,8 @@ describe('moving CLI rows into agents', () => {
       },
     });
     // one agent ran on a CLI row by id, one on a bare CLI that borrowed the default's model
-    saveAgent(dir, { name: 'mine', kind: 'deep-research', executor: 'connection-3' });
-    saveAgent(dir, { name: 'bare', kind: 'general', executor: 'cursor-cli' });
+    saveAgent(dir, { name: 'mine', executor: 'connection-3' });
+    saveAgent(dir, { name: 'bare', executor: 'cursor-cli' });
 
     const loaded = loadConfig(dir);
     expect(loaded.connections.map((c) => c.id)).toEqual(['connection-1']);
@@ -123,7 +123,7 @@ describe('moving CLI rows into agents', () => {
       llmUse: 'connection-1',
       extraction: { ...base.extraction, entityLlm: { ...defaultRoutedLlmConfig(), use: 'cursor-cli-1' } },
     });
-    saveAgent(dir, { name: 'cursor-cli-1', kind: 'general', executor: 'default', title: 'Something else' });
+    saveAgent(dir, { name: 'cursor-cli-1', executor: 'default', title: 'Something else' });
 
     const loaded = loadConfig(dir);
     expect(loadAgent(dir, 'cursor-cli-1')).toMatchObject({ title: 'Something else', executor: 'default' });
@@ -193,7 +193,8 @@ describe('the agents API with CLI agents', () => {
     current = await config();
     expect(current.llmUse).toBe('connection-1');
     expect(current.llm).toMatchObject({ provider: 'openai', model: 'ark/seed-evolving' });
-    expect(current.extraction.entityLlm.use).toBe('');
+    // the stage lands on the default by name, not on "whatever the default is"
+    expect(current.extraction.entityLlm.use).toBe('connection-1');
   });
 
   it('moves CLI rows an older client still sends into agents', async () => {
@@ -202,5 +203,108 @@ describe('the agents API with CLI agents', () => {
     expect((await config()).connections.map((c) => c.id)).toEqual(['connection-1']);
     const agents = (await (await app.request('/api/agents', { headers })).json()) as { agents: Array<{ name: string; executor: string }> };
     expect(agents.agents.find((a) => a.name === 'connection-3')).toMatchObject({ executor: 'codex-cli' });
+  });
+
+  it('runs a stage on a deepagents agent that pins a model, and moves it off by name', async () => {
+    await app.request('/api/agents/drafter', {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ agent: { title: 'Drafter', executor: 'connection-1', model: 'drafter-model' } }),
+    });
+    const saved = await app.request('/api/config', {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({
+        connections: [relay],
+        llmUse: 'connection-1',
+        extraction: { entityLlm: { use: 'drafter' }, conceptLlm: { use: 'deep-agent' }, documentLlm: { use: '' } },
+      }),
+    });
+    expect(saved.status).toBe(200);
+    let current = await config();
+    expect(current.extraction.entityLlm.use).toBe('drafter');
+    // the built-in pins no model, so it is its endpoint's row again: the stage lands on that
+    expect(current.extraction.conceptLlm.use).toBe('connection-1');
+    // a stage that names nothing is written down as the default
+    expect(current.extraction.documentLlm.use).toBe('connection-1');
+    expect(current.modelAgents).toBeUndefined();
+
+    // give the built-in a model of its own and a stage can name it ...
+    await app.request('/api/agents/deep-agent', { method: 'PUT', headers, body: JSON.stringify({ agent: { executor: 'default', model: 'own-model' } }) });
+    await app.request('/api/config', { method: 'PUT', headers, body: JSON.stringify({ extraction: { conceptLlm: { use: 'deep-agent' } } }) });
+    expect((await config()).extraction.conceptLlm.use).toBe('deep-agent');
+    // ... until a reset takes the model away, and the stage follows to the endpoint it runs on
+    await app.request('/api/agents/deep-agent', { method: 'DELETE', headers });
+    expect((await config()).extraction.conceptLlm.use).toBe('connection-1');
+
+    await app.request('/api/agents/drafter', { method: 'DELETE', headers });
+    current = await config();
+    expect(current.extraction.entityLlm.use).toBe('connection-1');
+  });
+});
+
+/**
+ * A stage sends its own prompt and wants one answer back, so an agent runs it
+ * one-shot: a CLI agent as itself, a deepagents agent as the model it runs on.
+ * One with no model of its own is that endpoint's row again, so it is no target.
+ */
+describe('deepagents agents as pipeline stages', () => {
+  const other = row({ id: 'connection-2', label: 'other', provider: 'openai', baseUrl: 'https://other.example/v1', apiKey: 'sk-2', model: 'other-model' });
+
+  it('runs a stage on the model an agent pins, and moves one on a model-less agent to its endpoint', () => {
+    const base = defaultConfig();
+    const { id: _id, ...mirror } = relay;
+    const dir = workspace('deepagents-stages', {
+      llm: mirror,
+      connections: [relay, other],
+      llmUse: 'connection-1',
+      extraction: {
+        ...base.extraction,
+        entityLlm: { ...defaultRoutedLlmConfig(), use: 'deep-agent' },
+        conceptLlm: { ...defaultRoutedLlmConfig(), use: 'pinned' },
+        documentLlm: { ...defaultRoutedLlmConfig(), use: 'plain', model: 'route-model' },
+      },
+    });
+    saveAgent(dir, { name: 'pinned', title: 'Pinned', executor: 'connection-2', model: 'agent-model' });
+    saveAgent(dir, { name: 'plain', title: 'Plain', executor: 'connection-2' });
+
+    const loaded = loadConfig(dir);
+    const resolve = (key: 'entityLlm' | 'conceptLlm' | 'documentLlm') =>
+      resolveRoutedLlmConfig(loaded.llm, loaded.extraction[key], routeTargets(loaded));
+    // one that pins a model brings that endpoint and its own model, and stays a target
+    expect(loaded.extraction.conceptLlm.use).toBe('pinned');
+    expect(resolve('conceptLlm')).toMatchObject({ baseUrl: 'https://other.example/v1', apiKey: 'sk-2', model: 'agent-model' });
+    expect(routeTargets(loaded).find((t) => t.id === 'pinned')).toMatchObject({ label: 'Pinned', model: 'agent-model' });
+
+    // one without is the endpoint it runs on, under another name: the stage
+    // moves there — the default's for the built-in that follows it, the pinned
+    // connection for the other — and runs exactly as before, route model included
+    expect(loaded.extraction.entityLlm.use).toBe('connection-1');
+    expect(resolve('entityLlm')).toMatchObject({ provider: 'openai', baseUrl: 'https://relay.example/v1', model: 'ark/seed-evolving' });
+    expect(loaded.extraction.documentLlm).toMatchObject({ use: 'connection-2', model: 'route-model' });
+    expect(resolve('documentLlm')).toMatchObject({ baseUrl: 'https://other.example/v1', model: 'route-model' });
+    expect(routeTargets(loaded).map((t) => t.id)).toEqual(['connection-1', 'connection-2', 'pinned']);
+
+    // the default cannot be an agent like these, since they may follow it
+    expect(llmTargets(loaded).map((t) => t.id)).toEqual(['connection-1', 'connection-2']);
+  });
+
+  it('leaves out one that follows a CLI default, and moves its stage to that default', () => {
+    const base = defaultConfig();
+    const claude = row({ id: 'claude-cli-1', label: 'Claude', provider: 'claude-cli' });
+    const { id: _id, ...mirror } = claude;
+    const dir = workspace('deepagents-cli-default', {
+      llm: mirror,
+      connections: [claude],
+      llmUse: 'claude-cli-1',
+      extraction: { ...base.extraction, entityLlm: { ...defaultRoutedLlmConfig(), use: 'follower' } },
+    });
+    // a model of its own, so it is only the CLI default that keeps it out
+    saveAgent(dir, { name: 'follower', executor: 'default', model: 'own-model' });
+
+    const loaded = loadConfig(dir);
+    expect(routeTargets(loaded).map((t) => t.id)).toEqual(['claude-cli-1']);
+    // what it would have run anyway, now written down
+    expect(loaded.extraction.entityLlm.use).toBe('claude-cli-1');
   });
 });

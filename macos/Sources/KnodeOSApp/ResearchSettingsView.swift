@@ -70,17 +70,12 @@ struct ResearchSettingsSection: View {
     }
 
     private var header: some View {
-        HStack(alignment: .bottom) {
-            VStack(alignment: .leading, spacing: 3) {
-                Eyebrow(text: L("03 · Research"), color: .knodeViolet)
-                Text(L("How the wiki gets written")).font(.title3.bold())
-                Text(L("What initialization does, how Ask behaves, and how a deep-research job runs: which agent from section 01 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 12)
-            RouteBadge(label: L("Pipeline"), color: .knodeViolet)
+        VStack(alignment: .leading, spacing: 3) {
+            Text(L("How the wiki gets written")).font(.title3.bold())
+            Text(L("What initialization does, how Ask behaves, and how a deep-research job runs: which agent from Providers & Agents takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents."))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -88,21 +83,17 @@ struct ResearchSettingsSection: View {
 
     private var runnerCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(L("Deep research pipeline")).font(.headline)
-                    Text(L("Which agent runs jobs, how many at once, and which profile it follows. Roles below may override the agent per phase."))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 12)
-                RouteBadge(label: L("Runner"), color: .knodeCyan)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(L("Deep research pipeline")).font(.headline)
+                Text(L("Which agent runs jobs, how many at once, and which profile it follows. Roles below may override the agent per phase."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
                     FieldLabel(L("Agent")) {
-                        AgentPicker(selection: $research.agent, agents: agents, kind: "deep-research", connections: connections, fallbackLabel: nil, defaultName: defaultTarget?.label ?? "")
+                        AgentPicker(selection: $research.agent, agents: agents, connections: connections, fallbackLabel: nil, defaultName: defaultTarget?.label ?? "")
                     }
                     ModelField(
                         placeholder: L("CLI default"),
@@ -186,16 +177,12 @@ struct ResearchSettingsSection: View {
     /// What the Wiki tab's initialize button does before the agent starts.
     private var initializationCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(L("Initialization")).font(.headline)
-                    Text(L("What the Wiki tab's initialize button does before the agent starts, and how many topic pages it queues afterwards."))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 12)
-                RouteBadge(label: L("Init"), color: .knodeCyan)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(L("Initialization")).font(.headline)
+                Text(L("What the Wiki tab's initialize button does before the agent starts, and how many topic pages it queues afterwards."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
@@ -221,24 +208,20 @@ struct ResearchSettingsSection: View {
 
     /// Which agent answers Ask, and the two things about a conversation that
     /// are not properties of the agent. Everything else — effort, tools, turn
-    /// cap, timeout, extra prompt — belongs to the agent itself, in section 01.
+    /// cap, timeout, extra prompt — belongs to the agent itself, under Providers & Agents.
     private var chatCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(L("Ask")).font(.headline)
-                    Text(L("Ask uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note."))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 12)
-                RouteBadge(label: L("Ask"), color: .knodeViolet)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(L("Ask")).font(.headline)
+                Text(L("Ask uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
                     FieldLabel(L("Agent")) {
-                        AgentPicker(selection: $chat.agent, agents: agents, kind: "general", connections: connections, fallbackLabel: L("The research agent, else the default provider"), defaultName: defaultTarget?.label ?? "")
+                        AgentPicker(selection: $chat.agent, agents: agents, connections: connections, fallbackLabel: L("The research agent, else the default provider"), defaultName: defaultTarget?.label ?? "")
                     }
                     FieldLabel(L("Messages replayed")) {
                         TextField("12", value: $chat.historyTurns, format: .number)
@@ -248,7 +231,7 @@ struct ResearchSettingsSection: View {
                     }
                 }
             }
-            Text(L("Effort, turns, timeout, tool grants and any extra prompt come from the agent — edit them where the agent is defined, in section 01."))
+            Text(L("Effort, turns, timeout, tool grants and any extra prompt come from the agent — edit them where the agent is defined, under Providers & Agents."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -598,17 +581,12 @@ struct ResearchSettingsSection: View {
 /// fallback any more, so an empty value is shown as the unconfigured state.
 struct AgentPicker: View {
     @Binding var selection: String
-    /// The agents from section 01; the kind this picker is for comes first.
+    /// The agents from Providers & Agents, in the order that table lists them.
     var agents: [AgentDefinition] = []
-    var kind: String = ""
     let connections: [LLMConnection]
     var fallbackLabel: String?
     /// What the default is called now, for a legacy `default` selection.
     var defaultName: String = ""
-
-    private var ordered: [AgentDefinition] {
-        kind.isEmpty ? agents : agents.filter { $0.kind == kind } + agents.filter { $0.kind != kind }
-    }
 
     var body: some View {
         Picker(L("Agent"), selection: $selection) {
@@ -617,7 +595,7 @@ struct AgentPicker: View {
             } else if selection.isEmpty {
                 Text(L("Not configured — pick an agent")).tag("")
             }
-            ForEach(ordered) { agent in
+            ForEach(agents) { agent in
                 Text("\(agent.title) · \(agent.isCli ? providerName(agent.executor) : "deepagents")").tag(agent.name)
             }
             if !selection.isEmpty && !agents.contains(where: { $0.name == selection }) {
