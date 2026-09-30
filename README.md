@@ -245,7 +245,7 @@ Four sections, each with its own tabs.
   - **Graph** — force-directed graph explorer + insights (hubs / isolated / types)
   - **Wiki** — one button initializes the knowledge base (survey → overview page + `AGENTS.md` guide + queued topic pages), then queue and review deep-research pages
   - **Dream** — run dreams, review and accept/reject suggestions
-- **Settings** — **Providers & Agents** (every model endpoint and key once, embedding and LLM in one table — `llmUse` marks which LLM is the default, and every job that names no provider of its own follows it — and the agents in a second table below: deepagents on one of those models, or a coding-agent CLI (Claude Code / Codex / Cursor) with its own path, model and effort. A CLI is an agent, not a model; a pipeline stage can still call a CLI agent one-shot), **Pipeline** (independently routed entity/concept/document-vision models; saving re-embeds or refreshes conversions when needed), **Research**, **Workspace**
+- **Settings** — **Providers & Agents** (every model endpoint and key once, embedding and LLM in one table — `llmUse` marks which LLM is the default, and every job that names no provider of its own follows it — and the agents in a second table below: deepagents on one of those models, or a coding-agent CLI (Claude Code / Codex / Cursor) with its own path, model and effort. A CLI is an agent, not a model), **Pipeline** (independently routed entity/concept/document-vision stages, each naming the model or agent it runs on — any agent is called one-shot, and a stage no longer follows the default; saving re-embeds or refreshes conversions when needed), **Research**, **Workspace**
 
 ## REST API (localhost)
 

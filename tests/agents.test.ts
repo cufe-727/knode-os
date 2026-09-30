@@ -2,11 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { defaultConfig, saveConfig } from '../src/config.js';
+import { defaultConfig, loadConfig, saveConfig } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
 import { AGENTS_DIR } from '../src/fs/layout.js';
 import { agentForSpec, resolveAgentSpec } from '../src/research/agent.js';
-import { AgentDefinition, ensureDefaultAgents, loadAgent, loadAgents, saveAgent, deleteAgent } from '../src/research/agents.js';
+import { AgentDefinition, BUILTIN_AGENTS, ensureDefaultAgents, loadAgent, loadAgents, saveAgent, deleteAgent } from '../src/research/agents.js';
+import { loadProfile } from '../src/research/profile.js';
 import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 
@@ -50,30 +51,28 @@ afterAll(async () => {
  * profile.
  */
 describe('agent definitions', () => {
-  it('seeds one template per kind, and a deleted built-in comes back', () => {
+  it('seeds the one template, and a deleted built-in comes back', () => {
     const dir = path.join(tmp, 'seed');
     fs.mkdirSync(dir, { recursive: true });
-    expect(ensureDefaultAgents(dir)).toEqual([
-      `${AGENTS_DIR}/deep-agent.yaml`,
-      `${AGENTS_DIR}/deep-research.yaml`,
-    ]);
+    expect(ensureDefaultAgents(dir)).toEqual([`${AGENTS_DIR}/deep-agent.yaml`]);
     // seeding twice writes nothing, so a user edit is never clobbered
     expect(ensureDefaultAgents(dir)).toEqual([]);
 
     const agents = loadAgents(dir);
-    expect(agents.get('deep-agent')).toMatchObject({ kind: 'general', executor: 'default' });
-    expect(agents.get('deep-research')).toMatchObject({ kind: 'deep-research' });
+    expect([...agents.keys()]).toEqual(['deep-agent']);
+    expect(agents.get('deep-agent')).toMatchObject({ title: 'deep agent', executor: 'default', model: '' });
+    expect(agents.get('deep-agent')).not.toHaveProperty('kind');
 
     expect(deleteAgent(dir, 'deep-agent')).toBe(true);
-    expect(loadAgent(dir, 'deep-agent')).toMatchObject({ kind: 'general' });
+    expect(loadAgent(dir, 'deep-agent')).toMatchObject({ executor: 'default' });
   });
 
   it('keeps an edit and fills what the file leaves out', () => {
     const dir = path.join(tmp, 'edit');
     fs.mkdirSync(dir, { recursive: true });
-    saveAgent(dir, { name: 'cheap', kind: 'general', executor: 'cursor-cli', effort: 'low' } as Partial<AgentDefinition> & { name: string });
+    saveAgent(dir, { name: 'cheap', executor: 'cursor-cli', effort: 'low' } as Partial<AgentDefinition> & { name: string });
     const loaded = loadAgent(dir, 'cheap');
-    expect(loaded).toMatchObject({ name: 'cheap', executor: 'cursor-cli', effort: 'low', kind: 'general' });
+    expect(loaded).toMatchObject({ name: 'cheap', executor: 'cursor-cli', effort: 'low' });
     // the fields the caller omitted come from the general template
     expect(loaded?.tools).toEqual({ write: false, files: true, web: 'inherit' });
     expect(loaded?.path).toBe(`${AGENTS_DIR}/cheap.yaml`);
@@ -86,7 +85,7 @@ describe('agent definitions', () => {
     fs.mkdirSync(dir, { recursive: true });
     const config = defaultConfig();
     config.connections = [{ id: 'ark', label: 'Ark', provider: 'openai', baseUrl: 'https://ark.example/v1', apiKey: 'sk', model: 'doubao', cliPath: '', cliTimeoutMs: 300_000 }];
-    saveAgent(dir, { name: 'writer', kind: 'deep-research', executor: 'ark', model: 'doubao-pro' });
+    saveAgent(dir, { name: 'writer', executor: 'ark', model: 'doubao-pro' });
 
     expect(agentForSpec(config, 'writer', '', dir)).toMatchObject({ kind: 'builtin', baseUrl: 'https://ark.example/v1', model: 'doubao-pro' });
     // a pre-agents config names the connection straight, and still resolves
@@ -100,7 +99,7 @@ describe('agent definitions', () => {
     fs.mkdirSync(dir, { recursive: true });
     const config = defaultConfig();
     config.connections = [{ id: 'ark', label: 'Ark', provider: 'openai', baseUrl: 'https://ark.example/v1', apiKey: 'sk', model: 'doubao', cliPath: '', cliTimeoutMs: 300_000 }];
-    saveAgent(dir, { name: 'writer', kind: 'general', executor: 'ark', model: 'doubao-pro', maxTurns: 7, effort: 'high' });
+    saveAgent(dir, { name: 'writer', executor: 'ark', model: 'doubao-pro', maxTurns: 7, effort: 'high' });
 
     const named = resolveAgentSpec(config, 'writer', '', dir);
     expect(named?.agent).toMatchObject({ kind: 'builtin', model: 'doubao-pro' });
@@ -116,12 +115,98 @@ describe('agent definitions', () => {
   });
 });
 
+/**
+ * `deep-research` shipped as a second template that was `deep-agent` under
+ * another name. Loading the config retires it: an untouched copy goes and
+ * whatever named it follows `deep-agent`; one someone edited stays.
+ */
+describe('retiring the deep-research template', () => {
+  // the two files exactly as the old templates were seeded
+  const seededResearch = [
+    'name: deep-research',
+    'title: 深度研究 agent',
+    'description: 按 research profile 的阶段与子代理跑：规划 → 并行调查 → 综合 → 评审 → 修订，把页面写回 wiki。',
+    'kind: deep-research',
+    'executor: default',
+    "model: ''",
+    'effort: default',
+    'tools:',
+    '  write: true',
+    '  files: true',
+    '  web: inherit',
+    'maxTurns: 0',
+    'timeoutMs: 0',
+    "prompt: ''",
+    '',
+  ].join('\n');
+  const seededGeneral = seededResearch
+    .replace('name: deep-research', 'name: deep-agent')
+    .replace('title: 深度研究 agent', 'title: 通用 deep agent')
+    .replace(/description: .*/, 'description: LangChain deepagents 循环，跑在 OpenAI 兼容连接上；单会话回答，可读知识库、可写隔离笔记。没装任何 CLI 的机器用它。')
+    .replace('kind: deep-research', 'kind: general');
+
+  function workspace(name: string, research: string): string {
+    const dir = path.join(tmp, name);
+    fs.mkdirSync(path.join(dir, AGENTS_DIR), { recursive: true });
+    const config = defaultConfig();
+    config.connections = [{ id: 'relay', label: 'relay', provider: 'openai', baseUrl: 'https://relay.example/v1', apiKey: 'sk', model: 'relay-model', cliPath: '', effort: 'default', cliTimeoutMs: 300_000 }];
+    config.llmUse = 'relay';
+    config.research.agent = 'deep-research';
+    config.chat.agent = 'deep-research';
+    config.extraction.entityLlm = { ...config.extraction.entityLlm, use: 'deep-research' };
+    saveConfig(dir, config);
+    fs.writeFileSync(path.join(dir, AGENTS_DIR, 'deep-research.yaml'), research);
+    fs.writeFileSync(path.join(dir, AGENTS_DIR, 'deep-agent.yaml'), seededGeneral);
+    const profiles = path.join(dir, 'playbooks', 'research', 'profiles');
+    fs.mkdirSync(profiles, { recursive: true });
+    fs.writeFileSync(path.join(profiles, 'mine.yaml'), "title: Mine\nroles:\n  - id: critic\n    phase: review\n    agent: deep-research\n  - id: planner\n    phase: plan\n    agent: ''\n");
+    return dir;
+  }
+
+  it('deletes an untouched copy and moves what named it to deep-agent', () => {
+    const dir = workspace('retired', seededResearch);
+    const loaded = loadConfig(dir);
+
+    expect(fs.existsSync(path.join(dir, AGENTS_DIR, 'deep-research.yaml'))).toBe(false);
+    expect(loaded.research.agent).toBe('deep-agent');
+    expect(loaded.chat.agent).toBe('deep-agent');
+    // deep-agent pins no model, so a stage on it is its endpoint's row: it lands there
+    expect(loaded.extraction.entityLlm.use).toBe('relay');
+    expect(loadProfile(dir, 'mine')?.roles.map((r) => r.agent)).toEqual(['deep-agent', '']);
+
+    // the built-in that stays takes its current wording, and no file keeps a kind
+    const file = path.join(dir, AGENTS_DIR, 'deep-agent.yaml');
+    expect(loadAgent(dir, 'deep-agent')).toMatchObject({ title: 'deep agent', executor: 'default', tools: { write: true, files: true, web: 'inherit' } });
+    expect(fs.readFileSync(file, 'utf8')).not.toMatch(/^kind:/m);
+
+    // written down once, and not seeded back: the next load finds nothing to do
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'knode.config.json'), 'utf8')).research.agent).toBe('deep-agent');
+    const before = fs.readFileSync(file, 'utf8');
+    expect(loadConfig(dir).research.agent).toBe('deep-agent');
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    expect(ensureDefaultAgents(dir)).toEqual([]);
+  });
+
+  it('keeps a copy someone edited, as an ordinary agent that runs as it did', () => {
+    // a prompt of its own, and the tools it inherited from the template left out
+    const edited = seededResearch.replace("prompt: ''", 'prompt: 先列提纲再写。').replace(/tools:\n(?: {2}.*\n)+/, '');
+    const dir = workspace('retired-edited', edited);
+    const loaded = loadConfig(dir);
+
+    expect(loaded.research.agent).toBe('deep-research');
+    expect(loadProfile(dir, 'mine')?.roles[0].agent).toBe('deep-research');
+    expect(BUILTIN_AGENTS['deep-research']).toBeUndefined();
+    expect(loadAgent(dir, 'deep-research')).toMatchObject({ title: '深度研究 agent', prompt: '先列提纲再写。', tools: { write: true, files: true, web: 'inherit' } });
+    expect(fs.readFileSync(path.join(dir, AGENTS_DIR, 'deep-research.yaml'), 'utf8')).not.toMatch(/^kind:/m);
+  });
+});
+
 describe('the agents API', () => {
   const read = async (path: string) => app.request(path, { headers });
 
-  it('lists the templates a new workspace starts with', async () => {
-    const body = (await read('/api/agents').then((r) => r.json())) as { agents: Array<{ name: string; kind: string; builtin: boolean }> };
-    expect(body.agents.map((a) => a.name).sort()).toEqual(['deep-agent', 'deep-research']);
+  it('lists the template a new workspace starts with', async () => {
+    const body = (await read('/api/agents').then((r) => r.json())) as { agents: Array<{ name: string; builtin: boolean }> };
+    expect(body.agents.map((a) => a.name)).toEqual(['deep-agent']);
     expect(body.agents.every((a) => a.builtin)).toBe(true);
   });
 
@@ -129,7 +214,7 @@ describe('the agents API', () => {
     const created = await app.request('/api/agents/mine', {
       method: 'PUT',
       headers,
-      body: JSON.stringify({ agent: { kind: 'deep-research', title: '我的研究员', executor: 'cursor-cli', effort: 'high' } }),
+      body: JSON.stringify({ agent: { title: '我的研究员', executor: 'cursor-cli', effort: 'high' } }),
     });
     expect(created.status).toBe(200);
     expect((await created.json()) as { title: string }).toMatchObject({ title: '我的研究员', executor: 'cursor-cli', effort: 'high' });

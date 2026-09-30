@@ -2234,9 +2234,10 @@ function agentTarget(agent) {
 }
 
 /**
- * Everything a stage or the default can run on: the models, then the CLI
- * agents, called one-shot — the mirror of the service's `llmTargets`. A model
- * wins an id clash, since it is what the config itself names.
+ * Everything the default can run on: the models, then the CLI agents, called
+ * one-shot — the mirror of the service's `llmTargets`. A model wins an id
+ * clash, since it is what the config itself names. A stage can run on more —
+ * see `routeTargets`.
  */
 function llmTargets() {
   const agents = agentDrafts.filter((a) => CLI_PROVIDERS.includes(a.executor) && !connectionById(a.name)).map(agentTarget);
@@ -2268,18 +2269,59 @@ function modelEndpoint(agent) {
 }
 
 /**
+ * An agent as a stage sees it, called one-shot: a CLI agent as itself, a
+ * deepagents agent as its own model on the endpoint it runs on. null for a
+ * deepagents agent that names no model — it would be that endpoint's row again
+ * under another name — and for one that runs on nothing.
+ */
+function agentRouteTarget(agent) {
+  if (CLI_PROVIDERS.includes(agent.executor)) return { ...agentTarget(agent), runtime: providerNames[agent.executor] ?? agent.executor };
+  const endpoint = (agent.model || '').trim() ? modelEndpoint(agent) : null;
+  if (!endpoint) return null;
+  return {
+    ...endpoint,
+    id: agent.name,
+    label: (agent.title || '').trim() || agent.name,
+    model: agent.model.trim(),
+    agent: true,
+    runtime: 'deepagents',
+  };
+}
+
+/**
+ * Everything a stage can name: the models, then the CLI agents and the
+ * deepagents agents that pin a model — the mirror of the service's
+ * `routeTargets`. Not `llmTargets`, because the default cannot
+ * be a deepagents agent: it may follow the default.
+ */
+function routeTargets() {
+  const agents = agentDrafts.filter((a) => !connectionById(a.name)).map(agentRouteTarget).filter(Boolean);
+  return [...connectionDrafts, ...agents];
+}
+
+function routeTargetById(id) {
+  return routeTargets().find((t) => t.id === id);
+}
+
+/**
+ * What a stage runs on: the target it names, else the default — where the
+ * service runs a stage naming nothing known, and what a save writes down.
+ * There is no "follow the default" entry to leave it on.
+ */
+function stageUse(use) {
+  return routeTargetById(use) ? use : (defaultConnection()?.id ?? '');
+}
+
+/**
  * The model a route runs with when it names none of its own — the mirror of
- * the service's `resolveRoutedLlmConfig`, over the models and the CLI agents.
+ * the service's `resolveRoutedLlmConfig`, over everything a stage can name.
  *
  * Shown as a Model field's placeholder and never written: an empty `model`
  * means "follow this provider", so pinning the string would stop the route
  * tracking the provider's own model.
  */
 function inheritedModelFor(use) {
-  const target = targetById(use);
-  if (target) return target.model || '';
-  // '' and 'default' follow whatever the default is
-  return (!use || use === 'default') ? (defaultConnection()?.model || '') : '';
+  return (routeTargetById(use) ?? defaultConnection())?.model || '';
 }
 
 /**
@@ -2353,11 +2395,11 @@ function defaultLlmSummaryText() {
 function routeSummary(prefix) {
   const use = $(`#cfg-${prefix}-use`).value;
   const model = $(`#cfg-${prefix}-model`).value.trim();
-  const target = targetById(use);
-  const fallback = defaultConnection()?.label?.trim() || 'Default model';
+  // a stage names what it runs on; one naming nothing known runs on the default
+  const target = routeTargetById(use) ?? defaultConnection();
   return {
-    provider: target ? target.label || target.id : fallback,
-    // an inheriting route prints what it inherits, not a blank
+    provider: target ? target.label?.trim() || providerNames[target.provider] || target.id : 'Not configured',
+    // an inheriting model prints what it inherits, not a blank
     model: model || inheritedModelFor(use),
   };
 }
@@ -2373,22 +2415,22 @@ function fillEmbeddingOptions() {
 }
 
 /**
- * Rebuild the per-route pickers: the default, the models, then the CLI agents
- * a stage can call one-shot. Keeps a selection that still exists.
+ * Rebuild the per-route pickers: the models, then every agent a stage can
+ * call one-shot. A stage names one of them — there is no "Default LLM" entry,
+ * which sat beside the default's own row as a second copy of it. Keeps a
+ * selection that still exists, else lands on the default.
  */
 function fillRouteOptions() {
-  const def = defaultConnection();
-  const agents = llmTargets().filter((t) => t.agent);
+  const agents = routeTargets().filter((t) => t.agent);
   for (const prefix of ['entity', 'concept', 'document']) {
     const select = $(`#cfg-${prefix}-use`);
     const previous = select.value;
-    select.innerHTML = [`<option value="">Default LLM${def ? ` · ${esc(def.label || def.id)}` : ''}</option>`]
-      .concat(connectionDrafts.map((c) => `<option value="${esc(c.id)}">${esc(c.label || c.id)}</option>`))
+    select.innerHTML = connectionDrafts.map((c) => `<option value="${esc(c.id)}">${esc(c.label || c.id)}</option>`)
       .concat(agents.length
-        ? [`<optgroup label="Agents, one call at a time">${agents.map((a) => `<option value="${esc(a.id)}">${esc(a.label)} · ${esc(providerNames[a.provider] ?? a.provider)}</option>`).join('')}</optgroup>`]
+        ? [`<optgroup label="Agents, one call at a time">${agents.map((a) => `<option value="${esc(a.id)}">${esc(a.label)} · ${esc(a.runtime)}</option>`).join('')}</optgroup>`]
         : [])
       .join('');
-    select.value = targetById(previous) ? previous : '';
+    select.value = stageUse(previous);
   }
   refreshResearchAgentOptions();
 }
@@ -2463,14 +2505,13 @@ function paintInheritedPlaceholders() {
 
 function routeProviderToggle(prefix) {
   const note = $(`#cfg-${prefix}-note`);
-  const target = targetById($(`#cfg-${prefix}-use`).value);
+  const target = routeTargetById($(`#cfg-${prefix}-use`).value) ?? defaultConnection();
   if (!target) {
-    const def = defaultConnection();
-    note.innerHTML = def
-      ? `<b>Inherited route.</b> Runs on the default LLM (${esc(def.label || def.id)}).`
-      : '<b>Inherited route.</b> Nothing to run on yet — add a model in section 01.';
+    note.innerHTML = 'Nothing to run on yet — add a model in section 01.';
   } else if (target.provider === 'openai') {
-    note.innerHTML = `<b>${esc(target.label || target.id)}</b> · ${esc((target.baseUrl || '').trim() || 'no endpoint set')}`;
+    // a model, or a deepagents agent called one-shot on its model
+    const how = target.agent ? ' · agent, one call at a time' : '';
+    note.innerHTML = `<b>${esc(target.label || target.id)}</b>${how} · ${esc((target.baseUrl || '').trim() || 'no endpoint set')}`;
   } else {
     // a CLI agent, called one-shot with its own path
     const meta = cliMeta[target.provider];
@@ -2480,9 +2521,7 @@ function routeProviderToggle(prefix) {
 }
 
 function fillRoute(prefix, route = {}) {
-  const use = route.use === 'default' ? '' : route.use || '';
-  const select = $(`#cfg-${prefix}-use`);
-  select.value = targetById(use) ? use : '';
+  $(`#cfg-${prefix}-use`).value = stageUse(route.use || '');
   $(`#cfg-${prefix}-model`).value = route.model || '';
   routeProviderToggle(prefix);
 }
@@ -2635,7 +2674,7 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     embeddingUse = cfg.embeddingUse || embeddingDrafts[0]?.id || '';
     connectionDrafts = (cfg.connections ?? []).map((c) => ({ ...c }));
     llmUse = cfg.llmUse || connectionDrafts[0]?.id || '';
-    // agents before routes: a stage may run on a CLI agent, and a route
+    // agents before routes: a stage may run on an agent, and a route
     // filled before its agent exists would read — and then save — as the default
     await loadAgentsList();
     if (activeWorkspace()?.id !== workspaceId) return;
@@ -2869,7 +2908,7 @@ async function loadAgentsList() {
     agentDrafts = [];
   }
   renderAgents();
-  // a stage and the research pickers may name a CLI agent
+  // a stage and the research pickers may name an agent
   fillRouteOptions();
 }
 
@@ -2892,7 +2931,6 @@ async function addAgent(runtime) {
       method: 'PUT',
       body: JSON.stringify({
         agent: {
-          kind: 'general',
           title: cli ? providerNames[runtime] : 'New deepagents agent',
           executor,
           // what Ask needs to take notes; a CLI answers with its own tools anyway
@@ -2920,8 +2958,7 @@ async function removeAgent(name) {
       $('#cfg-research-agent').value = cfg.research?.agent ?? '';
       $('#cfg-chat-agent').value = cfg.chat?.agent ?? '';
       for (const prefix of ['entity', 'concept', 'document']) {
-        const use = cfg.extraction?.[`${prefix}Llm`]?.use ?? '';
-        $(`#cfg-${prefix}-use`).value = targetById(use) ? use : '';
+        $(`#cfg-${prefix}-use`).value = stageUse(cfg.extraction?.[`${prefix}Llm`]?.use ?? '');
         routeProviderToggle(prefix);
       }
       renderProviders();
@@ -2942,7 +2979,6 @@ async function saveAgents() {
         agent: {
           title: (agent.title || '').trim() || agent.name,
           description: agent.description ?? '',
-          kind: agent.kind,
           executor: agent.executor,
           cliPath: agent.cliPath ?? '',
           model: agent.model ?? '',
@@ -3063,13 +3099,12 @@ function optionList(pairs, selected) {
 // The choices are the agents in section 01, each saying which runtime it is. A
 // config written before agents may name a bare CLI, the default or a model
 // straight; those keep resolving, so the one in use stays listed — only that one.
-function agentOptions(selected, fallbackLabel, kind = '') {
+function agentOptions(selected, fallbackLabel) {
   const opts = fallbackLabel
     ? [`<option value="">${esc(fallbackLabel)}</option>`]
     : [`<option value=""${selected ? ' disabled' : ' selected'}>Not configured — pick an agent</option>`];
-  // the kind this picker is for on top
-  const named = [...agentDrafts].sort((a, b) => Number(b.kind === kind) - Number(a.kind === kind));
-  for (const a of named) {
+  // in the order the agents table lists them: there is no kind to sort by
+  for (const a of agentDrafts) {
     const runtime = isCliAgent(a) ? providerNames[a.executor] : 'deepagents';
     opts.push(`<option value="${esc(a.name)}"${a.name === selected ? ' selected' : ''}>${esc(a.title || a.name)} · ${esc(runtime)}</option>`);
   }
@@ -3101,13 +3136,13 @@ function refreshResearchAgentOptions() {
   const select = $('#cfg-research-agent');
   if (!select) return;
   const current = select.value;
-  select.innerHTML = agentOptions(current, null, 'deep-research');
+  select.innerHTML = agentOptions(current, null);
   select.value = current;
   if (select.value !== current) select.value = '';
   const chatSelect = $('#cfg-chat-agent');
   if (chatSelect) {
     const chatCurrent = chatSelect.value;
-    chatSelect.innerHTML = agentOptions(chatCurrent, 'The research agent, else the default provider', 'general');
+    chatSelect.innerHTML = agentOptions(chatCurrent, 'The research agent, else the default provider');
     chatSelect.value = chatCurrent;
     if (chatSelect.value !== chatCurrent) chatSelect.value = '';
   }
@@ -3120,7 +3155,7 @@ function refreshResearchAgentOptions() {
 }
 
 function fillResearchForm(research) {
-  $('#cfg-research-agent').innerHTML = agentOptions(research.agent || '', null, 'deep-research');
+  $('#cfg-research-agent').innerHTML = agentOptions(research.agent || '', null);
   $('#cfg-research-agent').value = research.agent || '';
   $('#cfg-research-model').value = research.model || '';
   paintInheritedPlaceholders();
@@ -3590,13 +3625,10 @@ $('#cfg-providers').addEventListener('click', (event) => {
     $('#cfg-status').innerHTML = `<div class="cfg-line">The default provider is now ${esc(connectionDrafts[0].label || llmUse)} — every job that names no provider of its own follows it.</div>`;
   }
   renderProviders();
+  // a stage on the removed connection lands on the default, by name
   fillRouteOptions();
   updateConfigSummaries();
-  // a route pointing at the removed connection falls back to the default
-  for (const prefix of ['entity', 'concept', 'document']) {
-    if ($(`#cfg-${prefix}-use`).value === id) $(`#cfg-${prefix}-use`).value = '';
-    routeProviderToggle(prefix);
-  }
+  for (const prefix of ['entity', 'concept', 'document']) routeProviderToggle(prefix);
 });
 
 function setConfigBusy(busy) {

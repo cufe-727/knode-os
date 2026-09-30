@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { llmTargets, resolveRoutedLlmConfig } from '../config.js';
+import { resolveRoutedLlmConfig, routeTargets } from '../config.js';
 import { AppContext } from '../context.js';
 import { GUIDE_FILE, isSeedTemplate } from '../fs/datadir.js';
 import { loadOntology } from '../graph/ontology.js';
@@ -161,7 +161,7 @@ export async function surveyKnowledgeBase(ctx: AppContext): Promise<KbSurvey> {
   const datasources = (config.datasources ?? []).map((ds) => ({ id: ds.id, kind: String(ds.kind), datasets: datasets.filter((d) => d.source_id === ds.id).length }));
 
   const entityLlm = config.extraction.entityLlm
-    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, llmTargets(config), config.extraction.tier1Model))
+    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, routeTargets(config), config.extraction.tier1Model))
     : ctx.llm;
   const used = await budgetUsedToday(store).catch(() => 0);
 
