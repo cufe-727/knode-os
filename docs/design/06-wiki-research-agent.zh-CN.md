@@ -134,24 +134,27 @@ profile 把「怎么研究」从 harness 里抽出来：一份 YAML 同时回答
 
 | 块 | 键 | 作用 |
 | --- | --- | --- |
-| `reasoning` | `effort: default / low / medium / high / xhigh / max` | 每个会话的推理强度；角色可覆盖（`default` = 跟 CLI 自己的设置） |
+| `reasoning` | `effort: default / low / medium / high / xhigh / max / ultra`；`speed: default / fast` | 每个会话的推理强度与速度；角色可覆盖（`default` = 跟 CLI 自己的设置）。`ultra` 是 codex 在 `max` 之上的一档（最深推理、自动分派子任务）；`fast` 是 codex 目录里标为「Fast」的优先档（更快、用量更高），另外两个 CLI 忽略它 |
 | `search` | `web: inherit / on / off`；`freshness: live / cached`；`maxRounds` | 联网开关（只在 `review.external` 允许的范围内放宽或收窄，见 5c）、codex 检索新鲜度、每章节检索轮数（写进简报） |
 | `verification` | `minSourcesPerClaim`；`preferPrimarySources`；`resolveConflicts: flag / prefer_primary / prefer_recent` | 写进简报；`minSourcesPerClaim ≥ 2` 时校验器要求每条 `fact` 自带 `sources: [...]`（`suspected` 只告警） |
 | `stop` | `maxSections`；`marginalGain` | 提纲章节上限（代码强制）；「新一轮检索不再带来新事实就停」（写进简报） |
 | `output` | `citations`；`uncertainty`；`evidenceTable` | 写进简报；`evidenceTable` 让 `## 证据表` 成为必需章节（校验 + 提纲都认） |
 | `pipeline` | `'' / single / team / native` | 空 = 跟 `research.pipeline` |
-| `roles[]` | `id, title, phase, enabled, agent, model, effort, tools{write, files, web}, parallel, rounds, maxTurns, prompt, native, description` | 子代理定义（见 5b）；`agent` 为空 = `research.agent`，`prompt` 为空 = `phases/<phase>.md` |
+| `roles[]` | `id, title, phase, enabled, agent, model, effort, speed, tools{write, files, web}, parallel, rounds, maxTurns, prompt, native, description` | 子代理定义（见 5b）；`agent` 为空 = `research.agent`，`prompt` 为空 = `phases/<phase>.md` |
 
 内置四个（删除即重置为内置内容）：`default`（团队；强度与联网跟随 CLI 与 review 的默认值）、`quick`（单会话、medium、cached、最多 4 章节）、`thorough`（max、5 个并行研究员、2 轮评审、每条 fact 至少 2 个来源、证据表）、`native`（原生子代理、high）。简报里多出一段「研究规范（profile: …）」，把上面这些写成 agent 能读的规则。
 
-每个 CLI 的适配集中在 `src/research/launch.ts` 的 `sessionArgs`（`research export` 打印的命令行同样带上）。推理强度的两个适配器（`effortFor`、`cursorModel`）放在 `src/llm/cli.ts`，于是 LLM 连接上的一次性补全（它自己也带 `effort`）与研究会话用同一套写法：
+每个 CLI 的适配集中在 `src/research/launch.ts` 的 `sessionArgs`（`research export` 打印的命令行同样带上）。推理强度与速度的适配器（`effortFor`、`speedFor`、`cursorModel`）放在 `src/llm/cli.ts`，于是 LLM 连接上的一次性补全（它自己也带 `effort` / `speed`）与研究会话用同一套写法：
 
 | | claude | codex | cursor-agent |
 | --- | --- | --- | --- |
-| 推理强度 | `--effort <level>` | `-c model_reasoning_effort="…"` | 模型名括号 `model[effort=high]`（`xhigh`/`max` → `high`；没填模型就设不了） |
+| 推理强度 | `--effort <level>`（`ultra` → `max`） | `-c model_reasoning_effort="…"` | 模型名括号 `model[effort=high]`（`xhigh`/`max`/`ultra` → `high`；没填模型就设不了） |
+| 速度 | 无（不传） | `-c service_tier="fast"`；子代理层写 `service_tier = "fast"`。模型没声明的档位 codex 自己会告警并忽略 | 无（Fast 是列表里单独的 `-fast` 模型） |
 | 联网 | `WebSearch` / `WebFetch` 进 `--allowedTools` 或 `--disallowedTools` | `-c web_search="live" | "cached" | "disabled"`（不再用 `tools.web_search`） | 只能靠提示 |
 | 读文件 | `Read` / `Grep` / `Glob` 进白名单或黑名单 | 沙箱只读，总是可读 | `--add-dir`，总是可读 |
 | 原生子代理 | `--agents <json>`，并放开 `Agent` / `Task` | `agents.enabled`、`agents.max_concurrent_threads_per_session`、`agents.default_subagent_reasoning_effort`、`agents.<id>.description`、`agents.<id>.config_file` | 不支持（退回单会话） |
+
+macOS 设置里所有填模型的地方（阶段、agent、研究执行卡片、角色）是同一个模型框（2026‑09‑30）：点输入框就弹出该提供方或 CLI 列出的模型，直接输入即过滤——id 以输入开头的排最前，其次是 id 某一段以它开头（`sol` 能找到 `gpt-6.1-sol`）——↑↓ 选、↩ 确认、⎋ 关闭并保留输入。列表第一行「默认 · …」清空字段，写明留空时跑什么。模型跑在 CLI 上时框尾有一个强度 chip（例如「⚡ 高」），点开是滑杆：档位取自 `codex debug models` 里该模型的 `supported_reasoning_levels`（带说明与 `default_reasoning_level`），Fast 取自 `additional_speed_tiers` 与 `service_tiers`；没有逐模型信息的 CLI 用 `effortFor` 能传下去的档位。chip 灰色时显示的是实际生效的回落值：阶段跟随 agent，角色跟随 profile，执行卡片上的 chip 就是 profile 的 `reasoning`，再往下是 `~/.codex/config.toml` 的 `model_reasoning_effort` / `service_tier`（模型列表接口的 `defaults` 字段），最后是模型自己的默认档。API 模型端点不接收强度，框尾不显示 chip。
 
 入口：Settings 页。「Providers & Agents」一页两张表：上面是**模型**——embedding 与 LLM 端点，`connections` 里只放模型端点；下面是 **agent**，每个一份 `playbooks/agents/<name>.yaml`。agent 有两种运行时：`executor` = `claude-cli` | `codex-cli` | `cursor-cli` 时运行那个编码 agent CLI，带自己的 `cliPath`（留空 = 从 PATH 找）、`model` 与 `effort`；其他值则在某个模型上运行进程内的 LangChain `deepagents` 循环——`default` 跟随默认 LLM，连接 id 则固定一个；它跟随的若是 CLI agent，就标为不可运行，而不是顶着自己的名字悄悄去跑那个 CLI。两种之上都有：`tools`、`maxTurns`、`timeoutMs`、`prompt`。内置一个模板：`deep-agent`（deepagents，跟随默认 LLM）。2026‑09‑29 之前还有第二个模板 `deep-research`，它和 `deep-agent` 只差名字与一个只决定选择器排序的 `kind`——研究运行的强度、工具与提示词取自 profile，阶段又是单次调用，两者从来跑得一样——所以删掉了：`loadConfig` 删除仍与出厂内容一致的 `deep-research.yaml`，把引用它的 `research.agent`、`chat.agent`、阶段路由与 profile 角色改成 `deep-agent`；改过的保留为一个普通 agent。`kind` 字段同时去掉，加载时从各 agent 文件里清除。CLI 是 agent，不是模型端点：2026‑09‑28 之前 CLI 是 `connections` 里的行，结果「cursor」成了默认 *LLM*，deep agent 也悄悄跑成了 Cursor。`loadConfig` 会把 CLI 行按原 id 挪成 agent 文件——所以引用过它的路由、`llmUse`、`research.agent` 与角色都照常解析——并回写一次配置；默认若是 CLI，就改到第一个设了模型的模型端点（一个都没有的工作区保留 CLI）。流水线阶段写明自己跑在什么上——一个模型，或一个 agent 的单次调用（`routeTargets`）：CLI agent 就是它自己；deepagents agent 只有自带模型时才算目标，即它所跑端点上的那个模型。没自带模型的 deepagents agent 就是那个端点换了个名字，选择器不再单列它（此前两个内置模板都挨着它们所跑的模型各占一项），`pinRoutes` 把跑在它上面的阶段改到它的端点上。两者都不带自己的循环、工具与提示词。阶段不再跟随默认：选择器原先在 X 自己那一行旁边还列着「默认 LLM 提供方 · X」——同一个端点两个选项，只有默认换了才分得出差别——所以自 2026‑09‑29 起，`pinRoutes` 在加载和每次保存时把继承的路由（`''` / `'default'`）写成它当时所跑的默认，之后换默认不会带走任何阶段。默认本身仍可以是 CLI agent（`llmTargets`），但不能是 deepagents agent，因为它可能跟随默认。运行时字段在问答运行 agent 时生效（见 07 §4.1）；研究运行则从 profile 取，表单上写明了这一点。`GET /api/agents`、`GET/PUT/DELETE /api/agents/:name`；删内置等于重置，删其他会清掉指向它的 `research.agent` / `chat.agent`，把跑在它上面的阶段按名字移到默认，默认若是它则回退。「Research」页管研究本身——选运行任务的 agent、并发与超时、profile，编辑 profile 的强度 / 联网 / 核实 / 停止 / 输出，以及每个角色的 CLI、模型、强度、工具与提示词（另存为新 profile、重置内置）；`GET /api/research/profiles`、`GET/PUT/DELETE /api/research/profiles/:name`（PUT 带 `prompts: {roleId: text}` 会把改动的提示词写成文件，`activate: true` 顺带切换）；`PUT /api/config` 的 `research` 块（agent / model / profile / pipeline / 并发 / 轮数 / 超时 / auto）；`knode-os research profiles`、`knode-os research profile <name> [--use]`。
 

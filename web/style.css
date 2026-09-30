@@ -465,11 +465,11 @@ td.mono { font-size: 12px; }
 .cfg-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .cfg-span-2 { grid-column: span 2; }
 .cfg-card label, .route-card label, .cfg-defaults label, .provider-detail label, .stage-panel label, .stage-control label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: 0.02em; }
-.cfg-card input, .cfg-card select, .route-card input, .route-card select, .cfg-defaults input, .cfg-defaults select, .provider-detail input, .provider-detail select, .stage-panel input, .stage-panel select, .stage-budget input {
+.cfg-card input, .cfg-card select, .route-card input, .route-card select, .cfg-defaults input, .cfg-defaults select, .provider-detail input, .provider-detail select, .stage-panel input, .stage-panel select {
   width: 100%; min-height: 40px; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
   border-radius: 8px; padding: 8px 10px; outline: none; font-size: 12px; font-weight: 400; letter-spacing: normal;
 }
-.cfg-card input:focus, .cfg-card select:focus, .route-card input:focus, .route-card select:focus, .cfg-defaults input:focus, .cfg-defaults select:focus, .provider-detail input:focus, .provider-detail select:focus, .stage-panel input:focus, .stage-panel select:focus, .stage-budget input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.cfg-card input:focus, .cfg-card select:focus, .route-card input:focus, .route-card select:focus, .cfg-defaults input:focus, .cfg-defaults select:focus, .provider-detail input:focus, .provider-detail select:focus, .stage-panel input:focus, .stage-panel select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .cfg-card input:disabled, .cfg-card select:disabled, .route-card input:disabled, .route-card select:disabled, .cfg-defaults input:disabled, .provider-detail input:disabled, .provider-detail select:disabled { opacity: 0.38; cursor: not-allowed; }
 .cfg-check { flex-direction: row !important; align-items: center; gap: 8px !important; color: var(--fg) !important; font-weight: 400 !important; cursor: pointer; }
 .cfg-check input { width: auto !important; min-height: 0 !important; flex: 0 0 auto; margin: 0; accent-color: var(--accent); }
@@ -525,10 +525,6 @@ td.mono { font-size: 12px; }
 .cfg-connections-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; }
 .cfg-card-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 16px 0 8px; }
 .cfg-card-title small { display: block; color: var(--muted); font-size: 11px; font-weight: 400; }
-/* 03 · agents — same row chrome as the providers table, one extra field */
-.agent-prompt textarea { min-height: 120px; resize: vertical; border: 1px solid var(--border-strong); border-radius: 8px; padding: 8px; background: var(--bg); color: var(--fg); font-size: 11px; }
-.agent-prompt textarea:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
-.provider-detail .cfg-checks { display: flex; flex-wrap: wrap; gap: 16px; }
 
 /* the model picker: free text plus a list of what the provider actually offers */
 .model-field { position: relative; display: flex; align-items: center; gap: 4px; }
@@ -587,11 +583,6 @@ td.mono { font-size: 12px; }
 .stage-pin-label { color: var(--muted); font-size: 10px; font-weight: 600; }
 .stage-pin b { font-size: 13px; }
 .stage-pin small { color: #6b7280; font-size: 10px; }
-.stage-budget { display: flex; align-items: center; gap: 16px; border-top: 1px solid var(--border); padding: 15px 18px; }
-.stage-budget > div { flex: 1; }
-.stage-budget b { font-size: 12px; }
-.stage-budget p { margin: 3px 0 0; color: var(--muted); font-size: 10px; }
-.stage-budget input { width: 170px; }
 
 .cfg-connections-head small { display: block; color: var(--muted); font-size: 11px; font-weight: 400; }
 .cfg-connections { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }

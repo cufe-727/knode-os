@@ -19,6 +19,16 @@ import { CLI_COMMANDS, cliCommand, resolveExecutable, runProcess } from './cli.j
 export interface ModelOption {
   id: string;
   label?: string;
+  /**
+   * The reasoning efforts this model accepts, lowest first, when the provider
+   * says — today only `codex debug models` does. Absent = unknown, and the
+   * client offers the CLI's whole ladder instead.
+   */
+  efforts?: Array<{ id: string; description?: string }>;
+  /** The effort it runs at when none is set. */
+  defaultEffort?: string;
+  /** Speeds beyond standard it offers, e.g. `{ id: 'fast', name: 'Fast', description: '2x speed, increased usage' }`. */
+  speeds?: Array<{ id: string; name?: string; description?: string }>;
 }
 
 export interface ModelListResult {
@@ -30,6 +40,19 @@ export interface ModelListResult {
   resolvedPath?: string;
   note?: string;
   error?: string;
+  /**
+   * What the CLI runs when knode names nothing, read off its own config — so
+   * an empty field or a "default" effort can say what it amounts to. Only
+   * codex has a file that says (`~/.codex/config.toml`).
+   */
+  defaults?: CliDefaults;
+}
+
+export interface CliDefaults {
+  model?: string;
+  effort?: string;
+  /** 'fast' when the CLI asks for its priority tier on its own. */
+  speed?: string;
 }
 
 const LIST_TIMEOUT_MS = 60_000;
@@ -178,6 +201,7 @@ export function parseClaudeAliases(help: string): string[] {
  * `~/.codex/config.toml` names — which is all knode could ever see before.
  */
 async function listCodexModels(command: string): Promise<ModelListResult> {
+  const defaults = codexDefaults();
   try {
     const { code, stdout, stderr } = await runProcess(command, ['debug', 'models'], '', LIST_TIMEOUT_MS);
     if (code !== 0) throw new Error((stderr || stdout).trim().slice(0, 200) || `exited with code ${code}`);
@@ -187,17 +211,62 @@ async function listCodexModels(command: string): Promise<ModelListResult> {
       ok: true,
       source: 'cli',
       models,
-      note: 'From `codex debug models`. The second column is the reasoning effort each model accepts. Leave the field empty to use the CLI default.',
+      // no note: the source says where the list came from, and the list's
+      // first row says what an empty field runs
+      ...(defaults ? { defaults } : {}),
     };
   } catch (e) {
-    return codexConfiguredModels(message(e));
+    return { ...codexConfiguredModels(message(e)), ...(defaults ? { defaults } : {}) };
   }
+}
+
+const CODEX_CONFIG = () => path.join(os.homedir(), '.codex', 'config.toml');
+
+function codexDefaults(): CliDefaults | undefined {
+  try {
+    return parseCodexDefaults(fs.readFileSync(CODEX_CONFIG(), 'utf8'));
+  } catch {
+    return undefined; // no config file: the CLI's built-in defaults, which nothing here can name
+  }
+}
+
+/**
+ * The model, effort and tier `codex exec` falls back to, from its config: the
+ * top-level keys, overridden by the `[profiles.<name>]` a top-level `profile`
+ * selects. Undefined when the file sets none of them.
+ */
+export function parseCodexDefaults(toml: string): CliDefaults | undefined {
+  const top: Record<string, string> = {};
+  const profiles: Record<string, Record<string, string>> = {};
+  let section: Record<string, string> | null = top;
+  for (const line of toml.split('\n')) {
+    const header = /^\s*\[([^\]]+)\]/.exec(line);
+    if (header) {
+      const profile = /^profiles\.(.+)$/.exec(header[1].trim());
+      section = profile ? (profiles[profile[1].replace(/^["']|["']$/g, '')] ??= {}) : null;
+      continue;
+    }
+    const pair = /^\s*([A-Za-z_]+)\s*=\s*["']([^"']*)["']/.exec(line);
+    if (pair && section) section[pair[1]] = pair[2];
+  }
+  const merged = { ...top, ...(top.profile ? profiles[top.profile] : undefined) };
+  const out: CliDefaults = {};
+  if (merged.model) out.model = merged.model;
+  if (merged.model_reasoning_effort) out.effort = merged.model_reasoning_effort;
+  // 'priority' is the id the catalog gives the tier it names Fast
+  if (merged.service_tier === 'fast' || merged.service_tier === 'priority') out.speed = 'fast';
+  return Object.keys(out).length ? out : undefined;
 }
 
 /**
  * The listable models in a `codex debug models` payload, in the order the CLI
  * ranks them. `hide` covers the catalog's internal entries — a reserve model,
  * the one auto-review runs on — which the CLI does not offer either.
+ *
+ * Each keeps what the effort control needs from its entry: the levels it
+ * accepts, the one it defaults to, and the speed tiers beyond standard. The
+ * tier is named the way `additional_speed_tiers` names it (`fast`) — what
+ * `service_tier` takes — and described by the matching `service_tiers` entry.
  */
 export function parseCodexCatalog(stdout: string): ModelOption[] {
   const start = stdout.indexOf('{');
@@ -211,17 +280,27 @@ export function parseCodexCatalog(stdout: string): ModelOption[] {
     const model = row as Record<string, unknown>;
     const id = typeof model.slug === 'string' ? model.slug : '';
     if (!id || model.visibility === 'hide') continue;
-    const name = typeof model.display_name === 'string' && model.display_name ? model.display_name : id;
-    const efforts = Array.isArray(model.supported_reasoning_levels)
-      ? model.supported_reasoning_levels.flatMap((level) => {
-        const effort = level && typeof level === 'object' ? (level as { effort?: unknown }).effort : undefined;
-        return typeof effort === 'string' && effort ? [effort] : [];
-      })
-      : [];
-    // The levels ride in the label because the model list and the effort field
-    // are two separate controls: this is how picking one tells you the other.
-    const label = efforts.length ? `${name} · effort ${efforts[0]}–${efforts[efforts.length - 1]}` : name;
-    ranked.push({ option: { id, label }, priority: typeof model.priority === 'number' ? model.priority : Number.MAX_SAFE_INTEGER });
+    const label = typeof model.display_name === 'string' && model.display_name ? model.display_name : id;
+    const option: ModelOption = { id, label };
+    const efforts = records(model.supported_reasoning_levels).flatMap((level) =>
+      typeof level.effort === 'string' && level.effort
+        ? [{ id: level.effort, ...(typeof level.description === 'string' && level.description ? { description: level.description } : {}) }]
+        : [],
+    );
+    if (efforts.length) option.efforts = efforts;
+    if (typeof model.default_reasoning_level === 'string' && model.default_reasoning_level) option.defaultEffort = model.default_reasoning_level;
+    const tiers = records(model.service_tiers);
+    const speeds = (Array.isArray(model.additional_speed_tiers) ? model.additional_speed_tiers : []).flatMap((speed) => {
+      if (typeof speed !== 'string' || !speed) return [];
+      const tier = tiers.find((t) => typeof t.name === 'string' && t.name.toLowerCase() === speed.toLowerCase());
+      return [{
+        id: speed,
+        ...(typeof tier?.name === 'string' ? { name: tier.name } : {}),
+        ...(typeof tier?.description === 'string' && tier.description ? { description: tier.description } : {}),
+      }];
+    });
+    if (speeds.length) option.speeds = speeds;
+    ranked.push({ option, priority: typeof model.priority === 'number' ? model.priority : Number.MAX_SAFE_INTEGER });
   }
   ranked.sort((a, b) => a.priority - b.priority || a.option.id.localeCompare(b.option.id));
   return ranked.map((r) => r.option);
@@ -229,7 +308,7 @@ export function parseCodexCatalog(stdout: string): ModelOption[] {
 
 /** What `~/.codex/config.toml` selects: the default model and any per-profile one. */
 function codexConfiguredModels(reason: string): ModelListResult {
-  const file = path.join(os.homedir(), '.codex', 'config.toml');
+  const file = CODEX_CONFIG();
   const models: ModelOption[] = [];
   try {
     const toml = fs.readFileSync(file, 'utf8');
@@ -254,6 +333,11 @@ function codexConfiguredModels(reason: string): ModelListResult {
       ? `\`codex debug models\` did not answer (${reason}), so these are the models ~/.codex/config.toml selects. Leave the field empty to use the CLI default.`
       : `\`codex debug models\` did not answer (${reason}) and ~/.codex/config.toml sets no model. Leave the field empty to use the CLI default.`,
   };
+}
+
+/** The objects in what should be an array of them. */
+function records(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value) ? value.filter((v): v is Record<string, unknown> => Boolean(v) && typeof v === 'object') : [];
 }
 
 function message(e: unknown): string {

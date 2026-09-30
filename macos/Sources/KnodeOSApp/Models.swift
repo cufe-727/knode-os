@@ -600,8 +600,9 @@ struct LLMConfig: Codable, Equatable {
 }
 
 /// A pipeline route. `use` names the connection it runs on — empty for the
-/// default provider — and `model` overrides that connection's own model. The
-/// remaining fields only carry pre-connections configs the service migrates.
+/// default provider — and `model`, `effort` and `speed` override that
+/// target's own ("default" keeps the target's). The remaining fields only
+/// carry pre-connections configs the service migrates.
 struct RoutedLLMConfig: Codable, Equatable {
     var use: String
     var provider: String
@@ -609,6 +610,8 @@ struct RoutedLLMConfig: Codable, Equatable {
     var apiKey: String
     var model: String
     var cliPath: String
+    var effort: String
+    var speed: String
     var cliTimeoutMs: Int?
 
     init(from decoder: any Decoder) throws {
@@ -619,6 +622,8 @@ struct RoutedLLMConfig: Codable, Equatable {
         apiKey = try container.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
         cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? ""
+        effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? "default"
+        speed = try container.decodeIfPresent(String.self, forKey: .speed) ?? "default"
         cliTimeoutMs = try container.decodeIfPresent(Int.self, forKey: .cliTimeoutMs)
     }
 }
@@ -634,6 +639,9 @@ struct LLMConnection: Codable, Equatable, Identifiable {
     var cliPath: String
     /// See `LLMConfig.effort`.
     var effort: String
+    /// "fast" = codex's priority tier; "default" leaves the CLI's own. Only a
+    /// CLI agent standing in as a target carries anything else.
+    var speed: String
     var cliTimeoutMs: Int?
 
     init(id: String, label: String, provider: String = "openai") {
@@ -645,6 +653,7 @@ struct LLMConnection: Codable, Equatable, Identifiable {
         model = ""
         cliPath = ""
         effort = "default"
+        speed = "default"
         cliTimeoutMs = nil
     }
 
@@ -658,6 +667,7 @@ struct LLMConnection: Codable, Equatable, Identifiable {
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
         cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? ""
         effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? "default"
+        speed = try container.decodeIfPresent(String.self, forKey: .speed) ?? "default"
         cliTimeoutMs = try container.decodeIfPresent(Int.self, forKey: .cliTimeoutMs)
     }
 }
@@ -685,7 +695,6 @@ struct IngestConfig: Codable, Equatable {
 }
 
 struct ExtractionConfig: Codable, Equatable {
-    var dailyTokenBudget: Int
     var claims: Bool
     var entityLlm: RoutedLLMConfig
     var conceptLlm: RoutedLLMConfig
@@ -870,30 +879,24 @@ let cliProviderNames = ["claude-cli", "codex-cli", "cursor-cli"]
 /// A named agent: who runs a research job or a chat turn, and how hard they
 /// think. How the research itself is conducted stays in the profile.
 struct AgentDefinition: Codable, Equatable, Identifiable {
+    /// Web tools in Ask, within `review.external`. Ask's turn cap, timeout,
+    /// page and file tools are its own, the same for every agent.
     struct Tools: Codable, Equatable {
-        var write: Bool
-        var files: Bool
         /// "inherit" | "on" | "off"
         var web: String
 
-        init(write: Bool = false, files: Bool = true, web: String = "inherit") {
-            self.write = write
-            self.files = files
+        init(web: String = "inherit") {
             self.web = web
         }
 
         init(from decoder: any Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            let fallback = Tools()
-            write = try container.decodeIfPresent(Bool.self, forKey: .write) ?? fallback.write
-            files = try container.decodeIfPresent(Bool.self, forKey: .files) ?? fallback.files
-            web = try container.decodeIfPresent(String.self, forKey: .web) ?? fallback.web
+            web = try container.decodeIfPresent(String.self, forKey: .web) ?? Tools().web
         }
     }
 
     var name: String
     var title: String
-    var description: String
     /// A CLI provider name runs that CLI; "default" or a connection id runs
     /// the built-in deepagents loop on that model.
     var executor: String
@@ -901,11 +904,9 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
     var cliPath: String
     var model: String
     var effort: String
+    /// "fast" = codex's priority tier; the other CLIs ignore it.
+    var speed: String
     var tools: Tools
-    /// 0 = the caller's own default.
-    var maxTurns: Int
-    var timeoutMs: Int
-    var prompt: String
     var path: String
     /// Server-reported, never sent back.
     var builtin: Bool
@@ -916,16 +917,12 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
     init(name: String, executor: String = "default") {
         self.name = name
         title = name
-        description = ""
         self.executor = executor
         cliPath = ""
         model = ""
         effort = "default"
-        // what Ask needs to take notes; a CLI answers with its own tools anyway
-        tools = Tools(write: true, files: true, web: "inherit")
-        maxTurns = 0
-        timeoutMs = 0
-        prompt = ""
+        speed = "default"
+        tools = Tools()
         path = ""
         builtin = false
         runnable = false
@@ -935,15 +932,12 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         name = try container.decode(String.self, forKey: .name)
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? name
-        description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
         executor = try container.decodeIfPresent(String.self, forKey: .executor) ?? ""
         cliPath = try container.decodeIfPresent(String.self, forKey: .cliPath) ?? ""
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
         effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? "default"
+        speed = try container.decodeIfPresent(String.self, forKey: .speed) ?? "default"
         tools = try container.decodeIfPresent(Tools.self, forKey: .tools) ?? Tools()
-        maxTurns = try container.decodeIfPresent(Int.self, forKey: .maxTurns) ?? 0
-        timeoutMs = try container.decodeIfPresent(Int.self, forKey: .timeoutMs) ?? 0
-        prompt = try container.decodeIfPresent(String.self, forKey: .prompt) ?? ""
         path = try container.decodeIfPresent(String.self, forKey: .path) ?? ""
         builtin = try container.decodeIfPresent(Bool.self, forKey: .builtin) ?? false
         runnable = try container.decodeIfPresent(Bool.self, forKey: .runnable) ?? false
@@ -952,20 +946,16 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
     /// What `PUT /api/agents/:name` takes: the server owns `builtin`/`runnable`/`path`.
     struct Payload: Encodable {
         var title: String
-        var description: String
         var executor: String
         var cliPath: String
         var model: String
         var effort: String
+        var speed: String
         var tools: Tools
-        var maxTurns: Int
-        var timeoutMs: Int
-        var prompt: String
     }
 
     var payload: Payload {
-        Payload(title: title, description: description, executor: executor, cliPath: cliPath, model: model,
-                effort: effort, tools: tools, maxTurns: maxTurns, timeoutMs: timeoutMs, prompt: prompt)
+        Payload(title: title, executor: executor, cliPath: cliPath, model: model, effort: effort, speed: speed, tools: tools)
     }
 
     /// Runs a coding-agent CLI, rather than deepagents on a model.
@@ -979,6 +969,7 @@ struct AgentDefinition: Codable, Equatable, Identifiable {
         target.model = model
         target.cliPath = cliPath
         target.effort = effort
+        target.speed = speed
         return target
     }
 
@@ -1105,6 +1096,24 @@ struct ConfigTestResponse: Decodable {
 struct ModelOption: Decodable, Identifiable, Hashable {
     var id: String
     var label: String?
+    /// The reasoning efforts it accepts, lowest first — only when the
+    /// provider says (codex's catalog). Nil = unknown: the CLI's own ladder.
+    var efforts: [EffortOption]?
+    /// The level it runs at when none is set.
+    var defaultEffort: String?
+    /// Speeds beyond standard it offers, e.g. codex's Fast tier.
+    var speeds: [SpeedOption]?
+}
+
+struct EffortOption: Decodable, Hashable {
+    var id: String
+    var description: String?
+}
+
+struct SpeedOption: Decodable, Hashable {
+    var id: String
+    var name: String?
+    var description: String?
 }
 
 struct ModelListResponse: Decodable {
@@ -1119,6 +1128,17 @@ struct ModelListResponse: Decodable {
     /// True when the service answered from its own cache rather than the provider.
     var cached: Bool?
     var cachedAt: String?
+    /// What the CLI runs when nothing is named, from its own config file.
+    var defaults: CliDefaults?
+}
+
+/// A CLI's own defaults (codex's `~/.codex/config.toml`), so an empty model
+/// field or a "default" effort can show what it comes to.
+struct CliDefaults: Decodable, Hashable {
+    var model: String?
+    var effort: String?
+    /// "fast" when the CLI asks for its priority tier on its own.
+    var speed: String?
 }
 
 /**
@@ -1220,6 +1240,8 @@ struct ResearchRole: Codable, Equatable, Identifiable {
     var model: String
     /// "default" = the profile's reasoning effort.
     var effort: String
+    /// "default" = the profile's speed; "fast" = codex's priority tier.
+    var speed: String
     var tools: Tools
     /// research phase: parallel sessions (0 = the runner's fan-out).
     var parallel: Int
@@ -1239,7 +1261,7 @@ struct ResearchRole: Codable, Equatable, Identifiable {
     var promptDefault: String
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, phase, enabled, agent, model, effort, tools, parallel, rounds, maxTurns, prompt, native, description
+        case id, title, phase, enabled, agent, model, effort, speed, tools, parallel, rounds, maxTurns, prompt, native, description
         case promptPath, promptText, promptIsDefault, promptDefault
     }
 
@@ -1251,6 +1273,7 @@ struct ResearchRole: Codable, Equatable, Identifiable {
         agent = ""
         model = ""
         effort = "default"
+        speed = "default"
         tools = Tools(write: phase == "synthesize" || phase == "revise", files: true, web: "inherit")
         parallel = 0
         rounds = 0
@@ -1273,6 +1296,7 @@ struct ResearchRole: Codable, Equatable, Identifiable {
         agent = try c.decodeIfPresent(String.self, forKey: .agent) ?? ""
         model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
         effort = try c.decodeIfPresent(String.self, forKey: .effort) ?? "default"
+        speed = try c.decodeIfPresent(String.self, forKey: .speed) ?? "default"
         tools = try c.decodeIfPresent(Tools.self, forKey: .tools) ?? Tools(write: false, files: true, web: "inherit")
         parallel = try c.decodeIfPresent(Int.self, forKey: .parallel) ?? 0
         rounds = try c.decodeIfPresent(Int.self, forKey: .rounds) ?? 0
@@ -1295,6 +1319,7 @@ struct ResearchRole: Codable, Equatable, Identifiable {
         try c.encode(agent, forKey: .agent)
         try c.encode(model, forKey: .model)
         try c.encode(effort, forKey: .effort)
+        try c.encode(speed, forKey: .speed)
         try c.encode(tools, forKey: .tools)
         try c.encode(parallel, forKey: .parallel)
         try c.encode(rounds, forKey: .rounds)
@@ -1308,8 +1333,21 @@ struct ResearchRole: Codable, Equatable, Identifiable {
 /// `playbooks/research/profiles/<name>.yaml` as the service resolved it.
 struct ResearchProfileDetail: Codable, Equatable {
     struct Reasoning: Codable, Equatable {
-        /// default | low | medium | high | xhigh | max
+        /// default | low | medium | high | xhigh | max | ultra
         var effort: String
+        /// default | fast
+        var speed: String
+
+        init(effort: String = "default", speed: String = "default") {
+            self.effort = effort
+            self.speed = speed
+        }
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            effort = try c.decodeIfPresent(String.self, forKey: .effort) ?? "default"
+            speed = try c.decodeIfPresent(String.self, forKey: .speed) ?? "default"
+        }
     }
 
     struct Search: Codable, Equatable {

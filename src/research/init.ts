@@ -17,7 +17,7 @@ import { HUMAN_NOTES_HEADING, RunWorkspace } from './workspace.js';
  * agent run:
  *
  *   prepareInit    before the agent: reconcile sources, drain tier-1 extraction
- *                  (within budget and a time cap), regenerate the deterministic
+ *                  (within a time cap), regenerate the deterministic
  *                  views, survey the base. Each step lands on the job's payload
  *                  so the UI can show where a run is.
  *   topicsFrom     the planner's `topics` → follow-up pages worth their own job
@@ -57,7 +57,7 @@ function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** Run tier-1 extraction until the queue is empty, the budget is gone, nothing moves, or the time cap hits. */
+/** Run tier-1 extraction until the queue is empty, nothing moves, or the time cap hits. */
 export async function drainTier1(ctx: AppContext, opts: { maxMs: number; log: (m: string) => void }): Promise<StepOutcome<void>> {
   const { config, store } = ctx;
   const entityLlm = config.extraction.entityLlm
@@ -79,10 +79,6 @@ export async function drainTier1(ctx: AppContext, opts: { maxMs: number; log: (m
     processed += st.processed;
     failed += st.failed;
     if (st.queued === 0) break;
-    if (st.budgetLeft <= 0) {
-      reason = 'daily token budget exhausted';
-      break;
-    }
     if (st.processed === 0 && st.failed === 0) {
       reason = 'no progress';
       break;

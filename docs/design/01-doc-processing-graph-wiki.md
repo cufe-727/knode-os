@@ -29,7 +29,7 @@ scan → sha256 diff → chunk → embed → tsvector → wikilink 布线 → [�
 
 1. **LLM 抽取与摄入耦合**：旧版在 ingest 同步路径上对每个
    `raw/docs` 文档做一次全文抽取。文档量到十万级时，成本和时延都不可接受，
-   且没有预算控制、没有优先级。
+   且没有节流、没有优先级。
 2. **抽取结果只存在于 DB**：`.knode/` 被定义为"可随时删除重建"，但重建意味着
    重新支付全部 LLM 抽取成本——在海量场景下这个"可弃"承诺实际上失效了。
 3. **没有使用反馈回路**：文档/块被检索命中多少次、何时被用过，系统完全不知道，
@@ -38,7 +38,7 @@ scan → sha256 diff → chunk → embed → tsvector → wikilink 布线 → [�
 本设计的目标：
 
 - 每个文档上传后**立即可检索**（秒级，零 LLM）；
-- LLM 成本**按热度分层投放**，有全局预算约束；
+- LLM 成本**按热度分层投放**；
 - 抽取结果**持久化在文件层（sidecar）**，DB 重建不重付 LLM 成本；
 - 使用统计（时间、热度）沉淀到 sidecar 并**反映到 wiki**；
 - 存储与图算法为十万–百万级预留扩展路径。
@@ -102,7 +102,7 @@ flowchart TD
     t0 --> sidecar1[写 sidecar：元信息 + Tier0 抽取结果]
     sidecar1 --> queue[抽取优先级队列 extraction_queue]
 
-    subgraph t1 [Tier 1 异步 · 廉价 LLM · 按预算与热度调度]
+    subgraph t1 [Tier 1 异步 · 廉价 LLM · 按热度调度]
         extract["实体/关系抽取（LightRAG 式单次提取）"]
         extract --> merge[实体消歧 + 扁平图集合合并]
     end
@@ -139,7 +139,7 @@ flowchart TD
 实现上，Tier 0 = 现有 `ingestAll`/增量 ingest 减去 `extractWithLlm`，加上
 NLP 概念抽取与 sidecar 写入。
 
-### 2.3 Tier 1 — 异步实体/关系抽取（廉价 LLM，预算调度）
+### 2.3 Tier 1 — 异步实体/关系抽取（廉价 LLM，按热度调度）
 
 把现在同步路径上的 `extractWithLlm` 挪到后台队列：
 
@@ -151,9 +151,9 @@ NLP 概念抽取与 sidecar 写入。
     还没被查询过而永远排不上；
   - 重要性：可配的静态权重（如 `raw/docs` > `raw/skills`；未来可按目录/
     frontmatter 标记）。
-- **预算**：`extraction.dailyTokenBudget` 约束每日 LLM 用量。预算耗尽即停，
-  明天从队首继续。百万级语料下这意味着图谱按"被用的顺序"渐进变密，而不是
-  一次性付清。
+- **节奏**：每 `intervalMinutes` 分钟一轮，每轮出队 `batchSize` 篇，没有每日
+  token 预算（`extraction.dailyTokenBudget` 已于 2026-09-30 移除）。按优先级
+  出队，百万级语料下图谱按"被用的顺序"渐进变密。
 - **抽取本身**：沿用现有 prompt 结构（10 实体类型 / 8 关系类型），按 LightRAG
   方式对 chunk 批量单次提取，结果做名称/别名消歧后**集合并入**全局
   `entities`/`relations`（现有 upsert 逻辑已是合并语义，`mention_count`、
@@ -197,7 +197,7 @@ sequenceDiagram
     P->>S: 写 meta + extraction.tier0
     P->>Q: 入队（初始新鲜度 boost）
     Note over D: 文档此刻已可检索
-    Q->>P: 预算内按优先级出队
+    Q->>P: 按优先级出队一批
     P->>P: Tier 1 LLM 实体/关系抽取
     P->>D: entities/relations 集合合并
     P->>S: 回写 extraction.tier1
@@ -389,7 +389,7 @@ sidecar 的 `usage` 字段。DB 与 sidecar 之间，DB 是实时账本、sideca
   （wiki、skills 不变）；新增 raw→cooked 归一化步骤；移除同步
   `extractWithLlm` 调用，改为入队。
 - `src/server/serve.ts`：watcher 监听 raw/docs 触发归一化 + Tier 0；新增
-  Tier 1 预算循环与 stats 回刷定时任务；Tier 2 挂在 dream 调度器旁。
+  Tier 1 抽取循环与 stats 回刷定时任务；Tier 2 挂在 dream 调度器旁。
 - `src/store/db.ts`：新增 `chunk_stats`/`doc_stats`/`extraction_queue` 三表。
 - `src/search/search.ts`、`src/search/ask.ts`、`src/graph/query.ts`：命中后
   异步记账；RRF 热度微调。
@@ -417,8 +417,8 @@ sidecar 的 `usage` 字段。DB 与 sidecar 之间，DB 是实时账本、sideca
 - **图查询**：BFS 保持 3–4 hop 上限（现有 hop decay 0.5 不变）；`relations`
   按 `source_id`/`target_id` 已有索引；百万级实体时一切社区计算只跑热点诱导
   子图（Tier 2），永不全图 Leiden。
-- **抽取预算与并发**：Tier 1 按 batch 出队、并发调用受 `batchSize` 与预算双重
-  约束；失败重试计入 `attempts`，超限落 `failed` 并保留在 sidecar 供人工排查。
+- **抽取节奏与并发**：Tier 1 按 batch 出队，每轮文档数受 `batchSize`、并发调用
+  受 `concurrency` 约束；失败重试计入 `attempts`，超限落 `failed` 并保留在 sidecar 供人工排查。
 - **增量与幂等**：沿用 sha256 diff；`contentSha` 使 Tier 1 结果在内容不变时
   永久复用；sidecar 原子写保证崩溃安全。
 - **NLP 概念抽取的语言问题**：CJK 名词短语提取质量有限，首期用
@@ -430,7 +430,6 @@ sidecar 的 `usage` 字段。DB 与 sidecar 之间，DB 是实时账本、sideca
 ```jsonc
 {
   "extraction": {
-    "dailyTokenBudget": 2000000,   // Tier 1+2 每日 LLM token 预算
     "tier1Model": "",              // 空 = 沿用 llm.model；建议廉价模型
     "tier2Model": "",              // 空 = 沿用 llm.model；建议高能力模型
     "freshnessBoostDays": 3,       // 新文档优先级 boost 衰减期
@@ -485,7 +484,7 @@ GraphRAG 把 claim 抽取做成独立 workflow（额外一轮 LLM，默认关闭
 
 | 方面 | 旧版 | 本设计（已实现） |
 | --- | --- | --- |
-| LLM 抽取时机 | ingest 同步路径，逐文档全付 | 异步队列，预算 + 热度调度 |
+| LLM 抽取时机 | ingest 同步路径，逐文档全付 | 异步队列，按热度调度 |
 | 抽取结果持久层 | 仅 DB（重建即重付） | sidecar 文件（重建免 LLM） |
 | 零 LLM 图信号 | 仅 wikilink | wikilink + NLP 概念共现图（全覆盖） |
 | 社区/全局摘要 | 无 | Tier 2 热点子图社区摘要 → wiki 页 |

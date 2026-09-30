@@ -12,6 +12,12 @@ import SwiftUI
  * research itself does — effort bar, verification, roles — stays on the
  * Research tab, because that is a property of the research and not of who
  * runs it.
+ *
+ * So an agent's form is short: who runs, on what model, how hard a CLI
+ * thinks and whether Ask may give it the web. It used to hold a turn cap, a
+ * timeout, tools, a prompt and a description too — only Ask read them, and
+ * Ask now runs every agent the same way — and a "Make default" link: a
+ * workspace with no model makes its first CLI agent the default by itself.
  */
 struct AgentsSettingsSection: View {
     @Binding var agents: [AgentDefinition]
@@ -23,14 +29,11 @@ struct AgentsSettingsSection: View {
     let connections: [LLMConnection]
     /// What the default is right now in the draft: a model, or a CLI agent.
     let defaultTarget: LLMConnection?
-    let llmUse: String
     let cliTools: [String: CliTool]
     let isWorking: Bool
     /// "deepagents", or the CLI a new agent runs.
     let add: (String) -> Void
     let remove: (AgentDefinition) -> Void
-    /// Jobs that name no model run on this CLI agent, one-shot.
-    let makeDefault: (String) -> Void
     let loadModels: (AgentDefinition, Bool) async throws -> ModelListResponse
 
     @State private var expanded: Set<String> = []
@@ -176,167 +179,83 @@ struct AgentsSettingsSection: View {
     /// The built-in loop runs inside the service on a model from the table
     /// above: which one, and which of its models.
     private func deepagentsFields(index: Int, agent: AgentDefinition) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-                GridRow {
-                    FieldLabel(L("Runs on")) {
-                        Picker(L("Runs on"), selection: $agents[index].executor) {
-                            Text(defaultOption).tag(ResearchSettingsSection.defaultConnection)
-                            ForEach(connections) { connection in
-                                Text(connectionName(connection)).tag(connection.id)
-                            }
+        Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+            GridRow {
+                FieldLabel(L("Runs on")) {
+                    Picker(L("Runs on"), selection: $agents[index].executor) {
+                        Text(defaultOption).tag(ResearchSettingsSection.defaultConnection)
+                        ForEach(connections) { connection in
+                            Text(connectionName(connection)).tag(connection.id)
                         }
-                        .labelsHidden()
                     }
-                    ModelField(
-                        placeholder: L("Its own default"),
-                        text: $agents[index].model,
-                        inherited: modelEndpoint(agent)?.model ?? "",
-                        providerKey: agent.executor,
-                        route: "agent:\(agent.executor)",
-                        load: { refresh in try await loadModels(agents[index], refresh) }
-                    )
+                    .labelsHidden()
                 }
-                GridRow {
-                    Text(L("The built-in deepagents loop runs inside the service on this model. It has no reasoning-effort switch and no web tool."))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .gridCellColumns(2)
-                }
-                limitsRow(index: index)
-                descriptionRow(index: index)
+                ModelField(
+                    placeholder: L("Its own default"),
+                    text: $agents[index].model,
+                    inherited: modelEndpoint(agent)?.model ?? "",
+                    providerKey: agent.executor,
+                    route: "agent:\(agent.executor)",
+                    load: { refresh in try await loadModels(agents[index], refresh) }
+                )
             }
-            toolToggles(index: index)
-            promptEditor(index: index, agent: agent)
         }
     }
 
-    /// A CLI brings its own loop: which one, where it is, its model and how
-    /// hard it thinks — what the models table used to hold for it.
+    /// A CLI brings its own loop: which one, its model, how hard it thinks and
+    /// whether Ask may give it the web — and where it is, when that is needed.
     private func cliFields(index: Int, agent: AgentDefinition) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-                GridRow {
-                    FieldLabel(L("CLI")) {
-                        Picker(L("CLI"), selection: $agents[index].executor) {
-                            ForEach(cliProviderNames, id: \.self) { provider in
-                                Text(providerName(provider)).tag(provider)
-                            }
+        Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+            GridRow {
+                FieldLabel(L("CLI")) {
+                    Picker(L("CLI"), selection: $agents[index].executor) {
+                        ForEach(cliProviderNames, id: \.self) { provider in
+                            Text(providerName(provider)).tag(provider)
                         }
-                        .labelsHidden()
                     }
-                    ModelField(
-                        placeholder: L("Use CLI default"),
-                        text: $agents[index].model,
-                        providerKey: "\(agent.executor)|\(agent.cliPath)",
-                        route: "agent:\(agent.executor)",
-                        load: { refresh in try await loadModels(agents[index], refresh) }
-                    )
+                    .labelsHidden()
                 }
-                GridRow {
-                    FieldLabel(L("Reasoning effort")) {
-                        Picker(L("Reasoning effort"), selection: $agents[index].effort) {
-                            ForEach(EffortLevel.all, id: \.0) { Text(L($0.1)).tag($0.0) }
-                        }
-                        .labelsHidden()
+                // how hard and how fast sit at the model's end, as everywhere
+                // a model runs on a CLI
+                ModelField(
+                    placeholder: L("Use CLI default"),
+                    text: $agents[index].model,
+                    providerKey: "\(agent.executor)|\(agent.cliPath)",
+                    route: "agent:\(agent.executor)",
+                    load: { refresh in try await loadModels(agents[index], refresh) },
+                    tuning: ModelTuning(effort: $agents[index].effort, speed: $agents[index].speed, runtime: agent.executor)
+                )
+            }
+            GridRow {
+                FieldLabel(L("Web access")) {
+                    Picker(L("Web access"), selection: $agents[index].tools.web) {
+                        Text(L("Follow review.external")).tag("inherit")
+                        Text(L("On (within review.external)")).tag("on")
+                        Text(L("Off")).tag("off")
                     }
-                    FieldLabel(L("Web access")) {
-                        Picker(L("Web access"), selection: $agents[index].tools.web) {
-                            Text(L("Follow review.external")).tag("inherit")
-                            Text(L("On (within review.external)")).tag("on")
-                            Text(L("Off")).tag("off")
-                        }
-                        .labelsHidden()
-                    }
+                    .labelsHidden()
                 }
+            }
+            if needsPath(agent) {
                 GridRow {
                     CliExecutableField(tool: cliTools[agent.executor], path: $agents[index].cliPath)
                         .gridCellColumns(2)
                 }
-                GridRow {
-                    Text(llmProviderNote(agent.executor))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .gridCellColumns(2)
-                }
-                limitsRow(index: index)
-                descriptionRow(index: index)
-            }
-            toolToggles(index: index)
-            promptEditor(index: index, agent: agent)
-            if agent.name != llmUse {
-                HStack(spacing: 8) {
-                    Button(L("Make default")) { makeDefault(agent.name) }
-                        .buttonStyle(.link)
-                    Text(L("Jobs that name no model run on this CLI instead, one call at a time — for a machine with no model endpoint."))
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                }
             }
         }
     }
 
-    private func limitsRow(index: Int) -> some View {
-        GridRow {
-            FieldLabel(L("Turns per session")) {
-                TextField(L("0 = the caller's default"), value: $agents[index].maxTurns, format: .number)
-            }
-            FieldLabel(L("Timeout (minutes)")) {
-                TextField(L("0 = the caller's default"), value: timeoutMinutes(index), format: .number)
-            }
-        }
-    }
-
-    private func descriptionRow(index: Int) -> some View {
-        GridRow {
-            FieldLabel(L("Description")) {
-                TextField(L("When to pick this agent"), text: $agents[index].description)
-            }
-            .gridCellColumns(2)
-        }
-    }
-
-    private func toolToggles(index: Int) -> some View {
-        HStack(spacing: 18) {
-            Toggle(L("Writes pages (knode_write / knode_commit)"), isOn: $agents[index].tools.write)
-                .toggleStyle(.checkbox)
-            Toggle(L("Reads files (Read / Grep / Glob)"), isOn: $agents[index].tools.files)
-                .toggleStyle(.checkbox)
-        }
-    }
-
-    private func promptEditor(index: Int, agent: AgentDefinition) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(L("System prompt")).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-            TextEditor(text: $agents[index].prompt)
-                .font(.system(size: 11, design: .monospaced))
-                .frame(height: 120)
-                .padding(6)
-                .background(Color.black.opacity(0.22), in: RoundedRectangle(cornerRadius: 8))
-                .overlay { RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)) }
-            Text(L("Empty = the protocol the run workspace already carries. Stored at %@.", agent.path))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            // who reads the settings above: saying so beats a form that
-            // silently does nothing for one of its two callers
-            Text(L("Ask runs with these settings. A research run takes effort, turns, timeout, tools and prompt from its profile under Research instead."))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
+    /// A CLI the service finds on PATH needs no path, and the row's hover
+    /// already says where it is. The field shows when it is missing, or when a
+    /// path is pinned — which then offers the way back to PATH.
+    private func needsPath(_ agent: AgentDefinition) -> Bool {
+        !agent.cliPath.isEmpty || cliTools[agent.executor].map { $0.path == nil } ?? false
     }
 
     // MARK: - Row summaries
 
     private func typeName(_ agent: AgentDefinition) -> String {
-        switch agent.executor {
-        case "claude-cli": "Claude Code"
-        case "codex-cli": "Codex"
-        case "cursor-cli": "Cursor"
-        default: Self.deepagents
-        }
+        cliProductName(agent.executor) ?? Self.deepagents
     }
 
     private func modelEndpoint(_ agent: AgentDefinition) -> LLMConnection? {
@@ -380,12 +299,27 @@ struct AgentsSettingsSection: View {
                 text = agent.isCli ? L("CLI default") : L("Its own default")
             }
         }
-        return Text(text)
-            .font(.system(size: 11, design: .monospaced))
-            .foregroundStyle(agent.model.isEmpty ? .tertiary : .secondary)
-            .lineLimit(1)
-            .truncationMode(.middle)
-            .help(help)
+        // the effort and Fast a CLI agent sets, the way its model field's chip shows them
+        let effort = agent.isCli && agent.effort != "default" ? EffortLevel.name(agent.effort) : nil
+        let fast = agent.isCli && agent.speed == "fast"
+        return HStack(spacing: 4) {
+            Text(text)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(agent.model.isEmpty ? .tertiary : .secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if effort != nil || fast {
+                HStack(spacing: 2) {
+                    if fast { Image(systemName: "bolt.fill").font(.system(size: 8, weight: .bold)) }
+                    if let effort { Text(effort) }
+                }
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize()
+            }
+        }
+        .help(help)
     }
 
     /// Why this agent cannot run, in words that say what to change.
@@ -412,14 +346,6 @@ struct AgentsSettingsSection: View {
     /// A provider someone cleared the name of still has to be called something.
     private func connectionName(_ connection: LLMConnection) -> String {
         connection.label.trimmingCharacters(in: .whitespaces).isEmpty ? providerName(connection.provider) : connection.label
-    }
-
-    /// The config stores milliseconds; nobody thinks in them.
-    private func timeoutMinutes(_ index: Int) -> Binding<Int> {
-        Binding(
-            get: { agents[index].timeoutMs / 60_000 },
-            set: { agents[index].timeoutMs = max(0, $0) * 60_000 }
-        )
     }
 
     private func toggle(_ name: String) {

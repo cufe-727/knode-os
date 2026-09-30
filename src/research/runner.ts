@@ -140,6 +140,7 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
         jobId: job.id,
         allowNetwork,
         effort: profile.reasoning.effort,
+        speed: profile.reasoning.speed,
         webFreshness: profile.search.freshness,
       });
       if (job.kind === 'init') job = (await updateJob(ctx.store, job.id, { payload: { ...job.payload, topics: topicsFrom(launched.resultText) } }))!;

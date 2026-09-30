@@ -72,12 +72,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * template used to (`upgradeAgentFiles`), and `config.ts` cannot import
  * `agents.ts`.
  */
-export const DEEP_AGENT = {
-  name: 'deep-agent',
-  title: 'deep agent',
-  description:
-    'LangChain deepagents 循环，跑在 OpenAI 兼容连接上。问答时单会话作答（可读知识库、可写隔离笔记），研究时由 research profile 按阶段与子代理驱动。没装任何 CLI 的机器用它。',
-} as const;
+export const DEEP_AGENT = { name: 'deep-agent', title: 'deep agent' } as const;
 
 /** What every template was seeded with besides its name and wording. */
 const SEEDED: Record<string, unknown> = {
@@ -109,14 +104,16 @@ const RETIRED: Record<string, { replacement: string; seeded: Record<string, unkn
 
 /** A built-in's wording from before it changed, and what it says now. */
 const REWORDED: Record<string, Record<string, { was: string; now: string }>> = {
-  [DEEP_AGENT.name]: {
-    title: { was: '通用 deep agent', now: DEEP_AGENT.title },
-    description: {
-      was: 'LangChain deepagents 循环，跑在 OpenAI 兼容连接上；单会话回答，可读知识库、可写隔离笔记。没装任何 CLI 的机器用它。',
-      now: DEEP_AGENT.description,
-    },
-  },
+  [DEEP_AGENT.name]: { title: { was: '通用 deep agent', now: DEEP_AGENT.title } },
 };
+
+/**
+ * What only Ask ever read, and a description nothing read. Ask runs every
+ * agent with the same turn cap, timeout and tools now, and takes its
+ * instructions from the workspace's chat protocol (see `chatRuntimeFor`).
+ */
+const ASK_ONLY_FIELDS = ['description', 'maxTurns', 'timeoutMs', 'prompt'] as const;
+const ASK_ONLY_TOOLS = ['write', 'files'] as const;
 
 /** Whether a file still says what it was seeded with; a field it leaves out was the template's. */
 function asSeeded(raw: Record<string, unknown>, seeded: Record<string, unknown>): boolean {
@@ -137,9 +134,11 @@ function asSeeded(raw: Record<string, unknown>, seeded: Record<string, unknown>)
  * - A retired built-in still as it was seeded is deleted. One someone edited
  *   stays as an ordinary agent, with the template's values written in for the
  *   fields it was inheriting, so it runs as it did.
- * - A built-in whose title or description still reads as it shipped takes the
- *   current wording; an edited one is left alone.
+ * - A built-in whose title still reads as it shipped takes the current
+ *   wording; an edited one is left alone.
  * - `kind` goes from every file: it only ever ordered the pickers.
+ * - So do `description`, `maxTurns`, `timeoutMs`, `prompt` and the `write` /
+ *   `files` tools (`ASK_ONLY_FIELDS`); `tools.web` stays.
  *
  * Returns each retired name that has no file now, mapped to its replacement,
  * so whatever still names it can follow.
@@ -168,6 +167,13 @@ export function upgradeAgentFiles(dataDir: string): Map<string, string> {
       if (typeof next[field] === 'string' && (next[field] as string).trim() === was) next[field] = now;
     }
     delete next.kind;
+    for (const field of ASK_ONLY_FIELDS) delete next[field];
+    if (isRecord(next.tools)) {
+      // a new object: `raw` came from the parse cache (see `renameProfileAgents`)
+      const tools = Object.fromEntries(Object.entries(next.tools).filter(([key]) => !(ASK_ONLY_TOOLS as readonly string[]).includes(key)));
+      if (Object.keys(tools).length > 0) next.tools = tools;
+      else delete next.tools;
+    }
     if (JSON.stringify(next) !== JSON.stringify(raw)) writeAgentFile(dataDir, name, next);
   }
   return renamed;

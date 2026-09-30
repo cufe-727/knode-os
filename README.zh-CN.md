@@ -12,7 +12,7 @@ knode-os 结合了两个项目的核心思想:[llm_wiki](https://github.com/nash
 - **文件系统即数据库。** 数据目录(`raw/` + `wiki/`)就是普通的 markdown 文件,可以直接读、改、grep、`git init`。`.knode/` 下的 [PGlite](https://pglite.dev)(WASM 版 Postgres + pgvector)索引随时可删,`knode-os ingest` 即可重建。
 - **自动收集 agent trace。** Claude Code(`~/.claude/projects`)与 Codex CLI(`~/.codex/sessions`)的会话记录自动镜像到 `raw/traces/`,用过的 skills 进 `raw/skills/`。trace 供夜间 dream 分析使用;打开 `trace.episodes` 后会把每段会话备成可检索的 episode，在此之前不进检索索引。skills 一直可被检索。
 - **混合检索**:pgvector 余弦召回 + Postgres 全文检索 + 图谱信号,RRF 融合,并叠加温和的使用热度加权。开箱即用、完全离线(内置哈希 embedder);配置任意 OpenAI 兼容的 embedding 接口可获得生产级效果。
-- **分层知识图谱**:tier 0 在每次摄入时做确定性布线(`[[wikilink]]` + NLP 概念共现,不需要 LLM);变更文档进入 tier-1 队列,由 `serve` 后台(或 `knode-os extract`)在每日 token 预算内按热度优先做 LLM 实体/关系/断言抽取。抽取结果持久化到文档 sidecar,重建索引不会重复付费。支持多跳图搜索与图谱洞察(枢纽节点、孤立节点)。
+- **分层知识图谱**:tier 0 在每次摄入时做确定性布线(`[[wikilink]]` + NLP 概念共现,不需要 LLM);变更文档进入 tier-1 队列,由 `serve` 后台(或 `knode-os extract`)按热度优先做 LLM 实体/关系/断言抽取。抽取结果持久化到文档 sidecar,重建索引不会重复付费。支持多跳图搜索与图谱洞察(枢纽节点、孤立节点)。
 - **`/dream`**:每晚(或手动)分析近期 agent 会话——问了什么、哪些工具失败、什么在重复——产出对 **skills**、**memory**、**知识库** 的改进建议,在页面上一键接受/拒绝。
 - **实时数据源 —— 一个逻辑数据库。** 注册 MySQL、TimescaleDB、parquet/CSV 目录(DuckDB,模拟 HDFS)、JSON HTTP 端点、Prometheus 指标和对象目录:knode-os 把它们内省成知识图谱里的 capability(`datasource`/`dataset` 实体,按实体列采样生成 `appears_in` 边与 locator;端点和指标的绑定由已知的表和别名推导),并生成 `wiki/datasets/` 页面——行数据留在原系统、查询时实时获取。提到一个公司,图谱同时知道*哪些文档提到它*、*哪些表包含它*、*哪个 API 端点能查它*。
 - **Context Pack。** `knode-os pack "<语句>"`(或 MCP 工具 `knode_context_pack`)自动匹配语句中的实体,沿图谱展开(文档 chunk、带 `STALE`/`CONFLICT` 标记的时效断言、关联的实时表),按 playbook 执行实时探针查询(带 asOf 时间戳、短 TTL 缓存、绝不落库),并输出缺口分析和可直接执行的后续 SQL。
@@ -126,7 +126,7 @@ node dist/cli.js serve --data ~/knode-data
 
 任何 OpenAI 兼容端点都可以(Ollama、vLLM、硅基流动等)。`protocol` 决定用哪条线路说话:默认 `auto` 先探测端点有没有 `/responses`,有就走 Responses(推理模型在这条线上把思考作为独立的 output item 返回,而 Chat Completions 只能塞进各家拼写不一的 `message.reasoning_content`),没有则退回 `/chat/completions`;探测每个端点每进程只做一次,且不消耗 token。也可以钉成 `responses` 或 `chat`。embedding 另外支持 `"provider": "ark-multimodal"`,对接火山方舟的 `/embeddings/multimodal`(`doubao-embedding-vision-*`)。该接口不是 OpenAI 形态:每次请求只返回一个融合后的向量,因此 `baseUrl` 写到 `/api/v3` 为止,`model` 填接入点 id(`ep-…`),`batchSize` 的含义变为单条请求的并发数。实体提取、Concept 综合和文档视觉转换都可以独立路由。文本型 PDF 在本地提取；图片和扫描型 PDF 可使用支持视觉的 OpenAI 兼容模型、Codex CLI 或 Claude Code CLI 转成 Markdown。修改 `dimensions` 会在下次启动时重建 embedding 表。也可以在 Web 页面的 **Settings** 标签里编辑并测试各条模型路由。
 
-其他配置块(用 `knode-os config` 查看完整默认值):`ingest`(分块大小/重叠、文件监听)、`extraction`(每日 token 预算、批大小、间隔、tier-1/2 模型、是否抽取断言)、`heat`(热度半衰期、搜索加权、冷判定阈值)、`trace`(Claude/Codex trace 目录、skill 目录、同步间隔)、`server`(host/port)。
+其他配置块(用 `knode-os config` 查看完整默认值):`ingest`(分块大小/重叠、文件监听)、`extraction`(批大小、间隔、tier-1/2 模型、是否抽取断言)、`heat`(热度半衰期、搜索加权、冷判定阈值)、`trace`(Claude/Codex trace 目录、skill 目录、同步间隔)、`server`(host/port)。
 
 配置 LLM 后解锁:tier-1 实体/关系/断言抽取、`ask` 问答、`wiki generate` 文档摘要、tier-2 社区页、LLM 级 dream 分析。不配置时所有功能仍以确定性/启发式路径运行。
 
@@ -146,7 +146,7 @@ knode-os history <path>       一个源的 apply / dispose / purge 历史
 knode-os forget <path>        删除源、dispose 并清除其历史(不可逆)
 knode-os purge [--before iso] [--archived]  物理清除已 dispose 的历史 / 归档页面
 knode-os rebuild [--history]  删除 .knode/db 并从文件 + ledger 重建
-knode-os extract [--batch n]  在每日预算内消费 tier-1 LLM 抽取队列
+knode-os extract [--batch n]  消费一批 tier-1 LLM 抽取队列
 knode-os datasource list|sync             查看已注册实时表 / 重新内省 schema 进图谱
 knode-os datasource query <id> <sql>      对数据源执行只读原生 SQL
 knode-os pack <语句> [--json] [--as-of iso] [--valid-at iso]

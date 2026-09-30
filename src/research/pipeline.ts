@@ -6,7 +6,7 @@ import { pool } from '../pool.js';
 import { ResearchAgent, withModel } from './agent.js';
 import { getJob, ResearchJob } from './jobs.js';
 import { isCancelled, JobCancelledError, LaunchResult, launchSession, SessionResult } from './launch.js';
-import { effectiveEffort, NativeAgentSpec, requiredSections, ResearchProfile, ResearchRole, rolePrompt, rolesFor, webAllowed } from './profile.js';
+import { effectiveEffort, effectiveSpeed, NativeAgentSpec, requiredSections, ResearchProfile, ResearchRole, rolePrompt, rolesFor, webAllowed } from './profile.js';
 import { loadPhasePrompt, PhaseName, ResearchTemplate, researchSlug, subjectOf } from './templates.js';
 import { McpEndpoint, RunWorkspace } from './workspace.js';
 import { validateCompanions, validateResearchPage } from './validate.js';
@@ -183,6 +183,7 @@ function sessions(ctx: AppContext, input: PipelineInput): Sessions {
       tools: role.tools.write ? 'write' : 'read',
       files: role.tools.files,
       effort: effectiveEffort(profile, role),
+      speed: effectiveSpeed(profile, role),
       webFreshness: profile.search.freshness,
       agents: opts.agents,
       label,
@@ -342,6 +343,7 @@ export function nativeAgentSpecs(ctx: AppContext, input: PipelineInput, vars: Re
       web: webAllowed({ gate: input.webGate, kind: input.job.kind, profile, role: r, agent: input.agent }),
       model: r.model,
       effort: effectiveEffort(profile, r),
+      speed: effectiveSpeed(profile, r),
     }));
 }
 
@@ -352,7 +354,7 @@ export async function runNativePipeline(ctx: AppContext, input: PipelineInput): 
   const brief = fs.readFileSync(ws.briefPath, 'utf8');
   const writer = rolesFor(profile, 'synthesize')[0];
   const orchestrator: ResearchRole = {
-    ...(writer ?? { id: 'orchestrator', title: '主管', phase: 'synthesize', enabled: true, agent: '', model: '', effort: 'default', parallel: 0, rounds: 0, maxTurns: 0, prompt: '', native: false, description: '' }),
+    ...(writer ?? { id: 'orchestrator', title: '主管', phase: 'synthesize', enabled: true, agent: '', model: '', effort: 'default', speed: 'default', parallel: 0, rounds: 0, maxTurns: 0, prompt: '', native: false, description: '' }),
     tools: { write: true, files: writer?.tools.files ?? true, web: writer?.tools.web ?? 'inherit' },
   };
   const agent = roleAgent(orchestrator, input);

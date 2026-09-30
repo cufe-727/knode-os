@@ -85,7 +85,7 @@ page, and the `wiki/overview.md` `initDataDir` writes is long enough to qualify 
 `src/research/survey.ts` — deterministic, no LLM, about ten queries: documents by folder and date range,
 entities by type with the top ones, relation predicates (including `unknownPredicates`), claims by status and
 event range, wiki pages (generated / written / researched), ontology packs, live datasources, the extraction
-backlog and budget, the state of the guide and the overview, and whether `purpose.md` / `schema.md` are still
+backlog, the state of the guide and the overview, and whether `purpose.md` / `schema.md` are still
 templates. `renderSurvey` turns it into the brief's `## 知识库概况`; the initialization card uses the numbers.
 
 ## 4. The chat entry (`src/chat/`)

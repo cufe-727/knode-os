@@ -120,8 +120,8 @@ Tiered extraction (details in [01](01-doc-processing-graph-wiki.md)):
   entities get weak `co_occurs` edges whose weight accumulates on re-mention.
 - **Tier 1 — LLM, asynchronous** (when `llm.model` configured): changed docs
   are queued; a background pass (while `serve` runs, or `knode-os extract`)
-  drains the queue by priority (heat × freshness × root importance) within a
-  daily token budget, extracting typed entities (10 types), typed relations
+  drains the queue by priority (heat × freshness × root importance), one
+  batch per pass, extracting typed entities (10 types), typed relations
   (7 LLM types + deterministic `co_occurs`) and claims, grounded to chunks by
   name/alias matching. Results persist in the document sidecar for free replay.
 - **Tier 2 — nightly refinement**: label-propagation community detection over

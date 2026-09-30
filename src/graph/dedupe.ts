@@ -2,9 +2,7 @@ import crypto from 'node:crypto';
 import { KnodeConfig } from '../config.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { writeDeps } from '../lineage/deps.js';
-import { addBudgetUse, budgetUsedToday } from '../llm/budget.js';
 import { LlmClient } from '../llm/client.js';
-import { estimateTokens } from '../llm/tokens.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { setSuggestionStatus } from '../store/queries.js';
 import { applyMerge } from './merge.js';
@@ -212,21 +210,13 @@ export async function auditDuplicateEntities(
   const judgeMode = review?.llmJudge ?? 'off';
   const verdicts = new Map<string, MergeVerdict>();
   if (judgeMode !== 'off' && ctx.llm?.enabled) {
-    let budgetLeft = Math.max(0, ctx.config.extraction.dailyTokenBudget - (await budgetUsedToday(store)));
     for (const [id, c] of ranked.slice(0, review?.maxJudgedPerRun ?? 30)) {
       const prompt = await judgePrompt(store, c.a, c.b);
-      const cost = estimateTokens(prompt.system + prompt.user) + 200;
-      if (cost > budgetLeft) {
-        progress('dedupe: daily token budget exhausted before every candidate was judged');
-        break;
-      }
       try {
         const raw = await ctx.llm.completeJson<{ same?: unknown; confidence?: unknown; reason?: unknown }>(
           [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }], { maxTokens: 300 },
         );
         verdicts.set(id, { same: raw.same === true, confidence: Math.max(0, Math.min(1, Number(raw.confidence) || 0)), reason: String(raw.reason ?? '').slice(0, 600), model: ctx.llm.label });
-        await addBudgetUse(store, cost);
-        budgetLeft -= cost;
         stats.judged++;
       } catch (err) {
         progress(`dedupe: judge failed for ${c.a.name} / ${c.b.name}: ${err instanceof Error ? err.message : err}`);

@@ -7,7 +7,6 @@ import { reviewClaims } from '../graph/claim-review.js';
 import { slugify } from '../graph/store.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { writeDeps } from '../lineage/deps.js';
-import { budgetUsedToday } from '../llm/budget.js';
 import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
@@ -25,7 +24,6 @@ import { ensureHotTopics, hotEntities, HotEntity, PagesContext, regeneratePage }
 export interface Tier2Stats {
   communities: number;
   pagesWritten: number;
-  tokensUsed: number;
   claimIssues: number;
   /** Duplicate-entity pairs queued as merge suggestions. */
   mergeCandidates: number;
@@ -84,7 +82,7 @@ export async function refineWiki(
   opts: { onProgress?: (msg: string) => void; topEntities?: number; maxCommunities?: number; embedder?: EmbeddingProvider } = {},
 ): Promise<Tier2Stats> {
   const progress = opts.onProgress ?? (() => {});
-  const stats: Tier2Stats = { communities: 0, pagesWritten: 0, tokensUsed: 0, claimIssues: 0, mergeCandidates: 0, recommendations: 0, claimReviews: 0 };
+  const stats: Tier2Stats = { communities: 0, pagesWritten: 0, claimIssues: 0, mergeCandidates: 0, recommendations: 0, claimReviews: 0 };
   const ctx: PagesContext = {
     store,
     dataDir: store.dataDir,
@@ -125,7 +123,6 @@ export async function refineWiki(
     .slice(0, opts.maxCommunities ?? 5);
   stats.communities = groups.length;
 
-  const before = await budgetUsedToday(store);
   for (const group of groups) {
     const members = group.map((id) => byId.get(id)!).sort((a, b) => b.mention_count - a.mention_count);
     const anchor = members[0];
@@ -141,7 +138,6 @@ export async function refineWiki(
       progress(`tier2 summary failed for ${anchor.name}: ${err instanceof Error ? err.message : err}`);
     }
   }
-  stats.tokensUsed = Math.max(0, (await budgetUsedToday(store)) - before);
 
   await ensureHotTopics(ctx, { actor: 'tier2', force: true });
   try {

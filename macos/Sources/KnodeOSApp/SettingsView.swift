@@ -300,8 +300,6 @@ struct SettingsView: View {
                 stageFlow
                 Divider()
                 stageInspector
-                Divider()
-                budgetFooter
             }
             .knodeCard(padding: 0)
         }
@@ -370,9 +368,20 @@ struct SettingsView: View {
                 }
                 .font(.system(size: 10, design: .monospaced))
                 .lineLimit(1)
-                Text(stageRate(stage))
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                HStack(spacing: 4) {
+                    // an empty rate keeps the line's height, but takes no
+                    // gap before an effort
+                    if !stageRate(stage).isEmpty || stageTuning(stage) == nil { Text(stageRate(stage)) }
+                    // the effort and Fast the model field's chip sets, at a glance
+                    if let tuning = stageTuning(stage) {
+                        if !stageRate(stage).isEmpty, !tuning.effort.isEmpty { Text("·") }
+                        if tuning.fast { Image(systemName: "bolt.fill").font(.system(size: 8, weight: .bold)) }
+                        if !tuning.effort.isEmpty { Text(tuning.effort) }
+                    }
+                }
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
             }
             .frame(width: 148, alignment: .leading)
             .help(target.line)
@@ -514,23 +523,6 @@ struct SettingsView: View {
         }
     }
 
-    /// The one control that is genuinely not a stage's own.
-    private var budgetFooter: some View {
-        HStack(alignment: .bottom, spacing: 16) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(L("Daily token budget")).font(.subheadline.weight(.semibold))
-                Text(L("Shared by Extract and Synthesize — the two stages that run in the background."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 12)
-            TextField(L("Budget"), value: binding(\.extraction.dailyTokenBudget), format: .number)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 160)
-        }
-        .padding(18)
-    }
-
     /// `batchSize` is optional in the mirror, but the field is a plain number.
     private var embeddingBatchSize: Binding<Int> {
         Binding(
@@ -550,6 +542,24 @@ struct SettingsView: View {
         case .synthesize: routeSummary(\.extraction.conceptLlm)
         case .answer: defaultModelSummary
         }
+    }
+
+    /// A stage's own effort and Fast, else its agent's — what runs, as far as
+    /// the config says; nil where neither is set or the stage runs on a model.
+    private func stageTuning(_ stage: PipelineStage) -> (effort: String, fast: Bool)? {
+        guard let config else { return nil }
+        let route: RoutedLLMConfig
+        switch stage {
+        case .convert: route = config.extraction.documentLlm
+        case .extract: route = config.extraction.entityLlm
+        case .synthesize: route = config.extraction.conceptLlm
+        case .index, .answer: return nil
+        }
+        guard let target = routeTargets.first(where: { $0.id == route.use }), cliProviderNames.contains(target.provider) else { return nil }
+        let effort = route.effort != "default" ? route.effort : target.effort
+        let fast = route.speed == "fast" || target.speed == "fast"
+        guard effort != "default" || fast else { return nil }
+        return (effort == "default" ? "" : EffortLevel.name(effort), fast)
     }
 
     private func stageRate(_ stage: PipelineStage) -> String {
@@ -576,12 +586,10 @@ struct SettingsView: View {
                 uses: agentUses,
                 connections: config?.connections ?? [],
                 defaultTarget: defaultTarget,
-                llmUse: config?.llmUse ?? "",
                 cliTools: cliTools,
                 isWorking: isWorking,
                 add: { runtime in Task { await addAgent(runtime: runtime) } },
                 remove: { agentToRemove = $0 },
-                makeDefault: { name in config?.llmUse = name },
                 loadModels: { agent, refresh in try await agentModelList(agent, refresh: refresh) }
             )
         }
@@ -1257,184 +1265,6 @@ struct SettingsView: View {
     }
 }
 
-/// A model name stays free text — any id the provider accepts — with a list of
-/// what the configured provider actually offers: its own `/models`, the CLI's
-/// own list, or the aliases a CLI documents when it has no list at all.
-/// A model id stays free text, with a list of what the provider offers.
-struct ModelField: View {
-    let placeholder: String
-    @Binding var text: String
-    /**
-     * The model that runs when this field is empty, shown greyed in its place.
-     *
-     * Never written. An empty `model` means "follow the provider", and pinning
-     * the inherited string would stop the route tracking a later change to the
-     * provider's own model — the propagation named connections exist for. The
-     * popover's Clear link is how you get back to inheriting.
-     */
-    var inherited: String = ""
-    /// Changing provider invalidates a fetched list, since it came from the old one.
-    var providerKey: String = ""
-    var disabled = false
-    /// Which entry of the shared catalog this field reads. Two fields pointed
-    /// at the same route share one list instead of each asking.
-    let route: String
-    let load: (Bool) async throws -> ModelListResponse
-
-    @EnvironmentObject private var catalog: ModelCatalog
-    @State private var isShowing = false
-    @State private var filter = ""
-
-    private var key: String { "\(route)|\(providerKey)" }
-    private var result: ModelListResponse? { catalog.list(key) }
-    private var failure: String? { catalog.failure(key) }
-    private var isLoading: Bool { catalog.isLoading(key) }
-
-    var body: some View {
-        FieldLabel(L("Model")) {
-            HStack(spacing: 6) {
-                TextField(inherited.isEmpty ? placeholder : inherited, text: $text)
-                Button {
-                    isShowing = true
-                    Task { await reload() }
-                } label: {
-                    Image(systemName: "chevron.down").font(.caption.weight(.semibold))
-                }
-                .buttonStyle(.borderless)
-                .help(L("List the models this provider offers"))
-                .popover(isPresented: $isShowing, arrowEdge: .bottom) { picker }
-            }
-            .disabled(disabled)
-            .onChange(of: providerKey) { _, _ in filter = "" }
-        }
-    }
-
-    private var picker: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 8) {
-                Text(L("Available models")).font(.headline)
-                if let source = result?.source { RouteBadge(label: sourceLabel(source), color: source == "builtin" ? .knodeViolet : .knodeCyan) }
-                Spacer()
-                if isLoading { ProgressView().controlSize(.small) }
-                Button { Task { await reload(force: true) } } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless)
-                    .disabled(isLoading)
-                    .help(L("Ask the provider again"))
-            }
-            if !options.isEmpty {
-                TextField("Filter \(options.count) models", text: $filter)
-                    .textFieldStyle(.roundedBorder)
-                // An explicit height: a ScrollView has no ideal height of its
-                // own, and a popover sizes itself to its content, so a
-                // maxHeight alone collapses the list to nothing.
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 1) {
-                        ForEach(filtered) { option in row(option) }
-                    }
-                    .padding(.trailing, 2)
-                }
-                .frame(height: listHeight)
-                if filtered.isEmpty {
-                    Text(L("Nothing matches “%@”.", filter)).font(.caption).foregroundStyle(.secondary)
-                }
-            } else if isLoading {
-                Text(L("Asking the provider…")).font(.caption).foregroundStyle(.secondary)
-            } else if result != nil, failure == nil, result?.error == nil {
-                Text(L("This provider lists no models — type the id you want."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            if let message = failure ?? result?.error {
-                Label(message, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(Color.knodeBad)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if result?.cached == true, let at = result?.cachedAt {
-                Text(L("Cached — the service last asked at %@.", shortTime(at)))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-            if let note = result?.note {
-                Text(note)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Divider()
-            HStack {
-                Text(inherited.isEmpty
-                    ? L("Picking one fills the field — Save & apply writes it to the workspace config.")
-                    : L("Empty follows the provider (%@). Picking one pins it instead.", inherited))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer()
-                if !text.isEmpty {
-                    Button(L("Clear")) { text = ""; isShowing = false }
-                        .buttonStyle(.link)
-                        .font(.caption)
-                }
-            }
-        }
-        .padding(14)
-        .frame(width: 430)
-    }
-
-    private func row(_ option: ModelOption) -> some View {
-        Button {
-            text = option.id
-            isShowing = false
-        } label: {
-            HStack(spacing: 8) {
-                Text(option.id).font(.system(size: 12, design: .monospaced))
-                if let label = option.label {
-                    Text(label).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-                Spacer()
-                if option.id == text { Image(systemName: "checkmark").font(.caption).foregroundStyle(Color.knodeCyan) }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(option.id == text ? Color.knodeCyan.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var options: [ModelOption] { result?.models ?? [] }
-
-    /// Tall enough to read, short enough to stay a dropdown: one row is 25pt.
-    private var listHeight: CGFloat {
-        min(max(CGFloat(filtered.count) * 25, 25), 260)
-    }
-
-    private var filtered: [ModelOption] {
-        let needle = filter.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !needle.isEmpty else { return options }
-        return options.filter { $0.id.lowercased().contains(needle) || ($0.label ?? "").lowercased().contains(needle) }
-    }
-
-    private func reload(force: Bool = false) async {
-        await catalog.load(key, refresh: force, using: load)
-    }
-
-    /// Just the clock time: the date is never useful for a list minutes old.
-    private func shortTime(_ iso: String) -> String {
-        guard let date = ISO8601DateFormatter().date(from: iso) else { return iso }
-        return date.formatted(date: .omitted, time: .standard)
-    }
-
-    private func sourceLabel(_ source: String) -> String {
-        switch source {
-        case "api": L("from the endpoint")
-        case "cli": L("from the CLI")
-        default: "suggestions"
-        }
-    }
-}
-
 /// The CLI executable is an override: the service resolves the command on its
 /// own PATH first — which the desktop app augments with the usual install
 /// directories — so the field only earns space when that lookup fails or the
@@ -1679,7 +1509,7 @@ private struct LlmProviderFields: View {
                 .gridCellColumns(2)
             }
             GridRow {
-                Text(llmProviderNote("openai"))
+                Text(L("Any OpenAI-compatible chat endpoint works (OpenAI, DeepSeek, Ollama, vLLM, SiliconFlow…). Use env:VAR_NAME to keep the key out of the config file. An empty model disables LLM features; the deterministic pipeline keeps running."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1717,18 +1547,6 @@ func inheritedAgentModel(_ spec: String, agents: [AgentDefinition], targets: [LL
     return (defaultTarget?.provider == wanted ? defaultTarget : targets.first { $0.provider == wanted })?.model ?? ""
 }
 
-/// What this provider needs, and what an empty model means for it. Used to sit
-/// on the default's row alone; every row can be the default now.
-@MainActor
-func llmProviderNote(_ provider: String) -> String {
-    switch provider {
-    case "codex-cli": L("Uses your existing Codex login for a read-only one-shot request.")
-    case "claude-cli": L("Uses your existing Claude Code login for one non-interactive turn.")
-    case "cursor-cli": L("Uses your existing Cursor Agent login in headless print mode.")
-    default: L("Any OpenAI-compatible chat endpoint works (OpenAI, DeepSeek, Ollama, vLLM, SiliconFlow…). Use env:VAR_NAME to keep the key out of the config file. An empty model disables LLM features; the deterministic pipeline keeps running.")
-    }
-}
-
 @MainActor
 func embeddingProviderName(_ provider: String) -> String {
     switch provider {
@@ -1749,20 +1567,6 @@ func embeddingNote(_ provider: String) -> String {
     default:
         return L("Changing the API model or dimensions re-embeds the corpus after saving. Use env:VAR_NAME to keep keys out of the config file.")
     }
-}
-
-/// The reasoning-effort ladder, shared by every control that offers one: a
-/// provider row here, a research profile, a role, a chat. value → English
-/// label; the label goes through `L` at render time.
-enum EffortLevel {
-    static let all: [(String, String)] = [
-        ("default", "CLI default"),
-        ("low", "Low"),
-        ("medium", "Medium"),
-        ("high", "High"),
-        ("xhigh", "Extra high"),
-        ("max", "Max (claude & codex; cursor → high)"),
-    ]
 }
 
 /// A caption above a control, shared by every settings card.
@@ -1804,14 +1608,15 @@ private struct StagePicker: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             FieldLabel(L("Run with")) {
+                // each entry says what kind it is, so the closed picker does too
                 Picker(L("Run with"), selection: selection) {
                     ForEach(models) { connection in
-                        Text(name(connection)).tag(connection.id)
+                        Text(L("LLM: %@", name(connection))).tag(connection.id)
                     }
                     if !agents.isEmpty {
                         Divider()
                         ForEach(agents) { agent in
-                            Text(L("%@ · agent, one-shot", name(agent))).tag(agent.id)
+                            Text(L("Agent: %@", name(agent))).tag(agent.id)
                         }
                     }
                 }
@@ -1823,7 +1628,8 @@ private struct StagePicker: View {
                 inherited: target?.model ?? "",
                 providerKey: target?.id ?? route.use,
                 route: routeKey,
-                load: load
+                load: load,
+                tuning: tuning
             )
             Text(runningOn)
                 .font(.caption2)
@@ -1849,14 +1655,30 @@ private struct StagePicker: View {
         connection.label.isEmpty ? providerName(connection.provider) : connection.label
     }
 
+    /// A stage on a CLI agent sets its own effort and speed; "default" is the
+    /// agent's, as the service's `resolveRoutedLlmConfig` reads it. An API
+    /// model takes neither.
+    private var tuning: ModelTuning? {
+        guard let target, cliProviderNames.contains(target.provider) else { return nil }
+        return ModelTuning(
+            effort: $route.effort,
+            speed: $route.speed,
+            runtime: target.provider,
+            inheritedEffort: target.effort,
+            inheritedSpeed: target.speed,
+            inheritedFrom: L("the agent")
+        )
+    }
+
     private var runningOn: String {
         guard let connection = target else {
             return L("Nothing to run on yet — add a model under Providers & Agents.")
         }
-        let endpoint = connection.provider == "openai"
-            ? (connection.baseUrl.isEmpty ? L("no endpoint set") : connection.baseUrl)
-            : L("the %@ agent, one call at a time", providerName(connection.provider))
-        return L("Runs on %@.", endpoint)
+        guard connection.provider == "openai" else {
+            // a CLI agent spends its own login, as its row under Providers & Agents says
+            return L("Runs on your %@ subscription.", cliProductName(connection.provider) ?? providerName(connection.provider))
+        }
+        return L("Runs on %@.", connection.baseUrl.isEmpty ? L("no endpoint set") : connection.baseUrl)
     }
 }
 
@@ -2019,7 +1841,7 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .index:
             L("Not an LLM — it uses one of the embedding models under Providers & Agents. Changing which one, or its model or dimensions, re-embeds the whole corpus.")
         case .extract:
-            L("The busiest stage — it runs on every changed document, bounded by the daily budget and the batch size here. A fast, cheap model that returns clean JSON is usually the right trade.")
+            L("The busiest stage — it runs on every changed document, bounded by the batch size here. A fast, cheap model that returns clean JSON is usually the right trade.")
         case .synthesize:
             L("Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.")
         case .answer:
@@ -2037,5 +1859,16 @@ func providerName(_ provider: String) -> String {
     case "claude-cli": L("Claude Code CLI")
     case "cursor-cli": L("Cursor Agent CLI")
     default: provider
+    }
+}
+
+/// A CLI runtime by its product's name — "Codex", not "Codex CLI" — for
+/// saying whose subscription a CLI agent spends. Nil for anything else.
+func cliProductName(_ executor: String) -> String? {
+    switch executor {
+    case "claude-cli": "Claude Code"
+    case "codex-cli": "Codex"
+    case "cursor-cli": "Cursor"
+    default: nil
     }
 }

@@ -16,9 +16,7 @@ import { loadSourceText } from '../ingest/source.js';
 import { readDeps } from '../lineage/deps.js';
 import { archivedPath, disposeScope, findLiveScope } from '../lineage/scope.js';
 import { DepDecl } from '../lineage/types.js';
-import { addBudgetUse, budgetUsedToday } from '../llm/budget.js';
 import { LlmClient } from '../llm/client.js';
-import { estimateTokens } from '../llm/tokens.js';
 import { applyScope } from '../lineage/scope.js';
 import { isGeneratedConcept, okfGenerated } from '../okf/index.js';
 import { getDocHeat } from '../stats/heat.js';
@@ -70,7 +68,7 @@ export interface PageGenerator {
   /** 'file' owns a whole page; 'region' owns one managed region inside a human file (path = file#region). */
   mode: 'file' | 'region';
   plan(ctx: PagesContext, pagePath: string, hint?: Record<string, unknown>): Promise<PagePlan | null>;
-  /** null = deferred (LLM unavailable or out of budget). */
+  /** null = deferred (LLM unavailable). */
   render(ctx: PagesContext, pagePath: string, plan: PagePlan): Promise<PageRender | null>;
 }
 
@@ -219,14 +217,10 @@ const sourceSummary: PageGenerator = {
       const source = loadSourceText(ctx.dataDir, doc.path, doc.root);
       if (!source) return null;
       const content = source.text.slice(0, LLM_WIKI_INPUT_CHARS);
-      const cost = estimateTokens(content) + 1200;
-      const budgetLeft = Math.max(0, ctx.config.extraction.dailyTokenBudget - (await budgetUsedToday(ctx.store)));
-      if (cost > budgetLeft) return null;
       body = await llm.complete([
         { role: 'system', content: SOURCE_SYSTEM },
         { role: 'user', content: `Source file: ${doc.path}\n\n${content}` },
       ], { maxTokens: 1200 });
-      await addBudgetUse(ctx.store, cost);
       by = llm.label;
       at = new Date().toISOString();
       writeSourceSummary(ctx.dataDir, doc.path, { contentSha: doc.sha256, model: llm.label, body, generatedAt: at });
@@ -513,11 +507,7 @@ const conceptCluster: PageGenerator = {
         'Excerpts:',
         ...excerpts.map((x) => `> ${x}`),
       ].join('\n');
-      const cost = estimateTokens(prompt) + 800;
-      const budgetLeft = Math.max(0, ctx.config.extraction.dailyTokenBudget - (await budgetUsedToday(ctx.store)));
-      if (cost > budgetLeft) return null;
       body = await llm.complete([{ role: 'system', content: COMMUNITY_SYSTEM }, { role: 'user', content: prompt }], { maxTokens: 800 });
-      await addBudgetUse(ctx.store, cost);
       by = llm.label;
       at = new Date().toISOString();
       writePageCache(ctx.dataDir, pagePath, { inputsSha: plan.inputsSha, model: llm.label, body, generatedAt: at });

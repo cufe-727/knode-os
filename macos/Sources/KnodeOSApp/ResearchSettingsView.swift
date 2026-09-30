@@ -95,13 +95,16 @@ struct ResearchSettingsSection: View {
                     FieldLabel(L("Agent")) {
                         AgentPicker(selection: $research.agent, agents: agents, connections: connections, fallbackLabel: nil, defaultName: defaultTarget?.label ?? "")
                     }
+                    // a research run thinks as hard as its profile says, so the
+                    // profile's effort and speed sit on the model it runs
                     ModelField(
                         placeholder: L("CLI default"),
                         text: $research.model,
                         inherited: inheritedModel(research.agent),
                         providerKey: research.agent,
                         route: "agent:\(research.agent)",
-                        load: { refresh in try await loadModels(research.agent, refresh) }
+                        load: { refresh in try await loadModels(research.agent, refresh) },
+                        tuning: runnerTuning
                     )
                     FieldLabel(L("Profile")) {
                         Picker(L("Profile"), selection: $profileSelection) {
@@ -188,7 +191,7 @@ struct ResearchSettingsSection: View {
                 GridRow {
                     FieldLabel(L("Extraction first")) {
                         Picker(L("Extraction first"), selection: $research.initialization.extraction) {
-                            Text(L("Drain the tier-1 queue (within the daily budget)")).tag("drain")
+                            Text(L("Drain the tier-1 queue")).tag("drain")
                             Text(L("Skip — leave it to the background loop")).tag("skip")
                         }
                         .labelsHidden()
@@ -265,6 +268,35 @@ struct ResearchSettingsSection: View {
         Binding(
             get: { pinnedPipeline.isEmpty ? research.pipeline : pinnedPipeline },
             set: { if pinnedPipeline.isEmpty { research.pipeline = $0 } }
+        )
+    }
+
+    /// The CLI a spec runs on — an agent's executor, a CLI agent's provider, a
+    /// bare CLI name, or what the default is — and "" when it runs on a model,
+    /// which takes no effort.
+    private func runtime(_ spec: String) -> String {
+        let provider: String
+        if let agent = agents.first(where: { $0.name == spec }) {
+            provider = agent.executor
+        } else if spec == Self.defaultConnection {
+            provider = defaultTarget?.provider ?? ""
+        } else {
+            provider = connections.first { $0.id == spec }?.provider ?? spec
+        }
+        return cliProviderNames.contains(provider) ? provider : ""
+    }
+
+    /// The profile's effort and speed, on the model the research agent runs:
+    /// every session and role that sets none runs at them.
+    private var runnerTuning: ModelTuning? {
+        guard let profile else { return nil }
+        let cli = runtime(research.agent)
+        guard !cli.isEmpty else { return nil }
+        return ModelTuning(
+            effort: bind(\.reasoning.effort),
+            speed: bind(\.reasoning.speed),
+            runtime: cli,
+            note: L("Saved with the profile “%@” — every role that sets none runs at it.", profile.name)
         )
     }
 
@@ -359,12 +391,6 @@ struct ResearchSettingsSection: View {
                         }
                         .labelsHidden()
                     }
-                    FieldLabel(L("Reasoning effort")) {
-                        Picker(L("Reasoning effort"), selection: bind(\.reasoning.effort)) {
-                            ForEach(EffortLevel.all, id: \.0) { Text(L($0.1)).tag($0.0) }
-                        }
-                        .labelsHidden()
-                    }
                     FieldLabel(L("Web access")) {
                         Picker(L("Web access"), selection: bind(\.search.web)) {
                             Text(L("Follow review.external")).tag("inherit")
@@ -453,6 +479,8 @@ struct ResearchSettingsSection: View {
                     researchAgent: research.agent,
                     researchers: research.researchers,
                     reviewRounds: research.reviewRounds,
+                    profileReasoning: profile?.reasoning ?? ResearchProfileDetail.Reasoning(),
+                    runtime: runtime,
                     inheritedModel: inheritedModel,
                     loadModels: loadModels,
                     remove: { removeRole(id: roles[selectedIndex].id) }
@@ -697,6 +725,10 @@ private struct RoleCard: View {
     let researchAgent: String
     let researchers: Int
     let reviewRounds: Int
+    /// What a role that sets no effort or speed runs at.
+    let profileReasoning: ResearchProfileDetail.Reasoning
+    /// The CLI a spec runs on, "" for a model (see the section's `runtime`).
+    let runtime: (String) -> String
     let inheritedModel: (String) -> String
     let loadModels: (String, Bool) async throws -> ModelListResponse
     let remove: () -> Void
@@ -804,8 +836,7 @@ private struct RoleCard: View {
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
             if isSeeded {
                 GridRow {
-                    modelField
-                    effortField
+                    modelField.gridCellColumns(2)
                     webField
                 }
                 GridRow {
@@ -820,8 +851,7 @@ private struct RoleCard: View {
             } else {
                 GridRow {
                     phaseField
-                    modelField
-                    effortField
+                    modelField.gridCellColumns(2)
                 }
                 GridRow {
                     webField
@@ -844,6 +874,9 @@ private struct RoleCard: View {
         }
     }
 
+    /// The role's effort and speed ride on its model; "default" is the
+    /// profile's, and the effort the phase is usually worth is marked on the
+    /// slider, so the recommendation sits where the choice is made.
     private var modelField: some View {
         ModelField(
             placeholder: L("Agent's model"),
@@ -851,22 +884,17 @@ private struct RoleCard: View {
             inherited: inheritedModel(effectiveAgent),
             providerKey: effectiveAgent,
             route: "agent:\(effectiveAgent)",
-            load: { refresh in try await loadModels(effectiveAgent, refresh) }
+            load: { refresh in try await loadModels(effectiveAgent, refresh) },
+            tuning: ModelTuning(
+                effort: $role.effort,
+                speed: $role.speed,
+                runtime: runtime(effectiveAgent),
+                inheritedEffort: profileReasoning.effort,
+                inheritedSpeed: profileReasoning.speed,
+                inheritedFrom: L("the profile"),
+                recommended: advice.effort == "default" ? nil : advice.effort
+            )
         )
-    }
-
-    /// The effort the phase is usually worth is marked in the list, so the
-    /// recommendation sits where the choice is made.
-    private var effortField: some View {
-        FieldLabel(L("Effort")) {
-            Picker(L("Effort"), selection: $role.effort) {
-                Text(L("Profile default")).tag("default")
-                ForEach(EffortLevel.all.dropFirst(), id: \.0) { value, label in
-                    Text(value == advice.effort ? "\(L(label)) · \(L("recommended"))" : L(label)).tag(value)
-                }
-            }
-            .labelsHidden()
-        }
     }
 
     private var webField: some View {

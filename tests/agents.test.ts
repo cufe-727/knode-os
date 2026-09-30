@@ -74,7 +74,7 @@ describe('agent definitions', () => {
     const loaded = loadAgent(dir, 'cheap');
     expect(loaded).toMatchObject({ name: 'cheap', executor: 'cursor-cli', effort: 'low' });
     // the fields the caller omitted come from the general template
-    expect(loaded?.tools).toEqual({ write: false, files: true, web: 'inherit' });
+    expect(loaded?.tools).toEqual({ web: 'inherit' });
     expect(loaded?.path).toBe(`${AGENTS_DIR}/cheap.yaml`);
 
     expect(() => saveAgent(dir, { name: 'not a name' })).toThrow(/invalid agent name/);
@@ -99,11 +99,11 @@ describe('agent definitions', () => {
     fs.mkdirSync(dir, { recursive: true });
     const config = defaultConfig();
     config.connections = [{ id: 'ark', label: 'Ark', provider: 'openai', baseUrl: 'https://ark.example/v1', apiKey: 'sk', model: 'doubao', cliPath: '', cliTimeoutMs: 300_000 }];
-    saveAgent(dir, { name: 'writer', executor: 'ark', model: 'doubao-pro', maxTurns: 7, effort: 'high' });
+    saveAgent(dir, { name: 'writer', executor: 'ark', model: 'doubao-pro', effort: 'high', tools: { web: 'off' } });
 
     const named = resolveAgentSpec(config, 'writer', '', dir);
     expect(named?.agent).toMatchObject({ kind: 'builtin', model: 'doubao-pro' });
-    expect(named?.definition).toMatchObject({ name: 'writer', maxTurns: 7, effort: 'high' });
+    expect(named?.definition).toMatchObject({ name: 'writer', effort: 'high', tools: { web: 'off' } });
 
     // a bare spec has no definition to read settings from, by construction
     expect(resolveAgentSpec(config, 'ark', '', dir)?.definition).toBeNull();
@@ -174,10 +174,11 @@ describe('retiring the deep-research template', () => {
     expect(loaded.extraction.entityLlm.use).toBe('relay');
     expect(loadProfile(dir, 'mine')?.roles.map((r) => r.agent)).toEqual(['deep-agent', '']);
 
-    // the built-in that stays takes its current wording, and no file keeps a kind
+    // the built-in that stays takes its current wording, and no file keeps a
+    // kind or what only Ask read
     const file = path.join(dir, AGENTS_DIR, 'deep-agent.yaml');
-    expect(loadAgent(dir, 'deep-agent')).toMatchObject({ title: 'deep agent', executor: 'default', tools: { write: true, files: true, web: 'inherit' } });
-    expect(fs.readFileSync(file, 'utf8')).not.toMatch(/^kind:/m);
+    expect(loadAgent(dir, 'deep-agent')).toMatchObject({ title: 'deep agent', executor: 'default', tools: { web: 'inherit' } });
+    expect(fs.readFileSync(file, 'utf8')).not.toMatch(/^(kind|description|maxTurns|timeoutMs|prompt):|^ {2}(write|files):/m);
 
     // written down once, and not seeded back: the next load finds nothing to do
     expect(JSON.parse(fs.readFileSync(path.join(dir, 'knode.config.json'), 'utf8')).research.agent).toBe('deep-agent');
@@ -188,16 +189,55 @@ describe('retiring the deep-research template', () => {
   });
 
   it('keeps a copy someone edited, as an ordinary agent that runs as it did', () => {
-    // a prompt of its own, and the tools it inherited from the template left out
-    const edited = seededResearch.replace("prompt: ''", 'prompt: 先列提纲再写。').replace(/tools:\n(?: {2}.*\n)+/, '');
+    // an effort of its own, and the tools it inherited from the template left out
+    const edited = seededResearch.replace('effort: default', 'effort: high').replace(/tools:\n(?: {2}.*\n)+/, '');
     const dir = workspace('retired-edited', edited);
     const loaded = loadConfig(dir);
 
     expect(loaded.research.agent).toBe('deep-research');
     expect(loadProfile(dir, 'mine')?.roles[0].agent).toBe('deep-research');
     expect(BUILTIN_AGENTS['deep-research']).toBeUndefined();
-    expect(loadAgent(dir, 'deep-research')).toMatchObject({ title: '深度研究 agent', prompt: '先列提纲再写。', tools: { write: true, files: true, web: 'inherit' } });
-    expect(fs.readFileSync(path.join(dir, AGENTS_DIR, 'deep-research.yaml'), 'utf8')).not.toMatch(/^kind:/m);
+    expect(loadAgent(dir, 'deep-research')).toMatchObject({ title: '深度研究 agent', effort: 'high', tools: { web: 'inherit' } });
+    expect(fs.readFileSync(path.join(dir, AGENTS_DIR, 'deep-research.yaml'), 'utf8')).not.toMatch(/^(kind|description|maxTurns|timeoutMs|prompt):|^ {2}(write|files):/m);
+  });
+});
+
+/**
+ * An agent is who runs a job and on what model. The turn cap, timeout, page
+ * and file tools and system prompt only Ask read, and the description nothing
+ * read, leave the files on load; web access stays.
+ */
+describe('dropping what only Ask read', () => {
+  it('strips those fields from every agent file once, keeping web access', () => {
+    const dir = path.join(tmp, 'ask-only');
+    fs.mkdirSync(path.join(dir, AGENTS_DIR), { recursive: true });
+    saveConfig(dir, defaultConfig());
+    const file = path.join(dir, AGENTS_DIR, 'codex.yaml');
+    fs.writeFileSync(file, [
+      'name: codex',
+      'title: codex',
+      'description: When to pick this agent',
+      'executor: codex-cli',
+      'model: gpt-6-sol',
+      'effort: high',
+      'tools:',
+      '  write: false',
+      '  files: false',
+      '  web: on',
+      'maxTurns: 7',
+      'timeoutMs: 60000',
+      'prompt: 只用一句话回答。',
+      '',
+    ].join('\n'));
+
+    loadConfig(dir);
+    const text = fs.readFileSync(file, 'utf8');
+    expect(text).not.toMatch(/^(description|maxTurns|timeoutMs|prompt):|^ {2}(write|files):/m);
+    expect(loadAgent(dir, 'codex')).toMatchObject({ executor: 'codex-cli', model: 'gpt-6-sol', effort: 'high', tools: { web: 'on' } });
+
+    // the next load finds nothing to do
+    loadConfig(dir);
+    expect(fs.readFileSync(file, 'utf8')).toBe(text);
   });
 });
 

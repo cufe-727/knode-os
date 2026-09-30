@@ -9,7 +9,7 @@ import { defaultConfig } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
 import { sync } from '../src/ingest/sync.js';
 import { queueJob } from '../src/research/jobs.js';
-import { claudeAgentsJson, codexAgentLayer, cursorModel, effortFor, sessionArgs } from '../src/research/launch.js';
+import { claudeAgentsJson, codexAgentLayer, cursorModel, effortFor, sessionArgs, speedFor } from '../src/research/launch.js';
 import { outlineFrom } from '../src/research/pipeline.js';
 import {
   activeProfile, claimSourceIssues, ensureDefaultProfiles, loadProfile, loadProfiles, normalizeProfile, normalizePromptPath, profileBrief,
@@ -147,15 +147,29 @@ describe('research profiles · CLI adapters', () => {
     expect(effortFor('codex-cli', 'max')).toBe('max');
     expect(effortFor('cursor-cli', 'xhigh')).toBe('high');
     expect(effortFor('claude-cli', 'default')).toBeNull();
+    // ultra is codex's own rung; the others get the highest they take
+    expect(effortFor('codex-cli', 'ultra')).toBe('ultra');
+    expect(effortFor('claude-cli', 'ultra')).toBe('max');
+    expect(effortFor('cursor-cli', 'ultra')).toBe('high');
     expect(cursorModel('gpt-5', 'high')).toBe('gpt-5[effort=high]');
     expect(cursorModel('claude-opus-4-8[context=1m,fast=false]', 'max')).toBe('claude-opus-4-8[context=1m,fast=false,effort=high]');
     expect(cursorModel('claude-opus-4-8[effort=low]', 'medium')).toBe('claude-opus-4-8[effort=medium]');
     expect(cursorModel('', 'high')).toBe('');
   });
 
+  it('maps speed per CLI: only codex has a tier to ask for', () => {
+    expect(speedFor('codex-cli', 'fast')).toBe('fast');
+    expect(speedFor('codex-cli', 'default')).toBeNull();
+    expect(speedFor('codex-cli', undefined)).toBeNull();
+    expect(speedFor('claude-cli', 'fast')).toBeNull();
+    expect(speedFor('cursor-cli', 'fast')).toBeNull();
+  });
+
   it('claude: effort flag, web tools, file tools and native sub-agents', () => {
-    const agents = [{ id: 'researcher', title: '研究员', description: '取证', prompt: 'P', write: false, files: true, web: true, model: 'sonnet', effort: 'high' as const }];
-    const { args } = sessionArgs({ ...baseSession, effort: 'max', allowNetwork: true, agents });
+    const agents = [{ id: 'researcher', title: '研究员', description: '取证', prompt: 'P', write: false, files: true, web: true, model: 'sonnet', effort: 'high' as const, speed: 'default' as const }];
+    const { args } = sessionArgs({ ...baseSession, effort: 'max', speed: 'fast', allowNetwork: true, agents });
+    // claude has no per-call tier, so Fast asks nothing of it
+    expect(args.some((a) => a.includes('service_tier'))).toBe(false);
     expect(args).toContain('--effort');
     expect(args[args.indexOf('--effort') + 1]).toBe('max');
     expect(args).toContain('WebSearch');
@@ -183,7 +197,10 @@ describe('research profiles · CLI adapters', () => {
     const off = sessionArgs({ ...baseSession, agent: { ...baseSession.agent, provider: 'codex-cli' as const } }).args;
     expect(off).toContain('web_search="disabled"');
     expect(off.some((a) => a.startsWith('model_reasoning_effort'))).toBe(false);
-    const agents = [{ id: 'critic', title: '评审', description: '评审页面', prompt: "检查 '''页面'''", write: false, files: true, web: false, model: '', effort: 'high' as const }];
+    expect(off.some((a) => a.startsWith('service_tier'))).toBe(false);
+    const fast = sessionArgs({ ...baseSession, agent: { ...baseSession.agent, provider: 'codex-cli' as const }, speed: 'fast' }).args;
+    expect(fast).toContain('service_tier="fast"');
+    const agents = [{ id: 'critic', title: '评审', description: '评审页面', prompt: "检查 '''页面'''", write: false, files: true, web: false, model: '', effort: 'high' as const, speed: 'fast' as const }];
     const native = sessionArgs({ ...baseSession, agent: { ...baseSession.agent, provider: 'codex-cli' as const }, agents, effort: 'high' }).args;
     expect(native).toContain('agents.enabled=true');
     expect(native).toContain('agents.critic.description="评审页面"');
@@ -191,6 +208,8 @@ describe('research profiles · CLI adapters', () => {
     expect(native).toContain('agents.default_subagent_reasoning_effort="high"');
     const layer = codexAgentLayer(agents[0], 'live');
     expect(layer).toContain('model_reasoning_effort = "high"');
+    expect(layer).toContain('service_tier = "fast"');
+    expect(codexAgentLayer({ ...agents[0], speed: 'default' }, 'live')).not.toContain('service_tier');
     expect(layer).toContain('web_search = "disabled"');
     expect(layer).toContain("developer_instructions = '''");
     expect(layer).not.toContain("'''页面'''");
