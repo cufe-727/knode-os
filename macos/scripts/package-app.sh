@@ -12,7 +12,8 @@ RESOURCE_BUNDLE="$MACOS_DIR/.build/release/KnodeOS_KnodeOSApp.bundle"
 APP_ICON="$MACOS_DIR/App/AppIcon.icns"
 NODE_BIN="${KNODE_OS_NODE:-$(command -v node)}"
 DEPLOY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/knode-service.XXXXXX")"
-trap 'rm -rf "$DEPLOY_DIR"' EXIT
+PACK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/knode-pack.XXXXXX")"
+trap 'rm -rf "$DEPLOY_DIR" "$PACK_DIR"' EXIT
 
 cd "$REPO_DIR"
 npm run build
@@ -35,17 +36,25 @@ cp "$MACOS_DIR/.build/release/KnodeOS" "$BIN_DIR/KnodeOS"
 cp "$MACOS_DIR/App/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$APP_ICON" "$RESOURCES_DIR/AppIcon.icns"
 ditto "$RESOURCE_BUNDLE" "$APP_DIR/KnodeOS_KnodeOSApp.bundle"
-(cd "$REPO_DIR" && pnpm --filter knode-os deploy --prod --legacy --force "$DEPLOY_DIR")
+# The service's published files — what `pnpm pack` ships per package.json
+# `files` — unpacked into the deploy directory. This used to be
+# `pnpm deploy --legacy`, which copies the same files and then runs an install.
+# That install was a no-op ("Already up to date") only while pnpm's
+# optimistic-repeat-install check found node_modules/.pnpm-workspace-state-v1.json
+# recorded with --prod settings. An ordinary `pnpm install` in the repo records
+# `dev: true`, and the next deploy re-resolved every dependency from the
+# registry — offline or not, since KNODE_OS_PNPM_FLAGS never reached it.
+(cd "$REPO_DIR" && pnpm pack --pack-destination "$PACK_DIR" >/dev/null)
+tar -xzf "$PACK_DIR"/*.tgz -C "$DEPLOY_DIR" --strip-components=1
 # --prod skips *installing* devDependencies, but pnpm still resolves them, so a
 # dev-only package whose build script is not approved outside the workspace
 # (esbuild, pulled in by tsx and vitest) aborts the install under pnpm 11's
 # strict dep builds. The service runs plain `node dist/cli.js` and needs none of
 # them, so drop them from the deployed manifest before installing.
 node -e 'const fs=require("fs"); const p=process.argv[1]+"/package.json"; const j=JSON.parse(fs.readFileSync(p,"utf8")); delete j.devDependencies; fs.writeFileSync(p, JSON.stringify(j,null,2)+"\n")' "$DEPLOY_DIR"
-# Legacy deploy only copies the published files — since pnpm 11 it installs
-# nothing ("Already up to date"), which ships a service that cannot resolve its
-# own imports. Install the production tree here, hoisted so the bundle carries
-# plain directories instead of links into the developer's store.
+# The packed files carry no dependencies. Install the production tree here,
+# hoisted so the bundle carries plain directories instead of links into the
+# developer's store.
 # The workspace lockfile comes along, so the bundle carries the versions the
 # tests ran against. Without it this resolved every range afresh from registry
 # metadata: what shipped drifted as soon as the cached metadata did — dozens of
