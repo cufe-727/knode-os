@@ -185,7 +185,7 @@ program
 
 program
   .command('ask <question>')
-  .description('answer a question from the knowledge base with citations (needs llm.model configured)')
+  .description('answer a question from the knowledge base with citations (runs on the Summarize stage, extraction.summaryLlm)')
   .option('-m, --mode <mode>', 'retrieval mode: hybrid | vector | keyword | sag', 'hybrid')
   .action(async (question, opts) => {
     const ctx = await createContext(dataDir());

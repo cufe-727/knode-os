@@ -205,7 +205,7 @@ describe('the agents API with CLI agents', () => {
     expect(agents.agents.find((a) => a.name === 'connection-3')).toMatchObject({ executor: 'codex-cli' });
   });
 
-  it('runs a stage on a deepagents agent that pins a model, and moves it off by name', async () => {
+  it('runs a stage on a deepagents agent, with or without a model of its own, and moves it off by name', async () => {
     await app.request('/api/agents/drafter', {
       method: 'PUT',
       headers,
@@ -223,19 +223,18 @@ describe('the agents API with CLI agents', () => {
     expect(saved.status).toBe(200);
     let current = await config();
     expect(current.extraction.entityLlm.use).toBe('drafter');
-    // the built-in pins no model, so it is its endpoint's row again: the stage lands on that
-    expect(current.extraction.conceptLlm.use).toBe('connection-1');
+    // the built-in pins no model: it runs the loop on the default's
+    expect(current.extraction.conceptLlm.use).toBe('deep-agent');
     // a stage that names nothing is written down as the default
     expect(current.extraction.documentLlm.use).toBe('connection-1');
     expect(current.modelAgents).toBeUndefined();
 
-    // give the built-in a model of its own and a stage can name it ...
+    // a model of its own changes which model the loop runs on, not whether a stage can name it
     await app.request('/api/agents/deep-agent', { method: 'PUT', headers, body: JSON.stringify({ agent: { executor: 'default', model: 'own-model' } }) });
-    await app.request('/api/config', { method: 'PUT', headers, body: JSON.stringify({ extraction: { conceptLlm: { use: 'deep-agent' } } }) });
     expect((await config()).extraction.conceptLlm.use).toBe('deep-agent');
-    // ... until a reset takes the model away, and the stage follows to the endpoint it runs on
+    // resetting a built-in brings it back rather than taking the stage off it
     await app.request('/api/agents/deep-agent', { method: 'DELETE', headers });
-    expect((await config()).extraction.conceptLlm.use).toBe('connection-1');
+    expect((await config()).extraction.conceptLlm.use).toBe('deep-agent');
 
     await app.request('/api/agents/drafter', { method: 'DELETE', headers });
     current = await config();
@@ -245,13 +244,14 @@ describe('the agents API with CLI agents', () => {
 
 /**
  * A stage sends its own prompt and wants one answer back, so an agent runs it
- * one-shot: a CLI agent as itself, a deepagents agent as the model it runs on.
- * One with no model of its own is that endpoint's row again, so it is no target.
+ * once through its own loop: a CLI agent as itself, a deepagents agent as the
+ * deepagents loop on its model — which is what sets it apart from its
+ * endpoint's row, with or without a model of its own.
  */
 describe('deepagents agents as pipeline stages', () => {
   const other = row({ id: 'connection-2', label: 'other', provider: 'openai', baseUrl: 'https://other.example/v1', apiKey: 'sk-2', model: 'other-model' });
 
-  it('runs a stage on the model an agent pins, and moves one on a model-less agent to its endpoint', () => {
+  it('runs a stage on any deepagents agent, through its loop on the model it runs on', () => {
     const base = defaultConfig();
     const { id: _id, ...mirror } = relay;
     const dir = workspace('deepagents-stages', {
@@ -271,19 +271,21 @@ describe('deepagents agents as pipeline stages', () => {
     const loaded = loadConfig(dir);
     const resolve = (key: 'entityLlm' | 'conceptLlm' | 'documentLlm') =>
       resolveRoutedLlmConfig(loaded.llm, loaded.extraction[key], routeTargets(loaded));
-    // one that pins a model brings that endpoint and its own model, and stays a target
+    // one that pins a model brings that endpoint and its own model, run through the loop
     expect(loaded.extraction.conceptLlm.use).toBe('pinned');
-    expect(resolve('conceptLlm')).toMatchObject({ baseUrl: 'https://other.example/v1', apiKey: 'sk-2', model: 'agent-model' });
-    expect(routeTargets(loaded).find((t) => t.id === 'pinned')).toMatchObject({ label: 'Pinned', model: 'agent-model' });
+    expect(resolve('conceptLlm')).toMatchObject({ baseUrl: 'https://other.example/v1', apiKey: 'sk-2', model: 'agent-model', loop: 'deepagents' });
+    expect(routeTargets(loaded).find((t) => t.id === 'pinned')).toMatchObject({ label: 'Pinned', model: 'agent-model', loop: 'deepagents' });
 
-    // one without is the endpoint it runs on, under another name: the stage
-    // moves there — the default's for the built-in that follows it, the pinned
-    // connection for the other — and runs exactly as before, route model included
-    expect(loaded.extraction.entityLlm.use).toBe('connection-1');
-    expect(resolve('entityLlm')).toMatchObject({ provider: 'openai', baseUrl: 'https://relay.example/v1', model: 'ark/seed-evolving' });
-    expect(loaded.extraction.documentLlm).toMatchObject({ use: 'connection-2', model: 'route-model' });
-    expect(resolve('documentLlm')).toMatchObject({ baseUrl: 'https://other.example/v1', model: 'route-model' });
-    expect(routeTargets(loaded).map((t) => t.id)).toEqual(['connection-1', 'connection-2', 'pinned']);
+    // one without runs on its endpoint's model — the default's for the
+    // built-in that follows it, the pinned connection's for the other — and
+    // stays where it is, a route model still winning
+    expect(loaded.extraction.entityLlm.use).toBe('deep-agent');
+    expect(resolve('entityLlm')).toMatchObject({ provider: 'openai', baseUrl: 'https://relay.example/v1', model: 'ark/seed-evolving', loop: 'deepagents' });
+    expect(loaded.extraction.documentLlm).toMatchObject({ use: 'plain', model: 'route-model' });
+    expect(resolve('documentLlm')).toMatchObject({ baseUrl: 'https://other.example/v1', model: 'route-model', loop: 'deepagents' });
+    expect(routeTargets(loaded).map((t) => t.id)).toEqual(['connection-1', 'connection-2', 'deep-agent', 'pinned', 'plain']);
+    // a model is called directly, as before
+    expect(resolveRoutedLlmConfig(loaded.llm, { ...defaultRoutedLlmConfig(), use: 'connection-2' }, routeTargets(loaded))).not.toHaveProperty('loop');
 
     // the default cannot be an agent like these, since they may follow it
     expect(llmTargets(loaded).map((t) => t.id)).toEqual(['connection-1', 'connection-2']);

@@ -387,7 +387,7 @@ struct APIClient {
     }
 
     /// Models the draft config's provider offers for one route ("embedding",
-    /// "llm", "entityLlm", "conceptLlm", "documentLlm"). Inherited routes are
+    /// "llm", "entityLlm", "conceptLlm", "documentLlm", "summaryLlm"). Inherited routes are
     /// resolved against the draft default provider server-side.
     /// `refresh` asks the provider again instead of taking the service's
     /// cached answer — what the refresh button in the picker sends.

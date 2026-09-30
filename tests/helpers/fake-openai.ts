@@ -21,7 +21,7 @@ export interface FakeOpenAi {
   close: () => Promise<void>;
 }
 
-interface ChatRequest {
+export interface ChatRequest {
   model?: string;
   stream?: boolean;
   messages?: { role: string; content?: unknown; tool_calls?: { function?: { name?: string } }[] }[];
@@ -33,6 +33,11 @@ export interface FakeOpenAiOptions {
   delayMs?: number;
   /** Page body to write; defaults to a page that satisfies the entity template. */
   page?: (input: { target: string; sections: string[]; sources: string[] }) => string;
+  /**
+   * A plain answer for a request, instead of the research script — how a
+   * pipeline stage is answered. Returning undefined falls through to the script.
+   */
+  answer?: (request: ChatRequest) => string | undefined;
 }
 
 const textOf = (content: unknown): string =>
@@ -84,8 +89,11 @@ export async function startFakeOpenAi(opts: FakeOpenAiOptions = {}): Promise<Fak
     // The team pipeline marks each phase in its prompt, the same marker the fake
     // CLI dispatches on. Phases that only return text never touch a tool.
     const phase = /<!--\s*knode-phase:\s*(\w+)\s*-->/.exec(brief)?.[1] ?? null;
+    const answer = opts.answer?.(body);
     let message: Record<string, unknown>;
-    if (phase === 'plan') {
+    if (answer !== undefined) {
+      message = { role: 'assistant', content: answer };
+    } else if (phase === 'plan') {
       message = { role: 'assistant', content: planJson(target, sections) };
     } else if (phase === 'research') {
       const section = /阶段 2：调查「(.+?)」/.exec(brief)?.[1]?.trim() ?? sections[0] ?? '## 概要';

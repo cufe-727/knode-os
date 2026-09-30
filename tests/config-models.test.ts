@@ -410,7 +410,8 @@ describe('PUT /api/config with connections', () => {
 
     const after = ((await (await save({ llmUse: 'ark2' })).json()) as { config: KnodeConfig }).config;
     expect(after.llmUse).toBe('ark2');
-    // the mirror follows the row, so ctx.llm and every inheriting route move with it
+    // the mirror follows the row, so whatever follows the default moves with it
+    // — the stages do not, each names what it runs on
     expect(after.llm).toMatchObject({ baseUrl: 'https://ark.example/api/v3', model: 'doubao-pro', apiKey: '***' });
     // and the one that used to be the default is still on the list, just no longer default
     expect(after.connections.some((c) => c.id === previousDefault)).toBe(true);

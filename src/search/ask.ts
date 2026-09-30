@@ -84,7 +84,7 @@ export async function ask(
 
   if (!llm.enabled) {
     return {
-      answer: 'LLM is not configured (set llm.model in knode.config.json) — returning retrieved context only.',
+      answer: 'The Summarize stage has no model (Settings → Pipeline, or extraction.summaryLlm in knode.config.json) — returning retrieved context only.',
       citations: contexts.map((c, i) => ({ ref: i + 1, path: c.path, chunkId: c.chunkId })),
       gaps: [],
       contexts,

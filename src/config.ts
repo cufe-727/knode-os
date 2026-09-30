@@ -153,6 +153,14 @@ export interface LlmConfig {
   cliTimeoutMs: number;
   /** Shown in the UI. Empty = llmProviderLabel(provider). */
   label?: string;
+  /**
+   * 'deepagents' = run the deepagents loop on this endpoint and hand back its
+   * final answer, instead of calling the model directly: how a pipeline stage
+   * runs a deepagents agent (see `routeTargets`). Never stored; a route
+   * resolves it from the agent it names. CLI providers ignore it — their
+   * loop is the CLI's own.
+   */
+  loop?: 'deepagents';
 }
 
 /** Per-job LLM routing. `inherit` keeps using the default `llm` connection. */
@@ -201,6 +209,14 @@ export interface ExtractionConfig {
   conceptLlm: RoutedLlmConfig;
   /** Vision-capable provider used to convert images and scanned PDF pages to Markdown. */
   documentLlm: RoutedLlmConfig;
+  /**
+   * The Summarize stage: document summaries, Dream, the nightly merge and
+   * claim reviews, and knode_ask — every job that takes `ctx.llm` rather than
+   * a stage of its own (see `summaryLlmClient`). These ran on the default LLM
+   * until they got a route; `pinRoutes` writes a config from before down as
+   * the default it was running on.
+   */
+  summaryLlm: RoutedLlmConfig;
   /** New documents get a priority boost that decays over this many days. */
   freshnessBoostDays: number;
   /** Static per-root priority weights for the extraction queue. */
@@ -513,9 +529,10 @@ export interface KnodeConfig {
   /**
    * A mirror of the connection `llmUse` names, flattened by `syncActiveLlm`.
    *
-   * Everything that needs "the default model" — `ctx.llm`, a route that names
-   * no connection, `agentForSpec('default')` — reads this, so the default can
-   * become an ordinary row without touching any of them.
+   * Everything that needs "the default model" — a route that names no
+   * connection, `agentForSpec('default')` — reads this, so the default can
+   * become an ordinary row without touching any of them. `ctx.llm` used to
+   * be one of them; it is the Summarize stage's now (`summaryLlmClient`).
    */
   llm: LlmConfig;
   /**
@@ -636,6 +653,7 @@ export function defaultConfig(): KnodeConfig {
       entityLlm: defaultRoutedLlmConfig(),
       conceptLlm: defaultRoutedLlmConfig(),
       documentLlm: defaultRoutedLlmConfig(),
+      summaryLlm: defaultRoutedLlmConfig(),
       freshnessBoostDays: 3,
       importance: { docs: 1.0, skills: 0.6 },
       batchSize: 8,
@@ -749,6 +767,7 @@ export function resolveRoutedLlmConfig(
       effort: routeEffort(route.effort) ?? connection.effort,
       speed: routeSpeed(route.speed) ?? connection.speed,
       cliTimeoutMs: route.cliTimeoutMs || connection.cliTimeoutMs,
+      ...(connection.loop ? { loop: connection.loop } : {}),
     };
   }
   if (route.use) {
@@ -899,7 +918,7 @@ export function dropTokenBudget(config: KnodeConfig): boolean {
   return true;
 }
 
-const ROUTE_KEYS = ['entityLlm', 'conceptLlm', 'documentLlm'] as const;
+const ROUTE_KEYS = ['entityLlm', 'conceptLlm', 'documentLlm', 'summaryLlm'] as const;
 
 /**
  * Lift pre-connections route overrides into named connections, in memory, so
@@ -998,18 +1017,18 @@ export function llmTargets(config: Pick<KnodeConfig, 'connections' | 'agentLlms'
 
 /**
  * Everything a pipeline route can run on: `llmTargets`, then the deepagents
- * agents that pin a model of their own, as that model on their endpoint.
+ * agents, each as its endpoint with the deepagents loop on it.
  *
- * A stage sends its own prompt and wants one answer back, so an agent is
- * called one-shot either way: a CLI agent brings its path and model, a
- * deepagents agent its endpoint and model; neither brings its loop, tools or
- * prompt. A deepagents agent with no model of its own would therefore be its
- * endpoint's row again under another name — the stage picker listed each
- * such agent beside the model it is — so it is left out, and `pinRoutes`
- * moves a stage on one to that endpoint. The default cannot be one of these,
- * since they may follow it — so they stay out of `llmTargets`. One following
- * a default that is a CLI agent does not run at all (see `resolveAgentSpec`),
- * so it is no target either.
+ * A stage sends its own prompt and wants one answer back. A model answers it
+ * directly; an agent runs its own loop on it once and hands back the final
+ * answer — a CLI agent as that CLI, a deepagents agent as the deepagents loop
+ * on its model (`loop`, see `completeViaDeepagents`). So a deepagents agent is
+ * not its endpoint's row again under another name, even when it names no
+ * model of its own: the same model, reached through the loop.
+ *
+ * The default cannot be one of these, since they may follow it — so they
+ * stay out of `llmTargets`. One following a default that is a CLI agent does
+ * not run at all (see `resolveAgentSpec`), so it is no target either.
  */
 export function routeTargets(
   config: Pick<KnodeConfig, 'llm' | 'connections' | 'llmUse' | 'agentLlms' | 'modelAgents'>,
@@ -1018,15 +1037,19 @@ export function routeTargets(
   const connections = config.connections ?? [];
   const agents: LlmConnection[] = [];
   for (const agent of config.modelAgents ?? []) {
-    if (!agent.model || targets.some((t) => t.id === agent.id)) continue;
+    if (targets.some((t) => t.id === agent.id)) continue;
     const endpoint = agent.runsOn === 'default' ? activeLlm(config) : connections.find((c) => c.id === agent.runsOn);
     if (!endpoint || isCliProvider(endpoint.provider)) continue;
-    agents.push({ ...endpoint, id: agent.id, label: agent.label, model: agent.model });
+    agents.push({ ...endpoint, id: agent.id, label: agent.label, model: agent.model || endpoint.model, loop: 'deepagents' });
   }
   return [...targets, ...agents];
 }
 
-const LEGACY_ROUTE_MODELS = { entityLlm: 'tier1Model', conceptLlm: 'tier2Model' } as const;
+/** The routes that replaced a tier model, which a pinned route takes over. */
+const LEGACY_ROUTE_MODELS: Partial<Record<(typeof ROUTE_KEYS)[number], 'tier1Model' | 'tier2Model'>> = {
+  entityLlm: 'tier1Model',
+  conceptLlm: 'tier2Model',
+};
 
 /**
  * Write down what each pipeline stage runs on, by id.
@@ -1050,17 +1073,7 @@ export function pinRoutes(config: KnodeConfig): boolean {
     // 'default' is what `resolveRoutedLlmConfig` reads as the default, even
     // when an agent happens to have that name
     if (route.use && route.use !== 'default' && targets.some((t) => t.id === route.use)) continue;
-    // a deepagents agent with no model of its own is no target (`routeTargets`),
-    // but its endpoint is the very call it made, so the stage moves there
-    // rather than to the default
-    const agent = route.use && route.use !== 'default' ? config.modelAgents?.find((a) => a.id === route.use && !a.model) : undefined;
-    const endpoint = agent ? (agent.runsOn === 'default' ? config.llmUse : agent.runsOn) : '';
-    if (endpoint && targets.some((t) => t.id === endpoint)) {
-      config.extraction[key] = { ...route, use: endpoint };
-      moved = true;
-      continue;
-    }
-    const legacy = key === 'documentLlm' ? null : LEGACY_ROUTE_MODELS[key];
+    const legacy = LEGACY_ROUTE_MODELS[key];
     config.extraction[key] = { ...route, use: config.llmUse, model: route.model || (legacy ? config.extraction[legacy] : '') };
     if (legacy) config.extraction[legacy] = '';
     moved = true;
@@ -1356,6 +1369,7 @@ export function redactConfig(config: KnodeConfig): KnodeConfig {
     clone.extraction.entityLlm,
     clone.extraction.conceptLlm,
     clone.extraction.documentLlm,
+    clone.extraction.summaryLlm,
     ...(clone.connections ?? []),
     ...(clone.embeddingProviders ?? []),
   ];

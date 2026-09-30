@@ -120,7 +120,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
     'knode_ask',
     {
       title: 'Ask the knowledge base',
-      description: 'RAG answer with [n] citations and explicit gaps. Requires llm.model configured; otherwise returns retrieved context.',
+      description: 'RAG answer with [n] citations and explicit gaps, written by the Summarize pipeline stage (extraction.summaryLlm). When that stage has no model, returns the retrieved context instead.',
       inputSchema: {
         question: z.string(),
         mode: z.enum(['hybrid', 'vector', 'keyword', 'sag']).optional().describe('Retrieval mode (default hybrid)'),
