@@ -132,9 +132,12 @@ export async function applyExtraction(
   claims: ExtractedClaim[] = [],
   extractor = 'tier1.llm',
   opts: { docDate?: string | null } = {},
-): Promise<{ entities: number; relations: number; claims: number }> {
+): Promise<{ entities: number; relations: number; claims: number; entityIds: string[] }> {
   const ref = opts.docDate ?? null;
   const idByName = new Map<string, string>();
+  // every entity this extraction wrote evidence for, relation endpoints
+  // included — what the duplicate audit after a tier-1 pass looks at
+  const touched = new Set<string>();
 
   for (const e of entities) {
     const needles = [e.name, ...(e.aliases ?? [])].map((s) => s.toLowerCase());
@@ -143,6 +146,7 @@ export async function applyExtraction(
       return needles.some((n) => n && lc.includes(n));
     });
     const id = await w.entity(e, { extractor, segmentId: hits[0]?.id ?? page.chunkIds[0]?.id ?? null });
+    touched.add(id);
     idByName.set(e.name.toLowerCase(), id);
     for (const a of e.aliases ?? []) idByName.set(a.toLowerCase(), id);
     for (const h of hits.slice(0, 8)) await w.mention(id, h.id, page.documentId);
@@ -153,6 +157,8 @@ export async function applyExtraction(
   for (const r of relations) {
     const sourceId = idByName.get(r.source.toLowerCase()) ?? (await w.entity({ name: r.source, type: 'concept' }, { extractor }));
     const targetId = idByName.get(r.target.toLowerCase()) ?? (await w.entity({ name: r.target, type: 'concept' }, { extractor }));
+    touched.add(sourceId);
+    touched.add(targetId);
     // the writer normalizes the predicate against the ontology (synonyms, inverse readings, unknown → related_to)
     if (await w.relation(sourceId, targetId, { type: r.type, description: r.description, validFrom: dateStart(r.validFrom, ref), validTo: dateEnd(r.validTo, ref), extractor })) relCount++;
   }
@@ -186,7 +192,7 @@ export async function applyExtraction(
     });
     if (id) claimCount++;
   }
-  return { entities: entities.length, relations: relCount, claims: claimCount };
+  return { entities: entities.length, relations: relCount, claims: claimCount, entityIds: [...touched] };
 }
 
 /** Ground a claim statement to the chunk with the highest token overlap. */

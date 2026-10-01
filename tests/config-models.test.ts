@@ -181,7 +181,7 @@ describe('migrateRouteConnections', () => {
     const config = defaultConfig();
     config.llm = { ...config.llm, apiKey: 'sk-default', model: 'gpt-4.1-mini' };
     config.extraction.entityLlm = { ...defaultRoutedLlmConfig(), provider: 'cursor-cli', model: 'gpt-5.2' };
-    config.extraction.conceptLlm = { ...defaultRoutedLlmConfig(), provider: 'cursor-cli' };
+    config.extraction.summaryLlm = { ...defaultRoutedLlmConfig(), provider: 'cursor-cli' };
     config.extraction.documentLlm = { ...defaultRoutedLlmConfig(), provider: 'openai', model: 'gpt-4.1' };
     return config;
   };
@@ -191,7 +191,7 @@ describe('migrateRouteConnections', () => {
     expect(migrated.connections).toHaveLength(1);
     expect(migrated.connections[0]).toMatchObject({ id: 'cursor-cli-1', provider: 'cursor-cli', label: 'Cursor Agent CLI' });
     expect(migrated.extraction.entityLlm.use).toBe('cursor-cli-1');
-    expect(migrated.extraction.conceptLlm.use).toBe('cursor-cli-1');
+    expect(migrated.extraction.summaryLlm.use).toBe('cursor-cli-1');
     // the document route resolved to the default endpoint, so it points there
     expect(migrated.extraction.documentLlm.use).toBe('default');
   });
@@ -199,7 +199,7 @@ describe('migrateRouteConnections', () => {
   it('preserves what each route actually resolved to', () => {
     const before = legacy();
     const after = migrateRouteConnections(JSON.parse(JSON.stringify(before)) as KnodeConfig);
-    for (const key of ['entityLlm', 'conceptLlm', 'documentLlm'] as const) {
+    for (const key of ['entityLlm', 'summaryLlm', 'documentLlm'] as const) {
       expect(resolveRoutedLlmConfig(after.llm, after.extraction[key], after.connections)).toEqual(
         resolveRoutedLlmConfig(before.llm, before.extraction[key], []),
       );
@@ -567,6 +567,25 @@ describe('dropTokenBudget', () => {
   });
 });
 
+describe('dropInitExtractionChoice', () => {
+  it('drops the retired drain / skip choice and keeps the time cap', () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'init-config-'));
+    const file = path.join(dir, 'knode.config.json');
+    fs.writeFileSync(file, JSON.stringify(loadConfig(dir)));
+    loadConfig(dir); // settles whatever else a first load writes down
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, JSON.stringify({
+      ...stored,
+      research: { ...stored.research, init: { followUps: 4, extraction: 'skip', extractionMaxMs: 300_000 } },
+    }));
+
+    const loaded = loadConfig(dir);
+    expect(loaded.research.init).toEqual({ followUps: 4, extractionMaxMs: 300_000 });
+    // an initialization always catches up now, so the file stops offering a choice nothing reads
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).research.init).not.toHaveProperty('extraction');
+  });
+});
+
 describe('migrateDefaultLlm', () => {
   const write = (config: unknown) => {
     const dir = fs.mkdtempSync(path.join(tmp, 'default-llm-'));
@@ -611,21 +630,21 @@ describe('migrateDefaultLlm', () => {
       connections: [],
       extraction: {
         ...base.extraction,
-        tier2Model: 'legacy-concept',
+        tier1Model: 'legacy-entity',
         entityLlm: { ...defaultRoutedLlmConfig(), use: '' },
-        conceptLlm: { ...defaultRoutedLlmConfig(), use: 'default' },
+        summaryLlm: { ...defaultRoutedLlmConfig(), use: 'default' },
       },
     });
 
     const loaded = loadConfig(dir);
     // a stage names what it runs on: there is no "whatever the default is"
-    for (const key of ['entityLlm', 'conceptLlm', 'documentLlm'] as const) {
+    for (const key of ['entityLlm', 'documentLlm', 'summaryLlm', 'judgeLlm'] as const) {
       expect(loaded.extraction[key].use).toBe(loaded.llmUse);
     }
-    expect(resolveRoutedLlmConfig(loaded.llm, loaded.extraction.entityLlm, loaded.connections).model).toBe('m-3');
+    expect(resolveRoutedLlmConfig(loaded.llm, loaded.extraction.documentLlm, loaded.connections).model).toBe('m-3');
     // the legacy tier model the route was running is carried onto it
-    expect(loaded.extraction.conceptLlm.model).toBe('legacy-concept');
-    expect(loaded.extraction.tier2Model).toBe('');
+    expect(loaded.extraction.entityLlm.model).toBe('legacy-entity');
+    expect(loaded.extraction.tier1Model).toBe('');
 
     const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 'knode.config.json'), 'utf8')) as KnodeConfig;
     expect(onDisk.extraction.entityLlm.use).toBe(loaded.llmUse);

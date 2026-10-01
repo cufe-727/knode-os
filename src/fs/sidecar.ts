@@ -156,6 +156,7 @@ const PART_FILES: Record<SidecarPart, string> = {
 const CONTENT_FILE = 'content.md';
 const VIEWS_DIR = 'views';
 const SOURCE_SUMMARY_FILE = `${VIEWS_DIR}/source-summary.md`;
+const SOURCE_SUMMARY_FAILED_FILE = `${VIEWS_DIR}/source-summary.failed.json`;
 
 /* ------------------------------ low level ------------------------------ */
 
@@ -356,6 +357,41 @@ export function writeSourceSummary(dataDir: string, key: string, cache: SourceSu
     { contentSha: cache.contentSha, model: cache.model, generatedAt: cache.generatedAt },
     cache.body,
   );
+}
+
+/**
+ * Failed attempts at a document's summary page, counted for the content they
+ * were made on, so the background pass stops retrying a document that keeps
+ * failing until its content changes.
+ */
+export interface SourceSummaryFailure {
+  contentSha: string;
+  attempts: number;
+  error: string;
+  at: string;
+}
+
+export function readSourceSummaryFailure(dataDir: string, key: string): SourceSummaryFailure | null {
+  const raw = readJson<Partial<SourceSummaryFailure>>(path.join(sidecarDir(dataDir, key), SOURCE_SUMMARY_FAILED_FILE));
+  if (!raw || typeof raw.contentSha !== 'string' || typeof raw.attempts !== 'number') return null;
+  return { contentSha: raw.contentSha, attempts: raw.attempts, error: String(raw.error ?? ''), at: String(raw.at ?? '') };
+}
+
+/** One more failure on this content; a failure on different content starts the count over. */
+export function recordSourceSummaryFailure(dataDir: string, key: string, contentSha: string, error: string): SourceSummaryFailure {
+  const prev = readSourceSummaryFailure(dataDir, key);
+  const next: SourceSummaryFailure = {
+    contentSha,
+    attempts: prev?.contentSha === contentSha ? prev.attempts + 1 : 1,
+    error: error.slice(0, 300),
+    at: new Date().toISOString(),
+  };
+  writeAtomic(path.join(sidecarDir(dataDir, key), SOURCE_SUMMARY_FAILED_FILE), `${JSON.stringify(next, null, 2)}\n`);
+  return next;
+}
+
+export function clearSourceSummaryFailure(dataDir: string, key: string): void {
+  fs.rmSync(path.join(sidecarDir(dataDir, key), SOURCE_SUMMARY_FAILED_FILE), { force: true });
 }
 
 /* ------------------------------- helpers ------------------------------- */

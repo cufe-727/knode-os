@@ -144,7 +144,7 @@ describe('workspace lifecycle and API isolation', () => {
         llm: { provider: 'codex-cli', model: 'research-model', cliPath: 'codex-research' },
         extraction: {
           entityLlm: { provider: 'claude-cli', model: 'entity-model' },
-          conceptLlm: { provider: 'inherit', model: 'concept-model' },
+          summaryLlm: { provider: 'inherit', model: 'summary-model' },
         },
       }),
     });

@@ -18,7 +18,7 @@ materialized views (stubs, source summaries, community pages) — nothing "deepl
 | D1 runner | built into knode‑os: a persistent job queue inside `serve` launches the configured agent — the user's claude / codex / cursor CLI headlessly, or the **built‑in agent** (a LangChain `deepagents` loop in the `serve` process) on an OpenAI‑compatible connection, for machines with no CLI installed; an export‑bundle → run by hand → `reclaim` mode also exists. `research.agent` names one explicitly; there is no fallback to the default LLM provider (see 2026‑09‑18) |
 | D1a how the agent reaches knode | **MCP first, hosted by `serve` over Streamable HTTP** (`POST /mcp`); `raw/docs`, `wiki`, `.sidecar` mounted read‑only; **every write goes through `knode_write`**. Not "the agent shells out to the knode‑os CLI" (reopens the index per call, unstructured output, shell permissions) |
 | D2 page status | an agent‑written page is a **Source**: `actor: agent/<cli>` (or `agent/deep-agents`) → quarantined; its `aliases / relations / claims` enter the graph, disputes open where it contradicts trusted facts; a person promotes it |
-| D3 entity resolution | deterministic at write time (NFKC / width / corporate‑suffix folding + exact name/alias key match); fuzzy candidates go to a nightly audit → `merge` suggestions → a person → reversible link |
+| D3 entity resolution | deterministic at write time (NFKC / width / corporate‑suffix folding + exact name/alias key match); fuzzy candidates go to an audit → `merge` suggestions → a person → reversible link. Since 2026‑09‑30 the audit runs **right after every extraction pass** on the entities that pass wrote, with the nightly run as the backstop ([09](09-ingest-stage-rework.md)) |
 | D4 relation ontology | configurable packs (`playbooks/ontology/*.yaml`) with built‑in `core` and `organization` |
 
 Why MCP over HTTP rather than another stdio process: the default PGlite index is single‑process, so a `knode-os mcp` child
@@ -34,7 +34,8 @@ wiki/<type>/<slug>.md ◀── research runner ◀── research_jobs ◀─�
    │ actor: agent/<cli>, relations:, claims:, sources:, research:
    └──sync──▶ Source (quarantined) ──▶ disputes ──▶ promote (UI / knode_trust)
 serve: /api/* + /mcp (Streamable HTTP, per-workspace, bearer token) ◀── claude -p / codex exec / cursor-agent -p (isolated run workspace, read-only add-dir)
-nightly tier 2: community pages + claim audit (supersession) + duplicate-entity audit + recommendation refresh + wiki lint
+after each extraction pass: duplicate audit of the entities it wrote + document summaries (09)
+nightly tier 2: claim audit (supersession) + full duplicate-entity audit + claim review + recommendation refresh + wiki lint (community pages retired: hot clusters are research suggestions now, see 09)
 ```
 
 ## 2. Ontology, typed and time‑bound relations (`src/graph/ontology.ts`)
@@ -65,7 +66,7 @@ nightly tier 2: community pages + claim audit (supersession) + duplicate-entity 
 - Merges: `entity_links` + `entities.canonical_id`, written by a `merge` scope as an explicit effect (inverse
   `entity_link.remove`); `applyMerge / unmergeEntity` log ledger feedback that `rebuild` replays. Reads (graph search,
   claims, context packs, vfs, entity pages) redirect to the survivor; merged entities' stubs become redirects.
-- Nightly audit: same bare key / shared alias key / short name is a prefix of a longer same‑typed name / embedding
+- Duplicate audit (after each extraction pass over the entities it wrote, nightly in full — [09](09-ingest-stage-rework.md) §3): same bare key / shared alias key / short name is a prefix of a longer same‑typed name / embedding
   similarity (real embedders, cached in `entity_embeddings` by fold_sha) → `merge` suggestions, never re‑proposed once
   rejected. Surfaces: `knode-os entities merge|unmerge|merges|dedupe|resolve`, `POST /api/entities/*`.
 
@@ -121,11 +122,11 @@ The third mode, `native`, runs one orchestrator session that writes the page and
 | Layer | Config | Behaviour |
 | --- | --- | --- |
 | write-time resolution | `review.resolution: exact` (default) / `suffix` | `exact` merges a mention only when its spelling equals a known name or alias; `suffix` also merges names differing only by a corporate suffix. `entity_alias_keys.kind` tells exact from bare keys (migration v8) |
-| LLM judge | `review.llmJudge: off / suggest (default) / auto`, `llmMinConfidence`, `autoMergeMinConfidence`, `maxJudgedPerRun` | the nightly audit shows each candidate pair (descriptions + excerpts) to the LLM; `suggest` annotates the suggestion; a confident "different" is recorded as rejected (actor `llm-judge`) and never re-proposed; `auto` calls `applyMerge` (reversible) above `autoMergeMinConfidence` |
+| LLM judge | `review.llmJudge: off / suggest (default) / auto`, `llmMinConfidence`, `autoMergeMinConfidence`, `maxJudgedPerRun` | the audit (incremental after each extraction pass, full at night) shows each candidate pair (descriptions + excerpts) to the LLM; `suggest` annotates the suggestion; a confident "different" is recorded as rejected (actor `llm-judge`) and never re-proposed; `auto` calls `applyMerge` (reversible) above `autoMergeMinConfidence` |
 | claim review | `review.claims: off / suggest (default)` | open disputes and `suspected` claims get a verdict (a / b / both / neither / unclear) and a recommended action, filed as `knowledge` suggestions |
 | external verification | `review.external: off / verify (default) / research` | the master switch for web tools: `off` never; `verify` only for `verify` jobs (template `verify.md`, output `wiki/reviews/`), unless the profile or a role says `web: on`, which widens it to every job; `research` always, though a profile or role may still switch it off. claude keeps WebSearch/WebFetch, codex gets `web_search = live | cached` (freshness from the profile), cursor is told in the prompt; the page's `sameAs` becomes a merge suggestion, `notSameAs` a remembered rejection |
 
-`knode-os review entities|claims`, `POST /api/review/claims` and `POST /api/entities/dedupe` run the passes on demand; the nightly tier 2 runs claim audit → duplicate audit (with the judge) → claim review → recommendations → lint.
+`knode-os review entities|claims`, `POST /api/review/claims` and `POST /api/entities/dedupe` run the passes on demand; every extraction pass first runs an incremental duplicate audit over the entities it wrote, and the nightly tier 2 runs claim audit → full duplicate audit (with the judge) → claim review → recommendations → lint. The judge is the Judge stage's route (`extraction.judgeLlm`, 09).
 
 ## 5d. Research profiles (`src/research/profile.ts`, `playbooks/research/profiles/<name>.yaml`, `research.profile`)
 

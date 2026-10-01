@@ -27,7 +27,7 @@ struct TracesView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.knodeCyan)
                 .disabled(isSyncing)
-                Text(L("Mirrored into raw/traces/ — click a row to open one. They feed the nightly dream; turn on trace.episodes in Settings → Pipeline to make them searchable too."))
+                Text(L("Mirrored into raw/traces/ — click a row to open one. They feed the nightly dream; turn on trace.episodes in knode.config.json to make them searchable too."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)

@@ -12,7 +12,7 @@ knode-os 结合了两个项目的核心思想:[llm_wiki](https://github.com/nash
 - **文件系统即数据库。** 数据目录(`raw/` + `wiki/`)就是普通的 markdown 文件,可以直接读、改、grep、`git init`。`.knode/` 下的 [PGlite](https://pglite.dev)(WASM 版 Postgres + pgvector)索引随时可删,`knode-os ingest` 即可重建。
 - **自动收集 agent trace。** Claude Code(`~/.claude/projects`)与 Codex CLI(`~/.codex/sessions`)的会话记录自动镜像到 `raw/traces/`,用过的 skills 进 `raw/skills/`。trace 供夜间 dream 分析使用;打开 `trace.episodes` 后会把每段会话备成可检索的 episode，在此之前不进检索索引。skills 一直可被检索。
 - **混合检索**:pgvector 余弦召回 + Postgres 全文检索 + 图谱信号,RRF 融合,并叠加温和的使用热度加权。开箱即用、完全离线(内置哈希 embedder);配置任意 OpenAI 兼容的 embedding 接口可获得生产级效果。
-- **分层知识图谱**:tier 0 在每次摄入时做确定性布线(`[[wikilink]]` + NLP 概念共现,不需要 LLM);变更文档进入 tier-1 队列,由 `serve` 后台(或 `knode-os extract`)按热度优先做 LLM 实体/关系/断言抽取。抽取结果持久化到文档 sidecar,重建索引不会重复付费。支持多跳图搜索与图谱洞察(枢纽节点、孤立节点)。
+- **分层知识图谱**:tier 0 在每次摄入时做确定性布线(`[[wikilink]]` + NLP 概念共现,不需要 LLM);变更文档进入 tier-1 队列,由 `serve` 后台(或 `knode-os extract`)按热度优先做 LLM 实体/关系/断言抽取;每轮抽取后随即检查这一轮写到的实体有没有重复(合并可撤销),并给这些文档写摘要页。抽取结果持久化到文档 sidecar,重建索引不会重复付费。支持多跳图搜索与图谱洞察(枢纽节点、孤立节点)。
 - **`/dream`**:每晚(或手动)分析近期 agent 会话——问了什么、哪些工具失败、什么在重复——产出对 **skills**、**memory**、**知识库** 的改进建议,在页面上一键接受/拒绝。
 - **实时数据源 —— 一个逻辑数据库。** 注册 MySQL、TimescaleDB、parquet/CSV 目录(DuckDB,模拟 HDFS)、JSON HTTP 端点、Prometheus 指标和对象目录:knode-os 把它们内省成知识图谱里的 capability(`datasource`/`dataset` 实体,按实体列采样生成 `appears_in` 边与 locator;端点和指标的绑定由已知的表和别名推导),并生成 `wiki/datasets/` 页面——行数据留在原系统、查询时实时获取。提到一个公司,图谱同时知道*哪些文档提到它*、*哪些表包含它*、*哪个 API 端点能查它*。
 - **Context Pack。** `knode-os pack "<语句>"`(或 MCP 工具 `knode_context_pack`)自动匹配语句中的实体,沿图谱展开(文档 chunk、带 `STALE`/`CONFLICT` 标记的时效断言、关联的实时表),按 playbook 执行实时探针查询(带 asOf 时间戳、短 TTL 缓存、绝不落库),并输出缺口分析和可直接执行的后续 SQL。
@@ -115,9 +115,9 @@ node dist/cli.js serve --data ~/knode-data
   },
   "extraction": {
     "entityLlm": { "provider": "codex-cli", "model": "" },
-    "conceptLlm": { "provider": "cursor-cli", "model": "" },
     "documentLlm": { "provider": "codex-cli", "model": "" }, // 视觉模型/API/Codex/Claude Code
-    "summaryLlm": { "provider": "claude-cli", "model": "" }  // 文档摘要、Dream、夜间复核、knode_ask
+    "summaryLlm": { "provider": "codex-cli", "model": "" },  // 每篇文档一页摘要
+    "judgeLlm": { "provider": "claude-cli", "model": "" }    // knode_ask、Dream、重复实体与断言复核
   },
   "dream": { "schedule": "03:00", "lookbackDays": 7 }
 }
@@ -125,18 +125,19 @@ node dist/cli.js serve --data ~/knode-data
 
 索引默认放在 PostgreSQL(首次运行前设 `KNODE_DATABASE_KIND=pglite`,或把 `database.kind` 改成 `pglite`,即可用内嵌的零配置索引,测试套件用的就是它)。`postgres` 模式下同一套 schema 放在服务器上:所有工作区共用一个库,按 schema 隔离,各自在首次打开时创建。当单个工作区超出 PGlite 单进程 32 位 WASM 的承载力(约百万 chunk),或需要多个进程同时读同一份索引时,才值得这么做。用 schema 而非独立库来隔离是刻意的:独立库会给每个工作区带上一份约 8 MB 的系统目录;而把所有工作区塞进同一张表、用 workspace 列区分,则会直接失去向量索引 —— HNSW 沿着按距离排序的邻居图游走,标量列上的等值条件无法下推进这次游走,优化器只能退回顺序扫描。向量列使用 `halfvec` 存储:pgvector 的索引条目上限是一个 8 KB 页,`vector` 对应 2000 维而 `halfvec` 对应 4000 维,所以半精度正是 1536/2048 维下 HNSW 索引仍然可用的前提,同时表体积减半。已有库在两种列类型之间切换会原地转换,不需要重新嵌入。
 
-任何 OpenAI 兼容端点都可以(Ollama、vLLM、硅基流动等)。`protocol` 决定用哪条线路说话:默认 `auto` 先探测端点有没有 `/responses`,有就走 Responses(推理模型在这条线上把思考作为独立的 output item 返回,而 Chat Completions 只能塞进各家拼写不一的 `message.reasoning_content`),没有则退回 `/chat/completions`;探测每个端点每进程只做一次,且不消耗 token。也可以钉成 `responses` 或 `chat`。embedding 另外支持 `"provider": "ark-multimodal"`,对接火山方舟的 `/embeddings/multimodal`(`doubao-embedding-vision-*`)。该接口不是 OpenAI 形态:每次请求只返回一个融合后的向量,因此 `baseUrl` 写到 `/api/v3` 为止,`model` 填接入点 id(`ep-…`),`batchSize` 的含义变为单条请求的并发数。实体提取、Concept 综合、文档视觉转换和摘要（文档摘要、Dream、夜间的实体合并与 claim 复核、`knode_ask`）各有独立路由，可以指向一个模型或一个 agent；留空的路由会被写成它原本会跑的默认。文本型 PDF 在本地提取；图片和扫描型 PDF 可使用支持视觉的 OpenAI 兼容模型、Codex CLI 或 Claude Code CLI 转成 Markdown。修改 `dimensions` 会在下次启动时重建 embedding 表。也可以在 Web 页面的 **Settings** 标签里编辑并测试各条模型路由。
+任何 OpenAI 兼容端点都可以(Ollama、vLLM、硅基流动等)。`protocol` 决定用哪条线路说话:默认 `auto` 先探测端点有没有 `/responses`,有就走 Responses(推理模型在这条线上把思考作为独立的 output item 返回,而 Chat Completions 只能塞进各家拼写不一的 `message.reasoning_content`),没有则退回 `/chat/completions`;探测每个端点每进程只做一次,且不消耗 token。也可以钉成 `responses` 或 `chat`。embedding 另外支持 `"provider": "ark-multimodal"`,对接火山方舟的 `/embeddings/multimodal`(`doubao-embedding-vision-*`)。该接口不是 OpenAI 形态:每次请求只返回一个融合后的向量,因此 `baseUrl` 写到 `/api/v3` 为止,`model` 填接入点 id(`ep-…`),`batchSize` 的含义变为单条请求的并发数。文档视觉转换、实体提取、文档摘要和判断（`knode_ask`、Dream、重复实体与 claim 复核）各有独立路由，可以指向一个模型或一个 agent；留空的路由会被写成它原本会跑的默认。文本型 PDF 在本地提取；图片和扫描型 PDF 可使用支持视觉的 OpenAI 兼容模型、Codex CLI 或 Claude Code CLI 转成 Markdown。修改 `dimensions` 会在下次启动时重建 embedding 表。也可以在 Web 页面的 **Settings** 标签里编辑并测试各条模型路由。
 
-其他配置块(用 `knode-os config` 查看完整默认值):`ingest`(分块大小/重叠、文件监听)、`extraction`(批大小、间隔、tier-1/2 模型、是否抽取断言)、`heat`(热度半衰期、搜索加权、冷判定阈值)、`trace`(Claude/Codex trace 目录、skill 目录、同步间隔)、`server`(host/port)。
+其他配置块(用 `knode-os config` 查看完整默认值):`ingest`(分块大小/重叠、文件监听)、`extraction`(后台文档轮次的批大小与间隔、tier-1 模型、是否抽取断言)、`heat`(热度半衰期、搜索加权、冷判定阈值)、`trace`(Claude/Codex trace 目录、skill 目录、同步间隔)、`server`(host/port)。
 
-配置 LLM 后解锁:tier-1 实体/关系/断言抽取、`ask` 问答、`wiki generate` 文档摘要、tier-2 社区页、LLM 级 dream 分析。不配置时所有功能仍以确定性/启发式路径运行。
+配置 LLM 后解锁:tier-1 实体/关系/断言抽取及紧随其后的重复实体复核、每篇文档一页摘要、`ask` 问答、夜间断言复核、LLM 级 dream 分析;概念页由研究 agent 来写([docs/design/09](docs/design/09-ingest-stage-rework.zh-CN.md))。不配置时所有功能仍以确定性/启发式路径运行。
 
 ## CLI
 
 ```
 knode-os init                 创建数据目录与数据库
-knode-os serve [-p port]      Web 页面 + API + 文件监听 + trace 同步 + tier-1 抽取循环
-                              + 热度回写 + 夜间 dream 与 tier-2 精炼
+knode-os serve [-p port]      Web 页面 + API + 文件监听 + trace 同步 + 后台文档轮次
+                              (抽取 → 重复实体复核 → 摘要)
+                              + 热度回写 + 夜间 dream 与 tier-2
 knode-os sync [--only p..] [--verify] [--no-llm] [--no-datasources]
                               把声明态(raw/docs、wiki、skills、数据源配置)与索引对账:变更文件作为
                               scope 应用,被删除的源 dispose(它产生的所有效果全部撤销),依赖它们的
@@ -147,7 +148,7 @@ knode-os history <path>       一个源的 apply / dispose / purge 历史
 knode-os forget <path>        删除源、dispose 并清除其历史(不可逆)
 knode-os purge [--before iso] [--archived]  物理清除已 dispose 的历史 / 归档页面
 knode-os rebuild [--history]  删除 .knode/db 并从文件 + ledger 重建
-knode-os extract [--batch n]  消费一批 tier-1 LLM 抽取队列
+knode-os extract [--batch n]  跑一轮后台文档轮次:抽取一批、复核重复实体、写摘要
 knode-os datasource list|sync             查看已注册实时表 / 重新内省 schema 进图谱
 knode-os datasource query <id> <sql>      对数据源执行只读原生 SQL
 knode-os pack <语句> [--json] [--as-of iso] [--valid-at iso]
@@ -164,8 +165,8 @@ knode-os okf validate [bundle] [--json]  校验 OKF v0.2(默认校验 <data>/wik
 knode-os okf migrate [--dry-run]         将旧版 wiki 结构迁移到 OKF v0.2
 knode-os okf import <bundle> [--name n]  无损导入到 raw/docs/okf/<name>
 knode-os okf export <dir>                校验并导出原生 wiki bundle
-knode-os wiki generate        生成文档摘要页与实体页
-knode-os wiki refine          tier-2:热点社区概念页 + 断言审计 + 热门话题块
+knode-os wiki generate        补齐缺失的文档摘要页与实体页
+knode-os wiki refine          tier-2:断言审计 + 全量重复实体审计 + 断言复核 + 热门话题块 + 研究推荐
 knode-os trace sync           拉取新的 Claude Code / Codex trace 与 skills
 knode-os dream [--lookback d] 先同步 trace,再分析 → skills/memory/知识库建议
 knode-os research init [--now]  初始化知识库:先索引与抽取,再由 agent 写出 wiki/overview.md 与
@@ -216,7 +217,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
   - **Graph / 图谱** —— 力导向图谱浏览 + 洞察(枢纽/孤立节点/类型分布)
   - **Wiki** —— 一个按钮完成知识库初始化(通读 → 总览页 + AGENTS.md 指南 + 排队的主题页),并在此发起与审阅深度研究页
   - **Dream / 夜间分析** —— 手动触发 dream,审阅并接受/拒绝建议
-- **Settings / 设置** —— **Providers & Agents**（每个模型端点与密钥只配一次，embedding 与 LLM 同在一张表——`llmUse` 标出哪个 LLM 是默认，所有没有自己指定 provider 的任务都跟着它走；下面第二张表是 agent：跑在这些模型之一上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI（Claude Code / Codex / Cursor）。CLI 是 agent 而不是模型）、**Pipeline**（独立的 Entity / Concept / 文档视觉阶段路由，每个阶段写明自己跑在哪个模型或 agent 上——任一 agent 都按单次调用使用，阶段不再跟随默认；保存后按需重建 embedding 或刷新转换）、**Research**、**Workspace**
+- **Settings / 设置** —— **Providers & Agents**（每个模型端点与密钥只配一次，embedding 与 LLM 同在一张表——`llmUse` 标出哪个 LLM 是默认，所有没有自己指定 provider 的任务都跟着它走；下面第二张表是 agent：跑在这些模型之一上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI（Claude Code / Codex / Cursor）。CLI 是 agent 而不是模型）、**Ingest / 预处理**（独立的 Entity / Concept / 文档视觉阶段路由，每个阶段写明自己跑在哪个模型或 agent 上——任一 agent 都按单次调用使用，阶段不再跟随默认；保存后按需重建 embedding 或刷新转换）、**Research / 研究**、**Ask / 问答**（由哪个 agent 回答、每次回复带上最近几条消息、保留多少个对话）、**Workspace**。中间三页按知识在工作区里的流向排列：进来先预处理，再研究成 wiki，最后用来回答问题
 
 ## REST API(仅 localhost)
 

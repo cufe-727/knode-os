@@ -12,7 +12,7 @@ export interface AppContext {
   store: Store;
   embedder: EmbeddingProvider;
   /**
-   * The Summarize stage (`summaryLlmClient`), not the default model. Rebuilt
+   * The Judge stage (`judgeLlmClient`), not the default model. Rebuilt
    * whenever the config, or an agent its route may name, changes.
    */
   llm: LlmClient;
@@ -21,11 +21,17 @@ export interface AppContext {
 }
 
 /**
- * What `ctx.llm` runs on: the Summarize stage's route. Document summaries,
- * Dream, the nightly merge and claim reviews and knode_ask all take `ctx.llm`
- * rather than resolving a stage of their own, so that is the whole stage —
- * they ran on the default LLM before it had a route.
+ * What `ctx.llm` runs on: the Judge stage's route. knode_ask, Dream, the
+ * duplicate-entity review and the disputed-claim review all take `ctx.llm`
+ * rather than resolving a stage of their own, so that is the whole stage.
+ * They ran on the Summarize stage until it kept only document summaries
+ * (docs/design/09), and on the default LLM before that.
  */
+export function judgeLlmClient(config: KnodeConfig): LlmClient {
+  return new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.judgeLlm, routeTargets(config)));
+}
+
+/** The Summarize stage: one summary page per document, written in the background document pass. */
 export function summaryLlmClient(config: KnodeConfig): LlmClient {
   return new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.summaryLlm, routeTargets(config)));
 }
@@ -35,7 +41,7 @@ export async function createContext(dataDir: string): Promise<AppContext> {
   const config = loadConfig(dataDir);
   const store = await Store.open(dataDir, config.embedding.dimensions, config.database);
   const embedder = createEmbeddingProvider(config.embedding);
-  const llm = summaryLlmClient(config);
+  const llm = judgeLlmClient(config);
   const datasources = new DataSourceRegistry(dataDir, config.datasources);
   return { dataDir, config, store, embedder, llm, datasources };
 }

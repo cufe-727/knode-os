@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { Hono } from 'hono';
-import { AppContext, summaryLlmClient } from '../context.js';
+import { AppContext, judgeLlmClient } from '../context.js';
 import {
   EmbeddingConfig,
   KnodeConfig,
@@ -31,7 +31,7 @@ import {
   syncActiveLlm,
   defaultConfig,
   isCliProvider,
-  saveConfig, ResearchConfig, ChatConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS } from '../config.js';
+  saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
 import { assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
@@ -129,9 +129,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 type ExtractionConfigDraft = {
   entityLlm?: Partial<RoutedLlmConfig>;
-  conceptLlm?: Partial<RoutedLlmConfig>;
   documentLlm?: Partial<RoutedLlmConfig>;
   summaryLlm?: Partial<RoutedLlmConfig>;
+  judgeLlm?: Partial<RoutedLlmConfig>;
   claims?: boolean;
   batchSize?: number;
   concurrency?: number;
@@ -150,6 +150,8 @@ type ModelConfigDraft = {
   retrieval?: { sag?: Partial<SagSearchConfig> };
   research?: Partial<Omit<ResearchConfig, 'auto' | 'init'>> & { auto?: Partial<ResearchConfig['auto']>; init?: Partial<ResearchConfig['init']> };
   chat?: Partial<ChatConfig>;
+  /** What the Judge stage does with its verdicts; the other review keys are file-only. */
+  review?: Partial<Pick<ReviewConfig, 'llmJudge' | 'claims'>>;
 };
 
 /** What `serve` runs per workspace beside the routes; absent in tests and CLI-hosted apps. */
@@ -446,8 +448,8 @@ export function createApp(
   app.post('/api/config/test', async (c) => {
     const ctx = requestCtx(c);
     const draft = (await c.req.json().catch(() => ({}))) as ModelConfigDraft;
-    const out: { embedding: unknown; llm: unknown; entityLlm: unknown; conceptLlm: unknown; documentLlm: unknown; summaryLlm: unknown } = {
-      embedding: null, llm: null, entityLlm: null, conceptLlm: null, documentLlm: null, summaryLlm: null,
+    const out: { embedding: unknown; llm: unknown; entityLlm: unknown; documentLlm: unknown; summaryLlm: unknown; judgeLlm: unknown } = {
+      embedding: null, llm: null, entityLlm: null, documentLlm: null, summaryLlm: null, judgeLlm: null,
     };
 
     try {
@@ -464,19 +466,19 @@ export function createApp(
     // a route may name an agent, which the pipeline calls one-shot
     const connections = draftRouteTargets(ctx.config, draft);
     const entityRoute = mergeRoutedLlmConfig(ctx.config.extraction.entityLlm, draft.extraction?.entityLlm);
-    const conceptRoute = mergeRoutedLlmConfig(ctx.config.extraction.conceptLlm, draft.extraction?.conceptLlm);
     const documentRoute = mergeRoutedLlmConfig(ctx.config.extraction.documentLlm, draft.extraction?.documentLlm);
     const summaryRoute = mergeRoutedLlmConfig(ctx.config.extraction.summaryLlm, draft.extraction?.summaryLlm);
+    const judgeRoute = mergeRoutedLlmConfig(ctx.config.extraction.judgeLlm, draft.extraction?.judgeLlm);
     try {
       out.llm = await testLlmConfig(baseLlm);
     } catch (e) {
       out.llm = { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
-    const routedTests: Array<[keyof Pick<typeof out, 'entityLlm' | 'conceptLlm' | 'documentLlm' | 'summaryLlm'>, RoutedLlmConfig, string]> = [
+    const routedTests: Array<[keyof Pick<typeof out, 'entityLlm' | 'documentLlm' | 'summaryLlm' | 'judgeLlm'>, RoutedLlmConfig, string]> = [
       ['entityLlm', entityRoute, ctx.config.extraction.tier1Model],
-      ['conceptLlm', conceptRoute, ctx.config.extraction.tier2Model],
       ['documentLlm', documentRoute, ''],
       ['summaryLlm', summaryRoute, ''],
+      ['judgeLlm', judgeRoute, ''],
     ];
     for (const [key, route, legacyModel] of routedTests) {
       const fullyInherited =
@@ -533,7 +535,7 @@ export function createApp(
       return c.json(await listModelsCached('chat', connection, opts));
     }
 
-    if (route !== 'entityLlm' && route !== 'conceptLlm' && route !== 'documentLlm' && route !== 'summaryLlm') {
+    if (route !== 'entityLlm' && route !== 'documentLlm' && route !== 'summaryLlm' && route !== 'judgeLlm') {
       return c.json({ error: `unknown route: ${route}` }, 400);
     }
     const merged = mergeRoutedLlmConfig(ctx.config.extraction[route], draft.extraction?.[route]);
@@ -585,15 +587,14 @@ export function createApp(
           next.extraction.entityLlm = mergeRoutedLlmConfig(next.extraction.entityLlm, x.entityLlm);
           next.extraction.tier1Model = '';
         }
-        if (x.conceptLlm) {
-          next.extraction.conceptLlm = mergeRoutedLlmConfig(next.extraction.conceptLlm, x.conceptLlm);
-          next.extraction.tier2Model = '';
-        }
         if (x.documentLlm) {
           next.extraction.documentLlm = mergeRoutedLlmConfig(next.extraction.documentLlm, x.documentLlm);
         }
         if (x.summaryLlm) {
           next.extraction.summaryLlm = mergeRoutedLlmConfig(next.extraction.summaryLlm, x.summaryLlm);
+        }
+        if (x.judgeLlm) {
+          next.extraction.judgeLlm = mergeRoutedLlmConfig(next.extraction.judgeLlm, x.judgeLlm);
         }
         if (typeof x.claims === 'boolean') next.extraction.claims = x.claims;
         const batchSize = Number(x.batchSize);
@@ -655,7 +656,6 @@ export function createApp(
           cur.init = { ...cur.init };
           const followUps = Number(r.init.followUps);
           if (r.init.followUps !== undefined && Number.isFinite(followUps)) cur.init.followUps = Math.min(20, Math.max(0, Math.floor(followUps)));
-          if (r.init.extraction === 'drain' || r.init.extraction === 'skip') cur.init.extraction = r.init.extraction;
           const maxMs = Number(r.init.extractionMaxMs);
           if (r.init.extractionMaxMs !== undefined && Number.isFinite(maxMs)) cur.init.extractionMaxMs = Math.min(3_600_000, Math.max(60_000, Math.floor(maxMs)));
         }
@@ -677,6 +677,12 @@ export function createApp(
         };
         setInt('historyTurns', 0, 50);
         setInt('keep', 1, 500);
+      }
+      if (incoming.review) {
+        // the two modes the Judge stage's form sets; thresholds stay in the file
+        const { llmJudge, claims } = incoming.review;
+        if (llmJudge === 'off' || llmJudge === 'suggest' || llmJudge === 'auto') next.review.llmJudge = llmJudge;
+        if (claims === 'off' || claims === 'suggest') next.review.claims = claims;
       }
       if (incoming.retrieval?.sag) {
         const sag = incoming.retrieval.sag;
@@ -705,7 +711,7 @@ export function createApp(
 
       saveConfig(ctx.dataDir, next);
       ctx.config = next;
-      ctx.llm = summaryLlmClient(next);
+      ctx.llm = judgeLlmClient(next);
       ctx.embedder = createEmbeddingProvider(next.embedding);
 
       let reindex: Awaited<ReturnType<typeof sync>> | null = null;
@@ -1564,8 +1570,8 @@ export function createApp(
    * An agent file changed. The pipeline may run on any agent and the default
    * on a CLI agent, so re-read them, re-flatten the default in case it is one,
    * and move a stage whose agent is gone to the default — saving only when
-   * that moved something. `ctx.llm` is rebuilt either way: Summarize may run
-   * on the very agent that changed.
+   * that moved something. `ctx.llm` is rebuilt either way: Judge may run on
+   * the very agent that changed.
    */
   const refreshAgentLlms = (ctx: AppContext, moved = false) => {
     const before = JSON.stringify([ctx.config.llmUse, ctx.config.llm]);
@@ -1585,7 +1591,7 @@ export function createApp(
     if (moved || pinned || JSON.stringify([ctx.config.llmUse, ctx.config.llm]) !== before) {
       saveConfig(ctx.dataDir, ctx.config);
     }
-    ctx.llm = summaryLlmClient(ctx.config);
+    ctx.llm = judgeLlmClient(ctx.config);
   };
 
   app.get('/api/agents', (c) => {

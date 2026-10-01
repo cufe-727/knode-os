@@ -29,7 +29,7 @@ import { prepareRunWorkspace, runsRoot } from './research/workspace.js';
 import { recommendWikiTopics, refreshRecommendations } from './research/recommend.js';
 import { launchArgs } from './research/launch.js';
 import { loadProfile, loadProfiles, profileYaml } from './research/profile.js';
-import { runTier1Pass } from './graph/tier1.js';
+import { runDocumentPass } from './ingest/background.js';
 import { sync } from './ingest/sync.js';
 import { historyOf, lineageOf } from './lineage/inspect.js';
 import { forgetSource, purgeArchived, purgeDisposed } from './lineage/purge.js';
@@ -136,17 +136,18 @@ program
 
 program
   .command('extract')
-  .description('run one tier-1 extraction pass: drain a batch from the priority queue (heat × freshness × importance)')
-  .option('--batch <n>', 'max documents this pass')
-  .option('--concurrency <n>', 'parallel LLM extraction calls')
+  .description('run one background document pass: extract a batch from the priority queue (heat × freshness × importance), audit the entities it wrote for duplicates, write summary pages')
+  .option('--batch <n>', 'max documents this pass (extracted and summarized)')
+  .option('--concurrency <n>', 'parallel LLM calls')
   .action(async (opts) => {
     const ctx = await createContext(dataDir());
-    const stats = await runTier1Pass(ctx.store, ctx.config, ctx.llm, {
+    const { touched, documents, resolve, summaries, ...stats } = await runDocumentPass(ctx, {
       batchSize: opts.batch ? Number(opts.batch) : undefined,
       concurrency: opts.concurrency ? Number(opts.concurrency) : undefined,
       onProgress: (m) => console.log(`  ${m}`),
     });
-    console.log(JSON.stringify(stats, null, 2));
+    console.log(JSON.stringify({ ...stats, entitiesTouched: touched.length, documents, resolve, summaries }, null, 2));
+    await ctx.datasources.closeAll();
     await ctx.store.close();
   });
 
@@ -185,7 +186,7 @@ program
 
 program
   .command('ask <question>')
-  .description('answer a question from the knowledge base with citations (runs on the Summarize stage, extraction.summaryLlm)')
+  .description('answer a question from the knowledge base with citations (runs on the Judge stage, extraction.judgeLlm)')
   .option('-m, --mode <mode>', 'retrieval mode: hybrid | vector | keyword | sag', 'hybrid')
   .action(async (question, opts) => {
     const ctx = await createContext(dataDir());
@@ -955,7 +956,7 @@ okf
 const wiki = program.command('wiki').description('wiki maintenance');
 wiki
   .command('generate')
-  .description('generate source summary pages + entity stubs from indexed docs (uses LLM when configured; cold docs are demoted to the sources index)')
+  .description('fill in summary pages for documents still missing one (the Summarize stage, up to 20) + entity stubs; the background document pass writes summaries as documents arrive')
   .action(async () => {
     const ctx = await createContext(dataDir());
     const created = await generateWiki(ctx.store, ctx.llm, { config: ctx.config, embedder: ctx.embedder, datasources: ctx.datasources, onProgress: (m) => console.log(`  ${m}`) });
@@ -965,7 +966,7 @@ wiki
   });
 wiki
   .command('refine')
-  .description('tier-2 refinement: detect hot-subgraph communities, write concept cluster pages, refresh the hot-topics block in wiki/index.md')
+  .description('the nightly tier-2 pass: claim audit, full duplicate-entity audit, claim review, hot topics in wiki/index.md, research recommendations (hot communities become concept research suggestions)')
   .action(async () => {
     const ctx = await createContext(dataDir());
     const res = await refineWiki(ctx.store, ctx.config, ctx.llm, { onProgress: (m) => console.log(`  ${m}`), embedder: ctx.embedder });

@@ -219,7 +219,7 @@
     <section id="tab-traces" class="tab">
       <div class="searchbar">
         <button id="btn-trace-sync">sync now</button>
-        <span class="hint">Claude Code + Codex session transcripts are mirrored into <span class="mono">raw/traces/</span> — click a row to open it. They feed the nightly dream; turn on <span class="mono">trace.episodes</span> in Settings → Pipeline to make them searchable too.</span>
+        <span class="hint">Claude Code + Codex session transcripts are mirrored into <span class="mono">raw/traces/</span> — click a row to open it. They feed the nightly dream; turn on <span class="mono">trace.episodes</span> in <span class="mono">knode.config.json</span> to make them searchable too.</span>
       </div>
       <table id="traces-table"><thead><tr><th>source</th><th>project</th><th>session</th><th>started</th><th>size</th><th>analyzed</th></tr></thead><tbody></tbody></table>
     </section>
@@ -295,7 +295,7 @@
         </div>
 
         <section class="settings-section" data-subtab="providers" aria-labelledby="providers-title">
-          <div class="settings-section-head"><div><p class="section-index">01 · PROVIDERS &amp; AGENTS</p><h3 id="providers-title">Models</h3><p>Each model endpoint and its key, once. Pipeline stages pick from this list, and a deepagents agent below runs on one of them.</p></div><span class="section-badge">Configure once</span></div>
+          <div class="settings-section-head"><div><p class="section-index">01 · PROVIDERS &amp; AGENTS</p><h3 id="providers-title">Models</h3><p>Each model endpoint and its key, once. Ingest stages pick from this list, and a deepagents agent below runs on one of them.</p></div><span class="section-badge">Configure once</span></div>
 
           <div class="provider-table">
             <div class="provider-head">
@@ -317,7 +317,7 @@
         </section>
 
         <section class="settings-section" data-subtab="pipeline" aria-labelledby="pipeline-title">
-          <div class="settings-section-head"><div><p class="section-index">02 · PIPELINE</p><h3 id="pipeline-title">What each stage needs</h3><p>A document moves down this list. The stages ask different things of a model, which is why each one can run somewhere else.</p></div><span class="section-badge accent2">Per stage</span></div>
+          <div class="settings-section-head"><div><p class="section-index">02 · INGEST</p><h3 id="pipeline-title">How documents get processed</h3><p>A document moves down this list. The stages ask different things of a model, which is why each one can run somewhere else.</p></div><span class="section-badge accent2">Per stage</span></div>
 
           <div class="stage-board">
             <div id="stage-flow" class="stage-flow"></div>
@@ -357,12 +357,14 @@
               <div class="stage-panel" data-stage="entity" hidden>
                 <div class="stage-panel-copy">
                   <div class="stage-title"><h4>Extract</h4><span class="section-badge accent2">Volume</span></div>
-                  <p>Names entities, relations and factual claims in changed documents.</p>
+                  <p>Names entities, relations and factual claims in changed documents; what it finds is checked for duplicates right away.</p>
                   <p class="stage-req">The busiest stage — it runs on every changed document, bounded by the batch size here. A fast, cheap model that returns clean JSON is usually the right trade.</p>
                   <div class="stage-rates">
                     <label>Parallel calls<input id="cfg-extraction-concurrency" type="number" min="1" step="1" /></label>
                     <label>Documents per pass<input id="cfg-extraction-batch" type="number" min="1" step="1" /></label>
+                    <label>Catch-up before initializing (minutes)<input id="cfg-init-maxms" type="number" min="1" max="60" step="1" /></label>
                   </div>
+                  <p class="stage-req">Initializing the wiki first extracts whatever is still queued, for up to this long; the rest is left to the background passes.</p>
                   <label class="cfg-check"><input id="cfg-extraction-claims" type="checkbox" /> Extract factual claims alongside entities</label>
                 </div>
                 <div class="stage-control">
@@ -372,24 +374,12 @@
                 </div>
               </div>
 
-              <div class="stage-panel" data-stage="concept" hidden>
-                <div class="stage-panel-copy">
-                  <div class="stage-title"><h4>Synthesize</h4><span class="section-badge accent2">Quality</span></div>
-                  <p>Turns hot entity clusters into readable, linked Concept pages.</p>
-                  <p class="stage-req">Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.</p>
-                </div>
-                <div class="stage-control">
-                  <label>Run with<select id="cfg-concept-use" class="cfg-route-use"></select></label>
-                  <label>Model<span class="model-field"><input id="cfg-concept-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="conceptLlm" title="List the models this provider offers">⌄</button></span></label>
-                  <p class="route-note" id="cfg-concept-note"></p>
-                </div>
-              </div>
-
               <div class="stage-panel" data-stage="summary" hidden>
                 <div class="stage-panel-copy">
-                  <div class="stage-title"><h4>Summarize</h4><span class="section-badge accent2">Judgment</span></div>
-                  <p>Writes each document's summary page and answers <span class="mono">knode_ask</span>; overnight it runs Dream and reviews duplicate entities and disputed claims.</p>
-                  <p class="stage-req">Every job here reads the text it is handed and makes a call on it — what a document is about, whether two entities are one, which of two claims holds, what a week of agent sessions says. Nobody waits on most of them: summaries are written when the wiki is generated and refreshed overnight, beside Dream and the reviews, so a slower model or a CLI subscription only costs time. <span class="mono">knode_ask</span> is the exception — an agent is waiting on its answer.</p>
+                  <div class="stage-title"><h4>Summarize</h4><span class="section-badge accent2">Prose</span></div>
+                  <p>Writes one summary page per document, right after it is extracted.</p>
+                  <p class="stage-req">One call per document, for people to read rather than a program to parse, so it wants clean prose more than the strongest model. Changing the model does not rewrite summaries already written.</p>
+                  <p class="stage-req">Runs in Extract's background pass, with its documents per pass and parallel calls.</p>
                 </div>
                 <div class="stage-control">
                   <label>Run with<select id="cfg-summary-use" class="cfg-route-use"></select></label>
@@ -397,12 +387,30 @@
                   <p class="route-note" id="cfg-summary-note"></p>
                 </div>
               </div>
+
+              <div class="stage-panel" data-stage="judge" hidden>
+                <div class="stage-panel-copy">
+                  <div class="stage-title"><h4>Judge</h4><span class="section-badge accent2">Quality</span></div>
+                  <p>Answers <span class="mono">knode_ask</span> and reviews duplicate entities after each extraction pass; overnight it runs Dream and reviews disputed claims.</p>
+                  <p class="stage-req">Few calls, but each one decides something — whether two entities are one, which of two claims holds, what a week of agent sessions says — so a stronger model pays for itself. Only <span class="mono">knode_ask</span> has someone waiting on the answer.</p>
+                  <div class="stage-rates">
+                    <label>Duplicate entities<select id="cfg-review-judge"><option value="off">Off</option><option value="suggest">Suggest merges</option><option value="auto">Merge confident pairs</option></select></label>
+                    <label>Disputed claims<select id="cfg-review-claims"><option value="off">Off</option><option value="suggest">Suggest a verdict</option></select></label>
+                  </div>
+                  <p class="stage-req">After each extraction pass the entities it wrote are checked for duplicates, and the full graph again overnight; a merge can always be undone. Disputed claims are reviewed overnight.</p>
+                </div>
+                <div class="stage-control">
+                  <label>Run with<select id="cfg-judge-use" class="cfg-route-use"></select></label>
+                  <label>Model<span class="model-field"><input id="cfg-judge-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="judgeLlm" title="List the models this provider offers">⌄</button></span></label>
+                  <p class="route-note" id="cfg-judge-note"></p>
+                </div>
+              </div>
             </div>
           </div>
         </section>
 
         <section class="settings-section" data-subtab="research" aria-labelledby="research-title">
-          <div class="settings-section-head"><div><p class="section-index">03 · RESEARCH</p><h3 id="research-title">How the wiki gets written</h3><p>What initialization does, how Ask behaves, and how a deep-research job runs: which agent from section 01 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents.</p></div><span class="section-badge accent2">Pipeline</span></div>
+          <div class="settings-section-head"><div><p class="section-index">03 · RESEARCH</p><h3 id="research-title">How the wiki gets written</h3><p>How a deep-research job runs: which agent from section 01 takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents.</p></div><span class="section-badge accent2">Pipeline</span></div>
 
           <div class="cfg-card-title"><div><b>Deep research pipeline</b><small>Which agent runs jobs, how many at once, and which profile it follows. Roles below may override the agent per phase.</small></div><span class="section-badge accent2">Runner</span></div>
           <fieldset class="cfg-card cfg-card-wide">
@@ -418,25 +426,8 @@
               <label>Review rounds (default)<input id="cfg-research-rounds" type="number" min="0" max="6" step="1" /></label>
             </div>
             <label class="cfg-check"><input id="cfg-research-auto" type="checkbox" /> Accept the top recommendations automatically, up to <input id="cfg-research-daily" type="number" min="1" max="50" step="1" class="cfg-inline-num" /> jobs a day</label>
+            <label class="cfg-check">After an initialization, queue up to <input id="cfg-init-followups" type="number" min="0" max="20" step="1" class="cfg-inline-num" /> topic pages it suggests (0 = none)</label>
             <p class="cfg-callout" id="cfg-research-note"></p>
-          </fieldset>
-
-          <div class="cfg-card-title"><div><b>Initialization</b><small>What the Wiki tab's initialize button does before the agent starts, and how many topic pages it queues afterwards.</small></div><span class="section-badge">Init</span></div>
-          <fieldset class="cfg-card cfg-card-wide">
-            <div class="cfg-grid cfg-grid-3">
-              <label>Extraction first<select id="cfg-init-extraction"><option value="drain">Drain the tier-1 queue</option><option value="skip">Skip — leave it to the background loop</option></select></label>
-              <label>Extraction time cap (minutes)<input id="cfg-init-maxms" type="number" min="1" max="60" step="1" /></label>
-              <label>Follow-up pages queued<input id="cfg-init-followups" type="number" min="0" max="20" step="1" /></label>
-            </div>
-          </fieldset>
-
-          <div class="cfg-card-title"><div><b>Ask</b><small>Ask uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note. Effort, turns, timeout, tool grants and any extra prompt come from the agent — edit them where the agent is defined, in section 01.</small></div><span class="section-badge accent2">Ask</span></div>
-          <fieldset class="cfg-card cfg-card-wide">
-            <div class="cfg-grid cfg-grid-3">
-              <label>Agent<select id="cfg-chat-agent"></select></label>
-              <label>Messages replayed<input id="cfg-chat-history" type="number" min="0" max="50" step="1" /></label>
-              <label>Conversations kept<input id="cfg-chat-keep" type="number" min="1" max="500" step="1" /></label>
-            </div>
           </fieldset>
 
           <div class="cfg-card-title"><div><b>Profile <span id="cfg-profile-name" class="mono"></span></b><small>Stored as <span class="mono">playbooks/research/profiles/&lt;name&gt;.yaml</span> — edit here or in the file. The profile may pin its own pipeline.</small></div><div class="cfg-actions-inline"><button type="button" id="cfg-profile-duplicate" class="ghost">Duplicate…</button><button type="button" id="cfg-profile-delete" class="ghost">Delete</button></div></div>
@@ -467,6 +458,18 @@
             <button type="button" id="cfg-role-add" class="ghost">Add role</button>
           </div>
           <div id="cfg-roles" class="cfg-connections"></div>
+        </section>
+
+        <section class="settings-section" data-subtab="chat" aria-labelledby="chat-title">
+          <div class="settings-section-head"><div><p class="section-index">04 · ASK</p><h3 id="chat-title">How questions get answered</h3><p>Ask answers over MCP with an agent from section 01, and writes what you teach it as a quarantined note. Model, effort and web access come from the agent — edit it in section 01; the turn cap, timeout and tools are the same whichever agent answers.</p></div></div>
+
+          <fieldset class="cfg-card cfg-card-wide">
+            <div class="cfg-grid cfg-grid-3">
+              <label>Agent<select id="cfg-chat-agent"></select></label>
+              <label>Messages replayed<input id="cfg-chat-history" type="number" min="0" max="50" step="1" /></label>
+              <label>Conversations kept<input id="cfg-chat-keep" type="number" min="1" max="500" step="1" /></label>
+            </div>
+          </fieldset>
         </section>
 
         <div id="cfg-status" aria-live="polite"></div>

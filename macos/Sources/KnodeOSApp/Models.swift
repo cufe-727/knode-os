@@ -22,7 +22,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .library: [.files, .search, .traces]
         case .ask: [.ask]
         case .knowledge: [.graph, .wiki, .dream]
-        case .settings: [.providers, .pipeline, .research, .workspace]
+        case .settings: [.providers, .pipeline, .research, .chat, .workspace]
         }
     }
 
@@ -40,7 +40,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .library: L("Files, search, and agent traces")
         case .ask: L("An agent that answers from your workspace")
         case .knowledge: L("Graph, wiki, and nightly review")
-        case .settings: L("Model routes and pipeline limits")
+        case .settings: L("Models, ingest, research, and Ask")
         }
     }
 
@@ -56,6 +56,13 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
 
 /// A screen. Every tab belongs to exactly one section, which is what the
 /// sidebar selects; `AppSection.tabs` is the inverse and the two must agree.
+///
+/// Settings reads as the three things a workspace does with knowledge, in the
+/// order it happens: documents are processed as they come in (Ingest), agents
+/// research them into the wiki (Research), and the result answers questions
+/// (Ask). Ids keep their first names, so `pipeline` is titled Ingest; Ask's
+/// settings are `chat` — the config block they edit — because `ask` is the
+/// Ask screen itself.
 enum AppTab: String, CaseIterable, Identifiable, Codable {
     case files
     case search
@@ -67,6 +74,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
     case providers
     case pipeline
     case research
+    case chat
     case workspace
 
     var id: String { rawValue }
@@ -86,12 +94,12 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .files, .search, .traces: .library
         case .ask: .ask
         case .graph, .wiki, .dream: .knowledge
-        case .providers, .pipeline, .research, .workspace: .settings
+        case .providers, .pipeline, .research, .chat, .workspace: .settings
         }
     }
 
     /**
-     * Which screen shows this tab. Settings' four tabs share one host: keying
+     * Which screen shows this tab. Settings' five tabs share one host: keying
      * view identity on the leaf instead would rebuild `SettingsView` on every
      * sub-tab click, refetching the config and discarding unsaved routes.
      */
@@ -109,8 +117,9 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .wiki: L("Wiki")
         case .dream: L("Dream")
         case .providers: L("Providers & Agents")
-        case .pipeline: L("Pipeline")
+        case .pipeline: L("Ingest")
         case .research: L("Research")
+        case .chat: L("Ask")
         case .workspace: L("Workspace")
         }
     }
@@ -125,8 +134,9 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .wiki: L("Pages researched by agent CLIs")
         case .dream: L("Review agent improvement ideas")
         case .providers: L("Endpoints, credentials, and who does the work")
-        case .pipeline: L("What each stage needs")
+        case .pipeline: L("How documents get processed")
         case .research: L("How the wiki gets written")
+        case .chat: L("How questions get answered")
         case .workspace: L("Clear this workspace")
         }
     }
@@ -141,8 +151,9 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .wiki: "book.closed"
         case .dream: "moon.stars"
         case .providers: "cable.connector"
-        case .pipeline: "arrow.triangle.branch"
+        case .pipeline: "tray.and.arrow.down"
         case .research: "book.and.wrench"
+        case .chat: "bubble.left.and.bubble.right"
         case .workspace: "exclamationmark.triangle"
         }
     }
@@ -697,13 +708,40 @@ struct IngestConfig: Codable, Equatable {
 struct ExtractionConfig: Codable, Equatable {
     var claims: Bool
     var entityLlm: RoutedLLMConfig
-    var conceptLlm: RoutedLLMConfig
     var documentLlm: RoutedLLMConfig
-    /// The Summarize stage: document summaries, Dream, the nightly reviews
-    /// and knode_ask. They ran on the default LLM before it had a route.
+    /// The Summarize stage: one summary page per document, written in the
+    /// background pass right after extraction.
     var summaryLlm: RoutedLLMConfig
+    /// The Judge stage: knode_ask, Dream, the duplicate-entity review after
+    /// each extraction pass and the disputed-claim review.
+    var judgeLlm: RoutedLLMConfig
+    /// Documents per background pass — extracted, then summarized.
     var batchSize: Int
+    /// Parallel model calls in a background pass, for both.
     var concurrency: Int
+}
+
+/// What the Judge stage does with its verdicts: the service's `review.llmJudge`
+/// and `review.claims`. The thresholds stay in the config file, and the
+/// service keeps every key this client does not send.
+struct ReviewConfig: Codable, Equatable {
+    /// "off" | "suggest" | "auto" — auto merges pairs judged the same with
+    /// high confidence; a merge can always be undone.
+    var llmJudge: String
+    /// "off" | "suggest"
+    var claims: String
+
+    init(llmJudge: String = "suggest", claims: String = "suggest") {
+        self.llmJudge = llmJudge
+        self.claims = claims
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = ReviewConfig()
+        llmJudge = try container.decodeIfPresent(String.self, forKey: .llmJudge) ?? fallback.llmJudge
+        claims = try container.decodeIfPresent(String.self, forKey: .claims) ?? fallback.claims
+    }
 }
 
 /// The runner half of the service's `research` block: which coding-agent CLI
@@ -716,17 +754,18 @@ struct ResearchConfig: Codable, Equatable {
         var dailyJobs: Int
     }
 
-    /// What the Wiki tab's initialize button does before the agent starts.
+    /// What the Wiki tab's initialize button does around its agent run. It
+    /// always first extracts what the tier-1 queue still holds; the cap on
+    /// that is edited with the Extract stage under Ingest, the follow-ups in
+    /// the Research runner card.
     struct Initialization: Codable, Equatable {
         /// Topic pages queued as follow-up research jobs.
         var followUps: Int
-        /// "drain" runs tier-1 extraction to the end of the queue first; "skip" leaves it to the background loop.
-        var extraction: String
+        /// How long the catch-up extraction may run before the agent starts.
         var extractionMaxMs: Int
 
-        init(followUps: Int = 6, extraction: String = "drain", extractionMaxMs: Int = 900_000) {
+        init(followUps: Int = 6, extractionMaxMs: Int = 900_000) {
             self.followUps = followUps
-            self.extraction = extraction
             self.extractionMaxMs = extractionMaxMs
         }
 
@@ -734,7 +773,6 @@ struct ResearchConfig: Codable, Equatable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             let fallback = Initialization()
             followUps = try container.decodeIfPresent(Int.self, forKey: .followUps) ?? fallback.followUps
-            extraction = try container.decodeIfPresent(String.self, forKey: .extraction) ?? fallback.extraction
             extractionMaxMs = try container.decodeIfPresent(Int.self, forKey: .extractionMaxMs) ?? fallback.extractionMaxMs
         }
     }
@@ -847,6 +885,7 @@ struct KnodeConfig: Codable, Equatable {
     var llmUse: String
     var ingest: IngestConfig
     var extraction: ExtractionConfig
+    var review: ReviewConfig
     var research: ResearchConfig
     var chat: ChatConfig
 
@@ -860,6 +899,7 @@ struct KnodeConfig: Codable, Equatable {
         llmUse = try container.decodeIfPresent(String.self, forKey: .llmUse) ?? ""
         ingest = try container.decodeIfPresent(IngestConfig.self, forKey: .ingest) ?? IngestConfig()
         extraction = try container.decode(ExtractionConfig.self, forKey: .extraction)
+        review = try container.decodeIfPresent(ReviewConfig.self, forKey: .review) ?? ReviewConfig()
         research = try container.decodeIfPresent(ResearchConfig.self, forKey: .research) ?? ResearchConfig()
         chat = try container.decodeIfPresent(ChatConfig.self, forKey: .chat) ?? ChatConfig()
     }
@@ -1088,9 +1128,9 @@ struct ConfigTestResponse: Decodable {
     var embedding: RouteTestResult?
     var llm: RouteTestResult?
     var entityLlm: RouteTestResult?
-    var conceptLlm: RouteTestResult?
     var documentLlm: RouteTestResult?
     var summaryLlm: RouteTestResult?
+    var judgeLlm: RouteTestResult?
 }
 
 /// One entry of what a provider offers for a `model` field. The field itself

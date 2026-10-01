@@ -115,6 +115,7 @@ struct SettingsView: View {
                     switch model.selectedTab {
                     case .pipeline: pipelineSection
                     case .research: researchSection
+                    case .chat: askSection
                     case .workspace: workspaceDangerSection
                     default: providersSection
                     }
@@ -174,7 +175,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 14) {
             sectionHeader(
                 title: L("Models"),
-                detail: L("Each model endpoint and its key, once. Pipeline stages pick from this list, and a deepagents agent below runs on one of them.")
+                detail: L("Each model endpoint and its key, once. Ingest stages pick from this list, and a deepagents agent below runs on one of them.")
             )
             VStack(spacing: 0) {
                 providerTableHeader
@@ -296,7 +297,7 @@ struct SettingsView: View {
     private var pipelineSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             sectionHeader(
-                title: L("What each stage needs"),
+                title: L("How documents get processed"),
                 detail: L("A document moves down this list. The stages ask different things of a model, which is why each one can run somewhere else.")
             )
             HStack(alignment: .top, spacing: 0) {
@@ -468,15 +469,6 @@ struct SettingsView: View {
                 routeKey: "entityLlm",
                 load: { refresh in try await modelList(route: "entityLlm", refresh: refresh) }
             )
-        case .synthesize:
-            StagePicker(
-                route: binding(\.extraction.conceptLlm),
-                models: config?.connections ?? [],
-                agents: routeAgents,
-                defaultTarget: defaultTarget,
-                routeKey: "conceptLlm",
-                load: { refresh in try await modelList(route: "conceptLlm", refresh: refresh) }
-            )
         case .summarize:
             StagePicker(
                 route: binding(\.extraction.summaryLlm),
@@ -486,6 +478,48 @@ struct SettingsView: View {
                 routeKey: "summaryLlm",
                 load: { refresh in try await modelList(route: "summaryLlm", refresh: refresh) }
             )
+        case .judge:
+            VStack(alignment: .leading, spacing: 18) {
+                StagePicker(
+                    route: binding(\.extraction.judgeLlm),
+                    models: config?.connections ?? [],
+                    agents: routeAgents,
+                    defaultTarget: defaultTarget,
+                    routeKey: "judgeLlm",
+                    load: { refresh in try await modelList(route: "judgeLlm", refresh: refresh) }
+                )
+                reviewModes
+            }
+        }
+    }
+
+    /// What the Judge stage does with its verdicts. The duplicate review runs
+    /// after every extraction pass and again at night; the claim review at night.
+    private var reviewModes: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
+                GridRow {
+                    FieldLabel(L("Duplicate entities")) {
+                        Picker(L("Duplicate entities"), selection: binding(\.review.llmJudge)) {
+                            Text(L("Off")).tag("off")
+                            Text(L("Suggest merges")).tag("suggest")
+                            Text(L("Merge confident pairs")).tag("auto")
+                        }
+                        .labelsHidden()
+                    }
+                    FieldLabel(L("Disputed claims")) {
+                        Picker(L("Disputed claims"), selection: binding(\.review.claims)) {
+                            Text(L("Off")).tag("off")
+                            Text(L("Suggest a verdict")).tag("suggest")
+                        }
+                        .labelsHidden()
+                    }
+                }
+            }
+            Text(L("After each extraction pass the entities it wrote are checked for duplicates, and the full graph again overnight; a merge can always be undone. Disputed claims are reviewed overnight."))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -526,11 +560,26 @@ struct SettingsView: View {
                             TextField(L("Documents per pass"), value: binding(\.extraction.batchSize), format: .number)
                         }
                     }
+                    GridRow {
+                        FieldLabel(L("Catch-up before initializing (minutes)")) {
+                            TextField("15", value: initCatchUpMinutes, format: .number)
+                        }
+                        Color.clear.frame(height: 1)
+                    }
                 }
+                Text(L("Initializing the wiki first extracts whatever is still queued, for up to this long; the rest is left to the background passes."))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Toggle(L("Extract factual claims alongside entities"), isOn: binding(\.extraction.claims))
                     .toggleStyle(.checkbox)
             }
-        case .synthesize, .summarize:
+        case .summarize:
+            Text(L("Runs in Extract's background pass, with its documents per pass and parallel calls."))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        case .judge:
             EmptyView()
         }
     }
@@ -546,13 +595,23 @@ struct SettingsView: View {
         )
     }
 
+    /// The extraction an initialization catches up on before its agent starts,
+    /// in minutes. It is extraction, so it sits with the Extract stage, though
+    /// the service keeps it as `research.init.extractionMaxMs`.
+    private var initCatchUpMinutes: Binding<Int> {
+        Binding(
+            get: { max(1, (config?.research.initialization.extractionMaxMs ?? 900_000) / 60_000) },
+            set: { config?.research.initialization.extractionMaxMs = max(1, $0) * 60_000 }
+        )
+    }
+
     private func stageTarget(_ stage: PipelineStage) -> RouteTarget {
         switch stage {
         case .convert: routeSummary(\.extraction.documentLlm)
         case .index: embeddingSummary
         case .extract: routeSummary(\.extraction.entityLlm)
-        case .synthesize: routeSummary(\.extraction.conceptLlm)
         case .summarize: routeSummary(\.extraction.summaryLlm)
+        case .judge: routeSummary(\.extraction.judgeLlm)
         }
     }
 
@@ -564,8 +623,8 @@ struct SettingsView: View {
         switch stage {
         case .convert: route = config.extraction.documentLlm
         case .extract: route = config.extraction.entityLlm
-        case .synthesize: route = config.extraction.conceptLlm
         case .summarize: route = config.extraction.summaryLlm
+        case .judge: route = config.extraction.judgeLlm
         case .index: return nil
         }
         guard let target = routeTargets.first(where: { $0.id == route.use }), cliProviderNames.contains(target.provider) else { return nil }
@@ -580,8 +639,9 @@ struct SettingsView: View {
         return switch stage {
         case .convert: "×\(config.ingest.convertConcurrency)"
         case .index: "×\(config.ingest.concurrency) · \(config.embedding.batchSize ?? 32)/req"
-        case .extract: "×\(config.extraction.concurrency) · \(config.extraction.batchSize)/pass"
-        case .synthesize, .summarize: ""
+        // Summarize runs in Extract's pass, at its rates
+        case .extract, .summarize: "×\(config.extraction.concurrency) · \(config.extraction.batchSize)/pass"
+        case .judge: ""
         }
     }
 
@@ -658,9 +718,9 @@ struct SettingsView: View {
                 config?.llmUse = fresh.llmUse
                 config?.llm = fresh.llm
                 config?.extraction.entityLlm.use = fresh.extraction.entityLlm.use
-                config?.extraction.conceptLlm.use = fresh.extraction.conceptLlm.use
                 config?.extraction.documentLlm.use = fresh.extraction.documentLlm.use
                 config?.extraction.summaryLlm.use = fresh.extraction.summaryLlm.use
+                config?.extraction.judgeLlm.use = fresh.extraction.judgeLlm.use
             }
             statusMessage = response.reset == true
                 ? L("Agent %@ reset to the built-in", agent.title)
@@ -744,8 +804,8 @@ struct SettingsView: View {
             case .convert: routed(config.extraction.documentLlm) == row
             case .index: false
             case .extract: routed(config.extraction.entityLlm) == row
-            case .synthesize: routed(config.extraction.conceptLlm) == row
             case .summarize: routed(config.extraction.summaryLlm) == row
+            case .judge: routed(config.extraction.judgeLlm) == row
             }
         }
     }
@@ -754,7 +814,7 @@ struct SettingsView: View {
     /// Index and violet for the LLM stages, the colours their nodes have.
     private func pipelineUse(_ stages: [PipelineStage]) -> RowUse? {
         guard let first = stages.first else { return nil }
-        return RowUse(label: L("Pipeline"), color: first.color, help: L("Pipeline stages on this: %@", listed(stages.map(\.title))))
+        return RowUse(label: L("Ingest"), color: first.color, help: L("Ingest stages on this: %@", listed(stages.map(\.title))))
     }
 
     /// Research and Ask on a row, in the order the service resolves them:
@@ -775,8 +835,8 @@ struct SettingsView: View {
         let ask = chat.isEmpty ? (research.isEmpty ? ResearchSettingsSection.defaultConnection : research) : chat
         if specRow(ask) == row {
             let help = chat.isEmpty && !research.isEmpty
-                ? L("Ask names no agent of its own, so it follows the research agent — give it one under Research.")
-                : namesAgent(ask) ? "" : L("Ask runs on this directly rather than through an agent — give it one under Research.")
+                ? L("Ask names no agent of its own, so it follows the research agent — give it one under Ask.")
+                : namesAgent(ask) ? "" : L("Ask runs on this directly rather than through an agent — give it one under Ask.")
             uses.append(RowUse(label: L("Ask"), color: .knodeCyan, help: help))
         }
         return uses
@@ -814,7 +874,6 @@ struct SettingsView: View {
         if config != nil {
             ResearchSettingsSection(
                 research: binding(\.research),
-                chat: binding(\.chat),
                 profile: $profileDraft,
                 dirty: $profileDirty,
                 profileSelection: researchProfileBinding,
@@ -830,6 +889,20 @@ struct SettingsView: View {
                     showingDuplicate = true
                 },
                 remove: { showingProfileDelete = true }
+            )
+        }
+    }
+
+    // MARK: - Ask
+
+    @ViewBuilder
+    private var askSection: some View {
+        if config != nil {
+            AskSettingsSection(
+                chat: binding(\.chat),
+                agents: agents,
+                connections: llmTargets,
+                defaultTarget: defaultTarget
             )
         }
     }
@@ -983,8 +1056,8 @@ struct SettingsView: View {
             TestResultRow(label: L("1 · Convert"), result: result.documentLlm)
             TestResultRow(label: L("2 · Index"), result: result.embedding)
             TestResultRow(label: L("3 · Extract"), result: result.entityLlm)
-            TestResultRow(label: L("4 · Synthesize"), result: result.conceptLlm)
-            TestResultRow(label: L("5 · Summarize"), result: result.summaryLlm)
+            TestResultRow(label: L("4 · Summarize"), result: result.summaryLlm)
+            TestResultRow(label: L("5 · Judge"), result: result.judgeLlm)
         }
         .knodeCard()
     }
@@ -1100,12 +1173,20 @@ struct SettingsView: View {
         return try await model.client().listModels(route: "llm", config: draft, refresh: refresh)
     }
 
+    /// The routes the four model stages name, in the order a document meets them.
+    private let stageRoutes: [WritableKeyPath<KnodeConfig, RoutedLLMConfig>] = [
+        \KnodeConfig.extraction.documentLlm,
+        \KnodeConfig.extraction.entityLlm,
+        \KnodeConfig.extraction.summaryLlm,
+        \KnodeConfig.extraction.judgeLlm,
+    ]
+
     /// Every stage names what it runs on, and the service writes it down that
     /// way. A service from before that may still send '' or 'default' for
     /// "the default", which is `llmUse` — the picker has no entry for either.
     private func normalized(_ incoming: KnodeConfig) -> KnodeConfig {
         var config = incoming
-        for keyPath in [\KnodeConfig.extraction.entityLlm, \KnodeConfig.extraction.conceptLlm, \KnodeConfig.extraction.documentLlm] {
+        for keyPath in stageRoutes {
             let use = config[keyPath: keyPath].use
             if use.isEmpty || use == "default" { config[keyPath: keyPath].use = config.llmUse }
         }
@@ -1157,7 +1238,7 @@ struct SettingsView: View {
         }
         // A stage on the deleted connection would fall back to the default
         // without saying so; move it there explicitly, by name.
-        for keyPath in [\KnodeConfig.extraction.entityLlm, \KnodeConfig.extraction.conceptLlm, \KnodeConfig.extraction.documentLlm] {
+        for keyPath in stageRoutes {
             if config![keyPath: keyPath].use == id { config![keyPath: keyPath].use = config!.llmUse }
         }
     }
@@ -1788,11 +1869,16 @@ private struct TestResultRow: View {
     }
 }
 
-/// The five stages a document passes through, in order. Declaring them once
+/// The five stages, in the order a document meets them. Declaring them once
 /// keeps the flow nodes, the inspector and the per-stage rates from drifting
 /// apart — they used to be five hand-written blocks.
+///
+/// The first four are per document: Convert and Index on sync, Extract and
+/// Summarize in the background pass. Judge decides things — duplicates after
+/// each pass, disputes and Dream at night, knode_ask on demand. Concept pages
+/// are research's job, not a stage's (docs/design/09).
 enum PipelineStage: Int, CaseIterable, Identifiable {
-    case convert = 1, index, extract, synthesize, summarize
+    case convert = 1, index, extract, summarize, judge
 
     var id: Int { rawValue }
     var step: Int { rawValue }
@@ -1802,8 +1888,8 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .convert: L("Convert")
         case .index: L("Index")
         case .extract: L("Extract")
-        case .synthesize: L("Synthesize")
         case .summarize: L("Summarize")
+        case .judge: L("Judge")
         }
     }
 
@@ -1812,8 +1898,8 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .convert: L("Vision")
         case .index: L("Embedding")
         case .extract: L("Volume")
-        case .synthesize: L("Quality")
-        case .summarize: L("Judgment")
+        case .summarize: L("Prose")
+        case .judge: L("Quality")
         }
     }
 
@@ -1824,9 +1910,9 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         switch self {
         case .convert: L("Images and scanned PDF pages become searchable Markdown.")
         case .index: L("Every chunk becomes a vector for semantic and hybrid recall.")
-        case .extract: L("Names entities, relations and factual claims in changed documents.")
-        case .synthesize: L("Turns hot entity clusters into readable, linked Concept pages.")
-        case .summarize: L("Writes each document's summary page and answers knode_ask; overnight it runs Dream and reviews duplicate entities and disputed claims.")
+        case .extract: L("Names entities, relations and factual claims in changed documents; what it finds is checked for duplicates right away.")
+        case .summarize: L("Writes one summary page per document, right after it is extracted.")
+        case .judge: L("Answers knode_ask and reviews duplicate entities after each extraction pass; overnight it runs Dream and reviews disputed claims.")
         }
     }
 
@@ -1838,10 +1924,10 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
             L("Not an LLM — it uses one of the embedding models under Providers & Agents. Changing which one, or its model or dimensions, re-embeds the whole corpus.")
         case .extract:
             L("The busiest stage — it runs on every changed document, bounded by the batch size here. A fast, cheap model that returns clean JSON is usually the right trade.")
-        case .synthesize:
-            L("Far fewer calls than Extract — only hot clusters reach it — and the output is prose people read, so a stronger model pays for itself here.")
         case .summarize:
-            L("Every job here reads the text it is handed and makes a call on it — what a document is about, whether two entities are one, which of two claims holds, what a week of agent sessions says. Nobody waits on most of them: summaries are written when the wiki is generated and refreshed overnight, beside Dream and the reviews, so a slower model or a CLI subscription only costs time. knode_ask is the exception — an agent is waiting on its answer.")
+            L("One call per document, for people to read rather than a program to parse, so it wants clean prose more than the strongest model. Changing the model does not rewrite summaries already written.")
+        case .judge:
+            L("Few calls, but each one decides something — whether two entities are one, which of two claims holds, what a week of agent sessions says — so a stronger model pays for itself. Only knode_ask has someone waiting on the answer.")
         }
     }
 }
