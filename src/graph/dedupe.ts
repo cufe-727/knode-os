@@ -9,10 +9,15 @@ import { applyMerge } from './merge.js';
 import { typesCompatible } from './normalize.js';
 
 /**
- * Nightly duplicate-entity audit. Finds pairs that probably name the same
- * thing and files them as `merge` suggestions for a person to accept — the
- * write-time resolver only merges on exact key equality; everything fuzzier
- * ends here.
+ * Duplicate-entity audit. Finds pairs that probably name the same thing and
+ * files them as `merge` suggestions for a person to accept — the write-time
+ * resolver only merges on exact key equality; everything fuzzier ends here.
+ *
+ * It runs twice over: right after every tier-1 pass with `focus` set to the
+ * entities that pass wrote, so a duplicate surfaces minutes after its document
+ * arrives, and nightly over every pair as the backstop (docs/design/09). A
+ * merge is a reversible link either way, which is why it may run that early
+ * while write-time resolution stays exact.
  *
  * Signals, strongest first:
  *   1. same bare name key (corporate suffix stripped) — 0.98
@@ -34,6 +39,13 @@ export interface DedupeOptions {
   /** Most-mentioned entities considered for the embedding pass. */
   maxEmbedded?: number;
   maxSuggestions?: number;
+  /**
+   * Only score pairs with at least one entity in this set — the entities a
+   * tier-1 pass just wrote. Absent = every pair (the nightly audit). The
+   * embedding signal then embeds just these and looks for their neighbours
+   * among the vectors already cached.
+   */
+  focus?: string[];
 }
 
 export interface DedupeStats {
@@ -98,9 +110,12 @@ export async function auditDuplicateEntities(
      FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL`,
   );
   const byId = new Map(entities.map((e) => [e.id, e]));
+  const focus = opts.focus ? new Set(opts.focus.filter((id) => byId.has(id))) : null;
+  if (focus && focus.size === 0) return stats;
+  const inFocus = (a: EntityLite, b: EntityLite) => !focus || focus.has(a.id) || focus.has(b.id);
   const candidates = new Map<string, Candidate>();
   const propose = (a: EntityLite, b: EntityLite, score: number, reason: string) => {
-    if (a.id === b.id || !typesCompatible(a.type, b.type)) return;
+    if (a.id === b.id || !typesCompatible(a.type, b.type) || !inFocus(a, b)) return;
     const id = mergeSuggestionId(a.id, b.id);
     const prev = candidates.get(id);
     if (!prev || prev.score < score) candidates.set(id, { a, b, score, reason });
@@ -135,21 +150,30 @@ export async function auditDuplicateEntities(
   // 3. short name is a prefix of a longer one, same declared (non-placeholder) type
   const typed = entities.filter((e) => e.name_key && e.type !== 'concept' && e.type !== 'other');
   const isCjk = (s: string) => /[\u3400-\u9fff]/.test(s);
-  for (const short of typed) {
+  const prefix = (short: EntityLite, long: EntityLite) => {
     const k = short.name_key!;
-    if (k.length < (isCjk(k) ? 2 : 4)) continue;
-    for (const long of typed) {
-      if (long.id === short.id || long.type !== short.type) continue;
-      const lk = long.name_key!;
-      if (lk.length <= k.length || lk.length - k.length > 12 || !lk.startsWith(k)) continue;
-      propose(short, long, 0.85, `"${short.name}" 是 "${long.name}" 的前缀（同为 ${short.type}）`);
+    if (k.length < (isCjk(k) ? 2 : 4)) return;
+    if (long.id === short.id || long.type !== short.type) return;
+    const lk = long.name_key!;
+    if (lk.length <= k.length || lk.length - k.length > 12 || !lk.startsWith(k)) return;
+    propose(short, long, 0.85, `"${short.name}" 是 "${long.name}" 的前缀（同为 ${short.type}）`);
+  };
+  if (focus) {
+    // each focus entity against every other, in both roles — not every pair
+    for (const f of typed.filter((e) => focus.has(e.id))) {
+      for (const other of typed) {
+        prefix(f, other);
+        prefix(other, f);
+      }
     }
+  } else {
+    for (const short of typed) for (const long of typed) prefix(short, long);
   }
 
   // 4. embedding similarity (real embedders only)
   if (ctx.config.embedding.provider !== 'local' && ctx.embedder.model !== 'local-hash-v1') {
     const pool = entities
-      .filter((e) => e.type !== 'concept' || e.mention_count >= 3)
+      .filter((e) => (!focus || focus.has(e.id)) && (e.type !== 'concept' || e.mention_count >= 3))
       .sort((a, b) => b.mention_count - a.mention_count)
       .slice(0, opts.maxEmbedded ?? 600);
     const ids = pool.map((e) => e.id);

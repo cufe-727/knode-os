@@ -180,6 +180,8 @@ NLP 概念抽取与 sidecar 写入。
    - `wiki/index.md` 维护"热点主题"区块（见 3.3）。
 4. wiki 页被下一轮 ingest 索引回图谱——保留现有 wiki ↔ graph 正反馈循环。
 
+> 2026‑09‑30 起（[09](09-ingest-stage-rework.zh-CN.md)）：Tier 2 不再写社区摘要页——热点社区改为 `concept` 研究建议，由研究 agent 写带来源的概念页；文档摘要页挪到每轮抽取之后、每篇都写；重复实体审计在每轮抽取后增量跑一次，夜间仍全量兜底。
+
 ### 2.5 单文档时序
 
 ```mermaid
@@ -329,7 +331,7 @@ sidecar 的 `usage` 字段。DB 与 sidecar 之间，DB 是实时账本、sideca
      顶部渲染热度徽标；
    - `wiki/index.md` 由 Tier 2 维护"热点主题"区块（top-N 热点社区/实体链接）；
    - 冷文档（heat 低于阈值且超期未访问）在 wiki 生成时降级为 sources 索引页中
-     的一行链接，不再单独维护摘要页。
+     的一行链接，不再单独维护摘要页。（2026‑09‑30 起不再区分冷热：每篇文档都有摘要页，见 [09](09-ingest-stage-rework.zh-CN.md)。）
 
 ## 4. 目录层次
 

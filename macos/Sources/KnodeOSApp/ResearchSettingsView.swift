@@ -12,7 +12,6 @@ import SwiftUI
 /// agent actually receives.
 struct ResearchSettingsSection: View {
     @Binding var research: ResearchConfig
-    @Binding var chat: ChatConfig
     @Binding var profile: ResearchProfileDetail?
     @Binding var dirty: Bool
     /// Selecting another profile reloads its file, so it goes through the
@@ -55,8 +54,6 @@ struct ResearchSettingsSection: View {
         VStack(alignment: .leading, spacing: 14) {
             header
             runnerCard
-            initializationCard
-            chatCard
             if profile != nil {
                 profileCard
                 rolesEditor
@@ -72,7 +69,7 @@ struct ResearchSettingsSection: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(L("How the wiki gets written")).font(.title3.bold())
-            Text(L("What initialization does, how Ask behaves, and how a deep-research job runs: which agent from Providers & Agents takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents."))
+            Text(L("How a deep-research job runs: which agent from Providers & Agents takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -155,14 +152,26 @@ struct ResearchSettingsSection: View {
                     }
                 }
             }
-            HStack(spacing: 8) {
-                Toggle(L("Accept the top recommendations automatically, up to"), isOn: $research.auto.enabled)
-                    .toggleStyle(.checkbox)
-                TextField("3", value: $research.auto.dailyJobs, format: .number)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 64)
-                    .disabled(!research.auto.enabled)
-                Text(L("jobs a day")).font(.callout).foregroundStyle(.secondary)
+            // the two ways jobs get queued without anyone asking for one
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Toggle(L("Accept the top recommendations automatically, up to"), isOn: $research.auto.enabled)
+                        .toggleStyle(.checkbox)
+                    TextField("3", value: $research.auto.dailyJobs, format: .number)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 64)
+                        .disabled(!research.auto.enabled)
+                    Text(L("jobs a day")).font(.callout).foregroundStyle(.secondary)
+                }
+                HStack(spacing: 8) {
+                    Toggle(L("After an initialization, queue up to"), isOn: queuesFollowUps)
+                        .toggleStyle(.checkbox)
+                    TextField("6", value: $research.initialization.followUps, format: .number)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 64)
+                        .disabled(research.initialization.followUps == 0)
+                    Text(L("topic pages it suggests")).font(.callout).foregroundStyle(.secondary)
+                }
             }
             Text(note)
                 .font(.caption)
@@ -177,79 +186,13 @@ struct ResearchSettingsSection: View {
         return title == summary.name ? summary.name : "\(summary.name) · \(title)"
     }
 
-    /// What the Wiki tab's initialize button does before the agent starts.
-    private var initializationCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(L("Initialization")).font(.headline)
-                Text(L("What the Wiki tab's initialize button does before the agent starts, and how many topic pages it queues afterwards."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-                GridRow {
-                    FieldLabel(L("Extraction first")) {
-                        Picker(L("Extraction first"), selection: $research.initialization.extraction) {
-                            Text(L("Drain the tier-1 queue")).tag("drain")
-                            Text(L("Skip — leave it to the background loop")).tag("skip")
-                        }
-                        .labelsHidden()
-                    }
-                    FieldLabel(L("Extraction time cap (minutes)")) {
-                        TextField("15", value: extractionCapMinutes, format: .number)
-                            .disabled(research.initialization.extraction != "drain")
-                    }
-                    FieldLabel(L("Follow-up pages queued")) {
-                        TextField("6", value: $research.initialization.followUps, format: .number)
-                    }
-                }
-            }
-        }
-        .knodeCard(padding: 18)
-    }
-
-    /// Which agent answers Ask, and the two things about a conversation that
-    /// are not properties of the agent. Everything else — effort, tools, turn
-    /// cap, timeout, extra prompt — belongs to the agent itself, under Providers & Agents.
-    private var chatCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(L("Ask")).font(.headline)
-                Text(L("Ask uses the same agent research does: it answers over MCP, and writes what you teach it as a quarantined note."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-                GridRow {
-                    FieldLabel(L("Agent")) {
-                        AgentPicker(selection: $chat.agent, agents: agents, connections: connections, fallbackLabel: L("The research agent, else the default provider"), defaultName: defaultTarget?.label ?? "")
-                    }
-                    FieldLabel(L("Messages replayed")) {
-                        TextField("12", value: $chat.historyTurns, format: .number)
-                    }
-                    FieldLabel(L("Conversations kept")) {
-                        TextField("200", value: $chat.keep, format: .number)
-                    }
-                }
-            }
-            Text(L("Effort, turns, timeout, tool grants and any extra prompt come from the agent — edit them where the agent is defined, under Providers & Agents."))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(L("Every reply is a fresh session that replays the recent messages — there is no CLI session to resume, so a long conversation costs more input each turn."))
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .knodeCard(padding: 18)
-    }
-
-    private var extractionCapMinutes: Binding<Int> {
+    /// Whether an initialization queues the topic pages its plan suggests.
+    /// There is no separate switch in the config — none is `followUps: 0` —
+    /// so turning it back on starts from the default count.
+    private var queuesFollowUps: Binding<Bool> {
         Binding(
-            get: { max(1, research.initialization.extractionMaxMs / 60_000) },
-            set: { research.initialization.extractionMaxMs = max(1, $0) * 60_000 }
+            get: { research.initialization.followUps > 0 },
+            set: { research.initialization.followUps = $0 ? ResearchConfig.Initialization().followUps : 0 }
         )
     }
 

@@ -21,7 +21,7 @@ import SwiftUI
  */
 struct AgentsSettingsSection: View {
     @Binding var agents: [AgentDefinition]
-    /// What runs on each agent — Default, Pipeline, Research, Ask — by agent
+    /// What runs on each agent — Default, Ingest, Research, Ask — by agent
     /// name. SettingsView works it out, because the models table needs the
     /// same resolution for its own badges.
     let uses: [String: [RowUse]]

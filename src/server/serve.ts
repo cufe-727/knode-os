@@ -4,7 +4,7 @@ import path from 'node:path';
 import { AppContext } from '../context.js';
 import { SIDECAR_ROOT_SEGMENT } from '../fs/layout.js';
 import { startDreamScheduler } from '../dream/dream.js';
-import { runTier1Pass } from '../graph/tier1.js';
+import { describeDocumentPass, runDocumentPass } from '../ingest/background.js';
 import { sync } from '../ingest/sync.js';
 import { flushUsageToSidecars } from '../stats/heat.js';
 import { syncTraces } from '../traces/sync.js';
@@ -20,10 +20,11 @@ import { WorkspaceContextRegistry } from './workspaces.js';
 
 /**
  * `knode-os serve` — HTTP API + web UI, plus the background loops:
- * file watcher → scoped sync (apply changed, dispose removed), periodic
- * tier-1 extraction (heat-prioritized) followed by view
- * reconciliation, hourly usage-stats flush to sidecars, periodic trace sync,
- * datasource re-sync, nightly dream + tier-2 hot-subgraph refinement.
+ * file watcher → scoped sync (apply changed, dispose removed), the periodic
+ * document pass (heat-prioritized extraction → duplicate audit of what it
+ * wrote → summary pages) followed by view reconciliation, hourly usage-stats
+ * flush to sidecars, periodic trace sync, datasource re-sync, nightly dream +
+ * the tier-2 pass.
  */
 export async function startServer(ctx: AppContext): Promise<void> {
   const log = (msg: string) => console.log(`[knode-os] ${msg}`);
@@ -136,8 +137,9 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   }, interval);
   syncTimer.unref?.();
 
-  // tier-1 extraction loop: drain the priority queue a batch at a time, then
-  // let pages that depend on the new evidence regenerate
+  // the document pass: extract a batch from the priority queue, audit the
+  // entities it wrote for duplicates, write summary pages — then let pages
+  // that depend on the new evidence regenerate (docs/design/09)
   const tier1Interval = Math.max(1, ctx.config.extraction.intervalMinutes) * 60_000;
   let tier1Running = false;
   const tier1Timer = setInterval(() => {
@@ -145,14 +147,15 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     tier1Running = true;
     void track((async () => {
       try {
-        const t1 = await runTier1Pass(ctx.store, ctx.config, ctx.llm, { onProgress: log });
-        if (t1.processed || t1.failed) {
-          log(`tier1: ${t1.processed} extracted, ${t1.failed} failed, ${t1.queued} queued, ~${t1.tokensUsed} tokens`);
+        const pass = await runDocumentPass(ctx, { onProgress: log });
+        const line = describeDocumentPass(pass);
+        if (line) {
+          log(line);
           const views = await reconcileViews(ctx, { actor: 'tier1', llm: false, onProgress: log });
           if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
         }
       } catch (err) {
-        log(`tier1 pass failed: ${err instanceof Error ? err.message : err}`);
+        log(`document pass failed: ${err instanceof Error ? err.message : err}`);
       } finally {
         tier1Running = false;
       }
@@ -175,7 +178,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   }, flushInterval);
   flushTimer.unref?.();
 
-  // nightly dream + tier-2 hot-subgraph refinement
+  // nightly dream + the tier-2 pass
   const dreamTimer = startDreamScheduler(ctx, log);
   log(`dream scheduled daily at ${ctx.config.dream.schedule} (lookback ${ctx.config.dream.lookbackDays}d)`);
   const tier2Timer = startTier2Scheduler(ctx, log);
@@ -254,7 +257,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   };
 }
 
-/** Run tier-2 refinement daily, a few minutes after the dream schedule. */
+/** Run the tier-2 pass daily, a few minutes after the dream schedule. */
 function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void): NodeJS.Timeout {
   const [h, m] = ctx.config.dream.schedule.split(':').map(Number);
   const target = `${String(h).padStart(2, '0')}:${String((m + 10) % 60).padStart(2, '0')}`;
@@ -267,7 +270,7 @@ function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void): NodeJ
       lastRun = today;
       try {
         const res = await refineWiki(ctx.store, ctx.config, ctx.llm, { onProgress: log, embedder: ctx.embedder });
-        log(`tier2 done: ${res.pagesWritten} community pages from ${res.communities} hot communities`);
+        log(`tier2 done: ${res.mergeCandidates} merge suggestions, ${res.claimReviews} claim reviews, ${res.recommendations} research recommendations${res.retiredPages ? `, ${res.retiredPages} cluster pages archived` : ''}`);
         const views = await reconcileViews(ctx, { actor: 'tier2', llm: true, onProgress: log });
         if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
         const lint = await lintWiki(ctx, { onProgress: log });
@@ -278,6 +281,6 @@ function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void): NodeJ
     }
   }, 30 * 1000);
   timer.unref?.();
-  log(`tier2 refinement scheduled daily at ${target}`);
+  log(`tier2 pass scheduled daily at ${target}`);
   return timer;
 }

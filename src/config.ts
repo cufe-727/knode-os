@@ -201,31 +201,33 @@ export interface ExtractionConfig {
   claims: boolean;
   /** Model for tier-1 entity/relation extraction. Empty = use llm.model. */
   tier1Model: string;
-  /** Model for tier-2 community summaries / wiki pages. Empty = use llm.model. */
-  tier2Model: string;
   /** Provider and model used for tier-1 entity / relation / claim extraction. */
   entityLlm: RoutedLlmConfig;
-  /** Provider and model used for tier-2 concept synthesis / wiki refinement. */
-  conceptLlm: RoutedLlmConfig;
   /** Vision-capable provider used to convert images and scanned PDF pages to Markdown. */
   documentLlm: RoutedLlmConfig;
   /**
-   * The Summarize stage: document summaries, Dream, the nightly merge and
-   * claim reviews, and knode_ask — every job that takes `ctx.llm` rather than
-   * a stage of its own (see `summaryLlmClient`). These ran on the default LLM
-   * until they got a route; `pinRoutes` writes a config from before down as
-   * the default it was running on.
+   * The Summarize stage: one summary page per document in raw/docs, written in
+   * the background document pass right after extraction (see
+   * `summaryLlmClient`, `ensureSourceSummaries`).
    */
   summaryLlm: RoutedLlmConfig;
+  /**
+   * The Judge stage: knode_ask, Dream, the duplicate-entity review after each
+   * extraction pass and at night, and the disputed-claim review — every job
+   * that takes `ctx.llm` rather than a stage of its own (see `judgeLlmClient`).
+   * A config from before the split starts as its `summaryLlm`, which is where
+   * these jobs ran (`migrateJudgeRoute`).
+   */
+  judgeLlm: RoutedLlmConfig;
   /** New documents get a priority boost that decays over this many days. */
   freshnessBoostDays: number;
   /** Static per-root priority weights for the extraction queue. */
   importance: Record<string, number>;
-  /** How many queued documents one tier-1 pass may process. */
+  /** How many queued documents one background pass extracts — and how many summaries it writes. */
   batchSize: number;
-  /** Parallel LLM extraction calls within one tier-1 pass. */
+  /** Parallel LLM calls within one background pass, for extraction and summaries alike. */
   concurrency: number;
-  /** Minutes between background tier-1 queue passes while `serve` runs. */
+  /** Minutes between background document passes while `serve` runs. */
   intervalMinutes: number;
 }
 
@@ -440,16 +442,18 @@ export interface ResearchConfig {
   researchers: number;
   /** Critique → revise rounds in 'team' mode before the page is accepted or rejected. */
   reviewRounds: number;
-  /** Knowledge-base initialization (kind = init): what the pre-flight does and how many topic pages it queues. */
+  /** Knowledge-base initialization (kind = init): how long its pre-flight catches up on extraction, and how many topic pages it queues. */
   init: ResearchInitConfig;
 }
 
 export interface ResearchInitConfig {
   /** Topic pages (from the plan) queued as follow-up research jobs after an initialization. */
   followUps: number;
-  /** 'drain': run tier-1 extraction to the end of the queue before the agent starts; 'skip': leave the queue to the background loop. */
-  extraction: 'drain' | 'skip';
-  /** Cap on the pre-flight extraction time. */
+  /**
+   * How long an initialization first spends extracting documents that still
+   * wait in the tier-1 queue; whatever is left goes on in the background loop.
+   * The catch-up always runs — an empty queue makes it a no-op.
+   */
   extractionMaxMs: number;
 }
 
@@ -532,7 +536,7 @@ export interface KnodeConfig {
    * Everything that needs "the default model" — a route that names no
    * connection, `agentForSpec('default')` — reads this, so the default can
    * become an ordinary row without touching any of them. `ctx.llm` used to
-   * be one of them; it is the Summarize stage's now (`summaryLlmClient`).
+   * be one of them; it is the Judge stage's now (`judgeLlmClient`).
    */
   llm: LlmConfig;
   /**
@@ -649,11 +653,10 @@ export function defaultConfig(): KnodeConfig {
     extraction: {
       claims: true,
       tier1Model: '',
-      tier2Model: '',
       entityLlm: defaultRoutedLlmConfig(),
-      conceptLlm: defaultRoutedLlmConfig(),
       documentLlm: defaultRoutedLlmConfig(),
       summaryLlm: defaultRoutedLlmConfig(),
+      judgeLlm: defaultRoutedLlmConfig(),
       freshnessBoostDays: 3,
       importance: { docs: 1.0, skills: 0.6 },
       batchSize: 8,
@@ -700,7 +703,7 @@ export function defaultConfig(): KnodeConfig {
       profile: 'default',
       researchers: 3,
       reviewRounds: 1,
-      init: { followUps: 6, extraction: 'drain', extractionMaxMs: 900_000 },
+      init: { followUps: 6, extractionMaxMs: 900_000 },
     },
     graph: { ontologyPacks: ['core', 'organization'] },
     review: {
@@ -834,6 +837,10 @@ export function loadConfig(dataDir: string): KnodeConfig {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<KnodeConfig>;
   const merged = migrateChatConfig(deepMerge(base, raw));
   const unbudgeted = dropTokenBudget(merged);
+  const unchosen = dropInitExtractionChoice(merged);
+  // before routes are lifted and pinned, so the copy is lifted and pinned with them
+  const judged = migrateJudgeRoute(merged, raw);
+  const unconcepted = dropConceptRoute(merged);
   merged.agentLlms = base.agentLlms;
   merged.modelAgents = base.modelAgents;
   const renamed = renameRetiredAgents(merged, dataDir, retired);
@@ -847,9 +854,10 @@ export function loadConfig(dataDir: string): KnodeConfig {
   const pinned = pinRoutes(config);
   // the move wrote agent files, so the config that no longer names those rows
   // is written too — otherwise every load would move them again; a pinned
-  // stage, a spec renamed off a retired agent and a dropped token budget are
-  // written for the same reason
-  if (movesCli || pinned || renamed || unbudgeted) saveConfig(dataDir, config);
+  // stage, a spec renamed off a retired agent, a dropped token budget or init
+  // extraction choice, the Judge route's first copy and the retired concept
+  // route are written for the same reason
+  if (movesCli || pinned || renamed || unbudgeted || unchosen || judged || unconcepted) saveConfig(dataDir, config);
   return config;
 }
 
@@ -918,7 +926,52 @@ export function dropTokenBudget(config: KnodeConfig): boolean {
   return true;
 }
 
-const ROUTE_KEYS = ['entityLlm', 'conceptLlm', 'documentLlm', 'summaryLlm'] as const;
+/**
+ * Drop `research.init.extraction` ('drain' | 'skip'). An initialization now
+ * always catches up on what the tier-1 queue still holds before its agent
+ * starts — within `extractionMaxMs`, a no-op when nothing waits — so there is
+ * nothing left to choose. Removed for the same reason as the token budget:
+ * `deepMerge` would keep it in the file forever. Returns whether there was one.
+ */
+export function dropInitExtractionChoice(config: KnodeConfig): boolean {
+  const init = config.research?.init as unknown as Record<string, unknown> | undefined;
+  if (!init || !('extraction' in init)) return false;
+  delete init.extraction;
+  return true;
+}
+
+/**
+ * Give a config from before the Judge stage its route: a copy of `summaryLlm`.
+ * knode_ask, Dream and the two reviews ran on the Summarize stage until it
+ * kept only document summaries, so they keep running where they ran — the
+ * same target, model, effort and speed. `raw` is the file as written, since
+ * `deepMerge` has already filled in a default by now. Returns whether it copied.
+ */
+export function migrateJudgeRoute(config: KnodeConfig, raw: Partial<KnodeConfig>): boolean {
+  if ((raw.extraction as Partial<ExtractionConfig> | undefined)?.judgeLlm) return false;
+  config.extraction.judgeLlm = { ...config.extraction.summaryLlm };
+  return true;
+}
+
+/**
+ * Drop `extraction.conceptLlm` and its legacy `tier2Model`. The Synthesize
+ * stage wrote nightly concept-cluster pages; concept pages are research's job
+ * now (docs/design/09), so nothing reads either. `deepMerge` would keep them
+ * in the file forever, looking like settings. Returns whether there was one.
+ */
+export function dropConceptRoute(config: KnodeConfig): boolean {
+  const extraction = config.extraction as unknown as Record<string, unknown> | undefined;
+  if (!extraction) return false;
+  let dropped = false;
+  for (const key of ['conceptLlm', 'tier2Model']) {
+    if (!(key in extraction)) continue;
+    delete extraction[key];
+    dropped = true;
+  }
+  return dropped;
+}
+
+const ROUTE_KEYS = ['entityLlm', 'documentLlm', 'summaryLlm', 'judgeLlm'] as const;
 
 /**
  * Lift pre-connections route overrides into named connections, in memory, so
@@ -1045,10 +1098,9 @@ export function routeTargets(
   return [...targets, ...agents];
 }
 
-/** The routes that replaced a tier model, which a pinned route takes over. */
-const LEGACY_ROUTE_MODELS: Partial<Record<(typeof ROUTE_KEYS)[number], 'tier1Model' | 'tier2Model'>> = {
+/** The route that replaced a tier model, which a pinned route takes over. */
+const LEGACY_ROUTE_MODELS: Partial<Record<(typeof ROUTE_KEYS)[number], 'tier1Model'>> = {
   entityLlm: 'tier1Model',
-  conceptLlm: 'tier2Model',
 };
 
 /**
@@ -1367,9 +1419,9 @@ export function redactConfig(config: KnodeConfig): KnodeConfig {
     clone.embedding,
     clone.llm,
     clone.extraction.entityLlm,
-    clone.extraction.conceptLlm,
     clone.extraction.documentLlm,
     clone.extraction.summaryLlm,
+    clone.extraction.judgeLlm,
     ...(clone.connections ?? []),
     ...(clone.embeddingProviders ?? []),
   ];

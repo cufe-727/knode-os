@@ -2,13 +2,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
-import { KnodeConfig, resolveRoutedLlmConfig, routeTargets } from '../config.js';
+import { KnodeConfig } from '../config.js';
 import { LLM_WIKI_INPUT_CHARS } from '../constants.js';
+import { summaryLlmClient } from '../context.js';
 import { DataSourceRegistry } from '../datasource/registry.js';
 import { QueryResult } from '../datasource/types.js';
 import { safePath } from '../fs/files.js';
-import { readPageCache, writePageCache } from '../fs/page-sidecar.js';
-import { readSourceSummary, writeSourceSummary } from '../fs/sidecar.js';
+import { clearSourceSummaryFailure, readSourceSummary, readSourceSummaryFailure, recordSourceSummaryFailure, writeSourceSummary } from '../fs/sidecar.js';
 import { slugify } from '../graph/store.js';
 import { applyDocScope } from '../ingest/apply.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
@@ -39,13 +39,21 @@ import { hasRegions, renderRegion, replaceRegion, splitRegions } from './regions
  * so regeneration cannot loop.
  */
 
+/**
+ * `concept_cluster` has no generator any more — concept pages are research's
+ * job (docs/design/09) — but rows of that kind may still exist until
+ * `retireConceptClusterPages` archives them.
+ */
 export type PageKind = 'entity_stub' | 'source_summary' | 'dataset' | 'sources_index' | 'hot_topics' | 'concept_cluster' | 'dream' | 'research_index';
 
 export interface PagesContext {
   store: Store;
   dataDir: string;
   config: KnodeConfig;
+  /** The Judge stage (`ctx.llm`). */
   llm: LlmClient;
+  /** The Summarize stage; resolved from `config` when absent (`summaryLlmClient`). */
+  summaryLlm?: LlmClient;
   embedder: EmbeddingProvider;
   datasources?: DataSourceRegistry;
 }
@@ -65,6 +73,8 @@ export interface PageGenerator {
   kind: PageKind;
   version: number;
   llm: boolean;
+  /** The model an `llm` generator writes with, when that is not `ctx.llm`. */
+  client?(ctx: PagesContext): LlmClient;
   /** 'file' owns a whole page; 'region' owns one managed region inside a human file (path = file#region). */
   mode: 'file' | 'region';
   plan(ctx: PagesContext, pagePath: string, hint?: Record<string, unknown>): Promise<PagePlan | null>;
@@ -183,6 +193,7 @@ const sourceSummary: PageGenerator = {
   kind: 'source_summary',
   version: 2,
   llm: true,
+  client: (ctx) => documentSummaryLlm(ctx),
   mode: 'file',
   async plan(ctx, pagePath, hint) {
     let docPath = typeof hint?.documentPath === 'string' ? hint.documentPath : undefined;
@@ -348,14 +359,13 @@ const sourcesIndex: PageGenerator = {
     );
     if (docs.length === 0) return null;
     const heat = await getDocHeat(ctx.store, docs.map((d) => d.id), ctx.config.heat);
-    const pages = new Set((await ctx.store.query<{ path: string }>(`SELECT path FROM pages WHERE kind = 'source_summary' AND status <> 'archived'`)).map((p) => p.path));
+    const pages = await summaryPagesByDocument(ctx.store);
     const rows = docs.map((d) => {
       const h = heat.get(d.id) ?? 0;
-      const slug = slugify(d.title ?? path.basename(d.path));
-      const pageRel = `wiki/sources/${slug}.md`;
-      return { path: d.path, title: d.title ?? path.basename(d.path), slug, hasPage: pages.has(pageRel), heat: h, cold: h < ctx.config.heat.coldThreshold, sha: d.sha256 };
+      const page = pages.get(d.path)?.path ?? null;
+      return { path: d.path, title: d.title ?? path.basename(d.path), page: page ? path.posix.basename(page) : null, heat: h, cold: h < ctx.config.heat.coldThreshold, sha: d.sha256 };
     });
-    const setSha = sha16(rows.map((r) => [r.path, r.sha, r.hasPage, r.cold, Math.round(r.heat * 100)]));
+    const setSha = sha16(rows.map((r) => [r.path, r.sha, r.page, r.cold, Math.round(r.heat * 100)]));
     return {
       deps: [
         { kind: 'set', id: 'docs', sha: setSha },
@@ -366,14 +376,14 @@ const sourcesIndex: PageGenerator = {
     };
   },
   async render(_ctx, _pagePath, plan) {
-    const rows = plan.data.rows as { path: string; title: string; slug: string; hasPage: boolean; heat: number; cold: boolean }[];
+    const rows = plan.data.rows as { path: string; title: string; page: string | null; heat: number; cold: boolean }[];
     const lines = [
       '## Sources index',
       '',
-      'Every indexed document, hottest activity first. Cold documents are listed here without a maintained summary page.',
+      'Every indexed document, most recently updated first, linked to its summary page once the Summarize stage has written one.',
       '',
       ...rows.map((r) => {
-        const link = r.hasPage ? `[${r.title}](${r.slug}.md)` : r.title;
+        const link = r.page ? `[${r.title}](${r.page})` : r.title;
         const badge = r.cold ? ' `cold`' : ` \`heat ${r.heat.toFixed(2)}\``;
         return `* ${link} - \`${r.path}\`${badge}`;
       }),
@@ -433,120 +443,14 @@ const hotTopics: PageGenerator = {
   },
 };
 
-const COMMUNITY_SYSTEM = `You maintain a personal wiki. You are given a cluster of related entities and their relations from a knowledge graph, plus text excerpts where they appear. Write a wiki concept page that synthesizes what this cluster is about.
-
-Output rules:
-- Markdown only, no preamble.
-- Start with a one-paragraph synthesis, then "## Key entities" bullets, then "## Relations" describing how they connect.
-- Wrap every entity name in [[double brackets]].
-- Write in the dominant language of the excerpts. Max ~350 words.`;
-
-const conceptCluster: PageGenerator = {
-  kind: 'concept_cluster',
-  version: 2,
-  llm: true,
-  mode: 'file',
-  async plan(ctx, pagePath, hint) {
-    let anchor = typeof hint?.anchor === 'string' ? hint.anchor : undefined;
-    let members = Array.isArray(hint?.members) ? (hint!.members as string[]) : undefined;
-    if (!anchor || !members) {
-      const deps = await readDeps(ctx.store, { kind: 'page', id: pagePath });
-      anchor = anchor ?? deps.find((d) => d.input_kind === 'entity' && d.required)?.input_id;
-      members = members ?? deps.filter((d) => d.input_kind === 'entity').map((d) => d.input_id);
-    }
-    if (!anchor) return null;
-    const ids = [...new Set([anchor, ...(members ?? [])])];
-    const ph = ids.map((_, i) => `$${i + 1}`).join(',');
-    const rows = await ctx.store.query<HotEntity>(
-      `SELECT id, name, type, description, mention_count, fold_sha, 0::float AS heat FROM entities WHERE id IN (${ph}) AND tx_to IS NULL`,
-      ids,
-    );
-    const a = rows.find((r) => r.id === anchor);
-    if (!a) return null;
-    const memberRows = rows.filter((r) => r.id !== anchor).sort((x, y) => y.mention_count - x.mention_count);
-    if (memberRows.length < 2) return null;
-    return {
-      deps: [
-        { kind: 'entity', id: anchor, required: true, sha: a.fold_sha },
-        ...memberRows.map((m) => ({ kind: 'entity' as const, id: m.id })),
-      ],
-      inputsSha: sha16(['concept_cluster@2', anchor, memberRows.map((m) => m.id).sort()]),
-      data: { anchor: a, members: memberRows },
-    };
-  },
-  async render(ctx, pagePath, plan) {
-    const a = plan.data.anchor as HotEntity;
-    const members = plan.data.members as HotEntity[];
-    const all = [a, ...members];
-    const cached = readPageCache(ctx.dataDir, pagePath);
-    let body: string;
-    let by: string;
-    let at: string;
-    const llm = conceptLlm(ctx);
-    if (cached && cached.inputsSha === plan.inputsSha) {
-      body = cached.body;
-      by = cached.model;
-      at = cached.generatedAt;
-    } else {
-      if (!llm.enabled) return null;
-      const ids = all.map((e) => e.id);
-      const ph = ids.map((_, i) => `$${i + 1}`).join(',');
-      const rels = await ctx.store.query<{ source_id: string; target_id: string; type: string }>(
-        `SELECT source_id, target_id, type FROM relations WHERE source_id IN (${ph}) AND target_id IN (${ph}) AND tx_to IS NULL AND type <> 'co_occurs'`,
-        ids,
-      );
-      const byId = new Map(all.map((e) => [e.id, e]));
-      const excerpts = await groundingExcerpts(ctx.store, ids.slice(0, 5));
-      const prompt = [
-        'Entities:',
-        ...all.slice(0, 15).map((e) => `- ${e.name} (${e.type})${e.description ? ': ' + e.description.slice(0, 120) : ''}`),
-        '',
-        'Relations:',
-        ...rels.slice(0, 20).map((r) => `- ${byId.get(r.source_id)?.name} —${r.type}→ ${byId.get(r.target_id)?.name}`),
-        '',
-        'Excerpts:',
-        ...excerpts.map((x) => `> ${x}`),
-      ].join('\n');
-      body = await llm.complete([{ role: 'system', content: COMMUNITY_SYSTEM }, { role: 'user', content: prompt }], { maxTokens: 800 });
-      by = llm.label;
-      at = new Date().toISOString();
-      writePageCache(ctx.dataDir, pagePath, { inputsSha: plan.inputsSha, model: llm.label, body, generatedAt: at });
-    }
-    return {
-      frontmatter: {
-        title: `${a.name} cluster`,
-        type: 'concept',
-        entities: all.slice(0, 15).map((e) => e.name),
-        generated: okfGenerated(`knode-os/${by}`, at),
-        knode: knodeMeta('concept_cluster', { entities: all.map((e) => e.id) }),
-      },
-      regions: { body: body.trim() },
-    };
-  },
-};
-
-async function groundingExcerpts(store: Store, entityIds: string[]): Promise<string[]> {
-  if (entityIds.length === 0) return [];
-  const ph = entityIds.map((_, i) => `$${i + 1}`).join(',');
-  const rows = await store.query<{ content: string }>(
-    `SELECT DISTINCT c.content
-     FROM entity_mentions m JOIN chunks c ON c.id = m.chunk_id
-     WHERE m.entity_id IN (${ph})
-     LIMIT 5`,
-    entityIds,
-  );
-  return rows.map((r) => r.content.replace(/\s+/g, ' ').slice(0, 300));
-}
-
-/** The Summarize stage, which is what `ctx.llm` runs on (`summaryLlmClient`). */
+/**
+ * The Summarize stage — its own route, not `ctx.llm`, which is the Judge
+ * stage's. A context may carry it ready-made; otherwise it is resolved from
+ * the config each time, which is free: endpoint negotiation is cached per
+ * endpoint, not per client.
+ */
 function documentSummaryLlm(ctx: PagesContext): LlmClient {
-  return ctx.llm;
-}
-
-function conceptLlm(ctx: PagesContext): LlmClient {
-  return ctx.config.extraction.conceptLlm
-    ? new LlmClient(resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.conceptLlm, routeTargets(ctx.config), ctx.config.extraction.tier2Model))
-    : ctx.llm;
+  return ctx.summaryLlm ?? summaryLlmClient(ctx.config);
 }
 
 /** `wiki/index.md#recent-research`: the pages research agents wrote, newest first, with their review state. */
@@ -602,7 +506,6 @@ export const GENERATORS: Partial<Record<PageKind, PageGenerator>> = {
   dataset,
   sources_index: sourcesIndex,
   hot_topics: hotTopics,
-  concept_cluster: conceptCluster,
 };
 
 /* ----------------------------- composition ------------------------------ */
@@ -671,7 +574,10 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
     if (row?.status === 'dirty') await store.query(`UPDATE pages SET status = 'active', dirty_reason = NULL WHERE path = $1`, [pagePath]);
     return 'unchanged';
   }
-  if (gen.llm && !ctx.llm.enabled && !(await cachedRenderAvailable(ctx, gen, pagePath, plan))) return 'deferred';
+  // the model this generator writes with — the Summarize stage for a summary,
+  // not `ctx.llm` — decides whether an uncached page can be written now
+  const client = gen.client?.(ctx) ?? ctx.llm;
+  if (gen.llm && !client.enabled && !(await cachedRenderAvailable(ctx, gen, pagePath, plan))) return 'deferred';
 
   const rendered = await gen.render(ctx, pagePath, plan);
   if (!rendered) return 'deferred';
@@ -713,8 +619,7 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
   return 'regenerated';
 }
 
-async function cachedRenderAvailable(ctx: PagesContext, gen: PageGenerator, pagePath: string, plan: PagePlan): Promise<boolean> {
-  if (gen.kind === 'concept_cluster') return readPageCache(ctx.dataDir, pagePath)?.inputsSha === plan.inputsSha;
+async function cachedRenderAvailable(ctx: PagesContext, gen: PageGenerator, _pagePath: string, plan: PagePlan): Promise<boolean> {
   if (gen.kind === 'source_summary') {
     const doc = plan.data.doc as DocumentRow | undefined;
     if (!doc) return false;
@@ -864,34 +769,111 @@ function restoreArchived(dataDir: string, pagePath: string): void {
   }
 }
 
-/** Summary pages for hot / fresh documents without one (cold docs live only in the sources index). */
-export async function ensureSourceSummaries(ctx: PagesContext, opts: { limit?: number; actor?: string; onProgress?: (msg: string) => void } = {}): Promise<string[]> {
-  const progress = opts.onProgress ?? (() => {});
-  const docs = await ctx.store.query<DocumentRow>(
-    `SELECT * FROM documents WHERE root = 'docs' AND status = 'indexed' AND kind = 'source' ORDER BY updated_at DESC LIMIT $1`,
-    [opts.limit ?? 20],
+/** Summary pages still in use, by the document each one summarizes (its `document` dep). */
+async function summaryPagesByDocument(store: Store): Promise<Map<string, { path: string; status: string }>> {
+  const rows = await store.query<{ path: string; status: string; doc: string }>(
+    `SELECT p.path, p.status, d.input_id AS doc
+     FROM pages p JOIN deps d ON d.artifact_kind = 'page' AND d.artifact_id = p.path AND d.input_kind = 'document'
+     WHERE p.kind = 'source_summary' AND p.status <> 'archived'`,
   );
-  const heat = await getDocHeat(ctx.store, docs.map((d) => d.id), ctx.config.heat);
-  const graceMs = ctx.config.extraction.freshnessBoostDays * 24 * 3600 * 1000;
-  const isCold = (d: DocumentRow) =>
-    (heat.get(d.id) ?? 0) < ctx.config.heat.coldThreshold && Date.now() - new Date(d.created_at).getTime() > graceMs;
-  const created: string[] = [];
-  for (const doc of docs) {
-    if (isCold(doc)) continue;
-    const slug = slugify(doc.title ?? path.basename(doc.path));
-    const pagePath = `wiki/sources/${slug}.md`;
-    const [existing] = await ctx.store.query<{ path: string }>(`SELECT path FROM pages WHERE path = $1 AND status <> 'archived'`, [pagePath]);
-    if (existing) continue;
+  return new Map(rows.map((r) => [r.doc, { path: r.path, status: r.status }]));
+}
+
+/** `wiki/sources/<title slug>-<path hash>.md`: where a summary goes when its title's path belongs to someone else. */
+function hashedSummaryPath(doc: DocumentRow): string {
+  const slug = slugify(doc.title ?? path.basename(doc.path));
+  return `wiki/sources/${slug}-${crypto.createHash('sha256').update(doc.path).digest('hex').slice(0, 6)}.md`;
+}
+
+/** Summaries that failed this often on a document's current content wait for new content. */
+const MAX_SUMMARY_ATTEMPTS = 3;
+
+/**
+ * The Summarize stage: one summary page per indexed source document under
+ * raw/docs, written in the background document pass right after extraction
+ * (docs/design/09). One call writes at most `limit` pages — missing ones, and
+ * ones whose document changed since (dirty) — taking the documents in `prefer`
+ * (what the pass just extracted) first, then the most recently updated, with
+ * `concurrency` model calls at a time. A page keeps its path; a new one takes
+ * the title's path unless another document holds it. Returns the paths written.
+ */
+export async function ensureSourceSummaries(
+  ctx: PagesContext,
+  opts: { limit?: number; prefer?: string[]; concurrency?: number; actor?: string; onProgress?: (msg: string) => void } = {},
+): Promise<string[]> {
+  const progress = opts.onProgress ?? (() => {});
+  const limit = Math.max(0, Math.floor(opts.limit ?? 20));
+  if (limit === 0 || !documentSummaryLlm(ctx).enabled) return [];
+  const pages = await summaryPagesByDocument(ctx.store);
+  const docs = await ctx.store.query<DocumentRow>(
+    `SELECT * FROM documents WHERE root = 'docs' AND status = 'indexed' AND kind = 'source' ORDER BY updated_at DESC, path`,
+  );
+  const due = docs.filter((d) => {
+    const page = pages.get(d.path);
+    if (page && page.status !== 'dirty') return false;
+    const failed = readSourceSummaryFailure(ctx.dataDir, d.path);
+    return !(failed && failed.contentSha === d.sha256 && failed.attempts >= MAX_SUMMARY_ATTEMPTS);
+  });
+  const prefer = new Set(opts.prefer ?? []);
+  const picked = [...due.filter((d) => prefer.has(d.path)), ...due.filter((d) => !prefer.has(d.path))].slice(0, limit);
+  if (picked.length === 0) return [];
+
+  // paths are handed out before any call runs, so two new documents with one
+  // title never race for the same path
+  const owner = new Map([...pages].map(([doc, page]) => [page.path, doc]));
+  const work = picked.map((doc) => {
+    let pagePath = pages.get(doc.path)?.path;
+    if (!pagePath) {
+      const plain = `wiki/sources/${slugify(doc.title ?? path.basename(doc.path))}.md`;
+      pagePath = owner.has(plain) && owner.get(plain) !== doc.path ? hashedSummaryPath(doc) : plain;
+      owner.set(pagePath, doc.path);
+    }
+    return { doc, pagePath };
+  });
+
+  const written: string[] = [];
+  const summarize = async ({ doc, pagePath }: (typeof work)[number]) => {
     try {
       restoreArchived(ctx.dataDir, pagePath);
       progress(`summarizing ${doc.path}`);
-      const r = await regeneratePage(ctx, pagePath, 'source_summary', { actor: opts.actor, hint: { documentPath: doc.path } });
-      if (r === 'regenerated') created.push(pagePath);
+      let at = pagePath;
+      let r = await regeneratePage(ctx, at, 'source_summary', { actor: opts.actor, hint: { documentPath: doc.path } });
+      if (r === 'blocked' && at !== hashedSummaryPath(doc)) {
+        // a file a person wrote holds the title's path
+        at = hashedSummaryPath(doc);
+        r = await regeneratePage(ctx, at, 'source_summary', { actor: opts.actor, hint: { documentPath: doc.path } });
+      }
+      if (r === 'regenerated' || r === 'unchanged') {
+        clearSourceSummaryFailure(ctx.dataDir, doc.path);
+        if (r === 'regenerated') written.push(at);
+        return;
+      }
+      if (r === 'deferred' || r === 'blocked') throw new Error(r === 'blocked' ? `${at} belongs to a person` : 'no source text to summarize');
     } catch (err) {
-      progress(`summary failed for ${doc.path}: ${err instanceof Error ? err.message : err}`);
+      const message = err instanceof Error ? err.message : String(err);
+      const failed = recordSourceSummaryFailure(ctx.dataDir, doc.path, doc.sha256, message);
+      progress(`summary failed for ${doc.path} (${failed.attempts}/${MAX_SUMMARY_ATTEMPTS}): ${message}`);
     }
-  }
-  return created;
+  };
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(Math.max(1, Math.floor(opts.concurrency ?? 1)), work.length) }, async () => {
+      while (next < work.length) await summarize(work[next++]);
+    }),
+  );
+  return written;
+}
+
+/**
+ * Archive the concept-cluster pages the retired Synthesize stage wrote:
+ * concept pages are research's job now (docs/design/09). Prose a person added
+ * outside the managed region goes to wiki/.archive with the file. Idempotent;
+ * returns the paths it archived.
+ */
+export async function retireConceptClusterPages(ctx: PagesContext, opts: { actor?: string } = {}): Promise<string[]> {
+  const rows = await ctx.store.query<{ path: string }>(`SELECT path FROM pages WHERE kind = 'concept_cluster' AND status <> 'archived'`);
+  for (const r of rows) await archivePage(ctx, r.path, opts.actor ?? 'tier2');
+  return rows.map((r) => r.path);
 }
 
 export async function ensureSourcesIndex(ctx: PagesContext, opts: { actor?: string } = {}): Promise<RegenerateOutcome> {

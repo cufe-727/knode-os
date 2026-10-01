@@ -74,7 +74,7 @@ private struct MainWorkspaceView: View {
         case .graph: KnowledgeGraphView()
         case .wiki: WikiView()
         case .dream: DreamView()
-        case .providers, .pipeline, .research, .workspace: SettingsView()
+        case .providers, .pipeline, .research, .chat, .workspace: SettingsView()
         }
     }
 

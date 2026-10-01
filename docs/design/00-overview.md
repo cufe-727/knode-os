@@ -124,12 +124,16 @@ Tiered extraction (details in [01](01-doc-processing-graph-wiki.md)):
   batch per pass, extracting typed entities (10 types), typed relations
   (7 LLM types + deterministic `co_occurs`) and claims, grounded to chunks by
   name/alias matching. Results persist in the document sidecar for free replay.
-- **Tier 2 — nightly refinement**: label-propagation community detection over
-  the hot subgraph → LLM community concept pages, plus a zero-LLM claim audit
-  (contradictions, expired facts) feeding the suggestions queue.
+- **Tier 2 — nightly pass**: a zero-LLM claim audit (contradictions, expired
+  facts) feeding the suggestions queue, the full duplicate-entity audit, the
+  disputed-claim review and research recommendations. Hot communities became
+  `concept` research suggestions instead of LLM community pages, and every
+  extraction pass now reviews the entities it wrote for duplicates and writes
+  its documents' summary pages ([09](09-ingest-stage-rework.md)).
 
-`wiki generate` writes `wiki/sources/<slug>.md` summaries (LLM) and entity
-stub pages as materialized views with declared inputs: they regenerate when
+The background pass writes `wiki/sources/<slug>.md` summaries (LLM; `wiki
+generate` fills gaps by hand) and `wiki generate` writes entity stub pages, as
+materialized views with declared inputs: they regenerate when
 the entities/claims/documents they depend on change, and are archived when a
 required input is disposed. Human prose outside the managed regions survives
 regeneration and is itself a source.

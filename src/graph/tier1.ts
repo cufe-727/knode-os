@@ -31,6 +31,10 @@ export interface Tier1Stats {
   relations: number;
   tokensUsed: number;
   queued: number;
+  /** Entity ids this pass wrote evidence for — the duplicate audit's focus right after it (docs/design/09). */
+  touched: string[];
+  /** Documents this pass extracted (or replayed), by path — the first in line for a summary. */
+  documents: string[];
 }
 
 const MAX_ATTEMPTS = 3;
@@ -73,10 +77,10 @@ export async function applyTier1Scope(
   page: PageContext,
   extracted: { entities: ExtractedEntity[]; relations: ExtractedRelation[]; claims?: ExtractedClaim[] },
   opts: { model: string; actor?: string; at?: string; docDate?: string | null },
-): Promise<{ entities: number; relations: number; claims: number; outcome: 'applied' | 'unchanged' | 'orphan' }> {
+): Promise<{ entities: number; relations: number; claims: number; entityIds: string[]; outcome: 'applied' | 'unchanged' | 'orphan' }> {
   const parent = await findLiveScope(store, 'doc', doc.path);
-  if (!parent) return { entities: 0, relations: 0, claims: 0, outcome: 'orphan' };
-  let g = { entities: 0, relations: 0, claims: 0 };
+  if (!parent) return { entities: 0, relations: 0, claims: 0, entityIds: [], outcome: 'orphan' };
+  let g = { entities: 0, relations: 0, claims: 0, entityIds: [] as string[] };
   const res = await applyScope(
     store,
     { kind: 'tier1', key: doc.path },
@@ -116,7 +120,13 @@ async function runTier1PassUnlocked(
   opts: { onProgress?: (msg: string) => void; batchSize?: number; concurrency?: number } = {},
 ): Promise<Tier1Stats> {
   const progress = opts.onProgress ?? (() => {});
-  const stats: Tier1Stats = { processed: 0, failed: 0, entities: 0, relations: 0, tokensUsed: 0, queued: 0 };
+  const stats: Tier1Stats = { processed: 0, failed: 0, entities: 0, relations: 0, tokensUsed: 0, queued: 0, touched: [], documents: [] };
+  const touched = new Set<string>();
+  const done = (doc: { path: string }, entityIds: string[]) => {
+    stats.processed++;
+    stats.documents.push(doc.path);
+    for (const id of entityIds) touched.add(id);
+  };
   const entityLlm = config.extraction.entityLlm
     ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, routeTargets(config), config.extraction.tier1Model))
     : llm;
@@ -166,7 +176,7 @@ async function runTier1PassUnlocked(
         const g = await applyTier1Scope(store, doc, page, tier1, { model: tier1.model, docDate });
         stats.entities += g.entities;
         stats.relations += g.relations;
-        stats.processed++;
+        done(doc, g.entityIds);
         await dequeue();
         progress(`tier1 replay ${doc.path} (${g.entities} entities, ${g.claims} claims)`);
         return;
@@ -190,7 +200,7 @@ async function runTier1PassUnlocked(
       stats.tokensUsed += estimateTokens(content.slice(0, LLM_EXTRACT_INPUT_CHARS)) + OUTPUT_TOKEN_ESTIMATE;
       stats.entities += g.entities;
       stats.relations += g.relations;
-      stats.processed++;
+      done(doc, g.entityIds);
       await dequeue();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -227,5 +237,6 @@ async function runTier1PassUnlocked(
   );
 
   stats.queued = await countQueue();
+  stats.touched = [...touched];
   return stats;
 }

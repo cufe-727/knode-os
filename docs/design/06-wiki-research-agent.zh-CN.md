@@ -18,7 +18,7 @@
 | D1 执行方式 | knode‑os 内置 runner：`serve` 内的持久化任务队列拉起配置好的 agent —— 无头的 claude / codex / cursor CLI，或者跑在 OpenAI 兼容连接上的**内置 agent**（`serve` 进程内的 LangChain `deepagents` 循环），供没装任何 CLI 的机器使用；同时提供"导出任务包 → 手动跑 → reclaim"的模式。`research.agent` 必须显式指定，不再回退到默认 LLM 提供方（2026‑09‑18 改） |
 | D1a agent 怎么接 knode | **MCP 为主，由 `serve` 以 Streamable HTTP 提供**（`POST /mcp`）；`raw/docs`、`wiki`、`.sidecar` 只读挂给 agent；**所有写入只经 `knode_write`**。不采用"agent 调 knode‑os CLI"（每次重开库、非结构化输出、shell 权限面） |
 | D2 页面地位 | agent 写的 wiki 页是 **Source**：frontmatter `actor: agent/<cli>`（内置 agent 为 `agent/deep-agents`）→ quarantined；`aliases / relations / claims` 进图，与 trusted 冲突自动开 dispute；人工 promote 后升 trusted |
-| D3 实体消歧 | 写入时**确定性**解析（NFKC / 全半角 / 公司后缀归一 + name/alias 精确键匹配）；模糊候选交给夜间审计 → `merge` 建议 → 人工确认 → 可撤销链接 |
+| D3 实体消歧 | 写入时**确定性**解析（NFKC / 全半角 / 公司后缀归一 + name/alias 精确键匹配）；模糊候选交给审计 → `merge` 建议 → 人工确认 → 可撤销链接。2026‑09‑30 起审计在**每轮抽取之后**就对这一轮写到的实体跑一次，夜间再全量兜底（[09](09-ingest-stage-rework.zh-CN.md)） |
 | D4 关系本体 | 可配置本体（`playbooks/ontology/*.yaml`）+ 内置 `core` / `organization` 两个包 |
 
 为什么 MCP 走 HTTP 而不是再起一个 stdio 进程：默认索引后端 PGlite 是单进程嵌入库，`knode-os mcp` 会与正在运行的
@@ -34,7 +34,8 @@ wiki/<type>/<slug>.md ◀── research runner ◀── research_jobs ◀─�
    │ actor: agent/<cli>, relations:, claims:, sources:, research:
    └──sync──▶ Source(quarantined) ──▶ disputes ──▶ promote（UI / knode_trust）
 serve: /api/* + /mcp（Streamable HTTP，按工作区路由，bearer token）◀── claude -p / codex exec / cursor-agent -p（隔离 run workspace，只读 add-dir）
-夜间 Tier2：社区页 + claim 审计（supersession）+ 重复实体审计 + 推荐刷新 + wiki lint
+每轮抽取后：只看本轮实体的重复审计 + 文档摘要（09）
+夜间 Tier2：claim 审计（supersession）+ 全量重复实体审计 + 断言复核 + 推荐刷新 + wiki lint（社区页已退役，热点簇改为研究建议，见 09）
 ```
 
 ## 2. 本体与类型化 / 带时效的关系（`src/graph/ontology.ts`）
@@ -63,7 +64,7 @@ serve: /api/* + /mcp（Streamable HTTP，按工作区路由，bearer token）◀
 - 合并：`entity_links` + `entities.canonical_id`，由 `merge` scope 的显式效果写入（inverse `entity_link.remove`），
   `applyMerge / unmergeEntity` 记 ledger feedback（`entity.merge / entity.unmerge`），`rebuild` 按顺序重放。
   读路径（graph search、claims、context pack、vfs、实体页）统一重定向到幸存者；被合并实体的存根页变成重定向页。
-- 夜间审计（Tier‑2）：同 bare 键 / 共享别名键 / 短名是长名前缀（同类型）/ embedding 相似（真实 embedder 时，按 fold_sha 缓存于 `entity_embeddings`）
+- 重复实体审计（每轮抽取后只看本轮写到的实体，夜间 Tier‑2 全量，见 [09](09-ingest-stage-rework.zh-CN.md) §3）：同 bare 键 / 共享别名键 / 短名是长名前缀（同类型）/ embedding 相似（真实 embedder 时，按 fold_sha 缓存于 `entity_embeddings`）
   → `suggestions` kind `merge`（依赖两个实体，任一 tombstone 即 stale；拒绝过的对不再提出）。接受 → `applyMerge`。
 - 接口：`knode-os entities merge|unmerge|merges|dedupe|resolve`，`POST /api/entities/merge|unmerge|dedupe`，`GET /api/entities/merges`。
 
@@ -122,11 +123,11 @@ serve: /api/* + /mcp（Streamable HTTP，按工作区路由，bearer token）◀
 | 层 | 配置 | 行为 |
 | --- | --- | --- |
 | 写入时解析 | `review.resolution: exact`（默认）/ `suffix` | `exact` 只在拼写与已知名称或别名一致时自动合并；`suffix` 额外允许"只差公司后缀"的名称。`entity_alias_keys.kind` 区分 exact / bare 键（迁移 v8） |
-| LLM 复核 | `review.llmJudge: off / suggest（默认）/ auto`，`llmMinConfidence`、`autoMergeMinConfidence`、`maxJudgedPerRun` | 夜间审计把候选对连同描述与原文片段交给 LLM 判"是否同一实体"；`suggest` 把判定写进建议；判"不同"且置信 ≥ 阈值的对记为 rejected（actor `llm-judge`，不再提出）；`auto` 在置信 ≥ `autoMergeMinConfidence` 时直接 `applyMerge`（可撤销） |
+| LLM 复核 | `review.llmJudge: off / suggest（默认）/ auto`，`llmMinConfidence`、`autoMergeMinConfidence`、`maxJudgedPerRun` | 审计（每轮抽取后增量、夜间全量）把候选对连同描述与原文片段交给 LLM 判"是否同一实体"；`suggest` 把判定写进建议；判"不同"且置信 ≥ 阈值的对记为 rejected（actor `llm-judge`，不再提出）；`auto` 在置信 ≥ `autoMergeMinConfidence` 时直接 `applyMerge`（可撤销） |
 | 断言复核 | `review.claims: off / suggest（默认）` | 对开放 dispute 与 `suspected` 断言，LLM 读两条断言及其原文片段给出 verdict（a / b / both / neither / unclear）与建议动作（提升来源、降级、保留争议、需外部核实），写成 `knowledge` 建议 |
 | 外部核实 | `review.external: off / verify（默认）/ research` | 联网的总开关：`off` 永远不联网；`verify` 只让 `verify` 任务（模版 `verify.md`，输出 `wiki/reviews/`）联网，但 profile 或角色写 `web: on` 可把联网放宽到所有任务；`research` 全开，profile / 角色仍可关。claude 放开 WebSearch/WebFetch，codex 设 `web_search = live | cached`（新鲜度来自 profile），cursor 只能靠提示；页面 frontmatter 的 `sameAs` 变成待审 merge 建议，`notSameAs` 记为已拒绝 |
 
-`knode-os review entities|claims`、`POST /api/review/claims`、`POST /api/entities/dedupe` 可手动触发；夜间 Tier‑2 依次跑 claim 审计、重复实体审计（含 LLM 复核）、断言复核、推荐刷新、lint。
+`knode-os review entities|claims`、`POST /api/review/claims`、`POST /api/entities/dedupe` 可手动触发；每轮抽取后先对新写到的实体跑一次增量重复审计，夜间 Tier‑2 再依次跑 claim 审计、全量重复实体审计（含 LLM 复核）、断言复核、推荐刷新、lint。复核模型是「判断」阶段的路由（`extraction.judgeLlm`，09）。
 
 ## 5d. 研究 profile（`src/research/profile.ts`，`playbooks/research/profiles/<name>.yaml`，`research.profile`）
 

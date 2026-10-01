@@ -536,20 +536,25 @@ const NAV = [
     { id: 'wiki', title: 'Wiki', hint: 'Pages researched by agent CLIs' },
     { id: 'dream', title: 'Dream', hint: 'Review agent improvement ideas' },
   ] },
+  // Settings in the order knowledge moves: processed as it comes in (Ingest),
+  // researched into the wiki (Research), used to answer (Ask). Ids keep their
+  // first names, so `pipeline` is titled Ingest; Ask's settings are `chat`, the
+  // config block they edit, because `ask` is the Ask view itself.
   { id: 'settings', title: 'Settings', tabs: [
     { id: 'providers', title: 'Providers & Agents', hint: 'Endpoints, credentials, and who does the work' },
-    { id: 'pipeline', title: 'Pipeline', hint: 'What each stage needs' },
+    { id: 'pipeline', title: 'Ingest', hint: 'How documents get processed' },
     { id: 'research', title: 'Research', hint: 'How the wiki gets written' },
+    { id: 'chat', title: 'Ask', hint: 'How questions get answered' },
     { id: 'workspace', title: 'Workspace', hint: 'Clear this workspace' },
   ] },
 ];
 
 /**
- * Which `<section class="tab">` shows a tab. Settings' four tabs share one
+ * Which `<section class="tab">` shows a tab. Settings' five tabs share one
  * host: keying identity and loaders on the leaf instead would re-run
  * `loadConfigForm()` on every sub-tab click and throw away unsaved routes.
  */
-const TAB_HOST = { providers: 'settings', pipeline: 'settings', research: 'settings', workspace: 'settings' };
+const TAB_HOST = { providers: 'settings', pipeline: 'settings', research: 'settings', chat: 'settings', workspace: 'settings' };
 const hostOf = (tab) => TAB_HOST[tab] ?? tab;
 
 /**
@@ -2406,7 +2411,7 @@ function fillEmbeddingOptions() {
 }
 
 /** The stages that name a model or an agent, by their fields' prefix (`#cfg-<prefix>-use`, `<prefix>Llm`). */
-const ROUTE_PREFIXES = ['entity', 'concept', 'document', 'summary'];
+const ROUTE_PREFIXES = ['entity', 'document', 'summary', 'judge'];
 
 /**
  * Rebuild the per-route pickers: the models under LLM, then every agent a
@@ -2429,16 +2434,19 @@ function fillRouteOptions() {
 }
 
 /**
- * The five stages a document passes through. The flow draws one node each, and
- * the inspector below shows the panel of whichever is selected — the long
- * explanations used to be stacked five deep and cost two screens.
+ * The five stages, in the order a document meets them: Convert and Index on
+ * sync, Extract and Summarize in the background pass, and Judge, which decides
+ * things — duplicates after each pass, disputes and Dream at night, knode_ask
+ * on demand (docs/design/09). The flow draws one node each, and the inspector
+ * below shows the panel of whichever is selected — the long explanations used
+ * to be stacked five deep and cost two screens.
  */
 const PIPELINE_STAGES = [
   { key: 'document', step: 1, title: 'Convert', badge: 'vision', accent: 'accent2' },
   { key: 'index', step: 2, title: 'Index', badge: 'embedding', accent: 'accent' },
   { key: 'entity', step: 3, title: 'Extract', badge: 'volume', accent: 'accent2' },
-  { key: 'concept', step: 4, title: 'Synthesize', badge: 'quality', accent: 'accent2' },
-  { key: 'summary', step: 5, title: 'Summarize', badge: 'judgment', accent: 'accent2' },
+  { key: 'summary', step: 4, title: 'Summarize', badge: 'prose', accent: 'accent2' },
+  { key: 'judge', step: 5, title: 'Judge', badge: 'quality', accent: 'accent2' },
 ];
 let selectedStage = 'document';
 
@@ -2452,7 +2460,8 @@ function stageRate(key) {
   const int = (sel, fallback) => Number($(sel)?.value) || fallback;
   if (key === 'document') return `×${int('#cfg-ingest-convert', 2)}`;
   if (key === 'index') return `×${int('#cfg-ingest-concurrency', 4)} · ${int('#cfg-emb-batch', 32)}/req`;
-  if (key === 'entity') return `×${int('#cfg-extraction-concurrency', 1)} · ${int('#cfg-extraction-batch', 8)}/pass`;
+  // Summarize runs in Extract's pass, at its rates
+  if (key === 'entity' || key === 'summary') return `×${int('#cfg-extraction-concurrency', 1)} · ${int('#cfg-extraction-batch', 8)}/pass`;
   return '';
 }
 
@@ -2675,6 +2684,8 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-extraction-batch').value = cfg.extraction?.batchSize ?? 8;
     $('#cfg-extraction-concurrency').value = cfg.extraction?.concurrency ?? 1;
     $('#cfg-extraction-claims').checked = cfg.extraction?.claims !== false;
+    $('#cfg-review-judge').value = cfg.review?.llmJudge ?? 'suggest';
+    $('#cfg-review-claims').value = cfg.review?.claims ?? 'suggest';
     $('#cfg-ingest-concurrency').value = cfg.ingest?.concurrency ?? 4;
     $('#cfg-ingest-convert').value = cfg.ingest?.convertConcurrency ?? 2;
     $('#cfg-emb-batch').value = activeEmbedding()?.batchSize ?? 32;
@@ -2736,12 +2747,17 @@ function gatherConfig() {
     llmUse,
     extraction: {
       entityLlm: gatherRoute('entity'),
-      conceptLlm: gatherRoute('concept'),
       documentLlm: gatherRoute('document'),
       summaryLlm: gatherRoute('summary'),
+      judgeLlm: gatherRoute('judge'),
       batchSize: Number($('#cfg-extraction-batch').value),
       concurrency: Number($('#cfg-extraction-concurrency').value),
       claims: $('#cfg-extraction-claims').checked,
+    },
+    // what the Judge stage does with its verdicts
+    review: {
+      llmJudge: $('#cfg-review-judge').value,
+      claims: $('#cfg-review-claims').value,
     },
     research: gatherResearchConfig(),
     chat: gatherChatConfig(),
@@ -3020,7 +3036,7 @@ $('#cfg-agents').addEventListener('click', (event) => {
   if (event.target.classList.contains('agent-remove')) removeAgent(name);
 });
 
-/* ---------- Settings · 04 research: pipeline, initialization, chat, profile ---------- */
+/* ---------- Settings · research: pipeline, initialization, profile; and Ask's chat block ---------- */
 const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli'];
 const PROTOCOL_OPTIONS = [
   ['auto', 'Auto (Responses, else Chat)'], ['responses', 'Responses only'], ['chat', 'Chat Completions only'],
@@ -3115,7 +3131,6 @@ function fillResearchForm(research) {
   $('#cfg-research-rounds').value = research.reviewRounds ?? 1;
   $('#cfg-research-auto').checked = !!research.auto?.enabled;
   $('#cfg-research-daily').value = research.auto?.dailyJobs ?? 3;
-  $('#cfg-init-extraction').value = research.init?.extraction || 'drain';
   $('#cfg-init-maxms').value = Math.max(1, Math.round((research.init?.extractionMaxMs ?? 900000) / 60000));
   $('#cfg-init-followups').value = research.init?.followUps ?? 6;
   if (!$('#cfg-profile-effort').options.length) $('#cfg-profile-effort').innerHTML = optionList(EFFORT_OPTIONS, 'default');
@@ -3239,14 +3254,15 @@ function gatherResearchConfig() {
     auto: { enabled: $('#cfg-research-auto').checked, dailyJobs: Number($('#cfg-research-daily').value) || 3 },
     init: {
       followUps: Math.max(0, Number($('#cfg-init-followups').value) || 0),
-      extraction: $('#cfg-init-extraction').value,
+      // edited with the Extract stage under Ingest: it is how long the catch-up extraction may run
       extractionMaxMs: (Number($('#cfg-init-maxms').value) || 15) * 60000,
     },
   };
 }
 
-// effort, tools, turn cap, timeout and the extra prompt belong to the agent
-// definition now; what is left here is a property of the conversation.
+// The Ask tab. Model, effort and web access belong to the agent definition, and
+// the turn cap, timeout and tools are the same for every agent; what is left
+// here is a property of the conversation.
 function fillChatForm(chat) {
   $('#cfg-chat-agent').innerHTML = agentOptions(chat.agent || '', 'The research agent, else the default provider', 'general');
   $('#cfg-chat-agent').value = chat.agent || '';
@@ -3435,8 +3451,8 @@ function renderCfgResult(r) {
     ['1 · Convert', r.documentLlm],
     ['2 · Index', r.embedding],
     ['3 · Extract', r.entityLlm],
-    ['4 · Synthesize', r.conceptLlm],
-    ['5 · Summarize', r.summaryLlm],
+    ['4 · Summarize', r.summaryLlm],
+    ['5 · Judge', r.judgeLlm],
   ];
   $('#cfg-status').innerHTML = items.map(([label, result]) => {
     if (!result) return '';

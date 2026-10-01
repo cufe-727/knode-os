@@ -4,26 +4,28 @@ import { appendLog } from '../fs/datadir.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { refreshRecommendations } from '../research/recommend.js';
 import { reviewClaims } from '../graph/claim-review.js';
-import { slugify } from '../graph/store.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { writeDeps } from '../lineage/deps.js';
 import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
-import { ensureHotTopics, hotEntities, HotEntity, PagesContext, regeneratePage } from './pages.js';
+import { ensureHotTopics, PagesContext, retireConceptClusterPages } from './pages.js';
 
 /**
- * Tier-2 — nightly hot-subgraph refinement. The expensive, GraphRAG-style
- * community summarization, but only over the subgraph induced by the hottest
- * entities (never whole-graph Leiden): community summaries become wiki concept
- * pages (views with the anchor entity as a required input), and wiki/index.md
- * gets a maintained "hot topics" region. Cold regions of the graph stay at
- * tier-0/1 quality, which is the point.
+ * Tier-2 — the nightly pass over the whole graph: the zero-LLM claim audit,
+ * the full duplicate-entity audit (the backstop to the incremental one after
+ * every tier-1 pass), the disputed-claim review, the "hot topics" region of
+ * wiki/index.md and the research recommendations.
+ *
+ * It used to summarize hot communities into wiki/concepts/*-cluster.md pages
+ * itself. Hot communities only become `concept` research suggestions now
+ * (`refreshRecommendations`), and research writes the page with sources and
+ * review (docs/design/09); the old cluster pages are archived here.
  */
 
 export interface Tier2Stats {
-  communities: number;
-  pagesWritten: number;
+  /** Concept-cluster pages from before docs/design/09, archived this run. */
+  retiredPages: number;
   claimIssues: number;
   /** Duplicate-entity pairs queued as merge suggestions. */
   mergeCandidates: number;
@@ -74,15 +76,15 @@ export function detectCommunities(
   return groups;
 }
 
-/** Tier-2 refinement entry point (community pages + claim audit + hot topics). */
+/** Tier-2 entry point: claim audit, full duplicate audit, claim review, hot topics, recommendations. `llm` is the Judge stage. */
 export async function refineWiki(
   store: Store,
   config: KnodeConfig,
   llm: LlmClient,
-  opts: { onProgress?: (msg: string) => void; topEntities?: number; maxCommunities?: number; embedder?: EmbeddingProvider } = {},
+  opts: { onProgress?: (msg: string) => void; embedder?: EmbeddingProvider } = {},
 ): Promise<Tier2Stats> {
   const progress = opts.onProgress ?? (() => {});
-  const stats: Tier2Stats = { communities: 0, pagesWritten: 0, claimIssues: 0, mergeCandidates: 0, recommendations: 0, claimReviews: 0 };
+  const stats: Tier2Stats = { retiredPages: 0, claimIssues: 0, mergeCandidates: 0, recommendations: 0, claimReviews: 0 };
   const ctx: PagesContext = {
     store,
     dataDir: store.dataDir,
@@ -103,40 +105,12 @@ export async function refineWiki(
     progress(`claim review failed: ${err instanceof Error ? err.message : err}`);
   }
 
-  const ents = await hotEntities(store, opts.topEntities ?? 60);
-  if (ents.length < 3) {
-    await ensureHotTopics(ctx, { actor: 'tier2', force: true });
-    return stats;
-  }
-  const byId = new Map(ents.map((e) => [e.id, e]));
-  const ids = ents.map((e) => e.id);
-  const ph = ids.map((_, i) => `$${i + 1}`).join(',');
-  const rels = await store.query<{ source_id: string; target_id: string; weight: number }>(
-    `SELECT source_id, target_id, weight FROM relations
-     WHERE source_id IN (${ph}) AND target_id IN (${ph}) AND tx_to IS NULL`,
-    ids,
-  );
-
-  const groups = [...detectCommunities(ids, rels.map((r) => ({ source: r.source_id, target: r.target_id, weight: r.weight }))).values()]
-    .filter((g) => g.length >= 3)
-    .sort((a, b) => heatOf(b, byId) - heatOf(a, byId))
-    .slice(0, opts.maxCommunities ?? 5);
-  stats.communities = groups.length;
-
-  for (const group of groups) {
-    const members = group.map((id) => byId.get(id)!).sort((a, b) => b.mention_count - a.mention_count);
-    const anchor = members[0];
-    const pagePath = `wiki/concepts/${slugify(anchor.name)}-cluster.md`;
-    try {
-      progress(`tier2 community summary: ${anchor.name} (${members.length} entities)`);
-      const r = await regeneratePage(ctx, pagePath, 'concept_cluster', {
-        actor: 'tier2',
-        hint: { anchor: anchor.id, members: members.map((m) => m.id) },
-      });
-      if (r === 'regenerated') stats.pagesWritten++;
-    } catch (err) {
-      progress(`tier2 summary failed for ${anchor.name}: ${err instanceof Error ? err.message : err}`);
-    }
+  try {
+    const retired = await retireConceptClusterPages(ctx, { actor: 'tier2' });
+    stats.retiredPages = retired.length;
+    if (retired.length > 0) progress(`tier2: archived ${retired.length} concept-cluster page(s) — concept pages come from research now`);
+  } catch (err) {
+    progress(`retiring cluster pages failed: ${err instanceof Error ? err.message : err}`);
   }
 
   await ensureHotTopics(ctx, { actor: 'tier2', force: true });
@@ -145,8 +119,8 @@ export async function refineWiki(
   } catch (err) {
     progress(`recommendations failed: ${err instanceof Error ? err.message : err}`);
   }
-  if (stats.pagesWritten > 0) {
-    appendLog(store.dataDir, 'tier2', `${stats.pagesWritten} community pages from ${stats.communities} hot communities`);
+  if (stats.retiredPages > 0) {
+    appendLog(store.dataDir, 'tier2', `${stats.retiredPages} concept-cluster pages archived; hot communities are research suggestions now`);
   }
   return stats;
 }
@@ -286,8 +260,4 @@ async function auditClaims(store: Store, progress: (msg: string) => void): Promi
   }
   if (issues.length > 0) progress(`claim audit: ${issues.length} issues queued as suggestions`);
   return issues.length;
-}
-
-function heatOf(group: string[], byId: Map<string, HotEntity>): number {
-  return group.reduce((s, id) => s + (byId.get(id)?.heat ?? 0) + (byId.get(id)?.mention_count ?? 0) * 0.1, 0);
 }

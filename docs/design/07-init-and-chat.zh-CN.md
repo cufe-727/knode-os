@@ -31,7 +31,7 @@ codebase `/init` 的类比。`knode_write` 为此增加了根文件白名单 `AG
 POST /api/research/init ─▶ research_jobs(kind=init) ─kick─▶ service 认领
  runResearchJob
    ├─ prepareInit（src/research/init.ts）                    payload.steps 逐步落库，UI 可见
-   │    sync → drainTier1（可配置、有时间上限）→ ensureEntityStubs / HotTopics / SourcesIndex
+   │    sync → drainTier1（总是执行、有时间上限）→ ensureEntityStubs / HotTopics / SourcesIndex
    │    → surveyKnowledgeBase（空库直接失败："先添加文档"）
    ├─ prepareRunWorkspace：brief = 「知识库概况」+ 上一版指南全文 + 两个输出契约
    ├─ team 流水线，提示来自模板声明的 phases（init-plan / init-research / init-synthesize）
@@ -165,7 +165,9 @@ stream-json `tool_use` + `tool_result`；codex 没有事件流则为空），外
 > `ctx.llm` 不再读镜像。文档摘要、Dream、夜间的实体合并与 claim 复核、`knode_ask` 当初跑在默认上，是因为它们
 > 都没挑过模型；Settings 把它们显示成第五个阶段「回答」，却不能设置。它们现在是**摘要**阶段，有自己的路由
 > （`extraction.summaryLlm`，和其他阶段一样可以是模型或 agent）；`ctx.llm` 就是这条路由的客户端
-> （`summaryLlmClient`），此前的配置会被钉到它当时所跑的默认上。
+> （`summaryLlmClient`），此前的配置会被钉到它当时所跑的默认上。同日稍晚又拆了一次（[09](09-ingest-stage-rework.zh-CN.md)）：
+> 摘要阶段只管文档摘要，knode_ask、Dream 与两种复核归新的**判断**阶段（`extraction.judgeLlm`），`ctx.llm` 现在是它的客户端
+> （`judgeLlmClient`）；旧配置的判断路由取自原来的摘要路由。
 
 最后一条 LLM 连接不能删，和最后一个 embedding provider 一样：总得有人作答。删掉默认会把它降级到剩下的第一行，
 并在状态栏里说出来。
@@ -175,7 +177,7 @@ stream-json `tool_use` + `tool_result`；codex 没有事件流则为空），外
 ```jsonc
 "llmUse": "openai-1",          // connections[] 里哪一条是默认
 "research": {
-  "init": { "followUps": 6, "extraction": "drain", "extractionMaxMs": 900000 }
+  "init": { "followUps": 6, "extractionMaxMs": 900000 }
 },
 "chat": {
   "agent": "default", "model": "", "historyTurns": 12, "keep": 200
@@ -184,7 +186,7 @@ stream-json `tool_use` + `tool_result`；codex 没有事件流则为空），外
 
 迁移 **v9**：`chat_conversations` / `chat_messages` 两张表；**v10** 增加了 `chat_messages.payload`，虽然已无人
 写入但保留（见 §4.1）。内存里的配置迁移，按 `loadConfig` 的顺序：`migrateChatConfig` 删掉已归 agent 定义所有的
-`chat.*` 键，`migrateRouteConnections` 把前命名连接时代的路由端点提取成具名行，`migrateDefaultLlm` 把默认 LLM
+`chat.*` 键，`dropInitExtractionChoice` 删掉已退役的 `research.init.extraction`（`drain` | `skip`——初始化现在总是先补抽），`migrateRouteConnections` 把前命名连接时代的路由端点提取成具名行，`migrateDefaultLlm` 把默认 LLM
 也提取成一行（见 §4.2），`migrateEmbeddingProviders` 对 embedding 做同样的事。种子文件新增
 `playbooks/research/init.md`、`playbooks/research/phases/init-*.md`、`playbooks/chat/AGENTS.md`、
 `playbooks/chat/turn.md`（都不覆盖已有文件）。

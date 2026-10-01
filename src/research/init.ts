@@ -3,7 +3,7 @@ import path from 'node:path';
 import { resolveRoutedLlmConfig, routeTargets } from '../config.js';
 import { AppContext } from '../context.js';
 import { GUIDE_COPY, GUIDE_FILE } from '../fs/datadir.js';
-import { runTier1Pass } from '../graph/tier1.js';
+import { runDocumentPass } from '../ingest/background.js';
 import { sync } from '../ingest/sync.js';
 import { LlmClient } from '../llm/client.js';
 import { ensureEntityStubs, ensureHotTopics, ensureSourcesIndex, reconcileViews } from '../wiki/pages.js';
@@ -66,7 +66,7 @@ export async function drainTier1(ctx: AppContext, opts: { maxMs: number; log: (m
   const count = async () => (await store.query<{ n: number }>(`SELECT count(*)::int AS n FROM extraction_queue`))[0]?.n ?? 0;
   if (!entityLlm.enabled) {
     const n = await count();
-    return { detail: n ? `${n} document(s) await LLM extraction, but no extraction LLM is configured (Settings → Pipeline)` : 'no extraction LLM configured; nothing queued', skipped: true };
+    return { detail: n ? `${n} document(s) await LLM extraction, but no extraction LLM is configured (Settings → Ingest)` : 'no extraction LLM configured; nothing queued', skipped: true };
   }
   const t0 = Date.now();
   let processed = 0;
@@ -74,7 +74,8 @@ export async function drainTier1(ctx: AppContext, opts: { maxMs: number; log: (m
   let passes = 0;
   let reason = 'queue drained';
   for (;;) {
-    const st = await runTier1Pass(store, config, ctx.llm, { onProgress: opts.log });
+    // the whole background pass: what it extracts is also audited for duplicates and summarized
+    const st = await runDocumentPass(ctx, { onProgress: opts.log });
     passes++;
     processed += st.processed;
     failed += st.failed;
@@ -94,7 +95,7 @@ export async function drainTier1(ctx: AppContext, opts: { maxMs: number; log: (m
 
 export async function prepareInit(ctx: AppContext, jobIn: ResearchJob, opts: { log: (m: string) => void }): Promise<{ job: ResearchJob; survey: KbSurvey }> {
   const { log } = opts;
-  const init = ctx.config.research.init ?? { followUps: 6, extraction: 'drain' as const, extractionMaxMs: 900_000 };
+  const init = ctx.config.research.init ?? { followUps: 6, extractionMaxMs: 900_000 };
   const steps: InitStep[] = [];
   let job = jobIn;
   const record = async () => {
@@ -125,8 +126,9 @@ export async function prepareInit(ctx: AppContext, jobIn: ResearchJob, opts: { l
     const st = await sync(ctx, { actor: 'init', onProgress: log });
     return { detail: `${st.indexed} applied, ${st.unchanged} unchanged, ${st.disposed} disposed, ${st.chunks} chunks` };
   });
+  // whatever the sync left unextracted is caught up here; an empty queue
+  // makes this a no-op, so there is nothing to switch off
   await step('extract', async () => {
-    if (init.extraction === 'skip') return { detail: 'left to the background loop (research.init.extraction = skip)', skipped: true };
     const r = await drainTier1(ctx, { maxMs: init.extractionMaxMs, log });
     if (!r.skipped) {
       const views = await reconcileViews(ctx, { actor: 'init', llm: false, onProgress: log });

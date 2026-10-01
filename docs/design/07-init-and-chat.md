@@ -35,7 +35,7 @@ steps and a second output file.
 POST /api/research/init ─▶ research_jobs(kind=init) ─kick─▶ claimed by the loop
  runResearchJob
    ├─ prepareInit (src/research/init.ts)                      payload.steps persisted step by step
-   │    sync → drainTier1 (configurable, time-capped) → ensureEntityStubs / HotTopics / SourcesIndex
+   │    sync → drainTier1 (always, time-capped) → ensureEntityStubs / HotTopics / SourcesIndex
    │    → surveyKnowledgeBase (an empty base fails fast: "add documents first")
    ├─ prepareRunWorkspace: brief = the survey + the previous guide verbatim + both output contracts
    ├─ team pipeline, with the prompts the template declares (init-plan / init-research / init-synthesize)
@@ -194,7 +194,10 @@ named connections exist for. There is a test for exactly that.
 > of them picked a model, and Settings showed them as a fifth stage, "Answer", that could not be set. They are
 > the **Summarize** stage now, with a route of its own (`extraction.summaryLlm`, a model or an agent like any
 > stage); `ctx.llm` is that route's client (`summaryLlmClient`), and a config from before is pinned to the
-> default it ran on.
+> default it ran on. Later that day it split once more ([09](09-ingest-stage-rework.md)): Summarize only writes
+> document summaries, and knode_ask, Dream and the two reviews moved to a new **Judge** stage
+> (`extraction.judgeLlm`); `ctx.llm` is its client now (`judgeLlmClient`), and an existing config's Judge route
+> starts as its Summarize route.
 
 The last LLM connection cannot be removed, the way the last embedding provider cannot: something has to answer.
 Removing the default demotes it to the first row left and says so in the status line.
@@ -204,7 +207,7 @@ Removing the default demotes it to the first row left and says so in the status 
 ```jsonc
 "llmUse": "openai-1",          // which connections[] entry is the default
 "research": {
-  "init": { "followUps": 6, "extraction": "drain", "extractionMaxMs": 900000 }
+  "init": { "followUps": 6, "extractionMaxMs": 900000 }
 },
 "chat": {
   "agent": "default", "model": "", "historyTurns": 12, "keep": 200
@@ -213,7 +216,8 @@ Removing the default demotes it to the first row left and says so in the status 
 
 Migration **v9** adds `chat_conversations` / `chat_messages`; **v10** added `chat_messages.payload` and is kept
 though nothing writes it (§4.1). In-memory config migrations, in `loadConfig` order: `migrateChatConfig` drops
-the `chat.*` keys the agent definition now owns, `migrateRouteConnections` lifts pre-connections route endpoints
+the `chat.*` keys the agent definition now owns, `dropInitExtractionChoice` drops the retired
+`research.init.extraction` (`drain` | `skip` — an initialization now always catches up first), `migrateRouteConnections` lifts pre-connections route endpoints
 into named rows, `migrateDefaultLlm` lifts the default LLM into one (§4.2), `migrateEmbeddingProviders` does the
 same for embeddings. New seeded files: `playbooks/research/init.md`, `playbooks/research/phases/init-*.md`,
 `playbooks/chat/AGENTS.md`, `playbooks/chat/turn.md` — none overwrite an edit.

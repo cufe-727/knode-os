@@ -9,7 +9,9 @@ import { ensureEntityStubs, ensureSourceSummaries, ensureSourcesIndex, PagesCont
 /**
  * Wiki generation (llm_wiki's two-step ingest, generation half) on top of
  * the page-view runtime:
- * - one summary page per hot/fresh document under wiki/sources/
+ * - summary pages under wiki/sources/ for documents still missing one, up to
+ *   `limit` — the background document pass writes them as documents arrive
+ *   (docs/design/09); this fills gaps by hand
  * - one stub page per live extracted entity under wiki/entities/
  * - a managed "sources" region in wiki/sources/index.md listing every document
  * Every page declares its inputs; later syncs regenerate or archive it as the
@@ -37,9 +39,8 @@ export async function generateWiki(
     datasources: opts.datasources,
   };
   const created: string[] = [];
-  if (llm.enabled) {
-    created.push(...await ensureSourceSummaries(ctx, { limit: opts.limit ?? 20, actor: 'wiki', onProgress: progress }));
-  }
+  // on the Summarize stage's own route, which says whether it can run
+  created.push(...await ensureSourceSummaries(ctx, { limit: opts.limit ?? 20, actor: 'wiki', onProgress: progress }));
   created.push(...await ensureEntityStubs(ctx, { actor: 'wiki' }));
   await ensureSourcesIndex(ctx, { actor: 'wiki' });
   const rec = await reconcileViews(ctx, { actor: 'wiki', llm: true, onProgress: progress });
