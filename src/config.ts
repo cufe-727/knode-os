@@ -223,10 +223,21 @@ export interface ExtractionConfig {
   freshnessBoostDays: number;
   /** Static per-root priority weights for the extraction queue. */
   importance: Record<string, number>;
-  /** How many queued documents one background pass extracts — and how many summaries it writes. */
+  /**
+   * Model calls one background pass makes: extraction calls (one per segment,
+   * so a long document spans several passes) and, separately, summaries (one
+   * per document). See docs/design/10.
+   */
   batchSize: number;
   /** Parallel LLM calls within one background pass, for extraction and summaries alike. */
   concurrency: number;
+  /**
+   * Longest text one extraction call reads, in characters. A longer document
+   * is cut into segments of at most this size (src/graph/segment.ts), each
+   * extracted on its own and cached by its text hash; a shorter one is a
+   * single call, as before.
+   */
+  segmentChars: number;
   /** Minutes between background document passes while `serve` runs. */
   intervalMinutes: number;
 }
@@ -407,9 +418,13 @@ export interface ResearchConfig {
   agent: string;
   /** Model for the agent. Empty = the CLI's own default / the connection's model. */
   model: string;
-  /** Turn cap per job (claude --max-turns; advisory for CLIs without one). */
+  /**
+   * Turn cap for a session whose template sets none — every built-in template
+   * sets its own, and a role may set its own (claude --max-turns, the built-in
+   * loop's recursion limit; codex and cursor take no cap). Not in Settings.
+   */
   maxTurns: number;
-  /** Kill a job after this long. */
+  /** Kill one agent session after this long; a team job runs several. */
   timeoutMs: number;
   /** Concurrent CLI runs per workspace. */
   concurrency: number;
@@ -428,7 +443,8 @@ export interface ResearchConfig {
    * revision session fixes what it found (deep-research pipeline). 'native':
    * one orchestrator session with the profile's native roles registered as
    * the CLI's own sub-agents (claude --agents, codex agents.enabled). The
-   * active profile may override this.
+   * profile's own `pipeline` wins — Settings edits it there — so this is
+   * only what a profile that names none runs.
    */
   pipeline: 'single' | 'team' | 'native';
   /**
@@ -438,9 +454,9 @@ export interface ResearchConfig {
    * quick, thorough, native.
    */
   profile: string;
-  /** Parallel researcher sessions in 'team' mode. */
+  /** Parallel researcher sessions in 'team' mode, when the research role sets no `parallel`. */
   researchers: number;
-  /** Critique → revise rounds in 'team' mode before the page is accepted or rejected. */
+  /** Review → revise rounds in 'team' mode before the page is accepted or rejected, when the revise role sets none. */
   reviewRounds: number;
   /** Knowledge-base initialization (kind = init): how long its pre-flight catches up on extraction, and how many topic pages it queues. */
   init: ResearchInitConfig;
@@ -513,7 +529,22 @@ export interface ReviewConfig {
   maxJudgedPerRun: number;
   /** LLM review of disputed / suspected claims, filed as knowledge suggestions with a verdict. */
   claims: 'off' | 'suggest';
-  /** External (web) verification by research agents: off / only `verify` jobs get web tools / every research job may use them. */
+  /**
+   * Duplicate claims (docs/design/10): 'auto' merges pairs that are identical
+   * once normalized, and pairs the Judge calls the same at or above
+   * claimMergeMinConfidence that pass the number / period checks; the rest of
+   * the same-verdicts become suggestions. 'suggest' files every judged merge
+   * as a suggestion (identical ones still merge). 'off' leaves claims alone.
+   */
+  claimMerge: ReviewLlmMode;
+  /** 'auto' merges a judged pair without a person at or above this confidence. */
+  claimMergeMinConfidence: number;
+  /**
+   * The workspace's web switch, for research jobs and Ask alike: off / only
+   * `verify` jobs (and agents set to `on`) get web tools / every job may use
+   * them. A profile, role or agent can narrow it or widen `verify`, never
+   * past `off`. Edited on the Research tab.
+   */
   external: ReviewExternal;
 }
 
@@ -662,6 +693,7 @@ export function defaultConfig(): KnodeConfig {
       batchSize: 8,
       concurrency: 1,
       intervalMinutes: 5,
+      segmentChars: 12_000,
     },
     retrieval: {
       sag: {
@@ -713,6 +745,8 @@ export function defaultConfig(): KnodeConfig {
       autoMergeMinConfidence: 0.95,
       maxJudgedPerRun: 30,
       claims: 'suggest',
+      claimMerge: 'auto',
+      claimMergeMinConfidence: 0.9,
       external: 'verify',
     },
     chat: { agent: 'default', model: '', historyTurns: 12, keep: 200 },

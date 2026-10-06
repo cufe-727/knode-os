@@ -429,6 +429,35 @@ export class ScopeWriter {
     return linkId;
   }
 
+  /**
+   * Record "claim is the same as canonical" (graph/claim-merge.ts). Like
+   * linkEntity: an explicit effect whose inverse restores the claim — and any
+   * members it carried, which move onto the new representative so groups stay
+   * one level deep. Both claims are touched: the representative's fold takes
+   * in its members' evidence.
+   */
+  async linkClaim(l: { claimId: string; canonicalId: string; kind?: 'same_as' | 'contains'; reason?: string; actor?: string; confidence?: number | null }): Promise<string> {
+    const linkId = crypto.createHash('sha256').update(`claim-link|${l.claimId}|${l.canonicalId}`).digest('hex').slice(0, 16);
+    const [cur] = await this.q.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM claims WHERE id = $1`, [l.claimId]);
+    const members = await this.q.query<{ id: string }>(`SELECT id FROM claims WHERE canonical_id = $1`, [l.claimId]);
+    const regrouped = members.map((m) => m.id);
+    await this.effect('claim_link', l.claimId, { op: 'claim_link.remove', linkId, claimId: l.claimId, prevCanonical: cur?.canonical_id ?? null, regrouped }, async () => {
+      await this.q.query(
+        `INSERT INTO claim_links (id, claim_id, canonical_id, kind, scope_id, actor, reason, confidence, created_at, tx_to)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz, NULL)
+         ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind, scope_id = EXCLUDED.scope_id, actor = EXCLUDED.actor, reason = EXCLUDED.reason,
+           confidence = EXCLUDED.confidence, created_at = EXCLUDED.created_at, tx_to = NULL`,
+        [linkId, l.claimId, l.canonicalId, l.kind ?? 'same_as', this.scope.id, l.actor ?? this.scope.actor, l.reason ?? '', l.confidence ?? null, this.txTime],
+      );
+      await this.q.query(`UPDATE claims SET canonical_id = $2 WHERE id = $1`, [l.claimId, l.canonicalId]);
+      if (regrouped.length > 0) await this.q.query(`UPDATE claims SET canonical_id = $2 WHERE canonical_id = $1`, [l.claimId, l.canonicalId]);
+    });
+    this.touched.claims.add(l.claimId);
+    this.touched.claims.add(l.canonicalId);
+    for (const id of regrouped) this.touched.claims.add(id);
+    return linkId;
+  }
+
   async upsertDataset(row: DatasetUpsert): Promise<void> {
     const [prev] = await this.q.query<Record<string, unknown>>(`SELECT * FROM datasets WHERE id = $1`, [row.id]);
     await this.effect('row_upsert', `datasets:${row.id}`, { op: 'row.restore', table: 'datasets', id: row.id, prev: prev ? jsonSafe(prev) : null }, async () => {
@@ -498,13 +527,14 @@ export class ScopeWriter {
     this.stats.capabilities++;
   }
 
-  async enqueueTier1(documentId: string): Promise<void> {
+  /** Queue the document for tier-1 extraction; `segments` is how many extraction calls it will take (progress only). */
+  async enqueueTier1(documentId: string, segments = 0): Promise<void> {
     const [existing] = await this.q.query<{ document_id: string }>(`SELECT document_id FROM extraction_queue WHERE document_id = $1`, [documentId]);
     if (existing) return;
     await this.effect('enqueue', documentId, { op: 'queue.remove', documentId }, async () => {
       await this.q.query(
-        `INSERT INTO extraction_queue (document_id, tier, priority) VALUES ($1, 1, 0) ON CONFLICT (document_id) DO NOTHING`,
-        [documentId],
+        `INSERT INTO extraction_queue (document_id, tier, priority, segments_total) VALUES ($1, 1, 0, $2) ON CONFLICT (document_id) DO NOTHING`,
+        [documentId, segments],
       );
     });
   }

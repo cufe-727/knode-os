@@ -112,7 +112,7 @@ export async function recommendWikiTopics(ctx: AppContext, opts: RecommendOption
     );
     const troubleRows = await store.query<{ subject_id: string; n: number }>(
       `SELECT subject_id, count(*)::int AS n FROM claims
-       WHERE tx_to IS NULL AND subject_id IN (${ph}) AND (superseded_by IS NOT NULL OR (valid_to IS NOT NULL AND valid_to < now()))
+       WHERE tx_to IS NULL AND canonical_id IS NULL AND subject_id IN (${ph}) AND (superseded_by IS NOT NULL OR (valid_to IS NOT NULL AND valid_to < now()))
        GROUP BY subject_id`,
       ids,
     );

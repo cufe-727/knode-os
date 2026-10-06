@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { KnodeConfig } from '../config.js';
 import { appendLog } from '../fs/datadir.js';
+import { auditDuplicateClaims } from '../graph/claim-dedupe.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { refreshRecommendations } from '../research/recommend.js';
 import { reviewClaims } from '../graph/claim-review.js';
@@ -33,6 +34,8 @@ export interface Tier2Stats {
   recommendations: number;
   /** Disputed / suspected claims reviewed by the LLM (review.claims). */
   claimReviews: number;
+  /** Duplicate claims merged into a representative (review.claimMerge). */
+  claimsMerged: number;
 }
 
 /**
@@ -84,7 +87,7 @@ export async function refineWiki(
   opts: { onProgress?: (msg: string) => void; embedder?: EmbeddingProvider } = {},
 ): Promise<Tier2Stats> {
   const progress = opts.onProgress ?? (() => {});
-  const stats: Tier2Stats = { retiredPages: 0, claimIssues: 0, mergeCandidates: 0, recommendations: 0, claimReviews: 0 };
+  const stats: Tier2Stats = { retiredPages: 0, claimIssues: 0, mergeCandidates: 0, recommendations: 0, claimReviews: 0, claimsMerged: 0 };
   const ctx: PagesContext = {
     store,
     dataDir: store.dataDir,
@@ -93,12 +96,20 @@ export async function refineWiki(
     embedder: opts.embedder ?? createEmbeddingProvider(config.embedding),
   };
 
-  stats.claimIssues = await auditClaims(store, progress);
+  // entities first (claims are compared per canonical subject), then claims,
+  // then the audit over what is left: one fact in several wordings is one claim by then
   try {
     stats.mergeCandidates = (await auditDuplicateEntities({ store, embedder: ctx.embedder, config, llm }, { onProgress: progress })).suggested;
   } catch (err) {
     progress(`dedupe audit failed: ${err instanceof Error ? err.message : err}`);
   }
+  try {
+    const merged = await auditDuplicateClaims({ store, embedder: ctx.embedder, config, llm }, { onProgress: progress });
+    stats.claimsMerged = merged.merged;
+  } catch (err) {
+    progress(`claim merge failed: ${err instanceof Error ? err.message : err}`);
+  }
+  stats.claimIssues = await auditClaims(store, progress, { nearDuplicates: (config.review?.claimMerge ?? 'auto') === 'off' });
   try {
     stats.claimReviews = (await reviewClaims({ store, llm, config }, { onProgress: progress })).suggested;
   } catch (err) {
@@ -143,7 +154,7 @@ export async function refineWiki(
 export async function markSupersededClaims(store: Store): Promise<number> {
   const rows = await store.query<{ id: string; subject_id: string; type: string; valid_from: string | Date; valid_to: string | Date | null; superseded_by: string | null }>(
     `SELECT id, subject_id, type, valid_from, valid_to, superseded_by FROM claims
-     WHERE tx_to IS NULL AND status = 'fact' AND valid_from IS NOT NULL
+     WHERE tx_to IS NULL AND canonical_id IS NULL AND status = 'fact' AND valid_from IS NOT NULL
      ORDER BY subject_id, type, valid_from ASC, tx_from ASC`,
   );
   const groups = new Map<string, typeof rows>();
@@ -173,7 +184,12 @@ export async function markSupersededClaims(store: Store): Promise<number> {
   return changed + cleared.length;
 }
 
-async function auditClaims(store: Store, progress: (msg: string) => void): Promise<number> {
+/**
+ * `nearDuplicates`: also flag similar statements from different sources —
+ * only while duplicate-claim merging is off; otherwise the Judge's verdicts
+ * (merge, or a contradiction suggestion) already covered those pairs.
+ */
+async function auditClaims(store: Store, progress: (msg: string) => void, opts: { nearDuplicates: boolean }): Promise<number> {
   const superseded = await markSupersededClaims(store);
   if (superseded) progress(`claim audit: ${superseded} supersession marks updated`);
   const rows = await store.query<{
@@ -185,7 +201,7 @@ async function auditClaims(store: Store, progress: (msg: string) => void): Promi
      FROM claims cl
      JOIN entities e ON e.id = cl.subject_id
      LEFT JOIN scopes s ON s.id = cl.primary_scope_id
-     WHERE cl.tx_to IS NULL AND e.tx_to IS NULL`,
+     WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL AND e.tx_to IS NULL`,
   );
   if (rows.length === 0) return 0;
 
@@ -229,6 +245,7 @@ async function auditClaims(store: Store, progress: (msg: string) => void): Promi
       continue;
     }
     // near-duplicate statements from different sources — possible divergence
+    if (!opts.nearDuplicates) continue;
     for (let i = 0; i < group.length; i++) {
       for (let j = i + 1; j < group.length; j++) {
         const a = group[i], b = group[j];

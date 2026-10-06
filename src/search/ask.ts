@@ -35,7 +35,7 @@ async function factsForContexts(store: Store, chunkIds: string[], limit = 8): Pr
     `SELECT DISTINCT cl.id, se.name AS subject, oe.name AS object, cl.type, cl.statement,
             cl.status, cl.valid_from, cl.valid_to, s.key AS path, cl.evidence_count
      FROM entity_mentions m
-     JOIN claims cl ON cl.subject_id = m.entity_id AND cl.tx_to IS NULL
+     JOIN claims cl ON cl.subject_id = m.entity_id AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
      JOIN entities se ON se.id = cl.subject_id AND se.tx_to IS NULL
      LEFT JOIN entities oe ON oe.id = cl.object_id
      LEFT JOIN scopes s ON s.id = cl.primary_scope_id

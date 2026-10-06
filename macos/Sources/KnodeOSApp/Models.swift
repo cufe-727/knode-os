@@ -207,6 +207,8 @@ struct KnowledgeStats: Decodable, Equatable {
     var traces: Int
     var pendingSuggestions: Int
     var extractionQueue: Int?
+    /// Extraction calls still to make for the queue (a long document counts its segments).
+    var extractionSegments: Int?
     var embeddingModel: String?
     var llmModel: String?
     var lastDream: LastDream?
@@ -715,25 +717,38 @@ struct ExtractionConfig: Codable, Equatable {
     /// The Judge stage: knode_ask, Dream, the duplicate-entity review after
     /// each extraction pass and the disputed-claim review.
     var judgeLlm: RoutedLLMConfig
-    /// Documents per background pass — extracted, then summarized.
+    /// Model calls per background pass: extraction calls (a long document
+    /// takes one per segment) and, separately, summaries.
     var batchSize: Int
     /// Parallel model calls in a background pass, for both.
     var concurrency: Int
+    /// Longest text one extraction call reads (characters); a longer document
+    /// is read in segments. File-only — shown, never sent back as a change.
+    var segmentChars: Int?
 }
 
-/// What the Judge stage does with its verdicts: the service's `review.llmJudge`
-/// and `review.claims`. The thresholds stay in the config file, and the
-/// service keeps every key this client does not send.
+/// What the Judge stage does with its verdicts: the service's `review.llmJudge`,
+/// `review.claims` and `review.claimMerge`. The thresholds stay in the config
+/// file, and the service keeps every key this client does not send.
 struct ReviewConfig: Codable, Equatable {
     /// "off" | "suggest" | "auto" — auto merges pairs judged the same with
     /// high confidence; a merge can always be undone.
     var llmJudge: String
     /// "off" | "suggest"
     var claims: String
+    /// Duplicate claims: "off" | "suggest" | "auto" — auto merges identical
+    /// wordings and pairs judged the same with high confidence; undoable.
+    var claimMerge: String
+    /// The workspace's web switch, for research jobs and Ask alike:
+    /// "off" | "verify" (verification jobs, and agents set to on) | "research"
+    /// (every job). Edited on the Research tab.
+    var external: String
 
-    init(llmJudge: String = "suggest", claims: String = "suggest") {
+    init(llmJudge: String = "suggest", claims: String = "suggest", claimMerge: String = "auto", external: String = "verify") {
         self.llmJudge = llmJudge
         self.claims = claims
+        self.claimMerge = claimMerge
+        self.external = external
     }
 
     init(from decoder: any Decoder) throws {
@@ -741,6 +756,8 @@ struct ReviewConfig: Codable, Equatable {
         let fallback = ReviewConfig()
         llmJudge = try container.decodeIfPresent(String.self, forKey: .llmJudge) ?? fallback.llmJudge
         claims = try container.decodeIfPresent(String.self, forKey: .claims) ?? fallback.claims
+        claimMerge = try container.decodeIfPresent(String.self, forKey: .claimMerge) ?? fallback.claimMerge
+        external = try container.decodeIfPresent(String.self, forKey: .external) ?? fallback.external
     }
 }
 
@@ -782,12 +799,18 @@ struct ResearchConfig: Codable, Equatable {
     var agent: String
     var model: String
     var profile: String
-    /// "team" | "native" | "single" — a profile may pin its own.
+    /// "team" | "native" | "single" for a profile that names none. Settings
+    /// edits the pipeline on the profile, so this only round-trips.
     var pipeline: String
+    /// The turn cap for a template that sets none — every built-in one does.
+    /// Not edited here; the roles carry their own.
     var maxTurns: Int
+    /// One agent session's limit; a team job runs several.
     var timeoutMs: Int
     var concurrency: Int
+    /// What a research role with no `parallel` of its own runs at.
     var researchers: Int
+    /// What a revise role with no `rounds` of its own runs at.
     var reviewRounds: Int
     var auto: Auto
     var initialization: Initialization
@@ -1285,11 +1308,13 @@ struct ResearchRole: Codable, Equatable, Identifiable {
     /// "default" = the profile's speed; "fast" = codex's priority tier.
     var speed: String
     var tools: Tools
-    /// research phase: parallel sessions (0 = the runner's fan-out).
+    /// research phase: parallel sessions (0 = `research.researchers`).
     var parallel: Int
-    /// review / revise: rounds (0 = the runner's review rounds).
+    /// revise phase: review → revise rounds (0 = `research.reviewRounds`).
+    /// A review role's own is the older spelling, read only while no reviser
+    /// sets one; Settings no longer shows it there.
     var rounds: Int
-    /// 0 = derived from the template and the runner's turn cap.
+    /// 0 = the page template's cap.
     var maxTurns: Int
     /// Prompt file relative to playbooks/research/ ("" = the phase default).
     var prompt: String
@@ -1420,7 +1445,8 @@ struct ResearchProfileDetail: Codable, Equatable {
     var name: String
     var title: String
     var description: String
-    /// "" = the runner's pipeline.
+    /// "team" | "native" | "single"; "" = `research.pipeline`, which the
+    /// picker shows and replaces with an explicit value once it is changed.
     var pipeline: String
     var reasoning: Reasoning
     var search: Search

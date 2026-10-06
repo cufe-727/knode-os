@@ -86,7 +86,7 @@ export interface TraceRow {
 
 export interface SuggestionRow {
   id: string;
-  kind: 'skill' | 'memory' | 'knowledge' | 'pack' | 'recipe' | 'merge' | 'wiki';
+  kind: 'skill' | 'memory' | 'knowledge' | 'pack' | 'recipe' | 'merge' | 'claim-merge' | 'wiki';
   title: string;
   body: string;
   evidence: (string | { kind: string; id?: string; path?: string; text?: string })[];
@@ -95,7 +95,8 @@ export interface SuggestionRow {
   report_path: string | null;
   /**
    * Machine-applicable change: for kind 'pack' / 'recipe' the { path, content } of the file to write;
-   * for 'merge' { entityId, canonicalId, reason }; for 'wiki' the research job spec.
+   * for 'merge' { entityId, canonicalId, reason }; for 'claim-merge' { claimId, canonicalId, kind, confidence, reason };
+   * for 'wiki' the research job spec.
    */
   payload?: ({ path?: string; content?: string } & Record<string, unknown>) | null;
   created_at: string;

@@ -80,7 +80,8 @@ export async function drainTier1(ctx: AppContext, opts: { maxMs: number; log: (m
     processed += st.processed;
     failed += st.failed;
     if (st.queued === 0) break;
-    if (st.processed === 0 && st.failed === 0) {
+    // a pass may write no document yet still move a long one along (docs/design/10)
+    if (!st.progressed) {
       reason = 'no progress';
       break;
     }

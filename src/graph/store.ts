@@ -15,6 +15,8 @@ export interface ExtractedEntity {
   aliases?: string[];
   /** Name of a known entity this one is the same as (extraction-time linking); resolved before an id is assigned. */
   sameAs?: string | null;
+  /** Segments of a long document it was extracted from (docs/design/10); mentions are grounded there. */
+  segments?: number[];
 }
 
 export interface ExtractedRelation {
@@ -43,6 +45,8 @@ export interface ExtractedClaim {
   endDate?: string | null;
   /** When the asserted event happened, if the statement is about a dated event. */
   eventDate?: string | null;
+  /** Segment of a long document it was extracted from (docs/design/10); the claim is grounded there. */
+  segment?: number;
 }
 
 /** A document being wired into the graph: identity plus its indexed chunks. */

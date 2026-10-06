@@ -493,8 +493,9 @@ struct SettingsView: View {
         }
     }
 
-    /// What the Judge stage does with its verdicts. The duplicate review runs
-    /// after every extraction pass and again at night; the claim review at night.
+    /// What the Judge stage does with its verdicts. The duplicate reviews (of
+    /// entities and of claims) run after every extraction pass and again at
+    /// night; the disputed-claim review at night.
     private var reviewModes: some View {
         VStack(alignment: .leading, spacing: 10) {
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
@@ -515,8 +516,19 @@ struct SettingsView: View {
                         .labelsHidden()
                     }
                 }
+                GridRow {
+                    FieldLabel(L("Duplicate claims")) {
+                        Picker(L("Duplicate claims"), selection: binding(\.review.claimMerge)) {
+                            Text(L("Off")).tag("off")
+                            Text(L("Suggest merges")).tag("suggest")
+                            Text(L("Merge confident pairs")).tag("auto")
+                        }
+                        .labelsHidden()
+                    }
+                    Color.clear.frame(height: 1)
+                }
             }
-            Text(L("After each extraction pass the entities it wrote are checked for duplicates, and the full graph again overnight; a merge can always be undone. Disputed claims are reviewed overnight."))
+            Text(L("After each extraction pass the entities and claims it wrote are checked for duplicates, and everything again overnight; a merge can always be undone. Disputed claims are reviewed overnight."))
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -556,8 +568,8 @@ struct SettingsView: View {
                         FieldLabel(L("Parallel calls")) {
                             TextField(L("Parallel calls"), value: binding(\.extraction.concurrency), format: .number)
                         }
-                        FieldLabel(L("Documents per pass")) {
-                            TextField(L("Documents per pass"), value: binding(\.extraction.batchSize), format: .number)
+                        FieldLabel(L("Calls per pass")) {
+                            TextField(L("Calls per pass"), value: binding(\.extraction.batchSize), format: .number)
                         }
                     }
                     GridRow {
@@ -571,11 +583,20 @@ struct SettingsView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
+                Text(L("A document longer than %@ characters is read in segments, one call each; it may take several passes and is written once every segment is in.", (config?.extraction.segmentChars ?? 12_000).formatted()))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let queued = model.stats?.extractionQueue, queued > 0 {
+                    Text(L("Queue: %@ documents, %@ calls left", String(queued), String(model.stats?.extractionSegments ?? queued)))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
                 Toggle(L("Extract factual claims alongside entities"), isOn: binding(\.extraction.claims))
                     .toggleStyle(.checkbox)
             }
         case .summarize:
-            Text(L("Runs in Extract's background pass, with its documents per pass and parallel calls."))
+            Text(L("Runs in Extract's background pass, with its calls per pass and parallel calls."))
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -874,6 +895,7 @@ struct SettingsView: View {
         if config != nil {
             ResearchSettingsSection(
                 research: binding(\.research),
+                review: binding(\.review),
                 profile: $profileDraft,
                 dirty: $profileDirty,
                 profileSelection: researchProfileBinding,
@@ -1910,9 +1932,9 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         switch self {
         case .convert: L("Images and scanned PDF pages become searchable Markdown.")
         case .index: L("Every chunk becomes a vector for semantic and hybrid recall.")
-        case .extract: L("Names entities, relations and factual claims in changed documents; what it finds is checked for duplicates right away.")
+        case .extract: L("Names entities, relations and factual claims in changed documents, a long one in segments; what it finds is checked for duplicates right away.")
         case .summarize: L("Writes one summary page per document, right after it is extracted.")
-        case .judge: L("Answers knode_ask and reviews duplicate entities after each extraction pass; overnight it runs Dream and reviews disputed claims.")
+        case .judge: L("Answers knode_ask and reviews duplicate entities and claims after each extraction pass; overnight it runs Dream and reviews disputed claims.")
         }
     }
 
@@ -1923,11 +1945,11 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .index:
             L("Not an LLM — it uses one of the embedding models under Providers & Agents. Changing which one, or its model or dimensions, re-embeds the whole corpus.")
         case .extract:
-            L("The busiest stage — it runs on every changed document, bounded by the batch size here. A fast, cheap model that returns clean JSON is usually the right trade.")
+            L("The busiest stage — it runs on every changed document, a long one in segments, bounded by the calls per pass here. A fast, cheap model that returns clean JSON is usually the right trade.")
         case .summarize:
             L("One call per document, for people to read rather than a program to parse, so it wants clean prose more than the strongest model. Changing the model does not rewrite summaries already written.")
         case .judge:
-            L("Few calls, but each one decides something — whether two entities are one, which of two claims holds, what a week of agent sessions says — so a stronger model pays for itself. Only knode_ask has someone waiting on the answer.")
+            L("Few calls, but each one decides something — whether two entities are one, whether two claims say the same, which of two claims holds, what a week of agent sessions says — so a stronger model pays for itself. Only knode_ask has someone waiting on the answer.")
         }
     }
 }

@@ -6,7 +6,7 @@ import { pool } from '../pool.js';
 import { ResearchAgent, withModel } from './agent.js';
 import { getJob, ResearchJob } from './jobs.js';
 import { isCancelled, JobCancelledError, LaunchResult, launchSession, SessionResult } from './launch.js';
-import { effectiveEffort, effectiveSpeed, NativeAgentSpec, requiredSections, ResearchProfile, ResearchRole, rolePrompt, rolesFor, webAllowed } from './profile.js';
+import { effectiveEffort, effectiveSpeed, NativeAgentSpec, requiredSections, ResearchProfile, ResearchRole, revisionRounds, rolePrompt, rolesFor, webAllowed } from './profile.js';
 import { loadPhasePrompt, PhaseName, ResearchTemplate, researchSlug, subjectOf } from './templates.js';
 import { McpEndpoint, RunWorkspace } from './workspace.js';
 import { validateCompanions, validateResearchPage } from './validate.js';
@@ -22,7 +22,7 @@ import { validateCompanions, validateResearchPage } from './validate.js';
  *   review      every `review` role critiques the page (JSON verdict); the
  *               deterministic validator runs alongside
  *   revise      the `revise` role fixes what review + validation found; rounds
- *               come from the roles, else research.reviewRounds
+ *               come from the reviser, else research.reviewRounds
  *
  * A disabled role skips its phase (no planner → the template's sections; no
  * researcher → the synthesizer researches itself; no critic → validator only).
@@ -270,8 +270,7 @@ export async function runTeamPipeline(ctx: AppContext, input: PipelineInput): Pr
   /* ---- 4/5. review → revise ---- */
   const critics = rolesFor(profile, 'review');
   const revisers = rolesFor(profile, 'revise');
-  const configuredRounds = Math.max(0, ...[...critics, ...revisers].map((r) => r.rounds));
-  const rounds = revisers.length ? configuredRounds || Math.max(0, research?.reviewRounds ?? 1) : 0;
+  const rounds = revisionRounds(critics, revisers, research?.reviewRounds ?? 1);
   let reviewRounds = 0;
   let summary = synthRes.text;
   for (let round = 0; round <= rounds; round++) {

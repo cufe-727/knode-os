@@ -122,8 +122,8 @@ export async function surveyKnowledgeBase(ctx: AppContext): Promise<KbSurvey> {
   const top = await store.query<{ id: string; name: string; type: string; mention_count: number; wiki_path: string | null }>(
     `SELECT id, name, type, mention_count, wiki_path FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL ORDER BY mention_count DESC, evidence_count DESC LIMIT 20`,
   );
-  const claimStatus = await store.query<{ status: string; n: number }>(`SELECT status, count(*)::int AS n FROM claims WHERE tx_to IS NULL GROUP BY status ORDER BY n DESC`);
-  const [claimRange] = await store.query<{ lo: string | Date | null; hi: string | Date | null }>(`SELECT min(event_at) AS lo, max(event_at) AS hi FROM claims WHERE tx_to IS NULL`);
+  const claimStatus = await store.query<{ status: string; n: number }>(`SELECT status, count(*)::int AS n FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL GROUP BY status ORDER BY n DESC`);
+  const [claimRange] = await store.query<{ lo: string | Date | null; hi: string | Date | null }>(`SELECT min(event_at) AS lo, max(event_at) AS hi FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL`);
   const openDisputes = (await listDisputes(store, { status: 'open' })).length;
 
   // index.md / log.md are OKF navigation files, not anyone's prose

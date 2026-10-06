@@ -3,12 +3,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { KnodeConfig } from '../config.js';
 import { MAX_FILE_BYTES } from '../constants.js';
-import { readSidecarPart, replayableTier1, updateSidecarPart } from '../fs/sidecar.js';
+import { readSidecarPart, replayableTier1, SidecarTier1, truncatedTier1, updateSidecarPart } from '../fs/sidecar.js';
 import { extractConcepts, wireConcepts } from '../graph/concepts.js';
 import { frontmatterExtraction } from '../graph/frontmatter.js';
 import { parseCapabilityNotes } from '../capability/notes.js';
 import { TRUST_TIERS, TrustTier, detectDisputes, tierForActor } from '../lineage/trust.js';
 import { applyExtraction } from '../graph/llm-extract.js';
+import { segmentText } from '../graph/segment.js';
+import { enqueueTier1, segmentRangesOf } from '../graph/tier1.js';
 import { PageContext } from '../graph/store.js';
 import { applyWirePlan, extractWikilinks, planWireFromMarkdown, WikiIndex } from '../graph/wire.js';
 import { isReservedWikiFile } from '../lineage/declared.js';
@@ -119,7 +121,14 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     // a sidecar may have gained a replayable tier-1 extraction since (copied
     // from another machine, or written by a bench run) — apply it as the
     // document's child scope without re-indexing the document itself
-    if (root === 'docs') await ensureTier1Replay(store, file, sha, docId, live.id, opts);
+    if (root === 'docs') {
+      await ensureTier1Replay(store, file, raw, sha, docId, live.id, opts);
+      // an extraction from before segmented extraction read only the start of
+      // a long document: queue it again so the rest gets read (docs/design/10)
+      if (opts.queueTier1 && truncatedTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha, raw.length)) {
+        await enqueueTier1(store, docId, segmentText(raw, config.extraction.segmentChars).length);
+      }
+    }
     return { outcome: 'unchanged', ...none, scopeId: live.id };
   }
 
@@ -169,7 +178,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
       ? tierForActor(parsed.frontmatter.actor)
       : undefined;
   const declaredAcl = Array.isArray(parsed.frontmatter.acl) ? parsed.frontmatter.acl.map(String) : undefined;
-  const tier1 = root === 'docs' && isSource ? replayableTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha) : null;
+  const tier1 = root === 'docs' && isSource ? replayableTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha, raw.length) : null;
 
   /* ── the document scope ── */
   let g = { entities: 0, relations: 0 };
@@ -218,7 +227,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
         }
         const cg = await wireConcepts(w, page, concepts);
         g = { entities: g.entities + cg.entities, relations: g.relations + cg.relations };
-        if (!tier1 && opts.queueTier1) await w.enqueueTier1(docId);
+        if (!tier1 && opts.queueTier1) await w.enqueueTier1(docId, segmentText(raw, config.extraction.segmentChars).length);
       }
       // a capabilities/*.md file is an ordinary source *and* the semantic layer
       // over the capabilities it names: both halves belong to this one scope,
@@ -273,9 +282,12 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
         store,
         { kind: 'tier1', key: file },
         sha,
-        { parentId: res.scope.id, actor: 'tier1', at: opts.at, meta: { documentId: docId, model: tier1.model } },
+        { parentId: res.scope.id, actor: 'tier1', at: opts.at, meta: tier1ScopeMeta(docId, tier1) },
         async (w) => {
-          const lg = await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`, { docDate });
+          const lg = await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`, {
+            docDate,
+            segments: tier1Segments(raw, tier1),
+          });
           g = { entities: g.entities + lg.entities, relations: g.relations + lg.relations };
         },
       );
@@ -285,11 +297,23 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   return { outcome: 'applied', chunks: chunkRows.length, entities: g.entities, relations: g.relations, scopeId: res.scope.id };
 }
 
-async function ensureTier1Replay(store: Store, file: string, sha: string, docId: string, parentId: string, opts: ApplyDocOptions): Promise<void> {
-  const tier1 = replayableTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha);
+function tier1ScopeMeta(docId: string, tier1: SidecarTier1): Record<string, unknown> {
+  // a segmented result names itself, so a replay can tell it from an older result for the same content
+  return { documentId: docId, model: tier1.model, ...(tier1.segmenter ? { extractedAt: tier1.extractedAt } : {}) };
+}
+
+/** Grounding ranges for a segmented tier-1 result (see applyExtraction). */
+function tier1Segments(text: string, tier1: SidecarTier1): { text: string; ranges: { start: number; end: number }[] } | undefined {
+  const ranges = segmentRangesOf(tier1);
+  return ranges ? { text, ranges } : undefined;
+}
+
+async function ensureTier1Replay(store: Store, file: string, raw: string, sha: string, docId: string, parentId: string, opts: ApplyDocOptions): Promise<void> {
+  const tier1 = replayableTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha, raw.length);
   if (!tier1) return;
   const child = await findLiveScope(store, 'tier1', file);
-  if (child && child.sha === sha) return;
+  // the live scope already carries this result (a segmented one names its extractedAt)
+  if (child && child.sha === sha && (!tier1.segmenter || child.meta.extractedAt === tier1.extractedAt)) return;
   const chunks = await store.query<{ id: string; content: string }>(`SELECT id, content FROM chunks WHERE document_id = $1 ORDER BY seq`, [docId]);
   const [docRow] = await store.query<{ doc_date: string | Date | null }>(`SELECT doc_date FROM documents WHERE id = $1`, [docId]);
   const docDate = docRow?.doc_date ? new Date(docRow.doc_date).toISOString() : null;
@@ -298,9 +322,9 @@ async function ensureTier1Replay(store: Store, file: string, sha: string, docId:
     store,
     { kind: 'tier1', key: file },
     sha,
-    { parentId, actor: 'tier1', at: opts.at, meta: { documentId: docId, model: tier1.model } },
+    { parentId, actor: 'tier1', at: opts.at, force: true, meta: tier1ScopeMeta(docId, tier1) },
     async (w) => {
-      await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`, { docDate });
+      await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`, { docDate, segments: tier1Segments(raw, tier1) });
     },
   );
 }

@@ -137,9 +137,11 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   }, interval);
   syncTimer.unref?.();
 
-  // the document pass: extract a batch from the priority queue, audit the
-  // entities it wrote for duplicates, write summary pages — then let pages
-  // that depend on the new evidence regenerate (docs/design/09)
+  // the document pass: extract from the priority queue, audit the entities
+  // and claims it wrote for duplicates, write summary pages — then let pages
+  // that depend on the new evidence regenerate (docs/design/09, 10). While a
+  // backlog remains and passes make progress they run back to back; the
+  // interval only paces polling an empty (or stuck) queue.
   const tier1Interval = Math.max(1, ctx.config.extraction.intervalMinutes) * 60_000;
   let tier1Running = false;
   const tier1Timer = setInterval(() => {
@@ -147,12 +149,15 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     tier1Running = true;
     void track((async () => {
       try {
-        const pass = await runDocumentPass(ctx, { onProgress: log });
-        const line = describeDocumentPass(pass);
-        if (line) {
-          log(line);
-          const views = await reconcileViews(ctx, { actor: 'tier1', llm: false, onProgress: log });
-          if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
+        for (;;) {
+          const pass = await runDocumentPass(ctx, { onProgress: log });
+          const line = describeDocumentPass(pass);
+          if (line) {
+            log(line);
+            const views = await reconcileViews(ctx, { actor: 'tier1', llm: false, onProgress: log });
+            if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
+          }
+          if (disposed || pass.queued === 0 || !pass.progressed) break;
         }
       } catch (err) {
         log(`document pass failed: ${err instanceof Error ? err.message : err}`);

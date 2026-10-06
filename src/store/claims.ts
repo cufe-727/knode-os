@@ -75,6 +75,11 @@ export interface ClaimRecord {
   superseded: boolean;
   /** Path of the scope that first supported the claim. */
   sourcePath: string | null;
+  /**
+   * Every source that states it — in its own words or, for a merged group, in
+   * the words of a claim merged into it (docs/design/10).
+   */
+  sources: string[];
   evidenceCount: number;
   /** System time the knowledge base started believing this version. */
   txFrom: string | null;
@@ -142,6 +147,8 @@ export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<Cla
   }
   if (q.text) where.push(`cl.statement ILIKE ${p.add(`%${q.text}%`)}`);
   if (!q.includeSuperseded) where.push('cl.superseded_by IS NULL');
+  // a merged group answers once, as its representative
+  where.push('cl.canonical_id IS NULL');
   if (q.eventRange?.from) where.push(`cl.event_at >= ${p.add(q.eventRange.from)}::timestamptz`);
   if (q.eventRange?.to) where.push(`cl.event_at <= ${p.add(q.eventRange.to)}::timestamptz`);
 
@@ -166,11 +173,32 @@ export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<Cla
   );
 
   const projected = t.txTime ? await foldAsOf(store, rows, t, f) : rows;
+  const page = projected.slice(0, limit);
+  const sources = await sourcesOf(store, page.map((r) => r.id));
   return {
-    claims: projected.slice(0, limit).map((r) => project(r, now)),
+    claims: page.map((r) => project(r, now, sources.get(r.id))),
     matched: projected.length,
     applied: applied(t, f),
   };
+}
+
+/** Claim id → the paths of every live source behind it and the claims merged into it. */
+export async function sourcesOf(store: Store, ids: string[]): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  if (ids.length === 0) return out;
+  const p = new Params();
+  const ph = ids.map((id) => p.add(id)).join(',');
+  const rows = await store.query<{ rep: string; key: string }>(
+    `SELECT DISTINCT COALESCE(c.canonical_id, c.id) AS rep, s.key
+     FROM claims c
+     JOIN evidence e ON e.kind = 'claim' AND e.target_id = c.id AND e.tx_to IS NULL
+     JOIN scopes s ON s.id = e.scope_id
+     WHERE c.id IN (${ph}) OR c.canonical_id IN (${ph})
+     ORDER BY s.key`,
+    p.list,
+  );
+  for (const r of rows) (out.get(r.rep) ?? out.set(r.rep, []).get(r.rep)!).push(r.key);
+  return out;
 }
 
 /** Rebuild the candidate rows from the evidence that was live at `txTime`. */
@@ -217,7 +245,7 @@ async function foldAsOf(store: Store, rows: Row[], t: ResolvedTemporal, f: Resol
   return folded.map(({ row, scopeId }) => ({ ...row, source_path: scopeId ? keys.get(scopeId) ?? null : null }));
 }
 
-function project(r: Row, now: string): ClaimRecord {
+function project(r: Row, now: string, sources?: string[]): ClaimRecord {
   const validTo = toIso(r.valid_to);
   return {
     id: r.id,
@@ -236,6 +264,7 @@ function project(r: Row, now: string): ClaimRecord {
     supersededBy: r.superseded_by ?? null,
     superseded: Boolean(r.superseded_by),
     sourcePath: r.source_path,
+    sources: sources ?? (r.source_path ? [r.source_path] : []),
     evidenceCount: r.evidence_count,
     txFrom: r.tx_from,
   };

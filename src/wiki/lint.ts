@@ -137,7 +137,7 @@ export async function lintWiki(ctx: AppContext, opts: LintOptions = {}): Promise
         issues.push({ kind: 'stale_research', path: p.path, detail: `written ${writtenAt.slice(0, 10)}, newer evidence about ${entity.id} on ${newest.slice(0, 10)}` });
       }
       const superseded = await store.query<{ statement: string }>(
-        `SELECT statement FROM claims WHERE subject_id = $1 AND tx_to IS NULL AND superseded_by IS NOT NULL`,
+        `SELECT statement FROM claims WHERE subject_id = $1 AND tx_to IS NULL AND canonical_id IS NULL AND superseded_by IS NOT NULL`,
         [entity.id],
       );
       for (const s of superseded) {

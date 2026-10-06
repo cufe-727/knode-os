@@ -1,17 +1,24 @@
 import SwiftUI
 
-/// Settings · 03 · Deep research. The runner card says which coding-agent CLI
-/// writes wiki pages, how many jobs run at once and which profile they follow;
-/// the profile below it sets how hard they think, what they may read from the
-/// web and the bar a page has to clear, and the sub-agents that do the work sit
-/// behind one tab each — with its own CLI, model, tools and prompt.
+/// Settings · Research, in three layers. The runner card says which agent runs
+/// jobs, how many at once and for how long, and whether agents may use the web
+/// at all; the profile below it says how a job runs — its pipeline — and the
+/// bar a page has to clear; the sub-agents that do each phase sit behind one
+/// tab each, with their own model, tools and prompt.
 ///
 /// A profile is a file (`playbooks/research/profiles/<name>.yaml`), so what is
 /// edited here can equally be edited by hand; the role prompts travel with it
 /// and stay in the language they are written in, because that text is what the
 /// agent actually receives.
+///
+/// What the agent's runtime takes no flag for is greyed out, with the reason
+/// (see `ResearchRuntime`), and the rules a profile only writes into the brief
+/// sit folded away from the ones knode checks.
 struct ResearchSettingsSection: View {
     @Binding var research: ResearchConfig
+    /// The workspace's web switch (`review.external`): the cap over the
+    /// profile's, the roles' and Ask's own web settings.
+    @Binding var review: ReviewConfig
     @Binding var profile: ResearchProfileDetail?
     @Binding var dirty: Bool
     /// Selecting another profile reloads its file, so it goes through the
@@ -20,7 +27,7 @@ struct ResearchSettingsSection: View {
     let summaries: [ResearchProfileSummary]
     /// The models and the CLI agents (see `llmTargets`), for naming a spec.
     let connections: [LLMConnection]
-    /// The named agents from section 01, so the pickers can offer them.
+    /// The named agents from Providers & Agents, so the pickers can offer them.
     let agents: [AgentDefinition]
     /// What the default is in the draft: a model, or a CLI agent.
     let defaultTarget: LLMConnection?
@@ -34,12 +41,14 @@ struct ResearchSettingsSection: View {
     let remove: () -> Void
 
     @State private var selectedRoleID: String?
+    /// The rules the agent is only told about start folded.
+    @State private var rulesExpanded = false
 
     /// The coding-agent CLIs. An OpenAI-compatible connection can run a job
     /// too — on the built-in agent — so this list is no longer the whole set.
     static let cliProviders = ["claude-cli", "codex-cli", "cursor-cli"]
 
-    /// The spec that names the section-01 connection rather than a named one.
+    /// The spec that names the default connection rather than a named one.
     static let defaultConnection = "default"
 
     static let phases: [(String, String)] = [
@@ -69,7 +78,7 @@ struct ResearchSettingsSection: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(L("How the wiki gets written")).font(.title3.bold())
-            Text(L("How a deep-research job runs: which agent from Providers & Agents takes it, how the phases fan out, and the verification bar the profile sets for its sub-agents."))
+            Text(L("The runner picks who runs jobs; the profile sets how a job runs and the bar a page has to clear; its sub-agents each take one phase."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -81,8 +90,8 @@ struct ResearchSettingsSection: View {
     private var runnerCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(L("Deep research pipeline")).font(.headline)
-                Text(L("Which agent runs jobs, how many at once, and which profile it follows. Roles below may override the agent per phase."))
+                Text(L("Runner")).font(.headline)
+                Text(L("Who runs research jobs, how many at once, and whether agents may use the web at all."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -116,39 +125,21 @@ struct ResearchSettingsSection: View {
                     }
                 }
                 GridRow {
-                    FieldLabel(L("Pipeline")) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Picker(L("Pipeline"), selection: pipelineSelection) {
-                                Text(L("Team · plan, research, synthesize, review, revise")).tag("team")
-                                Text(L("Native sub-agents · one session")).tag("native")
-                                Text(L("Single session")).tag("single")
-                            }
-                            .labelsHidden()
-                            .disabled(!pinnedPipeline.isEmpty)
-                            if !pinnedPipeline.isEmpty {
-                                Text(L("Pinned by the profile “%@”. Change it in Pipeline override below, or pick a profile that does not pin one.", profileSelection))
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                    }
                     FieldLabel(L("Parallel jobs")) {
                         TextField("1", value: $research.concurrency, format: .number)
                     }
-                    FieldLabel(L("Turns per session")) {
-                        TextField("40", value: $research.maxTurns, format: .number)
-                    }
-                }
-                GridRow {
-                    FieldLabel(L("Timeout (minutes)")) {
+                    FieldLabel(L("Session timeout (minutes)")) {
                         TextField("20", value: timeoutMinutes, format: .number)
+                            .help(L("Each agent session stops after this long. A team job runs several — the plan, one per section, the write-up, each review — so the job as a whole takes longer."))
                     }
-                    FieldLabel(L("Researchers (default fan-out)")) {
-                        TextField("3", value: $research.researchers, format: .number)
-                    }
-                    FieldLabel(L("Review rounds (default)")) {
-                        TextField("1", value: $research.reviewRounds, format: .number)
+                    FieldLabel(L("Web access")) {
+                        Picker(L("Web access"), selection: $review.external) {
+                            Text(L("Off for every agent")).tag("off")
+                            Text(L("Verification jobs only")).tag("verify")
+                            Text(L("Every job, and Ask")).tag("research")
+                        }
+                        .labelsHidden()
+                        .help(L("The workspace's switch, Ask included. A profile, a role or an Ask agent can turn the web off, or on for more jobs — never past Off."))
                     }
                 }
             }
@@ -181,9 +172,13 @@ struct ResearchSettingsSection: View {
         .knodeCard(padding: 18)
     }
 
+    /// A profile by its title; the file name joins in only when another
+    /// profile reads the same, as a fresh duplicate does.
     private func profileLabel(_ summary: ResearchProfileSummary) -> String {
         let title = BuiltinNames.profileTitle(summary.title)
-        return title == summary.name ? summary.name : "\(summary.name) · \(title)"
+        guard !title.isEmpty, title != summary.name else { return summary.name }
+        let shared = summaries.contains { $0.name != summary.name && BuiltinNames.profileTitle($0.title) == title }
+        return shared ? "\(title) · \(summary.name)" : title
     }
 
     /// Whether an initialization queues the topic pages its plan suggests.
@@ -203,14 +198,23 @@ struct ResearchSettingsSection: View {
         )
     }
 
-    /// A profile may pin the pipeline; when it does, the runner's own setting
-    /// has no effect, so the picker shows what will actually run and locks.
-    private var pinnedPipeline: String { profile?.pipeline ?? "" }
+    /// The pipeline a job of this profile runs: its own, else what the config
+    /// keeps for a profile that names none.
+    private var pipeline: String {
+        let own = profile?.pipeline ?? ""
+        return own.isEmpty ? research.pipeline : own
+    }
 
+    /// Picking a pipeline writes it into the profile, so what the picker shows
+    /// is always what that profile runs.
     private var pipelineSelection: Binding<String> {
         Binding(
-            get: { pinnedPipeline.isEmpty ? research.pipeline : pinnedPipeline },
-            set: { if pinnedPipeline.isEmpty { research.pipeline = $0 } }
+            get: { pipeline },
+            set: { mode in
+                guard profile != nil, mode != pipeline else { return }
+                profile!.pipeline = mode
+                dirty = true
+            }
         )
     }
 
@@ -229,6 +233,43 @@ struct ResearchSettingsSection: View {
         return cliProviderNames.contains(provider) ? provider : ""
     }
 
+    /// What knode can hold a session on this spec to; nil while the spec
+    /// names nothing that resolves, which greys out nothing.
+    private func researchRuntime(_ spec: String) -> ResearchRuntime? {
+        guard !spec.isEmpty else { return nil }
+        if let agent = agents.first(where: { $0.name == spec }) {
+            return ResearchRuntime(provider: agent.isCli ? agent.executor : "")
+        }
+        let provider: String?
+        if spec == Self.defaultConnection {
+            provider = defaultTarget?.provider
+        } else if cliProviderNames.contains(spec) {
+            provider = spec
+        } else {
+            provider = connections.first { $0.id == spec }?.provider
+        }
+        guard let provider else { return nil }
+        return ResearchRuntime(provider: cliProviderNames.contains(provider) ? provider : "")
+    }
+
+    /// The runtimes a job of this profile runs on: the research agent's, and
+    /// any a role that is on has been pinned to by hand.
+    private var runtimesInUse: [ResearchRuntime] {
+        ([research.agent] + roles.filter { $0.enabled && !$0.agent.isEmpty }.map(\.agent)).compactMap(researchRuntime)
+    }
+
+    /// The runtime a native job's orchestrator — the writer's session — is on.
+    private var orchestratorRuntime: ResearchRuntime? {
+        let writer = roles.first { $0.enabled && $0.phase == "synthesize" }
+        return researchRuntime(writer.map { $0.agent.isEmpty ? research.agent : $0.agent } ?? research.agent)
+    }
+
+    /// What a job really runs: native on an orchestrator without sub-agents
+    /// (Cursor) comes to one session, as `runNativePipeline` falls back.
+    private var runningPipeline: String {
+        pipeline == "native" && orchestratorRuntime?.hasSubAgents == false ? "single" : pipeline
+    }
+
     /// The profile's effort and speed, on the model the research agent runs:
     /// every session and role that sets none runs at them.
     private var runnerTuning: ModelTuning? {
@@ -243,16 +284,6 @@ struct ResearchSettingsSection: View {
         )
     }
 
-    /// Only the CLIs ship a web tool; deepagents on a model has none.
-    private func agentWebCapable(_ spec: String) -> Bool {
-        if let agent = agents.first(where: { $0.name == spec }) { return agent.isCli }
-        if cliProviderNames.contains(spec) { return true }
-        let provider = spec == Self.defaultConnection
-            ? (defaultTarget?.provider ?? "")
-            : (connections.first { $0.id == spec }?.provider ?? "")
-        return cliProviderNames.contains(provider)
-    }
-
     /// A spec by the name the tables give it: an agent's title, the default
     /// with what it is now, or a model or CLI agent by its label.
     private func specLabel(_ spec: String) -> String {
@@ -263,34 +294,76 @@ struct ResearchSettingsSection: View {
         return connections.first { $0.id == spec }?.label ?? providerName(spec)
     }
 
+    private func pipelineName(_ mode: String) -> String {
+        switch mode {
+        case "native": L("Native sub-agents")
+        case "single": L("Single session")
+        default: L("Team")
+        }
+    }
+
+    /// Which jobs get web tools when no role says otherwise — `webAllowed` on
+    /// the service, read for this profile and the research agent.
+    private var webSummary: String {
+        guard let profile else { return "" }
+        if review.external == "off" || profile.search.web == "off" { return L("off") }
+        if researchRuntime(research.agent)?.hasWeb == false { return L("none (built-in agent)") }
+        if review.external == "research" || profile.search.web == "on" { return L("every job") }
+        return L("verification jobs only")
+    }
+
     /// What a job will actually do, assembled from the runner and the profile.
     private var note: String {
         let agentLabel = research.agent.isEmpty ? L("not configured") : specLabel(research.agent)
-        let webCapable = agentWebCapable(research.agent)
-        let pipeline = pinnedPipeline.isEmpty ? research.pipeline : pinnedPipeline
-        var parts = [
-            L("Agent: %@", agentLabel),
-            L("pipeline: %@", pipeline + (pinnedPipeline.isEmpty ? "" : " (\(L("pinned by profile")))")),
-        ]
+        let pipeline = runningPipeline
+        var parts = [L("Agent: %@", agentLabel), L("pipeline: %@", pipelineName(pipeline))]
         if let profile {
             parts.append(L("effort: %@", profile.reasoning.effort))
-            parts.append(webCapable ? L("web: %@ / %@", profile.search.web, profile.search.freshness) : L("web: none (built-in agent)"))
+            parts.append(L("web: %@", webSummary))
             parts.append(L("sources per fact: %@", String(profile.verification.minSourcesPerClaim)))
         }
         if pipeline != "single" {
-            let roles = (profile?.roles ?? []).filter(\.enabled).map { role -> String in
-                let fanout = role.phase == "research" ? (role.parallel == 0 ? research.researchers : role.parallel) : 0
-                return role.id + (fanout > 1 ? " ×\(fanout)" : "") + (role.agent.isEmpty ? "" : " @\(specLabel(role.agent))")
+            // native runs the writer's session and the roles offered to it; team runs every role that is on
+            let running = roles.filter { $0.enabled && (pipeline != "native" || $0.phase == "synthesize" || ($0.native && $0.phase != "revise")) }
+            let names = running.map { role -> String in
+                let fanout = pipeline == "team" && role.phase == "research" ? (role.parallel == 0 ? research.researchers : role.parallel) : 0
+                return BuiltinNames.roleTitle(id: role.id, title: role.title) + (fanout > 1 ? " ×\(fanout)" : "") + (role.agent.isEmpty ? "" : " @\(specLabel(role.agent))")
             }
-            parts.append(L("roles: %@", roles.isEmpty ? L("none") : roles.joined(separator: ", ")))
+            parts.append(L("roles: %@", names.isEmpty ? L("none") : names.joined(separator: L10n.isChinese ? "、" : ", ")))
         }
-        let caveat = webCapable
-            ? L("Web tools never exceed what review.external allows.")
-            : L("The built-in agent has no web tool — it verifies against the knowledge base only.")
-        return parts.joined(separator: " · ") + ". " + caveat
+        let limits = researchRuntime(research.agent)?.limits
+        return parts.joined(separator: " · ") + "." + (limits.map { " " + $0 } ?? "")
     }
 
     // MARK: - Profile
+
+    /// Whether any runtime in use can search the web at all; nothing in use
+    /// that resolves counts as yes, so a missing agent greys out nothing.
+    private var webPossible: Bool {
+        runtimesInUse.isEmpty || runtimesInUse.contains(where: \.hasWeb)
+    }
+
+    /// Only codex can be pointed at a cached index, and only while it may
+    /// search at all.
+    private var freshnessApplies: Bool {
+        let codex = runtimesInUse.isEmpty || runtimesInUse.contains(where: \.choosesFreshness)
+        return codex && review.external != "off" && profile?.search.web != "off"
+    }
+
+    /// One line on the pipeline that is picked: what runs, and on Cursor, why
+    /// native comes to a single session.
+    private var pipelineNote: String {
+        switch pipeline {
+        case "native":
+            let alone = orchestratorRuntime?.hasSubAgents == false
+            return L("One session — the Lead writer’s — runs the job and calls the roles offered as native sub-agents through the CLI itself.")
+                + (alone ? " " + L("Cursor has no sub-agents, so a native job runs as a single session.") : "")
+        case "single":
+            return L("One session does the whole job with the rules below; the sub-agents are not used.")
+        default:
+            return L("Plan → research each section in parallel → write → review ↔ revise, each its own session, done by the sub-agents below.")
+        }
+    }
 
     private var profileCard: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -302,7 +375,7 @@ struct ResearchSettingsSection: View {
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.secondary)
                     }
-                    Text(L("Stored as %@ — edit here or in the file. The profile may pin its own pipeline.",
+                    Text(L("Stored as %@ — edit here or in the file.",
                            profile?.path.isEmpty == false ? profile!.path : "playbooks/research/profiles/<name>.yaml"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -325,9 +398,8 @@ struct ResearchSettingsSection: View {
                     .gridCellColumns(2)
                 }
                 GridRow {
-                    FieldLabel(L("Pipeline override")) {
-                        Picker(L("Pipeline override"), selection: bind(\.pipeline)) {
-                            Text(L("Use the runner's pipeline")).tag("")
+                    FieldLabel(L("Pipeline")) {
+                        Picker(L("Pipeline"), selection: pipelineSelection) {
                             Text(L("Team")).tag("team")
                             Text(L("Native sub-agents")).tag("native")
                             Text(L("Single session")).tag("single")
@@ -336,50 +408,81 @@ struct ResearchSettingsSection: View {
                     }
                     FieldLabel(L("Web access")) {
                         Picker(L("Web access"), selection: bind(\.search.web)) {
-                            Text(L("Follow review.external")).tag("inherit")
+                            Text(L("Follow the workspace")).tag("inherit")
                             Text(L("On for every job")).tag("on")
                             Text(L("Off")).tag("off")
                         }
                         .labelsHidden()
+                        .disabled(review.external == "off" || !webPossible)
+                        .help(review.external == "off"
+                              ? L("Web access is off for the whole workspace — see the runner above.")
+                              : L("On widens the workspace's verification-only default to every job of this profile."))
                     }
-                }
-                GridRow {
                     FieldLabel(L("Search freshness")) {
                         Picker(L("Search freshness"), selection: bind(\.search.freshness)) {
                             Text(L("Live web search")).tag("live")
                             Text(L("Cached search index (codex)")).tag("cached")
                         }
                         .labelsHidden()
+                        .disabled(!freshnessApplies)
+                        .help(L("Only the Codex CLI can search a cached index; the other agents always search live."))
                     }
-                    FieldLabel(L("Search rounds per section")) {
-                        TextField("3", value: bind(\.search.maxRounds), format: .number)
+                }
+                // top-aligned: the checkbox is shorter than the two fields beside it
+                GridRow(alignment: .top) {
+                    FieldLabel(L("Max sections")) {
+                        TextField("8", value: bind(\.stop.maxSections), format: .number)
+                            .help(L("The team pipeline cuts the outline to this many sections."))
                     }
                     FieldLabel(L("Sources per fact")) {
                         TextField("1", value: bind(\.verification.minSourcesPerClaim), format: .number)
+                            .help(L("From 2 up, a page whose facts cite fewer sources is sent back."))
+                    }
+                    FieldLabel(L("Evidence table")) {
+                        Toggle(L("Required section"), isOn: bind(\.output.evidenceTable))
+                            .toggleStyle(.checkbox)
+                            .help(L("A page without the evidence table section is sent back."))
                     }
                 }
-                GridRow {
-                    FieldLabel(L("Conflicting sources")) {
-                        Picker(L("Conflicting sources"), selection: bind(\.verification.resolveConflicts)) {
-                            Text(L("Flag both sides as disputed")).tag("flag")
-                            Text(L("Prefer the primary source")).tag("prefer_primary")
-                            Text(L("Prefer the most recent")).tag("prefer_recent")
+            }
+            Text(pipelineNote)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            DisclosureGroup(isExpanded: $rulesExpanded) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+                        GridRow {
+                            FieldLabel(L("Search rounds per section")) {
+                                TextField("3", value: bind(\.search.maxRounds), format: .number)
+                            }
+                            FieldLabel(L("Conflicting sources")) {
+                                Picker(L("Conflicting sources"), selection: bind(\.verification.resolveConflicts)) {
+                                    Text(L("Flag both sides as disputed")).tag("flag")
+                                    Text(L("Prefer the primary source")).tag("prefer_primary")
+                                    Text(L("Prefer the most recent")).tag("prefer_recent")
+                                }
+                                .labelsHidden()
+                            }
                         }
-                        .labelsHidden()
                     }
-                    FieldLabel(L("Max sections")) {
-                        TextField("8", value: bind(\.stop.maxSections), format: .number)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Toggle(L("Prefer primary sources"), isOn: bind(\.verification.preferPrimarySources))
+                        Toggle(L("Stop a section when a search round adds nothing new"), isOn: bind(\.stop.marginalGain))
+                        Toggle(L("Cite a source on every fact"), isOn: bind(\.output.citations))
+                        Toggle(L("Mark uncertain claims as suspected"), isOn: bind(\.output.uncertainty))
                     }
+                    .toggleStyle(.checkbox)
+                }
+                .padding(.top, 8)
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(L("Research rules")).font(.callout.weight(.semibold))
+                    Text(L("Written into every brief for the agent to follow; knode does not check them."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
-            VStack(alignment: .leading, spacing: 6) {
-                Toggle(L("Prefer primary sources"), isOn: bind(\.verification.preferPrimarySources))
-                Toggle(L("Stop a section when a search round adds nothing new"), isOn: bind(\.stop.marginalGain))
-                Toggle(L("Cite a source on every fact"), isOn: bind(\.output.citations))
-                Toggle(L("Mark uncertain claims as suspected"), isOn: bind(\.output.uncertainty))
-                Toggle(L("Require an evidence table section"), isOn: bind(\.output.evidenceTable))
-            }
-            .toggleStyle(.checkbox)
         }
         .knodeCard(padding: 18)
     }
@@ -394,12 +497,30 @@ struct ResearchSettingsSection: View {
         return roles.isEmpty ? 0 : 0
     }
 
+    /// What a reviser with no rounds of its own runs: a review role's older
+    /// setting, else the config's default — `revisionRounds` on the service.
+    private var roundsFallback: Int {
+        let older = roles.filter { $0.enabled && $0.phase == "review" }.map(\.rounds).max() ?? 0
+        return older > 0 ? older : research.reviewRounds
+    }
+
+    private var rolesCaption: String {
+        switch pipeline {
+        case "single":
+            L("A single session uses none of these roles; they wait for the team or native pipeline.")
+        case "native":
+            L("The Lead writer’s session runs the job and calls the roles offered as native sub-agents; the others are not used.")
+        default:
+            L("Each role that is on runs as its own session, in phase order; turn one off to skip its phase.")
+        }
+    }
+
     private var rolesEditor: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(L("Sub-agents")).font(.headline)
-                    Text(L("One card per role. Each has its own CLI, model, effort, tools and prompt; turn a role off to skip its phase. Several roles may share a phase — review roles all run, research roles split the sections."))
+                    Text(rolesCaption)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -418,12 +539,15 @@ struct ResearchSettingsSection: View {
                     role: roleBinding(selectedIndex),
                     phaseDefaults: profile?.phaseDefaults ?? [:],
                     label: specLabel,
-                    pipeline: pinnedPipeline.isEmpty ? research.pipeline : pinnedPipeline,
+                    pipeline: pipeline,
                     researchAgent: research.agent,
                     researchers: research.researchers,
-                    reviewRounds: research.reviewRounds,
+                    roundsFallback: roundsFallback,
+                    webOff: review.external == "off",
+                    nativeFallsBack: orchestratorRuntime?.hasSubAgents == false,
                     profileReasoning: profile?.reasoning ?? ResearchProfileDetail.Reasoning(),
                     runtime: runtime,
+                    support: researchRuntime,
                     inheritedModel: inheritedModel,
                     loadModels: loadModels,
                     remove: { removeRole(id: roles[selectedIndex].id) }
@@ -478,14 +602,14 @@ struct ResearchSettingsSection: View {
     }
 
     /// The tab's second line: the phase, plus how this one role is multiplied —
-    /// sessions running at once for research, critique rounds for review.
+    /// sessions running at once for research, revision rounds for revise.
     private func phaseLabel(_ role: ResearchRole) -> String {
         switch role.phase {
         case "research":
             let fanout = role.parallel == 0 ? research.researchers : role.parallel
             return fanout > 1 ? L("research · %@ at a time", String(fanout)) : role.phase
-        case "review", "revise":
-            let rounds = role.rounds == 0 ? research.reviewRounds : role.rounds
+        case "revise":
+            let rounds = role.rounds == 0 ? roundsFallback : role.rounds
             return rounds > 1 ? L("%@ · %@ rounds", role.phase, String(rounds)) : role.phase
         default:
             return role.phase
@@ -537,6 +661,46 @@ struct ResearchSettingsSection: View {
                 dirty = true
             }
         )
+    }
+}
+
+/// What knode can hold one research session to on each runtime, read off
+/// `sessionArgs` (src/research/launch.ts) and the built-in agent
+/// (src/research/deepagents.ts). Settings greys out what a runtime takes no
+/// flag for, rather than letting it look as if it applied.
+private struct ResearchRuntime: Equatable {
+    /// "claude-cli" | "codex-cli" | "cursor-cli"; "" = the built-in agent on a model.
+    let provider: String
+
+    /// claude --max-turns; the built-in loop's recursion limit.
+    var capsTurns: Bool { provider == "claude-cli" || provider.isEmpty }
+    /// Whether a session gets knode_write or not: claude's allowed-tools list,
+    /// the built-in agent's tool list. codex and cursor see every MCP tool.
+    var scopesTools: Bool { provider == "claude-cli" || provider.isEmpty }
+    /// Read / Grep / Glob as tools to grant or withhold: claude only. codex's
+    /// sandbox and cursor always read; the built-in agent reads no files.
+    var scopesFiles: Bool { provider == "claude-cli" }
+    /// Web tools on or off per session: claude's WebSearch / WebFetch, codex's
+    /// web_search. cursor takes no switch; the built-in agent has no web tool.
+    var switchesWeb: Bool { provider == "claude-cli" || provider == "codex-cli" }
+    var hasWeb: Bool { !provider.isEmpty }
+    /// codex's web_search = live | cached.
+    var choosesFreshness: Bool { provider == "codex-cli" }
+    /// claude --agents, codex agents.<id>, deepagents' own; cursor has none.
+    var hasSubAgents: Bool { provider != "cursor-cli" }
+
+    /// Why settings are greyed out on this runtime; nil when none are.
+    @MainActor var limits: String? {
+        switch provider {
+        case "cursor-cli":
+            L("Cursor CLI takes no turn cap, tool scope or web switch from knode, so those settings are greyed out — the brief and the prompts are what steer it.")
+        case "codex-cli":
+            L("Codex CLI takes no turn cap or tool scope from knode — its sandbox keeps it read-only on disk — so those settings are greyed out.")
+        case "":
+            L("The built-in agent has no web tool and reads no files, so those settings are greyed out — it works through knode's tools only.")
+        default:
+            nil
+        }
     }
 }
 
@@ -654,24 +818,32 @@ private struct PhaseGuidance {
 ///
 /// The CLI is not chosen here. A job runs on one coding agent, picked once in
 /// the runner card above; a role that pins its own (by hand, in the YAML) says
-/// so below and can be put back.
+/// so below and can be put back. What that runtime takes no flag for is greyed
+/// out, and one line says why.
 private struct RoleCard: View {
     @Binding var role: ResearchRole
     let phaseDefaults: [String: String]
     /// A spec by the name the tables give it.
     let label: (String) -> String
-    /// The pipeline a job will really run, so the card can say whether the
-    /// native sub-agent switch means anything right now.
+    /// The pipeline a job will really run: the native sub-agent switch only
+    /// shows under `native`.
     let pipeline: String
     /// What an empty `role.agent` falls back to, so the model list is the one
     /// this role will really be asking.
     let researchAgent: String
     let researchers: Int
-    let reviewRounds: Int
+    /// What an unset Revision rounds runs (see the section's `roundsFallback`).
+    let roundsFallback: Int
+    /// The workspace's web switch is off, so no web setting here applies.
+    let webOff: Bool
+    /// The orchestrator's CLI has no sub-agents (Cursor), so native runs alone.
+    let nativeFallsBack: Bool
     /// What a role that sets no effort or speed runs at.
     let profileReasoning: ResearchProfileDetail.Reasoning
     /// The CLI a spec runs on, "" for a model (see the section's `runtime`).
     let runtime: (String) -> String
+    /// What knode can hold a spec's sessions to; nil while it names nothing.
+    let support: (String) -> ResearchRuntime?
     let inheritedModel: (String) -> String
     let loadModels: (String, Bool) async throws -> ModelListResponse
     let remove: () -> Void
@@ -688,6 +860,10 @@ private struct RoleCard: View {
         .opacity(role.enabled ? 1 : 0.55)
     }
 
+    /// What this role's runtime enforces; an agent that does not resolve
+    /// greys out nothing.
+    private var enforced: ResearchRuntime? { support(effectiveAgent) }
+
     /// What the role may touch. `native` is not a tool but a delegation: in the
     /// native pipeline one orchestrator session writes the page and calls the
     /// roles marked here as the CLI's own sub-agents, so the two roles that
@@ -695,14 +871,24 @@ private struct RoleCard: View {
     private var tools: some View {
         VStack(alignment: .leading, spacing: 6) {
             Toggle(L("Writes pages (knode_write / knode_commit)"), isOn: $role.tools.write)
+                .disabled(enforced?.scopesTools == false)
             Toggle(L("Reads files (Read / Grep / Glob)"), isOn: $role.tools.files)
-            Toggle(L("Offer to the orchestrator as a native sub-agent"), isOn: $role.native)
-                .disabled(!canBeNative)
-            Text(nativeNote)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.leading, 20)
+                .disabled(enforced?.scopesFiles == false)
+            if pipeline == "native" {
+                Toggle(L("Offer to the orchestrator as a native sub-agent"), isOn: $role.native)
+                    .disabled(!canBeNative || nativeFallsBack)
+                Text(nativeNote)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 20)
+            }
+            if let limits = enforced?.limits {
+                Text(limits)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .toggleStyle(.checkbox)
     }
@@ -713,8 +899,10 @@ private struct RoleCard: View {
         if !canBeNative {
             return L("The orchestrator writes the page itself, so this phase is never delegated.")
         }
-        let what = L("With pipeline = native, one session writes the page and calls this role through the CLI's own sub-agents (claude --agents, codex agents.<id>) instead of knode starting a session for it. Sub-agents never write pages.")
-        return pipeline == "native" ? what : what + " " + L("The pipeline is %@ right now, so this switch changes nothing.", pipeline)
+        if nativeFallsBack {
+            return L("Cursor has no sub-agents, so a native job runs as a single session.")
+        }
+        return L("One session writes the page and calls this role through the CLI's own sub-agents (claude --agents, codex agents.<id>) instead of knode starting a session for it. Sub-agents never write pages.")
     }
 
     private var advice: PhaseGuidance { .of(role.phase) }
@@ -725,7 +913,9 @@ private struct RoleCard: View {
 
     private var effectiveAgent: String { role.agent.isEmpty ? researchAgent : role.agent }
 
-    private var hasFanout: Bool { role.phase == "research" || role.phase == "review" || role.phase == "revise" }
+    /// Research is multiplied by sessions at once, revise by rounds; the
+    /// review roles all run once per round, so they carry no number.
+    private var hasFanout: Bool { role.phase == "research" || role.phase == "revise" }
 
     private var head: some View {
         HStack(spacing: 10) {
@@ -734,9 +924,6 @@ private struct RoleCard: View {
             TextField(L("Role title"), text: $role.title)
                 .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: 240)
-            Text("\(role.id) · \(role.phase)\(role.native ? " · \(L("native"))" : "")")
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.tertiary)
             Spacer()
             Button(role: .destructive) { remove() } label: { Image(systemName: "trash") }
                 .buttonStyle(.borderless)
@@ -843,17 +1030,20 @@ private struct RoleCard: View {
     private var webField: some View {
         FieldLabel(L("Web tools")) {
             Picker(L("Web tools"), selection: $role.tools.web) {
-                Text(L("Profile setting")).tag("inherit")
-                Text(L("On (within review.external)")).tag("on")
+                Text(L("Follow the profile")).tag("inherit")
+                Text(L("On (unless the workspace is off)")).tag("on")
                 Text(L("Off")).tag("off")
             }
             .labelsHidden()
+            .disabled(webOff || enforced?.switchesWeb == false)
         }
     }
 
     private var turnsField: some View {
         FieldLabel(L("Turns per session")) {
-            TextField(L("Default"), value: $role.maxTurns, format: .number)
+            TextField(L("Template's"), value: defaulted($role.maxTurns), format: .number)
+                .disabled(enforced?.capsTurns == false)
+                .help(L("Empty uses the page template's cap."))
         }
     }
 
@@ -861,14 +1051,24 @@ private struct RoleCard: View {
     private var fanoutField: some View {
         if role.phase == "research" {
             FieldLabel(L("Parallel sessions")) {
-                TextField("\(researchers)", value: $role.parallel, format: .number)
-                    .help(L("How many sections are researched at the same time. One session per section either way — the outline decides how many there are; 0 follows the runner."))
+                TextField(String(researchers), value: defaulted($role.parallel), format: .number)
+                    .help(L("How many sections are researched at the same time — one session per section either way. Empty runs %@ at a time.", String(researchers)))
             }
         } else {
-            FieldLabel(L("Rounds")) {
-                TextField("\(reviewRounds)", value: $role.rounds, format: .number)
+            FieldLabel(L("Revision rounds")) {
+                TextField(String(roundsFallback), value: defaulted($role.rounds), format: .number)
+                    .help(L("How many times a page may go back from review to this role before it is accepted or rejected. Empty allows %@.", String(roundsFallback)))
             }
         }
+    }
+
+    /// A role's 0 means "the default", so it shows as an empty field with the
+    /// default as its placeholder rather than as a literal 0.
+    private func defaulted(_ value: Binding<Int>) -> Binding<Int?> {
+        Binding(
+            get: { value.wrappedValue == 0 ? nil : value.wrappedValue },
+            set: { value.wrappedValue = max(0, $0 ?? 0) }
+        )
     }
 
     private var descriptionField: some View {

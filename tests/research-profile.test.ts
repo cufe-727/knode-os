@@ -13,7 +13,7 @@ import { claudeAgentsJson, codexAgentLayer, cursorModel, effortFor, sessionArgs,
 import { outlineFrom } from '../src/research/pipeline.js';
 import {
   activeProfile, claimSourceIssues, ensureDefaultProfiles, loadProfile, loadProfiles, normalizeProfile, normalizePromptPath, profileBrief,
-  requiredSections, rolePrompt, saveProfile, webAllowed,
+  requiredSections, revisionRounds, rolePrompt, saveProfile, webAllowed,
 } from '../src/research/profile.js';
 import { runResearchJob } from '../src/research/runner.js';
 import { templateFor } from '../src/research/templates.js';
@@ -49,6 +49,8 @@ describe('research profiles · files and normalization', () => {
     expect(profiles.get('default')!.roles.map((r) => r.id)).toEqual(['planner', 'researcher', 'synthesizer', 'critic', 'reviser']);
     expect(profiles.get('thorough')!.verification.minSourcesPerClaim).toBe(2);
     expect(profiles.get('thorough')!.roles.find((r) => r.id === 'researcher')!.parallel).toBe(5);
+    expect(profiles.get('thorough')!.roles.find((r) => r.id === 'reviser')!.rounds).toBe(2);
+    expect(profiles.get('thorough')!.roles.find((r) => r.id === 'critic')!.rounds).toBe(0);
     const config = defaultConfig();
     expect(activeProfile(dataDir, config).name).toBe('default');
     config.research.profile = 'thorough';
@@ -138,6 +140,25 @@ describe('research profiles · files and normalization', () => {
     const sections = outlineFrom('', ['## 概要', '## 关键事实', '## 来源', '## 证据表'], '宁德时代', 8);
     expect(sections.map((s) => s.title)).toEqual(['## 概要', '## 关键事实']);
     expect(outlineFrom('', ['## 概要', '## 关键事实'], 'x', 1)).toHaveLength(1);
+  });
+
+  it('counts revision rounds on the reviser, then a critic\'s older setting, then the default', () => {
+    const roles = normalizeProfile({}, 'default', '').roles;
+    const critic = roles.find((r) => r.phase === 'review')!;
+    const reviser = roles.find((r) => r.phase === 'revise')!;
+    expect(revisionRounds([critic], [reviser], 1)).toBe(1);
+    expect(revisionRounds([{ ...critic, rounds: 3 }], [reviser], 1)).toBe(3);
+    expect(revisionRounds([{ ...critic, rounds: 3 }], [{ ...reviser, rounds: 2 }], 1)).toBe(2);
+    expect(revisionRounds([critic], [], 4)).toBe(0);
+  });
+
+  it('reads an untouched seeded description as today\'s text', () => {
+    const seeded = '规划 → 并行调查 → 综合 → 评审 → 修订；推理强度与联网跟随 CLI 与 review.external 的默认值。';
+    const today = normalizeProfile({}, 'default', '').description;
+    expect(today).not.toContain('review.external');
+    expect(normalizeProfile({ description: seeded }, 'default', '').description).toBe(today);
+    expect(normalizeProfile({ description: seeded }, 'default-copy', '').description).toBe(today);
+    expect(normalizeProfile({ description: 'mine' }, 'default', '').description).toBe('mine');
   });
 });
 
@@ -366,6 +387,15 @@ claims:
     expect(cfg.research.maxTurns).toBe(25);
     expect(cfg.research.auto).toEqual({ enabled: true, dailyJobs: 2 });
     expect((await (await app.request('/api/research/profiles', { headers })).json()).active).toBe('custom');
+
+    // the workspace's web switch, which the Research tab sets; an unknown value changes nothing
+    const external = async (value: string) => {
+      await app.request('/api/config', { method: 'PUT', headers: json, body: JSON.stringify({ review: { external: value } }) });
+      return (await (await app.request('/api/config', { headers })).json()).review.external;
+    };
+    expect(await external('research')).toBe('research');
+    expect(await external('always')).toBe('research');
+    expect(await external('verify')).toBe('verify');
 
     expect((await app.request('/api/research/profiles/custom', { method: 'DELETE', headers })).status).toBe(400);
     await app.request('/api/config', { method: 'PUT', headers: json, body: JSON.stringify({ research: { profile: 'default', pipeline: 'team' } }) });

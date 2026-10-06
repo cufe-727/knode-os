@@ -76,7 +76,11 @@ export interface ResearchRole {
   tools: RoleTools;
   /** research phase: parallel sessions (0 = research.researchers). */
   parallel: number;
-  /** review / revise phases: critique → revise rounds (0 = research.reviewRounds). */
+  /**
+   * revise phase: review → revise rounds (0 = research.reviewRounds). A review
+   * role's own value is the older spelling, read only while no reviser sets
+   * one — see `revisionRounds`.
+   */
   rounds: number;
   /** Turn cap for one session (0 = derived from the template / research.maxTurns). */
   maxTurns: number;
@@ -174,7 +178,7 @@ function baseProfile(name: string, patch: Partial<Omit<ResearchProfile, 'name' |
 export const BUILTIN_PROFILES: Record<string, ResearchProfile> = {
   default: baseProfile('default', {
     title: '默认 · 团队流水线',
-    description: '规划 → 并行调查 → 综合 → 评审 → 修订；推理强度与联网跟随 CLI 与 review.external 的默认值。',
+    description: '规划 → 并行调查 → 综合 → 评审 → 修订；推理强度跟随 CLI 默认，联网跟随工作区设置。',
   }),
   quick: baseProfile('quick', {
     title: '快速 · 单会话',
@@ -193,7 +197,7 @@ export const BUILTIN_PROFILES: Record<string, ResearchProfile> = {
     verification: { minSourcesPerClaim: 2, preferPrimarySources: true, resolveConflicts: 'prefer_primary' },
     stop: { maxSections: 8, marginalGain: true },
     output: { citations: true, uncertainty: true, evidenceTable: true },
-    roles: (rs) => rs.map((r) => (r.id === 'researcher' ? { ...r, parallel: 5 } : r.id === 'critic' || r.id === 'reviser' ? { ...r, rounds: 2 } : r)),
+    roles: (rs) => rs.map((r) => (r.id === 'researcher' ? { ...r, parallel: 5 } : r.id === 'reviser' ? { ...r, rounds: 2 } : r)),
   }),
   native: baseProfile('native', {
     title: '原生子代理',
@@ -201,6 +205,15 @@ export const BUILTIN_PROFILES: Record<string, ResearchProfile> = {
     pipeline: 'native',
     reasoning: { effort: 'high', speed: 'default' },
   }),
+};
+
+/**
+ * Built-in descriptions as an earlier release seeded them. A file that still
+ * carries one, untouched, reads as today's text — the old one named a config
+ * key the Settings page no longer shows.
+ */
+const RESEEDED_DESCRIPTIONS: Record<string, string> = {
+  '规划 → 并行调查 → 综合 → 评审 → 修订；推理强度与联网跟随 CLI 与 review.external 的默认值。': BUILTIN_PROFILES.default.description,
 };
 
 /* ------------------------------------------------------------------ files */
@@ -373,7 +386,7 @@ export function normalizeProfile(raw: Record<string, unknown>, name: string, fil
     name,
     // a custom profile is its own thing: no borrowed title or description from the built-in default
     title: str(raw.title, builtin ? builtin.title : name),
-    description: str(raw.description, builtin ? builtin.description : ''),
+    description: ((d) => RESEEDED_DESCRIPTIONS[d] ?? d)(str(raw.description, builtin ? builtin.description : '')),
     pipeline: oneOf(raw.pipeline, [...PIPELINE_MODES, ''] as const, base.pipeline),
     reasoning: {
       effort: oneOf(reasoning.effort, EFFORTS, base.reasoning.effort),
@@ -471,6 +484,18 @@ export function effectiveSpeed(profile: ResearchProfile, role?: ResearchRole | n
 export function effectivePipeline(profile: ResearchProfile, config: KnodeConfig): PipelineMode {
   const fromConfig = config.research?.pipeline;
   return profile.pipeline || (fromConfig && (PIPELINE_MODES as readonly string[]).includes(fromConfig) ? (fromConfig as PipelineMode) : 'team');
+}
+
+/**
+ * How many times review → revise may go round. The revise role carries the
+ * count; a review role's own `rounds` is the older spelling, read only while
+ * no reviser sets one; then research.reviewRounds. No reviser, no rounds.
+ */
+export function revisionRounds(critics: ResearchRole[], revisers: ResearchRole[], fallback: number): number {
+  if (revisers.length === 0) return 0;
+  const own = Math.max(0, ...revisers.map((r) => r.rounds));
+  const older = Math.max(0, ...critics.map((r) => r.rounds));
+  return own || older || Math.max(0, fallback);
 }
 
 /**

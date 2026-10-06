@@ -94,7 +94,7 @@ export async function reviewClaims(
     `SELECT id, claim_id, against_id FROM disputes WHERE status = 'open' ORDER BY created_at DESC LIMIT $1`, [limit],
   )) pairs.push({ claimId: d.claim_id, againstId: d.against_id, disputeId: d.id });
   for (const c of await store.query<{ id: string }>(
-    `SELECT id FROM claims WHERE status = 'suspected' AND tx_to IS NULL AND superseded_by IS NULL ORDER BY tx_from DESC LIMIT $1`, [limit],
+    `SELECT id FROM claims WHERE status = 'suspected' AND tx_to IS NULL AND canonical_id IS NULL AND superseded_by IS NULL ORDER BY tx_from DESC LIMIT $1`, [limit],
   )) pairs.push({ claimId: c.id, againstId: null, disputeId: null });
 
   for (const pair of pairs.slice(0, limit)) {

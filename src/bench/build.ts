@@ -1,5 +1,6 @@
 import { AppContext } from '../context.js';
 import { readSidecarPart, replayableTier1 } from '../fs/sidecar.js';
+import { loadSourceText } from '../ingest/source.js';
 import { enqueueTier1, runTier1Pass, Tier1Stats } from '../graph/tier1.js';
 import { runIngest } from '../ingest/pipeline.js';
 import { generateWiki } from '../wiki/generate.js';
@@ -63,7 +64,7 @@ export async function benchBuild(ctx: AppContext, opts: BuildBenchOptions = {}):
     tier1Total.tokensUsed += pass.tokensUsed;
     tier1Total.queuedLeft = pass.queued;
     progress(`tier1 pass ${tier1Total.passes}: processed=${pass.processed} failed=${pass.failed} tokens=${pass.tokensUsed} queued=${pass.queued}`);
-    if (pass.queued === 0 || (pass.processed === 0 && pass.failed === 0)) break;
+    if (pass.queued === 0 || !pass.progressed) break;
   }
   const tier1Ms = Date.now() - tTier1;
 
@@ -115,7 +116,8 @@ async function requeueMissingTier1(ctx: AppContext): Promise<number> {
   );
   let requeued = 0;
   for (const doc of docs) {
-    const done = replayableTier1(readSidecarPart(ctx.dataDir, doc.path, 'tier1'), doc.sha256);
+    const text = loadSourceText(ctx.dataDir, doc.path, 'docs')?.text ?? '';
+    const done = replayableTier1(readSidecarPart(ctx.dataDir, doc.path, 'tier1'), doc.sha256, text.length);
     if (done) continue;
     await enqueueTier1(ctx.store, doc.id);
     requeued++;

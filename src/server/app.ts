@@ -94,6 +94,7 @@ import {
 } from '../store/queries.js';
 import { WorkspaceContextRegistry, WorkspaceScope, resolveWorkspaceScope, workspaceDataDir } from './workspaces.js';
 import { loadOrCreateMcpToken, mountMcp } from './mcp-http.js';
+import { applyClaimMerge, listClaimMerges, unmergeClaim } from '../graph/claim-merge.js';
 import { applyMerge, listMerges, unmergeEntity } from '../graph/merge.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { reviewClaims } from '../graph/claim-review.js';
@@ -150,8 +151,8 @@ type ModelConfigDraft = {
   retrieval?: { sag?: Partial<SagSearchConfig> };
   research?: Partial<Omit<ResearchConfig, 'auto' | 'init'>> & { auto?: Partial<ResearchConfig['auto']>; init?: Partial<ResearchConfig['init']> };
   chat?: Partial<ChatConfig>;
-  /** What the Judge stage does with its verdicts; the other review keys are file-only. */
-  review?: Partial<Pick<ReviewConfig, 'llmJudge' | 'claims'>>;
+  /** What the Judge stage does with its verdicts, and the workspace's web switch (Research tab); the other review keys are file-only. */
+  review?: Partial<Pick<ReviewConfig, 'llmJudge' | 'claims' | 'claimMerge' | 'external'>>;
 };
 
 /** What `serve` runs per workspace beside the routes; absent in tests and CLI-hosted apps. */
@@ -679,10 +680,13 @@ export function createApp(
         setInt('keep', 1, 500);
       }
       if (incoming.review) {
-        // the two modes the Judge stage's form sets; thresholds stay in the file
-        const { llmJudge, claims } = incoming.review;
+        // the three modes the Judge stage's form sets and the web switch on the
+        // Research tab; thresholds stay in the file
+        const { llmJudge, claims, claimMerge, external } = incoming.review;
         if (llmJudge === 'off' || llmJudge === 'suggest' || llmJudge === 'auto') next.review.llmJudge = llmJudge;
         if (claims === 'off' || claims === 'suggest') next.review.claims = claims;
+        if (claimMerge === 'off' || claimMerge === 'suggest' || claimMerge === 'auto') next.review.claimMerge = claimMerge;
+        if (external === 'off' || external === 'verify' || external === 'research') next.review.external = external;
       }
       if (incoming.retrieval?.sag) {
         const sag = incoming.retrieval.sag;
@@ -1417,7 +1421,7 @@ export function createApp(
     let applied: { applied: boolean; path?: string } = { applied: false };
     if (status === 'accepted') {
       const s = await getSuggestion(ctx.store, id);
-      if (s && (s.kind === 'pack' || s.kind === 'recipe' || s.kind === 'merge' || s.kind === 'wiki')) {
+      if (s && (s.kind === 'pack' || s.kind === 'recipe' || s.kind === 'merge' || s.kind === 'claim-merge' || s.kind === 'wiki')) {
         try {
           applied = await applySuggestion(ctx.store, ctx.dataDir, id);
         } catch (e) {
@@ -1448,6 +1452,30 @@ export function createApp(
     try {
       const { entityId } = await c.req.json<{ entityId: string }>();
       return c.json({ ok: await unmergeEntity(ctx.store, entityId, { actor: 'user' }) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  /* -------------------------- duplicate claims ---------------------------- */
+
+  app.get('/api/claims/merges', async (c) => c.json(await listClaimMerges(requestCtx(c).store)));
+
+  app.post('/api/claims/merge', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const { claimId, canonicalId, reason } = await c.req.json<{ claimId: string; canonicalId: string; reason?: string }>();
+      return c.json(await applyClaimMerge(ctx.store, { claimId, canonicalId, reason, actor: 'user' }));
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.post('/api/claims/unmerge', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const { claimId } = await c.req.json<{ claimId: string }>();
+      return c.json({ ok: await unmergeClaim(ctx.store, claimId, { actor: 'user' }) });
     } catch (e) {
       return c.json(err(e), 400);
     }
