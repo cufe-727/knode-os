@@ -19,6 +19,8 @@ export interface KnowledgeStats {
   traces: number;
   pending_suggestions: number;
   extraction_queue: number;
+  /** Extraction calls still to make for the queued documents (a long document counts its segments). */
+  extraction_segments: number;
   scopes: number;
   disposed_scopes: number;
   pages: number;
@@ -31,10 +33,11 @@ export async function knowledgeStats(store: Store): Promise<KnowledgeStats> {
            (SELECT count(*)::int FROM embeddings) AS embeddings,
            (SELECT count(*)::int FROM entities WHERE tx_to IS NULL) AS entities,
            (SELECT count(*)::int FROM relations WHERE tx_to IS NULL) AS relations,
-           (SELECT count(*)::int FROM claims WHERE tx_to IS NULL) AS claims,
+           (SELECT count(*)::int FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL) AS claims,
            (SELECT count(*)::int FROM traces) AS traces,
            (SELECT count(*)::int FROM suggestions WHERE status = 'pending') AS pending_suggestions,
            (SELECT count(*)::int FROM extraction_queue) AS extraction_queue,
+           (SELECT COALESCE(sum(GREATEST(segments_total - segments_done, 1)), 0)::int FROM extraction_queue) AS extraction_segments,
            (SELECT count(*)::int FROM scopes WHERE status = 'active') AS scopes,
            (SELECT count(*)::int FROM scopes WHERE status = 'disposed') AS disposed_scopes,
            (SELECT count(*)::int FROM pages WHERE status <> 'archived') AS pages`);

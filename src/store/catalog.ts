@@ -19,7 +19,7 @@ export const CATALOG_VIEWS: { name: string; description: string }[] = [
   { name: 'v_documents', description: 'indexed sources: path, root (docs/skills/wiki), kind (source/view), sha, status' },
   { name: 'v_entities', description: 'currently believed entities with mention and evidence counts' },
   { name: 'v_relations', description: 'currently believed typed edges with folded weight' },
-  { name: 'v_claims', description: 'currently believed claims with their world-time window and source path' },
+  { name: 'v_claims', description: 'currently believed claims with their world-time window and source path (a merged group appears once, as its representative)' },
   { name: 'v_scopes', description: 'every apply of a source, including disposed ones (applied_at / disposed_at)' },
   { name: 'v_evidence', description: 'per-source support behind each graph row, with its system-time window' },
   { name: 'v_pages', description: 'materialized wiki views and their input signatures' },
@@ -33,6 +33,7 @@ export const CATALOG_VIEWS: { name: string; description: string }[] = [
   { name: 'v_disputes', description: 'open contradictions between claims, and how they were resolved' },
   { name: 'v_worksets', description: 'pinned views for long-running tasks' },
   { name: 'v_entity_links', description: 'entities merged into a canonical one (same_as), with who decided and why' },
+  { name: 'v_claim_links', description: 'claims merged into a representative claim (same_as / contains), with who decided, why and how sure' },
   { name: 'v_research_jobs', description: 'deep-research jobs: what page was requested, which agent ran it, outcome' },
 ];
 

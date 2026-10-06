@@ -2661,6 +2661,18 @@ function addEmbeddingProvider() {
   updateConfigSummaries();
 }
 
+/** Under the Extract stage: what the background passes still have to read (a long document counts its segments). */
+async function showExtractionQueue() {
+  const el = $('#cfg-extraction-queue');
+  if (!el) return;
+  try {
+    const s = await api('/api/stats');
+    el.textContent = s.extraction_queue ? `Queue: ${s.extraction_queue} documents, ${s.extraction_segments ?? s.extraction_queue} calls left.` : '';
+  } catch {
+    el.textContent = '';
+  }
+}
+
 async function loadConfigForm({ preserveStatus = false } = {}) {
   // A workspace switch can happen while this request is in flight. Ignore a
   // response for the old workspace instead of painting its routes into the
@@ -2686,6 +2698,9 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-extraction-claims').checked = cfg.extraction?.claims !== false;
     $('#cfg-review-judge').value = cfg.review?.llmJudge ?? 'suggest';
     $('#cfg-review-claims').value = cfg.review?.claims ?? 'suggest';
+    $('#cfg-review-claim-merge').value = cfg.review?.claimMerge ?? 'auto';
+    $('#cfg-extraction-segment').textContent = (cfg.extraction?.segmentChars ?? 12000).toLocaleString('en-US');
+    void showExtractionQueue();
     $('#cfg-ingest-concurrency').value = cfg.ingest?.concurrency ?? 4;
     $('#cfg-ingest-convert').value = cfg.ingest?.convertConcurrency ?? 2;
     $('#cfg-emb-batch').value = activeEmbedding()?.batchSize ?? 32;
@@ -2758,6 +2773,7 @@ function gatherConfig() {
     review: {
       llmJudge: $('#cfg-review-judge').value,
       claims: $('#cfg-review-claims').value,
+      claimMerge: $('#cfg-review-claim-merge').value,
     },
     research: gatherResearchConfig(),
     chat: gatherChatConfig(),

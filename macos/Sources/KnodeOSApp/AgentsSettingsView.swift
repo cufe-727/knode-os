@@ -229,11 +229,12 @@ struct AgentsSettingsSection: View {
             GridRow {
                 FieldLabel(L("Web access")) {
                     Picker(L("Web access"), selection: $agents[index].tools.web) {
-                        Text(L("Follow review.external")).tag("inherit")
-                        Text(L("On (within review.external)")).tag("on")
+                        Text(L("Follow the workspace")).tag("inherit")
+                        Text(L("On (unless the workspace is off)")).tag("on")
                         Text(L("Off")).tag("off")
                     }
                     .labelsHidden()
+                    .help(L("Web access in Ask. The workspace's own switch is on the Research tab, and Off there wins."))
                 }
             }
             if needsPath(agent) {

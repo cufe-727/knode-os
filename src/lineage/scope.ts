@@ -328,6 +328,20 @@ async function revertEffect(
       if (link?.canonical_id) touched.entities.add(link.canonical_id);
       return;
     }
+    case 'claim_link.remove': {
+      const [link] = await q.query<{ canonical_id: string }>(`SELECT canonical_id FROM claim_links WHERE id = $1`, [inv.linkId]);
+      await q.query(`UPDATE claim_links SET tx_to = $2::timestamptz WHERE id = $1 AND tx_to IS NULL`, [inv.linkId, txTime]);
+      await q.query(`UPDATE claims SET canonical_id = $2 WHERE id = $1`, [inv.claimId, inv.prevCanonical]);
+      // the members it brought along go back to it, unless something else regrouped them since
+      if (link?.canonical_id && inv.regrouped.length > 0) {
+        const p = inv.regrouped.map((_, i) => `$${i + 3}`).join(',');
+        await q.query(`UPDATE claims SET canonical_id = $1 WHERE canonical_id = $2 AND id IN (${p})`, [inv.claimId, link.canonical_id, ...inv.regrouped]);
+      }
+      touched.claims.add(inv.claimId);
+      for (const id of inv.regrouped) touched.claims.add(id);
+      if (link?.canonical_id) touched.claims.add(link.canonical_id);
+      return;
+    }
     case 'page.restore': {
       if (reason === 'archived' || !inv.prev) {
         await q.query(

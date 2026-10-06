@@ -357,14 +357,15 @@
               <div class="stage-panel" data-stage="entity" hidden>
                 <div class="stage-panel-copy">
                   <div class="stage-title"><h4>Extract</h4><span class="section-badge accent2">Volume</span></div>
-                  <p>Names entities, relations and factual claims in changed documents; what it finds is checked for duplicates right away.</p>
-                  <p class="stage-req">The busiest stage — it runs on every changed document, bounded by the batch size here. A fast, cheap model that returns clean JSON is usually the right trade.</p>
+                  <p>Names entities, relations and factual claims in changed documents, a long one in segments; what it finds is checked for duplicates right away.</p>
+                  <p class="stage-req">The busiest stage — it runs on every changed document, a long one in segments, bounded by the calls per pass here. A fast, cheap model that returns clean JSON is usually the right trade.</p>
                   <div class="stage-rates">
                     <label>Parallel calls<input id="cfg-extraction-concurrency" type="number" min="1" step="1" /></label>
-                    <label>Documents per pass<input id="cfg-extraction-batch" type="number" min="1" step="1" /></label>
+                    <label>Calls per pass<input id="cfg-extraction-batch" type="number" min="1" step="1" /></label>
                     <label>Catch-up before initializing (minutes)<input id="cfg-init-maxms" type="number" min="1" max="60" step="1" /></label>
                   </div>
                   <p class="stage-req">Initializing the wiki first extracts whatever is still queued, for up to this long; the rest is left to the background passes.</p>
+                  <p class="stage-req">A document longer than <span id="cfg-extraction-segment">12,000</span> characters is read in segments, one call each; it may take several passes and is written once every segment is in. <span id="cfg-extraction-queue"></span></p>
                   <label class="cfg-check"><input id="cfg-extraction-claims" type="checkbox" /> Extract factual claims alongside entities</label>
                 </div>
                 <div class="stage-control">
@@ -379,7 +380,7 @@
                   <div class="stage-title"><h4>Summarize</h4><span class="section-badge accent2">Prose</span></div>
                   <p>Writes one summary page per document, right after it is extracted.</p>
                   <p class="stage-req">One call per document, for people to read rather than a program to parse, so it wants clean prose more than the strongest model. Changing the model does not rewrite summaries already written.</p>
-                  <p class="stage-req">Runs in Extract's background pass, with its documents per pass and parallel calls.</p>
+                  <p class="stage-req">Runs in Extract's background pass, with its calls per pass and parallel calls.</p>
                 </div>
                 <div class="stage-control">
                   <label>Run with<select id="cfg-summary-use" class="cfg-route-use"></select></label>
@@ -391,13 +392,14 @@
               <div class="stage-panel" data-stage="judge" hidden>
                 <div class="stage-panel-copy">
                   <div class="stage-title"><h4>Judge</h4><span class="section-badge accent2">Quality</span></div>
-                  <p>Answers <span class="mono">knode_ask</span> and reviews duplicate entities after each extraction pass; overnight it runs Dream and reviews disputed claims.</p>
-                  <p class="stage-req">Few calls, but each one decides something — whether two entities are one, which of two claims holds, what a week of agent sessions says — so a stronger model pays for itself. Only <span class="mono">knode_ask</span> has someone waiting on the answer.</p>
+                  <p>Answers <span class="mono">knode_ask</span> and reviews duplicate entities and claims after each extraction pass; overnight it runs Dream and reviews disputed claims.</p>
+                  <p class="stage-req">Few calls, but each one decides something — whether two entities are one, whether two claims say the same, which of two claims holds, what a week of agent sessions says — so a stronger model pays for itself. Only <span class="mono">knode_ask</span> has someone waiting on the answer.</p>
                   <div class="stage-rates">
                     <label>Duplicate entities<select id="cfg-review-judge"><option value="off">Off</option><option value="suggest">Suggest merges</option><option value="auto">Merge confident pairs</option></select></label>
                     <label>Disputed claims<select id="cfg-review-claims"><option value="off">Off</option><option value="suggest">Suggest a verdict</option></select></label>
+                    <label>Duplicate claims<select id="cfg-review-claim-merge"><option value="off">Off</option><option value="suggest">Suggest merges</option><option value="auto">Merge confident pairs</option></select></label>
                   </div>
-                  <p class="stage-req">After each extraction pass the entities it wrote are checked for duplicates, and the full graph again overnight; a merge can always be undone. Disputed claims are reviewed overnight.</p>
+                  <p class="stage-req">After each extraction pass the entities and claims it wrote are checked for duplicates, and everything again overnight; a merge can always be undone. Disputed claims are reviewed overnight.</p>
                 </div>
                 <div class="stage-control">
                   <label>Run with<select id="cfg-judge-use" class="cfg-route-use"></select></label>

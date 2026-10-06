@@ -4,6 +4,7 @@ import { AppContext } from '../context.js';
 import { DB_DIR } from '../fs/datadir.js';
 import { Sidecar } from '../fs/sidecar.js';
 import { applyExtraction } from '../graph/llm-extract.js';
+import { applyClaimMerge, unmergeClaim } from '../graph/claim-merge.js';
 import { applyMerge, unmergeEntity } from '../graph/merge.js';
 import { PageContext } from '../graph/store.js';
 import { documentIdFor } from '../ingest/apply.js';
@@ -69,6 +70,18 @@ export async function rebuild(ctx: AppContext, opts: { history?: boolean; onProg
       }
     } else if (ev.kind === 'entity.unmerge') {
       if (await unmergeEntity(store, ev.id, { actor: ev.actor, log: false })) feedbackReplayed++;
+    } else if (ev.kind === 'claim.merge') {
+      // claim merges too (docs/design/10): a merge of claims that no longer exist is skipped
+      const p = ev.payload as { canonicalId?: string; kind?: 'same_as' | 'contains'; reason?: string; confidence?: number | null } | undefined;
+      if (!p?.canonicalId) continue;
+      try {
+        await applyClaimMerge(store, { claimId: ev.id, canonicalId: p.canonicalId, kind: p.kind, reason: p.reason, confidence: p.confidence ?? null, actor: ev.actor, log: false });
+        feedbackReplayed++;
+      } catch (err) {
+        progress(`claim merge replay skipped for ${ev.id}: ${err instanceof Error ? err.message : err}`);
+      }
+    } else if (ev.kind === 'claim.unmerge') {
+      if (await unmergeClaim(store, ev.id, { actor: ev.actor, log: false })) feedbackReplayed++;
     }
   }
 

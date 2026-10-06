@@ -9,13 +9,13 @@ import { CATALOG_VIEWS } from '../src/store/catalog.js';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-schema-v7-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-describe('schema v7/v8/v10 (wiki research + review + quick answers)', () => {
+describe('schema v7/v8/v10/v11 (wiki research + review + quick answers + claim merges)', () => {
   it('adds the temporal relation / claim columns, resolution tables and research jobs, and every catalog view resolves', async () => {
     fs.mkdirSync(path.join(tmp, 'ws', '.knode'), { recursive: true });
     const store = await Store.open(path.join(tmp, 'ws'), 3);
     try {
-      expect(SCHEMA_VERSION).toBe(10);
-      expect(store.migration.to).toBe(10);
+      expect(SCHEMA_VERSION).toBe(11);
+      expect(store.migration.to).toBe(11);
       const columns = async (table: string) =>
         (await store.query<{ column_name: string }>(
           `SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1`,
@@ -31,6 +31,11 @@ describe('schema v7/v8/v10 (wiki research + review + quick answers)', () => {
       expect(await columns('research_jobs')).toEqual(expect.arrayContaining(['kind', 'template', 'status', 'output_path']));
       expect(await columns('chat_conversations')).toEqual(expect.arrayContaining(['title', 'agent', 'status', 'payload']));
       expect(await columns('chat_messages')).toEqual(expect.arrayContaining(['conversation_id', 'seq', 'role', 'content', 'events', 'payload', 'turns', 'cost_usd', 'error']));
+      expect(await columns('claims')).toContain('canonical_id');
+      expect(await columns('claim_links')).toEqual(expect.arrayContaining(['claim_id', 'canonical_id', 'kind', 'scope_id', 'confidence']));
+      expect(await columns('claim_pair_verdicts')).toEqual(expect.arrayContaining(['pair_id', 'relation', 'confidence', 'model']));
+      expect(await columns('claim_embeddings')).toEqual(expect.arrayContaining(['claim_id', 'model', 'embedding']));
+      expect(await columns('extraction_queue')).toEqual(expect.arrayContaining(['segments_total', 'segments_done']));
       for (const view of CATALOG_VIEWS) {
         await expect(store.query(`SELECT * FROM ${view.name} LIMIT 1`)).resolves.toBeDefined();
       }

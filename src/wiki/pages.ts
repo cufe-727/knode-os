@@ -127,7 +127,7 @@ const entityStub: PageGenerator = {
     }
     const claims = await ctx.store.query<{ id: string; statement: string; status: string; valid_from: string | null; valid_to: string | null; event_at: string | null; superseded_by: string | null; fold_sha: string }>(
       `SELECT id, statement, status, valid_from, valid_to, event_at, superseded_by, fold_sha FROM claims
-       WHERE subject_id = $1 AND tx_to IS NULL ORDER BY COALESCE(event_at, valid_from) DESC NULLS LAST, tx_from DESC, id LIMIT 30`,
+       WHERE subject_id = $1 AND tx_to IS NULL AND canonical_id IS NULL ORDER BY COALESCE(event_at, valid_from) DESC NULLS LAST, tx_from DESC, id LIMIT 30`,
       [id],
     );
     return {

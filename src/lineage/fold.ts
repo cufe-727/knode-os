@@ -204,18 +204,34 @@ async function foldRelations(q: Queryable, ids: string[], txTime: string, result
   }
 }
 
-async function foldClaims(q: Queryable, ids: string[], txTime: string, result: FoldResult): Promise<void> {
-  if (ids.length === 0) return;
-  const evidence = await liveEvidence(q, 'claim', ids);
+async function foldClaims(q: Queryable, touchedIds: string[], txTime: string, result: FoldResult): Promise<void> {
+  if (touchedIds.length === 0) return;
+  // a merged claim's representative folds over the whole group (docs/design/10),
+  // so touching a member refolds its representative as well
+  const p0 = new Params();
+  const ph0 = touchedIds.map((id) => p0.add(id)).join(',');
+  const reps = await q.query<{ canonical_id: string }>(
+    `SELECT DISTINCT canonical_id FROM claims WHERE id IN (${ph0}) AND canonical_id IS NOT NULL`,
+    p0.list,
+  );
+  const ids = [...new Set([...touchedIds, ...reps.map((r) => r.canonical_id)])];
   const p = new Params();
   const ph = ids.map((id) => p.add(id)).join(',');
   const current = await q.query<{
-    id: string; subject_id: string; statement: string; fold_sha: string; tx_to: string | null;
-  }>(`SELECT id, subject_id, statement, fold_sha, tx_to FROM claims WHERE id IN (${ph})`, p.list);
+    id: string; subject_id: string; statement: string; fold_sha: string; tx_to: string | null; canonical_id: string | null;
+  }>(`SELECT id, subject_id, statement, fold_sha, tx_to, canonical_id FROM claims WHERE id IN (${ph})`, p.list);
+  const p2 = new Params();
+  const ph2 = ids.map((id) => p2.add(id)).join(',');
+  const memberRows = await q.query<{ id: string; canonical_id: string }>(`SELECT id, canonical_id FROM claims WHERE canonical_id IN (${ph2})`, p2.list);
+  const members = groupBy(memberRows, (m) => m.canonical_id);
+  const evidence = await liveEvidence(q, 'claim', [...new Set([...ids, ...memberRows.map((m) => m.id)])]);
   const alive = await entityLiveness(q, [...new Set(current.map((c) => c.subject_id))]);
 
   for (const cur of current) {
-    const rows = evidence.get(cur.id) ?? [];
+    const own = members.get(cur.id) ?? [];
+    const rows = cur.canonical_id
+      ? evidence.get(cur.id) ?? []
+      : [...(evidence.get(cur.id) ?? []), ...own.flatMap((m) => evidence.get(m.id) ?? [])];
     const wasLive = cur.tx_to === null;
     const folded = foldClaimEvidence(cur, rows);
     const live = Boolean(folded) && alive.get(cur.subject_id) === true;
@@ -228,7 +244,8 @@ async function foldClaims(q: Queryable, ids: string[], txTime: string, result: F
       continue;
     }
     const f = folded!;
-    const foldSha = sha16([f.status, f.type, f.valid_from, f.valid_to, f.object_id, f.primary_scope_id, f.event_at, f.observed_at]);
+    // a representative's group size is part of what it shows (its source count)
+    const foldSha = sha16([f.status, f.type, f.valid_from, f.valid_to, f.object_id, f.primary_scope_id, f.event_at, f.observed_at, ...(own.length ? [own.length] : [])]);
     if (!wasLive) result.reopened.claims.add(cur.id);
     if (!wasLive || foldSha !== cur.fold_sha) result.changed.claims.add(cur.id);
     await q.query(

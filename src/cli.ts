@@ -14,6 +14,8 @@ import { benchExtractCompare } from './bench/extract-compare.js';
 import { benchQaGen, benchRetrieval, RetrievalMode } from './bench/qa.js';
 import { runSourceQuery } from './datasource/execute.js';
 import { graphInsights, graphOverview, graphSearch } from './graph/query.js';
+import { applyClaimMerge, listClaimMerges, unmergeClaim } from './graph/claim-merge.js';
+import { auditDuplicateClaims } from './graph/claim-dedupe.js';
 import { applyMerge, listMerges, unmergeEntity } from './graph/merge.js';
 import { auditDuplicateEntities } from './graph/dedupe.js';
 import { reviewClaims } from './graph/claim-review.js';
@@ -30,6 +32,7 @@ import { recommendWikiTopics, refreshRecommendations } from './research/recommen
 import { launchArgs } from './research/launch.js';
 import { loadProfile, loadProfiles, profileYaml } from './research/profile.js';
 import { runDocumentPass } from './ingest/background.js';
+import { requeueFailedExtractions } from './graph/tier1.js';
 import { sync } from './ingest/sync.js';
 import { historyOf, lineageOf } from './lineage/inspect.js';
 import { forgetSource, purgeArchived, purgeDisposed } from './lineage/purge.js';
@@ -136,17 +139,19 @@ program
 
 program
   .command('extract')
-  .description('run one background document pass: extract a batch from the priority queue (heat × freshness × importance), audit the entities it wrote for duplicates, write summary pages')
-  .option('--batch <n>', 'max documents this pass (extracted and summarized)')
+  .description('run one background document pass: extraction calls from the priority queue (heat × freshness × importance; long documents in segments), the duplicate audits over the entities and claims it wrote, summary pages')
+  .option('--batch <n>', 'max extraction calls (and summaries) this pass')
   .option('--concurrency <n>', 'parallel LLM calls')
+  .option('--retry-failed', 'first re-queue documents with segments that failed repeatedly, so they are tried again')
   .action(async (opts) => {
     const ctx = await createContext(dataDir());
-    const { touched, documents, resolve, summaries, ...stats } = await runDocumentPass(ctx, {
+    if (opts.retryFailed) console.log(`re-queued ${await requeueFailedExtractions(ctx.store, ctx.config)} document(s) with failed segments`);
+    const { touched, touchedClaims, documents, resolve, claims, summaries, ...stats } = await runDocumentPass(ctx, {
       batchSize: opts.batch ? Number(opts.batch) : undefined,
       concurrency: opts.concurrency ? Number(opts.concurrency) : undefined,
       onProgress: (m) => console.log(`  ${m}`),
     });
-    console.log(JSON.stringify({ ...stats, entitiesTouched: touched.length, documents, resolve, summaries }, null, 2));
+    console.log(JSON.stringify({ ...stats, entitiesTouched: touched.length, claimsTouched: touchedClaims.length, documents, resolve, claims, summaries }, null, 2));
     await ctx.datasources.closeAll();
     await ctx.store.close();
   });
@@ -1261,6 +1266,57 @@ reviewCmd
     const ctx = await createContext(dataDir());
     try {
       console.log(JSON.stringify(await reviewClaims(ctx, { onProgress: (m) => console.log(`  ${m}`), limit: Number(opts.limit) }), null, 2));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+
+const claimCmd = program.command('claim').description('duplicate claims (docs/design/10): merge one wording into another, undo merges, run the duplicate-claim audit');
+claimCmd
+  .command('merge <claim> <into>')
+  .description('record that <claim> states the same as <into>; reads show <into> with both sources, evidence is untouched, reversible with unmerge')
+  .option('--reason <text>', 'why (kept on the link and in the ledger)')
+  .option('--actor <name>', 'who decided', 'user')
+  .action(async (claim: string, into: string, opts: { reason?: string; actor: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log(JSON.stringify(await applyClaimMerge(ctx.store, { claimId: claim, canonicalId: into, reason: opts.reason, actor: opts.actor }), null, 2));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+claimCmd
+  .command('unmerge <claim>')
+  .description('undo a claim merge (disposes the claim-merge scope; the claim stands on its own again)')
+  .option('--actor <name>', 'who decided', 'user')
+  .action(async (claim: string, opts: { actor: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log((await unmergeClaim(ctx.store, claim, { actor: opts.actor })) ? 'unmerged' : 'no live merge for that claim');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+claimCmd
+  .command('merges')
+  .description('list live claim merges')
+  .action(async () => {
+    const ctx = await createContext(dataDir());
+    try {
+      for (const m of await listClaimMerges(ctx.store)) {
+        console.log(`${m.claimId} → ${m.canonicalId}  [${m.subject}] ${m.statement}  ⇒  ${m.canonicalStatement}  (${m.actor ?? '?'}${m.confidence !== null ? ` ${m.confidence.toFixed(2)}` : ''}: ${m.reason || '-'})`);
+      }
+    } finally {
+      await ctx.store.close();
+    }
+  });
+claimCmd
+  .command('dedupe')
+  .description('compare every claim with the other claims of its subject now and merge / suggest / flag (normally after each extraction pass and nightly)')
+  .action(async () => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log(JSON.stringify(await auditDuplicateClaims(ctx, { onProgress: (m) => console.log(`  ${m}`) }), null, 2));
     } finally {
       await ctx.store.close();
     }

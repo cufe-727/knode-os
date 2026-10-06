@@ -760,6 +760,55 @@ const V10_CHAT_QUICK = `
 ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}';
 `;
 
+// Long documents and duplicate claims (docs/design/10). The extraction queue
+// counts a document's segments for progress; a claim merged into another
+// points at its representative through canonical_id, recorded (and undone)
+// by a claim-merge scope through claim_links, exactly like entity merges; the
+// duplicate-claim audit remembers every pair it judged.
+const V11_CLAIM_MERGE = `
+ALTER TABLE extraction_queue ADD COLUMN IF NOT EXISTS segments_total INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE extraction_queue ADD COLUMN IF NOT EXISTS segments_done INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS canonical_id TEXT;
+CREATE INDEX IF NOT EXISTS claims_canonical_idx ON claims (canonical_id) WHERE canonical_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS claim_links (
+  id           TEXT PRIMARY KEY,
+  claim_id     TEXT NOT NULL,
+  canonical_id TEXT NOT NULL,
+  kind         TEXT NOT NULL DEFAULT 'same_as',
+  scope_id     TEXT,
+  actor        TEXT,
+  reason       TEXT NOT NULL DEFAULT '',
+  confidence   REAL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  tx_to        TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS claim_links_claim_idx ON claim_links (claim_id) WHERE tx_to IS NULL;
+CREATE TABLE IF NOT EXISTS claim_pair_verdicts (
+  pair_id    TEXT PRIMARY KEY,
+  a_id       TEXT NOT NULL,
+  b_id       TEXT NOT NULL,
+  relation   TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0,
+  reason     TEXT NOT NULL DEFAULT '',
+  model      TEXT,
+  judged_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- the catalog shows a merged group once, as its representative
+CREATE OR REPLACE VIEW v_claims AS
+  SELECT cl.id, cl.subject_id, cl.object_id, cl.type, cl.statement, cl.status,
+         cl.valid_from, cl.valid_to, cl.evidence_count, cl.tx_from,
+         s.key AS source_path, cl.event_at, cl.observed_at, cl.superseded_by
+  FROM claims cl
+  LEFT JOIN scopes s ON s.id = cl.primary_scope_id
+  WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL;
+
+CREATE OR REPLACE VIEW v_claim_links AS
+  SELECT l.id, l.claim_id, l.canonical_id, l.kind, l.actor, l.reason, l.confidence, l.created_at
+  FROM claim_links l WHERE l.tx_to IS NULL;
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -788,6 +837,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 8, name: 'review', up: async (q) => execScript(q, V8_REVIEW) },
   { version: 9, name: 'chat', up: async (q) => execScript(q, V9_CHAT) },
   { version: 10, name: 'chat-quick', up: async (q) => execScript(q, V10_CHAT_QUICK) },
+  { version: 11, name: 'claim-merge', up: async (q) => execScript(q, V11_CLAIM_MERGE) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

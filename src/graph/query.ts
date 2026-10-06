@@ -90,7 +90,7 @@ export async function claimsForEntities(store: Store, subjectIds: string[], limi
      JOIN entities se ON se.id = cl.subject_id
      LEFT JOIN entities oe ON oe.id = cl.object_id
      LEFT JOIN scopes s ON s.id = cl.primary_scope_id
-     WHERE cl.subject_id IN (${ph}) AND ${live('cl', p)} AND ${validOverlap('cl', p, t)} AND cl.superseded_by IS NULL
+     WHERE cl.subject_id IN (${ph}) AND ${live('cl', p)} AND ${validOverlap('cl', p, t)} AND cl.superseded_by IS NULL AND cl.canonical_id IS NULL
        AND ${evidenceFilterSql('cl.id', 'claim', p, f, null)}
      ORDER BY cl.tx_from DESC
      LIMIT ${lim}`,

@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { applyClaimMerge } from '../graph/claim-merge.js';
 import { applyMerge } from '../graph/merge.js';
 import { queueJob } from '../research/jobs.js';
 import { ResearchKind } from '../research/templates.js';
@@ -146,6 +147,13 @@ export async function applySuggestion(
     const kind = (p.kind ?? 'entity') as ResearchKind;
     const { job } = await queueJob(store, kind === 'question' ? { kind, query: p.target, requestedBy: 'suggestion' } : { kind, target: p.target, requestedBy: 'suggestion' });
     return { applied: true, job: { id: job.id, kind: job.kind } };
+  }
+  if (s.kind === 'claim-merge') {
+    // a duplicate-claim proposal (docs/design/10): accepting records the reversible link
+    const p = s.payload as { claimId?: string; canonicalId?: string; kind?: 'same_as' | 'contains'; reason?: string; confidence?: number } | null;
+    if (!p?.claimId || !p?.canonicalId) return { applied: false };
+    const r = await applyClaimMerge(store, { claimId: p.claimId, canonicalId: p.canonicalId, kind: p.kind, reason: p.reason ?? `suggestion ${id}`, confidence: p.confidence ?? null, actor: 'user' });
+    return { applied: true, merged: { entityId: r.claimId, canonicalId: r.canonicalId } };
   }
   if (s.kind === 'merge') {
     // a duplicate-entity proposal: accepting records the reversible link

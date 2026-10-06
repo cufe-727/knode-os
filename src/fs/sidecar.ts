@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { LEGACY_EXTRACT_CHARS, SEGMENTER_VERSION } from '../constants.js';
 import { safePath } from './files.js';
 import { SIDECAR_ROOT, sidecarRelFor } from './layout.js';
 
@@ -65,6 +66,8 @@ export interface SidecarEntity {
   description?: string;
   aliases?: string[];
   sameAs?: string | null;
+  /** Segments of a long document it was extracted from. */
+  segments?: number[];
 }
 
 export interface SidecarRelation {
@@ -86,6 +89,33 @@ export interface SidecarClaim {
   endDate?: string | null;
   /** When the asserted event happened (as opposed to the window the statement holds for). */
   eventDate?: string | null;
+  /** Segment of a long document it was extracted from. */
+  segment?: number;
+}
+
+/**
+ * One segment of a long document (docs/design/10): its own extraction, kept
+ * under the hash of its text so an edit re-extracts only the segments it
+ * changed and an interrupted document resumes where it stopped.
+ */
+export interface SidecarSegment {
+  i: number;
+  sha: string;
+  /** Character offsets into the document text. */
+  start: number;
+  end: number;
+  heading?: string | null;
+  /** 'failed' with `attempts` below the retry limit is retried by a later pass. */
+  status: 'done' | 'failed';
+  attempts?: number;
+  entities: SidecarEntity[];
+  relations: SidecarRelation[];
+  claims: SidecarClaim[];
+  /** First segment only: the entity the whole document is mainly about, null when it covers many. */
+  subject?: { name: string; type: string } | null;
+  model: string;
+  extractedAt: string;
+  error?: string;
 }
 
 export interface SidecarTier0 {
@@ -99,7 +129,9 @@ export interface SidecarTier0 {
 }
 
 export interface SidecarTier1 {
-  status: 'pending' | 'done' | 'failed';
+  /** 'partial': segments of the current content are still pending (not replayable). */
+  status: 'pending' | 'partial' | 'done' | 'failed';
+  /** The document-level result (segments merged); what a replay applies. */
   entities: SidecarEntity[];
   relations: SidecarRelation[];
   claims?: SidecarClaim[];
@@ -108,6 +140,12 @@ export interface SidecarTier1 {
   contentSha: string;
   extractedAt: string;
   error?: string;
+  /** Version of the segment cutter (SEGMENTER_VERSION); absent = one call over the first LEGACY_EXTRACT_CHARS. */
+  segmenter?: number;
+  /** Per-segment results of a document longer than one call (absent for a single-call document). */
+  segments?: SidecarSegment[];
+  /** Segments given up on after repeated failures; the rest was written. */
+  failedSegments?: number[];
 }
 
 export interface SidecarUsage {
@@ -400,8 +438,23 @@ export function clearSourceSummaryFailure(dataDir: string, key: string): void {
  * Tier-1 extraction that can be replayed for free: status is done and the
  * content hash still matches. Shared by ingest replay and the tier-1 queue.
  */
-export function replayableTier1(t1: SidecarTier1 | null | undefined, contentSha: string): SidecarTier1 | null {
-  return t1 && t1.status === 'done' && t1.contentSha === contentSha ? t1 : null;
+/**
+ * A tier-1 result that can be applied without calling a model: finished, for
+ * this content, and covering the whole document — written by the segmented
+ * extractor, or by the old single call for a document that fit in it.
+ */
+export function replayableTier1(t1: SidecarTier1 | null | undefined, contentSha: string, textChars: number): SidecarTier1 | null {
+  if (!t1 || t1.status !== 'done' || t1.contentSha !== contentSha) return null;
+  if (t1.segmenter === SEGMENTER_VERSION) return t1;
+  return textChars <= LEGACY_EXTRACT_CHARS ? t1 : null;
+}
+
+/**
+ * A finished single-call extraction of a document longer than that call read
+ * (written before segmented extraction): it has to be extracted again.
+ */
+export function truncatedTier1(t1: SidecarTier1 | null | undefined, contentSha: string, textChars: number): boolean {
+  return Boolean(t1 && t1.status === 'done' && t1.contentSha === contentSha && t1.segmenter === undefined && textChars > LEGACY_EXTRACT_CHARS);
 }
 
 export function emptyUsage(now = new Date().toISOString()): SidecarUsage {

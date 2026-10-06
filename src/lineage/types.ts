@@ -5,7 +5,7 @@
  * explicit *effect* carrying its own inverse.
  */
 
-export type ScopeKind = 'doc' | 'wiki-human' | 'tier1' | 'page' | 'datasource' | 'dataset' | 'dream' | 'absence' | 'merge' | 'lint';
+export type ScopeKind = 'doc' | 'wiki-human' | 'tier1' | 'page' | 'datasource' | 'dataset' | 'dream' | 'absence' | 'merge' | 'claim-merge' | 'lint';
 export type ScopeStatus = 'applying' | 'active' | 'disposed';
 export type DisposeReason = 'removed' | 'replaced' | 'archived' | 'purge';
 
@@ -80,13 +80,15 @@ export type InverseSpec =
   | { op: 'file.restore'; path: string; blob: string }
   | { op: 'region.restore'; path: string; region: string; prev: string | null }
   | { op: 'entity_link.remove'; linkId: string; entityId: string; prevCanonical: string | null }
+  /** `regrouped`: members of the merged claim that were moved onto the new representative with it. */
+  | { op: 'claim_link.remove'; linkId: string; claimId: string; prevCanonical: string | null; regrouped: string[] }
   | { op: 'noop' };
 
 export type FsOp =
   | { op: 'write'; path: string; content: string }
   | { op: 'region'; path: string; region: string; content: string };
 
-export type EffectKind = 'wiki_path' | 'row_upsert' | 'enqueue' | 'suggestion' | 'dep' | 'page' | 'file_write' | 'region_write' | 'entity_link';
+export type EffectKind = 'wiki_path' | 'row_upsert' | 'enqueue' | 'suggestion' | 'dep' | 'page' | 'file_write' | 'region_write' | 'entity_link' | 'claim_link';
 
 /** Structured provenance reference carried by suggestions / pages instead of verbatim copies. */
 export interface EvidenceRef {

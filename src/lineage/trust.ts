@@ -190,6 +190,8 @@ export async function detectDisputes(store: Store, scopeId: string): Promise<Dis
      FROM evidence ev
      JOIN claims a ON a.id = ev.target_id AND ev.kind = 'claim'
      JOIN claims b ON b.subject_id = a.subject_id AND b.type = a.type AND b.id <> a.id
+       -- two wordings of one fact (a merged claim group) are not a contradiction
+       AND COALESCE(b.canonical_id, b.id) <> COALESCE(a.canonical_id, a.id)
      WHERE ev.scope_id = $1 AND ev.tx_to IS NULL AND a.tx_to IS NULL AND b.tx_to IS NULL
        AND a.statement <> b.statement
        AND a.status <> 'absent' AND b.status <> 'absent'
