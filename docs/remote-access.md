@@ -76,13 +76,21 @@ authentication. Requests through the tunnel count as coming from another machine
 the edge reports HTTPS, and each account may use only its `remoteApis` groups.
 
 **An SSH tunnel.** The app's **SSH tunnel** mode takes:
-- a destination: `user@host`, or a Host alias from `~/.ssh/config`
-- the SSH port
+- a destination: `user@host`, or a Host alias selected from the Mac's `~/.ssh/config` (including `Include` files)
+- an optional SSH port override; leave it empty to use the host's config, or SSH's default of 22
 - the knode-os port on that machine (12000)
-- optionally, an identity file
+- optionally, an identity file override; leave it empty to use the host's config or ssh-agent
+
+The host menu reloads when the connection dialog opens, and its refresh button rereads the files. It lists literal
+aliases, omitting wildcard and negated patterns. Selecting an alias clears the optional overrides so OpenSSH can
+use that host's `User`, `HostName`, `Port`, `IdentityFile`, `ProxyJump` and other settings. The app only reads config
+text to discover names; it does not run `Match exec` commands or open private key files during discovery.
 
 The app keeps `ssh -N -L 127.0.0.1:<free port>:127.0.0.1:<port>` running for you. It runs ssh in batch mode, so it
-never asks for a password. Use a key that ssh-agent or the Keychain holds. Connect once in Terminal first, so the
+never asks for a password. It disables connection multiplexing and backgrounding for its own tunnel, even if
+`ControlMaster`, `ControlPersist` or `ForkAfterAuthentication` are enabled in your config. This keeps the process
+and forward owned by the app; other SSH sessions are unaffected. Use the port the remote service actually listens
+on — it can differ from the bundled local service's 9100. Use a key that ssh-agent or the Keychain holds. Connect once in Terminal first, so the
 host key is known. To the server, a tunnelled request comes from its own machine. It still needs an account, and is
 not limited to `remoteApis`: whoever can SSH into the machine is trusted with it already.
 

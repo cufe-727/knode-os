@@ -29,7 +29,7 @@ struct ConnectionSettings: Codable, Equatable {
     var remoteURL = ""
     /// `user@host`, or a Host alias from ~/.ssh/config.
     var sshDestination = ""
-    /// SSH port when not 22 (and not set in ~/.ssh/config).
+    /// Explicit SSH port override; nil lets OpenSSH read ~/.ssh/config.
     var sshPort: Int?
     /// The address at which the app runs the service bundled inside it when
     /// nothing answers. Any other local URL is a service managed elsewhere (the
@@ -53,7 +53,9 @@ struct ConnectionSettings: Codable, Equatable {
         switch mode {
         case .local: "local|\(Self.trimmed(localURL))"
         case .remote: "remote|\(Self.trimmed(remoteURL))"
-        case .ssh: "ssh|\(sshDestination.trimmingCharacters(in: .whitespaces)):\(sshPort ?? 22)|\(sshRemotePort)"
+        // An inherited port can be different from an explicit 22. Version the
+        // key so legacy sessions, which conflated them, require a fresh sign-in.
+        case .ssh: "ssh-v2|\(sshDestination.trimmingCharacters(in: .whitespacesAndNewlines)):\(sshPort.map(String.init) ?? "config")|\(sshRemotePort)"
         }
     }
 
@@ -84,9 +86,14 @@ final class SSHTunnel {
     private var stderrText = ""
     private let lock = NSLock()
     private(set) var localPort: Int?
-    private(set) var key: String?
+    private var configuration: ConnectionSettings?
 
     var isRunning: Bool { process?.isRunning == true }
+
+    var exitStatus: Int32? {
+        guard let process, !process.isRunning else { return nil }
+        return process.terminationStatus
+    }
 
     /// What ssh said on stderr, last line first matters most.
     var lastError: String {
@@ -99,30 +106,15 @@ final class SSHTunnel {
     /// Start (or keep) the tunnel for these settings; returns the local port.
     @discardableResult
     func start(_ settings: ConnectionSettings) throws -> Int {
-        let destination = settings.sshDestination.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !destination.isEmpty else { throw APIError(message: "Enter the SSH destination, e.g. you@mac-mini.local") }
-        guard !destination.hasPrefix("-"), !destination.contains(" ") else { throw APIError(message: "That is not an SSH destination") }
-        guard (1...65_535).contains(settings.sshRemotePort) else { throw APIError(message: "The service port must be 1–65535") }
-        if isRunning, key == settings.identity, let localPort { return localPort }
+        // Validate before stopping an existing tunnel.
+        _ = try Self.arguments(for: settings, localPort: 1)
+        if isRunning, configuration == settings, let localPort { return localPort }
         stop()
 
         let port = try Self.freeLocalPort()
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        var args = [
-            "-N", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-            "-L", "127.0.0.1:\(port):127.0.0.1:\(settings.sshRemotePort)",
-        ]
-        if let sshPort = settings.sshPort, sshPort != 22 { args += ["-p", String(sshPort)] }
-        let identity = (settings.sshIdentityFile as NSString).expandingTildeInPath.trimmingCharacters(in: .whitespaces)
-        if !identity.isEmpty { args += ["-i", identity, "-o", "IdentitiesOnly=yes"] }
-        args += ["--", destination]
-        task.arguments = args
+        task.arguments = try Self.arguments(for: settings, localPort: port)
         let pipe = Pipe()
         task.standardError = pipe
         task.standardOutput = FileHandle.nullDevice
@@ -147,8 +139,38 @@ final class SSHTunnel {
         process = task
         errorPipe = pipe
         localPort = port
-        key = settings.identity
+        configuration = settings
         return port
+    }
+
+    static func arguments(for settings: ConnectionSettings, localPort: Int) throws -> [String] {
+        let destination = settings.sshDestination.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !destination.isEmpty else { throw APIError(message: "Enter the SSH destination, e.g. you@mac-mini.local") }
+        guard !destination.hasPrefix("-"), !destination.contains(where: { $0.isWhitespace || $0.isNewline }) else { throw APIError(message: "That is not an SSH destination") }
+        guard (1...65_535).contains(settings.sshRemotePort) else { throw APIError(message: "The service port must be 1–65535") }
+        if let port = settings.sshPort, !(1...65_535).contains(port) { throw APIError(message: "The SSH port must be 1–65535") }
+        var args = [
+            "-N", "-T",
+            // Own the foreground process and its forward. A multiplexed client
+            // can exit 0 immediately after handing the forward to a shared
+            // master; ControlPersist / -f can also leave an unowned background
+            // process. Keep all host, authentication and ProxyJump settings.
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
+            "-o", "ControlPersist=no",
+            "-o", "ForkAfterAuthentication=no",
+            "-o", "BatchMode=yes",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-L", "127.0.0.1:\(localPort):127.0.0.1:\(settings.sshRemotePort)",
+        ]
+        if let sshPort = settings.sshPort { args += ["-p", String(sshPort)] }
+        let identity = (settings.sshIdentityFile.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
+        if !identity.isEmpty { args += ["-i", identity, "-o", "IdentitiesOnly=yes"] }
+        args += ["--", destination]
+        return args
     }
 
     func stop() {
@@ -157,7 +179,7 @@ final class SSHTunnel {
         if let process, process.isRunning { process.terminate() }
         process = nil
         localPort = nil
-        key = nil
+        configuration = nil
     }
 
     /// A port nothing listens on, from the system: the forward binds it on loopback only.

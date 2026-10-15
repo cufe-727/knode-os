@@ -13,6 +13,11 @@ let package = Package(
             path: "Sources/KnodeOSApp",
             resources: [.copy("Resources")]
         ),
+        .testTarget(
+            name: "KnodeOSAppTests",
+            dependencies: ["KnodeOSApp"],
+            path: "Tests/KnodeOSAppTests"
+        ),
     ],
     swiftLanguageModes: [.v5]
 )

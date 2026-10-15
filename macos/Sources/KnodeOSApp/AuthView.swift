@@ -10,19 +10,25 @@ struct AuthView: View {
     @State private var isWorking = false
     @State private var showingConnection = false
 
+    private var connected: Bool {
+        if case .connected = model.connectionState { return model.authInfo != nil }
+        return false
+    }
+    private var checking: Bool { model.connectionState == .checking }
+
     /// The service has no accounts and this Mac may make the first one.
-    private var setupHere: Bool { model.authInfo?.setupRequired == true && model.authInfo?.canSetup == true }
+    private var setupHere: Bool { connected && model.authInfo?.setupRequired == true && model.authInfo?.canSetup == true }
     /// The service has no accounts, and they are made on its own machine.
-    private var setupElsewhere: Bool { model.authInfo?.setupRequired == true && model.authInfo?.canSetup != true }
+    private var setupElsewhere: Bool { connected && model.authInfo?.setupRequired == true && model.authInfo?.canSetup != true }
 
     var body: some View {
         AuthShell {
             VStack(alignment: .leading, spacing: 22) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Eyebrow(text: setupHere ? L("First run") : L("Welcome back"))
-                    Text(setupHere ? L("Create the administrator") : setupElsewhere ? L("This service has no accounts") : L("Sign in to knode-os"))
+                    Eyebrow(text: !connected ? L("Connection") : setupHere ? L("First run") : L("Welcome back"))
+                    Text(!connected ? (checking ? L("Connecting…") : L("Connection unavailable")) : setupHere ? L("Create the administrator") : setupElsewhere ? L("This service has no accounts") : L("Sign in to knode-os"))
                         .font(.system(size: 30, weight: .bold))
-                    Text(setupHere
+                    Text(!connected ? L("Connect to your knode-os service to sign in. Check the destination and the service port if the connection fails.") : setupHere
                         ? L("The first account, made here on the machine knode-os runs on, administers it: settings, users and gateways.")
                         : setupElsewhere
                             ? L("The administrator is created on the machine knode-os runs on: run `knode-os user add <name> --admin` there, or open knode-os on it. Then sign in here.")
@@ -42,7 +48,12 @@ struct AuthView: View {
                     trustBox(prompt)
                 }
 
-                if !setupElsewhere {
+                if !connected {
+                    Button(L("Retry connection")) { Task { await model.checkConnection(startBundled: true) } }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.knodeCyan)
+                        .disabled(checking)
+                } else if !setupElsewhere {
                     VStack(alignment: .leading, spacing: 14) {
                         LabeledContent(L("Username")) {
                             TextField(setupHere ? L("e.g. admin") : L("Your username"), text: $username)
@@ -105,6 +116,11 @@ struct AuthView: View {
         .onAppear {
             if username.isEmpty { username = model.currentUser?.username ?? "" }
         }
+        .onChange(of: model.connection.identity) { _, _ in
+            password = ""
+            confirmation = ""
+            error = ""
+        }
         .sheet(isPresented: $showingConnection) {
             ConnectionSheet(isPresented: $showingConnection)
                 .environmentObject(model)
@@ -122,6 +138,7 @@ struct AuthView: View {
                 Text(model.serverURLString).font(.callout.monospaced()).lineLimit(1)
                 if case .unavailable(let message) = model.connectionState {
                     Text(message).font(.caption).foregroundStyle(Color.knodeBad).lineLimit(3)
+                        .textSelection(.enabled).help(message)
                 } else {
                     Text(ConnectionSheet.modeTitle(model.connection.mode)).font(.caption).foregroundStyle(.secondary)
                 }
@@ -181,6 +198,8 @@ struct ConnectionSheet: View {
     @State private var draft = ConnectionSettings()
     @State private var sshPortText = ""
     @State private var remotePortText = "9100"
+    @State private var hosts = SSHConfig.Hosts()
+    @State private var loadingHosts = false
 
     static func modeTitle(_ mode: ConnectionMode) -> String {
         switch mode {
@@ -192,73 +211,162 @@ struct ConnectionSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 6) {
                 Eyebrow(text: L("Connection"))
-                Text(L("Where is knode-os?")).font(.title.bold())
+                Text(L("Where is knode-os?")).font(.title2.bold())
                 Text(L("A session belongs to one service: connecting to another asks you to sign in there."))
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            Picker("", selection: $draft.mode) {
-                ForEach(ConnectionMode.allCases) { mode in Text(Self.modeTitle(mode)).tag(mode) }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Picker(L("Connection"), selection: $draft.mode) {
+                ForEach(ConnectionMode.allCases) { mode in
+                    Text(mode == .remote ? "HTTPS" : Self.modeTitle(mode)).tag(mode)
+                }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
 
-            Form {
-                switch draft.mode {
-                case .local:
-                    TextField(L("Service URL"), text: $draft.localURL, prompt: Text("http://127.0.0.1:9100"))
-                    Text(L("At the default address, http://127.0.0.1:9100, the app starts the service bundled inside it when nothing answers. Any other address is a service run elsewhere, such as a LaunchAgent."))
-                        .font(.caption).foregroundStyle(.secondary)
-                case .remote:
-                    TextField(L("Service URL"), text: $draft.remoteURL, prompt: Text("https://knode.example.com"))
-                    Text(L("A domain in front of the service (Cloudflare Tunnel), or the address of its HTTPS listener (server.tls), e.g. https://192.168.1.20:12443. A self-signed certificate is shown to you to trust on first connect."))
-                        .font(.caption).foregroundStyle(.secondary)
-                    if !draft.pinnedCertificates.isEmpty {
-                        ForEach(draft.pinnedCertificates.keys.sorted(), id: \.self) { key in
-                            HStack {
-                                VStack(alignment: .leading) {
-                                    Text(L("Trusted certificate for %@", key)).font(.caption)
-                                    Text(draft.pinnedCertificates[key] ?? "").font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Button(L("Forget")) { draft.pinnedCertificates[key] = nil }
-                            }
-                        }
-                    }
-                case .ssh:
-                    TextField(L("SSH destination"), text: $draft.sshDestination, prompt: Text("you@mac-mini.local"))
-                    TextField(L("SSH port"), text: $sshPortText, prompt: Text("22"))
-                    TextField(L("knode-os port on that machine"), text: $remotePortText, prompt: Text("9100"))
-                    TextField(L("Identity file (optional)"), text: $draft.sshIdentityFile, prompt: Text("~/.ssh/id_ed25519"))
-                    Text(L("The app runs ssh -L to that machine's loopback and keeps it open. It never asks for a password: use a key in ssh-agent or the Keychain, and connect once in Terminal so the host key is known. Host aliases from ~/.ssh/config work."))
-                        .font(.caption).foregroundStyle(.secondary)
+            // Give the sheet an explicit viewport. Grouped Form's intrinsic
+            // width and height used to push the header and picker out of bounds.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    connectionFields
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(18)
             }
-            .formStyle(.grouped)
+            .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 12))
 
             HStack {
                 Spacer()
                 Button(L("Cancel")) { isPresented = false }
-                Button(L("Connect")) {
-                    var next = draft
-                    next.sshPort = Int(sshPortText.trimmingCharacters(in: .whitespaces))
-                    next.sshRemotePort = Int(remotePortText.trimmingCharacters(in: .whitespaces)) ?? 9100
-                    model.applyConnection(next)
-                    isPresented = false
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.knodeCyan)
-                .keyboardShortcut(.defaultAction)
+                    .keyboardShortcut(.cancelAction)
+                Button(L("Connect"), action: connect)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.knodeCyan)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(draft.mode == .ssh && (draft.sshDestination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sshValidationError != nil))
             }
         }
-        .padding(26)
-        .frame(width: 560)
-        .onAppear {
+        .padding(24)
+        .frame(minWidth: 560, idealWidth: 620, maxWidth: 760, minHeight: 400, idealHeight: 560, maxHeight: 680)
+        .task {
             draft = model.connection
             sshPortText = draft.sshPort.map(String.init) ?? ""
             remotePortText = String(draft.sshRemotePort)
+            await reloadHosts()
         }
+    }
+
+    @ViewBuilder
+    private var connectionFields: some View {
+        switch draft.mode {
+        case .local:
+            field(L("Service URL"), text: $draft.localURL, prompt: "http://127.0.0.1:9100")
+            explanation(L("At the default address, http://127.0.0.1:9100, the app starts the service bundled inside it when nothing answers. Any other address is a service run elsewhere, such as a LaunchAgent."))
+        case .remote:
+            field(L("Service URL"), text: $draft.remoteURL, prompt: "https://knode.example.com")
+            explanation(L("A domain in front of the service (Cloudflare Tunnel), or the address of its HTTPS listener (server.tls), e.g. https://192.168.1.20:12443. A self-signed certificate is shown to you to trust on first connect."))
+            ForEach(draft.pinnedCertificates.keys.sorted(), id: \.self) { key in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(L("Trusted certificate for %@", key)).font(.caption)
+                    Text(draft.pinnedCertificates[key] ?? "")
+                        .font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(L("Forget")) { draft.pinnedCertificates[key] = nil }
+                }
+            }
+        case .ssh:
+            HStack {
+                Menu {
+                    ForEach(hosts.names, id: \.self) { host in
+                        Button(host) {
+                            draft.sshDestination = host
+                            // A selected alias inherits its own settings.
+                            sshPortText = ""
+                            draft.sshIdentityFile = ""
+                        }
+                    }
+                } label: {
+                    Text(L("Choose from SSH config…")).lineLimit(1)
+                }
+                .disabled(loadingHosts || hosts.names.isEmpty)
+                Button {
+                    Task { await reloadHosts() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help(L("Reload SSH config"))
+                .accessibilityLabel(L("Reload SSH config"))
+                .disabled(loadingHosts)
+            }
+            if !hosts.unreadableFiles.isEmpty {
+                explanation(L("Some SSH configuration files could not be read. You can still enter a destination below."))
+            } else if hosts.names.isEmpty && !loadingHosts {
+                explanation(L("No named hosts found in ~/.ssh/config. Enter a destination below."))
+            }
+            field(L("SSH destination"), text: $draft.sshDestination, prompt: L("Host alias or user@host"))
+            explanation(L("Hosts are read from ~/.ssh/config and its Include files. SSH automatically uses the host's user, port, identity files and jump host. Leave the overrides below empty to use that configuration."))
+            HStack(alignment: .top, spacing: 16) {
+                field(L("knode-os port on that machine"), text: $remotePortText, prompt: "9100")
+                field(L("SSH port (optional override)"), text: $sshPortText, prompt: L("From SSH config, otherwise 22"))
+            }
+            field(L("Identity file (optional override)"), text: $draft.sshIdentityFile, prompt: L("From SSH config or ssh-agent"))
+            if let error = sshValidationError {
+                Text(error).font(.caption).foregroundStyle(Color.knodeBad)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            explanation(L("Use a key in ssh-agent or the Keychain. Connect once in Terminal to trust a new host; this app does not ask for SSH passwords."))
+        }
+    }
+
+    private func field(_ title: String, text: Binding<String>, prompt: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.callout.weight(.medium))
+            TextField(title, text: text, prompt: Text(prompt))
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: .infinity)
+        }
+    }
+
+    private func explanation(_ text: String) -> some View {
+        Text(text).font(.caption).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var sshValidationError: String? {
+        let destination = draft.sshDestination.trimmingCharacters(in: .whitespacesAndNewlines)
+        if destination.hasPrefix("-") || destination.contains(where: { $0.isWhitespace || $0.isNewline }) {
+            return L("Enter a Host alias or user@host without spaces.")
+        }
+        let port = sshPortText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !port.isEmpty && !(Int(port).map { (1...65_535).contains($0) } ?? false) {
+            return L("The SSH port must be 1–65535")
+        }
+        if !(Int(remotePortText.trimmingCharacters(in: .whitespacesAndNewlines)).map { (1...65_535).contains($0) } ?? false) {
+            return L("The service port must be 1–65535")
+        }
+        return nil
+    }
+
+    private func reloadHosts() async {
+        loadingHosts = true
+        hosts = await Task.detached(priority: .utility) { SSHConfig.hosts() }.value
+        loadingHosts = false
+    }
+
+    private func connect() {
+        guard draft.mode != .ssh || sshValidationError == nil else { return }
+        var next = draft
+        next.sshDestination = next.sshDestination.trimmingCharacters(in: .whitespacesAndNewlines)
+        next.sshPort = Int(sshPortText.trimmingCharacters(in: .whitespacesAndNewlines))
+        next.sshRemotePort = Int(remotePortText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 9100
+        model.applyConnection(next)
+        isPresented = false
     }
 }
 

@@ -51,7 +51,9 @@ final class AppModel: ObservableObject {
         didSet { L10n.set(language) }
     }
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
+    private let probeSession: URLSession?
+    private var connectionCheckID = UUID()
     private let sessionKey = "knode-os.macos.session.v1"
     private let connectionKey = "knode-os.macos.connection.v1"
     /// Before connection modes: a single service URL.
@@ -68,7 +70,9 @@ final class AppModel: ObservableObject {
     /// Where each section was left, so switching away and back does not lose your place.
     private var lastTab: [AppSection: AppTab] = [:]
 
-    init() {
+    init(defaults: UserDefaults = .standard, connectsOnLaunch: Bool = true, probeSession: URLSession? = nil) {
+        self.defaults = defaults
+        self.probeSession = probeSession
         connection = Self.loadConnection(defaults, connectionKey: connectionKey, legacyKey: legacyServerKey)
         // the mock accounts of earlier builds had passwords hashed without salt: gone, never migrated
         defaults.removeObject(forKey: legacyAccountsKey)
@@ -85,12 +89,14 @@ final class AppModel: ObservableObject {
             // a stored session is only as good as its token: without one, sign in again
             phase = token == nil ? .signIn : .app
         }
-        Task {
-            await checkConnection(startBundled: true)
-            if phase == .app {
-                await verifySession()
-                await refreshWorkspaces()
-                await refreshStats()
+        if connectsOnLaunch {
+            Task {
+                await checkConnection(startBundled: true)
+                if phase == .app {
+                    await verifySession()
+                    await refreshWorkspaces()
+                    await refreshStats()
+                }
             }
         }
     }
@@ -163,6 +169,10 @@ final class AppModel: ObservableObject {
         next.remoteURL = ConnectionSettings.trimmed(next.remoteURL)
         next.sshDestination = next.sshDestination.trimmingCharacters(in: .whitespacesAndNewlines)
         let changedService = next.identity != connection.identity
+        // Invalidate in-flight replies before publishing a different service.
+        connectionCheckID = UUID()
+        authInfo = nil
+        connectionState = .checking
         connection = next
         if let data = try? JSONEncoder().encode(next) { defaults.set(data, forKey: connectionKey) }
         localService.stop()
@@ -201,55 +211,94 @@ final class AppModel: ObservableObject {
     /// never on a periodic re-check. Another local URL is a service managed
     /// elsewhere (`ConnectionSettings.usesBundledService`), never started here.
     func checkConnection(startBundled: Bool = false) async {
+        let checkID = UUID()
+        connectionCheckID = checkID
+        let settings = connection
+        authInfo = nil
         connectionState = .checking
         do {
-            let base = try await prepareTransport(startBundled: startBundled)
+            let base = try await prepareTransport(settings, checkID: checkID, startBundled: startBundled)
+            try requireCurrentCheck(checkID)
+            let client = connectionProbe(base, settings: settings)
+            let health = try await client.health()
+            try requireCurrentCheck(checkID)
+            let state = try await client.authState()
+            try requireCurrentCheck(checkID)
             effectiveBaseURL = base
-            let health = try await bareClient().health()
+            authInfo = state
             connectionState = .connected(health.dataRoot)
-            authInfo = try? await bareClient().authState()
         } catch {
+            guard connectionCheckID == checkID else { return }
+            authInfo = nil
+            effectiveBaseURL = nil
             connectionState = .unavailable(describe(error))
         }
     }
 
+    private func requireCurrentCheck(_ checkID: UUID) throws {
+        guard checkID == connectionCheckID else { throw CancellationError() }
+        try Task.checkCancellation()
+    }
+
+    /// Keep probes bound to the service they started with, even if the user
+    /// changes connection while a response is in flight. No session is needed.
+    private func connectionProbe(_ base: URL, settings: ConnectionSettings) -> APIClient {
+        APIClient(baseURL: base, username: "", workspace: Workspace(id: "default", name: "Default", kind: .personal),
+                  token: nil, urlSession: probeSession ?? (settings.mode == .remote ? PinningDelegate.session(for: settings.pinnedCertificates) : .shared))
+    }
+
     /// Bring up what the connection needs and answer the base URL: the bundled
     /// service for a local URL nothing answers on, the SSH tunnel, or nothing.
-    private func prepareTransport(startBundled: Bool) async throws -> URL {
-        switch connection.mode {
+    private func prepareTransport(_ settings: ConnectionSettings, checkID: UUID, startBundled: Bool) async throws -> URL {
+        try requireCurrentCheck(checkID)
+        switch settings.mode {
         case .local:
-            guard let base = Self.configuredURL(connection), base.scheme != nil else { throw APIError(message: "Invalid service URL") }
-            effectiveBaseURL = base
-            if (try? await bareClient().health()) != nil { return base }
-            guard connection.usesBundledService, startBundled || localService.isRunning, try localService.start(for: base) else { return base }
+            guard let base = Self.configuredURL(settings), base.scheme != nil else { throw APIError(message: "Invalid service URL") }
+            let client = connectionProbe(base, settings: settings)
+            let health = try? await client.health()
+            try requireCurrentCheck(checkID)
+            if health != nil { return base }
+            guard settings.usesBundledService, startBundled || localService.isRunning, try localService.start(for: base) else { return base }
             for _ in 0..<48 {
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                if (try? await bareClient().health()) != nil { return base }
+                try await Task.sleep(nanoseconds: 250_000_000)
+                try requireCurrentCheck(checkID)
+                let health = try? await client.health()
+                try requireCurrentCheck(checkID)
+                if health != nil { return base }
                 if !localService.isRunning { break }
             }
             let log = localService.logURL?.path ?? "~/Library/Logs/knode-os/service.log"
             throw APIError(message: "The bundled service did not become ready. See \(log)")
         case .remote:
-            guard let base = Self.configuredURL(connection), let scheme = base.scheme?.lowercased(), base.host != nil else {
+            guard let base = Self.configuredURL(settings), let scheme = base.scheme?.lowercased(), base.host != nil else {
                 throw APIError(message: "Enter the service URL, e.g. https://knode.example.com")
             }
             guard scheme == "https" || scheme == "http" else { throw APIError(message: "The service URL starts with https://") }
             return base
         case .ssh:
-            let port = try tunnel.start(connection)
+            let port = try tunnel.start(settings)
             guard let base = URL(string: "http://127.0.0.1:\(port)") else { throw APIError(message: "Invalid tunnel address") }
-            effectiveBaseURL = base
+            let client = connectionProbe(base, settings: settings)
             // ssh needs a moment to log in and open the forward
             for _ in 0..<60 {
-                if (try? await bareClient().health()) != nil { return base }
+                let health = try? await client.health()
+                try requireCurrentCheck(checkID)
                 if !tunnel.isRunning {
+                    // Process exit and the stderr readability handler can race.
+                    // Give the latter a moment to deliver a useful diagnosis.
+                    if tunnel.lastError.isEmpty { try await Task.sleep(nanoseconds: 100_000_000) }
+                    try requireCurrentCheck(checkID)
                     let said = tunnel.lastError
+                    let status = tunnel.exitStatus.map(String.init) ?? "?"
                     tunnel.stop()
-                    throw APIError(message: said.isEmpty ? L("ssh ended before the tunnel opened") : "ssh: \(said)")
+                    throw APIError(message: said.isEmpty ? L("SSH exited before the tunnel opened (status %@).", status) : "ssh: \(said)")
                 }
-                try? await Task.sleep(nanoseconds: 250_000_000)
+                if health != nil { return base }
+                try await Task.sleep(nanoseconds: 250_000_000)
+                try requireCurrentCheck(checkID)
             }
             let said = tunnel.lastError
+            tunnel.stop()
             throw APIError(message: said.isEmpty ? L("Nothing answered through the SSH tunnel — is knode-os running on that machine, on that port?") : "ssh: \(said)")
         }
     }
@@ -274,6 +323,7 @@ final class AppModel: ObservableObject {
     }
 
     func shutdown() {
+        connectionCheckID = UUID()
         localService.stop()
         tunnel.stop()
     }
@@ -307,6 +357,9 @@ final class AppModel: ObservableObject {
 
     /// The first account of a service on this Mac; the service refuses it from anywhere else.
     func createAdministrator(username: String, password: String, confirmation: String) async -> String? {
+        guard case .connected = connectionState, authInfo?.setupRequired == true, authInfo?.canSetup == true else {
+            return L("Connect to the service before creating an administrator.")
+        }
         let name = username.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard name.range(of: "^[a-z0-9][a-z0-9._-]{0,31}$", options: .regularExpression) != nil else {
             return L("Use up to 32 lower-case letters, digits, dots, dashes or underscores.")
