@@ -11,7 +11,8 @@
   "files": [
     "dist",
     "web",
-    "README.md"
+    "README.md",
+    "worker"
   ],
   "scripts": {
     "dev": "tsx src/cli.ts",

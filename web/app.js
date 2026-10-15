@@ -3,10 +3,12 @@
 
 const $ = (sel) => document.querySelector(sel);
 const api = async (path, opts = {}) => {
-  const headers = { 'content-type': 'application/json', ...workspaceRequestHeaders(), ...(opts.headers || {}) };
-  const res = await fetch(path, { ...opts, headers });
+  // X-Knode-CSRF: a page on another site cannot send it, so the server knows a write came from this one
+  const headers = { 'content-type': 'application/json', 'x-knode-csrf': '1', ...workspaceRequestHeaders(), ...(opts.headers || {}) };
+  const res = await fetch(path, { ...opts, headers, credentials: 'same-origin' });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    if (res.status === 401 && data.reason === 'auth') sessionEnded(data.error);
     const error = new Error(data.error || res.statusText);
     // the machine-readable cause, when a route sends one: a screen can act on
     // it instead of parsing the prose
@@ -60,16 +62,22 @@ const renderMd = (s) => {
 
 /* --------------------------- auth & workspaces ------------------------- */
 
+/**
+ * Sign-in belongs to the server (src/auth): a browser holds an HttpOnly
+ * session cookie, so nothing secret lives in this page. Storage keeps only
+ * which workspaces you had open (`authState`); who you are and what you may
+ * use (`serverAuth`) comes from the server on every load.
+ */
 const AUTH_KEY = 'knode-os.auth.v1';
-const ACCOUNTS_KEY = 'knode-os.mock-accounts.v1';
-const BUILTIN_ACCOUNTS = [
-  { username: 'admin', password: 'admin', name: 'Admin' },
-  { username: 'test', password: 'test', name: 'Test' },
-];
 let authState = null;
+/** The server's view of the session: account, groups usable here, teams, gateways. */
+let serverAuth = null;
+/** Sign-in is off on this server (development): any username, no password. */
+let authDisabled = false;
 let pendingUser = null;
 let pendingPersistence = 'local';
 let statsTimer = null;
+let sessionEndedShown = false;
 
 const initials = (value) => {
   const parts = String(value || 'You').trim().split(/[\s@._-]+/).filter(Boolean);
@@ -83,33 +91,6 @@ const nameFromUsername = (username) => String(username)
   .join(' ') || 'Your account';
 
 const normalizeUsername = (username) => String(username || '').trim().toLowerCase();
-
-function readMockAccounts() {
-  try {
-    const accounts = JSON.parse(localStorage.getItem(ACCOUNTS_KEY) || '[]');
-    return Array.isArray(accounts) ? accounts.filter((account) => account?.username && typeof account.password === 'string') : [];
-  } catch {
-    return [];
-  }
-}
-
-function findMockAccount(username, password) {
-  const normalized = normalizeUsername(username);
-  return [...BUILTIN_ACCOUNTS, ...readMockAccounts()]
-    .find((account) => normalizeUsername(account.username) === normalized && account.password === password) || null;
-}
-
-function usernameExists(username) {
-  const normalized = normalizeUsername(username);
-  return [...BUILTIN_ACCOUNTS, ...readMockAccounts()]
-    .some((account) => normalizeUsername(account.username) === normalized);
-}
-
-function saveMockAccount(account) {
-  const accounts = readMockAccounts();
-  accounts.push(account);
-  localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts));
-}
 
 function readAuthState() {
   for (const storage of [localStorage, sessionStorage]) {
@@ -129,6 +110,10 @@ function saveAuthState() {
     target.setItem(AUTH_KEY, JSON.stringify(authState));
     other.removeItem(AUTH_KEY);
   } catch { /* keep the current in-memory session */ }
+}
+
+function forgetAuthState() {
+  try { localStorage.removeItem(AUTH_KEY); sessionStorage.removeItem(AUTH_KEY); } catch { /* no-op */ }
 }
 
 function showAuthStep(step) {
@@ -156,6 +141,20 @@ function workspaceLabel(workspace) {
   return workspace?.name || 'Workspace';
 }
 
+/** The Teams the server says this account may open. */
+function serverTeams() {
+  return (serverAuth?.teams || []).map((team) => ({ id: team.id, name: team.name, kind: 'team', code: String(team.slug || '').toUpperCase() }));
+}
+
+/** Members keep only the Teams they were given; an administrator may keep any Team joined by code. */
+function allowedTeams(teams) {
+  const account = serverAuth?.account;
+  const given = serverTeams();
+  const open = authDisabled || !account || account.role === 'admin' || account.teams?.includes('*');
+  const kept = open ? teams : teams.filter((team) => given.some((g) => g.id === team.id));
+  return [...kept, ...given].filter((team, i, all) => all.findIndex((t) => t.id === team.id) === i);
+}
+
 function completeLogin(activeWorkspace, extraWorkspaces = []) {
   const user = pendingUser;
   if (!user) return;
@@ -163,13 +162,11 @@ function completeLogin(activeWorkspace, extraWorkspaces = []) {
   authState = {
     user,
     persistence: pendingPersistence,
-    workspaces: [personal, ...extraWorkspaces],
+    workspaces: [personal, ...allowedTeams(extraWorkspaces)],
     activeWorkspaceId: activeWorkspace.id,
   };
   saveAuthState();
   $('#login-password').value = '';
-  $('#register-password').value = '';
-  $('#register-confirm').value = '';
   pendingUser = null;
   enterApp();
 }
@@ -183,6 +180,7 @@ function workspaceRequestHeaders() {
   const workspace = activeWorkspace();
   const username = normalizeUsername(authState.user.username || authState.user.email);
   if (!username || !workspace) return {};
+  // the server acts for the signed-in account; the user header only matters with sign-in off
   return {
     'x-knode-user': username,
     'x-knode-workspace-kind': workspace.kind,
@@ -195,7 +193,7 @@ async function syncUserWorkspaces() {
   if (!authState?.user) return;
   const previous = activeWorkspace();
   const owned = await api('/api/workspaces');
-  const teams = authState.workspaces.filter((workspace) => workspace.kind === 'team');
+  const teams = allowedTeams(authState.workspaces.filter((workspace) => workspace.kind === 'team'));
   authState.workspaces = [...owned, ...teams];
   if (!authState.workspaces.some((workspace) => workspace.id === authState.activeWorkspaceId)) {
     authState.activeWorkspaceId = owned[0]?.id || teams[0]?.id;
@@ -225,8 +223,10 @@ function renderWorkspaceUI() {
   $('#workspace-context').classList.toggle('team', !personal);
   $('#account-avatar').textContent = userInitials;
   $('#account-name').textContent = user.name;
-  $('#account-email').textContent = user.username ? `@${user.username}` : user.email;
+  const role = serverAuth?.account?.role === 'admin' ? ' · administrator' : '';
+  $('#account-email').textContent = user.username ? `@${user.username}${role}` : user.email;
   document.body.dataset.workspace = workspace.kind;
+  document.body.dataset.role = serverAuth?.account?.role || 'member';
 
   const options = $('#workspace-options');
   options.innerHTML = '';
@@ -259,6 +259,10 @@ function switchWorkspace(id) {
 function joinTeam(code, fromOnboarding = false) {
   const team = teamFromCode(code);
   if (!team) return { error: 'Enter a valid Team code or invite link.' };
+  const account = serverAuth?.account;
+  if (!authDisabled && account && account.role !== 'admin' && !account.teams?.includes('*') && !serverTeams().some((t) => t.id === team.id)) {
+    return { error: `Your account has not been given ${team.name} — ask an administrator.` };
+  }
   if (fromOnboarding) {
     completeLogin(team, [team]);
     return { team };
@@ -315,7 +319,14 @@ function startAppData() {
   loadWorkspaceData();
 }
 
+function stopAppData() {
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = null;
+  stopChatPolling();
+}
+
 function enterApp() {
+  sessionEndedShown = false;
   $('#auth-view').hidden = true;
   $('#app-shell').hidden = false;
   // paints the header, the strip and the visible section from one source
@@ -329,18 +340,35 @@ function enterApp() {
     });
 }
 
-function showLogin() {
+function showAuthView() {
+  stopAppData();
+  closeWorkspaceMenu();
   $('#app-shell').hidden = true;
   $('#auth-view').hidden = false;
+}
+
+function showLogin(note = '') {
+  showAuthView();
   showAuthStep('login');
   $('#login-form').reset();
   $('#login-remember').checked = true;
   $('#login-password').type = 'password';
   $('#btn-toggle-password').textContent = 'Show';
   $('#login-error').textContent = '';
-  $('#register-error').textContent = '';
-  closeWorkspaceMenu();
-  setTimeout(() => $('#login-username').focus(), 0);
+  const message = note || (authDisabled ? 'Sign-in is off on this server (development): any username works, no password.' : '');
+  $('#login-note').textContent = message;
+  $('#login-note').hidden = !message;
+  const last = readAuthState()?.user?.username;
+  if (last) $('#login-username').value = last;
+  setTimeout(() => (last ? $('#login-password') : $('#login-username')).focus(), 0);
+}
+
+/** A request came back 401: the session is over (expired, signed out elsewhere, password changed). */
+function sessionEnded(message) {
+  if (sessionEndedShown || authDisabled) return;
+  sessionEndedShown = true;
+  serverAuth = null;
+  showLogin(message && !/^sign in first$/i.test(message) ? `${message.charAt(0).toUpperCase()}${message.slice(1)}.` : 'Your session ended — sign in again.');
 }
 
 function continueToWorkspaceChoice(user, persistence) {
@@ -352,26 +380,60 @@ function continueToWorkspaceChoice(user, persistence) {
   showAuthStep('workspaces');
 }
 
-$('#login-form').addEventListener('submit', (event) => {
+/** The server accepted us: back to the workspaces this browser had open for the same user, or choose. */
+function signedIn(view, persistence) {
+  serverAuth = view;
+  const account = view.account;
+  const user = { username: account.username, name: account.name || nameFromUsername(account.username) };
+  const stored = readAuthState();
+  if (stored && normalizeUsername(stored.user?.username) === account.username) {
+    authState = { ...stored, user, persistence };
+    authState.workspaces = [
+      ...authState.workspaces.filter((workspace) => workspace.kind === 'personal'),
+      ...allowedTeams(authState.workspaces.filter((workspace) => workspace.kind === 'team')),
+    ];
+    if (!authState.workspaces.some((workspace) => workspace.id === authState.activeWorkspaceId)) authState.activeWorkspaceId = personalWorkspace().id;
+    saveAuthState();
+    enterApp();
+    return;
+  }
+  // someone else signed in on this browser: their workspaces are not ours
+  forgetAuthState();
+  continueToWorkspaceChoice(user, persistence);
+}
+
+$('#login-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const username = normalizeUsername($('#login-username').value);
   const password = $('#login-password').value;
+  const remember = $('#login-remember').checked;
   if (!username) {
     $('#login-error').textContent = 'Enter your username.';
     $('#login-username').focus();
     return;
   }
-  const account = findMockAccount(username, password);
-  if (!account) {
-    $('#login-error').textContent = 'Invalid username or password.';
+  if (authDisabled) {
+    signedIn({ account: { username, name: nameFromUsername(username), role: 'admin', teams: ['*'] }, teams: [] }, remember ? 'local' : 'session');
+    return;
+  }
+  if (!password) {
+    $('#login-error').textContent = 'Enter your password.';
     $('#login-password').focus();
     return;
   }
-  $('#login-error').textContent = '';
-  continueToWorkspaceChoice(
-    { username: normalizeUsername(account.username), name: account.name || nameFromUsername(account.username) },
-    $('#login-remember').checked ? 'local' : 'session',
-  );
+  const button = $('#btn-login');
+  button.disabled = true;
+  try {
+    const view = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password, remember }) });
+    $('#login-error').textContent = '';
+    $('#login-note').hidden = true;
+    signedIn(view, remember ? 'local' : 'session');
+  } catch (error) {
+    $('#login-error').textContent = error.reason === 'setup' ? 'This server has no accounts yet.' : `${error.message.charAt(0).toUpperCase()}${error.message.slice(1)}.`;
+    $('#login-password').select();
+  } finally {
+    button.disabled = false;
+  }
 });
 
 $('#btn-toggle-password').addEventListener('click', () => {
@@ -381,51 +443,36 @@ $('#btn-toggle-password').addEventListener('click', () => {
   $('#btn-toggle-password').textContent = reveal ? 'Hide' : 'Show';
 });
 
-$('#btn-show-register').addEventListener('click', () => {
-  $('#register-form').reset();
-  $('#register-error').textContent = '';
-  showAuthStep('register');
-  setTimeout(() => $('#register-username').focus(), 0);
-});
-
-$('#btn-register-back').addEventListener('click', () => showAuthStep('login'));
-
-$('#register-form').addEventListener('submit', (event) => {
+$('#setup-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const rawUsername = $('#register-username').value.trim();
-  const username = normalizeUsername(rawUsername);
-  const password = $('#register-password').value;
-  const confirmPassword = $('#register-confirm').value;
-  if (!/^[a-zA-Z0-9._-]{3,32}$/.test(rawUsername)) {
-    $('#register-error').textContent = 'Use 3–32 letters, numbers, dots, dashes or underscores.';
-    $('#register-username').focus();
+  const username = normalizeUsername($('#setup-username').value);
+  const password = $('#setup-password').value;
+  if (!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(username)) {
+    $('#setup-error').textContent = 'Use up to 32 lower-case letters, digits, dots, dashes or underscores.';
+    $('#setup-username').focus();
     return;
   }
-  if (usernameExists(username)) {
-    $('#register-error').textContent = 'That username already exists.';
-    $('#register-username').focus();
+  if (password.length < 8) {
+    $('#setup-error').textContent = 'Passwords need at least 8 characters.';
+    $('#setup-password').focus();
     return;
   }
-  if (password.length < 4) {
-    $('#register-error').textContent = 'Password must be at least 4 characters.';
-    $('#register-password').focus();
+  if (password !== $('#setup-confirm').value) {
+    $('#setup-error').textContent = 'The passwords do not match.';
+    $('#setup-confirm').focus();
     return;
   }
-  if (password !== confirmPassword) {
-    $('#register-error').textContent = 'Passwords do not match.';
-    $('#register-confirm').focus();
-    return;
-  }
-  const account = { username, password, name: nameFromUsername(username) };
   try {
-    saveMockAccount(account);
-  } catch {
-    $('#register-error').textContent = 'This browser could not save the account.';
-    return;
+    const view = await api('/api/auth/setup', { method: 'POST', body: JSON.stringify({ username, password, name: nameFromUsername(username) }) });
+    $('#setup-error').textContent = '';
+    $('#setup-form').reset();
+    signedIn(view, 'local');
+  } catch (error) {
+    $('#setup-error').textContent = error.message;
   }
-  $('#register-error').textContent = '';
-  continueToWorkspaceChoice({ username: account.username, name: account.name }, 'local');
 });
+
+$('#btn-nosetup-retry').addEventListener('click', () => bootAuth());
 
 $('#btn-auth-back').addEventListener('click', () => showAuthStep('login'));
 $('#btn-use-personal').addEventListener('click', () => pendingUser && completeLogin(personalWorkspace()));
@@ -451,6 +498,7 @@ document.addEventListener('keydown', (event) => {
     if ($('#join-team-dialog').open) $('#join-team-dialog').close();
     if ($('#create-workspace-dialog').open) $('#create-workspace-dialog').close();
     if ($('#clear-workspace-dialog').open) $('#clear-workspace-dialog').close();
+    if ($('#user-dialog').open) $('#user-dialog').close();
   }
 });
 
@@ -503,17 +551,52 @@ $('#join-team-form').addEventListener('submit', (event) => {
   if (!result.error) $('#join-team-dialog').close();
 });
 
-$('#btn-sign-out').addEventListener('click', () => {
-  try { localStorage.removeItem(AUTH_KEY); sessionStorage.removeItem(AUTH_KEY); } catch { /* no-op */ }
+$('#btn-open-access').addEventListener('click', () => {
+  closeWorkspaceMenu();
+  navigate('access');
+});
+
+$('#btn-sign-out').addEventListener('click', async () => {
+  closeWorkspaceMenu();
+  if (!authDisabled) {
+    try { await api('/api/auth/logout', { method: 'POST', body: '{}' }); } catch { /* signed out here either way */ }
+  }
+  forgetAuthState();
   authState = null;
+  serverAuth = null;
   pendingUser = null;
   showLogin();
 });
 
-function bootAuth() {
-  authState = readAuthState();
-  if (authState) enterApp();
-  else showLogin();
+async function bootAuth() {
+  let state;
+  try {
+    state = await api('/api/auth/state');
+  } catch (error) {
+    showLogin(`The server did not answer: ${error.message}`);
+    return;
+  }
+  authDisabled = state.auth === false;
+  if (authDisabled) {
+    const stored = readAuthState();
+    if (stored) {
+      authState = stored;
+      serverAuth = { account: { username: stored.user.username, name: stored.user.name, role: 'admin', teams: ['*'] }, teams: [] };
+      enterApp();
+    } else showLogin();
+    return;
+  }
+  if (state.signedIn) {
+    signedIn(state, readAuthState()?.persistence || 'local');
+    return;
+  }
+  if (state.setupRequired) {
+    showAuthView();
+    showAuthStep(state.canSetup ? 'setup' : 'nosetup');
+    if (state.canSetup) setTimeout(() => $('#setup-username').focus(), 0);
+    return;
+  }
+  showLogin();
 }
 
 /* ----------------------------- navigation ------------------------------- */
@@ -546,6 +629,7 @@ const NAV = [
     { id: 'research', title: 'Research', hint: 'How the wiki gets written' },
     { id: 'chat', title: 'Ask', hint: 'How questions get answered' },
     { id: 'workspace', title: 'Workspace', hint: 'Clear this workspace' },
+    { id: 'access', title: 'Access', hint: 'Your account; users and gateways of this server' },
   ] },
 ];
 
@@ -573,6 +657,7 @@ const TAB_LOAD = {
   wiki: () => loadResearch(),
   ask: () => loadChat(),
   settings: () => loadConfigForm(),
+  access: () => loadAccess(),
   graph: () => { if (!graphState.loaded) loadGraph(''); },
 };
 
@@ -662,6 +747,279 @@ $('#subtabs').addEventListener('click', (event) => {
   if (button) navigate(button.dataset.tab);
 });
 
+/* ------------------------------- access -------------------------------- */
+
+/**
+ * Account & access: your password and sessions, and — for an administrator —
+ * the users of this server and the local services it publishes under /gw.
+ * Everything goes through /api/auth, and the server enforces all of it; this
+ * page only draws what it is told.
+ */
+
+const API_GROUP_LABELS = {
+  files: 'Files', search: 'Search', ask: 'Ask', knowledge: 'Knowledge', ingest: 'Ingest',
+  traces: 'Traces', datasources: 'Datasources', settings: 'Settings', gateway: 'Gateways',
+};
+const MEMBER_REMOTE_DEFAULT = ['files', 'search', 'ask', 'knowledge', 'ingest', 'traces'];
+let accessUsers = null;
+let editingUser = null;
+
+const when = (iso) => (iso ? new Date(iso).toLocaleString() : '—');
+const csvList = (value) => String(value || '').split(',').map((v) => v.trim()).filter(Boolean);
+
+async function loadAccess() {
+  const admin = document.querySelectorAll('.admin-only');
+  if (authDisabled) {
+    $('#access-summary').textContent = 'Sign-in is off on this server (development): there are no accounts here.';
+    admin.forEach((el) => { el.hidden = true; });
+    return;
+  }
+  try {
+    const me = await api('/api/auth/me');
+    serverAuth = { ...serverAuth, ...me };
+    renderAccount(me);
+    renderSessions(await api('/api/auth/sessions'));
+    const isAdmin = me.account.role === 'admin' && me.groups?.settings;
+    admin.forEach((el) => { el.hidden = !isAdmin; });
+    if (isAdmin) await loadAdmin();
+  } catch (error) {
+    toast(`Could not load access: ${error.message}`, 5000);
+  }
+}
+
+function renderAccount(me) {
+  const a = me.account;
+  $('#access-summary').textContent = `Signed in as ${a.name || a.username} (@${a.username}), ${me.local ? 'on this machine' : 'from another machine'}.`;
+  $('#access-role').textContent = a.role === 'admin' ? 'administrator' : 'member';
+  $('#access-groups').innerHTML = Object.entries(me.groups || {})
+    .map(([group, ok]) => `<span class="access-chip${ok ? ' ok' : ''}" title="${esc(me.apiGroups?.[group] || '')}">${ok ? '✓' : '✕'} ${esc(API_GROUP_LABELS[group] || group)}</span>`)
+    .join('');
+  const gateways = me.gateways || [];
+  $('#access-gateways-mine').innerHTML = gateways.length
+    ? `<div class="cfg-card-title"><b>Gateways you may use</b></div>${gateways.map((g) => `<p class="hint"><a href="${esc(g.path)}" target="_blank" rel="noopener">${esc(g.path)}</a> ${esc(g.description)}</p>`).join('')}`
+    : '';
+}
+
+function renderSessions(list) {
+  $('#access-sessions').innerHTML = list.map((s) => `<div class="access-row">
+      <span><b>${esc(s.label)}</b>${s.current ? ' <span class="section-badge">this one</span>' : ''}<small>${esc(s.kind)} · since ${esc(when(s.createdAt))} · last used ${esc(when(s.lastSeenAt))}${s.ip ? ` · ${esc(s.ip)}` : ''}</small></span>
+      ${s.current ? '' : `<button type="button" class="ghost" data-end-session="${esc(s.id)}">End</button>`}
+    </div>`).join('') || '<p class="hint">No sessions.</p>';
+}
+
+$('#access-sessions').addEventListener('click', async (event) => {
+  const id = event.target.closest?.('[data-end-session]')?.dataset.endSession;
+  if (!id) return;
+  try {
+    await api(`/api/auth/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    loadAccess();
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$('#btn-signout-others').addEventListener('click', async () => {
+  try {
+    await api('/api/auth/signout-others', { method: 'POST', body: '{}' });
+    toast('Signed out everywhere else');
+    loadAccess();
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$('#password-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const current = $('#password-current').value;
+  const password = $('#password-new').value;
+  if (password.length < 8) {
+    $('#password-error').textContent = 'Passwords need at least 8 characters.';
+    return;
+  }
+  if (password !== $('#password-confirm').value) {
+    $('#password-error').textContent = 'The new passwords do not match.';
+    return;
+  }
+  try {
+    // the answer carries a new session cookie: this browser stays signed in, every other session ends
+    await api('/api/auth/password', { method: 'POST', body: JSON.stringify({ current, password }) });
+    $('#password-form').reset();
+    $('#password-error').textContent = '';
+    toast('Password changed — your other sessions have ended');
+    loadAccess();
+  } catch (error) {
+    $('#password-error').textContent = error.message;
+  }
+});
+
+async function loadAdmin() {
+  const [users, gateways] = await Promise.all([api('/api/auth/users'), api('/api/auth/gateways')]);
+  accessUsers = users;
+  renderUsers(users);
+  renderGateways(gateways);
+}
+
+function renderUsers(data) {
+  const me = serverAuth?.account?.username;
+  $('#access-users').innerHTML = data.users.map((u) => `<tr${u.disabled ? ' class="disabled"' : ''}>
+      <td><b>${esc(u.username)}</b>${u.name && u.name !== u.username ? `<small>${esc(u.name)}</small>` : ''}${u.disabled ? '<small class="bad">disabled</small>' : ''}</td>
+      <td>${u.role === 'admin' ? 'administrator' : 'member'}</td>
+      <td>${u.role === 'admin' ? 'all' : esc(u.teams.join(', ') || '—')}</td>
+      <td>${u.remoteApis.includes('*') ? 'everything' : esc(u.remoteApis.map((g) => API_GROUP_LABELS[g] || g).join(', ') || 'nothing')}</td>
+      <td>${u.role === 'admin' ? 'all' : esc(u.gateways.join(', ') || '—')}</td>
+      <td>${u.sessions.count}${u.sessions.lastSeenAt ? `<small>${esc(when(u.sessions.lastSeenAt))}</small>` : ''}</td>
+      <td class="row-actions"><button type="button" class="ghost" data-edit-user="${esc(u.username)}">Edit</button>${u.username === me || !u.sessions.count ? '' : `<button type="button" class="ghost" data-signout-user="${esc(u.username)}">Sign out</button>`}</td>
+    </tr>`).join('');
+}
+
+function renderRemoteChecks(selected, groups) {
+  const all = selected.includes('*');
+  $('#user-remote-apis').innerHTML = `<label class="check-row"><input type="checkbox" id="user-remote-all"${all ? ' checked' : ''} /> Everything the role allows</label>`
+    + Object.entries(groups).map(([group, description]) => `<label class="check-row" title="${esc(description)}"><input type="checkbox" data-group="${esc(group)}"${all || selected.includes(group) ? ' checked' : ''}${all ? ' disabled' : ''} /> ${esc(API_GROUP_LABELS[group] || group)}</label>`).join('');
+}
+
+$('#user-remote-apis').addEventListener('change', (event) => {
+  if (event.target.id !== 'user-remote-all') return;
+  for (const box of document.querySelectorAll('#user-remote-apis input[data-group]')) {
+    box.disabled = event.target.checked;
+    if (event.target.checked) box.checked = true;
+  }
+});
+
+function openUserDialog(username) {
+  const u = username ? accessUsers?.users.find((x) => x.username === username) : null;
+  editingUser = u?.username || null;
+  const self = Boolean(u && u.username === serverAuth?.account?.username);
+  $('#user-dialog-title').textContent = u ? `Edit ${u.username}` : 'Add a user';
+  $('#user-dialog-hint').textContent = self
+    ? 'Your own password, role and sign-in are changed under Account, or by another administrator.'
+    : 'They sign in with this username and password, here or from the other machines you allow.';
+  $('#user-username').value = u?.username || '';
+  $('#user-username').disabled = Boolean(u);
+  $('#user-name').value = u?.name || '';
+  $('#user-password').value = '';
+  $('#user-password-label').textContent = u ? 'New password (empty keeps the current one)' : 'Password';
+  $('#user-password').disabled = self;
+  $('#user-role').value = u?.role || 'member';
+  $('#user-role').disabled = self;
+  $('#user-teams').value = (u?.teams || []).join(', ');
+  $('#user-gateways').value = (u?.gateways || []).join(', ');
+  $('#user-disabled').checked = Boolean(u?.disabled);
+  $('#user-disabled-row').hidden = !u || self;
+  renderRemoteChecks(u ? u.remoteApis : MEMBER_REMOTE_DEFAULT, accessUsers?.apiGroups || {});
+  $('#btn-delete-user').hidden = !u || self;
+  $('#user-error').textContent = '';
+  $('#user-dialog').showModal();
+  setTimeout(() => (u ? $('#user-name') : $('#user-username')).focus(), 0);
+}
+
+$('#btn-add-user').addEventListener('click', () => openUserDialog(null));
+$('#btn-cancel-user').addEventListener('click', () => $('#user-dialog').close());
+
+$('#access-users').addEventListener('click', async (event) => {
+  const edit = event.target.closest?.('[data-edit-user]')?.dataset.editUser;
+  if (edit) {
+    openUserDialog(edit);
+    return;
+  }
+  const signout = event.target.closest?.('[data-signout-user]')?.dataset.signoutUser;
+  if (!signout || !confirm(`End every session of ${signout}? They sign in again with their password.`)) return;
+  try {
+    const { ended } = await api(`/api/auth/users/${encodeURIComponent(signout)}/signout`, { method: 'POST', body: '{}' });
+    toast(`${signout}: ${ended} session${ended === 1 ? '' : 's'} ended`);
+    loadAdmin();
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$('#user-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const all = $('#user-remote-all')?.checked;
+  const remoteApis = all ? ['*'] : [...document.querySelectorAll('#user-remote-apis input[data-group]:checked')].map((box) => box.dataset.group);
+  const body = {
+    name: $('#user-name').value.trim(),
+    role: $('#user-role').value,
+    teams: csvList($('#user-teams').value),
+    gateways: csvList($('#user-gateways').value),
+    remoteApis,
+  };
+  const password = $('#user-password').value;
+  try {
+    if (editingUser) {
+      const self = editingUser === serverAuth?.account?.username;
+      if (self) delete body.role;
+      else body.disabled = $('#user-disabled').checked;
+      if (password && !self) {
+        if (password.length < 8) throw new Error('Passwords need at least 8 characters.');
+        body.password = password;
+      }
+      await api(`/api/auth/users/${encodeURIComponent(editingUser)}`, { method: 'PATCH', body: JSON.stringify(body) });
+      toast(`Saved ${editingUser}${body.password || body.disabled ? ' — their sessions ended' : ''}`);
+    } else {
+      if (password.length < 8) throw new Error('Passwords need at least 8 characters.');
+      const created = await api('/api/auth/users', { method: 'POST', body: JSON.stringify({ ...body, username: normalizeUsername($('#user-username').value), password }) });
+      toast(`Created ${created.username}`);
+    }
+    $('#user-dialog').close();
+    loadAdmin();
+  } catch (error) {
+    $('#user-error').textContent = error.message;
+  }
+});
+
+$('#btn-delete-user').addEventListener('click', async () => {
+  if (!editingUser || !confirm(`Remove ${editingUser}? Their workspaces stay on disk under users/${editingUser}.`)) return;
+  try {
+    await api(`/api/auth/users/${encodeURIComponent(editingUser)}`, { method: 'DELETE' });
+    $('#user-dialog').close();
+    toast(`Removed ${editingUser}`);
+    loadAdmin();
+  } catch (error) {
+    $('#user-error').textContent = error.message;
+  }
+});
+
+function renderGateways(list) {
+  $('#access-gateways').innerHTML = list.map((g) => `<tr>
+      <td class="mono">${esc(g.id)}</td>
+      <td class="mono">${esc(g.target)}${g.sandbox === false ? ' <small class="bad">unsandboxed</small>' : ''}</td>
+      <td>${esc(g.description || '')}</td>
+      <td class="row-actions"><a class="ghost" href="/gw/${encodeURIComponent(g.id)}/" target="_blank" rel="noopener">Open</a><button type="button" class="ghost" data-remove-gateway="${esc(g.id)}">Remove</button></td>
+    </tr>`).join('') || '<tr><td colspan="4" class="hint">No gateways yet.</td></tr>';
+}
+
+$('#gateway-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const body = {
+    id: $('#gateway-id').value.trim().toLowerCase(),
+    target: $('#gateway-target').value.trim(),
+    description: $('#gateway-description').value.trim(),
+    sandbox: $('#gateway-sandbox').checked,
+  };
+  try {
+    await api('/api/auth/gateways', { method: 'POST', body: JSON.stringify(body) });
+    $('#gateway-form').reset();
+    $('#gateway-sandbox').checked = true;
+    $('#gateway-error').textContent = '';
+    toast(`Published /gw/${body.id}/`);
+    loadAdmin();
+  } catch (error) {
+    $('#gateway-error').textContent = error.message;
+  }
+});
+
+$('#access-gateways').addEventListener('click', async (event) => {
+  const id = event.target.closest?.('[data-remove-gateway]')?.dataset.removeGateway;
+  if (!id || !confirm(`Stop publishing /gw/${id}/?`)) return;
+  try {
+    await api(`/api/auth/gateways/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    loadAdmin();
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
 /* ------------------------------- stats --------------------------------- */
 
 async function loadStats() {
@@ -734,6 +1092,15 @@ let treeData = null;
 let selectedDir = null;
 /** Folders left open, kept across reloads so something just created stays in view. */
 const expandedDirs = new Set(['wiki']);
+/** Linked folders in the tree: mirror path → the folder on this Mac it is mirrored from. Filled by loadTree. */
+const linkedDests = new Map();
+/** The folder on this Mac a path is mirrored from, or null — everything under a linked mirror is. */
+function mirroredSource(path) {
+  for (const [dest, source] of linkedDests) if (path === dest || path.startsWith(`${dest}/`)) return source;
+  return null;
+}
+/** The last path typed into an import, offered again next time. */
+let lastImportSource = '';
 
 /** How many files and bytes go into one upload request — a folder can hold thousands. */
 const UPLOAD_BATCH_FILES = 40;
@@ -799,8 +1166,9 @@ function renderTree(node, container) {
       if (!expandedDirs.has(child.path)) div.classList.add('collapsed');
       if (child.path === selectedDir) label.classList.add('picked');
       const paint = () => {
-        label.textContent = `${div.classList.contains('collapsed') ? '▸' : '▾'} ${child.name}`;
+        label.textContent = `${div.classList.contains('collapsed') ? '▸' : '▾'} ${child.name}${child.linked ? ' 🔗' : ''}`;
       };
+      if (child.linked) label.title = `linked to ${child.linked} — mirrored from there and kept in sync; edit the originals, not these copies`;
       paint();
       label.addEventListener('click', () => {
         // one click both picks the folder new items go into and opens it
@@ -828,14 +1196,29 @@ function renderTree(node, container) {
 /** What a right-click on a row offers, for that row — never for what is selected elsewhere. */
 function nodeMenu(node) {
   const dir = node.kind === 'dir';
-  const movable = isWritable(node.path) && node.path !== 'wiki' && node.path !== 'raw/docs';
+  // a linked folder's mirror is written by the link alone: nothing is created,
+  // renamed, moved or deleted inside it from here
+  const mirrored = mirroredSource(node.path);
+  const linkRoot = dir && linkedDests.has(node.path);
+  const movable = isWritable(node.path) && node.path !== 'wiki' && node.path !== 'raw/docs' && !mirrored;
   const items = [];
-  if (dir && isWritable(node.path)) {
+  if (dir && isWritable(node.path) && !mirrored) {
     items.push({ label: 'New file here…', run: () => { pickDir(node.path); newFile(node.path); } });
     items.push({ label: 'New folder here…', run: () => { pickDir(node.path); newFolder(node.path); } });
     items.push('-');
     items.push({ label: 'Upload files here…', run: () => { pickDir(node.path); pickUpload('files', node.path); } });
     items.push({ label: 'Upload folder here…', run: () => { pickDir(node.path); pickUpload('folder', node.path); } });
+    if (/^raw\/docs(\/|$)/.test(node.path)) {
+      items.push('-');
+      items.push({ label: 'Import folder from this Mac here…', run: () => { pickDir(node.path); importLocalFolder('copy', node.path); } });
+      items.push({ label: 'Link folder from this Mac here…', run: () => { pickDir(node.path); importLocalFolder('link', node.path); } });
+    }
+    items.push('-');
+  }
+  if (linkRoot) {
+    items.push({ label: 'Sync linked folder now', run: () => syncLinkedFolder(node.path) });
+    items.push({ label: 'Unlink (keep the copies)…', run: () => unlinkFolderNode(node, false) });
+    items.push({ label: 'Unlink and remove the copies…', danger: true, run: () => unlinkFolderNode(node, true) });
     items.push('-');
   }
   if (!dir) items.push({ label: 'Open', run: () => openFile(node.path) });
@@ -867,6 +1250,12 @@ function paintDestination() {
 
 async function loadTree() {
   treeData = await api('/api/tree');
+  linkedDests.clear();
+  const collect = (node) => {
+    if (node.linked) linkedDests.set(node.path, node.linked);
+    for (const child of node.children || []) collect(child);
+  };
+  collect(treeData);
   const el = $('#filetree');
   el.innerHTML = '';
   renderTree(treeData, el);
@@ -1050,7 +1439,16 @@ const fmtBytes = (bytes) => (bytes >= 1e6 ? `${(bytes / 1e6).toFixed(1)} MB` : `
  * past the cap. `canLoadFull` says the whole file still fits in one read, so
  * the user can promote the preview to a real edit.
  */
-function readOnlyNotice(derived, truncated, bytes) {
+function readOnlyNotice(derived, truncated, bytes, path = currentFile) {
+  // The mirror of a linked folder follows its source: a save here would be
+  // undone by the next sync (and the service refuses it).
+  const mirrored = path ? mirroredSource(path) : null;
+  if (mirrored) {
+    return {
+      text: `Mirrored from ${mirrored} — kept in sync with the original there, so it is read-only here. Edit the original instead.`,
+      canLoadFull: false,
+    };
+  }
   // Derived text is knode-os's rendering of a PDF or image. It is read-only
   // whatever its size: writing it back would replace the original's bytes, so
   // this is checked before the size rule and never offers a full load.
@@ -1099,7 +1497,7 @@ function renderFileContent(path, content, derived, truncated, bytes) {
   // derived text (a PDF / image's Markdown) is knode-os's, not the user's: readable, never editable here
   $('#file-view').innerHTML = path.endsWith('.md') || derived ? renderMd(content) : `<pre>${esc(content)}</pre>`;
   $('#file-editor').value = content;
-  const notice = readOnlyNotice(derived, truncated, bytes);
+  const notice = readOnlyNotice(derived, truncated, bytes, path);
   setFileNotice(notice);
   $('#btn-edit').textContent = 'edit';
   $('#btn-edit').disabled = Boolean(notice);
@@ -1121,7 +1519,7 @@ async function openFile(path, labelEl) {
     $('#file-view').hidden = false;
     $('#file-editor').hidden = true;
     renderFileContent(path, content, derived, truncated, bytes);
-    $('#btn-delete').disabled = false;
+    $('#btn-delete').disabled = Boolean(mirroredSource(path));
   } catch (e) {
     toast(`open failed: ${e.message}`);
   }
@@ -1181,8 +1579,113 @@ $('#btn-add').addEventListener('click', (ev) => {
     '-',
     { label: 'Upload files…', run: () => pickUpload('files') },
     { label: 'Upload folder…', run: () => pickUpload('folder') },
+    '-',
+    { label: 'Import folder from this Mac…', run: () => importLocalFolder('copy', dir) },
+    { label: 'Link folder from this Mac (keep in sync)…', run: () => importLocalFolder('link', dir) },
   ]);
 });
+
+/* ------------------------ folders from this Mac -------------------------- */
+
+const fmtCount = (n, noun) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+
+/**
+ * Import a folder that lives on this Mac, by its absolute path: copied once
+ * (`copy`) or mirrored and kept in sync (`link`). The browser cannot hand over
+ * a local path, so it is typed; the service reads the folder and says what it
+ * would carry before anything is written.
+ */
+async function importLocalFolder(mode, dir) {
+  const verb = mode === 'link' ? 'link' : 'import';
+  const source = prompt(
+    mode === 'link'
+      ? 'Absolute path of the folder on this Mac to link.\nIts files are mirrored into raw/docs and kept in sync: every change there is indexed, and the copies are read-only here.'
+      : 'Absolute path of the folder on this Mac to import.\nIts files are copied once into raw/docs with the folder structure kept.',
+    lastImportSource || '/Users/',
+  );
+  if (source === null) return;
+  const trimmed = source.trim();
+  if (!trimmed) return;
+  lastImportSource = trimmed;
+  // the picked folder when it can take the mirror, else the root of raw/docs
+  const base = isWritable(dir) && /^raw\/docs(\/|$)/.test(dir) && !mirroredSource(dir) ? dir : 'raw/docs';
+  const name = trimmed.replace(/\/+$/, '').split('/').pop();
+  toast('reading the folder…', 60000);
+  let plan;
+  try {
+    plan = await api('/api/folders/preview', { method: 'POST', body: JSON.stringify({ source: trimmed, dest: `${base}/${name}` }) });
+  } catch (e) {
+    toast(`${verb} failed: ${e.message}`, 6000);
+    return;
+  }
+  if (plan.linked) {
+    toast(`${plan.linked.dest} is already linked to ${plan.linked.source}`, 6000);
+    return;
+  }
+  const lines = [
+    `${mode === 'link' ? 'Link' : 'Import'} ${plan.source}`,
+    `→ ${plan.dest}`,
+    '',
+    `${fmtCount(plan.files, 'file')}, ${fmtBytes(plan.bytes)}${plan.sample.length ? ` — e.g. ${plan.sample.slice(0, 3).join(', ')}` : ''}.`,
+  ];
+  if (plan.tooLarge) lines.push(`${fmtCount(plan.tooLarge, 'file')} over ${fmtBytes(EDIT_BYTE_CAP)} will be copied but not indexed.`);
+  if (plan.skippedByType) lines.push(`${fmtCount(plan.skippedByType, 'file')} of types knode-os cannot index stay behind.`);
+  if (plan.exists) lines.push('', `${plan.dest} already exists: it becomes a mirror of this folder, and files only it has are removed.`);
+  if (mode === 'link') lines.push('', 'The copies are kept in sync while knode-os runs. Edit the originals, not the copies.');
+  lines.push('', 'Continue?');
+  if (!confirm(lines.join('\n'))) return;
+  toast(`${mode === 'link' ? 'linking' : 'importing'} ${fmtCount(plan.files, 'file')} — copying and indexing…`, 600000);
+  try {
+    const res = await api('/api/folders/import', { method: 'POST', body: JSON.stringify({ source: trimmed, dest: plan.dest, mode, replace: plan.exists }) });
+    reveal(res.dest);
+    await loadTree();
+    loadStats();
+    const indexed = res.sync ? ` · ${res.sync.indexed} indexed${res.sync.skipped ? `, ${res.sync.skipped} skipped` : ''}` : '';
+    toast(`${mode === 'link' ? 'linked' : 'imported'} ${res.dest}: ${fmtCount(res.copied.length, 'file')} copied${indexed}`, 6000);
+  } catch (e) {
+    toast(`${verb} failed: ${e.message}`, 6000);
+  }
+}
+
+async function syncLinkedFolder(dest) {
+  toast(`syncing ${dest} from its source…`, 600000);
+  try {
+    const { results } = await api('/api/folders/sync', { method: 'POST', body: JSON.stringify({ dest }) });
+    const r = results[0];
+    await loadTree();
+    loadStats();
+    if (!r) toast('nothing to sync');
+    else if (r.sourceMissing) toast(`${dest}: its source folder is not there — nothing changed`, 5000);
+    else toast(`${dest}: ${r.copied} copied, ${r.removed} removed${r.sync ? ` · ${r.sync.indexed} indexed, ${r.sync.disposed} disposed` : ' · already up to date'}`, 5000);
+  } catch (e) {
+    toast(`sync failed: ${e.message}`, 5000);
+  }
+}
+
+async function unlinkFolderNode(node, removeFiles) {
+  const source = linkedDests.get(node.path);
+  const question = removeFiles
+    ? `Unlink ${node.path} from ${source} and delete the ${fmtCount(fileCount(node), 'copied file')}?\n\nTheir knowledge is disposed (history stays in the ledger). The originals are not touched.`
+    : `Unlink ${node.path} from ${source}?\n\nThe copies stay as ordinary documents and stop following the source.`;
+  if (!confirm(question)) return;
+  toast(removeFiles ? `unlinking and removing ${node.path}…` : `unlinking ${node.path}…`, 600000);
+  try {
+    await api(`/api/folders?dest=${encodeURIComponent(node.path)}&removeFiles=${removeFiles ? 1 : 0}`, { method: 'DELETE' });
+    if (removeFiles && currentFile && (currentFile === node.path || currentFile.startsWith(`${node.path}/`))) {
+      currentFile = null;
+      $('#file-path').textContent = '';
+      $('#file-view').innerHTML = '';
+      setFileNotice(null);
+      $('#btn-edit').disabled = true;
+      $('#btn-delete').disabled = true;
+    }
+    await loadTree();
+    loadStats();
+    toast(removeFiles ? `unlinked and removed ${node.path}` : `unlinked ${node.path} — its files stay as ordinary documents`, 5000);
+  } catch (e) {
+    toast(`unlink failed: ${e.message}`, 5000);
+  }
+}
 
 $('#btn-clear-dir').addEventListener('click', () => {
   selectedDir = null;
@@ -1238,8 +1741,9 @@ async function uploadFiles(files, dir) {
       form.set('dir', dir);
       // a folder upload sends each file's path inside it, so the subtree is recreated
       for (const file of batch) form.append('files', file, file.webkitRelativePath || file.name);
-      const res = await fetch('/api/upload', { method: 'POST', headers: workspaceRequestHeaders(), body: form });
+      const res = await fetch('/api/upload', { method: 'POST', headers: { 'x-knode-csrf': '1', ...workspaceRequestHeaders() }, body: form, credentials: 'same-origin' });
       const data = await res.json().catch(() => ({}));
+      if (res.status === 401 && data.reason === 'auth') sessionEnded(data.error);
       if (!res.ok) throw new Error(data.error || res.statusText);
       saved += data.saved.length;
       toast(`uploading ${saved}/${files.length} files into ${dir}…`, 60000);
@@ -2213,6 +2717,9 @@ document.addEventListener('click', (event) => {
 let connectionDrafts = [];
 let embeddingDrafts = [];
 let embeddingUse = '';
+let embeddingPoolDraft = { enabled: false, model: 'bge-m3', dimensions: 1024, batchSize: 16 };
+let embeddingUsage = [];
+const defaultEmbeddingLimits = { requestsPerMinute: 60, tokensPerMinute: 100000, requestsPerDay: 5000, tokensPerDay: 1000000, concurrency: 2, resetTimezone: 'UTC' };
 /** Which connection is the default — the mirror of `embeddingUse`. */
 let llmUse = '';
 /** Provider ids whose row is open, kept across a redraw. */
@@ -2381,6 +2888,7 @@ const activeEmbedding = () =>
 const summaryLine = (t) => (t.model ? `${t.provider} · ${t.model}` : t.provider);
 
 function embeddingSummaryText() {
+  if (embeddingPoolDraft.enabled) return { provider: 'Model pool', model: embeddingPoolDraft.model };
   const active = activeEmbedding();
   if (!active) return { provider: 'Loading…', model: '' };
   const name = active.label || active.id;
@@ -2408,6 +2916,64 @@ function fillEmbeddingOptions() {
     .join('');
   select.value = embeddingDrafts.some((e) => e.id === embeddingUse) ? embeddingUse : (embeddingDrafts[0]?.id ?? '');
   embeddingUse = select.value;
+  select.disabled = embeddingPoolDraft.enabled;
+  $('#cfg-embedding-route-note').textContent = embeddingPoolDraft.enabled
+    ? `Automatic routing · ${embeddingPoolDraft.model} · ${poolEligibleKeys().length} compatible keys. Manage the pool in Providers & Agents.`
+    : 'Enable a model pool in Providers & Agents to share compatible keys.';
+}
+
+const canonicalEmbeddingModel = (model) => ['bge-m3', 'baai/bge-m3', '@cf/baai/bge-m3'].includes((model || '').toLowerCase()) ? 'bge-m3' : model;
+const poolEligibleKeys = () => embeddingDrafts.filter((e) => {
+  const model = canonicalEmbeddingModel(embeddingPoolDraft.model);
+  return e.enabled !== false && e.provider === 'openai' && [e.model, ...(e.catalog || [])].some((id) => canonicalEmbeddingModel(id) === model)
+    && (model === 'bge-m3' ? embeddingPoolDraft.dimensions === 1024 : e.model === model && e.dimensions === embeddingPoolDraft.dimensions);
+});
+
+function renderEmbeddingPool() {
+  const pool = embeddingPoolDraft;
+  const models = [...new Set(embeddingDrafts.flatMap((e) => [e.model, ...(e.catalog || [])]).filter(Boolean).map(canonicalEmbeddingModel))].sort();
+  $('#cfg-embedding-pool').innerHTML = `<div class="embedding-pool-head"><h4>Embedding model pool</h4>
+    <label class="cfg-check"><input data-pool="enabled" type="checkbox"${pool.enabled ? ' checked' : ''} /> Automatic routing</label></div>
+    <p class="cfg-callout">Choose one model. Compatible keys share the work. Lower priorities run first; equal priorities rotate. Unavailable keys cool down automatically.</p>
+    <div class="cfg-grid cfg-grid-3">
+      <label>Pool model<input data-pool="model" list="embedding-pool-models" value="${esc(pool.model)}" /><datalist id="embedding-pool-models">${models.map((m) => `<option value="${esc(m)}"></option>`).join('')}</datalist></label>
+      <label>Dimensions<input data-pool="dimensions" type="number" min="1" value="${pool.dimensions}" /></label>
+      <label>Texts per request<input data-pool="batchSize" type="number" min="1" max="128" value="${pool.batchSize}" /></label>
+    </div>
+    <div class="embedding-pool-head"><span id="cfg-pool-members" class="mono">${poolEligibleKeys().length} compatible keys · ${embeddingDrafts.length} configured</span>
+    <div class="cfg-actions"><button data-pool-action="models">Refresh all models</button><button data-pool-action="test"${pool.enabled ? '' : ' disabled'}>Test pool</button><button data-pool-action="usage">Refresh usage</button></div></div>
+    <p class="cfg-callout">Pool vectors are L2-normalized. Only matching models and dimensions participate. Changing the pool model re-embeds the workspace; changing keys or limits does not.</p>
+    <div id="cfg-pool-status" role="status"></div>
+    <details><summary>Usage today · shared across workspaces</summary><div class="embedding-usage">${embeddingDrafts.filter((e) => e.provider === 'openai').map((e) => {
+      const u = embeddingUsage.find((u) => u.id === e.id) || {};
+      const limit = { ...defaultEmbeddingLimits, ...e.limits };
+      return `<div><span>${esc(e.label)}</span><span>${u.requestsToday || 0} / ${limit.requestsPerDay} req</span><span>${u.tokensToday || 0} / ${limit.tokensPerDay} tokens</span><span>${u.cooldownUntil > Date.now() ? 'Cooling down' : esc(limit.resetTimezone)}</span></div>`;
+    }).join('')}</div><p class="cfg-callout">App usage persists across restarts. Tokens use provider usage when available, otherwise a conservative estimate. Other apps are not included. Zero limits block requests.</p></details>`;
+}
+
+async function refreshEmbeddingUsage() {
+  const scope = activeWorkspace()?.id;
+  const result = await api('/api/config/embedding-usage');
+  if (activeWorkspace()?.id !== scope) return;
+  embeddingUsage = result.entries || [];
+  renderEmbeddingPool();
+}
+
+function embeddingKeyLimits(entry) {
+  if (entry.provider !== 'openai') return '';
+  const limits = { ...defaultEmbeddingLimits, ...entry.limits };
+  const fields = [['requestsPerMinute', 'Requests / minute'], ['tokensPerMinute', 'Tokens / minute'], ['concurrency', 'Concurrent requests'], ['requestsPerDay', 'Requests / day'], ['tokensPerDay', 'Tokens / day']];
+  return `<div class="embedding-key-limits"><div class="embedding-pool-head">
+      <label class="cfg-check"><input data-field="enabled" type="checkbox"${entry.enabled !== false ? ' checked' : ''} /> Include in model pools</label>
+      <button data-embedding-action="test">Test key</button></div>
+    <div class="cfg-grid cfg-grid-3">${fields.map(([name, label]) => `<label>${label}<input data-limit="${name}" type="number" min="${name === 'concurrency' ? 1 : 0}" value="${limits[name]}" /></label>`).join('')}
+      <label>Daily reset timezone<input data-limit="resetTimezone" value="${esc(limits.resetTimezone)}" /></label>
+      <label>Priority · lower first<input data-field="priority" type="number" min="0" value="${entry.priority ?? 10}" /></label>
+      <label>Shared account quota group<input data-field="quotaGroup" value="${esc(entry.quotaGroup || '')}" placeholder="Same account → same group" /></label>
+      <label>OpenRouter upstream (optional)<input data-field="upstream" value="${esc(entry.upstream || '')}" placeholder="deepinfra/fp32" /></label>
+    </div><p class="cfg-callout">${esc(entry.limitNote || 'Application limits. Use the same quota group for keys belonging to one provider account.')}</p>
+    <div class="embedding-pool-head"><strong>Available embedding models · ${(entry.catalog || []).length}</strong><button data-embedding-action="models">Refresh models</button></div>
+    <p class="embedding-catalog mono">${esc((entry.catalog || []).join(' · ') || 'Refresh to list the embedding models this key can access.')}</p></div>`;
 }
 
 /** The stages that name a model or an agent, by their fields' prefix (`#cfg-<prefix>-use`, `<prefix>Llm`). */
@@ -2555,11 +3121,11 @@ function embeddingFields(entry) {
       <label>Provider<select data-field="provider">${optionsFor(EMBEDDING_PROVIDER_OPTIONS, entry.provider)}</select></label>
       <label>Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="${entry.provider === 'ark-multimodal' ? 'ep-…' : 'text-embedding-3-small'}"${api ? '' : ' disabled'} />${api ? modelChevron(`embedding:${entry.id}`) : ''}</span></label>
       <label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1"${api ? '' : ' disabled'} /></label>
-      <label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY"${api ? '' : ' disabled'} /></label>
+      <label>API key<input data-field="apiKey" type="password" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY"${api ? '' : ' disabled'} /></label>
       <label>Dimensions<input data-field="dimensions" type="number" min="1" step="1" value="${esc(entry.dimensions ?? '')}" /></label>
     </div>
     <label class="cfg-check"><input data-field="sendDimensions" type="checkbox"${entry.sendDimensions ? ' checked' : ''}${api ? '' : ' disabled'} /> Send the <span class="mono">dimensions</span> parameter with API requests</label>
-    <p class="cfg-callout">${esc(EMB_NOTES[entry.provider] ?? EMB_NOTES.openai)}</p>`;
+    <p class="cfg-callout">${esc(EMB_NOTES[entry.provider] ?? EMB_NOTES.openai)}</p>${embeddingKeyLimits(entry)}`;
 }
 
 /**
@@ -2578,6 +3144,7 @@ function llmFields(entry, route) {
 }
 
 function renderProviders() {
+  renderEmbeddingPool();
   const rows = embeddingDrafts.map((e) =>
     providerRow({
       kind: 'embedding',
@@ -2587,7 +3154,7 @@ function renderProviders() {
       placeholder: 'Name this provider',
       providerLabel: embeddingProviderLabel(e.provider),
       summary: e.provider === 'local' ? `hashing · ${e.dimensions || 384}d` : (e.model ? `${e.model} · ${e.dimensions || ''}d` : ''),
-      isDefault: e.id === embeddingUse,
+      isDefault: !embeddingPoolDraft.enabled && e.id === embeddingUse,
       // something has to embed, so the last one stays
       removable: embeddingDrafts.length > 1,
       fields: embeddingFields(e),
@@ -2684,6 +3251,9 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     loadedConfig = cfg;
     embeddingDrafts = (cfg.embeddingProviders ?? []).map((e) => ({ ...e }));
     embeddingUse = cfg.embeddingUse || embeddingDrafts[0]?.id || '';
+    embeddingPoolDraft = { enabled: false, model: 'bge-m3', dimensions: 1024, batchSize: 16, ...cfg.embeddingPool };
+    embeddingUsage = [];
+    void refreshEmbeddingUsage().catch(() => {});
     connectionDrafts = (cfg.connections ?? []).map((c) => ({ ...c }));
     llmUse = cfg.llmUse || connectionDrafts[0]?.id || '';
     // agents before routes: a stage may run on an agent, and a route
@@ -2703,7 +3273,7 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     void showExtractionQueue();
     $('#cfg-ingest-concurrency').value = cfg.ingest?.concurrency ?? 4;
     $('#cfg-ingest-convert').value = cfg.ingest?.convertConcurrency ?? 2;
-    $('#cfg-emb-batch').value = activeEmbedding()?.batchSize ?? 32;
+    $('#cfg-emb-batch').value = embeddingPoolDraft.enabled ? embeddingPoolDraft.batchSize : activeEmbedding()?.batchSize ?? 32;
     fillResearchForm(cfg.research ?? {});
     fillChatForm(cfg.chat ?? {});
     renderAgents();
@@ -2751,9 +3321,10 @@ function gatherConfig() {
       ...e,
       label: (e.label || '').trim() || e.id,
       // the request size is edited on the Index node, not in the provider row
-      batchSize: e.id === embeddingUse ? Number($('#cfg-emb-batch').value) || e.batchSize : e.batchSize,
+      batchSize: !embeddingPoolDraft.enabled && e.id === embeddingUse ? Number($('#cfg-emb-batch').value) || e.batchSize : e.batchSize,
     })),
     embeddingUse,
+    embeddingPool: { ...embeddingPoolDraft, ...(embeddingPoolDraft.enabled ? { batchSize: Number($('#cfg-emb-batch').value) || embeddingPoolDraft.batchSize } : {}) },
     ingest: {
       concurrency: Number($('#cfg-ingest-concurrency').value) || undefined,
       convertConcurrency: Number($('#cfg-ingest-convert').value) || undefined,
@@ -3503,6 +4074,12 @@ $('#cfg-embedding-use').addEventListener('change', (event) => {
 for (const id of ['#cfg-ingest-convert', '#cfg-ingest-concurrency', '#cfg-emb-batch', '#cfg-extraction-concurrency', '#cfg-extraction-batch']) {
   $(id).addEventListener('input', renderStageFlow);
 }
+$('#cfg-emb-batch').addEventListener('input', (event) => {
+  if (embeddingPoolDraft.enabled) {
+    embeddingPoolDraft.batchSize = Number(event.target.value);
+    $('#cfg-embedding-pool [data-pool="batchSize"]').value = event.target.value;
+  }
+});
 
 $('#cfg-add-provider').addEventListener('click', (event) => {
   showMenuUnder(event.currentTarget, [
@@ -3524,8 +4101,14 @@ function rowDraft(target) {
 $('#cfg-providers').addEventListener('input', (event) => {
   const field = event.target.dataset?.field;
   const found = rowDraft(event.target);
-  if (!field || !found) return;
-  found.draft[field] = field === 'dimensions' ? Number(event.target.value) || undefined : event.target.value;
+  if (!found) return;
+  const limit = event.target.dataset?.limit;
+  if (limit) {
+    found.draft.limits = { ...defaultEmbeddingLimits, ...found.draft.limits, [limit]: limit === 'resetTimezone' ? event.target.value : Number(event.target.value) };
+    return;
+  }
+  if (!field) return;
+  found.draft[field] = event.target.type === 'checkbox' ? event.target.checked : ['dimensions', 'priority'].includes(field) ? Number(event.target.value) : event.target.value;
   if (field === 'label') fillRouteOptions();
   // the row's own summary column used to refresh on a label edit and never on
   // a model one, so a typed model stayed invisible until the next redraw
@@ -3541,6 +4124,7 @@ $('#cfg-providers').addEventListener('change', (event) => {
   const found = rowDraft(event.target);
   if (!found) return;
   const field = event.target.dataset?.field;
+  if (field === 'enabled') { found.draft.enabled = event.target.checked; renderEmbeddingPool(); return; }
   if (field === 'sendDimensions') {
     found.draft.sendDimensions = event.target.checked;
     return;
@@ -3565,10 +4149,30 @@ $('#cfg-providers').addEventListener('change', (event) => {
   updateConfigSummaries();
 });
 
-$('#cfg-providers').addEventListener('click', (event) => {
+$('#cfg-providers').addEventListener('click', async (event) => {
   const row = event.target.closest?.('.provider-row');
   if (!row) return;
   const id = row.dataset.id;
+  if (event.target.dataset.embeddingAction) {
+    const draft = embeddingDrafts.find((e) => e.id === id);
+    const scope = activeWorkspace()?.id;
+    if (!draft) return;
+    event.target.disabled = true;
+    try {
+      if (event.target.dataset.embeddingAction === 'models') {
+        const result = await api('/api/config/models', { method: 'POST', body: JSON.stringify({ route: `embedding:${id}`, config: gatherConfig(), refresh: true }) });
+        if (!result.ok) throw new Error(result.error || result.note || 'Catalog unavailable');
+        if (activeWorkspace()?.id !== scope) return;
+        draft.catalog = result.models.map((m) => m.id); renderProviders();
+        toast('Catalog updated. Save & apply to keep it.');
+      } else {
+        const result = await api('/api/config/embedding-test', { method: 'POST', body: JSON.stringify({ id, config: gatherConfig() }) });
+        toast(`Key test passed · ${result.dimensions} dimensions`); await refreshEmbeddingUsage();
+      }
+    } catch (e) { toast(e.message); }
+    finally { event.target.disabled = false; }
+    return;
+  }
 
   if (event.target.classList.contains('provider-toggle')) {
     if (expandedProviders.has(id)) expandedProviders.delete(id); else expandedProviders.add(id);
@@ -3610,6 +4214,49 @@ $('#cfg-providers').addEventListener('click', (event) => {
   fillRouteOptions();
   updateConfigSummaries();
   for (const prefix of ROUTE_PREFIXES) routeProviderToggle(prefix);
+});
+
+$('#cfg-embedding-pool').addEventListener('input', (event) => {
+  const field = event.target.dataset.pool;
+  if (!field) return;
+  embeddingPoolDraft[field] = field === 'enabled' ? event.target.checked : field === 'model' ? event.target.value : Number(event.target.value);
+  if (field === 'model' && canonicalEmbeddingModel(embeddingPoolDraft.model) === 'bge-m3') embeddingPoolDraft.dimensions = 1024;
+  if (field === 'batchSize') $('#cfg-emb-batch').value = embeddingPoolDraft.batchSize;
+  if (field === 'enabled') $('#cfg-emb-batch').value = embeddingPoolDraft.enabled ? embeddingPoolDraft.batchSize : activeEmbedding()?.batchSize ?? 32;
+  fillEmbeddingOptions(); updateConfigSummaries();
+  $('#cfg-pool-members').textContent = `${poolEligibleKeys().length} compatible keys · ${embeddingDrafts.length} configured`;
+  $('#cfg-embedding-pool [data-pool-action="test"]').disabled = !embeddingPoolDraft.enabled;
+});
+
+$('#cfg-embedding-pool').addEventListener('click', async (event) => {
+  const action = event.target.dataset.poolAction;
+  if (!action) return;
+  const scope = activeWorkspace()?.id;
+  const draft = gatherConfig();
+  const rows = [...embeddingDrafts];
+  event.target.disabled = true;
+  const status = (text) => { if (activeWorkspace()?.id === scope) $('#cfg-pool-status').textContent = text; };
+  try {
+    if (action === 'models') {
+      let count = 0; const failures = [];
+      for (const row of rows.filter((e) => e.provider === 'openai')) {
+        if (activeWorkspace()?.id !== scope) return;
+        status(`Loading models: ${row.label}`);
+        try {
+          const result = await api('/api/config/models', { method: 'POST', body: JSON.stringify({ route: `embedding:${row.id}`, config: draft, refresh: true }) });
+          if (!result.ok) throw new Error();
+          row.catalog = result.models.map((m) => m.id); count++;
+        } catch { failures.push(row.label); }
+      }
+      if (activeWorkspace()?.id !== scope) return;
+      renderProviders(); status(`Refreshed ${count} keys. Save & apply to keep the catalog.${failures.length ? ' Unavailable: ' + failures.join(', ') : ''}`);
+    } else if (action === 'test') {
+      status('Testing the model pool…');
+      const result = await api('/api/config/embedding-test', { method: 'POST', body: JSON.stringify({ config: draft }) });
+      await refreshEmbeddingUsage(); status(`Pool test passed · ${result.dimensions} dimensions · ${result.ms} ms`);
+    } else { await refreshEmbeddingUsage(); }
+  } catch (error) { status(error.message); }
+  finally { event.target.disabled = false; }
 });
 
 function setConfigBusy(busy) {

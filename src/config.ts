@@ -41,6 +41,34 @@ export interface EmbeddingConnection extends EmbeddingConfig {
   /** Stable key `embedding.use` references. Never reused for a different endpoint. */
   id: string;
   label: string;
+  /** Opt out of a model pool without deleting the credential. */
+  enabled?: boolean;
+  /** Lower numbers are used first; equal priorities rotate fairly. */
+  priority?: number;
+  /** Keys for one provider account share a quota bucket across workspaces. */
+  quotaGroup?: string;
+  limits?: EmbeddingLimits;
+  limitNote?: string;
+  /** Last explicitly refreshed embedding catalog; IDs are provider-native. */
+  catalog?: string[];
+  /** OpenRouter upstream pin, for example deepinfra/fp32. */
+  upstream?: string;
+}
+
+export interface EmbeddingLimits {
+  requestsPerMinute: number;
+  tokensPerMinute: number;
+  requestsPerDay: number;
+  tokensPerDay: number;
+  concurrency: number;
+  resetTimezone: string;
+}
+
+export interface EmbeddingPoolConfig {
+  enabled: boolean;
+  model: string;
+  dimensions: number;
+  batchSize: number;
 }
 
 /**
@@ -240,6 +268,89 @@ export interface ExtractionConfig {
   segmentChars: number;
   /** Minutes between background document passes while `serve` runs. */
   intervalMinutes: number;
+  /**
+   * The worker slots `serve` runs for extraction on this machine (src/labeling):
+   * each names a route target — a connection or an agent, e.g. a Codex and a
+   * Cursor agent — and how many calls it runs at once. Absent or empty: the
+   * Extract stage's own route with `concurrency` slots. Workers on other
+   * machines come in through the remote API and need no entry here.
+   */
+  workers?: ExtractionWorkerConfig[];
+  /** Summary pages written at once by `serve`'s summary loop; default `concurrency`. */
+  summaryConcurrency?: number;
+}
+
+/** One kind of local labeling worker: what it runs on and how many calls at once. */
+export interface ExtractionWorkerConfig {
+  /** A route target id (`routeTargets`): a connection or an agent. */
+  use: string;
+  /** Calls in flight at once; 0 turns the worker off. */
+  slots: number;
+  /** Overrides the target's model / effort / speed / timeout for these calls. */
+  model?: string;
+  effort?: LlmEffort;
+  speed?: LlmSpeed;
+  cliTimeoutMs?: number;
+}
+
+/**
+ * The remote API (src/remote): labeling and knowledge access for other
+ * machines, under /remote/v1 on the same port, authenticated by per-machine
+ * tokens (`knode-os remote token create`). With sign-in off, requests from
+ * outside this machine reach these routes and nothing else (src/server/public-guard.ts).
+ */
+export interface RemoteApiConfig {
+  enabled: boolean;
+  /** Largest request body accepted, in bytes. */
+  maxBodyBytes?: number;
+  /** How long a labeling worker may hold a segment before it goes back in line (renewable). */
+  leaseMinutes?: number;
+}
+
+/**
+ * Sign-in for `serve` (src/auth): accounts in `.knode/accounts.json`, made
+ * with `knode-os user add` or, on a server with none yet, from the web UI or
+ * the app on this machine. Every request to the UI's API, /gw and the app
+ * needs a session, local or not; other machines must also come over HTTPS.
+ */
+export interface AuthConfig {
+  /** Off: serve trusts the workspace headers a client sends and answers only /remote/v1 from outside — for development. */
+  enabled: boolean;
+  /** Days a browser or app session lives without use. */
+  sessionDays?: number;
+  /**
+   * Answer other machines over plain HTTP. Only on a network that encrypts by
+   * itself (a VPN such as Tailscale or WireGuard): passwords and sessions
+   * cross it in the clear otherwise.
+   */
+  allowInsecureRemote?: boolean;
+}
+
+/**
+ * A second, HTTPS listener for reaching `serve` by IP address or a name of
+ * your own: the main one stays plain HTTP on loopback, for this machine, the
+ * MCP endpoint and a tunnel in front of it.
+ */
+export interface TlsListenerConfig {
+  port: number;
+  /** Address to listen on; "0.0.0.0" or "::" for every interface. */
+  host: string;
+  /** PEM certificate (chain) and private key; relative paths are under the data root. `knode-os tls init` makes a self-signed pair. */
+  cert: string;
+  key: string;
+}
+
+/**
+ * A folder elsewhere on this machine mirrored into raw/docs and kept in sync
+ * while `serve` runs (src/ingest/folders.ts). Written by the folder routes and
+ * `knode-os folders link`, never by hand.
+ */
+export interface LinkedFolder {
+  /** Absolute path of the folder outside the workspace. */
+  source: string;
+  /** Its mirror inside the workspace, a folder under raw/docs. */
+  dest: string;
+  createdAt: string;
 }
 
 export interface IngestConfig {
@@ -247,6 +358,8 @@ export interface IngestConfig {
   chunkOverlap: number;
   /** Re-sync automatically when files under the data dir change. */
   watch: boolean;
+  /** Folders mirrored from elsewhere on this machine; absent or empty when none is linked. */
+  linkedFolders?: LinkedFolder[];
   /** Parallel documents in flight during the index pass; embedding round-trips dominate. */
   concurrency?: number;
   /**
@@ -560,6 +673,8 @@ export interface KnodeConfig {
   embeddingProviders: EmbeddingConnection[];
   /** Which `embeddingProviders` entry the Index stage runs on. */
   embeddingUse: string;
+  /** One vector space, with compatible credentials selected at request time. */
+  embeddingPool?: EmbeddingPoolConfig;
   database: DatabaseConfig;
   /**
    * A mirror of the connection `llmUse` names, flattened by `syncActiveLlm`.
@@ -593,7 +708,7 @@ export interface KnodeConfig {
    * kept like `agentLlms`.
    */
   modelAgents?: ModelAgent[];
-  server: { port: number; host: string; mcp: McpServerConfig };
+  server: { port: number; host: string; mcp: McpServerConfig; remote?: RemoteApiConfig; auth?: AuthConfig; tls?: TlsListenerConfig | null };
   ingest: IngestConfig;
   extraction: ExtractionConfig;
   retrieval: { sag: SagSearchConfig };
@@ -679,7 +794,14 @@ export function defaultConfig(): KnodeConfig {
     // default's row on load instead.
     connections: [],
     llmUse: '',
-    server: { port: 9100, host: '127.0.0.1', mcp: { enabled: true, path: '/mcp' } },
+    server: {
+      port: 9100,
+      host: '127.0.0.1',
+      mcp: { enabled: true, path: '/mcp' },
+      remote: { enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15 },
+      auth: { enabled: true, sessionDays: 30, allowInsecureRemote: false },
+      tls: null,
+    },
     ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4, convertConcurrency: 2 },
     extraction: {
       claims: true,
@@ -1379,9 +1501,16 @@ export function activeEmbedding(
  * runs, so that diff keeps comparing two plain endpoints.
  */
 export function syncActiveEmbedding(config: KnodeConfig): KnodeConfig {
-  const { id, label, ...endpoint } = activeEmbedding(config);
-  config.embedding = endpoint;
-  config.embeddingUse = id;
+  const entry = activeEmbedding(config);
+  config.embeddingUse = entry.id;
+  const pool = config.embeddingPool;
+  config.embedding = pool?.enabled ? {
+    provider: 'openai', baseUrl: 'pool://l2-v1', apiKey: '', model: pool.model,
+    dimensions: pool.dimensions, batchSize: pool.batchSize, sendDimensions: false,
+  } : {
+    provider: entry.provider, baseUrl: entry.baseUrl, apiKey: entry.apiKey, model: entry.model,
+    dimensions: entry.dimensions, batchSize: entry.batchSize, sendDimensions: entry.sendDimensions,
+  };
   return config;
 }
 
@@ -1428,7 +1557,8 @@ export function saveConfig(dataDir: string, config: KnodeConfig): void {
   const file = path.join(dataDir, CONFIG_FILE);
   // derived from the agent files; writing them would make two copies to disagree
   const { agentLlms: _derived, modelAgents: _alsoDerived, ...persisted } = config;
-  fs.writeFileSync(file, JSON.stringify(persisted, null, 2) + '\n');
+  fs.writeFileSync(file, JSON.stringify(persisted, null, 2) + '\n', { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
 }
 
 /** Resolve "env:VAR" indirection in API keys. */

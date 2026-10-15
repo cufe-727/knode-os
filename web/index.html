@@ -33,37 +33,47 @@
             <h2>Sign in to knode-os</h2>
             <p>Continue to your personal knowledge workspace and Teams.</p>
           </div>
+          <p id="login-note" class="auth-note" hidden></p>
           <form id="login-form" class="auth-form" novalidate>
             <label for="login-username">Username</label>
-            <input id="login-username" name="username" autocomplete="username" placeholder="admin or test" required />
+            <input id="login-username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="Your username" required />
             <div class="password-label"><label for="login-password">Password</label><button id="btn-toggle-password" type="button">Show</button></div>
             <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required />
             <div class="form-row"><label class="check-row"><input id="login-remember" type="checkbox" checked /> Keep me signed in</label></div>
             <p id="login-error" class="form-error" role="alert"></p>
-            <button class="auth-primary" type="submit">Continue</button>
+            <button id="btn-login" class="auth-primary" type="submit">Sign in</button>
           </form>
-          <p class="auth-switch">New here? <button id="btn-show-register" class="text-button" type="button">Create a local account</button></p>
-          <p class="auth-demo-note">Mock accounts: <span class="mono">admin / admin</span> or <span class="mono">test / test</span>.</p>
+          <p class="auth-demo-note">No account? An administrator of this server creates one for you.</p>
         </div>
 
-        <div id="auth-register" class="auth-step">
-          <button id="btn-register-back" class="auth-back" type="button">Back to sign in</button>
+        <div id="auth-setup" class="auth-step">
           <div class="auth-step-head">
-            <p class="eyebrow">LOCAL ACCOUNT</p>
-            <h2>Create an account</h2>
-            <p>Choose a simple username and password for this browser.</p>
+            <p class="eyebrow">FIRST RUN</p>
+            <h2>Create the administrator</h2>
+            <p>This server has no accounts yet. The first one, made here on the machine knode-os runs on, administers it: settings, users and gateways.</p>
           </div>
-          <form id="register-form" class="auth-form" novalidate>
-            <label for="register-username">Username</label>
-            <input id="register-username" name="username" autocomplete="username" placeholder="3–32 letters or numbers" required />
-            <label for="register-password" class="register-field-label">Password</label>
-            <input id="register-password" name="password" type="password" autocomplete="new-password" placeholder="At least 4 characters" minlength="4" required />
-            <label for="register-confirm" class="register-field-label">Confirm password</label>
-            <input id="register-confirm" name="confirm" type="password" autocomplete="new-password" placeholder="Enter it again" minlength="4" required />
-            <p id="register-error" class="form-error" role="alert"></p>
-            <button class="auth-primary" type="submit">Create account</button>
+          <form id="setup-form" class="auth-form" novalidate>
+            <label for="setup-username">Username</label>
+            <input id="setup-username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="e.g. admin" required />
+            <label for="setup-password" class="register-field-label">Password</label>
+            <input id="setup-password" name="password" type="password" autocomplete="new-password" placeholder="At least 8 characters" minlength="8" required />
+            <label for="setup-confirm" class="register-field-label">Confirm password</label>
+            <input id="setup-confirm" name="confirm" type="password" autocomplete="new-password" placeholder="Enter it again" minlength="8" required />
+            <p id="setup-error" class="form-error" role="alert"></p>
+            <button class="auth-primary" type="submit">Create administrator</button>
           </form>
-          <p class="auth-demo-note">Mock only: this account is stored locally in the current browser.</p>
+          <p class="auth-demo-note">Workspaces of an existing user stay theirs: name the administrator after the folder under <span class="mono">users/</span> to keep yours.</p>
+        </div>
+
+        <div id="auth-nosetup" class="auth-step">
+          <div class="auth-step-head">
+            <p class="eyebrow">NOT SET UP YET</p>
+            <h2>This server has no accounts</h2>
+            <p>The administrator is created on the machine knode-os runs on, never from another one. On that machine, run:</p>
+          </div>
+          <pre class="auth-command">knode-os user add &lt;name&gt; --admin</pre>
+          <p class="auth-demo-note">or open knode-os there, in a browser or the app, and create it on the first screen. Then sign in here.</p>
+          <button id="btn-nosetup-retry" class="auth-primary" type="button">Check again</button>
         </div>
 
         <div id="auth-workspaces" class="auth-step">
@@ -112,6 +122,7 @@
           <div id="workspace-options"></div>
           <button id="btn-open-create-workspace" class="menu-action" type="button">Create workspace</button>
           <button id="btn-open-join-team" class="menu-action" type="button">Join another Team</button>
+          <button id="btn-open-access" class="menu-action" type="button">Account &amp; access</button>
           <button id="btn-sign-out" class="menu-action danger" type="button">Sign out</button>
         </div>
       </div>
@@ -132,7 +143,7 @@
       <aside id="filetree-pane">
         <div class="pane-actions">
           <button id="btn-refresh-tree" title="Refresh — reread the workspace tree from disk">⟳</button>
-          <button id="btn-add" title="Add — a new file or folder, or documents uploaded from disk, into the folder shown below">＋ add</button>
+          <button id="btn-add" title="Add — a new file or folder, documents uploaded from disk, or a folder from this Mac (copied once, or linked and kept in sync), into the folder shown below">＋ add</button>
           <button id="btn-ingest" title="Index — turn new and changed files into knowledge: chunk, embed, extract entities and refresh the wiki. The CLI calls this ingest / sync.">⛁ index</button>
           <input type="file" id="file-upload" multiple hidden />
           <input type="file" id="folder-upload" webkitdirectory hidden />
@@ -297,6 +308,7 @@
         <section class="settings-section" data-subtab="providers" aria-labelledby="providers-title">
           <div class="settings-section-head"><div><p class="section-index">01 · PROVIDERS &amp; AGENTS</p><h3 id="providers-title">Models</h3><p>Each model endpoint and its key, once. Ingest stages pick from this list, and a deepagents agent below runs on one of them.</p></div><span class="section-badge">Configure once</span></div>
 
+          <div id="cfg-embedding-pool" class="cfg-card embedding-pool"></div>
           <div class="provider-table">
             <div class="provider-head">
               <span></span><span>kind</span><span>name</span><span></span><span>provider</span><span>model</span>
@@ -342,7 +354,7 @@
                 <div class="stage-panel-copy">
                   <div class="stage-title"><h4>Index</h4><span class="section-badge">Embedding</span></div>
                   <p>Every chunk becomes a vector for semantic and hybrid recall.</p>
-                  <p class="stage-req">Not an LLM — it uses one of the embedding providers from section 01. Changing which one, or its model or dimensions, re-embeds the whole corpus.</p>
+                  <p class="stage-req">Uses a model pool or a single embedding key. Changing the model or dimensions re-embeds the corpus; rotating keys in a pool does not.</p>
                   <div class="stage-rates">
                     <label>Parallel documents<input id="cfg-ingest-concurrency" type="number" min="1" max="32" step="1" /></label>
                     <label>Texts per request<input id="cfg-emb-batch" type="number" min="1" max="256" step="1" /></label>
@@ -350,7 +362,7 @@
                 </div>
                 <div class="stage-control">
                   <label>Run with<select id="cfg-embedding-use"></select></label>
-                  <p class="route-note">One provider at a time — vectors from two models are not comparable. Switching re-embeds the whole corpus when you save.</p>
+                  <p class="route-note" id="cfg-embedding-route-note">Manage model pools and per-key budgets in Providers &amp; Agents.</p>
                 </div>
               </div>
 
@@ -486,8 +498,84 @@
         </section>
       </div>
     </section>
+
+    <!-- Account & access: who you are signed in as, and (administrators) the users and gateways of this server -->
+    <section id="tab-access" class="tab">
+      <div class="settings-wrap">
+        <div class="settings-hero">
+          <div><p class="eyebrow">ACCOUNT &amp; ACCESS</p><h2 class="settings-title">Who can reach this knowledge, and from where.</h2><p id="access-summary">Signed in.</p></div>
+        </div>
+
+        <section class="settings-section" aria-labelledby="account-title">
+          <div class="settings-section-head"><div><p class="section-index">01 · YOUR ACCOUNT</p><h3 id="account-title">Account</h3><p>A new password ends every other session of yours — browsers, apps and script tokens.</p></div><span id="access-role" class="section-badge">member</span></div>
+          <div class="access-grid">
+            <form id="password-form" class="cfg-card" novalidate>
+              <div class="cfg-card-title"><b>Change password</b></div>
+              <label>Current password<input id="password-current" type="password" autocomplete="current-password" required /></label>
+              <label>New password<input id="password-new" type="password" autocomplete="new-password" minlength="8" required /></label>
+              <label>Confirm new password<input id="password-confirm" type="password" autocomplete="new-password" minlength="8" required /></label>
+              <p id="password-error" class="form-error" role="alert"></p>
+              <div class="cfg-actions"><button class="primary" type="submit">Change password</button></div>
+            </form>
+            <div class="cfg-card">
+              <div class="cfg-card-title"><b>Signed-in sessions</b><button id="btn-signout-others" type="button" class="ghost">Sign out others</button></div>
+              <div id="access-sessions" class="access-list"></div>
+              <div class="cfg-card-title"><b>What you may use here</b></div>
+              <div id="access-groups" class="access-chips"></div>
+              <div id="access-gateways-mine"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-section admin-only" aria-labelledby="users-title" hidden>
+          <div class="settings-section-head"><div><p class="section-index">02 · USERS</p><h3 id="users-title">Users of this server</h3><p>Members open their own workspaces and the Teams listed for them, and never settings. From other machines an account may use only the API groups ticked for it. Ask and Research run coding agents on this machine — give them only to people you trust with it.</p></div><span class="section-badge accent2">Admin</span></div>
+          <div class="cfg-card">
+            <table class="access-table"><thead><tr><th>user</th><th>role</th><th>teams</th><th>from other machines</th><th>gateways</th><th>sessions</th><th></th></tr></thead><tbody id="access-users"></tbody></table>
+            <div class="cfg-actions"><button id="btn-add-user" type="button">＋ Add user</button></div>
+          </div>
+        </section>
+
+        <section class="settings-section admin-only" aria-labelledby="gateways-title" hidden>
+          <div class="settings-section-head"><div><p class="section-index">03 · GATEWAYS</p><h3 id="gateways-title">Local services, published under /gw</h3><p>A signed-in account allowed a gateway reaches the service at <span class="mono">/gw/&lt;id&gt;/…</span> — knode credentials stay here, the service sees <span class="mono">X-Knode-User</span>. Targets must be on this machine.</p></div><span class="section-badge accent2">Admin</span></div>
+          <div class="cfg-card">
+            <table class="access-table"><thead><tr><th>id</th><th>forwards to</th><th>description</th><th></th></tr></thead><tbody id="access-gateways"></tbody></table>
+            <form id="gateway-form" class="access-inline" novalidate>
+              <input id="gateway-id" placeholder="id, e.g. homebook" autocomplete="off" required />
+              <input id="gateway-target" placeholder="http://127.0.0.1:12200/api" autocomplete="off" required />
+              <input id="gateway-description" placeholder="description (optional)" autocomplete="off" />
+              <label class="check-row"><input id="gateway-sandbox" type="checkbox" checked /> sandboxed</label>
+              <button type="submit">Publish</button>
+            </form>
+            <p id="gateway-error" class="form-error" role="alert"></p>
+          </div>
+        </section>
+      </div>
+    </section>
     </main>
   </div>
+
+  <dialog id="user-dialog" class="team-dialog user-dialog">
+    <form id="user-form" novalidate>
+      <div class="dialog-head"><p class="eyebrow">ACCOUNT</p><h2 id="user-dialog-title">Add a user</h2><p id="user-dialog-hint">They sign in with this username and password, here or from other machines you allow.</p></div>
+      <label for="user-username">Username</label>
+      <input id="user-username" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="lower-case letters, digits, . _ -" required />
+      <label for="user-name">Display name</label>
+      <input id="user-name" autocomplete="off" placeholder="optional" />
+      <label for="user-password" id="user-password-label">Password</label>
+      <input id="user-password" type="password" autocomplete="new-password" placeholder="At least 8 characters" />
+      <label for="user-role">Role</label>
+      <select id="user-role"><option value="member">Member</option><option value="admin">Administrator</option></select>
+      <label for="user-teams">Teams (comma-separated, * for all)</label>
+      <input id="user-teams" autocomplete="off" placeholder="e.g. knode-labs" />
+      <p class="dialog-label">From other machines</p>
+      <div id="user-remote-apis" class="access-checks"></div>
+      <label for="user-gateways">Gateways (comma-separated, * for all)</label>
+      <input id="user-gateways" autocomplete="off" />
+      <label class="check-row" id="user-disabled-row"><input id="user-disabled" type="checkbox" /> Disabled — refuse sign-in</label>
+      <p id="user-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="btn-delete-user" class="danger-button" type="button">Remove</button><span class="spacer"></span><button id="btn-cancel-user" type="button">Cancel</button><button class="primary" type="submit">Save</button></div>
+    </form>
+  </dialog>
 
   <dialog id="join-team-dialog" class="team-dialog">
     <form id="join-team-form" novalidate>

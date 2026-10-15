@@ -154,13 +154,20 @@ struct SettingsView: View {
             .labelsHidden()
             .frame(width: 148)
             .help(L("Interface language — prompts and pages keep the language they are written in"))
-            Button(L("Test stages")) { Task { await test() } }
-                .disabled(config == nil || isWorking)
-                .help(L("Sends one real request per configured stage, before you save."))
-            Button(L("Save & apply")) { Task { await save() } }
-                .buttonStyle(.borderedProminent)
-                .tint(.knodeCyan)
-                .disabled(config == nil || isWorking)
+            if model.maySaveSettings {
+                Button(L("Test stages")) { Task { await test() } }
+                    .disabled(config == nil || isWorking)
+                    .help(L("Sends one real request per configured stage, before you save."))
+                Button(L("Save & apply")) { Task { await save() } }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.knodeCyan)
+                    .disabled(config == nil || isWorking)
+            } else {
+                // the service refuses a member's changes; say so instead of offering them
+                Label(L("Read-only: settings are an administrator's"), systemImage: "lock")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -177,6 +184,7 @@ struct SettingsView: View {
                 title: L("Models"),
                 detail: L("Each model endpoint and its key, once. Ingest stages pick from this list, and a deepagents agent below runs on one of them.")
             )
+            EmbeddingRoutingSection(config: $config)
             VStack(spacing: 0) {
                 providerTableHeader
                 ForEach(Array((config?.embeddingProviders ?? []).enumerated()), id: \.element.id) { index, entry in
@@ -230,7 +238,7 @@ struct SettingsView: View {
         ProviderRow(
             kind: L("Embed"),
             color: .knodeCyan,
-            isDefault: entry.id == config?.embeddingUse,
+            isDefault: config?.embeddingPool?.enabled != true && entry.id == config?.embeddingUse,
             label: binding(\.embeddingProviders)[index].label,
             providerName: embeddingProviderName(entry.provider),
             summary: embeddingRowSummary(entry),
@@ -244,6 +252,13 @@ struct SettingsView: View {
                 route: "embedding:\(entry.id)",
                 load: { refresh in try await modelList(route: "embedding:\(entry.id)", refresh: refresh) }
             )
+            if entry.provider == "openai" {
+                EmbeddingKeyRoutingFields(
+                    entry: binding(\.embeddingProviders)[index],
+                    load: { refresh in try await modelList(route: "embedding:\(entry.id)", refresh: refresh) },
+                    test: { try await model.client().testEmbedding(config!, id: entry.id) }
+                )
+            }
         }
     }
 
@@ -283,7 +298,9 @@ struct SettingsView: View {
 
     private func embeddingRowSummary(_ entry: EmbeddingConnection) -> String {
         let model = entry.provider == "local" ? L("Hashing") : entry.model
-        return model.isEmpty ? L("%@d", String(entry.dimensions)) : "\(model) · \(entry.dimensions)d"
+        let summary = model.isEmpty ? L("%@d", String(entry.dimensions)) : "\(model) · \(entry.dimensions)d"
+        return summary + (entry.enabled == false ? " · " + L("Disabled") : "") +
+            (entry.catalog == nil ? "" : " · " + L("%@ models", String(entry.catalog!.count)))
     }
 
     // MARK: - 02 · Pipeline
@@ -447,6 +464,11 @@ struct SettingsView: View {
             )
         case .index:
             VStack(alignment: .leading, spacing: 10) {
+                if let pool = config?.embeddingPool, pool.enabled {
+                    Label(L("Embedding model pool"), systemImage: "arrow.triangle.branch").foregroundStyle(Color.knodeCyan)
+                    Text("\(pool.model) · \(pool.dimensions)d · \(config?.embeddingProviders.filter { embeddingMatchesPool($0, pool) }.count ?? 0) keys")
+                    Text(L("Manage the pool and key limits in Providers & Agents.")).font(.caption).foregroundStyle(.secondary)
+                } else {
                 FieldLabel(L("Run with")) {
                     Picker(L("Run with"), selection: binding(\.embeddingUse)) {
                         ForEach(config?.embeddingProviders ?? []) { entry in
@@ -455,10 +477,11 @@ struct SettingsView: View {
                     }
                     .labelsHidden()
                 }
-                Text(L("One provider at a time — vectors from two models are not comparable. Switching re-embeds the whole corpus when you save."))
+                Text(L("Enable a model pool in Providers & Agents to share compatible keys. Changing the model re-embeds the workspace."))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
+                }
             }
         case .extract:
             StagePicker(
@@ -608,8 +631,9 @@ struct SettingsView: View {
     /// `batchSize` is optional in the mirror, but the field is a plain number.
     private var embeddingBatchSize: Binding<Int> {
         Binding(
-            get: { config?.embedding.batchSize ?? 32 },
+            get: { config?.embeddingPool?.enabled == true ? config!.embeddingPool!.batchSize : config?.activeEmbedding?.batchSize ?? 32 },
             set: { size in
+                if config?.embeddingPool?.enabled == true { config?.embeddingPool?.batchSize = size; return }
                 guard config != nil, let index = config!.embeddingProviders.firstIndex(where: { $0.id == config!.embeddingUse }) else { return }
                 config!.embeddingProviders[index].batchSize = size
             }
@@ -790,6 +814,9 @@ struct SettingsView: View {
 
     /// An embedding model has one job — Index — while it is the active one.
     private func embeddingUses(_ entry: EmbeddingConnection) -> [RowUse] {
+        if let pool = config?.embeddingPool, pool.enabled {
+            return embeddingMatchesPool(entry, pool) ? [RowUse(label: L("Pool"), color: .knodeCyan)] : []
+        }
         guard entry.id == config?.activeEmbedding?.id else { return [] }
         return [pipelineUse([.index])].compactMap { $0 }
     }
@@ -1063,6 +1090,7 @@ struct SettingsView: View {
             }
             Spacer()
             Button(L("Clear workspace"), role: .destructive) { showingClearConfirmation = true }
+                .disabled(!model.maySaveSettings)
                 .buttonStyle(.bordered)
                 .tint(.knodeBad)
                 .disabled(isWorking)
@@ -1104,6 +1132,7 @@ struct SettingsView: View {
 
     private var embeddingSummary: RouteTarget {
         guard let config else { return RouteTarget(provider: L("Loading…")) }
+        if let pool = config.embeddingPool, pool.enabled { return RouteTarget(provider: L("Embedding model pool"), model: pool.model) }
         guard let active = config.activeEmbedding else {
             return RouteTarget(provider: L("Embedding"), model: config.embedding.model.isEmpty ? L("API model not set") : config.embedding.model)
         }

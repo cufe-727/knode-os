@@ -73,10 +73,10 @@ export interface CatalogResult {
 }
 
 /**
- * Run one read-only SELECT against the catalog views. The statement is wrapped
- * in an outer LIMIT, so a query without one cannot return the whole graph.
+ * The statement a catalog query may run, or an error: one read-only SELECT /
+ * WITH over the catalog views only. Returned trimmed of a trailing semicolon.
  */
-export async function catalogQuery(store: Store, sql: string, opts: { maxRows?: number } = {}): Promise<CatalogResult> {
+export function validateCatalogSql(sql: string): string {
   assertReadOnlySql(sql);
   const trimmed = sql.trim().replace(/;\s*$/, '');
   const first = stripSqlLiterals(trimmed).trim().match(/[a-zA-Z_]+/)?.[0]?.toLowerCase();
@@ -84,8 +84,26 @@ export async function catalogQuery(store: Store, sql: string, opts: { maxRows?: 
     throw new Error(`catalog: only SELECT / WITH statements are supported (got "${first ?? '?'}")`);
   }
   assertCatalogTables(trimmed);
+  return trimmed;
+}
 
-  const maxRows = Math.min(Math.max(opts.maxRows ?? DEFAULT_MAX_ROWS, 1), HARD_MAX_ROWS);
+/** Rows a catalog query may return. */
+export function catalogRowCap(maxRows?: number): number {
+  return Math.min(Math.max(maxRows ?? DEFAULT_MAX_ROWS, 1), HARD_MAX_ROWS);
+}
+
+/** The catalog view names, for grants. */
+export function catalogViewNames(): string[] {
+  return [...VIEW_NAMES];
+}
+
+/**
+ * Run one read-only SELECT against the catalog views. The statement is wrapped
+ * in an outer LIMIT, so a query without one cannot return the whole graph.
+ */
+export async function catalogQuery(store: Store, sql: string, opts: { maxRows?: number } = {}): Promise<CatalogResult> {
+  const trimmed = validateCatalogSql(sql);
+  const maxRows = catalogRowCap(opts.maxRows);
   const started = Date.now();
   const rows = await store.query<Record<string, unknown>>(
     `SELECT * FROM (${trimmed}) AS catalog_query LIMIT $1`,

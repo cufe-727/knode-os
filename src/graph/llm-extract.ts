@@ -2,7 +2,7 @@ import { LLM_EXTRACT_INPUT_CHARS } from '../constants.js';
 import { dateEnd, dateStart } from '../store/dates.js';
 import { Queryable } from '../store/migrations.js';
 import { ScopeWriter } from '../lineage/writer.js';
-import { LlmClient } from '../llm/client.js';
+import { ChatMessage, LlmClient } from '../llm/client.js';
 import { builtinOntology, Ontology, promptFragment } from './ontology.js';
 import {
   CLAIM_STATUS,
@@ -111,32 +111,41 @@ export interface ExtractResult {
   subject?: { name: string; type: string } | null;
 }
 
+export interface ExtractOptions {
+  model?: string;
+  claims?: boolean;
+  ontology?: Ontology;
+  knownEntities?: KnownEntity[];
+  docDate?: string | null;
+  /** Text read per call; default LLM_EXTRACT_INPUT_CHARS. */
+  maxChars?: number;
+  segment?: SegmentContext;
+  subject?: { name: string; type: string } | null;
+  askSubject?: boolean;
+}
+
+/** One extraction call, ready to send: the messages, and what parsing the reply has to know. */
+export interface ExtractRequest {
+  messages: ChatMessage[];
+  maxTokens: number;
+  withClaims: boolean;
+  askSubject: boolean;
+}
+
+/** The model's reply before it is checked: whatever JSON came back. */
+export interface RawExtractReply {
+  entities?: ExtractedEntity[];
+  relations?: ExtractedRelation[];
+  claims?: ExtractedClaim[];
+  subject?: unknown;
+}
+
 /**
- * Call the LLM and return the raw entity/relation/claim lists. Pure
- * extraction, no DB writes; the result is persisted to the document's sidecar
- * so a DB rebuild can replay it without paying the LLM again.
- *
- * `segment` marks one part of a long document: the header names the part and
- * its section, `subject` (answered by the first part) tells the others what
- * the document is about, and `askSubject` asks the first part for it.
+ * The prompt for one extraction call. Split from the call itself so a call can
+ * run elsewhere — a labeling worker on another machine gets these messages and
+ * hands back the raw reply, which `parseExtractReply` checks here.
  */
-export async function llmExtract(
-  llm: LlmClient,
-  page: { path: string; title: string },
-  content: string,
-  opts: {
-    model?: string;
-    claims?: boolean;
-    ontology?: Ontology;
-    knownEntities?: KnownEntity[];
-    docDate?: string | null;
-    /** Text read per call; default LLM_EXTRACT_INPUT_CHARS. */
-    maxChars?: number;
-    segment?: SegmentContext;
-    subject?: { name: string; type: string } | null;
-    askSubject?: boolean;
-  } = {},
-): Promise<ExtractResult> {
+export function buildExtractRequest(page: { path: string; title: string }, content: string, opts: ExtractOptions = {}): ExtractRequest {
   const withClaims = opts.claims ?? true;
   const ontology = opts.ontology ?? builtinOntology();
   const body = content.slice(0, opts.maxChars ?? LLM_EXTRACT_INPUT_CHARS);
@@ -150,21 +159,53 @@ export async function llmExtract(
       ].join('\n')
     : `${date}\nDocument: ${page.title} (${page.path})`;
   const askSubject = Boolean(opts.askSubject);
-  const result = await llm.completeJson<{ entities?: ExtractedEntity[]; relations?: ExtractedRelation[]; claims?: ExtractedClaim[]; subject?: unknown }>([
-    { role: 'system', content: extractSystemPrompt(ontology, withClaims, askSubject) },
-    { role: 'user', content: `${knownEntitiesBlock(opts.knownEntities ?? [])}${head}\n\n${body}` },
-  // generous ceiling: reasoning models spend completion tokens on thinking
-  // before the JSON, and dense documents produce long entity/claim lists —
-  // a truncated response fails JSON parsing and wastes the whole call
-  ], { maxTokens: withClaims ? 12_000 : 9_000, model: opts.model });
+  return {
+    messages: [
+      { role: 'system', content: extractSystemPrompt(ontology, withClaims, askSubject) },
+      { role: 'user', content: `${knownEntitiesBlock(opts.knownEntities ?? [])}${head}\n\n${body}` },
+    ],
+    // generous ceiling: reasoning models spend completion tokens on thinking
+    // before the JSON, and dense documents produce long entity/claim lists —
+    // a truncated response fails JSON parsing and wastes the whole call
+    maxTokens: withClaims ? 12_000 : 9_000,
+    withClaims,
+    askSubject,
+  };
+}
 
+/**
+ * Call the LLM and return the raw entity/relation/claim lists. Pure
+ * extraction, no DB writes; the result is persisted to the document's sidecar
+ * so a DB rebuild can replay it without paying the LLM again.
+ *
+ * `segment` marks one part of a long document: the header names the part and
+ * its section, `subject` (answered by the first part) tells the others what
+ * the document is about, and `askSubject` asks the first part for it.
+ */
+export async function llmExtract(
+  llm: LlmClient,
+  page: { path: string; title: string },
+  content: string,
+  opts: ExtractOptions = {},
+): Promise<ExtractResult> {
+  const request = buildExtractRequest(page, content, opts);
+  const reply = await llm.completeJson<RawExtractReply>(request.messages, { maxTokens: request.maxTokens, model: opts.model });
+  return parseExtractReply(reply, request);
+}
+
+/** Check a reply against what was asked: drop malformed items, cap claims, read the subject. */
+export function parseExtractReply(result: RawExtractReply, request: Pick<ExtractRequest, 'withClaims' | 'askSubject'>): ExtractResult {
+  const { withClaims, askSubject } = request;
+  if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('extraction reply is not a JSON object');
+  // a field that is not a list is treated as empty: the reply may come from another machine
+  const list = <T>(value: T[] | undefined): T[] => (Array.isArray(value) ? value : []);
   const out: ExtractResult = {
-    entities: (result.entities ?? [])
+    entities: list(result.entities)
       .filter((e) => e && typeof e.name === 'string' && e.name.trim())
-      .map((e) => ({ ...e, sameAs: typeof e.sameAs === 'string' && e.sameAs.trim() ? e.sameAs.trim() : null })),
-    relations: (result.relations ?? []).filter((r) => r && r.source && r.target),
+      .map((e) => ({ ...e, aliases: list(e.aliases).filter((a) => typeof a === 'string'), sameAs: typeof e.sameAs === 'string' && e.sameAs.trim() ? e.sameAs.trim() : null })),
+    relations: list(result.relations).filter((r) => r && typeof r.source === 'string' && r.source && typeof r.target === 'string' && r.target),
     claims: withClaims
-      ? (result.claims ?? [])
+      ? list(result.claims)
           .filter((c) => c && typeof c.subject === 'string' && c.subject.trim() && typeof c.statement === 'string' && c.statement.trim())
           .slice(0, EXTRACT_CAPS.claims)
       : [],

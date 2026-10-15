@@ -2,10 +2,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { Hono } from 'hono';
+import { Context, Hono } from 'hono';
+import { LabelingScheduler } from '../labeling/scheduler.js';
+import { LocalLabelingWorkers } from '../labeling/local.js';
+import { mountRemoteApi } from '../remote/api.js';
+import { accountMayOpenTeam } from '../auth/accounts.js';
+import { AuthEnv, authMiddleware, existingTeams, mountAuthRoutes, mountGateways } from '../auth/http.js';
+import { AuthService } from '../auth/service.js';
+import { publicGuard } from './public-guard.js';
 import { AppContext, judgeLlmClient } from '../context.js';
 import {
   EmbeddingConfig,
+  EmbeddingPoolConfig,
   KnodeConfig,
   LlmConfig,
   LlmConnection,
@@ -31,17 +39,31 @@ import {
   syncActiveLlm,
   defaultConfig,
   isCliProvider,
-  saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS } from '../config.js';
+  saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS, ExtractionWorkerConfig } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
 import { assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
 import { hasSidecarSegment, SIDECAR_ROOT } from '../fs/layout.js';
 import { moveSidecar } from '../fs/sidecar.js';
 import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
+import {
+  assertNotLinked,
+  describeLinkedFolders,
+  FolderImportConflict,
+  importDestFor,
+  importFolder,
+  linkedFolders,
+  LinkedFolders,
+  linkOwning,
+  planFolderImport,
+  refreshLinkedFolders,
+  resolveImportSource,
+  unlinkFolder,
+} from '../ingest/folders.js';
 import { graphInsights, graphOverview, graphSearch } from '../graph/query.js';
 import { buildContextPack } from '../pack/pack.js';
 import { applySuggestion } from '../pack/learn.js';
-import { createEmbeddingProvider } from '../ingest/embeddings.js';
+import { canonicalEmbeddingModel, createConfiguredEmbeddingProvider, EmbeddingQuotaLedger, embeddingLimits, validateEmbeddingPool } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
 import { cachedCliToolStatus, listModelsCached, warmModelCache } from '../llm/model-cache.js';
 import { agentForSpec, resolveAgentSpec } from '../research/agent.js';
@@ -136,6 +158,8 @@ type ExtractionConfigDraft = {
   claims?: boolean;
   batchSize?: number;
   concurrency?: number;
+  summaryConcurrency?: number;
+  workers?: Partial<ExtractionWorkerConfig>[];
 };
 
 type ModelConfigDraft = {
@@ -143,6 +167,7 @@ type ModelConfigDraft = {
   embedding?: Partial<EmbeddingConfig>;
   embeddingProviders?: Partial<EmbeddingConnection>[];
   embeddingUse?: string;
+  embeddingPool?: Partial<EmbeddingPoolConfig>;
   ingest?: { concurrency?: number; convertConcurrency?: number };
   llm?: Partial<LlmConfig>;
   connections?: Partial<LlmConnection>[];
@@ -163,6 +188,11 @@ export interface WorkspaceServices {
   kickResearch: () => void;
   /** Register a background promise so shutdown waits for it. */
   track: <T>(job: Promise<T>) => Promise<T>;
+  /** The linked-folder watchers of this workspace; absent outside `serve`, where links are refreshed on demand only. */
+  folders?: LinkedFolders | null;
+  /** Extraction as leased work (src/labeling): local slots and remote workers take segments from it. */
+  labeling?: LabelingScheduler | null;
+  localWorkers?: LocalLabelingWorkers | null;
 }
 
 /**
@@ -196,7 +226,7 @@ type AppEnv = {
   Variables: {
     workspaceContext: AppContext;
     workspaceScope: WorkspaceScope;
-  };
+  } & Partial<AuthEnv['Variables']>;
 };
 
 function mergeLlmConfig(current: LlmConfig, incoming: Partial<LlmConfig> = {}): LlmConfig {
@@ -302,11 +332,27 @@ function mergeEmbeddings(
     if (!id || out.some((e) => e.id === id)) continue;
     const previous = current.find((e) => e.id === id);
     const merged = mergeEmbeddingConfig(previous ?? defaultEmbeddingConfig(), draft);
-    out.push({
+    const entry: EmbeddingConnection = {
+      ...previous,
       ...merged,
       id,
       label: typeof draft.label === 'string' && draft.label.trim() ? draft.label.trim() : previous?.label || embeddingProviderLabel(merged.provider),
-    });
+    };
+    if (typeof draft.enabled === 'boolean') entry.enabled = draft.enabled;
+    if (draft.priority !== undefined) {
+      if (!Number.isSafeInteger(draft.priority) || draft.priority < 0) throw new Error('Priority must be a non-negative integer.');
+      entry.priority = draft.priority;
+    }
+    for (const field of ['quotaGroup', 'limitNote', 'upstream'] as const) {
+      if (typeof draft[field] === 'string') entry[field] = draft[field].trim();
+    }
+    if (draft.catalog !== undefined) {
+      if (!Array.isArray(draft.catalog) || !draft.catalog.every((id) => typeof id === 'string')) throw new Error('Invalid embedding model catalog.');
+      entry.catalog = [...new Set(draft.catalog.map((id) => id.trim()).filter(Boolean))].slice(0, 1000);
+    }
+    if (draft.limits !== undefined) entry.limits = { ...embeddingLimits(entry), ...draft.limits };
+    embeddingLimits(entry);
+    out.push(entry);
   }
   // Something has to embed, so a list that would end up empty keeps the current one.
   return out.length ? out : current;
@@ -326,17 +372,23 @@ function defaultEmbeddingConfig(): EmbeddingConfig {
 function mergeEmbeddingSection(
   current: KnodeConfig,
   draft: ModelConfigDraft,
-): Pick<KnodeConfig, 'embedding' | 'embeddingProviders' | 'embeddingUse'> {
+): Pick<KnodeConfig, 'embedding' | 'embeddingProviders' | 'embeddingUse' | 'embeddingPool'> {
   const next: KnodeConfig = { ...current };
   next.embeddingProviders = mergeEmbeddings(current.embeddingProviders, draft.embeddingProviders);
   if (typeof draft.embeddingUse === 'string') next.embeddingUse = draft.embeddingUse.trim();
+  if (draft.embeddingPool) {
+    next.embeddingPool = { enabled: false, model: 'bge-m3', dimensions: 1024, batchSize: 16,
+      ...current.embeddingPool, ...draft.embeddingPool };
+    if (typeof next.embeddingPool.enabled !== 'boolean' || typeof next.embeddingPool.model !== 'string') throw new Error('Invalid embedding pool.');
+    next.embeddingPool.model = next.embeddingPool.model.trim();
+  }
   if (draft.embedding && !draft.embeddingProviders) {
     const active = activeEmbedding(next);
     next.embeddingProviders = next.embeddingProviders.map((e) =>
       (e.id === active.id ? { ...e, ...mergeEmbeddingConfig(e, draft.embedding) } : e));
   }
   syncActiveEmbedding(next);
-  return { embedding: next.embedding, embeddingProviders: next.embeddingProviders, embeddingUse: next.embeddingUse };
+  return { embedding: next.embedding, embeddingProviders: next.embeddingProviders, embeddingUse: next.embeddingUse, embeddingPool: next.embeddingPool };
 }
 
 function defaultConnectionConfig(): LlmConfig {
@@ -355,10 +407,21 @@ export function createApp(
   rootCtx: AppContext,
   log: (msg: string) => void = console.log,
   workspaceContexts = new WorkspaceContextRegistry(rootCtx.dataDir, { templateConfig: rootCtx.config }),
-  opts: { services?: (ctx: AppContext) => WorkspaceServices | null } = {},
+  opts: {
+    services?: (ctx: AppContext) => WorkspaceServices | null;
+    /** Sign-in (src/auth); absent, the app trusts the workspace headers and only the remote API is reachable from outside. */
+    auth?: AuthService | null;
+  } = {},
 ) {
   const app = new Hono<AppEnv>();
+  const auth = opts.auth ?? null;
+  const mcpPath = rootCtx.config.server.mcp?.path || '/mcp';
+  // before anything else: who is asking, from where, and may they
+  if (auth) app.use('*', authMiddleware(auth, { mcpPath }));
+  else app.use('*', publicGuard({ allowInsecureRemote: rootCtx.config.server.auth?.allowInsecureRemote }));
   const ingestRunning = new Set<string>();
+  /** Who the request acts for: the signed-in account, or (sign-in off) the user the client names. */
+  const requestUser = (c: Context<AppEnv>): string | undefined => (auth ? c.get('account')?.username : c.req.header('x-knode-user'));
   const servicesFor = (ctx: AppContext): WorkspaceServices | null => opts.services?.(ctx) ?? null;
 
   const err = (e: unknown) => ({ error: e instanceof Error ? e.message : String(e) });
@@ -367,14 +430,18 @@ export function createApp(
   const requestCtx = (c: { get: (key: 'workspaceContext') => AppContext }) => c.get('workspaceContext');
 
   app.use('/api/*', async (c, next) => {
-    if (c.req.path === '/api/health' || c.req.path === '/api/workspaces') return next();
+    if (c.req.path === '/api/health' || c.req.path === '/api/workspaces' || c.req.path.startsWith('/api/auth/')) return next();
     try {
       const scope = resolveWorkspaceScope({
-        user: c.req.header('x-knode-user'),
+        user: requestUser(c),
         kind: c.req.header('x-knode-workspace-kind'),
         id: c.req.header('x-knode-workspace-id'),
         name: c.req.header('x-knode-workspace-name'),
       });
+      const account = auth ? c.get('account') : undefined;
+      if (account && scope.kind === 'team' && !accountMayOpenTeam(account, scope.slug)) {
+        return c.json({ error: `your account has not been given the team "${scope.name}" — ask an administrator`, reason: 'forbidden' }, 403);
+      }
       c.set('workspaceScope', scope);
       if (scope.kind === 'personal' && !workspaceContexts.exists(scope)) {
         return c.json({ error: `workspace "${scope.name}" does not exist` }, 404);
@@ -398,13 +465,42 @@ export function createApp(
     });
   }
 
+  // labeling and knowledge access for other machines (src/remote), token-authenticated
+  if (rootCtx.config.server.remote?.enabled !== false) {
+    mountRemoteApi(app, {
+      rootDataDir: rootCtx.dataDir,
+      registry: workspaceContexts,
+      labeling: (ctx) => servicesFor(ctx)?.labeling ?? null,
+      config: rootCtx.config.server.remote,
+      log,
+    });
+  }
+
+  // sign-in, sessions, users and the gateways to local services (src/auth)
+  if (auth) {
+    mountAuthRoutes(app, auth, { teams: () => existingTeams(rootCtx.dataDir), log });
+    mountGateways(app, auth);
+  } else {
+    // the UI asks first; with sign-in off it falls back to naming a user
+    app.get('/api/auth/state', (c) => c.json({ auth: false, setupRequired: false, signedIn: false }));
+  }
+
   /* ------------------------------- system ------------------------------- */
 
-  app.get('/api/health', (c) => c.json({ ok: true, dataRoot: rootCtx.dataDir, workspaceIsolation: true }));
+  app.get('/api/health', (c) => {
+    // where the data lives is this machine's business
+    const local = c.get('client')?.local ?? true;
+    return c.json({
+      ok: true,
+      ...(local ? { dataRoot: rootCtx.dataDir } : {}),
+      workspaceIsolation: true,
+      auth: auth ? { enabled: true, setupRequired: auth.setupRequired() } : { enabled: false },
+    });
+  });
 
   app.get('/api/workspaces', (c) => {
     try {
-      const user = c.req.header('x-knode-user');
+      const user = requestUser(c);
       if (!user) return c.json({ error: 'username is required' }, 401);
       return c.json(workspaceContexts.listUserWorkspaces(user));
     } catch (e) {
@@ -414,7 +510,7 @@ export function createApp(
 
   app.post('/api/workspaces', async (c) => {
     try {
-      const user = c.req.header('x-knode-user');
+      const user = requestUser(c);
       if (!user) return c.json({ error: 'username is required' }, 401);
       const { name } = await c.req.json<{ name: string }>();
       return c.json(workspaceContexts.createUserWorkspace(user, name), 201);
@@ -444,6 +540,30 @@ export function createApp(
     return c.json(redactConfig(ctx.config));
   });
 
+  app.get('/api/config/embedding-usage', async (c) => {
+    try { return c.json({ entries: await new EmbeddingQuotaLedger().status(requestCtx(c).config.embeddingProviders) }); }
+    catch (e) { return c.json(err(e), 500); }
+  });
+
+  // A short, quota-accounted connectivity check without running the LLM stages.
+  app.post('/api/config/embedding-test', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = await c.req.json() as { config?: ModelConfigDraft; id?: string };
+      const merged = { ...ctx.config, ...mergeEmbeddingSection(ctx.config, body.config ?? {}) };
+      if (body.id) {
+        const entry = merged.embeddingProviders.find((e) => e.id === body.id);
+        if (!entry) throw new Error('Embedding key not found.');
+        merged.embeddingProviders = [{ ...entry, enabled: true }];
+        merged.embeddingPool = { enabled: true, model: entry.model, dimensions: entry.dimensions, batchSize: 1 };
+      }
+      const started = Date.now();
+      const provider = createConfiguredEmbeddingProvider(merged);
+      const [vector] = await provider.embed(['知识库使用向量检索，将相近语义的文本匹配起来。']);
+      return c.json({ ok: true, model: provider.model, dimensions: vector.length, ms: Date.now() - started });
+    } catch (e) { return c.json({ ok: false, ...err(e) }, 400); }
+  });
+
   // Test a draft model configuration without persisting it. An apiKey of '***'
   // means "keep the current secret" (GET /api/config redacts literal keys).
   app.post('/api/config/test', async (c) => {
@@ -454,8 +574,9 @@ export function createApp(
     };
 
     try {
-      const e = mergeEmbeddingSection(ctx.config, draft).embedding;
-      const provider = createEmbeddingProvider(e);
+      const merged = { ...ctx.config, ...mergeEmbeddingSection(ctx.config, draft) };
+      const e = merged.embedding;
+      const provider = createConfiguredEmbeddingProvider(merged);
       const t0 = Date.now();
       const [vec] = await provider.embed(['knode-os configuration connectivity test']);
       out.embedding = { ok: true, provider: e.provider, model: provider.model, dimensions: vec.length, ms: Date.now() - t0 };
@@ -508,7 +629,13 @@ export function createApp(
     const opts = { refresh: body.refresh === true };
 
     if (route === 'embedding') {
-      return c.json(await listModelsCached('embedding', mergeEmbeddingSection(ctx.config, draft).embedding, opts));
+      const merged = mergeEmbeddingSection(ctx.config, draft);
+      if (merged.embeddingPool?.enabled) {
+        const ids = new Set(merged.embeddingProviders.filter((e) => e.enabled !== false && e.provider === 'openai')
+          .flatMap((e) => [e.model, ...(e.catalog ?? [])]).filter(Boolean).map(canonicalEmbeddingModel));
+        return c.json({ ok: true, source: 'builtin', models: [...ids].sort().map((id) => ({ id })), note: 'Models from configured keys. Refresh a key to update its catalog.' });
+      }
+      return c.json(await listModelsCached('embedding', merged.embedding, opts));
     }
 
     // A named embedding provider lists on its own, before Index points at it.
@@ -602,6 +729,31 @@ export function createApp(
         const concurrency = Number(x.concurrency);
         if (Number.isFinite(batchSize) && batchSize >= 1) next.extraction.batchSize = Math.floor(batchSize);
         if (Number.isFinite(concurrency) && concurrency >= 1) next.extraction.concurrency = Math.floor(concurrency);
+        const summaryConcurrency = Number(x.summaryConcurrency);
+        if (x.summaryConcurrency !== undefined && Number.isFinite(summaryConcurrency) && summaryConcurrency >= 1) {
+          next.extraction.summaryConcurrency = Math.min(16, Math.floor(summaryConcurrency));
+        }
+        if (Array.isArray(x.workers)) {
+          // `serve`'s labeling slots per agent (src/labeling/local.ts); a target must exist
+          const targets = new Set(routeTargets(next).map((t) => t.id));
+          const workers = [];
+          for (const w of x.workers as Partial<ExtractionWorkerConfig>[]) {
+            const use = typeof w?.use === 'string' ? w.use.trim() : '';
+            const slots = Number(w?.slots);
+            if (!use || !Number.isFinite(slots) || slots < 0) return c.json({ error: 'each extraction worker needs a target ("use") and a slot count' }, 400);
+            if (!targets.has(use)) return c.json({ error: `extraction worker "${use}" is no connection or agent` }, 400);
+            const cliTimeoutMs = Number(w.cliTimeoutMs);
+            workers.push({
+              use,
+              slots: Math.min(16, Math.floor(slots)),
+              ...(typeof w.model === 'string' && w.model.trim() ? { model: w.model.trim() } : {}),
+              ...(w.effort && LLM_EFFORTS.includes(w.effort) ? { effort: w.effort } : {}),
+              ...(w.speed && LLM_SPEEDS.includes(w.speed) ? { speed: w.speed } : {}),
+              ...(Number.isFinite(cliTimeoutMs) && cliTimeoutMs >= 1000 ? { cliTimeoutMs: Math.floor(cliTimeoutMs) } : {}),
+            });
+          }
+          next.extraction.workers = workers;
+        }
       }
       // a client written before named connections sends a route's endpoint
       // inline; it becomes a row, the way `loadConfig` lifts it
@@ -713,10 +865,12 @@ export function createApp(
         previousDocumentLlm.baseUrl !== nextDocumentLlm.baseUrl ||
         previousDocumentLlm.cliPath !== nextDocumentLlm.cliPath;
 
+      validateEmbeddingPool(next);
+      const nextEmbedder = createConfiguredEmbeddingProvider(next);
       saveConfig(ctx.dataDir, next);
       ctx.config = next;
       ctx.llm = judgeLlmClient(next);
-      ctx.embedder = createEmbeddingProvider(next.embedding);
+      ctx.embedder = nextEmbedder;
 
       let reindex: Awaited<ReturnType<typeof sync>> | null = null;
       if (reembed || reconvert) {
@@ -759,7 +913,19 @@ export function createApp(
   app.get('/api/tree', (c) => {
     const ctx = requestCtx(c);
     try {
-      return c.json(listTree(ctx.dataDir, c.req.query('path') ?? '.'));
+      const tree = listTree(ctx.dataDir, c.req.query('path') ?? '.');
+      // the mirror of a linked folder says where it comes from, so a client can
+      // mark it and keep edits off it (the routes refuse them anyway)
+      const links = linkedFolders(ctx.config);
+      if (links.length) {
+        const mark = (node: typeof tree): void => {
+          const link = links.find((l) => l.dest === node.path);
+          if (link) (node as typeof tree & { linked?: string }).linked = link.source;
+          for (const child of node.children ?? []) mark(child);
+        };
+        mark(tree);
+      }
+      return c.json(tree);
     } catch (e) {
       return c.json(err(e), 400);
     }
@@ -802,6 +968,7 @@ export function createApp(
       if (!p || typeof content !== 'string') return c.json({ error: 'path and content required' }, 400);
       assertWritablePath(p);
       assertNotConvertedOriginal(p);
+      assertNotLinked(ctx.config, p, 'write to');
       writeFileText(ctx.dataDir, p, content);
       return c.json({ ok: true });
     } catch (e) {
@@ -816,6 +983,7 @@ export function createApp(
       if (!p) return c.json({ error: 'path required' }, 400);
       if (isProtectedPath(p)) return c.json({ error: 'refusing to delete a root path' }, 400);
       assertWritablePath(p);
+      assertNotLinked(ctx.config, p, 'delete');
       removePath(ctx.dataDir, p);
       // deleting a source is a dispose: everything it produced is reverted,
       // history stays queryable with as_of (use /api/forget to purge it)
@@ -835,6 +1003,7 @@ export function createApp(
       // a directory where the guide belongs would break every later read of it
       if (isProtectedPath(rel) || isRootWritableFile(rel)) return c.json({ error: `${rel} is a file this workspace owns, not a directory` }, 400);
       assertWritablePath(rel);
+      assertNotLinked(ctx.config, rel, 'create a folder in');
       makeDir(ctx.dataDir, rel);
       return c.json({ ok: true, path: rel });
     } catch (e) {
@@ -861,6 +1030,9 @@ export function createApp(
       if (isProtectedPath(src) || isProtectedPath(dst)) {
         return c.json({ error: 'refusing to move a root path' }, 400);
       }
+      // a linked folder's mirror (or anything holding one) stays where the link put it
+      assertNotLinked(ctx.config, src, 'move');
+      assertNotLinked(ctx.config, dst, 'move into');
       if (src === dst) return c.json({ ok: true, from: src, to: dst });
       // renameSync replaces the destination without a word, which in a batch
       // move would silently destroy a same-named file already sitting there
@@ -883,6 +1055,7 @@ export function createApp(
       const dir = sanitizeRelativePath((form.get('dir') as string) || '') || 'raw/docs';
       if (!/^(raw\/docs|wiki)(\/|$)/.test(dir)) return c.json({ error: 'uploads go to raw/docs or wiki' }, 400);
       if (hasSidecarSegment(dir)) return c.json({ error: `${SIDECAR_ROOT}/ is system-owned` }, 400);
+      assertNotLinked(ctx.config, dir, 'upload into');
       const saved: string[] = [];
       const skipped: string[] = [];
       for (const [, v] of form.entries()) {
@@ -912,6 +1085,97 @@ export function createApp(
       return c.json({ ok: true, saved, ...(skipped.length ? { skipped } : {}) });
     } catch (e) {
       return c.json(err(e), 400);
+    }
+  });
+
+  /* ---------------------------- folder import --------------------------- */
+
+  // A folder elsewhere on this machine, mirrored under raw/docs with its tree
+  // intact: once (copy) or kept in sync (link). See src/ingest/folders.ts.
+
+  app.get('/api/folders', (c) => {
+    const ctx = requestCtx(c);
+    const folders = servicesFor(ctx)?.folders ?? null;
+    return c.json({ links: folders ? folders.status() : describeLinkedFolders(ctx) });
+  });
+
+  // what an import would carry, before anything is written
+  app.post('/api/folders/preview', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { source?: string; dest?: string };
+      const source = resolveImportSource(ctx.dataDir, String(body.source ?? ''));
+      const dest = importDestFor(source, body.dest);
+      const plan = planFolderImport(source);
+      const owner = linkOwning(linkedFolders(ctx.config), dest);
+      return c.json({
+        source,
+        dest,
+        files: plan.files.length,
+        bytes: plan.bytes,
+        skippedByType: plan.skippedByType,
+        tooLarge: plan.tooLarge,
+        exists: pathExists(ctx.dataDir, dest),
+        linked: owner ? { source: owner.source, dest: owner.dest } : null,
+        sample: plan.files.slice(0, 8).map((f) => f.rel),
+      });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.post('/api/folders/import', async (c) => {
+    const ctx = requestCtx(c);
+    if (ingestRunning.has(ctx.dataDir)) return c.json({ error: 'ingest running — try again shortly' }, 409);
+    // held for the whole import: a config save in the meantime would drop the link it writes
+    ingestRunning.add(ctx.dataDir);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { source?: string; dest?: string; mode?: string; replace?: boolean };
+      const mode = body.mode === 'link' ? 'link' : body.mode === 'copy' || body.mode === undefined ? 'copy' : null;
+      if (!mode) return c.json({ error: 'mode must be copy or link' }, 400);
+      const opts = { dest: body.dest, replace: Boolean(body.replace), onProgress: log };
+      const folders = servicesFor(ctx)?.folders ?? null;
+      const result = mode === 'link' && folders
+        ? await folders.add(String(body.source ?? ''), opts)
+        : await importFolder(ctx, String(body.source ?? ''), { ...opts, mode });
+      return c.json({ ok: true, ...result });
+    } catch (e) {
+      return c.json(err(e), e instanceof FolderImportConflict ? 409 : 400);
+    } finally {
+      ingestRunning.delete(ctx.dataDir);
+    }
+  });
+
+  // mirror a link's source now (every link without `dest`) and index what changed
+  app.post('/api/folders/sync', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { dest?: string };
+      const dest = typeof body.dest === 'string' && body.dest.trim() ? cleanRelPath(body.dest) : undefined;
+      const folders = servicesFor(ctx)?.folders ?? null;
+      const results = folders ? await folders.refresh(dest) : await refreshLinkedFolders(ctx, dest, { onProgress: log });
+      return c.json({ ok: true, results: results.map((r) => ({ ...r, copied: r.copied.length, removed: r.removed.length })) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // forget a link; the mirror stays unless removeFiles=1, which disposes it like any deletion
+  app.delete('/api/folders', async (c) => {
+    const ctx = requestCtx(c);
+    if (ingestRunning.has(ctx.dataDir)) return c.json({ error: 'ingest running — try again shortly' }, 409);
+    ingestRunning.add(ctx.dataDir);
+    try {
+      const dest = cleanRelPath(c.req.query('dest') ?? '');
+      if (!dest) return c.json({ error: 'dest required' }, 400);
+      const removeFiles = c.req.query('removeFiles') === '1' || c.req.query('removeFiles') === 'true';
+      const folders = servicesFor(ctx)?.folders ?? null;
+      const result = folders ? await folders.remove(dest, { removeFiles }) : await unlinkFolder(ctx, dest, { removeFiles, onProgress: log });
+      return c.json({ ok: true, ...result });
+    } catch (e) {
+      return c.json(err(e), 400);
+    } finally {
+      ingestRunning.delete(ctx.dataDir);
     }
   });
 
@@ -1923,6 +2187,14 @@ export function createApp(
     } catch (e) {
       return c.json(err(e), 400);
     }
+  });
+
+  // the labeling scheduler and this machine's worker slots, for the UI
+  app.get('/api/labeling/status', async (c) => {
+    const ctx = requestCtx(c);
+    const services = servicesFor(ctx);
+    if (!services?.labeling) return c.json({ error: 'labeling runs only inside `knode-os serve`' }, 503);
+    return c.json({ scheduler: await services.labeling.status(), local: services.localWorkers?.status() ?? [] });
   });
 
   app.post('/api/dream', async (c) => {

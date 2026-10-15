@@ -15,6 +15,11 @@ export interface TreeNode {
 
 const HIDDEN = new Set(['.knode', SIDECAR_ROOT_SEGMENT, '.git', 'node_modules', '.DS_Store', '.obsidian']);
 
+/** A directory entry every walker skips: dot-entries, the derived state, dependency trees. */
+export function isHiddenName(name: string): boolean {
+  return HIDDEN.has(name) || name.startsWith('.');
+}
+
 /** Resolve a user-supplied relative path inside dataDir, rejecting traversal. */
 export function safePath(dataDir: string, rel: string): string {
   const cleaned = rel.replace(/\\/g, '/').replace(/^\/+/, '');

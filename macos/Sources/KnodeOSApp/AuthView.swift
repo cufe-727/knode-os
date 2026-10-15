@@ -2,71 +2,262 @@ import SwiftUI
 
 struct AuthView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var username = "admin"
+    @State private var username = ""
     @State private var password = ""
+    @State private var confirmation = ""
     @State private var remember = true
     @State private var error = ""
-    @State private var showingRegistration = false
+    @State private var isWorking = false
+    @State private var showingConnection = false
+
+    /// The service has no accounts and this Mac may make the first one.
+    private var setupHere: Bool { model.authInfo?.setupRequired == true && model.authInfo?.canSetup == true }
+    /// The service has no accounts, and they are made on its own machine.
+    private var setupElsewhere: Bool { model.authInfo?.setupRequired == true && model.authInfo?.canSetup != true }
 
     var body: some View {
         AuthShell {
-            VStack(alignment: .leading, spacing: 26) {
+            VStack(alignment: .leading, spacing: 22) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Eyebrow(text: L("Welcome back"))
-                    Text(L("Sign in to knode-os"))
+                    Eyebrow(text: setupHere ? L("First run") : L("Welcome back"))
+                    Text(setupHere ? L("Create the administrator") : setupElsewhere ? L("This service has no accounts") : L("Sign in to knode-os"))
                         .font(.system(size: 30, weight: .bold))
-                    Text(L("Continue to your personal knowledge workspace and Teams."))
+                    Text(setupHere
+                        ? L("The first account, made here on the machine knode-os runs on, administers it: settings, users and gateways.")
+                        : setupElsewhere
+                            ? L("The administrator is created on the machine knode-os runs on: run `knode-os user add <name> --admin` there, or open knode-os on it. Then sign in here.")
+                            : L("Continue to your personal knowledge workspace and Teams."))
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
-                VStack(alignment: .leading, spacing: 14) {
-                    LabeledContent("Username") {
-                        TextField(L("admin or test"), text: $username)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 330)
-                    }
-                    LabeledContent("Password") {
-                        SecureField(L("Enter your password"), text: $password)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 330)
-                    }
-                    Toggle(L("Keep me signed in"), isOn: $remember)
-                        .toggleStyle(.checkbox)
-                    if !error.isEmpty {
-                        Label(error, systemImage: "exclamationmark.circle.fill")
-                            .font(.callout)
-                            .foregroundStyle(Color.knodeBad)
-                    }
+                connectionRow
+
+                if let notice = model.authNotice, !setupHere {
+                    Label(notice, systemImage: "info.circle.fill")
+                        .font(.callout)
+                        .foregroundStyle(Color.knodeCyan)
+                }
+                if let prompt = model.trustPrompt {
+                    trustBox(prompt)
                 }
 
-                Button {
-                    error = model.signIn(username: username, password: password, remember: remember) ?? ""
-                } label: {
-                    Text(L("Continue"))
+                if !setupElsewhere {
+                    VStack(alignment: .leading, spacing: 14) {
+                        LabeledContent(L("Username")) {
+                            TextField(setupHere ? L("e.g. admin") : L("Your username"), text: $username)
+                                .textFieldStyle(.roundedBorder)
+                                .textContentType(.username)
+                                .frame(width: 330)
+                        }
+                        LabeledContent(L("Password")) {
+                            SecureField(setupHere ? L("At least 8 characters") : L("Enter your password"), text: $password)
+                                .textFieldStyle(.roundedBorder)
+                                .textContentType(setupHere ? .newPassword : .password)
+                                .frame(width: 330)
+                        }
+                        if setupHere {
+                            LabeledContent(L("Confirm")) {
+                                SecureField(L("Enter it again"), text: $confirmation)
+                                    .textFieldStyle(.roundedBorder)
+                                    .textContentType(.newPassword)
+                                    .frame(width: 330)
+                            }
+                        } else {
+                            Toggle(L("Keep me signed in"), isOn: $remember)
+                                .toggleStyle(.checkbox)
+                        }
+                        if !error.isEmpty {
+                            Label(error, systemImage: "exclamationmark.circle.fill")
+                                .font(.callout)
+                                .foregroundStyle(Color.knodeBad)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    Button {
+                        submit()
+                    } label: {
+                        HStack {
+                            if isWorking { ProgressView().controlSize(.small) }
+                            Text(setupHere ? L("Create administrator") : L("Sign in"))
+                        }
                         .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .tint(.knodeCyan)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isWorking)
+
+                    Text(setupHere ? L("Workspaces of an existing user stay theirs: name the administrator after the folder under users/ to keep yours.") : L("No account? An administrator of this service creates one for you."))
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity)
+                } else {
+                    Button(L("Check again")) { Task { await model.checkConnection(startBundled: true) } }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.knodeCyan)
+                }
+            }
+            .frame(width: 420)
+        }
+        .onAppear {
+            if username.isEmpty { username = model.currentUser?.username ?? "" }
+        }
+        .sheet(isPresented: $showingConnection) {
+            ConnectionSheet(isPresented: $showingConnection)
+                .environmentObject(model)
+        }
+    }
+
+    private var connectionRow: some View {
+        HStack(spacing: 9) {
+            switch model.connectionState {
+            case .checking: ProgressView().controlSize(.small)
+            case .connected: StatusDot(color: .knodeGood)
+            case .unavailable: StatusDot(color: .knodeBad)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.serverURLString).font(.callout.monospaced()).lineLimit(1)
+                if case .unavailable(let message) = model.connectionState {
+                    Text(message).font(.caption).foregroundStyle(Color.knodeBad).lineLimit(3)
+                } else {
+                    Text(ConnectionSheet.modeTitle(model.connection.mode)).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Button(L("Change…")) { showingConnection = true }
+                .buttonStyle(.link)
+        }
+        .padding(10)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func trustBox(_ prompt: AppModel.TrustPrompt) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(L("Trust this certificate?"), systemImage: "lock.trianglebadge.exclamationmark")
+                .font(.callout.weight(.semibold))
+            Text(L("%@ presents a certificate this Mac does not trust. Compare its fingerprint with the one `knode-os tls init` printed on the server before you trust it.", prompt.hostPort))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(prompt.fingerprint)
+                .font(.system(size: 10, design: .monospaced))
+                .textSelection(.enabled)
+            HStack {
+                Spacer()
+                Button(L("Trust and connect")) { model.trustPresentedCertificate() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.knodeViolet)
+            }
+        }
+        .padding(12)
+        .background(Color.knodeViolet.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func submit() {
+        isWorking = true
+        error = ""
+        Task {
+            if setupHere {
+                error = await model.createAdministrator(username: username, password: password, confirmation: confirmation) ?? ""
+            } else {
+                error = await model.signIn(username: username, password: password, remember: remember) ?? ""
+            }
+            if error.isEmpty {
+                password = ""
+                confirmation = ""
+            }
+            isWorking = false
+        }
+    }
+}
+
+/// Where the service is: this Mac, a URL, or a machine reached over SSH.
+struct ConnectionSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Binding var isPresented: Bool
+    @State private var draft = ConnectionSettings()
+    @State private var sshPortText = ""
+    @State private var remotePortText = "9100"
+
+    static func modeTitle(_ mode: ConnectionMode) -> String {
+        switch mode {
+        case .local: L("This Mac")
+        case .remote: L("Domain or address (HTTPS)")
+        case .ssh: L("SSH tunnel")
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 5) {
+                Eyebrow(text: L("Connection"))
+                Text(L("Where is knode-os?")).font(.title.bold())
+                Text(L("A session belongs to one service: connecting to another asks you to sign in there."))
+                    .foregroundStyle(.secondary)
+            }
+            Picker("", selection: $draft.mode) {
+                ForEach(ConnectionMode.allCases) { mode in Text(Self.modeTitle(mode)).tag(mode) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            Form {
+                switch draft.mode {
+                case .local:
+                    TextField(L("Service URL"), text: $draft.localURL, prompt: Text("http://127.0.0.1:9100"))
+                    Text(L("At the default address, http://127.0.0.1:9100, the app starts the service bundled inside it when nothing answers. Any other address is a service run elsewhere, such as a LaunchAgent."))
+                        .font(.caption).foregroundStyle(.secondary)
+                case .remote:
+                    TextField(L("Service URL"), text: $draft.remoteURL, prompt: Text("https://knode.example.com"))
+                    Text(L("A domain in front of the service (Cloudflare Tunnel), or the address of its HTTPS listener (server.tls), e.g. https://192.168.1.20:12443. A self-signed certificate is shown to you to trust on first connect."))
+                        .font(.caption).foregroundStyle(.secondary)
+                    if !draft.pinnedCertificates.isEmpty {
+                        ForEach(draft.pinnedCertificates.keys.sorted(), id: \.self) { key in
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(L("Trusted certificate for %@", key)).font(.caption)
+                                    Text(draft.pinnedCertificates[key] ?? "").font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button(L("Forget")) { draft.pinnedCertificates[key] = nil }
+                            }
+                        }
+                    }
+                case .ssh:
+                    TextField(L("SSH destination"), text: $draft.sshDestination, prompt: Text("you@mac-mini.local"))
+                    TextField(L("SSH port"), text: $sshPortText, prompt: Text("22"))
+                    TextField(L("knode-os port on that machine"), text: $remotePortText, prompt: Text("9100"))
+                    TextField(L("Identity file (optional)"), text: $draft.sshIdentityFile, prompt: Text("~/.ssh/id_ed25519"))
+                    Text(L("The app runs ssh -L to that machine's loopback and keeps it open. It never asks for a password: use a key in ssh-agent or the Keychain, and connect once in Terminal so the host key is known. Host aliases from ~/.ssh/config work."))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+
+            HStack {
+                Spacer()
+                Button(L("Cancel")) { isPresented = false }
+                Button(L("Connect")) {
+                    var next = draft
+                    next.sshPort = Int(sshPortText.trimmingCharacters(in: .whitespaces))
+                    next.sshRemotePort = Int(remotePortText.trimmingCharacters(in: .whitespaces)) ?? 9100
+                    model.applyConnection(next)
+                    isPresented = false
                 }
                 .buttonStyle(.borderedProminent)
-                .controlSize(.large)
                 .tint(.knodeCyan)
                 .keyboardShortcut(.defaultAction)
-
-                VStack(spacing: 8) {
-                    HStack(spacing: 4) {
-                        Text(L("New here?")).foregroundStyle(.secondary)
-                        Button(L("Create a local account")) { showingRegistration = true }
-                            .buttonStyle(.link)
-                    }
-                    Text(L("Mock accounts: admin / admin or test / test"))
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.tertiary)
-                }
-                .frame(maxWidth: .infinity)
             }
-            .frame(width: 400)
         }
-        .sheet(isPresented: $showingRegistration) {
-            RegistrationView(isPresented: $showingRegistration)
-                .environmentObject(model)
+        .padding(26)
+        .frame(width: 560)
+        .onAppear {
+            draft = model.connection
+            sshPortText = draft.sshPort.map(String.init) ?? ""
+            remotePortText = String(draft.sshRemotePort)
         }
     }
 }
@@ -201,45 +392,5 @@ private struct Benefit: View {
             Text(detail).font(.caption).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-private struct RegistrationView: View {
-    @EnvironmentObject private var model: AppModel
-    @Binding var isPresented: Bool
-    @State private var username = ""
-    @State private var password = ""
-    @State private var confirmation = ""
-    @State private var error = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            VStack(alignment: .leading, spacing: 6) {
-                Eyebrow(text: L("Local account"))
-                Text(L("Create an account")).font(.title.bold())
-                Text(L("Credentials stay on this Mac. The server still listens only on localhost."))
-                    .foregroundStyle(.secondary)
-            }
-            Form {
-                TextField(L("Username"), text: $username)
-                SecureField(L("Password"), text: $password)
-                SecureField(L("Confirm password"), text: $confirmation)
-            }
-            .formStyle(.grouped)
-            if !error.isEmpty { Text(error).foregroundStyle(Color.knodeBad) }
-            HStack {
-                Spacer()
-                Button(L("Cancel")) { isPresented = false }
-                Button(L("Create account")) {
-                    error = model.register(username: username, password: password, confirmation: confirmation) ?? ""
-                    if error.isEmpty { isPresented = false }
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.knodeCyan)
-                .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(28)
-        .frame(width: 480)
     }
 }

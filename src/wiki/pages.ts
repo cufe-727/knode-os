@@ -16,6 +16,7 @@ import { loadSourceText } from '../ingest/source.js';
 import { readDeps } from '../lineage/deps.js';
 import { archivedPath, disposeScope, findLiveScope } from '../lineage/scope.js';
 import { DepDecl } from '../lineage/types.js';
+import { classifyFailure } from '../labeling/failures.js';
 import { LlmClient } from '../llm/client.js';
 import { applyScope } from '../lineage/scope.js';
 import { isGeneratedConcept, okfGenerated } from '../okf/index.js';
@@ -799,14 +800,25 @@ const MAX_SUMMARY_ATTEMPTS = 3;
  */
 export async function ensureSourceSummaries(
   ctx: PagesContext,
-  opts: { limit?: number; prefer?: string[]; concurrency?: number; actor?: string; onProgress?: (msg: string) => void } = {},
+  opts: {
+    limit?: number;
+    prefer?: string[];
+    concurrency?: number;
+    actor?: string;
+    onProgress?: (msg: string) => void;
+    /** Leave out documents still waiting for extraction — a summary written first would miss what it finds. */
+    skipQueued?: boolean;
+    /** Counts summaries put off because the model could not be reached, for the caller's backoff. */
+    stats?: { deferred: number };
+  } = {},
 ): Promise<string[]> {
   const progress = opts.onProgress ?? (() => {});
   const limit = Math.max(0, Math.floor(opts.limit ?? 20));
   if (limit === 0 || !documentSummaryLlm(ctx).enabled) return [];
   const pages = await summaryPagesByDocument(ctx.store);
   const docs = await ctx.store.query<DocumentRow>(
-    `SELECT * FROM documents WHERE root = 'docs' AND status = 'indexed' AND kind = 'source' ORDER BY updated_at DESC, path`,
+    `SELECT * FROM documents d WHERE root = 'docs' AND status = 'indexed' AND kind = 'source'${opts.skipQueued ? ' AND NOT EXISTS (SELECT 1 FROM extraction_queue q WHERE q.document_id = d.id)' : ''}
+     ORDER BY updated_at DESC, path`,
   );
   const due = docs.filter((d) => {
     const page = pages.get(d.path);
@@ -851,6 +863,13 @@ export async function ensureSourceSummaries(
       if (r === 'deferred' || r === 'blocked') throw new Error(r === 'blocked' ? `${at} belongs to a person` : 'no source text to summarize');
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // an unreachable model (a rate limit, the network, a timeout) is no verdict on
+      // the document: it keeps its attempts, so an outage cannot use them all up
+      if (classifyFailure(message) === 'transient') {
+        if (opts.stats) opts.stats.deferred++;
+        progress(`summary put off for ${doc.path}: ${message.slice(0, 200)}`);
+        return;
+      }
       const failed = recordSourceSummaryFailure(ctx.dataDir, doc.path, doc.sha256, message);
       progress(`summary failed for ${doc.path} (${failed.attempts}/${MAX_SUMMARY_ATTEMPTS}): ${message}`);
     }
