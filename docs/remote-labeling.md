@@ -59,7 +59,16 @@ Without `workers`, the Extract stage's own route runs with `extraction.concurren
 servers, memory, default model) stays out of extraction prompts. It also keeps tens of thousands of
 sessions out of `~/.codex/sessions`.
 
-`GET /api/labeling/status` (UI headers) shows the queue, leases, every worker seen and the local slots' health.
+`GET /api/labeling/status` (UI headers) shows whether processing runs, the queue, leases, every worker seen and
+the local slots' health.
+
+**Starting and stopping.** The local slots, and the duplicate reviews and summary pages that follow them, spend
+model calls, so `serve` never starts them on its own, not at startup and not after a restart. An administrator
+starts them from the app (the *Processing* button in the toolbar), from the web UI (the button in the header) or with
+`POST /api/labeling/start`. They then run until stopped (`POST /api/labeling/stop`) or until the service stops.
+Stopping lets calls in flight finish. Importing, watching and embedding go on either way. Remote workers can still
+lease segments while processing is stopped, because they are started by hand on their own machines; what they write
+is reviewed and summarized once processing is started.
 
 ## Tokens
 

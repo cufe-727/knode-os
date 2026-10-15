@@ -1029,7 +1029,56 @@ async function loadStats() {
       `${s.documents} docs · ${s.chunks} chunks · ${s.entities} entities · ${s.relations} rels · ${s.traces} traces` +
       (s.pending_suggestions ? ` · ☾${s.pending_suggestions}` : '');
   } catch { /* server still starting */ }
+  loadProcessing();
 }
+
+/* ----------------------------- processing ------------------------------ */
+
+/**
+ * Extraction, reviews and summaries spend model calls, so the service never
+ * starts them on its own, not even after a restart: someone starts them here
+ * (or in the app) and they run until stopped. An administrator's switch.
+ */
+let processingStatus = null;
+
+async function loadProcessing() {
+  try {
+    processingStatus = await api('/api/labeling/status');
+  } catch {
+    processingStatus = null;
+  }
+  paintProcessing();
+}
+
+function paintProcessing() {
+  const button = $('#processing-toggle');
+  const state = processingStatus?.processing;
+  button.hidden = !state;
+  if (!state) return;
+  const mayChange = authDisabled || serverAuth?.groups?.settings === true;
+  const queued = processingStatus.scheduler?.queued;
+  button.classList.toggle('running', state.running);
+  button.textContent = state.running ? '● Processing' : '▶ Start processing';
+  button.disabled = !mayChange;
+  button.title = [
+    state.running ? 'Extraction, reviews and summaries are running — click to stop' : 'Extraction, reviews and summaries wait until someone starts them',
+    queued === undefined ? '' : `${queued} documents waiting`,
+    state.by && state.since ? `${state.running ? 'started' : 'stopped'} by ${state.by} at ${new Date(state.since).toLocaleTimeString()}` : '',
+    mayChange ? '' : 'an administrator starts and stops processing',
+  ].filter(Boolean).join(' · ');
+}
+
+$('#processing-toggle').addEventListener('click', async () => {
+  const running = processingStatus?.processing?.running === true;
+  if (running && !confirm('Stop processing? Calls in flight finish; nothing new starts until someone starts it again.')) return;
+  try {
+    await api(running ? '/api/labeling/stop' : '/api/labeling/start', { method: 'POST', body: '{}' });
+    toast(running ? 'Processing stopped — calls in flight finish' : 'Processing started: extraction, reviews and summaries');
+  } catch (error) {
+    toast(error.message, 5000);
+  }
+  loadProcessing();
+});
 
 /* ------------------------------- menus --------------------------------- */
 

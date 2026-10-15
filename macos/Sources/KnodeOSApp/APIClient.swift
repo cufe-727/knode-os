@@ -132,6 +132,17 @@ struct APIClient {
         try await send("/api/health", identity: .none)
     }
 
+    /* ----------------------------- processing ----------------------------- */
+
+    func labelingStatus() async throws -> LabelingStatusResponse {
+        try await send("/api/labeling/status")
+    }
+
+    /// Start or stop extraction, reviews and summaries — an administrator's call.
+    func setProcessing(_ running: Bool) async throws -> ProcessingSwitchResponse {
+        try await send(running ? "/api/labeling/start" : "/api/labeling/stop", method: "POST", body: Data("{}".utf8))
+    }
+
     /* ------------------------------ sign-in ------------------------------ */
 
     func authState() async throws -> AuthState {

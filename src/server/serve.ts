@@ -11,6 +11,7 @@ import { TreeWatcher, watchTree } from '../fs/watch.js';
 import { startDreamScheduler } from '../dream/dream.js';
 import { startFollowUp } from '../labeling/followup.js';
 import { LocalLabelingWorkers } from '../labeling/local.js';
+import { LabelingProcessing } from '../labeling/processing.js';
 import { LabelingScheduler } from '../labeling/scheduler.js';
 import { LinkedFolders } from '../ingest/folders.js';
 import { sync } from '../ingest/sync.js';
@@ -116,7 +117,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
       const started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp });
       services.set(workspaceCtx.dataDir, {
         mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders,
-        labeling: started.labeling, localWorkers: started.localWorkers,
+        labeling: started.labeling, localWorkers: started.localWorkers, processing: started.processing,
       });
       return async () => {
         services.delete(workspaceCtx.dataDir);
@@ -236,6 +237,7 @@ interface StartedServices {
   folders: LinkedFolders;
   labeling: LabelingScheduler;
   localWorkers: LocalLabelingWorkers;
+  processing: LabelingProcessing;
 }
 
 function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null } = {}): StartedServices {
@@ -306,14 +308,17 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   // remote workers take segments as they free up, nothing waits for the
   // slowest call; the duplicate audit of what was written, the views that
   // depend on it and the summary pages follow on their own loop
-  // (docs/design/09, 10)
+  // (docs/design/09, 10). The slots, reviews and summaries spend model calls,
+  // so none of them starts on its own: someone starts the processing (the
+  // app, POST /api/labeling/start) and it runs until stopped or shut down.
   const remote = ctx.config.server.remote;
   const labeling = new LabelingScheduler({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, log }, {
     leaseMs: Math.max(1, remote?.leaseMinutes ?? 15) * 60_000,
   });
   const localWorkers = new LocalLabelingWorkers(labeling, () => ctx.config, { log });
-  localWorkers.start();
-  const followUp = startFollowUp(ctx, labeling, { log, track });
+  const followUp = startFollowUp(ctx, labeling, { log, track, active: false });
+  const processing = new LabelingProcessing(localWorkers, followUp, log);
+  log('processing is stopped until an administrator starts it (the Processing button in the app or the web UI, or POST /api/labeling/start)');
 
   // usage stats → sidecar flush
   const flushInterval = Math.max(1, ctx.config.heat.flushIntervalMinutes) * 60_000;
@@ -422,6 +427,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     folders,
     labeling,
     localWorkers,
+    processing,
   };
 }
 

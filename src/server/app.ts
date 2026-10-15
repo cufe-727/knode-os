@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { Context, Hono } from 'hono';
 import { LabelingScheduler } from '../labeling/scheduler.js';
 import { LocalLabelingWorkers } from '../labeling/local.js';
+import { LabelingProcessing } from '../labeling/processing.js';
 import { mountRemoteApi } from '../remote/api.js';
 import { accountMayOpenTeam } from '../auth/accounts.js';
 import { AuthEnv, authMiddleware, existingTeams, mountAuthRoutes, mountGateways } from '../auth/http.js';
@@ -193,6 +194,8 @@ export interface WorkspaceServices {
   /** Extraction as leased work (src/labeling): local slots and remote workers take segments from it. */
   labeling?: LabelingScheduler | null;
   localWorkers?: LocalLabelingWorkers | null;
+  /** Starts and stops the slots, reviews and summaries; stopped until someone starts it. */
+  processing?: LabelingProcessing | null;
 }
 
 /**
@@ -2194,8 +2197,24 @@ export function createApp(
     const ctx = requestCtx(c);
     const services = servicesFor(ctx);
     if (!services?.labeling) return c.json({ error: 'labeling runs only inside `knode-os serve`' }, 503);
-    return c.json({ scheduler: await services.labeling.status(), local: services.localWorkers?.status() ?? [] });
+    return c.json({
+      processing: services.processing?.state() ?? null,
+      scheduler: await services.labeling.status(),
+      local: services.localWorkers?.status() ?? [],
+    });
   });
+
+  // processing spends model calls, so it runs only when someone starts it
+  const switchProcessing = (on: boolean) => async (c: Context<AppEnv>) => {
+    const ctx = requestCtx(c);
+    const processing = servicesFor(ctx)?.processing;
+    if (!processing) return c.json({ error: 'processing runs only inside `knode-os serve`' }, 503);
+    const by = c.get('account')?.username ?? c.req.header('x-knode-user') ?? 'local';
+    const changed = on ? processing.start(by) : processing.stop(by);
+    return c.json({ ok: true, changed, processing: processing.state() });
+  };
+  app.post('/api/labeling/start', switchProcessing(true));
+  app.post('/api/labeling/stop', switchProcessing(false));
 
   app.post('/api/dream', async (c) => {
     const ctx = requestCtx(c);

@@ -48,6 +48,9 @@ const RULES: Rule[] = [
   { prefix: '/api/chat/protocol', group: null, methods: READ },
   { prefix: '/api/chat/readiness', group: null },
   { prefix: '/api/labeling/status', group: 'ingest' },
+  // starting the processing spends the machine's model quota: an administrator's call
+  { prefix: '/api/labeling/start', group: 'settings' },
+  { prefix: '/api/labeling/stop', group: 'settings' },
 
   { prefix: '/api/config', group: 'settings' },
   { prefix: '/api/agents', group: 'settings' },

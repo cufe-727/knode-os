@@ -370,6 +370,8 @@ describe('sign-in in front of serve', () => {
       'POST /api/config/embedding-test',
       'POST /api/config/models',
       'POST /api/config/test',
+      'POST /api/labeling/start',
+      'POST /api/labeling/stop',
       'PUT /api/agents/:name',
       'PUT /api/chat/protocol',
       'PUT /api/config',

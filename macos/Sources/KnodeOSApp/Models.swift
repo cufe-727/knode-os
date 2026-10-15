@@ -312,6 +312,59 @@ struct AdminUserDraft: Encodable {
     var disabled: Bool?
 }
 
+/* ------------------------------ processing ------------------------------ */
+
+/// Whether the workspace's processing runs: extraction slots, reviews and
+/// summary pages. The service never starts it on its own.
+struct ProcessingState: Decodable, Equatable {
+    var running: Bool
+    var since: String?
+    var by: String?
+}
+
+/// GET /api/labeling/status, the parts the app shows.
+struct LabelingStatusResponse: Decodable, Equatable {
+    var processing: ProcessingState?
+    var scheduler: Scheduler?
+    var local: [LocalBackend]
+
+    struct Scheduler: Decodable, Equatable {
+        var queued: Int
+        var workers: [Worker]?
+        var lastHour: LastHour?
+    }
+
+    struct Worker: Decodable, Equatable {
+        var worker: String
+        var remote: Bool
+        var leased: Int
+    }
+
+    struct LastHour: Decodable, Equatable {
+        var calls: Int
+        var documentsWritten: Int
+    }
+
+    struct LocalBackend: Decodable, Equatable, Identifiable {
+        var id: String
+        var label: String
+        var slots: Int
+        var busy: Int
+        var pausedUntil: String?
+        var pauseReason: String?
+    }
+
+    /// Remote workers that held work lately.
+    var remoteWorkers: Int { scheduler?.workers?.filter { $0.remote && $0.leased > 0 }.count ?? 0 }
+}
+
+/// POST /api/labeling/start | stop.
+struct ProcessingSwitchResponse: Decodable {
+    var ok: Bool
+    var changed: Bool
+    var processing: ProcessingState
+}
+
 struct GatewayRecord: Decodable, Identifiable, Hashable {
     var id: String
     var target: String

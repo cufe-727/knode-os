@@ -29,6 +29,8 @@ final class AppModel: ObservableObject {
     /// from it. Set it through `select(_:)` so the section's last tab is kept.
     @Published private(set) var selectedTab: AppTab = .files
     @Published var stats: KnowledgeStats?
+    /// Extraction, reviews and summaries: whether they run, and on what. Nil when the service has no labeling (a CLI-hosted app).
+    @Published var processing: LabelingStatusResponse?
     @Published var connectionState: ConnectionState = .checking
     /// Where the service is and how to reach it.
     @Published private(set) var connection: ConnectionSettings
@@ -431,6 +433,7 @@ final class AppModel: ObservableObject {
         token = nil
         account = nil
         stats = nil
+        processing = nil
         authNotice = message ?? L("Your session ended — sign in again.")
         phase = .signIn
     }
@@ -448,6 +451,7 @@ final class AppModel: ObservableObject {
         pendingUser = nil
         pendingFilePath = nil
         stats = nil
+        processing = nil
         authNotice = nil
         phase = .signIn
     }
@@ -585,12 +589,25 @@ final class AppModel: ObservableObject {
         guard phase == .app else { return }
         do {
             stats = try await client().stats()
+            processing = try? await client().labelingStatus()
             if case .connected = connectionState {} else { await checkConnection() }
         } catch let error as APIError where error.sessionEnded {
             sessionEnded()
         } catch {
             // the tunnel or the service went away: look again (and reopen the tunnel)
             await checkConnection()
+        }
+    }
+
+    /// Start or stop the workspace's processing; the service refuses anyone but an administrator.
+    func setProcessing(_ running: Bool) async {
+        do {
+            let answer = try await client().setProcessing(running)
+            processing?.processing = answer.processing
+            showToast(running ? L("Processing started") : L("Processing stopped — calls in flight finish"))
+            processing = try? await client().labelingStatus()
+        } catch {
+            showError(error)
         }
     }
 
@@ -610,6 +627,7 @@ final class AppModel: ObservableObject {
             if previousActiveID != current.activeWorkspaceID {
                 pendingFilePath = nil
                 stats = nil
+                processing = nil
                 workspaceRevision += 1
             }
         } catch let error as APIError where error.sessionEnded {
@@ -667,6 +685,7 @@ final class AppModel: ObservableObject {
     private func workspaceDidChange(message: String) {
         pendingFilePath = nil
         stats = nil
+        processing = nil
         workspaceRevision += 1
         showToast(message)
         Task {

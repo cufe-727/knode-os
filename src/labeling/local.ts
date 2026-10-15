@@ -11,6 +11,10 @@ import { LabelingScheduler, LabelingTask, TaskOutcome, WorkerIdentity } from './
  * health: a rate limit pauses it, a run of bad answers rests it, a missing CLI
  * or expired login parks it for half an hour and then tries again
  * (src/labeling/failures.ts). Settings saves are picked up within a minute.
+ *
+ * The slots run only between `start()` and `stop()`, as often as someone
+ * starts and stops them (src/labeling/processing.ts): `serve` never starts
+ * them on its own.
  */
 
 export interface LocalWorkerSpec {
@@ -101,16 +105,31 @@ export class LocalLabelingWorkers {
     this.log = opts.log ?? (() => {});
   }
 
+  /** Whether the slots are taking work. */
+  get running(): boolean {
+    return this.timer !== null;
+  }
+
+  /** Take work from the scheduler, with fresh slots built from the current config. */
   start(): void {
+    if (this.timer) return;
+    this.stopped = false;
+    this.signature = '';
     this.reconfigure();
     this.timer = setInterval(() => this.reconfigure(), this.opts.reconfigureMs ?? 60_000);
     this.timer.unref?.();
   }
 
-  /** Stop taking work. A call in flight finishes on its own; its answer is dropped once the scheduler has stopped. */
+  /**
+   * Stop taking work. A call in flight finishes and hands its answer back
+   * (dropped only once the scheduler itself has stopped); `start()` again
+   * builds new slots.
+   */
   stop(): void {
     this.stopped = true;
+    this.generation++;
     if (this.timer) clearInterval(this.timer);
+    this.timer = null;
     for (const wake of this.sleepers) wake();
     this.sleepers.clear();
   }

@@ -127,6 +127,9 @@ private struct MainWorkspaceView: View {
             sectionTitleItem
         }
         ToolbarItemGroup(placement: .primaryAction) {
+            if model.processing != nil {
+                ProcessingButton()
+            }
             if let stats = model.stats {
                 HStack(spacing: 9) {
                     MetricPill(value: stats.documents, label: L("docs"))
@@ -554,5 +557,117 @@ private struct WorkspaceMenu: View {
         }
         .padding(10)
         .frame(width: 270)
+    }
+}
+
+/// Extraction, reviews and summaries spend model calls, so they run only when
+/// someone starts them: the service never does on its own, not even after a
+/// restart. The toolbar shows which it is; the panel starts and stops it.
+private struct ProcessingButton: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var showing = false
+
+    private var running: Bool { model.processing?.processing?.running == true }
+
+    var body: some View {
+        Button {
+            showing.toggle()
+        } label: {
+            HStack(spacing: 6) {
+                StatusDot(color: running ? .knodeGood : .secondary)
+                Text(running ? L("Processing") : L("Processing stopped"))
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(.thinMaterial, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(running ? L("Extraction, reviews and summaries are running") : L("Extraction, reviews and summaries wait until you start them"))
+        .popover(isPresented: $showing, arrowEdge: .bottom) {
+            ProcessingPanel()
+                .environmentObject(model)
+        }
+    }
+}
+
+private struct ProcessingPanel: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var working = false
+
+    private var status: LabelingStatusResponse? { model.processing }
+    private var running: Bool { status?.processing?.running == true }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L("Processing")).font(.headline)
+                Text(L("Extraction of entities, relations and claims, then duplicate reviews and summary pages. They spend model calls, so they run only after someone starts them — never on their own, not even after a restart."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 8) {
+                StatusDot(color: running ? .knodeGood : .secondary)
+                Text(stateLine).font(.callout.weight(.medium))
+            }
+            if let local = status?.local, !local.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(L("On this service")).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    ForEach(local) { backend in
+                        Text("\(backend.label) × \(backend.slots)\(running && backend.busy > 0 ? " · " + L("%@ busy", String(backend.busy)) : "")\(backend.pauseReason.map { " · " + L("resting: %@", $0) } ?? "")")
+                            .font(.caption.monospaced())
+                    }
+                }
+            }
+            if let scheduler = status?.scheduler {
+                Text(L("%@ documents waiting · last hour: %@ calls, %@ documents written", String(scheduler.queued), String(scheduler.lastHour?.calls ?? 0), String(scheduler.lastHour?.documentsWritten ?? 0)))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let remote = status?.remoteWorkers, remote > 0 {
+                Text(L("%@ remote workers are taking work too — they are started on their own machines.", String(remote)))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            HStack {
+                if !model.maySaveSettings {
+                    Text(L("An administrator starts and stops processing.")).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if working { ProgressView().controlSize(.small) }
+                Button(running ? L("Stop processing") : L("Start processing")) {
+                    working = true
+                    Task {
+                        await model.setProcessing(!running)
+                        working = false
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(running ? .knodeBad : .knodeCyan)
+                .disabled(working || !model.maySaveSettings)
+            }
+        }
+        .padding(16)
+        .frame(width: 380)
+        .task { await model.refreshStats() }
+    }
+
+    private var stateLine: String {
+        guard let state = status?.processing else { return L("Unknown") }
+        let when = state.since.flatMap(Self.time)
+        if state.running {
+            if let when, let by = state.by { return L("Running since %@, started by %@", when, by) }
+            return L("Running")
+        }
+        if let when, let by = state.by { return L("Stopped at %@ by %@", when, by) }
+        return L("Stopped since the service started")
+    }
+
+    private static func time(_ iso: String) -> String? {
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let date = parser.date(from: iso) ?? ISO8601DateFormatter().date(from: iso) else { return nil }
+        return date.formatted(date: .omitted, time: .shortened)
     }
 }

@@ -154,6 +154,11 @@ header {
 #tabs button:hover { color: var(--fg); }
 #tabs button.active { background: var(--bg3); color: var(--fg); border-color: var(--border); }
 #statsbar { margin-left: auto; color: var(--muted); font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.processing-toggle { flex: 0 0 auto; border: 1px solid var(--border-strong); border-radius: 999px; background: var(--bg2); color: var(--muted); padding: 5px 12px; cursor: pointer; font-size: 11px; font-weight: 650; white-space: nowrap; }
+.processing-toggle:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.processing-toggle.running { border-color: rgba(95, 210, 151, 0.45); color: var(--good); }
+.processing-toggle:disabled { cursor: default; opacity: 0.7; }
+.processing-toggle[hidden] { display: none; }
 .account-area { position: relative; flex: 0 0 auto; }
 .workspace-trigger {
   display: flex; align-items: center; gap: 9px; min-width: 166px; border: 1px solid var(--border);
