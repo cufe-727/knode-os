@@ -268,6 +268,43 @@ export interface ExtractionConfig {
   segmentChars: number;
   /** Minutes between background document passes while `serve` runs. */
   intervalMinutes: number;
+  /**
+   * The worker slots `serve` runs for extraction on this machine (src/labeling):
+   * each names a route target — a connection or an agent, e.g. a Codex and a
+   * Cursor agent — and how many calls it runs at once. Absent or empty: the
+   * Extract stage's own route with `concurrency` slots. Workers on other
+   * machines come in through the remote API and need no entry here.
+   */
+  workers?: ExtractionWorkerConfig[];
+  /** Summary pages written at once by `serve`'s summary loop; default `concurrency`. */
+  summaryConcurrency?: number;
+}
+
+/** One kind of local labeling worker: what it runs on and how many calls at once. */
+export interface ExtractionWorkerConfig {
+  /** A route target id (`routeTargets`): a connection or an agent. */
+  use: string;
+  /** Calls in flight at once; 0 turns the worker off. */
+  slots: number;
+  /** Overrides the target's model / effort / speed / timeout for these calls. */
+  model?: string;
+  effort?: LlmEffort;
+  speed?: LlmSpeed;
+  cliTimeoutMs?: number;
+}
+
+/**
+ * The remote API (src/remote): labeling and knowledge access for other
+ * machines, under /remote/v1 on the same port, authenticated by per-machine
+ * tokens (`knode-os remote token create`). Requests that arrive through a
+ * public hostname reach these routes and nothing else (src/server/public-guard.ts).
+ */
+export interface RemoteApiConfig {
+  enabled: boolean;
+  /** Largest request body accepted, in bytes. */
+  maxBodyBytes?: number;
+  /** How long a labeling worker may hold a segment before it goes back in line (renewable). */
+  leaseMinutes?: number;
 }
 
 /**
@@ -638,7 +675,7 @@ export interface KnodeConfig {
    * kept like `agentLlms`.
    */
   modelAgents?: ModelAgent[];
-  server: { port: number; host: string; mcp: McpServerConfig };
+  server: { port: number; host: string; mcp: McpServerConfig; remote?: RemoteApiConfig };
   ingest: IngestConfig;
   extraction: ExtractionConfig;
   retrieval: { sag: SagSearchConfig };
@@ -724,7 +761,7 @@ export function defaultConfig(): KnodeConfig {
     // default's row on load instead.
     connections: [],
     llmUse: '',
-    server: { port: 9100, host: '127.0.0.1', mcp: { enabled: true, path: '/mcp' } },
+    server: { port: 9100, host: '127.0.0.1', mcp: { enabled: true, path: '/mcp' }, remote: { enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15 } },
     ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4, convertConcurrency: 2 },
     extraction: {
       claims: true,

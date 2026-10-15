@@ -3,6 +3,10 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { Hono } from 'hono';
+import { LabelingScheduler } from '../labeling/scheduler.js';
+import { LocalLabelingWorkers } from '../labeling/local.js';
+import { mountRemoteApi } from '../remote/api.js';
+import { publicGuard } from './public-guard.js';
 import { AppContext, judgeLlmClient } from '../context.js';
 import {
   EmbeddingConfig,
@@ -32,7 +36,7 @@ import {
   syncActiveLlm,
   defaultConfig,
   isCliProvider,
-  saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS } from '../config.js';
+  saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS, ExtractionWorkerConfig } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
 import { assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
@@ -151,6 +155,8 @@ type ExtractionConfigDraft = {
   claims?: boolean;
   batchSize?: number;
   concurrency?: number;
+  summaryConcurrency?: number;
+  workers?: Partial<ExtractionWorkerConfig>[];
 };
 
 type ModelConfigDraft = {
@@ -181,6 +187,9 @@ export interface WorkspaceServices {
   track: <T>(job: Promise<T>) => Promise<T>;
   /** The linked-folder watchers of this workspace; absent outside `serve`, where links are refreshed on demand only. */
   folders?: LinkedFolders | null;
+  /** Extraction as leased work (src/labeling): local slots and remote workers take segments from it. */
+  labeling?: LabelingScheduler | null;
+  localWorkers?: LocalLabelingWorkers | null;
 }
 
 /**
@@ -398,6 +407,8 @@ export function createApp(
   opts: { services?: (ctx: AppContext) => WorkspaceServices | null } = {},
 ) {
   const app = new Hono<AppEnv>();
+  // before anything else: from outside this machine only the token-authenticated remote API exists
+  app.use('*', publicGuard());
   const ingestRunning = new Set<string>();
   const servicesFor = (ctx: AppContext): WorkspaceServices | null => opts.services?.(ctx) ?? null;
 
@@ -435,6 +446,17 @@ export function createApp(
       path: mcpConfig?.path || '/mcp',
       token: loadOrCreateMcpToken(rootCtx.dataDir),
       registry: workspaceContexts,
+    });
+  }
+
+  // labeling and knowledge access for other machines (src/remote), token-authenticated
+  if (rootCtx.config.server.remote?.enabled !== false) {
+    mountRemoteApi(app, {
+      rootDataDir: rootCtx.dataDir,
+      registry: workspaceContexts,
+      labeling: (ctx) => servicesFor(ctx)?.labeling ?? null,
+      config: rootCtx.config.server.remote,
+      log,
     });
   }
 
@@ -673,6 +695,31 @@ export function createApp(
         const concurrency = Number(x.concurrency);
         if (Number.isFinite(batchSize) && batchSize >= 1) next.extraction.batchSize = Math.floor(batchSize);
         if (Number.isFinite(concurrency) && concurrency >= 1) next.extraction.concurrency = Math.floor(concurrency);
+        const summaryConcurrency = Number(x.summaryConcurrency);
+        if (x.summaryConcurrency !== undefined && Number.isFinite(summaryConcurrency) && summaryConcurrency >= 1) {
+          next.extraction.summaryConcurrency = Math.min(16, Math.floor(summaryConcurrency));
+        }
+        if (Array.isArray(x.workers)) {
+          // `serve`'s labeling slots per agent (src/labeling/local.ts); a target must exist
+          const targets = new Set(routeTargets(next).map((t) => t.id));
+          const workers = [];
+          for (const w of x.workers as Partial<ExtractionWorkerConfig>[]) {
+            const use = typeof w?.use === 'string' ? w.use.trim() : '';
+            const slots = Number(w?.slots);
+            if (!use || !Number.isFinite(slots) || slots < 0) return c.json({ error: 'each extraction worker needs a target ("use") and a slot count' }, 400);
+            if (!targets.has(use)) return c.json({ error: `extraction worker "${use}" is no connection or agent` }, 400);
+            const cliTimeoutMs = Number(w.cliTimeoutMs);
+            workers.push({
+              use,
+              slots: Math.min(16, Math.floor(slots)),
+              ...(typeof w.model === 'string' && w.model.trim() ? { model: w.model.trim() } : {}),
+              ...(w.effort && LLM_EFFORTS.includes(w.effort) ? { effort: w.effort } : {}),
+              ...(w.speed && LLM_SPEEDS.includes(w.speed) ? { speed: w.speed } : {}),
+              ...(Number.isFinite(cliTimeoutMs) && cliTimeoutMs >= 1000 ? { cliTimeoutMs: Math.floor(cliTimeoutMs) } : {}),
+            });
+          }
+          next.extraction.workers = workers;
+        }
       }
       // a client written before named connections sends a route's endpoint
       // inline; it becomes a row, the way `loadConfig` lifts it
@@ -2106,6 +2153,14 @@ export function createApp(
     } catch (e) {
       return c.json(err(e), 400);
     }
+  });
+
+  // the labeling scheduler and this machine's worker slots, for the UI
+  app.get('/api/labeling/status', async (c) => {
+    const ctx = requestCtx(c);
+    const services = servicesFor(ctx);
+    if (!services?.labeling) return c.json({ error: 'labeling runs only inside `knode-os serve`' }, 503);
+    return c.json({ scheduler: await services.labeling.status(), local: services.localWorkers?.status() ?? [] });
   });
 
   app.post('/api/dream', async (c) => {

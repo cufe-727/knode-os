@@ -143,13 +143,22 @@ export class LlmClient {
 
   /** Complete and parse a JSON object, tolerating markdown code fences. */
   async completeJson<T>(messages: ChatMessage[], opts: { maxTokens?: number; model?: string } = {}): Promise<T> {
-    const raw = await this.complete(messages, { json: true, ...opts });
-    const stripped = raw.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '');
-    const start = stripped.indexOf('{');
-    const end = stripped.lastIndexOf('}');
-    const body = start >= 0 && end > start ? stripped.slice(start, end + 1) : stripped;
-    return JSON.parse(body) as T;
+    return jsonFromReply<T>(await this.complete(messages, { json: true, ...opts }));
   }
+}
+
+/**
+ * The JSON object in a model's reply: code fences stripped, anything before
+ * the first `{` or after the last `}` dropped. Throws when no object parses —
+ * shared by `completeJson` and the labeling workers, which hand back the raw
+ * reply a remote machine got.
+ */
+export function jsonFromReply<T = unknown>(raw: string): T {
+  const stripped = raw.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '');
+  const start = stripped.indexOf('{');
+  const end = stripped.lastIndexOf('}');
+  const body = start >= 0 && end > start ? stripped.slice(start, end + 1) : stripped;
+  return JSON.parse(body) as T;
 }
 
 /** Statuses that mean "this endpoint has no such route", as opposed to "your request was wrong". */

@@ -14,7 +14,7 @@ import type { ChatMessage } from './client.js';
  * All run in non-interactive one-shot mode with the OS temp dir as cwd so
  * the CLIs don't pick up repo instructions (AGENTS.md / CLAUDE.md) or try to
  * touch the workspace:
- *   - codex:  `codex exec --sandbox read-only --output-last-message <f> -`
+ *   - codex:  `codex exec --ignore-user-config --ephemeral --sandbox read-only --output-last-message <f> -`
  *   - claude: `claude -p --output-format json --max-turns 1`
  *   - cursor: `cursor-agent -p --output-format json --trust <prompt>` (`--trust` answers the
  *             workspace-trust prompt newer CLIs raise for the temp cwd; the model still
@@ -136,21 +136,45 @@ export async function completeViaCli(
   throw new Error(`not a CLI provider: ${cfg.provider}`);
 }
 
+/**
+ * The arguments of a one-shot `codex exec`. `--ignore-user-config` keeps the
+ * person's ~/.codex/config.toml out of a pipeline call — its MCP servers would
+ * start for every call and its memory and multi-agent instructions would ride
+ * along with every document (tens of thousands of characters each time) — and
+ * `--ephemeral` keeps tens of thousands of extraction sessions out of
+ * ~/.codex/sessions, where trace sync would read them back as agent traces.
+ * Model, effort and speed are passed explicitly instead.
+ */
+export function codexExecArgs(opts: { outFile: string; cwd: string; model?: string; effort?: LlmEffort; speed?: LlmSpeed; images?: string[] }): string[] {
+  // --output-last-message gives the bare final message without parsing JSONL events
+  const args = ['exec', '--ignore-user-config', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', opts.cwd, '--output-last-message', opts.outFile];
+  if (opts.model) args.push('--model', opts.model);
+  const effort = effortFor('codex-cli', opts.effort);
+  if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);
+  const tier = speedFor('codex-cli', opts.speed);
+  if (tier) args.push('-c', `service_tier="${tier}"`);
+  for (const image of opts.images ?? []) args.push('--image', image);
+  args.push('-'); // read the prompt from stdin
+  return args;
+}
+
+/**
+ * What a failed CLI said, for the error message. Its tail, not its head:
+ * codex prints a banner and echoes the whole prompt before it gets to the
+ * reason (a usage limit, an expired login), and a head cut kept only those.
+ */
+export function cliFailureText(stderr: string, stdout: string, max = 400): string {
+  const text = (stderr || stdout).trim();
+  return text.length > max ? `…${text.slice(-max)}` : text;
+}
+
 async function runCodex(cfg: LlmConfig, prompt: string, model?: string, images: string[] = []): Promise<string> {
   const cmd = cliCommand('codex-cli', cfg.cliPath);
-  // --output-last-message gives the bare final message without parsing JSONL events
   const outFile = path.join(os.tmpdir(), `knode-codex-${crypto.randomUUID()}.txt`);
-  const args = ['exec', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', os.tmpdir(), '--output-last-message', outFile];
-  if (model) args.push('--model', model);
-  const effort = effortFor('codex-cli', cfg.effort);
-  if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);
-  const tier = speedFor('codex-cli', cfg.speed);
-  if (tier) args.push('-c', `service_tier="${tier}"`);
-  for (const image of images) args.push('--image', image);
-  args.push('-'); // read the prompt from stdin
+  const args = codexExecArgs({ outFile, cwd: os.tmpdir(), model, effort: cfg.effort, speed: cfg.speed, images });
   try {
     const r = await runProcess(cmd, args, prompt, cfg.cliTimeoutMs);
-    if (r.code !== 0) throw new Error(`codex exec exited with code ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
+    if (r.code !== 0) throw new Error(`codex exec exited with code ${r.code}: ${cliFailureText(r.stderr, r.stdout)}`);
     const out = fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8').trim() : '';
     if (!out) throw new Error('codex exec finished but produced no message');
     return out;
@@ -183,7 +207,7 @@ async function runClaude(cfg: LlmConfig, prompt: string, model?: string, images:
     if (w.is_error || code !== 0) throw new Error(`claude CLI error: ${String(w.result ?? 'unknown').slice(0, 300)}`);
     return String(w.result ?? '').trim();
   }
-  if (code !== 0) throw new Error(`claude exited with code ${code}: ${(stderr || stdout).trim().slice(0, 300)}`);
+  if (code !== 0) throw new Error(`claude exited with code ${code}: ${cliFailureText(stderr, stdout)}`);
   return stdout.trim(); // older CLI or plain-text output
 }
 
@@ -199,7 +223,7 @@ async function runCursor(cfg: LlmConfig, prompt: string, model?: string): Promis
   const { code, stdout, stderr } = await runProcess(cmd, args, '', cfg.cliTimeoutMs);
   const { text, error } = readCursorStream(stdout);
   if (error || code !== 0) {
-    throw new Error(`cursor CLI error: ${(error || stderr || stdout).trim().slice(0, 300)}`);
+    throw new Error(`cursor CLI error: ${error ? error.trim().slice(0, 400) : cliFailureText(stderr, stdout)}`);
   }
   if (!text) throw new Error('cursor-agent finished but produced no message');
   return text;

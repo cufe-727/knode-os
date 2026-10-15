@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { KnodeConfig, resolveRoutedLlmConfig, routeTargets } from '../config.js';
 import { LLM_EXTRACT_INPUT_CHARS, SEGMENTER_VERSION } from '../constants.js';
 import { readSidecarPart, replayableTier1, SidecarSegment, SidecarTier1, updateSidecarPart } from '../fs/sidecar.js';
@@ -7,8 +8,18 @@ import { LlmClient } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { Store } from '../store/db.js';
 import { toIso } from '../store/temporal.js';
-import { applyExtraction, KnownEntity, knownEntitiesIn, llmExtract } from './llm-extract.js';
-import { loadOntology } from './ontology.js';
+import { heldDocuments, claimDocument, releaseDocument } from '../labeling/claims.js';
+import {
+  applyExtraction,
+  buildExtractRequest,
+  ExtractRequest,
+  ExtractResult,
+  KnownEntity,
+  knownEntitiesIn,
+  parseExtractReply,
+  RawExtractReply,
+} from './llm-extract.js';
+import { loadOntology, Ontology } from './ontology.js';
 import { mergeSegmentResults, Segment, segmentText } from './segment.js';
 import { ExtractedClaim, ExtractedEntity, ExtractedRelation, PageContext } from './store.js';
 
@@ -70,25 +81,32 @@ export async function enqueueTier1(store: Store, documentId: string, segments = 
   );
 }
 
-/** Refresh queue priorities from current heat, document age and root importance. */
-async function recomputePriorities(store: Store, config: KnodeConfig): Promise<void> {
+/**
+ * Refresh queue priorities from current heat, document age and root importance:
+ * priority = (1 + heat) × freshness × importance, where freshness decays from
+ * 3 to 1 over `extraction.freshnessBoostDays`. One statement — a queue of tens
+ * of thousands of documents made a per-row update a round trip per document on
+ * every pass.
+ */
+export async function refreshQueuePriorities(store: Store, config: KnodeConfig): Promise<void> {
   const boostDays = Math.max(0.1, config.extraction.freshnessBoostDays);
-  const rows = await store.query<{
-    document_id: string; root: string; created_at: string; heat: number | null;
-  }>(
-    `SELECT q.document_id, d.root, d.created_at, s.heat
-     FROM extraction_queue q
-     JOIN documents d ON d.id = q.document_id
-     LEFT JOIN doc_stats s ON s.document_id = q.document_id`,
-  );
-  const now = Date.now();
-  for (const r of rows) {
-    const ageDays = Math.max(0, (now - new Date(r.created_at).getTime()) / (24 * 3600 * 1000));
-    const freshness = 1 + 2 * Math.max(0, 1 - ageDays / boostDays);
-    const importance = config.extraction.importance[r.root] ?? 1.0;
-    const priority = (1 + (r.heat ?? 0)) * freshness * importance;
-    await store.query(`UPDATE extraction_queue SET priority = $2 WHERE document_id = $1`, [r.document_id, priority]);
+  const params: unknown[] = [boostDays];
+  const cases: string[] = [];
+  for (const [root, weight] of Object.entries(config.extraction.importance ?? {})) {
+    if (!Number.isFinite(weight)) continue;
+    params.push(root, weight);
+    cases.push(`WHEN $${params.length - 1} THEN $${params.length}::real`);
   }
+  const importance = cases.length ? `(CASE d.root ${cases.join(' ')} ELSE 1.0 END)` : '1.0';
+  await store.query(
+    `UPDATE extraction_queue q
+     SET priority = (1 + COALESCE(s.heat, 0))
+       * (1 + 2 * GREATEST(0, 1 - GREATEST(0, EXTRACT(EPOCH FROM (now() - d.created_at)) / 86400.0) / $1::real))
+       * ${importance}
+     FROM documents d LEFT JOIN doc_stats s ON s.document_id = d.id
+     WHERE d.id = q.document_id`,
+    params,
+  );
 }
 
 /** Apply a tier-1 extraction as a child scope of the document's live scope. */
@@ -142,7 +160,10 @@ export function segmentRangesOf(t1: SidecarTier1 | null | undefined): { start: n
 
 /**
  * Drain from the extraction queue — at most `batchSize` model calls. Called
- * periodically while `serve` runs, or manually via the CLI.
+ * by `knode-os extract`, an initialization draining the queue, and tests;
+ * `serve` runs the labeling scheduler instead (src/labeling), which shares the
+ * helpers below and holds its documents in the same registry, so the two never
+ * pick the same document.
  */
 // One pass at a time per data dir: serve's timer, `knode-os extract` and an
 // initialization job draining the queue must never pick the same batch twice.
@@ -160,7 +181,19 @@ export function runTier1Pass(
   return run;
 }
 
-interface QueueRow {
+/** The extraction stage's client: `extraction.entityLlm`, else the caller's. */
+export function entityLlmClient(config: KnodeConfig, fallback: LlmClient): LlmClient {
+  return config.extraction.entityLlm
+    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, routeTargets(config), config.extraction.tier1Model))
+    : fallback;
+}
+
+/** Segment size the extraction calls read, from the config. */
+export function extractionSegmentChars(config: KnodeConfig): number {
+  return Math.max(1000, Math.floor(config.extraction.segmentChars || LLM_EXTRACT_INPUT_CHARS));
+}
+
+export interface QueueRow {
   document_id: string;
   path: string;
   title: string | null;
@@ -168,8 +201,8 @@ interface QueueRow {
   doc_date: string | Date | null;
 }
 
-/** One queued document while a pass works on it. */
-interface DocPlan {
+/** One queued document while extraction works on it. */
+export interface DocPlan {
   row: QueueRow;
   text: string;
   page: PageContext;
@@ -184,11 +217,13 @@ interface Task {
   index: number;
 }
 
-function settled(r: SidecarSegment | null): boolean {
+/** A segment needs no more calls: extracted, or failed `MAX_ATTEMPTS` times. */
+export function settled(r: SidecarSegment | null): boolean {
   return Boolean(r && (r.status === 'done' || (r.attempts ?? 0) >= MAX_ATTEMPTS));
 }
 
-function pendingOf(plan: DocPlan): number[] {
+/** Segments of a plan still to extract. */
+export function pendingOf(plan: DocPlan): number[] {
   return plan.results.flatMap((r, i) => (settled(r) ? [] : [i]));
 }
 
@@ -212,6 +247,227 @@ function knownFromDocument(plan: DocPlan, text: string, limit = 20): KnownEntity
   return out;
 }
 
+/** Queued documents in extraction order (priority, then age), leaving out `exclude`. */
+export async function queuedDocuments(store: Store, opts: { exclude?: string[]; limit?: number } = {}): Promise<QueueRow[]> {
+  const params: unknown[] = [];
+  let where = `q.tier = 1 AND d.status = 'indexed'`;
+  if (opts.exclude?.length) {
+    params.push(opts.exclude);
+    where += ` AND NOT (q.document_id = ANY($${params.length}::text[]))`;
+  }
+  let limit = '';
+  if (opts.limit) {
+    params.push(Math.max(1, Math.floor(opts.limit)));
+    limit = ` LIMIT $${params.length}`;
+  }
+  return store.query<QueueRow>(
+    `SELECT q.document_id, d.path, d.title, d.sha256, d.doc_date
+     FROM extraction_queue q JOIN documents d ON d.id = q.document_id
+     WHERE ${where}
+     ORDER BY q.priority DESC, q.enqueued_at ASC${limit}`,
+    params,
+  );
+}
+
+export async function dequeueDocument(store: Store, documentId: string): Promise<void> {
+  await store.query(`DELETE FROM extraction_queue WHERE document_id = $1`, [documentId]);
+}
+
+export type AppliedTier1 = Awaited<ReturnType<typeof applyTier1Scope>>;
+
+export type PlannedDocument =
+  /** Its text is gone or yields no segment: dequeued. */
+  | { kind: 'dropped' }
+  /** The sidecar held a whole extraction of this content, applied for free: dequeued. */
+  | { kind: 'replayed'; applied: AppliedTier1 }
+  | { kind: 'plan'; plan: DocPlan };
+
+/**
+ * Open a queued document for extraction: its text, chunks and date, its
+ * segments, and every segment result the sidecar already holds for this text
+ * (cached by the segment's hash, so an edit re-extracts only what changed).
+ */
+export async function planQueuedDocument(
+  store: Store,
+  config: KnodeConfig,
+  row: QueueRow,
+  opts: { onProgress?: (msg: string) => void } = {},
+): Promise<PlannedDocument> {
+  const source = loadSourceText(store.dataDir, row.path, 'docs');
+  if (!source) {
+    await dequeueDocument(store, row.document_id);
+    return { kind: 'dropped' };
+  }
+  const text = source.text;
+  const chunks = await store.query<{ id: string; content: string }>(`SELECT id, content FROM chunks WHERE document_id = $1 ORDER BY seq`, [row.document_id]);
+  const page: PageContext = { documentId: row.document_id, path: row.path, title: row.title ?? row.path, chunkIds: chunks };
+  const docDate = toIso(row.doc_date);
+  const t1 = readSidecarPart(store.dataDir, row.path, 'tier1');
+
+  // replay for free when the sidecar already holds a whole extraction of
+  // this content; forced, because a queued document is one whose live scope
+  // may predate that result (an interrupted pass, a copied sidecar)
+  const replay = replayableTier1(t1, row.sha256, text.length);
+  if (replay) {
+    const ranges = segmentRangesOf(replay);
+    const applied = await applyTier1Scope(store, row, page, { entities: replay.entities, relations: replay.relations, claims: replay.claims ?? [] }, {
+      model: replay.model,
+      docDate,
+      force: true,
+      extractedAt: replay.extractedAt,
+      segments: ranges ? { text, ranges } : undefined,
+    });
+    await dequeueDocument(store, row.document_id);
+    opts.onProgress?.(`tier1 replay ${row.path} (${applied.entities} entities, ${applied.claims} claims)`);
+    return { kind: 'replayed', applied };
+  }
+
+  const segments = segmentText(text, extractionSegmentChars(config));
+  if (segments.length === 0) {
+    await dequeueDocument(store, row.document_id);
+    return { kind: 'dropped' };
+  }
+  const cached = new Map<string, SidecarSegment>();
+  if (t1?.segmenter === SEGMENTER_VERSION) for (const s of t1.segments ?? []) cached.set(s.sha, s);
+  return {
+    kind: 'plan',
+    plan: {
+      row, text, page, docDate, segments,
+      results: segments.map((seg) => {
+        const c = cached.get(seg.sha);
+        return c ? { ...c, i: seg.index, start: seg.start, end: seg.end, heading: seg.heading } : null;
+      }),
+    },
+  };
+}
+
+/**
+ * The prompt for one segment of an open document: the entities the graph and
+ * this document's finished segments already name, the lead segment's subject
+ * for a follower, the subject question for a lead.
+ */
+export async function segmentExtractRequest(store: Store, config: KnodeConfig, plan: DocPlan, index: number, ontology: Ontology): Promise<ExtractRequest> {
+  const seg = plan.segments[index];
+  const multi = plan.segments.length > 1;
+  const lead = plan.results[0];
+  const fromDb = await knownEntitiesIn(store, seg.text);
+  const fromDoc = multi ? knownFromDocument(plan, seg.text) : [];
+  const known = [...fromDoc, ...fromDb.filter((k) => !fromDoc.some((d) => d.name.toLowerCase() === k.name.toLowerCase()))].slice(0, 30);
+  return buildExtractRequest(plan.page, seg.text, {
+    claims: config.extraction.claims,
+    ontology,
+    knownEntities: known,
+    docDate: plan.docDate,
+    maxChars: extractionSegmentChars(config),
+    segment: multi ? { index, total: plan.segments.length, heading: seg.heading } : undefined,
+    subject: multi && index > 0 && lead?.status === 'done' ? lead.subject ?? null : null,
+    askSubject: multi && index === 0,
+  });
+}
+
+/** What one call made of a segment: its result, or one more failed attempt. */
+export type SegmentOutcome = { ok: true; result: ExtractResult } | { ok: false; error: string };
+
+/** Record a call's outcome on the plan; `model` names who answered (or failed to). */
+export function recordSegmentOutcome(plan: DocPlan, index: number, outcome: SegmentOutcome, model: string, at = new Date().toISOString()): void {
+  const seg = plan.segments[index];
+  const multi = plan.segments.length > 1;
+  if (outcome.ok) {
+    const extracted = outcome.result;
+    plan.results[index] = {
+      i: index, sha: seg.sha, start: seg.start, end: seg.end, heading: seg.heading, status: 'done',
+      entities: extracted.entities, relations: extracted.relations, claims: extracted.claims,
+      ...(multi && index === 0 ? { subject: extracted.subject ?? null } : {}),
+      model, extractedAt: at,
+    };
+    return;
+  }
+  const prev = plan.results[index];
+  const attempts = (prev?.status === 'failed' ? prev.attempts ?? 0 : 0) + 1;
+  plan.results[index] = {
+    i: index, sha: seg.sha, start: seg.start, end: seg.end, heading: seg.heading, status: 'failed', attempts,
+    entities: [], relations: [], claims: [], model, extractedAt: at, error: outcome.error.slice(0, 300),
+  };
+}
+
+/** Keep a document's progress in its sidecar after every call. */
+export function persistPlan(dataDir: string, plan: DocPlan, model: string): void {
+  updateSidecarPart(dataDir, plan.row.path, 'tier1', (prev) => ({
+    status: 'partial',
+    entities: prev?.entities ?? [],
+    relations: prev?.relations ?? [],
+    claims: prev?.claims ?? [],
+    model,
+    contentSha: plan.row.sha256,
+    extractedAt: prev?.extractedAt ?? new Date().toISOString(),
+    segmenter: SEGMENTER_VERSION,
+    segments: plan.results.filter((r): r is SidecarSegment => r !== null),
+  }));
+}
+
+export type FinishedDocument =
+  /** Every segment failed: given up like a failed single call (a content change retries). */
+  | { kind: 'failed' }
+  | { kind: 'written'; applied: AppliedTier1; segments: number; failedSegments: number[]; model: string };
+
+/** Write a settled document: merge its segments, persist the result, apply it, dequeue. */
+export async function finishPlan(store: Store, plan: DocPlan, fallbackModel: string): Promise<FinishedDocument> {
+  const { row } = plan;
+  const ok = plan.results.filter((r): r is SidecarSegment => r?.status === 'done');
+  const failedSegments = plan.results.flatMap((r, i) => (r?.status === 'failed' ? [i] : []));
+  const now = new Date().toISOString();
+  if (ok.length === 0) {
+    const error = plan.results.map((r) => r?.error).find(Boolean) ?? 'extraction failed';
+    updateSidecarPart(store.dataDir, row.path, 'tier1', (prev) => ({
+      status: 'failed',
+      entities: prev?.entities ?? [],
+      relations: prev?.relations ?? [],
+      model: fallbackModel,
+      contentSha: row.sha256,
+      extractedAt: now,
+      error: error.slice(0, 300),
+      segmenter: SEGMENTER_VERSION,
+      segments: plan.results.filter((r): r is SidecarSegment => r !== null),
+    }));
+    await dequeueDocument(store, row.document_id);
+    return { kind: 'failed' };
+  }
+  const single = plan.segments.length === 1;
+  const merged = single
+    ? { entities: ok[0].entities, relations: ok[0].relations, claims: ok[0].claims ?? [] }
+    : mergeSegmentResults(ok.map((r) => ({ index: r.i, entities: r.entities, relations: r.relations, claims: r.claims ?? [] })));
+  const model = [...ok].sort((a, b) => a.extractedAt.localeCompare(b.extractedAt)).pop()?.model ?? fallbackModel;
+  updateSidecarPart(store.dataDir, row.path, 'tier1', () => ({
+    status: 'done',
+    entities: merged.entities,
+    relations: merged.relations,
+    claims: merged.claims,
+    model,
+    contentSha: row.sha256,
+    extractedAt: now,
+    segmenter: SEGMENTER_VERSION,
+    segments: plan.results as SidecarSegment[],
+    ...(failedSegments.length ? { failedSegments } : {}),
+  }));
+  const applied = await applyTier1Scope(store, row, plan.page, merged, {
+    model,
+    docDate: plan.docDate,
+    force: true,
+    extractedAt: now,
+    segments: single ? undefined : { text: plan.text, ranges: plan.segments.map((s) => ({ start: s.start, end: s.end })) },
+  });
+  await dequeueDocument(store, row.document_id);
+  return { kind: 'written', applied, segments: plan.segments.length, failedSegments, model };
+}
+
+/** Queue counts of a document still in progress. */
+export async function recordPlanProgress(store: Store, plan: DocPlan): Promise<void> {
+  const doneCount = plan.results.filter(settled).length;
+  await store.query(`UPDATE extraction_queue SET segments_total = $2, segments_done = $3 WHERE document_id = $1`, [
+    plan.row.document_id, plan.segments.length, doneCount,
+  ]);
+}
+
 async function runTier1PassUnlocked(
   store: Store,
   config: KnodeConfig,
@@ -225,9 +481,7 @@ async function runTier1PassUnlocked(
   };
   const touched = new Set<string>();
   const touchedClaims = new Set<string>();
-  const entityLlm = config.extraction.entityLlm
-    ? new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, routeTargets(config), config.extraction.tier1Model))
-    : llm;
+  const entityLlm = entityLlmClient(config, llm);
 
   const countQueue = async () => {
     const [row] = await store.query<{ n: number; segments: number }>(
@@ -239,12 +493,10 @@ async function runTier1PassUnlocked(
   await countQueue();
   if (!entityLlm.enabled || stats.queued === 0) return stats;
 
-  await recomputePriorities(store, config);
+  await refreshQueuePriorities(store, config);
   const maxCalls = Math.max(1, Math.floor(opts.batchSize ?? config.extraction.batchSize));
   const concurrency = Math.max(1, Math.floor(opts.concurrency ?? config.extraction.concurrency ?? 1));
-  const segmentChars = Math.max(1000, Math.floor(config.extraction.segmentChars || LLM_EXTRACT_INPUT_CHARS));
   const ontology = loadOntology(store.dataDir, config.graph?.ontologyPacks);
-  const dequeue = (id: string) => store.query(`DELETE FROM extraction_queue WHERE document_id = $1`, [id]);
   const done = (path: string, g: { entities: number; relations: number; entityIds: string[]; claimIds: string[] }) => {
     stats.processed++;
     stats.entities += g.entities;
@@ -254,230 +506,109 @@ async function runTier1PassUnlocked(
     for (const id of g.claimIds) touchedClaims.add(id);
   };
 
-  /** Write a settled document: merge its segments, persist, apply. */
-  const finish = async (plan: DocPlan): Promise<void> => {
-    const { row } = plan;
-    const ok = plan.results.filter((r): r is SidecarSegment => r?.status === 'done');
-    const failedSegments = plan.results.flatMap((r, i) => (r?.status === 'failed' ? [i] : []));
-    const now = new Date().toISOString();
-    if (ok.length === 0) {
-      // every segment failed: give up like a failed single call (a content change retries)
-      const error = plan.results.map((r) => r?.error).find(Boolean) ?? 'extraction failed';
-      updateSidecarPart(store.dataDir, row.path, 'tier1', (prev) => ({
-        status: 'failed',
-        entities: prev?.entities ?? [],
-        relations: prev?.relations ?? [],
-        model: entityLlm.label,
-        contentSha: row.sha256,
-        extractedAt: now,
-        error: error.slice(0, 300),
-        segmenter: SEGMENTER_VERSION,
-        segments: plan.results.filter((r): r is SidecarSegment => r !== null),
-      }));
-      await dequeue(row.document_id);
-      stats.failed++;
-      return;
-    }
-    const single = plan.segments.length === 1;
-    const merged = single
-      ? { entities: ok[0].entities, relations: ok[0].relations, claims: ok[0].claims ?? [] }
-      : mergeSegmentResults(ok.map((r) => ({ index: r.i, entities: r.entities, relations: r.relations, claims: r.claims ?? [] })));
-    const model = [...ok].sort((a, b) => a.extractedAt.localeCompare(b.extractedAt)).pop()?.model ?? entityLlm.label;
-    updateSidecarPart(store.dataDir, row.path, 'tier1', () => ({
-      status: 'done',
-      entities: merged.entities,
-      relations: merged.relations,
-      claims: merged.claims,
-      model,
-      contentSha: row.sha256,
-      extractedAt: now,
-      segmenter: SEGMENTER_VERSION,
-      segments: plan.results as SidecarSegment[],
-      ...(failedSegments.length ? { failedSegments } : {}),
-    }));
-    const g = await applyTier1Scope(store, row, plan.page, merged, {
-      model,
-      docDate: plan.docDate,
-      force: true,
-      extractedAt: now,
-      segments: single ? undefined : { text: plan.text, ranges: plan.segments.map((s) => ({ start: s.start, end: s.end })) },
-    });
-    done(row.path, g);
-    await dequeue(row.document_id);
-    progress(`tier1 wrote ${row.path} (${single ? 'one call' : `${plan.segments.length} segments${failedSegments.length ? `, ${failedSegments.length} failed` : ''}`}; ${g.entities} entities, ${g.claims} claims)`);
-  };
+  // documents the labeling scheduler holds are its own; this pass holds what it opens
+  const owner = `pass:${crypto.randomUUID()}`;
+  const held: string[] = [];
+  try {
+    const queue = await queuedDocuments(store, { exclude: heldDocuments(store.dataDir) });
 
-  /** Keep a document's progress in its sidecar after every call. */
-  const persist = (plan: DocPlan) => {
-    updateSidecarPart(store.dataDir, plan.row.path, 'tier1', (prev) => ({
-      status: 'partial',
-      entities: prev?.entities ?? [],
-      relations: prev?.relations ?? [],
-      claims: prev?.claims ?? [],
-      model: entityLlm.label,
-      contentSha: plan.row.sha256,
-      extractedAt: prev?.extractedAt ?? new Date().toISOString(),
-      segmenter: SEGMENTER_VERSION,
-      segments: plan.results.filter((r): r is SidecarSegment => r !== null),
-    }));
-  };
+    const plans: DocPlan[] = [];
+    const ready: Task[] = [];
+    /** Followers held back until their document's first segment is in, with the calls reserved for them. */
+    const waiting = new Map<DocPlan, number[]>();
+    let planned = 0;
+    let opened = 0;
 
-  const queue = await store.query<QueueRow>(
-    `SELECT q.document_id, d.path, d.title, d.sha256, d.doc_date
-     FROM extraction_queue q JOIN documents d ON d.id = q.document_id
-     WHERE q.tier = 1 AND d.status = 'indexed'
-     ORDER BY q.priority DESC, q.enqueued_at ASC`,
-  );
+    for (const row of queue) {
+      if (planned >= maxCalls || opened >= maxCalls) break;
+      if (!claimDocument(store.dataDir, row.document_id, owner)) continue;
+      held.push(row.document_id);
+      opened++;
+      const planned_ = await planQueuedDocument(store, config, row, { onProgress: progress });
+      if (planned_.kind === 'replayed') {
+        done(row.path, planned_.applied);
+        continue;
+      }
+      if (planned_.kind !== 'plan') continue;
+      const plan = planned_.plan;
+      plans.push(plan);
+      const pending = pendingOf(plan);
+      if (pending.length === 0) continue; // every segment cached: written after the calls below
 
-  const plans: DocPlan[] = [];
-  const ready: Task[] = [];
-  /** Followers held back until their document's first segment is in, with the calls reserved for them. */
-  const waiting = new Map<DocPlan, number[]>();
-  let planned = 0;
-  let opened = 0;
-
-  for (const row of queue) {
-    if (planned >= maxCalls || opened >= maxCalls) break;
-    opened++;
-    const source = loadSourceText(store.dataDir, row.path, 'docs');
-    if (!source) {
-      await dequeue(row.document_id);
-      continue;
-    }
-    const text = source.text;
-    const chunks = await store.query<{ id: string; content: string }>(`SELECT id, content FROM chunks WHERE document_id = $1 ORDER BY seq`, [row.document_id]);
-    const page: PageContext = { documentId: row.document_id, path: row.path, title: row.title ?? row.path, chunkIds: chunks };
-    const docDate = toIso(row.doc_date);
-    const t1 = readSidecarPart(store.dataDir, row.path, 'tier1');
-
-    // replay for free when the sidecar already holds a whole extraction of
-    // this content; forced, because a queued document is one whose live scope
-    // may predate that result (an interrupted pass, a copied sidecar)
-    const replay = replayableTier1(t1, row.sha256, text.length);
-    if (replay) {
-      const ranges = segmentRangesOf(replay);
-      const g = await applyTier1Scope(store, row, page, { entities: replay.entities, relations: replay.relations, claims: replay.claims ?? [] }, {
-        model: replay.model,
-        docDate,
-        force: true,
-        extractedAt: replay.extractedAt,
-        segments: ranges ? { text, ranges } : undefined,
-      });
-      done(row.path, g);
-      await dequeue(row.document_id);
-      progress(`tier1 replay ${row.path} (${g.entities} entities, ${g.claims} claims)`);
-      continue;
-    }
-
-    const segments = segmentText(text, segmentChars);
-    if (segments.length === 0) {
-      await dequeue(row.document_id);
-      continue;
-    }
-    const cached = new Map<string, SidecarSegment>();
-    if (t1?.segmenter === SEGMENTER_VERSION) for (const s of t1.segments ?? []) cached.set(s.sha, s);
-    const plan: DocPlan = {
-      row, text, page, docDate, segments,
-      results: segments.map((seg) => {
-        const c = cached.get(seg.sha);
-        return c ? { ...c, i: seg.index, start: seg.start, end: seg.end, heading: seg.heading } : null;
-      }),
-    };
-    plans.push(plan);
-    const pending = pendingOf(plan);
-    if (pending.length === 0) continue; // every segment cached: written after the calls below
-
-    if (segments.length > 1 && !settled(plan.results[0])) {
-      // the first segment names the document's subject for the rest; the
-      // followers' calls are reserved so the document finishes before the next one starts
-      ready.push({ plan, index: 0 });
-      planned++;
-      const followers = pending.filter((i) => i !== 0).slice(0, Math.max(0, maxCalls - planned));
-      planned += followers.length;
-      waiting.set(plan, followers);
-    } else {
-      for (const i of pending.slice(0, maxCalls - planned)) {
-        ready.push({ plan, index: i });
+      if (plan.segments.length > 1 && !settled(plan.results[0])) {
+        // the first segment names the document's subject for the rest; the
+        // followers' calls are reserved so the document finishes before the next one starts
+        ready.push({ plan, index: 0 });
         planned++;
+        const followers = pending.filter((i) => i !== 0).slice(0, Math.max(0, maxCalls - planned));
+        planned += followers.length;
+        waiting.set(plan, followers);
+      } else {
+        for (const i of pending.slice(0, maxCalls - planned)) {
+          ready.push({ plan, index: i });
+          planned++;
+        }
       }
     }
-  }
 
-  const runTask = async ({ plan, index }: Task): Promise<void> => {
-    const seg = plan.segments[index];
-    const multi = plan.segments.length > 1;
-    const lead = plan.results[0];
-    const fromDb = await knownEntitiesIn(store, seg.text);
-    const fromDoc = multi ? knownFromDocument(plan, seg.text) : [];
-    const known = [...fromDoc, ...fromDb.filter((k) => !fromDoc.some((d) => d.name.toLowerCase() === k.name.toLowerCase()))].slice(0, 30);
-    const label = multi ? ` [${index + 1}/${plan.segments.length}]` : '';
-    const now = new Date().toISOString();
-    try {
-      progress(`tier1 extract ${plan.row.path}${label}`);
-      const extracted = await llmExtract(entityLlm, plan.page, seg.text, {
-        claims: config.extraction.claims,
-        ontology,
-        knownEntities: known,
-        docDate: plan.docDate,
-        maxChars: segmentChars,
-        segment: multi ? { index, total: plan.segments.length, heading: seg.heading } : undefined,
-        subject: multi && index > 0 && lead?.status === 'done' ? lead.subject ?? null : null,
-        askSubject: multi && index === 0,
-      });
-      plan.results[index] = {
-        i: index, sha: seg.sha, start: seg.start, end: seg.end, heading: seg.heading, status: 'done',
-        entities: extracted.entities, relations: extracted.relations, claims: extracted.claims,
-        ...(multi && index === 0 ? { subject: extracted.subject ?? null } : {}),
-        model: entityLlm.label, extractedAt: now,
-      };
-      stats.tokensUsed += estimateTokens(seg.text) + OUTPUT_TOKEN_ESTIMATE;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const prev = plan.results[index];
-      const attempts = (prev?.status === 'failed' ? prev.attempts ?? 0 : 0) + 1;
-      plan.results[index] = {
-        i: index, sha: seg.sha, start: seg.start, end: seg.end, heading: seg.heading, status: 'failed', attempts,
-        entities: [], relations: [], claims: [], model: entityLlm.label, extractedAt: now, error: msg.slice(0, 300),
-      };
-      stats.callsFailed++;
-      progress(`tier1 failed for ${plan.row.path}${label}: ${msg}`);
-    }
-    stats.calls++;
-    persist(plan);
-    const followers = index === 0 ? waiting.get(plan) : undefined;
-    if (followers) {
-      waiting.delete(plan);
-      // a first segment still to be retried holds its followers until a later pass
-      if (settled(plan.results[0])) for (const i of followers) ready.push({ plan, index: i });
-    }
-  };
-
-  // LLM calls run concurrently; scope transactions run afterwards, one at a time
-  await new Promise<void>((resolve) => {
-    let active = 0;
-    const pump = () => {
-      while (active < concurrency && ready.length > 0) {
-        const task = ready.shift()!;
-        active++;
-        void runTask(task).finally(() => {
-          active--;
-          pump();
-        });
+    const runTask = async ({ plan, index }: Task): Promise<void> => {
+      const seg = plan.segments[index];
+      const label = plan.segments.length > 1 ? ` [${index + 1}/${plan.segments.length}]` : '';
+      try {
+        progress(`tier1 extract ${plan.row.path}${label}`);
+        const request = await segmentExtractRequest(store, config, plan, index, ontology);
+        const reply = await entityLlm.completeJson<RawExtractReply>(request.messages, { maxTokens: request.maxTokens });
+        recordSegmentOutcome(plan, index, { ok: true, result: parseExtractReply(reply, request) }, entityLlm.label);
+        stats.tokensUsed += estimateTokens(seg.text) + OUTPUT_TOKEN_ESTIMATE;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recordSegmentOutcome(plan, index, { ok: false, error: msg }, entityLlm.label);
+        stats.callsFailed++;
+        progress(`tier1 failed for ${plan.row.path}${label}: ${msg}`);
       }
-      if (active === 0 && ready.length === 0) resolve();
+      stats.calls++;
+      persistPlan(store.dataDir, plan, entityLlm.label);
+      const followers = index === 0 ? waiting.get(plan) : undefined;
+      if (followers) {
+        waiting.delete(plan);
+        // a first segment still to be retried holds its followers until a later pass
+        if (settled(plan.results[0])) for (const i of followers) ready.push({ plan, index: i });
+      }
     };
-    pump();
-  });
 
-  for (const plan of plans) {
-    if (pendingOf(plan).length === 0) {
-      await finish(plan);
-    } else {
-      const doneCount = plan.results.filter(settled).length;
-      await store.query(`UPDATE extraction_queue SET segments_total = $2, segments_done = $3 WHERE document_id = $1`, [
-        plan.row.document_id, plan.segments.length, doneCount,
-      ]);
+    // LLM calls run concurrently; scope transactions run afterwards, one at a time
+    await new Promise<void>((resolve) => {
+      let active = 0;
+      const pump = () => {
+        while (active < concurrency && ready.length > 0) {
+          const task = ready.shift()!;
+          active++;
+          void runTask(task).finally(() => {
+            active--;
+            pump();
+          });
+        }
+        if (active === 0 && ready.length === 0) resolve();
+      };
+      pump();
+    });
+
+    for (const plan of plans) {
+      if (pendingOf(plan).length === 0) {
+        const finished = await finishPlan(store, plan, entityLlm.label);
+        if (finished.kind === 'failed') {
+          stats.failed++;
+          continue;
+        }
+        done(plan.row.path, finished.applied);
+        const { segments, failedSegments, applied } = finished;
+        progress(`tier1 wrote ${plan.row.path} (${segments === 1 ? 'one call' : `${segments} segments${failedSegments.length ? `, ${failedSegments.length} failed` : ''}`}; ${applied.entities} entities, ${applied.claims} claims)`);
+      } else {
+        await recordPlanProgress(store, plan);
+      }
     }
+  } finally {
+    for (const id of held) releaseDocument(store.dataDir, id, owner);
   }
 
   await countQueue();

@@ -6,7 +6,9 @@ import { isHiddenName } from '../fs/files.js';
 import { RAW_DOCS, RAW_SKILLS, WIKI_DIR } from '../fs/layout.js';
 import { TreeWatcher, watchTree } from '../fs/watch.js';
 import { startDreamScheduler } from '../dream/dream.js';
-import { describeDocumentPass, runDocumentPass } from '../ingest/background.js';
+import { startFollowUp } from '../labeling/followup.js';
+import { LocalLabelingWorkers } from '../labeling/local.js';
+import { LabelingScheduler } from '../labeling/scheduler.js';
 import { LinkedFolders } from '../ingest/folders.js';
 import { sync } from '../ingest/sync.js';
 import { flushUsageToSidecars } from '../stats/heat.js';
@@ -19,15 +21,15 @@ import { loadOrCreateMcpToken, MCP_TOKEN_FILE } from './mcp-http.js';
 import { startResearchLoop } from '../research/service.js';
 import { resetRunningConversations } from '../chat/store.js';
 import { McpEndpoint } from '../research/workspace.js';
-import { WorkspaceContextRegistry } from './workspaces.js';
+import { resolveWorkspaceScope, WorkspaceContextRegistry } from './workspaces.js';
 
 /**
- * `knode-os serve` — HTTP API + web UI, plus the background loops:
- * file watcher → scoped sync (apply changed, dispose removed), the periodic
- * document pass (heat-prioritized extraction → duplicate audit of what it
- * wrote → summary pages) followed by view reconciliation, hourly usage-stats
- * flush to sidecars, periodic trace sync, datasource re-sync, nightly dream +
- * the tier-2 pass.
+ * `knode-os serve` — HTTP API + web UI + the remote API, plus the background
+ * loops: file watcher → scoped sync (apply changed, dispose removed),
+ * extraction as leased work for this machine's worker slots and remote workers
+ * (src/labeling), the duplicate audit of what it wrote and summary pages after
+ * it, view reconciliation, hourly usage-stats flush to sidecars, periodic trace
+ * sync, datasource re-sync, nightly dream + the tier-2 pass.
  */
 export async function startServer(ctx: AppContext): Promise<void> {
   const log = (msg: string) => console.log(`[knode-os] ${msg}`);
@@ -47,7 +49,10 @@ export async function startServer(ctx: AppContext): Promise<void> {
         }
         : null;
       const started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp });
-      services.set(workspaceCtx.dataDir, { mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders });
+      services.set(workspaceCtx.dataDir, {
+        mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders,
+        labeling: started.labeling, localWorkers: started.localWorkers,
+      });
       return async () => {
         services.delete(workspaceCtx.dataDir);
         await started.stop();
@@ -65,7 +70,58 @@ export async function startServer(ctx: AppContext): Promise<void> {
       mcpBase.url = `http://${localHost}:${info.port}${mcp?.path || '/mcp'}`;
       log(`mcp endpoint ${mcpBase.url}  (bearer token: ${MCP_TOKEN_FILE}; register with \`knode-os connect <claude|codex|cursor> --http\`)`);
     }
+    if (ctx.config.server.remote?.enabled !== false) log(`remote API http://${host}:${info.port}/remote/v1  (tokens: \`knode-os remote token create\`)`);
+    autostartWorkspaces(ctx.dataDir, workspaceContexts, log);
   });
+}
+
+/**
+ * Open, at startup, every workspace that follows a linked folder: its watchers,
+ * extraction and summaries must not wait for someone to open it in the UI —
+ * after a restart they would otherwise sit idle until then.
+ */
+function autostartWorkspaces(root: string, registry: WorkspaceContextRegistry, log: (msg: string) => void): void {
+  const linked = (dataDir: string) => {
+    try {
+      const config = JSON.parse(fs.readFileSync(path.join(dataDir, 'knode.config.json'), 'utf8')) as { ingest?: { linkedFolders?: unknown[] } };
+      return Array.isArray(config.ingest?.linkedFolders) && config.ingest.linkedFolders.length > 0;
+    } catch {
+      return false;
+    }
+  };
+  const dirs = (abs: string) => {
+    try {
+      return fs.readdirSync(abs, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.name.startsWith('.')).map((e) => e.name);
+    } catch {
+      return [];
+    }
+  };
+  const open = (label: string, scope: Parameters<WorkspaceContextRegistry['get']>[0]) => {
+    void registry.get(scope).then(
+      () => log(`[${label}] opened at startup: it follows linked folders`),
+      (err) => log(`[${label}] could not open at startup: ${err instanceof Error ? err.message : err}`),
+    );
+  };
+  for (const user of dirs(path.join(root, 'users'))) {
+    for (const id of dirs(path.join(root, 'users', user, 'workspaces'))) {
+      const dataDir = path.join(root, 'users', user, 'workspaces', id);
+      if (!linked(dataDir)) continue;
+      try {
+        const manifest = JSON.parse(fs.readFileSync(path.join(dataDir, '.workspace.json'), 'utf8')) as { name?: string };
+        open(`users/${user}/workspaces/${id}`, resolveWorkspaceScope({ user, kind: 'personal', id, name: manifest.name || id }));
+      } catch (err) {
+        log(`[users/${user}/workspaces/${id}] could not open at startup: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }
+  for (const team of dirs(path.join(root, 'teams'))) {
+    if (!linked(path.join(root, 'teams', team))) continue;
+    try {
+      open(`teams/${team}`, resolveWorkspaceScope({ user: 'autostart', kind: 'team', name: team }));
+    } catch (err) {
+      log(`[teams/${team}] could not open at startup: ${err instanceof Error ? err.message : err}`);
+    }
+  }
 }
 
 const WATCH_FULL_SYNC_THRESHOLD = 200;
@@ -91,6 +147,8 @@ interface StartedServices {
   kickResearch: () => void;
   track: <T>(job: Promise<T>) => Promise<T>;
   folders: LinkedFolders;
+  labeling: LabelingScheduler;
+  localWorkers: LocalLabelingWorkers;
 }
 
 function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null } = {}): StartedServices {
@@ -157,36 +215,18 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   }, interval);
   syncTimer.unref?.();
 
-  // the document pass: extract from the priority queue, audit the entities
-  // and claims it wrote for duplicates, write summary pages — then let pages
-  // that depend on the new evidence regenerate (docs/design/09, 10). While a
-  // backlog remains and passes make progress they run back to back; the
-  // interval only paces polling an empty (or stuck) queue.
-  const tier1Interval = Math.max(1, ctx.config.extraction.intervalMinutes) * 60_000;
-  let tier1Running = false;
-  const tier1Timer = setInterval(() => {
-    if (disposed || tier1Running) return;
-    tier1Running = true;
-    void track((async () => {
-      try {
-        for (;;) {
-          const pass = await runDocumentPass(ctx, { onProgress: log });
-          const line = describeDocumentPass(pass);
-          if (line) {
-            log(line);
-            const views = await reconcileViews(ctx, { actor: 'tier1', llm: false, onProgress: log });
-            if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
-          }
-          if (disposed || pass.queued === 0 || !pass.progressed) break;
-        }
-      } catch (err) {
-        log(`document pass failed: ${err instanceof Error ? err.message : err}`);
-      } finally {
-        tier1Running = false;
-      }
-    })());
-  }, tier1Interval);
-  tier1Timer.unref?.();
+  // extraction as leased work (src/labeling): this machine's worker slots and
+  // remote workers take segments as they free up, nothing waits for the
+  // slowest call; the duplicate audit of what was written, the views that
+  // depend on it and the summary pages follow on their own loop
+  // (docs/design/09, 10)
+  const remote = ctx.config.server.remote;
+  const labeling = new LabelingScheduler({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, log }, {
+    leaseMs: Math.max(1, remote?.leaseMinutes ?? 15) * 60_000,
+  });
+  const localWorkers = new LocalLabelingWorkers(labeling, () => ctx.config, { log });
+  localWorkers.start();
+  const followUp = startFollowUp(ctx, labeling, { log, track });
 
   // usage stats → sidecar flush
   const flushInterval = Math.max(1, ctx.config.heat.flushIntervalMinutes) * 60_000;
@@ -277,7 +317,9 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       disposed = true;
       await research?.stop();
       clearInterval(syncTimer);
-      clearInterval(tier1Timer);
+      followUp.stop();
+      localWorkers.stop();
+      await labeling.stop();
       clearInterval(flushTimer);
       clearInterval(dreamTimer);
       clearInterval(tier2Timer);
@@ -291,6 +333,8 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     kickResearch: () => research?.kick(),
     track,
     folders,
+    labeling,
+    localWorkers,
   };
 }
 

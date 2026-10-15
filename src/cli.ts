@@ -32,6 +32,7 @@ import { recommendWikiTopics, refreshRecommendations } from './research/recommen
 import { launchArgs } from './research/launch.js';
 import { loadProfile, loadProfiles, profileYaml } from './research/profile.js';
 import { runDocumentPass } from './ingest/background.js';
+import { REMOTE_SCOPES, RemoteScope, RemoteTokenStore } from './remote/tokens.js';
 import { describeLinkedFolders, importFolder, refreshLinkedFolders, unlinkFolder } from './ingest/folders.js';
 import { requeueFailedExtractions } from './graph/tier1.js';
 import { sync } from './ingest/sync.js';
@@ -155,6 +156,53 @@ program
     console.log(JSON.stringify({ ...stats, entitiesTouched: touched.length, claimsTouched: touchedClaims.length, documents, resolve, claims, summaries }, null, 2));
     await ctx.datasources.closeAll();
     await ctx.store.close();
+  });
+
+/* ------------------------------ remote access ------------------------------ */
+
+const remote = program
+  .command('remote')
+  .description('tokens for the remote API other machines use — labeling workers, document reads/writes, read-only SQL (see src/remote)');
+
+const remoteTokens = remote.command('token').description('create, list or revoke remote API tokens (stored hashed under <data>/.knode)');
+
+const collect = (value: string, previous: string[] = []) => [...previous, ...value.split(',').map((v) => v.trim()).filter(Boolean)];
+
+remoteTokens
+  .command('create')
+  .description('mint a token for one machine or application; the token is printed once')
+  .requiredOption('--name <name>', 'who uses it, e.g. macbook-labeler or aliyun-sg')
+  .option('--scope <scope...>', `what it may do: ${REMOTE_SCOPES.join(', ')} (repeat or comma-separate)`, collect, [] as string[])
+  .option('--workspace <workspace...>', 'workspaces it may use: <user>/<workspace-id>, team/<name>, or * (repeat or comma-separate)', collect, [] as string[])
+  .action((opts: { name: string; scope: string[]; workspace: string[] }) => {
+    const store = new RemoteTokenStore(dataDir());
+    const { token, record } = store.create({ name: opts.name, scopes: opts.scope as RemoteScope[], workspaces: opts.workspace });
+    console.log(`token ${record.id} for ${record.name}: scopes ${record.scopes.join(', ')}; workspaces ${record.workspaces.join(', ')}`);
+    console.log('');
+    console.log(token);
+    console.log('');
+    console.log('This is the only time the token is shown. A running `serve` accepts it at once.');
+  });
+
+remoteTokens
+  .command('list')
+  .description('tokens with their scopes, workspaces and last use (never the secrets)')
+  .option('--json', 'raw JSON output')
+  .action((opts: { json?: boolean }) => {
+    const tokens = new RemoteTokenStore(dataDir()).list().map(({ hash: _hash, ...t }) => t);
+    if (opts.json) return console.log(JSON.stringify(tokens, null, 2));
+    if (tokens.length === 0) return console.log('no remote tokens — `knode-os remote token create --name <machine> --scope label --workspace <user>/<workspace>`');
+    for (const t of tokens) {
+      console.log(`${t.id}  ${t.name}  [${t.scopes.join(',')}]  ${t.workspaces.join(',')}  created ${t.createdAt.slice(0, 10)}${t.lastUsedAt ? `, last used ${t.lastUsedAt.slice(0, 16)}` : ''}${t.revokedAt ? `  REVOKED ${t.revokedAt.slice(0, 10)}` : ''}`);
+    }
+  });
+
+remoteTokens
+  .command('revoke <idOrName>')
+  .description('revoke a token; a running `serve` refuses it from the next request')
+  .action((idOrName: string) => {
+    const record = new RemoteTokenStore(dataDir()).revoke(idOrName);
+    console.log(`revoked ${record.id} (${record.name})`);
   });
 
 /* --------------------------- folders from this machine --------------------------- */
