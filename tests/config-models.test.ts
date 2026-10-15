@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import {
   EmbeddingConfig,
@@ -356,6 +356,38 @@ describe('PUT /api/config with embedding providers', () => {
     expect((await read()).llm.label).toBe('工作密钥');
     await save({ llm: { model: '' } });
     expect((await read()).llm.label).toBe('工作密钥');
+  });
+
+  it('persists model pools and key limits without exposing or erasing keys', async () => {
+    vi.stubEnv('KNODE_EMBEDDING_USAGE_FILE', path.join(tmp, 'pool-usage.json'));
+    const mock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const input = init?.body ? JSON.parse(String(init.body)).input : undefined;
+      return Response.json({ data: input ? input.map((_text: string, index: number) => ({ index, embedding: Array(1024).fill(1) })) : [] });
+    });
+    try {
+    const before = await read();
+    const poolEntry = { id: 'pool-test', label: 'Pool key', provider: 'openai', baseUrl: 'http://127.0.0.1:9/v1',
+      model: 'BAAI/bge-m3', dimensions: 1024, apiKey: 'pool-secret', catalog: ['BAAI/bge-m3'],
+      enabled: true, priority: 0, quotaGroup: 'account-test',
+      limits: { requestsPerMinute: 60, tokensPerMinute: 100000, requestsPerDay: 5000, tokensPerDay: 1000000, concurrency: 2, resetTimezone: 'UTC' } };
+    const response = await save({ embeddingProviders: [...before.embeddingProviders, poolEntry],
+      embeddingPool: { enabled: true, model: 'bge-m3', dimensions: 1024, batchSize: 16 } });
+    expect(response.status).toBe(200);
+    const result = await saved(response);
+    expect(result.config.embedding).toMatchObject({ apiKey: '', baseUrl: 'pool://l2-v1', dimensions: 1024 });
+    expect(result.config.embeddingProviders.at(-1)).toMatchObject({ apiKey: '***', limits: poolEntry.limits, priority: 0 });
+    const renamed = await saved(await save({ embeddingProviders: result.config.embeddingProviders.map((e) => ({ ...e, label: e.label + ' renamed' })) }));
+    expect(renamed.reembedded).toBe(false);
+    const file = path.join(root, 'users/tester/workspaces/default/knode.config.json');
+    const persisted = JSON.parse(fs.readFileSync(file, 'utf8')) as KnodeConfig;
+    expect(persisted.embeddingProviders.at(-1)?.apiKey).toBe('pool-secret');
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    const invalid = await save({ embeddingProviders: renamed.config.embeddingProviders.map((e) => ({ ...e, enabled: false })) });
+    expect(invalid.status).toBe(400);
+    expect((await read()).embeddingProviders.at(-1)?.enabled).toBe(true);
+    // Restore the offline fixture so unrelated route tests never need a network call.
+    await save({ embeddingProviders: before.embeddingProviders, embeddingUse: before.embeddingUse, embeddingPool: { enabled: false } });
+    } finally { mock.mockRestore(); vi.unstubAllEnvs(); }
   });
 });
 

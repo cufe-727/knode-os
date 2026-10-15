@@ -32,6 +32,7 @@ import { recommendWikiTopics, refreshRecommendations } from './research/recommen
 import { launchArgs } from './research/launch.js';
 import { loadProfile, loadProfiles, profileYaml } from './research/profile.js';
 import { runDocumentPass } from './ingest/background.js';
+import { describeLinkedFolders, importFolder, refreshLinkedFolders, unlinkFolder } from './ingest/folders.js';
 import { requeueFailedExtractions } from './graph/tier1.js';
 import { sync } from './ingest/sync.js';
 import { historyOf, lineageOf } from './lineage/inspect.js';
@@ -154,6 +155,92 @@ program
     console.log(JSON.stringify({ ...stats, entitiesTouched: touched.length, claimsTouched: touchedClaims.length, documents, resolve, claims, summaries }, null, 2));
     await ctx.datasources.closeAll();
     await ctx.store.close();
+  });
+
+/* --------------------------- folders from this machine --------------------------- */
+
+const folders = program
+  .command('folders')
+  .description('import a folder from this machine into raw/docs with its tree intact, once or kept in sync (see src/ingest/folders.ts)');
+
+/** The numbers one import or refresh produced, as one line. */
+const describeMirror = (r: { copied: string[]; removed: string[]; unchanged: number; tooLarge: number; skippedByType: number }) =>
+  `${r.copied.length} copied, ${r.removed.length} removed, ${r.unchanged} unchanged${r.tooLarge ? `, ${r.tooLarge} above the index limit (copied, not indexed)` : ''}${r.skippedByType ? `, ${r.skippedByType} of unsupported types left behind` : ''}`;
+
+const SERVE_HINT = 'note: a running `knode-os serve` keeps its own copy of the config — restart it, or link through the app, for it to watch this folder';
+
+folders
+  .command('list')
+  .description('linked folders and the state of their mirrors')
+  .option('--json', 'raw JSON output')
+  .action(async (opts) => {
+    const ctx = await createContext(dataDir());
+    const links = describeLinkedFolders(ctx);
+    if (opts.json) console.log(JSON.stringify(links, null, 2));
+    else if (links.length === 0) console.log('no linked folders — `knode-os folders link <folder>` mirrors one under raw/docs and keeps it in sync');
+    else for (const l of links) console.log(`${l.dest}  ←  ${l.source}${l.sourceExists ? '' : '  (source missing)'}  ${l.files} files, ${(l.bytes / 1e6).toFixed(1)} MB, linked ${l.createdAt.slice(0, 10)}`);
+    await ctx.store.close();
+  });
+
+const importAction = (mode: 'copy' | 'link') => async (source: string, opts: { to?: string; replace?: boolean; llm?: boolean }) => {
+  const ctx = await createContext(dataDir());
+  try {
+    const r = await importFolder(ctx, source, { dest: opts.to, mode, replace: Boolean(opts.replace), llmGraph: opts.llm, onProgress: (m) => console.log(`  ${m}`) });
+    console.log(`${mode === 'link' ? 'linked' : 'imported'} ${r.source} → ${r.dest}: ${describeMirror(r)}`);
+    console.log(`indexed: ${r.sync.indexed} applied, ${r.sync.unchanged} unchanged, ${r.sync.skipped} skipped, ${r.sync.errors} errors`);
+    if (mode === 'link') console.log(SERVE_HINT);
+  } finally {
+    await ctx.datasources.closeAll();
+    await ctx.store.close();
+  }
+};
+
+folders
+  .command('import <source>')
+  .description('copy a folder once into raw/docs/<name> (its tree intact) and index it')
+  .option('--to <dest>', 'destination under raw/docs (default: the folder\'s own name)')
+  .option('--replace', 'allow an existing destination: it becomes a mirror of the source')
+  .option('--no-llm', 'do not queue the documents for tier-1 LLM extraction')
+  .action(importAction('copy'));
+
+folders
+  .command('link <source>')
+  .description('mirror a folder into raw/docs/<name> and keep it in sync: `serve` watches it and indexes every change')
+  .option('--to <dest>', 'destination under raw/docs (default: the folder\'s own name)')
+  .option('--replace', 'allow an existing destination: it becomes the mirror')
+  .option('--no-llm', 'do not queue the documents for tier-1 LLM extraction')
+  .action(importAction('link'));
+
+folders
+  .command('sync [dest]')
+  .description('mirror the linked folders\' sources now and index what changed (one link with <dest>)')
+  .action(async (dest?: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const results = await refreshLinkedFolders(ctx, dest, { onProgress: (m) => console.log(`  ${m}`) });
+      for (const r of results) {
+        console.log(r.sourceMissing ? `${r.dest}: source folder missing — mirror left alone` : `${r.dest}: ${describeMirror(r)}${r.sync ? `; ${r.sync.indexed} applied, ${r.sync.disposed} disposed` : ''}`);
+      }
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+folders
+  .command('unlink <dest>')
+  .description('forget a link; the mirrored files stay as ordinary documents unless --remove-files')
+  .option('--remove-files', 'also delete the mirror and dispose its documents')
+  .action(async (dest: string, opts: { removeFiles?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const r = await unlinkFolder(ctx, dest, { removeFiles: Boolean(opts.removeFiles), onProgress: (m) => console.log(`  ${m}`) });
+      console.log(r.removedFiles ? `unlinked ${r.dest} and removed its files (${r.sync?.disposed ?? 0} disposed)` : `unlinked ${r.dest}; its files stay as ordinary documents`);
+      console.log(SERVE_HINT);
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
   });
 
 program

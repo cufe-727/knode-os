@@ -5,6 +5,7 @@ import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES } from '../constants.js';
 import { assertSourcePath, assertWritablePath, grepFiles, listTree, safePath, writeFileText } from '../fs/files.js';
 import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
+import { assertNotLinked } from '../ingest/folders.js';
 import { graphInsights, graphSearch } from '../graph/query.js';
 import { sync } from '../ingest/sync.js';
 import { historyOf, lineageOf } from '../lineage/inspect.js';
@@ -167,6 +168,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
     async ({ path: p, content }) => {
       assertWritablePath(p);
       assertNotConvertedOriginal(p);
+      assertNotLinked(ctx.config, p, 'write to');
       writeFileText(ctx.dataDir, p, content);
       return json({ ok: true, path: p });
     },
@@ -227,6 +229,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
     },
     async ({ path: p }) => {
       assertSourcePath(p);
+      assertNotLinked(ctx.config, p, 'forget');
       return json(await forgetSource(ctx, p));
     },
   );

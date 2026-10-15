@@ -164,6 +164,10 @@ knode-os obsidian status [dir]         检查 Vault 是否可直接打开
 knode-os okf validate [bundle] [--json]  校验 OKF v0.2(默认校验 <data>/wiki)
 knode-os okf migrate [--dry-run]         将旧版 wiki 结构迁移到 OKF v0.2
 knode-os okf import <bundle> [--name n]  无损导入到 raw/docs/okf/<name>
+knode-os folders import <文件夹> [--to d] [--replace]  把本机一个文件夹按原目录结构复制到 raw/docs/<名字> 并索引
+                              （只带走文本、PDF、图片）
+knode-os folders link <文件夹> [--to d]    同上但记住它：`serve` 监听该文件夹，新增、修改、删除都即时镜像进索引
+knode-os folders list | sync [dest] | unlink <dest> [--remove-files]
 knode-os okf export <dir>                校验并导出原生 wiki bundle
 knode-os wiki generate        补齐缺失的文档摘要页与实体页
 knode-os wiki refine          tier-2:断言审计 + 全量重复实体审计 + 断言复核 + 热门话题块 + 研究推荐
@@ -209,7 +213,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
 四个一级区，每区自带二级 tab。
 
 - **Library / 资料** —— 盒子里有什么
-  - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown)
+  - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown);**＋ add → Import / Link folder from this Mac** 按路径把本机一个文件夹整体带入并保留目录结构——一次性复制,或"链接"后由 `serve` 持续同步原文件夹的变化(树里带 🔗 标记,只读)
   - **Search / 检索** —— hybrid/vector/keyword 检索,展示分数构成;可限定在「文件」里选中的目录
   - **Traces / 轨迹** —— 已收集的 agent 会话;点一行即可打开 `raw/traces/` 下对应的镜像文件
 - **Ask / 问答** —— 一个问题，一次 agent 会话。配置好的 agent 通过 MCP 作答，跨多轮追查线索，并把你教它的内容写成隔离笔记（确认后采纳）。没有指定 agent 时跑 01 区的默认连接，所以只要配了模型 Ask 就能用；连这个也没配时，界面会直接说清楚要去配什么。

@@ -132,7 +132,7 @@
       <aside id="filetree-pane">
         <div class="pane-actions">
           <button id="btn-refresh-tree" title="Refresh — reread the workspace tree from disk">⟳</button>
-          <button id="btn-add" title="Add — a new file or folder, or documents uploaded from disk, into the folder shown below">＋ add</button>
+          <button id="btn-add" title="Add — a new file or folder, documents uploaded from disk, or a folder from this Mac (copied once, or linked and kept in sync), into the folder shown below">＋ add</button>
           <button id="btn-ingest" title="Index — turn new and changed files into knowledge: chunk, embed, extract entities and refresh the wiki. The CLI calls this ingest / sync.">⛁ index</button>
           <input type="file" id="file-upload" multiple hidden />
           <input type="file" id="folder-upload" webkitdirectory hidden />
@@ -297,6 +297,7 @@
         <section class="settings-section" data-subtab="providers" aria-labelledby="providers-title">
           <div class="settings-section-head"><div><p class="section-index">01 · PROVIDERS &amp; AGENTS</p><h3 id="providers-title">Models</h3><p>Each model endpoint and its key, once. Ingest stages pick from this list, and a deepagents agent below runs on one of them.</p></div><span class="section-badge">Configure once</span></div>
 
+          <div id="cfg-embedding-pool" class="cfg-card embedding-pool"></div>
           <div class="provider-table">
             <div class="provider-head">
               <span></span><span>kind</span><span>name</span><span></span><span>provider</span><span>model</span>
@@ -342,7 +343,7 @@
                 <div class="stage-panel-copy">
                   <div class="stage-title"><h4>Index</h4><span class="section-badge">Embedding</span></div>
                   <p>Every chunk becomes a vector for semantic and hybrid recall.</p>
-                  <p class="stage-req">Not an LLM — it uses one of the embedding providers from section 01. Changing which one, or its model or dimensions, re-embeds the whole corpus.</p>
+                  <p class="stage-req">Uses a model pool or a single embedding key. Changing the model or dimensions re-embeds the corpus; rotating keys in a pool does not.</p>
                   <div class="stage-rates">
                     <label>Parallel documents<input id="cfg-ingest-concurrency" type="number" min="1" max="32" step="1" /></label>
                     <label>Texts per request<input id="cfg-emb-batch" type="number" min="1" max="256" step="1" /></label>
@@ -350,7 +351,7 @@
                 </div>
                 <div class="stage-control">
                   <label>Run with<select id="cfg-embedding-use"></select></label>
-                  <p class="route-note">One provider at a time — vectors from two models are not comparable. Switching re-embeds the whole corpus when you save.</p>
+                  <p class="route-note" id="cfg-embedding-route-note">Manage model pools and per-key budgets in Providers &amp; Agents.</p>
                 </div>
               </div>
 

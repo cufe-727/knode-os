@@ -18,7 +18,9 @@ trap 'rm -rf "$DEPLOY_DIR" "$PACK_DIR"' EXIT
 cd "$REPO_DIR"
 npm run build
 cd "$MACOS_DIR"
-swift build -c release
+# A local SDK/toolchain override also serves machines whose newest SDK needs
+# compiler plugins not shipped in Command Line Tools yet.
+swift build -c release ${KNODE_OS_SWIFT_FLAGS:-}
 
 if [[ ! -f "$APP_ICON" ]]; then
   echo "Missing app icon: $APP_ICON" >&2

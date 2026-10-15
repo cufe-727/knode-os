@@ -106,8 +106,30 @@ export async function listEmbeddingModels(cfg: EmbeddingConfig): Promise<ModelLi
     };
   }
   try {
+    const base = cfg.baseUrl.replace(/\/+$/, '');
+    const url = new URL(base);
+    let catalogUrl: string | undefined;
+    let cloudflare = false;
+    if (url.hostname === 'api.siliconflow.cn' || url.hostname === 'api.siliconflow.com') catalogUrl = `${base}/models?sub_type=embedding`;
+    if (url.hostname === 'openrouter.ai') catalogUrl = `${base}/embeddings/models`;
+    if (url.hostname === 'api.cloudflare.com' && /\/accounts\/[^/]+\/ai\/v1$/.test(url.pathname)) {
+      catalogUrl = base.replace(/\/ai\/v1$/, '/ai/models/search?per_page=100');
+      cloudflare = true;
+    }
+    if (catalogUrl) {
+      const response = await fetch(catalogUrl, {
+        headers: { Authorization: `Bearer ${resolveSecret(cfg.apiKey)}` }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (!response.ok) throw new Error(`Embedding model discovery returned HTTP ${response.status}`);
+      const body = await response.json() as { data?: { id: string; name?: string }[];
+        result?: { name: string; task?: { name?: string } }[] };
+      const models = cloudflare
+        ? (body.result ?? []).filter((m) => /text.embeddings/i.test(m.task?.name ?? '')).map((m) => ({ id: m.name }))
+        : (body.data ?? []).filter((m) => typeof m.id === 'string').map((m) => ({ id: m.id, label: m.name }));
+      return { ok: true, source: 'api', models: models.sort((a, b) => a.id.localeCompare(b.id)) };
+    }
     const all = await listOpenAiModels(cfg.baseUrl, cfg.apiKey);
-    const embedding = all.models.filter((m) => /embed/i.test(m.id));
+    const embedding = all.models.filter((m) => /embed|(?:^|\/)bge-(?!reranker)|(?:^|\/)e5-/i.test(m.id));
     if (embedding.length) return { ...all, models: embedding };
     return { ...all, note: 'No model id looked like an embedding model, so every model the endpoint returned is listed.' };
   } catch (e) {

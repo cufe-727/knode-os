@@ -5,6 +5,7 @@ import { AppContext } from '../context.js';
 import { SIDECAR_ROOT_SEGMENT } from '../fs/layout.js';
 import { startDreamScheduler } from '../dream/dream.js';
 import { describeDocumentPass, runDocumentPass } from '../ingest/background.js';
+import { LinkedFolders } from '../ingest/folders.js';
 import { sync } from '../ingest/sync.js';
 import { flushUsageToSidecars } from '../stats/heat.js';
 import { syncTraces } from '../traces/sync.js';
@@ -44,7 +45,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
         }
         : null;
       const started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp });
-      services.set(workspaceCtx.dataDir, { mcp, kickResearch: started.kickResearch, track: started.track });
+      services.set(workspaceCtx.dataDir, { mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders });
       return async () => {
         services.delete(workspaceCtx.dataDir);
         await started.stop();
@@ -71,6 +72,7 @@ interface StartedServices {
   stop: () => Promise<void>;
   kickResearch: () => void;
   track: <T>(job: Promise<T>) => Promise<T>;
+  folders: LinkedFolders;
 }
 
 function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null } = {}): StartedServices {
@@ -183,6 +185,11 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   }, flushInterval);
   flushTimer.unref?.();
 
+  // linked folders: mirror what changed while knode-os was down, then follow
+  // their sources with a watcher of their own (src/ingest/folders.ts)
+  const folders = new LinkedFolders(ctx, { log, track });
+  folders.start();
+
   // nightly dream + the tier-2 pass
   const dreamTimer = startDreamScheduler(ctx, log);
   log(`dream scheduled daily at ${ctx.config.dream.schedule} (lookback ${ctx.config.dream.lookbackDays}d)`);
@@ -254,11 +261,13 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       clearInterval(dsTimer);
       if (watchTimer) clearTimeout(watchTimer);
       if (watcher) await watcher.close();
+      await folders.stop();
       await Promise.allSettled([...activeJobs]);
       await ctx.datasources.closeAll();
     },
     kickResearch: () => research?.kick(),
     track,
+    folders,
   };
 }
 

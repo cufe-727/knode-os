@@ -131,10 +131,13 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   let preparedDocs: Map<string, string> | undefined;
   let failed = new Set<string>();
   if (touchesDocs) {
+    // a scoped run prepares only the keys it was asked about: a watcher event
+    // on one file must not hash every file under raw/docs
     const prep = await prepareDocs(ctx.dataDir, {
       vision: documentLlm,
       concurrency: config.ingest.convertConcurrency,
       onProgress: progress,
+      prefixes,
     });
     stats.skipped += prep.stats.skipped;
     stats.errors += prep.stats.errors;

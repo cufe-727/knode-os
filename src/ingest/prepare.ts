@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { MAX_CONVERTIBLE_FILE_BYTES, MAX_FILE_BYTES } from '../constants.js';
-import { isTextFile, safePath, walkFiles } from '../fs/files.js';
+import { isHiddenName, isTextFile, safePath, walkFiles } from '../fs/files.js';
 import { RAW_DOCS } from '../fs/layout.js';
 import { hasContent, readContent, readSidecarPart, SidecarConversion, writeContent, writeSidecarPart } from '../fs/sidecar.js';
 import { NORMALIZER_VERSION, normalizeCookedFrontmatter } from '../okf/normalize.js';
@@ -61,6 +61,37 @@ export interface PrepareOptions extends ConversionOptions {
   concurrency?: number;
   /** Test hook: pretend the normalizer is at this version. */
   normalizerVersion?: number;
+  /**
+   * Prepare only the sources under these keys — a scoped sync (a watcher
+   * event, one linked folder's changes). Default: all of raw/docs. Keys are
+   * normalized the way `sync` normalizes `only`.
+   */
+  prefixes?: string[];
+}
+
+/**
+ * The raw/docs sources a prepare pass looks at. Without prefixes, all of
+ * them; with prefixes, only what sits under one — a prefix above raw/docs
+ * covers it whole, a directory is walked, a file is taken as it is. A key
+ * that no longer exists has nothing to prepare (sync disposes it), and a
+ * hidden path is never a source.
+ */
+export function rawDocsUnder(dataDir: string, prefixes: string[] | undefined): string[] {
+  if (!prefixes) return walkFiles(dataDir, RAW_DOCS);
+  const out = new Set<string>();
+  for (const p of prefixes) {
+    if (p === RAW_DOCS || RAW_DOCS.startsWith(`${p}/`)) return walkFiles(dataDir, RAW_DOCS);
+    if (!p.startsWith(`${RAW_DOCS}/`) || p.split('/').some(isHiddenName)) continue;
+    let st: fs.Stats;
+    try {
+      st = fs.statSync(safePath(dataDir, p));
+    } catch {
+      continue;
+    }
+    if (st.isDirectory()) for (const f of walkFiles(dataDir, p)) out.add(f);
+    else if (st.isFile()) out.add(p);
+  }
+  return [...out];
 }
 
 function producedBy(conversion: SidecarConversion | undefined): string | undefined {
@@ -163,7 +194,7 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
   };
 
   // Drained first: walkFiles is a generator, and pooled workers would race it.
-  const raws = [...walkFiles(dataDir, RAW_DOCS)];
+  const raws = rawDocsUnder(dataDir, opts.prefixes);
   await pool(raws, Math.max(1, opts.concurrency ?? 1), prepareOne);
 
   return { stats, wanted, failed };

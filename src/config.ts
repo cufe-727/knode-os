@@ -41,6 +41,34 @@ export interface EmbeddingConnection extends EmbeddingConfig {
   /** Stable key `embedding.use` references. Never reused for a different endpoint. */
   id: string;
   label: string;
+  /** Opt out of a model pool without deleting the credential. */
+  enabled?: boolean;
+  /** Lower numbers are used first; equal priorities rotate fairly. */
+  priority?: number;
+  /** Keys for one provider account share a quota bucket across workspaces. */
+  quotaGroup?: string;
+  limits?: EmbeddingLimits;
+  limitNote?: string;
+  /** Last explicitly refreshed embedding catalog; IDs are provider-native. */
+  catalog?: string[];
+  /** OpenRouter upstream pin, for example deepinfra/fp32. */
+  upstream?: string;
+}
+
+export interface EmbeddingLimits {
+  requestsPerMinute: number;
+  tokensPerMinute: number;
+  requestsPerDay: number;
+  tokensPerDay: number;
+  concurrency: number;
+  resetTimezone: string;
+}
+
+export interface EmbeddingPoolConfig {
+  enabled: boolean;
+  model: string;
+  dimensions: number;
+  batchSize: number;
 }
 
 /**
@@ -242,11 +270,26 @@ export interface ExtractionConfig {
   intervalMinutes: number;
 }
 
+/**
+ * A folder elsewhere on this machine mirrored into raw/docs and kept in sync
+ * while `serve` runs (src/ingest/folders.ts). Written by the folder routes and
+ * `knode-os folders link`, never by hand.
+ */
+export interface LinkedFolder {
+  /** Absolute path of the folder outside the workspace. */
+  source: string;
+  /** Its mirror inside the workspace, a folder under raw/docs. */
+  dest: string;
+  createdAt: string;
+}
+
 export interface IngestConfig {
   chunkSize: number;
   chunkOverlap: number;
   /** Re-sync automatically when files under the data dir change. */
   watch: boolean;
+  /** Folders mirrored from elsewhere on this machine; absent or empty when none is linked. */
+  linkedFolders?: LinkedFolder[];
   /** Parallel documents in flight during the index pass; embedding round-trips dominate. */
   concurrency?: number;
   /**
@@ -560,6 +603,8 @@ export interface KnodeConfig {
   embeddingProviders: EmbeddingConnection[];
   /** Which `embeddingProviders` entry the Index stage runs on. */
   embeddingUse: string;
+  /** One vector space, with compatible credentials selected at request time. */
+  embeddingPool?: EmbeddingPoolConfig;
   database: DatabaseConfig;
   /**
    * A mirror of the connection `llmUse` names, flattened by `syncActiveLlm`.
@@ -1379,9 +1424,16 @@ export function activeEmbedding(
  * runs, so that diff keeps comparing two plain endpoints.
  */
 export function syncActiveEmbedding(config: KnodeConfig): KnodeConfig {
-  const { id, label, ...endpoint } = activeEmbedding(config);
-  config.embedding = endpoint;
-  config.embeddingUse = id;
+  const entry = activeEmbedding(config);
+  config.embeddingUse = entry.id;
+  const pool = config.embeddingPool;
+  config.embedding = pool?.enabled ? {
+    provider: 'openai', baseUrl: 'pool://l2-v1', apiKey: '', model: pool.model,
+    dimensions: pool.dimensions, batchSize: pool.batchSize, sendDimensions: false,
+  } : {
+    provider: entry.provider, baseUrl: entry.baseUrl, apiKey: entry.apiKey, model: entry.model,
+    dimensions: entry.dimensions, batchSize: entry.batchSize, sendDimensions: entry.sendDimensions,
+  };
   return config;
 }
 
@@ -1428,7 +1480,8 @@ export function saveConfig(dataDir: string, config: KnodeConfig): void {
   const file = path.join(dataDir, CONFIG_FILE);
   // derived from the agent files; writing them would make two copies to disagree
   const { agentLlms: _derived, modelAgents: _alsoDerived, ...persisted } = config;
-  fs.writeFileSync(file, JSON.stringify(persisted, null, 2) + '\n');
+  fs.writeFileSync(file, JSON.stringify(persisted, null, 2) + '\n', { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
 }
 
 /** Resolve "env:VAR" indirection in API keys. */

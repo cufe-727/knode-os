@@ -386,6 +386,15 @@ struct APIClient {
         try await send("/api/config", method: "PUT", body: encoded(config))
     }
 
+    func embeddingUsage() async throws -> EmbeddingUsageResponse {
+        try await send("/api/config/embedding-usage")
+    }
+
+    func testEmbedding(_ config: KnodeConfig, id: String? = nil) async throws -> EmbeddingTestResponse {
+        struct Body: Encodable { var config: KnodeConfig; var id: String? }
+        return try await send("/api/config/embedding-test", method: "POST", body: encoded(Body(config: config, id: id)))
+    }
+
     /// Models the draft config's provider offers for one route ("embedding",
     /// "llm", "entityLlm", "documentLlm", "summaryLlm", "judgeLlm"). Inherited routes are
     /// resolved against the draft default provider server-side.

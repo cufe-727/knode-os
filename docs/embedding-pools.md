@@ -1,0 +1,17 @@
+# Embedding model pools
+
+Settings → Providers & Agents contains the embedding key inventory and the model pool. Add one row per key, refresh its model catalog, and enable automatic routing for a model and vector dimension. The Index stage then uses the pool for both ingestion and query embeddings.
+
+Each key has an enable switch, priority (lower first), RPM, TPM, daily request/token caps, concurrency and an IANA reset timezone. Zero request/token caps block calls. Equal priorities rotate by least recent use. OpenRouter can pin an upstream; a pin disables its upstream fallbacks. The original single-provider configuration remains available by switching off the pool.
+
+Only the exact BGE-M3 aliases `BAAI/bge-m3`, `baai/bge-m3`, and `@cf/baai/bge-m3` share the built-in `bge-m3` identity, at 1024 dimensions. Other models require the same selected model ID and dimension on each participating key. Model discovery lists embedding catalogs on SiliconFlow, Cloudflare and OpenRouter; a listed model is not a guarantee of available credits or capacity. All pooled vectors are checked for count, order, dimension and finite nonzero values, then L2-normalized. Cross-provider numerics may still differ; validate retrieval quality on representative documents before depending on exact rankings.
+
+The pool has its own vector identity. Changing its model or dimensions rebuilds embeddings, while rotating keys, changing priorities, or editing caps leaves the vector space unchanged. A pool never falls back to hashing or to another model.
+
+Usage is stored in `~/.knode-os/embedding-usage.json`, permission 0600. It contains credential hashes and counters, not keys. A process lock and atomic file replacement protect quota reservations across processes and workspaces. The same Cloudflare account is identified from its API URL; other providers can share an explicit account quota group. Use the same group and reset timezone for all keys belonging to one account. Within a group the stricter configured limits apply. The app conservatively counts all model requests in that group together, even where the provider has a separate allowance for each model.
+
+Every upstream attempt reserves its budget before sending, including retries on another key. Token reservation uses UTF-8 byte length plus per-input overhead, then settles to the provider's reported usage when available. Failed attempts retain the estimate. Daily accounting follows the configured timezone, including requests finishing after midnight. Rolling minute counters, active request leases and cooldowns survive restarts. Corrupt usage files fail closed. HTTP 429 respects `Retry-After`; transient errors cool down, and authentication/balance failures receive a longer cooldown. If every candidate is unavailable, the request waits briefly for a rate slot or returns an explicit error.
+
+These are **application caps**, not a live view of the provider's billing balance. Calls outside KnodeOS are not counted. Provider limits and paid/free quotas remain authoritative. Cloudflare Neurons and tokens are different units: any token cap estimated from the BGE-M3 neuron rate is specific to that model and does not cover other AI models on the account.
+
+The configuration API redacts keys as `***`, preserving the stored secret when the UI saves the placeholder. Key values stay in user configuration files outside the repository. `GET /api/config/embedding-usage` returns counters and cooldowns; `POST /api/config/embedding-test` tests a draft pool or one named key without running the LLM stages.

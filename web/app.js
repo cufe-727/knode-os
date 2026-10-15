@@ -734,6 +734,15 @@ let treeData = null;
 let selectedDir = null;
 /** Folders left open, kept across reloads so something just created stays in view. */
 const expandedDirs = new Set(['wiki']);
+/** Linked folders in the tree: mirror path → the folder on this Mac it is mirrored from. Filled by loadTree. */
+const linkedDests = new Map();
+/** The folder on this Mac a path is mirrored from, or null — everything under a linked mirror is. */
+function mirroredSource(path) {
+  for (const [dest, source] of linkedDests) if (path === dest || path.startsWith(`${dest}/`)) return source;
+  return null;
+}
+/** The last path typed into an import, offered again next time. */
+let lastImportSource = '';
 
 /** How many files and bytes go into one upload request — a folder can hold thousands. */
 const UPLOAD_BATCH_FILES = 40;
@@ -799,8 +808,9 @@ function renderTree(node, container) {
       if (!expandedDirs.has(child.path)) div.classList.add('collapsed');
       if (child.path === selectedDir) label.classList.add('picked');
       const paint = () => {
-        label.textContent = `${div.classList.contains('collapsed') ? '▸' : '▾'} ${child.name}`;
+        label.textContent = `${div.classList.contains('collapsed') ? '▸' : '▾'} ${child.name}${child.linked ? ' 🔗' : ''}`;
       };
+      if (child.linked) label.title = `linked to ${child.linked} — mirrored from there and kept in sync; edit the originals, not these copies`;
       paint();
       label.addEventListener('click', () => {
         // one click both picks the folder new items go into and opens it
@@ -828,14 +838,29 @@ function renderTree(node, container) {
 /** What a right-click on a row offers, for that row — never for what is selected elsewhere. */
 function nodeMenu(node) {
   const dir = node.kind === 'dir';
-  const movable = isWritable(node.path) && node.path !== 'wiki' && node.path !== 'raw/docs';
+  // a linked folder's mirror is written by the link alone: nothing is created,
+  // renamed, moved or deleted inside it from here
+  const mirrored = mirroredSource(node.path);
+  const linkRoot = dir && linkedDests.has(node.path);
+  const movable = isWritable(node.path) && node.path !== 'wiki' && node.path !== 'raw/docs' && !mirrored;
   const items = [];
-  if (dir && isWritable(node.path)) {
+  if (dir && isWritable(node.path) && !mirrored) {
     items.push({ label: 'New file here…', run: () => { pickDir(node.path); newFile(node.path); } });
     items.push({ label: 'New folder here…', run: () => { pickDir(node.path); newFolder(node.path); } });
     items.push('-');
     items.push({ label: 'Upload files here…', run: () => { pickDir(node.path); pickUpload('files', node.path); } });
     items.push({ label: 'Upload folder here…', run: () => { pickDir(node.path); pickUpload('folder', node.path); } });
+    if (/^raw\/docs(\/|$)/.test(node.path)) {
+      items.push('-');
+      items.push({ label: 'Import folder from this Mac here…', run: () => { pickDir(node.path); importLocalFolder('copy', node.path); } });
+      items.push({ label: 'Link folder from this Mac here…', run: () => { pickDir(node.path); importLocalFolder('link', node.path); } });
+    }
+    items.push('-');
+  }
+  if (linkRoot) {
+    items.push({ label: 'Sync linked folder now', run: () => syncLinkedFolder(node.path) });
+    items.push({ label: 'Unlink (keep the copies)…', run: () => unlinkFolderNode(node, false) });
+    items.push({ label: 'Unlink and remove the copies…', danger: true, run: () => unlinkFolderNode(node, true) });
     items.push('-');
   }
   if (!dir) items.push({ label: 'Open', run: () => openFile(node.path) });
@@ -867,6 +892,12 @@ function paintDestination() {
 
 async function loadTree() {
   treeData = await api('/api/tree');
+  linkedDests.clear();
+  const collect = (node) => {
+    if (node.linked) linkedDests.set(node.path, node.linked);
+    for (const child of node.children || []) collect(child);
+  };
+  collect(treeData);
   const el = $('#filetree');
   el.innerHTML = '';
   renderTree(treeData, el);
@@ -1050,7 +1081,16 @@ const fmtBytes = (bytes) => (bytes >= 1e6 ? `${(bytes / 1e6).toFixed(1)} MB` : `
  * past the cap. `canLoadFull` says the whole file still fits in one read, so
  * the user can promote the preview to a real edit.
  */
-function readOnlyNotice(derived, truncated, bytes) {
+function readOnlyNotice(derived, truncated, bytes, path = currentFile) {
+  // The mirror of a linked folder follows its source: a save here would be
+  // undone by the next sync (and the service refuses it).
+  const mirrored = path ? mirroredSource(path) : null;
+  if (mirrored) {
+    return {
+      text: `Mirrored from ${mirrored} — kept in sync with the original there, so it is read-only here. Edit the original instead.`,
+      canLoadFull: false,
+    };
+  }
   // Derived text is knode-os's rendering of a PDF or image. It is read-only
   // whatever its size: writing it back would replace the original's bytes, so
   // this is checked before the size rule and never offers a full load.
@@ -1099,7 +1139,7 @@ function renderFileContent(path, content, derived, truncated, bytes) {
   // derived text (a PDF / image's Markdown) is knode-os's, not the user's: readable, never editable here
   $('#file-view').innerHTML = path.endsWith('.md') || derived ? renderMd(content) : `<pre>${esc(content)}</pre>`;
   $('#file-editor').value = content;
-  const notice = readOnlyNotice(derived, truncated, bytes);
+  const notice = readOnlyNotice(derived, truncated, bytes, path);
   setFileNotice(notice);
   $('#btn-edit').textContent = 'edit';
   $('#btn-edit').disabled = Boolean(notice);
@@ -1121,7 +1161,7 @@ async function openFile(path, labelEl) {
     $('#file-view').hidden = false;
     $('#file-editor').hidden = true;
     renderFileContent(path, content, derived, truncated, bytes);
-    $('#btn-delete').disabled = false;
+    $('#btn-delete').disabled = Boolean(mirroredSource(path));
   } catch (e) {
     toast(`open failed: ${e.message}`);
   }
@@ -1181,8 +1221,113 @@ $('#btn-add').addEventListener('click', (ev) => {
     '-',
     { label: 'Upload files…', run: () => pickUpload('files') },
     { label: 'Upload folder…', run: () => pickUpload('folder') },
+    '-',
+    { label: 'Import folder from this Mac…', run: () => importLocalFolder('copy', dir) },
+    { label: 'Link folder from this Mac (keep in sync)…', run: () => importLocalFolder('link', dir) },
   ]);
 });
+
+/* ------------------------ folders from this Mac -------------------------- */
+
+const fmtCount = (n, noun) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+
+/**
+ * Import a folder that lives on this Mac, by its absolute path: copied once
+ * (`copy`) or mirrored and kept in sync (`link`). The browser cannot hand over
+ * a local path, so it is typed; the service reads the folder and says what it
+ * would carry before anything is written.
+ */
+async function importLocalFolder(mode, dir) {
+  const verb = mode === 'link' ? 'link' : 'import';
+  const source = prompt(
+    mode === 'link'
+      ? 'Absolute path of the folder on this Mac to link.\nIts files are mirrored into raw/docs and kept in sync: every change there is indexed, and the copies are read-only here.'
+      : 'Absolute path of the folder on this Mac to import.\nIts files are copied once into raw/docs with the folder structure kept.',
+    lastImportSource || '/Users/',
+  );
+  if (source === null) return;
+  const trimmed = source.trim();
+  if (!trimmed) return;
+  lastImportSource = trimmed;
+  // the picked folder when it can take the mirror, else the root of raw/docs
+  const base = isWritable(dir) && /^raw\/docs(\/|$)/.test(dir) && !mirroredSource(dir) ? dir : 'raw/docs';
+  const name = trimmed.replace(/\/+$/, '').split('/').pop();
+  toast('reading the folder…', 60000);
+  let plan;
+  try {
+    plan = await api('/api/folders/preview', { method: 'POST', body: JSON.stringify({ source: trimmed, dest: `${base}/${name}` }) });
+  } catch (e) {
+    toast(`${verb} failed: ${e.message}`, 6000);
+    return;
+  }
+  if (plan.linked) {
+    toast(`${plan.linked.dest} is already linked to ${plan.linked.source}`, 6000);
+    return;
+  }
+  const lines = [
+    `${mode === 'link' ? 'Link' : 'Import'} ${plan.source}`,
+    `→ ${plan.dest}`,
+    '',
+    `${fmtCount(plan.files, 'file')}, ${fmtBytes(plan.bytes)}${plan.sample.length ? ` — e.g. ${plan.sample.slice(0, 3).join(', ')}` : ''}.`,
+  ];
+  if (plan.tooLarge) lines.push(`${fmtCount(plan.tooLarge, 'file')} over ${fmtBytes(EDIT_BYTE_CAP)} will be copied but not indexed.`);
+  if (plan.skippedByType) lines.push(`${fmtCount(plan.skippedByType, 'file')} of types knode-os cannot index stay behind.`);
+  if (plan.exists) lines.push('', `${plan.dest} already exists: it becomes a mirror of this folder, and files only it has are removed.`);
+  if (mode === 'link') lines.push('', 'The copies are kept in sync while knode-os runs. Edit the originals, not the copies.');
+  lines.push('', 'Continue?');
+  if (!confirm(lines.join('\n'))) return;
+  toast(`${mode === 'link' ? 'linking' : 'importing'} ${fmtCount(plan.files, 'file')} — copying and indexing…`, 600000);
+  try {
+    const res = await api('/api/folders/import', { method: 'POST', body: JSON.stringify({ source: trimmed, dest: plan.dest, mode, replace: plan.exists }) });
+    reveal(res.dest);
+    await loadTree();
+    loadStats();
+    const indexed = res.sync ? ` · ${res.sync.indexed} indexed${res.sync.skipped ? `, ${res.sync.skipped} skipped` : ''}` : '';
+    toast(`${mode === 'link' ? 'linked' : 'imported'} ${res.dest}: ${fmtCount(res.copied.length, 'file')} copied${indexed}`, 6000);
+  } catch (e) {
+    toast(`${verb} failed: ${e.message}`, 6000);
+  }
+}
+
+async function syncLinkedFolder(dest) {
+  toast(`syncing ${dest} from its source…`, 600000);
+  try {
+    const { results } = await api('/api/folders/sync', { method: 'POST', body: JSON.stringify({ dest }) });
+    const r = results[0];
+    await loadTree();
+    loadStats();
+    if (!r) toast('nothing to sync');
+    else if (r.sourceMissing) toast(`${dest}: its source folder is not there — nothing changed`, 5000);
+    else toast(`${dest}: ${r.copied} copied, ${r.removed} removed${r.sync ? ` · ${r.sync.indexed} indexed, ${r.sync.disposed} disposed` : ' · already up to date'}`, 5000);
+  } catch (e) {
+    toast(`sync failed: ${e.message}`, 5000);
+  }
+}
+
+async function unlinkFolderNode(node, removeFiles) {
+  const source = linkedDests.get(node.path);
+  const question = removeFiles
+    ? `Unlink ${node.path} from ${source} and delete the ${fmtCount(fileCount(node), 'copied file')}?\n\nTheir knowledge is disposed (history stays in the ledger). The originals are not touched.`
+    : `Unlink ${node.path} from ${source}?\n\nThe copies stay as ordinary documents and stop following the source.`;
+  if (!confirm(question)) return;
+  toast(removeFiles ? `unlinking and removing ${node.path}…` : `unlinking ${node.path}…`, 600000);
+  try {
+    await api(`/api/folders?dest=${encodeURIComponent(node.path)}&removeFiles=${removeFiles ? 1 : 0}`, { method: 'DELETE' });
+    if (removeFiles && currentFile && (currentFile === node.path || currentFile.startsWith(`${node.path}/`))) {
+      currentFile = null;
+      $('#file-path').textContent = '';
+      $('#file-view').innerHTML = '';
+      setFileNotice(null);
+      $('#btn-edit').disabled = true;
+      $('#btn-delete').disabled = true;
+    }
+    await loadTree();
+    loadStats();
+    toast(removeFiles ? `unlinked and removed ${node.path}` : `unlinked ${node.path} — its files stay as ordinary documents`, 5000);
+  } catch (e) {
+    toast(`unlink failed: ${e.message}`, 5000);
+  }
+}
 
 $('#btn-clear-dir').addEventListener('click', () => {
   selectedDir = null;
@@ -2213,6 +2358,9 @@ document.addEventListener('click', (event) => {
 let connectionDrafts = [];
 let embeddingDrafts = [];
 let embeddingUse = '';
+let embeddingPoolDraft = { enabled: false, model: 'bge-m3', dimensions: 1024, batchSize: 16 };
+let embeddingUsage = [];
+const defaultEmbeddingLimits = { requestsPerMinute: 60, tokensPerMinute: 100000, requestsPerDay: 5000, tokensPerDay: 1000000, concurrency: 2, resetTimezone: 'UTC' };
 /** Which connection is the default — the mirror of `embeddingUse`. */
 let llmUse = '';
 /** Provider ids whose row is open, kept across a redraw. */
@@ -2381,6 +2529,7 @@ const activeEmbedding = () =>
 const summaryLine = (t) => (t.model ? `${t.provider} · ${t.model}` : t.provider);
 
 function embeddingSummaryText() {
+  if (embeddingPoolDraft.enabled) return { provider: 'Model pool', model: embeddingPoolDraft.model };
   const active = activeEmbedding();
   if (!active) return { provider: 'Loading…', model: '' };
   const name = active.label || active.id;
@@ -2408,6 +2557,64 @@ function fillEmbeddingOptions() {
     .join('');
   select.value = embeddingDrafts.some((e) => e.id === embeddingUse) ? embeddingUse : (embeddingDrafts[0]?.id ?? '');
   embeddingUse = select.value;
+  select.disabled = embeddingPoolDraft.enabled;
+  $('#cfg-embedding-route-note').textContent = embeddingPoolDraft.enabled
+    ? `Automatic routing · ${embeddingPoolDraft.model} · ${poolEligibleKeys().length} compatible keys. Manage the pool in Providers & Agents.`
+    : 'Enable a model pool in Providers & Agents to share compatible keys.';
+}
+
+const canonicalEmbeddingModel = (model) => ['bge-m3', 'baai/bge-m3', '@cf/baai/bge-m3'].includes((model || '').toLowerCase()) ? 'bge-m3' : model;
+const poolEligibleKeys = () => embeddingDrafts.filter((e) => {
+  const model = canonicalEmbeddingModel(embeddingPoolDraft.model);
+  return e.enabled !== false && e.provider === 'openai' && [e.model, ...(e.catalog || [])].some((id) => canonicalEmbeddingModel(id) === model)
+    && (model === 'bge-m3' ? embeddingPoolDraft.dimensions === 1024 : e.model === model && e.dimensions === embeddingPoolDraft.dimensions);
+});
+
+function renderEmbeddingPool() {
+  const pool = embeddingPoolDraft;
+  const models = [...new Set(embeddingDrafts.flatMap((e) => [e.model, ...(e.catalog || [])]).filter(Boolean).map(canonicalEmbeddingModel))].sort();
+  $('#cfg-embedding-pool').innerHTML = `<div class="embedding-pool-head"><h4>Embedding model pool</h4>
+    <label class="cfg-check"><input data-pool="enabled" type="checkbox"${pool.enabled ? ' checked' : ''} /> Automatic routing</label></div>
+    <p class="cfg-callout">Choose one model. Compatible keys share the work. Lower priorities run first; equal priorities rotate. Unavailable keys cool down automatically.</p>
+    <div class="cfg-grid cfg-grid-3">
+      <label>Pool model<input data-pool="model" list="embedding-pool-models" value="${esc(pool.model)}" /><datalist id="embedding-pool-models">${models.map((m) => `<option value="${esc(m)}"></option>`).join('')}</datalist></label>
+      <label>Dimensions<input data-pool="dimensions" type="number" min="1" value="${pool.dimensions}" /></label>
+      <label>Texts per request<input data-pool="batchSize" type="number" min="1" max="128" value="${pool.batchSize}" /></label>
+    </div>
+    <div class="embedding-pool-head"><span id="cfg-pool-members" class="mono">${poolEligibleKeys().length} compatible keys · ${embeddingDrafts.length} configured</span>
+    <div class="cfg-actions"><button data-pool-action="models">Refresh all models</button><button data-pool-action="test"${pool.enabled ? '' : ' disabled'}>Test pool</button><button data-pool-action="usage">Refresh usage</button></div></div>
+    <p class="cfg-callout">Pool vectors are L2-normalized. Only matching models and dimensions participate. Changing the pool model re-embeds the workspace; changing keys or limits does not.</p>
+    <div id="cfg-pool-status" role="status"></div>
+    <details><summary>Usage today · shared across workspaces</summary><div class="embedding-usage">${embeddingDrafts.filter((e) => e.provider === 'openai').map((e) => {
+      const u = embeddingUsage.find((u) => u.id === e.id) || {};
+      const limit = { ...defaultEmbeddingLimits, ...e.limits };
+      return `<div><span>${esc(e.label)}</span><span>${u.requestsToday || 0} / ${limit.requestsPerDay} req</span><span>${u.tokensToday || 0} / ${limit.tokensPerDay} tokens</span><span>${u.cooldownUntil > Date.now() ? 'Cooling down' : esc(limit.resetTimezone)}</span></div>`;
+    }).join('')}</div><p class="cfg-callout">App usage persists across restarts. Tokens use provider usage when available, otherwise a conservative estimate. Other apps are not included. Zero limits block requests.</p></details>`;
+}
+
+async function refreshEmbeddingUsage() {
+  const scope = activeWorkspace()?.id;
+  const result = await api('/api/config/embedding-usage');
+  if (activeWorkspace()?.id !== scope) return;
+  embeddingUsage = result.entries || [];
+  renderEmbeddingPool();
+}
+
+function embeddingKeyLimits(entry) {
+  if (entry.provider !== 'openai') return '';
+  const limits = { ...defaultEmbeddingLimits, ...entry.limits };
+  const fields = [['requestsPerMinute', 'Requests / minute'], ['tokensPerMinute', 'Tokens / minute'], ['concurrency', 'Concurrent requests'], ['requestsPerDay', 'Requests / day'], ['tokensPerDay', 'Tokens / day']];
+  return `<div class="embedding-key-limits"><div class="embedding-pool-head">
+      <label class="cfg-check"><input data-field="enabled" type="checkbox"${entry.enabled !== false ? ' checked' : ''} /> Include in model pools</label>
+      <button data-embedding-action="test">Test key</button></div>
+    <div class="cfg-grid cfg-grid-3">${fields.map(([name, label]) => `<label>${label}<input data-limit="${name}" type="number" min="${name === 'concurrency' ? 1 : 0}" value="${limits[name]}" /></label>`).join('')}
+      <label>Daily reset timezone<input data-limit="resetTimezone" value="${esc(limits.resetTimezone)}" /></label>
+      <label>Priority · lower first<input data-field="priority" type="number" min="0" value="${entry.priority ?? 10}" /></label>
+      <label>Shared account quota group<input data-field="quotaGroup" value="${esc(entry.quotaGroup || '')}" placeholder="Same account → same group" /></label>
+      <label>OpenRouter upstream (optional)<input data-field="upstream" value="${esc(entry.upstream || '')}" placeholder="deepinfra/fp32" /></label>
+    </div><p class="cfg-callout">${esc(entry.limitNote || 'Application limits. Use the same quota group for keys belonging to one provider account.')}</p>
+    <div class="embedding-pool-head"><strong>Available embedding models · ${(entry.catalog || []).length}</strong><button data-embedding-action="models">Refresh models</button></div>
+    <p class="embedding-catalog mono">${esc((entry.catalog || []).join(' · ') || 'Refresh to list the embedding models this key can access.')}</p></div>`;
 }
 
 /** The stages that name a model or an agent, by their fields' prefix (`#cfg-<prefix>-use`, `<prefix>Llm`). */
@@ -2555,11 +2762,11 @@ function embeddingFields(entry) {
       <label>Provider<select data-field="provider">${optionsFor(EMBEDDING_PROVIDER_OPTIONS, entry.provider)}</select></label>
       <label>Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="${entry.provider === 'ark-multimodal' ? 'ep-…' : 'text-embedding-3-small'}"${api ? '' : ' disabled'} />${api ? modelChevron(`embedding:${entry.id}`) : ''}</span></label>
       <label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1"${api ? '' : ' disabled'} /></label>
-      <label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY"${api ? '' : ' disabled'} /></label>
+      <label>API key<input data-field="apiKey" type="password" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY"${api ? '' : ' disabled'} /></label>
       <label>Dimensions<input data-field="dimensions" type="number" min="1" step="1" value="${esc(entry.dimensions ?? '')}" /></label>
     </div>
     <label class="cfg-check"><input data-field="sendDimensions" type="checkbox"${entry.sendDimensions ? ' checked' : ''}${api ? '' : ' disabled'} /> Send the <span class="mono">dimensions</span> parameter with API requests</label>
-    <p class="cfg-callout">${esc(EMB_NOTES[entry.provider] ?? EMB_NOTES.openai)}</p>`;
+    <p class="cfg-callout">${esc(EMB_NOTES[entry.provider] ?? EMB_NOTES.openai)}</p>${embeddingKeyLimits(entry)}`;
 }
 
 /**
@@ -2578,6 +2785,7 @@ function llmFields(entry, route) {
 }
 
 function renderProviders() {
+  renderEmbeddingPool();
   const rows = embeddingDrafts.map((e) =>
     providerRow({
       kind: 'embedding',
@@ -2587,7 +2795,7 @@ function renderProviders() {
       placeholder: 'Name this provider',
       providerLabel: embeddingProviderLabel(e.provider),
       summary: e.provider === 'local' ? `hashing · ${e.dimensions || 384}d` : (e.model ? `${e.model} · ${e.dimensions || ''}d` : ''),
-      isDefault: e.id === embeddingUse,
+      isDefault: !embeddingPoolDraft.enabled && e.id === embeddingUse,
       // something has to embed, so the last one stays
       removable: embeddingDrafts.length > 1,
       fields: embeddingFields(e),
@@ -2684,6 +2892,9 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     loadedConfig = cfg;
     embeddingDrafts = (cfg.embeddingProviders ?? []).map((e) => ({ ...e }));
     embeddingUse = cfg.embeddingUse || embeddingDrafts[0]?.id || '';
+    embeddingPoolDraft = { enabled: false, model: 'bge-m3', dimensions: 1024, batchSize: 16, ...cfg.embeddingPool };
+    embeddingUsage = [];
+    void refreshEmbeddingUsage().catch(() => {});
     connectionDrafts = (cfg.connections ?? []).map((c) => ({ ...c }));
     llmUse = cfg.llmUse || connectionDrafts[0]?.id || '';
     // agents before routes: a stage may run on an agent, and a route
@@ -2703,7 +2914,7 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     void showExtractionQueue();
     $('#cfg-ingest-concurrency').value = cfg.ingest?.concurrency ?? 4;
     $('#cfg-ingest-convert').value = cfg.ingest?.convertConcurrency ?? 2;
-    $('#cfg-emb-batch').value = activeEmbedding()?.batchSize ?? 32;
+    $('#cfg-emb-batch').value = embeddingPoolDraft.enabled ? embeddingPoolDraft.batchSize : activeEmbedding()?.batchSize ?? 32;
     fillResearchForm(cfg.research ?? {});
     fillChatForm(cfg.chat ?? {});
     renderAgents();
@@ -2751,9 +2962,10 @@ function gatherConfig() {
       ...e,
       label: (e.label || '').trim() || e.id,
       // the request size is edited on the Index node, not in the provider row
-      batchSize: e.id === embeddingUse ? Number($('#cfg-emb-batch').value) || e.batchSize : e.batchSize,
+      batchSize: !embeddingPoolDraft.enabled && e.id === embeddingUse ? Number($('#cfg-emb-batch').value) || e.batchSize : e.batchSize,
     })),
     embeddingUse,
+    embeddingPool: { ...embeddingPoolDraft, ...(embeddingPoolDraft.enabled ? { batchSize: Number($('#cfg-emb-batch').value) || embeddingPoolDraft.batchSize } : {}) },
     ingest: {
       concurrency: Number($('#cfg-ingest-concurrency').value) || undefined,
       convertConcurrency: Number($('#cfg-ingest-convert').value) || undefined,
@@ -3503,6 +3715,12 @@ $('#cfg-embedding-use').addEventListener('change', (event) => {
 for (const id of ['#cfg-ingest-convert', '#cfg-ingest-concurrency', '#cfg-emb-batch', '#cfg-extraction-concurrency', '#cfg-extraction-batch']) {
   $(id).addEventListener('input', renderStageFlow);
 }
+$('#cfg-emb-batch').addEventListener('input', (event) => {
+  if (embeddingPoolDraft.enabled) {
+    embeddingPoolDraft.batchSize = Number(event.target.value);
+    $('#cfg-embedding-pool [data-pool="batchSize"]').value = event.target.value;
+  }
+});
 
 $('#cfg-add-provider').addEventListener('click', (event) => {
   showMenuUnder(event.currentTarget, [
@@ -3524,8 +3742,14 @@ function rowDraft(target) {
 $('#cfg-providers').addEventListener('input', (event) => {
   const field = event.target.dataset?.field;
   const found = rowDraft(event.target);
-  if (!field || !found) return;
-  found.draft[field] = field === 'dimensions' ? Number(event.target.value) || undefined : event.target.value;
+  if (!found) return;
+  const limit = event.target.dataset?.limit;
+  if (limit) {
+    found.draft.limits = { ...defaultEmbeddingLimits, ...found.draft.limits, [limit]: limit === 'resetTimezone' ? event.target.value : Number(event.target.value) };
+    return;
+  }
+  if (!field) return;
+  found.draft[field] = event.target.type === 'checkbox' ? event.target.checked : ['dimensions', 'priority'].includes(field) ? Number(event.target.value) : event.target.value;
   if (field === 'label') fillRouteOptions();
   // the row's own summary column used to refresh on a label edit and never on
   // a model one, so a typed model stayed invisible until the next redraw
@@ -3541,6 +3765,7 @@ $('#cfg-providers').addEventListener('change', (event) => {
   const found = rowDraft(event.target);
   if (!found) return;
   const field = event.target.dataset?.field;
+  if (field === 'enabled') { found.draft.enabled = event.target.checked; renderEmbeddingPool(); return; }
   if (field === 'sendDimensions') {
     found.draft.sendDimensions = event.target.checked;
     return;
@@ -3565,10 +3790,30 @@ $('#cfg-providers').addEventListener('change', (event) => {
   updateConfigSummaries();
 });
 
-$('#cfg-providers').addEventListener('click', (event) => {
+$('#cfg-providers').addEventListener('click', async (event) => {
   const row = event.target.closest?.('.provider-row');
   if (!row) return;
   const id = row.dataset.id;
+  if (event.target.dataset.embeddingAction) {
+    const draft = embeddingDrafts.find((e) => e.id === id);
+    const scope = activeWorkspace()?.id;
+    if (!draft) return;
+    event.target.disabled = true;
+    try {
+      if (event.target.dataset.embeddingAction === 'models') {
+        const result = await api('/api/config/models', { method: 'POST', body: JSON.stringify({ route: `embedding:${id}`, config: gatherConfig(), refresh: true }) });
+        if (!result.ok) throw new Error(result.error || result.note || 'Catalog unavailable');
+        if (activeWorkspace()?.id !== scope) return;
+        draft.catalog = result.models.map((m) => m.id); renderProviders();
+        toast('Catalog updated. Save & apply to keep it.');
+      } else {
+        const result = await api('/api/config/embedding-test', { method: 'POST', body: JSON.stringify({ id, config: gatherConfig() }) });
+        toast(`Key test passed · ${result.dimensions} dimensions`); await refreshEmbeddingUsage();
+      }
+    } catch (e) { toast(e.message); }
+    finally { event.target.disabled = false; }
+    return;
+  }
 
   if (event.target.classList.contains('provider-toggle')) {
     if (expandedProviders.has(id)) expandedProviders.delete(id); else expandedProviders.add(id);
@@ -3610,6 +3855,49 @@ $('#cfg-providers').addEventListener('click', (event) => {
   fillRouteOptions();
   updateConfigSummaries();
   for (const prefix of ROUTE_PREFIXES) routeProviderToggle(prefix);
+});
+
+$('#cfg-embedding-pool').addEventListener('input', (event) => {
+  const field = event.target.dataset.pool;
+  if (!field) return;
+  embeddingPoolDraft[field] = field === 'enabled' ? event.target.checked : field === 'model' ? event.target.value : Number(event.target.value);
+  if (field === 'model' && canonicalEmbeddingModel(embeddingPoolDraft.model) === 'bge-m3') embeddingPoolDraft.dimensions = 1024;
+  if (field === 'batchSize') $('#cfg-emb-batch').value = embeddingPoolDraft.batchSize;
+  if (field === 'enabled') $('#cfg-emb-batch').value = embeddingPoolDraft.enabled ? embeddingPoolDraft.batchSize : activeEmbedding()?.batchSize ?? 32;
+  fillEmbeddingOptions(); updateConfigSummaries();
+  $('#cfg-pool-members').textContent = `${poolEligibleKeys().length} compatible keys · ${embeddingDrafts.length} configured`;
+  $('#cfg-embedding-pool [data-pool-action="test"]').disabled = !embeddingPoolDraft.enabled;
+});
+
+$('#cfg-embedding-pool').addEventListener('click', async (event) => {
+  const action = event.target.dataset.poolAction;
+  if (!action) return;
+  const scope = activeWorkspace()?.id;
+  const draft = gatherConfig();
+  const rows = [...embeddingDrafts];
+  event.target.disabled = true;
+  const status = (text) => { if (activeWorkspace()?.id === scope) $('#cfg-pool-status').textContent = text; };
+  try {
+    if (action === 'models') {
+      let count = 0; const failures = [];
+      for (const row of rows.filter((e) => e.provider === 'openai')) {
+        if (activeWorkspace()?.id !== scope) return;
+        status(`Loading models: ${row.label}`);
+        try {
+          const result = await api('/api/config/models', { method: 'POST', body: JSON.stringify({ route: `embedding:${row.id}`, config: draft, refresh: true }) });
+          if (!result.ok) throw new Error();
+          row.catalog = result.models.map((m) => m.id); count++;
+        } catch { failures.push(row.label); }
+      }
+      if (activeWorkspace()?.id !== scope) return;
+      renderProviders(); status(`Refreshed ${count} keys. Save & apply to keep the catalog.${failures.length ? ' Unavailable: ' + failures.join(', ') : ''}`);
+    } else if (action === 'test') {
+      status('Testing the model pool…');
+      const result = await api('/api/config/embedding-test', { method: 'POST', body: JSON.stringify({ config: draft }) });
+      await refreshEmbeddingUsage(); status(`Pool test passed · ${result.dimensions} dimensions · ${result.ms} ms`);
+    } else { await refreshEmbeddingUsage(); }
+  } catch (error) { status(error.message); }
+  finally { event.target.disabled = false; }
 });
 
 function setConfigBusy(busy) {

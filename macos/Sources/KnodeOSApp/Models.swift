@@ -557,6 +557,13 @@ struct EmbeddingConnection: Codable, Equatable, Identifiable {
     var dimensions: Int
     var batchSize: Int?
     var sendDimensions: Bool
+    var enabled: Bool?
+    var priority: Int?
+    var quotaGroup: String?
+    var limits: EmbeddingLimits?
+    var limitNote: String?
+    var catalog: [String]?
+    var upstream: String?
 
     init(id: String, label: String, provider: String = "openai") {
         self.id = id
@@ -581,7 +588,53 @@ struct EmbeddingConnection: Codable, Equatable, Identifiable {
         dimensions = try container.decodeIfPresent(Int.self, forKey: .dimensions) ?? 384
         batchSize = try container.decodeIfPresent(Int.self, forKey: .batchSize)
         sendDimensions = try container.decodeIfPresent(Bool.self, forKey: .sendDimensions) ?? false
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled)
+        priority = try container.decodeIfPresent(Int.self, forKey: .priority)
+        quotaGroup = try container.decodeIfPresent(String.self, forKey: .quotaGroup)
+        limits = try container.decodeIfPresent(EmbeddingLimits.self, forKey: .limits)
+        limitNote = try container.decodeIfPresent(String.self, forKey: .limitNote)
+        catalog = try container.decodeIfPresent([String].self, forKey: .catalog)
+        upstream = try container.decodeIfPresent(String.self, forKey: .upstream)
     }
+}
+
+struct EmbeddingLimits: Codable, Equatable {
+    var requestsPerMinute = 60
+    var tokensPerMinute = 100_000
+    var requestsPerDay = 5_000
+    var tokensPerDay = 1_000_000
+    var concurrency = 2
+    var resetTimezone = "UTC"
+}
+
+struct EmbeddingPoolConfig: Codable, Equatable {
+    var enabled = false
+    var model = "bge-m3"
+    var dimensions = 1024
+    var batchSize = 16
+}
+
+struct EmbeddingUsageResponse: Decodable {
+    var entries: [EmbeddingUsage]
+}
+
+struct EmbeddingUsage: Decodable, Identifiable {
+    var id: String
+    var requestsToday: Int
+    var tokensToday: Int
+    var requestsThisMinute: Int
+    var inFlight: Int
+    var cooldownUntil: Double?
+    var lastError: String?
+    var lastSuccess: Double?
+}
+
+struct EmbeddingTestResponse: Decodable {
+    var ok: Bool
+    var model: String?
+    var dimensions: Int?
+    var ms: Int?
+    var error: String?
 }
 
 struct LLMConfig: Codable, Equatable {
@@ -900,6 +953,7 @@ struct KnodeConfig: Codable, Equatable {
     var embeddingProviders: [EmbeddingConnection]
     /// Which `embeddingProviders` entry the Index stage runs on.
     var embeddingUse: String
+    var embeddingPool: EmbeddingPoolConfig?
     /// A mirror of the connection `llmUse` names, flattened by the service.
     /// Read-only here: the table edits the list, like the embedding one.
     var llm: LLMConfig
@@ -917,6 +971,7 @@ struct KnodeConfig: Codable, Equatable {
         embedding = try container.decode(EmbeddingConfig.self, forKey: .embedding)
         embeddingProviders = try container.decodeIfPresent([EmbeddingConnection].self, forKey: .embeddingProviders) ?? []
         embeddingUse = try container.decodeIfPresent(String.self, forKey: .embeddingUse) ?? ""
+        embeddingPool = try container.decodeIfPresent(EmbeddingPoolConfig.self, forKey: .embeddingPool)
         llm = try container.decode(LLMConfig.self, forKey: .llm)
         connections = try container.decodeIfPresent([LLMConnection].self, forKey: .connections) ?? []
         llmUse = try container.decodeIfPresent(String.self, forKey: .llmUse) ?? ""

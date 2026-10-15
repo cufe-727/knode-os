@@ -1,7 +1,8 @@
 import { KnodeConfig, loadConfig, resolveRoutedLlmConfig, routeTargets } from './config.js';
 import { DataSourceRegistry } from './datasource/registry.js';
 import { initDataDir } from './fs/datadir.js';
-import { createEmbeddingProvider, EmbeddingProvider } from './ingest/embeddings.js';
+import { EmbeddingProvider } from './ingest/embeddings.js';
+import { createConfiguredEmbeddingProvider } from './ingest/embedding-router.js';
 import { LlmClient } from './llm/client.js';
 import { Store } from './store/db.js';
 
@@ -40,7 +41,7 @@ export async function createContext(dataDir: string): Promise<AppContext> {
   initDataDir(dataDir);
   const config = loadConfig(dataDir);
   const store = await Store.open(dataDir, config.embedding.dimensions, config.database);
-  const embedder = createEmbeddingProvider(config.embedding);
+  const embedder = createConfiguredEmbeddingProvider(config);
   const llm = judgeLlmClient(config);
   const datasources = new DataSourceRegistry(dataDir, config.datasources);
   return { dataDir, config, store, embedder, llm, datasources };

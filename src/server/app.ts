@@ -6,6 +6,7 @@ import { Hono } from 'hono';
 import { AppContext, judgeLlmClient } from '../context.js';
 import {
   EmbeddingConfig,
+  EmbeddingPoolConfig,
   KnodeConfig,
   LlmConfig,
   LlmConnection,
@@ -38,10 +39,24 @@ import { assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isRootWr
 import { hasSidecarSegment, SIDECAR_ROOT } from '../fs/layout.js';
 import { moveSidecar } from '../fs/sidecar.js';
 import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
+import {
+  assertNotLinked,
+  describeLinkedFolders,
+  FolderImportConflict,
+  importDestFor,
+  importFolder,
+  linkedFolders,
+  LinkedFolders,
+  linkOwning,
+  planFolderImport,
+  refreshLinkedFolders,
+  resolveImportSource,
+  unlinkFolder,
+} from '../ingest/folders.js';
 import { graphInsights, graphOverview, graphSearch } from '../graph/query.js';
 import { buildContextPack } from '../pack/pack.js';
 import { applySuggestion } from '../pack/learn.js';
-import { createEmbeddingProvider } from '../ingest/embeddings.js';
+import { canonicalEmbeddingModel, createConfiguredEmbeddingProvider, EmbeddingQuotaLedger, embeddingLimits, validateEmbeddingPool } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
 import { cachedCliToolStatus, listModelsCached, warmModelCache } from '../llm/model-cache.js';
 import { agentForSpec, resolveAgentSpec } from '../research/agent.js';
@@ -143,6 +158,7 @@ type ModelConfigDraft = {
   embedding?: Partial<EmbeddingConfig>;
   embeddingProviders?: Partial<EmbeddingConnection>[];
   embeddingUse?: string;
+  embeddingPool?: Partial<EmbeddingPoolConfig>;
   ingest?: { concurrency?: number; convertConcurrency?: number };
   llm?: Partial<LlmConfig>;
   connections?: Partial<LlmConnection>[];
@@ -163,6 +179,8 @@ export interface WorkspaceServices {
   kickResearch: () => void;
   /** Register a background promise so shutdown waits for it. */
   track: <T>(job: Promise<T>) => Promise<T>;
+  /** The linked-folder watchers of this workspace; absent outside `serve`, where links are refreshed on demand only. */
+  folders?: LinkedFolders | null;
 }
 
 /**
@@ -302,11 +320,27 @@ function mergeEmbeddings(
     if (!id || out.some((e) => e.id === id)) continue;
     const previous = current.find((e) => e.id === id);
     const merged = mergeEmbeddingConfig(previous ?? defaultEmbeddingConfig(), draft);
-    out.push({
+    const entry: EmbeddingConnection = {
+      ...previous,
       ...merged,
       id,
       label: typeof draft.label === 'string' && draft.label.trim() ? draft.label.trim() : previous?.label || embeddingProviderLabel(merged.provider),
-    });
+    };
+    if (typeof draft.enabled === 'boolean') entry.enabled = draft.enabled;
+    if (draft.priority !== undefined) {
+      if (!Number.isSafeInteger(draft.priority) || draft.priority < 0) throw new Error('Priority must be a non-negative integer.');
+      entry.priority = draft.priority;
+    }
+    for (const field of ['quotaGroup', 'limitNote', 'upstream'] as const) {
+      if (typeof draft[field] === 'string') entry[field] = draft[field].trim();
+    }
+    if (draft.catalog !== undefined) {
+      if (!Array.isArray(draft.catalog) || !draft.catalog.every((id) => typeof id === 'string')) throw new Error('Invalid embedding model catalog.');
+      entry.catalog = [...new Set(draft.catalog.map((id) => id.trim()).filter(Boolean))].slice(0, 1000);
+    }
+    if (draft.limits !== undefined) entry.limits = { ...embeddingLimits(entry), ...draft.limits };
+    embeddingLimits(entry);
+    out.push(entry);
   }
   // Something has to embed, so a list that would end up empty keeps the current one.
   return out.length ? out : current;
@@ -326,17 +360,23 @@ function defaultEmbeddingConfig(): EmbeddingConfig {
 function mergeEmbeddingSection(
   current: KnodeConfig,
   draft: ModelConfigDraft,
-): Pick<KnodeConfig, 'embedding' | 'embeddingProviders' | 'embeddingUse'> {
+): Pick<KnodeConfig, 'embedding' | 'embeddingProviders' | 'embeddingUse' | 'embeddingPool'> {
   const next: KnodeConfig = { ...current };
   next.embeddingProviders = mergeEmbeddings(current.embeddingProviders, draft.embeddingProviders);
   if (typeof draft.embeddingUse === 'string') next.embeddingUse = draft.embeddingUse.trim();
+  if (draft.embeddingPool) {
+    next.embeddingPool = { enabled: false, model: 'bge-m3', dimensions: 1024, batchSize: 16,
+      ...current.embeddingPool, ...draft.embeddingPool };
+    if (typeof next.embeddingPool.enabled !== 'boolean' || typeof next.embeddingPool.model !== 'string') throw new Error('Invalid embedding pool.');
+    next.embeddingPool.model = next.embeddingPool.model.trim();
+  }
   if (draft.embedding && !draft.embeddingProviders) {
     const active = activeEmbedding(next);
     next.embeddingProviders = next.embeddingProviders.map((e) =>
       (e.id === active.id ? { ...e, ...mergeEmbeddingConfig(e, draft.embedding) } : e));
   }
   syncActiveEmbedding(next);
-  return { embedding: next.embedding, embeddingProviders: next.embeddingProviders, embeddingUse: next.embeddingUse };
+  return { embedding: next.embedding, embeddingProviders: next.embeddingProviders, embeddingUse: next.embeddingUse, embeddingPool: next.embeddingPool };
 }
 
 function defaultConnectionConfig(): LlmConfig {
@@ -444,6 +484,30 @@ export function createApp(
     return c.json(redactConfig(ctx.config));
   });
 
+  app.get('/api/config/embedding-usage', async (c) => {
+    try { return c.json({ entries: await new EmbeddingQuotaLedger().status(requestCtx(c).config.embeddingProviders) }); }
+    catch (e) { return c.json(err(e), 500); }
+  });
+
+  // A short, quota-accounted connectivity check without running the LLM stages.
+  app.post('/api/config/embedding-test', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = await c.req.json() as { config?: ModelConfigDraft; id?: string };
+      const merged = { ...ctx.config, ...mergeEmbeddingSection(ctx.config, body.config ?? {}) };
+      if (body.id) {
+        const entry = merged.embeddingProviders.find((e) => e.id === body.id);
+        if (!entry) throw new Error('Embedding key not found.');
+        merged.embeddingProviders = [{ ...entry, enabled: true }];
+        merged.embeddingPool = { enabled: true, model: entry.model, dimensions: entry.dimensions, batchSize: 1 };
+      }
+      const started = Date.now();
+      const provider = createConfiguredEmbeddingProvider(merged);
+      const [vector] = await provider.embed(['知识库使用向量检索，将相近语义的文本匹配起来。']);
+      return c.json({ ok: true, model: provider.model, dimensions: vector.length, ms: Date.now() - started });
+    } catch (e) { return c.json({ ok: false, ...err(e) }, 400); }
+  });
+
   // Test a draft model configuration without persisting it. An apiKey of '***'
   // means "keep the current secret" (GET /api/config redacts literal keys).
   app.post('/api/config/test', async (c) => {
@@ -454,8 +518,9 @@ export function createApp(
     };
 
     try {
-      const e = mergeEmbeddingSection(ctx.config, draft).embedding;
-      const provider = createEmbeddingProvider(e);
+      const merged = { ...ctx.config, ...mergeEmbeddingSection(ctx.config, draft) };
+      const e = merged.embedding;
+      const provider = createConfiguredEmbeddingProvider(merged);
       const t0 = Date.now();
       const [vec] = await provider.embed(['knode-os configuration connectivity test']);
       out.embedding = { ok: true, provider: e.provider, model: provider.model, dimensions: vec.length, ms: Date.now() - t0 };
@@ -508,7 +573,13 @@ export function createApp(
     const opts = { refresh: body.refresh === true };
 
     if (route === 'embedding') {
-      return c.json(await listModelsCached('embedding', mergeEmbeddingSection(ctx.config, draft).embedding, opts));
+      const merged = mergeEmbeddingSection(ctx.config, draft);
+      if (merged.embeddingPool?.enabled) {
+        const ids = new Set(merged.embeddingProviders.filter((e) => e.enabled !== false && e.provider === 'openai')
+          .flatMap((e) => [e.model, ...(e.catalog ?? [])]).filter(Boolean).map(canonicalEmbeddingModel));
+        return c.json({ ok: true, source: 'builtin', models: [...ids].sort().map((id) => ({ id })), note: 'Models from configured keys. Refresh a key to update its catalog.' });
+      }
+      return c.json(await listModelsCached('embedding', merged.embedding, opts));
     }
 
     // A named embedding provider lists on its own, before Index points at it.
@@ -713,10 +784,12 @@ export function createApp(
         previousDocumentLlm.baseUrl !== nextDocumentLlm.baseUrl ||
         previousDocumentLlm.cliPath !== nextDocumentLlm.cliPath;
 
+      validateEmbeddingPool(next);
+      const nextEmbedder = createConfiguredEmbeddingProvider(next);
       saveConfig(ctx.dataDir, next);
       ctx.config = next;
       ctx.llm = judgeLlmClient(next);
-      ctx.embedder = createEmbeddingProvider(next.embedding);
+      ctx.embedder = nextEmbedder;
 
       let reindex: Awaited<ReturnType<typeof sync>> | null = null;
       if (reembed || reconvert) {
@@ -759,7 +832,19 @@ export function createApp(
   app.get('/api/tree', (c) => {
     const ctx = requestCtx(c);
     try {
-      return c.json(listTree(ctx.dataDir, c.req.query('path') ?? '.'));
+      const tree = listTree(ctx.dataDir, c.req.query('path') ?? '.');
+      // the mirror of a linked folder says where it comes from, so a client can
+      // mark it and keep edits off it (the routes refuse them anyway)
+      const links = linkedFolders(ctx.config);
+      if (links.length) {
+        const mark = (node: typeof tree): void => {
+          const link = links.find((l) => l.dest === node.path);
+          if (link) (node as typeof tree & { linked?: string }).linked = link.source;
+          for (const child of node.children ?? []) mark(child);
+        };
+        mark(tree);
+      }
+      return c.json(tree);
     } catch (e) {
       return c.json(err(e), 400);
     }
@@ -802,6 +887,7 @@ export function createApp(
       if (!p || typeof content !== 'string') return c.json({ error: 'path and content required' }, 400);
       assertWritablePath(p);
       assertNotConvertedOriginal(p);
+      assertNotLinked(ctx.config, p, 'write to');
       writeFileText(ctx.dataDir, p, content);
       return c.json({ ok: true });
     } catch (e) {
@@ -816,6 +902,7 @@ export function createApp(
       if (!p) return c.json({ error: 'path required' }, 400);
       if (isProtectedPath(p)) return c.json({ error: 'refusing to delete a root path' }, 400);
       assertWritablePath(p);
+      assertNotLinked(ctx.config, p, 'delete');
       removePath(ctx.dataDir, p);
       // deleting a source is a dispose: everything it produced is reverted,
       // history stays queryable with as_of (use /api/forget to purge it)
@@ -835,6 +922,7 @@ export function createApp(
       // a directory where the guide belongs would break every later read of it
       if (isProtectedPath(rel) || isRootWritableFile(rel)) return c.json({ error: `${rel} is a file this workspace owns, not a directory` }, 400);
       assertWritablePath(rel);
+      assertNotLinked(ctx.config, rel, 'create a folder in');
       makeDir(ctx.dataDir, rel);
       return c.json({ ok: true, path: rel });
     } catch (e) {
@@ -861,6 +949,9 @@ export function createApp(
       if (isProtectedPath(src) || isProtectedPath(dst)) {
         return c.json({ error: 'refusing to move a root path' }, 400);
       }
+      // a linked folder's mirror (or anything holding one) stays where the link put it
+      assertNotLinked(ctx.config, src, 'move');
+      assertNotLinked(ctx.config, dst, 'move into');
       if (src === dst) return c.json({ ok: true, from: src, to: dst });
       // renameSync replaces the destination without a word, which in a batch
       // move would silently destroy a same-named file already sitting there
@@ -883,6 +974,7 @@ export function createApp(
       const dir = sanitizeRelativePath((form.get('dir') as string) || '') || 'raw/docs';
       if (!/^(raw\/docs|wiki)(\/|$)/.test(dir)) return c.json({ error: 'uploads go to raw/docs or wiki' }, 400);
       if (hasSidecarSegment(dir)) return c.json({ error: `${SIDECAR_ROOT}/ is system-owned` }, 400);
+      assertNotLinked(ctx.config, dir, 'upload into');
       const saved: string[] = [];
       const skipped: string[] = [];
       for (const [, v] of form.entries()) {
@@ -912,6 +1004,97 @@ export function createApp(
       return c.json({ ok: true, saved, ...(skipped.length ? { skipped } : {}) });
     } catch (e) {
       return c.json(err(e), 400);
+    }
+  });
+
+  /* ---------------------------- folder import --------------------------- */
+
+  // A folder elsewhere on this machine, mirrored under raw/docs with its tree
+  // intact: once (copy) or kept in sync (link). See src/ingest/folders.ts.
+
+  app.get('/api/folders', (c) => {
+    const ctx = requestCtx(c);
+    const folders = servicesFor(ctx)?.folders ?? null;
+    return c.json({ links: folders ? folders.status() : describeLinkedFolders(ctx) });
+  });
+
+  // what an import would carry, before anything is written
+  app.post('/api/folders/preview', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { source?: string; dest?: string };
+      const source = resolveImportSource(ctx.dataDir, String(body.source ?? ''));
+      const dest = importDestFor(source, body.dest);
+      const plan = planFolderImport(source);
+      const owner = linkOwning(linkedFolders(ctx.config), dest);
+      return c.json({
+        source,
+        dest,
+        files: plan.files.length,
+        bytes: plan.bytes,
+        skippedByType: plan.skippedByType,
+        tooLarge: plan.tooLarge,
+        exists: pathExists(ctx.dataDir, dest),
+        linked: owner ? { source: owner.source, dest: owner.dest } : null,
+        sample: plan.files.slice(0, 8).map((f) => f.rel),
+      });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.post('/api/folders/import', async (c) => {
+    const ctx = requestCtx(c);
+    if (ingestRunning.has(ctx.dataDir)) return c.json({ error: 'ingest running — try again shortly' }, 409);
+    // held for the whole import: a config save in the meantime would drop the link it writes
+    ingestRunning.add(ctx.dataDir);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { source?: string; dest?: string; mode?: string; replace?: boolean };
+      const mode = body.mode === 'link' ? 'link' : body.mode === 'copy' || body.mode === undefined ? 'copy' : null;
+      if (!mode) return c.json({ error: 'mode must be copy or link' }, 400);
+      const opts = { dest: body.dest, replace: Boolean(body.replace), onProgress: log };
+      const folders = servicesFor(ctx)?.folders ?? null;
+      const result = mode === 'link' && folders
+        ? await folders.add(String(body.source ?? ''), opts)
+        : await importFolder(ctx, String(body.source ?? ''), { ...opts, mode });
+      return c.json({ ok: true, ...result });
+    } catch (e) {
+      return c.json(err(e), e instanceof FolderImportConflict ? 409 : 400);
+    } finally {
+      ingestRunning.delete(ctx.dataDir);
+    }
+  });
+
+  // mirror a link's source now (every link without `dest`) and index what changed
+  app.post('/api/folders/sync', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { dest?: string };
+      const dest = typeof body.dest === 'string' && body.dest.trim() ? cleanRelPath(body.dest) : undefined;
+      const folders = servicesFor(ctx)?.folders ?? null;
+      const results = folders ? await folders.refresh(dest) : await refreshLinkedFolders(ctx, dest, { onProgress: log });
+      return c.json({ ok: true, results: results.map((r) => ({ ...r, copied: r.copied.length, removed: r.removed.length })) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // forget a link; the mirror stays unless removeFiles=1, which disposes it like any deletion
+  app.delete('/api/folders', async (c) => {
+    const ctx = requestCtx(c);
+    if (ingestRunning.has(ctx.dataDir)) return c.json({ error: 'ingest running — try again shortly' }, 409);
+    ingestRunning.add(ctx.dataDir);
+    try {
+      const dest = cleanRelPath(c.req.query('dest') ?? '');
+      if (!dest) return c.json({ error: 'dest required' }, 400);
+      const removeFiles = c.req.query('removeFiles') === '1' || c.req.query('removeFiles') === 'true';
+      const folders = servicesFor(ctx)?.folders ?? null;
+      const result = folders ? await folders.remove(dest, { removeFiles }) : await unlinkFolder(ctx, dest, { removeFiles, onProgress: log });
+      return c.json({ ok: true, ...result });
+    } catch (e) {
+      return c.json(err(e), 400);
+    } finally {
+      ingestRunning.delete(ctx.dataDir);
     }
   });
 

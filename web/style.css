@@ -728,3 +728,11 @@ td.mono { font-size: 12px; }
 .cfg-prompt textarea:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
 @media (max-width: 900px) { .cfg-grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .cfg-connections-head > button { flex: 0 0 auto; white-space: nowrap; }
+/* Embedding account inventory and shared model routing. */
+.embedding-pool { margin-bottom: 20px; border-color: var(--accent); }
+.embedding-pool-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 10px 0; }
+.embedding-pool-head h4 { margin: 0; }
+.embedding-key-limits { border-top: 1px solid var(--border); padding-top: 14px; margin-top: 14px; }
+.embedding-catalog { line-height: 1.8; overflow-wrap: anywhere; font-size: 12px; }
+.embedding-usage { overflow-x: auto; margin-top: 12px; }
+.embedding-usage > div { display: grid; grid-template-columns: minmax(180px, 1fr) 140px 220px 130px; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
