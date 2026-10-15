@@ -1,8 +1,10 @@
 import { serve } from '@hono/node-server';
-import chokidar from 'chokidar';
+import fs from 'node:fs';
 import path from 'node:path';
 import { AppContext } from '../context.js';
-import { SIDECAR_ROOT_SEGMENT } from '../fs/layout.js';
+import { isHiddenName } from '../fs/files.js';
+import { RAW_DOCS, RAW_SKILLS, WIKI_DIR } from '../fs/layout.js';
+import { TreeWatcher, watchTree } from '../fs/watch.js';
 import { startDreamScheduler } from '../dream/dream.js';
 import { describeDocumentPass, runDocumentPass } from '../ingest/background.js';
 import { LinkedFolders } from '../ingest/folders.js';
@@ -67,6 +69,22 @@ export async function startServer(ctx: AppContext): Promise<void> {
 }
 
 const WATCH_FULL_SYNC_THRESHOLD = 200;
+
+const WATCHED_TREES = [RAW_DOCS, RAW_SKILLS, WIKI_DIR];
+const WATCHED_FILES = new Set(['purpose.md', 'schema.md']);
+
+/**
+ * What the data-dir watcher syncs: raw/docs, raw/skills, wiki and the two
+ * anchor files. Never a hidden path — Obsidian rewrites its vault state during
+ * normal navigation, wiki/.archive holds disposed pages, the sidecar tree is
+ * written by the pipeline itself — nor anything else at the root (ledger,
+ * index, config).
+ */
+export function isWatchedSource(rel: string): boolean {
+  if (WATCHED_FILES.has(rel)) return true;
+  if (!WATCHED_TREES.some((t) => rel === t || rel.startsWith(`${t}/`))) return false;
+  return !rel.split('/').some(isHiddenName);
+}
 
 interface StartedServices {
   stop: () => Promise<void>;
@@ -195,24 +213,36 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   log(`dream scheduled daily at ${ctx.config.dream.schedule} (lookback ${ctx.config.dream.lookbackDays}d)`);
   const tier2Timer = startTier2Scheduler(ctx, log);
 
-  // watch docs + wiki for changes → debounced scoped sync (unlink events dispose)
+  // watch docs + wiki for changes → debounced scoped sync (a path that is gone
+  // disposes what was under it). One recursive watcher for the data dir, never
+  // one per file (src/fs/watch.ts).
   let watchTimer: NodeJS.Timeout | null = null;
-  let watcher: ReturnType<typeof chokidar.watch> | null = null;
+  let watcher: TreeWatcher | null = null;
   if (ctx.config.ingest.watch) {
     let running = false;
     const pending = new Set<string>();
     let fullSync = false;
-    const trigger = (event: string, absPath: string) => {
+    const trigger = (absPath: string) => {
       if (disposed) return;
       const rel = path.relative(ctx.dataDir, absPath).split(path.sep).join('/');
-      if (event === 'addDir' || event === 'unlinkDir' || !rel || rel.startsWith('..')) fullSync = true;
+      // an event naming no path (the data dir itself) is no source
+      if (!rel) return;
+      // a directory that came is synced whole; a path that is gone — a file or
+      // a directory — is a prefix the scoped sync disposes everything under
+      let isDir = false;
+      try {
+        isDir = fs.statSync(absPath).isDirectory();
+      } catch {
+        isDir = false;
+      }
+      if (isDir || rel.startsWith('..')) fullSync = true;
       else pending.add(rel);
       if (pending.size > WATCH_FULL_SYNC_THRESHOLD) fullSync = true;
       if (watchTimer) clearTimeout(watchTimer);
       watchTimer = setTimeout(() => {
         if (disposed) return;
         if (running) {
-          trigger('retry', absPath);
+          trigger(absPath);
           return;
         }
         running = true;
@@ -231,22 +261,15 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
         })());
       }, 1500);
     };
-    watcher = chokidar.watch([
-        path.join(ctx.dataDir, 'raw/docs'),
-        path.join(ctx.dataDir, 'raw/skills'),
-        path.join(ctx.dataDir, 'wiki'),
-        path.join(ctx.dataDir, 'purpose.md'),
-        path.join(ctx.dataDir, 'schema.md'),
-      ], {
-        ignoreInitial: true,
-        // Obsidian rewrites workspace/cache state during normal navigation;
-        // those Vault settings are not knowledge and must not trigger a sync.
-        // wiki/.archive holds disposed pages and is never a source, and the
-        // sidecar tree is written by the pipeline itself.
-        ignored: new RegExp(`(^|[/\\\\])(\\.obsidian|\\.archive|${SIDECAR_ROOT_SEGMENT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})([/\\\\]|$)`),
-      })
-      .on('all', trigger);
-    log('watching raw/docs, raw/skills, wiki for changes');
+    try {
+      watcher = watchTree(ctx.dataDir, (abs) => trigger(abs), {
+        ignore: (rel) => !isWatchedSource(rel),
+        onError: (err) => log(`watcher error: ${err.message}`),
+      });
+      log('watching raw/docs, raw/skills, wiki for changes');
+    } catch (err) {
+      log(`cannot watch ${ctx.dataDir}: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   return {
@@ -260,7 +283,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       clearInterval(tier2Timer);
       clearInterval(dsTimer);
       if (watchTimer) clearTimeout(watchTimer);
-      if (watcher) await watcher.close();
+      watcher?.close();
       await folders.stop();
       await Promise.allSettled([...activeJobs]);
       await ctx.datasources.closeAll();

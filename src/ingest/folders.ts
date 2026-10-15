@@ -1,11 +1,11 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import chokidar from 'chokidar';
 import { KnodeConfig, LinkedFolder, saveConfig } from '../config.js';
 import { MAX_CONVERTIBLE_FILE_BYTES, MAX_FILE_BYTES } from '../constants.js';
 import { isHiddenName, isTextFile, safePath, sanitizeRelativePath, walkFiles } from '../fs/files.js';
 import { hasSidecarSegment, RAW_DOCS, SIDECAR_ROOT } from '../fs/layout.js';
+import { TreeWatcher, watchTree } from '../fs/watch.js';
 import { isConvertibleFile } from './convert.js';
 import { sync, SyncContext, SyncStats } from './sync.js';
 
@@ -484,9 +484,6 @@ export function describeLinkedFolders(ctx: { dataDir: string; config: KnodeConfi
 /* ------------------------------ the watcher ------------------------------ */
 
 interface PendingEvents {
-  paths: Set<string>;
-  /** A directory came or went: re-mirror the whole link instead of path by path. */
-  full: boolean;
   timer: NodeJS.Timeout | null;
   running: boolean;
   /** Events arrived while a pass ran: run once more when it ends. */
@@ -501,18 +498,19 @@ export interface LinkedFoldersOptions {
   debounceMs?: number;
   /** Full reconcile of every link this often (stat-only when nothing changed); 0 disables. */
   reconcileMinutes?: number;
-  /** A file must stop growing for this long before it counts as written — exports rewrite whole files. */
+  /** A file must stop changing for this long before it counts as written — exports rewrite whole files. The quiet time is the longer of the two. */
   writeSettleMs?: number;
 }
 
 /**
- * What `serve` runs per workspace for its linked folders: a watcher per source
- * that mirrors changes as they happen and syncs the keys they touched, a
+ * What `serve` runs per workspace for its linked folders: one recursive
+ * watcher per source (src/fs/watch.ts — one handle per tree, never one per
+ * file) whose events re-mirror the link and sync the keys that changed, a
  * startup refresh for whatever changed while knode-os was down, and a periodic
  * reconcile for the events a filesystem watcher drops.
  */
 export class LinkedFolders {
-  private readonly watchers = new Map<string, ReturnType<typeof chokidar.watch>>();
+  private readonly watchers = new Map<string, TreeWatcher>();
   private readonly pending = new Map<string, PendingEvents>();
   private readonly runtime = new Map<string, LinkRuntime>();
   private reconcileTimer: NodeJS.Timeout | null = null;
@@ -520,13 +518,11 @@ export class LinkedFolders {
   private readonly log: (msg: string) => void;
   private readonly track: <T>(job: Promise<T>) => Promise<T>;
   private readonly debounceMs: number;
-  private readonly writeSettleMs: number;
 
   constructor(private readonly ctx: FolderContext, private readonly opts: LinkedFoldersOptions = {}) {
     this.log = opts.log ?? (() => {});
     this.track = opts.track ?? ((job) => job);
-    this.debounceMs = opts.debounceMs ?? 1500;
-    this.writeSettleMs = opts.writeSettleMs ?? 1000;
+    this.debounceMs = Math.max(opts.debounceMs ?? 1500, opts.writeSettleMs ?? 1000);
   }
 
   /** Watch every configured link and refresh each one once, in the background. */
@@ -550,7 +546,7 @@ export class LinkedFolders {
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     for (const state of this.pending.values()) if (state.timer) clearTimeout(state.timer);
     this.pending.clear();
-    await Promise.allSettled([...this.watchers.values()].map((w) => w.close()));
+    for (const w of this.watchers.values()) w.close();
     this.watchers.clear();
     for (const rt of this.runtime.values()) rt.watching = false;
   }
@@ -568,7 +564,7 @@ export class LinkedFolders {
 
   /** Forget a link and stop watching it; optionally remove the mirror. */
   async remove(dest: string, opts: { removeFiles?: boolean } = {}): Promise<Awaited<ReturnType<typeof unlinkFolder>>> {
-    await this.unwatch(dest);
+    this.unwatch(dest);
     this.runtime.delete(dest);
     return unlinkFolder(this.ctx, dest, { ...opts, onProgress: this.log });
   }
@@ -625,6 +621,8 @@ export class LinkedFolders {
         lastError: result.sourceMissing ? `source folder not found: ${link.source}` : null,
         lastChange: result.copied.length || result.removed.length ? { copied: result.copied.length, removed: result.removed.length, at } : rt.lastChange,
       });
+      // a source that was away (or whose watcher failed) is watched again once it is back
+      if (!result.sourceMissing) this.watch(link);
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -633,63 +631,68 @@ export class LinkedFolders {
     }
   }
 
+  /** The link is still configured — a refresh that ends after an unlink must not watch it again. */
+  private isLinked(link: LinkedFolder): boolean {
+    return linkedFolders(this.ctx.config).some((l) => l.dest === link.dest && l.source === link.source);
+  }
+
   private watch(link: LinkedFolder): void {
-    if (this.stopped || this.watchers.has(link.dest)) return;
-    const watcher = chokidar.watch(link.source, {
-      ignoreInitial: true,
-      followSymlinks: false,
-      // dot-entries never travel (the exporter's `.state/` cache, `.git/`), so their churn is not ours to see
-      ignored: (abs: string) => path.relative(link.source, abs).split(path.sep).some((seg) => seg && isHiddenName(seg)),
-      // an export rewrites a whole month file: wait until it stops growing
-      awaitWriteFinish: { stabilityThreshold: this.writeSettleMs, pollInterval: 200 },
-    });
-    watcher.on('all', (event, abs) => this.onEvent(link, event, abs));
-    watcher.on('error', (err) => {
+    if (this.stopped || this.watchers.has(link.dest) || !this.isLinked(link)) return;
+    let watcher: TreeWatcher;
+    try {
+      watcher = watchTree(link.source, () => this.onEvent(link), {
+        // dot-entries never travel (the exporter's `.state/` cache, `.git/`), so their churn is not ours to see
+        ignore: (rel) => rel.split('/').some((seg) => seg && isHiddenName(seg)),
+        onError: (err) => {
+          this.runtime.set(link.dest, { ...this.runtimeOf(link.dest), lastError: err.message });
+          this.log(`linked ${link.dest}: watcher error: ${err.message}`);
+          // dropped: the next reconcile watches the source again once it is there
+          this.unwatch(link.dest);
+        },
+      });
+    } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.runtime.set(link.dest, { ...this.runtimeOf(link.dest), lastError: message });
-      this.log(`linked ${link.dest}: watcher error: ${message}`);
-    });
+      this.log(`linked ${link.dest}: cannot watch ${link.source}: ${message}`);
+      return;
+    }
     this.watchers.set(link.dest, watcher);
     this.runtime.set(link.dest, { ...this.runtimeOf(link.dest), watching: true });
     this.log(`watching ${link.source} → ${link.dest}`);
   }
 
-  private async unwatch(dest: string): Promise<void> {
+  private unwatch(dest: string): void {
     const watcher = this.watchers.get(dest);
     this.watchers.delete(dest);
     const state = this.pending.get(dest);
     if (state?.timer) clearTimeout(state.timer);
     this.pending.delete(dest);
-    if (watcher) await watcher.close();
+    watcher?.close();
     const rt = this.runtime.get(dest);
     if (rt) rt.watching = false;
   }
 
-  private onEvent(link: LinkedFolder, event: string, abs: string): void {
+  private onEvent(link: LinkedFolder): void {
     if (this.stopped) return;
-    const state = this.pending.get(link.dest) ?? { paths: new Set<string>(), full: false, timer: null, running: false, rerun: false };
+    const state = this.pending.get(link.dest) ?? { timer: null, running: false, rerun: false };
     this.pending.set(link.dest, state);
-    if (event === 'addDir' || event === 'unlinkDir') state.full = true;
-    else state.paths.add(abs);
-    if (state.paths.size > SYNC_KEYS_MAX) state.full = true;
     if (state.timer) clearTimeout(state.timer);
     state.timer = setTimeout(() => void this.flush(link, state), this.debounceMs);
   }
 
   private async flush(link: LinkedFolder, state: PendingEvents): Promise<void> {
     state.timer = null;
-    if (this.stopped) return;
+    if (this.stopped || !this.isLinked(link)) return;
     if (state.running) {
       state.rerun = true;
       return;
     }
-    const full = state.full;
-    const paths = [...state.paths];
-    state.full = false;
-    state.paths.clear();
     state.running = true;
     try {
-      await this.track(this.apply(link, paths, { full }));
+      // an event only says that something under the source changed; re-walking
+      // the source against the mirror (stats only) decides what to copy, remove
+      // and sync — whatever the event's path, kind, or spelling of the name
+      await this.track(this.refreshOne(link).catch((err) => this.log(`linked ${link.dest}: sync failed: ${err instanceof Error ? err.message : err}`)));
     } finally {
       state.running = false;
       if (state.rerun) {
