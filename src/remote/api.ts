@@ -18,6 +18,7 @@ import { WorkspaceContextRegistry, resolveWorkspaceScope, WorkspaceScope } from 
 import { CATALOG_VIEWS } from '../store/catalog.js';
 import { queryClaims } from '../store/claims.js';
 import { listEntities } from '../store/queries.js';
+import { clientInfo } from '../server/public-guard.js';
 import { remoteCatalogQuery } from './sql.js';
 import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows } from './tokens.js';
 
@@ -88,8 +89,9 @@ export function assertRemoteReadable(rel: string): string {
   return clean;
 }
 
+/** The caller's address: the edge's word only when a proxy on this machine forwarded the request (src/server/public-guard.ts). */
 function clientOf(c: Context): string {
-  return c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for')?.split(',')[0].trim() ?? 'local';
+  return clientInfo(c).ip;
 }
 
 const text = (value: unknown, max: number) => String(value ?? '').slice(0, max);

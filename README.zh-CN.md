@@ -13,6 +13,7 @@ knode-os 结合了两个项目的核心思想:[llm_wiki](https://github.com/nash
 - **自动收集 agent trace。** Claude Code(`~/.claude/projects`)与 Codex CLI(`~/.codex/sessions`)的会话记录自动镜像到 `raw/traces/`,用过的 skills 进 `raw/skills/`。trace 供夜间 dream 分析使用;打开 `trace.episodes` 后会把每段会话备成可检索的 episode，在此之前不进检索索引。skills 一直可被检索。
 - **混合检索**:pgvector 余弦召回 + Postgres 全文检索 + 图谱信号,RRF 融合,并叠加温和的使用热度加权。开箱即用、完全离线(内置哈希 embedder);配置任意 OpenAI 兼容的 embedding 接口可获得生产级效果。
 - **分层知识图谱**:tier 0 在每次摄入时做确定性布线(`[[wikilink]]` + NLP 概念共现,不需要 LLM);变更文档进入 tier-1 队列,由 `serve` 后台(或 `knode-os extract`)按热度优先做 LLM 实体/关系/断言抽取;每轮抽取后随即检查这一轮写到的实体有没有重复(合并可撤销),并给这些文档写摘要页。抽取结果持久化到文档 sidecar,重建索引不会重复付费。支持多跳图搜索与图谱洞察(枢纽节点、孤立节点)。
+- **真实登录,随处可访问**:账号保存在服务端(管理员,以及管理员创建的成员),Web 页面与 macOS 应用都要登录——同一台 Mac 上也一样。其他机器可以经域名(Cloudflare Tunnel)、应用自己维持的 SSH 隧道,或 IP 地址上的 HTTPS 监听访问;每个账号从外部只能用允许它的 API 分组,还可以把本机其他服务的部分 API 发布在 `/gw/<id>` 下,用同一套登录保护。详见 [docs/remote-access.md](docs/remote-access.md)。
 - **标注即租约,可在任意机器上跑**:`serve` 把抽取分段交给本机的工作槽位(可同时跑多个 agent,例如 Codex 与 Cursor,见 `extraction.workers`),也交给远程工作者:`worker/knode-worker.mjs` 在别的机器上调用 Codex、Cursor、Claude Code 或 OpenAI 兼容 API,凭每台机器各自的 token 经 SSH 隧道或公网 HTTPS 访问 `/remote/v1`。慢调用不拖住别人,限流只让该后端暂停而不消耗重试次数,租约过期的分段会重新排队。同一套 API 还能读取、搜索、写入知识并回答只读 SQL。详见 [docs/remote-labeling.md](docs/remote-labeling.md)。
 - **`/dream`**:每晚(或手动)分析近期 agent 会话——问了什么、哪些工具失败、什么在重复——产出对 **skills**、**memory**、**知识库** 的改进建议,在页面上一键接受/拒绝。
 - **实时数据源 —— 一个逻辑数据库。** 注册 MySQL、TimescaleDB、parquet/CSV 目录(DuckDB,模拟 HDFS)、JSON HTTP 端点、Prometheus 指标和对象目录:knode-os 把它们内省成知识图谱里的 capability(`datasource`/`dataset` 实体,按实体列采样生成 `appears_in` 边与 locator;端点和指标的绑定由已知的表和别名推导),并生成 `wiki/datasets/` 页面——行数据留在原系统、查询时实时获取。提到一个公司,图谱同时知道*哪些文档提到它*、*哪些表包含它*、*哪个 API 端点能查它*。
@@ -37,6 +38,9 @@ node dist/cli.js search "向量召回" --data ~/knode-data
 
 # 启动全部服务(Web 页面 http://127.0.0.1:9100)
 node dist/cli.js serve --data ~/knode-data
+
+# 创建第一个账号——或者在本机打开 Web 页面,在首屏创建
+node dist/cli.js user add admin --admin --data ~/knode-data
 ```
 
 全局安装(`npm link` 或 `pnpm add -g .`)后可直接使用 `knode-os` 命令。
@@ -152,6 +156,10 @@ knode-os rebuild [--history]  删除 .knode/db 并从文件 + ledger 重建
 knode-os extract [--batch n]  跑一轮后台文档轮次:抽取一批、复核重复实体、写摘要
 knode-os remote token create --name <机器> --scope label,read,write,sql --workspace <用户>/<workspace>
                               为远程 API 签发每台机器各自的 token(另有 `remote token list | revoke`)
+knode-os user add <名字> [--admin] [--team t] [--remote-apis 分组] [--gateway id]
+                              可以登录的账号(另有 `user list | set | passwd | signout | remove | token | sessions`)
+knode-os gateway add <id> <http://127.0.0.1:端口/路径>   把本机服务发布在 /gw/<id> 下(另有 `gateway list | remove`)
+knode-os tls init [--host IP或域名]   为 HTTPS 监听(server.tls)生成自签名证书
 knode-os datasource list|sync             查看已注册实时表 / 重新内省 schema 进图谱
 knode-os datasource query <id> <sql>      对数据源执行只读原生 SQL
 knode-os pack <语句> [--json] [--as-of iso] [--valid-at iso]
@@ -211,7 +219,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
 
 ## Web 页面
 
-`knode-os serve` → http://127.0.0.1:9100
+`knode-os serve` → http://127.0.0.1:9100 ——用服务端的账号登录(第一个账号在本机创建:`knode-os user add`,或首屏)。同一套页面也能从其他机器经域名、SSH 隧道或 HTTPS 监听打开([docs/remote-access.md](docs/remote-access.md))。设置里的 **Access / 权限** 用于改自己的密码、管理会话;管理员还能在这里管理用户与网关。成员看到的设置是只读的。
 
 四个一级区，每区自带二级 tab。
 
@@ -226,12 +234,12 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
   - **Dream / 夜间分析** —— 手动触发 dream,审阅并接受/拒绝建议
 - **Settings / 设置** —— **Providers & Agents**（每个模型端点与密钥只配一次，embedding 与 LLM 同在一张表——`llmUse` 标出哪个 LLM 是默认，所有没有自己指定 provider 的任务都跟着它走；下面第二张表是 agent：跑在这些模型之一上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI（Claude Code / Codex / Cursor）。CLI 是 agent 而不是模型）、**Ingest / 预处理**（独立的 Entity / Concept / 文档视觉阶段路由，每个阶段写明自己跑在哪个模型或 agent 上——任一 agent 都按单次调用使用，阶段不再跟随默认；保存后按需重建 embedding 或刷新转换）、**Research / 研究**、**Ask / 问答**（由哪个 agent 回答、每次回复带上最近几条消息、保留多少个对话）、**Workspace**。中间三页按知识在工作区里的流向排列：进来先预处理，再研究成 wiki，最后用来回答问题
 
-## REST API(仅 localhost)
+## REST API
 
 `GET /api/health · /api/config · /api/stats · /api/tree · /api/file · /api/search · /api/graph · /api/graph/insights · /api/entities · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
 `PUT /api/config` · `PUT /api/file` · `DELETE /api/file` · `POST /api/config/test | /api/upload | /api/ingest | /api/ask | /api/mv | /api/mkdir | /api/traces/sync | /api/dream | /api/wiki/generate | /api/suggestions/:id/status`
 
-Workspace 范围内的数据 API 需要请求头：`X-Knode-User`、`X-Knode-Workspace-Kind`（`personal` 或 `team`）、`X-Knode-Workspace-ID` 和 `X-Knode-Workspace-Name`。`GET/POST /api/workspaces` 只需要 `X-Knode-User`；`DELETE /api/workspace` 会彻底清空所选 Workspace。
+每个接口都需要登录会话——已登录浏览器的 cookie,或 `Authorization: Bearer knu_…`(应用的,或 `knode-os user token` 签发给脚本的)——以及该接口所属 API 分组的权限;登录本身在 `/api/auth/*` 下([docs/remote-access.md](docs/remote-access.md))。Workspace 范围内的数据 API 另需请求头 `X-Knode-Workspace-Kind`（`personal` 或 `team`）、`X-Knode-Workspace-ID` 和 `X-Knode-Workspace-Name`；Workspace 的主人就是已登录的账号(只有关闭登录时才看 `X-Knode-User`)。`DELETE /api/workspace` 会彻底清空所选 Workspace。
 
 ## 开发
 
@@ -242,7 +250,7 @@ pnpm typecheck && pnpm test            # tsc + vitest
 
 ## 安全说明
 
-服务只绑定 `127.0.0.1`，目前仍是浏览器 Mock 登录；Workspace 请求头只负责存储路由，不是真实的权限认证，请勿对外暴露界面。经公网域名或任何代理到达的请求只能访问 `/remote/v1`，必须走 HTTPS 并携带每台机器各自的 token(哈希存储、按 workspace 与能力限定、限速、留审计日志)，其余路径一律返回 404，详见 [docs/remote-labeling.md](docs/remote-labeling.md)。API key 支持 `env:VAR` 引用，配置文件可不落盘密钥。文件 API 被限制在当前 Workspace 目录内（防路径穿越）；写入、移动和删除操作（HTTP 与 MCP 一致）仅限 `wiki/`、`raw/docs/` 与 `playbooks/packs/`，且永远不会落到系统专有的 `.sidecar/` 目录。
+服务只绑定 `127.0.0.1`，并要求每个客户端登录——浏览器、应用和脚本，本机也不例外(`src/auth`)：密码用 scrypt 哈希，会话只存哈希，登录按地址和用户名限速，浏览器的写操作有 CSRF 防护。来自其他机器的请求必须走 HTTPS(经隧道,或 `server.tls` 监听)，且只能使用账号允许从外部使用的 API 分组；`/mcp` 只对本机开放；`serve` 拒绝在其他机器能以明文 HTTP 访问的地址上监听。成员不能修改设置，只能打开自己的 Workspace 和分配给他们的 Team——但 Ask 与 Research 会在服务所在的机器上运行编码 agent，只开放给你信得过的人。远程标注工作者在 `/remote/v1` 上使用每台机器各自的 token(哈希存储、按 workspace 与能力限定、限速、留审计日志)，详见 [docs/remote-access.md](docs/remote-access.md) 与 [docs/remote-labeling.md](docs/remote-labeling.md)。API key 支持 `env:VAR` 引用，配置文件可不落盘密钥。文件 API 被限制在当前 Workspace 目录内（防路径穿越）；写入、移动和删除操作（HTTP 与 MCP 一致）仅限 `wiki/`、`raw/docs/` 与 `playbooks/packs/`，且永远不会落到系统专有的 `.sidecar/` 目录。
 
 ## License
 

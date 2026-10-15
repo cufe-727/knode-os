@@ -3,10 +3,12 @@
 
 const $ = (sel) => document.querySelector(sel);
 const api = async (path, opts = {}) => {
-  const headers = { 'content-type': 'application/json', ...workspaceRequestHeaders(), ...(opts.headers || {}) };
-  const res = await fetch(path, { ...opts, headers });
+  // X-Knode-CSRF: a page on another site cannot send it, so the server knows a write came from this one
+  const headers = { 'content-type': 'application/json', 'x-knode-csrf': '1', ...workspaceRequestHeaders(), ...(opts.headers || {}) };
+  const res = await fetch(path, { ...opts, headers, credentials: 'same-origin' });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    if (res.status === 401 && data.reason === 'auth') sessionEnded(data.error);
     const error = new Error(data.error || res.statusText);
     // the machine-readable cause, when a route sends one: a screen can act on
     // it instead of parsing the prose
@@ -60,16 +62,22 @@ const renderMd = (s) => {
 
 /* --------------------------- auth & workspaces ------------------------- */
 
+/**
+ * Sign-in belongs to the server (src/auth): a browser holds an HttpOnly
+ * session cookie, so nothing secret lives in this page. Storage keeps only
+ * which workspaces you had open (`authState`); who you are and what you may
+ * use (`serverAuth`) comes from the server on every load.
+ */
 const AUTH_KEY = 'knode-os.auth.v1';
-const ACCOUNTS_KEY = 'knode-os.mock-accounts.v1';
-const BUILTIN_ACCOUNTS = [
-  { username: 'admin', password: 'admin', name: 'Admin' },
-  { username: 'test', password: 'test', name: 'Test' },
-];
 let authState = null;
+/** The server's view of the session: account, groups usable here, teams, gateways. */
+let serverAuth = null;
+/** Sign-in is off on this server (development): any username, no password. */
+let authDisabled = false;
 let pendingUser = null;
 let pendingPersistence = 'local';
 let statsTimer = null;
+let sessionEndedShown = false;
 
 const initials = (value) => {
   const parts = String(value || 'You').trim().split(/[\s@._-]+/).filter(Boolean);
@@ -83,33 +91,6 @@ const nameFromUsername = (username) => String(username)
   .join(' ') || 'Your account';
 
 const normalizeUsername = (username) => String(username || '').trim().toLowerCase();
-
-function readMockAccounts() {
-  try {
-    const accounts = JSON.parse(localStorage.getItem(ACCOUNTS_KEY) || '[]');
-    return Array.isArray(accounts) ? accounts.filter((account) => account?.username && typeof account.password === 'string') : [];
-  } catch {
-    return [];
-  }
-}
-
-function findMockAccount(username, password) {
-  const normalized = normalizeUsername(username);
-  return [...BUILTIN_ACCOUNTS, ...readMockAccounts()]
-    .find((account) => normalizeUsername(account.username) === normalized && account.password === password) || null;
-}
-
-function usernameExists(username) {
-  const normalized = normalizeUsername(username);
-  return [...BUILTIN_ACCOUNTS, ...readMockAccounts()]
-    .some((account) => normalizeUsername(account.username) === normalized);
-}
-
-function saveMockAccount(account) {
-  const accounts = readMockAccounts();
-  accounts.push(account);
-  localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts));
-}
 
 function readAuthState() {
   for (const storage of [localStorage, sessionStorage]) {
@@ -129,6 +110,10 @@ function saveAuthState() {
     target.setItem(AUTH_KEY, JSON.stringify(authState));
     other.removeItem(AUTH_KEY);
   } catch { /* keep the current in-memory session */ }
+}
+
+function forgetAuthState() {
+  try { localStorage.removeItem(AUTH_KEY); sessionStorage.removeItem(AUTH_KEY); } catch { /* no-op */ }
 }
 
 function showAuthStep(step) {
@@ -156,6 +141,20 @@ function workspaceLabel(workspace) {
   return workspace?.name || 'Workspace';
 }
 
+/** The Teams the server says this account may open. */
+function serverTeams() {
+  return (serverAuth?.teams || []).map((team) => ({ id: team.id, name: team.name, kind: 'team', code: String(team.slug || '').toUpperCase() }));
+}
+
+/** Members keep only the Teams they were given; an administrator may keep any Team joined by code. */
+function allowedTeams(teams) {
+  const account = serverAuth?.account;
+  const given = serverTeams();
+  const open = authDisabled || !account || account.role === 'admin' || account.teams?.includes('*');
+  const kept = open ? teams : teams.filter((team) => given.some((g) => g.id === team.id));
+  return [...kept, ...given].filter((team, i, all) => all.findIndex((t) => t.id === team.id) === i);
+}
+
 function completeLogin(activeWorkspace, extraWorkspaces = []) {
   const user = pendingUser;
   if (!user) return;
@@ -163,13 +162,11 @@ function completeLogin(activeWorkspace, extraWorkspaces = []) {
   authState = {
     user,
     persistence: pendingPersistence,
-    workspaces: [personal, ...extraWorkspaces],
+    workspaces: [personal, ...allowedTeams(extraWorkspaces)],
     activeWorkspaceId: activeWorkspace.id,
   };
   saveAuthState();
   $('#login-password').value = '';
-  $('#register-password').value = '';
-  $('#register-confirm').value = '';
   pendingUser = null;
   enterApp();
 }
@@ -183,6 +180,7 @@ function workspaceRequestHeaders() {
   const workspace = activeWorkspace();
   const username = normalizeUsername(authState.user.username || authState.user.email);
   if (!username || !workspace) return {};
+  // the server acts for the signed-in account; the user header only matters with sign-in off
   return {
     'x-knode-user': username,
     'x-knode-workspace-kind': workspace.kind,
@@ -195,7 +193,7 @@ async function syncUserWorkspaces() {
   if (!authState?.user) return;
   const previous = activeWorkspace();
   const owned = await api('/api/workspaces');
-  const teams = authState.workspaces.filter((workspace) => workspace.kind === 'team');
+  const teams = allowedTeams(authState.workspaces.filter((workspace) => workspace.kind === 'team'));
   authState.workspaces = [...owned, ...teams];
   if (!authState.workspaces.some((workspace) => workspace.id === authState.activeWorkspaceId)) {
     authState.activeWorkspaceId = owned[0]?.id || teams[0]?.id;
@@ -225,8 +223,10 @@ function renderWorkspaceUI() {
   $('#workspace-context').classList.toggle('team', !personal);
   $('#account-avatar').textContent = userInitials;
   $('#account-name').textContent = user.name;
-  $('#account-email').textContent = user.username ? `@${user.username}` : user.email;
+  const role = serverAuth?.account?.role === 'admin' ? ' · administrator' : '';
+  $('#account-email').textContent = user.username ? `@${user.username}${role}` : user.email;
   document.body.dataset.workspace = workspace.kind;
+  document.body.dataset.role = serverAuth?.account?.role || 'member';
 
   const options = $('#workspace-options');
   options.innerHTML = '';
@@ -259,6 +259,10 @@ function switchWorkspace(id) {
 function joinTeam(code, fromOnboarding = false) {
   const team = teamFromCode(code);
   if (!team) return { error: 'Enter a valid Team code or invite link.' };
+  const account = serverAuth?.account;
+  if (!authDisabled && account && account.role !== 'admin' && !account.teams?.includes('*') && !serverTeams().some((t) => t.id === team.id)) {
+    return { error: `Your account has not been given ${team.name} — ask an administrator.` };
+  }
   if (fromOnboarding) {
     completeLogin(team, [team]);
     return { team };
@@ -315,7 +319,14 @@ function startAppData() {
   loadWorkspaceData();
 }
 
+function stopAppData() {
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = null;
+  stopChatPolling();
+}
+
 function enterApp() {
+  sessionEndedShown = false;
   $('#auth-view').hidden = true;
   $('#app-shell').hidden = false;
   // paints the header, the strip and the visible section from one source
@@ -329,18 +340,35 @@ function enterApp() {
     });
 }
 
-function showLogin() {
+function showAuthView() {
+  stopAppData();
+  closeWorkspaceMenu();
   $('#app-shell').hidden = true;
   $('#auth-view').hidden = false;
+}
+
+function showLogin(note = '') {
+  showAuthView();
   showAuthStep('login');
   $('#login-form').reset();
   $('#login-remember').checked = true;
   $('#login-password').type = 'password';
   $('#btn-toggle-password').textContent = 'Show';
   $('#login-error').textContent = '';
-  $('#register-error').textContent = '';
-  closeWorkspaceMenu();
-  setTimeout(() => $('#login-username').focus(), 0);
+  const message = note || (authDisabled ? 'Sign-in is off on this server (development): any username works, no password.' : '');
+  $('#login-note').textContent = message;
+  $('#login-note').hidden = !message;
+  const last = readAuthState()?.user?.username;
+  if (last) $('#login-username').value = last;
+  setTimeout(() => (last ? $('#login-password') : $('#login-username')).focus(), 0);
+}
+
+/** A request came back 401: the session is over (expired, signed out elsewhere, password changed). */
+function sessionEnded(message) {
+  if (sessionEndedShown || authDisabled) return;
+  sessionEndedShown = true;
+  serverAuth = null;
+  showLogin(message && !/^sign in first$/i.test(message) ? `${message.charAt(0).toUpperCase()}${message.slice(1)}.` : 'Your session ended — sign in again.');
 }
 
 function continueToWorkspaceChoice(user, persistence) {
@@ -352,26 +380,60 @@ function continueToWorkspaceChoice(user, persistence) {
   showAuthStep('workspaces');
 }
 
-$('#login-form').addEventListener('submit', (event) => {
+/** The server accepted us: back to the workspaces this browser had open for the same user, or choose. */
+function signedIn(view, persistence) {
+  serverAuth = view;
+  const account = view.account;
+  const user = { username: account.username, name: account.name || nameFromUsername(account.username) };
+  const stored = readAuthState();
+  if (stored && normalizeUsername(stored.user?.username) === account.username) {
+    authState = { ...stored, user, persistence };
+    authState.workspaces = [
+      ...authState.workspaces.filter((workspace) => workspace.kind === 'personal'),
+      ...allowedTeams(authState.workspaces.filter((workspace) => workspace.kind === 'team')),
+    ];
+    if (!authState.workspaces.some((workspace) => workspace.id === authState.activeWorkspaceId)) authState.activeWorkspaceId = personalWorkspace().id;
+    saveAuthState();
+    enterApp();
+    return;
+  }
+  // someone else signed in on this browser: their workspaces are not ours
+  forgetAuthState();
+  continueToWorkspaceChoice(user, persistence);
+}
+
+$('#login-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const username = normalizeUsername($('#login-username').value);
   const password = $('#login-password').value;
+  const remember = $('#login-remember').checked;
   if (!username) {
     $('#login-error').textContent = 'Enter your username.';
     $('#login-username').focus();
     return;
   }
-  const account = findMockAccount(username, password);
-  if (!account) {
-    $('#login-error').textContent = 'Invalid username or password.';
+  if (authDisabled) {
+    signedIn({ account: { username, name: nameFromUsername(username), role: 'admin', teams: ['*'] }, teams: [] }, remember ? 'local' : 'session');
+    return;
+  }
+  if (!password) {
+    $('#login-error').textContent = 'Enter your password.';
     $('#login-password').focus();
     return;
   }
-  $('#login-error').textContent = '';
-  continueToWorkspaceChoice(
-    { username: normalizeUsername(account.username), name: account.name || nameFromUsername(account.username) },
-    $('#login-remember').checked ? 'local' : 'session',
-  );
+  const button = $('#btn-login');
+  button.disabled = true;
+  try {
+    const view = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password, remember }) });
+    $('#login-error').textContent = '';
+    $('#login-note').hidden = true;
+    signedIn(view, remember ? 'local' : 'session');
+  } catch (error) {
+    $('#login-error').textContent = error.reason === 'setup' ? 'This server has no accounts yet.' : `${error.message.charAt(0).toUpperCase()}${error.message.slice(1)}.`;
+    $('#login-password').select();
+  } finally {
+    button.disabled = false;
+  }
 });
 
 $('#btn-toggle-password').addEventListener('click', () => {
@@ -381,51 +443,36 @@ $('#btn-toggle-password').addEventListener('click', () => {
   $('#btn-toggle-password').textContent = reveal ? 'Hide' : 'Show';
 });
 
-$('#btn-show-register').addEventListener('click', () => {
-  $('#register-form').reset();
-  $('#register-error').textContent = '';
-  showAuthStep('register');
-  setTimeout(() => $('#register-username').focus(), 0);
-});
-
-$('#btn-register-back').addEventListener('click', () => showAuthStep('login'));
-
-$('#register-form').addEventListener('submit', (event) => {
+$('#setup-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const rawUsername = $('#register-username').value.trim();
-  const username = normalizeUsername(rawUsername);
-  const password = $('#register-password').value;
-  const confirmPassword = $('#register-confirm').value;
-  if (!/^[a-zA-Z0-9._-]{3,32}$/.test(rawUsername)) {
-    $('#register-error').textContent = 'Use 3–32 letters, numbers, dots, dashes or underscores.';
-    $('#register-username').focus();
+  const username = normalizeUsername($('#setup-username').value);
+  const password = $('#setup-password').value;
+  if (!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(username)) {
+    $('#setup-error').textContent = 'Use up to 32 lower-case letters, digits, dots, dashes or underscores.';
+    $('#setup-username').focus();
     return;
   }
-  if (usernameExists(username)) {
-    $('#register-error').textContent = 'That username already exists.';
-    $('#register-username').focus();
+  if (password.length < 8) {
+    $('#setup-error').textContent = 'Passwords need at least 8 characters.';
+    $('#setup-password').focus();
     return;
   }
-  if (password.length < 4) {
-    $('#register-error').textContent = 'Password must be at least 4 characters.';
-    $('#register-password').focus();
+  if (password !== $('#setup-confirm').value) {
+    $('#setup-error').textContent = 'The passwords do not match.';
+    $('#setup-confirm').focus();
     return;
   }
-  if (password !== confirmPassword) {
-    $('#register-error').textContent = 'Passwords do not match.';
-    $('#register-confirm').focus();
-    return;
-  }
-  const account = { username, password, name: nameFromUsername(username) };
   try {
-    saveMockAccount(account);
-  } catch {
-    $('#register-error').textContent = 'This browser could not save the account.';
-    return;
+    const view = await api('/api/auth/setup', { method: 'POST', body: JSON.stringify({ username, password, name: nameFromUsername(username) }) });
+    $('#setup-error').textContent = '';
+    $('#setup-form').reset();
+    signedIn(view, 'local');
+  } catch (error) {
+    $('#setup-error').textContent = error.message;
   }
-  $('#register-error').textContent = '';
-  continueToWorkspaceChoice({ username: account.username, name: account.name }, 'local');
 });
+
+$('#btn-nosetup-retry').addEventListener('click', () => bootAuth());
 
 $('#btn-auth-back').addEventListener('click', () => showAuthStep('login'));
 $('#btn-use-personal').addEventListener('click', () => pendingUser && completeLogin(personalWorkspace()));
@@ -451,6 +498,7 @@ document.addEventListener('keydown', (event) => {
     if ($('#join-team-dialog').open) $('#join-team-dialog').close();
     if ($('#create-workspace-dialog').open) $('#create-workspace-dialog').close();
     if ($('#clear-workspace-dialog').open) $('#clear-workspace-dialog').close();
+    if ($('#user-dialog').open) $('#user-dialog').close();
   }
 });
 
@@ -503,17 +551,52 @@ $('#join-team-form').addEventListener('submit', (event) => {
   if (!result.error) $('#join-team-dialog').close();
 });
 
-$('#btn-sign-out').addEventListener('click', () => {
-  try { localStorage.removeItem(AUTH_KEY); sessionStorage.removeItem(AUTH_KEY); } catch { /* no-op */ }
+$('#btn-open-access').addEventListener('click', () => {
+  closeWorkspaceMenu();
+  navigate('access');
+});
+
+$('#btn-sign-out').addEventListener('click', async () => {
+  closeWorkspaceMenu();
+  if (!authDisabled) {
+    try { await api('/api/auth/logout', { method: 'POST', body: '{}' }); } catch { /* signed out here either way */ }
+  }
+  forgetAuthState();
   authState = null;
+  serverAuth = null;
   pendingUser = null;
   showLogin();
 });
 
-function bootAuth() {
-  authState = readAuthState();
-  if (authState) enterApp();
-  else showLogin();
+async function bootAuth() {
+  let state;
+  try {
+    state = await api('/api/auth/state');
+  } catch (error) {
+    showLogin(`The server did not answer: ${error.message}`);
+    return;
+  }
+  authDisabled = state.auth === false;
+  if (authDisabled) {
+    const stored = readAuthState();
+    if (stored) {
+      authState = stored;
+      serverAuth = { account: { username: stored.user.username, name: stored.user.name, role: 'admin', teams: ['*'] }, teams: [] };
+      enterApp();
+    } else showLogin();
+    return;
+  }
+  if (state.signedIn) {
+    signedIn(state, readAuthState()?.persistence || 'local');
+    return;
+  }
+  if (state.setupRequired) {
+    showAuthView();
+    showAuthStep(state.canSetup ? 'setup' : 'nosetup');
+    if (state.canSetup) setTimeout(() => $('#setup-username').focus(), 0);
+    return;
+  }
+  showLogin();
 }
 
 /* ----------------------------- navigation ------------------------------- */
@@ -546,6 +629,7 @@ const NAV = [
     { id: 'research', title: 'Research', hint: 'How the wiki gets written' },
     { id: 'chat', title: 'Ask', hint: 'How questions get answered' },
     { id: 'workspace', title: 'Workspace', hint: 'Clear this workspace' },
+    { id: 'access', title: 'Access', hint: 'Your account; users and gateways of this server' },
   ] },
 ];
 
@@ -573,6 +657,7 @@ const TAB_LOAD = {
   wiki: () => loadResearch(),
   ask: () => loadChat(),
   settings: () => loadConfigForm(),
+  access: () => loadAccess(),
   graph: () => { if (!graphState.loaded) loadGraph(''); },
 };
 
@@ -660,6 +745,279 @@ $('#tabs').addEventListener('click', (event) => {
 $('#subtabs').addEventListener('click', (event) => {
   const button = event.target.closest?.('button[data-tab]');
   if (button) navigate(button.dataset.tab);
+});
+
+/* ------------------------------- access -------------------------------- */
+
+/**
+ * Account & access: your password and sessions, and — for an administrator —
+ * the users of this server and the local services it publishes under /gw.
+ * Everything goes through /api/auth, and the server enforces all of it; this
+ * page only draws what it is told.
+ */
+
+const API_GROUP_LABELS = {
+  files: 'Files', search: 'Search', ask: 'Ask', knowledge: 'Knowledge', ingest: 'Ingest',
+  traces: 'Traces', datasources: 'Datasources', settings: 'Settings', gateway: 'Gateways',
+};
+const MEMBER_REMOTE_DEFAULT = ['files', 'search', 'ask', 'knowledge', 'ingest', 'traces'];
+let accessUsers = null;
+let editingUser = null;
+
+const when = (iso) => (iso ? new Date(iso).toLocaleString() : '—');
+const csvList = (value) => String(value || '').split(',').map((v) => v.trim()).filter(Boolean);
+
+async function loadAccess() {
+  const admin = document.querySelectorAll('.admin-only');
+  if (authDisabled) {
+    $('#access-summary').textContent = 'Sign-in is off on this server (development): there are no accounts here.';
+    admin.forEach((el) => { el.hidden = true; });
+    return;
+  }
+  try {
+    const me = await api('/api/auth/me');
+    serverAuth = { ...serverAuth, ...me };
+    renderAccount(me);
+    renderSessions(await api('/api/auth/sessions'));
+    const isAdmin = me.account.role === 'admin' && me.groups?.settings;
+    admin.forEach((el) => { el.hidden = !isAdmin; });
+    if (isAdmin) await loadAdmin();
+  } catch (error) {
+    toast(`Could not load access: ${error.message}`, 5000);
+  }
+}
+
+function renderAccount(me) {
+  const a = me.account;
+  $('#access-summary').textContent = `Signed in as ${a.name || a.username} (@${a.username}), ${me.local ? 'on this machine' : 'from another machine'}.`;
+  $('#access-role').textContent = a.role === 'admin' ? 'administrator' : 'member';
+  $('#access-groups').innerHTML = Object.entries(me.groups || {})
+    .map(([group, ok]) => `<span class="access-chip${ok ? ' ok' : ''}" title="${esc(me.apiGroups?.[group] || '')}">${ok ? '✓' : '✕'} ${esc(API_GROUP_LABELS[group] || group)}</span>`)
+    .join('');
+  const gateways = me.gateways || [];
+  $('#access-gateways-mine').innerHTML = gateways.length
+    ? `<div class="cfg-card-title"><b>Gateways you may use</b></div>${gateways.map((g) => `<p class="hint"><a href="${esc(g.path)}" target="_blank" rel="noopener">${esc(g.path)}</a> ${esc(g.description)}</p>`).join('')}`
+    : '';
+}
+
+function renderSessions(list) {
+  $('#access-sessions').innerHTML = list.map((s) => `<div class="access-row">
+      <span><b>${esc(s.label)}</b>${s.current ? ' <span class="section-badge">this one</span>' : ''}<small>${esc(s.kind)} · since ${esc(when(s.createdAt))} · last used ${esc(when(s.lastSeenAt))}${s.ip ? ` · ${esc(s.ip)}` : ''}</small></span>
+      ${s.current ? '' : `<button type="button" class="ghost" data-end-session="${esc(s.id)}">End</button>`}
+    </div>`).join('') || '<p class="hint">No sessions.</p>';
+}
+
+$('#access-sessions').addEventListener('click', async (event) => {
+  const id = event.target.closest?.('[data-end-session]')?.dataset.endSession;
+  if (!id) return;
+  try {
+    await api(`/api/auth/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    loadAccess();
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$('#btn-signout-others').addEventListener('click', async () => {
+  try {
+    await api('/api/auth/signout-others', { method: 'POST', body: '{}' });
+    toast('Signed out everywhere else');
+    loadAccess();
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$('#password-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const current = $('#password-current').value;
+  const password = $('#password-new').value;
+  if (password.length < 8) {
+    $('#password-error').textContent = 'Passwords need at least 8 characters.';
+    return;
+  }
+  if (password !== $('#password-confirm').value) {
+    $('#password-error').textContent = 'The new passwords do not match.';
+    return;
+  }
+  try {
+    // the answer carries a new session cookie: this browser stays signed in, every other session ends
+    await api('/api/auth/password', { method: 'POST', body: JSON.stringify({ current, password }) });
+    $('#password-form').reset();
+    $('#password-error').textContent = '';
+    toast('Password changed — your other sessions have ended');
+    loadAccess();
+  } catch (error) {
+    $('#password-error').textContent = error.message;
+  }
+});
+
+async function loadAdmin() {
+  const [users, gateways] = await Promise.all([api('/api/auth/users'), api('/api/auth/gateways')]);
+  accessUsers = users;
+  renderUsers(users);
+  renderGateways(gateways);
+}
+
+function renderUsers(data) {
+  const me = serverAuth?.account?.username;
+  $('#access-users').innerHTML = data.users.map((u) => `<tr${u.disabled ? ' class="disabled"' : ''}>
+      <td><b>${esc(u.username)}</b>${u.name && u.name !== u.username ? `<small>${esc(u.name)}</small>` : ''}${u.disabled ? '<small class="bad">disabled</small>' : ''}</td>
+      <td>${u.role === 'admin' ? 'administrator' : 'member'}</td>
+      <td>${u.role === 'admin' ? 'all' : esc(u.teams.join(', ') || '—')}</td>
+      <td>${u.remoteApis.includes('*') ? 'everything' : esc(u.remoteApis.map((g) => API_GROUP_LABELS[g] || g).join(', ') || 'nothing')}</td>
+      <td>${u.role === 'admin' ? 'all' : esc(u.gateways.join(', ') || '—')}</td>
+      <td>${u.sessions.count}${u.sessions.lastSeenAt ? `<small>${esc(when(u.sessions.lastSeenAt))}</small>` : ''}</td>
+      <td class="row-actions"><button type="button" class="ghost" data-edit-user="${esc(u.username)}">Edit</button>${u.username === me || !u.sessions.count ? '' : `<button type="button" class="ghost" data-signout-user="${esc(u.username)}">Sign out</button>`}</td>
+    </tr>`).join('');
+}
+
+function renderRemoteChecks(selected, groups) {
+  const all = selected.includes('*');
+  $('#user-remote-apis').innerHTML = `<label class="check-row"><input type="checkbox" id="user-remote-all"${all ? ' checked' : ''} /> Everything the role allows</label>`
+    + Object.entries(groups).map(([group, description]) => `<label class="check-row" title="${esc(description)}"><input type="checkbox" data-group="${esc(group)}"${all || selected.includes(group) ? ' checked' : ''}${all ? ' disabled' : ''} /> ${esc(API_GROUP_LABELS[group] || group)}</label>`).join('');
+}
+
+$('#user-remote-apis').addEventListener('change', (event) => {
+  if (event.target.id !== 'user-remote-all') return;
+  for (const box of document.querySelectorAll('#user-remote-apis input[data-group]')) {
+    box.disabled = event.target.checked;
+    if (event.target.checked) box.checked = true;
+  }
+});
+
+function openUserDialog(username) {
+  const u = username ? accessUsers?.users.find((x) => x.username === username) : null;
+  editingUser = u?.username || null;
+  const self = Boolean(u && u.username === serverAuth?.account?.username);
+  $('#user-dialog-title').textContent = u ? `Edit ${u.username}` : 'Add a user';
+  $('#user-dialog-hint').textContent = self
+    ? 'Your own password, role and sign-in are changed under Account, or by another administrator.'
+    : 'They sign in with this username and password, here or from the other machines you allow.';
+  $('#user-username').value = u?.username || '';
+  $('#user-username').disabled = Boolean(u);
+  $('#user-name').value = u?.name || '';
+  $('#user-password').value = '';
+  $('#user-password-label').textContent = u ? 'New password (empty keeps the current one)' : 'Password';
+  $('#user-password').disabled = self;
+  $('#user-role').value = u?.role || 'member';
+  $('#user-role').disabled = self;
+  $('#user-teams').value = (u?.teams || []).join(', ');
+  $('#user-gateways').value = (u?.gateways || []).join(', ');
+  $('#user-disabled').checked = Boolean(u?.disabled);
+  $('#user-disabled-row').hidden = !u || self;
+  renderRemoteChecks(u ? u.remoteApis : MEMBER_REMOTE_DEFAULT, accessUsers?.apiGroups || {});
+  $('#btn-delete-user').hidden = !u || self;
+  $('#user-error').textContent = '';
+  $('#user-dialog').showModal();
+  setTimeout(() => (u ? $('#user-name') : $('#user-username')).focus(), 0);
+}
+
+$('#btn-add-user').addEventListener('click', () => openUserDialog(null));
+$('#btn-cancel-user').addEventListener('click', () => $('#user-dialog').close());
+
+$('#access-users').addEventListener('click', async (event) => {
+  const edit = event.target.closest?.('[data-edit-user]')?.dataset.editUser;
+  if (edit) {
+    openUserDialog(edit);
+    return;
+  }
+  const signout = event.target.closest?.('[data-signout-user]')?.dataset.signoutUser;
+  if (!signout || !confirm(`End every session of ${signout}? They sign in again with their password.`)) return;
+  try {
+    const { ended } = await api(`/api/auth/users/${encodeURIComponent(signout)}/signout`, { method: 'POST', body: '{}' });
+    toast(`${signout}: ${ended} session${ended === 1 ? '' : 's'} ended`);
+    loadAdmin();
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$('#user-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const all = $('#user-remote-all')?.checked;
+  const remoteApis = all ? ['*'] : [...document.querySelectorAll('#user-remote-apis input[data-group]:checked')].map((box) => box.dataset.group);
+  const body = {
+    name: $('#user-name').value.trim(),
+    role: $('#user-role').value,
+    teams: csvList($('#user-teams').value),
+    gateways: csvList($('#user-gateways').value),
+    remoteApis,
+  };
+  const password = $('#user-password').value;
+  try {
+    if (editingUser) {
+      const self = editingUser === serverAuth?.account?.username;
+      if (self) delete body.role;
+      else body.disabled = $('#user-disabled').checked;
+      if (password && !self) {
+        if (password.length < 8) throw new Error('Passwords need at least 8 characters.');
+        body.password = password;
+      }
+      await api(`/api/auth/users/${encodeURIComponent(editingUser)}`, { method: 'PATCH', body: JSON.stringify(body) });
+      toast(`Saved ${editingUser}${body.password || body.disabled ? ' — their sessions ended' : ''}`);
+    } else {
+      if (password.length < 8) throw new Error('Passwords need at least 8 characters.');
+      const created = await api('/api/auth/users', { method: 'POST', body: JSON.stringify({ ...body, username: normalizeUsername($('#user-username').value), password }) });
+      toast(`Created ${created.username}`);
+    }
+    $('#user-dialog').close();
+    loadAdmin();
+  } catch (error) {
+    $('#user-error').textContent = error.message;
+  }
+});
+
+$('#btn-delete-user').addEventListener('click', async () => {
+  if (!editingUser || !confirm(`Remove ${editingUser}? Their workspaces stay on disk under users/${editingUser}.`)) return;
+  try {
+    await api(`/api/auth/users/${encodeURIComponent(editingUser)}`, { method: 'DELETE' });
+    $('#user-dialog').close();
+    toast(`Removed ${editingUser}`);
+    loadAdmin();
+  } catch (error) {
+    $('#user-error').textContent = error.message;
+  }
+});
+
+function renderGateways(list) {
+  $('#access-gateways').innerHTML = list.map((g) => `<tr>
+      <td class="mono">${esc(g.id)}</td>
+      <td class="mono">${esc(g.target)}${g.sandbox === false ? ' <small class="bad">unsandboxed</small>' : ''}</td>
+      <td>${esc(g.description || '')}</td>
+      <td class="row-actions"><a class="ghost" href="/gw/${encodeURIComponent(g.id)}/" target="_blank" rel="noopener">Open</a><button type="button" class="ghost" data-remove-gateway="${esc(g.id)}">Remove</button></td>
+    </tr>`).join('') || '<tr><td colspan="4" class="hint">No gateways yet.</td></tr>';
+}
+
+$('#gateway-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const body = {
+    id: $('#gateway-id').value.trim().toLowerCase(),
+    target: $('#gateway-target').value.trim(),
+    description: $('#gateway-description').value.trim(),
+    sandbox: $('#gateway-sandbox').checked,
+  };
+  try {
+    await api('/api/auth/gateways', { method: 'POST', body: JSON.stringify(body) });
+    $('#gateway-form').reset();
+    $('#gateway-sandbox').checked = true;
+    $('#gateway-error').textContent = '';
+    toast(`Published /gw/${body.id}/`);
+    loadAdmin();
+  } catch (error) {
+    $('#gateway-error').textContent = error.message;
+  }
+});
+
+$('#access-gateways').addEventListener('click', async (event) => {
+  const id = event.target.closest?.('[data-remove-gateway]')?.dataset.removeGateway;
+  if (!id || !confirm(`Stop publishing /gw/${id}/?`)) return;
+  try {
+    await api(`/api/auth/gateways/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    loadAdmin();
+  } catch (error) {
+    toast(error.message);
+  }
 });
 
 /* ------------------------------- stats --------------------------------- */
@@ -1383,8 +1741,9 @@ async function uploadFiles(files, dir) {
       form.set('dir', dir);
       // a folder upload sends each file's path inside it, so the subtree is recreated
       for (const file of batch) form.append('files', file, file.webkitRelativePath || file.name);
-      const res = await fetch('/api/upload', { method: 'POST', headers: workspaceRequestHeaders(), body: form });
+      const res = await fetch('/api/upload', { method: 'POST', headers: { 'x-knode-csrf': '1', ...workspaceRequestHeaders() }, body: form, credentials: 'same-origin' });
       const data = await res.json().catch(() => ({}));
+      if (res.status === 401 && data.reason === 'auth') sessionEnded(data.error);
       if (!res.ok) throw new Error(data.error || res.statusText);
       saved += data.saved.length;
       toast(`uploading ${saved}/${files.length} files into ${dir}…`, 60000);

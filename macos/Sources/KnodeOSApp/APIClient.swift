@@ -5,13 +5,27 @@ struct APIError: LocalizedError {
     /// The machine-readable `reason` a route sends alongside `error`, when it
     /// sends one — a screen can then act on the cause rather than the prose.
     var reason: String?
+    var status: Int?
     var errorDescription: String? { message }
+
+    init(message: String, reason: String? = nil, status: Int? = nil) {
+        self.message = message
+        self.reason = reason
+        self.status = status
+    }
+
+    /// The session is over: expired, ended elsewhere, or the password changed.
+    var sessionEnded: Bool { status == 401 && reason == "auth" }
 }
 
 struct APIClient {
     let baseURL: URL
     let username: String
     let workspace: Workspace
+    /// The session token (`knu_…`) sent as a bearer token; nil before signing in.
+    var token: String? = nil
+    /// The shared session, or one that trusts a pinned self-signed certificate.
+    var urlSession: URLSession = .shared
 
     private var decoder: JSONDecoder {
         let decoder = JSONDecoder()
@@ -39,7 +53,18 @@ struct APIClient {
     }
 
     private func userHeaders(_ request: inout URLRequest) {
+        // the service acts for the signed-in account; the name only matters to one with sign-in off
         request.setValue(username.lowercased(), forHTTPHeaderField: "X-Knode-User")
+    }
+
+    private func authorize(_ request: inout URLRequest) {
+        if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+    }
+
+    private func failure(_ data: Data, _ http: HTTPURLResponse, fallback: String? = nil) -> APIError {
+        let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let message = payload?["error"] as? String ?? fallback ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
+        return APIError(message: message, reason: payload?["reason"] as? String, status: http.statusCode)
     }
 
     private func workspaceHeaders(_ request: inout URLRequest) {
@@ -67,15 +92,14 @@ struct APIClient {
         case .user: userHeaders(&request)
         case .workspace: workspaceHeaders(&request)
         }
+        authorize(&request)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await urlSession.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw APIError(message: "The service returned an invalid response")
         }
         guard (200..<300).contains(http.statusCode) else {
-            let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-            let message = payload?["error"] as? String ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
-            throw APIError(message: message, reason: payload?["reason"] as? String)
+            throw failure(data, http)
         }
         do {
             return try decoder.decode(T.self, from: data)
@@ -106,6 +130,87 @@ struct APIClient {
 
     func health() async throws -> ServerHealth {
         try await send("/api/health", identity: .none)
+    }
+
+    /* ------------------------------ sign-in ------------------------------ */
+
+    func authState() async throws -> AuthState {
+        try await send("/api/auth/state", identity: .none)
+    }
+
+    /// Signs in for a bearer token (`client: app`); the service never sets a cookie for it.
+    func login(username: String, password: String, label: String) async throws -> AuthSnapshot {
+        struct Body: Encodable { var username: String; var password: String; var client = "app"; var label: String }
+        return try await send("/api/auth/login", method: "POST", body: encoded(Body(username: username, password: password, label: label)), identity: .none)
+    }
+
+    /// The first account, which only a client on the service's own machine may create.
+    func setup(username: String, password: String, label: String) async throws -> AuthSnapshot {
+        struct Body: Encodable { var username: String; var password: String; var client = "app"; var label: String }
+        return try await send("/api/auth/setup", method: "POST", body: encoded(Body(username: username, password: password, label: label)), identity: .none)
+    }
+
+    func logout() async throws -> ActionResponse {
+        try await send("/api/auth/logout", method: "POST", body: Data("{}".utf8), identity: .none)
+    }
+
+    func me() async throws -> AuthSnapshot {
+        try await send("/api/auth/me", identity: .none)
+    }
+
+    /// Answers a fresh token: every other session of the account ends.
+    func changePassword(current: String, new password: String) async throws -> AuthRenewal {
+        struct Body: Encodable { var current: String; var password: String }
+        return try await send("/api/auth/password", method: "POST", body: encoded(Body(current: current, password: password)), identity: .none)
+    }
+
+    func authSessions() async throws -> [AuthSessionRow] {
+        try await send("/api/auth/sessions", identity: .none)
+    }
+
+    func endSession(id: String) async throws -> ActionResponse {
+        try await send("/api/auth/sessions/\(segment(id))", method: "DELETE", identity: .none)
+    }
+
+    func signOutOthers() async throws -> AuthRenewal {
+        try await send("/api/auth/signout-others", method: "POST", body: Data("{}".utf8), identity: .none)
+    }
+
+    func adminUsers() async throws -> AdminUsersResponse {
+        try await send("/api/auth/users", identity: .none)
+    }
+
+    func createUser(_ draft: AdminUserDraft) async throws -> AuthAccount {
+        try await send("/api/auth/users", method: "POST", body: encoded(draft), identity: .none)
+    }
+
+    func updateUser(_ username: String, _ draft: AdminUserDraft) async throws -> AuthAccount {
+        try await send("/api/auth/users/\(segment(username))", method: "PATCH", body: encoded(draft), identity: .none)
+    }
+
+    func removeUser(_ username: String) async throws -> ActionResponse {
+        try await send("/api/auth/users/\(segment(username))", method: "DELETE", identity: .none)
+    }
+
+    func signOutUser(_ username: String) async throws -> ActionResponse {
+        try await send("/api/auth/users/\(segment(username))/signout", method: "POST", body: Data("{}".utf8), identity: .none)
+    }
+
+    func gateways() async throws -> [GatewayRecord] {
+        try await send("/api/auth/gateways", identity: .none)
+    }
+
+    func addGateway(id: String, target: String, description: String, sandbox: Bool) async throws -> GatewayRecord {
+        struct Body: Encodable { var id: String; var target: String; var description: String; var sandbox: Bool }
+        return try await send("/api/auth/gateways", method: "POST", body: encoded(Body(id: id, target: target, description: description, sandbox: sandbox)), identity: .none)
+    }
+
+    func removeGateway(id: String) async throws -> ActionResponse {
+        try await send("/api/auth/gateways/\(segment(id))", method: "DELETE", identity: .none)
+    }
+
+    private func segment(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? value
     }
 
     func workspaces() async throws -> [Workspace] {
@@ -203,12 +308,11 @@ struct APIClient {
         request.httpBody = body
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         workspaceHeaders(&request)
+        authorize(&request)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-            throw APIError(message: payload?["error"] as? String ?? "Upload failed")
-        }
+        let (data, response) = try await urlSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw APIError(message: "Upload failed") }
+        guard (200..<300).contains(http.statusCode) else { throw failure(data, http, fallback: "Upload failed") }
         return try decoder.decode(UploadResponse.self, from: data)
     }
 

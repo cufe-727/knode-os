@@ -1,6 +1,9 @@
 import { serve } from '@hono/node-server';
 import fs from 'node:fs';
+import https from 'node:https';
+import type { AddressInfo } from 'node:net';
 import path from 'node:path';
+import { AuthService } from '../auth/service.js';
 import { AppContext } from '../context.js';
 import { isHiddenName } from '../fs/files.js';
 import { RAW_DOCS, RAW_SKILLS, WIKI_DIR } from '../fs/layout.js';
@@ -18,10 +21,56 @@ import { refineWiki } from '../wiki/refine.js';
 import { lintWiki } from '../wiki/lint.js';
 import { createApp, WorkspaceServices } from './app.js';
 import { loadOrCreateMcpToken, MCP_TOKEN_FILE } from './mcp-http.js';
+import { isLoopbackAddress } from './public-guard.js';
 import { startResearchLoop } from '../research/service.js';
 import { resetRunningConversations } from '../chat/store.js';
 import { McpEndpoint } from '../research/workspace.js';
 import { resolveWorkspaceScope, WorkspaceContextRegistry } from './workspaces.js';
+
+const isLoopbackHost = (host: string) => host === 'localhost' || isLoopbackAddress(host.replace(/^\[|\]$/g, ''));
+
+/**
+ * Where `serve` listens, checked before anything opens: a listener other
+ * machines can reach must speak HTTPS (`server.tls`), unless the operator has
+ * said the network encrypts by itself — they would be turned away at every
+ * request otherwise, after typing a password over plain HTTP.
+ */
+export function assertListeners(server: AppContext['config']['server']): void {
+  const insecureOk = server.auth?.allowInsecureRemote === true;
+  if (!isLoopbackHost(server.host) && !insecureOk) {
+    throw new Error(
+      `server.host is ${server.host}, which other machines can reach over plain HTTP. Keep it on 127.0.0.1 and either put a tunnel `
+      + 'in front (Cloudflare Tunnel, SSH), or add an HTTPS listener with server.tls (`knode-os tls init`). On a network that '
+      + 'encrypts by itself (a VPN) set server.auth.allowInsecureRemote: true instead.',
+    );
+  }
+  const tls = server.tls;
+  if (tls) {
+    if (!Number.isInteger(tls.port) || tls.port < 1 || tls.port > 65_535) throw new Error('server.tls.port must be a port number');
+    if (tls.port === server.port) throw new Error('server.tls.port must differ from server.port');
+    if (!tls.cert || !tls.key) throw new Error('server.tls needs cert and key (PEM files) — `knode-os tls init` makes a self-signed pair');
+  }
+  if (server.auth?.enabled === false && (tls || !isLoopbackHost(server.host))) {
+    throw new Error('sign-in is off (server.auth.enabled: false): serve must then listen on loopback only, without server.tls');
+  }
+}
+
+function readPem(root: string, file: string, label: string): Buffer {
+  const abs = path.isAbsolute(file) ? file : path.join(root, file);
+  try {
+    return fs.readFileSync(abs);
+  } catch (err) {
+    throw new Error(`server.tls.${label}: cannot read ${abs}: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/** A listener that cannot bind is fatal, and says which port: never a silent move to another one. */
+function failOnListenError(server: { on: (event: 'error', cb: (err: NodeJS.ErrnoException) => void) => unknown }, what: string): void {
+  server.on('error', (err) => {
+    console.error(`[knode-os] cannot listen on ${what}: ${err.code === 'EADDRINUSE' ? 'the port is taken by another process' : err.message}`);
+    process.exit(1);
+  });
+}
 
 /**
  * `knode-os serve` — HTTP API + web UI + the remote API, plus the background
@@ -30,9 +79,25 @@ import { resolveWorkspaceScope, WorkspaceContextRegistry } from './workspaces.js
  * (src/labeling), the duplicate audit of what it wrote and summary pages after
  * it, view reconciliation, hourly usage-stats flush to sidecars, periodic trace
  * sync, datasource re-sync, nightly dream + the tier-2 pass.
+ *
+ * Every request needs a signed-in account (src/auth) unless
+ * `server.auth.enabled` is false. The main listener is plain HTTP, for this
+ * machine and the tunnels in front of it; `server.tls` adds an HTTPS one for
+ * other machines.
  */
 export async function startServer(ctx: AppContext): Promise<void> {
   const log = (msg: string) => console.log(`[knode-os] ${msg}`);
+  assertListeners(ctx.config.server);
+  const authConfig = ctx.config.server.auth;
+  // browsers share cookies across the ports of a host: one name per port keeps a dev server from signing prod out
+  const auth = authConfig?.enabled === false ? null : new AuthService(ctx.dataDir, {
+    sessionDays: authConfig?.sessionDays,
+    allowInsecureRemote: authConfig?.allowInsecureRemote,
+    cookieName: `knode_session_${ctx.config.server.port}`,
+  });
+  const tlsOptions = ctx.config.server.tls
+    ? { cert: readPem(ctx.dataDir, ctx.config.server.tls.cert, 'cert'), key: readPem(ctx.dataDir, ctx.config.server.tls.key, 'key') }
+    : null;
   const mcpBase: { url: string | null } = { url: null };
   const mcpToken = loadOrCreateMcpToken(ctx.dataDir);
   // per-workspace background services the routes may poke (queue a job and run it now; the MCP endpoint a chat turn attaches to)
@@ -59,10 +124,10 @@ export async function startServer(ctx: AppContext): Promise<void> {
       };
     },
   });
-  const app = createApp(ctx, log, workspaceContexts, { services: (workspaceCtx) => services.get(workspaceCtx.dataDir) ?? null });
+  const app = createApp(ctx, log, workspaceContexts, { services: (workspaceCtx) => services.get(workspaceCtx.dataDir) ?? null, auth });
   const { port, host } = ctx.config.server;
 
-  serve({ fetch: app.fetch, port, hostname: host }, (info) => {
+  const main = serve({ fetch: app.fetch, port, hostname: host }, (info) => {
     log(`serving http://${host}:${info.port}  (workspace root: ${ctx.dataDir})`);
     const mcp = ctx.config.server.mcp;
     if (!mcp || mcp.enabled !== false) {
@@ -71,8 +136,30 @@ export async function startServer(ctx: AppContext): Promise<void> {
       log(`mcp endpoint ${mcpBase.url}  (bearer token: ${MCP_TOKEN_FILE}; register with \`knode-os connect <claude|codex|cursor> --http\`)`);
     }
     if (ctx.config.server.remote?.enabled !== false) log(`remote API http://${host}:${info.port}/remote/v1  (tokens: \`knode-os remote token create\`)`);
+    if (!auth) log('sign-in is OFF (server.auth.enabled: false): any local client may act as any user — for development only');
+    else if (auth.setupRequired()) {
+      log(`no accounts yet: create the administrator with \`knode-os user add <name> --admin\`, or open http://${host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host}:${info.port} on this machine`);
+    } else log(`sign-in on: ${auth.accounts.list().length} account(s) in .knode/accounts.json  (\`knode-os user list\`)`);
     autostartWorkspaces(ctx.dataDir, workspaceContexts, log);
   });
+  failOnListenError(main, `${host}:${port}`);
+
+  const tls = ctx.config.server.tls;
+  if (tls && tlsOptions) {
+    const secure = serve({ fetch: app.fetch, port: tls.port, hostname: tls.host || '0.0.0.0', createServer: https.createServer, serverOptions: tlsOptions }, (info) => {
+      const at = info as AddressInfo;
+      log(`serving https://${tls.host || '0.0.0.0'}:${at.port}  (for other machines; certificate ${tls.cert})`);
+    });
+    failOnListenError(secure, `${tls.host || '0.0.0.0'}:${tls.port} (server.tls)`);
+  }
+
+  // last-use times of sessions are written once a minute; a clean stop writes the rest
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.once(signal, () => {
+      auth?.close();
+      process.exit(0);
+    });
+  }
 }
 
 /**

@@ -2,10 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { Hono } from 'hono';
+import { Context, Hono } from 'hono';
 import { LabelingScheduler } from '../labeling/scheduler.js';
 import { LocalLabelingWorkers } from '../labeling/local.js';
 import { mountRemoteApi } from '../remote/api.js';
+import { accountMayOpenTeam } from '../auth/accounts.js';
+import { AuthEnv, authMiddleware, existingTeams, mountAuthRoutes, mountGateways } from '../auth/http.js';
+import { AuthService } from '../auth/service.js';
 import { publicGuard } from './public-guard.js';
 import { AppContext, judgeLlmClient } from '../context.js';
 import {
@@ -223,7 +226,7 @@ type AppEnv = {
   Variables: {
     workspaceContext: AppContext;
     workspaceScope: WorkspaceScope;
-  };
+  } & Partial<AuthEnv['Variables']>;
 };
 
 function mergeLlmConfig(current: LlmConfig, incoming: Partial<LlmConfig> = {}): LlmConfig {
@@ -404,12 +407,21 @@ export function createApp(
   rootCtx: AppContext,
   log: (msg: string) => void = console.log,
   workspaceContexts = new WorkspaceContextRegistry(rootCtx.dataDir, { templateConfig: rootCtx.config }),
-  opts: { services?: (ctx: AppContext) => WorkspaceServices | null } = {},
+  opts: {
+    services?: (ctx: AppContext) => WorkspaceServices | null;
+    /** Sign-in (src/auth); absent, the app trusts the workspace headers and only the remote API is reachable from outside. */
+    auth?: AuthService | null;
+  } = {},
 ) {
   const app = new Hono<AppEnv>();
-  // before anything else: from outside this machine only the token-authenticated remote API exists
-  app.use('*', publicGuard());
+  const auth = opts.auth ?? null;
+  const mcpPath = rootCtx.config.server.mcp?.path || '/mcp';
+  // before anything else: who is asking, from where, and may they
+  if (auth) app.use('*', authMiddleware(auth, { mcpPath }));
+  else app.use('*', publicGuard({ allowInsecureRemote: rootCtx.config.server.auth?.allowInsecureRemote }));
   const ingestRunning = new Set<string>();
+  /** Who the request acts for: the signed-in account, or (sign-in off) the user the client names. */
+  const requestUser = (c: Context<AppEnv>): string | undefined => (auth ? c.get('account')?.username : c.req.header('x-knode-user'));
   const servicesFor = (ctx: AppContext): WorkspaceServices | null => opts.services?.(ctx) ?? null;
 
   const err = (e: unknown) => ({ error: e instanceof Error ? e.message : String(e) });
@@ -418,14 +430,18 @@ export function createApp(
   const requestCtx = (c: { get: (key: 'workspaceContext') => AppContext }) => c.get('workspaceContext');
 
   app.use('/api/*', async (c, next) => {
-    if (c.req.path === '/api/health' || c.req.path === '/api/workspaces') return next();
+    if (c.req.path === '/api/health' || c.req.path === '/api/workspaces' || c.req.path.startsWith('/api/auth/')) return next();
     try {
       const scope = resolveWorkspaceScope({
-        user: c.req.header('x-knode-user'),
+        user: requestUser(c),
         kind: c.req.header('x-knode-workspace-kind'),
         id: c.req.header('x-knode-workspace-id'),
         name: c.req.header('x-knode-workspace-name'),
       });
+      const account = auth ? c.get('account') : undefined;
+      if (account && scope.kind === 'team' && !accountMayOpenTeam(account, scope.slug)) {
+        return c.json({ error: `your account has not been given the team "${scope.name}" — ask an administrator`, reason: 'forbidden' }, 403);
+      }
       c.set('workspaceScope', scope);
       if (scope.kind === 'personal' && !workspaceContexts.exists(scope)) {
         return c.json({ error: `workspace "${scope.name}" does not exist` }, 404);
@@ -460,13 +476,31 @@ export function createApp(
     });
   }
 
+  // sign-in, sessions, users and the gateways to local services (src/auth)
+  if (auth) {
+    mountAuthRoutes(app, auth, { teams: () => existingTeams(rootCtx.dataDir), log });
+    mountGateways(app, auth);
+  } else {
+    // the UI asks first; with sign-in off it falls back to naming a user
+    app.get('/api/auth/state', (c) => c.json({ auth: false, setupRequired: false, signedIn: false }));
+  }
+
   /* ------------------------------- system ------------------------------- */
 
-  app.get('/api/health', (c) => c.json({ ok: true, dataRoot: rootCtx.dataDir, workspaceIsolation: true }));
+  app.get('/api/health', (c) => {
+    // where the data lives is this machine's business
+    const local = c.get('client')?.local ?? true;
+    return c.json({
+      ok: true,
+      ...(local ? { dataRoot: rootCtx.dataDir } : {}),
+      workspaceIsolation: true,
+      auth: auth ? { enabled: true, setupRequired: auth.setupRequired() } : { enabled: false },
+    });
+  });
 
   app.get('/api/workspaces', (c) => {
     try {
-      const user = c.req.header('x-knode-user');
+      const user = requestUser(c);
       if (!user) return c.json({ error: 'username is required' }, 401);
       return c.json(workspaceContexts.listUserWorkspaces(user));
     } catch (e) {
@@ -476,7 +510,7 @@ export function createApp(
 
   app.post('/api/workspaces', async (c) => {
     try {
-      const user = c.req.header('x-knode-user');
+      const user = requestUser(c);
       if (!user) return c.json({ error: 'username is required' }, 401);
       const { name } = await c.req.json<{ name: string }>();
       return c.json(workspaceContexts.createUserWorkspace(user, name), 201);

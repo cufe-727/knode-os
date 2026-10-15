@@ -33,6 +33,7 @@ import { launchArgs } from './research/launch.js';
 import { loadProfile, loadProfiles, profileYaml } from './research/profile.js';
 import { runDocumentPass } from './ingest/background.js';
 import { REMOTE_SCOPES, RemoteScope, RemoteTokenStore } from './remote/tokens.js';
+import { registerAuthCommands } from './auth/cli.js';
 import { describeLinkedFolders, importFolder, refreshLinkedFolders, unlinkFolder } from './ingest/folders.js';
 import { requeueFailedExtractions } from './graph/tier1.js';
 import { sync } from './ingest/sync.js';
@@ -204,6 +205,10 @@ remoteTokens
     const record = new RemoteTokenStore(dataDir()).revoke(idOrName);
     console.log(`revoked ${record.id} (${record.name})`);
   });
+
+/* --------------------- accounts, gateways, certificate --------------------- */
+
+registerAuthCommands(program, dataDir);
 
 /* --------------------------- folders from this machine --------------------------- */
 

@@ -154,13 +154,20 @@ struct SettingsView: View {
             .labelsHidden()
             .frame(width: 148)
             .help(L("Interface language — prompts and pages keep the language they are written in"))
-            Button(L("Test stages")) { Task { await test() } }
-                .disabled(config == nil || isWorking)
-                .help(L("Sends one real request per configured stage, before you save."))
-            Button(L("Save & apply")) { Task { await save() } }
-                .buttonStyle(.borderedProminent)
-                .tint(.knodeCyan)
-                .disabled(config == nil || isWorking)
+            if model.maySaveSettings {
+                Button(L("Test stages")) { Task { await test() } }
+                    .disabled(config == nil || isWorking)
+                    .help(L("Sends one real request per configured stage, before you save."))
+                Button(L("Save & apply")) { Task { await save() } }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.knodeCyan)
+                    .disabled(config == nil || isWorking)
+            } else {
+                // the service refuses a member's changes; say so instead of offering them
+                Label(L("Read-only: settings are an administrator's"), systemImage: "lock")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -1083,6 +1090,7 @@ struct SettingsView: View {
             }
             Spacer()
             Button(L("Clear workspace"), role: .destructive) { showingClearConfirmation = true }
+                .disabled(!model.maySaveSettings)
                 .buttonStyle(.bordered)
                 .tint(.knodeBad)
                 .disabled(isWorking)

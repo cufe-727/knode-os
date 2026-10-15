@@ -29,5 +29,10 @@ reproducible build bundle after the installed app is verified. Leaving multiple
 loose `.app` bundles lets macOS list each copy as another application.
 
 The packaged app needs no separate Terminal process. Its default service URL
-is `http://127.0.0.1:9100`; the connection control in the sidebar can still be
-used for an externally managed local or remote service.
+is `http://127.0.0.1:9100`, where it starts its bundled service when nothing
+answers. The connection control in the sidebar (or **Change…** on the sign-in
+screen) points it elsewhere: another local URL, a domain or address over HTTPS
+(a self-signed certificate is shown to you to trust once), or a machine reached
+through an SSH tunnel the app keeps open itself. Every service asks you to sign
+in; the session token is kept in `~/Library/Application Support/KnodeOS/sessions.json` (0600). See
+[docs/remote-access.md](../docs/remote-access.md).

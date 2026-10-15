@@ -92,16 +92,16 @@ ssh -o ProxyCommand="cloudflared access ssh --hostname %h" -N -L 12000:127.0.0.1
 node worker/knode-worker.mjs --server http://127.0.0.1:12000 --workspace admin/finance --backends codex:2
 ```
 
-An SSH-forwarded request is local to the Mac mini, so it reaches everything a local client reaches. The remote
-API still requires a token.
+An SSH-forwarded request is local to the Mac mini. The remote API still requires a token.
 
 **Over public HTTPS.** In Cloudflare Zero Trust, add a public hostname to the Mac mini's tunnel:
 `knode-os.lemoncheese.cc` → `http://localhost:12000`. Following the service registry's rule for public
-application domains, do not put Cloudflare Access in front of it: the tokens are the authentication. Turn on
-*Always Use HTTPS*. The public boundary (`src/server/public-guard.ts`) treats a request as public when it
-names a non-loopback host or carries proxy headers (`cf-*`, `x-forwarded-*`). A public request:
-- reaches `/remote/v1` and nothing else (the UI, `/api` and `/mcp` answer 404);
-- must arrive over HTTPS.
+application domains, do not put Cloudflare Access in front of it: the server authenticates every request
+itself — per-machine tokens here, accounts for the web UI, the app and `/api`
+([remote-access.md](remote-access.md)). Turn on *Always Use HTTPS*. A request counts as coming from another
+machine when it names a non-loopback host, carries a proxy's headers (`cf-*`, `x-forwarded-*`) or arrives on a
+non-loopback connection (src/server/public-guard.ts); such a request must arrive over HTTPS, and `/mcp` does not
+answer it.
 
 ## Running a worker
 

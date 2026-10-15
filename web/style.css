@@ -90,6 +90,10 @@ body {
 .auth-switch { margin: 18px 0 0; color: var(--muted); font-size: 12px; text-align: center; }
 .auth-demo-note { margin: 18px 0 0; color: #687486; font-size: 11px; text-align: center; }
 .auth-switch + .auth-demo-note { margin-top: 9px; }
+.auth-note { margin: 0 0 16px; border: 1px solid rgba(92, 200, 255, 0.28); border-radius: 9px; background: var(--accent-soft); color: var(--fg); padding: 9px 12px; font-size: 12px; }
+.auth-note[hidden] { display: none; }
+.auth-command { margin: 0 0 14px; border: 1px solid var(--border-strong); border-radius: 9px; background: var(--bg); color: var(--accent); padding: 12px 14px; font-family: var(--mono); font-size: 13px; }
+.auth-primary:disabled { opacity: 0.6; cursor: wait; }
 .register-field-label { margin-top: 18px !important; }
 .auth-back { margin: 0 0 26px; border: 0; padding: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; }
 .auth-back:hover { color: var(--accent); }
@@ -736,3 +740,37 @@ td.mono { font-size: 12px; }
 .embedding-catalog { line-height: 1.8; overflow-wrap: anywhere; font-size: 12px; }
 .embedding-usage { overflow-x: auto; margin-top: 12px; }
 .embedding-usage > div { display: grid; grid-template-columns: minmax(180px, 1fr) 140px 220px 130px; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+
+/* account & access */
+.access-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 14px; align-items: start; }
+.access-list { display: flex; flex-direction: column; gap: 6px; }
+.access-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--bg); }
+.access-row small, .access-table small { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
+.access-row .section-badge { margin-left: 6px; }
+.access-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.access-chip { border: 1px solid var(--border); border-radius: 999px; padding: 3px 9px; color: var(--muted); font-size: 11px; }
+.access-chip.ok { border-color: rgba(95, 210, 151, 0.35); color: var(--good); }
+.access-table td { vertical-align: top; }
+.access-table tr.disabled td { opacity: 0.55; }
+.access-table .bad, .access-row .bad { color: var(--bad); }
+.row-actions { white-space: nowrap; text-align: right; }
+.row-actions > * + * { margin-left: 6px; }
+a.ghost { display: inline-block; text-decoration: none; }
+.access-inline { display: grid; grid-template-columns: 1fr 1.6fr 1.6fr auto auto; gap: 8px; align-items: center; }
+.access-inline button { border: 1px solid var(--accent); border-radius: 8px; background: var(--accent-soft); color: var(--accent); padding: 8px 14px; cursor: pointer; font-weight: 650; }
+.access-checks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 14px; margin: 0 0 12px; }
+.user-dialog { width: min(520px, calc(100vw - 32px)); }
+.team-dialog select { width: 100%; min-height: 40px; margin: 0 0 12px; border: 1px solid var(--border-strong); border-radius: 9px; background: var(--bg); color: var(--fg); padding: 8px 10px; }
+.team-dialog input:disabled, .team-dialog select:disabled { opacity: 0.5; }
+.team-dialog .check-row { margin: 0 0 6px; }
+.team-dialog input[type="checkbox"], .access-inline input[type="checkbox"] { width: auto; min-height: 0; margin: 0; padding: 0; }
+.user-dialog input:not([type="checkbox"]) { min-height: 40px; margin-bottom: 12px; }
+.dialog-label { margin: 4px 0 8px; color: var(--fg); font-size: 12px; font-weight: 600; }
+.dialog-actions .spacer { flex: 1; }
+.dialog-actions [hidden] { display: none; }
+/* members read settings but cannot change them: the server refuses, so the page does not offer */
+body[data-role="member"] #btn-cfg-save, body[data-role="member"] #btn-cfg-test, body[data-role="member"] #btn-clear-workspace { display: none; }
+@media (max-width: 900px) {
+  .access-grid { grid-template-columns: 1fr; }
+  .access-inline { grid-template-columns: 1fr; }
+}

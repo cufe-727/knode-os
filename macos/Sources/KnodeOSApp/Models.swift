@@ -22,7 +22,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .library: [.files, .search, .traces]
         case .ask: [.ask]
         case .knowledge: [.graph, .wiki, .dream]
-        case .settings: [.providers, .pipeline, .research, .chat, .workspace]
+        case .settings: [.providers, .pipeline, .research, .chat, .workspace, .access]
         }
     }
 
@@ -76,6 +76,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
     case research
     case chat
     case workspace
+    case access
 
     var id: String { rawValue }
 
@@ -94,17 +95,18 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .files, .search, .traces: .library
         case .ask: .ask
         case .graph, .wiki, .dream: .knowledge
-        case .providers, .pipeline, .research, .chat, .workspace: .settings
+        case .providers, .pipeline, .research, .chat, .workspace, .access: .settings
         }
     }
 
     /**
-     * Which screen shows this tab. Settings' five tabs share one host: keying
-     * view identity on the leaf instead would rebuild `SettingsView` on every
-     * sub-tab click, refetching the config and discarding unsaved routes.
+     * Which screen shows this tab. Settings' five config tabs share one host:
+     * keying view identity on the leaf instead would rebuild `SettingsView` on
+     * every sub-tab click, refetching the config and discarding unsaved routes.
+     * Access is a screen of its own.
      */
     var host: String {
-        section == .settings ? "settings" : rawValue
+        section == .settings && self != .access ? "settings" : rawValue
     }
 
     @MainActor var title: String {
@@ -121,6 +123,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .research: L("Research")
         case .chat: L("Ask")
         case .workspace: L("Workspace")
+        case .access: L("Access")
         }
     }
 
@@ -138,6 +141,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .research: L("How the wiki gets written")
         case .chat: L("How questions get answered")
         case .workspace: L("Clear this workspace")
+        case .access: L("Your account; users and gateways of this server")
         }
     }
 
@@ -155,6 +159,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .research: "book.and.wrench"
         case .chat: "bubble.left.and.bubble.right"
         case .workspace: "exclamationmark.triangle"
+        case .access: "person.badge.key"
         }
     }
 }
@@ -178,6 +183,10 @@ struct Workspace: Codable, Hashable, Identifiable {
 struct UserProfile: Codable, Hashable {
     var username: String
     var name: String
+    /// "admin" or "member", as the service last said; absent in sessions stored before sign-in was real.
+    var role: String?
+
+    var isAdmin: Bool { role == "admin" }
 }
 
 struct StoredSession: Codable {
@@ -186,16 +195,130 @@ struct StoredSession: Codable {
     var activeWorkspaceID: String
 }
 
-struct LocalAccount: Codable {
-    var username: String
-    var name: String
-    var passwordHash: String
-}
-
 struct ServerHealth: Decodable {
     var ok: Bool
     var dataRoot: String?
     var workspaceIsolation: Bool?
+    var auth: HealthAuth?
+
+    struct HealthAuth: Decodable {
+        var enabled: Bool
+        var setupRequired: Bool?
+    }
+}
+
+/* ------------------------------- sign-in -------------------------------- */
+
+/// An account as the service shows it (src/auth/accounts.ts), never with its password.
+struct AuthAccount: Codable, Hashable, Identifiable {
+    var username: String
+    var name: String
+    var role: String
+    var teams: [String]
+    var remoteApis: [String]
+    var gateways: [String]
+    var disabled: Bool?
+    var createdAt: String?
+    var passwordChangedAt: String?
+
+    var id: String { username }
+    var isAdmin: Bool { role == "admin" }
+}
+
+struct AuthTeam: Decodable, Hashable {
+    var id: String
+    var name: String
+    var slug: String
+}
+
+struct AuthGateway: Decodable, Hashable, Identifiable {
+    var id: String
+    var description: String
+    var path: String
+}
+
+/// Who you are signed in as and what you may use from where you are.
+struct AuthSnapshot: Decodable {
+    var account: AuthAccount
+    var local: Bool?
+    var groups: [String: Bool]?
+    var teams: [AuthTeam]?
+    var gateways: [AuthGateway]?
+    var apiGroups: [String: String]?
+    /// Only in a sign-in's answer, once.
+    var token: String?
+}
+
+/// GET /api/auth/state: what the sign-in screen needs before anyone is signed in.
+struct AuthState: Decodable {
+    var auth: Bool
+    var setupRequired: Bool?
+    var canSetup: Bool?
+    var local: Bool?
+    var minPasswordLength: Int?
+}
+
+/// A password change or "sign out others" ends every session but the one asking, which gets a new token.
+struct AuthRenewal: Decodable {
+    var ok: Bool
+    var token: String?
+}
+
+struct AuthSessionRow: Decodable, Identifiable, Hashable {
+    var id: String
+    var kind: String
+    var label: String
+    var createdAt: String
+    var lastSeenAt: String
+    var expiresAt: String
+    var ip: String?
+    var current: Bool?
+}
+
+struct AdminUser: Decodable, Identifiable, Hashable {
+    var username: String
+    var name: String
+    var role: String
+    var teams: [String]
+    var remoteApis: [String]
+    var gateways: [String]
+    var disabled: Bool?
+    var sessions: Sessions
+
+    struct Sessions: Decodable, Hashable {
+        var count: Int
+        var lastSeenAt: String?
+    }
+
+    var id: String { username }
+}
+
+struct AdminUsersResponse: Decodable {
+    var users: [AdminUser]
+    var apiGroups: [String: String]
+    var teams: [String]
+    var gateways: [String]
+}
+
+/// What the admin form sends; nil fields are left as they are.
+struct AdminUserDraft: Encodable {
+    var username: String?
+    var name: String?
+    var password: String?
+    var role: String?
+    var teams: [String]?
+    var remoteApis: [String]?
+    var gateways: [String]?
+    var disabled: Bool?
+}
+
+struct GatewayRecord: Decodable, Identifiable, Hashable {
+    var id: String
+    var target: String
+    var description: String?
+    var sandbox: Bool?
+    var passAuthorization: Bool?
+    var createdAt: String?
 }
 
 struct KnowledgeStats: Decodable, Equatable {

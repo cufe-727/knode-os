@@ -75,6 +75,7 @@ private struct MainWorkspaceView: View {
         case .wiki: WikiView()
         case .dream: DreamView()
         case .providers, .pipeline, .research, .chat, .workspace: SettingsView()
+        case .access: AccessView()
         }
     }
 
@@ -308,17 +309,25 @@ private struct AppSidebar: View {
 
 private struct ConnectionPanel: View {
     @EnvironmentObject private var model: AppModel
+    @State private var showingConnection = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(L("Knode service")).font(.headline)
-                Text(L("The app starts its bundled local service automatically. Enter another URL only when connecting to an externally managed service."))
+                Text(L("This Mac, a domain or address over HTTPS, or a machine reached through an SSH tunnel. Each asks you to sign in."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            TextField("http://127.0.0.1:9100", text: $model.serverURLString)
-                .textFieldStyle(.roundedBorder)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(ConnectionSheet.modeTitle(model.connection.mode)).font(.caption).foregroundStyle(.secondary)
+                Text(model.serverURLString).font(.callout.monospaced()).textSelection(.enabled)
+                if let account = model.account?.account {
+                    Text(L("Signed in as %@ (%@)", account.username, account.isAdmin ? L("administrator") : L("member")))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
             HStack {
                 switch model.connectionState {
                 case .checking:
@@ -336,14 +345,19 @@ private struct ConnectionPanel: View {
             }
             .font(.caption)
             HStack {
+                Button(L("Reconnect")) { Task { await model.checkConnection(startBundled: true) } }
                 Spacer()
-                Button(L("Connect")) { model.applyServerURL() }
+                Button(L("Change connection…")) { showingConnection = true }
                     .buttonStyle(.borderedProminent)
                     .tint(.knodeCyan)
             }
         }
         .padding(18)
         .frame(width: 390)
+        .sheet(isPresented: $showingConnection) {
+            ConnectionSheet(isPresented: $showingConnection)
+                .environmentObject(model)
+        }
     }
 }
 
@@ -508,6 +522,17 @@ private struct WorkspaceMenu: View {
                 showingJoinTeam = true
             } label: {
                 Label("Join another Team…", systemImage: "person.2.badge.plus")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                showingWorkspacePicker = false
+                model.select(.access)
+            } label: {
+                Label(L("Account & access…"), systemImage: "person.badge.key")
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)

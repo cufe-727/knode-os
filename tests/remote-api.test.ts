@@ -61,7 +61,8 @@ describe('the remote API', () => {
       headers.set('cf-visitor', JSON.stringify({ scheme: init.public === 'http' ? 'http' : 'https' }));
     }
     if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
-    return app.request(init.public ? `https://knode.example.com${p}` : `http://127.0.0.1:12000${p}`, { ...init, headers });
+    // cloudflared reaches serve over plain HTTP; the edge's scheme is in cf-visitor
+    return app.request(init.public ? `http://knode.example.com${p}` : `http://127.0.0.1:12000${p}`, { ...init, headers });
   };
   const ws = '/remote/v1/w/admin/finance';
 

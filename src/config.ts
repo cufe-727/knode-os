@@ -296,8 +296,8 @@ export interface ExtractionWorkerConfig {
 /**
  * The remote API (src/remote): labeling and knowledge access for other
  * machines, under /remote/v1 on the same port, authenticated by per-machine
- * tokens (`knode-os remote token create`). Requests that arrive through a
- * public hostname reach these routes and nothing else (src/server/public-guard.ts).
+ * tokens (`knode-os remote token create`). With sign-in off, requests from
+ * outside this machine reach these routes and nothing else (src/server/public-guard.ts).
  */
 export interface RemoteApiConfig {
   enabled: boolean;
@@ -305,6 +305,39 @@ export interface RemoteApiConfig {
   maxBodyBytes?: number;
   /** How long a labeling worker may hold a segment before it goes back in line (renewable). */
   leaseMinutes?: number;
+}
+
+/**
+ * Sign-in for `serve` (src/auth): accounts in `.knode/accounts.json`, made
+ * with `knode-os user add` or, on a server with none yet, from the web UI or
+ * the app on this machine. Every request to the UI's API, /gw and the app
+ * needs a session, local or not; other machines must also come over HTTPS.
+ */
+export interface AuthConfig {
+  /** Off: serve trusts the workspace headers a client sends and answers only /remote/v1 from outside — for development. */
+  enabled: boolean;
+  /** Days a browser or app session lives without use. */
+  sessionDays?: number;
+  /**
+   * Answer other machines over plain HTTP. Only on a network that encrypts by
+   * itself (a VPN such as Tailscale or WireGuard): passwords and sessions
+   * cross it in the clear otherwise.
+   */
+  allowInsecureRemote?: boolean;
+}
+
+/**
+ * A second, HTTPS listener for reaching `serve` by IP address or a name of
+ * your own: the main one stays plain HTTP on loopback, for this machine, the
+ * MCP endpoint and a tunnel in front of it.
+ */
+export interface TlsListenerConfig {
+  port: number;
+  /** Address to listen on; "0.0.0.0" or "::" for every interface. */
+  host: string;
+  /** PEM certificate (chain) and private key; relative paths are under the data root. `knode-os tls init` makes a self-signed pair. */
+  cert: string;
+  key: string;
 }
 
 /**
@@ -675,7 +708,7 @@ export interface KnodeConfig {
    * kept like `agentLlms`.
    */
   modelAgents?: ModelAgent[];
-  server: { port: number; host: string; mcp: McpServerConfig; remote?: RemoteApiConfig };
+  server: { port: number; host: string; mcp: McpServerConfig; remote?: RemoteApiConfig; auth?: AuthConfig; tls?: TlsListenerConfig | null };
   ingest: IngestConfig;
   extraction: ExtractionConfig;
   retrieval: { sag: SagSearchConfig };
@@ -761,7 +794,14 @@ export function defaultConfig(): KnodeConfig {
     // default's row on load instead.
     connections: [],
     llmUse: '',
-    server: { port: 9100, host: '127.0.0.1', mcp: { enabled: true, path: '/mcp' }, remote: { enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15 } },
+    server: {
+      port: 9100,
+      host: '127.0.0.1',
+      mcp: { enabled: true, path: '/mcp' },
+      remote: { enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15 },
+      auth: { enabled: true, sessionDays: 30, allowInsecureRemote: false },
+      tls: null,
+    },
     ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4, convertConcurrency: 2 },
     extraction: {
       claims: true,
