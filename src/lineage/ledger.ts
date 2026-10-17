@@ -66,6 +66,19 @@ export function ledgerTail(dataDir: string): { seq: number; ts: string } | null 
   return last ? { seq: last.seq, ts: last.ts } : null;
 }
 
+/**
+ * Take the ledger counter's row lock as the first statement of a scope
+ * transaction. Every scope transaction bumps the counter before it commits,
+ * so it holds that lock to the end anyway; taking it first makes scope
+ * transactions queue on it instead of deadlocking. An apply used to take it
+ * at the start and a dispose only at the end, after the entity rows its fold
+ * locked — the rows a concurrent apply's fold then waited for while holding
+ * the counter (Postgres "deadlock detected" between sync and tier-1 writes).
+ */
+export async function lockLedger(q: Queryable): Promise<void> {
+  await q.query(`SELECT 1 FROM meta WHERE key = 'ledger_seq' FOR UPDATE`);
+}
+
 /** Next ledger sequence number, allocated inside the scope transaction so DB rows and log lines agree. */
 export async function nextLedgerSeq(q: Queryable): Promise<number> {
   const [row] = await q.query<{ seq: number | string }>(

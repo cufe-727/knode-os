@@ -226,12 +226,15 @@ export async function applyDatasourceScopes(
         .update(`${schemaSha}|${description}|${JSON.stringify(samples)}`)
         .digest('hex').slice(0, 24);
 
-      await applyScope(
+      // counted per run of the body, which a transaction rolled back for a deadlock runs again
+      let locators = 0;
+      const child = await applyScope(
         store,
         { kind: 'dataset', key: `${ds.id}.${table.name}` },
         childSha,
         { parentId: parent.scope.id, actor, at: opts.at?.('dataset', `${ds.id}.${table.name}`), meta: { datasetId, sourceId: ds.id, table: table.name } },
         async (w) => {
+          locators = 0;
           await w.entity({ name: `${ds.id}.${table.name}`, type: 'dataset', description }, { extractor: 'datasource' });
           await w.relation(datasetId, sourceEntityId, { type: 'stored_in', description: `${shape.kind} lives in ${ds.kind} source ${ds.id}`, extractor: 'datasource' });
           await w.capability({
@@ -248,7 +251,6 @@ export async function applyDatasourceScopes(
             cost: ds.cost ?? 1,
             placement: 'federate',
           });
-          stats.capabilities++;
           let linked = 0;
           for (const s of samples) {
             const resolved = s.entityId ?? await resolveEntityIdByNameOrAlias(w.q, s.value);
@@ -263,7 +265,7 @@ export async function applyDatasourceScopes(
             // how to reach this entity here: bind <column> to <value>
             await w.locator(entityId, capId, s.column, s.value);
             for (const alias of s.aliases) await w.locator(entityId, capId, s.column, alias);
-            stats.locators += 1 + s.aliases.length;
+            locators += 1 + s.aliases.length;
           }
           await w.upsertDataset({
             id: datasetId,
@@ -278,6 +280,10 @@ export async function applyDatasourceScopes(
           });
         },
       );
+      if (child.outcome === 'applied') {
+        stats.capabilities++;
+        stats.locators += locators;
+      }
       stats.tables++;
       stats.linkedEntities += samples.length;
       if (samples.length) progress(`linked ${samples.length} entities from ${ds.id}.${table.name}`);

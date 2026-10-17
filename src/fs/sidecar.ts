@@ -337,6 +337,18 @@ export function removeSidecar(dataDir: string, key: string): void {
   pruneEmpty(dir, safePath(dataDir, SIDECAR_ROOT));
 }
 
+/**
+ * Whether a sidecar holds work that took model calls to make: a tier-1
+ * extraction (finished or in part), a cached source summary, or a conversion
+ * a vision model wrote (a PDF's own text layer costs nothing to redo).
+ */
+export function sidecarHoldsPaidWork(dataDir: string, key: string): boolean {
+  const dir = sidecarDir(dataDir, key);
+  if (isFile(path.join(dir, PART_FILES.tier1)) || isFile(path.join(dir, SOURCE_SUMMARY_FILE))) return true;
+  if (!isFile(path.join(dir, CONTENT_FILE))) return false;
+  return readPartFrom(dir, 'meta')?.conversion?.kind !== 'pdf-text';
+}
+
 /** Move a sidecar along with its source (`/api/mv`), so a moved PDF is not converted again. */
 export function moveSidecar(dataDir: string, fromKey: string, toKey: string): boolean {
   const src = sidecarDir(dataDir, fromKey);

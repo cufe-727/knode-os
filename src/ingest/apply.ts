@@ -196,6 +196,8 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
       meta: { documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title },
     },
     async (w) => {
+      // counted afresh on every run: a transaction rolled back for a deadlock runs the body again
+      g = { entities: 0, relations: 0 };
       await w.document(
         { id: docId, path: file, root, title, sha256: sha, mime: guessMime(file), bytes, kind: cls.kind, docDate },
         chunkRows,
@@ -243,16 +245,17 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   /* ── child scopes: human prose on a generated page, tier-1 replay ── */
   if (humanPlan) {
     const humanSha = crypto.createHash('sha256').update(cls.humanBody).digest('hex');
+    let human = { entities: 0, relations: 0 };
     await applyScope(
       store,
       { kind: 'wiki-human', key: file },
       humanSha,
       { parentId: res.scope.id, actor, at: opts.at, meta: { documentId: docId } },
       async (w) => {
-        const s = await applyWirePlan(w, page, humanPlan, { extractor: 'human' });
-        g = { entities: g.entities + s.entities, relations: g.relations + s.relations };
+        human = await applyWirePlan(w, page, humanPlan, { extractor: 'human' });
       },
     );
+    g = { entities: g.entities + human.entities, relations: g.relations + human.relations };
   }
 
   if (root === 'docs' && isSource) {
@@ -278,19 +281,20 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     }
 
     if (tier1) {
+      let lg = { entities: 0, relations: 0 };
       await applyScope(
         store,
         { kind: 'tier1', key: file },
         sha,
         { parentId: res.scope.id, actor: 'tier1', at: opts.at, meta: tier1ScopeMeta(docId, tier1) },
         async (w) => {
-          const lg = await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`, {
+          lg = await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`, {
             docDate,
             segments: tier1Segments(raw, tier1),
           });
-          g = { entities: g.entities + lg.entities, relations: g.relations + lg.relations };
         },
       );
+      g = { entities: g.entities + lg.entities, relations: g.relations + lg.relations };
     }
   }
 

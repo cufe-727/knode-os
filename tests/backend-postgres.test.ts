@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import pg from 'pg';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import type { DatabaseConfig } from '../src/config.js';
+import { applyScope, disposeScope, findLiveScope } from '../src/lineage/scope.js';
 import { schemaNameFor } from '../src/store/backend.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
@@ -89,6 +90,11 @@ async function dropAbandonedDatabases(pool: pg.Pool): Promise<void> {
     // A leftover another user owns is not ours to drop; skip it quietly.
     await pool.query(`DROP DATABASE IF EXISTS "${datname}" WITH (FORCE)`).catch(() => {});
   }
+}
+
+/** Transactions Store.tx ran again, by the warning it logs for each. */
+function retries(warn: { mock: { calls: unknown[][] } }): number {
+  return warn.mock.calls.filter(([message]) => String(message).includes('transaction rolled back')).length;
 }
 
 afterAll(async () => {
@@ -205,6 +211,64 @@ describe.skipIf(!ready)('postgres backend', () => {
     } finally {
       await a.close();
       await b.close();
+    }
+  });
+
+  it('runs a transaction again when Postgres picks it as a deadlock victim', async () => {
+    const store = await Store.open(workspaceDir(), 2048, dbConfig);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await store.exec(`CREATE TABLE deadlock_probe (id INT PRIMARY KEY, n INT NOT NULL); INSERT INTO deadlock_probe VALUES (1, 0), (2, 0);`);
+      // each transaction holds one row before either asks for the other's
+      const runs = [0, 0];
+      let holding = 0;
+      let bothHold!: () => void;
+      const crossed = new Promise<void>((resolve) => (bothHold = resolve));
+      const cross = (i: number, first: number, second: number) =>
+        store.tx(async (q) => {
+          runs[i]++;
+          await q.query(`UPDATE deadlock_probe SET n = n + 1 WHERE id = $1`, [first]);
+          if (runs[i] === 1) {
+            if (++holding === 2) bothHold();
+            await crossed;
+          }
+          await q.query(`UPDATE deadlock_probe SET n = n + 1 WHERE id = $1`, [second]);
+        });
+      await Promise.all([cross(0, 1, 2), cross(1, 2, 1)]);
+      // Postgres aborted one of them (40P01), which ran again once the other committed
+      expect([...runs].sort()).toEqual([1, 2]);
+      expect(retries(warn)).toBe(1);
+      expect(await store.query(`SELECT n FROM deadlock_probe ORDER BY id`)).toEqual([{ n: 2 }, { n: 2 }]);
+    } finally {
+      warn.mockRestore();
+      await store.close();
+    }
+  });
+
+  it('queues concurrent scope transactions on the ledger instead of deadlocking them', async () => {
+    const store = await Store.open(workspaceDir(), 2048, dbConfig);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      // documents that all name one hub entity, like a sync's re-indexes and remote tier-1 writes
+      const apply = (key: string, sha: string) =>
+        applyScope(store, { kind: 'doc', key }, sha, { actor: 'test' }, async (w) => {
+          await w.entity({ name: '宁德时代', type: 'organization' }, { extractor: 'test' });
+          await w.entity({ name: `${key} ${sha}`, type: 'concept' }, { extractor: 'test' });
+        });
+      const keys = Array.from({ length: 12 }, (_, i) => `raw/docs/${i}.md`);
+      for (const key of keys) await apply(key, 'v1');
+      const scopes = await Promise.all(keys.map((key) => findLiveScope(store, 'doc', key)));
+
+      // half of them change while the other half are removed, all at once: a
+      // dispose used to lock the hub in its fold and only then the ledger,
+      // while an apply held the ledger and waited for the hub
+      await Promise.all(keys.map((key, i) => (i % 2 ? apply(key, 'v2') : disposeScope(store, scopes[i]!.id, { actor: 'test', reason: 'removed' }))));
+      expect(retries(warn)).toBe(0);
+      expect(await store.query(`SELECT count(*)::int AS n FROM scopes WHERE status = 'active'`)).toEqual([{ n: keys.length / 2 }]);
+      expect(await store.query(`SELECT (tx_to IS NULL) AS live, evidence_count FROM entities WHERE id = '宁德时代'`)).toEqual([{ live: true, evidence_count: keys.length / 2 }]);
+    } finally {
+      warn.mockRestore();
+      await store.close();
     }
   });
 

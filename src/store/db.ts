@@ -17,6 +17,17 @@ export const VECTOR_TYPE = 'halfvec';
 /** Largest dimension pgvector will build an HNSW index for, per VECTOR_TYPE. */
 const HNSW_MAX_DIM = 4000;
 
+/** SQLSTATEs after which a transaction is simply run again: deadlock_detected, serialization_failure. */
+const RETRY_SQLSTATES = new Set(['40P01', '40001']);
+
+/** Tries a transaction gets in all before such a failure is passed on (see Store.tx). */
+export const TX_ATTEMPTS = 4;
+
+function isRetryableTxError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  return typeof code === 'string' && RETRY_SQLSTATES.has(code);
+}
+
 /**
  * DDL for the dimension-dependent embeddings table. Above HNSW_MAX_DIM the
  * index is skipped rather than failing the open — recall falls back to a
@@ -130,16 +141,37 @@ export class Store implements Queryable {
    * Run `fn` inside a transaction. The passed handle must be used for every
    * statement in the callback — PGlite holds a mutex for the transaction, so
    * calling `store.query` from inside it deadlocks.
+   *
+   * A transaction Postgres picks as a deadlock victim, or one that fails to
+   * serialize, is rolled back and run again, up to TX_ATTEMPTS times in all —
+   * so `fn` may run more than once: it keeps effects outside the database for
+   * after it returns, and starts any state it builds up afresh.
    */
   async tx<T>(fn: (q: Queryable) => Promise<T>): Promise<T> {
-    return this.db.transaction(async (tx) =>
-      fn({
-        query: async (sql, params) => (await tx.query(sql, params)).rows as never,
-        exec: async (sql) => {
-          await tx.exec(sql);
-        },
-      }),
-    );
+    for (let attempt = 1; ; attempt++) {
+      // a body that swallowed the deadlock error fails later on "current transaction is aborted": the deadlock decides
+      let conflict = false;
+      const watch = <R>(p: Promise<R>): Promise<R> =>
+        p.catch((err: unknown) => {
+          if (isRetryableTxError(err)) conflict = true;
+          throw err;
+        });
+      try {
+        return await this.db.transaction(async (tx) =>
+          fn({
+            query: async (sql, params) => (await watch(tx.query(sql, params))).rows as never,
+            exec: async (sql) => {
+              await watch(tx.exec(sql));
+            },
+          }),
+        );
+      } catch (err) {
+        if (attempt >= TX_ATTEMPTS || !(conflict || isRetryableTxError(err))) throw err;
+        console.warn(`[knode-os] transaction rolled back (${err instanceof Error ? err.message : err}); running it again, attempt ${attempt + 1} of ${TX_ATTEMPTS}`);
+        // the transaction that won holds its locks until it commits; let it
+        await new Promise((r) => setTimeout(r, attempt * (20 + Math.random() * 30)));
+      }
+    }
   }
 
   /** Legacy transaction helper; prefer `tx`. */

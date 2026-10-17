@@ -63,14 +63,13 @@ export async function purgeDisposed(store: Store, opts: { before?: string; actor
     summary.orphansRemoved.entities += res.orphansRemoved.entities;
   }
   if (opts.before) {
-    const compacted = await store.tx(async (q) => {
+    const { compacted, gc } = await store.tx(async (q) => {
       const r = await q.query<{ id: number }>(`DELETE FROM evidence WHERE tx_to IS NOT NULL AND tx_to < $1::timestamptz RETURNING id`, [opts.before]);
-      const gc = await gcOrphanRows(q);
-      summary.orphansRemoved.claims += gc.claims;
-      summary.orphansRemoved.relations += gc.relations;
-      summary.orphansRemoved.entities += gc.entities;
-      return r.length;
+      return { compacted: r.length, gc: await gcOrphanRows(q) };
     });
+    summary.orphansRemoved.claims += gc.claims;
+    summary.orphansRemoved.relations += gc.relations;
+    summary.orphansRemoved.entities += gc.entities;
     summary.evidenceCompacted = compacted;
   }
   return summary;
