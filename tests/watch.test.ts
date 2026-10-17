@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { watchTree } from '../src/fs/watch.js';
-import { isWatchedSource } from '../src/server/serve.js';
+import { coveringPrefixes, isWatchedSource } from '../src/server/serve.js';
 
 /**
  * Tree watching (src/fs/watch.ts): one handle per watched tree. chokidar held
@@ -83,5 +83,24 @@ describe('what the data-dir watcher syncs', () => {
     ]) {
       expect(isWatchedSource(rel), rel).toBe(false);
     }
+  });
+});
+
+describe('folding a burst of watcher paths into sync prefixes', () => {
+  it('keeps a few paths as they are, minus the ones another path covers', () => {
+    expect(coveringPrefixes(['wiki/x.md', 'raw/docs/a/1.md', 'raw/docs/a', 'purpose.md'], 200)).toEqual(['purpose.md', 'raw/docs/a', 'wiki/x.md']);
+  });
+
+  it('syncs the folder a mirror was copied into or removed from, never the whole data dir', () => {
+    // 1,899 files of one account across seven years, the way unlinking the tgb mirror reported them
+    const files = Array.from({ length: 1899 }, (_, i) => `raw/docs/content-markdown/tgb/股海贼王__16cb02614da0/${2020 + (i % 7)}/${i}.md`);
+    expect(coveringPrefixes(files, 200)).toEqual(Array.from({ length: 7 }, (_, i) => `raw/docs/content-markdown/tgb/股海贼王__16cb02614da0/${2020 + i}`));
+    expect(coveringPrefixes(files, 1)).toEqual(['raw/docs/content-markdown/tgb/股海贼王__16cb02614da0']);
+  });
+
+  it('lifts nothing above its tree, and leaves the anchor files alone', () => {
+    const spread = [...Array.from({ length: 300 }, (_, i) => `raw/docs/d${i}.md`), ...Array.from({ length: 300 }, (_, i) => `wiki/p${i}.md`), 'schema.md'];
+    expect(coveringPrefixes(spread, 10)).toEqual(['raw/docs', 'schema.md', 'wiki']);
+    expect(coveringPrefixes(spread, 1)).toEqual(['raw/docs', 'schema.md', 'wiki']);
   });
 });

@@ -109,6 +109,46 @@ export function linkOwning(links: LinkedFolder[], rel: string): LinkedFolder | n
   return links.find((l) => clean === l.dest || clean.startsWith(`${l.dest}/`)) ?? null;
 }
 
+/**
+ * Destinations an import or an unlink is writing right now, per data dir, with
+ * the time their claim lapses (Infinity while the operation runs). Each such
+ * operation syncs the keys it writes itself; the claim outlives it by a few
+ * seconds because a filesystem watcher reports late.
+ */
+const inFlight = new Map<string, Map<string, number>>();
+const SETTLE_MS = 10_000;
+
+function holdDest(dataDir: string, dest: string): () => void {
+  const held = inFlight.get(dataDir) ?? new Map<string, number>();
+  inFlight.set(dataDir, held);
+  held.set(dest, Infinity);
+  return () => held.set(dest, Date.now() + SETTLE_MS);
+}
+
+/**
+ * True when a change at `rel` is already being synced by the folder machinery,
+ * so a watcher on the data dir must leave it alone: a linked folder's mirror
+ * (its own watcher and reconcile sync it) or a destination an import or unlink
+ * is writing. Without this, every link, import and unlink of a large folder
+ * also set off a second sync of everything it touched.
+ */
+export function syncedByFolders(dataDir: string, config: KnodeConfig, rel: string): boolean {
+  const clean = rel.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  if (linkOwning(linkedFolders(config), clean)) return true;
+  const held = inFlight.get(dataDir);
+  if (!held) return false;
+  const now = Date.now();
+  let owned = false;
+  for (const [dest, until] of held) {
+    if (until < now) {
+      held.delete(dest);
+      continue;
+    }
+    if (clean === dest || clean.startsWith(`${dest}/`)) owned = true;
+  }
+  return owned;
+}
+
 /** Links whose mirror sits inside `rel` — moving or deleting `rel` would take their mirror along. */
 export function linksUnder(links: LinkedFolder[], rel: string): LinkedFolder[] {
   const clean = rel.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
@@ -364,13 +404,18 @@ export async function importFolder(ctx: FolderContext, source: string, opts: Imp
 
   const progress = opts.onProgress ?? (() => {});
   progress(`${opts.mode === 'link' ? 'linking' : 'importing'} ${src} → ${dest}`);
-  const mirrored = mirrorFolder(ctx.dataDir, src, dest, { prune: exists });
-  progress(`${opts.mode}: ${mirrored.copied.length} copied, ${mirrored.removed.length} removed, ${mirrored.unchanged} unchanged${mirrored.tooLarge ? `, ${mirrored.tooLarge} above the index limit` : ''}`);
-  if (opts.mode === 'link') {
-    persistLinks(ctx, [...links, { source: src, dest, createdAt: new Date().toISOString() }]);
+  const release = holdDest(ctx.dataDir, dest);
+  try {
+    const mirrored = mirrorFolder(ctx.dataDir, src, dest, { prune: exists });
+    progress(`${opts.mode}: ${mirrored.copied.length} copied, ${mirrored.removed.length} removed, ${mirrored.unchanged} unchanged${mirrored.tooLarge ? `, ${mirrored.tooLarge} above the index limit` : ''}`);
+    if (opts.mode === 'link') {
+      persistLinks(ctx, [...links, { source: src, dest, createdAt: new Date().toISOString() }]);
+    }
+    const stats = await sync(ctx, { only: [dest], llmGraph: opts.llmGraph, onProgress: opts.onProgress });
+    return { ...mirrored, source: src, dest, mode: opts.mode, sync: stats };
+  } finally {
+    release();
   }
-  const stats = await sync(ctx, { only: [dest], llmGraph: opts.llmGraph, onProgress: opts.onProgress });
-  return { ...mirrored, source: src, dest, mode: opts.mode, sync: stats };
 }
 
 export interface RefreshResult extends MirrorResult {
@@ -422,11 +467,21 @@ export async function unlinkFolder(ctx: FolderContext, dest: string, opts: { rem
   const links = linkedFolders(ctx.config);
   const link = links.find((l) => l.dest === dest);
   if (!link) throw new Error(`no linked folder at ${dest}`);
-  persistLinks(ctx, links.filter((l) => l !== link));
-  if (!opts.removeFiles) return { dest, removedFiles: false, sync: null };
-  fs.rmSync(safePath(ctx.dataDir, dest), { recursive: true, force: true });
-  const stats = await sync(ctx, { only: [dest], onProgress: opts.onProgress });
-  return { dest, removedFiles: true, sync: stats };
+  if (!opts.removeFiles) {
+    persistLinks(ctx, links.filter((l) => l !== link));
+    return { dest, removedFiles: false, sync: null };
+  }
+  // held before the link is forgotten: from then on the mirror is no longer
+  // the link's, and its removal is synced right here
+  const release = holdDest(ctx.dataDir, dest);
+  try {
+    persistLinks(ctx, links.filter((l) => l !== link));
+    fs.rmSync(safePath(ctx.dataDir, dest), { recursive: true, force: true });
+    const stats = await sync(ctx, { only: [dest], onProgress: opts.onProgress });
+    return { dest, removedFiles: true, sync: stats };
+  } finally {
+    release();
+  }
 }
 
 export interface LinkedFolderStatus extends LinkedFolder {

@@ -809,6 +809,18 @@ CREATE OR REPLACE VIEW v_claim_links AS
   FROM claim_links l WHERE l.tx_to IS NULL;
 `;
 
+// Indexes a source's disposal leaned on without having them. Deleting a
+// document's chunks sets claims.chunk_id to NULL through its foreign key, which
+// without an index scanned every claim once per chunk; an entity's delete does
+// the same to claims.object_id, a scope's purge to pages.scope_id; and every
+// fold of an entity looks up the entities merged into it by canonical_id.
+const V12_DISPOSE_INDEXES = `
+CREATE INDEX IF NOT EXISTS claims_chunk_idx ON claims (chunk_id) WHERE chunk_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS claims_object_idx ON claims (object_id) WHERE object_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS pages_scope_idx ON pages (scope_id) WHERE scope_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS entities_canonical_idx ON entities (canonical_id) WHERE canonical_id IS NOT NULL;
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -838,6 +850,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 9, name: 'chat', up: async (q) => execScript(q, V9_CHAT) },
   { version: 10, name: 'chat-quick', up: async (q) => execScript(q, V10_CHAT_QUICK) },
   { version: 11, name: 'claim-merge', up: async (q) => execScript(q, V11_CLAIM_MERGE) },
+  { version: 12, name: 'dispose-indexes', up: async (q) => execScript(q, V12_DISPOSE_INDEXES) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

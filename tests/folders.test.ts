@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { loadConfig } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
@@ -16,6 +16,7 @@ import {
   planFolderImport,
   refreshLinkedFolders,
   resolveImportSource,
+  syncedByFolders,
   unlinkFolder,
 } from '../src/ingest/folders.js';
 import { rawDocsUnder } from '../src/ingest/prepare.js';
@@ -456,5 +457,60 @@ describe('the linked-folder service', () => {
     expect(await findLiveScope(ctx.store, 'doc', 'raw/docs/again/tgb/2026-11.md')).not.toBeNull();
     expect(driven.status()[0].lastChange).toMatchObject({ copied: 1 });
     await driven.stop();
+  });
+});
+
+describe('what the folder machinery syncs by itself', () => {
+  const data = path.join(tmp, 'owned-data');
+  const source = path.join(tmp, 'owned-source');
+  let ctx: AppContext;
+  beforeAll(async () => {
+    makeExport(source);
+    ctx = await createContext(data);
+  });
+  afterAll(async () => {
+    vi.useRealTimers();
+    await ctx.store.close();
+  });
+  const owned = (rel: string) => syncedByFolders(ctx.dataDir, ctx.config, rel);
+  const later = (ms: number) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + ms);
+  };
+
+  it('claims an import while it writes and syncs, and for a moment after; never the folders around it', async () => {
+    const key = 'raw/docs/owned/xueqiu/2026-09.md';
+    expect(owned(key)).toBe(false);
+    const during: boolean[] = [];
+    await importFolder(ctx, source, { mode: 'copy', dest: 'owned', onProgress: () => during.push(owned(key)) });
+    expect(during).toContain(true);
+    // the watcher's events arrive late: still the import's
+    expect(owned(key)).toBe(true);
+    expect(owned('raw/docs/owned')).toBe(true);
+    expect(owned('raw/docs/owned-too/a.md')).toBe(false);
+    expect(owned('raw/docs')).toBe(false);
+    expect(owned('raw/docs/notes.md')).toBe(false);
+    later(11_000);
+    // a copy is ordinary content once the claim lapses
+    expect(owned(key)).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it('leaves a linked mirror to its link for as long as it is linked, and an unlink with its files to the unlink', async () => {
+    const key = 'raw/docs/followed/xueqiu/2026-09.md';
+    await importFolder(ctx, source, { mode: 'link', dest: 'followed' });
+    later(60_000);
+    expect(owned(key)).toBe(true);
+    vi.useRealTimers();
+
+    await unlinkFolder(ctx, 'raw/docs/followed', { removeFiles: true });
+    expect(linkedFolders(ctx.config)).toEqual([]);
+    expect(fs.existsSync(path.join(ctx.dataDir, 'raw/docs/followed'))).toBe(false);
+    // the removal was synced by the unlink itself
+    expect(await findLiveScope(ctx.store, 'doc', key)).toBeNull();
+    expect(owned(key)).toBe(true);
+    later(11_000);
+    expect(owned(key)).toBe(false);
+    vi.useRealTimers();
   });
 });

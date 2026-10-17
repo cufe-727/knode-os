@@ -46,18 +46,18 @@ export async function foldTouched(q: Queryable, touched: TouchedSet, txTime: str
 
   await foldEntities(q, [...touched.entities], txTime, result, opts.typePrecedence);
 
-  // liveness flips cascade to the edges and claims that hang off the entity
-  const flipped = [...result.tombstoned.entities, ...result.reopened.entities];
-  if (flipped.length > 0) {
-    const p = new Params();
-    const ph = flipped.map((id) => p.add(id)).join(',');
-    const rels = await q.query<{ id: string }>(`SELECT id FROM relations WHERE source_id IN (${ph}) OR target_id IN (${ph})`, p.list);
-    for (const r of rels) relationIds.add(r.id);
-    const p2 = new Params();
-    const ph2 = flipped.map((id) => p2.add(id)).join(',');
-    const cls = await q.query<{ id: string }>(`SELECT id FROM claims WHERE subject_id IN (${ph2})`, p2.list);
-    for (const c of cls) claimIds.add(c.id);
-  }
+  // liveness flips cascade to the edges and claims that hang off the entity.
+  // A tombstone can only end the live ones: an edge or claim that is already
+  // gone stays gone, and a hub entity collects tens of thousands of those.
+  const tombstoned = [...result.tombstoned.entities];
+  const reopened = [...result.reopened.entities];
+  const attached = async (ids: string[], live: boolean) => {
+    const only = live ? ' AND tx_to IS NULL' : '';
+    for (const r of await selectIn<{ id: string }>(q, ids, (ph) => `SELECT id FROM relations WHERE (source_id IN (${ph}) OR target_id IN (${ph}))${only}`)) relationIds.add(r.id);
+    for (const c of await selectIn<{ id: string }>(q, ids, (ph) => `SELECT id FROM claims WHERE subject_id IN (${ph})${only}`)) claimIds.add(c.id);
+  };
+  await attached(tombstoned, true);
+  await attached(reopened, false);
 
   await foldRelations(q, [...relationIds], txTime, result);
   await foldClaims(q, [...claimIds], txTime, result);
@@ -71,14 +71,32 @@ function sha16(value: unknown): string {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16);
 }
 
+/**
+ * Ids bound per IN list. Postgres takes at most 65,535 parameters in one
+ * statement, and the edges of a single hub entity can number more.
+ */
+export const IN_BATCH = 5000;
+
+/** Run `sql(placeholders)` over `ids` in slices that fit one statement, and return the rows of every slice. */
+async function selectIn<T>(q: Queryable, ids: readonly string[], sql: (ph: string) => string, lead: unknown[] = []): Promise<T[]> {
+  const rows: T[] = [];
+  for (let i = 0; i < ids.length; i += IN_BATCH) {
+    const p = new Params(lead);
+    const ph = ids.slice(i, i + IN_BATCH).map((id) => p.add(id)).join(',');
+    // a slice of hub edges can return more rows than a spread may pass as arguments
+    for (const row of await q.query<T>(sql(ph), p.list)) rows.push(row);
+  }
+  return rows;
+}
+
 async function liveEvidence(q: Queryable, kind: string, ids: string[]): Promise<Map<string, EvidenceAtRow[]>> {
   if (ids.length === 0) return new Map();
-  const p = new Params([kind]);
-  const ph = ids.map((id) => p.add(id)).join(',');
-  const rows = await q.query<EvidenceAtRow>(
-    `SELECT kind, target_id, scope_id, segment_id, weight, extractor, attrs, tx_from
+  const rows = await selectIn<EvidenceAtRow>(
+    q,
+    ids,
+    (ph) => `SELECT kind, target_id, scope_id, segment_id, weight, extractor, attrs, tx_from
      FROM evidence WHERE kind = $1 AND target_id IN (${ph}) AND tx_to IS NULL`,
-    p.list,
+    [kind],
   );
   return groupBy(rows, (r) => r.target_id);
 }
@@ -86,19 +104,16 @@ async function liveEvidence(q: Queryable, kind: string, ids: string[]): Promise<
 async function foldEntities(q: Queryable, ids: string[], txTime: string, result: FoldResult, precedence?: readonly string[]): Promise<void> {
   if (ids.length === 0) return;
   const evidence = await liveEvidence(q, 'entity', ids);
-  const p = new Params();
-  const ph = ids.map((id) => p.add(id)).join(',');
-  const mentionRows = await q.query<{ entity_id: string; n: number }>(
-    `SELECT entity_id, count(DISTINCT chunk_id)::int AS n FROM entity_mentions WHERE entity_id IN (${ph}) GROUP BY entity_id`,
-    p.list,
+  const mentionRows = await selectIn<{ entity_id: string; n: number }>(
+    q,
+    ids,
+    (ph) => `SELECT entity_id, count(DISTINCT chunk_id)::int AS n FROM entity_mentions WHERE entity_id IN (${ph}) GROUP BY entity_id`,
   );
   const mentions = new Map(mentionRows.map((r) => [r.entity_id, r.n]));
-  const p2 = new Params();
-  const ph2 = ids.map((id) => p2.add(id)).join(',');
-  const current = await q.query<{
+  const current = await selectIn<{
     id: string; name: string; type: string; description: string; aliases: string[];
     mention_count: number; evidence_count: number; fold_sha: string; tx_to: string | null;
-  }>(`SELECT id, name, type, description, aliases, mention_count, evidence_count, fold_sha, tx_to FROM entities WHERE id IN (${ph2})`, p2.list);
+  }>(q, ids, (ph) => `SELECT id, name, type, description, aliases, mention_count, evidence_count, fold_sha, tx_to FROM entities WHERE id IN (${ph})`);
 
   for (const cur of current) {
     const rows = evidence.get(cur.id) ?? [];
@@ -159,9 +174,7 @@ async function refreshEntityKeys(q: Queryable, id: string, name: string, aliases
 async function entityLiveness(q: Queryable, ids: string[]): Promise<Map<string, boolean>> {
   const out = new Map<string, boolean>();
   if (ids.length === 0) return out;
-  const p = new Params();
-  const ph = ids.map((id) => p.add(id)).join(',');
-  const rows = await q.query<{ id: string; tx_to: string | null }>(`SELECT id, tx_to FROM entities WHERE id IN (${ph})`, p.list);
+  const rows = await selectIn<{ id: string; tx_to: string | null }>(q, ids, (ph) => `SELECT id, tx_to FROM entities WHERE id IN (${ph})`);
   for (const r of rows) out.set(r.id, r.tx_to === null);
   return out;
 }
@@ -169,12 +182,10 @@ async function entityLiveness(q: Queryable, ids: string[]): Promise<Map<string, 
 async function foldRelations(q: Queryable, ids: string[], txTime: string, result: FoldResult): Promise<void> {
   if (ids.length === 0) return;
   const evidence = await liveEvidence(q, 'relation', ids);
-  const p = new Params();
-  const ph = ids.map((id) => p.add(id)).join(',');
-  const current = await q.query<{
+  const current = await selectIn<{
     id: string; source_id: string; target_id: string; type: string; description: string; weight: number;
     evidence_count: number; fold_sha: string; tx_to: string | null;
-  }>(`SELECT id, source_id, target_id, type, description, weight, evidence_count, fold_sha, tx_to FROM relations WHERE id IN (${ph})`, p.list);
+  }>(q, ids, (ph) => `SELECT id, source_id, target_id, type, description, weight, evidence_count, fold_sha, tx_to FROM relations WHERE id IN (${ph})`);
   const endpoints = [...new Set(current.flatMap((r) => [r.source_id, r.target_id]))];
   const alive = await entityLiveness(q, endpoints);
 
@@ -208,21 +219,16 @@ async function foldClaims(q: Queryable, touchedIds: string[], txTime: string, re
   if (touchedIds.length === 0) return;
   // a merged claim's representative folds over the whole group (docs/design/10),
   // so touching a member refolds its representative as well
-  const p0 = new Params();
-  const ph0 = touchedIds.map((id) => p0.add(id)).join(',');
-  const reps = await q.query<{ canonical_id: string }>(
-    `SELECT DISTINCT canonical_id FROM claims WHERE id IN (${ph0}) AND canonical_id IS NOT NULL`,
-    p0.list,
+  const reps = await selectIn<{ canonical_id: string }>(
+    q,
+    touchedIds,
+    (ph) => `SELECT DISTINCT canonical_id FROM claims WHERE id IN (${ph}) AND canonical_id IS NOT NULL`,
   );
   const ids = [...new Set([...touchedIds, ...reps.map((r) => r.canonical_id)])];
-  const p = new Params();
-  const ph = ids.map((id) => p.add(id)).join(',');
-  const current = await q.query<{
+  const current = await selectIn<{
     id: string; subject_id: string; statement: string; fold_sha: string; tx_to: string | null; canonical_id: string | null;
-  }>(`SELECT id, subject_id, statement, fold_sha, tx_to, canonical_id FROM claims WHERE id IN (${ph})`, p.list);
-  const p2 = new Params();
-  const ph2 = ids.map((id) => p2.add(id)).join(',');
-  const memberRows = await q.query<{ id: string; canonical_id: string }>(`SELECT id, canonical_id FROM claims WHERE canonical_id IN (${ph2})`, p2.list);
+  }>(q, ids, (ph) => `SELECT id, subject_id, statement, fold_sha, tx_to, canonical_id FROM claims WHERE id IN (${ph})`);
+  const memberRows = await selectIn<{ id: string; canonical_id: string }>(q, ids, (ph) => `SELECT id, canonical_id FROM claims WHERE canonical_id IN (${ph})`);
   const members = groupBy(memberRows, (m) => m.canonical_id);
   const evidence = await liveEvidence(q, 'claim', [...new Set([...ids, ...memberRows.map((m) => m.id)])]);
   const alive = await entityLiveness(q, [...new Set(current.map((c) => c.subject_id))]);

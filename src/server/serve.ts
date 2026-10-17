@@ -13,7 +13,7 @@ import { startFollowUp } from '../labeling/followup.js';
 import { LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
 import { LabelingScheduler } from '../labeling/scheduler.js';
-import { LinkedFolders } from '../ingest/folders.js';
+import { LinkedFolders, syncedByFolders } from '../ingest/folders.js';
 import { sync } from '../ingest/sync.js';
 import { flushUsageToSidecars } from '../stats/heat.js';
 import { syncTraces } from '../traces/sync.js';
@@ -212,10 +212,37 @@ function autostartWorkspaces(root: string, registry: WorkspaceContextRegistry, l
   }
 }
 
-const WATCH_FULL_SYNC_THRESHOLD = 200;
+/** Prefixes one watcher-triggered sync names at most; more paths are folded into their folders. */
+const WATCH_SCOPE_MAX = 200;
 
 const WATCHED_TREES = [RAW_DOCS, RAW_SKILLS, WIKI_DIR];
 const WATCHED_FILES = new Set(['purpose.md', 'schema.md']);
+
+/**
+ * At most `max` sync prefixes that cover every path a watcher reported: while
+ * there are too many, the deepest ones are replaced by their folder. A burst
+ * of changes under one folder (a copy, an export rewriting a tree) then syncs
+ * that folder instead of the whole data dir. Nothing is lifted above the tree
+ * it belongs to (raw/docs, raw/skills, wiki), and an anchor file stays itself.
+ */
+export function coveringPrefixes(paths: Iterable<string>, max: number): string[] {
+  const floorOf = (p: string) => WATCHED_TREES.find((t) => p === t || p.startsWith(`${t}/`)) ?? p;
+  const depth = (p: string) => p.split('/').length;
+  // a path below another one in the set is covered by it already
+  const covered = (set: Set<string>) =>
+    new Set([...set].filter((p) => {
+      for (let up = path.posix.dirname(p); up !== '.' && up !== '/'; up = path.posix.dirname(up)) if (set.has(up)) return false;
+      return true;
+    }));
+  let set = covered(new Set(paths));
+  while (set.size > max) {
+    const liftable = [...set].filter((p) => p !== floorOf(p));
+    if (liftable.length === 0) break;
+    const deepest = liftable.reduce((d, p) => Math.max(d, depth(p)), 0);
+    set = covered(new Set([...set].map((p) => (p !== floorOf(p) && depth(p) === deepest ? path.posix.dirname(p) : p))));
+  }
+  return [...set].sort();
+}
 
 /**
  * What the data-dir watcher syncs: raw/docs, raw/skills, wiki and the two
@@ -359,17 +386,13 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       const rel = path.relative(ctx.dataDir, absPath).split(path.sep).join('/');
       // an event naming no path (the data dir itself) is no source
       if (!rel) return;
-      // a directory that came is synced whole; a path that is gone — a file or
-      // a directory — is a prefix the scoped sync disposes everything under
-      let isDir = false;
-      try {
-        isDir = fs.statSync(absPath).isDirectory();
-      } catch {
-        isDir = false;
-      }
-      if (isDir || rel.startsWith('..')) fullSync = true;
+      // a linked mirror, or a folder an import / unlink is writing, is synced
+      // by that machinery itself (src/ingest/folders.ts)
+      if (!rel.startsWith('..') && syncedByFolders(ctx.dataDir, ctx.config, rel)) return;
+      // every path is a prefix: a directory that came is synced whole, a path
+      // that is gone — a file or a directory — disposes everything under it
+      if (rel.startsWith('..')) fullSync = true;
       else pending.add(rel);
-      if (pending.size > WATCH_FULL_SYNC_THRESHOLD) fullSync = true;
       if (watchTimer) clearTimeout(watchTimer);
       watchTimer = setTimeout(() => {
         if (disposed) return;
@@ -378,7 +401,8 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
           return;
         }
         running = true;
-        const only = fullSync ? undefined : [...pending];
+        // a burst under one folder syncs that folder, never the whole data dir
+        const only = fullSync ? undefined : coveringPrefixes(pending, WATCH_SCOPE_MAX);
         pending.clear();
         fullSync = false;
         void track((async () => {
