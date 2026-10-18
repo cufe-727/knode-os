@@ -18,7 +18,7 @@ import {
 } from '../src/config.js';
 import { cliCommand, readCursorStream, resolveExecutable } from '../src/llm/cli.js';
 import { parseClaudeAliases, parseCodexCatalog, parseCodexDefaults } from '../src/llm/models.js';
-import { clearModelCache } from '../src/llm/model-cache.js';
+import { clearModelCache, listModelsCached } from '../src/llm/model-cache.js';
 import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 
@@ -146,6 +146,22 @@ describe('the model list cache', () => {
     const both = await Promise.all([models(missing('/nope/claude')), models(missing('/nope/claude'))]);
     const stamps = await Promise.all(both.map(async (r) => ((await r.json()) as { cachedAt: string }).cachedAt));
     expect(stamps[0]).toBe(stamps[1]);
+  });
+
+  it('stamps that answer once, however late each ask resumes', async () => {
+    clearModelCache();
+    // A clock that moves on with every read: what a loaded machine does to two
+    // asks resuming one after the other, made certain rather than occasional.
+    // Called directly, not through the route, so the second ask is sure to
+    // join the first one's fetch instead of finding its entry.
+    let now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now++);
+    try {
+      const cfg = { ...defaultConfig().llm, provider: 'claude-cli' as const, cliPath: '/nope/claude' };
+      const [first, second] = await Promise.all([listModelsCached('chat', cfg), listModelsCached('chat', cfg)]);
+      expect(second.cachedAt).toBe(first.cachedAt);
+      expect([first.cached, second.cached]).toEqual([false, false]);
+    } finally { clock.mockRestore(); }
   });
 });
 
