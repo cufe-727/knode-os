@@ -133,4 +133,46 @@ describe('replacing a scope keeps the document projection', () => {
       await ctx.store.close();
     }
   });
+
+  it('a forced re-apply of a document with a live tier-1 child keeps every vector and asks for none', async () => {
+    const dataDir = path.join(tmp, 'reapply');
+    initDataDir(dataDir);
+    const file = 'raw/docs/long.md';
+    write(dataDir, file, `# Long\n\n宁德时代。\n\n${Array.from({ length: 5 }, (_, i) => para(i)).join('\n\n')}\n`);
+    const ctx = await createContext(dataDir);
+    const counting = new CountingEmbedder(ctx.embedder);
+    ctx.embedder = counting;
+    try {
+      await sync(ctx, { llmGraph: false });
+      const meta = readSidecarPart(dataDir, file, 'meta')!;
+      updateSidecarPart(dataDir, file, 'tier1', () => tier1Part(meta.contentSha256, '2026-10-18T00:00:00.000Z'));
+      await sync(ctx, { llmGraph: false });
+      const doc = (await findLiveScope(ctx.store, 'doc', file))!;
+      const child = (await findLiveScope(ctx.store, 'tier1', file))!;
+      const chunks = await count(ctx.store, 'chunks');
+      expect(await count(ctx.store, 'embeddings')).toBe(chunks);
+
+      // the production case: unchanged content, a finished tier-1 in the sidecar,
+      // the CLI deferring vectors to the server (`knode-os sync --reapply`)
+      counting.texts = 0;
+      const stats = await sync({ ...ctx, embeddings: { kick() {} } }, { llmGraph: false, reapply: true, only: [file] });
+      expect(stats.applied).toBe(1);
+      expect(counting.texts).toBe(0);
+      expect(await count(ctx.store, 'chunks')).toBe(chunks);
+      expect(await count(ctx.store, 'embeddings')).toBe(chunks);
+      const [row] = await ctx.store.query<{ status: string }>(`SELECT status FROM documents WHERE path = $1`, [file]);
+      expect(row.status).toBe('indexed');
+
+      // the scope and its tier-1 child were replaced, and nothing of the old pair is still live
+      const doc2 = (await findLiveScope(ctx.store, 'doc', file))!;
+      const child2 = (await findLiveScope(ctx.store, 'tier1', file))!;
+      expect(doc2.id).not.toBe(doc.id);
+      expect(child2.id).not.toBe(child.id);
+      expect(child2.parent_id).toBe(doc2.id);
+      expect(await count(ctx.store, `evidence WHERE scope_id IN ('${doc.id}', '${child.id}') AND tx_to IS NULL`)).toBe(0);
+      expect(await count(ctx.store, `extraction_queue`)).toBe(0);
+    } finally {
+      await ctx.store.close();
+    }
+  });
 });
