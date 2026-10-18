@@ -52,8 +52,9 @@ import { PageContext } from './store.js';
  *      the text length, and terms the stop list names — built-in, edited by a
  *      person, or learned from the corpus's own text (learnFrequentTerms,
  *      src/graph/concept-stoplist.ts) — are dropped. The survivors become
- *      `concept` placeholders with `tier0.concept` evidence and weak co_occurs
- *      edges.
+ *      `concept` placeholders with `tier0.concept` evidence; their co-occurrence
+ *      with the document's other entities is derived from the mentions on read
+ *      (cooccur.ts), never stored as edges.
  *
  * Placeholders are provisional: once tier-1 has read the document, the ones
  * that did not resolve to a typed entity are retired (retireTier0Placeholders)
@@ -697,11 +698,11 @@ export async function wireLinks(w: ScopeWriter, page: PageContext, links: LinkPl
 }
 
 /**
- * Persist the mined terms as placeholders: concept entities, chunk mentions,
- * weak co_occurs edges. `leading` (the document's linked entities) joins the
- * co-occurrence so typed entities and placeholders of one document connect.
+ * Persist the mined terms as placeholders: concept entities and chunk
+ * mentions. Their co-occurrence with the document's other entities is derived
+ * from the mentions on read (cooccur.ts), not written as edges.
  */
-export async function wireConcepts(w: ScopeWriter, page: PageContext, concepts: string[], leading: string[] = []): Promise<{ entities: number; relations: number }> {
+export async function wireConcepts(w: ScopeWriter, page: PageContext, concepts: string[]): Promise<{ entities: number }> {
   const ids: string[] = [];
   for (const term of concepts) {
     const needle = term.toLowerCase();
@@ -711,9 +712,7 @@ export async function wireConcepts(w: ScopeWriter, page: PageContext, concepts: 
     for (const h of hits.slice(0, MENTIONS_PER_ENTITY)) await w.mention(id, h.id, page.documentId);
     if (hits.length === 0 && page.chunkIds[0]) await w.mention(id, page.chunkIds[0].id, page.documentId);
   }
-  const unique = [...new Set(ids)];
-  const relations = await w.coOccurrence([...new Set([...leading, ...unique])], { weight: 0.1, window: 6, extractor: CONCEPT_EXTRACTOR });
-  return { entities: unique.length, relations };
+  return { entities: new Set(ids).size };
 }
 
 /* ───────────────────────────── retirement ───────────────────────────── */
@@ -722,18 +721,18 @@ export async function wireConcepts(w: ScopeWriter, page: PageContext, concepts: 
  * Once tier-1 has read a document, its tier-0 placeholders have done their
  * job: the `tier0.concept` evidence this document scope wrote for terms that
  * are still untyped — not resolved onto a typed entity, not merged into one —
- * is closed, along with the co_occurs evidence that touched them and their
- * mentions, and the touched rows are folded (a placeholder with no other
+ * is closed along with their mentions (which is what their co-occurrence was
+ * derived from), and the touched rows are folded (a placeholder with no other
  * support tombstones). Evidence for terms tier-1 typed stays: it is this
  * document's support for a real entity. The sidecar's tier0.json is not
  * touched, so a history rebuild still replays the mined list.
  *
  * Idempotent; run after every tier-1 scope apply (src/graph/tier1.ts).
  */
-export async function retireTier0Placeholders(store: Store, docScopeId: string, opts: { at?: string } = {}): Promise<{ entities: number; relations: number }> {
+export async function retireTier0Placeholders(store: Store, docScopeId: string, opts: { at?: string } = {}): Promise<{ entities: number }> {
   const txTime = opts.at ?? new Date().toISOString();
   const precedence = typePrecedence(loadOntology(store.dataDir));
-  let result = { entities: 0, relations: 0 };
+  let result = { entities: 0 };
   await store.tx(async (q) => {
     const rows = await q.query<{ target_id: string }>(
       `SELECT DISTINCT ev.target_id FROM evidence ev JOIN entities e ON e.id = ev.target_id
@@ -751,17 +750,9 @@ export async function retireTier0Placeholders(store: Store, docScopeId: string, 
       [docScopeId, txTime, CONCEPT_EXTRACTOR, ...ids],
     );
     for (const id of ids) touched.entities.add(id);
-    const rels = await q.query<{ target_id: string }>(
-      `UPDATE evidence ev SET tx_to = $2::timestamptz FROM relations r
-       WHERE ev.scope_id = $1 AND ev.kind = 'relation' AND ev.extractor = $3 AND ev.tx_to IS NULL AND r.id = ev.target_id
-         AND (r.source_id IN (${ph(4)}) OR r.target_id IN (${ph(4)}))
-       RETURNING ev.target_id`,
-      [docScopeId, txTime, CONCEPT_EXTRACTOR, ...ids],
-    );
-    for (const r of rels) touched.relations.add(r.target_id);
     await q.query(`DELETE FROM entity_mentions WHERE scope_id = $1 AND entity_id IN (${ph(2)})`, [docScopeId, ...ids]);
     await foldTouched(q, touched, txTime, { typePrecedence: precedence });
-    result = { entities: ids.length, relations: rels.length };
+    result = { entities: ids.length };
   });
   return result;
 }

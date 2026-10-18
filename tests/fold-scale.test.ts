@@ -24,15 +24,23 @@ function write(root: string, rel: string, content: string): void {
   fs.writeFileSync(abs, content);
 }
 
-const doc = (title: string, names: string[]) => `---
-title: ${title}
-entities:
-${names.map((n) => `  - { name: ${n}, type: organization }`).join('\n')}
----
-# ${title}
-
-${names.map((n) => `[[${n}]]`).join('、')} 同时出现在这份报告里。
-`;
+/** Co-occurrence is derived from mentions, not stored, so the edges the fold is tested on are typed: one per consecutive pair. */
+const EDGE_TYPE = 'competes_with';
+const doc = (title: string, names: string[]) => {
+  const relations = names.slice(1).map((n, i) => `  - { source: ${names[i]}, target: ${n}, type: ${EDGE_TYPE} }`);
+  return [
+    '---',
+    `title: ${title}`,
+    'entities:',
+    ...names.map((n) => `  - { name: ${n}, type: organization }`),
+    ...(relations.length ? ['relations:', ...relations] : []),
+    '---',
+    `# ${title}`,
+    '',
+    `${names.map((n) => `[[${n}]]`).join('、')} 同时出现在这份报告里。`,
+    '',
+  ].join('\n');
+};
 
 describe('the fold at scale', () => {
   const dataDir = path.join(tmp, 'ws');
@@ -65,7 +73,7 @@ describe('the fold at scale', () => {
     const live = async (id: string) => (await store.query<{ live: boolean }>(`SELECT (tx_to IS NULL) AS live FROM entities WHERE id = $1`, [id]))[0]?.live;
     const edge = async (a: string, b: string) =>
       (await store.query<{ live: boolean; tx_to: string | null }>(
-        `SELECT (tx_to IS NULL) AS live, tx_to FROM relations WHERE type = 'co_occurs' AND ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))`,
+        `SELECT (tx_to IS NULL) AS live, tx_to FROM relations WHERE type = '${EDGE_TYPE}' AND ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))`,
         [a, b],
       ))[0];
 
@@ -109,7 +117,7 @@ describe('the fold at scale', () => {
     const live = async (id: string) => (await store.query<{ live: boolean }>(`SELECT (tx_to IS NULL) AS live FROM entities WHERE id = $1`, [id]))[0]?.live;
     const edgeOf = async (a: string, b: string) =>
       (await store.query<{ id: string; live: boolean }>(
-        `SELECT id, (tx_to IS NULL) AS live FROM relations WHERE type = 'co_occurs' AND ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))`,
+        `SELECT id, (tx_to IS NULL) AS live FROM relations WHERE type = '${EDGE_TYPE}' AND ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))`,
         [a, b],
       ))[0];
     write(dataDir, 'raw/docs/e.md', doc('丁戊报告', ['丁公司', '戊公司']));

@@ -113,7 +113,11 @@ export async function rebuild(ctx: AppContext, opts: { history?: boolean; onProg
   return { sync: stats, feedbackReplayed, historyReplayed };
 }
 
-/** Graph-only re-apply of a removed document from its attic sidecar (no chunks, no mentions). */
+/**
+ * Graph-only re-apply of a removed document from its attic sidecar: no chunks
+ * and no mentions, so no derived co-occurrence either — a replayed source
+ * contributes its entities, typed relations and claims.
+ */
 async function applyAtticScope(store: Store, key: string, sidecar: Sidecar, opts: { at: string }): Promise<string | null> {
   const docId = documentIdFor(key);
   const page: PageContext = { documentId: docId, path: key, title: sidecar.meta.title ?? path.posix.basename(key), chunkIds: [] };
@@ -126,12 +130,10 @@ async function applyAtticScope(store: Store, key: string, sidecar: Sidecar, opts
       for (const term of sidecar.extraction.tier0?.concepts ?? []) {
         await w.entity({ name: term, type: 'concept' }, { extractor: 'tier0.concept' });
       }
-      const linked: string[] = [];
       for (const target of sidecar.extraction.tier0?.wikilinks ?? []) {
         const name = path.posix.basename(target.replace(/\.md$/i, ''));
-        if (name) linked.push(await w.entity({ name, type: 'concept' }, { extractor: 'tier0.wikilink' }));
+        if (name) await w.entity({ name, type: 'concept' }, { extractor: 'tier0.wikilink' });
       }
-      await w.coOccurrence(linked, { weight: 0.3, window: 12, extractor: 'tier0.wikilink' });
       const declared = sidecar.extraction.tier0?.declared;
       const docDate = sidecar.meta.docDate ?? null;
       if (declared) await applyExtraction(w, page, declared.entities, declared.relations ?? [], declared.claims, 'tier0.frontmatter', { docDate });
