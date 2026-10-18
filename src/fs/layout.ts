@@ -8,7 +8,7 @@ import path from 'node:path';
  *   ├── raw/{docs,traces,skills}   originals; the raw path is the canonical key of every source
  *   ├── .sidecar/<key>/            derived, system-owned state mirroring the data dir (keep it)
  *   ├── wiki/                      curated knowledge (OKF bundle + Obsidian vault)
- *   ├── playbooks/{packs,capabilities,intents,ontology,research}   agent-editable configuration
+ *   ├── playbooks/{packs,capabilities,intents,ontology,research,concepts}   agent-editable configuration
  *   ├── ledger/                    events.jsonl + attic (machine truth)
  *   └── .knode/db                  PGlite index (disposable)
  *
@@ -33,6 +33,8 @@ export const INTENTS_DIR = `${CONFIG_DIR}/intents`;
 export const ONTOLOGY_DIR = `${CONFIG_DIR}/ontology`;
 /** Deep-research templates: what an external agent is told when asked to write a wiki page (see src/research). */
 export const RESEARCH_DIR = `${CONFIG_DIR}/research`;
+/** Tier-0 concept mining: the editable stop list and the learned frequent-term list (see src/graph/concept-stoplist). */
+export const CONCEPTS_DIR = `${CONFIG_DIR}/concepts`;
 
 /**
  * Named agents. Not to be confused with the `AGENTS.md` at the data root,

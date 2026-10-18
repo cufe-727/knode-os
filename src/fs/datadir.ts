@@ -4,6 +4,7 @@ import { CONFIG_FILE, defaultConfig, saveConfig } from '../config.js';
 import { initObsidianVault } from '../obsidian/vault.js';
 import { ensureDefaultPlaybooks } from '../pack/playbook.js';
 import { ensureDefaultIntents } from '../compiler/intents.js';
+import { ensureDefaultConceptStoplist } from '../graph/concept-stoplist.js';
 import { ensureDefaultOntology } from '../graph/ontology.js';
 import { ensureDefaultResearchTemplates } from '../research/templates.js';
 import { ensureDefaultChatPlaybooks } from '../chat/templates.js';
@@ -40,6 +41,7 @@ import { CAPABILITIES_DIR, DB_DIR, INTENTS_DIR, LEGACY_TOP_LEVEL, PACKS_DIR } fr
  *   │   └── dreams/           nightly dream reports
  *   ├── playbooks/            agent-editable configuration (Markdown / YAML)
  *   │   ├── packs/            context-pack playbooks, revised by the learning loop
+ *   │   ├── concepts/         tier-0 concept stop list (editable) and learned frequent terms
  *   │   ├── capabilities/     semantic layer over live sources (metric definitions, joins, pitfalls)
  *   │   └── intents/          intent specs: the slots an answer needs (Context Compiler)
  *   ├── ledger/               machine truth: events.jsonl (apply/dispose/purge/feedback)
@@ -231,7 +233,7 @@ export function initDataDir(dataDir: string): InitResult {
   created.push(...obsidian.created.map((rel) => `wiki/${rel}`));
   // starters for the two configurable layers: how to retrieve (playbook) and
   // what an answer needs (intent). Both are examples to edit, never overwritten.
-  created.push(...ensureDefaultPlaybooks(dataDir), ...ensureDefaultIntents(dataDir), ...ensureDefaultOntology(dataDir), ...ensureDefaultResearchTemplates(dataDir), ...ensureDefaultProfiles(dataDir), ...ensureDefaultAgents(dataDir), ...ensureDefaultChatPlaybooks(dataDir));
+  created.push(...ensureDefaultPlaybooks(dataDir), ...ensureDefaultIntents(dataDir), ...ensureDefaultOntology(dataDir), ...ensureDefaultConceptStoplist(dataDir), ...ensureDefaultResearchTemplates(dataDir), ...ensureDefaultProfiles(dataDir), ...ensureDefaultAgents(dataDir), ...ensureDefaultChatPlaybooks(dataDir));
   if (!fs.existsSync(path.join(dataDir, CONFIG_FILE))) {
     saveConfig(dataDir, defaultConfig());
     created.push(CONFIG_FILE);

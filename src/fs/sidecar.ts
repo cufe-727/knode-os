@@ -121,7 +121,10 @@ export interface SidecarSegment {
 export interface SidecarTier0 {
   /** sha256 of the content the extraction was computed from. */
   contentSha: string;
+  /** Terms the zero-LLM miner kept (placeholders until tier-1 reads the document; replayed by a history rebuild). */
   concepts: string[];
+  /** Names of typed entities the graph already knew that this document was linked to (informational). */
+  linked?: string[];
   wikilinks: string[];
   extractedAt: string;
   /** Frontmatter-declared entities / claims (tier 0.5), kept so a removed source can be replayed from the attic. */
