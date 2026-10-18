@@ -44,10 +44,14 @@ import { classifyFailure, FailureKind } from './failures.js';
 export interface LabelingTask {
   id: string;
   kind: 'extract';
+  /** The document and part, for a worker's log. */
+  label: string;
   document: { path: string; title: string; part: number; parts: number };
   messages: ChatMessage[];
   /** The same messages flattened the way a one-shot CLI takes them, JSON directive included. */
   prompt: string;
+  /** The answer is a JSON object. */
+  json: true;
   maxTokens: number;
   leaseExpiresAt: string;
 }
@@ -149,9 +153,13 @@ export interface SchedulerContext {
   /** Read on every use: a settings save swaps the config. */
   config: () => KnodeConfig;
   log?: (msg: string) => void;
+  /** A document's extraction was written to the graph: its summary page is due (src/work/summarize.ts). */
+  onWritten?: (path: string) => void;
 }
 
 export class LabelingScheduler {
+  /** The kind of work it hands out (src/work/broker.ts). */
+  readonly kind = 'extract' as const;
   private readonly owner = `labeling:${crypto.randomUUID()}`;
   private readonly open = new Map<string, OpenDoc>();
   private readonly leases = new Map<string, Lease>();
@@ -185,6 +193,11 @@ export class LabelingScheduler {
 
   get leaseDurationMs(): number {
     return this.leaseMs;
+  }
+
+  /** Whether a task id is one of this scheduler's leases, live or lately expired. */
+  holds(taskId: string): boolean {
+    return this.leases.has(taskId);
   }
 
   /** Up to `max` segments for `who` to run now; empty when nothing is due. */
@@ -424,12 +437,15 @@ export class LabelingScheduler {
     this.leases.set(lease.id, lease);
     doc.ready.delete(index);
     doc.leased.set(index, lease.id);
+    const parts = doc.plan.segments.length;
     return {
       id: lease.id,
       kind: 'extract',
-      document: { path: doc.plan.row.path, title: doc.plan.page.title, part: index + 1, parts: doc.plan.segments.length },
+      label: `${doc.plan.row.path}${parts > 1 ? ` [${index + 1}/${parts}]` : ''}`,
+      document: { path: doc.plan.row.path, title: doc.plan.page.title, part: index + 1, parts },
       messages: request.messages,
       prompt: renderCliPrompt(request.messages, true),
+      json: true,
       maxTokens: request.maxTokens,
       leaseExpiresAt: new Date(lease.expiresAt).toISOString(),
     };
@@ -549,5 +565,6 @@ export class LabelingScheduler {
     this.finished.documents.push(path);
     this.finished.entityIds.push(...applied.entityIds);
     this.finished.claimIds.push(...applied.claimIds);
+    this.ctx.onWritten?.(path);
   }
 }

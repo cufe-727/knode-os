@@ -17,7 +17,7 @@ import { readDeps } from '../lineage/deps.js';
 import { archivedPath, disposeScope, findLiveScope } from '../lineage/scope.js';
 import { DepDecl } from '../lineage/types.js';
 import { classifyFailure } from '../labeling/failures.js';
-import { LlmClient } from '../llm/client.js';
+import { ChatMessage, LlmClient } from '../llm/client.js';
 import { applyScope } from '../lineage/scope.js';
 import { isGeneratedConcept, okfGenerated } from '../okf/index.js';
 import { getDocHeat } from '../stats/heat.js';
@@ -190,6 +190,24 @@ Output rules:
 - Wrap every important person/org/product/concept name in [[double brackets]].
 - Write in the document's language. Max ~400 words.`;
 
+/**
+ * The Summarize stage's call for one document — the same whether this
+ * process makes it or a worker leases it (src/work/summarize.ts). Null when
+ * the document has no text to read.
+ */
+export function sourceSummaryRequest(dataDir: string, doc: Pick<DocumentRow, 'path' | 'root'>): { messages: ChatMessage[]; maxTokens: number } | null {
+  const source = loadSourceText(dataDir, doc.path, doc.root);
+  if (!source) return null;
+  const content = source.text.slice(0, LLM_WIKI_INPUT_CHARS);
+  return {
+    messages: [
+      { role: 'system', content: SOURCE_SYSTEM },
+      { role: 'user', content: `Source file: ${doc.path}\n\n${content}` },
+    ],
+    maxTokens: 1200,
+  };
+}
+
 const sourceSummary: PageGenerator = {
   kind: 'source_summary',
   version: 2,
@@ -226,13 +244,9 @@ const sourceSummary: PageGenerator = {
       at = cached.generatedAt;
     } else {
       if (!llm.enabled) return null;
-      const source = loadSourceText(ctx.dataDir, doc.path, doc.root);
-      if (!source) return null;
-      const content = source.text.slice(0, LLM_WIKI_INPUT_CHARS);
-      body = await llm.complete([
-        { role: 'system', content: SOURCE_SYSTEM },
-        { role: 'user', content: `Source file: ${doc.path}\n\n${content}` },
-      ], { maxTokens: 1200 });
+      const request = sourceSummaryRequest(ctx.dataDir, doc);
+      if (!request) return null;
+      body = await llm.complete(request.messages, { maxTokens: request.maxTokens });
       by = llm.label;
       at = new Date().toISOString();
       writeSourceSummary(ctx.dataDir, doc.path, { contentSha: doc.sha256, model: llm.label, body, generatedAt: at });
@@ -786,8 +800,78 @@ function hashedSummaryPath(doc: DocumentRow): string {
   return `wiki/sources/${slug}-${crypto.createHash('sha256').update(doc.path).digest('hex').slice(0, 6)}.md`;
 }
 
+/** `wiki/sources/<title slug>.md`: where a document's first summary page goes, unless another document holds it. */
+function plainSummaryPath(doc: DocumentRow): string {
+  return `wiki/sources/${slugify(doc.title ?? path.basename(doc.path))}.md`;
+}
+
 /** Summaries that failed this often on a document's current content wait for new content. */
-const MAX_SUMMARY_ATTEMPTS = 3;
+export const MAX_SUMMARY_ATTEMPTS = 3;
+
+/**
+ * Documents due a summary page: indexed sources under raw/docs whose page is
+ * missing or dirty (their document changed since), leaving out those that
+ * failed MAX_SUMMARY_ATTEMPTS times on their current content and those in
+ * `exclude` — the documents in `prefer` first, then the most recently
+ * updated. `due` counts them all, `docs` holds the first `limit`.
+ */
+export async function dueSummaryDocuments(
+  store: Store,
+  dataDir: string,
+  opts: {
+    limit: number;
+    prefer?: string[];
+    /** Leave out documents still waiting for extraction — a summary written first would miss what it finds. */
+    skipQueued?: boolean;
+    exclude?: ReadonlySet<string>;
+  },
+): Promise<{ docs: DocumentRow[]; due: number; pages: Map<string, { path: string; status: string }> }> {
+  const pages = await summaryPagesByDocument(store);
+  const docs = await store.query<DocumentRow>(
+    `SELECT * FROM documents d WHERE root = 'docs' AND status = 'indexed' AND kind = 'source'${opts.skipQueued ? ' AND NOT EXISTS (SELECT 1 FROM extraction_queue q WHERE q.document_id = d.id)' : ''}
+     ORDER BY updated_at DESC, path`,
+  );
+  const due = docs.filter((d) => {
+    if (opts.exclude?.has(d.path)) return false;
+    const page = pages.get(d.path);
+    if (page && page.status !== 'dirty') return false;
+    const failed = readSourceSummaryFailure(dataDir, d.path);
+    return !(failed && failed.contentSha === d.sha256 && failed.attempts >= MAX_SUMMARY_ATTEMPTS);
+  });
+  const prefer = new Set(opts.prefer ?? []);
+  const ordered = prefer.size ? [...due.filter((d) => prefer.has(d.path)), ...due.filter((d) => !prefer.has(d.path))] : due;
+  return { docs: ordered.slice(0, Math.max(0, opts.limit)), due: due.length, pages };
+}
+
+/**
+ * Write a document's summary page — at `pagePath`, else where its page is or
+ * a new one goes — or at its hashed path when a file a person wrote holds
+ * that one. Says what happened and where.
+ */
+export async function writeSourceSummaryPage(
+  ctx: PagesContext,
+  doc: DocumentRow,
+  opts: { pagePath?: string; actor?: string } = {},
+): Promise<{ outcome: RegenerateOutcome; path: string }> {
+  let at = opts.pagePath ?? (await summaryPagePath(ctx.store, doc));
+  restoreArchived(ctx.dataDir, at);
+  let outcome = await regeneratePage(ctx, at, 'source_summary', { actor: opts.actor, hint: { documentPath: doc.path } });
+  if (outcome === 'blocked' && at !== hashedSummaryPath(doc)) {
+    // a file a person wrote holds the title's path
+    at = hashedSummaryPath(doc);
+    outcome = await regeneratePage(ctx, at, 'source_summary', { actor: opts.actor, hint: { documentPath: doc.path } });
+  }
+  return { outcome, path: at };
+}
+
+/** Where one document's summary page goes: where it is, else the title's path unless another document's page holds that. */
+async function summaryPagePath(store: Store, doc: DocumentRow): Promise<string> {
+  const pages = await summaryPagesByDocument(store);
+  const own = pages.get(doc.path)?.path;
+  if (own) return own;
+  const plain = plainSummaryPath(doc);
+  return [...pages].some(([other, page]) => page.path === plain && other !== doc.path) ? hashedSummaryPath(doc) : plain;
+}
 
 /**
  * The Summarize stage: one summary page per indexed source document under
@@ -797,6 +881,9 @@ const MAX_SUMMARY_ATTEMPTS = 3;
  * (what the pass just extracted) first, then the most recently updated, with
  * `concurrency` model calls at a time. A page keeps its path; a new one takes
  * the title's path unless another document holds it. Returns the paths written.
+ *
+ * `serve` leases the same calls to its own slots and to remote workers
+ * instead (src/work/summarize.ts); this is the one-shot pass.
  */
 export async function ensureSourceSummaries(
   ctx: PagesContext,
@@ -815,19 +902,7 @@ export async function ensureSourceSummaries(
   const progress = opts.onProgress ?? (() => {});
   const limit = Math.max(0, Math.floor(opts.limit ?? 20));
   if (limit === 0 || !documentSummaryLlm(ctx).enabled) return [];
-  const pages = await summaryPagesByDocument(ctx.store);
-  const docs = await ctx.store.query<DocumentRow>(
-    `SELECT * FROM documents d WHERE root = 'docs' AND status = 'indexed' AND kind = 'source'${opts.skipQueued ? ' AND NOT EXISTS (SELECT 1 FROM extraction_queue q WHERE q.document_id = d.id)' : ''}
-     ORDER BY updated_at DESC, path`,
-  );
-  const due = docs.filter((d) => {
-    const page = pages.get(d.path);
-    if (page && page.status !== 'dirty') return false;
-    const failed = readSourceSummaryFailure(ctx.dataDir, d.path);
-    return !(failed && failed.contentSha === d.sha256 && failed.attempts >= MAX_SUMMARY_ATTEMPTS);
-  });
-  const prefer = new Set(opts.prefer ?? []);
-  const picked = [...due.filter((d) => prefer.has(d.path)), ...due.filter((d) => !prefer.has(d.path))].slice(0, limit);
+  const { docs: picked, pages } = await dueSummaryDocuments(ctx.store, ctx.dataDir, { limit, prefer: opts.prefer, skipQueued: opts.skipQueued });
   if (picked.length === 0) return [];
 
   // paths are handed out before any call runs, so two new documents with one
@@ -836,7 +911,7 @@ export async function ensureSourceSummaries(
   const work = picked.map((doc) => {
     let pagePath = pages.get(doc.path)?.path;
     if (!pagePath) {
-      const plain = `wiki/sources/${slugify(doc.title ?? path.basename(doc.path))}.md`;
+      const plain = plainSummaryPath(doc);
       pagePath = owner.has(plain) && owner.get(plain) !== doc.path ? hashedSummaryPath(doc) : plain;
       owner.set(pagePath, doc.path);
     }
@@ -846,15 +921,8 @@ export async function ensureSourceSummaries(
   const written: string[] = [];
   const summarize = async ({ doc, pagePath }: (typeof work)[number]) => {
     try {
-      restoreArchived(ctx.dataDir, pagePath);
       progress(`summarizing ${doc.path}`);
-      let at = pagePath;
-      let r = await regeneratePage(ctx, at, 'source_summary', { actor: opts.actor, hint: { documentPath: doc.path } });
-      if (r === 'blocked' && at !== hashedSummaryPath(doc)) {
-        // a file a person wrote holds the title's path
-        at = hashedSummaryPath(doc);
-        r = await regeneratePage(ctx, at, 'source_summary', { actor: opts.actor, hint: { documentPath: doc.path } });
-      }
+      const { outcome: r, path: at } = await writeSourceSummaryPage(ctx, doc, { pagePath, actor: opts.actor });
       if (r === 'regenerated' || r === 'unchanged') {
         clearSourceSummaryFailure(ctx.dataDir, doc.path);
         if (r === 'regenerated') written.push(at);

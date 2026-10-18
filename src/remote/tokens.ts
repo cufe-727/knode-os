@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { isWorkKind, WORK_KINDS, WorkKind } from '../work/kinds.js';
 
 /**
  * Tokens for the remote API (src/remote/api.ts) — one per machine or
@@ -17,7 +18,7 @@ export const REMOTE_SCOPES = ['label', 'read', 'write', 'sql'] as const;
 export type RemoteScope = (typeof REMOTE_SCOPES)[number];
 
 export const REMOTE_SCOPE_HELP: Record<RemoteScope, string> = {
-  label: 'take extraction work and hand back results (remote labeling workers)',
+  label: `take leased work and hand back results (remote workers): ${WORK_KINDS.join(', ')}, or the kinds the token names`,
   read: 'list, read and search documents; read the graph and claims',
   write: 'write and delete documents under raw/docs, wiki and playbooks/packs; trigger a sync',
   sql: 'read-only SQL over the catalog views (v_*)',
@@ -31,6 +32,8 @@ export interface RemoteTokenRecord {
   scopes: RemoteScope[];
   /** Workspaces it may use: "<user>/<workspace-id>", "team/<name>", or "*". */
   workspaces: string[];
+  /** The kinds of work `label` covers for it; absent, every kind (src/work/kinds.ts). */
+  kinds?: WorkKind[];
   createdAt: string;
   lastUsedAt?: string;
   revokedAt?: string;
@@ -72,7 +75,7 @@ export class RemoteTokenStore {
   }
 
   /** Mint a token; the secret is shown once and never stored. */
-  create(opts: { name: string; scopes: RemoteScope[]; workspaces: string[] }): { token: string; record: RemoteTokenRecord } {
+  create(opts: { name: string; scopes: RemoteScope[]; workspaces: string[]; kinds?: string[] }): { token: string; record: RemoteTokenRecord } {
     const name = opts.name.trim();
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) throw new Error('token name: 1-64 letters, digits, dot, dash or underscore');
     const scopes = [...new Set(opts.scopes)];
@@ -80,11 +83,18 @@ export class RemoteTokenStore {
     for (const s of scopes) if (!(REMOTE_SCOPES as readonly string[]).includes(s)) throw new Error(`unknown scope "${s}" — scopes are ${REMOTE_SCOPES.join(', ')}`);
     const workspaces = [...new Set(opts.workspaces.map(normalizeWorkspaceSpec))];
     if (workspaces.length === 0) throw new Error('name the workspaces the token may use (e.g. admin/finance), or *');
+    const kinds = [...new Set(opts.kinds ?? [])];
+    for (const k of kinds) if (!isWorkKind(k)) throw new Error(`unknown kind of work "${k}" — kinds are ${WORK_KINDS.join(', ')}`);
+    if (kinds.length > 0 && !scopes.includes('label')) throw new Error('kinds narrow the "label" scope — give the token that scope too');
     const file = this.read();
     if (file.tokens.some((t) => t.name === name && !t.revokedAt)) throw new Error(`a live token named "${name}" exists — revoke it first or pick another name`);
     const id = crypto.randomBytes(6).toString('hex');
     const secret = crypto.randomBytes(32).toString('base64url');
-    const record: RemoteTokenRecord = { id, name, hash: sha256(secret), scopes, workspaces, createdAt: new Date().toISOString() };
+    const record: RemoteTokenRecord = {
+      id, name, hash: sha256(secret), scopes, workspaces,
+      ...(kinds.length ? { kinds: kinds as WorkKind[] } : {}),
+      createdAt: new Date().toISOString(),
+    };
     file.tokens.push(record);
     this.write(file);
     return { token: `knr_${id}_${secret}`, record: { ...record } };
@@ -157,4 +167,9 @@ export function tokenAllows(record: RemoteTokenRecord, scope: RemoteScope, works
   if (!record.scopes.includes(scope)) return false;
   const ws = workspace.toLowerCase();
   return record.workspaces.some((w) => w === '*' || w === ws);
+}
+
+/** May the token take this kind of work in this workspace? `label`, narrowed by its kinds when it names any. */
+export function tokenAllowsKind(record: RemoteTokenRecord, kind: WorkKind, workspace: string): boolean {
+  return tokenAllows(record, 'label', workspace) && (!record.kinds?.length || record.kinds.includes(kind));
 }

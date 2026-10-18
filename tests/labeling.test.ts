@@ -2,22 +2,28 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { defaultConfig, defaultRoutedLlmConfig, ExtractionWorkerConfig, LlmConnection } from '../src/config.js';
+import { defaultConfig, defaultRoutedLlmConfig, ExtractionWorkerConfig, KnodeConfig, LlmConnection } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
-import { readSidecarPart, readSourceSummaryFailure } from '../src/fs/sidecar.js';
+import { readSidecarPart, readSourceSummary, readSourceSummaryFailure } from '../src/fs/sidecar.js';
 import { runTier1Pass } from '../src/graph/tier1.js';
 import { sync } from '../src/ingest/sync.js';
 import { classifyFailure, newBackendHealth, recordBackendOutcome } from '../src/labeling/failures.js';
-import { LocalLabelingWorkers, localWorkerSpecs } from '../src/labeling/local.js';
+import { LocalLabelingWorkers, localSummarySpec, localWorkerSpecs } from '../src/labeling/local.js';
 import { LabelingScheduler, LabelingTask, WorkerIdentity } from '../src/labeling/scheduler.js';
 import { ensureDefaultAgents } from '../src/research/agents.js';
+import { WorkBroker, WorkSource, WorkTask } from '../src/work/broker.js';
+import { workerHints } from '../src/work/config.js';
+import { WorkKind } from '../src/work/kinds.js';
+import { SummarySource } from '../src/work/summarize.js';
 import { ensureSourceSummaries } from '../src/wiki/pages.js';
 import { startFakeOpenAi, type ChatRequest, type FakeOpenAi } from './helpers/fake-openai.js';
 
 /**
- * Extraction as leased work (src/labeling): the scheduler hands segments to
- * whoever asks — `serve`'s own slots or a remote worker — checks and records
- * every answer, and writes a document once its last segment is in.
+ * Leased work (src/labeling, src/work): the scheduler hands extraction
+ * segments to whoever asks — `serve`'s own slots or a remote worker — checks
+ * and records every answer, and writes a document once its last segment is
+ * in; the summary source does the same with summary pages; the broker puts
+ * the two behind one lease protocol and shares a slot that takes both.
  */
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-labeling-'));
@@ -93,6 +99,12 @@ async function workspace(name: string, fake: FakeOpenAi, opts: { workers?: Extra
 const queued = async (ctx: AppContext) => (await ctx.store.query<{ path: string }>(
   `SELECT d.path FROM extraction_queue q JOIN documents d ON d.id = q.document_id ORDER BY d.path`,
 )).map((r) => r.path);
+
+/** Summary pages written, by the document each one summarizes. */
+const summaryPages = async (ctx: AppContext) => new Map((await ctx.store.query<{ path: string; doc: string }>(
+  `SELECT p.path, d.input_id AS doc FROM pages p JOIN deps d ON d.artifact_kind = 'page' AND d.artifact_id = p.path AND d.input_kind = 'document'
+   WHERE p.kind = 'source_summary' AND p.status <> 'archived'`,
+)).map((r) => [r.doc, r.path]));
 
 const reply = (task: LabelingTask) => replyFor(task.messages.filter((m) => m.role === 'user').at(-1)?.content ?? '');
 
@@ -254,21 +266,246 @@ describe('local labeling workers', () => {
     expect(localWorkerSpecs({ ...ctx.config, extraction: { ...ctx.config.extraction, workers: [{ use: 'connection-1', slots: 0 }] } })).toEqual([]);
   });
 
-  it('drain the queue on their own slots, several calls at a time', async () => {
-    const scheduler = new LabelingScheduler({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config }, { priorityRefreshMs: 0 });
-    const workers = new LocalLabelingWorkers(scheduler, () => ctx.config, { idleMs: 50 });
+  it('drain the queue on their own slots, several calls at a time, and write every summary page after it', async () => {
+    let summaries: SummarySource | null = null;
+    const scheduler = new LabelingScheduler({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, onWritten: (p) => summaries?.prefer(p) }, { priorityRefreshMs: 0 });
+    summaries = new SummarySource(ctx, {}, { idleScanMs: 50 });
+    const broker = new WorkBroker([scheduler, summaries]);
+    const workers = new LocalLabelingWorkers(broker, () => ctx.config, { idleMs: 50 });
     workers.start();
     try {
       await until(async () => (await queued(ctx)).length === 0 && (await scheduler.status()).openDocuments === 0, 30_000, 'the queue to drain');
-      const [backend] = workers.status();
+      await until(async () => (await summaryPages(ctx)).size === 3, 30_000, 'the summary pages');
+      const [backend, summarize] = workers.status();
       expect(backend).toMatchObject({ id: 'connection-1', slots: 3, failed: { model: 0, transient: 0, fatal: 0 } });
       expect(backend.ok).toBe(backend.calls);
+      // the summaries ran on the Summarize stage's own slots, not on the extraction ones
+      expect(summarize).toMatchObject({ id: 'summarize', slots: 1, calls: 3, ok: 3 });
       expect(readSidecarPart(ctx.dataDir, 'raw/docs/long.md', 'tier1')?.status).toBe('done');
       expect((await scheduler.status()).totals.documentsWritten).toBe(3);
+      expect(readSourceSummary(ctx.dataDir, 'raw/docs/a.md')?.model).toBe('fake-model');
     } finally {
       workers.stop();
-      await scheduler.stop();
+      await broker.stop();
     }
+  });
+
+  it('run summaries on the Summarize stage\'s route, `summaryConcurrency` at a time, or none', () => {
+    expect(localSummarySpec(ctx.config)).toMatchObject({ id: 'summarize', kinds: ['summarize'], slots: 1 });
+    expect(localSummarySpec({ ...ctx.config, extraction: { ...ctx.config.extraction, summaryConcurrency: 4 } })?.slots).toBe(4);
+    // 0: only remote workers write summaries
+    expect(localSummarySpec({ ...ctx.config, extraction: { ...ctx.config.extraction, summaryConcurrency: 0 } })).toBeNull();
+  });
+});
+
+/** A source with as many tasks as `supply` says, for the broker's own rules. */
+class FakeSource implements WorkSource {
+  readonly leaseDurationMs = 60_000;
+  readonly issued = new Set<string>();
+  readonly completed: string[] = [];
+  private n = 0;
+  constructor(readonly kind: WorkKind, public supply = Infinity) {}
+  async lease(): Promise<WorkTask[]> {
+    if (this.supply <= 0) return [];
+    this.supply--;
+    const id = `${this.kind}-${++this.n}`;
+    this.issued.add(id);
+    return [{ id, kind: this.kind, label: id, messages: [], prompt: '', json: this.kind === 'extract', maxTokens: 1, leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() }];
+  }
+  async complete(id: string) {
+    this.completed.push(id);
+    return { accepted: true };
+  }
+  renew(ids: string[]) {
+    return { renewed: ids, lost: [] };
+  }
+  async release(ids: string[]) {
+    return ids.length;
+  }
+  holds(id: string) {
+    return this.issued.has(id);
+  }
+  async status() {
+    return { leases: [] };
+  }
+  async stop() {}
+}
+
+describe('the work broker', () => {
+  const slot: WorkerIdentity = { worker: 'macbook/codex#1', backend: 'codex', remote: true };
+  const both: WorkKind[] = ['extract', 'summarize'];
+  const kindsOf = async (broker: WorkBroker, n: number, kinds = both) => {
+    const out: string[] = [];
+    for (let i = 0; i < n; i++) out.push((await broker.lease(slot, kinds))[0]?.kind ?? 'none');
+    return out;
+  };
+
+  it('shares a slot that takes both kinds three segments to one summary', async () => {
+    const broker = new WorkBroker([new FakeSource('extract'), new FakeSource('summarize')]);
+    expect(await kindsOf(broker, 12)).toEqual(['extract', 'summarize', 'extract', 'extract', 'extract', 'summarize', 'extract', 'extract', 'extract', 'summarize', 'extract', 'extract']);
+  });
+
+  it('banks no credit for a kind that had nothing to give', async () => {
+    const summaries = new FakeSource('summarize', 0);
+    const broker = new WorkBroker([new FakeSource('extract'), summaries]);
+    expect(await kindsOf(broker, 9)).toEqual(Array(9).fill('extract'));
+    // summaries come due: they take their share from here on, not everything until they catch up
+    summaries.supply = Infinity;
+    expect(await kindsOf(broker, 8)).toEqual(['summarize', 'extract', 'extract', 'extract', 'summarize', 'extract', 'extract', 'extract']);
+  });
+
+  it('takes the shares from the config, and serves a slot only the kinds it asks for', async () => {
+    const broker = new WorkBroker([new FakeSource('extract'), new FakeSource('summarize')], { shares: () => ({ extract: 1, summarize: 1 }) });
+    expect(await kindsOf(broker, 4)).toEqual(['extract', 'summarize', 'extract', 'summarize']);
+    expect(await kindsOf(broker, 3, ['summarize'])).toEqual(['summarize', 'summarize', 'summarize']);
+    expect(await kindsOf(broker, 1, [])).toEqual(['none']);
+    // an unusable weight falls back to its default
+    expect(new WorkBroker([], { shares: () => ({ extract: 0, summarize: -2 }) }).shares()).toEqual({ extract: 3, summarize: 1 });
+  });
+
+  it('sends answers, renewals and releases back to the source that issued the lease', async () => {
+    const extract = new FakeSource('extract');
+    const summarize = new FakeSource('summarize');
+    const broker = new WorkBroker([extract, summarize]);
+    const [a] = await broker.lease(slot, ['extract']);
+    const [b] = await broker.lease(slot, ['summarize']);
+    expect(await broker.complete(a.id, slot, { ok: true, text: '{}' })).toEqual({ accepted: true });
+    expect(await broker.complete(b.id, slot, { ok: false, error: 'HTTP 429' })).toEqual({ accepted: true });
+    expect([extract.completed, summarize.completed]).toEqual([[a.id], [b.id]]);
+    expect(await broker.complete('no-such-lease', slot, { ok: true, text: '' })).toMatchObject({ accepted: false });
+    expect(broker.renew([a.id, b.id, 'no-such-lease'], slot)).toEqual({ renewed: [a.id, b.id], lost: ['no-such-lease'] });
+    expect(await broker.release([a.id, b.id], slot)).toBe(2);
+    const [worker] = (await broker.status()).workers;
+    expect(worker).toMatchObject({ worker: 'macbook/codex#1', kinds: ['summarize'], ok: 1, failed: 1 });
+  });
+});
+
+describe('worker hints', () => {
+  it('tell a worker how the server runs each kind on each CLI', () => {
+    const base = defaultConfig();
+    const agent = (id: string, provider: LlmConnection['provider'], model: string, effort: LlmConnection['effort'], speed: LlmConnection['speed'] = 'default'): LlmConnection => ({
+      id, label: id, provider, baseUrl: '', apiKey: '', model, cliPath: '', effort, speed, cliTimeoutMs: 60_000,
+    });
+    const config: KnodeConfig = {
+      ...base,
+      agentLlms: [agent('codex-agent', 'codex-cli', 'gpt-agent', 'high', 'fast'), agent('cursor-agent', 'cursor-cli', 'grok', 'max')],
+      extraction: {
+        ...base.extraction,
+        entityLlm: { ...defaultRoutedLlmConfig(), use: 'codex-agent' },
+        summaryLlm: { ...defaultRoutedLlmConfig(), use: 'codex-agent', model: 'gpt-summary' },
+        // listed with no slots, a worker entry still says how extraction runs on that agent
+        workers: [{ use: 'codex-agent', slots: 0, model: 'gpt-extract', effort: 'medium' }, { use: 'cursor-agent', slots: 2 }],
+      },
+    };
+    expect(workerHints(config)).toEqual({
+      extract: { codex: { model: 'gpt-extract', effort: 'medium', speed: 'fast' }, cursor: { model: 'grok[effort=high]' } },
+      summarize: { codex: { model: 'gpt-summary', effort: 'high', speed: 'fast' } },
+    });
+    // an endpoint gets no hints: model names differ between them
+    expect(workerHints(base)).toEqual({ extract: {}, summarize: {} });
+  });
+});
+
+describe('the summary source', () => {
+  let fake: FakeOpenAi;
+  let ctx: AppContext;
+  let source: SummarySource;
+  const mac: WorkerIdentity = { worker: 'macbook/codex#1', backend: 'codex', remote: true };
+  const box: WorkerIdentity = { worker: 'aliyun/api#1', backend: 'api', remote: true };
+  const extractAll = async () => runTier1Pass(ctx.store, ctx.config, ctx.llm, { batchSize: 32 });
+
+  beforeAll(async () => {
+    fake = await startFakeOpenAi({ answer: extractAnswer });
+    ctx = await workspace('summary-source', fake);
+    expect((await extractAll()).processed).toBe(3);
+    source = new SummarySource(ctx, {}, { leaseMs: 1_000, modelRetryMs: 0, transientRetryMs: 0, idleScanMs: 0 });
+  });
+  afterAll(async () => {
+    await source?.stop();
+    await ctx?.store.close();
+    await fake?.close();
+  });
+
+  it('hands out the documents due a summary, the latest extracted first, and writes each page from the answer with no model call of its own', async () => {
+    write(ctx.dataDir, 'raw/docs/q.md', '# 待抽取\n\n还没抽取的文档。\n');
+    await sync(ctx, { only: ['raw/docs/q.md'] });
+    source.prefer('raw/docs/b.md');
+    const tasks = await source.lease(mac, 8);
+    // a document still waiting for extraction is not due: its summary would miss what extraction finds
+    expect(tasks.map((t) => t.label)[0]).toBe('raw/docs/b.md');
+    expect(tasks.map((t) => t.label).sort()).toEqual(['raw/docs/a.md', 'raw/docs/b.md', 'raw/docs/long.md']);
+    const [first] = tasks;
+    expect(first).toMatchObject({ kind: 'summarize', json: false, maxTokens: 1200 });
+    expect(first.messages[0].content).toContain('Summarize the document');
+    expect(first.prompt).toContain('Source file: raw/docs/b.md');
+    expect(first.prompt).not.toContain('single JSON object');
+
+    const calls = fake.calls.length;
+    for (const t of tasks) {
+      expect(await source.complete(t.id, mac, { ok: true, text: `# 摘要\n\n${t.label} 的摘要。`, model: 'codex:gpt-test' })).toEqual({ accepted: true });
+    }
+    await until(async () => (await summaryPages(ctx)).size === 3, 10_000, 'the summary pages');
+    expect(fake.calls.length).toBe(calls);
+    const page = fs.readFileSync(path.join(ctx.dataDir, (await summaryPages(ctx)).get('raw/docs/b.md')!), 'utf8');
+    expect(page).toContain('raw/docs/b.md 的摘要。');
+    expect(page).toContain('knode-os/remote:codex:gpt-test');
+    expect(readSourceSummary(ctx.dataDir, 'raw/docs/b.md')).toMatchObject({ model: 'remote:codex:gpt-test' });
+    expect(await source.lease(box, 8)).toEqual([]);
+    expect((await source.status()).totals).toMatchObject({ calls: 3, ok: 3, pagesWritten: 3 });
+
+    fs.rmSync(path.join(ctx.dataDir, 'raw/docs/q.md'));
+    await sync(ctx, { only: ['raw/docs/q.md'] });
+  });
+
+  it('keeps a document\'s attempts through busy backends, and gives up after three bad answers', async () => {
+    write(ctx.dataDir, 'raw/docs/c.md', '# 丙\n\n一段会失败的文本。\n');
+    await sync(ctx, { only: ['raw/docs/c.md'] });
+    await extractAll();
+    let [task] = await source.lease(mac, 1);
+    expect(task.label).toBe('raw/docs/c.md');
+    expect(await source.complete(task.id, mac, { ok: false, error: 'HTTP 429 Too Many Requests' })).toEqual({ accepted: true });
+    expect(readSourceSummaryFailure(ctx.dataDir, 'raw/docs/c.md')).toBeNull();
+    for (const outcome of [
+      { ok: true as const, text: '   ' },
+      { ok: false as const, error: 'the model refused', kind: 'model' as const },
+      { ok: false as const, error: 'unusable reply' },
+    ]) {
+      [task] = await source.lease(box, 1);
+      expect(task.label).toBe('raw/docs/c.md');
+      expect(await source.complete(task.id, box, outcome)).toEqual({ accepted: true });
+    }
+    expect(readSourceSummaryFailure(ctx.dataDir, 'raw/docs/c.md')).toMatchObject({ attempts: 3 });
+    expect(await source.lease(mac, 1)).toEqual([]);
+  });
+
+  it('puts a lapsed lease back in line and refuses the late answer once someone else has the document', async () => {
+    write(ctx.dataDir, 'raw/docs/d.md', '# 丁\n\n一份会被转手的文档。\n');
+    await sync(ctx, { only: ['raw/docs/d.md'] });
+    await extractAll();
+    const [stale] = await source.lease(mac, 1);
+    expect(stale.label).toBe('raw/docs/d.md');
+    await sleep(1_100);
+    const [fresh] = await source.lease(box, 1);
+    expect(fresh.label).toBe('raw/docs/d.md');
+    expect(await source.complete(stale.id, mac, { ok: true, text: '迟到的摘要。' })).toMatchObject({ accepted: false });
+    expect(await source.complete(fresh.id, box, { ok: true, text: '# 丁\n\n摘要。' })).toEqual({ accepted: true });
+    expect(readSourceSummary(ctx.dataDir, 'raw/docs/d.md')?.body.trim()).toBe('# 丁\n\n摘要。');
+    expect((await source.status()).totals.leasesExpired).toBeGreaterThanOrEqual(1);
+  });
+
+  it('drops an answer for a document that changed while it was out; the new text waits for its extraction', async () => {
+    write(ctx.dataDir, 'raw/docs/e.md', '# 戊\n\n第一版。\n');
+    await sync(ctx, { only: ['raw/docs/e.md'] });
+    await extractAll();
+    const [task] = await source.lease(mac, 1);
+    expect(task.label).toBe('raw/docs/e.md');
+    write(ctx.dataDir, 'raw/docs/e.md', '# 戊\n\n第二版，内容变了。\n');
+    await sync(ctx, { only: ['raw/docs/e.md'] });
+    const stale = (await source.status()).totals.stale;
+    expect(await source.complete(task.id, mac, { ok: true, text: '第一版的摘要。' })).toEqual({ accepted: true });
+    expect((await source.status()).totals.stale).toBe(stale + 1);
+    expect(readSourceSummary(ctx.dataDir, 'raw/docs/e.md')).toBeNull();
+    expect(await source.lease(mac, 8)).toEqual([]);
   });
 });
 

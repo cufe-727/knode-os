@@ -13,6 +13,8 @@ import { startFollowUp } from '../labeling/followup.js';
 import { LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
 import { LabelingScheduler } from '../labeling/scheduler.js';
+import { WorkBroker } from '../work/broker.js';
+import { SummarySource } from '../work/summarize.js';
 import { LinkedFolders, syncedByFolders } from '../ingest/folders.js';
 import { sync } from '../ingest/sync.js';
 import { flushUsageToSidecars } from '../stats/heat.js';
@@ -76,9 +78,9 @@ function failOnListenError(server: { on: (event: 'error', cb: (err: NodeJS.Errno
 /**
  * `knode-os serve` — HTTP API + web UI + the remote API, plus the background
  * loops: file watcher → scoped sync (apply changed, dispose removed),
- * extraction as leased work for this machine's worker slots and remote workers
- * (src/labeling), the duplicate audit of what it wrote and summary pages after
- * it, view reconciliation, hourly usage-stats flush to sidecars, periodic trace
+ * extraction and summary pages as leased work for this machine's slots and
+ * remote workers (src/labeling, src/work), the duplicate audit of what was
+ * written, view reconciliation, hourly usage-stats flush to sidecars, periodic trace
  * sync, datasource re-sync, nightly dream + the tier-2 pass.
  *
  * Every request needs a signed-in account (src/auth) unless
@@ -117,7 +119,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
       const started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp });
       services.set(workspaceCtx.dataDir, {
         mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders,
-        labeling: started.labeling, localWorkers: started.localWorkers, processing: started.processing,
+        labeling: started.labeling, work: started.work, localWorkers: started.localWorkers, processing: started.processing,
       });
       return async () => {
         services.delete(workspaceCtx.dataDir);
@@ -263,6 +265,7 @@ interface StartedServices {
   track: <T>(job: Promise<T>) => Promise<T>;
   folders: LinkedFolders;
   labeling: LabelingScheduler;
+  work: WorkBroker;
   localWorkers: LocalLabelingWorkers;
   processing: LabelingProcessing;
 }
@@ -331,19 +334,20 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   }, interval);
   syncTimer.unref?.();
 
-  // extraction as leased work (src/labeling): this machine's worker slots and
-  // remote workers take segments as they free up, nothing waits for the
-  // slowest call; the duplicate audit of what was written, the views that
-  // depend on it and the summary pages follow on their own loop
-  // (docs/design/09, 10). The slots, reviews and summaries spend model calls,
-  // so none of them starts on its own: someone starts the processing (the
-  // app, POST /api/labeling/start) and it runs until stopped or shut down.
-  const remote = ctx.config.server.remote;
-  const labeling = new LabelingScheduler({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, log }, {
-    leaseMs: Math.max(1, remote?.leaseMinutes ?? 15) * 60_000,
-  });
-  const localWorkers = new LocalLabelingWorkers(labeling, () => ctx.config, { log });
+  // extraction and summary pages as leased work (src/labeling, src/work): this
+  // machine's slots and remote workers take segments and summaries as they
+  // free up, nothing waits for the slowest call; the duplicate audit of what
+  // was written and the views that depend on it follow on their own loop
+  // (docs/design/09, 10, 11). This machine's slots and the reviews spend model
+  // calls, so none of them starts on its own: someone starts the processing
+  // (the app, POST /api/labeling/start) and it runs until stopped or shut down.
+  const leaseMs = Math.max(1, ctx.config.server.remote?.leaseMinutes ?? 15) * 60_000;
+  let summaries: SummarySource | null = null;
+  const labeling = new LabelingScheduler({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, log, onWritten: (p) => summaries?.prefer(p) }, { leaseMs });
   const followUp = startFollowUp(ctx, labeling, { log, track, active: false });
+  summaries = new SummarySource(ctx, { serialize: followUp.serialize, log }, { leaseMs });
+  const work = new WorkBroker([labeling, summaries], { shares: () => ctx.config.server.remote?.shares });
+  const localWorkers = new LocalLabelingWorkers(work, () => ctx.config, { log });
   const processing = new LabelingProcessing(localWorkers, followUp, log);
   log('processing is stopped until an administrator starts it (the Processing button in the app or the web UI, or POST /api/labeling/start)');
 
@@ -435,7 +439,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       clearInterval(syncTimer);
       followUp.stop();
       localWorkers.stop();
-      await labeling.stop();
+      await work.stop();
       clearInterval(flushTimer);
       clearInterval(dreamTimer);
       clearInterval(tier2Timer);
@@ -450,6 +454,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     track,
     folders,
     labeling,
+    work,
     localWorkers,
     processing,
   };

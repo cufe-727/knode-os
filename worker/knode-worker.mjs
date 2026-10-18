@@ -1,26 +1,34 @@
 #!/usr/bin/env node
 // knode-os remote labeling worker — one file, no dependencies, Node 20+.
 //
-// Takes extraction segments from a knode-os server (POST /remote/v1/.../labeling/lease),
-// runs each on a model available on this machine, and hands back the raw reply
-// (…/labeling/complete). The server builds every prompt and checks every reply; this
-// script only runs the calls. Leases are renewed while a call runs and handed back
+// Takes work from a knode-os server (POST /remote/v1/.../work/lease) — extraction segments
+// and summary pages — runs each call on a model available on this machine, and hands back
+// the raw reply (…/work/complete). The server builds every prompt and checks every reply;
+// this script only runs the calls. Leases are renewed while a call runs and handed back
 // when the worker stops, so a stopped or crashed worker never strands work.
 //
 //   KNODE_TOKEN=knr_… node knode-worker.mjs --server https://knode-os.example \
 //     --workspace admin/finance --backends codex:2,cursor:2
 //
 // Backends (slots after the colon):
-//   codex   codex exec, read-only sandbox, ~/.codex/config.toml ignored (--codex-model, --codex-effort)
+//   codex   codex exec, read-only sandbox, ~/.codex/config.toml ignored (--codex-model, --codex-effort, --codex-speed)
 //   cursor  cursor-agent -p in ask mode (--cursor-model)
-//   claude  claude -p, one turn (--claude-model)
+//   claude  claude -p, one turn (--claude-model, --claude-effort)
 //   api     an OpenAI-compatible /chat/completions endpoint (--api-base-url, --api-model;
 //           the key comes from the variable named by --api-key-env, default OPENAI_API_KEY)
+//
+// Kinds of work (--kinds extract,summarize; default: every kind the server offers this token):
+//   extract    extraction segments, answered with a JSON object
+//   summarize  summary pages, answered in Markdown
+// The rest comes from the server (GET …/work/config): the kinds it offers, how long a lease
+// lasts, and how it runs each kind on codex, claude and cursor — model, effort, speed. A CLI
+// backend follows those unless its model is given here. A server that predates work/* hands
+// out extraction only, over …/labeling/*.
 //
 // Other options: --name <worker> (default: hostname), --timeout-ms <ms> (default 600000), --idle-ms <ms> (poll wait),
 // --header "Name: value" (repeatable; e.g. a Cloudflare Access service token),
 // --token-file <path> (instead of KNODE_TOKEN), --once (exit when there is no work),
-// --check (show what the token may do and which backends are installed, then exit).
+// --check (show what the token may do, what the server offers and which backends are installed, then exit).
 
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -58,6 +66,10 @@ const workerName = String(args.name ?? process.env.KNODE_WORKER_NAME ?? os.hostn
 const timeoutMs = Number(args.timeoutMs ?? 600_000);
 const backendSpec = String(args.backends ?? process.env.KNODE_BACKENDS ?? 'codex:1');
 const idleMs = Math.max(100, Number(args.idleMs ?? 20_000));
+const KINDS = ['extract', 'summarize'];
+const kindSpec = args.kinds ?? process.env.KNODE_KINDS;
+const askedKinds = kindSpec ? String(kindSpec).split(',').map((k) => k.trim()).filter(Boolean) : null;
+for (const k of askedKinds ?? []) if (!KINDS.includes(k)) throw new Error(`unknown kind of work "${k}" — use ${KINDS.join(', ')}`);
 if (!server || !/^https?:\/\//.test(server)) throw new Error('--server http(s)://… required (or KNODE_SERVER)');
 if (!/^[^/]+\/[^/]+$/.test(workspace)) throw new Error('--workspace <user>/<workspace-id> required (or KNODE_WORKSPACE)');
 if (!token) throw new Error('a token is required: KNODE_TOKEN=knr_… or --token-file <path>');
@@ -98,6 +110,47 @@ async function call(method, url, body) {
   }
   return { status: res.status, data };
 }
+
+/* ------------------------ the server's configuration ------------------------ */
+
+// GET …/work/config: the kinds this token may take here, lease length, model hints per kind and CLI.
+// null for a server that predates work/*: extraction only, over …/labeling/*.
+let work = null;
+let reading = null;
+
+async function readWorkConfig() {
+  try {
+    work = (await call('GET', `${base}/work/config`)).data;
+  } catch (err) {
+    // an older server answers a path it does not know with a bare 404; a missing workspace says so
+    if (err.status !== 404 || /no workspace/.test(err.message)) throw err;
+    work = null;
+  }
+}
+
+/** Read the config again (a lease answer said it changed); one read at a time, failures logged. */
+function rereadWorkConfig() {
+  reading ??= readWorkConfig()
+    .then(() => log(`server configuration changed: ${describeKinds()}`))
+    .catch((err) => log(`could not read the server configuration: ${err.message}`))
+    .finally(() => (reading = null));
+  return reading;
+}
+
+/** The kinds the LLM slots ask for: those given with --kinds, of the ones the server offers. */
+function kindsNow() {
+  const offered = work ? KINDS.filter((k) => work.kinds?.[k] === true) : ['extract'];
+  return askedKinds ? askedKinds.filter((k) => offered.includes(k)) : offered;
+}
+
+function describeKinds() {
+  if (!work) return 'a server from before work/* — extraction only';
+  const offered = KINDS.filter((k) => work.kinds?.[k] === true);
+  return `offers ${offered.join(', ') || 'nothing to this token'}; this worker takes ${kindsNow().join(', ') || 'nothing'}`;
+}
+
+/** How the server runs this kind of work on this CLI, unless this worker was given a model of its own. */
+const hintFor = (kind, backend) => work?.hints?.[kind ?? 'extract']?.[backend] ?? null;
 
 /* ------------------------- failures and backoff ------------------------- */
 // a copy of src/labeling/failures.ts
@@ -193,19 +246,28 @@ function readCursorStream(stdout) {
   return { text: chunks.join('\n').trim() || result.trim(), error };
 }
 
+// A backend given a model here ignores the server's hint for it (an effort chosen for another model);
+// otherwise the hint's model, effort and speed apply, each unless given here.
+const own = (model, hint) => (model ? null : hint);
+
 const BACKENDS = {
   codex: {
     bin: () => String(args.codexBin ?? 'codex'),
-    label: () => `codex:${args.codexModel ?? 'default'}`,
-    async complete(task) {
+    label: (hint) => `codex:${args.codexModel ?? own(args.codexModel, hint)?.model ?? 'default'}`,
+    async complete(task, hint) {
+      const h = own(args.codexModel, hint);
+      const model = args.codexModel ?? h?.model;
+      const effort = args.codexEffort ?? h?.effort;
+      const speed = args.codexSpeed ?? h?.speed;
       const dir = scratch();
       const out = path.join(dir, 'answer.txt');
       const ws = path.join(dir, 'workspace');
       fs.mkdirSync(ws);
       try {
         const argv = ['exec', '--ignore-user-config', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', ws, '--output-last-message', out];
-        if (args.codexModel) argv.push('--model', String(args.codexModel));
-        if (args.codexEffort) argv.push('-c', `model_reasoning_effort="${args.codexEffort}"`);
+        if (model) argv.push('--model', String(model));
+        if (effort) argv.push('-c', `model_reasoning_effort="${effort}"`);
+        if (speed) argv.push('-c', `service_tier="${speed}"`);
         argv.push('-');
         const r = await run(this.bin(), argv, task.prompt, ws);
         if (r.code !== 0) throw new Error(`codex exec exited with code ${r.code}: ${tail(r.stderr, r.stdout)}`);
@@ -219,12 +281,13 @@ const BACKENDS = {
   },
   cursor: {
     bin: () => String(args.cursorBin ?? 'cursor-agent'),
-    label: () => `cursor:${args.cursorModel ?? 'default'}`,
-    async complete(task) {
+    label: (hint) => `cursor:${args.cursorModel ?? hint?.model ?? 'default'}`,
+    async complete(task, hint) {
+      const model = args.cursorModel ?? hint?.model;
       const dir = scratch();
       try {
         const argv = ['-p', '--output-format', 'stream-json', '--trust', '--mode', 'ask', '--sandbox', 'enabled', '--workspace', dir];
-        if (args.cursorModel) argv.push('--model', String(args.cursorModel));
+        if (model) argv.push('--model', String(model));
         const r = await run(this.bin(), argv, task.prompt, dir);
         const { text, error } = readCursorStream(r.stdout);
         if (error || r.code !== 0) throw new Error(`cursor CLI error: ${error ? error.slice(0, 400) : tail(r.stderr, r.stdout)}`);
@@ -237,12 +300,16 @@ const BACKENDS = {
   },
   claude: {
     bin: () => String(args.claudeBin ?? 'claude'),
-    label: () => `claude:${args.claudeModel ?? 'default'}`,
-    async complete(task) {
+    label: (hint) => `claude:${args.claudeModel ?? own(args.claudeModel, hint)?.model ?? 'default'}`,
+    async complete(task, hint) {
+      const h = own(args.claudeModel, hint);
+      const model = args.claudeModel ?? h?.model;
+      const effort = args.claudeEffort ?? h?.effort;
       const dir = scratch();
       try {
         const argv = ['-p', '--output-format', 'json', '--max-turns', '1', '--no-session-persistence'];
-        if (args.claudeModel) argv.push('--model', String(args.claudeModel));
+        if (model) argv.push('--model', String(model));
+        if (effort) argv.push('--effort', String(effort));
         const r = await run(this.bin(), argv, task.prompt, dir);
         let wrapper = null;
         try {
@@ -269,10 +336,12 @@ const BACKENDS = {
       const model = String(args.apiModel ?? process.env.KNODE_API_MODEL ?? '');
       const key = process.env[String(args.apiKeyEnv ?? 'OPENAI_API_KEY')] ?? '';
       if (!baseUrl || !model) throw new Error('api backend needs --api-base-url and --api-model (CLI not found)');
+      // a summary is Markdown; only a task that wants JSON (every one from an older server) asks for JSON mode
+      const json = task.json !== false;
       const res = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) },
-        body: JSON.stringify({ model, messages: task.messages, temperature: 0.2, max_tokens: task.maxTokens, response_format: { type: 'json_object' } }),
+        body: JSON.stringify({ model, messages: task.messages, temperature: 0.2, max_tokens: task.maxTokens, ...(json ? { response_format: { type: 'json_object' } } : {}) }),
         signal: AbortSignal.timeout(timeoutMs),
       });
       const body = await res.text();
@@ -303,17 +372,31 @@ function onPath(bin) {
 
 if (args.check) {
   const { data } = await call('GET', `${server}/remote/v1/whoami`);
-  log(`token ${data.name} (${data.id}): scopes ${data.scopes?.join(', ')}; workspaces ${data.workspaces?.join(', ')}`);
-  const { data: status } = await call('GET', `${base}/labeling/status`);
-  log(`${workspace}: ${status.queued} documents queued, ${status.leases?.length ?? 0} segments out, ${status.workers?.length ?? 0} workers seen`);
-  for (const b of backends) log(`backend ${b.name} × ${b.slots}: ${onPath(b.impl.bin()) ? 'installed' : 'NOT FOUND on PATH'} (${b.impl.label()})`);
+  log(`token ${data.name} (${data.id}): scopes ${data.scopes?.join(', ')}${data.kinds ? ` (work: ${data.kinds.join(', ')})` : ''}; workspaces ${data.workspaces?.join(', ')}`);
+  await readWorkConfig();
+  log(`${workspace}: ${describeKinds()}`);
+  if (work) {
+    const { data: status } = await call('GET', `${base}/work/status`);
+    const extract = status.kinds?.extract;
+    const summaries = status.kinds?.summarize;
+    if (extract) log(`extraction: ${extract.queued} documents queued, ${extract.leases?.length ?? 0} segments out`);
+    if (summaries) log(`summaries: ${summaries.due} documents due at the last look, ${summaries.leases?.length ?? 0} out`);
+    log(`${status.workers?.length ?? 0} workers seen`);
+  } else {
+    const { data: status } = await call('GET', `${base}/labeling/status`);
+    log(`${workspace}: ${status.queued} documents queued, ${status.leases?.length ?? 0} segments out, ${status.workers?.length ?? 0} workers seen`);
+  }
+  for (const b of backends) {
+    const runs = kindsNow().map((kind) => `${kind} on ${b.impl.label(hintFor(kind, b.name))}`);
+    log(`backend ${b.name} × ${b.slots}: ${onPath(b.impl.bin()) ? 'installed' : 'NOT FOUND on PATH'} (${runs.join(', ') || b.impl.label(null)})`);
+  }
   process.exit(0);
 }
 
 /* -------------------------------- slots --------------------------------- */
 
 let stopping = false;
-const held = new Map(); // lease id → identity body, for release on shutdown
+const held = new Map(); // lease id → { identity, route }, for release on shutdown
 const sleepers = new Set();
 const sleep = (ms) => new Promise((resolve) => {
   if (stopping) return resolve();
@@ -326,8 +409,15 @@ const sleep = (ms) => new Promise((resolve) => {
   sleepers.add(done);
 });
 
+/** A task for the log: the document (and part), and what is asked of it. */
+function describeTask(task) {
+  const doc = task.document;
+  const label = task.label ?? (doc ? `${doc.path}${doc.parts > 1 ? ` [${doc.part}/${doc.parts}]` : ''}` : task.id);
+  return task.kind === 'summarize' ? `summary of ${label}` : label;
+}
+
 async function slot(backend, n) {
-  const identity = { worker: `${workerName}/${backend.name}#${n}`, backend: backend.impl.label() };
+  const identity = { worker: `${workerName}/${backend.name}#${n}`, backend: backend.impl.label(null) };
   let idleRounds = 0;
   while (!stopping) {
     const pause = backend.health.pausedUntil - Date.now();
@@ -335,12 +425,19 @@ async function slot(backend, n) {
       await sleep(Math.min(pause, 15_000));
       continue;
     }
+    if (reading) await reading;
+    // work/* on a server that has it; extraction over labeling/* on one from before
+    const route = work ? 'work' : 'labeling';
+    const kinds = kindsNow();
     let task;
     let leaseSeconds = 900;
     try {
-      const { data } = await call('POST', `${base}/labeling/lease`, { ...identity, max: 1 });
-      task = data.tasks?.[0];
-      leaseSeconds = data.leaseSeconds ?? leaseSeconds;
+      if (kinds.length) {
+        const { data } = await call('POST', `${base}/${route}/lease`, route === 'work' ? { ...identity, kinds, max: 1 } : { ...identity, max: 1 });
+        task = data.tasks?.[0];
+        leaseSeconds = data.leaseSeconds ?? leaseSeconds;
+        if (work && data.configVersion && data.configVersion !== work.version) void rereadWorkConfig();
+      }
     } catch (err) {
       log(`${identity.worker}: lease failed: ${err.message}`);
       if (err.status === 401 || err.status === 403) {
@@ -356,26 +453,27 @@ async function slot(backend, n) {
       continue;
     }
     idleRounds = 0;
-    held.set(task.id, identity);
+    held.set(task.id, { identity, route });
     const renew = setInterval(() => {
-      call('POST', `${base}/labeling/renew`, { ...identity, ids: [task.id] }).catch((err) => log(`${identity.worker}: renew failed: ${err.message}`));
+      call('POST', `${base}/${route}/renew`, { ...identity, ids: [task.id] }).catch((err) => log(`${identity.worker}: renew failed: ${err.message}`));
     }, Math.max(10_000, (leaseSeconds * 1000) / 3));
     const started = Date.now();
-    const where = `${task.document.path}${task.document.parts > 1 ? ` [${task.document.part}/${task.document.parts}]` : ''}`;
+    const where = describeTask(task);
+    const hint = hintFor(task.kind, backend.name);
     let outcome;
     try {
-      const text = await backend.impl.complete(task);
-      outcome = { ok: true, text, model: backend.impl.label() };
+      const text = await backend.impl.complete(task, hint);
+      outcome = { ok: true, text, model: backend.impl.label(hint) };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      outcome = { ok: false, error: message, kind: classify(message), model: backend.impl.label() };
+      outcome = { ok: false, error: message, kind: classify(message), model: backend.impl.label(hint) };
     } finally {
       clearInterval(renew);
     }
     if (stopping && !outcome.ok) break; // killed on shutdown: released below
     backend.health.calls++;
     try {
-      const { data } = await call('POST', `${base}/labeling/complete`, { ...identity, id: task.id, ...outcome });
+      const { data } = await call('POST', `${base}/${route}/complete`, { ...identity, id: task.id, ...outcome });
       held.delete(task.id);
       const secs = Math.round((Date.now() - started) / 1000);
       if (!data.accepted) log(`${identity.worker}: ${where} not taken back: ${data.reason}`);
@@ -398,20 +496,35 @@ async function slot(backend, n) {
 async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
-  log(`${signal}: stopping — handing back ${held.size} segment(s)`);
+  log(`${signal}: stopping — handing back ${held.size} task(s)`);
   for (const child of children) child.kill('SIGTERM');
   for (const wake of sleepers) wake();
   const byWorker = new Map();
-  for (const [id, identity] of held) {
-    const list = byWorker.get(identity.worker) ?? { identity, ids: [] };
+  for (const [id, { identity, route }] of held) {
+    const key = `${route} ${identity.worker}`;
+    const list = byWorker.get(key) ?? { identity, route, ids: [] };
     list.ids.push(id);
-    byWorker.set(identity.worker, list);
+    byWorker.set(key, list);
   }
-  await Promise.allSettled([...byWorker.values()].map(({ identity, ids }) => call('POST', `${base}/labeling/release`, { ...identity, ids })));
+  await Promise.allSettled([...byWorker.values()].map(({ identity, route, ids }) => call('POST', `${base}/${route}/release`, { ...identity, ids })));
 }
 process.on('SIGINT', () => void shutdown('SIGINT').then(() => process.exit(130)));
 process.on('SIGTERM', () => void shutdown('SIGTERM').then(() => process.exit(143)));
 
+// a server that cannot be reached yet is waited for; a token or workspace it refuses is not
+for (;;) {
+  try {
+    await readWorkConfig();
+    break;
+  } catch (err) {
+    if (err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 429) throw err;
+    log(`could not read the server configuration: ${err.message} — trying again in 30s`);
+    await sleep(30_000);
+    if (stopping) process.exit(0);
+  }
+}
 log(`knode worker ${workerName} → ${server} ${workspace}: ${backends.map((b) => `${b.name} × ${b.slots}`).join(', ')} (session ${crypto.randomUUID().slice(0, 8)})`);
+log(`${workspace}: ${describeKinds()}`);
+if (kindsNow().length === 0) log('nothing to take here — check --kinds, the token\'s kinds and what the server offers');
 await Promise.all(backends.flatMap((b) => Array.from({ length: b.slots }, (_, i) => slot(b, i + 1))));
 log('no more work — exiting');

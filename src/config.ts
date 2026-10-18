@@ -276,7 +276,10 @@ export interface ExtractionConfig {
    * machines come in through the remote API and need no entry here.
    */
   workers?: ExtractionWorkerConfig[];
-  /** Summary pages written at once by `serve`'s summary loop; default `concurrency`. */
+  /**
+   * Summary pages written at once on `serve`'s own summary slots (src/labeling/local.ts);
+   * default `concurrency`. 0 leaves summaries to remote workers.
+   */
   summaryConcurrency?: number;
 }
 
@@ -303,8 +306,18 @@ export interface RemoteApiConfig {
   enabled: boolean;
   /** Largest request body accepted, in bytes. */
   maxBodyBytes?: number;
-  /** How long a labeling worker may hold a segment before it goes back in line (renewable). */
+  /** How long a worker may hold a segment or a summary before it goes back in line (renewable). */
   leaseMinutes?: number;
+  /**
+   * The kinds of work besides extraction (always offered) that remote workers
+   * may take here (docs/design/11). Summaries default to on.
+   */
+  offer?: { summarize?: boolean };
+  /**
+   * How a slot that takes several kinds of work shares them: tasks handed out
+   * per kind, by weight (src/work/broker.ts). Default extraction 3, summaries 1.
+   */
+  shares?: { extract?: number; summarize?: number };
 }
 
 /**
@@ -798,7 +811,7 @@ export function defaultConfig(): KnodeConfig {
       port: 9100,
       host: '127.0.0.1',
       mcp: { enabled: true, path: '/mcp' },
-      remote: { enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15 },
+      remote: { enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15, offer: { summarize: true }, shares: { extract: 3, summarize: 1 } },
       auth: { enabled: true, sessionDays: 30, allowInsecureRemote: false },
       tls: null,
     },
