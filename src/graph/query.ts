@@ -173,13 +173,14 @@ export async function graphSearch(
   for (let hop = 0; hop < depth && frontier.length > 0; hop++) {
     // a merged entity's edges count for its survivor: expand the frontier to whole merge groups
     const frontierAll = await expandGroups(store, frontier);
+    // stored co_occurs rows may linger until the v13 cleanup has deleted them (store/migrations.ts); readers never show them
     const rels = asOf
-      ? (await relationsAsOf(store, frontierAll, asOf)).filter((r) => overlapsValidWindow(r, t))
+      ? (await relationsAsOf(store, frontierAll, asOf)).filter((r) => r.type !== 'co_occurs' && overlapsValidWindow(r, t))
       : await (async () => {
           const rp = new Params();
           const placeholders = frontierAll.map((id) => rp.add(id)).join(',');
           return store.query<RelationRow>(
-            `SELECT * FROM relations r WHERE (source_id IN (${placeholders}) OR target_id IN (${placeholders})) AND ${live('r', rp)} AND ${validOverlap('r', rp, t)}`,
+            `SELECT * FROM relations r WHERE (source_id IN (${placeholders}) OR target_id IN (${placeholders})) AND r.type <> 'co_occurs' AND ${live('r', rp)} AND ${validOverlap('r', rp, t)}`,
             rp.list,
           );
         })();
@@ -338,7 +339,7 @@ export async function graphOverview(store: Store, limit = 120): Promise<GraphSea
   const ids = ents.map((e) => e.id);
   const ph = ids.map((_, i) => `$${i + 1}`).join(',');
   const rels = await store.query<RelationRow>(
-    `SELECT * FROM relations WHERE source_id IN (${ph}) AND target_id IN (${ph}) AND tx_to IS NULL`,
+    `SELECT * FROM relations WHERE source_id IN (${ph}) AND target_id IN (${ph}) AND type <> 'co_occurs' AND tx_to IS NULL`,
     ids,
   );
   const edges: GraphEdge[] = rels.map((r) => ({
@@ -381,23 +382,24 @@ export interface GraphInsights {
 
 /** Simple graph health insights (llm_wiki's "Graph Insights" idea, minimal version). */
 export async function graphInsights(store: Store): Promise<GraphInsights> {
+  // typed edges only: stored co_occurs rows may linger until the v13 cleanup has deleted them
   const [tot] = await store.query<{ entities: number; relations: number; mentions: number; tombstoned: number }>(
     `SELECT (SELECT count(*)::int FROM entities WHERE tx_to IS NULL) AS entities,
-            (SELECT count(*)::int FROM relations WHERE tx_to IS NULL) AS relations,
+            (SELECT count(*)::int FROM relations WHERE tx_to IS NULL AND type <> 'co_occurs') AS relations,
             (SELECT count(*)::int FROM entity_mentions) AS mentions,
             (SELECT count(*)::int FROM entities WHERE tx_to IS NOT NULL) AS tombstoned`,
   );
   const hubs = await store.query<{ id: string; name: string; degree: number }>(
     `SELECT e.id, e.name, count(r.*)::int AS degree
      FROM entities e
-     JOIN relations r ON (r.source_id = e.id OR r.target_id = e.id) AND r.tx_to IS NULL
+     JOIN relations r ON (r.source_id = e.id OR r.target_id = e.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
      WHERE e.tx_to IS NULL
      GROUP BY e.id, e.name ORDER BY degree DESC LIMIT 10`,
   );
   const isolated = await store.query<{ id: string; name: string }>(
     `SELECT e.id, e.name FROM entities e
      WHERE e.tx_to IS NULL
-       AND NOT EXISTS (SELECT 1 FROM relations r WHERE (r.source_id = e.id OR r.target_id = e.id) AND r.tx_to IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM relations r WHERE (r.source_id = e.id OR r.target_id = e.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs')
        AND NOT ${coOccursSql('e.id')}
      ORDER BY e.mention_count DESC LIMIT 20`,
   );
@@ -405,7 +407,7 @@ export async function graphInsights(store: Store): Promise<GraphInsights> {
     `SELECT type, count(*)::int AS n FROM entities WHERE tx_to IS NULL GROUP BY type ORDER BY n DESC`,
   );
   const relationTypeCounts = await store.query<{ type: string; n: number }>(
-    `SELECT type, count(*)::int AS n FROM relations WHERE tx_to IS NULL GROUP BY type ORDER BY n DESC`,
+    `SELECT type, count(*)::int AS n FROM relations WHERE tx_to IS NULL AND type <> 'co_occurs' GROUP BY type ORDER BY n DESC`,
   );
   const unknownPredicates = await store.query<{ raw: string; n: number }>(
     `SELECT attrs ->> 'raw_type' AS raw, count(*)::int AS n FROM evidence

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { AppContext } from '../context.js';
 import { safePath } from '../fs/files.js';
+import { coOccurringEntities } from '../graph/cooccur.js';
 import { writeDeps } from '../lineage/deps.js';
 import { parseFrontmatter } from '../markdown.js';
 import { queryTerms } from '../search/search.js';
@@ -101,7 +102,7 @@ export async function recommendWikiTopics(ctx: AppContext, opts: RecommendOption
     );
     const degreeRows = await store.query<{ id: string; n: number }>(
       `SELECT e.id, count(r.id)::int AS n FROM entities e
-       LEFT JOIN relations r ON (r.source_id = e.id OR r.target_id = e.id) AND r.tx_to IS NULL
+       LEFT JOIN relations r ON (r.source_id = e.id OR r.target_id = e.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
        WHERE e.id IN (${ph}) GROUP BY e.id`,
       ids,
     );
@@ -188,12 +189,22 @@ export async function recommendWikiTopics(ctx: AppContext, opts: RecommendOption
     }
 
     /* ---- concept communities ---- */
+    // typed edges plus the co-occurrence derived among the hot entities (the
+    // bulk of what used to be stored co_occurs rows, which readers now ignore)
     const rels = await store.query<{ source_id: string; target_id: string; weight: number }>(
-      `SELECT source_id, target_id, weight FROM relations WHERE source_id IN (${ph}) AND target_id IN (${ph}) AND tx_to IS NULL`,
+      `SELECT source_id, target_id, weight FROM relations WHERE source_id IN (${ph}) AND target_id IN (${ph}) AND type <> 'co_occurs' AND tx_to IS NULL`,
       ids,
     );
+    const links = rels.map((r) => ({ source: r.source_id, target: r.target_id, weight: r.weight }));
+    const seenPair = new Set<string>();
+    for (const x of await coOccurringEntities(store, ids, { among: ids, maxDocuments: 50 })) {
+      const [a, b] = x.source < x.target ? [x.source, x.target] : [x.target, x.source];
+      if (seenPair.has(`${a}|${b}`)) continue;
+      seenPair.add(`${a}|${b}`);
+      links.push({ source: a, target: b, weight: x.weight });
+    }
     const byId = new Map(hot.map((e) => [e.id, e]));
-    const groups = [...detectCommunities(ids, rels.map((r) => ({ source: r.source_id, target: r.target_id, weight: r.weight }))).values()]
+    const groups = [...detectCommunities(ids, links).values()]
       .filter((g) => g.length >= 4)
       .sort((a, b) => b.length - a.length)
       .slice(0, 5);

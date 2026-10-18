@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import { vector } from '@electric-sql/pglite-pgvector';
 import { Store } from '../src/store/db.js';
-import { MIGRATIONS, SCHEMA_VERSION } from '../src/store/migrations.js';
+import { COOCCURS_CLEANUP_META, dropStoredCoOccurrence, MIGRATIONS, SCHEMA_VERSION } from '../src/store/migrations.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-migrations-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -107,14 +107,70 @@ describe('v13: co-occurrence is derived, not stored', () => {
     store = await Store.open(dataDir, 3);
     try {
       expect(store.migration).toEqual({ from: 12, to: SCHEMA_VERSION });
+      // the rows go in batches in the background once the migration committed, and the flag records it
+      expect(await store.cleanup).toMatchObject({ relations: 1, evidence: 1, batches: 1 });
       expect(await store.query(`SELECT id FROM relations ORDER BY id`)).toEqual([{ id: 'typed' }]);
       expect(await store.query(`SELECT kind, target_id FROM evidence ORDER BY kind`)).toEqual([
         { kind: 'entity', target_id: 'a' },
         { kind: 'relation', target_id: 'typed' },
       ]);
+      expect(await store.getMeta(COOCCURS_CLEANUP_META)).toMatchObject({ pending: false, relations: 1, evidence: 1, batches: 1 });
       expect(await store.query(`SELECT indexname FROM pg_indexes WHERE tablename = 'entity_mentions' AND indexname = 'mentions_document_idx'`)).toEqual([
         { indexname: 'mentions_document_idx' },
       ]);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it('deletes in short batches, logs progress, stops when asked and resumes, and does nothing once the flag is down', async () => {
+    const dataDir = path.join(tmp, 'v13-batches');
+    fs.mkdirSync(path.join(dataDir, '.knode'), { recursive: true });
+    const store = await Store.open(dataDir, 3);
+    try {
+      await store.cleanup; // the fresh database's own (empty) run
+      await store.query(`INSERT INTO scopes (id, kind, key, sha, status, actor, applied_at) VALUES ('s1', 'doc', 'raw/docs/a.md', 'sha', 'active', 'test', now())`);
+      await store.query(`INSERT INTO entities (id, name, type) VALUES ('a', 'A', 'concept'), ('b', 'B', 'concept')`);
+      const ids = Array.from({ length: 25 }, (_, i) => `co-${String(i).padStart(2, '0')}`);
+      await store.query(
+        `INSERT INTO relations (id, source_id, target_id, type, weight) SELECT id, 'a', 'b', 'co_occurs', 0.3 FROM unnest($1::text[]) AS t(id)`,
+        [ids],
+      );
+      await store.query(
+        `INSERT INTO relations (id, source_id, target_id, type, weight) VALUES ('typed', 'a', 'b', 'related_to', 1)`,
+      );
+      // two evidence rows per co_occurs edge (two sources), one for the typed edge
+      await store.query(
+        `INSERT INTO evidence (kind, target_id, scope_id, weight, extractor, attrs, tx_from)
+         SELECT 'relation', id, 's1', 0.3, x, '{}', now() FROM unnest($1::text[]) AS t(id), unnest(ARRAY['tier0.wikilink', 'tier1.llm']) AS e(x)`,
+        [ids],
+      );
+      await store.query(`INSERT INTO evidence (kind, target_id, scope_id, weight, extractor, attrs, tx_from) VALUES ('relation', 'typed', 's1', 1, 'tier0.frontmatter', '{}', now())`);
+
+      // nothing pending: a no-op
+      expect(await dropStoredCoOccurrence(store)).toBeNull();
+      expect(await store.query(`SELECT count(*)::int AS n FROM relations WHERE type = 'co_occurs'`)).toEqual([{ n: 25 }]);
+
+      await store.setMeta(COOCCURS_CLEANUP_META, { pending: true });
+      // stopped after the first statement (the floor is 100 relations per statement, so one batch takes all 25):
+      // the flag stays up and the work done so far is kept
+      let stopped = false;
+      const paused: string[] = [];
+      const partial = await dropStoredCoOccurrence(store, { stop: () => stopped, log: (line) => { paused.push(line); stopped = true; } });
+      expect(partial).toMatchObject({ relations: 0, batches: 0 });
+      expect(paused.at(-1)).toContain('paused at 0 / 25');
+      expect(await store.getMeta(COOCCURS_CLEANUP_META)).toMatchObject({ pending: true });
+
+      const lines: string[] = [];
+      const res = await dropStoredCoOccurrence(store, { batch: 10, log: (line) => lines.push(line) });
+      expect(res).toMatchObject({ relations: 25, evidence: 50, batches: 1 });
+      expect(await store.query(`SELECT id FROM relations ORDER BY id`)).toEqual([{ id: 'typed' }]);
+      expect(await store.query(`SELECT count(*)::int AS n FROM evidence WHERE kind = 'relation'`)).toEqual([{ n: 1 }]);
+      expect(await store.getMeta(COOCCURS_CLEANUP_META)).toMatchObject({ pending: false, relations: 25, evidence: 50 });
+      expect(lines[0]).toContain('dropping 25 stored co_occurs relation rows');
+      expect(lines.at(-1)).toContain('dropped 25 stored co_occurs relation rows and 50 evidence rows');
+      // idempotent: the flag is down, a second run touches nothing
+      expect(await dropStoredCoOccurrence(store)).toBeNull();
     } finally {
       await store.close();
     }
