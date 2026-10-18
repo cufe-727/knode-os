@@ -223,6 +223,8 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
       if (r.outcome === 'applied') {
         stats.indexed++;
         stats.applied++;
+        // embedding keeps pace with a long pass instead of starting when it ends
+        if (r.chunks) ctx.embeddings?.kick();
       } else if (r.outcome === 'unchanged') stats.unchanged++;
       else stats.skipped++;
       stats.chunks += r.chunks;

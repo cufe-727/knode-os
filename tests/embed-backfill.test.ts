@@ -158,6 +158,22 @@ describe('embedding after indexing', () => {
     expect(await pendingEmbeddings(ctx.store, embedder.model)).toBe(0);
   });
 
+  it('is kicked as each document is applied, not only when a long pass ends', async () => {
+    const kicks: number[] = [];
+    const saved = ctx.embeddings;
+    ctx.embeddings = { kick: () => kicks.push(Date.now()) };
+    try {
+      for (let i = 10; i < 13; i++) write(dataDir, `raw/docs/batch/r${i}.md`, REPORT(i));
+      const stats = await sync(ctx, { llmGraph: false, only: ['raw/docs/batch'] });
+      expect(stats.applied).toBe(3);
+      // one kick per applied document, and one more as the pass ends
+      expect(kicks.length).toBeGreaterThanOrEqual(4);
+    } finally {
+      ctx.embeddings = saved;
+    }
+    while ((await backfill.runOnce()) !== 0) { /* leave nothing pending for the next case */ }
+  });
+
   it('works through what is pending on its own once started, and picks up what a sync adds', async () => {
     backfill.start();
     write(dataDir, 'raw/docs/d.md', REPORT(4));
