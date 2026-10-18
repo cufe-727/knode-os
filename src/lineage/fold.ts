@@ -46,18 +46,27 @@ export async function foldTouched(q: Queryable, touched: TouchedSet, txTime: str
 
   await foldEntities(q, [...touched.entities], txTime, result, opts.typePrecedence);
 
-  // liveness flips cascade to the edges and claims that hang off the entity.
-  // A tombstone can only end the live ones: an edge or claim that is already
-  // gone stays gone, and a hub entity collects tens of thousands of those.
+  // liveness flips cascade to the edges and claims that hang off the entity,
+  // but only to the rows whose liveness the flip can change. A tombstone can
+  // only end the live ones; a return can only revive a row that still has
+  // live evidence (a claim: its own, or its merged members'). Any other row
+  // folds to what it already is, and a hub entity collects tens of thousands
+  // of them — refolding those made re-importing a cleared corpus crawl.
   const tombstoned = [...result.tombstoned.entities];
   const reopened = [...result.reopened.entities];
-  const attached = async (ids: string[], live: boolean) => {
-    const only = live ? ' AND tx_to IS NULL' : '';
-    for (const r of await selectIn<{ id: string }>(q, ids, (ph) => `SELECT id FROM relations WHERE (source_id IN (${ph}) OR target_id IN (${ph}))${only}`)) relationIds.add(r.id);
-    for (const c of await selectIn<{ id: string }>(q, ids, (ph) => `SELECT id FROM claims WHERE subject_id IN (${ph})${only}`)) claimIds.add(c.id);
+  const liveEvidenceOf = (kind: string, alias: string) =>
+    `EXISTS (SELECT 1 FROM evidence e WHERE e.kind = '${kind}' AND e.target_id = ${alias}.id AND e.tx_to IS NULL)`;
+  const attached = async (ids: string[], revive: boolean) => {
+    const rel = revive ? ` AND (r.tx_to IS NULL OR ${liveEvidenceOf('relation', 'r')})` : ' AND r.tx_to IS NULL';
+    const cl = revive
+      ? ` AND (c.tx_to IS NULL OR ${liveEvidenceOf('claim', 'c')}
+          OR EXISTS (SELECT 1 FROM claims m JOIN evidence e ON e.kind = 'claim' AND e.target_id = m.id AND e.tx_to IS NULL WHERE m.canonical_id = c.id))`
+      : ' AND c.tx_to IS NULL';
+    for (const r of await selectIn<{ id: string }>(q, ids, (ph) => `SELECT r.id FROM relations r WHERE (r.source_id IN (${ph}) OR r.target_id IN (${ph}))${rel}`)) relationIds.add(r.id);
+    for (const c of await selectIn<{ id: string }>(q, ids, (ph) => `SELECT c.id FROM claims c WHERE c.subject_id IN (${ph})${cl}`)) claimIds.add(c.id);
   };
-  await attached(tombstoned, true);
-  await attached(reopened, false);
+  await attached(tombstoned, false);
+  await attached(reopened, true);
 
   await foldRelations(q, [...relationIds], txTime, result);
   await foldClaims(q, [...claimIds], txTime, result);

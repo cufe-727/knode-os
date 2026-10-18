@@ -6,6 +6,7 @@ import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { sync } from '../src/ingest/sync.js';
 import { foldTouched, IN_BATCH } from '../src/lineage/fold.js';
+import { findLiveScope } from '../src/lineage/scope.js';
 import { emptyTouched } from '../src/lineage/types.js';
 
 /**
@@ -101,5 +102,37 @@ describe('the fold at scale', () => {
     await sync(ctx, { llmGraph: false });
     expect((await edge('甲公司', '乙公司'))?.live).toBe(true);
     expect((await edge('甲公司', '丙公司'))?.live).toBe(false);
+  });
+
+  it('revives an edge with live evidence when its dead endpoint returns, without being touched itself', async () => {
+    const { store } = ctx;
+    const live = async (id: string) => (await store.query<{ live: boolean }>(`SELECT (tx_to IS NULL) AS live FROM entities WHERE id = $1`, [id]))[0]?.live;
+    const edgeOf = async (a: string, b: string) =>
+      (await store.query<{ id: string; live: boolean }>(
+        `SELECT id, (tx_to IS NULL) AS live FROM relations WHERE type = 'co_occurs' AND ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))`,
+        [a, b],
+      ))[0];
+    write(dataDir, 'raw/docs/e.md', doc('丁戊报告', ['丁公司', '戊公司']));
+    await sync(ctx, { llmGraph: false });
+    fs.rmSync(path.join(dataDir, 'raw/docs/e.md'));
+    await sync(ctx, { llmGraph: false });
+    const gone = await edgeOf('丁公司', '戊公司');
+    expect(gone?.live).toBe(false);
+    // 丁 returns alone; then the edge gains live evidence from 丁's source while 戊 is still dead
+    write(dataDir, 'raw/docs/f.md', doc('丁报告', ['丁公司']));
+    await sync(ctx, { llmGraph: false });
+    expect(await live('丁公司')).toBe(true);
+    const f = await findLiveScope(store, 'doc', 'raw/docs/f.md');
+    await store.query(
+      `INSERT INTO evidence (kind, target_id, scope_id, segment_id, weight, extractor, attrs, tx_from, trust)
+       SELECT 'relation', $1, scope_id, NULL, 1, 'test.injected', '{}'::jsonb, now(), trust FROM evidence WHERE scope_id = $2 LIMIT 1`,
+      [gone!.id, f!.id],
+    );
+    expect((await edgeOf('丁公司', '戊公司'))?.live).toBe(false);
+    // 戊 returns through a source that names only 戊: the edge is not touched, its endpoint's return revives it
+    write(dataDir, 'raw/docs/g.md', doc('戊报告', ['戊公司']));
+    await sync(ctx, { llmGraph: false });
+    expect(await live('戊公司')).toBe(true);
+    expect((await edgeOf('丁公司', '戊公司'))?.live).toBe(true);
   });
 });
