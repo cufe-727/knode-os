@@ -70,6 +70,25 @@ describe('watchTree', () => {
   it('throws for a root that is not there, so the caller can retry later', () => {
     expect(() => watchTree(path.join(tmp, 'missing'), () => {})).toThrow();
   });
+
+  it('tells the other watchers of the process when one opens or closes, since that blinds them for a moment', () => {
+    for (const dir of ['blind-a', 'blind-b']) fs.mkdirSync(path.join(tmp, dir), { recursive: true });
+    const blinded = { a: 0, b: 0 };
+    const a = watchTree(path.join(tmp, 'blind-a'), () => {}, { onBlinded: () => blinded.a++ });
+    try {
+      expect(blinded).toEqual({ a: 0, b: 0 });
+      const b = watchTree(path.join(tmp, 'blind-b'), () => {}, { onBlinded: () => blinded.b++ });
+      expect(blinded).toEqual({ a: 1, b: 0 });
+      b.close();
+      expect(blinded).toEqual({ a: 2, b: 0 });
+      b.close();
+      expect(blinded).toEqual({ a: 2, b: 0 });
+      expect(() => watchTree(path.join(tmp, 'missing'), () => {})).toThrow();
+      expect(blinded).toEqual({ a: 2, b: 0 });
+    } finally {
+      a.close();
+    }
+  });
 });
 
 describe('what the data-dir watcher syncs', () => {
