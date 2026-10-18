@@ -2608,6 +2608,40 @@ const cliMeta = {
   'cursor-cli': { command: 'cursor-agent -p', path: 'cursor-agent', note: 'Uses your existing Cursor Agent login in headless print mode.' },
 };
 
+/**
+ * GET /api/config/providers: what `provider` may name on this service — the
+ * built-ins plus whatever its loaded plugins registered, each with the config
+ * fields it reads. The names above are the fallback for a service that does
+ * not answer it.
+ */
+let providerCatalog = { llm: [], embedding: [], storage: [], converters: [] };
+const LLM_FIELDS_DEFAULT = ['baseUrl', 'apiKey', 'protocol', 'model'];
+
+function applyProviderCatalog(catalog) {
+  providerCatalog = { llm: [], embedding: [], storage: [], converters: [], ...(catalog || {}) };
+  for (const p of providerCatalog.llm) {
+    providerNames[p.id] = p.label;
+    if (p.note && !LLM_NOTES[p.id]) LLM_NOTES[p.id] = p.note;
+  }
+  for (const p of providerCatalog.embedding) {
+    if (!EMBEDDING_PROVIDER_OPTIONS.some(([id]) => id === p.id)) EMBEDDING_PROVIDER_OPTIONS.push([p.id, p.label]);
+    if (p.note && !EMB_NOTES[p.id]) EMB_NOTES[p.id] = p.note;
+  }
+}
+
+/** The providers a connection row may pick: endpoints and other non-agent kinds (the coding-agent CLIs are agents, in the table below). */
+function connectionProviderOptions(selected) {
+  const listed = providerCatalog.llm.filter((p) => p.kind !== 'cli').map((p) => [p.id, p.label]);
+  const pairs = listed.length ? listed : [['openai', providerNames.openai]];
+  if (selected && !pairs.some(([id]) => id === selected)) pairs.push([selected, providerNames[selected] ?? selected]);
+  return pairs;
+}
+
+/** Which fields a connection's provider reads; the OpenAI-compatible set when the service did not say. */
+function llmProviderFields(provider) {
+  return providerCatalog.llm.find((p) => p.id === provider)?.fields ?? LLM_FIELDS_DEFAULT;
+}
+
 /* ---------- the model picker, shared by every model field ---------- */
 
 /**
@@ -3183,13 +3217,23 @@ function embeddingFields(entry) {
  * the table below, with their path and effort.
  */
 function llmFields(entry, route) {
+  const provider = entry.provider || 'openai';
+  // the form follows the provider: an endpoint shows its URL, key and wire; a
+  // command its executable; a plugin provider whatever fields it declared
+  const fields = llmProviderFields(provider);
+  const has = (field) => fields.includes(field);
+  const inputs = [];
+  if (has('baseUrl')) inputs.push(`<label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1" /></label>`);
+  if (has('apiKey')) inputs.push(`<label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY" /></label>`);
+  if (has('protocol')) inputs.push(`<label>Protocol<select data-field="protocol">${optionList(PROTOCOL_OPTIONS, entry.protocol || 'auto')}</select></label>`);
+  if (has('cliPath')) inputs.push(`<label class="cfg-span-2">Executable<input data-field="cliPath" value="${esc(entry.cliPath || '')}" placeholder="/path/to/program" /></label>`);
+  if (has('cliTimeoutMs')) inputs.push(`<label>Timeout (ms)<input data-field="cliTimeoutMs" type="number" min="1000" step="1000" value="${esc(entry.cliTimeoutMs ?? 300000)}" /></label>`);
+  if (has('model')) inputs.push(`<label class="cfg-span-2">Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="${provider === 'openai' ? 'gpt-4.1-mini' : 'model id'}" />${modelChevron(route)}</span></label>`);
   return `<div class="cfg-grid cfg-grid-2">
-      <label class="cfg-span-2">Base URL<input data-field="baseUrl" value="${esc(entry.baseUrl || '')}" placeholder="https://api.openai.com/v1" /></label>
-      <label>API key<input data-field="apiKey" value="${esc(entry.apiKey || '')}" placeholder="env:OPENAI_API_KEY" /></label>
-      <label>Protocol<select data-field="protocol">${optionList(PROTOCOL_OPTIONS, entry.protocol || 'auto')}</select></label>
-      <label class="cfg-span-2">Model<span class="model-field"><input data-field="model" value="${esc(entry.model || '')}" placeholder="gpt-4.1-mini" />${modelChevron(route)}</span></label>
+      <label>Provider<select data-field="provider">${optionsFor(connectionProviderOptions(provider), provider)}</select></label>
+      ${inputs.join('\n      ')}
     </div>
-    <p class="cfg-callout">${esc(LLM_NOTES.openai)}</p>`;
+    <p class="cfg-callout">${esc(LLM_NOTES[provider] ?? LLM_NOTES.openai)}</p>`;
 }
 
 function renderProviders() {
@@ -3298,6 +3342,13 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     const cfg = await api('/api/config');
     if (activeWorkspace()?.id !== workspaceId) return;
     loadedConfig = cfg;
+    // which providers this service knows — its plugins may add some
+    try {
+      applyProviderCatalog(await api('/api/config/providers'));
+    } catch {
+      // an older service: the built-in names above stay
+    }
+    if (activeWorkspace()?.id !== workspaceId) return;
     embeddingDrafts = (cfg.embeddingProviders ?? []).map((e) => ({ ...e }));
     embeddingUse = cfg.embeddingUse || embeddingDrafts[0]?.id || '';
     embeddingPoolDraft = { enabled: false, model: 'bge-m3', dimensions: 1024, batchSize: 16, ...cfg.embeddingPool };
@@ -4189,9 +4240,10 @@ $('#cfg-providers').addEventListener('change', (event) => {
     found.draft.baseUrl = '';
     found.draft.apiKey = '';
     found.draft.model = '';
-  } else if (found.row.dataset.kind === 'llm' && found.draft.provider !== 'openai') {
-    found.draft.baseUrl = '';
-    found.draft.apiKey = '';
+  } else if (found.row.dataset.kind === 'llm') {
+    const fields = llmProviderFields(found.draft.provider);
+    if (!fields.includes('baseUrl')) found.draft.baseUrl = '';
+    if (!fields.includes('apiKey')) found.draft.apiKey = '';
   }
   renderProviders();
   fillRouteOptions();

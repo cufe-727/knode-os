@@ -280,7 +280,9 @@ export class WorkspaceContextRegistry {
   private async open(dataDir: string, scope: WorkspaceScope): Promise<AppContext> {
     const configFile = path.join(dataDir, CONFIG_FILE);
     if (!fs.existsSync(configFile)) this.initialize(dataDir, scope, new Date().toISOString());
-    const ctx = await createContext(dataDir);
+    // a workspace's config is a copy of the root's: a plugin it names by a
+    // relative path lives beside the root config, not in every workspace
+    const ctx = await createContext(dataDir, { pluginRoots: [this.rootDataDir] });
     const cleanup = await this.options.onCreate?.(ctx, scope);
     if (cleanup) this.cleanups.set(dataDir, cleanup);
     return ctx;

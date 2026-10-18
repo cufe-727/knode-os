@@ -43,6 +43,7 @@ const RULES: Rule[] = [
   { prefix: '/api/auth/', group: null },
   { prefix: '/api/workspaces', group: null },
   { prefix: '/api/config', group: null, methods: READ },
+  { prefix: '/api/plugins', group: null, methods: READ },
   { prefix: '/api/agents', group: null, methods: READ },
   { prefix: '/api/research/profiles', group: null, methods: READ },
   { prefix: '/api/chat/protocol', group: null, methods: READ },

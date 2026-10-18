@@ -1,8 +1,15 @@
 import crypto from 'node:crypto';
 import { EmbeddingConfig, resolveSecret } from '../config.js';
 import { EMBED_INPUT_CHARS } from '../constants.js';
+import { pluginRegistry } from '../plugins/registry.js';
 
+/**
+ * What the Index stage, the duplicate audits and search embed with. The
+ * built-in providers are below; `createEmbeddingProvider` picks one — or one a
+ * plugin registered — by the config's `provider` (docs/design/11).
+ */
 export interface EmbeddingProvider {
+  /** Identity of the vector space; vectors are only comparable within one model. */
   readonly model: string;
   readonly dimensions: number;
   embed(texts: string[]): Promise<number[][]>;
@@ -12,7 +19,7 @@ export interface EmbeddingProvider {
  * Calls any OpenAI-compatible `/embeddings` endpoint (OpenAI, Azure, Ollama,
  * vLLM, SiliconFlow, …). Configure baseUrl/model/dimensions in knode.config.json.
  */
-class OpenAIEmbeddingProvider implements EmbeddingProvider {
+export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   readonly model: string;
   readonly dimensions: number;
   private readonly baseUrl: string;
@@ -66,7 +73,7 @@ class OpenAIEmbeddingProvider implements EmbeddingProvider {
  * means images can later be embedded into the same space by sending an
  * `image_url` part instead.
  */
-class ArkMultimodalEmbeddingProvider implements EmbeddingProvider {
+export class ArkMultimodalEmbeddingProvider implements EmbeddingProvider {
   readonly model: string;
   readonly dimensions: number;
   private readonly url: string;
@@ -172,8 +179,16 @@ export class LocalHashEmbeddingProvider implements EmbeddingProvider {
   }
 }
 
+/**
+ * The provider a config names, from the plugin registry. An unknown id is an
+ * error rather than a quiet fallback to the hashing embedder: vectors from two
+ * models in one table would make recall silently wrong.
+ */
 export function createEmbeddingProvider(cfg: EmbeddingConfig): EmbeddingProvider {
-  if (cfg.provider === 'openai') return new OpenAIEmbeddingProvider(cfg);
-  if (cfg.provider === 'ark-multimodal') return new ArkMultimodalEmbeddingProvider(cfg);
-  return new LocalHashEmbeddingProvider(cfg.dimensions);
+  const plugin = pluginRegistry().embeddingProvider(cfg.provider);
+  if (!plugin) {
+    const known = pluginRegistry().embeddingProviders().map((p) => p.id).join(', ');
+    throw new Error(`unknown embedding provider "${cfg.provider}" (registered: ${known}) — a plugin that provides it must be listed under "plugins" in knode.config.json`);
+  }
+  return plugin.create(cfg);
 }

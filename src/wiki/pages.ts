@@ -20,6 +20,7 @@ import { classifyFailure } from '../labeling/failures.js';
 import { LlmClient } from '../llm/client.js';
 import { applyScope } from '../lineage/scope.js';
 import { isGeneratedConcept, okfGenerated } from '../okf/index.js';
+import { pluginRegistry } from '../plugins/registry.js';
 import { getDocHeat } from '../stats/heat.js';
 import { Store } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
@@ -229,10 +230,12 @@ const sourceSummary: PageGenerator = {
       const source = loadSourceText(ctx.dataDir, doc.path, doc.root);
       if (!source) return null;
       const content = source.text.slice(0, LLM_WIKI_INPUT_CHARS);
-      body = await llm.complete([
+      // `summary.request` hooks (docs/design/11) may rewrite the prompt — a house style, a language, extra context
+      const messages = await pluginRegistry().filter('summary.request', [
         { role: 'system', content: SOURCE_SYSTEM },
         { role: 'user', content: `Source file: ${doc.path}\n\n${content}` },
-      ], { maxTokens: 1200 });
+      ], { path: doc.path, root: doc.root, dataDir: ctx.dataDir, title: doc.title ?? path.basename(doc.path), text: content });
+      body = await llm.complete(messages, { maxTokens: 1200 });
       by = llm.label;
       at = new Date().toISOString();
       writeSourceSummary(ctx.dataDir, doc.path, { contentSha: doc.sha256, model: llm.label, body, generatedAt: at });

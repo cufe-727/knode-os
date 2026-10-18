@@ -1,8 +1,9 @@
 import crypto from 'node:crypto';
 import { KnodeConfig } from '../config.js';
-import { parseExtractReply, RawExtractReply } from '../graph/llm-extract.js';
+import { RawExtractReply } from '../graph/llm-extract.js';
 import { loadOntology, Ontology } from '../graph/ontology.js';
 import {
+  checkExtractReply,
   DocPlan,
   finishPlan,
   pendingOf,
@@ -224,7 +225,7 @@ export class LabelingScheduler {
       }
       this.leases.delete(taskId);
       doc.leased.delete(lease.index);
-      this.record(who, doc, lease, outcome);
+      await this.record(who, doc, lease, outcome);
       if (!settled(doc.plan.results[lease.index]) && !doc.leased.has(lease.index)) doc.ready.add(lease.index);
       if (lease.index === 0 && doc.plan.segments.length > 1 && settled(doc.plan.results[0])) {
         for (const i of pendingOf(doc.plan)) if (!doc.leased.has(i)) doc.ready.add(i);
@@ -435,7 +436,7 @@ export class LabelingScheduler {
     };
   }
 
-  private record(who: WorkerIdentity, doc: OpenDoc, lease: Lease, outcome: TaskOutcome): void {
+  private async record(who: WorkerIdentity, doc: OpenDoc, lease: Lease, outcome: TaskOutcome): Promise<void> {
     const now = Date.now();
     const plan = doc.plan;
     const label = plan.segments.length > 1 ? ` [${lease.index + 1}/${plan.segments.length}]` : '';
@@ -447,7 +448,8 @@ export class LabelingScheduler {
     if (outcome.ok) {
       try {
         const reply = jsonFromReply<RawExtractReply>(outcome.text);
-        recordSegmentOutcome(plan, lease.index, { ok: true, result: parseExtractReply(reply, lease.request) }, model);
+        const result = await checkExtractReply(reply, lease.request, { dataDir: this.ctx.dataDir, plan, index: lease.index, model });
+        recordSegmentOutcome(plan, lease.index, { ok: true, result }, model);
         doc.strikes.delete(lease.index);
         doc.notBefore.delete(lease.index);
       } catch (err) {

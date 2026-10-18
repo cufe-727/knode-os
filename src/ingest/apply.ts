@@ -17,12 +17,14 @@ import { isReservedWikiFile } from '../lineage/declared.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
 import { ParsedMarkdown, parseFrontmatter, titleFromMarkdown } from '../markdown.js';
 import { isGeneratedConcept } from '../okf/index.js';
+import { pluginRegistry } from '../plugins/registry.js';
 import { restoreUsageFromSidecar } from '../stats/heat.js';
 import { Store } from '../store/db.js';
 import { DocRoot } from '../types.js';
 import { hasProse, hasRegions, stripRegions } from '../wiki/regions.js';
 import { chunkText } from './chunker.js';
 import { docDateOf } from './docdate.js';
+import { estimateTokens } from '../llm/tokens.js';
 import type { DeferredEmbeddings } from '../context.js';
 import { EmbeddingProvider } from './embeddings.js';
 import { loadSourceText, sha256 } from './source.js';
@@ -144,7 +146,17 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const docDate = docDateOf(file, parsed.frontmatter);
 
   /* ── pure preparation: chunking, embeddings (network, unless deferred), tier-0 plans ── */
-  const pieces = await chunkText(file, parsed.body, config.ingest, { markdown: source.derived || undefined });
+  // plugin hooks (docs/design/11) may reshape the chunks and the tier-0 terms
+  // here, before anything is written; the scope body below stays pure writes
+  const registry = pluginRegistry();
+  let pieces = await chunkText(file, parsed.body, config.ingest, { markdown: source.derived || undefined });
+  if (registry.hasHandlers('chunk')) {
+    pieces = (await registry.filter('chunk', pieces, {
+      path: file, root, dataDir: store.dataDir, text: parsed.body,
+      config: { chunkSize: config.ingest.chunkSize, chunkOverlap: config.ingest.chunkOverlap },
+    })).filter((p) => p && typeof p.content === 'string' && p.content.trim().length > 0)
+      .map((p) => ({ content: p.content, tokenCount: Number.isFinite(p.tokenCount) ? p.tokenCount : estimateTokens(p.content) }));
+  }
   const chunkRows = pieces.map((p, i) => ({ id: chunkIdFor(docId, i, p.content), seq: i, content: p.content, tokenCount: p.tokenCount }));
   const vectors = new Map<string, number[]>();
   if (chunkRows.length > 0) {
@@ -171,7 +183,11 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const humanPlan = !isSource && cls.graph
     ? planWireFromMarkdown(store.dataDir, page, { frontmatter: parsed.frontmatter, body: cls.humanBody }, { selfEntity: true, body: cls.humanBody, wikiIndex: opts.wikiIndex })
     : null;
-  const concepts = root === 'docs' && isSource ? extractConcepts(parsed.body) : [];
+  let concepts = root === 'docs' && isSource ? extractConcepts(parsed.body) : [];
+  if (root === 'docs' && isSource && registry.hasHandlers('tier0.concepts')) {
+    const filtered = await registry.filter('tier0.concepts', concepts, { path: file, root, dataDir: store.dataDir, text: parsed.body, frontmatter: parsed.frontmatter });
+    concepts = [...new Set((Array.isArray(filtered) ? filtered : []).filter((c) => typeof c === 'string').map((c) => c.trim()).filter(Boolean))];
+  }
   const declared = root === 'docs' && isSource ? frontmatterExtraction(parsed.frontmatter) : null;
   const capabilityNotes = root === 'capabilities' ? parseCapabilityNotes(parsed) : [];
   // Trust follows the *document's* origin, not whoever happened to run this
@@ -299,7 +315,14 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     }
   }
 
-  return { outcome: 'applied', chunks: chunkRows.length, entities: g.entities, relations: g.relations, scopeId: res.scope.id };
+  const outcome: DocOutcome = { outcome: 'applied', chunks: chunkRows.length, entities: g.entities, relations: g.relations, scopeId: res.scope.id };
+  if (registry.hasHandlers('document.applied')) {
+    await registry.emit('document.applied', {
+      path: file, root, dataDir: store.dataDir, outcome: 'applied',
+      chunks: outcome.chunks, entities: outcome.entities, relations: outcome.relations, scopeId: outcome.scopeId,
+    });
+  }
+  return outcome;
 }
 
 function tier1ScopeMeta(docId: string, tier1: SidecarTier1): Record<string, unknown> {

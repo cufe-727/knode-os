@@ -1,7 +1,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import type { PluginSpec } from './plugins/types.js';
 import { agentFileNames, isValidAgentName, readAgentFile, renameProfileAgents, upgradeAgentFiles, writeAgentFile } from './research/agent-file.js';
+
+/** The embedding providers knode-os ships with; a plugin may register more (docs/design/11). */
+export const BUILTIN_EMBEDDING_PROVIDERS = ['openai', 'ark-multimodal', 'local'] as const;
+export type BuiltinEmbeddingProvider = (typeof BUILTIN_EMBEDDING_PROVIDERS)[number];
 
 export interface EmbeddingConfig {
   /**
@@ -9,9 +14,10 @@ export interface EmbeddingConfig {
    * 'ark-multimodal' = Volcengine Ark's /embeddings/multimodal endpoint
    *                    (doubao-embedding-vision-*), which fuses one input into
    *                    a single vector and therefore embeds one text per call;
-   * 'local'          = built-in hashing embedder (offline, no key needed).
+   * 'local'          = built-in hashing embedder (offline, no key needed);
+   * anything else    = an embedding provider a plugin registered.
    */
-  provider: 'openai' | 'ark-multimodal' | 'local';
+  provider: string;
   baseUrl: string;
   /** Plain key, or "env:VAR_NAME" to read from the environment. */
   apiKey: string;
@@ -86,7 +92,8 @@ export interface EmbeddingPoolConfig {
  * a scalar column cannot be pushed into the walk).
  */
 export interface DatabaseConfig {
-  kind: 'pglite' | 'postgres';
+  /** 'pglite', 'postgres', or the id of a storage backend a plugin registered (docs/design/11). */
+  kind: string;
   host: string;
   port: number;
   user: string;
@@ -96,9 +103,33 @@ export interface DatabaseConfig {
   database: string;
   /** Schemas are named `<prefix>_<workspace slug>_<hash of the data dir>`. */
   schemaPrefix: string;
+  /**
+   * postgres: a connection string (`postgres://user:pass@host:5432/knode`)
+   * instead of the host/port/user/password/database fields; "env:VAR_NAME"
+   * reads it from the environment. A database named in the URL wins over
+   * `database`.
+   */
+  url?: string;
+  /** postgres: TLS — true or 'require' verify the server certificate, 'no-verify' encrypts without verifying. */
+  ssl?: boolean | 'require' | 'no-verify';
+  /** postgres: connections in one workspace's pool (pg's default is 10). */
+  poolSize?: number;
+  /** pglite: where the embedded database lives, relative to the workspace or absolute. Default `.knode/db`. */
+  path?: string;
+  /** Anything a storage plugin needs beyond the fields above. */
+  options?: Record<string, unknown>;
 }
 
-export type LlmProvider = 'openai' | 'codex-cli' | 'claude-cli' | 'cursor-cli';
+/**
+ * What `provider` may name on a connection or a route: a built-in
+ * (`BUILTIN_LLM_PROVIDERS`) or an LLM provider a plugin registered. Open so a
+ * config may name a provider the running process has not loaded — the client
+ * then reports it, rather than the config failing to parse.
+ */
+export type LlmProvider = string;
+
+/** The LLM providers knode-os ships with. `command` runs any executable as a model (src/llm/providers/command.ts). */
+export const BUILTIN_LLM_PROVIDERS = ['openai', 'codex-cli', 'claude-cli', 'cursor-cli', 'command'] as const;
 
 /** The coding-agent CLIs: agents that bring their own loop, kept in `playbooks/agents/`. */
 export const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli'] as const;
@@ -150,7 +181,9 @@ export interface LlmConfig {
    * 'openai'     = any OpenAI-compatible /v1/chat/completions endpoint (needs baseUrl/apiKey);
    * 'codex-cli'  = shell out to the local `codex exec` CLI (reuses its login, no key);
    * 'claude-cli' = shell out to the local `claude -p` CLI (reuses its login, no key);
-   * 'cursor-cli' = shell out to the local `cursor-agent -p` CLI (reuses its login, no key).
+   * 'cursor-cli' = shell out to the local `cursor-agent -p` CLI (reuses its login, no key);
+   * 'command'    = run the executable at `cliPath` once per call (JSON on stdin, reply on stdout);
+   * anything else = an LLM provider a plugin registered.
    */
   provider: LlmProvider;
   /** OpenAI-compatible endpoint. Ignored by CLI providers. */
@@ -745,6 +778,13 @@ export interface KnodeConfig {
     /** Max trace excerpt characters fed to the LLM per dream run. */
     maxContextChars: number;
   };
+  /**
+   * Plugin modules to load when this workspace opens (docs/design/11): LLM and
+   * embedding providers, storage backends, document converters and hooks at
+   * the processing stages. Loaded once per process; file-only — the settings
+   * screen does not edit it.
+   */
+  plugins?: PluginSpec[];
 }
 
 export const CONFIG_FILE = 'knode.config.json';
@@ -1543,12 +1583,14 @@ export function embeddingProviderLabel(provider: EmbeddingConfig['provider']): s
   }
 }
 
+/** The built-in providers' display names; a plugin provider's label comes from its registration (GET /api/config/providers). */
 export function llmProviderLabel(provider: LlmProvider): string {
   switch (provider) {
     case 'openai': return 'OpenAI-compatible API';
     case 'codex-cli': return 'Codex CLI';
     case 'claude-cli': return 'Claude Code CLI';
     case 'cursor-cli': return 'Cursor Agent CLI';
+    case 'command': return 'Command · any executable';
     default: return provider;
   }
 }
@@ -1596,5 +1638,19 @@ export function redactConfig(config: KnodeConfig): KnodeConfig {
     if (ds.password && !ds.password.startsWith('env:')) ds.password = '***';
   }
   if (clone.database?.password && !clone.database.password.startsWith('env:')) clone.database.password = '***';
+  if (clone.database?.url) clone.database.url = redactConnectionUrl(clone.database.url);
   return clone;
+}
+
+/** A connection string with its password masked; an "env:VAR" reference or a string that is no URL is returned as it is. */
+export function redactConnectionUrl(url: string): string {
+  if (!url || url.startsWith('env:')) return url;
+  try {
+    const parsed = new URL(url);
+    if (!parsed.password) return url;
+    parsed.password = '***';
+    return parsed.toString();
+  } catch {
+    return url;
+  }
 }

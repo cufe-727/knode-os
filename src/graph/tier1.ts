@@ -6,6 +6,7 @@ import { loadSourceText } from '../ingest/source.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
 import { LlmClient } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
+import { pluginRegistry } from '../plugins/registry.js';
 import { Store } from '../store/db.js';
 import { toIso } from '../store/temporal.js';
 import { heldDocuments, claimDocument, releaseDocument } from '../labeling/claims.js';
@@ -353,7 +354,7 @@ export async function segmentExtractRequest(store: Store, config: KnodeConfig, p
   const fromDb = await knownEntitiesIn(store, seg.text);
   const fromDoc = multi ? knownFromDocument(plan, seg.text) : [];
   const known = [...fromDoc, ...fromDb.filter((k) => !fromDoc.some((d) => d.name.toLowerCase() === k.name.toLowerCase()))].slice(0, 30);
-  return buildExtractRequest(plan.page, seg.text, {
+  const request = buildExtractRequest(plan.page, seg.text, {
     claims: config.extraction.claims,
     ontology,
     knownEntities: known,
@@ -363,6 +364,39 @@ export async function segmentExtractRequest(store: Store, config: KnodeConfig, p
     subject: multi && index > 0 && lead?.status === 'done' ? lead.subject ?? null : null,
     askSubject: multi && index === 0,
   });
+  // `extract.request` hooks (docs/design/11) see the call as it will be sent —
+  // or leased to a worker on another machine, which runs exactly these messages
+  const registry = pluginRegistry();
+  if (!registry.hasHandlers('extract.request')) return request;
+  const shaped = await registry.filter('extract.request', request, { path: plan.row.path, root: 'docs', dataDir: store.dataDir, title: plan.page.title, segment: segmentContext(plan, index) });
+  if (!shaped || !Array.isArray(shaped.messages) || shaped.messages.length === 0) throw new Error(`extract.request hook returned no messages for ${plan.row.path}`);
+  return { ...request, ...shaped, maxTokens: Number.isFinite(shaped.maxTokens) && shaped.maxTokens > 0 ? Math.floor(shaped.maxTokens) : request.maxTokens };
+}
+
+function segmentContext(plan: DocPlan, index: number): { index: number; total: number; heading: string | null } | undefined {
+  if (plan.segments.length <= 1) return undefined;
+  return { index, total: plan.segments.length, heading: plan.segments[index]?.heading ?? null };
+}
+
+/**
+ * Check a model's reply the way `parseExtractReply` does, then let
+ * `extract.result` hooks (docs/design/11) filter, rename or enrich what was
+ * extracted; the outcome is checked once more, so a loosely shaped answer from
+ * a hook never reaches the sidecar. Shared by the batch pass and the labeling
+ * scheduler, so a hook sees every extraction however it was run.
+ */
+export async function checkExtractReply(
+  reply: RawExtractReply,
+  request: Pick<ExtractRequest, 'withClaims' | 'askSubject'>,
+  ctx: { dataDir: string; plan: DocPlan; index: number; model: string },
+): Promise<ExtractResult> {
+  const parsed = parseExtractReply(reply, request);
+  const registry = pluginRegistry();
+  if (!registry.hasHandlers('extract.result')) return parsed;
+  const shaped = await registry.filter('extract.result', parsed, {
+    path: ctx.plan.row.path, root: 'docs', dataDir: ctx.dataDir, title: ctx.plan.page.title, model: ctx.model, segment: segmentContext(ctx.plan, ctx.index),
+  });
+  return parseExtractReply(shaped as RawExtractReply, request);
 }
 
 /** What one call made of a segment: its result, or one more failed attempt. */
@@ -558,7 +592,8 @@ async function runTier1PassUnlocked(
         progress(`tier1 extract ${plan.row.path}${label}`);
         const request = await segmentExtractRequest(store, config, plan, index, ontology);
         const reply = await entityLlm.completeJson<RawExtractReply>(request.messages, { maxTokens: request.maxTokens });
-        recordSegmentOutcome(plan, index, { ok: true, result: parseExtractReply(reply, request) }, entityLlm.label);
+        const result = await checkExtractReply(reply, request, { dataDir: store.dataDir, plan, index, model: entityLlm.label });
+        recordSegmentOutcome(plan, index, { ok: true, result }, entityLlm.label);
         stats.tokensUsed += estimateTokens(seg.text) + OUTPUT_TOKEN_ESTIMATE;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

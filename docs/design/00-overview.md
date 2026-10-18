@@ -193,3 +193,7 @@ regeneration and is itself a source.
   consistent view, quarantined agent writes that open disputes instead of
   overwriting, ACLs intersected down the derivation chain, and change
   subscriptions cursored on system time.
+- [11 — Plugins: pluggable processing stages, storage and models](11-plugins-and-udfs.md) ([中文](11-plugins-and-udfs.zh-CN.md))
+  — one registry for LLM / embedding providers, storage backends, document
+  converters and user-defined hooks at every processing stage; the built-ins
+  are registered through the same API. How-to: [docs/plugins.md](../plugins.md).

@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { redactConfig, resolveDataDir, CONFIG_FILE, loadConfig, saveConfig } from './config.js';
 import { createContext } from './context.js';
+import { configuredPluginSpecs, loadPlugins } from './plugins/loader.js';
+import { pluginRegistry } from './plugins/registry.js';
 import { initDataDir } from './fs/datadir.js';
 import { benchAnswer } from './bench/answer.js';
 import { benchBuild } from './bench/build.js';
@@ -1790,6 +1792,36 @@ program
     const { loadConfig } = await import('./config.js');
     console.log(`config file: ${path.join(dir, CONFIG_FILE)}\n`);
     console.log(JSON.stringify(redactConfig(loadConfig(dir)), null, 2));
+  });
+
+program
+  .command('plugins')
+  .description('load the plugins this data directory names and list what they — and the built-ins — provide: LLM and embedding providers, storage backends, converters, hooks')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    const dir = dataDir();
+    initDataDir(dir);
+    const config = loadConfig(dir);
+    const specs = configuredPluginSpecs(config.plugins);
+    await loadPlugins(dir, config.plugins, { log: opts.json ? undefined : (m) => console.log(`  ${m}`) });
+    const registry = pluginRegistry();
+    if (opts.json) {
+      console.log(JSON.stringify({ configured: specs, plugins: registry.describe(), warnings: registry.warnings }, null, 2));
+      return;
+    }
+    console.log(specs.length ? `configured: ${specs.map((s) => s.module).join(', ')}` : 'configured: none (add "plugins": [{ "module": "./plugins/x.mjs" }] to knode.config.json, or set KNODE_PLUGINS)');
+    for (const p of registry.describe()) {
+      const parts = [
+        p.llmProviders.length ? `llm: ${p.llmProviders.join(', ')}` : '',
+        p.embeddingProviders.length ? `embedding: ${p.embeddingProviders.join(', ')}` : '',
+        p.storageBackends.length ? `storage: ${p.storageBackends.join(', ')}` : '',
+        p.converters.length ? `converters: ${p.converters.join(', ')}` : '',
+        p.hooks.length ? `hooks: ${p.hooks.join(', ')}` : '',
+      ].filter(Boolean);
+      console.log(`\n${p.name}${p.version ? ` ${p.version}` : ''}  (${p.source})${p.description ? `\n  ${p.description}` : ''}`);
+      for (const line of parts) console.log(`  ${line}`);
+    }
+    for (const warning of registry.warnings) console.log(`\nnote: ${warning}`);
   });
 
 program.parseAsync(process.argv).catch((err) => {

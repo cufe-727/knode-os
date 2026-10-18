@@ -21,6 +21,7 @@ knode-os combines two ideas — [llm_wiki](https://github.com/nashsu/llm_wiki)'s
 - **Context packs.** `knode-os pack "<utterance>"` (or the `knode_context_pack` MCP tool) matches entities in the utterance, expands the graph (doc chunks, time-bound claims flagged `STALE`/`CONFLICT`, linked live tables), executes playbook-declared probe queries against the live sources (asOf-stamped, short-TTL cached, never persisted), and returns gap analysis with ready-to-run follow-up SQL.
 - **Playbooks that learn.** Context packs are driven by agent-editable `playbooks/packs/*.md` workflows. Every build is logged to `pack_events`; `knode-os pack-optimize` (also part of the nightly dream) turns failure/gap patterns into full playbook revisions — accepted suggestions are written back to `playbooks/packs/`, so the next query runs a better script.
 - **MCP server** so Claude Code / Codex (CLI or app) can search, ask, read, write, grep, run native SQL against live sources, and build context packs directly.
+- **Pluggable models, storage and stages.** A plugin module (`plugins` in `knode.config.json`) adds LLM providers, embedding providers, storage backends, document converters and user-defined hooks at every processing stage — strip boilerplate before hashing, change chunking, filter tier-0 terms, add a rule to every extraction prompt, post-process what the model returned, restyle summaries, get told when a document lands. The built-ins are registered through the same API; a `command` provider runs any executable as a model with no code at all. See [docs/plugins.md](docs/plugins.md).
 - **Native Google OKF v0.2 compatibility**: `wiki/` is itself a portable Open Knowledge Format bundle, with validation, version routing, legacy migration, lossless bundle import/export, and graph wiring for ordinary OKF markdown links. The v0.2 provenance/trust/lifecycle families (`generated`, `verified`, `status`, `stale_after`) are understood, and v0.1 bundles are still read through the spec's documented fallbacks. Unknown types, extension frontmatter and broken links are consumed permissively as the specification requires.
 - **Native Obsidian Vault**: open `wiki/` directly in Obsidian. Vault-local settings and an attachment directory are preconfigured; Properties, aliases, tags, `[[wikilinks]]`, vault paths, heading/block references and `![[embeds]]` work natively. Every imported or exported OKF knowledge bundle is also initialized as its own Vault.
 - **`ask`**: cited answers from your knowledge base with an explicit "what's missing" gap list.
@@ -69,6 +70,7 @@ Install globally (`npm link` or `pnpm add -g .`) to use the `knode-os` binary di
 │   ├── packs/          # context-pack playbooks (revised by the learning loop)
 │   ├── capabilities/   # semantic notes over live datasource capabilities
 │   └── intents/        # intent specs: the slots an answer needs
+├── plugins/            # optional: plugin modules named in knode.config.json (providers, converters, hooks)
 ├── ledger/             # events.jsonl (machine truth) + attic/ (sidecars of removed sources)
 └── .knode/             # derived PGlite index — safe to delete & reindex
 ```
@@ -110,11 +112,12 @@ CLI-only data directories continue to use `<data>/knode.config.json`:
     "kind": "postgres",              // default: PostgreSQL (one shared database, a schema per workspace); "pglite" = embedded, zero setup
     "host": "127.0.0.1", "port": 5432,
     "user": "", "password": "",      // password also takes "env:VAR"; empty for trust/peer auth
+    "url": "",                       // or one connection string instead (postgres://…, "env:VAR" too), with "ssl": "require" and "poolSize"
     "database": "knode",             // one shared database, created on first open
     "schemaPrefix": "ws"             // one schema per workspace: <prefix>_<workspace>_<hash>
   },
   "llm": {
-    "provider": "openai",            // also: "codex-cli" / "claude-cli" / "cursor-cli"
+    "provider": "openai",            // also: "codex-cli" / "claude-cli" / "cursor-cli", "command" (any executable), or a plugin's
     "baseUrl": "https://api.openai.com/v1",
     "apiKey": "env:OPENAI_API_KEY",
     "model": "gpt-4.1-mini"          // empty = LLM features off, heuristics used
@@ -145,11 +148,16 @@ CLI-only data directories continue to use `<data>/knode.config.json`:
       "endpoints": [{ "name": "quote", "path": "/v1/quote", "params": [{ "name": "symbol", "required": true }],
                       "resultPath": "data", "entityParams": [{ "column": "symbol", "entityType": "organization" }] }] }
   ],
-  "pack": { "maxEntities": 4, "maxDocs": 6, "maxProbes": 6, "liveTtlSeconds": 30, "staleNewsDays": 7 }
+  "pack": { "maxEntities": 4, "maxDocs": 6, "maxProbes": 6, "liveTtlSeconds": 30, "staleNewsDays": 7 },
+  "plugins": [                       // providers, storage backends, converters and hooks — see docs/plugins.md
+    { "module": "./plugins/house-rules.mjs", "options": { "redact": ["CONFIDENTIAL"] } }
+  ]
 }
 ```
 
 Any OpenAI-compatible endpoint works (Ollama, vLLM, SiliconFlow, …). `protocol` picks the wire: the default `auto` probes once per endpoint (tokenlessly) for a `/responses` route and prefers it — reasoning models return their thinking as a first-class output item there, while Chat Completions can only smuggle it through a non-standard `message.reasoning_content` — and falls back to `/chat/completions` when there is none. Pin it to `responses` or `chat` to skip the probe. For embeddings, `"provider": "ark-multimodal"` additionally targets Volcengine Ark's `/embeddings/multimodal` route (`doubao-embedding-vision-*`), which is not OpenAI-shaped: it returns one fused vector per request, so `baseUrl` ends at `/api/v3`, `model` is the endpoint id (`ep-…`), and `batchSize` becomes the concurrency window over single-text calls. Document vision, entity extraction, document summaries and judging (`knode_ask`, Dream, the duplicate-entity and claim reviews) each have their own route, which names a model or an agent; a route left empty is written down as the default it would have run on. Image/scanned-PDF conversion supports a vision-capable OpenAI-compatible model, Codex CLI or Claude Code CLI. Text PDFs are extracted locally without an LLM. Changing `dimensions` drops and rebuilds the embedding table on next start. Everything can also be edited from the web UI's **Settings** tab (with route tests).
+
+**Plugins.** `provider` and `database.kind` name ids from a registry, and the built-ins are only its first entries ([docs/design/11](docs/design/11-plugins-and-udfs.md)). A module listed under `plugins` (or in `KNODE_PLUGINS`) may register an LLM provider for a vendor API knode-os does not speak, an embedding provider, a storage backend that reaches a Postgres some other way, a converter for another file type (`.docx`, `.epub`, …), and hooks at the processing stages: `source.text`, `chunk`, `tier0.concepts`, `extract.request`, `extract.result`, `summary.request`, `document.applied`. The `command` provider needs no plugin: `cliPath` names an executable that gets `{ messages, model, json, maxTokens, images }` on stdin and answers on stdout, with the connection's key in `KNODE_LLM_API_KEY`. `database.url` takes a connection string (`env:DATABASE_URL` too) with `ssl` and `poolSize`; `database.path` moves a PGlite index. `knode-os plugins` and `GET /api/config/providers` show what is registered. Walkthrough and examples: [docs/plugins.md](docs/plugins.md), [demo/plugins](demo/plugins/README.md).
 
 The index lives in PostgreSQL by default (set `KNODE_DATABASE_KIND=pglite` before the first run, or `database.kind: "pglite"`, for the embedded zero-setup index that the test suite also uses). With `postgres` the same schema sits on the server: all workspaces share one database and are isolated by schema, each created on first open. That is worth doing once a workspace outgrows PGlite's single-process 32-bit WASM build (roughly a million chunks) or when several processes must read one index at once. Schema-level isolation is deliberate — a database would carry its own ~8 MB catalog per workspace, while folding every workspace into shared tables keyed by a workspace column would cost the vector index outright: HNSW walks a distance-ordered neighbour graph, so an equality predicate on a scalar column cannot be pushed into the walk and the planner falls back to a sequential scan. Embedding vectors are stored as `halfvec`: pgvector caps an index entry at one 8 KB page, which is 2000 dims for `vector` but 4000 for `halfvec`, so half precision is what keeps the HNSW index reachable at 1536/2048 dims — and halves the table. Switching an existing database between the two column types converts in place without re-embedding.
 
@@ -225,6 +233,7 @@ knode-os entities merge|unmerge|merges|dedupe|resolve   entity resolution: rever
 knode-os review entities|claims   the review passes (LLM judge over duplicate candidates; verdicts on disputed / suspected claims)
 knode-os wiki lint             orphans, broken links, stale / unreviewed research pages, expired and superseded text
 knode-os config               show active config (redacted)
+knode-os plugins [--json]     the plugins this data directory loads and what they — and the built-ins — provide
 ```
 
 Every command takes `--data <path>` (or set `KNODE_OS_DATA`).
@@ -267,7 +276,7 @@ Four sections, each with its own tabs.
 
 ## REST API
 
-`GET /api/health · /api/config · /api/stats · /api/tree · /api/file · /api/search[?as_of] · /api/grep · /api/graph[?as_of&valid_at] · /api/graph/insights · /api/entities · /api/documents · /api/datasources · /api/okf/validate · /api/traces · /api/suggestions · /api/lineage?kind&id · /api/history?path`
+`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/tree · /api/file · /api/search[?as_of] · /api/grep · /api/graph[?as_of&valid_at] · /api/graph/insights · /api/entities · /api/documents · /api/datasources · /api/okf/validate · /api/traces · /api/suggestions · /api/lineage?kind&id · /api/history?path`
 `PUT /api/config` · `PUT /api/file` · `DELETE /api/file` (disposes the source) · `POST /api/config/test | /api/upload | /api/ingest | /api/sync | /api/forget | /api/purge | /api/rebuild | /api/ask | /api/pack | /api/mv | /api/mkdir | /api/datasources/sync | /api/datasources/:id/query | /api/traces/sync | /api/dream | /api/wiki/generate | /api/suggestions/:id/status` · folders from this machine: `GET /api/folders` · `POST /api/folders/preview | /api/folders/import` (`{ source, dest?, mode: copy | link, replace? }`) `| /api/folders/sync` · `DELETE /api/folders?dest=…&removeFiles=1`
 
 Every route needs a session — a signed-in browser's cookie, or `Authorization: Bearer knu_…` (the app's, or a script's from `knode-os user token`) — and the route's API group; sign-in itself is under `/api/auth/*` ([docs/remote-access.md](docs/remote-access.md)). Workspace-scoped data APIs also take `X-Knode-Workspace-Kind` (`personal` or `team`), `X-Knode-Workspace-ID`, and `X-Knode-Workspace-Name`; the workspace's owner is the signed-in account (`X-Knode-User` names it only with sign-in off). `DELETE /api/workspace` completely clears the selected workspace.

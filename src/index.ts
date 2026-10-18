@@ -61,3 +61,29 @@ export {
 export { createApp } from './server/app.js';
 export { startServer } from './server/serve.js';
 export * from './types.js';
+
+/* ------------------------------ plugin API ------------------------------ */
+// What a plugin module (or an embedding program) registers against; see docs/design/11.
+export { PluginRegistry, pluginRegistry, resetPluginRegistry } from './plugins/registry.js';
+export { configuredPluginSpecs, loadPlugins, resolvePluginModule } from './plugins/loader.js';
+export type {
+  ConverterInput,
+  DocumentAppliedEvent,
+  DocumentConverterPlugin,
+  DocumentHookContext,
+  EmbeddingProviderPlugin,
+  HookName,
+  KnodePlugin,
+  LlmBackend,
+  LlmProviderPlugin,
+  PipelineHooks,
+  PluginApi,
+  PluginSpec,
+  PluginSummary,
+  StorageBackendPlugin,
+} from './plugins/types.js';
+export { LlmClient, jsonFromReply, type ChatMessage, type CompletionOptions, type ImageAttachment } from './llm/client.js';
+export { withProvenance, type ConversionResult, type VisionModel } from './ingest/converters/shared.js';
+export { openPglite, openPostgres, postgresPoolConfig, type Backend, type BackendTx } from './store/backend.js';
+export type { ChunkPiece } from './ingest/chunker.js';
+export type { ExtractRequest, ExtractResult } from './graph/llm-extract.js';

@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { AppContext } from '../context.js';
-import { DB_DIR } from '../fs/datadir.js';
 import { Sidecar } from '../fs/sidecar.js';
 import { applyExtraction } from '../graph/llm-extract.js';
 import { applyClaimMerge, unmergeClaim } from '../graph/claim-merge.js';
@@ -9,6 +8,7 @@ import { applyMerge, unmergeEntity } from '../graph/merge.js';
 import { PageContext } from '../graph/store.js';
 import { documentIdFor } from '../ingest/apply.js';
 import { sync, SyncStats } from '../ingest/sync.js';
+import { pgliteDir } from '../store/backend.js';
 import { Store } from '../store/db.js';
 import { readAtticSidecar } from './attic.js';
 import { appendLedger, ledgerTimeline, nextLedgerSeq, readLedger, seedLedgerSeq } from './ledger.js';
@@ -34,7 +34,8 @@ export async function rebuild(ctx: AppContext, opts: { history?: boolean; onProg
   const progress = opts.onProgress ?? (() => {});
   const dataDir = ctx.dataDir;
   await ctx.store.close();
-  fs.rmSync(path.join(dataDir, DB_DIR), { recursive: true, force: true });
+  // the embedded database's directory; on a server backend there is nothing on disk to drop
+  fs.rmSync(pgliteDir(dataDir, ctx.config.database), { recursive: true, force: true });
   ctx.store = await Store.open(dataDir, ctx.config.embedding.dimensions, ctx.config.database);
   const store = ctx.store;
   await seedLedgerSeq(store, dataDir);

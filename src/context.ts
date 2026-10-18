@@ -4,6 +4,7 @@ import { initDataDir } from './fs/datadir.js';
 import { EmbeddingProvider } from './ingest/embeddings.js';
 import { createConfiguredEmbeddingProvider } from './ingest/embedding-router.js';
 import { LlmClient } from './llm/client.js';
+import { loadPlugins } from './plugins/loader.js';
 import { Store } from './store/db.js';
 
 /** Everything a command needs, wired from a data directory. */
@@ -50,9 +51,21 @@ export function summaryLlmClient(config: KnodeConfig): LlmClient {
   return new LlmClient(resolveRoutedLlmConfig(config.llm, config.extraction.summaryLlm, routeTargets(config)));
 }
 
-export async function createContext(dataDir: string): Promise<AppContext> {
+export interface CreateContextOptions {
+  /**
+   * Where a relative plugin path in this workspace's config is also looked
+   * for: the root data directory whose config the workspace copied (set by
+   * the workspace registry under `serve`).
+   */
+  pluginRoots?: string[];
+}
+
+export async function createContext(dataDir: string, opts: CreateContextOptions = {}): Promise<AppContext> {
   initDataDir(dataDir);
   const config = loadConfig(dataDir);
+  // plugins before anything that resolves a provider: the store may open on a
+  // backend one of them adds, the embedder and the stages on providers they add
+  await loadPlugins(dataDir, config.plugins, { log: (msg) => console.log(`[knode-os] ${msg}`), roots: opts.pluginRoots });
   const store = await Store.open(dataDir, config.embedding.dimensions, config.database);
   const embedder = createConfiguredEmbeddingProvider(config);
   const llm = judgeLlmClient(config);

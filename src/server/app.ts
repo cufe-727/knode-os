@@ -18,7 +18,6 @@ import {
   KnodeConfig,
   LlmConfig,
   LlmConnection,
-  LlmProvider,
   RoutedLlmConfig,
   SagSearchConfig,
   redactConfig,
@@ -104,6 +103,9 @@ import { syncTraces } from '../traces/sync.js';
 import { runDream } from '../dream/dream.js';
 import { generateWiki } from '../wiki/generate.js';
 import { validateOkfBundle } from '../okf/index.js';
+import { configuredPluginSpecs } from '../plugins/loader.js';
+import { pluginRegistry } from '../plugins/registry.js';
+import { HOOK_NAMES } from '../plugins/types.js';
 import { resolveKnowledgeLink } from '../obsidian/links.js';
 import {
   getSuggestion,
@@ -222,8 +224,9 @@ function isProtectedPath(rel: string): boolean {
   return PROTECTED_PATHS.has(cleanRelPath(rel)) || PROTECTED_PATHS.has(rel);
 }
 
-const LLM_PROVIDERS: LlmProvider[] = ['openai', 'codex-cli', 'claude-cli', 'cursor-cli'];
-const EMBEDDING_PROVIDERS: EmbeddingConfig['provider'][] = ['openai', 'ark-multimodal', 'local'];
+/** A provider a client may name: a built-in, or one a loaded plugin registered (src/plugins). */
+const knownLlmProvider = (id: unknown): id is string => typeof id === 'string' && pluginRegistry().llmProvider(id) !== undefined;
+const knownEmbeddingProvider = (id: unknown): id is string => typeof id === 'string' && pluginRegistry().embeddingProvider(id) !== undefined;
 
 type AppEnv = {
   Variables: {
@@ -235,7 +238,7 @@ type AppEnv = {
 function mergeLlmConfig(current: LlmConfig, incoming: Partial<LlmConfig> = {}): LlmConfig {
   const cliTimeout = Number(incoming.cliTimeoutMs);
   return {
-    provider: incoming.provider && LLM_PROVIDERS.includes(incoming.provider) ? incoming.provider : current.provider,
+    provider: knownLlmProvider(incoming.provider) ? incoming.provider : current.provider,
     baseUrl: typeof incoming.baseUrl === 'string' ? incoming.baseUrl.trim() : current.baseUrl,
     apiKey: incoming.apiKey === '***' || incoming.apiKey === undefined ? current.apiKey : String(incoming.apiKey),
     model: typeof incoming.model === 'string' ? incoming.model.trim() : current.model,
@@ -253,7 +256,7 @@ function mergeRoutedLlmConfig(current: RoutedLlmConfig, incoming: Partial<Routed
   const provider = incoming.provider;
   return {
     use: typeof incoming.use === 'string' ? incoming.use.trim() : current.use,
-    provider: provider === 'inherit' || (provider && LLM_PROVIDERS.includes(provider)) ? provider : current.provider,
+    provider: provider === 'inherit' || knownLlmProvider(provider) ? provider : current.provider,
     baseUrl: typeof incoming.baseUrl === 'string' ? incoming.baseUrl.trim() : current.baseUrl,
     apiKey: incoming.apiKey === '***' || incoming.apiKey === undefined ? current.apiKey : String(incoming.apiKey),
     model: typeof incoming.model === 'string' ? incoming.model.trim() : current.model,
@@ -309,7 +312,7 @@ function mergeEmbeddingConfig(current: EmbeddingConfig, incoming: Partial<Embedd
   const dims = Number(incoming.dimensions);
   const batch = Number(incoming.batchSize);
   return {
-    provider: incoming.provider && EMBEDDING_PROVIDERS.includes(incoming.provider) ? incoming.provider : current.provider,
+    provider: knownEmbeddingProvider(incoming.provider) ? incoming.provider : current.provider,
     baseUrl: typeof incoming.baseUrl === 'string' ? incoming.baseUrl.trim() : current.baseUrl,
     apiKey: incoming.apiKey === '***' || incoming.apiKey === undefined ? current.apiKey : String(incoming.apiKey),
     model: typeof incoming.model === 'string' ? incoming.model.trim() : current.model,
@@ -541,6 +544,39 @@ export function createApp(
     // Never awaited: a slow endpoint must not hold up reading the config.
     warmModelCache(ctx.config);
     return c.json(redactConfig(ctx.config));
+  });
+
+  // What `provider` and `database.kind` may name here: the built-ins and what
+  // the loaded plugins registered, with the fields each one reads, so a
+  // settings screen can draw a form for a provider it has never heard of.
+  app.get('/api/config/providers', (c) => {
+    const registry = pluginRegistry();
+    const owner = new Map<string, string>();
+    for (const plugin of registry.describe()) {
+      for (const id of plugin.llmProviders) owner.set(`llm:${id}`, plugin.name);
+      for (const id of plugin.embeddingProviders) owner.set(`embedding:${id}`, plugin.name);
+      for (const id of plugin.storageBackends) owner.set(`storage:${id}`, plugin.name);
+      for (const id of plugin.converters) owner.set(`converter:${id}`, plugin.name);
+    }
+    const by = (kind: string, id: string) => owner.get(`${kind}:${id}`) ?? 'builtin';
+    return c.json({
+      llm: registry.llmProviders().map((p) => ({ id: p.id, label: p.label, kind: p.kind, fields: p.fields ?? null, note: p.note ?? null, listsModels: typeof p.listModels === 'function', plugin: by('llm', p.id) })),
+      embedding: registry.embeddingProviders().map((p) => ({ id: p.id, label: p.label, kind: p.kind, fields: p.fields ?? null, note: p.note ?? null, listsModels: typeof p.listModels === 'function', plugin: by('embedding', p.id) })),
+      storage: registry.storageBackends().map((b) => ({ id: b.id, label: b.label, note: b.note ?? null, plugin: by('storage', b.id) })),
+      converters: registry.converterList().map((v) => ({ id: v.id, label: v.label ?? v.id, extensions: v.extensions, version: v.version ?? 1, usesVision: v.usesVision === true, plugin: by('converter', v.id) })),
+      hooks: HOOK_NAMES.map((hook) => ({ hook, handlers: registry.describe().filter((p) => p.hooks.includes(hook)).map((p) => p.name) })),
+    });
+  });
+
+  // The plugins this process loaded and what each one registered (docs/design/11).
+  app.get('/api/plugins', (c) => {
+    const ctx = requestCtx(c);
+    const registry = pluginRegistry();
+    return c.json({
+      configured: configuredPluginSpecs(ctx.config.plugins).map((spec) => ({ module: spec.module, options: Object.keys(spec.options ?? {}) })),
+      plugins: registry.describe(),
+      warnings: registry.warnings,
+    });
   });
 
   app.get('/api/config/embedding-usage', async (c) => {

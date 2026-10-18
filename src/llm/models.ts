@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { EmbeddingConfig, LlmConfig, resolveSecret } from '../config.js';
+import { EmbeddingConfig, isCliProvider, LlmConfig, resolveSecret } from '../config.js';
+import { pluginRegistry } from '../plugins/registry.js';
 import { CLI_COMMANDS, cliCommand, resolveExecutable, runProcess } from './cli.js';
 
 /**
@@ -62,12 +63,29 @@ const FETCH_TIMEOUT_MS = 20_000;
 const CLAUDE_ALIASES = ['fable', 'opus', 'sonnet', 'haiku'];
 
 export async function listChatModels(cfg: LlmConfig): Promise<ModelListResult> {
+  // a plugin provider says what it offers, or says nothing and the field stays free text
+  const plugin = pluginRegistry().llmProvider(cfg.provider);
+  if (plugin?.listModels) {
+    try {
+      return await plugin.listModels(cfg);
+    } catch (e) {
+      return { ok: false, source: 'api', models: [], error: message(e) };
+    }
+  }
   if (cfg.provider === 'openai') {
     try {
       return await listOpenAiModels(cfg.baseUrl, cfg.apiKey);
     } catch (e) {
       return { ok: false, source: 'api', models: [], error: message(e) };
     }
+  }
+  if (cfg.provider === 'command') {
+    return { ok: true, source: 'builtin', models: [], note: 'A command takes any model name: it is passed through as `model` in the request and as $KNODE_LLM_MODEL.' };
+  }
+  if (!isCliProvider(cfg.provider)) {
+    return plugin
+      ? { ok: true, source: 'builtin', models: [], note: `${plugin.label} lists no models — type a model id.` }
+      : { ok: false, source: 'builtin', models: [], error: `unknown provider: ${cfg.provider}` };
   }
   const command = cliCommand(cfg.provider, cfg.cliPath);
   const resolvedPath = resolveExecutable(command);
@@ -94,6 +112,14 @@ export async function listChatModels(cfg: LlmConfig): Promise<ModelListResult> {
 }
 
 export async function listEmbeddingModels(cfg: EmbeddingConfig): Promise<ModelListResult> {
+  const plugin = pluginRegistry().embeddingProvider(cfg.provider);
+  if (plugin?.listModels) {
+    try {
+      return await plugin.listModels(cfg);
+    } catch (e) {
+      return { ok: false, source: 'api', models: [], error: message(e) };
+    }
+  }
   if (cfg.provider === 'local') {
     return { ok: true, source: 'builtin', models: [], note: 'The local hashing embedder has no model to choose.' };
   }
@@ -104,6 +130,11 @@ export async function listEmbeddingModels(cfg: EmbeddingConfig): Promise<ModelLi
       models: [],
       note: 'Ark endpoints are created in the Ark console and are not listable — paste the endpoint id (ep-…).',
     };
+  }
+  if (cfg.provider !== 'openai') {
+    return plugin
+      ? { ok: true, source: 'builtin', models: [], note: `${plugin.label} lists no models — type a model id.` }
+      : { ok: false, source: 'builtin', models: [], error: `unknown provider: ${cfg.provider}` };
   }
   try {
     const base = cfg.baseUrl.replace(/\/+$/, '');

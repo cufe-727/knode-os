@@ -20,6 +20,7 @@ knode-os 结合了两个项目的核心思想:[llm_wiki](https://github.com/nash
 - **Context Pack。** `knode-os pack "<语句>"`(或 MCP 工具 `knode_context_pack`)自动匹配语句中的实体,沿图谱展开(文档 chunk、带 `STALE`/`CONFLICT` 标记的时效断言、关联的实时表),按 playbook 执行实时探针查询(带 asOf 时间戳、短 TTL 缓存、绝不落库),并输出缺口分析和可直接执行的后续 SQL。
 - **会学习的 playbook。** Context pack 由 agent 可编辑的 `playbooks/packs/*.md` 工作流驱动;每次构建记录到 `pack_events`,`knode-os pack-optimize`(也随夜间 dream 运行)把失败/缺口模式转化为完整的 playbook 修订建议——接受后直接写回 `playbooks/packs/`,下一次查询就跑在更好的脚本上。
 - **MCP 服务**:Claude Code / Codex(命令行或 App)可直接搜索、提问、读写、grep、对实时数据源执行原生 SQL、构建 context pack。
+- **模型、存储与处理阶段皆可插拔。** 一个插件模块(`knode.config.json` 的 `plugins`)可以注册 LLM provider、embedding provider、存储后端、文档转换器,以及各处理阶段的用户自定义钩子 —— 哈希前去掉模板文字、换一种切块、过滤 tier-0 概念词、给每次抽取提示词加规则、后处理模型返回的结果、改写摘要风格、文档落库时得到通知。内建实现用的是同一套 API;`command` provider 则不用写代码就能把任意可执行文件当作模型。见 [docs/plugins.md](docs/plugins.md)。
 - **Google OKF v0.2 原生兼容**:`wiki/` 本身就是一个可移植的 Open Knowledge Format bundle；支持规范校验、版本路由、旧库迁移、外部 bundle 无损导入/导出，OKF 普通 Markdown 链接会进入知识图谱。v0.2 的溯源/信任/生命周期字段(`generated`、`verified`、`status`、`stale_after`)会被识别,v0.1 bundle 仍按规范给出的回退路径读取。未知类型、扩展 frontmatter 和断链按规范宽容处理。
 - **原生 Obsidian Vault**:`wiki/` 可直接在 Obsidian 中作为 Vault 打开，内置 Vault 配置与附件目录；支持 Properties、别名、标签、`[[Wikilink]]`、路径链接、标题/块引用和 `![[嵌入]]`。OKF 导入和导出的每个知识 bundle 也自动是独立 Vault。
 - **`ask`**:基于知识库的带引用问答,并显式列出"知识库还缺什么"。
@@ -68,6 +69,7 @@ node dist/cli.js user add admin --admin --data ~/knode-data
 │   ├── packs/          # context-pack playbook(由学习闭环修订)
 │   ├── capabilities/   # 对实时数据源能力的语义注释
 │   └── intents/        # intent 规格:一个答案需要哪些槽位
+├── plugins/            # 可选:knode.config.json 里点名的插件模块(provider、转换器、钩子)
 ├── ledger/             # events.jsonl(机器真相)+ attic/(被删源的 sidecar)
 └── .knode/             # 派生的 PGlite 索引 —— 可随时删除重建
 ```
@@ -108,11 +110,12 @@ node dist/cli.js user add admin --admin --data ~/knode-data
     "kind": "postgres",              // 默认 PostgreSQL(共用一个库,按工作区分 schema);"pglite" = 内嵌、零配置
     "host": "127.0.0.1", "port": 5432,
     "user": "", "password": "",      // password 同样支持 "env:VAR";trust/peer 认证留空
+    "url": "",                       // 或改用一条连接串(postgres://…,也支持 "env:VAR"),配合 "ssl": "require" 与 "poolSize"
     "database": "knode",             // 所有工作区共用一个库,首次打开时创建
     "schemaPrefix": "ws"             // 每个工作区一个 schema:<prefix>_<workspace>_<hash>
   },
   "llm": {
-    "provider": "openai",            // 也可用 "codex-cli" / "claude-cli" / "cursor-cli"
+    "provider": "openai",            // 也可用 "codex-cli" / "claude-cli" / "cursor-cli"、"command"(任意可执行文件)或插件注册的 provider
     "baseUrl": "https://api.openai.com/v1",
     "apiKey": "env:OPENAI_API_KEY",
     "protocol": "auto",              // auto = 优先 Responses,端点没有该路由则退回 Chat Completions
@@ -124,13 +127,18 @@ node dist/cli.js user add admin --admin --data ~/knode-data
     "summaryLlm": { "provider": "codex-cli", "model": "" },  // 每篇文档一页摘要
     "judgeLlm": { "provider": "claude-cli", "model": "" }    // knode_ask、Dream、重复实体与断言复核
   },
-  "dream": { "schedule": "03:00", "lookbackDays": 7 }
+  "dream": { "schedule": "03:00", "lookbackDays": 7 },
+  "plugins": [                       // provider、存储后端、转换器与钩子 —— 见 docs/plugins.md
+    { "module": "./plugins/house-rules.mjs", "options": { "redact": ["CONFIDENTIAL"] } }
+  ]
 }
 ```
 
 索引默认放在 PostgreSQL(首次运行前设 `KNODE_DATABASE_KIND=pglite`,或把 `database.kind` 改成 `pglite`,即可用内嵌的零配置索引,测试套件用的就是它)。`postgres` 模式下同一套 schema 放在服务器上:所有工作区共用一个库,按 schema 隔离,各自在首次打开时创建。当单个工作区超出 PGlite 单进程 32 位 WASM 的承载力(约百万 chunk),或需要多个进程同时读同一份索引时,才值得这么做。用 schema 而非独立库来隔离是刻意的:独立库会给每个工作区带上一份约 8 MB 的系统目录;而把所有工作区塞进同一张表、用 workspace 列区分,则会直接失去向量索引 —— HNSW 沿着按距离排序的邻居图游走,标量列上的等值条件无法下推进这次游走,优化器只能退回顺序扫描。向量列使用 `halfvec` 存储:pgvector 的索引条目上限是一个 8 KB 页,`vector` 对应 2000 维而 `halfvec` 对应 4000 维,所以半精度正是 1536/2048 维下 HNSW 索引仍然可用的前提,同时表体积减半。已有库在两种列类型之间切换会原地转换,不需要重新嵌入。
 
 任何 OpenAI 兼容端点都可以(Ollama、vLLM、硅基流动等)。`protocol` 决定用哪条线路说话:默认 `auto` 先探测端点有没有 `/responses`,有就走 Responses(推理模型在这条线上把思考作为独立的 output item 返回,而 Chat Completions 只能塞进各家拼写不一的 `message.reasoning_content`),没有则退回 `/chat/completions`;探测每个端点每进程只做一次,且不消耗 token。也可以钉成 `responses` 或 `chat`。embedding 另外支持 `"provider": "ark-multimodal"`,对接火山方舟的 `/embeddings/multimodal`(`doubao-embedding-vision-*`)。该接口不是 OpenAI 形态:每次请求只返回一个融合后的向量,因此 `baseUrl` 写到 `/api/v3` 为止,`model` 填接入点 id(`ep-…`),`batchSize` 的含义变为单条请求的并发数。文档视觉转换、实体提取、文档摘要和判断（`knode_ask`、Dream、重复实体与 claim 复核）各有独立路由，可以指向一个模型或一个 agent；留空的路由会被写成它原本会跑的默认。文本型 PDF 在本地提取；图片和扫描型 PDF 可使用支持视觉的 OpenAI 兼容模型、Codex CLI 或 Claude Code CLI 转成 Markdown。修改 `dimensions` 会在下次启动时重建 embedding 表。也可以在 Web 页面的 **Settings** 标签里编辑并测试各条模型路由。
+
+**插件。** `provider` 与 `database.kind` 填的是注册表里的 id,内建实现只是其中最早的几项([docs/design/11](docs/design/11-plugins-and-udfs.zh-CN.md))。`plugins` 里(或环境变量 `KNODE_PLUGINS`)列出的模块可以注册 knode-os 不会说的厂商 API 的 LLM provider、embedding provider、以另一种方式到达 Postgres 的存储后端、其他文件类型(`.docx`、`.epub` 等)的转换器,以及各处理阶段的钩子(用户自定义函数):`source.text`、`chunk`、`tier0.concepts`、`extract.request`、`extract.result`、`summary.request`、`document.applied`。`command` provider 不需要写插件:`cliPath` 指向一个可执行文件,它从标准输入读到 `{ messages, model, json, maxTokens, images }`,把回答写到标准输出,连接的 key 以 `KNODE_LLM_API_KEY` 传入。`database.url` 接受连接串(也可写 `env:DATABASE_URL`),配合 `ssl` 与 `poolSize`;`database.path` 可以移动 PGlite 索引的位置。`knode-os plugins` 与 `GET /api/config/providers` 列出已注册的一切。示例与指南:[docs/plugins.md](docs/plugins.md)、[demo/plugins](demo/plugins/README.md)。
 
 其他配置块(用 `knode-os config` 查看完整默认值):`ingest`(分块大小/重叠、文件监听)、`extraction`(后台文档轮次的批大小与间隔、tier-1 模型、是否抽取断言)、`heat`(热度半衰期、搜索加权、冷判定阈值)、`trace`(Claude/Codex trace 目录、skill 目录、同步间隔)、`server`(host/port)。
 
@@ -191,6 +199,7 @@ knode-os chat "<消息>" [-c <会话>]  和配置好的 CLI 聊知识库(它经 
 knode-os mcp                  在 stdio 上运行 MCP 服务
 knode-os connect claude|codex 把 MCP 服务注册到 agent CLI
 knode-os config               查看当前配置(密钥已脱敏)
+knode-os plugins [--json]     列出本数据目录加载的插件,以及它们和内建实现提供的 provider、后端、转换器与钩子
 ```
 
 所有命令都支持 `--data <path>`(或设置 `KNODE_OS_DATA`)。
@@ -236,7 +245,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
 
 ## REST API
 
-`GET /api/health · /api/config · /api/stats · /api/tree · /api/file · /api/search · /api/graph · /api/graph/insights · /api/entities · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
+`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/tree · /api/file · /api/search · /api/graph · /api/graph/insights · /api/entities · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
 `PUT /api/config` · `PUT /api/file` · `DELETE /api/file` · `POST /api/config/test | /api/upload | /api/ingest | /api/ask | /api/mv | /api/mkdir | /api/traces/sync | /api/dream | /api/wiki/generate | /api/suggestions/:id/status`
 
 每个接口都需要登录会话——已登录浏览器的 cookie,或 `Authorization: Bearer knu_…`(应用的,或 `knode-os user token` 签发给脚本的)——以及该接口所属 API 分组的权限;登录本身在 `/api/auth/*` 下([docs/remote-access.md](docs/remote-access.md))。Workspace 范围内的数据 API 另需请求头 `X-Knode-Workspace-Kind`（`personal` 或 `team`）、`X-Knode-Workspace-ID` 和 `X-Knode-Workspace-Name`；Workspace 的主人就是已登录的账号(只有关闭登录时才看 `X-Knode-User`)。`DELETE /api/workspace` 会彻底清空所选 Workspace。

@@ -123,7 +123,7 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
 
     const sourceSha = sha256(fs.readFileSync(abs));
     const meta = readSidecarPart(dataDir, rawRel, 'meta');
-    const cacheKey = convertible ? conversionCacheKey(opts) : undefined;
+    const cacheKey = convertible ? conversionCacheKey(opts, rawRel) : undefined;
     const sameSource = meta !== null && meta.sourceSha256 === sourceSha;
     const sameConversion = !convertible || (meta?.conversion?.key === cacheKey && hasContent(dataDir, rawRel));
 

@@ -1,0 +1,80 @@
+import path from 'node:path';
+import type { LlmClient } from '../../llm/client.js';
+
+/**
+ * What every document converter shares: the result shape, the vision model
+ * handed to converters that need one, and the Markdown provenance header.
+ * Converters themselves are plugins (src/plugins/types.ts); the built-in PDF
+ * and image ones live beside this file.
+ */
+
+export interface VisionModel {
+  enabled: boolean;
+  label: string;
+  complete: LlmClient['complete'];
+}
+
+/** The built-in kinds, open to whatever a plugin converter reports. */
+export type ConversionKind = 'image-vision' | 'pdf-text' | 'pdf-vision' | 'pdf-hybrid' | (string & {});
+
+export interface ConversionResult {
+  markdown: string;
+  kind: ConversionKind;
+  /** What produced the text: a vision model's label, or the converter's own name (e.g. "pdfjs"). */
+  model: string;
+  warnings: string[];
+}
+
+export const DEFAULT_MAX_PDF_PAGES = 100;
+export const DEFAULT_MAX_IMAGE_DIMENSION = 2048;
+
+/** Ask the Convert stage's vision model for the Markdown of one image. */
+export async function transcribeImage(vision: VisionModel, imagePath: string, context: string): Promise<string> {
+  const response = await vision.complete([
+    {
+      role: 'system',
+      content: [
+        'Convert images into faithful, standalone Markdown for a searchable knowledge base.',
+        'Preserve every legible word in its original language. Recreate headings, lists and tables with Markdown.',
+        'Describe charts, diagrams, screenshots and spatial relationships needed to understand the content.',
+        'Do not invent missing facts. Do not discuss the conversion process. Return Markdown only.',
+      ].join(' '),
+    },
+    { role: 'user', content: `${context}\n\nTranscribe and describe this image as Markdown.` },
+  ], { images: [{ path: imagePath, mimeType: 'image/png' }], maxTokens: 8_000 });
+  const markdown = stripOuterFence(response).trim();
+  if (!markdown) throw new Error(`vision model ${vision.label} returned empty Markdown`);
+  return markdown;
+}
+
+/** The frontmatter every converted document starts with: where it came from and what made it. */
+export function withProvenance(rawRel: string, kind: ConversionKind, model: string, body: string): string {
+  const title = path.basename(rawRel, path.extname(rawRel));
+  return [
+    '---',
+    `title: ${JSON.stringify(title)}`,
+    `source: ${JSON.stringify(rawRel)}`,
+    `source_type: ${JSON.stringify(path.extname(rawRel).slice(1).toLowerCase())}`,
+    `conversion: ${JSON.stringify(kind)}`,
+    `conversion_model: ${JSON.stringify(model)}`,
+    '---',
+    '',
+    body.trim(),
+    '',
+  ].join('\n');
+}
+
+export function stripOuterFence(value: string): string {
+  return value.replace(/^\s*```(?:markdown|md)?\s*/i, '').replace(/\s*```\s*$/i, '');
+}
+
+export function meaningfulLength(value: string): number {
+  return value.replace(/\s+/g, '').length;
+}
+
+export function requireVision(vision: VisionModel | undefined, rawRel: string): VisionModel {
+  if (!vision?.enabled) {
+    throw new Error(`image conversion requires a vision model (OpenAI-compatible, codex-cli, or claude-cli): ${rawRel}`);
+  }
+  return vision;
+}

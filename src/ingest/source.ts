@@ -4,6 +4,7 @@ import { CappedText, isTextFile, readFileTextCapped, safePath } from '../fs/file
 import { RAW_DOCS, RAW_TRACES, sidecarRelFor } from '../fs/layout.js';
 import { readContent } from '../fs/sidecar.js';
 import { normalizeCookedFrontmatter } from '../okf/normalize.js';
+import { pluginRegistry } from '../plugins/registry.js';
 import { DocRoot } from '../types.js';
 import { isConvertibleFile } from './convert.js';
 
@@ -58,8 +59,22 @@ export function normalizeSourceText(rel: string, text: string): string {
   return normalizeCookedFrontmatter(rel, text);
 }
 
-/** Indexed text for a source key, or null when nothing indexable exists yet. */
+/**
+ * Indexed text for a source key, or null when nothing indexable exists yet.
+ *
+ * `source.text` plugin hooks run last, on every read: what they return is the
+ * content — hashed, chunked, extracted and replayed as such — so a hook that
+ * changes its mind changes the document, which is the honest outcome.
+ */
 export function loadSourceText(dataDir: string, rel: string, root: DocRoot): SourceText | null {
+  const loaded = readSource(dataDir, rel, root);
+  if (!loaded) return null;
+  const registry = pluginRegistry();
+  if (!registry.hasHandlers('source.text')) return loaded;
+  return { ...loaded, text: registry.filterSync('source.text', loaded.text, { path: rel, root, dataDir }) };
+}
+
+function readSource(dataDir: string, rel: string, root: DocRoot): SourceText | null {
   if (root === 'traces' || (root === 'docs' && isConvertibleFile(rel))) {
     const text = readContent(dataDir, rel);
     return text === null ? null : { text, derived: true };

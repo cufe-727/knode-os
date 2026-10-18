@@ -5,12 +5,17 @@ import { vector } from '@electric-sql/pglite-pgvector';
 import pg from 'pg';
 import { DatabaseConfig, resolveSecret } from '../config.js';
 import { DB_DIR } from '../fs/datadir.js';
+import { pluginRegistry } from '../plugins/registry.js';
 
 /**
  * The database surface the Store needs, so an external Postgres server can
  * stand in for the embedded PGlite one. Modelled on PGlite's own shape —
  * `query` returns `{ rows }`, `exec` runs multi-statement DDL scripts — so the
  * embedded backend satisfies it without a wrapper.
+ *
+ * Which backend opens is decided by `database.kind` through the plugin
+ * registry: `pglite` and `postgres` are built in (below), and a storage plugin
+ * may add another way of reaching a Postgres with pgvector (docs/design/11).
  */
 export interface Backend {
   query<T>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
@@ -49,15 +54,73 @@ export function schemaNameFor(dataDir: string, prefix: string): string {
   return `${head}_${hash}`;
 }
 
-/** Connection settings shared by the admin and per-workspace pools. */
-function connectionOptions(cfg: DatabaseConfig): pg.PoolConfig {
-  const password = resolveSecret(cfg.password);
-  return {
-    host: cfg.host,
-    port: cfg.port,
-    user: cfg.user || undefined,
-    ...(password ? { password } : {}),
-  };
+/* ------------------------------ PostgreSQL ------------------------------ */
+
+/**
+ * The database a `postgres` config names: the connection string's, when it
+ * has one (`url` names the server *and* the database), else `database`, else
+ * `knode`.
+ */
+export function postgresDatabaseName(cfg: DatabaseConfig): string {
+  const url = resolveSecret(cfg.url ?? '');
+  if (url) {
+    try {
+      const name = decodeURIComponent(new URL(url).pathname.replace(/^\/+/, ''));
+      if (name) return name;
+    } catch {
+      // not a URL pg can parse either; the pool reports that
+    }
+  }
+  return cfg.database || 'knode';
+}
+
+/** A connection string with its database swapped — the maintenance database for CREATE DATABASE, the real one afterwards. */
+function withDatabase(url: string, database: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.pathname = `/${encodeURIComponent(database)}`;
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * `pg` pool settings for a database config: either the connection string
+ * (`url`, "env:VAR" resolved) or the host/port/user/password fields, plus TLS
+ * (`ssl`: true / 'require' verify the server certificate, 'no-verify'
+ * encrypts without verifying) and the pool size. `database` picks which
+ * database the pool connects to; `max` caps its connections.
+ */
+export function postgresPoolConfig(cfg: DatabaseConfig, opts: { database?: string; max?: number } = {}): pg.PoolConfig {
+  const url = resolveSecret(cfg.url ?? '');
+  const password = resolveSecret(cfg.password ?? '');
+  const ssl = cfg.ssl === 'no-verify' ? { rejectUnauthorized: false } : cfg.ssl === true || cfg.ssl === 'require' ? true : undefined;
+  const base: pg.PoolConfig = url
+    ? { connectionString: opts.database ? withDatabase(url, opts.database) : url }
+    : {
+      host: cfg.host,
+      port: cfg.port,
+      user: cfg.user || undefined,
+      ...(password ? { password } : {}),
+      ...(opts.database ? { database: opts.database } : {}),
+    };
+  const max = opts.max ?? (Number.isInteger(cfg.poolSize) && cfg.poolSize! > 0 ? cfg.poolSize : undefined);
+  return { ...base, ...(ssl !== undefined ? { ssl } : {}), ...(max ? { max } : {}) };
+}
+
+/** Where a postgres config points, for error messages (never the password). */
+function describePostgres(cfg: DatabaseConfig): string {
+  const url = resolveSecret(cfg.url ?? '');
+  if (url) {
+    try {
+      const parsed = new URL(url);
+      return `${parsed.hostname}${parsed.port ? `:${parsed.port}` : ''}`;
+    } catch {
+      return 'the configured database.url';
+    }
+  }
+  return `${cfg.host}:${cfg.port}`;
 }
 
 /** Double-quote an identifier we generated ourselves; belt-and-braces. */
@@ -72,7 +135,7 @@ function quoteIdent(name: string): string {
  * 42P04, which is success as far as the caller is concerned.
  */
 async function ensureDatabase(cfg: DatabaseConfig, name: string): Promise<void> {
-  const admin = new pg.Pool({ ...connectionOptions(cfg), database: 'postgres', max: 1 });
+  const admin = new pg.Pool(postgresPoolConfig(cfg, { database: 'postgres', max: 1 }));
   try {
     const { rows } = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [name]);
     if (rows.length > 0) return;
@@ -91,7 +154,7 @@ async function ensureDatabase(cfg: DatabaseConfig, name: string): Promise<void> 
  * and the `<=>` operator do not resolve.
  */
 async function ensureSchema(cfg: DatabaseConfig, database: string, schema: string): Promise<void> {
-  const pool = new pg.Pool({ ...connectionOptions(cfg), database, max: 1 });
+  const pool = new pg.Pool(postgresPoolConfig(cfg, { database, max: 1 }));
   try {
     await pool.query('CREATE EXTENSION IF NOT EXISTS vector SCHEMA public');
     await pool.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(schema)}`);
@@ -141,35 +204,63 @@ class PostgresBackend implements Backend {
 }
 
 /**
- * Open the backend for one workspace: PostgreSQL when the config says so
- * (the default since 2026-09), the embedded PGlite database otherwise — an
- * absent `database` block still opens PGlite so old data dirs keep working.
+ * The built-in `postgres` backend: one shared database (created on first
+ * open), one schema per workspace, reached through `url` or the
+ * host/port/user/password fields.
+ */
+export async function openPostgres(dataDir: string, cfg: DatabaseConfig): Promise<Backend> {
+  const database = postgresDatabaseName(cfg);
+  const schema = schemaNameFor(dataDir, cfg.schemaPrefix || 'ws');
+  try {
+    await ensureDatabase(cfg, database);
+  } catch (err) {
+    const e = err as { code?: string; errors?: { code?: string }[]; message?: string };
+    const code = e.code ?? e.errors?.[0]?.code ?? '';
+    if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EHOSTUNREACH|ECONNRESET/.test(code) || /ECONNREFUSED|connect/i.test(String(e.message))) {
+      throw new Error(
+        `cannot reach PostgreSQL at ${describePostgres(cfg)} — database.kind is "postgres" by default. Start the server, fix database.url or database.host/port/user/password in knode.config.json, or set database.kind to "pglite" for an embedded index (${e.message ?? code})`,
+      );
+    }
+    throw err;
+  }
+  await ensureSchema(cfg, database, schema);
+  // Set on the connection itself so every pooled client starts in the right
+  // schema — no per-checkout SET, and no race with `pool.on('connect')`.
+  const pool = new pg.Pool({
+    ...postgresPoolConfig(cfg, { database }),
+    options: `-c search_path=${schema},public`,
+  });
+  return new PostgresBackend(pool);
+}
+
+/* -------------------------------- PGlite -------------------------------- */
+
+/** Where a workspace's embedded database lives: `database.path` (relative to the workspace, or absolute), default `.knode/db`. */
+export function pgliteDir(dataDir: string, cfg?: Pick<DatabaseConfig, 'path'>): string {
+  const configured = cfg?.path?.trim();
+  if (!configured) return path.join(dataDir, DB_DIR);
+  return path.isAbsolute(configured) ? configured : path.join(dataDir, configured);
+}
+
+/** The built-in `pglite` backend: Postgres + pgvector embedded in the process, nothing to install or run. */
+export async function openPglite(dataDir: string, cfg?: Pick<DatabaseConfig, 'path'>): Promise<Backend> {
+  return (await PGlite.create(pgliteDir(dataDir, cfg), { extensions: { vector } })) as unknown as Backend;
+}
+
+/* -------------------------------- entry --------------------------------- */
+
+/**
+ * Open the backend for one workspace, by `database.kind`: PostgreSQL when the
+ * config says so (the default since 2026-09), the embedded PGlite database
+ * otherwise — an absent `database` block still opens PGlite so old data dirs
+ * keep working. Any other kind must come from a storage plugin.
  */
 export async function openBackend(dataDir: string, cfg?: DatabaseConfig): Promise<Backend> {
-  if (cfg?.kind === 'postgres') {
-    const database = cfg.database || 'knode';
-    const schema = schemaNameFor(dataDir, cfg.schemaPrefix || 'ws');
-    try {
-      await ensureDatabase(cfg, database);
-    } catch (err) {
-      const e = err as { code?: string; errors?: { code?: string }[]; message?: string };
-      const code = e.code ?? e.errors?.[0]?.code ?? '';
-      if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EHOSTUNREACH|ECONNRESET/.test(code) || /ECONNREFUSED|connect/i.test(String(e.message))) {
-        throw new Error(
-          `cannot reach PostgreSQL at ${cfg.host}:${cfg.port} — database.kind is "postgres" by default. Start the server, fix database.host/port/user/password in knode.config.json, or set database.kind to "pglite" for an embedded index (${e.message ?? code})`,
-        );
-      }
-      throw err;
-    }
-    await ensureSchema(cfg, database, schema);
-    // Set on the connection itself so every pooled client starts in the right
-    // schema — no per-checkout SET, and no race with `pool.on('connect')`.
-    const pool = new pg.Pool({
-      ...connectionOptions(cfg),
-      database,
-      options: `-c search_path=${schema},public`,
-    });
-    return new PostgresBackend(pool);
+  const kind = cfg?.kind || 'pglite';
+  const backend = pluginRegistry().storageBackend(kind);
+  if (!backend) {
+    const known = pluginRegistry().storageBackends().map((b) => b.id).join(', ');
+    throw new Error(`unknown database.kind "${kind}" (registered: ${known}) — a plugin that provides it must be listed under "plugins" in knode.config.json`);
   }
-  return (await PGlite.create(path.join(dataDir, DB_DIR), { extensions: { vector } })) as unknown as Backend;
+  return backend.open(dataDir, cfg ?? { kind, host: '', port: 0, user: '', password: '', database: '', schemaPrefix: 'ws' });
 }
