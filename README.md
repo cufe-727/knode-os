@@ -165,7 +165,9 @@ knode-os init                 create the data directory layout + database
 knode-os serve [-p port]      web UI + API + watcher + trace sync + background document pass
                               (extract → resolve duplicates → summarize)
                               + usage-stats flush + nightly dream & tier-2 pass
-knode-os sync [--only p..] [--verify] [--no-llm] [--no-datasources]
+knode-os sync [--only p..] [--verify] [--no-llm] [--no-datasources] [--reapply] [--defer-embeddings]
+                                      # --reapply: recompute tier-0 for unchanged documents too (chunks and vectors kept)
+knode-os concepts learn [--ratio 0.02]  # learn the corpus-frequent stop terms into playbooks/concepts/frequent.yaml
                               reconcile declared sources (raw/docs, wiki, skills, datasources) with
                               the index: apply changed files as scopes, dispose removed ones (every
                               effect reverted), regenerate dependent wiki views. `ingest` is an alias.

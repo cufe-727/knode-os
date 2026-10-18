@@ -154,8 +154,12 @@ NLP 概念抽取与 sidecar 写入。
 >    片段只被一条规则计数一次（首字母大写短语、全大写缩写、反引号标识符互不重复）；
 >    每篇上限按长度算，1 词/400 字，最少 3、最多 24，取代固定的 8。停用词三层合并：
 >    内置通用词、可编辑的 `playbooks/concepts/stoplist.yaml`（`terms` 加、`allow` 放行）、
->    语料学习的 `playbooks/concepts/frequent.yaml`（出现在 >2% 已索引文档中的概念词，由
->    `entity_mentions` 统计，语料翻倍或每 10 分钟重算，机器维护）。
+>    语料学习的 `playbooks/concepts/frequent.yaml`：`knode-os concepts learn` 扫描全部已索引
+>    文档的正文，按候选词统计文档频率，出现在 >2%（且不少于 10 篇；语料不足 50 篇不学）的
+>    词写入——按文本而非按图谱里的 concept 实体统计，所以与图谱当前状态无关，重导入期间
+>    照样成立；全量 sync 结束后在没有列表、语料翻倍或列表超过 7 天时自动重学。学到的高频词
+>    只约束挖掘，不约束链接表面（语料里高频的名字往往正是该语料的枢纽实体）；链接表面只
+>    受内置词和人工 `terms` 约束。
 > 3. **占位符退休**：Tier 1 的 scope 为某文档落地后（`applyTier1Scope`，含 sidecar 回放），
 >    该文档未解析到有类型实体的 `tier0.concept` 证据、涉及它们的 co_occurs 证据与 mention
 >    被关闭并折叠——无其他来源支撑的概念节点随之 tombstone；sidecar 的 `tier0.json`
@@ -163,6 +167,11 @@ NLP 概念抽取与 sidecar 写入。
 >
 > 共现边仍由 Tier 0 一次写出：链接到的有类型实体与本篇的概念占位符一起进入同一组
 > `co_occurs`（0.1 权重，窗口 6）。
+>
+> 存量语料的升级：`knode-os sync --reapply [--only <prefix>]` 对内容未变的文档也重新 apply——
+> 替换文档 scope（chunk 与向量按内容寻址保留，不重新 embed；CLI 下自动 `--defer-embeddings`，
+> 缺失向量留给服务进程的后台 embedder）、重算 Tier 0、从 sidecar 回放已完成的 Tier 1，
+> sidecar 里 Tier 1 已 done 的文档不再入抽取队列。先 `concepts learn`，再 `--reapply`。
 
 ### 2.3 Tier 1 — 异步实体/关系抽取（廉价 LLM，按热度调度）
 

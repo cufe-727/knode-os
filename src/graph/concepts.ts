@@ -1,14 +1,19 @@
 import { foldTouched } from '../lineage/fold.js';
 import { emptyTouched } from '../lineage/types.js';
 import { ScopeWriter } from '../lineage/writer.js';
-import { ParsedMarkdown } from '../markdown.js';
+import { loadSourceText } from '../ingest/source.js';
+import { ParsedMarkdown, parseFrontmatter, titleFromMarkdown } from '../markdown.js';
 import { Store } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
 import {
   CJK_FUNCTION_CHARS,
-  computeFrequentTerms,
   EN_STOP,
+  FREQUENT_MIN_CORPUS,
+  FREQUENT_RELEARN_MS,
   FrequentTerms,
+  frequentStamp,
+  frequentThreshold,
+  indexedDocumentCount,
   readConceptStoplist,
   readFrequentTerms,
   stopKeySet,
@@ -45,9 +50,10 @@ import { PageContext } from './store.js';
  *      know is kept together as one term). Exporter template text is stripped
  *      first, every occurrence is counted once, the per-document cap follows
  *      the text length, and terms the stop list names — built-in, edited by a
- *      person, or learned from the corpus (src/graph/concept-stoplist.ts) —
- *      are dropped. The survivors become `concept` placeholders with
- *      `tier0.concept` evidence and weak co_occurs edges.
+ *      person, or learned from the corpus's own text (learnFrequentTerms,
+ *      src/graph/concept-stoplist.ts) — are dropped. The survivors become
+ *      `concept` placeholders with `tier0.concept` evidence and weak co_occurs
+ *      edges.
  *
  * Placeholders are provisional: once tier-1 has read the document, the ones
  * that did not resolve to a typed entity are retired (retireTier0Placeholders)
@@ -447,15 +453,11 @@ export interface Tier0Known {
 
 /** How long a loaded index is trusted before the store is asked whether anything changed. */
 const PROBE_MS = 60_000;
-/** The learned frequent-term list is recomputed at most this often (and whenever the corpus doubled). */
-const FREQUENT_TTL_MS = 10 * 60_000;
 
 interface KnownCache {
   probedAt: number;
   stamp: string;
   rows: LinkCandidate[];
-  frequent: FrequentTerms | null;
-  frequentAt: number;
   stopStamp: string;
   stop: Set<string>;
   index: LinkIndex;
@@ -469,8 +471,6 @@ function emptyKnownCache(): KnownCache {
     probedAt: 0,
     stamp: '',
     rows: [],
-    frequent: null,
-    frequentAt: 0,
     stopStamp: '',
     stop: builtinStopKeys(),
     index: buildLinkIndex([]),
@@ -487,11 +487,9 @@ export function invalidateTier0Known(dataDir: string): void {
 /**
  * What tier-0 may link to and must not mine, for one workspace: the index of
  * typed entities and the merged stop set. Loaded once and re-checked every
- * PROBE_MS with one cheap query (the typed-entity count and latest change, the
- * indexed-document count); reloaded only when that changed. The learned
- * frequent-term list is recomputed from the mentions table when the corpus
- * has doubled since the last time or FREQUENT_TTL_MS passed, and written to
- * playbooks/concepts/frequent.yaml for a person to read.
+ * PROBE_MS with one cheap query (the typed-entity count and latest change);
+ * reloaded only when that changed. The two list files under
+ * playbooks/concepts/ are re-read whenever they change on disk.
  */
 export async function tier0Known(store: Store, opts: { force?: boolean } = {}): Promise<Tier0Known> {
   let c = knownCaches.get(store.dataDir);
@@ -507,44 +505,81 @@ export async function tier0Known(store: Store, opts: { force?: boolean } = {}): 
 }
 
 async function refreshKnown(store: Store, c: KnownCache, force: boolean): Promise<void> {
-  const [probe] = await store.query<{ typed: number; latest: string | Date | null; docs: number }>(
+  const [probe] = await store.query<{ typed: number; latest: string | Date | null }>(
     `SELECT (SELECT count(*)::int FROM entities WHERE tx_to IS NULL AND type <> 'concept' AND canonical_id IS NULL) AS typed,
-            (SELECT max(updated_at) FROM entities WHERE tx_to IS NULL AND type <> 'concept') AS latest,
-            (SELECT count(*)::int FROM documents WHERE status = 'indexed' AND root = 'docs') AS docs`,
+            (SELECT max(updated_at) FROM entities WHERE tx_to IS NULL AND type <> 'concept') AS latest`,
   );
   const stamp = `${probe?.typed ?? 0}:${probe?.latest ? new Date(probe.latest).getTime() : 0}`;
-  const now = Date.now();
   let rowsChanged = false;
   if (force || stamp !== c.stamp) {
     c.rows = await loadLinkCandidates(store, store.dataDir);
     c.stamp = stamp;
     rowsChanged = true;
   }
-
-  // the learned list: what another process persisted, recomputed when due
-  if (c.frequent === null) c.frequent = readFrequentTerms(store.dataDir);
-  const docs = probe?.docs ?? 0;
-  const due = force || c.frequent === null || docs >= 2 * Math.max(c.frequent.docs, 1) || now - c.frequentAt > FREQUENT_TTL_MS;
-  if (due) {
-    const computed = await computeFrequentTerms(store, { docs });
-    if (computed.terms.length > 0 || c.frequent !== null) {
-      try {
-        writeFrequentTerms(store.dataDir, computed);
-      } catch {
-        // a read-only playbooks directory keeps the list in memory only
-      }
-    }
-    c.frequent = computed;
-    c.frequentAt = now;
-  }
-
-  const stopStamp = `${stoplistStamp(store.dataDir)}|${c.frequent?.at ?? ''}`;
+  const stopStamp = `${stoplistStamp(store.dataDir)}|${frequentStamp(store.dataDir)}`;
   if (rowsChanged || stopStamp !== c.stopStamp) {
-    c.stop = stopKeySet(readConceptStoplist(store.dataDir), c.frequent);
-    c.index = buildLinkIndex(c.rows, c.stop);
+    const editable = readConceptStoplist(store.dataDir);
+    c.stop = stopKeySet(editable, readFrequentTerms(store.dataDir));
+    // link surfaces skip the generic words only: a name frequent in this
+    // corpus is often its hub entity, and linking that is the point
+    c.index = buildLinkIndex(c.rows, stopKeySet(editable, null));
     c.stopStamp = stopStamp;
   }
-  c.probedAt = now;
+  c.probedAt = Date.now();
+}
+
+/* ───────────────────────── learning the frequent terms ───────────────────────── */
+
+/**
+ * Learn the corpus-frequent terms from the indexed documents' own text and
+ * persist them to playbooks/concepts/frequent.yaml: every candidate the miner
+ * would consider (template stripped, before any stop list) is counted once per
+ * document, and the terms in at least the threshold share of the documents are
+ * the list. Measured on candidates rather than on what was mined, it has no
+ * feedback with the filter it feeds; measured on text rather than on concept
+ * entities, it is the same list whether or not the graph currently holds
+ * them — a re-import that disposes every old placeholder as it runs changes
+ * nothing here. `knode-os concepts learn`; also maybeLearnFrequentTerms.
+ */
+export async function learnFrequentTerms(
+  store: Store,
+  opts: { ratio?: number; minCorpus?: number; minDocs?: number; limit?: number; onProgress?: (msg: string) => void } = {},
+): Promise<FrequentTerms> {
+  const rows = await store.query<{ path: string }>(`SELECT path FROM documents WHERE status = 'indexed' AND root = 'docs' ORDER BY path`);
+  const df = new Map<string, { term: string; docs: number }>();
+  let scanned = 0;
+  for (const r of rows) {
+    const src = loadSourceText(store.dataDir, r.path, 'docs');
+    if (!src) continue;
+    scanned++;
+    const parsed = parseFrontmatter(src.text);
+    const text = stripTemplate(parsed.body, { source: frontmatterNames(parsed.frontmatter).source, title: titleFromMarkdown(r.path, parsed) });
+    for (const cand of conceptCandidates(text)) {
+      const k = keyOf(cand.term);
+      const e = df.get(k);
+      if (e) e.docs++;
+      else df.set(k, { term: cand.term, docs: 1 });
+    }
+    if (scanned % 1000 === 0) opts.onProgress?.(`concepts: scanned ${scanned}/${rows.length} documents`);
+  }
+  const threshold = frequentThreshold(scanned, opts.ratio, opts.minCorpus, opts.minDocs);
+  const terms = threshold === null
+    ? []
+    : [...df.values()].filter((e) => e.docs >= threshold).sort((a, b) => b.docs - a.docs || a.term.localeCompare(b.term)).slice(0, opts.limit ?? 1000);
+  const result: FrequentTerms = { docs: scanned, threshold: threshold ?? 0, at: new Date().toISOString(), terms };
+  // a corpus too small to measure leaves no file behind, unless one is there to be reset
+  if (threshold !== null || readFrequentTerms(store.dataDir)) writeFrequentTerms(store.dataDir, result);
+  invalidateTier0Known(store.dataDir);
+  return result;
+}
+
+/** After a full sync pass: learn when the workspace has no list yet, the corpus doubled since, or the list is FREQUENT_RELEARN_MS old. */
+export async function maybeLearnFrequentTerms(store: Store, opts: { onProgress?: (msg: string) => void } = {}): Promise<FrequentTerms | null> {
+  const docs = await indexedDocumentCount(store);
+  if (docs < FREQUENT_MIN_CORPUS) return null;
+  const current = readFrequentTerms(store.dataDir);
+  const stale = !current || docs >= 2 * Math.max(current.docs, 1) || Date.now() - new Date(current.at).getTime() > FREQUENT_RELEARN_MS;
+  return stale ? learnFrequentTerms(store, opts) : null;
 }
 
 /* ────────────────────────────── planning ────────────────────────────── */

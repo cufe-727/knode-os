@@ -6,7 +6,7 @@ import { applyDatasourceScopes } from '../datasource/sync.js';
 import { safePath } from '../fs/files.js';
 import { listSidecarKeys, RAW_DOCS, RAW_TRACES } from '../fs/layout.js';
 import { removeSidecar } from '../fs/sidecar.js';
-import { invalidateTier0Known } from '../graph/concepts.js';
+import { invalidateTier0Known, maybeLearnFrequentTerms } from '../graph/concepts.js';
 import { loadOntology, typePrecedence } from '../graph/ontology.js';
 import { buildWikiIndex } from '../graph/wire.js';
 import { DATASOURCES_PREFIX, declaredKey, enumerateDeclared, matchesPrefixes, normalizePrefixes } from '../lineage/declared.js';
@@ -56,6 +56,8 @@ export interface SyncOptions {
   datasources?: boolean;
   /** Run consistency checks (fold recount, ledger/scopes agreement). */
   verify?: boolean;
+  /** Re-apply documents whose content is unchanged too (tier-0 recomputed, tier-1 replayed; see ApplyDocOptions.reapply). */
+  reapply?: boolean;
   actor?: string;
   /** Transaction time override per source (rebuild replays original apply times when the sha still matches). */
   at?: (kind: ScopeKind, key: string, sha?: string) => string | undefined;
@@ -218,6 +220,7 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
     try {
       const r = await applyDocScope(ctx, d.key, d.root ?? 'docs', {
         queueTier1,
+        reapply: opts.reapply,
         actor,
         at: opts.at?.('doc', d.key, d.sha),
         wikiIndex,
@@ -265,6 +268,13 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   stats.pagesRegenerated += views.regenerated;
   stats.pagesArchived += views.archived;
   stats.pagesDeferred += views.deferred;
+
+  // the corpus-frequent stop terms follow the corpus: a full pass that applied
+  // documents learns them again when the list is missing, old, or the corpus doubled
+  if (touchesDocs && !prefixes && stats.applied > 0) {
+    const learned = await maybeLearnFrequentTerms(store, { onProgress: progress });
+    if (learned) progress(`concepts: ${learned.terms.length} frequent terms learned over ${learned.docs} documents (threshold ${learned.threshold})`);
+  }
 
   if (opts.verify) stats.verify = await verify(ctx, progress);
   // what this pass applied or regenerated may wait for vectors

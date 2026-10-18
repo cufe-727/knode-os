@@ -64,6 +64,14 @@ export interface ApplyDocContext {
 export interface ApplyDocOptions {
   /** Queue the document for tier-1 LLM extraction when no sidecar replay exists. */
   queueTier1?: boolean;
+  /**
+   * Re-apply although content and embedding model are unchanged: the live
+   * scope is replaced (chunks and their vectors kept — the chunk ids are
+   * content-addressed), tier-0 evidence is recomputed, a finished tier-1 is
+   * replayed from the sidecar, and nothing new is queued for extraction where
+   * the sidecar's tier-1 is done. `knode-os sync --reapply`.
+   */
+  reapply?: boolean;
   actor?: string;
   at?: string;
   wikiIndex?: WikiIndex;
@@ -125,7 +133,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
 
   const live = await findLiveScope(store, 'doc', file);
   const sameModel = live?.meta.embedModel === embedder.model;
-  if (live && live.sha === sha && sameModel) {
+  if (live && live.sha === sha && sameModel && !opts.reapply) {
     // a sidecar may have gained a replayable tier-1 extraction since (copied
     // from another machine, or written by a bench run) — apply it as the
     // document's child scope without re-indexing the document itself
@@ -188,7 +196,11 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
       ? tierForActor(parsed.frontmatter.actor)
       : undefined;
   const declaredAcl = Array.isArray(parsed.frontmatter.acl) ? parsed.frontmatter.acl.map(String) : undefined;
-  const tier1 = root === 'docs' && isSource ? replayableTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha, raw.length) : null;
+  const tier1Part = root === 'docs' && isSource ? readSidecarPart(store.dataDir, file, 'tier1') : null;
+  const tier1 = tier1Part ? replayableTier1(tier1Part, sha, raw.length) : null;
+  // a re-apply recomputes tier-0; what a model has already read of this content is not read again
+  const tier1Done = tier1Part?.status === 'done' && tier1Part.contentSha === sha;
+  const queueTier1 = Boolean(opts.queueTier1) && !tier1 && !(opts.reapply && tier1Done);
 
   /* ── the document scope ── */
   let g = { entities: 0, relations: 0 };
@@ -199,7 +211,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     {
       actor,
       at: opts.at,
-      force: Boolean(live && !sameModel),
+      force: Boolean(live && (!sameModel || opts.reapply)),
       keepProjectionOnReplace: true,
       trust: declaredTrust,
       acl: declaredAcl,
@@ -240,7 +252,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
         const lg = tier0 ? await wireLinks(w, page, tier0.links) : { entities: 0, ids: [] };
         const cg = await wireConcepts(w, page, tier0?.concepts ?? [], lg.ids);
         g = { entities: g.entities + lg.entities + cg.entities, relations: g.relations + cg.relations };
-        if (!tier1 && opts.queueTier1) await w.enqueueTier1(docId, segmentText(raw, config.extraction.segmentChars).length);
+        if (queueTier1) await w.enqueueTier1(docId, segmentText(raw, config.extraction.segmentChars).length);
       }
       // a capabilities/*.md file is an ordinary source *and* the semantic layer
       // over the capabilities it names: both halves belong to this one scope,

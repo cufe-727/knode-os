@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { readSidecarPart, updateSidecarPart } from '../src/fs/sidecar.js';
-import { computeFrequentTerms, readConceptStoplist, stopKeySet } from '../src/graph/concept-stoplist.js';
+import { readConceptStoplist, readFrequentTerms, stopKeySet } from '../src/graph/concept-stoplist.js';
 import {
   buildLinkIndex,
   conceptCandidates,
@@ -13,6 +13,7 @@ import {
   extractConcepts,
   findLinks,
   frontmatterNames,
+  learnFrequentTerms,
   maskSpans,
   selectConcepts,
   stripTemplate,
@@ -258,17 +259,26 @@ describe('tier-0 through sync', () => {
     expect(await count(`evidence WHERE scope_id = $1 AND kind = 'entity' AND extractor = 'tier0.concept' AND tx_to IS NULL`, [scope.id])).toBe(3);
   });
 
-  it('learns corpus-frequent terms from the mentions table; the stop list can overrule them', async () => {
-    const frequent = await computeFrequentTerms(ctx.store, { ratio: 0.5, minCorpus: 2, minDocs: 2 });
+  it('learns corpus-frequent terms from the documents themselves; the stop list can overrule them', async () => {
+    const frequent = await learnFrequentTerms(ctx.store, { ratio: 0.5, minCorpus: 2, minDocs: 2 });
     expect(frequent.docs).toBe(2);
     expect(frequent.threshold).toBe(2);
-    // 波动 is a concept of both documents
+    // 波动 is a candidate in both documents; the declared organization is counted from its text, not from the graph
     expect(frequent.terms.map((t) => t.term)).toContain('波动');
+    expect(frequent.terms.map((t) => t.term)).not.toContain('LPPL');
+    expect(readFrequentTerms(dataDir)?.terms.map((t) => t.term)).toContain('波动');
     const stop = stopKeySet({ terms: [], allow: [] }, frequent);
     expect(stop.has(keyOf('波动'))).toBe(true);
     expect(stopKeySet({ terms: [], allow: ['波动'] }, frequent).has(keyOf('波动'))).toBe(false);
-    // the corpus is too small for the real threshold: nothing is learned yet
-    expect((await computeFrequentTerms(ctx.store)).terms).toEqual([]);
+    // a document applied from now on does not mine the learned term
+    write(dataDir, 'raw/docs/third.md', `---\ntitle: 丙\n---\n# 丙\n\n波动率在上升，波动率的均值回归需要耐心，波动率本身不是风险；均值回归是老话题。\n`);
+    await sync(ctx, { llmGraph: false });
+    const third = readSidecarPart(dataDir, 'raw/docs/third.md', 'tier0')!.concepts;
+    expect(third).not.toContain('波动');
+    expect(third).toContain('均值');
+    // the real threshold needs a corpus of 50 documents: nothing is learned (and the small-corpus list is reset)
+    expect((await learnFrequentTerms(ctx.store)).terms).toEqual([]);
+    expect(readFrequentTerms(dataDir)?.terms).toEqual([]);
   });
 
   it('retires the placeholders tier-1 did not type once the document has been read', async () => {
