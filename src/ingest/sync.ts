@@ -6,6 +6,7 @@ import { applyDatasourceScopes } from '../datasource/sync.js';
 import { safePath } from '../fs/files.js';
 import { listSidecarKeys, RAW_DOCS, RAW_TRACES } from '../fs/layout.js';
 import { removeSidecar } from '../fs/sidecar.js';
+import { invalidateTier0Known } from '../graph/concepts.js';
 import { loadOntology, typePrecedence } from '../graph/ontology.js';
 import { buildWikiIndex } from '../graph/wire.js';
 import { DATASOURCES_PREFIX, declaredKey, enumerateDeclared, matchesPrefixes, normalizePrefixes } from '../lineage/declared.js';
@@ -134,6 +135,8 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   let preparedDocs: Map<string, string> | undefined;
   let failed = new Set<string>();
   if (touchesDocs) {
+    // tier-0 links against what the graph knows now, not what it knew when the last pass loaded its index
+    invalidateTier0Known(ctx.dataDir);
     // a scoped run prepares only the keys it was asked about: a watcher event
     // on one file must not hash every file under raw/docs
     const prep = await prepareDocs(ctx.dataDir, {

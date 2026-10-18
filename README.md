@@ -67,6 +67,7 @@ Install globally (`npm link` or `pnpm add -g .`) to use the `knode-os` binary di
 │   ├── entities/  concepts/  sources/  dreams/  datasets/
 ├── playbooks/          # agent-editable configuration
 │   ├── packs/          # context-pack playbooks (revised by the learning loop)
+│   ├── concepts/       # tier-0 concept stop list (stoplist.yaml, editable) + learned frequent terms
 │   ├── capabilities/   # semantic notes over live datasource capabilities
 │   └── intents/        # intent specs: the slots an answer needs
 ├── ledger/             # events.jsonl (machine truth) + attic/ (sidecars of removed sources)

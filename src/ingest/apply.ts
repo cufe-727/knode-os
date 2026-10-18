@@ -4,13 +4,13 @@ import path from 'node:path';
 import { KnodeConfig } from '../config.js';
 import { MAX_FILE_BYTES } from '../constants.js';
 import { readSidecarPart, replayableTier1, SidecarTier1, truncatedTier1, updateSidecarPart } from '../fs/sidecar.js';
-import { extractConcepts, wireConcepts } from '../graph/concepts.js';
+import { planTier0, Tier0Plan, wireConcepts, wireLinks } from '../graph/concepts.js';
 import { frontmatterExtraction } from '../graph/frontmatter.js';
 import { parseCapabilityNotes } from '../capability/notes.js';
 import { TRUST_TIERS, TrustTier, detectDisputes, tierForActor } from '../lineage/trust.js';
 import { applyExtraction } from '../graph/llm-extract.js';
 import { segmentText } from '../graph/segment.js';
-import { enqueueTier1, segmentRangesOf } from '../graph/tier1.js';
+import { applyTier1Scope, enqueueTier1, segmentRangesOf } from '../graph/tier1.js';
 import { PageContext } from '../graph/store.js';
 import { applyWirePlan, extractWikilinks, planWireFromMarkdown, WikiIndex } from '../graph/wire.js';
 import { isReservedWikiFile } from '../lineage/declared.js';
@@ -29,11 +29,14 @@ import { loadSourceText, sha256 } from './source.js';
 
 /**
  * Apply one file as a document scope: chunk → embed (reusing unchanged
- * content-addressed chunks) → search projection → tier-0 graph evidence, all
- * inside one scope transaction. Under `serve` the embed step is left to the
- * background embedder (`ctx.embeddings`): an apply never waits on the
- * rate-limited pool, and never fails because its daily quota is spent. Tier-1 sidecar replays and the human-written
- * parts of generated pages become child scopes of the document's scope.
+ * content-addressed chunks) → search projection → tier-0 graph evidence
+ * (declared facts, links to entities the graph already knows, mined concept
+ * placeholders — src/graph/concepts.ts), all inside one scope transaction.
+ * Under `serve` the embed step is left to the background embedder
+ * (`ctx.embeddings`): an apply never waits on the rate-limited pool, and never
+ * fails because its daily quota is spent. Tier-1 sidecar replays and the
+ * human-written parts of generated pages become child scopes of the document's
+ * scope.
  *
  * The text comes from src/ingest/source.ts: raw text normalized in memory, or
  * the sidecar's content.md for converted originals and trace episodes.
@@ -127,7 +130,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     // from another machine, or written by a bench run) — apply it as the
     // document's child scope without re-indexing the document itself
     if (root === 'docs') {
-      await ensureTier1Replay(store, file, raw, sha, docId, live.id, opts);
+      await ensureTier1Replay(store, file, raw, sha, docId, opts);
       // an extraction from before segmented extraction read only the start of
       // a long document: queue it again so the rest gets read (docs/design/10)
       if (opts.queueTier1 && truncatedTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha, raw.length)) {
@@ -171,8 +174,10 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const humanPlan = !isSource && cls.graph
     ? planWireFromMarkdown(store.dataDir, page, { frontmatter: parsed.frontmatter, body: cls.humanBody }, { selfEntity: true, body: cls.humanBody, wikiIndex: opts.wikiIndex })
     : null;
-  const concepts = root === 'docs' && isSource ? extractConcepts(parsed.body) : [];
   const declared = root === 'docs' && isSource ? frontmatterExtraction(parsed.frontmatter) : null;
+  // tier-0 links what the graph already knows and mines the rest; both are
+  // planned here (two reads) so the scope body only writes
+  const tier0: Tier0Plan | null = root === 'docs' && isSource ? await planTier0(store, parsed, title) : null;
   const capabilityNotes = root === 'capabilities' ? parseCapabilityNotes(parsed) : [];
   // Trust follows the *document's* origin, not whoever happened to run this
   // sync. A note an agent wrote stays agent-written; sync is a mechanical
@@ -230,8 +235,11 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
           const dg = await applyExtraction(w, page, declared.entities, declared.relations, declared.claims, 'tier0.frontmatter', { docDate });
           g = { entities: g.entities + dg.entities, relations: g.relations + dg.relations };
         }
-        const cg = await wireConcepts(w, page, concepts);
-        g = { entities: g.entities + cg.entities, relations: g.relations + cg.relations };
+        // then links to typed entities the graph already knows, then the mined
+        // placeholders; the two share the document's co-occurrence edges
+        const lg = tier0 ? await wireLinks(w, page, tier0.links) : { entities: 0, ids: [] };
+        const cg = await wireConcepts(w, page, tier0?.concepts ?? [], lg.ids);
+        g = { entities: g.entities + lg.entities + cg.entities, relations: g.relations + cg.relations };
         if (!tier1 && opts.queueTier1) await w.enqueueTier1(docId, segmentText(raw, config.extraction.segmentChars).length);
       }
       // a capabilities/*.md file is an ordinary source *and* the semantic layer
@@ -274,7 +282,8 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     if (meta) {
       updateSidecarPart(store.dataDir, file, 'tier0', () => ({
         contentSha: sha,
-        concepts,
+        concepts: tier0?.concepts ?? [],
+        linked: tier0?.links.map((l) => l.name) ?? [],
         wikilinks: extractWikilinks(parsed.body),
         extractedAt: now,
         declared: declared ? { entities: declared.entities, relations: declared.relations, claims: declared.claims } : null,
@@ -283,28 +292,20 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     }
 
     if (tier1) {
-      await applyScope(
-        store,
-        { kind: 'tier1', key: file },
-        sha,
-        { parentId: res.scope.id, actor: 'tier1', at: opts.at, meta: tier1ScopeMeta(docId, tier1) },
-        async (w) => {
-          const lg = await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`, {
-            docDate,
-            segments: tier1Segments(raw, tier1),
-          });
-          g = { entities: g.entities + lg.entities, relations: g.relations + lg.relations };
-        },
-      );
+      // the replay goes through applyTier1Scope like a fresh extraction, so the
+      // tier-0 placeholders it supersedes are retired the same way
+      const lg = await applyTier1Scope(store, { path: file, sha256: sha }, page, { entities: tier1.entities, relations: tier1.relations, claims: tier1.claims ?? [] }, {
+        model: tier1.model,
+        at: opts.at,
+        docDate,
+        extractedAt: tier1.segmenter ? tier1.extractedAt : undefined,
+        segments: tier1Segments(raw, tier1),
+      });
+      g = { entities: g.entities + lg.entities, relations: g.relations + lg.relations };
     }
   }
 
   return { outcome: 'applied', chunks: chunkRows.length, entities: g.entities, relations: g.relations, scopeId: res.scope.id };
-}
-
-function tier1ScopeMeta(docId: string, tier1: SidecarTier1): Record<string, unknown> {
-  // a segmented result names itself, so a replay can tell it from an older result for the same content
-  return { documentId: docId, model: tier1.model, ...(tier1.segmenter ? { extractedAt: tier1.extractedAt } : {}) };
 }
 
 /** Grounding ranges for a segmented tier-1 result (see applyExtraction). */
@@ -313,7 +314,7 @@ function tier1Segments(text: string, tier1: SidecarTier1): { text: string; range
   return ranges ? { text, ranges } : undefined;
 }
 
-async function ensureTier1Replay(store: Store, file: string, raw: string, sha: string, docId: string, parentId: string, opts: ApplyDocOptions): Promise<void> {
+async function ensureTier1Replay(store: Store, file: string, raw: string, sha: string, docId: string, opts: ApplyDocOptions): Promise<void> {
   const tier1 = replayableTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha, raw.length);
   if (!tier1) return;
   const child = await findLiveScope(store, 'tier1', file);
@@ -323,15 +324,14 @@ async function ensureTier1Replay(store: Store, file: string, raw: string, sha: s
   const [docRow] = await store.query<{ doc_date: string | Date | null }>(`SELECT doc_date FROM documents WHERE id = $1`, [docId]);
   const docDate = docRow?.doc_date ? new Date(docRow.doc_date).toISOString() : null;
   const page: PageContext = { documentId: docId, path: file, title: path.basename(file), chunkIds: chunks };
-  await applyScope(
-    store,
-    { kind: 'tier1', key: file },
-    sha,
-    { parentId, actor: 'tier1', at: opts.at, force: true, meta: tier1ScopeMeta(docId, tier1) },
-    async (w) => {
-      await applyExtraction(w, page, tier1.entities, tier1.relations, tier1.claims ?? [], `tier1.llm:${tier1.model}`, { docDate, segments: tier1Segments(raw, tier1) });
-    },
-  );
+  await applyTier1Scope(store, { path: file, sha256: sha }, page, { entities: tier1.entities, relations: tier1.relations, claims: tier1.claims ?? [] }, {
+    model: tier1.model,
+    at: opts.at,
+    force: true,
+    docDate,
+    extractedAt: tier1.segmenter ? tier1.extractedAt : undefined,
+    segments: tier1Segments(raw, tier1),
+  });
 }
 
 export function guessMime(file: string): string {
