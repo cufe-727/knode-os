@@ -103,8 +103,10 @@ relations:
     expect(stats.indexed).toBeGreaterThanOrEqual(1);
 
     const rels = await ctx.store.query<{ source_id: string; target_id: string; type: string; valid_from: string | null; valid_to: string | null; weight: number }>(
-      `SELECT source_id, target_id, type, valid_from, valid_to, weight FROM relations WHERE tx_to IS NULL AND type <> 'co_occurs' ORDER BY type, source_id`,
+      `SELECT source_id, target_id, type, valid_from, valid_to, weight FROM relations WHERE tx_to IS NULL ORDER BY type, source_id`,
     );
+    // only typed predicates are rows; co-occurrence is derived from mentions on read
+    expect(rels.map((r) => r.type)).not.toContain('co_occurs');
     const by = (type: string) => rels.filter((r) => r.type === type);
     // synonym → canonical, direction kept
     expect(by('supplies_to').map((r) => [r.source_id, r.target_id])).toEqual(expect.arrayContaining([['宁德时代', '特斯拉'], ['宁德时代', '蔚来']]));
@@ -123,6 +125,7 @@ relations:
     const insights = await graphInsights(ctx.store);
     expect(insights.unknownPredicates).toEqual([{ raw: 'sponsors', n: 1 }]);
     expect(insights.relationTypeCounts.map((r) => r.type)).toEqual(expect.arrayContaining(['supplies_to', 'subsidiary_of']));
+    expect(insights.relationTypeCounts.map((r) => r.type)).not.toContain('co_occurs');
 
     // world-time filtering on edges: the 蔚来 contract ended in 2019
     const now = await graphSearch(ctx.store, '宁德时代', { depth: 1, validAt: '2024-06-01', track: false });

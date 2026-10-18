@@ -132,8 +132,9 @@ flowchart TD
 3. **向量 + 全文**：沿用现有 embeddings + tsvector 流程。
 4. **NLP 概念抽取（新增）**：从每个 chunk 提取名词短语/关键词（英文可用
    POS-tag 名词短语；CJK 用分词 + 停用词过滤 + TF-IDF 截断）。产出
-   `concept` 类型的轻量实体 + chunk 级 `co_occurs` 边（LazyGraphRAG 的概念共现
-   图）。这层图谱质量不高，但覆盖 100% 文档、成本为零，保证冷文档也有图信号。
+   `concept` 类型的轻量实体 + chunk 级 mention（LazyGraphRAG 的概念共现图；
+   `co_occurs` 边不落库，读取时由 `entity_mentions` 推导，见 05 §4.3）。这层图谱
+   质量不高，但覆盖 100% 文档、成本为零，保证冷文档也有图信号。
 5. **确定性 wikilink 布线**：沿用 `src/graph/extract.ts` 的 `wireFromMarkdown`。
 
 实现上，Tier 0 = 现有 `ingestAll`/增量 ingest 减去 `extractWithLlm`，加上
@@ -190,8 +191,8 @@ NLP 概念抽取与 sidecar 写入。
   出队，百万级语料下图谱按"被用的顺序"渐进变密。
 - **抽取本身**：沿用现有 prompt 结构（10 实体类型 / 8 关系类型），按 LightRAG
   方式对 chunk 批量单次提取，结果做名称/别名消歧后**集合并入**全局
-  `entities`/`relations`（现有 upsert 逻辑已是合并语义，`mention_count`、
-  `co_occurs` weight 累积保留）。
+  `entities`/`relations`（现有 upsert 逻辑已是合并语义，`mention_count` 累积
+  保留；`co_occurs` 不再落库，由 mention 读时推导）。
 - **回写 sidecar**：抽取结果连同 `model`、`contentSha` 写入 sidecar 的
   `extraction.tier1`。下次 DB 重建或内容未变的重复 ingest，直接从 sidecar
   回放，不再调 LLM。

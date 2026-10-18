@@ -69,7 +69,11 @@ export interface NormalizedPredicate {
   unknown?: string;
 }
 
-/** Predicates the pipeline itself writes; always legal, never in the prompt. */
+/**
+ * Predicates the pipeline itself writes; always legal, never in the prompt.
+ * `co_occurs` is no longer written — co-occurrence is derived from mentions on
+ * read (cooccur.ts) — but stays legal so old sidecars and packs still validate.
+ */
 export const SYSTEM_RELATION_TYPES = ['related_to', 'mentions', 'links_to', 'co_occurs', 'stored_in', 'appears_in'] as const;
 
 export const CORE_PACK_YAML = `# Ontology pack "core": the vocabulary every knode-os graph is written in.

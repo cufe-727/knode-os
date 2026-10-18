@@ -80,3 +80,43 @@ describe('upgrading early desktop databases', () => {
     }
   });
 });
+
+describe('v13: co-occurrence is derived, not stored', () => {
+  it('drops co_occurs rows with their evidence, keeps typed edges, and indexes mentions by document', async () => {
+    const dataDir = path.join(tmp, 'v13');
+    fs.mkdirSync(path.join(dataDir, '.knode'), { recursive: true });
+    let store = await Store.open(dataDir, 3);
+    try {
+      await store.query(`INSERT INTO scopes (id, kind, key, sha, status, actor, applied_at) VALUES ('s1', 'doc', 'raw/docs/a.md', 'sha', 'active', 'test', now())`);
+      await store.query(`INSERT INTO entities (id, name, type) VALUES ('a', 'A', 'concept'), ('b', 'B', 'concept'), ('c', 'C', 'concept')`);
+      await store.query(
+        `INSERT INTO relations (id, source_id, target_id, type, weight) VALUES ('co', 'a', 'b', 'co_occurs', 0.3), ('typed', 'a', 'c', 'related_to', 1)`,
+      );
+      await store.query(
+        `INSERT INTO evidence (kind, target_id, scope_id, weight, extractor, attrs, tx_from) VALUES
+           ('relation', 'co', 's1', 0.3, 'tier0.wikilink', '{}', now()),
+           ('relation', 'typed', 's1', 1, 'tier0.frontmatter', '{}', now()),
+           ('entity', 'a', 's1', 1, 'tier0.wikilink', '{}', now())`,
+      );
+      // a database that still has the rows is one that stopped at v12
+      await store.query(`UPDATE meta SET value = '{"v":12}'::jsonb WHERE key = 'schema_version'`);
+    } finally {
+      await store.close();
+    }
+
+    store = await Store.open(dataDir, 3);
+    try {
+      expect(store.migration).toEqual({ from: 12, to: SCHEMA_VERSION });
+      expect(await store.query(`SELECT id FROM relations ORDER BY id`)).toEqual([{ id: 'typed' }]);
+      expect(await store.query(`SELECT kind, target_id FROM evidence ORDER BY kind`)).toEqual([
+        { kind: 'entity', target_id: 'a' },
+        { kind: 'relation', target_id: 'typed' },
+      ]);
+      expect(await store.query(`SELECT indexname FROM pg_indexes WHERE tablename = 'entity_mentions' AND indexname = 'mentions_document_idx'`)).toEqual([
+        { indexname: 'mentions_document_idx' },
+      ]);
+    } finally {
+      await store.close();
+    }
+  });
+});

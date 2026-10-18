@@ -9,16 +9,17 @@ import { CATALOG_VIEWS } from '../src/store/catalog.js';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-schema-v7-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-describe('schema v7/v8/v10/v11/v12 (wiki research + review + quick answers + claim merges + dispose indexes)', () => {
+describe('schema v7/v8/v10/v11/v12/v13 (wiki research + review + quick answers + claim merges + dispose indexes + derived co-occurrence)', () => {
   it('adds the temporal relation / claim columns, resolution tables and research jobs, and every catalog view resolves', async () => {
     fs.mkdirSync(path.join(tmp, 'ws', '.knode'), { recursive: true });
     const store = await Store.open(path.join(tmp, 'ws'), 3);
     try {
-      expect(SCHEMA_VERSION).toBe(12);
-      expect(store.migration.to).toBe(12);
-      // every foreign key a disposal fires, and the merged-entity lookup of the fold, has an index to use
+      expect(SCHEMA_VERSION).toBe(13);
+      expect(store.migration.to).toBe(13);
+      // every foreign key a disposal fires, the merged-entity lookup of the fold, and the
+      // document side of derived co-occurrence (v13) have an index to use
       const indexes = (await store.query<{ indexname: string }>(`SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()`)).map((r) => r.indexname);
-      expect(indexes).toEqual(expect.arrayContaining(['claims_chunk_idx', 'claims_object_idx', 'pages_scope_idx', 'entities_canonical_idx']));
+      expect(indexes).toEqual(expect.arrayContaining(['claims_chunk_idx', 'claims_object_idx', 'pages_scope_idx', 'entities_canonical_idx', 'mentions_document_idx']));
       const columns = async (table: string) =>
         (await store.query<{ column_name: string }>(
           `SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1`,

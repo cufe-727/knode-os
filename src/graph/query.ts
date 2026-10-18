@@ -23,6 +23,7 @@ import {
   toDateString,
 } from '../store/temporal.js';
 import { ClaimItem, EntityRow, GraphEdge, GraphNode, GraphSearchResult, RelationRow, SearchResult } from '../types.js';
+import { coOccurrenceEdge, coOccurringEntities, coOccursSql } from './cooccur.js';
 import { canonicalMap, expandGroups } from './resolve.js';
 
 /**
@@ -114,10 +115,13 @@ async function scopeKeys(store: Store, scopeIds: string[]): Promise<Map<string, 
 /**
  * Graph search: seed entities matched by name/alias/description, then BFS
  * expansion over relations with per-hop decay (llm_wiki's multi-signal idea,
- * simplified: edge weight × hop decay). Returns a scored subgraph plus the
- * chunks where the entities are grounded. With `asOf`, nodes and edges are
- * recomputed from evidence as of that system time; `filter` restricts both the
- * seed entities and the grounding chunks to the requested sources.
+ * simplified: edge weight × hop decay). Co-occurrence is not stored: each hop
+ * derives it from the mentions the frontier shares with other entities
+ * (cooccur.ts) and counts it at half a typed edge's gain. Returns a scored
+ * subgraph plus the chunks where the entities are grounded. With `asOf`, nodes
+ * and edges are recomputed from evidence as of that system time; `filter`
+ * restricts both the seed entities and the grounding chunks to the requested
+ * sources.
  */
 export async function graphSearch(
   store: Store,
@@ -161,6 +165,10 @@ export async function graphSearch(
   const edges = new Map<string, GraphEdge>();
   let frontier = [...score.keys()];
   const HOP_DECAY = 0.5;
+  /** A weak signal: a derived co_occurs edge yields half the gain of a typed edge of the same weight. */
+  const CO_OCCURS_DISCOUNT = 0.5;
+  /** Past the seeds, only this many frontier nodes (highest score first) derive co-occurrence: a frontier of hubs reads millions of mentions. */
+  const CO_OCCURS_FRONTIER = 12;
 
   for (let hop = 0; hop < depth && frontier.length > 0; hop++) {
     // a merged entity's edges count for its survivor: expand the frontier to whole merge groups
@@ -175,9 +183,23 @@ export async function graphSearch(
             rp.list,
           );
         })();
-    const canon = await canonicalMap(store, rels.flatMap((r) => [r.source_id, r.target_id]));
+    const coFrontier = hop === 0
+      ? frontierAll
+      : await expandGroups(store, [...frontier].sort((a, b) => (score.get(b) ?? 0) - (score.get(a) ?? 0)).slice(0, CO_OCCURS_FRONTIER));
+    const co = await coOccurringEntities(store, coFrontier, { asOf, filter: f });
+    const canon = await canonicalMap(store, [...rels.flatMap((r) => [r.source_id, r.target_id]), ...co.flatMap((x) => [x.source, x.target])]);
     const c = (id: string) => canon.get(id) ?? id;
     const next = new Set<string>();
+    const reach = (from: string, to: string, weight: number, discount: number) => {
+      const base = score.get(from);
+      if (base === undefined) return;
+      const gain = base * HOP_DECAY * Math.min(1, weight / 2 + 0.5) * discount;
+      const prev = score.get(to) ?? 0;
+      if (gain > prev) {
+        score.set(to, gain);
+        if (!nodeById.has(to)) next.add(to);
+      }
+    };
     for (const r of rels) {
       const sId = c(r.source_id);
       const tId = c(r.target_id);
@@ -191,16 +213,21 @@ export async function graphSearch(
           validFrom: toDateString(r.valid_from ?? null), validTo: toDateString(r.valid_to ?? null),
         });
       }
-      for (const [from, to] of [[sId, tId], [tId, sId]] as const) {
-        const base = score.get(from);
-        if (base === undefined) continue;
-        const gain = base * HOP_DECAY * Math.min(1, r.weight / 2 + 0.5) * (r.type === 'co_occurs' ? 0.5 : 1);
-        const prev = score.get(to) ?? 0;
-        if (gain > prev) {
-          score.set(to, gain);
-          if (!nodeById.has(to)) next.add(to);
-        }
-      }
+      reach(sId, tId, r.weight, 1);
+      reach(tId, sId, r.weight, 1);
+    }
+    // derived, undirected, and never summed across hops: a pair seen again keeps its strongest reading
+    for (const x of co) {
+      const sId = c(x.source);
+      const tId = c(x.target);
+      if (sId === tId) continue;
+      const edge = coOccurrenceEdge({ ...x, source: sId, target: tId });
+      const key = `${edge.source}|${edge.type}|${edge.target}`;
+      const existing = edges.get(key);
+      if (!existing) edges.set(key, edge);
+      else if (edge.weight > existing.weight) Object.assign(existing, edge);
+      reach(sId, tId, x.weight, CO_OCCURS_DISCOUNT);
+      reach(tId, sId, x.weight, CO_OCCURS_DISCOUNT);
     }
     const ids = [...next];
     if (ids.length > 0) {
@@ -297,7 +324,11 @@ async function asOfRows(store: Store, ids: string[], asOf: string, fallback: Ent
   }));
 }
 
-/** Whole-graph overview for visualization (top-N live entities by mentions + edges among them). */
+/**
+ * Whole-graph overview for visualization: top-N live entities by mentions, the
+ * typed edges among them, and the co-occurrence derived among them (each
+ * node's strongest neighbours; see cooccur.ts).
+ */
 export async function graphOverview(store: Store, limit = 120): Promise<GraphSearchResult> {
   const ents = await store.query<EntityRow>(
     `SELECT * FROM entities WHERE tx_to IS NULL ORDER BY mention_count DESC, updated_at DESC LIMIT $1`,
@@ -310,16 +341,34 @@ export async function graphOverview(store: Store, limit = 120): Promise<GraphSea
     `SELECT * FROM relations WHERE source_id IN (${ph}) AND target_id IN (${ph}) AND tx_to IS NULL`,
     ids,
   );
+  const edges: GraphEdge[] = rels.map((r) => ({
+    source: r.source_id, target: r.target_id, type: r.type, description: r.description, weight: r.weight,
+    validFrom: toDateString(r.valid_from ?? null), validTo: toDateString(r.valid_to ?? null),
+  }));
+  // every node is a seed, so each pair comes back from both ends: keep it once.
+  // The top nodes are the hubs; their 50 newest documents are enough to rank
+  // their partners among themselves, and keep the finance overview under a second.
+  const seen = new Set<string>();
+  for (const x of await coOccurringEntities(store, ids, { among: ids, maxDocuments: 50 })) {
+    const edge = coOccurrenceEdge(x);
+    const key = `${edge.source}|${edge.target}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edges.push(edge);
+  }
   return {
     nodes: ents.map((e) => ({ id: e.id, name: e.name, type: e.type, description: e.description, score: e.mention_count, mentionCount: e.mention_count })),
-    edges: rels.map((r) => ({ source: r.source_id, target: r.target_id, type: r.type, description: r.description, weight: r.weight, validFrom: toDateString(r.valid_from ?? null), validTo: toDateString(r.valid_to ?? null) })),
+    edges,
     chunks: [],
   };
 }
 
 export interface GraphInsights {
+  /** `relations` counts typed edges; co-occurrence is derived from mentions and not a row. */
   totals: { entities: number; relations: number; mentions: number; tombstoned: number };
+  /** Degree over typed edges. */
   hubs: { id: string; name: string; degree: number }[];
+  /** No typed edge and no co-occurring entity: not even a document that mentions it mentions anything else. */
   isolated: { id: string; name: string }[];
   typeCounts: { type: string; n: number }[];
   relationTypeCounts: { type: string; n: number }[];
@@ -347,7 +396,9 @@ export async function graphInsights(store: Store): Promise<GraphInsights> {
   );
   const isolated = await store.query<{ id: string; name: string }>(
     `SELECT e.id, e.name FROM entities e
-     WHERE e.tx_to IS NULL AND NOT EXISTS (SELECT 1 FROM relations r WHERE (r.source_id = e.id OR r.target_id = e.id) AND r.tx_to IS NULL)
+     WHERE e.tx_to IS NULL
+       AND NOT EXISTS (SELECT 1 FROM relations r WHERE (r.source_id = e.id OR r.target_id = e.id) AND r.tx_to IS NULL)
+       AND NOT ${coOccursSql('e.id')}
      ORDER BY e.mention_count DESC LIMIT 20`,
   );
   const typeCounts = await store.query<{ type: string; n: number }>(

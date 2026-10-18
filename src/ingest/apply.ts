@@ -248,10 +248,10 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
           g = { entities: g.entities + dg.entities, relations: g.relations + dg.relations };
         }
         // then links to typed entities the graph already knows, then the mined
-        // placeholders; the two share the document's co-occurrence edges
+        // placeholders; co-occurrence between them is derived from their mentions on read
         const lg = tier0 ? await wireLinks(w, page, tier0.links) : { entities: 0, ids: [] };
-        const cg = await wireConcepts(w, page, tier0?.concepts ?? [], lg.ids);
-        g = { entities: g.entities + lg.entities + cg.entities, relations: g.relations + cg.relations };
+        const cg = await wireConcepts(w, page, tier0?.concepts ?? []);
+        g = { entities: g.entities + lg.entities + cg.entities, relations: g.relations };
         if (queueTier1) await w.enqueueTier1(docId, segmentText(raw, config.extraction.segmentChars).length);
       }
       // a capabilities/*.md file is an ordinary source *and* the semantic layer

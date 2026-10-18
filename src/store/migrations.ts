@@ -821,6 +821,26 @@ CREATE INDEX IF NOT EXISTS pages_scope_idx ON pages (scope_id) WHERE scope_id IS
 CREATE INDEX IF NOT EXISTS entities_canonical_idx ON entities (canonical_id) WHERE canonical_id IS NOT NULL;
 `;
 
+// Co-occurrence is derived from entity_mentions on read now (src/graph/cooccur.ts):
+// two entities co-occur when a live document mentions both, strongly when one
+// chunk does. The stored `co_occurs` rows said nothing the mentions did not and
+// were 92% of the finance workspace's relations table, so they go — deleted
+// rather than tombstoned, because an as_of read folds relations back out of
+// their evidence and would resurrect them. The document index is what the
+// derivation joins on.
+// Measured 2026-10-18 on a copy of that workspace (844k co_occurs of 912k
+// relations, 2.0M of 2.96M evidence rows; Postgres 17 with the server's own
+// settings, shared_buffers 128MB): evidence delete 19.3 s (one hash join over a
+// sequential scan of evidence; the IN-subquery form plans identically),
+// relations delete 0.6 s, index 0.1 s. Plain VACUUM afterwards leaves the
+// files at 1.15 GB / 203 MB — the space is reused, not returned; VACUUM FULL
+// would return it at the cost of an exclusive lock.
+const V13_DERIVED_COOCCURRENCE = `
+DELETE FROM evidence e USING relations r WHERE r.id = e.target_id AND e.kind = 'relation' AND r.type = 'co_occurs';
+DELETE FROM relations WHERE type = 'co_occurs';
+CREATE INDEX IF NOT EXISTS mentions_document_idx ON entity_mentions (document_id);
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -851,6 +871,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 10, name: 'chat-quick', up: async (q) => execScript(q, V10_CHAT_QUICK) },
   { version: 11, name: 'claim-merge', up: async (q) => execScript(q, V11_CLAIM_MERGE) },
   { version: 12, name: 'dispose-indexes', up: async (q) => execScript(q, V12_DISPOSE_INDEXES) },
+  { version: 13, name: 'derived-cooccurrence', up: async (q) => execScript(q, V13_DERIVED_COOCCURRENCE) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

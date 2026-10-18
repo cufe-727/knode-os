@@ -101,7 +101,7 @@ export async function recommendWikiTopics(ctx: AppContext, opts: RecommendOption
     );
     const degreeRows = await store.query<{ id: string; n: number }>(
       `SELECT e.id, count(r.id)::int AS n FROM entities e
-       LEFT JOIN relations r ON (r.source_id = e.id OR r.target_id = e.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
+       LEFT JOIN relations r ON (r.source_id = e.id OR r.target_id = e.id) AND r.tx_to IS NULL
        WHERE e.id IN (${ph}) GROUP BY e.id`,
       ids,
     );

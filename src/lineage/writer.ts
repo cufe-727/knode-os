@@ -299,7 +299,11 @@ export class ScopeWriter {
     return id;
   }
 
-  /** Chunk-level mention; the chunk row must already exist (call `document` first). */
+  /**
+   * Chunk-level mention; the chunk row must already exist (call `document`
+   * first). Co-occurrence between entities is derived from these rows on read
+   * (graph/cooccur.ts), never stored as edges.
+   */
   async mention(entityId: string, chunkId: string, documentId: string): Promise<void> {
     const rows = await this.q.query<{ entity_id: string }>(
       `INSERT INTO entity_mentions (entity_id, chunk_id, document_id, scope_id) VALUES ($1, $2, $3, $4)
@@ -308,22 +312,6 @@ export class ScopeWriter {
     );
     if (rows.length) this.stats.mentions++;
     this.touched.entities.add(entityId);
-  }
-
-  /**
-   * Weak `co_occurs` edges between entities appearing in the same source.
-   * Each entity is paired with the next `window - 1` entities in list order,
-   * so edge count stays linear in the entity count.
-   */
-  async coOccurrence(entityIds: string[], o: { weight: number; window: number; extractor: string }): Promise<number> {
-    const ids = [...new Set(entityIds)];
-    let count = 0;
-    for (let i = 0; i < ids.length; i++) {
-      for (let j = i + 1; j < ids.length && j < i + o.window; j++) {
-        if (await this.relation(ids[i], ids[j], { type: 'co_occurs', weight: o.weight, extractor: o.extractor })) count++;
-      }
-    }
-    return count;
   }
 
   private async addEvidence(kind: string, targetId: string, extractor: string, weight: number, segmentId: string | null, attrs: Record<string, unknown>): Promise<boolean> {

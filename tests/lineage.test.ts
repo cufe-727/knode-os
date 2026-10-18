@@ -9,6 +9,7 @@ import { loadConfig, saveConfig } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { readSidecarPart, updateSidecarPart } from '../src/fs/sidecar.js';
+import { coOccurringEntities } from '../src/graph/cooccur.js';
 import { claimsForEntities, graphSearch } from '../src/graph/query.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import { sync } from '../src/ingest/sync.js';
@@ -131,7 +132,9 @@ describe('lineage: temporal composability of sources', () => {
     expect(ev.map((e) => e.extractor)).toEqual(expect.arrayContaining(['tier0.frontmatter']));
     expect((await entityRow(store, '比亚迪')).tx_to).toBeNull();
     expect(await count(store, `claims WHERE subject_id = '宁德时代' AND tx_to IS NULL`)).toBe(1);
-    expect(await count(store, `relations WHERE type = 'co_occurs' AND tx_to IS NULL`)).toBeGreaterThan(0);
+    // co-occurrence is derived from the mentions on read, never stored as relation rows
+    expect(await count(store, `relations WHERE type = 'co_occurs'`)).toBe(0);
+    expect((await coOccurringEntities(store, ['比亚迪'])).find((x) => x.target === '动力电池')).toMatchObject({ documents: 1, chunks: 1 });
     const forDoc = (events: ReturnType<typeof readLedger>) =>
       events.filter((e) => (e.ev === 'apply' || e.ev === 'dispose') && e.scope.key === 'raw/docs/a.md');
     expect(forDoc(readLedger(dataDir)).map((e) => e.ev)).toEqual(['apply']);
@@ -201,13 +204,8 @@ describe('lineage: temporal composability of sources', () => {
 
   it('re-applies idempotently: unchanged sources write nothing and weights never inflate', async () => {
     const { store } = ctx;
-    const weightOf = async () => {
-      const [row] = await store.query<{ weight: number }>(
-        `SELECT weight FROM relations WHERE type = 'co_occurs' AND tx_to IS NULL
-         AND ((source_id = '比亚迪' AND target_id = '动力电池') OR (source_id = '动力电池' AND target_id = '比亚迪'))`,
-      );
-      return row?.weight;
-    };
+    // the derived 比亚迪 — 动力电池 co-occurrence: one document, one shared chunk, however often the source is synced
+    const weightOf = async () => (await coOccurringEntities(store, ['比亚迪'])).find((x) => x.target === '动力电池')?.weight;
     const before = {
       scopes: await count(store, 'scopes'),
       evidence: await count(store, 'evidence'),
@@ -244,6 +242,9 @@ describe('lineage: temporal composability of sources', () => {
     await sleep(20);
     const t1 = new Date().toISOString();
     await sleep(20);
+    // while a.md is live, its mentions give 比亚迪 a derived co_occurs edge to 动力电池
+    const edgesNow = await graphSearch(store, '比亚迪', { track: false });
+    expect(edgesNow.edges.some((e) => e.type === 'co_occurs' && [e.source, e.target].includes('动力电池'))).toBe(true);
     fs.rmSync(path.join(dataDir, 'raw/docs/a.md'));
     await sync(ctx, { llmGraph: false });
     await sleep(20);
@@ -257,8 +258,11 @@ describe('lineage: temporal composability of sources', () => {
     expect(now.nodes.find((n) => n.id === '宁德时代')).toBeUndefined();
     const then = await graphSearch(store, '宁德时代', { track: false, asOf: t1 });
     expect(then.nodes.find((n) => n.id === '宁德时代')).toBeDefined();
+    // the entity is still there as_of t1; its co-occurrence is not, because the
+    // mentions it was derived from went with the source (docs/design/05 §4.6)
     const edgesThen = await graphSearch(store, '比亚迪', { track: false, asOf: t1 });
-    expect(edgesThen.edges.length).toBeGreaterThan(0);
+    expect(edgesThen.nodes.find((n) => n.id === '比亚迪')).toBeDefined();
+    expect(edgesThen.edges).toEqual([]);
     expect((await graphSearch(store, '比亚迪', { track: false })).nodes.find((n) => n.id === '比亚迪')).toBeUndefined();
 
     // documents live at t1 are searchable as_of t1 only while their chunks exist;
