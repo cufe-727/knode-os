@@ -14,6 +14,11 @@ import path from 'node:path';
  *
  * It reports paths, not event kinds: a caller stats or re-walks to learn what
  * happened. An event the OS could not attribute to a path reports the root.
+ *
+ * Nothing is reported until a moment after this returns (FSEvents opens its
+ * stream on another thread), and opening a watcher blinds the others in the
+ * process for that moment too (libuv runs them all on one stream, rebuilt on
+ * each open). A caller that must not miss a change re-walks once the watch is up.
  */
 export interface TreeWatcher {
   close(): void;

@@ -560,9 +560,10 @@ export interface LinkedFoldersOptions {
 /**
  * What `serve` runs per workspace for its linked folders: one recursive
  * watcher per source (src/fs/watch.ts — one handle per tree, never one per
- * file) whose events re-mirror the link and sync the keys that changed, a
- * startup refresh for whatever changed while knode-os was down, and a periodic
- * reconcile for the events a filesystem watcher drops.
+ * file) whose events re-mirror the link and sync the keys that changed, one
+ * such pass as each watcher opens for what changed before it could report
+ * anything, a startup refresh for whatever changed while knode-os was down,
+ * and a periodic reconcile for the events a filesystem watcher drops.
  */
 export class LinkedFolders {
   private readonly watchers = new Map<string, TreeWatcher>();
@@ -714,6 +715,11 @@ export class LinkedFolders {
     this.watchers.set(link.dest, watcher);
     this.runtime.set(link.dest, { ...this.runtimeOf(link.dest), watching: true });
     this.log(`watching ${link.source} → ${link.dest}`);
+    // a change made before the OS's side of the watch is up is never reported —
+    // one since the walk that ran before this (the import, a refresh) or one in
+    // the moment FSEvents takes to open its stream on another thread once
+    // fs.watch has returned — so one debounced pass re-walks the source
+    this.onEvent(link);
   }
 
   private unwatch(dest: string): void {
