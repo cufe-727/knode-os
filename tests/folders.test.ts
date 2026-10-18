@@ -42,6 +42,16 @@ function write(root: string, rel: string, content: string | Buffer): void {
   fs.writeFileSync(abs, content);
 }
 
+/** Wait until the async `check` holds, or fail after `ms`. */
+async function eventually(check: () => Promise<boolean>, label: string, ms = 10_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await sleep(100);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
 /** Wait until `check` holds, or fail after `ms`. */
 async function until(check: () => boolean, ms = 10_000, label = 'condition'): Promise<void> {
   const deadline = Date.now() + ms;
@@ -259,15 +269,17 @@ describe('folder import over the API', () => {
     expect((await post('/api/folders/preview', { source: path.join(tmp, 'missing') })).status).toBe(400);
   });
 
-  it('copies a folder once, tree intact, and indexes it', async () => {
+  it('copies a folder once, tree intact, and indexes it after answering', async () => {
     const response = await post('/api/folders/import', { source, dest: 'exports', mode: 'copy' });
     expect(response.status).toBe(200);
     const result = await response.json();
-    expect(result).toMatchObject({ ok: true, mode: 'copy', dest: 'raw/docs/exports', tooLarge: 1 });
+    expect(result).toMatchObject({ ok: true, mode: 'copy', dest: 'raw/docs/exports', tooLarge: 1, sync: null, indexing: true });
     expect(result.copied).toHaveLength(6);
-    // five indexable documents; the oversized one is copied and skipped by the index, as the plan said
-    expect(result.sync.indexed).toBe(5);
-    expect(result.sync.skipped).toBe(1);
+    // indexing follows the answer: five indexable documents; the oversized one is copied and skipped, as the plan said
+    const ctx = await workspaceCtx();
+    const docs = ['INDEX.md', 'feishu/INDEX.md', 'feishu/混沌__e33af2da801e/2026-09.md', 'feishu/混沌__e33af2da801e/2026-10.md', 'xueqiu/2026-09.md'];
+    await eventually(async () => (await Promise.all(docs.map((d) => findLiveScope(ctx.store, 'doc', `raw/docs/exports/${d}`)))).every(Boolean), 'the copy to be indexed');
+    expect(await findLiveScope(ctx.store, 'doc', 'raw/docs/exports/big/2025-07.md')).toBeNull();
     expect(fs.existsSync(path.join(workspaceDir, 'raw/docs/exports/feishu/混沌__e33af2da801e/2026-10.md'))).toBe(true);
     expect(fs.existsSync(path.join(workspaceDir, 'raw/docs/exports/content.sqlite'))).toBe(false);
 
@@ -294,10 +306,11 @@ describe('folder import over the API', () => {
   });
 
   it('links a folder: the mirror is marked in the tree, remembered in the config, and read-only to every write route', async () => {
-    const response = await post('/api/folders/import', { source, dest: 'finance/exports', mode: 'link' });
+    // `wait`: the answer comes once the link is indexed, with what that pass did
+    const response = await post('/api/folders/import', { source, dest: 'finance/exports', mode: 'link', wait: true });
     expect(response.status).toBe(200);
     const result = await response.json();
-    expect(result).toMatchObject({ ok: true, mode: 'link', dest: 'raw/docs/finance/exports' });
+    expect(result).toMatchObject({ ok: true, mode: 'link', dest: 'raw/docs/finance/exports', indexing: false });
     expect(result.sync.indexed).toBe(5);
 
     const config = loadConfig(workspaceDir);
@@ -382,7 +395,7 @@ describe('folder import over the API', () => {
     expect((await post('/api/mkdir', { path: 'raw/docs/finance/exports/mine' })).status).toBe(200);
     expect((await app.request('/api/folders?dest=raw%2Fdocs%2Ffinance%2Fexports', { method: 'DELETE', headers })).status).toBe(400);
 
-    expect((await post('/api/folders/import', { source, dest: 'gone', mode: 'link' })).status).toBe(200);
+    expect((await post('/api/folders/import', { source, dest: 'gone', mode: 'link', wait: true })).status).toBe(200);
     const removed = await app.request('/api/folders?dest=raw%2Fdocs%2Fgone&removeFiles=1', { method: 'DELETE', headers });
     expect(removed.status).toBe(200);
     const body = await removed.json();

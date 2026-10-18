@@ -23,13 +23,16 @@ import { DocRoot } from '../types.js';
 import { hasProse, hasRegions, stripRegions } from '../wiki/regions.js';
 import { chunkText } from './chunker.js';
 import { docDateOf } from './docdate.js';
+import type { DeferredEmbeddings } from '../context.js';
 import { EmbeddingProvider } from './embeddings.js';
 import { loadSourceText, sha256 } from './source.js';
 
 /**
  * Apply one file as a document scope: chunk → embed (reusing unchanged
  * content-addressed chunks) → search projection → tier-0 graph evidence, all
- * inside one scope transaction. Tier-1 sidecar replays and the human-written
+ * inside one scope transaction. Under `serve` the embed step is left to the
+ * background embedder (`ctx.embeddings`): an apply never waits on the
+ * rate-limited pool, and never fails because its daily quota is spent. Tier-1 sidecar replays and the human-written
  * parts of generated pages become child scopes of the document's scope.
  *
  * The text comes from src/ingest/source.ts: raw text normalized in memory, or
@@ -51,6 +54,8 @@ export interface ApplyDocContext {
   store: Store;
   config: KnodeConfig;
   embedder: EmbeddingProvider;
+  /** When set, chunks are written without vectors and embedded later (src/ingest/embed-backfill.ts). */
+  embeddings?: DeferredEmbeddings;
 }
 
 export interface ApplyDocOptions {
@@ -138,7 +143,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const cls = await classify(store, file, root, parsed);
   const docDate = docDateOf(file, parsed.frontmatter);
 
-  /* ── pure preparation: chunking, embeddings (network), tier-0 plans ── */
+  /* ── pure preparation: chunking, embeddings (network, unless deferred), tier-0 plans ── */
   const pieces = await chunkText(file, parsed.body, config.ingest, { markdown: source.derived || undefined });
   const chunkRows = pieces.map((p, i) => ({ id: chunkIdFor(docId, i, p.content), seq: i, content: p.content, tokenCount: p.tokenCount }));
   const vectors = new Map<string, number[]>();
@@ -149,7 +154,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
         .map((r) => r.chunk_id),
     );
     const missing = chunkRows.filter((c) => !have.has(c.id));
-    if (missing.length > 0) {
+    if (missing.length > 0 && !ctx.embeddings) {
       const vecs = await embedder.embed(missing.map((c) => c.content));
       missing.forEach((c, i) => vectors.set(c.id, vecs[i]));
     }

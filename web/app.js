@@ -1689,7 +1689,7 @@ async function importLocalFolder(mode, dir) {
     reveal(res.dest);
     await loadTree();
     loadStats();
-    const indexed = res.sync ? ` · ${res.sync.indexed} indexed${res.sync.skipped ? `, ${res.sync.skipped} skipped` : ''}` : '';
+    const indexed = res.sync ? ` · ${res.sync.indexed} indexed${res.sync.skipped ? `, ${res.sync.skipped} skipped` : ''}` : res.indexing ? ' · indexing in the background' : '';
     toast(`${mode === 'link' ? 'linked' : 'imported'} ${res.dest}: ${fmtCount(res.copied.length, 'file')} copied${indexed}`, 6000);
   } catch (e) {
     toast(`${verb} failed: ${e.message}`, 6000);

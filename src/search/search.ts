@@ -204,8 +204,11 @@ export async function search(
   }
   const fetchK = Math.max(k * 3, 24);
 
+  // hybrid recall outlives an embedding provider that cannot serve the query
+  // (a spent daily quota): keyword and graph still answer; vector mode says so
+  const vectorRecall = () => vectorSearch(store, embedder, query, fetchK, opts.queryVector, opts.asOf, opts.filter);
   const [vec, kw, gr] = await Promise.all([
-    mode !== 'keyword' ? vectorSearch(store, embedder, query, fetchK, opts.queryVector, opts.asOf, opts.filter) : Promise.resolve([]),
+    mode === 'hybrid' ? vectorRecall().catch(() => [] as RankedChunk[]) : mode === 'vector' ? vectorRecall() : Promise.resolve([]),
     mode !== 'vector' ? keywordSearch(store, query, fetchK, opts.asOf, opts.filter) : Promise.resolve([]),
     mode === 'hybrid' ? graphSignal(store, query, fetchK, opts.asOf, opts.filter) : Promise.resolve([]),
   ]);

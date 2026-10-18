@@ -79,7 +79,7 @@ import {
   saveAgent,
 } from '../research/agents.js';
 import { availableAgents, suggestResearchAgent } from '../research/executors.js';
-import { sync } from '../ingest/sync.js';
+import { sync, SyncStats } from '../ingest/sync.js';
 import { historyOf, lineageOf } from '../lineage/inspect.js';
 import { forgetSource, purgeArchived, purgeDisposed } from '../lineage/purge.js';
 import { rebuild } from '../lineage/rebuild.js';
@@ -1130,14 +1130,26 @@ export function createApp(
   app.post('/api/folders/import', async (c) => {
     const ctx = requestCtx(c);
     if (ingestRunning.has(ctx.dataDir)) return c.json({ error: 'ingest running — try again shortly' }, 409);
-    // held for the whole import: a config save in the meantime would drop the link it writes
+    // held while the folder is copied and the link written: a config save in
+    // the meantime would drop the link. Indexing runs after the response
+    // (unless `wait`), with vectors after that (src/ingest/embed-backfill.ts).
     ingestRunning.add(ctx.dataDir);
     try {
-      const body = (await c.req.json().catch(() => ({}))) as { source?: string; dest?: string; mode?: string; replace?: boolean };
+      const body = (await c.req.json().catch(() => ({}))) as { source?: string; dest?: string; mode?: string; replace?: boolean; wait?: boolean };
       const mode = body.mode === 'link' ? 'link' : body.mode === 'copy' || body.mode === undefined ? 'copy' : null;
       if (!mode) return c.json({ error: 'mode must be copy or link' }, 400);
-      const opts = { dest: body.dest, replace: Boolean(body.replace), onProgress: log };
-      const folders = servicesFor(ctx)?.folders ?? null;
+      const services = servicesFor(ctx);
+      const background = body.wait === true
+        ? undefined
+        : {
+          track: services?.track,
+          onIndexed: (done: { dest: string; sync: SyncStats | null; error?: string }) =>
+            log(done.error
+              ? `import ${done.dest}: indexing failed: ${done.error}`
+              : `import ${done.dest}: ${done.sync!.indexed} indexed, ${done.sync!.unchanged} unchanged, ${done.sync!.errors} errors, ${done.sync!.chunks} chunks`),
+        };
+      const opts = { dest: body.dest, replace: Boolean(body.replace), onProgress: log, background };
+      const folders = services?.folders ?? null;
       const result = mode === 'link' && folders
         ? await folders.add(String(body.source ?? ''), opts)
         : await importFolder(ctx, String(body.source ?? ''), { ...opts, mode });

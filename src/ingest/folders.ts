@@ -79,13 +79,26 @@ export interface ImportFolderOptions {
   replace?: boolean;
   llmGraph?: boolean;
   onProgress?: (msg: string) => void;
+  /**
+   * Return once the folder is copied (and, for a link, remembered), and index
+   * the mirror afterwards: `track` takes the indexing job (serve waits for it
+   * at shutdown), `onIndexed` hears how it went. Without it the import indexes
+   * the mirror before it returns.
+   */
+  background?: {
+    track?: <T>(job: Promise<T>) => Promise<T>;
+    onIndexed?: (done: { dest: string; sync: SyncStats | null; error?: string }) => void;
+  };
 }
 
 export interface ImportFolderResult extends MirrorResult {
   source: string;
   dest: string;
   mode: ImportMode;
-  sync: SyncStats;
+  /** The indexing pass, or null while it runs in the background. */
+  sync: SyncStats | null;
+  /** True when indexing goes on after this returned. */
+  indexing: boolean;
 }
 
 /** A request the caller can fix by choosing differently (an occupied destination, a folder already linked) — 409. */
@@ -404,17 +417,29 @@ export async function importFolder(ctx: FolderContext, source: string, opts: Imp
 
   const progress = opts.onProgress ?? (() => {});
   progress(`${opts.mode === 'link' ? 'linking' : 'importing'} ${src} → ${dest}`);
+  // the destination stays claimed until it is indexed, in the background too
   const release = holdDest(ctx.dataDir, dest);
+  let handedOff = false;
   try {
     const mirrored = mirrorFolder(ctx.dataDir, src, dest, { prune: exists });
     progress(`${opts.mode}: ${mirrored.copied.length} copied, ${mirrored.removed.length} removed, ${mirrored.unchanged} unchanged${mirrored.tooLarge ? `, ${mirrored.tooLarge} above the index limit` : ''}`);
     if (opts.mode === 'link') {
       persistLinks(ctx, [...links, { source: src, dest, createdAt: new Date().toISOString() }]);
     }
-    const stats = await sync(ctx, { only: [dest], llmGraph: opts.llmGraph, onProgress: opts.onProgress });
-    return { ...mirrored, source: src, dest, mode: opts.mode, sync: stats };
+    const indexing = sync(ctx, { only: [dest], llmGraph: opts.llmGraph, onProgress: opts.onProgress });
+    if (opts.background) {
+      const { track = (job) => job, onIndexed } = opts.background;
+      handedOff = true;
+      void track(indexing.finally(release)).then(
+        (stats) => onIndexed?.({ dest, sync: stats }),
+        (err) => onIndexed?.({ dest, sync: null, error: err instanceof Error ? err.message : String(err) }),
+      );
+      return { ...mirrored, source: src, dest, mode: opts.mode, sync: null, indexing: true };
+    }
+    const stats = await indexing;
+    return { ...mirrored, source: src, dest, mode: opts.mode, sync: stats, indexing: false };
   } finally {
-    release();
+    if (!handedOff) release();
   }
 }
 
@@ -606,13 +631,23 @@ export class LinkedFolders {
     for (const rt of this.runtime.values()) rt.watching = false;
   }
 
-  /** Link a folder: mirror, remember, index, then watch it. */
+  /** Link a folder: mirror, remember, index (now, or in the background), then watch it. */
   async add(source: string, opts: Omit<ImportFolderOptions, 'mode'> = {}): Promise<ImportFolderResult> {
-    const result = await importFolder(this.ctx, source, { ...opts, mode: 'link', onProgress: opts.onProgress ?? this.log });
+    const background = opts.background
+      ? {
+        track: opts.background.track ?? this.track,
+        onIndexed: (done: { dest: string; sync: SyncStats | null; error?: string }) => {
+          this.runtime.set(done.dest, { ...this.runtimeOf(done.dest), lastSyncAt: new Date().toISOString(), lastError: done.error ?? null });
+          opts.background?.onIndexed?.(done);
+        },
+      }
+      : undefined;
+    const result = await importFolder(this.ctx, source, { ...opts, background, mode: 'link', onProgress: opts.onProgress ?? this.log });
     const link = linkedFolders(this.ctx.config).find((l) => l.dest === result.dest);
     if (link) {
       this.watch(link);
-      this.runtime.set(link.dest, { ...this.runtimeOf(link.dest), lastSyncAt: new Date().toISOString(), lastChange: { copied: result.copied.length, removed: result.removed.length, at: new Date().toISOString() } });
+      const at = new Date().toISOString();
+      this.runtime.set(link.dest, { ...this.runtimeOf(link.dest), ...(result.indexing ? {} : { lastSyncAt: at }), lastChange: { copied: result.copied.length, removed: result.removed.length, at } });
     }
     return result;
   }

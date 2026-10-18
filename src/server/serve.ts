@@ -13,6 +13,7 @@ import { startFollowUp } from '../labeling/followup.js';
 import { LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
 import { LabelingScheduler } from '../labeling/scheduler.js';
+import { EmbeddingBackfill } from '../ingest/embed-backfill.js';
 import { LinkedFolders, syncedByFolders } from '../ingest/folders.js';
 import { sync } from '../ingest/sync.js';
 import { flushUsageToSidecars } from '../stats/heat.js';
@@ -269,6 +270,12 @@ interface StartedServices {
 
 function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null } = {}): StartedServices {
   let disposed = false;
+  // vectors are computed after a document is indexed, never while it is: an
+  // import or sync does not wait on the rate-limited pool, and a spent daily
+  // quota leaves chunks pending instead of documents unindexed
+  const embeddings = new EmbeddingBackfill(ctx, { log, concurrency: Math.max(1, ctx.config.ingest.concurrency ?? 4) });
+  ctx.embeddings = embeddings;
+  embeddings.start();
   // deep-research jobs: an external CLI writes wiki pages through the MCP endpoint serve hosts
   const research = opts.mcp ? startResearchLoop(ctx, { mcp: opts.mcp, log }) : null;
   // a chat turn only lives in one process: whatever a previous serve left mid-answer is idle now
@@ -444,6 +451,8 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       watcher?.close();
       await folders.stop();
       await Promise.allSettled([...activeJobs]);
+      await embeddings.stop();
+      ctx.embeddings = undefined;
       await ctx.datasources.closeAll();
     },
     kickResearch: () => research?.kick(),

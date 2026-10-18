@@ -240,7 +240,7 @@ const importAction = (mode: 'copy' | 'link') => async (source: string, opts: { t
   try {
     const r = await importFolder(ctx, source, { dest: opts.to, mode, replace: Boolean(opts.replace), llmGraph: opts.llm, onProgress: (m) => console.log(`  ${m}`) });
     console.log(`${mode === 'link' ? 'linked' : 'imported'} ${r.source} → ${r.dest}: ${describeMirror(r)}`);
-    console.log(`indexed: ${r.sync.indexed} applied, ${r.sync.unchanged} unchanged, ${r.sync.skipped} skipped, ${r.sync.errors} errors`);
+    if (r.sync) console.log(`indexed: ${r.sync.indexed} applied, ${r.sync.unchanged} unchanged, ${r.sync.skipped} skipped, ${r.sync.errors} errors`);
     if (mode === 'link') console.log(SERVE_HINT);
   } finally {
     await ctx.datasources.closeAll();

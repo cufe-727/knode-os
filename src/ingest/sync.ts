@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { KnodeConfig, resolveRoutedLlmConfig, routeTargets } from '../config.js';
+import type { DeferredEmbeddings } from '../context.js';
 import { DataSourceRegistry } from '../datasource/registry.js';
 import { applyDatasourceScopes } from '../datasource/sync.js';
 import { safePath } from '../fs/files.js';
@@ -41,6 +42,8 @@ export interface SyncContext {
   embedder: EmbeddingProvider;
   llm: LlmClient;
   datasources?: DataSourceRegistry;
+  /** Set by `serve`: applies leave vectors to the background embedder (src/ingest/embed-backfill.ts). */
+  embeddings?: DeferredEmbeddings;
 }
 
 export interface SyncOptions {
@@ -259,6 +262,8 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   stats.pagesDeferred += views.deferred;
 
   if (opts.verify) stats.verify = await verify(ctx, progress);
+  // what this pass applied or regenerated may wait for vectors
+  if (stats.applied || stats.pagesRegenerated) ctx.embeddings?.kick();
   return stats;
 }
 

@@ -19,6 +19,19 @@ export interface AppContext {
   llm: LlmClient;
   /** Lazily-connected external live data sources (mysql / timescale / duckdb). */
   datasources: DataSourceRegistry;
+  /**
+   * Set by `serve`: documents are applied without waiting for their vectors,
+   * and this embeds whatever is missing in the background
+   * (src/ingest/embed-backfill.ts). Absent — the CLI, tests — a document's
+   * vectors are computed while it is applied.
+   */
+  embeddings?: DeferredEmbeddings;
+}
+
+/** Where an apply leaves the vectors it did not compute. */
+export interface DeferredEmbeddings {
+  /** New chunks are waiting for vectors. */
+  kick(): void;
 }
 
 /**
