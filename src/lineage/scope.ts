@@ -210,7 +210,12 @@ export async function disposeScope(store: Store, scopeId: string, opts: DisposeO
   const fsInverses: InverseSpec[] = [];
   let seq = 0;
   let result!: DisposeResult;
-  const documentId = typeof scope.meta.documentId === 'string' ? scope.meta.documentId : null;
+  // The document projection — chunks, the embeddings that cascade from them,
+  // the documents row — belongs to the doc scope alone. A child (a tier-1
+  // extraction, human prose on a generated page) names the document only to
+  // find it: disposing one, or replacing it with a fresh extraction, must leave
+  // the projection in place, or every vector of the document is paid for again.
+  const documentId = scope.kind === 'doc' && typeof scope.meta.documentId === 'string' ? scope.meta.documentId : null;
   const precedence = typePrecedence(loadOntology(store.dataDir));
 
   await store.tx(async (q) => {
