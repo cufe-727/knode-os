@@ -1,7 +1,7 @@
 import { ChatMessage } from '../llm/client.js';
 import { FailureKind } from '../labeling/failures.js';
 import { CompleteResult, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
-import { WORK_KINDS, WorkKind } from './kinds.js';
+import { isSharedKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
 
 /**
  * The work broker — every kind of leased work behind one lease protocol
@@ -10,18 +10,20 @@ import { WORK_KINDS, WorkKind } from './kinds.js';
  * One per workspace in `serve`. Each kind has a source that makes its tasks
  * and knows what an answer means: the labeling scheduler for extraction
  * segments (src/labeling/scheduler.ts), the summary source for summary pages
- * (src/work/summarize.ts). A slot — one of `serve`'s own (src/labeling/local.ts)
+ * (src/work/summarize.ts), the judge source for a review's judge calls
+ * (src/work/judge.ts). A slot — one of `serve`'s own (src/labeling/local.ts)
  * or one on a remote worker (src/remote) — asks for the kinds it takes, and
  * the broker picks which source serves it. Answers, renewals and releases go
  * back to the source that issued the lease.
  *
- * A slot that takes several kinds gets them by weight (`server.remote.shares`,
- * extraction 3 : summaries 1 by default): each kind's count of tasks handed
- * out, divided by its weight, decides who is next. A kind that had nothing to
- * give banks no credit for it — when it has work again it starts level with
- * the others instead of taking everything until it has caught up. That keeps
- * summaries moving while an import's extraction backlog is out, and
- * extraction moving while summaries pile up.
+ * Judge calls go first: a review is waiting on them, and a round has only a
+ * bounded number. A slot that takes several of the other kinds gets them by
+ * weight (`server.remote.shares`, extraction 3 : summaries 1 by default): each
+ * kind's count of tasks handed out, divided by its weight, decides who is
+ * next. A kind that had nothing to give banks no credit for it — when it has
+ * work again it starts level with the others instead of taking everything
+ * until it has caught up. That keeps summaries moving while an import's
+ * extraction backlog is out, and extraction moving while summaries pile up.
  */
 
 export interface WorkTask {
@@ -59,11 +61,11 @@ export interface WorkSource {
   stop(): Promise<void>;
 }
 
-export const DEFAULT_SHARES: Record<WorkKind, number> = { extract: 3, summarize: 1 };
+export const DEFAULT_SHARES: Record<SharedKind, number> = { extract: 3, summarize: 1 };
 
 export interface BrokerOptions {
   /** Read on every lease: a settings save may change them. */
-  shares?: () => Partial<Record<WorkKind, number>> | undefined;
+  shares?: () => Partial<Record<SharedKind, number>> | undefined;
 }
 
 export interface WorkerStatus {
@@ -80,7 +82,7 @@ export interface WorkerStatus {
 }
 
 export interface WorkStatus {
-  shares: Record<WorkKind, number>;
+  shares: Record<SharedKind, number>;
   kinds: Partial<Record<WorkKind, SourceStatus>>;
   workers: WorkerStatus[];
 }
@@ -118,29 +120,40 @@ export class WorkBroker {
     return (this.sources.get(kind) ?? [...this.sources.values()][0])?.leaseDurationMs ?? 15 * 60_000;
   }
 
-  /** The weight of each kind, from the config, a missing or unusable one at its default. */
-  shares(): Record<WorkKind, number> {
+  /** The weight of each shared kind, from the config, a missing or unusable one at its default. */
+  shares(): Record<SharedKind, number> {
     const configured = this.opts.shares?.() ?? {};
     const out = { ...DEFAULT_SHARES };
-    for (const kind of WORK_KINDS) {
+    for (const kind of SHARED_KINDS) {
       const w = Number(configured[kind]);
       if (Number.isFinite(w) && w > 0) out[kind] = w;
     }
     return out;
   }
 
-  /** Up to `max` tasks of one of `kinds` for `who`, the kind chosen by share; empty when none of them has work. */
+  /** Whether a worker asked for this kind of work within the last `withinMs`. */
+  askedLately(kind: WorkKind, withinMs: number): boolean {
+    const since = Date.now() - withinMs;
+    for (const w of this.workers.values()) if (w.lastSeen >= since && w.kinds.includes(kind)) return true;
+    return false;
+  }
+
+  /** Up to `max` tasks of one of `kinds` for `who` — judge calls first, then a shared kind by share; empty when none has work. */
   async lease(who: WorkerIdentity, kinds: readonly WorkKind[], max = 1): Promise<WorkTask[]> {
     const wanted = WORK_KINDS.filter((k) => kinds.includes(k) && this.sources.has(k));
     this.seen(who, wanted);
     if (wanted.length === 0) return [];
+    for (const kind of wanted.filter((k) => !isSharedKind(k))) {
+      const tasks = await this.sources.get(kind)!.lease(who, max);
+      if (tasks.length) return tasks;
+    }
     const shares = this.shares();
     // passes are sums of 1/weight, so a tie may differ in the last bits: within a hair, WORK_KINDS order decides
-    const order = [...wanted].sort((a, b) => {
+    const order = wanted.filter(isSharedKind).sort((a, b) => {
       const d = (this.pass.get(a) ?? 0) - (this.pass.get(b) ?? 0);
       return Math.abs(d) > 1e-9 ? d : WORK_KINDS.indexOf(a) - WORK_KINDS.indexOf(b);
     });
-    const idle: WorkKind[] = [];
+    const idle: SharedKind[] = [];
     for (const kind of order) {
       const tasks = await this.sources.get(kind)!.lease(who, max);
       if (tasks.length === 0) {

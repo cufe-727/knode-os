@@ -363,6 +363,17 @@ describe('the work broker', () => {
     expect(new WorkBroker([], { shares: () => ({ extract: 0, summarize: -2 }) }).shares()).toEqual({ extract: 3, summarize: 1 });
   });
 
+  it('puts the judge calls a review waits on before both, and leaves their shares as they were', async () => {
+    const judge = new FakeSource('judge', 2);
+    const broker = new WorkBroker([new FakeSource('extract'), new FakeSource('summarize'), judge]);
+    expect(broker.askedLately('judge', 60_000)).toBe(false);
+    expect(await kindsOf(broker, 6, ['extract', 'summarize', 'judge'])).toEqual(['judge', 'judge', 'extract', 'summarize', 'extract', 'extract']);
+    expect(broker.askedLately('judge', 60_000)).toBe(true);
+    // a slot that does not take judge calls never gets one
+    judge.supply = Infinity;
+    expect(await kindsOf(broker, 2)).toEqual(['extract', 'summarize']);
+  });
+
   it('sends answers, renewals and releases back to the source that issued the lease', async () => {
     const extract = new FakeSource('extract');
     const summarize = new FakeSource('summarize');
@@ -397,12 +408,13 @@ describe('worker hints', () => {
         workers: [{ use: 'codex-agent', slots: 0, model: 'gpt-extract', effort: 'medium' }, { use: 'cursor-agent', slots: 2 }],
       },
     };
-    expect(workerHints(config)).toEqual({
+    expect(workerHints({ ...config, extraction: { ...config.extraction, judgeLlm: { ...defaultRoutedLlmConfig(), use: 'cursor-agent', effort: 'low' } } })).toEqual({
       extract: { codex: { model: 'gpt-extract', effort: 'medium', speed: 'fast' }, cursor: { model: 'grok[effort=high]' } },
       summarize: { codex: { model: 'gpt-summary', effort: 'high', speed: 'fast' } },
+      judge: { cursor: { model: 'grok[effort=low]' } },
     });
     // an endpoint gets no hints: model names differ between them
-    expect(workerHints(base)).toEqual({ extract: {}, summarize: {} });
+    expect(workerHints(base)).toEqual({ extract: {}, summarize: {}, judge: {} });
   });
 });
 

@@ -10,10 +10,12 @@ import { RAW_DOCS, RAW_SKILLS, WIKI_DIR } from '../fs/layout.js';
 import { TreeWatcher, watchTree } from '../fs/watch.js';
 import { startDreamScheduler } from '../dream/dream.js';
 import { startFollowUp } from '../labeling/followup.js';
-import { LocalLabelingWorkers } from '../labeling/local.js';
+import { judgesHere, LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
 import { LabelingScheduler } from '../labeling/scheduler.js';
 import { WorkBroker } from '../work/broker.js';
+import { offeredRemotely } from '../work/config.js';
+import { JudgeSource } from '../work/judge.js';
 import { SummarySource } from '../work/summarize.js';
 import { LinkedFolders, syncedByFolders } from '../ingest/folders.js';
 import { sync } from '../ingest/sync.js';
@@ -334,19 +336,29 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   }, interval);
   syncTimer.unref?.();
 
-  // extraction and summary pages as leased work (src/labeling, src/work): this
-  // machine's slots and remote workers take segments and summaries as they
-  // free up, nothing waits for the slowest call; the duplicate audit of what
-  // was written and the views that depend on it follow on their own loop
-  // (docs/design/09, 10, 11). This machine's slots and the reviews spend model
-  // calls, so none of them starts on its own: someone starts the processing
-  // (the app, POST /api/labeling/start) and it runs until stopped or shut down.
+  // extraction, summary pages and judge calls as leased work (src/labeling,
+  // src/work): this machine's slots and remote workers take segments,
+  // summaries and a review's judge calls as they free up, nothing waits for
+  // the slowest call; the duplicate audit of what was written and the views
+  // that depend on it follow on their own loop (docs/design/09, 10, 11). This
+  // machine's slots and the reviews spend model calls, so none of them starts
+  // on its own: someone starts the processing (the app, POST
+  // /api/labeling/start) and it runs until stopped or shut down.
   const leaseMs = Math.max(1, ctx.config.server.remote?.leaseMinutes ?? 15) * 60_000;
   let summaries: SummarySource | null = null;
+  const remoteJudge = { askedLately: () => false };
   const labeling = new LabelingScheduler({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, log, onWritten: (p) => summaries?.prefer(p) }, { leaseMs });
-  const followUp = startFollowUp(ctx, labeling, { log, track, active: false });
+  // a review's judge calls: this machine's judge slots answer them, and remote
+  // workers too where the workspace offers them and one asked lately
+  const judges = new JudgeSource({
+    enabled: () => judgesHere(ctx.config) || (offeredRemotely(ctx.config, 'judge') && remoteJudge.askedLately()),
+    deadlineMs: () => Math.max(1, ctx.config.server.remote?.callDeadlineMinutes ?? 20) * 60_000,
+    log,
+  }, { leaseMs });
+  const followUp = startFollowUp(ctx, labeling, { log, track, active: false, judge: judges, onPause: () => judges.cancelWaiting('processing stopped') });
   summaries = new SummarySource(ctx, { serialize: followUp.serialize, log }, { leaseMs });
-  const work = new WorkBroker([labeling, summaries], { shares: () => ctx.config.server.remote?.shares });
+  const work = new WorkBroker([labeling, summaries, judges], { shares: () => ctx.config.server.remote?.shares });
+  remoteJudge.askedLately = () => work.askedLately('judge', 2 * 60_000);
   const localWorkers = new LocalLabelingWorkers(work, () => ctx.config, { log });
   const processing = new LabelingProcessing(localWorkers, followUp, log);
   log('processing is stopped until an administrator starts it (the Processing button in the app or the web UI, or POST /api/labeling/start)');

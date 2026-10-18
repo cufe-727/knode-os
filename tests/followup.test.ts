@@ -9,18 +9,22 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
  */
 
 const timing = { reviewMs: 0 };
-const calls = { reviews: 0 };
+const calls: { reviews: number; judges: unknown[] } = { reviews: 0, judges: [] };
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 vi.mock('../src/graph/dedupe.js', () => ({
-  auditDuplicateEntities: async () => {
+  auditDuplicateEntities: async (ctx: { judge?: unknown }) => {
     calls.reviews++;
+    calls.judges.push(ctx.judge);
     await sleep(timing.reviewMs);
-    return { suggested: 0, autoMerged: 0, llmRejected: 0 };
+    return { suggested: 0, autoMerged: 0, llmRejected: 0, leftToPerson: 0 };
   },
 }));
 vi.mock('../src/graph/claim-dedupe.js', () => ({
-  auditDuplicateClaims: async () => ({ merged: 0, suggested: 0, conflicts: 0 }),
+  auditDuplicateClaims: async (ctx: { judge?: unknown }) => {
+    calls.judges.push(ctx.judge);
+    return { merged: 0, suggested: 0, conflicts: 0, leftToPerson: 0 };
+  },
 }));
 vi.mock('../src/wiki/pages.js', () => ({
   reconcileViews: async () => ({ regenerated: 0, archived: 0 }),
@@ -33,7 +37,7 @@ const { defaultConfig, defaultRoutedLlmConfig } = await import('../src/config.js
 
 /** A scheduler that always has a finished batch to review, so every review is a slow one. */
 const busyScheduler = () => ({
-  takeFinished: () => ({ written: 1, failed: 0, documents: ['raw/docs/a.md'], entityIds: ['e1'], claimIds: [] }),
+  takeFinished: () => ({ written: 1, failed: 0, documents: ['raw/docs/a.md'], entityIds: ['e1'], claimIds: ['c1'] }),
 });
 
 const ctx = { config: { extraction: { intervalMinutes: 5, concurrency: 1 } } } as never;
@@ -42,6 +46,7 @@ const stops: (() => void)[] = [];
 afterEach(() => {
   for (const stop of stops.splice(0)) stop();
   calls.reviews = 0;
+  calls.judges = [];
 });
 
 describe('the follow-up loop', () => {
@@ -90,6 +95,23 @@ describe('the follow-up loop', () => {
     await followUp.serialize(page);
     expect(pages).toBe(1);
   });
+
+  it('hands both audits\' judge calls to the judge it was given, and gives up the waiting ones on a pause', async () => {
+    timing.reviewMs = 5;
+    const judge = { enabled: true, run: async () => [] };
+    let pauses = 0;
+    const followUp = startFollowUp(ctx, busyScheduler() as never, { reviewIntervalMs: 20, judge, onPause: () => pauses++ });
+    stops.push(followUp.stop);
+    await sleep(100);
+    expect(calls.judges.length).toBeGreaterThanOrEqual(2);
+    expect(calls.judges.every((j) => j === judge)).toBe(true);
+    followUp.setActive(false);
+    followUp.setActive(false);
+    // a pause is felt once; switching on again is no pause
+    expect(pauses).toBe(1);
+    followUp.setActive(true);
+    expect(pauses).toBe(1);
+  });
 });
 
 describe('processing', () => {
@@ -103,11 +125,11 @@ describe('processing', () => {
         protocol: 'chat' as const, model: 'fake-model', cliPath: '', effort: 'default' as const, cliTimeoutMs: 5_000,
       }],
       llmUse: 'connection-1',
-      extraction: { ...base.extraction, entityLlm: route, summaryLlm: route, workers: [{ use: 'connection-1', slots: 2 }] },
+      extraction: { ...base.extraction, entityLlm: route, summaryLlm: route, judgeLlm: route, workers: [{ use: 'connection-1', slots: 2 }] },
     };
   };
 
-  it('starts this machine\'s slots — extraction and summaries — and the reviews together, as often as it is started and stopped', async () => {
+  it('starts this machine\'s slots — extraction, summaries and judge calls — and the reviews together, as often as it is started and stopped', async () => {
     const asked: string[] = [];
     const work = {
       lease: async (_who: unknown, kinds: readonly string[]) => {
@@ -130,8 +152,9 @@ describe('processing', () => {
     expect(processing.start('admin')).toBe(false);
     expect(followUp.active).toBe(true);
     await sleep(100);
-    // each slot asks only for its own kind: segments on the Extract route, summaries on the Summarize route
-    expect(new Set(asked)).toEqual(new Set(['extract', 'summarize']));
+    // each slot asks only for its own kind: segments on the Extract route, summaries on the
+    // Summarize route, judge calls on the Judge route
+    expect(new Set(asked)).toEqual(new Set(['extract', 'summarize', 'judge']));
     expect(processing.state()).toMatchObject({ running: true, by: 'admin' });
 
     expect(processing.stop('admin')).toBe(true);
@@ -145,6 +168,6 @@ describe('processing', () => {
     processing.start('admin');
     await sleep(100);
     expect(asked.length).toBeGreaterThan(stopped);
-    expect(workers.status().map((b) => [b.id, b.slots])).toEqual([['connection-1', 2], ['summarize', 1]]);
+    expect(workers.status().map((b) => [b.id, b.slots])).toEqual([['connection-1', 2], ['summarize', 1], ['judge', 2]]);
   });
 });

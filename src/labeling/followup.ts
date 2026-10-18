@@ -2,6 +2,7 @@ import { AppContext } from '../context.js';
 import { auditDuplicateClaims } from '../graph/claim-dedupe.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { reconcileViews } from '../wiki/pages.js';
+import { JudgeRunner } from '../work/judge.js';
 import { LabelingScheduler } from './scheduler.js';
 
 /**
@@ -10,7 +11,9 @@ import { LabelingScheduler } from './scheduler.js';
  * `extraction.intervalMinutes`, the duplicate-entity and duplicate-claim
  * audits over what was written since the last round, then the views that
  * depend on it — the Resolve and Merge-claims steps of the old pass
- * (docs/design/09, 10).
+ * (docs/design/09, 10). A review offers all its judge calls at once (`judge`,
+ * src/work/judge.ts), so `serve`'s judge slots and remote workers answer them
+ * side by side instead of one after another.
  *
  * Summary pages are leased work of their own (src/work/summarize.ts): `serve`'s
  * summary slots and remote workers write them as they come, and their pages
@@ -34,6 +37,14 @@ export interface FollowUpOptions {
   active?: boolean;
   /** Between the end of one review and the start of the next (default `extraction.intervalMinutes`). */
   reviewIntervalMs?: number;
+  /**
+   * Where a review's judge calls go: the judge source, so `serve`'s judge
+   * slots and remote workers answer them side by side (src/work/judge.ts).
+   * Absent, the Judge route one call at a time.
+   */
+  judge?: JudgeRunner;
+  /** Called when the reviews are paused — the judge source gives up the calls nobody has taken. */
+  onPause?: () => void;
 }
 
 export interface FollowUp {
@@ -65,11 +76,11 @@ export function startFollowUp(ctx: AppContext, scheduler: LabelingScheduler, opt
     const batch = scheduler.takeFinished();
     if (batch.written === 0 && batch.failed === 0) return;
     const parts = [`${batch.written} written${batch.failed ? `, ${batch.failed} given up` : ''}`];
-    const reviewCtx = { store: ctx.store, embedder: ctx.embedder, config: ctx.config, llm: ctx.llm };
+    const reviewCtx = { store: ctx.store, embedder: ctx.embedder, config: ctx.config, llm: ctx.llm, judge: opts.judge };
     if (batch.entityIds.length) {
       try {
         const r = await auditDuplicateEntities(reviewCtx, { focus: [...new Set(batch.entityIds)], onProgress: log });
-        if (r.suggested || r.autoMerged || r.llmRejected) parts.push(`resolve: ${r.suggested} merge suggestions${r.autoMerged ? `, ${r.autoMerged} merged` : ''}${r.llmRejected ? `, ${r.llmRejected} rejected` : ''}`);
+        if (r.suggested || r.autoMerged || r.llmRejected) parts.push(`resolve: ${r.suggested} merge suggestions${r.autoMerged ? `, ${r.autoMerged} merged` : ''}${r.llmRejected ? `, ${r.llmRejected} rejected` : ''}${r.leftToPerson ? `, ${r.leftToPerson} remote verdicts left to a person` : ''}`);
       } catch (err) {
         log(`resolve failed: ${err instanceof Error ? err.message : err}`);
       }
@@ -77,7 +88,7 @@ export function startFollowUp(ctx: AppContext, scheduler: LabelingScheduler, opt
     if (batch.claimIds.length) {
       try {
         const r = await auditDuplicateClaims(reviewCtx, { focus: [...new Set(batch.claimIds)], onProgress: log });
-        if (r.merged || r.suggested || r.conflicts) parts.push(`claims: ${r.merged} merged, ${r.suggested} suggestions, ${r.conflicts} contradictions`);
+        if (r.merged || r.suggested || r.conflicts) parts.push(`claims: ${r.merged} merged, ${r.suggested} suggestions, ${r.conflicts} contradictions${r.leftToPerson ? ` (${r.leftToPerson} remote verdicts left to a person)` : ''}`);
       } catch (err) {
         log(`claim merge failed: ${err instanceof Error ? err.message : err}`);
       }
@@ -113,7 +124,9 @@ export function startFollowUp(ctx: AppContext, scheduler: LabelingScheduler, opt
       if (reviewTimer) clearTimeout(reviewTimer);
     },
     setActive: (on: boolean) => {
+      const pausing = active && !on;
       active = on;
+      if (pausing) opts.onPause?.();
     },
     get active() {
       return active;

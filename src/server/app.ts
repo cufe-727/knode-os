@@ -2196,7 +2196,7 @@ export function createApp(
     }
   });
 
-  // the labeling scheduler, the summary source and this machine's worker slots, for the UI;
+  // the labeling scheduler, the summary and judge sources and this machine's worker slots, for the UI;
   // `scheduler.workers` lists every worker the broker saw, whatever it took
   app.get('/api/labeling/status', async (c) => {
     const ctx = requestCtx(c);
@@ -2208,6 +2208,7 @@ export function createApp(
       processing: services.processing?.state() ?? null,
       scheduler: work ? { ...scheduler, workers: work.workers } : scheduler,
       summaries: work?.kinds.summarize ?? null,
+      judge: work?.kinds.judge ?? null,
       shares: work?.shares ?? null,
       local: services.localWorkers?.status() ?? [],
     });

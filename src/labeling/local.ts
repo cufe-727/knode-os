@@ -10,7 +10,8 @@ import { TaskOutcome, WorkerIdentity } from './scheduler.js';
  * `serve`'s own worker slots: slots per backend that take work from the work
  * broker (src/work/broker.ts) and run it on this machine — extraction on a
  * Codex agent and a Cursor agent side by side, say (`extraction.workers`),
- * and summary pages on the Summarize stage's route (`summaryConcurrency`).
+ * summary pages on the Summarize stage's route (`summaryConcurrency`) and a
+ * review's judge calls on the Judge stage's route (`review.concurrency`).
  * Each backend keeps its own health: a rate limit pauses it, a run of bad
  * answers rests it, a missing CLI or expired login parks it for half an hour
  * and then tries again (src/labeling/failures.ts). Settings saves are picked
@@ -82,6 +83,24 @@ export function localSummarySpec(config: KnodeConfig): LocalWorkerSpec | null {
   if (!(slots > 0)) return null;
   const llm = resolveRoutedLlmConfig(config.llm, config.extraction.summaryLlm, routeTargets(config));
   return { id: 'summarize', kinds: ['summarize'], slots: Math.min(16, slots), llm };
+}
+
+/**
+ * The judge slots `serve` runs: the Judge stage's route with
+ * `review.concurrency` slots (default 2), taking the calls a review waits on
+ * (src/work/judge.ts). 0 turns them off — then only remote workers judge.
+ */
+export function localJudgeSpec(config: KnodeConfig): LocalWorkerSpec | null {
+  const slots = Math.floor(Number(config.review?.concurrency ?? 2));
+  if (!(slots > 0)) return null;
+  const llm = resolveRoutedLlmConfig(config.llm, config.extraction.judgeLlm, routeTargets(config));
+  return { id: 'judge', kinds: ['judge'], slots: Math.min(16, slots), llm };
+}
+
+/** Whether this machine can answer judge calls itself: judge slots on a Judge route with a model. */
+export function judgesHere(config: KnodeConfig): boolean {
+  const spec = localJudgeSpec(config);
+  return spec !== null && new LlmClient(spec.llm).enabled;
 }
 
 export interface LocalBackendStatus {
@@ -180,8 +199,8 @@ export class LocalLabelingWorkers {
   reconfigure(): void {
     if (this.stopped) return;
     const config = this.config();
-    const summary = localSummarySpec(config);
-    const specs = [...localWorkerSpecs(config, this.log), ...(summary ? [summary] : [])]
+    const stages = [localSummarySpec(config), localJudgeSpec(config)].filter((s): s is LocalWorkerSpec => s !== null);
+    const specs = [...localWorkerSpecs(config, this.log), ...stages]
       .map((s) => ({ ...s, client: new LlmClient(s.llm) }))
       .filter((s) => s.client.enabled);
     const signature = JSON.stringify(specs.map((s) => [s.id, s.kinds, s.slots, s.llm.provider, s.llm.model, s.llm.effort, s.llm.speed, s.llm.cliTimeoutMs, s.llm.baseUrl]));
@@ -255,7 +274,7 @@ export class LocalLabelingWorkers {
     const renew = setInterval(() => this.work.renew([task.id], who), Math.max(5_000, Math.floor((Number.isFinite(leaseMs) ? leaseMs : 60_000) / 3)));
     renew.unref?.();
     try {
-      this.log(`${task.kind === 'extract' ? 'tier1 extract' : 'summarize'} ${task.label} · ${backend.id}`);
+      this.log(`${task.kind === 'extract' ? 'tier1 extract' : task.kind === 'summarize' ? 'summarize' : 'judge'} ${task.label} · ${backend.id}`);
       const text = await backend.client.complete(task.messages, { json: task.json, maxTokens: task.maxTokens });
       return { ok: true, text, model: backend.client.label };
     } catch (err) {

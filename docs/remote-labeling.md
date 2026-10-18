@@ -1,10 +1,11 @@
 # Remote workers and the remote API
 
-`knode-os serve` runs tier-1 extraction ("labeling") and summary pages as **leased work**
-([design 11](design/11-remote-processing.md)). Per workspace, a scheduler (`src/labeling/scheduler.ts`) takes
-documents off the extraction queue, cuts them into segments and hands segments out one at a time, and a summary
-source (`src/work/summarize.ts`) hands out the documents due a summary page. A work broker (`src/work/broker.ts`)
-puts both behind one lease protocol. Whoever holds a lease runs the call on its own model and hands back the
+`knode-os serve` runs tier-1 extraction ("labeling"), summary pages and the duplicate reviews' judge calls as
+**leased work** ([design 11](design/11-remote-processing.md)). Per workspace, a scheduler
+(`src/labeling/scheduler.ts`) takes documents off the extraction queue, cuts them into segments and hands segments
+out one at a time; a summary source (`src/work/summarize.ts`) hands out the documents due a summary page; and a
+judge source (`src/work/judge.ts`) hands out the calls a review is waiting on. A work broker (`src/work/broker.ts`)
+puts all three behind one lease protocol. Whoever holds a lease runs the call on its own model and hands back the
 raw reply. That can be one of `serve`'s own worker slots or a worker on another machine. The server checks every
 reply and keeps it in the document's sidecar. It writes a document to the graph once its last segment is in,
 and a summary page as soon as its summary is in.
@@ -49,7 +50,13 @@ extracted most lately first. The reply goes to the summary cache in the document
 from that cache, in turn with the reviews below and without a model call of the server's own. A page that could
 not be written is written from the cache later, so nothing a worker sent is lost to a restart.
 
-The duplicate-entity and duplicate-claim audits run over what was written every `extraction.intervalMinutes`.
+The duplicate-entity and duplicate-claim audits run over what was written every `extraction.intervalMinutes`. Each
+builds all its judge calls first and offers them at once, so `serve`'s judge slots (and remote workers, where offered)
+answer them side by side. A call waits at most `server.remote.callDeadlineMinutes` (default 20); one nobody answered
+fails, and its pair simply goes unjudged this round. A reply that is no JSON object goes out again, up to three times.
+Every verdict records the model that gave it. A remote verdict merges or rejects nothing by itself unless
+`server.remote.judgeModels` names its model: it is filed as a suggestion with the verdict attached, for a person to
+decide. The nightly pass and `knode-os extract` call the Judge route themselves.
 
 ## Local worker slots
 
@@ -69,7 +76,8 @@ own route, `summaryConcurrency` at a time:
 
 Without `workers`, the Extract stage's own route runs with `extraction.concurrency` slots. Workers listed with
 `"slots": 0` turn this machine's extraction slots off, and `"summaryConcurrency": 0` its summary slots: it then
-only hands that work to remote workers. Saving settings
+only hands that work to remote workers. Judge calls run on the Judge stage's route, `review.concurrency` at a time
+(default 2); 0 leaves them to remote workers. Saving settings
 (`PUT /api/config`) takes effect within a minute. No restart is needed. Codex runs as
 `codex exec --ignore-user-config --ephemeral` for every pipeline call, so your `~/.codex/config.toml` (MCP
 servers, memory, default model) stays out of extraction prompts. It also keeps tens of thousands of
@@ -82,7 +90,8 @@ leases, every worker seen and the local slots' health.
 them on its own, not at startup and not after a restart. An administrator
 starts them from the app (the *Processing* button in the toolbar), from the web UI (the button in the header) or with
 `POST /api/labeling/start`. They then run until stopped (`POST /api/labeling/stop`) or until the service stops.
-Stopping lets calls in flight finish. Importing, watching and embedding go on either way. Remote workers can still
+Stopping lets calls in flight finish; a review gives up the judge calls nobody has taken yet and goes on with the
+verdicts it has. Importing, watching and embedding go on either way. Remote workers can still
 lease segments and summaries while processing is stopped, because they are started by hand on their own machines.
 The summary pages they write are written either way; what they extract is reviewed once processing is started.
 
@@ -91,7 +100,10 @@ The summary pages they write are written either way; what they extract is review
 | setting | default | meaning |
 |---|---|---|
 | `server.remote.offer.summarize` | `true` | remote workers may take summaries here (extraction is always offered) |
-| `server.remote.shares` | `{ "extract": 3, "summarize": 1 }` | a slot that takes both kinds gets them by these weights |
+| `server.remote.offer.judge` | `false` | remote workers may take the judge calls a review is waiting on |
+| `server.remote.shares` | `{ "extract": 3, "summarize": 1 }` | a slot that takes both kinds gets them by these weights; judge calls go before either |
+| `server.remote.judgeModels` | `[]` | remote models whose verdicts may merge or reject without a person: `"codex:gpt-6.1-sol"`, or a prefix like `"codex:*"` |
+| `server.remote.callDeadlineMinutes` | `20` | longest a review waits for one judge call |
 
 The share keeps summaries moving while an import's extraction backlog is out, and extraction moving while summaries
 pile up. A kind that had nothing to give banks no credit for it: when it has work again, it takes its share from
@@ -109,7 +121,7 @@ knode-os remote token revoke macbook
 
 | scope | allows |
 |---|---|
-| `label` | lease extraction segments and summaries and hand back replies; `--kinds` narrows it to some of them |
+| `label` | lease extraction segments, summaries and judge calls and hand back replies; `--kinds` narrows it to some of them |
 | `read` | list/read documents under raw/docs, raw/skills, wiki and playbook content; search; graph; claims |
 | `write` | write or delete documents under raw/docs, wiki and playbooks/packs (never a linked folder's mirror); trigger a sync |
 | `sql` | read-only SQL over the `v_*` catalog views |
@@ -166,7 +178,8 @@ node knode-worker.mjs … --check     # what the token may do, what the server o
 At start, and whenever a lease answer says it changed, the worker reads `GET …/work/config`: the kinds this token
 may take here, how long a lease lasts, the shares, and **hints** — how the server itself runs each kind on codex,
 claude and cursor (the model, and the effort and speed in that CLI's terms), taken from `extraction.workers` and the
-Extract stage's route for extraction and from the Summarize stage's route for summaries. A CLI backend follows the
+Extract stage's route for extraction, from the Summarize stage's route for summaries, and from the Judge stage's
+route for judge calls. A CLI backend follows the
 hints unless it was given a model of its own (`--codex-model`, `--claude-model`, `--cursor-model`; `--codex-effort`,
 `--codex-speed` and `--claude-effort` override single fields). An `api` backend ignores them: model names differ
 between endpoints. Without `--kinds`, the worker takes every kind the server offers it. Against a server from
@@ -189,12 +202,12 @@ Workspace routes are `/w/<owner>/<workspace>/…`, where `<owner>` is a username
 | `GET /health` | — | `{ ok }` |
 | `GET /whoami` | any | the token's name, scopes, workspaces, kinds |
 | `GET /worker.mjs` | any | the worker script |
-| `GET …/work/config` | label | `{ version, leaseSeconds: { llm }, kinds: { extract, summarize }, shares, hints: { <kind>: { codex?, claude?, cursor? } } }` |
+| `GET …/work/config` | label | `{ version, leaseSeconds: { llm }, kinds: { extract, summarize, judge }, shares, hints: { <kind>: { codex?, claude?, cursor? } } }` |
 | `POST …/work/lease` | label | `{ worker, backend, kinds?, max }` → `{ configVersion, leaseSeconds, tasks: [{ id, kind, label, messages, prompt, json, maxTokens, leaseExpiresAt, document? }] }` |
 | `POST …/work/complete` | label | `{ worker, backend, id, ok, text \| error, kind?, model? }` → `{ accepted, documentWritten? }` (409 when the lease moved on) |
 | `POST …/work/renew` | label | `{ worker, backend, ids }` → `{ renewed, lost }` |
 | `POST …/work/release` | label | `{ worker, backend, ids }` → `{ released }` |
-| `GET …/work/status` | label / read | per kind (queue or due, leases, totals), shares, workers |
+| `GET …/work/status` | label / read | per kind (queue, due or waiting; leases; totals), shares, workers |
 | `POST …/labeling/lease` | label (extract) | the same as `work/lease` with `kinds: ["extract"]`, answered `{ leaseSeconds, tasks }` |
 | `POST …/labeling/complete`, `…/renew`, `…/release` | label | the same as `work/*` |
 | `GET …/labeling/status` | label / read | extraction's queue, leases, workers, totals |

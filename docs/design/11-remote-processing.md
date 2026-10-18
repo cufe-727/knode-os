@@ -1,7 +1,8 @@
 # 11 — Remote processing: embeddings, summaries and reviews on remote workers
 
-> Status: **phase 1 implemented** (2026‑10‑17): the work broker, summaries as leased work, `work/*` with
-> `work/config`, worker kinds and hints (§9). Phases 2–4 are proposed. Extends [remote labeling](../remote-labeling.md),
+> Status: **phases 1 and 2 implemented** (2026‑10‑18): the work broker, summaries as leased work, `work/*` with
+> `work/config`, worker kinds and hints, and the Judge stage's review calls fanned out to `serve`'s judge slots and
+> remote workers (§9). Phases 3–4 are proposed. Extends [remote labeling](../remote-labeling.md),
 > which leased only tier-1 extraction, to the Index stage's vectors, the Summarize stage and the Judge stage's review
 > calls. Workers read the embedding configuration, and hints for the LLM stages, from the server instead of being
 > configured by hand.
@@ -120,9 +121,9 @@ behind the Processing button as now.
 
 ### 3.2 judge
 
-Today the entity judge and the claim judge call the Judge route one at a time inside the follow-up review. Each will
-build all its prompts first, then hand them to `runCalls('judge', calls)`. That offers the calls together and waits
-for all of them:
+Before phase 2 the entity judge and the claim judge called the Judge route one at a time inside the follow-up review.
+Each now builds all its prompts first, then hands them to a `JudgeRunner` (`src/work/judge.ts`). In `serve` that is
+the judge source, which offers the calls together as leased work and waits for all of them:
 
 - Each call has a deadline (`server.remote.callDeadlineMinutes`, default 20). A call that misses it fails as transient.
   The review handles it as it handles a failed call now: no verdict, and the pair comes up again in a later round.
@@ -131,11 +132,19 @@ for all of them:
 - Each verdict records the model that gave it (`remote:codex:…`), as extraction does.
 - A remote verdict merges without a person (`review.llmJudge` or `review.claimMerge` set to `auto`) only when its model
   is in `server.remote.judgeModels`, which is empty by default. Otherwise it is filed as a suggestion with the verdict
-  attached.
+  attached. The same holds for the entity judge's automatic rejection: a remote "different" verdict outside the list
+  leaves the suggestion open instead of closing it. Verdicts that change nothing (a claim pair judged unrelated) are
+  remembered as any verdict is.
 - Remote workers get `judge` calls only when `server.remote.offer.judge` is on.
+- A reply that is no JSON object is a bad answer: the call goes out again, up to three times. Stopping processing gives
+  up the calls nobody has taken yet; the review goes on with the verdicts it has.
+- The judge counts as available when this machine has judge slots on a Judge route with a model, or when remote
+  judging is offered and a worker asked for judge calls in the last two minutes. Otherwise a review files its
+  candidates unjudged, as it does with no Judge model, instead of waiting out the deadline.
 
 The nightly tier-2 pass (`refineWiki`: the claim review and the nightly duplicate-entity audit) runs whether or not
-processing is started, so it can't count on serve's slots. It keeps calling the Judge route itself (§10).
+processing is started, so it can't count on serve's slots. It keeps calling the Judge route itself, one call at a time
+(§10), as do `knode-os extract` and an initialization.
 
 ### 3.3 embed
 
@@ -371,10 +380,12 @@ behind the switch.
    unchanged worker still extracts, and the share rule is covered by `labeling.test.ts` and `followup.test.ts`. The
    end-to-end worker test in `remote-api.test.ts`, which runs the real worker against a fake model endpoint, grows
    a summary case.
-2. **Judge calls.** `runCalls` in the entity and claim judges; serve's judge slots; remote judging off by default, with
-   `judgeModels` deciding whether a remote verdict may merge.
+2. **Judge calls** — *implemented* (`src/work/judge.ts`). The entity and claim judges hand all their calls to a
+   `JudgeRunner` at once; serve's judge slots (`review.concurrency`); remote judging off by default
+   (`server.remote.offer.judge`), with `judgeModels` deciding whether a remote verdict may merge or reject on its own.
    *Done when* a review runs its calls in parallel with no remote worker, and a remote verdict from a model outside
-   `judgeModels` is filed as a suggestion instead of merging.
+   `judgeModels` is filed as a suggestion instead of merging. `tests/judge.test.ts` covers both against a model
+   endpoint that counts the calls it has in flight, and `remote-api.test.ts` has the real worker answer a judge call.
 3. **Embedding.** `PooledEmbeddingProvider` split into reserve, call, check and settle; the embed source with audit
    requests and the chunk backlog; `deferred` mode; the identity filter in vector queries; serve's embed slots; lent
    keys with the two scopes and the per-key switch; the worker's `embed` backend.

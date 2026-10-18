@@ -16,6 +16,7 @@ import { createApp } from '../src/server/app.js';
 import { hostnameOf, isPublicRequest } from '../src/server/public-guard.js';
 import { resolveWorkspaceScope, WorkspaceContextRegistry } from '../src/server/workspaces.js';
 import { WorkBroker } from '../src/work/broker.js';
+import { JudgeSource } from '../src/work/judge.js';
 import { SummarySource } from '../src/work/summarize.js';
 import { startFakeOpenAi, type ChatRequest, type FakeOpenAi } from './helpers/fake-openai.js';
 
@@ -78,6 +79,7 @@ describe('the remote API', () => {
   let app: ReturnType<typeof createApp>;
   const schedulers = new Map<string, LabelingScheduler>();
   const brokers = new Map<string, WorkBroker>();
+  const judgeSources = new Map<string, JudgeSource>();
   const tok: Record<string, string> = {};
 
   /** A request as a client on this machine (or through an SSH tunnel) sends it, or as it arrives through the Cloudflare Tunnel. */
@@ -110,17 +112,20 @@ describe('the remote API', () => {
     rootCtx = await createContext(root);
     registry = new WorkspaceContextRegistry(root, {
       templateConfig: rootCtx.config,
-      // what `serve` wires per workspace: the scheduler and the summary source behind one broker
+      // what `serve` wires per workspace: the scheduler, the summary source and the judge source behind one broker
       onCreate: (ctx) => {
         let summaries: SummarySource | null = null;
         const scheduler = new LabelingScheduler({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, onWritten: (p) => summaries?.prefer(p) }, { priorityRefreshMs: 0 });
         summaries = new SummarySource(ctx, {}, { idleScanMs: 0 });
-        const broker = new WorkBroker([scheduler, summaries], { shares: () => ctx.config.server.remote?.shares });
+        const judges = new JudgeSource({ enabled: () => true }, { modelRetryMs: 0, transientRetryMs: 0 });
+        const broker = new WorkBroker([scheduler, summaries, judges], { shares: () => ctx.config.server.remote?.shares });
         schedulers.set(ctx.dataDir, scheduler);
         brokers.set(ctx.dataDir, broker);
+        judgeSources.set(ctx.dataDir, judges);
         return async () => {
           schedulers.delete(ctx.dataDir);
           brokers.delete(ctx.dataDir);
+          judgeSources.delete(ctx.dataDir);
           await broker.stop();
         };
       },
@@ -265,11 +270,12 @@ describe('the remote API', () => {
 
     it('tells a worker what it may take here, narrowed by its token and by the workspace', async () => {
       const config = await (await req(`${ws}/work/config`, { token: tok.labeler })).json() as Config;
-      expect(config).toMatchObject({ kinds: { extract: true, summarize: true }, shares: { extract: 3, summarize: 1 }, leaseSeconds: { llm: 900 } });
+      // judge calls stay on this machine unless the workspace offers them
+      expect(config).toMatchObject({ kinds: { extract: true, summarize: true, judge: false }, shares: { extract: 3, summarize: 1 }, leaseSeconds: { llm: 900 } });
       expect(config.version).toMatch(/^[0-9a-f]{16}$/);
       // the workspace's models are endpoints, so there is no CLI to hint at
-      expect(config.hints).toEqual({ extract: {}, summarize: {} });
-      expect(((await (await req(`${ws}/work/config`, { token: tok.extractor })).json()) as Config).kinds).toEqual({ extract: true, summarize: false });
+      expect(config.hints).toEqual({ extract: {}, summarize: {}, judge: {} });
+      expect(((await (await req(`${ws}/work/config`, { token: tok.extractor })).json()) as Config).kinds).toEqual({ extract: true, summarize: false, judge: false });
       expect((await req(`${ws}/work/config`, { token: tok.reader })).status).toBe(403);
 
       // the workspace stops offering summaries: the config says so under a new version, and none is leased
@@ -427,6 +433,45 @@ describe('the remote API', () => {
       const summaryCalls = fake.calls.filter((call) => textOf(call.messages?.[0]?.content).includes('Summarize the document'));
       expect(summaryCalls.length).toBe(2);
       for (const call of summaryCalls) expect(call).not.toHaveProperty('response_format');
+    });
+
+    it('answers the judge calls a review waits on, where the workspace offers them', async () => {
+      const judges = judgeSources.get(fin.dataDir)!;
+      const remote = fin.config.server.remote!;
+      fin.config.server.remote = { ...remote, offer: { ...remote.offer, judge: true } };
+      const server = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' });
+      await new Promise<void>((resolve) => server.once('listening', () => resolve()));
+      try {
+        const answers = judges.run([{
+          label: '宁德时代 / 宁德时代新能源',
+          messages: [
+            { role: 'system', content: 'You decide whether two entities in a knowledge graph denote the same real-world thing.' },
+            { role: 'user', content: 'Entity A: 宁德时代 (organization)\n\nEntity B: 宁德时代新能源 (organization)' },
+          ],
+          maxTokens: 300,
+        }]);
+        const port = (server.address() as AddressInfo).port;
+        const worker = spawn(process.execPath, [
+          path.resolve('worker/knode-worker.mjs'),
+          '--server', `http://127.0.0.1:${port}`, '--workspace', 'admin/finance', '--name', 'judge-box',
+          '--backends', 'api:1', '--api-base-url', fake.url, '--api-model', 'fake-model', '--kinds', 'judge', '--once', '--idle-ms', '150',
+        ], { env: { ...process.env, KNODE_TOKEN: tok.labeler, OPENAI_API_KEY: 'sk-test' }, stdio: ['ignore', 'pipe', 'pipe'] });
+        let output = '';
+        worker.stdout.on('data', (d) => (output += d));
+        worker.stderr.on('data', (d) => (output += d));
+        const code = await new Promise<number | null>((resolve) => worker.on('close', resolve));
+        expect(code, output).toBe(0);
+        expect(output).toContain('this worker takes judge');
+        expect(output).toContain('judge call on 宁德时代 / 宁德时代新能源 done');
+        const [answer] = await answers;
+        expect(answer).toMatchObject({ ok: true, model: 'remote:api:fake-model' });
+        // a judge call wants a JSON object: the worker asked its endpoint for JSON mode
+        const judgeCall = fake.calls.filter((c) => textOf(c.messages?.[0]?.content).includes('denote the same real-world thing')).at(-1);
+        expect(judgeCall).toHaveProperty('response_format');
+      } finally {
+        fin.config.server.remote = remote;
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     });
 
     it('falls back to extraction over labeling/* on a server from before work/*', async () => {

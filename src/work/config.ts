@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { KnodeConfig, LlmConfig, LlmProvider, resolveRoutedLlmConfig, routeTargets } from '../config.js';
 import { cursorModel, effortFor, speedFor } from '../llm/cli.js';
-import { WORK_KINDS, WorkKind } from './kinds.js';
+import { SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
 
 /**
  * What a remote worker reads from the server instead of being told by hand
@@ -14,9 +14,9 @@ import { WORK_KINDS, WorkKind } from './kinds.js';
  * cursor's effort inside the model name). Extraction's come from
  * `extraction.workers` (with their overrides, listed with 0 slots or not),
  * then the Extract stage's route; summaries' from the Summarize stage's
- * route. A worker applies one to a backend of the same CLI unless it was
- * given a model of its own. Endpoints (`api` backends) get none: model names
- * differ between them.
+ * route; judge calls' from the Judge stage's. A worker applies one to a
+ * backend of the same CLI unless it was given a model of its own. Endpoints
+ * (`api` backends) get none: model names differ between them.
  */
 
 export type CliFamily = 'codex' | 'claude' | 'cursor';
@@ -35,15 +35,16 @@ export interface WorkerConfig {
   leaseSeconds: { llm: number };
   /** The kinds this token may take here and the workspace offers remote workers. */
   kinds: Record<WorkKind, boolean>;
-  shares: Record<WorkKind, number>;
+  shares: Record<SharedKind, number>;
   hints: WorkerHints;
 }
 
 const FAMILY: Partial<Record<LlmProvider, CliFamily>> = { 'codex-cli': 'codex', 'claude-cli': 'claude', 'cursor-cli': 'cursor' };
 
-/** Whether the workspace offers this kind of work to remote workers (extraction always). */
+/** Whether the workspace offers this kind of work to remote workers: extraction always, summaries unless turned off, judge calls only when turned on. */
 export function offeredRemotely(config: KnodeConfig, kind: WorkKind): boolean {
   if (kind === 'summarize') return config.server.remote?.offer?.summarize !== false;
+  if (kind === 'judge') return config.server.remote?.offer?.judge === true;
   return true;
 }
 
@@ -65,6 +66,7 @@ export function workerHints(config: KnodeConfig): WorkerHints {
   return {
     extract: hintsFrom(extract),
     summarize: hintsFrom([resolveRoutedLlmConfig(config.llm, config.extraction.summaryLlm, targets)]),
+    judge: hintsFrom([resolveRoutedLlmConfig(config.llm, config.extraction.judgeLlm, targets)]),
   };
 }
 
@@ -91,7 +93,7 @@ function hintsFrom(configs: LlmConfig[]): Partial<Record<CliFamily, BackendHint>
 }
 
 /** The configuration a worker holding a token that may take `allowed` reads for this workspace. */
-export function workerConfig(config: KnodeConfig, opts: { allowed: readonly WorkKind[]; leaseMs: number; shares: Record<WorkKind, number> }): WorkerConfig {
+export function workerConfig(config: KnodeConfig, opts: { allowed: readonly WorkKind[]; leaseMs: number; shares: Record<SharedKind, number> }): WorkerConfig {
   const body = {
     leaseSeconds: { llm: Math.round(opts.leaseMs / 1000) },
     kinds: Object.fromEntries(WORK_KINDS.map((k) => [k, opts.allowed.includes(k) && offeredRemotely(config, k)])) as Record<WorkKind, boolean>,

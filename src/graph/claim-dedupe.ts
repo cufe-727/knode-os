@@ -2,9 +2,10 @@ import crypto from 'node:crypto';
 import { KnodeConfig } from '../config.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { writeDeps } from '../lineage/deps.js';
-import { LlmClient } from '../llm/client.js';
+import { jsonFromReply, LlmClient } from '../llm/client.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
+import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
 import { applyClaimMerge, reanchorClaimGroups } from './claim-merge.js';
 
 /**
@@ -49,6 +50,11 @@ export interface ClaimDedupeStats {
   conflicts: number;
   embedded: number;
   reanchored: number;
+  /**
+   * Confident merges judged by a remote model outside `server.remote.judgeModels`:
+   * filed as suggestions instead of merged.
+   */
+  leftToPerson: number;
 }
 
 export type ClaimRelation = 'same' | 'contains' | 'conflict' | 'different_time' | 'unrelated';
@@ -220,12 +226,13 @@ function windowsDisjoint(a: ClaimLite, b: ClaimLite): boolean {
 /* --------------------------------- the audit -------------------------------- */
 
 export async function auditDuplicateClaims(
-  ctx: { store: Store; embedder: EmbeddingProvider; config: KnodeConfig; llm?: LlmClient },
+  /** `judge`: where the judge calls go (src/work/judge.ts); absent, the Judge route `llm`, one call at a time. */
+  ctx: { store: Store; embedder: EmbeddingProvider; config: KnodeConfig; llm?: LlmClient; judge?: JudgeRunner },
   opts: ClaimDedupeOptions = {},
 ): Promise<ClaimDedupeStats> {
   const { store, config } = ctx;
   const progress = opts.onProgress ?? (() => {});
-  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, judged: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0 };
+  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, judged: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0, leftToPerson: 0 };
   const mode = config.review?.claimMerge ?? 'auto';
   if (mode === 'off') return stats;
   const minConfidence = config.review?.claimMergeMinConfidence ?? 0.9;
@@ -352,21 +359,25 @@ export async function auditDuplicateClaims(
     toJudge.push(pair);
   }
 
-  /* the Judge stage, in batches */
-  if (toJudge.length > 0 && ctx.llm?.enabled) {
+  /* the Judge stage, in batches — every batch offered at once (src/work/judge.ts) */
+  const judge = ctx.judge ?? (ctx.llm ? directJudge(ctx.llm) : null);
+  if (toJudge.length > 0 && judge?.enabled) {
     const per = Math.max(1, opts.pairsPerCall ?? 12);
-    for (let i = 0; i < toJudge.length; i += per) {
-      const batch = toJudge.slice(i, i + per);
+    const batches: Pair[][] = [];
+    for (let i = 0; i < toJudge.length; i += per) batches.push(toJudge.slice(i, i + per));
+    const answers = await judge.run(batches.map(judgeCall));
+    answers.forEach((answer, i) => {
+      const batch = batches[i];
       try {
-        const verdicts = await judgeBatch(ctx.llm, batch);
-        for (const [k, v] of verdicts) {
+        if (!answer.ok) throw new Error(answer.error);
+        for (const [k, v] of verdictsOf(answer.text, answer.model, batch)) {
           outcomes.push({ pair: batch[k], verdict: v });
           stats.judged++;
         }
       } catch (err) {
         progress(`claims: judge failed for a batch of ${batch.length}: ${err instanceof Error ? err.message : err}`);
       }
-    }
+    });
   }
 
   /* act on the verdicts; a claim merged earlier in this run answers through its representative */
@@ -385,7 +396,11 @@ export async function auditDuplicateClaims(
       const b = current(pair.b);
       if (a.id === b.id) continue;
       const [keep, fold] = representative({ ...pair, a, b }, verdict);
-      const auto = identical || (mode === 'auto' && confidence >= minConfidence && pair.guards.length === 0);
+      // a remote model outside server.remote.judgeModels advises; a person decides
+      const confident = mode === 'auto' && confidence >= minConfidence && pair.guards.length === 0;
+      const decides = verdictMayDecide(config, verdict.model);
+      if (confident && !decides && !identical) stats.leftToPerson++;
+      const auto = identical || (confident && decides);
       if (auto) {
         try {
           await applyClaimMerge(store, {
@@ -486,12 +501,19 @@ function describeClaim(label: string, c: ClaimLite): string {
   ].filter(Boolean).join('\n');
 }
 
-async function judgeBatch(llm: LlmClient, batch: Pair[]): Promise<Map<number, Verdict>> {
+/** The Judge stage's call for one batch of pairs. */
+function judgeCall(batch: Pair[]): JudgeCall {
   const user = batch.map((p, i) => `Pair ${i + 1} — subject: ${p.a.subject_name}\n${describeClaim('A', p.a)}\n${describeClaim('B', p.b)}`).join('\n\n');
-  const raw = await llm.completeJson<{ verdicts?: { pair?: unknown; relation?: unknown; keep?: unknown; confidence?: unknown; reason?: unknown }[] }>(
-    [{ role: 'system', content: JUDGE_SYSTEM }, { role: 'user', content: user }],
-    { maxTokens: 400 + 220 * batch.length },
-  );
+  return {
+    label: `${batch.length} claim pair${batch.length === 1 ? '' : 's'} of ${batch[0].a.subject_name}`,
+    messages: [{ role: 'system', content: JUDGE_SYSTEM }, { role: 'user', content: user }],
+    maxTokens: 400 + 220 * batch.length,
+  };
+}
+
+/** The verdicts in a judge's answer to one batch, by the pair's index in it. */
+function verdictsOf(text: string, model: string, batch: Pair[]): Map<number, Verdict> {
+  const raw = jsonFromReply<{ verdicts?: { pair?: unknown; relation?: unknown; keep?: unknown; confidence?: unknown; reason?: unknown }[] }>(text);
   const out = new Map<number, Verdict>();
   const relations: ClaimRelation[] = ['same', 'contains', 'conflict', 'different_time', 'unrelated'];
   for (const v of raw.verdicts ?? []) {
@@ -503,7 +525,7 @@ async function judgeBatch(llm: LlmClient, batch: Pair[]): Promise<Map<number, Ve
       keep: v.keep === 'a' || v.keep === 'b' ? v.keep : null,
       confidence: Math.max(0, Math.min(1, Number(v.confidence) || 0)),
       reason: String(v.reason ?? '').slice(0, 400),
-      model: llm.label,
+      model,
     });
   }
   return out;
