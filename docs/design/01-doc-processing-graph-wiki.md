@@ -132,12 +132,47 @@ flowchart TD
 3. **向量 + 全文**：沿用现有 embeddings + tsvector 流程。
 4. **NLP 概念抽取（新增）**：从每个 chunk 提取名词短语/关键词（英文可用
    POS-tag 名词短语；CJK 用分词 + 停用词过滤 + TF-IDF 截断）。产出
-   `concept` 类型的轻量实体 + chunk 级 `co_occurs` 边（LazyGraphRAG 的概念共现
-   图）。这层图谱质量不高，但覆盖 100% 文档、成本为零，保证冷文档也有图信号。
+   `concept` 类型的轻量实体 + chunk 级 mention（LazyGraphRAG 的概念共现图；
+   `co_occurs` 边不落库，读取时由 `entity_mentions` 推导，见 05 §4.3）。这层图谱
+   质量不高，但覆盖 100% 文档、成本为零，保证冷文档也有图信号。
 5. **确定性 wikilink 布线**：沿用 `src/graph/extract.ts` 的 `wireFromMarkdown`。
 
 实现上，Tier 0 = 现有 `ingestAll`/增量 ingest 减去 `extractWithLlm`，加上
 NLP 概念抽取与 sidecar 写入。
+
+> **2026‑10‑18 起：Tier 0 的边界改为"链接已知，不发现新事物"；发现与定型新实体是 Tier 1 的事。**
+> 第 4 步（`src/graph/concepts.ts`）现在分三段：
+>
+> 1. **已知实体链接**：正文先与图谱里已有的有类型实体（`type <> 'concept'`，按
+>    `entity_alias_keys` 的名字/别名/并入拼写；拉丁文整词匹配，CJK 子串匹配）以及
+>    frontmatter 声明的作者（`source:`）做匹配。命中一次即够：在**已有实体**上写
+>    `tier0.link` 证据（半权重、兜底类型，不会盖过 Tier 1 给出的名字和类型）和 chunk
+>    mention，绝不新建 concept 节点；命中的文本在挖掘前被遮蔽，所以已知名字的碎片不会
+>    再变成概念。候选集按 mention_count 取前 1 万，每工作区缓存、每分钟探测一次变化。
+> 2. **剩余文本的零 LLM 挖掘**：先剥离导出器模板（`- image: 附件 (…)` 附件行、重复
+>    作者或标题的标题行、HTML 锚点）；CJK 用 `Intl.Segmenter('zh', word)` 分词，分词器
+>    不认识的连续单字（特朗普、美联储、估值）合成一个词，不再用 2–4 字滑动窗口；每个
+>    片段只被一条规则计数一次（首字母大写短语、全大写缩写、反引号标识符互不重复）；
+>    每篇上限按长度算，1 词/400 字，最少 3、最多 24，取代固定的 8。停用词三层合并：
+>    内置通用词、可编辑的 `playbooks/concepts/stoplist.yaml`（`terms` 加、`allow` 放行）、
+>    语料学习的 `playbooks/concepts/frequent.yaml`：`knode-os concepts learn` 扫描全部已索引
+>    文档的正文，按候选词统计文档频率，出现在 >2%（且不少于 10 篇；语料不足 50 篇不学）的
+>    词写入——按文本而非按图谱里的 concept 实体统计，所以与图谱当前状态无关，重导入期间
+>    照样成立；全量 sync 结束后在没有列表、语料翻倍或列表超过 7 天时自动重学。学到的高频词
+>    只约束挖掘，不约束链接表面（语料里高频的名字往往正是该语料的枢纽实体）；链接表面只
+>    受内置词和人工 `terms` 约束。
+> 3. **占位符退休**：Tier 1 的 scope 为某文档落地后（`applyTier1Scope`，含 sidecar 回放），
+>    该文档未解析到有类型实体的 `tier0.concept` 证据、涉及它们的 co_occurs 证据与 mention
+>    被关闭并折叠——无其他来源支撑的概念节点随之 tombstone；sidecar 的 `tier0.json`
+>    仍保留挖掘列表（及 `linked` 名单），历史重建照旧回放。
+>
+> 共现边仍由 Tier 0 一次写出：链接到的有类型实体与本篇的概念占位符一起进入同一组
+> `co_occurs`（0.1 权重，窗口 6）。
+>
+> 存量语料的升级：`knode-os sync --reapply [--only <prefix>]` 对内容未变的文档也重新 apply——
+> 替换文档 scope（chunk 与向量按内容寻址保留，不重新 embed；CLI 下自动 `--defer-embeddings`，
+> 缺失向量留给服务进程的后台 embedder）、重算 Tier 0、从 sidecar 回放已完成的 Tier 1，
+> sidecar 里 Tier 1 已 done 的文档不再入抽取队列。先 `concepts learn`，再 `--reapply`。
 
 ### 2.3 Tier 1 — 异步实体/关系抽取（廉价 LLM，按热度调度）
 
@@ -156,8 +191,8 @@ NLP 概念抽取与 sidecar 写入。
   出队，百万级语料下图谱按"被用的顺序"渐进变密。
 - **抽取本身**：沿用现有 prompt 结构（10 实体类型 / 8 关系类型），按 LightRAG
   方式对 chunk 批量单次提取，结果做名称/别名消歧后**集合并入**全局
-  `entities`/`relations`（现有 upsert 逻辑已是合并语义，`mention_count`、
-  `co_occurs` weight 累积保留）。
+  `entities`/`relations`（现有 upsert 逻辑已是合并语义，`mention_count` 累积
+  保留；`co_occurs` 不再落库，由 mention 读时推导）。
 - **回写 sidecar**：抽取结果连同 `model`、`contentSha` 写入 sidecar 的
   `extraction.tier1`。下次 DB 重建或内容未变的重复 ingest，直接从 sidecar
   回放，不再调 LLM。

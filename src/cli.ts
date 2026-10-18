@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { redactConfig, resolveDataDir, CONFIG_FILE, loadConfig, saveConfig } from './config.js';
 import { createContext } from './context.js';
+import { learnFrequentTerms } from './graph/concepts.js';
+import { CONCEPT_FREQUENT_FILE, FREQUENT_MIN_CORPUS } from './graph/concept-stoplist.js';
 import { configuredPluginSpecs, loadPlugins } from './plugins/loader.js';
 import { pluginRegistry } from './plugins/registry.js';
 import { initDataDir } from './fs/datadir.js';
@@ -112,13 +114,18 @@ program
     await startServer(ctx);
   });
 
-const syncCommand = async (opts: { llm?: boolean; datasources?: boolean; only?: string[]; verify?: boolean }) => {
+const syncCommand = async (opts: { llm?: boolean; datasources?: boolean; only?: string[]; verify?: boolean; reapply?: boolean; deferEmbeddings?: boolean }) => {
   const ctx = await createContext(dataDir());
-  const stats = await sync(ctx, {
+  // deferred: chunks are written without vectors and the running server's
+  // background embedder fills them in, so a CLI pass never competes with it
+  // for the rate-limited pool — a re-apply of a whole workspace always defers
+  const defer = Boolean(opts.reapply || opts.deferEmbeddings);
+  const stats = await sync(defer ? { ...ctx, embeddings: { kick() {} } } : ctx, {
     llmGraph: opts.llm,
     datasources: opts.datasources === false ? false : undefined,
     only: opts.only && opts.only.length ? opts.only : undefined,
     verify: opts.verify,
+    reapply: opts.reapply,
     onProgress: (m) => console.log(`  ${m}`),
   });
   console.log(JSON.stringify(stats, null, 2));
@@ -133,7 +140,28 @@ program
   .option('--no-datasources', 'skip live datasource schema sync')
   .option('--only <prefix...>', 'restrict to path prefixes (e.g. raw/docs/reports) or "datasources"')
   .option('--verify', 'recount folds and repair ledger / page drift')
+  .option('--reapply', 'also re-apply documents whose content is unchanged: tier-0 evidence recomputed, tier-1 replayed from the sidecar, chunks and vectors kept, nothing new queued where the sidecar tier-1 is done (implies --defer-embeddings)')
+  .option('--defer-embeddings', 'write chunks without vectors and leave embedding to the running server, as `serve` does')
   .action(syncCommand);
+
+const concepts = program.command('concepts').description('tier-0 concept mining: the stop terms learned from the corpus (playbooks/concepts/)');
+concepts
+  .command('learn')
+  .description('scan the indexed documents and write playbooks/concepts/frequent.yaml — terms in more than 2% of them are never mined as concepts; run it before `sync --reapply`')
+  .option('--ratio <share>', 'document share above which a term is frequent', '0.02')
+  .action(async (opts) => {
+    const ctx = await createContext(dataDir());
+    const r = await learnFrequentTerms(ctx.store, { ratio: Number(opts.ratio), onProgress: (m) => console.log(`  ${m}`) });
+    console.log(JSON.stringify({
+      docs: r.docs,
+      threshold: r.threshold || null,
+      terms: r.terms.length,
+      file: r.threshold ? CONCEPT_FREQUENT_FILE : `nothing learned: fewer than ${FREQUENT_MIN_CORPUS} indexed documents`,
+      top: r.terms.slice(0, 40).map((t) => `${t.term} (${t.docs})`),
+    }, null, 2));
+    await ctx.datasources.closeAll();
+    await ctx.store.close();
+  });
 
 program
   .command('ingest')

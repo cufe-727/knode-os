@@ -305,9 +305,6 @@ export async function applyExtraction(
     if (await w.relation(sourceId, targetId, { type: r.type, description: r.description, validFrom: dateStart(r.validFrom, ref), validTo: dateEnd(r.validTo, ref), extractor })) relCount++;
   }
 
-  // weak co-occurrence between extracted entities of the same document
-  await w.coOccurrence([...idByName.values()], { weight: 0.2, window: 8, extractor });
-
   // claims — citable assertions grounded to the best-overlapping chunk;
   // subjects that don't resolve to an extracted entity are dropped
   let claimCount = 0;

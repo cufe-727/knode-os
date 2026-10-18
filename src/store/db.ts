@@ -1,6 +1,6 @@
 import { DatabaseConfig } from '../config.js';
 import { Backend, openBackend } from './backend.js';
-import { migrate, MigrationResult, Queryable } from './migrations.js';
+import { CoOccursCleanupResult, dropStoredCoOccurrence, migrate, MigrationResult, Queryable } from './migrations.js';
 
 /**
  * Vector column type for the embeddings table.
@@ -64,6 +64,13 @@ function embeddingsDdl(dim: number): string {
 export class Store implements Queryable {
   /** Result of the migration run performed by `open` (from === to when nothing changed). */
   public migration: MigrationResult = { from: 0, to: 0 };
+  /**
+   * The batched follow-up of migration v13 (dropStoredCoOccurrence), running in
+   * the background since `open`: settled when it has finished or `close` stopped
+   * it. Await it to know the stored co_occurs rows are gone.
+   */
+  public cleanup: Promise<CoOccursCleanupResult | null> = Promise.resolve(null);
+  private stopCleanup = false;
 
   private constructor(
     public readonly db: Backend,
@@ -114,6 +121,13 @@ export class Store implements Queryable {
     }
     await db.exec(embeddingsDdl(embeddingDim));
     await store.setMeta('embedding', { dim: embeddingDim, type: VECTOR_TYPE });
+    // v13 leaves the stored co_occurs rows for here: short autocommitted batches
+    // in the background, not one delete inside the migration's transaction, so
+    // the open returns at once; close() stops them and the next open resumes
+    store.cleanup = dropStoredCoOccurrence(store, { stop: () => store.stopCleanup }).catch((err: unknown) => {
+      console.warn(`[knode-os] co_occurs cleanup stopped: ${err instanceof Error ? err.message : String(err)}; the next open resumes it`);
+      return null;
+    });
     return store;
   }
 
@@ -175,6 +189,9 @@ export class Store implements Queryable {
   }
 
   async close(): Promise<void> {
+    // let the batch in flight finish, then stop: a half-done cleanup resumes at the next open
+    this.stopCleanup = true;
+    await this.cleanup;
     await this.db.close();
   }
 }

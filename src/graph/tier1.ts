@@ -20,6 +20,7 @@ import {
   parseExtractReply,
   RawExtractReply,
 } from './llm-extract.js';
+import { retireTier0Placeholders } from './concepts.js';
 import { loadOntology, Ontology } from './ontology.js';
 import { mergeSegmentResults, Segment, segmentText } from './segment.js';
 import { ExtractedClaim, ExtractedEntity, ExtractedRelation, PageContext } from './store.js';
@@ -110,7 +111,12 @@ export async function refreshQueuePriorities(store: Store, config: KnodeConfig):
   );
 }
 
-/** Apply a tier-1 extraction as a child scope of the document's live scope. */
+/**
+ * Apply a tier-1 extraction as a child scope of the document's live scope.
+ * Once it is in, the document's tier-0 concept placeholders that did not
+ * resolve to a typed entity are retired (src/graph/concepts.ts): tier-1 has
+ * now said what the document is about.
+ */
 export async function applyTier1Scope(
   store: Store,
   doc: { path: string; sha256: string },
@@ -150,6 +156,7 @@ export async function applyTier1Scope(
       });
     },
   );
+  if (res.outcome === 'applied') await retireTier0Placeholders(store, parent.id, { at: res.scope.applied_at });
   return { ...g, outcome: res.outcome };
 }
 

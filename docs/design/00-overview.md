@@ -100,8 +100,9 @@ their sidecar), `raw/skills` and `wiki/` — traces are indexed only when
    two `chunk → entity → chunk` rounds; rare/shared entities score the structural
    pool, embeddings coarse-rank it, and RRF merges it with a reserved direct route.
 5. Hybrid signals are fused with reciprocal-rank fusion (RRF, k=60; graph weighted 0.6).
-6. `graph search` does seeded BFS over persistent `relations` with per-hop decay 0.5 and
-   `co_occurs` edges discounted ×0.5.
+6. `graph search` does seeded BFS over persistent `relations` with per-hop decay 0.5;
+   `co_occurs` edges are derived from shared chunk mentions at query time (never
+   stored, see `src/graph/cooccur.ts`) and discounted ×0.5.
 7. `ask` defaults to hybrid + graph retrieval; `--mode sag` swaps in the SAG
    route without changing existing defaults. SAG results expose hop count,
    seed chunk, bridge entities, and direct/SAG/both provenance.
@@ -116,13 +117,13 @@ Tiered extraction (details in [01](01-doc-processing-graph-wiki.md)):
 - **Tier 0 — deterministic, at ingest** (always): `[[wikilinks]]` → entities +
   `mentions` edges; wiki pages under `entities|concepts/` are themselves
   entities (path = type, like gbrain schema packs); NLP concept mining
-  (capitalized phrases, acronyms, CJK n-grams) → concept entities; co-occurring
-  entities get weak `co_occurs` edges whose weight accumulates on re-mention.
+  (capitalized phrases, acronyms, CJK n-grams) → concept entities. Co-occurrence
+  is not stored: graph reads derive weak `co_occurs` edges from the chunk mentions.
 - **Tier 1 — LLM, asynchronous** (when `llm.model` configured): changed docs
   are queued; a background pass (while `serve` runs, or `knode-os extract`)
   drains the queue by priority (heat × freshness × root importance), one
   batch per pass, extracting typed entities (10 types), typed relations
-  (7 LLM types + deterministic `co_occurs`) and claims, grounded to chunks by
+  (7 LLM types; `co_occurs` is derived at read time) and claims, grounded to chunks by
   name/alias matching. Results persist in the document sidecar for free replay.
 - **Tier 2 — nightly pass**: a zero-LLM claim audit (contradictions, expired
   facts) feeding the suggestions queue, the full duplicate-entity audit, the

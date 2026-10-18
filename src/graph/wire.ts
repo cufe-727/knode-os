@@ -168,21 +168,18 @@ export async function applyWirePlan(
     if (page.path.startsWith('wiki/')) await w.setWikiPath(selfId, page.path);
     stats.entities++;
   }
-  const linkedIds: string[] = [];
   for (const link of plan.links) {
     const targetId = await w.entity(
       { name: link.name, type: link.type, description: link.description },
       { extractor: opts.extractor, segmentId: link.holderChunkId },
     );
-    linkedIds.push(targetId);
     stats.entities++;
+    // the mention is what links the linked pages to each other: co-occurrence is derived from it on read (cooccur.ts)
     if (link.holderChunkId) await w.mention(targetId, link.holderChunkId, page.documentId);
     if (selfId && selfId !== targetId) {
       if (await w.relation(selfId, targetId, { type: link.relation, description: link.relDescription, extractor: opts.extractor })) stats.relations++;
     }
   }
-  // Pages sharing a source: weak co-occurrence edges between all linked entities.
-  stats.relations += await w.coOccurrence(linkedIds, { weight: 0.3, window: 12, extractor: opts.extractor });
   return stats;
 }
 

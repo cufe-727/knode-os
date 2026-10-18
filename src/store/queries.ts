@@ -32,7 +32,7 @@ export async function knowledgeStats(store: Store): Promise<KnowledgeStats> {
            (SELECT count(*)::int FROM chunks) AS chunks,
            (SELECT count(*)::int FROM embeddings) AS embeddings,
            (SELECT count(*)::int FROM entities WHERE tx_to IS NULL) AS entities,
-           (SELECT count(*)::int FROM relations WHERE tx_to IS NULL) AS relations,
+           (SELECT count(*)::int FROM relations WHERE tx_to IS NULL AND type <> 'co_occurs') AS relations,
            (SELECT count(*)::int FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL) AS claims,
            (SELECT count(*)::int FROM traces) AS traces,
            (SELECT count(*)::int FROM suggestions WHERE status = 'pending') AS pending_suggestions,

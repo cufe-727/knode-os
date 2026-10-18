@@ -20,6 +20,9 @@ export interface Queryable {
   exec?(sql: string): Promise<void>;
 }
 
+/** `meta` key v13 sets: stored co_occurs rows are still to be deleted (see dropStoredCoOccurrence). */
+export const COOCCURS_CLEANUP_META = 'cooccurs_cleanup';
+
 export interface MigrationContext {
   /** Schema version the database had before this migration run started. */
   from: number;
@@ -821,6 +824,27 @@ CREATE INDEX IF NOT EXISTS pages_scope_idx ON pages (scope_id) WHERE scope_id IS
 CREATE INDEX IF NOT EXISTS entities_canonical_idx ON entities (canonical_id) WHERE canonical_id IS NOT NULL;
 `;
 
+// Co-occurrence is derived from entity_mentions on read now (src/graph/cooccur.ts):
+// two entities co-occur when a live document mentions both, strongly when one
+// chunk does. The stored `co_occurs` rows said nothing the mentions did not and
+// were 92% of the finance workspace's relations table (844k of 912k rows, with
+// 2.0M of its 2.96M evidence rows behind them), so they go — deleted rather
+// than tombstoned, because an as_of read folds relations back out of their
+// evidence and would resurrect them.
+//
+// The migration itself only adds the index the derivation joins on and flags
+// the cleanup; the rows are deleted by `dropStoredCoOccurrence`, which
+// Store.open runs in the background once the migrations have committed, in
+// short autocommitted batches, so the startup transaction never holds two
+// million row locks and the service comes up at once while writers keep
+// going. Readers ignore rows of this type until then. Measured on a Postgres
+// copy of that workspace: see dropStoredCoOccurrence.
+const V13_DERIVED_COOCCURRENCE = `
+CREATE INDEX IF NOT EXISTS mentions_document_idx ON entity_mentions (document_id);
+INSERT INTO meta (key, value) VALUES ('${COOCCURS_CLEANUP_META}', '{"pending": true}'::jsonb)
+  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -851,9 +875,90 @@ export const MIGRATIONS: Migration[] = [
   { version: 10, name: 'chat-quick', up: async (q) => execScript(q, V10_CHAT_QUICK) },
   { version: 11, name: 'claim-merge', up: async (q) => execScript(q, V11_CLAIM_MERGE) },
   { version: 12, name: 'dispose-indexes', up: async (q) => execScript(q, V12_DISPOSE_INDEXES) },
+  { version: 13, name: 'derived-cooccurrence', up: async (q) => execScript(q, V13_DERIVED_COOCCURRENCE) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;
+
+export interface CoOccursCleanupResult {
+  relations: number;
+  evidence: number;
+  batches: number;
+  seconds: number;
+}
+
+interface MetaStore extends Queryable {
+  getMeta<T>(key: string): Promise<T | undefined>;
+  setMeta(key: string, value: unknown): Promise<void>;
+}
+
+/**
+ * The follow-up v13 flags: delete the stored co_occurs rows and their evidence,
+ * `batch` relations per statement, each statement its own transaction, keyed
+ * forward by relation id so a batch never re-walks what the last one deleted.
+ * Store.open starts it in the background once the migrations have committed,
+ * so the service comes up at once; `close` stops it after the statement in
+ * flight and the next open resumes where it stopped. Readers ignore rows of
+ * this type until it is done (graph/query.ts and the other relation readers).
+ * Nothing here touches `meta.ledger_seq`. Idempotent: the flag stays pending
+ * until a batch finds nothing left, so a stopped run, a crash, or a second
+ * opener working at the same time all simply continue.
+ *
+ * Measured 2026-10-18 by opening a Postgres 17 copy of the finance workspace
+ * with this code (998k co_occurs rows, 2.24M evidence rows; shared_buffers
+ * 128MB, the server's settings): open returned after 0.1 s; 100 statements of
+ * 10k relations, median 1.0 s, p95 1.7 s, max 2.7 s each (the evidence rows of
+ * a batch are scattered over a 1.2 GB table), 99 s in all, each statement
+ * holding only its own row locks for that long. The one-statement delete it
+ * replaces took 20 s inside the startup transaction.
+ */
+export async function dropStoredCoOccurrence(
+  store: MetaStore,
+  opts: { batch?: number; log?: (line: string) => void; stop?: () => boolean } = {},
+): Promise<CoOccursCleanupResult | null> {
+  const flag = await store.getMeta<{ pending?: boolean }>(COOCCURS_CLEANUP_META);
+  if (!flag?.pending) return null;
+  const batch = Math.max(100, Math.floor(opts.batch ?? 10_000));
+  const log = opts.log ?? ((line: string) => console.log(`[knode-os] ${line}`));
+  const [{ n: total }] = await store.query<{ n: number }>(`SELECT count(*)::int AS n FROM relations WHERE type = 'co_occurs'`);
+  const started = Date.now();
+  if (total > 0) log(`dropping ${total} stored co_occurs relation rows and their evidence, ${batch} relations per statement (co-occurrence is derived from mentions now)`);
+  let relations = 0;
+  let evidence = 0;
+  let batches = 0;
+  let last = '';
+  let lastLog = started;
+  for (;;) {
+    if (opts.stop?.()) {
+      log(`co_occurs cleanup paused at ${relations} / ${total} relations after ${((Date.now() - started) / 1000).toFixed(1)} s; the next open resumes it`);
+      return { relations, evidence, batches, seconds: (Date.now() - started) / 1000 };
+    }
+    const [row] = await store.query<{ relations: number; evidence: number; last: string | null }>(
+      `WITH batch AS (
+         SELECT id FROM relations WHERE type = 'co_occurs' AND id > $1 ORDER BY id LIMIT $2
+       ), ev AS (
+         DELETE FROM evidence e USING batch b WHERE e.kind = 'relation' AND e.target_id = b.id RETURNING e.id
+       ), rel AS (
+         DELETE FROM relations r USING batch b WHERE r.id = b.id RETURNING r.id
+       )
+       SELECT (SELECT count(*)::int FROM rel) AS relations, (SELECT count(*)::int FROM ev) AS evidence, (SELECT max(id) FROM batch) AS last`,
+      [last, batch],
+    );
+    if (!row?.last) break;
+    last = row.last;
+    relations += Number(row.relations);
+    evidence += Number(row.evidence);
+    batches++;
+    if (Date.now() - lastLog >= 2000) {
+      lastLog = Date.now();
+      log(`co_occurs cleanup: ${relations} / ${total} relations, ${evidence} evidence rows, ${((lastLog - started) / 1000).toFixed(1)} s`);
+    }
+  }
+  const seconds = (Date.now() - started) / 1000;
+  await store.setMeta(COOCCURS_CLEANUP_META, { pending: false, finishedAt: new Date().toISOString(), relations, evidence, batches, seconds });
+  if (total > 0 || relations > 0) log(`dropped ${relations} stored co_occurs relation rows and ${evidence} evidence rows in ${batches} batches, ${seconds.toFixed(1)} s`);
+  return { relations, evidence, batches, seconds };
+}
 
 async function execScript(q: Queryable, script: string): Promise<void> {
   if (q.exec) {
