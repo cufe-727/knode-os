@@ -1,4 +1,5 @@
 import { foldTouched } from '../lineage/fold.js';
+import { lockLedger } from '../lineage/ledger.js';
 import { emptyTouched } from '../lineage/types.js';
 import { ScopeWriter } from '../lineage/writer.js';
 import { loadSourceText } from '../ingest/source.js';
@@ -542,6 +543,13 @@ async function refreshKnown(store: Store, c: KnownCache, force: boolean): Promis
  * them — a re-import that disposes every old placeholder as it runs changes
  * nothing here. `knode-os concepts learn`; also maybeLearnFrequentTerms.
  */
+/**
+ * Ceiling on the learned list, not a target: at the 2% threshold a 13.5k-document
+ * corpus has a few thousand frequent terms, and a cap of 1,000 silently left
+ * out every term seen in 271–840 documents.
+ */
+export const FREQUENT_TERM_LIMIT = 20_000;
+
 export async function learnFrequentTerms(
   store: Store,
   opts: { ratio?: number; minCorpus?: number; minDocs?: number; limit?: number; onProgress?: (msg: string) => void } = {},
@@ -566,7 +574,7 @@ export async function learnFrequentTerms(
   const threshold = frequentThreshold(scanned, opts.ratio, opts.minCorpus, opts.minDocs);
   const terms = threshold === null
     ? []
-    : [...df.values()].filter((e) => e.docs >= threshold).sort((a, b) => b.docs - a.docs || a.term.localeCompare(b.term)).slice(0, opts.limit ?? 1000);
+    : [...df.values()].filter((e) => e.docs >= threshold).sort((a, b) => b.docs - a.docs || a.term.localeCompare(b.term)).slice(0, opts.limit ?? FREQUENT_TERM_LIMIT);
   const result: FrequentTerms = { docs: scanned, threshold: threshold ?? 0, at: new Date().toISOString(), terms };
   // a corpus too small to measure leaves no file behind, unless one is there to be reset
   if (threshold !== null || readFrequentTerms(store.dataDir)) writeFrequentTerms(store.dataDir, result);
@@ -734,6 +742,8 @@ export async function retireTier0Placeholders(store: Store, docScopeId: string, 
   const precedence = typePrecedence(loadOntology(store.dataDir));
   let result = { entities: 0 };
   await store.tx(async (q) => {
+    // folds entity rows: queue on the ledger lock like every scope transaction
+    await lockLedger(q);
     const rows = await q.query<{ target_id: string }>(
       `SELECT DISTINCT ev.target_id FROM evidence ev JOIN entities e ON e.id = ev.target_id
        WHERE ev.scope_id = $1 AND ev.kind = 'entity' AND ev.extractor = $2 AND ev.tx_to IS NULL

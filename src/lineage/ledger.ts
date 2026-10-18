@@ -76,6 +76,21 @@ export async function nextLedgerSeq(q: Queryable): Promise<number> {
   return Number(row?.seq ?? 1);
 }
 
+/**
+ * Take the ledger row lock without allocating a number — for a transaction
+ * that folds entity rows but writes no ledger line. Every transaction that
+ * folds takes this lock before touching any entity row, so two of them queue
+ * here instead of waiting on each other's rows: a dispose that had folded the
+ * author entity of one document while an apply folded it for the next
+ * deadlocked at ingest concurrency 4 (every document of an author links it).
+ */
+export async function lockLedger(q: Queryable): Promise<void> {
+  await q.query(
+    `INSERT INTO meta (key, value) VALUES ('ledger_seq', '{"seq":0}'::jsonb)
+     ON CONFLICT (key) DO UPDATE SET value = meta.value`,
+  );
+}
+
 /** Re-seed the sequence counter from the log (rebuild path). */
 export async function seedLedgerSeq(q: Queryable, dataDir: string): Promise<number> {
   const tail = ledgerTail(dataDir);
