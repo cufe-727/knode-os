@@ -185,7 +185,10 @@ private let zhHansPairs: [(String, String)] = [
     ("Enable a model pool in Providers & Agents to share compatible keys. Changing the model re-embeds the workspace.", "在“提供方与代理”中启用模型池，共享兼容 Key。更换模型会重新计算工作区向量。"),
     ("Choose one model. Compatible keys share the work; lower priorities run first, equal priorities rotate. Rate-limited or unavailable keys cool down automatically.", "选择一个模型，由兼容 Key 分担请求。优先使用较小优先级，同级轮换；遇到限流或故障会自动冷却并切换。"),
     ("Pool vectors are L2-normalized. Only matching models and dimensions participate. Changing the pool model re-embeds the workspace; changing keys or limits does not.", "模型池统一对向量做 L2 归一化，仅使用模型和维度匹配的 Key。更换池内模型会重算向量；调整 Key 或限额无需重算。"),
-    ("App usage persists across restarts. Tokens use provider usage when available, otherwise a conservative estimate. Activity in other apps is not included. Zero limits block requests.", "用量跨重启保留。优先采用平台返回的 Token 用量，否则使用保守估算；不包含其他应用的用量。限额设为 0 将阻止请求。"),
+    ("App usage persists across restarts. Tokens are the provider's own count when its response includes one (SiliconFlow, OpenRouter), otherwise an estimate for the model (Cloudflare reports none). Activity in other apps is not included. Zero limits block requests.", "用量跨重启保留。响应中带有 Token 用量时采用平台自己的计数（SiliconFlow、OpenRouter），否则按模型估算（Cloudflare 不返回用量）；不包含其他应用的用量。限额设为 0 将阻止请求。"),
+    ("reported", "平台返回"),
+    ("estimated", "估算"),
+    ("%d%% estimated", "%d%% 为估算"),
     // MARK: - Shell and sections
     // Level 1: the four sidebar sections.
     ("Library", "资料"),
