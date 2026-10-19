@@ -109,12 +109,15 @@ interface EmbeddingProviderPlugin {
 interface StorageBackendPlugin {
   id: string; label: string; note?: string;
   open(dataDir: string, config: DatabaseConfig): Promise<Backend>;
+  drop?(dataDir: string, config: DatabaseConfig): Promise<void>;   // 该 workspace 的整个索引
 }
 ```
 
 `DatabaseConfig` 除内建字段外新增 `url`、`ssl`、`poolSize`（postgres）、`path`（pglite），以及给插件自用的
 `options` 对象。`openPglite` 与 `openPostgres` 已导出，插件可以包装它们（不同的目录布局、先打开一条隧道、
-一个通过 HTTP 说 pg 协议的驱动）。
+一个通过 HTTP 说 pg 协议的驱动）；`dropPglite` 与 `dropPostgres` 同样导出，供插件的 `drop` 使用。清空 workspace
+与 `knode-os rebuild` 都经它删除索引（`dropBackend`）：pglite 删除自己的目录，postgres 以 CASCADE 删除该 workspace
+的 schema；没有 `drop` 的后端会让两者直接报错，而不是删掉文件、把旧索引留给下一次打开。
 
 ### 3.4 文档转换器
 

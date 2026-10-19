@@ -160,7 +160,7 @@ knode-os lineage show <entity|relation|claim|page|document> <id>
 knode-os history <path>       一个源的 apply / dispose / purge 历史
 knode-os forget <path>        删除源、dispose 并清除其历史(不可逆)
 knode-os purge [--before iso] [--archived]  物理清除已 dispose 的历史 / 归档页面
-knode-os rebuild [--history]  删除 .knode/db 并从文件 + ledger 重建
+knode-os rebuild [--history]  删除索引(.knode/db,或该 workspace 在 PostgreSQL 中的 schema)并从文件 + ledger 重建
 knode-os extract [--batch n]  跑一轮后台文档轮次:抽取一批、复核重复实体、写摘要
 knode-os remote token create --name <机器> --scope label,read,write,sql --workspace <用户>/<workspace>
                               为远程 API 签发每台机器各自的 token(另有 `remote token list | revoke`)

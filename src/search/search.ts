@@ -1,7 +1,7 @@
 import { HeatConfig, SagSearchConfig, defaultConfig } from '../config.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { NO_FILTER, ResolvedScopeFilter, documentFilterSql } from '../store/resolver.js';
-import { Params, TimeInput, toIso, toDateString } from '../store/temporal.js';
+import { Params, TimeInput, rowLiveAt, toIso, toDateString } from '../store/temporal.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { getDocHeat, recordChunkHits } from '../stats/heat.js';
 import { SearchResult } from '../types.js';
@@ -160,7 +160,14 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
   return [...fts, ...like.filter((r) => !seen.has(r.chunk_id))].slice(0, k);
 }
 
-/** Chunks mentioning live entities whose name/alias matches the query (graph signal). */
+/**
+ * Chunks mentioning entities whose name/alias matches the query (graph
+ * signal): one row per chunk, ranked by how many matching entities it
+ * mentions, then by how often those entities are mentioned overall, then by
+ * id — RRF reads the rank, so the order must not be the planner's. An entity
+ * counts when it was live at `asOf` (the evidence test the other graph routes
+ * use), not merely now. `raw` is the matching-entity count, as in graphSearch.
+ */
 async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
   const terms = queryTerms(query, 5);
   if (terms.length === 0) return [];
@@ -169,16 +176,19 @@ async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput
     const ph = p.add(`%${t}%`);
     return `(e.name ILIKE ${ph} OR e.aliases::text ILIKE ${ph})`;
   }).join(' OR ');
+  const entityLive = rowLiveAt('e', 'entity', p, asOf);
   const cond = docLiveAt('d', p, asOf, filter);
   const lim = p.add(k);
   return store.query<RankedChunk>(
-    `SELECT DISTINCT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
-            e.mention_count::float AS raw
+    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
+            count(DISTINCT e.id)::float AS raw
      FROM entities e
      JOIN entity_mentions m ON m.entity_id = e.id
      JOIN chunks c ON c.id = m.chunk_id
      JOIN documents d ON d.id = c.document_id
-     WHERE (${conds}) AND e.tx_to IS NULL AND ${cond}
+     WHERE (${conds}) AND ${entityLive} AND ${cond}
+     GROUP BY c.id, d.id
+     ORDER BY count(DISTINCT e.id) DESC, sum(e.mention_count) DESC, c.id
      LIMIT ${lim}`,
     p.list,
   );

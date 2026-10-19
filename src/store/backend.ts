@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
 import { vector } from '@electric-sql/pglite-pgvector';
@@ -6,6 +7,7 @@ import pg from 'pg';
 import { DatabaseConfig, resolveSecret } from '../config.js';
 import { DB_DIR } from '../fs/datadir.js';
 import { pluginRegistry } from '../plugins/registry.js';
+import type { StorageBackendPlugin } from '../plugins/types.js';
 
 /**
  * The database surface the Store needs, so an external Postgres server can
@@ -16,6 +18,9 @@ import { pluginRegistry } from '../plugins/registry.js';
  * Which backend opens is decided by `database.kind` through the plugin
  * registry: `pglite` and `postgres` are built in (below), and a storage plugin
  * may add another way of reaching a Postgres with pgvector (docs/design/11).
+ * Dropping a workspace's whole index (clearing the workspace, `knode-os
+ * rebuild`) goes through the same registry, as `dropBackend`: only the backend
+ * knows where that index lives.
  */
 export interface Backend {
   query<T>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
@@ -203,6 +208,11 @@ class PostgresBackend implements Backend {
   }
 }
 
+/** The schema a `postgres` config gives one workspace. */
+function workspaceSchema(dataDir: string, cfg: DatabaseConfig): string {
+  return schemaNameFor(dataDir, cfg.schemaPrefix || 'ws');
+}
+
 /**
  * The built-in `postgres` backend: one shared database (created on first
  * open), one schema per workspace, reached through `url` or the
@@ -210,7 +220,7 @@ class PostgresBackend implements Backend {
  */
 export async function openPostgres(dataDir: string, cfg: DatabaseConfig): Promise<Backend> {
   const database = postgresDatabaseName(cfg);
-  const schema = schemaNameFor(dataDir, cfg.schemaPrefix || 'ws');
+  const schema = workspaceSchema(dataDir, cfg);
   try {
     await ensureDatabase(cfg, database);
   } catch (err) {
@@ -233,6 +243,46 @@ export async function openPostgres(dataDir: string, cfg: DatabaseConfig): Promis
   return new PostgresBackend(pool);
 }
 
+/** How long a drop waits for another connection's locks on the schema before it gives up. */
+const DROP_LOCK_TIMEOUT = '30s';
+
+/**
+ * Drop one workspace's schema, every table in it included; the next
+ * `openPostgres` creates it again, empty. The schema is named after the
+ * workspace path, so deleting the directory alone hands a recreated workspace
+ * its old tables back.
+ *
+ * A schema holding an extension is refused: CASCADE would drop the extension,
+ * and with it every column of its types in every other workspace. pgvector
+ * belongs in `public` (ensureSchema puts it there).
+ */
+export async function dropPostgres(dataDir: string, cfg: DatabaseConfig): Promise<void> {
+  const schema = workspaceSchema(dataDir, cfg);
+  const pool = new pg.Pool({
+    ...postgresPoolConfig(cfg, { database: postgresDatabaseName(cfg), max: 1 }),
+    options: `-c lock_timeout=${DROP_LOCK_TIMEOUT}`,
+  });
+  try {
+    const { rows } = await pool.query<{ extname: string }>(
+      `SELECT e.extname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE n.nspname = $1`,
+      [schema],
+    );
+    if (rows.length > 0) {
+      const names = rows.map((r) => r.extname).join(', ');
+      throw new Error(`schema ${schema} holds the extension ${names}, which dropping it would remove from every workspace — move it to public first (ALTER EXTENSION ${rows[0].extname} SET SCHEMA public)`);
+    }
+    await pool.query(`DROP SCHEMA IF EXISTS ${quoteIdent(schema)} CASCADE`);
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    // no database yet: nothing was ever stored here
+    if (code === '3D000') return;
+    if (code === '55P03') throw new Error(`schema ${schema} is in use by another connection (another knode-os process on this workspace?) — stop it and try again`);
+    throw err;
+  } finally {
+    await pool.end();
+  }
+}
+
 /* -------------------------------- PGlite -------------------------------- */
 
 /** Where a workspace's embedded database lives: `database.path` (relative to the workspace, or absolute), default `.knode/db`. */
@@ -247,7 +297,23 @@ export async function openPglite(dataDir: string, cfg?: Pick<DatabaseConfig, 'pa
   return (await PGlite.create(pgliteDir(dataDir, cfg), { extensions: { vector } })) as unknown as Backend;
 }
 
+/** Delete a workspace's embedded database directory; the next `openPglite` creates an empty one. */
+export async function dropPglite(dataDir: string, cfg?: Pick<DatabaseConfig, 'path'>): Promise<void> {
+  fs.rmSync(pgliteDir(dataDir, cfg), { recursive: true, force: true });
+}
+
 /* -------------------------------- entry --------------------------------- */
+
+/** The registered backend `database.kind` names (an absent config is PGlite), and the config to hand it. */
+function storageBackendFor(cfg?: DatabaseConfig): { backend: StorageBackendPlugin; config: DatabaseConfig } {
+  const kind = cfg?.kind || 'pglite';
+  const backend = pluginRegistry().storageBackend(kind);
+  if (!backend) {
+    const known = pluginRegistry().storageBackends().map((b) => b.id).join(', ');
+    throw new Error(`unknown database.kind "${kind}" (registered: ${known}) — a plugin that provides it must be listed under "plugins" in knode.config.json`);
+  }
+  return { backend, config: cfg ?? { kind, host: '', port: 0, user: '', password: '', database: '', schemaPrefix: 'ws' } };
+}
 
 /**
  * Open the backend for one workspace, by `database.kind`: PostgreSQL when the
@@ -256,11 +322,30 @@ export async function openPglite(dataDir: string, cfg?: Pick<DatabaseConfig, 'pa
  * keep working. Any other kind must come from a storage plugin.
  */
 export async function openBackend(dataDir: string, cfg?: DatabaseConfig): Promise<Backend> {
-  const kind = cfg?.kind || 'pglite';
-  const backend = pluginRegistry().storageBackend(kind);
-  if (!backend) {
-    const known = pluginRegistry().storageBackends().map((b) => b.id).join(', ');
-    throw new Error(`unknown database.kind "${kind}" (registered: ${known}) — a plugin that provides it must be listed under "plugins" in knode.config.json`);
+  const { backend, config } = storageBackendFor(cfg);
+  return backend.open(dataDir, config);
+}
+
+/**
+ * Throw unless `database.kind` names a backend that can drop a workspace's
+ * index. Callers check this before closing anything, so a backend without
+ * `drop` leaves the workspace as it was rather than half cleared.
+ */
+export function assertBackendDroppable(cfg?: DatabaseConfig): void {
+  const { backend } = storageBackendFor(cfg);
+  if (typeof backend.drop !== 'function') {
+    throw new Error(`storage backend "${backend.id}" (database.kind) cannot drop a workspace's index: it has no drop(dataDir, config), and clearing the files alone would leave the old index for the next open. Add drop() to the plugin that provides it, or delete the index by hand.`);
   }
-  return backend.open(dataDir, cfg ?? { kind, host: '', port: 0, user: '', password: '', database: '', schemaPrefix: 'ws' });
+}
+
+/**
+ * Drop one workspace's whole index, wherever its backend keeps it: the
+ * embedded database's directory, the workspace's schema on a server, or
+ * whatever a plugin backend's `drop` removes. The store must be closed first;
+ * the next open starts empty.
+ */
+export async function dropBackend(dataDir: string, cfg?: DatabaseConfig): Promise<void> {
+  assertBackendDroppable(cfg);
+  const { backend, config } = storageBackendFor(cfg);
+  await backend.drop!(dataDir, config);
 }

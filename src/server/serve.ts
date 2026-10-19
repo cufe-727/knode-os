@@ -8,7 +8,7 @@ import { AppContext } from '../context.js';
 import { isHiddenName } from '../fs/files.js';
 import { RAW_DOCS, RAW_SKILLS, WIKI_DIR } from '../fs/layout.js';
 import { TreeWatcher, watchTree } from '../fs/watch.js';
-import { startDreamScheduler } from '../dream/dream.js';
+import { nightlySchedule, startDreamScheduler } from '../dream/dream.js';
 import { startFollowUp } from '../labeling/followup.js';
 import { LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
@@ -387,7 +387,9 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
 
   // nightly dream + the tier-2 pass
   const dreamTimer = startDreamScheduler(ctx, log);
-  log(`dream scheduled daily at ${ctx.config.dream.schedule} (lookback ${ctx.config.dream.lookbackDays}d)`);
+  const nightly = nightlySchedule(ctx.config);
+  if (nightly) log(`dream scheduled daily at ${nightly.dream} (lookback ${ctx.config.dream.lookbackDays}d)`);
+  else log(`dream.schedule ${JSON.stringify(ctx.config.dream.schedule)} is not a 24-hour "HH:MM" time: the nightly dream and tier-2 pass will not run`);
   const tier2Timer = startTier2Scheduler(ctx, log);
 
   // watch docs + wiki for changes → debounced scoped sync (a path that is gone
@@ -475,16 +477,18 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   };
 }
 
-/** Run the tier-2 pass daily, a few minutes after the dream schedule. */
-function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void): NodeJS.Timeout {
-  const [h, m] = ctx.config.dream.schedule.split(':').map(Number);
-  const target = `${String(h).padStart(2, '0')}:${String((m + 10) % 60).padStart(2, '0')}`;
+/**
+ * Run the tier-2 pass daily, a few minutes after the dream schedule
+ * (`nightlySchedule`). Like Dream's, it reads the schedule on every tick, so the
+ * pass keeps following Dream when the config changes. Exported for tests.
+ */
+export function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void): NodeJS.Timeout {
   let lastRun = '';
   const timer = setInterval(async () => {
     const now = new Date();
     const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     const today = now.toISOString().slice(0, 10);
-    if (hhmm === target && lastRun !== today) {
+    if (hhmm === nightlySchedule(ctx.config)?.tier2 && lastRun !== today) {
       lastRun = today;
       try {
         const res = await refineWiki(ctx.store, ctx.config, ctx.llm, { onProgress: log, embedder: ctx.embedder });
@@ -499,6 +503,7 @@ function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void): NodeJ
     }
   }, 30 * 1000);
   timer.unref?.();
-  log(`tier2 pass scheduled daily at ${target}`);
+  const target = nightlySchedule(ctx.config)?.tier2;
+  if (target) log(`tier2 pass scheduled daily at ${target}`);
   return timer;
 }

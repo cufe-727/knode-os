@@ -4,8 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import pg from 'pg';
 import { afterAll, describe, expect, it } from 'vitest';
-import type { DatabaseConfig } from '../src/config.js';
-import { schemaNameFor } from '../src/store/backend.js';
+import { defaultConfig, type DatabaseConfig } from '../src/config.js';
+import { createContext } from '../src/context.js';
+import { rebuild } from '../src/lineage/rebuild.js';
+import { resolveWorkspaceScope, WorkspaceContextRegistry } from '../src/server/workspaces.js';
+import { dropBackend, schemaNameFor } from '../src/store/backend.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 import { catalogQuery, catalogReaderRole } from '../src/store/catalog.js';
 
@@ -64,6 +67,17 @@ async function postgresReady(): Promise<boolean> {
 
 const ready = await postgresReady();
 const dirs: string[] = [];
+
+/** Whether this run's database still has the schema a workspace directory maps to. */
+async function schemaExists(dir: string): Promise<boolean> {
+  const pool = adminPool(dbConfig.database);
+  try {
+    const { rows } = await pool.query(`SELECT 1 FROM pg_namespace WHERE nspname = $1`, [schemaNameFor(dir, dbConfig.schemaPrefix)]);
+    return rows.length > 0;
+  } finally {
+    await pool.end().catch(() => {});
+  }
+}
 
 function workspaceDir(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-pgtest-'));
@@ -206,6 +220,99 @@ describe.skipIf(!ready)('postgres backend', () => {
     } finally {
       await a.close();
       await b.close();
+    }
+  });
+
+  it('drops one workspace schema whole, leaves the others, and the next open starts empty', async () => {
+    const dir = workspaceDir();
+    const a = await Store.open(dir, 2048, dbConfig);
+    const b = await Store.open(workspaceDir(), 2048, dbConfig);
+    try {
+      await a.query(`INSERT INTO documents (id, path, root, sha256, bytes) VALUES ('stale', '/tmp/a.md', 'raw', 's', 1)`);
+      await b.query(`INSERT INTO documents (id, path, root, sha256, bytes) VALUES ('kept', '/tmp/b.md', 'raw', 's', 1)`);
+      await a.close();
+
+      // B's pool stays open throughout: idle connections to another schema do not hold the drop up
+      await dropBackend(dir, dbConfig);
+      expect(await schemaExists(dir)).toBe(false);
+
+      const reopened = await Store.open(dir, 2048, dbConfig);
+      try {
+        expect(reopened.migration.from).toBe(0);
+        expect(await reopened.query(`SELECT id FROM documents`)).toEqual([]);
+      } finally {
+        await reopened.close();
+      }
+      expect(await b.query<{ id: string }>(`SELECT id FROM documents`)).toEqual([{ id: 'kept' }]);
+    } finally {
+      await b.close();
+    }
+  });
+
+  it('treats a schema or a database that was never created as nothing to drop', async () => {
+    const dir = workspaceDir();
+    await dropBackend(dir, dbConfig);
+    expect(await schemaExists(dir)).toBe(false);
+
+    const absent = `${runDatabase}_absent`;
+    await dropBackend(dir, { ...dbConfig, database: absent });
+    const pool = adminPool();
+    try {
+      // and dropping does not create it
+      expect((await pool.query(`SELECT 1 FROM pg_database WHERE datname = $1`, [absent])).rows).toEqual([]);
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  });
+
+  it('clears a workspace down to a new schema, not an emptied directory over the old one', async () => {
+    const templateConfig = defaultConfig();
+    templateConfig.database = { ...dbConfig };
+    const registry = new WorkspaceContextRegistry(workspaceDir(), { templateConfig });
+    const scope = resolveWorkspaceScope({ user: 'alice', kind: 'personal', id: 'default', name: 'Default' });
+    try {
+      const ctx = await registry.get(scope);
+      // a row no file reproduces, like a chat or a research job
+      await ctx.store.query(`INSERT INTO suggestions (id, kind, title, body) VALUES ('stale', 'skill', 'stale', 'stale')`);
+      await registry.reset(scope);
+      const fresh = await registry.get(scope);
+      expect(await fresh.store.query(`SELECT id FROM suggestions`)).toEqual([]);
+    } finally {
+      await registry.closeAll();
+    }
+  });
+
+  it('rebuilds into a new schema, so rows no file reproduces are gone', async () => {
+    const dir = workspaceDir();
+    fs.writeFileSync(path.join(dir, 'knode.config.json'), JSON.stringify({ database: dbConfig }));
+    const ctx = await createContext(dir);
+    try {
+      await ctx.store.query(`INSERT INTO suggestions (id, kind, title, body) VALUES ('stale', 'skill', 'stale', 'stale')`);
+      await rebuild(ctx);
+      expect(await ctx.store.query(`SELECT id FROM suggestions`)).toEqual([]);
+      expect(await schemaExists(dir)).toBe(true);
+    } finally {
+      await ctx.store.close();
+    }
+  });
+
+  it('refuses to drop a schema an extension lives in', async (t) => {
+    const dir = workspaceDir();
+    await (await Store.open(dir, 2048, dbConfig)).close();
+    const schema = schemaNameFor(dir, dbConfig.schemaPrefix);
+    const pool = adminPool(dbConfig.database);
+    try {
+      // CASCADE would take the extension, and its types in every other workspace, with it
+      try {
+        await pool.query(`CREATE EXTENSION citext SCHEMA "${schema}"`);
+      } catch {
+        t.skip();
+      }
+      await expect(dropBackend(dir, dbConfig)).rejects.toThrow(/holds the extension citext/);
+      expect(await schemaExists(dir)).toBe(true);
+    } finally {
+      await pool.query(`DROP EXTENSION IF EXISTS citext`).catch(() => {});
+      await pool.end().catch(() => {});
     }
   });
 

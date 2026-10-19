@@ -77,6 +77,14 @@ export interface StorageBackendPlugin {
   label: string;
   note?: string;
   open(dataDir: string, config: DatabaseConfig): Promise<Backend>;
+  /**
+   * Delete everything this backend keeps for the workspace, so the next
+   * `open` starts on an empty index. Clearing a workspace and `knode-os
+   * rebuild` call it with the workspace's store closed, and it may run when
+   * nothing was ever stored. Optional, but both refuse to run on a backend
+   * without it rather than leave the old index behind for the next open.
+   */
+  drop?(dataDir: string, config: DatabaseConfig): Promise<void>;
 }
 
 export interface ConverterInput {

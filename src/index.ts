@@ -84,6 +84,6 @@ export type {
 } from './plugins/types.js';
 export { LlmClient, jsonFromReply, type ChatMessage, type CompletionOptions, type ImageAttachment } from './llm/client.js';
 export { withProvenance, type ConversionResult, type VisionModel } from './ingest/converters/shared.js';
-export { openPglite, openPostgres, postgresPoolConfig, type Backend, type BackendTx } from './store/backend.js';
+export { dropPglite, dropPostgres, openPglite, openPostgres, postgresPoolConfig, type Backend, type BackendTx } from './store/backend.js';
 export type { ChunkPiece } from './ingest/chunker.js';
 export type { ExtractRequest, ExtractResult } from './graph/llm-extract.js';

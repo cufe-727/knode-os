@@ -202,7 +202,7 @@ is a way of *reaching* such a database. Most cases need no plugin: the built-in
 absolute). A plugin backend wraps one of them, or brings its own driver:
 
 ```js
-import { openPostgres } from 'knode-os';
+import { dropPostgres, openPostgres } from 'knode-os';
 storageBackends: [{
   id: 'neon',
   label: 'Neon (pooled)',
@@ -210,10 +210,19 @@ storageBackends: [{
     const url = await resolvePooledUrl(cfg.options?.project);   // whatever the service needs
     return openPostgres(dataDir, { ...cfg, kind: 'postgres', url, ssl: 'require' });
   },
+  async drop(dataDir, cfg) {                                    // clearing the workspace, `knode-os rebuild`
+    const url = await resolvePooledUrl(cfg.options?.project);
+    return dropPostgres(dataDir, { ...cfg, kind: 'postgres', url, ssl: 'require' });
+  },
 }]
 ```
 
-`database.options` is free-form for a plugin's own settings.
+`database.options` is free-form for a plugin's own settings. `drop` deletes
+everything the backend keeps for one workspace, so the next `open` starts
+empty: the built-ins remove the PGlite directory or `DROP SCHEMA … CASCADE` the
+workspace's schema (`dropPglite`, `dropPostgres`). It is optional, but clearing
+a workspace and `knode-os rebuild` refuse to run on a backend without one
+rather than delete the files and leave the old index for the next open.
 
 ## Document converters
 
