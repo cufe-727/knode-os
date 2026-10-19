@@ -95,9 +95,10 @@ export async function coOccurringEntities(q: Queryable, ids: readonly string[], 
   const perEntity = Math.max(1, Math.floor(opts.perEntity ?? DEFAULT_PER_ENTITY));
   const maxDocuments = Math.max(1, Math.floor(opts.maxDocuments ?? DEFAULT_MAX_DOCUMENTS));
 
+  // seeds and `among` go as array parameters: graphOverview passes the web API's limit through uncapped
   const p = new Params();
-  const seedPh = seeds.map((id) => p.add(id)).join(',');
-  const amongCond = among ? `AND o.entity_id IN (${among.map((id) => p.add(id)).join(',')})` : '';
+  const seedPh = p.add(seeds);
+  const amongCond = among ? `AND o.entity_id = ANY(${p.add(among)}::text[])` : '';
   const docCond = docLiveAt('d', p, opts.asOf, opts.filter ?? NO_FILTER);
   const maxDocs = p.add(maxDocuments);
   const targetLive = rowLiveAt('e', 'entity', p, opts.asOf);
@@ -111,7 +112,7 @@ export async function coOccurringEntities(q: Queryable, ids: readonly string[], 
            SELECT DISTINCT m.entity_id, m.document_id, d.doc_date, d.updated_at
            FROM entity_mentions m
            JOIN documents d ON d.id = m.document_id
-           WHERE m.entity_id IN (${seedPh}) AND ${docCond}
+           WHERE m.entity_id = ANY(${seedPh}::text[]) AND ${docCond}
          ) x
        ) recent
        WHERE rn <= ${maxDocs}

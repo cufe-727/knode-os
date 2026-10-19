@@ -85,17 +85,19 @@ export interface EvidenceAtRow {
   tx_from: string;
 }
 
-/** Evidence rows that were live at `asOf` for the given targets. */
+/**
+ * Evidence rows that were live at `asOf` for the given targets. The ids go to
+ * the database as one array parameter: an `as_of` read folds every row it
+ * matched, often more than one statement can bind (65,535 parameters).
+ */
 export async function evidenceAsOf(q: Queryable, kind: string, ids: string[], asOf: string): Promise<EvidenceAtRow[]> {
   if (ids.length === 0) return [];
-  const p = new Params([kind, asOf]);
-  const ph = ids.map((id) => p.add(id)).join(',');
   return q.query<EvidenceAtRow>(
     `SELECT kind, target_id, scope_id, segment_id, weight, extractor, attrs, tx_from
      FROM evidence
-     WHERE kind = $1 AND target_id IN (${ph})
+     WHERE kind = $1 AND target_id = ANY($3::text[])
        AND tx_from <= $2::timestamptz AND (tx_to IS NULL OR tx_to > $2::timestamptz)`,
-    p.list,
+    [kind, asOf, ids],
   );
 }
 
@@ -252,11 +254,9 @@ export async function entitiesAsOf(q: Queryable, ids: string[], asOf: string): P
   if (ids.length === 0) return [];
   const rows = await evidenceAsOf(q, 'entity', ids, asOf);
   const grouped = groupBy(rows, (r) => r.target_id);
-  const p = new Params();
-  const ph = ids.map((id) => p.add(id)).join(',');
   const current = await q.query<{ id: string; name: string; type: string; description: string; aliases: string[]; wiki_path: string | null; mention_count: number }>(
-    `SELECT id, name, type, description, aliases, wiki_path, mention_count FROM entities WHERE id IN (${ph})`,
-    p.list,
+    `SELECT id, name, type, description, aliases, wiki_path, mention_count FROM entities WHERE id = ANY($1::text[])`,
+    [ids],
   );
   const byId = new Map(current.map((c) => [c.id, c]));
   const out: EntityAsOf[] = [];
@@ -271,11 +271,10 @@ export async function entitiesAsOf(q: Queryable, ids: string[], asOf: string): P
 /** Relations touching `entityIds` that were live at `asOf`, recomputed from evidence. */
 export async function relationsAsOf(q: Queryable, entityIds: string[], asOf: string): Promise<RelationAsOf[]> {
   if (entityIds.length === 0) return [];
-  const p = new Params();
-  const ph = entityIds.map((id) => p.add(id)).join(',');
+  // past the seeds a graph search's frontier holds every neighbour it reached: one array parameter
   const candidates = await q.query<{ id: string; source_id: string; target_id: string; type: string }>(
-    `SELECT id, source_id, target_id, type FROM relations WHERE source_id IN (${ph}) OR target_id IN (${ph})`,
-    p.list,
+    `SELECT id, source_id, target_id, type FROM relations WHERE source_id = ANY($1::text[]) OR target_id = ANY($1::text[])`,
+    [entityIds],
   );
   if (candidates.length === 0) return [];
   const rows = await evidenceAsOf(q, 'relation', candidates.map((c) => c.id), asOf);
@@ -291,11 +290,9 @@ export async function relationsAsOf(q: Queryable, entityIds: string[], asOf: str
 /** Claims about `subjectIds` that were live at `asOf`, recomputed from evidence. */
 export async function claimsAsOf(q: Queryable, subjectIds: string[], asOf: string): Promise<ClaimAsOf[]> {
   if (subjectIds.length === 0) return [];
-  const p = new Params();
-  const ph = subjectIds.map((id) => p.add(id)).join(',');
   const candidates = await q.query<{ id: string; subject_id: string; statement: string }>(
-    `SELECT id, subject_id, statement FROM claims WHERE subject_id IN (${ph})`,
-    p.list,
+    `SELECT id, subject_id, statement FROM claims WHERE subject_id = ANY($1::text[])`,
+    [subjectIds],
   );
   if (candidates.length === 0) return [];
   const rows = await evidenceAsOf(q, 'claim', candidates.map((c) => c.id), asOf);
