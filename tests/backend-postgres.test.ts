@@ -346,12 +346,13 @@ describe.skipIf(!ready)('postgres backend', () => {
       );
 
       const judged: number[] = [];
+      // the audit's judge calls go through complete(), whose reply is read as JSON (src/work/judge.ts)
       const llm = {
         enabled: true,
         label: 'stub',
-        completeJson: async (messages: { role: string; content: string }[]) => {
+        complete: async (messages: { role: string; content: string }[]) => {
           judged.push([...(messages.at(-1)?.content ?? '').matchAll(/^Pair \d+ — /gm)].length);
-          return { verdicts: [] };
+          return JSON.stringify({ verdicts: [] });
         },
       } as unknown as LlmClient;
       const config = defaultConfig();

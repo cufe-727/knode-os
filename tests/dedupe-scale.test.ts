@@ -55,16 +55,19 @@ function everyPair(ids: string[], key: (a: string, b: string) => string): { id: 
 
 const pairLabel = (a: string, b: string) => [a, b].sort().join(' | ');
 
-/** A judge that records the pairs it was shown (`calls`: call by call) and answers nothing, or `relation` for every pair. */
+/**
+ * A judge that records the pairs it was shown (`calls`: call by call) and answers nothing, or `relation` for every
+ * pair. The audit sends its calls through a JudgeRunner (src/work/judge.ts), which reads complete()'s reply as JSON.
+ */
 function recordingJudge(shown: string[], opts: { relation?: ClaimRelation; calls?: string[][] } = {}): LlmClient {
-  const completeJson = async (messages: { role: string; content: string }[]) => {
+  const complete = async (messages: { role: string; content: string }[]) => {
     const user = messages.find((m) => m.role === 'user')?.content ?? '';
     const pairs = [...user.matchAll(/Pair \d+ — subject: [^\n]*\nA: "([^"]*)"[\s\S]*?\nB: "([^"]*)"/g)].map((m) => pairLabel(m[1], m[2]));
     shown.push(...pairs);
     opts.calls?.push(pairs);
-    return { verdicts: opts.relation ? pairs.map((_, i) => ({ pair: i + 1, relation: opts.relation, confidence: 0.3, reason: '测试' })) : [] };
+    return JSON.stringify({ verdicts: opts.relation ? pairs.map((_, i) => ({ pair: i + 1, relation: opts.relation, confidence: 0.3, reason: '测试' })) : [] });
   };
-  return { enabled: true, label: 'stub', provider: 'openai', model: 'stub', completeJson } as unknown as LlmClient;
+  return { enabled: true, label: 'stub', provider: 'openai', model: 'stub', complete } as unknown as LlmClient;
 }
 
 describe('the duplicate-claim audit at scale', () => {
