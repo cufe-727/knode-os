@@ -987,6 +987,12 @@ export interface MigrationResult {
 /**
  * Bring the database to the current schema version. A database created before
  * versioning (no `schema_version` key but a `documents` table) is treated as v1.
+ *
+ * Only the schema the store creates its tables in counts, `current_schema()`:
+ * `public` on PGlite, the workspace's own schema on Postgres. On Postgres
+ * `public` sits on every workspace's search_path (pgvector lives there), so a
+ * `documents` table in it belongs to no workspace and must not make a fresh
+ * schema look like v1.
  */
 export async function migrate(
   q: Queryable,
@@ -996,7 +1002,7 @@ export async function migrate(
   let current = row?.value?.v;
   if (current === undefined) {
     const [t] = await q.query<{ n: number }>(
-      `SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'documents'`,
+      `SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'documents'`,
     );
     current = t?.n ? 1 : 0;
   }
