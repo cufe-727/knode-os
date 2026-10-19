@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Context, Hono, MiddlewareHandler } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
+import { contentSecurityPolicy } from '../server/csp.js';
 import { ClientInfo, clientInfo, PUBLIC_PREFIX } from '../server/public-guard.js';
 import { accountAllows, accountMayUseGateway, AccountUpdate, MIN_PASSWORD_LENGTH, normalizeUsername, PublicAccount, Role } from './accounts.js';
 import { API_GROUP_NAMES, API_GROUPS, apiGroupOf, ApiGroup } from './apis.js';
@@ -59,11 +60,12 @@ function forbidden(group: ApiGroup, account: PublicAccount, client: ClientInfo):
 
 const isUnder = (p: string, prefix: string) => p === prefix || p.startsWith(`${prefix}/`);
 
-/** No framing (clickjacking), no referrer leaving the origin, no type sniffing. */
+/** No framing (clickjacking), no referrer leaving the origin, no type sniffing, and a page that runs only our own scripts (src/server/csp.ts). */
 function hardenUi(c: Context): void {
   c.header('x-frame-options', 'DENY');
   c.header('referrer-policy', 'same-origin');
   c.header('x-content-type-options', 'nosniff');
+  c.header('content-security-policy', contentSecurityPolicy(c.res.headers.get('content-type')));
 }
 
 export function authMiddleware(auth: AuthService, opts: { mcpPath?: string } = {}): MiddlewareHandler {

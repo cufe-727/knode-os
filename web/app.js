@@ -25,40 +25,9 @@ const toast = (msg, ms = 2600) => {
   t._timer = setTimeout(() => t.classList.remove('show'), ms);
 };
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-let markedConfigured = false;
 
-function configureMarkdown() {
-  if (markedConfigured || !window.marked?.use) return;
-  window.marked.use({
-    extensions: [{
-      name: 'wikilink',
-      level: 'inline',
-      start(src) {
-        const at = src.search(/!?\[\[/);
-        return at < 0 ? undefined : at;
-      },
-      tokenizer(src) {
-        const match = /^(!)?\[\[([^\]\n]+)\]\]/.exec(src);
-        if (!match) return undefined;
-        const fields = match[2].split('|');
-        const target = fields.shift().trim();
-        if (!target) return undefined;
-        const note = target.split('#', 1)[0].replace(/\\/g, '/').replace(/\.(md|markdown)$/i, '');
-        const label = fields.join('|').trim() || note.split('/').pop() || target.replace(/^#/, '');
-        return { type: 'wikilink', raw: match[0], target, label, embed: Boolean(match[1]) };
-      },
-      renderer(token) {
-        return `<a class="wikilink" href="#" data-wikilink="${esc(token.target)}">${esc(token.label)}</a>`;
-      },
-    }],
-  });
-  markedConfigured = true;
-}
-
-const renderMd = (s) => {
-  configureMarkdown();
-  return window.marked?.parse ? window.marked.parse(s) : `<pre>${esc(s)}</pre>`;
-};
+/** Markdown someone else wrote, as HTML that carries formatting only: no raw HTML, no script links (web/markdown.js). */
+const renderMd = (s) => (window.knodeMarkdown ? window.knodeMarkdown.render(s) : `<pre>${esc(s)}</pre>`);
 
 /* --------------------------- auth & workspaces ------------------------- */
 
@@ -2051,7 +2020,7 @@ async function loadSuggestions() {
       const div = document.createElement('div');
       div.className = `suggestion ${s.status}`;
       const evidence = (s.evidence ?? []).map((e) => `<div>${esc(e)}</div>`).join('');
-      div.innerHTML = `<span class="skind ${s.kind}">${s.kind}</span> <span class="hint mono">${s.status} · ${new Date(s.created_at).toLocaleDateString()}</span>
+      div.innerHTML = `<span class="skind ${esc(s.kind)}">${esc(s.kind)}</span> <span class="hint mono">${esc(s.status)} · ${new Date(s.created_at).toLocaleDateString()}</span>
         <div class="stitle">${esc(s.title)}</div>
         <div class="sbody markdown">${renderMd(s.body)}</div>
         ${evidence ? `<div class="evidence">${evidence}</div>` : ''}
@@ -2107,13 +2076,13 @@ async function loadResearchJobs() {
     for (const j of jobs) {
       const div = document.createElement('div');
       div.className = 'job';
-      const what = `${j.kind} · ${esc(j.target ?? j.query ?? '')}`;
+      const what = `${esc(j.kind)} · ${esc(j.target ?? j.query ?? '')}`;
       const when = new Date(j.finishedAt ?? j.startedAt ?? j.createdAt).toLocaleString();
       const actions = [];
-      if (j.status === 'queued' || j.status === 'running') actions.push(`<button data-cancel="${j.id}">cancel</button>`);
-      if (j.status === 'failed' || j.status === 'cancelled') actions.push(`<button data-retry="${j.id}">retry</button>`);
-      actions.push(`<button data-log="${j.id}">log</button>`);
-      div.innerHTML = `<span class="jstatus ${j.status}">${j.status}</span>
+      if (j.status === 'queued' || j.status === 'running') actions.push(`<button data-cancel="${esc(j.id)}">cancel</button>`);
+      if (j.status === 'failed' || j.status === 'cancelled') actions.push(`<button data-retry="${esc(j.id)}">retry</button>`);
+      actions.push(`<button data-log="${esc(j.id)}">log</button>`);
+      div.innerHTML = `<span class="jstatus ${esc(j.status)}">${esc(j.status)}</span>
         <span>${what}${j.outputPath ? ` → ${pageLink(j.outputPath)}` : ''} <span class="hint mono">${when}${j.turns ? ` · ${j.turns} turns` : ''}${j.agent ? ` · ${esc(j.agent)}` : ''}</span></span>
         <span class="jactions">${actions.join('')}</span>
         ${j.error ? `<div class="jerr">${esc(j.error)}</div>` : ''}`;

@@ -10,6 +10,7 @@ import { mountRemoteApi } from '../remote/api.js';
 import { accountMayOpenTeam } from '../auth/accounts.js';
 import { AuthEnv, authMiddleware, existingTeams, mountAuthRoutes, mountGateways } from '../auth/http.js';
 import { AuthService } from '../auth/service.js';
+import { contentSecurityPolicy } from './csp.js';
 import { publicGuard } from './public-guard.js';
 import { AppContext, judgeLlmClient } from '../context.js';
 import {
@@ -2293,7 +2294,14 @@ export function createApp(
       '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon',
     };
     const ct = types[path.extname(abs)] ?? 'application/octet-stream';
-    return c.body(fs.readFileSync(abs), 200, { 'content-type': ct });
+    // with sign-in off nothing else hardens the UI, so its files carry the policy themselves
+    return c.body(fs.readFileSync(abs), 200, {
+      'content-type': ct,
+      'content-security-policy': contentSecurityPolicy(ct),
+      'x-content-type-options': 'nosniff',
+      'x-frame-options': 'DENY',
+      'referrer-policy': 'same-origin',
+    });
   });
 
   return app;

@@ -11,6 +11,7 @@ import { AuthService } from '../src/auth/service.js';
 import { SessionStore } from '../src/auth/sessions.js';
 import { AppContext, createContext } from '../src/context.js';
 import { createApp } from '../src/server/app.js';
+import { API_CSP, UI_CSP } from '../src/server/csp.js';
 import { clientInfo } from '../src/server/public-guard.js';
 import { assertListeners } from '../src/server/serve.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
@@ -379,9 +380,13 @@ describe('sign-in in front of serve', () => {
     ]);
   });
 
-  it('serves the UI to anyone — it signs in by itself — with framing refused', async () => {
+  it('serves the UI to anyone — it signs in by itself — with framing refused and only its own scripts', async () => {
     const res = await req('/', { remote: true });
     expect(res.status).toBe(200);
     expect(res.headers.get('x-frame-options')).toBe('DENY');
+    expect(res.headers.get('content-security-policy')).toBe(UI_CSP);
+    // API answers are data: a policy that lets nothing in them run
+    expect((await req('/api/auth/state', { remote: true })).headers.get('content-security-policy')).toBe(API_CSP);
+    expect((await req('/api/stats', { token: await login('bob'), headers: ws() })).headers.get('content-security-policy')).toBe(API_CSP);
   });
 });
