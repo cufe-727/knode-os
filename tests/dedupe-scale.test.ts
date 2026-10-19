@@ -17,7 +17,8 @@ import { sourcesOf } from '../src/store/claims.js';
  * statement can bind (Postgres and PGlite both stop at 65,535 parameters), so
  * id lists go to the database as one array parameter. It also brings up more
  * pairs than one night can judge, so the claim audit judges at most
- * review.claimMergeMaxJudgedPerRun of them, the most promising first.
+ * review.claimMergeMaxJudgedPerRun of them, the most promising first; with real
+ * vectors, a pair that only shares a number needs a cosine of 0.7 as well.
  */
 
 const MAX_PARAMS = 65_535;
@@ -185,6 +186,9 @@ describe('the claim audit\'s per-run judge limit', () => {
   // all share 20%: pairs only the judge can settle, and tied on every signal
   const statement = (i: number) => `第${i}项业务收入同比增长20%`;
   const limited = (max: number) => ({ ...ctx.config, review: { ...ctx.config.review, claimMergeMaxJudgedPerRun: max } });
+  const realVectors = () => ({ ...ctx.config, embedding: { ...ctx.config.embedding, provider: 'openai' as const } });
+  /** `v` along axis `k` and the rest along `rest`: cosine `v` with the unit vector along `k`. */
+  const vector = (k: number, v = 1, rest = -1) => Array.from({ length: ctx.store.embeddingDim }, (_, i) => (i === k ? v : i === rest ? Math.sqrt(1 - v * v) : 0));
 
   beforeAll(async () => {
     initDataDir(dataDir);
@@ -242,39 +246,82 @@ describe('the claim audit\'s per-run judge limit', () => {
     const same = ['丁公司计划扩大海外产能', '丁公司打算扩充在海外的生产能力'];
     const close = ['丁公司今年将新开十家门店', '丁公司年内准备开设十家新店'];
     const negated = ['丁公司会提高分红比例', '丁公司不会提高分红比例'];
-    const numbers = ['丁公司毛利率为30%，净利率为12%', '丁公司销售费用率30%，研发费用率12%', '丁公司海外收入占比30%'];
+    const numbers = ['丁公司毛利率为30%，净利率为12%', '丁公司销售费用率30%，研发费用率12%', '丁公司海外收入占比30%', '丁公司员工持股比例12%'];
     write(dataDir, 'raw/docs/ding.md', claimsDoc('丁公司', [...same, ...negated, numbers[0], numbers[1]]));
     await sync(ctx, { llmGraph: false });
     // newer, so the newest-claim rule would take these first if similarity and shared numbers did not come before it
-    write(dataDir, 'raw/docs/ding-later.md', claimsDoc('丁公司', [...close, numbers[2]]));
+    write(dataDir, 'raw/docs/ding-later.md', claimsDoc('丁公司', [...close, numbers[2], numbers[3]]));
     await sync(ctx, { llmGraph: false });
     const focus = (await store.query<{ id: string }>(`SELECT id FROM claims WHERE subject_id = '丁公司' AND tx_to IS NULL`)).map((r) => r.id);
-    expect(focus).toHaveLength(9);
+    expect(focus).toHaveLength(10);
 
-    // cosine 1 for the first and the negated pair, 0.9 for the second; the claims that share numbers point elsewhere
-    const dim = store.embeddingDim;
-    const axis = (k: number, v = 1) => Array.from({ length: dim }, (_, i) => (i === k ? v : 0));
+    // cosine 1 for the first and the negated pair, 0.9 for the second. Of the claims that share a number, the first has
+    // cosine 0.82 with the fourth and 0.8 with the second and third; the second has less than 0.7 with the third and fourth
     const vectors = new Map<string, number[]>([
-      [same[0], axis(0)], [same[1], axis(0)],
-      [close[0], axis(1)], [close[1], axis(1, 0.9).map((v, i) => (i === 2 ? Math.sqrt(1 - 0.81) : v))],
-      [negated[0], axis(3)], [negated[1], axis(3)],
-      ...numbers.map((s, k): [string, number[]] => [s, axis(4 + k)]),
+      [same[0], vector(0)], [same[1], vector(0)],
+      [close[0], vector(1)], [close[1], vector(1, 0.9, 2)],
+      [negated[0], vector(3)], [negated[1], vector(3)],
+      [numbers[0], vector(4)], [numbers[1], vector(4, 0.8, 5)], [numbers[2], vector(4, 0.8, 6)], [numbers[3], vector(4, 0.82, 7)],
     ]);
-    const embedder: EmbeddingProvider = { model: 'test-vectors', dimensions: dim, embed: async (texts) => texts.map((t) => vectors.get(t.slice(t.indexOf('：') + 1))!) };
-    const config = { ...ctx.config, embedding: { ...ctx.config.embedding, provider: 'openai' as const } };
+    const embedder: EmbeddingProvider = { model: 'test-vectors', dimensions: store.embeddingDim, embed: async (texts) => texts.map((t) => vectors.get(t.slice(t.indexOf('：') + 1))!) };
+    const config = realVectors();
 
     const shown: string[] = [];
     const all = await auditDuplicateClaims({ store, embedder, config, llm: recordingJudge(shown) }, { focus });
-    expect(all).toMatchObject({ embedded: 9, candidates: 6, deferred: 0 });
-    // alike in meaning before sharing a number; free to merge before guarded (the negation); closer, then more numbers in common
-    expect(shown.slice(0, 4)).toEqual([pairLabel(same[0], same[1]), pairLabel(close[0], close[1]), pairLabel(negated[0], negated[1]), pairLabel(numbers[0], numbers[1])]);
-    expect(new Set(shown.slice(4))).toEqual(new Set([pairLabel(numbers[0], numbers[2]), pairLabel(numbers[1], numbers[2])]));
+    expect(all).toMatchObject({ embedded: 10, candidates: 6, deferred: 0 });
+    // alike in meaning before sharing a number; free to merge before guarded (the negation); closer; among the pairs that
+    // only share a number, the higher cosine, then more numbers in common before the newer claim. The second claim's
+    // pairs with the third and fourth share a number but stay under cosine 0.7, so they never come up.
+    expect(shown).toEqual([
+      pairLabel(same[0], same[1]), pairLabel(close[0], close[1]), pairLabel(negated[0], negated[1]),
+      pairLabel(numbers[0], numbers[3]), pairLabel(numbers[0], numbers[1]), pairLabel(numbers[0], numbers[2]),
+    ]);
 
     // the stub remembered nothing, so a limited run starts from the same pairs
     const firstTwo: string[] = [];
     const limitedRun = await auditDuplicateClaims({ store, embedder, config: { ...config, review: { ...config.review, claimMergeMaxJudgedPerRun: 2 } }, llm: recordingJudge(firstTwo) }, { focus });
     expect(limitedRun).toMatchObject({ candidates: 6, deferred: 4 });
     expect(firstTwo).toEqual(shown.slice(0, 2));
+  });
+
+  it('brings up a pair that only shares a number once both claims have vectors', async () => {
+    const { store } = ctx;
+    const twins = ['戊公司2025年营收120亿元', '戊公司全年收入达到120亿元'];
+    write(dataDir, 'raw/docs/wu.md', claimsDoc('戊公司', twins));
+    await sync(ctx, { llmGraph: false });
+    const focus = (await store.query<{ id: string }>(`SELECT id FROM claims WHERE subject_id = '戊公司' AND tx_to IS NULL`)).map((r) => r.id);
+    expect(focus).toHaveLength(2);
+    const run = async (embedder: EmbeddingProvider, config: AppContext['config']) => {
+      const shown: string[] = [];
+      const lines: string[] = [];
+      const stats = await auditDuplicateClaims({ store, embedder, config, llm: recordingJudge(shown) }, { focus, onProgress: (m) => lines.push(m) });
+      return { stats, shown, lines };
+    };
+
+    // without real vectors the shared figure is enough
+    const local = await run(ctx.embedder, ctx.config);
+    expect(local.stats).toMatchObject({ candidates: 1 });
+    expect(local.shown).toEqual([pairLabel(twins[0], twins[1])]);
+
+    // with them it needs cosine 0.7 as well (these have 0.8), so while the embedding pool is out the pair waits
+    let out = true;
+    const embedder: EmbeddingProvider = {
+      model: 'test-vectors',
+      dimensions: store.embeddingDim,
+      embed: async (texts) => {
+        if (out) throw new Error('daily quota reached');
+        return texts.map((t) => (t.includes('营收') ? vector(8) : vector(8, 0.8, 9)));
+      },
+    };
+    const waiting = await run(embedder, realVectors());
+    expect(waiting.lines).toContain('claims: embedding batch failed: daily quota reached');
+    expect(waiting.stats).toMatchObject({ embedded: 0, candidates: 0 });
+    expect(waiting.shown).toEqual([]);
+
+    out = false;
+    const later = await run(embedder, realVectors());
+    expect(later.stats).toMatchObject({ embedded: 2, candidates: 1 });
+    expect(later.shown).toEqual([pairLabel(twins[0], twins[1])]);
   });
 });
 
