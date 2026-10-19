@@ -1226,7 +1226,7 @@ function nodeMenu(node) {
     items.push('-');
     items.push({ label: 'Upload files here…', run: () => { pickDir(node.path); pickUpload('files', node.path); } });
     items.push({ label: 'Upload folder here…', run: () => { pickDir(node.path); pickUpload('folder', node.path); } });
-    if (/^raw\/docs(\/|$)/.test(node.path)) {
+    if (/^raw\/docs(\/|$)/.test(node.path) && mayImportFolders()) {
       items.push('-');
       items.push({ label: 'Import folder from this Mac here…', run: () => { pickDir(node.path); importLocalFolder('copy', node.path); } });
       items.push({ label: 'Link folder from this Mac here…', run: () => { pickDir(node.path); importLocalFolder('link', node.path); } });
@@ -1597,13 +1597,18 @@ $('#btn-add').addEventListener('click', (ev) => {
     '-',
     { label: 'Upload files…', run: () => pickUpload('files') },
     { label: 'Upload folder…', run: () => pickUpload('folder') },
-    '-',
-    { label: 'Import folder from this Mac…', run: () => importLocalFolder('copy', dir) },
-    { label: 'Link folder from this Mac (keep in sync)…', run: () => importLocalFolder('link', dir) },
+    ...(mayImportFolders() ? [
+      '-',
+      { label: 'Import folder from this Mac…', run: () => importLocalFolder('copy', dir) },
+      { label: 'Link folder from this Mac (keep in sync)…', run: () => importLocalFolder('link', dir) },
+    ] : []),
   ]);
 });
 
 /* ------------------------ folders from this Mac -------------------------- */
+
+/** Importing reads this Mac's own disk, so it is an administrator's call (the server puts it under `settings`). */
+const mayImportFolders = () => authDisabled || serverAuth?.groups?.settings === true;
 
 const fmtCount = (n, noun) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 

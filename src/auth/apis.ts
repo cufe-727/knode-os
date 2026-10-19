@@ -13,14 +13,14 @@
  */
 
 export const API_GROUPS = {
-  files: 'browse, read, edit, upload and move files; linked folders',
+  files: 'browse, read, edit, upload and move files; sync and unlink linked folders',
   search: 'search, graph, entities, documents, claims, stats, lineage and history',
   ask: 'Ask, chat and context packs',
   knowledge: 'wiki, research, dream, suggestions, merges and reviews',
   ingest: 'sync, ingest, forget, purge, rebuild and labeling status',
   traces: 'agent traces',
   datasources: 'configured live datasources and their read-only queries',
-  settings: 'workspace settings — models, connections, agents, profiles — and clearing a workspace',
+  settings: 'workspace settings — models, connections, agents, profiles — clearing a workspace, and importing or linking a folder from this machine',
   gateway: 'local services published through /gw/<id>',
 } as const;
 
@@ -52,6 +52,9 @@ const RULES: Rule[] = [
   // starting the processing spends the machine's model quota: an administrator's call
   { prefix: '/api/labeling/start', group: 'settings' },
   { prefix: '/api/labeling/stop', group: 'settings' },
+  // so is reading a folder off this machine's disk, which holds far more than this workspace
+  { prefix: '/api/folders/import', group: 'settings' },
+  { prefix: '/api/folders/preview', group: 'settings' },
 
   { prefix: '/api/config', group: 'settings' },
   { prefix: '/api/agents', group: 'settings' },

@@ -52,7 +52,7 @@ function credentialOf(c: Context, cookieName: string): { token: string; via: 'co
 }
 
 function forbidden(group: ApiGroup, account: PublicAccount, client: ClientInfo): string {
-  if (account.role !== 'admin' && group === 'settings') return 'only an administrator may change settings, users or gateways, or start and stop processing';
+  if (account.role !== 'admin' && group === 'settings') return 'only an administrator may change settings, users or gateways, import folders from this machine, or start and stop processing';
   return client.local
     ? `your account may not use ${group}`
     : `your account may not use ${group} from outside this machine — an administrator can allow it (knode-os user set ${account.username} --remote-apis …)`;

@@ -102,6 +102,11 @@ describe('API groups', () => {
     expect(apiGroupOf('PUT', '/api/research/profiles/deep')).toBe('settings');
     expect(apiGroupOf('POST', '/api/research/jobs')).toBe('knowledge');
     expect(apiGroupOf('GET', '/api/labeling/status')).toBe('ingest');
+    // reading this machine's disk is an administrator's call; following an existing link is not
+    expect(apiGroupOf('POST', '/api/folders/import')).toBe('settings');
+    expect(apiGroupOf('POST', '/api/folders/preview')).toBe('settings');
+    expect(apiGroupOf('POST', '/api/folders/sync')).toBe('files');
+    expect(apiGroupOf('GET', '/api/folders')).toBe('files');
     expect(apiGroupOf('GET', '/api/auth/users')).toBe('settings');
     expect(apiGroupOf('GET', '/api/auth/me')).toBeNull();
     expect(apiGroupOf('GET', '/gw/svc/x')).toBe('gateway');
@@ -371,6 +376,8 @@ describe('sign-in in front of serve', () => {
       'POST /api/config/embedding-test',
       'POST /api/config/models',
       'POST /api/config/test',
+      'POST /api/folders/import',
+      'POST /api/folders/preview',
       'POST /api/labeling/start',
       'POST /api/labeling/stop',
       'PUT /api/agents/:name',

@@ -115,7 +115,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
           headers: { 'x-knode-user': scope.user, 'x-knode-workspace-kind': scope.kind, 'x-knode-workspace-id': scope.id, 'x-knode-workspace-name': scope.name },
         }
         : null;
-      const started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp });
+      const started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp, rootDataDir: ctx.dataDir });
       services.set(workspaceCtx.dataDir, {
         mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders,
         labeling: started.labeling, localWorkers: started.localWorkers, processing: started.processing,
@@ -268,7 +268,7 @@ interface StartedServices {
   processing: LabelingProcessing;
 }
 
-function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null } = {}): StartedServices {
+function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null; rootDataDir?: string } = {}): StartedServices {
   let disposed = false;
   // vectors are computed after a document is indexed, never while it is: an
   // import or sync does not wait on the rate-limited pool, and a spent daily
@@ -371,7 +371,8 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
 
   // linked folders: mirror what changed while knode-os was down, then follow
   // their sources with a watcher of their own (src/ingest/folders.ts)
-  const folders = new LinkedFolders(ctx, { log, track });
+  // a link never follows into the data root, whatever the config says (src/ingest/folders.ts)
+  const folders = new LinkedFolders(ctx, { log, track, policy: { protectedRoots: opts.rootDataDir ? [opts.rootDataDir] : [] } });
   folders.start();
 
   // nightly dream + the tier-2 pass

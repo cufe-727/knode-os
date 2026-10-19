@@ -1134,6 +1134,9 @@ export function createApp(
 
   // A folder elsewhere on this machine, mirrored under raw/docs with its tree
   // intact: once (copy) or kept in sync (link). See src/ingest/folders.ts.
+  // Importing is an administrator's call (src/auth/apis.ts), and never reaches
+  // into the data root: other accounts' workspaces, the teams, the tokens.
+  const importPolicy = { protectedRoots: [rootCtx.dataDir] };
 
   app.get('/api/folders', (c) => {
     const ctx = requestCtx(c);
@@ -1146,7 +1149,7 @@ export function createApp(
     const ctx = requestCtx(c);
     try {
       const body = (await c.req.json().catch(() => ({}))) as { source?: string; dest?: string };
-      const source = resolveImportSource(ctx.dataDir, String(body.source ?? ''));
+      const source = resolveImportSource(ctx.dataDir, String(body.source ?? ''), importPolicy);
       const dest = importDestFor(source, body.dest);
       const plan = planFolderImport(source);
       const owner = linkOwning(linkedFolders(ctx.config), dest);
@@ -1187,7 +1190,7 @@ export function createApp(
               ? `import ${done.dest}: indexing failed: ${done.error}`
               : `import ${done.dest}: ${done.sync!.indexed} indexed, ${done.sync!.unchanged} unchanged, ${done.sync!.errors} errors, ${done.sync!.chunks} chunks`),
         };
-      const opts = { dest: body.dest, replace: Boolean(body.replace), onProgress: log, background };
+      const opts = { dest: body.dest, replace: Boolean(body.replace), policy: importPolicy, onProgress: log, background };
       const folders = services?.folders ?? null;
       const result = mode === 'link' && folders
         ? await folders.add(String(body.source ?? ''), opts)
@@ -1207,7 +1210,7 @@ export function createApp(
       const body = (await c.req.json().catch(() => ({}))) as { dest?: string };
       const dest = typeof body.dest === 'string' && body.dest.trim() ? cleanRelPath(body.dest) : undefined;
       const folders = servicesFor(ctx)?.folders ?? null;
-      const results = folders ? await folders.refresh(dest) : await refreshLinkedFolders(ctx, dest, { onProgress: log });
+      const results = folders ? await folders.refresh(dest) : await refreshLinkedFolders(ctx, dest, { onProgress: log, policy: importPolicy });
       return c.json({ ok: true, results: results.map((r) => ({ ...r, copied: r.copied.length, removed: r.removed.length })) });
     } catch (e) {
       return c.json(err(e), 400);

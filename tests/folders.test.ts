@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { AuthService } from '../src/auth/service.js';
 import { loadConfig } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
@@ -525,5 +526,99 @@ describe('what the folder machinery syncs by itself', () => {
     later(11_000);
     expect(owned(key)).toBe(false);
     vi.useRealTimers();
+  });
+});
+
+describe('who may import, and from where', () => {
+  const root = path.join(tmp, 'guarded-root');
+  const source = path.join(tmp, 'guarded-source');
+  const policy = { protectedRoots: [root] };
+  let rootCtx: AppContext;
+  let registry: WorkspaceContextRegistry;
+  let auth: AuthService;
+  let app: ReturnType<typeof createApp>;
+  let admin = '';
+  let member = '';
+
+  const ws = { 'x-knode-workspace-kind': 'personal', 'x-knode-workspace-id': 'default', 'x-knode-workspace-name': 'Default' };
+  const post = (url: string, token: string, body: unknown) => app.request(`http://127.0.0.1:12000${url}`, {
+    method: 'POST',
+    headers: { ...ws, authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  beforeAll(async () => {
+    makeExport(source);
+    rootCtx = await createContext(root);
+    registry = new WorkspaceContextRegistry(root, { templateConfig: rootCtx.config });
+    auth = new AuthService(root, { cookieName: 'knode_session_folders' });
+    app = createApp(rootCtx, () => {}, registry, { auth });
+    const accounts = [
+      await auth.accounts.create({ username: 'admin', password: 'correct horse battery', role: 'admin' }),
+      await auth.accounts.create({ username: 'bob', password: 'correct horse battery' }),
+    ];
+    [admin, member] = accounts.map((a) => auth.issue(a, { kind: 'app', label: 'vitest' }).token);
+    for (const token of [admin, member]) {
+      await app.request('http://127.0.0.1:12000/api/workspaces', { headers: { authorization: `Bearer ${token}` } });
+    }
+    write(path.join(root, 'users', 'admin', 'workspaces', 'default'), 'raw/docs/private-notes.md', '# admin only\n');
+  });
+
+  afterAll(async () => {
+    auth.close();
+    await registry.closeAll();
+    await rootCtx.store.close();
+  });
+
+  it('keeps a member from reading this machine\'s folders at all', async () => {
+    for (const url of ['/api/folders/preview', '/api/folders/import']) {
+      const res = await post(url, member, { source, mode: 'copy' });
+      expect(res.status, url).toBe(403);
+      expect((await res.json()).group).toBe('settings');
+    }
+    expect(fs.existsSync(path.join(root, 'users', 'bob', 'workspaces', 'default', 'raw', 'docs', 'guarded-source'))).toBe(false);
+    // what the member keeps: the links already in their workspace
+    const links = await app.request('http://127.0.0.1:12000/api/folders', { headers: { ...ws, authorization: `Bearer ${member}` } });
+    expect(links.status).toBe(200);
+  });
+
+  it('lets an administrator import from the machine, but never from inside the data root', async () => {
+    expect((await post('/api/folders/preview', admin, { source })).status).toBe(200);
+    // another account's workspace, the teams, the accounts: all inside the data root
+    for (const target of [path.join(root, 'users', 'admin'), path.join(root, 'users'), path.join(root, '.knode'), root]) {
+      const res = await post('/api/folders/preview', admin, { source: target });
+      expect(res.status, target).toBe(400);
+      expect((await res.json()).error, target).toMatch(/data root|this workspace/);
+      expect((await post('/api/folders/import', admin, { source: target, mode: 'link', dest: 'stolen' })).status, target).toBe(400);
+    }
+    expect(fs.existsSync(path.join(root, 'users', 'admin', 'workspaces', 'default', 'raw', 'docs', 'stolen'))).toBe(false);
+  });
+
+  it('refuses a source that sits inside or contains a protected root, and the filesystem root', () => {
+    const data = path.join(root, 'users', 'admin', 'workspaces', 'default');
+    expect(resolveImportSource(data, source, policy)).toBe(source);
+    expect(() => resolveImportSource(data, path.join(root, 'users', 'bob'), policy)).toThrow(/inside the knode-os data root/);
+    expect(() => resolveImportSource(path.join(tmp, 'plan-data'), tmp, { protectedRoots: [root] })).toThrow(/contains/);
+    expect(() => resolveImportSource(data, '/', policy)).toThrow(/contains/);
+  });
+
+  it('does not follow an old link into the data root', async () => {
+    // a link written before the rule (or by hand) is refused when it is refreshed
+    const ctx = await registry.get({ user: 'admin', kind: 'personal', id: 'default', name: 'Default', slug: 'default', relativeDir: 'users/admin/workspaces/default' });
+    const bobDocs = path.join(root, 'users', 'bob', 'workspaces', 'default', 'raw', 'docs');
+    write(bobDocs, 'secret.md', '# bob only\n');
+    ctx.config.ingest.linkedFolders = [{ source: bobDocs, dest: 'raw/docs/bob', createdAt: new Date().toISOString() }];
+    const res = await post('/api/folders/sync', admin, { dest: 'raw/docs/bob' });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/data root/);
+    expect(fs.existsSync(path.join(ctx.dataDir, 'raw', 'docs', 'bob', 'secret.md'))).toBe(false);
+
+    const service = new LinkedFolders(ctx, { reconcileMinutes: 0, policy });
+    await expect(service.refresh('raw/docs/bob')).rejects.toThrow(/data root/);
+    expect(service.status()[0].lastError).toMatch(/data root/);
+    await service.apply(linkedFolders(ctx.config)[0], [path.join(bobDocs, 'secret.md')]);
+    expect(fs.existsSync(path.join(ctx.dataDir, 'raw', 'docs', 'bob', 'secret.md'))).toBe(false);
+    await service.stop();
+    ctx.config.ingest.linkedFolders = [];
   });
 });

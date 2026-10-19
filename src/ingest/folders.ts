@@ -77,6 +77,8 @@ export interface ImportFolderOptions {
   mode: ImportMode;
   /** Allow a destination that already exists: it becomes a mirror of the source (files it alone has are removed). */
   replace?: boolean;
+  /** Folders the source must stay out of (resolveImportSource). */
+  policy?: ImportSourcePolicy;
   llmGraph?: boolean;
   onProgress?: (msg: string) => void;
   /**
@@ -183,13 +185,48 @@ export function assertNotLinked(config: KnodeConfig, rel: string, what = 'write 
   if (inside.length) throw new Error(`${rel} contains the linked folder ${inside[0].dest} — unlink it first`);
 }
 
+/** Who may read what an import reads: folders it must stay out of, beyond the workspace itself. */
+export interface ImportSourcePolicy {
+  /**
+   * Folders a source may neither sit inside nor contain — under `serve`, the
+   * data root: every other account's workspaces, the teams, the accounts and
+   * tokens under `.knode/`.
+   */
+  protectedRoots?: string[];
+}
+
+/** `inner` is `outer` or below it (`/` contains everything — a plain prefix test would miss it). */
+function within(inner: string, outer: string): boolean {
+  const rel = path.relative(outer, inner);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/** The resolved path, or the path as given when it does not exist (yet). */
+function realOrSelf(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/** Throw when a source folder (already resolved) reaches into a protected root, either way round. */
+function assertOutsideProtected(real: string, shown: string, policy: ImportSourcePolicy): void {
+  for (const root of policy.protectedRoots ?? []) {
+    const guarded = realOrSelf(root);
+    if (within(real, guarded)) throw new Error(`${shown} is inside the knode-os data root — other workspaces, accounts and tokens live there; it cannot be imported`);
+    if (within(guarded, real)) throw new Error(`${shown} contains the knode-os data root — other workspaces, accounts and tokens live there; it cannot be imported`);
+  }
+}
+
 /**
  * The source folder as an absolute path, checked to be a real directory that
- * neither sits inside this workspace nor contains it. `~/` is expanded. The
- * path keeps the caller's spelling (symlinks intact); containment is checked
- * on resolved paths so a symlinked spelling cannot slip either way.
+ * neither sits inside this workspace nor contains it, nor a protected root
+ * (`policy`). `~/` is expanded. The path keeps the caller's spelling (symlinks
+ * intact); containment is checked on resolved paths so a symlinked spelling
+ * cannot slip either way.
  */
-export function resolveImportSource(dataDir: string, source: string): string {
+export function resolveImportSource(dataDir: string, source: string, policy: ImportSourcePolicy = {}): string {
   if (typeof source !== 'string' || !source.trim()) throw new Error('source folder required');
   let abs = source.trim();
   if (abs === '~' || abs.startsWith('~/')) abs = path.join(os.homedir(), abs.slice(1));
@@ -203,8 +240,9 @@ export function resolveImportSource(dataDir: string, source: string): string {
   }
   if (!fs.statSync(real).isDirectory()) throw new Error(`not a folder: ${abs}`);
   const data = fs.realpathSync(dataDir);
-  if (real === data || real.startsWith(data + path.sep)) throw new Error(`${abs} is inside this workspace already`);
-  if (data === real || data.startsWith(real + path.sep)) throw new Error(`${abs} contains this workspace — importing it would copy the workspace into itself`);
+  if (within(real, data)) throw new Error(`${abs} is inside this workspace already`);
+  if (within(data, real)) throw new Error(`${abs} contains this workspace — importing it would copy the workspace into itself`);
+  assertOutsideProtected(real, abs, policy);
   return abs;
 }
 
@@ -401,7 +439,7 @@ function persistLinks(ctx: FolderContext, links: LinkedFolder[]): void {
  * follows in the background pass, as for any other document.
  */
 export async function importFolder(ctx: FolderContext, source: string, opts: ImportFolderOptions): Promise<ImportFolderResult> {
-  const src = resolveImportSource(ctx.dataDir, source);
+  const src = resolveImportSource(ctx.dataDir, source, opts.policy);
   const dest = importDestFor(src, opts.dest);
   const links = linkedFolders(ctx.config);
   const owner = linkOwning(links, dest);
@@ -451,12 +489,21 @@ export interface RefreshResult extends MirrorResult {
   sourceMissing: boolean;
 }
 
+/** A link remembered before its source was off limits (or written into the config by hand) is not followed there. */
+function assertLinkAllowed(link: LinkedFolder, policy: ImportSourcePolicy | undefined): void {
+  if (policy) assertOutsideProtected(realOrSelf(link.source), link.source, policy);
+}
+
 /**
  * Bring one link's mirror up to date and sync what changed. A source that is
  * not there is left alone rather than pruned: an unmounted disk must not
  * dispose a whole folder's knowledge.
  */
-export async function refreshLinkedFolder(ctx: FolderContext, link: LinkedFolder, opts: { onProgress?: (m: string) => void } = {}): Promise<RefreshResult> {
+export async function refreshLinkedFolder(
+  ctx: FolderContext,
+  link: LinkedFolder,
+  opts: { onProgress?: (m: string) => void; policy?: ImportSourcePolicy } = {},
+): Promise<RefreshResult> {
   let present = false;
   try {
     present = fs.statSync(link.source).isDirectory();
@@ -466,6 +513,7 @@ export async function refreshLinkedFolder(ctx: FolderContext, link: LinkedFolder
   if (!present) {
     return { dest: link.dest, copied: [], removed: [], unchanged: 0, files: 0, bytes: 0, skippedByType: 0, tooLarge: 0, sync: null, sourceMissing: true };
   }
+  assertLinkAllowed(link, opts.policy);
   const mirrored = mirrorFolder(ctx.dataDir, link.source, link.dest, { prune: true });
   const changed = [...mirrored.copied, ...mirrored.removed];
   if (changed.length === 0) return { ...mirrored, dest: link.dest, sync: null, sourceMissing: false };
@@ -475,7 +523,11 @@ export async function refreshLinkedFolder(ctx: FolderContext, link: LinkedFolder
 }
 
 /** Refresh every link, or the one at `dest`. */
-export async function refreshLinkedFolders(ctx: FolderContext, dest?: string, opts: { onProgress?: (m: string) => void } = {}): Promise<RefreshResult[]> {
+export async function refreshLinkedFolders(
+  ctx: FolderContext,
+  dest?: string,
+  opts: { onProgress?: (m: string) => void; policy?: ImportSourcePolicy } = {},
+): Promise<RefreshResult[]> {
   const links = linkedFolders(ctx.config).filter((l) => !dest || l.dest === dest);
   if (dest && links.length === 0) throw new Error(`no linked folder at ${dest}`);
   const out: RefreshResult[] = [];
@@ -580,6 +632,8 @@ export interface LinkedFoldersOptions {
   reconcileMinutes?: number;
   /** A file must stop changing for this long before it counts as written — exports rewrite whole files. The quiet time is the longer of the two. */
   writeSettleMs?: number;
+  /** Folders no link may import from or follow into (resolveImportSource). */
+  policy?: ImportSourcePolicy;
 }
 
 /**
@@ -642,7 +696,7 @@ export class LinkedFolders {
         },
       }
       : undefined;
-    const result = await importFolder(this.ctx, source, { ...opts, background, mode: 'link', onProgress: opts.onProgress ?? this.log });
+    const result = await importFolder(this.ctx, source, { ...opts, background, mode: 'link', policy: opts.policy ?? this.opts.policy, onProgress: opts.onProgress ?? this.log });
     const link = linkedFolders(this.ctx.config).find((l) => l.dest === result.dest);
     if (link) {
       this.watch(link);
@@ -684,6 +738,7 @@ export class LinkedFolders {
         await this.refreshOne(link);
         return;
       }
+      assertLinkAllowed(link, this.opts.policy);
       const { changed } = mirrorPaths(this.ctx.dataDir, link, absPaths);
       if (changed.length === 0) return;
       this.log(`linked ${link.dest}: ${changed.length} change(s) from ${link.source}`);
@@ -703,7 +758,7 @@ export class LinkedFolders {
   private async refreshOne(link: LinkedFolder): Promise<RefreshResult> {
     const at = new Date().toISOString();
     try {
-      const result = await refreshLinkedFolder(this.ctx, link, { onProgress: this.log });
+      const result = await refreshLinkedFolder(this.ctx, link, { onProgress: this.log, policy: this.opts.policy });
       const rt = this.runtimeOf(link.dest);
       this.runtime.set(link.dest, {
         ...rt,
