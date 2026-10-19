@@ -186,16 +186,14 @@ export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<Cla
 export async function sourcesOf(store: Store, ids: string[]): Promise<Map<string, string[]>> {
   const out = new Map<string, string[]>();
   if (ids.length === 0) return out;
-  const p = new Params();
-  const ph = ids.map((id) => p.add(id)).join(',');
   const rows = await store.query<{ rep: string; key: string }>(
     `SELECT DISTINCT COALESCE(c.canonical_id, c.id) AS rep, s.key
      FROM claims c
      JOIN evidence e ON e.kind = 'claim' AND e.target_id = c.id AND e.tx_to IS NULL
      JOIN scopes s ON s.id = e.scope_id
-     WHERE c.id IN (${ph}) OR c.canonical_id IN (${ph})
+     WHERE c.id = ANY($1::text[]) OR c.canonical_id = ANY($1::text[])
      ORDER BY s.key`,
-    p.list,
+    [ids],
   );
   for (const r of rows) (out.get(r.rep) ?? out.set(r.rep, []).get(r.rep)!).push(r.key);
   return out;
@@ -236,9 +234,7 @@ async function foldAsOf(store: Store, rows: Row[], t: ResolvedTemporal, f: Resol
   // the supporting scope at that time is not necessarily today's primary one
   const keys = new Map<string, string>();
   if (scopeIds.size > 0) {
-    const sp = new Params();
-    const ph = [...scopeIds].map((id) => sp.add(id)).join(',');
-    for (const s of await store.query<{ id: string; key: string }>(`SELECT id, key FROM scopes WHERE id IN (${ph})`, sp.list)) {
+    for (const s of await store.query<{ id: string; key: string }>(`SELECT id, key FROM scopes WHERE id = ANY($1::text[])`, [[...scopeIds]])) {
       keys.set(s.id, s.key);
     }
   }

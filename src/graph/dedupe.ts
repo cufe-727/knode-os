@@ -221,11 +221,11 @@ export async function auditDuplicateEntities(
   stats.candidates = candidates.size;
   if (candidates.size === 0) return stats;
 
-  // never re-propose a pair a person already rejected, or one already linked
+  // never re-propose a pair a person already rejected, or one already linked;
+  // one array parameter, since a nightly run scores more pairs than a statement can bind
   const ids = [...candidates.keys()];
-  const ph = ids.map((_, i) => `$${i + 1}`).join(',');
   const decided = new Set(
-    (await store.query<{ id: string }>(`SELECT id FROM suggestions WHERE id IN (${ph}) AND status IN ('rejected', 'accepted')`, ids)).map((r) => r.id),
+    (await store.query<{ id: string }>(`SELECT id FROM suggestions WHERE id = ANY($1::text[]) AND status IN ('rejected', 'accepted')`, [ids])).map((r) => r.id),
   );
   const ranked = [...candidates.entries()].filter(([id]) => !decided.has(id)).sort((x, y) => y[1].score - x[1].score).slice(0, opts.maxSuggestions ?? 50);
 

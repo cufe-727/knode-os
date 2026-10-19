@@ -304,13 +304,12 @@ export async function auditDuplicateClaims(
     for (const f of focus) {
       const block = blockOf(f);
       if (block.length === 0) continue;
-      const ph = block.map((_, i) => `$${i + 2}`).join(',');
       const rows = await store.query<{ claim_id: string; sim: number }>(
         `SELECT b.claim_id, (1 - (a.embedding <=> b.embedding))::float AS sim
-         FROM claim_embeddings a JOIN claim_embeddings b ON b.claim_id IN (${ph})
+         FROM claim_embeddings a JOIN claim_embeddings b ON b.claim_id = ANY($2::text[])
          WHERE a.claim_id = $1
          ORDER BY a.embedding <=> b.embedding LIMIT 5`,
-        [f.id, ...block.map((c) => c.id)],
+        [f.id, block.map((c) => c.id)],
       );
       for (const r of rows) {
         const other = byId.get(r.claim_id);
@@ -322,11 +321,11 @@ export async function auditDuplicateClaims(
   if (pairs.size === 0) return stats;
 
   /* pairs already decided: a remembered verdict, or a person's answer to a suggestion */
+  // one array parameter: a nightly run brings up more pairs than a statement can bind (65,535)
   const ids = [...pairs.keys()];
-  const ph = ids.map((_, i) => `$${i + 1}`).join(',');
   const decided = new Set([
-    ...(await store.query<{ pair_id: string }>(`SELECT pair_id FROM claim_pair_verdicts WHERE pair_id IN (${ph})`, ids)).map((r) => r.pair_id),
-    ...(await store.query<{ id: string }>(`SELECT id FROM suggestions WHERE id IN (${ph}) AND status IN ('accepted', 'rejected')`, ids)).map((r) => r.id),
+    ...(await store.query<{ pair_id: string }>(`SELECT pair_id FROM claim_pair_verdicts WHERE pair_id = ANY($1::text[])`, [ids])).map((r) => r.pair_id),
+    ...(await store.query<{ id: string }>(`SELECT id FROM suggestions WHERE id = ANY($1::text[]) AND status IN ('accepted', 'rejected')`, [ids])).map((r) => r.id),
   ]);
 
   const toJudge: Pair[] = [];

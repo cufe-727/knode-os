@@ -4,7 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import pg from 'pg';
 import { afterAll, describe, expect, it } from 'vitest';
-import type { DatabaseConfig } from '../src/config.js';
+import { defaultConfig, type DatabaseConfig } from '../src/config.js';
+import { auditDuplicateClaims, claimPairId } from '../src/graph/claim-dedupe.js';
+import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
+import type { LlmClient } from '../src/llm/client.js';
 import { schemaNameFor } from '../src/store/backend.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
@@ -205,6 +208,44 @@ describe.skipIf(!ready)('postgres backend', () => {
     } finally {
       await a.close();
       await b.close();
+    }
+  });
+
+  it('runs the nightly claim audit over more candidate pairs than one statement can bind', async () => {
+    const store = await Store.open(workspaceDir(), 2048, dbConfig);
+    try {
+      // one subject, n claims sharing a number: every one of the n(n-1)/2 pairs is a candidate
+      const n = 370;
+      await store.query(`INSERT INTO entities (id, name, type) VALUES ('jia', '甲公司', 'organization')`);
+      await store.query(
+        `INSERT INTO claims (id, subject_id, statement)
+         SELECT 'claim-' || g, 'jia', '第' || g || '项业务收入同比增长20%' FROM generate_series(1, $1::int) AS g`,
+        [n],
+      );
+      const pairs: string[] = [];
+      for (let i = 1; i <= n; i++) for (let j = i + 1; j <= n; j++) pairs.push(claimPairId(`claim-${i}`, `claim-${j}`));
+      expect(pairs.length).toBeGreaterThan(65_535);
+      // every pair but the first already has a remembered verdict
+      await store.query(
+        `INSERT INTO claim_pair_verdicts (pair_id, a_id, b_id, relation) SELECT id, '', '', 'unrelated' FROM unnest($1::text[]) AS id`,
+        [pairs.slice(1)],
+      );
+
+      const judged: number[] = [];
+      const llm = {
+        enabled: true,
+        label: 'stub',
+        completeJson: async (messages: { role: string; content: string }[]) => {
+          judged.push([...(messages.at(-1)?.content ?? '').matchAll(/^Pair \d+ — /gm)].length);
+          return { verdicts: [] };
+        },
+      } as unknown as LlmClient;
+      const config = defaultConfig();
+      const stats = await auditDuplicateClaims({ store, embedder: createEmbeddingProvider(config.embedding), config, llm });
+      expect(stats.candidates).toBe(pairs.length);
+      expect(judged).toEqual([1]);
+    } finally {
+      await store.close();
     }
   });
 
