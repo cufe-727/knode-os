@@ -71,10 +71,11 @@ const PG_QUOTED_PREFIX = /[uU]&"/y;
 /**
  * Whitespace holding a newline, then a quote: PostgreSQL continues the string
  * literal before it there, in that literal's escape mode — `E'a'⏎'\''` is one
- * E-string. (One character or one whole comment line per repetition, so a
- * failed match cannot backtrack exponentially.)
+ * E-string, a vertical tab before the newline included. (One character or one
+ * whole comment line per repetition, so a failed match cannot backtrack
+ * exponentially.)
  */
-const PG_QUOTE_CONTINUE = /[ \t\f]*(?:--[^\n\r]*)?[\n\r](?:[ \t\n\r\f\v]|--[^\n\r]*[\n\r])*'/y;
+const PG_QUOTE_CONTINUE = /[ \t\f\v]*(?:--[^\n\r]*)?[\n\r](?:[ \t\n\r\f\v]|--[^\n\r]*[\n\r])*'/y;
 
 const MYSQL_WORD = /[A-Za-z_$\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*/y;
 /** An executable comment's opening — `/*!`, `/*!80013`, MariaDB's `/*M!100100` — whose text MySQL runs as SQL. */

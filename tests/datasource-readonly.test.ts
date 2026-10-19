@@ -43,6 +43,7 @@ describe('SQL guard: read by the rules of the database that runs the statement',
     expect(pg('SELECT 1 -- note\r; DELETE FROM t')).toThrow(/multiple/);
     // PostgreSQL continues a string across a newline in the first part's escape mode
     expect(pg("SELECT E'a'\n'\\'' ; DELETE FROM t ; -- '")).toThrow(/multiple/);
+    expect(pg("SELECT E'a'\v\n'\\'' ; DELETE FROM t ; -- '")).toThrow(/multiple/);
   });
 
   it('passes what PostgreSQL reads as one read, which a neutral reading refused', () => {
@@ -133,6 +134,7 @@ describe('TimescaleDB / PostgreSQL connector: the server keeps agent SQL read-on
       "SELECT '\\'; DELETE FROM quotes; --'",
       'SELECT 1 -- note\r; DELETE FROM quotes',
       "SELECT E'a'\n'\\'' ; DELETE FROM quotes ; -- '",
+      "SELECT E'a'\v\n'\\'' ; DELETE FROM quotes ; -- '",
     ]) {
       await expect(source.query(sql), JSON.stringify(sql)).rejects.toThrow(/cannot insert multiple commands into a prepared statement/);
     }
