@@ -460,16 +460,47 @@ describe('the linked-folder service', () => {
     expect(fs.existsSync(path.join(data, 'raw/docs/exports/tgb/2026-10.md'))).toBe(true);
   });
 
+  it('catches up on a change made before its watcher could report it', async () => {
+    const early = path.join(tmp, 'early-source');
+    const mirror = path.join(data, 'raw/docs/early');
+    makeExport(early);
+    const linker = new LinkedFolders(ctx, { debounceMs: 150, writeSettleMs: 150, reconcileMinutes: 0 });
+    let wrote = false;
+    try {
+      // written once the mirror pass is done, while the link still indexes: no
+      // watcher is up yet, so none will ever report it
+      await linker.add(early, {
+        dest: 'early',
+        llmGraph: false,
+        onProgress: () => {
+          if (wrote || !fs.existsSync(path.join(mirror, 'INDEX.md'))) return;
+          write(early, 'weibo/2026-10.md', '# 微博 · 2026-10\n\n## 2026-10-05 · 大才子 · 帖子\n\n存储芯片涨价。\n');
+          wrote = true;
+        },
+      });
+      expect(wrote).toBe(true);
+      expect(fs.existsSync(path.join(mirror, 'weibo/2026-10.md'))).toBe(false);
+      await until(() => fs.existsSync(path.join(mirror, 'weibo/2026-10.md')), 15_000, 'the mirror to catch up with weibo/2026-10.md');
+      await until(() => linker.status().find((s) => s.dest === 'raw/docs/early')?.lastChange?.copied === 1, 15_000, 'the sync after the copy');
+      expect(await findLiveScope(ctx.store, 'doc', 'raw/docs/early/weibo/2026-10.md')).not.toBeNull();
+    } finally {
+      await linker.stop();
+    }
+  });
+
   it('applies reported paths directly when driven without a watcher', async () => {
-    const result = await importFolder(ctx, source, { dest: 'again', mode: 'link', llmGraph: false });
+    // a source of its own: a link another test left behind is no conflict
+    const own = path.join(tmp, 'driven-source');
+    makeExport(own);
+    const result = await importFolder(ctx, own, { dest: 'again', mode: 'link', llmGraph: false });
     expect(result.copied.length).toBeGreaterThan(0);
-    const link = linkedFolders(ctx.config)[0];
+    const link = linkedFolders(ctx.config).find((l) => l.source === own)!;
     expect(link.dest).toBe('raw/docs/again');
     const driven = new LinkedFolders(ctx, { reconcileMinutes: 0 });
-    write(source, 'tgb/2026-11.md', '# 淘股吧 · 2026-11\n\n短线情绪回暖。\n');
-    await driven.apply(link, [path.join(source, 'tgb/2026-11.md')]);
+    write(own, 'tgb/2026-11.md', '# 淘股吧 · 2026-11\n\n短线情绪回暖。\n');
+    await driven.apply(link, [path.join(own, 'tgb/2026-11.md')]);
     expect(await findLiveScope(ctx.store, 'doc', 'raw/docs/again/tgb/2026-11.md')).not.toBeNull();
-    expect(driven.status()[0].lastChange).toMatchObject({ copied: 1 });
+    expect(driven.status().find((s) => s.dest === 'raw/docs/again')?.lastChange).toMatchObject({ copied: 1 });
     await driven.stop();
   });
 });

@@ -14,8 +14,8 @@ import { LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
 import { LabelingScheduler } from '../labeling/scheduler.js';
 import { EmbeddingBackfill } from '../ingest/embed-backfill.js';
-import { LinkedFolders, syncedByFolders } from '../ingest/folders.js';
-import { sync } from '../ingest/sync.js';
+import { LinkedFolders, linkedFolders, linkOwning, syncedByFolders } from '../ingest/folders.js';
+import { sync, SyncContext, SyncStats } from '../ingest/sync.js';
 import { flushUsageToSidecars } from '../stats/heat.js';
 import { syncTraces } from '../traces/sync.js';
 import { reconcileViews } from '../wiki/pages.js';
@@ -268,6 +268,213 @@ export function isWatchedSource(rel: string): boolean {
   return !rel.split('/').some(isHiddenName);
 }
 
+function summarize(log: (msg: string) => void, label: string, s: SyncStats): void {
+  log(`${label}: ${s.indexed} applied, ${s.unchanged} unchanged, ${s.disposed} disposed, ${s.chunks} chunks, ${s.pagesRegenerated} pages regenerated${s.pagesArchived ? `, ${s.pagesArchived} archived` : ''}${s.datasourceErrors.length ? `, datasource errors: ${s.datasourceErrors.length}` : ''}`);
+}
+
+/** One stat-only look at what the data-dir watcher follows. */
+interface WatchedFiles {
+  /** When the walk began. */
+  at: number;
+  /** Data-dir-relative path → ctimeMs, which every write, rename or metadata change moves. */
+  files: Map<string, number>;
+  /** Folders left out because the folder machinery syncs them. */
+  owned: string[];
+}
+
+/**
+ * Stat every file under raw/docs, raw/skills and wiki, and the anchor files,
+ * reading none. A linked mirror or a folder an import or unlink is writing is
+ * not walked at all: with its exports linked, a 34k-file workspace costs a
+ * few directory listings.
+ */
+function scanWatched(ctx: SyncContext): WatchedFiles {
+  const look: WatchedFiles = { at: Date.now(), files: new Map(), owned: [] };
+  const stat = (rel: string) => {
+    try {
+      look.files.set(rel, fs.statSync(path.join(ctx.dataDir, rel)).ctimeMs);
+    } catch {
+      // gone meanwhile, or an anchor file that was never there
+    }
+  };
+  const visit = (rel: string) => {
+    if (syncedByFolders(ctx.dataDir, ctx.config, rel)) {
+      look.owned.push(rel);
+      return;
+    }
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(path.join(ctx.dataDir, rel), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (isHiddenName(e.name)) continue;
+      if (e.isDirectory()) visit(`${rel}/${e.name}`);
+      else stat(`${rel}/${e.name}`);
+    }
+  };
+  for (const tree of WATCHED_TREES) visit(tree);
+  for (const file of WATCHED_FILES) stat(file);
+  return look;
+}
+
+export interface DataDirWatchOptions {
+  log: (msg: string) => void;
+  /** Register a background sync so shutdown waits for it. */
+  track: <T>(job: Promise<T>) => Promise<T>;
+  /** Quiet time after the last event before a sync runs, and after another watcher opened or closed before a catch-up. */
+  debounceMs?: number;
+}
+
+/**
+ * Watch docs + wiki for changes → debounced scoped sync (a path that is gone
+ * disposes what was under it). One recursive watcher for the data dir, never
+ * one per file (src/fs/watch.ts). Null when the data dir cannot be watched.
+ *
+ * Whenever another watcher of the process opens or closes (a folder linked, a
+ * linked source back, a workspace opened), this one is blind for a moment,
+ * and nothing re-syncs raw/docs or wiki on a timer. So a moment later a
+ * catch-up stats what this watcher follows and syncs each change since its
+ * last look that the watcher never reported. Linked mirrors are not walked,
+ * and what the watcher did report is not synced twice: linking a folder costs
+ * a large workspace a stat walk, not a re-index.
+ */
+export function watchDataDir(ctx: SyncContext, opts: DataDirWatchOptions): TreeWatcher | null {
+  const { log, track } = opts;
+  const debounceMs = opts.debounceMs ?? 1500;
+  let closed = false;
+  let watchTimer: NodeJS.Timeout | null = null;
+  let catchUpTimer: NodeJS.Timeout | null = null;
+  let running = false;
+  const pending = new Set<string>();
+  let fullSync = false;
+  // when the watcher last reported each path ('.' for everything): the sync
+  // that report started (or the folder machinery's) reads it after that
+  let reported = new Map<string, number>();
+  // taken before the watch opens: whatever its stream misses from here on shows up in a catch-up
+  let seen = scanWatched(ctx);
+
+  const flush = () => {
+    watchTimer = null;
+    if (closed) return;
+    if (running) {
+      schedule();
+      return;
+    }
+    running = true;
+    // a burst under one folder syncs that folder, never the whole data dir
+    const only = fullSync ? undefined : coveringPrefixes(pending, WATCH_SCOPE_MAX);
+    pending.clear();
+    fullSync = false;
+    void track((async () => {
+      try {
+        const stats = await sync(ctx, { only });
+        if (stats.indexed || stats.disposed || stats.pagesRegenerated) summarize(log, 'watch sync', stats);
+      } catch (err) {
+        log(`watch sync failed: ${err instanceof Error ? err.message : err}`);
+      } finally {
+        running = false;
+      }
+    })());
+  };
+  const schedule = () => {
+    if (watchTimer) clearTimeout(watchTimer);
+    watchTimer = setTimeout(flush, debounceMs);
+  };
+  const trigger = (absPath: string) => {
+    if (closed) return;
+    const rel = path.relative(ctx.dataDir, absPath).split(path.sep).join('/');
+    // an event naming no path (the data dir itself) is no source
+    if (!rel) return;
+    const outside = rel.startsWith('..');
+    // a linked mirror is synced by its link (src/ingest/folders.ts)
+    if (!outside && linkOwning(linkedFolders(ctx.config), rel)) return;
+    // seen: synced from here on — by the sync below, or by the import or
+    // unlink writing that folder, which syncs what it writes itself
+    reported.set(outside ? '.' : rel, Date.now());
+    if (!outside && syncedByFolders(ctx.dataDir, ctx.config, rel)) return;
+    // every path is a prefix: a directory that came is synced whole, a path
+    // that is gone — a file or a directory — disposes everything under it
+    if (outside) fullSync = true;
+    else pending.add(rel);
+    schedule();
+  };
+
+  /**
+   * When `rel`, gone now, went at the latest: its removal touched the nearest
+   * folder still there, and any later change in that folder only moves this on.
+   */
+  const goneAt = (rel: string): number => {
+    for (let dir = path.posix.dirname(rel); ; dir = path.posix.dirname(dir)) {
+      try {
+        return fs.statSync(path.join(ctx.dataDir, dir)).ctimeMs;
+      } catch {
+        if (dir === '.') return Infinity;
+      }
+    }
+  };
+  const catchUp = () => {
+    catchUpTimer = null;
+    if (closed) return;
+    const before = seen;
+    const saw = reported;
+    seen = scanWatched(ctx);
+    reported = new Map();
+    const reportedSince = (rel: string, at: number) => {
+      for (let p = rel; ; p = path.posix.dirname(p)) {
+        if ((saw.get(p) ?? -Infinity) >= at) return true;
+        if (p === '.') return false;
+      }
+    };
+    const under = (dirs: string[], rel: string) => dirs.some((d) => rel.startsWith(`${d}/`));
+    const missed: string[] = [];
+    for (const [rel, ctime] of seen.files) {
+      const was = before.files.get(rel);
+      if (was === ctime) continue;
+      // a folder the folder machinery has let go of since (a link removed with
+      // its copies kept, an import's claim lapsed): it synced what it held
+      if (was === undefined && ctime < before.at && under(before.owned, rel)) continue;
+      if (!reportedSince(rel, ctime)) missed.push(rel);
+    }
+    for (const rel of before.files.keys()) {
+      if (seen.files.has(rel) || under(seen.owned, rel)) continue;
+      if (!reportedSince(rel, goneAt(rel))) missed.push(rel);
+    }
+    if (missed.length === 0) return;
+    const shown = missed.length > 5 ? `${missed.slice(0, 5).join(', ')} and ${missed.length - 5} more` : missed.join(', ');
+    log(`watch catch-up: ${missed.length} change(s) the watcher never reported: ${shown}`);
+    for (const rel of missed) trigger(path.join(ctx.dataDir, rel));
+  };
+
+  let watcher: TreeWatcher;
+  try {
+    watcher = watchTree(ctx.dataDir, (abs) => trigger(abs), {
+      ignore: (rel) => !isWatchedSource(rel),
+      onError: (err) => log(`watcher error: ${err.message}`),
+      // a look once the rebuilt stream is up; a burst of opens (a workspace
+      // starting with its links) gets one
+      onBlinded: () => {
+        if (closed) return;
+        if (catchUpTimer) clearTimeout(catchUpTimer);
+        catchUpTimer = setTimeout(catchUp, debounceMs);
+      },
+    });
+  } catch (err) {
+    log(`cannot watch ${ctx.dataDir}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+  log('watching raw/docs, raw/skills, wiki for changes');
+  return {
+    close: () => {
+      closed = true;
+      if (watchTimer) clearTimeout(watchTimer);
+      if (catchUpTimer) clearTimeout(catchUpTimer);
+      watcher.close();
+    },
+  };
+}
+
 interface StartedServices {
   stop: () => Promise<void>;
   kickResearch: () => void;
@@ -301,16 +508,13 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     );
     return job;
   };
-  const summarize = (label: string, s: Awaited<ReturnType<typeof sync>>) =>
-    log(`${label}: ${s.indexed} applied, ${s.unchanged} unchanged, ${s.disposed} disposed, ${s.chunks} chunks, ${s.pagesRegenerated} pages regenerated${s.pagesArchived ? `, ${s.pagesArchived} archived` : ''}${s.datasourceErrors.length ? `, datasource errors: ${s.datasourceErrors.length}` : ''}`);
-
   // initial trace sync + full reconciliation (async, doesn't block startup)
   void track((async () => {
     try {
       const ts = await syncTraces(ctx.store, ctx.config);
       if (disposed) return;
       if (ts.copied || ts.skills) log(`trace sync: ${ts.copied} traces, ${ts.skills} skill files`);
-      summarize('sync', await sync(ctx, { onProgress: (m) => log(m) }));
+      summarize(log, 'sync', await sync(ctx, { onProgress: (m) => log(m) }));
     } catch (err) {
       log(`startup sync failed: ${err instanceof Error ? err.message : err}`);
     }
@@ -392,65 +596,13 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   else log(`dream.schedule ${JSON.stringify(ctx.config.dream.schedule)} is not a 24-hour "HH:MM" time: the nightly dream and tier-2 pass will not run`);
   const tier2Timer = startTier2Scheduler(ctx, log);
 
-  // watch docs + wiki for changes → debounced scoped sync (a path that is gone
-  // disposes what was under it). One recursive watcher for the data dir, never
-  // one per file (src/fs/watch.ts).
-  let watchTimer: NodeJS.Timeout | null = null;
-  let watcher: TreeWatcher | null = null;
-  if (ctx.config.ingest.watch) {
-    let running = false;
-    const pending = new Set<string>();
-    let fullSync = false;
-    const trigger = (absPath: string) => {
-      if (disposed) return;
-      const rel = path.relative(ctx.dataDir, absPath).split(path.sep).join('/');
-      // an event naming no path (the data dir itself) is no source
-      if (!rel) return;
-      // a linked mirror, or a folder an import / unlink is writing, is synced
-      // by that machinery itself (src/ingest/folders.ts)
-      if (!rel.startsWith('..') && syncedByFolders(ctx.dataDir, ctx.config, rel)) return;
-      // every path is a prefix: a directory that came is synced whole, a path
-      // that is gone — a file or a directory — disposes everything under it
-      if (rel.startsWith('..')) fullSync = true;
-      else pending.add(rel);
-      if (watchTimer) clearTimeout(watchTimer);
-      watchTimer = setTimeout(() => {
-        if (disposed) return;
-        if (running) {
-          trigger(absPath);
-          return;
-        }
-        running = true;
-        // a burst under one folder syncs that folder, never the whole data dir
-        const only = fullSync ? undefined : coveringPrefixes(pending, WATCH_SCOPE_MAX);
-        pending.clear();
-        fullSync = false;
-        void track((async () => {
-          try {
-            const stats = await sync(ctx, { only });
-            if (stats.indexed || stats.disposed || stats.pagesRegenerated) summarize('watch sync', stats);
-          } catch (err) {
-            log(`watch sync failed: ${err instanceof Error ? err.message : err}`);
-          } finally {
-            running = false;
-          }
-        })());
-      }, 1500);
-    };
-    try {
-      watcher = watchTree(ctx.dataDir, (abs) => trigger(abs), {
-        ignore: (rel) => !isWatchedSource(rel),
-        onError: (err) => log(`watcher error: ${err.message}`),
-      });
-      log('watching raw/docs, raw/skills, wiki for changes');
-    } catch (err) {
-      log(`cannot watch ${ctx.dataDir}: ${err instanceof Error ? err.message : err}`);
-    }
-  }
+  // watch docs + wiki for changes → debounced scoped sync
+  const dataWatcher = ctx.config.ingest.watch ? watchDataDir(ctx, { log, track }) : null;
 
   return {
     stop: async () => {
       disposed = true;
+      dataWatcher?.close();
       await research?.stop();
       clearInterval(syncTimer);
       followUp.stop();
@@ -460,8 +612,6 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       clearInterval(dreamTimer);
       clearInterval(tier2Timer);
       clearInterval(dsTimer);
-      if (watchTimer) clearTimeout(watchTimer);
-      watcher?.close();
       await folders.stop();
       await Promise.allSettled([...activeJobs]);
       await embeddings.stop();

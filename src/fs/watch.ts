@@ -14,6 +14,12 @@ import path from 'node:path';
  *
  * It reports paths, not event kinds: a caller stats or re-walks to learn what
  * happened. An event the OS could not attribute to a path reports the root.
+ *
+ * Nothing is reported until a moment after this returns (FSEvents opens its
+ * stream on another thread), and opening or closing a watcher blinds the
+ * others in the process for that moment too (libuv runs them all on one
+ * stream, rebuilt on each open and close). A caller that must not miss a
+ * change re-walks once the watch is up, and again after `onBlinded`.
  */
 export interface TreeWatcher {
   close(): void;
@@ -23,6 +29,19 @@ export interface WatchTreeOptions {
   /** Drop a path (posix, relative to the root) before it is reported. */
   ignore?: (rel: string) => boolean;
   onError?: (err: Error) => void;
+  /**
+   * Another watcher of this process opened or closed, so a change made here
+   * in that moment may never be reported. Called inside that open or close:
+   * keep it cheap, and look again a while later, once the stream is back.
+   */
+  onBlinded?: () => void;
+}
+
+/** The watchers this process has open, as told when another one opens or closes. */
+const openWatchers = new Set<{ onBlinded?: () => void }>();
+
+function blindOthers(self: { onBlinded?: () => void }): void {
+  for (const other of [...openWatchers]) if (other !== self) other.onBlinded?.();
 }
 
 /** Throws when `root` cannot be watched (missing, not a directory). */
@@ -32,6 +51,19 @@ export function watchTree(root: string, onPath: (abs: string, rel: string) => vo
     if (rel && opts.ignore?.(rel)) return;
     onPath(rel ? path.join(root, rel) : root, rel);
   });
-  watcher.on('error', (err) => opts.onError?.(err));
-  return { close: () => watcher.close() };
+  const self = { onBlinded: opts.onBlinded };
+  watcher.on('error', (err) => {
+    // node has closed the handle by now
+    if (openWatchers.delete(self)) blindOthers(self);
+    opts.onError?.(err);
+  });
+  openWatchers.add(self);
+  blindOthers(self);
+  return {
+    close: () => {
+      if (!openWatchers.delete(self)) return;
+      watcher.close();
+      blindOthers(self);
+    },
+  };
 }
