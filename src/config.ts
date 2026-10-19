@@ -1634,11 +1634,20 @@ export function redactConfig(config: KnodeConfig): KnodeConfig {
   for (const c of secretHolders) {
     if (c.apiKey && !c.apiKey.startsWith('env:')) c.apiKey = '***';
   }
+  const literal = (value: unknown) => !(typeof value === 'string' && (value === '' || value.startsWith('env:')));
   for (const ds of clone.datasources ?? []) {
     if (ds.password && !ds.password.startsWith('env:')) ds.password = '***';
+    // an API token travels as a header; a URL may carry a password of its own
+    for (const name of Object.keys(ds.headers ?? {})) if (literal(ds.headers![name])) ds.headers![name] = '***';
+    if (ds.baseUrl) ds.baseUrl = redactConnectionUrl(ds.baseUrl);
   }
   if (clone.database?.password && !clone.database.password.startsWith('env:')) clone.database.password = '***';
   if (clone.database?.url) clone.database.url = redactConnectionUrl(clone.database.url);
+  // plugin options are the plugin's business, keys included; GET /api/plugins names them, never their values
+  for (const spec of Array.isArray(clone.plugins) ? clone.plugins : []) {
+    if (!spec || typeof spec !== 'object' || !spec.options || typeof spec.options !== 'object') continue;
+    for (const key of Object.keys(spec.options)) if (literal(spec.options[key])) spec.options[key] = '***';
+  }
   return clone;
 }
 

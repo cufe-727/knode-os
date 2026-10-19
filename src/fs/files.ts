@@ -31,7 +31,37 @@ export function safePath(dataDir: string, rel: string): string {
   return abs;
 }
 
+/** The workspace config — literal API keys live in it. Settings reads it through the redacted GET /api/config. */
+const CONFIG_FILE_NAME = 'knode.config.json';
+
+/**
+ * Paths no file route reads, lists or writes — the REST file API, MCP's
+ * knode_read / knode_ls / knode_grep / knode_write, grep: the workspace
+ * config, and every dot-entry, which is where a workspace keeps what is not
+ * knowledge — `.knode/` (the index, tokens, audit log), `.runs/` (the
+ * research and chat run workspaces, with their MCP credentials),
+ * `.workspace.json`, a `.git/` or `.obsidian/` someone put there. The sidecar
+ * tree at the root stays readable: it holds the Markdown derived from PDFs
+ * and images, which agents are told to read.
+ *
+ * Compared without case, because the volume usually ignores it:
+ * `Knode.Config.json` opens the same file on macOS.
+ */
+export function isPrivatePath(rel: string): boolean {
+  const clean = cleanRelPath(rel).toLowerCase();
+  if (!clean) return false;
+  if (clean === CONFIG_FILE_NAME) return true;
+  return clean.split('/').some((segment, i) => segment.startsWith('.') && !(i === 0 && segment === SIDECAR_ROOT_SEGMENT));
+}
+
+export function assertNotPrivate(rel: string): void {
+  if (!isPrivatePath(rel)) return;
+  const config = cleanRelPath(rel).toLowerCase() === CONFIG_FILE_NAME;
+  throw new Error(`${rel} is not available through the file API${config ? ' — Settings shows the configuration, without its keys' : ': it is the workspace\'s private state'}`);
+}
+
 export function listTree(dataDir: string, rel = '.', maxDepth = 8): TreeNode {
+  assertNotPrivate(rel);
   const abs = safePath(dataDir, rel);
   const stat = fs.statSync(abs);
   const name = rel === '.' ? path.basename(dataDir) : path.basename(abs);
@@ -42,7 +72,7 @@ export function listTree(dataDir: string, rel = '.', maxDepth = 8): TreeNode {
   const node: TreeNode = { name, path: relPosix, kind: 'dir', children: [] };
   if (maxDepth <= 0) return node;
   const entries = fs.readdirSync(abs, { withFileTypes: true })
-    .filter((e) => !HIDDEN.has(e.name) && !e.name.startsWith('.'))
+    .filter((e) => !HIDDEN.has(e.name) && !e.name.startsWith('.') && !isPrivatePath(relPosix ? `${relPosix}/${e.name}` : e.name))
     .sort((a, b) => (a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1));
   for (const e of entries) {
     const childRel = relPosix ? `${relPosix}/${e.name}` : e.name;
@@ -168,10 +198,10 @@ export function isRootWritableFile(rel: string): boolean {
   return ROOT_WRITABLE_FILES.has(cleanRelPath(rel));
 }
 
-/** The sidecar tree is system-owned: no external write may land there, whatever root it is under. */
+/** The sidecar tree is system-owned: no external write may land there, whatever root it is under; nor in a private path. */
 export function isWritablePath(rel: string): boolean {
   const clean = cleanRelPath(rel);
-  if (!clean) return false;
+  if (!clean || isPrivatePath(clean)) return false;
   return ROOT_WRITABLE_FILES.has(clean) || (!hasSidecarSegment(clean) && WRITABLE_ROOTS_RE.test(clean));
 }
 
@@ -237,7 +267,7 @@ export function grepFiles(
   const maxMatches = Math.min(opts.maxMatches ?? 100, 500);
   const re = new RegExp(pattern, opts.ignoreCase === false ? '' : 'i');
   const explicit = opts.path ? opts.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') : undefined;
-  if (explicit !== undefined && hasSidecarSegment(explicit)) return [];
+  if (explicit !== undefined && (hasSidecarSegment(explicit) || isPrivatePath(explicit))) return [];
   const roots = explicit !== undefined ? [explicit] : GREP_ROOTS;
   const out: GrepMatch[] = [];
 
@@ -254,6 +284,8 @@ export function grepFiles(
       if (!isTextFile(key) && fs.existsSync(safePath(dataDir, derived))) targets.push({ read: derived, report: key });
     }
     for (const target of targets) {
+      // a walk from the root passes the config too
+      if (isPrivatePath(target.read)) continue;
       const abs = safePath(dataDir, target.read);
       if (fs.statSync(abs).size > MAX_GREP_FILE_BYTES) continue;
       const lines = fs.readFileSync(abs, 'utf8').split('\n');

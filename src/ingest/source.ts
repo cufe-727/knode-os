@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { CappedText, isTextFile, readFileTextCapped, safePath } from '../fs/files.js';
+import { assertNotPrivate, CappedText, isTextFile, readFileTextCapped, safePath } from '../fs/files.js';
 import { RAW_DOCS, RAW_TRACES, sidecarRelFor } from '../fs/layout.js';
 import { readContent } from '../fs/sidecar.js';
 import { normalizeCookedFrontmatter } from '../okf/normalize.js';
@@ -89,9 +89,11 @@ function readSource(dataDir: string, rel: string, root: DocRoot): SourceText | n
 /**
  * Capped read for preview surfaces (`GET /api/file`, `knode_read`): a
  * convertible original answers with its derived Markdown (null until it has
- * been prepared); anything else reads the file itself.
+ * been prepared); anything else reads the file itself — never the config or
+ * the workspace's private state (`isPrivatePath`).
  */
 export function readSourceTextCapped(dataDir: string, rel: string, maxBytes: number): (CappedText & { derived: boolean }) | null {
+  assertNotPrivate(rel);
   if (isDerivedTextSource(rel)) {
     const contentRel = `${sidecarRelFor(rel)}/${CONTENT_FILE}`;
     if (!fs.existsSync(safePath(dataDir, contentRel))) return null;

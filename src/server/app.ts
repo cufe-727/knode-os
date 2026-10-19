@@ -43,7 +43,7 @@ import {
   saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS, ExtractionWorkerConfig } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
-import { assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
+import { assertNotPrivate, assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isPrivatePath, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
 import { hasSidecarSegment, SIDECAR_ROOT } from '../fs/layout.js';
 import { moveSidecar } from '../fs/sidecar.js';
 import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
@@ -976,6 +976,8 @@ export function createApp(
     try {
       const p = c.req.query('path');
       if (!p) return c.json({ error: 'path required' }, 400);
+      // the config (literal keys) and the private state are not files to hand out, to anyone
+      if (isPrivatePath(p)) return c.json({ error: `${p} is not available through the file API`, reason: 'private' }, 403);
       const asked = Number(c.req.query('maxBytes'));
       const cap = Number.isFinite(asked) && asked > 0 ? Math.min(asked, MAX_FILE_BYTES) : MAX_PREVIEW_BYTES;
       // a PDF / image original answers with the Markdown knode-os derived from it
@@ -1431,7 +1433,9 @@ export function createApp(
     const ctx = requestCtx(c);
     try {
       const asIndexed = ['1', 'true'].includes(c.req.query('asIndexed') ?? '');
-      return c.json(validateOkfBundle(safePath(ctx.dataDir, c.req.query('path') ?? 'wiki'), { asIndexed }));
+      const bundle = c.req.query('path') ?? 'wiki';
+      assertNotPrivate(bundle);
+      return c.json(validateOkfBundle(safePath(ctx.dataDir, bundle), { asIndexed }));
     } catch (e) {
       return c.json(err(e), 400);
     }

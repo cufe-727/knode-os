@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { AppContext } from '../context.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES } from '../constants.js';
-import { assertSourcePath, assertWritablePath, grepFiles, listTree, safePath, writeFileText } from '../fs/files.js';
+import { assertNotPrivate, assertSourcePath, assertWritablePath, grepFiles, listTree, safePath, writeFileText } from '../fs/files.js';
 import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
 import { assertNotLinked } from '../ingest/folders.js';
 import { graphInsights, graphSearch } from '../graph/query.js';
@@ -244,7 +244,10 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
         as_indexed: z.boolean().optional(),
       },
     },
-    async ({ path: p, as_indexed }) => json(validateOkfBundle(safePath(ctx.dataDir, p ?? 'wiki'), { asIndexed: Boolean(as_indexed) })),
+    async ({ path: p, as_indexed }) => {
+      assertNotPrivate(p ?? 'wiki');
+      return json(validateOkfBundle(safePath(ctx.dataDir, p ?? 'wiki'), { asIndexed: Boolean(as_indexed) }));
+    },
   );
 
   server.registerTool(
