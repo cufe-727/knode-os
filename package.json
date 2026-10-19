@@ -40,6 +40,7 @@
     "@napi-rs/canvas": "0.1.80",
     "chokidar": "^5.0.0",
     "commander": "^15.0.0",
+    "d3": "^7.9.0",
     "deepagents": "1.13.5",
     "gray-matter": "^4.0.3",
     "hono": "^4.12.25",

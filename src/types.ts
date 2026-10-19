@@ -145,8 +145,12 @@ export interface GraphNode {
   name: string;
   type: string;
   description: string;
+  /** Mentions in an overview; hop-decayed relevance to the query in a search. */
   score: number;
   mentionCount: number;
+  /** Live typed relations across the whole graph, not only among the nodes returned. */
+  degree?: number;
+  wikiPath?: string | null;
 }
 
 export interface GraphEdge {

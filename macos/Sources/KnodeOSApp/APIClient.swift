@@ -124,7 +124,7 @@ struct APIClient {
     private func path(_ endpoint: String, query: [URLQueryItem]) -> String {
         var components = URLComponents()
         components.path = endpoint
-        components.queryItems = query
+        components.queryItems = query.isEmpty ? nil : query
         return components.string ?? endpoint
     }
 
@@ -339,12 +339,44 @@ struct APIClient {
         return try await send(path("/api/search", query: items))
     }
 
-    func graph(query: String, depth: Int) async throws -> GraphResponse {
-        let items: [URLQueryItem] = query.isEmpty ? [] : [
-            .init(name: "q", value: query),
-            .init(name: "depth", value: String(depth)),
-        ]
+    /// An empty query is the overview — the top entities by mentions, `limit`
+    /// of them, `types` only, with (`edges` = all) or without (`typed`) the
+    /// derived co-occurrence edges. A name is the local graph `depth` hops
+    /// around it, where `limit` caps the nodes and the other two do not apply.
+    func graph(query: String, depth: Int, limit: Int? = nil, types: [String] = [], edges: String? = nil) async throws -> GraphResponse {
+        var items: [URLQueryItem] = []
+        if query.isEmpty {
+            if !types.isEmpty { items.append(.init(name: "types", value: types.joined(separator: ","))) }
+            if let edges { items.append(.init(name: "edges", value: edges)) }
+        } else {
+            items.append(.init(name: "q", value: query))
+            items.append(.init(name: "depth", value: String(depth)))
+        }
+        if let limit { items.append(.init(name: "limit", value: String(limit))) }
         return try await send(path("/api/graph", query: items))
+    }
+
+    /// One page of Knowledge → Entities, filtered, sorted and counted by the
+    /// service. `order` left nil takes the order the sort reads best in:
+    /// counts and dates largest first, names and types A to Z.
+    func entities(
+        q: String = "",
+        types: [String] = [],
+        sort: String = "mentions",
+        order: String? = nil,
+        offset: Int = 0,
+        limit: Int = 50,
+        merged: Bool = false
+    ) async throws -> EntityPage {
+        var items: [URLQueryItem] = []
+        if !q.isEmpty { items.append(.init(name: "q", value: q)) }
+        if !types.isEmpty { items.append(.init(name: "type", value: types.joined(separator: ","))) }
+        items.append(.init(name: "sort", value: sort))
+        if let order { items.append(.init(name: "order", value: order)) }
+        items.append(.init(name: "offset", value: String(offset)))
+        items.append(.init(name: "limit", value: String(limit)))
+        if merged { items.append(.init(name: "merged", value: "1")) }
+        return try await send(path("/api/entities", query: items))
     }
 
     func graphInsights() async throws -> GraphInsights {
