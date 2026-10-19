@@ -165,11 +165,16 @@ describe('catalog guard', () => {
   });
 
   it('reads the statement the way Postgres lexes it', () => {
-    // a dollar quote, a backslash in a standard string and a nested comment end where Postgres ends them
     for (const sql of [
+      // a dollar quote, a backslash in a standard string and a nested comment end where Postgres ends them
       "SELECT $$ ' $$ AS s FROM chunks -- '",
       "SELECT 'a\\' AS s FROM chunks -- '",
       "SELECT 1 /* /* */ ' */ FROM chunks -- '",
+      // so does a -- comment at a carriage return
+      'SELECT 1 -- x\r FROM chunks',
+      // a string continued on a later line keeps its escape mode: E'a'⏎'\'' is one E-string, and FROM follows it
+      "SELECT E'a'\n'\\'' FROM chunks --'",
+      "SELECT E'a' \v-- c\r\n\t-- d\n'\\'' FROM chunks --'",
     ]) {
       expect(() => assertCatalogTables(sql), sql).toThrow(/not readable/);
     }
@@ -177,6 +182,10 @@ describe('catalog guard', () => {
     expect(() =>
       assertCatalogTables("SELECT extract(year FROM valid_from) AS y, E'it\\'s' AS s, ARRAY[1, 2] AS a FROM v_claims WHERE id IS NOT DISTINCT FROM 'x'"),
     ).not.toThrow();
+    // a literal continued on a later line is one literal
+    expect(() => assertCatalogTables("SELECT 'a'\n'b' AS s FROM v_claims")).not.toThrow();
+    // blank and comment lines that lead to no quote are read in one pass, not split every way a nested quantifier would
+    expect(() => assertCatalogTables(`SELECT 'a'${'\n  -- c'.repeat(20_000)}\n FROM chunks`)).toThrow(/not readable/);
   });
 
   it('refuses a statement that would close the subquery it is wrapped in', () => {
