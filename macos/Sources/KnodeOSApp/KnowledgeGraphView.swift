@@ -349,18 +349,3 @@ private struct InsightMetric: View {
         .knodeCard()
     }
 }
-
-private func nodeColor(_ type: String) -> Color {
-    switch type.lowercased() {
-    case "person": .knodeGood
-    case "organization": .orange
-    case "product": .pink
-    case "project": .red
-    case "component": .blue
-    case "technology": .knodeCyan
-    case "concept": .knodeViolet
-    case "event": .purple
-    case "location": .mint
-    default: .gray
-    }
-}

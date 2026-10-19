@@ -42,6 +42,8 @@ final class AppModel: ObservableObject {
     @Published var account: AuthSnapshot?
     @Published var trustPrompt: TrustPrompt?
     @Published var pendingFilePath: String?
+    /// An entity name the graph explores when it next appears; set by Entities → Explore in graph.
+    @Published var pendingGraphQuery: String?
     /// The folder picked in the Files tree. Shared so Search can scope to it.
     @Published var pickedDirectory: String?
     @Published var workspaceRevision = 0
@@ -450,6 +452,7 @@ final class AppModel: ObservableObject {
         session = nil
         pendingUser = nil
         pendingFilePath = nil
+        pendingGraphQuery = nil
         stats = nil
         processing = nil
         authNotice = nil
@@ -585,6 +588,17 @@ final class AppModel: ObservableObject {
         return pendingFilePath
     }
 
+    /// Show the local graph around an entity: the graph tab reads the name on its next load.
+    func exploreEntity(_ name: String) {
+        pendingGraphQuery = name
+        select(.graph)
+    }
+
+    func consumePendingGraphQuery() -> String? {
+        defer { pendingGraphQuery = nil }
+        return pendingGraphQuery
+    }
+
     func refreshStats() async {
         guard phase == .app else { return }
         do {
@@ -626,6 +640,7 @@ final class AppModel: ObservableObject {
             setSession(current)
             if previousActiveID != current.activeWorkspaceID {
                 pendingFilePath = nil
+                pendingGraphQuery = nil
                 stats = nil
                 processing = nil
                 workspaceRevision += 1
@@ -684,6 +699,7 @@ final class AppModel: ObservableObject {
 
     private func workspaceDidChange(message: String) {
         pendingFilePath = nil
+        pendingGraphQuery = nil
         stats = nil
         processing = nil
         workspaceRevision += 1

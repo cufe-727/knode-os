@@ -21,7 +21,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .library: [.files, .search, .traces]
         case .ask: [.ask]
-        case .knowledge: [.graph, .wiki, .dream]
+        case .knowledge: [.graph, .entities, .wiki, .dream]
         case .settings: [.providers, .pipeline, .research, .chat, .workspace, .access]
         }
     }
@@ -39,7 +39,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .library: L("Files, search, and agent traces")
         case .ask: L("An agent that answers from your workspace")
-        case .knowledge: L("Graph, wiki, and nightly review")
+        case .knowledge: L("Graph, entities, wiki, and nightly review")
         case .settings: L("Models, ingest, research, and Ask")
         }
     }
@@ -69,6 +69,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
     case traces
     case ask
     case graph
+    case entities
     case wiki
     case dream
     case providers
@@ -94,7 +95,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .files, .search, .traces: .library
         case .ask: .ask
-        case .graph, .wiki, .dream: .knowledge
+        case .graph, .entities, .wiki, .dream: .knowledge
         case .providers, .pipeline, .research, .chat, .workspace, .access: .settings
         }
     }
@@ -116,6 +117,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .traces: L("Traces")
         case .ask: L("Ask")
         case .graph: L("Graph")
+        case .entities: L("Entities")
         case .wiki: L("Wiki")
         case .dream: L("Dream")
         case .providers: L("Providers & Agents")
@@ -134,6 +136,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .traces: L("Claude Code and Codex sessions")
         case .ask: L("An agent that answers from your workspace")
         case .graph: L("Entities, relations, and claims")
+        case .entities: L("Every entity, filtered and sorted")
         case .wiki: L("Pages researched by agent CLIs")
         case .dream: L("Review agent improvement ideas")
         case .providers: L("Endpoints, credentials, and who does the work")
@@ -152,6 +155,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .traces: "terminal"
         case .ask: "sparkles"
         case .graph: "point.3.connected.trianglepath.dotted"
+        case .entities: "tablecells"
         case .wiki: "book.closed"
         case .dream: "moon.stars"
         case .providers: "cable.connector"
@@ -458,8 +462,12 @@ struct GraphNode: Decodable, Hashable, Identifiable {
     var name: String
     var type: String
     var description: String
+    /// Mentions in an overview; hop-decayed relevance to the query in a search.
     var score: Double
     var mentionCount: Int
+    /// Live typed relations across the whole graph, not only the ones in view; absent from older services.
+    var degree: Int?
+    var wikiPath: String?
 }
 
 struct GraphEdge: Decodable, Hashable, Identifiable {
@@ -506,6 +514,45 @@ struct GraphInsights: Decodable {
     var hubs: [Hub]
     var isolated: [Isolated]
     var typeCounts: [TypeCount]
+}
+
+/// One row of Knowledge → Entities (`GET /api/entities`): a live entity with
+/// the numbers that say what it is worth. The JSON is camelCase already, and
+/// the `sources` families carry no underscore, so the snake_case decoder
+/// leaves every key as it came.
+struct EntityItem: Decodable, Identifiable, Hashable {
+    var id: String
+    var name: String
+    var type: String
+    var description: String
+    var aliases: [String]
+    var wikiPath: String?
+    /// Distinct chunks that mention the entity.
+    var mentions: Int
+    var documents: Int
+    /// Live typed relations it takes part in, from either end.
+    var relations: Int
+    var evidence: Int
+    /// Live entity evidence per extractor family: mined, link, wikilink, frontmatter, llm, human, datasource, probe, other.
+    var sources: [String: Int]
+    /// The survivor this entity was merged into, when it was.
+    var canonicalId: String?
+    var createdAt: String?
+    var updatedAt: String?
+
+    /// What the Updated column sorts by; a missing date sorts first.
+    var updatedKey: String { updatedAt ?? "" }
+}
+
+/// One page of the entity table, with the type counts of the whole table under the same `merged` setting.
+struct EntityPage: Decodable {
+    var items: [EntityItem]
+    var total: Int
+    var offset: Int
+    var limit: Int
+    var sort: String
+    var order: String
+    var typeCounts: [GraphInsights.TypeCount]
 }
 
 struct TraceItem: Decodable, Identifiable, Hashable {
