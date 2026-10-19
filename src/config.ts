@@ -772,7 +772,10 @@ export interface KnodeConfig {
     episodes?: boolean;
   };
   dream: {
-    /** Local time "HH:MM" at which the nightly dream runs while `serve` is up. */
+    /**
+     * Local 24-hour time "HH:MM" at which the nightly dream runs while `serve`
+     * is up ("3:00" is read as 03:00); the tier-2 pass follows ten minutes later.
+     */
     schedule: string;
     lookbackDays: number;
     /** Max trace excerpt characters fed to the LLM per dream run. */
@@ -1032,6 +1035,9 @@ export function loadConfig(dataDir: string): KnodeConfig {
   }
   const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<KnodeConfig>;
   const merged = migrateChatConfig(deepMerge(base, raw));
+  // the schedulers compare "HH:MM" strings, so "3:00" is held as 03:00; a value
+  // that is no time of day stays as written, and `serve` says it will not run
+  if (merged.dream) merged.dream.schedule = normalizeTimeOfDay(merged.dream.schedule) ?? merged.dream.schedule;
   const unbudgeted = dropTokenBudget(merged);
   const unchosen = dropInitExtractionChoice(merged);
   // before routes are lifted and pinned, so the copy is lifted and pinned with them
@@ -1601,6 +1607,32 @@ export function saveConfig(dataDir: string, config: KnodeConfig): void {
   const { agentLlms: _derived, modelAgents: _alsoDerived, ...persisted } = config;
   fs.writeFileSync(file, JSON.stringify(persisted, null, 2) + '\n', { mode: 0o600 });
   fs.chmodSync(file, 0o600);
+}
+
+/**
+ * A local time of day the way the nightly schedulers match it against the
+ * clock: zero-padded 24-hour "HH:MM". An unpadded hour ("3:00") is read as
+ * meant; anything else ("3am", "25:00", "03:5") is null.
+ */
+export function normalizeTimeOfDay(value: unknown): string | null {
+  const match = typeof value === 'string' ? /^\s*(\d{1,2}):(\d{2})\s*$/.exec(value) : null;
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return null;
+  return formatTimeOfDay(hours * 60 + minutes);
+}
+
+/** An "HH:MM" time of day `minutes` later: carried into the next hour, wrapped past midnight. */
+export function addMinutesToTimeOfDay(time: string, minutes: number): string {
+  const [hours, mins] = time.split(':').map(Number);
+  return formatTimeOfDay(hours * 60 + mins + minutes);
+}
+
+function formatTimeOfDay(minutesSinceMidnight: number): string {
+  const day = 24 * 60;
+  const t = ((minutesSinceMidnight % day) + day) % day;
+  return `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
 }
 
 /** Resolve "env:VAR" indirection in API keys. */

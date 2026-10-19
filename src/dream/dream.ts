@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { KnodeConfig } from '../config.js';
+import { addMinutesToTimeOfDay, KnodeConfig, normalizeTimeOfDay } from '../config.js';
 import { AppContext } from '../context.js';
 import { appendLog } from '../fs/datadir.js';
 import { safePath, walkFiles } from '../fs/files.js';
@@ -435,6 +435,20 @@ function renderReport(
   return lines.join('\n');
 }
 
+/** How long after Dream `serve` starts the nightly tier-2 pass. */
+const TIER2_DELAY_MINUTES = 10;
+
+/**
+ * When the nightly runs start, as local "HH:MM": Dream at `dream.schedule`,
+ * the tier-2 pass TIER2_DELAY_MINUTES later — in the next hour, or after
+ * midnight, when that is where the delay lands. Null while the schedule is not
+ * a time of day; then neither runs.
+ */
+export function nightlySchedule(config: Pick<KnodeConfig, 'dream'>): { dream: string; tier2: string } | null {
+  const dream = normalizeTimeOfDay(config.dream?.schedule);
+  return dream ? { dream, tier2: addMinutesToTimeOfDay(dream, TIER2_DELAY_MINUTES) } : null;
+}
+
 /**
  * Minute-resolution scheduler: fires runDream once per day at the configured
  * time. Reads `ctx.config`/`ctx.llm` on every tick so runtime config changes
@@ -446,7 +460,7 @@ export function startDreamScheduler(ctx: AppContext, log: (msg: string) => void)
     const now = new Date();
     const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     const today = now.toISOString().slice(0, 10);
-    if (hhmm === ctx.config.dream.schedule && lastRun !== today) {
+    if (hhmm === nightlySchedule(ctx.config)?.dream && lastRun !== today) {
       lastRun = today;
       try {
         const res = await runDream(ctx.store, ctx.config, ctx.llm, { onProgress: log });
