@@ -2,10 +2,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { PGlite } from '@electric-sql/pglite';
+import { PGlite, type Transaction } from '@electric-sql/pglite';
 import { vector } from '@electric-sql/pglite-pgvector';
 import { Store } from '../src/store/db.js';
-import { COOCCURS_CLEANUP_META, dropStoredCoOccurrence, MIGRATIONS, SCHEMA_VERSION } from '../src/store/migrations.js';
+import { COOCCURS_CLEANUP_META, dropStoredCoOccurrence, migrate, MIGRATIONS, type Queryable, SCHEMA_VERSION } from '../src/store/migrations.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-migrations-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -77,6 +77,59 @@ describe('upgrading early desktop databases', () => {
       expect(await reopened.query(`SELECT content FROM chunks`)).toEqual([{ content: 'Existing knowledge' }]);
     } finally {
       await reopened.close();
+    }
+  });
+});
+
+describe('telling an unversioned database from a fresh one outside public', () => {
+  // On Postgres a workspace is a schema in a shared database, reached through
+  // search_path `<schema>,public` (store/backend.ts); a SET does the same here.
+  // `public` is common ground, so only the workspace's own schema may count.
+  const queryable = (db: Pick<Transaction, 'query' | 'exec'>): Queryable => ({
+    query: async <T>(sql: string, params?: unknown[]) => (await db.query<T>(sql, params)).rows,
+    exec: async (sql) => { await db.exec(sql); },
+  });
+  const migrateOn = (db: PGlite) => migrate(queryable(db), (fn) => db.transaction((tx) => fn(queryable(tx))));
+
+  it('migrates a fresh schema from v0 although public holds a documents table', async () => {
+    const db = await PGlite.create({ extensions: { vector } });
+    try {
+      await db.exec(`
+        CREATE EXTENSION vector;
+        CREATE TABLE documents (id TEXT PRIMARY KEY);
+        INSERT INTO documents VALUES ('stray');
+        CREATE SCHEMA ws_fresh;
+        SET search_path = ws_fresh, public;
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value JSONB NOT NULL);
+      `);
+      expect(await migrateOn(db)).toEqual({ from: 0, to: SCHEMA_VERSION });
+      const q = queryable(db);
+      // read as v1, the lineage migration would have flagged a rebuild of a graph that never was
+      expect(await q.query(`SELECT key FROM meta WHERE key = 'lineage_rebuild'`)).toEqual([]);
+      expect(await q.query(`SELECT table_schema FROM information_schema.tables WHERE table_name = 'documents' ORDER BY 1`)).toEqual([
+        { table_schema: 'public' },
+        { table_schema: 'ws_fresh' },
+      ]);
+      expect(await q.query(`SELECT id FROM public.documents`)).toEqual([{ id: 'stray' }]);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('still reads an unversioned documents table in its own schema as v1', async () => {
+    const db = await PGlite.create({ extensions: { vector } });
+    try {
+      await db.exec(`
+        CREATE EXTENSION vector;
+        CREATE SCHEMA ws_legacy;
+        SET search_path = ws_legacy, public;
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value JSONB NOT NULL);
+      `);
+      await MIGRATIONS[0].up(queryable(db), { from: 0 });
+      expect(await migrateOn(db)).toEqual({ from: 1, to: SCHEMA_VERSION });
+      expect(await queryable(db).query(`SELECT key FROM meta WHERE key = 'lineage_rebuild'`)).toEqual([{ key: 'lineage_rebuild' }]);
+    } finally {
+      await db.close();
     }
   });
 });
