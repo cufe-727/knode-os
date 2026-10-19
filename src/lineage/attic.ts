@@ -27,6 +27,10 @@ export function moveSidecarToAttic(dataDir: string, key: string, scopeId: string
   return true;
 }
 
+export function hasAtticSidecar(dataDir: string, scopeId: string): boolean {
+  return fs.existsSync(safePath(dataDir, atticSidecarRel(scopeId)));
+}
+
 export function readAtticSidecar(dataDir: string, scopeId: string): Sidecar | null {
   return readSidecarFromDir(safePath(dataDir, atticSidecarRel(scopeId)));
 }

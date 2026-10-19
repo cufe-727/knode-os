@@ -77,12 +77,16 @@ export async function nextLedgerSeq(q: Queryable): Promise<number> {
 }
 
 /**
- * Take the ledger row lock without allocating a number — for a transaction
- * that folds entity rows but writes no ledger line. Every transaction that
- * folds takes this lock before touching any entity row, so two of them queue
- * here instead of waiting on each other's rows: a dispose that had folded the
- * author entity of one document while an apply folded it for the next
- * deadlocked at ingest concurrency 4 (every document of an author links it).
+ * Take the ledger row lock without allocating a number, as the first
+ * statement of every transaction that folds entity rows: scope applies and
+ * disposes (which bump the counter before they commit, so they hold the lock
+ * to the end anyway), purges and placeholder retirement. Taken first, it
+ * makes them queue here instead of waiting on each other's rows: a dispose
+ * used to take it only at its end, after its fold had locked the rows a
+ * concurrent apply, holding the counter, then waited for — Postgres
+ * "deadlock detected" between sync and tier-1 writes, and at ingest
+ * concurrency 4, where every document of an author links it. The upsert
+ * creates the row on a fresh index, so the first transactions queue too.
  */
 export async function lockLedger(q: Queryable): Promise<void> {
   await q.query(

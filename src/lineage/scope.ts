@@ -3,12 +3,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { safePath } from '../fs/files.js';
 import { RAW_DOCS } from '../fs/layout.js';
+import { removeSidecar, sidecarDir, sidecarHoldsPaidWork } from '../fs/sidecar.js';
 import { Store } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
-import { moveSidecarToAttic, readBlob, removeAtticSidecar, removeBlob } from './attic.js';
+import { hasAtticSidecar, moveSidecarToAttic, readBlob, removeAtticSidecar, removeBlob } from './attic.js';
 import { emptyPropagation, Propagation, propagate, writeDeps } from './deps.js';
 import { FoldResult, foldTouched } from './fold.js';
-import { appendLedger, LedgerScopeRef, nextLedgerSeq } from './ledger.js';
+import { appendLedger, LedgerScopeRef, lockLedger, nextLedgerSeq } from './ledger.js';
 import { TrustTier, tierForActor } from './trust.js';
 import { DisposeReason, emptyTouched, InverseSpec, ScopeKind, ScopeRow, TouchedSet, WriterStats } from './types.js';
 import { runFsOps, ScopeWriter } from './writer.js';
@@ -21,11 +22,18 @@ import { replaceRegion } from '../wiki/regions.js';
  *   applyScope    open a scope for (kind, key, sha), run the body through a
  *                 ScopeWriter, fold the touched aggregates, propagate to
  *                 dependents, commit, then run file effects and log the event.
- *                 Same (kind, key, sha) → `unchanged` before any write.
+ *                 Same (kind, key, sha) → `unchanged` before any write. A
+ *                 previous version is disposed in the same transaction, so
+ *                 an apply that fails leaves it live rather than half replaced.
  *   disposeScope  children first, then close this scope's evidence, drop its
  *                 mentions / projection, replay explicit inverses in reverse
- *                 order, fold, propagate, tombstone.
+ *                 order, fold, propagate, tombstone — all in one transaction.
  *   purgeScope    physically erase a disposed scope (evidence history, attic).
+ *
+ * Every scope transaction takes the ledger counter's lock first (lockLedger),
+ * and Store.tx runs it again when Postgres still picks it as a deadlock
+ * victim — bodies may run more than once and keep file effects for after
+ * COMMIT.
  */
 
 export interface ApplyOptions {
@@ -84,6 +92,15 @@ export interface DisposeResult {
   children: string[];
 }
 
+/** A scope disposed inside a transaction, with what is left to do once it commits. */
+interface Disposed {
+  scope: ScopeRow;
+  reason: DisposeReason;
+  seq: number;
+  ts: string;
+  fsInverses: InverseSpec[];
+}
+
 export function scopeRef(s: ScopeRow): LedgerScopeRef {
   return { id: s.id, kind: s.kind, key: s.key, sha: s.sha, parent: s.parent_id };
 }
@@ -124,7 +141,11 @@ function isoOf(v: unknown): string {
   return v instanceof Date ? v.toISOString() : String(v);
 }
 
-/** Apply a source. See module doc. */
+/**
+ * Apply a source. See module doc. `body` may run more than once (a
+ * transaction Postgres rolls back for a deadlock runs again): it writes
+ * through the writer, and whatever it counts outside starts over each time.
+ */
 export async function applyScope(
   store: Store,
   key: { kind: ScopeKind; key: string },
@@ -133,19 +154,10 @@ export async function applyScope(
   body: (w: ScopeWriter) => Promise<void>,
 ): Promise<ApplyResult> {
   const actor = opts.actor ?? 'system';
+  const unchanged = (scope: ScopeRow): ApplyResult =>
+    ({ scope, outcome: 'unchanged', touched: emptyTouched(), fold: null, propagation: emptyPropagation(), stats: zeroStats() });
   const live = await findLiveScope(store, key.kind, key.key);
-  if (live && live.sha === sha && !opts.force) {
-    return { scope: live, outcome: 'unchanged', touched: emptyTouched(), fold: null, propagation: emptyPropagation(), stats: zeroStats() };
-  }
-  if (live && (opts.replace ?? true)) {
-    await disposeScope(store, live.id, {
-      actor,
-      reason: 'replaced',
-      at: opts.at,
-      keepProjection: opts.keepProjectionOnReplace ?? key.kind === 'doc',
-      log: opts.log,
-    });
-  }
+  if (live && live.sha === sha && !opts.force) return unchanged(live);
 
   const txTime = opts.at ?? new Date().toISOString();
   const id = crypto.createHash('sha256').update(`${key.kind}|${key.key}|${sha}|${txTime}|${opts.parentId ?? ''}`).digest('hex').slice(0, 24);
@@ -171,29 +183,41 @@ export async function applyScope(
     if (parent?.trust === 'quarantined') trust = 'quarantined';
   }
   const acl = opts.acl ?? [];
+  const ontology = loadOntology(store.dataDir);
+  const precedence = typePrecedence(ontology);
 
   let writer!: ScopeWriter;
   let seq = 0;
-  let result!: ApplyResult;
-  await store.tx(async (q) => {
+  let disposed: Disposed[] = [];
+  const result = await store.tx(async (q): Promise<ApplyResult> => {
+    disposed = [];
     // the ledger lock comes first in every transaction that folds entity rows
     // (dispose, purge, placeholder retirement too): scope transactions queue
     // on it instead of deadlocking on the entity rows they both fold
-    seq = await nextLedgerSeq(q);
+    await lockLedger(q);
+    // the live version as of this transaction: a retry runs after whoever won the deadlock committed
+    const current = await findLiveScope(q, key.kind, key.key);
+    if (current && current.sha === sha && !opts.force) return unchanged(current);
+    if (current && (opts.replace ?? true)) {
+      await disposeTree(q, current, { reason: 'replaced', keepProjection: opts.keepProjectionOnReplace ?? key.kind === 'doc' }, txTime, precedence, disposed);
+    }
     await q.query(
       `INSERT INTO scopes (id, kind, key, sha, parent_id, status, actor, applied_at, meta, trust, acl)
        VALUES ($1, $2, $3, $4, $5, 'applying', $6, $7::timestamptz, $8::jsonb, $9, $10::jsonb)`,
       [id, scope.kind, scope.key, sha, scope.parent_id, actor, txTime, JSON.stringify(scope.meta), trust, JSON.stringify(acl)],
     );
-    writer = new ScopeWriter(q, scope, txTime, store.dataDir, trust);
+    seq = await nextLedgerSeq(q);
+    writer = new ScopeWriter(q, scope, txTime, store.dataDir, trust, ontology);
     await body(writer);
-    const fold = await foldTouched(q, writer.touched, txTime, { typePrecedence: typePrecedence(writer.ontology) });
+    const fold = await foldTouched(q, writer.touched, txTime, { typePrecedence: precedence });
     const propagation = await propagate(q, fold.changed, fold.tombstoned, txTime);
     await q.query(`UPDATE scopes SET status = 'active' WHERE id = $1`, [id]);
-    scope.status = 'active';
-    result = { scope, outcome: 'applied', touched: writer.touched, fold, propagation, stats: writer.stats };
+    return { scope, outcome: 'applied', touched: writer.touched, fold, propagation, stats: writer.stats };
   });
+  if (result.outcome === 'unchanged') return result;
+  scope.status = 'active';
 
+  settleDisposed(store.dataDir, disposed, actor, opts.log);
   runFsOps(store.dataDir, writer.fsOps);
   if (opts.log ?? true) {
     appendLedger(store.dataDir, {
@@ -208,94 +232,112 @@ export async function applyScope(
   return result;
 }
 
-/** Dispose a scope: revert everything it produced (children first). */
+/**
+ * Dispose a scope: revert everything it produced, children first, in one
+ * transaction — a dispose that fails leaves the whole tree live.
+ */
 export async function disposeScope(store: Store, scopeId: string, opts: DisposeOptions): Promise<DisposeResult | null> {
-  const scope = await scopeById(store, scopeId);
-  if (!scope || scope.status === 'disposed') return null;
   const actor = opts.actor ?? 'system';
-  const children = await liveChildren(store, scopeId);
-  for (const child of children) {
-    await disposeScope(store, child.id, { actor, reason: opts.reason, at: opts.at, keepProjection: false, log: opts.log });
-  }
-
   const txTime = opts.at ?? new Date().toISOString();
+  const precedence = typePrecedence(loadOntology(store.dataDir));
+  let disposed: Disposed[] = [];
+  const result = await store.tx(async (q) => {
+    disposed = [];
+    await lockLedger(q);
+    const scope = await scopeById(q, scopeId);
+    if (!scope || scope.status === 'disposed') return null;
+    return disposeTree(q, scope, { reason: opts.reason, keepProjection: opts.keepProjection }, txTime, precedence, disposed);
+  });
+  settleDisposed(store.dataDir, disposed, actor, opts.log);
+  return result;
+}
+
+/** Dispose `scope` and its live children (first) inside an open transaction; what is left for after COMMIT goes to `out`. */
+async function disposeTree(
+  q: Queryable,
+  scope: ScopeRow,
+  opts: { reason: DisposeReason; keepProjection?: boolean },
+  txTime: string,
+  precedence: readonly string[],
+  out: Disposed[],
+): Promise<DisposeResult> {
+  const children = await liveChildren(q, scope.id);
+  for (const child of children) await disposeTree(q, child, { reason: opts.reason }, txTime, precedence, out);
+
+  const scopeId = scope.id;
+  const touched = emptyTouched();
+  const tombstoned = emptyTouched();
   const fsInverses: InverseSpec[] = [];
-  let seq = 0;
-  let result!: DisposeResult;
   // The document projection — chunks, the embeddings that cascade from them,
   // the documents row — belongs to the doc scope alone. A child (a tier-1
   // extraction, human prose on a generated page) names the document only to
   // find it: disposing one, or replacing it with a fresh extraction, must leave
   // the projection in place, or every vector of the document is paid for again.
   const documentId = scope.kind === 'doc' && typeof scope.meta.documentId === 'string' ? scope.meta.documentId : null;
-  const precedence = typePrecedence(loadOntology(store.dataDir));
 
-  await store.tx(async (q) => {
-    // same lock order as applyScope: the ledger lock before any entity row,
-    // or a dispose folding what a concurrent apply folds deadlocks with it
-    seq = await nextLedgerSeq(q);
-    const touched = emptyTouched();
-    const tombstoned = emptyTouched();
-
-    const ev = await q.query<{ kind: string; target_id: string }>(
-      `UPDATE evidence SET tx_to = $2::timestamptz WHERE scope_id = $1 AND tx_to IS NULL RETURNING kind, target_id`,
-      [scopeId, txTime],
-    );
-    for (const r of ev) {
-      if (r.kind === 'entity') touched.entities.add(r.target_id);
-      else if (r.kind === 'relation') touched.relations.add(r.target_id);
-      else if (r.kind === 'claim') touched.claims.add(r.target_id);
-    }
-    const mentions = await q.query<{ entity_id: string }>(`DELETE FROM entity_mentions WHERE scope_id = $1 RETURNING entity_id`, [scopeId]);
-    for (const m of mentions) touched.entities.add(m.entity_id);
-
-    // capabilities, their locators and their notes are scope-owned: closing
-    // them here is what retires a source's query surface along with the source
-    for (const table of ['capabilities', 'capability_notes', 'locators']) {
-      await q.query(`UPDATE ${table} SET tx_to = $2::timestamptz WHERE scope_id = $1 AND tx_to IS NULL`, [scopeId, txTime]);
-    }
-
-    if (documentId && !opts.keepProjection) {
-      await q.query(`DELETE FROM chunks WHERE document_id = $1`, [documentId]);
-      await q.query(`UPDATE documents SET status = 'disposed', scope_id = NULL, updated_at = now() WHERE id = $1`, [documentId]);
-      touched.documents.add(scope.key);
-      tombstoned.documents.add(scope.key);
-    }
-
-    const effects = await q.query<{ seq: number; kind: string; target: string; inverse: InverseSpec }>(
-      `SELECT seq, kind, target, inverse FROM effects WHERE scope_id = $1 AND reverted_at IS NULL ORDER BY seq DESC`,
-      [scopeId],
-    );
-    for (const e of effects) {
-      await revertEffect(q, e.inverse, opts.reason, txTime, touched, tombstoned, fsInverses);
-      await q.query(`UPDATE effects SET reverted_at = $2::timestamptz WHERE seq = $1`, [e.seq, txTime]);
-    }
-
-    const fold = await foldTouched(q, touched, txTime, { typePrecedence: precedence });
-    for (const d of tombstoned.documents) fold.tombstoned.documents.add(d);
-    for (const d of tombstoned.datasets) fold.tombstoned.datasets.add(d);
-    for (const d of touched.documents) fold.changed.documents.add(d);
-    for (const d of touched.datasets) fold.changed.datasets.add(d);
-    const propagation = await propagate(q, fold.changed, fold.tombstoned, txTime, { archive: opts.reason !== 'replaced' });
-
-    await q.query(
-      `UPDATE scopes SET status = 'disposed', disposed_at = $2::timestamptz, meta = meta || $3::jsonb WHERE id = $1`,
-      [scopeId, txTime, JSON.stringify({ reason: opts.reason })],
-    );
-    result = { scope: { ...scope, status: 'disposed', disposed_at: txTime }, touched, fold, propagation, children: children.map((c) => c.id) };
-  });
-
-  runInverseFsOps(store.dataDir, fsInverses, opts.reason);
-  // a removed document's sidecar (paid extraction, usage history) goes to the
-  // attic; the raw file itself is the user's and is never touched here
-  let attic: string | null = null;
-  if (scope.kind === 'doc' && opts.reason === 'removed' && scope.key.startsWith(`${RAW_DOCS}/`)) {
-    if (moveSidecarToAttic(store.dataDir, scope.key, scopeId)) attic = scopeId;
+  const ev = await q.query<{ kind: string; target_id: string }>(
+    `UPDATE evidence SET tx_to = $2::timestamptz WHERE scope_id = $1 AND tx_to IS NULL RETURNING kind, target_id`,
+    [scopeId, txTime],
+  );
+  for (const r of ev) {
+    if (r.kind === 'entity') touched.entities.add(r.target_id);
+    else if (r.kind === 'relation') touched.relations.add(r.target_id);
+    else if (r.kind === 'claim') touched.claims.add(r.target_id);
   }
-  if (opts.log ?? true) {
-    appendLedger(store.dataDir, { seq, ts: txTime, ev: 'dispose', actor, scope: scopeRef(scope), reason: opts.reason, attic });
+  const mentions = await q.query<{ entity_id: string }>(`DELETE FROM entity_mentions WHERE scope_id = $1 RETURNING entity_id`, [scopeId]);
+  for (const m of mentions) touched.entities.add(m.entity_id);
+
+  // capabilities, their locators and their notes are scope-owned: closing
+  // them here is what retires a source's query surface along with the source
+  for (const table of ['capabilities', 'capability_notes', 'locators']) {
+    await q.query(`UPDATE ${table} SET tx_to = $2::timestamptz WHERE scope_id = $1 AND tx_to IS NULL`, [scopeId, txTime]);
   }
-  return result;
+
+  if (documentId && !opts.keepProjection) {
+    await q.query(`DELETE FROM chunks WHERE document_id = $1`, [documentId]);
+    await q.query(`UPDATE documents SET status = 'disposed', scope_id = NULL, updated_at = now() WHERE id = $1`, [documentId]);
+    touched.documents.add(scope.key);
+    tombstoned.documents.add(scope.key);
+  }
+
+  const effects = await q.query<{ seq: number; kind: string; target: string; inverse: InverseSpec }>(
+    `SELECT seq, kind, target, inverse FROM effects WHERE scope_id = $1 AND reverted_at IS NULL ORDER BY seq DESC`,
+    [scopeId],
+  );
+  for (const e of effects) {
+    await revertEffect(q, e.inverse, opts.reason, txTime, touched, tombstoned, fsInverses);
+    await q.query(`UPDATE effects SET reverted_at = $2::timestamptz WHERE seq = $1`, [e.seq, txTime]);
+  }
+
+  const fold = await foldTouched(q, touched, txTime, { typePrecedence: precedence });
+  for (const d of tombstoned.documents) fold.tombstoned.documents.add(d);
+  for (const d of tombstoned.datasets) fold.tombstoned.datasets.add(d);
+  for (const d of touched.documents) fold.changed.documents.add(d);
+  for (const d of touched.datasets) fold.changed.datasets.add(d);
+  const propagation = await propagate(q, fold.changed, fold.tombstoned, txTime, { archive: opts.reason !== 'replaced' });
+
+  await q.query(
+    `UPDATE scopes SET status = 'disposed', disposed_at = $2::timestamptz, meta = meta || $3::jsonb WHERE id = $1`,
+    [scopeId, txTime, JSON.stringify({ reason: opts.reason })],
+  );
+  out.push({ scope, reason: opts.reason, seq: await nextLedgerSeq(q), ts: txTime, fsInverses });
+  return { scope: { ...scope, status: 'disposed', disposed_at: txTime }, touched, fold, propagation, children: children.map((c) => c.id) };
+}
+
+/** After COMMIT, in dispose order (children first): file inverses, the attic move, the ledger line. */
+function settleDisposed(dataDir: string, disposed: Disposed[], actor: string, log: boolean | undefined): void {
+  for (const d of disposed) {
+    runInverseFsOps(dataDir, d.fsInverses, d.reason);
+    // a removed document's sidecar (paid extraction, usage history) goes to the
+    // attic; the raw file itself is the user's and is never touched here
+    let attic: string | null = null;
+    if (d.scope.kind === 'doc' && d.reason === 'removed' && d.scope.key.startsWith(`${RAW_DOCS}/`)) {
+      if (moveSidecarToAttic(dataDir, d.scope.key, d.scope.id)) attic = d.scope.id;
+    }
+    if (log ?? true) {
+      appendLedger(dataDir, { seq: d.seq, ts: d.ts, ev: 'dispose', actor, scope: scopeRef(d.scope), reason: d.reason, attic });
+    }
+  }
 }
 
 async function revertEffect(
@@ -434,6 +476,79 @@ function runInverseFsOps(dataDir: string, inverses: InverseSpec[], reason: Dispo
   }
 }
 
+export interface OrphanResult {
+  /** The documents row was tombstoned here (its chunks and embeddings dropped). */
+  tombstoned: boolean;
+  chunks: number;
+  /** Attic entry the sidecar moved to (the document's last scope id). */
+  attic: string | null;
+  propagation: Propagation;
+}
+
+/**
+ * Dispose what is left of a removed document that no live scope owns: its
+ * search projection and, under raw/docs, its sidecar. A re-index that failed
+ * half way left this behind while a replace still ran as two transactions —
+ * the old version disposed as 'replaced' (which keeps chunks, embeddings and
+ * the documents row for the new apply), the new version never committed —
+ * and once the source is gone no dispose ever comes for it. This does what
+ * the document scope's own dispose would have: drop the chunks, tombstone the
+ * row, fold the entities its mentions touched, archive the pages that
+ * required it, and move the sidecar to the attic under the document's last
+ * scope (or, with no scope to file it under, keep it if it holds paid work).
+ * Returns null while a live scope owns the key.
+ */
+export async function disposeOrphanDocument(
+  store: Store,
+  key: string,
+  opts: { actor?: string; at?: string; log?: boolean } = {},
+): Promise<OrphanResult | null> {
+  const scopes = await scopesForKey(store, 'doc', key);
+  if (scopes.some((s) => s.status !== 'disposed')) return null;
+  const [last] = scopes;
+  const actor = opts.actor ?? 'system';
+  const txTime = opts.at ?? new Date().toISOString();
+  const [doc] = await store.query<{ id: string }>(
+    `SELECT d.id FROM documents d
+     WHERE d.path = $1 AND (d.status <> 'disposed' OR EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.id))`,
+    [key],
+  );
+  const dropped = !doc ? null : await store.tx(async (q) => {
+    await lockLedger(q);
+    if (await findLiveScope(q, 'doc', key)) return 'live' as const; // applied since the caller looked
+    const precedence = typePrecedence(loadOntology(store.dataDir));
+    const touched = emptyTouched();
+    const tombstoned = emptyTouched();
+    const mentioned = await q.query<{ entity_id: string }>(
+      `SELECT DISTINCT m.entity_id FROM chunks c JOIN entity_mentions m ON m.chunk_id = c.id WHERE c.document_id = $1`,
+      [doc.id],
+    );
+    for (const m of mentioned) touched.entities.add(m.entity_id);
+    const chunks = await q.query<{ id: string }>(`DELETE FROM chunks WHERE document_id = $1 RETURNING id`, [doc.id]);
+    await q.query(`UPDATE documents SET status = 'disposed', scope_id = NULL, updated_at = now() WHERE id = $1`, [doc.id]);
+    touched.documents.add(key);
+    tombstoned.documents.add(key);
+    const fold = await foldTouched(q, touched, txTime, { typePrecedence: precedence });
+    for (const d of tombstoned.documents) fold.tombstoned.documents.add(d);
+    const propagation = await propagate(q, fold.changed, fold.tombstoned, txTime);
+    return { chunks: chunks.length, propagation, seq: last ? await nextLedgerSeq(q) : 0 };
+  });
+  if (dropped === 'live') return null;
+
+  // the sidecar takes the way a removal's would; an attic entry the last scope
+  // already has (it was removed once before) is never overwritten
+  let attic: string | null = null;
+  if (key.startsWith(`${RAW_DOCS}/`) && fs.existsSync(sidecarDir(store.dataDir, key))) {
+    if (last && !hasAtticSidecar(store.dataDir, last.id) && moveSidecarToAttic(store.dataDir, key, last.id)) attic = last.id;
+    else if (!sidecarHoldsPaidWork(store.dataDir, key)) removeSidecar(store.dataDir, key);
+  }
+  if (last && (dropped || attic) && (opts.log ?? true)) {
+    const seq = dropped?.seq || (await nextLedgerSeq(store));
+    appendLedger(store.dataDir, { seq, ts: txTime, ev: 'dispose', actor, scope: scopeRef(last), reason: 'removed', attic });
+  }
+  return { tombstoned: Boolean(dropped), chunks: dropped?.chunks ?? 0, attic, propagation: dropped?.propagation ?? emptyPropagation() };
+}
+
 export interface PurgeResult {
   purged: string[];
   orphansRemoved: { claims: number; relations: number; entities: number };
@@ -455,6 +570,7 @@ export async function purgeScope(store: Store, scopeId: string, opts: { actor?: 
   let seq = 0;
   let orphans = { claims: 0, relations: 0, entities: 0 };
   await store.tx(async (q) => {
+    await lockLedger(q);
     await q.query(`DELETE FROM evidence WHERE scope_id = $1`, [scopeId]);
     await q.query(`DELETE FROM effects WHERE scope_id = $1`, [scopeId]);
     await q.query(`DELETE FROM entity_mentions WHERE scope_id = $1`, [scopeId]);

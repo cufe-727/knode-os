@@ -12,7 +12,7 @@ import { buildWikiIndex } from '../graph/wire.js';
 import { DATASOURCES_PREFIX, declaredKey, enumerateDeclared, matchesPrefixes, normalizePrefixes } from '../lineage/declared.js';
 import { recountAll } from '../lineage/fold.js';
 import { appendLedger, nextLedgerSeq, readLedger } from '../lineage/ledger.js';
-import { disposeScope } from '../lineage/scope.js';
+import { disposeOrphanDocument, disposeScope } from '../lineage/scope.js';
 import { ScopeKind, ScopeRow } from '../lineage/types.js';
 import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
@@ -203,13 +203,33 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
     stats.disposed++;
   }
 
-  // orphan sidecars: neither a raw original nor a live scope (disposed
-  // sources moved theirs to the attic a moment ago, so nothing paid is lost)
+  // orphans: what a removed source left that no live scope owns, so no
+  // dispose above reaches it — a search projection a re-index that failed
+  // half way left behind, or a raw/docs sidecar with neither a raw original
+  // nor a live scope (disposed sources moved theirs to the attic a moment
+  // ago). Each goes the way a removal would: chunks dropped, row tombstoned,
+  // pages archived, sidecar to the attic — never just deleted while it holds
+  // paid extraction.
+  const orphans = new Set<string>();
+  const unowned = await store.query<{ path: string }>(
+    `SELECT d.path FROM documents d
+     WHERE (d.status <> 'disposed' OR EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.id))
+       AND NOT EXISTS (SELECT 1 FROM scopes s WHERE s.kind = 'doc' AND s.key = d.path AND s.status <> 'disposed')`,
+  );
+  for (const { path: key } of unowned) {
+    if (matchesPrefixes(key, prefixes) && !declared.has(declaredKey('doc', key)) && !failed.has(key)) orphans.add(key);
+  }
   if (touchesDocs && preparedDocs) {
     for (const key of listSidecarKeys(ctx.dataDir, RAW_DOCS)) {
       if (preparedDocs.has(key) || failed.has(key) || running.has(declaredKey('doc', key)) || !matchesPrefixes(key, prefixes)) continue;
-      removeSidecar(ctx.dataDir, key);
+      orphans.add(key);
     }
+  }
+  for (const key of orphans) {
+    const r = await disposeOrphanDocument(store, key, { actor });
+    if (!r?.tombstoned) continue;
+    progress(`dispose orphaned projection ${key}`);
+    stats.removed++;
   }
 
   // added / replaced documents
@@ -240,8 +260,13 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
       stats.errors++;
       const msg = err instanceof Error ? err.message : String(err);
       progress(`error ${d.key}: ${msg}`);
+      // a re-index that failed leaves the previous version live (the replace
+      // is one transaction): its row stays searchable and only records the error
       await store.query(
-        `UPDATE documents SET status = 'error', error = $2, updated_at = now() WHERE path = $1`,
+        `UPDATE documents
+         SET status = CASE WHEN EXISTS (SELECT 1 FROM scopes s WHERE s.id = documents.scope_id AND s.status = 'active') THEN status ELSE 'error' END,
+             error = $2, updated_at = now()
+         WHERE path = $1`,
         [d.key, msg.slice(0, 500)],
       );
     }

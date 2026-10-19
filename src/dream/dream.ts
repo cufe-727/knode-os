@@ -111,6 +111,7 @@ export async function runDream(
 
   const rows: SuggestionRow[] = [];
   const res = await applyScope(store, { kind: 'dream', key: today }, inputsSha, { actor: 'dream', meta: { sessions: digests.length } }, async (w) => {
+    rows.length = 0; // a transaction rolled back for a deadlock runs the body again
     await w.writeFile(reportPath, report);
     await w.page({
       path: reportPath,
