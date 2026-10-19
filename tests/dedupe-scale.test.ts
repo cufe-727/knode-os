@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
-import { auditDuplicateClaims, claimPairId } from '../src/graph/claim-dedupe.js';
+import { auditDuplicateClaims, claimPairId, ClaimRelation } from '../src/graph/claim-dedupe.js';
 import { auditDuplicateEntities, mergeSuggestionId } from '../src/graph/dedupe.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import { sync } from '../src/ingest/sync.js';
@@ -15,7 +15,9 @@ import { sourcesOf } from '../src/store/claims.js';
  * The duplicate audits at the sizes a real workspace reaches: a nightly run
  * over every claim (or entity) brings up more candidate pairs than one
  * statement can bind (Postgres and PGlite both stop at 65,535 parameters), so
- * id lists go to the database as one array parameter.
+ * id lists go to the database as one array parameter. It also brings up more
+ * pairs than one night can judge, so the claim audit judges at most
+ * review.claimMergeMaxJudgedPerRun of them, the most promising first.
  */
 
 const MAX_PARAMS = 65_535;
@@ -52,12 +54,14 @@ function everyPair(ids: string[], key: (a: string, b: string) => string): { id: 
 
 const pairLabel = (a: string, b: string) => [a, b].sort().join(' | ');
 
-/** A judge that answers nothing and records the pairs it was shown. */
-function recordingJudge(shown: string[]): LlmClient {
+/** A judge that records the pairs it was shown (`calls`: call by call) and answers nothing, or `relation` for every pair. */
+function recordingJudge(shown: string[], opts: { relation?: ClaimRelation; calls?: string[][] } = {}): LlmClient {
   const completeJson = async (messages: { role: string; content: string }[]) => {
     const user = messages.find((m) => m.role === 'user')?.content ?? '';
-    for (const m of user.matchAll(/Pair \d+ — subject: [^\n]*\nA: "([^"]*)"[\s\S]*?\nB: "([^"]*)"/g)) shown.push(pairLabel(m[1], m[2]));
-    return { verdicts: [] };
+    const pairs = [...user.matchAll(/Pair \d+ — subject: [^\n]*\nA: "([^"]*)"[\s\S]*?\nB: "([^"]*)"/g)].map((m) => pairLabel(m[1], m[2]));
+    shown.push(...pairs);
+    opts.calls?.push(pairs);
+    return { verdicts: opts.relation ? pairs.map((_, i) => ({ pair: i + 1, relation: opts.relation, confidence: 0.3, reason: '测试' })) : [] };
   };
   return { enabled: true, label: 'stub', provider: 'openai', model: 'stub', completeJson } as unknown as LlmClient;
 }
@@ -78,6 +82,20 @@ describe('the duplicate-claim audit at scale', () => {
   afterAll(async () => {
     await ctx?.datasources.closeAll();
     await ctx?.store.close();
+  });
+
+  it('judges no more of a backlog than one run may, and leaves the rest for later', async () => {
+    // the first night after a long outage: no pair has a verdict yet. The stub
+    // answers nothing, so `judged` stays 0 and the next test finds no verdicts.
+    const total = (n * (n - 1)) / 2;
+    const calls: string[][] = [];
+    const lines: string[] = [];
+    const stats = await auditDuplicateClaims({ store: ctx.store, embedder: ctx.embedder, config: ctx.config, llm: recordingJudge([], { calls }) }, { onProgress: (m) => lines.push(m) });
+    expect(ctx.config.review.claimMergeMaxJudgedPerRun).toBe(1200);
+    expect(stats).toMatchObject({ candidates: total, deferred: total - 1200 });
+    expect(calls).toHaveLength(100);
+    expect(new Set(calls.flat()).size).toBe(1200);
+    expect(lines).toContain(`claims: 0 merged, 0 merge suggestions, 0 contradictions (${total} pairs, 0 judged, ${total - 1200} left for later)`);
   });
 
   it('looks up the decided pairs among more candidates than one statement can bind', async () => {
@@ -158,6 +176,105 @@ describe('the duplicate-claim audit at scale', () => {
     const ids = [claim.id, ...Array.from({ length: 70_000 }, (_, i) => `claim-${i}`)];
     expect(ids.length).toBeGreaterThan(MAX_PARAMS);
     expect(await sourcesOf(ctx.store, ids)).toEqual(new Map([[claim.id, ['raw/docs/jia.md']]]));
+  });
+});
+
+describe('the claim audit\'s per-run judge limit', () => {
+  const dataDir = path.join(tmp, 'judge-limit');
+  let ctx: AppContext;
+  // all share 20%: pairs only the judge can settle, and tied on every signal
+  const statement = (i: number) => `第${i}项业务收入同比增长20%`;
+  const limited = (max: number) => ({ ...ctx.config, review: { ...ctx.config.review, claimMergeMaxJudgedPerRun: max } });
+
+  beforeAll(async () => {
+    initDataDir(dataDir);
+    // the rules settle two more pairs: one revenue figure for two years, and a buyback plan
+    // whose twin, identical once normalized, comes in the later document
+    write(dataDir, 'raw/docs/old.md', claimsDoc('丙公司', [...Array.from({ length: 6 }, (_, i) => statement(i)), '丙公司2024年营收100亿元', '丙公司2025年营收100亿元', '丙公司计划回购股份。']));
+    ctx = await createContext(dataDir);
+    await sync(ctx, { llmGraph: false });
+    // written later: these are the newest claims
+    write(dataDir, 'raw/docs/new.md', claimsDoc('丙公司', [statement(6), statement(7), '丙公司 计划回购股份']));
+    await sync(ctx, { llmGraph: false });
+  });
+  afterAll(async () => {
+    await ctx?.datasources.closeAll();
+    await ctx?.store.close();
+  });
+
+  it('settles rule pairs whatever the limit, and judges the rest over several runs, newest claims first', async () => {
+    const { store, embedder } = ctx;
+    const shown: string[] = [];
+    const run = async (max: number) => {
+      const calls: string[][] = [];
+      const lines: string[] = [];
+      const stats = await auditDuplicateClaims({ store, embedder, config: limited(max), llm: recordingJudge(shown, { relation: 'unrelated', calls }) }, { onProgress: (m) => lines.push(m) });
+      return { stats, calls, lines };
+    };
+
+    // with no judge calls allowed, the rule pairs still settle
+    const first = await run(0);
+    expect(first.stats).toMatchObject({ candidates: 30, identical: 1, differentTime: 1, merged: 1, judged: 0, deferred: 28 });
+    expect(first.calls).toEqual([]);
+    expect(first.lines).toContain('claims: 1 merged, 0 merge suggestions, 0 contradictions (30 pairs, 0 judged, 28 left for later)');
+
+    // the 13 pairs with a claim of the later document go first
+    const second = await run(13);
+    expect(second.stats).toMatchObject({ candidates: 29, identical: 0, differentTime: 0, judged: 13, deferred: 15 });
+    expect(second.calls.map((c) => c.length)).toEqual([12, 1]);
+    const newer = [statement(6), statement(7)];
+    for (const label of second.calls.flat()) expect(newer.some((s) => label.split(' | ').includes(s))).toBe(true);
+    expect(second.lines).toContain('claims: 0 merged, 0 merge suggestions, 0 contradictions (29 pairs, 13 judged, 15 left for later)');
+
+    // what was left comes up again until every pair has a verdict, and none is judged twice
+    expect((await run(13)).stats).toMatchObject({ judged: 13, deferred: 2 });
+    expect((await run(13)).stats).toMatchObject({ judged: 2, deferred: 0 });
+    const last = await run(13);
+    expect(last.stats).toMatchObject({ judged: 0, deferred: 0 });
+    expect(last.calls).toEqual([]);
+    expect(last.lines).toEqual([]);
+    expect(shown).toHaveLength(28);
+    expect(new Set(shown)).toEqual(new Set(everyPair(Array.from({ length: 8 }, (_, i) => statement(i)), pairLabel).map((p) => p.id)));
+  });
+
+  it('sends the most promising pairs first', async () => {
+    const { store } = ctx;
+    const same = ['丁公司计划扩大海外产能', '丁公司打算扩充在海外的生产能力'];
+    const close = ['丁公司今年将新开十家门店', '丁公司年内准备开设十家新店'];
+    const negated = ['丁公司会提高分红比例', '丁公司不会提高分红比例'];
+    const numbers = ['丁公司毛利率为30%，净利率为12%', '丁公司销售费用率30%，研发费用率12%', '丁公司海外收入占比30%'];
+    write(dataDir, 'raw/docs/ding.md', claimsDoc('丁公司', [...same, ...negated, numbers[0], numbers[1]]));
+    await sync(ctx, { llmGraph: false });
+    // newer, so the newest-claim rule would take these first if similarity and shared numbers did not come before it
+    write(dataDir, 'raw/docs/ding-later.md', claimsDoc('丁公司', [...close, numbers[2]]));
+    await sync(ctx, { llmGraph: false });
+    const focus = (await store.query<{ id: string }>(`SELECT id FROM claims WHERE subject_id = '丁公司' AND tx_to IS NULL`)).map((r) => r.id);
+    expect(focus).toHaveLength(9);
+
+    // cosine 1 for the first and the negated pair, 0.9 for the second; the claims that share numbers point elsewhere
+    const dim = store.embeddingDim;
+    const axis = (k: number, v = 1) => Array.from({ length: dim }, (_, i) => (i === k ? v : 0));
+    const vectors = new Map<string, number[]>([
+      [same[0], axis(0)], [same[1], axis(0)],
+      [close[0], axis(1)], [close[1], axis(1, 0.9).map((v, i) => (i === 2 ? Math.sqrt(1 - 0.81) : v))],
+      [negated[0], axis(3)], [negated[1], axis(3)],
+      ...numbers.map((s, k): [string, number[]] => [s, axis(4 + k)]),
+    ]);
+    const embedder: EmbeddingProvider = { model: 'test-vectors', dimensions: dim, embed: async (texts) => texts.map((t) => vectors.get(t.slice(t.indexOf('：') + 1))!) };
+    const config = { ...ctx.config, embedding: { ...ctx.config.embedding, provider: 'openai' as const } };
+
+    const shown: string[] = [];
+    const all = await auditDuplicateClaims({ store, embedder, config, llm: recordingJudge(shown) }, { focus });
+    expect(all).toMatchObject({ embedded: 9, candidates: 6, deferred: 0 });
+    // alike in meaning before sharing a number; free to merge before guarded (the negation); closer, then more numbers in common
+    expect(shown.slice(0, 4)).toEqual([pairLabel(same[0], same[1]), pairLabel(close[0], close[1]), pairLabel(negated[0], negated[1]), pairLabel(numbers[0], numbers[1])]);
+    expect(new Set(shown.slice(4))).toEqual(new Set([pairLabel(numbers[0], numbers[2]), pairLabel(numbers[1], numbers[2])]));
+
+    // the stub remembered nothing, so a limited run starts from the same pairs
+    const firstTwo: string[] = [];
+    const limitedRun = await auditDuplicateClaims({ store, embedder, config: { ...config, review: { ...config.review, claimMergeMaxJudgedPerRun: 2 } }, llm: recordingJudge(firstTwo) }, { focus });
+    expect(limitedRun).toMatchObject({ candidates: 6, deferred: 4 });
+    expect(firstTwo).toEqual(shown.slice(0, 2));
   });
 });
 

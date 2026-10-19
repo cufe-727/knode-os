@@ -206,6 +206,11 @@ Known entities: …                                       ← 见下
 ### 4.4 判断模型
 
 - 走「判断」路由（`ctx.llm`），**成批**：一次调用判至多 12 对，不分主体。实体消歧今天是一对一次调用；断言量大，一对一次会让判断调用比抽取还多。
+- **每轮至多判 `review.claimMergeMaxJudgedPerRun` 对**（默认 1,200，即 100 次调用），最有希望的先判：相似度信号找出的对排在只靠数字相同找出的对前面；
+  §4.3 里没有一条拦着不让自动合并的对排在其余的前面；再按相似度高、相同的关键数字多、断言新排。其余的对没有结论，下一轮还会被提出，夜间那轮比较全部断言。
+  逐字相同、时期不同的对由 §4.3 定，不调模型，也从不排队。不设上限时，积压会拖住 tier 2 的其余步骤：finance 最大的两次夜间运行判了 7,531 和 9,252 对，
+  各用了约四小时（每次调用约 20 秒）。按这个顺序，finance 已判的 28,974 对（2026-10-19）里，促成合并、建议或矛盾标记的 1,628 个结论有 681 个落在前 1,200 对；
+  按当时判的顺序是 141 个。只靠数字相同找出的对占已判的 55%，其中有结果的只有 0.9%。
 - 每对给出：主体；两条的原文、type、状态、事件时间 / 有效期 / 文档日期、来源路径；各自落点切块的 300 字摘录。
 - 规则：只有一条蕴含另一条（同样的事实、同一时期、同样的数字）才算 same；舍入后一致的数字算同一个数，超出舍入的不同才是 conflict；
   时期不同是 different_time；拿不准就给低置信。每对返回 `{relation, keep: "a" | "b", confidence, reason}`，理由用断言的语言写。
@@ -264,14 +269,15 @@ Known entities: …                                       ← 见下
 },
 "review": {
   "claimMerge": "auto",             // 新增：off / suggest / auto
-  "claimMergeMinConfidence": 0.9    // 新增：auto 合并的置信门槛
+  "claimMergeMinConfidence": 0.9,   // 新增：auto 合并的置信门槛
+  "claimMergeMaxJudgedPerRun": 1200 // 每轮判定的对数，最有希望的先判（§4.4）；其余留给之后的运行
 }
 ```
 
 - **数据库迁移**：`claims.canonical_id`、`claim_links`、`claim_pair_verdicts`、`extraction_queue.segments_total / segments_done`；
   `v_claims` 视图追加 `canonical_id` 列并只出代表；`claim_embeddings` 写进 `embeddingsDdl`（`src/store/db.ts`）。
 - **配置迁移**：不用改写文件。新键都有默认值，`batchSize` 的值照用。
-- **`PUT /api/config`**：接收 `review.claimMerge`；`segmentChars`、`claimMergeMinConfidence` 只能改配置文件。
+- **`PUT /api/config`**：接收 `review.claimMerge`；`segmentChars`、`claimMergeMinConfidence`、`claimMergeMaxJudgedPerRun` 只能改配置文件。
 - **CLI**：`knode-os extract` 输出调用数与剩余段数，`--retry-failed` 先把有失败段的文档重新入队；新增
   `knode-os claim merge <claim> <into>`、`claim unmerge <claim>`、`claim merges`、`claim dedupe`
   （`claims` 已经是查询命令，所以用单数）。
@@ -292,7 +298,7 @@ Known entities: …                                       ← 见下
   这是一次性的，之后只为新增和改动的段付费。
 - **断言数量**：从 210 条涨到一万条上下（合并前；实测每段 24–25 条，见 §8）。合并率在回填后实测。
 - **embedding**：每条新断言一次请求。
-- **判断调用**：12 对一次，规模在回填后实测；时期不同、逐字相同这两类先被确定性检查挡掉，不调模型。
+- **判断调用**：12 对一次，每轮至多 `claimMergeMaxJudgedPerRun`（1,200）对，规模在回填后实测；时期不同、逐字相同这两类先被确定性检查挡掉，不调模型。
 - **实体**：实体数也会从 261 涨到数千，`llmJudge = suggest` 下待确认的实体合并建议会同比增加，见 §9 第 4 条。
 
 ## 8. 验证

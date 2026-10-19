@@ -638,7 +638,7 @@ export interface ReviewConfig {
   llmMinConfidence: number;
   /** 'auto' merges without a person at or above this confidence. */
   autoMergeMinConfidence: number;
-  /** Candidates judged per nightly run (one LLM call each). */
+  /** Duplicate-entity candidates judged per run (one LLM call each). */
   maxJudgedPerRun: number;
   /** LLM review of disputed / suspected claims, filed as knowledge suggestions with a verdict. */
   claims: 'off' | 'suggest';
@@ -652,6 +652,15 @@ export interface ReviewConfig {
   claimMerge: ReviewLlmMode;
   /** 'auto' merges a judged pair without a person at or above this confidence. */
   claimMergeMinConfidence: number;
+  /**
+   * Duplicate-claim pairs the Judge looks at per run, 12 to a call (the
+   * default 1200 is 100 calls). The most promising go first: pairs that read
+   * alike before pairs that only share a number, pairs that could merge
+   * before guarded ones. The rest have no verdict yet, so a later run
+   * proposes them again — the nightly one compares every claim. Identical and
+   * different-period pairs need no model and never wait. 0 judges none.
+   */
+  claimMergeMaxJudgedPerRun: number;
   /**
    * The workspace's web switch, for research jobs and Ask alike: off / only
    * `verify` jobs (and agents set to `on`) get web tools / every job may use
@@ -869,6 +878,7 @@ export function defaultConfig(): KnodeConfig {
       claims: 'suggest',
       claimMerge: 'auto',
       claimMergeMinConfidence: 0.9,
+      claimMergeMaxJudgedPerRun: 1200,
       external: 'verify',
     },
     chat: { agent: 'default', model: '', historyTurns: 12, keep: 200 },

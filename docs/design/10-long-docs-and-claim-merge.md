@@ -247,6 +247,15 @@ reason, model, time) — not into `suggestions`: there are an order of magnitude
 
 - On the Judge route (`ctx.llm`), **batched**: up to 12 pairs per call, regardless of subject. Entity resolution makes
   one call per pair today; at claim volume that would mean more judge calls than extraction calls.
+- **At most `review.claimMergeMaxJudgedPerRun` pairs a run** (default 1,200, i.e. 100 calls), the most promising first:
+  pairs the similarity signal brought up before pairs that only share a number; pairs that none of §4.3's checks keep
+  from merging before the rest; then the higher similarity, the more shared key numbers, the newer claim. The others get
+  no verdict, so a later run proposes them again; the nightly run compares every claim. Identical and different-period
+  pairs are settled by §4.3 without a model and never wait. Without the cap a backlog holds up the rest of tier 2:
+  finance's two largest nightly runs judged 7,531 and 9,252 pairs and took about four hours each (some 20 s a call). In
+  this order, the first 1,200 of finance's 28,974 judged pairs (2026-10-19) hold 681 of the 1,628 verdicts that merged,
+  suggested or flagged anything; in the order they were judged, 141. Pairs that only shared numbers were 55% of the
+  judged pairs and 0.9% of them produced anything.
 - Per pair: the subject; both statements with type, status, event time / validity / document date and source path; a
   300-character excerpt of each grounding chunk.
 - Rules: same only when one entails the other (same facts, same period, same numbers); figures that agree after
@@ -319,7 +328,8 @@ Exactly like entity merges (`src/graph/merge.ts`):
 },
 "review": {
   "claimMerge": "auto",             // new: off / suggest / auto
-  "claimMergeMinConfidence": 0.9    // new: confidence floor for automatic merges
+  "claimMergeMinConfidence": 0.9,   // new: confidence floor for automatic merges
+  "claimMergeMaxJudgedPerRun": 1200 // pairs judged per run, most promising first (§4.4); the rest wait for a later run
 }
 ```
 
@@ -327,7 +337,8 @@ Exactly like entity merges (`src/graph/merge.ts`):
   `extraction_queue.segments_total / segments_done`; `v_claims` appends `canonical_id` and shows representatives only;
   `claim_embeddings` joins `embeddingsDdl` (`src/store/db.ts`).
 - **Config migration**: none needed. The new keys have defaults and `batchSize` keeps its value.
-- **`PUT /api/config`**: accepts `review.claimMerge`; `segmentChars` and `claimMergeMinConfidence` are file-only.
+- **`PUT /api/config`**: accepts `review.claimMerge`; `segmentChars`, `claimMergeMinConfidence` and
+  `claimMergeMaxJudgedPerRun` are file-only.
 - **CLI**: `knode-os extract` reports calls and segments left, and `--retry-failed` first re-queues documents with
   failed segments; new `knode-os claim merge <claim> <into>`, `claim unmerge <claim>`, `claim merges`, `claim dedupe`
   (singular, because `claims` is already the query command).
@@ -353,8 +364,8 @@ Exactly like entity merges (`src/graph/merge.ts`):
 - **Claims**: from 210 to around ten thousand before merging (24–25 per segment in the live run, §8). The merge rate
   gets measured after the backfill.
 - **Embeddings**: one request per new claim.
-- **Judge calls**: 12 pairs per call; the volume gets measured after the backfill. Different-period and identical pairs
-  are settled by the deterministic checks without a call.
+- **Judge calls**: 12 pairs per call, at most `claimMergeMaxJudgedPerRun` (1,200) pairs a run; the volume gets measured
+  after the backfill. Different-period and identical pairs are settled by the deterministic checks without a call.
 - **Entities** grow from 261 to several thousand too, and under `llmJudge = suggest` so do pending entity-merge
   suggestions — see §9 item 4.
 
