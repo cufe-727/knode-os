@@ -1,4 +1,4 @@
-# 11 — Remote processing: embeddings, summaries and reviews on remote workers
+# 12 — Remote processing: embeddings, summaries and reviews on remote workers
 
 > Status: **phases 1 and 2 implemented** (2026‑10‑18): the work broker, summaries as leased work, `work/*` with
 > `work/config`, worker kinds and hints, and the Judge stage's review calls fanned out to `serve`'s judge slots and

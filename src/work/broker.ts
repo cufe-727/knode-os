@@ -5,7 +5,7 @@ import { isSharedKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './
 
 /**
  * The work broker — every kind of leased work behind one lease protocol
- * (docs/design/11).
+ * (docs/design/12).
  *
  * One per workspace in `serve`. Each kind has a source that makes its tasks
  * and knows what an answer means: the labeling scheduler for extraction

@@ -9,7 +9,7 @@ import { dueSummaryDocuments, MAX_SUMMARY_ATTEMPTS, PagesContext, sourceSummaryR
 import { noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
 
 /**
- * Summary pages as leased work (docs/design/11).
+ * Summary pages as leased work (docs/design/12).
  *
  * One per workspace in `serve`, behind the work broker (src/work/broker.ts).
  * A slot that asks for a summary gets the next document due one — an indexed

@@ -33,7 +33,7 @@ import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows, tokenAll
  *   GET  /worker.mjs                               the remote worker script (worker/knode-worker.mjs)
  *   /w/<owner>/<workspace>/…                       <owner> = a username, or "team" for a team workspace
  *     work       GET work/config, POST work/lease | complete | renew | release,
- *                GET work/status — every kind of leased work (docs/design/11)       (scope label)
+ *                GET work/status — every kind of leased work (docs/design/12)       (scope label)
  *     labeling   POST labeling/lease | complete | renew | release, GET labeling/status:
  *                the same for extraction only, as workers before work/* speak it    (scope label)
  *     documents  GET documents, GET document?path=                                      (scope read)

@@ -5,7 +5,7 @@ import { SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
 
 /**
  * What a remote worker reads from the server instead of being told by hand
- * (`GET …/work/config`, docs/design/11): which kinds of work it may take
+ * (`GET …/work/config`, docs/design/12): which kinds of work it may take
  * here, how long a lease lasts, how kinds share a slot, and — per kind — how
  * the server itself would run the call on each coding-agent CLI.
  *

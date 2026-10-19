@@ -1,7 +1,7 @@
 # Remote workers and the remote API
 
 `knode-os serve` runs tier-1 extraction ("labeling"), summary pages and the duplicate reviews' judge calls as
-**leased work** ([design 11](design/11-remote-processing.md)). Per workspace, a scheduler
+**leased work** ([design 12](design/12-remote-processing.md)). Per workspace, a scheduler
 (`src/labeling/scheduler.ts`) takes documents off the extraction queue, cuts them into segments and hands segments
 out one at a time; a summary source (`src/work/summarize.ts`) hands out the documents due a summary page; and a
 judge source (`src/work/judge.ts`) hands out the calls a review is waiting on. A work broker (`src/work/broker.ts`)

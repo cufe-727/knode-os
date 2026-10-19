@@ -7,7 +7,7 @@ import { ChatMessage, jsonFromReply, LlmClient } from '../llm/client.js';
 import { noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
 
 /**
- * The Judge stage's review calls (docs/design/11 §3.2).
+ * The Judge stage's review calls (docs/design/12 §3.2).
  *
  * A review — the duplicate-entity and duplicate-claim audits — builds all its
  * judge prompts first and hands them to a `JudgeRunner` at once, then reads

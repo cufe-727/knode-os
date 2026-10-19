@@ -343,7 +343,7 @@ export interface RemoteApiConfig {
   leaseMinutes?: number;
   /**
    * The kinds of work besides extraction (always offered) that remote workers
-   * may take here (docs/design/11). Summaries default to on, the Judge
+   * may take here (docs/design/12). Summaries default to on, the Judge
    * stage's review calls to off.
    */
   offer?: { summarize?: boolean; judge?: boolean };

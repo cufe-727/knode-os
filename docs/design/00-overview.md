@@ -200,3 +200,8 @@ regeneration and is itself a source.
   — one registry for LLM / embedding providers, storage backends, document
   converters and user-defined hooks at every processing stage; the built-ins
   are registered through the same API. How-to: [docs/plugins.md](../plugins.md).
+- [12 — Remote processing: embeddings, summaries and reviews on remote workers](12-remote-processing.md)
+  — one lease protocol for extraction segments, summary pages and a review's
+  judge calls, taken by `serve`'s own slots and by remote workers, which read
+  their setup from the server; remote embedding is proposed. How-to:
+  [docs/remote-labeling.md](../remote-labeling.md).
