@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { KnodeConfig } from '../config.js';
 import { MAX_FILE_BYTES } from '../constants.js';
-import { readSidecarPart, replayableTier1, SidecarTier1, truncatedTier1, updateSidecarPart } from '../fs/sidecar.js';
+import { originOf, readSidecarPart, replayableTier1, SidecarTier1, truncatedTier1, updateSidecarPart } from '../fs/sidecar.js';
 import { planTier0, Tier0Plan, wireConcepts, wireLinks } from '../graph/concepts.js';
 import { frontmatterExtraction } from '../graph/frontmatter.js';
 import { parseCapabilityNotes } from '../capability/notes.js';
@@ -206,12 +206,18 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const capabilityNotes = root === 'capabilities' ? parseCapabilityNotes(parsed) : [];
   // Trust follows the *document's* origin, not whoever happened to run this
   // sync. A note an agent wrote stays agent-written; sync is a mechanical
-  // reconciliation, not the author. Frontmatter may also say so outright.
+  // reconciliation, not the author. The writer of these exact bytes, when one
+  // is on record (an agent through MCP — src/fs/sidecar.ts `originOf`), sets
+  // the ceiling; frontmatter may say "agent" or "quarantined" outright, but
+  // never raise a document above its writer: that is the agent's own text.
+  const writer = root === 'traces' || source.derived ? null : originOf(store.dataDir, file);
+  const writerTier = tierForActor(writer?.actor ?? actor);
   const declaredTrust = typeof parsed.frontmatter.trust === 'string' && TRUST_TIERS.includes(parsed.frontmatter.trust as TrustTier)
     ? (parsed.frontmatter.trust as TrustTier)
     : typeof parsed.frontmatter.actor === 'string'
       ? tierForActor(parsed.frontmatter.actor)
       : undefined;
+  const trust: TrustTier = writerTier === 'quarantined' ? 'quarantined' : declaredTrust ?? writerTier;
   const declaredAcl = Array.isArray(parsed.frontmatter.acl) ? parsed.frontmatter.acl.map(String) : undefined;
   const tier1Part = root === 'docs' && isSource ? readSidecarPart(store.dataDir, file, 'tier1') : null;
   const tier1 = tier1Part ? replayableTier1(tier1Part, sha, raw.length) : null;
@@ -230,7 +236,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
       at: opts.at,
       force: Boolean(live && (!sameModel || opts.reapply)),
       keepProjectionOnReplace: true,
-      trust: declaredTrust,
+      trust,
       acl: declaredAcl,
       meta: { documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title },
     },

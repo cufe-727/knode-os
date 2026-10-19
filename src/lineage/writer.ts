@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { safePath } from '../fs/files.js';
+import { carryOrigin } from '../fs/sidecar.js';
 import {
   CLAIM_STATUS,
   claimId,
@@ -590,17 +591,19 @@ export class ScopeWriter {
   }
 }
 
-/** Execute queued file operations (after the transaction committed). Idempotent. */
+/**
+ * Execute queued file operations (after the transaction committed). Idempotent.
+ * A page is composed around the prose already in the file, so whoever wrote
+ * that file (an agent, on record in its sidecar) is still its writer after.
+ */
 export function runFsOps(dataDir: string, ops: FsOp[]): void {
   for (const op of ops) {
     const abs = safePath(dataDir, op.path);
     fs.mkdirSync(require_dirname(abs), { recursive: true });
-    if (op.op === 'write') {
-      fs.writeFileSync(abs, op.content);
-    } else {
-      const current = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
-      fs.writeFileSync(abs, replaceRegion(current, op.region, op.content));
-    }
+    const current = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : null;
+    const next = op.op === 'write' ? op.content : replaceRegion(current ?? '', op.region, op.content);
+    if (current !== null) carryOrigin(dataDir, op.path, current, next);
+    fs.writeFileSync(abs, next);
   }
 }
 

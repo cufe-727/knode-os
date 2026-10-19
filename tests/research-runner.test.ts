@@ -169,4 +169,18 @@ type: organization
     expect(second.status).toBe('done');
     expect(fs.readFileSync(path.join(wsDir, 'wiki', 'entities', '蔚来.md'), 'utf8')).toContain('人工备注：这一段是人写的');
   }, 120_000);
+
+  it('drops a trust tier the agent gave its own page, and the page stays quarantined', async () => {
+    const { job } = await queueJob(ctx.store, { kind: 'entity', target: '宁德时代', requestedBy: 'test', payload: { variant: 'self-trusted' } });
+    process.env.FAKE_AGENT_MODE = 'self-trusted';
+    const done = await runResearchJob(ctx, job, { mcp, agent, log: () => {} });
+    expect(done.status).toBe('done');
+    const page = fs.readFileSync(path.join(wsDir, 'wiki', 'entities', '宁德时代.md'), 'utf8');
+    expect(page).not.toMatch(/^trust:/m);
+    expect(page).not.toMatch(/^actor: user$/m);
+    expect(page).toContain('actor: agent/claude-cli');
+    const scopes = await ctx.store.query<{ kind: string; trust: string }>(`SELECT kind, trust FROM scopes WHERE key = 'wiki/entities/宁德时代.md' AND status = 'active'`);
+    expect(scopes.length).toBeGreaterThan(0);
+    expect(scopes.every((s) => s.trust === 'quarantined')).toBe(true);
+  }, 120_000);
 });

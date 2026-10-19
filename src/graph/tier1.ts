@@ -4,6 +4,7 @@ import { LLM_EXTRACT_INPUT_CHARS, SEGMENTER_VERSION } from '../constants.js';
 import { readSidecarPart, replayableTier1, SidecarSegment, SidecarTier1, updateSidecarPart } from '../fs/sidecar.js';
 import { loadSourceText } from '../ingest/source.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
+import { detectDisputes } from '../lineage/trust.js';
 import { LlmClient } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { pluginRegistry } from '../plugins/registry.js';
@@ -156,7 +157,12 @@ export async function applyTier1Scope(
       });
     },
   );
-  if (res.outcome === 'applied') await retireTier0Placeholders(store, parent.id, { at: res.scope.applied_at });
+  if (res.outcome === 'applied') {
+    await retireTier0Placeholders(store, parent.id, { at: res.scope.applied_at });
+    // the claims a model read out of a quarantined source are quarantined too
+    // (applyScope), and where they contradict a trusted one that is recorded
+    await detectDisputes(store, res.scope.id);
+  }
   return { ...g, outcome: res.outcome };
 }
 

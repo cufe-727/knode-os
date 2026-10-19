@@ -3,7 +3,8 @@ import { z } from 'zod';
 import { AppContext } from '../context.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES } from '../constants.js';
-import { assertNotPrivate, assertSourcePath, assertWritablePath, grepFiles, listTree, safePath, writeFileText } from '../fs/files.js';
+import { assertNotPrivate, assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, listTree, safePath, writeFileText } from '../fs/files.js';
+import { recordOrigin } from '../fs/sidecar.js';
 import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
 import { assertNotLinked } from '../ingest/folders.js';
 import { graphInsights, graphSearch } from '../graph/query.js';
@@ -35,13 +36,29 @@ import { killAgentsFor } from '../research/launch.js';
 import { surveyKnowledgeBase } from '../research/survey.js';
 import { loadResearchTemplates, RESEARCH_KINDS, ResearchKind } from '../research/templates.js';
 
+/** Who wrote what an MCP client writes: an agent's text, quarantined until a person promotes it (src/lineage/trust.ts). */
+export const MCP_WRITER = 'mcp';
+
+export interface KnodeToolOptions {
+  /**
+   * Who is on the other end. `agent`: a research or Ask run this server
+   * launched for a workspace (its token is that workspace's,
+   * src/server/mcp-http.ts) — it may not promote a source or settle a
+   * dispute, which is the review its own writes wait for. `owner` (the
+   * default): this machine's own MCP clients, a person at the keyboard.
+   */
+  caller?: 'owner' | 'agent';
+}
+
 /**
  * The knode-os tool surface, independent of transport. The stdio server
  * (`knode-os mcp`) and the Streamable HTTP endpoint `serve` mounts at /mcp
  * both register exactly this set, so an agent sees the same tools whichever
  * way it connects.
  */
-export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
+export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: KnodeToolOptions = {}): void {
+  const agent = opts.caller === 'agent';
+  const forPerson = (what: string) => new Error(`${what} is a person's review, not an agent's: ask them to do it in knode-os (the source's "adopt" in the UI, or \`knode-os trust\`)`);
   const json = (data: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] });
   const asOfSchema = z.string().optional().describe('System time (ISO 8601): answer from what the knowledge base contained at that instant');
   const validAtSchema = z.string().optional().describe('World time (ISO 8601): only claims whose validity window contains this instant');
@@ -169,6 +186,9 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
       assertWritablePath(p);
       assertNotConvertedOriginal(p);
       assertNotLinked(ctx.config, p, 'write to');
+      // on record before the bytes land, so no sync sees them unattributed: whatever
+      // its frontmatter claims, this is an MCP client's text (src/fs/sidecar.ts)
+      recordOrigin(ctx.dataDir, cleanRelPath(p), content, MCP_WRITER);
       writeFileText(ctx.dataDir, p, content);
       return json({ ok: true, path: p });
     },
@@ -458,7 +478,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
       },
     },
     async ({ workset, content, title, path: p, keep_open }) =>
-      json(await commitWorkset(ctx, { worksetId: workset, content, title, path: p, keepOpen: keep_open })),
+      json(await commitWorkset(ctx, { worksetId: workset, content, title, path: p, keepOpen: keep_open, writer: MCP_WRITER })),
   );
 
   server.registerTool(
@@ -530,6 +550,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
     },
     async ({ action, id, status, actor }) => {
       if (action === 'resolve') {
+        if (agent) throw forPerson('settling a dispute');
         if (!id) throw new Error('resolve needs id');
         return json({ resolved: await resolveDispute(ctx.store, id, actor) });
       }
@@ -549,7 +570,11 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext): void {
         actor: z.string().optional(),
       },
     },
-    async ({ path: p, to, actor }) => json(await setScopeTrust(ctx.store, { key: p, to, actor })),
+    async ({ path: p, to, actor }) => {
+      // an agent's writes wait for this very call; it may demote, never promote
+      if (agent && to === 'trusted') throw forPerson('promoting a source');
+      return json(await setScopeTrust(ctx.store, { key: p, to, actor }));
+    },
   );
 
   server.registerTool(

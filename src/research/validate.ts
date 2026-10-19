@@ -3,6 +3,7 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import { AppContext } from '../context.js';
 import { safePath } from '../fs/files.js';
+import { recordOrigin } from '../fs/sidecar.js';
 import { frontmatterExtraction } from '../graph/frontmatter.js';
 import { loadOntology, normalizePredicate } from '../graph/ontology.js';
 import { buildWikiIndex, extractObsidianLinks } from '../graph/wire.js';
@@ -18,8 +19,11 @@ import { RunWorkspace } from './workspace.js';
  * "the knowledge base has a new source". Structural checks are errors (the
  * job is retried once with the reasons in its brief); quality hints are
  * warnings kept on the job. The page is also *normalized*: the actor and
- * research keys are stamped with the values the runner knows to be true, so
- * trust attribution never depends on the agent remembering to write them.
+ * research keys are stamped with the values the runner knows to be true, and
+ * a `trust` key is dropped, so trust attribution never depends on the agent
+ * remembering to write them — or on it claiming a tier of its own. The page
+ * is put on record as the agent's (src/fs/sidecar.ts `recordOrigin`), so it
+ * stays quarantined whatever its frontmatter says.
  */
 
 export interface ValidationReport {
@@ -68,6 +72,11 @@ export async function validateResearchPage(
   let normalized = false;
   if (fm.actor !== ws.actor) {
     fm.actor = ws.actor;
+    normalized = true;
+  }
+  // nor is its trust tier: the page waits for a person to promote it
+  if (Object.prototype.hasOwnProperty.call(fm, 'trust')) {
+    delete fm.trust;
     normalized = true;
   }
   const research = fm.research && typeof fm.research === 'object' ? (fm.research as Record<string, unknown>) : null;
@@ -159,8 +168,10 @@ export async function validateResearchPage(
   if (normalized) {
     text = matter.stringify(parsed.content.replace(/^\n+/, ''), fm).replace(/\n{3,}/g, '\n\n');
     if (!text.endsWith('\n')) text += '\n';
-    fs.writeFileSync(abs, text);
   }
+  // the agent's page, as it wrote it or as stamped here: on record before it is rewritten
+  recordOrigin(ctx.dataDir, ws.outputPath, text, ws.actor);
+  if (normalized) fs.writeFileSync(abs, text);
 
   // OKF conformance of the bundle as indexed, restricted to this file
   try {

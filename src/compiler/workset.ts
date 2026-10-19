@@ -1,6 +1,9 @@
 import crypto from 'node:crypto';
 import { AppContext } from '../context.js';
-import { assertWritablePath, writeFileText } from '../fs/files.js';
+import { assertWritablePath, cleanRelPath, writeFileText } from '../fs/files.js';
+import { recordOrigin } from '../fs/sidecar.js';
+import { assertNotLinked } from '../ingest/folders.js';
+import { assertNotConvertedOriginal } from '../ingest/source.js';
 import { Store } from '../store/db.js';
 import { ResolvedTemporal, resolveTemporal } from '../store/resolver.js';
 import { toIso } from '../store/temporal.js';
@@ -126,6 +129,11 @@ export interface CommitInput {
   /** Keep the workset open after writing (default: close it). */
   keepOpen?: boolean;
   actor?: string;
+  /**
+   * Who is writing, put on record next to the note (src/fs/sidecar.ts) — an
+   * MCP client's commit is quarantined whatever actor it names.
+   */
+  writer?: string;
 }
 
 /**
@@ -143,6 +151,9 @@ export async function commitWorkset(ctx: AppContext, input: CommitInput): Promis
 
   const rel = input.path ?? `raw/docs/notes/${ws.id}.md`;
   assertWritablePath(rel);
+  // the guards every other write takes: no Markdown over a PDF, nothing into a linked mirror
+  assertNotConvertedOriginal(rel);
+  assertNotLinked(ctx.config, rel, 'write to');
   const frontmatter = [
     '---',
     `title: ${JSON.stringify(input.title ?? (ws.note || `Working notes ${ws.id}`))}`,
@@ -153,7 +164,9 @@ export async function commitWorkset(ctx: AppContext, input: CommitInput): Promis
     '---',
     '',
   ].filter((l) => l !== null).join('\n');
-  writeFileText(ctx.dataDir, rel, `${frontmatter}${input.content.trim()}\n`);
+  const text = `${frontmatter}${input.content.trim()}\n`;
+  if (input.writer) recordOrigin(ctx.dataDir, cleanRelPath(rel), text, input.writer);
+  writeFileText(ctx.dataDir, rel, text);
 
   const [row] = await ctx.store.query<Row>(
     `UPDATE worksets SET commit_path = $2, closed_at = CASE WHEN $3 THEN closed_at ELSE now() END

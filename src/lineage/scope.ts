@@ -49,7 +49,8 @@ export interface ApplyOptions {
   /**
    * Trust tier for everything this scope writes. Defaults to the actor's tier,
    * so an agent's own write is quarantined without every call site having to
-   * remember to say so.
+   * remember to say so. A child of a quarantined scope is quarantined whatever
+   * this says.
    */
   trust?: TrustTier;
   /** Actors allowed to read what this scope produced; empty = unrestricted. */
@@ -160,7 +161,15 @@ export async function applyScope(
     disposed_at: null,
     meta: opts.meta ?? {},
   };
-  const trust = opts.trust ?? tierForActor(actor);
+  let trust = opts.trust ?? tierForActor(actor);
+  // a child — a document's tier-1 extraction, the prose on a generated page —
+  // is what was read out of its parent, so it is never trusted above it:
+  // otherwise a model reading an agent's quarantined note would turn its
+  // claims into the knowledge base's position
+  if (opts.parentId && trust !== 'quarantined') {
+    const [parent] = await store.query<{ trust: TrustTier }>(`SELECT trust FROM scopes WHERE id = $1`, [opts.parentId]);
+    if (parent?.trust === 'quarantined') trust = 'quarantined';
+  }
   const acl = opts.acl ?? [];
 
   let writer!: ScopeWriter;

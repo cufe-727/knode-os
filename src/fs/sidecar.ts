@@ -195,6 +195,7 @@ const PART_FILES: Record<SidecarPart, string> = {
   usage: 'usage.json',
 };
 const CONTENT_FILE = 'content.md';
+const ORIGIN_FILE = 'origin.json';
 const VIEWS_DIR = 'views';
 const SOURCE_SUMMARY_FILE = `${VIEWS_DIR}/source-summary.md`;
 const SOURCE_SUMMARY_FAILED_FILE = `${VIEWS_DIR}/source-summary.failed.json`;
@@ -335,7 +336,7 @@ export function readSidecar(dataDir: string, key: string): Sidecar | null {
 export function removeSidecar(dataDir: string, key: string): void {
   const dir = sidecarDir(dataDir, key);
   if (!fs.existsSync(dir)) return;
-  for (const file of [...Object.values(PART_FILES), CONTENT_FILE]) fs.rmSync(path.join(dir, file), { force: true });
+  for (const file of [...Object.values(PART_FILES), CONTENT_FILE, ORIGIN_FILE]) fs.rmSync(path.join(dir, file), { force: true });
   fs.rmSync(path.join(dir, VIEWS_DIR), { recursive: true, force: true });
   pruneEmpty(dir, safePath(dataDir, SIDECAR_ROOT));
 }
@@ -378,6 +379,67 @@ export function writeContent(dataDir: string, key: string, text: string): void {
 
 export function hasContent(dataDir: string, key: string): boolean {
   return isFile(path.join(sidecarDir(dataDir, key), CONTENT_FILE));
+}
+
+/* -------------------------------- origin ------------------------------- */
+
+/**
+ * Who wrote a source's bytes, when it was not a person at the filesystem: an
+ * agent through MCP (knode_write, knode_commit), a research run stamping the
+ * page its agent wrote. Trust is capped by it (src/ingest/apply.ts) — the
+ * file cannot be the record, its frontmatter is the writer's to write and it
+ * may be no Markdown at all — so it is kept here: out of the writer's reach
+ * (the sidecar tree is system-owned), moved with the file, kept by a rebuild.
+ *
+ * A record holds for exactly the bytes that were written, by hash. Whoever
+ * edits the file afterwards, in the UI or an editor, is its writer from then
+ * on; a system rewrite that keeps the writer's text (a managed region
+ * refreshed) carries the record over (`carryOrigin`). The last few writes are
+ * kept, so a file restored to an earlier version gets that version's writer.
+ */
+export interface SourceOrigin {
+  actor: string;
+  sha256: string;
+  at: string;
+}
+
+const ORIGINS_KEPT = 16;
+
+const bytesSha = (content: string | Uint8Array) => crypto.createHash('sha256').update(content).digest('hex');
+
+function readOrigins(dataDir: string, key: string): SourceOrigin[] {
+  const raw = readJson<{ writes?: unknown }>(path.join(sidecarDir(dataDir, key), ORIGIN_FILE));
+  return Array.isArray(raw?.writes)
+    ? (raw.writes as Partial<SourceOrigin>[]).filter((w): w is SourceOrigin => typeof w?.actor === 'string' && typeof w.sha256 === 'string')
+    : [];
+}
+
+/** Record that `actor` wrote `content` to `key`. Call it before writing the file, so no reader sees the bytes unattributed. */
+export function recordOrigin(dataDir: string, key: string, content: string | Uint8Array, actor: string): void {
+  const sha256 = bytesSha(content);
+  const writes = [{ actor, sha256, at: new Date().toISOString() }, ...readOrigins(dataDir, key).filter((w) => w.sha256 !== sha256)];
+  writeAtomic(path.join(sidecarDir(dataDir, key), ORIGIN_FILE), `${JSON.stringify({ writes: writes.slice(0, ORIGINS_KEPT) }, null, 2)}\n`);
+}
+
+/** Who wrote the bytes `key` holds now, when a recorded writer did; null for anything else. */
+export function originOf(dataDir: string, key: string): SourceOrigin | null {
+  const writes = readOrigins(dataDir, key);
+  if (writes.length === 0) return null;
+  let bytes: Buffer;
+  try {
+    bytes = fs.readFileSync(safePath(dataDir, key));
+  } catch {
+    return null;
+  }
+  const sha256 = bytesSha(bytes);
+  return writes.find((w) => w.sha256 === sha256) ?? null;
+}
+
+/** A system rewrite of `key` from `before` to `after` keeps whoever wrote `before`. */
+export function carryOrigin(dataDir: string, key: string, before: string | Uint8Array, after: string | Uint8Array): void {
+  const sha256 = bytesSha(before);
+  const writer = readOrigins(dataDir, key).find((w) => w.sha256 === sha256);
+  if (writer) recordOrigin(dataDir, key, after, writer.actor);
 }
 
 /* -------------------------------- views -------------------------------- */

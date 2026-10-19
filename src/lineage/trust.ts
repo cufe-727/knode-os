@@ -63,9 +63,11 @@ export interface PromoteResult {
 }
 
 /**
- * Promote a quarantined source to trusted, or demote a trusted one.
+ * Promote a quarantined source to trusted, or demote a trusted one — with the
+ * live scopes read out of it (its tier-1 extraction, the prose on a generated
+ * page), which carry its tier (src/lineage/scope.ts).
  *
- * Promotion resolves the disputes that scope opened: the whole point of
+ * Promotion resolves the disputes those scopes opened: the whole point of
  * quarantining was to hold the disagreement open until somebody looked at it,
  * so the act of looking is what closes it.
  */
@@ -75,8 +77,10 @@ export async function setScopeTrust(
 ): Promise<PromoteResult> {
   const p = new Params([opts.key]);
   const kindCond = opts.kind ? ` AND kind = ${p.add(opts.kind)}` : '';
+  // the source itself, not a scope read out of it under the same key; a document before a page of the same path
   const [scope] = await store.query<{ id: string; key: string; trust: TrustTier }>(
-    `SELECT id, key, trust FROM scopes WHERE key = $1${kindCond} AND status = 'active' ORDER BY applied_at DESC LIMIT 1`,
+    `SELECT id, key, trust FROM scopes WHERE key = $1${kindCond} AND status = 'active' AND parent_id IS NULL
+     ORDER BY (kind = 'doc') DESC, applied_at DESC LIMIT 1`,
     p.list,
   );
   if (!scope) throw new Error(`no live scope for "${opts.key}"`);
@@ -84,17 +88,27 @@ export async function setScopeTrust(
   let evidenceRows = 0;
   let disputesResolved = 0;
   await store.tx(async (q) => {
-    await q.query(`UPDATE scopes SET trust = $2 WHERE id = $1`, [scope.id, opts.to]);
+    const tree = (await q.query<{ id: string }>(
+      `WITH RECURSIVE tree AS (
+         SELECT id FROM scopes WHERE id = $1
+         UNION SELECT s.id FROM scopes s JOIN tree t ON s.parent_id = t.id WHERE s.status <> 'disposed'
+       ) SELECT id FROM tree`,
+      [scope.id],
+    )).map((r) => r.id);
+    const t = new Params([opts.to]);
+    const inTree = tree.map((id) => t.add(id)).join(',');
+    await q.query(`UPDATE scopes SET trust = $1 WHERE id IN (${inTree})`, t.list);
     const rows = await q.query<{ id: string }>(
-      `UPDATE evidence SET trust = $2 WHERE scope_id = $1 AND tx_to IS NULL RETURNING id`,
-      [scope.id, opts.to],
+      `UPDATE evidence SET trust = $1 WHERE scope_id IN (${inTree}) AND tx_to IS NULL RETURNING id`,
+      t.list,
     );
     evidenceRows = rows.length;
     if (opts.to === 'trusted') {
+      const r = new Params([opts.actor ?? 'user']);
       const resolved = await q.query<{ id: string }>(
-        `UPDATE disputes SET status = 'resolved', resolved_at = now(), resolved_by = $2
-         WHERE scope_id = $1 AND status = 'open' RETURNING id`,
-        [scope.id, opts.actor ?? 'user'],
+        `UPDATE disputes SET status = 'resolved', resolved_at = now(), resolved_by = $1
+         WHERE scope_id IN (${tree.map((id) => r.add(id)).join(',')}) AND status = 'open' RETURNING id`,
+        r.list,
       );
       disputesResolved = resolved.length;
     }

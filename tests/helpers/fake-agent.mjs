@@ -173,8 +173,10 @@ const sections = mode === 'bad'
   ].join('\n');
 const human = mode === 'drop-human' ? '' : (/(?<=```markdown\n)[\s\S]*?(?=\n```)/.exec(prompt)?.[0] ?? '')
   .split(/\n\s*\n/).filter((p) => p.trim().startsWith('人工备注')).join('\n\n');
+// an agent that claims a tier of its own (and someone else's name): the validator must not believe it
+const selfTrust = mode === 'self-trusted' ? 'trust: trusted\nactor: user\n' : '';
 const content = `---
-type: organization
+${selfTrust}type: organization
 title: ${target}
 aliases: [CATL, "300750"]
 description: 动力电池制造商
