@@ -77,6 +77,16 @@ const PARAM = /\$\d+/y;
 /** E'…' escapes with backslashes; U&'…', B'…', X'…' and N'…' quote like '…'. */
 const STRING_PREFIX = /(?:[eE]|[uU]&|[bBxXnN])'/y;
 const QUOTED_PREFIX = /[uU]&"/y;
+/** A -- comment runs to the next newline or carriage return. */
+const LINE_COMMENT = /--[^\n\r]*/y;
+/**
+ * Whitespace holding a newline, then a quote: Postgres continues the string
+ * literal before it there, in that literal's escape mode — `E'a'⏎'\''` is one
+ * E-string. A vertical tab before the newline counts as whitespace too. One
+ * character or one whole comment line per repetition, so a failed match cannot
+ * backtrack exponentially.
+ */
+const QUOTE_CONTINUE = /[ \t\f\v]*(?:--[^\n\r]*)?[\n\r](?:[ \t\n\r\f\v]|--[^\n\r]*[\n\r])*'/y;
 
 function match(re: RegExp, sql: string, at: number): string | undefined {
   re.lastIndex = at;
@@ -100,8 +110,10 @@ function closeQuote(sql: string, open: number, backslashEscapes: boolean): numbe
  * The tokens PostgreSQL reads from `sql`. The shared guard's stripper is
  * dialect-neutral; this one follows Postgres where they differ — a backslash
  * is an ordinary character in '…' (only E'…' escapes with it), $tag$…$tag$
- * quotes a string, and block comments nest — so no quoting trick can show the
- * check a different statement than the one the database runs.
+ * quotes a string, block comments nest, a -- comment ends at a carriage return
+ * as well as a newline, and a string continued on a later line keeps its
+ * escape mode — so no quoting trick can show the check a different statement
+ * than the one the database runs.
  */
 function lex(sql: string): Token[] {
   const out: Token[] = [];
@@ -111,9 +123,8 @@ function lex(sql: string): Token[] {
     let m: string | undefined;
     if (SPACE.test(ch)) {
       i++;
-    } else if (sql.startsWith('--', i)) {
-      const nl = sql.indexOf('\n', i);
-      i = nl === -1 ? sql.length : nl + 1;
+    } else if ((m = match(LINE_COMMENT, sql, i))) {
+      i += m.length;
     } else if (sql.startsWith('/*', i)) {
       let depth = 0;
       do {
@@ -129,7 +140,10 @@ function lex(sql: string): Token[] {
       } while (depth > 0 && i < sql.length);
     } else if (ch === "'" || (m = match(STRING_PREFIX, sql, i))) {
       const open = i + (m ? m.length - 1 : 0);
-      const end = closeQuote(sql, open, m?.[0] === 'e' || m?.[0] === 'E');
+      const backslashEscapes = m?.[0] === 'e' || m?.[0] === 'E';
+      let end = closeQuote(sql, open, backslashEscapes);
+      let more: string | undefined;
+      while ((more = match(QUOTE_CONTINUE, sql, end))) end = closeQuote(sql, end + more.length - 1, backslashEscapes);
       out.push({ kind: 'literal', text: sql.slice(i, end) });
       i = end;
     } else if (ch === '"' || (m = match(QUOTED_PREFIX, sql, i))) {
