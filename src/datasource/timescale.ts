@@ -8,8 +8,16 @@ import {
   normalizeRows,
   QueryOptions,
   QueryResult,
+  queryTimeoutMs,
   TableSchema,
 } from './types.js';
+
+/**
+ * The extended query protocol: its Parse message holds exactly one statement,
+ * so the server itself refuses `SELECT 1; DELETE …`. (node-postgres has the
+ * switch; its typings do not.)
+ */
+const extendedProtocol = (text: string) => ({ text, queryMode: 'extended' }) as pg.QueryConfig;
 
 /** TimescaleDB (plain Postgres wire protocol) connector for time-series tables. */
 export class TimescaleConnector implements DataSourceConnector {
@@ -64,7 +72,7 @@ export class TimescaleConnector implements DataSourceConnector {
   async query(sql: string, opts: QueryOptions = {}): Promise<QueryResult> {
     const maxRows = opts.maxRows ?? this.config.maxRows ?? DEFAULT_MAX_ROWS;
     const t0 = Date.now();
-    const res = await this.pool.query(sql);
+    const res = await this.readOnly(sql, queryTimeoutMs(opts, this.config));
     const { rows, truncated } = normalizeRows(res.rows as Record<string, unknown>[], maxRows);
     return {
       source: this.id,
@@ -75,6 +83,36 @@ export class TimescaleConnector implements DataSourceConnector {
       asOf: new Date().toISOString(),
       elapsedMs: Date.now() - t0,
     };
+  }
+
+  /**
+   * Run one statement the way the server keeps it read-only, whatever the
+   * database user may do: alone (extended protocol), inside a READ ONLY
+   * transaction that is always rolled back, under a statement timeout. Then
+   * DISCARD ALL drops what a rollback leaves in the session — an advisory
+   * lock, a prepared statement. So no write, setting or lock outlives the
+   * call, even when the guard has misread the statement.
+   */
+  private async readOnly(sql: string, timeoutMs: number): Promise<pg.QueryResult> {
+    const client = await this.pool.connect();
+    let unusable: Error | undefined;
+    try {
+      await client.query('BEGIN TRANSACTION READ ONLY');
+      try {
+        await client.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
+        return await client.query(extendedProtocol(sql));
+      } finally {
+        await client
+          .query('ROLLBACK')
+          .then(() => client.query('DISCARD ALL'))
+          .catch((err: Error) => {
+            unusable = err;
+          });
+      }
+    } finally {
+      // a connection that could not roll back is closed, not handed to the next call
+      client.release(unusable);
+    }
   }
 
   async sampleColumn(table: string, column: string, aliasColumns: string[], limit: number): Promise<{ value: string; aliases: string[] }[]> {

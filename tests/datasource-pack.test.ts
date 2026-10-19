@@ -34,7 +34,9 @@ describe('read-only SQL guard', () => {
     expect(() => assertReadOnlySql('SELECT 1; DROP TABLE t')).toThrow(/multiple/);
     expect(() => assertReadOnlySql('WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x')).toThrow(/DELETE/);
     expect(() => assertReadOnlySql('INSERT INTO t VALUES (1)')).toThrow(/read-only/);
-    expect(() => assertReadOnlySql('SELECT * FROM t INTO OUTFILE "/tmp/x" -- copy')).not.toThrow(); // comment stripped, no banned keyword
+    // writes a file on the server, which a read-only transaction does not prevent
+    expect(() => assertReadOnlySql('SELECT * FROM t INTO OUTFILE "/tmp/x"', 'mysql')).toThrow(/INTO/);
+    expect(() => assertReadOnlySql('SELECT * FROM t -- copy')).not.toThrow(); // comment stripped, no banned keyword
     expect(() => assertReadOnlySql('COPY t TO stdout')).toThrow(/read-only/);
   });
 
