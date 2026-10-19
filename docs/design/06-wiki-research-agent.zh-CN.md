@@ -183,7 +183,7 @@ macOS 设置里所有填模型的地方（阶段、agent、研究执行卡片、
 - 迁移 `V7_WIKI_RESEARCH`：`relations.valid_from/valid_to`、`claims.event_at/observed_at/superseded_by`、`documents.doc_date`、
   `entities.canonical_id/name_key`、`entity_alias_keys`、`entity_links`、`research_jobs`、视图补列 + `v_entity_links` / `v_research_jobs`；
   `entity_embeddings` 随 embedding 维度在开库时建。
-- token：`<data>/.knode/mcp-token`（0600），`knode-os connect <claude|codex|cursor> --http` 注册 HTTP 端点。
+- token：`<data>/.knode/mcp-token`（0600）属于本机自己的客户端（开启登录时，它指定的工作区必须是某个账号自己的，或该账号被授权的团队），`knode-os connect <claude|codex|cursor> --http` 注册 HTTP 端点。`serve` 启动的 agent（研究任务、Ask 对话）改用为其工作区单独签发、只存在内存里的 token：只能打开这个工作区，且不能提升来源可信度或裁决争议（`knode_trust` 到 trusted、`knode_disputes` resolve）——那正是它自己写入的内容在等待的人工审核。
 
 ## 9. 未决 / 已知限制
 

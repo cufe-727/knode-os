@@ -8,7 +8,7 @@ import { MCP_SERVER_INFO } from '../mcp/server.js';
 import { mcpInstructions } from '../mcp/instructions.js';
 import { registerKnodeTools } from '../mcp/tools.js';
 import { AppContext } from '../context.js';
-import { resolveWorkspaceScope, WorkspaceContextRegistry } from './workspaces.js';
+import { resolveWorkspaceScope, WorkspaceContextRegistry, WorkspaceScope } from './workspaces.js';
 
 /**
  * MCP over Streamable HTTP, mounted on the same Hono app as the REST API.
@@ -24,11 +24,21 @@ import { resolveWorkspaceScope, WorkspaceContextRegistry } from './workspaces.js
  * workspace context (tool registration is a handful of closures), and replies
  * as plain JSON. Nothing here needs server-initiated streams.
  *
- * Auth: a bearer token generated once per data root and kept in
- * `.knode/mcp-token` (0600). Clients that cannot set headers (some CLIs only
- * take a URL) may pass `token` and the workspace fields as query parameters —
- * the endpoint binds to loopback by default, so the URL never leaves the
- * machine.
+ * Auth, two kinds of bearer token:
+ *
+ *   - the data root's, generated once and kept in `.knode/mcp-token` (0600):
+ *     this machine's own clients (`knode-os connect`), which name the
+ *     workspace in headers — with sign-in on, an account that exists and, for
+ *     a team, has been given it;
+ *   - a workspace's (`McpWorkspaceTokens`), minted by `serve` for the agents
+ *     it launches there — research jobs, Ask turns — and held in memory only.
+ *     It opens that workspace and no other: headers may repeat it, never pick
+ *     another. Its sessions get the tools an agent may use
+ *     (registerKnodeTools `caller: 'agent'`).
+ *
+ * Clients that cannot set headers (some CLIs only take a URL) may pass `token`
+ * and the workspace fields as query parameters — the endpoint answers this
+ * machine only, so the URL never leaves it.
  */
 
 export const MCP_TOKEN_FILE = '.knode/mcp-token';
@@ -48,11 +58,43 @@ export function loadOrCreateMcpToken(rootDataDir: string): string {
   return token;
 }
 
+/**
+ * The tokens `serve` hands the agents it launches in a workspace: one per open
+ * workspace, minted when its services start and revoked when they stop, never
+ * written anywhere but the run directories that need them. A leaked one opens
+ * the workspace it was made for, and only as an agent.
+ */
+export class McpWorkspaceTokens {
+  private readonly scopes = new Map<string, WorkspaceScope>();
+
+  mint(scope: WorkspaceScope): string {
+    const token = `kmw_${crypto.randomBytes(24).toString('base64url')}`;
+    this.scopes.set(token, scope);
+    return token;
+  }
+
+  revoke(token: string): void {
+    this.scopes.delete(token);
+  }
+
+  /** The workspace a presented token was made for, or null. */
+  scopeOf(presented: string | null): WorkspaceScope | null {
+    if (!presented) return null;
+    for (const [token, scope] of this.scopes) if (tokenMatches(presented, token)) return scope;
+    return null;
+  }
+}
+
 export interface MountMcpOptions {
   path: string;
+  /** The data root's token: this machine's own clients. */
   token: string;
   /** Multi-workspace mode: the request's headers / query pick the workspace. */
   registry?: WorkspaceContextRegistry;
+  /** Workspace tokens: a request presenting one is bound to its workspace (multi-workspace mode only). */
+  workspaceTokens?: McpWorkspaceTokens;
+  /** For a request on the data root's token: why the workspace it names is not open to it, or null when it is. */
+  authorize?: (scope: WorkspaceScope) => string | null;
   /** Single-context mode (a CLI run hosting the endpoint for itself): every request hits this context. */
   context?: AppContext;
 }
@@ -84,23 +126,43 @@ export function mcpWorkspaceHeaders(req: Request): { user?: string; kind?: strin
   };
 }
 
+/** Whether the request names a workspace at all (an agent's token needs none). */
+function namesWorkspace(req: Request): boolean {
+  const q = new URL(req.url).searchParams;
+  return ['x-knode-user', 'x-knode-workspace-kind', 'x-knode-workspace-id', 'x-knode-workspace-name'].some((h) => req.headers.has(h))
+    || ['user', 'kind', 'id', 'name'].some((p) => q.has(p));
+}
+
 export function mountMcp(app: Hono<any>, opts: MountMcpOptions): void {
   app.all(opts.path, async (c) => {
     const req = c.req.raw;
-    if (!tokenMatches(presentedToken(req), opts.token)) {
+    const presented = presentedToken(req);
+    const bound = opts.registry ? opts.workspaceTokens?.scopeOf(presented) ?? null : null;
+    if (!bound && !tokenMatches(presented, opts.token)) {
       return c.json({ error: 'mcp: missing or invalid bearer token' }, 401);
     }
     let ctx: AppContext;
     if (opts.context) ctx = opts.context;
     else if (opts.registry) {
       try {
-        const scope = resolveWorkspaceScope(mcpWorkspaceHeaders(req));
-        if (scope.kind === 'personal' && !opts.registry.exists(scope)) {
-          return c.json({ error: `workspace "${scope.name}" does not exist` }, 404);
+        let scope: WorkspaceScope;
+        if (bound) {
+          // the token is the workspace: what the request names may only agree with it
+          if (namesWorkspace(req) && resolveWorkspaceScope(mcpWorkspaceHeaders(req)).relativeDir !== bound.relativeDir) {
+            return c.json({ error: `mcp: this token belongs to the workspace "${bound.name}", not the one this request names` }, 403);
+          }
+          scope = bound;
+        } else {
+          scope = resolveWorkspaceScope(mcpWorkspaceHeaders(req));
+          const refusal = opts.authorize?.(scope);
+          if (refusal) return c.json({ error: `mcp: ${refusal}` }, 403);
+          if (scope.kind === 'personal' && !opts.registry.exists(scope)) {
+            return c.json({ error: `workspace "${scope.name}" does not exist` }, 404);
+          }
         }
         ctx = await opts.registry.get(scope);
       } catch (e) {
-        return c.json({ error: e instanceof Error ? e.message : String(e) }, 401);
+        return c.json({ error: e instanceof Error ? e.message : String(e) }, bound ? 403 : 401);
       }
     } else {
       return c.json({ error: 'mcp: no workspace registry or context mounted' }, 500);
@@ -108,7 +170,7 @@ export function mountMcp(app: Hono<any>, opts: MountMcpOptions): void {
 
     // the base's own guide rides along as server instructions (cached by the file's mtime)
     const server = new McpServer(MCP_SERVER_INFO, { instructions: mcpInstructions(ctx.dataDir) });
-    registerKnodeTools(server, ctx);
+    registerKnodeTools(server, ctx, { caller: bound ? 'agent' : 'owner' });
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

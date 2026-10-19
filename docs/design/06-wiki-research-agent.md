@@ -32,7 +32,7 @@ raw/docs ──sync──▶ Tier0 (frontmatter entities/relations/claims → co
                     └─ Tier1 LLM (ontology-driven prompt + known-entity injection + document date) ──┘
 wiki/<type>/<slug>.md ◀── research runner ◀── research_jobs ◀── recommendations (suggestions kind=wiki) / `research ask` / by hand
    │ actor: agent/<cli>, relations:, claims:, sources:, research:
-   └──sync──▶ Source (quarantined) ──▶ disputes ──▶ promote (UI / knode_trust)
+   └──sync──▶ Source (quarantined) ──▶ disputes ──▶ promote (UI / knode_trust from this machine's own clients)
 serve: /api/* + /mcp (Streamable HTTP, per-workspace, bearer token) ◀── claude -p / codex exec / cursor-agent -p (isolated run workspace, read-only add-dir)
 after each extraction pass: duplicate audit of the entities it wrote + document summaries (09)
 nightly tier 2: claim audit (supersession) + full duplicate-entity audit + claim review + recommendation refresh + wiki lint (community pages retired: hot clusters are research suggestions now, see 09)
@@ -175,7 +175,7 @@ still in a page, pages in open disputes. Report page `wiki/lint/<date>.md`; nigh
 
 ## 8. Config and migration
 
-`database.kind` now defaults to `postgres` (`pglite` stays an explicit option; the test suite sets `KNODE_DATABASE_KIND=pglite`), and an unreachable server is a clear error rather than a silent fallback. `server.mcp`, `research { agent, model, profile, pipeline: single | team | native, maxTurns, timeoutMs, concurrency, runsDir, keepRuns, readDirs, researchers, reviewRounds, auto }` (profiles under `playbooks/research/profiles/`, built-ins default / quick / thorough / native), `graph { ontologyPacks }`, `review { resolution, llmJudge, llmMinConfidence, autoMergeMinConfidence, maxJudgedPerRun, claims, external }`. Migration `V7_WIKI_RESEARCH` adds the columns and tables above and `V8_REVIEW` adds `entity_alias_keys.kind`; `entity_embeddings` is created with the embedding dimension at open. The MCP bearer token lives in `<data>/.knode/mcp-token`; `knode-os connect <client>` registers the HTTP endpoint (`--stdio` for a standalone process).
+`database.kind` now defaults to `postgres` (`pglite` stays an explicit option; the test suite sets `KNODE_DATABASE_KIND=pglite`), and an unreachable server is a clear error rather than a silent fallback. `server.mcp`, `research { agent, model, profile, pipeline: single | team | native, maxTurns, timeoutMs, concurrency, runsDir, keepRuns, readDirs, researchers, reviewRounds, auto }` (profiles under `playbooks/research/profiles/`, built-ins default / quick / thorough / native), `graph { ontologyPacks }`, `review { resolution, llmJudge, llmMinConfidence, autoMergeMinConfidence, maxJudgedPerRun, claims, external }`. Migration `V7_WIKI_RESEARCH` adds the columns and tables above and `V8_REVIEW` adds `entity_alias_keys.kind`; `entity_embeddings` is created with the embedding dimension at open. The MCP bearer token lives in `<data>/.knode/mcp-token` and is this machine's own clients' (with sign-in on, the workspace it names must be an account's own, or a team the account has been given); `knode-os connect <client>` registers the HTTP endpoint (`--stdio` for a standalone process). The agents `serve` launches — research jobs, Ask turns — get a token minted for their workspace instead, held in memory: it opens that workspace and no other, and it may not promote a source or settle a dispute (`knode_trust` to trusted, `knode_disputes` resolve), which is the review the agent's own writes wait for.
 
 ## 9. Open items
 

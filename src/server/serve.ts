@@ -22,7 +22,7 @@ import { reconcileViews } from '../wiki/pages.js';
 import { refineWiki } from '../wiki/refine.js';
 import { lintWiki } from '../wiki/lint.js';
 import { createApp, WorkspaceServices } from './app.js';
-import { loadOrCreateMcpToken, MCP_TOKEN_FILE } from './mcp-http.js';
+import { MCP_TOKEN_FILE, McpWorkspaceTokens } from './mcp-http.js';
 import { isLoopbackAddress } from './public-guard.js';
 import { startResearchLoop } from '../research/service.js';
 import { resetRunningConversations } from '../chat/store.js';
@@ -101,21 +101,30 @@ export async function startServer(ctx: AppContext): Promise<void> {
     ? { cert: readPem(ctx.dataDir, ctx.config.server.tls.cert, 'cert'), key: readPem(ctx.dataDir, ctx.config.server.tls.key, 'key') }
     : null;
   const mcpBase: { url: string | null } = { url: null };
-  const mcpToken = loadOrCreateMcpToken(ctx.dataDir);
+  // the data root's token (.knode/mcp-token) is this machine's own clients'; the agents
+  // launched in a workspace get a token for that workspace alone (src/server/mcp-http.ts)
+  const mcpTokens = new McpWorkspaceTokens();
   // per-workspace background services the routes may poke (queue a job and run it now; the MCP endpoint a chat turn attaches to)
   const services = new Map<string, WorkspaceServices>();
   const workspaceContexts = new WorkspaceContextRegistry(ctx.dataDir, {
     templateConfig: ctx.config,
     onCreate: (workspaceCtx, scope) => {
       const workspaceLog = (msg: string) => log(`[${scope.relativeDir}] ${msg}`);
+      const agentToken = mcpTokens.mint(scope);
       const mcp = (): McpEndpoint | null => mcpBase.url
         ? {
           url: mcpBase.url,
-          token: mcpToken,
+          token: agentToken,
           headers: { 'x-knode-user': scope.user, 'x-knode-workspace-kind': scope.kind, 'x-knode-workspace-id': scope.id, 'x-knode-workspace-name': scope.name },
         }
         : null;
-      const started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp, rootDataDir: ctx.dataDir });
+      let started: StartedServices;
+      try {
+        started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp, rootDataDir: ctx.dataDir });
+      } catch (err) {
+        mcpTokens.revoke(agentToken);
+        throw err;
+      }
       services.set(workspaceCtx.dataDir, {
         mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders,
         labeling: started.labeling, localWorkers: started.localWorkers, processing: started.processing,
@@ -123,10 +132,11 @@ export async function startServer(ctx: AppContext): Promise<void> {
       return async () => {
         services.delete(workspaceCtx.dataDir);
         await started.stop();
+        mcpTokens.revoke(agentToken);
       };
     },
   });
-  const app = createApp(ctx, log, workspaceContexts, { services: (workspaceCtx) => services.get(workspaceCtx.dataDir) ?? null, auth });
+  const app = createApp(ctx, log, workspaceContexts, { services: (workspaceCtx) => services.get(workspaceCtx.dataDir) ?? null, auth, mcpTokens });
   const { port, host } = ctx.config.server;
 
   const main = serve({ fetch: app.fetch, port, hostname: host }, (info) => {

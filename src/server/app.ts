@@ -119,7 +119,7 @@ import {
   setSuggestionStatus,
 } from '../store/queries.js';
 import { WorkspaceContextRegistry, WorkspaceScope, resolveWorkspaceScope, workspaceDataDir } from './workspaces.js';
-import { loadOrCreateMcpToken, mountMcp } from './mcp-http.js';
+import { loadOrCreateMcpToken, McpWorkspaceTokens, mountMcp } from './mcp-http.js';
 import { applyClaimMerge, listClaimMerges, unmergeClaim } from '../graph/claim-merge.js';
 import { applyMerge, listMerges, unmergeEntity } from '../graph/merge.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
@@ -418,6 +418,8 @@ export function createApp(
     services?: (ctx: AppContext) => WorkspaceServices | null;
     /** Sign-in (src/auth); absent, the app trusts the workspace headers and only the remote API is reachable from outside. */
     auth?: AuthService | null;
+    /** The MCP tokens `serve` mints for the agents it launches, one per workspace (src/server/mcp-http.ts). */
+    mcpTokens?: McpWorkspaceTokens;
   } = {},
 ) {
   const app = new Hono<AppEnv>();
@@ -469,6 +471,17 @@ export function createApp(
       path: mcpConfig?.path || '/mcp',
       token: loadOrCreateMcpToken(rootCtx.dataDir),
       registry: workspaceContexts,
+      workspaceTokens: opts.mcpTokens,
+      // the data root's token names its workspace in headers: with sign-in on, an
+      // account's own, or a team it has been given — as the REST routes hold it
+      authorize: auth
+        ? (scope) => {
+          const account = auth.accounts.get(scope.user);
+          if (!account || account.disabled) return `"${scope.user}" is not an account on this server — name yours (knode-os connect --user <name>)`;
+          if (scope.kind === 'team' && !accountMayOpenTeam(account, scope.slug)) return `the account "${account.username}" has not been given the team "${scope.name}"`;
+          return null;
+        }
+        : undefined,
     });
   }
 
