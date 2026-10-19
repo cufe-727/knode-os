@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import { AppContext } from '../context.js';
 import { Sidecar } from '../fs/sidecar.js';
@@ -8,7 +7,7 @@ import { applyMerge, unmergeEntity } from '../graph/merge.js';
 import { PageContext } from '../graph/store.js';
 import { documentIdFor } from '../ingest/apply.js';
 import { sync, SyncStats } from '../ingest/sync.js';
-import { pgliteDir } from '../store/backend.js';
+import { assertBackendDroppable, dropBackend } from '../store/backend.js';
 import { Store } from '../store/db.js';
 import { readAtticSidecar } from './attic.js';
 import { appendLedger, ledgerTimeline, nextLedgerSeq, readLedger, seedLedgerSeq } from './ledger.js';
@@ -16,7 +15,8 @@ import { applyScope, disposeScope } from './scope.js';
 import { ScopeKind } from './types.js';
 
 /**
- * `knode-os rebuild` — drop the derived database and reconstruct it from the
+ * `knode-os rebuild` — drop the derived database (through the storage
+ * backend, so a server-side schema goes too) and reconstruct it from the
  * files plus the ledger. Sources that are unchanged since their last logged
  * apply keep their original `tx_from`; with `--history`, sources that were
  * removed but whose sidecars survive in the attic are re-applied and
@@ -33,9 +33,12 @@ export interface RebuildReport {
 export async function rebuild(ctx: AppContext, opts: { history?: boolean; onProgress?: (msg: string) => void } = {}): Promise<RebuildReport> {
   const progress = opts.onProgress ?? (() => {});
   const dataDir = ctx.dataDir;
+  // before the store closes: a backend that cannot drop its index fails here, with the workspace still open
+  assertBackendDroppable(ctx.config.database);
   await ctx.store.close();
-  // the embedded database's directory; on a server backend there is nothing on disk to drop
-  fs.rmSync(pgliteDir(dataDir, ctx.config.database), { recursive: true, force: true });
+  // the whole index, wherever the backend keeps it: the embedded database's
+  // directory, or this workspace's schema on a server
+  await dropBackend(dataDir, ctx.config.database);
   ctx.store = await Store.open(dataDir, ctx.config.embedding.dimensions, ctx.config.database);
   const store = ctx.store;
   await seedLedgerSeq(store, dataDir);

@@ -184,7 +184,8 @@ knode-os lineage show <entity|relation|claim|page|document> <id>
 knode-os history <path>       apply / dispose / purge history of a source
 knode-os forget <path>        delete a source, dispose it and purge its history (irreversible)
 knode-os purge [--before iso] [--archived]  erase disposed history / archived pages
-knode-os rebuild [--history]  drop .knode/db and reconstruct it from files + ledger
+knode-os rebuild [--history]  drop the index (.knode/db, or the workspace's PostgreSQL schema) and
+                              reconstruct it from files + ledger
 knode-os datasource list|sync             registered live tables / re-introspect schemas into the graph
 knode-os datasource query <id> <sql>      read-only native SQL against a configured source
 knode-os pack <utterance> [--json] [--as-of iso] [--valid-at iso]

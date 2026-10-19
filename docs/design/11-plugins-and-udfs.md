@@ -126,6 +126,7 @@ provider only.
 interface StorageBackendPlugin {
   id: string; label: string; note?: string;
   open(dataDir: string, config: DatabaseConfig): Promise<Backend>;
+  drop?(dataDir: string, config: DatabaseConfig): Promise<void>;   // the workspace's whole index
 }
 ```
 
@@ -133,7 +134,11 @@ interface StorageBackendPlugin {
 (postgres), `path` (pglite) and an `options` object for whatever a plugin
 needs. `openPglite` and `openPostgres` are exported, so a plugin can wrap them
 (a different directory layout, a tunnel it opens first, a driver that speaks
-the pg wire over HTTP).
+the pg wire over HTTP), and so are `dropPglite` and `dropPostgres` for its
+`drop`. Clearing a workspace and `knode-os rebuild` drop the index through it
+(`dropBackend`): pglite removes its directory, postgres drops the workspace's
+schema with CASCADE, and a backend without `drop` makes both fail with an
+error instead of deleting the files and leaving the old index behind.
 
 ### 3.4 Document converters
 

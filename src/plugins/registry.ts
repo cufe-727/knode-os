@@ -138,6 +138,7 @@ export class PluginRegistry {
   registerStorageBackend(plugin: StorageBackendPlugin, owner = 'api'): void {
     const id = this.validId(plugin.id, 'storage backend', owner);
     if (typeof plugin.open !== 'function') throw new Error(`plugin ${owner}: storage backend "${id}" has no open()`);
+    if (plugin.drop !== undefined && typeof plugin.drop !== 'function') throw new Error(`plugin ${owner}: storage backend "${id}" has a drop that is not a function`);
     this.replacing('storage', id, owner);
     this.storage.set(id, { ...plugin, id });
     this.summary(owner).storageBackends.push(id);

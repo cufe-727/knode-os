@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { AppContext, createContext } from '../context.js';
-import { CONFIG_FILE, KnodeConfig, saveConfig } from '../config.js';
+import { CONFIG_FILE, DatabaseConfig, defaultConfig, KnodeConfig, loadConfig, saveConfig } from '../config.js';
 import { initDataDir } from '../fs/datadir.js';
+import { loadPlugins } from '../plugins/loader.js';
+import { assertBackendDroppable, dropBackend } from '../store/backend.js';
 
 export type WorkspaceKind = 'personal' | 'team';
 
@@ -212,7 +214,10 @@ export class WorkspaceContextRegistry {
     return fs.existsSync(workspaceDataDir(this.rootDataDir, scope));
   }
 
-  /** Delete every byte in a workspace, then recreate only its empty skeleton. */
+  /**
+   * Delete every byte in a workspace — its files and its index, wherever the
+   * storage backend keeps that — then recreate only its empty skeleton.
+   */
   async reset(scope: WorkspaceScope): Promise<void> {
     const dataDir = workspaceDataDir(this.rootDataDir, scope);
     if (this.resetting.has(dataDir)) throw new Error('workspace is already being cleared');
@@ -225,7 +230,13 @@ export class WorkspaceContextRegistry {
         createdAt = manifest.createdAt;
         resetScope = { ...scope, name: manifest.name };
       }
+      // The index goes first, and only through a backend that can drop it:
+      // a PostgreSQL schema is named after this path, so removing the files
+      // alone would hand the recreated workspace its old tables back.
+      const database = await this.databaseConfig(dataDir);
+      assertBackendDroppable(database);
       await this.closeDataDir(dataDir);
+      await dropBackend(dataDir, database);
       fs.rmSync(dataDir, { recursive: true, force: true });
       this.initialize(dataDir, resetScope, createdAt);
       fs.writeFileSync(path.join(dataDir, TRACE_SYNC_SINCE_FILE), new Date().toISOString() + '\n');
@@ -255,6 +266,28 @@ export class WorkspaceContextRegistry {
       });
     }
     if (isNew) fs.writeFileSync(path.join(dataDir, TRACE_SYNC_SINCE_FILE), new Date().toISOString() + '\n');
+  }
+
+  /**
+   * Where a workspace's index lives: what its open context was opened with,
+   * else what its config file says, else what a new workspace gets. A config
+   * that cannot be read is no reason to refuse the clear (it may be why the
+   * workspace is being cleared); the workspace was made from the template.
+   */
+  private async databaseConfig(dataDir: string): Promise<DatabaseConfig> {
+    const open = await this.contexts.get(dataDir)?.catch(() => undefined);
+    if (open) return open.config.database;
+    let config = this.options.templateConfig ?? defaultConfig();
+    if (fs.existsSync(path.join(dataDir, CONFIG_FILE))) {
+      try {
+        config = loadConfig(dataDir);
+      } catch {
+        // keep the template's
+      }
+    }
+    // the backend `database.kind` names may come from a plugin no open context has loaded yet
+    await loadPlugins(dataDir, config.plugins, { log: (msg) => console.log(`[knode-os] ${msg}`), roots: [this.rootDataDir] });
+    return config.database;
   }
 
   private writeManifest(dataDir: string, manifest: WorkspaceManifest): void {

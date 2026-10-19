@@ -5,7 +5,7 @@ import { ArkMultimodalEmbeddingProvider, LocalHashEmbeddingProvider, OpenAIEmbed
 import { cliProviders } from '../llm/providers/cli.js';
 import { commandProvider } from '../llm/providers/command.js';
 import { openAiProvider } from '../llm/providers/openai.js';
-import { openPglite, openPostgres } from '../store/backend.js';
+import { dropPglite, dropPostgres, openPglite, openPostgres } from '../store/backend.js';
 import type { PluginRegistry } from './registry.js';
 
 /**
@@ -55,12 +55,14 @@ export function registerBuiltins(registry: PluginRegistry): void {
         label: 'Embedded PGlite',
         note: 'Postgres + pgvector embedded in the process, one database per workspace under .knode/db (database.path moves it). Zero setup; one process at a time.',
         open: (dataDir, cfg) => openPglite(dataDir, cfg),
+        drop: (dataDir, cfg) => dropPglite(dataDir, cfg),
       },
       {
         id: 'postgres',
         label: 'PostgreSQL server',
         note: 'One shared database, one schema per workspace. Reached through database.url (a connection string; "env:VAR" allowed) or host/port/user/password/database, with ssl and poolSize.',
         open: (dataDir, cfg) => openPostgres(dataDir, cfg),
+        drop: (dataDir, cfg) => dropPostgres(dataDir, cfg),
       },
     ],
     converters: [pdfConverter, imageConverter],

@@ -1244,7 +1244,7 @@ program
 
 program
   .command('rebuild')
-  .description('drop .knode/db and reconstruct it from files + ledger (original apply times kept for unchanged sources)')
+  .description('drop the derived index (.knode/db, or the workspace\'s schema on PostgreSQL) and reconstruct it from files + ledger (original apply times kept for unchanged sources)')
   .option('--history', 'also replay removed sources from attic sidecars so graph-layer --as-of answers match the original timeline')
   .action(async (opts) => {
     const ctx = await createContext(dataDir());
