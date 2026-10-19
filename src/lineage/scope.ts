@@ -176,12 +176,15 @@ export async function applyScope(
   let seq = 0;
   let result!: ApplyResult;
   await store.tx(async (q) => {
+    // the ledger lock comes first in every transaction that folds entity rows
+    // (dispose, purge, placeholder retirement too): scope transactions queue
+    // on it instead of deadlocking on the entity rows they both fold
+    seq = await nextLedgerSeq(q);
     await q.query(
       `INSERT INTO scopes (id, kind, key, sha, parent_id, status, actor, applied_at, meta, trust, acl)
        VALUES ($1, $2, $3, $4, $5, 'applying', $6, $7::timestamptz, $8::jsonb, $9, $10::jsonb)`,
       [id, scope.kind, scope.key, sha, scope.parent_id, actor, txTime, JSON.stringify(scope.meta), trust, JSON.stringify(acl)],
     );
-    seq = await nextLedgerSeq(q);
     writer = new ScopeWriter(q, scope, txTime, store.dataDir, trust);
     await body(writer);
     const fold = await foldTouched(q, writer.touched, txTime, { typePrecedence: typePrecedence(writer.ontology) });
@@ -228,6 +231,9 @@ export async function disposeScope(store: Store, scopeId: string, opts: DisposeO
   const precedence = typePrecedence(loadOntology(store.dataDir));
 
   await store.tx(async (q) => {
+    // same lock order as applyScope: the ledger lock before any entity row,
+    // or a dispose folding what a concurrent apply folds deadlocks with it
+    seq = await nextLedgerSeq(q);
     const touched = emptyTouched();
     const tombstoned = emptyTouched();
 
@@ -276,7 +282,6 @@ export async function disposeScope(store: Store, scopeId: string, opts: DisposeO
       `UPDATE scopes SET status = 'disposed', disposed_at = $2::timestamptz, meta = meta || $3::jsonb WHERE id = $1`,
       [scopeId, txTime, JSON.stringify({ reason: opts.reason })],
     );
-    seq = await nextLedgerSeq(q);
     result = { scope: { ...scope, status: 'disposed', disposed_at: txTime }, touched, fold, propagation, children: children.map((c) => c.id) };
   });
 

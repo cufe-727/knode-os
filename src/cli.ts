@@ -149,9 +149,10 @@ concepts
   .command('learn')
   .description('scan the indexed documents and write playbooks/concepts/frequent.yaml — terms in more than 2% of them are never mined as concepts; run it before `sync --reapply`')
   .option('--ratio <share>', 'document share above which a term is frequent', '0.02')
+  .option('--limit <n>', 'at most this many learned terms (default 20000)')
   .action(async (opts) => {
     const ctx = await createContext(dataDir());
-    const r = await learnFrequentTerms(ctx.store, { ratio: Number(opts.ratio), onProgress: (m) => console.log(`  ${m}`) });
+    const r = await learnFrequentTerms(ctx.store, { ratio: Number(opts.ratio), limit: opts.limit ? Number(opts.limit) : undefined, onProgress: (m) => console.log(`  ${m}`) });
     console.log(JSON.stringify({
       docs: r.docs,
       threshold: r.threshold || null,
