@@ -54,8 +54,12 @@ interface Entry {
 }
 
 const entries = new Map<string, Entry>();
-/** Two dropdowns opening at once share one upstream call. */
-const inFlight = new Map<string, Promise<ModelListResult>>();
+/**
+ * Two dropdowns opening at once share one upstream call, and one entry: the
+ * call remembers its own answer, so the asks waiting on it all return one
+ * stamp instead of each writing its own a millisecond apart.
+ */
+const inFlight = new Map<string, Promise<Entry>>();
 
 /**
  * What makes two configurations the same endpoint. The key is hashed so a
@@ -107,16 +111,20 @@ export async function listModelsCached(
     return { ...hit.result, cached: true, cachedAt: new Date(hit.fetchedAt).toISOString() };
   }
 
-  const startedAt = Date.now();
   let pending = opts.refresh ? undefined : inFlight.get(key);
   if (!pending) {
+    // Timed from here, not from when the last ask joined: a failure's back-off
+    // is sized by what the call cost.
+    const startedAt = Date.now();
     pending = (kind === 'chat'
       ? listChatModels(cfg as LlmConfig)
       : listEmbeddingModels(cfg as EmbeddingConfig)
-    ).finally(() => inFlight.delete(key));
+    )
+      .then((result) => remember(key, result, Date.now() - startedAt))
+      .finally(() => inFlight.delete(key));
     inFlight.set(key, pending);
   }
-  const entry = remember(key, await pending, Date.now() - startedAt);
+  const entry = await pending;
   return { ...entry.result, cached: false, cachedAt: new Date(entry.fetchedAt).toISOString() };
 }
 
