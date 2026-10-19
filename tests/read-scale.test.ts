@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { listCapabilities } from '../src/capability/store.js';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
-import { claimsForEntities, graphOverview, graphSearch } from '../src/graph/query.js';
+import { claimsForEntities, GRAPH_MAX_NODES, graphOverview, graphSearch } from '../src/graph/query.js';
 import { sync } from '../src/ingest/sync.js';
 import { findLiveScope } from '../src/lineage/scope.js';
 import { queryClaims } from '../src/store/claims.js';
@@ -147,10 +147,17 @@ describe('reads at scale', () => {
     });
   }
 
-  it('lays out an overview of more nodes than one statement can bind', async () => {
+  it('caps an overview asked for more nodes than one statement can bind', async () => {
     const res = await graphOverview(ctx.store, n + 10);
-    expect(res.nodes.length).toBeGreaterThan(n);
-    expect(res.edges.filter((e) => e.source === hub && e.type === 'supplies')).toHaveLength(n);
+    expect(res.nodes).toHaveLength(GRAPH_MAX_NODES);
+    const ids = new Set(res.nodes.map((x) => x.id));
+    expect(ids.has(hub)).toBe(true);
+    // every partner laid out keeps its edge to the hub, and no edge leaves the overview
+    const partners = res.nodes.filter((x) => x.id.startsWith('partner-')).length;
+    expect(res.edges.filter((e) => e.source === hub && e.type === 'supplies')).toHaveLength(partners);
+    for (const e of res.edges) expect(ids.has(e.source) && ids.has(e.target)).toBe(true);
+    // the hub's degree counts all of its typed edges, not only the ones drawn
+    expect(res.nodes.find((x) => x.id === hub)?.degree).toBe(n);
   });
 
   it('lists a catalog of more capabilities than one statement can bind', async () => {
