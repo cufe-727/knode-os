@@ -8,6 +8,8 @@
   <link rel="stylesheet" href="/style.css" />
   <script src="/vendor/marked.js"></script>
   <script src="/markdown.js"></script>
+  <script src="/vendor/d3.js"></script>
+  <script src="/graph.js"></script>
 </head>
 <body>
   <section id="auth-view" class="auth-shell" aria-label="Sign in to knode-os">
@@ -223,9 +225,67 @@
         <button id="btn-graph-insights">insights</button>
       </div>
       <div id="graph-wrap">
-        <canvas id="graph-canvas"></canvas>
+        <div id="graph-stage">
+          <canvas id="graph-canvas" tabindex="0" aria-label="knowledge graph"></canvas>
+          <span class="hint" id="graph-caption"></span>
+          <div id="graph-legend"></div>
+          <details id="graph-settings" class="graph-settings">
+            <summary>settings</summary>
+            <div class="graph-settings-body">
+              <p class="eyebrow">filters</p>
+              <label><span>find</span><input type="text" id="gs-query" placeholder="highlight by name…" /></label>
+              <label><span>nodes</span><select id="gs-limit"><option value="50">50</option><option value="100">100</option><option value="150">150</option><option value="200">200</option><option value="300">300</option><option value="400">400</option></select></label>
+              <label class="check"><input type="checkbox" id="gs-cooccur" /><span>co-occurrence edges</span></label>
+              <label class="check"><input type="checkbox" id="gs-hideOrphans" /><span>hide orphans</span></label>
+              <label><span>min weight</span><input type="range" id="gs-minWeight" min="0" max="5" step="0.1" /><output></output></label>
+              <p class="eyebrow">display</p>
+              <label><span>node size</span><input type="range" id="gs-nodeSize" min="0.5" max="2" step="0.05" /><output></output></label>
+              <label><span>link width</span><input type="range" id="gs-linkWidth" min="0.5" max="3" step="0.1" /><output></output></label>
+              <label><span>text fade</span><input type="range" id="gs-textFade" min="0.4" max="2.5" step="0.05" /><output></output></label>
+              <label class="check"><input type="checkbox" id="gs-arrows" /><span>arrows on typed edges</span></label>
+              <label class="check"><input type="checkbox" id="gs-pin" /><span>keep dragged nodes where dropped</span></label>
+              <p class="eyebrow">forces</p>
+              <label><span>center</span><input type="range" id="gs-center" min="0" max="0.3" step="0.01" /><output></output></label>
+              <label><span>repel</span><input type="range" id="gs-repel" min="50" max="600" step="10" /><output></output></label>
+              <label><span>link distance</span><input type="range" id="gs-linkDistance" min="30" max="250" step="5" /><output></output></label>
+              <div class="row"><button id="gs-fit">fit to view</button><button id="gs-reset">reset</button></div>
+            </div>
+          </details>
+        </div>
         <div id="graph-side"></div>
       </div>
+    </section>
+
+    <!-- Entities -->
+    <section id="tab-entities" class="tab">
+      <div class="searchbar">
+        <input id="ent-q" placeholder="filter by name or alias…" />
+        <select id="ent-type"><option value="">all types</option></select>
+        <label class="hint check"><input type="checkbox" id="ent-merged" /> merged too</label>
+        <span class="hint" id="ent-count"></span>
+        <div class="pager">
+          <button id="ent-prev">‹ prev</button>
+          <span class="hint mono" id="ent-page"></span>
+          <button id="ent-next">next ›</button>
+          <select id="ent-size" title="rows per page"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select>
+        </div>
+      </div>
+      <table id="entities-table">
+        <thead><tr>
+          <th data-sort="name">name</th>
+          <th data-sort="type">type</th>
+          <th>aliases</th>
+          <th>description</th>
+          <th class="num" data-sort="mentions" title="chunks that mention it">mentions</th>
+          <th class="num" title="documents that mention it">docs</th>
+          <th class="num" title="typed relations, from either end">relations</th>
+          <th class="num" data-sort="evidence" title="evidence rows behind it">evidence</th>
+          <th title="which extractors wrote its evidence">sources</th>
+          <th>wiki</th>
+          <th data-sort="updated">updated</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
     </section>
 
     <!-- Traces -->

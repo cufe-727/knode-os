@@ -254,12 +254,7 @@ function loadWorkspaceData() {
   expandedDirs.clear();
   expandedDirs.add('wiki');
   loadedConfig = null;
-  if (graphState.anim) cancelAnimationFrame(graphState.anim);
-  graphState.nodes = [];
-  graphState.edges = [];
-  graphState.loaded = false;
-  graphState.anim = null;
-  graphState.selected = null;
+  resetGraph();
   $('#filetree').innerHTML = '';
   $('#file-path').textContent = '';
   $('#file-view').hidden = false;
@@ -272,6 +267,7 @@ function loadWorkspaceData() {
   $('#btn-delete').disabled = true;
   $('#search-results').innerHTML = '';
   $('#graph-side').innerHTML = '';
+  resetEntities();
   $('#traces-table tbody').innerHTML = '';
   $('#suggestions').innerHTML = '';
   $('#cfg-status').innerHTML = '';
@@ -585,6 +581,7 @@ const NAV = [
   { id: 'ask', title: 'Ask', tabs: [{ id: 'ask', title: 'Ask', hint: 'An agent that answers from your workspace' }] },
   { id: 'knowledge', title: 'Knowledge', tabs: [
     { id: 'graph', title: 'Graph', hint: 'Entities, relations, and claims' },
+    { id: 'entities', title: 'Entities', hint: 'Every entity, filtered and sorted' },
     { id: 'wiki', title: 'Wiki', hint: 'Pages researched by agent CLIs' },
     { id: 'dream', title: 'Dream', hint: 'Review agent improvement ideas' },
   ] },
@@ -627,7 +624,9 @@ const TAB_LOAD = {
   ask: () => loadChat(),
   settings: () => loadConfigForm(),
   access: () => loadAccess(),
-  graph: () => { if (!graphState.loaded) loadGraph(''); },
+  // the box may hold a name another view put there (exploreEntity): arrival runs it
+  graph: () => { if (!graphState.loaded) loadGraph($('#graph-q').value.trim()); },
+  entities: () => loadEntities(),
 };
 
 const NAV_KEY = 'knode-os.nav.v1';
@@ -1830,125 +1829,238 @@ $('#search-q').addEventListener('keydown', (e) => e.key === 'Enter' && doSearch(
 
 /* ------------------------------- graph --------------------------------- */
 
-const graphState = { nodes: [], edges: [], loaded: false, anim: null, selected: null };
+/** One colour per entity type, shared by the graph canvas and the entity table's type pills (set through element.style, as the page policy allows). */
+const ENTITY_COLORS = { person: '#5fd297', organization: '#ffc861', product: '#ff9e7a', project: '#ff7a90', component: '#7ab8ff', technology: '#5cc8ff', concept: '#b48cff', event: '#e98cff', location: '#8cffe2', other: '#8b95a5' };
+const entityColor = (type) => ENTITY_COLORS[type] ?? ENTITY_COLORS.other;
 
-async function loadGraph(q) {
-  const depth = $('#graph-depth').value;
-  const url = q ? `/api/graph?q=${encodeURIComponent(q)}&depth=${depth}` : '/api/graph';
+const GRAPH_KEY = 'knode-os.graph.v1';
+
+/** Display preferences for the graph (web/graph.js draws by them), kept across workspaces and reloads. */
+function restoreGraphSettings() {
+  const defaults = window.KnodeGraph?.DEFAULTS ?? {};
+  let saved = {};
   try {
-    const res = await api(url);
+    const raw = JSON.parse(localStorage.getItem(GRAPH_KEY) ?? 'null');
+    if (raw && raw.v === 1) saved = raw;
+  } catch {
+    /* storage may be off, or hold something older */
+  }
+  const settings = { ...defaults };
+  for (const key of Object.keys(defaults)) if (key in saved) settings[key] = saved[key];
+  return settings;
+}
+
+function saveGraphSettings() {
+  try {
+    localStorage.setItem(GRAPH_KEY, JSON.stringify({ v: 1, ...graphState.settings }));
+  } catch {
+    /* storage may be off */
+  }
+}
+
+const graphState = { graph: null, res: null, mode: 'overview', query: '', loaded: false, settings: restoreGraphSettings() };
+
+function resetGraph() {
+  graphState.graph?.clear();
+  graphState.res = null;
+  graphState.query = '';
+  graphState.loaded = false;
+  $('#graph-caption').textContent = '';
+  $('#graph-legend').innerHTML = '';
+  $('#graph-side').innerHTML = '';
+}
+
+/** The canvas controller, built on first use; without d3 the stage says so instead of breaking. */
+function ensureGraph() {
+  if (graphState.graph) return graphState.graph;
+  if (!window.KnodeGraph?.available) {
+    const stage = $('#graph-stage');
+    if (!stage.querySelector('.graph-empty')) {
+      const p = document.createElement('p');
+      p.className = 'hint graph-empty';
+      p.textContent = 'the graph view needs the d3 package: run pnpm install where the service runs, then restart it';
+      stage.appendChild(p);
+    }
+    return null;
+  }
+  const g = new KnodeGraph($('#graph-canvas'), { colors: ENTITY_COLORS, settings: graphState.settings });
+  g.on('select', (n) => renderGraphSide(n));
+  g.on('open', (n) => loadGraph(n.name));
+  g.on('stats', (s) => paintGraphCaption(s));
+  graphState.graph = g;
+  paintGraphSettings();
+  return g;
+}
+
+/** Empty query: the overview, the top entities by mentions. A name: the local graph around it. */
+async function loadGraph(q) {
+  const g = ensureGraph();
+  if (!g) return;
+  const s = graphState.settings;
+  const params = new URLSearchParams({ limit: String(s.limit) });
+  if (q) {
+    params.set('q', q);
+    params.set('depth', $('#graph-depth').value);
+  } else if (!s.cooccur) {
+    // the co-occurrence join is the slow part of an overview: skip it when it will not be drawn
+    params.set('edges', 'typed');
+  }
+  try {
+    const res = await api(`/api/graph?${params}`);
+    graphState.res = res;
+    graphState.mode = q ? 'search' : 'overview';
+    graphState.query = q;
     graphState.loaded = true;
-    startGraph(res.nodes, res.edges);
-    const side = $('#graph-side');
-    side.innerHTML = res.nodes.length === 0 ? '<p class="hint">graph is empty — index docs first (entities come from [[wikilinks]] and LLM extraction).</p>' : '';
-    const claimsBySubject = new Map();
-    for (const cl of res.claims ?? []) {
-      if (!claimsBySubject.has(cl.subject)) claimsBySubject.set(cl.subject, []);
-      claimsBySubject.get(cl.subject).push(cl);
-    }
-    for (const n of res.nodes.slice(0, 30)) {
-      const card = document.createElement('div');
-      card.className = 'entity-card';
-      const facts = (claimsBySubject.get(n.name) ?? []).slice(0, 3)
-        .map((cl) => `<div class="hint">◈ ${esc(cl.statement.slice(0, 120))} <span class="mono">[${esc(cl.status)}]</span></div>`)
-        .join('');
-      card.innerHTML = `<span class="etype">${esc(n.type)}</span> <span class="ename">${esc(n.name)}</span>
-        <div class="hint">${esc((n.description || '').slice(0, 140))}</div>
-        <div class="hint mono">score ${(n.score ?? 0).toFixed(2)} · ${n.mentionCount} mentions</div>${facts}`;
-      side.appendChild(card);
-    }
-    if (res.chunks?.length) {
-      const h = document.createElement('p');
-      h.className = 'hint';
-      h.textContent = 'grounded in: ' + [...new Set(res.chunks.map((c) => c.path))].slice(0, 5).join(', ');
-      side.appendChild(h);
-    }
+    $('#graph-q').value = q;
+    g.load(res.nodes, res.edges, { mode: graphState.mode });
+    paintGraphLegend(res.nodes);
+    renderGraphSide(null);
   } catch (e) {
     toast(`graph failed: ${e.message}`);
   }
 }
 
-function startGraph(nodes, edges) {
-  const canvas = $('#graph-canvas');
-  const ctx = canvas.getContext('2d');
-  const W = (canvas.width = canvas.clientWidth * devicePixelRatio);
-  const H = (canvas.height = canvas.clientHeight * devicePixelRatio);
-  const colors = { person: '#5fd297', organization: '#ffc861', product: '#ff9e7a', project: '#ff7a90', component: '#7ab8ff', technology: '#5cc8ff', concept: '#b48cff', event: '#e98cff', location: '#8cffe2', other: '#8b95a5' };
+function paintGraphCaption({ nodes, edges }) {
+  const what = graphState.mode === 'search'
+    ? `local graph · “${graphState.query}” · ${$('#graph-depth').value} hops · ranked by relevance`
+    : `overview · top ${graphState.settings.limit} by mentions`;
+  $('#graph-caption').textContent = `${what} · ${nodes} nodes · ${edges} edges`;
+}
 
-  const ns = nodes.slice(0, 150).map((n, i) => ({
-    ...n,
-    x: W / 2 + Math.cos((i / nodes.length) * 6.283) * Math.min(W, H) * 0.33,
-    y: H / 2 + Math.sin((i / nodes.length) * 6.283) * Math.min(W, H) * 0.33,
-    vx: 0, vy: 0,
-    r: (6 + Math.min(14, Math.sqrt(n.mentionCount + 1) * 3)) * devicePixelRatio,
-  }));
-  const byId = new Map(ns.map((n) => [n.id, n]));
-  const es = edges.filter((e) => byId.has(e.source) && byId.has(e.target));
+/** One chip per type in the result, with its count; a click hides or shows that type. */
+function paintGraphLegend(nodes) {
+  const counts = new Map();
+  for (const n of nodes) counts.set(n.type, (counts.get(n.type) ?? 0) + 1);
+  const hidden = new Set(graphState.settings.hiddenTypes);
+  const legend = $('#graph-legend');
+  legend.innerHTML = [...counts.entries()].sort((a, b) => b[1] - a[1])
+    .map(([type, n]) => `<button class="chip${hidden.has(type) ? ' off' : ''}" data-type="${esc(type)}" title="hide or show this type"><span class="dot"></span>${esc(type)} · ${n}</button>`)
+    .join('');
+  for (const chip of legend.querySelectorAll('.chip')) chip.querySelector('.dot').style.background = entityColor(chip.dataset.type);
+}
 
-  if (graphState.anim) cancelAnimationFrame(graphState.anim);
-  graphState.nodes = ns;
-  graphState.edges = es;
+$('#graph-legend').addEventListener('click', (ev) => {
+  const chip = ev.target.closest('.chip');
+  if (!chip) return;
+  const hidden = new Set(graphState.settings.hiddenTypes);
+  if (hidden.has(chip.dataset.type)) hidden.delete(chip.dataset.type);
+  else hidden.add(chip.dataset.type);
+  chip.classList.toggle('off', hidden.has(chip.dataset.type));
+  graphState.settings.hiddenTypes = [...hidden];
+  graphState.graph?.setSettings({ hiddenTypes: graphState.settings.hiddenTypes });
+  saveGraphSettings();
+});
 
-  let ticks = 0;
-  const step = () => {
-    // forces
-    for (const a of ns) {
-      a.vx += (W / 2 - a.x) * 0.0004;
-      a.vy += (H / 2 - a.y) * 0.0004;
-      for (const b of ns) {
-        if (a === b) continue;
-        let dx = a.x - b.x, dy = a.y - b.y;
-        let d2 = dx * dx + dy * dy + 0.01;
-        if (d2 < 40000 * devicePixelRatio) {
-          const f = 1200 * devicePixelRatio / d2;
-          a.vx += dx * f * 0.01;
-          a.vy += dy * f * 0.01;
-        }
-      }
+/** The settings panel shows the current values; every control writes straight back. */
+function paintGraphSettings() {
+  const s = graphState.settings;
+  for (const key of Object.keys(window.KnodeGraph?.DEFAULTS ?? {})) {
+    const el = document.getElementById(`gs-${key}`);
+    if (!el) continue;
+    if (el.type === 'checkbox') el.checked = Boolean(s[key]);
+    else el.value = String(s[key]);
+    const out = el.nextElementSibling;
+    if (out && out.tagName === 'OUTPUT') out.textContent = String(s[key]);
+  }
+}
+
+for (const key of Object.keys(window.KnodeGraph?.DEFAULTS ?? {})) {
+  const el = document.getElementById(`gs-${key}`);
+  if (!el) continue;
+  const apply = () => {
+    const value = el.type === 'checkbox' ? el.checked : Number(el.value);
+    graphState.settings[key] = value;
+    const out = el.nextElementSibling;
+    if (out && out.tagName === 'OUTPUT') out.textContent = String(value);
+    saveGraphSettings();
+    // the node count, and co-occurrence in an overview, change what the server sends
+    if (key === 'limit' || (key === 'cooccur' && graphState.mode === 'overview')) {
+      if (graphState.loaded) loadGraph(graphState.query);
+      return;
     }
-    for (const e of es) {
-      const a = byId.get(e.source), b = byId.get(e.target);
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const d = Math.sqrt(dx * dx + dy * dy) + 0.01;
-      const want = 110 * devicePixelRatio;
-      const f = ((d - want) / d) * 0.004 * Math.min(2, e.weight);
-      a.vx += dx * f; a.vy += dy * f;
-      b.vx -= dx * f; b.vy -= dy * f;
-    }
-    for (const n of ns) {
-      n.vx *= 0.85; n.vy *= 0.85;
-      n.x = Math.max(n.r, Math.min(W - n.r, n.x + n.vx));
-      n.y = Math.max(n.r, Math.min(H - n.r, n.y + n.vy));
-    }
-    // draw
-    ctx.clearRect(0, 0, W, H);
-    ctx.strokeStyle = 'rgba(140,150,170,0.25)';
-    for (const e of es) {
-      const a = byId.get(e.source), b = byId.get(e.target);
-      ctx.lineWidth = Math.min(3, 0.5 + e.weight * 0.4) * devicePixelRatio;
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-    }
-    ctx.font = `${11 * devicePixelRatio}px sans-serif`;
-    for (const n of ns) {
-      ctx.fillStyle = colors[n.type] || colors.other;
-      ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, 6.283); ctx.fill();
-      ctx.fillStyle = '#d7dde6';
-      ctx.fillText(n.name.slice(0, 22), n.x + n.r + 3, n.y + 4);
-    }
-    if (++ticks < 240) graphState.anim = requestAnimationFrame(step);
+    graphState.graph?.setSettings({ [key]: value });
   };
-  step();
+  el.addEventListener(el.type === 'range' ? 'input' : 'change', apply);
+}
+$('#gs-query').addEventListener('input', () => graphState.graph?.setQuery($('#gs-query').value));
+$('#gs-fit').addEventListener('click', () => graphState.graph?.fit());
+$('#gs-reset').addEventListener('click', () => {
+  const defaults = window.KnodeGraph?.DEFAULTS ?? {};
+  const refetch = graphState.settings.limit !== defaults.limit || graphState.settings.cooccur !== defaults.cooccur;
+  graphState.settings = { ...defaults };
+  saveGraphSettings();
+  paintGraphSettings();
+  $('#gs-query').value = '';
+  graphState.graph?.setQuery('');
+  graphState.graph?.setSettings(graphState.settings);
+  if (refetch && graphState.loaded) loadGraph(graphState.query);
+  else if (graphState.res) paintGraphLegend(graphState.res.nodes);
+});
 
-  canvas.onclick = (ev) => {
-    const rect = canvas.getBoundingClientRect();
-    const x = (ev.clientX - rect.left) * devicePixelRatio;
-    const y = (ev.clientY - rect.top) * devicePixelRatio;
-    const hit = ns.find((n) => (n.x - x) ** 2 + (n.y - y) ** 2 <= (n.r + 4) ** 2);
-    if (hit) {
-      $('#graph-q').value = hit.name;
-      loadGraph(hit.name);
-    }
+/**
+ * The panel beside the canvas: the selected node with its neighbours and
+ * claims, or, with nothing selected, the top of the result.
+ */
+function renderGraphSide(node) {
+  const side = $('#graph-side');
+  const res = graphState.res;
+  const g = graphState.graph;
+  if (!res || !g) {
+    side.innerHTML = '';
+    return;
+  }
+  if (!res.nodes.length) {
+    side.innerHTML = '<p class="hint">graph is empty — index docs first (entities come from [[wikilinks]], frontmatter and extraction).</p>';
+    return;
+  }
+  const claimsBySubject = new Map();
+  for (const cl of res.claims ?? []) (claimsBySubject.get(cl.subject) ?? claimsBySubject.set(cl.subject, []).get(cl.subject)).push(cl);
+  // the number means mentions in an overview and relevance to the query in a search: say which
+  const numbers = (n) => {
+    const parts = [`${n.mentionCount} mentions`, `degree ${typeof n.degree === 'number' ? n.degree : '?'}`];
+    if (graphState.mode === 'search') parts.unshift(`relevance ${(n.score ?? 0).toFixed(2)}`);
+    return parts.join(' · ');
   };
+  const facts = (n, max) => (claimsBySubject.get(n.name) ?? []).slice(0, max)
+    .map((cl) => `<div class="hint">◈ ${esc(cl.statement.slice(0, 120))} <span class="mono">[${esc(cl.status)}]</span></div>`)
+    .join('');
+  const pill = (type) => `<span class="tpill" data-type="${esc(type)}">${esc(type)}</span>`;
+
+  if (node) {
+    const neighbours = g.neighbours(node.id);
+    side.innerHTML = `<div class="entity-card selected">
+        ${pill(node.type)} <span class="ename">${esc(node.name)}</span>
+        <div class="hint">${esc((node.description || '').slice(0, 240))}</div>
+        <div class="hint mono">${esc(numbers(node))}</div>
+        ${facts(node, 5)}
+        <div class="actions">
+          <button data-local>local graph</button>
+          <button data-wiki${node.wikiPath ? '' : ' disabled title="no wiki page yet"'}>open wiki page</button>
+        </div>
+      </div>
+      <div class="entity-card"><b>${neighbours.length ? `${neighbours.length} neighbours in view` : 'no neighbours in view'}</b>
+        ${neighbours.slice(0, 24).map((x) => `<div class="nb" data-id="${esc(x.node.id)}">${pill(x.node.type)}<span>${esc(x.node.name)}</span><span class="hint mono">${x.co ? 'co-occurs' : esc(x.type)} ${x.weight.toFixed(1)}</span></div>`).join('')}
+      </div>`;
+    side.querySelector('[data-local]').addEventListener('click', () => loadGraph(node.name));
+    if (node.wikiPath) side.querySelector('[data-wiki]').addEventListener('click', () => { navigate('files'); openFile(node.wikiPath); });
+    for (const nb of side.querySelectorAll('.nb')) {
+      nb.addEventListener('click', () => { g.select(nb.dataset.id); g.focus(nb.dataset.id); });
+      nb.addEventListener('mouseenter', () => g.setHover(nb.dataset.id));
+      nb.addEventListener('mouseleave', () => g.setHover(null));
+    }
+  } else {
+    side.innerHTML = res.nodes.slice(0, 30).map((n) => `<div class="entity-card pick" data-id="${esc(n.id)}">
+        ${pill(n.type)} <span class="ename">${esc(n.name)}</span>
+        <div class="hint">${esc((n.description || '').slice(0, 140))}</div>
+        <div class="hint mono">${esc(numbers(n))}</div>${facts(n, 3)}
+      </div>`).join('');
+    if (res.chunks?.length) {
+      side.insertAdjacentHTML('beforeend', `<p class="hint">grounded in: ${[...new Set(res.chunks.map((c) => c.path))].slice(0, 5).map(pageLink).join(', ')}</p>`);
+      wireOpenLinks(side);
+    }
+    for (const card of side.querySelectorAll('.entity-card.pick')) card.addEventListener('click', () => { g.select(card.dataset.id); g.focus(card.dataset.id); });
+  }
+  for (const p of side.querySelectorAll('.tpill')) p.style.color = entityColor(p.dataset.type);
 }
 
 $('#btn-graph').addEventListener('click', () => loadGraph($('#graph-q').value.trim()));
@@ -1968,6 +2080,152 @@ $('#btn-graph-insights').addEventListener('click', async () => {
   } catch (e) {
     toast(`insights failed: ${e.message}`);
   }
+});
+
+/* ------------------------------ entities ------------------------------- */
+
+/**
+ * Knowledge → Entities: one page of GET /api/entities at a time. The server
+ * filters, sorts and counts; this keeps the query and paints what comes back.
+ */
+const entState = { q: '', type: '', merged: false, sort: 'mentions', order: 'desc', offset: 0, limit: 50, total: 0, seq: 0 };
+/** The order a column reads best in when it is first chosen. */
+const ENT_FIRST_ORDER = { name: 'asc', type: 'asc', mentions: 'desc', evidence: 'desc', updated: 'desc' };
+let entTimer = null;
+
+function resetEntities() {
+  Object.assign(entState, { q: '', type: '', merged: false, offset: 0, total: 0 });
+  entState.seq++;
+  $('#ent-q').value = '';
+  $('#ent-merged').checked = false;
+  $('#ent-type').innerHTML = '<option value="">all types</option>';
+  delete $('#ent-type').dataset.sig;
+  $('#ent-count').textContent = '';
+  $('#ent-page').textContent = '';
+  $('#entities-table tbody').innerHTML = '';
+}
+
+async function loadEntities() {
+  // boot runs a loader twice and a slow page may arrive after a fast one: the latest request wins
+  const seq = ++entState.seq;
+  const params = new URLSearchParams({ sort: entState.sort, order: entState.order, offset: String(entState.offset), limit: String(entState.limit) });
+  if (entState.q) params.set('q', entState.q);
+  if (entState.type) params.set('type', entState.type);
+  if (entState.merged) params.set('merged', '1');
+  try {
+    const page = await api(`/api/entities?${params}`);
+    if (seq === entState.seq) renderEntities(page);
+  } catch (e) {
+    if (seq === entState.seq) $('#entities-table tbody').innerHTML = `<tr><td colspan="11" class="hint">entities failed: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+function renderEntities(page) {
+  entState.total = page.total;
+  entState.offset = page.offset;
+  entState.limit = page.limit;
+  const tbody = $('#entities-table tbody');
+  tbody.innerHTML = page.items.map((e) => {
+    const aliases = e.aliases.slice(0, 3).join(', ') + (e.aliases.length > 3 ? ` +${e.aliases.length - 3}` : '');
+    const sources = Object.entries(e.sources).sort((a, b) => b[1] - a[1]).map(([family, n]) => `<span class="spill">${esc(family)} ${n}</span>`).join(' ');
+    return `<tr>
+      <td><a href="#" class="ename" data-explore="${esc(e.name)}" title="explore in the graph">${esc(e.name)}</a>${e.canonicalId ? ' <span class="hint">merged</span>' : ''}</td>
+      <td><span class="tpill" data-type="${esc(e.type)}">${esc(e.type)}</span></td>
+      <td class="hint" title="${esc(e.aliases.join(', '))}">${esc(aliases)}</td>
+      <td class="hint ent-desc" title="${esc(e.description)}">${esc(e.description.slice(0, 120))}</td>
+      <td class="num mono">${e.mentions}</td>
+      <td class="num mono">${e.documents}</td>
+      <td class="num mono">${e.relations}</td>
+      <td class="num mono">${e.evidence}</td>
+      <td>${sources}</td>
+      <td>${e.wikiPath ? pageLink(e.wikiPath) : '<span class="hint">—</span>'}</td>
+      <td class="mono hint">${e.updatedAt ? new Date(e.updatedAt).toLocaleDateString() : '—'}</td>
+    </tr>`;
+  }).join('');
+  if (!page.items.length) {
+    const filtered = entState.q || entState.type;
+    tbody.innerHTML = `<tr><td colspan="11" class="hint">${filtered ? 'no entities match' : 'no entities yet — index documents first (entities come from frontmatter, [[wikilinks]] and extraction)'}</td></tr>`;
+  }
+  for (const pill of tbody.querySelectorAll('.tpill')) pill.style.color = entityColor(pill.dataset.type);
+  wireOpenLinks(tbody);
+
+  // the type filter keeps its options, and the selection, while the types hold still
+  const sel = $('#ent-type');
+  const sig = page.typeCounts.map((t) => `${t.type}:${t.n}`).join('|');
+  if (sel.dataset.sig !== sig) {
+    sel.dataset.sig = sig;
+    sel.innerHTML = `<option value="">all types</option>${page.typeCounts.map((t) => `<option value="${esc(t.type)}">${esc(t.type)} (${t.n.toLocaleString()})</option>`).join('')}`;
+    sel.value = entState.type;
+    if (sel.value !== entState.type) entState.type = '';
+  }
+
+  const from = page.total === 0 ? 0 : page.offset + 1;
+  const to = Math.min(page.total, page.offset + page.items.length);
+  $('#ent-count').textContent = `${page.total.toLocaleString()} ${page.total === 1 ? 'entity' : 'entities'}`;
+  $('#ent-page').textContent = page.total ? `${from.toLocaleString()}–${to.toLocaleString()} of ${page.total.toLocaleString()}` : '';
+  $('#ent-prev').disabled = page.offset <= 0;
+  $('#ent-next').disabled = to >= page.total;
+  $('#ent-size').value = String(page.limit);
+  for (const th of document.querySelectorAll('#entities-table th[data-sort]')) {
+    th.classList.toggle('sorted', th.dataset.sort === entState.sort);
+    th.classList.toggle('asc', th.dataset.sort === entState.sort && entState.order === 'asc');
+  }
+}
+
+/** Open the graph on an entity: the box holds the name, and arrival (or a view already loaded) runs it once. */
+function exploreEntity(name) {
+  $('#graph-q').value = name;
+  if (graphState.loaded) loadGraph(name);
+  navigate('graph');
+}
+
+$('#ent-q').addEventListener('input', () => {
+  clearTimeout(entTimer);
+  entTimer = setTimeout(() => {
+    entState.q = $('#ent-q').value.trim();
+    entState.offset = 0;
+    loadEntities();
+  }, 250);
+});
+$('#ent-type').addEventListener('change', () => {
+  entState.type = $('#ent-type').value;
+  entState.offset = 0;
+  loadEntities();
+});
+$('#ent-merged').addEventListener('change', () => {
+  entState.merged = $('#ent-merged').checked;
+  entState.offset = 0;
+  loadEntities();
+});
+$('#ent-size').addEventListener('change', () => {
+  const limit = Number($('#ent-size').value) || 50;
+  // the first row on screen stays on screen, on whichever page now holds it
+  entState.offset = Math.floor(entState.offset / limit) * limit;
+  entState.limit = limit;
+  loadEntities();
+});
+$('#ent-prev').addEventListener('click', () => {
+  entState.offset = Math.max(0, entState.offset - entState.limit);
+  loadEntities();
+});
+$('#ent-next').addEventListener('click', () => {
+  entState.offset += entState.limit;
+  loadEntities();
+});
+$('#entities-table thead').addEventListener('click', (ev) => {
+  const th = ev.target.closest('th[data-sort]');
+  if (!th) return;
+  const col = th.dataset.sort;
+  entState.order = col === entState.sort ? (entState.order === 'asc' ? 'desc' : 'asc') : ENT_FIRST_ORDER[col];
+  entState.sort = col;
+  entState.offset = 0;
+  loadEntities();
+});
+$('#entities-table tbody').addEventListener('click', (ev) => {
+  const a = ev.target.closest('a[data-explore]');
+  if (!a) return;
+  ev.preventDefault();
+  exploreEntity(a.dataset.explore);
 });
 
 /* ------------------------------- traces -------------------------------- */
