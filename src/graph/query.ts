@@ -22,9 +22,13 @@ import {
   Temporal,
   toDateString,
 } from '../store/temporal.js';
+import { typedDegrees } from '../store/entities.js';
 import { ClaimItem, EntityRow, GraphEdge, GraphNode, GraphSearchResult, RelationRow, SearchResult } from '../types.js';
 import { coOccurrenceEdge, coOccurringEntities, coOccursSql } from './cooccur.js';
 import { canonicalMap, expandGroups } from './resolve.js';
+
+/** Most nodes a graph read returns: past this a canvas is a ball of edges, and the overview's co-occurrence join is the cost. */
+export const GRAPH_MAX_NODES = 400;
 
 /**
  * Scope of a graph read: which times to answer from, and which sources may
@@ -129,7 +133,7 @@ export async function graphSearch(
   opts: { depth?: number; limit?: number; chunkLimit?: number; heat?: HeatConfig; track?: boolean } & GraphScope = {},
 ): Promise<GraphSearchResult> {
   const depth = Math.min(opts.depth ?? 2, 4);
-  const limit = opts.limit ?? 30;
+  const limit = Math.min(GRAPH_MAX_NODES, Math.max(1, Math.floor(opts.limit ?? 30) || 30));
   const chunkLimit = opts.chunkLimit ?? 8;
   const { t, f } = scopeOf(opts);
   const asOf = t.txTime;
@@ -250,9 +254,12 @@ export async function graphSearch(
       description: e.description,
       score: score.get(e.id) ?? 0,
       mentionCount: e.mention_count,
+      wikiPath: e.wiki_path ?? null,
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
+  const degrees = await typedDegrees(store, nodes.map((n) => n.id));
+  for (const n of nodes) n.degree = degrees.get(n.id) ?? 0;
   const keep = new Set(nodes.map((n) => n.id));
   const keptEdges = [...edges.values()].filter((e) => keep.has(e.source) && keep.has(e.target));
 
@@ -325,40 +332,64 @@ async function asOfRows(store: Store, ids: string[], asOf: string, fallback: Ent
   }));
 }
 
+export interface GraphOverviewOptions {
+  /** Top entities by mentions to return, 1..GRAPH_MAX_NODES (default 120). */
+  limit?: number;
+  /** Only entities of these types. */
+  types?: string[];
+  /** `typed` leaves the derived co-occurrence edges out — the costly part of an overview. */
+  edges?: 'typed' | 'all';
+}
+
+/** Co-occurrence partners kept per hub: the default 50, among 120 hubs, drew a near-complete graph. */
+const OVERVIEW_CO_PER_ENTITY = 12;
+
 /**
- * Whole-graph overview for visualization: top-N live entities by mentions, the
- * typed edges among them, and the co-occurrence derived among them (each
- * node's strongest neighbours; see cooccur.ts).
+ * Whole-graph overview for visualization: top-N live entities by mentions (a
+ * merged entity answers as its survivor), the typed edges among them, and the
+ * co-occurrence derived among them (each node's strongest neighbours; see
+ * cooccur.ts). A bare number is the limit, as callers passed it before.
  */
-export async function graphOverview(store: Store, limit = 120): Promise<GraphSearchResult> {
+export async function graphOverview(store: Store, opts: number | GraphOverviewOptions = {}): Promise<GraphSearchResult> {
+  const o = typeof opts === 'number' ? { limit: opts } : opts;
+  const limit = Math.min(GRAPH_MAX_NODES, Math.max(1, Math.floor(o.limit ?? 120) || 120));
+  const types = (o.types ?? []).map((t) => t.trim()).filter(Boolean).slice(0, 20);
+  const p = new Params();
+  const where = [live('e', p), 'e.canonical_id IS NULL'];
+  if (types.length) where.push(`e.type IN (${types.map((t) => p.add(t)).join(',')})`);
   const ents = await store.query<EntityRow>(
-    `SELECT * FROM entities WHERE tx_to IS NULL ORDER BY mention_count DESC, updated_at DESC LIMIT $1`,
-    [limit],
+    `SELECT * FROM entities e WHERE ${where.join(' AND ')} ORDER BY e.mention_count DESC, e.updated_at DESC LIMIT ${p.add(limit)}`,
+    p.list,
   );
   if (ents.length === 0) return { nodes: [], edges: [], chunks: [] };
   const ids = ents.map((e) => e.id);
-  const ph = ids.map((_, i) => `$${i + 1}`).join(',');
   const rels = await store.query<RelationRow>(
-    `SELECT * FROM relations WHERE source_id IN (${ph}) AND target_id IN (${ph}) AND type <> 'co_occurs' AND tx_to IS NULL`,
-    ids,
+    `SELECT * FROM relations WHERE source_id = ANY($1::text[]) AND target_id = ANY($1::text[]) AND type <> 'co_occurs' AND tx_to IS NULL`,
+    [ids],
   );
   const edges: GraphEdge[] = rels.map((r) => ({
     source: r.source_id, target: r.target_id, type: r.type, description: r.description, weight: r.weight,
     validFrom: toDateString(r.valid_from ?? null), validTo: toDateString(r.valid_to ?? null),
   }));
-  // every node is a seed, so each pair comes back from both ends: keep it once.
-  // The top nodes are the hubs; their 50 newest documents are enough to rank
-  // their partners among themselves, and keep the finance overview under a second.
-  const seen = new Set<string>();
-  for (const x of await coOccurringEntities(store, ids, { among: ids, maxDocuments: 50 })) {
-    const edge = coOccurrenceEdge(x);
-    const key = `${edge.source}|${edge.target}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    edges.push(edge);
+  if (o.edges !== 'typed') {
+    // every node is a seed, so each pair comes back from both ends: keep it once.
+    // The top nodes are the hubs; their 50 newest documents are enough to rank
+    // their partners among themselves, and keep the finance overview under a second.
+    const seen = new Set<string>();
+    for (const x of await coOccurringEntities(store, ids, { among: ids, maxDocuments: 50, perEntity: OVERVIEW_CO_PER_ENTITY })) {
+      const edge = coOccurrenceEdge(x);
+      const key = `${edge.source}|${edge.target}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push(edge);
+    }
   }
+  const degrees = await typedDegrees(store, ids);
   return {
-    nodes: ents.map((e) => ({ id: e.id, name: e.name, type: e.type, description: e.description, score: e.mention_count, mentionCount: e.mention_count })),
+    nodes: ents.map((e) => ({
+      id: e.id, name: e.name, type: e.type, description: e.description, score: e.mention_count, mentionCount: e.mention_count,
+      degree: degrees.get(e.id) ?? 0, wikiPath: e.wiki_path ?? null,
+    })),
     edges,
     chunks: [],
   };

@@ -113,11 +113,11 @@ import {
   knowledgeStats,
   listDatasets,
   listDocuments,
-  listEntities,
   listSuggestions,
   listTraces,
   setSuggestionStatus,
 } from '../store/queries.js';
+import { queryEntities } from '../store/entities.js';
 import { WorkspaceContextRegistry, WorkspaceScope, resolveWorkspaceScope, workspaceDataDir } from './workspaces.js';
 import { loadOrCreateMcpToken, McpWorkspaceTokens, mountMcp } from './mcp-http.js';
 import { applyClaimMerge, listClaimMerges, unmergeClaim } from '../graph/claim-merge.js';
@@ -1385,9 +1385,12 @@ export function createApp(
     try {
       const q = c.req.query('q');
       const depth = Number(c.req.query('depth') ?? 2);
+      // nodes to return; each reader clamps it to its own range, and NaN means its default
+      const limit = Number(c.req.query('limit'));
       if (q) {
         return c.json(await graphSearch(ctx.store, q, {
           depth,
+          limit,
           heat: ctx.config.heat,
           temporal: resolveTemporal({
             asOf: c.req.query('as_of') || undefined,
@@ -1397,7 +1400,11 @@ export function createApp(
           filter: resolveScopeFilter({ kinds: csv(c.req.query('kinds')), sources: csv(c.req.query('sources')) }),
         }));
       }
-      return c.json(await graphOverview(ctx.store, Number(c.req.query('limit') ?? 120)));
+      return c.json(await graphOverview(ctx.store, {
+        limit,
+        types: csv(c.req.query('types')),
+        edges: c.req.query('edges') === 'typed' ? 'typed' : 'all',
+      }));
     } catch (e) {
       return c.json(err(e), status(e));
     }
@@ -1435,9 +1442,18 @@ export function createApp(
     return c.json(await graphInsights(ctx.store));
   });
 
+  // one page of the entity table (src/store/entities.ts); the remote API keeps the bare list
   app.get('/api/entities', async (c) => {
     const ctx = requestCtx(c);
-    return c.json(await listEntities(ctx.store, c.req.query('q')));
+    return c.json(await queryEntities(ctx.store, {
+      q: c.req.query('q'),
+      types: csv(c.req.query('type')),
+      sort: c.req.query('sort'),
+      order: c.req.query('order'),
+      offset: Number(c.req.query('offset')),
+      limit: Number(c.req.query('limit')),
+      merged: c.req.query('merged') === '1' || c.req.query('merged') === 'true',
+    }));
   });
 
   app.get('/api/documents', async (c) => {
@@ -2303,6 +2319,12 @@ export function createApp(
     if (!markedJs) return c.text('window.marked=null;', 200, { 'content-type': 'text/javascript' });
     return c.text(fs.readFileSync(markedJs, 'utf8'), 200, { 'content-type': 'text/javascript' });
   });
+  // the graph view's layout, zoom and drag (web/graph.js); without it the view says so instead of breaking
+  const d3Js = findD3Umd();
+  app.get('/vendor/d3.js', (c) => {
+    if (!d3Js) return c.text('window.d3=null;', 200, { 'content-type': 'text/javascript' });
+    return c.text(fs.readFileSync(d3Js, 'utf8'), 200, { 'content-type': 'text/javascript' });
+  });
   app.get('/*', (c) => {
     if (!webDir) return c.text('web UI assets not found', 404);
     let rel = c.req.path.replace(/^\/+/, '') || 'index.html';
@@ -2346,6 +2368,19 @@ function findMarkedUmd(): string | null {
       const p = path.join(path.dirname(entry), name);
       if (fs.existsSync(p)) return p;
     }
+  } catch {
+    /* not installed */
+  }
+  return null;
+}
+
+/** d3's browser bundle: the package exports only its ES entry, and `dist/` sits beside that entry's `src/`. */
+function findD3Umd(): string | null {
+  try {
+    const require = createRequire(import.meta.url);
+    const entry = require.resolve('d3'); // .../d3/src/index.js
+    const p = path.resolve(path.dirname(entry), '..', 'dist', 'd3.min.js');
+    if (fs.existsSync(p)) return p;
   } catch {
     /* not installed */
   }
