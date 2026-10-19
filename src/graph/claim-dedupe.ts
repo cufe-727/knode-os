@@ -17,10 +17,13 @@ import { applyClaimMerge, reanchorClaimGroups } from './claim-merge.js';
  * Only representative claims of the same canonical subject are compared (plus
  * the swapped subject/object group). Candidates come from three signals —
  * identical once normalized, embedding similarity of "subject: statement",
- * shared key numbers — then deterministic checks settle what they can
+ * shared key numbers (with real vectors, only where the two statements' cosine
+ * still reaches a lower floor) — then deterministic checks settle what they can
  * (different periods), and the Judge stage classifies the rest in batches as
  * same / contains / conflict / different_time / unrelated. Every verdict is
- * remembered in claim_pair_verdicts, so no pair is judged twice.
+ * remembered in claim_pair_verdicts, so no pair is judged twice. A run judges
+ * at most review.claimMergeMaxJudgedPerRun pairs, the most promising first
+ * (judgeOrder); the rest have no verdict yet and come up again next time.
  *
  * Runs after every tier-1 pass over the claims that pass wrote, and nightly
  * over everything (with re-anchoring of groups whose representative lost its
@@ -33,6 +36,8 @@ export interface ClaimDedupeOptions {
   focus?: string[];
   /** Cosine floor for the embedding signal. */
   threshold?: number;
+  /** Cosine floor for a pair that shares a key number, when real vectors are in use. */
+  numberThreshold?: number;
   /** Pairs per judge call. */
   pairsPerCall?: number;
 }
@@ -44,6 +49,8 @@ export interface ClaimDedupeStats {
   /** Settled as different periods without a model. */
   differentTime: number;
   judged: number;
+  /** Pairs that needed the judge but did not fit under review.claimMergeMaxJudgedPerRun: left for a later run. */
+  deferred: number;
   merged: number;
   suggested: number;
   conflicts: number;
@@ -77,6 +84,12 @@ interface Pair {
   b: ClaimLite;
   /** Signals that brought the pair up. */
   why: string[];
+  /** The similarity signal's score: embedding cosine, or wording overlap without real vectors; 0 when it did not bring the pair up. */
+  similarity: number;
+  /** Embedding cosine of a pair only a shared number brought up (real vectors); 0 otherwise. */
+  cosine: number;
+  /** Key numbers the two statements share. */
+  shared: number;
   /** Guards that keep a judged pair from merging without a person. */
   guards: string[];
 }
@@ -225,12 +238,14 @@ export async function auditDuplicateClaims(
 ): Promise<ClaimDedupeStats> {
   const { store, config } = ctx;
   const progress = opts.onProgress ?? (() => {});
-  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, judged: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0 };
+  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, judged: 0, deferred: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0 };
   const mode = config.review?.claimMerge ?? 'auto';
   if (mode === 'off') return stats;
   const minConfidence = config.review?.claimMergeMinConfidence ?? 0.9;
+  const maxJudged = Math.max(0, config.review?.claimMergeMaxJudgedPerRun ?? 1200);
   const llmMin = config.review?.llmMinConfidence ?? 0.6;
   const threshold = opts.threshold ?? 0.85;
+  const numberThreshold = opts.numberThreshold ?? 0.7;
 
   if (!opts.focus) stats.reanchored = await reanchorClaimGroups(store, { onProgress: progress });
 
@@ -267,14 +282,12 @@ export async function auditDuplicateClaims(
 
   /* candidates from text alone */
   const pairs = new Map<string, Pair>();
-  const propose = (a: ClaimLite, b: ClaimLite, why: string) => {
+  const propose = (a: ClaimLite, b: ClaimLite, why: string, score: { similarity?: number; shared?: number } = {}) => {
     const id = claimPairId(a.id, b.id);
-    const prev = pairs.get(id);
-    if (prev) {
-      if (!prev.why.includes(why)) prev.why.push(why);
-      return;
-    }
-    pairs.set(id, { id, a, b, why: [why], guards: [] });
+    const pair = pairs.get(id) ?? pairs.set(id, { id, a, b, why: [], similarity: 0, cosine: 0, shared: 0, guards: [] }).get(id)!;
+    if (!pair.why.includes(why)) pair.why.push(why);
+    pair.similarity = Math.max(pair.similarity, score.similarity ?? 0);
+    pair.shared = Math.max(pair.shared, score.shared ?? 0);
   };
   const realVectors = config.embedding.provider !== 'local' && ctx.embedder.model !== 'local-hash-v1';
   for (const f of focus) {
@@ -286,8 +299,11 @@ export async function auditDuplicateClaims(
         continue;
       }
       const shared = numbersOf(c.statement).filter((n) => fNums.some((m) => sameNumber(n, m)));
-      if (shared.length > 0) propose(f, c, `数字相同 ${shared.slice(0, 3).map((n) => `${n.value}${n.unit}`).join('、')}`);
-      else if (!realVectors && overlap(f.statement, c.statement) >= 0.6) propose(f, c, '措辞重叠');
+      if (shared.length > 0) propose(f, c, `数字相同 ${shared.slice(0, 3).map((n) => `${n.value}${n.unit}`).join('、')}`, { shared: shared.length });
+      else if (!realVectors) {
+        const words = overlap(f.statement, c.statement);
+        if (words >= 0.6) propose(f, c, '措辞重叠', { similarity: words });
+      }
     }
   }
 
@@ -304,29 +320,45 @@ export async function auditDuplicateClaims(
     for (const f of focus) {
       const block = blockOf(f);
       if (block.length === 0) continue;
-      const ph = block.map((_, i) => `$${i + 2}`).join(',');
       const rows = await store.query<{ claim_id: string; sim: number }>(
         `SELECT b.claim_id, (1 - (a.embedding <=> b.embedding))::float AS sim
-         FROM claim_embeddings a JOIN claim_embeddings b ON b.claim_id IN (${ph})
+         FROM claim_embeddings a JOIN claim_embeddings b ON b.claim_id = ANY($2::text[])
          WHERE a.claim_id = $1
          ORDER BY a.embedding <=> b.embedding LIMIT 5`,
-        [f.id, ...block.map((c) => c.id)],
+        [f.id, block.map((c) => c.id)],
       );
       for (const r of rows) {
         const other = byId.get(r.claim_id);
-        if (other && r.sim >= threshold) propose(f, other, `语义相似度 ${r.sim.toFixed(2)}`);
+        if (other && r.sim >= threshold) propose(f, other, `语义相似度 ${r.sim.toFixed(2)}`, { similarity: r.sim });
       }
     }
+
+    // A shared number lowers the cosine bar instead of replacing it: on finance's judged
+    // pairs (2026-10-19), those it alone brought up gave 3 merges, suggestions or
+    // contradictions in 8,527 below cosine 0.70, and 137 in 7,304 from 0.70 to 0.85.
+    // A claim with no vector yet (its embedding failed) waits for one.
+    const numberOnly = [...pairs.values()].filter((p) => p.similarity === 0 && !p.why.includes('identical'));
+    for (let i = 0; i < numberOnly.length; i += 5000) {
+      const slice = numberOnly.slice(i, i + 5000);
+      const rows = await store.query<{ a: string; b: string; sim: number }>(
+        `SELECT x.a, x.b, (1 - (ea.embedding <=> eb.embedding))::float AS sim
+         FROM unnest($1::text[], $2::text[]) AS x(a, b)
+         JOIN claim_embeddings ea ON ea.claim_id = x.a JOIN claim_embeddings eb ON eb.claim_id = x.b`,
+        [slice.map((p) => p.a.id), slice.map((p) => p.b.id)],
+      );
+      for (const r of rows) pairs.get(claimPairId(r.a, r.b))!.cosine = r.sim;
+    }
+    for (const p of numberOnly) if (p.cosine < numberThreshold) pairs.delete(p.id);
   }
   stats.candidates = pairs.size;
   if (pairs.size === 0) return stats;
 
   /* pairs already decided: a remembered verdict, or a person's answer to a suggestion */
+  // one array parameter: a nightly run brings up more pairs than a statement can bind (65,535)
   const ids = [...pairs.keys()];
-  const ph = ids.map((_, i) => `$${i + 1}`).join(',');
   const decided = new Set([
-    ...(await store.query<{ pair_id: string }>(`SELECT pair_id FROM claim_pair_verdicts WHERE pair_id IN (${ph})`, ids)).map((r) => r.pair_id),
-    ...(await store.query<{ id: string }>(`SELECT id FROM suggestions WHERE id IN (${ph}) AND status IN ('accepted', 'rejected')`, ids)).map((r) => r.id),
+    ...(await store.query<{ pair_id: string }>(`SELECT pair_id FROM claim_pair_verdicts WHERE pair_id = ANY($1::text[])`, [ids])).map((r) => r.pair_id),
+    ...(await store.query<{ id: string }>(`SELECT id FROM suggestions WHERE id = ANY($1::text[]) AND status IN ('accepted', 'rejected')`, [ids])).map((r) => r.id),
   ]);
 
   const toJudge: Pair[] = [];
@@ -352,11 +384,13 @@ export async function auditDuplicateClaims(
     toJudge.push(pair);
   }
 
-  /* the Judge stage, in batches */
+  /* the Judge stage, in batches, most promising first: at most claimMergeMaxJudgedPerRun pairs a run (the rule-settled ones above never wait) */
   if (toJudge.length > 0 && ctx.llm?.enabled) {
     const per = Math.max(1, opts.pairsPerCall ?? 12);
-    for (let i = 0; i < toJudge.length; i += per) {
-      const batch = toJudge.slice(i, i + per);
+    const sent = judgeOrder(toJudge).slice(0, maxJudged);
+    stats.deferred = toJudge.length - sent.length;
+    for (let i = 0; i < sent.length; i += per) {
+      const batch = sent.slice(i, i + per);
       try {
         const verdicts = await judgeBatch(ctx.llm, batch);
         for (const [k, v] of verdicts) {
@@ -416,10 +450,40 @@ export async function auditDuplicateClaims(
       if (a.id !== b.id && (await fileConflict(store, { ...pair, a, b }, verdict))) stats.conflicts++;
     }
   }
-  if (stats.merged || stats.suggested || stats.conflicts) {
-    progress(`claims: ${stats.merged} merged, ${stats.suggested} merge suggestions, ${stats.conflicts} contradictions (${stats.candidates} pairs, ${stats.judged} judged)`);
+  if (stats.merged || stats.suggested || stats.conflicts || stats.deferred) {
+    progress(`claims: ${stats.merged} merged, ${stats.suggested} merge suggestions, ${stats.conflicts} contradictions (${stats.candidates} pairs, ${stats.judged} judged${stats.deferred ? `, ${stats.deferred} left for later` : ''})`);
   }
   return stats;
+}
+
+/**
+ * Pairs in the order the Judge stage takes them, so that a capped run spends
+ * its calls where a verdict changes something: pairs the similarity signal
+ * brought up before pairs that only share a number; then pairs no guard holds
+ * back (only they can merge on the verdict); then the higher similarity (the
+ * higher cosine, among pairs that only share a number), the more shared key
+ * numbers, the newer claim; the pair id settles the rest. Ranking finance's
+ * 28,974 judged pairs (2026-10-19) this way puts 681 of the 1,628 verdicts that
+ * merged, suggested or flagged anything among the first 1,200; in the order
+ * they were judged there were 141. Among the 7,304 that only shared a number
+ * at cosine 0.70 or more, the first 500 by cosine hold 41 of their 137 such
+ * verdicts; by shared numbers and age, 14.
+ */
+function judgeOrder(pairs: Pair[]): Pair[] {
+  const newest = new Map(pairs.map((p) => {
+    const a = toIso(p.a.tx_from) ?? '';
+    const b = toIso(p.b.tx_from) ?? '';
+    return [p.id, a > b ? a : b];
+  }));
+  const text = (x: string, y: string) => (x < y ? -1 : x > y ? 1 : 0);
+  return [...pairs].sort((x, y) =>
+    Number(y.similarity > 0) - Number(x.similarity > 0)
+    || Number(x.guards.length > 0) - Number(y.guards.length > 0)
+    || y.similarity - x.similarity
+    || y.cosine - x.cosine
+    || y.shared - x.shared
+    || text(newest.get(y.id)!, newest.get(x.id)!)
+    || text(x.id, y.id));
 }
 
 /** The representative of a pair: an established group keeps its own; else the judge's pick, more evidence, earlier. */

@@ -216,11 +216,34 @@ Three signals:
    and digit forms. Such a pair is same with confidence 1, no model call. Today "…grew 20 %." and "…grew 20%" are two
    claims.
 2. **Embedding similarity** ≥ 0.85 (to be calibrated) over "subject: statement", the 5 nearest within the subject.
-3. **Shared key numbers**: numbers with units (亿, 万, %, pct, ×, yuan, dollars…) overlap and the periods match — a
-   candidate even when the vectors disagree. Restated financial facts keep their numbers more faithfully than their words.
-   Numbers are compared at the coarser of the two precisions: 36.19亿 and 36.2亿, 0.45% and 0.5%, 14.9% and 15% agree.
+3. **Shared key numbers**: numbers with units (亿, 万, %, pct, ×, yuan, dollars…) overlap and the periods match.
+   Restated financial facts keep their numbers more faithfully than their words, so a shared figure lowers the cosine
+   bar from 0.85 to **0.70** (`numberThreshold`, calibrated on bge-m3 like the 0.85). It does not replace the bar, and
+   the pair's own cosine counts even when it is not among the 5 nearest. Numbers are compared at the coarser of the two
+   precisions: 36.19亿 and 36.2亿, 0.45% and 0.5%, 14.9% and 15% agree.
 
-With the local hash embedder (meaningless distances) signal 2 is skipped and today's token overlap ≥ 0.6 stands in.
+   At first a shared number made a candidate even when the vectors disagreed. A read-only backtest of finance's 28,974
+   judged pairs (2026-10-19) showed what that cost. 15,831 of them (55%) came from a shared number alone, and 140 of
+   those verdicts merged, suggested or flagged anything (0.9%). Almost all of the 140 sat just under the similarity bar:
+
+   | Pairs only a shared number brought up | Pairs | Verdicts that merged, suggested or flagged anything |
+   | --- | --- | --- |
+   | cosine under 0.70 | 8,527 | 3 (0.04%) |
+   | 0.70–0.75 | 3,281 | 22 (0.7%) |
+   | 0.75–0.80 | 2,378 | 35 (1.5%) |
+   | 0.80–0.85 | 1,645 | 80 (4.9%) |
+   | *For comparison: similarity 0.85–0.90* | 9,088 | 483 (5.3%) |
+
+   The 0.70 floor drops 29% of all judging and 3 of the 1,628 useful verdicts. Requiring the similarity signal instead
+   (drop these pairs) would have lost all 140, among them 46 of the 208 contradictions. Requiring more shared numbers
+   does not separate them: as the audit counts them, the rate was 0.9%, 1.1% and 0.7% for 1, 2 and 3 or more.
+
+With the local hash embedder (meaningless distances) signal 2 is skipped, today's token overlap ≥ 0.6 stands in, and a
+shared number alone still makes a candidate. With real vectors, a claim whose embedding failed (the embedding pool's
+daily quota, say) brings up no number pairs until a later run has embedded it; they are not judged on the number
+alone. On finance on 2026-10-19, 159 k of the 191 k claims that have a same-subject neighbour had no vector yet (the
+nightly embedding stopped at the pool's quota), and that held for 181,460 of the 182,476 number pairs waiting for the
+judge.
 
 Vectors live in a new table, `claim_embeddings` (`claim_id`, `model`, `embedding halfvec(dim)`), created with the
 vector width and dropped on a width change, like `entity_embeddings`. A claim's statement is part of its id and never
@@ -247,6 +270,17 @@ reason, model, time) — not into `suggestions`: there are an order of magnitude
 
 - On the Judge route (`ctx.llm`), **batched**: up to 12 pairs per call, regardless of subject. Entity resolution makes
   one call per pair today; at claim volume that would mean more judge calls than extraction calls.
+- **At most `review.claimMergeMaxJudgedPerRun` pairs a run** (default 1,200, i.e. 100 calls), the most promising first:
+  pairs the similarity signal brought up before pairs that only share a number; pairs that none of §4.3's checks keep
+  from merging before the rest; then the higher similarity (for pairs that only share a number, the higher cosine), the
+  more shared key numbers, the newer claim. The others get
+  no verdict, so a later run proposes them again; the nightly run compares every claim. Identical and different-period
+  pairs are settled by §4.3 without a model and never wait. Without the cap a backlog holds up the rest of tier 2:
+  finance's two largest nightly runs judged 7,531 and 9,252 pairs and took about four hours each (some 20 s a call). In
+  this order, the first 1,200 of finance's 28,974 judged pairs (2026-10-19) hold 681 of the 1,628 verdicts that merged,
+  suggested or flagged anything; in the order they were judged, 141. Pairs that only shared numbers were 55% of the
+  judged pairs and 0.9% of them produced anything. §4.2's cosine floor now leaves out 54% of them. Ranking the rest by
+  cosine puts 41 of their 137 useful verdicts in the first 500 such pairs; ranking by shared numbers and age put 14 there.
 - Per pair: the subject; both statements with type, status, event time / validity / document date and source path; a
   300-character excerpt of each grounding chunk.
 - Rules: same only when one entails the other (same facts, same period, same numbers); figures that agree after
@@ -319,7 +353,8 @@ Exactly like entity merges (`src/graph/merge.ts`):
 },
 "review": {
   "claimMerge": "auto",             // new: off / suggest / auto
-  "claimMergeMinConfidence": 0.9    // new: confidence floor for automatic merges
+  "claimMergeMinConfidence": 0.9,   // new: confidence floor for automatic merges
+  "claimMergeMaxJudgedPerRun": 1200 // pairs judged per run, most promising first (§4.4); the rest wait for a later run
 }
 ```
 
@@ -327,7 +362,8 @@ Exactly like entity merges (`src/graph/merge.ts`):
   `extraction_queue.segments_total / segments_done`; `v_claims` appends `canonical_id` and shows representatives only;
   `claim_embeddings` joins `embeddingsDdl` (`src/store/db.ts`).
 - **Config migration**: none needed. The new keys have defaults and `batchSize` keeps its value.
-- **`PUT /api/config`**: accepts `review.claimMerge`; `segmentChars` and `claimMergeMinConfidence` are file-only.
+- **`PUT /api/config`**: accepts `review.claimMerge`; `segmentChars`, `claimMergeMinConfidence` and
+  `claimMergeMaxJudgedPerRun` are file-only.
 - **CLI**: `knode-os extract` reports calls and segments left, and `--retry-failed` first re-queues documents with
   failed segments; new `knode-os claim merge <claim> <into>`, `claim unmerge <claim>`, `claim merges`, `claim dedupe`
   (singular, because `claims` is already the query command).
@@ -353,8 +389,9 @@ Exactly like entity merges (`src/graph/merge.ts`):
 - **Claims**: from 210 to around ten thousand before merging (24–25 per segment in the live run, §8). The merge rate
   gets measured after the backfill.
 - **Embeddings**: one request per new claim.
-- **Judge calls**: 12 pairs per call; the volume gets measured after the backfill. Different-period and identical pairs
-  are settled by the deterministic checks without a call.
+- **Judge calls**: 12 pairs per call, at most `claimMergeMaxJudgedPerRun` (1,200) pairs a run; the volume gets measured
+  after the backfill. Different-period and identical pairs are settled by the deterministic checks without a call. Pairs
+  that only share a number need cosine 0.70 (§4.2), which would have spared 29% of finance's judging up to 2026-10-19.
 - **Entities** grow from 261 to several thousand too, and under `llmJudge = suggest` so do pending entity-merge
   suggestions — see §9 item 4.
 
