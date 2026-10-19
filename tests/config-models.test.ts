@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import {
   EmbeddingConfig,
+  EmbeddingConnection,
   KnodeConfig,
   activeEmbedding,
   defaultConfig,
@@ -19,6 +20,7 @@ import {
 import { cliCommand, readCursorStream, resolveExecutable } from '../src/llm/cli.js';
 import { parseClaudeAliases, parseCodexCatalog, parseCodexDefaults } from '../src/llm/models.js';
 import { clearModelCache, listModelsCached } from '../src/llm/model-cache.js';
+import { EmbeddingQuotaLedger } from '../src/ingest/embedding-router.js';
 import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 
@@ -404,6 +406,27 @@ describe('PUT /api/config with embedding providers', () => {
     // Restore the offline fixture so unrelated route tests never need a network call.
     await save({ embeddingProviders: before.embeddingProviders, embeddingUse: before.embeddingUse, embeddingPool: { enabled: false } });
     } finally { mock.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it('returns estimatedTokensToday for each key from the shared ledger', async () => {
+    const file = path.join(tmp, 'usage-route.json');
+    vi.stubEnv('KNODE_EMBEDDING_USAGE_FILE', file);
+    try {
+      const before = await read();
+      const key: EmbeddingConnection = { id: 'usage-test', label: 'Usage key', provider: 'openai', baseUrl: 'http://127.0.0.1:9/v1', model: 'BAAI/bge-m3',
+        dimensions: 1024, batchSize: 16, sendDimensions: false, apiKey: 'usage-secret', catalog: ['BAAI/bge-m3'], enabled: true, priority: 0, quotaGroup: 'account-usage-test',
+        limits: { requestsPerMinute: 60, tokensPerMinute: 100000, requestsPerDay: 5000, tokensPerDay: 1000000, concurrency: 2, resetTimezone: 'UTC' } };
+      expect((await save({ embeddingProviders: [...before.embeddingProviders, key] })).status).toBe(200);
+      // One response with usage (40 tokens) and one without (the 25 reserved stay as the estimate).
+      const ledger = new EmbeddingQuotaLedger(file);
+      await ledger.finish((await ledger.reserve([key], 100)).ticket!, { tokens: 40 });
+      await ledger.finish((await ledger.reserve([key], 25)).ticket!, {});
+      const usage = (await (await app.request('/api/config/embedding-usage', { headers })).json()) as { entries: { id: string }[] };
+      expect(usage.entries.find((e) => e.id === 'usage-test')).toMatchObject({ requestsToday: 2, tokensToday: 65, estimatedTokensToday: 25 });
+    } finally {
+      await save({ embeddingProviders: (await read()).embeddingProviders.filter((e) => e.id !== 'usage-test') });
+      vi.unstubAllEnvs();
+    }
   });
 });
 

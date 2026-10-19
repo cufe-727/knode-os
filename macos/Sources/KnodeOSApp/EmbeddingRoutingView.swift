@@ -81,7 +81,7 @@ struct EmbeddingRoutingSection: View {
                     ForEach(entries.filter { $0.provider == "openai" }) { entry in
                         usageRow(entry)
                     }
-                    Text(L("App usage persists across restarts. Tokens use provider usage when available, otherwise a conservative estimate. Activity in other apps is not included. Zero limits block requests."))
+                    Text(L("App usage persists across restarts. Tokens are the provider's own count when its response includes one (SiliconFlow, OpenRouter), otherwise an estimate for the model (Cloudflare reports none). Activity in other apps is not included. Zero limits block requests."))
                         .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }.padding(.top, 8)
             }.font(.caption)
@@ -100,9 +100,18 @@ struct EmbeddingRoutingSection: View {
             Circle().fill(entry.enabled == false ? Color.gray : cooling ? Color.orange : Color.knodeCyan).frame(width: 6, height: 6)
             Text(entry.label).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
             Text("\(row?.requestsToday ?? 0) / \(limits.requestsPerDay) req")
-            Text("\(row?.tokensToday ?? 0) / \(limits.tokensPerDay) tokens")
+            Text("\(row?.tokensToday ?? 0) / \(limits.tokensPerDay) tokens\(tokenSource(row))")
             Text(cooling ? L("Cooling down") : limits.resetTimezone).foregroundStyle(.secondary)
         }.font(.system(size: 10, design: .monospaced)).help(row?.lastError ?? entry.limitNote ?? "")
+    }
+
+    /// Which of today's tokens a provider counted. A day recorded before the split existed has none, so no tag.
+    private func tokenSource(_ row: EmbeddingUsage?) -> String {
+        guard let row, row.tokensToday > 0, var estimated = row.estimatedTokensToday else { return "" }
+        estimated = min(estimated, row.tokensToday)
+        if estimated == 0 { return " · " + L("reported") }
+        if estimated == row.tokensToday { return " · " + L("estimated") }
+        return " · " + L("%d%% estimated", 100 * estimated / row.tokensToday)
     }
 
     private func refreshUsage() async {

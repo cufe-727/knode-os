@@ -3262,8 +3262,18 @@ function renderEmbeddingPool() {
     <details><summary>Usage today · shared across workspaces</summary><div class="embedding-usage">${embeddingDrafts.filter((e) => e.provider === 'openai').map((e) => {
       const u = embeddingUsage.find((u) => u.id === e.id) || {};
       const limit = { ...defaultEmbeddingLimits, ...e.limits };
-      return `<div><span>${esc(e.label)}</span><span>${u.requestsToday || 0} / ${limit.requestsPerDay} req</span><span>${u.tokensToday || 0} / ${limit.tokensPerDay} tokens</span><span>${u.cooldownUntil > Date.now() ? 'Cooling down' : esc(limit.resetTimezone)}</span></div>`;
-    }).join('')}</div><p class="cfg-callout">App usage persists across restarts. Tokens use provider usage when available, otherwise a conservative estimate. Other apps are not included. Zero limits block requests.</p></details>`;
+      const source = embeddingTokenSource(u);
+      return `<div><span>${esc(e.label)}</span><span>${u.requestsToday || 0} / ${limit.requestsPerDay} req</span><span title="${esc(source.title)}">${u.tokensToday || 0} / ${limit.tokensPerDay} tokens${source.tag ? ` · ${source.tag}` : ''}</span><span>${u.cooldownUntil > Date.now() ? 'Cooling down' : esc(limit.resetTimezone)}</span></div>`;
+    }).join('')}</div><p class="cfg-callout">App usage persists across restarts. Tokens are the provider's own count when its response includes one (SiliconFlow, OpenRouter), otherwise an estimate for the model (Cloudflare reports none). Other apps are not included. Zero limits block requests.</p></details>`;
+}
+
+// Which of today's tokens a provider counted. A day recorded before the split existed has none, so no tag.
+function embeddingTokenSource(u) {
+  const tokens = u.tokensToday || 0;
+  if (!tokens || u.estimatedTokensToday == null) return { tag: '', title: '' };
+  const estimated = Math.min(tokens, u.estimatedTokensToday);
+  const tag = !estimated ? 'reported' : estimated === tokens ? 'estimated' : `${Math.round(100 * estimated / tokens)}% estimated`;
+  return { tag, title: `${estimated} estimated · ${tokens - estimated} reported by the provider` };
 }
 
 async function refreshEmbeddingUsage() {

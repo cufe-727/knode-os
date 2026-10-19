@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { EmbeddingConnection, EmbeddingLimits, EmbeddingPoolConfig, KnodeConfig, resolveSecret } from '../config.js';
 import { EMBED_INPUT_CHARS } from '../constants.js';
 import { createEmbeddingProvider, EmbeddingProvider } from './embeddings.js';
+import { estimateEmbeddingTokens } from './embedding-tokens.js';
 
 export const DEFAULT_EMBEDDING_LIMITS: EmbeddingLimits = {
   requestsPerMinute: 60, tokensPerMinute: 100_000, requestsPerDay: 5_000,
@@ -66,7 +67,10 @@ const dayKey = (now: number, timezone: string) => new Intl.DateTimeFormat('en-CA
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 interface Reservation { id: string; at: number; tokens: number; day: string; expires: number; active: boolean }
-interface Bucket { days: Record<string, { requests: number; tokens: number }>; recent: Reservation[]; lastUsed: number }
+// `estimated` is the part of `tokens` no provider reported. A day recorded before the field existed has
+// no split, so it stays without one rather than count those tokens as reported.
+interface Day { requests: number; tokens: number; estimated?: number }
+interface Bucket { days: Record<string, Day>; recent: Reservation[]; lastUsed: number }
 interface Health { cooldownUntil: number; lastError?: string; lastSuccess?: number }
 interface Ledger { version: 1; buckets: Record<string, Bucket>; health: Record<string, Health> }
 interface Ticket { entry: EmbeddingConnection; bucket: string; credential: string; reservation: Reservation }
@@ -153,7 +157,7 @@ export class EmbeddingQuotaLedger {
         }
         const bucket = this.bucket(ledger, id, now);
         const day = dayKey(now, limits.resetTimezone);
-        const today = bucket.days[day] ??= { requests: 0, tokens: 0 };
+        const today = bucket.days[day] ??= { requests: 0, tokens: 0, estimated: 0 };
         if (today.requests >= limits.requestsPerDay || today.tokens + tokens > limits.tokensPerDay) {
           reasons.push(`${entry.label}: daily quota reached`); continue;
         }
@@ -189,10 +193,13 @@ export class EmbeddingQuotaLedger {
       const reservation = bucket?.recent.find((r) => r.id === ticket.reservation.id);
       if (reservation) {
         reservation.active = false;
+        const day = bucket.days[reservation.day];
         if (typeof result.tokens === 'number' && Number.isSafeInteger(result.tokens) && result.tokens >= 0) {
-          const day = bucket.days[reservation.day];
           if (day) day.tokens += result.tokens - reservation.tokens;
           reservation.tokens = result.tokens;
+        } else if (day?.estimated !== undefined) {
+          // No provider usage (none in the response, or the call failed): the reservation stays as the estimate.
+          day.estimated += reservation.tokens;
         }
       }
       ledger.health[ticket.credential] = result.error
@@ -206,8 +213,12 @@ export class EmbeddingQuotaLedger {
       const now = this.now();
       const limits = embeddingLimits(entry);
       const bucket = this.bucket(ledger, quotaId(entry), now);
-      const today = bucket.days[dayKey(now, limits.resetTimezone)] ?? { requests: 0, tokens: 0 };
+      const day = dayKey(now, limits.resetTimezone);
+      const today = bucket.days[day] ?? { requests: 0, tokens: 0, estimated: 0 };
+      // A request in flight is still its estimate until the response settles it.
+      const pending = bucket.recent.reduce((n, r) => n + (r.active && r.day === day ? r.tokens : 0), 0);
       return { id: entry.id, requestsToday: today.requests, tokensToday: today.tokens,
+        ...(today.estimated === undefined ? {} : { estimatedTokensToday: today.estimated + pending }),
         requestsThisMinute: bucket.recent.filter((r) => r.at > now - 60_000).length,
         inFlight: bucket.recent.filter((r) => r.active).length, ...ledger.health[credentialId(entry)] };
     }));
@@ -247,7 +258,7 @@ export class PooledEmbeddingProvider implements EmbeddingProvider {
     let batch: string[] = [], tokens = 0;
     for (const text of texts) {
       const input = text.slice(0, EMBED_INPUT_CHARS) || ' ';
-      const estimate = Buffer.byteLength(input, 'utf8') + 32;
+      const estimate = estimateEmbeddingTokens(input);
       if (batch.length && (batch.length >= batchSize || tokens + estimate > tokenCeiling)) {
         vectors.push(...await this.embedBatch(batch, tokens)); batch = []; tokens = 0;
       }

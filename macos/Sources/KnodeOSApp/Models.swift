@@ -845,6 +845,7 @@ struct EmbeddingUsage: Decodable, Identifiable {
     var id: String
     var requestsToday: Int
     var tokensToday: Int
+    var estimatedTokensToday: Int?
     var requestsThisMinute: Int
     var inFlight: Int
     var cooldownUntil: Double?
