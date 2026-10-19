@@ -112,10 +112,10 @@ export async function canonicalMap(q: Queryable, ids: readonly string[]): Promis
   const out = new Map<string, string>();
   const list = [...new Set(ids)];
   if (list.length === 0) return out;
-  const ph = list.map((_, i) => `$${i + 1}`).join(',');
+  // a graph search asks about every endpoint a hop reached: one array parameter, not an IN list
   const rows = await q.query<{ id: string; canonical_id: string }>(
-    `SELECT id, canonical_id FROM entities WHERE id IN (${ph}) AND canonical_id IS NOT NULL`,
-    list,
+    `SELECT id, canonical_id FROM entities WHERE id = ANY($1::text[]) AND canonical_id IS NOT NULL`,
+    [list],
   );
   for (const r of rows) out.set(r.id, r.canonical_id);
   return out;
@@ -126,10 +126,9 @@ export async function membersOf(q: Queryable, canonicalIds: readonly string[]): 
   const out = new Map<string, string[]>();
   const list = [...new Set(canonicalIds)];
   if (list.length === 0) return out;
-  const ph = list.map((_, i) => `$${i + 1}`).join(',');
   const rows = await q.query<{ id: string; canonical_id: string }>(
-    `SELECT id, canonical_id FROM entities WHERE canonical_id IN (${ph}) AND tx_to IS NULL`,
-    list,
+    `SELECT id, canonical_id FROM entities WHERE canonical_id = ANY($1::text[]) AND tx_to IS NULL`,
+    [list],
   );
   for (const r of rows) (out.get(r.canonical_id) ?? out.set(r.canonical_id, []).get(r.canonical_id)!).push(r.id);
   return out;

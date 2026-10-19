@@ -4,10 +4,12 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
+import { applyClaimMerge, unmergeClaim } from '../src/graph/claim-merge.js';
 import { sync } from '../src/ingest/sync.js';
 import { foldTouched, IN_BATCH } from '../src/lineage/fold.js';
 import { findLiveScope } from '../src/lineage/scope.js';
 import { emptyTouched } from '../src/lineage/types.js';
+import { ensureEntityStubs } from '../src/wiki/pages.js';
 
 /**
  * The fold (src/lineage/fold.ts) at the sizes a real workspace reaches: a hub
@@ -142,5 +144,122 @@ describe('the fold at scale', () => {
     await sync(ctx, { llmGraph: false });
     expect(await live('戊公司')).toBe(true);
     expect((await edgeOf('丁公司', '戊公司'))?.live).toBe(true);
+  });
+});
+
+describe('disposal at scale', () => {
+  const dataDir = path.join(tmp, 'disposal');
+  let ctx: AppContext;
+  /** More ids than one statement can bind: 65,535 parameters, and the count wraps past it. */
+  const n = 70_000;
+
+  beforeAll(async () => {
+    initDataDir(dataDir);
+    ctx = await createContext(dataDir);
+  });
+  afterAll(async () => {
+    await ctx?.store.close();
+  });
+
+  const count = async (sql: string, params: unknown[] = []) => (await ctx.store.query<{ n: number }>(sql, params))[0].n;
+
+  it('disposes the only source of a hub entity with more live edges than one statement can bind', async () => {
+    // the watch sync that failed after the finance folders were cleared on
+    // 2026-10-17: a document went, its hub entity died, and the tombstone
+    // reached more edges than one statement binds ("bind message has 14761
+    // parameter formats but 0 parameters")
+    const { store } = ctx;
+    write(dataDir, 'raw/docs/hub.md', doc('枢纽报告', ['枢纽集团']));
+    write(dataDir, 'raw/docs/partners.md', doc('合作方名录', ['合作方甲']));
+    await sync(ctx, { llmGraph: false });
+    const [{ id: hub }] = await store.query<{ id: string }>(`SELECT id FROM entities WHERE name = '枢纽集团'`);
+    const partners = await findLiveScope(store, 'doc', 'raw/docs/partners.md');
+    // the hub's wiki page, which goes to the archive with it
+    const page = `wiki/entities/${hub}.md`;
+    expect(await ensureEntityStubs(ctx, { minMentions: 1 })).toContain(page);
+
+    // an edge from the hub to each of n partners; the partners and the edges stand on partners.md, the hub only on hub.md
+    await store.query(
+      `INSERT INTO entities (id, name, type, evidence_count) SELECT 'partner-' || g, '合作方' || g, 'organization', 1 FROM generate_series(1, $1::int) AS g`,
+      [n],
+    );
+    await store.query(
+      `INSERT INTO relations (id, source_id, target_id, type, weight, evidence_count)
+       SELECT 'edge-' || g, $2, 'partner-' || g, '${EDGE_TYPE}', 1, 1 FROM generate_series(1, $1::int) AS g`,
+      [n, hub],
+    );
+    await store.query(
+      `INSERT INTO evidence (kind, target_id, scope_id, weight, extractor, tx_from)
+       SELECT k.kind, k.prefix || g, $2, 1, 'test.bulk', now()
+       FROM generate_series(1, $1::int) AS g, (VALUES ('entity', 'partner-'), ('relation', 'edge-')) AS k(kind, prefix)`,
+      [n, partners!.id],
+    );
+    const liveEdges = () => count(`SELECT count(*)::int AS n FROM relations WHERE source_id = $1 AND tx_to IS NULL`, [hub]);
+    expect(await liveEdges()).toBe(n);
+
+    // hub.md goes, and the watcher syncs that one path
+    fs.rmSync(path.join(dataDir, 'raw/docs/hub.md'));
+    const stats = await sync(ctx, { only: ['raw/docs/hub.md'], llmGraph: false });
+    expect(stats).toMatchObject({ disposed: 1, pagesArchived: 1 });
+    expect(await count(`SELECT count(*)::int AS n FROM entities WHERE id = $1 AND tx_to IS NULL`, [hub])).toBe(0);
+    expect(await liveEdges()).toBe(0);
+    expect(await count(`SELECT count(*)::int AS n FROM pages WHERE path = $1 AND status = 'archived'`, [page])).toBe(1);
+    expect(fs.existsSync(path.join(dataDir, 'wiki/.archive/entities', `${hub}.md`))).toBe(true);
+    // the partners stand on their own source
+    expect(await count(`SELECT count(*)::int AS n FROM entities WHERE id LIKE 'partner-%' AND tx_to IS NULL`)).toBe(n);
+  });
+
+  it('undoes a claim merge that carried more members than one statement can bind', async () => {
+    const { store } = ctx;
+    write(dataDir, 'raw/docs/jia.md', [
+      '---',
+      'title: 甲公司',
+      'entities:',
+      '  - { name: 甲公司, type: organization }',
+      'claims:',
+      '  - { subject: 甲公司, statement: "甲公司营收增长20%" }',
+      '  - { subject: 甲公司, statement: "甲公司收入同比增长两成" }',
+      '---',
+      '# 甲公司',
+      '',
+    ].join('\n'));
+    await sync(ctx, { llmGraph: false });
+    const claim = async (statement: string) => (await store.query<{ id: string; subject_id: string }>(`SELECT id, subject_id FROM claims WHERE statement = $1`, [statement]))[0];
+    const from = await claim('甲公司营收增长20%');
+    const into = await claim('甲公司收入同比增长两成');
+    // `from` already represents n claims (members whose sources have gone stay in their group)
+    await store.query(
+      `INSERT INTO claims (id, subject_id, statement, canonical_id, tx_to)
+       SELECT 'member-' || g, $2, '甲公司营收增长20%（转述 ' || g || '）', $3, now() FROM generate_series(1, $1::int) AS g`,
+      [n, from.subject_id, from.id],
+    );
+    const members = (rep: string) => count(`SELECT count(*)::int AS n FROM claims WHERE canonical_id = $1`, [rep]);
+
+    // the merge takes `from`'s whole group along; undoing it gives the group back
+    await applyClaimMerge(store, { claimId: from.id, canonicalId: into.id });
+    expect(await members(into.id)).toBe(n + 1);
+    expect(await unmergeClaim(store, from.id)).toBe(true);
+    expect(await members(from.id)).toBe(n);
+    expect(await members(into.id)).toBe(0);
+  });
+
+  it('rebuilds the lookup keys of an entity that answers to more names than one statement can bind', async () => {
+    // an entity answers to its own names and to those of every entity merged
+    // into it; the fold rewrote them with two parameters per key
+    const { store } = ctx;
+    write(dataDir, 'raw/docs/yi.md', doc('乙公司简介', ['乙公司']));
+    await sync(ctx, { llmGraph: false });
+    const [{ id }] = await store.query<{ id: string }>(`SELECT id FROM entities WHERE name = '乙公司'`);
+    const merged = 40_000;
+    expect(2 * merged).toBeGreaterThan(65_535);
+    await store.query(
+      `INSERT INTO entities (id, name, type, canonical_id) SELECT 'former-' || g, '乙公司旧称' || g, 'organization', $2 FROM generate_series(1, $1::int) AS g`,
+      [merged, id],
+    );
+    const touched = emptyTouched();
+    touched.entities.add(id);
+    await store.tx((q) => foldTouched(q, touched, new Date().toISOString()));
+    expect(await count(`SELECT count(*)::int AS n FROM entity_alias_keys WHERE entity_id = $1`, [id])).toBe(merged + 1);
+    expect(await count(`SELECT count(*)::int AS n FROM entity_alias_keys WHERE entity_id = $1 AND alias_key = $2`, [id, '乙公司旧称39999'])).toBe(1);
   });
 });

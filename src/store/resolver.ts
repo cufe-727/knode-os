@@ -358,7 +358,8 @@ export async function idsPassingFilter(
 ): Promise<Set<string>> {
   if (ids.length === 0 || isEmptyFilter(f)) return new Set(ids);
   const p = new Params();
-  const ph = ids.map((id) => p.add(id)).join(',');
+  // one array parameter: an as_of read checks every row it matched, often more than a statement can bind
+  const list = p.add(ids);
   const parts: string[] = [];
   if (f.kinds) parts.push(`(${f.kinds.map((k) => KIND_SQL[k]('fd')).join(' OR ')})`);
   if (f.sources) parts.push(pathPrefixSql('fs.key', p, f.sources));
@@ -371,7 +372,7 @@ export async function idsPassingFilter(
     `SELECT DISTINCT fe.target_id FROM evidence fe
        JOIN scopes fs ON fs.id = fe.scope_id
        LEFT JOIN documents fd ON fd.path = fs.key
-     WHERE fe.kind = ${p.add(kind)} AND fe.target_id IN (${ph}) AND ${tx} AND ${parts.join(' AND ')}`,
+     WHERE fe.kind = ${p.add(kind)} AND fe.target_id = ANY(${list}::text[]) AND ${tx} AND ${parts.join(' AND ')}`,
     p.list,
   );
   return new Set(rows.map((r) => r.target_id));

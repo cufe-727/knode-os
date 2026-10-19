@@ -174,8 +174,13 @@ async function refreshEntityKeys(q: Queryable, id: string, name: string, aliases
   await q.query(`DELETE FROM entity_alias_keys WHERE entity_id = $1`, [id]);
   const list = [...keys.entries()] as [string, KeyKind][];
   if (list.length > 0) {
-    const values = list.map((_, i) => `($1, $${i * 2 + 2}, $${i * 2 + 3})`).join(',');
-    await q.query(`INSERT INTO entity_alias_keys (entity_id, alias_key, kind) VALUES ${values} ON CONFLICT DO NOTHING`, [id, ...list.flat()]);
+    // aliases and merged members accumulate with the corpus: two array parameters, not two per key
+    await q.query(
+      `INSERT INTO entity_alias_keys (entity_id, alias_key, kind)
+       SELECT $1, k.alias_key, k.kind FROM unnest($2::text[], $3::text[]) AS k(alias_key, kind)
+       ON CONFLICT DO NOTHING`,
+      [id, list.map(([k]) => k), list.map(([, kind]) => kind)],
+    );
   }
   await q.query(`UPDATE entities SET name_key = $2 WHERE id = $1`, [id, nameKey(name).bare || null]);
 }

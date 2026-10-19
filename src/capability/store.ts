@@ -148,11 +148,12 @@ export async function listCapabilities(store: Store, filter: CapabilityFilter = 
 async function notesFor(store: Store, ids: string[], asOf: string | null): Promise<Map<string, NoteRow[]>> {
   const grouped = new Map<string, NoteRow[]>();
   if (ids.length === 0) return grouped;
+  // every capability the listing matched, the whole catalog when unfiltered: one array parameter
   const p = new Params();
-  const ph = ids.map((id) => p.add(id)).join(',');
+  const list = p.add(ids);
   const rows = await store.query<NoteRow>(
     `SELECT capability_id, source_path, semantics, sample_queries, pitfalls, joins, cost, freshness_seconds
-     FROM capability_notes n WHERE capability_id IN (${ph}) AND ${live('n', p, asOf)} ORDER BY source_path`,
+     FROM capability_notes n WHERE capability_id = ANY(${list}::text[]) AND ${live('n', p, asOf)} ORDER BY source_path`,
     p.list,
   );
   for (const r of rows) (grouped.get(r.capability_id) ?? grouped.set(r.capability_id, []).get(r.capability_id)!).push(r);

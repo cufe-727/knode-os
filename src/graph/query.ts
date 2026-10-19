@@ -79,7 +79,7 @@ export async function claimsForEntities(store: Store, subjectIds: string[], limi
     }));
   }
   const p = new Params();
-  const ph = entityIds.map((id) => p.add(id)).join(',');
+  const subjects = p.add(entityIds);
   const lim = p.add(limit);
   const rows = await store.query<{
     id: string; subject: string; object: string | null; type: string; statement: string;
@@ -91,7 +91,7 @@ export async function claimsForEntities(store: Store, subjectIds: string[], limi
      JOIN entities se ON se.id = cl.subject_id
      LEFT JOIN entities oe ON oe.id = cl.object_id
      LEFT JOIN scopes s ON s.id = cl.primary_scope_id
-     WHERE cl.subject_id IN (${ph}) AND ${live('cl', p)} AND ${validOverlap('cl', p, t)} AND cl.superseded_by IS NULL AND cl.canonical_id IS NULL
+     WHERE cl.subject_id = ANY(${subjects}::text[]) AND ${live('cl', p)} AND ${validOverlap('cl', p, t)} AND cl.superseded_by IS NULL AND cl.canonical_id IS NULL
        AND ${evidenceFilterSql('cl.id', 'claim', p, f, null)}
      ORDER BY cl.tx_from DESC
      LIMIT ${lim}`,
@@ -106,9 +106,8 @@ export async function claimsForEntities(store: Store, subjectIds: string[], limi
 
 async function scopeKeys(store: Store, scopeIds: string[]): Promise<Map<string, string>> {
   if (scopeIds.length === 0) return new Map();
-  const p = new Params();
-  const ph = scopeIds.map((id) => p.add(id)).join(',');
-  const rows = await store.query<{ id: string; key: string }>(`SELECT id, key FROM scopes WHERE id IN (${ph})`, p.list);
+  // the scopes behind every claim an as_of read matched: one array parameter, not an IN list
+  const rows = await store.query<{ id: string; key: string }>(`SELECT id, key FROM scopes WHERE id = ANY($1::text[])`, [scopeIds]);
   return new Map(rows.map((r) => [r.id, r.key]));
 }
 
@@ -177,10 +176,11 @@ export async function graphSearch(
     const rels = asOf
       ? (await relationsAsOf(store, frontierAll, asOf)).filter((r) => r.type !== 'co_occurs' && overlapsValidWindow(r, t))
       : await (async () => {
+          // past the seeds a frontier holds every neighbour reached, more than an IN list can bind
           const rp = new Params();
-          const placeholders = frontierAll.map((id) => rp.add(id)).join(',');
+          const reached = rp.add(frontierAll);
           return store.query<RelationRow>(
-            `SELECT * FROM relations r WHERE (source_id IN (${placeholders}) OR target_id IN (${placeholders})) AND r.type <> 'co_occurs' AND ${live('r', rp)} AND ${validOverlap('r', rp, t)}`,
+            `SELECT * FROM relations r WHERE (source_id = ANY(${reached}::text[]) OR target_id = ANY(${reached}::text[])) AND r.type <> 'co_occurs' AND ${live('r', rp)} AND ${validOverlap('r', rp, t)}`,
             rp.list,
           );
         })();
@@ -306,8 +306,8 @@ async function canonicalSeeds(store: Store, seeds: EntityRow[], asOf: string | n
 async function liveRows(store: Store, ids: string[]): Promise<EntityRow[]> {
   if (ids.length === 0) return [];
   const p = new Params();
-  const ph = ids.map((id) => p.add(id)).join(',');
-  return store.query<EntityRow>(`SELECT * FROM entities e WHERE id IN (${ph}) AND ${live('e', p)}`, p.list);
+  const list = p.add(ids);
+  return store.query<EntityRow>(`SELECT * FROM entities e WHERE id = ANY(${list}::text[]) AND ${live('e', p)}`, p.list);
 }
 
 /** Entity rows as they were at `asOf` (falls back to the current row for wiki_path). */
@@ -337,10 +337,10 @@ export async function graphOverview(store: Store, limit = 120): Promise<GraphSea
   );
   if (ents.length === 0) return { nodes: [], edges: [], chunks: [] };
   const ids = ents.map((e) => e.id);
-  const ph = ids.map((_, i) => `$${i + 1}`).join(',');
+  // the web API passes the caller's limit through uncapped: bind the nodes as one array
   const rels = await store.query<RelationRow>(
-    `SELECT * FROM relations WHERE source_id IN (${ph}) AND target_id IN (${ph}) AND type <> 'co_occurs' AND tx_to IS NULL`,
-    ids,
+    `SELECT * FROM relations WHERE source_id = ANY($1::text[]) AND target_id = ANY($1::text[]) AND type <> 'co_occurs' AND tx_to IS NULL`,
+    [ids],
   );
   const edges: GraphEdge[] = rels.map((r) => ({
     source: r.source_id, target: r.target_id, type: r.type, description: r.description, weight: r.weight,
