@@ -8,7 +8,7 @@ import { claimsForEntities, graphSearch } from '../src/graph/query.js';
 import { sync } from '../src/ingest/sync.js';
 import { buildContextPack } from '../src/pack/pack.js';
 import { search } from '../src/search/search.js';
-import { catalogQuery, assertCatalogTables } from '../src/store/catalog.js';
+import { catalogQuery, assertCatalogTables, catalogReaderRole, validateCatalogSql } from '../src/store/catalog.js';
 import { queryClaims } from '../src/store/claims.js';
 import {
   TemporalError,
@@ -124,6 +124,63 @@ describe('catalog guard', () => {
     expect(() => assertCatalogTables('SELECT * FROM claims')).toThrow(/not readable/);
     expect(() => assertCatalogTables('SELECT * FROM pg_catalog.pg_tables')).toThrow(/not readable/);
     expect(() => assertCatalogTables('SELECT * FROM v_claims JOIN evidence ON true')).toThrow(/not readable/);
+  });
+
+  it('checks every relation a statement reads, not only the first after FROM or JOIN', () => {
+    for (const sql of [
+      'SELECT * FROM v_entities e, chunks c',
+      'SELECT * FROM v_entities e JOIN v_claims c ON c.id IS DISTINCT FROM e.id, chunks k',
+      'SELECT * FROM v_entities e, LATERAL (SELECT * FROM chunks) k',
+      'SELECT * FROM (chunks k CROSS JOIN v_claims c)',
+      'SELECT * FROM v_entities, ONLY chunks',
+      'SELECT id FROM v_claims UNION TABLE chunks',
+      'WITH t AS (TABLE chunks) SELECT * FROM t',
+      'SELECT * FROM v_entities, public.chunks',
+      'SELECT * FROM v_entities, "chunks"',
+    ]) {
+      expect(() => assertCatalogTables(sql), sql).toThrow(/not readable/);
+    }
+    expect(() =>
+      assertCatalogTables('SELECT * FROM v_entities e, v_claims c, LATERAL (SELECT * FROM v_evidence v WHERE v.target_id = e.id) x'),
+    ).not.toThrow();
+  });
+
+  it('reads a name as a CTE only where the CTE is in scope', () => {
+    for (const sql of [
+      // a plain WITH cannot see itself, so the inner name is the table
+      'WITH chunks AS (SELECT * FROM chunks) SELECT * FROM chunks',
+      // a named window is not a CTE
+      'SELECT * FROM chunks WINDOW chunks AS (ORDER BY 1)',
+      // a CTE ends with the subquery that declares it
+      'SELECT * FROM (WITH t AS (SELECT * FROM v_claims) SELECT * FROM t) s, t',
+    ]) {
+      expect(() => assertCatalogTables(sql), sql).toThrow(/not readable/);
+    }
+    expect(() =>
+      assertCatalogTables('WITH RECURSIVE r(id) AS (SELECT id FROM v_entities UNION ALL SELECT id FROM r) SELECT * FROM r'),
+    ).not.toThrow();
+    expect(() =>
+      assertCatalogTables('WITH a AS (SELECT * FROM v_claims), b AS MATERIALIZED (SELECT * FROM a) SELECT * FROM a JOIN b USING (id)'),
+    ).not.toThrow();
+  });
+
+  it('reads the statement the way Postgres lexes it', () => {
+    // a dollar quote, a backslash in a standard string and a nested comment end where Postgres ends them
+    for (const sql of [
+      "SELECT $$ ' $$ AS s FROM chunks -- '",
+      "SELECT 'a\\' AS s FROM chunks -- '",
+      "SELECT 1 /* /* */ ' */ FROM chunks -- '",
+    ]) {
+      expect(() => assertCatalogTables(sql), sql).toThrow(/not readable/);
+    }
+    // FROM inside EXTRACT, and IS [NOT] DISTINCT FROM, open no FROM list
+    expect(() =>
+      assertCatalogTables("SELECT extract(year FROM valid_from) AS y, E'it\\'s' AS s, ARRAY[1, 2] AS a FROM v_claims WHERE id IS NOT DISTINCT FROM 'x'"),
+    ).not.toThrow();
+  });
+
+  it('refuses a statement that would close the subquery it is wrapped in', () => {
+    expect(() => validateCatalogSql('SELECT 1) AS x, chunks, (SELECT 2')).toThrow(/unbalanced/);
   });
 });
 
@@ -312,6 +369,38 @@ describe('phase 2: temporal and scope filters across the query surfaces', () => 
     await expect(catalogQuery(ctx.store, `SELECT * FROM claims`)).rejects.toThrow(/not readable/);
     await expect(catalogQuery(ctx.store, `DELETE FROM v_claims`)).rejects.toThrow(/read-only guard/);
     await expect(catalogQuery(ctx.store, `SHOW TABLES`)).rejects.toThrow(/only SELECT/);
+  });
+
+  it("runs catalog SQL read-only, rolled back, as a reader of this workspace's views alone", async () => {
+    // the text check cannot see into a function call; the database decides what it may read
+    await expect(catalogQuery(ctx.store, `SELECT query_to_xml('select * from claims', true, true, '') AS x`))
+      .rejects.toThrow(/permission denied for table claims/);
+    await expect(catalogQuery(ctx.store, `SELECT lo_create(0) AS oid`)).rejects.toThrow(/read-only transaction/);
+    // a changed setting goes with its query: the next one still finds the views
+    await catalogQuery(ctx.store, `SELECT set_config('search_path', 'pg_catalog', false) AS s`);
+    expect((await catalogQuery(ctx.store, `SELECT count(*)::int AS n FROM v_claims`)).rows).toEqual([{ n: 2 }]);
+
+    const ours = catalogReaderRole('public');
+    expect(await ctx.store.query(`SELECT rolsuper, rolcanlogin FROM pg_roles WHERE rolname = $1`, [ours]))
+      .toEqual([{ rolsuper: false, rolcanlogin: false }]);
+
+    // On a shared Postgres database another workspace's views sit beside these,
+    // granted to that workspace's reader and to no one else's.
+    const theirs = catalogReaderRole('ws_other');
+    expect(theirs).not.toBe(ours);
+    await ctx.store.exec(`
+      CREATE SCHEMA ws_other;
+      CREATE VIEW ws_other.v_documents AS SELECT 'raw/docs/theirs.md'::text AS path;
+      CREATE ROLE ${theirs} NOLOGIN;
+      GRANT USAGE ON SCHEMA ws_other TO ${theirs};
+      GRANT SELECT ON ws_other.v_documents TO ${theirs};
+    `);
+    try {
+      await expect(catalogQuery(ctx.store, `SELECT query_to_xml('select * from ws_other.v_documents', true, true, '') AS x`))
+        .rejects.toThrow(/permission denied for schema ws_other/);
+    } finally {
+      await ctx.store.exec(`DROP SCHEMA ws_other CASCADE; DROP ROLE ${theirs};`);
+    }
   });
 
   it('answers as_of from the state before a source was removed, filter included', async () => {

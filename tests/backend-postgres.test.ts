@@ -7,6 +7,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import type { DatabaseConfig } from '../src/config.js';
 import { schemaNameFor } from '../src/store/backend.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
+import { catalogQuery, catalogReaderRole } from '../src/store/catalog.js';
 
 /**
  * Exercises the external-Postgres backend against a real server. Skipped
@@ -219,6 +220,41 @@ describe.skipIf(!ready)('postgres backend', () => {
       expect(second.migration).toEqual({ from: version, to: version });
     } finally {
       await second.close();
+    }
+  });
+
+  it("runs each workspace's catalog SQL as its own reader, blind to the other workspaces", async () => {
+    const a = await Store.open(workspaceDir(), 2048, dbConfig);
+    const b = await Store.open(workspaceDir(), 2048, dbConfig);
+    const schemas: string[] = [];
+    try {
+      for (const store of [a, b]) {
+        schemas.push((await store.query<{ schema: string }>(`SELECT current_schema() AS schema`))[0].schema);
+      }
+      const [, schemaB] = schemas;
+      const countB = `SELECT query_to_xml('select count(*) from ${schemaB}.v_documents', true, true, '') AS x`;
+      expect(catalogReaderRole(schemas[0])).not.toBe(catalogReaderRole(schemaB));
+      // each reader reads its own workspace's views, through a function call too
+      expect((await catalogQuery(a, `SELECT count(*)::int AS n FROM v_documents`)).rows).toEqual([{ n: 0 }]);
+      expect((await catalogQuery(b, countB)).rowCount).toBe(1);
+      // the service's own connection may read B's schema; A's reader may not, nor B's a base table
+      await expect(catalogQuery(a, countB)).rejects.toThrow(/permission denied for schema/);
+      await expect(catalogQuery(b, `SELECT query_to_xml('select * from documents', true, true, '') AS x`))
+        .rejects.toThrow(/permission denied for table documents/);
+    } finally {
+      await a.close();
+      await b.close();
+      // readers are cluster-wide: drop this run's with their grants (the database goes in afterAll)
+      const pool = adminPool(dbConfig.database);
+      try {
+        for (const role of schemas.map(catalogReaderRole)) {
+          if (!(await pool.query(`SELECT 1 FROM pg_roles WHERE rolname = $1`, [role])).rows.length) continue;
+          await pool.query(`DROP OWNED BY ${role}`);
+          await pool.query(`DROP ROLE ${role}`);
+        }
+      } finally {
+        await pool.end().catch(() => {});
+      }
     }
   });
 });

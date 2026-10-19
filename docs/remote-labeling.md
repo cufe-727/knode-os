@@ -168,13 +168,14 @@ Workspace routes are `/w/<owner>/<workspace>/…`, where `<owner>` is a username
 ## Why SQL goes through the API
 
 Postgres on the Mac mini trusts every loopback connection for every role. A forwarded port would let any
-holder log in as the superuser, so Postgres is never exposed. Remote SQL runs inside `serve` instead
-(`src/remote/sql.ts`), behind four layers:
-- the catalog guard: one `SELECT`/`WITH`, `v_*` views only;
+holder log in as the superuser, so Postgres is never exposed. Remote SQL runs inside `serve` instead, on the
+same path as `knode_query` (`src/store/catalog.ts`), behind four layers:
+- the catalog guard: one `SELECT`/`WITH`, and every relation it names a `v_*` view or a CTE in scope;
 - a `READ ONLY` transaction that is always rolled back, so a changed setting cannot outlive the query;
 - a statement timeout;
-- `SET LOCAL ROLE knode_remote_reader`, a `NOLOGIN` role that may only `SELECT` the catalog views. It is
-  created on first use, and grants are added per workspace schema.
+- `SET LOCAL ROLE knode_reader_<hash>`, the workspace's own `NOLOGIN` role, which may only `SELECT` that
+  schema's catalog views. It is created on first use. One role per schema matters because the guard cannot
+  see inside a function call such as `query_to_xml`: a role shared by every workspace would read them all.
 
 Writes go through the API's file routes and a sync, like any other edit. The files stay the record, lineage
 names the token, and a rebuild loses nothing.

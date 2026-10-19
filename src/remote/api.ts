@@ -15,11 +15,10 @@ import { FailureKind } from '../labeling/failures.js';
 import { LabelingScheduler, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
 import { search, SearchMode } from '../search/search.js';
 import { WorkspaceContextRegistry, resolveWorkspaceScope, WorkspaceScope } from '../server/workspaces.js';
-import { CATALOG_VIEWS } from '../store/catalog.js';
+import { CATALOG_VIEWS, catalogQuery } from '../store/catalog.js';
 import { queryClaims } from '../store/claims.js';
 import { listEntities } from '../store/queries.js';
 import { clientInfo } from '../server/public-guard.js';
-import { remoteCatalogQuery } from './sql.js';
 import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows } from './tokens.js';
 
 /**
@@ -40,8 +39,9 @@ import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows } from '.
  * Reads are limited to the knowledge — documents, wiki, playbook content — and
  * never reach the config, the token files or the ledger. Writes go to files
  * and through a scoped sync like any other edit, attributed to the token, so
- * the files stay the record and a rebuild loses nothing. SQL runs read-only
- * (src/remote/sql.ts). Each request is logged to .knode/remote-audit.jsonl.
+ * the files stay the record and a rebuild loses nothing. SQL runs read-only,
+ * as the workspace's catalog reader (src/store/catalog.ts). Each request is
+ * logged to .knode/remote-audit.jsonl.
  */
 
 export interface RemoteApiDeps {
@@ -364,7 +364,7 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     const ctx = need(c, 'sql');
     const b = await body(c);
     if (typeof b.sql !== 'string' || !b.sql.trim()) throw new HttpError(400, 'sql required');
-    return c.json(await remoteCatalogQuery(ctx.store, ctx.config, b.sql, { maxRows: Number(b.maxRows) || undefined }));
+    return c.json(await catalogQuery(ctx.store, b.sql, { maxRows: Number(b.maxRows) || undefined }));
   });
 
   // the UI's catch-all must not answer for an unknown API path

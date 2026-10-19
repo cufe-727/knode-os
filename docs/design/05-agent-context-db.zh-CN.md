@@ -240,7 +240,7 @@ materialize（文档与解析文本、媒体元数据/描述/embedding、trace�
 ### 7.3 结构化 `knode_claims` 与 catalog（Phase 2，已实现）
 
 - `knode_claims {subject?, object?, types?, statuses?, text?, as_of?, valid_at?, valid_range?, kinds?, sources?, limit?}`：返回断言本身而不是需要 agent 自己读、自己信的散文。每行带有效期窗口、`status`（fact/suspected/disputed）、`stale`（窗口已关闭）、支撑它的 scope 路径与 evidence 条数。CLI `knode-os claims [subject]`、HTTP `GET /api/claims`。
-- `knode_query(source='catalog')`：对 PGlite 的只读视图 `v_documents / v_entities / v_relations / v_claims / v_scopes / v_evidence / v_pages / v_datasets / v_mentions` 跑 SQL。视图隐去 fold 记账列（`fold_sha`、`dirty_reason`）并默认只暴露当前相信的行，因此一条普通 SELECT 不可能把 tombstone 当成现状读出去；历史仍可经 `v_evidence` 查到。守卫 = `assertReadOnlySql` + 只允许 SELECT/WITH + 关系白名单（含 CTE 名）+ 外层强制 `LIMIT`。`knode_datasources` 与 `datasource list` 会一并列出这些视图。
+- `knode_query(source='catalog')`：对 PGlite 的只读视图 `v_documents / v_entities / v_relations / v_claims / v_scopes / v_evidence / v_pages / v_datasets / v_mentions` 跑 SQL。视图隐去 fold 记账列（`fold_sha`、`dirty_reason`）并默认只暴露当前相信的行，因此一条普通 SELECT 不可能把 tombstone 当成现状读出去；历史仍可经 `v_evidence` 查到。守卫 = `assertReadOnlySql` + 只允许 SELECT/WITH + 关系白名单，在 Postgres 读取关系的每个位置检查（FROM 与逗号列表、JOIN、LATERAL、TABLE、带括号的 FROM 项；CTE 名只在其作用域内有效）+ 外层强制 `LIMIT`。数据库层面同样强制：每条查询都在一个总会回滚的 READ ONLY 事务里、带语句超时、以该工作区自己的只读角色执行，该角色只能 SELECT 本 schema 的视图——因此守卫看不进去的函数调用（如 `query_to_xml`）也读不到更多东西。`knode_datasources` 与 `datasource list` 会一并列出这些视图。
 
 ### 7.4 虚拟文件系统（Phase 4，已实现）
 
