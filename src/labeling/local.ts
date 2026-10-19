@@ -1,16 +1,21 @@
 import os from 'node:os';
 import { KnodeConfig, LlmConfig, resolveRoutedLlmConfig, routeTargets } from '../config.js';
 import { LlmClient } from '../llm/client.js';
+import { WorkTask } from '../work/broker.js';
+import { WorkKind } from '../work/kinds.js';
 import { BackendHealth, classifyFailure, newBackendHealth, recordBackendOutcome } from './failures.js';
-import { LabelingScheduler, LabelingTask, TaskOutcome, WorkerIdentity } from './scheduler.js';
+import { TaskOutcome, WorkerIdentity } from './scheduler.js';
 
 /**
- * `serve`'s own labeling workers: slots per backend that take segments from
- * the scheduler and run them on this machine — a Codex agent and a Cursor
- * agent side by side, say (`extraction.workers`). Each backend keeps its own
- * health: a rate limit pauses it, a run of bad answers rests it, a missing CLI
- * or expired login parks it for half an hour and then tries again
- * (src/labeling/failures.ts). Settings saves are picked up within a minute.
+ * `serve`'s own worker slots: slots per backend that take work from the work
+ * broker (src/work/broker.ts) and run it on this machine — extraction on a
+ * Codex agent and a Cursor agent side by side, say (`extraction.workers`),
+ * summary pages on the Summarize stage's route (`summaryConcurrency`) and a
+ * review's judge calls on the Judge stage's route (`review.concurrency`).
+ * Each backend keeps its own health: a rate limit pauses it, a run of bad
+ * answers rests it, a missing CLI or expired login parks it for half an hour
+ * and then tries again (src/labeling/failures.ts). Settings saves are picked
+ * up within a minute.
  *
  * The slots run only between `start()` and `stop()`, as often as someone
  * starts and stops them (src/labeling/processing.ts): `serve` never starts
@@ -18,10 +23,19 @@ import { LabelingScheduler, LabelingTask, TaskOutcome, WorkerIdentity } from './
  */
 
 export interface LocalWorkerSpec {
-  /** The route target the slots run on ('extract' for the Extract stage's own route). */
+  /** The route target the slots run on ('extract' for the Extract stage's own route, 'summarize' for the Summarize stage's). */
   id: string;
+  /** The kinds of work they take. */
+  kinds: WorkKind[];
   slots: number;
   llm: LlmConfig;
+}
+
+/** What the slots take their work from: the work broker. */
+export interface WorkLeaser {
+  lease(who: WorkerIdentity, kinds: readonly WorkKind[], max?: number): Promise<WorkTask[]>;
+  complete(taskId: string, who: WorkerIdentity, outcome: TaskOutcome): Promise<unknown>;
+  renew(taskIds: string[], who: WorkerIdentity): unknown;
 }
 
 /**
@@ -37,7 +51,7 @@ export function localWorkerSpecs(config: KnodeConfig, warn: (msg: string) => voi
   if (listed.length > 0 && workers.length === 0) return [];
   if (workers.length === 0) {
     const llm = resolveRoutedLlmConfig(config.llm, route, targets, config.extraction.tier1Model);
-    return [{ id: route.use || 'extract', slots: Math.max(1, Math.min(16, Math.floor(config.extraction.concurrency || 1))), llm }];
+    return [{ id: route.use || 'extract', kinds: ['extract'], slots: Math.max(1, Math.min(16, Math.floor(config.extraction.concurrency || 1))), llm }];
   }
   const out: LocalWorkerSpec[] = [];
   for (const w of workers) {
@@ -54,9 +68,39 @@ export function localWorkerSpecs(config: KnodeConfig, warn: (msg: string) => voi
       speed: w.speed ?? 'default',
       cliTimeoutMs: w.cliTimeoutMs ?? route.cliTimeoutMs,
     }, targets);
-    out.push({ id, slots: Math.min(16, Math.floor(w.slots)), llm });
+    out.push({ id, kinds: ['extract'], slots: Math.min(16, Math.floor(w.slots)), llm });
   }
   return out;
+}
+
+/**
+ * The summary slots `serve` runs: the Summarize stage's route with
+ * `summaryConcurrency` slots (default `concurrency`). 0 turns them off — then
+ * only remote workers write summaries.
+ */
+export function localSummarySpec(config: KnodeConfig): LocalWorkerSpec | null {
+  const slots = Math.floor(Number(config.extraction.summaryConcurrency ?? config.extraction.concurrency ?? 1));
+  if (!(slots > 0)) return null;
+  const llm = resolveRoutedLlmConfig(config.llm, config.extraction.summaryLlm, routeTargets(config));
+  return { id: 'summarize', kinds: ['summarize'], slots: Math.min(16, slots), llm };
+}
+
+/**
+ * The judge slots `serve` runs: the Judge stage's route with
+ * `review.concurrency` slots (default 2), taking the calls a review waits on
+ * (src/work/judge.ts). 0 turns them off — then only remote workers judge.
+ */
+export function localJudgeSpec(config: KnodeConfig): LocalWorkerSpec | null {
+  const slots = Math.floor(Number(config.review?.concurrency ?? 2));
+  if (!(slots > 0)) return null;
+  const llm = resolveRoutedLlmConfig(config.llm, config.extraction.judgeLlm, routeTargets(config));
+  return { id: 'judge', kinds: ['judge'], slots: Math.min(16, slots), llm };
+}
+
+/** Whether this machine can answer judge calls itself: judge slots on a Judge route with a model. */
+export function judgesHere(config: KnodeConfig): boolean {
+  const spec = localJudgeSpec(config);
+  return spec !== null && new LlmClient(spec.llm).enabled;
 }
 
 export interface LocalBackendStatus {
@@ -74,6 +118,7 @@ export interface LocalBackendStatus {
 
 interface Backend {
   id: string;
+  kinds: WorkKind[];
   client: LlmClient;
   slots: number;
   busy: number;
@@ -98,7 +143,7 @@ export class LocalLabelingWorkers {
   private readonly log: (msg: string) => void;
 
   constructor(
-    private readonly scheduler: LabelingScheduler,
+    private readonly work: WorkLeaser,
     private readonly config: () => KnodeConfig,
     private readonly opts: LocalWorkersOptions = {},
   ) {
@@ -153,18 +198,22 @@ export class LocalLabelingWorkers {
   /** Rebuild the slots when the configured workers changed; old slots finish their call and stop. */
   reconfigure(): void {
     if (this.stopped) return;
-    const specs = localWorkerSpecs(this.config(), this.log).map((s) => ({ ...s, client: new LlmClient(s.llm) })).filter((s) => s.client.enabled);
-    const signature = JSON.stringify(specs.map((s) => [s.id, s.slots, s.llm.provider, s.llm.model, s.llm.effort, s.llm.speed, s.llm.cliTimeoutMs, s.llm.baseUrl]));
+    const config = this.config();
+    const stages = [localSummarySpec(config), localJudgeSpec(config)].filter((s): s is LocalWorkerSpec => s !== null);
+    const specs = [...localWorkerSpecs(config, this.log), ...stages]
+      .map((s) => ({ ...s, client: new LlmClient(s.llm) }))
+      .filter((s) => s.client.enabled);
+    const signature = JSON.stringify(specs.map((s) => [s.id, s.kinds, s.slots, s.llm.provider, s.llm.model, s.llm.effort, s.llm.speed, s.llm.cliTimeoutMs, s.llm.baseUrl]));
     if (signature === this.signature) return;
     this.signature = signature;
     const generation = ++this.generation;
-    this.backends = specs.map((s) => ({ id: s.id, client: s.client, slots: s.slots, busy: 0, health: newBackendHealth() }));
+    this.backends = specs.map((s) => ({ id: s.id, kinds: s.kinds, client: s.client, slots: s.slots, busy: 0, health: newBackendHealth() }));
     for (const backend of this.backends) {
       for (let n = 1; n <= backend.slots; n++) void this.slot(backend, n, generation);
     }
     this.log(this.backends.length
       ? `labeling: local workers ${this.backends.map((b) => `${b.id} (${b.client.label}) × ${b.slots}`).join(', ')}`
-      : 'labeling: no local workers (the Extract stage has no model) — remote workers can still take segments');
+      : 'labeling: no local workers (no stage has a model here) — remote workers can still take work');
   }
 
   private sleep(ms: number): Promise<void> {
@@ -194,9 +243,9 @@ export class LocalLabelingWorkers {
         await this.sleep(Math.min(pause, 15_000));
         continue;
       }
-      let task: LabelingTask | undefined;
+      let task: WorkTask | undefined;
       try {
-        [task] = await this.scheduler.lease(who, 1);
+        [task] = await this.work.lease(who, backend.kinds, 1);
       } catch (err) {
         this.log(`labeling: ${who.worker} could not take work: ${err instanceof Error ? err.message : err}`);
         await this.sleep(30_000);
@@ -209,23 +258,24 @@ export class LocalLabelingWorkers {
       }
       const outcome = await this.run(backend, task, who);
       try {
-        await this.scheduler.complete(task.id, who, outcome);
+        await this.work.complete(task.id, who, outcome);
       } catch (err) {
-        this.log(`labeling: ${who.worker} could not hand back ${task.document.path}: ${err instanceof Error ? err.message : err}`);
+        this.log(`labeling: ${who.worker} could not hand back ${task.label}: ${err instanceof Error ? err.message : err}`);
       }
       const rest = recordBackendOutcome(backend.health, outcome.ok ? { ok: true } : { ok: false, kind: outcome.kind ?? 'model', error: outcome.error });
       if (rest > 0) this.log(`labeling: ${backend.id} rests ${Math.ceil(rest / 60_000)} min after ${backend.health.pauseReason}: ${backend.health.lastError ?? ''}`);
     }
   }
 
-  private async run(backend: Backend, task: LabelingTask, who: WorkerIdentity): Promise<TaskOutcome> {
+  private async run(backend: Backend, task: WorkTask, who: WorkerIdentity): Promise<TaskOutcome> {
     backend.busy++;
     // keep the lease while the call runs; a CLI call may take minutes
-    const renew = setInterval(() => this.scheduler.renew([task.id], who), Math.max(5_000, Math.floor(this.scheduler.leaseDurationMs / 3)));
+    const leaseMs = Date.parse(task.leaseExpiresAt) - Date.now();
+    const renew = setInterval(() => this.work.renew([task.id], who), Math.max(5_000, Math.floor((Number.isFinite(leaseMs) ? leaseMs : 60_000) / 3)));
     renew.unref?.();
     try {
-      this.log(`tier1 extract ${task.document.path}${task.document.parts > 1 ? ` [${task.document.part}/${task.document.parts}]` : ''} · ${backend.id}`);
-      const text = await backend.client.complete(task.messages, { json: true, maxTokens: task.maxTokens });
+      this.log(`${task.kind === 'extract' ? 'tier1 extract' : task.kind === 'summarize' ? 'summarize' : 'judge'} ${task.label} · ${backend.id}`);
+      const text = await backend.client.complete(task.messages, { json: task.json, maxTokens: task.maxTokens });
       return { ok: true, text, model: backend.client.label };
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);

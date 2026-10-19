@@ -37,6 +37,7 @@ import { launchArgs } from './research/launch.js';
 import { loadProfile, loadProfiles, profileYaml } from './research/profile.js';
 import { runDocumentPass } from './ingest/background.js';
 import { REMOTE_SCOPES, RemoteScope, RemoteTokenStore } from './remote/tokens.js';
+import { WORK_KINDS } from './work/kinds.js';
 import { registerAuthCommands } from './auth/cli.js';
 import { describeLinkedFolders, importFolder, refreshLinkedFolders, unlinkFolder } from './ingest/folders.js';
 import { requeueFailedExtractions } from './graph/tier1.js';
@@ -194,7 +195,7 @@ program
 
 const remote = program
   .command('remote')
-  .description('tokens for the remote API other machines use — labeling workers, document reads/writes, read-only SQL (see src/remote)');
+  .description('tokens for the remote API other machines use — extraction and summary workers, document reads/writes, read-only SQL (see src/remote)');
 
 const remoteTokens = remote.command('token').description('create, list or revoke remote API tokens (stored hashed under <data>/.knode)');
 
@@ -206,10 +207,11 @@ remoteTokens
   .requiredOption('--name <name>', 'who uses it, e.g. macbook-labeler or aliyun-sg')
   .option('--scope <scope...>', `what it may do: ${REMOTE_SCOPES.join(', ')} (repeat or comma-separate)`, collect, [] as string[])
   .option('--workspace <workspace...>', 'workspaces it may use: <user>/<workspace-id>, team/<name>, or * (repeat or comma-separate)', collect, [] as string[])
-  .action((opts: { name: string; scope: string[]; workspace: string[] }) => {
+  .option('--kinds <kind...>', `the kinds of work "label" covers for it: ${WORK_KINDS.join(', ')} (default: all)`, collect, [] as string[])
+  .action((opts: { name: string; scope: string[]; workspace: string[]; kinds: string[] }) => {
     const store = new RemoteTokenStore(dataDir());
-    const { token, record } = store.create({ name: opts.name, scopes: opts.scope as RemoteScope[], workspaces: opts.workspace });
-    console.log(`token ${record.id} for ${record.name}: scopes ${record.scopes.join(', ')}; workspaces ${record.workspaces.join(', ')}`);
+    const { token, record } = store.create({ name: opts.name, scopes: opts.scope as RemoteScope[], workspaces: opts.workspace, kinds: opts.kinds });
+    console.log(`token ${record.id} for ${record.name}: scopes ${record.scopes.join(', ')}${record.kinds ? ` (work: ${record.kinds.join(', ')})` : ''}; workspaces ${record.workspaces.join(', ')}`);
     console.log('');
     console.log(token);
     console.log('');
@@ -225,7 +227,7 @@ remoteTokens
     if (opts.json) return console.log(JSON.stringify(tokens, null, 2));
     if (tokens.length === 0) return console.log('no remote tokens — `knode-os remote token create --name <machine> --scope label --workspace <user>/<workspace>`');
     for (const t of tokens) {
-      console.log(`${t.id}  ${t.name}  [${t.scopes.join(',')}]  ${t.workspaces.join(',')}  created ${t.createdAt.slice(0, 10)}${t.lastUsedAt ? `, last used ${t.lastUsedAt.slice(0, 16)}` : ''}${t.revokedAt ? `  REVOKED ${t.revokedAt.slice(0, 10)}` : ''}`);
+      console.log(`${t.id}  ${t.name}  [${t.scopes.join(',')}${t.kinds ? `; work: ${t.kinds.join(',')}` : ''}]  ${t.workspaces.join(',')}  created ${t.createdAt.slice(0, 10)}${t.lastUsedAt ? `, last used ${t.lastUsedAt.slice(0, 16)}` : ''}${t.revokedAt ? `  REVOKED ${t.revokedAt.slice(0, 10)}` : ''}`);
     }
   });
 

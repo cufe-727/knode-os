@@ -12,14 +12,17 @@ import { assertNotLinked } from '../ingest/folders.js';
 import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
 import { sync } from '../ingest/sync.js';
 import { FailureKind } from '../labeling/failures.js';
-import { LabelingScheduler, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
+import { TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
 import { search, SearchMode } from '../search/search.js';
 import { WorkspaceContextRegistry, resolveWorkspaceScope, WorkspaceScope } from '../server/workspaces.js';
 import { CATALOG_VIEWS, catalogQuery } from '../store/catalog.js';
 import { queryClaims } from '../store/claims.js';
 import { listEntities } from '../store/queries.js';
 import { clientInfo } from '../server/public-guard.js';
-import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows } from './tokens.js';
+import { WorkBroker } from '../work/broker.js';
+import { offeredRemotely, workerConfig } from '../work/config.js';
+import { isWorkKind, WORK_KINDS, WorkKind } from '../work/kinds.js';
+import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows, tokenAllowsKind } from './tokens.js';
 
 /**
  * The remote API: what other machines may do with this knowledge base,
@@ -29,7 +32,10 @@ import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows } from '.
  *   GET  /whoami                                   the token's name, scopes and workspaces
  *   GET  /worker.mjs                               the remote worker script (worker/knode-worker.mjs)
  *   /w/<owner>/<workspace>/…                       <owner> = a username, or "team" for a team workspace
- *     labeling   POST labeling/lease | complete | renew | release, GET labeling/status   (scope label)
+ *     work       GET work/config, POST work/lease | complete | renew | release,
+ *                GET work/status — every kind of leased work (docs/design/11)       (scope label)
+ *     labeling   POST labeling/lease | complete | renew | release, GET labeling/status:
+ *                the same for extraction only, as workers before work/* speak it    (scope label)
  *     documents  GET documents, GET document?path=                                      (scope read)
  *                PUT document?path= {content}, DELETE document?path=, POST sync          (scope write)
  *     knowledge  GET search?q=, graph?q=, claims?…, entities?q=                          (scope read)
@@ -47,8 +53,8 @@ import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows } from '.
 export interface RemoteApiDeps {
   rootDataDir: string;
   registry: WorkspaceContextRegistry;
-  /** The labeling scheduler `serve` runs for a workspace; null outside `serve`. */
-  labeling: (ctx: AppContext) => LabelingScheduler | null;
+  /** The work broker `serve` runs for a workspace (src/work/broker.ts); null outside `serve`. */
+  work: (ctx: AppContext) => WorkBroker | null;
   config?: RemoteApiConfig;
   log?: (msg: string) => void;
 }
@@ -172,7 +178,7 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
 
   api.get('/whoami', (c) => {
     const t = c.get('token');
-    return c.json({ id: t.id, name: t.name, scopes: t.scopes, workspaces: t.workspaces, createdAt: t.createdAt });
+    return c.json({ id: t.id, name: t.name, scopes: t.scopes, workspaces: t.workspaces, ...(t.kinds ? { kinds: t.kinds } : {}), createdAt: t.createdAt });
   });
 
   // a workspace the token may use, opened through the same registry as the UI's
@@ -200,11 +206,16 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     if (!tokenAllows(c.get('token'), scope, c.get('workspace'))) throw new HttpError(403, `this token lacks the "${scope}" scope here`);
     return c.get('ctx');
   };
-  const scheduler = (ctx: AppContext) => {
-    const s = deps.labeling(ctx);
-    if (!s) throw new HttpError(503, 'labeling runs only inside `knode-os serve`');
-    return s;
+  const broker = (ctx: AppContext) => {
+    const b = deps.work(ctx);
+    if (!b) throw new HttpError(503, 'leased work runs only inside `knode-os serve`');
+    return b;
   };
+  /** The kinds the token may take here that the workspace offers remote workers. */
+  const allowedKinds = (c: Context<RemoteEnv>): WorkKind[] =>
+    WORK_KINDS.filter((k) => tokenAllowsKind(c.get('token'), k, c.get('workspace')) && offeredRemotely(c.get('ctx').config, k));
+  const configFor = (c: Context<RemoteEnv>, b: WorkBroker) =>
+    workerConfig(c.get('ctx').config, { allowed: allowedKinds(c), leaseMs: b.leaseDurationMs(), shares: b.shares() });
   const whoOf = (c: Context<RemoteEnv>, body: Record<string, unknown>): WorkerIdentity => ({
     worker: `${c.get('token').name}/${text(body.worker || 'worker', 80)}`,
     backend: text(body.backend || 'unknown', 80),
@@ -217,17 +228,9 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
   };
   const ids = (value: unknown): string[] => (Array.isArray(value) ? value.map((v) => text(v, 64)).filter(Boolean).slice(0, 64) : []);
 
-  /* ------------------------------ labeling ------------------------------ */
+  /* ----------------------------- leased work ---------------------------- */
 
-  api.post('/w/:owner/:workspace/labeling/lease', async (c) => {
-    const ctx = need(c, 'label');
-    const b = await body(c);
-    const s = scheduler(ctx);
-    const tasks = await s.lease(whoOf(c, b), Number(b.max ?? 1) || 1);
-    return c.json({ leaseSeconds: Math.round(s.leaseDurationMs / 1000), tasks });
-  });
-
-  api.post('/w/:owner/:workspace/labeling/complete', async (c) => {
+  const complete = async (c: Context<RemoteEnv>) => {
     const ctx = need(c, 'label');
     const b = await body(c);
     const id = text(b.id, 64);
@@ -236,28 +239,61 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     const outcome: TaskOutcome = b.ok === true
       ? { ok: true, text: text(b.text, 2 * 1024 * 1024), model: b.model ? text(b.model, 120) : undefined }
       : { ok: false, error: text(b.error || 'failed without a message', 2000), kind, model: b.model ? text(b.model, 120) : undefined };
-    const result = await scheduler(ctx).complete(id, whoOf(c, b), outcome);
+    const result = await broker(ctx).complete(id, whoOf(c, b), outcome);
     return c.json(result, result.accepted ? 200 : 409);
-  });
-
-  api.post('/w/:owner/:workspace/labeling/renew', async (c) => {
+  };
+  const renew = async (c: Context<RemoteEnv>) => {
     const ctx = need(c, 'label');
     const b = await body(c);
-    return c.json(scheduler(ctx).renew(ids(b.ids), whoOf(c, b)));
-  });
-
-  api.post('/w/:owner/:workspace/labeling/release', async (c) => {
+    return c.json(broker(ctx).renew(ids(b.ids), whoOf(c, b)));
+  };
+  const release = async (c: Context<RemoteEnv>) => {
     const ctx = need(c, 'label');
     const b = await body(c);
-    return c.json({ released: await scheduler(ctx).release(ids(b.ids), whoOf(c, b)) });
-  });
-
-  api.get('/w/:owner/:workspace/labeling/status', async (c) => {
+    return c.json({ released: await broker(ctx).release(ids(b.ids), whoOf(c, b)) });
+  };
+  const watching = (c: Context<RemoteEnv>) => {
     const token = c.get('token');
     if (!tokenAllows(token, 'label', c.get('workspace')) && !tokenAllows(token, 'read', c.get('workspace'))) {
       throw new HttpError(403, 'this token lacks the "label" or "read" scope here');
     }
-    return c.json(await scheduler(c.get('ctx')).status());
+    return broker(c.get('ctx'));
+  };
+
+  // what a worker reads instead of being told by hand: the kinds it may take, lease, shares, model hints
+  api.get('/w/:owner/:workspace/work/config', (c) => c.json(configFor(c, broker(need(c, 'label')))));
+
+  api.post('/w/:owner/:workspace/work/lease', async (c) => {
+    const ctx = need(c, 'label');
+    const b = await body(c);
+    const s = broker(ctx);
+    const allowed = allowedKinds(c);
+    const asked = Array.isArray(b.kinds) ? b.kinds.filter(isWorkKind) : allowed;
+    const kinds = asked.filter((k) => allowed.includes(k));
+    const tasks = kinds.length ? await s.lease(whoOf(c, b), kinds, Number(b.max ?? 1) || 1) : [];
+    return c.json({ configVersion: configFor(c, s).version, leaseSeconds: Math.round(s.leaseDurationMs() / 1000), tasks });
+  });
+  api.post('/w/:owner/:workspace/work/complete', complete);
+  api.post('/w/:owner/:workspace/work/renew', renew);
+  api.post('/w/:owner/:workspace/work/release', release);
+  api.get('/w/:owner/:workspace/work/status', async (c) => c.json(await watching(c).status()));
+
+  // extraction only, as workers that predate work/* speak it
+  api.post('/w/:owner/:workspace/labeling/lease', async (c) => {
+    const ctx = need(c, 'label');
+    if (!tokenAllowsKind(c.get('token'), 'extract', c.get('workspace'))) throw new HttpError(403, 'this token may not take extraction work');
+    const b = await body(c);
+    const s = broker(ctx);
+    const tasks = await s.lease(whoOf(c, b), ['extract'], Number(b.max ?? 1) || 1);
+    return c.json({ leaseSeconds: Math.round(s.leaseDurationMs('extract') / 1000), tasks });
+  });
+  api.post('/w/:owner/:workspace/labeling/complete', complete);
+  api.post('/w/:owner/:workspace/labeling/renew', renew);
+  api.post('/w/:owner/:workspace/labeling/release', release);
+  api.get('/w/:owner/:workspace/labeling/status', async (c) => {
+    const extract = watching(c).source('extract');
+    if (!extract) throw new HttpError(503, 'extraction is not leased here');
+    return c.json(await extract.status());
   });
 
   /* ------------------------------ documents ----------------------------- */

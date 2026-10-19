@@ -2,9 +2,10 @@ import crypto from 'node:crypto';
 import { KnodeConfig } from '../config.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { writeDeps } from '../lineage/deps.js';
-import { LlmClient } from '../llm/client.js';
+import { jsonFromReply, LlmClient } from '../llm/client.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { setSuggestionStatus } from '../store/queries.js';
+import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
 import { applyMerge } from './merge.js';
 import { typesCompatible } from './normalize.js';
 
@@ -58,6 +59,11 @@ export interface DedupeStats {
   llmRejected: number;
   /** Merged without a person (review.llmJudge = auto). */
   autoMerged: number;
+  /**
+   * Verdicts of a remote model outside `server.remote.judgeModels` that would
+   * have merged or rejected a pair on their own: filed as suggestions instead.
+   */
+  leftToPerson: number;
 }
 
 export interface MergeVerdict {
@@ -97,13 +103,14 @@ function survivor(a: EntityLite, b: EntityLite): [keep: EntityLite, fold: Entity
 }
 
 export async function auditDuplicateEntities(
-  ctx: { store: Store; embedder: EmbeddingProvider; config: KnodeConfig; llm?: LlmClient },
+  /** `judge`: where the judge calls go (src/work/judge.ts); absent, the Judge route `llm`, one call at a time. */
+  ctx: { store: Store; embedder: EmbeddingProvider; config: KnodeConfig; llm?: LlmClient; judge?: JudgeRunner },
   opts: DedupeOptions = {},
 ): Promise<DedupeStats> {
   const { store } = ctx;
   const progress = opts.onProgress ?? (() => {});
   const threshold = opts.threshold ?? 0.92;
-  const stats: DedupeStats = { candidates: 0, suggested: 0, embedded: 0, judged: 0, llmRejected: 0, autoMerged: 0 };
+  const stats: DedupeStats = { candidates: 0, suggested: 0, embedded: 0, judged: 0, llmRejected: 0, autoMerged: 0, leftToPerson: 0 };
 
   const entities = await store.query<EntityLite>(
     `SELECT id, name, type, description, aliases, name_key, mention_count, evidence_count, fold_sha
@@ -229,28 +236,40 @@ export async function auditDuplicateEntities(
   );
   const ranked = [...candidates.entries()].filter(([id]) => !decided.has(id)).sort((x, y) => y[1].score - x[1].score).slice(0, opts.maxSuggestions ?? 50);
 
-  // 3b. the LLM judge (review.llmJudge): a second opinion with the grounding text in front of it
+  // 3b. the LLM judge (review.llmJudge): a second opinion with the grounding text in front of it —
+  // every call offered at once, so `serve`'s judge slots and remote workers answer them side by side
   const review = ctx.config.review;
   const judgeMode = review?.llmJudge ?? 'off';
   const verdicts = new Map<string, MergeVerdict>();
-  if (judgeMode !== 'off' && ctx.llm?.enabled) {
-    for (const [id, c] of ranked.slice(0, review?.maxJudgedPerRun ?? 30)) {
+  const judge = ctx.judge ?? (ctx.llm ? directJudge(ctx.llm) : null);
+  if (judgeMode !== 'off' && judge?.enabled) {
+    const judged = ranked.slice(0, review?.maxJudgedPerRun ?? 30);
+    const calls: JudgeCall[] = [];
+    for (const [, c] of judged) {
       const prompt = await judgePrompt(store, c.a, c.b);
+      calls.push({ label: `${c.a.name} / ${c.b.name}`, messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }], maxTokens: 300 });
+    }
+    const answers = await judge.run(calls);
+    answers.forEach((answer, i) => {
+      const [id, c] = judged[i];
       try {
-        const raw = await ctx.llm.completeJson<{ same?: unknown; confidence?: unknown; reason?: unknown }>(
-          [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }], { maxTokens: 300 },
-        );
-        verdicts.set(id, { same: raw.same === true, confidence: Math.max(0, Math.min(1, Number(raw.confidence) || 0)), reason: String(raw.reason ?? '').slice(0, 600), model: ctx.llm.label });
+        if (!answer.ok) throw new Error(answer.error);
+        const raw = jsonFromReply<{ same?: unknown; confidence?: unknown; reason?: unknown }>(answer.text);
+        verdicts.set(id, { same: raw.same === true, confidence: Math.max(0, Math.min(1, Number(raw.confidence) || 0)), reason: String(raw.reason ?? '').slice(0, 600), model: answer.model });
         stats.judged++;
       } catch (err) {
         progress(`dedupe: judge failed for ${c.a.name} / ${c.b.name}: ${err instanceof Error ? err.message : err}`);
       }
-    }
+    });
   }
 
   for (const [id, c] of ranked) {
     const [keep, fold] = survivor(c.a, c.b);
     const verdict = verdicts.get(id);
+    // a remote model outside server.remote.judgeModels advises; a person decides
+    const decides = verdict ? verdictMayDecide(ctx.config, verdict.model) : false;
+    const wouldReject = Boolean(verdict && !verdict.same && verdict.confidence >= (review?.llmMinConfidence ?? 0.6));
+    const wouldMerge = Boolean(verdict && verdict.same && judgeMode === 'auto' && verdict.confidence >= (review?.autoMergeMinConfidence ?? 0.95));
     const title = `合并重复实体: ${fold.name} → ${keep.name}`;
     const body = [
       `"${fold.name}"（${fold.type}，${fold.mention_count} 次提及）看起来与 "${keep.name}"（${keep.type}，${keep.mention_count} 次提及）是同一实体。`,
@@ -269,13 +288,13 @@ export async function auditDuplicateEntities(
       { kind: 'entity', id: keep.id, required: true },
       { kind: 'entity', id: fold.id, required: true },
     ]);
-    if (verdict && !verdict.same && verdict.confidence >= (review?.llmMinConfidence ?? 0.6)) {
+    if (verdict && wouldReject && decides) {
       // remembered as a decision so the pair is never proposed again; a person can still merge by hand
       await setSuggestionStatus(store, id, 'rejected', 'llm-judge');
       stats.llmRejected++;
       continue;
     }
-    if (verdict && verdict.same && judgeMode === 'auto' && verdict.confidence >= (review?.autoMergeMinConfidence ?? 0.95)) {
+    if (verdict && wouldMerge && decides) {
       try {
         await applyMerge(store, { entityId: fold.id, canonicalId: keep.id, reason: `llm-judge ${verdict.confidence.toFixed(2)}: ${verdict.reason}`, actor: 'llm-judge' });
         await setSuggestionStatus(store, id, 'accepted', 'llm-judge');
@@ -285,10 +304,11 @@ export async function auditDuplicateEntities(
         progress(`dedupe: auto-merge failed for ${fold.name}: ${err instanceof Error ? err.message : err}`);
       }
     }
+    if (!decides && (wouldReject || wouldMerge)) stats.leftToPerson++;
     stats.suggested++;
   }
   if (stats.suggested > 0 || stats.autoMerged > 0 || stats.llmRejected > 0) {
-    progress(`dedupe: ${stats.suggested} merge candidates queued as suggestions (${stats.candidates} pairs scored${stats.judged ? `, ${stats.judged} judged by LLM` : ''}${stats.autoMerged ? `, ${stats.autoMerged} merged automatically` : ''}${stats.llmRejected ? `, ${stats.llmRejected} rejected by the judge` : ''})`);
+    progress(`dedupe: ${stats.suggested} merge candidates queued as suggestions (${stats.candidates} pairs scored${stats.judged ? `, ${stats.judged} judged by LLM` : ''}${stats.autoMerged ? `, ${stats.autoMerged} merged automatically` : ''}${stats.llmRejected ? `, ${stats.llmRejected} rejected by the judge` : ''}${stats.leftToPerson ? `, ${stats.leftToPerson} remote verdicts left to a person` : ''})`);
   }
   return stats;
 }

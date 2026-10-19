@@ -7,6 +7,7 @@ import { LabelingScheduler } from '../labeling/scheduler.js';
 import { LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
 import { mountRemoteApi } from '../remote/api.js';
+import { WorkBroker } from '../work/broker.js';
 import { accountMayOpenTeam } from '../auth/accounts.js';
 import { AuthEnv, authMiddleware, existingTeams, mountAuthRoutes, mountGateways } from '../auth/http.js';
 import { AuthService } from '../auth/service.js';
@@ -196,8 +197,10 @@ export interface WorkspaceServices {
   folders?: LinkedFolders | null;
   /** Extraction as leased work (src/labeling): local slots and remote workers take segments from it. */
   labeling?: LabelingScheduler | null;
+  /** Every kind of leased work — segments and summaries — behind one lease protocol (src/work/broker.ts). */
+  work?: WorkBroker | null;
   localWorkers?: LocalLabelingWorkers | null;
-  /** Starts and stops the slots, reviews and summaries; stopped until someone starts it. */
+  /** Starts and stops the slots and the reviews; stopped until someone starts it. */
   processing?: LabelingProcessing | null;
 }
 
@@ -490,7 +493,7 @@ export function createApp(
     mountRemoteApi(app, {
       rootDataDir: rootCtx.dataDir,
       registry: workspaceContexts,
-      labeling: (ctx) => servicesFor(ctx)?.labeling ?? null,
+      work: (ctx) => servicesFor(ctx)?.work ?? null,
       config: rootCtx.config.server.remote,
       log,
     });
@@ -782,8 +785,9 @@ export function createApp(
         const concurrency = Number(x.concurrency);
         if (Number.isFinite(batchSize) && batchSize >= 1) next.extraction.batchSize = Math.floor(batchSize);
         if (Number.isFinite(concurrency) && concurrency >= 1) next.extraction.concurrency = Math.floor(concurrency);
+        // 0 leaves summaries to remote workers (src/labeling/local.ts)
         const summaryConcurrency = Number(x.summaryConcurrency);
-        if (x.summaryConcurrency !== undefined && Number.isFinite(summaryConcurrency) && summaryConcurrency >= 1) {
+        if (x.summaryConcurrency !== undefined && Number.isFinite(summaryConcurrency) && summaryConcurrency >= 0) {
           next.extraction.summaryConcurrency = Math.min(16, Math.floor(summaryConcurrency));
         }
         if (Array.isArray(x.workers)) {
@@ -2277,14 +2281,20 @@ export function createApp(
     }
   });
 
-  // the labeling scheduler and this machine's worker slots, for the UI
+  // the labeling scheduler, the summary and judge sources and this machine's worker slots, for the UI;
+  // `scheduler.workers` lists every worker the broker saw, whatever it took
   app.get('/api/labeling/status', async (c) => {
     const ctx = requestCtx(c);
     const services = servicesFor(ctx);
     if (!services?.labeling) return c.json({ error: 'labeling runs only inside `knode-os serve`' }, 503);
+    const scheduler = await services.labeling.status();
+    const work = services.work ? await services.work.status() : null;
     return c.json({
       processing: services.processing?.state() ?? null,
-      scheduler: await services.labeling.status(),
+      scheduler: work ? { ...scheduler, workers: work.workers } : scheduler,
+      summaries: work?.kinds.summarize ?? null,
+      judge: work?.kinds.judge ?? null,
+      shares: work?.shares ?? null,
       local: services.localWorkers?.status() ?? [],
     });
   });

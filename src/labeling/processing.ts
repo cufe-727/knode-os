@@ -2,15 +2,16 @@ import { FollowUp } from './followup.js';
 import { LocalLabelingWorkers } from './local.js';
 
 /**
- * A workspace's processing: the work that spends model calls once documents
- * are in — this machine's extraction slots (src/labeling/local.ts) and, after
- * them, the duplicate reviews and summary pages (src/labeling/followup.ts).
+ * A workspace's processing: the work that spends this machine's model calls
+ * once documents are in — its extraction and summary slots
+ * (src/labeling/local.ts) and the duplicate reviews after them
+ * (src/labeling/followup.ts).
  *
  * `serve` never starts it on its own, not at startup and not after a restart:
  * someone starts it (the app, the web UI, POST /api/labeling/start) and it
  * runs until someone stops it or the service stops. Importing, watching and
  * embedding documents go on regardless, and remote workers may still lease
- * segments: they are started by hand on their own machines.
+ * segments and summaries: they are started by hand on their own machines.
  */
 
 export interface ProcessingState {
@@ -34,7 +35,7 @@ export class LabelingProcessing {
     return this.workers.running;
   }
 
-  /** Start the slots, reviews and summaries. False when they were running already. */
+  /** Start the slots (extraction and summaries) and the reviews. False when they were running already. */
   start(by: string): boolean {
     if (this.workers.running) return false;
     this.workers.start();

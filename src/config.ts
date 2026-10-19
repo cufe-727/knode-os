@@ -309,7 +309,10 @@ export interface ExtractionConfig {
    * machines come in through the remote API and need no entry here.
    */
   workers?: ExtractionWorkerConfig[];
-  /** Summary pages written at once by `serve`'s summary loop; default `concurrency`. */
+  /**
+   * Summary pages written at once on `serve`'s own summary slots (src/labeling/local.ts);
+   * default `concurrency`. 0 leaves summaries to remote workers.
+   */
   summaryConcurrency?: number;
 }
 
@@ -336,8 +339,29 @@ export interface RemoteApiConfig {
   enabled: boolean;
   /** Largest request body accepted, in bytes. */
   maxBodyBytes?: number;
-  /** How long a labeling worker may hold a segment before it goes back in line (renewable). */
+  /** How long a worker may hold a segment or a summary before it goes back in line (renewable). */
   leaseMinutes?: number;
+  /**
+   * The kinds of work besides extraction (always offered) that remote workers
+   * may take here (docs/design/11). Summaries default to on, the Judge
+   * stage's review calls to off.
+   */
+  offer?: { summarize?: boolean; judge?: boolean };
+  /**
+   * How a slot that takes several kinds of work shares them: tasks handed out
+   * per kind, by weight (src/work/broker.ts). Default extraction 3, summaries 1.
+   * Judge calls go before either.
+   */
+  shares?: { extract?: number; summarize?: number };
+  /** Longest a review waits for one judge call to be answered, here or remotely (default 20). */
+  callDeadlineMinutes?: number;
+  /**
+   * The remote models whose verdicts may merge or reject without a person
+   * (`review.llmJudge` / `review.claimMerge` set to auto): model labels as a
+   * worker reports them ("codex:gpt-6.1-sol"), or a prefix ending in * ("codex:*").
+   * Any other remote verdict is filed as a suggestion with the verdict attached.
+   */
+  judgeModels?: string[];
 }
 
 /**
@@ -673,6 +697,12 @@ export interface ReviewConfig {
   autoMergeMinConfidence: number;
   /** Duplicate-entity candidates judged per run (one LLM call each). */
   maxJudgedPerRun: number;
+  /**
+   * Judge calls `serve` runs at once on its own judge slots, on the Judge
+   * stage's route, while a review waits on them (default 2). 0 leaves them
+   * to remote workers (`server.remote.offer.judge`).
+   */
+  concurrency?: number;
   /** LLM review of disputed / suspected claims, filed as knowledge suggestions with a verdict. */
   claims: 'off' | 'suggest';
   /**
@@ -850,7 +880,10 @@ export function defaultConfig(): KnodeConfig {
       port: 9100,
       host: '127.0.0.1',
       mcp: { enabled: true, path: '/mcp' },
-      remote: { enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15 },
+      remote: {
+        enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15,
+        offer: { summarize: true, judge: false }, shares: { extract: 3, summarize: 1 }, callDeadlineMinutes: 20, judgeModels: [],
+      },
       auth: { enabled: true, sessionDays: 30, allowInsecureRemote: false },
       tls: null,
     },
@@ -918,6 +951,7 @@ export function defaultConfig(): KnodeConfig {
       llmMinConfidence: 0.6,
       autoMergeMinConfidence: 0.95,
       maxJudgedPerRun: 30,
+      concurrency: 2,
       claims: 'suggest',
       claimMerge: 'auto',
       claimMergeMinConfidence: 0.9,

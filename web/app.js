@@ -1025,12 +1025,14 @@ function paintProcessing() {
   if (!state) return;
   const mayChange = authDisabled || serverAuth?.groups?.settings === true;
   const queued = processingStatus.scheduler?.queued;
+  const due = processingStatus.summaries?.due;
   button.classList.toggle('running', state.running);
   button.textContent = state.running ? '● Processing' : '▶ Start processing';
   button.disabled = !mayChange;
   button.title = [
     state.running ? 'Extraction, reviews and summaries are running — click to stop' : 'Extraction, reviews and summaries wait until someone starts them',
     queued === undefined ? '' : `${queued} documents waiting`,
+    due ? `${due} summaries due` : '',
     state.by && state.since ? `${state.running ? 'started' : 'stopped'} by ${state.by} at ${new Date(state.since).toLocaleTimeString()}` : '',
     mayChange ? '' : 'an administrator starts and stops processing',
   ].filter(Boolean).join(' · ');
