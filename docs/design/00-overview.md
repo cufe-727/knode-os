@@ -94,7 +94,9 @@ their sidecar), `raw/skills` and `wiki/` — traces are indexed only when
    feature-hashing embedder so the system works with zero keys; configure any
    OpenAI-compatible endpoint for real quality).
 2. **keyword** — Postgres `tsvector`('simple') + ILIKE fallback for CJK.
-3. **graph** — chunks mentioning entities whose name/alias matches the query.
+3. **graph** — chunks mentioning entities whose name/alias matches the query (live
+   at `as_of` when one is given), one row per chunk, ranked by how many matching
+   entities it mentions, then by their mention counts.
 4. **sag** — opt-in query-time event retrieval. A chunk is the phase-one event
    unit and `entity_mentions` is the event/entity join. Direct hits seed up to
    two `chunk → entity → chunk` rounds; rare/shared entities score the structural
