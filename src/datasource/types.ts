@@ -48,7 +48,12 @@ export interface DataSourceConnector {
   readonly config: DataSourceConfig;
   /** List the queryable units — tables, endpoints or metrics — with their fields. */
   introspect(): Promise<TableSchema[]>;
-  /** Run one read-only request in this source's dialect (SQL callers must guard it first). */
+  /**
+   * Run one read-only request in this source's dialect. A SQL connector has its
+   * database enforce that — one statement, in a read-only transaction that is
+   * always rolled back, under a timeout — and callers still pass the statement
+   * through the SQL guard first (`runSourceQuery`), for an early, readable refusal.
+   */
   query(statement: string, opts?: QueryOptions): Promise<QueryResult>;
   /** Distinct values of one column (entity linking); optional alias columns ride along. */
   sampleColumn(table: string, column: string, aliasColumns: string[], limit: number): Promise<{ value: string; aliases: string[] }[]>;
@@ -59,6 +64,18 @@ export interface DataSourceConnector {
 
 export const DEFAULT_MAX_ROWS = 200;
 export const DEFAULT_TIMEOUT_MS = 10_000;
+
+/**
+ * How long one call may run, in milliseconds: the call's own limit, else the
+ * source's, else the default. Never 0, which PostgreSQL and MySQL read as "no
+ * limit", and never past what their timeout settings accept.
+ */
+export function queryTimeoutMs(opts: QueryOptions, config: DataSourceConfig): number {
+  for (const ms of [opts.timeoutMs, config.timeoutMs]) {
+    if (typeof ms === 'number' && Number.isFinite(ms) && ms >= 1) return Math.min(Math.floor(ms), 2_147_483_647);
+  }
+  return DEFAULT_TIMEOUT_MS;
+}
 
 /** Clamp + JSON-sanitize driver rows (BigInt, Date, Buffer → JSON-safe). */
 export function normalizeRows(rows: Record<string, unknown>[], maxRows: number): { rows: Record<string, unknown>[]; truncated: boolean } {

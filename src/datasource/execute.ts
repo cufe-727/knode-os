@@ -1,17 +1,19 @@
 import { DataSourceKind, SourceDialect } from '../config.js';
-import { assertReadOnlySql, sqlStringLiteral } from './guard.js';
+import { assertReadOnlySql, sqlDialectForKind, sqlStringLiteral } from './guard.js';
 import { DataSourceRegistry } from './registry.js';
 import { QueryOptions, QueryResult } from './types.js';
 
 /**
  * The single entry point for running a statement against a configured source.
  *
- * Only the SQL dialect goes through the SQL guard; the others are read-only by
- * construction (an HTTP source can reach nothing but its declared endpoints,
- * PromQL cannot write, the object store is opened read-only). Routing this in
- * one place is what keeps a new connector from quietly bypassing the guard, or
- * from having SQL keyword rules applied to a PromQL expression that legitimately
- * contains one.
+ * Only the SQL dialect goes through the SQL guard, read by the lexical rules
+ * of the source's database; the others are read-only by construction (an HTTP
+ * source can reach nothing but its declared endpoints, PromQL cannot write,
+ * the object store is opened read-only). Routing this in one place is what
+ * keeps a new connector from quietly bypassing the guard, or from having SQL
+ * keyword rules applied to a PromQL expression that legitimately contains one.
+ * The guard only explains a refusal early: each SQL connector has its database
+ * enforce the same rules on the statement it is handed.
  */
 export async function runSourceQuery(
   registry: DataSourceRegistry,
@@ -20,7 +22,7 @@ export async function runSourceQuery(
   opts: QueryOptions = {},
 ): Promise<QueryResult> {
   const connector = registry.get(source);
-  if (connector.dialect === 'sql') assertReadOnlySql(statement);
+  if (connector.dialect === 'sql') assertReadOnlySql(statement, sqlDialectForKind(connector.kind));
   return connector.query(statement, opts);
 }
 
