@@ -91,14 +91,45 @@ struct GraphSettings: Codable, Equatable {
  * the adjacency that hover and the side panel read. Node sizes follow links
  * the way Obsidian's do: the global typed degree when the service sent it,
  * else what is in view. Each node has two sizes: `radius` is what the layout
- * keeps apart, `displayRadius` what is drawn.
+ * keeps apart, `displayRadius` what is drawn. The relations between a pair of
+ * nodes fold into one `Bundle`: one line on the canvas, one edge to click,
+ * one neighbour in the side panel; the layout still pulls along every
+ * relation (`linkSpecs`).
  */
 struct GraphScene {
     struct Neighbour {
         let node: GraphNode
+        /// The primary relation between them.
         let edge: GraphEdge
-        /// The edge leaves the node this neighbour belongs to.
+        /// The primary relation leaves the node this neighbour belongs to.
         let outgoing: Bool
+        /// Every distinct relation between them.
+        let bundle: Bundle
+    }
+
+    /**
+     * The relations between one pair of nodes. They are the distinct ones (a
+     * type once per direction, at its strongest reading), most specific first:
+     * the five coloured families, then other typed, then co-occurrence, each by
+     * weight. The first, the primary, gives the line its family and its ends.
+     */
+    struct Bundle: Identifiable {
+        /// The pair's ids in order, the same whichever way its relations run.
+        let id: String
+        /// The primary relation's source and target.
+        let a: String
+        let b: String
+        let relations: [GraphEdge]
+        /// The strongest relation's weight.
+        let weight: Double
+        /// A directed relation runs a → b.
+        let forward: Bool
+        /// A directed relation runs b → a.
+        let backward: Bool
+
+        var primary: GraphEdge { relations[0] }
+
+        static func id(_ x: String, _ y: String) -> String { x < y ? "\(x)|\(y)" : "\(y)|\(x)" }
     }
 
     private(set) var nodes: [GraphNode] = []
@@ -106,8 +137,11 @@ struct GraphScene {
     private(set) var byID: [String: GraphNode] = [:]
     /// Position in the service's ranking, what seeds the layout.
     private(set) var rank: [String: Int] = [:]
-    /// Strongest edge first.
+    /// One per neighbour, strongest first.
     private(set) var neighbours: [String: [Neighbour]] = [:]
+    /// One per pair of nodes in view, in the order their first relation came.
+    private(set) var bundles: [Bundle] = []
+    private var bundleIndex: [String: Int] = [:]
     private(set) var inViewDegree: [String: Int] = [:]
     /// Types in the reply with how many nodes each has, most first: the legend, before any type is hidden.
     private(set) var typeCounts: [(type: String, count: Int)] = []
@@ -154,11 +188,15 @@ struct GraphScene {
         for edge in edges {
             inViewDegree[edge.source, default: 0] += 1
             inViewDegree[edge.target, default: 0] += 1
-            guard let source = byID[edge.source], let target = byID[edge.target] else { continue }
-            neighbours[edge.source, default: []].append(Neighbour(node: target, edge: edge, outgoing: true))
-            neighbours[edge.target, default: []].append(Neighbour(node: source, edge: edge, outgoing: false))
         }
-        for key in neighbours.keys { neighbours[key]?.sort { $0.edge.weight > $1.edge.weight } }
+        bundles = Self.bundle(edges)
+        bundleIndex = Dictionary(bundles.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for bundle in bundles {
+            guard let a = byID[bundle.a], let b = byID[bundle.b] else { continue }
+            neighbours[bundle.a, default: []].append(Neighbour(node: b, edge: bundle.primary, outgoing: true, bundle: bundle))
+            neighbours[bundle.b, default: []].append(Neighbour(node: a, edge: bundle.primary, outgoing: false, bundle: bundle))
+        }
+        for key in neighbours.keys { neighbours[key]?.sort { $0.bundle.weight > $1.bundle.weight } }
         largest = Set(nodes.sorted { degree(of: $0) > degree(of: $1) }.prefix(12).map(\.id))
         let logs = nodes.map { log1p(Double(degree(of: $0))) }
         if let lo = logs.min(), let hi = logs.max() { logDegrees = lo...hi }
@@ -193,6 +231,81 @@ struct GraphScene {
     /// A node with its neighbours in view: what hover and selection light up.
     func highlight(around id: String) -> Set<String> {
         Set([id] + (neighbours[id]?.map(\.node.id) ?? []))
+    }
+
+    func bundle(_ id: String) -> Bundle? {
+        bundleIndex[id].map { bundles[$0] }
+    }
+
+    /// Fold relations into one bundle per pair of nodes, in the order each pair first appears.
+    static func bundle(_ edges: [GraphEdge]) -> [Bundle] {
+        func rank(_ edge: GraphEdge) -> Int {
+            edge.type == "co_occurs" ? 2 : GraphPalette.family(of: edge.type).id == GraphPalette.otherTyped.id ? 1 : 0
+        }
+        var order: [String] = []
+        var distinct: [String: [String: GraphEdge]] = [:]
+        for edge in edges {
+            let pair = Bundle.id(edge.source, edge.target)
+            // an undirected type is one relation whichever end it was written from
+            let key = GraphPalette.undirected.contains(edge.type) ? edge.type : "\(edge.type)|\(edge.source)"
+            if distinct[pair] == nil { order.append(pair) }
+            if let seen = distinct[pair]?[key], seen.weight >= edge.weight { continue }
+            distinct[pair, default: [:]][key] = edge
+        }
+        return order.map { pair in
+            let relations = distinct[pair]!.values.sorted { m, n in
+                rank(m) != rank(n) ? rank(m) < rank(n) : m.weight != n.weight ? m.weight > n.weight : m.type < n.type
+            }
+            let primary = relations[0]
+            let directed = relations.filter { !GraphPalette.undirected.contains($0.type) }
+            return Bundle(
+                id: pair, a: primary.source, b: primary.target, relations: relations,
+                weight: relations.map(\.weight).max() ?? 0,
+                forward: directed.contains { $0.source == primary.source },
+                backward: directed.contains { $0.source == primary.target }
+            )
+        }
+    }
+
+    /**
+     * The node under a point on screen: on its drawn disc or within 5 points
+     * of it, and always within 10 points of its centre; the nearest when
+     * several reach. Kept that tight so the edges between nodes stay easy to
+     * click. `position` says where a node is drawn.
+     */
+    func node(near point: CGPoint, scale: CGFloat, nodeSize: Double, position: (String) -> CGPoint?) -> GraphNode? {
+        var best: GraphNode?
+        var bestDistance = CGFloat.infinity
+        for node in nodes {
+            guard let p = position(node.id) else { continue }
+            let d = hypot(p.x - point.x, p.y - point.y)
+            let reach = max(10, max(displayRadius(of: node, nodeSize: nodeSize) * scale, 3) + 5)
+            if d <= reach && d < bestDistance {
+                best = node
+                bestDistance = d
+            }
+        }
+        return best
+    }
+
+    /// The bundle whose line passes nearest a point on screen, within `reach` points. `position` says where a node is drawn.
+    func bundle(near point: CGPoint, reach: CGFloat = 6, position: (String) -> CGPoint?) -> Bundle? {
+        var best: Bundle?
+        var bestDistance = reach
+        for bundle in bundles {
+            guard let a = position(bundle.a), let b = position(bundle.b) else { continue }
+            let dx = b.x - a.x
+            let dy = b.y - a.y
+            let length2 = dx * dx + dy * dy
+            guard length2 > 0 else { continue }
+            let u = max(0, min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / length2))
+            let d = hypot(point.x - (a.x + u * dx), point.y - (a.y + u * dy))
+            if d < bestDistance {
+                best = bundle
+                bestDistance = d
+            }
+        }
+        return best
     }
 
     func nodeSpecs(nodeSize: Double) -> [GraphSimulation.NodeSpec] {

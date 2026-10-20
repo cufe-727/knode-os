@@ -357,6 +357,13 @@ main { flex: 1; min-height: 0; overflow: hidden; display: flex; }
 .chip .dot.ring { box-sizing: border-box; width: 9px; height: 9px; border: 1.5px solid; background: #11151c; }
 .chip svg { flex: none; }
 .rel-swatch { display: inline-block; width: 10px; height: 2px; border-radius: 1px; margin-right: 5px; vertical-align: middle; }
+.entity-card .edge-ends { display: flex; flex-direction: column; gap: 2px; margin: 4px 0 6px; }
+.entity-card .rel { display: flex; flex-direction: column; gap: 2px; padding: 7px 0; border-top: 1px solid var(--border); }
+.entity-card .rel:first-child { border-top: 0; padding-top: 0; }
+.entity-card .rel:last-child { padding-bottom: 0; }
+.entity-card .rel-head { display: flex; align-items: center; gap: 6px; }
+.entity-card .rel-head .rel-swatch { width: 14px; height: 3px; margin-right: 0; flex: none; }
+.entity-card .rel-head .hint { margin-left: auto; white-space: nowrap; }
 .chip.off { opacity: 0.45; text-decoration: line-through; }
 .chip:hover { border-color: var(--accent); }
 .graph-settings { position: absolute; top: 10px; right: 10px; width: 260px; background: rgba(15, 17, 21, 0.9); border: 1px solid var(--border); border-radius: 10px; font-size: 12px; }

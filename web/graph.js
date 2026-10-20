@@ -9,10 +9,11 @@
  * `KnodeGraph.available` is false, so the app can say so instead of breaking.
  *
  * The look is "Glyph + glow": every node is a dark disc in a ring of its
- * type's colour with the type's icon inside, every relation takes its
- * family's colour and line pattern, and the `glow` setting adds a corona
- * around each node, light-blended relations and particles that flow along a
- * focused node's relations. The Mac app draws the same (GraphRenderer.swift). */
+ * type's colour with the type's icon inside; the relations between a pair of
+ * nodes draw as one edge in the colour and line pattern of the most specific
+ * one's family, and a click on the edge lists them all; the `glow` setting
+ * adds a corona around each node, light-blended edges and particles that flow
+ * along a focused node's edges. The Mac app draws the same (GraphRenderer.swift). */
 'use strict';
 
 const GRAPH_FONT = '-apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif';
@@ -36,8 +37,8 @@ class KnodeGraph {
   static FILTER_KEYS = ['hiddenTypes', 'hiddenRelations', 'hideOrphans', 'cooccur', 'minWeight'];
   static available = typeof d3 !== 'undefined' && d3 !== null;
 
-  /** How far from a node's centre, in screen pixels, a pointer still counts as on it. */
-  static HIT_PX = 18;
+  /** How far from a node's centre, in screen pixels, a pointer always counts as on it; past that, its disc and 5 px round it. */
+  static HIT_PX = 10;
   static ZOOM_EXTENT = [0.15, 8];
 
   /**
@@ -65,6 +66,50 @@ class KnodeGraph {
     return KnodeGraph.FAMILY_OF.get(type) ?? KnodeGraph.FAMILIES[5];
   }
 
+  /**
+   * The relations between one pair of nodes, folded into a bundle: drawn as
+   * one line, hit as one edge and listed as one neighbour, while the layout
+   * keeps every relation's own spring. A bundle's relations are the distinct
+   * ones (a type once per direction, at its strongest reading), most specific
+   * first: the five coloured families, then other typed, then co-occurrence,
+   * each by weight. The first, the primary, gives the line its family and
+   * its ends `a` → `b`; `forward` and `backward` say whether any directed
+   * relation runs a → b or b → a.
+   */
+  static bundleLinks(links) {
+    const rank = (l) => (l.co ? 2 : l.fam.id === 'other' ? 1 : 0);
+    const pairs = new Map();
+    for (const l of links) {
+      const key = l.source.id < l.target.id ? `${l.source.id}|${l.target.id}` : `${l.target.id}|${l.source.id}`;
+      let distinct = pairs.get(key);
+      if (!distinct) pairs.set(key, (distinct = new Map()));
+      // an undirected type is one relation whichever end it was written from
+      const id = l.directed ? `${l.type}|${l.source.id}` : l.type;
+      const seen = distinct.get(id);
+      if (!seen || l.weight > seen.weight) distinct.set(id, l);
+    }
+    const bundles = [];
+    for (const [id, distinct] of pairs) {
+      const relations = [...distinct.values()].sort((m, n) => rank(m) - rank(n) || n.weight - m.weight);
+      const primary = relations[0];
+      const a = primary.source, b = primary.target;
+      bundles.push({
+        id, a, b, relations, primary,
+        weight: Math.max(...relations.map((r) => r.weight)),
+        forward: relations.some((r) => r.directed && r.source === a),
+        backward: relations.some((r) => r.directed && r.source === b),
+        // where along the line its particles start, so neighbouring bundles do not pulse in step
+        phase: (bundles.length * 0.6180339887) % 1,
+      });
+    }
+    return bundles;
+  }
+
+  /** A relation's type as it reads in the panel and on the canvas. */
+  static relationName(l) {
+    return l.co ? 'co-occurs' : l.type.replace(/_/g, ' ');
+  }
+
   constructor(canvas, { colors = {}, settings = {} } = {}) {
     if (!KnodeGraph.available) throw new Error('d3 is not available');
     this.canvas = canvas;
@@ -84,10 +129,15 @@ class KnodeGraph {
     this.byId = new Map();
     this.nodes = [];
     this.links = [];
+    /** One per pair of nodes in view: what is drawn and clicked (see bundleLinks). */
+    this.bundles = [];
+    /** Node id → neighbour id → the bundle between them. */
     this.adj = new Map();
     this.largest = new Set();
     this.hover = null;
     this.selected = null;
+    this.hoverEdge = null;
+    this.selectedEdge = null;
     this.matches = null;
     this.mode = 'overview';
     this.handlers = {};
@@ -142,16 +192,26 @@ class KnodeGraph {
       });
     this.sel = d3.select(canvas).call(this.drag).call(this.zoom).on('dblclick.zoom', null);
 
+    // a node under the pointer wins; otherwise the nearest edge within reach
     this.onMove = (ev) => {
       const [x, y] = d3.pointer(ev, canvas);
       const n = this.nodeAt(x, y);
       if (n !== this.hover) this.setHover(n ? n.id : null);
+      const e = n ? null : this.edgeAt(x, y);
+      if (e !== this.hoverEdge) this.setHoverEdge(e ? e.id : null);
     };
-    this.onLeave = () => this.setHover(null);
+    this.onLeave = () => {
+      this.setHover(null);
+      this.setHoverEdge(null);
+    };
     this.onClick = (ev) => {
       const [x, y] = d3.pointer(ev, canvas);
       const n = this.nodeAt(x, y);
-      this.select(n ? n.id : null);
+      if (n) return this.select(n.id);
+      const e = this.edgeAt(x, y);
+      if (e) return this.selectEdge(e.id);
+      this.select(null);
+      this.selectEdge(null);
     };
     this.onDblClick = (ev) => {
       const [x, y] = d3.pointer(ev, canvas);
@@ -161,7 +221,9 @@ class KnodeGraph {
     this.onKey = (ev) => {
       if (ev.key !== 'Escape') return;
       this.setHover(null);
+      this.setHoverEdge(null);
       this.select(null);
+      this.selectEdge(null);
     };
     canvas.addEventListener('mousemove', this.onMove);
     canvas.addEventListener('mouseleave', this.onLeave);
@@ -228,24 +290,33 @@ class KnodeGraph {
       return o;
     });
     const objById = new Map(this.nodes.map((o) => [o.id, o]));
-    this.links = edges.map((e, i) => ({
+    this.links = edges.map((e) => ({
       source: objById.get(e.source), target: objById.get(e.target),
       type: e.type, weight: e.weight, description: e.description, co: e.type === 'co_occurs',
       fam: KnodeGraph.family(e.type), directed: !KnodeGraph.UNDIRECTED.has(e.type),
-      // where along the relation its particles start, so neighbouring relations do not pulse in step
-      phase: (i * 0.6180339887) % 1,
+      validFrom: e.validFrom ?? null, validTo: e.validTo ?? null,
     }));
-    this.adj = new Map();
     for (const o of this.nodes) o.inDegree = 0;
     for (const l of this.links) {
       l.source.inDegree++;
       l.target.inDegree++;
-      (this.adj.get(l.source.id) ?? this.adj.set(l.source.id, new Map()).get(l.source.id)).set(l.target.id, l);
-      (this.adj.get(l.target.id) ?? this.adj.set(l.target.id, new Map()).get(l.target.id)).set(l.source.id, l);
+    }
+    this.bundles = KnodeGraph.bundleLinks(this.links);
+    this.adj = new Map();
+    for (const b of this.bundles) {
+      (this.adj.get(b.a.id) ?? this.adj.set(b.a.id, new Map()).get(b.a.id)).set(b.b.id, b);
+      (this.adj.get(b.b.id) ?? this.adj.set(b.b.id, new Map()).get(b.b.id)).set(b.a.id, b);
     }
     this.sizeNodes();
     if (this.selected && !objById.has(this.selected.id)) this.select(null);
     if (this.hover && !objById.has(this.hover.id)) this.hover = null;
+    // a selected edge survives a refilter while its pair still has a relation in view, now with what is left of it
+    if (this.selectedEdge) {
+      const kept = this.bundles.find((b) => b.id === this.selectedEdge.id) ?? null;
+      this.selectedEdge = kept;
+      this.emit('selectEdge', kept);
+    }
+    if (this.hoverEdge) this.hoverEdge = this.bundles.find((b) => b.id === this.hoverEdge.id) ?? null;
     this.sim.nodes(this.nodes);
     this.sim.force('link').links(this.links);
     this.sim.alpha(alpha).restart();
@@ -322,20 +393,41 @@ class KnodeGraph {
     this.invalidate();
   }
 
+  /** Select a node, or none. A node and an edge are never selected together. */
   select(id) {
     const n = id ? this.byId.get(id) ?? null : null;
-    if (n === this.selected) return;
+    if (n === this.selected && !(n && this.selectedEdge)) return;
     this.selected = n;
+    if (n) this.selectedEdge = null;
     this.emit('select', n);
     this.invalidate();
   }
 
-  /** A node's neighbours in view, strongest edge first. */
+  /** Select the edge between a pair of nodes (a bundle id), or none. */
+  selectEdge(id) {
+    const b = id ? this.bundles.find((x) => x.id === id) ?? null : null;
+    if (b === this.selectedEdge) return;
+    this.selectedEdge = b;
+    if (b) this.selected = null;
+    this.emit('selectEdge', b);
+    this.invalidate();
+  }
+
+  setHoverEdge(id) {
+    const b = id ? this.bundles.find((x) => x.id === id) ?? null : null;
+    if (b === this.hoverEdge) return;
+    this.hoverEdge = b;
+    this.canvas.classList.toggle('over', Boolean(b || this.hover));
+    this.invalidate();
+  }
+
+  /** A node's neighbours in view, one per neighbour with every relation between them, strongest first. */
   neighbours(id) {
     const out = [];
-    for (const [other, l] of this.adj.get(id) ?? []) {
+    for (const [other, b] of this.adj.get(id) ?? []) {
       const node = this.byId.get(other);
-      if (node) out.push({ node, weight: l.weight, type: l.type, co: l.co, fam: l.fam, out: l.source.id === id });
+      const p = b.primary;
+      if (node) out.push({ node, bundle: b, relations: b.relations, weight: b.weight, type: p.type, co: p.co, fam: p.fam, out: p.source.id === id });
     }
     return out.sort((a, b) => b.weight - a.weight);
   }
@@ -350,9 +442,12 @@ class KnodeGraph {
     this.byId.clear();
     this.nodes = [];
     this.links = [];
+    this.bundles = [];
     this.adj.clear();
     this.hover = null;
     this.selected = null;
+    this.hoverEdge = null;
+    this.selectedEdge = null;
     this.matches = null;
     this.sim.nodes([]);
     this.sim.force('link').links([]);
@@ -422,13 +517,38 @@ class KnodeGraph {
     this.sel.transition().duration(400).call(this.zoom.transform, t);
   }
 
-  /** The node under a screen point, or null: within the hit distance, or within the drawn disc when that is larger. */
+  /**
+   * The node under a screen point, or null: on its drawn disc or within 5 px
+   * of it, and always within HIT_PX of its centre. Kept that tight so the
+   * edges between nodes stay easy to click.
+   */
   nodeAt(sx, sy) {
     if (!this.nodes.length) return null;
     const [x, y] = this.t.invert([sx, sy]);
-    const hit = KnodeGraph.HIT_PX / this.t.k;
-    const n = this.sim.find(x, y, Math.max(hit, 18 * this.settings.nodeSize));
-    return n && Math.hypot(n.x - x, n.y - y) <= Math.max(hit, n.r) ? n : null;
+    const k = this.t.k;
+    const reach = (n) => Math.max(KnodeGraph.HIT_PX / k, Math.max(n.r, 3 / k) + 5 / k);
+    const n = this.sim.find(x, y, Math.max(KnodeGraph.HIT_PX / k, 18 * this.settings.nodeSize + 5 / k));
+    return n && Math.hypot(n.x - x, n.y - y) <= reach(n) ? n : null;
+  }
+
+  /** The edge under a screen point: the bundle whose line passes nearest, within 6 px. */
+  edgeAt(sx, sy) {
+    const t = this.t;
+    let best = null;
+    let bestD = 6;
+    for (const b of this.bundles) {
+      const ax = t.applyX(b.a.x), ay = t.applyY(b.a.y);
+      const dx = t.applyX(b.b.x) - ax, dy = t.applyY(b.b.y) - ay;
+      const len2 = dx * dx + dy * dy;
+      if (!len2) continue;
+      const u = Math.max(0, Math.min(1, ((sx - ax) * dx + (sy - ay) * dy) / len2));
+      const d = Math.hypot(sx - (ax + u * dx), sy - (ay + u * dy));
+      if (d < bestD) {
+        best = b;
+        bestD = d;
+      }
+    }
+    return best;
   }
 
   invalidate() {
@@ -476,23 +596,29 @@ class KnodeGraph {
       pos.set(n.id, { n, x, y, r, on: x + r > -pad && x - r < w + pad && y + r > -pad && y - r < h + pad });
     }
 
-    // what stands out: a hovered or selected node with its neighbours, else the search matches
+    // what stands out: a hovered or selected node with its neighbours; with no node, a hovered or
+    // selected edge with its two ends; else the search matches
     const focus = this.hover ?? this.selected;
-    const hi = focus ? new Set([focus.id, ...(this.adj.get(focus.id)?.keys() ?? [])]) : this.matches;
-    const lit = (l) => (focus ? l.source.id === focus.id || l.target.id === focus.id : hi.has(l.source.id) && hi.has(l.target.id));
+    const edge = focus ? null : this.hoverEdge ?? this.selectedEdge;
+    const hi = focus ? new Set([focus.id, ...(this.adj.get(focus.id)?.keys() ?? [])])
+      : edge ? new Set([edge.a.id, edge.b.id]) : this.matches;
+    const lit = (bd) => (focus ? bd.a.id === focus.id || bd.b.id === focus.id : edge ? bd === edge : hi.has(bd.a.id) && hi.has(bd.b.id));
 
-    // relations, one stroke per style: thousands of strokes a frame became a few dozen
+    // one line per pair of nodes, one stroke per style: thousands of strokes a frame became a few dozen
     const zoomW = Math.max(0.75, Math.min(1.5, Math.sqrt(k))) * s.linkWidth;
     const rest = new Map(), bright = new Map(), chevrons = [], flows = [], mids = [];
-    for (const l of this.links) {
-      const a = pos.get(l.source.id), b = pos.get(l.target.id);
+    let chosen = null;
+    for (const bd of this.bundles) {
+      const a = pos.get(bd.a.id), b = pos.get(bd.b.id);
       if (!a.on && !b.on) continue;
+      // the primary relation gives the line its family, and its weight the line's strength
+      const l = bd.primary;
       const fam = l.fam;
-      const on = hi ? lit(l) : false;
+      const on = hi ? lit(bd) : false;
       let alpha = fam.id === 'cooccur' ? 0.03 + 0.03 * Math.min(1, l.weight / 6)
         : fam.id === 'other' ? 0.04 + 0.05 * Math.min(1, l.weight / 3)
         : (0.1 + 0.11 * Math.min(1, l.weight / 3)) * fam.boost;
-      // light-blended relations add up where they cross, so each starts fainter
+      // light-blended lines add up where they cross, so each starts fainter
       if (glow) alpha *= 0.8;
       if (hi) alpha = on ? (fam.id === 'cooccur' ? 0.4 : fam.id === 'other' ? 0.55 : 0.92) : alpha * 0.06;
       alpha = Math.round(alpha * 40) / 40;
@@ -502,17 +628,29 @@ class KnodeGraph {
       let bt = batches.get(key);
       if (!bt) batches.set(key, (bt = { color: fam.color, alpha, width, dash: fam.dash, segs: [] }));
       bt.segs.push(a.x, a.y, b.x, b.y);
+      if (bd === this.selectedEdge) chosen = { bd, a, b, width };
       const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-      if (on && focus) {
-        if (l.directed) chevrons.push({ l, a, b, mx, my, alpha: 1 });
-        if (!l.co) flows.push({ l, a, b });
-        mids.push({ l, x: mx, y: my + 9 });
-      } else if (s.arrows && !hi && l.directed && !l.co && k >= 0.7) {
-        // the arrows setting marks every directed relation, as quietly as the relation itself
-        chevrons.push({ l, a, b, mx, my, alpha: Math.min(0.6, alpha * 2.5) });
+      if (on && (focus || edge)) {
+        if (bd.forward || bd.backward) chevrons.push({ bd, a, b, alpha: 1 });
+        if (!l.co) flows.push({ bd, a, b });
+        // the relation names sit just below the middle, clear of a chevron there
+        mids.push({ bd, x: mx, y: my + 13 });
+      } else if (s.arrows && !hi && (bd.forward || bd.backward) && !l.co && k >= 0.7) {
+        // the arrows setting marks every directed edge, as quietly as the edge itself
+        chevrons.push({ bd, a, b, alpha: Math.min(0.6, alpha * 2.5) });
       }
     }
     if (glow) ctx.globalCompositeOperation = 'lighter';
+    // the selected edge lies on a soft band of its colour, picked out in either look
+    if (chosen) {
+      ctx.beginPath();
+      ctx.moveTo(chosen.a.x, chosen.a.y);
+      ctx.lineTo(chosen.b.x, chosen.b.y);
+      ctx.strokeStyle = rgba(chosen.bd.primary.fam.color, 0.28);
+      ctx.lineWidth = chosen.width + 6;
+      ctx.lineCap = 'round';
+      ctx.stroke();
+    }
     this.strokeBatches(rest);
     this.strokeBatches(bright);
 
@@ -550,9 +688,9 @@ class KnodeGraph {
     });
     for (const g of shown) this.drawNode(g, hi, glow);
 
-    const placed = this.drawLabels(pos, shown, focus, hi, glow, w, h);
-    if (focus && k >= 0.75) this.drawRelationNames(mids, placed, pos, hi, w, h);
-    // particles keep flowing while a node is focused with glow on
+    const placed = this.drawLabels(pos, shown, focus, edge, hi, glow, w, h);
+    if ((focus || edge) && k >= 0.75) this.drawRelationNames(mids, placed, pos, hi, edge, w, h);
+    // particles keep flowing while a node or an edge is focused with glow on
     if (moving) this.invalidate();
   }
 
@@ -596,17 +734,21 @@ class KnodeGraph {
     ctx.setLineDash([]);
   }
 
-  /** Light particles along focused relations: source to target, both ways for an undirected one. */
+  /** Light particles along focused edges: each way the edge's directed relations run, both ways when none is directed. */
   drawParticles(flows, time) {
     const ctx = this.ctx;
-    for (const { l, a, b } of flows) {
-      const both = !l.directed;
-      const n = both || l.weight > 2 ? 2 : 1;
-      const col = mixWhite(l.fam.color, 0.45);
+    for (const { bd, a, b } of flows) {
+      const ways = [];
+      if (bd.forward) ways.push(false);
+      if (bd.backward) ways.push(true);
+      if (!ways.length) ways.push(false, true);
+      // a strong one-way edge carries two particles
+      const n = ways.length === 1 && bd.weight > 2 ? 2 : ways.length;
+      const col = mixWhite(bd.primary.fam.color, 0.45);
       for (let i = 0; i < n; i++) {
-        const back = both && i === 1;
+        const back = ways[i % ways.length];
         for (let tail = 0; tail < 3; tail++) {
-          let p = (time * 0.22 + l.phase + i / n - tail * 0.018) % 1;
+          let p = (time * 0.22 + bd.phase + i / n - tail * 0.018) % 1;
           if (p < 0) p += 1;
           if (back) p = 1 - p;
           ctx.beginPath();
@@ -618,22 +760,32 @@ class KnodeGraph {
     }
   }
 
-  /** A chevron at the middle of a directed relation, pointing at its target. */
+  /** A chevron near the middle of an edge for each way its directed relations run; a two-way edge gets two, pointing apart. */
   drawChevrons(chevrons, glow) {
     const ctx = this.ctx;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.lineWidth = 1.6;
-    for (const { l, a, b, mx, my, alpha } of chevrons) {
-      const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1;
-      const ux = dx / d, uy = dy / d, sz = 4.5;
-      ctx.beginPath();
-      ctx.moveTo(mx - ux * sz - uy * sz, my - uy * sz + ux * sz);
-      ctx.lineTo(mx + ux * sz * 0.6, my + uy * sz * 0.6);
-      ctx.lineTo(mx - ux * sz + uy * sz, my - uy * sz - ux * sz);
-      ctx.strokeStyle = rgba(glow ? mixWhite(l.fam.color, 0.2) : l.fam.color, alpha);
-      ctx.stroke();
+    for (const { bd, a, b, alpha } of chevrons) {
+      ctx.strokeStyle = rgba(glow ? mixWhite(bd.primary.fam.color, 0.2) : bd.primary.fam.color, alpha);
+      const both = bd.forward && bd.backward;
+      // two-way chevrons sit well apart, clear of the relation names at the middle
+      if (bd.forward) this.chevron(a, b, both ? 0.64 : 0.5);
+      if (bd.backward) this.chevron(b, a, both ? 0.64 : 0.5);
     }
+  }
+
+  /** One chevron at fraction `t` of the way from `from` to `to`, pointing at `to`. */
+  chevron(from, to, t) {
+    const ctx = this.ctx;
+    const dx = to.x - from.x, dy = to.y - from.y, d = Math.hypot(dx, dy) || 1;
+    const ux = dx / d, uy = dy / d, sz = 4.5;
+    const mx = from.x + dx * t, my = from.y + dy * t;
+    ctx.beginPath();
+    ctx.moveTo(mx - ux * sz - uy * sz, my - uy * sz + ux * sz);
+    ctx.lineTo(mx + ux * sz * 0.6, my + uy * sz * 0.6);
+    ctx.lineTo(mx - ux * sz + uy * sz, my - uy * sz - ux * sz);
+    ctx.stroke();
   }
 
   /** A dark disc in a ring of the type's colour, the type's icon inside, and a gap round it so neighbours never merge. */
@@ -698,7 +850,9 @@ class KnodeGraph {
    * nodes are labelled; otherwise labels fade in with zoom and the twelve
    * largest nodes keep theirs however far out the view is.
    */
-  drawLabels(pos, shown, focus, hi, glow, w, h) {
+  drawLabels(pos, shown, focus, edge, hi, glow, w, h) {
+    // the focused node, or both ends of the focused edge, are always labelled, in bold
+    const held = (g) => (focus ? g.n.id === focus.id : Boolean(edge) && (g.n.id === edge.a.id || g.n.id === edge.b.id));
     const ctx = this.ctx;
     const k = this.t.k;
     const fade = Math.max(0, Math.min(1, (k - this.settings.textFade) / 0.35));
@@ -718,7 +872,7 @@ class KnodeGraph {
     ctx.lineJoin = 'round';
     for (const g of items) {
       if (!g || !g.on) continue;
-      const strong = (focus && g.n.id === focus.id) || (this.selected && g.n.id === this.selected.id) || this.largest.has(g.n.id);
+      const strong = held(g) || (this.selected && g.n.id === this.selected.id) || this.largest.has(g.n.id);
       const font = `${strong ? 600 : 500} 11px ${GRAPH_FONT}`;
       const text = g.n.name.length > 24 ? `${g.n.name.slice(0, 23)}…` : g.n.name;
       const tw = this.textWidth(text, font);
@@ -726,7 +880,7 @@ class KnodeGraph {
       const box = [g.x - tw / 2 - 2, top, g.x + tw / 2 + 2, top + 14];
       if (box[0] < 2 || box[2] > w - 2 || box[3] > h - 2) continue;
       if (placed.some((b) => b[0] < box[2] && b[2] > box[0] && b[1] < box[3] && b[3] > box[1])) continue;
-      if (!(focus && g.n.id === focus.id) && this.coversNode(box, pos, g.n.id, hi)) continue;
+      if (!held(g) && this.coversNode(box, pos, g.n.id, hi)) continue;
       placed.push(box);
       ctx.globalAlpha = hi || this.largest.has(g.n.id) ? 1 : fade;
       ctx.font = font;
@@ -745,15 +899,23 @@ class KnodeGraph {
     return placed;
   }
 
-  /** The relation name on a focused node's strongest typed relations, where it fits. */
-  drawRelationNames(mids, placed, pos, hi, w, h) {
+  /**
+   * Relation names on lit edges, where they fit. A focused edge shows all of
+   * its relations; with a focused node, its strongest edges show their
+   * primary relation and how many more they hold.
+   */
+  drawRelationNames(mids, placed, pos, hi, edge, w, h) {
     const ctx = this.ctx;
     const font = `500 10px ${GRAPH_FONT}`;
-    const items = mids.filter((m) => !m.l.co && m.l.fam.id !== 'other').sort((a, b) => b.l.weight - a.l.weight).slice(0, 14);
+    const named = (bd) => bd.relations.length > 1 || (!bd.primary.co && bd.primary.fam.id !== 'other');
+    const items = edge ? mids : mids.filter((m) => named(m.bd)).sort((p, q) => q.bd.weight - p.bd.weight).slice(0, 14);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     for (const m of items) {
-      const text = m.l.type.replace(/_/g, ' ');
+      const names = m.bd.relations.map((r) => KnodeGraph.relationName(r));
+      const text = edge
+        ? names.length > 3 ? `${names.slice(0, 3).join(' · ')} +${names.length - 3}` : names.join(' · ')
+        : names.length > 1 ? `${names[0]} +${names.length - 1}` : names[0];
       const tw = this.textWidth(text, font);
       const box = [m.x - tw / 2 - 3, m.y - 7, m.x + tw / 2 + 3, m.y + 7];
       if (box[0] < 2 || box[2] > w - 2 || box[1] < 2 || box[3] > h - 2) continue;

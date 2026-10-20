@@ -34,12 +34,14 @@ private enum TypeSymbols {
  * One frame of the graph in the "Glyph + glow" look, the same as the web
  * canvas (web/graph.js): every node is a dark disc in a ring of its type's
  * colour with the type's icon inside and a canvas-coloured gap round it, so
- * neighbours never merge; every relation takes its family's colour and line
- * pattern; a focused node's relations go full strength, with chevrons for
- * direction and their names where they fit. `settings.glow` adds a deep blue
- * field, a corona round each disc (coronas add up, so a dense cluster
- * brightens instead of clotting), light-blended relations and particles that
- * flow along the focused relations.
+ * neighbours never merge. The relations between a pair of nodes draw as one
+ * line (`GraphScene.Bundle`) in the colour and pattern of the most specific
+ * one's family. A focused node's edges, or a focused edge, go full strength,
+ * with chevrons for each way their relations run and their names where they
+ * fit; a selected edge lies on a soft band of its colour. `settings.glow`
+ * adds a deep blue field, a corona round each disc (coronas add up, so a
+ * dense cluster brightens instead of clotting), light-blended lines and
+ * particles that flow along the focused edges.
  *
  * Everything is drawn in screen points, so strokes, icons and labels keep
  * their size at any zoom. Nodes are drawn at `GraphScene.displayRadius`; the
@@ -50,13 +52,15 @@ private enum TypeSymbols {
 struct GraphRenderer {
     var scene: GraphScene
     var nodes: [GraphSimulation.Node]
-    var links: [GraphSimulation.Link]
     var settings: GraphSettings
     var scale: CGFloat
     /// Where the world's origin sits, relative to the canvas centre.
     var pan: CGSize
     var hoveredID: String?
     var selectedID: String?
+    /// Bundle ids, focused when no node is.
+    var hoveredEdgeID: String? = nil
+    var selectedEdgeID: String? = nil
     /// Seconds: where the particles are.
     var time: Double
     var reduceMotion: Bool
@@ -74,6 +78,11 @@ struct GraphRenderer {
         Text(text).font(.system(size: size, weight: strong ? .semibold : .medium))
     }
 
+    /// A relation's type as it reads on the canvas and in the side panel.
+    nonisolated static func relationName(_ type: String) -> String {
+        type == "co_occurs" ? "co-occurs" : type.replacingOccurrences(of: "_", with: " ")
+    }
+
     private struct Spot {
         let node: GraphSimulation.Node
         let point: CGPoint
@@ -85,6 +94,18 @@ struct GraphRenderer {
         let family: String
         let alpha: Int
         let width: Int
+    }
+
+    private struct Lit {
+        let bundle: GraphScene.Bundle
+        let a: CGPoint
+        let b: CGPoint
+        let index: Int
+    }
+
+    /// Where the world point of a node is on screen, for hit testing against what is drawn.
+    static func point(of node: GraphSimulation.Node, scale: CGFloat, pan: CGSize, size: CGSize) -> CGPoint {
+        CGPoint(x: size.width / 2 + pan.width + node.x * scale, y: size.height / 2 + pan.height + node.y * scale)
     }
 
     /// Draws the frame; whether anything on it moves by itself, so the timeline keeps running.
@@ -108,35 +129,38 @@ struct GraphRenderer {
         var spotByID: [String: Spot] = [:]
         for spot in spots { spotByID[spot.node.id] = spot }
 
-        // what stands out: a hovered or selected node with its neighbours
+        // what stands out: a hovered or selected node with its neighbours; with no node, a hovered or selected edge with its ends
         let focus = (hoveredID ?? selectedID).flatMap { scene.byID[$0] == nil ? nil : $0 }
-        let highlight = focus.map { scene.highlight(around: $0) }
+        let edge = focus == nil ? (hoveredEdgeID ?? selectedEdgeID).flatMap { scene.bundle($0) } : nil
+        let highlight: Set<String>? = focus.map { scene.highlight(around: $0) } ?? edge.map { [$0.a, $0.b] }
         func dimmed(_ id: String) -> Bool { highlight.map { !$0.contains(id) } ?? false }
 
-        // relations, one stroke per style: a few dozen strokes a frame instead of thousands
+        // one line per pair of nodes, one stroke per style: a few dozen strokes a frame instead of thousands
         let zoomWidth = min(1.5, max(0.75, Double(k).squareRoot())) * settings.linkWidth
         var rest: [Batch: Path] = [:]
         var bright: [Batch: Path] = [:]
-        var chevrons: [(family: GraphPalette.Family, a: CGPoint, b: CGPoint, alpha: Double)] = []
-        var flows: [(link: GraphSimulation.Link, family: GraphPalette.Family, a: CGPoint, b: CGPoint, phase: Double)] = []
-        var middles: [(link: GraphSimulation.Link, point: CGPoint)] = []
-        for (i, link) in links.enumerated() {
-            let a = spots[link.a]
-            let b = spots[link.b]
-            if !a.on && !b.on { continue }
-            let family = GraphPalette.family(of: link.type)
-            let lit = focus != nil && (a.node.id == focus || b.node.id == focus)
+        var chevrons: [(lit: Lit, alpha: Double)] = []
+        var flows: [Lit] = []
+        var middles: [(bundle: GraphScene.Bundle, point: CGPoint)] = []
+        var chosen: (a: CGPoint, b: CGPoint, family: GraphPalette.Family, width: Double)?
+        for (i, bundle) in scene.bundles.enumerated() {
+            guard let a = spotByID[bundle.a], let b = spotByID[bundle.b], a.on || b.on else { continue }
+            // the primary relation gives the line its family, and its weight the line's strength
+            let primary = bundle.primary
+            let family = GraphPalette.family(of: primary.type)
+            let coOccurs = primary.type == "co_occurs"
+            let lit = focus.map { bundle.a == $0 || bundle.b == $0 } ?? (edge.map { $0.id == bundle.id } ?? false)
             var alpha: Double = switch family.id {
-            case GraphPalette.cooccurrence.id: 0.03 + 0.03 * min(1, link.weight / 6)
-            case GraphPalette.otherTyped.id: 0.04 + 0.05 * min(1, link.weight / 3)
-            default: (0.1 + 0.11 * min(1, link.weight / 3)) * family.boost
+            case GraphPalette.cooccurrence.id: 0.03 + 0.03 * min(1, primary.weight / 6)
+            case GraphPalette.otherTyped.id: 0.04 + 0.05 * min(1, primary.weight / 3)
+            default: (0.1 + 0.11 * min(1, primary.weight / 3)) * family.boost
             }
-            // light-blended relations add up where they cross, so each starts fainter
+            // light-blended lines add up where they cross, so each starts fainter
             if glow { alpha *= 0.8 }
             if highlight != nil {
                 alpha = lit ? (family.id == GraphPalette.cooccurrence.id ? 0.4 : family.id == GraphPalette.otherTyped.id ? 0.55 : 0.92) : alpha * 0.06
             }
-            let width = (link.coOccurs ? 0.9 : 0.75 + 0.2 * min(4, link.weight)) * (lit ? 1.35 : 1) * zoomWidth
+            let width = (coOccurs ? 0.9 : 0.75 + 0.2 * min(4, primary.weight)) * (lit ? 1.35 : 1) * zoomWidth
             let key = Batch(family: family.id, alpha: Int((alpha * 40).rounded()), width: Int((width * 4).rounded()))
             if lit {
                 bright[key, default: Path()].move(to: a.point)
@@ -145,18 +169,27 @@ struct GraphRenderer {
                 rest[key, default: Path()].move(to: a.point)
                 rest[key, default: Path()].addLine(to: b.point)
             }
-            let directed = !GraphPalette.undirected.contains(link.type)
+            if bundle.id == selectedEdgeID { chosen = (a.point, b.point, family, width) }
+            let directed = bundle.forward || bundle.backward
+            let item = Lit(bundle: bundle, a: a.point, b: b.point, index: i)
             if lit {
-                if directed { chevrons.append((family, a.point, b.point, 1)) }
-                if !link.coOccurs { flows.append((link, family, a.point, b.point, (Double(i) * 0.6180339887).truncatingRemainder(dividingBy: 1))) }
-                middles.append((link, CGPoint(x: (a.point.x + b.point.x) / 2, y: (a.point.y + b.point.y) / 2 + 9)))
-            } else if settings.arrows && highlight == nil && directed && !link.coOccurs && k >= 0.7 {
-                // the arrows setting marks every directed relation, as quietly as the relation itself
-                chevrons.append((family, a.point, b.point, min(0.6, alpha * 2.5)))
+                if directed { chevrons.append((item, 1)) }
+                if !coOccurs { flows.append(item) }
+                // the relation names sit just below the middle, clear of a chevron there
+                middles.append((bundle, CGPoint(x: (a.point.x + b.point.x) / 2, y: (a.point.y + b.point.y) / 2 + 13)))
+            } else if settings.arrows && highlight == nil && directed && !coOccurs && k >= 0.7 {
+                // the arrows setting marks every directed edge, as quietly as the edge itself
+                chevrons.append((item, min(0.6, alpha * 2.5)))
             }
         }
         var light = context
         if glow { light.blendMode = .plusLighter }
+        if let chosen {
+            var band = Path()
+            band.move(to: chosen.a)
+            band.addLine(to: chosen.b)
+            light.stroke(band, with: .color(chosen.family.rgb.color(0.28)), style: StrokeStyle(lineWidth: chosen.width + 6, lineCap: .round))
+        }
         stroke(rest, in: light)
         stroke(bright, in: light)
 
@@ -198,9 +231,9 @@ struct GraphRenderer {
             drawNode(spot, type: type, icon: icons[type], dim: dimmed(spot.node.id), glow: glow, in: context)
         }
 
-        var placed = drawLabels(spots: spots, spotByID: spotByID, shown: shown, focus: focus, highlight: highlight, glow: glow, size: size, in: context)
-        if focus != nil && k >= 0.75 {
-            drawRelationNames(middles, placed: &placed, spots: shown, highlight: highlight, size: size, in: context)
+        var placed = drawLabels(spots: spots, spotByID: spotByID, shown: shown, focus: focus, edge: edge, highlight: highlight, glow: glow, size: size, in: context)
+        if (focus != nil || edge != nil) && k >= 0.75 {
+            drawRelationNames(middles, placed: &placed, spots: shown, highlight: highlight, all: edge != nil, size: size, in: context)
         }
         return moving
     }
@@ -242,17 +275,24 @@ struct GraphRenderer {
         }
     }
 
-    /// Light particles along focused relations: source to target, both ways for an undirected one.
-    private func drawParticles(_ flows: [(link: GraphSimulation.Link, family: GraphPalette.Family, a: CGPoint, b: CGPoint, phase: Double)], in context: GraphicsContext, time: Double) {
+    /// Light particles along focused edges: each way the edge's directed relations run, both ways when none is directed.
+    private func drawParticles(_ flows: [Lit], in context: GraphicsContext, time: Double) {
         var heads: [String: Path] = [:]
         var tails: [String: (near: Path, far: Path)] = [:]
         for flow in flows {
-            let both = GraphPalette.undirected.contains(flow.link.type)
-            let count = both || flow.link.weight > 2 ? 2 : 1
+            let bundle = flow.bundle
+            let family = GraphPalette.family(of: bundle.primary.type).id
+            var ways: [Bool] = []
+            if bundle.forward { ways.append(false) }
+            if bundle.backward { ways.append(true) }
+            if ways.isEmpty { ways = [false, true] }
+            // a strong one-way edge carries two particles
+            let count = ways.count == 1 && bundle.weight > 2 ? 2 : ways.count
+            let phase = (Double(flow.index) * 0.6180339887).truncatingRemainder(dividingBy: 1)
             for i in 0..<count {
-                let back = both && i == 1
+                let back = ways[i % ways.count]
                 for tail in 0..<3 {
-                    var p = (time * 0.22 + flow.phase + Double(i) / Double(count) - Double(tail) * 0.018).truncatingRemainder(dividingBy: 1)
+                    var p = (time * 0.22 + phase + Double(i) / Double(count) - Double(tail) * 0.018).truncatingRemainder(dividingBy: 1)
                     if p < 0 { p += 1 }
                     if back { p = 1 - p }
                     let x = flow.a.x + (flow.b.x - flow.a.x) * p
@@ -260,9 +300,9 @@ struct GraphRenderer {
                     let r: CGFloat = tail == 0 ? 1.8 : 1.3
                     let dot = CGRect(x: x - r, y: y - r, width: r * 2, height: r * 2)
                     switch tail {
-                    case 0: heads[flow.family.id, default: Path()].addEllipse(in: dot)
-                    case 1: tails[flow.family.id, default: (Path(), Path())].near.addEllipse(in: dot)
-                    default: tails[flow.family.id, default: (Path(), Path())].far.addEllipse(in: dot)
+                    case 0: heads[family, default: Path()].addEllipse(in: dot)
+                    case 1: tails[family, default: (Path(), Path())].near.addEllipse(in: dot)
+                    default: tails[family, default: (Path(), Path())].far.addEllipse(in: dot)
                     }
                 }
             }
@@ -277,25 +317,34 @@ struct GraphRenderer {
         }
     }
 
-    /// A chevron at the middle of a directed relation, pointing at its target.
-    private func drawChevrons(_ chevrons: [(family: GraphPalette.Family, a: CGPoint, b: CGPoint, alpha: Double)], in context: GraphicsContext, glow: Bool) {
+    /// A chevron near the middle of an edge for each way its directed relations run; a two-way edge gets two, pointing apart.
+    private func drawChevrons(_ chevrons: [(lit: Lit, alpha: Double)], in context: GraphicsContext, glow: Bool) {
         let style = StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round)
-        for chevron in chevrons {
-            let dx = chevron.b.x - chevron.a.x
-            let dy = chevron.b.y - chevron.a.y
-            let d = max(hypot(dx, dy), 1)
-            let ux = dx / d
-            let uy = dy / d
-            let s: CGFloat = 4.5
-            let mx = (chevron.a.x + chevron.b.x) / 2
-            let my = (chevron.a.y + chevron.b.y) / 2
-            var path = Path()
-            path.move(to: CGPoint(x: mx - ux * s - uy * s, y: my - uy * s + ux * s))
-            path.addLine(to: CGPoint(x: mx + ux * s * 0.6, y: my + uy * s * 0.6))
-            path.addLine(to: CGPoint(x: mx - ux * s + uy * s, y: my - uy * s - ux * s))
-            let rgb = glow ? chevron.family.rgb.lighter(0.2) : chevron.family.rgb
-            context.stroke(path, with: .color(rgb.color(chevron.alpha)), style: style)
+        for (lit, alpha) in chevrons {
+            let family = GraphPalette.family(of: lit.bundle.primary.type)
+            let shading = GraphicsContext.Shading.color((glow ? family.rgb.lighter(0.2) : family.rgb).color(alpha))
+            // two-way chevrons sit well apart, clear of the relation names at the middle
+            let both = lit.bundle.forward && lit.bundle.backward
+            if lit.bundle.forward { context.stroke(chevron(from: lit.a, to: lit.b, at: both ? 0.64 : 0.5), with: shading, style: style) }
+            if lit.bundle.backward { context.stroke(chevron(from: lit.b, to: lit.a, at: both ? 0.64 : 0.5), with: shading, style: style) }
         }
+    }
+
+    /// One chevron at fraction `t` of the way from `from` to `to`, pointing at `to`.
+    private func chevron(from: CGPoint, to: CGPoint, at t: CGFloat) -> Path {
+        let dx = to.x - from.x
+        let dy = to.y - from.y
+        let d = max(hypot(dx, dy), 1)
+        let ux = dx / d
+        let uy = dy / d
+        let s: CGFloat = 4.5
+        let mx = from.x + dx * t
+        let my = from.y + dy * t
+        var path = Path()
+        path.move(to: CGPoint(x: mx - ux * s - uy * s, y: my - uy * s + ux * s))
+        path.addLine(to: CGPoint(x: mx + ux * s * 0.6, y: my + uy * s * 0.6))
+        path.addLine(to: CGPoint(x: mx - ux * s + uy * s, y: my - uy * s - ux * s))
+        return path
     }
 
     /// A dark disc in a ring of the type's colour, the type's icon inside, and a gap round it so neighbours never merge.
@@ -348,18 +397,23 @@ struct GraphRenderer {
 
     /**
      * Labels under their nodes, most important first, each skipped when an
-     * earlier label or another node holds the spot. With a focus, it and its
-     * neighbours are labelled; otherwise labels fade in with zoom and the
-     * twelve largest nodes keep theirs however far out the view is.
+     * earlier label or another node holds the spot. A focused node and its
+     * neighbours are labelled, or a focused edge's two ends; otherwise labels
+     * fade in with zoom and the twelve largest nodes keep theirs however far
+     * out the view is.
      */
-    private func drawLabels(spots: [Spot], spotByID: [String: Spot], shown: [Spot], focus: String?, highlight: Set<String>?, glow: Bool, size: CGSize, in context: GraphicsContext) -> [CGRect] {
+    private func drawLabels(spots: [Spot], spotByID: [String: Spot], shown: [Spot], focus: String?, edge: GraphScene.Bundle?, highlight: Set<String>?, glow: Bool, size: CGSize, in context: GraphicsContext) -> [CGRect] {
         let fade = max(0, min(1, (Double(scale) - settings.textFade) / 0.35))
+        // the focused node, or both ends of the focused edge, are always labelled, in bold
+        func held(_ id: String) -> Bool { focus.map { $0 == id } ?? (edge.map { $0.a == id || $0.b == id } ?? false) }
         var items: [Spot]
         if let focus, let spot = spotByID[focus] {
             let neighbours = (scene.neighbours[focus] ?? [])
-                .map { (id: $0.node.id, rank: $0.edge.weight + ($0.edge.type == "co_occurs" ? 0 : 2)) }
+                .map { (id: $0.node.id, rank: $0.bundle.weight + ($0.edge.type == "co_occurs" ? 0 : 2)) }
                 .sorted { $0.rank > $1.rank }
             items = [spot] + neighbours.compactMap { spotByID[$0.id] }
+        } else if let edge {
+            items = [edge.a, edge.b].compactMap { spotByID[$0] }
         } else {
             items = shown.filter { scene.largest.contains($0.node.id) || fade >= 0.05 }
                 .sorted { scene.degree(ofID: $0.node.id) > scene.degree(ofID: $1.node.id) }
@@ -368,13 +422,13 @@ struct GraphRenderer {
         var drawn: [(text: String, strong: Bool, point: CGPoint, alpha: Double)] = []
         for spot in items where spot.on {
             guard let node = scene.byID[spot.node.id] else { continue }
-            let strong = spot.node.id == focus || spot.node.id == selectedID || scene.largest.contains(spot.node.id)
+            let strong = held(spot.node.id) || spot.node.id == selectedID || scene.largest.contains(spot.node.id)
             let text = node.name.count > 24 ? String(node.name.prefix(23)) + "…" : node.name
             let width = metrics.width(of: text, size: 11, strong: strong, in: context)
             let box = CGRect(x: spot.point.x - width / 2 - 2, y: spot.point.y + spot.r + 3, width: width + 4, height: 14)
             if box.minX < 2 || box.maxX > size.width - 2 || box.maxY > size.height - 2 { continue }
             if placed.contains(where: { $0.intersects(box) }) { continue }
-            if spot.node.id != focus && coversNode(box, spots: shown, ownID: spot.node.id, highlight: highlight) { continue }
+            if !held(spot.node.id) && coversNode(box, spots: shown, ownID: spot.node.id, highlight: highlight) { continue }
             placed.append(box)
             drawn.append((text, strong, CGPoint(x: spot.point.x, y: box.midY), highlight != nil || scene.largest.contains(spot.node.id) ? 1 : fade))
         }
@@ -389,14 +443,22 @@ struct GraphRenderer {
         return placed
     }
 
-    /// The relation name on a focused node's strongest typed relations, where it fits.
-    private func drawRelationNames(_ middles: [(link: GraphSimulation.Link, point: CGPoint)], placed: inout [CGRect], spots: [Spot], highlight: Set<String>?, size: CGSize, in context: GraphicsContext) {
-        let named = middles
-            .filter { !$0.link.coOccurs && GraphPalette.family(of: $0.link.type).id != GraphPalette.otherTyped.id }
-            .sorted { $0.link.weight > $1.link.weight }
-            .prefix(14)
-        for item in named {
-            let text = item.link.type.replacingOccurrences(of: "_", with: " ")
+    /**
+     * Relation names on lit edges, where they fit. A focused edge (`all`)
+     * shows every one of its relations; with a focused node, its strongest
+     * edges show their primary relation and how many more they hold.
+     */
+    private func drawRelationNames(_ middles: [(bundle: GraphScene.Bundle, point: CGPoint)], placed: inout [CGRect], spots: [Spot], highlight: Set<String>?, all: Bool, size: CGSize, in context: GraphicsContext) {
+        func named(_ bundle: GraphScene.Bundle) -> Bool {
+            bundle.relations.count > 1
+                || (bundle.primary.type != "co_occurs" && GraphPalette.family(of: bundle.primary.type).id != GraphPalette.otherTyped.id)
+        }
+        let items = all ? Array(middles) : Array(middles.filter { named($0.bundle) }.sorted { $0.bundle.weight > $1.bundle.weight }.prefix(14))
+        for item in items {
+            let names = item.bundle.relations.map { Self.relationName($0.type) }
+            let text = all
+                ? (names.count > 3 ? names.prefix(3).joined(separator: " · ") + " +\(names.count - 3)" : names.joined(separator: " · "))
+                : (names.count > 1 ? "\(names[0]) +\(names.count - 1)" : names[0])
             let width = metrics.width(of: text, size: 10, strong: false, in: context)
             let box = CGRect(x: item.point.x - width / 2 - 3, y: item.point.y - 7, width: width + 6, height: 14)
             if box.minX < 2 || box.maxX > size.width - 2 || box.minY < 2 || box.maxY > size.height - 2 { continue }

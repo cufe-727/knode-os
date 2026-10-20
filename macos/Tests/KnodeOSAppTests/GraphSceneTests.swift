@@ -74,6 +74,61 @@ final class GraphSceneTests: XCTestCase {
         XCTAssertEqual(scene.linkSpecs.map(\.type), ["works_at", "works_at", "works_at"])
     }
 
+    func testTheRelationsBetweenOnePairFoldIntoOneEdge() {
+        let pair = GraphResponse(
+            nodes: [node("a", "organization", degree: 4), node("b", "organization", degree: 2), node("c", "product")],
+            edges: [
+                edge("a", "b", "works_at", weight: 2),
+                edge("b", "a", "invested_in", weight: 1.5),
+                edge("a", "b", "co_occurs", weight: 3),
+                edge("a", "b", "works_at", weight: 0.5),
+                edge("b", "a", "related_to", weight: 1),
+                edge("a", "b", "related_to", weight: 0.8),
+                edge("a", "c", "produces", weight: 1),
+            ],
+            chunks: [],
+            claims: nil
+        )
+        let scene = GraphScene(response: pair, settings: GraphSettings())
+        XCTAssertEqual(scene.bundles.count, 2)
+        let ab = scene.bundle(GraphScene.Bundle.id("b", "a"))!
+        // a type once per direction at its strongest reading, an undirected type once either way, most specific first
+        XCTAssertEqual(ab.relations.map(\.type), ["works_at", "invested_in", "related_to", "co_occurs"])
+        XCTAssertEqual(ab.relations.first?.weight, 2)
+        XCTAssertEqual(ab.relations.first { $0.type == "related_to" }?.weight, 1)
+        XCTAssertEqual([ab.a, ab.b], ["a", "b"])
+        XCTAssertTrue(ab.forward)
+        XCTAssertTrue(ab.backward)
+        XCTAssertEqual(ab.weight, 3)
+        // one neighbour per pair, carrying every relation between them
+        XCTAssertEqual(scene.neighbours["a"]?.map(\.node.id), ["b", "c"])
+        XCTAssertEqual(scene.neighbours["a"]?.first?.bundle.relations.count, 4)
+        XCTAssertEqual(scene.neighbours["b"]?.map(\.node.id), ["a"])
+        XCTAssertEqual(scene.neighbours["b"]?.first?.outgoing, false)
+        // the layout still pulls along every relation
+        XCTAssertEqual(scene.linkSpecs.count, 7)
+        // hiding capital leaves the pair what is left of it, running one way only
+        var settings = GraphSettings()
+        settings.hiddenRelations = ["capital"]
+        let narrowed = GraphScene(response: pair, settings: settings).bundle(ab.id)!
+        XCTAssertEqual(narrowed.relations.map(\.type), ["works_at", "related_to", "co_occurs"])
+        XCTAssertFalse(narrowed.backward)
+    }
+
+    func testThePointerFindsANodeOnItsDiscElseTheNearestEdge() {
+        let scene = GraphScene(response: reply, settings: GraphSettings())
+        // a square in screen points: a–b along the top, c–d along the bottom, b–c across, a–c down the left
+        let at: [String: CGPoint] = ["a": CGPoint(x: 0, y: 0), "b": CGPoint(x: 100, y: 0), "c": CGPoint(x: 0, y: 100), "d": CGPoint(x: 100, y: 100), "lone": CGPoint(x: 500, y: 500)]
+        let position = { (id: String) in at[id] }
+        // a is drawn at 18 points: its disc and 5 points round it count, no further
+        XCTAssertEqual(scene.node(near: CGPoint(x: 22, y: 0), scale: 1, nodeSize: 1, position: position)?.id, "a")
+        XCTAssertNil(scene.node(near: CGPoint(x: 50, y: 4), scale: 1, nodeSize: 1, position: position))
+        // off every node, the line passing nearest, within 6 points
+        XCTAssertEqual(scene.bundle(near: CGPoint(x: 50, y: 4), position: position)?.id, GraphScene.Bundle.id("a", "b"))
+        XCTAssertNil(scene.bundle(near: CGPoint(x: 50, y: 9), position: position))
+        XCTAssertEqual(scene.bundle(near: CGPoint(x: 60, y: 103), position: position)?.id, GraphScene.Bundle.id("c", "d"))
+    }
+
     func testEveryRelationTypeHasAFamily() {
         XCTAssertEqual(GraphPalette.family(of: "supplies_to").id, "value")
         XCTAssertEqual(GraphPalette.family(of: "subsidiary_of").id, "structure")

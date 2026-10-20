@@ -1894,6 +1894,7 @@ function ensureGraph() {
   }
   const g = new KnodeGraph($('#graph-canvas'), { colors: ENTITY_COLORS, settings: graphState.settings });
   g.on('select', (n) => renderGraphSide(n));
+  g.on('selectEdge', (b) => renderGraphSide(null, b));
   g.on('open', (n) => loadGraph(n.name));
   g.on('stats', (s) => paintGraphCaption(s));
   graphState.graph = g;
@@ -2082,9 +2083,10 @@ $('#gs-reset').addEventListener('click', () => {
 
 /**
  * The panel beside the canvas: the selected node with its neighbours and
- * claims, or, with nothing selected, the top of the result.
+ * claims, the selected edge with each distinct relationship it holds, or,
+ * with nothing selected, the top of the result.
  */
-function renderGraphSide(node) {
+function renderGraphSide(node, edge = null) {
   const side = $('#graph-side');
   const res = graphState.res;
   const g = graphState.graph;
@@ -2108,6 +2110,37 @@ function renderGraphSide(node) {
     .map((cl) => `<div class="hint">◈ ${esc(cl.statement.slice(0, 120))} <span class="mono">[${esc(cl.status)}]</span></div>`)
     .join('');
   const pill = (type) => `<span class="tpill" data-type="${esc(type)}">${esc(type)}</span>`;
+  const relationList = (relations) => {
+    const names = relations.map((r) => esc(KnodeGraph.relationName(r)));
+    return names.length > 2 ? `${names.slice(0, 2).join(' · ')} +${names.length - 2}` : names.join(' · ');
+  };
+
+  if (edge) {
+    const n = edge.relations.length;
+    const rows = edge.relations.map((r) => {
+      // a directed relation reads source → target; an undirected one joins the two ends
+      const way = r.directed ? `${esc(r.source.name)} → ${esc(r.target.name)}` : `${esc(edge.a.name)} ↔ ${esc(edge.b.name)}`;
+      const when = r.validFrom || r.validTo ? `<div class="hint mono">valid ${esc(r.validFrom ?? '…')} – ${esc(r.validTo ?? '…')}</div>` : '';
+      return `<div class="rel" data-family="${esc(r.fam.id)}">
+          <div class="rel-head"><span class="rel-swatch"></span><b>${esc(KnodeGraph.relationName(r))}</b><span class="hint mono">weight ${r.weight.toFixed(1)}</span></div>
+          <div class="hint mono">${way}</div>
+          ${r.description ? `<div class="hint">${esc(r.description.slice(0, 280))}</div>` : ''}${when}
+        </div>`;
+    }).join('');
+    side.innerHTML = `<div class="entity-card selected">
+        <p class="eyebrow">relationship</p>
+        <div class="edge-ends">
+          <div class="nb" data-id="${esc(edge.a.id)}">${pill(edge.a.type)}<span>${esc(edge.a.name)}</span></div>
+          <div class="nb" data-id="${esc(edge.b.id)}">${pill(edge.b.type)}<span>${esc(edge.b.name)}</span></div>
+        </div>
+        <div class="hint mono">${n === 1 ? '1 relationship' : `${n} distinct relationships`} between them</div>
+      </div>
+      <div class="entity-card">${rows}</div>`;
+    for (const nb of side.querySelectorAll('.nb')) nb.addEventListener('click', () => { g.select(nb.dataset.id); g.focus(nb.dataset.id); });
+    for (const p of side.querySelectorAll('.tpill')) p.style.color = entityColor(p.dataset.type);
+    for (const row of side.querySelectorAll('.rel')) row.querySelector('.rel-swatch').style.background = KnodeGraph.FAMILIES.find((f) => f.id === row.dataset.family)?.color ?? '';
+    return;
+  }
 
   if (node) {
     const neighbours = g.neighbours(node.id);
@@ -2122,7 +2155,7 @@ function renderGraphSide(node) {
         </div>
       </div>
       <div class="entity-card"><b>${neighbours.length ? `${neighbours.length} neighbours in view` : 'no neighbours in view'}</b>
-        ${neighbours.slice(0, 24).map((x) => `<div class="nb" data-id="${esc(x.node.id)}">${pill(x.node.type)}<span>${esc(x.node.name)}</span><span class="hint mono"><span class="rel-swatch" data-family="${esc(x.fam.id)}"></span>${x.co ? 'co-occurs' : esc(x.type)} ${x.weight.toFixed(1)}</span></div>`).join('')}
+        ${neighbours.slice(0, 24).map((x) => `<div class="nb" data-id="${esc(x.node.id)}">${pill(x.node.type)}<span>${esc(x.node.name)}</span><span class="hint mono"><span class="rel-swatch" data-family="${esc(x.fam.id)}"></span>${relationList(x.relations)} ${x.weight.toFixed(1)}</span></div>`).join('')}
       </div>`;
     for (const sw of side.querySelectorAll('.rel-swatch')) sw.style.background = KnodeGraph.FAMILIES.find((f) => f.id === sw.dataset.family)?.color ?? '';
     side.querySelector('[data-local]').addEventListener('click', () => loadGraph(node.name));

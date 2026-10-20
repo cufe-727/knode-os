@@ -476,6 +476,9 @@ struct GraphEdge: Decodable, Hashable, Identifiable {
     var type: String
     var description: String
     var weight: Double
+    /// Date-only world-time window, when the relation carries one.
+    var validFrom: String? = nil
+    var validTo: String? = nil
     var id: String { "\(source)-\(target)-\(type)" }
 }
 

@@ -27,6 +27,8 @@ struct KnowledgeGraphView: View {
     @State private var scene = GraphScene()
     @State private var sim = GraphSimulation()
     @State private var selectedNodeID: String?
+    /// A bundle: the relations between one pair of nodes. Never selected together with a node.
+    @State private var selectedEdgeID: String?
     @State private var insights: GraphInsights?
     @State private var isLoading = true
     @State private var showingInsights = false
@@ -44,6 +46,10 @@ struct KnowledgeGraphView: View {
         selectedNodeID.flatMap { scene.byID[$0] }
     }
 
+    private var selectedEdge: GraphScene.Bundle? {
+        selectedEdgeID.flatMap { scene.bundle($0) }
+    }
+
     private var isSearch: Bool {
         if case .search = mode { return true }
         return false
@@ -59,7 +65,7 @@ struct KnowledgeGraphView: View {
             } else if let response, !response.nodes.isEmpty {
                 HSplitView {
                     ZStack(alignment: .topLeading) {
-                        GraphCanvas(scene: scene, sim: sim, settings: settings, generation: generation, heat: heat, selectedID: $selectedNodeID) { node in
+                        GraphCanvas(scene: scene, sim: sim, settings: settings, generation: generation, heat: heat, selectedID: $selectedNodeID, selectedEdgeID: $selectedEdgeID) { node in
                             query = node.name
                             Task { await loadGraph() }
                         }
@@ -90,6 +96,9 @@ struct KnowledgeGraphView: View {
             await loadGraph()
         }
         .onChange(of: settings) { old, new in apply(old, new) }
+        // a node and an edge are never selected together: picking one lets go of the other
+        .onChange(of: selectedNodeID) { _, id in if id != nil { selectedEdgeID = nil } }
+        .onChange(of: selectedEdgeID) { _, id in if id != nil { selectedNodeID = nil } }
         .sheet(isPresented: $showingInsights) {
             InsightsSheet(insights: insights)
         }
@@ -154,13 +163,18 @@ struct KnowledgeGraphView: View {
 
     private func sidePanel(_ response: GraphResponse) -> some View {
         VStack(spacing: 0) {
-            if let node = selectedNode {
+            if let edge = selectedEdge {
+                edgeCard(edge)
+                Divider()
+            } else if let node = selectedNode {
                 selectedCard(node)
                 Divider()
             }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    if let node = selectedNode {
+                    if let edge = selectedEdge {
+                        relationList(edge)
+                    } else if let node = selectedNode {
                         neighbourList(node)
                         claimList(node)
                     } else {
@@ -215,11 +229,97 @@ struct KnowledgeGraphView: View {
         .background(Color.knodeViolet.opacity(0.07))
     }
 
+    /// The selected edge: its two ends, each a way to that node, and how many distinct relationships it holds.
+    private func edgeCard(_ edge: GraphScene.Bundle) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Eyebrow(text: L("Relationship"), color: .knodeViolet)
+                Spacer()
+                Button { selectedEdgeID = nil } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(L("Clear selection"))
+            }
+            ForEach([edge.a, edge.b], id: \.self) { id in
+                if let node = scene.byID[id] {
+                    Button { selectedNodeID = id } label: {
+                        HStack(spacing: 8) {
+                            RouteBadge(label: node.type, color: nodeColor(node.type))
+                            Text(node.name).font(.title3.bold()).lineLimit(1)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(L("Select this node"))
+                }
+            }
+            Text(edge.relations.count == 1 ? L("1 relationship between them") : L("%@ distinct relationships between them", String(edge.relations.count)))
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.knodeViolet.opacity(0.07))
+    }
+
+    /// Each distinct relationship in the selected edge: its family, which way it runs, its weight, what the source said and when it holds.
+    @ViewBuilder
+    private func relationList(_ edge: GraphScene.Bundle) -> some View {
+        ForEach(Array(edge.relations.enumerated()), id: \.offset) { _, relation in
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Capsule()
+                        .fill(GraphPalette.family(of: relation.type).color)
+                        .frame(width: 14, height: 3)
+                    Text(relation.type == "co_occurs" ? L("co-occurs") : GraphRenderer.relationName(relation.type))
+                        .font(.callout.weight(.semibold))
+                    Spacer()
+                    Text(L("weight %@", String(format: "%.1f", relation.weight)))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                Text(direction(of: relation, in: edge))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                if !relation.description.isEmpty {
+                    Text(relation.description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if relation.validFrom != nil || relation.validTo != nil {
+                    Text(L("valid %@ – %@", relation.validFrom ?? "…", relation.validTo ?? "…"))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(11)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 9))
+            .overlay { RoundedRectangle(cornerRadius: 9).stroke(Color.white.opacity(0.07)) }
+        }
+    }
+
+    /// A directed relation reads source → target; an undirected one joins the two ends.
+    private func direction(of relation: GraphEdge, in edge: GraphScene.Bundle) -> String {
+        let name = { (id: String) in scene.byID[id]?.name ?? id }
+        return GraphPalette.undirected.contains(relation.type)
+            ? "\(name(edge.a)) ↔ \(name(edge.b))"
+            : "\(name(relation.source)) → \(name(relation.target))"
+    }
+
     /// Mentions in an overview; in a search also the relevance to the query, which is what ranked the node.
     private func numbers(_ node: GraphNode) -> String {
         var parts = [L("%@ mentions", String(node.mentionCount)), L("degree %@", String(scene.degree(of: node)))]
         if isSearch { parts.insert(L("relevance %@", String(format: "%.2f", node.score)), at: 0) }
         return parts.joined(separator: " · ")
+    }
+
+    /// A neighbour's relations, short: the first two, then how many more.
+    private func relationSummary(_ edge: GraphScene.Bundle) -> String {
+        let names = edge.relations.map { $0.type == "co_occurs" ? L("co-occurs") : $0.type }
+        return names.count > 2 ? names.prefix(2).joined(separator: " · ") + " +\(names.count - 2)" : names.joined(separator: " · ")
     }
 
     @ViewBuilder
@@ -238,7 +338,7 @@ struct KnowledgeGraphView: View {
                     Capsule()
                         .fill(GraphPalette.family(of: item.edge.type).color)
                         .frame(width: 10, height: 2)
-                    Text(String(format: "%@ %.1f", item.edge.type == "co_occurs" ? L("co-occurs") : item.edge.type, item.edge.weight))
+                    Text(String(format: "%@ %.1f", relationSummary(item.bundle), item.bundle.weight))
                         .font(.caption2.monospaced())
                         .foregroundStyle(.secondary)
                 }
@@ -358,6 +458,8 @@ struct KnowledgeGraphView: View {
         scene = GraphScene(response: response, settings: settings)
         sim.load(nodes: scene.nodeSpecs(nodeSize: settings.nodeSize), links: scene.linkSpecs, alpha: alpha)
         if let selectedNodeID, scene.byID[selectedNodeID] == nil { self.selectedNodeID = nil }
+        // a selected edge stays while its pair still has a relation in view, showing what is left of it
+        if let selectedEdgeID, scene.bundle(selectedEdgeID) == nil { self.selectedEdgeID = nil }
         heat += 1
     }
 
@@ -376,6 +478,7 @@ struct KnowledgeGraphView: View {
             mode = text.isEmpty ? .overview : .search(text)
             response = reply
             selectedNodeID = nil
+            selectedEdgeID = nil
             sim.reset()
             rebuildScene(alpha: 1)
             // a local graph opens on the entity it was asked for
@@ -387,6 +490,7 @@ struct KnowledgeGraphView: View {
         } catch {
             response = nil
             selectedNodeID = nil
+            selectedEdgeID = nil
             model.showError(error, prefix: "Graph failed")
         }
     }
@@ -408,9 +512,10 @@ struct KnowledgeGraphView: View {
 /**
  * The drawing and the pointer. A `TimelineView` drives the simulation one
  * tick a frame until it settles, then pauses, so a still graph costs nothing;
- * a drag, a filter or a slider resumes it, and so does a focused node while
- * glow is on, whose relations carry moving particles. `GraphRenderer` draws
- * each frame in screen points.
+ * a drag, a filter or a slider resumes it, and so does a focused node or
+ * edge while glow is on, whose lines carry moving particles. `GraphRenderer`
+ * draws each frame in screen points. The pointer finds a node first, on its
+ * disc or just round it, and otherwise the nearest edge.
  */
 private struct GraphCanvas: View {
     let scene: GraphScene
@@ -419,6 +524,8 @@ private struct GraphCanvas: View {
     let generation: Int
     let heat: Int
     @Binding var selectedID: String?
+    /// A bundle id: the relations between one pair of nodes.
+    @Binding var selectedEdgeID: String?
     /// A double-click on a node: open the local graph around it.
     let onOpen: (GraphNode) -> Void
 
@@ -426,6 +533,7 @@ private struct GraphCanvas: View {
     /// Where the world's origin sits, relative to the canvas centre.
     @State private var pan = CGSize.zero
     @State private var hoveredID: String?
+    @State private var hoveredEdgeID: String?
     @State private var paused = false
     @State private var drag: DragState?
     @State private var magnifyStart: CGFloat?
@@ -438,13 +546,11 @@ private struct GraphCanvas: View {
         case pan(CGSize)
     }
 
-    /// How far from a node's centre, in screen points, a pointer still counts as on it.
-    private static let hitPoints: CGFloat = 18
     private static let zoomRange: ClosedRange<CGFloat> = 0.15...8
 
-    /// Particles flow along a focused node's relations while glow is on: the timeline keeps running after the layout settles.
+    /// Particles flow along a focused node's or edge's lines while glow is on: the timeline keeps running after the layout settles.
     private var flowing: Bool {
-        settings.glow && !reduceMotion && (hoveredID ?? selectedID) != nil
+        settings.glow && !reduceMotion && (hoveredID ?? selectedID ?? hoveredEdgeID ?? selectedEdgeID) != nil
     }
 
     var body: some View {
@@ -463,10 +569,13 @@ private struct GraphCanvas: View {
             .onContinuousHover(coordinateSpace: .local) { phase in
                 switch phase {
                 case .active(let point):
-                    let id = sim.node(at: world(point, size), hit: Self.hitPoints / scale)?.id
+                    let id = nodeID(at: point, size)
                     if id != hoveredID { hoveredID = id }
+                    let edge = id == nil ? edgeID(at: point, size) : nil
+                    if edge != hoveredEdgeID { hoveredEdgeID = edge }
                 case .ended:
                     hoveredID = nil
+                    hoveredEdgeID = nil
                 }
             }
         }
@@ -475,6 +584,7 @@ private struct GraphCanvas: View {
             scale = 1
             pan = .zero
             hoveredID = nil
+            hoveredEdgeID = nil
             paused = false
         }
         .onChange(of: heat) { paused = false }
@@ -493,8 +603,9 @@ private struct GraphCanvas: View {
 
     private func renderer(time: Double) -> GraphRenderer {
         GraphRenderer(
-            scene: scene, nodes: sim.nodes, links: sim.links, settings: settings, scale: scale, pan: pan,
-            hoveredID: hoveredID, selectedID: selectedID, time: time, reduceMotion: reduceMotion, metrics: metrics
+            scene: scene, nodes: sim.nodes, settings: settings, scale: scale, pan: pan,
+            hoveredID: hoveredID, selectedID: selectedID, hoveredEdgeID: hoveredEdgeID, selectedEdgeID: selectedEdgeID,
+            time: time, reduceMotion: reduceMotion, metrics: metrics
         )
     }
 
@@ -504,15 +615,28 @@ private struct GraphCanvas: View {
         CGPoint(x: (point.x - size.width / 2 - pan.width) / scale, y: (point.y - size.height / 2 - pan.height) / scale)
     }
 
+    /// Where each node is drawn now, for hit testing against what is on screen.
+    private func position(_ size: CGSize) -> (String) -> CGPoint? {
+        { id in sim.node(id).map { GraphRenderer.point(of: $0, scale: scale, pan: pan, size: size) } }
+    }
+
+    private func nodeID(at point: CGPoint, _ size: CGSize) -> String? {
+        scene.node(near: point, scale: scale, nodeSize: settings.nodeSize, position: position(size))?.id
+    }
+
+    private func edgeID(at point: CGPoint, _ size: CGSize) -> String? {
+        scene.bundle(near: point, position: position(size))?.id
+    }
+
     /// A press on a node drags it (pinned, with the layout kept warm); a press elsewhere pans. A press that did not move is a click.
     private func dragGesture(size: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 0, coordinateSpace: .local)
             .onChanged { value in
                 if drag == nil {
                     let start = world(value.startLocation, size)
-                    if let node = sim.node(at: start, hit: Self.hitPoints / scale) {
-                        drag = .node(node.id)
-                        sim.pin(node.id, at: start)
+                    if let id = nodeID(at: value.startLocation, size) {
+                        drag = .node(id)
+                        sim.pin(id, at: start)
                         sim.alphaTarget = 0.3
                         paused = false
                     } else {
@@ -536,7 +660,7 @@ private struct GraphCanvas: View {
                     if !settings.pin { sim.unpin(id) }
                     if moved < 3 { tap(id) }
                 case .pan:
-                    if moved < 3 { tap(nil) }
+                    if moved < 3 { tap(nil, at: value.location, size: size) }
                 case nil:
                     break
                 }
@@ -544,11 +668,21 @@ private struct GraphCanvas: View {
             }
     }
 
-    /// A click selects; a second one on the same node within 0.4 s opens its local graph; a click on nothing clears.
-    private func tap(_ id: String?) {
+    /**
+     * A click on a node selects it, and a second one within 0.4 s opens its
+     * local graph; a click off every node selects the edge nearest the point,
+     * if one is within reach; a click on nothing clears.
+     */
+    private func tap(_ id: String?, at point: CGPoint? = nil, size: CGSize = .zero) {
         guard let id else {
-            selectedID = nil
             lastTap = nil
+            if let point, let edge = edgeID(at: point, size) {
+                selectedEdgeID = edge
+                selectedID = nil
+            } else {
+                selectedID = nil
+                selectedEdgeID = nil
+            }
             return
         }
         if let last = lastTap, last.id == id, Date().timeIntervalSince(last.at) < 0.4 {
@@ -558,6 +692,7 @@ private struct GraphCanvas: View {
         }
         lastTap = (id, Date())
         selectedID = id
+        selectedEdgeID = nil
     }
 
     private func magnifyGesture(size: CGSize) -> some Gesture {
