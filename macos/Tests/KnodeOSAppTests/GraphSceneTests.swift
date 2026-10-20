@@ -44,6 +44,50 @@ final class GraphSceneTests: XCTestCase {
         XCTAssertTrue(scene.largest.contains("a"))
     }
 
+    func testDrawnSizesSpreadTheLogOfTheDegreeOverWhatIsInView() {
+        let scene = GraphScene(response: reply, settings: GraphSettings())
+        // log(1 + degree) runs from lone's 0 to a's log 10: the ends map to 4 and 18
+        XCTAssertEqual(scene.displayRadius(of: scene.byID["a"]!, nodeSize: 1), 18, accuracy: 0.001)
+        XCTAssertEqual(scene.displayRadius(of: scene.byID["lone"]!, nodeSize: 1), 4, accuracy: 0.001)
+        XCTAssertEqual(scene.displayRadius(of: scene.byID["b"]!, nodeSize: 1), 4 + 14 * log1p(2.0) / log1p(9.0), accuracy: 0.001)
+        XCTAssertEqual(scene.displayRadius(of: scene.byID["a"]!, nodeSize: 2), 36, accuracy: 0.001)
+        // the layout keeps the older size, so nodes keep their spacing
+        XCTAssertEqual(scene.radius(of: scene.byID["a"]!, nodeSize: 1), 9.6, accuracy: 0.001)
+        XCTAssertEqual(scene.degree(ofID: "c"), 3)
+    }
+
+    func testRelationFamiliesFilterEdgesAndFeedTheLegend() {
+        var settings = GraphSettings()
+        settings.hiddenRelations = ["cooperation"]
+        var scene = GraphScene(response: reply, settings: settings)
+        // works_at is cooperation & people: only the co-occurrence edge is left
+        XCTAssertEqual(scene.edges.map(\.type), ["co_occurs"])
+        // the legend counts the reply, before any family is hidden, in the palette's order
+        XCTAssertEqual(scene.familyCounts.map(\.family.id), ["cooperation", "cooccur"])
+        XCTAssertEqual(scene.familyCounts.map(\.count), [3, 1])
+
+        // co-occurrence stays listed with nothing of it in the reply: its chip switches the fetch back on
+        let typedOnly = GraphResponse(nodes: reply.nodes, edges: reply.edges.filter { $0.type != "co_occurs" }, chunks: [], claims: nil)
+        scene = GraphScene(response: typedOnly, settings: GraphSettings())
+        XCTAssertEqual(scene.familyCounts.map(\.family.id), ["cooperation", "cooccur"])
+        XCTAssertEqual(scene.familyCounts.last?.count, 0)
+        XCTAssertEqual(scene.linkSpecs.map(\.type), ["works_at", "works_at", "works_at"])
+    }
+
+    func testEveryRelationTypeHasAFamily() {
+        XCTAssertEqual(GraphPalette.family(of: "supplies_to").id, "value")
+        XCTAssertEqual(GraphPalette.family(of: "subsidiary_of").id, "structure")
+        XCTAssertEqual(GraphPalette.family(of: "invested_in").id, "capital")
+        XCTAssertEqual(GraphPalette.family(of: "competes_with").id, "competition")
+        XCTAssertEqual(GraphPalette.family(of: "founded").id, "cooperation")
+        XCTAssertEqual(GraphPalette.family(of: "co_occurs").id, "cooccur")
+        // generic, system and unknown predicates draw as "other typed"
+        XCTAssertEqual(GraphPalette.family(of: "related_to").id, "other")
+        XCTAssertEqual(GraphPalette.family(of: "links_to").id, "other")
+        XCTAssertEqual(GraphPalette.family(of: "something_new").id, "other")
+        XCTAssertEqual(Set(GraphPalette.families.flatMap(\.types)).count, GraphPalette.families.flatMap(\.types).count)
+    }
+
     func testFiltersNarrowNodesAndEdgesTogether() {
         var settings = GraphSettings()
         settings.hiddenTypes = ["organization"]
@@ -77,6 +121,31 @@ final class GraphSceneTests: XCTestCase {
         XCTAssertEqual(GraphSettings(json: "not json"), GraphSettings())
         XCTAssertEqual(GraphSettings(json: nil), GraphSettings())
         XCTAssertEqual(settings.forces, .init(center: 0.06, repel: 420, linkDistance: 90))
+    }
+
+    func testGlowIsOnByDefaultAndTheNewKeysPersist() {
+        // a copy saved before these keys existed keeps working: glow on, every family shown
+        let older = GraphSettings(json: #"{"limit":200,"hiddenTypes":["event"]}"#)
+        XCTAssertTrue(older.glow)
+        XCTAssertEqual(older.hiddenRelations, [])
+        var settings = GraphSettings()
+        settings.glow = false
+        settings.hiddenRelations = ["capital", "competition"]
+        XCTAssertEqual(GraphSettings(json: settings.json), settings)
+        XCTAssertFalse(GraphSettings(json: #"{"glow":false}"#).glow)
+    }
+
+    func testAHiddenFamilyRefiltersAndGlowOnlyRedraws() {
+        let old = GraphSettings()
+        var new = old
+        new.hiddenRelations = ["structure"]
+        XCTAssertTrue(new.filtersDiffer(from: old))
+        XCTAssertFalse(new.needsRefetch(from: old, overview: true))
+        new = old
+        new.glow = false
+        XCTAssertFalse(new.filtersDiffer(from: old))
+        XCTAssertFalse(new.needsRefetch(from: old, overview: true))
+        XCTAssertEqual(new.forces, old.forces)
     }
 
     func testOnlyTheNodeCountAndAnOverviewsCoOccurrenceAskTheServiceAgain() {

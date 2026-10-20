@@ -36,6 +36,8 @@ final class GraphSimulation {
         let b: Int
         let weight: Double
         let coOccurs: Bool
+        /// The relation's predicate: which family it is drawn as.
+        let type: String
         var distance = 0.0
         var strength = 0.0
         /// d3's share of the correction the target takes: the source's degree against the pair's.
@@ -62,6 +64,7 @@ final class GraphSimulation {
         var target: String
         var weight: Double
         var coOccurs: Bool
+        var type = "related_to"
     }
 
     private(set) var nodes: [Node] = []
@@ -104,15 +107,15 @@ final class GraphSimulation {
         }
         index = Dictionary(nodes.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
         var count = [Int](repeating: 0, count: nodes.count)
-        var pairs: [(a: Int, b: Int, weight: Double, coOccurs: Bool)] = []
+        var pairs: [(a: Int, b: Int, spec: LinkSpec)] = []
         for spec in linkSpecs {
             guard let a = index[spec.source], let b = index[spec.target], a != b else { continue }
             count[a] += 1
             count[b] += 1
-            pairs.append((a, b, spec.weight, spec.coOccurs))
+            pairs.append((a, b, spec))
         }
         links = pairs.map { pair in
-            Link(a: pair.a, b: pair.b, weight: pair.weight, coOccurs: pair.coOccurs,
+            Link(a: pair.a, b: pair.b, weight: pair.spec.weight, coOccurs: pair.spec.coOccurs, type: pair.spec.type,
                  bias: Double(count[pair.a]) / Double(count[pair.a] + count[pair.b]))
         }
         applyForces()

@@ -512,18 +512,7 @@ extension View {
 }
 
 /// The colour of an entity type, the same in the graph, the entity table's
-/// badges and the insights sheet.
+/// badges and the insights sheet, and the same as the web UI's.
 func nodeColor(_ type: String) -> Color {
-    switch type.lowercased() {
-    case "person": .knodeGood
-    case "organization": .orange
-    case "product": .pink
-    case "project": .red
-    case "component": .blue
-    case "technology": .knodeCyan
-    case "concept": .knodeViolet
-    case "event": .purple
-    case "location": .mint
-    default: .gray
-    }
+    GraphPalette.typeColor(type)
 }

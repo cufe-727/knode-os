@@ -10,7 +10,8 @@ private enum GraphMode: Equatable {
 /**
  * Knowledge → Graph: the knowledge graph the way Obsidian draws one. A force
  * layout (`GraphSimulation`, d3-force's integrator) settles and sleeps; nodes
- * are sized by their links and coloured by type; hovering isolates a
+ * are sized by their links and drawn by type, relations by family
+ * (`GraphRenderer`, with an optional glow); hovering isolates a
  * neighbourhood; the view zooms, pans and lets nodes be dragged; labels fade
  * in with zoom. An empty search is the overview — the top entities by
  * mentions — and a name is the local graph around it, ranked by relevance.
@@ -62,7 +63,7 @@ struct KnowledgeGraphView: View {
                             query = node.name
                             Task { await loadGraph() }
                         }
-                        legend
+                        GraphLegend(typeCounts: scene.typeCounts, familyCounts: scene.familyCounts, settings: $settings)
                             .padding(12)
                         caption
                             .padding(12)
@@ -134,33 +135,6 @@ struct KnowledgeGraphView: View {
         .background(.bar)
     }
 
-    /// One chip per type in the reply, with its count; a click hides or shows that type.
-    private var legend: some View {
-        HStack(spacing: 6) {
-            ForEach(scene.typeCounts, id: \.type) { item in
-                let hidden = settings.hiddenTypes.contains(item.type)
-                Button { toggle(type: item.type) } label: {
-                    HStack(spacing: 5) {
-                        Circle()
-                            .fill(nodeColor(item.type))
-                            .frame(width: 7, height: 7)
-                        Text("\(item.type) · \(item.count.formatted())")
-                            .font(.caption2)
-                            .strikethrough(hidden)
-                    }
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(.thickMaterial, in: Capsule())
-                    .opacity(hidden ? 0.5 : 1)
-                }
-                .buttonStyle(.plain)
-                .help(L("Hide or show this type"))
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .clipped()
-    }
-
     /// What the canvas shows and how big it is.
     private var caption: some View {
         let hops = depth == 1 ? L("1 hop") : L("%@ hops", String(depth))
@@ -174,14 +148,6 @@ struct KnowledgeGraphView: View {
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .background(.thickMaterial, in: Capsule())
-    }
-
-    private func toggle(type: String) {
-        if let i = settings.hiddenTypes.firstIndex(of: type) {
-            settings.hiddenTypes.remove(at: i)
-        } else {
-            settings.hiddenTypes.append(type)
-        }
     }
 
     /* ------------------------------ side panel ----------------------------- */
@@ -269,6 +235,9 @@ struct KnowledgeGraphView: View {
                         .font(.callout)
                         .lineLimit(1)
                     Spacer()
+                    Capsule()
+                        .fill(GraphPalette.family(of: item.edge.type).color)
+                        .frame(width: 10, height: 2)
                     Text(String(format: "%@ %.1f", item.edge.type == "co_occurs" ? L("co-occurs") : item.edge.type, item.edge.weight))
                         .font(.caption2.monospaced())
                         .foregroundStyle(.secondary)
@@ -439,10 +408,9 @@ struct KnowledgeGraphView: View {
 /**
  * The drawing and the pointer. A `TimelineView` drives the simulation one
  * tick a frame until it settles, then pauses, so a still graph costs nothing;
- * a drag, a filter or a slider resumes it. Everything is drawn under one
- * translate-and-scale, except labels, which are drawn in screen space at a
- * fixed 11 pt — the same as 11 / scale in world space, without re-laying the
- * text out for every zoom step.
+ * a drag, a filter or a slider resumes it, and so does a focused node while
+ * glow is on, whose relations carry moving particles. `GraphRenderer` draws
+ * each frame in screen points.
  */
 private struct GraphCanvas: View {
     let scene: GraphScene
@@ -462,28 +430,30 @@ private struct GraphCanvas: View {
     @State private var drag: DragState?
     @State private var magnifyStart: CGFloat?
     @State private var lastTap: (id: String, at: Date)?
+    @State private var metrics = GraphLabelMetrics()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private enum DragState {
         case node(String)
         case pan(CGSize)
     }
 
-    private static let background = Color(red: 0.045, green: 0.052, blue: 0.066)
-    private static let edgeColor = Color(red: 140 / 255, green: 150 / 255, blue: 170 / 255)
-    private static let labelColor = Color(white: 0.86)
-    /// What everything outside a hovered neighbourhood fades to.
-    private static let dim = 0.12
     /// How far from a node's centre, in screen points, a pointer still counts as on it.
     private static let hitPoints: CGFloat = 18
     private static let zoomRange: ClosedRange<CGFloat> = 0.15...8
 
+    /// Particles flow along a focused node's relations while glow is on: the timeline keeps running after the layout settles.
+    private var flowing: Bool {
+        settings.glow && !reduceMotion && (hoveredID ?? selectedID) != nil
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
-            TimelineView(.animation(paused: paused)) { _ in
+            TimelineView(.animation(paused: paused)) { timeline in
                 Canvas(rendersAsynchronously: false) { context, size in
                     step()
-                    draw(in: context, size: size)
+                    renderer(time: timeline.date.timeIntervalSinceReferenceDate).draw(in: context, size: size)
                 }
             }
             .background(ScrollWheelCatcher { event in handleScroll(event, size: size) })
@@ -500,7 +470,7 @@ private struct GraphCanvas: View {
                 }
             }
         }
-        .background(Self.background)
+        .background(GraphRenderer.background)
         .onChange(of: generation) {
             scale = 1
             pan = .zero
@@ -508,123 +478,24 @@ private struct GraphCanvas: View {
             paused = false
         }
         .onChange(of: heat) { paused = false }
+        .onChange(of: flowing) { _, now in if now { paused = false } }
     }
 
-    /// One tick a frame while there is heat; the frame after it settles, pause.
+    /// One tick a frame while there is heat; the frame after it settles, pause, unless particles are flowing.
     private func step() {
         guard !paused else { return }
         if sim.settled {
-            DispatchQueue.main.async { paused = true }
+            if !flowing { DispatchQueue.main.async { paused = true } }
         } else {
             sim.tick()
         }
     }
 
-    /* ------------------------------- drawing ------------------------------ */
-
-    private func draw(in context: GraphicsContext, size: CGSize) {
-        let nodes = sim.nodes
-        guard !nodes.isEmpty else { return }
-        let k = scale
-        let origin = CGPoint(x: size.width / 2 + pan.width, y: size.height / 2 + pan.height)
-        var g = context
-        g.translateBy(x: origin.x, y: origin.y)
-        g.scaleBy(x: k, y: k)
-
-        // the viewport in world units, so what is off screen costs nothing
-        let x0 = -origin.x / k
-        let y0 = -origin.y / k
-        let x1 = (size.width - origin.x) / k
-        let y1 = (size.height - origin.y) / k
-        func inView(_ n: GraphSimulation.Node) -> Bool {
-            n.x + n.r >= x0 && n.x - n.r <= x1 && n.y + n.r >= y0 && n.y - n.r <= y1
-        }
-
-        // what stands out: a hovered or selected node with its neighbours
-        let focus = hoveredID ?? selectedID
-        let highlight = focus.map { scene.highlight(around: $0) }
-        func lit(_ link: GraphSimulation.Link) -> Bool {
-            guard let focus else { return false }
-            return nodes[link.a].id == focus || nodes[link.b].id == focus
-        }
-
-        // edges, one stroke per style: a few dozen strokes a frame instead of thousands
-        struct Style: Hashable {
-            let co: Bool
-            let lit: Bool
-            let alpha: Int
-            let width: Int
-        }
-        var buckets: [Style: Path] = [:]
-        for link in sim.links {
-            let a = nodes[link.a]
-            let b = nodes[link.b]
-            if !inView(a) && !inView(b) { continue }
-            var alpha = link.coOccurs ? 0.07 + 0.2 * min(1, link.weight / 3) : 0.18 + 0.4 * min(1, link.weight / 4)
-            let isLit = highlight != nil && lit(link)
-            if highlight != nil { alpha = isLit ? max(alpha, 0.55) : alpha * Self.dim }
-            let width = settings.linkWidth * (0.6 + min(2, 0.3 * link.weight)) / Double(k).squareRoot()
-            let style = Style(co: link.coOccurs, lit: isLit, alpha: Int((alpha * 20).rounded()), width: Int((width * 4).rounded()))
-            buckets[style, default: Path()].move(to: a.point)
-            buckets[style, default: Path()].addLine(to: b.point)
-        }
-        for (style, path) in buckets.sorted(by: { ($0.key.co ? 0 : 1) < ($1.key.co ? 0 : 1) }) {
-            let alpha = Double(style.alpha) / 20
-            guard alpha > 0 else { continue }
-            let color = (style.lit ? Color.knodeCyan : Self.edgeColor).opacity(alpha)
-            let width = Double(style.width) / 4
-            g.stroke(path, with: .color(color), style: StrokeStyle(lineWidth: width, dash: style.co ? [4 / k, 4 / k] : []))
-        }
-
-        if settings.arrows && k >= 0.7 {
-            var arrows = Path()
-            let s = 6 / Double(k)
-            for link in sim.links where !link.coOccurs {
-                let a = nodes[link.a]
-                let b = nodes[link.b]
-                guard inView(b), highlight == nil || lit(link) else { continue }
-                let dx = b.x - a.x
-                let dy = b.y - a.y
-                let d = max(hypot(dx, dy), 1)
-                let ux = dx / d
-                let uy = dy / d
-                let tx = b.x - ux * (b.r + 1)
-                let ty = b.y - uy * (b.r + 1)
-                arrows.move(to: CGPoint(x: tx, y: ty))
-                arrows.addLine(to: CGPoint(x: tx - ux * s - uy * s * 0.5, y: ty - uy * s + ux * s * 0.5))
-                arrows.addLine(to: CGPoint(x: tx - ux * s + uy * s * 0.5, y: ty - uy * s - ux * s * 0.5))
-                arrows.closeSubpath()
-            }
-            g.fill(arrows, with: .color(Self.edgeColor.opacity(0.7)))
-        }
-
-        for n in nodes where inView(n) {
-            let dimmed = highlight.map { !$0.contains(n.id) } ?? false
-            let color = nodeColor(scene.byID[n.id]?.type ?? "").opacity(dimmed ? Self.dim : 1)
-            let circle = Path(ellipseIn: CGRect(x: n.x - n.r, y: n.y - n.r, width: n.r * 2, height: n.r * 2))
-            g.fill(circle, with: .color(color))
-            if n.id == selectedID {
-                g.stroke(circle, with: .color(.white), lineWidth: 2 / k)
-            } else if n.pinned != nil {
-                g.stroke(circle, with: .color(Self.labelColor.opacity(0.6)), lineWidth: 1.5 / k)
-            }
-        }
-
-        // labels fade in with zoom; far out, only the largest nodes and the highlight keep theirs
-        let labelAlpha = max(0, min(1, (Double(k) - settings.textFade) / 0.35))
-        context.drawLayer { layer in
-            layer.addFilter(.shadow(color: Self.background.opacity(0.95), radius: 2))
-            for n in nodes where inView(n) {
-                let forced = highlight?.contains(n.id) == true || n.id == selectedID
-                if highlight != nil && !forced { continue }
-                let alpha = forced ? 1 : labelAlpha >= 0.05 ? labelAlpha : (scene.largest.contains(n.id) ? 0.9 : 0)
-                guard alpha > 0, let node = scene.byID[n.id] else { continue }
-                let name = node.name.count > 28 ? String(node.name.prefix(27)) + "…" : node.name
-                let at = CGPoint(x: origin.x + (n.x + n.r) * k + 4, y: origin.y + n.y * k)
-                layer.opacity = alpha
-                layer.draw(Text(name).font(.system(size: 11)).foregroundColor(Self.labelColor), at: at, anchor: .leading)
-            }
-        }
+    private func renderer(time: Double) -> GraphRenderer {
+        GraphRenderer(
+            scene: scene, nodes: sim.nodes, links: sim.links, settings: settings, scale: scale, pan: pan,
+            hoveredID: hoveredID, selectedID: selectedID, time: time, reduceMotion: reduceMotion, metrics: metrics
+        )
     }
 
     /* ------------------------------- pointer ------------------------------ */
@@ -808,6 +679,7 @@ private struct GraphSettingsPanel: View {
             SettingSlider(label: L("Min edge weight"), value: $settings.minWeight, range: 0...5, step: 0.1, digits: 1)
             Divider()
             Eyebrow(text: L("Display"), color: .knodeViolet)
+            Toggle(L("Glow"), isOn: $settings.glow)
             SettingSlider(label: L("Node size"), value: $settings.nodeSize, range: 0.5...2, step: 0.05, digits: 2)
             SettingSlider(label: L("Link thickness"), value: $settings.linkWidth, range: 0.5...3, step: 0.1, digits: 1)
             SettingSlider(label: L("Text fade"), value: $settings.textFade, range: 0.4...2.5, step: 0.05, digits: 2)

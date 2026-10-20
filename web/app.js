@@ -1831,8 +1831,15 @@ $('#search-q').addEventListener('keydown', (e) => e.key === 'Enter' && doSearch(
 
 /* ------------------------------- graph --------------------------------- */
 
-/** One colour per entity type, shared by the graph canvas and the entity table's type pills (set through element.style, as the page policy allows). */
-const ENTITY_COLORS = { person: '#5fd297', organization: '#ffc861', product: '#ff9e7a', project: '#ff7a90', component: '#7ab8ff', technology: '#5cc8ff', concept: '#b48cff', event: '#e98cff', location: '#8cffe2', other: '#8b95a5' };
+/**
+ * One colour per entity type, shared by the graph canvas and the entity table's type pills (set through
+ * element.style, as the page policy allows) — the same set as the Mac app's. The four common types
+ * (organization, product, concept, person) stay apart under red-green colour blindness.
+ */
+const ENTITY_COLORS = {
+  organization: '#ba7f02', product: '#e5657b', concept: '#9581ef', person: '#09a0a0', location: '#4b99d7', event: '#c158ae',
+  technology: '#3db6cf', project: '#d76549', component: '#627ace', datasource: '#7d8ea1', dataset: '#8ca2ae', other: '#7c8088',
+};
 const entityColor = (type) => ENTITY_COLORS[type] ?? ENTITY_COLORS.other;
 
 const GRAPH_KEY = 'knode-os.graph.v1';
@@ -1915,7 +1922,7 @@ async function loadGraph(q) {
     graphState.loaded = true;
     $('#graph-q').value = q;
     g.load(res.nodes, res.edges, { mode: graphState.mode });
-    paintGraphLegend(res.nodes);
+    paintGraphLegend(res);
     renderGraphSide(null);
   } catch (e) {
     toast(`graph failed: ${e.message}`);
@@ -1929,21 +1936,93 @@ function paintGraphCaption({ nodes, edges }) {
   $('#graph-caption').textContent = `${what} · ${nodes} nodes · ${edges} edges`;
 }
 
-/** One chip per type in the result, with its count; a click hides or shows that type. */
-function paintGraphLegend(nodes) {
-  const counts = new Map();
-  for (const n of nodes) counts.set(n.type, (counts.get(n.type) ?? 0) + 1);
-  const hidden = new Set(graphState.settings.hiddenTypes);
+/** A short line in a relation family's colour and pattern, built as SVG nodes (the page allows no inline style). */
+function relationSample(family) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', '18');
+  svg.setAttribute('height', '8');
+  svg.setAttribute('aria-hidden', 'true');
+  const line = document.createElementNS(ns, 'line');
+  for (const [k, v] of Object.entries({ x1: 1, y1: 4, x2: 17, y2: 4, stroke: family.color, 'stroke-width': 2, 'stroke-linecap': family.dash.length ? 'round' : 'butt' })) line.setAttribute(k, String(v));
+  if (family.dash.length) line.setAttribute('stroke-dasharray', family.dash.join(' '));
+  svg.appendChild(line);
+  return svg;
+}
+
+/**
+ * Two rows of chips. Entity types in the result, with their counts; a click hides or shows that type.
+ * Relation families, with their counts; a click hides or shows that family, and the co-occurrence chip
+ * is the same switch as the settings checkbox.
+ */
+function paintGraphLegend(res) {
+  const s = graphState.settings;
   const legend = $('#graph-legend');
-  legend.innerHTML = [...counts.entries()].sort((a, b) => b[1] - a[1])
-    .map(([type, n]) => `<button class="chip${hidden.has(type) ? ' off' : ''}" data-type="${esc(type)}" title="hide or show this type"><span class="dot"></span>${esc(type)} · ${n}</button>`)
-    .join('');
-  for (const chip of legend.querySelectorAll('.chip')) chip.querySelector('.dot').style.background = entityColor(chip.dataset.type);
+  legend.textContent = '';
+
+  const counts = new Map();
+  for (const n of res.nodes) counts.set(n.type, (counts.get(n.type) ?? 0) + 1);
+  const hidden = new Set(s.hiddenTypes);
+  const types = document.createElement('div');
+  types.className = 'legend-row';
+  for (const [type, n] of [...counts.entries()].sort((a, b) => b[1] - a[1])) {
+    const chip = document.createElement('button');
+    chip.className = `chip${hidden.has(type) ? ' off' : ''}`;
+    chip.dataset.type = type;
+    chip.title = 'hide or show this type';
+    const dot = document.createElement('span');
+    dot.className = 'dot ring';
+    const color = entityColor(type);
+    dot.style.borderColor = color;
+    if (s.glow) dot.style.boxShadow = `0 0 6px 1px ${color}`;
+    chip.append(dot, `${type} · ${n}`);
+    types.appendChild(chip);
+  }
+
+  const families = new Map();
+  for (const e of res.edges) {
+    const id = KnodeGraph.family(e.type).id;
+    families.set(id, (families.get(id) ?? 0) + 1);
+  }
+  const relations = document.createElement('div');
+  relations.className = 'legend-row';
+  for (const family of KnodeGraph.FAMILIES) {
+    const n = families.get(family.id) ?? 0;
+    // co-occurrence stays listed when switched off: an overview then does not even fetch it
+    if (!n && family.id !== 'cooccur') continue;
+    const off = family.id === 'cooccur' ? !s.cooccur : (s.hiddenRelations ?? []).includes(family.id);
+    const chip = document.createElement('button');
+    chip.className = `chip${off ? ' off' : ''}`;
+    chip.dataset.family = family.id;
+    chip.title = 'hide or show this relation family';
+    chip.append(relationSample(family), n ? `${family.label} · ${n}` : family.label);
+    relations.appendChild(chip);
+  }
+  legend.append(types, relations);
 }
 
 $('#graph-legend').addEventListener('click', (ev) => {
   const chip = ev.target.closest('.chip');
   if (!chip) return;
+  const family = chip.dataset.family;
+  if (family === 'cooccur') {
+    // the settings checkbox owns this switch, refetch included
+    const box = $('#gs-cooccur');
+    box.checked = !graphState.settings.cooccur;
+    chip.classList.toggle('off', !box.checked);
+    box.dispatchEvent(new Event('change'));
+    return;
+  }
+  if (family) {
+    const off = new Set(graphState.settings.hiddenRelations ?? []);
+    if (off.has(family)) off.delete(family);
+    else off.add(family);
+    chip.classList.toggle('off', off.has(family));
+    graphState.settings.hiddenRelations = [...off];
+    graphState.graph?.setSettings({ hiddenRelations: graphState.settings.hiddenRelations });
+    saveGraphSettings();
+    return;
+  }
   const hidden = new Set(graphState.settings.hiddenTypes);
   if (hidden.has(chip.dataset.type)) hidden.delete(chip.dataset.type);
   else hidden.add(chip.dataset.type);
@@ -1981,6 +2060,8 @@ for (const key of Object.keys(window.KnodeGraph?.DEFAULTS ?? {})) {
       return;
     }
     graphState.graph?.setSettings({ [key]: value });
+    // the legend shows co-occurrence's switch, and glow on the type swatches
+    if ((key === 'glow' || key === 'cooccur') && graphState.res) paintGraphLegend(graphState.res);
   };
   el.addEventListener(el.type === 'range' ? 'input' : 'change', apply);
 }
@@ -1996,7 +2077,7 @@ $('#gs-reset').addEventListener('click', () => {
   graphState.graph?.setQuery('');
   graphState.graph?.setSettings(graphState.settings);
   if (refetch && graphState.loaded) loadGraph(graphState.query);
-  else if (graphState.res) paintGraphLegend(graphState.res.nodes);
+  else if (graphState.res) paintGraphLegend(graphState.res);
 });
 
 /**
@@ -2041,8 +2122,9 @@ function renderGraphSide(node) {
         </div>
       </div>
       <div class="entity-card"><b>${neighbours.length ? `${neighbours.length} neighbours in view` : 'no neighbours in view'}</b>
-        ${neighbours.slice(0, 24).map((x) => `<div class="nb" data-id="${esc(x.node.id)}">${pill(x.node.type)}<span>${esc(x.node.name)}</span><span class="hint mono">${x.co ? 'co-occurs' : esc(x.type)} ${x.weight.toFixed(1)}</span></div>`).join('')}
+        ${neighbours.slice(0, 24).map((x) => `<div class="nb" data-id="${esc(x.node.id)}">${pill(x.node.type)}<span>${esc(x.node.name)}</span><span class="hint mono"><span class="rel-swatch" data-family="${esc(x.fam.id)}"></span>${x.co ? 'co-occurs' : esc(x.type)} ${x.weight.toFixed(1)}</span></div>`).join('')}
       </div>`;
+    for (const sw of side.querySelectorAll('.rel-swatch')) sw.style.background = KnodeGraph.FAMILIES.find((f) => f.id === sw.dataset.family)?.color ?? '';
     side.querySelector('[data-local]').addEventListener('click', () => loadGraph(node.name));
     if (node.wikiPath) side.querySelector('[data-wiki]').addEventListener('click', () => { navigate('files'); openFile(node.wikiPath); });
     for (const nb of side.querySelectorAll('.nb')) {

@@ -6,24 +6,64 @@
  * zoomable, pannable canvas, nodes that can be dragged and pinned, hover
  * that isolates a neighbourhood, labels that fade in with zoom, the way
  * Obsidian's graph view behaves. Without d3 the class still exists but
- * `KnodeGraph.available` is false, so the app can say so instead of breaking. */
+ * `KnodeGraph.available` is false, so the app can say so instead of breaking.
+ *
+ * The look is "Glyph + glow": every node is a dark disc in a ring of its
+ * type's colour with the type's icon inside, every relation takes its
+ * family's colour and line pattern, and the `glow` setting adds a corona
+ * around each node, light-blended relations and particles that flow along a
+ * focused node's relations. The Mac app draws the same (GraphRenderer.swift). */
 'use strict';
 
+const GRAPH_FONT = '-apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif';
+const hexRgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+const rgba = (hex, a) => `rgba(${hexRgb(hex).join(',')},${a})`;
+/** `a` moved toward `b` by `t`. */
+const mixHex = (a, b, t) => {
+  const x = hexRgb(a), y = hexRgb(b);
+  return '#' + x.map((v, i) => Math.round(v + (y[i] - v) * t).toString(16).padStart(2, '0')).join('');
+};
+const mixWhite = (hex, t) => mixHex(hex, '#ffffff', t);
+
 class KnodeGraph {
-  /** Display preferences, persisted by the app; the force values are shared with the Mac app's simulation. */
+  /** Display preferences, persisted by the app; the keys and the force values are shared with the Mac app. */
   static DEFAULTS = Object.freeze({
-    limit: 150, hiddenTypes: [], hideOrphans: false, cooccur: true, minWeight: 0,
-    nodeSize: 1, linkWidth: 1, textFade: 1, arrows: false, pin: false,
+    limit: 150, hiddenTypes: [], hiddenRelations: [], hideOrphans: false, cooccur: true, minWeight: 0,
+    nodeSize: 1, linkWidth: 1, textFade: 1, arrows: false, pin: false, glow: true,
     center: 0.06, repel: 180, linkDistance: 90,
   });
   static FORCE_KEYS = ['center', 'repel', 'linkDistance'];
-  static FILTER_KEYS = ['hiddenTypes', 'hideOrphans', 'cooccur', 'minWeight'];
+  static FILTER_KEYS = ['hiddenTypes', 'hiddenRelations', 'hideOrphans', 'cooccur', 'minWeight'];
   static available = typeof d3 !== 'undefined' && d3 !== null;
 
   /** How far from a node's centre, in screen pixels, a pointer still counts as on it. */
   static HIT_PX = 18;
-  static DIM = 0.12;
   static ZOOM_EXTENT = [0.15, 8];
+
+  /**
+   * Relation families: the ontology's predicates folded into five coloured
+   * groups, a neutral "other typed" for the generic, rare and unknown ones, and
+   * the derived co-occurrence. Each has a line pattern too, so a relation still
+   * reads without its colour. The five hues stay apart under red-green colour
+   * blindness and from the main node colours. The Mac app uses the same table.
+   */
+  static FAMILIES = Object.freeze([
+    { id: 'structure', label: 'structure', color: '#019aeb', boost: 1, dash: [], types: ['part_of', 'member_of', 'subsidiary_of', 'located_in', 'regulated_by'] },
+    { id: 'capital', label: 'capital', color: '#bfaa03', boost: 1, dash: [7, 3], types: ['owns', 'invested_in', 'acquired'] },
+    { id: 'value', label: 'value chain', color: '#08d7ee', boost: 0.85, dash: [], types: ['produces', 'supplies_to', 'uses', 'depends_on'] },
+    { id: 'competition', label: 'competition', color: '#fe9f9d', boost: 0.95, dash: [2.5, 2.5], types: ['competes_with', 'contradicts'] },
+    { id: 'cooperation', label: 'cooperation & people', color: '#1a9951', boost: 1.3, dash: [6, 2.5, 1.5, 2.5], types: ['partner_of', 'works_at', 'reports_to', 'authored', 'founded'] },
+    { id: 'other', label: 'other typed', color: '#8a93a6', boost: 1, dash: [], types: ['related_to', 'caused', 'succeeded_by'] },
+    { id: 'cooccur', label: 'co-occurrence', color: '#8a93a6', boost: 1, dash: [1.2, 3.2], types: ['co_occurs'] },
+  ]);
+  static FAMILY_OF = new Map(this.FAMILIES.flatMap((f) => f.types.map((t) => [t, f])));
+  /** No direction to show: the relation reads the same both ways, or says nothing about direction. */
+  static UNDIRECTED = new Set(['competes_with', 'contradicts', 'partner_of', 'co_occurs', 'related_to']);
+
+  /** The family a relation type draws as; anything the table does not name is "other typed". */
+  static family(type) {
+    return KnodeGraph.FAMILY_OF.get(type) ?? KnodeGraph.FAMILIES[5];
+  }
 
   constructor(canvas, { colors = {}, settings = {} } = {}) {
     if (!KnodeGraph.available) throw new Error('d3 is not available');
@@ -34,7 +74,10 @@ class KnodeGraph {
     const css = getComputedStyle(document.documentElement);
     this.fg = css.getPropertyValue('--fg').trim() || '#d7dde6';
     this.halo = css.getPropertyValue('--bg2').trim() || '#161a21';
-    this.accent = '92,200,255';
+    this.motion = window.matchMedia?.('(prefers-reduced-motion: reduce)') ?? null;
+    this.motion?.addEventListener?.('change', () => this.invalidate());
+    /** Measured label widths, by font and text: labels are placed every frame, measured once. */
+    this.widths = new Map();
 
     this.all = { nodes: [], edges: [] };
     /** Every node object this view has ever placed, by id: a refilter keeps positions. */
@@ -161,10 +204,12 @@ class KnodeGraph {
   applyFilter(alpha = 0.3) {
     const s = this.settings;
     const hidden = new Set(s.hiddenTypes);
+    const hiddenFamilies = new Set(s.hiddenRelations);
     const kept = this.all.nodes.filter((n) => !hidden.has(n.type));
     const ids = new Set(kept.map((n) => n.id));
     const edges = this.all.edges.filter((e) =>
-      ids.has(e.source) && ids.has(e.target) && e.source !== e.target && (s.cooccur || e.type !== 'co_occurs') && e.weight >= s.minWeight);
+      ids.has(e.source) && ids.has(e.target) && e.source !== e.target && (s.cooccur || e.type !== 'co_occurs') && e.weight >= s.minWeight
+      && !hiddenFamilies.has(KnodeGraph.family(e.type).id));
     const linked = new Set();
     for (const e of edges) {
       linked.add(e.source);
@@ -183,9 +228,12 @@ class KnodeGraph {
       return o;
     });
     const objById = new Map(this.nodes.map((o) => [o.id, o]));
-    this.links = edges.map((e) => ({
+    this.links = edges.map((e, i) => ({
       source: objById.get(e.source), target: objById.get(e.target),
       type: e.type, weight: e.weight, description: e.description, co: e.type === 'co_occurs',
+      fam: KnodeGraph.family(e.type), directed: !KnodeGraph.UNDIRECTED.has(e.type),
+      // where along the relation its particles start, so neighbouring relations do not pulse in step
+      phase: (i * 0.6180339887) % 1,
     }));
     this.adj = new Map();
     for (const o of this.nodes) o.inDegree = 0;
@@ -204,15 +252,30 @@ class KnodeGraph {
     this.emit('stats', { nodes: this.nodes.length, edges: this.links.length });
   }
 
-  /** Radius from links, the way Obsidian sizes nodes: the global typed degree when the server sent it, else what is in view. */
+  /**
+   * Two radii per node, both from links: the global typed degree when the
+   * server sent it, else what is in view. `spacing` is what the layout keeps
+   * apart, the size nodes used to be drawn at, so a layout settles as it always
+   * has. `r` is what is drawn: the log of the degree across the nodes in view,
+   * 4 to 18 px times the node size, so hubs stand out even when every top
+   * node has hundreds of links.
+   */
   sizeNodes() {
     const scale = this.settings.nodeSize;
+    const degree = (o) => (typeof o.degree === 'number' ? o.degree : o.inDegree);
+    let lo = Infinity, hi = -Infinity;
     for (const o of this.nodes) {
-      const degree = typeof o.degree === 'number' ? o.degree : o.inDegree;
-      o.r = scale * Math.min(22, 3 + 2.2 * Math.sqrt(degree));
+      const v = Math.log1p(degree(o));
+      lo = Math.min(lo, v);
+      hi = Math.max(hi, v);
     }
-    this.largest = new Set([...this.nodes].sort((a, b) => b.r - a.r).slice(0, 12).map((o) => o.id));
-    this.sim.force('collide').radius((d) => d.r + 3);
+    for (const o of this.nodes) {
+      const d = degree(o);
+      o.spacing = scale * Math.min(22, 3 + 2.2 * Math.sqrt(d));
+      o.r = scale * (4 + 14 * (hi > lo ? (Math.log1p(d) - lo) / (hi - lo) : 0.5));
+    }
+    this.largest = new Set([...this.nodes].sort((a, b) => degree(b) - degree(a)).slice(0, 12).map((o) => o.id));
+    this.sim.force('collide').radius((d) => d.spacing + 3);
   }
 
   applyForces() {
@@ -272,7 +335,7 @@ class KnodeGraph {
     const out = [];
     for (const [other, l] of this.adj.get(id) ?? []) {
       const node = this.byId.get(other);
-      if (node) out.push({ node, weight: l.weight, type: l.type, co: l.co, out: l.source.id === id });
+      if (node) out.push({ node, weight: l.weight, type: l.type, co: l.co, fam: l.fam, out: l.source.id === id });
     }
     return out.sort((a, b) => b.weight - a.weight);
   }
@@ -359,11 +422,13 @@ class KnodeGraph {
     this.sel.transition().duration(400).call(this.zoom.transform, t);
   }
 
-  /** The node under a screen point, or null. */
+  /** The node under a screen point, or null: within the hit distance, or within the drawn disc when that is larger. */
   nodeAt(sx, sy) {
     if (!this.nodes.length) return null;
     const [x, y] = this.t.invert([sx, sy]);
-    return this.sim.find(x, y, KnodeGraph.HIT_PX / this.t.k) ?? null;
+    const hit = KnodeGraph.HIT_PX / this.t.k;
+    const n = this.sim.find(x, y, Math.max(hit, 18 * this.settings.nodeSize));
+    return n && Math.hypot(n.x - x, n.y - y) <= Math.max(hit, n.r) ? n : null;
   }
 
   invalidate() {
@@ -374,6 +439,21 @@ class KnodeGraph {
     });
   }
 
+  textWidth(text, font) {
+    const key = `${font}|${text}`;
+    let w = this.widths.get(key);
+    if (w === undefined) {
+      this.ctx.font = font;
+      w = this.ctx.measureText(text).width;
+      this.widths.set(key, w);
+    }
+    return w;
+  }
+
+  /**
+   * One frame, drawn in screen pixels so strokes, icons and labels keep their
+   * size at any zoom: background, relations, glow, direction, nodes, labels.
+   */
   draw() {
     const { canvas: c, ctx, t } = this;
     const dpr = window.devicePixelRatio || 1;
@@ -382,113 +462,394 @@ class KnodeGraph {
     if (!w || !h) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    if (!this.nodes.length) return;
-    ctx.translate(t.x, t.y);
-    ctx.scale(t.k, t.k);
-    const k = t.k;
     const s = this.settings;
+    const glow = Boolean(s.glow);
+    const k = t.k;
+    this.drawBackground(w, h, glow);
+    if (!this.nodes.length) return;
 
-    // the viewport in world units, so what is off screen costs nothing
-    const x0 = -t.x / k, y0 = -t.y / k, x1 = (w - t.x) / k, y1 = (h - t.y) / k;
-    const inView = (n) => n.x + n.r >= x0 && n.x - n.r <= x1 && n.y + n.r >= y0 && n.y - n.r <= y1;
+    // screen geometry, and what is on screen: what is not costs nothing
+    const pad = 40;
+    const pos = new Map();
+    for (const n of this.nodes) {
+      const x = t.applyX(n.x), y = t.applyY(n.y), r = Math.max(n.r * k, 3);
+      pos.set(n.id, { n, x, y, r, on: x + r > -pad && x - r < w + pad && y + r > -pad && y - r < h + pad });
+    }
 
     // what stands out: a hovered or selected node with its neighbours, else the search matches
     const focus = this.hover ?? this.selected;
     const hi = focus ? new Set([focus.id, ...(this.adj.get(focus.id)?.keys() ?? [])]) : this.matches;
     const lit = (l) => (focus ? l.source.id === focus.id || l.target.id === focus.id : hi.has(l.source.id) && hi.has(l.target.id));
 
-    // edges, one stroke per style: thousands of strokes a frame became a few dozen
-    const buckets = new Map();
+    // relations, one stroke per style: thousands of strokes a frame became a few dozen
+    const zoomW = Math.max(0.75, Math.min(1.5, Math.sqrt(k))) * s.linkWidth;
+    const rest = new Map(), bright = new Map(), chevrons = [], flows = [], mids = [];
     for (const l of this.links) {
-      if (!inView(l.source) && !inView(l.target)) continue;
-      let alpha = l.co ? 0.07 + 0.2 * Math.min(1, l.weight / 3) : 0.18 + 0.4 * Math.min(1, l.weight / 4);
-      let color = '140,150,170';
-      if (hi) {
-        if (lit(l)) {
-          color = this.accent;
-          alpha = Math.max(alpha, 0.55);
-        } else alpha *= KnodeGraph.DIM;
+      const a = pos.get(l.source.id), b = pos.get(l.target.id);
+      if (!a.on && !b.on) continue;
+      const fam = l.fam;
+      const on = hi ? lit(l) : false;
+      let alpha = fam.id === 'cooccur' ? 0.03 + 0.03 * Math.min(1, l.weight / 6)
+        : fam.id === 'other' ? 0.04 + 0.05 * Math.min(1, l.weight / 3)
+        : (0.1 + 0.11 * Math.min(1, l.weight / 3)) * fam.boost;
+      // light-blended relations add up where they cross, so each starts fainter
+      if (glow) alpha *= 0.8;
+      if (hi) alpha = on ? (fam.id === 'cooccur' ? 0.4 : fam.id === 'other' ? 0.55 : 0.92) : alpha * 0.06;
+      alpha = Math.round(alpha * 40) / 40;
+      const width = Math.round((l.co ? 0.9 : 0.75 + 0.2 * Math.min(4, l.weight)) * (on ? 1.35 : 1) * zoomW * 4) / 4;
+      const key = `${fam.id}|${alpha}|${width}`;
+      const batches = on ? bright : rest;
+      let bt = batches.get(key);
+      if (!bt) batches.set(key, (bt = { color: fam.color, alpha, width, dash: fam.dash, segs: [] }));
+      bt.segs.push(a.x, a.y, b.x, b.y);
+      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      if (on && focus) {
+        if (l.directed) chevrons.push({ l, a, b, mx, my, alpha: 1 });
+        if (!l.co) flows.push({ l, a, b });
+        mids.push({ l, x: mx, y: my + 9 });
+      } else if (s.arrows && !hi && l.directed && !l.co && k >= 0.7) {
+        // the arrows setting marks every directed relation, as quietly as the relation itself
+        chevrons.push({ l, a, b, mx, my, alpha: Math.min(0.6, alpha * 2.5) });
       }
-      const a = Math.round(alpha * 20) / 20;
-      const width = Math.round((s.linkWidth * (0.6 + Math.min(2, 0.3 * l.weight)) / Math.sqrt(k)) * 4) / 4;
-      const key = `${l.co ? 'c' : 't'}|${color}|${a}|${width}`;
-      let b = buckets.get(key);
-      if (!b) buckets.set(key, (b = { co: l.co, color, alpha: a, width, links: [] }));
-      b.links.push(l);
     }
-    const order = [...buckets.values()].sort((p, q) => (p.co === q.co ? 0 : p.co ? -1 : 1));
-    for (const b of order) {
-      if (b.alpha <= 0) continue;
-      ctx.beginPath();
-      for (const l of b.links) {
-        ctx.moveTo(l.source.x, l.source.y);
-        ctx.lineTo(l.target.x, l.target.y);
+    if (glow) ctx.globalCompositeOperation = 'lighter';
+    this.strokeBatches(rest);
+    this.strokeBatches(bright);
+
+    const shown = [...pos.values()].filter((g) => g.on);
+    let moving = false;
+    if (glow) {
+      // a corona round every disc; coronas add up, so a dense cluster brightens instead of clotting
+      for (const g of shown) {
+        const col = this.colorOf(g.n.type);
+        const dim = hi && !hi.has(g.n.id);
+        const R = g.r * 2.3 + 5;
+        const a = dim ? 0.12 : this.selected && g.n.id === this.selected.id ? 1.5 : 1;
+        const corona = ctx.createRadialGradient(g.x, g.y, g.r * 0.85, g.x, g.y, R);
+        corona.addColorStop(0, rgba(col, Math.min(0.9, 0.48 * a)));
+        corona.addColorStop(0.4, rgba(col, 0.15 * a));
+        corona.addColorStop(1, rgba(col, 0));
+        ctx.fillStyle = corona;
+        ctx.beginPath();
+        ctx.arc(g.x, g.y, R, 0, Math.PI * 2);
+        ctx.fill();
       }
-      ctx.strokeStyle = `rgba(${b.color},${b.alpha})`;
+      if (flows.length) {
+        const still = this.motion?.matches ?? false;
+        moving = !still;
+        this.drawParticles(flows, still ? 0.35 : performance.now() / 1000);
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    this.drawChevrons(chevrons, glow);
+
+    // nodes: the faded ones first, then larger under smaller, so a small node is never buried
+    shown.sort((p, q) => {
+      const dp = hi && !hi.has(p.n.id) ? 0 : 1, dq = hi && !hi.has(q.n.id) ? 0 : 1;
+      return dp - dq || q.r - p.r;
+    });
+    for (const g of shown) this.drawNode(g, hi, glow);
+
+    const placed = this.drawLabels(pos, shown, focus, hi, glow, w, h);
+    if (focus && k >= 0.75) this.drawRelationNames(mids, placed, pos, hi, w, h);
+    // particles keep flowing while a node is focused with glow on
+    if (moving) this.invalidate();
+  }
+
+  colorOf(type) {
+    return this.colors[type] ?? this.colors.other ?? '#7c8088';
+  }
+
+  /** Glow: a deep blue field. Without: the stage's own colour with a faint dot grid that moves with the view. */
+  drawBackground(w, h, glow) {
+    const ctx = this.ctx;
+    if (glow) {
+      const bg = ctx.createRadialGradient(w / 2, h * 0.45, 0, w / 2, h * 0.45, Math.max(w, h) * 0.8);
+      bg.addColorStop(0, '#121730');
+      bg.addColorStop(1, '#06070c');
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, w, h);
+      return;
+    }
+    const step = 40 * this.t.k;
+    if (step < 14) return;
+    ctx.fillStyle = 'rgba(160,175,200,.07)';
+    const ox = ((this.t.x % step) + step) % step, oy = ((this.t.y % step) + step) % step;
+    for (let x = ox; x < w; x += step) for (let y = oy; y < h; y += step) ctx.fillRect(x - 0.6, y - 0.6, 1.2, 1.2);
+  }
+
+  strokeBatches(batches) {
+    const ctx = this.ctx;
+    for (const b of batches.values()) {
+      if (b.alpha <= 0.004) continue;
+      ctx.beginPath();
+      for (let i = 0; i < b.segs.length; i += 4) {
+        ctx.moveTo(b.segs[i], b.segs[i + 1]);
+        ctx.lineTo(b.segs[i + 2], b.segs[i + 3]);
+      }
+      ctx.strokeStyle = rgba(b.color, b.alpha);
       ctx.lineWidth = b.width;
-      ctx.setLineDash(b.co ? [4 / k, 4 / k] : []);
+      ctx.setLineDash(b.dash);
+      ctx.lineCap = b.dash.length ? 'round' : 'butt';
       ctx.stroke();
     }
     ctx.setLineDash([]);
+  }
 
-    if (s.arrows && k >= 0.7) {
-      ctx.fillStyle = 'rgba(140,150,170,0.7)';
-      const size = 6 / k;
-      for (const l of this.links) {
-        if (l.co || !inView(l.target) || (hi && !lit(l))) continue;
-        const dx = l.target.x - l.source.x, dy = l.target.y - l.source.y;
-        const d = Math.hypot(dx, dy) || 1;
-        const ux = dx / d, uy = dy / d;
-        const tx = l.target.x - ux * (l.target.r + 1), ty = l.target.y - uy * (l.target.r + 1);
-        ctx.beginPath();
-        ctx.moveTo(tx, ty);
-        ctx.lineTo(tx - ux * size - uy * size * 0.5, ty - uy * size + ux * size * 0.5);
-        ctx.lineTo(tx - ux * size + uy * size * 0.5, ty - uy * size - ux * size * 0.5);
-        ctx.closePath();
-        ctx.fill();
+  /** Light particles along focused relations: source to target, both ways for an undirected one. */
+  drawParticles(flows, time) {
+    const ctx = this.ctx;
+    for (const { l, a, b } of flows) {
+      const both = !l.directed;
+      const n = both || l.weight > 2 ? 2 : 1;
+      const col = mixWhite(l.fam.color, 0.45);
+      for (let i = 0; i < n; i++) {
+        const back = both && i === 1;
+        for (let tail = 0; tail < 3; tail++) {
+          let p = (time * 0.22 + l.phase + i / n - tail * 0.018) % 1;
+          if (p < 0) p += 1;
+          if (back) p = 1 - p;
+          ctx.beginPath();
+          ctx.arc(a.x + (b.x - a.x) * p, a.y + (b.y - a.y) * p, tail ? 1.3 : 1.8, 0, Math.PI * 2);
+          ctx.fillStyle = rgba(col, [0.95, 0.45, 0.2][tail]);
+          ctx.fill();
+        }
       }
     }
+  }
 
-    for (const n of this.nodes) {
-      if (!inView(n)) continue;
-      ctx.globalAlpha = hi && !hi.has(n.id) ? KnodeGraph.DIM : 1;
-      ctx.fillStyle = this.colors[n.type] ?? this.colors.other ?? '#8b95a5';
+  /** A chevron at the middle of a directed relation, pointing at its target. */
+  drawChevrons(chevrons, glow) {
+    const ctx = this.ctx;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = 1.6;
+    for (const { l, a, b, mx, my, alpha } of chevrons) {
+      const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1;
+      const ux = dx / d, uy = dy / d, sz = 4.5;
       ctx.beginPath();
-      ctx.arc(n.x, n.y, n.r, 0, 2 * Math.PI);
-      ctx.fill();
-      if (this.selected && n.id === this.selected.id) {
-        ctx.lineWidth = 2 / k;
-        ctx.strokeStyle = '#ffffff';
-        ctx.stroke();
-      } else if (n.fx != null) {
-        ctx.lineWidth = 1.5 / k;
-        ctx.strokeStyle = 'rgba(215,221,230,0.6)';
-        ctx.stroke();
-      }
+      ctx.moveTo(mx - ux * sz - uy * sz, my - uy * sz + ux * sz);
+      ctx.lineTo(mx + ux * sz * 0.6, my + uy * sz * 0.6);
+      ctx.lineTo(mx - ux * sz + uy * sz, my - uy * sz - ux * sz);
+      ctx.strokeStyle = rgba(glow ? mixWhite(l.fam.color, 0.2) : l.fam.color, alpha);
+      ctx.stroke();
     }
-    ctx.globalAlpha = 1;
+  }
 
-    // labels fade in with zoom; far out, only the largest nodes and the highlight keep theirs
-    const labelAlpha = Math.max(0, Math.min(1, (k - s.textFade) / 0.35));
-    ctx.font = `${11 / k}px system-ui, -apple-system, "Segoe UI", sans-serif`;
+  /** A dark disc in a ring of the type's colour, the type's icon inside, and a gap round it so neighbours never merge. */
+  drawNode(g, hi, glow) {
+    const ctx = this.ctx;
+    const col = this.colorOf(g.n.type);
+    const dim = hi && !hi.has(g.n.id);
+    const sel = this.selected && g.n.id === this.selected.id;
+    const hov = this.hover && g.n.id === this.hover.id;
+    // with glow the ring and icon run brighter and the disc takes a trace of its colour
+    const ring = glow ? mixWhite(col, 0.12) : col;
+    const ink = glow ? mixWhite(col, 0.25) : col;
+    ctx.beginPath();
+    ctx.arc(g.x, g.y, g.r + 2, 0, Math.PI * 2);
+    ctx.fillStyle = glow ? 'rgba(7,8,12,.88)' : this.halo;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(g.x, g.y, g.r, 0, Math.PI * 2);
+    ctx.fillStyle = glow ? mixHex('#0d1019', col, dim ? 0.04 : sel || hov ? 0.26 : 0.13) : sel || hov ? '#1d2330' : '#11151c';
+    ctx.fill();
+    ctx.lineWidth = sel ? 2.6 : hov ? 2.1 : g.r > 8 ? 1.7 : 1.3;
+    ctx.strokeStyle = rgba(ring, dim ? 0.22 : 1);
+    ctx.stroke();
+    if (g.r >= 6.5) KnodeGraph.icon(ctx, g.n.type, g.x, g.y, g.r * 0.5, rgba(ink, dim ? 0.18 : 0.95), g.r > 12 ? 1.5 : 1.25);
+    else {
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, Math.max(1, g.r * 0.36), 0, Math.PI * 2);
+      ctx.fillStyle = rgba(ink, dim ? 0.2 : 1);
+      ctx.fill();
+    }
+    if (sel) {
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, g.r + 5, 0, Math.PI * 2);
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = rgba(ring, 0.5);
+      ctx.stroke();
+    } else if (g.n.fx != null) {
+      // pinned where it was dropped
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, g.r + 4, 0, Math.PI * 2);
+      ctx.setLineDash([2, 2.5]);
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = 'rgba(215,221,230,.6)';
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  /** Whether a label box would cover a node that is not faded out. */
+  coversNode(box, pos, ownId, hi) {
+    for (const g of pos.values()) {
+      if (g.n.id === ownId || !g.on || g.r < 3 || (hi && !hi.has(g.n.id))) continue;
+      const cx = Math.max(box[0], Math.min(g.x, box[2])), cy = Math.max(box[1], Math.min(g.y, box[3]));
+      if (Math.hypot(cx - g.x, cy - g.y) < g.r - 1) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Labels under their nodes, most important first, each skipped when an
+   * earlier label or another node holds the spot. With a highlight, its
+   * nodes are labelled; otherwise labels fade in with zoom and the twelve
+   * largest nodes keep theirs however far out the view is.
+   */
+  drawLabels(pos, shown, focus, hi, glow, w, h) {
+    const ctx = this.ctx;
+    const k = this.t.k;
+    const fade = Math.max(0, Math.min(1, (k - this.settings.textFade) / 0.35));
+    let items;
+    if (focus) {
+      const nb = this.neighbours(focus.id).map((x) => ({ id: x.node.id, w: x.weight + (x.co ? 0 : 2) })).sort((a, b) => b.w - a.w);
+      items = [pos.get(focus.id), ...nb.map((x) => pos.get(x.id))];
+    } else if (hi) {
+      items = shown.filter((g) => hi.has(g.n.id));
+    } else {
+      const degree = (o) => (typeof o.degree === 'number' ? o.degree : o.inDegree);
+      items = shown.filter((g) => this.largest.has(g.n.id) || fade >= 0.05).sort((a, b) => degree(b.n) - degree(a.n));
+    }
+    const placed = [];
+    ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.lineJoin = 'round';
-    for (const n of this.nodes) {
-      if (!inView(n)) continue;
-      const forced = (hi && hi.has(n.id)) || (this.selected && n.id === this.selected.id);
-      if (hi && !forced) continue;
-      const a = forced ? 1 : labelAlpha >= 0.05 ? labelAlpha : this.largest.has(n.id) ? 0.9 : 0;
-      if (a <= 0) continue;
-      ctx.globalAlpha = a;
-      const text = n.name.length > 28 ? `${n.name.slice(0, 27)}…` : n.name;
-      const x = n.x + n.r + 4 / k;
-      ctx.lineWidth = 3 / k;
-      ctx.strokeStyle = this.halo;
-      ctx.strokeText(text, x, n.y);
-      ctx.fillStyle = this.fg;
-      ctx.fillText(text, x, n.y);
+    for (const g of items) {
+      if (!g || !g.on) continue;
+      const strong = (focus && g.n.id === focus.id) || (this.selected && g.n.id === this.selected.id) || this.largest.has(g.n.id);
+      const font = `${strong ? 600 : 500} 11px ${GRAPH_FONT}`;
+      const text = g.n.name.length > 24 ? `${g.n.name.slice(0, 23)}…` : g.n.name;
+      const tw = this.textWidth(text, font);
+      const top = g.y + g.r + 3;
+      const box = [g.x - tw / 2 - 2, top, g.x + tw / 2 + 2, top + 14];
+      if (box[0] < 2 || box[2] > w - 2 || box[3] > h - 2) continue;
+      if (placed.some((b) => b[0] < box[2] && b[2] > box[0] && b[1] < box[3] && b[3] > box[1])) continue;
+      if (!(focus && g.n.id === focus.id) && this.coversNode(box, pos, g.n.id, hi)) continue;
+      placed.push(box);
+      ctx.globalAlpha = hi || this.largest.has(g.n.id) ? 1 : fade;
+      ctx.font = font;
+      if (glow) {
+        ctx.shadowColor = 'rgba(6,7,12,.9)';
+        ctx.shadowBlur = 6;
+      }
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = glow ? '#06070c' : this.halo;
+      ctx.strokeText(text, g.x, top + 7);
+      ctx.fillStyle = glow ? '#e8ebf5' : this.fg;
+      ctx.fillText(text, g.x, top + 7);
+      ctx.shadowBlur = 0;
     }
     ctx.globalAlpha = 1;
+    return placed;
+  }
+
+  /** The relation name on a focused node's strongest typed relations, where it fits. */
+  drawRelationNames(mids, placed, pos, hi, w, h) {
+    const ctx = this.ctx;
+    const font = `500 10px ${GRAPH_FONT}`;
+    const items = mids.filter((m) => !m.l.co && m.l.fam.id !== 'other').sort((a, b) => b.l.weight - a.l.weight).slice(0, 14);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (const m of items) {
+      const text = m.l.type.replace(/_/g, ' ');
+      const tw = this.textWidth(text, font);
+      const box = [m.x - tw / 2 - 3, m.y - 7, m.x + tw / 2 + 3, m.y + 7];
+      if (box[0] < 2 || box[2] > w - 2 || box[1] < 2 || box[3] > h - 2) continue;
+      if (placed.some((b) => b[0] < box[2] && b[2] > box[0] && b[1] < box[3] && b[3] > box[1]) || this.coversNode(box, pos, null, hi)) continue;
+      placed.push(box);
+      ctx.fillStyle = 'rgba(11,13,18,.82)';
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(box[0], box[1], box[2] - box[0], box[3] - box[1], 4);
+      else ctx.rect(box[0], box[1], box[2] - box[0], box[3] - box[1]);
+      ctx.fill();
+      ctx.font = font;
+      ctx.fillStyle = '#b9c1ce';
+      ctx.fillText(text, m.x, m.y + 0.5);
+    }
+  }
+
+  /** A type's icon, drawn in a unit box scaled to `s` with a `lw`-pixel line: the Mac app uses the matching SF Symbols. */
+  static icon(ctx, type, x, y, s, color, lw) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(s, s);
+    ctx.lineWidth = lw / s;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    switch (type) {
+      case 'organization': // building
+        ctx.rect(-0.55, -0.72, 1.1, 1.45);
+        ctx.stroke();
+        for (const yy of [-0.42, -0.08, 0.26]) for (const xx of [-0.22, 0.22]) ctx.fillRect(xx - 0.09, yy - 0.08, 0.18, 0.16);
+        break;
+      case 'person':
+        ctx.arc(0, -0.36, 0.3, 0, Math.PI * 2);
+        ctx.moveTo(-0.66, 0.78);
+        ctx.quadraticCurveTo(-0.62, 0.06, 0, 0.06);
+        ctx.quadraticCurveTo(0.62, 0.06, 0.66, 0.78);
+        ctx.stroke();
+        break;
+      case 'product': // box
+        ctx.moveTo(0, -0.78); ctx.lineTo(0.68, -0.39); ctx.lineTo(0.68, 0.39); ctx.lineTo(0, 0.78); ctx.lineTo(-0.68, 0.39); ctx.lineTo(-0.68, -0.39); ctx.closePath();
+        ctx.moveTo(-0.68, -0.39); ctx.lineTo(0, 0); ctx.lineTo(0.68, -0.39); ctx.moveTo(0, 0); ctx.lineTo(0, 0.78);
+        ctx.stroke();
+        break;
+      case 'concept': // spark
+        ctx.moveTo(0, -0.82); ctx.quadraticCurveTo(0.1, -0.1, 0.82, 0); ctx.quadraticCurveTo(0.1, 0.1, 0, 0.82); ctx.quadraticCurveTo(-0.1, 0.1, -0.82, 0); ctx.quadraticCurveTo(-0.1, -0.1, 0, -0.82);
+        ctx.stroke();
+        break;
+      case 'location': // pin
+        ctx.arc(0, -0.22, 0.5, Math.PI * 0.8, Math.PI * 0.2);
+        ctx.lineTo(0, 0.82);
+        ctx.closePath();
+        ctx.stroke();
+        ctx.beginPath(); ctx.arc(0, -0.22, 0.16, 0, Math.PI * 2); ctx.fill();
+        break;
+      case 'event': // calendar
+        ctx.rect(-0.66, -0.52, 1.32, 1.22);
+        ctx.moveTo(-0.66, -0.14); ctx.lineTo(0.66, -0.14);
+        ctx.moveTo(-0.32, -0.78); ctx.lineTo(-0.32, -0.36); ctx.moveTo(0.32, -0.78); ctx.lineTo(0.32, -0.36);
+        ctx.stroke();
+        break;
+      case 'technology': // chip
+        ctx.rect(-0.46, -0.46, 0.92, 0.92);
+        for (const v of [-0.2, 0.2]) { ctx.moveTo(v, -0.46); ctx.lineTo(v, -0.78); ctx.moveTo(v, 0.46); ctx.lineTo(v, 0.78); ctx.moveTo(-0.46, v); ctx.lineTo(-0.78, v); ctx.moveTo(0.46, v); ctx.lineTo(0.78, v); }
+        ctx.stroke();
+        break;
+      case 'datasource': // cylinder
+        ctx.ellipse(0, -0.5, 0.62, 0.22, 0, 0, Math.PI * 2);
+        ctx.moveTo(-0.62, -0.5); ctx.lineTo(-0.62, 0.5); ctx.ellipse(0, 0.5, 0.62, 0.22, 0, Math.PI, 0, true); ctx.lineTo(0.62, -0.5);
+        ctx.stroke();
+        break;
+      case 'dataset': // table
+        ctx.rect(-0.68, -0.56, 1.36, 1.12);
+        ctx.moveTo(-0.68, -0.18); ctx.lineTo(0.68, -0.18); ctx.moveTo(-0.14, -0.56); ctx.lineTo(-0.14, 0.56);
+        ctx.stroke();
+        break;
+      case 'project': // flag
+        ctx.moveTo(-0.5, 0.82); ctx.lineTo(-0.5, -0.78); ctx.lineTo(0.62, -0.5); ctx.lineTo(-0.5, -0.16);
+        ctx.stroke();
+        break;
+      case 'component': // nut
+        for (let i = 0; i < 6; i++) {
+          const a = Math.PI / 6 + (i * Math.PI) / 3;
+          if (i) ctx.lineTo(Math.cos(a) * 0.78, Math.sin(a) * 0.78);
+          else ctx.moveTo(Math.cos(a) * 0.78, Math.sin(a) * 0.78);
+        }
+        ctx.closePath();
+        ctx.moveTo(0.3, 0); ctx.arc(0, 0, 0.3, 0, Math.PI * 2);
+        ctx.stroke();
+        break;
+      default: // three dots
+        for (const xx of [-0.45, 0, 0.45]) { ctx.moveTo(xx + 0.13, 0); ctx.arc(xx, 0, 0.13, 0, Math.PI * 2); }
+        ctx.fill();
+    }
+    ctx.restore();
   }
 }
 

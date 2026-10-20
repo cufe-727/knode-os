@@ -10,6 +10,8 @@ struct GraphSettings: Codable, Equatable {
     /// Nodes to ask the service for: the top entities by mentions in an overview, the cap in a local graph.
     var limit = 150
     var hiddenTypes: [String] = []
+    /// Relation families (`GraphPalette.Family.id`) left out; co-occurrence has its own switch, `cooccur`.
+    var hiddenRelations: [String] = []
     var hideOrphans = false
     /// Draw the derived co-occurrence edges; in an overview, off also spares the service the join.
     var cooccur = true
@@ -21,6 +23,8 @@ struct GraphSettings: Codable, Equatable {
     var arrows = false
     /// Keep a dragged node where it was dropped instead of letting the forces take it back.
     var pin = false
+    /// Coronas round the nodes, light-blended relations and particles along a focused node's relations.
+    var glow = true
     var center = 0.06
     var repel = 180.0
     var linkDistance = 90.0
@@ -29,7 +33,7 @@ struct GraphSettings: Codable, Equatable {
     static let nodeCounts = [50, 100, 150, 200, 300, 400]
 
     enum CodingKeys: String, CodingKey {
-        case limit, hiddenTypes, hideOrphans, cooccur, minWeight, nodeSize, linkWidth, textFade, arrows, pin, center, repel, linkDistance
+        case limit, hiddenTypes, hiddenRelations, hideOrphans, cooccur, minWeight, nodeSize, linkWidth, textFade, arrows, pin, glow, center, repel, linkDistance
     }
 
     init() {}
@@ -46,6 +50,7 @@ struct GraphSettings: Codable, Equatable {
         let defaults = GraphSettings()
         limit = try c.decodeIfPresent(Int.self, forKey: .limit) ?? defaults.limit
         hiddenTypes = try c.decodeIfPresent([String].self, forKey: .hiddenTypes) ?? defaults.hiddenTypes
+        hiddenRelations = try c.decodeIfPresent([String].self, forKey: .hiddenRelations) ?? defaults.hiddenRelations
         hideOrphans = try c.decodeIfPresent(Bool.self, forKey: .hideOrphans) ?? defaults.hideOrphans
         cooccur = try c.decodeIfPresent(Bool.self, forKey: .cooccur) ?? defaults.cooccur
         minWeight = try c.decodeIfPresent(Double.self, forKey: .minWeight) ?? defaults.minWeight
@@ -54,6 +59,7 @@ struct GraphSettings: Codable, Equatable {
         textFade = try c.decodeIfPresent(Double.self, forKey: .textFade) ?? defaults.textFade
         arrows = try c.decodeIfPresent(Bool.self, forKey: .arrows) ?? defaults.arrows
         pin = try c.decodeIfPresent(Bool.self, forKey: .pin) ?? defaults.pin
+        glow = try c.decodeIfPresent(Bool.self, forKey: .glow) ?? defaults.glow
         center = try c.decodeIfPresent(Double.self, forKey: .center) ?? defaults.center
         repel = try c.decodeIfPresent(Double.self, forKey: .repel) ?? defaults.repel
         linkDistance = try c.decodeIfPresent(Double.self, forKey: .linkDistance) ?? defaults.linkDistance
@@ -75,7 +81,8 @@ struct GraphSettings: Codable, Equatable {
 
     /// Changes to which nodes and edges the reply shows.
     func filtersDiffer(from old: GraphSettings) -> Bool {
-        hiddenTypes != old.hiddenTypes || hideOrphans != old.hideOrphans || cooccur != old.cooccur || minWeight != old.minWeight
+        hiddenTypes != old.hiddenTypes || hiddenRelations != old.hiddenRelations || hideOrphans != old.hideOrphans
+            || cooccur != old.cooccur || minWeight != old.minWeight
     }
 }
 
@@ -83,7 +90,8 @@ struct GraphSettings: Codable, Equatable {
  * What the canvas shows: the service's reply under the current filters, with
  * the adjacency that hover and the side panel read. Node sizes follow links
  * the way Obsidian's do: the global typed degree when the service sent it,
- * else what is in view.
+ * else what is in view. Each node has two sizes: `radius` is what the layout
+ * keeps apart, `displayRadius` what is drawn.
  */
 struct GraphScene {
     struct Neighbour {
@@ -103,8 +111,13 @@ struct GraphScene {
     private(set) var inViewDegree: [String: Int] = [:]
     /// Types in the reply with how many nodes each has, most first: the legend, before any type is hidden.
     private(set) var typeCounts: [(type: String, count: Int)] = []
+    /// Relation families in the reply with how many edges each has, in the palette's order: the legend's
+    /// second row. Co-occurrence is always listed, since an overview without it does not fetch it.
+    private(set) var familyCounts: [(family: GraphPalette.Family, count: Int)] = []
     /// The twelve largest nodes keep their label however far out the view is.
     private(set) var largest: Set<String> = []
+    /// log(1 + degree) across the nodes in view, what `displayRadius` spreads over.
+    private var logDegrees: ClosedRange<Double> = 0...0
 
     init() {}
 
@@ -114,14 +127,21 @@ struct GraphScene {
         typeCounts = counts
             .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
             .map { (type: $0.key, count: $0.value) }
+        var perFamily: [String: Int] = [:]
+        for edge in response.edges { perFamily[GraphPalette.family(of: edge.type).id, default: 0] += 1 }
+        familyCounts = GraphPalette.families
+            .map { (family: $0, count: perFamily[$0.id] ?? 0) }
+            .filter { $0.count > 0 || $0.family.id == GraphPalette.cooccurrence.id }
         for (i, node) in response.nodes.enumerated() where rank[node.id] == nil { rank[node.id] = i }
 
         let hidden = Set(settings.hiddenTypes)
+        let hiddenFamilies = Set(settings.hiddenRelations)
         let kept = response.nodes.filter { !hidden.contains($0.type) }
         let ids = Set(kept.map(\.id))
         let shownEdges = response.edges.filter { edge in
             ids.contains(edge.source) && ids.contains(edge.target) && edge.source != edge.target
                 && (settings.cooccur || edge.type != "co_occurs") && edge.weight >= settings.minWeight
+                && !hiddenFamilies.contains(GraphPalette.family(of: edge.type).id)
         }
         var linked = Set<String>()
         for edge in shownEdges {
@@ -140,15 +160,34 @@ struct GraphScene {
         }
         for key in neighbours.keys { neighbours[key]?.sort { $0.edge.weight > $1.edge.weight } }
         largest = Set(nodes.sorted { degree(of: $0) > degree(of: $1) }.prefix(12).map(\.id))
+        let logs = nodes.map { log1p(Double(degree(of: $0))) }
+        if let lo = logs.min(), let hi = logs.max() { logDegrees = lo...hi }
     }
 
     func degree(of node: GraphNode) -> Int {
         node.degree ?? inViewDegree[node.id] ?? 0
     }
 
-    /// Radius from links: nodeSize × (3 + 2.2·√degree), capped at nodeSize × 22.
+    func degree(ofID id: String) -> Int {
+        byID[id].map { degree(of: $0) } ?? 0
+    }
+
+    /// The layout's radius, from links: nodeSize × (3 + 2.2·√degree), capped at nodeSize × 22. Nodes used to be drawn at it.
     func radius(of node: GraphNode, nodeSize: Double) -> Double {
         nodeSize * min(22, 3 + 2.2 * Double(degree(of: node)).squareRoot())
+    }
+
+    /**
+     * The drawn radius: log(1 + degree) spread across the nodes in view onto
+     * 4–18, times nodeSize. A top-150 overview has hundreds of links per
+     * node, so `radius` caps almost all of them at the same 22; this keeps
+     * hubs apart from the rest, and drawn smaller than the layout keeps them
+     * apart, nodes have room between them.
+     */
+    func displayRadius(of node: GraphNode, nodeSize: Double) -> Double {
+        let span = logDegrees.upperBound - logDegrees.lowerBound
+        let t = span > 0 ? (log1p(Double(degree(of: node))) - logDegrees.lowerBound) / span : 0.5
+        return nodeSize * (4 + 14 * min(1, max(0, t)))
     }
 
     /// A node with its neighbours in view: what hover and selection light up.
@@ -163,6 +202,6 @@ struct GraphScene {
     }
 
     var linkSpecs: [GraphSimulation.LinkSpec] {
-        edges.map { .init(source: $0.source, target: $0.target, weight: $0.weight, coOccurs: $0.type == "co_occurs") }
+        edges.map { .init(source: $0.source, target: $0.target, weight: $0.weight, coOccurs: $0.type == "co_occurs", type: $0.type) }
     }
 }
