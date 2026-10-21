@@ -205,3 +205,9 @@ regeneration and is itself a source.
   judge calls, taken by `serve`'s own slots and by remote workers, which read
   their setup from the server; remote embedding is proposed. How-to:
   [docs/remote-labeling.md](../remote-labeling.md).
+- [13 — The client contract: how other projects use knode-os, starting with rookie-trade](13-client-contract.md) ([中文](13-client-contract.zh-CN.md))
+  — proposed: one contract (`contract/`, generated OpenAPI and golden schemas)
+  behind `/remote/v1`, MCP and a thin Python SDK; tokens with a role and a
+  trust tier; `known_at`, a fourth time axis that reads only what was available
+  at a decision time; market data and a run registry read in place as
+  datasources; experiments and author track records written back as sources.
