@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { redactConfig, resolveDataDir, CONFIG_FILE, loadConfig, saveConfig } from './config.js';
 import { createContext } from './context.js';
-import { learnFrequentTerms } from './graph/concepts.js';
+import { learnFrequentTerms, relinkTier0 } from './graph/concepts.js';
 import { CONCEPT_FREQUENT_FILE, FREQUENT_MIN_CORPUS } from './graph/concept-stoplist.js';
 import { configuredPluginSpecs, loadPlugins } from './plugins/loader.js';
 import { pluginRegistry } from './plugins/registry.js';
@@ -1415,6 +1415,20 @@ entities
     const ctx = await createContext(dataDir());
     try {
       console.log(JSON.stringify(await auditDuplicateEntities(ctx, { onProgress: (m) => console.log(`  ${m}`) }), null, 2));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+entities
+  .command('relink')
+  .description('recompute every document\'s tier-0 links against the current link surfaces (after a stop-list edit or a rule change): mentions and counts follow, nothing is re-extracted')
+  .option('--limit <n>', 'relink only the first n documents by path (a trial run)')
+  .action(async (opts: { limit?: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const limit = opts.limit !== undefined ? Number(opts.limit) : undefined;
+      if (limit !== undefined && !(Number.isInteger(limit) && limit >= 0)) throw new Error('--limit takes a non-negative integer');
+      console.log(JSON.stringify(await relinkTier0(ctx.store, { limit, onProgress: (m) => console.log(`  ${m}`) }), null, 2));
     } finally {
       await ctx.store.close();
     }

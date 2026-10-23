@@ -26,10 +26,12 @@ import { keyOf } from './normalize.js';
  *               a person can see why a term is missing, and promote one to
  *               `allow`.
  *
- * The built-in words and a person's `terms` also keep link surfaces clean: a
- * generic alias is never matched, so it cannot pull every document onto one
- * entity. The learned list shapes mining only — a name frequent in a corpus
- * is often that corpus's hub entity, and linking it is the point.
+ * The built-in words and a person's `terms` also keep link surfaces and alias
+ * lists clean: a generic alias is never matched (src/graph/concepts.ts
+ * weakLinkKey) and is dropped from the entity row by the fold
+ * (aliasStopKeys). The learned list shapes mining and alias surfaces, never a
+ * name's — a name frequent in a corpus is often that corpus's hub entity, and
+ * linking it is the point.
  */
 
 export const CONCEPT_STOPLIST_FILE = `${CONCEPTS_DIR}/stoplist.yaml`;
@@ -252,4 +254,22 @@ export function stoplistStamp(dataDir: string): string {
 
 export function frequentStamp(dataDir: string): string {
   return fileStamp(path.join(dataDir, CONCEPT_FREQUENT_FILE));
+}
+
+const aliasStopCache = new Map<string, { stamp: string; keys: Set<string> }>();
+
+/**
+ * The words an alias may not be — the built-in lists and the workspace's
+ * `terms`, by normalized key — for the fold (src/lineage/fold.ts): an
+ * extractor's "other spellings" sometimes include 市场 or 公司, and an alias
+ * that ordinary would resolve and link every document onto one entity. Read
+ * once per data dir and again when stoplist.yaml changes.
+ */
+export function aliasStopKeys(dataDir: string): ReadonlySet<string> {
+  const stamp = stoplistStamp(dataDir);
+  const hit = aliasStopCache.get(dataDir);
+  if (hit && hit.stamp === stamp) return hit.keys;
+  const keys = stopKeySet(readConceptStoplist(dataDir), null);
+  aliasStopCache.set(dataDir, { stamp, keys });
+  return keys;
 }

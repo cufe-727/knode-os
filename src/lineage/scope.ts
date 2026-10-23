@@ -8,11 +8,12 @@ import { Store } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
 import { hasAtticSidecar, moveSidecarToAttic, readBlob, removeAtticSidecar, removeBlob } from './attic.js';
 import { emptyPropagation, Propagation, propagate, writeDeps } from './deps.js';
-import { FoldResult, foldTouched } from './fold.js';
+import { FoldOptions, FoldResult, foldTouched } from './fold.js';
 import { appendLedger, LedgerScopeRef, lockLedger, nextLedgerSeq } from './ledger.js';
 import { TrustTier, tierForActor } from './trust.js';
 import { DisposeReason, emptyTouched, InverseSpec, ScopeKind, ScopeRow, TouchedSet, WriterStats } from './types.js';
 import { runFsOps, ScopeWriter } from './writer.js';
+import { aliasStopKeys } from '../graph/concept-stoplist.js';
 import { loadOntology, typePrecedence } from '../graph/ontology.js';
 import { replaceRegion } from '../wiki/regions.js';
 
@@ -184,7 +185,7 @@ export async function applyScope(
   }
   const acl = opts.acl ?? [];
   const ontology = loadOntology(store.dataDir);
-  const precedence = typePrecedence(ontology);
+  const fold = foldOptions(store.dataDir, ontology);
 
   let writer!: ScopeWriter;
   let seq = 0;
@@ -199,7 +200,7 @@ export async function applyScope(
     const current = await findLiveScope(q, key.kind, key.key);
     if (current && current.sha === sha && !opts.force) return unchanged(current);
     if (current && (opts.replace ?? true)) {
-      await disposeTree(q, current, { reason: 'replaced', keepProjection: opts.keepProjectionOnReplace ?? key.kind === 'doc' }, txTime, precedence, disposed);
+      await disposeTree(q, current, { reason: 'replaced', keepProjection: opts.keepProjectionOnReplace ?? key.kind === 'doc' }, txTime, fold, disposed);
     }
     await q.query(
       `INSERT INTO scopes (id, kind, key, sha, parent_id, status, actor, applied_at, meta, trust, acl)
@@ -209,10 +210,10 @@ export async function applyScope(
     seq = await nextLedgerSeq(q);
     writer = new ScopeWriter(q, scope, txTime, store.dataDir, trust, ontology);
     await body(writer);
-    const fold = await foldTouched(q, writer.touched, txTime, { typePrecedence: precedence });
-    const propagation = await propagate(q, fold.changed, fold.tombstoned, txTime);
+    const folded = await foldTouched(q, writer.touched, txTime, fold);
+    const propagation = await propagate(q, folded.changed, folded.tombstoned, txTime);
     await q.query(`UPDATE scopes SET status = 'active' WHERE id = $1`, [id]);
-    return { scope, outcome: 'applied', touched: writer.touched, fold, propagation, stats: writer.stats };
+    return { scope, outcome: 'applied', touched: writer.touched, fold: folded, propagation, stats: writer.stats };
   });
   if (result.outcome === 'unchanged') return result;
   scope.status = 'active';
@@ -239,17 +240,22 @@ export async function applyScope(
 export async function disposeScope(store: Store, scopeId: string, opts: DisposeOptions): Promise<DisposeResult | null> {
   const actor = opts.actor ?? 'system';
   const txTime = opts.at ?? new Date().toISOString();
-  const precedence = typePrecedence(loadOntology(store.dataDir));
+  const fold = foldOptions(store.dataDir);
   let disposed: Disposed[] = [];
   const result = await store.tx(async (q) => {
     disposed = [];
     await lockLedger(q);
     const scope = await scopeById(q, scopeId);
     if (!scope || scope.status === 'disposed') return null;
-    return disposeTree(q, scope, { reason: opts.reason, keepProjection: opts.keepProjection }, txTime, precedence, disposed);
+    return disposeTree(q, scope, { reason: opts.reason, keepProjection: opts.keepProjection }, txTime, fold, disposed);
   });
   settleDisposed(store.dataDir, disposed, actor, opts.log);
   return result;
+}
+
+/** How every fold of one data dir runs: the ontology's type precedence and the words an alias may not be. */
+function foldOptions(dataDir: string, ontology = loadOntology(dataDir)): FoldOptions {
+  return { typePrecedence: typePrecedence(ontology), aliasStop: aliasStopKeys(dataDir) };
 }
 
 /** Dispose `scope` and its live children (first) inside an open transaction; what is left for after COMMIT goes to `out`. */
@@ -258,11 +264,11 @@ async function disposeTree(
   scope: ScopeRow,
   opts: { reason: DisposeReason; keepProjection?: boolean },
   txTime: string,
-  precedence: readonly string[],
+  fold: FoldOptions,
   out: Disposed[],
 ): Promise<DisposeResult> {
   const children = await liveChildren(q, scope.id);
-  for (const child of children) await disposeTree(q, child, { reason: opts.reason }, txTime, precedence, out);
+  for (const child of children) await disposeTree(q, child, { reason: opts.reason }, txTime, fold, out);
 
   const scopeId = scope.id;
   const touched = emptyTouched();
@@ -309,19 +315,19 @@ async function disposeTree(
     await q.query(`UPDATE effects SET reverted_at = $2::timestamptz WHERE seq = $1`, [e.seq, txTime]);
   }
 
-  const fold = await foldTouched(q, touched, txTime, { typePrecedence: precedence });
-  for (const d of tombstoned.documents) fold.tombstoned.documents.add(d);
-  for (const d of tombstoned.datasets) fold.tombstoned.datasets.add(d);
-  for (const d of touched.documents) fold.changed.documents.add(d);
-  for (const d of touched.datasets) fold.changed.datasets.add(d);
-  const propagation = await propagate(q, fold.changed, fold.tombstoned, txTime, { archive: opts.reason !== 'replaced' });
+  const folded = await foldTouched(q, touched, txTime, fold);
+  for (const d of tombstoned.documents) folded.tombstoned.documents.add(d);
+  for (const d of tombstoned.datasets) folded.tombstoned.datasets.add(d);
+  for (const d of touched.documents) folded.changed.documents.add(d);
+  for (const d of touched.datasets) folded.changed.datasets.add(d);
+  const propagation = await propagate(q, folded.changed, folded.tombstoned, txTime, { archive: opts.reason !== 'replaced' });
 
   await q.query(
     `UPDATE scopes SET status = 'disposed', disposed_at = $2::timestamptz, meta = meta || $3::jsonb WHERE id = $1`,
     [scopeId, txTime, JSON.stringify({ reason: opts.reason })],
   );
   out.push({ scope, reason: opts.reason, seq: await nextLedgerSeq(q), ts: txTime, fsInverses });
-  return { scope: { ...scope, status: 'disposed', disposed_at: txTime }, touched, fold, propagation, children: children.map((c) => c.id) };
+  return { scope: { ...scope, status: 'disposed', disposed_at: txTime }, touched, fold: folded, propagation, children: children.map((c) => c.id) };
 }
 
 /** After COMMIT, in dispose order (children first): file inverses, the attic move, the ledger line. */
@@ -516,7 +522,6 @@ export async function disposeOrphanDocument(
   const dropped = !doc ? null : await store.tx(async (q) => {
     await lockLedger(q);
     if (await findLiveScope(q, 'doc', key)) return 'live' as const; // applied since the caller looked
-    const precedence = typePrecedence(loadOntology(store.dataDir));
     const touched = emptyTouched();
     const tombstoned = emptyTouched();
     const mentioned = await q.query<{ entity_id: string }>(
@@ -528,7 +533,7 @@ export async function disposeOrphanDocument(
     await q.query(`UPDATE documents SET status = 'disposed', scope_id = NULL, updated_at = now() WHERE id = $1`, [doc.id]);
     touched.documents.add(key);
     tombstoned.documents.add(key);
-    const fold = await foldTouched(q, touched, txTime, { typePrecedence: precedence });
+    const fold = await foldTouched(q, touched, txTime, foldOptions(store.dataDir));
     for (const d of tombstoned.documents) fold.tombstoned.documents.add(d);
     const propagation = await propagate(q, fold.changed, fold.tombstoned, txTime);
     return { chunks: chunks.length, propagation, seq: last ? await nextLedgerSeq(q) : 0 };

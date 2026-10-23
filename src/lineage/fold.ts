@@ -37,6 +37,8 @@ export interface FoldResult {
 export interface FoldOptions {
   /** Entity type precedence (from the ontology); defaults to the built-in order. */
   typePrecedence?: readonly string[];
+  /** Words an alias may not be (src/graph/concept-stoplist.ts aliasStopKeys); none dropped when absent. */
+  aliasStop?: ReadonlySet<string>;
 }
 
 export async function foldTouched(q: Queryable, touched: TouchedSet, txTime: string, opts: FoldOptions = {}): Promise<FoldResult> {
@@ -44,7 +46,7 @@ export async function foldTouched(q: Queryable, touched: TouchedSet, txTime: str
   const relationIds = new Set(touched.relations);
   const claimIds = new Set(touched.claims);
 
-  await foldEntities(q, [...touched.entities], txTime, result, opts.typePrecedence);
+  await foldEntities(q, [...touched.entities], txTime, result, opts.typePrecedence, opts.aliasStop);
 
   // liveness flips cascade to the edges and claims that hang off the entity,
   // but only to the rows whose liveness the flip can change. A tombstone can
@@ -110,7 +112,7 @@ async function liveEvidence(q: Queryable, kind: string, ids: string[]): Promise<
   return groupBy(rows, (r) => r.target_id);
 }
 
-async function foldEntities(q: Queryable, ids: string[], txTime: string, result: FoldResult, precedence?: readonly string[]): Promise<void> {
+async function foldEntities(q: Queryable, ids: string[], txTime: string, result: FoldResult, precedence?: readonly string[], aliasStop?: ReadonlySet<string>): Promise<void> {
   if (ids.length === 0) return;
   const evidence = await liveEvidence(q, 'entity', ids);
   const mentionRows = await selectIn<{ entity_id: string; n: number }>(
@@ -128,7 +130,7 @@ async function foldEntities(q: Queryable, ids: string[], txTime: string, result:
     const rows = evidence.get(cur.id) ?? [];
     const mentionCount = mentions.get(cur.id) ?? 0;
     const wasLive = cur.tx_to === null;
-    const folded = foldEntityEvidence(cur.id, rows, mentionCount, cur, precedence);
+    const folded = foldEntityEvidence(cur.id, rows, mentionCount, cur, precedence, aliasStop);
     if (!folded) {
       if (wasLive) {
         await q.query(

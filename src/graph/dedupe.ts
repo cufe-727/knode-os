@@ -6,6 +6,7 @@ import { jsonFromReply, LlmClient } from '../llm/client.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { setSuggestionStatus } from '../store/queries.js';
 import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
+import { tier0Known, weakLinkKey } from './concepts.js';
 import { applyMerge } from './merge.js';
 import { typesCompatible } from './normalize.js';
 
@@ -147,7 +148,10 @@ export async function auditDuplicateEntities(
      JOIN entities eb ON eb.id = kb.entity_id AND eb.tx_to IS NULL AND eb.canonical_id IS NULL
      WHERE length(ka.alias_key) >= 2`,
   );
+  // a short number, a two-letter spelling or a stop word is shared by strangers (every "11", every 公司), not by duplicates
+  const { stop } = await tier0Known(store);
   for (const r of shared) {
+    if (weakLinkKey(r.alias_key, { isName: true, stop })) continue;
     const a = byId.get(r.a), b = byId.get(r.b);
     if (!a || !b) continue;
     if (r.kinds === 'exact/exact') propose(a, b, 0.95, `共享别名/名称 "${r.alias_key}"`);

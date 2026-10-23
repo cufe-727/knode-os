@@ -1,12 +1,13 @@
 import { foldTouched } from '../lineage/fold.js';
 import { lockLedger } from '../lineage/ledger.js';
-import { emptyTouched } from '../lineage/types.js';
+import { emptyTouched, ScopeRow } from '../lineage/types.js';
 import { ScopeWriter } from '../lineage/writer.js';
 import { loadSourceText } from '../ingest/source.js';
 import { ParsedMarkdown, parseFrontmatter, titleFromMarkdown } from '../markdown.js';
 import { Store } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
 import {
+  aliasStopKeys,
   CJK_FUNCTION_CHARS,
   EN_STOP,
   FREQUENT_MIN_CORPUS,
@@ -21,6 +22,7 @@ import {
   stoplistStamp,
   writeFrequentTerms,
 } from './concept-stoplist.js';
+import type { TrustTier } from '../lineage/trust.js';
 import { wikilinkName } from './frontmatter.js';
 import { keyOf, mentionKeys } from './normalize.js';
 import { loadOntology, typePrecedence } from './ontology.js';
@@ -41,10 +43,14 @@ import { PageContext } from './store.js';
  *      for them — names, aliases and the names of entities merged into them,
  *      via entity_alias_keys — plus the author its frontmatter declares in
  *      `source:`. Latin spellings match whole words, CJK spellings match as
- *      substrings. One mention is enough. A link writes `tier0.link` evidence
+ *      substrings. One mention is enough. A spelling that would link on its
+ *      own in any text is no surface (weakLinkKey): a number of fewer than
+ *      five digits, a one- or two-letter Latin spelling, a stop word, or — as
+ *      an alias — a corpus-frequent word. A link writes `tier0.link` evidence
  *      and chunk mentions on the existing entity, never a new node, and the
  *      matched text is masked before mining so no fragment of a known name
- *      can become a concept.
+ *      can become a concept. `relinkTier0` recomputes every document's links
+ *      after the surfaces changed.
  *   2. **Mining.** What is left is mined for a few topical terms: Latin
  *      proper-noun phrases, acronyms and code identifiers, and CJK words as
  *      `Intl.Segmenter` cuts them (a run of characters the segmenter does not
@@ -277,6 +283,10 @@ export interface LinkCandidate {
   type: string;
   /** Normalized lookup keys (entity_alias_keys / normalize.ts). */
   keys: string[];
+  /** The entity's aliases as written, for the extraction prompt (knownEntitiesIn). */
+  aliases?: string[];
+  /** Folded mention count: the order the prompt lists known entities in. */
+  mentions?: number;
 }
 
 export interface LinkIndex {
@@ -291,13 +301,40 @@ const MAX_KEY_CHARS = 32;
 const LATIN_GAP = 2;
 const GAP_RE = /^[\s\-.·'’&]*$/;
 
-export function buildLinkIndex(candidates: LinkCandidate[], stop?: Set<string>): LinkIndex {
+/** A number of fewer than this many digits is a date, a count or a price before it is a ticker. */
+const MIN_NUMERIC_KEY = 5;
+/** A Latin spelling shorter than this is an abbreviation that turns up in any text. */
+const MIN_LATIN_KEY = 3;
+const DIGITS_RE = /^\d+$/;
+const ASCII_KEY_RE = /^[a-z0-9]+$/;
+
+/**
+ * A spelling that must not link a document on its own, whatever entity it
+ * belongs to: a number of fewer than five digits ("11" sits in every
+ * `11-24 11:18` heading and linked a phone to seven thousand documents), a
+ * one- or two-letter Latin spelling (an abbreviation found inside any text),
+ * a term the stop list names, and — for an alias, never for the entity's own
+ * name — a term the corpus-frequent list names: an ordinary word the
+ * extractor reported as "another spelling" (市场, 指数, 大盘 for A股) would
+ * pull every document onto one entity, while a frequent *name* is that
+ * corpus's hub and linking it is the point.
+ */
+export function weakLinkKey(key: string, opts: { isName: boolean; stop?: ReadonlySet<string>; aliasStop?: ReadonlySet<string> }): boolean {
+  if (DIGITS_RE.test(key)) return key.length < MIN_NUMERIC_KEY;
+  if (ASCII_KEY_RE.test(key) && key.length < MIN_LATIN_KEY) return true;
+  if (opts.stop?.has(key)) return true;
+  return !opts.isName && Boolean(opts.aliasStop?.has(key));
+}
+
+export function buildLinkIndex(candidates: LinkCandidate[], stop?: ReadonlySet<string>, aliasStop?: ReadonlySet<string>): LinkIndex {
   const byKey = new Map<string, LinkCandidate>();
   const prefixes = new Set<string>();
   let maxChars = 0;
   for (const c of candidates) {
+    const nameKey = keyOf(c.name);
     for (const k of c.keys) {
-      if (k.length < 2 || k.length > MAX_KEY_CHARS || stop?.has(k) || byKey.has(k)) continue;
+      if (k.length < 2 || k.length > MAX_KEY_CHARS || byKey.has(k)) continue;
+      if (weakLinkKey(k, { isName: k === nameKey, stop, aliasStop })) continue;
       byKey.set(k, c);
       if (k.length > maxChars) maxChars = k.length;
       for (let i = 1; i < k.length; i++) prefixes.add(k.slice(0, i));
@@ -391,6 +428,8 @@ interface CandidateRow {
   id: string;
   name: string;
   type: string;
+  aliases: unknown;
+  mention_count: number;
   alias_key: string;
   kind: string;
 }
@@ -406,7 +445,10 @@ function groupCandidates(rows: CandidateRow[], mode: 'exact' | 'suffix'): LinkCa
   for (const r of rows) {
     if (mode === 'exact' && r.kind !== 'exact') continue;
     let c = out.get(r.id);
-    if (!c) out.set(r.id, (c = { id: r.id, name: r.name, type: r.type, keys: [] }));
+    if (!c) {
+      const aliases = Array.isArray(r.aliases) ? r.aliases.map(String) : [];
+      out.set(r.id, (c = { id: r.id, name: r.name, type: r.type, keys: [], aliases, mentions: Number(r.mention_count) || 0 }));
+    }
     // a person's nickname that is also an ordinary word (老大) links nothing; the person's own name always does
     if (r.type === 'person' && r.alias_key.length <= 2 && r.alias_key !== keyOf(r.name) && HAN_RE.test(r.alias_key) && isDictionaryWord(r.alias_key)) continue;
     c.keys.push(r.alias_key);
@@ -417,8 +459,8 @@ function groupCandidates(rows: CandidateRow[], mode: 'exact' | 'suffix'): LinkCa
 /** Live typed entities with every spelling they answer to, hottest first. */
 export async function loadLinkCandidates(q: Queryable, dataDir: string, limit = LINK_CANDIDATE_LIMIT): Promise<LinkCandidate[]> {
   const rows = await q.query<CandidateRow>(
-    `SELECT e.id, e.name, e.type, k.alias_key, k.kind
-     FROM (SELECT id, name, type, mention_count FROM entities
+    `SELECT e.id, e.name, e.type, e.aliases, e.mention_count, k.alias_key, k.kind
+     FROM (SELECT id, name, type, aliases, mention_count FROM entities
            WHERE tx_to IS NULL AND type <> 'concept' AND canonical_id IS NULL
            ORDER BY mention_count DESC, id LIMIT $1) e
      JOIN entity_alias_keys k ON k.entity_id = e.id
@@ -437,7 +479,7 @@ export async function typedEntitiesNamed(q: Queryable, dataDir: string, names: s
   const list = [...keys];
   const ph = list.map((_, i) => `$${i + 1}`).join(',');
   const rows = await q.query<CandidateRow>(
-    `SELECT e.id, e.name, e.type, k.alias_key, k.kind
+    `SELECT e.id, e.name, e.type, e.aliases, e.mention_count, k.alias_key, k.kind
      FROM entity_alias_keys k JOIN entities e ON e.id = k.entity_id
      WHERE k.alias_key IN (${ph}) AND e.tx_to IS NULL AND e.type <> 'concept' AND e.canonical_id IS NULL
      ORDER BY e.mention_count DESC, e.id, k.alias_key`,
@@ -522,9 +564,10 @@ async function refreshKnown(store: Store, c: KnownCache, force: boolean): Promis
   if (rowsChanged || stopStamp !== c.stopStamp) {
     const editable = readConceptStoplist(store.dataDir);
     c.stop = stopKeySet(editable, readFrequentTerms(store.dataDir));
-    // link surfaces skip the generic words only: a name frequent in this
-    // corpus is often its hub entity, and linking that is the point
-    c.index = buildLinkIndex(c.rows, stopKeySet(editable, null));
+    // a name skips the generic words only: a name frequent in this corpus is
+    // often its hub entity, and linking that is the point; an alias that is a
+    // frequent word links nothing (weakLinkKey)
+    c.index = buildLinkIndex(c.rows, stopKeySet(editable, null), c.stop);
     c.stopStamp = stopStamp;
   }
   c.probedAt = Date.now();
@@ -761,8 +804,113 @@ export async function retireTier0Placeholders(store: Store, docScopeId: string, 
     );
     for (const id of ids) touched.entities.add(id);
     await q.query(`DELETE FROM entity_mentions WHERE scope_id = $1 AND entity_id IN (${ph(2)})`, [docScopeId, ...ids]);
-    await foldTouched(q, touched, txTime, { typePrecedence: precedence });
+    await foldTouched(q, touched, txTime, { typePrecedence: precedence, aliasStop: aliasStopKeys(store.dataDir) });
     result = { entities: ids.length };
   });
   return result;
+}
+
+/* ───────────────────────────── relinking ───────────────────────────── */
+
+export interface RelinkStats {
+  /** Source documents whose links were recomputed. */
+  documents: number;
+  /** `tier0.link` evidence rows closed, and written again. */
+  linksBefore: number;
+  linksAfter: number;
+  /** Entities folded afterwards: every one that lost or gained a link. */
+  entities: number;
+}
+
+/** Entities folded per transaction once every document is relinked. */
+const RELINK_FOLD_BATCH = 500;
+
+/**
+ * Recompute every live source document's tier-0 links against the current
+ * link surfaces — after the surface rules changed (weakLinkKey) or the stop
+ * lists did — without re-applying the documents. Per document, in its own
+ * transaction: the scope's `tier0.link` evidence is closed, the mentions of the
+ * entities it had only linked go with it, and the links are planned and
+ * written again from the text and the chunks. The entities touched are folded
+ * once at the end, in batches, not per document — a hub entity has tens of
+ * thousands of evidence rows and would otherwise be refolded for every
+ * document that names it. Mined placeholders, tier-1 and the sidecars are not
+ * touched; a history rebuild recomputes tier-0 from the text the same way.
+ * `knode-os entities relink`.
+ */
+export async function relinkTier0(store: Store, opts: { onProgress?: (msg: string) => void; limit?: number } = {}): Promise<RelinkStats> {
+  const progress = opts.onProgress ?? (() => {});
+  await tier0Known(store, { force: true });
+  const ontology = loadOntology(store.dataDir);
+  const precedence = typePrecedence(ontology);
+  const aliasStop = aliasStopKeys(store.dataDir);
+  const docs = await store.query<{ id: string; path: string; scope_id: string }>(
+    `SELECT d.id, d.path, d.scope_id FROM documents d JOIN scopes s ON s.id = d.scope_id
+     WHERE d.root = 'docs' AND d.status = 'indexed' AND d.kind = 'source' AND s.status = 'active'
+     ORDER BY d.path`,
+  );
+  const work = opts.limit !== undefined ? docs.slice(0, Math.max(0, opts.limit)) : docs;
+  const touched = new Set<string>();
+  const stats: RelinkStats = { documents: 0, linksBefore: 0, linksAfter: 0, entities: 0 };
+  for (const doc of work) {
+    const source = loadSourceText(store.dataDir, doc.path, 'docs');
+    if (!source) continue;
+    const parsed = parseFrontmatter(source.text);
+    const title = titleFromMarkdown(doc.path, parsed);
+    // planned outside the transaction, as an apply plans it (src/ingest/apply.ts)
+    const plan = await planTier0(store, parsed, title);
+    const txTime = new Date().toISOString();
+    await store.tx(async (q) => {
+      // folds nothing, but closes and writes evidence: queue on the ledger lock like every scope transaction
+      await lockLedger(q);
+      const [scope] = await q.query<ScopeRow & { trust: string | null }>(`SELECT * FROM scopes WHERE id = $1 AND status = 'active'`, [doc.scope_id]);
+      if (!scope) return;
+      // a mention row is shared by every scope that found the entity in the chunk (one primary key),
+      // so the mentions of an entity the document's tier-1 extraction or its own other evidence
+      // supports stay: only what the links alone brought is deleted
+      const old = await q.query<{ target_id: string; others: boolean }>(
+        `SELECT ev.target_id,
+                EXISTS (SELECT 1 FROM evidence o JOIN scopes s ON s.id = o.scope_id
+                        WHERE (o.scope_id = ev.scope_id OR s.parent_id = ev.scope_id) AND s.status <> 'disposed'
+                          AND o.kind = 'entity' AND o.target_id = ev.target_id AND o.extractor <> $2 AND o.tx_to IS NULL) AS others
+         FROM evidence ev WHERE ev.scope_id = $1 AND ev.kind = 'entity' AND ev.extractor = $2 AND ev.tx_to IS NULL`,
+        [scope.id, LINK_EXTRACTOR],
+      );
+      if (old.length > 0) {
+        await q.query(
+          `UPDATE evidence SET tx_to = $2::timestamptz WHERE scope_id = $1 AND kind = 'entity' AND extractor = $3 AND tx_to IS NULL`,
+          [scope.id, txTime, LINK_EXTRACTOR],
+        );
+        const linkOnly = old.filter((r) => !r.others).map((r) => r.target_id);
+        if (linkOnly.length > 0) {
+          await q.query(`DELETE FROM entity_mentions WHERE scope_id = $1 AND entity_id IN (${linkOnly.map((_, i) => `$${i + 2}`).join(',')})`, [scope.id, ...linkOnly]);
+        }
+        for (const r of old) touched.add(r.target_id);
+        stats.linksBefore += old.length;
+      }
+      const chunks = await q.query<{ id: string; content: string }>(`SELECT id, content FROM chunks WHERE document_id = $1 ORDER BY seq`, [doc.id]);
+      const page: PageContext = { documentId: doc.id, path: doc.path, title: title ?? doc.path, chunkIds: chunks };
+      const trust: TrustTier = scope.trust === 'quarantined' ? 'quarantined' : 'trusted';
+      const linked = await wireLinks(new ScopeWriter(q, scope, txTime, store.dataDir, trust, ontology), page, plan.links);
+      for (const id of linked.ids) touched.add(id);
+      stats.linksAfter += linked.ids.length;
+      stats.documents++;
+    });
+    if (stats.documents % 500 === 0) progress(`relink: ${stats.documents}/${work.length} documents`);
+  }
+  const ids = [...touched];
+  for (let i = 0; i < ids.length; i += RELINK_FOLD_BATCH) {
+    const batch = ids.slice(i, i + RELINK_FOLD_BATCH);
+    const txTime = new Date().toISOString();
+    await store.tx(async (q) => {
+      await lockLedger(q);
+      const t = emptyTouched();
+      for (const id of batch) t.entities.add(id);
+      await foldTouched(q, t, txTime, { typePrecedence: precedence, aliasStop });
+    });
+    progress(`relink: folded ${Math.min(i + RELINK_FOLD_BATCH, ids.length)}/${ids.length} entities`);
+  }
+  stats.entities = ids.length;
+  invalidateTier0Known(store.dataDir);
+  return stats;
 }

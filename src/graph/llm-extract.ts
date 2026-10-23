@@ -1,8 +1,9 @@
 import { LLM_EXTRACT_INPUT_CHARS } from '../constants.js';
 import { dateEnd, dateStart } from '../store/dates.js';
-import { Queryable } from '../store/migrations.js';
+import { Store } from '../store/db.js';
 import { ScopeWriter } from '../lineage/writer.js';
 import { ChatMessage, LlmClient } from '../llm/client.js';
+import { findLinks, LinkCandidate, tier0Known } from './concepts.js';
 import { builtinOntology, Ontology, promptFragment } from './ontology.js';
 import {
   CLAIM_STATUS,
@@ -74,26 +75,46 @@ function knownEntitiesBlock(known: KnownEntity[]): string {
   return `Known entities already in the knowledge graph — reuse these canonical names, or reference one via sameAs when you extract it under another spelling:\n${lines.join('\n')}\n\n`;
 }
 
+/** Aliases listed per known entity: the spellings this text uses first, then the stored ones. */
+const KNOWN_ALIASES_SHOWN = 6;
+
 /**
- * Entities the graph already holds that appear in `text` (by name or alias),
- * hottest first — the candidate list the tier-1 prompt shows so the LLM
- * links to them instead of minting near-duplicates.
+ * Entities the graph already holds that appear in `text`, most often first —
+ * the candidate list the tier-1 prompt shows so the LLM links to them instead
+ * of minting near-duplicates. Found the way tier-0 links a document
+ * (src/graph/concepts.ts): the workspace's link index, Latin spellings as
+ * whole words, CJK as substrings, and never on a weak surface — a bare
+ * substring scan listed iPhone 11 for every "11" in a date and 债券 for the
+ * "cd" in "cdn". The aliases shown are capped: an entity with two hundred
+ * spellings is named by the ones in this text and a few more.
  */
-export async function knownEntitiesIn(q: Queryable, text: string, limit = 30): Promise<KnownEntity[]> {
-  const rows = await q.query<{ name: string; type: string; aliases: string[] }>(
-    `SELECT name, type, aliases FROM entities
-     WHERE tx_to IS NULL AND canonical_id IS NULL AND type <> 'concept' AND mention_count >= 2
-     ORDER BY mention_count DESC LIMIT 500`,
-  );
-  const lc = text.toLowerCase();
-  const out: KnownEntity[] = [];
-  for (const r of rows) {
-    const aliases = Array.isArray(r.aliases) ? r.aliases.map(String) : [];
-    const needles = [r.name, ...aliases].map((x) => x.toLowerCase()).filter((x) => x.length >= 2);
-    if (needles.some((n) => lc.includes(n))) out.push({ name: r.name, type: r.type, aliases });
-    if (out.length >= limit) break;
+export async function knownEntitiesIn(store: Store, text: string, limit = 30): Promise<KnownEntity[]> {
+  const { index } = await tier0Known(store);
+  const hits = new Map<string, { candidate: LinkCandidate; count: number; surfaces: string[] }>();
+  for (const span of findLinks(text, index)) {
+    const c = span.candidate;
+    if (!c.id) continue;
+    let hit = hits.get(c.id);
+    if (!hit) hits.set(c.id, (hit = { candidate: c, count: 0, surfaces: [] }));
+    hit.count++;
+    const surface = text.slice(span.start, span.end);
+    if (!hit.surfaces.some((s) => s.toLowerCase() === surface.toLowerCase())) hit.surfaces.push(surface);
   }
-  return out;
+  return [...hits.values()]
+    .sort((a, b) => b.count - a.count || (b.candidate.mentions ?? 0) - (a.candidate.mentions ?? 0) || a.candidate.name.localeCompare(b.candidate.name))
+    .slice(0, limit)
+    .map(({ candidate, surfaces }) => {
+      const seen = new Set([candidate.name.toLowerCase()]);
+      const aliases: string[] = [];
+      for (const a of [...surfaces, ...(candidate.aliases ?? [])]) {
+        if (aliases.length >= KNOWN_ALIASES_SHOWN) break;
+        const k = a.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        aliases.push(a);
+      }
+      return { name: candidate.name, type: candidate.type, aliases };
+    });
 }
 
 /** Where a segment sits in a long document (docs/design/10): shown to the model above the text. */

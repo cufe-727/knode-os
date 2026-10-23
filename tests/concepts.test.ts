@@ -15,10 +15,14 @@ import {
   frontmatterNames,
   learnFrequentTerms,
   maskSpans,
+  relinkTier0,
   selectConcepts,
   stripTemplate,
+  weakLinkKey,
 } from '../src/graph/concepts.js';
+import { knownEntitiesIn } from '../src/graph/llm-extract.js';
 import { keyOf } from '../src/graph/normalize.js';
+import { documentIdFor } from '../src/ingest/apply.js';
 import { sync } from '../src/ingest/sync.js';
 import { findLiveScope } from '../src/lineage/scope.js';
 import { parseFrontmatter, titleFromMarkdown } from '../src/markdown.js';
@@ -112,7 +116,7 @@ const CAP_CHARS_FOR_MAX = 24 * 400;
 const KNOWN = `---
 title: 交易所与作者
 entities:
-  - { name: 纽约证券交易所, type: organization, aliases: ["NYSE"] }
+  - { name: 纽约证券交易所, type: organization, aliases: ["NYSE", "公司"] }
   - { name: 不明真相的群众, type: person }
 ---
 # 交易所与作者
@@ -205,6 +209,34 @@ describe('linking to what the graph knows', () => {
     const generic = buildLinkIndex([{ id: 'p', name: '某人', type: 'person', keys: ['某人', '公司'] }], stopKeySet({ terms: [], allow: [] }, null));
     expect(findLinks('这家公司的某人说', generic).map((s) => s.key)).toEqual(['某人']);
   });
+
+  it('never links on a short number, a two-letter spelling or a generic alias', () => {
+    const stop = stopKeySet({ terms: [], allow: [] }, null);
+    const frequent = new Set([keyOf('指数'), keyOf('茅台')]);
+    expect(weakLinkKey('11', { isName: false })).toBe(true);
+    expect(weakLinkKey('2025', { isName: true })).toBe(true);
+    expect(weakLinkKey('600519', { isName: false })).toBe(false);
+    expect(weakLinkKey('ai', { isName: true })).toBe(true);
+    expect(weakLinkKey('nyse', { isName: false })).toBe(false);
+    expect(weakLinkKey('a股', { isName: false })).toBe(false);
+    expect(weakLinkKey(keyOf('公司'), { isName: false, stop })).toBe(true);
+    expect(weakLinkKey(keyOf('公司'), { isName: true, stop })).toBe(true);
+    // a frequent word is no alias surface, but a frequent name is the hub it names
+    expect(weakLinkKey(keyOf('指数'), { isName: false, aliasStop: frequent })).toBe(true);
+    expect(weakLinkKey(keyOf('茅台'), { isName: true, aliasStop: frequent })).toBe(false);
+
+    const index = buildLinkIndex(
+      [
+        { id: 'iphone-11', name: 'iPhone 11', type: 'product', keys: ['iphone11', '11'] },
+        { id: 'a股', name: 'A股', type: 'dataset', keys: ['a股', keyOf('指数'), keyOf('公司')] },
+        { id: '茅台', name: '茅台', type: 'organization', keys: ['茅台'] },
+      ],
+      stop,
+      frequent,
+    );
+    const text = '## 11-24 11:18 · 表舅\n\nA股指数走弱，茅台和 iPhone 11 降价；公司观望。';
+    expect(findLinks(text, index).map((s) => `${s.candidate.id}:${text.slice(s.start, s.end)}`)).toEqual(['a股:A股', '茅台:茅台', 'iphone-11:iPhone 11']);
+  });
 });
 
 describe('tier-0 through sync', () => {
@@ -245,6 +277,10 @@ describe('tier-0 through sync', () => {
     expect(await count(`entities WHERE name = '纽约证券交易所' AND tx_to IS NULL`)).toBe(1);
     expect(await count(`entities WHERE id = '纽约证券交易所' AND type = 'organization' AND tx_to IS NULL`)).toBe(1);
     expect(await count(`entities WHERE id = '不明真相的群众' AND type = 'person' AND tx_to IS NULL`)).toBe(1);
+    // the declared alias that is a stop word stays in the evidence but out of the row
+    const [org] = await ctx.store.query<{ aliases: string[] }>(`SELECT aliases FROM entities WHERE id = '纽约证券交易所'`);
+    expect(org.aliases).toEqual(['NYSE']);
+    expect(await count(`entity_alias_keys WHERE entity_id = '纽约证券交易所' AND alias_key = $1`, [keyOf('公司')])).toBe(0);
 
     // no template noise, no fragments of the author name
     const noise = ['附件', ...AUTHOR_FRAGMENTS];
@@ -327,5 +363,50 @@ describe('tier-0 through sync', () => {
     // running again changes nothing
     await sync(ctx, { llmGraph: false });
     expect(await count(`evidence WHERE scope_id = $1 AND kind = 'entity' AND extractor = 'tier0.concept' AND tx_to IS NULL`, [scope.id])).toBe(1);
+  });
+
+  it('names for the extraction prompt only the entities the text really contains, with a few aliases', async () => {
+    const names = async (text: string) => (await knownEntitiesIn(ctx.store, text)).map((k) => k.name);
+    expect(await names('NYSEX 开盘后，纽约证券交易所的成交量放大')).toEqual(['纽约证券交易所']);
+    expect(await names('the nyse floor')).toEqual(['纽约证券交易所']);
+    // a whole word, never a substring; the author's name links as itself
+    expect(await names('NYSEX only, and silver')).toEqual([]);
+    expect(await names('不明真相的群众说过')).toEqual(['不明真相的群众']);
+    const [known] = await knownEntitiesIn(ctx.store, 'nyse 与 NYSE 都指纽约证券交易所');
+    expect(known).toEqual({ name: '纽约证券交易所', type: 'organization', aliases: ['nyse'] });
+  });
+
+  it('relinks every document from its text: a link no surface gives any more goes, its mentions and count with it', async () => {
+    const key = 'raw/docs/third.md';
+    const docId = documentIdFor(key);
+    const scope = (await findLiveScope(ctx.store, 'doc', key))!;
+    const [chunk] = await ctx.store.query<{ id: string }>(`SELECT id FROM chunks WHERE document_id = $1 ORDER BY seq LIMIT 1`, [docId]);
+    // the pollution a weak surface left behind: a link, and a mention, on a document that never names the organization
+    await ctx.store.query(
+      `INSERT INTO evidence (kind, target_id, scope_id, segment_id, weight, extractor, attrs, tx_from, trust)
+       VALUES ('entity', '纽约证券交易所', $1, $2, 0.5, 'tier0.link', '{"name":"纽约证券交易所","type":"concept"}', now(), 'trusted')`,
+      [scope.id, chunk.id],
+    );
+    await ctx.store.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id, scope_id) VALUES ('纽约证券交易所', $1, $2, $3) ON CONFLICT DO NOTHING`, [chunk.id, docId, scope.id]);
+    const digest = (await findLiveScope(ctx.store, 'doc', 'raw/docs/digest.md'))!;
+
+    const stats = await relinkTier0(ctx.store);
+    // three documents; the two genuine digest links and the planted one were closed
+    expect(stats).toMatchObject({ documents: 3, linksBefore: 3 });
+    expect(stats.entities).toBeGreaterThanOrEqual(2);
+    expect(await count(`evidence WHERE scope_id = $1 AND target_id = '纽约证券交易所' AND extractor = 'tier0.link' AND tx_to IS NULL`, [scope.id])).toBe(0);
+    expect(await count(`entity_mentions WHERE scope_id = $1 AND entity_id = '纽约证券交易所'`, [scope.id])).toBe(0);
+    // the digest's genuine links are written again (with whatever tier-1 has typed since), the closed rows stay as history
+    const live = await ctx.store.query<{ target_id: string }>(
+      `SELECT target_id FROM evidence WHERE scope_id = $1 AND extractor = 'tier0.link' AND tx_to IS NULL ORDER BY target_id`,
+      [digest.id],
+    );
+    expect(live.map((r) => r.target_id)).toEqual(expect.arrayContaining(['不明真相的群众', '纽约证券交易所']));
+    expect(await count(`evidence WHERE scope_id = $1 AND extractor = 'tier0.link' AND tx_to IS NOT NULL`, [digest.id])).toBe(2);
+    expect(await count(`entity_mentions WHERE scope_id = $1 AND entity_id = '纽约证券交易所'`, [digest.id])).toBeGreaterThan(0);
+    const [row] = await ctx.store.query<{ mention_count: number }>(`SELECT mention_count FROM entities WHERE id = '纽约证券交易所'`);
+    expect(row.mention_count).toBe(await count(`(SELECT DISTINCT chunk_id FROM entity_mentions WHERE entity_id = '纽约证券交易所') m`));
+    // running again changes nothing
+    expect(await relinkTier0(ctx.store)).toMatchObject({ documents: 3, linksBefore: stats.linksAfter, linksAfter: stats.linksAfter });
   });
 });

@@ -1,3 +1,4 @@
+import { keyOf } from '../graph/normalize.js';
 import { Queryable } from './migrations.js';
 
 /**
@@ -114,13 +115,19 @@ export interface EntityAsOf {
 
 export const TYPE_PRECEDENCE = ['person', 'organization', 'product', 'project', 'component', 'technology', 'event', 'location', 'datasource', 'dataset', 'other', 'concept'];
 
-/** Fold entity evidence into the row shape (shared by current-state folds and as_of reads). */
+/**
+ * Fold entity evidence into the row shape (shared by current-state folds and
+ * as_of reads). `aliasStop` names the words an alias may not be (the stop
+ * lists, by normalized key): an extractor's "other spelling" that is an
+ * ordinary word stays in the evidence but out of the row.
+ */
 export function foldEntityEvidence(
   id: string,
   rows: EvidenceAtRow[],
   mentionCount: number,
   fallback?: { name: string; type: string; description: string; aliases: string[] },
   precedence: readonly string[] = TYPE_PRECEDENCE,
+  aliasStop?: ReadonlySet<string>,
 ): EntityAsOf | null {
   if (rows.length === 0) return null;
   const sorted = [...rows].sort((a, b) =>
@@ -151,7 +158,7 @@ export function foldEntityEvidence(
     const list = Array.isArray(r.attrs.aliases) ? r.attrs.aliases : [];
     for (const a of list) {
       const s = String(a).trim();
-      if (!s) continue;
+      if (!s || aliasStop?.has(keyOf(s))) continue;
       const k = s.toLowerCase();
       if (!aliasSet.has(k)) aliasSet.set(k, s);
     }
