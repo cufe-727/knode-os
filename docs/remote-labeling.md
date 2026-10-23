@@ -45,10 +45,13 @@ changed while its segments were out, it is not written over its new text: the ne
 queue, and unchanged segments are reused from the sidecar. A summary of a document that changed while it was out
 is dropped; the new text gets a summary of its own after its extraction.
 
-A summary is due once a document's extraction is done (documents still in the extraction queue wait), the ones
-extracted most lately first. The reply goes to the summary cache in the document's sidecar, and the page is written
-from that cache, in turn with the reviews below and without a model call of the server's own. A page that could
-not be written is written from the cache later, so nothing a worker sent is lost to a restart.
+A summary is due once a document's extraction is done (documents still in the extraction queue wait) and the
+document is long enough for a page (`extraction.summaryMinChars`), the ones extracted most lately first. A document
+that fits one call is one task; a long one is a task per segment — several workers can hold its parts at once — and
+then one task that merges the parts (docs/design/14). A part's reply goes to the part cache in the document's
+sidecar, the final reply to its summary cache, and the page is written from that cache, in turn with the reviews
+below and without a model call of the server's own. A page that could not be written is written from the cache
+later, so nothing a worker sent is lost to a restart.
 
 The duplicate-entity and duplicate-claim audits run over what was written every `extraction.intervalMinutes`. Each
 builds all its judge calls first and offers them at once, so `serve`'s judge slots (and remote workers, where offered)

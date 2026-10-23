@@ -129,6 +129,21 @@ export interface SegmentHookContext {
   segment?: { index: number; total: number; heading: string | null };
 }
 
+/** What a `summary.request` hook sees of the summary being asked for (docs/design/14). */
+export interface SummaryHookContext {
+  title: string;
+  /** The text this call reads: the document, one segment of it, or the part summaries a merge call combines. */
+  text: string;
+  /** 'single': the whole document in one call; 'part': one segment of a long one; 'reduce': the call that merges the parts. */
+  step: 'single' | 'part' | 'reduce';
+  /** The language the page is written in, e.g. zh, en. */
+  language: string;
+  /** The graph's names the model may link — the only names allowed inside [[…]]. */
+  entities: string[];
+  /** The document's own platform and author, which are not to be listed as entities. */
+  channels: string[];
+}
+
 export interface DocumentAppliedEvent extends DocumentHookContext {
   outcome: 'applied';
   chunks: number;
@@ -157,7 +172,7 @@ export interface PipelineHooks {
   /** One extraction call's checked result, before it is kept in the sidecar and written to the graph. */
   'extract.result': (result: ExtractResult, ctx: DocumentHookContext & SegmentHookContext & { title: string; model: string }) => ExtractResult | Promise<ExtractResult>;
   /** The Summarize stage's prompt for one document. */
-  'summary.request': (messages: ChatMessage[], ctx: DocumentHookContext & { title: string; text: string }) => ChatMessage[] | Promise<ChatMessage[]>;
+  'summary.request': (messages: ChatMessage[], ctx: DocumentHookContext & SegmentHookContext & SummaryHookContext) => ChatMessage[] | Promise<ChatMessage[]>;
   /** A document was applied as a scope: chunks, keyword index and tier-0 graph are in. */
   'document.applied': (event: DocumentAppliedEvent) => void | Promise<void>;
 }

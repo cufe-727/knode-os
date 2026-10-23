@@ -845,6 +845,15 @@ INSERT INTO meta (key, value) VALUES ('${COOCCURS_CLEANUP_META}', '{"pending": t
   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 `;
 
+// The length of a document's indexed text in characters, beside its bytes:
+// the Summarize stage leaves documents under `extraction.summaryMinChars`
+// out, and the scan that finds due documents must know that without reading
+// every file (docs/design/14). Written with every apply; rows indexed before
+// it exists keep NULL until the scan reads the text once (`documentChars`).
+const V14_DOCUMENT_CHARS = `
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS chars INTEGER;
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -876,6 +885,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 11, name: 'claim-merge', up: async (q) => execScript(q, V11_CLAIM_MERGE) },
   { version: 12, name: 'dispose-indexes', up: async (q) => execScript(q, V12_DISPOSE_INDEXES) },
   { version: 13, name: 'derived-cooccurrence', up: async (q) => execScript(q, V13_DERIVED_COOCCURRENCE) },
+  { version: 14, name: 'document-chars', up: async (q) => execScript(q, V14_DOCUMENT_CHARS) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

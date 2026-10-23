@@ -244,7 +244,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
       // counted afresh on every run: a transaction rolled back for a deadlock runs the body again
       g = { entities: 0, relations: 0 };
       await w.document(
-        { id: docId, path: file, root, title, sha256: sha, mime: guessMime(file), bytes, kind: cls.kind, docDate },
+        { id: docId, path: file, root, title, sha256: sha, mime: guessMime(file), bytes, chars: raw.length, kind: cls.kind, docDate },
         chunkRows,
         vectors,
         embedder.model,

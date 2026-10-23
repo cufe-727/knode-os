@@ -52,6 +52,8 @@ export interface DocumentProjection {
   sha256: string;
   mime: string;
   bytes: number;
+  /** Length of the indexed text in characters (the Summarize stage's size threshold reads it). */
+  chars?: number;
   kind: 'source' | 'view';
   /** Reference date of the source (ISO), when one was found. */
   docDate?: string | null;
@@ -339,12 +341,12 @@ export class ScopeWriter {
     // a pre-lineage row may hold this path under another id: it is replaced wholesale
     await this.q.query(`DELETE FROM documents WHERE path = $1 AND id <> $2`, [row.path, row.id]);
     await this.q.query(
-      `INSERT INTO documents (id, path, root, title, sha256, mime, bytes, status, scope_id, kind, doc_date)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'indexed', $8, $9, $10::timestamptz)
+      `INSERT INTO documents (id, path, root, title, sha256, mime, bytes, chars, status, scope_id, kind, doc_date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'indexed', $9, $10, $11::timestamptz)
        ON CONFLICT (id) DO UPDATE SET
          path = EXCLUDED.path, root = EXCLUDED.root, title = EXCLUDED.title, sha256 = EXCLUDED.sha256, mime = EXCLUDED.mime,
-         bytes = EXCLUDED.bytes, status = 'indexed', error = NULL, scope_id = EXCLUDED.scope_id, kind = EXCLUDED.kind, doc_date = EXCLUDED.doc_date, updated_at = now()`,
-      [row.id, row.path, row.root, row.title, row.sha256, row.mime, row.bytes, this.scope.id, row.kind, toIso(row.docDate)],
+         bytes = EXCLUDED.bytes, chars = EXCLUDED.chars, status = 'indexed', error = NULL, scope_id = EXCLUDED.scope_id, kind = EXCLUDED.kind, doc_date = EXCLUDED.doc_date, updated_at = now()`,
+      [row.id, row.path, row.root, row.title, row.sha256, row.mime, row.bytes, row.chars ?? null, this.scope.id, row.kind, toIso(row.docDate)],
     );
     if (chunks.length === 0) {
       await this.q.query(`DELETE FROM chunks WHERE document_id = $1`, [row.id]);

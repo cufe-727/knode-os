@@ -160,12 +160,37 @@ export interface SidecarUsage {
   flushedAt: string | null;
 }
 
+/**
+ * How much of a long document its summary read (docs/design/14): the text was
+ * cut into `parts` segments, `read` of them were summarized, holding `share`
+ * of the characters and `sectionsRead` of the `sections` sub-headings.
+ */
+export interface SourceSummaryCoverage {
+  chars: number;
+  parts: number;
+  read: number;
+  share: number;
+  sections: number;
+  sectionsRead: number;
+}
+
 /** Cached LLM source summary, keyed by the content it was derived from. */
 export interface SourceSummaryCache {
   contentSha: string;
   model: string;
   generatedAt: string;
   body: string;
+  /** The language the summary was written in (zh, en, …); absent in caches written before docs/design/14. */
+  language?: string;
+  /** Present when the document was summarized in segments. */
+  coverage?: SourceSummaryCoverage;
+}
+
+/** One segment's summary of a long document, cached by the segment's text hash so an edit keeps the others. */
+export interface SourceSummaryPart {
+  body: string;
+  model: string;
+  generatedAt: string;
 }
 
 /** The assembled in-memory view of a sidecar directory. */
@@ -198,6 +223,7 @@ const CONTENT_FILE = 'content.md';
 const ORIGIN_FILE = 'origin.json';
 const VIEWS_DIR = 'views';
 const SOURCE_SUMMARY_FILE = `${VIEWS_DIR}/source-summary.md`;
+const SOURCE_SUMMARY_PARTS_FILE = `${VIEWS_DIR}/source-summary.parts.json`;
 const SOURCE_SUMMARY_FAILED_FILE = `${VIEWS_DIR}/source-summary.failed.json`;
 
 /* ------------------------------ low level ------------------------------ */
@@ -348,7 +374,7 @@ export function removeSidecar(dataDir: string, key: string): void {
  */
 export function sidecarHoldsPaidWork(dataDir: string, key: string): boolean {
   const dir = sidecarDir(dataDir, key);
-  if (isFile(path.join(dir, PART_FILES.tier1)) || isFile(path.join(dir, SOURCE_SUMMARY_FILE))) return true;
+  if (isFile(path.join(dir, PART_FILES.tier1)) || isFile(path.join(dir, SOURCE_SUMMARY_FILE)) || isFile(path.join(dir, SOURCE_SUMMARY_PARTS_FILE))) return true;
   if (!isFile(path.join(dir, CONTENT_FILE))) return false;
   return readPartFrom(dir, 'meta')?.conversion?.kind !== 'pdf-text';
 }
@@ -463,15 +489,71 @@ export function readSourceSummary(dataDir: string, key: string): SourceSummaryCa
   const model = cacheString(cache.frontmatter.model);
   const generatedAt = cacheString(cache.frontmatter.generatedAt);
   if (contentSha === null || model === null || generatedAt === null) return null;
-  return { contentSha, model, generatedAt, body: cache.body };
+  const coverage = parseCoverage(cacheString(cache.frontmatter.coverage));
+  const language = cacheString(cache.frontmatter.language);
+  return { contentSha, model, generatedAt, body: cache.body, ...(language ? { language } : {}), ...(coverage ? { coverage } : {}) };
 }
 
 export function writeSourceSummary(dataDir: string, key: string, cache: SourceSummaryCache): void {
   writeMarkdownCache(
     path.join(sidecarDir(dataDir, key), SOURCE_SUMMARY_FILE),
-    { contentSha: cache.contentSha, model: cache.model, generatedAt: cache.generatedAt },
+    {
+      contentSha: cache.contentSha,
+      model: cache.model,
+      generatedAt: cache.generatedAt,
+      ...(cache.language ? { language: cache.language } : {}),
+      // the cache file's values are strings: the coverage rides along as JSON
+      ...(cache.coverage ? { coverage: JSON.stringify(cache.coverage) } : {}),
+    },
     cache.body,
   );
+}
+
+function parseCoverage(raw: string | null): SourceSummaryCoverage | null {
+  if (!raw) return null;
+  try {
+    const c = JSON.parse(raw) as Partial<SourceSummaryCoverage>;
+    const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+    const chars = n(c.chars);
+    const parts = n(c.parts);
+    const read = n(c.read);
+    const share = n(c.share);
+    if (chars === null || parts === null || read === null || share === null) return null;
+    return { chars, parts, read, share, sections: n(c.sections) ?? 0, sectionsRead: n(c.sectionsRead) ?? 0 };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The part summaries of a long document (docs/design/14), by the hash of the
+ * segment each one summarizes — the same hash the segmented extractor keys
+ * its results by, so an edit re-summarizes only the segments it changed and
+ * an interrupted document resumes with the parts it has.
+ */
+export function readSourceSummaryParts(dataDir: string, key: string): Map<string, SourceSummaryPart> {
+  const raw = readJson<{ parts?: Record<string, Partial<SourceSummaryPart>> }>(path.join(sidecarDir(dataDir, key), SOURCE_SUMMARY_PARTS_FILE));
+  const out = new Map<string, SourceSummaryPart>();
+  if (!raw || typeof raw.parts !== 'object' || raw.parts === null) return out;
+  for (const [sha, p] of Object.entries(raw.parts)) {
+    if (typeof p?.body === 'string' && p.body.trim()) out.set(sha, { body: p.body, model: String(p.model ?? ''), generatedAt: String(p.generatedAt ?? '') });
+  }
+  return out;
+}
+
+/** Keep one part; parts of segments the document no longer has (not in `keep`) are dropped with it. */
+export function writeSourceSummaryPart(dataDir: string, key: string, sha: string, part: SourceSummaryPart, keep?: Iterable<string>): void {
+  const parts = readSourceSummaryParts(dataDir, key);
+  parts.set(sha, part);
+  if (keep) {
+    const current = new Set(keep);
+    for (const s of [...parts.keys()]) if (!current.has(s)) parts.delete(s);
+  }
+  writeAtomic(path.join(sidecarDir(dataDir, key), SOURCE_SUMMARY_PARTS_FILE), `${JSON.stringify({ parts: Object.fromEntries(parts) }, null, 2)}\n`);
+}
+
+export function clearSourceSummaryParts(dataDir: string, key: string): void {
+  fs.rmSync(path.join(sidecarDir(dataDir, key), SOURCE_SUMMARY_PARTS_FILE), { force: true });
 }
 
 /**

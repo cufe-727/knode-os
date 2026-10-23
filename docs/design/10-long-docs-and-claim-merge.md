@@ -459,8 +459,9 @@ characters of the 2025‑08 archive.
 3. Claims are compared within one canonical subject (and the swapped subject/object group) only; duplicates under two
    not-yet-merged duplicate entities surface after the entity merge.
 4. Partial overlaps, where each claim has a fact the other lacks, are not merged.
-5. Summaries still read only the first 14,000 characters (`LLM_WIKI_INPUT_CHARS`), so a long document's summary page
-   reflects its beginning only. Out of scope here; summaries could later be written from the segments' extractions.
+5. ~~Summaries still read only the first 14,000 characters (`LLM_WIKI_INPUT_CHARS`), so a long document's summary page
+   reflects its beginning only.~~ Done in docs/design/14: a long document is summarized segment by segment — the same
+   segments as extraction — and the parts merged; the page says how much of the document it read.
 6. Looking back in system time (`as_of`) filters claims by the **current** groups, and a representative folds only its
    own evidence of that time: a moment before a merge shows the merged grouping.
 

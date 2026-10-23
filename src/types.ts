@@ -10,6 +10,8 @@ export interface DocumentRow {
   sha256: string;
   mime: string | null;
   bytes: number;
+  /** Length of the indexed text in characters; null for a row indexed before the column existed (schema v14). */
+  chars?: number | null;
   status: 'pending' | 'indexed' | 'error' | 'skipped' | 'disposed';
   error: string | null;
   created_at: string;

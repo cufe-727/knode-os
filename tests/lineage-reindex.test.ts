@@ -136,6 +136,8 @@ describe('re-indexing a changed document', () => {
   beforeAll(async () => {
     initDataDir(dataDir);
     ctx = await createContext(dataDir);
+    // the reports here are a few lines each: no size threshold, or they would get no summary page
+    ctx.config.extraction.summaryMinChars = 0;
     store = ctx.store;
   });
   afterAll(async () => {

@@ -236,6 +236,7 @@ knode-os chat "<message>" [-c <conversation>]   talk to the configured CLI about
 knode-os entities merge|unmerge|merges|dedupe|resolve   entity resolution: reversible merges and the duplicate audit
 knode-os review entities|claims   the review passes (LLM judge over duplicate candidates; verdicts on disputed / suspected claims)
 knode-os wiki lint             orphans, broken links, stale / unreviewed research pages, expired and superseded text
+knode-os wiki prune-summaries [--dry-run] [--min-chars n]   archive the summary pages of documents under extraction.summaryMinChars
 knode-os config               show active config (redacted)
 knode-os plugins [--json]     the plugins this data directory loads and what they — and the built-ins — provide
 ```

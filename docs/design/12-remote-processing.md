@@ -96,7 +96,7 @@ The other two workspaces hold 18 chunks between them, so the ledger's volume is 
 | Kind | Unit | Source | Checked and written by | Offered to remote workers by default |
 | --- | --- | --- | --- | --- |
 | `extract` | one segment | the labeling scheduler, unchanged | unchanged: sidecar, then the graph | yes, as now |
-| `summarize` | one document | documents due a summary page | the summary cache, then the page | yes |
+| `summarize` | one call: a document, or one segment of a long one, or the merge of its parts (docs/design/14) | documents due a summary page | the part cache or the summary cache, then the page | yes |
 | `judge` | one call | a running review | the review that made the call | no |
 | `embed` | a batch of texts | the chunk backlog and the audits | the vector tables | yes, on lent keys or a calibrated own endpoint |
 

@@ -91,7 +91,7 @@ wrong answer from a user function must not be indexed quietly.
 | `tier0.concepts` | tier-0 concept mining of a raw/docs source | `(terms: string[], { path, root, dataDir, text, frontmatter })` → terms |
 | `extract.request` | one tier-1 extraction call, before it is sent or leased to a worker | `(request: { messages, maxTokens, withClaims, askSubject }, { path, title, segment? })` → request |
 | `extract.result` | the checked result of one extraction call | `(result: { entities, relations, claims, subject? }, { path, title, model, segment? })` → result |
-| `summary.request` | the Summarize stage's prompt | `(messages, { path, title, text })` → messages |
+| `summary.request` | one call of the Summarize stage: a whole document, one segment of a long one, or the merge of its parts (docs/design/14) | `(messages, { path, title, text, step, language, entities, channels, segment? })` → messages |
 | `document.applied` | a document scope landed (chunks, keyword index, tier-0 graph) | `({ path, root, dataDir, chunks, entities, relations, scopeId })`, no return; errors are logged |
 
 What `source.text` returns *is* the content: it is hashed as the document's
