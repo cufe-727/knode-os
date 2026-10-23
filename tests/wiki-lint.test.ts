@@ -37,9 +37,9 @@ title: 旧年报
 entities:
   - { name: 宁德时代, type: organization }
 claims:
-  - { subject: 宁德时代, type: ceo, statement: 张三担任 CFO, startDate: "2019-01-01" }
+  - { subject: 宁德时代, type: guidance, statement: 2025 年全年出货指引 400GWh, startDate: "2025-01-01", endDate: "2025-12-31" }
 ---
-张三担任 CFO。
+2025 年全年出货指引 400GWh。
 `);
     write(dataDir, 'wiki/entities/宁德时代.md', `---
 type: organization
@@ -53,7 +53,7 @@ research: { job: r_x, kind: entity, template: entity, at: "${old}", agent: claud
 
 ## 概要
 
-张三担任 CFO（来源：raw/docs/2026-01-10-old.md）。见 [[电池]]。
+2025 年全年出货指引 400GWh（来源：raw/docs/2026-01-10-old.md）。见 [[电池]]。
 `);
     write(dataDir, 'wiki/concepts/电池.md', `---
 type: concept
@@ -82,15 +82,16 @@ stale_after: "2020-01-01T00:00:00Z"
 `);
     ctx = await createContext(dataDir);
     await sync(ctx, { llmGraph: false });
-    // newer evidence about 宁德时代 after the research page was written, replacing the CFO fact
+    // newer evidence about 宁德时代 after the research page was written, replacing the 2025 guidance (a measure:
+    // a later period supersedes the earlier one; a management fact such as a CFO change would not)
     write(dataDir, 'raw/docs/2026-09-01-new.md', `---
 title: 新公告
 entities:
   - { name: 宁德时代, type: organization }
 claims:
-  - { subject: 宁德时代, type: ceo, statement: 李四担任 CFO, startDate: "2026-09-01" }
+  - { subject: 宁德时代, type: guidance, statement: 2026 年全年出货指引 500GWh, startDate: "2026-01-01", endDate: "2026-12-31" }
 ---
-李四接替张三担任 CFO。
+2026 年全年出货指引 500GWh。
 `);
     await sync(ctx, { llmGraph: false });
     await markSupersededClaims(ctx.store);

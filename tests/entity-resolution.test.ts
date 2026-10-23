@@ -118,9 +118,11 @@ claims:
     expect(applied).toMatchObject({ applied: true, merged: { entityId: '宁德时代新能源科技股份有限公司', canonicalId: '宁德时代' } });
     expect((await listMerges(ctx.store)).map((m) => [m.entityId, m.canonicalId])).toEqual([['宁德时代新能源科技股份有限公司', '宁德时代']]);
 
-    // id-based claim reads include everything merged into the survivor (name-based queryClaims already matched by substring)
-    expect((await claimsForEntities(ctx.store, ['宁德时代'], 20)).map((c) => c.type).sort()).toEqual(['market', 'revenue', 'supply']);
-    expect((await queryClaims(ctx.store, { subject: '300750' })).claims.map((c) => c.type).sort()).toEqual(['market', 'revenue', 'supply']);
+    // id-based claim reads include everything merged into the survivor (name-based queryClaims already matched by substring);
+    // the free labels the sources used landed on the closed list (revenue → earnings, supply → fundamentals, market → other)
+    expect((await claimsForEntities(ctx.store, ['宁德时代'], 20)).map((c) => c.type).sort()).toEqual(['earnings', 'fundamentals', 'other']);
+    expect((await queryClaims(ctx.store, { subject: '300750' })).claims.map((c) => c.type).sort()).toEqual(['earnings', 'fundamentals', 'other']);
+    expect((await queryClaims(ctx.store, { subject: '300750', types: ['revenue'] })).claims.map((c) => c.statement)).toEqual(['2025 年营业收入 4000 亿元']);
     const graph = await graphSearch(ctx.store, '宁德时代新能源科技股份有限公司', { depth: 1, track: false });
     expect(graph.nodes.map((n) => n.id)).toContain('宁德时代');
     expect(graph.nodes.map((n) => n.id)).not.toContain('宁德时代新能源科技股份有限公司');
@@ -135,7 +137,7 @@ claims:
     expect(await ctx.store.query(`SELECT canonical_id FROM entities WHERE id = '宁德时代新能源科技股份有限公司'`)).toEqual([{ canonical_id: '宁德时代' }]);
     expect(await unmergeEntity(ctx.store, '宁德时代新能源科技股份有限公司')).toBe(true);
     expect(await ctx.store.query(`SELECT canonical_id FROM entities WHERE id = '宁德时代新能源科技股份有限公司'`)).toEqual([{ canonical_id: null }]);
-    expect((await claimsForEntities(ctx.store, ['宁德时代'], 20)).map((c) => c.type).sort()).toEqual(['market', 'supply']);
+    expect((await claimsForEntities(ctx.store, ['宁德时代'], 20)).map((c) => c.type).sort()).toEqual(['fundamentals', 'other']);
 
     // a rejected pair is never proposed again (the audit re-proposes after the unmerge, then a person says no)
     await auditDuplicateEntities(ctx, {});

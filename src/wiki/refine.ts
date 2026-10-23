@@ -8,6 +8,7 @@ import { reviewClaims } from '../graph/claim-review.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { writeDeps } from '../lineage/deps.js';
 import { LlmClient } from '../llm/client.js';
+import { CLAIM_TYPES } from '../graph/store.js';
 import { Store } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
 import { ensureHotTopics, PagesContext, retireConceptClusterPages } from './pages.js';
@@ -137,29 +138,39 @@ export async function refineWiki(
 }
 
 /**
- * Zero-LLM claim audit over live claims: flag contradictions (same subject +
- * type with clashing status, or near-duplicate statements from different
- * sources) and expired facts (valid_to in the past). Findings become
+ * Zero-LLM claim audit over live facts (kind = fact; views, forecasts and
+ * rumours are neither stale nor contradicted): flag contradictions (same
+ * subject + type + object with clashing status, or near-duplicate statements
+ * from different sources) and expired facts (valid_to in the past). Findings become
  * suggestions (kind 'knowledge') that declare the claims they depend on, so a
  * claim that disappears marks its suggestion stale instead of leaving it
  * dangling.
  */
 /**
- * Supersession: among facts of one subject and type, an older one whose window
+ * Supersession: among facts (kind = fact) of one subject, type and object, for
+ * the measure-like types (CLAIM_TYPES.supersedes), an older one whose window
  * ended by the time a newer one began (or never closed) is marked superseded
- * by it. System-maintained, not evidence — the old fact stays for history and
+ * by it. A forecast never supersedes the result it foresaw and is never
+ * superseded; a management or event fact is never "replaced" by a later one.
+ * System-maintained, not evidence — the old fact stays for history and
  * timelines but stops being quoted as current. Marks whose superseder is gone
  * are cleared.
  */
 export async function markSupersededClaims(store: Store): Promise<number> {
-  const rows = await store.query<{ id: string; subject_id: string; type: string; valid_from: string | Date; valid_to: string | Date | null; superseded_by: string | null }>(
-    `SELECT id, subject_id, type, valid_from, valid_to, superseded_by FROM claims
-     WHERE tx_to IS NULL AND canonical_id IS NULL AND status = 'fact' AND valid_from IS NOT NULL
-     ORDER BY subject_id, type, valid_from ASC, tx_from ASC`,
+  const rows = await store.query<{ id: string; subject_id: string; type: string; object_id: string | null; valid_from: string | Date; valid_to: string | Date | null; superseded_by: string | null }>(
+    `SELECT id, subject_id, type, object_id, valid_from, valid_to, superseded_by FROM claims
+     WHERE tx_to IS NULL AND canonical_id IS NULL AND status = 'fact' AND kind = 'fact' AND valid_from IS NOT NULL
+       AND type = ANY($1::text[])
+     ORDER BY subject_id, type, object_id, valid_from ASC, tx_from ASC`,
+    [CLAIM_TYPES.filter((t) => t.supersedes).map((t) => t.id)],
   );
+  // with a closed type list "same subject and type" is coarse, so only the
+  // measure-like types take part (CLAIM_TYPES.supersedes: a later period of
+  // earnings, a later holding of the same stock …) and the object is part of
+  // the key; views, forecasts and rumours are never current facts
   const groups = new Map<string, typeof rows>();
   for (const r of rows) {
-    const key = `${r.subject_id}|${r.type}`;
+    const key = `${r.subject_id}|${r.type}|${r.object_id ?? ''}`;
     (groups.get(key) ?? groups.set(key, []).get(key)!).push(r);
   }
   let changed = 0;
@@ -193,10 +204,10 @@ async function auditClaims(store: Store, progress: (msg: string) => void, opts: 
   const superseded = await markSupersededClaims(store);
   if (superseded) progress(`claim audit: ${superseded} supersession marks updated`);
   const rows = await store.query<{
-    id: string; subject_id: string; subject: string; type: string; statement: string;
-    status: string; valid_to: string | null; primary_scope_id: string | null; path: string | null;
+    id: string; subject_id: string; subject: string; type: string; object_id: string | null; statement: string;
+    status: string; kind: string; valid_to: string | null; primary_scope_id: string | null; path: string | null;
   }>(
-    `SELECT cl.id, cl.subject_id, e.name AS subject, cl.type, cl.statement, cl.status,
+    `SELECT cl.id, cl.subject_id, e.name AS subject, cl.type, cl.object_id, cl.statement, cl.status, cl.kind,
             cl.valid_to, cl.primary_scope_id, s.key AS path
      FROM claims cl
      JOIN entities e ON e.id = cl.subject_id
@@ -208,10 +219,10 @@ async function auditClaims(store: Store, progress: (msg: string) => void, opts: 
   const issues: { title: string; body: string; evidence: string[]; claims: string[] }[] = [];
   const today = new Date().toISOString().slice(0, 10);
 
-  // expired facts
+  // expired facts (a forecast whose window closed is not a stale fact)
   for (const c of rows) {
     const validTo = toDateString(c.valid_to);
-    if (c.status === 'fact' && validTo && validTo < today) {
+    if (c.status === 'fact' && c.kind === 'fact' && validTo && validTo < today) {
       issues.push({
         title: `断言可能已过期: ${c.subject}`,
         body: `"${c.statement}" 的有效期至 ${validTo}，已过期。建议核实并更新相关文档/wiki 页。`,
@@ -221,10 +232,11 @@ async function auditClaims(store: Store, progress: (msg: string) => void, opts: 
     }
   }
 
-  // contradictions within (subject, type) groups
+  // contradictions within (subject, type, object) groups of facts — views and forecasts contradict nothing
   const groups = new Map<string, typeof rows>();
   for (const c of rows) {
-    const key = `${c.subject_id}|${c.type}`;
+    if (c.kind !== 'fact') continue;
+    const key = `${c.subject_id}|${c.type}|${c.object_id ?? ''}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key)!.push(c);
   }

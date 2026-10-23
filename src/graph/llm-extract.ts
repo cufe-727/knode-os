@@ -6,10 +6,13 @@ import { ChatMessage, LlmClient } from '../llm/client.js';
 import { builtinOntology, Ontology, promptFragment } from './ontology.js';
 import {
   CLAIM_STATUS,
+  CLAIM_TYPES,
   ExtractedClaim,
   ExtractedEntity,
   ExtractedRelation,
   PageContext,
+  normalizeClaimKind,
+  normalizeClaimType,
 } from './store.js';
 
 /**
@@ -26,18 +29,24 @@ import {
  */
 export const EXTRACT_CAPS = { entities: 25, relations: 30, claims: 25 } as const;
 
+/** The closed claim vocabulary as the prompt lists it (system types left out). */
+function claimTypeLines(): string {
+  return CLAIM_TYPES.filter((t) => !t.system).map((t) => `  - ${t.id}: ${t.description}`).join('\n');
+}
+
 function extractSystemPrompt(ont: Ontology, withClaims: boolean, askSubject: boolean): string {
   const vocab = promptFragment(ont);
   const base = `You are a knowledge-graph extraction engine. Extract the most important named entities and the relations between them from the text.
 
 Rules:
-- Entity types: ${vocab.entityTypes}.
+- Entity types (one per entity, the most specific that fits; concept only when nothing else does):
+${vocab.entityTypes}
 - Relation types (direction reads "source <type> target"; an inverse spelling such as "parent_of" is accepted and flipped):
 ${vocab.relationTypes}
 - Only entities that matter to the text; at most ${EXTRACT_CAPS.entities} entities and ${EXTRACT_CAPS.relations} relations.
 - Keep names short and canonical (e.g. "PostgreSQL", not "the PostgreSQL database"); put other spellings, abbreviations and tickers in aliases.
 - Never extract a generic reference as an entity (公司, 本公司, 该公司, 我们, 作者, "the company", "the firm", "the author"): put what it says under the entity it refers to when the text makes that clear, otherwise leave it out.
-- description: one sentence, factual, in the document's language.
+- description: one sentence saying what the entity is in general — the kind of thing it is and what it does or stands for — not what this document says about it ("宁德时代是全球最大的动力电池制造商", not "宁德时代本周涨停"); in the document's language; empty when the text does not tell.
 - relation validFrom/validTo: ISO-8601 dates when the document says since when / until when the relation holds (ownership, supply contracts, employment), else null.
 - sameAs: when an entity is one of the "Known entities" given with the document under another spelling, keep your spelling as name and put the known name in sameAs; otherwise null.`;
   const subjectRule = askSubject
@@ -50,16 +59,18 @@ ${vocab.relationTypes}
   }
   return base + subjectRule + `
 
-Also extract claims — specific, informative factual assertions stated in the document:
+Also extract claims — specific, informative assertions the document makes (facts, views, forecasts):
 - subject: must be one of the extracted entity names. object: the affected entity name, or null.
-- type: a short category label you choose (e.g. "capability", "decision", "benchmark").
-- statement: one self-contained sentence in the document's language.
-- status: "fact" (the document states it as confirmed), "suspected" (unverified/hedged), or "disputed" (the document contradicts or questions it).
+- type: exactly one of
+${claimTypeLines()}
+- kind: "fact" (something that happened or holds, stated as such — a reported number, a dated event, a policy issued), "opinion" (someone's judgement or view — 认为, 看好, 估值偏高), "prediction" (a forecast, target or expectation — 预计, 预期, 目标价, 将会), or "rumor" (hearsay or an unconfirmed report — 传闻, 据说, 网传).
+- statement: one self-contained sentence in the document's language stating the assertion itself, without attribution phrases such as 作者认为 / 文中称 / 他说 ("宁德时代估值偏高", not "作者认为宁德时代估值偏高") — kind says it is a view, forecast or rumor, and the source document says whose.
+- status: how firmly the source asserts it — "fact" (stated as settled), "suspected" (hedged, uncertain or unverified), or "disputed" (the document contradicts or questions it).
 - eventDate: when the statement is about something that happened at a time (a result, a deal, an appointment), that date; else null.
 - startDate/endDate: the period during which the statement holds (a role, a contract, a guidance window), else null.
 - Dates are ISO-8601 at the stated precision (YYYY, YYYY-MM, YYYY-MM-DD or YYYY-Qn). Resolve relative expressions ("last year", "去年", "本季度") against the time the passage itself says it was written (a post's timestamp, a dated heading) when it states one, otherwise against the document date given with the input; if neither is known, leave relative dates null.
 - Only claims that carry real information; skip trivia; at most ${EXTRACT_CAPS.claims} claims.
-Respond with JSON only: {${subjectField}"entities":[{"name","type","description","aliases":[],"sameAs"}],"relations":[{"source","target","type","description","validFrom","validTo"}],"claims":[{"subject","object","type","statement","status","eventDate","startDate","endDate"}]}`;
+Respond with JSON only: {${subjectField}"entities":[{"name","type","description","aliases":[],"sameAs"}],"relations":[{"source","target","type","description","validFrom","validTo"}],"claims":[{"subject","object","type","kind","statement","status","eventDate","startDate","endDate"}]}`;
 }
 
 export interface KnownEntity {
@@ -204,10 +215,12 @@ export function parseExtractReply(result: RawExtractReply, request: Pick<Extract
       .filter((e) => e && typeof e.name === 'string' && e.name.trim())
       .map((e) => ({ ...e, aliases: list(e.aliases).filter((a) => typeof a === 'string'), sameAs: typeof e.sameAs === 'string' && e.sameAs.trim() ? e.sameAs.trim() : null })),
     relations: list(result.relations).filter((r) => r && typeof r.source === 'string' && r.source && typeof r.target === 'string' && r.target),
+    // the type and kind come back on the closed lists whatever the model wrote (unknown type → other, unknown kind → fact)
     claims: withClaims
       ? list(result.claims)
           .filter((c) => c && typeof c.subject === 'string' && c.subject.trim() && typeof c.statement === 'string' && c.statement.trim())
           .slice(0, EXTRACT_CAPS.claims)
+          .map((c) => ({ ...c, type: normalizeClaimType(c.type), kind: normalizeClaimKind(c.kind) }))
       : [],
   };
   if (askSubject) {
@@ -320,7 +333,9 @@ export async function applyExtraction(
     const chunkId = bestChunkFor(c.statement, own?.length ? own : page.chunkIds);
     const id = await w.claim(subjectId, {
       objectId,
-      type: (c.type || 'fact').trim(),
+      // sidecars written before the closed vocabulary carry free-text types: mapped here on replay too
+      type: normalizeClaimType(c.type),
+      kind: normalizeClaimKind(c.kind),
       statement: c.statement,
       status,
       // dates the way the source wrote them → windows at the stated precision, relative forms anchored on the document date

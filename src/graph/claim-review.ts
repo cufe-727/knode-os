@@ -34,6 +34,7 @@ interface ClaimDetail {
   type: string;
   statement: string;
   status: string;
+  kind: string;
   valid_from: string | Date | null;
   valid_to: string | Date | null;
   event_at: string | Date | null;
@@ -48,7 +49,7 @@ export function claimReviewId(claimId: string, againstId: string | null): string
 
 async function detail(store: Store, id: string): Promise<ClaimDetail | null> {
   const [row] = await store.query<ClaimDetail>(
-    `SELECT cl.id, e.name AS subject, cl.type, cl.statement, cl.status, cl.valid_from, cl.valid_to, cl.event_at,
+    `SELECT cl.id, e.name AS subject, cl.type, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at,
             s.key AS source_path, s.trust, c.content AS excerpt
      FROM claims cl
      JOIN entities e ON e.id = cl.subject_id
@@ -64,7 +65,7 @@ function describe(label: string, c: ClaimDetail): string {
   const when = [toDateString(c.event_at), toDateString(c.valid_from) && `${toDateString(c.valid_from)} ~ ${toDateString(c.valid_to) ?? ''}`].filter(Boolean).join(' / ');
   return [
     `Claim ${label}: "${c.statement}"`,
-    `  subject: ${c.subject}; type: ${c.type}; status: ${c.status}${when ? `; time: ${when}` : ''}`,
+    `  subject: ${c.subject}; type: ${c.type}; kind: ${c.kind}; status: ${c.status}${when ? `; time: ${when}` : ''}`,
     `  source: ${c.source_path ?? 'unknown'} (${c.trust ?? 'unknown trust'})`,
     c.excerpt ? `  excerpt: ${c.excerpt.replace(/\s+/g, ' ').slice(0, 600)}` : '  excerpt: (none)',
   ].join('\n');
@@ -94,7 +95,8 @@ export async function reviewClaims(
     `SELECT id, claim_id, against_id FROM disputes WHERE status = 'open' ORDER BY created_at DESC LIMIT $1`, [limit],
   )) pairs.push({ claimId: d.claim_id, againstId: d.against_id, disputeId: d.id });
   for (const c of await store.query<{ id: string }>(
-    `SELECT id FROM claims WHERE status = 'suspected' AND tx_to IS NULL AND canonical_id IS NULL AND superseded_by IS NULL ORDER BY tx_from DESC LIMIT $1`, [limit],
+    // a hedged view or forecast cannot be verified against its excerpt: only hedged facts queue
+    `SELECT id FROM claims WHERE status = 'suspected' AND kind = 'fact' AND tx_to IS NULL AND canonical_id IS NULL AND superseded_by IS NULL ORDER BY tx_from DESC LIMIT $1`, [limit],
   )) pairs.push({ claimId: c.id, againstId: null, disputeId: null });
 
   for (const pair of pairs.slice(0, limit)) {

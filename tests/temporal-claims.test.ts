@@ -101,8 +101,8 @@ date: 2024-03-01
 entities:
   - { name: 宁德时代, type: organization }
 claims:
-  - { subject: 宁德时代, type: cfo, statement: 张三担任 CFO, startDate: "2019-01-01" }
-  - { subject: 宁德时代, type: cfo, statement: 李四担任 CFO, startDate: "2024-03-01" }
+  - { subject: 宁德时代, object: 时代上汽, type: holding, statement: 持有时代上汽 51% 股权, startDate: "2019-01-01" }
+  - { subject: 宁德时代, object: 时代上汽, type: holding, statement: 持有时代上汽 70% 股权, startDate: "2024-03-01" }
 ---
 李四接替张三出任 CFO。
 `);
@@ -120,20 +120,26 @@ claims:
 
     const all = await queryClaims(ctx.store, { subject: '宁德时代', includeSuperseded: true, order: 'timeline', limit: 20 });
     const by = (type: string, text: string) => all.claims.find((c) => c.type === type && c.statement.includes(text))!;
-    expect(by('revenue', '1000').eventAt).toBe('2026-07-01');   // 本季度 relative to 2026-08-10 → Q3 2026
-    expect(by('revenue', '800').eventAt).toBe('2025-07-01');    // 去年同期 → Q3 2025
-    expect(by('revenue', '1000').observedAt).toBe('2026-08-10');
-    expect(by('ceo', '曾毓群').validFrom).toBe('2011-01-01');
+    // the free labels the frontmatter used landed on the closed list (revenue → earnings, ceo → management)
+    expect(by('earnings', '1000').eventAt).toBe('2026-07-01');   // 本季度 relative to 2026-08-10 → Q3 2026
+    expect(by('earnings', '800').eventAt).toBe('2025-07-01');    // 去年同期 → Q3 2025
+    expect(by('earnings', '1000').observedAt).toBe('2026-08-10');
+    expect(by('management', '曾毓群').validFrom).toBe('2011-01-01');
     expect(by('guidance', '500GWh')).toMatchObject({ validFrom: '2026-01-01', validTo: '2026-12-31' });
-    expect(all.claims.map((c) => c.type)).toEqual(['ceo', 'cfo', 'cfo', 'revenue', 'guidance', 'revenue']); // timeline order
+    expect(all.claims.map((c) => c.type)).toEqual(['management', 'holding', 'holding', 'earnings', 'guidance', 'earnings']); // timeline order
 
-    // supersession: the 2024 CFO fact replaces the 2019 one
+    // supersession: the 2024 stake replaces the 2019 one (same subject, type and object); the chairman's role, open-ended
+    // and older, is a management fact and is replaced by nothing
     expect(await markSupersededClaims(ctx.store)).toBe(1);
-    const current = await queryClaims(ctx.store, { subject: '宁德时代', types: ['cfo'] });
-    expect(current.claims.map((c) => c.statement)).toEqual(['李四担任 CFO']);
-    const history = await queryClaims(ctx.store, { subject: '宁德时代', types: ['cfo'], includeSuperseded: true, order: 'timeline' });
-    expect(history.claims.map((c) => [c.statement, c.superseded])).toEqual([['张三担任 CFO', true], ['李四担任 CFO', false]]);
-    expect((await claimsForEntities(ctx.store, ['宁德时代'], 20)).map((c) => c.statement)).not.toContain('张三担任 CFO');
+    const current = await queryClaims(ctx.store, { subject: '宁德时代', types: ['holding'] });
+    expect(current.claims.map((c) => c.statement)).toEqual(['持有时代上汽 70% 股权']);
+    const history = await queryClaims(ctx.store, { subject: '宁德时代', types: ['holding'], includeSuperseded: true, order: 'timeline' });
+    expect(history.claims.map((c) => [c.statement, c.superseded])).toEqual([['持有时代上汽 51% 股权', true], ['持有时代上汽 70% 股权', false]]);
+    const live = (await claimsForEntities(ctx.store, ['宁德时代'], 20)).map((c) => c.statement);
+    expect(live).not.toContain('持有时代上汽 51% 股权');
+    expect(live).toContain('曾毓群担任董事长');
+    // a filter spelled with the old label still finds its claims
+    expect((await queryClaims(ctx.store, { subject: '宁德时代', types: ['revenue'] })).claims).toHaveLength(2);
     const q3 = await queryClaims(ctx.store, { subject: '宁德时代', eventRange: { from: '2026-07-01T00:00:00Z', to: '2026-09-30T23:59:59Z' } });
     expect(q3.claims.map((c) => c.statement)).toEqual(['2026Q2 营业收入 1000 亿元']);
     // running the audit again changes nothing
@@ -144,10 +150,11 @@ claims:
     const page = fs.readFileSync(path.join(dataDir, 'wiki', 'entities', '宁德时代.md'), 'utf8');
     expect(page).toContain('## Facts (current)');
     expect(page).toContain('## Timeline');
-    expect(page).toMatch(/- 2019-01-01 · 张三担任 CFO `fact` _\(superseded\)_/);
-    expect(page.indexOf('2019-01-01 · 张三')).toBeLessThan(page.indexOf('2026-07-01 · 2026Q2'));
+    expect(page).toMatch(/- 2019-01-01 · 持有时代上汽 51% 股权 `fact` _\(superseded\)_/);
+    expect(page.indexOf('2019-01-01 · 持有')).toBeLessThan(page.indexOf('2026-07-01 · 2026Q2'));
     const facts = page.slice(page.indexOf('## Facts (current)'), page.indexOf('## Timeline'));
-    expect(facts).not.toContain('张三担任 CFO');
-    expect(facts).toContain('李四担任 CFO');
+    expect(facts).not.toContain('持有时代上汽 51% 股权');
+    expect(facts).toContain('持有时代上汽 70% 股权');
+    expect(facts).toContain('曾毓群担任董事长');
   });
 });

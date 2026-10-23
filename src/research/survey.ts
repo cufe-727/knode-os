@@ -46,7 +46,7 @@ export interface KbSurvey {
     mergeCandidates: number;
   };
   relations: { total: number; byType: { type: string; n: number }[]; unknownPredicates: { raw: string; n: number }[] };
-  claims: { total: number; byStatus: { status: string; n: number }[]; eventRange: { from: string | null; to: string | null }; openDisputes: number };
+  claims: { total: number; byStatus: { status: string; n: number }[]; byKind: { kind: string; n: number }[]; eventRange: { from: string | null; to: string | null }; openDisputes: number };
   wiki: {
     views: number;
     humanPages: number;
@@ -123,6 +123,7 @@ export async function surveyKnowledgeBase(ctx: AppContext): Promise<KbSurvey> {
     `SELECT id, name, type, mention_count, wiki_path FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL ORDER BY mention_count DESC, evidence_count DESC LIMIT 20`,
   );
   const claimStatus = await store.query<{ status: string; n: number }>(`SELECT status, count(*)::int AS n FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL GROUP BY status ORDER BY n DESC`);
+  const claimKind = await store.query<{ kind: string; n: number }>(`SELECT kind, count(*)::int AS n FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL GROUP BY kind ORDER BY n DESC`);
   const [claimRange] = await store.query<{ lo: string | Date | null; hi: string | Date | null }>(`SELECT min(event_at) AS lo, max(event_at) AS hi FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL`);
   const openDisputes = (await listDisputes(store, { status: 'open' })).length;
 
@@ -186,7 +187,7 @@ export async function surveyKnowledgeBase(ctx: AppContext): Promise<KbSurvey> {
       mergeCandidates: insights.mergeCandidates,
     },
     relations: { total: insights.totals.relations, byType: insights.relationTypeCounts, unknownPredicates: insights.unknownPredicates },
-    claims: { total: stats.claims, byStatus: claimStatus, eventRange: { from: day(claimRange?.lo), to: day(claimRange?.hi) }, openDisputes },
+    claims: { total: stats.claims, byStatus: claimStatus, byKind: claimKind, eventRange: { from: day(claimRange?.lo), to: day(claimRange?.hi) }, openDisputes },
     wiki: { views, humanPages: Math.max(0, wikiSources - researchPages), researchPages, overview },
     guide,
     ontology: {
@@ -237,7 +238,8 @@ export function renderSurvey(s: KbSurvey): string {
   }
   if (s.claims.byStatus.length) {
     lines.push('### claims', '');
-    lines.push(`${s.claims.byStatus.map((c) => `${c.status} ${c.n}`).join(' · ')}；未决争议 ${s.claims.openDisputes}`, '');
+    const kinds = (s.claims.byKind ?? []).filter((c) => c.kind !== 'fact');
+    lines.push(`${s.claims.byStatus.map((c) => `${c.status} ${c.n}`).join(' · ')}${kinds.length ? `；其中 ${kinds.map((c) => `${c.kind} ${c.n}`).join(' · ')}` : ''}；未决争议 ${s.claims.openDisputes}`, '');
   }
   if (s.datasources.length) {
     lines.push('### 外部数据源', '');

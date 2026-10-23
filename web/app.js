@@ -2107,7 +2107,7 @@ function renderGraphSide(node, edge = null) {
     return parts.join(' · ');
   };
   const facts = (n, max) => (claimsBySubject.get(n.name) ?? []).slice(0, max)
-    .map((cl) => `<div class="hint">◈ ${esc(cl.statement.slice(0, 120))} <span class="mono">[${esc(cl.status)}]</span></div>`)
+    .map((cl) => `<div class="hint">◈ ${esc(cl.statement.slice(0, 120))} <span class="mono">[${esc(cl.kind && cl.kind !== 'fact' ? cl.kind : cl.status)}]</span></div>`)
     .join('');
   const pill = (type) => `<span class="tpill" data-type="${esc(type)}">${esc(type)}</span>`;
   const relationList = (relations) => {

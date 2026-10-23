@@ -75,6 +75,7 @@ export async function claimsForEntities(store: Store, subjectIds: string[], limi
       type: c.type,
       statement: c.statement,
       status: c.status,
+      kind: c.kind,
       startDate: toDateString(c.valid_from),
       endDate: toDateString(c.valid_to),
       eventDate: toDateString(c.event_at),
@@ -87,9 +88,9 @@ export async function claimsForEntities(store: Store, subjectIds: string[], limi
   const lim = p.add(limit);
   const rows = await store.query<{
     id: string; subject: string; object: string | null; type: string; statement: string;
-    status: string; valid_from: string | null; valid_to: string | null; event_at: string | null; path: string | null; evidence_count: number;
+    status: string; kind: string; valid_from: string | null; valid_to: string | null; event_at: string | null; path: string | null; evidence_count: number;
   }>(
-    `SELECT cl.id, se.name AS subject, oe.name AS object, cl.type, cl.statement, cl.status,
+    `SELECT cl.id, se.name AS subject, oe.name AS object, cl.type, cl.statement, cl.status, cl.kind,
             cl.valid_from, cl.valid_to, cl.event_at, s.key AS path, cl.evidence_count
      FROM claims cl
      JOIN entities se ON se.id = cl.subject_id
@@ -103,7 +104,7 @@ export async function claimsForEntities(store: Store, subjectIds: string[], limi
   );
   return rows.map((r) => ({
     id: r.id, subject: r.subject, object: r.object, type: r.type, statement: r.statement,
-    status: r.status, startDate: toDateString(r.valid_from), endDate: toDateString(r.valid_to), eventDate: toDateString(r.event_at), path: r.path,
+    status: r.status, kind: r.kind, startDate: toDateString(r.valid_from), endDate: toDateString(r.valid_to), eventDate: toDateString(r.event_at), path: r.path,
     evidenceCount: r.evidence_count,
   }));
 }

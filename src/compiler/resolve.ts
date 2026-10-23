@@ -1,6 +1,7 @@
 import { AppContext } from '../context.js';
 import { listCapabilities, locatorsForEntities, CapabilityRecord, Locator } from '../capability/store.js';
 import { claimsForEntities } from '../graph/query.js';
+import { claimTypeOf } from '../graph/store.js';
 import { liveAbsences } from './absence.js';
 import { buildContextPack, ContextPack, PackClaim, PackEntity, matchEntities } from '../pack/pack.js';
 import { NO_FILTER, ResolvedScopeFilter, ResolvedTemporal, resolveTemporal } from '../store/resolver.js';
@@ -94,7 +95,8 @@ function fillLocally(slot: SlotSpec, pack: ContextPack, claims: PackClaim[]): { 
     if (from === 'graph' && pack.matchedEntities.length > 0) return { filled: true, source: 'graph neighbourhood' };
     if (from === 'documents' && pack.evidence.docs.length > 0) return { filled: true, source: `${pack.evidence.docs.length} indexed chunks` };
     if (from === 'claims') {
-      const wanted = slot.claimTypes?.length ? claims.filter((c) => slot.claimTypes!.includes(c.type)) : claims;
+      const asked = new Set((slot.claimTypes ?? []).map((t) => claimTypeOf(t) ?? t));
+      const wanted = asked.size > 0 ? claims.filter((c) => asked.has(c.type)) : claims;
       if (wanted.length > 0) return { filled: true, source: `${wanted.length} claims` };
     }
     if (from === 'datasets' && pack.evidence.datasets.length > 0) return { filled: true, source: `${pack.evidence.datasets.length} linked tables` };

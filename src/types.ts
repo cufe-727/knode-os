@@ -61,6 +61,8 @@ export interface ClaimItem {
   type: string;
   statement: string;
   status: string;
+  /** fact | opinion | prediction | rumor (absent on rows read before claims had a kind). */
+  kind?: string;
   /** Validity window (world time), date-only. */
   startDate: string | null;
   endDate: string | null;

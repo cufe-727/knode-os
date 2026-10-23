@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { graphInsights, graphSearch } from '../src/graph/query.js';
-import { buildOntology, CORE_PACK_YAML, loadOntology, normalizePredicate, ORGANIZATION_PACK_YAML, promptFragment, typePrecedence } from '../src/graph/ontology.js';
+import { buildOntology, builtinOntology, CORE_PACK_YAML, FINANCE_PACK_YAML, loadOntology, normalizePredicate, ORGANIZATION_PACK_YAML, promptFragment, typePrecedence } from '../src/graph/ontology.js';
 import { frontmatterExtraction } from '../src/graph/frontmatter.js';
 import { sync } from '../src/ingest/sync.js';
 import { ONTOLOGY_DIR } from '../src/fs/layout.js';
@@ -52,6 +52,56 @@ describe('ontology packs', () => {
     expect(prompt.relationTypes).toContain('subsidiary_of');
     expect(prompt.relationTypes).toContain('inverse: parent_of');
     expect(prompt.relationTypes).not.toContain('co_occurs');
+    expect(prompt.entityTypes).toContain('- person (人物): a named individual');
+  });
+
+  it('ships the finance pack: market vocabulary on top of core, restated core types keep their place', () => {
+    const fin = buildOntology([{ name: 'core', text: CORE_PACK_YAML }, { name: 'organization', text: ORGANIZATION_PACK_YAML }, { name: 'finance', text: FINANCE_PACK_YAML }]);
+    const ids = fin.entityTypes.map((t) => t.id);
+    expect(ids).toEqual(expect.arrayContaining(['market', 'index', 'security', 'fund', 'sector', 'theme', 'indicator', 'currency', 'commodity', 'policy']));
+    // restated by finance, declared by core: place (and fold precedence) unchanged, description replaced, label kept
+    expect(ids.indexOf('organization')).toBe(1);
+    expect(fin.entityTypes.find((t) => t.id === 'product')).toMatchObject({ label: '产品', description: expect.stringContaining('not a sector') });
+    expect(typePrecedence(fin).at(-1)).toBe('concept');
+    expect(typePrecedence(fin).indexOf('organization')).toBeLessThan(typePrecedence(fin).indexOf('security'));
+    // finance predicates: synonyms, inverse readings; a spelling an earlier pack claimed stays with it
+    expect(normalizePredicate(fin, '成分股')).toEqual({ type: 'constituent_of', flip: false });
+    expect(normalizePredicate(fin, '成分股包括')).toEqual({ type: 'constituent_of', flip: true });
+    expect(normalizePredicate(fin, '所属板块')).toEqual({ type: 'belongs_to_sector', flip: false });
+    expect(normalizePredicate(fin, '跟踪指数')).toEqual({ type: 'tracks', flip: false });
+    expect(normalizePredicate(fin, '利好')).toEqual({ type: 'benefits_from', flip: true });
+    expect(normalizePredicate(fin, '受益于')).toEqual({ type: 'benefits_from', flip: false });
+    expect(normalizePredicate(fin, '利空')).toEqual({ type: 'harmed_by', flip: true });
+    expect(normalizePredicate(fin, '看好')).toEqual({ type: 'recommends', flip: false });
+    expect(normalizePredicate(fin, '看空')).toEqual({ type: 'bearish_on', flip: false });
+    expect(normalizePredicate(fin, '持仓')).toEqual({ type: 'holds_position_in', flip: false });
+    expect(normalizePredicate(fin, '持股')).toEqual({ type: 'owns', flip: false });
+    expect(normalizePredicate(fin, 'managed_by')).toEqual({ type: 'manages_fund', flip: true });
+    expect(normalizePredicate(fin, '上市于')).toEqual({ type: 'listed_on', flip: false });
+    expect(normalizePredicate(fin, 'Lists')).toEqual({ type: 'listed_on', flip: true });
+    expect(normalizePredicate(fin, '预计')).toEqual({ type: 'predicts', flip: false });
+    expect(normalizePredicate(fin, 'parent_of')).toEqual({ type: 'subsidiary_of', flip: true });
+    expect(normalizePredicate(fin, '加入')).toEqual({ type: 'member_of', flip: false });
+    // the prompt lists each entity type with its label, meaning and examples — the restated description is the finance one
+    const prompt = promptFragment(fin);
+    expect(prompt.entityTypes).toContain('- index (指数): a stock-market or asset index');
+    expect(prompt.entityTypes).toContain('e.g. 上证指数, 沪深300');
+    expect(prompt.entityTypes).toContain('- indicator (指标)');
+    expect(prompt.entityTypes).toContain('- event (事件): one dated happening with a name (a crash');
+    expect(prompt.entityTypes.split('\n').filter((l) => l.startsWith('- event '))).toHaveLength(1);
+    expect(prompt.relationTypes).toContain('- constituent_of: A is a constituent of index B; inverse: has_constituent; organization|security|fund → index; time-bound');
+    expect(prompt.relationTypes).toContain('- member_of: A belongs to group or alliance B (an index constituent is constituent_of');
+    // the default vocabulary does not offer any of it
+    const base = builtinOntology();
+    expect(base.packs).toEqual(['core', 'organization']);
+    expect(base.entityTypes.map((t) => t.id)).not.toContain('index');
+    expect(normalizePredicate(base, '成分股')).toMatchObject({ type: 'related_to', unknown: '成分股' });
+    // a workspace that names the pack without a file of its own reads the built-in
+    const bare = fs.mkdtempSync(path.join(tmp, 'bare-'));
+    const named = loadOntology(bare, ['core', 'finance']);
+    expect(named.packs).toEqual(['core', 'finance']);
+    expect(named.entityTypes.map((t) => t.id)).toContain('sector');
+    expect(loadOntology(bare, ['core', 'no-such-pack']).packs).toEqual(['core']);
   });
 
   it('parses frontmatter relations in list and map form with validity windows', () => {
@@ -96,8 +146,12 @@ relations:
     ctx = await createContext(dataDir);
     expect(fs.existsSync(path.join(dataDir, ONTOLOGY_DIR, 'core.yaml'))).toBe(true);
     expect(fs.existsSync(path.join(dataDir, ONTOLOGY_DIR, 'organization.yaml'))).toBe(true);
+    // the finance pack is seeded beside them, ready to be listed, and not in force until it is
+    expect(fs.existsSync(path.join(dataDir, ONTOLOGY_DIR, 'finance.yaml'))).toBe(true);
     const ont = loadOntology(dataDir);
     expect(ont.packs).toEqual(['core', 'organization']);
+    expect(ont.entityTypes.map((t) => t.id)).not.toContain('index');
+    expect(loadOntology(dataDir, ['core', 'organization', 'finance']).entityTypes.map((t) => t.id)).toContain('index');
 
     const stats = await sync(ctx, { llmGraph: false });
     expect(stats.indexed).toBeGreaterThanOrEqual(1);

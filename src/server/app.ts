@@ -1422,6 +1422,7 @@ export function createApp(
         object: c.req.query('object') || undefined,
         types: csv(c.req.query('types')),
         statuses: csv(c.req.query('status')),
+        kinds: csv(c.req.query('claim_kind')),
         text: c.req.query('text') || undefined,
         limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
         eventRange: c.req.query('event_range')
