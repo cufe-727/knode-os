@@ -1007,6 +1007,69 @@ class KnodeGraph {
         ctx.moveTo(0.3, 0); ctx.arc(0, 0, 0.3, 0, Math.PI * 2);
         ctx.stroke();
         break;
+      case 'market': // exchange: a pediment over columns
+        ctx.moveTo(-0.78, -0.2); ctx.lineTo(0, -0.72); ctx.lineTo(0.78, -0.2); ctx.closePath();
+        for (const xx of [-0.44, 0, 0.44]) { ctx.moveTo(xx, -0.2); ctx.lineTo(xx, 0.66); }
+        ctx.moveTo(-0.8, 0.66); ctx.lineTo(0.8, 0.66);
+        ctx.stroke();
+        break;
+      case 'index': // rising line on axes
+        ctx.moveTo(-0.74, -0.74); ctx.lineTo(-0.74, 0.74); ctx.lineTo(0.78, 0.74);
+        ctx.moveTo(-0.5, 0.4); ctx.lineTo(-0.1, -0.02); ctx.lineTo(0.16, 0.26); ctx.lineTo(0.66, -0.42);
+        ctx.moveTo(0.36, -0.46); ctx.lineTo(0.66, -0.42); ctx.lineTo(0.64, -0.12);
+        ctx.stroke();
+        break;
+      case 'security': // ticket
+        ctx.moveTo(-0.8, -0.44); ctx.lineTo(0.8, -0.44); ctx.lineTo(0.8, -0.16);
+        ctx.arc(0.8, 0, 0.16, -Math.PI / 2, Math.PI / 2, true);
+        ctx.lineTo(0.8, 0.44); ctx.lineTo(-0.8, 0.44); ctx.lineTo(-0.8, 0.16);
+        ctx.arc(-0.8, 0, 0.16, Math.PI / 2, -Math.PI / 2, true);
+        ctx.closePath();
+        ctx.moveTo(0.3, -0.44); ctx.lineTo(0.3, -0.12); ctx.moveTo(0.3, 0.12); ctx.lineTo(0.3, 0.44);
+        ctx.stroke();
+        break;
+      case 'fund': // pie, one slice filled
+        ctx.arc(0, 0, 0.74, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, 0); ctx.arc(0, 0, 0.74, -Math.PI / 2, 0); ctx.closePath(); ctx.fill();
+        break;
+      case 'sector': // four tiles
+        for (const xx of [-0.44, 0.44]) for (const yy of [-0.44, 0.44]) ctx.rect(xx - 0.27, yy - 0.27, 0.54, 0.54);
+        ctx.stroke();
+        break;
+      case 'theme': // tag
+        ctx.rotate(Math.PI / 4);
+        ctx.moveTo(-0.82, 0); ctx.lineTo(-0.36, -0.44); ctx.lineTo(0.62, -0.44); ctx.lineTo(0.62, 0.44); ctx.lineTo(-0.36, 0.44); ctx.closePath();
+        ctx.stroke();
+        ctx.beginPath(); ctx.arc(-0.3, 0, 0.11, 0, Math.PI * 2); ctx.fill();
+        break;
+      case 'indicator': // gauge with needle
+        ctx.arc(0, 0.14, 0.7, Math.PI * 0.78, Math.PI * 2.22);
+        ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, 0.14); ctx.lineTo(0.42, -0.34); ctx.stroke();
+        ctx.beginPath(); ctx.arc(0, 0.14, 0.12, 0, Math.PI * 2); ctx.fill();
+        break;
+      case 'currency': // banknote
+        ctx.rect(-0.8, -0.5, 1.6, 1);
+        ctx.moveTo(0.24, 0); ctx.arc(0, 0, 0.24, 0, Math.PI * 2);
+        ctx.moveTo(-0.52, -0.16); ctx.lineTo(-0.52, 0.16); ctx.moveTo(0.52, -0.16); ctx.lineTo(0.52, 0.16);
+        ctx.stroke();
+        break;
+      case 'commodity': // drop
+        ctx.moveTo(0, -0.82);
+        ctx.bezierCurveTo(0.1, -0.5, 0.58, -0.18, 0.58, 0.22);
+        ctx.arc(0, 0.22, 0.58, 0, Math.PI);
+        ctx.bezierCurveTo(-0.58, -0.18, -0.1, -0.5, 0, -0.82);
+        ctx.closePath();
+        ctx.stroke();
+        break;
+      case 'policy': // scroll: a page between two rollers
+        ctx.ellipse(0, -0.56, 0.78, 0.17, 0, 0, Math.PI * 2);
+        ctx.moveTo(0.78, 0.56); ctx.ellipse(0, 0.56, 0.78, 0.17, 0, 0, Math.PI * 2);
+        ctx.moveTo(-0.46, -0.39); ctx.lineTo(-0.46, 0.39); ctx.moveTo(0.46, -0.39); ctx.lineTo(0.46, 0.39);
+        ctx.moveTo(-0.2, -0.1); ctx.lineTo(0.2, -0.1); ctx.moveTo(-0.2, 0.12); ctx.lineTo(0.2, 0.12);
+        ctx.stroke();
+        break;
       default: // three dots
         for (const xx of [-0.45, 0, 0.45]) { ctx.moveTo(xx + 0.13, 0); ctx.arc(xx, 0, 0.13, 0, Math.PI * 2); }
         ctx.fill();

@@ -39,8 +39,10 @@ struct GraphRGB: Hashable {
  * ontology's predicates into five coloured groups, a neutral "other typed"
  * for the generic, rare and unknown ones, and the derived co-occurrence. Each
  * family has a line pattern as well, so a relation reads without its colour.
- * The four common types and the five family hues were checked to stay apart
- * under red-green colour blindness on the dark canvas.
+ * The four common core types, the finance pack's common types (market, index,
+ * sector, theme, fund) and the five family hues were checked to stay apart
+ * under red-green colour blindness on the dark canvas; the rarer finance types
+ * are distinct in normal vision and lean on their icons there.
  */
 enum GraphPalette {
     struct Family: Identifiable, Hashable {
@@ -69,6 +71,17 @@ enum GraphPalette {
         case "component": GraphRGB(0x627ace)
         case "datasource": GraphRGB(0x7d8ea1)
         case "dataset": GraphRGB(0x8ca2ae)
+        // the finance ontology pack
+        case "market": GraphRGB(0x4170e9)
+        case "index": GraphRGB(0xd6b529)
+        case "security": GraphRGB(0xa6a266)
+        case "fund": GraphRGB(0xcba1fa)
+        case "sector": GraphRGB(0x148a53)
+        case "theme": GraphRGB(0xe29f81)
+        case "indicator": GraphRGB(0xc1ccd7)
+        case "currency": GraphRGB(0x56d0af)
+        case "commodity": GraphRGB(0xca564b)
+        case "policy": GraphRGB(0xeda6c1)
         default: GraphRGB(0x7c8088)
         }
     }
@@ -89,6 +102,17 @@ enum GraphPalette {
         case "component": "puzzlepiece"
         case "datasource": "cylinder"
         case "dataset": "tablecells"
+        // the finance ontology pack (all available since macOS 14)
+        case "market": "building.columns"
+        case "index": "chart.line.uptrend.xyaxis"
+        case "security": "ticket"
+        case "fund": "chart.pie"
+        case "sector": "square.grid.2x2"
+        case "theme": "tag"
+        case "indicator": "gauge.with.needle"
+        case "currency": "banknote"
+        case "commodity": "drop"
+        case "policy": "scroll"
         default: "ellipsis"
         }
     }
