@@ -1833,12 +1833,18 @@ $('#search-q').addEventListener('keydown', (e) => e.key === 'Enter' && doSearch(
 
 /**
  * One colour per entity type, shared by the graph canvas and the entity table's type pills (set through
- * element.style, as the page policy allows) — the same set as the Mac app's. The four common types
- * (organization, product, concept, person) stay apart under red-green colour blindness.
+ * element.style, as the page policy allows) — the same set as the Mac app's (GraphPalette.swift). The
+ * four common core types (organization, product, concept, person) stay apart under red-green colour
+ * blindness, and so do the finance pack's common types (market, index, sector, theme, fund), from each
+ * other and from those four; the rarer finance types are kept distinct in normal vision and may share a
+ * colour-blind appearance only with rare or unrelated types, so their icons tell them apart there.
  */
 const ENTITY_COLORS = {
   organization: '#ba7f02', product: '#e5657b', concept: '#9581ef', person: '#09a0a0', location: '#4b99d7', event: '#c158ae',
   technology: '#3db6cf', project: '#d76549', component: '#627ace', datasource: '#7d8ea1', dataset: '#8ca2ae', other: '#7c8088',
+  // the finance ontology pack
+  market: '#4170e9', index: '#d6b529', security: '#a6a266', fund: '#cba1fa', sector: '#148a53',
+  theme: '#e29f81', indicator: '#c1ccd7', currency: '#56d0af', commodity: '#ca564b', policy: '#eda6c1',
 };
 const entityColor = (type) => ENTITY_COLORS[type] ?? ENTITY_COLORS.other;
 

@@ -10,6 +10,15 @@ requests a separate installation:
 - Build with `./macos/scripts/package-app.sh` from the repository root. Install
   `macos/build/KnodeOS.app` at the fixed path `/Applications/KnodeOS.app` and
   preserve its bundle identifier, `dev.knode.os`. Always launch that installed path.
+- The Swift build uses the toolchain's default SDK unless `KNODE_OS_SWIFT_FLAGS`
+  is set (for example `--sdk /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`,
+  or a toolchain of your own). When the default SDK cannot compile a `@State`
+  view, as the macOS 27.0 SDK cannot under Command Line Tools, which lack its
+  SwiftUI macro plugin, `macos/scripts/swift-sdk-flags.sh` falls back to the
+  newest installed SDK that can and says so on stderr. A manual build takes the
+  same flags, `swift build $(scripts/swift-sdk-flags.sh)` in `macos/`; so does
+  `swift test`, which also needs XCTest, and this machine's Command Line Tools
+  ship none.
 - Do not create dated, versioned, `backup`, `previous-install`, or `previous-build`
   application copies in Applications, the repository, or Application Support. If a
   persistent rollback copy is needed, keep just one compressed archive at

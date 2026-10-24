@@ -18,9 +18,12 @@ trap 'rm -rf "$DEPLOY_DIR" "$PACK_DIR"' EXIT
 cd "$REPO_DIR"
 npm run build
 cd "$MACOS_DIR"
-# A local SDK/toolchain override also serves machines whose newest SDK needs
-# compiler plugins not shipped in Command Line Tools yet.
-swift build -c release ${KNODE_OS_SWIFT_FLAGS:-}
+# KNODE_OS_SWIFT_FLAGS chooses the SDK or toolchain by hand; without it the
+# helper probes the default SDK and falls back to the newest installed one that
+# can compile a @State view (Command Line Tools lack the SwiftUI macro plugin
+# the macOS 27.0 SDK needs), or fails with the compiler's reason.
+SWIFT_FLAGS="$("$SCRIPT_DIR/swift-sdk-flags.sh")"
+swift build -c release $SWIFT_FLAGS
 
 if [[ ! -f "$APP_ICON" ]]; then
   echo "Missing app icon: $APP_ICON" >&2

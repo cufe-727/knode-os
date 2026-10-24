@@ -21,6 +21,16 @@ Build an ordinary `.app` bundle in `macos/build/`:
 ./scripts/package-app.sh
 ```
 
+The Swift build takes `KNODE_OS_SWIFT_FLAGS` when it is set (an `--sdk` path,
+or a toolchain of your own); otherwise `scripts/swift-sdk-flags.sh` picks the
+SDK: it probes the default one with a `@State` view and, when that fails (the
+macOS 27.0 SDK under Command Line Tools, which lack its SwiftUI macro plugin),
+falls back to the newest installed SDK that passes, saying so on stderr. The
+same flags serve a manual build or run: `swift build $(scripts/swift-sdk-flags.sh)`,
+`swift run KnodeOS $(scripts/swift-sdk-flags.sh)`. `swift test` takes them too
+but also needs XCTest, which Command Line Tools may not include (the Mac mini's
+do not; it needs Xcode).
+
 For local installation and debugging, run `./scripts/install-app.sh`. It builds,
 replaces `/Applications/KnodeOS.app` following the
 [local installation workflow](../AGENTS.md), and launches that fixed path.
