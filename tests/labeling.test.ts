@@ -85,7 +85,8 @@ async function workspace(name: string, fake: FakeOpenAi, opts: { workers?: Extra
     ...base,
     connections: [model],
     llmUse: 'connection-1',
-    extraction: { ...base.extraction, entityLlm: route, documentLlm: route, summaryLlm: route, judgeLlm: route, segmentChars: 1000, workers: opts.workers },
+    // one-line documents: no size threshold, or none would be due a summary
+    extraction: { ...base.extraction, entityLlm: route, documentLlm: route, summaryLlm: route, judgeLlm: route, segmentChars: 1000, summaryMinChars: 0, workers: opts.workers },
   }));
   ensureDefaultAgents(dataDir);
   write(dataDir, 'raw/docs/a.md', '# 甲\n\n宁德时代发布季度报告。\n');

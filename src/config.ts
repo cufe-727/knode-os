@@ -314,6 +314,25 @@ export interface ExtractionConfig {
    * default `concurrency`. 0 leaves summaries to remote workers.
    */
   summaryConcurrency?: number;
+  /**
+   * Shortest document the Summarize stage writes a page for, in characters of
+   * its indexed text (frontmatter included). A shorter document gets no
+   * summary page at all — not a pointer page either: a page is indexed again
+   * as a view, so for a one-paragraph post it would only double the post's
+   * weight in search while saying less than the post (docs/design/14). Such
+   * documents are never "due" a summary; `knode-os wiki prune-summaries`
+   * archives the pages written before the threshold existed. 0 summarizes
+   * every document.
+   */
+  summaryMinChars: number;
+  /**
+   * Segments one summary reads at most. A document longer than one call
+   * (`LLM_WIKI_INPUT_CHARS`) is cut the way extraction cuts it, each segment
+   * summarized on its own and the parts merged in one more call; past this
+   * many segments the summary samples evenly through the document and the
+   * page says how much of it was read (docs/design/14).
+   */
+  summaryMaxSegments: number;
 }
 
 /** One kind of local labeling worker: what it runs on and how many calls at once. */
@@ -901,6 +920,8 @@ export function defaultConfig(): KnodeConfig {
       concurrency: 1,
       intervalMinutes: 5,
       segmentChars: 12_000,
+      summaryMinChars: 1_500,
+      summaryMaxSegments: 12,
     },
     retrieval: {
       sag: {

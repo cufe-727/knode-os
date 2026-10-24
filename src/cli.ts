@@ -45,7 +45,7 @@ import { sync } from './ingest/sync.js';
 import { historyOf, lineageOf } from './lineage/inspect.js';
 import { forgetSource, purgeArchived, purgeDisposed } from './lineage/purge.js';
 import { rebuild } from './lineage/rebuild.js';
-import { reconcileViews } from './wiki/pages.js';
+import { pruneShortSummaries, reconcileViews } from './wiki/pages.js';
 import { buildContextPack } from './pack/pack.js';
 import { applySuggestion, optimizePacks } from './pack/learn.js';
 import { listSuggestions, setSuggestionStatus } from './store/queries.js';
@@ -1175,6 +1175,27 @@ wiki
       const r = await lintWiki(ctx, { report: opts.report, file: opts.report, onProgress: (m) => console.log(`  ${m}`) });
       for (const i of r.issues) console.log(`${i.kind.padEnd(16)} ${i.path}  ${i.detail}`);
       console.log(JSON.stringify({ pages: r.pages, counts: r.counts, report: r.reportPath, suggestions: r.suggestions }, null, 2));
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+wiki
+  .command('prune-summaries')
+  .description('archive the summary pages of documents under extraction.summaryMinChars (to wiki/.archive; the cached summaries stay, so lowering the threshold brings them back without a model call)')
+  .option('--dry-run', 'list the pages without archiving them')
+  .option('--min-chars <n>', 'apply this threshold instead of the configured one')
+  .action(async (opts: { dryRun?: boolean; minChars?: string }) => {
+    const minChars = opts.minChars === undefined ? undefined : Number(opts.minChars);
+    if (minChars !== undefined && !(Number.isFinite(minChars) && minChars >= 0)) {
+      console.error('--min-chars must be a number of characters');
+      process.exitCode = 1;
+      return;
+    }
+    const ctx = await createContext(dataDir());
+    try {
+      const r = await pruneShortSummaries(ctx, { minChars, dryRun: Boolean(opts.dryRun), actor: 'cli', onProgress: (m) => console.log(`  ${m}`) });
+      console.log(JSON.stringify({ minChars: r.minChars, dryRun: Boolean(opts.dryRun), archived: r.archived.length, kept: r.kept }, null, 2));
     } finally {
       await ctx.datasources.closeAll();
       await ctx.store.close();

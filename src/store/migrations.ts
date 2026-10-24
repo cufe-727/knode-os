@@ -860,6 +860,15 @@ CREATE OR REPLACE VIEW v_claims AS
   WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL;
 `;
 
+// The length of a document's indexed text in characters, beside its bytes:
+// the Summarize stage leaves documents under `extraction.summaryMinChars`
+// out, and the scan that finds due documents must know that without reading
+// every file (docs/design/14). Written with every apply; rows indexed before
+// it exists keep NULL until the scan reads the text once (`documentChars`).
+const V15_DOCUMENT_CHARS = `
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS chars INTEGER;
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -892,6 +901,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 12, name: 'dispose-indexes', up: async (q) => execScript(q, V12_DISPOSE_INDEXES) },
   { version: 13, name: 'derived-cooccurrence', up: async (q) => execScript(q, V13_DERIVED_COOCCURRENCE) },
   { version: 14, name: 'claim-kind', up: async (q) => execScript(q, V14_CLAIM_KIND) },
+  { version: 15, name: 'document-chars', up: async (q) => execScript(q, V15_DOCUMENT_CHARS) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

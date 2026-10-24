@@ -114,6 +114,8 @@ serve's timer, `knode-os extract` and an initialization's catch-up never audit o
   changing the summary model does not rewrite existing summaries.
 - `wiki generate` and `POST /api/wiki/generate` still fill gaps by hand (the same function, 20 per call by default).
 - The sources index in `wiki/sources/index.md` still shows heat; it no longer says cold documents have no page.
+- Since docs/design/14: no page for a document under `extraction.summaryMinChars`, the scaffold in the document's
+  language, links held to the graph's names, and long documents summarized segment by segment.
 
 ## 5. Synthesize retires
 

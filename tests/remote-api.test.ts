@@ -107,7 +107,8 @@ describe('the remote API', () => {
     fs.mkdirSync(root, { recursive: true });
     fs.writeFileSync(path.join(root, 'knode.config.json'), JSON.stringify({
       ...base, connections: [model], llmUse: 'connection-1',
-      extraction: { ...base.extraction, entityLlm: route, documentLlm: route, summaryLlm: route, judgeLlm: route },
+      // one-line documents: no size threshold, or none would be due a summary
+      extraction: { ...base.extraction, entityLlm: route, documentLlm: route, summaryLlm: route, judgeLlm: route, summaryMinChars: 0 },
     }));
     rootCtx = await createContext(root);
     registry = new WorkspaceContextRegistry(root, {

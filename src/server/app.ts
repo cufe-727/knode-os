@@ -164,6 +164,8 @@ type ExtractionConfigDraft = {
   batchSize?: number;
   concurrency?: number;
   summaryConcurrency?: number;
+  summaryMinChars?: number;
+  summaryMaxSegments?: number;
   workers?: Partial<ExtractionWorkerConfig>[];
 };
 
@@ -790,6 +792,11 @@ export function createApp(
         if (x.summaryConcurrency !== undefined && Number.isFinite(summaryConcurrency) && summaryConcurrency >= 0) {
           next.extraction.summaryConcurrency = Math.min(16, Math.floor(summaryConcurrency));
         }
+        // the Summarize stage's size threshold (0: every document) and how many segments one summary reads at most (docs/design/14)
+        const summaryMinChars = Number(x.summaryMinChars);
+        if (x.summaryMinChars !== undefined && Number.isFinite(summaryMinChars) && summaryMinChars >= 0) next.extraction.summaryMinChars = Math.floor(summaryMinChars);
+        const summaryMaxSegments = Number(x.summaryMaxSegments);
+        if (x.summaryMaxSegments !== undefined && Number.isFinite(summaryMaxSegments) && summaryMaxSegments >= 1) next.extraction.summaryMaxSegments = Math.min(64, Math.floor(summaryMaxSegments));
         if (Array.isArray(x.workers)) {
           // `serve`'s labeling slots per agent (src/labeling/local.ts); a target must exist
           const targets = new Set(routeTargets(next).map((t) => t.id));

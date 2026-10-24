@@ -1,29 +1,33 @@
 import crypto from 'node:crypto';
-import { clearSourceSummaryFailure, readSourceSummary, readSourceSummaryFailure, recordSourceSummaryFailure, writeSourceSummary } from '../fs/sidecar.js';
+import { clearSourceSummaryFailure, readSourceSummary, readSourceSummaryFailure, recordSourceSummaryFailure, writeSourceSummary, writeSourceSummaryPart } from '../fs/sidecar.js';
 import { classifyFailure, FailureKind } from '../labeling/failures.js';
 import { CompleteResult, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
 import { renderCliPrompt } from '../llm/cli.js';
-import { ChatMessage, LlmClient } from '../llm/client.js';
+import { LlmClient } from '../llm/client.js';
 import { DocumentRow } from '../types.js';
-import { dueSummaryDocuments, MAX_SUMMARY_ATTEMPTS, PagesContext, sourceSummaryRequest, writeSourceSummaryPage } from '../wiki/pages.js';
+import { dueSummaryDocuments, MAX_SUMMARY_ATTEMPTS, PagesContext, writeSourceSummaryPage } from '../wiki/pages.js';
+import { finishSummary, pendingSteps, planSummary, stepLabel, summaryMinChars, SummaryStep, summaryStepRequest, SummaryWork } from '../wiki/summary.js';
 import { noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
 
 /**
- * Summary pages as leased work (docs/design/12).
+ * Summary pages as leased work (docs/design/12, 14).
  *
  * One per workspace in `serve`, behind the work broker (src/work/broker.ts).
- * A slot that asks for a summary gets the next document due one — an indexed
- * source no longer waiting for extraction, whose page is missing or dirty,
- * the ones extracted most lately first — and the call to make: the prompt
- * the page itself would send (`sourceSummaryRequest`). Whoever holds the
- * lease runs it on its own model and hands back the text.
+ * A slot that asks for a summary gets the next call of the next document due
+ * one — an indexed source no longer waiting for extraction, long enough for a
+ * page, whose page is missing or dirty, the ones extracted most lately first.
+ * A document that fits one call is one task; a long one is a task per
+ * segment, which several workers can hold at once, and then one task that
+ * merges the parts (src/wiki/summary.ts). Whoever holds a lease runs its
+ * messages on its own model and hands back the text.
  *
- * The answer goes to the document's summary cache in its sidecar, keyed by
- * the content it summarizes, and the page is then written from that cache —
- * in the reviews' turn (src/labeling/followup.ts), so a summary page and a
- * review never write at once, and without a model call of this machine's.
- * A page that cannot be written now is written from the cache later; nothing
- * a worker wrote is lost to a restart.
+ * A part's answer goes to the document's part cache in its sidecar, keyed by
+ * the segment's text; the final answer goes to the document's summary cache,
+ * keyed by the content it summarizes, and the page is then written from that
+ * cache — in the reviews' turn (src/labeling/followup.ts), so a summary page
+ * and a review never write at once, and without a model call of this
+ * machine's. A page that cannot be written now is written from the cache
+ * later; nothing a worker wrote is lost to a restart.
  *
  * Failures count as they always have: a bad answer uses one of the
  * document's three attempts on its current content, a rate limit or a lost
@@ -32,7 +36,7 @@ import { noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
  */
 
 export interface SummarySourceOptions {
-  /** How long a worker may hold a document before it goes back in line (renewable). */
+  /** How long a worker may hold a call before it goes back in line (renewable). */
   leaseMs?: number;
   /** Wait before a document goes out again after a bad answer (× its attempts so far). */
   modelRetryMs?: number;
@@ -55,18 +59,31 @@ export interface SummaryStatus extends SourceStatus {
   /** Documents due a summary page at the last look, not counting those out or waiting to retry. */
   due: number;
   scannedAt: string | null;
-  leases: { id: string; worker: string; backend: string; remote: boolean; document: string; ageSeconds: number; expiresInSeconds: number }[];
-  totals: { calls: number; ok: number; failed: Record<FailureKind, number>; leasesExpired: number; pagesWritten: number; stale: number };
+  leases: { id: string; worker: string; backend: string; remote: boolean; document: string; label: string; ageSeconds: number; expiresInSeconds: number }[];
+  totals: {
+    calls: number;
+    ok: number;
+    /** Of `ok`, the answers that were one part of a long document rather than a finished summary. */
+    parts: number;
+    failed: Record<FailureKind, number>;
+    leasesExpired: number;
+    pagesWritten: number;
+    stale: number;
+  };
   lastHour: { calls: number; pagesWritten: number };
 }
 
 interface SummaryLease {
   id: string;
   doc: DocumentRow;
+  work: SummaryWork;
+  step: SummaryStep;
+  /** The document and the step: a long document's parts can be out to several workers at once. */
+  key: string;
   who: WorkerIdentity;
   issuedAt: number;
   expiresAt: number;
-  /** Kept a while after expiry so a late answer can still land when nobody else took the document. */
+  /** Kept a while after expiry so a late answer can still land when nobody else took the call. */
   expired: boolean;
 }
 
@@ -85,10 +102,13 @@ const STALE_SCAN_MS = 5 * 60_000;
 const PREFER_SCAN_MS = 30_000;
 const RECENT_LIMIT = 500;
 
+const stepKey = (doc: DocumentRow, step: SummaryStep): string => `${doc.path}\u0000${step.kind === 'part' ? `part:${step.sha}` : step.kind}`;
+const pathOfKey = (key: string): string => key.slice(0, key.indexOf('\u0000'));
+
 export class SummarySource implements WorkSource {
   readonly kind = 'summarize' as const;
   private readonly leases = new Map<string, SummaryLease>();
-  /** Document path → the lease that holds it. */
+  /** Step key (document and step) → the lease that holds it. */
   private readonly held = new Map<string, string>();
   /** Document path → earliest time it may go out again after a failure. */
   private readonly notBefore = new Map<string, number>();
@@ -98,6 +118,8 @@ export class SummarySource implements WorkSource {
   private readonly writing = new Set<string>();
   /** Documents extracted lately, newest last: they go first. */
   private readonly recent: string[] = [];
+  /** Documents with calls still to hand out — the rest of a long document's parts, its merge once they are in — ahead of the last look. */
+  private readonly ready: DocumentRow[] = [];
   private candidates: DocumentRow[] = [];
   private scannedAt = 0;
   private due = 0;
@@ -107,7 +129,7 @@ export class SummarySource implements WorkSource {
   private chain: Promise<unknown> = Promise.resolve();
   private ownPages: Promise<unknown> = Promise.resolve();
   private stopped = false;
-  private readonly totals: SummaryStatus['totals'] = { calls: 0, ok: 0, failed: noFailures(), leasesExpired: 0, pagesWritten: 0, stale: 0 };
+  private readonly totals: SummaryStatus['totals'] = { calls: 0, ok: 0, parts: 0, failed: noFailures(), leasesExpired: 0, pagesWritten: 0, stale: 0 };
   private readonly recentCalls: number[] = [];
   private readonly recentPages: number[] = [];
   private readonly leaseMs: number;
@@ -143,7 +165,7 @@ export class SummarySource implements WorkSource {
     this.preferPending = true;
   }
 
-  /** Up to `max` documents for `who` to summarize now; empty when none is due. */
+  /** Up to `max` calls for `who` to run now; empty when none is due. */
   async lease(who: WorkerIdentity, max = 1): Promise<WorkTask[]> {
     if (this.stopped) return [];
     const want = Math.max(1, Math.min(8, Math.floor(max)));
@@ -153,31 +175,39 @@ export class SummarySource implements WorkSource {
       while (out.length < want && !this.stopped) {
         const doc = await this.next();
         if (!doc) break;
-        const request = await sourceSummaryRequest(this.ctx.dataDir, doc);
-        if (!request) {
-          // nothing to read: no model can help until the document changes
-          recordSourceSummaryFailure(this.ctx.dataDir, doc.path, doc.sha256, 'no source text to summarize');
+        const plan = await planSummary(this.ctx.store, this.ctx.dataDir, this.ctx.config, doc);
+        if (plan.kind === 'none') {
+          // nothing to read: no model can help until the document changes. (A document under the
+          // size threshold is not offered by the scan; one the threshold moved under since is simply not leased.)
+          if (plan.reason === 'no-text') recordSourceSummaryFailure(this.ctx.dataDir, doc.path, doc.sha256, 'no source text to summarize');
           continue;
         }
-        out.push(this.issue(doc, request, who));
+        // the calls of it nobody holds: every part of a long document may be out at once
+        for (const step of pendingSteps(plan).filter((s) => !this.held.has(stepKey(doc, s)))) {
+          if (out.length >= want) {
+            this.requeue(doc); // the rest of it goes out next
+            break;
+          }
+          out.push(await this.issue(doc, plan, step, who));
+        }
       }
       return out;
     });
   }
 
-  /** Hand back a call's outcome. A lapsed lease is still accepted while nobody else has the document. */
+  /** Hand back a call's outcome. A lapsed lease is still accepted while nobody else has the call. */
   async complete(taskId: string, who: WorkerIdentity, outcome: TaskOutcome): Promise<CompleteResult> {
     return this.locked(async (): Promise<CompleteResult> => {
       const lease = this.leases.get(taskId);
       if (!lease) return { accepted: false, reason: 'unknown or long-expired lease' };
       if (lease.who.worker !== who.worker) return { accepted: false, reason: 'the lease belongs to another worker' };
-      const holder = this.held.get(lease.doc.path);
+      const holder = this.held.get(lease.key);
       if (lease.expired ? holder !== undefined : holder !== lease.id) {
         this.leases.delete(taskId);
         return { accepted: false, reason: lease.expired ? 'lease expired and the document moved on' : 'document no longer leased to this worker' };
       }
       this.leases.delete(taskId);
-      this.held.delete(lease.doc.path);
+      this.held.delete(lease.key);
       await this.record(lease, who, outcome);
       return { accepted: true };
     });
@@ -199,7 +229,7 @@ export class SummarySource implements WorkSource {
     return { renewed, lost };
   }
 
-  /** Give leases back unanswered (a worker shutting down): the documents go straight back in line. */
+  /** Give leases back unanswered (a worker shutting down): the calls go straight back in line. */
   async release(taskIds: string[], who: WorkerIdentity): Promise<number> {
     return this.locked(async () => {
       let n = 0;
@@ -207,7 +237,8 @@ export class SummarySource implements WorkSource {
         const lease = this.leases.get(id);
         if (!lease || lease.who.worker !== who.worker) continue;
         this.leases.delete(id);
-        if (this.held.get(lease.doc.path) === id) this.held.delete(lease.doc.path);
+        if (this.held.get(lease.key) === id) this.held.delete(lease.key);
+        this.requeue(lease.doc);
         n++;
       }
       return n;
@@ -221,7 +252,7 @@ export class SummarySource implements WorkSource {
       due: this.due,
       scannedAt: this.scannedAt ? new Date(this.scannedAt).toISOString() : null,
       leases: [...this.leases.values()].filter((l) => !l.expired).map((l) => ({
-        id: l.id, worker: l.who.worker, backend: l.who.backend, remote: l.who.remote, document: l.doc.path,
+        id: l.id, worker: l.who.worker, backend: l.who.backend, remote: l.who.remote, document: l.doc.path, label: stepLabel(l.work, l.step),
         ageSeconds: Math.round((now - l.issuedAt) / 1000), expiresInSeconds: Math.round((l.expiresAt - now) / 1000),
       })),
       totals: { ...this.totals, failed: { ...this.totals.failed } },
@@ -252,15 +283,31 @@ export class SummarySource implements WorkSource {
     while (this.recentPages.length && this.recentPages[0] < hourAgo) this.recentPages.shift();
   }
 
-  /** The next document to lease, from the last look at what is due or a new one. */
+  /** Documents with a call out. */
+  private heldPaths(): Set<string> {
+    return new Set([...this.held.keys()].map(pathOfKey));
+  }
+
+  /** A document with calls still to hand out goes before the last look's documents. */
+  private requeue(doc: DocumentRow): void {
+    if (!this.ready.some((d) => d.path === doc.path)) this.ready.push(doc);
+    this.quietUntil = 0;
+  }
+
+  /** The next document with a call to hand out: one put back, else from the last look at what is due or a new one. */
   private async next(): Promise<DocumentRow | null> {
     const now = Date.now();
+    while (this.ready.length) {
+      const doc = this.ready.shift()!;
+      if (this.writing.has(doc.path) || (this.notBefore.get(doc.path) ?? 0) > now) continue;
+      if (await this.stillDue(doc)) return doc;
+    }
     const age = now - this.scannedAt;
     if (age > STALE_SCAN_MS || (this.preferPending && age > PREFER_SCAN_MS)) this.candidates = [];
     for (let looks = 0; looks < 2; looks++) {
       while (this.candidates.length) {
         const doc = this.candidates.shift()!;
-        if (this.held.has(doc.path) || this.writing.has(doc.path) || (this.notBefore.get(doc.path) ?? 0) > now) continue;
+        if (this.writing.has(doc.path) || (this.notBefore.get(doc.path) ?? 0) > now) continue;
         if (await this.stillDue(doc)) return doc;
       }
       if (!(await this.scan(now))) return null;
@@ -272,12 +319,14 @@ export class SummarySource implements WorkSource {
   private async scan(now: number): Promise<boolean> {
     if (now < this.quietUntil) return false;
     const waiting = [...this.notBefore].filter(([, t]) => t > now);
-    const exclude = new Set([...this.held.keys(), ...this.writing, ...waiting.map(([p]) => p)]);
+    // a document with a call out comes back through `requeue` when that call lands
+    const exclude = new Set([...this.heldPaths(), ...this.writing, ...waiting.map(([p]) => p)]);
     const { docs, due } = await dueSummaryDocuments(this.ctx.store, this.ctx.dataDir, {
       limit: SCAN_SIZE,
       prefer: [...this.recent].reverse(),
       skipQueued: true,
       exclude,
+      minChars: summaryMinChars(this.ctx.config),
     });
     this.scannedAt = now;
     this.due = due;
@@ -304,15 +353,16 @@ export class SummarySource implements WorkSource {
     return !(failed && failed.contentSha === doc.sha256 && failed.attempts >= MAX_SUMMARY_ATTEMPTS);
   }
 
-  private issue(doc: DocumentRow, request: { messages: ChatMessage[]; maxTokens: number }, who: WorkerIdentity): WorkTask {
+  private async issue(doc: DocumentRow, work: SummaryWork, step: SummaryStep, who: WorkerIdentity): Promise<WorkTask> {
+    const request = await summaryStepRequest(work, step, this.ctx.dataDir);
     const now = Date.now();
-    const lease: SummaryLease = { id: crypto.randomUUID(), doc, who, issuedAt: now, expiresAt: now + this.leaseMs, expired: false };
+    const lease: SummaryLease = { id: crypto.randomUUID(), doc, work, step, key: stepKey(doc, step), who, issuedAt: now, expiresAt: now + this.leaseMs, expired: false };
     this.leases.set(lease.id, lease);
-    this.held.set(doc.path, lease.id);
+    this.held.set(lease.key, lease.id);
     return {
       id: lease.id,
       kind: 'summarize',
-      label: doc.path,
+      label: stepLabel(work, step),
       messages: request.messages,
       prompt: renderCliPrompt(request.messages, false),
       json: false,
@@ -323,14 +373,14 @@ export class SummarySource implements WorkSource {
 
   private async record(lease: SummaryLease, who: WorkerIdentity, outcome: TaskOutcome): Promise<void> {
     const now = Date.now();
-    const { doc } = lease;
+    const { doc, work, step } = lease;
     const model = who.remote ? `remote:${outcome.model || who.backend}` : outcome.model || who.backend;
     this.totals.calls++;
     this.recentCalls.push(now);
     let failure: { kind: FailureKind; error: string };
     if (outcome.ok) {
-      const body = outcome.text.trim();
-      if (body) {
+      const text = outcome.text.trim();
+      if (text) {
         const [current] = await this.ctx.store.query<{ sha256: string; status: string }>(`SELECT sha256, status FROM documents WHERE id = $1`, [doc.id]);
         // the document changed while it was being read (its new text is due a summary of its own),
         // or a late answer comes after another worker's: either way there is nothing to write
@@ -338,10 +388,21 @@ export class SummarySource implements WorkSource {
           this.totals.stale++;
           return;
         }
-        writeSourceSummary(this.ctx.dataDir, doc.path, { contentSha: doc.sha256, model, body, generatedAt: new Date(now).toISOString() });
         this.totals.ok++;
         this.notBefore.delete(doc.path);
         this.strikes.delete(doc.path);
+        if (step.kind === 'part') {
+          // one segment of a long document: kept by the segment's hash, so the rest of the
+          // document — its other parts, then the merge — goes out next and an edit keeps this one
+          writeSourceSummaryPart(this.ctx.dataDir, doc.path, step.sha, { body: text, model, generatedAt: new Date(now).toISOString() }, work.segments.map((s) => s.sha));
+          this.totals.parts++;
+          this.requeue(doc);
+          return;
+        }
+        const { body, coverage } = finishSummary(work, text);
+        writeSourceSummary(this.ctx.dataDir, doc.path, {
+          contentSha: doc.sha256, model, body, generatedAt: new Date(now).toISOString(), language: work.language, ...(coverage ? { coverage } : {}),
+        });
         this.queuePage(doc);
         return;
       }
@@ -379,8 +440,8 @@ export class SummarySource implements WorkSource {
       if (lease.expiresAt > now) continue;
       lease.expired = true;
       this.totals.leasesExpired++;
-      if (this.held.get(lease.doc.path) !== lease.id) continue;
-      this.held.delete(lease.doc.path);
+      if (this.held.get(lease.key) !== lease.id) continue;
+      this.held.delete(lease.key);
       this.fail(lease.doc, { kind: 'transient', error: `no answer from ${lease.who.worker} before its lease ran out` }, lease.who.worker, now);
     }
   }

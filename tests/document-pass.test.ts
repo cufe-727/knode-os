@@ -76,7 +76,8 @@ describe('the background document pass', () => {
       ...base,
       connections: [model],
       llmUse: 'connection-1',
-      extraction: { ...base.extraction, entityLlm: route, documentLlm: route, summaryLlm: route, judgeLlm: route },
+      // the documents here are a line each: no size threshold, or none would get a summary
+      extraction: { ...base.extraction, entityLlm: route, documentLlm: route, summaryLlm: route, judgeLlm: route, summaryMinChars: 0 },
       review: { ...base.review, llmJudge: 'auto' },
     }));
     ensureDefaultAgents(dataDir);
@@ -158,6 +159,9 @@ describe('summaries on their own', () => {
 
   beforeAll(async () => {
     write(dataDir, 'raw/docs/c.md', '# 备忘\n\n一段要总结的文字。\n');
+    // one-line documents: no size threshold here
+    const base = defaultConfig();
+    write(dataDir, 'knode.config.json', JSON.stringify({ ...base, extraction: { ...base.extraction, summaryMinChars: 0 } }));
     ctx = await createContext(dataDir);
     await sync(ctx, { llmGraph: false });
   });

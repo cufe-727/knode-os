@@ -23,7 +23,11 @@ export const LEGACY_EXTRACT_CHARS = 12_000;
 /** Version of the segment cutter; a tier-1 sidecar that carries it covers the whole document. */
 export const SEGMENTER_VERSION = 1;
 
-/** Document text sent to wiki source-page summarization is truncated here. */
+/**
+ * Longest text one summarization call reads. A document longer than this is
+ * summarized in segments and the parts merged (src/wiki/summary.ts), so the
+ * cap bounds a call, not what a summary page covers.
+ */
 export const LLM_WIKI_INPUT_CHARS = 14_000;
 
 /** Per-chunk text sent to the embeddings endpoint is truncated here. */

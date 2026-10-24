@@ -3,29 +3,27 @@ import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { KnodeConfig } from '../config.js';
-import { LLM_WIKI_INPUT_CHARS } from '../constants.js';
 import { summaryLlmClient } from '../context.js';
 import { DataSourceRegistry } from '../datasource/registry.js';
 import { QueryResult } from '../datasource/types.js';
 import { safePath } from '../fs/files.js';
-import { clearSourceSummaryFailure, readSourceSummary, readSourceSummaryFailure, recordSourceSummaryFailure, writeSourceSummary } from '../fs/sidecar.js';
+import { clearSourceSummaryFailure, readSourceSummary, readSourceSummaryFailure, recordSourceSummaryFailure } from '../fs/sidecar.js';
 import { slugify } from '../graph/store.js';
 import { applyDocScope } from '../ingest/apply.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
-import { loadSourceText } from '../ingest/source.js';
 import { readDeps } from '../lineage/deps.js';
 import { archivedPath, disposeScope, findLiveScope } from '../lineage/scope.js';
 import { DepDecl } from '../lineage/types.js';
 import { classifyFailure } from '../labeling/failures.js';
-import { ChatMessage, LlmClient } from '../llm/client.js';
+import { LlmClient } from '../llm/client.js';
 import { applyScope } from '../lineage/scope.js';
 import { isGeneratedConcept, okfGenerated } from '../okf/index.js';
-import { pluginRegistry } from '../plugins/registry.js';
 import { getDocHeat } from '../stats/heat.js';
 import { Store } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
 import { DocumentRow } from '../types.js';
 import { hasRegions, renderRegion, replaceRegion, splitRegions } from './regions.js';
+import { asSummaryLanguage, detectSummaryLanguage, documentChars, isShortDocument, planSummary, produceSummary, shortByRow, summaryMinChars, summaryScaffold } from './summary.js';
 
 /**
  * Wiki pages as materialized views.
@@ -191,35 +189,12 @@ const entityStub: PageGenerator = {
   },
 };
 
-const SOURCE_SYSTEM = `You maintain a personal wiki. Summarize the document into a wiki source page.
-
-Output rules:
-- Markdown only, no preamble.
-- Start with: a one-paragraph abstract, then "## Key points" bullets, then "## Entities" linking the important entities as [[Entity Name]] wikilinks.
-- Wrap every important person/org/product/concept name in [[double brackets]].
-- Write in the document's language. Max ~400 words.`;
-
 /**
- * The Summarize stage's call for one document — the same whether this
- * process makes it or a worker leases it (src/work/summarize.ts). Null when
- * the document has no text to read.
+ * The Summarize stage's page (docs/design/14). What it asks a model and what
+ * it makes of the answer lives in ./summary.ts, shared with the leased work
+ * source (src/work/summarize.ts); the one-shot pass calls the model from
+ * `render`, through `produceSummary`.
  */
-export async function sourceSummaryRequest(
-  dataDir: string,
-  doc: Pick<DocumentRow, 'path' | 'root' | 'title'>,
-): Promise<{ messages: ChatMessage[]; maxTokens: number } | null> {
-  const source = loadSourceText(dataDir, doc.path, doc.root);
-  if (!source) return null;
-  const content = source.text.slice(0, LLM_WIKI_INPUT_CHARS);
-  // `summary.request` hooks (docs/design/11) may rewrite the prompt — a house style, a language, extra context —
-  // for a summary a remote worker writes as much as for one written here
-  const messages = await pluginRegistry().filter('summary.request', [
-    { role: 'system', content: SOURCE_SYSTEM },
-    { role: 'user', content: `Source file: ${doc.path}\n\n${content}` },
-  ], { path: doc.path, root: doc.root, dataDir, title: doc.title ?? path.basename(doc.path), text: content });
-  return { messages, maxTokens: 1200 };
-}
-
 const sourceSummary: PageGenerator = {
   kind: 'source_summary',
   version: 2,
@@ -235,6 +210,9 @@ const sourceSummary: PageGenerator = {
     if (!docPath) return null;
     const [doc] = await ctx.store.query<DocumentRow>(`SELECT * FROM documents WHERE path = $1 AND status = 'indexed'`, [docPath]);
     if (!doc) return null;
+    // a document under the size threshold gets no page: one written before the
+    // threshold is archived when its document next changes (`wiki prune-summaries` sweeps the rest)
+    if (await isShortDocument(ctx.store, ctx.dataDir, doc, summaryMinChars(ctx.config))) return null;
     return {
       deps: [{ kind: 'document', id: doc.path, required: true, sha: doc.sha256 }],
       inputsSha: sha16(['source_summary@2', doc.sha256]),
@@ -243,39 +221,32 @@ const sourceSummary: PageGenerator = {
   },
   async render(ctx, _pagePath, plan) {
     const doc = plan.data.doc as DocumentRow;
-    const cached = readSourceSummary(ctx.dataDir, doc.path);
-    let body: string;
+    const llm = documentSummaryLlm(ctx);
     // generated.by/at describe the body we are about to write, so a cache hit
     // reports the model and instant that produced it, not this regeneration.
-    let by: string;
-    let at: string;
-    const llm = documentSummaryLlm(ctx);
-    if (cached && cached.contentSha === doc.sha256) {
-      body = cached.body;
-      by = cached.model;
-      at = cached.generatedAt;
-    } else {
+    let cached = readSourceSummary(ctx.dataDir, doc.path);
+    if (!cached || cached.contentSha !== doc.sha256) {
       if (!llm.enabled) return null;
-      const request = await sourceSummaryRequest(ctx.dataDir, doc);
-      if (!request) return null;
-      body = await llm.complete(request.messages, { maxTokens: request.maxTokens });
-      by = llm.label;
-      at = new Date().toISOString();
-      writeSourceSummary(ctx.dataDir, doc.path, { contentSha: doc.sha256, model: llm.label, body, generatedAt: at });
+      const work = await planSummary(ctx.store, ctx.dataDir, ctx.config, doc);
+      if (work.kind === 'none') return null;
+      cached = await produceSummary(ctx.dataDir, work, llm);
     }
+    // a cache from before the language was recorded is read for it
+    const language = asSummaryLanguage(cached.language) ?? detectSummaryLanguage(cached.body);
     const heat = (await getDocHeat(ctx.store, [doc.id], ctx.config.heat)).get(doc.id) ?? 0;
     const title = doc.title ?? path.basename(doc.path);
     return {
       frontmatter: {
         title,
         type: 'source',
-        description: `Summary of ${doc.path}.`,
+        description: summaryScaffold(language).description(doc.path),
         source: doc.path,
         heat: Number(heat.toFixed(3)),
-        generated: okfGenerated(`knode-os/${by}`, at),
+        ...(cached.coverage ? { coverage: cached.coverage } : {}),
+        generated: okfGenerated(`knode-os/${cached.model}`, cached.generatedAt),
         knode: knodeMeta('source_summary', { documents: [doc.path] }),
       },
-      regions: { body: body.trim() },
+      regions: { body: cached.body.trim() },
     };
   },
 };
@@ -387,12 +358,16 @@ const sourcesIndex: PageGenerator = {
     if (docs.length === 0) return null;
     const heat = await getDocHeat(ctx.store, docs.map((d) => d.id), ctx.config.heat);
     const pages = await summaryPagesByDocument(ctx.store);
+    const minChars = summaryMinChars(ctx.config);
     const rows = docs.map((d) => {
       const h = heat.get(d.id) ?? 0;
       const page = pages.get(d.path)?.path ?? null;
-      return { path: d.path, title: d.title ?? path.basename(d.path), page: page ? path.posix.basename(page) : null, heat: h, cold: h < ctx.config.heat.coldThreshold, sha: d.sha256 };
+      // under the size threshold by its row alone; a row without `chars` that its bytes do not
+      // settle reads as merely unsummarized until the Summarize stage's scan fills the column in
+      const short = !page && shortByRow(d, minChars) === true;
+      return { path: d.path, title: d.title ?? path.basename(d.path), page: page ? path.posix.basename(page) : null, heat: h, cold: h < ctx.config.heat.coldThreshold, short, sha: d.sha256 };
     });
-    const setSha = sha16(rows.map((r) => [r.path, r.sha, r.page, r.cold, Math.round(r.heat * 100)]));
+    const setSha = sha16(rows.map((r) => [r.path, r.sha, r.page, r.cold, r.short, Math.round(r.heat * 100)]));
     return {
       deps: [
         { kind: 'set', id: 'docs', sha: setSha },
@@ -403,16 +378,16 @@ const sourcesIndex: PageGenerator = {
     };
   },
   async render(_ctx, _pagePath, plan) {
-    const rows = plan.data.rows as { path: string; title: string; page: string | null; heat: number; cold: boolean }[];
+    const rows = plan.data.rows as { path: string; title: string; page: string | null; heat: number; cold: boolean; short?: boolean }[];
     const lines = [
       '## Sources index',
       '',
-      'Every indexed document, most recently updated first, linked to its summary page once the Summarize stage has written one.',
+      'Every indexed document, most recently updated first, linked to its summary page once the Summarize stage has written one. A document under `extraction.summaryMinChars` (`short`) gets none: search finds the document itself.',
       '',
       ...rows.map((r) => {
         const link = r.page ? `[${r.title}](${r.page})` : r.title;
         const badge = r.cold ? ' `cold`' : ` \`heat ${r.heat.toFixed(2)}\``;
-        return `* ${link} - \`${r.path}\`${badge}`;
+        return `* ${link} - \`${r.path}\`${badge}${r.short ? ' `short`' : ''}`;
       }),
     ];
     return { frontmatter: {}, regions: { sources: lines.join('\n') } };
@@ -822,10 +797,11 @@ export const MAX_SUMMARY_ATTEMPTS = 3;
 
 /**
  * Documents due a summary page: indexed sources under raw/docs whose page is
- * missing or dirty (their document changed since), leaving out those that
- * failed MAX_SUMMARY_ATTEMPTS times on their current content and those in
- * `exclude` — the documents in `prefer` first, then the most recently
- * updated. `due` counts them all, `docs` holds the first `limit`.
+ * missing or dirty (their document changed since), leaving out those under
+ * `minChars` (docs/design/14), those that failed MAX_SUMMARY_ATTEMPTS times
+ * on their current content and those in `exclude` — the documents in
+ * `prefer` first, then the most recently updated. `due` counts them all,
+ * `docs` holds the first `limit`.
  */
 export async function dueSummaryDocuments(
   store: Store,
@@ -836,20 +812,29 @@ export async function dueSummaryDocuments(
     /** Leave out documents still waiting for extraction — a summary written first would miss what it finds. */
     skipQueued?: boolean;
     exclude?: ReadonlySet<string>;
+    /** Documents shorter than this, in characters of indexed text, are never due (`extraction.summaryMinChars`); default 0, every document. */
+    minChars?: number;
   },
 ): Promise<{ docs: DocumentRow[]; due: number; pages: Map<string, { path: string; status: string }> }> {
   const pages = await summaryPagesByDocument(store);
+  const minChars = Math.max(0, Math.floor(opts.minChars ?? 0));
   const docs = await store.query<DocumentRow>(
     `SELECT * FROM documents d WHERE root = 'docs' AND status = 'indexed' AND kind = 'source'${opts.skipQueued ? ' AND NOT EXISTS (SELECT 1 FROM extraction_queue q WHERE q.document_id = d.id)' : ''}
+       AND ($1::int <= 0 OR d.chars IS NULL OR d.chars >= $1::int)
      ORDER BY updated_at DESC, path`,
+    [minChars],
   );
-  const due = docs.filter((d) => {
-    if (opts.exclude?.has(d.path)) return false;
+  const due: DocumentRow[] = [];
+  for (const d of docs) {
+    if (opts.exclude?.has(d.path)) continue;
     const page = pages.get(d.path);
-    if (page && page.status !== 'dirty') return false;
+    if (page && page.status !== 'dirty') continue;
+    // a row indexed before the `chars` column reads its text once here, never again
+    if (await isShortDocument(store, dataDir, d, minChars)) continue;
     const failed = readSourceSummaryFailure(dataDir, d.path);
-    return !(failed && failed.contentSha === d.sha256 && failed.attempts >= MAX_SUMMARY_ATTEMPTS);
-  });
+    if (failed && failed.contentSha === d.sha256 && failed.attempts >= MAX_SUMMARY_ATTEMPTS) continue;
+    due.push(d);
+  }
   const prefer = new Set(opts.prefer ?? []);
   const ordered = prefer.size ? [...due.filter((d) => prefer.has(d.path)), ...due.filter((d) => !prefer.has(d.path))] : due;
   return { docs: ordered.slice(0, Math.max(0, opts.limit)), due: due.length, pages };
@@ -914,7 +899,7 @@ export async function ensureSourceSummaries(
   const progress = opts.onProgress ?? (() => {});
   const limit = Math.max(0, Math.floor(opts.limit ?? 20));
   if (limit === 0 || !documentSummaryLlm(ctx).enabled) return [];
-  const { docs: picked, pages } = await dueSummaryDocuments(ctx.store, ctx.dataDir, { limit, prefer: opts.prefer, skipQueued: opts.skipQueued });
+  const { docs: picked, pages } = await dueSummaryDocuments(ctx.store, ctx.dataDir, { limit, prefer: opts.prefer, skipQueued: opts.skipQueued, minChars: summaryMinChars(ctx.config) });
   if (picked.length === 0) return [];
 
   // paths are handed out before any call runs, so two new documents with one
@@ -973,6 +958,48 @@ export async function retireConceptClusterPages(ctx: PagesContext, opts: { actor
   const rows = await ctx.store.query<{ path: string }>(`SELECT path FROM pages WHERE kind = 'concept_cluster' AND status <> 'archived'`);
   for (const r of rows) await archivePage(ctx, r.path, opts.actor ?? 'tier2');
   return rows.map((r) => r.path);
+}
+
+export interface PruneSummariesResult {
+  minChars: number;
+  /** Summary pages archived — or, on a dry run, that would be. */
+  archived: string[];
+  /** Pages kept: their documents are long enough. */
+  kept: number;
+}
+
+/**
+ * Archive the summary pages of documents under `extraction.summaryMinChars`
+ * (docs/design/14): pages written before the threshold existed, or before it
+ * was raised. Each goes to wiki/.archive through `archivePage`, its search
+ * projection with it, and the sources index is rewritten without the links.
+ * The cached summaries stay in the sidecars, so lowering the threshold brings
+ * the pages back without a model call. `knode-os wiki prune-summaries`.
+ */
+export async function pruneShortSummaries(
+  ctx: PagesContext,
+  opts: { minChars?: number; dryRun?: boolean; actor?: string; onProgress?: (msg: string) => void } = {},
+): Promise<PruneSummariesResult> {
+  const progress = opts.onProgress ?? (() => {});
+  const actor = opts.actor ?? 'wiki';
+  const minChars = Math.max(0, Math.floor(opts.minChars ?? summaryMinChars(ctx.config)));
+  const archived: string[] = [];
+  let kept = 0;
+  if (minChars <= 0) return { minChars, archived, kept };
+  for (const [docPath, page] of await summaryPagesByDocument(ctx.store)) {
+    const [doc] = await ctx.store.query<DocumentRow>(`SELECT * FROM documents WHERE path = $1 AND status = 'indexed'`, [docPath]);
+    if (!doc) continue; // a page whose document is gone is reconcileViews' to archive
+    const chars = await documentChars(ctx.store, ctx.dataDir, doc);
+    if (chars === null || chars >= minChars) {
+      kept++;
+      continue;
+    }
+    progress(`${opts.dryRun ? 'would archive' : 'archiving'} ${page.path} — ${docPath} has ${chars} characters, under ${minChars}`);
+    if (!opts.dryRun) await archivePage(ctx, page.path, actor);
+    archived.push(page.path);
+  }
+  if (!opts.dryRun && archived.length > 0) await ensureSourcesIndex(ctx, { actor });
+  return { minChars, archived, kept };
 }
 
 export async function ensureSourcesIndex(ctx: PagesContext, opts: { actor?: string } = {}): Promise<RegenerateOutcome> {

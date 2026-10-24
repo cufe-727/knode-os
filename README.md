@@ -237,6 +237,7 @@ knode-os entities merge|unmerge|merges|dedupe|resolve   entity resolution: rever
 knode-os entities relink       recompute every document's tier-0 links after a stop-list edit or a surface-rule change
 knode-os review entities|claims   the review passes (LLM judge over duplicate candidates; verdicts on disputed / suspected claims)
 knode-os wiki lint             orphans, broken links, stale / unreviewed research pages, expired and superseded text
+knode-os wiki prune-summaries [--dry-run] [--min-chars n]   archive the summary pages of documents under extraction.summaryMinChars
 knode-os config               show active config (redacted)
 knode-os plugins [--json]     the plugins this data directory loads and what they — and the built-ins — provide
 ```
