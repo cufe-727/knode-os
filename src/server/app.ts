@@ -62,7 +62,8 @@ import {
   resolveImportSource,
   unlinkFolder,
 } from '../ingest/folders.js';
-import { graphInsights, graphOverview, graphSearch } from '../graph/query.js';
+import { documentMentions } from '../graph/mentions.js';
+import { entityDetail, graphInsights, graphOverview, graphSearch } from '../graph/query.js';
 import { buildContextPack } from '../pack/pack.js';
 import { applySuggestion } from '../pack/learn.js';
 import { canonicalEmbeddingModel, createConfiguredEmbeddingProvider, EmbeddingQuotaLedger, embeddingLimits, validateEmbeddingPool } from '../ingest/embedding-router.js';
@@ -1466,6 +1467,31 @@ export function createApp(
       limit: Number(c.req.query('limit')),
       merged: c.req.query('merged') === '1' || c.req.query('merged') === 'true',
     }));
+  });
+
+  // the entities a Markdown view marks: known names in the text it shows, and what its file was indexed with
+  app.post('/api/entities/mentions', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { text?: unknown; path?: unknown };
+      if (typeof body.text !== 'string') return c.json({ error: 'text required' }, 400);
+      return c.json(await documentMentions(ctx.store, body.text, { path: typeof body.path === 'string' ? body.path : undefined }));
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
+  });
+
+  // the panel a marked name opens: the entity with its relations, co-mentions, claims and documents
+  app.get('/api/entities/detail', async (c) => {
+    const ctx = requestCtx(c);
+    const id = c.req.query('id');
+    if (!id) return c.json({ error: 'id required' }, 400);
+    try {
+      const detail = await entityDetail(ctx.store, id);
+      return detail ? c.json(detail) : c.json({ error: `no live entity ${id}` }, 404);
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
   });
 
   app.get('/api/documents', async (c) => {

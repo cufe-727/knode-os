@@ -27,7 +27,7 @@ const toast = (msg, ms = 2600) => {
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 /** Markdown someone else wrote, as HTML that carries formatting only: no raw HTML, no script links (web/markdown.js). */
-const renderMd = (s) => (window.knodeMarkdown ? window.knodeMarkdown.render(s) : `<pre>${esc(s)}</pre>`);
+const renderMd = (s, opts) => (window.knodeMarkdown ? window.knodeMarkdown.render(s, opts) : `<pre>${esc(s)}</pre>`);
 
 /* --------------------------- auth & workspaces ------------------------- */
 
@@ -249,6 +249,10 @@ function joinTeam(code, fromOnboarding = false) {
 function loadWorkspaceData() {
   currentFile = null;
   editing = false;
+  // another workspace's files and entities: nothing to go back to, nothing to show
+  fileTrail.length = 0;
+  paintBack();
+  closeEntityPanel();
   treeData = null;
   selectedDir = null;
   expandedDirs.clear();
@@ -1106,6 +1110,12 @@ function showMenuUnder(anchor, items) {
 
 let currentFile = null;
 let editing = false;
+/**
+ * Where each followed link came from — a wikilink, a cited source, the entity
+ * panel — so ‹ returns to the same file at the same place: checking a source
+ * should not cost the reader their position in the page that cited it.
+ */
+const fileTrail = [];
 let treeData = null;
 /** The folder clicked in the tree — where new items and uploads land. */
 let selectedDir = null;
@@ -1511,10 +1521,41 @@ async function loadFullFile() {
   }
 }
 
+const isMarkdownPath = (path) => /\.(md|markdown)$/i.test(path ?? '');
+
+/** Whether a page's metadata panel opens unfolded: the reader's last choice, folded at first. */
+const METADATA_OPEN_KEY = 'knode-os.markdown.metadataOpen';
+const metadataOpen = () => {
+  try {
+    return localStorage.getItem(METADATA_OPEN_KEY) === '1';
+  } catch {
+    return false;
+  }
+};
+$('#file-view').addEventListener('toggle', (event) => {
+  if (!event.target.matches?.('details.md-meta')) return;
+  try {
+    localStorage.setItem(METADATA_OPEN_KEY, event.target.open ? '1' : '0');
+  } catch {
+    // a private window keeps no preferences; the panel still opens
+  }
+}, true); // toggle does not bubble
+
+/** Paint text into the file view: Markdown with its notes and metadata and then the entities it names, anything else as it is. */
+function paintFileView(path, content, derived = false) {
+  const view = $('#file-view');
+  if (!isMarkdownPath(path) && !derived) {
+    view.innerHTML = `<pre>${esc(content)}</pre>`;
+    return;
+  }
+  view.innerHTML = renderMd(content, { metadataOpen: metadataOpen() });
+  markFileMentions(path, content);
+}
+
 /** Paint the file pane and decide, from this read alone, whether editing is allowed. */
 function renderFileContent(path, content, derived, truncated, bytes) {
   // derived text (a PDF / image's Markdown) is knode-os's, not the user's: readable, never editable here
-  $('#file-view').innerHTML = path.endsWith('.md') || derived ? renderMd(content) : `<pre>${esc(content)}</pre>`;
+  paintFileView(path, content, derived);
   $('#file-editor').value = content;
   const notice = readOnlyNotice(derived, truncated, bytes, path);
   setFileNotice(notice);
@@ -1523,7 +1564,8 @@ function renderFileContent(path, content, derived, truncated, bytes) {
   $('#btn-save').disabled = true;
 }
 
-async function openFile(path, labelEl) {
+/** `fragment`: where a link pointed inside the file — an export's entry anchor or a heading. */
+async function openFile(path, labelEl, fragment = null) {
   try {
     const { content, derived, truncated, bytes } = await api(`/api/file?path=${encodeURIComponent(path)}`);
     currentFile = path;
@@ -1539,14 +1581,131 @@ async function openFile(path, labelEl) {
     $('#file-editor').hidden = true;
     renderFileContent(path, content, derived, truncated, bytes);
     $('#btn-delete').disabled = Boolean(mirroredSource(path));
+    if (fragment) scrollToFragment(fragment);
+    else $('#file-view').scrollTop = 0;
   } catch (e) {
     toast(`open failed: ${e.message}`);
+  }
+}
+
+/** Draw the eye to what a jump landed on. */
+function flash(...els) {
+  for (const el of els) {
+    el.classList.remove('flash');
+    void el.offsetWidth; // restart the animation on a second jump to the same place
+    el.classList.add('flash');
+  }
+}
+
+/** A citation's note in the list of notes. */
+function scrollToNote(label) {
+  const note = $('#file-view').querySelector(`[data-fn-def="${CSS.escape(label)}"]`);
+  if (!note) return;
+  note.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  flash(note);
+}
+
+/** Back from a note to the first place the text cites it. */
+function scrollToCitation(label) {
+  const ref = $('#file-view').querySelector(`[data-fn="${CSS.escape(label)}"]`);
+  if (!ref) return;
+  ref.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  flash(ref.closest('sup') ?? ref);
+}
+
+/**
+ * Where a link's #fragment points: an export's entry anchor, which lights up
+ * the whole entry (up to the next anchor or rule), else a heading with that text.
+ */
+function scrollToFragment(fragment) {
+  const view = $('#file-view');
+  const anchor = view.querySelector(`[data-anchor="${CSS.escape(fragment)}"]`);
+  if (anchor) {
+    const entry = [];
+    for (let el = anchor.nextElementSibling; el && !el.matches('.md-anchor, hr'); el = el.nextElementSibling) entry.push(el);
+    (entry[0] ?? anchor).scrollIntoView({ block: 'start' });
+    flash(...entry);
+    return;
+  }
+  const want = fragment.trim().toLowerCase();
+  const slug = (s) => s.trim().toLowerCase().replace(/\s+/g, '-');
+  const heading = [...view.querySelectorAll('h1, h2, h3, h4, h5, h6')].find((h) => h.textContent.trim().toLowerCase() === want || slug(h.textContent) === want);
+  if (!heading) return;
+  heading.scrollIntoView({ block: 'start' });
+  flash(heading);
+}
+
+/* -------------------------- entities in the text -------------------------- */
+
+let mentionRequest = 0;
+
+/** Ask which known entities the painted text names, then mark them — unless another paint came first. */
+async function markFileMentions(path, content) {
+  const request = ++mentionRequest;
+  try {
+    const { mentions } = await api('/api/entities/mentions', { method: 'POST', body: JSON.stringify({ text: content, path }) });
+    if (request !== mentionRequest || currentFile !== path) return;
+    markMentions($('#file-view'), mentions ?? []);
+  } catch {
+    // marking is extra: the file reads the same without it
+  }
+}
+
+/**
+ * Turn the entities' names into links that open the entity panel, in their
+ * type's colour: the first mention of each per section, outside headings,
+ * links, code, the metadata panel and the notes, so the text stays readable.
+ */
+function markMentions(view, mentions) {
+  const matcher = window.knodeMarkdown?.mentionMatcher(mentions);
+  if (!matcher || matcher.empty) return;
+  const SKIP = 'a, code, pre, sup, .md-meta, .footnotes';
+  const runs = [];
+  let seen = new Set();
+  const walker = document.createTreeWalker(view, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (node.nodeType === Node.TEXT_NODE) return node.parentElement.closest('h1, h2, h3, h4, h5, h6') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      if (/^H[1-3]$/.test(node.tagName)) return NodeFilter.FILTER_ACCEPT; // a new section
+      return node.matches(SKIP) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
+    },
+  });
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (node.nodeType === Node.ELEMENT_NODE) seen = new Set();
+    else runs.push({ node, seen });
+  }
+  for (const { node, seen: section } of runs) {
+    const pieces = matcher.split(node.data);
+    if (!pieces.some((p) => p.mention && !section.has(p.mention.id))) continue;
+    const frag = document.createDocumentFragment();
+    for (const piece of pieces) {
+      if (!piece.mention || section.has(piece.mention.id)) {
+        frag.append(piece.text);
+        continue;
+      }
+      section.add(piece.mention.id);
+      const a = document.createElement('a');
+      a.href = '#';
+      a.className = 'entity-mention';
+      a.dataset.entity = piece.mention.id;
+      a.title = `${piece.mention.type} · ${piece.mention.name}`;
+      a.textContent = piece.text;
+      a.style.setProperty('--entity', entityColor(piece.mention.type));
+      frag.append(a);
+    }
+    node.replaceWith(frag);
   }
 }
 
 $('#file-view').addEventListener('click', async (event) => {
   const anchor = event.target.closest('a');
   if (!anchor || !currentFile) return;
+  if (anchor.dataset.fn || anchor.dataset.fnBack || anchor.dataset.entity) {
+    event.preventDefault();
+    if (anchor.dataset.fn) scrollToNote(anchor.dataset.fn);
+    else if (anchor.dataset.fnBack) scrollToCitation(anchor.dataset.fnBack);
+    else openEntity(anchor.dataset.entity);
+    return;
+  }
   const wikiTarget = anchor.dataset.wikilink;
   const href = anchor.getAttribute('href') || '';
   const target = wikiTarget || href;
@@ -1555,12 +1714,41 @@ $('#file-view').addEventListener('click', async (event) => {
   event.preventDefault();
   try {
     const resolved = await api(`/api/link/resolve?target=${encodeURIComponent(target)}&from=${encodeURIComponent(currentFile)}`);
-    reveal(parentDir(resolved.path));
-    await loadTree();
-    await openFile(resolved.path);
+    if (resolved.path === currentFile) {
+      if (resolved.fragment) scrollToFragment(resolved.fragment);
+      return;
+    }
+    await followTo(resolved.path, resolved.fragment);
   } catch (e) {
     toast(`link unavailable: ${e.message}`);
   }
+});
+
+function paintBack() {
+  const last = fileTrail.at(-1);
+  $('#btn-back').hidden = !last;
+  $('#btn-back').title = last ? `Back to ${last.path}` : '';
+}
+
+async function followTo(path, fragment = null) {
+  if (currentFile && currentFile !== path) {
+    fileTrail.push({ path: currentFile, scrollTop: $('#file-view').scrollTop });
+    if (fileTrail.length > 50) fileTrail.shift();
+  }
+  reveal(parentDir(path));
+  await loadTree();
+  await openFile(path, null, fragment);
+  paintBack();
+}
+
+$('#btn-back').addEventListener('click', async () => {
+  const last = fileTrail.pop();
+  paintBack();
+  if (!last) return;
+  reveal(parentDir(last.path));
+  await loadTree();
+  await openFile(last.path);
+  $('#file-view').scrollTop = last.scrollTop;
 });
 
 $('#btn-load-full').addEventListener('click', loadFullFile);
@@ -1571,18 +1759,114 @@ $('#btn-edit').addEventListener('click', () => {
   $('#file-editor').hidden = !editing;
   $('#btn-edit').textContent = editing ? 'preview' : 'edit';
   $('#btn-save').disabled = !editing;
-  if (!editing) $('#file-view').innerHTML = currentFile.endsWith('.md') ? renderMd($('#file-editor').value) : `<pre>${esc($('#file-editor').value)}</pre>`;
+  if (!editing) paintFileView(currentFile, $('#file-editor').value);
 });
 
 $('#btn-save').addEventListener('click', async () => {
   try {
     await api('/api/file', { method: 'PUT', body: JSON.stringify({ path: currentFile, content: $('#file-editor').value }) });
     toast(`saved ${currentFile}`);
-    $('#file-view').innerHTML = currentFile.endsWith('.md') ? renderMd($('#file-editor').value) : `<pre>${esc($('#file-editor').value)}</pre>`;
+    paintFileView(currentFile, $('#file-editor').value);
   } catch (e) {
     toast(`save failed: ${e.message}`);
   }
 });
+
+/* ------------------------------ entity panel ------------------------------ */
+
+/**
+ * The panel a marked name opens beside the file: the entity, its relations
+ * folded per neighbour, who its documents mention alongside it, its claims
+ * and the documents that mention it most. A neighbour opens in the same
+ * panel, and ‹ walks back. Reading stays where it was: a wiki page, when the
+ * entity has one, is a button away, not where the click lands.
+ */
+const entityPanel = { trail: [], request: 0 };
+
+async function openEntity(id, { back = false } = {}) {
+  const panel = $('#entity-panel');
+  const request = ++entityPanel.request;
+  panel.hidden = false;
+  if (!back) {
+    if (entityPanel.trail.at(-1) !== id) entityPanel.trail.push(id);
+  }
+  $('#entity-panel-back').hidden = entityPanel.trail.length < 2;
+  $('#entity-panel-body').innerHTML = '<p class="hint">loading…</p>';
+  try {
+    const detail = await api(`/api/entities/detail?id=${encodeURIComponent(id)}`);
+    if (request !== entityPanel.request) return;
+    renderEntityPanel(detail);
+  } catch (e) {
+    if (request !== entityPanel.request) return;
+    $('#entity-panel-body').innerHTML = `<p class="hint">${esc(e.message)}</p>`;
+  }
+}
+
+function closeEntityPanel() {
+  entityPanel.request++;
+  entityPanel.trail = [];
+  $('#entity-panel').hidden = true;
+}
+
+$('#entity-panel-close').addEventListener('click', closeEntityPanel);
+$('#entity-panel-back').addEventListener('click', () => {
+  if (entityPanel.trail.length < 2) return;
+  entityPanel.trail.pop();
+  openEntity(entityPanel.trail.at(-1), { back: true });
+});
+
+/** A relation as the panel reads it from the open entity's side: `→ supplies to`, `← invested in`, `↔ partner of`. */
+function relationLabel(relation) {
+  const way = KnodeGraph.UNDIRECTED.has(relation.type) ? '↔' : relation.direction === 'out' ? '→' : '←';
+  return `${way} ${KnodeGraph.relationName({ type: relation.type })}`;
+}
+
+function renderEntityPanel(d) {
+  const e = d.entity;
+  const pill = (type) => `<span class="tpill" data-type="${esc(type)}">${esc(type)}</span>`;
+  const family = (type) => KnodeGraph.family(type).color;
+  const groups = d.relations.map((g) => `<div class="nb" data-entity="${esc(g.other.id)}">
+      ${pill(g.other.type)}<span class="nb-name">${esc(g.other.name)}</span>
+      <span class="nb-rels">${g.relations.map((r) => `<span class="nb-rel" title="${esc(r.description || r.type)}"><span class="rel-swatch" data-rel="${esc(r.type)}"></span>${esc(relationLabel(r))}</span>`).join('')}</span>
+    </div>`).join('');
+  const co = d.cooccurring.map((x) => `<button class="chip" data-entity="${esc(x.id)}" title="${x.documents} shared ${x.documents === 1 ? 'document' : 'documents'}"><span class="dot" data-type="${esc(x.type)}"></span>${esc(x.name)}</button>`).join('');
+  const claims = d.claims.map((cl) => `<div class="hint">◈ ${esc(cl.statement.slice(0, 200))} <span class="mono">[${esc(cl.status)}]</span></div>`).join('');
+  const docs = d.documents.map((doc) => `<a href="#" class="doc-link mono" data-path="${esc(doc.path)}" title="${esc(doc.path)}">${esc(doc.title || doc.path)}</a>`).join('');
+  const count = (n, noun) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+  const numbers = [count(e.mentionCount, 'mention'), count(e.documentCount, 'document'), `degree ${e.degree}`].join(' · ');
+  $('#entity-panel-body').innerHTML = `<div class="entity-card selected">
+      ${pill(e.type)} <span class="ename">${esc(e.name)}</span>
+      ${e.aliases.length ? `<div class="hint">also ${e.aliases.map(esc).join(' · ')}</div>` : ''}
+      ${e.description ? `<div class="hint">${esc(e.description.slice(0, 400))}</div>` : ''}
+      <div class="hint mono">${esc(numbers)}</div>
+      <div class="actions">
+        <button data-wiki${e.wikiPath ? ` title="${esc(e.wikiPath)}"` : ' disabled title="no wiki page yet"'}>open wiki page</button>
+        <button data-graph>show in graph</button>
+      </div>
+    </div>
+    <div class="entity-card"><b>${d.relations.length ? `relations · ${d.relations.length + d.moreRelations}` : 'no typed relations yet'}</b>${groups}
+      ${d.moreRelations ? `<div class="hint">+${d.moreRelations} more in the graph</div>` : ''}</div>
+    ${co ? `<div class="entity-card"><b>mentioned alongside</b><div class="chips">${co}</div></div>` : ''}
+    ${claims ? `<div class="entity-card"><b>claims</b>${claims}</div>` : ''}
+    ${docs ? `<div class="entity-card"><b>mentioned in</b>${docs}</div>` : ''}`;
+  const body = $('#entity-panel-body');
+  for (const p of body.querySelectorAll('.tpill')) p.style.color = entityColor(p.dataset.type);
+  for (const dot of body.querySelectorAll('.dot[data-type]')) dot.style.background = entityColor(dot.dataset.type);
+  for (const sw of body.querySelectorAll('.rel-swatch[data-rel]')) sw.style.background = family(sw.dataset.rel);
+  for (const el of body.querySelectorAll('[data-entity]')) el.addEventListener('click', () => openEntity(el.dataset.entity));
+  for (const a of body.querySelectorAll('.doc-link')) {
+    a.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      followTo(a.dataset.path);
+    });
+  }
+  const wiki = body.querySelector('[data-wiki]');
+  if (e.wikiPath) wiki.addEventListener('click', () => followTo(e.wikiPath));
+  body.querySelector('[data-graph]').addEventListener('click', () => {
+    navigate('graph');
+    loadGraph(e.name);
+  });
+}
 
 $('#btn-delete').addEventListener('click', () => {
   if (currentFile) deleteNode({ path: currentFile, kind: 'file' });

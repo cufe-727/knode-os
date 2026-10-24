@@ -114,6 +114,22 @@ describe('Markdown rendering (web/markdown.js)', () => {
     expect(html).toContain('data-wikilink="a&quot;b"');
   });
 
+  it('reads one piece of HTML, an empty anchor alone on its line, and only in that exact shape', () => {
+    expect(md.render('<a id="e-1f2e"></a>\n## 09:06')).toBe('<span class="md-anchor" data-anchor="e-1f2e"></span><h2>09:06</h2>\n');
+    for (const payload of [
+      '<a id="x" onclick="alert(1)"></a>',
+      '<a id="x"><img src=x onerror=alert(1)></a>',
+      '<a id="x" href="javascript:alert(1)"></a>',
+      '<a id="x\' onmouseover=\'alert(1)"></a>',
+      '<a name="x">text</a>',
+      'before <a id="x"></a> after',
+    ]) {
+      const html = md.render(payload);
+      expect(html).not.toMatch(/<(a|img|span)\b/i);
+      expect(html).not.toMatch(/\bon[a-z]+\s*=\s*['"]/i);
+    }
+  });
+
   it('is what every Markdown view in the UI renders through', () => {
     const app = fs.readFileSync(path.join(webDir, 'app.js'), 'utf8');
     expect(app).not.toMatch(/marked\.(parse|use)\b/);

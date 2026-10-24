@@ -488,11 +488,30 @@ export async function typedEntitiesNamed(q: Queryable, dataDir: string, names: s
   return groupCandidates(rows, mode);
 }
 
+/** Live entities of any type with these ids, with every spelling they answer to (what a document was indexed with), hottest first. */
+export async function linkCandidatesFor(q: Queryable, dataDir: string, ids: string[]): Promise<LinkCandidate[]> {
+  if (ids.length === 0) return [];
+  const rows = await q.query<CandidateRow>(
+    `SELECT e.id, e.name, e.type, k.alias_key, k.kind
+     FROM entity_alias_keys k JOIN entities e ON e.id = k.entity_id
+     WHERE e.id = ANY($1::text[]) AND e.tx_to IS NULL AND e.canonical_id IS NULL
+     ORDER BY e.mention_count DESC, e.id, k.alias_key`,
+    [ids],
+  );
+  return groupCandidates(rows, resolutionMode(dataDir));
+}
+
 /* ───────────────────── per-workspace cache of the known ───────────────────── */
 
 export interface Tier0Known {
   index: LinkIndex;
   stop: Set<string>;
+  /**
+   * The generic words alone, which no spelling in `index` may be (`stop` adds
+   * the corpus-frequent ones, which no alias may be): for another link index
+   * built beside it by the same rule.
+   */
+  linkStop: Set<string>;
 }
 
 /** How long a loaded index is trusted before the store is asked whether anything changed. */
@@ -504,6 +523,7 @@ interface KnownCache {
   rows: LinkCandidate[];
   stopStamp: string;
   stop: Set<string>;
+  linkStop: Set<string>;
   index: LinkIndex;
   inflight: Promise<void> | null;
 }
@@ -517,6 +537,7 @@ function emptyKnownCache(): KnownCache {
     rows: [],
     stopStamp: '',
     stop: builtinStopKeys(),
+    linkStop: builtinStopKeys(),
     index: buildLinkIndex([]),
     inflight: null,
   };
@@ -545,7 +566,7 @@ export async function tier0Known(store: Store, opts: { force?: boolean } = {}): 
     });
     await cache.inflight;
   }
-  return { index: c.index, stop: c.stop };
+  return { index: c.index, stop: c.stop, linkStop: c.linkStop };
 }
 
 async function refreshKnown(store: Store, c: KnownCache, force: boolean): Promise<void> {
@@ -567,7 +588,8 @@ async function refreshKnown(store: Store, c: KnownCache, force: boolean): Promis
     // a name skips the generic words only: a name frequent in this corpus is
     // often its hub entity, and linking that is the point; an alias that is a
     // frequent word links nothing (weakLinkKey)
-    c.index = buildLinkIndex(c.rows, stopKeySet(editable, null), c.stop);
+    c.linkStop = stopKeySet(editable, null);
+    c.index = buildLinkIndex(c.rows, c.linkStop, c.stop);
     c.stopStamp = stopStamp;
   }
   c.probedAt = Date.now();
