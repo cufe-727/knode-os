@@ -147,8 +147,8 @@ function role(patch: Partial<ResearchRole> & Pick<ResearchRole, 'id' | 'phase'>)
 
 export function defaultRoles(): ResearchRole[] {
   return [
-    role({ id: 'planner', phase: 'plan', title: '规划者', maxTurns: 12, description: '读简报、摸底索引，把页面拆成可并行调查的章节（JSON 提纲）' }),
-    role({ id: 'researcher', phase: 'research', title: '研究员', native: true, description: '只负责一个章节：用 knode 检索与只读资料取证，返回发现与候选 claims / relations' }),
+    role({ id: 'planner', phase: 'plan', title: '规划者', maxTurns: 12, description: '读简报、摸底索引，把调查按时期或子问题拆成可并行的子任务（JSON 提纲）' }),
+    role({ id: 'researcher', phase: 'research', title: '研究员', native: true, description: '只负责一个时期或子问题：用 knode 检索与只读资料取证，返回带日期与来源的发现、候选 claims / relations' }),
     role({ id: 'synthesizer', phase: 'synthesize', title: '主笔', tools: { write: true, files: true, web: 'inherit' }, description: '把发现综合成页面并用 knode_write 写入' }),
     role({ id: 'critic', phase: 'review', title: '评审', maxTurns: 12, native: true, description: '对照契约评审页面，抽查来源，返回 JSON 判定' }),
     role({ id: 'reviser', phase: 'revise', title: '修订者', tools: { write: true, files: true, web: 'inherit' }, description: '按评审与校验意见修正页面' }),
@@ -177,8 +177,8 @@ function baseProfile(name: string, patch: Partial<Omit<ResearchProfile, 'name' |
 /** The four built-in profiles, seeded once and re-seeded when deleted (delete = reset). */
 export const BUILTIN_PROFILES: Record<string, ResearchProfile> = {
   default: baseProfile('default', {
-    title: '默认 · 团队流水线',
-    description: '规划 → 并行调查 → 综合 → 评审 → 修订；推理强度跟随 CLI 默认，联网跟随工作区设置。',
+    title: '默认 · 跟随运行器',
+    description: '流水线跟随运行器（默认是原生子代理：一个会话按时期或子问题把取证并行派给子代理，再自己写页；团队流水线更全面，慢约三倍）；推理强度跟随 CLI，联网跟随工作区设置。',
   }),
   quick: baseProfile('quick', {
     title: '快速 · 单会话',
@@ -201,19 +201,30 @@ export const BUILTIN_PROFILES: Record<string, ResearchProfile> = {
   }),
   native: baseProfile('native', {
     title: '原生子代理',
-    description: '一个主管会话，研究员与评审作为 CLI 原生子代理（claude --agents / codex agents.enabled）；cursor 退回单会话。',
+    description: '一个主管会话按时期或子问题把取证并行派给 CLI 原生子代理（claude --agents / codex agents.<id> / cursor .cursor/agents），自己核对并写页；推理强度高。',
     pipeline: 'native',
     reasoning: { effort: 'high', speed: 'default' },
   }),
 };
 
 /**
- * Built-in descriptions as an earlier release seeded them. A file that still
- * carries one, untouched, reads as today's text — the old one named a config
- * key the Settings page no longer shows.
+ * Built-in titles and descriptions as earlier releases seeded them. A file
+ * that still carries one, untouched, reads as today's text: the first named
+ * a config key the Settings page no longer shows, the rest said the default
+ * ran the team pipeline and that Cursor had no sub-agents (both until
+ * 2026-10-21).
  */
-const RESEEDED_DESCRIPTIONS: Record<string, string> = {
+const RESEEDED_TEXT: Record<string, string> = {
   '规划 → 并行调查 → 综合 → 评审 → 修订；推理强度与联网跟随 CLI 与 review.external 的默认值。': BUILTIN_PROFILES.default.description,
+  '规划 → 并行调查 → 综合 → 评审 → 修订；推理强度跟随 CLI 默认，联网跟随工作区设置。': BUILTIN_PROFILES.default.description,
+  '默认 · 团队流水线': BUILTIN_PROFILES.default.title,
+  '一个主管会话，研究员与评审作为 CLI 原生子代理（claude --agents / codex agents.enabled）；cursor 退回单会话。': BUILTIN_PROFILES.native.description,
+};
+
+/** Role descriptions as releases before 2026-10-21 seeded them, when research was split by page section. */
+const RESEEDED_ROLE_TEXT: Record<string, string> = {
+  '读简报、摸底索引，把页面拆成可并行调查的章节（JSON 提纲）': defaultRoles()[0].description,
+  '只负责一个章节：用 knode 检索与只读资料取证，返回发现与候选 claims / relations': defaultRoles()[1].description,
 };
 
 /* ------------------------------------------------------------------ files */
@@ -358,7 +369,7 @@ export function normalizeRole(raw: unknown, index: number): ResearchRole | null 
     maxTurns: int(o.maxTurns, 0, 0, 500),
     prompt: normalizePromptPath(o.prompt),
     native: bool(o.native, false),
-    description: str(o.description),
+    description: ((d) => RESEEDED_ROLE_TEXT[d] ?? d)(str(o.description)),
   };
 }
 
@@ -385,8 +396,8 @@ export function normalizeProfile(raw: Record<string, unknown>, name: string, fil
   return {
     name,
     // a custom profile is its own thing: no borrowed title or description from the built-in default
-    title: str(raw.title, builtin ? builtin.title : name),
-    description: ((d) => RESEEDED_DESCRIPTIONS[d] ?? d)(str(raw.description, builtin ? builtin.description : '')),
+    title: ((t) => RESEEDED_TEXT[t] ?? t)(str(raw.title, builtin ? builtin.title : name)),
+    description: ((d) => RESEEDED_TEXT[d] ?? d)(str(raw.description, builtin ? builtin.description : '')),
     pipeline: oneOf(raw.pipeline, [...PIPELINE_MODES, ''] as const, base.pipeline),
     reasoning: {
       effort: oneOf(reasoning.effort, EFFORTS, base.reasoning.effort),
@@ -483,7 +494,7 @@ export function effectiveSpeed(profile: ResearchProfile, role?: ResearchRole | n
 
 export function effectivePipeline(profile: ResearchProfile, config: KnodeConfig): PipelineMode {
   const fromConfig = config.research?.pipeline;
-  return profile.pipeline || (fromConfig && (PIPELINE_MODES as readonly string[]).includes(fromConfig) ? (fromConfig as PipelineMode) : 'team');
+  return profile.pipeline || (fromConfig && (PIPELINE_MODES as readonly string[]).includes(fromConfig) ? (fromConfig as PipelineMode) : 'native');
 }
 
 /**

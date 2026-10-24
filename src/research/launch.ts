@@ -342,6 +342,10 @@ export function sessionArgs(input: CliSessionInput): { cmd: string; args: string
         'exec', '-', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', input.cwd,
         '-c', `mcp_servers.knode-os.url=${JSON.stringify(mcpUrlWithWorkspace(input.mcp))}`,
         '-c', 'mcp_servers.knode-os.bearer_token_env_var="KNODE_MCP_TOKEN"',
+        // codex gates MCP tools per server; under approval_policy = "never" (a common
+        // ~/.codex/config.toml setting) a gated call is refused, so every knode tool
+        // would fail in exec mode. The server is knode's own, so its tools are pre-approved.
+        '-c', 'mcp_servers.knode-os.default_tools_approval_mode="approve"',
         '-c', `web_search=${tomlString(web ? input.webFreshness ?? 'live' : 'disabled')}`,
         ...(effort ? ['-c', `model_reasoning_effort=${tomlString(effort)}`] : []),
         ...(tier ? ['-c', `service_tier=${tomlString(tier)}`] : []),
