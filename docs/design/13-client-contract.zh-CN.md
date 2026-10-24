@@ -256,7 +256,7 @@ anchors:
   `chunks.metadata` 里。第一个锚点之前的文字取文档的默认值。
 - **证据**（落到某个 chunk 上的 tier-1 实体、关系或 claim，以及 mention）取其 chunk 的可获得性。生产端的 claim 用
   frontmatter `claims` 里的 `anchor:` 指明自己的条目，取该条目的值。
-- `chunks` 和 `evidence` 增加带索引的 `available_at` 列（schema v14）。文档 apply 时填写；已经索引的文档用
+- `chunks` 和 `evidence` 增加带索引的 `available_at` 列（schema v16）。文档 apply 时填写；已经索引的文档用
   `sync --reapply` 补上。
 
 ### 4.3 `known_at` 读取会重算什么
@@ -576,7 +576,7 @@ CLI 仍是管理员的工具：token、`connect`、datasource、sync、rebuild�
    失败。
 3. **按输入回放 tier 1**（§6.4）。
    *完成标准*：给已抽取的文档加一个 frontmatter 键，会重跑 tier 0，并在不调用模型的情况下保留它的 tier-1 claim。
-4. **`known_at`。** 条目索引和 claim 锚点；chunk 和证据上的 `available_at`（schema v14）；resolver 中的新轴；
+4. **`known_at`。** 条目索引和 claim 锚点；chunk 和证据上的 `available_at`（schema v16）；resolver 中的新轴；
    search、claims、graph、evidence 和 mentions；排除生成页面。
    *完成标准*：一个合成语料通过测试：帖子 A 在 t1 说 X，帖子 B 在 t3 反驳它；`known_at` 为 t2 时，X 是 fact 且
    没有 dispute，为 t4 时变为 disputed；周文件里周日的帖子在该周周一不可见；帖子文件里的评论只在它自己的时间之后
@@ -617,7 +617,7 @@ CLI 仍是管理员的工具：token、`connect`、datasource、sync、rebuild�
 | 远程 API | `src/remote/api.ts`（由操作挂载路由；记录写入者；批量写入）；`src/remote/tokens.ts`（`role`、`tier`、scope `mcp` 和 `live`） |
 | MCP | `src/server/mcp-http.ts`（带 `mcp` 的 `knr_` token）；`src/mcp/tools.ts`（随着操作迁移，改由操作注册） |
 | 信任 | `src/lineage/trust.ts`；`src/fs/sidecar.ts`（远程路由调用 `recordOrigin`） |
-| `known_at` | `src/store/resolver.ts`；`src/store/migrations.ts`（v14：`chunks` 和 `evidence` 上的 `available_at`，`v_entries`）；`src/ingest/chunker.ts` 和 `src/lineage/writer.ts`（锚点、可获得性）；`src/graph/frontmatter.ts`（`anchors`、claim 的 `anchor`）；`src/graph/llm-extract.ts`；`src/store/claims.ts`；`src/search/search.ts`、`src/search/sag.ts`；`src/graph/query.ts` |
+| `known_at` | `src/store/resolver.ts`；`src/store/migrations.ts`（v16：`chunks` 和 `evidence` 上的 `available_at`，`v_entries`）；`src/ingest/chunker.ts` 和 `src/lineage/writer.ts`（锚点、可获得性）；`src/graph/frontmatter.ts`（`anchors`、claim 的 `anchor`）；`src/graph/llm-extract.ts`；`src/store/claims.ts`；`src/search/search.ts`、`src/search/sag.ts`；`src/graph/query.ts` |
 | tier-1 回放 | `src/ingest/apply.ts`、`src/fs/sidecar.ts`（按提示词的输入回放） |
 | 数据源 | `src/config.ts`（表上的 `files`、实体列上的 `sample`）；`src/datasource/duckdb.ts`（glob 表、重新展开）；`src/datasource/sync.ts`（采样数量） |
 | CLI | `src/cli.ts`（`remote token create --role`、`connect --project --token-env`） |

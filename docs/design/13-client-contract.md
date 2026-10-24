@@ -272,7 +272,7 @@ Everything derived takes its availability from what it is grounded in:
   anchor takes the document's default.
 - **Evidence** (a tier-1 entity, relation or claim grounded to a chunk, or a mention) takes its chunk's
   availability. A producer claim names its entry with `anchor:` in frontmatter `claims` and takes that entry's.
-- `chunks` and `evidence` gain an indexed `available_at` column (schema v14). It is filled when a document is
+- `chunks` and `evidence` gain an indexed `available_at` column (schema v16). It is filled when a document is
   applied, and `sync --reapply` fills it for documents already indexed.
 
 ### 4.3 What a `known_at` read recomputes
@@ -617,7 +617,7 @@ The administrator installs these. The API's write scope reaches only `raw/docs`,
 3. **Tier-1 replay keyed on its inputs** (§6.4).
    *Done when* adding a frontmatter key to an extracted document re-runs tier 0 and keeps its tier-1 claims without a
    model call.
-4. **`known_at`.** The entry index and claim anchors; `available_at` on chunks and evidence (schema v14); the
+4. **`known_at`.** The entry index and claim anchors; `available_at` on chunks and evidence (schema v16); the
    resolver axis; search, claims, graph, evidence and mentions; generated pages left out.
    *Done when* a synthetic corpus passes: post A at t1 says X and post B at t3 contradicts it; at `known_at` t2, X is a
    fact with no dispute, and at t4 it is disputed; a Sunday post in a weekly file is invisible on that week's Monday;
@@ -665,7 +665,7 @@ knowledge-derived feature enters a backtest.
 | Remote API | `src/remote/api.ts` (routes mounted from the operations; writers recorded; batch writes); `src/remote/tokens.ts` (`role`, `tier`, the scopes `mcp` and `live`) |
 | MCP | `src/server/mcp-http.ts` (`knr_` tokens with `mcp`); `src/mcp/tools.ts` (registered from the operations as they move) |
 | Trust | `src/lineage/trust.ts`; `src/fs/sidecar.ts` (`recordOrigin` from the remote routes) |
-| `known_at` | `src/store/resolver.ts`; `src/store/migrations.ts` (v14: `available_at` on `chunks` and `evidence`, `v_entries`); `src/ingest/chunker.ts` and `src/lineage/writer.ts` (anchors, availability); `src/graph/frontmatter.ts` (`anchors`, claim `anchor`); `src/graph/llm-extract.ts`; `src/store/claims.ts`; `src/search/search.ts`, `src/search/sag.ts`; `src/graph/query.ts` |
+| `known_at` | `src/store/resolver.ts`; `src/store/migrations.ts` (v16: `available_at` on `chunks` and `evidence`, `v_entries`); `src/ingest/chunker.ts` and `src/lineage/writer.ts` (anchors, availability); `src/graph/frontmatter.ts` (`anchors`, claim `anchor`); `src/graph/llm-extract.ts`; `src/store/claims.ts`; `src/search/search.ts`, `src/search/sag.ts`; `src/graph/query.ts` |
 | Tier-1 replay | `src/ingest/apply.ts`, `src/fs/sidecar.ts` (replay keyed on the prompt's inputs) |
 | Datasources | `src/config.ts` (`files` on tables, `sample` on entity columns); `src/datasource/duckdb.ts` (glob tables, re-expansion); `src/datasource/sync.ts` (sample size) |
 | CLI | `src/cli.ts` (`remote token create --role`, `connect --project --token-env`) |
