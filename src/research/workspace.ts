@@ -21,6 +21,7 @@ import { profileBrief, requiredSections, ResearchProfile } from './profile.js';
  *                           the existing page (for refresh / overwrite), previous rejection reasons
  *   .mcp.json               MCP endpoint for Claude Code (headers carry token + workspace)
  *   .cursor/mcp.json        the same for cursor-agent
+ *   .cursor/cli.json        cursor-agent's permissions: knode's MCP tools allowed, file writes and shell denied
  *   transcript.jsonl        stdout of the run (stream-json / NDJSON)
  *   result.json             what the runner concluded
  *
@@ -137,7 +138,17 @@ export function knowledgeNotes(dataDir: string, opts: { guide?: string | null } 
   return notes.length ? `# 知识库自述\n\n${notes.join('\n\n')}` : '';
 }
 
-/** The files a CLI session reads from its cwd: the schema, the MCP endpoint (Claude Code and Cursor forms), a README. */
+/**
+ * cursor-agent's permissions for a session in this workspace (`.cursor/cli.json`).
+ * In print mode it rejects every MCP tool call that is not allow-listed — even
+ * with --approve-mcps — while its own edit and shell tools stay usable, so
+ * without this file an agent cannot read the knowledge base and saves the page
+ * straight to disk. Allowed: knode's tools; denied: file writes and shell, so
+ * pages travel through knode_write as for every other CLI.
+ */
+export const CURSOR_PERMISSIONS = { permissions: { allow: ['Mcp(knode-os:*)'], deny: ['Write(**)', 'Shell(*)'] } };
+
+/** The files a CLI session reads from its cwd: the schema, the MCP endpoint (Claude Code and Cursor forms), Cursor's permissions, a README. */
 export function writeAgentFiles(dir: string, input: { schema: string; mcp: McpEndpoint; readme: string }): void {
   fs.mkdirSync(path.join(dir, '.cursor'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'CLAUDE.md'), input.schema);
@@ -145,6 +156,7 @@ export function writeAgentFiles(dir: string, input: { schema: string; mcp: McpEn
   const server = { type: 'http', url: input.mcp.url, headers: { Authorization: `Bearer ${input.mcp.token}`, ...input.mcp.headers } };
   fs.writeFileSync(path.join(dir, '.mcp.json'), JSON.stringify({ mcpServers: { 'knode-os': server } }, null, 2) + '\n');
   fs.writeFileSync(path.join(dir, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { 'knode-os': { url: input.mcp.url, headers: server.headers } } }, null, 2) + '\n');
+  fs.writeFileSync(path.join(dir, '.cursor', 'cli.json'), JSON.stringify(CURSOR_PERMISSIONS, null, 2) + '\n');
   fs.writeFileSync(path.join(dir, 'README.md'), input.readme);
 }
 

@@ -626,13 +626,15 @@ export interface ResearchConfig {
   /** Accept the top recommendations automatically, up to `dailyJobs` per day. */
   auto: { enabled: boolean; dailyJobs: number };
   /**
-   * 'single': one agent session does everything. 'team': a plan session
-   * outlines the page, parallel researcher sessions each take one section,
-   * a synthesis session writes the page, a review session critiques it and a
-   * revision session fixes what it found (deep-research pipeline). 'native':
-   * one orchestrator session with the profile's native roles registered as
-   * the CLI's own sub-agents (claude --agents, codex agents.enabled). The
-   * profile's own `pipeline` wins — Settings edits it there — so this is
+   * 'native' (default): one orchestrator session with the profile's native
+   * roles registered as the CLI's own sub-agents (claude --agents, codex
+   * agents.<id>, cursor .cursor/agents); it splits the research by period or
+   * sub-question, delegates it in parallel and writes the page itself.
+   * 'team' (the deeper, slower mode): a plan session splits the research the
+   * same way, parallel researcher sessions take one part each, a synthesis
+   * session writes the page, a review session critiques it and a revision
+   * session fixes what it found. 'single': one agent session does everything.
+   * The profile's own `pipeline` wins — Settings edits it there — so this is
    * only what a profile that names none runs.
    */
   pipeline: 'single' | 'team' | 'native';
@@ -959,7 +961,7 @@ export function defaultConfig(): KnodeConfig {
       keepRuns: 20,
       readDirs: ['raw/docs', 'wiki', '.sidecar'],
       auto: { enabled: false, dailyJobs: 3 },
-      pipeline: 'team',
+      pipeline: 'native',
       profile: 'default',
       researchers: 3,
       reviewRounds: 1,
