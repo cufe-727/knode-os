@@ -1,5 +1,5 @@
 import { normalizePredicate, Ontology } from './ontology.js';
-import { CLAIM_STATUS, ExtractedClaim, ExtractedEntity, ExtractedRelation } from './store.js';
+import { CLAIM_STATUS, ExtractedClaim, ExtractedEntity, ExtractedRelation, normalizeClaimKind } from './store.js';
 
 /**
  * Tier-0 declarative extraction: documents may carry explicit `entities:`,
@@ -140,6 +140,7 @@ export function frontmatterExtraction(fm: Record<string, unknown>, opts: Declare
       type: typeof o.type === 'string' && o.type.trim() ? o.type.trim() : 'fact',
       statement,
       status: status as ExtractedClaim['status'],
+      ...(typeof o.kind === 'string' ? { kind: normalizeClaimKind(o.kind) } : {}),
       startDate: dateStr(o.startDate ?? o.start_date ?? o.validFrom ?? o.valid_from),
       endDate: dateStr(o.endDate ?? o.end_date ?? o.validTo ?? o.valid_to),
       eventDate: dateStr(o.eventDate ?? o.event_date ?? o.date),

@@ -42,7 +42,14 @@ serve: /api/* + /mcp（Streamable HTTP，按工作区路由，bearer token）◀
 
 - 本体包 `playbooks/ontology/<pack>.yaml`，按 `graph.ontologyPacks`（默认 `["core","organization"]`）顺序合并；
   `initDataDir` 播种内置包，之后不覆盖用户编辑。关系类型字段：`id / inverse / symmetric / hierarchical / temporal /
-  domain / range / synonyms / inverseSynonyms / description / system`。
+  domain / range / synonyms / inverseSynonyms / description / system`。实体类型带 `label / description / examples`，
+  tier‑1 prompt 逐行列出每个类型及其说明；后面的包可以重述一个类型来改写说明，位置（即折叠优先级）不变。
+- 第三个内置包 `finance`（可选启用，2026‑10‑23）是股市语料的词汇：实体类型 `market`、`index`、`security`（不是公司
+  也不是基金的可交易工具；上市公司仍是 `organization`，股票代码放 aliases）、`fund`、`sector`、`theme`、`indicator`、
+  `currency`、`commodity`、`policy`；关系 `listed_on`、`constituent_of`、`belongs_to_sector`、`tracks`、`issued_by`、
+  `manages_fund`、`benefits_from` / `harmed_by`（利好 / 利空 读作反向）、`holds_position_in`、`recommends` / `bearish_on`、
+  `predicts`。没有 channel 类型：平台或媒体账号是 `organization`，博主是 `person`；泛指的涨跌（大跌）是 `price_move`
+  claim，不是 `event` 实体。
 - `normalizePredicate()`：同义词 → 规范 id；反向拼写（`parent_of`、`母公司`、`buys_from`）→ 规范 id 并**翻转方向**；
   对称谓词端点按 id 排序只存一行；未知谓词 → `related_to`，原拼写记入 evidence attrs `raw_type`，
   `knode_graph_insights.unknownPredicates` 统计——提示扩本体。系统谓词（`mentions / links_to / co_occurs / …`）永远合法、不进 prompt。
@@ -75,8 +82,16 @@ serve: /api/* + /mcp（Streamable HTTP，按工作区路由，bearer token）◀
   → 精度感知的 `[from, to]`；相对形式按文档日期折算，缺参考日期返回 null。`valid_range` 查询短语复用同一语法。
 - claims 新列 `event_at`（事件时间，最高权重支持者）、`observed_at`（最早来源日期）、`superseded_by`（系统维护）。
   prompt 与 frontmatter 都区分 `eventDate` 与 `startDate/endDate`。
-- supersession：同主体同类型、均为 fact、较旧者窗口在较新者开始前结束（或未闭合）→ `superseded_by = 新者`；
+- supersession：同主体、同类型、同对象、均为 fact 且 kind 为 fact、较旧者窗口在较新者开始前结束（或未闭合）→ `superseded_by = 新者`；
   `knode_claims` 默认隐藏（`include_superseded=true` 可见），`order=timeline` 按事件时间排序，`event_range` 过滤。
+- claims 的 `type` 收敛为封闭列表（`CLAIM_TYPES`，`src/graph/store.ts`：`price_move`、`technical`、`earnings`、`guidance`、
+  `fundamentals`、`valuation`、`fund_flow`、`holding`、`management`、`recommendation`、`outlook`、`macro`、`policy`、`event`、
+  `risk`、`method`、`other`，另有系统用的 `absence`），prompt 逐行列出；其它拼写（旧的自由标签、中文名、近似写法）在解析、
+  sidecar 回放和写入时按同义词映射，未知 → `other`；过滤条件（`knode_claims.types`、模版 slot 的 `claimTypes`）里的旧标签同样映射，未知的匹配不到任何行。新列 `kind`（迁移 v14）：`fact` / `opinion` / `prediction` / `rumor`，
+  与 `status`（来源断言得多肯定）并列；statement 不带归属语（写"宁德时代估值偏高"而不是"作者认为…"），归属由 kind 表达。
+  supersession 只在度量类类型上进行（`CLAIM_TYPES.supersedes`：earnings、guidance、valuation、price_move、technical、fund_flow、macro、holding、recommendation、outlook；较晚的 `management` 或 `event` 事实不替代任何东西），按主体、类型、对象分组；它与过期事实审计、来源争议、夜间复核只看 `kind = fact`；重复 claim 判官能看到 kind，kind 不同的一对不自动合并；
+  实体存根页把 "Views and forecasts" 与 "Facts (current)" 分开列；`knode_claims` / `GET /api/claims` / `knode-os claims`
+  以 `claim_kinds` / `claim_kind` / `--kind` 过滤。实体 description 改为与文档无关的一句话（它是什么，而不是本文说了它什么）。
 - 实体存根页拆成 `## Facts (current)`（未替代、未过期）与 `## Timeline`（按事件时间升序，被替代的标注）。
 
 ## 5. 研究 runner（`src/research/`）

@@ -873,6 +873,7 @@ program
   .option('--object <ref>', 'entity on the other side of the claim')
   .option('--types <list>', 'comma-separated claim types, e.g. earnings,guidance')
   .option('--status <list>', 'comma-separated: fact,suspected,disputed')
+  .option('--kind <list>', 'comma-separated: fact,opinion,prediction,rumor')
   .option('--text <substring>', 'substring of the statement')
   .option('-n, --limit <n>', 'max rows', '50')
   .option('--as-of <iso>', 'system time: what the knowledge base believed then')
@@ -890,6 +891,7 @@ program
       object: opts.object,
       types: list(opts.types),
       statuses: list(opts.status),
+      kinds: list(opts.kind),
       text: opts.text,
       limit: Number(opts.limit),
       temporal: resolveTemporal({ asOf: opts.asOf, validAt: opts.validAt, validRange: opts.validRange }),

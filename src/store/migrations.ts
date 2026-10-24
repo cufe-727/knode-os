@@ -845,6 +845,21 @@ INSERT INTO meta (key, value) VALUES ('${COOCCURS_CLEANUP_META}', '{"pending": t
   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 `;
 
+// Claims say what sort of assertion they are: `kind` is fact / opinion /
+// prediction / rumor beside `status`, which keeps saying how firmly the source
+// makes it. Rows written before read as facts, which is how they were stored.
+// The view gains the column at its end, as a replaced view must.
+const V14_CLAIM_KIND = `
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'fact';
+CREATE OR REPLACE VIEW v_claims AS
+  SELECT cl.id, cl.subject_id, cl.object_id, cl.type, cl.statement, cl.status,
+         cl.valid_from, cl.valid_to, cl.evidence_count, cl.tx_from,
+         s.key AS source_path, cl.event_at, cl.observed_at, cl.superseded_by, cl.kind
+  FROM claims cl
+  LEFT JOIN scopes s ON s.id = cl.primary_scope_id
+  WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL;
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -876,6 +891,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 11, name: 'claim-merge', up: async (q) => execScript(q, V11_CLAIM_MERGE) },
   { version: 12, name: 'dispose-indexes', up: async (q) => execScript(q, V12_DISPOSE_INDEXES) },
   { version: 13, name: 'derived-cooccurrence', up: async (q) => execScript(q, V13_DERIVED_COOCCURRENCE) },
+  { version: 14, name: 'claim-kind', up: async (q) => execScript(q, V14_CLAIM_KIND) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

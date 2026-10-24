@@ -266,8 +266,10 @@ async function foldClaims(q: Queryable, touchedIds: string[], txTime: string, re
       continue;
     }
     const f = folded!;
-    // a representative's group size is part of what it shows (its source count)
-    const foldSha = sha16([f.status, f.type, f.valid_from, f.valid_to, f.object_id, f.primary_scope_id, f.event_at, f.observed_at, ...(own.length ? [own.length] : [])]);
+    // a representative's group size is part of what it shows (its source count);
+    // the kind joins only when it is not the default, so rows folded before
+    // claims had one keep their sha and nothing downstream re-renders for it
+    const foldSha = sha16([f.status, f.type, f.valid_from, f.valid_to, f.object_id, f.primary_scope_id, f.event_at, f.observed_at, ...(own.length ? [own.length] : []), ...(f.kind === 'fact' ? [] : [f.kind])]);
     if (!wasLive) result.reopened.claims.add(cur.id);
     if (!wasLive || foldSha !== cur.fold_sha) result.changed.claims.add(cur.id);
     await q.query(
@@ -276,13 +278,13 @@ async function foldClaims(q: Queryable, touchedIds: string[], txTime: string, re
               object_id = (SELECT id FROM entities WHERE id = $7),
               chunk_id = (SELECT id FROM chunks WHERE id = $8),
               evidence_count = $9, fold_sha = $10,
-              event_at = $12::timestamptz, observed_at = $13::timestamptz,
+              event_at = $12::timestamptz, observed_at = $13::timestamptz, kind = $14,
               tx_from = CASE WHEN tx_to IS NOT NULL THEN $11::timestamptz ELSE tx_from END, tx_to = NULL
        WHERE id = $1`,
       [
         cur.id, f.status, f.type, f.valid_from, f.valid_to,
         f.primary_scope_id, f.object_id, f.segment_id, f.evidence_count, foldSha, txTime,
-        f.event_at, f.observed_at,
+        f.event_at, f.observed_at, f.kind,
       ],
     );
   }

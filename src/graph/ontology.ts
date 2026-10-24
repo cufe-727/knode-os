@@ -89,20 +89,52 @@ export const CORE_PACK_YAML = `# Ontology pack "core": the vocabulary every knod
 #   temporal     usually holds for a period — extraction asks for validFrom / validTo
 #   domain/range typical entity types on each side (prompt hints, not constraints)
 #   synonyms / inverseSynonyms   raw spellings mapped onto this predicate
+#
+# entityTypes fields:
+#   id           the type stored on the entity
+#   label        a short name in the corpus language
+#   description  one line the tier-1 prompt shows (what belongs here, what does not)
+#   examples     a few names the prompt shows after the description
+# A later pack may restate a type to sharpen its description for its domain;
+# the type keeps its place (and fold precedence) from the pack that declared it.
 id: core
 entityTypes:
-  - { id: person, label: 人物 }
-  - { id: organization, label: 组织 / 公司 }
-  - { id: product, label: 产品 }
-  - { id: project, label: 项目 }
-  - { id: component, label: 组件 / 模块 }
-  - { id: technology, label: 技术 }
-  - { id: event, label: 事件 }
-  - { id: location, label: 地点 }
-  - { id: datasource, label: 数据源 }
-  - { id: dataset, label: 数据集 }
-  - { id: other, label: 其他 }
-  - { id: concept, label: 概念（兜底） }
+  - id: person
+    label: 人物
+    description: a named individual (an executive, analyst, author, official)
+  - id: organization
+    label: 组织 / 公司
+    description: a company, institution, agency, exchange, platform or team
+  - id: product
+    label: 产品
+    description: a product or service an organization makes or sells
+  - id: project
+    label: 项目
+    description: a named initiative, programme or venture with a start and an end
+  - id: component
+    label: 组件 / 模块
+    description: a part, module or subsystem of a product or system
+  - id: technology
+    label: 技术
+    description: a technology, technique, standard or material
+  - id: event
+    label: 事件
+    description: one dated happening with a name (a launch, a deal, a crash, a meeting)
+  - id: location
+    label: 地点
+    description: a place — country, region, city, site
+  - id: datasource
+    label: 数据源
+    description: a system or feed that data comes from
+  - id: dataset
+    label: 数据集
+    description: a table or data set
+  - id: other
+    label: 其他
+    description: a named thing no type above fits (prefer a specific type)
+  - id: concept
+    label: 概念（兜底）
+    description: an abstract notion; the fallback when nothing else fits
 relationTypes:
   - { id: related_to, description: generic association when nothing more specific applies, system: true }
   - id: part_of
@@ -247,7 +279,182 @@ relationTypes:
     synonyms: [supervised_by, licensed_by, 受监管于, 监管]
 `;
 
-const BUILTIN_PACKS: Record<string, string> = { core: CORE_PACK_YAML, organization: ORGANIZATION_PACK_YAML };
+export const FINANCE_PACK_YAML = `# Ontology pack "finance": markets, securities, sectors, indicators and the
+# relations a stock-market corpus states. Directions read "A <predicate> B".
+# Opt-in: list it after core and organization in graph.ontologyPacks.
+#
+# Typing rules this pack adds on top of core:
+#   - A listed company is one entity, type organization, with its tickers
+#     (300750, CATL, 宁德时代.SZ) in aliases. security is for instruments that
+#     are not a company or a fund (可转债, 债券, 期货/期权合约, 存托凭证).
+#   - A platform or media account (雪球, 知识星球, 微博) is an organization and a
+#     blogger is a person; there is no channel type, so an author stays one
+#     entity whether quoted as a writer or as a trader.
+#   - A generic market move (大跌, 反弹, 回调) is a claim of type price_move,
+#     never an event entity; an event is one dated happening with a name.
+#   - A sector or theme is named bare (银行, not 银行股 / 银行板块); an indicator
+#     is the measure (5日均线, 市盈率), its value on a day is a claim.
+id: finance
+description: markets, securities, sectors, indicators and who holds, recommends or forecasts what
+entityTypes:
+  # core types restated with the meaning they have in a market corpus (place and precedence unchanged)
+  - id: organization
+    description: a company (listed or not; tickers in aliases), exchange, regulator, central bank, fund manager, broker, platform or media account
+    examples: [宁德时代, 贵州茅台, 中国证监会, 美联储, 雪球]
+  - id: product
+    description: a concrete product or service a company sells; not a sector, theme, index or indicator
+    examples: [麒麟电池, Model Y, 余额宝]
+  - id: technology
+    description: a technology or technical approach; a technical indicator such as 均线 is an indicator
+    examples: [固态电池, CPO, 大模型]
+  - id: event
+    description: one dated happening with a name (a crash, a meeting, a launch, an incident); a generic rise or fall is a price_move claim, not an entity
+    examples: [2015年股灾, 2020年3月美股熔断, 2024年中央经济工作会议]
+  - id: dataset
+    description: a data table or data set; an index or a market is not a dataset
+  - id: market
+    label: 市场
+    description: a trading venue or market segment where securities are listed and traded
+    examples: [A股, 港股, 美股, 科创板, 北交所, 债市]
+  - id: index
+    label: 指数
+    description: a stock-market or asset index — the number funds track and bloggers quote
+    examples: [上证指数, 沪深300, 创业板指, 上证50, 纳斯达克指数, 美元指数]
+  - id: security
+    label: 证券
+    description: a tradable instrument that is not a company or a fund — a bond, convertible, futures or options contract, warrant, depositary receipt; a listed company stays organization with its tickers as aliases
+    examples: [宁德转债, 十年期国债, 沪深300股指期货]
+  - id: fund
+    label: 基金
+    description: a fund or fund product — a public mutual fund, ETF, private fund, QDII, pension or sovereign fund (tickers in aliases)
+    examples: [科创50ETF, 易方达蓝筹精选, 社保基金, 挪威主权基金]
+  - id: sector
+    label: 行业 / 板块
+    description: an industry or industry board — what companies do, named bare (银行, not 银行股), with a stable hierarchy (part_of)
+    examples: [半导体, 新能源, 光模块, 医药, 消费, 银行, 券商, 军工]
+  - id: theme
+    label: 题材 / 概念
+    description: a market theme or concept board stocks are grouped under — a narrative rather than an industry
+    examples: [人工智能, 算力, 低空经济, 华为产业链, 中特估, 国企改革]
+  - id: indicator
+    label: 指标
+    description: a measure, ratio or technical / fundamental / flow indicator — the measure itself; its value on a day is a claim
+    examples: [市盈率, 5日均线, MACD, 融资余额, 北向资金净流入, 换手率, ROE]
+  - id: currency
+    label: 货币
+    description: a currency or crypto-asset
+    examples: [人民币, 美元, 日元, 比特币]
+  - id: commodity
+    label: 商品
+    description: a traded commodity or raw material
+    examples: [黄金, 原油, 铜, 碳酸锂, 铁矿石, 白银]
+  - id: policy
+    label: 政策
+    description: a government, regulator or central-bank policy, measure, regulation or official meeting
+    examples: [国九条, 降准, 以旧换新, 中央经济工作会议, 美联储加息]
+relationTypes:
+  - id: member_of
+    description: A belongs to group or alliance B (an index constituent is constituent_of, a sector or theme member belongs_to_sector)
+  - id: listed_on
+    inverse: lists
+    hierarchical: true
+    temporal: true
+    domain: [organization, security, fund]
+    range: [market]
+    description: A is listed or traded on market B
+    synonyms: [traded_on, trades_on, 上市于, 在...上市, 挂牌, 登陆]
+    inverseSynonyms: [lists, 上市公司包括]
+  - id: constituent_of
+    inverse: has_constituent
+    hierarchical: true
+    temporal: true
+    domain: [organization, security, fund]
+    range: [index]
+    description: A is a constituent of index B
+    synonyms: [component_of_index, member_of_index, included_in_index, in_index, 成分股, 成份股, 指数成分, 纳入, 纳入指数]
+    inverseSynonyms: [has_constituent, includes_constituent, 成分股包括, 成分股有]
+  - id: belongs_to_sector
+    inverse: sector_includes
+    hierarchical: true
+    domain: [organization, security, fund, product]
+    range: [sector, theme]
+    description: A (a company, stock, fund or product) belongs to sector or theme B
+    synonyms: [in_sector, sector_of?, in_theme, theme_of?, 所属行业, 所属板块, 属于板块, 属于行业, 概念股, 板块成员, 行业分类, 题材股]
+    inverseSynonyms: [sector_includes, theme_includes, includes_stock, 板块包含, 板块内个股, 行业包含, 成员股]
+  - id: tracks
+    inverse: tracked_by
+    domain: [fund, security]
+    range: [index, commodity, currency]
+    description: fund or ETF A tracks index or asset B
+    synonyms: [tracks_index, tracking, follows_index, indexed_to, 跟踪, 跟踪指数, 挂钩, 跟踪标的]
+    inverseSynonyms: [tracked_by, 被跟踪]
+  - id: issued_by
+    inverse: issued
+    domain: [security, fund, currency]
+    range: [organization]
+    description: instrument A was issued by B (a convertible by its company, a fund by its manager, a currency by its central bank)
+    synonyms: [issuer?, issuer_is, 发行人, 发行方, 由...发行]
+    inverseSynonyms: [issued, issues, 发行, 发行了]
+  - id: manages_fund
+    inverse: managed_by
+    temporal: true
+    domain: [person, organization]
+    range: [fund]
+    description: person or company A manages fund B
+    synonyms: [fund_manager_of, runs_fund, 管理基金, 基金经理, 掌管]
+    inverseSynonyms: [managed_by, 由...管理, 基金经理是]
+  - id: benefits_from
+    inverse: benefits
+    domain: [organization, sector, theme, security, fund, commodity, currency, market, index]
+    range: [policy, event, theme, technology, commodity, currency]
+    description: A gains from B (a policy, event, trend or price move); the opposite is harmed_by
+    synonyms: [gains_from, boosted_by, supported_by, driven_by, 受益于, 受益, 受提振, 得益于]
+    inverseSynonyms: [benefits, boosts, favors, favours, supports, 利好, 提振, 带动, 推动, 有利于]
+  - id: harmed_by
+    inverse: hurts
+    domain: [organization, sector, theme, security, fund, commodity, currency, market, index]
+    range: [policy, event, theme, technology, commodity, currency]
+    description: A loses from B (a policy, event, trend or price move); the opposite is benefits_from
+    synonyms: [hurt_by, pressured_by, weighed_by, suffers_from, 受损于, 受冲击, 受压制, 受拖累]
+    inverseSynonyms: [hurts, weighs_on, pressures, drags, 利空, 冲击, 压制, 拖累, 不利于]
+  - id: holds_position_in
+    inverse: held_by
+    temporal: true
+    domain: [person, fund, organization]
+    range: [organization, security, fund, commodity, currency, index]
+    description: A holds a trading or portfolio position in B (a stock, fund, bond, commodity); a corporate equity stake is owns
+    synonyms: [holds, holds_position, position_in, long, 持仓, 持有, 重仓, 建仓, 加仓, 买入, 配置, 买了]
+    inverseSynonyms: [held_by, 被持有, 持仓者]
+  - id: recommends
+    inverse: recommended_by
+    temporal: true
+    domain: [person, organization]
+    range: [organization, security, fund, sector, theme, commodity, currency, index, market]
+    description: A recommends buying, holding or watching B (看好 / 推荐 / 建议关注); a bearish call is bearish_on
+    synonyms: [recommend, bullish_on, likes, rates_buy, 看好, 推荐, 看多, 唱多, 建议买入, 建议关注, 建议持有, 评级买入, 评级增持, 增持评级]
+    inverseSynonyms: [recommended_by, 被推荐, 被看好]
+  - id: bearish_on
+    inverse: shunned_by
+    temporal: true
+    domain: [person, organization]
+    range: [organization, security, fund, sector, theme, commodity, currency, index, market]
+    description: A advises against B or expects it to fall (看空 / 建议卖出 / 回避); the opposite is recommends
+    synonyms: [bearish, shorts, rates_sell, 看空, 看淡, 不看好, 唱空, 建议卖出, 建议回避, 回避, 减持评级, 评级减持, 做空]
+    inverseSynonyms: [shunned_by, 被看空]
+  - id: predicts
+    inverse: predicted_by
+    temporal: true
+    domain: [person, organization]
+    description: A forecasts something about B (an event, a policy, a price level); the forecast itself is a claim of kind prediction
+    synonyms: [forecasts, expects, projects, anticipates, 预测, 预计, 预期, 预判, 预言]
+    inverseSynonyms: [predicted_by, forecast_by, 被预测]
+`;
+
+/** Every pack that ships with knode-os, seeded into playbooks/ontology/ on init and used when a named pack file is missing. */
+const BUILTIN_PACKS: Record<string, string> = { core: CORE_PACK_YAML, organization: ORGANIZATION_PACK_YAML, finance: FINANCE_PACK_YAML };
+
+/** The packs a workspace uses unless its config lists others (`finance` ships but is opt-in). */
+export const DEFAULT_ONTOLOGY_PACKS: readonly string[] = ['core', 'organization'];
 
 /** Write the built-in packs once (never overwrites user edits). */
 export function ensureDefaultOntology(dataDir: string): string[] {
@@ -385,9 +592,9 @@ const cache = new Map<string, CacheEntry>();
 function packsFromConfig(dataDir: string): string[] {
   try {
     const packs = loadConfig(dataDir).graph?.ontologyPacks;
-    return Array.isArray(packs) && packs.length > 0 ? packs.map(String) : ['core', 'organization'];
+    return Array.isArray(packs) && packs.length > 0 ? packs.map(String) : [...DEFAULT_ONTOLOGY_PACKS];
   } catch {
-    return ['core', 'organization'];
+    return [...DEFAULT_ONTOLOGY_PACKS];
   }
 }
 
@@ -419,9 +626,14 @@ export function loadOntology(dataDir: string, packs: string[] = packsFromConfig(
   return ontology;
 }
 
-/** The built-in vocabulary alone (used where no data directory is at hand). */
+/** The default packs' built-in text alone (used where no data directory is at hand). */
 export function builtinOntology(): Ontology {
-  return buildOntology(Object.entries(BUILTIN_PACKS).map(([name, text]) => ({ name, text })));
+  return buildOntology(DEFAULT_ONTOLOGY_PACKS.map((name) => ({ name, text: BUILTIN_PACKS[name] })));
+}
+
+/** A shipped pack's yaml by name (`core`, `organization`, `finance`), for copying into a workspace. */
+export function builtinPackYaml(name: string): string | undefined {
+  return BUILTIN_PACKS[name];
 }
 
 export function entityTypeIds(ont: Ontology): Set<string> {
@@ -488,9 +700,18 @@ export function normalizePredicate(ont: Ontology, raw: string): NormalizedPredic
   return { type: 'related_to', flip: false, unknown: raw.trim() };
 }
 
-/** The relation list as the tier-1 prompt states it: canonical id, one-line meaning, inverse spelling, hints. */
+/**
+ * The vocabulary as the tier-1 prompt states it: one line per entity type
+ * (id, label, meaning, examples) and per relation type (canonical id,
+ * one-line meaning, inverse spelling, hints).
+ */
 export function promptFragment(ont: Ontology): { entityTypes: string; relationTypes: string } {
-  const entityTypes = ont.entityTypes.map((t) => t.id).join(', ');
+  const entityTypes = ont.entityTypes.map((t) => {
+    const parts: string[] = [];
+    if (t.description) parts.push(t.description);
+    if (t.examples?.length) parts.push(`e.g. ${t.examples.join(', ')}`);
+    return `- ${t.id}${t.label ? ` (${t.label})` : ''}${parts.length ? `: ${parts.join('; ')}` : ''}`;
+  }).join('\n');
   const lines: string[] = [];
   for (const r of ont.relationTypes) {
     if (r.system) continue;

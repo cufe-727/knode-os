@@ -3,9 +3,11 @@ import fs from 'node:fs';
 import { safePath } from '../fs/files.js';
 import { carryOrigin } from '../fs/sidecar.js';
 import {
+  CLAIM_KINDS,
   CLAIM_STATUS,
   claimId,
   ExtractedEntity,
+  normalizeClaimType,
   relationId,
   slugify,
 } from '../graph/store.js';
@@ -260,9 +262,12 @@ export class ScopeWriter {
     subjectId: string,
     c: {
       objectId?: string | null;
+      /** One of CLAIM_TYPES; any other spelling is mapped (unknown → other). */
       type: string;
       statement: string;
       status: string;
+      /** fact | opinion | prediction | rumor (default fact): what sort of assertion, apart from how firmly it is made. */
+      kind?: string;
       validFrom?: string | null;
       validTo?: string | null;
       /** When the asserted event happened (world time), if distinct from the validity window. */
@@ -278,16 +283,19 @@ export class ScopeWriter {
     if (!statement) return null;
     const id = claimId(subjectId, statement);
     const status = (CLAIM_STATUS as readonly string[]).includes(c.status) ? c.status : 'fact';
+    const kind = (CLAIM_KINDS as readonly string[]).includes(c.kind ?? '') ? c.kind! : 'fact';
+    const type = normalizeClaimType(c.type);
     const validFrom = toIso(c.validFrom);
     const validTo = toIso(c.validTo);
     await this.q.query(
-      `INSERT INTO claims (id, subject_id, object_id, type, statement, status, valid_from, valid_to, tx_from)
-       VALUES ($1, $2, NULL, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8::timestamptz) ON CONFLICT (id) DO NOTHING`,
-      [id, subjectId, (c.type || 'fact').trim(), statement, status, validFrom, validTo, this.txTime],
+      `INSERT INTO claims (id, subject_id, object_id, type, statement, status, kind, valid_from, valid_to, tx_from)
+       VALUES ($1, $2, NULL, $3, $4, $5, $6, $7::timestamptz, $8::timestamptz, $9::timestamptz) ON CONFLICT (id) DO NOTHING`,
+      [id, subjectId, type, statement, status, kind, validFrom, validTo, this.txTime],
     );
     const added = await this.addEvidence('claim', id, c.extractor, c.weight ?? 1, c.segmentId ?? null, {
-      type: (c.type || 'fact').trim(),
+      type,
       status,
+      kind,
       statement,
       valid_from: validFrom,
       valid_to: validTo,

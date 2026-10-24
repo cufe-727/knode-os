@@ -73,6 +73,7 @@ interface ClaimLite {
   subject_name: string;
   statement: string;
   status: string;
+  kind: string;
   type: string;
   valid_from: string | Date | null;
   valid_to: string | Date | null;
@@ -259,7 +260,7 @@ export async function auditDuplicateClaims(
   // every representative claim, with its canonical subject / object
   const claims = await store.query<ClaimLite>(
     `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(oe.canonical_id, c.object_id) AS object,
-            se.name AS subject_name, c.statement, c.status, c.type, c.valid_from, c.valid_to, c.event_at,
+            se.name AS subject_name, c.statement, c.status, c.kind, c.type, c.valid_from, c.valid_to, c.event_at,
             c.evidence_count, (SELECT count(*)::int FROM claims m WHERE m.canonical_id = c.id) AS members,
             c.tx_from, s.key AS source_path, ch.content AS excerpt
      FROM claims c
@@ -388,6 +389,8 @@ export async function auditDuplicateClaims(
     if (na.length > 0 && nb.length > 0 && !numbersWithin(na, nb) && !numbersWithin(nb, na)) pair.guards.push('数字不一致');
     if (negated(a.statement) !== negated(b.statement)) pair.guards.push('否定不一致');
     if ((a.status === 'fact' && b.status === 'disputed') || (a.status === 'disputed' && b.status === 'fact')) pair.guards.push('状态冲突');
+    // a forecast and the result it foresaw, or a view and the fact it is about, are not one claim
+    if (a.kind !== b.kind) pair.guards.push('性质不同');
     toJudge.push(pair);
   }
 
@@ -561,7 +564,7 @@ function describeClaim(label: string, c: ClaimLite): string {
     .filter(Boolean).join('; ');
   return [
     `${label}: "${c.statement}"`,
-    `   type: ${c.type}; status: ${c.status}${when ? `; ${when}` : ''}; source: ${c.source_path ?? 'unknown'}`,
+    `   type: ${c.type}; kind: ${c.kind}; status: ${c.status}${when ? `; ${when}` : ''}; source: ${c.source_path ?? 'unknown'}`,
     c.excerpt ? `   excerpt: ${c.excerpt.replace(/\s+/g, ' ').slice(0, 300)}` : null,
   ].filter(Boolean).join('\n');
 }

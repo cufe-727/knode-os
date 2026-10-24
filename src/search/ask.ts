@@ -20,7 +20,7 @@ const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are
 Rules:
 - Answer in the question's language, concise but complete.
 - Cite evidence inline as [n] after the claims it supports. Only cite chunks you actually used.
-- Known facts marked [suspected] or [disputed] are unverified — if you use one, explicitly flag the uncertainty in your answer.
+- Known facts marked [suspected] or [disputed] are unverified — if you use one, explicitly flag the uncertainty in your answer. One marked [opinion], [prediction] or [rumor] is a view, a forecast or hearsay from the sources, not an established fact: say so when you use it.
 - If the context is insufficient or contradictory, say so explicitly.
 - End with a JSON line: {"citations":[n,...],"gaps":["what the knowledge base is missing to answer better", ...]} (gaps may be empty).`;
 
@@ -30,10 +30,10 @@ async function factsForContexts(store: Store, chunkIds: string[], limit = 8): Pr
   const ph = chunkIds.map((_, i) => `$${i + 1}`).join(',');
   const rows = await store.query<{
     id: string; subject: string; object: string | null; type: string; statement: string;
-    status: string; valid_from: string | null; valid_to: string | null; path: string | null; evidence_count: number;
+    status: string; kind: string; valid_from: string | null; valid_to: string | null; path: string | null; evidence_count: number;
   }>(
     `SELECT DISTINCT cl.id, se.name AS subject, oe.name AS object, cl.type, cl.statement,
-            cl.status, cl.valid_from, cl.valid_to, s.key AS path, cl.evidence_count
+            cl.status, cl.kind, cl.valid_from, cl.valid_to, s.key AS path, cl.evidence_count
      FROM entity_mentions m
      JOIN claims cl ON cl.subject_id = m.entity_id AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
      JOIN entities se ON se.id = cl.subject_id AND se.tx_to IS NULL
@@ -45,16 +45,23 @@ async function factsForContexts(store: Store, chunkIds: string[], limit = 8): Pr
   );
   return rows.map((r) => ({
     id: r.id, subject: r.subject, object: r.object, type: r.type, statement: r.statement,
-    status: r.status, startDate: toDateString(r.valid_from), endDate: toDateString(r.valid_to), path: r.path,
+    status: r.status, kind: r.kind, startDate: toDateString(r.valid_from), endDate: toDateString(r.valid_to), path: r.path,
     evidenceCount: r.evidence_count,
   }));
+}
+
+/** `[fact]` / `[suspected]` for a fact; a view, forecast or rumour is tagged by its kind, with the status when hedged. */
+export function claimTag(c: { status: string; kind?: string | null }): string {
+  const kind = c.kind ?? 'fact';
+  if (kind === 'fact') return c.status;
+  return c.status === 'fact' ? kind : `${kind}, ${c.status}`;
 }
 
 function renderFacts(facts: ClaimItem[]): string {
   if (facts.length === 0) return '';
   const lines = facts.map((f) => {
     const period = f.startDate || f.endDate ? ` (${f.startDate ?? '?'} ~ ${f.endDate ?? ''})` : '';
-    return `- [${f.status}] ${f.statement}${period}`;
+    return `- [${claimTag(f)}] ${f.statement}${period}`;
   });
   return `\n\n# Known facts\n${lines.join('\n')}`;
 }

@@ -127,8 +127,8 @@ const entityStub: PageGenerator = {
         data: { entity: e, claims: [], redirect: { id: c.id, name: c.name } },
       };
     }
-    const claims = await ctx.store.query<{ id: string; statement: string; status: string; valid_from: string | null; valid_to: string | null; event_at: string | null; superseded_by: string | null; fold_sha: string }>(
-      `SELECT id, statement, status, valid_from, valid_to, event_at, superseded_by, fold_sha FROM claims
+    const claims = await ctx.store.query<{ id: string; statement: string; status: string; kind: string; valid_from: string | null; valid_to: string | null; event_at: string | null; superseded_by: string | null; fold_sha: string }>(
+      `SELECT id, statement, status, kind, valid_from, valid_to, event_at, superseded_by, fold_sha FROM claims
        WHERE subject_id = $1 AND tx_to IS NULL AND canonical_id IS NULL ORDER BY COALESCE(event_at, valid_from) DESC NULLS LAST, tx_from DESC, id LIMIT 30`,
       [id],
     );
@@ -143,22 +143,30 @@ const entityStub: PageGenerator = {
   },
   async render(_ctx, _pagePath, plan) {
     const e = plan.data.entity as { id: string; name: string; type: string; description: string; aliases: string[] };
-    const claims = plan.data.claims as { id: string; statement: string; status: string; valid_from: string | null; valid_to: string | null; event_at?: string | null; superseded_by?: string | null }[];
+    const claims = plan.data.claims as { id: string; statement: string; status: string; kind?: string; valid_from: string | null; valid_to: string | null; event_at?: string | null; superseded_by?: string | null }[];
     const redirect = plan.data.redirect as { id: string; name: string } | undefined;
     const lines = redirect
       ? [`# ${e.name}`, '', `→ 已合并到 [[${redirect.name}]]（merged into; \`knode-os entities unmerge ${e.id}\` reverts it）`]
       : [`# ${e.name}`, '', e.description || '_No description yet — fill me in._'];
-    // gbrain's split: the compiled truth (what holds now) above, the dated history below
+    // gbrain's split: the compiled truth (what holds now) above, the dated history below;
+    // views, forecasts and rumours are not facts and get their own list, tagged by kind
     const now = new Date().toISOString();
-    const current = claims.filter((c) => !c.superseded_by && !(toIso(c.valid_to) && toIso(c.valid_to)! < now));
+    const kindOf = (c: { kind?: string }) => c.kind ?? 'fact';
+    const periodOf = (c: { valid_from: string | null; valid_to: string | null }) => {
+      const from = toDateString(c.valid_from);
+      const to = toDateString(c.valid_to);
+      return from || to ? ` \`${from ?? '?'} ~ ${to ?? ''}\`` : '';
+    };
+    const live = claims.filter((c) => !c.superseded_by && !(toIso(c.valid_to) && toIso(c.valid_to)! < now));
+    const current = live.filter((c) => kindOf(c) === 'fact');
     if (current.length > 0) {
       lines.push('', '## Facts (current)', '');
-      for (const c of current) {
-        const from = toDateString(c.valid_from);
-        const to = toDateString(c.valid_to);
-        const period = from || to ? ` \`${from ?? '?'} ~ ${to ?? ''}\`` : '';
-        lines.push(`- ${c.statement} \`${c.status}\`${period}`);
-      }
+      for (const c of current) lines.push(`- ${c.statement} \`${c.status}\`${periodOf(c)}`);
+    }
+    const views = live.filter((c) => kindOf(c) !== 'fact');
+    if (views.length > 0) {
+      lines.push('', '## Views and forecasts', '');
+      for (const c of views) lines.push(`- ${c.statement} \`${kindOf(c)}\`${c.status === 'fact' ? '' : ` \`${c.status}\``}${periodOf(c)}`);
     }
     const dated = claims
       .filter((c) => toIso(c.event_at ?? null) || toIso(c.valid_from))
@@ -167,7 +175,7 @@ const entityStub: PageGenerator = {
       lines.push('', '## Timeline', '');
       for (const c of dated) {
         const when = toDateString(c.event_at ?? null) ?? toDateString(c.valid_from);
-        lines.push(`- ${when} · ${c.statement} \`${c.status}\`${c.superseded_by ? ' _(superseded)_' : ''}`);
+        lines.push(`- ${when} · ${c.statement} \`${c.status}\`${kindOf(c) === 'fact' ? '' : ` \`${kindOf(c)}\``}${c.superseded_by ? ' _(superseded)_' : ''}`);
       }
     }
     return {

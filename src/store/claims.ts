@@ -1,3 +1,4 @@
+import { CLAIM_KINDS, claimTypeOf } from '../graph/store.js';
 import { Store } from './db.js';
 import {
   NO_FILTER,
@@ -34,10 +35,12 @@ export interface ClaimQuery {
   subject?: string;
   /** Same matching as `subject`, applied to the claim's object entity. */
   object?: string;
-  /** Claim types (free-form; `earnings`, `guidance`, … as the extractor emitted them). */
+  /** Claim types (CLAIM_TYPES ids; a known old spelling such as `revenue` is mapped, an unknown one matches nothing). */
   types?: string[];
   /** fact | suspected | disputed */
   statuses?: string[];
+  /** fact | opinion | prediction | rumor */
+  kinds?: string[];
   /** Substring of the statement text. */
   text?: string;
   /** Only claims whose event time falls in this window (ISO instants; open sides null). */
@@ -60,6 +63,8 @@ export interface ClaimRecord {
   type: string;
   statement: string;
   status: string;
+  /** fact | opinion | prediction | rumor: what sort of assertion, apart from how firmly it is made (`status`). */
+  kind: string;
   /** World time the assertion starts holding; null = open. */
   validFrom: string | null;
   /** World time it stops holding; null = still open. */
@@ -94,6 +99,7 @@ export interface ClaimQueryResult {
 }
 
 const STATUSES = new Set(['fact', 'suspected', 'disputed']);
+const KINDS = new Set<string>(CLAIM_KINDS);
 
 interface Row {
   id: string;
@@ -104,6 +110,7 @@ interface Row {
   type: string;
   statement: string;
   status: string;
+  kind: string;
   // the driver hands back Date objects for timestamptz; normalize before comparing
   valid_from: string | Date | null;
   valid_to: string | Date | null;
@@ -139,11 +146,19 @@ export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<Cla
   const where: string[] = [];
   if (q.subject) where.push(entityRefSql('cl.subject_id', p, q.subject));
   if (q.object) where.push(entityRefSql('cl.object_id', p, q.object));
-  if (q.types?.length) where.push(`cl.type IN (${q.types.map((x) => p.add(x)).join(',')})`);
+  if (q.types?.length) {
+    const types = [...new Set(q.types.map((x) => claimTypeOf(x) ?? x))];
+    where.push(`cl.type IN (${types.map((x) => p.add(x)).join(',')})`);
+  }
   if (q.statuses?.length) {
     const valid = q.statuses.filter((s) => STATUSES.has(s.toLowerCase()));
     if (valid.length === 0) return { claims: [], matched: 0, applied: applied(t, f) };
     where.push(`cl.status IN (${valid.map((x) => p.add(x.toLowerCase())).join(',')})`);
+  }
+  if (q.kinds?.length) {
+    const valid = q.kinds.filter((k) => KINDS.has(k.toLowerCase()));
+    if (valid.length === 0) return { claims: [], matched: 0, applied: applied(t, f) };
+    where.push(`cl.kind IN (${valid.map((x) => p.add(x.toLowerCase())).join(',')})`);
   }
   if (q.text) where.push(`cl.statement ILIKE ${p.add(`%${q.text}%`)}`);
   if (!q.includeSuperseded) where.push('cl.superseded_by IS NULL');
@@ -160,7 +175,7 @@ export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<Cla
 
   const rows = await store.query<Row>(
     `SELECT cl.id, cl.subject_id, se.name AS subject, cl.object_id, oe.name AS object,
-            cl.type, cl.statement, cl.status, cl.valid_from, cl.valid_to,
+            cl.type, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to,
             cl.event_at, cl.observed_at, cl.superseded_by,
             s.key AS source_path, cl.evidence_count, cl.tx_from
      FROM claims cl
@@ -219,6 +234,7 @@ async function foldAsOf(store: Store, rows: Row[], t: ResolvedTemporal, f: Resol
         ...row,
         type: fold.type,
         status: fold.status,
+        kind: fold.kind,
         object_id: fold.object_id,
         valid_from: fold.valid_from,
         valid_to: fold.valid_to,
@@ -252,6 +268,7 @@ function project(r: Row, now: string, sources?: string[]): ClaimRecord {
     type: r.type,
     statement: r.statement,
     status: r.status,
+    kind: r.kind,
     validFrom: toDateString(r.valid_from),
     validTo: toDateString(validTo),
     stale: Boolean(validTo && validTo < now),

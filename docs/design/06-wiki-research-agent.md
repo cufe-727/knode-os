@@ -42,7 +42,16 @@ nightly tier 2: claim audit (supersession) + full duplicate-entity audit + claim
 
 - Packs under `playbooks/ontology/<pack>.yaml`, merged in `graph.ontologyPacks` order (default `["core","organization"]`);
   `initDataDir` seeds the built‑ins and never overwrites edits. Relation fields: `id / inverse / symmetric / hierarchical /
-  temporal / domain / range / synonyms / inverseSynonyms / description / system`.
+  temporal / domain / range / synonyms / inverseSynonyms / description / system`. Entity types carry `label / description /
+  examples`, and the tier‑1 prompt lists each type on its own line with them; a later pack may restate a type to sharpen
+  its description without moving it (fold precedence is declaration order).
+- A third built‑in, `finance` (opt‑in, 2026‑10‑23), is the vocabulary of a stock‑market corpus: entity types `market`,
+  `index`, `security` (an instrument that is not a company or a fund — a listed company stays `organization` with its
+  tickers as aliases), `fund`, `sector`, `theme`, `indicator`, `currency`, `commodity`, `policy`; relations `listed_on`,
+  `constituent_of`, `belongs_to_sector`, `tracks`, `issued_by`, `manages_fund`, `benefits_from` / `harmed_by` (利好 / 利空
+  read inverse), `holds_position_in`, `recommends` / `bearish_on`, `predicts`. There is no channel type: a platform or
+  media account is an `organization`, a blogger a `person`. A generic market move (大跌) is a `price_move` claim, not an
+  `event` entity.
 - `normalizePredicate()`: synonym → canonical id; an inverse reading (`parent_of`, `母公司`, `buys_from`) → canonical id
   **with the edge flipped**; symmetric predicates are stored once with ordered endpoints; unknown spellings → `related_to`
   with the original kept in evidence attrs `raw_type` and counted by `knode_graph_insights.unknownPredicates`.
@@ -77,8 +86,22 @@ nightly tier 2: claim audit (supersession) + full duplicate-entity audit + claim
 - `normalizeDateExpr()` turns `2026-08 / 2026Q2 / 2026年第二季度 / 2026年上半年 / FY2025 / 去年 / 上季度 / 去年同期 /
   2024年以来 / 截至 2026-06-30` into precision‑aware `[from, to]` spans; relative forms resolve against the document date.
 - New claim columns `event_at`, `observed_at`, `superseded_by`; prompts and frontmatter distinguish `eventDate` from
-  `startDate/endDate`. Supersession marks the older of two facts of the same subject and type; `knode_claims` hides them
+  `startDate/endDate`. Supersession marks the older of two facts of the same subject, type and object; `knode_claims` hides them
   unless `include_superseded`, and `order=timeline` / `event_range` build chronologies.
+- Claims carry a closed `type` and a `kind` (2026‑10‑23). `type` is one of `CLAIM_TYPES` (`src/graph/store.ts`): `price_move`,
+  `technical`, `earnings`, `guidance`, `fundamentals`, `valuation`, `fund_flow`, `holding`, `management`, `recommendation`,
+  `outlook`, `macro`, `policy`, `event`, `risk`, `method`, `other` (plus the system `absence`); the prompt lists them with one
+  line each, and any other spelling — the old free labels, Chinese names, near misses — maps through synonyms on parse, on
+  sidecar replay and in the writer, unknown → `other`; a filter (`knode_claims.types`, a template slot's `claimTypes`) spelled
+  with an old label is mapped too, an unknown one matches nothing. `kind` (migration v14, `claims.kind`) is `fact` / `opinion` / `prediction` /
+  `rumor`, beside `status`, which keeps saying how firmly the source asserts; the statement is written without its
+  attribution ("宁德时代估值偏高", not "作者认为…") and the kind carries it. Supersession runs over the measure‑like types
+  only (`CLAIM_TYPES.supersedes`: earnings, guidance, valuation, price_move, technical, fund_flow, macro, holding,
+  recommendation, outlook — a later `management` or `event` fact replaces nothing), by subject, type and object; it,
+  the stale‑fact audit, source disputes and the nightly review consider `kind = fact` only; the duplicate‑claim judge sees the kind and a pair of
+  different kinds never merges on its own; entity stubs list "Views and forecasts" apart from "Facts (current)";
+  `knode_claims` / `GET /api/claims` / `knode-os claims` filter by `claim_kinds` / `claim_kind` / `--kind`. Entity
+  descriptions are asked context‑free (what the thing is, not what the document says about it).
 - Entity stubs split into `## Facts (current)` and `## Timeline`.
 
 ## 5. The research runner (`src/research/`)

@@ -209,6 +209,8 @@ export interface ClaimAsOf {
   type: string;
   statement: string;
   status: string;
+  /** fact | opinion | prediction | rumor (highest-weight supporter's reading). */
+  kind: string;
   valid_from: string | null;
   valid_to: string | null;
   /** When the event happened (highest-weight supporter's statement). */
@@ -233,6 +235,7 @@ export function foldClaimEvidence(row: { id: string; subject_id: string; stateme
     ? 'absent'
     : statuses.includes('disputed') ? 'disputed' : statuses.includes('fact') ? 'fact' : 'suspected';
   const type = byWeight.map((r) => str(r.attrs.type)).find(Boolean) ?? 'fact';
+  const kind = byWeight.map((r) => str(r.attrs.kind)).find(Boolean) ?? 'fact';
   const froms = rows.map((r) => toIso(str(r.attrs.valid_from))).filter((x): x is string => Boolean(x)).sort();
   const openEnded = rows.some((r) => !toIso(str(r.attrs.valid_to)));
   const tos = rows.map((r) => toIso(str(r.attrs.valid_to))).filter((x): x is string => Boolean(x)).sort();
@@ -246,6 +249,7 @@ export function foldClaimEvidence(row: { id: string; subject_id: string; stateme
     type,
     statement: row.statement,
     status,
+    kind,
     valid_from: froms[0] ?? null,
     valid_to: openEnded ? null : tos[tos.length - 1] ?? null,
     event_at: eventAt,

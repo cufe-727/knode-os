@@ -138,7 +138,7 @@ export const listClaims = defineOp({
   path: '/w/:owner/:workspace/claims',
   scope: 'read',
   tier: 'stable',
-  input: ClaimsQuery,   // subject, object, types, statuses, text, valid_at | valid_range, event_range,
+  input: ClaimsQuery,   // subject, object, types, statuses, claim_kinds, text, valid_at | valid_range, event_range,
                         // as_of, known_at, kinds, sources, trust, cursor, limit
   output: ClaimsPage,   // claims[], next_cursor, applied[]
   mcp: { name: 'knode_claims', description: '…' },

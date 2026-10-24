@@ -9,13 +9,13 @@ import { CATALOG_VIEWS } from '../src/store/catalog.js';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-schema-v7-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-describe('schema v7/v8/v10/v11/v12/v13 (wiki research + review + quick answers + claim merges + dispose indexes + derived co-occurrence)', () => {
+describe('schema v7/v8/v10/v11/v12/v13/v14 (wiki research + review + quick answers + claim merges + dispose indexes + derived co-occurrence + claim kind)', () => {
   it('adds the temporal relation / claim columns, resolution tables and research jobs, and every catalog view resolves', async () => {
     fs.mkdirSync(path.join(tmp, 'ws', '.knode'), { recursive: true });
     const store = await Store.open(path.join(tmp, 'ws'), 3);
     try {
-      expect(SCHEMA_VERSION).toBe(13);
-      expect(store.migration.to).toBe(13);
+      expect(SCHEMA_VERSION).toBe(14);
+      expect(store.migration.to).toBe(14);
       // every foreign key a disposal fires, the merged-entity lookup of the fold, and the
       // document side of derived co-occurrence (v13) have an index to use
       const indexes = (await store.query<{ indexname: string }>(`SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()`)).map((r) => r.indexname);

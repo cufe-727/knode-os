@@ -327,13 +327,15 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: Kno
     {
       title: 'Query claims directly',
       description:
-        'Time-bound assertions as structured rows, instead of prose you have to read and trust. Each claim carries its world-time validity window, its status among conflicting sources (fact / suspected / disputed), the source path that supports it and how many evidence rows back it. Use this when the question is "what do we hold about X, and since when" — as_of asks what was believed then, valid_at / valid_range ask what holds in the world, and stale=true means the validity window has already closed.',
+        'Time-bound assertions as structured rows, instead of prose you have to read and trust. Each claim carries its world-time validity window, its status among conflicting sources (fact / suspected / disputed), its kind (fact / opinion / prediction / rumor), the source path that supports it and how many evidence rows back it. Use this when the question is "what do we hold about X, and since when" — as_of asks what was believed then, valid_at / valid_range ask what holds in the world, and stale=true means the validity window has already closed.',
       inputSchema: {
         subject: z.string().optional().describe('Entity id, name or alias the claim is about'),
         object: z.string().optional().describe('Entity id, name or alias on the other side of the claim'),
         types: z.array(z.string()).optional().describe('Claim types, e.g. ["earnings", "guidance"]'),
         statuses: z.array(z.enum(['fact', 'suspected', 'disputed', 'absent'])).optional()
           .describe('absent = negative knowledge: a lookup that came back empty, with the window it holds for'),
+        claim_kinds: z.array(z.enum(['fact', 'opinion', 'prediction', 'rumor'])).optional()
+          .describe('What sort of assertion: fact = happened or holds; opinion = someone\'s view; prediction = a forecast; rumor = unconfirmed. Default: all'),
         text: z.string().optional().describe('Substring of the statement'),
         event_range: z.string().optional().describe('Only claims whose event time falls in this window: "2026-01-01..2026-06-30", "2026Q2", "2026"'),
         include_superseded: z.boolean().optional().describe('Also return facts a newer fact of the same subject and type replaced (hidden by default)'),
@@ -348,9 +350,9 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: Kno
         actor: actorSchema,
       },
     },
-    async ({ subject, object, types, statuses, text, event_range, include_superseded, order, limit, as_of, valid_at, valid_range, kinds, sources, trust, actor }) =>
+    async ({ subject, object, types, statuses, claim_kinds, text, event_range, include_superseded, order, limit, as_of, valid_at, valid_range, kinds, sources, trust, actor }) =>
       json(await queryClaims(ctx.store, {
-        subject, object, types, statuses, text, limit,
+        subject, object, types, statuses, kinds: claim_kinds, text, limit,
         eventRange: event_range ? (({ validFrom, validTo }) => ({ from: validFrom, to: validTo }))(resolveTemporal({ validRange: event_range })) : undefined,
         includeSuperseded: include_superseded,
         order,

@@ -85,6 +85,8 @@ export interface SidecarClaim {
   type: string;
   statement: string;
   status: 'fact' | 'suspected' | 'disputed' | 'absent';
+  /** fact | opinion | prediction | rumor; absent in sidecars written before claims had a kind (read as fact). */
+  kind?: 'fact' | 'opinion' | 'prediction' | 'rumor';
   startDate?: string | null;
   endDate?: string | null;
   /** When the asserted event happened (as opposed to the window the statement holds for). */

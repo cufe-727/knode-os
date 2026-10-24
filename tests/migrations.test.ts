@@ -229,3 +229,43 @@ describe('v13: co-occurrence is derived, not stored', () => {
     }
   });
 });
+
+describe('v14: claims carry a kind', () => {
+  it('adds the column with facts as the default and exposes it at the end of v_claims', async () => {
+    const dataDir = path.join(tmp, 'v14');
+    fs.mkdirSync(path.join(dataDir, '.knode'), { recursive: true });
+    let store = await Store.open(dataDir, 3);
+    try {
+      await store.cleanup;
+      // a database that stopped at v13: no kind column, the v11 view
+      await store.query(`DROP VIEW v_claims`);
+      await store.query(`ALTER TABLE claims DROP COLUMN kind`);
+      await store.query(
+        `CREATE VIEW v_claims AS
+           SELECT cl.id, cl.subject_id, cl.object_id, cl.type, cl.statement, cl.status,
+                  cl.valid_from, cl.valid_to, cl.evidence_count, cl.tx_from,
+                  s.key AS source_path, cl.event_at, cl.observed_at, cl.superseded_by
+           FROM claims cl LEFT JOIN scopes s ON s.id = cl.primary_scope_id
+           WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL`,
+      );
+      await store.query(`INSERT INTO entities (id, name, type) VALUES ('a', 'A', 'concept')`);
+      await store.query(`INSERT INTO claims (id, subject_id, type, statement, status) VALUES ('c1', 'a', 'earnings', 'A earned', 'fact')`);
+      await store.query(`UPDATE meta SET value = '{"v":13}'::jsonb WHERE key = 'schema_version'`);
+    } finally {
+      await store.close();
+    }
+
+    store = await Store.open(dataDir, 3);
+    try {
+      expect(store.migration).toEqual({ from: 13, to: SCHEMA_VERSION });
+      expect(await store.query(`SELECT kind FROM claims WHERE id = 'c1'`)).toEqual([{ kind: 'fact' }]);
+      expect(await store.query(`SELECT kind FROM v_claims WHERE id = 'c1'`)).toEqual([{ kind: 'fact' }]);
+      const columns = await store.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns WHERE table_name = 'v_claims' ORDER BY ordinal_position`,
+      );
+      expect(columns.at(-1)).toEqual({ column_name: 'kind' });
+    } finally {
+      await store.close();
+    }
+  });
+});
