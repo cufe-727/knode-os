@@ -558,6 +558,87 @@ struct EntityPage: Decodable {
     var typeCounts: [GraphInsights.TypeCount]
 }
 
+/// An entity a text names, with the spellings the text uses for it (POST /api/entities/mentions).
+struct EntityMention: Decodable, Hashable, Identifiable {
+    var id: String
+    var name: String
+    var type: String
+    var wikiPath: String?
+    var surfaces: [String]
+    var count: Int
+}
+
+struct EntityMentionsResponse: Decodable {
+    var mentions: [EntityMention]
+}
+
+/// One entity at a glance, for the panel a marked name opens (GET /api/entities/detail).
+struct EntityDetail: Decodable {
+    struct Entity: Decodable, Hashable {
+        var id: String
+        var name: String
+        var type: String
+        var description: String
+        var aliases: [String]
+        var wikiPath: String?
+        var mentionCount: Int
+        var documentCount: Int
+        var degree: Int
+    }
+
+    struct Neighbour: Decodable, Hashable, Identifiable {
+        var id: String
+        var name: String
+        var type: String
+        var wikiPath: String?
+    }
+
+    struct Relation: Decodable, Hashable {
+        var type: String
+        /// `out` reads entity → other, `in` other → entity.
+        var direction: String
+        var weight: Double
+        var description: String
+        var validFrom: String?
+        var validTo: String?
+    }
+
+    /// Every relation with one neighbour, strongest first.
+    struct RelationGroup: Decodable, Hashable, Identifiable {
+        var other: Neighbour
+        var weight: Double
+        var relations: [Relation]
+
+        var id: String { other.id }
+    }
+
+    /// An entity its documents mention alongside it, with no typed relation between them.
+    struct CoMention: Decodable, Hashable, Identifiable {
+        var id: String
+        var name: String
+        var type: String
+        var wikiPath: String?
+        var documents: Int
+        var chunks: Int
+        var weight: Double
+    }
+
+    struct Document: Decodable, Hashable, Identifiable {
+        var path: String
+        var title: String?
+        var mentions: Int
+
+        var id: String { path }
+    }
+
+    var entity: Entity
+    var relations: [RelationGroup]
+    var moreRelations: Int
+    var cooccurring: [CoMention]
+    var claims: [Claim]
+    var documents: [Document]
+}
+
 struct TraceItem: Decodable, Identifiable, Hashable {
     var id: String
     var source: String

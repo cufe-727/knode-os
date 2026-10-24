@@ -451,3 +451,143 @@ export async function graphInsights(store: Store): Promise<GraphInsights> {
   );
   return { totals: tot, hubs, isolated, typeCounts, relationTypeCounts, unknownPredicates, merged: merges?.merged ?? 0, mergeCandidates: merges?.candidates ?? 0 };
 }
+
+/** One entity at a glance, for the panel a Markdown view opens on a marked name. */
+export interface EntityDetail {
+  entity: {
+    id: string;
+    name: string;
+    type: string;
+    description: string;
+    aliases: string[];
+    wikiPath: string | null;
+    mentionCount: number;
+    /** Live, indexed documents that mention it. */
+    documentCount: number;
+    /** Live typed relations across the whole graph. */
+    degree: number;
+  };
+  /** Its typed relations, one group per entity at the other end, strongest first. */
+  relations: EntityRelationGroup[];
+  /** Neighbours past `relations`' cut. */
+  moreRelations: number;
+  /** Entities its documents mention alongside it (derived, cooccur.ts) that it has no typed relation with. */
+  cooccurring: { id: string; name: string; type: string; wikiPath: string | null; documents: number; chunks: number; weight: number }[];
+  claims: ClaimItem[];
+  /** The documents that mention it most, by distinct chunks. */
+  documents: { path: string; title: string | null; mentions: number }[];
+}
+
+export interface EntityRelationGroup {
+  other: { id: string; name: string; type: string; wikiPath: string | null };
+  /** The strongest relation's weight. */
+  weight: number;
+  /** One per type and direction: `out` reads entity → other, `in` other → entity. */
+  relations: { type: string; direction: 'out' | 'in'; weight: number; description: string; validFrom: string | null; validTo: string | null }[];
+}
+
+const DETAIL_RELATION_GROUPS = 60;
+const DETAIL_COOCCURRING = 12;
+const DETAIL_DOCUMENTS = 8;
+
+/**
+ * An entity with what the graph holds about it now: its typed relations
+ * folded per neighbour (the pair rule of the graph views' bundles), the
+ * entities its documents mention alongside it, its claims, and the documents
+ * that mention it most. A merged id answers as its survivor, with the whole
+ * group's relations and mentions. Null when no live entity has the id.
+ */
+export async function entityDetail(store: Store, id: string): Promise<EntityDetail | null> {
+  const canonical = (await canonicalMap(store, [id])).get(id) ?? id;
+  const [row] = await liveRows(store, [canonical]);
+  if (!row) return null;
+  const members = await expandGroups(store, [row.id]);
+  const inGroup = new Set(members);
+
+  const rels = await store.query<RelationRow>(
+    `SELECT * FROM relations r WHERE (source_id = ANY($1::text[]) OR target_id = ANY($1::text[])) AND r.type <> 'co_occurs' AND r.tx_to IS NULL`,
+    [members],
+  );
+  const canon = await canonicalMap(store, rels.flatMap((r) => [r.source_id, r.target_id]));
+  const c = (x: string) => canon.get(x) ?? x;
+  const groups = new Map<string, Map<string, EntityRelationGroup['relations'][number]>>();
+  for (const r of rels) {
+    const out = inGroup.has(r.source_id);
+    const other = c(out ? r.target_id : r.source_id);
+    if (inGroup.has(other)) continue;
+    const direction = out ? 'out' : 'in';
+    const byKind = groups.get(other) ?? groups.set(other, new Map()).get(other)!;
+    const key = `${r.type}|${direction}`;
+    const seen = byKind.get(key);
+    // several sources asserting one relation add up, as in graphSearch
+    if (seen) {
+      seen.weight = Number((seen.weight + r.weight).toFixed(4));
+      if ((r.description ?? '').length > seen.description.length) seen.description = r.description ?? '';
+    } else {
+      byKind.set(key, {
+        type: r.type, direction, weight: r.weight, description: r.description ?? '',
+        validFrom: toDateString(r.valid_from ?? null), validTo: toDateString(r.valid_to ?? null),
+      });
+    }
+  }
+  const others = new Map((await liveRows(store, [...groups.keys()])).map((e) => [e.id, e]));
+  const ranked = [...groups.entries()]
+    .filter(([other]) => others.has(other))
+    .map(([other, byKind]) => {
+      const e = others.get(other)!;
+      const relations = [...byKind.values()].sort((a, b) => b.weight - a.weight || a.type.localeCompare(b.type));
+      return { other: { id: e.id, name: e.name, type: e.type, wikiPath: e.wiki_path ?? null }, weight: relations[0].weight, relations };
+    })
+    .sort((a, b) => b.weight - a.weight || a.other.name.localeCompare(b.other.name));
+
+  const co = await coOccurringEntities(store, members, { perEntity: DETAIL_COOCCURRING * 2 });
+  const coCanon = await canonicalMap(store, co.map((x) => x.target));
+  const strongest = new Map<string, (typeof co)[number]>();
+  for (const x of co) {
+    const target = coCanon.get(x.target) ?? x.target;
+    if (inGroup.has(target) || groups.has(target)) continue;
+    const seen = strongest.get(target);
+    if (!seen || x.weight > seen.weight) strongest.set(target, { ...x, target });
+  }
+  const coTop = [...strongest.values()].sort((a, b) => b.weight - a.weight || a.target.localeCompare(b.target)).slice(0, DETAIL_COOCCURRING);
+  const coRows = new Map((await liveRows(store, coTop.map((x) => x.target))).map((e) => [e.id, e]));
+
+  const [claims, degrees, documents, [{ n: documentCount }]] = await Promise.all([
+    claimsForEntities(store, [row.id], 8),
+    typedDegrees(store, members),
+    store.query<{ path: string; title: string | null; mentions: number }>(
+      `SELECT d.path, d.title, count(DISTINCT m.chunk_id)::int AS mentions
+       FROM entity_mentions m JOIN documents d ON d.id = m.document_id
+       WHERE m.entity_id = ANY($1::text[]) AND d.status = 'indexed'
+       GROUP BY d.path, d.title ORDER BY mentions DESC, d.path LIMIT ${DETAIL_DOCUMENTS}`,
+      [members],
+    ),
+    store.query<{ n: number }>(
+      `SELECT count(DISTINCT m.document_id)::int AS n FROM entity_mentions m JOIN documents d ON d.id = m.document_id
+       WHERE m.entity_id = ANY($1::text[]) AND d.status = 'indexed'`,
+      [members],
+    ),
+  ]);
+
+  return {
+    entity: {
+      id: row.id,
+      name: row.name,
+      type: row.type,
+      description: row.description ?? '',
+      aliases: Array.isArray(row.aliases) ? row.aliases.map(String) : [],
+      wikiPath: row.wiki_path ?? null,
+      mentionCount: row.mention_count,
+      documentCount,
+      degree: [...degrees.values()].reduce((n, d) => n + d, 0),
+    },
+    relations: ranked.slice(0, DETAIL_RELATION_GROUPS),
+    moreRelations: Math.max(0, ranked.length - DETAIL_RELATION_GROUPS),
+    cooccurring: coTop.filter((x) => coRows.has(x.target)).map((x) => {
+      const e = coRows.get(x.target)!;
+      return { id: e.id, name: e.name, type: e.type, wikiPath: e.wiki_path ?? null, documents: x.documents, chunks: x.chunks, weight: x.weight };
+    }),
+    claims,
+    documents,
+  };
+}

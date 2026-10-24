@@ -379,6 +379,17 @@ struct APIClient {
         return try await send(path("/api/entities", query: items))
     }
 
+    /// The known entities a text names, for a Markdown view to mark; `path` adds what that file was indexed with.
+    func entityMentions(text: String, path filePath: String?) async throws -> EntityMentionsResponse {
+        struct Body: Encodable { var text: String; var path: String? }
+        return try await send("/api/entities/mentions", method: "POST", body: encoded(Body(text: text, path: filePath)))
+    }
+
+    /// One entity with its relations, co-mentions, claims and documents: the panel a marked name opens.
+    func entityDetail(id: String) async throws -> EntityDetail {
+        try await send(path("/api/entities/detail", query: [.init(name: "id", value: id)]))
+    }
+
     func graphInsights() async throws -> GraphInsights {
         try await send("/api/graph/insights")
     }

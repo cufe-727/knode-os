@@ -162,6 +162,7 @@
       </aside>
       <div id="file-pane">
         <div class="file-toolbar">
+          <button id="btn-back" title="Back to the file a link was followed from" hidden>‹</button>
           <span id="file-path" class="mono"></span>
           <span class="spacer"></span>
           <button id="btn-edit" disabled>edit</button>
@@ -175,6 +176,15 @@
         <article id="file-view" class="markdown"></article>
         <textarea id="file-editor" class="mono" spellcheck="false" hidden></textarea>
       </div>
+      <aside id="entity-panel" hidden>
+        <div class="entity-panel-bar">
+          <button id="entity-panel-back" title="Back to the previous entity" hidden>‹</button>
+          <span class="eyebrow">entity</span>
+          <span class="spacer"></span>
+          <button id="entity-panel-close" title="Close the panel">✕</button>
+        </div>
+        <div id="entity-panel-body"></div>
+      </aside>
     </section>
 
     <!-- Search -->

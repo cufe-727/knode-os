@@ -113,6 +113,21 @@ struct FileBrowserView: View {
     @State private var fileBytes: Int?
     @State private var selectionMode = false
     @State private var checkedPaths: Set<String> = []
+    /// The known entities the open file names, marked in its preview.
+    @State private var mentions: [EntityMention] = []
+    /// Where the preview should go once it shows: a followed link's #fragment, or the block a way back returns to.
+    @State private var scrollTarget: MarkdownScrollTarget?
+    /// The entities opened in the entity panel, the one shown last; empty while the panel is closed.
+    @State private var entityTrail: [String] = []
+    /// The block whose text opened the entity panel: where ‹ returns after the panel opens a file.
+    @State private var panelOrigin: Int?
+    /// Files a followed link left, the latest last, each with the block the link sat in.
+    @State private var backTrail: [FileReturn] = []
+
+    private struct FileReturn {
+        let path: String
+        let block: Int?
+    }
 
     var body: some View {
         HSplitView {
@@ -122,6 +137,12 @@ struct FileBrowserView: View {
                 .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Color(nsColor: .textBackgroundColor).opacity(0.25))
+        .inspector(isPresented: Binding(get: { !entityTrail.isEmpty }, set: { if !$0 { entityTrail = [] } })) {
+            EntityInspector(trail: $entityTrail) { path in
+                Task { await openFromPanel(path) }
+            }
+            .inspectorColumnWidth(min: 300, ideal: 350, max: 480)
+        }
         .task { await initialLoad() }
         .onChange(of: model.connectionState) { _, state in
             if case .connected = state, tree == nil {
@@ -313,6 +334,13 @@ struct FileBrowserView: View {
         if let selectedPath {
             VStack(spacing: 0) {
                 HStack(spacing: 8) {
+                    if let back = backTrail.last {
+                        Button { Task { await goBack() } } label: {
+                            Image(systemName: "chevron.left")
+                        }
+                        .disabled(isWorking)
+                        .help(L("Back to %@", back.path))
+                    }
                     Image(systemName: selectedPath.hasSuffix(".md") ? "doc.richtext" : "doc.text")
                         .foregroundStyle(Color.knodeCyan)
                     Text(selectedPath)
@@ -369,10 +397,14 @@ struct FileBrowserView: View {
                     ScrollView {
                         Group {
                             if selectedPath.hasSuffix(".md") || selectedPath.hasSuffix(".markdown") {
-                                MarkdownText(markdown: content) { target in
-                                    Task { await openKnowledgeLink(target, from: selectedPath) }
+                                MarkdownText(markdown: content, mentions: mentions, scrollTarget: $scrollTarget, onOpenEntity: { id, block in
+                                    panelOrigin = block
+                                    if entityTrail.last != id { entityTrail.append(id) }
+                                }) { target, block in
+                                    Task { await openKnowledgeLink(target, from: selectedPath, block: block) }
                                 }
                                     .font(.system(size: 15))
+                                    .task(id: [selectedPath, content]) { await loadMentions(in: content, at: selectedPath) }
                             } else {
                                 PlainTextPreview(text: content)
                             }
@@ -729,6 +761,8 @@ struct FileBrowserView: View {
             // the create target follows the last thing clicked: a file hands it
             // back to the file's own folder
             selectedDirectory = nil
+            // the entities the last file named are not this one's: none until its own arrive
+            mentions = []
             content = response.content
             // A capped read must never round-trip through the editor: saving it
             // back would rewrite the file with only the previewed prefix.
@@ -764,14 +798,50 @@ struct FileBrowserView: View {
         }
     }
 
-    private func openKnowledgeLink(_ target: String, from sourcePath: String) async {
+    /// Follow a link in the preview; its #fragment — a cited export entry, a heading — is brought into view once the file is shown.
+    private func openKnowledgeLink(_ target: String, from sourcePath: String, block: Int?) async {
         do {
             let resolved = try await model.client().resolveLink(target, from: sourcePath)
-            expand(parentDirectory(of: resolved.path))
-            await openFile(resolved.path)
+            if resolved.path != selectedPath {
+                await leave(for: resolved.path, returningTo: block)
+            }
+            scrollTarget = resolved.fragment.map(MarkdownScrollTarget.fragment)
         } catch {
             model.showError(error, prefix: "Link unavailable")
         }
+    }
+
+    /// A file the entity panel points at: a wiki page, a document that mentions the entity.
+    private func openFromPanel(_ path: String) async {
+        guard path != selectedPath else { return }
+        await leave(for: path, returningTo: panelOrigin)
+    }
+
+    /// Open another file, remembering this one and where in it the reader was, for ‹.
+    private func leave(for path: String, returningTo block: Int?) async {
+        let origin = selectedPath.map { FileReturn(path: $0, block: block) }
+        expand(parentDirectory(of: path))
+        await openFile(path)
+        guard let origin, selectedPath == path else { return }
+        backTrail.append(origin)
+        if backTrail.count > 50 { backTrail.removeFirst() }
+    }
+
+    /// Back to the file a link was followed from, at the block the link sat in.
+    private func goBack() async {
+        guard let last = backTrail.popLast() else { return }
+        expand(parentDirectory(of: last.path))
+        await openFile(last.path)
+        guard selectedPath == last.path else { return }
+        scrollTarget = last.block.map(MarkdownScrollTarget.block)
+    }
+
+    /// Ask which known entities the previewed text names. Marking is extra: a failed read leaves the text unmarked.
+    private func loadMentions(in text: String, at path: String) async {
+        guard !text.isEmpty else { return }
+        guard let found = try? await model.client().entityMentions(text: text, path: path).mentions,
+              !Task.isCancelled, selectedPath == path, content == text else { return }
+        mentions = found
     }
 
     private func save() async {
