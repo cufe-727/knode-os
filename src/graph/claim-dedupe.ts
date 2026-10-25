@@ -3,6 +3,7 @@ import { KnodeConfig } from '../config.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { writeDeps } from '../lineage/deps.js';
 import { jsonFromReply, LlmClient } from '../llm/client.js';
+import { breather } from '../pool.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
 import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
@@ -220,11 +221,127 @@ function tokens(s: string): Set<string> {
   return new Set(s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t.length >= 2));
 }
 
-function overlap(a: string, b: string): number {
-  const ta = tokens(a);
-  const tb = tokens(b);
+function overlap(ta: Set<string>, tb: Set<string>): number {
   const inter = [...ta].filter((t) => tb.has(t)).length;
   return inter / Math.max(1, Math.min(ta.size, tb.size));
+}
+
+/* ----------------------------- candidate lookup ----------------------------- */
+
+/** `fn` of a claim's statement, worked out once per statement. */
+function perStatement<T>(fn: (s: string) => T): (c: ClaimLite) => T {
+  const memo = new Map<string, T>();
+  return (c) => {
+    let v = memo.get(c.statement);
+    if (v === undefined) memo.set(c.statement, (v = fn(c.statement)));
+    return v;
+  };
+}
+
+/** What the text checks read from a statement. */
+interface Readings {
+  key: (c: ClaimLite) => string;
+  numbers: (c: ClaimLite) => KeyNumber[];
+  words: (c: ClaimLite) => Set<string>;
+}
+
+/** A figure rounded to `p` decimal places, as sameNumber rounds it. */
+function figure(n: KeyNumber, p: number): string {
+  return `${n.unit}|${p}|${Math.round(n.value * 10 ** p + 1e-9)}`;
+}
+
+/**
+ * sameNumber compares two figures at the coarser of their precisions, so a
+ * number is filed under its figure at every precision up to its own ("≥p":
+ * written with p decimals or more) and at exactly its own ("=p"). The numbers
+ * that match `n` are then those under n's own figure among the "≥", and under
+ * its figure at each coarser precision q among the "=" (`figureProbes`).
+ */
+function figureKeys(n: KeyNumber): string[] {
+  const keys = [`=${figure(n, n.decimals)}`];
+  for (let p = 0; p <= n.decimals; p++) keys.push(`≥${figure(n, p)}`);
+  return keys;
+}
+
+function figureProbes(n: KeyNumber): string[] {
+  const keys = [`≥${figure(n, n.decimals)}`];
+  for (let q = 0; q < n.decimals; q++) keys.push(`=${figure(n, q)}`);
+  return keys;
+}
+
+/**
+ * One block (a subject's claims, or a swapped subject/object group) indexed by
+ * what a text candidate shares with its claim: the normalized statement, a key
+ * number or — for the wording overlap, without real vectors — a word. The
+ * lookup gives the positions of the claims that share any of them with `f`, in
+ * block order: the only ones the text checks can bring up.
+ */
+function indexBlock(block: ClaimLite[], read: Readings, words: boolean): (f: ClaimLite) => number[] {
+  const byKey = new Map<string, number[]>();
+  const byNumber = new Map<string, number[]>();
+  const byWord = words ? new Map<string, number[]>() : null;
+  const file = (map: Map<string, number[]>, k: string, i: number) => {
+    const at = map.get(k);
+    if (!at) map.set(k, [i]);
+    else if (at[at.length - 1] !== i) at.push(i);
+  };
+  block.forEach((c, i) => {
+    file(byKey, read.key(c), i);
+    for (const n of read.numbers(c)) for (const k of figureKeys(n)) file(byNumber, k, i);
+    if (byWord) for (const w of read.words(c)) file(byWord, w, i);
+  });
+  return (f) => {
+    const at = new Set(byKey.get(read.key(f)));
+    for (const n of read.numbers(f)) for (const k of figureProbes(n)) for (const i of byNumber.get(k) ?? []) at.add(i);
+    if (byWord) for (const w of read.words(f)) for (const i of byWord.get(w) ?? []) at.add(i);
+    return [...at].sort((x, y) => x - y);
+  };
+}
+
+type Propose = (a: ClaimLite, b: ClaimLite, why: string, score?: { similarity?: number; shared?: number }) => void;
+
+/**
+ * Candidates from text alone: each focus claim against the claims of its
+ * blocks that are identical to it once normalized, share a key number with it
+ * or — with `words`, when there are no real vectors — overlap its wording.
+ * Each statement is read once, and a claim meets only the claims it shares
+ * something with (indexBlock), in block order, so the pairs come up as a
+ * comparison with every claim of the block would bring them. That comparison,
+ * normalizing both statements again for each pair, held finance's server for
+ * more than an hour a night (2026-10-26: 499,865 claims, 541 million pairs; A股
+ * alone has 10,171 claims). The readings and indexes go with the step: on a
+ * nightly run they cover every statement.
+ */
+async function textCandidates(
+  focus: ClaimLite[],
+  blocksOf: (f: ClaimLite) => ClaimLite[][],
+  propose: Propose,
+  opts: { words: boolean; pause: () => Promise<void> },
+): Promise<void> {
+  const read: Readings = { key: perStatement(statementKey), numbers: perStatement(numbersOf), words: perStatement(tokens) };
+  const indexes = new Map<ClaimLite[], (f: ClaimLite) => number[]>();
+  for (const f of focus) {
+    const fKey = read.key(f);
+    const fNums = read.numbers(f);
+    for (const block of blocksOf(f)) {
+      const sharing = indexes.get(block) ?? indexes.set(block, indexBlock(block, read, opts.words)).get(block)!;
+      for (const i of sharing(f)) {
+        const c = block[i];
+        if (c.id === f.id) continue;
+        if (read.key(c) === fKey) {
+          propose(f, c, 'identical');
+          continue;
+        }
+        const shared = read.numbers(c).filter((n) => fNums.some((m) => sameNumber(n, m)));
+        if (shared.length > 0) propose(f, c, `数字相同 ${shared.slice(0, 3).map((n) => `${n.value}${n.unit}`).join('、')}`, { shared: shared.length });
+        else if (opts.words) {
+          const words = overlap(read.words(f), read.words(c));
+          if (words >= 0.6) propose(f, c, '措辞重叠', { similarity: words });
+        }
+      }
+    }
+    await opts.pause();
+  }
 }
 
 /** The claims' own validity windows are both known and do not meet. */
@@ -282,15 +399,19 @@ export async function auditDuplicateClaims(
       (bySwapped.get(k) ?? bySwapped.set(k, []).get(k)!).push(c);
     }
   }
-  const blockOf = (f: ClaimLite): ClaimLite[] => {
-    const same = bySubject.get(f.subject) ?? [];
-    const swapped = f.object ? bySwapped.get(`${f.subject}|${f.object}`) ?? [] : [];
-    return [...same, ...swapped].filter((c) => c.id !== f.id);
+  /** The groups a claim is compared within: its subject's claims, and the claims with subject and object swapped. */
+  const blocksOf = (f: ClaimLite): ClaimLite[][] => {
+    const swapped = f.object ? bySwapped.get(`${f.subject}|${f.object}`) : undefined;
+    return swapped ? [bySubject.get(f.subject)!, swapped] : [bySubject.get(f.subject)!];
   };
+  const blockOf = (f: ClaimLite): ClaimLite[] => blocksOf(f).flat().filter((c) => c.id !== f.id);
+  // the nightly run covers every claim: its long loops let the server answer in between (with
+  // PGlite, which answers queries on the event loop, a run of queries holds it as well)
+  const pause = breather();
 
   /* candidates from text alone */
   const pairs = new Map<string, Pair>();
-  const propose = (a: ClaimLite, b: ClaimLite, why: string, score: { similarity?: number; shared?: number } = {}) => {
+  const propose: Propose = (a, b, why, score = {}) => {
     const id = claimPairId(a.id, b.id);
     const pair = pairs.get(id) ?? pairs.set(id, { id, a, b, why: [], similarity: 0, cosine: 0, shared: 0, guards: [] }).get(id)!;
     if (!pair.why.includes(why)) pair.why.push(why);
@@ -298,34 +419,26 @@ export async function auditDuplicateClaims(
     pair.shared = Math.max(pair.shared, score.shared ?? 0);
   };
   const realVectors = config.embedding.provider !== 'local' && ctx.embedder.model !== 'local-hash-v1';
-  for (const f of focus) {
-    const fKey = statementKey(f.statement);
-    const fNums = numbersOf(f.statement);
-    for (const c of blockOf(f)) {
-      if (statementKey(c.statement) === fKey) {
-        propose(f, c, 'identical');
-        continue;
-      }
-      const shared = numbersOf(c.statement).filter((n) => fNums.some((m) => sameNumber(n, m)));
-      if (shared.length > 0) propose(f, c, `数字相同 ${shared.slice(0, 3).map((n) => `${n.value}${n.unit}`).join('、')}`, { shared: shared.length });
-      else if (!realVectors) {
-        const words = overlap(f.statement, c.statement);
-        if (words >= 0.6) propose(f, c, '措辞重叠', { similarity: words });
-      }
-    }
-  }
+  await textCandidates(focus, blocksOf, propose, { words: !realVectors, pause });
 
   /* candidates from embeddings: nearest claims of the same subject */
   if (realVectors) {
+    // a block's claims once, however many of them are in focus
     const needed = new Set<string>();
+    const listed = new Set<ClaimLite[]>();
     for (const f of focus) {
-      const block = blockOf(f);
-      if (block.length === 0) continue;
+      const blocks = blocksOf(f);
+      if (!blocks.some((b) => b.some((c) => c.id !== f.id))) continue;
       needed.add(f.id);
-      for (const c of block) needed.add(c.id);
+      for (const b of blocks) {
+        if (listed.has(b)) continue;
+        listed.add(b);
+        for (const c of b) needed.add(c.id);
+      }
     }
     stats.embedded = await ensureClaimEmbeddings(store, ctx.embedder, [...needed].map((id) => byId.get(id)!).filter(Boolean), progress);
     for (const f of focus) {
+      await pause();
       const block = blockOf(f);
       if (block.length === 0) continue;
       const rows = await store.query<{ claim_id: string; sim: number }>(
@@ -371,7 +484,11 @@ export async function auditDuplicateClaims(
 
   const toJudge: Pair[] = [];
   const outcomes: { pair: Pair; verdict: Verdict }[] = [];
+  const numbersIn = perStatement(numbersOf);
+  const periodsIn = perStatement(periodsOf);
+  const negatedIn = perStatement(negated);
   for (const pair of pairs.values()) {
+    await pause();
     if (decided.has(pair.id)) continue;
     const { a, b } = pair;
     if (pair.why.includes('identical')) {
@@ -379,15 +496,15 @@ export async function auditDuplicateClaims(
       stats.identical++;
       continue;
     }
-    if (windowsDisjoint(a, b) || periodsDisjoint(periodsOf(a.statement), periodsOf(b.statement))) {
+    if (windowsDisjoint(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b))) {
       outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '时期不同', model: 'rule' } });
       stats.differentTime++;
       continue;
     }
-    const na = numbersOf(a.statement);
-    const nb = numbersOf(b.statement);
+    const na = numbersIn(a);
+    const nb = numbersIn(b);
     if (na.length > 0 && nb.length > 0 && !numbersWithin(na, nb) && !numbersWithin(nb, na)) pair.guards.push('数字不一致');
-    if (negated(a.statement) !== negated(b.statement)) pair.guards.push('否定不一致');
+    if (negatedIn(a) !== negatedIn(b)) pair.guards.push('否定不一致');
     if ((a.status === 'fact' && b.status === 'disputed') || (a.status === 'disputed' && b.status === 'fact')) pair.guards.push('状态冲突');
     // a forecast and the result it foresaw, or a view and the fact it is about, are not one claim
     if (a.kind !== b.kind) pair.guards.push('性质不同');
@@ -426,6 +543,7 @@ export async function auditDuplicateClaims(
     return byId.get(id) ?? c;
   };
   for (const { pair, verdict } of outcomes) {
+    await pause();
     await rememberVerdict(store, pair, verdict);
     const { relation, confidence } = verdict;
     if (relation === 'same' || relation === 'contains') {

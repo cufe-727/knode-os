@@ -161,9 +161,10 @@ export async function auditDuplicateEntities(
   // 3. short name is a prefix of a longer one, same declared (non-placeholder) type
   const typed = entities.filter((e) => e.name_key && e.type !== 'concept' && e.type !== 'other');
   const isCjk = (s: string) => /[\u3400-\u9fff]/.test(s);
+  const longEnough = (k: string) => k.length >= (isCjk(k) ? 2 : 4);
   const prefix = (short: EntityLite, long: EntityLite) => {
     const k = short.name_key!;
-    if (k.length < (isCjk(k) ? 2 : 4)) return;
+    if (!longEnough(k)) return;
     if (long.id === short.id || long.type !== short.type) return;
     const lk = long.name_key!;
     if (lk.length <= k.length || lk.length - k.length > 12 || !lk.startsWith(k)) return;
@@ -178,7 +179,23 @@ export async function auditDuplicateEntities(
       }
     }
   } else {
-    for (const short of typed) for (const long of typed) prefix(short, long);
+    // every pair, without trying every pair: sorted by key, the keys that start with a key follow
+    // it, so each name meets only those (taken in the order of `typed`, as a full pass would).
+    // Every pair held finance's server for 40 s (2026-10-26: 51,349 typed entities, 2.6 billion pairs).
+    const byKey = typed.map((e, i) => ({ e, i })).sort((x, y) => (x.e.name_key! < y.e.name_key! ? -1 : x.e.name_key! > y.e.name_key! ? 1 : 0));
+    for (const short of typed) {
+      const k = short.name_key!;
+      if (!longEnough(k)) continue;
+      let lo = 0;
+      for (let hi = byKey.length; lo < hi; ) {
+        const mid = (lo + hi) >> 1;
+        if (byKey[mid].e.name_key! < k) lo = mid + 1;
+        else hi = mid;
+      }
+      const longer: { e: EntityLite; i: number }[] = [];
+      for (let j = lo; j < byKey.length && byKey[j].e.name_key!.startsWith(k); j++) longer.push(byKey[j]);
+      for (const { e } of longer.sort((x, y) => x.i - y.i)) prefix(short, e);
+    }
   }
 
   // 4. embedding similarity (real embedders only)

@@ -19,3 +19,19 @@ export async function pool<T, R>(items: T[], size: number, fn: (item: T, index: 
   );
   return out;
 }
+
+/**
+ * A pause for a long synchronous stretch of an async function (the nightly
+ * audits walk hundreds of thousands of rows): `await pause()` between steps
+ * gives the event loop a turn — timers, sockets, file events, so the server
+ * keeps answering — once `sliceMs` of work has gone by since the last one, and
+ * otherwise resolves at once.
+ */
+export function breather(sliceMs = 20): () => Promise<void> {
+  let since = performance.now();
+  return async () => {
+    if (performance.now() - since < sliceMs) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    since = performance.now();
+  };
+}
