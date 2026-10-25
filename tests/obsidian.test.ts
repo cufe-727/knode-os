@@ -7,7 +7,7 @@ import { initDataDir } from '../src/fs/datadir.js';
 import { extractObsidianLinks } from '../src/graph/wire.js';
 import { runIngest } from '../src/ingest/pipeline.js';
 import { getObsidianVaultStatus, initObsidianVault, OBSIDIAN_APP_CONFIG } from '../src/obsidian/vault.js';
-import { resolveKnowledgeLink } from '../src/obsidian/links.js';
+import { linkedName, resolveKnowledgeLink } from '../src/obsidian/links.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-obsidian-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -74,6 +74,16 @@ describe('Obsidian link compatibility', () => {
     expect(resolveKnowledgeLink(data, 'wiki/index.md', 'Original Post#Details')).toEqual({ path: 'wiki/entities/original-post.md', fragment: 'Details' });
     expect(resolveKnowledgeLink(data, 'wiki/index.md', 'https://example.com')).toBeNull();
     expect(resolveKnowledgeLink(data, '../outside.md', '原帖')).toBeNull();
+  });
+
+  it('reads the name a link with no note behind it stands for, which may be an entity', () => {
+    expect(linkedName(' 英伟达 ')).toBe('英伟达');
+    expect(linkedName('英伟达.md#估值')).toBe('英伟达');
+    expect(linkedName('%E8%8B%B1%E4%BC%9F%E8%BE%BE')).toBe('英伟达');
+    // a folder names a note, and an external link nothing in the graph
+    expect(linkedName('entities/英伟达')).toBe('');
+    expect(linkedName('https://example.com')).toBe('');
+    expect(linkedName('#估值')).toBe('');
   });
 
   it('resolves vault-root wikilinks in bodies and Properties to real concept titles', async () => {

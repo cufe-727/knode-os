@@ -15,7 +15,8 @@ import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 /**
  * What a Markdown view marks and opens: POST /api/entities/mentions finds the
  * known entities a text names, GET /api/entities/detail answers the panel a
- * marked name opens.
+ * marked name opens, and GET /api/link/resolve sends a [[link]] to a name no
+ * note answers to there too.
  */
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-entity-mentions-'));
@@ -208,5 +209,41 @@ describe('GET /api/entities/detail', () => {
   it('answers 404 for an id with no live entity and 400 without one', async () => {
     expect((await app.request('/api/entities/detail?id=nope', { headers })).status).toBe(404);
     expect((await app.request('/api/entities/detail', { headers })).status).toBe(400);
+  });
+});
+
+describe('GET /api/link/resolve', () => {
+  const resolve = (target: string, from = 'wiki/index.md') =>
+    app.request(`/api/link/resolve?target=${encodeURIComponent(target)}&from=${encodeURIComponent(from)}`, { headers });
+
+  it('opens the entity a name no note answers to stands for: by its name or an alias, a merged one as its survivor', async () => {
+    const entity = { id: await idOf('宁德时代'), name: '宁德时代', type: 'organization' };
+    for (const target of ['宁德时代', 'CATL', 'catl', '宁王', '宁德时代#估值']) {
+      const res = await resolve(target);
+      expect(res.status, target).toBe(200);
+      expect(await res.json(), target).toEqual({ path: null, fragment: null, entity });
+    }
+    // from a document outside the wiki, too
+    expect(await (await resolve('CATL', 'raw/docs/notes.md')).json()).toMatchObject({ entity: { name: '宁德时代' } });
+  });
+
+  it('prefers a note, then the entity’s own page', async () => {
+    write(ws.dataDir, 'wiki/concepts/Apple.md', '# Apple\n');
+    write(ws.dataDir, 'wiki/entities/byd.md', '# 比亚迪\n');
+    await ws.store.query(`UPDATE entities SET wiki_path = 'wiki/entities/byd.md' WHERE id = $1`, [await idOf('比亚迪')]);
+    try {
+      expect(await (await resolve('Apple')).json()).toEqual({ path: 'wiki/concepts/Apple.md', fragment: null });
+      expect(await (await resolve('BYD')).json()).toEqual({ path: 'wiki/entities/byd.md', fragment: null });
+    } finally {
+      await ws.store.query(`UPDATE entities SET wiki_path = NULL WHERE id = $1`, [await idOf('比亚迪')]);
+      fs.rmSync(path.join(ws.dataDir, 'wiki/concepts/Apple.md'));
+      fs.rmSync(path.join(ws.dataDir, 'wiki/entities/byd.md'));
+    }
+  });
+
+  it('answers 404 for a name only links know, a name nothing knows, and a path', async () => {
+    // notes.md's [[动力电池]] left a concept behind; that alone does not make the link lead anywhere
+    expect(await idOf('动力电池')).toBeTruthy();
+    for (const target of ['动力电池', '谁也不知道', 'folder/宁德时代']) expect((await resolve(target)).status, target).toBe(404);
   });
 });

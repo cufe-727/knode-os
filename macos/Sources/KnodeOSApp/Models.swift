@@ -428,9 +428,18 @@ struct FileResponse: Decodable {
     var derived: Bool?
 }
 
+/// Where a followed link leads (GET /api/link/resolve): a file, or — for a name no
+/// note answers to but the graph knows — the entity, whose panel the link opens.
 struct ResolvedLinkResponse: Decodable {
-    var path: String
+    struct Entity: Decodable {
+        var id: String
+        var name: String
+        var type: String
+    }
+
+    var path: String?
     var fragment: String?
+    var entity: Entity?
 }
 
 struct SearchResult: Decodable, Identifiable, Hashable {

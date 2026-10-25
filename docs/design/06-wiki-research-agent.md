@@ -196,6 +196,14 @@ Zero LLM: orphans, broken wikilinks, stale / unreviewed research pages, expired 
 still in a page, pages in open disputes. Report page `wiki/lint/<date>.md`; nightly after tier 2; `knode-os wiki lint`,
 `POST /api/wiki/lint`.
 
+Since 2026‑10‑25 a link is broken only when its name has neither a page nor an entity the graph knows from more than
+links to it (`entitiesNamed` in `src/graph/resolve.ts`: a name or alias key, a merged entity as its survivor; the
+concept a link to an unwritten page leaves does not count, or every link would be its own target). A link to an entity
+whose page has another name counts as a link to that page. A link to an entity with no page is no finding: the report
+counts those apart (`entityLinks`) and lists the entities linked from the most pages, the pages most worth writing. In
+the web and Mac viewers the same link opens the entity panel: `GET /api/link/resolve` answers `{ entity }` when no note
+does. Orphans count ordinary Markdown links as well as wikilinks (`index.md` links `overview.md` that way).
+
 ## 8. Config and migration
 
 `database.kind` now defaults to `postgres` (`pglite` stays an explicit option; the test suite sets `KNODE_DATABASE_KIND=pglite`), and an unreachable server is a clear error rather than a silent fallback. `server.mcp`, `research { agent, model, profile, pipeline: single | team | native, maxTurns, timeoutMs, concurrency, runsDir, keepRuns, readDirs, researchers, reviewRounds, auto }` (profiles under `playbooks/research/profiles/`, built-ins default / quick / thorough / native), `graph { ontologyPacks }`, `review { resolution, llmJudge, llmMinConfidence, autoMergeMinConfidence, maxJudgedPerRun, claims, external }`. Migration `V7_WIKI_RESEARCH` adds the columns and tables above and `V8_REVIEW` adds `entity_alias_keys.kind`; `entity_embeddings` is created with the embedding dimension at open. The MCP bearer token lives in `<data>/.knode/mcp-token` and is this machine's own clients' (with sign-in on, the workspace it names must be an account's own, or a team the account has been given); `knode-os connect <client>` registers the HTTP endpoint (`--stdio` for a standalone process). The agents `serve` launches — research jobs, Ask turns — get a token minted for their workspace instead, held in memory: it opens that workspace and no other, and it may not promote a source or settle a dispute (`knode_trust` to trusted, `knode_disputes` resolve), which is the review the agent's own writes wait for.

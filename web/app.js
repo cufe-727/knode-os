@@ -1714,6 +1714,11 @@ $('#file-view').addEventListener('click', async (event) => {
   event.preventDefault();
   try {
     const resolved = await api(`/api/link/resolve?target=${encodeURIComponent(target)}&from=${encodeURIComponent(currentFile)}`);
+    // a name with no note behind it that the graph knows opens the entity's panel
+    if (resolved.entity) {
+      openEntity(resolved.entity.id);
+      return;
+    }
     if (resolved.path === currentFile) {
       if (resolved.fragment) scrollToFragment(resolved.fragment);
       return;

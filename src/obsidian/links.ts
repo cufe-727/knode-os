@@ -78,6 +78,19 @@ export function resolveKnowledgeLink(
   return metadataMatches.length === 1 ? { path: metadataMatches[0], fragment } : null;
 }
 
+/**
+ * The name a link stands for when no note answers to it — `[[英伟达]]`,
+ * `[[英伟达.md#估值]]` → `英伟达` — which may be an entity the graph has. A
+ * link with a folder in it names a note, not an entity: empty, as for an
+ * external link.
+ */
+export function linkedName(rawTarget: string): string {
+  const decoded = decodeTarget(rawTarget.trim());
+  if (!decoded || isExternalTarget(decoded)) return '';
+  const name = decoded.split('#', 1)[0].split('?', 1)[0].replace(/\.(md|markdown)$/i, '').trim();
+  return name.includes('/') || name.includes('\\') ? '' : name;
+}
+
 function decodeTarget(value: string): string {
   try {
     return decodeURIComponent(value);

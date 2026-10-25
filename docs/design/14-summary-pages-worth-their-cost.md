@@ -112,6 +112,7 @@ long one.
    still resolve where a stub exists.
 4. Entity stub pages are still written only by `wiki generate` (`ensureEntityStubs`, 30 at a time), so a link to a
    graph name may still have no page behind it. The link is now at least a name the graph has; writing stubs for
-   every linked entity is a separate change.
+   every linked entity is a separate change. Since 2026‑10‑25 such a link opens the entity panel, and `wiki lint`
+   counts it apart from broken links (06 §7).
 5. Existing pages keep their English scaffold and free-form links until their documents change. Re-summarizing
    them is a model-call budget decision, not taken here.

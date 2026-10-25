@@ -398,8 +398,7 @@ struct FileBrowserView: View {
                         Group {
                             if selectedPath.hasSuffix(".md") || selectedPath.hasSuffix(".markdown") {
                                 MarkdownText(markdown: content, mentions: mentions, scrollTarget: $scrollTarget, onOpenEntity: { id, block in
-                                    panelOrigin = block
-                                    if entityTrail.last != id { entityTrail.append(id) }
+                                    openEntity(id, from: block)
                                 }) { target, block in
                                     Task { await openKnowledgeLink(target, from: selectedPath, block: block) }
                                 }
@@ -799,16 +798,28 @@ struct FileBrowserView: View {
     }
 
     /// Follow a link in the preview; its #fragment — a cited export entry, a heading — is brought into view once the file is shown.
+    /// A name no note answers to but the graph knows opens the entity panel instead.
     private func openKnowledgeLink(_ target: String, from sourcePath: String, block: Int?) async {
         do {
             let resolved = try await model.client().resolveLink(target, from: sourcePath)
-            if resolved.path != selectedPath {
-                await leave(for: resolved.path, returningTo: block)
+            if let entity = resolved.entity {
+                openEntity(entity.id, from: block)
+                return
+            }
+            guard let path = resolved.path else { return }
+            if path != selectedPath {
+                await leave(for: path, returningTo: block)
             }
             scrollTarget = resolved.fragment.map(MarkdownScrollTarget.fragment)
         } catch {
             model.showError(error, prefix: "Link unavailable")
         }
+    }
+
+    /// Show an entity in the panel, remembering the block whose text opened it.
+    private func openEntity(_ id: String, from block: Int?) {
+        panelOrigin = block
+        if entityTrail.last != id { entityTrail.append(id) }
     }
 
     /// A file the entity panel points at: a wiki page, a document that mentions the entity.

@@ -1174,7 +1174,7 @@ wiki
     try {
       const r = await lintWiki(ctx, { report: opts.report, file: opts.report, onProgress: (m) => console.log(`  ${m}`) });
       for (const i of r.issues) console.log(`${i.kind.padEnd(16)} ${i.path}  ${i.detail}`);
-      console.log(JSON.stringify({ pages: r.pages, counts: r.counts, report: r.reportPath, suggestions: r.suggestions }, null, 2));
+      console.log(JSON.stringify({ pages: r.pages, counts: r.counts, entityLinks: { links: r.entityLinks.links, entities: r.entityLinks.entities }, report: r.reportPath, suggestions: r.suggestions }, null, 2));
     } finally {
       await ctx.datasources.closeAll();
       await ctx.store.close();

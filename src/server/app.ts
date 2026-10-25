@@ -64,6 +64,7 @@ import {
 } from '../ingest/folders.js';
 import { documentMentions } from '../graph/mentions.js';
 import { entityDetail, graphInsights, graphOverview, graphSearch } from '../graph/query.js';
+import { entitiesNamed } from '../graph/resolve.js';
 import { buildContextPack } from '../pack/pack.js';
 import { applySuggestion } from '../pack/learn.js';
 import { canonicalEmbeddingModel, createConfiguredEmbeddingProvider, EmbeddingQuotaLedger, embeddingLimits, validateEmbeddingPool } from '../ingest/embedding-router.js';
@@ -109,7 +110,7 @@ import { validateOkfBundle } from '../okf/index.js';
 import { configuredPluginSpecs } from '../plugins/loader.js';
 import { pluginRegistry } from '../plugins/registry.js';
 import { HOOK_NAMES } from '../plugins/types.js';
-import { resolveKnowledgeLink } from '../obsidian/links.js';
+import { linkedName, resolveKnowledgeLink } from '../obsidian/links.js';
 import {
   getSuggestion,
   knowledgeStats,
@@ -1014,15 +1015,20 @@ export function createApp(
     }
   });
 
-  app.get('/api/link/resolve', (c) => {
+  app.get('/api/link/resolve', async (c) => {
     const ctx = requestCtx(c);
     try {
       const target = c.req.query('target');
       const from = c.req.query('from');
       if (!target || !from) return c.json({ error: 'target and from required' }, 400);
       const resolved = resolveKnowledgeLink(ctx.dataDir, from, target);
-      if (!resolved) return c.json({ error: `link target not found: ${target}` }, 404);
-      return c.json(resolved);
+      if (resolved) return c.json(resolved);
+      // a name no note answers to may be an entity the graph has: its page when it has one, else the entity's panel
+      const name = linkedName(target);
+      const entity = name ? (await entitiesNamed(ctx.store, [name])).get(name) : undefined;
+      if (entity?.wikiPath && pathExists(ctx.dataDir, entity.wikiPath)) return c.json({ path: entity.wikiPath, fragment: null });
+      if (entity) return c.json({ path: null, fragment: null, entity: { id: entity.id, name: entity.name, type: entity.type } });
+      return c.json({ error: `link target not found: ${target}` }, 404);
     } catch (e) {
       return c.json(err(e), 400);
     }

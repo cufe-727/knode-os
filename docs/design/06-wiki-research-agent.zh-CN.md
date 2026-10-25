@@ -188,6 +188,12 @@ macOS 设置里所有填模型的地方（阶段、agent、研究执行卡片、
 零 LLM：孤儿页、坏 wikilink、研究页早于最新证据（→ refresh 建议）、隔离超期未审、`stale_after` 过期、正文仍含被替代的事实、
 有 open dispute 的页。报告写成视图页 `wiki/lint/<date>.md`（`lint` scope），夜间 Tier‑2 之后运行；`knode-os wiki lint`、`POST /api/wiki/lint`。
 
+2026‑10‑25 起，链接的名字既没有页面、也不是图谱从链接以外认识的实体时，才算坏链接（`src/graph/resolve.ts` 的 `entitiesNamed`：
+按名字或别名 key 查，被合并的实体落到幸存者；指向未写页面的链接自己留下的 concept 不算，否则每个链接都成了自己的目标）。
+实体的页面换了个文件名，算链到那一页。实体没有页面不算问题：报告单独计数（`entityLinks`），按被多少页链接列出这些实体——
+最值得写页面的就是它们。网页和 Mac 端点这样的链接会打开实体面板：没有笔记对应时 `GET /api/link/resolve` 返回 `{ entity }`。
+孤儿页同时计入普通 Markdown 链接和 wikilink（`index.md` 就是这样链接 `overview.md` 的）。
+
 ## 8. 配置与迁移
 
 - `database.kind` 出厂默认改为 `postgres`（共用库 `knode`、按工作区分 schema）；`pglite` 保留为显式可选，测试套件通过 `KNODE_DATABASE_KIND=pglite` 使用它；连不上 Postgres 时报清晰错误而不是静默回退。

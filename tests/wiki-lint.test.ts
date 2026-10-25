@@ -11,7 +11,7 @@ import { markSupersededClaims } from '../src/wiki/refine.js';
 /**
  * wiki lint: orphans, broken links, stale / unreviewed research pages,
  * expired pages and superseded statements, reported as a view page and
- * filed as refresh suggestions.
+ * filed as refresh suggestions; links to entities with no page counted apart.
  */
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-lint-'));
@@ -35,7 +35,8 @@ describe('wiki lint', () => {
     write(dataDir, 'raw/docs/2026-01-10-old.md', `---
 title: 旧年报
 entities:
-  - { name: 宁德时代, type: organization }
+  - { name: 宁德时代, type: organization, aliases: [CATL] }
+  - { name: 比亚迪, type: organization }
 claims:
   - { subject: 宁德时代, type: guidance, statement: 2025 年全年出货指引 400GWh, startDate: "2025-01-01", endDate: "2025-12-31" }
 ---
@@ -61,7 +62,15 @@ title: 电池
 ---
 # 电池
 
-动力电池的核心厂商包括 [[宁德时代]] 与 [[不存在的页]]。
+动力电池的核心厂商包括 [[宁德时代]]（[[CATL]]）、[[比亚迪]] 与 [[不存在的页]]。
+`);
+    write(dataDir, 'wiki/concepts/储能.md', `---
+type: concept
+title: 储能
+---
+# 储能
+
+只有一个普通的 Markdown 链接指到这里。
 `);
     write(dataDir, 'wiki/concepts/孤儿.md', `---
 type: concept
@@ -78,7 +87,7 @@ stale_after: "2020-01-01T00:00:00Z"
 ---
 # 过期
 
-见 [[电池]]。
+见 [[电池]] 与 [储能](储能.md)。
 `);
     ctx = await createContext(dataDir);
     await sync(ctx, { llmGraph: false });
@@ -100,7 +109,17 @@ claims:
     const has = (kind: string, p: string) => report.issues.some((i) => i.kind === kind && i.path === p);
     expect(has('orphan', 'wiki/concepts/孤儿.md')).toBe(true);
     expect(has('orphan', 'wiki/concepts/电池.md')).toBe(false); // linked from 宁德时代 and 过期
-    expect(has('broken_link', 'wiki/concepts/电池.md')).toBe(true);
+    // only 不存在的页 is broken: the concept its own link left is no entity the graph knows; CATL is
+    // 宁德时代's alias and reaches its page; 比亚迪 has no page but opens the entity, so it is counted apart
+    expect(report.issues.filter((i) => i.kind === 'broken_link').map((i) => `${i.path} ${i.detail}`)).toEqual([
+      'wiki/concepts/电池.md [[不存在的页]] names no page and no graph entity',
+    ]);
+    expect(report.entityLinks).toMatchObject({ links: 1, entities: 1 });
+    expect(report.entityLinks.top).toEqual([expect.objectContaining({ name: '比亚迪', type: 'organization', pages: 1 })]);
+    // an ordinary Markdown link reaches a page too, from a page or from index.md
+    expect(has('orphan', 'wiki/concepts/储能.md')).toBe(false);
+    expect(fs.existsSync(path.join(dataDir, 'wiki/overview.md'))).toBe(true);
+    expect(has('orphan', 'wiki/overview.md')).toBe(false);
     expect(has('expired', 'wiki/concepts/过期.md')).toBe(true);
     expect(has('stale_research', 'wiki/entities/宁德时代.md')).toBe(true);
     expect(has('superseded_text', 'wiki/entities/宁德时代.md')).toBe(true);
@@ -109,7 +128,10 @@ claims:
     // the report is a view page, and the stale page became a refresh suggestion
     expect(report.reportPath).toMatch(/^wiki\/lint\/\d{4}-\d{2}-\d{2}\.md$/);
     expect(fs.existsSync(path.join(dataDir, report.reportPath!))).toBe(true);
-    expect(fs.readFileSync(path.join(dataDir, report.reportPath!), 'utf8')).toContain('## broken_link');
+    const page = fs.readFileSync(path.join(dataDir, report.reportPath!), 'utf8');
+    expect(page).toContain('## broken_link (1)');
+    expect(page).toContain('## entities without a page (1)');
+    expect(page).toContain('- [[比亚迪]] (organization) — linked from 1 page');
     expect(await ctx.store.query(`SELECT kind FROM pages WHERE path = $1 AND tx_to IS NULL`, [report.reportPath])).toEqual([{ kind: 'lint' }]);
     const refresh = (await listSuggestions(ctx.store, { status: 'pending' })).find((s) => s.kind === 'wiki' && (s.payload as { target?: string })?.target === 'wiki/entities/宁德时代.md');
     expect(refresh?.payload).toMatchObject({ kind: 'refresh' });
