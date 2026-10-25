@@ -979,9 +979,15 @@ export function createApp(
   app.get('/api/tree', (c) => {
     const ctx = requestCtx(c);
     try {
-      const tree = listTree(ctx.dataDir, c.req.query('path') ?? '.');
+      // `depth=1` lists a folder's own entries, the way the clients open folders;
+      // without it the whole subtree comes back. `dirs=1` leaves the files out.
+      const depthArg = c.req.query('depth');
+      const depth = depthArg === undefined ? undefined : Number(depthArg);
+      if (depth !== undefined && !(Number.isInteger(depth) && depth >= 1)) return c.json({ error: 'depth must be a whole number of levels, 1 or more' }, 400);
+      const tree = listTree(ctx.dataDir, c.req.query('path') ?? '.', depth, { dirsOnly: ['1', 'true'].includes(c.req.query('dirs') ?? '') });
       // the mirror of a linked folder says where it comes from, so a client can
-      // mark it and keep edits off it (the routes refuse them anyway)
+      // mark it and keep edits off it (the routes refuse them anyway); the list
+      // rides along for files under a mirror whose folder was never listed
       const links = linkedFolders(ctx.config);
       if (links.length) {
         const mark = (node: typeof tree): void => {
@@ -991,7 +997,7 @@ export function createApp(
         };
         mark(tree);
       }
-      return c.json(tree);
+      return c.json({ ...tree, links: links.map((l) => ({ path: l.dest, source: l.source })) });
     } catch (e) {
       return c.json(err(e), 400);
     }

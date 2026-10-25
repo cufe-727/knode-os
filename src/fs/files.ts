@@ -10,6 +10,7 @@ export interface TreeNode {
   kind: 'file' | 'dir';
   bytes?: number;
   mtime?: string;
+  /** A folder's entries; absent on a folder past the listing's depth — not listed, which is not empty. */
   children?: TreeNode[];
 }
 
@@ -60,7 +61,13 @@ export function assertNotPrivate(rel: string): void {
   throw new Error(`${rel} is not available through the file API${config ? ' — Settings shows the configuration, without its keys' : ': it is the workspace\'s private state'}`);
 }
 
-export function listTree(dataDir: string, rel = '.', maxDepth = 8): TreeNode {
+/**
+ * A file or a folder `maxDepth` levels down. A folder past that depth comes
+ * back without `children`, so a client can list one level at a time and fetch
+ * a folder when it is opened: a whole workspace is tens of thousands of files.
+ * `dirsOnly` leaves the files out — the folders a picker offers.
+ */
+export function listTree(dataDir: string, rel = '.', maxDepth = 8, opts: { dirsOnly?: boolean } = {}): TreeNode {
   assertNotPrivate(rel);
   const abs = safePath(dataDir, rel);
   const stat = fs.statSync(abs);
@@ -69,18 +76,20 @@ export function listTree(dataDir: string, rel = '.', maxDepth = 8): TreeNode {
   if (stat.isFile()) {
     return { name, path: relPosix, kind: 'file', bytes: stat.size, mtime: stat.mtime.toISOString() };
   }
-  const node: TreeNode = { name, path: relPosix, kind: 'dir', children: [] };
+  const node: TreeNode = { name, path: relPosix, kind: 'dir' };
   if (maxDepth <= 0) return node;
+  const children: TreeNode[] = (node.children = []);
   const entries = fs.readdirSync(abs, { withFileTypes: true })
     .filter((e) => !HIDDEN.has(e.name) && !e.name.startsWith('.') && !isPrivatePath(relPosix ? `${relPosix}/${e.name}` : e.name))
     .sort((a, b) => (a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1));
   for (const e of entries) {
     const childRel = relPosix ? `${relPosix}/${e.name}` : e.name;
     if (e.isDirectory()) {
-      node.children!.push(listTree(dataDir, childRel, maxDepth - 1));
-    } else {
+      // the last level needs no stat: the entry already says it is a folder
+      children.push(maxDepth > 1 ? listTree(dataDir, childRel, maxDepth - 1, opts) : { name: e.name, path: childRel, kind: 'dir' });
+    } else if (!opts.dirsOnly) {
       const st = fs.statSync(path.join(abs, e.name));
-      node.children!.push({ name: e.name, path: childRel, kind: 'file', bytes: st.size, mtime: st.mtime.toISOString() });
+      children.push({ name: e.name, path: childRel, kind: 'file', bytes: st.size, mtime: st.mtime.toISOString() });
     }
   }
   return node;

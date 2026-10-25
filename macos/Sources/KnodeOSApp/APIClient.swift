@@ -241,8 +241,14 @@ struct APIClient {
         try await send("/api/stats")
     }
 
-    func tree() async throws -> TreeNode {
-        try await send("/api/tree")
+    /// A folder `depth` levels down — 1 for its own entries, the way the file
+    /// browser opens folders — or its whole subtree without one.
+    /// `directoriesOnly` leaves the files out.
+    func tree(path folder: String = ".", depth: Int? = nil, directoriesOnly: Bool = false) async throws -> TreeNode {
+        var query = [URLQueryItem(name: "path", value: folder.isEmpty ? "." : folder)]
+        if let depth { query.append(.init(name: "depth", value: String(depth))) }
+        if directoriesOnly { query.append(.init(name: "dirs", value: "1")) }
+        return try await send(path("/api/tree", query: query))
     }
 
     /// Reads a file. Without `maxBytes` the service caps the read at its preview

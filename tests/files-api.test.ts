@@ -271,3 +271,30 @@ describe('sanitizeRelativePath', () => {
     expect(sanitizeRelativePath('../../..')).toBe('');
   });
 });
+
+describe('GET /api/tree', () => {
+  it('lists the tree a level at a time, or the folders alone', async () => {
+    expect((await mkdir('wiki/levels/pricing/2026')).status).toBe(200);
+    fs.writeFileSync(path.join(workspaceDir, 'wiki', 'levels', 'pricing', 'notes.md'), '# notes\n');
+    type Node = { path: string; kind: string; children?: Node[] };
+    const get = async (query: string): Promise<Node> => (await app.request(`/api/tree?${query}`, { headers })).json();
+
+    // one level: a subfolder comes back without children — not listed, which is not empty
+    const level = await get('path=wiki/levels&depth=1');
+    const pricing = level.children?.find((c) => c.path === 'wiki/levels/pricing');
+    expect(pricing).toEqual({ name: 'pricing', path: 'wiki/levels/pricing', kind: 'dir' });
+    expect((await get('path=wiki/levels/pricing&depth=1')).children?.map((c) => c.path))
+      .toEqual(['wiki/levels/pricing/2026', 'wiki/levels/pricing/notes.md']);
+    expect((await get('path=wiki/levels&depth=2')).children?.find((c) => c.path === 'wiki/levels/pricing')?.children?.length).toBe(2);
+    // the workspace root, as the file tree opens it
+    expect((await get('path=.&depth=1')).children?.map((c) => c.path)).toEqual(expect.arrayContaining(['raw', 'wiki']));
+    // the folders alone, all the way down: what a destination picker offers
+    const dirs = await get('path=wiki/levels&dirs=1');
+    const flat = (n: Node): Node[] => [n, ...(n.children ?? []).flatMap(flat)];
+    expect(flat(dirs).every((n) => n.kind === 'dir')).toBe(true);
+    expect(flat(dirs).map((n) => n.path)).toEqual(expect.arrayContaining(['wiki/levels/pricing', 'wiki/levels/pricing/2026']));
+    // without a depth, the whole subtree as before
+    expect((await get('path=wiki/levels')).children?.find((c) => c.path === 'wiki/levels/pricing')?.children?.length).toBe(2);
+    for (const bad of ['0', '-1', '1.5', 'deep']) expect((await app.request(`/api/tree?path=wiki&depth=${bad}`, { headers })).status, bad).toBe(400);
+  });
+});

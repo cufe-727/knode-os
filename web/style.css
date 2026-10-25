@@ -256,6 +256,8 @@ main { flex: 1; min-height: 0; overflow: hidden; display: flex; }
 .tree-label.selected { background: var(--bg3); color: var(--accent); }
 .tree-children { margin-left: 14px; border-left: 1px dashed var(--border); padding-left: 4px; }
 .tree-dir.collapsed > .tree-children { display: none; }
+.tree-note { padding: 1.5px 4px; color: var(--muted); font-size: 12px; }
+.tree-more > .tree-label { cursor: pointer; color: var(--muted); font-style: italic; }
 
 /* right-click menu, shared by the tree rows and the pane's own menu buttons */
 .popup-menu {

@@ -245,7 +245,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
 
 ## REST API
 
-`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/tree · /api/file · /api/search · /api/graph[?limit&types&edges] · /api/graph/insights · /api/entities[?q&type&sort&order&offset&limit&merged] · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
+`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/tree[?path&depth&dirs] · /api/file · /api/search · /api/graph[?limit&types&edges] · /api/graph/insights · /api/entities[?q&type&sort&order&offset&limit&merged] · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
 `PUT /api/config` · `PUT /api/file` · `DELETE /api/file` · `POST /api/config/test | /api/upload | /api/ingest | /api/ask | /api/mv | /api/mkdir | /api/traces/sync | /api/dream | /api/wiki/generate | /api/suggestions/:id/status`
 
 每个接口都需要登录会话——已登录浏览器的 cookie,或 `Authorization: Bearer knu_…`(应用的,或 `knode-os user token` 签发给脚本的)——以及该接口所属 API 分组的权限;登录本身在 `/api/auth/*` 下([docs/remote-access.md](docs/remote-access.md))。Workspace 范围内的数据 API 另需请求头 `X-Knode-Workspace-Kind`（`personal` 或 `team`）、`X-Knode-Workspace-ID` 和 `X-Knode-Workspace-Name`；Workspace 的主人就是已登录的账号(只有关闭登录时才看 `X-Knode-User`)。`DELETE /api/workspace` 会彻底清空所选 Workspace。

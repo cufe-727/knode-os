@@ -71,7 +71,12 @@ struct FileBrowserView: View {
     private static let uploadBatchByteLimit = 24 * 1024 * 1024
 
     @EnvironmentObject private var model: AppModel
-    @State private var tree: TreeNode?
+    /// Each listed folder's own entries ("" is the workspace root). A workspace
+    /// can hold tens of thousands of files, so a folder is listed when it
+    /// opens, one level at a time, never the whole tree at once.
+    @State private var listings: [String: [TreeNode]] = [:]
+    /// Every folder the destination picker offers, read when it opens.
+    @State private var writableDirectories: [String] = []
     @State private var selectedPath: String?
     @State private var content = ""
     @State private var editorContent = ""
@@ -144,8 +149,9 @@ struct FileBrowserView: View {
             .inspectorColumnWidth(min: 300, ideal: 350, max: 480)
         }
         .task { await initialLoad() }
+        .task(id: expandedPaths) { await listOpenFolders() }
         .onChange(of: model.connectionState) { _, state in
-            if case .connected = state, tree == nil {
+            if case .connected = state, listings[""] == nil {
                 Task { await initialLoad() }
             }
         }
@@ -287,24 +293,36 @@ struct FileBrowserView: View {
             if !selectionMode { destinationBar }
 
             Divider()
-            if isLoading && tree == nil {
+            if isLoading && listings[""] == nil {
                 ProgressView("Loading files…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let children = tree?.children {
+            } else if listings[""] != nil {
                 ScrollView {
+                    // one flat lazy list of the rows on screen: a folder of
+                    // thousands of files builds only the rows scrolled into view
                     LazyVStack(alignment: .leading, spacing: 1) {
-                        ForEach(children) { node in
-                            FileTreeNodeView(
-                                node: node,
-                                selectedPath: selectedPath,
-                                selectedDirectory: selectedDirectory,
-                                selectionMode: selectionMode,
-                                checkedPaths: $checkedPaths,
-                                expandedPaths: $expandedPaths,
-                                openFile: { path in Task { await openFile(path) } },
-                                selectDirectory: { selectedDirectory = $0 },
-                                perform: perform
-                            )
+                        ForEach(visibleRows) { row in
+                            if let node = row.node {
+                                FileTreeRow(
+                                    node: node,
+                                    depth: row.depth,
+                                    isExpanded: expandedPaths.contains(node.path),
+                                    selectedPath: selectedPath,
+                                    selectedDirectory: selectedDirectory,
+                                    selectionMode: selectionMode,
+                                    checkedPaths: $checkedPaths,
+                                    toggle: toggleExpansion,
+                                    openFile: { path in Task { await openFile(path) } },
+                                    selectDirectory: { selectedDirectory = $0 },
+                                    perform: perform
+                                )
+                            } else {
+                                Text(row.note ?? "")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.tertiary)
+                                    .padding(.leading, CGFloat(row.depth) * FileTreeRow.indent + 24)
+                                    .padding(.vertical, 3)
+                            }
                         }
                     }
                     .padding(.horizontal, 6)
@@ -612,6 +630,7 @@ struct FileBrowserView: View {
         }
         .padding(26)
         .frame(width: 520)
+        .task { await loadWritableDirectories() }
     }
 
     private var trimmedDestination: String {
@@ -625,9 +644,16 @@ struct FileBrowserView: View {
         writableDirectories.contains(trimmedDestination)
     }
 
-    /// Every folder an upload or a move may target, newest tree first.
-    private var writableDirectories: [String] {
-        (tree?.children ?? []).flatMap(\.writableDirectoryPaths)
+    /// Every folder an upload or a move may target — raw/docs and wiki, folders
+    /// only, read when the picker opens rather than kept with the tree.
+    private func loadWritableDirectories() async {
+        var found: [String] = []
+        for root in ["raw/docs", "wiki"] {
+            if let subtree = try? await model.client().tree(path: root, directoriesOnly: true) {
+                found += subtree.flattenedDirectoryPaths
+            }
+        }
+        writableDirectories = found
     }
 
     private func destinationTitle(_ purpose: DestinationPurpose) -> String {
@@ -737,17 +763,87 @@ struct FileBrowserView: View {
         await openFile(requested ?? "wiki/index.md")
     }
 
+    /// Re-read the folders on screen — the root and every open folder, one
+    /// level each. A folder out of sight is listed again when it opens; one
+    /// that is gone closes.
     private func loadTree() async {
         isLoading = true
         defer { isLoading = false }
+        var fresh: [String: [TreeNode]] = [:]
         do {
-            let loadedTree = try await model.client().tree()
-            tree = loadedTree
-            let directoryPaths = Set(loadedTree.flattenedDirectoryPaths)
-            expandedPaths.formIntersection(directoryPaths)
-            if directoryPaths.contains("wiki") { expandedPaths.insert("wiki") }
+            fresh[""] = try await model.client().tree(path: "", depth: 1).children ?? []
         } catch {
             model.showError(error, prefix: "Files")
+            return
+        }
+        for path in expandedPaths.filter(isOnScreen).sorted() {
+            if let entries = try? await model.client().tree(path: path, depth: 1).children {
+                fresh[path] = entries
+            } else {
+                expandedPaths.remove(path)
+            }
+        }
+        listings = fresh
+        if fresh[""]?.contains(where: { $0.path == "wiki" }) == true { expandedPaths.insert("wiki") }
+    }
+
+    /// List the open folders on screen that have no listing yet: a folder is
+    /// fetched when it opens.
+    private func listOpenFolders() async {
+        guard listings[""] != nil, !isLoading else { return }
+        for path in expandedPaths.filter({ isOnScreen($0) && listings[$0] == nil }).sorted() {
+            await list(path)
+        }
+    }
+
+    /// One folder's own entries. A folder that is gone closes.
+    private func list(_ path: String) async {
+        do {
+            listings[path] = try await model.client().tree(path: path, depth: 1).children ?? []
+        } catch {
+            guard !Task.isCancelled else { return }
+            expandedPaths.remove(path)
+        }
+    }
+
+    /// Whether a folder's rows are on screen: it and every folder above it are open.
+    private func isOnScreen(_ path: String) -> Bool {
+        let parts = path.split(separator: "/")
+        return parts.indices.allSatisfy { expandedPaths.contains(parts[...$0].joined(separator: "/")) }
+    }
+
+    /// The tree as it shows: every listed entry under open folders, depth
+    /// first, and a note where an open folder is still being listed or is empty.
+    private var visibleRows: [TreeRow] {
+        var rows: [TreeRow] = []
+        func add(_ folder: String, depth: Int) {
+            guard let entries = listings[folder] else {
+                rows.append(TreeRow(id: "\(folder)/·loading", depth: depth, node: nil, note: L("Loading…")))
+                return
+            }
+            if entries.isEmpty {
+                rows.append(TreeRow(id: "\(folder)/·empty", depth: depth, node: nil, note: L("Empty folder")))
+            }
+            for entry in entries {
+                rows.append(TreeRow(id: entry.id, depth: depth, node: entry, note: nil))
+                if entry.kind == .dir, expandedPaths.contains(entry.path) { add(entry.path, depth: depth + 1) }
+            }
+        }
+        add("", depth: 0)
+        return rows
+    }
+
+    private func toggleExpansion(_ path: String) {
+        if expandedPaths.contains(path) { expandedPaths.remove(path) } else { expandedPaths.insert(path) }
+    }
+
+    /// Bring a path's row into the tree: open the folders above it, and list
+    /// its folder again when that listing predates the file.
+    private func showInTree(_ path: String) async {
+        let parent = parentDirectory(of: path)
+        expand(parent)
+        if let entries = listings[parent], !entries.contains(where: { $0.path == path }) {
+            await list(parent)
         }
     }
 
@@ -831,7 +927,7 @@ struct FileBrowserView: View {
     /// Open another file, remembering this one and where in it the reader was, for ‹.
     private func leave(for path: String, returningTo block: Int?) async {
         let origin = selectedPath.map { FileReturn(path: $0, block: block) }
-        expand(parentDirectory(of: path))
+        await showInTree(path)
         await openFile(path)
         guard let origin, selectedPath == path else { return }
         backTrail.append(origin)
@@ -841,7 +937,7 @@ struct FileBrowserView: View {
     /// Back to the file a link was followed from, at the block the link sat in.
     private func goBack() async {
         guard let last = backTrail.popLast() else { return }
-        expand(parentDirectory(of: last.path))
+        await showInTree(last.path)
         await openFile(last.path)
         guard selectedPath == last.path else { return }
         scrollTarget = last.block.map(MarkdownScrollTarget.block)
@@ -905,14 +1001,21 @@ struct FileBrowserView: View {
 
     private func beginNewFile(in directory: String) {
         let folder = directory.isEmpty ? "wiki" : directory
-        newFilePath = "\(folder)/\(freeName(in: folder, base: "new-note", ext: ".md"))"
-        activeSheet = .newFile
+        Task {
+            // the suggested name must be free, so the folder is listed first
+            if listings[folder] == nil { await list(folder) }
+            newFilePath = "\(folder)/\(freeName(in: folder, base: "new-note", ext: ".md"))"
+            activeSheet = .newFile
+        }
     }
 
     private func beginNewFolder(in directory: String) {
         let folder = directory.isEmpty ? "wiki" : directory
-        newFolderPath = "\(folder)/\(freeName(in: folder, base: "new-folder"))"
-        activeSheet = .newFolder
+        Task {
+            if listings[folder] == nil { await list(folder) }
+            newFolderPath = "\(folder)/\(freeName(in: folder, base: "new-folder"))"
+            activeSheet = .newFolder
+        }
     }
 
     private func beginRename(_ path: String) {
@@ -949,9 +1052,9 @@ struct FileBrowserView: View {
         case .move:
             askDestination(for: .moveNode(node.path))
         case .delete:
-            deleteTarget = DeleteTarget(path: node.path, isDirectory: node.kind == .dir, fileCount: node.fileCount)
+            Task { await askToDelete(node) }
         case .select:
-            selectFiles(node.kind == .file ? (node.isWritable ? [node.path] : []) : node.writableFilePaths)
+            Task { await selectAll(under: node) }
         case .copyPath:
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(node.path, forType: .string)
@@ -959,10 +1062,41 @@ struct FileBrowserView: View {
         }
     }
 
+    /// A folder's listing is one level, so what goes with it is counted when
+    /// its delete is asked for.
+    private func askToDelete(_ node: TreeNode) async {
+        guard node.kind == .dir else {
+            deleteTarget = DeleteTarget(path: node.path, isDirectory: false, fileCount: 1)
+            return
+        }
+        do {
+            let subtree = try await model.client().tree(path: node.path)
+            deleteTarget = DeleteTarget(path: node.path, isDirectory: true, fileCount: subtree.fileCount)
+        } catch {
+            model.showError(error, prefix: "Delete failed")
+        }
+    }
+
+    /// Tick a file, or every writable file at or below a folder — its whole
+    /// subtree, read when asked.
+    private func selectAll(under node: TreeNode) async {
+        guard node.kind == .dir else {
+            selectFiles(node.isWritable ? [node.path] : [])
+            return
+        }
+        do {
+            let paths = try await model.client().tree(path: node.path).writableFilePaths
+            if paths.isEmpty { model.showToast("Nothing in \(node.path)/ can be selected") }
+            selectFiles(paths)
+        } catch {
+            model.showError(error, prefix: "Select failed")
+        }
+    }
+
     /// A default name nothing in `directory` is using yet, so creating two
-    /// notes in a row cannot quietly overwrite the first.
+    /// notes in a row cannot quietly overwrite the first. The folder is listed first.
     private func freeName(in directory: String, base: String, ext: String = "") -> String {
-        let siblings = Set((node(at: directory)?.children ?? []).map(\.name))
+        let siblings = Set((listings[directory] ?? []).map(\.name))
         var candidate = base + ext
         var index = 2
         while siblings.contains(candidate) {
@@ -972,19 +1106,10 @@ struct FileBrowserView: View {
         return candidate
     }
 
-    /// The node at a path, for the questions only the loaded tree can answer:
-    /// is this a folder, what is already in it.
+    /// The node at a path, from its folder's listing — whether a row someone
+    /// right-clicked is a folder.
     private func node(at path: String) -> TreeNode? {
-        func find(_ node: TreeNode) -> TreeNode? {
-            if node.path == path { return node }
-            guard node.path.isEmpty || path.hasPrefix("\(node.path)/") else { return nil }
-            for child in node.children ?? [] {
-                if let hit = find(child) { return hit }
-            }
-            return nil
-        }
-        guard let tree else { return nil }
-        return find(tree)
+        listings[parentDirectory(of: path)]?.first { $0.path == path }
     }
 
     private func name(of path: String) -> String {
@@ -1408,13 +1533,28 @@ private enum NodeAction {
     case copyPath
 }
 
-private struct FileTreeNodeView: View {
+/// One row of the file tree as it shows: an entry, or a note in a folder that
+/// is still being listed or is empty.
+private struct TreeRow: Identifiable {
+    let id: String
+    let depth: Int
+    let node: TreeNode?
+    let note: String?
+}
+
+/// One entry of the tree, indented to its depth — a flat row rather than a
+/// nested group, so the list builds only the rows scrolled into view.
+private struct FileTreeRow: View {
+    static let indent: CGFloat = 13
+
     let node: TreeNode
+    let depth: Int
+    let isExpanded: Bool
     let selectedPath: String?
     let selectedDirectory: String?
     let selectionMode: Bool
     @Binding var checkedPaths: Set<String>
-    @Binding var expandedPaths: Set<String>
+    let toggle: (String) -> Void
     let openFile: (String) -> Void
     let selectDirectory: (String) -> Void
     let perform: (NodeAction, TreeNode) -> Void
@@ -1422,34 +1562,14 @@ private struct FileTreeNodeView: View {
     @ViewBuilder
     var body: some View {
         if node.kind == .dir {
-            DisclosureGroup(isExpanded: expansionBinding) {
-                if let children = node.children {
-                    ForEach(children) { child in
-                        FileTreeNodeView(
-                            node: child,
-                            selectedPath: selectedPath,
-                            selectedDirectory: selectedDirectory,
-                            selectionMode: selectionMode,
-                            checkedPaths: $checkedPaths,
-                            expandedPaths: $expandedPaths,
-                            openFile: openFile,
-                            selectDirectory: selectDirectory,
-                            perform: perform
-                        )
-                    }
-                    .padding(.leading, 13)
+            rowLabel
+                // one click both picks the folder new items go into and
+                // opens it — the two things a click on a folder can mean
+                .onTapGesture {
+                    selectDirectory(node.path)
+                    toggle(node.path)
                 }
-            } label: {
-                rowLabel
-                    .contentShape(Rectangle())
-                    // one click both picks the folder new items go into and
-                    // opens it — the two things a click on a folder can mean
-                    .onTapGesture {
-                        selectDirectory(node.path)
-                        toggleExpansion()
-                    }
-                    .contextMenu { directoryMenu }
-            }
+                .contextMenu { directoryMenu }
         } else if selectionMode {
             rowLabel
                 .onTapGesture { toggleChecked() }
@@ -1471,9 +1591,8 @@ private struct FileTreeNodeView: View {
             Button(L("Upload folder here…")) { perform(.uploadFolder, node) }
             Divider()
         }
-        let writable = node.writableFilePaths
-        Button(writable.count == 1 ? L("Select 1 file here") : L("Select %@ files here", String(writable.count))) { perform(.select, node) }
-            .disabled(writable.isEmpty)
+        // what is below is read when asked: the folder's listing is one level
+        Button(L("Select the files here")) { perform(.select, node) }
         Button(L("Copy path")) { perform(.copyPath, node) }
         if node.isMovable {
             Divider()
@@ -1498,21 +1617,6 @@ private struct FileTreeNodeView: View {
         }
     }
 
-    private var expansionBinding: Binding<Bool> {
-        Binding(
-            get: { expandedPaths.contains(node.path) },
-            set: { isExpanded in
-                if isExpanded { expandedPaths.insert(node.path) }
-                else { expandedPaths.remove(node.path) }
-            }
-        )
-    }
-
-    private func toggleExpansion() {
-        if expandedPaths.contains(node.path) { expandedPaths.remove(node.path) }
-        else { expandedPaths.insert(node.path) }
-    }
-
     private var isChecked: Bool { checkedPaths.contains(node.path) }
 
     private func toggleChecked() {
@@ -1522,6 +1626,15 @@ private struct FileTreeNodeView: View {
 
     private var rowLabel: some View {
         HStack(spacing: 7) {
+            if node.kind == .dir {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .frame(width: 10)
+            } else {
+                Color.clear.frame(width: 10, height: 1)
+            }
             if selectionMode, node.kind == .file {
                 Image(systemName: isChecked ? "checkmark.square.fill" : "square")
                     .foregroundStyle(node.isWritable ? (isChecked ? Color.knodeCyan : Color.secondary) : Color.secondary.opacity(0.3))
@@ -1545,6 +1658,7 @@ private struct FileTreeNodeView: View {
         .contentShape(Rectangle())
         .opacity(selectionMode && node.kind == .file && !node.isWritable ? 0.45 : 1)
         .background(rowHighlight, in: RoundedRectangle(cornerRadius: 6))
+        .padding(.leading, CGFloat(depth) * Self.indent)
     }
 
     private var rowHighlight: Color {
@@ -1567,14 +1681,6 @@ private extension TreeNode {
     var flattenedDirectoryPaths: [String] {
         guard kind == .dir else { return [] }
         return [path] + (children ?? []).flatMap(\.flattenedDirectoryPaths)
-    }
-
-    /// Directories an upload or a move may target — what the destination
-    /// picker lists.
-    var writableDirectoryPaths: [String] {
-        guard kind == .dir else { return [] }
-        let here = isWritable ? [path] : []
-        return here + (children ?? []).flatMap(\.writableDirectoryPaths)
     }
 
     /// Every deletable file at or below this node — what "select all here" adds.

@@ -253,7 +253,8 @@ function loadWorkspaceData() {
   fileTrail.length = 0;
   paintBack();
   closeEntityPanel();
-  treeData = null;
+  listings.clear();
+  shownEntries.clear();
   selectedDir = null;
   expandedDirs.clear();
   expandedDirs.add('wiki');
@@ -1116,12 +1117,21 @@ let editing = false;
  * should not cost the reader their position in the page that cited it.
  */
 const fileTrail = [];
-let treeData = null;
+/**
+ * Each listed folder's own entries ('' is the workspace root). A workspace can
+ * hold tens of thousands of files, so a folder is listed when it opens, one
+ * level at a time, never the whole tree at once.
+ */
+const listings = new Map();
+/** How many rows a long folder shows before "show more". */
+const TREE_PAGE = 500;
+/** Long folders shown past their first page: folder → rows shown. */
+const shownEntries = new Map();
 /** The folder clicked in the tree — where new items and uploads land. */
 let selectedDir = null;
 /** Folders left open, kept across reloads so something just created stays in view. */
 const expandedDirs = new Set(['wiki']);
-/** Linked folders in the tree: mirror path → the folder on this Mac it is mirrored from. Filled by loadTree. */
+/** Linked folders in the tree: mirror path → the folder on this Mac it is mirrored from. Every listing carries them. */
 const linkedDests = new Map();
 /** The folder on this Mac a path is mirrored from, or null — everything under a linked mirror is. */
 function mirroredSource(path) {
@@ -1149,22 +1159,9 @@ function targetDir() {
 /** The same folder, kept to one an upload may actually land in. */
 const uploadTarget = () => (isWritable(targetDir()) ? targetDir() : 'raw/docs');
 
-function nodeAt(path) {
-  const find = (node) => {
-    if (node.path === path) return node;
-    if (node.path && !path.startsWith(`${node.path}/`)) return null;
-    for (const child of node.children || []) {
-      const hit = find(child);
-      if (hit) return hit;
-    }
-    return null;
-  };
-  return treeData ? find(treeData) : null;
-}
-
-/** A default name nothing in the folder uses yet, so two creates cannot collide. */
+/** A default name nothing in the folder uses yet, so two creates cannot collide. List the folder first. */
 function freeName(dir, base, ext = '') {
-  const taken = new Set((nodeAt(dir)?.children || []).map((c) => c.name));
+  const taken = new Set((listings.get(dir) || []).map((c) => c.name));
   let name = base + ext;
   for (let i = 2; taken.has(name); i += 1) name = `${base}-${i}${ext}`;
   return name;
@@ -1172,54 +1169,139 @@ function freeName(dir, base, ext = '') {
 
 const fileCount = (node) => (node.kind === 'file' ? 1 : (node.children || []).reduce((n, c) => n + fileCount(c), 0));
 
+/** How many files a folder holds at any depth, or null when it cannot be read — asked when a delete needs it. */
+async function filesUnder(path) {
+  try {
+    return fileCount(await api(`/api/tree?path=${encodeURIComponent(path)}`));
+  } catch {
+    return null;
+  }
+}
+
+/** One folder's entries from the service, or null when the folder is gone. */
+async function fetchListing(dir) {
+  try {
+    const node = await api(`/api/tree?path=${encodeURIComponent(dir || '.')}&depth=1`);
+    linkedDests.clear();
+    for (const link of node.links || []) linkedDests.set(link.path, link.source);
+    return node.children || [];
+  } catch {
+    return null;
+  }
+}
+
+/** A folder's entries, listing it if nothing has yet; null when it is gone. */
+async function ensureListing(dir) {
+  if (!listings.has(dir)) {
+    const entries = await fetchListing(dir);
+    if (entries) listings.set(dir, entries);
+  }
+  return listings.get(dir) || null;
+}
+
+/** Whether a folder's rows are on screen: it and every folder above it are open. */
+function isOnScreen(dir) {
+  const parts = dir.split('/');
+  return parts.every((_, i) => expandedDirs.has(parts.slice(0, i + 1).join('/')));
+}
+
 /** Reveal a path by opening it and every folder above it. */
 function reveal(path) {
   const parts = path.split('/').filter(Boolean);
   for (let i = 1; i <= parts.length; i += 1) expandedDirs.add(parts.slice(0, i).join('/'));
 }
 
-function renderTree(node, container) {
-  if (!node.children) return;
-  for (const child of node.children) {
-    const div = document.createElement('div');
-    div.className = child.kind === 'dir' ? 'tree-dir' : 'tree-file';
+/** Redraw the tree from the listings: the root's rows, and each open folder's inside it. */
+function renderTree() {
+  const el = $('#filetree');
+  el.innerHTML = '';
+  renderEntries('', el);
+  paintDestination();
+}
+
+/**
+ * A folder's rows, a page at a time, listing the folder first when nothing
+ * has: opening a folder of thousands of files costs one request and a page of
+ * rows, not the whole tree.
+ */
+function renderEntries(dir, container) {
+  const entries = listings.get(dir);
+  if (!entries) {
+    container.innerHTML = '<div class="tree-note">loading…</div>';
+    ensureListing(dir).then((list) => {
+      container.innerHTML = list ? '' : '<div class="tree-note">could not list this folder</div>';
+      if (list) renderEntries(dir, container);
+    });
+    return;
+  }
+  if (entries.length === 0) {
+    container.innerHTML = '<div class="tree-note">empty</div>';
+    return;
+  }
+  const shown = Math.min(entries.length, shownEntries.get(dir) || TREE_PAGE);
+  for (const child of entries.slice(0, shown)) container.appendChild(treeRow(child));
+  if (shown < entries.length) {
+    const more = document.createElement('div');
+    more.className = 'tree-more';
     const label = document.createElement('span');
     label.className = 'tree-label';
-    label.dataset.path = child.path;
-    div.appendChild(label);
-    if (child.kind === 'dir') {
-      const kids = document.createElement('div');
-      kids.className = 'tree-children';
-      renderTree(child, kids);
-      div.appendChild(kids);
-      if (!expandedDirs.has(child.path)) div.classList.add('collapsed');
-      if (child.path === selectedDir) label.classList.add('picked');
-      const paint = () => {
-        label.textContent = `${div.classList.contains('collapsed') ? '▸' : '▾'} ${child.name}${child.linked ? ' 🔗' : ''}`;
-      };
-      if (child.linked) label.title = `linked to ${child.linked} — mirrored from there and kept in sync; edit the originals, not these copies`;
-      paint();
-      label.addEventListener('click', () => {
-        // one click both picks the folder new items go into and opens it
-        pickDir(child.path);
-        div.classList.toggle('collapsed');
-        if (div.classList.contains('collapsed')) expandedDirs.delete(child.path);
-        else expandedDirs.add(child.path);
-        paint();
-      });
-    } else {
-      label.textContent = `· ${child.name}`;
-      if (child.path === currentFile) label.classList.add('selected');
-      label.addEventListener('click', () => openFile(child.path, label));
-    }
-    label.addEventListener('contextmenu', (ev) => {
-      ev.preventDefault();
-      // the dismisser on document would otherwise close the menu we just opened
-      ev.stopPropagation();
-      showMenu(ev.clientX, ev.clientY, nodeMenu(child));
+    label.textContent = `… ${entries.length - shown} more — show ${Math.min(TREE_PAGE, entries.length - shown)}`;
+    label.addEventListener('click', () => {
+      shownEntries.set(dir, shown + TREE_PAGE);
+      container.innerHTML = '';
+      renderEntries(dir, container);
     });
-    container.appendChild(div);
+    more.appendChild(label);
+    container.appendChild(more);
   }
+}
+
+function treeRow(child) {
+  const div = document.createElement('div');
+  div.className = child.kind === 'dir' ? 'tree-dir' : 'tree-file';
+  const label = document.createElement('span');
+  label.className = 'tree-label';
+  label.dataset.path = child.path;
+  div.appendChild(label);
+  if (child.kind === 'dir') {
+    const kids = document.createElement('div');
+    kids.className = 'tree-children';
+    div.appendChild(kids);
+    // a folder's rows are made when it opens, not before
+    if (expandedDirs.has(child.path)) renderEntries(child.path, kids);
+    else div.classList.add('collapsed');
+    if (child.path === selectedDir) label.classList.add('picked');
+    const paint = () => {
+      label.textContent = `${div.classList.contains('collapsed') ? '▸' : '▾'} ${child.name}${child.linked ? ' 🔗' : ''}`;
+    };
+    if (child.linked) label.title = `linked to ${child.linked} — mirrored from there and kept in sync; edit the originals, not these copies`;
+    paint();
+    label.addEventListener('click', () => {
+      // one click both picks the folder new items go into and opens it
+      pickDir(child.path);
+      div.classList.toggle('collapsed');
+      if (div.classList.contains('collapsed')) expandedDirs.delete(child.path);
+      else {
+        expandedDirs.add(child.path);
+        if (!kids.querySelector('.tree-dir, .tree-file')) {
+          kids.innerHTML = '';
+          renderEntries(child.path, kids);
+        }
+      }
+      paint();
+    });
+  } else {
+    label.textContent = `· ${child.name}`;
+    if (child.path === currentFile) label.classList.add('selected');
+    label.addEventListener('click', () => openFile(child.path, label));
+  }
+  label.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();
+    // the dismisser on document would otherwise close the menu we just opened
+    ev.stopPropagation();
+    showMenu(ev.clientX, ev.clientY, nodeMenu(child));
+  });
+  return div;
 }
 
 /** What a right-click on a row offers, for that row — never for what is selected elsewhere. */
@@ -1277,18 +1359,35 @@ function paintDestination() {
   $('#btn-clear-dir').hidden = !selectedDir;
 }
 
+/**
+ * Re-read the folders on screen — the root and every open folder, one level
+ * each — and redraw. A folder out of sight is listed again when it opens.
+ */
 async function loadTree() {
-  treeData = await api('/api/tree');
-  linkedDests.clear();
-  const collect = (node) => {
-    if (node.linked) linkedDests.set(node.path, node.linked);
-    for (const child of node.children || []) collect(child);
-  };
-  collect(treeData);
-  const el = $('#filetree');
-  el.innerHTML = '';
-  renderTree(treeData, el);
-  paintDestination();
+  const open = ['', ...[...expandedDirs].filter(isOnScreen)];
+  const lists = await Promise.all(open.map(fetchListing));
+  listings.clear();
+  open.forEach((dir, i) => {
+    if (lists[i]) listings.set(dir, lists[i]);
+    else expandedDirs.delete(dir);
+  });
+  renderTree();
+}
+
+/** Bring a path's row on screen: open the folders above it, listing only what is not listed yet. */
+async function showInTree(path) {
+  const parent = parentDir(path);
+  reveal(parent);
+  const parts = parent.split('/').filter(Boolean);
+  await Promise.all(['', ...parts.map((_, i) => parts.slice(0, i + 1).join('/'))].map(ensureListing));
+  // a file made since its folder was listed: list the folder again
+  if (!(listings.get(parent) || []).some((c) => c.path === path)) {
+    const fresh = await fetchListing(parent);
+    if (fresh) listings.set(parent, fresh);
+  }
+  const index = (listings.get(parent) || []).findIndex((c) => c.path === path);
+  if (index >= (shownEntries.get(parent) || TREE_PAGE)) shownEntries.set(parent, Math.ceil((index + 1) / TREE_PAGE) * TREE_PAGE);
+  renderTree();
 }
 
 async function copyPath(path) {
@@ -1302,6 +1401,7 @@ async function copyPath(path) {
 
 async function newFile(dir) {
   const folder = isWritable(dir) ? dir : 'wiki';
+  await ensureListing(folder);
   const suggested = `${folder}/${freeName(folder, 'new-note', '.md')}`;
   const path = prompt('New file path (under wiki/ or raw/docs/):', suggested);
   if (!path) return;
@@ -1322,6 +1422,7 @@ async function newFile(dir) {
 
 async function newFolder(dir) {
   const folder = isWritable(dir) ? dir : 'wiki';
+  await ensureListing(folder);
   const suggested = `${folder}/${freeName(folder, 'new-folder')}`;
   const path = prompt('New folder path (under wiki/ or raw/docs/):', suggested);
   if (!path) return;
@@ -1414,9 +1515,11 @@ async function moveSubtree(from, to) {
 }
 
 async function deleteNode(node) {
-  const files = fileCount(node);
+  // the folder's own listing is one level: what goes with it is counted now
+  const files = node.kind === 'dir' ? await filesUnder(node.path) : 1;
+  const inside = files === null ? 'everything' : `the ${files} file${files === 1 ? '' : 's'}`;
   const question = node.kind === 'dir'
-    ? `Delete ${node.path}/ and the ${files} file${files === 1 ? '' : 's'} inside it?`
+    ? `Delete ${node.path}/ and ${inside} inside it?`
     : `Delete ${node.path}?`;
   if (!confirm(question)) return;
   try {
@@ -1424,7 +1527,7 @@ async function deleteNode(node) {
     forget(node.path);
     await loadTree();
     loadStats();
-    toast(node.kind === 'dir' ? `deleted ${node.path}/ — ${files} file${files === 1 ? '' : 's'}` : `deleted ${node.path}`);
+    toast(node.kind === 'dir' ? `deleted ${node.path}/ — ${files === null ? 'and its files' : `${files} file${files === 1 ? '' : 's'}`}` : `deleted ${node.path}`);
   } catch (e) {
     toast(`delete failed: ${e.message}`);
   }
@@ -1740,8 +1843,7 @@ async function followTo(path, fragment = null) {
     fileTrail.push({ path: currentFile, scrollTop: $('#file-view').scrollTop });
     if (fileTrail.length > 50) fileTrail.shift();
   }
-  reveal(parentDir(path));
-  await loadTree();
+  await showInTree(path);
   await openFile(path, null, fragment);
   paintBack();
 }
@@ -1750,8 +1852,7 @@ $('#btn-back').addEventListener('click', async () => {
   const last = fileTrail.pop();
   paintBack();
   if (!last) return;
-  reveal(parentDir(last.path));
-  await loadTree();
+  await showInTree(last.path);
   await openFile(last.path);
   $('#file-view').scrollTop = last.scrollTop;
 });
@@ -1977,8 +2078,9 @@ async function syncLinkedFolder(dest) {
 
 async function unlinkFolderNode(node, removeFiles) {
   const source = linkedDests.get(node.path);
+  const files = removeFiles ? await filesUnder(node.path) : null;
   const question = removeFiles
-    ? `Unlink ${node.path} from ${source} and delete the ${fmtCount(fileCount(node), 'copied file')}?\n\nTheir knowledge is disposed (history stays in the ledger). The originals are not touched.`
+    ? `Unlink ${node.path} from ${source} and delete the ${files === null ? 'copied files' : fmtCount(files, 'copied file')}?\n\nTheir knowledge is disposed (history stays in the ledger). The originals are not touched.`
     : `Unlink ${node.path} from ${source}?\n\nThe copies stay as ordinary documents and stop following the source.`;
   if (!confirm(question)) return;
   toast(removeFiles ? `unlinking and removing ${node.path}…` : `unlinking ${node.path}…`, 600000);

@@ -322,6 +322,9 @@ describe('folder import over the API', () => {
     const t = await tree();
     expect(findNode(t, 'raw/docs/finance/exports')?.linked).toBe(source);
     expect(findNode(t, 'raw/docs/finance')?.linked).toBeUndefined();
+    // a listing one level down still says which folders are mirrors, for files under one not listed yet
+    const top = await (await app.request('/api/tree?path=wiki&depth=1', { headers })).json();
+    expect(top.links).toEqual([{ path: 'raw/docs/finance/exports', source }]);
 
     const mirrored = 'raw/docs/finance/exports/xueqiu/2026-09.md';
     const put = await app.request('/api/file', { method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ path: mirrored, content: '# overwritten' }) });
