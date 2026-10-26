@@ -83,7 +83,8 @@ interface ClaimLite {
   members: number;
   tx_from: string | Date;
   source_path: string | null;
-  excerpt: string | null;
+  /** Its chunk, whose text the Judge stage shows as the excerpt (chunkTexts). */
+  chunk_id: string | null;
 }
 
 interface Pair {
@@ -379,12 +380,11 @@ export async function auditDuplicateClaims(
     `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(oe.canonical_id, c.object_id) AS object,
             se.name AS subject_name, c.statement, c.status, c.kind, c.type, c.valid_from, c.valid_to, c.event_at,
             c.evidence_count, (SELECT count(*)::int FROM claims m WHERE m.canonical_id = c.id) AS members,
-            c.tx_from, s.key AS source_path, ch.content AS excerpt
+            c.tx_from, s.key AS source_path, c.chunk_id
      FROM claims c
      JOIN entities se ON se.id = c.subject_id
      LEFT JOIN entities oe ON oe.id = c.object_id
      LEFT JOIN scopes s ON s.id = c.primary_scope_id
-     LEFT JOIN chunks ch ON ch.id = c.chunk_id
      WHERE c.tx_to IS NULL AND c.canonical_id IS NULL AND c.status <> 'absent'`,
   );
   const byId = new Map(claims.map((c) => [c.id, c]));
@@ -520,7 +520,8 @@ export async function auditDuplicateClaims(
     stats.deferred = toJudge.length - sent.length;
     const batches: Pair[][] = [];
     for (let i = 0; i < sent.length; i += per) batches.push(sent.slice(i, i + per));
-    const answers = batches.length ? await judge.run(batches.map(judgeCall)) : [];
+    const excerpts = await chunkTexts(store, sent.flatMap((p) => [p.a.chunk_id, p.b.chunk_id]));
+    const answers = batches.length ? await judge.run(batches.map((batch) => judgeCall(batch, excerpts))) : [];
     answers.forEach((answer, i) => {
       const batch = batches[i];
       try {
@@ -677,19 +678,34 @@ Judge only from the statements, their dates and the excerpts. Figures that agree
 For same, keep is the clearer and more complete claim ("a" or "b"). confidence is 0–1. reason: one sentence in the claims' language.
 Respond with JSON only: {"verdicts":[{"pair":1,"relation":"same|contains|conflict|different_time|unrelated","keep":"a|b","confidence":0.0,"reason":"…"}]}`;
 
-function describeClaim(label: string, c: ClaimLite): string {
+/**
+ * The text of these chunks: the Judge stage's excerpts, read for the claims it
+ * is shown alone. Read with every claim they held 0.9 GB through the whole
+ * nightly audit (finance, 2026-10-26: 466 million characters for 499,865
+ * claims), for at most 2 × claimMergeMaxJudgedPerRun claims shown 300
+ * characters each.
+ */
+async function chunkTexts(store: Store, ids: (string | null)[]): Promise<Map<string, string>> {
+  const wanted = [...new Set(ids.filter((id): id is string => Boolean(id)))];
+  if (wanted.length === 0) return new Map();
+  const rows = await store.query<{ id: string; content: string }>(`SELECT id, content FROM chunks WHERE id = ANY($1::text[])`, [wanted]);
+  return new Map(rows.map((r) => [r.id, r.content]));
+}
+
+function describeClaim(label: string, c: ClaimLite, excerpts: Map<string, string>): string {
   const when = [toDateString(c.event_at) && `event ${toDateString(c.event_at)}`, toDateString(c.valid_from) && `holds ${toDateString(c.valid_from)} ~ ${toDateString(c.valid_to) ?? ''}`]
     .filter(Boolean).join('; ');
+  const excerpt = c.chunk_id ? excerpts.get(c.chunk_id) : undefined;
   return [
     `${label}: "${c.statement}"`,
     `   type: ${c.type}; kind: ${c.kind}; status: ${c.status}${when ? `; ${when}` : ''}; source: ${c.source_path ?? 'unknown'}`,
-    c.excerpt ? `   excerpt: ${c.excerpt.replace(/\s+/g, ' ').slice(0, 300)}` : null,
+    excerpt ? `   excerpt: ${excerpt.replace(/\s+/g, ' ').slice(0, 300)}` : null,
   ].filter(Boolean).join('\n');
 }
 
-/** The Judge stage's call for one batch of pairs. */
-function judgeCall(batch: Pair[]): JudgeCall {
-  const user = batch.map((p, i) => `Pair ${i + 1} — subject: ${p.a.subject_name}\n${describeClaim('A', p.a)}\n${describeClaim('B', p.b)}`).join('\n\n');
+/** The Judge stage's call for one batch of pairs; `excerpts` by chunk id (chunkTexts). */
+function judgeCall(batch: Pair[], excerpts: Map<string, string>): JudgeCall {
+  const user = batch.map((p, i) => `Pair ${i + 1} — subject: ${p.a.subject_name}\n${describeClaim('A', p.a, excerpts)}\n${describeClaim('B', p.b, excerpts)}`).join('\n\n');
   return {
     label: `${batch.length} claim pair${batch.length === 1 ? '' : 's'} of ${batch[0].a.subject_name}`,
     messages: [{ role: 'system', content: JUDGE_SYSTEM }, { role: 'user', content: user }],
