@@ -133,7 +133,7 @@ describe('the duplicate-claim audit at scale', () => {
     expect(shown.sort()).toEqual([pairLabel(statement(0), statement(1)), pairLabel(statement(2), statement(3))].sort());
   });
 
-  it('compares a subject\'s claims by embedding with the whole subject bound as one array', async () => {
+  it('compares a subject\'s claims by embedding in one query, binding the subject\'s ids once', async () => {
     const { store } = ctx;
     const others = Array.from({ length: 40 }, (_, i) => `乙公司第${i}家门店开业`);
     const twins = ['乙公司计划扩大海外产能', '乙公司打算扩充在海外的生产能力'];
@@ -163,13 +163,12 @@ describe('the duplicate-claim audit at scale', () => {
       const stats = await auditDuplicateClaims({ store, embedder, config, llm: recordingJudge(shown) }, { focus });
       expect(stats).toMatchObject({ embedded: focus.length, candidates: 1 });
       expect(shown).toEqual([pairLabel(twins[0], twins[1])]);
-      // two parameters per claim however many claims its subject has: the claim, and the rest of the subject as one array
-      const similarity = spy.mock.calls.filter(([sql]) => sql.includes('JOIN claim_embeddings b'));
-      expect(similarity).toHaveLength(focus.length);
-      for (const [, params] of similarity) {
-        expect(params).toHaveLength(2);
-        expect(params?.[1]).toHaveLength(focus.length - 1);
-      }
+      // not a query per claim with the rest of the subject each time: one for them all, the subject's ids bound once
+      const similarity = spy.mock.calls.filter(([sql]) => sql.includes('CROSS JOIN LATERAL'));
+      expect(similarity).toHaveLength(1);
+      const [[, params]] = similarity;
+      expect(params?.[0]).toEqual(focus);
+      expect([...(params?.[2] as string[])].sort()).toEqual([...focus].sort());
     } finally {
       spy.mockRestore();
     }
@@ -325,6 +324,107 @@ describe('the claim audit\'s per-run judge limit', () => {
     const later = await run(embedder, realVectors());
     expect(later.stats).toMatchObject({ embedded: 2, candidates: 1 });
     expect(later.shown).toEqual([pairLabel(twins[0], twins[1])]);
+  });
+});
+
+describe('the claim audit\'s nearest claims by embedding', () => {
+  const dataDir = path.join(tmp, 'nearest');
+  let ctx: AppContext;
+
+  beforeAll(async () => {
+    initDataDir(dataDir);
+    ctx = await createContext(dataDir);
+  });
+  afterAll(async () => {
+    await ctx?.datasources.closeAll();
+    await ctx?.store.close();
+  });
+
+  it('brings up what a query per claim would, comparing a block of claims at a time', async () => {
+    const { store } = ctx;
+    const dim = store.embeddingDim;
+    // seeded vectors: a topic's claims scatter around one direction, mostly reaching cosine 0.85 with each other
+    let seed = 7;
+    const random = () => (seed = (seed * 48271) % 2147483647) / 2147483647 - 0.5;
+    const claims: { id: string; subject: string; object: string | null; statement: string; v: number[] }[] = [];
+    const topic = (members: [subject: string, object: string | null][]) => {
+      const centre = Array.from({ length: dim }, random);
+      for (const [subject, object] of members) {
+        const k = claims.length;
+        claims.push({ id: `near-${String(k).padStart(4, '0')}`, subject, object, statement: `${subject}的第${k}条消息`, v: centre.map((x) => x + 0.4 * random()) });
+      }
+    };
+    const times = <T>(n: number, x: T): T[] => Array.from({ length: n }, () => x);
+    // one subject too big for one query, sixty small ones sharing queries, claims about a pair of
+    // subjects both ways (the swapped groups), and some about the big subject itself
+    const small = Array.from({ length: 60 }, (_, i) => `小公司${i}`);
+    for (let i = 0; i < 110; i++) topic(times(1 + (i % 9), ['大公司', null]));
+    topic(times(6, ['大公司', '大公司']));
+    for (const [i, s] of small.entries()) {
+      topic(times(1 + (i % 4), [s, null]));
+      topic(times(1 + (i % 3), [s, null]));
+      if (i < 30) topic([...times(1 + (i % 3), ['大公司', s] as [string, string]), ...times(1 + (i % 2), [s, '大公司'] as [string, string])]);
+      if (i < 20) topic([[s, small[i + 1]], [small[i + 1], s], [small[i + 1], s]]);
+    }
+    const subjects = [...new Set(claims.map((c) => c.subject))];
+    await store.query(`INSERT INTO entities (id, name, type, name_key) SELECT s, s, 'organization', s FROM unnest($1::text[]) AS s`, [subjects]);
+    await store.query(
+      `INSERT INTO claims (id, subject_id, object_id, statement) SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])`,
+      [claims.map((c) => c.id), claims.map((c) => c.subject), claims.map((c) => c.object), claims.map((c) => c.statement)],
+    );
+    const vectors = new Map(claims.map((c) => [`${c.subject}：${c.statement}`, c.v]));
+    const embedder: EmbeddingProvider = { model: 'test-vectors', dimensions: dim, embed: async (texts) => texts.map((t) => vectors.get(t)!) };
+    const config = { ...ctx.config, embedding: { ...ctx.config.embedding, provider: 'openai' as const }, review: { ...ctx.config.review, claimMergeMaxJudgedPerRun: 100_000 } };
+    const group = (key: (c: (typeof claims)[number]) => string | null) => {
+      const out = new Map<string, typeof claims>();
+      for (const c of claims) {
+        const k = key(c);
+        if (k !== null) (out.get(k) ?? out.set(k, []).get(k)!).push(c);
+      }
+      return out;
+    };
+    const bySubject = group((c) => c.subject);
+    const bySwapped = group((c) => (c.object ? `${c.object}|${c.subject}` : null));
+    // compared a slice at a time
+    expect(bySubject.get('大公司')!.length).toBeGreaterThan(400);
+
+    const spy = vi.spyOn(store, 'query');
+    const shown: string[] = [];
+    try {
+      const stats = await auditDuplicateClaims({ store, embedder, config, llm: recordingJudge(shown) });
+      expect(stats).toMatchObject({ embedded: claims.length, candidates: shown.length });
+      // a few queries instead of one per claim, none weighing more than 25,000 pairs or comparing
+      // with more than 400 claims
+      const similarity = spy.mock.calls.filter(([sql]) => sql.includes('CROSS JOIN LATERAL'));
+      expect(similarity.length).toBeLessThan(claims.length / 25);
+      for (const [, params] of similarity) {
+        const [ids, , others] = params as string[][];
+        expect(others.length).toBeLessThanOrEqual(400);
+        expect(ids.length * others.length).toBeLessThanOrEqual(25_000);
+      }
+    } finally {
+      spy.mockRestore();
+    }
+
+    // what one query per claim brings up, over the claim's subject and its swapped group (equal
+    // distances to the lower id), from the vectors the audit stored
+    const statementOf = new Map(claims.map((c) => [c.id, c.statement]));
+    const expected = new Set<string>();
+    for (const f of claims) {
+      const block = [...bySubject.get(f.subject)!, ...(bySwapped.get(`${f.subject}|${f.object}`) ?? [])].filter((c) => c.id !== f.id);
+      if (block.length === 0) continue;
+      const rows = await store.query<{ claim_id: string; sim: number }>(
+        `SELECT b.claim_id, (1 - (a.embedding <=> b.embedding))::float AS sim
+         FROM claim_embeddings a JOIN claim_embeddings b ON b.claim_id = ANY($2::text[])
+         WHERE a.claim_id = $1
+         ORDER BY a.embedding <=> b.embedding, b.claim_id COLLATE "C" LIMIT 5`,
+        [f.id, block.map((c) => c.id)],
+      );
+      for (const r of rows) if (r.sim >= 0.85) expected.add(pairLabel(f.statement, statementOf.get(r.claim_id)!));
+    }
+    expect(expected.size).toBeGreaterThan(300);
+    expect(shown.length).toBe(expected.size);
+    expect(new Set(shown)).toEqual(expected);
   });
 });
 
