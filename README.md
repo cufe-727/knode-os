@@ -1,6 +1,6 @@
 # knode-os
 
-> Local-first knowledge OS for coding agents — an auto-built **wiki** + **knowledge graph** + **vector recall** over your documents, your agents' traces, and the skills they use. One process, one folder, embedded Postgres.
+> Local-first knowledge OS for coding agents — an auto-built **wiki** + **knowledge graph** + **vector recall** over your documents, your agents' traces, and the skills they use. One process, one folder, one PostgreSQL + pgvector index.
 
 [简体中文](./README.zh-CN.md) · [Design overview](./docs/design/00-overview.md) · [Agent Context Database (v2)](./docs/design/05-agent-context-db.md) · [OKF compatibility](./docs/design/02-okf-compatibility.md) · [Obsidian compatibility](./docs/design/03-obsidian-vault.md)
 
@@ -9,7 +9,7 @@ knode-os combines two ideas — [llm_wiki](https://github.com/nashsu/llm_wiki)'s
 ## Highlights
 
 - **One command**: `knode-os serve` starts the web UI, the REST API, a file watcher, periodic trace sync, and the nightly dream.
-- **Your filesystem is the database.** A plain data directory (`raw/` + `wiki/`) you can read, edit, grep, and `git init`. The embedded [PGlite](https://pglite.dev) (Postgres + pgvector, WASM) index under `.knode/` is rebuildable at any time with `knode-os ingest`.
+- **Your filesystem is the database.** A plain data directory (`raw/` + `wiki/`) you can read, edit, grep, and `git init`. The index — PostgreSQL with [pgvector](https://github.com/pgvector/pgvector), one schema per workspace — is derived from it and can be rebuilt at any time with `knode-os rebuild`. For zero setup, opt into the embedded [PGlite](https://pglite.dev) (Postgres + pgvector in WASM) under `.knode/db` instead.
 - **Agent traces, collected automatically.** Claude Code (`~/.claude/projects`) and Codex CLI (`~/.codex/sessions`) session transcripts are mirrored into `raw/traces/`; used skills into `raw/skills/`. Traces feed the nightly dream analysis; they stay out of search until `trace.episodes` is on, which prepares each transcript as a searchable episode. Skills are searchable.
 - **Hybrid retrieval**: pgvector cosine recall + Postgres full-text + knowledge-graph signals, fused with RRF, plus a mild usage-heat boost. Works offline out of the box (built-in hashing embedder); plug in any OpenAI-compatible embedding endpoint for production quality.
 - **SAG multi-hop retrieval**: opt-in `chunk → entity → chunk` event expansion over the existing graph, vector coarse ranking, direct-route fallback, and an inspectable bridge-entity trace for every structural hit.
@@ -30,6 +30,10 @@ knode-os combines two ideas — [llm_wiki](https://github.com/nashsu/llm_wiki)'s
 
 ```bash
 pnpm install && pnpm build
+
+# the index lives in PostgreSQL with the pgvector extension, on 127.0.0.1:5432 unless the `database`
+# block of knode.config.json says otherwise (see Configure models). No server? Run init as
+# `KNODE_DATABASE_KIND=pglite node dist/cli.js init …` for the embedded zero-setup index instead.
 
 # initialize a data directory (default ~/.knode-os, or --data <path> / $KNODE_OS_DATA)
 node dist/cli.js init --data ~/knode-data
@@ -73,16 +77,16 @@ Install globally (`npm link` or `pnpm add -g .`) to use the `knode-os` binary di
 │   └── intents/        # intent specs: the slots an answer needs
 ├── plugins/            # optional: plugin modules named in knode.config.json (providers, converters, hooks)
 ├── ledger/             # events.jsonl (machine truth) + attic/ (sidecars of removed sources)
-└── .knode/             # derived PGlite index — safe to delete & reindex
+└── .knode/             # local state; with PGlite also the index itself (db/)
 ```
 
-Search results cite `raw/docs/...` paths — exactly what you uploaded. Text files are indexed from `raw/` directly (no copies); a PDF or image is converted once into `.sidecar/raw/docs/<file>/content.md`, and opening such a hit in the UI or through `knode_read` shows that Markdown. Unlike `.knode/`, the `.sidecar/` tree is not disposable: it holds paid LLM extraction results and usage history, and a rebuild replays them for free.
+Search results cite `raw/docs/...` paths — exactly what you uploaded. Text files are indexed from `raw/` directly (no copies); a PDF or image is converted once into `.sidecar/raw/docs/<file>/content.md`, and opening such a hit in the UI or through `knode_read` shows that Markdown. Unlike the index, the `.sidecar/` tree is not disposable: it holds paid LLM extraction results and usage history, and a rebuild replays them for free.
 
 When `serve` is used with the web UI, `--data` is the workspace root. A user can own multiple workspaces; every workspace is a complete independent data directory with the layout above:
 
 ```
 <data>/
-├── users/<username>/workspaces/<workspace-id>/  # private files, config, wiki and PGlite index
+├── users/<username>/workspaces/<workspace-id>/  # private files, config and wiki; the index is its own PostgreSQL schema
 └── teams/<team-name>/                         # shared by users who select the same Team name
 ```
 
@@ -110,7 +114,7 @@ CLI-only data directories continue to use `<data>/knode.config.json`:
     "dimensions": 1536
   },
   "database": {                      // where the derived index lives
-    "kind": "postgres",              // default: PostgreSQL (one shared database, a schema per workspace); "pglite" = embedded, zero setup
+    "kind": "postgres",              // default: PostgreSQL + pgvector (one shared database, a schema per workspace); "pglite" = embedded, zero setup
     "host": "127.0.0.1", "port": 5432,
     "user": "", "password": "",      // password also takes "env:VAR"; empty for trust/peer auth
     "url": "",                       // or one connection string instead (postgres://…, "env:VAR" too), with "ssl": "require" and "poolSize"
@@ -160,7 +164,7 @@ Any OpenAI-compatible endpoint works (Ollama, vLLM, SiliconFlow, …). `protocol
 
 **Plugins.** `provider` and `database.kind` name ids from a registry, and the built-ins are only its first entries ([docs/design/11](docs/design/11-plugins-and-udfs.md)). A module listed under `plugins` (or in `KNODE_PLUGINS`) may register an LLM provider for a vendor API knode-os does not speak, an embedding provider, a storage backend that reaches a Postgres some other way, a converter for another file type (`.docx`, `.epub`, …), and hooks at the processing stages: `source.text`, `chunk`, `tier0.concepts`, `extract.request`, `extract.result`, `summary.request`, `document.applied`. The `command` provider needs no plugin: `cliPath` names an executable that gets `{ messages, model, json, maxTokens, images }` on stdin and answers on stdout, with the connection's key in `KNODE_LLM_API_KEY`. `database.url` takes a connection string (`env:DATABASE_URL` too) with `ssl` and `poolSize`; `database.path` moves a PGlite index. `knode-os plugins` and `GET /api/config/providers` show what is registered. Walkthrough and examples: [docs/plugins.md](docs/plugins.md), [demo/plugins](demo/plugins/README.md).
 
-The index lives in PostgreSQL by default (set `KNODE_DATABASE_KIND=pglite` before the first run, or `database.kind: "pglite"`, for the embedded zero-setup index that the test suite also uses). With `postgres` the same schema sits on the server: all workspaces share one database and are isolated by schema, each created on first open. That is worth doing once a workspace outgrows PGlite's single-process 32-bit WASM build (roughly a million chunks) or when several processes must read one index at once. Schema-level isolation is deliberate — a database would carry its own ~8 MB catalog per workspace, while folding every workspace into shared tables keyed by a workspace column would cost the vector index outright: HNSW walks a distance-ordered neighbour graph, so an equality predicate on a scalar column cannot be pushed into the walk and the planner falls back to a sequential scan. Embedding vectors are stored as `halfvec`: pgvector caps an index entry at one 8 KB page, which is 2000 dims for `vector` but 4000 for `halfvec`, so half precision is what keeps the HNSW index reachable at 1536/2048 dims — and halves the table. Switching an existing database between the two column types converts in place without re-embedding.
+The index lives in PostgreSQL with pgvector by default: all workspaces share one database and are isolated by schema, each created on first open — so are the database and the `vector` extension when the server lacks them, which is why pgvector must be installed there. PGlite is the opt-in alternative: the same schema embedded in the process under `<workspace>/.knode/db`, with nothing to install — set `KNODE_DATABASE_KIND=pglite` before the first run, or `database.kind: "pglite"`; the test suite runs on it too. It suits small workspaces: it is a single-process 32-bit WASM build that tops out around a million chunks, lets one process at a time open the index, and answers queries on Node's event loop, so a long query holds up the whole server meanwhile. Schema-level isolation is deliberate — a database would carry its own ~8 MB catalog per workspace, while folding every workspace into shared tables keyed by a workspace column would cost the vector index outright: HNSW walks a distance-ordered neighbour graph, so an equality predicate on a scalar column cannot be pushed into the walk and the planner falls back to a sequential scan. Embedding vectors are stored as `halfvec`: pgvector caps an index entry at one 8 KB page, which is 2000 dims for `vector` but 4000 for `halfvec`, so half precision is what keeps the HNSW index reachable at 1536/2048 dims — and halves the table. Switching an existing database between the two column types converts in place without re-embedding.
 
 Further config blocks (see `knode-os config` for the full active set with defaults): `ingest` (chunk size/overlap, file watching, `linkedFolders` — the folders `knode-os folders link` mirrors under raw/docs), `extraction` (batch size and interval of the background document pass, tier-1 model, claims on/off, `workers` — the labeling slots `serve` runs per agent — and `summaryConcurrency`), `retrieval.sag` (seed/frontier/candidate limits, hop count, direct-route ratio), `heat` (usage-heat half-life, search boost weight, cold threshold), `trace` (Claude/Codex trace directories, skill dirs, sync interval), `server` (host/port, `server.mcp` — the Streamable HTTP MCP endpoint `serve` hosts at `/mcp` —, `server.remote` — the token-authenticated remote API at `/remote/v1`: `enabled`, `leaseMinutes`, `maxBodyBytes` —, `server.auth` — sign-in: `enabled`, `sessionDays`, `allowInsecureRemote` — and `server.tls` — an HTTPS listener beside the main one: `port`, `host`, `cert`, `key`), `graph.ontologyPacks` (which `playbooks/ontology/*.yaml` packs define entity and relation types; built-ins `core`, `organization` and the opt-in `finance` — markets, indices, securities, funds, sectors, themes, indicators, policies and who holds, recommends or forecasts what), `research` (which agent writes deep-research wiki pages: `agent` = a named agent from `playbooks/agents/` (Settings → Providers & Agents) — deepagents on one of the models, or a coding-agent CLI with its own path, model and effort — or, as configs written before named agents have it, `claude-cli` / `codex-cli` / `cursor-cli`, a connection id, or `default` for the section-01 connection — an OpenAI-compatible one runs the built-in agent, so no coding-agent CLI is needed; empty = not configured, `model`, `profile` = a research profile under `playbooks/research/profiles/` (reasoning effort, web search freshness, verification bar and the sub-agent roles, each with its own CLI, model, tools and prompt — built-ins `default` / `quick` / `thorough` / `native`, editable in Settings → Research), `pipeline` = `team` (plan, parallel research, synthesize, review, revise), `native` (one session with the roles as the CLI's own sub-agents) or `single`, `maxTurns`, `timeoutMs`, `concurrency`, `readDirs`, `researchers`, `reviewRounds`, `auto.enabled` / `auto.dailyJobs`), `research.init` (the initialize button always first extracts what the tier-1 queue still holds, for up to `extractionMaxMs` — edited with the Extract stage under Settings → Ingest — then queues up to `followUps` topic pages), `chat` (the agent behind Ask: `agent` — a named agent, a connection id, a CLI, or `default` for the section-01 connection, which is also the shipped value — plus `model`, `historyTurns` and `keep`; model, effort and web access come from the agent's own `playbooks/agents/<name>.yaml`, and the turn cap, timeout and tools are the same for every agent) and `review` (how much checking sits between extraction and the graph: `resolution` = `exact` | `suffix` for write-time merges, `llmJudge` = `off` | `suggest` | `auto` with `llmMinConfidence` / `autoMergeMinConfidence`, `claims` = `off` | `suggest`, `external` = `off` | `verify` | `research` for the agent's web tools). See [docs/design/06](docs/design/06-wiki-research-agent.md) and [docs/design/07](docs/design/07-init-and-chat.md).
 
@@ -184,7 +188,7 @@ knode-os lineage show <entity|relation|claim|page|document> <id>
 knode-os history <path>       apply / dispose / purge history of a source
 knode-os forget <path>        delete a source, dispose it and purge its history (irreversible)
 knode-os purge [--before iso] [--archived]  erase disposed history / archived pages
-knode-os rebuild [--history]  drop the index (.knode/db, or the workspace's PostgreSQL schema) and
+knode-os rebuild [--history]  drop the index (the workspace's PostgreSQL schema, or .knode/db with PGlite) and
                               reconstruct it from files + ledger
 knode-os datasource list|sync             registered live tables / re-introspect schemas into the graph
 knode-os datasource query <id> <sql>      read-only native SQL against a configured source

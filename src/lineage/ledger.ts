@@ -5,9 +5,10 @@ import { ScopeKind } from './types.js';
 
 /**
  * The machine-facing truth: an append-only event log in the data directory.
- * Files remain the human-facing truth; the PGlite database is a projection of
- * both and can be rebuilt (`knode-os rebuild`) by replaying this log and
- * re-applying the declared sources.
+ * Files remain the human-facing truth; the index (a PostgreSQL schema, or the
+ * embedded PGlite database) is a projection of both and can be rebuilt
+ * (`knode-os rebuild`) by replaying this log and re-applying the declared
+ * sources.
  *
  * Events are small (one line per apply/dispose/purge/feedback) and never
  * contain document content — only keys, hashes and ids.

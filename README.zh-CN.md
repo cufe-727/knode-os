@@ -1,6 +1,6 @@
 # knode-os
 
-> 面向 coding agent 的本地优先知识操作系统 —— 在你的文档、agent 执行 trace 和用过的 skills 之上,自动构建 **wiki** + **知识图谱** + **向量召回**。一个进程、一个文件夹、内嵌 Postgres。
+> 面向 coding agent 的本地优先知识操作系统 —— 在你的文档、agent 执行 trace 和用过的 skills 之上,自动构建 **wiki** + **知识图谱** + **向量召回**。一个进程、一个文件夹、一个 PostgreSQL + pgvector 索引。
 
 [English](./README.md) · [设计文档](./docs/design/00-overview.md) · [Agent Context Database（v2 重设计）](./docs/design/05-agent-context-db.zh-CN.md) · [OKF 兼容设计](./docs/design/02-okf-compatibility.md) · [Obsidian 兼容设计](./docs/design/03-obsidian-vault.md)
 
@@ -9,7 +9,7 @@ knode-os 结合了两个项目的核心思想:[llm_wiki](https://github.com/nash
 ## 特性
 
 - **一条命令**:`knode-os serve` 同时启动 Web 页面、REST API、文件监听、trace 定时同步和夜间 dream。
-- **文件系统即数据库。** 数据目录(`raw/` + `wiki/`)就是普通的 markdown 文件,可以直接读、改、grep、`git init`。`.knode/` 下的 [PGlite](https://pglite.dev)(WASM 版 Postgres + pgvector)索引随时可删,`knode-os ingest` 即可重建。
+- **文件系统即数据库。** 数据目录(`raw/` + `wiki/`)就是普通的 markdown 文件,可以直接读、改、grep、`git init`。索引放在 PostgreSQL + [pgvector](https://github.com/pgvector/pgvector) 里,每个工作区一个 schema,由这些文件派生,随时可用 `knode-os rebuild` 重建。想零配置,也可以改用内嵌在 `.knode/db` 的 [PGlite](https://pglite.dev)(WASM 版 Postgres + pgvector)。
 - **自动收集 agent trace。** Claude Code(`~/.claude/projects`)与 Codex CLI(`~/.codex/sessions`)的会话记录自动镜像到 `raw/traces/`,用过的 skills 进 `raw/skills/`。trace 供夜间 dream 分析使用;打开 `trace.episodes` 后会把每段会话备成可检索的 episode，在此之前不进检索索引。skills 一直可被检索。
 - **混合检索**:pgvector 余弦召回 + Postgres 全文检索 + 图谱信号,RRF 融合,并叠加温和的使用热度加权。开箱即用、完全离线(内置哈希 embedder);配置任意 OpenAI 兼容的 embedding 接口可获得生产级效果。
 - **分层知识图谱**:tier 0 在每次摄入时做确定性布线(`[[wikilink]]` + NLP 概念共现,不需要 LLM);变更文档进入 tier-1 队列,由 `serve` 后台(或 `knode-os extract`)按热度优先做 LLM 实体/关系/断言抽取;每轮抽取后随即检查这一轮写到的实体有没有重复(合并可撤销),并给这些文档写摘要页。抽取结果持久化到文档 sidecar,重建索引不会重复付费。支持多跳图搜索与图谱洞察(枢纽节点、孤立节点)。
@@ -29,6 +29,10 @@ knode-os 结合了两个项目的核心思想:[llm_wiki](https://github.com/nash
 
 ```bash
 pnpm install && pnpm build
+
+# 索引放在装有 pgvector 扩展的 PostgreSQL 里,默认连 127.0.0.1:5432,可在 knode.config.json 的
+# `database` 段改(见「配置模型」)。没有 PostgreSQL 服务器?初始化时改用
+# `KNODE_DATABASE_KIND=pglite node dist/cli.js init …`,即得到内嵌的零配置索引。
 
 # 初始化数据目录(默认 ~/.knode-os,可用 --data <path> 或 $KNODE_OS_DATA)
 node dist/cli.js init --data ~/knode-data
@@ -71,16 +75,16 @@ node dist/cli.js user add admin --admin --data ~/knode-data
 │   └── intents/        # intent 规格:一个答案需要哪些槽位
 ├── plugins/            # 可选:knode.config.json 里点名的插件模块(provider、转换器、钩子)
 ├── ledger/             # events.jsonl(机器真相)+ attic/(被删源的 sidecar)
-└── .knode/             # 派生的 PGlite 索引 —— 可随时删除重建
+└── .knode/             # 本地状态;用 PGlite 时索引本身也在这里(db/)
 ```
 
-搜索结果里的引用路径就是 `raw/docs/...`,即你上传的原件。文本文件直接从 `raw/` 索引,不再复制;PDF 或图片只转换一次,结果放在 `.sidecar/raw/docs/<文件>/content.md`,在页面或 `knode_read` 里打开这样的命中看到的就是这份 Markdown。与 `.knode/` 不同,`.sidecar/` 不是可弃的:它保存付费的 LLM 抽取结果和使用热度,重建索引时免费回放。
+搜索结果里的引用路径就是 `raw/docs/...`,即你上传的原件。文本文件直接从 `raw/` 索引,不再复制;PDF 或图片只转换一次,结果放在 `.sidecar/raw/docs/<文件>/content.md`,在页面或 `knode_read` 里打开这样的命中看到的就是这份 Markdown。与索引不同,`.sidecar/` 不是可弃的:它保存付费的 LLM 抽取结果和使用热度,重建索引时免费回放。
 
 通过 Web UI 使用 `serve` 时，`--data` 是所有 Workspace 的根目录。一个用户可以拥有多个 Workspace；每个 Workspace 都有一套完整、独立的上述目录结构：
 
 ```
 <data>/
-├── users/<username>/workspaces/<workspace-id>/  # 私有文件、配置、Wiki 和 PGlite 索引
+├── users/<username>/workspaces/<workspace-id>/  # 私有文件、配置和 Wiki;索引是它在 PostgreSQL 中的独立 schema
 └── teams/<team-name>/                         # 选择同名 Team 的用户共享
 ```
 
@@ -107,7 +111,7 @@ node dist/cli.js user add admin --admin --data ~/knode-data
     "dimensions": 1536
   },
   "database": {                      // 派生索引存在哪
-    "kind": "postgres",              // 默认 PostgreSQL(共用一个库,按工作区分 schema);"pglite" = 内嵌、零配置
+    "kind": "postgres",              // 默认 PostgreSQL + pgvector(共用一个库,按工作区分 schema);"pglite" = 内嵌、零配置
     "host": "127.0.0.1", "port": 5432,
     "user": "", "password": "",      // password 同样支持 "env:VAR";trust/peer 认证留空
     "url": "",                       // 或改用一条连接串(postgres://…,也支持 "env:VAR"),配合 "ssl": "require" 与 "poolSize"
@@ -134,7 +138,7 @@ node dist/cli.js user add admin --admin --data ~/knode-data
 }
 ```
 
-索引默认放在 PostgreSQL(首次运行前设 `KNODE_DATABASE_KIND=pglite`,或把 `database.kind` 改成 `pglite`,即可用内嵌的零配置索引,测试套件用的就是它)。`postgres` 模式下同一套 schema 放在服务器上:所有工作区共用一个库,按 schema 隔离,各自在首次打开时创建。当单个工作区超出 PGlite 单进程 32 位 WASM 的承载力(约百万 chunk),或需要多个进程同时读同一份索引时,才值得这么做。用 schema 而非独立库来隔离是刻意的:独立库会给每个工作区带上一份约 8 MB 的系统目录;而把所有工作区塞进同一张表、用 workspace 列区分,则会直接失去向量索引 —— HNSW 沿着按距离排序的邻居图游走,标量列上的等值条件无法下推进这次游走,优化器只能退回顺序扫描。向量列使用 `halfvec` 存储:pgvector 的索引条目上限是一个 8 KB 页,`vector` 对应 2000 维而 `halfvec` 对应 4000 维,所以半精度正是 1536/2048 维下 HNSW 索引仍然可用的前提,同时表体积减半。已有库在两种列类型之间切换会原地转换,不需要重新嵌入。
+索引默认放在带 pgvector 的 PostgreSQL 中:所有工作区共用一个库,按 schema 隔离,各自在首次打开时创建 —— 服务器上还没有这个库或 `vector` 扩展时也会一并创建,所以服务器上要装好 pgvector。PGlite 是可选的替代:把同一套 schema 内嵌在进程里,放在 `<workspace>/.knode/db`,什么都不用装 —— 首次运行前设 `KNODE_DATABASE_KIND=pglite`,或把 `database.kind` 改成 `pglite`;测试套件用的也是它。它只适合小工作区:单进程 32 位 WASM,承载上限约百万 chunk,同一时间只能有一个进程打开索引,而且查询在 Node 的事件循环上执行,一条长查询会让整个服务在此期间停止响应。用 schema 而非独立库来隔离是刻意的:独立库会给每个工作区带上一份约 8 MB 的系统目录;而把所有工作区塞进同一张表、用 workspace 列区分,则会直接失去向量索引 —— HNSW 沿着按距离排序的邻居图游走,标量列上的等值条件无法下推进这次游走,优化器只能退回顺序扫描。向量列使用 `halfvec` 存储:pgvector 的索引条目上限是一个 8 KB 页,`vector` 对应 2000 维而 `halfvec` 对应 4000 维,所以半精度正是 1536/2048 维下 HNSW 索引仍然可用的前提,同时表体积减半。已有库在两种列类型之间切换会原地转换,不需要重新嵌入。
 
 任何 OpenAI 兼容端点都可以(Ollama、vLLM、硅基流动等)。`protocol` 决定用哪条线路说话:默认 `auto` 先探测端点有没有 `/responses`,有就走 Responses(推理模型在这条线上把思考作为独立的 output item 返回,而 Chat Completions 只能塞进各家拼写不一的 `message.reasoning_content`),没有则退回 `/chat/completions`;探测每个端点每进程只做一次,且不消耗 token。也可以钉成 `responses` 或 `chat`。embedding 另外支持 `"provider": "ark-multimodal"`,对接火山方舟的 `/embeddings/multimodal`(`doubao-embedding-vision-*`)。该接口不是 OpenAI 形态:每次请求只返回一个融合后的向量,因此 `baseUrl` 写到 `/api/v3` 为止,`model` 填接入点 id(`ep-…`),`batchSize` 的含义变为单条请求的并发数。文档视觉转换、实体提取、文档摘要和判断（`knode_ask`、Dream、重复实体与 claim 复核）各有独立路由，可以指向一个模型或一个 agent；留空的路由会被写成它原本会跑的默认。文本型 PDF 在本地提取；图片和扫描型 PDF 可使用支持视觉的 OpenAI 兼容模型、Codex CLI 或 Claude Code CLI 转成 Markdown。修改 `dimensions` 会在下次启动时重建 embedding 表。也可以在 Web 页面的 **Settings** 标签里编辑并测试各条模型路由。
 
@@ -160,7 +164,7 @@ knode-os lineage show <entity|relation|claim|page|document> <id>
 knode-os history <path>       一个源的 apply / dispose / purge 历史
 knode-os forget <path>        删除源、dispose 并清除其历史(不可逆)
 knode-os purge [--before iso] [--archived]  物理清除已 dispose 的历史 / 归档页面
-knode-os rebuild [--history]  删除索引(.knode/db,或该 workspace 在 PostgreSQL 中的 schema)并从文件 + ledger 重建
+knode-os rebuild [--history]  删除索引(该 workspace 在 PostgreSQL 中的 schema;用 PGlite 时为 .knode/db)并从文件 + ledger 重建
 knode-os extract [--batch n]  跑一轮后台文档轮次:抽取一批、复核重复实体、写摘要
 knode-os remote token create --name <机器> --scope label,read,write,sql --workspace <用户>/<workspace>
                               为远程 API 签发每台机器各自的 token(另有 `remote token list | revoke`)

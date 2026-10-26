@@ -68,8 +68,8 @@ function embeddingsDdl(dim: number): string {
  * The derived index over the markdown/file tree plus the lineage ledger —
  * deleting it and re-running `knode-os sync` (or `rebuild`) reconstructs
  * everything. Schema evolution goes through versioned migrations (see
- * migrations.ts). Backed by embedded PGlite by default, or an external
- * Postgres server when `database.kind` says so (see backend.ts).
+ * migrations.ts). Backed by a PostgreSQL server with pgvector by default, or
+ * by embedded PGlite when `database.kind` is "pglite" (see backend.ts).
  */
 
 export class Store implements Queryable {
@@ -153,8 +153,9 @@ export class Store implements Queryable {
 
   /**
    * Run `fn` inside a transaction. The passed handle must be used for every
-   * statement in the callback — PGlite holds a mutex for the transaction, so
-   * calling `store.query` from inside it deadlocks.
+   * statement in the callback: on PostgreSQL `store.query` runs on another
+   * pooled connection, outside the transaction, and on PGlite, which holds a
+   * mutex for the transaction, calling it from inside deadlocks.
    *
    * A transaction Postgres picks as a deadlock victim, or one that fails to
    * serialize, is rolled back and run again, up to TX_ATTEMPTS times in all —

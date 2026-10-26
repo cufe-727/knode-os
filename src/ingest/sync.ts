@@ -273,7 +273,8 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
     }
   };
   // embedding round-trips dominate; fan files out while scope transactions
-  // serialize on the single PGlite connection underneath
+  // serialize underneath (PostgreSQL: on the ledger row lock, see lockLedger;
+  // PGlite: on its single connection)
   const concurrency = Math.max(1, config.ingest.concurrency ?? 1);
   let next = 0;
   await Promise.all(

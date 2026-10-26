@@ -10,7 +10,8 @@ import path from 'node:path';
  *   ├── wiki/                      curated knowledge (OKF bundle + Obsidian vault)
  *   ├── playbooks/{packs,capabilities,intents,ontology,research,concepts}   agent-editable configuration
  *   ├── ledger/                    events.jsonl + attic (machine truth)
- *   └── .knode/db                  PGlite index (disposable)
+ *   └── .knode/db                  PGlite index (disposable), only with database.kind "pglite" —
+ *                                  by default the index is a schema on a PostgreSQL server
  *
  * This module has no knode-os imports so every other module can depend on it.
  */

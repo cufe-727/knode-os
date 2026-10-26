@@ -1,7 +1,8 @@
 # knode-os — design overview
 
 > Local-first knowledge OS for coding agents. One TypeScript process, one data
-> directory, one embedded Postgres.
+> directory, one PostgreSQL + pgvector index (embedded PGlite as the opt-in
+> alternative).
 >
 > **v2 direction — Agent Context Database.** Every source is a scope whose
 > effects can be reverted (Cordis-style temporal composability), wiki pages are
@@ -24,6 +25,10 @@ knode-os combines three ideas:
 ## Architecture
 
 ```
+   data dir (files = truth)   ledger/ (events,   ~/.claude/projects,
+   raw/{docs,traces,skills}   attic = machine    ~/.codex/sessions
+   wiki/ playbooks/           truth)             (mirrored by trace sync)
+            ▼                  ▼                 ▼
 ┌────────────────────────────────────────────────────────────┐
 │ knode-os (single Node.js process)                          │
 │                                                            │
@@ -45,16 +50,16 @@ knode-os combines three ideas:
 │   background (serve): tier-1 LLM extraction (child scopes) │
 │       · usage-stats flush → sidecars · nightly dream       │
 │       · tier-2 refinement · view reconciliation            │
-│                         │                                  │
-│                 PGlite (.knode/db) — rebuildable           │
+└─────────────────────────┬──────────────────────────────────┘
+                          ▼
+┌────────────────────────────────────────────────────────────┐
+│ index — PostgreSQL + pgvector, one schema per workspace    │
+│ (opt-in: embedded PGlite in .knode/db) — rebuildable       │
+│                                                            │
 │   scopes · effects · evidence · deps · pages               │
 │   documents · chunks · embeddings · entities · relations   │
 │   entity_mentions · claims · datasets · stats · queue      │
 └────────────────────────────────────────────────────────────┘
-            ▲                  ▲                 ▲
-   data dir (files = truth)   ledger/ (events,   ~/.claude/projects,
-   raw/{docs,traces,skills}   attic = machine    ~/.codex/sessions
-   wiki/ playbooks/           truth)             (mirrored by trace sync)
 ```
 
 ## Data directory
@@ -78,15 +83,18 @@ knode-os combines three ideas:
 │   ├── entities/  concepts/  sources/  dreams/  datasets/
 ├── playbooks/          agent-editable configuration: packs/ capabilities/ intents/
 ├── ledger/             events.jsonl (machine truth) + attic/ (sidecars of removed sources)
-└── .knode/             PGlite database (L2) — delete + `ingest` to rebuild
+└── .knode/             local state; with PGlite also the index itself (L2, db/)
 ```
 
-Everything under `.knode/` is derived. `documents.sha256` makes ingestion
-incremental and idempotent; sidecars let a rebuild replay paid LLM extractions
-and usage history for free. Ingest indexes `raw/docs` (text sources straight
-from the file, normalized in memory; PDFs and images through the Markdown in
-their sidecar), `raw/skills` and `wiki/` — traces are indexed only when
-`trace.episodes` is on; otherwise they feed the dream cycle only.
+The index (L2) is derived: by default the workspace's schema in PostgreSQL with
+pgvector, or with `database.kind: "pglite"` the embedded PGlite database in
+`.knode/db`; `knode-os rebuild` drops it and builds it again from the files and
+the ledger. `documents.sha256` makes ingestion incremental and idempotent;
+sidecars let a rebuild replay paid LLM extractions and usage history for free.
+Ingest indexes `raw/docs` (text sources straight from the file, normalized in
+memory; PDFs and images through the Markdown in their sidecar), `raw/skills`
+and `wiki/` — traces are indexed only when `trace.episodes` is on; otherwise
+they feed the dream cycle only.
 
 ## Retrieval
 

@@ -13,12 +13,14 @@ import { resolveWorkspaceScope, WorkspaceContextRegistry, WorkspaceScope } from 
 /**
  * MCP over Streamable HTTP, mounted on the same Hono app as the REST API.
  *
- * Why HTTP and not another stdio process: the embedded PGlite index is
- * single-process, so a `knode-os mcp` child launched next to a running `serve`
- * would fight it for the workspace. Hosting the transport inside serve means
- * every agent — the research runner's headless CLI, or an interactive Claude
- * Code / Codex / Cursor session — reads and writes the one live index, with
- * the same workspace isolation the REST routes enforce.
+ * Why HTTP and not another stdio process: a `knode-os mcp` child launched next
+ * to a running `serve` would open the workspace's index a second time — on
+ * PostgreSQL bypassing serve's watchers, locks and sign-in, and on the opt-in
+ * PGlite index, which is single-process, fighting serve for it. Hosting the
+ * transport inside serve means every agent — the research runner's headless
+ * CLI, or an interactive Claude Code / Codex / Cursor session — reads and
+ * writes the one live index, with the same workspace isolation the REST routes
+ * enforce.
  *
  * Stateless: each request gets a fresh McpServer bound to the request's
  * workspace context (tool registration is a handful of closures), and replies

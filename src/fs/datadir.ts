@@ -46,7 +46,8 @@ import { CAPABILITIES_DIR, DB_DIR, INTENTS_DIR, LEGACY_TOP_LEVEL, PACKS_DIR } fr
  *   │   └── intents/          intent specs: the slots an answer needs (Context Compiler)
  *   ├── ledger/               machine truth: events.jsonl (apply/dispose/purge/feedback)
  *   │   └── attic/            sidecars + previous file versions of disposed sources
- *   └── .knode/               derived state (L2 — PGlite database) — safe to delete & rebuild
+ *   └── .knode/               local state; with database.kind "pglite" also the index itself
+ *                             (L2, db/) — by default the index is this workspace's PostgreSQL schema
  */
 
 const RAW_DIRS = ['raw/docs', 'raw/traces/claude', 'raw/traces/codex', 'raw/skills'];

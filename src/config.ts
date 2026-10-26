@@ -80,16 +80,16 @@ export interface EmbeddingPoolConfig {
 /**
  * Where the derived index lives.
  *
- * 'pglite' keeps the zero-setup default: an embedded Postgres per workspace
- * under `<workspace>/.knode/db`, nothing to install or run. 'postgres' points
- * the same schema at an external server — worth it once a workspace outgrows
- * PGlite's single-process 32-bit WASM build (roughly a million chunks), or when
- * several processes must read one index concurrently. There, all workspaces
- * share one database and are isolated by schema: a schema is free where a
- * database carries its own ~8 MB catalog, one pool serves every workspace, and
- * each schema keeps a private HNSW index (a shared table keyed by workspace
- * could not — HNSW walks a distance-ordered graph, so an equality predicate on
- * a scalar column cannot be pushed into the walk).
+ * 'postgres', the default, keeps it on a PostgreSQL server with pgvector. All
+ * workspaces share one database and are isolated by schema: a schema is free
+ * where a database carries its own ~8 MB catalog, and each schema keeps a
+ * private HNSW index (a shared table keyed by workspace could not — HNSW walks
+ * a distance-ordered graph, so an equality predicate on a scalar column cannot
+ * be pushed into the walk). 'pglite' opts into the same schema embedded in the
+ * process, per workspace under `<workspace>/.knode/db`, with nothing to install
+ * or run — for offline / zero-setup use and the test suite: a single-process
+ * 32-bit WASM build, it tops out around a million chunks and lets one process
+ * at a time open the index.
  */
 export interface DatabaseConfig {
   /** 'pglite', 'postgres', or the id of a storage backend a plugin registered (docs/design/11). */

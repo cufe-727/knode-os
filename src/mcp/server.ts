@@ -11,9 +11,11 @@ export const MCP_SERVER_INFO = { name: 'knode-os', version: '0.2.0' } as const;
  *   Claude Code:  claude mcp add knode-os -- knode-os mcp --data ~/.knode-os
  *   Codex CLI:    [mcp_servers.knode-os] command = "knode-os", args = ["mcp", "--data", "~/.knode-os"]
  *
- * This process opens the data directory itself, so it must not run beside a
- * `knode-os serve` on the same PGlite workspace — connect to the HTTP endpoint
- * serve mounts instead (`knode-os connect <client> --http`).
+ * This process opens the data directory itself, so it should not run beside a
+ * `knode-os serve` on the same workspace: on PostgreSQL it would bypass serve's
+ * watchers, locks and sign-in, and with the opt-in PGlite index, which is
+ * single-process, it must not. Connect to the HTTP endpoint serve mounts
+ * instead (`knode-os connect <client> --http`).
  */
 export async function startMcpServer(ctx: AppContext): Promise<void> {
   const server = new McpServer(MCP_SERVER_INFO, { instructions: mcpInstructions(ctx.dataDir) });

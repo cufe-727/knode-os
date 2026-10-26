@@ -43,7 +43,9 @@ import {
  *
  * Bound to one scope and one open transaction. Bodies must not await
  * network / LLM / embedding calls — compute first, write second — so the
- * single PGlite connection is held briefly.
+ * transaction ends quickly: on PostgreSQL it holds a pooled connection and the
+ * ledger row lock other writers queue on (`lockLedger`), on PGlite the single
+ * connection.
  */
 
 export interface DocumentProjection {

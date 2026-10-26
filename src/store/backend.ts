@@ -10,8 +10,8 @@ import { pluginRegistry } from '../plugins/registry.js';
 import type { StorageBackendPlugin } from '../plugins/types.js';
 
 /**
- * The database surface the Store needs, so an external Postgres server can
- * stand in for the embedded PGlite one. Modelled on PGlite's own shape —
+ * The database surface the Store needs, met alike by a PostgreSQL server (the
+ * default) and by embedded PGlite. Modelled on PGlite's own shape —
  * `query` returns `{ rows }`, `exec` runs multi-statement DDL scripts — so the
  * embedded backend satisfies it without a wrapper.
  *
@@ -316,10 +316,10 @@ function storageBackendFor(cfg?: DatabaseConfig): { backend: StorageBackendPlugi
 }
 
 /**
- * Open the backend for one workspace, by `database.kind`: PostgreSQL when the
- * config says so (the default since 2026-09), the embedded PGlite database
- * otherwise — an absent `database` block still opens PGlite so old data dirs
- * keep working. Any other kind must come from a storage plugin.
+ * Open the backend for one workspace, by `database.kind`: a PostgreSQL server
+ * by default (since 2026-09), the embedded PGlite database for "pglite", and
+ * any other kind from a storage plugin. Called without a config at all, it
+ * opens PGlite.
  */
 export async function openBackend(dataDir: string, cfg?: DatabaseConfig): Promise<Backend> {
   const { backend, config } = storageBackendFor(cfg);
