@@ -345,6 +345,120 @@ async function textCandidates(
   }
 }
 
+/** A claim near another by embedding, and their cosine. */
+interface Near {
+  claim_id: string;
+  sim: number;
+}
+
+/**
+ * What one similarity query weighs: at most this many pairs (claims × the
+ * claims each is compared with; with 1024 dimensions up to 0.15 s on PGlite,
+ * which answers on the event loop, and 0.03 s on Postgres), and at most this
+ * many claims to compare with, whose vectors (up to 3072 dimensions) then stay
+ * within work_mem's default 4 MB.
+ */
+const NEAR_PAIRS_PER_QUERY = 25_000;
+const NEAR_ROWS_PER_QUERY = 400;
+
+/**
+ * Each focus claim's five nearest claims by embedding among the claims of its
+ * blocks (blocksOf), those at `threshold` or above, nearest first.
+ *
+ * One query per claim, binding the claim's whole block as an id array, made
+ * finance's nightly run (2026-10-26) send 485,512 queries and 547 million ids,
+ * and fetch both vectors of every comparison out of line (TOAST) twice. Here
+ * claims are compared in batches with a slice of their block: its ids bound
+ * and its vectors read once per query, each distance worked out once, small
+ * blocks sharing a query. A claim's nearest in each slice of its block, and in
+ * its swapped group (a block of its own), are then merged.
+ *
+ * Equal distances go to the lower claim id; the per-claim query left them to
+ * its sort, over rows in the order of its plan (on Postgres, for a big block, a
+ * parallel scan).
+ */
+async function nearClaims(
+  store: Store,
+  focus: ClaimLite[],
+  blocksOf: (f: ClaimLite) => ClaimLite[][],
+  opts: { threshold: number; pause: () => Promise<void> },
+): Promise<Map<ClaimLite, Near[]>> {
+  // the focus claims of each block. A swapped group shares no claim with the
+  // subject's block, or lies within it when subject and object are one entity.
+  const members = new Map<ClaimLite[], ClaimLite[]>();
+  for (const f of focus) {
+    const [own, swapped] = blocksOf(f);
+    for (const block of swapped && f.object !== f.subject ? [own, swapped] : [own]) {
+      (members.get(block) ?? members.set(block, []).get(block)!).push(f);
+    }
+  }
+
+  const near = new Map<ClaimLite, Near[]>();
+  // a query compares each of its claims with the claims of its piece: a slice of a block
+  let batch = { claims: [] as ClaimLite[], pieces: [] as number[], ids: [] as string[], idPieces: [] as number[], next: 0 };
+  const flush = async () => {
+    await opts.pause();
+    const rows = await store.query<{ ord: number; claim_id: string; sim: number }>(
+      // the vectors are read once (subvector copies one whole; the stored ones are
+      // kept out of line), OFFSET 0 keeps each distance a column computed once, and
+      // only the nearest at the threshold come back (a NaN cosine never reaches it)
+      `WITH focus AS MATERIALIZED (
+         SELECT f.ord, f.piece, f.id, subvector(e.embedding, 1, $5::int) AS v
+         FROM unnest($1::text[], $2::int[]) WITH ORDINALITY AS f(id, piece, ord)
+         JOIN claim_embeddings e ON e.claim_id = f.id
+       ), block AS MATERIALIZED (
+         SELECT x.piece, e.claim_id, subvector(e.embedding, 1, $5::int) AS v
+         FROM unnest($3::text[], $4::int[]) AS x(id, piece)
+         JOIN claim_embeddings e ON e.claim_id = x.id
+       )
+       SELECT a.ord::int AS ord, n.claim_id, n.sim
+       FROM focus a CROSS JOIN LATERAL (
+         SELECT s.claim_id, s.d, (1 - s.d)::float AS sim
+         FROM (SELECT b.claim_id, a.v <=> b.v AS d FROM block b WHERE b.piece = a.piece AND b.claim_id <> a.id OFFSET 0) s
+         ORDER BY s.d, s.claim_id COLLATE "C" LIMIT 5
+       ) n
+       WHERE n.sim >= $6::float8 AND n.sim <> 'NaN'
+       ORDER BY a.ord, n.d, n.claim_id COLLATE "C"`,
+      [batch.claims.map((c) => c.id), batch.pieces, batch.ids, batch.idPieces, store.embeddingDim, opts.threshold],
+    );
+    for (const r of rows) {
+      const f = batch.claims[r.ord - 1];
+      (near.get(f) ?? near.set(f, []).get(f)!).push({ claim_id: r.claim_id, sim: r.sim });
+    }
+    batch = { claims: [], pieces: [], ids: [], idPieces: [], next: 0 };
+  };
+  for (const [block, claims] of members) {
+    if (block.length === 1 && claims[0] === block[0]) continue;
+    for (let j = 0; j < block.length; j += NEAR_ROWS_PER_QUERY) {
+      const slice = block.slice(j, j + NEAR_ROWS_PER_QUERY);
+      const per = Math.max(1, Math.floor(NEAR_PAIRS_PER_QUERY / slice.length));
+      for (let i = 0; i < claims.length; i += per) {
+        const part = claims.slice(i, i + per);
+        const ids = batch.ids.length + slice.length;
+        if (batch.claims.length > 0 && ((batch.claims.length + part.length) * ids > NEAR_PAIRS_PER_QUERY || ids > NEAR_ROWS_PER_QUERY)) await flush();
+        const piece = batch.next++;
+        for (const f of part) {
+          batch.claims.push(f);
+          batch.pieces.push(piece);
+        }
+        for (const c of slice) {
+          batch.ids.push(c.id);
+          batch.idPieces.push(piece);
+        }
+      }
+    }
+  }
+  if (batch.claims.length > 0) await flush();
+
+  // a claim compared in several pieces keeps the five nearest of them all, ordered as the queries order them
+  for (const list of near.values()) {
+    if (list.length < 2) continue;
+    list.sort((x, y) => y.sim - x.sim || (x.claim_id < y.claim_id ? -1 : x.claim_id > y.claim_id ? 1 : 0));
+    list.length = Math.min(list.length, 5);
+  }
+  return near;
+}
+
 /** The claims' own validity windows are both known and do not meet. */
 function windowsDisjoint(a: ClaimLite, b: ClaimLite): boolean {
   const af = toIso(a.valid_from);
@@ -404,7 +518,6 @@ export async function auditDuplicateClaims(
     const swapped = f.object ? bySwapped.get(`${f.subject}|${f.object}`) : undefined;
     return swapped ? [bySubject.get(f.subject)!, swapped] : [bySubject.get(f.subject)!];
   };
-  const blockOf = (f: ClaimLite): ClaimLite[] => blocksOf(f).flat().filter((c) => c.id !== f.id);
   // the nightly run covers every claim: its long loops let the server answer in between (with
   // PGlite, which answers queries on the event loop, a run of queries holds it as well)
   const pause = breather();
@@ -437,20 +550,12 @@ export async function auditDuplicateClaims(
       }
     }
     stats.embedded = await ensureClaimEmbeddings(store, ctx.embedder, [...needed].map((id) => byId.get(id)!).filter(Boolean), progress);
+    const near = await nearClaims(store, focus, blocksOf, { threshold, pause });
     for (const f of focus) {
       await pause();
-      const block = blockOf(f);
-      if (block.length === 0) continue;
-      const rows = await store.query<{ claim_id: string; sim: number }>(
-        `SELECT b.claim_id, (1 - (a.embedding <=> b.embedding))::float AS sim
-         FROM claim_embeddings a JOIN claim_embeddings b ON b.claim_id = ANY($2::text[])
-         WHERE a.claim_id = $1
-         ORDER BY a.embedding <=> b.embedding LIMIT 5`,
-        [f.id, block.map((c) => c.id)],
-      );
-      for (const r of rows) {
+      for (const r of near.get(f) ?? []) {
         const other = byId.get(r.claim_id);
-        if (other && r.sim >= threshold) propose(f, other, `语义相似度 ${r.sim.toFixed(2)}`, { similarity: r.sim });
+        if (other) propose(f, other, `语义相似度 ${r.sim.toFixed(2)}`, { similarity: r.sim });
       }
     }
 
