@@ -30,7 +30,7 @@ import { researchSlug } from './templates.js';
  *   ├── .captures.json                 url → file, for every capture (dotfile: never indexed)
  *   └── <study>/
  *       ├── sources.md                 the study's register: title, site, date, URL, file, why
- *       ├── web/<date>-<site>-<slug>.html   pages as fetched, one provenance comment prepended
+ *       ├── web/<date>-<site>-<slug>.html   pages as fetched (as UTF-8), one provenance comment prepended
  *       ├── files/<date>-<site>-<slug>.pdf  PDFs, images, CSV / JSON, text as fetched
  *       ├── notes/                     what the study's collectors found (written by the study runner)
  *       └── reports/                   a deep-research model's report (written by the study runner)
@@ -475,13 +475,14 @@ export async function captureUrl(ctx: AppContext, req: CaptureRequest): Promise<
       outline = conv.outline.slice(0, 40).map((h) => ({ level: h.level, text: h.text }));
       chars = conv.markdown.length;
       warnings.push(...conv.warnings);
-      // the bytes as fetched, as UTF-8, under one line that says where they came from
+      // the page as fetched, as UTF-8, under one line that says where it came from; the BOM
+      // says UTF-8 to a browser that opens the file, over a GBK page's own <meta charset>
       const prior = readCaptureComment(html);
       const head = captureComment({
         url: asked, finalUrl, fetched: now, contentType: res.contentType, charset, sha256: sha256(res.body), by: req.actor,
         ...(req.study ? { study: req.study.id } : {}), ...(req.why ? { why: req.why } : {}),
       });
-      bytes = Buffer.from(prior ? html : head + html);
+      bytes = Buffer.from(`\uFEFF${prior ? html : head + html}`);
     } else if (kind === 'pdf') {
       const info = await pdfInfo(res.body);
       title = info.title ?? title;

@@ -438,4 +438,24 @@ describe('sign-in in front of serve', () => {
     expect((await req('/api/auth/state', { remote: true })).headers.get('content-security-policy')).toBe(API_CSP);
     expect((await req('/api/stats', { token: await login('bob'), headers: ws() })).headers.get('content-security-policy')).toBe(API_CSP);
   });
+
+  it('opens an original from a link — the session says who, the query which workspace — and keeps the page sandboxed', async () => {
+    const page = path.join(root, 'users', 'admin', 'workspaces', 'default', 'raw', 'docs', 'saved.html');
+    fs.mkdirSync(path.dirname(page), { recursive: true });
+    fs.writeFileSync(page, '<!doctype html><html><head><title>Saved</title></head><body><p>hello</p><script>steal()</script></body></html>');
+    const bobToken = await login('bob');
+    const signedIn = await req('/api/auth/login', { method: 'POST', body: JSON.stringify({ username: 'admin', password: PASSWORD }) });
+    const cookie = signedIn.headers.get('set-cookie')!.split(';')[0];
+    const q = (extra: Record<string, string> = {}) => new URLSearchParams({ path: 'raw/docs/saved.html', kind: 'personal', id: 'default', name: 'default', ...extra });
+    const res = await req(`/api/file/original?${q()}`, { cookie, remote: true });
+    expect(res.status).toBe(200);
+    // the UI's policy would let the page run as ours: the route's sandbox stands
+    expect(res.headers.get('content-security-policy')).toMatch(/^sandbox allow-popups allow-popups-to-escape-sandbox; default-src 'none'/);
+    expect(res.headers.get('x-frame-options')).toBe('DENY');
+    expect(await res.text()).toContain(`<head><meta http-equiv="Content-Security-Policy" content="script-src 'none'`);
+    // a user named in the query is not who the request acts for
+    const bob = await req(`/api/file/original?${q({ user: 'admin' })}`, { token: bobToken });
+    expect(bob.status).toBe(404);
+    expect((await req(`/api/file/original?${q()}`)).status).toBe(401);
+  });
 });

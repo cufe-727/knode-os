@@ -1,3 +1,5 @@
+import AppKit
+import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -581,6 +583,32 @@ final class AppModel: ObservableObject {
     func openFile(_ path: String) {
         pendingFilePath = path
         select(.files)
+    }
+
+    /// Files a browser shows as they are: the file view shows what knode-os read out of them.
+    static func hasOriginal(_ path: String) -> Bool {
+        let originals: Set<String> = ["pdf", "html", "htm", "xhtml", "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tif", "tiff", "heic", "heif", "svg"]
+        return originals.contains((path as NSString).pathExtension.lowercased())
+    }
+
+    /// Open the file itself in the app that reads it (Preview, the browser),
+    /// from a copy in the temporary folder: the PDF as it is, a web page as
+    /// the service sends it, its script turned off.
+    func openOriginal(_ path: String) async {
+        do {
+            let data = try await client().originalFile(at: path)
+            // one folder per workspace file, so two files of the same name stay apart and a second open replaces the first copy
+            let key = SHA256.hash(data: Data("\(activeWorkspace?.id ?? "")/\(path)".utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+            let folder = FileManager.default.temporaryDirectory
+                .appendingPathComponent("KnodeOS Originals", isDirectory: true)
+                .appendingPathComponent(key, isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let copy = folder.appendingPathComponent((path as NSString).lastPathComponent)
+            try data.write(to: copy, options: .atomic)
+            if !NSWorkspace.shared.open(copy) { showToast(L("No app on this Mac opens %@", (path as NSString).lastPathComponent)) }
+        } catch {
+            showError(error, prefix: L("Open original failed"))
+        }
     }
 
     func consumePendingFile() -> String? {

@@ -12,6 +12,7 @@ import { accountMayOpenTeam } from '../auth/accounts.js';
 import { AuthEnv, authMiddleware, existingTeams, mountAuthRoutes, mountGateways } from '../auth/http.js';
 import { AuthService } from '../auth/service.js';
 import { contentSecurityPolicy } from './csp.js';
+import { OriginalError, readOriginal } from './originals.js';
 import { publicGuard } from './public-guard.js';
 import { AppContext, judgeLlmClient } from '../context.js';
 import {
@@ -457,12 +458,15 @@ export function createApp(
 
   app.use('/api/*', async (c, next) => {
     if (c.req.path === '/api/health' || c.req.path === '/api/workspaces' || c.req.path.startsWith('/api/auth/')) return next();
+    // a link opened in a tab cannot send headers: an original names its workspace in the query
+    const linked = c.req.path === '/api/file/original' && c.req.method === 'GET';
+    const named = (header: string, query: string) => c.req.header(header) ?? (linked ? c.req.query(query) : undefined);
     try {
       const scope = resolveWorkspaceScope({
-        user: requestUser(c),
-        kind: c.req.header('x-knode-workspace-kind'),
-        id: c.req.header('x-knode-workspace-id'),
-        name: c.req.header('x-knode-workspace-name'),
+        user: requestUser(c) ?? (linked && !auth ? c.req.query('user') : undefined),
+        kind: named('x-knode-workspace-kind', 'kind'),
+        id: named('x-knode-workspace-id', 'id'),
+        name: named('x-knode-workspace-name', 'name'),
       });
       const account = auth ? c.get('account') : undefined;
       if (account && scope.kind === 'team' && !accountMayOpenTeam(account, scope.slug)) {
@@ -1075,6 +1079,19 @@ export function createApp(
       return c.json({ path: p, citedBy: await citedBy(ctx.store, p) });
     } catch (e) {
       return c.json(err(e), 500);
+    }
+  });
+
+  // the file itself, for people to read: a PDF, a picture, a saved page made safe to open (src/server/originals.ts)
+  app.get('/api/file/original', (c) => {
+    const ctx = requestCtx(c);
+    const p = c.req.query('path');
+    if (!p) return c.json({ error: 'path required' }, 400);
+    try {
+      const { body, headers } = readOriginal(ctx.dataDir, p);
+      return c.body(body, 200, headers);
+    } catch (e) {
+      return c.json(err(e), e instanceof OriginalError ? e.status : 404);
     }
   });
 

@@ -61,12 +61,17 @@ function forbidden(group: ApiGroup, account: PublicAccount, client: ClientInfo):
 
 const isUnder = (p: string, prefix: string) => p === prefix || p.startsWith(`${prefix}/`);
 
-/** No framing (clickjacking), no referrer leaving the origin, no type sniffing, and a page that runs only our own scripts (src/server/csp.ts). */
+/**
+ * No framing (clickjacking), no referrer leaving the origin, no type sniffing,
+ * and a page that runs only our own scripts (src/server/csp.ts). A route that
+ * sets a policy of its own keeps it: an original page goes out sandboxed
+ * (src/server/originals.ts), which the UI's policy would undo.
+ */
 function hardenUi(c: Context): void {
   c.header('x-frame-options', 'DENY');
   c.header('referrer-policy', 'same-origin');
   c.header('x-content-type-options', 'nosniff');
-  c.header('content-security-policy', contentSecurityPolicy(c.res.headers.get('content-type')));
+  if (!c.res.headers.has('content-security-policy')) c.header('content-security-policy', contentSecurityPolicy(c.res.headers.get('content-type')));
 }
 
 export function authMiddleware(auth: AuthService, opts: { mcpPath?: string } = {}): MiddlewareHandler {
