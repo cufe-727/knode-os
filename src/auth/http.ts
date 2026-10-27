@@ -9,6 +9,7 @@ import { API_GROUP_NAMES, API_GROUPS, apiGroupOf, ApiGroup } from './apis.js';
 import { forwardToGateway } from './gateways.js';
 import { AuthError, AuthService } from './service.js';
 import { looksLikeSessionToken, PublicSession, SessionKind } from './sessions.js';
+import { resolveWorkspaceScope, workspaceDataDir } from '../server/workspaces.js';
 
 /**
  * Sign-in over HTTP: the middleware that guards `serve`, the /api/auth routes
@@ -445,7 +446,15 @@ export function mountGateways(app: Hono<any>, auth: AuthService): void {
 export function existingTeams(rootDataDir: string): string[] {
   try {
     return fs.readdirSync(path.join(rootDataDir, 'teams'), { withFileTypes: true })
-      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .filter((e) => {
+        if (e.name.startsWith('.')) return false;
+        if (e.isDirectory()) return true;
+        if (!e.isSymbolicLink()) return false;
+        try {
+          const scope = resolveWorkspaceScope({ user: 'admin', kind: 'team', name: e.name });
+          return fs.statSync(workspaceDataDir(rootDataDir, scope)).isDirectory();
+        } catch { return false; }
+      })
       .map((e) => e.name)
       .sort();
   } catch {

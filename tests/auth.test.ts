@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AccountStore, accountAllows } from '../src/auth/accounts.js';
+import { existingTeams } from '../src/auth/http.js';
 import { apiGroupOf } from '../src/auth/apis.js';
 import { normalizeGatewayTarget } from '../src/auth/gateways.js';
 import { AuthService } from '../src/auth/service.js';
@@ -14,7 +15,7 @@ import { createApp } from '../src/server/app.js';
 import { API_CSP, UI_CSP } from '../src/server/csp.js';
 import { clientInfo } from '../src/server/public-guard.js';
 import { assertListeners } from '../src/server/serve.js';
-import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
+import { WorkspaceContextRegistry, resolveWorkspaceScope, workspaceDataDir } from '../src/server/workspaces.js';
 
 /**
  * Sign-in (src/auth): accounts and sessions on disk, the middleware in front
@@ -291,6 +292,45 @@ describe('sign-in in front of serve', () => {
     expect((await (await req('/api/health', { remote: true })).json()).dataRoot).toBeUndefined();
     expect((await (await req('/api/health')).json()).dataRoot).toBe(rootCtx.dataDir);
     expect((await req('/mcp', { method: 'POST', remote: true, body: '{}' })).status).toBe(404);
+  });
+
+  it('shares an existing personal workspace through a team without a second index or access to other workspaces', async () => {
+    const ownerScope = resolveWorkspaceScope({ user: 'admin', kind: 'personal', id: 'research', name: 'Research' });
+    const teamScope = resolveWorkspaceScope({ user: 'bob', kind: 'team', name: 'Finance' });
+    const source = workspaceDataDir(root, ownerScope);
+    const alias = path.join(root, 'teams', 'finance');
+    fs.mkdirSync(path.dirname(alias), { recursive: true });
+    fs.symlinkSync(source, alias, 'dir');
+    fs.writeFileSync(path.join(source, 'wiki', 'shared-note.md'), '# Shared original');
+    const token = await login('bob');
+    const teamHeaders = ws('team-finance', 'team', 'Finance');
+    try {
+      expect(existingTeams(root)).toContain('finance');
+      expect(workspaceDataDir(root, teamScope)).toBe(source);
+      expect(await registry.get(teamScope)).toBe(await registry.get(ownerScope));
+      expect((await req('/api/file?path=wiki/shared-note.md', { token, headers: teamHeaders, remote: true })).status).toBe(403);
+      await auth.accounts.update('bob', { teams: ['knode-labs', 'finance'] });
+      const view = await (await req('/api/auth/me', { token, remote: true })).json();
+      expect(view.teams).toContainEqual({ id: 'team-finance', name: 'Finance', kind: 'team', slug: 'finance' });
+      const read = await req('/api/file?path=wiki/shared-note.md', { token, headers: teamHeaders, remote: true });
+      expect(read.status).toBe(200);
+      expect((await read.json()).content).toBe('# Shared original');
+      expect((await req('/api/file?path=wiki/shared-note.md', { token, headers: { ...ws('research'), 'x-knode-user': 'admin' }, remote: true })).status).toBe(404);
+      await expect(registry.reset(teamScope)).rejects.toThrow(/owner/);
+      await auth.accounts.update('bob', { teams: ['knode-labs'] });
+      expect((await req('/api/file?path=wiki/shared-note.md', { token, headers: teamHeaders, remote: true })).status).toBe(403);
+    } finally {
+      fs.unlinkSync(alias);
+      await auth.accounts.update('bob', { teams: ['knode-labs'] });
+    }
+    // Broken and external links must fail closed instead of initializing or exposing a new workspace.
+    for (const target of [path.join(root, 'missing'), tmp, path.join(source, 'wiki')]) {
+      fs.symlinkSync(target, alias, 'dir');
+      try {
+        expect(() => workspaceDataDir(root, teamScope)).toThrow();
+        expect(existingTeams(root)).not.toContain('finance');
+      } finally { fs.unlinkSync(alias); }
+    }
   });
 
   it('throttles failed sign-ins per client', async () => {

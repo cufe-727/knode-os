@@ -45,6 +45,19 @@ knode-os user sessions [alice] [--revoke <id>]
 Administrators can do the same in the web UI and the app under **Settings → Access**. Everyone can change their own
 password and end their own sessions there.
 
+An operator can share an existing personal workspace through a Team alias, without moving or copying its data:
+
+```bash
+mkdir -p ~/.knode-os/teams
+ln -s ../users/admin/workspaces/finance ~/.knode-os/teams/finance
+knode-os user set alice --team finance
+```
+
+The alias must point to an existing `users/<owner>/workspaces/<id>` within the same data root. Team membership is
+checked before opening it. The Team and the owner's personal view share the same files, index, processing and
+updates; members have their usual read/write permissions. Remove the alias or the member's Team grant to stop
+sharing. Clearing through an alias is refused; an intentional clear must use the owner's personal workspace.
+
 Accounts are kept in `.knode/accounts.json` and sessions in `.knode/sessions.json`, both mode 0600 and under the data
 root. Passwords are hashed with scrypt (N=2¹⁵), and a session token is stored only as its SHA-256. A running `serve`
 re-reads both files when they change, so CLI changes take effect without a restart.

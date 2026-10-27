@@ -107,6 +107,22 @@ export function workspaceDataDir(rootDataDir: string, scope: WorkspaceScope): st
     : path.resolve(rootDataDir, 'teams');
   const resolved = path.resolve(parent, scope.slug);
   if (!resolved.startsWith(parent + path.sep)) throw new Error('workspace path escapes the data root');
+  // An operator can share an existing personal workspace as a Team. Resolve
+  // the alias before opening a context: the files, PostgreSQL schema, watchers
+  // and worker leases must retain the owner's original workspace identity.
+  if (scope.kind === 'team' && fs.lstatSync(resolved, { throwIfNoEntry: false })?.isSymbolicLink()) {
+    const target = fs.realpathSync(resolved);
+    const users = fs.realpathSync(path.join(rootDataDir, 'users'));
+    const parts = path.relative(users, target).split(path.sep);
+    if (parts.length !== 3 || parts[1] !== 'workspaces'
+      || workspaceSlug(parts[0], 'owner') !== parts[0]
+      || workspaceSlug(parts[2], 'workspace id') !== parts[2]
+      || !fs.statSync(target).isDirectory()
+      || !fs.existsSync(path.join(target, CONFIG_FILE))) {
+      throw new Error('a shared Team must point to an existing personal workspace in this data root');
+    }
+    return path.resolve(rootDataDir, 'users', ...parts);
+  }
   return resolved;
 }
 
@@ -220,6 +236,9 @@ export class WorkspaceContextRegistry {
    */
   async reset(scope: WorkspaceScope): Promise<void> {
     const dataDir = workspaceDataDir(this.rootDataDir, scope);
+    if (scope.kind === 'team' && dataDir !== path.resolve(this.rootDataDir, 'teams', scope.slug)) {
+      throw new Error('clear a shared workspace from its owner\'s personal workspace, not its Team alias');
+    }
     if (this.resetting.has(dataDir)) throw new Error('workspace is already being cleared');
     this.resetting.add(dataDir);
     try {
