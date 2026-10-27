@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { AppContext } from '../context.js';
 import { Sidecar } from '../fs/sidecar.js';
+import { rawDocTarget } from '../graph/citations.js';
 import { applyExtraction } from '../graph/llm-extract.js';
 import { applyClaimMerge, unmergeClaim } from '../graph/claim-merge.js';
 import { applyMerge, unmergeEntity } from '../graph/merge.js';
@@ -135,6 +136,7 @@ async function applyAtticScope(store: Store, key: string, sidecar: Sidecar, opts
         await w.entity({ name: term, type: 'concept' }, { extractor: 'tier0.concept' });
       }
       for (const target of sidecar.extraction.tier0?.wikilinks ?? []) {
+        if (rawDocTarget(key, target)) continue; // a raw document is no entity (src/graph/citations.ts)
         const name = path.posix.basename(target.replace(/\.md$/i, ''));
         if (name) await w.entity({ name, type: 'concept' }, { extractor: 'tier0.wikilink' });
       }

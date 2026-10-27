@@ -5,6 +5,8 @@
  * explicit *effect* carrying its own inverse.
  */
 
+import type { TrustTier } from './trust.js';
+
 export type ScopeKind = 'doc' | 'wiki-human' | 'tier1' | 'page' | 'datasource' | 'dataset' | 'dream' | 'absence' | 'merge' | 'claim-merge' | 'lint';
 export type ScopeStatus = 'applying' | 'active' | 'disposed';
 export type DisposeReason = 'removed' | 'replaced' | 'archived' | 'purge';
@@ -20,6 +22,8 @@ export interface ScopeRow {
   applied_at: string;
   disposed_at: string | null;
   meta: Record<string, unknown>;
+  /** The tier the scope was applied at, or promoted / demoted to since (src/lineage/trust.ts); read from `scopes`. */
+  trust?: TrustTier;
 }
 
 /** Ids whose aggregate rows an apply/dispose touched (recomputed by the fold). */
@@ -107,6 +111,8 @@ export interface WriterStats {
   effects: number;
   capabilities: number;
   locators: number;
+  /** Citations of raw/docs files a wiki page wrote (src/graph/citations.ts). */
+  citations: number;
   /** Relation predicates that matched nothing in the ontology and fell back to related_to. */
   unknownPredicates: number;
 }

@@ -1168,5 +1168,8 @@ private let zhHansPairs: [(String, String)] = [
     ("1 shared document", "1 个共同文档"),
     ("%@ shared documents", "%@ 个共同文档"),
     ("Mentioned in", "提及于"),
+    ("Cited by", "被引用于"),
+    ("Wiki pages that cite this file: [[raw/docs/…]] and Markdown links, sources: entries, relations such as tested_by", "引用这个文件的百科页面：[[raw/docs/…]] 与 Markdown 链接、sources: 条目、tested_by 等 relations"),
+    ("An agent wrote this page and nobody has promoted it yet", "这一页由 agent 写成，还没有人把它提升为可信"),
     ("Back to %@", "返回 %@"),
 ]

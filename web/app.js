@@ -264,6 +264,7 @@ function loadWorkspaceData() {
   $('#file-path').textContent = '';
   $('#file-view').hidden = false;
   $('#file-view').innerHTML = '';
+  clearFileCitations();
   $('#file-editor').hidden = true;
   $('#file-editor').value = '';
   $('#btn-edit').textContent = 'edit';
@@ -1550,6 +1551,7 @@ function clearOpenFile() {
   $('#file-editor').value = '';
   $('#file-editor').hidden = true;
   setFileNotice(null);
+  clearFileCitations();
   $('#btn-edit').textContent = 'edit';
   $('#btn-edit').disabled = true;
   $('#btn-save').disabled = true;
@@ -1683,6 +1685,7 @@ async function openFile(path, labelEl, fragment = null) {
     $('#file-view').hidden = false;
     $('#file-editor').hidden = true;
     renderFileContent(path, content, derived, truncated, bytes);
+    loadFileCitations(path);
     $('#btn-delete').disabled = Boolean(mirroredSource(path));
     if (fragment) scrollToFragment(fragment);
     else $('#file-view').scrollTop = 0;
@@ -1737,6 +1740,52 @@ function scrollToFragment(fragment) {
   heading.scrollIntoView({ block: 'start' });
   flash(heading);
 }
+
+/* ------------------------- pages citing a raw file ------------------------ */
+
+let citationRequest = 0;
+
+/**
+ * The wiki pages citing the open raw/docs file (src/graph/citations.ts), each
+ * with how it cites it, above the text; nothing when none does. A slow answer
+ * for a file the reader already left is dropped, as the mention marks are.
+ */
+async function loadFileCitations(path) {
+  clearFileCitations();
+  if (!path.startsWith('raw/docs/')) return;
+  const request = citationRequest;
+  try {
+    const { citedBy } = await api(`/api/file/citations?path=${encodeURIComponent(path)}`);
+    if (request !== citationRequest || currentFile !== path) return;
+    paintFileCitations(citedBy ?? []);
+  } catch {
+    // the list is extra: the file reads the same without it
+  }
+}
+
+function clearFileCitations() {
+  citationRequest++;
+  paintFileCitations([]);
+}
+
+function paintFileCitations(pages) {
+  $('#file-citations').hidden = pages.length === 0;
+  $('#file-citations-list').innerHTML = pages.map((page) => {
+    const labels = [...new Set(page.links.map((l) => l.label.replace(/_/g, ' ')))].join(' · ');
+    const via = [...new Set(page.links.map((l) => l.via))].join(', ');
+    const badge = page.trust === 'quarantined'
+      ? '<span class="trust quarantined" title="An agent wrote this page and nobody has promoted it yet">quarantined</span>'
+      : '';
+    return `<span class="citation"><a href="#" class="doc-link" data-path="${esc(page.path)}" title="${esc(`${page.path} — ${via}`)}">${esc(page.title || page.path)}</a> <span class="hint">${esc(labels)}</span>${badge}</span>`;
+  }).join('');
+}
+
+$('#file-citations-list').addEventListener('click', (event) => {
+  const link = event.target.closest('a.doc-link');
+  if (!link) return;
+  event.preventDefault();
+  followTo(link.dataset.path);
+});
 
 /* -------------------------- entities in the text -------------------------- */
 
@@ -2091,6 +2140,7 @@ async function unlinkFolderNode(node, removeFiles) {
       $('#file-path').textContent = '';
       $('#file-view').innerHTML = '';
       setFileNotice(null);
+      clearFileCitations();
       $('#btn-edit').disabled = true;
       $('#btn-delete').disabled = true;
     }

@@ -11,6 +11,7 @@ import {
   relationId,
   slugify,
 } from '../graph/store.js';
+import type { PlannedCitation } from '../graph/citations.js';
 import { entityTypeIds, loadOntology, normalizePredicate, Ontology, relationSpec } from '../graph/ontology.js';
 import { resolutionMode, resolveEntityId, ResolvedEntity } from '../graph/resolve.js';
 import { entityKeyKinds, KeyKind, mentionKeys, typesCompatible } from '../graph/normalize.js';
@@ -47,6 +48,9 @@ import {
  * ledger row lock other writers queue on (`lockLedger`), on PGlite the single
  * connection.
  */
+
+/** Citation rows per INSERT: ten parameters each, well under PostgreSQL's 65,535. */
+const CITATION_BATCH = 500;
 
 export interface DocumentProjection {
   id: string;
@@ -135,7 +139,7 @@ export interface NewSuggestion {
 export class ScopeWriter {
   readonly touched: TouchedSet = emptyTouched();
   readonly fsOps: FsOp[] = [];
-  readonly stats: WriterStats = { entities: 0, relations: 0, claims: 0, mentions: 0, chunks: 0, effects: 0, capabilities: 0, locators: 0, unknownPredicates: 0 };
+  readonly stats: WriterStats = { entities: 0, relations: 0, claims: 0, mentions: 0, chunks: 0, effects: 0, capabilities: 0, locators: 0, citations: 0, unknownPredicates: 0 };
   private readonly entityTypes: Set<string>;
   private readonly resolveCache = new Map<string, ResolvedEntity>();
   /** Lookup keys of entities written by this scope body — the fold publishes them only after commit. */
@@ -526,6 +530,27 @@ export class ScopeWriter {
       ],
     );
     this.stats.capabilities++;
+  }
+
+  /**
+   * A wiki page's citations of raw/docs files (src/graph/citations.ts): rows
+   * this scope owns, closed with it on replace or dispose like capability
+   * notes. Batched, because a trader page cites hundreds of posts.
+   */
+  async citations(documentId: string, sourcePath: string, rows: PlannedCitation[]): Promise<void> {
+    for (let i = 0; i < rows.length; i += CITATION_BATCH) {
+      const params: unknown[] = [];
+      const tuples = rows.slice(i, i + CITATION_BATCH).map((r) => {
+        const at = params.push(this.scope.id, documentId, sourcePath, r.path, r.type, r.inverse, r.via, r.fragment, r.chunkId, this.txTime) - 10;
+        return `(${Array.from({ length: 9 }, (_, k) => `$${at + k + 1}`).join(', ')}, $${at + 10}::timestamptz)`;
+      });
+      await this.q.query(
+        `INSERT INTO citations (scope_id, document_id, source_path, target_path, type, inverse, via, fragment, chunk_id, tx_from)
+         VALUES ${tuples.join(', ')}`,
+        params,
+      );
+    }
+    this.stats.citations += rows.length;
   }
 
   /** Queue the document for tier-1 extraction; `segments` is how many extraction calls it will take (progress only). */

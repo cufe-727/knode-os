@@ -237,7 +237,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
 四个一级区，每区自带二级 tab。
 
 - **Library / 资料** —— 盒子里有什么
-  - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown);**＋ add → Import / Link folder from this Mac** 按路径把本机一个文件夹整体带入并保留目录结构——一次性复制,或"链接"后由 `serve` 持续同步原文件夹的变化(树里带 🔗 标记,只读)
+  - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown);**＋ add → Import / Link folder from this Mac** 按路径把本机一个文件夹整体带入并保留目录结构——一次性复制,或"链接"后由 `serve` 持续同步原文件夹的变化(树里带 🔗 标记,只读);打开 `raw/docs` 下的文件时，顶部列出引用它的 wiki 页面(**cited by**:来自它们的 `[[raw/docs/…]]` 与 Markdown 链接、`sources:`(derived from)以及 `tested_by` 等 `relations:`，[写法见此](docs/frontmatter-contract.zh-CN.md))
   - **Search / 检索** —— hybrid/vector/keyword 检索,展示分数构成;可限定在「文件」里选中的目录
   - **Traces / 轨迹** —— 已收集的 agent 会话;点一行即可打开 `raw/traces/` 下对应的镜像文件
 - **Ask / 问答** —— 一个问题，一次 agent 会话。配置好的 agent 通过 MCP 作答，跨多轮追查线索，并把你教它的内容写成隔离笔记（确认后采纳）。没有指定 agent 时跑 01 区的默认连接，所以只要配了模型 Ask 就能用；连这个也没配时，界面会直接说清楚要去配什么。
@@ -249,7 +249,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
 
 ## REST API
 
-`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/tree[?path&depth&dirs] · /api/file · /api/search · /api/graph[?limit&types&edges] · /api/graph/insights · /api/entities[?q&type&sort&order&offset&limit&merged] · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
+`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/tree[?path&depth&dirs] · /api/file · /api/file/citations?path · /api/search · /api/graph[?limit&types&edges] · /api/graph/insights · /api/entities[?q&type&sort&order&offset&limit&merged] · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
 `PUT /api/config` · `PUT /api/file` · `DELETE /api/file` · `POST /api/config/test | /api/upload | /api/ingest | /api/ask | /api/mv | /api/mkdir | /api/traces/sync | /api/dream | /api/wiki/generate | /api/suggestions/:id/status`
 
 每个接口都需要登录会话——已登录浏览器的 cookie,或 `Authorization: Bearer knu_…`(应用的,或 `knode-os user token` 签发给脚本的)——以及该接口所属 API 分组的权限;登录本身在 `/api/auth/*` 下([docs/remote-access.md](docs/remote-access.md))。Workspace 范围内的数据 API 另需请求头 `X-Knode-Workspace-Kind`（`personal` 或 `team`）、`X-Knode-Workspace-ID` 和 `X-Knode-Workspace-Name`；Workspace 的主人就是已登录的账号(只有关闭登录时才看 `X-Knode-User`)。`DELETE /api/workspace` 会彻底清空所选 Workspace。

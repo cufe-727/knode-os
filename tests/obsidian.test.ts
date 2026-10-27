@@ -76,6 +76,17 @@ describe('Obsidian link compatibility', () => {
     expect(resolveKnowledgeLink(data, '../outside.md', '原帖')).toBeNull();
   });
 
+  it('follows a Markdown link that climbs out of its folder, and only as far as the workspace', () => {
+    const data = path.join(tmp, 'climbing');
+    initDataDir(data);
+    write(data, 'wiki/entities/b.md', '# B\n');
+    write(data, 'raw/docs/papers/d1.md', '# d1\n');
+    expect(resolveKnowledgeLink(data, 'wiki/concepts/a.md', '../entities/b.md')).toEqual({ path: 'wiki/entities/b.md', fragment: null });
+    expect(resolveKnowledgeLink(data, 'wiki/concepts/a.md', '../../raw/docs/papers/d1.md#e-4171ba2c'))
+      .toEqual({ path: 'raw/docs/papers/d1.md', fragment: 'e-4171ba2c' });
+    expect(resolveKnowledgeLink(data, 'wiki/concepts/a.md', '../../../outside.md')).toBeNull();
+  });
+
   it('reads the name a link with no note behind it stands for, which may be an entity', () => {
     expect(linkedName(' 英伟达 ')).toBe('英伟达');
     expect(linkedName('英伟达.md#估值')).toBe('英伟达');

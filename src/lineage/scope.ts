@@ -294,8 +294,9 @@ async function disposeTree(
   for (const m of mentions) touched.entities.add(m.entity_id);
 
   // capabilities, their locators and their notes are scope-owned: closing
-  // them here is what retires a source's query surface along with the source
-  for (const table of ['capabilities', 'capability_notes', 'locators']) {
+  // them here is what retires a source's query surface along with the source;
+  // so are a page's citations, which then stop listing it on the files it cited
+  for (const table of ['capabilities', 'capability_notes', 'locators', 'citations']) {
     await q.query(`UPDATE ${table} SET tx_to = $2::timestamptz WHERE scope_id = $1 AND tx_to IS NULL`, [scopeId, txTime]);
   }
 
@@ -612,5 +613,5 @@ export async function gcOrphanRows(q: Queryable): Promise<{ claims: number; rela
 }
 
 function zeroStats(): WriterStats {
-  return { entities: 0, relations: 0, claims: 0, mentions: 0, chunks: 0, effects: 0, capabilities: 0, locators: 0, unknownPredicates: 0 };
+  return { entities: 0, relations: 0, claims: 0, mentions: 0, chunks: 0, effects: 0, capabilities: 0, locators: 0, citations: 0, unknownPredicates: 0 };
 }

@@ -297,6 +297,19 @@ main { flex: 1; min-height: 0; overflow: hidden; display: flex; }
   border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer;
 }
 .file-notice button:hover { border-color: var(--accent); }
+/* the wiki pages citing an open raw/docs file: bounded, so a much-cited file still leaves room to read it */
+.file-citations {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 7px 14px; border-bottom: 1px solid var(--border); background: var(--bg2);
+  max-height: 7.5em; overflow-y: auto;
+}
+.file-citations .eyebrow { flex: none; }
+#file-citations-list { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12.5px; }
+.file-citations .citation { white-space: nowrap; }
+.file-citations .doc-link { color: var(--accent); text-decoration: none; }
+.file-citations .doc-link:hover { text-decoration: underline; }
+.file-citations .trust { margin-left: 4px; padding: 1px 7px; border-radius: 10px; background: var(--bg3); font-family: var(--mono); font-size: 10.5px; }
+.file-citations .trust.quarantined { color: var(--warn, #d08a1d); }
 #file-view { flex: 1; overflow: auto; padding: 18px 26px; max-width: 920px; }
 #file-editor {
   flex: 1; resize: none; border: none; outline: none;

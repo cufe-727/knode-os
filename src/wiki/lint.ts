@@ -4,6 +4,8 @@ import path from 'node:path';
 import { AppContext } from '../context.js';
 import { appendLog } from '../fs/datadir.js';
 import { safePath, walkFiles } from '../fs/files.js';
+import { CitationVia, pageCitations, rawDocTarget, rawDocValue } from '../graph/citations.js';
+import { frontmatterExtraction } from '../graph/frontmatter.js';
 import { entitiesNamed, NamedEntity } from '../graph/resolve.js';
 import { extractObsidianLinks } from '../graph/wire.js';
 import { applyDocScope } from '../ingest/apply.js';
@@ -21,7 +23,8 @@ import { ensureRecentResearch } from './pages.js';
  * `wiki lint` — eslint for the knowledge product. Zero LLM. Finds:
  *
  *   orphan           a page nothing links to (not even index.md), by [[wikilink]] or Markdown link
- *   broken_link      a [[wikilink]] to a name with neither a page nor a graph entity behind it
+ *   broken_link      a [[wikilink]] to a name with neither a page nor a graph entity behind it,
+ *                    or a citation of a raw/docs file that is not there (src/graph/citations.ts)
  *   stale_research   a research page older than the newest evidence about its subject
  *   unreviewed       a quarantined research page nobody promoted for `unreviewedDays`
  *   expired          an OKF `stale_after` in the past
@@ -82,6 +85,28 @@ interface WikiPage {
 /** Most items the report page lists per section. */
 const REPORT_LIST = 100;
 
+/** How a broken citation was written, for the finding. */
+const CITATION_SYNTAX: Record<CitationVia, (target: string) => string> = {
+  wikilink: (t) => `[[${t}]]`,
+  embed: (t) => `![[${t}]]`,
+  markdown: (t) => `Markdown link to ${t}`,
+  sources: (t) => `sources entry ${t}`,
+  relations: (t) => `relations entry ${t}`,
+};
+
+/** A cited file exists under any spelling the app's link resolver would open it by (src/obsidian/links.ts). */
+function citedFileExists(dataDir: string, target: string): boolean {
+  const candidates = path.posix.extname(target) ? [target] : [target, `${target}.md`, `${target}.markdown`, `${target}/index.md`];
+  return candidates.some((rel) => {
+    try {
+      const abs = safePath(dataDir, rel);
+      return fs.existsSync(abs) && fs.statSync(abs).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
+
 function loadPages(dataDir: string): WikiPage[] {
   const out: WikiPage[] = [];
   for (const rel of walkFiles(dataDir, 'wiki')) {
@@ -127,7 +152,8 @@ export async function lintWiki(ctx: AppContext, opts: LintOptions = {}): Promise
   };
   const sources = [...pages.map((p) => ({ path: p.path, body: p.body })), { path: 'wiki/index.md', body: indexText }];
   const wikilinks = sources.map((src) =>
-    extractObsidianLinks(src.body).map((l) => {
+    // a [[raw/docs/…]] link cites a file (checked below), it names no page: its basename must not reach one
+    extractObsidianLinks(src.body).filter((l) => !rawDocTarget(src.path, l.target)).map((l) => {
       const base = path.posix.basename(l.target.replace(/\.md$/i, '')).toLowerCase();
       return { raw: l.target, resolved: byBase.get(base) ?? [] };
     }),
@@ -171,6 +197,26 @@ export async function lintWiki(ctx: AppContext, opts: LintOptions = {}): Promise
   for (const p of pages) {
     if (p.path.startsWith('wiki/sources/') || p.path.startsWith('wiki/questions/')) continue; // reached from their indexes / search, not links
     if (!inbound.get(p.path)) issues.push({ kind: 'orphan', path: p.path, detail: 'no page (nor index.md) links here' });
+  }
+
+  // citations of raw/docs files (src/graph/citations.ts) are kept by path whether or not the file exists: say which do not
+  const fileExists = new Map<string, boolean>();
+  for (const p of pages) {
+    const relations = frontmatterExtraction({ relations: p.frontmatter.relations }, { citationTarget: (v) => rawDocValue(p.path, v) })?.citations ?? [];
+    const cited = [
+      ...pageCitations(p.path, p.frontmatter, p.body, { frontmatter: true }),
+      ...relations.map((d) => ({ ...d, via: 'relations' as const })),
+    ];
+    const reported = new Set<string>();
+    for (const c of cited) {
+      const key = c.path.toLowerCase();
+      if (reported.has(key)) continue;
+      let exists = fileExists.get(key);
+      if (exists === undefined) fileExists.set(key, (exists = citedFileExists(dataDir, c.path)));
+      if (exists) continue;
+      reported.add(key);
+      issues.push({ kind: 'broken_link', path: p.path, detail: `${CITATION_SYNTAX[c.via](c.path)} names no file` });
+    }
   }
 
   const now = new Date().toISOString();

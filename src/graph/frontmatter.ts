@@ -1,3 +1,4 @@
+import type { RawDocTarget } from './citations.js';
 import { normalizePredicate, Ontology } from './ontology.js';
 import { CLAIM_STATUS, ExtractedClaim, ExtractedEntity, ExtractedRelation, normalizeClaimKind } from './store.js';
 
@@ -28,6 +29,15 @@ export interface DeclaredExtraction {
   entities: ExtractedEntity[];
   relations: ExtractedRelation[];
   claims: ExtractedClaim[];
+  /** Relations naming a raw/docs file, diverted when `citationTarget` is given. */
+  citations: DeclaredCitation[];
+}
+
+export interface DeclaredCitation extends RawDocTarget {
+  /** The predicate as written; relationCitation (src/graph/citations.ts) normalizes it. */
+  type: string;
+  /** The file was the relation's source and the page its target. */
+  fileIsSource: boolean;
 }
 
 export interface DeclaredOptions {
@@ -35,6 +45,14 @@ export interface DeclaredOptions {
   defaultSource?: string;
   /** When given, relation predicates are checked against the ontology and unknown ones reported. */
   ontology?: Ontology;
+  /**
+   * The raw/docs file a relation endpoint names, if any (a wiki page's
+   * citations, src/graph/citations.ts). A relation between the page itself —
+   * `source` absent or `defaultSource` — and such a file becomes a citation
+   * rather than an edge to an entity named after the file. Paired with another
+   * entity, or with a second file, it is dropped: there is no node to put it on.
+   */
+  citationTarget?: (value: string) => RawDocTarget | null;
 }
 
 /** `[[Name|label]]` → `Name`; plain strings pass through. */
@@ -84,7 +102,19 @@ export function frontmatterExtraction(fm: Record<string, unknown>, opts: Declare
   }
 
   const relations: ExtractedRelation[] = [];
+  const citations: DeclaredCitation[] = [];
   const addRelation = (source: string, target: string, type: string, extra: Record<string, unknown> = {}) => {
+    if (opts.citationTarget) {
+      const fromFile = opts.citationTarget(source);
+      const toFile = opts.citationTarget(target);
+      if (fromFile || toFile) {
+        const other = wikilinkName(toFile ? source : target).toLowerCase();
+        const isPage = !other || other === (opts.defaultSource ?? '').trim().toLowerCase();
+        const ty = typeof type === 'string' ? type.trim() : '';
+        if (ty && isPage && !(fromFile && toFile)) citations.push({ ...(toFile ?? fromFile)!, type: ty, fileIsSource: !toFile });
+        return;
+      }
+    }
     const s = wikilinkName(source);
     const t = wikilinkName(target);
     const ty = typeof type === 'string' ? type.trim() : '';
@@ -150,6 +180,6 @@ export function frontmatterExtraction(fm: Record<string, unknown>, opts: Declare
     if (typeof o.object === 'string' && wikilinkName(o.object)) addEntity({ name: wikilinkName(o.object), type: 'concept' });
   }
 
-  if (entities.length === 0 && claims.length === 0 && relations.length === 0) return null;
-  return { entities, relations, claims };
+  if (entities.length === 0 && claims.length === 0 && relations.length === 0 && citations.length === 0) return null;
+  return { entities, relations, claims, citations };
 }

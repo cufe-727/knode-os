@@ -30,27 +30,30 @@ export function resolveKnowledgeLink(
   if (!source) return null;
   if (!pathPart) return existingFile(dataDir, source) ? { path: source, fragment } : null;
 
-  const clean = normalizeRelative(pathPart.replace(/^\/+/, ''));
-  if (!clean) return null;
+  const target = pathPart.replace(/^\/+/, '');
+  // null for a path that climbs above its start (`../../raw/docs/x.md`): it can
+  // still be relative to the page, which is joined before it is judged
+  const clean = normalizeRelative(target);
   const sourceDir = path.posix.dirname(source);
   const vaultRoot = source === 'wiki' || source.startsWith('wiki/') ? 'wiki' : null;
   const candidates: string[] = [];
 
   // Explicit workspace-root paths remain workspace-root paths. Everything else
   // first follows ordinary Markdown's source-relative resolution.
-  if (/^(wiki|raw)(\/|$)/.test(clean)) candidates.push(clean);
-  else candidates.push(path.posix.join(sourceDir, clean));
-  if (vaultRoot && clean !== vaultRoot && !clean.startsWith(`${vaultRoot}/`)) {
+  if (clean && /^(wiki|raw)(\/|$)/.test(clean)) candidates.push(clean);
+  else candidates.push(path.posix.join(sourceDir, target));
+  if (clean && vaultRoot && clean !== vaultRoot && !clean.startsWith(`${vaultRoot}/`)) {
     candidates.push(path.posix.join(vaultRoot, clean));
   }
-  candidates.push(clean);
+  if (clean) candidates.push(clean);
 
+  // resolveCandidate normalizes again and refuses anything outside the workspace
   for (const candidate of unique(candidates)) {
     const resolved = resolveCandidate(dataDir, candidate);
     if (resolved) return { path: resolved, fragment };
   }
 
-  if (!vaultRoot) return null;
+  if (!vaultRoot || !clean) return null;
   const wikiFiles = markdownFiles(dataDir, vaultRoot);
   const wantedStem = path.posix.basename(clean).replace(/\.(md|markdown)$/i, '');
 

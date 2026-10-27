@@ -83,6 +83,7 @@ import {
 } from '../research/agents.js';
 import { availableAgents, suggestResearchAgent } from '../research/executors.js';
 import { sync, SyncStats } from '../ingest/sync.js';
+import { citedBy } from '../lineage/citations.js';
 import { historyOf, lineageOf } from '../lineage/inspect.js';
 import { forgetSource, purgeArchived, purgeDisposed } from '../lineage/purge.js';
 import { rebuild } from '../lineage/rebuild.js';
@@ -1018,6 +1019,19 @@ export function createApp(
       return c.json({ path: p, content: file.content, bytes: file.bytes, truncated: file.truncated, derived: file.derived });
     } catch (e) {
       return c.json(err(e), 404);
+    }
+  });
+
+  // the wiki pages citing a raw/docs file (src/graph/citations.ts): the file view's "Cited by"
+  app.get('/api/file/citations', async (c) => {
+    const ctx = requestCtx(c);
+    const p = c.req.query('path');
+    if (!p) return c.json({ error: 'path required' }, 400);
+    if (isPrivatePath(p)) return c.json({ error: `${p} is not available through the file API`, reason: 'private' }, 403);
+    try {
+      return c.json({ path: p, citedBy: await citedBy(ctx.store, p) });
+    } catch (e) {
+      return c.json(err(e), 500);
     }
   });
 

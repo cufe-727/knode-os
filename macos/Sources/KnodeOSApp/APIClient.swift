@@ -259,6 +259,11 @@ struct APIClient {
         return try await send(path("/api/file", query: query))
     }
 
+    /// The wiki pages citing a raw/docs file. An older service answers 404.
+    func fileCitations(at filePath: String) async throws -> FileCitationsResponse {
+        try await send(path("/api/file/citations", query: [.init(name: "path", value: filePath)]))
+    }
+
     func resolveLink(_ target: String, from sourcePath: String) async throws -> ResolvedLinkResponse {
         try await send(path("/api/link/resolve", query: [
             .init(name: "target", value: target),

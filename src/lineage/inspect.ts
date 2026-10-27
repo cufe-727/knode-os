@@ -1,5 +1,6 @@
 import { LedgerEvent, readLedger } from './ledger.js';
 
+import { CitedFile, citedBy, CitingPage, citesOf } from './citations.js';
 import { readDeps } from './deps.js';
 import { scopesForKey, scopeById } from './scope.js';
 import { Store } from '../store/db.js';
@@ -33,6 +34,9 @@ export interface LineageReport {
   evidence: EvidenceView[];
   deps?: DepRow[];
   scopes?: ScopeRow[];
+  /** A document: the wiki pages citing it, and the raw/docs files it cites (src/graph/citations.ts). */
+  citedBy?: CitingPage[];
+  cites?: CitedFile[];
 }
 
 const TABLE: Record<'entity' | 'relation' | 'claim', string> = { entity: 'entities', relation: 'relations', claim: 'claims' };
@@ -52,7 +56,15 @@ export async function lineageOf(store: Store, kind: LineageReport['kind'], id: s
     for (const s of scopes) {
       children.push(...(await store.query<ScopeRow>(`SELECT * FROM scopes WHERE parent_id = $1 ORDER BY applied_at DESC`, [s.id])).map(normalizeScope));
     }
-    return { kind, id: key, current: current ?? null, evidence: [], scopes: [...scopes, ...children] };
+    return {
+      kind,
+      id: key,
+      current: current ?? null,
+      evidence: [],
+      scopes: [...scopes, ...children],
+      citedBy: await citedBy(store, key),
+      cites: await citesOf(store, key),
+    };
   }
   const [current] = await store.query<Record<string, unknown>>(`SELECT * FROM ${TABLE[kind]} WHERE id = $1`, [id]);
   const rows = await store.query<{
