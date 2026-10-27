@@ -11,7 +11,7 @@ import { saveAgent } from '../src/research/agents.js';
 import { readManifest, registerPath, waitForCaptureIndexing } from '../src/research/capture.js';
 import { checkCharts, parseChart } from '../src/research/chart.js';
 import { claimNextJob, getJob, listJobs } from '../src/research/jobs.js';
-import { normalizeBrief, refineBrief, sourcesHeading } from '../src/research/refine.js';
+import { localizeNoteHeadings, normalizeBrief, noteHeadings, refineBrief, sourceMarker, sourcesHeading } from '../src/research/refine.js';
 import { runResearchJob } from '../src/research/runner.js';
 import { continueStudies, createStudy, refineStudy, startProblem, startStudy, studyPayload, studyView, updateStudy } from '../src/research/study.js';
 import { createApp } from '../src/server/app.js';
@@ -143,6 +143,16 @@ describe('briefs', () => {
     expect(none.refiner).toBe('template');
     expect(none.brief.pages).toHaveLength(1);
   });
+
+  it('cites and heads notes in the study language, whichever language a collector used', () => {
+    expect(sourceMarker('en')).toBe('(Source: raw/docs/…)');
+    expect(sourceMarker('zh-CN')).toBe('（来源：raw/docs/…）');
+    expect(sourceMarker('ja')).toBe('(Source: raw/docs/…)'); // like the sources heading, other languages get the English form
+    expect(noteHeadings('en')).toEqual(['## Findings', '## Data', '## Views', '## Gaps']);
+    const note = '## 发现\n- revenue rose\n\n##  数据 \n- 2025=4.5\n\n### 发现\n## 观点\n- bullish\n\n## 缺口\n- none\n## Other\n';
+    expect(localizeNoteHeadings(note, 'en')).toBe('## Findings\n- revenue rose\n\n## Data\n- 2025=4.5\n\n### 发现\n## Views\n- bullish\n\n## Gaps\n- none\n## Other\n');
+    expect(localizeNoteHeadings('## Findings\n- x\n## Gaps\n', 'zh')).toBe('## 发现\n- x\n## 缺口\n');
+  });
 });
 
 describe('charts', () => {
@@ -198,6 +208,12 @@ describe('a study, end to end', () => {
     expect(p.notes).toHaveLength(2);
     const note = fs.readFileSync(path.join(wsDir, p.notes[0]), 'utf8');
     expect(note).toContain('type: research-notes');
+    // the collector headed its notes in Chinese (the fake copies the template); an English study keeps English ones
+    expect(note).toContain('## Findings');
+    expect(note).not.toContain('## 发现');
+    const collectPrompt = fs.readFileSync(path.join(wsDir, '.runs', `${studyId}-collect`, 'prompt-collect.md'), 'utf8');
+    expect(collectPrompt).toContain('正文出处写 `(Source: raw/docs/…)`');
+    expect(collectPrompt).toContain('`## Findings` / `## Data` / `## Views` / `## Gaps`');
     expect(note).toMatch(/sources: \["raw\/docs\/research\/anthropic-ipo-deep-dive\/web\//);
     // the seed and both collectors' pages are captured, in the manifest and the register
     const captured = readManifest(wsDir).entries.filter((e) => e.studies.some((s) => s.id === studyId));
@@ -228,6 +244,8 @@ describe('a study, end to end', () => {
       const brief = fs.readFileSync(path.join(wsDir, '.runs', done.id, 'brief.md'), 'utf8');
       expect(brief).toContain('研究课题（study');
       expect(brief).toContain('raw/docs/research/anthropic-ipo-deep-dive/sources.md');
+      expect(brief).toContain('正文出处写 `(Source: raw/docs/…)`');
+      expect(brief).not.toContain('笔记的四个固定标题'); // a page writes no notes
     }
     expect(await continueStudies(ctx)).toBe(1);
     const study = await getJob(ctx.store, studyId);

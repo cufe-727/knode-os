@@ -103,6 +103,36 @@ export function defaultReportSections(language: string): string[] {
   return REPORT_SECTIONS[language.slice(0, 2).toLowerCase()] ?? REPORT_SECTIONS.en;
 }
 
+const SOURCE_MARKER: Record<string, string> = { en: '(Source: raw/docs/…)', zh: '（来源：raw/docs/…）' };
+
+/** How a page in this language cites a file inline (the research protocol and templates show the Chinese form). */
+export function sourceMarker(language: string): string {
+  return SOURCE_MARKER[language.slice(0, 2).toLowerCase()] ?? SOURCE_MARKER.en;
+}
+
+const NOTE_HEADINGS: Record<string, string[]> = {
+  en: ['## Findings', '## Data', '## Views', '## Gaps'],
+  zh: ['## 发现', '## 数据', '## 观点', '## 缺口'],
+};
+
+/** A collector's note headings in this language, in their fixed order: findings, data, views, gaps. */
+export function noteHeadings(language: string): string[] {
+  return NOTE_HEADINGS[language.slice(0, 2).toLowerCase()] ?? NOTE_HEADINGS.en;
+}
+
+/** A collector's note with its fixed headings in this language, whichever language it headed them in. */
+export function localizeNoteHeadings(text: string, language: string): string {
+  const wanted = noteHeadings(language);
+  return text.replace(/^##[ \t].*$/gm, (line) => {
+    const heading = line.replace(/\s+/g, ' ').trim();
+    for (const headings of Object.values(NOTE_HEADINGS)) {
+      const i = headings.indexOf(heading);
+      if (i >= 0) return wanted[i];
+    }
+    return line;
+  });
+}
+
 /** 'zh' when the text is mostly CJK, else 'en'. */
 export function detectLanguage(text: string): string {
   const cjk = (text.match(/[㐀-鿿豈-﫿]/g) ?? []).length;

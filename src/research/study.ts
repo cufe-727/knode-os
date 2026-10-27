@@ -14,7 +14,7 @@ import { createJobRow, getJob, listJobs, ResearchJob, TERMINAL_STATUSES, updateJ
 import { isCancelled, JobCancelledError, killAgentsFor, launchSession } from './launch.js';
 import { PhaseRecord } from './pipeline.js';
 import { activeProfile, effectiveEffort, effectiveSpeed, loadProfile, ResearchProfile, webAllowed } from './profile.js';
-import { detectLanguage, normalizeBrief, refineBrief, sourcesHeading, StudyBrief, StudyPage, templateBrief } from './refine.js';
+import { detectLanguage, localizeNoteHeadings, normalizeBrief, noteHeadings, refineBrief, sourceMarker, sourcesHeading, StudyBrief, StudyPage, templateBrief } from './refine.js';
 import { loadResearchSources, mcpServersFor, ExtraMcpServer, ResearchSource, sourcesBrief } from './sources.js';
 import { loadPhasePrompt, loadResearchProtocol, researchSlug } from './templates.js';
 import { knowledgeNotes, McpEndpoint, runsRoot, writeAgentFiles } from './workspace.js';
@@ -452,16 +452,22 @@ function languageName(tag: string): string {
  * The study as an agent reads it — in every collector's prompt, and in the
  * brief of every page and of the report: what is being researched, for what,
  * within which bounds, which pages exist, and what has been gathered so far.
+ * It names the source marker (and, for collectors, the note headings) in the
+ * study's language: the protocol and templates a workspace was seeded with
+ * show the Chinese ones, and a page in English copied them.
  */
-export function studyDocument(ctx: AppContext, job: ResearchJob, opts: { focusPage?: string | null; sources: ResearchSource[]; web: boolean; webSearchTool: boolean }): string {
+export function studyDocument(ctx: AppContext, job: ResearchJob, opts: { focusPage?: string | null; sources: ResearchSource[]; web: boolean; webSearchTool: boolean; notes?: boolean }): string {
   const p = studyPayload(job);
   const b = p.brief;
   const slug = job.target ?? b.slug;
+  const zh = b.language.startsWith('zh');
   const lines = [
     `## 研究课题（study \`${job.id}\`）`,
     '',
     `- 课题：${b.title}`,
     `- 输出语言：${languageName(b.language)}——页面标题、正文与章节标题都用这个语言（frontmatter 的键名不变）`,
+    `- 正文出处写 \`${sourceMarker(b.language)}\`${zh ? '' : '：协议与模板里的「（来源：…）」是中文写法，本课题不用'}`,
+    opts.notes ? `- 笔记的四个固定标题依次写 ${noteHeadings(b.language).map((h) => `\`${h}\``).join(' / ')}${zh ? '' : '，不用模板里的中文标题'}` : null,
     `- 目标：${b.objective}`,
     b.restatement ? `- 研究请求（改写）：${b.restatement}` : null,
     `- 范围：${b.scope.include.length ? `包含 ${b.scope.include.join('；')}` : '（未限定）'}${b.scope.exclude.length ? `；不含 ${b.scope.exclude.join('；')}` : ''}${b.scope.timeframe ? `；时间 ${b.scope.timeframe}` : ''}；截至 ${b.scope.asOf}`,
@@ -684,7 +690,7 @@ export async function runStudyCollect(ctx: AppContext, jobIn: ResearchJob, deps:
       readme: `Collector sessions of study ${job.id}. transcript-collect-<n>.jsonl are their outputs; the notes land in ${studyFolder(slug)}/notes/.\n`,
       extraMcp,
     });
-    const document = studyDocument(ctx, job, { sources, web, webSearchTool: webSearchEnabled(ctx.config.research.web) });
+    const document = studyDocument(ctx, job, { sources, web, webSearchTool: webSearchEnabled(ctx.config.research.web), notes: true });
     const collectors = Math.max(1, ctx.config.research.study.collectors);
     const perCollector = Math.max(4, Math.ceil(maxCaptures / Math.max(1, p.brief.pages.length)));
     const results = await pool(p.brief.pages, collectors, async (page, i) => {
@@ -712,7 +718,7 @@ export async function runStudyCollect(ctx: AppContext, jobIn: ResearchJob, deps:
         return null;
       }
       const rel = `${studyFolder(slug)}/notes/${String(i + 1).padStart(2, '0')}-${page.slug}.md`;
-      notesFile(ctx.dataDir, { rel, title: `${zh ? '收集笔记' : 'Notes'} — ${page.title}`, study: job.id, page: page.id, actor, sources: citedPaths(text), body: text, language: lang });
+      notesFile(ctx.dataDir, { rel, title: `${zh ? '收集笔记' : 'Notes'} — ${page.title}`, study: job.id, page: page.id, actor, sources: citedPaths(text), body: localizeNoteHeadings(text, lang), language: lang });
       return rel;
     });
     notes.push(...results.filter((r): r is string => Boolean(r)));
