@@ -519,10 +519,10 @@ export function revisionRounds(critics: ResearchRole[], revisers: ResearchRole[]
  * session is masked to `false` here rather than being handed a brief that
  * promises external verification it cannot perform.
  */
-export function webAllowed(input: { gate: 'off' | 'verify' | 'research'; kind: string; profile: ResearchProfile; role?: ResearchRole | null; agent?: ResearchAgent | null }): boolean {
+export function webAllowed(input: { gate: 'off' | 'verify' | 'research'; kind: string; profile: ResearchProfile; role?: ResearchRole | null; agent?: ResearchAgent | null; search?: boolean }): boolean {
   const { gate, kind, profile, role } = input;
   if (gate === 'off') return false;
-  if (input.agent !== undefined && !agentWebCapable(input.agent)) return false;
+  if (input.agent !== undefined && !agentWebCapable(input.agent, input.search)) return false;
   const roleWeb = role?.tools.web ?? 'inherit';
   if (roleWeb === 'off' || (roleWeb === 'inherit' && profile.search.web === 'off')) return false;
   if (gate === 'research') return true;
@@ -530,9 +530,14 @@ export function webAllowed(input: { gate: 'off' | 'verify' | 'research'; kind: s
   return kind === 'verify' || forced;
 }
 
-/** Sections the page must have: the template's plus the evidence table when the profile asks for one. */
-export function requiredSections(template: ResearchTemplate, profile: ResearchProfile | null | undefined): string[] {
-  const sections = [...template.requires.sections];
+/**
+ * Sections the page must have: the template's — or, for a study's pages, the
+ * outline its brief planned (`job.payload.sections`) — plus the evidence
+ * table when the profile asks for one.
+ */
+export function requiredSections(template: ResearchTemplate, profile: ResearchProfile | null | undefined, job?: { payload?: Record<string, unknown> } | null): string[] {
+  const planned = Array.isArray(job?.payload?.sections) ? (job!.payload!.sections as unknown[]).map(String).filter((s) => s.trim()) : null;
+  const sections = planned?.length ? [...planned] : [...template.requires.sections];
   if (profile?.output.evidenceTable && !sections.some((s) => /证据表|evidence/i.test(s))) sections.push(EVIDENCE_TABLE_SECTION);
   return sections;
 }

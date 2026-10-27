@@ -379,6 +379,12 @@
           const label = parts.length > 3 ? `…/${parts.slice(-2).join('/')}` : token.text;
           return `<a class="path-link" href="#" data-wikilink="${escapeHtml(token.text)}" title="${escapeHtml(token.text)}"><code>${escapeHtml(label)}</code></a>`;
         },
+        code(token) {
+          // a ```chart block is data web/chart.js draws, every string in it escaped; without chart.js it stays code
+          const lang = String(token.lang ?? '').trim().toLowerCase().split(/\s+/, 1)[0];
+          if (lang !== 'chart' || !global.knodeChart) return false;
+          return global.knodeChart.render(token.text);
+        },
       },
       extensions: [anchor, footnoteDef, wikilink, footnoteRef],
     });

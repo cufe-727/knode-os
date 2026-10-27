@@ -16,6 +16,8 @@ import { renderSurvey } from './survey.js';
 import { ResearchTemplate, templateFor } from './templates.js';
 import { validateCompanions, validateResearchPage } from './validate.js';
 import { McpEndpoint, prepareRunWorkspace, pruneRuns, runsRoot, RunWorkspace } from './workspace.js';
+import { markStudyReport, runStudyCollect, studyAgent, studyBriefLines, studyMcpServers, studyPayload, studyProfile } from './study.js';
+import { webSearchEnabled } from './web.js';
 import { ensureRecentResearch } from '../wiki/pages.js';
 import { fileMergeCandidate } from '../graph/dedupe.js';
 import { resolveEntityId } from '../graph/resolve.js';
@@ -59,10 +61,20 @@ async function markCancelled(ctx: AppContext, jobId: string, log: (m: string) =>
   return row;
 }
 
+/** A study and its pages carry their own runner; every other job runs on research.agent. */
+function isStudyJob(job: ResearchJob): boolean {
+  return job.kind === 'study' || job.kind === 'section';
+}
+
+/** The agent a job runs on: the test's override, a study's own runner, else research.agent. */
+export function agentForJob(ctx: AppContext, job: ResearchJob): ResearchAgent | null {
+  return isStudyJob(job) ? studyAgent(ctx, job) : resolveResearchAgent(ctx.config, ctx.dataDir);
+}
+
 export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: RunOptions): Promise<ResearchJob> {
   const log = opts.log ?? (() => {});
   const research = ctx.config.research;
-  const agent = opts.agent ?? resolveResearchAgent(ctx.config, ctx.dataDir);
+  const agent = opts.agent ?? agentForJob(ctx, jobIn);
   if (!agent) throw new Error(`no research agent configured: set research.agent to a CLI (claude-cli / codex-cli / cursor-cli), a connection id, or 'default' to run the built-in agent on the default LLM connection (Settings → Providers & Agents)`);
   clearCancelled(jobIn.id); // a job that starts (or restarts) is not cancelled, whatever an earlier attempt was
   let job = (await updateJob(ctx.store, jobIn.id, {
@@ -88,10 +100,23 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
     return (await updateJob(ctx.store, job.id, { status: 'failed', error, finishedAt: new Date().toISOString(), payload: { ...job.payload, rejections } }))!;
   };
 
-  const profile = opts.profile ?? activeProfile(ctx.dataDir, ctx.config);
+  const profile = opts.profile ?? (isStudyJob(job) ? studyProfile(ctx, job) : activeProfile(ctx.dataDir, ctx.config));
   const webGate = ctx.config.review?.external ?? 'verify';
-  const allowNetwork = webAllowed({ gate: webGate, kind: job.kind, profile, agent });
-  const pipeline = effectivePipeline(profile, ctx.config);
+  const webSearch = webSearchEnabled(research?.web);
+  const allowNetwork = webAllowed({ gate: webGate, kind: job.kind, profile, agent, search: webSearch });
+  // a study's report reads the pages it links: one session is enough, and quicker than a team
+  const pipeline = job.kind === 'study' ? 'single' : effectivePipeline(profile, ctx.config);
+  const extraMcp = isStudyJob(job) ? studyMcpServers(ctx, job) : [];
+
+  // a study's first stage gathers material and queues its pages; only its report is a page of its own
+  if (job.kind === 'study' && studyPayload(job).stage !== 'report') {
+    try {
+      return await runStudyCollect(ctx, job, { mcp: opts.mcp, agent, profile, readDirs, log });
+    } catch (err) {
+      if (err instanceof JobCancelledError) return markCancelled(ctx, job.id, log);
+      return fail(`study: ${err instanceof Error ? err.message : err}`, false);
+    }
+  }
 
   // an initialization first brings the base up to date and surveys it; the survey replaces the resolve seed in the brief
   let seed: string | undefined;
@@ -110,6 +135,8 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
     ws = await prepareRunWorkspace(ctx, job, template, {
       runsDir: research?.runsDir ?? '.runs', provider: agent.provider, mcp: opts.mcp, readDirs, allowNetwork, profile,
       seed, guide: job.kind === 'init' ? null : undefined,
+      extraBrief: isStudyJob(job) ? await studyBriefLines(ctx, job, { allowNetwork }) : undefined,
+      extraMcp,
     });
     job = (await updateJob(ctx.store, job.id, {
       worksetId: ws.worksetId,
@@ -124,7 +151,7 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
   let launched: LaunchResult;
   try {
     if (pipeline === 'team' || pipeline === 'native') {
-      const pipelineInput = { job, template, ws, agent, mcp: opts.mcp, readDirs, profile, webGate, log, agentFor: (spec: string, model: string) => agentForSpec(ctx.config, spec, model, ctx.dataDir) };
+      const pipelineInput = { job, template, ws, agent, mcp: opts.mcp, readDirs, profile, webGate, webSearch, extraMcp, log, agentFor: (spec: string, model: string) => agentForSpec(ctx.config, spec, model, ctx.dataDir) };
       const team = pipeline === 'team' ? await runTeamPipeline(ctx, pipelineInput) : await runNativePipeline(ctx, pipelineInput);
       launched = team;
       const topics = job.kind === 'init' ? topicsFrom(team.planText || team.resultText) : undefined;
@@ -142,6 +169,7 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
         effort: profile.reasoning.effort,
         speed: profile.reasoning.speed,
         webFreshness: profile.search.freshness,
+        extraMcp,
       });
       if (job.kind === 'init') job = (await updateJob(ctx.store, job.id, { payload: { ...job.payload, topics: topicsFrom(launched.resultText) } }))!;
     }
@@ -151,7 +179,8 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
   }
   const done = await finalizeResearchJob(ctx, job, ws, launched, { ...opts, agent, template, profile });
   clearCancelled(job.id);
-  return done;
+  if (done.kind === 'study') await markStudyReport(ctx, done).catch(() => {});
+  return (await getJob(ctx.store, done.id)) ?? done;
 }
 
 /**
@@ -192,7 +221,7 @@ export async function finalizeResearchJob(
   report.errors.push(...companions.errors);
   report.warnings.push(...companions.warnings);
   report.ok = report.errors.length === 0;
-  if (job.kind === 'verify' && !agentWebCapable(opts.agent)) {
+  if (job.kind === 'verify' && !agentWebCapable(opts.agent, webSearchEnabled(research?.web))) {
     report.warnings.push('the built-in agent has no web tool — this verification checked the knowledge base only, not external sources');
   }
   if (fs.existsSync(ws.dir)) fs.writeFileSync(path.join(ws.dir, 'validation.json'), JSON.stringify(report, null, 2) + '\n');

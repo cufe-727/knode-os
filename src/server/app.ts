@@ -128,7 +128,7 @@ import { applyClaimMerge, listClaimMerges, unmergeClaim } from '../graph/claim-m
 import { applyMerge, listMerges, unmergeEntity } from '../graph/merge.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { reviewClaims } from '../graph/claim-review.js';
-import { cancelJob, getJob, latestJob, listJobs, queueJob, retryJob, ResearchStatus } from '../research/jobs.js';
+import { cancelJob, getJob, latestJob, listJobs, queueJob, retryJob, ResearchStatus, updateJob } from '../research/jobs.js';
 import { builtinAvailable, killAgentsFor } from '../research/launch.js';
 import { loadResearchTemplates, PHASES, RESEARCH_KINDS, ResearchKind } from '../research/templates.js';
 import { activeProfile, BUILTIN_PROFILES, deleteProfile, EFFORTS, effectivePipeline, isValidProfileName, loadProfile, loadProfiles, PIPELINE_MODES, profileSummary, ResearchProfile, rolePromptText, saveProfile, writeRolePrompt } from '../research/profile.js';
@@ -139,6 +139,10 @@ import { CHAT_PROTOCOL_FILE, loadChatProtocol, saveChatProtocol } from '../chat/
 import { CHAT_DIR } from '../fs/layout.js';
 import { McpEndpoint, runsRoot } from '../research/workspace.js';
 import { recommendWikiTopics, refreshRecommendations } from '../research/recommend.js';
+import { captureUrl, readManifest } from '../research/capture.js';
+import { deleteResearchSource, loadResearchSources, redactSource, RESEARCH_SOURCE_KINDS, saveResearchSource, sourceProblem } from '../research/sources.js';
+import { cancelStudy, createStudy, deleteStudyDraft, listStudies, refineStudyInBackground, refiningSince, startProblem, startStudy, studyView, updateStudy, studyPayload } from '../research/study.js';
+import { webSearchEnabled, WEB_SEARCH_PROVIDERS } from '../research/web.js';
 import { lintWiki } from '../wiki/lint.js';
 
 /**
@@ -184,7 +188,12 @@ type ModelConfigDraft = {
   llmUse?: string;
   extraction?: ExtractionConfigDraft;
   retrieval?: { sag?: Partial<SagSearchConfig> };
-  research?: Partial<Omit<ResearchConfig, 'auto' | 'init'>> & { auto?: Partial<ResearchConfig['auto']>; init?: Partial<ResearchConfig['init']> };
+  research?: Partial<Omit<ResearchConfig, 'auto' | 'init' | 'study' | 'web'>> & {
+    auto?: Partial<ResearchConfig['auto']>;
+    init?: Partial<ResearchConfig['init']>;
+    study?: Partial<ResearchConfig['study']>;
+    web?: Partial<Omit<ResearchConfig['web'], 'search'>> & { search?: Partial<ResearchConfig['web']['search']> };
+  };
   chat?: Partial<ChatConfig>;
   /** What the Judge stage does with its verdicts, and the workspace's web switch (Research tab); the other review keys are file-only. */
   review?: Partial<Pick<ReviewConfig, 'llmJudge' | 'claims' | 'claimMerge' | 'external'>>;
@@ -878,6 +887,40 @@ export function createApp(
           if (r.init.followUps !== undefined && Number.isFinite(followUps)) cur.init.followUps = Math.min(20, Math.max(0, Math.floor(followUps)));
           const maxMs = Number(r.init.extractionMaxMs);
           if (r.init.extractionMaxMs !== undefined && Number.isFinite(maxMs)) cur.init.extractionMaxMs = Math.min(3_600_000, Math.max(60_000, Math.floor(maxMs)));
+        }
+        if (r.study) {
+          cur.study = { ...cur.study };
+          const clamp = (key: 'collectors' | 'maxPages' | 'maxCaptures', min: number, max: number) => {
+            const value = Number(r.study![key]);
+            if (r.study![key] !== undefined && Number.isFinite(value)) cur.study[key] = Math.min(max, Math.max(min, Math.floor(value)));
+          };
+          clamp('collectors', 1, 8);
+          clamp('maxPages', 1, 12);
+          clamp('maxCaptures', 1, 500);
+          if (typeof r.study.refiner === 'string') {
+            const spec = r.study.refiner.trim();
+            if (spec && !agentForSpec(next, spec, '', ctx.dataDir) && !llmTargets(next).some((t) => t.id === spec)) return c.json({ error: `unknown refiner "${spec}"` }, 400);
+            cur.study.refiner = spec;
+          }
+        }
+        if (r.web) {
+          cur.web = { ...cur.web, search: { ...cur.web.search } };
+          if (r.web.search) {
+            const sr = r.web.search;
+            if (typeof sr.provider === 'string' && (sr.provider === '' || (WEB_SEARCH_PROVIDERS as string[]).includes(sr.provider))) cur.web.search.provider = sr.provider;
+            if (typeof sr.baseUrl === 'string') cur.web.search.baseUrl = sr.baseUrl.trim();
+            // '***' is the redacted key GET /api/config hands out: keep the stored one
+            if (typeof sr.apiKey === 'string' && sr.apiKey !== '***') cur.web.search.apiKey = sr.apiKey.trim();
+            const max = Number(sr.maxResults);
+            if (sr.maxResults !== undefined && Number.isFinite(max)) cur.web.search.maxResults = Math.min(20, Math.max(1, Math.floor(max)));
+          }
+          if (typeof r.web.allowPrivateHosts === 'boolean') cur.web.allowPrivateHosts = r.web.allowPrivateHosts;
+          if (typeof r.web.userAgent === 'string' && r.web.userAgent.trim()) cur.web.userAgent = r.web.userAgent.trim().slice(0, 300);
+          if (typeof r.web.proxy === 'string' && !r.web.proxy.includes('***')) cur.web.proxy = r.web.proxy.trim();
+          const bytes = Number(r.web.maxBytes);
+          if (r.web.maxBytes !== undefined && Number.isFinite(bytes)) cur.web.maxBytes = Math.min(200 * 1024 * 1024, Math.max(256 * 1024, Math.floor(bytes)));
+          const timeout = Number(r.web.timeoutMs);
+          if (r.web.timeoutMs !== undefined && Number.isFinite(timeout)) cur.web.timeoutMs = Math.min(600_000, Math.max(5_000, Math.floor(timeout)));
         }
       }
       if (incoming.chat) {
@@ -2226,6 +2269,218 @@ export function createApp(
   app.post('/api/research/jobs/:id/retry', async (c) => {
     const job = await retryJob(requestCtx(c).store, c.req.param('id'));
     return job ? c.json(job) : c.json({ error: 'job is not in a retryable state' }, 400);
+  });
+
+
+  /* ------------------------------ research studies ------------------------ */
+
+  // A topic researched into several pages (docs/design/15). A study is a draft until started:
+  // POST creates it and refines it once, refine / PUT edit it, start queues it.
+  const studyOr404 = async (ctx: AppContext, id: string) => {
+    const job = await getJob(ctx.store, id);
+    return job && job.kind === 'study' ? job : null;
+  };
+
+  app.get('/api/research/studies', async (c) => {
+    const ctx = requestCtx(c);
+    const jobs = await listStudies(ctx, Math.min(200, Number(c.req.query('limit') ?? 50) || 50));
+    return c.json(jobs.map((j) => {
+      const p = studyPayload(j);
+      return {
+        id: j.id, status: j.status, stage: p.stage, title: p.brief.title, slug: j.target, topic: p.topic.slice(0, 400),
+        pages: p.brief.pages.length, children: p.children.length, runner: p.runner, web: p.sources.web,
+        createdAt: j.createdAt, startedAt: j.startedAt, finishedAt: j.finishedAt, error: j.error, steps: p.steps,
+        outputPath: j.outputPath,
+      };
+    }));
+  });
+
+  app.post('/api/research/studies', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = await c.req.json<{ topic?: string; runner?: Record<string, unknown>; sources?: { web?: boolean; ids?: string[] }; language?: string; refine?: boolean }>();
+      if (!body.topic?.trim()) return c.json({ error: 'topic is required' }, 400);
+      // the refiner may be a CLI one-shot that takes minutes: the draft comes back now, the brief when it is in
+      const track = servicesFor(ctx)?.track ?? (<T,>(p: Promise<T>) => p);
+      const job = await createStudy(ctx, { topic: body.topic, runner: body.runner, sources: body.sources, language: body.language, refine: body.refine === false ? false : 'background', track, requestedBy: requestUser(c) ?? 'web' });
+      return c.json({ ...(await studyView(ctx, job)), refining: refiningSince(job) }, 201);
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.get('/api/research/studies/:id', async (c) => {
+    const ctx = requestCtx(c);
+    const job = await studyOr404(ctx, c.req.param('id'));
+    if (!job) return c.json({ error: 'no such study' }, 404);
+    const view = await studyView(ctx, job);
+    return c.json({ ...view, refining: refiningSince(job), startProblem: job.status === 'draft' ? startProblem(ctx, job) : null });
+  });
+
+  app.put('/api/research/studies/:id', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = await c.req.json<{ brief?: unknown; runner?: Record<string, unknown>; sources?: { web?: boolean; ids?: string[] } }>();
+      const job = await updateStudy(ctx, c.req.param('id'), { brief: body.brief as never, runner: body.runner, sources: body.sources });
+      return c.json({ ...(await studyView(ctx, job)), startProblem: startProblem(ctx, job) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.post('/api/research/studies/:id/refine', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = await c.req.json<{ feedback?: string; answers?: Record<string, string>; brief?: unknown; runner?: Record<string, unknown>; sources?: { web?: boolean; ids?: string[] } }>().catch(() => ({} as Record<string, never>));
+      const track = servicesFor(ctx)?.track ?? (<T,>(p: Promise<T>) => p);
+      const job = await refineStudyInBackground(ctx, c.req.param('id'), { feedback: body.feedback, answers: body.answers, brief: body.brief as never, runner: body.runner, sources: body.sources }, track);
+      return c.json({ ...(await studyView(ctx, job)), refining: refiningSince(job), startProblem: startProblem(ctx, job) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.post('/api/research/studies/:id/start', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const job = await startStudy(ctx, c.req.param('id'));
+      servicesFor(ctx)?.kickResearch();
+      return c.json(await studyView(ctx, job));
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.post('/api/research/studies/:id/cancel', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      return c.json(await cancelStudy(ctx, c.req.param('id')));
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // a failed study goes back in line at the stage it failed in; its failed pages are retried with it
+  app.post('/api/research/studies/:id/retry', async (c) => {
+    const ctx = requestCtx(c);
+    const job = await studyOr404(ctx, c.req.param('id'));
+    if (!job) return c.json({ error: 'no such study' }, 404);
+    if (!['failed', 'cancelled'].includes(job.status)) return c.json({ error: `a ${job.status} study is not retried` }, 400);
+    const children = await listJobs(ctx.store, { study: job.id, limit: 100 });
+    for (const child of children) if (child.status === 'failed' || child.status === 'cancelled') await retryJob(ctx.store, child.id);
+    const p = studyPayload(job);
+    const stage = p.stage === 'pages' ? (children.length ? 'pages' : 'collect') : p.stage;
+    await updateJob(ctx.store, job.id, {
+      status: stage === 'pages' ? 'waiting' : 'queued', error: null, finishedAt: null, attempts: 0,
+      payload: { ...job.payload, stage, rejections: [] },
+    });
+    servicesFor(ctx)?.kickResearch();
+    return c.json(await studyView(ctx, (await getJob(ctx.store, job.id))!));
+  });
+
+  app.delete('/api/research/studies/:id', async (c) => {
+    const ctx = requestCtx(c);
+    const removed = await deleteStudyDraft(ctx, c.req.param('id'));
+    return removed ? c.json({ removed }) : c.json({ error: 'only a draft that never started can be deleted — cancel a running study instead' }, 400);
+  });
+
+  // a person's review of what a study produced: its pages, and the sources it captured
+  app.post('/api/research/studies/:id/promote', async (c) => {
+    const ctx = requestCtx(c);
+    const job = await studyOr404(ctx, c.req.param('id'));
+    if (!job) return c.json({ error: 'no such study' }, 404);
+    const body = await c.req.json<{ what?: 'pages' | 'sources' | 'all'; to?: 'trusted' | 'quarantined' }>().catch(() => ({} as { what?: 'pages' | 'sources' | 'all'; to?: 'trusted' | 'quarantined' }));
+    const what = body.what ?? 'pages';
+    const to = body.to ?? 'trusted';
+    const view = await studyView(ctx, job);
+    const paths = [
+      ...(what !== 'sources' ? [...view.pages.map((p) => p.path), view.reportPath] : []),
+      ...(what !== 'pages' ? [...view.captures.map((x) => x.path), view.registerPath, ...view.notes] : []),
+    ].filter((p) => fs.existsSync(safePath(ctx.dataDir, p)));
+    const results: unknown[] = [];
+    for (const p of paths) {
+      try {
+        results.push(await setScopeTrust(ctx.store, { key: p, to, actor: requestUser(c) }));
+      } catch (e) {
+        results.push({ key: p, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return c.json({ to, count: paths.length, results });
+  });
+
+  // the tail of one session of a study: collect-<n> (gathering) or the report's transcript
+  app.get('/api/research/studies/:id/log', async (c) => {
+    const ctx = requestCtx(c);
+    const job = await studyOr404(ctx, c.req.param('id'));
+    if (!job) return c.json({ error: 'no such study' }, 404);
+    const label = c.req.query('label') ?? '';
+    if (!/^[a-z0-9-]{1,40}$/i.test(label)) return c.json({ error: 'label must be letters, digits and -' }, 400);
+    const root = runsRoot(ctx.dataDir, ctx.config.research?.runsDir ?? '.runs');
+    const file = label.startsWith('collect')
+      ? path.join(root, `${job.id}-collect`, `transcript-${label}.jsonl`)
+      : path.join(root, job.id, label === 'agent' ? 'transcript.jsonl' : `transcript-${label}.jsonl`);
+    const log = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').slice(-200).join('\n') : null;
+    const collectDir = path.join(root, `${job.id}-collect`);
+    const labels = fs.existsSync(collectDir) ? fs.readdirSync(collectDir).filter((f) => /^transcript-.+\.jsonl$/.test(f)).map((f) => f.replace(/^transcript-|\.jsonl$/g, '')).sort() : [];
+    return c.json({ label, log, labels });
+  });
+
+  // a person saves a web page or file into the knowledge base (into a study, or on its own)
+  app.post('/api/research/capture', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = await c.req.json<{ url?: string; study?: string; why?: string }>();
+      if (!body.url?.trim()) return c.json({ error: 'url is required' }, 400);
+      let study: { id: string; slug: string; title?: string } | null = null;
+      if (body.study) {
+        const job = await studyOr404(ctx, body.study);
+        if (!job) return c.json({ error: 'no such study' }, 404);
+        study = { id: job.id, slug: job.target ?? job.id, title: studyPayload(job).brief.title };
+      }
+      return c.json(await captureUrl(ctx, { url: body.url, study, why: body.why, actor: requestUser(c) ?? 'web', index: 'background' }), 201);
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.get('/api/research/captures', async (c) => {
+    const ctx = requestCtx(c);
+    const entries = readManifest(ctx.dataDir).entries;
+    return c.json(entries.slice(-500).reverse());
+  });
+
+  // what a study may use: the research sources, knode's own web search, the workspace's web switch
+  app.get('/api/research/sources', (c) => {
+    const ctx = requestCtx(c);
+    const sources = loadResearchSources(ctx.dataDir).map((s) => ({ ...redactSource(s), problem: sourceProblem(s, ctx.config) }));
+    return c.json({
+      sources,
+      kinds: RESEARCH_SOURCE_KINDS,
+      datasources: ctx.config.datasources.map((d) => ({ id: d.id, kind: d.kind, description: d.description ?? '' })),
+      web: {
+        gate: ctx.config.review?.external ?? 'verify',
+        search: { provider: ctx.config.research.web.search.provider, enabled: webSearchEnabled(ctx.config.research.web), providers: WEB_SEARCH_PROVIDERS },
+        proxy: ctx.config.research.web.proxy ? 'configured' : (process.env.HTTPS_PROXY || process.env.https_proxy ? 'environment' : 'none'),
+        userAgent: ctx.config.research.web.userAgent,
+      },
+      connections: llmTargets(ctx.config).filter((t) => t.baseUrl && !isCliProvider(t.provider)).map((t) => ({ id: t.id, label: t.label, model: t.model })),
+    });
+  });
+
+  app.put('/api/research/sources/:id', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = await c.req.json<Record<string, unknown>>();
+      const saved = saveResearchSource(ctx.dataDir, { ...body, id: c.req.param('id') }, ctx.config);
+      return c.json({ ...redactSource(saved), problem: sourceProblem(saved, ctx.config) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.delete('/api/research/sources/:id', (c) => {
+    const ctx = requestCtx(c);
+    return deleteResearchSource(ctx.dataDir, c.req.param('id')) ? c.json({ removed: true }) : c.json({ error: 'no such source' }, 404);
   });
 
   /* ------------------------------ chat ------------------------------------ */

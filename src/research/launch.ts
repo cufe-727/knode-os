@@ -4,6 +4,7 @@ import path from 'node:path';
 import { cliCommand, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess, speedFor } from '../llm/cli.js';
 import { AgentProvider, CliAgent, ResearchAgent } from './agent.js';
 import { Effort, Freshness, NativeAgentSpec, Speed } from './profile.js';
+import type { ExtraMcpServer } from './sources.js';
 import { McpEndpoint, RunWorkspace } from './workspace.js';
 
 /**
@@ -43,6 +44,8 @@ export interface LaunchInput {
   webFreshness?: Freshness;
   /** Native sub-agents for the orchestrator session (pipeline = native). */
   agents?: NativeAgentSpec[];
+  /** MCP servers of the research sources a study selected, attached next to knode's own. */
+  extraMcp?: ExtraMcpServer[];
 }
 
 export interface LaunchResult {
@@ -160,13 +163,63 @@ export function mcpUrlWithWorkspace(mcp: McpEndpoint): string {
   return u.toString();
 }
 
-/** knode tools a read-only session may call (claude enforces the list; other CLIs are told in the prompt). */
+/**
+ * knode tools a read-only session may call (claude enforces the list; other
+ * CLIs are told in the prompt). It writes no page — but it may keep what it
+ * read: `knode_capture` puts a fetched original under raw/docs/research, the
+ * one write that is a researcher's job, not the writer's.
+ */
 export const READ_TOOLS = [
   'knode_search', 'knode_graph_search', 'knode_ask', 'knode_ls', 'knode_read', 'knode_grep', 'knode_context_pack', 'knode_claims',
   'knode_resolve', 'knode_plan', 'knode_feedback', 'knode_lineage', 'knode_history', 'knode_graph_insights', 'knode_suggestions',
   'knode_absences', 'knode_disputes', 'knode_capabilities', 'knode_datasources', 'knode_query', 'knode_worksets', 'knode_okf_validate',
-  'knode_survey',
+  'knode_survey', 'knode_capture', 'knode_web_search', 'knode_web_fetch', 'knode_api', 'knode_chart', 'knode_study',
 ].map((t) => `mcp__knode-os__${t}`);
+
+/** The tool names a session may call on a source's MCP server: its allowlist, else all of them. */
+export function extraToolNames(servers: ExtraMcpServer[] | undefined): string[] {
+  return (servers ?? []).flatMap((s) => (s.tools.length ? s.tools.map((t) => `mcp__${s.id}__${t}`) : [`mcp__${s.id}__*`]));
+}
+
+/** An environment variable name for one secret of one source's server (codex reads headers and env from the environment). */
+function secretVar(id: string, key: string, i: number): string {
+  return `KNODE_SRC_${id.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}_${i}_${key.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}`.slice(0, 100);
+}
+
+/**
+ * codex's `-c` overrides for the sources' servers. Header and environment
+ * values go through the session's environment (`env_http_headers`,
+ * `env_vars`), so no secret ever sits in the argv.
+ */
+export function codexExtraMcpArgs(servers: ExtraMcpServer[] | undefined): { args: string[]; env: Record<string, string> } {
+  const args: string[] = [];
+  const env: Record<string, string> = {};
+  for (const s of servers ?? []) {
+    const key = `mcp_servers.${s.id}`;
+    if (s.url) {
+      args.push('-c', `${key}.url=${JSON.stringify(s.url)}`);
+      const headers = Object.entries(s.headers ?? {});
+      if (headers.length) {
+        const map = headers.map(([h, v], i) => {
+          const name = secretVar(s.id, h, i);
+          env[name] = v;
+          return `${JSON.stringify(h)} = ${JSON.stringify(name)}`;
+        });
+        args.push('-c', `${key}.env_http_headers={ ${map.join(', ')} }`);
+      }
+    } else if (s.command) {
+      args.push('-c', `${key}.command=${JSON.stringify(s.command)}`, '-c', `${key}.args=${JSON.stringify(s.args ?? [])}`);
+      const vars = Object.entries(s.env ?? {});
+      if (vars.length) {
+        for (const [k, v] of vars) env[k] = v;
+        args.push('-c', `${key}.env_vars=${JSON.stringify(vars.map(([k]) => k))}`);
+      }
+    }
+    args.push('-c', `${key}.default_tools_approval_mode="approve"`);
+    if (s.tools.length) args.push('-c', `${key}.enabled_tools=${JSON.stringify(s.tools)}`);
+  }
+  return { args, env };
+}
 
 export interface SessionInput {
   agent: ResearchAgent;
@@ -193,6 +246,8 @@ export interface SessionInput {
   webFreshness?: Freshness;
   /** Native sub-agents registered with the CLI (claude --agents, codex agents.<id>). */
   agents?: NativeAgentSpec[];
+  /** Sources' MCP servers, attached next to knode's (the cwd's .mcp.json / .cursor files carry them for claude and cursor). */
+  extraMcp?: ExtraMcpServer[];
   /** Names the transcript file: transcript.jsonl for 'agent', transcript-<label>.jsonl otherwise. */
   label: string;
 }
@@ -207,9 +262,10 @@ export interface SessionResult {
   transcriptPath: string;
 }
 
-export function sessionEnv(input: { mcp: McpEndpoint; jobId: string; outputPath: string; worksetId: string }): NodeJS.ProcessEnv {
+export function sessionEnv(input: { mcp: McpEndpoint; jobId: string; outputPath: string; worksetId: string; extraMcp?: ExtraMcpServer[] }): NodeJS.ProcessEnv {
   return {
     ...process.env,
+    ...codexExtraMcpArgs(input.extraMcp).env,
     KNODE_MCP_URL: input.mcp.url,
     KNODE_MCP_URL_WS: mcpUrlWithWorkspace(input.mcp),
     KNODE_MCP_TOKEN: input.mcp.token,
@@ -224,7 +280,7 @@ export function sessionEnv(input: { mcp: McpEndpoint; jobId: string; outputPath:
 }
 
 export function agentEnv(input: LaunchInput): NodeJS.ProcessEnv {
-  return sessionEnv({ mcp: input.mcp, jobId: input.jobId, outputPath: input.ws.outputPath, worksetId: input.ws.worksetId });
+  return sessionEnv({ mcp: input.mcp, jobId: input.jobId, outputPath: input.ws.outputPath, worksetId: input.ws.worksetId, extraMcp: input.extraMcp });
 }
 
 /* ------------------------------------------------------------------ adapters */
@@ -301,6 +357,7 @@ export function sessionArgs(input: CliSessionInput): { cmd: string; args: string
   if (provider === 'claude-cli') {
     const allowed = [
       ...(input.tools === 'write' ? ['mcp__knode-os__*'] : READ_TOOLS),
+      ...extraToolNames(input.extraMcp),
       ...(files ? ['Read', 'Grep', 'Glob'] : []),
       ...(web ? ['WebSearch', 'WebFetch'] : []),
       ...(agents ? ['Agent', 'Task'] : []),
@@ -346,7 +403,10 @@ export function sessionArgs(input: CliSessionInput): { cmd: string; args: string
         // ~/.codex/config.toml setting) a gated call is refused, so every knode tool
         // would fail in exec mode. The server is knode's own, so its tools are pre-approved.
         '-c', 'mcp_servers.knode-os.default_tools_approval_mode="approve"',
+        // a capture fetches and converts a whole filing; codex's default 60 s per tool call is too short for that
+        '-c', 'mcp_servers.knode-os.tool_timeout_sec=300',
         '-c', `web_search=${tomlString(web ? input.webFreshness ?? 'live' : 'disabled')}`,
+        ...codexExtraMcpArgs(input.extraMcp).args,
         ...(effort ? ['-c', `model_reasoning_effort=${tomlString(effort)}`] : []),
         ...(tier ? ['-c', `service_tier=${tomlString(tier)}`] : []),
         ...agentArgs,
@@ -491,7 +551,7 @@ function sessionFrom(input: LaunchInput): Omit<SessionInput, 'prompt'> {
     agent: input.agent, maxTurns: input.maxTurns, timeoutMs: input.timeoutMs,
     cwd: input.ws.dir, mcp: input.mcp, readDirs: input.readDirs, jobId: input.jobId, outputPath: input.ws.outputPath,
     worksetId: input.ws.worksetId, allowNetwork: input.allowNetwork, tools: 'write', label: 'agent',
-    effort: input.effort, speed: input.speed, webFreshness: input.webFreshness, agents: input.agents,
+    effort: input.effort, speed: input.speed, webFreshness: input.webFreshness, agents: input.agents, extraMcp: input.extraMcp,
   };
 }
 

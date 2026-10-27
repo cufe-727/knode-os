@@ -14,6 +14,7 @@ import {
   abortSession,
   isCancelled,
   JobCancelledError,
+  extraToolNames,
   READ_TOOLS,
   registerSession,
   SessionInput,
@@ -78,20 +79,23 @@ function chatModel(agent: Pick<BuiltinAgent, 'baseUrl' | 'apiKey' | 'model'>, us
  * scope is merely described to codex and cursor in the prompt — a tool left out
  * here simply does not exist for the model.
  */
-export function allowedTools(tools: StructuredToolInterface[], scope: 'read' | 'write'): StructuredToolInterface[] {
+export function allowedTools(tools: StructuredToolInterface[], scope: 'read' | 'write', extra: string[] = []): StructuredToolInterface[] {
   if (scope === 'write') return tools;
   const allowed = new Set(READ_TOOLS);
-  return tools.filter((t) => allowed.has(t.name));
+  // a source's server: every tool (`mcp__<id>__*`) or the ones its allowlist names
+  const whole = extra.filter((n) => n.endsWith('__*')).map((n) => n.slice(0, -1));
+  const named = new Set(extra.filter((n) => !n.endsWith('__*')));
+  return tools.filter((t) => allowed.has(t.name) || named.has(t.name) || whole.some((prefix) => t.name.startsWith(prefix)));
 }
 
 /** A profile role marked `native` becomes one of the agent's own sub-agents. */
-function toSubAgent(spec: NativeAgentSpec, agent: BuiltinAgent, tools: StructuredToolInterface[], useResponsesApi: boolean): SubAgent {
+function toSubAgent(spec: NativeAgentSpec, agent: BuiltinAgent, tools: StructuredToolInterface[], useResponsesApi: boolean, extra: string[] = []): SubAgent {
   return {
     name: spec.id,
     description: spec.description || spec.title || spec.id,
     systemPrompt: spec.prompt,
     // sub-agents never write the page: the orchestrator does, through knode_write
-    tools: allowedTools(tools, 'read') as SubAgent['tools'],
+    tools: allowedTools(tools, 'read', extra) as SubAgent['tools'],
     ...(spec.model ? { model: chatModel(agent, useResponsesApi, spec.model) } : {}),
   };
 }
@@ -117,6 +121,10 @@ export async function runBuiltinSession(input: BuiltinSessionInput): Promise<Ses
         url: input.mcp.url,
         headers: { Authorization: `Bearer ${input.mcp.token}`, ...input.mcp.headers },
       },
+      // a study's research sources (src/research/sources.ts), next to knode's own
+      ...Object.fromEntries((input.extraMcp ?? []).map((s) => [s.id, s.url
+        ? { transport: 'http' as const, url: s.url, headers: s.headers ?? {} }
+        : { transport: 'stdio' as const, command: s.command!, args: s.args ?? [], env: { ...process.env, ...(s.env ?? {}) } as Record<string, string> }])),
     },
     // yields `mcp__knode-os__<tool>` — the same spelling the CLIs use, which
     // READ_TOOLS and parseActivity's prefix strip both depend on
@@ -136,9 +144,9 @@ export async function runBuiltinSession(input: BuiltinSessionInput): Promise<Ses
   let turns = 0;
   try {
     const all = (await client.getTools()) as StructuredToolInterface[];
-    const tools = allowedTools(all, input.tools);
+    const tools = allowedTools(all, input.tools, extraToolNames(input.extraMcp));
     note(`tools: ${tools.length}/${all.length} (${input.tools})`);
-    if (input.allowNetwork) note('note: the built-in agent has no web tool — this session searched the knowledge base only');
+    if (input.allowNetwork && !all.some((t) => t.name === 'mcp__knode-os__knode_web_search')) note('note: the built-in agent has no web tool and no search provider is configured (research.web.search) — this session searched the knowledge base only');
 
     const schemaFile = path.join(input.cwd, 'AGENTS.md');
     const systemPrompt = fs.existsSync(schemaFile) ? fs.readFileSync(schemaFile, 'utf8') : '';
@@ -152,7 +160,7 @@ export async function runBuiltinSession(input: BuiltinSessionInput): Promise<Ses
     );
     const useResponsesApi = wire === 'responses';
     note(`wire: ${wire}`);
-    const subagents = input.agents?.length ? input.agents.map((a) => toSubAgent(a, input.agent, all, useResponsesApi)) : undefined;
+    const subagents = input.agents?.length ? input.agents.map((a) => toSubAgent(a, input.agent, all, useResponsesApi, extraToolNames(input.extraMcp))) : undefined;
 
     const agent = createDeepAgent({
       model: chatModel(input.agent, useResponsesApi),

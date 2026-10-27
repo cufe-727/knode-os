@@ -167,9 +167,11 @@ export function resolveResearchAgent(config: KnodeConfig, dataDir?: string): Res
 
 /**
  * Whether this agent can reach the web at all. Only the CLIs ship a web tool;
- * the built-in agent has none, so `allowNetwork` must be masked rather than
- * letting the brief promise external verification that cannot happen.
+ * the built-in agent has none of its own, so `allowNetwork` must be masked
+ * rather than letting the brief promise external verification that cannot
+ * happen — unless a person configured knode's own search (`research.web.search`,
+ * `searchConfigured`), which reaches every agent as `knode_web_search`.
  */
-export function agentWebCapable(agent: ResearchAgent | null | undefined): boolean {
-  return agent?.kind === 'cli';
+export function agentWebCapable(agent: ResearchAgent | null | undefined, searchConfigured = false): boolean {
+  return agent?.kind === 'cli' || (agent?.kind === 'builtin' && searchConfigured);
 }

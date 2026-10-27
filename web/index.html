@@ -6,7 +6,9 @@
   <title>knode-os</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/chart.css" />
   <script src="/vendor/marked.js"></script>
+  <script src="/chart.js"></script>
   <script src="/markdown.js"></script>
   <script src="/vendor/d3.js"></script>
   <script src="/graph.js"></script>
@@ -109,6 +111,7 @@
       <nav id="tabs" aria-label="Primary navigation">
         <button data-section="library" class="active" title="Files, search, and agent traces">Library</button>
         <button data-section="ask" title="An agent that answers from your workspace">Ask</button>
+        <button data-section="studies" title="Research a topic into several wiki pages: refine the question, collect sources, write the pages">Research</button>
         <button data-section="knowledge" title="Graph, wiki, and nightly review">Knowledge</button>
         <button data-section="settings" title="Model routes and pipeline limits">Settings</button>
       </nav>
@@ -370,6 +373,74 @@
         <div class="wiki-span">
           <h3 class="wiki-h">Research pages</h3>
           <div id="research-pages" class="hint">loading…</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Research: studies — a topic researched into several pages (docs/design/15) -->
+    <section id="tab-studies" class="tab">
+      <div class="study-layout">
+        <aside class="study-list">
+          <div class="study-list-head">
+            <b>Studies</b>
+            <button id="btn-study-new" class="primary" type="button">＋ New study</button>
+          </div>
+          <div id="study-items" class="hint">loading…</div>
+        </aside>
+        <div class="study-main">
+          <div id="study-compose" class="study-card">
+            <p class="section-index">NEW STUDY</p>
+            <h3 class="study-title">What do you want to research?</h3>
+            <p class="hint">A topic, a question, or a paragraph of what you want to understand. The refiner turns it into a brief — questions, the pages to write, the sources to start from — that you edit before anything runs.</p>
+            <textarea id="study-topic" rows="6" placeholder="Starting with Anthropic's latest prospectus, I want to understand its revenue and cost structure, the companies upstream and downstream in its value chain, how it compares with competitors, what others think of it, and its prospects."></textarea>
+            <div class="cfg-grid cfg-grid-3 study-form">
+              <label>Runs on<select id="study-agent"></select></label>
+              <label>Model<input id="study-model" placeholder="the agent's default" /></label>
+              <label>Depth<select id="study-profile"></select></label>
+              <label>Collection<select id="study-mode"><option value="agent">Agent sessions · search, read and capture</option><option value="deep-research">Deep-research model · one long call collects</option></select></label>
+              <label data-deep hidden>Deep-research connection<select id="study-dr-connection"></select></label>
+              <label data-deep hidden>Deep-research model<input id="study-dr-model" placeholder="o3-deep-research" /></label>
+            </div>
+            <fieldset class="study-sources">
+              <legend>Sources</legend>
+              <label class="cfg-check"><input type="checkbox" checked disabled /> This knowledge base <span class="hint">· always read first</span></label>
+              <label class="cfg-check"><input id="study-web" type="checkbox" checked /> The web <span id="study-web-note" class="hint"></span></label>
+              <div id="study-source-list" class="study-source-list"></div>
+            </fieldset>
+            <div class="study-actions">
+              <button id="btn-study-refine" class="primary" type="button">Refine the question →</button>
+              <span id="study-compose-note" class="hint"></span>
+            </div>
+          </div>
+          <div id="study-detail" hidden></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Research: where a study may look -->
+    <section id="tab-sources" class="tab">
+      <div class="sources-wrap">
+        <div class="study-card">
+          <p class="section-index">WEB</p>
+          <h3 class="study-title">Web access</h3>
+          <p id="web-gate-note" class="hint"></p>
+          <div class="cfg-grid cfg-grid-3 study-form">
+            <label>Search API · for agents without search of their own<select id="web-search-provider"><option value="">None · agents use their own search</option><option value="searxng">SearXNG · self-hosted, no key</option><option value="brave">Brave Search</option><option value="tavily">Tavily</option><option value="serper">Serper · Google results</option></select></label>
+            <label>Base URL<input id="web-search-base" placeholder="the provider's default" /></label>
+            <label>API key<input id="web-search-key" placeholder="a key, or env:VAR" autocomplete="off" /></label>
+            <label>User-Agent<input id="web-user-agent" /></label>
+            <label>Proxy<input id="web-proxy" placeholder="HTTPS_PROXY from the environment" /></label>
+            <label class="cfg-check study-check"><input id="web-private" type="checkbox" /> Also fetch private and local addresses</label>
+          </div>
+          <div class="study-actions"><button id="btn-web-save" type="button">Save web settings</button><span class="hint">Some publishers want a contact in the User-Agent — SEC EDGAR asks for “Name email@domain”.</span></div>
+        </div>
+        <div class="study-card">
+          <div class="study-head">
+            <div><p class="section-index">SOURCES</p><h3 class="study-title">Your data sources</h3><p class="hint">MCP servers, JSON APIs, trusted sites and live datasources a study may use besides this knowledge base and the web. Each is a file, <span class="mono">playbooks/research/sources/&lt;id&gt;.yaml</span>; an administrator adds them.</p></div>
+            <button id="btn-source-new" type="button">＋ Add source</button>
+          </div>
+          <div id="source-editor" hidden></div>
+          <div id="source-items" class="hint">loading…</div>
         </div>
       </div>
     </section>

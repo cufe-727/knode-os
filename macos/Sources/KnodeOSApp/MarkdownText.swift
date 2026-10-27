@@ -208,6 +208,9 @@ struct MarkdownText: View {
                 .overlay(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 1).fill(Color.knodeViolet.opacity(0.7)).frame(width: 3)
                 }
+        case .code(let code, let language) where language?.lowercased() == "chart" && ChartSpec.parse(code) != nil:
+            // a research page's chart: data in the page, drawn here (MarkdownChart.swift)
+            MarkdownChart(spec: ChartSpec.parse(code)!)
         case .code(let code, let language):
             ScrollView(.horizontal) {
                 Text(code)

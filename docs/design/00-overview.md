@@ -219,3 +219,8 @@ regeneration and is itself a source.
   trust tier; `known_at`, a fourth time axis that reads only what was available
   at a decision time; market data and a run registry read in place as
   datasources; experiments and author track records written back as sources.
+- [15 — Research studies: from a topic to a set of wiki pages, with the sources kept](15-research-studies.md)
+  — a topic refined into a brief the person edits, then collected (web, the
+  base, MCP / API / site sources, or a deep-research model) into originals
+  under raw/docs/research that the pipeline converts and indexes, written up as
+  one page per part plus a report, with charts as data blocks.

@@ -10,7 +10,17 @@ import { ResearchKind } from './templates.js';
  * transcript and result so a failed run can be inspected or re-run by hand.
  */
 
-export type ResearchStatus = 'queued' | 'running' | 'validating' | 'done' | 'failed' | 'cancelled';
+/**
+ * `draft` and `waiting` belong to studies (kind = study, docs/design/15): a
+ * study is a draft while its brief is refined, and waits while the pages it
+ * queued are written. Neither is ever claimed.
+ */
+export type ResearchStatus = 'draft' | 'queued' | 'running' | 'validating' | 'waiting' | 'done' | 'failed' | 'cancelled';
+
+/** Statuses a job can still move out of on its own. */
+export const LIVE_STATUSES: ResearchStatus[] = ['queued', 'running', 'validating', 'waiting'];
+/** Statuses a job never leaves without a person (retry). */
+export const TERMINAL_STATUSES: ResearchStatus[] = ['done', 'failed', 'cancelled'];
 
 export interface ResearchJob {
   id: string;
@@ -76,6 +86,20 @@ export interface QueueJobInput {
   payload?: Record<string, unknown>;
 }
 
+/**
+ * A job row as given, status included, with no deduplication — for a study,
+ * which starts as a draft, and the pages it queues, whose targets are its own.
+ */
+export async function createJobRow(store: Store, input: QueueJobInput & { status: ResearchStatus }): Promise<ResearchJob> {
+  const id = `r_${crypto.randomBytes(5).toString('hex')}`;
+  const [row] = await store.query<Row>(
+    `INSERT INTO research_jobs (id, kind, target, query, template, status, payload, requested_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8) RETURNING ${COLS}`,
+    [id, input.kind, input.target?.trim() || null, input.query?.trim() || null, input.template?.trim() || input.kind, input.status, JSON.stringify(input.payload ?? {}), input.requestedBy ?? null],
+  );
+  return project(row);
+}
+
 /** Queue a job; an identical job already queued or running is returned instead of duplicated. */
 export async function queueJob(store: Store, input: QueueJobInput): Promise<{ job: ResearchJob; created: boolean }> {
   const target = input.target?.trim() || null;
@@ -104,7 +128,7 @@ export async function getJob(store: Store, id: string): Promise<ResearchJob | nu
   return row ? project(row) : null;
 }
 
-export async function listJobs(store: Store, opts: { status?: ResearchStatus | ResearchStatus[]; kind?: ResearchKind; requestedBy?: string; limit?: number } = {}): Promise<ResearchJob[]> {
+export async function listJobs(store: Store, opts: { status?: ResearchStatus | ResearchStatus[]; kind?: ResearchKind; requestedBy?: string; study?: string; limit?: number } = {}): Promise<ResearchJob[]> {
   const statuses = opts.status ? (Array.isArray(opts.status) ? opts.status : [opts.status]) : null;
   const params: unknown[] = [];
   const conds: string[] = [];
@@ -119,6 +143,10 @@ export async function listJobs(store: Store, opts: { status?: ResearchStatus | R
     params.push(opts.requestedBy);
     conds.push(`requested_by = $${params.length}`);
   }
+  if (opts.study) {
+    params.push(opts.study);
+    conds.push(`payload ->> 'study' = $${params.length}`);
+  }
   params.push(opts.limit ?? 100);
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const rows = await store.query<Row>(`SELECT ${COLS} FROM research_jobs ${where} ORDER BY created_at DESC LIMIT $${params.length}`, params);
@@ -132,7 +160,7 @@ export async function latestJob(store: Store, kind: ResearchKind): Promise<Resea
 }
 
 export async function updateJob(store: Store, id: string, patch: Partial<{
-  status: ResearchStatus; agent: string | null; model: string | null; worksetId: string | null; outputPath: string | null;
+  status: ResearchStatus; target: string | null; query: string | null; agent: string | null; model: string | null; worksetId: string | null; outputPath: string | null;
   error: string | null; attempts: number; turns: number | null; costUsd: number | null; payload: Record<string, unknown>;
   startedAt: string | null; finishedAt: string | null;
 }>): Promise<ResearchJob | null> {
@@ -143,6 +171,8 @@ export async function updateJob(store: Store, id: string, patch: Partial<{
     sets.push(`${col} = $${params.length}${cast}`);
   };
   if (patch.status !== undefined) set('status', patch.status);
+  if (patch.target !== undefined) set('target', patch.target);
+  if (patch.query !== undefined) set('query', patch.query);
   if (patch.agent !== undefined) set('agent', patch.agent);
   if (patch.model !== undefined) set('model', patch.model);
   if (patch.worksetId !== undefined) set('workset_id', patch.worksetId);
@@ -159,11 +189,17 @@ export async function updateJob(store: Store, id: string, patch: Partial<{
   return row ? project(row) : null;
 }
 
-/** Atomically take the oldest queued job (null when the queue is empty). */
-export async function claimNextJob(store: Store): Promise<ResearchJob | null> {
+/**
+ * Atomically take the oldest queued job (null when the queue is empty).
+ * `ownRunnerOnly`: only a job that names its own agent (a study's, in
+ * `payload.runner.agent`) — what the loop may still run when research.agent
+ * is not configured.
+ */
+export async function claimNextJob(store: Store, opts: { ownRunnerOnly?: boolean } = {}): Promise<ResearchJob | null> {
+  const own = opts.ownRunnerOnly ? `AND COALESCE(payload -> 'runner' ->> 'agent', '') <> ''` : '';
   const [row] = await store.query<Row>(
     `UPDATE research_jobs SET status = 'running', started_at = now(), attempts = attempts + 1
-     WHERE id = (SELECT id FROM research_jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1)
+     WHERE id = (SELECT id FROM research_jobs WHERE status = 'queued' ${own} ORDER BY created_at LIMIT 1)
      RETURNING ${COLS}`,
   );
   return row ? project(row) : null;
@@ -171,7 +207,7 @@ export async function claimNextJob(store: Store): Promise<ResearchJob | null> {
 
 export async function cancelJob(store: Store, id: string): Promise<boolean> {
   const rows = await store.query<{ id: string }>(
-    `UPDATE research_jobs SET status = 'cancelled', finished_at = now() WHERE id = $1 AND status IN ('queued', 'running', 'validating') RETURNING id`,
+    `UPDATE research_jobs SET status = 'cancelled', finished_at = now() WHERE id = $1 AND status IN ('draft', 'queued', 'running', 'validating', 'waiting') RETURNING id`,
     [id],
   );
   return rows.length > 0;

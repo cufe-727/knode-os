@@ -16,6 +16,7 @@ const PREAMBLE = [
   'knode-os is a local knowledge base: documents → entities / relations / claims → wiki pages. For a question start with knode_resolve; knode_search (mode=sag) finds passages, knode_claims dated facts, knode_graph_search relations; as_of / valid_at travel in time.',
   `Read the base's own guide first — knode_read "${GUIDE_FILE}" (what it holds, how things are named, which tool answers which question) — and knode_survey for the current numbers.`,
   'Writes go through knode_write (wiki/, raw/docs/, playbooks/packs/) and land quarantined until a person promotes them; a contradiction opens a dispute instead of overwriting.',
+  'Web material you rely on goes in with knode_capture: knode fetches the URL itself, keeps the original under raw/docs/research/ (converted and indexed like any document) and returns the path to cite. knode_study shows multi-page research studies.',
 ].join('\n');
 
 const cache = new Map<string, { key: string; text: string }>();

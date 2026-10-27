@@ -24,6 +24,7 @@ knode-os 结合了两个项目的核心思想:[llm_wiki](https://github.com/nash
 - **Google OKF v0.2 原生兼容**:`wiki/` 本身就是一个可移植的 Open Knowledge Format bundle；支持规范校验、版本路由、旧库迁移、外部 bundle 无损导入/导出，OKF 普通 Markdown 链接会进入知识图谱。v0.2 的溯源/信任/生命周期字段(`generated`、`verified`、`status`、`stale_after`)会被识别,v0.1 bundle 仍按规范给出的回退路径读取。未知类型、扩展 frontmatter 和断链按规范宽容处理。
 - **原生 Obsidian Vault**:`wiki/` 可直接在 Obsidian 中作为 Vault 打开，内置 Vault 配置与附件目录；支持 Properties、别名、标签、`[[Wikilink]]`、路径链接、标题/块引用和 `![[嵌入]]`。OKF 导入和导出的每个知识 bundle 也自动是独立 Vault。
 - **`ask`**:基于知识库的带引用问答,并显式列出"知识库还缺什么"。
+- **研究课题(study)**:给一个主题——比如"从 Anthropic 最新的招股书出发,看它的收入与成本结构、上下游、竞争对手、外界评价与前景"——选谁来研究(Codex、Claude Code、Cursor、内置 agent,或深度研究模型)、能看哪些来源(知识库、网络、你自己的 MCP 服务器 / API / 站点)。规划员先把它改写成一份可编辑的研究简报(更具体的问题、要写的页面、起始来源、要问你的澄清问题);开始后,收集员找资料并**存下来**:每一份被依赖的网页、PDF、数据文件都由 knode 自己抓取,原件放进 `raw/docs/research/<课题>/`,像其他文档一样被转换(HTML / PDF → Markdown)和索引。每个部分一页、外加一页总报告写进 `wiki/research/`,引用这些文件,图表是 ` ```chart ` 数据块,网页端直接画出来。见 [设计 15](docs/design/15-research-studies.md)。
 
 ## 快速开始
 
@@ -58,7 +59,7 @@ node dist/cli.js user add admin --admin --data ~/knode-data
 ├── purpose.md          # 这个知识库是干什么的
 ├── schema.md           # wiki 结构规则
 ├── raw/                # 原始输入,永不改写;raw 路径就是每个源的键
-│   ├── docs/           # 用户上传的文档(文本、PDF、图片)
+│   ├── docs/           # 用户上传的文档(文本、PDF、HTML、图片);research/<课题>/ 是研究课题收集的资料
 │   ├── traces/         # claude/ + codex/ 会话记录(自动同步)
 │   └── skills/         # agent 用过的 skills 与 prompts(自动同步)
 ├── .sidecar/           # 派生状态,每个源一个目录,镜像上面的目录树 —— 请保留
@@ -196,6 +197,11 @@ knode-os wiki generate        补齐缺失的文档摘要页与实体页
 knode-os wiki refine          tier-2:断言审计 + 全量重复实体审计 + 断言复核 + 热门话题块 + 研究推荐
 knode-os trace sync           拉取新的 Claude Code / Codex trace 与 skills
 knode-os dream [--lookback d] 先同步 trace,再分析 → skills/memory/知识库建议
+knode-os research study new "<主题>" [--agent codex-cli] [--no-web] [--sources a,b] [--deep-research 连接:模型] [--start | --now]
+                              研究课题:主题 → 研究简报(问题、页面、起始来源);--start 排队,--now 在本进程跑完 收集 → 分页 → 总报告
+                              (另有 study refine <id> [意见] [--answer "问题=回答"]、study start | run | show | list | cancel)
+knode-os research capture <url> [--study <id>]   把网页 / PDF / 数据文件存进 raw/docs/research,转换并索引
+knode-os research sources     playbooks/research/sources 下的研究来源(MCP 服务器、API、站点、数据源)
 knode-os research init [--now]  初始化知识库:先索引与抽取,再由 agent 写出 wiki/overview.md 与
                               AGENTS.md / CLAUDE.md 指南,并把值得单独成页的主题排进队列
 knode-os chat "<消息>" [-c <会话>]  和配置好的 CLI 聊知识库(它经 MCP 回答,并把你教的内容写成隔离笔记);
@@ -220,7 +226,7 @@ knode-os connect claude   # 执行 claude mcp add --scope user knode-os -- node 
 knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-os]
 ```
 
-暴露的 MCP 工具:`knode_resolve`(优先调这个,见下)、`knode_plan`、`knode_feedback`、`knode_capabilities`、`knode_checkout` / `knode_commit` / `knode_worksets`(为长任务锚定一致视图,结束时把结论写回为 Source)、`knode_absences`(查过但没找到的东西)、`knode_disputes` / `knode_trust`(矛盾,以及提升被隔离的写入)、`knode_subscribe`(订阅实体/源/意图的变化)、`knode_learning`(planner 学到了什么)、`knode_search`、`knode_graph_search`、`knode_claims`、`knode_ask`、`knode_ls`、`knode_read`(路径以 `/` 开头则读虚拟文件系统;raw/docs 下的 PDF/图片返回其派生 Markdown)、`knode_write`(仅限 wiki/、raw/docs 与 playbooks/packs/)、`knode_grep`、`knode_ingest` / `knode_sync`、`knode_lineage`、`knode_history`、`knode_forget`、`knode_okf_validate`、`knode_graph_insights`、`knode_survey`(这个库里有什么,全是数字——陌生工作区的第一个调用)、`knode_suggestions`、`knode_context_pack`、`knode_datasources`、`knode_query`(只读原生 SQL,`source="catalog"` 可查知识库自身的 `v_*` 视图)。三条时间轴互相独立:`as_of`(系统时间:当时相信什么)、`valid_at` / `valid_range`(世界时间:断言何时成立)、`freshness`(实时读最多可以多旧);`kinds` / `sources` 限定哪些源可以作答。
+暴露的 MCP 工具:`knode_resolve`(优先调这个,见下)、`knode_capture`(把网页 / PDF / 数据文件存进 raw/docs/research 作为来源,返回可引用的路径)、`knode_web_fetch`、`knode_web_search`(配置了 `research.web.search` 时)、`knode_api`(调用配置好的 API 来源)、`knode_chart`(检查图表块)、`knode_study`(研究课题)、`knode_plan`、`knode_feedback`、`knode_capabilities`、`knode_checkout` / `knode_commit` / `knode_worksets`(为长任务锚定一致视图,结束时把结论写回为 Source)、`knode_absences`(查过但没找到的东西)、`knode_disputes` / `knode_trust`(矛盾,以及提升被隔离的写入)、`knode_subscribe`(订阅实体/源/意图的变化)、`knode_learning`(planner 学到了什么)、`knode_search`、`knode_graph_search`、`knode_claims`、`knode_ask`、`knode_ls`、`knode_read`(路径以 `/` 开头则读虚拟文件系统;raw/docs 下的 PDF/图片返回其派生 Markdown)、`knode_write`(仅限 wiki/、raw/docs 与 playbooks/packs/)、`knode_grep`、`knode_ingest` / `knode_sync`、`knode_lineage`、`knode_history`、`knode_forget`、`knode_okf_validate`、`knode_graph_insights`、`knode_survey`(这个库里有什么,全是数字——陌生工作区的第一个调用)、`knode_suggestions`、`knode_context_pack`、`knode_datasources`、`knode_query`(只读原生 SQL,`source="catalog"` 可查知识库自身的 `v_*` 视图)。三条时间轴互相独立:`as_of`(系统时间:当时相信什么)、`valid_at` / `valid_range`(世界时间:断言何时成立)、`freshness`(实时读最多可以多旧);`kinds` / `sources` 限定哪些源可以作答。
 
 **用 `knode_resolve` 取代 search。** search 返回的是「文本长得像」的东西;resolve 会先算出这**类**问题的答案需要哪些槽位(`playbooks/intents/*.yaml` 里声明),把本地索引能答的部分直接答掉,剩下的编译成一份 plan 交给 agent 执行。填不上的必需槽位会出现在 `unknowns` 里,而不是用几篇看起来相关的文档糊过去。执行完用 `knode_feedback` 带上 receipt id 回报,下一次同类问题就会更准。
 
@@ -240,6 +246,9 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
   - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown);**＋ add → Import / Link folder from this Mac** 按路径把本机一个文件夹整体带入并保留目录结构——一次性复制,或"链接"后由 `serve` 持续同步原文件夹的变化(树里带 🔗 标记,只读);打开 `raw/docs` 下的文件时，顶部列出引用它的 wiki 页面(**cited by**:来自它们的 `[[raw/docs/…]]` 与 Markdown 链接、`sources:`(derived from)以及 `tested_by` 等 `relations:`，[写法见此](docs/frontmatter-contract.zh-CN.md))
   - **Search / 检索** —— hybrid/vector/keyword 检索,展示分数构成;可限定在「文件」里选中的目录
   - **Traces / 轨迹** —— 已收集的 agent 会话;点一行即可打开 `raw/traces/` 下对应的镜像文件
+- **Research / 研究** —— 研究课题:一个主题研究成几页
+  - **Studies** —— 写下你想弄清楚什么,选 agent(或深度研究模型)、深度与来源,点"规划":简报带着更具体的问题、计划的页面、起始来源和要问你的问题回来;编辑、回答、再规划,然后开始。运行中的课题显示各阶段、已收集的资料(标题、站点、日期、文件)、收集笔记、每个分页与总报告——一键提升页面或资料的信任级别,查看各会话日志
+  - **Sources** —— 网络设置(给没有自带搜索的 agent 用的搜索 API、User-Agent、代理)与你自己的来源:MCP 服务器、声明了端点的 JSON API、带种子 URL 的可信站点、实时数据源
 - **Ask / 问答** —— 一个问题，一次 agent 会话。配置好的 agent 通过 MCP 作答，跨多轮追查线索，并把你教它的内容写成隔离笔记（确认后采纳）。没有指定 agent 时跑 01 区的默认连接，所以只要配了模型 Ask 就能用；连这个也没配时，界面会直接说清楚要去配什么。
 - **Knowledge / 知识** —— 从资料里长出来的东西
   - **Graph / 图谱** —— 力导向图谱浏览 + 洞察(枢纽/孤立节点/类型分布)

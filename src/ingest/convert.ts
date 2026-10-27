@@ -42,6 +42,21 @@ export function convertedPathForRaw(rawRel: string): string {
   return isConvertibleFile(rawRel) ? `${rawRel}.md` : rawRel;
 }
 
+/** Material research captured (src/research/capture.ts): kept whole, because what a study came for is often at the end. */
+const RESEARCH_CAPTURES = 'raw/docs/research/';
+export const RESEARCH_MAX_PDF_PAGES = 1000;
+
+/**
+ * Pages a PDF is converted up to. A prospectus or an annual report puts its
+ * financial statements last, so a captured PDF is read to the end (up to
+ * RESEARCH_MAX_PDF_PAGES); everything else keeps the default, and with it the
+ * cache key it was converted under.
+ */
+export function pdfPageLimit(rawRel: string | undefined, opts: ConversionOptions): number {
+  if (opts.maxPdfPages !== undefined) return opts.maxPdfPages;
+  return rawRel?.replace(/\\/g, '/').startsWith(RESEARCH_CAPTURES) ? RESEARCH_MAX_PDF_PAGES : DEFAULT_MAX_PDF_PAGES;
+}
+
 /**
  * What a cached conversion is keyed by: the converter and its version, the
  * vision model when the converter uses one, and the size limits. A different
@@ -57,7 +72,7 @@ export function conversionCacheKey(opts: ConversionOptions, rawRel?: string): st
   return [
     head,
     vision,
-    `pages:${opts.maxPdfPages ?? DEFAULT_MAX_PDF_PAGES}`,
+    `pages:${pdfPageLimit(rawRel, opts)}`,
     `image:${opts.maxImageDimension ?? DEFAULT_MAX_IMAGE_DIMENSION}`,
   ].join('|');
 }
@@ -73,7 +88,7 @@ export async function convertDocumentToMarkdown(
     absPath: sourcePath,
     rel: rawRel,
     vision: opts.vision,
-    maxPdfPages: opts.maxPdfPages,
+    maxPdfPages: pdfPageLimit(rawRel, opts),
     maxImageDimension: opts.maxImageDimension,
   };
   const result = await converter.convert(input);

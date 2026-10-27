@@ -651,6 +651,51 @@ export interface ResearchConfig {
   reviewRounds: number;
   /** Knowledge-base initialization (kind = init): how long its pre-flight catches up on extraction, and how many topic pages it queues. */
   init: ResearchInitConfig;
+  /** Studies: a topic researched into several pages (kind = study, docs/design/15). */
+  study: ResearchStudyConfig;
+  /** What research may fetch from the web, where it goes, and which search API knode itself calls. */
+  web: ResearchWebConfig;
+}
+
+export interface ResearchStudyConfig {
+  /** Collector sessions a study runs at once while it gathers material. */
+  collectors: number;
+  /** Pages one study may plan besides its report; the refiner is told, and a longer plan is cut. */
+  maxPages: number;
+  /** Web captures one study may make before knode_capture refuses more. */
+  maxCaptures: number;
+  /**
+   * Who turns a topic into a brief: an agent name, connection id or CLI.
+   * Empty = the default LLM when it is a model endpoint, else the study's own agent, one-shot.
+   */
+  refiner: string;
+}
+
+export type WebSearchProvider = '' | 'searxng' | 'brave' | 'tavily' | 'serper';
+
+export interface ResearchWebConfig {
+  /**
+   * The search API behind `knode_web_search`. Empty = none: only an agent with
+   * a search tool of its own (Claude Code, Codex) searches the web, the
+   * built-in agent cannot. Nothing is called that a person did not name here.
+   */
+  search: { provider: WebSearchProvider; baseUrl: string; apiKey: string; maxResults: number };
+  /** Largest response a capture or fetch reads. */
+  maxBytes: number;
+  timeoutMs: number;
+  /**
+   * Also fetch private, loopback and link-local addresses (an intranet wiki).
+   * Off: a URL an agent picked can never reach this machine's own services or
+   * the local network.
+   */
+  allowPrivateHosts: boolean;
+  /**
+   * Proxy for fetches: '' = HTTPS_PROXY / HTTP_PROXY from the environment
+   * (NO_PROXY honoured), 'none' = direct, or an http:// proxy URL.
+   */
+  proxy: string;
+  /** User-Agent for fetches. Some publishers require a contact (SEC EDGAR asks for "Name email@domain"). */
+  userAgent: string;
 }
 
 export interface ResearchInitConfig {
@@ -966,6 +1011,15 @@ export function defaultConfig(): KnodeConfig {
       researchers: 3,
       reviewRounds: 1,
       init: { followUps: 6, extractionMaxMs: 900_000 },
+      study: { collectors: 3, maxPages: 6, maxCaptures: 60, refiner: '' },
+      web: {
+        search: { provider: '', baseUrl: '', apiKey: '', maxResults: 8 },
+        maxBytes: 25 * 1024 * 1024,
+        timeoutMs: 30_000,
+        allowPrivateHosts: false,
+        proxy: '',
+        userAgent: 'knode-os/0.1 (local research assistant)',
+      },
     },
     graph: { ontologyPacks: ['core', 'organization'] },
     review: {
@@ -1733,6 +1787,9 @@ export function redactConfig(config: KnodeConfig): KnodeConfig {
   for (const c of secretHolders) {
     if (c.apiKey && !c.apiKey.startsWith('env:')) c.apiKey = '***';
   }
+  const search = clone.research?.web?.search;
+  if (search?.apiKey && !search.apiKey.startsWith('env:')) search.apiKey = '***';
+  if (clone.research?.web?.proxy) clone.research.web.proxy = redactConnectionUrl(clone.research.web.proxy);
   const literal = (value: unknown) => !(typeof value === 'string' && (value === '' || value.startsWith('env:')));
   for (const ds of clone.datasources ?? []) {
     if (ds.password && !ds.password.startsWith('env:')) ds.password = '***';

@@ -16,7 +16,7 @@ describe('research templates', () => {
     const dir = path.join(dataDir, RESEARCH_DIR);
     expect(fs.existsSync(path.join(dir, 'AGENTS.md'))).toBe(true);
     const all = loadResearchTemplates(dataDir);
-    expect([...all.keys()].sort()).toEqual(['comparison', 'concept', 'entity', 'init', 'question', 'refresh', 'timeline', 'verify']);
+    expect([...all.keys()].sort()).toEqual(['comparison', 'concept', 'entity', 'init', 'question', 'refresh', 'section', 'study', 'timeline', 'verify']);
     expect(fs.existsSync(path.join(dir, 'phases', 'plan.md'))).toBe(true);
     expect(fs.existsSync(path.join(dir, 'phases', 'init-plan.md'))).toBe(true);
     const init = all.get('init')!;

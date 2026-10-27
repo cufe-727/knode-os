@@ -35,6 +35,10 @@ import { prepareRunWorkspace, runsRoot } from './research/workspace.js';
 import { recommendWikiTopics, refreshRecommendations } from './research/recommend.js';
 import { launchArgs } from './research/launch.js';
 import { loadProfile, loadProfiles, profileYaml } from './research/profile.js';
+import { captureUrl } from './research/capture.js';
+import { loadResearchSources, sourceProblem } from './research/sources.js';
+import { continueStudies, createStudy, listStudies, refineStudy, startProblem, startStudy, cancelStudy, studyPayload, studyView, StudyRunner } from './research/study.js';
+import type { StudyBrief } from './research/refine.js';
 import { runDocumentPass } from './ingest/background.js';
 import { REMOTE_SCOPES, RemoteScope, RemoteTokenStore } from './remote/tokens.js';
 import { WORK_KINDS } from './work/kinds.js';
@@ -1675,6 +1679,227 @@ research
     } finally {
       await ctx.store.close();
     }
+  });
+/** A brief as a person reads it in a terminal. */
+function printBrief(id: string, status: string, brief: StudyBrief, problem: string | null): void {
+  console.log(`\n${brief.title}   (${id}, ${status}, ${brief.language})`);
+  console.log(`\n${brief.objective}`);
+  if (brief.restatement) console.log(`\n${brief.restatement}`);
+  if (brief.scope.timeframe || brief.scope.include.length) console.log(`\nscope: ${[brief.scope.include.join('; '), brief.scope.timeframe].filter(Boolean).join(' · ')}${brief.scope.exclude.length ? `  (not: ${brief.scope.exclude.join('; ')})` : ''}`);
+  for (const page of brief.pages) {
+    console.log(`\n  ${page.id}  ${page.title}  → wiki/research/${brief.slug}/${page.slug}.md`);
+    for (const qid of page.questions) {
+      const q = brief.questions.find((x) => x.id === qid);
+      if (q) console.log(`        ${q.id} ${q.text}`);
+    }
+  }
+  if (brief.seedUrls.length) console.log(`\nseed URLs:\n${brief.seedUrls.map((u) => `  ${u.url}${u.why ? `  — ${u.why}` : ''}`).join('\n')}`);
+  if (brief.clarifications.length) {
+    console.log('\nclarifications (answer with `research study refine <id> --answer "<question>=<answer>"`):');
+    for (const c of brief.clarifications) console.log(`  ? ${c.question}${c.options.length ? `  [${c.options.join(' | ')}]` : ''}${c.answer ? `  → ${c.answer}` : ''}`);
+  }
+  if (problem) console.log(`\ncannot start yet: ${problem}`);
+}
+
+/**
+ * A whole study, here: collect, every page, the report — what `serve`'s queue
+ * would do over its ticks, one job at a time, against a temporary MCP endpoint.
+ */
+async function runStudyNow(ctx: Awaited<ReturnType<typeof createContext>>, id: string, log: (m: string) => void): Promise<void> {
+  await withTemporaryMcp(ctx, async (mcp) => {
+    for (let round = 0; round < 50; round++) {
+      await continueStudies(ctx, log);
+      const study = await getJob(ctx.store, id);
+      if (!study) throw new Error(`no study ${id}`);
+      if (study.status === 'queued') {
+        const [claimed] = await ctx.store.query<{ id: string }>(`UPDATE research_jobs SET status = 'running', started_at = now(), attempts = attempts + 1 WHERE id = $1 AND status = 'queued' RETURNING id`, [id]);
+        if (claimed) await runResearchJob(ctx, (await getJob(ctx.store, id))!, { mcp, log });
+        continue;
+      }
+      if (study.status !== 'waiting') return;
+      const pages = await listJobs(ctx.store, { study: id, status: 'queued', limit: 100 });
+      if (pages.length === 0) return;
+      for (const page of pages) {
+        const [claimed] = await ctx.store.query<{ id: string }>(`UPDATE research_jobs SET status = 'running', started_at = now(), attempts = attempts + 1 WHERE id = $1 AND status = 'queued' RETURNING id`, [page.id]);
+        if (claimed) await runResearchJob(ctx, (await getJob(ctx.store, page.id))!, { mcp, log });
+      }
+    }
+  });
+}
+
+const study = research.command('study').description('studies: a topic researched into several wiki pages — refine the question, collect sources into raw/docs/research, write the pages and a report');
+study
+  .command('new <topic...>')
+  .description('create a study from a topic and refine it into a brief (pages, questions, seed sources); --start queues it')
+  .option('--agent <spec>', 'agent that runs it: an agent name, connection id or claude-cli / codex-cli / cursor-cli (default research.agent)')
+  .option('--model <model>', 'model for that agent')
+  .option('--profile <name>', 'research profile for its pages (default research.profile)')
+  .option('--no-web', 'do not search the web: the knowledge base and the selected sources only')
+  .option('--sources <ids>', 'research sources to use (comma-separated; default: the enabled ones)')
+  .option('--deep-research <connection:model>', 'collect with a deep-research model on an OpenAI-compatible connection, e.g. openai:o3-deep-research')
+  .option('--language <tag>', 'output language (default: the topic\'s)')
+  .option('--no-refine', 'skip the refiner: a template brief to edit')
+  .option('--start', 'queue it right away')
+  .option('--now', 'run the whole study in this process (implies --start)')
+  .action(async (parts: string[], opts: { agent?: string; model?: string; profile?: string; web: boolean; sources?: string; deepResearch?: string; language?: string; refine: boolean; start?: boolean; now?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const runner: Partial<StudyRunner> = { agent: opts.agent ?? '', model: opts.model ?? '', profile: opts.profile ?? '' };
+      if (opts.deepResearch) {
+        const at = opts.deepResearch.indexOf(':');
+        if (at < 1) throw new Error('--deep-research takes <connection>:<model>');
+        Object.assign(runner, { mode: 'deep-research', deepResearch: { connection: opts.deepResearch.slice(0, at), model: opts.deepResearch.slice(at + 1) } });
+      }
+      console.log('refining…');
+      let job = await createStudy(ctx, {
+        topic: parts.join(' '), runner, requestedBy: 'cli', language: opts.language, refine: opts.refine,
+        sources: { web: opts.web, ...(opts.sources ? { ids: opts.sources.split(',').map((x) => x.trim()).filter(Boolean) } : {}) },
+      });
+      const p = studyPayload(job);
+      const last = p.refinements[p.refinements.length - 1];
+      if (last?.error) console.log(`refiner (${last.refiner}): ${last.error}`);
+      printBrief(job.id, job.status, p.brief, startProblem(ctx, job));
+      if (opts.start || opts.now) {
+        job = await startStudy(ctx, job.id);
+        console.log(`\nstarted ${job.id}`);
+        if (opts.now) await runStudyNow(ctx, job.id, (m) => console.log(`  ${m}`));
+      }
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+study
+  .command('refine <id> [feedback...]')
+  .description('refine a draft: what to change, and answers to its clarifications')
+  .option('--answer <q=a...>', 'answer a clarification ("<question>=<answer>"; repeatable)', (v: string, all: string[] = []) => [...all, v])
+  .action(async (id: string, parts: string[], opts: { answer?: string[] }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const answers = Object.fromEntries((opts.answer ?? []).map((a) => {
+        const at = a.indexOf('=');
+        return at > 0 ? [a.slice(0, at).trim(), a.slice(at + 1).trim()] : [a.trim(), ''];
+      }));
+      console.log('refining…');
+      const job = await refineStudy(ctx, id, { feedback: parts.join(' '), answers });
+      const p = studyPayload(job);
+      const last = p.refinements[p.refinements.length - 1];
+      if (last?.error) console.log(`refiner (${last.refiner}): ${last.error}`);
+      printBrief(job.id, job.status, p.brief, startProblem(ctx, job));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+study
+  .command('start <id>')
+  .description('queue a draft study (serve runs it); --now runs it here')
+  .option('--now', 'run the whole study in this process')
+  .action(async (id: string, opts: { now?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const job = await startStudy(ctx, id);
+      console.log(`started ${job.id}`);
+      if (opts.now) await runStudyNow(ctx, job.id, (m) => console.log(`  ${m}`));
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+study
+  .command('run <id>')
+  .description('go on with a started study in this process: whatever stage it is at, until it is done')
+  .action(async (id: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      await runStudyNow(ctx, id, (m) => console.log(`  ${m}`));
+      const job = await getJob(ctx.store, id);
+      console.log(job ? `${job.id}: ${job.status} (${studyPayload(job).stage})${job.outputPath ? ` → ${job.outputPath}` : ''}` : `no study ${id}`);
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+study
+  .command('show <id>')
+  .option('--json', 'the whole view as JSON')
+  .action(async (id: string, opts: { json?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const job = await getJob(ctx.store, id);
+      if (!job || job.kind !== 'study') throw new Error(`no study ${id}`);
+      const view = await studyView(ctx, job);
+      if (opts.json) {
+        console.log(JSON.stringify(view, null, 2));
+        return;
+      }
+      printBrief(job.id, job.status, view.payload.brief, job.status === 'draft' ? startProblem(ctx, job) : null);
+      console.log(`\nstages: ${view.payload.steps.map((st) => `${st.name}=${st.status}${st.detail ? ` (${st.detail})` : ''}`).join('  ')}`);
+      console.log(`\npages:${view.pages.map((pg) => `\n  ${pg.status.padEnd(10)} ${pg.path}${pg.trust ? `  [${pg.trust}]` : ''}${pg.error ? `  ✗ ${pg.error.slice(0, 100)}` : ''}`).join('')}`);
+      console.log(`report: ${view.reportPath}${view.reportExists ? '' : ' (not yet)'}`);
+      console.log(`sources: ${view.captures.length} captured — ${view.registerPath}`);
+    } finally {
+      await ctx.store.close();
+    }
+  });
+study
+  .command('list')
+  .action(async () => {
+    const ctx = await createContext(dataDir());
+    try {
+      const jobs = await listStudies(ctx, 50);
+      for (const j of jobs) {
+        const p = studyPayload(j);
+        console.log(`${j.id}  ${j.status.padEnd(10)} ${p.stage.padEnd(8)} ${p.brief.title.slice(0, 70)}`);
+      }
+      if (jobs.length === 0) console.log('(no studies)');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+study
+  .command('cancel <id>')
+  .description('cancel a study and the pages it has not finished')
+  .action(async (id: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log(JSON.stringify(await cancelStudy(ctx, id)));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+research
+  .command('capture <url>')
+  .description('save a web page or file (HTML, PDF, CSV / JSON, image) into raw/docs/research — fetched, converted and indexed like any document')
+  .option('--study <id>', 'file it under a study')
+  .option('--why <text>', 'what it is for')
+  .action(async (url: string, opts: { study?: string; why?: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      let ref: { id: string; slug: string; title?: string } | null = null;
+      if (opts.study) {
+        const job = await getJob(ctx.store, opts.study);
+        if (!job || job.kind !== 'study') throw new Error(`no study ${opts.study}`);
+        ref = { id: job.id, slug: job.target ?? job.id, title: studyPayload(job).brief.title };
+      }
+      const r = await captureUrl(ctx, { url, study: ref, why: opts.why, actor: process.env.USER || 'cli', index: 'wait' });
+      console.log(JSON.stringify({ path: r.path, title: r.title, kind: r.kind, published: r.published, reused: r.reused, bytes: r.bytes, chars: r.chars, warnings: r.warnings, outline: r.outline.slice(0, 15) }, null, 2));
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+research
+  .command('sources')
+  .description('the research sources under playbooks/research/sources (MCP servers, APIs, sites, datasources)')
+  .action(async () => {
+    const dir = dataDir();
+    const config = loadConfig(dir);
+    const sources = loadResearchSources(dir);
+    for (const s of sources) {
+      const problem = sourceProblem(s, config);
+      console.log(`${s.enabled ? '●' : '○'} ${s.id.padEnd(20)} ${s.kind.padEnd(10)} ${s.title}${problem ? `  ✗ ${problem}` : ''}`);
+    }
+    if (sources.length === 0) console.log(`(no research sources — add YAML files under playbooks/research/sources/, or in the web UI: Research → Sources)`);
   });
 research
   .command('cancel <id>')
