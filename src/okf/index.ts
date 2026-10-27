@@ -109,13 +109,9 @@ interface ParsedOkfFile {
  * graph edges; images, wikilinks, external links and links in code are ignored.
  */
 export function extractMarkdownLinks(markdown: string): OkfLink[] {
-  const withoutCode = markdown
-    .replace(/```[\s\S]*?```/g, '')
-    .replace(/~~~[\s\S]*?~~~/g, '')
-    .replace(/`[^`\n]*`/g, '');
   const links: OkfLink[] = [];
   const seen = new Set<string>();
-  for (const match of withoutCode.matchAll(/(?<!!)\[([^\]]+)\]\(([^)]+)\)/g)) {
+  for (const match of withoutMarkdownCode(markdown).matchAll(/(?<!!)\[([^\]]+)\]\(([^)]+)\)/g)) {
     const label = match[1].trim();
     let target = match[2].trim();
     if (target.startsWith('<')) {
@@ -133,6 +129,14 @@ export function extractMarkdownLinks(markdown: string): OkfLink[] {
     }
   }
   return links;
+}
+
+/** The text with fenced blocks and inline code removed: a link written as code is an example, not a link. */
+export function withoutMarkdownCode(markdown: string): string {
+  return markdown
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/~~~[\s\S]*?~~~/g, '')
+    .replace(/`[^`\n]*`/g, '');
 }
 
 /** Resolve an OKF link to a bundle-relative markdown path, or null if external. */

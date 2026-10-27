@@ -40,6 +40,7 @@ export const CATALOG_VIEWS: { name: string; description: string }[] = [
   { name: 'v_pages', description: 'materialized wiki views and their input signatures' },
   { name: 'v_datasets', description: 'registered live tables and their schemas' },
   { name: 'v_mentions', description: 'entity ↔ chunk ↔ document grounding' },
+  { name: 'v_citations', description: 'wiki pages citing raw/docs files: page and file path, predicate (cites / derived_from / tested_by …), how the link was written, the citing page\'s trust' },
   { name: 'v_capabilities', description: 'what can be asked of which source, with schema, cost and freshness' },
   { name: 'v_locators', description: 'how to reach an entity through a capability: parameter and value to bind' },
   { name: 'v_capability_notes', description: 'the written semantic layer: metric definitions, joins, pitfalls' },

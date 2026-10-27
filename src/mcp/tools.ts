@@ -221,7 +221,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: Kno
     'knode_lineage',
     {
       title: 'Lineage of a graph row or page',
-      description: 'Why does the knowledge base believe this? Lists every live and historical evidence row (source scope, extractor, weight, system-time window) behind an entity/relation/claim, the inputs a page was built from, or the scope history of a document.',
+      description: 'Why does the knowledge base believe this? Lists every live and historical evidence row (source scope, extractor, weight, system-time window) behind an entity/relation/claim, the inputs a page was built from, or the scope history of a document — with the wiki pages citing it (citedBy: cites / derived_from / tested_by …) and the raw/docs files it cites.',
       inputSchema: {
         kind: z.enum(['entity', 'relation', 'claim', 'page', 'document']),
         id: z.string().describe('Entity slug, relation/claim id, page path (wiki/…), or document path'),

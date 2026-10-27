@@ -4,8 +4,10 @@ import path from 'node:path';
 import { KnodeConfig } from '../config.js';
 import { MAX_FILE_BYTES } from '../constants.js';
 import { originOf, readSidecarPart, replayableTier1, SidecarTier1, truncatedTier1, updateSidecarPart } from '../fs/sidecar.js';
+import { CITATIONS_VERSION, dedupeCitations, rawDocValue, relationCitation } from '../graph/citations.js';
 import { planTier0, Tier0Plan, wireConcepts, wireLinks } from '../graph/concepts.js';
 import { frontmatterExtraction } from '../graph/frontmatter.js';
+import { loadOntology } from '../graph/ontology.js';
 import { parseCapabilityNotes } from '../capability/notes.js';
 import { TRUST_TIERS, TrustTier, detectDisputes, tierForActor } from '../lineage/trust.js';
 import { applyExtraction } from '../graph/llm-extract.js';
@@ -135,7 +137,13 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
 
   const live = await findLiveScope(store, 'doc', file);
   const sameModel = live?.meta.embedModel === embedder.model;
-  if (live && live.sha === sha && sameModel && !opts.reapply) {
+  // a wiki page applied before pages could cite raw/docs files is read again
+  // once — unless it is a generated view: the summaries cite their documents
+  // in machine-written regions, which never count
+  const citationsStale = root === 'wiki' && live !== null && live.sha === sha && sameModel
+    && live.meta.citations !== CITATIONS_VERSION && live.meta.kind !== 'view'
+    && !isReservedWikiFile(file) && raw.includes('raw/docs/');
+  if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale) {
     // a sidecar may have gained a replayable tier-1 extraction since (copied
     // from another machine, or written by a bench run) — apply it as the
     // document's child scope without re-indexing the document itself
@@ -192,8 +200,24 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     ? planWireFromMarkdown(store.dataDir, page, parsed, { selfEntity: cls.selfEntity, wikiIndex: opts.wikiIndex, body: sourceBody })
     : null;
   const humanPlan = !isSource && cls.graph
-    ? planWireFromMarkdown(store.dataDir, page, { frontmatter: parsed.frontmatter, body: cls.humanBody }, { selfEntity: true, body: cls.humanBody, wikiIndex: opts.wikiIndex })
+    ? planWireFromMarkdown(store.dataDir, page, { frontmatter: parsed.frontmatter, body: cls.humanBody }, { selfEntity: true, body: cls.humanBody, wikiIndex: opts.wikiIndex, citations: 'body' })
     : null;
+  // a bundle page may declare entities, typed relations and claims in its
+  // frontmatter (research pages do), its own entity the default subject. On a
+  // wiki page a relation naming a raw/docs file is a citation instead, which
+  // needs no entity of the page's own
+  const fm = parsed.frontmatter;
+  const declaredWiki = wirePlan && (wirePlan.self || root === 'wiki') && (fm.relations || fm.claims || fm.entities)
+    ? frontmatterExtraction(
+      { relations: fm.relations, claims: fm.claims, entities: fm.entities },
+      { defaultSource: wirePlan.self?.name, citationTarget: root === 'wiki' ? (v) => rawDocValue(file, v) : undefined },
+    )
+    : null;
+  if (wirePlan && declaredWiki?.citations.length) {
+    const ontology = loadOntology(store.dataDir);
+    const typed = declaredWiki.citations.map((d) => ({ ...relationCitation(ontology, d), chunkId: null }));
+    wirePlan.citations = dedupeCitations([...wirePlan.citations, ...typed]);
+  }
   const declared = root === 'docs' && isSource ? frontmatterExtraction(parsed.frontmatter) : null;
   // tier-0 links what the graph already knows and mines the rest; both are
   // planned here (two reads) so the scope body only writes
@@ -217,7 +241,11 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     : typeof parsed.frontmatter.actor === 'string'
       ? tierForActor(parsed.frontmatter.actor)
       : undefined;
-  const trust: TrustTier = writerTier === 'quarantined' ? 'quarantined' : declaredTrust ?? writerTier;
+  // the same bytes applied again keep the tier their live scope has: a person
+  // may have promoted it since (setScopeTrust), and re-reading is no new version
+  const trust: TrustTier = live && live.sha === sha && live.trust
+    ? live.trust
+    : writerTier === 'quarantined' ? 'quarantined' : declaredTrust ?? writerTier;
   const declaredAcl = Array.isArray(parsed.frontmatter.acl) ? parsed.frontmatter.acl.map(String) : undefined;
   const tier1Part = root === 'docs' && isSource ? readSidecarPart(store.dataDir, file, 'tier1') : null;
   const tier1 = tier1Part ? replayableTier1(tier1Part, sha, raw.length) : null;
@@ -234,11 +262,11 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     {
       actor,
       at: opts.at,
-      force: Boolean(live && (!sameModel || opts.reapply)),
+      force: Boolean(live && (!sameModel || opts.reapply || citationsStale)),
       keepProjectionOnReplace: true,
       trust,
       acl: declaredAcl,
-      meta: { documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title },
+      meta: { documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title, ...(root === 'wiki' ? { citations: CITATIONS_VERSION } : {}) },
     },
     async (w) => {
       // counted afresh on every run: a transaction rolled back for a deadlock runs the body again
@@ -252,17 +280,9 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
       if (wirePlan) {
         const s = await applyWirePlan(w, page, wirePlan, { extractor: 'tier0.wikilink' });
         g = { entities: g.entities + s.entities, relations: g.relations + s.relations };
-        // a bundle page may declare entities, typed relations and claims in its
-        // frontmatter (research pages do); its own entity is the default subject
-        if (wirePlan.self && (parsed.frontmatter.relations || parsed.frontmatter.claims || parsed.frontmatter.entities)) {
-          const declaredWiki = frontmatterExtraction(
-            { relations: parsed.frontmatter.relations, claims: parsed.frontmatter.claims, entities: parsed.frontmatter.entities },
-            { defaultSource: wirePlan.self.name },
-          );
-          if (declaredWiki) {
-            const dg = await applyExtraction(w, page, declaredWiki.entities, declaredWiki.relations, declaredWiki.claims, 'tier0.frontmatter', { docDate });
-            g = { entities: g.entities, relations: g.relations + dg.relations };
-          }
+        if (wirePlan.self && declaredWiki && (declaredWiki.entities.length || declaredWiki.relations.length || declaredWiki.claims.length)) {
+          const dg = await applyExtraction(w, page, declaredWiki.entities, declaredWiki.relations, declaredWiki.claims, 'tier0.frontmatter', { docDate });
+          g = { entities: g.entities, relations: g.relations + dg.relations };
         }
       }
       if (root === 'docs' && isSource) {

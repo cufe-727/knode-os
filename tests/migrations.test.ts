@@ -269,3 +269,40 @@ describe('v14: claims carry a kind', () => {
     }
   });
 });
+
+describe('v16: citations', () => {
+  it('adds the scope-owned citations table and its catalog view to a v15 database', async () => {
+    const dataDir = path.join(tmp, 'v16');
+    fs.mkdirSync(path.join(dataDir, '.knode'), { recursive: true });
+    let store = await Store.open(dataDir, 3);
+    try {
+      await store.cleanup;
+      // a database that stopped at v15: no citations yet
+      await store.query(`DROP VIEW v_citations`);
+      await store.query(`DROP TABLE citations`);
+      await store.query(`UPDATE meta SET value = '{"v":15}'::jsonb WHERE key = 'schema_version'`);
+    } finally {
+      await store.close();
+    }
+
+    store = await Store.open(dataDir, 3);
+    try {
+      expect(store.migration).toEqual({ from: 15, to: SCHEMA_VERSION });
+      await store.query(
+        `INSERT INTO scopes (id, kind, key, sha, status, actor, applied_at, meta) VALUES ('s1', 'doc', 'wiki/k1.md', 'x', 'active', 'sync', now(), '{}'::jsonb)`,
+      );
+      await store.query(
+        `INSERT INTO citations (scope_id, document_id, source_path, target_path, type, via, tx_from)
+         VALUES ('s1', 'd1', 'wiki/k1.md', 'raw/docs/Paper.md', 'derived_from', 'sources', now())`,
+      );
+      expect(await store.query(`SELECT source_path, target_path, type, inverse, trust FROM v_citations`)).toEqual([
+        { source_path: 'wiki/k1.md', target_path: 'raw/docs/Paper.md', type: 'derived_from', inverse: false, trust: 'trusted' },
+      ]);
+      // the rows go with the scope that wrote them
+      await store.query(`DELETE FROM scopes WHERE id = 's1'`);
+      expect(await store.query(`SELECT * FROM citations`)).toEqual([]);
+    } finally {
+      await store.close();
+    }
+  });
+});

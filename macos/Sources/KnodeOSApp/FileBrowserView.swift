@@ -120,6 +120,8 @@ struct FileBrowserView: View {
     @State private var checkedPaths: Set<String> = []
     /// The known entities the open file names, marked in its preview.
     @State private var mentions: [EntityMention] = []
+    /// The wiki pages citing the open raw/docs file.
+    @State private var citations: [CitingPage] = []
     /// Where the preview should go once it shows: a followed link's #fragment, or the block a way back returns to.
     @State private var scrollTarget: MarkdownScrollTarget?
     /// The entities opened in the entity panel, the one shown last; empty while the panel is closed.
@@ -406,6 +408,11 @@ struct FileBrowserView: View {
                     Divider()
                 }
 
+                if !citations.isEmpty {
+                    citationStrip
+                    Divider()
+                }
+
                 if isEditing {
                     TextEditor(text: $editorContent)
                         .font(.system(size: 13, design: .monospaced))
@@ -433,6 +440,7 @@ struct FileBrowserView: View {
                     }
                 }
             }
+            .task(id: selectedPath) { await loadCitations(for: selectedPath) }
         } else {
             EmptyState(
                 symbol: "doc.text.magnifyingglass",
@@ -440,6 +448,44 @@ struct FileBrowserView: View {
                 message: L("Browse the workspace tree, or drag documents and folders onto it to upload and index them.")
             )
         }
+    }
+
+    /// The wiki pages citing the open raw/docs file, each opening its page with ‹ back to here.
+    private var citationStrip: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Eyebrow(text: L("Cited by"))
+                .help(L("Wiki pages that cite this file: [[raw/docs/…]] and Markdown links, sources: entries, relations such as tested_by"))
+            FlowLayout(spacing: 14) {
+                ForEach(citations) { page in
+                    Button { Task { await leave(for: page.path, returningTo: nil) } } label: {
+                        HStack(spacing: 5) {
+                            Label(page.title ?? page.path, systemImage: "doc.richtext")
+                                .foregroundStyle(Color.knodeCyan)
+                            Text(page.labels)
+                                .foregroundStyle(.secondary)
+                            if page.trust == "quarantined" {
+                                Text(page.trust)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.orange)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 1)
+                                    .background(Color.orange.opacity(0.12), in: Capsule())
+                                    .help(L("An agent wrote this page and nobody has promoted it yet"))
+                            }
+                        }
+                        .lineLimit(1)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isWorking)
+                    .help(page.path)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 11))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
     }
 
     private var newFileSheet: some View {
@@ -941,6 +987,15 @@ struct FileBrowserView: View {
         await openFile(last.path)
         guard selectedPath == last.path else { return }
         scrollTarget = last.block.map(MarkdownScrollTarget.block)
+    }
+
+    /// The wiki pages citing a raw/docs file. Extra, like the marks: a failed read (an older service answers 404) shows no strip.
+    private func loadCitations(for path: String) async {
+        citations = []
+        guard path.hasPrefix("raw/docs/") else { return }
+        guard let found = try? await model.client().fileCitations(at: path).citedBy,
+              !Task.isCancelled, selectedPath == path else { return }
+        citations = found
     }
 
     /// Ask which known entities the previewed text names. Marking is extra: a failed read leaves the text unmarked.

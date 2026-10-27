@@ -869,6 +869,39 @@ const V15_DOCUMENT_CHARS = `
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS chars INTEGER;
 `;
 
+// A wiki page citing a file under raw/docs — a [[raw/docs/…]] link, a Markdown
+// link, a `sources:` entry, a typed `relations:` entry (src/graph/citations.ts).
+// A raw document has no node in the graph and relations join entities, so a
+// citation is a row of its own, owned by the citing page's scope like a
+// capability note and closed by tx_to when that scope is replaced or disposed,
+// which keeps "cited by" right under `as_of`. The target is the path the page
+// wrote, normalized, not a document id: a page may cite a file uploaded later,
+// and the order sync applies them in must not matter. Lookups fold case, as
+// the file system the paths come from does.
+const V16_CITATIONS = `
+CREATE TABLE IF NOT EXISTS citations (
+  seq          BIGSERIAL PRIMARY KEY,
+  scope_id     TEXT NOT NULL REFERENCES scopes(id) ON DELETE CASCADE,
+  document_id  TEXT NOT NULL,
+  source_path  TEXT NOT NULL,
+  target_path  TEXT NOT NULL,
+  type         TEXT NOT NULL,
+  inverse      BOOLEAN NOT NULL DEFAULT false,
+  via          TEXT NOT NULL,
+  fragment     TEXT,
+  chunk_id     TEXT,
+  tx_from      TIMESTAMPTZ NOT NULL,
+  tx_to        TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS citations_target_idx ON citations (lower(target_path), tx_from);
+CREATE INDEX IF NOT EXISTS citations_source_idx ON citations (source_path, tx_from);
+CREATE INDEX IF NOT EXISTS citations_scope_idx ON citations (scope_id);
+CREATE OR REPLACE VIEW v_citations AS
+  SELECT c.source_path, c.target_path, c.type, c.inverse, c.via, c.fragment, s.trust, c.tx_from
+  FROM citations c JOIN scopes s ON s.id = c.scope_id
+  WHERE c.tx_to IS NULL;
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -902,6 +935,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 13, name: 'derived-cooccurrence', up: async (q) => execScript(q, V13_DERIVED_COOCCURRENCE) },
   { version: 14, name: 'claim-kind', up: async (q) => execScript(q, V14_CLAIM_KIND) },
   { version: 15, name: 'document-chars', up: async (q) => execScript(q, V15_DOCUMENT_CHARS) },
+  { version: 16, name: 'citations', up: async (q) => execScript(q, V16_CITATIONS) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

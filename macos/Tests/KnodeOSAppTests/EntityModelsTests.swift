@@ -51,4 +51,27 @@ final class EntityModelsTests: XCTestCase {
         XCTAssertNil(reply.claims)
         XCTAssertEqual(reply.edges[0].type, "co_occurs")
     }
+
+    func testTheWikiPagesCitingAFileDecodeWithTheirLinks() throws {
+        let json = """
+        {"path":"raw/docs/papers/d1.md","citedBy":[
+          {"path":"wiki/concepts/K1.md","title":"K1","trust":"trusted","links":[
+            {"type":"derived_from","inverse":false,"label":"derived_from","via":"sources","fragment":null},
+            {"type":"tested_by","inverse":true,"label":"tests","via":"relations","fragment":null},
+            {"type":"cites","inverse":false,"label":"cites","via":"markdown","fragment":"e-4171ba2c"}]},
+          {"path":"wiki/concepts/agent-page.md","title":null,"trust":"quarantined","links":[
+            {"type":"cites","inverse":false,"label":"cites","via":"wikilink","fragment":null}]}]}
+        """
+        let reply = try decoder.decode(FileCitationsResponse.self, from: Data(json.utf8))
+        XCTAssertEqual(reply.path, "raw/docs/papers/d1.md")
+        XCTAssertEqual(reply.citedBy.map(\.id), ["wiki/concepts/K1.md", "wiki/concepts/agent-page.md"])
+        let k1 = reply.citedBy[0]
+        XCTAssertEqual(k1.labels, "derived from · tests · cites")
+        XCTAssertTrue(k1.links[1].inverse)
+        XCTAssertEqual(k1.links[2].fragment, "e-4171ba2c")
+        let agent = reply.citedBy[1]
+        XCTAssertNil(agent.title)
+        XCTAssertEqual(agent.trust, "quarantined")
+        XCTAssertNil(agent.links[0].fragment)
+    }
 }

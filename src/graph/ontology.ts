@@ -50,6 +50,12 @@ export interface RelationTypeSpec {
   examples?: string[];
   /** Written by the pipeline itself (mentions, co_occurs …); never offered to the LLM. */
   system?: boolean;
+  /**
+   * A page's link to a document (cites, derived_from, tested_by): an author
+   * writes it in frontmatter, the extraction prompt never offers it, the
+   * research brief does (src/graph/citations.ts).
+   */
+  documentLink?: boolean;
 }
 
 export interface Ontology {
@@ -75,6 +81,42 @@ export interface NormalizedPredicate {
  * read (cooccur.ts) — but stays legal so old sidecars and packs still validate.
  */
 export const SYSTEM_RELATION_TYPES = ['related_to', 'mentions', 'links_to', 'co_occurs', 'stored_in', 'appears_in'] as const;
+
+/**
+ * Predicates a wiki page cites a document with (src/graph/citations.ts),
+ * present in every workspace whatever its packs say: the packs on disk are
+ * the user's files and are never rewritten, so a workspace seeded before
+ * these existed would otherwise read `derived_from` as `related_to`. Between
+ * two entities they are ordinary predicates (`derived_from: ["[[K0]]"]`). The
+ * synonyms stay few and unambiguous, because the writer normalizes tier-1
+ * output with them too.
+ */
+export const DOCUMENT_RELATION_TYPES: readonly RelationTypeSpec[] = [
+  {
+    id: 'cites',
+    inverse: 'cited_by',
+    description: 'A refers to document B as a source',
+    synonyms: ['references', '引用'],
+    inverseSynonyms: ['referenced_by', '被引用'],
+    documentLink: true,
+  },
+  {
+    id: 'derived_from',
+    inverse: 'basis_of',
+    description: 'A was worked out from B: a paper, a dataset, a post, another idea',
+    synonyms: ['based_on', 'adapted_from', '源自', '推导自'],
+    inverseSynonyms: ['basis_for'],
+    documentLink: true,
+  },
+  {
+    id: 'tested_by',
+    inverse: 'tests',
+    description: 'A was tested, backtested or validated by B: an experiment, a backtest record',
+    synonyms: ['backtested_by', 'validated_by'],
+    inverseSynonyms: ['backtests', '回测'],
+    documentLink: true,
+  },
+];
 
 export const CORE_PACK_YAML = `# Ontology pack "core": the vocabulary every knode-os graph is written in.
 # Edit or add packs under playbooks/ontology/ and list them in knode.config.json
@@ -534,6 +576,7 @@ export function parseOntologyPack(text: string): { id: string; entityTypes: Enti
       inverseSynonyms: strings(o.inverseSynonyms ?? o.inverse_synonyms),
       examples: strings(o.examples),
       system: o.system === true,
+      documentLink: o.documentLink === true || o.document_link === true,
     });
   }
   return { id: typeof fm.id === 'string' ? fm.id : '', entityTypes, relationTypes };
@@ -554,7 +597,7 @@ function mergeSpec<T extends { id: string }>(into: Map<string, T>, spec: T): voi
   into.set(spec.id, merged as T);
 }
 
-/** Merge packs in order into one ontology; system predicates are always present. */
+/** Merge packs in order into one ontology; system and document predicates are always present. */
 export function buildOntology(packs: { name: string; text: string }[]): Ontology {
   const entityTypes = new Map<string, EntityTypeSpec>();
   const relationTypes = new Map<string, RelationTypeSpec>();
@@ -565,6 +608,9 @@ export function buildOntology(packs: { name: string; text: string }[]): Ontology
   }
   for (const id of SYSTEM_RELATION_TYPES) {
     if (!relationTypes.has(id)) relationTypes.set(id, { id, system: true, symmetric: id === 'co_occurs' });
+  }
+  for (const spec of DOCUMENT_RELATION_TYPES) {
+    if (!relationTypes.has(spec.id)) relationTypes.set(spec.id, { ...spec });
   }
   if (!entityTypes.has('concept')) entityTypes.set('concept', { id: 'concept' });
   const sha = sha16(packs.map((p) => [p.name, p.text]));
@@ -703,9 +749,11 @@ export function normalizePredicate(ont: Ontology, raw: string): NormalizedPredic
 /**
  * The vocabulary as the tier-1 prompt states it: one line per entity type
  * (id, label, meaning, examples) and per relation type (canonical id,
- * one-line meaning, inverse spelling, hints).
+ * one-line meaning, inverse spelling, hints). `documentLinks` adds the
+ * predicates a page cites documents with: the research brief wants them, the
+ * extraction prompt does not.
  */
-export function promptFragment(ont: Ontology): { entityTypes: string; relationTypes: string } {
+export function promptFragment(ont: Ontology, opts: { documentLinks?: boolean } = {}): { entityTypes: string; relationTypes: string } {
   const entityTypes = ont.entityTypes.map((t) => {
     const parts: string[] = [];
     if (t.description) parts.push(t.description);
@@ -714,7 +762,7 @@ export function promptFragment(ont: Ontology): { entityTypes: string; relationTy
   }).join('\n');
   const lines: string[] = [];
   for (const r of ont.relationTypes) {
-    if (r.system) continue;
+    if (r.system || (r.documentLink && !opts.documentLinks)) continue;
     const parts: string[] = [];
     if (r.description) parts.push(r.description);
     if (r.symmetric) parts.push('symmetric');

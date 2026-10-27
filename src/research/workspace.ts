@@ -215,7 +215,7 @@ export async function prepareRunWorkspace(ctx: AppContext, job: ResearchJob, tem
     return { path: c.path, sections: c.sections, backupPath };
   });
   const ontology = loadOntology(ctx.dataDir);
-  const vocab = promptFragment(ontology);
+  const vocab = promptFragment(ontology, { documentLinks: true });
 
   const schema = [
     loadResearchProtocol(ctx.dataDir).trim(),
@@ -250,6 +250,8 @@ export async function prepareRunWorkspace(ctx: AppContext, job: ResearchJob, tem
     '## 可用的关系谓词（frontmatter relations 的键）',
     '',
     vocab.relationTypes,
+    '',
+    'cites / derived_from / tested_by 的目标可以是 raw/docs 下的文件路径（如 `tested_by: [raw/docs/backtests/x.md]`）：它记为本页对该文件的引用，打开那个文件时会列出本页。frontmatter `sources` 里的 raw/docs 路径按 derived_from 记。',
     '',
     '实体类型：',
     vocab.entityTypes,

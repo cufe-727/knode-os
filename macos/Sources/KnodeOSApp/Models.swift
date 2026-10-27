@@ -428,6 +428,42 @@ struct FileResponse: Decodable {
     var derived: Bool?
 }
 
+/// The wiki pages citing a raw/docs file (`GET /api/file/citations`): its
+/// `[[raw/docs/…]]` and Markdown links, `sources:` entries and typed
+/// `relations:` such as `tested_by` (src/graph/citations.ts).
+struct FileCitationsResponse: Decodable {
+    var path: String
+    var citedBy: [CitingPage]
+}
+
+struct CitingPage: Decodable, Identifiable {
+    var path: String
+    var title: String?
+    /// `trusted`, or `quarantined` for a page an agent wrote that nobody has promoted yet.
+    var trust: String
+    var links: [CitationLink]
+
+    var id: String { path }
+
+    /// How the page cites the file, as it reads: "derived from · tested by".
+    var labels: String {
+        var seen = Set<String>()
+        return links.map { $0.label.replacingOccurrences(of: "_", with: " ") }
+            .filter { seen.insert($0).inserted }
+            .joined(separator: " · ")
+    }
+}
+
+struct CitationLink: Decodable {
+    var type: String
+    var inverse: Bool
+    /// The predicate as the page states it toward the file: an inverse row reads as its inverse name (`tests`).
+    var label: String
+    /// `wikilink`, `embed`, `markdown`, `sources` or `relations`.
+    var via: String
+    var fragment: String?
+}
+
 /// Where a followed link leads (GET /api/link/resolve): a file, or — for a name no
 /// note answers to but the graph knows — the entity, whose panel the link opens.
 struct ResolvedLinkResponse: Decodable {

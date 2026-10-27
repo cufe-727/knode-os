@@ -97,8 +97,11 @@ Structural rules the wiki follows. Edit freely — generators respect this file.
 - Cross-reference with ordinary markdown links (OKF + Obsidian) or Obsidian
   \`[[wikilinks]]\`, aliases, heading/block links and embeds; all are understood
   by the knowledge graph.
+- Cite a file under raw/docs with \`[[raw/docs/…]]\`, a markdown link, a
+  \`sources:\` entry (read as derived_from) or a \`relations:\` entry such as
+  \`tested_by: [raw/docs/…]\`; the file then lists the page as citing it.
 - Relation types: related_to, part_of, uses, depends_on, works_at, authored,
-  mentions, links_to (OKF markdown links).
+  mentions, links_to (OKF markdown links), cites, derived_from, tested_by.
 `;
 
 const INDEX_TEMPLATE = `---

@@ -4,6 +4,7 @@ import { safePath } from '../fs/files.js';
 import { ScopeWriter } from '../lineage/writer.js';
 import { ParsedMarkdown, parseFrontmatter, titleFromMarkdown } from '../markdown.js';
 import { extractMarkdownLinks, resolveOkfLink } from '../okf/index.js';
+import { dedupeCitations, frontmatterStrings, pageCitations, PlannedCitation, rawDocTarget } from './citations.js';
 import { PageContext } from './store.js';
 
 /**
@@ -30,7 +31,8 @@ export function extractObsidianLinks(content: string): ObsidianLink[] {
   for (const match of content.matchAll(/(!)?\[\[([^\]]+)\]\]/g)) {
     const inner = match[2];
     const pipeAt = inner.indexOf('|');
-    const destination = (pipeAt >= 0 ? inner.slice(0, pipeAt) : inner).trim();
+    // `[[note\|label]]` is how a table cell escapes the pipe: the backslash is not part of the name
+    const destination = (pipeAt >= 0 ? inner.slice(0, pipeAt) : inner).replace(/\\$/, '').trim();
     const customLabel = pipeAt >= 0 ? inner.slice(pipeAt + 1).trim() : '';
     const target = destination.split('#', 1)[0].trim();
     if (!target) continue; // same-note heading/block reference
@@ -91,6 +93,8 @@ export interface WireLink {
 export interface WirePlan {
   self: { name: string; type: string; description: string; aliases: string[] } | null;
   links: WireLink[];
+  /** The raw/docs files a wiki page cites (src/graph/citations.ts). */
+  citations: PlannedCitation[];
 }
 
 export interface WirePlanOptions {
@@ -99,6 +103,13 @@ export interface WirePlanOptions {
   /** Body to scan (defaults to parsed.body — views pass their human-only text). */
   body?: string;
   wikiIndex?: WikiIndex;
+  /**
+   * Which citations of raw/docs files to plan: the body and frontmatter of a
+   * wiki page (`all`, the default under wiki/), the body alone (`body`: the
+   * human prose of a generated page, whose frontmatter the generator wrote),
+   * or none (`none`, the default elsewhere).
+   */
+  citations?: 'all' | 'body' | 'none';
 }
 
 /** Pure planning step: no database writes. */
@@ -118,8 +129,11 @@ export function planWireFromMarkdown(dataDir: string, page: PageContext, parsed:
   }
 
   const links: WireLink[] = [];
-  const propertyText = collectFrontmatterStrings(fm).join('\n');
+  const propertyText = frontmatterStrings(fm).join('\n');
   for (const link of extractObsidianLinks(`${body}\n${propertyText}`)) {
+    // a raw document is no entity: a wiki page's link to one is a citation (below), anyone else's is nothing —
+    // tested before the bundle lookup, so an Obsidian stub at wiki/raw/docs/… cannot capture it
+    if (rawDocTarget(page.path, link.target)) continue;
     const resolved = okfPage ? resolveObsidianTarget(dataDir, okfPage, link.target, opts.wikiIndex) : null;
     const targetName = resolved?.title || link.label || link.target;
     const holder = page.chunkIds.find((c) => c.content.includes(`[[${link.target}`)) ?? page.chunkIds[0];
@@ -151,7 +165,15 @@ export function planWireFromMarkdown(dataDir: string, page: PageContext, parsed:
       });
     }
   }
-  return { self, links };
+
+  const mode = opts.citations ?? (page.path.startsWith('wiki/') ? 'all' : 'none');
+  const citations = mode === 'none'
+    ? []
+    : dedupeCitations(pageCitations(page.path, fm, body, { frontmatter: mode === 'all' })).map((c) => ({
+      ...c,
+      chunkId: c.needle ? page.chunkIds.find((chunk) => chunk.content.includes(c.needle!))?.id ?? null : null,
+    }));
+  return { self, links, citations };
 }
 
 /** Apply a wire plan as evidence of one scope. */
@@ -180,6 +202,7 @@ export async function applyWirePlan(
       if (await w.relation(selfId, targetId, { type: link.relation, description: link.relDescription, extractor: opts.extractor })) stats.relations++;
     }
   }
+  await w.citations(page.documentId, page.path, plan.citations);
   return stats;
 }
 
@@ -287,13 +310,6 @@ function findNotesByBasename(root: string, basename: string): string[] {
   };
   visit(root, '');
   return matches;
-}
-
-function collectFrontmatterStrings(value: unknown): string[] {
-  if (typeof value === 'string') return [value];
-  if (Array.isArray(value)) return value.flatMap(collectFrontmatterStrings);
-  if (value && typeof value === 'object') return Object.values(value).flatMap(collectFrontmatterStrings);
-  return [];
 }
 
 export function firstParagraph(md: string): string {

@@ -70,7 +70,7 @@ wiki/entities/x.md                               bundle=wiki       self=Archive 
 | `description` / `resource` | 推荐 | 没有兜底，要就自己写 |
 | `tags` | 推荐 | 必须是 YAML list（摄入侧暂不消费，只做校验） |
 | `generated: { by, at }` | 可选 | `by` 是 actor：`<producer>/<version>`、`human:<id>`、`process:<id>` |
-| `sources` | 可选 | 材料出处，每条至少 `{ id, resource, title }` |
+| `sources` | 可选 | 材料出处，每条至少 `{ id, resource, title }`；wiki 页里指向 `raw/docs/…` 的条目记为对该文件的 `derived_from` 引用（见下文） |
 | `verified` / `status` / `stale_after` | 可选 | 信任分档与生命周期 |
 
 时间戳一律用带显式 UTC 偏移的 ISO 8601（`2026-09-13T04:05:24Z`）。纯日期 `2026-09-13`
@@ -81,7 +81,7 @@ wiki/entities/x.md                               bundle=wiki       self=Archive 
 | 键 | 在哪生效 | 作用 |
 | --- | --- | --- |
 | `entities` / `claims` | `raw/docs/**` 与 bundle 页 | tier-0 声明式抽取——不配 LLM 也能建图，是这批键里最值钱的。claims 可带 `eventDate`（事件时间）与 `startDate/endDate`（有效期），日期支持 `2026Q2`、`2026年上半年`、`去年`（按文档日期折算）等写法；bundle 页里 `subject` 缺省为页面自身实体 |
-| `relations` | `raw/docs/**` 与 bundle 页 | 类型化关系：列表 `- { source?, target, type, from?, to? }` 或映射 `supplies_to: ["[[特斯拉]]"]`；谓词按 `playbooks/ontology/*.yaml` 归一（同义词、反向拼写自动翻转、未知降级为 `related_to` 并计数）；bundle 页缺省 source 为页面自身实体 |
+| `relations` | `raw/docs/**` 与 bundle 页 | 类型化关系：列表 `- { source?, target, type, from?, to? }` 或映射 `supplies_to: ["[[特斯拉]]"]`；谓词按 `playbooks/ontology/*.yaml` 归一（同义词、反向拼写自动翻转、未知降级为 `related_to` 并计数）；bundle 页缺省 source 为页面自身实体；wiki 页里目标是 `raw/docs/…` 路径的关系记为对该文件的引用（见下文） |
 | `date` / `published` / `as_of` | 全部 | 文档参考日期（`documents.doc_date`）；缺省从路径里的日期推断，永不用 mtime |
 | `sameAs`（entities 内） | 全部 | 声明该实体与已知实体相同，写入时直接落到规范实体 |
 | `actor: agent/<cli>` + `research: {…}` | `wiki/**` | 研究 agent 写的页面：显式 `actor` 使其成为 **Source**（即使带 `generated`），以 quarantined 入库；`research` 记录 job / 模版 / 时间，runner 会盖章 |
@@ -90,7 +90,29 @@ wiki/entities/x.md                               bundle=wiki       self=Archive 
 | `trust` / `actor` | 全部 | 信任分档 |
 | `acl` | 全部 | 访问控制 |
 | `aliases` | 仅 bundle 内 | 实体别名 |
-| `[[wikilink]]` | 仅 bundle 内解析成 `links_to` | 其余位置退化为 `mentions` |
+| `[[wikilink]]` | 仅 bundle 内解析成 `links_to` | 其余位置退化为 `mentions`；`[[raw/docs/…]]` 指向文件：wiki 页里是引用，别处不建任何实体 |
+
+### wiki 页引用 raw 文件
+
+`raw/docs` 下的文件在图谱里没有节点，关系又只连实体，所以 wiki 页指向它的链接不建实体，而是记成一条
+**引用**（`citations` 表，schema v16，规则在 [src/graph/citations.ts](../src/graph/citations.ts)）。
+打开那个文件时，Files 视图（网页与 Mac 应用）顶部列出引用它的页面和方式。
+
+| wiki 页里的写法 | 记为 |
+| --- | --- |
+| `[[raw/docs/…]]`、`![[raw/docs/…]]`（正文或 frontmatter 字符串） | `cites` |
+| 解析到 `raw/docs/` 下的 Markdown 链接（相对本页，或以 `raw/` 开头） | `cites` |
+| `sources:` 里的 `raw/docs/…`（字符串、`[[…]]` 或对象的 `resource` / `path`） | `derived_from` |
+| `relations:` 里目标是 `raw/docs/…` 的条目（source 缺省或就是本页） | 照写的谓词：`tested_by`、`derived_from`……（反向写法如 `tests` 自动翻转） |
+
+- 按页面写的路径记，不要求文件已存在：先写页面、后上传文件也算引用；`wiki lint` 会把指向不存在文件的引用报成 `broken_link`。
+- 同一页对同一文件只记一次；写了具体谓词时，普通的 `cites` 让位。
+- 只有源页面（人或 agent 写的）引用；生成页只算受管区域外的人写正文；`index.md` / `log.md` 不引用。raw 文档里的 `[[raw/docs/…]]` 也不建实体，但不记引用。
+- 代码里的链接不算；footnote 里写成代码的路径（`` `raw/docs/…#e-…` ``）只供点击跳转。
+- 引用随页面的 scope 生灭：改页面会替换它的引用，删页面会撤销它们，`as_of` 能查到当时的状态。agent 写的页面以 quarantined 出现，直到有人 promote。
+- 读取方式：Files 视图、`GET /api/file/citations?path=…`、`knode_lineage({ kind: 'document' })` 的 `citedBy` / `cites`、目录视图 `v_citations`。
+- `cites` / `derived_from` / `tested_by` 在每个工作区都可用（不依赖 `playbooks/ontology` 里的文件），也能用在实体之间（`derived_from: ["[[K0]]"]`）；它们不进抽取 prompt，但研究 agent 的说明里有。
+- Obsidian 的 vault 是 `wiki/`：在 Obsidian 里 `[[raw/…]]` 指向 vault 之外，打不开（点了会在 `wiki/raw/…` 建空页，knode-os 不把它当成链接目标）。
 
 ## 4. 值得自己写的最小模板
 
