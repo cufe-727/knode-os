@@ -289,4 +289,35 @@ describe('a study, end to end', () => {
     const refused = await app.request(`/api/research/studies/${studyId}/refine`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json', 'x-knode-csrf': '1' }, body: '{}' });
     expect(refused.status).toBe(400);
   });
+
+  it('promotes what the study produced, says what changed, and offers nothing once all of it is trusted', async () => {
+    type Tiers = { trusted: number; quarantined: number; unindexed: number };
+    type View = { pages: { trust: string | null }[]; reportTrust: string | null; tiers: { pages: Tiers; sources: Tiers } };
+    type Promotion = { to: string; changed: string[]; unchanged: string[]; notIndexed: string[]; failed: unknown[]; count: number };
+    const view = async () => (await app.request(`/api/research/studies/${studyId}`, { headers })).json() as Promise<View>;
+    const promote = (body: unknown) => app.request(`/api/research/studies/${studyId}/promote`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json', 'x-knode-csrf': '1' }, body: JSON.stringify(body),
+    });
+    const before = await view();
+    expect(before.tiers.pages).toEqual({ trusted: 0, quarantined: 3, unindexed: 0 }); // two pages and the report
+    expect(before.tiers.sources.quarantined).toBeGreaterThan(0);
+    const pages = await (await promote({ what: 'pages' })).json() as Promotion;
+    expect(pages).toMatchObject({ to: 'trusted', unchanged: [], notIndexed: [], failed: [], count: 3 });
+    expect(pages.changed.sort()).toEqual(['wiki/research/anthropic-ipo-deep-dive.md', 'wiki/research/anthropic-ipo-deep-dive/competitors.md', 'wiki/research/anthropic-ipo-deep-dive/revenue-and-costs.md']);
+    const middle = await view();
+    expect(middle.pages.map((p) => p.trust)).toEqual(['trusted', 'trusted']);
+    expect(middle.reportTrust).toBe('trusted');
+    expect(middle.tiers.pages).toEqual({ trusted: 3, quarantined: 0, unindexed: 0 });
+    expect(middle.tiers.sources).toEqual(before.tiers.sources);
+    // a second click changes nothing and says so
+    const again = await (await promote({ what: 'pages' })).json() as Promotion;
+    expect(again).toMatchObject({ changed: [], count: 0 });
+    expect(again.unchanged).toHaveLength(3);
+    const sources = await (await promote({ what: 'sources' })).json() as Promotion;
+    expect(sources.changed).toHaveLength(before.tiers.sources.quarantined);
+    expect(sources.changed.every((p) => p.startsWith('raw/docs/research/anthropic-ipo-deep-dive/'))).toBe(true);
+    expect((await view()).tiers.sources).toMatchObject({ quarantined: 0, trusted: before.tiers.sources.trusted + before.tiers.sources.quarantined });
+    expect((await promote({ what: 'everything' })).status).toBe(400);
+    expect((await promote({ what: 'pages', to: 'public' })).status).toBe(400);
+  });
 });

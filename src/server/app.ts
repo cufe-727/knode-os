@@ -96,7 +96,7 @@ import { evaluatePacks, writeEvalReport } from '../compiler/evaluate.js';
 import { writeRankerReport } from '../compiler/ranker.js';
 import { changesSince, listSubscriptions, subscribe, unsubscribe } from '../compiler/subscribe.js';
 import { checkout, commitWorkset, envelopeFor, listWorksets } from '../compiler/workset.js';
-import { listDisputes, resolveDispute, setScopeTrust } from '../lineage/trust.js';
+import { listDisputes, resolveDispute, setScopeTrust, TRUST_TIERS, TrustTier } from '../lineage/trust.js';
 import { listReceipts, recordFeedback } from '../compiler/receipts.js';
 import { readVirtual } from '../compiler/vfs.js';
 import { renderCapabilityDts } from '../capability/dts.js';
@@ -141,7 +141,7 @@ import { McpEndpoint, runsRoot } from '../research/workspace.js';
 import { recommendWikiTopics, refreshRecommendations } from '../research/recommend.js';
 import { captureUrl, readManifest } from '../research/capture.js';
 import { deleteResearchSource, loadResearchSources, redactSource, RESEARCH_SOURCE_KINDS, saveResearchSource, sourceProblem } from '../research/sources.js';
-import { cancelStudy, createStudy, deleteStudyDraft, listStudies, refineStudyInBackground, refiningSince, startProblem, startStudy, studyView, updateStudy, studyPayload } from '../research/study.js';
+import { cancelStudy, createStudy, deleteStudyDraft, listStudies, promoteStudy, refineStudyInBackground, refiningSince, startProblem, startStudy, StudyFiles, studyView, updateStudy, studyPayload } from '../research/study.js';
 import { webSearchEnabled, WEB_SEARCH_PROVIDERS } from '../research/web.js';
 import { lintWiki } from '../wiki/lint.js';
 
@@ -2389,23 +2389,14 @@ export function createApp(
     const ctx = requestCtx(c);
     const job = await studyOr404(ctx, c.req.param('id'));
     if (!job) return c.json({ error: 'no such study' }, 404);
-    const body = await c.req.json<{ what?: 'pages' | 'sources' | 'all'; to?: 'trusted' | 'quarantined' }>().catch(() => ({} as { what?: 'pages' | 'sources' | 'all'; to?: 'trusted' | 'quarantined' }));
+    const body = await c.req.json<{ what?: StudyFiles; to?: TrustTier }>().catch(() => ({} as { what?: StudyFiles; to?: TrustTier }));
     const what = body.what ?? 'pages';
     const to = body.to ?? 'trusted';
-    const view = await studyView(ctx, job);
-    const paths = [
-      ...(what !== 'sources' ? [...view.pages.map((p) => p.path), view.reportPath] : []),
-      ...(what !== 'pages' ? [...view.captures.map((x) => x.path), view.registerPath, ...view.notes] : []),
-    ].filter((p) => fs.existsSync(safePath(ctx.dataDir, p)));
-    const results: unknown[] = [];
-    for (const p of paths) {
-      try {
-        results.push(await setScopeTrust(ctx.store, { key: p, to, actor: requestUser(c) }));
-      } catch (e) {
-        results.push({ key: p, error: e instanceof Error ? e.message : String(e) });
-      }
-    }
-    return c.json({ to, count: paths.length, results });
+    if (!['pages', 'sources', 'all'].includes(what)) return c.json({ error: 'what must be pages, sources or all' }, 400);
+    if (!TRUST_TIERS.includes(to)) return c.json({ error: `to must be ${TRUST_TIERS.join(' or ')}` }, 400);
+    const promotion = await promoteStudy(ctx, job, { what, to, actor: requestUser(c) });
+    // count is what changed (clients before `changed` read it)
+    return c.json({ what, ...promotion, count: promotion.changed.length });
   });
 
   // the tail of one session of a study: collect-<n> (gathering) or the report's transcript

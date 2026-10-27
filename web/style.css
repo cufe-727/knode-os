@@ -962,6 +962,7 @@ body[data-role="member"] #btn-cfg-save, body[data-role="member"] #btn-cfg-test, 
 .study-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .study-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; }
 .study-head-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.study-head-actions button { white-space: nowrap; }
 .study-title-input { font-size: 17px !important; font-weight: 600; margin: 2px 0 4px; }
 .study-topic summary, .study-block > summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .study-topic p { white-space: pre-wrap; font-size: 13px; }
@@ -995,7 +996,10 @@ body[data-role="member"] #btn-cfg-save, body[data-role="member"] #btn-cfg-test, 
 .study-source-editor { border: 1px solid var(--accent); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px; background: var(--bg); }
 @media (max-width: 860px) {
   .study-layout { grid-template-columns: 1fr; }
-  .study-list { position: static; max-height: none; }
+  /* a scrolling list's row may shrink to nothing, and the study card is drawn over it */
+  .study-list { position: static; max-height: none; overflow: visible; }
+  .study-head { flex-direction: column; }
+  .study-head-actions { justify-content: flex-start; }
 }
 .study-progress { height: 3px; border-radius: 2px; background: var(--bg3); overflow: hidden; }
 .study-progress span { display: block; height: 100%; width: 30%; background: var(--accent); border-radius: 2px; animation: study-progress 1.6s ease-in-out infinite; }
