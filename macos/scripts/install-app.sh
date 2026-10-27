@@ -30,11 +30,19 @@ done
 
 log() { echo "[install] $*"; }
 
+# Delete a bundle, then take it out of LaunchServices — in that order. A record
+# can outlive an unregister made while the bundle still exists under
+# /Applications (two staged old.app copies stayed listed that way, 2026-10-27);
+# unregistering the path once nothing is there clears it.
+discard() {
+  rm -rf "$1"
+  "$LSREGISTER" -u "$1" >/dev/null 2>&1 || true
+}
+
 if [[ $build == 1 ]]; then
   if ! "$SCRIPT_DIR/package-app.sh"; then
     # A half-built bundle is useless and would show up as another app.
-    "$LSREGISTER" -u "$BUILD_APP" >/dev/null 2>&1 || true
-    rm -rf "$BUILD_APP"
+    discard "$BUILD_APP"
     echo "Build failed; $TARGET was left untouched." >&2
     exit 1
   fi
@@ -53,8 +61,13 @@ done
 # --- Stage the complete new bundle in a hidden directory beside the target.
 STAGE="$(mktemp -d /Applications/.KnodeOS-install.XXXXXX)"
 ditto "$BUILD_APP" "$STAGE/new.app"
-# Keep the staged copies out of LaunchServices while they exist.
+# Keep the staged copies out of LaunchServices while they exist, and once they are gone.
 "$LSREGISTER" -u "$STAGE/new.app" >/dev/null 2>&1 || true
+discard_stage() {
+  discard "$STAGE/new.app"
+  discard "$STAGE/old.app"
+  rm -rf "$STAGE"
+}
 
 swapped=0
 restore() {
@@ -67,9 +80,7 @@ restore() {
     "$LSREGISTER" -f "$TARGET" >/dev/null 2>&1 || true
     open "$TARGET" || true
   fi
-  "$LSREGISTER" -u "$STAGE/new.app" >/dev/null 2>&1 || true
-  "$LSREGISTER" -u "$STAGE/old.app" >/dev/null 2>&1 || true
-  rm -rf "$STAGE"
+  discard_stage
   exit "$status"
 }
 trap restore ERR INT TERM
@@ -134,16 +145,18 @@ if [[ $backup == 1 && -d "$STAGE/old.app" ]]; then
   ditto -c -k --keepParent "$STAGE/old.app" "$BACKUP_ZIP"
   log "previous bundle archived to $BACKUP_ZIP"
 fi
-"$LSREGISTER" -u "$STAGE/old.app" >/dev/null 2>&1 || true
-rm -rf "$STAGE"
-"$LSREGISTER" -u "$BUILD_APP" >/dev/null 2>&1 || true
-rm -rf "$BUILD_APP"
+discard_stage
+discard "$BUILD_APP"
 "$LSREGISTER" -f "$TARGET"
 
-# --- Verify a single registered copy.
-paths="$("$LSREGISTER" -dump 2>/dev/null | grep -E '^path:.*KnodeOS[^/]*\.app' | sed -E 's/^path: *//; s/ \(0x[0-9a-f]+\)$//' | sort -u)"
-if [[ "$paths" != "$TARGET" ]]; then
+# --- Verify a single registered copy. Any other bundle LaunchServices lists
+# under a KnodeOS path (a staged copy, a build, a copy elsewhere) is named here,
+# not removed; bundles inside the installed app are its own.
+registered="$("$LSREGISTER" -dump 2>/dev/null | sed -nE 's/^path: *(.*KnodeOS.*) \(0x[0-9a-f]+\)$/\1/p' | sort -u || true)"
+others="$(grep -vxF "$TARGET" <<<"$registered" | grep -vF "$TARGET/" || true)"
+if [[ -n "$others" ]]; then
   echo "Warning: LaunchServices lists other KnodeOS bundles:" >&2
-  echo "$paths" >&2
+  echo "$others" >&2
 fi
+grep -qxF "$TARGET" <<<"$registered" || echo "Warning: LaunchServices does not list $TARGET" >&2
 log "installed and running from $TARGET"
