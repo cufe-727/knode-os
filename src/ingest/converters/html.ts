@@ -45,9 +45,10 @@ const CAPTURE_KEYS = ['url', 'finalUrl', 'fetched', 'contentType', 'charset', 's
  *
  * The JSON is kept to printable ASCII: `--` (which could end the comment, and
  * which an XML reader of an XHTML page rejects), `<`, `>` and every non-ASCII
- * character are written as \u escapes. The line is then the same bytes in
- * whatever charset the page itself uses, so prepending it to the original
- * bytes of a GBK or Shift_JIS page cannot garble either of them.
+ * character are written as \u escapes, so the line reads the same in any
+ * charset that keeps ASCII as it is. Capture writes it, and the page after it,
+ * as UTF-8 behind a BOM, which outranks a GBK or Shift_JIS page's own
+ * `<meta charset>` in a browser and in `decodeSavedHtml`.
  */
 export function captureComment(c: HtmlCapture): string {
   const record: Record<string, string> = {};
@@ -1049,13 +1050,18 @@ export function htmlToMarkdown(html: string, opts: { baseUrl?: string } = {}): H
   return { markdown, meta: readMeta(parsed, ctx, main), outline, tables: ctx.tables, links: ctx.links, warnings };
 }
 
-/** Decode a saved page: a BOM, then a `<meta charset>` in its first bytes, else UTF-8 (what knode's captures are). */
-function readHtmlFile(absPath: string): string {
-  const bytes = fs.readFileSync(absPath);
+/**
+ * Decode a saved page: a BOM, then knode's own capture (UTF-8, whatever the
+ * page declared: the record's `charset` says what it was fetched as), then a
+ * `<meta charset>` in its first bytes, else UTF-8.
+ */
+export function decodeSavedHtml(bytes: Buffer): string {
   if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return bytes.subarray(3).toString('utf8');
   if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le').decode(bytes);
   if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes);
   const head = bytes.subarray(0, 4096).toString('latin1');
+  // a capture from before captures began with a BOM: UTF-8 too, under the page's own <meta charset>
+  if (CAPTURE_START.test(head)) return bytes.toString('utf8');
   const label = /<meta[^>]+charset\s*=\s*["']?([\w:.-]+)/i.exec(head)?.[1]?.toLowerCase();
   if (label && label !== 'utf-8' && label !== 'utf8') {
     try {
@@ -1068,7 +1074,7 @@ function readHtmlFile(absPath: string): string {
 }
 
 async function convertHtml(input: ConverterInput): Promise<ConversionResult> {
-  const html = readHtmlFile(input.absPath);
+  const html = decodeSavedHtml(fs.readFileSync(input.absPath));
   const capture = readCaptureComment(html);
   const conv = htmlToMarkdown(html, { baseUrl: capture?.finalUrl ?? capture?.url });
   const m = conv.meta;

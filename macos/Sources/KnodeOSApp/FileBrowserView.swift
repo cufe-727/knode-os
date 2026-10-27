@@ -369,6 +369,12 @@ struct FileBrowserView: View {
                         .help(selectedPath)
                     Spacer()
                     if isWorking { ProgressView().controlSize(.small) }
+                    if AppModel.hasOriginal(selectedPath) {
+                        Button { Task { await model.openOriginal(selectedPath) } } label: {
+                            Label(L("Open Original"), systemImage: "arrow.up.forward.app")
+                        }
+                        .help(L("The file itself, in the app that reads it: the PDF, the picture, the web page as it was saved"))
+                    }
                     Button(isEditing ? "Preview" : "Edit") { isEditing.toggle() }
                         .disabled(!isWritable(selectedPath) || isWorking || !isEditable)
                     Button(L("Save")) { Task { await save() } }
@@ -1410,7 +1416,7 @@ struct FileBrowserView: View {
         // Derived text is knode-os's rendering of a PDF or image. It is read-only
         // whatever its size: writing it back would replace the original's bytes.
         if isDerived {
-            return "Derived Markdown — knode-os produced this from the original, so it is read-only. Replace the original by uploading a new copy."
+            return L("Derived Markdown — knode-os produced this from the original, so it is read-only. Open Original opens the file itself; replace it by uploading a new copy.")
         }
         guard isTruncated else { return nil }
         let cap = ByteCountFormatter.string(fromByteCount: Int64(Self.previewByteCap), countStyle: .file)

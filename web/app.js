@@ -1553,6 +1553,7 @@ function clearOpenFile() {
   currentFile = null;
   editing = false;
   $('#file-path').textContent = '';
+  showOriginalLink(null);
   $('#file-view').innerHTML = '';
   $('#file-view').hidden = false;
   $('#file-editor').value = '';
@@ -1563,6 +1564,31 @@ function clearOpenFile() {
   $('#btn-edit').disabled = true;
   $('#btn-save').disabled = true;
   $('#btn-delete').disabled = true;
+}
+
+/** Files a browser shows as they are (src/server/originals.ts): the file view shows what knode-os read out of them. */
+const hasOriginal = (path) => /\.(pdf|html?|xhtml|png|jpe?g|gif|webp|avif|bmp|tiff?|heic|heif|svg)$/i.test(path ?? '');
+
+/** The file itself, to open in a tab: a link sends no headers, so it names the workspace in its query. */
+function originalHref(path) {
+  const q = new URLSearchParams({ path });
+  const h = workspaceRequestHeaders();
+  if (h['x-knode-workspace-kind']) {
+    q.set('kind', h['x-knode-workspace-kind']);
+    q.set('id', h['x-knode-workspace-id']);
+    q.set('name', h['x-knode-workspace-name']);
+  }
+  // with sign-in on the session says who you are; off, the name does
+  if (authDisabled && h['x-knode-user']) q.set('user', h['x-knode-user']);
+  return `/api/file/original?${q}`;
+}
+
+/** "original ↗" in the file toolbar, for a PDF, a picture or a web page. */
+function showOriginalLink(path) {
+  const link = $('#btn-original');
+  link.hidden = !hasOriginal(path);
+  if (link.hidden) link.removeAttribute('href');
+  else link.href = originalHref(path);
 }
 
 /** Mirrors MAX_PREVIEW_BYTES in the service — the cap on an unqualified read. */
@@ -1595,7 +1621,7 @@ function readOnlyNotice(derived, truncated, bytes, path = currentFile) {
   // this is checked before the size rule and never offers a full load.
   if (derived) {
     return {
-      text: 'Derived Markdown — knode-os produced this from the original, so it is read-only. Replace the original by uploading a new copy.',
+      text: 'Derived Markdown — knode-os produced this from the original, so it is read-only. "original ↗" opens the file itself; replace it by uploading a new copy.',
       canLoadFull: false,
     };
   }
@@ -1691,6 +1717,7 @@ async function openFile(path, labelEl, fragment = null) {
     (labelEl || document.querySelector(`#filetree .tree-file > .tree-label[data-path="${CSS.escape(path)}"]`))?.classList.add('selected');
     paintDestination();
     $('#file-path').textContent = path;
+    showOriginalLink(path);
     $('#file-view').hidden = false;
     $('#file-editor').hidden = true;
     renderFileContent(path, content, derived, truncated, bytes);
@@ -5672,7 +5699,7 @@ function renderStudy(view) {
     <div class="study-block"><h4>Sources <span class="hint">· ${view.captures.length} captured into the knowledge base${view.captures.length ? ` · ${sourcesTier(tiers.sources)}` : ''} · register ${pageLink(view.registerPath)}</span></h4>
       ${view.captures.length ? `<table class="study-table"><thead><tr><th>Title</th><th>Site</th><th>Published</th><th>Type</th><th>File</th></tr></thead><tbody>${view.captures.map((c) => `<tr>
         <td>${/^https?:\/\//i.test(c.url || '') ? `<a href="${esc(c.url)}" target="_blank" rel="noopener noreferrer">${esc(c.title || c.url)}</a>` : esc(c.title || c.url || '')}${c.why ? `<div class="hint">${esc(c.why)}</div>` : ''}</td>
-        <td>${esc(c.site)}</td><td class="mono">${esc(c.published || '—')}</td><td>${esc(c.kind)}</td><td>${pageLink(c.path)}</td></tr>`).join('')}</tbody></table>` : '<p class="hint">nothing captured yet.</p>'}
+        <td>${esc(c.site)}</td><td class="mono">${esc(c.published || '—')}</td><td>${esc(c.kind)}</td><td>${pageLink(c.path)}${hasOriginal(c.path) ? ` <a href="${esc(originalHref(c.path))}" target="_blank" rel="noopener" class="hint" title="the file itself, as it was captured">original ↗</a>` : ''}</td></tr>`).join('')}</tbody></table>` : '<p class="hint">nothing captured yet.</p>'}
       ${view.notes.length ? `<p class="hint">Collector notes: ${view.notes.map((n) => pageLink(n)).join(' · ')}</p>` : ''}
     </div>
     <details class="study-block"><summary>The brief</summary>

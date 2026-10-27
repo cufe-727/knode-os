@@ -259,6 +259,24 @@ struct APIClient {
         return try await send(path("/api/file", query: query))
     }
 
+    /// The file itself, as bytes: a PDF or a picture as it is, a web page with
+    /// its script turned off and its links pointing back at its site. An older
+    /// service answers 404.
+    func originalFile(at filePath: String) async throws -> Data {
+        var request = URLRequest(url: try url(for: path("/api/file/original", query: [.init(name: "path", value: filePath)])))
+        request.timeoutInterval = 360
+        workspaceHeaders(&request)
+        authorize(&request)
+        let (data, response) = try await urlSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError(message: "The service returned an invalid response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw failure(data, http, fallback: http.statusCode == 404 ? "This service cannot open originals yet — update it" : nil)
+        }
+        return data
+    }
+
     /// The wiki pages citing a raw/docs file. An older service answers 404.
     func fileCitations(at filePath: String) async throws -> FileCitationsResponse {
         try await send(path("/api/file/citations", query: [.init(name: "path", value: filePath)]))

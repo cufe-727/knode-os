@@ -21,6 +21,10 @@ import { textPdf } from './helpers/pdf.js';
  * indexes it. The guard keeps agent-chosen URLs off private addresses.
  */
 
+/** "人工智能公司的年收入达到四百七十亿美元" in GBK. */
+const GBK_SENTENCE = Buffer.from('c8cbb9a4d6c7c4dcb9abcbbeb5c4c4eacad5c8ebb4efb5bdcbc4b0d9c6dfcaaed2dac3c0d4aa', 'hex');
+const SENTENCE = '人工智能公司的年收入达到四百七十亿美元';
+
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-capture-'));
 const dataDir = path.join(tmp, 'data');
 let ctx: AppContext;
@@ -57,6 +61,14 @@ beforeAll(async () => {
     } else if (url.pathname === '/mirror') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(ARTICLE);
+    } else if (url.pathname === '/gbk') {
+      // a GBK page that says so in its header and its <meta>: knode keeps it as UTF-8
+      res.writeHead(200, { 'content-type': 'text/html; charset=gbk' });
+      res.end(Buffer.concat([
+        Buffer.from(`<!doctype html><html><head><meta charset="gbk"><title>GBK</title></head><body><article><h1>Revenue</h1><p>`),
+        GBK_SENTENCE,
+        Buffer.from(`</p><p>${'The company reported its revenue for the year in a filing with the regulator. '.repeat(4)}</p></article></body></html>`),
+      ]));
     } else if (url.pathname === '/s-1.pdf') {
       res.writeHead(200, { 'content-type': 'application/pdf' });
       res.end(textPdf('Registration Statement on Form S-1. Total revenue 4.5 billion.'));
@@ -145,7 +157,8 @@ describe('captureUrl', () => {
     expect(r.published).toMatch(/^2026-06-01/);
     expect(r.outline.map((h) => h.text)).toEqual(expect.arrayContaining(['Revenue', 'Risks']));
     const raw = fs.readFileSync(path.join(dataDir, r.path), 'utf8');
-    expect(raw.startsWith('<!-- knode-capture: ')).toBe(true);
+    // UTF-8, and says so ahead of anything the page declares
+    expect(raw.startsWith('\uFEFF<!-- knode-capture: ')).toBe(true);
     expect(raw).toContain('<article>');
     // on record as the agent's: it lands quarantined like the rest of its work
     expect(originOf(dataDir, r.path)?.actor).toBe('agent/codex-cli');
@@ -185,10 +198,22 @@ describe('captureUrl', () => {
     expect(mirror.path).toBe(again.path);
   });
 
+  it('keeps a page in another charset as UTF-8, readable on disk and in its Markdown', async () => {
+    const r = await captureUrl(ctx, { url: `${base}/gbk`, study, actor: 'agent/codex-cli', index: 'wait' });
+    const raw = fs.readFileSync(path.join(dataDir, r.path), 'utf8');
+    expect(raw.startsWith('\uFEFF<!-- knode-capture: ')).toBe(true);
+    expect(raw).toContain('"charset":"gbk"');
+    expect(raw).toContain(`<meta charset="gbk">`);
+    expect(raw).toContain(SENTENCE);
+    expect(readSourceTextCapped(dataDir, r.path, 4 * 1024 * 1024)!.content).toContain(SENTENCE);
+  });
+
   it('keeps a PDF whole, dated by its metadata when it has some, and a CSV as data', async () => {
     const pdf = await captureUrl(ctx, { url: `${base}/s-1.pdf`, study, title: 'Form S-1', actor: 'agent/codex-cli', index: 'wait' });
     expect(pdf.kind).toBe('pdf');
     expect(pdf.path).toMatch(/^raw\/docs\/research\/anthropic-ipo\/files\/.+\.pdf$/);
+    // the file is the PDF as fetched, byte for byte
+    expect(fs.readFileSync(path.join(dataDir, pdf.path)).equals(textPdf('Registration Statement on Form S-1. Total revenue 4.5 billion.'))).toBe(true);
     expect(readSourceTextCapped(dataDir, pdf.path, 4 * 1024 * 1024)?.content).toContain('Registration Statement on Form S-1');
     const csv = await captureUrl(ctx, { url: `${base}/data.csv`, study, actor: 'agent/codex-cli' });
     expect(csv.kind).toBe('data');

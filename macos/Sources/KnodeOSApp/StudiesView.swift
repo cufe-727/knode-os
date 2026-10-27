@@ -290,6 +290,11 @@ struct StudiesView: View {
                         Spacer()
                         Text([c.site, c.published.map { String($0.prefix(10)) } ?? "", c.kind].filter { !$0.isEmpty }.joined(separator: " · "))
                             .font(.caption).foregroundStyle(.secondary)
+                        if AppModel.hasOriginal(c.path) {
+                            Button(L("Original")) { Task { await model.openOriginal(c.path) } }
+                                .buttonStyle(.link).font(.caption)
+                                .help(L("The file itself, as it was captured"))
+                        }
                     }
                 }
             }
