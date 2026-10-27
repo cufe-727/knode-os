@@ -3,6 +3,7 @@ import { claimNextJob, requeueStale, updateJob } from './jobs.js';
 import { killActiveAgents } from './launch.js';
 import { autoAcceptRecommendations } from './recommend.js';
 import { resolveResearchAgent, runResearchJob } from './runner.js';
+import { continueStudies } from './study.js';
 import { McpEndpoint } from './workspace.js';
 
 /**
@@ -21,23 +22,48 @@ export function startResearchLoop(
 
   void requeueStale(ctx.store).then((n) => n && opts.log(`research: ${n} interrupted job(s) queued again`)).catch(() => {});
 
-  const tick = async () => {
+  // one tick at a time: a job ending, the timer and a UI kick can all ask for one, and two
+  // ticks racing past `running < concurrency` would claim one job too many
+  let ticking: Promise<void> | null = null;
+  let again = false;
+  const tick = (): Promise<void> => {
+    if (ticking) {
+      again = true;
+      return ticking;
+    }
+    ticking = (async () => {
+      try {
+        do {
+          again = false;
+          await claimLoop();
+        } while (again && !disposed);
+      } finally {
+        ticking = null;
+      }
+    })();
+    return ticking;
+  };
+
+  const claimLoop = async () => {
     if (disposed) return;
+    // a study whose pages have all finished goes on to its report
+    await continueStudies(ctx, opts.log).catch(() => 0);
     const concurrency = Math.max(1, ctx.config.research?.concurrency ?? 1);
     while (!disposed && running < concurrency) {
       const mcp = opts.mcp();
       if (!mcp) return;
+      // without research.agent only a job that names its own (a study's) can run
       const agent = resolveResearchAgent(ctx.config, ctx.dataDir);
-      if (!agent) {
+      let job = await claimNextJob(ctx.store, { ownRunnerOnly: !agent }).catch(() => null);
+      if (!agent && !job) {
         if (!warnedNoAgent) {
           opts.log(`research: no agent configured — queued jobs wait. Set research.agent in knode.config.json to a CLI (claude-cli / codex-cli / cursor-cli), a connection id, or 'default' to run the built-in agent on the default LLM connection`);
           warnedNoAgent = true;
         }
         return;
       }
-      warnedNoAgent = false;
-      let job = await claimNextJob(ctx.store).catch(() => null);
-      if (!job && ctx.config.research?.auto?.enabled && running === 0) {
+      if (agent) warnedNoAgent = false;
+      if (!job && agent && ctx.config.research?.auto?.enabled && running === 0) {
         // nothing queued: let auto mode accept the best recommendation within today's budget
         const n = await autoAcceptRecommendations(ctx, ctx.config.research.auto.dailyJobs ?? 3).catch(() => 0);
         if (n > 0) job = await claimNextJob(ctx.store).catch(() => null);
@@ -52,6 +78,8 @@ export function startResearchLoop(
         .finally(() => {
           running--;
           inflight.delete(p);
+          // a page of a study may have been its last: let the study go on, and claim what is next
+          if (!disposed) void tick();
         });
       inflight.add(p);
     }

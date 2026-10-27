@@ -406,6 +406,7 @@ describe('sign-in in front of serve', () => {
       'DELETE /api/auth/gateways/:id',
       'DELETE /api/auth/users/:username',
       'DELETE /api/research/profiles/:name',
+      'DELETE /api/research/sources/:id',
       'DELETE /api/workspace',
       'GET /api/auth/gateways',
       'GET /api/auth/users',
@@ -424,6 +425,7 @@ describe('sign-in in front of serve', () => {
       'PUT /api/chat/protocol',
       'PUT /api/config',
       'PUT /api/research/profiles/:name',
+      'PUT /api/research/sources/:id',
     ]);
   });
 

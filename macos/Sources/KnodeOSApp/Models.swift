@@ -12,6 +12,7 @@ import SwiftUI
 enum AppSection: String, CaseIterable, Identifiable, Codable {
     case library
     case ask
+    case research
     case knowledge
     case settings
 
@@ -21,6 +22,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .library: [.files, .search, .traces]
         case .ask: [.ask]
+        case .research: [.studies]
         case .knowledge: [.graph, .entities, .wiki, .dream]
         case .settings: [.providers, .pipeline, .research, .chat, .workspace, .access]
         }
@@ -30,6 +32,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .library: L("Library")
         case .ask: L("Ask")
+        case .research: L("Research")
         case .knowledge: L("Knowledge")
         case .settings: L("Settings")
         }
@@ -39,6 +42,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .library: L("Files, search, and agent traces")
         case .ask: L("An agent that answers from your workspace")
+        case .research: L("Research a topic into several wiki pages")
         case .knowledge: L("Graph, entities, wiki, and nightly review")
         case .settings: L("Models, ingest, research, and Ask")
         }
@@ -48,6 +52,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .library: "books.vertical"
         case .ask: "sparkles"
+        case .research: "doc.text.magnifyingglass"
         case .knowledge: "lightbulb"
         case .settings: "slider.horizontal.3"
         }
@@ -68,6 +73,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
     case search
     case traces
     case ask
+    case studies
     case graph
     case entities
     case wiki
@@ -95,6 +101,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .files, .search, .traces: .library
         case .ask: .ask
+        case .studies: .research
         case .graph, .entities, .wiki, .dream: .knowledge
         case .providers, .pipeline, .research, .chat, .workspace, .access: .settings
         }
@@ -116,6 +123,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .search: L("Search")
         case .traces: L("Traces")
         case .ask: L("Ask")
+        case .studies: L("Studies")
         case .graph: L("Graph")
         case .entities: L("Entities")
         case .wiki: L("Wiki")
@@ -135,6 +143,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .search: L("Hybrid, vector, and keyword recall")
         case .traces: L("Claude Code and Codex sessions")
         case .ask: L("An agent that answers from your workspace")
+        case .studies: L("Research a topic into several wiki pages")
         case .graph: L("Entities, relations, and claims")
         case .entities: L("Every entity, filtered and sorted")
         case .wiki: L("Pages researched by agent CLIs")
@@ -154,6 +163,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .search: "magnifyingglass"
         case .traces: "terminal"
         case .ask: "sparkles"
+        case .studies: "doc.text.magnifyingglass"
         case .graph: "point.3.connected.trianglepath.dotted"
         case .entities: "tablecells"
         case .wiki: "book.closed"
@@ -1988,4 +1998,64 @@ extension Color {
     static let knodeViolet = Color(red: 0.71, green: 0.55, blue: 1.0)
     static let knodeGood = Color(red: 0.37, green: 0.82, blue: 0.59)
     static let knodeBad = Color(red: 1.0, green: 0.48, blue: 0.56)
+}
+
+
+/* ------------------------------ research studies ------------------------------ */
+
+/// A study as the list shows it (GET /api/research/studies).
+struct StudySummary: Decodable, Identifiable, Hashable {
+    struct Step: Decodable, Hashable { var name: String; var status: String; var detail: String? }
+    var id: String
+    var status: String
+    var stage: String
+    var title: String
+    var topic: String
+    var pages: Int
+    var createdAt: String
+    var error: String?
+    var steps: [Step]
+}
+
+/// One study (GET /api/research/studies/:id): its brief, stages, pages, sources and report.
+struct StudyDetail: Decodable {
+    struct Job: Decodable { var id: String; var status: String; var agent: String?; var error: String?; var startedAt: String?; var finishedAt: String? }
+    struct Clarification: Decodable, Hashable { var question: String; var options: [String]; var answer: String? }
+    struct Question: Decodable, Hashable { var id: String; var text: String; var page: String }
+    struct Page: Decodable, Hashable { var id: String; var title: String; var slug: String; var purpose: String; var sections: [String]; var questions: [String] }
+    struct Report: Decodable { var title: String }
+    struct Brief: Decodable {
+        var title: String
+        var slug: String
+        var language: String
+        var objective: String
+        var restatement: String
+        var clarifications: [Clarification]
+        var questions: [Question]
+        var pages: [Page]
+        var report: Report
+    }
+    struct Runner: Decodable { var mode: String; var agent: String }
+    struct Payload: Decodable {
+        var topic: String
+        var brief: Brief
+        var stage: String
+        var steps: [StudySummary.Step]
+        var runner: Runner
+    }
+    struct PageState: Decodable, Identifiable, Hashable { var id: String; var title: String; var path: String; var status: String; var trust: String?; var error: String? }
+    struct Capture: Decodable, Identifiable, Hashable {
+        var path: String; var title: String?; var site: String; var kind: String; var published: String?; var url: String
+        var id: String { path }
+    }
+    var job: Job
+    var payload: Payload
+    var reportPath: String
+    var reportExists: Bool
+    var pages: [PageState]
+    var captures: [Capture]
+    var refining: String?
+    var startProblem: String?
+
+    var isLive: Bool { ["queued", "running", "validating", "waiting"].contains(job.status) || refining != nil }
 }

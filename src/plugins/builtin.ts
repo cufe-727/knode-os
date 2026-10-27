@@ -1,4 +1,5 @@
 import { embeddingProviderLabel } from '../config.js';
+import { htmlConverter } from '../ingest/converters/html.js';
 import { imageConverter } from '../ingest/converters/image.js';
 import { pdfConverter } from '../ingest/converters/pdf.js';
 import { ArkMultimodalEmbeddingProvider, LocalHashEmbeddingProvider, OpenAIEmbeddingProvider } from '../ingest/embeddings.js';
@@ -65,6 +66,6 @@ export function registerBuiltins(registry: PluginRegistry): void {
         drop: (dataDir, cfg) => dropPostgres(dataDir, cfg),
       },
     ],
-    converters: [pdfConverter, imageConverter],
+    converters: [pdfConverter, imageConverter, htmlConverter],
   }, BUILTIN_PLUGIN);
 }

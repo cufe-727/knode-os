@@ -1,0 +1,168 @@
+/* knode-os web UI — charts drawn from ```chart blocks (web/chart.js) */
+
+/*
+ * The chart's own tokens, scoped to its figure. It sits on a card of the
+ * app's --bg2; ink and furniture are the app's text and border tokens, one
+ * step off the surface so the grid stays recessive.
+ *
+ * The eight series hues are the reference palette's dark steps, in its fixed
+ * order: series 1, 2, 3 … take slots 1, 2, 3 …, never cycled, so a chart holds
+ * at most eight series. Checked against the card itself:
+ *
+ *   node dataviz/scripts/validate_palette.js \
+ *     "#3987e5,#d95926,#199e70,#c98500,#d55181,#008300,#9085e9,#e66767" \
+ *     --mode dark --surface "#161a21"
+ *
+ *   lightness band, chroma floor, adjacent CVD ΔE 8.4 (≥ 8), normal-vision
+ *   ΔE 19.3 (≥ 15), contrast ≥ 3:1 for every slot: all pass.
+ *
+ * Text never wears a series colour: values, names and axes are ink (13:1,
+ * 8.6:1 and 5.8:1 on the card); a swatch, key or mark beside them carries the
+ * series. The markup has no inline style (the page's policy forbids it), so
+ * every colour reaches a mark through a class here.
+ */
+.kchart {
+  --kc-surface: var(--bg2, #161a21);
+  --kc-raised: var(--bg3, #1e242e);
+  --kc-grid: var(--border, #262d39);
+  --kc-axis: var(--border-strong, #354052);
+  --kc-ink: var(--fg, #d7dde6);
+  --kc-ink-2: #aeb7c4;
+  --kc-ink-3: var(--muted, #8b95a5);
+  --kc-warn: var(--warn, #d08a1d);
+  --kc-s1: #3987e5; /* blue */
+  --kc-s2: #d95926; /* orange */
+  --kc-s3: #199e70; /* aqua */
+  --kc-s4: #c98500; /* yellow */
+  --kc-s5: #d55181; /* magenta */
+  --kc-s6: #008300; /* green */
+  --kc-s7: #9085e9; /* violet */
+  --kc-s8: #e66767; /* red */
+
+  max-width: 760px;
+  margin: 16px 0;
+  padding: 14px 16px 10px;
+  border: 1px solid var(--kc-grid);
+  border-radius: 10px;
+  background: var(--kc-surface);
+  color: var(--kc-ink);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+/* a series' colour, carried by whatever mark, swatch or key wears the class */
+.kchart .kc-s1 { color: var(--kc-s1); }
+.kchart .kc-s2 { color: var(--kc-s2); }
+.kchart .kc-s3 { color: var(--kc-s3); }
+.kchart .kc-s4 { color: var(--kc-s4); }
+.kchart .kc-s5 { color: var(--kc-s5); }
+.kchart .kc-s6 { color: var(--kc-s6); }
+.kchart .kc-s7 { color: var(--kc-s7); }
+.kchart .kc-s8 { color: var(--kc-s8); }
+
+/* title, subtitle and legend: HTML above the plot, so they stay their size as the plot scales */
+.kchart-head { display: flex; flex-direction: column; gap: 1px; margin: 0 0 10px; }
+.kchart-title { color: var(--kc-ink); font-size: 14px; font-weight: 650; line-height: 1.35; overflow-wrap: anywhere; }
+.kchart-subtitle { color: var(--kc-ink-3); font-size: 12.5px; overflow-wrap: anywhere; }
+.kchart .kchart-legend {
+  display: flex; flex-wrap: wrap; gap: 4px 16px;
+  margin: 0 0 8px; padding: 0; list-style: none;
+  color: var(--kc-ink-2); font-size: 12px;
+}
+.kchart .kchart-legend li { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.kchart-key { flex: none; display: inline-block; background: currentColor; }
+.kchart-key-box { width: 10px; height: 10px; border-radius: 2px; }
+.kchart-key-line { width: 14px; height: 2px; border-radius: 1px; }
+
+/* the plot: a fixed viewBox scaled to the column; its height follows from the width, x-axis band included */
+.kchart-plot { position: relative; }
+.kchart-plot:focus { outline: none; }
+.kchart-plot:focus-visible { outline: 2px solid var(--accent, #5cc8ff); outline-offset: 3px; border-radius: 4px; }
+.kchart-svg { display: block; width: 100%; height: auto; overflow: visible; font-family: inherit; }
+
+/* furniture: solid hairlines one step off the surface, crisp at any scale */
+.kchart .kc-grid,
+.kchart .kc-axis,
+.kchart .kc-cross { fill: none; stroke-width: 1px; vector-effect: non-scaling-stroke; shape-rendering: crispEdges; }
+.kchart .kc-grid { stroke: var(--kc-grid); }
+.kchart .kc-axis { stroke: var(--kc-axis); }
+.kchart .kc-cross { stroke: var(--kc-ink-3); stroke-opacity: 0.55; }
+.kchart .kc-tick { fill: var(--kc-ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+.kchart .kc-cat { font-variant-numeric: normal; }
+.kchart .kc-row { fill: var(--kc-ink-2); font-size: 11px; }
+.kchart .kc-unit { fill: var(--kc-ink-3); font-size: 11px; }
+
+/* marks: thin bars with a rounded data end, 2px lines, washes at a tenth, dots ringed in the surface */
+.kchart .kc-bar { fill: currentColor; transition: opacity 0.12s; }
+.kchart .kc-line { fill: none; stroke: currentColor; stroke-width: 2px; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.kchart .kc-area { fill: currentColor; fill-opacity: 0.1; stroke: none; }
+.kchart .kc-dot { fill: currentColor; stroke: var(--kc-surface); stroke-width: 2px; }
+
+/* direct labels: ink, never the series colour */
+.kchart .kc-value { fill: var(--kc-ink); font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.kchart .kc-name { fill: var(--kc-ink-2); font-size: 11px; }
+
+/* hover: targets bigger than their marks; the hovered mark lifts as the others step back */
+.kchart .kc-hit { fill: transparent; stroke: none; pointer-events: all; }
+.kchart .kc-hover { display: none; pointer-events: none; }
+.kchart .kc-hover.kc-on { display: inline; }
+.kchart .kc-hover .kc-off { display: none; }
+.kchart .kc-hovering .kc-bar { opacity: 0.55; }
+.kchart .kc-hovering .kc-bar.kc-hot { opacity: 1; }
+
+.kchart-tip {
+  position: absolute; z-index: 5; top: 0; left: 0;
+  min-width: 120px; max-width: 280px; padding: 7px 10px 8px;
+  border: 1px solid var(--kc-axis); border-radius: 8px;
+  background: var(--kc-raised); box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
+  color: var(--kc-ink); font-size: 12px; line-height: 1.4;
+  pointer-events: none;
+}
+.kchart-tip-head { margin: 0 0 4px; color: var(--kc-ink-2); font-size: 11.5px; overflow-wrap: anywhere; }
+.kchart-tip-row { display: flex; align-items: baseline; gap: 6px; padding: 1px 4px; margin: 0 -4px; border-radius: 4px; }
+.kchart-tip-row.kc-hot { background: rgba(255, 255, 255, 0.06); }
+.kchart-tip-key { flex: none; align-self: center; width: 10px; height: 2px; border-radius: 1px; background: currentColor; }
+.kchart-tip-total { margin-top: 3px; padding-top: 4px; border-top: 1px solid var(--kc-grid); border-radius: 0; }
+.kchart-tip-total .kchart-tip-key { background: transparent; }
+.kchart-tip-val { color: var(--kc-ink); font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.kchart-tip-unit { color: var(--kc-ink-3); font-size: 11px; white-space: nowrap; }
+.kchart-tip-name { min-width: 0; margin-left: 2px; overflow: hidden; color: var(--kc-ink-3); text-overflow: ellipsis; white-space: nowrap; }
+.kchart-tip-row.kc-hot .kchart-tip-name { color: var(--kc-ink-2); }
+
+/* under the plot: the note, the source, problems with the spec, the numbers */
+.kchart-note,
+.kchart-source { margin: 8px 0 0; color: var(--kc-ink-3); font-size: 11.5px; overflow-wrap: anywhere; }
+.kchart-note + .kchart-note,
+.kchart-note + .kchart-source { margin-top: 3px; }
+.kchart-label { margin-right: 3px; color: var(--kc-ink-2); font-weight: 600; }
+.kchart-issues {
+  margin: 8px 0 0; padding: 6px 10px; border-left: 2px solid var(--kc-warn); border-radius: 0 6px 6px 0;
+  background: rgba(208, 138, 29, 0.08); color: var(--kc-ink-2); font-size: 11.5px;
+}
+.kchart-issues-title { margin: 0; color: var(--kc-ink); font-weight: 600; }
+.kchart-issues-title span { color: var(--kc-warn); }
+.kchart .kchart-issues ul { margin: 2px 0 0; padding-left: 16px; }
+
+.kchart-data { margin: 8px 0 0; }
+.kchart-data > summary { width: max-content; color: var(--kc-ink-3); font-size: 11.5px; cursor: pointer; user-select: none; }
+.kchart-data > summary:hover { color: var(--kc-ink); }
+.kchart-table-wrap { max-height: 320px; margin-top: 6px; overflow: auto; }
+.kchart .kchart-table { width: auto; min-width: 50%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.kchart .kchart-table caption { padding: 0 0 4px; color: var(--kc-ink-3); font-size: 11px; text-align: left; caption-side: top; }
+.kchart .kchart-table th,
+.kchart .kchart-table td { padding: 3px 12px 3px 0; border: 0; border-bottom: 1px solid var(--kc-grid); text-align: left; vertical-align: top; }
+.kchart .kchart-table thead th { position: sticky; top: 0; background: var(--kc-surface); color: var(--kc-ink-3); font-weight: 500; }
+.kchart .kchart-table tbody th { color: var(--kc-ink-2); font-weight: 400; overflow-wrap: anywhere; }
+.kchart .kchart-table .kc-num { padding-left: 12px; text-align: right; white-space: nowrap; }
+.kchart .kchart-table th:last-child,
+.kchart .kchart-table td:last-child { padding-right: 0; }
+.kchart .kchart-table .kc-gap { color: var(--kc-ink-3); }
+
+/* a block that could not be drawn: why, above the JSON as written */
+.kchart-error {
+  margin: 16px 0; padding: 10px 14px 12px;
+  border: 1px solid rgba(255, 122, 144, 0.35); border-radius: 10px; background: rgba(255, 122, 144, 0.05);
+}
+.kchart-error-title { margin: 0 0 4px; color: var(--bad, #ff7a90); font-size: 12.5px; font-weight: 650; }
+.kchart-error ul { margin: 0 0 10px; padding-left: 18px; color: var(--fg, #d7dde6); font-size: 12.5px; }
+.kchart-error pre { margin: 0; }

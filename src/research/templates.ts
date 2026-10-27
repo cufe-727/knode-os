@@ -17,9 +17,20 @@ import type { RolePhase } from './profile.js';
  * frontmatter keys and sections) the validator enforces.
  */
 
-export type ResearchKind = 'entity' | 'concept' | 'comparison' | 'timeline' | 'question' | 'refresh' | 'verify' | 'init';
+export type ResearchKind = 'entity' | 'concept' | 'comparison' | 'timeline' | 'question' | 'refresh' | 'verify' | 'init' | 'study' | 'section';
 
+/** The kinds a job can be queued as directly. */
 export const RESEARCH_KINDS: ResearchKind[] = ['entity', 'concept', 'comparison', 'timeline', 'question', 'refresh', 'verify', 'init'];
+
+/**
+ * The kinds of a study (docs/design/15), which only the study service
+ * creates: `study` is the study itself and its report page, `section` one of
+ * the pages it plans. Their outlines come from the study's brief.
+ */
+export const STUDY_KINDS: ResearchKind[] = ['study', 'section'];
+
+/** Every kind a template may declare. */
+export const ALL_RESEARCH_KINDS: ResearchKind[] = [...RESEARCH_KINDS, ...STUDY_KINDS];
 
 /** A second file a template asks the agent to write next to the page (the knowledge-base guide for `init`). */
 export interface TemplateCompanion {
@@ -362,9 +373,79 @@ knode_write 的路径约定、必需 frontmatter、quarantine 与 promote、disp
 \`\`\`
 `;
 
-const BUILTIN: Record<ResearchKind, string> = { entity: ENTITY, concept: CONCEPT, comparison: COMPARISON, timeline: TIMELINE, question: QUESTION, refresh: REFRESH, verify: VERIFY, init: INIT };
 
-export type PhaseName = 'plan' | 'research' | 'synthesize' | 'review' | 'revise' | 'orchestrate' | 'init-plan' | 'init-research' | 'init-synthesize';
+/** The chart block every study page may carry (src/research/chart.ts); the viewers draw it, Obsidian shows the JSON. */
+const CHART_RULES = `## 图表（\`\`\`chart 块）
+
+有一组可比的数字（按年份的收入、成本构成、各方份额、估值对比……）时，在相关章节放一个图表块；数字必须来自你引用的来源，图下用一两句话说明它说明了什么。不要为画图而画图，一页 1–4 个足够。写之前可以用 knode_chart 检查格式。
+
+\`\`\`\`markdown
+\`\`\`chart
+{"type": "bar", "title": "图题", "unit": "USD bn", "x": ["2023", "2024", "2025"],
+ "series": [{"name": "收入", "values": [0.1, 0.9, 4.5]}],
+ "source": "raw/docs/research/<课题>/files/<文件>", "note": "口径说明（可选）"}
+\`\`\`
+\`\`\`\`
+
+- type：bar（类别对比）/ hbar（类别名长或做排名）/ stacked-bar（构成，值不能为负）/ line、area（时间序列，至少 3 个点）。
+- x 与每个 series.values 一样长；缺的值写 null；最多 8 个 series、60 个类别；一张图只用一个单位、一根纵轴（量纲不同就画两张）。
+- source 必填：数字出自哪些 raw/docs 路径（或 URL）。`;
+
+const SECTION = `---
+type: research-template
+kind: section
+output: wiki/research/{slug}.md
+maxTurns: 60
+requires:
+  frontmatter: [type, title, study, sources, actor, research]
+  sections: []
+---
+# 研究课题分页：{target}
+
+这一页是一个研究课题（study）的一部分。brief 的「研究课题」一节写明课题的目标、范围、**本页要回答的问题**、本页的必需章节、输出语言，以及收集阶段已经存进知识库的资料：\`raw/docs/research/<课题>/\` 下的网页（web/）、文件（files/：PDF、数据）、收集员的笔记（notes/）和资料登记表（sources.md）。
+
+## 步骤
+
+1. **读已收集的资料**：knode_read 读本课题的 sources.md 与 notes/ 里和本页有关的笔记；knode_search（sources 限定 \`raw/docs/research/<课题>\`，mode=sag）找段落。长文档（招股书、年报）用 knode_read 的 \`section\`（章节标题）或 \`offset\` / \`limit\`（行）分段读，不要整篇读。
+2. **逐个回答本页的问题**：每个结论都写出处——引用 raw/docs/... 路径（正文 \`（来源：raw/docs/…）\` 或脚注），而不是只给 URL。资料不够时：brief 允许联网就继续搜索，要引用的网页 / PDF 先用 **knode_capture** 保存（带 study 参数），引用它返回的路径；不允许联网就写进缺口。
+3. **区分事实与观点**：公司自己披露的数字、监管文件、审计数据是事实；分析师、媒体、投资人的判断是观点，写明是谁、何时说的（claims 里 kind 用 opinion / prediction）。互相矛盾的数字并列写出并说明口径。
+4. **数字与图表**：见下文图表规则。
+5. **写页**：用 knode_write 写到输出路径。frontmatter：\`type: research-page\`，\`title\`，\`study\`（课题 id，见 brief），\`sources\`（每一个引用过的 raw/docs 路径），\`relations\`（谓词用本体 id，本页的主语是 brief 指定的主体实体），\`claims\`（关键数字与判断，带日期），\`actor\` / \`research\` 用 brief 给的值。
+6. **与其他分页互链**：brief 列出了本课题的其他页面，相关处用 \`[[页面名]]\` 指过去，不要重复它们的内容。
+
+${CHART_RULES}
+`;
+
+const STUDY = `---
+type: research-template
+kind: study
+output: wiki/research/{slug}.md
+maxTurns: 40
+requires:
+  frontmatter: [type, title, study, sources, actor, research]
+  sections: []
+---
+# 研究报告（课题总页）：{target}
+
+这是一个研究课题（study）的总页：分页已经写好（brief 的「本课题的页面」列出了它们的路径、标题与状态），资料也已存进知识库。你的任务是写一页**能单独读懂**的研究报告：先回答最初的问题，再把读者引到各分页。
+
+## 步骤
+
+1. knode_read 读每一个已完成的分页（只读，不要改它们），和本课题的 sources.md；需要时 knode_search 补充。
+2. **摘要**：用 5–10 句话直接回答用户最初的研究请求（brief 的「原始请求」），先结论后条件；数字带日期和出处。
+3. **关键发现**：8–15 条，每条一句话 + 出处（分页的 [[链接]] 或 raw/docs 路径）。
+4. **本研究的页面**：每个分页一行：\`[[页面名]]\` — 它回答了什么。没写成的分页如实说明。
+5. **图表**：挑 1–3 个最能说明问题的数字序列（分页里的图表可以复用）。
+6. **待解问题**：资料缺口、互相矛盾的数字、只有单一来源的说法、需要后续跟踪的事件与日期。
+7. **方法与来源**：研究日期、用了哪些来源（知识库 / 网络 / 自定义来源）、收集了多少份资料、主要一手来源是什么。
+8. 用 knode_write 写到输出路径；frontmatter：\`type: research-report\`、\`title\`、\`study\`、\`sources\`（引用过的 raw/docs 路径与分页路径）、\`actor\` / \`research\` 用 brief 给的值。
+
+${CHART_RULES}
+`;
+
+const BUILTIN: Record<ResearchKind, string> = { entity: ENTITY, concept: CONCEPT, comparison: COMPARISON, timeline: TIMELINE, question: QUESTION, refresh: REFRESH, verify: VERIFY, init: INIT, study: STUDY, section: SECTION };
+
+export type PhaseName = 'plan' | 'research' | 'synthesize' | 'review' | 'revise' | 'orchestrate' | 'init-plan' | 'init-research' | 'init-synthesize' | 'refine' | 'collect';
 
 /**
  * The team pipeline's phase prompts (research.pipeline = "team"). Each is a
@@ -442,6 +523,58 @@ export const PHASES: Record<PhaseName, string> = {
 流程：先 knode_resolve 摸底（workset \`{workset}\`）→ 把页面拆成 3–6 个章节 → 每个章节派给一个研究员子代理，任务里写清要回答的问题、建议检索词、涉及实体和 workset → 汇总发现写页（每条事实带来源；候选 claims / relations 核对后进 frontmatter）→ 派评审子代理检查页面 → 按评审意见修订 → knode_feedback → knode_commit（workset \`{workset}\`，content 写一段研究日志）。
 
 子代理没有 knode_write；只有你写页。子代理返回的内容没有来源就不要采用。
+`,
+  refine: `<!-- knode-phase: refine -->
+# 研究课题规划
+
+你是研究规划员。用户给了一个想研究的主题。你的任务是把它变成一份可以直接执行的研究简报：改写成清楚的研究问题，补上用户可能没想到但重要的方面，拆成可以分头调查的问题，并规划要写的 wiki 页面。你**不做研究本身**，也不调用任何工具——只根据下面给出的信息规划。
+
+今天是 {today}。输出语言：{language}（简报里所有面向读者的文字——标题、目标、问题、页面标题与章节——都用这个语言）。最多规划 {maxPages} 个分页（另有一页总报告，不必列入 pages）。
+
+{context}
+
+规划规则：
+- objective 用一段话说清：要回答什么、为什么、读者读完能做什么判断。restatement 把用户原话改写成结构清楚的研究请求。
+- 用户点名的方面一个都不能漏；再补 2–5 个用户没提但懂行的人一定会看的方面（风险、监管、会计口径、关键人物、时间节点、数据可得性……），在 why 里说明为什么重要。
+- questions：12–30 个具体、可回答、可查证的问题，每个归属一个分页（page 填分页 id），queries 给 2–4 个检索词（含英文原名、代码、常见别称）。
+- pages：3–{maxPages} 个分页，按读者阅读顺序排；每页 4–7 个章节（"## " 开头的标题，用输出语言；不要写"来源 / Sources"章节，系统会加）；charts 写本页适合画的图（数据是什么）；entities 列本页涉及的主要实体（规范名）。
+- 资料是否可得要现实：知识库里已有什么见下文；需要联网的地方在 seedUrls 给出你确信存在的一手来源 URL（监管文件、公司官网 / 投资者关系、官方博客），不确定的 URL 不要写，交给检索。
+- clarifications：最多 4 个真正会改变研究方向的问题（例如"最新招股书"指哪一份、关注的时间范围、要不要覆盖某类竞争对手），每个给 2–4 个选项；没有就留空数组。已经回答过的问题不要再问，按回答调整计划。
+- 如果下面给出了上一版简报和用户的修改意见，在上一版的基础上按意见修改，保留没被否定的部分。
+
+只输出一个 JSON 对象，不要其他文字：
+{"title":"…","language":"{language}","objective":"…","restatement":"…","scope":{"include":["…"],"exclude":["…"],"timeframe":"…","asOf":"{today}"},"assumptions":["…"],"clarifications":[{"question":"…","options":["…","…"]}],"questions":[{"id":"q1","text":"…","why":"…","page":"p1","queries":["…"]}],"pages":[{"id":"p1","title":"…","purpose":"…","sections":["## …"],"questions":["q1"],"charts":["…"],"entities":["…"]}],"entities":["…"],"seedUrls":[{"url":"https://…","why":"…"}],"searchQueries":["…"],"report":{"title":"…","sections":["## …"]}}
+`,
+  collect: `<!-- knode-phase: collect -->
+# 收集资料：「{page}」
+
+你是研究课题「{title}」的资料收集员，只负责下面这一部分。你的产出是两样东西：**存进知识库的原始资料**（用 knode_capture），和一份**带出处的发现笔记**（你的最终回复）。你不写 wiki 页（不要调用 knode_write / knode_commit）。
+
+课题 id：\`{study}\`（每次 knode_capture 都带上 study="{study}"）
+课题目标：{objective}
+本部分要回答的问题：
+{questions}
+建议检索词：{queries}
+输出语言：{language}
+
+## 步骤
+
+1. **先查知识库**：knode_resolve / knode_search（mode=sag）/ knode_claims。已经在库里的资料不必再收集，直接引用它的路径。
+2. **再查网络与其他来源**（见 brief 的「资料来源」）：一手资料优先——监管文件（如 SEC EDGAR 的 S-1 / 10-K / 424B）、公司公告与招股书、财报、官方博客与投资者关系页、权威数据库；其次是可靠媒体、研究机构与分析师报告。时间敏感的信息以最新日期为准，并记下日期。
+3. **保存要依赖的资料**：每一份你会引用的网页 / PDF / 数据，用 knode_capture（url、study="{study}"、why 一句话）。它返回的 path（raw/docs/research/…）就是以后引用的来源；返回的 outline 是文档的章节，长文档用 knode_read 的 section 分段读。抓取失败（403、需要登录、只有脚本）时换一个来源（同一文件的 PDF / 其他镜像），实在不行再把你读到的要点作为 content 传给 knode_capture，存成摘录。
+4. **不要保存**搜索结果页、目录页、与问题无关的页面；同一事实已有一手来源就不必再存转载。最多保存 {maxCaptures} 份。
+5. 每个问题都尽量给出答案；答不了的写进缺口，说明查过哪里。
+
+## 输出（Markdown，不要 frontmatter，固定结构）
+
+## 发现
+- 每条一行：结论（含数字与日期）·（来源：raw/docs/research/… 路径）
+## 数据
+- 可以画图的数字序列，每条一行：名称 · 单位 · 各期数值（期间=数值，…）·（来源：路径）
+## 观点
+- 别人怎么看：谁、何时、什么判断 ·（来源：路径）
+## 缺口
+- 没找到什么、互相矛盾之处、哪些说法只有单一来源
 `,
   'init-plan': `<!-- knode-phase: plan -->
 # 阶段 1：规划知识库初始化
@@ -577,7 +710,7 @@ function parsePhases(v: unknown): Partial<Record<RolePhase, string>> {
 export function parseResearchTemplate(text: string, name: string, filePath: string): ResearchTemplate | null {
   const { frontmatter: fm, body } = parseFrontmatter(text);
   if (fm.type !== 'research-template') return null;
-  const kind = typeof fm.kind === 'string' && (RESEARCH_KINDS as string[]).includes(fm.kind) ? (fm.kind as ResearchKind) : null;
+  const kind = typeof fm.kind === 'string' && (ALL_RESEARCH_KINDS as string[]).includes(fm.kind) ? (fm.kind as ResearchKind) : null;
   if (!kind) return null;
   const requires = (fm.requires ?? {}) as Record<string, unknown>;
   const maxTurns = Number(fm.maxTurns);
@@ -597,6 +730,8 @@ export function parseResearchTemplate(text: string, name: string, filePath: stri
 /** What a job is about, for prompts and the brief: an init job is about the whole base. */
 export function subjectOf(job: { kind: ResearchKind; target: string | null; query: string | null }): string {
   if (job.kind === 'init') return job.target ?? '本知识库';
+  // a study's target is its slug, a page's `<study>/<page>`: the title (query) is what it is about
+  if (job.kind === 'study' || job.kind === 'section') return job.query ?? job.target ?? '';
   return job.kind === 'question' ? job.query ?? job.target ?? '' : job.target ?? job.query ?? '';
 }
 
@@ -646,8 +781,12 @@ export function renderOutputPath(template: ResearchTemplate, job: { kind: Resear
   }
   const subject = subjectOf(job);
   const date = new Date().toISOString().slice(0, 10);
+  // a study names its pages itself (`<study>/<page>`, already slugs); everything else is slugged from its subject
+  const slug = (job.kind === 'study' || job.kind === 'section') && job.target
+    ? job.target.split('/').map((part) => researchSlug(part)).filter(Boolean).join('/')
+    : researchSlug(subject);
   return template.output
-    .replace(/\{slug\}/g, researchSlug(subject) || 'untitled')
+    .replace(/\{slug\}/g, slug || 'untitled')
     .replace(/\{kind\}/g, job.kind)
     .replace(/\{date\}/g, date);
 }

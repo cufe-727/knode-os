@@ -234,7 +234,9 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   // is on record (an agent through MCP — src/fs/sidecar.ts `originOf`), sets
   // the ceiling; frontmatter may say "agent" or "quarantined" outright, but
   // never raise a document above its writer: that is the agent's own text.
-  const writer = root === 'traces' || source.derived ? null : originOf(store.dataDir, file);
+  // a converted original counts too: a page or PDF an agent had knode capture is on record as the agent's
+  // (src/research/capture.ts); one nobody recorded costs nothing here, originOf returns before reading it
+  const writer = root === 'traces' ? null : originOf(store.dataDir, file);
   const writerTier = tierForActor(writer?.actor ?? actor);
   const declaredTrust = typeof parsed.frontmatter.trust === 'string' && TRUST_TIERS.includes(parsed.frontmatter.trust as TrustTier)
     ? (parsed.frontmatter.trust as TrustTier)

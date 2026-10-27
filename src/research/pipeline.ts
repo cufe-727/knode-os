@@ -8,6 +8,7 @@ import { getJob, ResearchJob } from './jobs.js';
 import { isCancelled, JobCancelledError, LaunchResult, launchSession, SessionResult } from './launch.js';
 import { effectiveEffort, effectiveSpeed, NativeAgentSpec, requiredSections, ResearchProfile, ResearchRole, revisionRounds, rolePrompt, rolesFor, webAllowed } from './profile.js';
 import { loadPhasePrompt, PhaseName, ResearchTemplate, researchSlug, subjectOf } from './templates.js';
+import type { ExtraMcpServer } from './sources.js';
 import { McpEndpoint, RunWorkspace } from './workspace.js';
 import { validateCompanions, validateResearchPage } from './validate.js';
 
@@ -67,6 +68,10 @@ export interface PipelineInput {
   agentFor: (spec: string, model: string) => ResearchAgent | null;
   /** review.external — the master switch for web tools. */
   webGate: 'off' | 'verify' | 'research';
+  /** knode's own web search is configured (research.web.search): the built-in agent can search too. */
+  webSearch?: boolean;
+  /** A study's research sources: MCP servers attached to every session. */
+  extraMcp?: ExtraMcpServer[];
   log: (m: string) => void;
 }
 
@@ -179,13 +184,14 @@ function sessions(ctx: AppContext, input: PipelineInput): Sessions {
       jobId: job.id,
       outputPath: ws.outputPath,
       worksetId: ws.worksetId,
-      allowNetwork: webAllowed({ gate: input.webGate, kind: job.kind, profile, role, agent }),
+      allowNetwork: webAllowed({ gate: input.webGate, kind: job.kind, profile, role, agent, search: input.webSearch }),
       tools: role.tools.write ? 'write' : 'read',
       files: role.tools.files,
       effort: effectiveEffort(profile, role),
       speed: effectiveSpeed(profile, role),
       webFreshness: profile.search.freshness,
       agents: opts.agents,
+      extraMcp: input.extraMcp,
       label,
     });
     phases.push({ name, label, role: role.id, agent: agent.provider, turns: r.turns, costUsd: r.costUsd, error: r.error, ms: Date.now() - t0 });
@@ -216,7 +222,7 @@ export async function runTeamPipeline(ctx: AppContext, input: PipelineInput): Pr
   const subject = subjectOf(job);
   const S = sessions(ctx, input);
   const vars = baseVars(input, S.defaultTurns);
-  const required = requiredSections(template, profile);
+  const required = requiredSections(template, profile, job);
   const phasePrompt = template.phases ?? {};
 
   /* ---- 1. plan ---- */
@@ -339,7 +345,7 @@ export function nativeAgentSpecs(ctx: AppContext, input: PipelineInput, vars: Re
       prompt: rolePrompt(ctx.dataDir, r, { ...vars, section: delegated, questions: delegated, queries: delegated, issues: delegated }, template.phases?.[r.phase]),
       write: false,
       files: r.tools.files,
-      web: webAllowed({ gate: input.webGate, kind: input.job.kind, profile, role: r, agent: input.agent }),
+      web: webAllowed({ gate: input.webGate, kind: input.job.kind, profile, role: r, agent: input.agent, search: input.webSearch }),
       model: r.model,
       effort: effectiveEffort(profile, r),
       speed: effectiveSpeed(profile, r),

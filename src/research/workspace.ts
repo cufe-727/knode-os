@@ -12,6 +12,7 @@ import { stripRegions } from '../wiki/regions.js';
 import { ResearchJob } from './jobs.js';
 import { loadResearchProtocol, renderOutputPath, ResearchTemplate, subjectOf } from './templates.js';
 import { profileBrief, requiredSections, ResearchProfile } from './profile.js';
+import type { ExtraMcpServer } from './sources.js';
 
 /**
  * The run workspace an agent CLI is launched in: `<data>/<runsDir>/<jobId>/`.
@@ -148,15 +149,30 @@ export function knowledgeNotes(dataDir: string, opts: { guide?: string | null } 
  */
 export const CURSOR_PERMISSIONS = { permissions: { allow: ['Mcp(knode-os:*)'], deny: ['Write(**)', 'Shell(*)'] } };
 
-/** The files a CLI session reads from its cwd: the schema, the MCP endpoint (Claude Code and Cursor forms), Cursor's permissions, a README. */
-export function writeAgentFiles(dir: string, input: { schema: string; mcp: McpEndpoint; readme: string }): void {
+/**
+ * The files a CLI session reads from its cwd: the schema, the MCP endpoint (Claude Code and Cursor forms), Cursor's permissions, a README.
+ * A study's sources add their MCP servers next to knode's (`extraMcp`); their
+ * secrets live in these files, which only the session's own user can read.
+ */
+export function writeAgentFiles(dir: string, input: { schema: string; mcp: McpEndpoint; readme: string; extraMcp?: ExtraMcpServer[] }): void {
   fs.mkdirSync(path.join(dir, '.cursor'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'CLAUDE.md'), input.schema);
   fs.writeFileSync(path.join(dir, 'AGENTS.md'), input.schema);
   const server = { type: 'http', url: input.mcp.url, headers: { Authorization: `Bearer ${input.mcp.token}`, ...input.mcp.headers } };
-  fs.writeFileSync(path.join(dir, '.mcp.json'), JSON.stringify({ mcpServers: { 'knode-os': server } }, null, 2) + '\n');
-  fs.writeFileSync(path.join(dir, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { 'knode-os': { url: input.mcp.url, headers: server.headers } } }, null, 2) + '\n');
-  fs.writeFileSync(path.join(dir, '.cursor', 'cli.json'), JSON.stringify(CURSOR_PERMISSIONS, null, 2) + '\n');
+  const extra = input.extraMcp ?? [];
+  const claudeExtra = Object.fromEntries(extra.map((s) => [s.id, s.url
+    ? { type: 'http', url: s.url, headers: s.headers ?? {} }
+    : { type: 'stdio', command: s.command, args: s.args ?? [], env: s.env ?? {} }]));
+  const cursorExtra = Object.fromEntries(extra.map((s) => [s.id, s.url
+    ? { url: s.url, headers: s.headers ?? {} }
+    : { command: s.command, args: s.args ?? [], env: s.env ?? {} }]));
+  const write = (rel: string, data: unknown) => fs.writeFileSync(path.join(dir, rel), JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+  write('.mcp.json', { mcpServers: { 'knode-os': server, ...claudeExtra } });
+  write(path.join('.cursor', 'mcp.json'), { mcpServers: { 'knode-os': { url: input.mcp.url, headers: server.headers }, ...cursorExtra } });
+  const permissions = extra.length
+    ? { permissions: { ...CURSOR_PERMISSIONS.permissions, allow: [...CURSOR_PERMISSIONS.permissions.allow, ...extra.map((s) => `Mcp(${s.id}:*)`)] } }
+    : CURSOR_PERMISSIONS;
+  fs.writeFileSync(path.join(dir, '.cursor', 'cli.json'), JSON.stringify(permissions, null, 2) + '\n');
   fs.writeFileSync(path.join(dir, 'README.md'), input.readme);
 }
 
@@ -174,6 +190,8 @@ export interface PrepareRunOptions {
   guide?: string | null;
   /** Extra brief sections appended before the closing line. */
   extraBrief?: string[];
+  /** MCP servers of a study's research sources, written next to knode's into the session config files. */
+  extraMcp?: ExtraMcpServer[];
 }
 
 export async function prepareRunWorkspace(ctx: AppContext, job: ResearchJob, template: ResearchTemplate, opts: PrepareRunOptions): Promise<RunWorkspace> {
@@ -186,7 +204,9 @@ export async function prepareRunWorkspace(ctx: AppContext, job: ResearchJob, tem
   const worksetId = job.worksetId ?? (await checkout(ctx.store, { actor, note: `research ${job.id}: ${job.kind} ${job.target ?? job.query ?? ''}` })).id;
   const research = { job: job.id, kind: job.kind, template: template.name, at: new Date().toISOString(), agent: opts.provider, workset: worksetId };
   const subject = subjectOf(job);
-  const vars = { target: job.target ?? subject, query: job.query ?? subject, output: outputPath, actor, research: JSON.stringify(research), slug: path.posix.basename(outputPath, '.md') };
+  // a study's target is a slug (`<study>/<page>`): its pages and report are about their title
+  const titled = job.kind === 'study' || job.kind === 'section';
+  const vars = { target: titled ? subject : job.target ?? subject, query: job.query ?? subject, output: outputPath, actor, research: JSON.stringify(research), slug: path.posix.basename(outputPath, '.md') };
 
   const abs = safePath(ctx.dataDir, outputPath);
   let existingPage = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : null;
@@ -241,7 +261,7 @@ export async function prepareRunWorkspace(ctx: AppContext, job: ResearchJob, tem
     ...companions.map((c) => `- 附加输出（也用 knode_write 写，path 就是 \`${c.path}\`）：\`${c.path}\`；必需章节：${c.sections.join(' / ') || '（无固定章节）'}`),
     `- workset：\`${worksetId}\`（所有 knode_* 读取都带上它）`,
     `- frontmatter 必需键：${template.requires.frontmatter.join(', ') || '（无额外要求）'}`,
-    `- 必需章节：${requiredSections(template, opts.profile).join(' / ') || '（无固定章节）'}`,
+    `- 必需章节：${requiredSections(template, opts.profile, job).join(' / ') || '（无固定章节）'}`,
     `- frontmatter 固定值：\`actor: ${actor}\`；\`research: ${JSON.stringify(research)}\``,
     `- 只读资料目录：${opts.readDirs.join(', ')}`,
     `- 联网核实：${opts.allowNetwork ? '允许（WebSearch / WebFetch 可用；来源写 URL，单一外部来源的断言用 suspected）' : '不允许（只用知识库与只读资料）'}`,
@@ -266,7 +286,7 @@ export async function prepareRunWorkspace(ctx: AppContext, job: ResearchJob, tem
   const briefPath = path.join(dir, 'brief.md');
   fs.writeFileSync(briefPath, brief);
 
-  writeAgentFiles(dir, { schema, mcp: opts.mcp, readme: `Run workspace for research job ${job.id}. brief.md is the prompt; CLAUDE.md / AGENTS.md the schema; transcript.jsonl the agent's output.\n` });
+  writeAgentFiles(dir, { schema, mcp: opts.mcp, extraMcp: opts.extraMcp, readme: `Run workspace for research job ${job.id}. brief.md is the prompt; CLAUDE.md / AGENTS.md the schema; transcript.jsonl the agent's output.\n` });
 
   return { dir, briefPath, outputPath, actor, research, worksetId, existingPage, humanParagraphs, companions };
 }

@@ -10,6 +10,7 @@ import { buildWikiIndex, extractObsidianLinks } from '../graph/wire.js';
 import { validateOkfBundle } from '../okf/index.js';
 import { normalizeDateExpr } from '../store/dates.js';
 import { ResearchJob } from './jobs.js';
+import { checkCharts } from './chart.js';
 import { claimSourceIssues, requiredSections, ResearchProfile } from './profile.js';
 import { ResearchTemplate } from './templates.js';
 import { RunWorkspace } from './workspace.js';
@@ -84,6 +85,12 @@ export async function validateResearchPage(
     fm.research = ws.research;
     normalized = true;
   }
+  // a study's page names its study — the runner knows which, so the agent cannot get it wrong
+  const study = input.job.kind === 'study' ? input.job.id : typeof input.job.payload.study === 'string' ? input.job.payload.study : null;
+  if (study && fm.study !== study) {
+    fm.study = study;
+    normalized = true;
+  }
   if (typeof fm.sources === 'string') {
     fm.sources = [fm.sources];
     normalized = true;
@@ -118,9 +125,14 @@ export async function validateResearchPage(
   if (template.requires.frontmatter.includes('sources') && verifiable.length === 0) errors.push('no verifiable source in frontmatter.sources (paths relative to the data dir)');
 
   // sections (the template's, plus the evidence table when the profile requires one)
-  for (const heading of requiredSections(template, input.profile)) {
+  for (const heading of requiredSections(template, input.profile, input.job)) {
     if (!headingPresent(parsed.content, heading)) errors.push(`missing section ${heading}`);
   }
+
+  // charts are data the viewers draw: a block they cannot read is an error the reviser fixes
+  const charts = checkCharts(parsed.content);
+  errors.push(...charts.errors);
+  warnings.push(...charts.warnings);
 
   // relations / claims against the ontology and date grammar
   const declared = frontmatterExtraction({ relations: fm.relations, claims: fm.claims }, { defaultSource: typeof fm.title === 'string' ? fm.title : undefined });

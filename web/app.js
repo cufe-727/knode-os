@@ -585,6 +585,11 @@ const NAV = [
     { id: 'traces', title: 'Traces', hint: 'Claude Code and Codex sessions' },
   ] },
   { id: 'ask', title: 'Ask', tabs: [{ id: 'ask', title: 'Ask', hint: 'An agent that answers from your workspace' }] },
+  // a topic researched into several pages: refine it, collect sources, write and review the pages
+  { id: 'studies', title: 'Research', tabs: [
+    { id: 'studies', title: 'Studies', hint: 'Research a topic into several wiki pages' },
+    { id: 'sources', title: 'Sources', hint: 'The web, your APIs, MCP servers and sites a study may use' },
+  ] },
   { id: 'knowledge', title: 'Knowledge', tabs: [
     { id: 'graph', title: 'Graph', hint: 'Entities, relations, and claims' },
     { id: 'entities', title: 'Entities', hint: 'Every entity, filtered and sorted' },
@@ -627,6 +632,8 @@ const TAB_LOAD = {
   traces: () => loadTraces(),
   dream: () => loadSuggestions(),
   wiki: () => loadResearch(),
+  studies: () => loadStudies(),
+  sources: () => loadSources(),
   ask: () => loadChat(),
   settings: () => loadConfigForm(),
   access: () => loadAccess(),
@@ -1654,6 +1661,8 @@ function paintFileView(path, content, derived = false) {
     return;
   }
   view.innerHTML = renderMd(content, { metadataOpen: metadataOpen() });
+  // ```chart blocks render as SVG in renderMd; hover and keyboard are added here (web/chart.js)
+  window.knodeChart?.hydrate(view);
   markFileMentions(path, content);
 }
 
@@ -1811,7 +1820,8 @@ async function markFileMentions(path, content) {
 function markMentions(view, mentions) {
   const matcher = window.knodeMarkdown?.mentionMatcher(mentions);
   if (!matcher || matcher.empty) return;
-  const SKIP = 'a, code, pre, sup, .md-meta, .footnotes';
+  // a chart's labels are SVG text: a mention link wrapped around one would make it vanish
+  const SKIP = 'a, code, pre, sup, .md-meta, .footnotes, .kchart';
   const runs = [];
   let seen = new Set();
   const walker = document.createTreeWalker(view, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
@@ -3220,6 +3230,7 @@ function renderChatThread(conversation) {
     div.className = `chat-msg ${m.role}`;
     const body = m.content ? renderMd(m.content) : `<p class="hint">${esc(m.error ? `(${m.error})` : '(empty reply)')}</p>`;
     div.innerHTML = `<div class="markdown">${body}</div>`;
+    window.knodeChart?.hydrate(div);
     if (m.role === 'assistant') {
       const chips = document.createElement('div');
       chips.className = 'chat-chips';
@@ -3311,6 +3322,7 @@ async function askQuestion(text) {
   const mine = document.createElement('div');
   mine.className = 'chat-msg user';
   mine.innerHTML = `<div class="markdown">${renderMd(text)}</div>`;
+  window.knodeChart?.hydrate(mine);
   thread.appendChild(mine);
   thread.scrollTop = thread.scrollHeight;
   const res = await api(`/api/chat/conversations/${chatActiveId}/messages`, { method: 'POST', body: JSON.stringify({ text }) });
@@ -5256,6 +5268,569 @@ $('#clear-workspace-form').addEventListener('submit', async (event) => {
   } finally {
     button.textContent = 'Clear workspace';
     button.disabled = $('#clear-workspace-confirm').value.trim().toUpperCase() !== 'CLEAR';
+  }
+});
+
+/* --------------------------- research · studies ------------------------- */
+
+/**
+ * Studies (docs/design/15): a topic, refined into a brief the person edits,
+ * then run — seed sources are captured, collectors gather material into
+ * raw/docs/research/<study>/, one page per planned part is written, and a
+ * report links them. The list on the left is every study of the workspace;
+ * the right side is the composer, a draft's brief, or a study that ran.
+ */
+
+const STUDY_STEP_LABELS = { seed: 'Capture seed sources', collect: 'Collect material', index: 'Index what was collected', pages: 'Write the pages', report: 'Write the report' };
+const STUDY_LIVE = new Set(['queued', 'running', 'validating', 'waiting']);
+const study = { id: null, view: null, timer: null, options: null, busy: false };
+
+const lines = (v) => String(v || '').split('\n').map((x) => x.trim()).filter(Boolean);
+const statusChip = (s) => `<span class="jstatus ${esc(s)}">${esc(s)}</span>`;
+
+async function loadStudies() {
+  await loadStudyOptions().catch((e) => toast(`research options: ${e.message}`));
+  await loadStudyList();
+  if (study.id) await openStudy(study.id, { quiet: true });
+  else showComposer();
+}
+
+/** What the composer offers: the agents that can run here, the profiles, the sources and the web switch. */
+async function loadStudyOptions() {
+  const [agents, profiles, sources, config] = await Promise.all([
+    api('/api/config/agents'), api('/api/research/profiles'), api('/api/research/sources'), api('/api/config'),
+  ]);
+  study.options = { agents: agents.agents ?? [], profiles: profiles.profiles ?? [], activeProfile: profiles.active, sources, config };
+  const configured = config.research?.agent || '';
+  $('#study-agent').innerHTML = [
+    `<option value="">${configured ? `Research agent · ${esc(configured)}` : 'Research agent · not configured'}</option>`,
+    ...study.options.agents.map((a) => `<option value="${esc(a.id)}"${a.available ? '' : ' disabled'}>${esc(a.label)}${a.available ? '' : ` — ${esc(a.reason || 'unavailable')}`}</option>`),
+  ].join('');
+  $('#study-profile').innerHTML = study.options.profiles.map((p) => `<option value="${esc(p.name)}"${p.name === study.options.activeProfile ? ' selected' : ''}>${esc(p.name)}${p.title && p.title !== p.name ? ` · ${esc(p.title)}` : ''}</option>`).join('');
+  $('#study-dr-connection').innerHTML = (sources.connections ?? []).map((c) => `<option value="${esc(c.id)}">${esc(c.label || c.id)}${c.model ? ` · ${esc(c.model)}` : ''}</option>`).join('')
+    || '<option value="">no API connection — add one under Settings → Providers & Agents</option>';
+  const gate = sources.web?.gate;
+  $('#study-web').disabled = gate === 'off';
+  if (gate === 'off') $('#study-web').checked = false;
+  $('#study-web-note').textContent = gate === 'off'
+    ? '· off for this workspace (Settings → Research → Web access)'
+    : `· Claude Code and Codex search with their own tools${sources.web?.search?.enabled ? `; others through ${sources.web.search.provider}` : ''}; what they cite is captured into raw/docs/research`;
+  $('#study-source-list').innerHTML = (sources.sources ?? []).length
+    ? sources.sources.map((s) => `<label class="cfg-check"><input type="checkbox" data-source="${esc(s.id)}"${s.enabled ? ' checked' : ''}${s.problem ? ' disabled' : ''} /> ${esc(s.title)} <span class="hint">· ${esc(s.kind)}${s.problem ? ` · ${esc(s.problem)}` : s.description ? ` · ${esc(s.description.slice(0, 90))}` : ''}</span></label>`).join('')
+    : '<p class="hint">No sources of your own yet — add MCP servers, APIs or trusted sites under Research → Sources.</p>';
+}
+
+async function loadStudyList() {
+  const el = $('#study-items');
+  try {
+    const rows = await api('/api/research/studies?limit=80');
+    if (!rows.length) {
+      el.innerHTML = '<p class="hint">No studies yet. Describe a topic on the right to start one.</p>';
+      return;
+    }
+    el.innerHTML = rows.map((r) => `<button type="button" class="study-item${r.id === study.id ? ' active' : ''}" data-study="${esc(r.id)}">
+        <span class="study-item-title">${esc(r.title || r.topic)}</span>
+        <span class="study-item-meta">${statusChip(r.status)} <span class="hint">${esc(r.stage)} · ${esc(new Date(r.createdAt).toLocaleDateString())}${r.pages ? ` · ${r.pages} pages` : ''}</span></span>
+      </button>`).join('');
+    el.querySelectorAll('[data-study]').forEach((b) => b.addEventListener('click', () => openStudy(b.dataset.study)));
+  } catch (e) {
+    el.innerHTML = `<p class="hint">failed: ${esc(e.message)}</p>`;
+  }
+}
+
+function stopStudyPolling() {
+  clearTimeout(study.timer);
+  study.timer = null;
+}
+
+function showComposer() {
+  stopStudyPolling();
+  study.id = null;
+  study.view = null;
+  $('#study-compose').hidden = false;
+  $('#study-detail').hidden = true;
+  document.querySelectorAll('.study-item.active').forEach((b) => b.classList.remove('active'));
+}
+
+$('#btn-study-new').addEventListener('click', () => {
+  showComposer();
+  $('#study-topic').focus();
+});
+$('#study-mode').addEventListener('change', () => {
+  const deep = $('#study-mode').value === 'deep-research';
+  document.querySelectorAll('#study-compose [data-deep]').forEach((el) => { el.hidden = !deep; });
+});
+
+function composeRunner() {
+  const deep = $('#study-mode').value === 'deep-research';
+  return {
+    agent: $('#study-agent').value, model: $('#study-model').value.trim(), profile: $('#study-profile').value,
+    mode: deep ? 'deep-research' : 'agent',
+    deepResearch: deep ? { connection: $('#study-dr-connection').value, model: $('#study-dr-model').value.trim() || 'o3-deep-research' } : null,
+  };
+}
+
+$('#btn-study-refine').addEventListener('click', async () => {
+  const topic = $('#study-topic').value.trim();
+  if (topic.length < 8) return toast('describe what you want to research first');
+  const button = $('#btn-study-refine');
+  button.disabled = true;
+  $('#study-compose-note').textContent = 'refining — the model reads the topic and what the knowledge base holds (up to a minute or two on a CLI)…';
+  try {
+    const sources = { web: $('#study-web').checked, ids: [...document.querySelectorAll('#study-source-list input[data-source]:checked')].map((i) => i.dataset.source) };
+    const view = await api('/api/research/studies', { method: 'POST', body: JSON.stringify({ topic, runner: composeRunner(), sources }) });
+    $('#study-topic').value = '';
+    $('#study-compose-note').textContent = '';
+    study.id = view.job.id;
+    await loadStudyList();
+    await openStudy(view.job.id);
+  } catch (e) {
+    $('#study-compose-note').textContent = `could not start: ${e.message}`;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+async function openStudy(id, opts = {}) {
+  stopStudyPolling();
+  study.id = id;
+  document.querySelectorAll('.study-item').forEach((b) => b.classList.toggle('active', b.dataset.study === id));
+  try {
+    const view = await api(`/api/research/studies/${encodeURIComponent(id)}`);
+    study.view = view;
+    $('#study-compose').hidden = true;
+    $('#study-detail').hidden = false;
+    if (view.job.status === 'draft' && view.refining) renderRefining(view);
+    else if (view.job.status === 'draft') renderDraft(view);
+    else renderStudy(view);
+    if (STUDY_LIVE.has(view.job.status) || view.refining) {
+      study.timer = setTimeout(() => {
+        if (currentTab === 'studies' && study.id === id && !study.busy) openStudy(id, { quiet: true }).then(() => loadStudyList());
+      }, view.refining ? 2500 : 4000);
+    }
+  } catch (e) {
+    if (!opts.quiet) toast(`study: ${e.message}`);
+  }
+}
+
+/* ---- a draft: the brief, editable ---- */
+
+/** The refiner is at work (a CLI one-shot can take a minute or two): the request, and what it is doing. */
+function renderRefining(view) {
+  const p = view.payload;
+  const runner = p.runner.agent || 'the research agent';
+  $('#study-detail').innerHTML = `<div class="study-card">
+    <p class="section-index">DRAFT · ${esc(view.job.id)}</p>
+    <h3 class="study-title">Refining the question…</h3>
+    <p class="hint">The refiner reads your request, what this knowledge base already holds about it and the sources you picked, and plans the questions, the pages and the sources to start from${p.refinements.length ? ' — with your answers and edits' : ''}. It runs on the default model, else on ${esc(runner)}, once; nothing is searched or fetched yet. Since ${esc(new Date(view.refining).toLocaleTimeString())}.</p>
+    <div class="study-progress"><span></span></div>
+    <details class="study-topic" open><summary>Your request</summary><p>${esc(p.topic)}</p></details>
+  </div>`;
+}
+
+function renderDraft(view) {
+  const b = view.payload.brief;
+  const last = view.payload.refinements[view.payload.refinements.length - 1];
+  const el = $('#study-detail');
+  const questionOf = (id) => b.questions.find((q) => q.id === id);
+  el.innerHTML = `<div class="study-card">
+    <div class="study-head">
+      <div><p class="section-index">DRAFT · ${esc(view.job.id)}</p>
+        <input class="study-title-input" data-f="title" value="${esc(b.title)}" />
+        <p class="hint">${last ? `refined by ${esc(last.refiner)} in ${Math.round((last.ms || 0) / 1000)} s${last.error ? ` — <span class="jerr-inline">${esc(last.error)}</span>` : ''}` : 'not refined yet'} · folder <span class="mono">raw/docs/research/${esc(b.slug)}/</span> · pages under <span class="mono">wiki/research/${esc(b.slug)}/</span></p>
+      </div>
+      <div class="study-head-actions"><button type="button" data-act="delete" class="ghost">Delete draft</button></div>
+    </div>
+    <details class="study-topic"><summary>Your request</summary><p>${esc(view.payload.topic)}</p></details>
+    <div class="cfg-grid study-form">
+      <label>Objective<textarea data-f="objective" rows="3">${esc(b.objective)}</textarea></label>
+      ${b.restatement ? `<p class="study-restatement"><b>As the refiner reads it:</b> ${esc(b.restatement)}</p>` : ''}
+      <div class="cfg-grid cfg-grid-3">
+        <label>In scope (one per line)<textarea data-f="include" rows="3">${esc(b.scope.include.join('\n'))}</textarea></label>
+        <label>Out of scope<textarea data-f="exclude" rows="3">${esc(b.scope.exclude.join('\n'))}</textarea></label>
+        <div class="cfg-grid"><label>Time frame<input data-f="timeframe" value="${esc(b.scope.timeframe)}" /></label>
+          <label>Write in<select data-f="language">${[['en', 'English'], ['zh', '中文']].map(([v, l]) => `<option value="${v}"${b.language.startsWith(v) ? ' selected' : ''}>${l}</option>`).join('')}</select></label></div>
+      </div>
+    </div>
+    ${b.clarifications.length ? `<div class="study-block"><h4>Questions for you</h4>${b.clarifications.map((c, i) => `<div class="study-clar" data-clar="${i}">
+        <p>${esc(c.question)}</p>
+        <div class="study-chips">${c.options.map((o) => `<button type="button" class="chat-chip" data-pick="${esc(o)}">${esc(o)}</button>`).join('')}</div>
+        <input data-answer placeholder="your answer" value="${esc(c.answer || '')}" />
+      </div>`).join('')}</div>` : ''}
+    <div class="study-block"><h4>Pages <span class="hint">· one job each, plus a report that links them</span></h4>
+      <div id="study-pages">${b.pages.map((p) => pageEditor(p, p.questions.map(questionOf).filter(Boolean))).join('')}</div>
+      <button type="button" data-act="add-page">＋ Page</button>
+    </div>
+    <div class="study-block"><h4>Start from these sources <span class="hint">· captured before the agents start; one per line, “URL — why”</span></h4>
+      <textarea data-f="seeds" rows="3">${esc(b.seedUrls.map((u) => `${u.url}${u.why ? ` — ${u.why}` : ''}`).join('\n'))}</textarea>
+    </div>
+    <div class="study-block study-refine">
+      <h4>Refine again</h4>
+      <textarea data-f="feedback" rows="2" placeholder="What should change? — e.g. “focus on 2025–2026”, “add Chinese competitors”, “one page on compute costs”"></textarea>
+      <div class="study-actions">
+        <button type="button" data-act="refine">↻ Refine with my answers and edits</button>
+        <button type="button" data-act="save">Save edits</button>
+        <button type="button" data-act="start" class="primary">▶ Start research</button>
+        <span class="hint" data-note>${view.startProblem ? `cannot start yet: ${esc(view.startProblem)}` : `${b.pages.length} pages · ${b.questions.length} questions · ${view.payload.runner.mode === 'deep-research' ? `deep research on ${esc(view.payload.runner.deepResearch?.model || '?')}` : `runs on ${esc(view.payload.runner.agent || 'the research agent')}`} · web ${view.payload.sources.web ? 'on' : 'off'}`}</span>
+      </div>
+    </div>
+  </div>`;
+  el.querySelectorAll('[data-pick]').forEach((b2) => b2.addEventListener('click', () => {
+    b2.closest('.study-clar').querySelector('[data-answer]').value = b2.dataset.pick;
+  }));
+  el.querySelector('[data-act="add-page"]').addEventListener('click', () => {
+    $('#study-pages').insertAdjacentHTML('beforeend', pageEditor({ id: '', title: '', purpose: '', sections: [], charts: [] }, [{ id: '', text: '' }]));
+    wirePageEditors();
+  });
+  wirePageEditors();
+  const note = el.querySelector('[data-note]');
+  const run = async (what, fn) => {
+    study.busy = true;
+    el.querySelectorAll('[data-act]').forEach((b2) => { b2.disabled = true; });
+    note.textContent = what;
+    try {
+      await fn();
+    } catch (e) {
+      note.textContent = e.message;
+      toast(e.message, 5000);
+    } finally {
+      study.busy = false;
+      el.querySelectorAll('[data-act]').forEach((b2) => { b2.disabled = false; });
+    }
+  };
+  el.querySelector('[data-act="refine"]').addEventListener('click', () => run('refining…', async () => {
+    await api(`/api/research/studies/${view.job.id}/refine`, { method: 'POST', body: JSON.stringify({ brief: gatherBrief(view), answers: gatherAnswers(), feedback: el.querySelector('[data-f="feedback"]').value.trim() }) });
+    study.busy = false;
+    await openStudy(view.job.id);
+  }));
+  el.querySelector('[data-act="save"]').addEventListener('click', () => run('saving…', async () => {
+    renderDraft(await api(`/api/research/studies/${view.job.id}`, { method: 'PUT', body: JSON.stringify({ brief: gatherBrief(view) }) }));
+    toast('brief saved');
+    loadStudyList();
+  }));
+  el.querySelector('[data-act="start"]').addEventListener('click', () => run('starting…', async () => {
+    await api(`/api/research/studies/${view.job.id}`, { method: 'PUT', body: JSON.stringify({ brief: gatherBrief(view) }) });
+    await api(`/api/research/studies/${view.job.id}/start`, { method: 'POST' });
+    toast('research started');
+    await loadStudyList();
+    await openStudy(view.job.id);
+  }));
+  el.querySelector('[data-act="delete"]').addEventListener('click', () => run('deleting…', async () => {
+    if (!confirm('Delete this draft?')) return;
+    await api(`/api/research/studies/${view.job.id}`, { method: 'DELETE' });
+    showComposer();
+    loadStudyList();
+  }));
+}
+
+function pageEditor(p, questions) {
+  return `<div class="study-page" data-page="${esc(p.id)}" data-slug="${esc(p.slug || '')}">
+    <div class="study-page-head"><input data-pf="title" value="${esc(p.title)}" placeholder="Page title" /><button type="button" class="ghost" data-remove-page title="remove this page">✕</button></div>
+    <textarea data-pf="purpose" rows="2" placeholder="What this page answers">${esc(p.purpose || '')}</textarea>
+    <div class="cfg-grid cfg-grid-2">
+      <label>Questions<div class="study-questions">${questions.map((q) => questionRow(q)).join('')}</div><button type="button" class="ghost" data-add-q>＋ question</button></label>
+      <label>Sections (one per line)<textarea data-pf="sections" rows="5">${esc((p.sections || []).map((s) => s.replace(/^##\s*/, '')).join('\n'))}</textarea>
+        <span class="hint">Charts it should carry</span><textarea data-pf="charts" rows="2">${esc((p.charts || []).join('\n'))}</textarea></label>
+    </div>
+  </div>`;
+}
+
+function questionRow(q) {
+  return `<div class="study-q" data-q="${esc(q.id || '')}"><textarea rows="2" data-qtext>${esc(q.text || '')}</textarea><button type="button" class="ghost" data-remove-q title="remove">✕</button></div>`;
+}
+
+function wirePageEditors() {
+  document.querySelectorAll('#study-pages .study-page').forEach((page) => {
+    if (page.dataset.wired) return;
+    page.dataset.wired = '1';
+    page.querySelector('[data-remove-page]').addEventListener('click', () => page.remove());
+    page.querySelector('[data-add-q]').addEventListener('click', (ev) => {
+      ev.preventDefault();
+      page.querySelector('.study-questions').insertAdjacentHTML('beforeend', questionRow({}));
+      wireQuestionRows(page);
+    });
+    wireQuestionRows(page);
+  });
+}
+
+function wireQuestionRows(page) {
+  page.querySelectorAll('[data-remove-q]').forEach((b) => {
+    if (b.dataset.wired) return;
+    b.dataset.wired = '1';
+    b.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      b.closest('.study-q').remove();
+    });
+  });
+}
+
+function gatherAnswers() {
+  const out = {};
+  const b = study.view?.payload.brief;
+  document.querySelectorAll('#study-detail [data-clar]').forEach((el) => {
+    const c = b?.clarifications[Number(el.dataset.clar)];
+    const a = el.querySelector('[data-answer]').value.trim();
+    if (c && a) out[c.question] = a;
+  });
+  return out;
+}
+
+/** The brief as the person left it on screen; the server normalizes it again. */
+function gatherBrief(view) {
+  const b = view.payload.brief;
+  const root = $('#study-detail');
+  const f = (name) => root.querySelector(`[data-f="${name}"]`)?.value ?? '';
+  const answers = gatherAnswers();
+  const pages = [];
+  const questions = [];
+  root.querySelectorAll('#study-pages .study-page').forEach((el, i) => {
+    const title = el.querySelector('[data-pf="title"]').value.trim();
+    if (!title) return;
+    const id = `p${pages.length + 1}`;
+    const prior = b.pages.find((p) => p.id === el.dataset.page);
+    const qids = [];
+    el.querySelectorAll('.study-q').forEach((row) => {
+      const text = row.querySelector('[data-qtext]').value.trim();
+      if (!text) return;
+      const old = b.questions.find((q) => q.id === row.dataset.q);
+      const qid = `q${questions.length + 1}`;
+      questions.push({ id: qid, text, why: old?.why ?? '', page: id, queries: old?.queries ?? [] });
+      qids.push(qid);
+    });
+    pages.push({
+      id, title, slug: el.dataset.slug || '', purpose: el.querySelector('[data-pf="purpose"]').value.trim(),
+      sections: lines(el.querySelector('[data-pf="sections"]').value).map((s) => `## ${s.replace(/^#+\s*/, '')}`),
+      questions: qids, charts: lines(el.querySelector('[data-pf="charts"]').value), entities: prior?.entities ?? [],
+    });
+    void i;
+  });
+  return {
+    ...b,
+    title: f('title').trim() || b.title,
+    objective: f('objective').trim(),
+    language: f('language') || b.language,
+    scope: { ...b.scope, include: lines(f('include')), exclude: lines(f('exclude')), timeframe: f('timeframe').trim() },
+    clarifications: b.clarifications.map((c) => ({ ...c, ...(answers[c.question] ? { answer: answers[c.question] } : {}) })),
+    pages,
+    questions,
+    seedUrls: lines(f('seeds')).map((l) => {
+      const [url, ...why] = l.split(/\s+[—–-]\s+/);
+      return { url: url.trim(), why: why.join(' — ').trim() };
+    }).filter((u) => /^https?:\/\//i.test(u.url)),
+  };
+}
+
+/* ---- a study that runs or ran ---- */
+
+function renderStudy(view) {
+  const { job, payload: p } = view;
+  const live = STUDY_LIVE.has(job.status);
+  const el = $('#study-detail');
+  const runner = p.runner.mode === 'deep-research'
+    ? `deep research · ${esc(p.runner.deepResearch?.model || '?')}, pages by ${esc(job.agent || p.runner.agent || 'the research agent')}`
+    : `${esc(job.agent || p.runner.agent || 'the research agent')}${job.model ? ` · ${esc(job.model)}` : ''}`;
+  const trustChip = (t) => (t ? `<span class="trust ${esc(t)}">${esc(t)}</span>` : '');
+  el.innerHTML = `<div class="study-card">
+    <div class="study-head">
+      <div><p class="section-index">STUDY · ${esc(job.id)}</p><h3 class="study-title">${esc(p.brief.title)}</h3>
+        <p class="hint">${statusChip(job.status)} ${esc(p.stage)} · ${runner} · web ${p.sources.web ? 'on' : 'off'}${job.startedAt ? ` · started ${esc(new Date(job.startedAt).toLocaleString())}` : ''}${job.finishedAt ? ` · finished ${esc(new Date(job.finishedAt).toLocaleString())}` : ''}</p>
+        ${job.error ? `<p class="jerr">${esc(job.error)}</p>` : ''}
+      </div>
+      <div class="study-head-actions">
+        ${live ? '<button type="button" data-act="cancel">Cancel</button>' : ''}
+        ${job.status === 'failed' || job.status === 'cancelled' ? '<button type="button" data-act="retry">Retry</button>' : ''}
+        ${view.pages.some((pg) => pg.trust === 'quarantined') || view.reportExists ? '<button type="button" data-act="promote-pages" title="mark the pages and the report trusted: their facts become the knowledge base\'s position">Promote pages</button>' : ''}
+        ${view.captures.length ? '<button type="button" data-act="promote-sources" title="mark the captured sources and notes trusted">Promote sources</button>' : ''}
+      </div>
+    </div>
+    <ol class="init-steps study-steps">${p.steps.map((s) => `<li data-status="${esc(s.status)}"><b>${esc(STUDY_STEP_LABELS[s.name] || s.name)}</b><span>${esc(s.detail || s.status)}</span></li>`).join('')}</ol>
+    <div class="study-block"><h4>Report</h4>
+      ${view.reportExists ? `<div class="rpage"><span><a href="#" data-open="${esc(view.reportPath)}">${esc(p.brief.report.title)}</a> <span class="hint mono">${esc(view.reportPath)}</span></span>${trustChip(view.reportTrust)}<span></span></div>` : `<p class="hint">${esc(view.reportPath)} — written once the pages are done.</p>`}
+    </div>
+    <div class="study-block"><h4>Pages</h4>
+      ${view.pages.map((pg) => `<div class="rpage"><span>${pg.status === 'done' ? `<a href="#" data-open="${esc(pg.path)}">${esc(pg.title)}</a>` : esc(pg.title)} <span class="hint mono">${esc(pg.path.split('/').pop())}${pg.warnings.length ? ` · ${pg.warnings.length} warnings` : ''}</span>${pg.error ? `<span class="jerr">${esc(pg.error.slice(0, 300))}</span>` : ''}</span>${trustChip(pg.trust)}${statusChip(pg.status)}</div>`).join('')}
+    </div>
+    <div class="study-block"><h4>Sources <span class="hint">· ${view.captures.length} captured into the knowledge base · register ${pageLink(view.registerPath)}</span></h4>
+      ${view.captures.length ? `<table class="study-table"><thead><tr><th>Title</th><th>Site</th><th>Published</th><th>Type</th><th>File</th></tr></thead><tbody>${view.captures.map((c) => `<tr>
+        <td>${/^https?:\/\//i.test(c.url || '') ? `<a href="${esc(c.url)}" target="_blank" rel="noopener noreferrer">${esc(c.title || c.url)}</a>` : esc(c.title || c.url || '')}${c.why ? `<div class="hint">${esc(c.why)}</div>` : ''}</td>
+        <td>${esc(c.site)}</td><td class="mono">${esc(c.published || '—')}</td><td>${esc(c.kind)}</td><td>${pageLink(c.path)}</td></tr>`).join('')}</tbody></table>` : '<p class="hint">nothing captured yet.</p>'}
+      ${view.notes.length ? `<p class="hint">Collector notes: ${view.notes.map((n) => pageLink(n)).join(' · ')}</p>` : ''}
+    </div>
+    <details class="study-block"><summary>The brief</summary>
+      <p>${esc(p.brief.objective)}</p>
+      ${p.brief.pages.map((pg) => `<p><b>${esc(pg.title)}</b></p><ul>${pg.questions.map((qid) => p.brief.questions.find((q) => q.id === qid)).filter(Boolean).map((q) => `<li>${esc(q.text)}</li>`).join('')}</ul>`).join('')}
+      <p class="hint">Request: ${esc(p.topic)}</p>
+    </details>
+    <details class="study-block" data-logs><summary>Session logs</summary><div class="study-actions" data-log-buttons><span class="hint">loading…</span></div><pre class="mono study-log" hidden></pre></details>
+  </div>`;
+  wireOpenLinks(el);
+  const act = async (what, fn) => {
+    try {
+      await fn();
+    } catch (e) {
+      toast(`${what}: ${e.message}`, 5000);
+    }
+  };
+  el.querySelector('[data-act="cancel"]')?.addEventListener('click', () => act('cancel', async () => {
+    if (!confirm('Cancel this study and the pages it has not written yet?')) return;
+    await api(`/api/research/studies/${job.id}/cancel`, { method: 'POST' });
+    openStudy(job.id);
+    loadStudyList();
+  }));
+  el.querySelector('[data-act="retry"]')?.addEventListener('click', () => act('retry', async () => {
+    await api(`/api/research/studies/${job.id}/retry`, { method: 'POST' });
+    openStudy(job.id);
+    loadStudyList();
+  }));
+  for (const [sel, what] of [['[data-act="promote-pages"]', 'pages'], ['[data-act="promote-sources"]', 'sources']]) {
+    el.querySelector(sel)?.addEventListener('click', () => act('promote', async () => {
+      const r = await api(`/api/research/studies/${job.id}/promote`, { method: 'POST', body: JSON.stringify({ what }) });
+      toast(`${r.count} ${what === 'pages' ? 'page(s)' : 'source(s)'} promoted`);
+      openStudy(job.id);
+    }));
+  }
+  el.querySelector('[data-logs]').addEventListener('toggle', async (ev) => {
+    if (!ev.target.open) return;
+    const box = el.querySelector('[data-log-buttons]');
+    try {
+      const { labels } = await api(`/api/research/studies/${job.id}/log?label=agent`);
+      const all = [...labels, 'agent'];
+      box.innerHTML = all.map((l) => `<button type="button" data-log="${esc(l)}">${esc(l === 'agent' ? 'report' : l)}</button>`).join('');
+      box.querySelectorAll('[data-log]').forEach((b) => b.addEventListener('click', async () => {
+        const r = await api(`/api/research/studies/${job.id}/log?label=${encodeURIComponent(b.dataset.log)}`);
+        const pre = el.querySelector('.study-log');
+        pre.hidden = false;
+        pre.textContent = r.log ?? '(no transcript yet)';
+      }));
+    } catch (e) {
+      box.textContent = e.message;
+    }
+  });
+}
+
+/* --------------------------- research · sources ------------------------- */
+
+/** The web settings and the research sources (playbooks/research/sources). Saving either is an administrator's call. */
+let sourceDrafts = null;
+
+async function loadSources() {
+  try {
+    const [data, config] = await Promise.all([api('/api/research/sources'), api('/api/config')]);
+    sourceDrafts = data;
+    const web = config.research?.web ?? {};
+    $('#web-search-provider').value = web.search?.provider ?? '';
+    $('#web-search-base').value = web.search?.baseUrl ?? '';
+    $('#web-search-key').value = web.search?.apiKey ?? '';
+    $('#web-user-agent').value = web.userAgent ?? '';
+    $('#web-proxy').value = web.proxy ?? '';
+    $('#web-private').checked = Boolean(web.allowPrivateHosts);
+    const gate = data.web.gate;
+    $('#web-gate-note').textContent = `${gate === 'off' ? 'Web access is off for this workspace' : gate === 'research' ? 'Every research job may use the web' : 'Studies may use the web when you tick it; other jobs only verify'} (Settings → Research → Web access). Claude Code and Codex search with their own tools; the search API below is for the built-in agent and Cursor, through knode_web_search. Proxy: ${data.web.proxy}.`;
+    renderSourceList();
+  } catch (e) {
+    $('#source-items').innerHTML = `<p class="hint">failed: ${esc(e.message)}</p>`;
+  }
+}
+
+function renderSourceList() {
+  const el = $('#source-items');
+  const list = sourceDrafts?.sources ?? [];
+  if (!list.length) {
+    el.innerHTML = '<p class="hint">No sources yet. An MCP server (a filings database, a market-data vendor), a JSON API with its endpoints, a list of trusted sites, or one of the live datasources.</p>';
+    return;
+  }
+  el.innerHTML = list.map((s) => `<div class="rpage"><span><b>${esc(s.title)}</b> <span class="mono hint">${esc(s.id)}</span> <span class="hint">· ${esc(s.kind)}${s.description ? ` · ${esc(s.description)}` : ''}</span>${s.problem ? `<span class="jerr">${esc(s.problem)}</span>` : ''}</span>
+      <span class="trust ${s.enabled ? 'trusted' : ''}">${s.enabled ? 'on by default' : 'off by default'}</span>
+      <span class="ractions"><button type="button" data-edit="${esc(s.id)}">edit</button><button type="button" data-del="${esc(s.id)}">delete</button></span></div>`).join('');
+  el.querySelectorAll('[data-edit]').forEach((b) => b.addEventListener('click', () => editSource(list.find((s) => s.id === b.dataset.edit))));
+  el.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm(`Delete source ${b.dataset.del}?`)) return;
+    try {
+      await api(`/api/research/sources/${encodeURIComponent(b.dataset.del)}`, { method: 'DELETE' });
+      loadSources();
+    } catch (e) {
+      toast(e.message, 5000);
+    }
+  }));
+}
+
+const kv = (obj, sep) => Object.entries(obj || {}).map(([k, v]) => `${k}${sep}${v}`).join('\n');
+const parseKv = (text, sep) => Object.fromEntries(lines(text).map((l) => {
+  const at = l.indexOf(sep);
+  return at > 0 ? [l.slice(0, at).trim(), l.slice(at + sep.length).trim()] : [l, ''];
+}));
+
+function editSource(s) {
+  const src = s ?? { id: '', title: '', kind: 'site', description: '', enabled: true, url: '', headers: {}, command: '', args: [], env: {}, tools: [], endpoints: [], domains: [], urls: [], datasource: '' };
+  const el = $('#source-editor');
+  el.hidden = false;
+  el.innerHTML = `<div class="study-source-editor">
+    <div class="cfg-grid cfg-grid-3 study-form">
+      <label>Id<input data-s="id" value="${esc(src.id)}" ${s ? 'disabled' : ''} placeholder="sec-edgar" /></label>
+      <label>Title<input data-s="title" value="${esc(src.title)}" /></label>
+      <label>Kind<select data-s="kind">${['site', 'api', 'mcp', 'datasource'].map((k) => `<option value="${k}"${k === src.kind ? ' selected' : ''}>${{ site: 'Trusted sites', api: 'JSON API', mcp: 'MCP server', datasource: 'Live datasource' }[k]}</option>`).join('')}</select></label>
+    </div>
+    <label class="study-wide">What it holds and when to use it (the agent reads this)<textarea data-s="description" rows="2">${esc(src.description)}</textarea></label>
+    <label class="cfg-check study-check"><input data-s="enabled" type="checkbox"${src.enabled ? ' checked' : ''} /> Selected for new studies</label>
+    <div data-kind="site" class="cfg-grid cfg-grid-2 study-form">
+      <label>Domains (one per line)<textarea data-s="domains" rows="3">${esc(src.domains.join('\n'))}</textarea></label>
+      <label>Seed URLs, captured at the start (one per line)<textarea data-s="urls" rows="3">${esc(src.urls.join('\n'))}</textarea></label>
+    </div>
+    <div data-kind="api" class="cfg-grid study-form">
+      <label>Base URL<input data-s="api-url" value="${esc(src.kind === 'api' ? src.url : '')}" placeholder="https://data.example.com/v1" /></label>
+      <label>Headers (Name: value, one per line; values may be env:VAR)<textarea data-s="api-headers" rows="2">${esc(src.kind === 'api' ? kv(src.headers, ': ') : '')}</textarea></label>
+      <label>Endpoints (JSON: [{"name","path","description","params":[{"name","in":"query|path","required"}],"resultPath"}])<textarea data-s="endpoints" rows="6" class="mono">${esc(JSON.stringify(src.endpoints, null, 2))}</textarea></label>
+    </div>
+    <div data-kind="mcp" class="cfg-grid study-form">
+      <label>URL (Streamable HTTP) — or leave empty and give a command<input data-s="mcp-url" value="${esc(src.kind === 'mcp' ? src.url : '')}" placeholder="https://mcp.example.com/mcp" /></label>
+      <label>Headers (Name: value)<textarea data-s="mcp-headers" rows="2">${esc(src.kind === 'mcp' ? kv(src.headers, ': ') : '')}</textarea></label>
+      <div class="cfg-grid cfg-grid-2"><label>Command (a local process)<input data-s="command" value="${esc(src.command)}" placeholder="npx" /></label>
+        <label>Arguments (one per line)<textarea data-s="args" rows="2">${esc(src.args.join('\n'))}</textarea></label></div>
+      <label>Environment (NAME=value, one per line)<textarea data-s="env" rows="2">${esc(kv(src.env, '='))}</textarea></label>
+      <label>Only these tools (one per line; empty = all)<textarea data-s="tools" rows="2">${esc(src.tools.join('\n'))}</textarea></label>
+    </div>
+    <div data-kind="datasource" class="study-form">
+      <label>Datasource<select data-s="datasource">${(sourceDrafts?.datasources ?? []).map((d) => `<option value="${esc(d.id)}"${d.id === src.datasource ? ' selected' : ''}>${esc(d.id)} · ${esc(d.kind)}</option>`).join('') || '<option value="">no datasources in knode.config.json</option>'}</select></label>
+    </div>
+    <div class="study-actions"><button type="button" class="primary" data-save>Save source</button><button type="button" class="ghost" data-close>Close</button><span class="hint" data-note></span></div>
+  </div>`;
+  const kindOf = () => el.querySelector('[data-s="kind"]').value;
+  const showKind = () => el.querySelectorAll('[data-kind]').forEach((d) => { d.hidden = d.dataset.kind !== kindOf(); });
+  el.querySelector('[data-s="kind"]').addEventListener('change', showKind);
+  showKind();
+  el.querySelector('[data-close]').addEventListener('click', () => { el.hidden = true; });
+  el.querySelector('[data-save]').addEventListener('click', async () => {
+    const v = (k) => el.querySelector(`[data-s="${k}"]`).value;
+    const kind = kindOf();
+    const id = (s?.id ?? v('id')).trim();
+    if (!id) return toast('give the source an id');
+    const body = { title: v('title').trim() || id, kind, description: v('description').trim(), enabled: el.querySelector('[data-s="enabled"]').checked };
+    try {
+      if (kind === 'site') Object.assign(body, { domains: lines(v('domains')), urls: lines(v('urls')) });
+      if (kind === 'api') Object.assign(body, { url: v('api-url').trim(), headers: parseKv(v('api-headers'), ':'), endpoints: JSON.parse(v('endpoints') || '[]') });
+      if (kind === 'mcp') Object.assign(body, { url: v('mcp-url').trim(), headers: parseKv(v('mcp-headers'), ':'), command: v('command').trim(), args: lines(v('args')), env: parseKv(v('env'), '='), tools: lines(v('tools')) });
+      if (kind === 'datasource') Object.assign(body, { datasource: v('datasource') });
+      await api(`/api/research/sources/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(body) });
+      toast(`source ${id} saved`);
+      el.hidden = true;
+      loadSources();
+    } catch (e) {
+      el.querySelector('[data-note]').textContent = e.message;
+    }
+  });
+}
+
+$('#btn-source-new').addEventListener('click', () => editSource(null));
+$('#btn-web-save').addEventListener('click', async () => {
+  try {
+    await api('/api/config', { method: 'PUT', body: JSON.stringify({ research: { web: {
+      search: { provider: $('#web-search-provider').value, baseUrl: $('#web-search-base').value.trim(), apiKey: $('#web-search-key').value.trim() },
+      userAgent: $('#web-user-agent').value.trim(), proxy: $('#web-proxy').value.trim(), allowPrivateHosts: $('#web-private').checked,
+    } } }) });
+    toast('web settings saved');
+    loadSources();
+  } catch (e) {
+    toast(`could not save: ${e.message}`, 5000);
   }
 });
 

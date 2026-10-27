@@ -9,6 +9,8 @@
 //                     | teach (chat: writes a note through knode_write + knode_sync)
 //   FAKE_AGENT_REVIEW critique → the first review of a run fails once, forcing a revise round
 //   FAKE_AGENT_SLEEP_MS  how long `slow` sleeps (default 3000)
+//   FAKE_CAPTURE_URL  a study's collector (phase collect) captures <url>?part=<n> through knode_capture
+//   FAKE_STUDY_CHART  bad → a study page carries a chart block the validator must refuse
 import fs from 'node:fs';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -81,6 +83,47 @@ const tool = async (name, args) => {
   return res;
 };
 const text = (res) => res.content?.[0]?.text ?? '';
+
+if (phase === 'collect') {
+  // a study's collector: capture a page through knode, report findings that cite the captured path
+  const studyId = /课题 id：`([^`]+)`/.exec(prompt)?.[1];
+  const part = /# 收集资料：「(.+?)」/.exec(prompt)?.[1] ?? 'part';
+  let captured = null;
+  if (process.env.FAKE_CAPTURE_URL) {
+    const res = await tool('knode_capture', { url: `${process.env.FAKE_CAPTURE_URL}?part=${encodeURIComponent(part)}`, study: studyId, why: `for ${part}` });
+    try {
+      captured = JSON.parse(text(res)).path;
+    } catch {
+      captured = null;
+    }
+  }
+  await client.close();
+  finish(`## 发现\n- ${part}：2025 年收入 45 亿美元 · 2026-03 ·（来源：${captured ?? 'raw/docs/trusted.md'}）\n\n## 数据\n- 收入 · USD bn · 2024=0.9, 2025=4.5 ·（来源：${captured ?? 'raw/docs/trusted.md'}）\n\n## 观点\n- 分析师看好 ·（来源：${captured ?? 'raw/docs/trusted.md'}）\n\n## 缺口\n- 无\n`, turns);
+  process.exit(0);
+}
+
+// a study's page or its report: the sections its brief planned, citing what the study collected
+const studyKind = /- 类型：(section|study)\b/.exec(prompt)?.[1] ?? null;
+if (studyKind && phase !== 'revise') {
+  const studyId = /study `(r_[0-9a-f]+)`/.exec(prompt)?.[1] ?? '';
+  const collected = [...new Set([...prompt.matchAll(/`(raw\/docs\/research\/[^`]+)`/g)].map((m) => m[1]))].filter((p) => !p.endsWith('/'));
+  const cites = collected.length ? collected.slice(0, 3) : ['raw/docs/trusted.md'];
+  const chart = process.env.FAKE_STUDY_CHART === 'bad'
+    ? '```chart\n{"type": "pie", "title": "", "x": ["2024"], "series": [{"name": "Revenue", "values": [1, 2]}]}\n```'
+    : `\`\`\`chart\n${JSON.stringify({ type: 'bar', title: 'Revenue by year', unit: 'USD bn', x: ['2024', '2025'], series: [{ name: 'Revenue', values: [0.9, 4.5] }], source: cites[0] })}\n\`\`\``;
+  const body = requiredSections.map((h, i) => (/sources|来源/i.test(h)
+    ? `${h}\n\n${cites.map((c) => `- ${c}`).join('\n')}`
+    : `${h}\n\n${target}: one finding for ${h.replace(/^#+\s*/, '')} (source: ${cites[0]}).${i === 0 ? `\n\n${chart}` : ''}`)).join('\n\n');
+  const page = `---\ntype: ${studyKind === 'study' ? 'research-report' : 'research-page'}\ntitle: ${JSON.stringify(target)}\nstudy: ${studyId}\nsources: [${cites.map((c) => JSON.stringify(c)).join(', ')}]\n---\n# ${target}\n\n${body}\n`;
+  const wrotePage = await tool('knode_write', { path: outputPath, content: page });
+  await client.close();
+  if (wrotePage.isError) {
+    emit({ type: 'result', subtype: 'error', is_error: true, result: `knode_write failed: ${text(wrotePage)}`, num_turns: turns });
+    process.exit(1);
+  }
+  finish(`wrote ${outputPath}`, turns);
+  process.exit(0);
+}
 
 if (phase === 'chat') {
   const message = /## 本轮消息\n+([\s\S]*?)(?:\n## |$)/.exec(prompt)?.[1]?.trim() ?? prompt.slice(-200);

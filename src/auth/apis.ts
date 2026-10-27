@@ -46,6 +46,7 @@ const RULES: Rule[] = [
   { prefix: '/api/plugins', group: null, methods: READ },
   { prefix: '/api/agents', group: null, methods: READ },
   { prefix: '/api/research/profiles', group: null, methods: READ },
+  { prefix: '/api/research/sources', group: null, methods: READ },
   { prefix: '/api/chat/protocol', group: null, methods: READ },
   { prefix: '/api/chat/readiness', group: null },
   { prefix: '/api/labeling/status', group: 'ingest' },
@@ -59,6 +60,8 @@ const RULES: Rule[] = [
   { prefix: '/api/config', group: 'settings' },
   { prefix: '/api/agents', group: 'settings' },
   { prefix: '/api/research/profiles', group: 'settings' },
+  // a source can name a command for the server to run (an MCP server over stdio): an administrator's call
+  { prefix: '/api/research/sources', group: 'settings' },
   { prefix: '/api/chat/protocol', group: 'settings' },
   { prefix: '/api/workspace', group: 'settings' },
 

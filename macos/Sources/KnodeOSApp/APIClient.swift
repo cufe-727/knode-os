@@ -595,4 +595,45 @@ struct APIClient {
     func availableAgents() async throws -> AvailableAgentsResponse {
         try await send("/api/config/agents")
     }
+
+    /* ------------------------------ research studies ------------------------------ */
+
+    func studies() async throws -> [StudySummary] {
+        try await send("/api/research/studies?limit=80")
+    }
+
+    func study(id: String) async throws -> StudyDetail {
+        try await send("/api/research/studies/\(id)")
+    }
+
+    /// A draft from a topic; the service refines it in the background (poll the study).
+    func createStudy(topic: String, agent: String, web: Bool) async throws -> StudyDetail {
+        struct Runner: Encodable { var agent: String }
+        struct Sources: Encodable { var web: Bool }
+        struct Body: Encodable { var topic: String; var runner: Runner; var sources: Sources }
+        return try await send("/api/research/studies", method: "POST", body: encoded(Body(topic: topic, runner: Runner(agent: agent), sources: Sources(web: web))))
+    }
+
+    func refineStudy(id: String, feedback: String, answers: [String: String]) async throws -> StudyDetail {
+        struct Body: Encodable { var feedback: String; var answers: [String: String] }
+        return try await send("/api/research/studies/\(id)/refine", method: "POST", body: encoded(Body(feedback: feedback, answers: answers)))
+    }
+
+    func startStudy(id: String) async throws -> StudyDetail {
+        try await send("/api/research/studies/\(id)/start", method: "POST", body: Data("{}".utf8))
+    }
+
+    func cancelStudy(id: String) async throws -> [String: Int] {
+        try await send("/api/research/studies/\(id)/cancel", method: "POST", body: Data("{}".utf8))
+    }
+
+    /// Mark a study's pages (or its captured sources) trusted.
+    func promoteStudy(id: String, what: String) async throws -> PromoteStudyResponse {
+        struct Body: Encodable { var what: String }
+        return try await send("/api/research/studies/\(id)/promote", method: "POST", body: encoded(Body(what: what)))
+    }
+}
+
+struct PromoteStudyResponse: Decodable {
+    var count: Int
 }

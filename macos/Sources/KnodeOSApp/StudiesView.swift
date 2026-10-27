@@ -1,0 +1,406 @@
+import SwiftUI
+
+/// Research studies (docs/design/15): a topic, refined into a brief, then
+/// researched into several wiki pages and a report. The list of studies on
+/// the left; on the right the composer, a draft's brief (answer its questions,
+/// say what to change, refine again, start), or a study that runs or ran.
+/// Editing a brief page by page is the web UI's; this screen covers the loop.
+/// Mirrors the web UI's Research → Studies.
+struct StudiesView: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var studies: [StudySummary] = []
+    @State private var selected: String?
+    @State private var detail: StudyDetail?
+    @State private var agents: [AvailableAgent] = []
+    @State private var topic = ""
+    @State private var agent = ""
+    @State private var web = true
+    @State private var feedback = ""
+    @State private var answers: [String: String] = [:]
+    @State private var busy = false
+    @State private var errorMessage: String?
+    @State private var poller: Task<Void, Never>?
+
+    private let stepLabels = ["seed": "Capture seed sources", "collect": "Collect material", "index": "Index what was collected", "pages": "Write the pages", "report": "Write the report"]
+
+    var body: some View {
+        HStack(spacing: 0) {
+            list
+                .frame(width: 270)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if let errorMessage {
+                        Text(errorMessage).font(.callout).foregroundStyle(.red)
+                    }
+                    if let detail {
+                        if detail.refining != nil {
+                            refiningCard(detail)
+                        } else if detail.job.status == "draft" {
+                            draftCard(detail)
+                        } else {
+                            studyCard(detail)
+                        }
+                    } else {
+                        composer
+                    }
+                }
+                .padding(20)
+                .frame(maxWidth: 980, alignment: .leading)
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.22))
+        .task { await load() }
+        .onDisappear { poller?.cancel() }
+    }
+
+    /* ---------------------------------------------------------------- list */
+
+    private var list: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(L("Studies")).font(.headline)
+                Spacer()
+                Button {
+                    poller?.cancel()
+                    selected = nil
+                    detail = nil
+                } label: {
+                    Label(L("New study"), systemImage: "plus")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    if studies.isEmpty {
+                        Text(L("No studies yet. Describe a topic on the right to start one.")).font(.callout).foregroundStyle(.secondary)
+                    }
+                    ForEach(studies) { s in
+                        Button {
+                            Task { await open(s.id) }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(s.title.isEmpty ? s.topic : s.title).font(.system(size: 12.5, weight: .medium)).lineLimit(2)
+                                HStack(spacing: 6) {
+                                    StatusChip(status: s.status)
+                                    Text("\(s.stage) · \(s.pages) \(L("pages"))").font(.system(size: 10.5)).foregroundStyle(.secondary)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(9)
+                            .background(selected == s.id ? Color.knodeCyan.opacity(0.14) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .padding(14)
+    }
+
+    /* ------------------------------------------------------------ composer */
+
+    private var composer: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Eyebrow(text: L("New study"))
+            Text(L("What do you want to research?")).font(.title3.weight(.semibold))
+            Text(L("A topic, a question, or a paragraph of what you want to understand. The refiner turns it into a brief — questions, the pages to write, the sources to start from — that you edit before anything runs."))
+                .font(.callout).foregroundStyle(.secondary)
+            TextEditor(text: $topic)
+                .font(.system(size: 13))
+                .frame(minHeight: 120)
+                .padding(6)
+                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+            HStack(spacing: 14) {
+                Picker(L("Runs on"), selection: $agent) {
+                    Text(L("The research agent")).tag("")
+                    ForEach(agents.filter(\.available)) { a in Text(a.label).tag(a.id) }
+                }
+                .frame(maxWidth: 360)
+                Toggle(L("Search the web"), isOn: $web)
+            }
+            HStack {
+                Button(L("Refine the question")) { Task { await create() } }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(busy || topic.trimmingCharacters(in: .whitespacesAndNewlines).count < 8)
+                if busy { ProgressView().controlSize(.small) }
+            }
+        }
+    }
+
+    private func refiningCard(_ d: StudyDetail) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Eyebrow(text: "\(L("Draft")) · \(d.job.id)")
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text(L("Refining the question…")).font(.title3.weight(.semibold))
+            }
+            Text(L("The refiner reads your request, what this knowledge base already holds about it and the sources you picked, and plans the questions, the pages and the sources to start from. Nothing is searched or fetched yet."))
+                .font(.callout).foregroundStyle(.secondary)
+            Text(d.payload.topic).font(.callout).textSelection(.enabled)
+        }
+    }
+
+    /* --------------------------------------------------------------- draft */
+
+    private func draftCard(_ d: StudyDetail) -> some View {
+        let b = d.payload.brief
+        return VStack(alignment: .leading, spacing: 14) {
+            Eyebrow(text: "\(L("Draft")) · \(d.job.id)")
+            Text(b.title).font(.title3.weight(.semibold)).textSelection(.enabled)
+            Text(b.objective).font(.callout).textSelection(.enabled)
+            if !b.restatement.isEmpty {
+                Text(b.restatement).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            if !b.clarifications.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(L("Questions for you")).font(.headline)
+                    ForEach(b.clarifications, id: \.question) { c in
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(c.question).font(.callout)
+                            if !c.options.isEmpty {
+                                Picker("", selection: answerBinding(c)) {
+                                    Text(L("Not answered")).tag("")
+                                    ForEach(c.options, id: \.self) { o in Text(o).tag(o) }
+                                }
+                                .labelsHidden()
+                            }
+                            TextField(L("your answer"), text: answerBinding(c))
+                                .textFieldStyle(.roundedBorder)
+                        }
+                    }
+                }
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("\(L("Pages")) · \(b.pages.count)").font(.headline)
+                ForEach(b.pages, id: \.id) { page in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(page.title).font(.system(size: 13, weight: .semibold))
+                        if !page.purpose.isEmpty { Text(page.purpose).font(.system(size: 11.5)).foregroundStyle(.secondary) }
+                        ForEach(page.questions, id: \.self) { qid in
+                            if let q = b.questions.first(where: { $0.id == qid }) {
+                                Text("• \(q.text)").font(.system(size: 11.5))
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text(L("Refine again")).font(.headline)
+                TextEditor(text: $feedback)
+                    .font(.system(size: 12.5))
+                    .frame(minHeight: 60)
+                    .padding(6)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+                HStack {
+                    Button(L("Refine with my answers")) { Task { await refine(d) } }.disabled(busy)
+                    Button(L("Start research")) { Task { await start(d) } }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(busy || d.startProblem != nil)
+                    if busy { ProgressView().controlSize(.small) }
+                    if let problem = d.startProblem { Text(problem).font(.caption).foregroundStyle(.orange) }
+                }
+                Text(L("Edit pages and questions one by one in the web UI (Research → Studies)."))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func answerBinding(_ c: StudyDetail.Clarification) -> Binding<String> {
+        Binding(get: { answers[c.question] ?? c.answer ?? "" }, set: { answers[c.question] = $0 })
+    }
+
+    /* --------------------------------------------------------------- study */
+
+    private func studyCard(_ d: StudyDetail) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Eyebrow(text: "\(L("Study")) · \(d.job.id)")
+            Text(d.payload.brief.title).font(.title3.weight(.semibold)).textSelection(.enabled)
+            HStack(spacing: 8) {
+                StatusChip(status: d.job.status)
+                Text("\(d.payload.stage) · \(d.job.agent ?? d.payload.runner.agent)").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if d.isLive {
+                    Button(L("Cancel")) { Task { await cancel(d) } }
+                }
+                if d.reportExists || d.pages.contains(where: { $0.trust == "quarantined" }) {
+                    Button(L("Promote pages")) { Task { await promote(d, what: "pages") } }
+                }
+                if !d.captures.isEmpty {
+                    Button(L("Promote sources")) { Task { await promote(d, what: "sources") } }
+                }
+            }
+            if let error = d.job.error {
+                Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(d.payload.steps, id: \.name) { step in
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        StatusChip(status: step.status)
+                        Text(L(stepLabels[step.name] ?? step.name)).font(.system(size: 12, weight: .medium)).frame(width: 190, alignment: .leading)
+                        Text(step.detail ?? "").font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(2)
+                    }
+                }
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text(L("Report")).font(.headline)
+                if d.reportExists {
+                    Button(d.payload.brief.report.title) { model.openFile(d.reportPath) }.buttonStyle(.link)
+                } else {
+                    Text(L("Written once the pages are done.")).font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text(L("Pages")).font(.headline)
+                ForEach(d.pages) { page in
+                    HStack(spacing: 8) {
+                        if page.status == "done" {
+                            Button(page.title) { model.openFile(page.path) }.buttonStyle(.link)
+                        } else {
+                            Text(page.title)
+                        }
+                        Spacer()
+                        if let trust = page.trust { Text(trust).font(.caption).foregroundStyle(trust == "trusted" ? .green : .orange) }
+                        StatusChip(status: page.status)
+                    }
+                    if let error = page.error { Text(error).font(.caption).foregroundStyle(.secondary).lineLimit(3) }
+                }
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("\(L("Sources")) · \(d.captures.count)").font(.headline)
+                ForEach(d.captures) { c in
+                    HStack(spacing: 8) {
+                        Button(c.title ?? c.url) { model.openFile(c.path) }.buttonStyle(.link).lineLimit(1)
+                        Spacer()
+                        Text([c.site, c.published.map { String($0.prefix(10)) } ?? "", c.kind].filter { !$0.isEmpty }.joined(separator: " · "))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------- actions */
+
+    private func load() async {
+        guard let api = try? model.client() else { return }
+        do {
+            async let list = api.studies()
+            async let available = api.availableAgents()
+            studies = try await list
+            agents = (try? await available)?.agents ?? []
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func open(_ id: String) async {
+        selected = id
+        guard let api = try? model.client() else { return }
+        do {
+            detail = try await api.study(id: id)
+            answers = [:]
+            errorMessage = nil
+            watch(id)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Poll while the study runs or its brief is being refined.
+    private func watch(_ id: String) {
+        poller?.cancel()
+        guard detail?.isLive == true else { return }
+        poller = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: detail?.refining != nil ? 2_500_000_000 : 5_000_000_000)
+                guard !Task.isCancelled, selected == id, let api = try? model.client(), let next = try? await api.study(id: id) else { continue }
+                detail = next
+                if let list = try? await api.studies() { studies = list }
+                if !next.isLive { break }
+            }
+        }
+    }
+
+    private func run(_ work: @escaping (APIClient) async throws -> Void) async {
+        guard let api = try? model.client() else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            try await work(api)
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func create() async {
+        await run { api in
+            let created = try await api.createStudy(topic: topic, agent: agent, web: web)
+            topic = ""
+            await load()
+            await open(created.job.id)
+        }
+    }
+
+    private func refine(_ d: StudyDetail) async {
+        await run { api in
+            let next = try await api.refineStudy(id: d.job.id, feedback: feedback, answers: answers.filter { !$0.value.isEmpty })
+            feedback = ""
+            detail = next
+            watch(d.job.id)
+        }
+    }
+
+    private func start(_ d: StudyDetail) async {
+        await run { api in
+            let next = try await api.startStudy(id: d.job.id)
+            detail = next
+            await load()
+            watch(d.job.id)
+        }
+    }
+
+    private func cancel(_ d: StudyDetail) async {
+        await run { api in
+            _ = try await api.cancelStudy(id: d.job.id)
+            await open(d.job.id)
+        }
+    }
+
+    private func promote(_ d: StudyDetail, what: String) async {
+        await run { api in
+            _ = try await api.promoteStudy(id: d.job.id, what: what)
+            await open(d.job.id)
+        }
+    }
+}
+
+/// A job or step status as a small coloured label.
+private struct StatusChip: View {
+    let status: String
+
+    private var color: Color {
+        switch status {
+        case "done": .green
+        case "failed", "cancelled": .red
+        case "running", "validating", "waiting", "queued": .knodeCyan
+        default: .secondary
+        }
+    }
+
+    var body: some View {
+        Text(status)
+            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background(color.opacity(0.12), in: Capsule())
+    }
+}

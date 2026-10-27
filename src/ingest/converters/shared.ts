@@ -47,9 +47,14 @@ export async function transcribeImage(vision: VisionModel, imagePath: string, co
   return markdown;
 }
 
-/** The frontmatter every converted document starts with: where it came from and what made it. */
-export function withProvenance(rawRel: string, kind: ConversionKind, model: string, body: string): string {
-  const title = path.basename(rawRel, path.extname(rawRel));
+/**
+ * The frontmatter every converted document starts with: where it came from and what made it.
+ * `extra` adds what a converter read from the document itself — a web page's own title, its
+ * address and dates — after the fixed keys; a key whose value is empty is left out.
+ */
+export function withProvenance(rawRel: string, kind: ConversionKind, model: string, body: string, extra: Record<string, string | null | undefined> = {}): string {
+  const { title: ownTitle, ...rest } = extra;
+  const title = ownTitle?.trim() || path.basename(rawRel, path.extname(rawRel));
   return [
     '---',
     `title: ${JSON.stringify(title)}`,
@@ -57,6 +62,7 @@ export function withProvenance(rawRel: string, kind: ConversionKind, model: stri
     `source_type: ${JSON.stringify(path.extname(rawRel).slice(1).toLowerCase())}`,
     `conversion: ${JSON.stringify(kind)}`,
     `conversion_model: ${JSON.stringify(model)}`,
+    ...Object.entries(rest).filter(([, v]) => typeof v === 'string' && v.trim()).map(([k, v]) => `${k}: ${JSON.stringify(v!.trim())}`),
     '---',
     '',
     body.trim(),

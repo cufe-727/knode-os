@@ -35,6 +35,12 @@ import { cancelJob, getJob, listJobs, queueJob } from '../research/jobs.js';
 import { killAgentsFor } from '../research/launch.js';
 import { surveyKnowledgeBase } from '../research/survey.js';
 import { loadResearchTemplates, RESEARCH_KINDS, ResearchKind } from '../research/templates.js';
+import { captureUrl, fetchReadable } from '../research/capture.js';
+import { chartBlock, parseChart } from '../research/chart.js';
+import { callApiSource, loadResearchSource } from '../research/sources.js';
+import { createStudy, listStudies, startStudy, studyAgent, studyView, refineStudy } from '../research/study.js';
+import { webSearch, webSearchEnabled } from '../research/web.js';
+import { readSection } from '../research/read.js';
 
 /** Who wrote what an MCP client writes: an agent's text, quarantined until a person promotes it (src/lineage/trust.ts). */
 export const MCP_WRITER = 'mcp';
@@ -164,14 +170,21 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: Kno
     'knode_read',
     {
       title: 'Read a knowledge file',
-      description: 'Read a file by its path relative to the data directory, e.g. "wiki/index.md". A PDF or image under raw/docs returns the Markdown knode-os derived from it. A path starting with "/" reads the virtual filesystem instead — /entities/<id>.md, /claims/<subject>.md, /capabilities/<source>/<name>.md, /live/<capability>?<param>=<value> — rendered on read, and every one of them accepts ?as_of=<iso>. Read "/" for the roots.',
-      inputSchema: { path: z.string() },
+      description: 'Read a file by its path relative to the data directory, e.g. "wiki/index.md". A PDF, web page (HTML) or image under raw/docs returns the Markdown knode-os derived from it. A long document (a prospectus, an annual report) reads in parts: `section` returns one heading\'s section (a heading\'s text, as the capture outline or `outline: true` lists them), `offset` / `limit` a range of lines, `outline: true` only the headings with their line numbers. A path starting with "/" reads the virtual filesystem instead — /entities/<id>.md, /claims/<subject>.md, /capabilities/<source>/<name>.md, /live/<capability>?<param>=<value> — rendered on read, and every one of them accepts ?as_of=<iso>. Read "/" for the roots.',
+      inputSchema: {
+        path: z.string(),
+        section: z.string().optional().describe('A heading of the document: its section is returned, up to the next heading of the same or a higher level'),
+        offset: z.number().int().min(1).optional().describe('First line to return (1-based)'),
+        limit: z.number().int().min(1).max(5000).optional().describe('Lines to return (default 400 when offset is given)'),
+        outline: z.boolean().optional().describe('Return only the headings, with line numbers'),
+      },
     },
-    async ({ path: p }) => {
+    async ({ path: p, section, offset, limit, outline }) => {
       if (isVirtualPath(p)) return { content: [{ type: 'text' as const, text: await readVirtual(ctx, p) }] };
       const file = readSourceTextCapped(ctx.dataDir, p, MAX_FILE_BYTES);
-      if (!file) throw new Error(`no derived text for ${p} yet — run knode_sync first`);
-      return { content: [{ type: 'text' as const, text: file.content }] };
+      if (!file) throw new Error(`no derived text for ${p} yet — run knode_sync first (a capture is indexed within seconds)`);
+      if (section === undefined && offset === undefined && limit === undefined && !outline) return { content: [{ type: 'text' as const, text: file.content }] };
+      return { content: [{ type: 'text' as const, text: readSection(file.content, { section, offset, limit, outline }) }] };
     },
   );
 
@@ -644,6 +657,147 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: Kno
         return json([...loadResearchTemplates(ctx.dataDir).values()].map((t) => ({ name: t.name, kind: t.kind, output: t.output, requires: t.requires, path: t.path })));
       }
       return json(await listJobs(ctx.store, { status, limit: 50 }));
+    },
+  );
+
+
+  /* ---------------------------------------------------------- research: web, sources, charts, studies */
+
+  /** The actor a capture is on record as: the study's agent when it names one, else an MCP client. */
+  const captureActor = async (study: string | undefined): Promise<{ actor: string; ref: { id: string; slug: string; title?: string } | null }> => {
+    if (!study) return { actor: MCP_WRITER, ref: null };
+    const job = await getJob(ctx.store, study);
+    if (!job || job.kind !== 'study') throw new Error(`no study ${study} — knode_study action=list shows them`);
+    const agentFor = studyAgent(ctx, job);
+    const brief = (job.payload.brief ?? {}) as { title?: string };
+    return { actor: agentFor ? `agent/${agentFor.provider}` : MCP_WRITER, ref: { id: job.id, slug: job.target ?? job.id, title: brief.title } };
+  };
+
+  server.registerTool(
+    'knode_capture',
+    {
+      title: 'Save web material into the knowledge base',
+      description: 'Fetch a URL — a web page, a PDF, a CSV / JSON file, an image — and keep it as a source under raw/docs/research/<study>/: knode fetches it itself (never pass the page as text unless knode cannot), keeps the original, converts it to Markdown and indexes it within seconds. Returns the path to cite (frontmatter `sources:`, `（来源：…）`), the title, the publication date when the page states one, and the outline of a long document (read its parts with knode_read `section`). The same URL is kept once; a second capture returns the first. Pass `study` inside a research study. When the site refuses knode (403, a login, a page that is all script), capture another URL for the same document, or pass the text you read as `content` to keep a clearly labelled excerpt.',
+      inputSchema: {
+        url: z.string().describe('http(s) URL of the page or file'),
+        study: z.string().optional().describe('The research study this is for (its id, e.g. r_0123456789)'),
+        why: z.string().optional().describe('One line: what this source is for'),
+        title: z.string().optional().describe('A title, when the document carries none (a PDF without metadata)'),
+        content: z.string().optional().describe('Only when knode could not fetch the URL: the text you read, saved as your excerpt of it'),
+      },
+    },
+    async ({ url, study, why, title, content }) => {
+      const { actor, ref } = await captureActor(study);
+      return json(await captureUrl(ctx, { url, study: ref, why, title, content, actor, maxCaptures: ref ? ctx.config.research.study.maxCaptures : undefined }));
+    },
+  );
+
+  server.registerTool(
+    'knode_web_fetch',
+    {
+      title: 'Read a web page without keeping it',
+      description: 'Fetch a URL and return its readable text (HTML as Markdown), in slices of up to 60 000 characters (`offset`, `limit`) — to decide whether a page is worth a knode_capture. Nothing is saved; cite only what you captured.',
+      inputSchema: {
+        url: z.string(),
+        offset: z.number().int().min(0).optional().describe('Character offset (the previous answer\'s nextOffset)'),
+        limit: z.number().int().min(1000).max(60000).optional(),
+      },
+    },
+    async ({ url, offset, limit }) => json(await fetchReadable(ctx, url, { offset, limit })),
+  );
+
+  if (webSearchEnabled(ctx.config.research?.web)) {
+    server.registerTool(
+      'knode_web_search',
+      {
+        title: 'Search the web',
+        description: `Search the web through the search API this knowledge base is configured with (${ctx.config.research.web.search.provider}). Returns title, URL, snippet and date per result; read one with knode_web_fetch, keep the ones you rely on with knode_capture.`,
+        inputSchema: {
+          query: z.string(),
+          max: z.number().int().min(1).max(20).optional(),
+          domains: z.array(z.string()).optional().describe('Only these sites, e.g. ["sec.gov"]'),
+          recency: z.enum(['day', 'week', 'month', 'year']).optional(),
+        },
+      },
+      async ({ query, max, domains, recency }) => json(await webSearch(ctx.config.research.web, query, { max, domains, recency })),
+    );
+  }
+
+  server.registerTool(
+    'knode_api',
+    {
+      title: 'Call a configured API source',
+      description: 'Call one declared endpoint of an API research source (playbooks/research/sources/<id>.yaml, kind api). Only declared endpoints and parameters pass. `capture: true` also keeps the answer as a data file of the study (raw/docs/research/<study>/files/…), so it can be cited.',
+      inputSchema: {
+        source: z.string(),
+        endpoint: z.string(),
+        params: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+        capture: z.boolean().optional(),
+        study: z.string().optional(),
+        why: z.string().optional(),
+      },
+    },
+    async ({ source, endpoint, params, capture, study, why }) => {
+      const src = loadResearchSource(ctx.dataDir, source);
+      if (!src) throw new Error(`no research source "${source}"`);
+      const res = await callApiSource(ctx.config, src, endpoint, params ?? {});
+      let saved: unknown = null;
+      if (capture && res.status < 400) {
+        const { actor, ref } = await captureActor(study);
+        saved = await captureUrl(ctx, {
+          url: res.url, study: ref, why: why ?? `${src.title}: ${endpoint}`, actor, title: `${src.title} — ${endpoint}`,
+          prefetched: { url: res.url, finalUrl: res.finalUrl, status: res.status, headers: {}, contentType: res.contentType, charset: res.charset, body: res.body, truncated: false },
+        });
+      }
+      return json({ source: res.source, endpoint: res.endpoint, url: res.url, status: res.status, contentType: res.contentType, records: res.records, text: res.records ? undefined : res.text, truncated: res.truncated, captured: saved });
+    },
+  );
+
+  server.registerTool(
+    'knode_chart',
+    {
+      title: 'Check a chart before writing it',
+      description: 'Validate a chart spec for a ```chart block in a wiki page — {"type": "bar|line|area|stacked-bar|hbar", "title", "subtitle"?, "unit"?, "x": [labels], "series": [{"name", "values": [numbers or null]}], "source": "the paths / URLs the numbers come from", "note"?}. Returns the errors, or the normalized block to paste into the page.',
+      inputSchema: { spec: z.union([z.string(), z.record(z.string(), z.unknown())]) },
+    },
+    async ({ spec }) => {
+      const r = parseChart(typeof spec === 'string' ? spec : JSON.stringify(spec));
+      return json({ ok: r.errors.length === 0, errors: r.errors, warnings: r.warnings, block: r.spec ? chartBlock(r.spec) : null });
+    },
+  );
+
+  server.registerTool(
+    'knode_study',
+    {
+      title: 'Research studies',
+      description: 'Research studies: a topic researched into several wiki pages (collect sources → one page per planned part → a report). action=list shows recent studies, show one study (brief, stages, pages, captured sources). From this machine\'s own clients also: create (a topic; refined into a brief right away), refine (feedback on a draft), start (queue a draft).',
+      inputSchema: {
+        action: z.enum(['list', 'show', 'create', 'refine', 'start']),
+        id: z.string().optional(),
+        topic: z.string().optional().describe('For create: what to research, in a sentence or a paragraph'),
+        feedback: z.string().optional().describe('For refine: what to change in the brief'),
+        agent: z.string().optional().describe('For create: the agent that runs it (default research.agent)'),
+        web: z.boolean().optional().describe('For create: may it search the web (default true)'),
+      },
+    },
+    async ({ action, id, topic, feedback, agent: agentSpec, web }) => {
+      if (action === 'list') {
+        return json((await listStudies(ctx, 30)).map((j) => ({ id: j.id, status: j.status, stage: j.payload.stage, title: (j.payload.brief as { title?: string } | undefined)?.title ?? j.query, created: j.createdAt })));
+      }
+      if (action === 'show') {
+        if (!id) throw new Error('show needs id');
+        const job = await getJob(ctx.store, id);
+        if (!job || job.kind !== 'study') throw new Error(`no study ${id}`);
+        return json(await studyView(ctx, job));
+      }
+      if (agent) throw new Error(`${action} is a person's decision — it spends the agent's quota on a whole study: ask them to do it in knode-os (Research)`);
+      if (action === 'create') {
+        if (!topic) throw new Error('create needs topic');
+        return json(await createStudy(ctx, { topic, runner: agentSpec ? { agent: agentSpec } : undefined, sources: web === undefined ? undefined : { web }, requestedBy: 'mcp' }));
+      }
+      if (!id) throw new Error(`${action} needs id`);
+      if (action === 'refine') return json(await refineStudy(ctx, id, { feedback }));
+      return json(await startStudy(ctx, id));
     },
   );
 
