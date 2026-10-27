@@ -34,9 +34,10 @@ const guideSections = (companion?.[2] ?? '').split(' / ').map((s) => s.trim()).f
 const emit = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
 const finish = (text, turns) => emit({ type: 'result', subtype: 'success', is_error: false, result: text, num_turns: turns, total_cost_usd: 0.0123 });
 emit({ type: 'system', subtype: 'init', cwd: process.cwd(), phase });
-// what the harness launched us with, so tests can check the adapter flags
+// what the harness launched us with, so tests can check the adapter flags and the prompt
 try {
   fs.writeFileSync(path.join(process.cwd(), `argv-${phase ?? 'agent'}.json`), JSON.stringify(process.argv.slice(2)));
+  fs.writeFileSync(path.join(process.cwd(), `prompt-${phase ?? 'agent'}.md`), prompt);
 } catch {
   // read-only workspace in some tests
 }
