@@ -228,11 +228,11 @@ struct StudiesView: View {
                 if d.isLive {
                     Button(L("Cancel")) { Task { await cancel(d) } }
                 }
-                if d.reportExists || d.pages.contains(where: { $0.trust == "quarantined" }) {
-                    Button(L("Promote pages")) { Task { await promote(d, what: "pages") } }
+                if let n = d.tiers?.pages.quarantined, n > 0 {
+                    Button(L("Promote pages (%@)", String(n))) { Task { await promote(d, what: "pages") } }
                 }
-                if !d.captures.isEmpty {
-                    Button(L("Promote sources")) { Task { await promote(d, what: "sources") } }
+                if let n = d.tiers?.sources.quarantined, n > 0 {
+                    Button(L("Promote sources (%@)", String(n))) { Task { await promote(d, what: "sources") } }
                 }
             }
             if let error = d.job.error {
@@ -265,14 +265,25 @@ struct StudiesView: View {
                             Text(page.title)
                         }
                         Spacer()
-                        if let trust = page.trust { Text(trust).font(.caption).foregroundStyle(trust == "trusted" ? .green : .orange) }
+                        if let trust = page.trust { Text(L(trust)).font(.caption).foregroundStyle(trust == "trusted" ? .green : .orange) }
                         StatusChip(status: page.status)
                     }
                     if let error = page.error { Text(error).font(.caption).foregroundStyle(.secondary).lineLimit(3) }
                 }
             }
             VStack(alignment: .leading, spacing: 6) {
-                Text("\(L("Sources")) · \(d.captures.count)").font(.headline)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("\(L("Sources")) · \(d.captures.count)").font(.headline)
+                    if let t = d.tiers?.sources, !d.captures.isEmpty {
+                        if t.quarantined > 0 {
+                            Text(L("%@ files quarantined (captures, notes, register)", String(t.quarantined))).font(.caption).foregroundStyle(.orange)
+                        } else if t.unindexed > 0 {
+                            Text(L("%@ files not indexed yet", String(t.unindexed))).font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text(L("all trusted")).font(.caption).foregroundStyle(.green)
+                        }
+                    }
+                }
                 ForEach(d.captures) { c in
                     HStack(spacing: 8) {
                         Button(c.title ?? c.url) { model.openFile(c.path) }.buttonStyle(.link).lineLimit(1)
@@ -376,9 +387,20 @@ struct StudiesView: View {
 
     private func promote(_ d: StudyDetail, what: String) async {
         await run { api in
-            _ = try await api.promoteStudy(id: d.job.id, what: what)
+            let r = try await api.promoteStudy(id: d.job.id, what: what)
             await open(d.job.id)
+            model.showToast(promotionSummary(r, what: what), duration: r.failed.isEmpty && r.notIndexed.isEmpty ? 3_000_000_000 : 6_000_000_000)
         }
+    }
+
+    /// "Pages and report: 7 now trusted · 1 not indexed yet" — what a Promote changed, as the web UI words it.
+    private func promotionSummary(_ r: PromoteStudyResponse, what: String) -> String {
+        var parts: [String] = []
+        if !r.changed.isEmpty { parts.append(L("%@ now trusted", String(r.changed.count))) }
+        if !r.unchanged.isEmpty { parts.append(L("%@ already trusted", String(r.unchanged.count))) }
+        if !r.notIndexed.isEmpty { parts.append(L("%@ not indexed yet — try again in a moment", String(r.notIndexed.count))) }
+        if let first = r.failed.first { parts.append(L("%@ failed: %@", String(r.failed.count), first.error)) }
+        return "\(what == "pages" ? L("Pages and report") : L("Sources")): \(parts.isEmpty ? L("nothing to promote") : parts.joined(separator: " · "))"
     }
 }
 

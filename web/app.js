@@ -5622,6 +5622,23 @@ function gatherBrief(view) {
 
 /* ---- a study that runs or ran ---- */
 
+/** What a Promote changed, as the person reads it: "Pages and report: 7 now trusted · 1 not indexed yet". */
+function promotionSummary(what, r) {
+  const parts = [
+    r.changed.length ? `${r.changed.length} now ${r.to}` : '',
+    r.unchanged.length ? `${r.unchanged.length} already ${r.to}` : '',
+    r.notIndexed.length ? `${r.notIndexed.length} not indexed yet — try again in a moment` : '',
+    r.failed.length ? `${r.failed.length} failed: ${r.failed[0].error}` : '',
+  ].filter(Boolean);
+  return `${what === 'pages' ? 'Pages and report' : 'Sources'}: ${parts.join(' · ') || 'nothing to promote'}`;
+}
+
+/** How a study's source files (captures, notes, register) stand: "61 files quarantined", "2 files not indexed yet" or "all trusted". */
+function sourcesTier(t) {
+  if (t.quarantined) return `${t.quarantined} files quarantined (captures, notes, register)`;
+  return t.unindexed ? `${t.unindexed} files not indexed yet` : 'all trusted';
+}
+
 function renderStudy(view) {
   const { job, payload: p } = view;
   const live = STUDY_LIVE.has(job.status);
@@ -5630,6 +5647,8 @@ function renderStudy(view) {
     ? `deep research · ${esc(p.runner.deepResearch?.model || '?')}, pages by ${esc(job.agent || p.runner.agent || 'the research agent')}`
     : `${esc(job.agent || p.runner.agent || 'the research agent')}${job.model ? ` · ${esc(job.model)}` : ''}`;
   const trustChip = (t) => (t ? `<span class="trust ${esc(t)}">${esc(t)}</span>` : '');
+  const none = { trusted: 0, quarantined: 0, unindexed: 0 };
+  const tiers = { pages: view.tiers?.pages ?? none, sources: view.tiers?.sources ?? none };
   el.innerHTML = `<div class="study-card">
     <div class="study-head">
       <div><p class="section-index">STUDY · ${esc(job.id)}</p><h3 class="study-title">${esc(p.brief.title)}</h3>
@@ -5639,8 +5658,8 @@ function renderStudy(view) {
       <div class="study-head-actions">
         ${live ? '<button type="button" data-act="cancel">Cancel</button>' : ''}
         ${job.status === 'failed' || job.status === 'cancelled' ? '<button type="button" data-act="retry">Retry</button>' : ''}
-        ${view.pages.some((pg) => pg.trust === 'quarantined') || view.reportExists ? '<button type="button" data-act="promote-pages" title="mark the pages and the report trusted: their facts become the knowledge base\'s position">Promote pages</button>' : ''}
-        ${view.captures.length ? '<button type="button" data-act="promote-sources" title="mark the captured sources and notes trusted">Promote sources</button>' : ''}
+        ${tiers.pages.quarantined ? `<button type="button" data-act="promote-pages" title="mark the pages and the report trusted: their facts become the knowledge base's position">Promote pages (${tiers.pages.quarantined})</button>` : ''}
+        ${tiers.sources.quarantined ? `<button type="button" data-act="promote-sources" title="mark the captured sources, the notes and the register trusted">Promote sources (${tiers.sources.quarantined})</button>` : ''}
       </div>
     </div>
     <ol class="init-steps study-steps">${p.steps.map((s) => `<li data-status="${esc(s.status)}"><b>${esc(STUDY_STEP_LABELS[s.name] || s.name)}</b><span>${esc(s.detail || s.status)}</span></li>`).join('')}</ol>
@@ -5650,7 +5669,7 @@ function renderStudy(view) {
     <div class="study-block"><h4>Pages</h4>
       ${view.pages.map((pg) => `<div class="rpage"><span>${pg.status === 'done' ? `<a href="#" data-open="${esc(pg.path)}">${esc(pg.title)}</a>` : esc(pg.title)} <span class="hint mono">${esc(pg.path.split('/').pop())}${pg.warnings.length ? ` · ${pg.warnings.length} warnings` : ''}</span>${pg.error ? `<span class="jerr">${esc(pg.error.slice(0, 300))}</span>` : ''}</span>${trustChip(pg.trust)}${statusChip(pg.status)}</div>`).join('')}
     </div>
-    <div class="study-block"><h4>Sources <span class="hint">· ${view.captures.length} captured into the knowledge base · register ${pageLink(view.registerPath)}</span></h4>
+    <div class="study-block"><h4>Sources <span class="hint">· ${view.captures.length} captured into the knowledge base${view.captures.length ? ` · ${sourcesTier(tiers.sources)}` : ''} · register ${pageLink(view.registerPath)}</span></h4>
       ${view.captures.length ? `<table class="study-table"><thead><tr><th>Title</th><th>Site</th><th>Published</th><th>Type</th><th>File</th></tr></thead><tbody>${view.captures.map((c) => `<tr>
         <td>${/^https?:\/\//i.test(c.url || '') ? `<a href="${esc(c.url)}" target="_blank" rel="noopener noreferrer">${esc(c.title || c.url)}</a>` : esc(c.title || c.url || '')}${c.why ? `<div class="hint">${esc(c.why)}</div>` : ''}</td>
         <td>${esc(c.site)}</td><td class="mono">${esc(c.published || '—')}</td><td>${esc(c.kind)}</td><td>${pageLink(c.path)}</td></tr>`).join('')}</tbody></table>` : '<p class="hint">nothing captured yet.</p>'}
@@ -5685,7 +5704,7 @@ function renderStudy(view) {
   for (const [sel, what] of [['[data-act="promote-pages"]', 'pages'], ['[data-act="promote-sources"]', 'sources']]) {
     el.querySelector(sel)?.addEventListener('click', () => act('promote', async () => {
       const r = await api(`/api/research/studies/${job.id}/promote`, { method: 'POST', body: JSON.stringify({ what }) });
-      toast(`${r.count} ${what === 'pages' ? 'page(s)' : 'source(s)'} promoted`);
+      toast(promotionSummary(what, r), r.failed.length || r.notIndexed.length ? 6000 : 3000);
       openStudy(job.id);
     }));
   }

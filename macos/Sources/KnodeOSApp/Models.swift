@@ -2048,12 +2048,16 @@ struct StudyDetail: Decodable {
         var path: String; var title: String?; var site: String; var kind: String; var published: String?; var url: String
         var id: String { path }
     }
+    /// The files one Promote covers, by tier: `quarantined` is what it would make trusted.
+    struct TierCounts: Decodable { var trusted: Int; var quarantined: Int; var unindexed: Int }
+    struct Tiers: Decodable { var pages: TierCounts; var sources: TierCounts }
     var job: Job
     var payload: Payload
     var reportPath: String
     var reportExists: Bool
     var pages: [PageState]
     var captures: [Capture]
+    var tiers: Tiers?
     var refining: String?
     var startProblem: String?
 

@@ -6,7 +6,9 @@ import { llmTargets } from '../config.js';
 import { safePath, writeFileBytes } from '../fs/files.js';
 import { recordOrigin } from '../fs/sidecar.js';
 import { sync } from '../ingest/sync.js';
+import { setScopeTrust, TrustTier } from '../lineage/trust.js';
 import { pool } from '../pool.js';
+import { Params } from '../store/temporal.js';
 import { agentForSpec, ResearchAgent, resolveResearchAgent } from './agent.js';
 import { captureUrl, registerPath, studyCaptures, studyFolder, waitForCaptureIndexing } from './capture.js';
 import { runDeepResearch } from './deep-research.js';
@@ -394,7 +396,12 @@ export interface StudyView {
   captures: { path: string; title: string | null; site: string; kind: string; published: string | null; url: string; why: string }[];
   registerPath: string;
   notes: string[];
+  /** The files each Promote covers, by tier: `quarantined` is what it would make trusted; `unindexed` it cannot promote yet. */
+  tiers: Record<Exclude<StudyFiles, 'all'>, { trusted: number; quarantined: number; unindexed: number }>;
 }
+
+/** What a Promote covers: the pages and the report, the sources (captures, notes, register), or both. */
+export type StudyFiles = 'pages' | 'sources' | 'all';
 
 export function reportPathFor(slug: string): string {
   return `${STUDY_WIKI_DIR}/${slug}.md`;
@@ -404,36 +411,93 @@ export function pagePathFor(slug: string, page: Pick<StudyPage, 'slug'>): string
   return `${STUDY_WIKI_DIR}/${slug}/${page.slug}.md`;
 }
 
-async function trustOf(ctx: AppContext, rel: string): Promise<string | null> {
-  const [row] = await ctx.store.query<{ trust: string }>(`SELECT trust FROM scopes WHERE kind = 'doc' AND key = $1 AND status = 'active' ORDER BY applied_at DESC LIMIT 1`, [rel]);
-  return row?.trust ?? null;
+/** The tier of each file's live document, by path; a file not indexed yet has none. */
+async function trustOf(ctx: AppContext, rels: string[]): Promise<Map<string, TrustTier>> {
+  if (rels.length === 0) return new Map();
+  const p = new Params();
+  const rows = await ctx.store.query<{ key: string; trust: TrustTier }>(
+    `SELECT DISTINCT ON (key) key, trust FROM scopes WHERE kind = 'doc' AND key IN (${rels.map((r) => p.add(r)).join(',')}) AND status = 'active'
+     ORDER BY key, applied_at DESC`,
+    p.list,
+  );
+  return new Map(rows.map((r) => [r.key, r.trust]));
+}
+
+/** A study's files as its two Promote buttons cover them: the pages and the report; the captures, notes and register. */
+function studyFiles(job: ResearchJob, captures: string[]): Record<Exclude<StudyFiles, 'all'>, string[]> {
+  const p = studyPayload(job);
+  const slug = job.target ?? p.brief.slug;
+  return {
+    pages: [...p.brief.pages.map((page) => pagePathFor(slug, page)), reportPathFor(slug)],
+    sources: [...captures, registerPath(slug), ...p.notes],
+  };
 }
 
 export async function studyView(ctx: AppContext, job: ResearchJob): Promise<StudyView> {
   const p = studyPayload(job);
   const slug = job.target ?? p.brief.slug;
   const children = p.children.length ? await listJobs(ctx.store, { study: job.id, limit: 100 }) : [];
-  const pages: StudyPageView[] = [];
-  for (const page of p.brief.pages) {
+  const captures = studyCaptures(ctx.dataDir, job.id).map((e) => ({
+    path: e.path, title: e.title, site: e.site, kind: e.kind, published: e.published, url: e.urls[e.urls.length - 1] ?? e.url,
+    why: e.studies.find((s) => s.id === job.id)?.why ?? '',
+  }));
+  const files = studyFiles(job, captures.map((c) => c.path));
+  const existing = new Set([...files.pages, ...files.sources].filter((rel) => fs.existsSync(safePath(ctx.dataDir, rel))));
+  const trust = await trustOf(ctx, [...existing]);
+  const tierOf = (rel: string) => (existing.has(rel) ? trust.get(rel) ?? null : null);
+  const pages: StudyPageView[] = p.brief.pages.map((page) => {
     const rel = pagePathFor(slug, page);
     const child = children.find((c) => (c.payload.page as StudyPage | undefined)?.id === page.id) ?? null;
-    pages.push({
+    return {
       id: page.id, title: page.title, path: rel, job: child?.id ?? null, status: child?.status ?? (job.status === 'draft' ? 'planned' : 'pending'),
-      trust: fs.existsSync(safePath(ctx.dataDir, rel)) ? await trustOf(ctx, rel) : null,
+      trust: tierOf(rel),
       error: child?.error ?? null, warnings: Array.isArray(child?.payload.warnings) ? (child!.payload.warnings as string[]) : [],
-    });
-  }
+    };
+  });
   const report = reportPathFor(slug);
-  const reportExists = fs.existsSync(safePath(ctx.dataDir, report));
+  const tiers = (rels: string[]) => {
+    const present = rels.filter((rel) => existing.has(rel));
+    const of = (tier: TrustTier | null) => present.filter((rel) => tierOf(rel) === tier).length;
+    return { trusted: of('trusted'), quarantined: of('quarantined'), unindexed: of(null) };
+  };
   return {
-    job, payload: p, reportPath: report, reportExists, reportTrust: reportExists ? await trustOf(ctx, report) : null, pages,
-    captures: studyCaptures(ctx.dataDir, job.id).map((e) => ({
-      path: e.path, title: e.title, site: e.site, kind: e.kind, published: e.published, url: e.urls[e.urls.length - 1] ?? e.url,
-      why: e.studies.find((s) => s.id === job.id)?.why ?? '',
-    })),
+    job, payload: p, reportPath: report, reportExists: existing.has(report), reportTrust: tierOf(report), pages,
+    captures,
     registerPath: registerPath(slug),
     notes: p.notes,
+    tiers: { pages: tiers(files.pages), sources: tiers(files.sources) },
   };
+}
+
+export interface StudyPromotion {
+  to: TrustTier;
+  /** Files whose tier changed; files already at it; files not indexed yet (nothing to promote until they are); errors. */
+  changed: string[];
+  unchanged: string[];
+  notIndexed: string[];
+  failed: { path: string; error: string }[];
+}
+
+/** A person's review of what a study produced: its pages and report, or the sources it captured, made trusted (or quarantined again). */
+export async function promoteStudy(ctx: AppContext, job: ResearchJob, opts: { what: StudyFiles; to: TrustTier; actor?: string }): Promise<StudyPromotion> {
+  const all = studyFiles(job, studyCaptures(ctx.dataDir, job.id).map((e) => e.path));
+  const files = (opts.what === 'all' ? [...all.pages, ...all.sources] : all[opts.what]).filter((rel) => fs.existsSync(safePath(ctx.dataDir, rel)));
+  const trust = await trustOf(ctx, files);
+  const out: StudyPromotion = { to: opts.to, changed: [], unchanged: [], notIndexed: [], failed: [] };
+  for (const rel of files) {
+    const tier = trust.get(rel);
+    if (!tier) out.notIndexed.push(rel);
+    else if (tier === opts.to) out.unchanged.push(rel);
+    else {
+      try {
+        await setScopeTrust(ctx.store, { key: rel, to: opts.to, actor: opts.actor });
+        out.changed.push(rel);
+      } catch (e) {
+        out.failed.push({ path: rel, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+  }
+  return out;
 }
 
 export async function listStudies(ctx: AppContext, limit = 50): Promise<ResearchJob[]> {

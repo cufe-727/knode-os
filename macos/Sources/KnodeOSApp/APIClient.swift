@@ -634,6 +634,12 @@ struct APIClient {
     }
 }
 
+/// What a Promote changed: files made trusted, files already trusted, files not indexed yet, failures.
 struct PromoteStudyResponse: Decodable {
-    var count: Int
+    struct Failure: Decodable { var path: String; var error: String }
+    var to: String
+    var changed: [String]
+    var unchanged: [String]
+    var notIndexed: [String]
+    var failed: [Failure]
 }
