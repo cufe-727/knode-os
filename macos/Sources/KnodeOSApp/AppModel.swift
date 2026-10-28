@@ -617,6 +617,25 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// A study as one HTML file, opened in the browser: from there it reads, saves, or prints to PDF.
+    func openStudyExport(id: String, slug: String) async {
+        do {
+            let data = try await client().studyExport(id: id)
+            // one folder per study and workspace, so a second export replaces the first copy
+            let key = SHA256.hash(data: Data("\(activeWorkspace?.id ?? "")/\(id)".utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+            let folder = FileManager.default.temporaryDirectory
+                .appendingPathComponent("KnodeOS Exports", isDirectory: true)
+                .appendingPathComponent(key, isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let name = slug.isEmpty ? id : slug
+            let copy = folder.appendingPathComponent("\(name).html")
+            try data.write(to: copy, options: .atomic)
+            if !NSWorkspace.shared.open(copy) { showToast(L("No app on this Mac opens %@", "\(name).html")) }
+        } catch {
+            showError(error, prefix: L("Export failed"))
+        }
+    }
+
     func consumePendingFile() -> String? {
         defer { pendingFilePath = nil }
         return pendingFilePath

@@ -277,6 +277,24 @@ struct APIClient {
         return data
     }
 
+    /// A study as one HTML file — the report, then the pages, its charts as
+    /// numbered figures — to read, save or print. An older service answers 404.
+    func studyExport(id: String) async throws -> Data {
+        let study = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        var request = URLRequest(url: try url(for: "/api/research/studies/\(study)/export"))
+        request.timeoutInterval = 120
+        workspaceHeaders(&request)
+        authorize(&request)
+        let (data, response) = try await urlSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError(message: "The service returned an invalid response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw failure(data, http, fallback: http.statusCode == 404 ? "This service cannot export studies yet — update it" : nil)
+        }
+        return data
+    }
+
     /// The wiki pages citing a raw/docs file. An older service answers 404.
     func fileCitations(at filePath: String) async throws -> FileCitationsResponse {
         try await send(path("/api/file/citations", query: [.init(name: "path", value: filePath)]))

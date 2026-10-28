@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { saveAgent } from '../src/research/agents.js';
 import { readManifest, registerPath, waitForCaptureIndexing } from '../src/research/capture.js';
-import { checkCharts, parseChart } from '../src/research/chart.js';
+import { checkCharts, parseChart, timelineDate } from '../src/research/chart.js';
 import { claimNextJob, getJob, listJobs } from '../src/research/jobs.js';
 import { localizeNoteHeadings, normalizeBrief, noteHeadings, refineBrief, sourceMarker, sourcesHeading } from '../src/research/refine.js';
 import { runResearchJob } from '../src/research/runner.js';
@@ -168,6 +168,58 @@ describe('charts', () => {
     expect(checkCharts('# x\n\n```chart\n{not json\n```\n').errors[0]).toMatch(/line 3: not valid JSON/);
     expect(checkCharts('```json\n{"a":1}\n```').count).toBe(0);
   });
+
+  const check = (o: Record<string, unknown>) => parseChart(JSON.stringify({ title: 'T', source: 'raw/docs/x.md', ...o }));
+
+  it('reads market shares, and warns when percentages lose a part', () => {
+    const shares = { type: 'share', unit: '%', x: ['2024', '2025'], series: [{ name: 'Samsung', values: [41, 34.1] }, { name: 'SK hynix', values: [34.5, 36.5] }, { name: 'Micron', values: [21.5, 23.5] }, { name: 'Others', values: [3, 5.9] }] };
+    expect(check(shares)).toMatchObject({ errors: [], warnings: [] });
+    const short = check({ ...shares, series: shares.series.slice(0, 3) });
+    expect(short.errors).toEqual([]);
+    expect(short.warnings[0]).toMatch(/the 2024 shares add up to 97%, not 100 — add an "Other" series/);
+    // amounts are fine (the chart works the shares out); negatives and an empty column are not
+    expect(check({ ...shares, unit: 'USD bn', series: shares.series.slice(0, 2) }).warnings).toEqual([]);
+    expect(check({ ...shares, unit: 'USD bn', series: shares.series.slice(0, 1) }).warnings).toEqual(['"T": a share chart of one series fills every column — add the others, or draw it as bars']);
+    expect(check({ type: 'share', x: ['a', 'b'], series: [{ name: 'A', values: [-1, 0] }, { name: 'B', values: [2, null] }] }).errors).toEqual(['share values must not be negative', 'share: "b" has nothing to share out (every value is empty or zero)']);
+  });
+
+  it('takes a scatter as two measures over named points', () => {
+    const scatter = { type: 'scatter', x: ['SK hynix', 'Samsung', 'Micron'], series: [{ name: 'Revenue growth, %', values: [48, 22, null] }, { name: 'Forward P/E', values: [7.5, 11.2, 9.8] }] };
+    const ok = check(scatter);
+    expect(ok.errors).toEqual([]);
+    expect(ok.warnings).toEqual(['scatter: 1 of 3 points lack one of the two values and are left out']);
+    expect(check({ ...scatter, series: scatter.series.slice(0, 1) }).errors).toEqual(['a scatter takes two series, the horizontal measure first and then the vertical one (1 given)']);
+    expect(check({ ...scatter, series: [scatter.series[0], { name: 'P/E', values: [null, 1, 2] }] }).errors).toEqual(['a scatter needs at least two points with both values']);
+  });
+
+  it('checks that a waterfall\'s steps add up to its levels', () => {
+    const walk = { type: 'waterfall', unit: 'pp', x: ['Q2', 'Price', 'Mix', 'Cost', 'Q3'], series: [{ name: 'Gross margin', values: [38.5, 6.2, 2.1, -1.4, 45.4] }] };
+    expect(check(walk)).toMatchObject({ errors: [], warnings: [] });
+    // one decimal each: four values carry 0.2 of rounding between them, no more
+    expect(check({ ...walk, series: [{ name: 'Gross margin', values: [38.5, 6.2, 2.1, -1.4, 45.6] }] }).warnings).toEqual([]);
+    expect(check({ ...walk, series: [{ name: 'Gross margin', values: [38.5, 6.2, 2.1, -1.4, 46] }] }).warnings).toEqual(['"T": the steps up to "Q3" add up to 45.4, but that bar says 46']);
+    // subtotals by label
+    const pnl = check({ type: 'waterfall', x: ['Revenue', 'Costs', 'Gross', 'Opex', 'EBIT'], totals: ['Revenue', 'Gross', 'EBIT'], series: [{ name: 'USD bn', values: [10, -6, 4, -1.5, 2.5] }] });
+    expect(pnl).toMatchObject({ errors: [], warnings: [] });
+    expect(pnl.spec?.totals).toEqual(['Revenue', 'Gross', 'EBIT']);
+    expect(check({ ...walk, totals: ['Q2', 'Q4'] }).errors).toEqual(['totals names "Q4", which is not one of the x labels']);
+    expect(check({ ...walk, series: [{ name: 'A', values: [1, null, 2, 3, 6] }] }).errors).toEqual(['a waterfall has no gaps — every bar is a level or a change (value 2 is null)']);
+    expect(check({ ...walk, series: [...walk.series, walk.series[0]] }).errors).toEqual(['a waterfall takes one series, its steps (2 given)']);
+  });
+
+  it('reads a timeline\'s values as dates and keeps them as written', () => {
+    const hbm = { type: 'timeline', x: ['HBM3E', 'HBM4', 'HBM4E'], series: [{ name: 'SK hynix', values: ['2024-03', 'Q4 2025', 2027] }, { name: 'Samsung', values: ['2024-Q4', '2026-h1', null] }] };
+    const ok = check(hbm);
+    expect(ok).toMatchObject({ errors: [], warnings: [] });
+    expect(ok.spec?.series.map((s) => s.values)).toEqual([['2024-03', '2025-Q4', 2027], ['2024-Q4', '2026-H1', null]]);
+    expect(timelineDate('2025-Q4')).toEqual({ at: 2025.75, text: '2025-Q4' });
+    expect(timelineDate('2026-H2')).toEqual({ at: 2026.5, text: '2026-H2' });
+    for (const bad of ['Mar 2024', '2026-13', '2026-H3', 1850, true]) expect(timelineDate(bad), String(bad)).toBeUndefined();
+    expect(check({ ...hbm, series: [{ name: 'Micron', values: ['2024-02', 'next year', null] }] }).errors).toEqual([
+      'series "Micron": a timeline\'s values are dates — a year (2025), "2025-03", "2025-Q4", "2026-H1" — or null',
+    ]);
+    expect(check({ ...hbm, series: [{ name: 'Micron', values: ['2026', '2025-Q2', null] }] }).warnings[0]).toMatch(/Micron reaches "HBM4" \(2025-Q2\) before "HBM3E" \(2026\)/);
+  });
 });
 
 describe('a study, end to end', () => {
@@ -214,6 +266,7 @@ describe('a study, end to end', () => {
     const collectPrompt = fs.readFileSync(path.join(wsDir, '.runs', `${studyId}-collect`, 'prompt-collect.md'), 'utf8');
     expect(collectPrompt).toContain('正文出处写 `(Source: raw/docs/…)`');
     expect(collectPrompt).toContain('`## Findings` / `## Data` / `## Views` / `## Gaps`');
+    expect(collectPrompt).not.toContain('### 图表'); // collectors write notes, not charts
     expect(note).toMatch(/sources: \["raw\/docs\/research\/anthropic-ipo-deep-dive\/web\//);
     // the seed and both collectors' pages are captured, in the manifest and the register
     const captured = readManifest(wsDir).entries.filter((e) => e.studies.some((s) => s.id === studyId));
@@ -246,6 +299,9 @@ describe('a study, end to end', () => {
       expect(brief).toContain('raw/docs/research/anthropic-ipo-deep-dive/sources.md');
       expect(brief).toContain('正文出处写 `(Source: raw/docs/…)`');
       expect(brief).not.toContain('笔记的四个固定标题'); // a page writes no notes
+      // the chart types, the newer ones too: a workspace's seeded templates may predate them
+      expect(brief).toContain('### 图表（```chart 块）');
+      for (const type of ['- share：', '- scatter：', '- waterfall：', '- timeline：']) expect(brief).toContain(type);
     }
     expect(await continueStudies(ctx)).toBe(1);
     const study = await getJob(ctx.store, studyId);
@@ -290,6 +346,59 @@ describe('a study, end to end', () => {
     expect(refused.status).toBe(400);
   });
 
+  it('exports the finished study as one HTML file: the report, then the pages, figures numbered', async () => {
+    const res = await app.request(`/api/research/studies/${studyId}/export`, { headers });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('text/html; charset=utf-8');
+    expect(res.headers.get('content-disposition')).toBe(`inline; filename="anthropic-ipo-deep-dive.html"; filename*=UTF-8''anthropic-ipo-deep-dive.html`);
+    expect(res.headers.get('content-security-policy')).toMatch(/^sandbox allow-popups allow-popups-to-escape-sandbox; default-src 'none'; style-src 'unsafe-inline'/);
+    const html = await res.text();
+    expect(html.startsWith('<!doctype html>\n<html lang="en">')).toBe(true);
+    expect(html).toContain('<title>Anthropic IPO deep dive</title>');
+    expect(html).toContain(`<meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; style-src &#39;unsafe-inline&#39;;`);
+    // self-contained and inert: styles inline, no script, nothing fetched
+    expect(html).not.toMatch(/<script|<link |<iframe| on[a-z]+=|javascript:/i);
+    expect(html).toContain('@media print');
+    // the report first, then the pages in the brief's order
+    const order = ['wiki/research/anthropic-ipo-deep-dive.md', 'wiki/research/anthropic-ipo-deep-dive/revenue-and-costs.md', 'wiki/research/anthropic-ipo-deep-dive/competitors.md'].map((p) => html.indexOf(`<code>${p}</code>`));
+    expect(order.every((at) => at > 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(html).toContain('<nav class="toc" aria-labelledby="toc-title"><h2 id="toc-title">Contents</h2><ol><li><a href="#d0">');
+    expect(html).toContain('<a href="#d1-2">Revenue model</a>');
+    // a figure per chart, numbered through the file, drawn as SVG with its source under it
+    expect(html.match(/<figure class="kchart kchart-bar" data-kchart="bar" id="fig-\d+">/g)).toHaveLength(3);
+    expect(html).toContain('<figcaption class="kchart-head"><span class="kchart-num">Figure 1</span><span class="kchart-title">Revenue by year</span></figcaption>');
+    expect(html).toContain('<svg class="kchart-svg"');
+    expect(html).not.toContain('class="kc-hits"');
+    expect(html).toMatch(/<p class="kchart-source"><span class="kchart-label">Source<\/span> raw\/docs\/research\/anthropic-ipo-deep-dive\//);
+    expect(html).toContain('<li><a href="#fig-3">Figure 3</a> Revenue by year');
+    // what was captured, numbered, and how much of it a person has reviewed: nothing yet
+    expect(html.match(/<li id="src-\d+">/g)).toHaveLength(3);
+    expect(html).toContain('3 of the 3 documents are not reviewed');
+    // a capture the text cites as a path links to its entry there
+    const report = path.join(wsDir, 'wiki/research/anthropic-ipo-deep-dive.md');
+    const written = fs.readFileSync(report, 'utf8');
+    const { captures } = await studyView(ctx, (await getJob(ctx.store, studyId))!);
+    try {
+      fs.writeFileSync(report, `${written}\nAs filed (Source: \`${captures[1].path}#e-1\`).\n`);
+      const cited = await (await app.request(`/api/research/studies/${studyId}/export`, { headers })).text();
+      expect(cited).toContain(`<a class="path-link" href="#src-2" title="${captures[1].path}#e-1"><code>…/${captures[1].path.split('/').slice(-2).join('/')}#e-1</code></a>`);
+      expect(cited).toContain(`<li id="src-2"><span class="src-title">`);
+    } finally {
+      fs.writeFileSync(report, written);
+    }
+
+    // a link opened in a tab names its workspace in the query, as an original's does; ?download=1 saves it
+    const linked = await app.request(`/api/research/studies/${studyId}/export?user=admin&kind=personal&id=default&name=Default&download=1`);
+    expect(linked.status).toBe(200);
+    expect(linked.headers.get('content-disposition')).toMatch(/^attachment; filename="anthropic-ipo-deep-dive.html"/);
+    expect((await app.request('/api/research/studies/r_0000000000/export', { headers })).status).toBe(404);
+    const draft = await createStudy(ctx, { topic: 'A study that has written nothing yet, to export.', refine: false, runner: { agent: 'fake' } });
+    const empty = await app.request(`/api/research/studies/${draft.id}/export`, { headers });
+    expect(empty.status).toBe(409);
+    expect(((await empty.json()) as { error: string }).error).toMatch(/nothing to export yet/);
+  });
+
   it('promotes what the study produced, says what changed, and offers nothing once all of it is trusted', async () => {
     type Tiers = { trusted: number; quarantined: number; unindexed: number };
     type View = { pages: { trust: string | null }[]; reportTrust: string | null; tiers: { pages: Tiers; sources: Tiers } };
@@ -319,5 +428,61 @@ describe('a study, end to end', () => {
     expect((await view()).tiers.sources).toMatchObject({ quarantined: 0, trusted: before.tiers.sources.trusted + before.tiers.sources.quarantined });
     expect((await promote({ what: 'everything' })).status).toBe(400);
     expect((await promote({ what: 'pages', to: 'public' })).status).toBe(400);
+  });
+});
+
+describe('a study export', () => {
+  it('makes a page\'s links work inside the file, and leaves out what has nowhere to go', async () => {
+    const draft = await createStudy(ctx, { topic: '内存芯片行业：份额、估值与 HBM 路线图。', refine: false, runner: { agent: 'fake' } });
+    const brief = normalizeBrief({
+      title: '内存芯片行业', language: 'zh', objective: '看清三家内存厂的份额、估值与 HBM 节奏。',
+      pages: [{ id: 'p1', title: '市场份额', slug: 'share', sections: ['## 份额'] }, { id: 'p2', title: 'HBM 路线图', slug: 'hbm', sections: ['## 路线图'] }],
+      questions: [{ id: 'q1', text: '谁的份额在涨？', page: 'p1' }, { id: 'q2', text: '谁先量产 HBM4？', page: 'p2' }],
+    }, { topic: 'x', maxPages: 4 });
+    const job = await updateStudy(ctx, draft.id, { brief });
+    const slug = job.target!;
+    const write = (rel: string, text: string) => {
+      fs.mkdirSync(path.dirname(path.join(wsDir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(wsDir, rel), text);
+    };
+    const share = JSON.stringify({ type: 'share', title: 'DRAM 份额', unit: '%', x: ['2024', '2025'], series: [{ name: '三星', values: [41, 34] }, { name: 'SK 海力士', values: [35, 37] }, { name: '其他', values: [24, 29] }], source: 'raw/docs/research/x/files/trendforce.pdf' });
+    write(`wiki/research/${slug}/share.md`, `---\ntitle: 市场份额\n---\n# 市场份额\n\n## 份额\n\n海力士领先[^a]，见 [[research/${slug}/hbm|HBM 路线图]] 与 [[research/${slug}|总报告]]，也见 [[entities/samsung|三星]]（来源：\`raw/docs/research/${slug}/web/a.html#p3\`；\`raw/docs/other.md\`）。\n\n| 厂商 | 份额 |\n| --- | ---: |\n| 三星 | 34% |\n\n[官网](https://example.com/a) · [内部](../notes.md) · ![图](local.png)\n\n\`\`\`chart\n${share}\n\`\`\`\n\n[^a]: TrendForce 2025 年数据。\n`);
+    // the report is not written yet; the export still carries the page, and says what is missing
+    const { exportStudy } = await import('../src/research/export.js');
+    const { html, figures, documents } = await exportStudy(ctx, job, new Date('2026-10-28T09:30:00Z'));
+    expect({ figures, documents }).toEqual({ figures: 1, documents: 1 });
+    expect(html.startsWith('<!doctype html>\n<html lang="zh">')).toBe(true);
+    expect(html).toContain('<h2 id="toc-title">目录</h2>');
+    expect(html).toContain('<p class="notice">尚未写成：');
+    expect(html).toContain('导出于');
+    expect(html).toContain('2026-10-28 09:30 UTC');
+    // the study's own pages land inside the file; a page not exported, and any other note, read as text
+    expect(html).toContain('<span class="wikilink">HBM 路线图</span>');
+    expect(html).toContain('<span class="wikilink">总报告</span>');
+    expect(html).toContain('<span class="wikilink">三星</span>');
+    // a path not among the captures is shown whole; footnotes link both ways inside the document
+    expect(html).toContain(`<code title="raw/docs/other.md">raw/docs/other.md</code>`);
+    expect(html).toContain('<sup class="fn-ref" id="d0-fnref-1"><a href="#d0-fn-1" title="TrendForce 2025 年数据。">[1]</a></sup>');
+    expect(html).toContain('<li class="fn" id="d0-fn-1"><span class="fn-num">[1]</span>');
+    expect(html).toContain('<a href="#d0-fnref-1" class="fn-back">↩</a>');
+    // the web opens in a tab; a workspace-relative link or picture has nothing to point at here
+    expect(html).toContain('<a href="https://example.com/a" target="_blank" rel="noopener noreferrer">官网</a>');
+    expect(html).toContain('<span class="link">内部</span>');
+    expect(html).toContain('<span class="image-missing">[图]</span>');
+    expect(html).toContain('<td align="right">34%</td>');
+    expect(html).toContain('<figcaption class="kchart-head"><span class="kchart-num">图 1</span><span class="kchart-title">DRAM 份额</span></figcaption>');
+    expect(html).toContain('<span class="kchart-label">来源</span> raw/docs/research/x/files/trendforce.pdf');
+    expect(html).not.toMatch(/data-wikilink|data-fn=|href="#"[ >]/);
+
+    // once the second page and the report exist, the links between them land on them
+    write(`wiki/research/${slug}/hbm.md`, `# HBM 路线图\n\n## 路线图\n\n回到 [[research/${slug}/share|份额]]。\n`);
+    write(`wiki/research/${slug}.md`, `# 总报告\n\n## 结论\n\n见 [[research/${slug}/hbm]]。\n`);
+    const full = (await exportStudy(ctx, job)).html;
+    expect(full.indexOf('<article class="doc" id="d0">')).toBeLessThan(full.indexOf('<code>wiki/research/'));
+    expect(full).toContain(`<code>wiki/research/${slug}.md</code>`);
+    expect(full).toContain('<a class="wikilink" href="#d2">hbm</a>');
+    expect(full).toContain('<a class="wikilink" href="#d1">份额</a>');
+    expect(full).toContain('<a class="wikilink" href="#d2">HBM 路线图</a>');
+    expect(full).not.toContain('尚未写成');
   });
 });

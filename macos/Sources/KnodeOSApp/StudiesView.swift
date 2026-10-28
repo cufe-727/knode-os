@@ -234,6 +234,10 @@ struct StudiesView: View {
                 if let n = d.tiers?.sources.quarantined, n > 0 {
                     Button(L("Promote sources (%@)", String(n))) { Task { await promote(d, what: "sources") } }
                 }
+                if d.reportExists || d.pages.contains(where: { $0.status == "done" }) {
+                    Button(L("Export")) { Task { await model.openStudyExport(id: d.job.id, slug: d.payload.brief.slug) } }
+                        .help(L("The report and its pages as one HTML file, its charts as numbered figures: read it, save it, or print it to PDF"))
+                }
             }
             if let error = d.job.error {
                 Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)

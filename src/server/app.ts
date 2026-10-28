@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
 import { Context, Hono } from 'hono';
 import { LabelingScheduler } from '../labeling/scheduler.js';
 import { LocalLabelingWorkers } from '../labeling/local.js';
@@ -12,6 +11,7 @@ import { accountMayOpenTeam } from '../auth/accounts.js';
 import { AuthEnv, authMiddleware, existingTeams, mountAuthRoutes, mountGateways } from '../auth/http.js';
 import { AuthService } from '../auth/service.js';
 import { contentSecurityPolicy } from './csp.js';
+import { findMarkedUmd, findWebDir } from '../web-assets.js';
 import { OriginalError, readOriginal } from './originals.js';
 import { publicGuard } from './public-guard.js';
 import { AppContext, judgeLlmClient } from '../context.js';
@@ -144,6 +144,7 @@ import { recommendWikiTopics, refreshRecommendations } from '../research/recomme
 import { captureUrl, readManifest } from '../research/capture.js';
 import { deleteResearchSource, loadResearchSources, redactSource, RESEARCH_SOURCE_KINDS, saveResearchSource, sourceProblem } from '../research/sources.js';
 import { cancelStudy, createStudy, deleteStudyDraft, listStudies, promoteStudy, refineStudyInBackground, refiningSince, startProblem, startStudy, StudyFiles, studyView, updateStudy, studyPayload } from '../research/study.js';
+import { EXPORT_POLICY, exportStudy, StudyExportError } from '../research/export.js';
 import { webSearchEnabled, WEB_SEARCH_PROVIDERS } from '../research/web.js';
 import { lintWiki } from '../wiki/lint.js';
 import { listNotices } from './notices.js';
@@ -162,8 +163,6 @@ function csv(value: string | undefined): string[] | undefined {
   const out = value.split(',').map((x) => x.trim()).filter(Boolean);
   return out.length > 0 ? out : undefined;
 }
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 type ExtractionConfigDraft = {
   entityLlm?: Partial<RoutedLlmConfig>;
@@ -460,8 +459,8 @@ export function createApp(
 
   app.use('/api/*', async (c, next) => {
     if (c.req.path === '/api/health' || c.req.path === '/api/workspaces' || c.req.path.startsWith('/api/auth/')) return next();
-    // a link opened in a tab cannot send headers: an original names its workspace in the query
-    const linked = c.req.path === '/api/file/original' && c.req.method === 'GET';
+    // a link opened in a tab cannot send headers: an original, or a study's export, names its workspace in the query
+    const linked = c.req.method === 'GET' && (c.req.path === '/api/file/original' || /^\/api\/research\/studies\/[^/]+\/export$/.test(c.req.path));
     const named = (header: string, query: string) => c.req.header(header) ?? (linked ? c.req.query(query) : undefined);
     try {
       const scope = resolveWorkspaceScope({
@@ -2448,6 +2447,29 @@ export function createApp(
     return c.json({ label, log, labels });
   });
 
+  // the study as one HTML file to read, save or print: the report, then the pages (src/research/export.ts)
+  app.get('/api/research/studies/:id/export', async (c) => {
+    const ctx = requestCtx(c);
+    const job = await studyOr404(ctx, c.req.param('id'));
+    if (!job) return c.json({ error: 'no such study' }, 404);
+    try {
+      const { html, filename } = await exportStudy(ctx, job);
+      const ascii = filename.replace(/[^\x20-\x7e]|["\\]/g, '_');
+      return c.body(html, 200, {
+        'content-type': 'text/html; charset=utf-8',
+        'content-disposition': `${c.req.query('download') === '1' ? 'attachment' : 'inline'}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+        // what agents wrote, as a page of its own: a sandbox (a unique origin, no script), styles inline, pictures from the web
+        'content-security-policy': `sandbox allow-popups allow-popups-to-escape-sandbox; ${EXPORT_POLICY}; frame-ancestors 'none'`,
+        'x-content-type-options': 'nosniff',
+        'x-frame-options': 'DENY',
+        'referrer-policy': 'no-referrer',
+        'cache-control': 'private, no-cache',
+      });
+    } catch (e) {
+      return c.json(err(e), e instanceof StudyExportError ? e.status : 500);
+    }
+  });
+
   // a person saves a web page or file into the knowledge base (into a study, or on its own)
   app.post('/api/research/capture', async (c) => {
     const ctx = requestCtx(c);
@@ -2731,31 +2753,6 @@ export function createApp(
   });
 
   return app;
-}
-
-function findWebDir(): string | null {
-  for (const candidate of [
-    path.resolve(__dirname, '../../web'), // dist/server → package root
-    path.resolve(__dirname, '../../../web'),
-    path.resolve(process.cwd(), 'web'),
-  ]) {
-    if (fs.existsSync(path.join(candidate, 'index.html'))) return candidate;
-  }
-  return null;
-}
-
-function findMarkedUmd(): string | null {
-  try {
-    const require = createRequire(import.meta.url);
-    const entry = require.resolve('marked'); // .../marked/lib/marked.cjs
-    for (const name of ['marked.umd.js', 'marked.cjs']) {
-      const p = path.join(path.dirname(entry), name);
-      if (fs.existsSync(p)) return p;
-    }
-  } catch {
-    /* not installed */
-  }
-  return null;
 }
 
 /** d3's browser bundle: the package exports only its ES entry, and `dist/` sits beside that entry's `src/`. */

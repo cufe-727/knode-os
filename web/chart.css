@@ -59,6 +59,14 @@
 .kchart .kc-s6 { color: var(--kc-s6); }
 .kchart .kc-s7 { color: var(--kc-s7); }
 .kchart .kc-s8 { color: var(--kc-s8); }
+/*
+ * A waterfall's changes: aqua up, orange down — the palette's slots 3 and 2,
+ * apart under every colour-vision deficiency the palette was checked for, and
+ * never the only cue: a rise floats up from the level before it, its label
+ * signed. Its levels wear the series' own slot 1.
+ */
+.kchart .kc-up { color: var(--kc-s3); }
+.kchart .kc-down { color: var(--kc-s2); }
 
 /* title, subtitle and legend: HTML above the plot, so they stay their size as the plot scales */
 .kchart-head { display: flex; flex-direction: column; gap: 1px; margin: 0 0 10px; }
@@ -91,6 +99,11 @@
 .kchart .kc-cat { font-variant-numeric: normal; }
 .kchart .kc-row { fill: var(--kc-ink-2); font-size: 11px; }
 .kchart .kc-unit { fill: var(--kc-ink-3); font-size: 11px; }
+/* a scatter's two measures, named at the top of its vertical axis and the end of its horizontal one */
+.kchart .kc-axis-title { fill: var(--kc-ink-2); font-size: 11px; font-weight: 600; }
+/* a waterfall's level carried on to the next bar; a timeline's row from its first date to its last */
+.kchart .kc-link { fill: none; stroke: var(--kc-ink-3); stroke-width: 1px; stroke-dasharray: 2 3; stroke-opacity: 0.8; vector-effect: non-scaling-stroke; }
+.kchart .kc-track { fill: none; stroke: currentColor; stroke-width: 2px; stroke-opacity: 0.35; stroke-linecap: round; vector-effect: non-scaling-stroke; }
 
 /* marks: thin bars with a rounded data end, 2px lines, washes at a tenth, dots ringed in the surface */
 .kchart .kc-bar { fill: currentColor; transition: opacity 0.12s; }
@@ -107,8 +120,10 @@
 .kchart .kc-hover { display: none; pointer-events: none; }
 .kchart .kc-hover.kc-on { display: inline; }
 .kchart .kc-hover .kc-off { display: none; }
-.kchart .kc-hovering .kc-bar { opacity: 0.55; }
-.kchart .kc-hovering .kc-bar.kc-hot { opacity: 1; }
+.kchart .kc-hovering .kc-bar,
+.kchart .kc-hovering .kc-mark { opacity: 0.55; transition: opacity 0.12s; }
+.kchart .kc-hovering .kc-bar.kc-hot,
+.kchart .kc-hovering .kc-mark.kc-hot { opacity: 1; }
 
 .kchart-tip {
   position: absolute; z-index: 5; top: 0; left: 0;
@@ -126,6 +141,7 @@
 .kchart-tip-total .kchart-tip-key { background: transparent; }
 .kchart-tip-val { color: var(--kc-ink); font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .kchart-tip-unit { color: var(--kc-ink-3); font-size: 11px; white-space: nowrap; }
+.kchart-tip-share { color: var(--kc-ink-2); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .kchart-tip-name { min-width: 0; margin-left: 2px; overflow: hidden; color: var(--kc-ink-3); text-overflow: ellipsis; white-space: nowrap; }
 .kchart-tip-row.kc-hot .kchart-tip-name { color: var(--kc-ink-2); }
 
@@ -157,6 +173,7 @@
 .kchart .kchart-table th:last-child,
 .kchart .kchart-table td:last-child { padding-right: 0; }
 .kchart .kchart-table .kc-gap { color: var(--kc-ink-3); }
+.kchart .kchart-table .kc-pct { color: var(--kc-ink-3); }
 
 /* a block that could not be drawn: why, above the JSON as written */
 .kchart-error {
