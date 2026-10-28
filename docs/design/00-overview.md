@@ -224,6 +224,10 @@ regeneration and is itself a source.
   base, MCP / API / site sources, or a deep-research model) into originals
   under raw/docs/research that the pipeline converts and indexes, written up as
   one page per part plus a report, with charts as data blocks.
+- [18 — Estimates before a task starts: time, tokens, transfer, cost, and each plan's share](18-estimates.md)
+  — every leased call measured (tokens from Codex, Claude Code, Cursor and endpoints, time, bytes); the processing
+  and a study counted and costed before Start; Codex's windows read from Codex and calibrated on the account's
+  tokens, Cursor and Claude Code against what their plans include.
 - [16 — Time in the knowledge base: entries, mention timelines, measures and market data](16-time.md)
   — proposed: time belongs to entries (a post, comment or message at its
   minute, read from the export's headings); a census of mentions per entry;

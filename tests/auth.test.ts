@@ -415,6 +415,8 @@ describe('sign-in in front of serve', () => {
       'DELETE /api/workspace',
       'GET /api/auth/gateways',
       'GET /api/auth/users',
+      // the machine's own Codex and Cursor accounts: plan, windows, credits
+      'GET /api/usage',
       'PATCH /api/auth/users/:username',
       'POST /api/auth/gateways',
       'POST /api/auth/users',

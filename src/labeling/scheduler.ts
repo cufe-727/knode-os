@@ -18,6 +18,7 @@ import {
 } from '../graph/tier1.js';
 import { ChatMessage, jsonFromReply } from '../llm/client.js';
 import { renderCliPrompt } from '../llm/cli.js';
+import type { CallUsage } from '../llm/usage.js';
 import { Store } from '../store/db.js';
 import { claimDocument, heldDocuments, releaseDocument } from './claims.js';
 import { classifyFailure, FailureKind } from './failures.js';
@@ -65,9 +66,10 @@ export interface WorkerIdentity {
   remote: boolean;
 }
 
+/** `usage` is what the provider said the call used, when it said (src/llm/usage.ts). */
 export type TaskOutcome =
-  | { ok: true; text: string; model?: string }
-  | { ok: false; error: string; kind?: FailureKind; model?: string };
+  | { ok: true; text: string; model?: string; usage?: CallUsage }
+  | { ok: false; error: string; kind?: FailureKind; model?: string; usage?: CallUsage };
 
 export interface CompleteResult {
   accepted: boolean;

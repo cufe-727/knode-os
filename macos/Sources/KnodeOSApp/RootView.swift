@@ -649,6 +649,15 @@ private struct ProcessingPanel: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            // starting spends model calls: what it would take, before anyone presses Start
+            if !running && status?.processing != nil {
+                Divider()
+                ScrollView {
+                    EstimateSection { try await model.client().processingEstimate() }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 380)
+            }
             HStack {
                 if !model.maySaveSettings {
                     Text(L("An administrator starts and stops processing.")).font(.caption).foregroundStyle(.secondary)
@@ -668,7 +677,7 @@ private struct ProcessingPanel: View {
             }
         }
         .padding(16)
-        .frame(width: 380)
+        .frame(width: running ? 380 : 460)
         .task { await model.refreshStats() }
     }
 

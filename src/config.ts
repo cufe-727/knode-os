@@ -909,6 +909,25 @@ export interface KnodeConfig {
    * screen does not edit it.
    */
   plugins?: PluginSpec[];
+  /** What estimates price calls at and compare them with (docs/design/18). File-only. */
+  usage?: UsageConfig;
+}
+
+/**
+ * Prices and plan allowances for estimates (src/estimate). Everything is
+ * optional: without it an estimate prices only the models it knows, and
+ * shows a plan's share only where the service reports its own use (Codex).
+ */
+export interface UsageConfig {
+  /** US dollars per million tokens, by model name — exact, or a prefix ending in `*` — over the built-in table. */
+  prices?: Record<string, { input: number; cachedInput: number; cacheWrite?: number; output: number }>;
+  /** What a plan includes, in usage at API prices, for a service that does not report its own use. */
+  allowances?: {
+    cursor?: { monthlyUsd?: number };
+    claude?: { fiveHourUsd?: number; weeklyUsd?: number };
+  };
+  /** Read the Codex account's limits through `codex app-server` (no model call). Default on. */
+  codexLimits?: boolean;
 }
 
 export const CONFIG_FILE = 'knode.config.json';

@@ -9,6 +9,7 @@ import { isHiddenName } from '../fs/files.js';
 import { RAW_DOCS, RAW_SKILLS, WIKI_DIR } from '../fs/layout.js';
 import { TreeWatcher, watchTree } from '../fs/watch.js';
 import { nightlySchedule, startDreamScheduler } from '../dream/dream.js';
+import { CallLedger } from '../estimate/ledger.js';
 import { startFollowUp } from '../labeling/followup.js';
 import { judgesHere, LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
@@ -133,6 +134,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
       services.set(workspaceCtx.dataDir, {
         mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders,
         labeling: started.labeling, work: started.work, localWorkers: started.localWorkers, processing: started.processing, translations: started.translations,
+        calls: started.calls,
       });
       return async () => {
         services.delete(workspaceCtx.dataDir);
@@ -490,6 +492,7 @@ interface StartedServices {
   localWorkers: LocalLabelingWorkers;
   processing: LabelingProcessing;
   translations: TranslateSource;
+  calls: CallLedger;
 }
 
 function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null; rootDataDir?: string } = {}): StartedServices {
@@ -582,7 +585,9 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   summaries = new SummarySource(ctx, { serialize: followUp.serialize, log }, { leaseMs });
   // translations into the content languages (docs/design/17): idle while they are off
   const translations = new TranslateSource({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, log }, { leaseMs });
-  const work = new WorkBroker([labeling, summaries, judges, translations], { shares: () => ctx.config.server.remote?.shares });
+  // every answered call is measured, so the next estimate learns from it (docs/design/18)
+  const calls = CallLedger.forWorkspace(ctx.dataDir, { log });
+  const work = new WorkBroker([labeling, summaries, judges, translations], { shares: () => ctx.config.server.remote?.shares, ledger: calls });
   remoteJudge.askedLately = () => work.askedLately('judge', 2 * 60_000);
   const localWorkers = new LocalLabelingWorkers(work, () => ctx.config, { log });
   const processing = new LabelingProcessing(localWorkers, followUp, log);
@@ -628,6 +633,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       followUp.stop();
       localWorkers.stop();
       await work.stop();
+      calls.flush();
       clearInterval(flushTimer);
       clearInterval(dreamTimer);
       clearInterval(tier2Timer);
@@ -646,6 +652,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     localWorkers,
     processing,
     translations,
+    calls,
   };
 }
 

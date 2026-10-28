@@ -2,6 +2,7 @@ import os from 'node:os';
 import { KnodeConfig, LlmConfig, resolveRoutedLlmConfig, routeTargets } from '../config.js';
 import { contentLanguages } from '../lang/languages.js';
 import { LlmClient } from '../llm/client.js';
+import type { CallUsage } from '../llm/usage.js';
 import { WorkTask } from '../work/broker.js';
 import { WorkKind } from '../work/kinds.js';
 import { BackendHealth, classifyFailure, newBackendHealth, recordBackendOutcome } from './failures.js';
@@ -289,13 +290,16 @@ export class LocalLabelingWorkers {
     const leaseMs = Date.parse(task.leaseExpiresAt) - Date.now();
     const renew = setInterval(() => this.work.renew([task.id], who), Math.max(5_000, Math.floor((Number.isFinite(leaseMs) ? leaseMs : 60_000) / 3)));
     renew.unref?.();
+    // what the provider says the call used, for the estimates' ledger (src/estimate/ledger.ts)
+    let usage: CallUsage | undefined;
+    const onUsage = (u: CallUsage) => { usage = u; };
     try {
       this.log(`${task.kind === 'extract' ? 'tier1 extract' : task.kind} ${task.label} · ${backend.id}`);
-      const text = await backend.client.complete(task.messages, { json: task.json, maxTokens: task.maxTokens });
-      return { ok: true, text, model: backend.client.label };
+      const text = await backend.client.complete(task.messages, { json: task.json, maxTokens: task.maxTokens, onUsage });
+      return { ok: true, text, model: backend.client.label, ...(usage ? { usage } : {}) };
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
-      return { ok: false, error, kind: classifyFailure(error), model: backend.client.label };
+      return { ok: false, error, kind: classifyFailure(error), model: backend.client.label, ...(usage ? { usage } : {}) };
     } finally {
       clearInterval(renew);
       backend.busy--;

@@ -44,6 +44,12 @@ import { loadResearchSources, sourceProblem } from './research/sources.js';
 import { continueStudies, createStudy, listStudies, refineStudy, startProblem, startStudy, cancelStudy, studyPayload, studyView, StudyRunner } from './research/study.js';
 import type { StudyBrief } from './research/refine.js';
 import { runDocumentPass } from './ingest/background.js';
+import type { TaskEstimate } from './estimate/estimate.js';
+import { formatEstimate } from './estimate/format.js';
+import { CallLedger } from './estimate/ledger.js';
+import { estimateProcessing } from './estimate/processing.js';
+import { quotaSources } from './estimate/quota.js';
+import { estimateStudy } from './estimate/study.js';
 import { REMOTE_SCOPES, RemoteScope, RemoteTokenStore } from './remote/tokens.js';
 import { WORK_KINDS } from './work/kinds.js';
 import { registerAuthCommands } from './auth/cli.js';
@@ -249,6 +255,34 @@ program
         console.log(JSON.stringify({ path: p, language: target, ...r }));
         if (r.status === 'failed') process.exitCode = 1;
       }
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+program
+  .command('estimate')
+  .description('what a task would take before it starts: model calls, tokens, time, transfer, cost at API prices, and the share of each plan (Codex, Cursor, Claude Code) — `processing` (extraction, reviews, summaries) or `study <id>`')
+  .argument('[task]', 'processing | study', 'processing')
+  .argument('[id]', "a study's id")
+  .option('--json', 'print the estimate as JSON')
+  .action(async (task: string, id: string | undefined, opts) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const quota = quotaSources(ctx.config);
+      let estimate: TaskEstimate;
+      if (task === 'study') {
+        const job = id ? await getJob(ctx.store, id) : null;
+        if (!job || job.kind !== 'study') throw new Error(id ? `no study ${id}` : 'name the study: knode-os estimate study <id>');
+        estimate = await estimateStudy({ store: ctx.store, config: ctx.config, job, quota, showBalance: true });
+      } else if (task === 'processing') {
+        // remote workers are known only to a running `serve`; from here the estimate counts this machine's slots
+        estimate = await estimateProcessing({ store: ctx.store, config: ctx.config, ledger: CallLedger.forWorkspace(ctx.dataDir), workers: [], quota, showBalance: true });
+      } else {
+        throw new Error(`no such task: ${task} (processing | study)`);
+      }
+      console.log(opts.json ? JSON.stringify(estimate, null, 2) : formatEstimate(estimate));
     } finally {
       await ctx.datasources.closeAll();
       await ctx.store.close();
