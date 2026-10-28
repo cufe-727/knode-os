@@ -105,6 +105,9 @@ const STRIKE_LIMIT = 5;
 const SCAN_SIZE = 64;
 /** Older documents whose language one look reads (schema v17 backfill). */
 const BACKFILL_BATCH = 500;
+/** The background pass reads smaller batches, with a pause between them for the service's other work. */
+const BACKGROUND_BATCH = 200;
+const BACKGROUND_PAUSE_MS = 100;
 const STALE_SCAN_MS = 5 * 60_000;
 
 const docKey = (path: string, target: string) => `${path}\u0000${target}`;
@@ -127,6 +130,7 @@ export class TranslateSource implements WorkSource {
   private due = 0;
   private quietUntil = 0;
   private chain: Promise<unknown> = Promise.resolve();
+  private backfilling: Promise<void> | null = null;
   private stopped = false;
   private readonly totals: TranslateStatus['totals'] = { calls: 0, ok: 0, failed: noFailures(), leasesExpired: 0, documents: 0, stale: 0 };
   private readonly recentCalls: number[] = [];
@@ -157,6 +161,40 @@ export class TranslateSource implements WorkSource {
   wake(): void {
     this.quietUntil = 0;
     this.candidates = [];
+    void this.backfill();
+  }
+
+  /**
+   * Read the language of the documents indexed before it was recorded
+   * (schema v17), in batches beside the service's other work. It reads
+   * files and calls no model, so it waits for nobody to start the
+   * processing — and until it is done neither the stage nor an estimate can
+   * tell which documents are foreign. Runs while content languages are on:
+   * from the start of `serve`, and from a save that turns them on.
+   */
+  backfill(): Promise<void> {
+    if (this.backfilling) return this.backfilling;
+    if (this.stopped || !contentLanguages(this.ctx.config()).on) return Promise.resolve();
+    const run = async () => {
+      let filled = 0;
+      try {
+        while (!this.stopped && contentLanguages(this.ctx.config()).on) {
+          const batch = await backfillLanguages(this.ctx.store, this.ctx.dataDir, BACKGROUND_BATCH);
+          filled += batch.filled;
+          // a batch short of full, or one that filled nothing (rows an apply holds), is the end of it
+          if (batch.read < BACKGROUND_BATCH || batch.filled === 0) break;
+          await new Promise((resolve) => setTimeout(resolve, BACKGROUND_PAUSE_MS));
+        }
+        if (filled) this.log(`translate: read the language of ${filled.toLocaleString('en-US')} documents indexed before it was recorded`);
+      } catch (err) {
+        this.log(`translate: language backfill failed: ${err instanceof Error ? err.message : err}`);
+      } finally {
+        this.backfilling = null;
+        this.quietUntil = 0;
+      }
+    };
+    this.backfilling = run();
+    return this.backfilling;
   }
 
   async lease(who: WorkerIdentity, max = 1): Promise<WorkTask[]> {
@@ -262,6 +300,8 @@ export class TranslateSource implements WorkSource {
   async stop(): Promise<void> {
     this.stopped = true;
     await this.locked(async () => {});
+    // a batch under way finishes its rows before the store closes
+    await this.backfilling;
     this.leases.clear();
     this.held.clear();
   }
@@ -307,11 +347,13 @@ export class TranslateSource implements WorkSource {
   private async scan(now: number): Promise<boolean> {
     if (now < this.quietUntil) return false;
     const languages = contentLanguages(this.ctx.config());
-    // documents indexed before their language was recorded are read once, a batch per look
-    const filled = await backfillLanguages(this.ctx.store, this.ctx.dataDir, BACKFILL_BATCH).catch((err) => {
-      this.log(`translate: language backfill failed: ${err instanceof Error ? err.message : err}`);
-      return 0;
-    });
+    // documents indexed before their language was recorded are read once, a batch per look — unless the background pass is at it
+    const batch = this.backfilling
+      ? { read: 0, filled: 0 }
+      : await backfillLanguages(this.ctx.store, this.ctx.dataDir, BACKFILL_BATCH).catch((err) => {
+        this.log(`translate: language backfill failed: ${err instanceof Error ? err.message : err}`);
+        return { read: 0, filled: 0 };
+      });
     const waiting = [...this.notBefore].filter(([, t]) => t > now);
     // a document with a segment out comes back through `requeue` when that call lands
     const exclude = new Set([...[...this.held.keys()].map(docKeyOfStep), ...waiting.map(([k]) => k)]);
@@ -320,7 +362,7 @@ export class TranslateSource implements WorkSource {
     this.due = count;
     this.candidates = due.map((d) => ({ doc: d.doc, target: d.target }));
     // nothing due: look again after a while — at once while older documents still wait to have their language read
-    if (due.length === 0) this.quietUntil = filled >= BACKFILL_BATCH ? now : Math.min(now + this.idleScanMs, ...waiting.map(([, t]) => t));
+    if (due.length === 0) this.quietUntil = batch.read >= BACKFILL_BATCH && batch.filled > 0 ? now : Math.min(now + this.idleScanMs, ...waiting.map(([, t]) => t));
     return due.length > 0;
   }
 

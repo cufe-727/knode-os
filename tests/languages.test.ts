@@ -13,7 +13,7 @@ import { detectLanguage, detectTextLanguage } from '../src/lang/detect.js';
 import { contentLanguages, normalizeLanguage, normalizeLanguagesConfig } from '../src/lang/languages.js';
 import { protectSpans, restoreSpans } from '../src/lang/protect.js';
 import {
-  dueTranslations, finishSegment, pendingSegments, planTranslation, recordTranslationState, splitFrontmatter, storeSegment, translateNow, translationRequest, translationRow,
+  backfillLanguages, dueTranslations, finishSegment, pendingSegments, planTranslation, recordTranslationState, splitFrontmatter, storeSegment, translateNow, translationRequest, translationRow,
 } from '../src/lang/translate.js';
 import { WorkerIdentity } from '../src/labeling/scheduler.js';
 import { LlmClient } from '../src/llm/client.js';
@@ -353,6 +353,16 @@ describe('the Translate stage as leased work', () => {
     expect(await source.complete(task.id, mac, { ok: true, text: toChinese(requestText(task.messages)) })).toEqual({ accepted: true });
     // a file without frontmatter gets none in its translation: the lines the index adds are not the reader's
     expect(readTranslation(ctx.dataDir, 'raw/docs/old.md', 'zh')?.body.startsWith('译文')).toBe(true);
+  });
+
+  it('reads older documents\' language and length in the background, with nobody leasing anything', async () => {
+    await ctx.store.query(`UPDATE documents SET language = NULL, chars = NULL WHERE path IN ('raw/docs/filing.md', 'raw/docs/post.md')`);
+    await source.backfill();
+    const rows = await ctx.store.query<{ path: string; language: string; chars: number }>(`SELECT path, language, chars FROM documents WHERE path IN ('raw/docs/filing.md', 'raw/docs/post.md') ORDER BY path`);
+    expect(rows.map((r) => [r.path, r.language])).toEqual([['raw/docs/filing.md', 'en'], ['raw/docs/post.md', 'zh']]);
+    expect(rows.every((r) => r.chars > 0)).toBe(true);
+    // nothing left to read: the next pass reads no file
+    expect(await backfillLanguages(ctx.store, ctx.dataDir)).toEqual({ read: 0, filled: 0 });
   });
 
   it('hands out nothing while content languages are off', async () => {

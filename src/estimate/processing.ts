@@ -173,12 +173,20 @@ export async function estimateProcessing(input: ProcessingEstimateInput): Promis
   const translation = { docs: 0, calls: 0, prompt: 0, output: 0 };
   if (languages.on) {
     const { due } = await dueTranslations(store, languages, { limit: 1_000_000 });
+    // a document indexed before its length was kept is measured by its chunks, as extraction and summaries are
+    const unsized = due.filter((d) => d.doc.chars === null || d.doc.chars === undefined).map((d) => d.doc.id);
+    const measured = new Map((unsized.length ? await store.query<{ id: string; chunks: number; tokens: string | number }>(
+      `SELECT document_id AS id, count(*)::int AS chunks, COALESCE(sum(token_count), 0)::bigint AS tokens FROM chunks WHERE document_id = ANY($1::text[]) GROUP BY document_id`,
+      [unsized],
+    ) : []).map((r) => [r.id, r]));
     for (const { doc } of due) {
       const source = doc.language || 'en';
-      const chars = doc.chars ?? 0;
-      if (chars <= 0) continue;
+      const perChar = translationTokensPerChar(source);
+      const chunks = measured.get(doc.id);
+      const text = typeof doc.chars === 'number' ? doc.chars * perChar : chunks ? textTokens(chunks) : 0;
+      if (text <= 0) continue;
+      const chars = typeof doc.chars === 'number' ? doc.chars : text / perChar;
       const calls = Math.max(1, Math.ceil(chars / (translationSegmentChars(source) * SEGMENT_FILL)));
-      const text = chars * translationTokensPerChar(source);
       translation.docs++;
       translation.calls += calls;
       translation.prompt += text + calls * TRANSLATE_SYSTEM_TOKENS;

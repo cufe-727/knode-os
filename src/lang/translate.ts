@@ -331,23 +331,31 @@ export async function withdrawTranslationRequest(q: Queryable, documentId: strin
 
 /**
  * Fill in the language of documents indexed before the column existed
- * (schema v17), reading each text once. A row an apply holds is left to it,
- * the next apply writes the column for good. '' records "no language".
+ * (schema v17), reading each text once — and its length where that was
+ * never kept either (schema v15), from the same read, so the stage's size
+ * limit and the estimates know it too. A cache fill, not a change of
+ * record: a row an apply holds is left to it, and the next apply writes both
+ * columns for good. '' records "no language". Says how many rows it read
+ * and how many it filled.
  */
-export async function backfillLanguages(q: Queryable, dataDir: string, limit = 500): Promise<number> {
+export async function backfillLanguages(q: Queryable, dataDir: string, limit = 500): Promise<{ read: number; filled: number }> {
   const rows = await q.query<Pick<DocumentRow, 'id' | 'path' | 'root' | 'sha256'>>(
     `SELECT id, path, root, sha256 FROM documents WHERE language IS NULL AND status = 'indexed' AND root = 'docs' AND kind = 'source' LIMIT $1`,
     [limit],
   );
+  let filled = 0;
   for (const row of rows) {
     const loaded = loadSourceText(dataDir, row.path, row.root);
     const language = loaded ? detectLanguage(loaded.text, parseFrontmatter(loaded.text).frontmatter) ?? '' : '';
-    await q.query(
-      `UPDATE documents SET language = $2 WHERE id IN (SELECT id FROM documents WHERE id = $1 AND sha256 = $3 AND language IS NULL FOR UPDATE SKIP LOCKED)`,
-      [row.id, language, row.sha256],
+    const updated = await q.query<{ id: string }>(
+      `UPDATE documents SET language = $2, chars = COALESCE(chars, $4::int)
+       WHERE id IN (SELECT id FROM documents WHERE id = $1 AND sha256 = $3 AND language IS NULL FOR UPDATE SKIP LOCKED)
+       RETURNING id`,
+      [row.id, language, row.sha256, loaded ? loaded.text.length : null],
     );
+    filled += updated.length;
   }
-  return rows.length;
+  return { read: rows.length, filled };
 }
 
 /** A document due a translation, and into which language. */
