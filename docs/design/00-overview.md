@@ -224,3 +224,10 @@ regeneration and is itself a source.
   base, MCP / API / site sources, or a deep-research model) into originals
   under raw/docs/research that the pipeline converts and indexes, written up as
   one page per part plus a report, with charts as data blocks.
+- [16 — Time in the knowledge base: entries, mention timelines, measures and market data](16-time.md)
+  — proposed: time belongs to entries (a post, comment or message at its
+  minute, read from the export's headings); a census of mentions per entry;
+  `timeline`, `feed`, `between` and `changes` reads over a `posted` window;
+  shelf lives for undated claims; numbers as measures checked against the
+  market; rookie-trade's prices and statements read in place, point in time,
+  with instruments and market events as producer documents.
