@@ -1095,6 +1095,7 @@ async function loadStats() {
       (s.pending_suggestions ? ` · ☾${s.pending_suggestions}` : '');
   } catch { /* server still starting */ }
   loadProcessing();
+  void loadContentLanguages();
 }
 
 /* ------------------------------- notices ------------------------------- */
@@ -1329,6 +1330,7 @@ function paintProcessing() {
   const mayChange = authDisabled || serverAuth?.groups?.settings === true;
   const queued = processingStatus.scheduler?.queued;
   const due = processingStatus.summaries?.due;
+  const translations = processingStatus.translations?.enabled ? processingStatus.translations : null;
   button.classList.toggle('running', state.running);
   button.textContent = state.running ? '● Processing' : '▶ Start processing';
   button.disabled = !mayChange;
@@ -1336,6 +1338,7 @@ function paintProcessing() {
     state.running ? 'Extraction, reviews and summaries are running — click to stop' : 'Extraction, reviews and summaries wait until someone starts them',
     queued === undefined ? '' : `${queued} documents waiting`,
     due ? `${due} summaries due` : '',
+    translations?.due ? `${translations.due} translations into ${languageInEnglish(translations.primary)} due` : '',
     state.by && state.since ? `${state.running ? 'started' : 'stopped'} by ${state.by} at ${new Date(state.since).toLocaleTimeString()}` : '',
     mayChange ? '' : 'an administrator starts and stops processing',
   ].filter(Boolean).join(' · ');
@@ -1343,15 +1346,175 @@ function paintProcessing() {
 
 $('#processing-toggle').addEventListener('click', async () => {
   const running = processingStatus?.processing?.running === true;
-  if (running && !confirm('Stop processing? Calls in flight finish; nothing new starts until someone starts it again.')) return;
+  if (running) {
+    if (!confirm('Stop processing? Calls in flight finish; nothing new starts until someone starts it again.')) return;
+    try {
+      await api('/api/labeling/stop', { method: 'POST', body: '{}' });
+      toast('Processing stopped — calls in flight finish');
+    } catch (error) {
+      toast(error.message, 5000);
+    }
+    loadProcessing();
+    return;
+  }
+  // starting spends model calls: say how many, and what of each plan, first
+  openEstimate({
+    title: 'Start processing?',
+    lede: 'Extraction of everything waiting, the duplicate reviews after it and the summary pages due — on this machine\'s slots, and on the remote workers taking work.',
+    url: '/api/labeling/estimate',
+    confirm: 'Start processing',
+    run: async () => {
+      await api('/api/labeling/start', { method: 'POST', body: '{}' });
+      toast('Processing started: extraction, reviews and summaries');
+      loadProcessing();
+    },
+  });
+});
+
+/* ------------------------------ estimates ------------------------------ */
+
+/**
+ * What a task will take, shown before it starts (docs/design/18): the work,
+ * its time, tokens, transfer and cost, and each plan's share — Codex's windows
+ * as Codex reports them, the others against what their plans include. The
+ * person starts it from here, or not. An estimate that cannot be made (an
+ * older server) does not stand in the way: the dialog says so and Start
+ * still works.
+ */
+let estimateRun = null;
+
+async function openEstimate({ title, lede, url, confirm, run }) {
+  const dialog = $('#estimate-dialog');
+  $('#estimate-title').textContent = title;
+  $('#estimate-lede').textContent = lede;
+  $('#btn-estimate-confirm').textContent = confirm;
+  $('#btn-estimate-confirm').disabled = false;
+  $('#estimate-body').innerHTML = '<div class="est-loading">Estimating — counting the work and reading the plans…</div>';
+  estimateRun = run;
+  dialog.showModal();
   try {
-    await api(running ? '/api/labeling/stop' : '/api/labeling/start', { method: 'POST', body: '{}' });
-    toast(running ? 'Processing stopped — calls in flight finish' : 'Processing started: extraction, reviews and summaries');
+    const estimate = await api(url);
+    if (dialog.open && estimateRun === run) {
+      $('#estimate-body').innerHTML = renderEstimate(estimate);
+      placeBars($('#estimate-body'));
+    }
+  } catch (error) {
+    if (dialog.open && estimateRun === run) $('#estimate-body').innerHTML = `<div class="est-error">No estimate: ${esc(error.message)}. You can still start.</div>`;
+  }
+}
+
+$('#btn-estimate-cancel').addEventListener('click', () => $('#estimate-dialog').close());
+// Escape closes it too: nothing starts once it is gone
+$('#estimate-dialog').addEventListener('close', () => { estimateRun = null; });
+
+$('#estimate-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const run = estimateRun;
+  if (!run) return;
+  const button = $('#btn-estimate-confirm');
+  button.disabled = true;
+  try {
+    await run();
+    $('#estimate-dialog').close();
   } catch (error) {
     toast(error.message, 5000);
+  } finally {
+    button.disabled = false;
   }
-  loadProcessing();
 });
+
+const estInt = (n) => Math.round(n).toLocaleString();
+
+function estDuration(seconds) {
+  if (!(seconds > 0)) return '0 s';
+  if (seconds < 90) return `${Math.round(seconds)} s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) return `${minutes} min`;
+  const hours = seconds / 3600;
+  if (hours < 48) return `${hours < 10 ? hours.toFixed(1) : Math.round(hours)} h`;
+  const days = hours / 24;
+  return `${days < 10 ? days.toFixed(1) : Math.round(days)} days`;
+}
+
+function estBytes(bytes) {
+  if (!(bytes > 0)) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = bytes;
+  let i = 0;
+  while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+  return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
+function estTokens(n) {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${Math.round(n / 1e3)}k`;
+  return String(Math.round(n));
+}
+
+const estUsd = (usd) => (usd >= 100 ? `$${estInt(usd)}` : usd >= 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(3)}`);
+const estPercent = (p) => (p >= 10 ? `${Math.round(p)}%` : p >= 1 ? `${p.toFixed(1)}%` : `${p.toFixed(2)}%`);
+/** "a – b" under a figure, unless both ends read the same. */
+const estSpread = (r, f) => (f(r.low) === f(r.high) ? '' : `${f(r.low)} – ${f(r.high)}`);
+const estWhen = (iso) => new Date(iso).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+function renderEstimate(e) {
+  const t = e.totals;
+  const tile = (label, value, sub) => `<div class="est-tile"><span>${esc(label)}</span><strong>${value}</strong>${sub ? `<small>${sub}</small>` : ''}</div>`;
+  const tiles = [
+    tile('Time', t.seconds ? `≈ ${esc(estDuration(t.seconds.expected))}` : 'waits', t.seconds ? esc(estSpread(t.seconds, estDuration)) : 'no slot takes it yet'),
+    tile('Model calls', esc(estInt(t.calls)), ''),
+    tile('Tokens', `${esc(estTokens(t.tokens.input.expected))} in · ${esc(estTokens(t.tokens.output.expected))} out`, `${esc(estTokens(t.tokens.cached))} of the input from cache`),
+    tile('Transfer', `↓ ${esc(estBytes(t.bytes.down.expected))}`, `↑ ${esc(estBytes(t.bytes.up.expected))}${t.bytes.remote.expected > 0 ? ` · remote workers ${esc(estBytes(t.bytes.remote.expected))}` : ''}`),
+    tile('At API prices', t.costUsd ? `≈ ${esc(estUsd(t.costUsd.expected))}` : '—', t.costUsd ? `${esc(estSpread(t.costUsd, estUsd))}${t.unpriced.length ? ' · some models unpriced' : ''}` : 'no price known for the model'),
+  ].join('');
+  const work = e.work.map((w) => `<li><b>${esc(w.label)}</b><span>${esc(w.detail)}</span></li>`).join('');
+  const services = e.services.map(renderServiceShare).join('');
+  const notes = e.notes.length ? `<ul class="est-notes">${e.notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : '';
+  const rows = e.lines.map((l) => {
+    const b = l.perCall.basis;
+    const basis = `<span class="${b.tokens === 'measured' ? 'est-measured' : 'est-default'}">${b.tokens === 'measured' ? `measured over ${estInt(b.measuredCalls)} calls` : 'estimated'}</span> · <span class="${b.time === 'measured' ? 'est-measured' : 'est-default'}">${b.time === 'measured' ? 'timed' : 'default time'}</span>`;
+    return `<tr><td>${esc(l.label)}</td><td class="mono">${esc(l.route)}${l.remote ? ' (remote)' : ''}</td><td class="num">${l.slots || '—'}</td><td class="num">${esc(estInt(l.calls))}</td>
+      <td class="num">${esc(estTokens(l.perCall.input))} / ${esc(estTokens(l.perCall.output))}</td><td class="num">${esc(estDuration(l.perCall.seconds.expected))}</td><td>${basis}</td></tr>`;
+  }).join('');
+  return `<ul class="est-work">${work}</ul>
+    <div class="est-tiles">${tiles}</div>
+    ${services}
+    ${notes}
+    ${rows ? `<details class="est-details"><summary>How this was estimated</summary>
+      <table class="est-table"><thead><tr><th>Work</th><th>Route</th><th class="num">Slots</th><th class="num">Calls</th><th class="num">In / out per call</th><th class="num">Each</th><th>From</th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="est-basis">Ranges span what the figures rest on: a route's measured calls once it has run some, its service's defaults before. Each answered call is measured, so the next estimate is closer.</p>
+    </details>` : ''}`;
+}
+
+/** A window bar's segments, sized from their data attributes. */
+function placeBars(root) {
+  root.querySelectorAll('.est-bar > span').forEach((segment) => {
+    segment.style.left = `${Number(segment.dataset.left) || 0}%`;
+    segment.style.width = `${Number(segment.dataset.width) || 0}%`;
+  });
+}
+
+function renderServiceShare(s) {
+  const head = `<div class="est-service-head"><b>${esc(s.label)}</b><span>${s.plan ? `${esc(s.plan)} plan · ` : ''}${esc(estInt(s.calls))} calls · ${esc(estTokens(s.tokens.input))} in / ${esc(estTokens(s.tokens.output))} out${s.costUsd ? ` · ≈ ${esc(estUsd(s.costUsd.expected))} at API prices` : ''}</span></div>`;
+  const windows = s.windows.map((w) => {
+    const used = w.usedPercent ?? 0;
+    const task = w.taskPercent;
+    const over = task && used + task.expected > 100;
+    // widths go on through element.style once drawn (placeBars): the page's policy allows no style attribute
+    const from = Math.min(100, used);
+    const bar = `<div class="est-bar"><span class="used" data-left="0" data-width="${from}"></span>${task ? `<span class="task${over ? ' over' : ''}" data-left="${from}" data-width="${Math.max(0.6, Math.min(100 - from, task.expected))}"></span>` : ''}</div>`;
+    const now = w.usedPercent !== null ? `<b>${esc(estPercent(w.usedPercent))} used</b>${w.resetsAt ? ` · resets ${esc(estWhen(w.resetsAt))}` : ''}` : '';
+    const figure = task
+      ? `This task: <b>≈ ${esc(estPercent(task.expected))}</b>${estSpread(task, estPercent) ? ` (${esc(estSpread(task, estPercent))})` : ''}${over ? ' <span class="over">— past the limit</span>' : ''}`
+      : 'This task: not estimated';
+    return `<div class="est-window"><div class="est-window-label"><span>${esc(w.name[0].toUpperCase() + w.name.slice(1))} window</span><span>${now}</span></div>${bar}<div class="est-window-figure">${figure}</div><div class="est-basis">${esc(w.basis)}</div></div>`;
+  }).join('');
+  const credits = s.credits ? `<div class="est-basis">Credits: ${s.credits.unlimited ? 'unlimited' : s.credits.balance !== null ? esc(estInt(s.credits.balance)) : s.credits.hasCredits ? 'yes' : 'none'}</div>` : '';
+  const alert = s.limitReached ? `<p class="est-alert">${esc(s.label)} says a limit is reached: ${esc(s.limitReached.replace(/_/g, ' '))}.</p>` : '';
+  const notes = s.notes.length ? `<ul class="est-notes">${s.notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : '';
+  return `<div class="est-service">${head}${windows}${credits}${alert}${notes}</div>`;
+}
 
 /* ------------------------------- menus --------------------------------- */
 
@@ -1979,10 +2142,11 @@ async function loadFullFile() {
   if (!currentFile) return;
   const path = currentFile;
   try {
-    const { content, derived, truncated, bytes } = await api(`/api/file?path=${encodeURIComponent(path)}&maxBytes=${EDIT_BYTE_CAP}`);
+    const file = await api(fileUrl(path, { maxBytes: EDIT_BYTE_CAP }));
     if (currentFile !== path) return; // the user moved on while this was in flight
-    renderFileContent(path, content, derived, truncated, bytes);
-    if (truncated) toast(`${path} is too large to edit here`);
+    renderFileContent(path, file.content, file.derived, file.truncated, file.bytes);
+    paintLanguages(path, file);
+    if (file.truncated) toast(`${path} is too large to edit here`);
   } catch (e) {
     toast(`load failed: ${e.message}`);
   }
@@ -2040,7 +2204,10 @@ function renderFileContent(path, content, derived, truncated, bytes) {
  */
 async function openFile(path, labelEl, fragment = null) {
   try {
-    const { content, derived, truncated, bytes } = await api(`/api/file?path=${encodeURIComponent(path)}${fragment ? `&maxBytes=${EDIT_BYTE_CAP}` : ''}`);
+    // the reading language is known before the first file of a workspace opens
+    if (contentLanguagesLoaded !== (activeWorkspace()?.id ?? null)) await loadContentLanguages();
+    const file = await api(fileUrl(path, fragment ? { maxBytes: EDIT_BYTE_CAP } : {}));
+    const { content, derived, truncated, bytes } = file;
     currentFile = path;
     editing = false;
     // the create target follows the last thing clicked: a file hands it back
@@ -2054,6 +2221,7 @@ async function openFile(path, labelEl, fragment = null) {
     $('#file-view').hidden = false;
     $('#file-editor').hidden = true;
     renderFileContent(path, content, derived, truncated, bytes);
+    paintLanguages(path, file);
     loadFileCitations(path);
     $('#btn-delete').disabled = Boolean(mirroredSource(path));
     if (fragment) scrollToFragment(fragment);
@@ -2062,6 +2230,178 @@ async function openFile(path, labelEl, fragment = null) {
     toast(`open failed: ${e.message}`);
   }
 }
+
+/* --------------------------- content languages -------------------------- */
+
+/**
+ * Content languages (docs/design/17). A workspace with them on reads in a
+ * primary language: documents in other languages are translated into it in
+ * the background, and into a secondary one when a reader asks. Which version
+ * this reader opens — the reading language — is theirs, kept in this browser
+ * and defaulting to the workspace's primary; "original" reads every
+ * document as it was written. It is not the interface language: this page's
+ * own words stay as they are whatever a reader picks here.
+ */
+let contentLanguages = null; // GET /api/languages: the catalog and the workspace's settings; null on an older service
+const READING_LANGUAGE_KEY = 'knode-os.reading-language';
+
+/** The names the service would give, for an older one that has no catalog to send. */
+const LANGUAGE_NAMES = {
+  zh: '简体中文', 'zh-Hant': '繁體中文', en: 'English', ja: '日本語', ko: '한국어',
+  fr: 'Français', de: 'Deutsch', es: 'Español', pt: 'Português', it: 'Italiano', ru: 'Русский',
+};
+
+/** A language as the switcher shows it: in itself. */
+const languageName = (code) => contentLanguages?.languages?.find((l) => l.code === code)?.native ?? LANGUAGE_NAMES[code] ?? code;
+/** A language as this page's sentences name it. */
+const languageInEnglish = (code) => contentLanguages?.languages?.find((l) => l.code === code)?.english ?? code;
+
+let contentLanguagesLoaded = null;
+
+async function loadContentLanguages() {
+  try {
+    contentLanguages = await api('/api/languages');
+  } catch {
+    contentLanguages = null;
+  }
+  contentLanguagesLoaded = activeWorkspace()?.id ?? null;
+}
+
+/** 'original', or a language code; null while the workspace has content languages off. */
+function readingLanguage() {
+  if (!contentLanguages?.enabled) return null;
+  let picked = null;
+  try {
+    picked = localStorage.getItem(READING_LANGUAGE_KEY);
+  } catch {
+    // a private window keeps no preferences: the primary language it is
+  }
+  if (picked === 'original') return picked;
+  // a pick another workspace offers is not this one's: its primary then
+  return picked && contentLanguages.offered?.includes(picked) ? picked : contentLanguages.primary;
+}
+
+function setReadingLanguage(value) {
+  try {
+    localStorage.setItem(READING_LANGUAGE_KEY, value);
+  } catch {
+    // kept for this page only
+  }
+}
+
+/** The file API for `path`, asking for the reader's language. */
+function fileUrl(path, { maxBytes } = {}) {
+  const q = new URLSearchParams({ path });
+  if (maxBytes) q.set('maxBytes', String(maxBytes));
+  const lang = readingLanguage();
+  if (lang && lang !== 'original') q.set('lang', lang);
+  return `/api/file?${q}`;
+}
+
+let languageRefresh = null;
+
+/**
+ * The switcher and what it says about the open file: the original and the
+ * workspace's languages, the reader's pick marked, and — when the pick has no
+ * translation yet — why, with the one action that helps. A translation is
+ * read-only: an edit belongs to the original.
+ */
+function paintLanguages(path, file) {
+  clearTimeout(languageRefresh);
+  const box = $('#file-langs');
+  const notice = $('#file-lang-notice');
+  const langs = file.languages;
+  if (!langs || !langs.source || langs.offered.length < 2) {
+    box.hidden = true;
+    box.innerHTML = '';
+    notice.hidden = true;
+    return;
+  }
+  const pick = readingLanguage();
+  const wanted = pick === 'original' || !pick ? langs.source : pick;
+  // a language the document is written in already — zh for a zh-Hant reader — reads as its original
+  const asked = langs.offered.includes(wanted) ? wanted : langs.source;
+  const others = langs.offered.filter((code) => code !== langs.source);
+  const button = (value, code, label, title) =>
+    `<button type="button" data-reading="${esc(value)}" class="${code === asked ? 'selected' : ''}" title="${esc(title)}">${esc(label)}</button>`;
+  box.innerHTML = button('original', langs.source, `${languageName(langs.source)} · original`, 'Read every document in the language it was written in')
+    + others.map((code) => button(code, code, languageName(code), `Read documents in ${languageInEnglish(code)} where a translation exists`)).join('');
+  box.hidden = false;
+
+  const state = langs.translations?.[asked];
+  const translation = file.translation;
+  let text = '';
+  let action = '';
+  if (translation) {
+    // reading a translation: never editable, the original is the file
+    $('#btn-edit').disabled = true;
+    const by = translation.model ? ` by ${translation.model}` : '';
+    text = translation.done < translation.parts
+      ? `Translated ${translation.done} of ${translation.parts} parts so far${by} — the rest still reads in ${languageInEnglish(langs.source)}. Read-only: edit the original.`
+      : `Translated from ${languageInEnglish(langs.source)}${by}. Read-only: edit the original.`;
+  } else if (asked !== langs.source && state) {
+    const into = languageInEnglish(asked);
+    if (state.status === 'requested') {
+      text = `Queued for translation into ${into}${processingStatus?.processing && !processingStatus.processing.running ? ' — it runs once processing is started, or when a remote worker takes it' : ''}. Showing the original meanwhile.`;
+    } else if (state.status === 'failed') {
+      text = `The translation into ${into} failed${state.error ? `: ${state.error}` : ''}. Showing the original.`;
+      action = 'try again';
+    } else if (state.status === 'skipped') {
+      text = `Nothing in this document to translate into ${into}.`;
+    } else {
+      text = `Not translated into ${into} yet${asked === langs.primary ? ' — documents in other languages are translated in the background, the newest first' : ''}. Showing the original.`;
+      action = asked === langs.primary ? 'translate next' : 'translate';
+    }
+  }
+  notice.hidden = !text;
+  $('#file-lang-notice-text').textContent = text;
+  const go = $('#btn-translate');
+  go.hidden = !action;
+  go.textContent = action;
+  go.dataset.lang = asked;
+  // a translation under way is looked at again while the file stays open
+  const pending = (translation && translation.done < translation.parts) || state?.status === 'requested' || state?.status === 'partial';
+  if (pending) languageRefresh = setTimeout(() => refreshLanguages(path, translation?.done ?? -1), 20_000);
+}
+
+/** Repaint the open file when its translation moved on, keeping the reader's place. */
+async function refreshLanguages(path, doneBefore) {
+  if (currentFile !== path || editing) return;
+  try {
+    const file = await api(fileUrl(path));
+    if (currentFile !== path || editing) return;
+    const done = file.translation?.done ?? -1;
+    if (done !== doneBefore) {
+      const view = $('#file-view');
+      const top = view.scrollTop;
+      renderFileContent(path, file.content, file.derived, file.truncated, file.bytes);
+      view.scrollTop = top;
+    }
+    paintLanguages(path, file);
+  } catch {
+    // the next open tries again
+  }
+}
+
+$('#file-langs').addEventListener('click', (event) => {
+  const value = event.target.closest?.('[data-reading]')?.dataset.reading;
+  if (!value || !currentFile || editing) return;
+  setReadingLanguage(value);
+  void openFile(currentFile);
+});
+
+$('#btn-translate').addEventListener('click', async () => {
+  const path = currentFile;
+  const lang = $('#btn-translate').dataset.lang;
+  if (!path || !lang) return;
+  try {
+    const r = await api('/api/file/translate', { method: 'POST', body: JSON.stringify({ path, lang }) });
+    toast(r.status === 'done' ? 'Already translated' : r.processing ? `Queued: the ${languageInEnglish(lang)} translation is next` : `Queued — it is translated once processing is started, or when a remote worker takes it`, 5000);
+    if (currentFile === path) void openFile(path);
+  } catch (e) {
+    toast(e.message, 5000);
+  }
+});
 
 /** Draw the eye to what a jump landed on. */
 function flash(...els) {
@@ -4386,7 +4726,7 @@ function embeddingKeyLimits(entry) {
 }
 
 /** The stages that name a model or an agent, by their fields' prefix (`#cfg-<prefix>-use`, `<prefix>Llm`). */
-const ROUTE_PREFIXES = ['entity', 'document', 'summary', 'judge'];
+const ROUTE_PREFIXES = ['entity', 'document', 'summary', 'judge', 'translate'];
 
 /**
  * Rebuild the per-route pickers: the models under LLM, then every agent a
@@ -4422,6 +4762,8 @@ const PIPELINE_STAGES = [
   { key: 'entity', step: 3, title: 'Extract', badge: 'volume', accent: 'accent2' },
   { key: 'summary', step: 4, title: 'Summarize', badge: 'prose', accent: 'accent2' },
   { key: 'judge', step: 5, title: 'Judge', badge: 'quality', accent: 'accent2' },
+  // beside the background pass, while content languages are on (docs/design/17)
+  { key: 'translate', step: 6, title: 'Translate', badge: 'languages', accent: 'accent2' },
 ];
 let selectedStage = 'document';
 
@@ -4437,6 +4779,11 @@ function stageRate(key) {
   if (key === 'index') return `×${int('#cfg-ingest-concurrency', 4)} · ${int('#cfg-emb-batch', 32)}/req`;
   // Summarize runs in Extract's pass, at its rates
   if (key === 'entity' || key === 'summary') return `×${int('#cfg-extraction-concurrency', 1)} · ${int('#cfg-extraction-batch', 8)}/pass`;
+  if (key === 'translate') {
+    if (!$('#cfg-lang-enabled').checked) return 'off';
+    const slots = Number($('#cfg-translate-concurrency').value);
+    return `→ ${$('#cfg-lang-primary').value || '?'} · ×${Number.isFinite(slots) ? slots : 1}`;
+  }
   return '';
 }
 
@@ -4692,6 +5039,8 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-extraction-batch').value = cfg.extraction?.batchSize ?? 8;
     $('#cfg-extraction-concurrency').value = cfg.extraction?.concurrency ?? 1;
     $('#cfg-extraction-claims').checked = cfg.extraction?.claims !== false;
+    await fillLanguagesForm(cfg);
+    if (activeWorkspace()?.id !== workspaceId) return;
     $('#cfg-review-judge').value = cfg.review?.llmJudge ?? 'suggest';
     $('#cfg-review-claims').value = cfg.review?.claims ?? 'suggest';
     $('#cfg-review-claim-merge').value = cfg.review?.claimMerge ?? 'auto';
@@ -4725,6 +5074,58 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     if (activeWorkspace()?.id !== workspaceId) return;
     $('#cfg-status').innerHTML = `<div class="cfg-line bad">load failed: ${esc(e.message)}</div>`;
   }
+}
+
+/**
+ * The Translate stage's languages: on or off, the primary language, the
+ * secondary ones (any other the catalog has), and the size past which a
+ * document waits for a reader to ask. The catalog comes from the service.
+ */
+async function fillLanguagesForm(cfg) {
+  if (!contentLanguages) await loadContentLanguages();
+  const catalog = contentLanguages?.languages ?? Object.entries(LANGUAGE_NAMES).map(([code, native]) => ({ code, native, english: code }));
+  const langs = cfg.languages ?? { enabled: false, primary: '', secondary: [], maxChars: 200000 };
+  $('#cfg-lang-enabled').checked = langs.enabled === true;
+  $('#cfg-lang-primary').innerHTML = `<option value="">— choose —</option>${catalog.map((l) => `<option value="${esc(l.code)}">${esc(l.native)} · ${esc(l.english)}</option>`).join('')}`;
+  $('#cfg-lang-primary').value = langs.primary || '';
+  const secondary = new Set(langs.secondary ?? []);
+  $('#cfg-lang-secondary').innerHTML = catalog
+    .map((l) => `<label class="cfg-check cfg-inline-check"><input type="checkbox" value="${esc(l.code)}"${secondary.has(l.code) ? ' checked' : ''} /> ${esc(l.native)}</label>`)
+    .join('');
+  $('#cfg-lang-maxchars').value = langs.maxChars ?? 200000;
+  $('#cfg-translate-concurrency').value = cfg.extraction?.translateConcurrency ?? cfg.extraction?.concurrency ?? 1;
+  paintLanguageForm();
+}
+
+/** The primary language is no secondary one; the stage's line says what it is doing. */
+function paintLanguageForm() {
+  const primary = $('#cfg-lang-primary').value;
+  for (const box of document.querySelectorAll('#cfg-lang-secondary input')) {
+    box.disabled = box.value === primary;
+    if (box.disabled) box.checked = false;
+  }
+  const t = processingStatus?.translations;
+  $('#cfg-lang-status').textContent = !$('#cfg-lang-enabled').checked
+    ? 'Off: nothing is translated, summaries keep each document\'s language and readers see no switcher.'
+    : t?.enabled
+      ? `${count(t.due, ['translation', 'translations'])} due at the last look · ${count(t.leases.length, ['segment', 'segments'])} out · ${count(t.lastHour.documents, ['document', 'documents'])} finished in the last hour.`
+      : 'Translations start once this is saved and processing runs (or a remote worker takes them).';
+}
+
+function gatherLanguages() {
+  return {
+    enabled: $('#cfg-lang-enabled').checked,
+    primary: $('#cfg-lang-primary').value,
+    secondary: [...document.querySelectorAll('#cfg-lang-secondary input:checked')].map((box) => box.value),
+    maxChars: Math.max(0, Math.floor(Number($('#cfg-lang-maxchars').value) || 0)),
+  };
+}
+
+for (const id of ['#cfg-lang-enabled', '#cfg-lang-primary', '#cfg-translate-concurrency']) {
+  $(id).addEventListener('change', () => {
+    paintLanguageForm();
+    updateConfigSummaries();
+  });
 }
 
 function gatherRoute(prefix) {
@@ -4762,10 +5163,13 @@ function gatherConfig() {
       documentLlm: gatherRoute('document'),
       summaryLlm: gatherRoute('summary'),
       judgeLlm: gatherRoute('judge'),
+      translateLlm: gatherRoute('translate'),
       batchSize: Number($('#cfg-extraction-batch').value),
       concurrency: Number($('#cfg-extraction-concurrency').value),
+      translateConcurrency: Number($('#cfg-translate-concurrency').value),
       claims: $('#cfg-extraction-claims').checked,
     },
+    languages: gatherLanguages(),
     // what the Judge stage does with its verdicts
     review: {
       llmJudge: $('#cfg-review-judge').value,
@@ -5466,6 +5870,7 @@ function renderCfgResult(r) {
     ['3 · Extract', r.entityLlm],
     ['4 · Summarize', r.summaryLlm],
     ['5 · Judge', r.judgeLlm],
+    ['6 · Translate', r.translateLlm],
   ];
   $('#cfg-status').innerHTML = items.map(([label, result]) => {
     if (!result) return '';
@@ -6016,12 +6421,23 @@ function renderDraft(view) {
     toast('brief saved');
     loadStudyList();
   }));
-  el.querySelector('[data-act="start"]').addEventListener('click', () => run('starting…', async () => {
+  const hint = note.textContent;
+  el.querySelector('[data-act="start"]').addEventListener('click', () => run('saving…', async () => {
+    // saved first, so the estimate reads the brief as it stands now
     await api(`/api/research/studies/${view.job.id}`, { method: 'PUT', body: JSON.stringify({ brief: gatherBrief(view) }) });
-    await api(`/api/research/studies/${view.job.id}/start`, { method: 'POST' });
-    toast('research started');
-    await loadStudyList();
-    await openStudy(view.job.id);
+    note.textContent = hint;
+    openEstimate({
+      title: 'Start research?',
+      lede: `${b.pages.length} page${b.pages.length === 1 ? '' : 's'} and a report: a collector gathers each page's sources, an agent writes each page, then the report — measured against the studies run here before.`,
+      url: `/api/research/studies/${view.job.id}/estimate`,
+      confirm: '▶ Start research',
+      run: async () => {
+        await api(`/api/research/studies/${view.job.id}/start`, { method: 'POST' });
+        toast('research started');
+        await loadStudyList();
+        await openStudy(view.job.id);
+      },
+    });
   }));
   el.querySelector('[data-act="delete"]').addEventListener('click', () => run('deleting…', async () => {
     if (!confirm('Delete this draft?')) return;

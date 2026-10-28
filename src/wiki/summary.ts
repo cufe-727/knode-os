@@ -10,6 +10,8 @@ import { parseFrontmatter } from '../markdown.js';
 import { pluginRegistry } from '../plugins/registry.js';
 import { Queryable } from '../store/migrations.js';
 import { DocumentRow } from '../types.js';
+import { detectTextLanguage } from '../lang/detect.js';
+import { contentLanguages, promptLanguage } from '../lang/languages.js';
 
 /**
  * What the Summarize stage asks a model, and what it makes of the answer
@@ -101,13 +103,18 @@ export function asSummaryLanguage(code: string | null | undefined): SummaryLangu
   return typeof code === 'string' && isLanguage(code) ? code : null;
 }
 
+/** A language code as the scaffold it is written with: Chinese of either script is zh, a language without one of its own gets English. */
+const scaffoldOf = (code: string): SummaryLanguage => {
+  const base = code.split('-')[0].toLowerCase();
+  return isLanguage(base) ? base : 'en';
+};
+
 /**
  * The language a document's page is written in: what its frontmatter
- * declares (`lang` / `language`), else the script most of its text is in.
- * A CJK character carries about a word; Latin words run five or six
- * letters, so the two are compared as words, and a Chinese post full of
- * tickers and English terms still reads as Chinese. Latin-script text of
- * any language gets the English scaffold.
+ * declares (`lang` / `language`), else what its text reads as
+ * (src/lang/detect.ts) — the script most of what a reader reads is in, URLs,
+ * tags and code left out. Latin-script text of any language gets the English
+ * scaffold.
  */
 export function detectSummaryLanguage(text: string, frontmatter: Record<string, unknown> = {}): SummaryLanguage {
   for (const key of ['lang', 'language']) {
@@ -116,23 +123,22 @@ export function detectSummaryLanguage(text: string, frontmatter: Record<string, 
     const code = v.trim().toLowerCase().split(/[-_]/)[0];
     if (isLanguage(code)) return code;
   }
-  const sample = text.length > 40_000 ? text.slice(0, 20_000) + text.slice(-20_000) : text;
-  let han = 0;
-  let kana = 0;
-  let hangul = 0;
-  let latin = 0;
-  for (const ch of sample) {
-    const cp = ch.codePointAt(0)!;
-    if ((cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0x3400 && cp <= 0x4dbf) || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0x20000 && cp <= 0x2a6df)) han++;
-    else if ((cp >= 0x3040 && cp <= 0x30ff) || (cp >= 0x31f0 && cp <= 0x31ff)) kana++;
-    else if ((cp >= 0xac00 && cp <= 0xd7af) || (cp >= 0x1100 && cp <= 0x11ff) || (cp >= 0x3130 && cp <= 0x318f)) hangul++;
-    else if ((cp >= 0x41 && cp <= 0x5a) || (cp >= 0x61 && cp <= 0x7a) || (cp >= 0xc0 && cp <= 0x24f)) latin++;
-  }
-  const cjk = han + kana + hangul;
-  if (cjk === 0 || cjk < latin * 0.3) return 'en';
-  if (kana >= cjk * 0.1) return 'ja';
-  if (hangul >= cjk * 0.3) return 'ko';
-  return 'zh';
+  const detected = detectTextLanguage(text);
+  return detected ? scaffoldOf(detected) : 'en';
+}
+
+/**
+ * The language a summary page is written in. With content languages on
+ * (docs/design/17), the workspace's primary language whatever the
+ * document's — an English filing gets a Chinese page in a Chinese workspace
+ * — and `writeIn` says exactly which, traditional Chinese included; else the
+ * document's own (`detectSummaryLanguage`).
+ */
+export function summaryLanguageFor(config: Pick<KnodeConfig, 'languages'>, text: string, frontmatter: Record<string, unknown> = {}): { language: SummaryLanguage; writeIn: string | null } {
+  const languages = contentLanguages(config);
+  // a primary language with no scaffold of its own keeps English headings, not English prose
+  if (languages.on && languages.primary) return { language: scaffoldOf(languages.primary), writeIn: promptLanguage(languages.primary) };
+  return { language: detectSummaryLanguage(text, frontmatter), writeIn: null };
 }
 
 /* ------------------------------ vocabulary ------------------------------ */
@@ -342,6 +348,8 @@ export interface SummaryWork {
   title: string;
   text: string;
   language: SummaryLanguage;
+  /** The language exactly, when the workspace's primary decides it rather than the document (docs/design/17). */
+  writeIn?: string | null;
   channels: string[];
   vocabulary: LinkVocabulary;
   /** The segments this summary reads: the whole text of a document that fits one call; all, or an even sample, of a long one's. */
@@ -386,11 +394,13 @@ export async function planSummary(q: Queryable, dataDir: string, config: KnodeCo
   const minChars = summaryMinChars(config);
   if (text.length < minChars) return { kind: 'none', reason: 'short', chars: text.length, minChars };
   const { frontmatter } = parseFrontmatter(text);
+  const { language, writeIn } = summaryLanguageFor(config, text, frontmatter);
   const base = {
     doc,
     title: doc.title ?? path.basename(doc.path),
     text,
-    language: detectSummaryLanguage(text, frontmatter),
+    language,
+    writeIn,
     channels: channelNames(frontmatter),
     vocabulary: await linkVocabulary(q, doc.id),
   };
@@ -467,7 +477,7 @@ function pageSystem(work: SummaryWork, entities: SummaryEntity[], part: { index:
   const rules = [
     '- Markdown only, no preamble, no title line.',
     `- Start with a one-paragraph abstract, then a "## ${s.keyPoints}" section of ${part ? 'up to 8 bullets' : 'bullets'}, then a "## ${s.entities}" section listing the important entities as [[Entity Name]] wikilinks. Use exactly these two headings.`,
-    `- Write in ${s.name}.`,
+    `- Write in ${work.writeIn ?? s.name}.`,
     linkRule(entities),
     channelRule(work),
     `- Max ~${part ? 250 : 400} words.`,
@@ -481,7 +491,7 @@ function mergeSystem(work: SummaryWork, read: number): string {
   const rules = [
     '- Markdown only, no preamble, no title line.',
     `- Start with a one-paragraph abstract of the whole document, then a "## ${s.keyPoints}" section of up to 12 bullets in the document's order, then a "## ${s.entities}" section listing the important entities as [[Entity Name]] wikilinks. Use exactly these two headings.`,
-    `- Write in ${s.name}.`,
+    `- Write in ${work.writeIn ?? s.name}.`,
     '- Keep the [[wikilinks]] exactly as the parts spell them and add no new ones; list each entity once.',
     '- Write about the document, not about the parts or the merging.',
     channelRule(work),

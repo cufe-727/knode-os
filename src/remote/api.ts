@@ -13,6 +13,7 @@ import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/sour
 import { sync } from '../ingest/sync.js';
 import { FailureKind } from '../labeling/failures.js';
 import { TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
+import { sanitizeUsage } from '../llm/usage.js';
 import { search, SearchMode } from '../search/search.js';
 import { WorkspaceContextRegistry, resolveWorkspaceScope, WorkspaceScope } from '../server/workspaces.js';
 import { CATALOG_VIEWS, catalogQuery } from '../store/catalog.js';
@@ -236,9 +237,11 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     const id = text(b.id, 64);
     if (!id) throw new HttpError(400, 'id required');
     const kind = ['model', 'transient', 'fatal'].includes(String(b.kind)) ? (b.kind as FailureKind) : undefined;
+    // what the worker's CLI or endpoint said the call used (a worker from before this sends none)
+    const usage = sanitizeUsage(b.usage) ?? undefined;
     const outcome: TaskOutcome = b.ok === true
-      ? { ok: true, text: text(b.text, 2 * 1024 * 1024), model: b.model ? text(b.model, 120) : undefined }
-      : { ok: false, error: text(b.error || 'failed without a message', 2000), kind, model: b.model ? text(b.model, 120) : undefined };
+      ? { ok: true, text: text(b.text, 2 * 1024 * 1024), model: b.model ? text(b.model, 120) : undefined, usage }
+      : { ok: false, error: text(b.error || 'failed without a message', 2000), kind, model: b.model ? text(b.model, 120) : undefined, usage };
     const result = await broker(ctx).complete(id, whoOf(c, b), outcome);
     return c.json(result, result.accepted ? 200 : 409);
   };

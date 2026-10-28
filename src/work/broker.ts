@@ -1,4 +1,6 @@
+import { CallLedger, isRefusal } from '../estimate/ledger.js';
 import { ChatMessage } from '../llm/client.js';
+import { estimateTokens } from '../llm/tokens.js';
 import { FailureKind } from '../labeling/failures.js';
 import { CompleteResult, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
 import { isSharedKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
@@ -24,6 +26,11 @@ import { isSharedKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './
  * work again it starts level with the others instead of taking everything
  * until it has caught up. That keeps summaries moving while an import's
  * extraction backlog is out, and extraction moving while summaries pile up.
+ *
+ * Every answer is also measured into the workspace's call ledger
+ * (src/estimate/ledger.ts) — how long the lease took, how big the prompt and
+ * the reply were, what the provider said it used — whoever answered it, so an
+ * estimate learns from remote workers' calls as well as this machine's.
  */
 
 export interface WorkTask {
@@ -61,12 +68,24 @@ export interface WorkSource {
   stop(): Promise<void>;
 }
 
-export const DEFAULT_SHARES: Record<SharedKind, number> = { extract: 3, summarize: 1 };
+export const DEFAULT_SHARES: Record<SharedKind, number> = { extract: 3, summarize: 1, translate: 1 };
 
 export interface BrokerOptions {
   /** Read on every lease: a settings save may change them. */
   shares?: () => Partial<Record<SharedKind, number>> | undefined;
+  /** Where answered calls are measured (src/estimate/ledger.ts). */
+  ledger?: CallLedger | null;
 }
+
+/** A lease handed out, until its answer comes back: what the ledger needs of it. */
+interface Issued {
+  kind: WorkKind;
+  at: number;
+  promptTokens: number;
+}
+
+/** A lease nobody answered or released is forgotten after this long (a lapsed one is re-issued under a new id). */
+const ISSUED_TTL_MS = 6 * 3_600_000;
 
 export interface WorkerStatus {
   worker: string;
@@ -101,6 +120,7 @@ export class WorkBroker {
   /** Tasks handed out per kind, each divided by its kind's weight: the lowest goes next. */
   private readonly pass = new Map<WorkKind, number>();
   private readonly workers = new Map<string, WorkerRecord>();
+  private readonly issued = new Map<string, Issued>();
 
   constructor(sources: WorkSource[], private readonly opts: BrokerOptions = {}) {
     for (const source of sources) this.sources.set(source.kind, source);
@@ -145,7 +165,7 @@ export class WorkBroker {
     if (wanted.length === 0) return [];
     for (const kind of wanted.filter((k) => !isSharedKind(k))) {
       const tasks = await this.sources.get(kind)!.lease(who, max);
-      if (tasks.length) return tasks;
+      if (tasks.length) return this.issue(tasks);
     }
     const shares = this.shares();
     // passes are sums of 1/weight, so a tie may differ in the last bits: within a hair, WORK_KINDS order decides
@@ -164,7 +184,7 @@ export class WorkBroker {
       // a kind that had nothing to give starts level with the one served, never behind it
       for (const k of idle) this.pass.set(k, Math.max(this.pass.get(k) ?? 0, at));
       this.pass.set(kind, at + tasks.length / shares[kind]);
-      return tasks;
+      return this.issue(tasks);
     }
     return [];
   }
@@ -180,6 +200,7 @@ export class WorkBroker {
       else record.failed++;
     }
     this.touch(who);
+    this.measure(taskId, who, outcome);
     return result;
   }
 
@@ -200,6 +221,7 @@ export class WorkBroker {
   async release(taskIds: string[], who: WorkerIdentity): Promise<number> {
     let n = 0;
     for (const [source, ids] of this.bySource(taskIds, [])) n += await source.release(ids, who);
+    for (const id of taskIds) this.issued.delete(id);
     return n;
   }
 
@@ -227,6 +249,35 @@ export class WorkBroker {
   }
 
   /* ------------------------------ internals ------------------------------ */
+
+  /** Note when each task went out, and how big its prompt was, for the ledger. */
+  private issue(tasks: WorkTask[]): WorkTask[] {
+    if (!this.opts.ledger) return tasks;
+    const now = Date.now();
+    for (const [id, i] of this.issued) if (now - i.at > ISSUED_TTL_MS) this.issued.delete(id);
+    for (const task of tasks) this.issued.set(task.id, { kind: task.kind, at: now, promptTokens: estimateTokens(task.prompt) });
+    return tasks;
+  }
+
+  /** Record an answer in the ledger: lease to answer, prompt and reply sizes, the provider's own count. */
+  private measure(taskId: string, who: WorkerIdentity, outcome: TaskOutcome): void {
+    const issued = this.issued.get(taskId);
+    if (!issued || !this.opts.ledger) return;
+    this.issued.delete(taskId);
+    this.opts.ledger.record({
+      kind: issued.kind,
+      route: outcome.model || who.backend,
+      remote: who.remote,
+      ok: outcome.ok,
+      ms: Date.now() - issued.at,
+      promptTokens: issued.promptTokens,
+      replyTokens: outcome.ok ? estimateTokens(outcome.text) : 0,
+      usage: outcome.usage ?? null,
+      // a limit is what a worker reports as transient; a bad answer that merely mentions one is not
+      refused: !outcome.ok && outcome.kind !== 'model' && isRefusal(outcome.error),
+      error: outcome.ok ? undefined : outcome.error,
+    });
+  }
 
   private owner(taskId: string): WorkSource | undefined {
     for (const source of this.sources.values()) if (source.holds(taskId)) return source;

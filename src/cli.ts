@@ -5,7 +5,11 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
-import { redactConfig, resolveDataDir, CONFIG_FILE, loadConfig, saveConfig } from './config.js';
+import { redactConfig, resolveDataDir, resolveRoutedLlmConfig, routeTargets, CONFIG_FILE, loadConfig, saveConfig } from './config.js';
+import { contentLanguages, normalizeLanguage } from './lang/languages.js';
+import { translateNow } from './lang/translate.js';
+import { LlmClient } from './llm/client.js';
+import type { DocumentRow } from './types.js';
 import { createContext } from './context.js';
 import { learnFrequentTerms, relinkTier0 } from './graph/concepts.js';
 import { CONCEPT_FREQUENT_FILE, FREQUENT_MIN_CORPUS } from './graph/concept-stoplist.js';
@@ -40,6 +44,12 @@ import { loadResearchSources, sourceProblem } from './research/sources.js';
 import { continueStudies, createStudy, listStudies, refineStudy, startProblem, startStudy, cancelStudy, studyPayload, studyView, StudyRunner } from './research/study.js';
 import type { StudyBrief } from './research/refine.js';
 import { runDocumentPass } from './ingest/background.js';
+import type { TaskEstimate } from './estimate/estimate.js';
+import { formatEstimate } from './estimate/format.js';
+import { CallLedger } from './estimate/ledger.js';
+import { estimateProcessing } from './estimate/processing.js';
+import { quotaSources } from './estimate/quota.js';
+import { estimateStudy } from './estimate/study.js';
 import { REMOTE_SCOPES, RemoteScope, RemoteTokenStore } from './remote/tokens.js';
 import { WORK_KINDS } from './work/kinds.js';
 import { registerAuthCommands } from './auth/cli.js';
@@ -193,6 +203,90 @@ program
     console.log(JSON.stringify({ ...stats, entitiesTouched: touched.length, claimsTouched: touchedClaims.length, documents, resolve, claims, summaries }, null, 2));
     await ctx.datasources.closeAll();
     await ctx.store.close();
+  });
+
+program
+  .command('translate')
+  .description('translate documents into a content language now, on the Translate stage\'s route, segment by segment (docs/design/17); --status: translations by language')
+  .argument('[paths...]', 'documents under raw/docs')
+  .option('--lang <code>', 'the language to translate into (default: the primary content language)')
+  .option('--retries <n>', 'tries more per segment whose answer will not do', '1')
+  .option('--status', 'print translations by language and status, translate nothing')
+  .action(async (paths: string[], opts: { lang?: string; retries: string; status?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const languages = contentLanguages(ctx.config);
+      if (opts.status || paths.length === 0) {
+        const rows = await ctx.store.query<{ language: string; status: string; n: number; parts: number }>(
+          `SELECT t.language, t.status, count(*)::int AS n, COALESCE(sum(t.parts), 0)::int AS parts
+           FROM translations t JOIN documents d ON d.id = t.document_id AND d.sha256 = t.content_sha AND d.status = 'indexed'
+           GROUP BY t.language, t.status ORDER BY t.language, t.status`,
+        );
+        const byLanguage = await ctx.store.query<{ language: string | null; n: number }>(
+          `SELECT language, count(*)::int AS n FROM documents WHERE root = 'docs' AND status = 'indexed' AND kind = 'source' GROUP BY language ORDER BY n DESC`,
+        );
+        console.log(JSON.stringify({
+          languages: { enabled: languages.on, primary: languages.primary, secondary: languages.secondary, maxChars: languages.maxChars },
+          documents: Object.fromEntries(byLanguage.map((r) => [r.language === null ? 'unknown (not read yet)' : r.language || 'none', r.n])),
+          translations: rows,
+        }, null, 2));
+        return;
+      }
+      const target = opts.lang ? normalizeLanguage(opts.lang) : languages.primary;
+      if (!target) {
+        console.error(opts.lang ? `unknown language "${opts.lang}"` : 'no --lang given and no primary content language configured (languages.primary)');
+        process.exitCode = 1;
+        return;
+      }
+      const llm = new LlmClient(resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.translateLlm, routeTargets(ctx.config)));
+      if (!llm.enabled) {
+        console.error('the Translate stage runs on nothing — pick a model or an agent for it (Settings → Ingest → Translate, extraction.translateLlm)');
+        process.exitCode = 1;
+        return;
+      }
+      for (const p of paths) {
+        const [doc] = await ctx.store.query<DocumentRow>(`SELECT * FROM documents WHERE path = $1 AND status = 'indexed' AND root = 'docs'`, [p]);
+        if (!doc) {
+          console.error(`${p}: no indexed document under raw/docs`);
+          process.exitCode = 1;
+          continue;
+        }
+        const r = await translateNow(ctx.store, ctx.dataDir, doc, target, llm, { retries: Number(opts.retries) || 0, onProgress: (m) => console.log(`  ${m}`) });
+        console.log(JSON.stringify({ path: p, language: target, ...r }));
+        if (r.status === 'failed') process.exitCode = 1;
+      }
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+program
+  .command('estimate')
+  .description('what a task would take before it starts: model calls, tokens, time, transfer, cost at API prices, and the share of each plan (Codex, Cursor, Claude Code) — `processing` (extraction, reviews, summaries) or `study <id>`')
+  .argument('[task]', 'processing | study', 'processing')
+  .argument('[id]', "a study's id")
+  .option('--json', 'print the estimate as JSON')
+  .action(async (task: string, id: string | undefined, opts) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const quota = quotaSources(ctx.config);
+      let estimate: TaskEstimate;
+      if (task === 'study') {
+        const job = id ? await getJob(ctx.store, id) : null;
+        if (!job || job.kind !== 'study') throw new Error(id ? `no study ${id}` : 'name the study: knode-os estimate study <id>');
+        estimate = await estimateStudy({ store: ctx.store, config: ctx.config, job, quota, showBalance: true });
+      } else if (task === 'processing') {
+        // remote workers are known only to a running `serve`; from here the estimate counts this machine's slots
+        estimate = await estimateProcessing({ store: ctx.store, config: ctx.config, ledger: CallLedger.forWorkspace(ctx.dataDir), workers: [], quota, showBalance: true });
+      } else {
+        throw new Error(`no such task: ${task} (processing | study)`);
+      }
+      console.log(opts.json ? JSON.stringify(estimate, null, 2) : formatEstimate(estimate));
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
   });
 
 /* ------------------------------ remote access ------------------------------ */

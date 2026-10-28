@@ -772,7 +772,7 @@ function restoreArchived(dataDir: string, pagePath: string): void {
 }
 
 /** Summary pages still in use, by the document each one summarizes (its `document` dep). */
-async function summaryPagesByDocument(store: Store): Promise<Map<string, { path: string; status: string }>> {
+export async function summaryPagesByDocument(store: Store): Promise<Map<string, { path: string; status: string }>> {
   const rows = await store.query<{ path: string; status: string; doc: string }>(
     `SELECT p.path, p.status, d.input_id AS doc
      FROM pages p JOIN deps d ON d.artifact_kind = 'page' AND d.artifact_id = p.path AND d.input_kind = 'document'

@@ -638,10 +638,25 @@ private struct ProcessingPanel: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            // only where the workspace has content languages on: elsewhere nothing is translated
+            if let translations = status?.translations, translations.enabled {
+                Text(translations.queueLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if let remote = status?.remoteWorkers, remote > 0 {
                 Text(L("%@ remote workers are taking work too — they are started on their own machines.", String(remote)))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+            // starting spends model calls: what it would take, before anyone presses Start
+            if !running && status?.processing != nil {
+                Divider()
+                ScrollView {
+                    EstimateSection { try await model.client().processingEstimate() }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 380)
             }
             HStack {
                 if !model.maySaveSettings {
@@ -662,7 +677,7 @@ private struct ProcessingPanel: View {
             }
         }
         .padding(16)
-        .frame(width: 380)
+        .frame(width: running ? 380 : 460)
         .task { await model.refreshStats() }
     }
 

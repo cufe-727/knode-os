@@ -4,6 +4,7 @@ import { LlmConfig, LlmProtocol, resolveSecret } from '../../config.js';
 import type { LlmBackend, LlmProviderPlugin } from '../../plugins/types.js';
 import type { ChatMessage, CompletionOptions, ImageAttachment } from '../client.js';
 import { demoteToChat, negotiateProtocol } from '../protocol.js';
+import { usageFromOpenAi } from '../usage.js';
 
 /**
  * The built-in `openai` provider: a minimal client for any OpenAI-compatible
@@ -65,17 +66,14 @@ export class OpenAiCompatibleBackend implements LlmBackend {
 
   /** The Responses wire. `null` = no such route here; the caller falls back. */
   private async viaResponses(messages: ChatMessage[], opts: CompletionOptions, model: string): Promise<string | null> {
-    const res = await fetch(`${this.baseUrl}/responses`, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({
-        model,
-        input: withResponsesImages(messages, opts.images ?? []),
-        temperature: 0.2,
-        ...(opts.maxTokens ? { max_output_tokens: opts.maxTokens + REASONING_ALLOWANCE } : {}),
-        ...(opts.json ? { text: { format: { type: 'json_object' } } } : {}),
-      }),
+    const request = JSON.stringify({
+      model,
+      input: withResponsesImages(messages, opts.images ?? []),
+      temperature: 0.2,
+      ...(opts.maxTokens ? { max_output_tokens: opts.maxTokens + REASONING_ALLOWANCE } : {}),
+      ...(opts.json ? { text: { format: { type: 'json_object' } } } : {}),
     });
+    const res = await fetch(`${this.baseUrl}/responses`, { method: 'POST', headers: this.headers(), body: request });
     if (ROUTE_MISSING.has(res.status)) {
       await res.text().catch(() => '');
       // a pinned wire reports the missing route instead of quietly changing wires
@@ -86,29 +84,38 @@ export class OpenAiCompatibleBackend implements LlmBackend {
       const body = await res.text();
       throw new Error(`responses request failed (${res.status}): ${body.slice(0, 300)}`);
     }
-    return textFromResponses(await res.json());
+    const body = await res.text();
+    const json = JSON.parse(body) as unknown;
+    reportUsage(opts, json, request, body);
+    return textFromResponses(json);
   }
 
   /** The Chat Completions wire: what most "OpenAI-compatible" endpoints mean. */
   private async viaChatCompletions(messages: ChatMessage[], opts: CompletionOptions, model: string): Promise<string> {
-    const res = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({
-        model,
-        messages: withOpenAiImages(messages, opts.images ?? []),
-        temperature: 0.2,
-        ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
-        ...(opts.json ? { response_format: { type: 'json_object' } } : {}),
-      }),
+    const request = JSON.stringify({
+      model,
+      messages: withOpenAiImages(messages, opts.images ?? []),
+      temperature: 0.2,
+      ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
+      ...(opts.json ? { response_format: { type: 'json_object' } } : {}),
     });
+    const res = await fetch(`${this.baseUrl}/chat/completions`, { method: 'POST', headers: this.headers(), body: request });
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`chat request failed (${res.status}): ${body.slice(0, 300)}`);
     }
-    const json = (await res.json()) as { choices: { message: { content: string } }[] };
+    const body = await res.text();
+    const json = JSON.parse(body) as { choices: { message: { content: string } }[] };
+    reportUsage(opts, json, request, body);
     return json.choices[0]?.message?.content ?? '';
   }
+}
+
+/** Tell the caller what a call used: the endpoint's own count, and the bodies that went each way. */
+function reportUsage(opts: CompletionOptions, json: unknown, request: string, response: string): void {
+  if (!opts.onUsage) return;
+  const usage = usageFromOpenAi(json);
+  if (usage) opts.onUsage({ ...usage, bytesUp: Buffer.byteLength(request), bytesDown: Buffer.byteLength(response) });
 }
 
 export function openAiProvider(): LlmProviderPlugin {

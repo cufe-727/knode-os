@@ -23,7 +23,7 @@ class CliBackend implements LlmBackend {
 
   complete(messages: ChatMessage[], opts: CompletionOptions = {}): Promise<string> {
     // maxTokens is not controllable through the CLIs; the prompts already bound output size
-    return completeViaCli(this.cfg, messages, { json: opts.json, model: opts.model, images: opts.images?.map((image) => image.path) });
+    return completeViaCli(this.cfg, messages, { json: opts.json, model: opts.model, images: opts.images?.map((image) => image.path), onUsage: opts.onUsage });
   }
 }
 

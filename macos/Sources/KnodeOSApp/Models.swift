@@ -345,6 +345,52 @@ struct LabelingStatusResponse: Decodable, Equatable {
     var processing: ProcessingState?
     var scheduler: Scheduler?
     var local: [LocalBackend]
+    /// The Translate stage's leased work (docs/design/17); nil from an older service.
+    var translations: Translations?
+
+    /// Counted in translations — a document into one language — which is
+    /// what `due` and the last hour count; a long document's segments can be
+    /// out to several workers at once, so the leases are folded to that.
+    struct Translations: Decodable, Equatable {
+        var enabled: Bool
+        var primary: String?
+        var due: Int
+        var leases: [Lease]
+        var lastHour: Hour?
+
+        /// Optional, like everything this panel reads, so an odd lease can
+        /// never cost the whole status.
+        struct Lease: Decodable, Equatable {
+            var document: String?
+            var language: String?
+        }
+
+        struct Hour: Decodable, Equatable {
+            var calls: Int?
+            var documents: Int?
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+            primary = try container.decodeIfPresent(String.self, forKey: .primary)
+            due = try container.decodeIfPresent(Int.self, forKey: .due) ?? 0
+            leases = try container.decodeIfPresent([Lease].self, forKey: .leases) ?? []
+            lastHour = try container.decodeIfPresent(Hour.self, forKey: .lastHour)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case enabled, primary, due, leases, lastHour
+        }
+
+        /// Translations a worker holds a segment of right now.
+        var inProgress: Int { Set(leases.map { "\($0.document ?? "")\u{0}\($0.language ?? "")" }).count }
+
+        /// One line for the processing panel and the Translate stage alike.
+        @MainActor var queueLine: String {
+            L("Translations: %@ due, %@ in progress, %@ written in the last hour", String(due), String(inProgress), String(lastHour?.documents ?? 0))
+        }
+    }
 
     struct Scheduler: Decodable, Equatable {
         var queued: Int
@@ -450,6 +496,161 @@ struct FileResponse: Decodable {
     /// True when the text is Markdown knode-os derived from a PDF or image
     /// rather than the file's own bytes — readable, never editable.
     var derived: Bool?
+    /// The document's languages, for an indexed raw/docs document in a
+    /// workspace with content languages on. An older service sends none.
+    var languages: FileLanguages?
+    /// Only when `content` is a translation rather than the original.
+    var translation: FileTranslation?
+}
+
+/// What `GET /api/file` says about a document's languages (docs/design/17 §4):
+/// which one it is written in, which ones a reader may pick, and how far the
+/// translation into each one got.
+struct FileLanguages: Decodable, Equatable {
+    /// The language the document is written in; nil for a text without letters.
+    var source: String?
+    var primary: String?
+    /// The workspace's languages, the primary first, and the document's own
+    /// when it is neither.
+    var offered: [String]
+    /// The language `content` is in: the asked one when it is translated,
+    /// else the source.
+    var shown: String?
+    var translations: [String: TranslationState]
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        source = try container.decodeIfPresent(String.self, forKey: .source)
+        primary = try container.decodeIfPresent(String.self, forKey: .primary)
+        offered = try container.decodeIfPresent([String].self, forKey: .offered) ?? []
+        shown = try container.decodeIfPresent(String.self, forKey: .shown)
+        translations = try container.decodeIfPresent([String: TranslationState].self, forKey: .translations) ?? [:]
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case source, primary, offered, shown, translations
+    }
+}
+
+/// One language of a document: "source" for its own, then "none",
+/// "requested", "partial", "done", "failed" or "skipped".
+struct TranslationState: Decodable, Equatable {
+    var status: String
+    var parts: Int
+    var done: Int
+    var model: String?
+    var generatedAt: String?
+    var requested: Bool?
+    var error: String?
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decodeIfPresent(String.self, forKey: .status) ?? "none"
+        parts = try container.decodeIfPresent(Int.self, forKey: .parts) ?? 0
+        done = try container.decodeIfPresent(Int.self, forKey: .done) ?? 0
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        generatedAt = try container.decodeIfPresent(String.self, forKey: .generatedAt)
+        requested = try container.decodeIfPresent(Bool.self, forKey: .requested)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+
+    init(status: String, parts: Int = 0, done: Int = 0, requested: Bool? = nil) {
+        self.status = status
+        self.parts = parts
+        self.done = done
+        self.requested = requested
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case status, parts, done, model, generatedAt, requested, error
+    }
+}
+
+/// The translation `content` is: a partial one has `done` of `parts`
+/// segments translated and the original standing in for the rest. All of it
+/// optional, so a surprise here never keeps the file itself from opening.
+struct FileTranslation: Decodable, Equatable {
+    var language: String?
+    var done: Int?
+    var parts: Int?
+    var model: String?
+}
+
+/// `POST /api/file/translate`. `processing` false says this machine's
+/// processing is stopped, so the request waits for it — or for a remote
+/// worker; a withdrawn request answers without it.
+struct TranslationRequestResponse: Decodable {
+    var ok: Bool?
+    var status: String?
+    var processing: Bool?
+}
+
+/// A language knode-os can detect and translate into (`LANGUAGES` in
+/// src/lang/languages.ts): `native` is what a switcher shows, `english`
+/// what a settings list explains it with.
+struct ContentLanguage: Decodable, Identifiable, Hashable {
+    var code: String
+    var english: String
+    var native: String
+    var prompt: String?
+
+    var id: String { code }
+
+    /// The service's catalog as of docs/design/17, for an older service that
+    /// has no `GET /api/languages`, and for naming a language in the file
+    /// view without asking for the list again.
+    static let builtin: [ContentLanguage] = [
+        ContentLanguage(code: "zh", english: "Chinese (Simplified)", native: "简体中文"),
+        ContentLanguage(code: "zh-Hant", english: "Chinese (Traditional)", native: "繁體中文"),
+        ContentLanguage(code: "en", english: "English", native: "English"),
+        ContentLanguage(code: "ja", english: "Japanese", native: "日本語"),
+        ContentLanguage(code: "ko", english: "Korean", native: "한국어"),
+        ContentLanguage(code: "fr", english: "French", native: "Français"),
+        ContentLanguage(code: "de", english: "German", native: "Deutsch"),
+        ContentLanguage(code: "es", english: "Spanish", native: "Español"),
+        ContentLanguage(code: "pt", english: "Portuguese", native: "Português"),
+        ContentLanguage(code: "it", english: "Italian", native: "Italiano"),
+        ContentLanguage(code: "ru", english: "Russian", native: "Русский"),
+    ]
+
+    init(code: String, english: String, native: String, prompt: String? = nil) {
+        self.code = code
+        self.english = english
+        self.native = native
+        self.prompt = prompt
+    }
+
+    /// A code by its own name — 简体中文, English — or the code itself for a
+    /// language this catalog does not know.
+    static func nativeName(_ code: String) -> String {
+        builtin.first { $0.code.caseInsensitiveCompare(code) == .orderedSame }?.native ?? code
+    }
+
+    /// The same in English, which `L` turns into the interface's language —
+    /// what a sentence names a language by: "Translated from Japanese".
+    static func englishName(_ code: String) -> String {
+        builtin.first { $0.code.caseInsensitiveCompare(code) == .orderedSame }?.english ?? code
+    }
+
+    /// Whether text in `a` needs no translation into `b`, the Chinese scripts
+    /// counted as one, as the service's `sameLanguage` counts them: detection
+    /// reads the script and cannot tell simplified from traditional.
+    static func same(_ a: String?, _ b: String?) -> Bool {
+        guard let a, let b else { return false }
+        func base(_ code: String) -> String { code.split(separator: "-").first.map { $0.lowercased() } ?? code.lowercased() }
+        return base(a) == base(b)
+    }
+}
+
+/// `GET /api/languages`: the languages knode-os knows and the workspace's own
+/// settings, for pickers.
+struct LanguagesResponse: Decodable {
+    var languages: [ContentLanguage]
+    var enabled: Bool?
+    var primary: String?
+    var secondary: [String]?
+    var offered: [String]?
+    var maxChars: Int?
 }
 
 /// The wiki pages citing a raw/docs file (`GET /api/file/citations`): its
@@ -1253,14 +1454,69 @@ struct ExtractionConfig: Codable, Equatable {
     /// The Judge stage: knode_ask, Dream, the duplicate-entity review after
     /// each extraction pass and the disputed-claim review.
     var judgeLlm: RoutedLLMConfig
+    /// The Translate stage: documents into the content languages, segment by
+    /// segment. A service from before it sends none, and starts its own as a
+    /// copy of the Summarize route (`migrateTranslateRoute`) — so does this
+    /// mirror, which keeps the stage's form one shape either way.
+    var translateLlm: RoutedLLMConfig
     /// Model calls per background pass: extraction calls (a long document
     /// takes one per segment) and, separately, summaries.
     var batchSize: Int
     /// Parallel model calls in a background pass, for both.
     var concurrency: Int
+    /// This machine's translation slots; nil follows `concurrency`, and 0
+    /// leaves translations to remote workers.
+    var translateConcurrency: Int?
     /// Longest text one extraction call reads (characters); a longer document
     /// is read in segments. File-only — shown, never sent back as a change.
     var segmentChars: Int?
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        claims = try container.decode(Bool.self, forKey: .claims)
+        entityLlm = try container.decode(RoutedLLMConfig.self, forKey: .entityLlm)
+        documentLlm = try container.decode(RoutedLLMConfig.self, forKey: .documentLlm)
+        summaryLlm = try container.decode(RoutedLLMConfig.self, forKey: .summaryLlm)
+        judgeLlm = try container.decode(RoutedLLMConfig.self, forKey: .judgeLlm)
+        translateLlm = try container.decodeIfPresent(RoutedLLMConfig.self, forKey: .translateLlm) ?? summaryLlm
+        batchSize = try container.decode(Int.self, forKey: .batchSize)
+        concurrency = try container.decode(Int.self, forKey: .concurrency)
+        translateConcurrency = try container.decodeIfPresent(Int.self, forKey: .translateConcurrency)
+        segmentChars = try container.decodeIfPresent(Int.self, forKey: .segmentChars)
+    }
+}
+
+/// The workspace's content languages (`languages` in knode.config.json,
+/// docs/design/17): the primary language the knowledge is read in, which
+/// every other document is translated into in the background, and the
+/// secondary ones a reader may ask for. Not the interface language, which is
+/// each person's own and never part of the workspace.
+struct LanguagesConfig: Codable, Equatable {
+    /// Off: nothing is translated, summaries keep the document's language,
+    /// readers see no switcher.
+    var enabled: Bool
+    /// A code from the service's catalog; empty = not chosen yet, which the
+    /// service refuses together with `enabled`.
+    var primary: String
+    var secondary: [String]
+    /// Longest document translated without a request, in characters; 0 = no limit.
+    var maxChars: Int
+
+    init(enabled: Bool = false, primary: String = "", secondary: [String] = [], maxChars: Int = 200_000) {
+        self.enabled = enabled
+        self.primary = primary
+        self.secondary = secondary
+        self.maxChars = maxChars
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = LanguagesConfig()
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? fallback.enabled
+        primary = try container.decodeIfPresent(String.self, forKey: .primary) ?? fallback.primary
+        secondary = try container.decodeIfPresent([String].self, forKey: .secondary) ?? fallback.secondary
+        maxChars = try container.decodeIfPresent(Int.self, forKey: .maxChars) ?? fallback.maxChars
+    }
 }
 
 /// What the Judge stage does with its verdicts: the service's `review.llmJudge`,
@@ -1448,6 +1704,9 @@ struct KnodeConfig: Codable, Equatable {
     var review: ReviewConfig
     var research: ResearchConfig
     var chat: ChatConfig
+    /// Nil from a service that predates content languages: it has no
+    /// Translate stage either, and the form says so instead of offering one.
+    var languages: LanguagesConfig?
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -1463,6 +1722,7 @@ struct KnodeConfig: Codable, Equatable {
         review = try container.decodeIfPresent(ReviewConfig.self, forKey: .review) ?? ReviewConfig()
         research = try container.decodeIfPresent(ResearchConfig.self, forKey: .research) ?? ResearchConfig()
         chat = try container.decodeIfPresent(ChatConfig.self, forKey: .chat) ?? ChatConfig()
+        languages = try container.decodeIfPresent(LanguagesConfig.self, forKey: .languages)
     }
 
     /// The entry the Index stage runs on, or nil while the list is still loading.
@@ -1692,6 +1952,7 @@ struct ConfigTestResponse: Decodable {
     var documentLlm: RouteTestResult?
     var summaryLlm: RouteTestResult?
     var judgeLlm: RouteTestResult?
+    var translateLlm: RouteTestResult?
 }
 
 /// One entry of what a provider offers for a `model` field. The field itself

@@ -15,6 +15,7 @@ import { REMOTE_TOKENS_FILE, RemoteTokenStore } from '../src/remote/tokens.js';
 import { createApp } from '../src/server/app.js';
 import { hostnameOf, isPublicRequest } from '../src/server/public-guard.js';
 import { resolveWorkspaceScope, WorkspaceContextRegistry } from '../src/server/workspaces.js';
+import { CallLedger } from '../src/estimate/ledger.js';
 import { WorkBroker } from '../src/work/broker.js';
 import { JudgeSource } from '../src/work/judge.js';
 import { SummarySource } from '../src/work/summarize.js';
@@ -80,6 +81,7 @@ describe('the remote API', () => {
   const schedulers = new Map<string, LabelingScheduler>();
   const brokers = new Map<string, WorkBroker>();
   const judgeSources = new Map<string, JudgeSource>();
+  const ledgers = new Map<string, CallLedger>();
   const tok: Record<string, string> = {};
 
   /** A request as a client on this machine (or through an SSH tunnel) sends it, or as it arrives through the Cloudflare Tunnel. */
@@ -119,10 +121,12 @@ describe('the remote API', () => {
         const scheduler = new LabelingScheduler({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, onWritten: (p) => summaries?.prefer(p) }, { priorityRefreshMs: 0 });
         summaries = new SummarySource(ctx, {}, { idleScanMs: 0 });
         const judges = new JudgeSource({ enabled: () => true }, { modelRetryMs: 0, transientRetryMs: 0 });
-        const broker = new WorkBroker([scheduler, summaries, judges], { shares: () => ctx.config.server.remote?.shares });
+        const ledger = CallLedger.forWorkspace(ctx.dataDir, { flushMs: 60_000 });
+        const broker = new WorkBroker([scheduler, summaries, judges], { shares: () => ctx.config.server.remote?.shares, ledger });
         schedulers.set(ctx.dataDir, scheduler);
         brokers.set(ctx.dataDir, broker);
         judgeSources.set(ctx.dataDir, judges);
+        ledgers.set(ctx.dataDir, ledger);
         return async () => {
           schedulers.delete(ctx.dataDir);
           brokers.delete(ctx.dataDir);
@@ -275,8 +279,10 @@ describe('the remote API', () => {
       expect(config).toMatchObject({ kinds: { extract: true, summarize: true, judge: false }, shares: { extract: 3, summarize: 1 }, leaseSeconds: { llm: 900 } });
       expect(config.version).toMatch(/^[0-9a-f]{16}$/);
       // the workspace's models are endpoints, so there is no CLI to hint at
-      expect(config.hints).toEqual({ extract: {}, summarize: {}, judge: {} });
-      expect(((await (await req(`${ws}/work/config`, { token: tok.extractor })).json()) as Config).kinds).toEqual({ extract: true, summarize: false, judge: false });
+      expect(config.hints).toEqual({ extract: {}, summarize: {}, judge: {}, translate: {} });
+      // translations are offered only where the workspace has content languages on (docs/design/17)
+      expect(config.kinds.translate).toBe(false);
+      expect(((await (await req(`${ws}/work/config`, { token: tok.extractor })).json()) as Config).kinds).toEqual({ extract: true, summarize: false, judge: false, translate: false });
       expect((await req(`${ws}/work/config`, { token: tok.reader })).status).toBe(403);
 
       // the workspace stops offering summaries: the config says so under a new version, and none is leased
@@ -434,6 +440,12 @@ describe('the remote API', () => {
       const summaryCalls = fake.calls.filter((call) => textOf(call.messages?.[0]?.content).includes('Summarize the document'));
       expect(summaryCalls.length).toBe(2);
       for (const call of summaryCalls) expect(call).not.toHaveProperty('response_format');
+      // the worker sent back what its endpoint counted, and the server measured each answer (docs/design/18)
+      const measured = ledgers.get(fin.dataDir)!.route('extract', 'api:fake-model')!;
+      expect(measured).toMatchObject({ remote: true, failed: 0 });
+      expect(measured.measured.calls).toBe(measured.ok);
+      expect(measured.measured.input / measured.measured.calls).toBe(20);
+      expect(measured.bytes.calls).toBe(measured.ok);
     });
 
     it('answers the judge calls a review waits on, where the workspace offers them', async () => {
