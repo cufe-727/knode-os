@@ -585,6 +585,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   summaries = new SummarySource(ctx, { serialize: followUp.serialize, log }, { leaseMs });
   // translations into the content languages (docs/design/17): idle while they are off
   const translations = new TranslateSource({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, log }, { leaseMs });
+  void translations.backfill();
   // every answered call is measured, so the next estimate learns from it (docs/design/18)
   const calls = CallLedger.forWorkspace(ctx.dataDir, { log });
   const work = new WorkBroker([labeling, summaries, judges, translations], { shares: () => ctx.config.server.remote?.shares, ledger: calls });

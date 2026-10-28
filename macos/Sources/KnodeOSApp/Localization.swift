@@ -776,6 +776,7 @@ private let zhHansPairs: [(String, String)] = [
     ("Extraction", "抽取"),
     ("Summary pages", "摘要页"),
     ("Duplicate reviews", "重复审查"),
+    ("Translations", "翻译"),
     ("Start research?", "开始研究？"),
     ("%@ pages and a report: a collector gathers each page's sources, an agent writes each page, then the report — measured against the studies run here before.", "%@ 个页面加一份报告：每页先由收集者汇集来源，再由 agent 撰写，最后写报告——按此前在这里运行过的研究估算。"),
     // sign-in (src/auth) and connections
