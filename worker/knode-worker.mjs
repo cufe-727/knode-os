@@ -11,7 +11,8 @@
 //     --workspace admin/finance --backends codex:2,cursor:2
 //
 // Backends (slots after the colon):
-//   codex   codex exec, read-only sandbox, ~/.codex/config.toml ignored (--codex-model, --codex-effort, --codex-speed)
+//   codex   codex exec, read-only sandbox, ~/.codex/config.toml ignored, plugins and analytics off
+//           (--codex-model, --codex-effort, --codex-speed)
 //   cursor  cursor-agent -p in ask mode (--cursor-model)
 //   claude  claude -p, one turn (--claude-model, --claude-effort)
 //   api     an OpenAI-compatible /chat/completions endpoint (--api-base-url, --api-model;
@@ -266,7 +267,12 @@ const BACKENDS = {
       const ws = path.join(dir, 'workspace');
       fs.mkdirSync(ws);
       try {
-        const argv = ['exec', '--ignore-user-config', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', ws, '--output-last-message', out];
+        // plugins on would download ChatGPT's whole plugin catalog (~15 MB) on every call; analytics
+        // on uploads ~0.65 MB of metrics at exit. `-c`, unlike --disable, is ignored by a Codex without them.
+        const argv = [
+          'exec', '--ignore-user-config', '--ephemeral', '-c', 'features.plugins=false', '-c', 'analytics.enabled=false',
+          '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', ws, '--output-last-message', out,
+        ];
         if (model) argv.push('--model', String(model));
         if (effort) argv.push('-c', `model_reasoning_effort="${effort}"`);
         if (speed) argv.push('-c', `service_tier="${speed}"`);

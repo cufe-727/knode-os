@@ -14,7 +14,8 @@ import type { ChatMessage } from './client.js';
  * All run in non-interactive one-shot mode with the OS temp dir as cwd so
  * the CLIs don't pick up repo instructions (AGENTS.md / CLAUDE.md) or try to
  * touch the workspace:
- *   - codex:  `codex exec --ignore-user-config --ephemeral --sandbox read-only --output-last-message <f> -`
+ *   - codex:  `codex exec --ignore-user-config --ephemeral -c features.plugins=false -c analytics.enabled=false
+ *             --sandbox read-only --output-last-message <f> -`
  *   - claude: `claude -p --output-format json --max-turns 1`
  *   - cursor: `cursor-agent -p --output-format json --trust <prompt>` (`--trust` answers the
  *             workspace-trust prompt newer CLIs raise for the temp cwd; the model still
@@ -144,10 +145,21 @@ export async function completeViaCli(
  * `--ephemeral` keeps tens of thousands of extraction sessions out of
  * ~/.codex/sessions, where trace sync would read them back as agent traces.
  * Model, effort and speed are passed explicitly instead.
+ *
+ * Plugins are turned off too. They are on by default, `--ignore-user-config`
+ * or not, and with them every start downloads ChatGPT's whole plugin catalog
+ * (about 15 MB in Codex 0.161, ten times the call itself) and starts the MCP
+ * servers of the plugins installed on the account, none of which a one-shot
+ * call uses. Analytics off drops the usage metrics (about 0.65 MB) each
+ * process uploads as it exits. Both go through `-c`: a Codex without the
+ * setting ignores it there, while `--disable <feature>` would fail the call.
  */
 export function codexExecArgs(opts: { outFile: string; cwd: string; model?: string; effort?: LlmEffort; speed?: LlmSpeed; images?: string[] }): string[] {
   // --output-last-message gives the bare final message without parsing JSONL events
-  const args = ['exec', '--ignore-user-config', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', opts.cwd, '--output-last-message', opts.outFile];
+  const args = [
+    'exec', '--ignore-user-config', '--ephemeral', '-c', 'features.plugins=false', '-c', 'analytics.enabled=false',
+    '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', opts.cwd, '--output-last-message', opts.outFile,
+  ];
   if (opts.model) args.push('--model', opts.model);
   const effort = effortFor('codex-cli', opts.effort);
   if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);

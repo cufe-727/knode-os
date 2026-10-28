@@ -10,7 +10,7 @@ import { estimateTokens } from '../src/llm/tokens.js';
 import { createEmbeddingProvider, LocalHashEmbeddingProvider } from '../src/ingest/embeddings.js';
 import { slugify } from '../src/graph/store.js';
 import { extractWikilinks } from '../src/graph/wire.js';
-import { completeViaCli, renderCliPrompt } from '../src/llm/cli.js';
+import { codexExecArgs, completeViaCli, renderCliPrompt } from '../src/llm/cli.js';
 import { LlmClient } from '../src/llm/client.js';
 import { queryTerms } from '../src/search/search.js';
 
@@ -238,6 +238,14 @@ echo -n '{"entities":[{"name":"PGlite","type":"technology"}]}' > "$out"
     expect(client.label).toBe('codex-cli');
     const res = await client.completeJson<{ entities: { name: string }[] }>([{ role: 'user', content: 'x' }]);
     expect(res.entities[0].name).toBe('PGlite');
+  });
+
+  it('codex-cli: turns plugins and analytics off for a one-shot call', () => {
+    // with plugins on, every start downloads ChatGPT's whole plugin catalog (~15 MB)
+    const args = codexExecArgs({ outFile: '/tmp/out.txt', cwd: '/tmp', images: ['/tmp/page.png'] }).join(' ');
+    expect(args).toContain('--ignore-user-config --ephemeral -c features.plugins=false -c analytics.enabled=false');
+    expect(args).not.toContain('--disable'); // fails the call on a Codex that lacks the feature
+    expect(args).toMatch(/--image \/tmp\/page\.png -$/);
   });
 
   it('claude-cli: unwraps the --output-format json result field', async () => {

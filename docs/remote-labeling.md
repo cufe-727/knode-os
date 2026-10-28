@@ -82,9 +82,12 @@ Without `workers`, the Extract stage's own route runs with `extraction.concurren
 only hands that work to remote workers. Judge calls run on the Judge stage's route, `review.concurrency` at a time
 (default 2); 0 leaves them to remote workers. Saving settings
 (`PUT /api/config`) takes effect within a minute. No restart is needed. Codex runs as
-`codex exec --ignore-user-config --ephemeral` for every pipeline call, so your `~/.codex/config.toml` (MCP
-servers, memory, default model) stays out of extraction prompts. It also keeps tens of thousands of
-sessions out of `~/.codex/sessions`.
+`codex exec --ignore-user-config --ephemeral -c features.plugins=false -c analytics.enabled=false` for every
+pipeline call, so your `~/.codex/config.toml` (MCP servers, memory, default model) stays out of extraction
+prompts. It also keeps tens of thousands of sessions out of `~/.codex/sessions`. Plugins are on by default
+even without that file. Left on, every call would first download ChatGPT's whole plugin catalog (about
+15 MB, ten times the call itself) and start the servers of the plugins on your account. Analytics would
+upload about 0.65 MB of usage metrics as each call exits.
 
 `GET /api/labeling/status` (UI headers) shows whether processing runs, the extraction queue, the summaries due,
 leases, every worker seen and the local slots' health.
