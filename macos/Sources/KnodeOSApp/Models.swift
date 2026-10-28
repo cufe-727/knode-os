@@ -24,7 +24,7 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
         case .ask: [.ask]
         case .research: [.studies]
         case .knowledge: [.graph, .entities, .wiki, .dream]
-        case .settings: [.providers, .pipeline, .research, .chat, .workspace, .access]
+        case .settings: [.providers, .pipeline, .research, .chat, .playbooks, .workspace, .access]
         }
     }
 
@@ -82,6 +82,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
     case pipeline
     case research
     case chat
+    case playbooks
     case workspace
     case access
 
@@ -103,7 +104,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .ask: .ask
         case .studies: .research
         case .graph, .entities, .wiki, .dream: .knowledge
-        case .providers, .pipeline, .research, .chat, .workspace, .access: .settings
+        case .providers, .pipeline, .research, .chat, .playbooks, .workspace, .access: .settings
         }
     }
 
@@ -132,6 +133,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .pipeline: L("Ingest")
         case .research: L("Research")
         case .chat: L("Ask")
+        case .playbooks: L("Playbooks")
         case .workspace: L("Workspace")
         case .access: L("Access")
         }
@@ -152,6 +154,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .pipeline: L("How documents get processed")
         case .research: L("How the wiki gets written")
         case .chat: L("How questions get answered")
+        case .playbooks: L("Templates, prompts, and vocabularies agents follow")
         case .workspace: L("Clear this workspace")
         case .access: L("Your account; users and gateways of this server")
         }
@@ -172,6 +175,7 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         case .pipeline: "tray.and.arrow.down"
         case .research: "book.and.wrench"
         case .chat: "bubble.left.and.bubble.right"
+        case .playbooks: "doc.badge.gearshape"
         case .workspace: "exclamationmark.triangle"
         case .access: "person.badge.key"
         }
@@ -422,9 +426,19 @@ struct TreeNode: Decodable, Identifiable, Hashable {
     var bytes: Int?
     var mtime: String?
     var children: [TreeNode]?
+    /// What a folder knode-os makes is for (FOLDER_ABOUT in the service), in
+    /// English; the row shows it through `L`, which knows every one.
+    var about: String?
+    /// The folder on the service's machine a linked folder mirrors.
+    var linked: String?
 
     var id: String { path.isEmpty ? "__root__" : path }
     var isWritable: Bool { path == "wiki" || path.hasPrefix("wiki/") || path == "raw/docs" || path.hasPrefix("raw/docs/") }
+
+    /// Root files the file view may edit although nothing else may happen to
+    /// them there — no move, rename or delete: what the workspace is for and
+    /// the rules its wiki follows (OWNER_ROOT_FILES in the service).
+    static let ownerRootFiles: Set<String> = ["purpose.md", "schema.md"]
 }
 
 struct FileResponse: Decodable {
@@ -754,6 +768,112 @@ struct UploadItem {
 
 struct ActionResponse: Decodable {
     var ok: Bool
+}
+
+/// What a pass over the configured datasources did (`POST /api/datasources/sync`).
+struct DatasourceSyncResponse: Decodable {
+    var sources: Int
+    var wikiPages: Int
+    var errors: [String]
+}
+
+/// What the service says a person should know about the workspace
+/// (`GET /api/notices`, src/server/notices.ts): data, not sentences — the app
+/// words each kind in the interface language. `id` is the kind, of which there
+/// is at most one; `key` changes when the notice says something new.
+struct NoticesResponse: Decodable {
+    var notices: [WorkspaceNotice]
+}
+
+struct WorkspaceNotice: Decodable, Identifiable, Hashable {
+    /// lint, traces-off, purpose, initialize or datasources.
+    var id: String
+    var key: String
+    /// info or warn.
+    var level: String
+    // lint: the newest report, and the one before it
+    var report: String?
+    var date: String?
+    var summary: LintSummary?
+    var previous: LintPrevious?
+    // traces-off: what collecting would copy
+    var sessions: Int?
+    var bytes: Int?
+    // purpose: the file to write
+    var path: String?
+    // initialize: which of the two exist already
+    var overview: Bool?
+    var guide: Bool?
+    // datasources: the last pass
+    var at: String?
+    var sources: Int?
+    var errors: [String]?
+}
+
+/// A lint report's counts, as its summary line states them.
+struct LintSummary: Decodable, Hashable {
+    var pages: Int
+    var findings: Int
+    var counts: LintCounts
+}
+
+/// The kinds of finding (the service's LintKind; the decoder turns `broken_link` into `brokenLink`).
+struct LintCounts: Decodable, Hashable {
+    var orphan: Int?
+    var brokenLink: Int?
+    var staleResearch: Int?
+    var unreviewed: Int?
+    var expired: Int?
+    var supersededText: Int?
+    var openDispute: Int?
+}
+
+struct LintPrevious: Decodable, Hashable {
+    var date: String
+    var summary: LintSummary
+}
+
+/// playbooks/ as Settings edits it (`GET /api/playbooks`, src/fs/playbooks.ts).
+struct PlaybooksResponse: Decodable {
+    var groups: [PlaybookGroup]
+}
+
+struct PlaybookGroup: Decodable, Identifiable, Hashable {
+    /// research, phases, packs, intents, ontology, concepts, capabilities, chat, agents, profiles or sources.
+    var id: String
+    var dir: String
+    /// providers, research or sources: the page that edits the whole group, files or none.
+    var managedIn: String?
+    var files: [PlaybookFile]
+}
+
+struct PlaybookFile: Decodable, Identifiable, Hashable {
+    var id: String { path }
+    var path: String
+    var name: String
+    var bytes: Int
+    var mtime: String
+    /// knode-os ships a version of the file: a reset writes it back.
+    var builtin: Bool
+    /// The file differs from that version.
+    var modified: Bool
+    /// knode-os regenerates the file, so an edit would not last.
+    var readonly: Bool
+    /// providers, research or sources: the page that edits the file instead.
+    var managedIn: String?
+}
+
+/// One playbook with its text, as reading, saving and resetting return it.
+struct PlaybookText: Decodable {
+    var file: PlaybookFile
+    var text: String
+
+    private enum CodingKeys: String, CodingKey { case text }
+
+    init(from decoder: Decoder) throws {
+        file = try PlaybookFile(from: decoder)
+        text = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .text)
+    }
 }
 
 /// One pre-flight step of an initialization (index, extract, regenerate, survey).

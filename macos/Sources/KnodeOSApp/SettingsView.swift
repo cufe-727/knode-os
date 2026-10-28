@@ -17,6 +17,8 @@ struct SettingsView: View {
     @State private var hoveredStage: PipelineStage?
     /// Model lists, shared by every picker on the screen.
     @StateObject private var catalog = ModelCatalog()
+    /// The Playbooks tab's groups and open draft, kept across the other tabs.
+    @StateObject private var playbooks = PlaybooksEditor()
     /// The named agents Ask and Research point at (the second table on 01).
     @State private var agents: [AgentDefinition] = []
     @State private var agentToRemove: AgentDefinition?
@@ -116,6 +118,7 @@ struct SettingsView: View {
                     case .pipeline: pipelineSection
                     case .research: researchSection
                     case .chat: askSection
+                    case .playbooks: PlaybooksSettingsSection(editor: playbooks)
                     case .workspace: workspaceDangerSection
                     default: providersSection
                     }
@@ -154,7 +157,13 @@ struct SettingsView: View {
             .labelsHidden()
             .frame(width: 148)
             .help(L("Interface language — prompts and pages keep the language they are written in"))
-            if model.maySaveSettings {
+            if !model.maySaveSettings {
+                // the service refuses a member's changes; say so instead of offering them
+                Label(L("Read-only: settings are an administrator's"), systemImage: "lock")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if model.selectedTab != .playbooks {
+                // a playbook saves from its own editor: these two are the config's
                 Button(L("Test stages")) { Task { await test() } }
                     .disabled(config == nil || isWorking)
                     .help(L("Sends one real request per configured stage, before you save."))
@@ -162,11 +171,6 @@ struct SettingsView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.knodeCyan)
                     .disabled(config == nil || isWorking)
-            } else {
-                // the service refuses a member's changes; say so instead of offering them
-                Label(L("Read-only: settings are an administrator's"), systemImage: "lock")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
     }

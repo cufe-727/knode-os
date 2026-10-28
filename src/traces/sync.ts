@@ -29,11 +29,40 @@ export interface SyncTracesOptions {
 const MAX_TRACE_BYTES = 64 * 1024 * 1024;
 const TRACE_SYNC_SINCE_FILE = '.knode/trace-sync-since';
 
+/**
+ * Whether automatic trace collection waits here. A workspace that is created
+ * or cleared does not pull in this machine's agent sessions until someone
+ * collects them on purpose (`ignoreSince`), which lifts the pause.
+ */
+export function traceCollectionPaused(dataDir: string): boolean {
+  return fs.existsSync(path.join(dataDir, TRACE_SYNC_SINCE_FILE));
+}
+
+/** What collecting would copy: the sessions under the configured trace directories, as `syncTraces` picks them. */
+export function collectableTraces(config: KnodeConfig): { sessions: number; bytes: number } {
+  let sessions = 0;
+  let bytes = 0;
+  for (const root of [config.trace.claudeProjectsDir, config.trace.codexSessionsDir]) {
+    if (!root || !fs.existsSync(root)) continue;
+    for (const file of walkAbsolute(root)) {
+      if (!file.endsWith('.jsonl')) continue;
+      try {
+        const size = fs.statSync(file).size;
+        if (size === 0 || size > MAX_TRACE_BYTES) continue;
+        sessions++;
+        bytes += size;
+      } catch {
+        /* gone since the walk */
+      }
+    }
+  }
+  return { sessions, bytes };
+}
+
 export async function syncTraces(store: Store, config: KnodeConfig, options: SyncTracesOptions = {}): Promise<SyncStats> {
   const stats: SyncStats = { copied: 0, unchanged: 0, skills: 0 };
-  const pauseFile = path.join(store.dataDir, TRACE_SYNC_SINCE_FILE);
-  if (!options.ignoreSince && fs.existsSync(pauseFile)) return stats;
-  if (options.ignoreSince) fs.rmSync(pauseFile, { force: true });
+  if (!options.ignoreSince && traceCollectionPaused(store.dataDir)) return stats;
+  if (options.ignoreSince) fs.rmSync(path.join(store.dataDir, TRACE_SYNC_SINCE_FILE), { force: true });
 
   await syncTree(store, config.trace.claudeProjectsDir, path.join(store.dataDir, 'raw/traces/claude'), 'claude', stats);
   await syncTree(store, config.trace.codexSessionsDir, path.join(store.dataDir, 'raw/traces/codex'), 'codex', stats);

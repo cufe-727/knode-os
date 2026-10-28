@@ -56,6 +56,31 @@ export interface EntityLinks {
   top: { id: string; name: string; type: string; pages: number }[];
 }
 
+/** A report's counts, as its summary line states them (`parseLintSummary`). */
+export interface LintSummary {
+  pages: number;
+  findings: number;
+  counts: Partial<Record<LintKind, number>>;
+}
+
+/** The report's one-line summary under its title; the lint notice reads it back with `parseLintSummary`. */
+function summaryLine(pages: number, findings: number, counts: Record<LintKind, number>, entityLinks: EntityLinks): string {
+  const kinds = Object.entries(counts).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`).join(', ') || 'none';
+  return `> ${pages} pages · ${findings} findings: ${kinds}${entityLinks.links ? ` · ${entityLinks.links} links to ${entityLinks.entities} entities without a page` : ''}`;
+}
+
+/** The counts of a report `lintWiki` wrote, from its summary line; null for text that is not one. */
+export function parseLintSummary(report: string): LintSummary | null {
+  const m = /^> (\d+) pages · (\d+) findings: ([^·\n]*)/m.exec(report);
+  if (!m) return null;
+  const counts: Partial<Record<LintKind, number>> = {};
+  for (const part of m[3].split(',')) {
+    const kv = /^\s*([a-z_]+) (\d+)\s*$/.exec(part);
+    if (kv) counts[kv[1] as LintKind] = Number(kv[2]);
+  }
+  return { pages: Number(m[1]), findings: Number(m[2]), counts };
+}
+
 export interface LintReport {
   issues: LintIssue[];
   counts: Record<LintKind, number>;
@@ -300,7 +325,7 @@ export async function lintWiki(ctx: AppContext, opts: LintOptions = {}): Promise
       '',
       `# Wiki lint — ${today}`,
       '',
-      `> ${pages.length} pages · ${issues.length} findings: ${Object.entries(counts).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`).join(', ') || 'none'}${entityLinks.links ? ` · ${entityLinks.links} links to ${entityLinks.entities} entities without a page` : ''}`,
+      summaryLine(pages.length, issues.length, counts, entityLinks),
       '',
     ];
     for (const kind of Object.keys(counts) as LintKind[]) {

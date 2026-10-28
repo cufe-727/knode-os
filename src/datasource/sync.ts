@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { DataSourceConfig, DataSourceKind, EntityColumnConfig, KnodeConfig, SourceDialect } from '../config.js';
 import { judgeLlmClient } from '../context.js';
 import { resolveEntityIdByNameOrAlias, slugify } from '../graph/store.js';
@@ -299,7 +301,39 @@ export async function applyDatasourceScopes(
       }
     }
   }
+  // a workspace with no datasources has nothing to report, and full syncs come often
+  if (stats.sources > 0 || stats.errors.length > 0) writeDatasourceStatus(ctx.dataDir, { at: new Date().toISOString(), sources: stats.sources, errors: stats.errors });
   return stats;
+}
+
+/** Where the last pass over the datasources left its outcome: private state a notice reads. */
+const STATUS_FILE = '.knode/datasources.json';
+
+/** How the last pass over the configured datasources went (null before the first one). */
+export interface DatasourceStatus {
+  at: string;
+  sources: number;
+  errors: string[];
+}
+
+function writeDatasourceStatus(dataDir: string, status: DatasourceStatus): void {
+  try {
+    const file = path.join(dataDir, STATUS_FILE);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(status, null, 2) + '\n');
+  } catch {
+    /* the notice is a convenience; the pass itself succeeded or failed on its own */
+  }
+}
+
+export function readDatasourceStatus(dataDir: string): DatasourceStatus | null {
+  try {
+    const status = JSON.parse(fs.readFileSync(path.join(dataDir, STATUS_FILE), 'utf8')) as Partial<DatasourceStatus>;
+    if (typeof status.at !== 'string' || !Array.isArray(status.errors)) return null;
+    return { at: status.at, sources: Number(status.sources) || 0, errors: status.errors.map(String) };
+  } catch {
+    return null;
+  }
 }
 
 async function collectSamples(

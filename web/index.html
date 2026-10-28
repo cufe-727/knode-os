@@ -116,6 +116,10 @@
         <button data-section="settings" title="Model routes and pipeline limits">Settings</button>
       </nav>
       <div id="statsbar" title="documents / chunks / entities / relations"></div>
+      <div class="notices-area">
+        <button id="notices-toggle" class="notices-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="notices-panel" title="What this workspace needs you to know" hidden></button>
+        <div id="notices-panel" class="notices-panel" role="region" aria-label="Notices" hidden></div>
+      </div>
       <button id="processing-toggle" class="processing-toggle" type="button" hidden></button>
       <div class="account-area">
         <button id="workspace-trigger" class="workspace-trigger" type="button" aria-haspopup="menu" aria-expanded="false">
@@ -636,6 +640,24 @@
         </section>
 
         <div id="cfg-status" aria-live="polite"></div>
+
+        <section class="settings-section" data-subtab="playbooks" aria-labelledby="playbooks-title">
+          <div class="settings-section-head"><div><p class="section-index">05 · PLAYBOOKS</p><h3 id="playbooks-title">What knode-os works from</h3><p>The prompts research agents and Ask are given, how context is gathered for a question, what an answer needs, and the words the graph is written in. They live in playbooks/, which the file tree leaves out; a change applies to the next job that reads the file.</p></div><span id="pb-badge" class="section-badge accent2">Prompts &amp; vocabularies</span></div>
+          <div class="pb-layout">
+            <nav id="pb-groups" class="pb-groups" aria-label="Playbooks"></nav>
+            <div class="pb-editor">
+              <div class="pb-file-head"><span id="pb-path" class="mono"></span><span id="pb-tags"></span></div>
+              <p id="pb-note" class="hint" hidden></p>
+              <textarea id="pb-text" spellcheck="false" aria-labelledby="pb-path" readonly></textarea>
+              <div class="cfg-actions pb-actions">
+                <button id="pb-save" class="primary" type="button" disabled>Save</button>
+                <button id="pb-revert" type="button" disabled>Revert</button>
+                <button id="pb-reset" type="button" hidden>Reset to built-in</button>
+                <span id="pb-status" class="hint" aria-live="polite"></span>
+              </div>
+            </div>
+          </div>
+        </section>
 
         <section class="settings-section danger-zone" data-subtab="workspace" aria-labelledby="clear-workspace-title">
           <div>

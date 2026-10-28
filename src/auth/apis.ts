@@ -14,13 +14,13 @@
 
 export const API_GROUPS = {
   files: 'browse, read, edit, upload and move files; sync and unlink linked folders',
-  search: 'search, graph, entities, documents, claims, stats, lineage and history',
+  search: 'search, graph, entities, documents, claims, stats, notices, lineage and history',
   ask: 'Ask, chat and context packs',
   knowledge: 'wiki, research, dream, suggestions, merges and reviews',
   ingest: 'sync, ingest, forget, purge, rebuild and labeling status',
   traces: 'agent traces',
   datasources: 'configured live datasources and their read-only queries',
-  settings: 'workspace settings — models, connections, agents, profiles — clearing a workspace, and importing or linking a folder from this machine',
+  settings: 'workspace settings — models, connections, agents, profiles, playbooks — clearing a workspace, and importing or linking a folder from this machine',
   gateway: 'local services published through /gw/<id>',
 } as const;
 
@@ -48,6 +48,7 @@ const RULES: Rule[] = [
   { prefix: '/api/research/profiles', group: null, methods: READ },
   { prefix: '/api/research/sources', group: null, methods: READ },
   { prefix: '/api/chat/protocol', group: null, methods: READ },
+  { prefix: '/api/playbooks', group: null, methods: READ },
   { prefix: '/api/chat/readiness', group: null },
   { prefix: '/api/labeling/status', group: 'ingest' },
   // starting the processing spends the machine's model quota: an administrator's call
@@ -63,6 +64,7 @@ const RULES: Rule[] = [
   // a source can name a command for the server to run (an MCP server over stdio): an administrator's call
   { prefix: '/api/research/sources', group: 'settings' },
   { prefix: '/api/chat/protocol', group: 'settings' },
+  { prefix: '/api/playbooks', group: 'settings' },
   { prefix: '/api/workspace', group: 'settings' },
 
   { prefix: '/api/tree', group: 'files' },
@@ -98,6 +100,7 @@ const RULES: Rule[] = [
   { prefix: '/api/disputes', group: 'search' },
   { prefix: '/api/stats', group: 'search' },
   { prefix: '/api/survey', group: 'search' },
+  { prefix: '/api/notices', group: 'search' },
   { prefix: '/api/lineage', group: 'search' },
   { prefix: '/api/history', group: 'search' },
   { prefix: '/api/capabilities', group: 'search' },

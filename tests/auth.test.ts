@@ -101,6 +101,10 @@ describe('API groups', () => {
     expect(apiGroupOf('POST', '/api/disputes/x/resolve')).toBe('knowledge');
     expect(apiGroupOf('GET', '/api/research/profiles')).toBeNull();
     expect(apiGroupOf('PUT', '/api/research/profiles/deep')).toBe('settings');
+    // playbooks are read to draw Settings and written by an administrator; notices are workspace state
+    expect(apiGroupOf('GET', '/api/playbooks/file')).toBeNull();
+    expect(apiGroupOf('PUT', '/api/playbooks/file')).toBe('settings');
+    expect(apiGroupOf('GET', '/api/notices')).toBe('search');
     expect(apiGroupOf('POST', '/api/research/jobs')).toBe('knowledge');
     expect(apiGroupOf('GET', '/api/labeling/status')).toBe('ingest');
     // reading this machine's disk is an administrator's call; following an existing link is not
@@ -405,6 +409,7 @@ describe('sign-in in front of serve', () => {
       'DELETE /api/agents/:name',
       'DELETE /api/auth/gateways/:id',
       'DELETE /api/auth/users/:username',
+      'DELETE /api/playbooks/file',
       'DELETE /api/research/profiles/:name',
       'DELETE /api/research/sources/:id',
       'DELETE /api/workspace',
@@ -424,6 +429,7 @@ describe('sign-in in front of serve', () => {
       'PUT /api/agents/:name',
       'PUT /api/chat/protocol',
       'PUT /api/config',
+      'PUT /api/playbooks/file',
       'PUT /api/research/profiles/:name',
       'PUT /api/research/sources/:id',
     ]);

@@ -3,7 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
-import { sanitizeRelativePath } from '../src/fs/files.js';
+import { isWritablePath, sanitizeRelativePath } from '../src/fs/files.js';
+import { FOLDER_ABOUT, TREE_HIDDEN } from '../src/fs/layout.js';
 import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 import { textPdf } from './helpers/pdf.js';
@@ -296,5 +297,46 @@ describe('GET /api/tree', () => {
     // without a depth, the whole subtree as before
     expect((await get('path=wiki/levels')).children?.find((c) => c.path === 'wiki/levels/pricing')?.children?.length).toBe(2);
     for (const bad of ['0', '-1', '1.5', 'deep']) expect((await app.request(`/api/tree?path=wiki&depth=${bad}`, { headers })).status, bad).toBe(400);
+  });
+
+  it('leaves the system folders out and says what each built-in folder is for', async () => {
+    type Node = { path: string; kind: string; about?: string; children?: Node[] };
+    const get = async (query: string): Promise<Node> => (await app.request(`/api/tree?${query}`, { headers })).json();
+    fs.mkdirSync(path.join(workspaceDir, 'wiki', 'lint'), { recursive: true });
+    fs.writeFileSync(path.join(workspaceDir, 'wiki', 'lint', '2026-10-27.md'), '# Wiki lint\n');
+    expect(fs.existsSync(path.join(workspaceDir, 'ledger'))).toBe(true);
+    expect(fs.existsSync(path.join(workspaceDir, 'playbooks'))).toBe(true);
+
+    const root = await get('path=.&depth=1');
+    expect(root.children?.map((c) => c.path)).not.toEqual(expect.arrayContaining(['ledger']));
+    expect(root.children?.map((c) => c.path)).not.toEqual(expect.arrayContaining(['playbooks']));
+    expect(root.children?.find((c) => c.path === 'raw')?.about).toBe(FOLDER_ABOUT.raw);
+    const wiki = await get('path=wiki&depth=1');
+    expect(wiki.about).toBe(FOLDER_ABOUT.wiki);
+    expect(wiki.children?.find((c) => c.path === 'wiki/entities')?.about).toBe('People, organizations, products');
+    // a folder someone made says nothing
+    expect(wiki.children?.find((c) => c.path === 'wiki/levels')?.about).toBeUndefined();
+    for (const hidden of TREE_HIDDEN) {
+      const all = await get('path=.');
+      const flat = (n: Node): string[] => [n.path, ...(n.children ?? []).flatMap(flat)];
+      expect(flat(all).some((p) => p === hidden || p.startsWith(`${hidden}/`)), hidden).toBe(false);
+    }
+    // hidden is not gone: a hidden folder lists by its own path, and its files open
+    expect((await get('path=wiki/lint&depth=1')).children?.map((c) => c.path)).toEqual(['wiki/lint/2026-10-27.md']);
+    expect((await app.request('/api/file?path=wiki/lint/2026-10-27.md', { headers })).status).toBe(200);
+  });
+});
+
+describe('purpose.md and schema.md', () => {
+  it('are the owner\'s to edit through the file API, and never an agent\'s', async () => {
+    const put = (p: string, content: string) => app.request('/api/file', { method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ path: p, content }) });
+    expect((await put('purpose.md', '# Purpose\n\nTrack the traders we follow.\n')).status).toBe(200);
+    expect(fs.readFileSync(path.join(workspaceDir, 'purpose.md'), 'utf8')).toContain('Track the traders');
+    expect((await put('schema.md', '# Wiki schema\n')).status).toBe(200);
+    // MCP's knode_write checks isWritablePath, which they are not
+    expect(isWritablePath('purpose.md')).toBe(false);
+    expect(isWritablePath('schema.md')).toBe(false);
+    expect((await put('knode.config.json', '{}')).status).toBe(400);
+    expect((await put('ledger/events.jsonl', '')).status).toBe(400);
   });
 });

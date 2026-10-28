@@ -152,6 +152,11 @@ struct FileBrowserView: View {
         }
         .task { await initialLoad() }
         .task(id: expandedPaths) { await listOpenFolders() }
+        // a file asked for while this screen is already up — a notice's "Open report"
+        .onChange(of: model.pendingFilePath) { _, path in
+            guard path != nil, let requested = model.consumePendingFile() else { return }
+            Task { await openFile(requested) }
+        }
         .onChange(of: model.connectionState) { _, state in
             if case .connected = state, listings[""] == nil {
                 Task { await initialLoad() }
@@ -376,7 +381,7 @@ struct FileBrowserView: View {
                         .help(L("The file itself, in the app that reads it: the PDF, the picture, the web page as it was saved"))
                     }
                     Button(isEditing ? "Preview" : "Edit") { isEditing.toggle() }
-                        .disabled(!isWritable(selectedPath) || isWorking || !isEditable)
+                        .disabled(!isEditablePath(selectedPath) || isWorking || !isEditable)
                     Button(L("Save")) { Task { await save() } }
                         .buttonStyle(.borderedProminent)
                         .tint(.knodeCyan)
@@ -1022,6 +1027,8 @@ struct FileBrowserView: View {
             isEditing = false
             model.showToast("Saved \(selectedPath)")
             await loadTree()
+            // a written purpose answers its notice
+            if TreeNode.ownerRootFiles.contains(selectedPath) { await model.refreshNotices() }
         } catch {
             model.showError(error, prefix: "Save failed")
         }
@@ -1407,7 +1414,7 @@ struct FileBrowserView: View {
     /// A truncated preview can be promoted to a full read — and so to editing —
     /// as long as the text is the file's own and the service will serve it whole.
     private var canLoadFullFile: Bool {
-        guard let selectedPath, isWritable(selectedPath), !isDerived, let fileBytes else { return false }
+        guard let selectedPath, isEditablePath(selectedPath), !isDerived, let fileBytes else { return false }
         return isTruncated && fileBytes <= Self.editByteCap
     }
 
@@ -1539,6 +1546,12 @@ struct FileBrowserView: View {
 
     private func isWritable(_ path: String) -> Bool {
         path == "wiki" || path.hasPrefix("wiki/") || path == "raw/docs" || path.hasPrefix("raw/docs/")
+    }
+
+    /// What the editor may open on: the writable roots, and the root files the
+    /// owner writes, which stay out of moves, renames and deletes all the same.
+    private func isEditablePath(_ path: String) -> Bool {
+        isWritable(path) || TreeNode.ownerRootFiles.contains(path)
     }
 }
 
@@ -1706,6 +1719,14 @@ private struct FileTreeRow: View {
                 .frame(width: 16)
             Text(node.name)
                 .lineLimit(1)
+                .layoutPriority(1)
+            if let folderNote {
+                Text(folderNote)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
             Spacer(minLength: 4)
             if let bytes = node.bytes, node.kind == .file {
                 Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))
@@ -1720,6 +1741,15 @@ private struct FileTreeRow: View {
         .opacity(selectionMode && node.kind == .file && !node.isWritable ? 0.45 : 1)
         .background(rowHighlight, in: RoundedRectangle(cornerRadius: 6))
         .padding(.leading, CGFloat(depth) * Self.indent)
+        .modifier(OptionalHelp(text: folderNote))
+    }
+
+    /// What a folder is for: one knode-os makes says so, a linked one says where it comes from.
+    private var folderNote: String? {
+        guard node.kind == .dir else { return nil }
+        if let about = node.about, !about.isEmpty { return L(about) }
+        if let linked = node.linked, !linked.isEmpty { return L("Linked from %@", (linked as NSString).abbreviatingWithTildeInPath) }
+        return nil
     }
 
     private var rowHighlight: Color {
@@ -1735,6 +1765,16 @@ private struct FileTreeRow: View {
         if node.name.hasSuffix(".md") || node.name.hasSuffix(".markdown") { return "doc.richtext" }
         if node.name.hasSuffix(".json") || node.name.hasSuffix(".jsonl") { return "curlybraces" }
         return "doc.text"
+    }
+}
+
+/// A tooltip when there is something to say, none otherwise.
+private struct OptionalHelp: ViewModifier {
+    let text: String?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let text { content.help(text) } else { content }
     }
 }
 

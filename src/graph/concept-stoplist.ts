@@ -122,7 +122,8 @@ export interface FrequentTerms {
   terms: FrequentTerm[];
 }
 
-const STOPLIST_TEMPLATE = `# Tier-0 concept stop list (src/graph/concepts.ts).
+/** The stop list seeded as `playbooks/concepts/stoplist.yaml`; Settings resets an edited copy to it. */
+export const STOPLIST_TEMPLATE = `# Tier-0 concept stop list (src/graph/concepts.ts).
 #
 # Tier-0 mines a few topical terms per document without a model. Generic words
 # make useless graph nodes: add them under \`terms\`. knode-os also learns which
