@@ -1,4 +1,5 @@
 import { keyOf } from '../graph/normalize.js';
+import { normalizeClaimType } from '../graph/store.js';
 import { Queryable } from './migrations.js';
 
 /**
@@ -234,7 +235,8 @@ export function foldClaimEvidence(row: { id: string; subject_id: string; stateme
   const status = allAbsent
     ? 'absent'
     : statuses.includes('disputed') ? 'disputed' : statuses.includes('fact') ? 'fact' : 'suspected';
-  const type = byWeight.map((r) => str(r.attrs.type)).find(Boolean) ?? 'fact';
+  // evidence written before the closed list carries the extractor's own label (市场表现, 盈利预测 …)
+  const type = normalizeClaimType(byWeight.map((r) => str(r.attrs.type)).find(Boolean));
   const kind = byWeight.map((r) => str(r.attrs.kind)).find(Boolean) ?? 'fact';
   const froms = rows.map((r) => toIso(str(r.attrs.valid_from))).filter((x): x is string => Boolean(x)).sort();
   const openEnded = rows.some((r) => !toIso(str(r.attrs.valid_to)));

@@ -9,10 +9,13 @@ import { readSidecarPart, updateSidecarPart } from '../src/fs/sidecar.js';
 import { buildExtractRequest, parseExtractReply, RawExtractReply } from '../src/graph/llm-extract.js';
 import { buildOntology, CORE_PACK_YAML, FINANCE_PACK_YAML, ORGANIZATION_PACK_YAML } from '../src/graph/ontology.js';
 import { claimsForEntities } from '../src/graph/query.js';
-import { CLAIM_TYPES, claimTypeOf, normalizeClaimKind, normalizeClaimType } from '../src/graph/store.js';
+import { CLAIM_TYPE_MAPPING_SHA, CLAIM_TYPES, claimTypeOf, normalizeClaimKind, normalizeClaimType } from '../src/graph/store.js';
 import { sync } from '../src/ingest/sync.js';
+import { CLAIM_TYPES_META, refoldClaimTypes } from '../src/lineage/claim-types.js';
 import { claimTag } from '../src/search/ask.js';
 import { queryClaims } from '../src/store/claims.js';
+import { Store } from '../src/store/db.js';
+import { NO_TEMPORAL } from '../src/store/resolver.js';
 import { markSupersededClaims } from '../src/wiki/refine.js';
 
 /**
@@ -69,6 +72,35 @@ describe('closed claim vocabulary', () => {
     expect(normalizeClaimKind('fact')).toBe('fact');
     expect(normalizeClaimKind(undefined)).toBe('fact');
     expect(normalizeClaimKind('whatever')).toBe('fact');
+  });
+
+  it('reads a label nothing spells whole by the earliest stem in it, then by its generic head', () => {
+    // the topic comes first in the old compound labels, the aspect after it
+    expect(normalizeClaimType('盈利预测')).toBe('earnings');
+    expect(normalizeClaimType('风险判断')).toBe('risk');
+    expect(normalizeClaimType('市场份额')).toBe('fundamentals');
+    expect(normalizeClaimType('价格变化')).toBe('price_move');
+    // of two stems starting together the longer: 技术判断 is technical analysis, 技术路线 technology
+    expect(normalizeClaimType('技术判断')).toBe('technical');
+    expect(normalizeClaimType('技术路线')).toBe('fundamentals');
+    // 交易 decides only a label no stem names
+    expect(normalizeClaimType('交易建议')).toBe('recommendation');
+    expect(normalizeClaimType('交易心得')).toBe('method');
+    expect(normalizeClaimType('交易结果')).toBe('holding');
+    expect(normalizeClaimType('交易')).toBe('holding');
+    // frequent compounds the stems would get wrong are spelled out whole
+    expect(normalizeClaimType('交易计划')).toBe('recommendation');
+    expect(normalizeClaimType('行情预测')).toBe('outlook');
+    expect(normalizeClaimType('产品发布')).toBe('event');
+    // Latin words count whole: `ta` is not found in `metadata`
+    expect(normalizeClaimType('earnings_forecast')).toBe('earnings');
+    expect(normalizeClaimType('investment view')).toBe('outlook');
+    expect(normalizeClaimType('CPI数据')).toBe('macro');
+    expect(normalizeClaimType('metadata')).toBe('other');
+    expect(normalizeClaimType('市场影响')).toBe('other');
+    // filters stay exact: an unknown spelling matches nothing rather than its stem's type
+    expect(claimTypeOf('盈利预测')).toBeUndefined();
+    expect(CLAIM_TYPE_MAPPING_SHA).toMatch(/^[0-9a-f]{16}$/);
   });
 
   it('asks for the finance types, the closed list, a kind and a context-free description', () => {
@@ -191,5 +223,65 @@ describe('closed claim vocabulary', () => {
     expect(superseded.get('张三持有比亚迪')).toBeNull();
     expect((await queryClaims(ctx.store, { subject: '宁德时代', types: ['earnings'] })).claims.map((c) => c.statement).sort())
       .toEqual(['宁德时代2025年营收4000亿元', '宁德时代2026年营收将达5000亿元']);
+  });
+});
+
+describe('claims folded before the closed list', () => {
+  it('fold the old label onto the list, and are refolded once, in the background after open', async () => {
+    const dir = path.join(tmp, 'retype');
+    fs.mkdirSync(path.join(dir, '.knode'), { recursive: true });
+    let store = await Store.open(dir, 3);
+    const types = async () =>
+      Object.fromEntries((await store.query<{ id: string; type: string }>(`SELECT id, type FROM claims ORDER BY id`)).map((r) => [r.id, r.type]));
+    try {
+      // a store without claims has nothing to refold: it records the mapping before open returns
+      expect(await store.getMeta(CLAIM_TYPES_META)).toMatchObject({ sha: CLAIM_TYPE_MAPPING_SHA, claims: 0 });
+      expect(await store.retype).toBeNull();
+
+      // the extractor's own labels, on the rows and in the evidence they fold from
+      await store.query(`INSERT INTO scopes (id, kind, key, sha, status, actor, applied_at) VALUES ('s1', 'doc', 'raw/docs/a.md', 'sha', 'active', 'test', now())`);
+      await store.query(`INSERT INTO entities (id, name, type) VALUES ('catl', '宁德时代', 'organization')`);
+      const claims: [string, string, string][] = [
+        ['c1', '盈利预测', '宁德时代2026年净利润约1170亿元'],
+        ['c2', '交易建议', '宁德时代可逢低买入'],
+        ['c3', '市场影响', '宁德时代下跌拖累创业板'],
+        ['c4', 'earnings', '宁德时代2025年营收4000亿元'],
+      ];
+      for (const [id, type, statement] of claims) {
+        await store.query(`INSERT INTO claims (id, subject_id, type, statement, status, tx_from) VALUES ($1, 'catl', $2, $3, 'fact', now())`, [id, type, statement]);
+        await store.query(
+          `INSERT INTO evidence (kind, target_id, scope_id, weight, extractor, attrs, tx_from) VALUES ('claim', $1, 's1', 1, 'tier1.llm', $2::jsonb, now())`,
+          [id, JSON.stringify({ type, status: 'fact', statement })],
+        );
+      }
+      // a read that folds from evidence maps the label already
+      const asOf = await queryClaims(store, { temporal: { ...NO_TEMPORAL, txTime: new Date(Date.now() + 60_000).toISOString() } });
+      expect(Object.fromEntries(asOf.claims.map((c) => [c.statement, c.type]))).toMatchObject({ 宁德时代2026年净利润约1170亿元: 'earnings', 宁德时代可逢低买入: 'recommendation' });
+
+      // folded under an older mapping; a stopped refold leaves that recorded
+      await store.setMeta(CLAIM_TYPES_META, { sha: 'older-mapping' });
+      expect(await refoldClaimTypes(store, { stop: () => true, log: () => {} })).toMatchObject({ claims: 0, batches: 0 });
+      expect(await store.getMeta(CLAIM_TYPES_META)).toEqual({ sha: 'older-mapping' });
+    } finally {
+      await store.close();
+    }
+
+    store = await Store.open(dir, 3);
+    try {
+      // the claims the mapping may move (off the list, or other) and only those; the listed one is left alone
+      expect(await store.retype).toMatchObject({ claims: 3, changed: 3, batches: 1 });
+      expect(await types()).toEqual({ c1: 'earnings', c2: 'recommendation', c3: 'other', c4: 'earnings' });
+      expect(await store.getMeta(CLAIM_TYPES_META)).toMatchObject({ sha: CLAIM_TYPE_MAPPING_SHA, claims: 3, changed: 3 });
+    } finally {
+      await store.close();
+    }
+
+    // once recorded, an open starts nothing
+    store = await Store.open(dir, 3);
+    try {
+      expect(await store.retype).toBeNull();
+    } finally {
+      await store.close();
+    }
   });
 });

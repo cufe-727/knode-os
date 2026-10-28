@@ -1,4 +1,5 @@
 import { DatabaseConfig } from '../config.js';
+import { ClaimTypeRefoldResult, claimTypesStale, refoldClaimTypes } from '../lineage/claim-types.js';
 import { Backend, openBackend } from './backend.js';
 import { CoOccursCleanupResult, dropStoredCoOccurrence, migrate, MigrationResult, Queryable } from './migrations.js';
 
@@ -81,6 +82,12 @@ export class Store implements Queryable {
    * it. Await it to know the stored co_occurs rows are gone.
    */
   public cleanup: Promise<CoOccursCleanupResult | null> = Promise.resolve(null);
+  /**
+   * The refold claims folded under an older claim type mapping need
+   * (refoldClaimTypes), running in the background after `cleanup`; settled at
+   * once when nothing needs it.
+   */
+  public retype: Promise<ClaimTypeRefoldResult | null> = Promise.resolve(null);
   private stopCleanup = false;
 
   private constructor(
@@ -139,6 +146,16 @@ export class Store implements Queryable {
       console.warn(`[knode-os] co_occurs cleanup stopped: ${err instanceof Error ? err.message : String(err)}; the next open resumes it`);
       return null;
     });
+    // claims folded under an older claim type mapping follow the same way; a
+    // store without claims records the mapping here and starts nothing
+    if (await claimTypesStale(store)) {
+      store.retype = store.cleanup
+        .then(() => refoldClaimTypes(store, { stop: () => store.stopCleanup }))
+        .catch((err: unknown) => {
+          console.warn(`[knode-os] claim type refold stopped: ${err instanceof Error ? err.message : String(err)}; the next open resumes it`);
+          return null;
+        });
+    }
     return store;
   }
 
@@ -222,9 +239,10 @@ export class Store implements Queryable {
   }
 
   async close(): Promise<void> {
-    // let the batch in flight finish, then stop: a half-done cleanup resumes at the next open
+    // let the batch in flight finish, then stop: a half-done cleanup or refold resumes at the next open
     this.stopCleanup = true;
     await this.cleanup;
+    await this.retype;
     await this.db.close();
   }
 }

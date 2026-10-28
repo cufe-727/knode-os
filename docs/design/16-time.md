@@ -1,6 +1,6 @@
 # 16 — Time in the knowledge base: entries, mention timelines, measures and market data
 
-> Status: **proposed** (2026‑10‑27). Builds on [05](05-agent-context-db.md) §7.1 (`as_of`, `valid_at`, `freshness`)
+> Status: **proposed** (2026‑10‑27); phase A (§5.4) implemented (2026‑10‑28). Builds on [05](05-agent-context-db.md) §7.1 (`as_of`, `valid_at`, `freshness`)
 > and [13](13-client-contract.md) §4–§5 (`known_at`, the entry index, the `rt-market` datasource). Schema v17 here is
 > the version 13 planned for `available_at`, and carries those columns. Figures are read-only aggregates of the
 > finance workspace and of rookie-trade's `data/market`, taken on 2026‑10‑27 (knode-os at d73bb38, schema v16).
@@ -334,10 +334,16 @@ verdict}` on the claim, system-maintained like `superseded_by`, not evidence:
 Predictions with a metric and a horizon (a target price within six months, FY2027 net profit) are scored when the
 horizon closes: the measured half of 13 §7.2's track records.
 
-### 5.4 Free-text types
+### 5.4 Free-text types (implemented)
 
-The fold maps `attrs.type` through `normalizeClaimType`, and one `sync --verify` refolds the claims whose type is off
-the list. This is independent of everything else here and comes first, since every type filter in §6 depends on it.
+The fold maps `attrs.type` through `normalizeClaimType` (`foldClaimEvidence`). A whole-spelling lookup alone would
+have sent 88% of the old labels' claims to `other`, so a label nothing spells whole is read by the earliest stem in
+it (盈利预测 → earnings, 风险判断 → risk, 交易建议 → recommendation), then by a generic head (交易结果 → holding); 15%
+stay in `other`. Claims folded under an older mapping are refolded once, in the background after the store opens,
+whenever the mapping's hash changes (`src/lineage/claim-types.ts`), and nothing that depends on them is marked dirty or
+stale. On a copy of the finance workspace this moved 367,688 claims onto the list in 37.7 s, 186 transactions of
+0.2 s each, leaving 9% of live claims in `other`. It is independent of everything else here and comes first, since
+every type filter in §6 depends on it.
 
 ## 6. Reads
 
@@ -556,7 +562,7 @@ read needs them, which would then follow the same pattern with their own capabil
 
 | Phase | Content | Done when |
 | --- | --- | --- |
-| A | Claim types mapped in the fold (§5.4) | no live claim has a type off the list after one `sync --verify` |
+| A | Claim types mapped in the fold and refolded after open (§5.4) | done: on a copy of finance no live claim is left off the list |
 | B | Schema v17, `time.zone`, the four entry readers; apply writes entries, chunk times and evidence times; `time backfill` | the 22,563 exported files have one entry per anchor (1,377,373); a comment in a weekly file carries its own minute; a claim from a Wednesday post has that Wednesday as `observed_at`; no chunk or embedding was rewritten |
 | C | Occurrences at apply and relink; `timeline`, `feed`, `between`; `posted` on search, SAG, claims and graph; the catalog views; CLI, MCP and the entity panel | a synthetic day file of 470 messages, 60 of them naming X, counts 60; an alias added later counts its past entries; `feed` over 24 h returns exactly the window's entries, with their claims |
 | D | Shelf life; the metrics vocabulary; measures from tier 1 and the statement pass; supersession per metric; `changes` from the base | `valid_at: today` leaves out a 2016 opinion; "PE 18 → 15" comes back as a measure change; a forecast supersedes no result |
