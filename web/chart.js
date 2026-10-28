@@ -6,12 +6,21 @@
  * `chart`, holding one JSON object —
  *
  *   {
- *     "type": "bar",                bar · line · area · stacked-bar · hbar (bar when left out)
+ *     "type": "bar",                bar · line · area · stacked-bar · hbar · share ·
+ *                                   scatter · waterfall · timeline (bar when left out)
  *     "title": "…", "subtitle": "…", "unit": "USD bn",
  *     "x": ["2024-12", "2025-05"],                        the categories, in order
  *     "series": [{ "name": "…", "values": [1, null] }],   1 to 8 of them; null is a gap
  *     "source": "…", "note": "…"
  *   }
+ *
+ * Four types read the categories their own way (src/research/chart.ts has
+ * the contract): a share chart draws each column as 100%; a scatter's `x`
+ * names its points and its two series are the horizontal and the vertical
+ * measure; a waterfall's one series holds levels (`totals`, by x label; the
+ * first and the last bar when left out) and the changes between them; a
+ * timeline's `x` lists generations in order, a row per series, each value a
+ * date — 2025, "2025-03", "2025-Q4", "2026-H1".
  *
  * web/markdown.js hands the block's text to `render`, which returns a figure:
  * the title, a legend, the SVG, the note and the source, and the numbers as a
@@ -37,13 +46,17 @@
  * the tests load this file the way the page does, next to marked.
  */
 (function (global) {
-  const TYPES = ['bar', 'line', 'area', 'stacked-bar', 'hbar'];
+  const TYPES = ['bar', 'line', 'area', 'stacked-bar', 'hbar', 'share', 'scatter', 'waterfall', 'timeline'];
   const TYPE_NAMES = {
     bar: 'Bar chart',
     line: 'Line chart',
     area: 'Area chart',
     'stacked-bar': 'Stacked bar chart',
     hbar: 'Horizontal bar chart',
+    share: 'Share chart',
+    scatter: 'Scatter plot',
+    waterfall: 'Waterfall chart',
+    timeline: 'Timeline',
   };
   /** One series per categorical hue: a ninth is never invented. */
   const MAX_SERIES = 8;
@@ -220,6 +233,51 @@
   }
 
   /**
+   * A timeline's value: where it stands, in years (the start of its period:
+   * "2025-Q4" is 2025.75), and how it reads; null for a gap, undefined when it
+   * is no date. The server's validator (timelineDate) reads the same forms.
+   */
+  function toDate(v) {
+    if (v === null) return null;
+    const year = (y) => y >= 1900 && y <= 2199;
+    if (typeof v === 'number') return Number.isFinite(v) && year(Math.floor(v)) ? { at: v, text: String(v) } : undefined;
+    if (typeof v !== 'string') return undefined;
+    const t = v.trim();
+    if (t === '') return null;
+    let m = /^(\d{4})(?:\.\d+)?$/.exec(t);
+    if (m) return year(Number(m[1])) ? { at: Number(t), text: t } : undefined;
+    m = /^(\d{4})[-/.](\d{1,2})$/.exec(t);
+    if (m) {
+      const month = Number(m[2]);
+      return year(Number(m[1])) && month >= 1 && month <= 12 ? { at: Number(m[1]) + (month - 1) / 12, text: `${m[1]}-${m[2].padStart(2, '0')}` } : undefined;
+    }
+    // 2025-Q4, 2025 Q4, Q4 2025; the same with H for a half
+    m = /^(\d{4})[-\s]?([QH])([1-4])$/i.exec(t);
+    const swapped = m ? null : /^([QH])([1-4])[-\s]?(\d{4})$/i.exec(t);
+    const [y, kind, n] = m ? [Number(m[1]), m[2].toUpperCase(), Number(m[3])] : swapped ? [Number(swapped[3]), swapped[1].toUpperCase(), Number(swapped[2])] : [0, '', 0];
+    if (!kind || !year(y) || (kind === 'H' && n > 2)) return undefined;
+    return { at: y + (n - 1) / (kind === 'Q' ? 4 : 2), text: `${y}-${kind}${n}` };
+  }
+
+  /** A waterfall's levels, as indexes: the bars `totals` names, else the first and the last. */
+  function waterfallTotals(given, x, errors) {
+    const ends = x.length > 1 ? [0, x.length - 1] : [0];
+    if (given === undefined || given === null) return ends;
+    if (!Array.isArray(given)) {
+      errors.push('"totals" must list the x labels of the bars that are levels; the first and the last bar are taken as levels.');
+      return ends;
+    }
+    const out = [];
+    for (const t of given) {
+      const label = typeof t === 'string' ? oneLine(t) : typeof t === 'number' && Number.isFinite(t) ? String(t) : '';
+      const i = label ? x.indexOf(label) : -1;
+      if (i < 0) errors.push(`"totals" names ${shown(t)}, which is not an x label; it is left out.`);
+      else if (!out.includes(i)) out.push(i);
+    }
+    return out.sort((a, b) => a - b);
+  }
+
+  /**
    * The spec in a block's text, normalized — `type` defaulted to bar, `x` as
    * strings, values finite numbers or null, absent text fields '' — and what
    * is wrong with it, in words. `spec` is null only when nothing can be
@@ -311,12 +369,21 @@
             + `${given.length < xCount ? 'the missing ones are gaps' : 'the extra ones are left out'}.`);
         }
         const bad = [];
-        const values = x.map((_, i) => (i < given.length ? toNumber(given[i], () => bad.push(i + 1)) : null));
+        // a timeline's values are dates: drawn at the year they stand for, read as written
+        const texts = type === 'timeline' ? [] : null;
+        const values = x.map((_, i) => {
+          if (!texts) return i < given.length ? toNumber(given[i], () => bad.push(i + 1)) : null;
+          const d = i < given.length ? toDate(given[i]) : null;
+          if (d === undefined) bad.push(i + 1);
+          texts.push(d ? d.text : '');
+          return d ? d.at : null;
+        });
         if (bad.length) {
-          errors.push(`Series ${shown(name)}: ${plural(bad.length, 'value', 'values')} ${positions(bad)} ${plural(bad.length, 'is not a number', 'are not numbers')}, `
+          errors.push(`Series ${shown(name)}: ${plural(bad.length, 'value', 'values')} ${positions(bad)} `
+            + `${texts ? `${plural(bad.length, 'is not a date', 'are not dates')} (a year, "2025-03", "2025-Q4" or "2026-H1")` : plural(bad.length, 'is not a number', 'are not numbers')}, `
             + `shown as ${plural(bad.length, 'a gap', 'gaps')}.`);
         }
-        series.push({ name, values });
+        series.push(texts ? { name, values, texts } : { name, values });
       });
       if (!fatal && series.length === 0) {
         errors.push('No series could be read, so there is nothing to draw.');
@@ -327,7 +394,31 @@
       errors.push('Every value is empty, so there is nothing to draw.');
       fatal = true;
     }
-    return { spec: fatal ? null : { type, title, subtitle, unit, x, series, source, note }, errors };
+    const over = (k) => (k === 1 ? 'one is' : `${k} are`);
+    if (!fatal && type === 'scatter') {
+      if (series.length < 2) {
+        errors.push('A scatter needs two series: the horizontal measure, then the vertical one.');
+        fatal = true;
+      } else {
+        if (series.length > 2) errors.push(`A scatter takes two series, the horizontal measure and the vertical one; the last ${over(series.length - 2)} left out.`);
+        series.splice(2);
+        if (!x.some((_, i) => series[0].values[i] !== null && series[1].values[i] !== null)) {
+          errors.push('No point has both of its values, so there is nothing to draw.');
+          fatal = true;
+        }
+      }
+    }
+    let totals = null;
+    if (!fatal && type === 'waterfall') {
+      if (series.length > 1) errors.push(`A waterfall takes one series; the last ${over(series.length - 1)} left out.`);
+      series.splice(1);
+      const empty = series[0].values.map((v, i) => (v === null ? i + 1 : 0)).filter(Boolean);
+      if (empty.length) errors.push(`A waterfall has no gaps: ${plural(empty.length, 'value', 'values')} ${positions(empty)} ${plural(empty.length, 'is', 'are')} empty, drawn as no change.`);
+      totals = waterfallTotals(raw.totals, x, errors);
+    }
+    const spec = { type, title, subtitle, unit, x, series, source, note };
+    if (totals) spec.totals = totals;
+    return { spec: fatal ? null : spec, errors };
   }
 
   /* ------------------------------- drawing -------------------------------- */
@@ -412,12 +503,34 @@
     return out;
   }
 
-  /** bar, stacked-bar, line and area: categories across, one value axis up the side. */
+  const pctText = (v) => `${trimZeros(v.toFixed(1))}%`;
+
+  /**
+   * Whether a share chart's values already are its shares: a percent unit and
+   * every column adding up to 100, give or take the rounding of its parts.
+   * Otherwise the chart works the shares out, and the table and the tooltip
+   * show them beside the values.
+   */
+  function sharesGiven(spec, totals) {
+    if (!/%|percent|pct|百分/i.test(spec.unit)) return false;
+    return totals.every((t, i) => {
+      const parts = spec.series.filter((s) => s.values[i] !== null).length;
+      return parts === 0 || Math.abs(t - 100) <= Math.max(1, 0.5 * parts);
+    });
+  }
+
+  /** A column's positive values added up: what a stack stands on, and what a share is a share of. */
+  function columnTotals(spec) {
+    return spec.x.map((_, i) => clean(spec.series.reduce((sum, s) => (s.values[i] !== null && s.values[i] > 0 ? sum + s.values[i] : sum), 0)));
+  }
+
+  /** bar, stacked-bar, share, line and area: categories across, one value axis up the side. */
   function drawColumns(spec, notes) {
     const { type, x, series, unit } = spec;
     const n = x.length;
     const m = series.length;
-    const stacked = type === 'stacked-bar';
+    const share = type === 'share';
+    const stacked = type === 'stacked-bar' || share;
     const lineLike = type === 'line' || type === 'area';
 
     let lo = Infinity;
@@ -440,6 +553,12 @@
         hi = Math.max(hi, sum);
       }
       if (dropped) notes.push(`${dropped} negative ${plural(dropped, 'value is', 'values are')} left out of the stacks; the data table lists ${plural(dropped, 'it', 'them')}.`);
+      if (share) {
+        // every column stands for 100%: an empty one has nothing to share out
+        hi = 100;
+        const empty = totals.map((t, i) => (t > 0 ? '' : x[i])).filter(Boolean);
+        if (empty.length) notes.push(`${positions(empty.map((e) => shown(e)))} ${plural(empty.length, 'has', 'have')} no positive value, so ${plural(empty.length, 'its column is', 'their columns are')} left empty.`);
+      }
     } else {
       for (const s of series) {
         for (const v of s.values) {
@@ -449,16 +568,18 @@
         }
       }
     }
-    const axis = valueAxis(type, lo, hi);
-    const ticks = tickLabels(axis.ticks);
+    // a share chart's axis is the column itself, 0 to 100%: its ticks say so, and need no unit above them
+    const axis = share ? { min: 0, max: 100, ticks: [0, 25, 50, 75, 100] } : valueAxis(type, lo, hi);
+    const ticks = share ? axis.ticks.map((t) => `${t}%`) : tickLabels(axis.ticks);
     const left = Math.ceil(Math.max(28, ...ticks.map((t) => textWidth(t) + 12)));
-    const top = unit ? 30 : 20;
+    const top = unit && !share ? 30 : 20;
     const bottom = H - 26;
     const yAt = (v) => bottom - ((v - axis.min) / (axis.max - axis.min)) * (bottom - top);
 
-    // the right margin holds the direct labels that ride past the last marks
+    // the right margin holds the direct labels that ride past the last marks; a share's name carries its share
     const named = m >= 2 && m <= 4 && (lineLike || stacked);
-    const nameW = named ? Math.min(NAME_MAX, Math.max(...series.map((s) => textWidth(s.name)))) : 0;
+    const pctW = share ? textWidth(' 99.9%') : 0; // the widest a share sets
+    const nameW = named ? Math.min(NAME_MAX, Math.max(...series.map((s) => textWidth(s.name)))) + pctW : 0;
     const stackWidth = (band) => Math.min(BAR_MAX, Math.max(band * 0.6, Math.min(1, band)));
     let right = W - 14;
     if (lineLike && m === 1) {
@@ -471,7 +592,7 @@
         const band = (right - left) / n;
         const over = right - (band - stackWidth(band)) / 2 + 6 + nameW + 2 - W;
         if (over <= 0) break;
-        right -= over;
+        right -= Math.ceil(over); // a whole pixel at least: the band narrows with the plot, so an exact step falls just short
       }
     }
 
@@ -494,7 +615,7 @@
       text.push(label('kc-tick', left - 8, y + 3.5, ticks[k], 'end'));
     });
     const baseline = `<line class="kc-axis" x1="${left}" x2="${p(right)}" y1="${p(zero)}" y2="${p(zero)}"/>`;
-    if (unit) text.push(label('kc-unit', 2, 12, fit(unit, W - 4), 'start'));
+    if (unit && !share) text.push(label('kc-unit', 2, 12, fit(unit, W - 4), 'start'));
     for (const c of thinLabels(x, step, xAt)) {
       const whole = c.text === c.full ? '' : `<title>${esc(c.full)}</title>`;
       text.push(`<text class="kc-tick kc-cat" x="${p(c.cx)}" y="${bottom + 17}" text-anchor="middle">${esc(c.text)}${whole}</text>`);
@@ -554,11 +675,12 @@
         hits.push(hitRect(i, null, cx - band / 2, top, band, bottom - top));
         let sum = 0;
         const segments = [];
+        const scale = share ? (totals[i] > 0 ? 100 / totals[i] : 0) : 1;
         series.forEach((s, j) => {
           const v = s.values[i];
-          if (v === null || v <= 0) return;
-          segments.push({ j, y0: yAt(sum), y1: yAt(sum + v) });
-          sum += v;
+          if (v === null || v <= 0 || scale === 0) return;
+          segments.push({ j, y0: yAt(sum), y1: yAt(sum + v * scale), pct: v * scale });
+          sum += v * scale;
         });
         const drawn = [];
         segments.forEach((sg, k) => {
@@ -578,8 +700,10 @@
         for (const sg of lastColumn.drawn) {
           if (sg.low - sg.y1 < 12) continue;
           const y = (sg.y1 + sg.low) / 2 + 4;
-          const t = fit(series[sg.j].name, W - 2 - lx);
-          if (t && place(lx, y, lx + textWidth(t))) text.push(label('kc-name', lx, y, t, 'start'));
+          const pct = share ? ` ${pctText(sg.pct)}` : '';
+          const t = fit(series[sg.j].name, W - 2 - lx - (pct ? textWidth(pct) : 0));
+          if (!t || !place(lx, y, lx + textWidth(t + pct))) continue;
+          text.push(pct ? `<text class="kc-name" x="${p(lx)}" y="${p(y)}">${esc(t)}<tspan class="kc-value">${esc(pct)}</tspan></text>` : label('kc-name', lx, y, t, 'start'));
         }
       }
     }
@@ -662,6 +786,7 @@
     const geom = { k: type, plot: [left, top, right, bottom].map(p), at: x.map((_, i) => p(xAt(i))) };
     if (lineLike) geom.y = points.map((row) => row.map((pt) => (pt ? p(pt[1]) : null)));
     if (stacked) geom.tot = totals;
+    if (share && sharesGiven(spec, totals)) geom.pc = 1;
     // a line rides over the baseline; a bar stands on it
     const body = `<g class="kc-grid-layer">${grid.join('')}${lineLike ? baseline : ''}</g>`
       + `<g class="kc-marks">${marks.join('')}</g>${lineLike ? '' : baseline}`
@@ -770,52 +895,426 @@
     return { height: p(height), body, geom };
   }
 
+  /** Boxes already taken on the plot — marks and labels — so a label only goes where it touches none. */
+  function boxSet() {
+    const taken = [];
+    return {
+      take: (b) => taken.push(b),
+      free: (b) => !taken.some((o) => b[0] < o[2] && b[2] > o[0] && b[1] < o[3] && b[3] > o[1]),
+    };
+  }
+
+  /** The box a label sets in, from where it is anchored. */
+  function labelBox(text, x, y, anchor) {
+    const w = textWidth(text);
+    const x0 = anchor === 'start' ? x : anchor === 'end' ? x - w : x - w / 2;
+    return [x0 - 1, y - 9, x0 + w + 1, y + 2];
+  }
+
+  /** Tick labels along a foot, left to right, each one skipped that would touch the one before. */
+  function footTicks(values, labels, at, y, text) {
+    let edge = -Infinity;
+    values.forEach((t, k) => {
+      const w = textWidth(labels[k]);
+      const cx = Math.min(Math.max(at(t), w / 2 + 2), W - w / 2 - 2);
+      if (cx - w / 2 < edge + LABEL_GAP) return;
+      text.push(label('kc-tick', cx, y, labels[k], 'middle'));
+      edge = cx + w / 2;
+    });
+  }
+
+  /** A scatter's axis fits its values, from zero when zero is near, with room so no point sits on the frame. */
+  function scatterAxis(lo, hi) {
+    if (lo > 0 && lo <= hi - lo) lo = 0;
+    else if (hi < 0 && -hi <= hi - lo) hi = 0;
+    const pad = (hi - lo) * 0.05 || Math.abs(hi) * 0.1 || 1;
+    return niceAxis(lo === 0 ? 0 : lo - pad, hi === 0 ? 0 : hi + pad);
+  }
+
+  /** An axis's name, with the chart's unit when the name does not carry it already. */
+  const axisName = (name, unit) => (unit && !name.includes(unit) ? `${name} (${unit})` : name);
+
+  /**
+   * scatter: `x` names the points; the first series places them across, the
+   * second up. One series of points, so one hue; each point wears its name
+   * where it touches no other point or name — outliers first, since they are
+   * what a scatter is read for — and the rest are in the tooltip and the table.
+   */
+  function drawScatter(spec) {
+    const { x, series, unit } = spec;
+    const [across, up] = series;
+    const pts = [];
+    x.forEach((_, i) => {
+      if (across.values[i] !== null && up.values[i] !== null) pts.push({ i, a: across.values[i], b: up.values[i] });
+    });
+    const hAxis = scatterAxis(Math.min(...pts.map((pt) => pt.a)), Math.max(...pts.map((pt) => pt.a)));
+    const vAxis = scatterAxis(Math.min(...pts.map((pt) => pt.b)), Math.max(...pts.map((pt) => pt.b)));
+    const hTicks = tickLabels(hAxis.ticks);
+    const vTicks = tickLabels(vAxis.ticks);
+    const height = 360;
+    const left = Math.ceil(Math.max(28, ...vTicks.map((t) => textWidth(t) + 12)));
+    const top = 30; // the vertical measure's name rides above the plot
+    const right = W - 14;
+    const bottom = height - 44; // under the plot: the ticks, then the horizontal measure's name
+    const xAt = (v) => left + ((v - hAxis.min) / (hAxis.max - hAxis.min)) * (right - left);
+    const yAt = (v) => bottom - ((v - vAxis.min) / (vAxis.max - vAxis.min)) * (bottom - top);
+
+    const grid = [];
+    const marks = [];
+    const text = [];
+    const hits = [];
+    vAxis.ticks.forEach((t, k) => {
+      const y = yAt(t);
+      if (k > 0) grid.push(`<line class="kc-grid" x1="${left}" x2="${p(right)}" y1="${p(y)}" y2="${p(y)}"/>`);
+      text.push(label('kc-tick', left - 8, y + 3.5, vTicks[k], 'end'));
+    });
+    hAxis.ticks.forEach((t, k) => {
+      if (k > 0) grid.push(`<line class="kc-grid" x1="${p(xAt(t))}" x2="${p(xAt(t))}" y1="${top}" y2="${bottom}"/>`);
+    });
+    footTicks(hAxis.ticks, hTicks, xAt, bottom + 15, text);
+    // the frame's foot and left side, and zero where it falls inside the plot
+    const axes = [`<line class="kc-axis" x1="${left}" x2="${p(right)}" y1="${bottom}" y2="${bottom}"/>`, `<line class="kc-axis" x1="${left}" x2="${left}" y1="${top}" y2="${bottom}"/>`];
+    if (vAxis.min < 0 && vAxis.max > 0) axes.push(`<line class="kc-axis" x1="${left}" x2="${p(right)}" y1="${p(yAt(0))}" y2="${p(yAt(0))}"/>`);
+    if (hAxis.min < 0 && hAxis.max > 0) axes.push(`<line class="kc-axis" x1="${p(xAt(0))}" x2="${p(xAt(0))}" y1="${top}" y2="${bottom}"/>`);
+    text.push(label('kc-axis-title', 2, 14, fit(axisName(up.name, unit), W - 4), 'start'));
+    text.push(label('kc-axis-title', right, bottom + 34, fit(axisName(across.name, unit), right - 4), 'end'));
+
+    const taken = boxSet();
+    for (const pt of pts) {
+      pt.cx = xAt(pt.a);
+      pt.cy = yAt(pt.b);
+      taken.take([pt.cx - DOT - 1, pt.cy - DOT - 1, pt.cx + DOT + 1, pt.cy + DOT + 1]);
+      marks.push(`<circle class="kc-dot kc-pt kc-mark kc-s1" data-i="${pt.i}" cx="${p(pt.cx)}" cy="${p(pt.cy)}" r="${DOT}"/>`);
+      hits.push(`<circle class="kc-hit" data-i="${pt.i}" cx="${p(pt.cx)}" cy="${p(pt.cy)}" r="12"/>`);
+    }
+    const mx = pts.reduce((s, pt) => s + pt.cx, 0) / pts.length;
+    const my = pts.reduce((s, pt) => s + pt.cy, 0) / pts.length;
+    const far = [...pts].sort((a, b) => Math.hypot(b.cx - mx, b.cy - my) - Math.hypot(a.cx - mx, a.cy - my));
+    for (const pt of far) {
+      const t = fit(x[pt.i], 110);
+      if (!t) continue;
+      const tries = [[pt.cx + DOT + 4, pt.cy + 4, 'start'], [pt.cx - DOT - 4, pt.cy + 4, 'end'], [pt.cx, pt.cy - DOT - 5, 'middle'], [pt.cx, pt.cy + DOT + 13, 'middle']];
+      for (const [lx, ly, anchor] of tries) {
+        const box = labelBox(t, lx, ly, anchor);
+        if (box[0] < left - 2 || box[2] > W - 2 || box[1] < top - 12 || box[3] > bottom - 1 || !taken.free(box)) continue;
+        taken.take(box);
+        text.push(label('kc-name', lx, ly, t, anchor));
+        break;
+      }
+    }
+
+    const at = x.map(() => null);
+    const pt = x.map(() => null);
+    for (const q of pts) {
+      at[q.i] = p(q.cx);
+      pt[q.i] = [p(q.cx), p(q.cy)];
+    }
+    const geom = { k: 'scatter', plot: [left, top, right, bottom].map(p), at, pt };
+    const body = `<g class="kc-grid-layer">${grid.join('')}${axes.join('')}</g><g class="kc-marks">${marks.join('')}</g>`
+      + `<g class="kc-text">${text.join('')}</g><g class="kc-hits">${hits.join('')}</g>`;
+    return { height, body, geom };
+  }
+
+  /** A waterfall's bars: each level from zero, each change from the level before it, and the level after each. */
+  function waterfallBars(spec) {
+    const values = spec.series[0].values;
+    const totals = new Set(spec.totals);
+    let level = 0;
+    return values.map((v, i) => {
+      if (totals.has(i)) {
+        if (v !== null) level = v;
+        return { i, kind: 'total', from: 0, to: v, level };
+      }
+      const from = level;
+      if (v !== null) level = clean(level + v);
+      return { i, kind: v === null || v === 0 ? 'flat' : v > 0 ? 'up' : 'down', from, to: v === null ? null : level, level };
+    });
+  }
+
+  /** A change as a label writes it: signed, so a bar that floats reads as a step. */
+  const signed = (v, format) => (v > 0 ? `+${format(v)}` : format(v));
+
+  /**
+   * waterfall: one series as a bridge — its levels stand on zero in the
+   * series' hue, each change floats from the level before it (increases and
+   * decreases in two hues, rounded at the end they move to), and a dotted
+   * line carries each level on to the next bar. Every bar is labelled where
+   * its label fits: a bridge is read step by step.
+   */
+  function drawWaterfall(spec) {
+    const { x, unit } = spec;
+    const n = x.length;
+    const bars = waterfallBars(spec);
+    let lo = 0;
+    let hi = 0;
+    for (const b of bars) {
+      if (b.to === null) continue;
+      lo = Math.min(lo, b.from, b.to);
+      hi = Math.max(hi, b.from, b.to);
+    }
+    const axis = niceAxis(lo, hi);
+    const ticks = tickLabels(axis.ticks);
+    const left = Math.ceil(Math.max(28, ...ticks.map((t) => textWidth(t) + 12)));
+    const top = unit ? 30 : 20;
+    const bottom = H - 26;
+    const right = W - 14;
+    const band = (right - left) / n;
+    const bw = Math.min(BAR_MAX, Math.max(band * 0.6, Math.min(1, band)));
+    const xAt = (i) => left + (i + 0.5) * band;
+    const yAt = (v) => bottom - ((v - axis.min) / (axis.max - axis.min)) * (bottom - top);
+    const zero = yAt(0);
+
+    const grid = [];
+    const marks = [];
+    const links = [];
+    const text = [];
+    const hits = [];
+    const place = labelSet();
+    axis.ticks.forEach((t, k) => {
+      const y = yAt(t);
+      if (t !== 0) grid.push(`<line class="kc-grid" x1="${left}" x2="${p(right)}" y1="${p(y)}" y2="${p(y)}"/>`);
+      text.push(label('kc-tick', left - 8, y + 3.5, ticks[k], 'end'));
+    });
+    if (unit) text.push(label('kc-unit', 2, 12, fit(unit, W - 4), 'start'));
+    for (const c of thinLabels(x, band, xAt)) {
+      const whole = c.text === c.full ? '' : `<title>${esc(c.full)}</title>`;
+      text.push(`<text class="kc-tick kc-cat" x="${p(c.cx)}" y="${bottom + 17}" text-anchor="middle">${esc(c.text)}${whole}</text>`);
+    }
+
+    for (const b of bars) {
+      const cx = xAt(b.i);
+      hits.push(hitRect(b.i, null, cx - band / 2, top, band, bottom - top));
+      if (b.i < n - 1) links.push(`<line class="kc-link" x1="${p(cx + bw / 2)}" x2="${p(xAt(b.i + 1) - bw / 2)}" y1="${p(yAt(b.level))}" y2="${p(yAt(b.level))}"/>`);
+      if (b.to === null) continue;
+      const y0 = yAt(b.from);
+      const y1 = yAt(b.to);
+      const v = spec.series[0].values[b.i];
+      if (Math.abs(y1 - y0) >= 0.5) {
+        const hue = b.kind === 'total' ? 'kc-s1' : b.kind === 'up' ? 'kc-up' : 'kc-down';
+        const end = b.kind === 'total' ? (v >= 0 ? 'top' : 'bottom') : b.kind === 'up' ? 'top' : 'bottom';
+        marks.push(`<path class="kc-bar ${hue}" data-i="${b.i}" d="${barPath(cx - bw / 2, Math.min(y0, y1), bw, Math.abs(y1 - y0), end)}"/>`);
+      }
+      // the label rides past the end the bar moves to: above a rise or a level above zero, below a fall
+      const t = b.kind === 'total' ? compact(v) : signed(v, compact);
+      const w = textWidth(t);
+      if (w > band - 2) continue;
+      const below = b.kind === 'down' || (b.kind === 'total' && v < 0);
+      const y = below ? Math.max(y0, y1) + 13 : Math.min(y0, y1) - 5;
+      if ((below && y > bottom - 3) || y < top - 8) continue;
+      if (place(cx - w / 2, y, cx + w / 2)) text.push(label('kc-value', cx, y, t, 'middle'));
+    }
+
+    const geom = { k: 'waterfall', plot: [left, top, right, bottom].map(p), at: x.map((_, i) => p(xAt(i))), tt: spec.totals, up: bars.map((b) => (b.kind === 'up' ? 1 : 0)) };
+    const body = `<g class="kc-grid-layer">${grid.join('')}${links.join('')}</g><g class="kc-marks">${marks.join('')}</g>`
+      + `<line class="kc-axis" x1="${left}" x2="${p(right)}" y1="${p(zero)}" y2="${p(zero)}"/>`
+      + `<g class="kc-text">${text.join('')}</g><g class="kc-hits">${hits.join('')}</g>`;
+    return { height: H, body, geom };
+  }
+
+  /**
+   * timeline: a row per series, named in a column on the left like an hbar's
+   * categories, and one time axis along the foot in years. Each date is a dot
+   * in its series' hue, the generation it marks named above it (below when
+   * that would touch a name already there), and a faint track joins a row's
+   * first date to its last.
+   */
+  function drawTimeline(spec) {
+    const { x, series } = spec;
+    const m = series.length;
+    const rowH = 44;
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const s of series) {
+      for (const v of s.values) {
+        if (v === null) continue;
+        lo = Math.min(lo, v);
+        hi = Math.max(hi, v);
+      }
+    }
+    // whole years, the last one to its end: a date in 2027 sits inside 2027, not on the frame
+    const first = Math.floor(lo);
+    const last = Math.floor(hi) + 1;
+    const span = last - first;
+    const step = span <= 12 ? 1 : span <= 24 ? 2 : span <= 60 ? 5 : 10;
+    const years = [];
+    for (let y = Math.ceil(first / step) * step; y <= last; y += step) years.push(y);
+    const left = Math.ceil(Math.max(40, Math.min(ROW_LABEL_MAX, Math.max(...series.map((s) => textWidth(s.name)))) + 14));
+    const right = W - 18;
+    const top = 4;
+    const bottom = top + m * rowH;
+    const xAt = (t) => left + ((t - first) / span) * (right - left);
+
+    const grid = [];
+    const marks = [];
+    const text = [];
+    const hits = [];
+    for (const y of years) grid.push(`<line class="kc-grid" x1="${p(xAt(y))}" x2="${p(xAt(y))}" y1="${top}" y2="${bottom}"/>`);
+    footTicks(years, years.map(String), xAt, bottom + 15, text);
+
+    const taken = boxSet();
+    const pt = series.map(() => x.map(() => null));
+    const rowCenter = [];
+    series.forEach((s, j) => {
+      const cy = top + j * rowH + rowH / 2 + 7; // the dot below the row's middle, its name above it
+      rowCenter.push(p(cy));
+      text.push(label('kc-cat kc-row', left - 8, cy + 4, fit(s.name, left - 14), 'end'));
+      const dated = s.values.map((v, i) => (v === null ? null : { i, cx: xAt(v) })).filter(Boolean);
+      if (dated.length > 1) {
+        const xs = dated.map((d) => d.cx);
+        marks.push(`<line class="kc-track kc-s${j + 1}" x1="${p(Math.min(...xs))}" x2="${p(Math.max(...xs))}" y1="${p(cy)}" y2="${p(cy)}"/>`);
+      }
+      for (const d of dated) {
+        pt[j][d.i] = [p(d.cx), p(cy)];
+        taken.take([d.cx - DOT - 1, cy - DOT - 1, d.cx + DOT + 1, cy + DOT + 1]);
+      }
+      for (const d of dated) {
+        marks.push(`<circle class="kc-dot kc-mark kc-s${j + 1}" data-i="${d.i}" data-s="${j}" cx="${p(d.cx)}" cy="${p(cy)}" r="${DOT}"/>`);
+        hits.push(`<circle class="kc-hit" data-i="${d.i}" data-s="${j}" cx="${p(d.cx)}" cy="${p(cy)}" r="12"/>`);
+        const t = fit(x[d.i], 120);
+        if (!t) continue;
+        const w = textWidth(t);
+        const cx = Math.min(Math.max(d.cx, left + w / 2), W - w / 2 - 2);
+        for (const y of [cy - 10, cy + 18]) {
+          const box = labelBox(t, cx, y, 'middle');
+          if (!taken.free(box)) continue;
+          taken.take(box);
+          text.push(label('kc-name', cx, y, t, 'middle'));
+          break;
+        }
+      }
+    });
+
+    // a generation's place for the keyboard's readout: where its first date stands
+    const at = x.map((_, i) => {
+      const hit = pt.find((row) => row[i]);
+      return hit ? hit[i][0] : p((left + right) / 2);
+    });
+    const geom = { k: 'timeline', plot: [left, top, right, bottom].map(p), at, pt, rows: rowCenter };
+    const body = `<g class="kc-grid-layer">${grid.join('')}</g>`
+      + `<line class="kc-axis" x1="${left}" x2="${p(right)}" y1="${bottom}" y2="${bottom}"/>`
+      + `<g class="kc-marks">${marks.join('')}</g><g class="kc-text">${text.join('')}</g><g class="kc-hits">${hits.join('')}</g>`;
+    return { height: bottom + 22, body, geom };
+  }
+
+  /** A series' values from lowest to highest, as a sentence says them. */
+  function range(values, unit) {
+    const list = values.filter((v) => v !== null);
+    if (!list.length) return 'no values';
+    const lo = Math.min(...list);
+    const hi = Math.max(...list);
+    return `${lo === hi ? fullNumber(lo) : `${fullNumber(lo)} to ${fullNumber(hi)}`}${unit ? ` ${unit}` : ''}`;
+  }
+
   /** What the chart shows, in a sentence, for a screen reader: the span of categories and each series' range. */
   function describe(spec) {
-    const { x, series, unit } = spec;
+    const { type, x, series, unit } = spec;
     const span = x.length > 1 ? `${x[0]} to ${x[x.length - 1]}` : x[0];
-    const parts = series.map((s) => {
-      const values = s.values.filter((v) => v !== null);
-      if (!values.length) return `${s.name}: no values`;
-      const lo = Math.min(...values);
-      const hi = Math.max(...values);
-      return `${s.name} ${lo === hi ? fullNumber(lo) : `${fullNumber(lo)} to ${fullNumber(hi)}`}${unit ? ` ${unit}` : ''}`;
-    });
+    if (type === 'scatter') {
+      const k = x.filter((_, i) => series[0].values[i] !== null && series[1].values[i] !== null).length;
+      return `${k} ${plural(k, 'point', 'points')}. Across, ${series[0].name}: ${range(series[0].values, unit)}. Up, ${series[1].name}: ${range(series[1].values, unit)}.`;
+    }
+    if (type === 'timeline') {
+      const rows = series.map((s) => {
+        const dated = s.texts.filter(Boolean);
+        return `${s.name}: ${dated.length ? `${dated[0]} to ${dated[dated.length - 1]}` : 'no dates'}`;
+      });
+      return `${x.length} ${plural(x.length, 'milestone', 'milestones')}, ${span}. ${rows.join('; ')}.`;
+    }
+    if (type === 'waterfall') {
+      const bars = waterfallBars(spec);
+      return `${x.length} ${plural(x.length, 'bar', 'bars')}, ${span}: from ${fullNumber(bars[0].level)} to ${fullNumber(bars[bars.length - 1].level)}${unit ? ` ${unit}` : ''}.`;
+    }
+    const parts = series.map((s) => `${s.name} ${range(s.values, unit)}`);
     return `${x.length} ${plural(x.length, 'category', 'categories')}, ${span}. ${parts.join('; ')}.`;
   }
 
-  /** Two or more series: names beside a swatch that mirrors the mark. One series needs none: the title names it. */
+  /** The figure's name, for a screen reader: its type, its title and how much it holds. */
+  function ariaName(spec) {
+    const { type, title, x, series } = spec;
+    const n = x.length;
+    const head = `${TYPE_NAMES[type]}: ${title || 'untitled'}`;
+    if (type === 'scatter') {
+      const k = x.filter((_, i) => series[0].values[i] !== null && series[1].values[i] !== null).length;
+      return `${head}, ${k} ${plural(k, 'point', 'points')}`;
+    }
+    if (type === 'waterfall') return `${head}, ${n} ${plural(n, 'bar', 'bars')}`;
+    if (type === 'timeline') return `${head}, ${n} ${plural(n, 'milestone', 'milestones')}, ${series.length} series`;
+    return `${head}, ${n} ${plural(n, 'category', 'categories')}, ${series.length} series`;
+  }
+
+  const legendItem = (key, cls, name) => `<li><span class="kchart-key ${key} ${cls}" aria-hidden="true"></span>${esc(name)}</li>`;
+
+  /**
+   * Two or more series: names beside a swatch that mirrors the mark. One
+   * series needs none: the title names it. A waterfall's hues are its bars'
+   * kinds, so they get keys; a scatter's axes and a timeline's rows name
+   * what they show themselves.
+   */
   function legend(spec) {
-    if (spec.series.length < 2) return '';
+    if (spec.type === 'waterfall') {
+      const kinds = new Set(waterfallBars(spec).map((b) => b.kind));
+      const items = [legendItem('kchart-key-box', 'kc-s1', spec.series[0].name)];
+      if (kinds.has('up')) items.push(legendItem('kchart-key-box', 'kc-up', 'Increase'));
+      if (kinds.has('down')) items.push(legendItem('kchart-key-box', 'kc-down', 'Decrease'));
+      return `<ul class="kchart-legend" aria-label="Legend">${items.join('')}</ul>`;
+    }
+    if (spec.series.length < 2 || spec.type === 'scatter' || spec.type === 'timeline') return '';
     const key = spec.type === 'line' ? 'kchart-key-line' : 'kchart-key-box';
-    const items = spec.series.map((s, j) => `<li><span class="kchart-key ${key} kc-s${j + 1}" aria-hidden="true"></span>${esc(s.name)}</li>`);
+    const items = spec.series.map((s, j) => legendItem(key, `kc-s${j + 1}`, s.name));
     return `<ul class="kchart-legend" aria-label="Legend">${items.join('')}</ul>`;
   }
 
-  /** The numbers drawn, as a table: every value reachable without hovering. */
+  const cell = (text, gap) => `<td class="kc-num${gap ? ' kc-gap' : ''}">${text}</td>`;
+
+  /**
+   * The numbers drawn, as a table: every value reachable without hovering,
+   * and what the tooltip reads, so the two always agree. A share chart that
+   * works its shares out shows each one beside its value; a waterfall adds
+   * the running total; a timeline shows its dates as written.
+   */
   function dataTable(spec) {
-    const { x, series, unit } = spec;
-    const head = series.map((s) => `<th scope="col" class="kc-num">${esc(s.name)}</th>`).join('');
-    const rows = x.map((cat, i) => {
-      const cells = series.map((s) => {
-        const v = s.values[i];
-        return `<td class="kc-num${v === null ? ' kc-gap' : ''}">${esc(fullNumber(v))}</td>`;
+    const { type, x, series } = spec;
+    const unit = type === 'timeline' ? '' : spec.unit;
+    let names = series.map((s) => s.name);
+    let rows;
+    let caption = unit ? `Values in ${unit}` : '';
+    if (type === 'waterfall') {
+      const bars = waterfallBars(spec);
+      names = [series[0].name, 'Running total'];
+      rows = bars.map((b) => {
+        const v = series[0].values[b.i];
+        return [cell(esc(b.kind === 'total' ? fullNumber(v) : signed(v, fullNumber)), v === null), cell(esc(fullNumber(b.level)))];
       });
-      return `<tr><th scope="row">${esc(cat)}</th>${cells.join('')}</tr>`;
-    });
+    } else if (type === 'share' && !sharesGiven(spec, columnTotals(spec))) {
+      // the value as given, and in brackets what the bar draws: its share of the column
+      const totals = columnTotals(spec);
+      caption = `${unit ? `Values in ${unit}; in` : 'In'} brackets, each value's share of its column`;
+      rows = x.map((_, i) => series.map((s) => {
+        const v = s.values[i];
+        const pct = v !== null && v > 0 && totals[i] > 0 ? `<span class="kc-pct"> (${pctText((v / totals[i]) * 100)})</span>` : '';
+        return cell(`<span class="kc-v">${esc(fullNumber(v))}</span>${pct}`, v === null);
+      }));
+    } else {
+      rows = x.map((_, i) => series.map((s) => {
+        const v = s.values[i];
+        return cell(esc(type === 'timeline' ? s.texts[i] || '—' : fullNumber(v)), v === null);
+      }));
+    }
+    const corner = { scatter: 'Point', waterfall: 'Bar', timeline: 'Milestone' }[type] ?? 'Category';
+    const head = names.map((name) => `<th scope="col" class="kc-num">${esc(name)}</th>`).join('');
+    const body = x.map((cat, i) => `<tr><th scope="row">${esc(cat)}</th>${rows[i].join('')}</tr>`);
     const attrs = unit ? ` data-unit="${esc(unit)}"` : '';
-    const caption = unit ? `<caption>Values in ${esc(unit)}</caption>` : '';
-    return `<details class="kchart-data"><summary>Data</summary><div class="kchart-table-wrap"><table class="kchart-table"${attrs}>${caption}`
-      + `<thead><tr><th scope="col">Category</th>${head}</tr></thead><tbody>${rows.join('')}</tbody></table></div></details>`;
+    return `<details class="kchart-data"><summary>Data</summary><div class="kchart-table-wrap"><table class="kchart-table"${attrs}>${caption ? `<caption>${esc(caption)}</caption>` : ''}`
+      + `<thead><tr><th scope="col">${corner}</th>${head}</tr></thead><tbody>${body.join('')}</tbody></table></div></details>`;
   }
+
+  const DRAW = { hbar: drawRows, scatter: drawScatter, waterfall: drawWaterfall, timeline: drawTimeline };
 
   function figure(spec, problems) {
     const notes = [];
-    const chart = spec.type === 'hbar' ? drawRows(spec) : drawColumns(spec, notes);
-    const { type, title, subtitle, x, series } = spec;
-    const n = x.length;
-    const m = series.length;
-    const name = `${TYPE_NAMES[type]}: ${title || 'untitled'}, ${n} ${plural(n, 'category', 'categories')}, ${m} series`;
+    const chart = (DRAW[spec.type] ?? drawColumns)(spec, notes);
+    const { type, title, subtitle } = spec;
+    const name = ariaName(spec);
     const svg = `<svg class="kchart-svg" viewBox="0 0 ${W} ${chart.height}" width="100%" preserveAspectRatio="xMidYMid meet" role="img"`
       + ` aria-label="${esc(name)}" data-kc="${esc(JSON.stringify(chart.geom))}"><title>${esc(title || TYPE_NAMES[type])}</title>`
       + `<desc>${esc(describe(spec))}</desc>${chart.body}</svg>`;
@@ -890,9 +1389,11 @@
     if (!geom || !Array.isArray(geom.at)) return;
     const kind = geom.k;
     const lineLike = kind === 'line' || kind === 'area';
-    // what the tooltip says comes from the table, so the two always agree
+    const stackLike = kind === 'stacked-bar' || kind === 'share';
+    // what the tooltip says comes from the table, so the two always agree; a share it worked out rides in brackets
     const names = [...table.tHead.rows[0].cells].slice(1).map((c) => c.textContent);
-    const rows = [...table.tBodies[0].rows].map((r) => [...r.cells].map((c) => c.textContent));
+    const rows = [...table.tBodies[0].rows].map((r) => [...r.cells].map((c) => (c.querySelector('.kc-v') ?? c).textContent));
+    const shares = [...table.tBodies[0].rows].map((r) => [...r.cells].map((c) => (c.querySelector('.kc-pct')?.textContent ?? '').replace(/[\s()]/g, '')));
     const unit = table.getAttribute('data-unit') || '';
     const n = rows.length;
     const [, plotTop, , plotBottom] = geom.plot;
@@ -940,26 +1441,36 @@
       svg.classList.toggle('kc-hovering', lit.length > 0);
     }
 
+    /** One line of the readout: a key in the mark's hue (none for a scatter's measures), the value, its unit, a share, the name. */
+    function tipRow(hue, value, name, { hot = false, share = '', cls = '' } = {}) {
+      const row = el('div', `kchart-tip-row${hot ? ' kc-hot' : ''}${cls ? ` ${cls}` : ''}`);
+      if (hue !== null) row.append(el('span', `kchart-tip-key${hue ? ` ${hue}` : ''}`));
+      row.append(el('span', 'kchart-tip-val', value));
+      if (unit && value !== '—') row.append(el('span', 'kchart-tip-unit', unit));
+      if (share) row.append(el('span', 'kchart-tip-share', share));
+      row.append(el('span', 'kchart-tip-name', name));
+      tip.append(row);
+    }
+
     /** The readout for category `i`: the value leads and the series' name follows; `only` limits it to one bar, `hot` marks a segment. */
     function fill(i, only, hot) {
       tip.replaceChildren(el('div', 'kchart-tip-head', rows[i][0] || '—'));
-      let order = names.map((_, j) => j);
-      if (kind === 'stacked-bar') order.reverse(); // read top down, as the stack stands
-      if (only !== undefined) order = [only];
-      for (const j of order) {
-        const value = rows[i][j + 1];
-        const row = el('div', `kchart-tip-row${j === hot ? ' kc-hot' : ''}`);
-        row.append(el('span', `kchart-tip-key kc-s${j + 1}`), el('span', 'kchart-tip-val', value));
-        if (unit && value !== '—') row.append(el('span', 'kchart-tip-unit', unit));
-        row.append(el('span', 'kchart-tip-name', names[j]));
-        tip.append(row);
-      }
-      if (kind === 'stacked-bar' && only === undefined && names.length > 1 && Array.isArray(geom.tot)) {
-        const row = el('div', 'kchart-tip-row kchart-tip-total');
-        row.append(el('span', 'kchart-tip-key'), el('span', 'kchart-tip-val', fullNumber(geom.tot[i])));
-        if (unit) row.append(el('span', 'kchart-tip-unit', unit));
-        row.append(el('span', 'kchart-tip-name', 'Total'));
-        tip.append(row);
+      if (kind === 'scatter') {
+        // one point: both of its measures
+        names.forEach((name, j) => tipRow(null, rows[i][j + 1], name));
+      } else if (kind === 'waterfall') {
+        const level = Array.isArray(geom.tt) && geom.tt.includes(i);
+        tipRow(level ? 'kc-s1' : geom.up?.[i] ? 'kc-up' : 'kc-down', rows[i][1], level ? names[0] : 'Change');
+        if (!level) tipRow('', rows[i][2], names[1], { cls: 'kchart-tip-total' });
+      } else {
+        let order = names.map((_, j) => j);
+        if (stackLike) order.reverse(); // read top down, as the stack stands
+        if (only !== undefined) order = [only];
+        for (const j of order) tipRow(`kc-s${j + 1}`, rows[i][j + 1], names[j], { hot: j === hot, share: shares[i][j + 1] });
+        // a share chart whose values are its shares already adds up to 100%: no total to tell
+        if (stackLike && only === undefined && names.length > 1 && Array.isArray(geom.tot) && !geom.pc) {
+          tipRow('', fullNumber(geom.tot[i]), 'Total', { cls: 'kchart-tip-total' });
+        }
       }
       tip.hidden = false;
     }
@@ -1009,7 +1520,7 @@
       const marks = [...svg.querySelectorAll(selector)];
       if (!marks.length) {
         if (kind === 'hbar') placeUnder(geom.plot[0], geom.at[i] - 8, geom.at[i] + 8);
-        else placeTip(geom.at[i], plotBottom);
+        else placeTip(geom.at[i] ?? (geom.plot[0] + geom.plot[2]) / 2, kind === 'scatter' ? (plotTop + plotBottom) / 2 : plotBottom);
         return;
       }
       let x0 = Infinity;
@@ -1023,9 +1534,13 @@
         x1 = Math.max(x1, b.x + b.width);
         y1 = Math.max(y1, b.y + b.height);
       }
-      if (kind === 'hbar') placeUnder((x0 + x1) / 2, y0, y1);
+      // a timeline's whole generation spans its rows: beside them, like a column's readout
+      if (kind === 'hbar' || (kind === 'timeline' && marks.length === 1)) placeUnder((x0 + x1) / 2, y0, y1);
       else placeTip(x1, y0 + Math.min(12, (y1 - y0) / 2), x0);
     }
+
+    /** What a category's marks are, for the hover's lift and the tooltip's place: points for a scatter or a timeline, else bars. */
+    const marksOf = (i, s) => `${kind === 'scatter' || kind === 'timeline' ? '.kc-mark' : '.kc-bar'}[data-i="${i}"]${s === undefined ? '' : `[data-s="${s}"]`}`;
 
     function showLine(i) {
       active = i;
@@ -1056,8 +1571,8 @@
       if (lineLike) return showLine(i);
       active = i;
       fill(i);
-      light(`.kc-bar[data-i="${i}"]`);
-      placeBy(`.kc-bar[data-i="${i}"]`, i);
+      light(marksOf(i));
+      placeBy(marksOf(i), i);
       return undefined;
     }
 
@@ -1091,16 +1606,16 @@
       tip.removeAttribute('aria-live'); // a pointer needs no announcements; the keyboard path turns them on
       if (lineLike) return showLine(i);
       active = i;
-      if (kind === 'stacked-bar') {
+      if (stackLike) {
         // the whole stack, read top down, the segment under the pointer marked
         fill(i, undefined, s);
-        light(s === undefined ? null : `.kc-bar[data-i="${i}"][data-s="${s}"]`);
-        placeBy(`.kc-bar[data-i="${i}"]`, i);
+        light(s === undefined ? null : marksOf(i, s));
+        placeBy(marksOf(i), i);
       } else {
-        // the bar under the pointer: its category and value
+        // the mark under the pointer: its category and value (a waterfall's bar and a scatter's point carry no series)
         fill(i, s);
-        light(`.kc-bar[data-i="${i}"][data-s="${s}"]`);
-        placeBy(`.kc-bar[data-i="${i}"][data-s="${s}"]`, i);
+        light(marksOf(i, s));
+        placeBy(marksOf(i, s), i);
       }
       return undefined;
     }

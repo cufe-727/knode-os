@@ -18,7 +18,7 @@ import { PhaseRecord } from './pipeline.js';
 import { activeProfile, effectiveEffort, effectiveSpeed, loadProfile, ResearchProfile, webAllowed } from './profile.js';
 import { detectLanguage, localizeNoteHeadings, normalizeBrief, noteHeadings, refineBrief, sourceMarker, sourcesHeading, StudyBrief, StudyPage, templateBrief } from './refine.js';
 import { loadResearchSources, mcpServersFor, ExtraMcpServer, ResearchSource, sourcesBrief } from './sources.js';
-import { loadPhasePrompt, loadResearchProtocol, researchSlug } from './templates.js';
+import { CHART_TYPE_GUIDE, loadPhasePrompt, loadResearchProtocol, researchSlug } from './templates.js';
 import { knowledgeNotes, McpEndpoint, runsRoot, writeAgentFiles } from './workspace.js';
 import { webSearchEnabled } from './web.js';
 
@@ -518,7 +518,9 @@ function languageName(tag: string): string {
  * within which bounds, which pages exist, and what has been gathered so far.
  * It names the source marker (and, for collectors, the note headings) in the
  * study's language: the protocol and templates a workspace was seeded with
- * show the Chinese ones, and a page in English copied them.
+ * show the Chinese ones, and a page in English copied them. For the same
+ * reason the chart types a page may use are listed here, the newer ones
+ * included: a workspace seeded before them never learns them from its templates.
  */
 export function studyDocument(ctx: AppContext, job: ResearchJob, opts: { focusPage?: string | null; sources: ResearchSource[]; web: boolean; webSearchTool: boolean; notes?: boolean }): string {
   const p = studyPayload(job);
@@ -568,6 +570,14 @@ export function studyDocument(ctx: AppContext, job: ResearchJob, opts: { focusPa
   lines.push('', ...sourcesBrief(opts.sources, { web: opts.web, webSearchTool: opts.webSearchTool }));
   lines.push(`保存资料：knode_capture(url, study="${job.id}", why="…")；它返回的 raw/docs/research/${slug}/… 路径就是引用的来源。`);
   lines.push(`页面互链用知识库根路径：\`[[research/${slug}/<页面 slug>|标题]]\`；总报告是 \`[[research/${slug}|…]]\`。`);
+  if (!opts.notes) {
+    lines.push('', '### 图表（```chart 块）', '');
+    lines.push('一组可比的数字放进一个 ```chart 块（一个 JSON 对象，写之前可用 knode_chart 检查）。每种类型同一个形状：x 是类别，每个 series 的 values 与 x 等长，缺值写 null；最多 8 个 series、60 个类别；source 写数字出自的 raw/docs 路径。');
+    lines.push('- bar / hbar（对比、排名）、stacked-bar（构成）、line / area（时间序列）照旧；比较厂商与路线图时还可以用：');
+    lines.push(CHART_TYPE_GUIDE);
+    lines.push('例：{"type": "waterfall", "title": "毛利率：Q2 → Q3", "unit": "pp", "x": ["Q2", "DRAM 价格", "成本", "Q3"], "series": [{"name": "毛利率", "values": [38.5, 6.2, -0.9, 43.8]}], "source": "raw/docs/…"}');
+    lines.push('例：{"type": "timeline", "title": "HBM 代际", "x": ["HBM3E", "HBM4"], "series": [{"name": "SK hynix", "values": ["2024-03", "2025-Q4"]}, {"name": "三星", "values": ["2024-Q4", null]}], "source": "raw/docs/…"}');
+  }
   return lines.join('\n');
 }
 

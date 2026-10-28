@@ -1831,6 +1831,20 @@ function originalHref(path) {
   return `/api/file/original?${q}`;
 }
 
+/** A study as one HTML file to read, save or print (src/research/export.ts); named in the query like an original. */
+function studyExportHref(id) {
+  const q = new URLSearchParams();
+  const h = workspaceRequestHeaders();
+  if (h['x-knode-workspace-kind']) {
+    q.set('kind', h['x-knode-workspace-kind']);
+    q.set('id', h['x-knode-workspace-id']);
+    q.set('name', h['x-knode-workspace-name']);
+  }
+  if (authDisabled && h['x-knode-user']) q.set('user', h['x-knode-user']);
+  const query = q.toString();
+  return `/api/research/studies/${encodeURIComponent(id)}/export${query ? `?${query}` : ''}`;
+}
+
 /** "original ↗" in the file toolbar, for a PDF, a picture or a web page. */
 function showOriginalLink(path) {
   const link = $('#btn-original');
@@ -6083,6 +6097,7 @@ function renderStudy(view) {
         ${job.status === 'failed' || job.status === 'cancelled' ? '<button type="button" data-act="retry">Retry</button>' : ''}
         ${tiers.pages.quarantined ? `<button type="button" data-act="promote-pages" title="mark the pages and the report trusted: their facts become the knowledge base's position">Promote pages (${tiers.pages.quarantined})</button>` : ''}
         ${tiers.sources.quarantined ? `<button type="button" data-act="promote-sources" title="mark the captured sources, the notes and the register trusted">Promote sources (${tiers.sources.quarantined})</button>` : ''}
+        ${view.reportExists || view.pages.some((pg) => pg.status === 'done') ? `<a class="study-link" href="${esc(studyExportHref(job.id))}" target="_blank" rel="noopener" title="the report and its pages as one HTML file, its charts as figures: read it, save it, or print it to PDF">Export ↗</a>` : ''}
       </div>
     </div>
     <ol class="init-steps study-steps">${p.steps.map((s) => `<li data-status="${esc(s.status)}"><b>${esc(STUDY_STEP_LABELS[s.name] || s.name)}</b><span>${esc(s.detail || s.status)}</span></li>`).join('')}</ol>

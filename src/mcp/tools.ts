@@ -757,7 +757,12 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: Kno
     'knode_chart',
     {
       title: 'Check a chart before writing it',
-      description: 'Validate a chart spec for a ```chart block in a wiki page — {"type": "bar|line|area|stacked-bar|hbar", "title", "subtitle"?, "unit"?, "x": [labels], "series": [{"name", "values": [numbers or null]}], "source": "the paths / URLs the numbers come from", "note"?}. Returns the errors, or the normalized block to paste into the page.',
+      description: 'Validate a chart spec for a ```chart block in a wiki page — {"type": "bar|hbar|line|area|stacked-bar|share|scatter|waterfall|timeline", "title", "subtitle"?, "unit"?, "x": [labels], "series": [{"name", "values": [numbers or null]}], "source": "the paths / URLs the numbers come from", "note"?}. Every type has that shape: x names the categories, each series has one value per category, at most 8 series and 60 categories, one unit and one value axis. '
+        + 'share: each column drawn as 100% — market share over time, a series per company; percentages that add up to 100 per column (add an "Other" series), or amounts the chart turns into shares. '
+        + 'scatter: x names the points; exactly two series, the horizontal measure first and then the vertical one, each named with its unit ("Forward P/E, ×") — valuation against growth. '
+        + 'waterfall: one series, a bridge such as a margin walk: the first and the last bar are levels and the bars between are changes (positive or negative); with subtotals in the middle, name every level in "totals": [x labels]; the changes should add up to the next level. '
+        + 'timeline: x lists generations or milestones in order (HBM3E, HBM4, HBM4E), a series per maker, and each value is when it got there: 2025, "2025-03", "2025-Q4", "2026-H1", or null for not yet. '
+        + 'Colour follows the series, never a rank. Returns the errors and warnings, or the normalized block to paste into the page.',
       inputSchema: { spec: z.union([z.string(), z.record(z.string(), z.unknown())]) },
     },
     async ({ spec }) => {

@@ -374,6 +374,17 @@ knode_write 的路径约定、必需 frontmatter、quarantine 与 promote、disp
 `;
 
 
+/**
+ * How the four comparison types read the shape (src/research/chart.ts), for
+ * the templates a workspace is seeded with — and, since those are never
+ * refreshed, for the study document every page and report is briefed with.
+ */
+export const CHART_TYPE_GUIDE = `- share：份额随时间变化（每列画成 100%）。x 是时期，每家一个 series；值是 % 时每列应合计 100（缺的部分加一个"其他" series），也可以直接给金额，图会按列折算成份额。
+- scatter：两个指标的散点，如估值对增速。x 是各点的名字；正好两个 series，先横轴指标、后纵轴指标，单位写进 series 名（"Forward P/E, ×"）。
+- waterfall：桥图，如毛利率从上一季到这一季的拆解。只有一个 series：第一根和最后一根是水平值，中间是变动（可正可负）；中间还有小计时，用 "totals": ["Q2", "毛利", "Q3"] 按 x 标签列出所有水平值。变动加起来要等于下一个水平值。
+- timeline：代际或里程碑的时间线，如各家 HBM3E → HBM4 → HBM4E。x 按先后列出代际，每家一个 series，值是时间："2025"、"2025-03"、"2025-Q4"、"2026-H1"（或 2025 这样的数字），还没有就写 null。
+- 颜色按 series 区分；一个 series 只表示一类东西（一家公司、一个指标），不要用颜色表示名次。`;
+
 /** The chart block every study page may carry (src/research/chart.ts); the viewers draw it, Obsidian shows the JSON. */
 const CHART_RULES = `## 图表（\`\`\`chart 块）
 
@@ -387,9 +398,10 @@ const CHART_RULES = `## 图表（\`\`\`chart 块）
 \`\`\`
 \`\`\`\`
 
-- type：bar（类别对比）/ hbar（类别名长或做排名）/ stacked-bar（构成，值不能为负）/ line、area（时间序列，至少 3 个点）。
+- type：bar（类别对比）/ hbar（类别名长或做排名）/ stacked-bar（构成，值不能为负）/ line、area（时间序列，至少 3 个点）/ share、scatter、waterfall、timeline（见下）。
 - x 与每个 series.values 一样长；缺的值写 null；最多 8 个 series、60 个类别；一张图只用一个单位、一根纵轴（量纲不同就画两张）。
-- source 必填：数字出自哪些 raw/docs 路径（或 URL）。`;
+- source 必填：数字出自哪些 raw/docs 路径（或 URL）。
+${CHART_TYPE_GUIDE}`;
 
 const SECTION = `---
 type: research-template

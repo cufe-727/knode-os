@@ -208,6 +208,8 @@ struct MarkdownText: View {
                 .overlay(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 1).fill(Color.knodeViolet.opacity(0.7)).frame(width: 3)
                 }
+        case .table(let table):
+            MarkdownTableView(table: table)
         case .code(let code, let language) where language?.lowercased() == "chart" && ChartSpec.parse(code) != nil:
             // a research page's chart: data in the page, drawn here (MarkdownChart.swift)
             MarkdownChart(spec: ChartSpec.parse(code)!)
@@ -304,6 +306,97 @@ struct MarkdownText: View {
             return url.relativeString.removingPercentEncoding ?? url.relativeString
         }
         return nil
+    }
+}
+
+/**
+ * A GFM table: a header, then the rows, in a grid whose columns size to their
+ * widest cell. A cell of a sentence or more wraps at a fixed width instead of
+ * widening its column; a table wider than the page scrolls sideways. Numbers
+ * line up on the right, as in a printed table, unless the delimiter row says
+ * otherwise.
+ */
+private struct MarkdownTableView: View {
+    let table: MarkdownBlock.Table
+
+    /// Past this many characters a cell wraps: a column of short labels stays one line each.
+    private static let wrapAfter = 48
+    private static let wrapWidth: CGFloat = 300
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+                GridRow {
+                    ForEach(Array(table.header.enumerated()), id: \.offset) { column, text in
+                        cell(text, column: column)
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .gridColumnAlignment(table.alignments[column].horizontal)
+                    }
+                }
+                Rectangle().fill(Color.primary.opacity(0.22)).frame(height: 1)
+                ForEach(Array(table.rows.enumerated()), id: \.offset) { index, row in
+                    GridRow {
+                        ForEach(Array(row.enumerated()), id: \.offset) { column, text in
+                            cell(text, column: column).font(.system(size: 12.5))
+                        }
+                    }
+                    if index < table.rows.count - 1 {
+                        Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .scrollIndicators(.automatic, axes: .horizontal)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(L("Table, %@ columns, %@ rows", String(table.header.count), String(table.rows.count)))
+    }
+
+    @ViewBuilder
+    private func cell(_ text: AttributedString, column: Int) -> some View {
+        let alignment = table.alignments[column]
+        Group {
+            if text.characters.count > Self.wrapAfter {
+                Text(text)
+                    .multilineTextAlignment(alignment.text)
+                    .frame(width: Self.wrapWidth, alignment: alignment.frame)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(text).fixedSize()
+            }
+        }
+        .monospacedDigit()
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+    }
+}
+
+/// How a table column lines up its cells.
+enum CellAlignment {
+    case leading, center, trailing
+
+    var horizontal: HorizontalAlignment {
+        switch self {
+        case .leading: .leading
+        case .center: .center
+        case .trailing: .trailing
+        }
+    }
+
+    var frame: Alignment {
+        switch self {
+        case .leading: .leading
+        case .center: .center
+        case .trailing: .trailing
+        }
+    }
+
+    var text: TextAlignment {
+        switch self {
+        case .leading: .leading
+        case .center: .center
+        case .trailing: .trailing
+        }
     }
 }
 
@@ -557,6 +650,7 @@ private struct MarkdownBlock: Identifiable {
         case ordered([ListItem])
         case quote(AttributedString)
         case code(String, String?)
+        case table(Table)
         case frontmatter(Frontmatter)
         case note(Note)
         /// An export's `<a id="…"></a>`: nothing to see, somewhere to land.
@@ -569,6 +663,14 @@ private struct MarkdownBlock: Identifiable {
         let summary: String
         /// The YAML as written, its wikilinks and workspace paths made links.
         let body: AttributedString
+    }
+
+    struct Table {
+        let header: [AttributedString]
+        /// Every row as wide as the header: a short one padded, a long one cut.
+        let rows: [[AttributedString]]
+        /// Per column: as the delimiter row says, else trailing for a column of numbers.
+        let alignments: [CellAlignment]
     }
 
     struct Note {
@@ -614,9 +716,18 @@ private enum RawBlock {
     case ordered([RawListItem])
     case quote(String)
     case code(String, String?)
+    case table(RawTable)
     case anchor(String)
     case note(label: String, text: String)
     case rule
+}
+
+/// A table before its cells are converted.
+private struct RawTable {
+    let header: [String]
+    let rows: [[String]]
+    /// What the delimiter row asks of each column; nil where it names no alignment.
+    let alignments: [CellAlignment?]
 }
 
 /// A list item before its text is converted.
@@ -658,6 +769,87 @@ private func noteStart(_ line: String) -> (label: String, text: String)? {
     return (String(match.output.1), String(match.output.2))
 }
 
+/**
+ * A table row's cells, GFM's way: split on `|` outside code spans, `\|` a
+ * bar of the cell's own, the pipes at either end optional. A backtick run
+ * opens a code span only when the same run closes it later on the line.
+ */
+private func tableCells(_ line: String) -> [String] {
+    let text = Array(line.trimmingCharacters(in: .whitespaces))
+    var cells: [String] = []
+    var current = ""
+    var open = 0 // the backtick run of the open code span; 0 outside one
+    var i = 0
+    while i < text.count {
+        let ch = text[i]
+        if ch == "\\", i + 1 < text.count, text[i + 1] == "|" {
+            current.append("|")
+            i += 2
+            continue
+        }
+        if ch == "`" {
+            var run = 0
+            while i + run < text.count, text[i + run] == "`" { run += 1 }
+            let fence = String(repeating: "`", count: run)
+            if open == run {
+                open = 0
+            } else if open == 0, String(text[(i + run)...]).contains(fence) {
+                open = run
+            }
+            current += fence
+            i += run
+            continue
+        }
+        if ch == "|", open == 0 {
+            cells.append(current)
+            current = ""
+        } else {
+            current.append(ch)
+        }
+        i += 1
+    }
+    cells.append(current)
+    if text.first == "|", !cells.isEmpty { cells.removeFirst() }
+    if text.last == "|", text.count > 1, text[text.count - 2] != "\\", !cells.isEmpty { cells.removeLast() }
+    return cells.map { $0.trimmingCharacters(in: .whitespaces) }
+}
+
+/// `| --- | :---: | ---: |`: each column's alignment (nil where it names none), or nil when the line is no delimiter row.
+private func tableDelimiter(_ line: String) -> [CellAlignment?]? {
+    guard line.contains("-") else { return nil }
+    let cells = tableCells(line)
+    guard !cells.isEmpty else { return nil }
+    var out: [CellAlignment?] = []
+    for cell in cells {
+        guard cell.range(of: "^:?-+:?$", options: .regularExpression) != nil else { return nil }
+        let left = cell.hasPrefix(":")
+        let right = cell.hasSuffix(":")
+        out.append(left && right ? .center : right ? .trailing : left ? .leading : nil)
+    }
+    return out
+}
+
+/// The alignments of the table that starts at `index`: a row with a bar, then a delimiter row with as many cells.
+private func tableStart(_ lines: [String], _ index: Int) -> [CellAlignment?]? {
+    guard index + 1 < lines.count, lines[index].contains("|"), let alignments = tableDelimiter(lines[index + 1]) else { return nil }
+    return tableCells(lines[index]).count == alignments.count ? alignments : nil
+}
+
+/// A cell that reads as a number: 1,234.5 · −3% · $4.5bn · (12) · 7.5× · 36 pp · 4.2 万亿 — or a dash for none.
+private func isNumericCell(_ cell: String) -> Bool {
+    let text = cell.replacingOccurrences(of: #"[*_`]"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespaces)
+    return text.range(
+        of: #"^[(\[]?[+\-−±~≈<>≤≥]?\s?(?:[$€£¥₩]|US\$|HK\$|USD|RMB|CNY|KRW|JPY)?\s?\d[\d,.\s]*(?:\.\d+)?\s?(?:%|‰|pp|bps?|x|×|[KMBT]|bn|mn|m|k|万亿|万|亿|千|元|美元|倍|个百分点)?[)\]]?$"#,
+        options: .regularExpression
+    ) != nil
+}
+
+/// A column of numbers, a dash or two among them: what a printed table aligns on the right.
+private func isNumericColumn(_ cells: [String]) -> Bool {
+    let filled = cells.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && !["—", "–", "-", "n/a", "N/A", "…"].contains($0) }
+    return !filled.isEmpty && filled.allSatisfy(isNumericCell)
+}
+
 private func parseMarkdown(_ source: String) -> ParsedMarkdown {
     let lines = source.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
     var index = 0
@@ -689,6 +881,7 @@ private func parseMarkdown(_ source: String) -> ParsedMarkdown {
         switch block {
         case .heading(_, let text), .paragraph(let text), .quote(let text): cite(text, from: rawIndex)
         case .unordered(let items), .ordered(let items): items.forEach { cite($0.text, from: rawIndex) }
+        case .table(let table): (table.header + table.rows.flatMap { $0 }).forEach { cite($0, from: rawIndex) }
         default: break
         }
     }
@@ -740,6 +933,16 @@ private func parseMarkdown(_ source: String) -> ParsedMarkdown {
             append(.quote(inlineMarkdown(text, notes: numbers, block: out.blocks.count)), markable: true)
         case .code(let code, let language):
             append(.code(code, language))
+        case .table(let table):
+            let id = out.blocks.count
+            let cell = { (text: String) in inlineMarkdown(text, notes: numbers, block: id) }
+            append(.table(MarkdownBlock.Table(
+                header: table.header.map(cell),
+                rows: table.rows.map { $0.map(cell) },
+                alignments: table.alignments.enumerated().map { column, given in
+                    given ?? (isNumericColumn(table.rows.map { $0[column] }) ? .trailing : .leading)
+                }
+            )))
         case .anchor(let name):
             if out.anchors[name] == nil { out.anchors[name] = out.blocks.count }
             append(.anchor(name))
@@ -849,9 +1052,23 @@ private func rawBlocks(_ lines: [String], from start: Int) -> [RawBlock] {
             continue
         }
 
+        if let alignments = tableStart(lines, index) {
+            let width = alignments.count
+            let fit = { (cells: [String]) in Array((cells + Array(repeating: "", count: max(0, width - cells.count))).prefix(width)) }
+            let header = tableCells(line)
+            var rows: [[String]] = []
+            index += 2
+            while index < lines.count, !startsBlock(lines[index]) {
+                rows.append(fit(tableCells(lines[index])))
+                index += 1
+            }
+            blocks.append(.table(RawTable(header: header, rows: rows, alignments: alignments)))
+            continue
+        }
+
         var paragraph: [String] = [trimmed]
         index += 1
-        while index < lines.count, !startsBlock(lines[index]) {
+        while index < lines.count, !startsBlock(lines[index]), tableStart(lines, index) == nil {
             paragraph.append(lines[index].trimmingCharacters(in: .whitespaces))
             index += 1
         }
