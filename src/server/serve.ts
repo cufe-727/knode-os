@@ -21,6 +21,7 @@ import { WorkBroker } from '../work/broker.js';
 import { offeredRemotely } from '../work/config.js';
 import { JudgeSource } from '../work/judge.js';
 import { SummarySource } from '../work/summarize.js';
+import { TranslateSource } from '../work/translate.js';
 import { flushUsageToSidecars } from '../stats/heat.js';
 import { syncTraces } from '../traces/sync.js';
 import { reconcileViews } from '../wiki/pages.js';
@@ -132,7 +133,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
       }
       services.set(workspaceCtx.dataDir, {
         mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders,
-        labeling: started.labeling, work: started.work, localWorkers: started.localWorkers, processing: started.processing,
+        labeling: started.labeling, work: started.work, localWorkers: started.localWorkers, processing: started.processing, translations: started.translations,
         calls: started.calls,
       });
       return async () => {
@@ -490,6 +491,7 @@ interface StartedServices {
   work: WorkBroker;
   localWorkers: LocalLabelingWorkers;
   processing: LabelingProcessing;
+  translations: TranslateSource;
   calls: CallLedger;
 }
 
@@ -581,9 +583,11 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   }, { leaseMs });
   const followUp = startFollowUp(ctx, labeling, { log, track, active: false, judge: judges, onPause: () => judges.cancelWaiting('processing stopped') });
   summaries = new SummarySource(ctx, { serialize: followUp.serialize, log }, { leaseMs });
+  // translations into the content languages (docs/design/17): idle while they are off
+  const translations = new TranslateSource({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, log }, { leaseMs });
   // every answered call is measured, so the next estimate learns from it (docs/design/18)
   const calls = CallLedger.forWorkspace(ctx.dataDir, { log });
-  const work = new WorkBroker([labeling, summaries, judges], { shares: () => ctx.config.server.remote?.shares, ledger: calls });
+  const work = new WorkBroker([labeling, summaries, judges, translations], { shares: () => ctx.config.server.remote?.shares, ledger: calls });
   remoteJudge.askedLately = () => work.askedLately('judge', 2 * 60_000);
   const localWorkers = new LocalLabelingWorkers(work, () => ctx.config, { log });
   const processing = new LabelingProcessing(localWorkers, followUp, log);
@@ -647,6 +651,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     work,
     localWorkers,
     processing,
+    translations,
     calls,
   };
 }

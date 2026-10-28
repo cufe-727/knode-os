@@ -50,6 +50,7 @@ const RULES: Rule[] = [
   { prefix: '/api/chat/protocol', group: null, methods: READ },
   { prefix: '/api/playbooks', group: null, methods: READ },
   { prefix: '/api/chat/readiness', group: null },
+  { prefix: '/api/languages', group: null, methods: READ },
   { prefix: '/api/labeling/status', group: 'ingest' },
   // what starting it would spend is anyone's to see who may see its status (a balance only an administrator's)
   { prefix: '/api/labeling/estimate', group: 'ingest' },

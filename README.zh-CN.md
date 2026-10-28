@@ -26,6 +26,7 @@ knode-os 结合了两个项目的核心思想:[llm_wiki](https://github.com/nash
 - **原生 Obsidian Vault**:`wiki/` 可直接在 Obsidian 中作为 Vault 打开，内置 Vault 配置与附件目录；支持 Properties、别名、标签、`[[Wikilink]]`、路径链接、标题/块引用和 `![[嵌入]]`。OKF 导入和导出的每个知识 bundle 也自动是独立 Vault。
 - **`ask`**:基于知识库的带引用问答,并显式列出"知识库还缺什么"。
 - **研究课题(study)**:给一个主题——比如"从 Anthropic 最新的招股书出发,看它的收入与成本结构、上下游、竞争对手、外界评价与前景"——选谁来研究(Codex、Claude Code、Cursor、内置 agent,或深度研究模型)、能看哪些来源(知识库、网络、你自己的 MCP 服务器 / API / 站点)。规划员先把它改写成一份可编辑的研究简报(更具体的问题、要写的页面、起始来源、要问你的澄清问题);开始后,收集员找资料并**存下来**:每一份被依赖的网页、PDF、数据文件都由 knode 自己抓取,原件放进 `raw/docs/research/<课题>/`,像其他文档一样被转换(HTML / PDF → Markdown)和索引。每个部分一页、外加一页总报告写进 `wiki/research/`,引用这些文件,图表是 ` ```chart ` 数据块,网页端和 macOS 应用都直接画出来(柱状、折线、面积、堆叠柱、横向柱,以及做比较用的:100% 堆叠的份额图、两个指标的散点图、桥图(waterfall)、各家代际的时间线)。**导出**把一个课题合成一个自包含的 HTML 文件——先总报告、后各页,带目录、编号的图表及其来源——任何浏览器都能看,打印成 PDF 也干净。见 [设计 15](docs/design/15-research-studies.md)。
+- **内容语言**：给工作区指定一个主语言（以及若干次要语言），`raw/docs` 下用其他语言写的文档会在后台被翻译成主语言——翻译的是 Markdown，原件不动：PDF、网页保留原文件——按段落分段交给 Translate 阶段的 agent（Codex、Claude Code、Cursor 或任一模型），链接、被引用的锚点和代码不交给模型、译完再核对放回。网页和 macOS app 都有阅读语言切换（原文或译文）；次要语言在读者请求时才翻译。摘要页用主语言写。界面语言仍是每位读者自己的设置。见 [设计 17](docs/design/17-content-languages.md)。
 
 ## 快速开始
 
@@ -65,7 +66,8 @@ node dist/cli.js user add admin --admin --data ~/knode-data
 │   └── skills/         # agent 用过的 skills 与 prompts(自动同步)
 ├── .sidecar/           # 派生状态,每个源一个目录,镜像上面的目录树 —— 请保留
 │   └── raw/docs/<文件>/  # content.md(PDF/图片转换出的 Markdown)、meta.json(哈希、chunk 清单)、
-│                         # tier0.json / tier1.json(抽取结果)、usage.json(热度)、views/(LLM 摘要缓存)
+│                         # tier0.json / tier1.json(抽取结果)、usage.json(热度)、views/(LLM 摘要缓存，
+│                         # translations/<lang>.md——内容语言的译文，见设计 17)
 ├── wiki/                 # 原生 OKF v0.2 bundle + Obsidian Vault
 │   ├── .obsidian/        # Vault 配置(已有设置绝不覆盖)
 │   ├── attachments/      # Obsidian 附件
@@ -131,7 +133,14 @@ node dist/cli.js user add admin --admin --data ~/knode-data
     "entityLlm": { "provider": "codex-cli", "model": "" },
     "documentLlm": { "provider": "codex-cli", "model": "" }, // 视觉模型/API/Codex/Claude Code
     "summaryLlm": { "provider": "codex-cli", "model": "" },  // 每篇文档一页摘要
-    "judgeLlm": { "provider": "claude-cli", "model": "" }    // knode_ask、Dream、重复实体与断言复核
+    "judgeLlm": { "provider": "claude-cli", "model": "" },   // knode_ask、Dream、重复实体与断言复核
+    "translateLlm": { "provider": "codex-cli", "model": "" } // 把文档译成主内容语言（初始为 summaryLlm 的副本）
+  },
+  "languages": {                     // 内容语言（设计 17），默认关闭
+    "enabled": true,
+    "primary": "zh",                 // 知识库的阅读语言：其他语言的文档都译成它
+    "secondary": ["en"],             // 出现在读者的切换器里，读者请求时才翻译
+    "maxChars": 200000               // 更长的文档只在请求时翻译；0 = 不限
   },
   "dream": { "schedule": "03:00", "lookbackDays": 7 },
   "plugins": [                       // provider、存储后端、转换器与钩子 —— 见 docs/plugins.md
@@ -168,6 +177,7 @@ knode-os forget <path>        删除源、dispose 并清除其历史(不可逆)
 knode-os purge [--before iso] [--archived]  物理清除已 dispose 的历史 / 归档页面
 knode-os rebuild [--history]  删除索引(该 workspace 在 PostgreSQL 中的 schema;用 PGlite 时为 .knode/db)并从文件 + ledger 重建
 knode-os extract [--batch n]  跑一轮后台文档轮次:抽取一批、复核重复实体、写摘要
+knode-os translate <path…> [--lang zh] | --status   立即在 Translate 路由上翻译文档 / 按语言列出译文
 knode-os remote token create --name <机器> --scope label,read,write,sql --workspace <用户>/<workspace>
                               为远程 API 签发每台机器各自的 token(另有 `remote token list | revoke`)
 knode-os user add <名字> [--admin] [--team t] [--remote-apis 分组] [--gateway id]
@@ -244,7 +254,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
 四个一级区，每区自带二级 tab。
 
 - **Library / 资料** —— 盒子里有什么
-  - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown);**＋ add → Import / Link folder from this Mac** 按路径把本机一个文件夹整体带入并保留目录结构——一次性复制,或"链接"后由 `serve` 持续同步原文件夹的变化(树里带 🔗 标记,只读);打开 `raw/docs` 下的文件时，顶部列出引用它的 wiki 页面(**cited by**:来自它们的 `[[raw/docs/…]]` 与 Markdown 链接、`sources:`(derived from)以及 `tested_by` 等 `relations:`，[写法见此](docs/frontmatter-contract.zh-CN.md))；目录树不列系统目录——`ledger/`、`playbooks/`（在 **设置 → Playbooks** 里编辑），以及 `wiki/lint/` 和 `wiki/datasets/`（它们的消息改由通知送达）——并在 knode-os 建的每个目录旁写明它的用途；`purpose.md` 和 `schema.md` 可在这里直接编辑，agent 不会改写它们
+  - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown);开启内容语言后，文档按读者的阅读语言打开——工具栏里的切换器选原文或译文（按浏览器记住），还没有译文时给出 **translate**（译文只读）;**＋ add → Import / Link folder from this Mac** 按路径把本机一个文件夹整体带入并保留目录结构——一次性复制,或"链接"后由 `serve` 持续同步原文件夹的变化(树里带 🔗 标记,只读);打开 `raw/docs` 下的文件时，顶部列出引用它的 wiki 页面(**cited by**:来自它们的 `[[raw/docs/…]]` 与 Markdown 链接、`sources:`(derived from)以及 `tested_by` 等 `relations:`，[写法见此](docs/frontmatter-contract.zh-CN.md))；目录树不列系统目录——`ledger/`、`playbooks/`（在 **设置 → Playbooks** 里编辑），以及 `wiki/lint/` 和 `wiki/datasets/`（它们的消息改由通知送达）——并在 knode-os 建的每个目录旁写明它的用途；`purpose.md` 和 `schema.md` 可在这里直接编辑，agent 不会改写它们
   - **Search / 检索** —— hybrid/vector/keyword 检索,展示分数构成;可限定在「文件」里选中的目录
   - **Traces / 轨迹** —— 已收集的 agent 会话;点一行即可打开 `raw/traces/` 下对应的镜像文件
 - **Research / 研究** —— 研究课题:一个主题研究成几页
@@ -255,13 +265,14 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
   - **Graph / 图谱** —— 力导向图谱浏览 + 洞察(枢纽/孤立节点/类型分布)
   - **Wiki** —— 一个按钮完成知识库初始化(通读 → 总览页 + AGENTS.md 指南 + 排队的主题页),并在此发起与审阅深度研究页
   - **Dream / 夜间分析** —— 手动触发 dream,审阅并接受/拒绝建议
-- **Settings / 设置** —— **Providers & Agents**（每个模型端点与密钥只配一次，embedding 与 LLM 同在一张表——`llmUse` 标出哪个 LLM 是默认，所有没有自己指定 provider 的任务都跟着它走；下面第二张表是 agent：跑在这些模型之一上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI（Claude Code / Codex / Cursor）。CLI 是 agent 而不是模型）、**Ingest / 预处理**（独立的 Entity / Concept / 文档视觉阶段路由，每个阶段写明自己跑在哪个模型或 agent 上——任一 agent 都按单次调用使用，阶段不再跟随默认；保存后按需重建 embedding 或刷新转换）、**Research / 研究**、**Ask / 问答**（由哪个 agent 回答、每次回复带上最近几条消息、保留多少个对话）、**Playbooks**（`playbooks/` 下的文件，按 knode-os 读取它们的方式分组——研究模版与阶段提示词、context pack、intent、本体包、概念停用词表、能力说明、Ask 的协议与每轮提示词——每个文件都能编辑、撤销，或重置为 knode-os 自带的版本，保存前会检查 YAML 与模版；agent、研究 profile 与研究来源指向编辑它们的页面）、**Workspace**。中间三页按知识在工作区里的流向排列：进来先预处理，再研究成 wiki，最后用来回答问题
+- **Settings / 设置** —— **Providers & Agents**（每个模型端点与密钥只配一次，embedding 与 LLM 同在一张表——`llmUse` 标出哪个 LLM 是默认，所有没有自己指定 provider 的任务都跟着它走；下面第二张表是 agent：跑在这些模型之一上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI（Claude Code / Codex / Cursor）。CLI 是 agent 而不是模型）、**Ingest / 预处理**（独立的 Entity / Concept / 文档视觉阶段路由，以及带内容语言设置的 Translate 阶段，每个阶段写明自己跑在哪个模型或 agent 上——任一 agent 都按单次调用使用，阶段不再跟随默认；保存后按需重建 embedding 或刷新转换）、**Research / 研究**、**Ask / 问答**（由哪个 agent 回答、每次回复带上最近几条消息、保留多少个对话）、**Playbooks**（`playbooks/` 下的文件，按 knode-os 读取它们的方式分组——研究模版与阶段提示词、context pack、intent、本体包、概念停用词表、能力说明、Ask 的协议与每轮提示词——每个文件都能编辑、撤销，或重置为 knode-os 自带的版本，保存前会检查 YAML 与模版；agent、研究 profile 与研究来源指向编辑它们的页面）、**Workspace**。中间三页按知识在工作区里的流向排列：进来先预处理，再研究成 wiki，最后用来回答问题
 
 **通知**（页头的 ⚑）告诉你工作区需要你做什么，每条带一个对应操作：最近一次 wiki 检查（按类别的问题数、与上一份报告相比的变化，**Open report**）、上次同步失败的数据源（**Retry**）、仍在等你同意的 trace 采集（**Collect traces**，会说明要复制多少个会话）、仍是模版的 `purpose.md`（**Edit purpose.md**），以及从未初始化的 wiki（**Go to Initialize**）。关掉的通知在内容变化后会再次出现。
 
 ## REST API
 
 `GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/notices · /api/playbooks · /api/playbooks/file?path · /api/tree[?path&depth&dirs] · /api/file · /api/file/citations?path · /api/search · /api/graph[?limit&types&edges] · /api/graph/insights · /api/entities[?q&type&sort&order&offset&limit&merged] · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
+内容语言：`GET /api/languages` · `GET /api/file?path&lang`（有译文时返回该语言的文档，`languages` 说明各译文进度） · `POST /api/file/translate`（`{ path, lang, cancel? }`）
 `PUT /api/config` · `PUT /api/file` · `PUT /api/playbooks/file` · `DELETE /api/playbooks/file`（重置为自带版本） · `DELETE /api/file` · `POST /api/config/test | /api/upload | /api/ingest | /api/ask | /api/mv | /api/mkdir | /api/traces/sync | /api/dream | /api/wiki/generate | /api/suggestions/:id/status`
 
 每个接口都需要登录会话——已登录浏览器的 cookie,或 `Authorization: Bearer knu_…`(应用的,或 `knode-os user token` 签发给脚本的)——以及该接口所属 API 分组的权限;登录本身在 `/api/auth/*` 下([docs/remote-access.md](docs/remote-access.md))。Workspace 范围内的数据 API 另需请求头 `X-Knode-Workspace-Kind`（`personal` 或 `team`）、`X-Knode-Workspace-ID` 和 `X-Knode-Workspace-Name`；Workspace 的主人就是已登录的账号(只有关闭登录时才看 `X-Knode-User`)。`DELETE /api/workspace` 会彻底清空所选 Workspace。

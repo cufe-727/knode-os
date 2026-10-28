@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { KnodeConfig, LlmConfig, LlmProvider, resolveRoutedLlmConfig, routeTargets } from '../config.js';
+import { contentLanguages } from '../lang/languages.js';
 import { cursorModel, effortFor, speedFor } from '../llm/cli.js';
 import { SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
 
@@ -14,7 +15,8 @@ import { SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
  * cursor's effort inside the model name). Extraction's come from
  * `extraction.workers` (with their overrides, listed with 0 slots or not),
  * then the Extract stage's route; summaries' from the Summarize stage's
- * route; judge calls' from the Judge stage's. A worker applies one to a
+ * route; judge calls' from the Judge stage's; translations' from the
+ * Translate stage's. A worker applies one to a
  * backend of the same CLI unless it was given a model of its own. Endpoints
  * (`api` backends) get none: model names differ between them.
  */
@@ -41,10 +43,16 @@ export interface WorkerConfig {
 
 const FAMILY: Partial<Record<LlmProvider, CliFamily>> = { 'codex-cli': 'codex', 'claude-cli': 'claude', 'cursor-cli': 'cursor' };
 
-/** Whether the workspace offers this kind of work to remote workers: extraction always, summaries unless turned off, judge calls only when turned on. */
+/**
+ * Whether the workspace offers this kind of work to remote workers:
+ * extraction always, summaries unless turned off, judge calls only when
+ * turned on, translations while content languages are on (docs/design/17)
+ * unless turned off.
+ */
 export function offeredRemotely(config: KnodeConfig, kind: WorkKind): boolean {
   if (kind === 'summarize') return config.server.remote?.offer?.summarize !== false;
   if (kind === 'judge') return config.server.remote?.offer?.judge === true;
+  if (kind === 'translate') return contentLanguages(config).on && config.server.remote?.offer?.translate !== false;
   return true;
 }
 
@@ -67,6 +75,7 @@ export function workerHints(config: KnodeConfig): WorkerHints {
     extract: hintsFrom(extract),
     summarize: hintsFrom([resolveRoutedLlmConfig(config.llm, config.extraction.summaryLlm, targets)]),
     judge: hintsFrom([resolveRoutedLlmConfig(config.llm, config.extraction.judgeLlm, targets)]),
+    translate: hintsFrom([resolveRoutedLlmConfig(config.llm, config.extraction.translateLlm, targets)]),
   };
 }
 

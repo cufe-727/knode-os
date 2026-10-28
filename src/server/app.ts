@@ -11,6 +11,10 @@ import { LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
 import { mountRemoteApi } from '../remote/api.js';
 import { WorkBroker } from '../work/broker.js';
+import type { TranslateSource } from '../work/translate.js';
+import type { DocumentRow } from '../types.js';
+import { contentLanguages, LANGUAGES, LanguagesConfig, normalizeLanguage, normalizeLanguagesConfig, sameLanguage } from '../lang/languages.js';
+import { documentLanguages, isDataFile, recordTranslationState, translatedText, translationRow, withdrawTranslationRequest } from '../lang/translate.js';
 import { accountMayOpenTeam } from '../auth/accounts.js';
 import { AuthEnv, authMiddleware, existingTeams, mountAuthRoutes, mountGateways } from '../auth/http.js';
 import { AuthService } from '../auth/service.js';
@@ -49,7 +53,7 @@ import {
   saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS, ExtractionWorkerConfig } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
-import { assertNotPrivate, assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isOwnerRootFile, isPrivatePath, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
+import { assertNotPrivate, assertSourcePath, assertWritablePath, capText, cleanRelPath, grepFiles, isOwnerRootFile, isPrivatePath, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
 import { FOLDER_ABOUT, hasSidecarSegment, SIDECAR_ROOT, TREE_HIDDEN } from '../fs/layout.js';
 import { listPlaybooks, readPlaybook, resetPlaybook, savePlaybook } from '../fs/playbooks.js';
 import { moveSidecar } from '../fs/sidecar.js';
@@ -173,10 +177,12 @@ type ExtractionConfigDraft = {
   documentLlm?: Partial<RoutedLlmConfig>;
   summaryLlm?: Partial<RoutedLlmConfig>;
   judgeLlm?: Partial<RoutedLlmConfig>;
+  translateLlm?: Partial<RoutedLlmConfig>;
   claims?: boolean;
   batchSize?: number;
   concurrency?: number;
   summaryConcurrency?: number;
+  translateConcurrency?: number;
   summaryMinChars?: number;
   summaryMaxSegments?: number;
   workers?: Partial<ExtractionWorkerConfig>[];
@@ -203,6 +209,8 @@ type ModelConfigDraft = {
   chat?: Partial<ChatConfig>;
   /** What the Judge stage does with its verdicts, and the workspace's web switch (Research tab); the other review keys are file-only. */
   review?: Partial<Pick<ReviewConfig, 'llmJudge' | 'claims' | 'claimMerge' | 'external'>>;
+  /** Content languages (docs/design/17). */
+  languages?: Partial<LanguagesConfig>;
 };
 
 /** What `serve` runs per workspace beside the routes; absent in tests and CLI-hosted apps. */
@@ -222,6 +230,8 @@ export interface WorkspaceServices {
   localWorkers?: LocalLabelingWorkers | null;
   /** Starts and stops the slots and the reviews; stopped until someone starts it. */
   processing?: LabelingProcessing | null;
+  /** Translations into the content languages as leased work (src/work/translate.ts); a request wakes it. */
+  translations?: TranslateSource | null;
   /** What answered calls cost, measured by the broker — an estimate's averages (src/estimate/ledger.ts). */
   calls?: CallLedger | null;
 }
@@ -652,8 +662,8 @@ export function createApp(
   app.post('/api/config/test', async (c) => {
     const ctx = requestCtx(c);
     const draft = (await c.req.json().catch(() => ({}))) as ModelConfigDraft;
-    const out: { embedding: unknown; llm: unknown; entityLlm: unknown; documentLlm: unknown; summaryLlm: unknown; judgeLlm: unknown } = {
-      embedding: null, llm: null, entityLlm: null, documentLlm: null, summaryLlm: null, judgeLlm: null,
+    const out: { embedding: unknown; llm: unknown; entityLlm: unknown; documentLlm: unknown; summaryLlm: unknown; judgeLlm: unknown; translateLlm: unknown } = {
+      embedding: null, llm: null, entityLlm: null, documentLlm: null, summaryLlm: null, judgeLlm: null, translateLlm: null,
     };
 
     try {
@@ -674,16 +684,18 @@ export function createApp(
     const documentRoute = mergeRoutedLlmConfig(ctx.config.extraction.documentLlm, draft.extraction?.documentLlm);
     const summaryRoute = mergeRoutedLlmConfig(ctx.config.extraction.summaryLlm, draft.extraction?.summaryLlm);
     const judgeRoute = mergeRoutedLlmConfig(ctx.config.extraction.judgeLlm, draft.extraction?.judgeLlm);
+    const translateRoute = mergeRoutedLlmConfig(ctx.config.extraction.translateLlm, draft.extraction?.translateLlm);
     try {
       out.llm = await testLlmConfig(baseLlm);
     } catch (e) {
       out.llm = { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
-    const routedTests: Array<[keyof Pick<typeof out, 'entityLlm' | 'documentLlm' | 'summaryLlm' | 'judgeLlm'>, RoutedLlmConfig, string]> = [
+    const routedTests: Array<[keyof Pick<typeof out, 'entityLlm' | 'documentLlm' | 'summaryLlm' | 'judgeLlm' | 'translateLlm'>, RoutedLlmConfig, string]> = [
       ['entityLlm', entityRoute, ctx.config.extraction.tier1Model],
       ['documentLlm', documentRoute, ''],
       ['summaryLlm', summaryRoute, ''],
       ['judgeLlm', judgeRoute, ''],
+      ['translateLlm', translateRoute, ''],
     ];
     for (const [key, route, legacyModel] of routedTests) {
       const fullyInherited =
@@ -746,7 +758,7 @@ export function createApp(
       return c.json(await listModelsCached('chat', connection, opts));
     }
 
-    if (route !== 'entityLlm' && route !== 'documentLlm' && route !== 'summaryLlm' && route !== 'judgeLlm') {
+    if (route !== 'entityLlm' && route !== 'documentLlm' && route !== 'summaryLlm' && route !== 'judgeLlm' && route !== 'translateLlm') {
       return c.json({ error: `unknown route: ${route}` }, 400);
     }
     const merged = mergeRoutedLlmConfig(ctx.config.extraction[route], draft.extraction?.[route]);
@@ -756,6 +768,13 @@ export function createApp(
   // Where each coding-agent CLI resolved to on the service PATH — Settings uses
   // this to keep the executable field out of the way when it is redundant.
   app.get('/api/config/cli-tools', (c) => c.json({ tools: cachedCliToolStatus({ refresh: c.req.query('refresh') === '1' }) }));
+
+  // the languages knode-os knows, and the workspace's content languages: what a client's pickers and switcher show (docs/design/17)
+  app.get('/api/languages', (c) => {
+    const ctx = requestCtx(c);
+    const current = contentLanguages(ctx.config);
+    return c.json({ languages: LANGUAGES, enabled: current.on, primary: current.primary, secondary: current.secondary, offered: current.offered, maxChars: current.maxChars });
+  });
 
   // Which executors can actually run here, and which one to preselect when
   // `research.agent` is still empty. Both clients read this instead of each
@@ -807,6 +826,9 @@ export function createApp(
         if (x.judgeLlm) {
           next.extraction.judgeLlm = mergeRoutedLlmConfig(next.extraction.judgeLlm, x.judgeLlm);
         }
+        if (x.translateLlm) {
+          next.extraction.translateLlm = mergeRoutedLlmConfig(next.extraction.translateLlm, x.translateLlm);
+        }
         if (typeof x.claims === 'boolean') next.extraction.claims = x.claims;
         const batchSize = Number(x.batchSize);
         const concurrency = Number(x.concurrency);
@@ -816,6 +838,11 @@ export function createApp(
         const summaryConcurrency = Number(x.summaryConcurrency);
         if (x.summaryConcurrency !== undefined && Number.isFinite(summaryConcurrency) && summaryConcurrency >= 0) {
           next.extraction.summaryConcurrency = Math.min(16, Math.floor(summaryConcurrency));
+        }
+        // and translations (docs/design/17)
+        const translateConcurrency = Number(x.translateConcurrency);
+        if (x.translateConcurrency !== undefined && Number.isFinite(translateConcurrency) && translateConcurrency >= 0) {
+          next.extraction.translateConcurrency = Math.min(16, Math.floor(translateConcurrency));
         }
         // the Summarize stage's size threshold (0: every document) and how many segments one summary reads at most (docs/design/14)
         const summaryMinChars = Number(x.summaryMinChars);
@@ -963,6 +990,16 @@ export function createApp(
         if (claimMerge === 'off' || claimMerge === 'suggest' || claimMerge === 'auto') next.review.claimMerge = claimMerge;
         if (external === 'off' || external === 'verify' || external === 'research') next.review.external = external;
       }
+      if (incoming.languages) {
+        // content languages (docs/design/17): a language knode-os does not know is refused, not dropped in silence
+        const l = incoming.languages;
+        for (const tag of [l.primary, ...(Array.isArray(l.secondary) ? l.secondary : [])]) {
+          if (typeof tag === 'string' && tag.trim() && !normalizeLanguage(tag)) return c.json({ error: `unknown language "${tag}"` }, 400);
+        }
+        const merged = normalizeLanguagesConfig({ ...next.languages, ...l });
+        if (merged.enabled && !merged.primary) return c.json({ error: 'content languages need a primary language' }, 400);
+        next.languages = merged;
+      }
       if (incoming.retrieval?.sag) {
         const sag = incoming.retrieval.sag;
         const setInt = (key: keyof Omit<SagSearchConfig, 'directRatio'>, min: number, max: number) => {
@@ -994,6 +1031,8 @@ export function createApp(
       ctx.config = next;
       ctx.llm = judgeLlmClient(next);
       ctx.embedder = nextEmbedder;
+      // a new primary language, or the languages turned on: the Translate stage looks again
+      servicesFor(ctx)?.translations?.wake();
 
       let reindex: Awaited<ReturnType<typeof sync>> | null = null;
       if (reembed || reconvert) {
@@ -1072,21 +1111,86 @@ export function createApp(
     }
   });
 
-  app.get('/api/file', (c) => {
+  app.get('/api/file', async (c) => {
     const ctx = requestCtx(c);
     try {
       const p = c.req.query('path');
       if (!p) return c.json({ error: 'path required' }, 400);
       // the config (literal keys) and the private state are not files to hand out, to anyone
       if (isPrivatePath(p)) return c.json({ error: `${p} is not available through the file API`, reason: 'private' }, 403);
-      const asked = Number(c.req.query('maxBytes'));
-      const cap = Number.isFinite(asked) && asked > 0 ? Math.min(asked, MAX_FILE_BYTES) : MAX_PREVIEW_BYTES;
+      const maxBytes = Number(c.req.query('maxBytes'));
+      const cap = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.min(maxBytes, MAX_FILE_BYTES) : MAX_PREVIEW_BYTES;
       // a PDF / image original answers with the Markdown knode-os derived from it
       const file = readSourceTextCapped(ctx.dataDir, p, cap);
       if (!file) return c.json({ error: `no derived text for ${p} yet — run a sync first` }, 404);
-      return c.json({ path: p, content: file.content, bytes: file.bytes, truncated: file.truncated, derived: file.derived });
+      // the document in the reader's language, where the workspace has content languages on (docs/design/17)
+      const languages = await documentLanguages(ctx.store, ctx.dataDir, ctx.config, p);
+      const asked = normalizeLanguage(c.req.query('lang'));
+      if (languages && asked && !sameLanguage(asked, languages.source)) {
+        const [doc] = await ctx.store.query<Pick<DocumentRow, 'id' | 'path' | 'root' | 'sha256'>>(`SELECT id, path, root, sha256 FROM documents WHERE path = $1 AND status = 'indexed'`, [p]);
+        const translated = doc ? translatedText(ctx.dataDir, doc, asked) : null;
+        if (translated) {
+          const capped = capText(translated.text, cap);
+          return c.json({
+            path: p, content: capped.content, bytes: capped.bytes, truncated: capped.truncated, derived: file.derived,
+            languages: { ...languages, shown: asked }, translation: { language: asked, done: translated.done, parts: translated.parts, model: translated.model },
+          });
+        }
+      }
+      return c.json({
+        path: p, content: file.content, bytes: file.bytes, truncated: file.truncated, derived: file.derived,
+        ...(languages ? { languages: { ...languages, shown: languages.source } } : {}),
+      });
     } catch (e) {
       return c.json(err(e), 404);
+    }
+  });
+
+  // ask for a document in another of the workspace's languages: the Translate stage takes it next (docs/design/17)
+  app.post('/api/file/translate', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = await c.req.json<{ path?: string; lang?: string; cancel?: boolean }>().catch(() => ({} as { path?: string; lang?: string; cancel?: boolean }));
+      const p = typeof body.path === 'string' ? body.path : '';
+      if (!p) return c.json({ error: 'path required' }, 400);
+      if (isPrivatePath(p)) return c.json({ error: `${p} is not available through the file API`, reason: 'private' }, 403);
+      const languages = contentLanguages(ctx.config);
+      if (!languages.on) return c.json({ error: 'content languages are off for this workspace — turn them on in Settings → Ingest → Translate' }, 409);
+      const lang = normalizeLanguage(body.lang);
+      if (!lang || !languages.offered.includes(lang)) return c.json({ error: `${body.lang ?? '(none)'} is not one of this workspace's languages (${languages.offered.join(', ')})` }, 400);
+      const [doc] = await ctx.store.query<Pick<DocumentRow, 'id' | 'path' | 'root' | 'sha256' | 'language'>>(
+        `SELECT id, path, root, sha256, language FROM documents WHERE path = $1 AND status = 'indexed' AND root = 'docs' AND kind = 'source'`,
+        [p],
+      );
+      if (!doc) return c.json({ error: `${p} is no indexed document under raw/docs` }, 404);
+      if (isDataFile(p)) return c.json({ error: `${p} is data, not prose: it is not translated` }, 400);
+      const current = await documentLanguages(ctx.store, ctx.dataDir, ctx.config, p);
+      if (current?.source && sameLanguage(current.source, lang)) return c.json({ error: `${p} is written in ${lang} already` }, 400);
+      if (body.cancel) {
+        await withdrawTranslationRequest(ctx.store, doc.id, lang);
+        return c.json({ ok: true, status: current?.translations[lang]?.status ?? 'none' });
+      }
+      const state = current?.translations[lang];
+      if (state?.status !== 'done') {
+        const row = await translationRow(ctx.store, doc.id, lang);
+        // a failed translation asked for again starts its attempts over
+        const fresh = row?.status === 'failed' && row.content_sha === doc.sha256;
+        if (fresh) await ctx.store.query(`UPDATE translations SET attempts = 0 WHERE document_id = $1 AND language = $2`, [doc.id, lang]);
+        const partial = row && row.content_sha === doc.sha256 && row.status === 'partial';
+        await recordTranslationState(ctx.store, doc, lang, {
+          status: partial ? 'partial' : 'requested', parts: partial ? row.parts : 0, done: partial ? row.done : 0, requested: true,
+        });
+        servicesFor(ctx)?.translations?.wake();
+      }
+      const services = servicesFor(ctx);
+      return c.json({
+        ok: true,
+        status: state?.status === 'done' ? 'done' : 'requested',
+        // a request waits for this machine's slots or a remote worker; with neither it waits for processing to start
+        processing: services?.processing?.state().running ?? false,
+      });
+    } catch (e) {
+      return c.json(err(e), 400);
     }
   });
 
@@ -2710,6 +2814,7 @@ export function createApp(
       scheduler: work ? { ...scheduler, workers: work.workers } : scheduler,
       summaries: work?.kinds.summarize ?? null,
       judge: work?.kinds.judge ?? null,
+      translations: work?.kinds.translate ?? null,
       shares: work?.shares ?? null,
       local: services.localWorkers?.status() ?? [],
     });

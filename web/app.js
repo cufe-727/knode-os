@@ -1028,6 +1028,7 @@ async function loadStats() {
       (s.pending_suggestions ? ` · ☾${s.pending_suggestions}` : '');
   } catch { /* server still starting */ }
   loadProcessing();
+  void loadContentLanguages();
 }
 
 /* ------------------------------- notices ------------------------------- */
@@ -1262,6 +1263,7 @@ function paintProcessing() {
   const mayChange = authDisabled || serverAuth?.groups?.settings === true;
   const queued = processingStatus.scheduler?.queued;
   const due = processingStatus.summaries?.due;
+  const translations = processingStatus.translations?.enabled ? processingStatus.translations : null;
   button.classList.toggle('running', state.running);
   button.textContent = state.running ? '● Processing' : '▶ Start processing';
   button.disabled = !mayChange;
@@ -1269,6 +1271,7 @@ function paintProcessing() {
     state.running ? 'Extraction, reviews and summaries are running — click to stop' : 'Extraction, reviews and summaries wait until someone starts them',
     queued === undefined ? '' : `${queued} documents waiting`,
     due ? `${due} summaries due` : '',
+    translations?.due ? `${translations.due} translations into ${languageInEnglish(translations.primary)} due` : '',
     state.by && state.since ? `${state.running ? 'started' : 'stopped'} by ${state.by} at ${new Date(state.since).toLocaleTimeString()}` : '',
     mayChange ? '' : 'an administrator starts and stops processing',
   ].filter(Boolean).join(' · ');
@@ -2072,10 +2075,11 @@ async function loadFullFile() {
   if (!currentFile) return;
   const path = currentFile;
   try {
-    const { content, derived, truncated, bytes } = await api(`/api/file?path=${encodeURIComponent(path)}&maxBytes=${EDIT_BYTE_CAP}`);
+    const file = await api(fileUrl(path, { maxBytes: EDIT_BYTE_CAP }));
     if (currentFile !== path) return; // the user moved on while this was in flight
-    renderFileContent(path, content, derived, truncated, bytes);
-    if (truncated) toast(`${path} is too large to edit here`);
+    renderFileContent(path, file.content, file.derived, file.truncated, file.bytes);
+    paintLanguages(path, file);
+    if (file.truncated) toast(`${path} is too large to edit here`);
   } catch (e) {
     toast(`load failed: ${e.message}`);
   }
@@ -2129,7 +2133,10 @@ function renderFileContent(path, content, derived, truncated, bytes) {
 /** `fragment`: where a link pointed inside the file — an export's entry anchor or a heading. */
 async function openFile(path, labelEl, fragment = null) {
   try {
-    const { content, derived, truncated, bytes } = await api(`/api/file?path=${encodeURIComponent(path)}`);
+    // the reading language is known before the first file of a workspace opens
+    if (contentLanguagesLoaded !== (activeWorkspace()?.id ?? null)) await loadContentLanguages();
+    const file = await api(fileUrl(path));
+    const { content, derived, truncated, bytes } = file;
     currentFile = path;
     editing = false;
     // the create target follows the last thing clicked: a file hands it back
@@ -2143,6 +2150,7 @@ async function openFile(path, labelEl, fragment = null) {
     $('#file-view').hidden = false;
     $('#file-editor').hidden = true;
     renderFileContent(path, content, derived, truncated, bytes);
+    paintLanguages(path, file);
     loadFileCitations(path);
     $('#btn-delete').disabled = Boolean(mirroredSource(path));
     if (fragment) scrollToFragment(fragment);
@@ -2151,6 +2159,178 @@ async function openFile(path, labelEl, fragment = null) {
     toast(`open failed: ${e.message}`);
   }
 }
+
+/* --------------------------- content languages -------------------------- */
+
+/**
+ * Content languages (docs/design/17). A workspace with them on reads in a
+ * primary language: documents in other languages are translated into it in
+ * the background, and into a secondary one when a reader asks. Which version
+ * this reader opens — the reading language — is theirs, kept in this browser
+ * and defaulting to the workspace's primary; "original" reads every
+ * document as it was written. It is not the interface language: this page's
+ * own words stay as they are whatever a reader picks here.
+ */
+let contentLanguages = null; // GET /api/languages: the catalog and the workspace's settings; null on an older service
+const READING_LANGUAGE_KEY = 'knode-os.reading-language';
+
+/** The names the service would give, for an older one that has no catalog to send. */
+const LANGUAGE_NAMES = {
+  zh: '简体中文', 'zh-Hant': '繁體中文', en: 'English', ja: '日本語', ko: '한국어',
+  fr: 'Français', de: 'Deutsch', es: 'Español', pt: 'Português', it: 'Italiano', ru: 'Русский',
+};
+
+/** A language as the switcher shows it: in itself. */
+const languageName = (code) => contentLanguages?.languages?.find((l) => l.code === code)?.native ?? LANGUAGE_NAMES[code] ?? code;
+/** A language as this page's sentences name it. */
+const languageInEnglish = (code) => contentLanguages?.languages?.find((l) => l.code === code)?.english ?? code;
+
+let contentLanguagesLoaded = null;
+
+async function loadContentLanguages() {
+  try {
+    contentLanguages = await api('/api/languages');
+  } catch {
+    contentLanguages = null;
+  }
+  contentLanguagesLoaded = activeWorkspace()?.id ?? null;
+}
+
+/** 'original', or a language code; null while the workspace has content languages off. */
+function readingLanguage() {
+  if (!contentLanguages?.enabled) return null;
+  let picked = null;
+  try {
+    picked = localStorage.getItem(READING_LANGUAGE_KEY);
+  } catch {
+    // a private window keeps no preferences: the primary language it is
+  }
+  if (picked === 'original') return picked;
+  // a pick another workspace offers is not this one's: its primary then
+  return picked && contentLanguages.offered?.includes(picked) ? picked : contentLanguages.primary;
+}
+
+function setReadingLanguage(value) {
+  try {
+    localStorage.setItem(READING_LANGUAGE_KEY, value);
+  } catch {
+    // kept for this page only
+  }
+}
+
+/** The file API for `path`, asking for the reader's language. */
+function fileUrl(path, { maxBytes } = {}) {
+  const q = new URLSearchParams({ path });
+  if (maxBytes) q.set('maxBytes', String(maxBytes));
+  const lang = readingLanguage();
+  if (lang && lang !== 'original') q.set('lang', lang);
+  return `/api/file?${q}`;
+}
+
+let languageRefresh = null;
+
+/**
+ * The switcher and what it says about the open file: the original and the
+ * workspace's languages, the reader's pick marked, and — when the pick has no
+ * translation yet — why, with the one action that helps. A translation is
+ * read-only: an edit belongs to the original.
+ */
+function paintLanguages(path, file) {
+  clearTimeout(languageRefresh);
+  const box = $('#file-langs');
+  const notice = $('#file-lang-notice');
+  const langs = file.languages;
+  if (!langs || !langs.source || langs.offered.length < 2) {
+    box.hidden = true;
+    box.innerHTML = '';
+    notice.hidden = true;
+    return;
+  }
+  const pick = readingLanguage();
+  const wanted = pick === 'original' || !pick ? langs.source : pick;
+  // a language the document is written in already — zh for a zh-Hant reader — reads as its original
+  const asked = langs.offered.includes(wanted) ? wanted : langs.source;
+  const others = langs.offered.filter((code) => code !== langs.source);
+  const button = (value, code, label, title) =>
+    `<button type="button" data-reading="${esc(value)}" class="${code === asked ? 'selected' : ''}" title="${esc(title)}">${esc(label)}</button>`;
+  box.innerHTML = button('original', langs.source, `${languageName(langs.source)} · original`, 'Read every document in the language it was written in')
+    + others.map((code) => button(code, code, languageName(code), `Read documents in ${languageInEnglish(code)} where a translation exists`)).join('');
+  box.hidden = false;
+
+  const state = langs.translations?.[asked];
+  const translation = file.translation;
+  let text = '';
+  let action = '';
+  if (translation) {
+    // reading a translation: never editable, the original is the file
+    $('#btn-edit').disabled = true;
+    const by = translation.model ? ` by ${translation.model}` : '';
+    text = translation.done < translation.parts
+      ? `Translated ${translation.done} of ${translation.parts} parts so far${by} — the rest still reads in ${languageInEnglish(langs.source)}. Read-only: edit the original.`
+      : `Translated from ${languageInEnglish(langs.source)}${by}. Read-only: edit the original.`;
+  } else if (asked !== langs.source && state) {
+    const into = languageInEnglish(asked);
+    if (state.status === 'requested') {
+      text = `Queued for translation into ${into}${processingStatus?.processing && !processingStatus.processing.running ? ' — it runs once processing is started, or when a remote worker takes it' : ''}. Showing the original meanwhile.`;
+    } else if (state.status === 'failed') {
+      text = `The translation into ${into} failed${state.error ? `: ${state.error}` : ''}. Showing the original.`;
+      action = 'try again';
+    } else if (state.status === 'skipped') {
+      text = `Nothing in this document to translate into ${into}.`;
+    } else {
+      text = `Not translated into ${into} yet${asked === langs.primary ? ' — documents in other languages are translated in the background, the newest first' : ''}. Showing the original.`;
+      action = asked === langs.primary ? 'translate next' : 'translate';
+    }
+  }
+  notice.hidden = !text;
+  $('#file-lang-notice-text').textContent = text;
+  const go = $('#btn-translate');
+  go.hidden = !action;
+  go.textContent = action;
+  go.dataset.lang = asked;
+  // a translation under way is looked at again while the file stays open
+  const pending = (translation && translation.done < translation.parts) || state?.status === 'requested' || state?.status === 'partial';
+  if (pending) languageRefresh = setTimeout(() => refreshLanguages(path, translation?.done ?? -1), 20_000);
+}
+
+/** Repaint the open file when its translation moved on, keeping the reader's place. */
+async function refreshLanguages(path, doneBefore) {
+  if (currentFile !== path || editing) return;
+  try {
+    const file = await api(fileUrl(path));
+    if (currentFile !== path || editing) return;
+    const done = file.translation?.done ?? -1;
+    if (done !== doneBefore) {
+      const view = $('#file-view');
+      const top = view.scrollTop;
+      renderFileContent(path, file.content, file.derived, file.truncated, file.bytes);
+      view.scrollTop = top;
+    }
+    paintLanguages(path, file);
+  } catch {
+    // the next open tries again
+  }
+}
+
+$('#file-langs').addEventListener('click', (event) => {
+  const value = event.target.closest?.('[data-reading]')?.dataset.reading;
+  if (!value || !currentFile || editing) return;
+  setReadingLanguage(value);
+  void openFile(currentFile);
+});
+
+$('#btn-translate').addEventListener('click', async () => {
+  const path = currentFile;
+  const lang = $('#btn-translate').dataset.lang;
+  if (!path || !lang) return;
+  try {
+    const r = await api('/api/file/translate', { method: 'POST', body: JSON.stringify({ path, lang }) });
+    toast(r.status === 'done' ? 'Already translated' : r.processing ? `Queued: the ${languageInEnglish(lang)} translation is next` : `Queued — it is translated once processing is started, or when a remote worker takes it`, 5000);
+    if (currentFile === path) void openFile(path);
+  } catch (e) {
+    toast(e.message, 5000);
+  }
+});
 
 /** Draw the eye to what a jump landed on. */
 function flash(...els) {
@@ -4475,7 +4655,7 @@ function embeddingKeyLimits(entry) {
 }
 
 /** The stages that name a model or an agent, by their fields' prefix (`#cfg-<prefix>-use`, `<prefix>Llm`). */
-const ROUTE_PREFIXES = ['entity', 'document', 'summary', 'judge'];
+const ROUTE_PREFIXES = ['entity', 'document', 'summary', 'judge', 'translate'];
 
 /**
  * Rebuild the per-route pickers: the models under LLM, then every agent a
@@ -4511,6 +4691,8 @@ const PIPELINE_STAGES = [
   { key: 'entity', step: 3, title: 'Extract', badge: 'volume', accent: 'accent2' },
   { key: 'summary', step: 4, title: 'Summarize', badge: 'prose', accent: 'accent2' },
   { key: 'judge', step: 5, title: 'Judge', badge: 'quality', accent: 'accent2' },
+  // beside the background pass, while content languages are on (docs/design/17)
+  { key: 'translate', step: 6, title: 'Translate', badge: 'languages', accent: 'accent2' },
 ];
 let selectedStage = 'document';
 
@@ -4526,6 +4708,11 @@ function stageRate(key) {
   if (key === 'index') return `×${int('#cfg-ingest-concurrency', 4)} · ${int('#cfg-emb-batch', 32)}/req`;
   // Summarize runs in Extract's pass, at its rates
   if (key === 'entity' || key === 'summary') return `×${int('#cfg-extraction-concurrency', 1)} · ${int('#cfg-extraction-batch', 8)}/pass`;
+  if (key === 'translate') {
+    if (!$('#cfg-lang-enabled').checked) return 'off';
+    const slots = Number($('#cfg-translate-concurrency').value);
+    return `→ ${$('#cfg-lang-primary').value || '?'} · ×${Number.isFinite(slots) ? slots : 1}`;
+  }
   return '';
 }
 
@@ -4781,6 +4968,8 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-extraction-batch').value = cfg.extraction?.batchSize ?? 8;
     $('#cfg-extraction-concurrency').value = cfg.extraction?.concurrency ?? 1;
     $('#cfg-extraction-claims').checked = cfg.extraction?.claims !== false;
+    await fillLanguagesForm(cfg);
+    if (activeWorkspace()?.id !== workspaceId) return;
     $('#cfg-review-judge').value = cfg.review?.llmJudge ?? 'suggest';
     $('#cfg-review-claims').value = cfg.review?.claims ?? 'suggest';
     $('#cfg-review-claim-merge').value = cfg.review?.claimMerge ?? 'auto';
@@ -4814,6 +5003,58 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     if (activeWorkspace()?.id !== workspaceId) return;
     $('#cfg-status').innerHTML = `<div class="cfg-line bad">load failed: ${esc(e.message)}</div>`;
   }
+}
+
+/**
+ * The Translate stage's languages: on or off, the primary language, the
+ * secondary ones (any other the catalog has), and the size past which a
+ * document waits for a reader to ask. The catalog comes from the service.
+ */
+async function fillLanguagesForm(cfg) {
+  if (!contentLanguages) await loadContentLanguages();
+  const catalog = contentLanguages?.languages ?? Object.entries(LANGUAGE_NAMES).map(([code, native]) => ({ code, native, english: code }));
+  const langs = cfg.languages ?? { enabled: false, primary: '', secondary: [], maxChars: 200000 };
+  $('#cfg-lang-enabled').checked = langs.enabled === true;
+  $('#cfg-lang-primary').innerHTML = `<option value="">— choose —</option>${catalog.map((l) => `<option value="${esc(l.code)}">${esc(l.native)} · ${esc(l.english)}</option>`).join('')}`;
+  $('#cfg-lang-primary').value = langs.primary || '';
+  const secondary = new Set(langs.secondary ?? []);
+  $('#cfg-lang-secondary').innerHTML = catalog
+    .map((l) => `<label class="cfg-check cfg-inline-check"><input type="checkbox" value="${esc(l.code)}"${secondary.has(l.code) ? ' checked' : ''} /> ${esc(l.native)}</label>`)
+    .join('');
+  $('#cfg-lang-maxchars').value = langs.maxChars ?? 200000;
+  $('#cfg-translate-concurrency').value = cfg.extraction?.translateConcurrency ?? cfg.extraction?.concurrency ?? 1;
+  paintLanguageForm();
+}
+
+/** The primary language is no secondary one; the stage's line says what it is doing. */
+function paintLanguageForm() {
+  const primary = $('#cfg-lang-primary').value;
+  for (const box of document.querySelectorAll('#cfg-lang-secondary input')) {
+    box.disabled = box.value === primary;
+    if (box.disabled) box.checked = false;
+  }
+  const t = processingStatus?.translations;
+  $('#cfg-lang-status').textContent = !$('#cfg-lang-enabled').checked
+    ? 'Off: nothing is translated, summaries keep each document\'s language and readers see no switcher.'
+    : t?.enabled
+      ? `${count(t.due, ['translation', 'translations'])} due at the last look · ${count(t.leases.length, ['segment', 'segments'])} out · ${count(t.lastHour.documents, ['document', 'documents'])} finished in the last hour.`
+      : 'Translations start once this is saved and processing runs (or a remote worker takes them).';
+}
+
+function gatherLanguages() {
+  return {
+    enabled: $('#cfg-lang-enabled').checked,
+    primary: $('#cfg-lang-primary').value,
+    secondary: [...document.querySelectorAll('#cfg-lang-secondary input:checked')].map((box) => box.value),
+    maxChars: Math.max(0, Math.floor(Number($('#cfg-lang-maxchars').value) || 0)),
+  };
+}
+
+for (const id of ['#cfg-lang-enabled', '#cfg-lang-primary', '#cfg-translate-concurrency']) {
+  $(id).addEventListener('change', () => {
+    paintLanguageForm();
+    updateConfigSummaries();
+  });
 }
 
 function gatherRoute(prefix) {
@@ -4851,10 +5092,13 @@ function gatherConfig() {
       documentLlm: gatherRoute('document'),
       summaryLlm: gatherRoute('summary'),
       judgeLlm: gatherRoute('judge'),
+      translateLlm: gatherRoute('translate'),
       batchSize: Number($('#cfg-extraction-batch').value),
       concurrency: Number($('#cfg-extraction-concurrency').value),
+      translateConcurrency: Number($('#cfg-translate-concurrency').value),
       claims: $('#cfg-extraction-claims').checked,
     },
+    languages: gatherLanguages(),
     // what the Judge stage does with its verdicts
     review: {
       llmJudge: $('#cfg-review-judge').value,
@@ -5555,6 +5799,7 @@ function renderCfgResult(r) {
     ['3 · Extract', r.entityLlm],
     ['4 · Summarize', r.summaryLlm],
     ['5 · Judge', r.judgeLlm],
+    ['6 · Translate', r.translateLlm],
   ];
   $('#cfg-status').innerHTML = items.map(([label, result]) => {
     if (!result) return '';

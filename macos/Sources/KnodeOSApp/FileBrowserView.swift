@@ -9,6 +9,18 @@ struct FileBrowserView: View {
     /// the largest file "Load full file" can make editable.
     static let editByteCap = 4 * 1024 * 1024
 
+    /// Where the reader's reading language lives: per device, like the
+    /// interface language, and just as separate from the workspace.
+    static let readingLanguageKey = "knode-os.macos.reading-language.v1"
+
+    /// The reading language that reads every document as it was written —
+    /// the switcher's "· original" entry, as in the web UI.
+    static let originalsPick = "original"
+
+    /// How long a translation under way is left before the document is read
+    /// again: a segment lands whole, and most take longer than this to write.
+    private static let translationPollSeconds: UInt64 = 20
+
     /// One presentation slot: stacking `.sheet` modifiers on a single view is
     /// unreliable, so every editor shares this one.
     private enum ActiveSheet: Identifiable {
@@ -130,6 +142,24 @@ struct FileBrowserView: View {
     @State private var panelOrigin: Int?
     /// Files a followed link left, the latest last, each with the block the link sat in.
     @State private var backTrail: [FileReturn] = []
+    /// The version of a document the reader reads, for every document on
+    /// this Mac (docs/design/17 D1): a language code, `originalsPick`, or
+    /// empty until someone picks — the workspace's primary language stands in
+    /// until then.
+    @AppStorage(FileBrowserView.readingLanguageKey) private var readingLanguagePick = ""
+    /// The open document's languages as its last read told them; nil for a
+    /// file that has none — anything outside raw/docs, a workspace with
+    /// content languages off, an older service.
+    @State private var fileLanguages: FileLanguages?
+    /// Set while the text on screen is a translation: read-only, since an
+    /// edit belongs to the original.
+    @State private var shownTranslation: FileTranslation?
+    /// The workspace's primary language as the last document named it, so a
+    /// reader who never picked one is asked for in it from the first read on.
+    @State private var workspacePrimary: String?
+    /// What the last translation request for the open file said about this
+    /// machine's processing; false means the request waits for it.
+    @State private var translationProcessing: Bool?
 
     private struct FileReturn {
         let path: String
@@ -374,6 +404,9 @@ struct FileBrowserView: View {
                         .help(selectedPath)
                     Spacer()
                     if isWorking { ProgressView().controlSize(.small) }
+                    if let languages = switchableLanguages {
+                        readingLanguageMenu(languages)
+                    }
                     if AppModel.hasOriginal(selectedPath) {
                         Button { Task { await model.openOriginal(selectedPath) } } label: {
                             Label(L("Open Original"), systemImage: "arrow.up.forward.app")
@@ -419,6 +452,10 @@ struct FileBrowserView: View {
                     Divider()
                 }
 
+                if let languages = switchableLanguages, let wanted = readingLanguage(for: languages) {
+                    languageNotice(languages, wanted: wanted)
+                }
+
                 if !citations.isEmpty {
                     citationStrip
                     Divider()
@@ -452,6 +489,10 @@ struct FileBrowserView: View {
                 }
             }
             .task(id: selectedPath) { await loadCitations(for: selectedPath) }
+            // restarts on another file or language, and ends once the translation is in
+            .task(id: translationUnderWay ? "\(selectedPath)\u{0}\(fileLanguages.flatMap(readingLanguage(for:)) ?? "")" : nil) {
+                await followTranslation()
+            }
         } else {
             EmptyState(
                 symbol: "doc.text.magnifyingglass",
@@ -497,6 +538,148 @@ struct FileBrowserView: View {
         .font(.system(size: 11))
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+    }
+
+    /// The reading-language switcher, as the web UI has it: the document's
+    /// own language marked as the original — picking it reads every document
+    /// as it was written — then the workspace's other languages by their own
+    /// names. A pick is the reader's for every document on this Mac, not this
+    /// one's alone.
+    private func readingLanguageMenu(_ languages: FileLanguages) -> some View {
+        let current = readingLanguage(for: languages)
+        let others = languages.offered.filter { !isOriginal($0, of: languages) }
+        // the original is ticked whenever that is what the reading language comes to here
+        let selection = Binding(
+            get: { current.flatMap { isOriginal($0, of: languages) ? nil : $0 } ?? Self.originalsPick },
+            set: { pickReadingLanguage($0) }
+        )
+        return Menu {
+            Picker(L("Reading language"), selection: selection) {
+                Text("\(ContentLanguage.nativeName(languages.source ?? "")) · \(L("original"))")
+                    .help(L("Read every document in the language it was written in"))
+                    .tag(Self.originalsPick)
+                ForEach(others, id: \.self) { code in
+                    Text(ContentLanguage.nativeName(code)).tag(code)
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } label: {
+            Label(ContentLanguage.nativeName(current ?? ""), systemImage: "globe")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        // a pick reads the file again, which would throw an open editor's text away
+        .disabled(isWorking || isEditing)
+        .help(L("Reading language — which version of a document this Mac shows; originals are never changed"))
+    }
+
+    /// The open document's languages when there is something to switch
+    /// between: a language of its own — a text without letters has none to
+    /// translate from — and another one beside it.
+    private var switchableLanguages: FileLanguages? {
+        guard let languages = fileLanguages, languages.source != nil, languages.offered.count > 1 else { return nil }
+        return languages
+    }
+
+    /// The document's own language: the entry the service marks as the
+    /// source, which for a traditional-Chinese primary over a simplified
+    /// document is the primary's own code.
+    private func isOriginal(_ code: String, of languages: FileLanguages) -> Bool {
+        languages.translations[code]?.status == "source" || code == languages.source
+    }
+
+    /// A language as a sentence names it, in the interface's language.
+    private func spokenName(_ code: String) -> String {
+        L(ContentLanguage.englishName(code))
+    }
+
+    /// The line under the header about the open document's language: what
+    /// a translation on screen is, or why the original stands in for the
+    /// reading language and what can be done about it.
+    @ViewBuilder
+    private func languageNotice(_ languages: FileLanguages, wanted: String) -> some View {
+        if let translation = shownTranslation {
+            let from = languages.source.map(spokenName) ?? "—"
+            let translator = translation.model.flatMap { $0.isEmpty ? nil : $0 }
+            let caption = translator.map { L("Translated from %@ by %@ · read-only, edits belong to the original", from, $0) }
+                ?? L("Translated from %@ · read-only, edits belong to the original", from)
+            if let done = translation.done, let parts = translation.parts, done < parts {
+                languageLine(caption + "\n" + L("Translated %d of %d parts — the rest shows the original", done, parts), symbol: "character.book.closed", tint: .knodeCyan) {
+                    Button(L("Check again")) { Task { await rereadOpenFile() } }
+                }
+            } else {
+                languageLine(caption, symbol: "character.book.closed", tint: .knodeCyan) { EmptyView() }
+            }
+        } else if let state = languages.translations[wanted] {
+            let name = spokenName(wanted)
+            switch state.status {
+            case "none":
+                // the primary language is the background's anyway: asking only moves the document up
+                let background = wanted == languages.primary
+                languageLine(
+                    background
+                        ? L("Not translated into %@ yet — documents in other languages are translated in the background, the newest first", name)
+                        : L("Not translated into %@ yet", name),
+                    symbol: "character.book.closed",
+                    tint: .knodeCyan
+                ) {
+                    Button(background ? L("Translate next") : L("Translate")) { Task { await requestTranslation(into: wanted) } }
+                }
+            case "requested", "partial":
+                // the toolbar's processing status, which is kept current; else what the request answered
+                let stopped = model.processing?.processing.map { !$0.running } ?? (translationProcessing == false)
+                languageLine(
+                    stopped
+                        ? L("Queued for translation into %@ — it runs once processing is started, or when a remote worker takes it", name)
+                        : L("Queued for translation into %@", name),
+                    symbol: "hourglass",
+                    tint: .knodeCyan
+                ) {
+                    Button(L("Check again")) { Task { await rereadOpenFile() } }
+                    if state.requested == true {
+                        Button(L("Withdraw")) { Task { await withdrawTranslation(of: wanted) } }
+                            .help(L("Take the request back before it spends model calls"))
+                    }
+                }
+            case "failed":
+                languageLine(
+                    state.error.map { L("The translation into %@ failed: %@", name, $0) } ?? L("The translation into %@ failed", name),
+                    symbol: "exclamationmark.triangle.fill",
+                    tint: .orange
+                ) {
+                    Button(L("Try again")) { Task { await requestTranslation(into: wanted) } }
+                }
+            case "skipped":
+                languageLine(L("Nothing in this document to translate into %@", name), symbol: "character.book.closed", tint: .knodeCyan) { EmptyView() }
+            default:
+                // its own language, or a translation done since this read
+                EmptyView()
+            }
+        }
+    }
+
+    /// One line under the header, the shape of the read-only notice above it
+    /// and tinted for what it says.
+    private func languageLine<Actions: View>(_ text: String, symbol: String, tint: Color, @ViewBuilder actions: () -> Actions) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: symbol)
+                    .foregroundStyle(tint)
+                Text(text)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                actions()
+                    .controlSize(.small)
+                    .disabled(isWorking)
+            }
+            .font(.system(size: 11))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .background(tint.opacity(0.08))
+            Divider()
+        }
     }
 
     private var newFileSheet: some View {
@@ -916,45 +1099,180 @@ struct FileBrowserView: View {
         isWorking = true
         defer { isWorking = false }
         do {
-            let response = try await model.client().file(at: path)
+            let response = try await read(path)
+            // a request's answer was about the file it was made for
+            if response.path != selectedPath { translationProcessing = nil }
             selectedPath = response.path
             // the create target follows the last thing clicked: a file hands it
             // back to the file's own folder
             selectedDirectory = nil
             // the entities the last file named are not this one's: none until its own arrive
             mentions = []
-            content = response.content
-            // A capped read must never round-trip through the editor: saving it
-            // back would rewrite the file with only the previewed prefix.
-            isTruncated = response.truncated ?? false
-            isDerived = response.derived ?? false
-            fileBytes = response.bytes
-            editorContent = isEditable ? response.content : ""
+            show(response)
             isEditing = false
         } catch {
             model.showError(error, prefix: "Open failed")
         }
     }
 
+    /// A file in the reading language. Usually one read; a second only when
+    /// the first shows the document's reading language is not the one asked
+    /// for — the first document, before the workspace's primary language is
+    /// known, or a pick this workspace does not offer — and reading again
+    /// would show something else: a translation that exists, or the original
+    /// instead of one.
+    private func read(_ path: String) async throws -> FileResponse {
+        // the originals need no language: the original is what comes without one
+        let asked = readingLanguagePick == Self.originalsPick ? nil : readingLanguagePick.isEmpty ? workspacePrimary : readingLanguagePick
+        let response = try await model.client().file(at: path, lang: asked)
+        guard let languages = response.languages, let wanted = readingLanguage(for: languages), wanted != asked else { return response }
+        let worthReading = ContentLanguage.same(wanted, languages.source)
+            ? response.translation != nil
+            : ["done", "partial"].contains(languages.translations[wanted]?.status ?? "")
+        guard worthReading else { return response }
+        return try await model.client().file(at: path, lang: wanted)
+    }
+
+    /// The language to read a document in: its own for a reader who picked
+    /// the originals, the reader's pick where the document offers it — a
+    /// pick from another workspace may not be this one's — else the
+    /// workspace's primary language.
+    private func readingLanguage(for languages: FileLanguages) -> String? {
+        let wanted: String?
+        if readingLanguagePick == Self.originalsPick {
+            wanted = languages.source ?? languages.primary
+        } else if !readingLanguagePick.isEmpty, languages.offered.contains(readingLanguagePick) {
+            wanted = readingLanguagePick
+        } else {
+            wanted = languages.primary
+        }
+        // a language the document is written in already — zh for a zh-Hant
+        // reader — reads as its original, under the original's own code
+        if let wanted, let source = languages.source, ContentLanguage.same(wanted, source) { return source }
+        return wanted
+    }
+
+    /// Put a read on screen: its text, what may be done with it, and its languages.
+    private func show(_ response: FileResponse) {
+        content = response.content
+        // A capped read must never round-trip through the editor: saving it
+        // back would rewrite the file with only the previewed prefix.
+        isTruncated = response.truncated ?? false
+        isDerived = response.derived ?? false
+        fileBytes = response.bytes
+        fileLanguages = response.languages
+        shownTranslation = response.translation
+        if let primary = response.languages?.primary { workspacePrimary = primary }
+        editorContent = isEditable ? response.content : ""
+    }
+
+    /// Read the open document again in the reading language: after a pick,
+    /// a request, and while its translation is under way. `quietly` is the
+    /// timer's: no spinner, no error, and nothing redrawn when nothing moved.
+    private func rereadOpenFile(quietly: Bool = false) async {
+        guard let path = selectedPath, !isEditing else { return }
+        if !quietly { isWorking = true }
+        defer { if !quietly { isWorking = false } }
+        do {
+            let response = try await read(path)
+            // the reader may have moved on, or started editing, meanwhile
+            guard selectedPath == path, !isEditing else { return }
+            if response.content == content, response.languages == fileLanguages, response.translation == shownTranslation { return }
+            if response.content != content { mentions = [] }
+            show(response)
+        } catch {
+            if !quietly { model.showError(error, prefix: "Open failed") }
+        }
+    }
+
     /// Re-read the open file without the preview cap, so it can be edited.
     /// The editor only ever holds a complete file: that is what makes a save safe.
+    /// Only ever the original — a translation is never edited — so no language is asked for.
     private func loadFullFile() async {
         guard let selectedPath else { return }
         isWorking = true
         defer { isWorking = false }
         do {
             let response = try await model.client().file(at: selectedPath, maxBytes: Self.editByteCap)
-            let stillCapped = response.truncated ?? false
-            content = response.content
-            isTruncated = stillCapped
-            isDerived = response.derived ?? false
-            fileBytes = response.bytes
-            editorContent = isEditable ? response.content : ""
-            if stillCapped {
+            show(response)
+            if isTruncated {
                 model.showToast("\(selectedPath) is too large to edit here")
             }
         } catch {
             model.showError(error, prefix: "Load failed")
+        }
+    }
+
+    /// The reader picked a language, or the originals: theirs for every
+    /// document from now on, and the open one is read again when that changes it.
+    private func pickReadingLanguage(_ pick: String) {
+        guard !pick.isEmpty else { return }
+        let before = fileLanguages.flatMap(readingLanguage(for:))
+        readingLanguagePick = pick
+        guard fileLanguages.flatMap(readingLanguage(for:)) != before else { return }
+        Task { await rereadOpenFile() }
+    }
+
+    /// Ask for the open document in `language`; the Translate stage takes it
+    /// next. The line under the header shows it queued from here on, and the
+    /// document is read again while it is under way.
+    private func requestTranslation(into language: String) async {
+        guard let path = selectedPath else { return }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let answer = try await model.client().requestTranslation(path: path, lang: language)
+            guard selectedPath == path else { return }
+            translationProcessing = answer.processing
+            if answer.status == "done" {
+                // translated meanwhile, by someone else's request or the background
+                isWorking = false
+                await rereadOpenFile()
+                return
+            }
+            var state = fileLanguages?.translations[language] ?? TranslationState(status: "requested")
+            // one under way stays under way: the service keeps its parts
+            if state.status != "partial" { state.status = "requested" }
+            state.requested = true
+            state.error = nil
+            fileLanguages?.translations[language] = state
+        } catch {
+            model.showError(error, prefix: L("Translation request failed"))
+        }
+    }
+
+    /// Withdraw a request nobody needs any more — before it spends model calls.
+    private func withdrawTranslation(of language: String) async {
+        guard let path = selectedPath else { return }
+        do {
+            _ = try await model.client().requestTranslation(path: path, lang: language, cancel: true)
+            await rereadOpenFile()
+        } catch {
+            model.showError(error, prefix: L("Could not withdraw the request"))
+        }
+    }
+
+    /// Whether the open document's translation into the reading language is
+    /// being written, so that reading it again can show more of it.
+    private var translationUnderWay: Bool {
+        guard !isEditing, let languages = fileLanguages, let wanted = readingLanguage(for: languages) else { return false }
+        let status = languages.translations[wanted]?.status
+        return status == "requested" || status == "partial"
+    }
+
+    /// While a translation is under way, read the document again every 20
+    /// seconds, so a reader sees it grow instead of having to reopen it — but
+    /// not while nothing can move it: this machine's processing stopped and no
+    /// remote worker seen.
+    private func followTranslation() async {
+        guard translationUnderWay else { return }
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: Self.translationPollSeconds * 1_000_000_000)
+            guard !Task.isCancelled, translationUnderWay else { return }
+            let stopped = model.processing?.processing?.running == false
+            let remote = model.processing?.scheduler?.workers?.contains { $0.remote } ?? false
+            if stopped && !remote { continue }
+            await rereadOpenFile(quietly: true)
         }
     }
 
@@ -1416,18 +1734,26 @@ struct FileBrowserView: View {
         }
     }
 
-    /// The editor may open only on a complete file that is the user's own text.
-    private var isEditable: Bool { !isTruncated && !isDerived }
+    /// The editor may open only on a complete file that is the user's own
+    /// text — not a translation, whose edits would belong to the original.
+    private var isEditable: Bool { !isTruncated && !isDerived && shownTranslation == nil }
 
     /// A truncated preview can be promoted to a full read — and so to editing —
     /// as long as the text is the file's own and the service will serve it whole.
     private var canLoadFullFile: Bool {
-        guard let selectedPath, isEditablePath(selectedPath), !isDerived, let fileBytes else { return false }
+        guard let selectedPath, isEditablePath(selectedPath), !isDerived, shownTranslation == nil, let fileBytes else { return false }
         return isTruncated && fileBytes <= Self.editByteCap
     }
 
     /// Why the open file cannot be edited, or nil when it can.
     private var readOnlyNotice: String? {
+        // A translation says it is one in its own line under the header; a
+        // capped one only needs to say it is capped.
+        if shownTranslation != nil {
+            guard isTruncated else { return nil }
+            let cap = ByteCountFormatter.string(fromByteCount: Int64(Self.previewByteCap), countStyle: .file)
+            return L("Preview only — showing the first %@ of the translation.", cap)
+        }
         // Derived text is knode-os's rendering of a PDF or image. It is read-only
         // whatever its size: writing it back would replace the original's bytes.
         if isDerived {
@@ -1453,6 +1779,9 @@ struct FileBrowserView: View {
         isDerived = false
         fileBytes = nil
         isEditing = false
+        fileLanguages = nil
+        shownTranslation = nil
+        translationProcessing = nil
     }
 
     private func selectFiles(_ paths: [String]) {

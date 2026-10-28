@@ -30,6 +30,9 @@ struct SettingsView: View {
     @State private var showingDuplicate = false
     @State private var duplicateName = ""
     @State private var showingProfileDelete = false
+    /// The languages the Translate stage can write: the service's list, or
+    /// the built-in copy of it until that arrives or when it never does.
+    @State private var languageCatalog: [ContentLanguage] = ContentLanguage.builtin
 
     var body: some View {
         VStack(spacing: 0) {
@@ -309,7 +312,7 @@ struct SettingsView: View {
 
     // MARK: - 02 · Pipeline
 
-    /// The five stages as a rail, top to bottom in the order a document passes
+    /// The six stages as a rail, top to bottom in the order a document passes
     /// through them, with the selected stage's form beside it. A node carries
     /// what a person checks at a glance — where it runs and how fast — and the
     /// form holds everything else. The nodes used to be a row over the form,
@@ -341,7 +344,7 @@ struct SettingsView: View {
         .padding(12)
     }
 
-    /// Under the step numbers, so the five read down one column.
+    /// Under the step numbers, so the six read down one column.
     private var stageArrow: some View {
         Image(systemName: "arrow.down")
             .font(.system(size: 8, weight: .semibold))
@@ -517,7 +520,109 @@ struct SettingsView: View {
                 )
                 reviewModes
             }
+        case .translate:
+            if config?.languages == nil {
+                // a service from before content languages has neither the
+                // stage nor the languages, and would drop both on a save
+                Text(L("This service has no Translate stage yet — update knode-os on it to translate documents."))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                VStack(alignment: .leading, spacing: 18) {
+                    StagePicker(
+                        route: binding(\.extraction.translateLlm),
+                        models: config?.connections ?? [],
+                        agents: routeAgents,
+                        defaultTarget: defaultTarget,
+                        routeKey: "translateLlm",
+                        load: { refresh in try await modelList(route: "translateLlm", refresh: refresh) }
+                    )
+                    contentLanguages
+                }
+            }
         }
+    }
+
+    /// What the Translate stage translates into: the workspace's content
+    /// languages. They are the workspace's, not this Mac's — the interface
+    /// language at the top of the page is a person's own and changes no
+    /// document — and each reader picks among them in the file view.
+    private var contentLanguages: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(L("Translate documents into the primary language"), isOn: languagesEnabled)
+                .toggleStyle(.checkbox)
+            FieldLabel(L("Primary language")) {
+                Picker(L("Primary language"), selection: primaryLanguage) {
+                    if config?.languages?.primary.isEmpty != false {
+                        Text(L("Not chosen")).tag("")
+                    }
+                    ForEach(languageCatalog) { language in
+                        Text(languageName(language)).tag(language.code)
+                    }
+                }
+                .labelsHidden()
+            }
+            FieldLabel(L("Secondary languages")) {
+                FlowLayout(spacing: 12) {
+                    ForEach(languageCatalog.filter { $0.code != config?.languages?.primary }) { language in
+                        Toggle(languageName(language), isOn: secondaryLanguage(language.code))
+                            .toggleStyle(.checkbox)
+                    }
+                }
+            }
+            Text(L("Every document in another language is translated into the primary one in the background; into a secondary one only when a reader asks. Originals are never changed, and summaries are written in the primary language."))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// A language by its own name, then by the interface's where that reads
+    /// differently — "日本語 · Japanese", but "English" alone.
+    private func languageName(_ language: ContentLanguage) -> String {
+        let local = L(language.english)
+        return local == language.native ? language.native : "\(language.native) · \(local)"
+    }
+
+    /// Turning translation on with no primary language picked yet pre-fills
+    /// the interface's — only a pre-fill, shown in the picker below and saved
+    /// with everything else, since the service refuses one without the other.
+    private var languagesEnabled: Binding<Bool> {
+        Binding(
+            get: { config?.languages?.enabled ?? false },
+            set: { on in
+                guard config?.languages != nil else { return }
+                config!.languages!.enabled = on
+                if on, config!.languages!.primary.isEmpty { config!.languages!.primary = L10n.isChinese ? "zh" : "en" }
+            }
+        )
+    }
+
+    /// The primary language is never also a secondary one.
+    private var primaryLanguage: Binding<String> {
+        Binding(
+            get: { config?.languages?.primary ?? "" },
+            set: { code in
+                guard config?.languages != nil else { return }
+                config!.languages!.primary = code
+                config!.languages!.secondary.removeAll { $0 == code }
+            }
+        )
+    }
+
+    /// Kept in the catalog's order, which is the order the switcher lists them in.
+    private func secondaryLanguage(_ code: String) -> Binding<Bool> {
+        Binding(
+            get: { config?.languages?.secondary.contains(code) ?? false },
+            set: { on in
+                guard config?.languages != nil else { return }
+                var picked = Set(config!.languages!.secondary)
+                if on { picked.insert(code) } else { picked.remove(code) }
+                let order = languageCatalog.map(\.code)
+                config!.languages!.secondary = picked.sorted { (order.firstIndex(of: $0) ?? .max) < (order.firstIndex(of: $1) ?? .max) }
+            }
+        )
     }
 
     /// What the Judge stage does with its verdicts. The duplicate reviews (of
@@ -629,7 +734,52 @@ struct SettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
         case .judge:
             EmptyView()
+        case .translate:
+            if config?.languages != nil {
+                VStack(alignment: .leading, spacing: 10) {
+                    // the second caption wraps to two lines; level fields read better than level captions
+                    Grid(alignment: .bottomLeading, horizontalSpacing: 16, verticalSpacing: 10) {
+                        GridRow {
+                            FieldLabel(L("Parallel calls")) {
+                                TextField(L("Parallel calls"), value: translateConcurrency, format: .number)
+                            }
+                            FieldLabel(L("Longest document translated without a request")) {
+                                TextField(L("Longest document translated without a request"), value: languagesBinding(\.maxChars), format: .number)
+                            }
+                        }
+                    }
+                    Text(L("Parallel calls start at Extract's; 0 leaves translations to remote workers. The longest document is in characters, 0 for no limit — a longer one is translated when a reader asks for it."))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let translations = model.processing?.translations, translations.enabled {
+                        Text(translations.queueLine)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
         }
+    }
+
+    /// This machine's translation slots: unset, they are Extract's parallel
+    /// calls, which is what the field shows until someone types a number.
+    private var translateConcurrency: Binding<Int> {
+        Binding(
+            get: { config?.extraction.translateConcurrency ?? config?.extraction.concurrency ?? 0 },
+            set: { config?.extraction.translateConcurrency = max(0, $0) }
+        )
+    }
+
+    /// One field of the `languages` block, which only a service that sends it shows.
+    private func languagesBinding<Value>(_ keyPath: WritableKeyPath<LanguagesConfig, Value>) -> Binding<Value> {
+        Binding(
+            get: { (config?.languages ?? LanguagesConfig())[keyPath: keyPath] },
+            set: { value in
+                guard config?.languages != nil else { return }
+                config!.languages![keyPath: keyPath] = value
+            }
+        )
     }
 
     /// `batchSize` is optional in the mirror, but the field is a plain number.
@@ -661,6 +811,8 @@ struct SettingsView: View {
         case .extract: routeSummary(\.extraction.entityLlm)
         case .summarize: routeSummary(\.extraction.summaryLlm)
         case .judge: routeSummary(\.extraction.judgeLlm)
+        case .translate:
+            config == nil || config?.languages != nil ? routeSummary(\.extraction.translateLlm) : RouteTarget(provider: L("Not on this service"))
         }
     }
 
@@ -674,6 +826,9 @@ struct SettingsView: View {
         case .extract: route = config.extraction.entityLlm
         case .summarize: route = config.extraction.summaryLlm
         case .judge: route = config.extraction.judgeLlm
+        case .translate:
+            guard config.languages != nil else { return nil }
+            route = config.extraction.translateLlm
         case .index: return nil
         }
         guard let target = routeTargets.first(where: { $0.id == route.use }), cliProviderNames.contains(target.provider) else { return nil }
@@ -691,6 +846,13 @@ struct SettingsView: View {
         // Summarize runs in Extract's pass, at its rates
         case .extract, .summarize: "×\(config.extraction.concurrency) · \(config.extraction.batchSize)/pass"
         case .judge: ""
+        // its own slots, and the languages it writes, primary first
+        case .translate:
+            if let languages = config.languages, languages.enabled, !languages.primary.isEmpty {
+                "×\(config.extraction.translateConcurrency ?? config.extraction.concurrency) · \(([languages.primary] + languages.secondary).joined(separator: ", "))"
+            } else {
+                config.languages == nil ? "" : L("Off")
+            }
         }
     }
 
@@ -770,6 +932,7 @@ struct SettingsView: View {
                 config?.extraction.documentLlm.use = fresh.extraction.documentLlm.use
                 config?.extraction.summaryLlm.use = fresh.extraction.summaryLlm.use
                 config?.extraction.judgeLlm.use = fresh.extraction.judgeLlm.use
+                config?.extraction.translateLlm.use = fresh.extraction.translateLlm.use
             }
             statusMessage = response.reset == true
                 ? L("Agent %@ reset to the built-in", agent.title)
@@ -858,6 +1021,8 @@ struct SettingsView: View {
             case .extract: routed(config.extraction.entityLlm) == row
             case .summarize: routed(config.extraction.summaryLlm) == row
             case .judge: routed(config.extraction.judgeLlm) == row
+            // the mirror's copy of Summarize's route on a service without the stage runs nothing
+            case .translate: config.languages != nil && routed(config.extraction.translateLlm) == row
             }
         }
     }
@@ -1112,6 +1277,7 @@ struct SettingsView: View {
             TestResultRow(label: L("3 · Extract"), result: result.entityLlm)
             TestResultRow(label: L("4 · Summarize"), result: result.summaryLlm)
             TestResultRow(label: L("5 · Judge"), result: result.judgeLlm)
+            TestResultRow(label: L("6 · Translate"), result: result.translateLlm)
         }
         .knodeCard()
     }
@@ -1228,12 +1394,13 @@ struct SettingsView: View {
         return try await model.client().listModels(route: "llm", config: draft, refresh: refresh)
     }
 
-    /// The routes the four model stages name, in the order a document meets them.
+    /// The routes the five model stages name, in the order a document meets them.
     private let stageRoutes: [WritableKeyPath<KnodeConfig, RoutedLLMConfig>] = [
         \KnodeConfig.extraction.documentLlm,
         \KnodeConfig.extraction.entityLlm,
         \KnodeConfig.extraction.summaryLlm,
         \KnodeConfig.extraction.judgeLlm,
+        \KnodeConfig.extraction.translateLlm,
     ]
 
     /// Every stage names what it runs on, and the service writes it down that
@@ -1305,6 +1472,10 @@ struct SettingsView: View {
             config = normalized(try await model.client().config())
             if let tools = try? await model.client().cliTools() {
                 cliTools = Dictionary(tools.tools.map { ($0.provider, $0) }, uniquingKeysWith: { first, _ in first })
+            }
+            // an older service has no list to give, nor a stage to give it to
+            if config?.languages != nil, let known = try? await model.client().languages().languages, !known.isEmpty {
+                languageCatalog = known
             }
             // With no agent configured, pre-fill what the service says can run
             // here. Only a pre-fill — nothing is saved until Save is pressed, so
@@ -1924,16 +2095,18 @@ private struct TestResultRow: View {
     }
 }
 
-/// The five stages, in the order a document meets them. Declaring them once
+/// The six stages, in the order a document meets them. Declaring them once
 /// keeps the flow nodes, the inspector and the per-stage rates from drifting
 /// apart — they used to be five hand-written blocks.
 ///
 /// The first four are per document: Convert and Index on sync, Extract and
 /// Summarize in the background pass. Judge decides things — duplicates after
-/// each pass, disputes and Dream at night, knode_ask on demand. Concept pages
+/// each pass, disputes and Dream at night, knode_ask on demand. Translate is
+/// per document again, on slots of its own (docs/design/17); it came last and
+/// stays last, so the others keep the numbers both clients show. Concept pages
 /// are research's job, not a stage's (docs/design/09).
 enum PipelineStage: Int, CaseIterable, Identifiable {
-    case convert = 1, index, extract, summarize, judge
+    case convert = 1, index, extract, summarize, judge, translate
 
     var id: Int { rawValue }
     var step: Int { rawValue }
@@ -1945,6 +2118,7 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .extract: L("Extract")
         case .summarize: L("Summarize")
         case .judge: L("Judge")
+        case .translate: L("Translate")
         }
     }
 
@@ -1955,6 +2129,7 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .extract: L("Volume")
         case .summarize: L("Prose")
         case .judge: L("Quality")
+        case .translate: L("Languages")
         }
     }
 
@@ -1968,6 +2143,7 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
         case .extract: L("Names entities, relations and factual claims in changed documents, a long one in segments; what it finds is checked for duplicates right away.")
         case .summarize: L("Writes one summary page per document, right after it is extracted.")
         case .judge: L("Answers knode_ask and reviews duplicate entities and claims after each extraction pass; overnight it runs Dream and reviews disputed claims.")
+        case .translate: L("Translates documents into the workspace's languages, a segment at a time, and keeps each translation beside its original.")
         }
     }
 
@@ -1983,6 +2159,8 @@ enum PipelineStage: Int, CaseIterable, Identifiable {
             L("One call per document, for people to read rather than a program to parse, so it wants clean prose more than the strongest model. Changing the model does not rewrite summaries already written.")
         case .judge:
             L("Few calls, but each one decides something — whether two entities are one, whether two claims say the same, which of two claims holds, what a week of agent sessions says — so a stronger model pays for itself. Only knode_ask has someone waiting on the answer.")
+        case .translate:
+            L("One call per segment of about 8,000 characters, or 4,000 of Chinese, Japanese or Korean. It is for people to read, so it wants a model that writes both languages well and leaves every link, anchor and piece of code where it was; an answer that loses one is tried again. Changing the model does not rewrite translations already written.")
         }
     }
 }
