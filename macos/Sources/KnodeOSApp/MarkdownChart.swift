@@ -109,6 +109,7 @@ struct ChartSpec: Decodable, Equatable {
         let category: String
         let index: Int
         let series: String
+        let seriesIndex: Int
         let value: Double
     }
 
@@ -117,7 +118,7 @@ struct ChartSpec: Decodable, Equatable {
         series.enumerated().flatMap { s, entry in
             x.enumerated().compactMap { i, label -> Point? in
                 guard i < entry.values.count, let value = entry.values[i] else { return nil }
-                return Point(id: "\(s)-\(i)", category: label, index: i, series: seriesName(s), value: value)
+                return Point(id: "\(s)-\(i)", category: label, index: i, series: seriesName(s), seriesIndex: s, value: value)
             }
         }
     }
@@ -127,7 +128,7 @@ struct ChartSpec: Decodable, Equatable {
         let positive = points.filter { $0.value > 0 }
         var totals: [Int: Double] = [:]
         for p in positive { totals[p.index, default: 0] += p.value }
-        return positive.map { p in Point(id: p.id, category: p.category, index: p.index, series: p.series, value: p.value / (totals[p.index] ?? 1)) }
+        return positive.map { p in Point(id: p.id, category: p.category, index: p.index, series: p.series, seriesIndex: p.seriesIndex, value: p.value / (totals[p.index] ?? 1)) }
     }
 
     /* ------------------------------------------------------------ scatter */
@@ -290,11 +291,12 @@ struct MarkdownChart: View {
         case "scatter": scatter
         case "waterfall": waterfall
         case "timeline": timeline.colouredBySeries(seriesNames, palette, legend: false)
+        case "hbar": hbar.colouredBySeries(seriesNames, palette, legend: spec.series.count > 1)
         default: categorical.colouredBySeries(seriesNames, palette, legend: spec.series.count > 1)
         }
     }
 
-    /// bar, stacked-bar, share, hbar, line and area: one value per series and category.
+    /// bar, stacked-bar, share, line and area: one value per series and category.
     @ViewBuilder
     private var categorical: some View {
         let unit = spec.unit ?? ""
@@ -316,15 +318,6 @@ struct MarkdownChart: View {
             }
             .chartXScale(domain: spec.x)
             .chartYAxisLabel(unit)
-        case "hbar":
-            Chart(spec.points) { p in
-                BarMark(x: .value(measure, p.value), y: .value("Category", p.category))
-                    .foregroundStyle(by: .value("Series", p.series))
-                    .position(by: .value("Series", p.series))
-                    .cornerRadius(3)
-            }
-            .chartYScale(domain: spec.x)
-            .chartXAxisLabel(unit)
         case "share":
             // each column stacked to 100%, its parts worked out here; a negative value has no share of it
             Chart(spec.sharePoints) { p in
@@ -358,6 +351,43 @@ struct MarkdownChart: View {
             .chartXScale(domain: spec.x)
             .chartYAxisLabel(unit)
         }
+    }
+
+    /**
+     * A row per category, the first at the top, with a bar in it for each
+     * series, the first series uppermost. The rows stand on a numeric axis, as
+     * the timeline's do, so each name sits level with its bars; a name is cut
+     * at 200 pt, as the web viewer cuts it.
+     */
+    private var hbar: some View {
+        let unit = spec.unit ?? ""
+        let measure = unit.isEmpty ? "Value" : unit
+        let rows = spec.x.count
+        let level = { (row: Int) in Double(rows - 1 - row) }
+        // the bars fill this much of the 26 pt `height` gives a row, and stay that thick in the taller rows of a short list
+        let band = (spec.series.count > 1 ? 0.8 : 0.62) * min(1, Double(rows * 26) / Double(height - 40))
+        let slot = band / Double(max(1, spec.series.count))
+        let thick = spec.series.count > 1 ? slot * 0.8 : slot
+        return Chart(spec.points) { p in
+            let centre = level(p.index) + band / 2 - (Double(p.seriesIndex) + 0.5) * slot
+            // a BarMark across a numeric axis is as thick as a number of points; a rectangle's thickness is in rows, so it keeps to its row
+            RectangleMark(xStart: .value(measure, 0.0), xEnd: .value(measure, p.value), yStart: .value("Row", centre - thick / 2), yEnd: .value("Row", centre + thick / 2))
+                .foregroundStyle(by: .value("Series", p.series))
+                .cornerRadius(3)
+                .accessibilityLabel(p.category)
+                .accessibilityValue("\(p.series) \(p.value.formatted()) \(unit)")
+        }
+        .chartYScale(domain: -0.5...(Double(rows) - 0.5))
+        .chartYAxis {
+            AxisMarks(position: .leading, values: spec.x.indices.map(level)) { value in
+                AxisValueLabel {
+                    if let y = value.as(Double.self), let row = spec.x.indices.first(where: { level($0) == y }) {
+                        Text(spec.x[row]).font(.system(size: 11)).lineLimit(1).frame(maxWidth: 200, alignment: .trailing)
+                    }
+                }
+            }
+        }
+        .chartXAxisLabel(unit)
     }
 
     /// One hue for one set of points, each named beside its dot; the axes are named after the two series.
