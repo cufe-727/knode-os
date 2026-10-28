@@ -29,3 +29,57 @@ export function titleFromMarkdown(file: string, parsed: ParsedMarkdown): string 
   if (h1) return h1[1].trim();
   return path.basename(file).replace(/\.[^.]+$/, '');
 }
+
+/** What a folder listing shows of a Markdown file without opening it (`GET /api/tree?meta=1`). */
+export interface MarkdownMeta {
+  title?: string;
+  description?: string;
+  date?: string;
+  type?: string;
+  tags?: string[];
+  stage?: string;
+  verdict?: string;
+}
+
+const FRONTMATTER_BLOCK = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/;
+
+/** A frontmatter value as one line of text: a YAML date as its day, a list or map left out. */
+function metaText(value: unknown, max: number): string | undefined {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? undefined : value.toISOString().slice(0, 10);
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (typeof value !== 'string') return undefined;
+  const text = value.replace(/\s+/g, ' ').trim();
+  return text ? text.slice(0, max) : undefined;
+}
+
+/**
+ * The frontmatter fields a reader lists a document by — title, description,
+ * date, type, tags, stage, verdict — read from the head of the file (the
+ * first heading stands in for a missing title), or null when it has none of
+ * them. Frontmatter that does not close within `head`, or does not parse, is
+ * no frontmatter.
+ */
+export function markdownMeta(head: string): MarkdownMeta | null {
+  const block = FRONTMATTER_BLOCK.exec(head);
+  let fields: Record<string, unknown> = {};
+  if (block) {
+    try {
+      // options, even empty, keep gray-matter from caching every head it is given
+      fields = (matter(block[0], {}).data ?? {}) as Record<string, unknown>;
+    } catch {
+      fields = {};
+    }
+  }
+  const meta: MarkdownMeta = {};
+  const title = metaText(fields.title, 300) ?? metaText(/^#\s+(.+)$/m.exec(block ? head.slice(block[0].length) : head)?.[1], 300);
+  if (title) meta.title = title;
+  const description = metaText(fields.description, 600);
+  if (description) meta.description = description;
+  for (const key of ['date', 'type', 'stage', 'verdict'] as const) {
+    const value = metaText(fields[key], 120);
+    if (value) meta[key] = value;
+  }
+  const tags = (Array.isArray(fields.tags) ? fields.tags : [fields.tags]).map((t) => metaText(t, 60)).filter((t): t is string => Boolean(t));
+  if (tags.length) meta.tags = tags.slice(0, 20);
+  return Object.keys(meta).length ? meta : null;
+}
