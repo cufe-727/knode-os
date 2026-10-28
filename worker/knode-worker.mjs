@@ -159,7 +159,7 @@ const hintFor = (kind, backend) => work?.hints?.[kind ?? 'extract']?.[backend] ?
 // a copy of src/labeling/failures.ts
 
 const FATAL = /cli not found|\benoent\b|not logged in|login required|please (log|sign) ?in|unauthori[sz]ed|authentication (failed|required)|invalid api key|incorrect api key|\b401\b|\b403\b|forbidden|subscription (has )?expired/;
-const TRANSIENT = /rate.?limit|usage limit|quota|too many requests|\b429\b|overloaded|over capacity|try again (later|in)|\b50[234]\b|econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network|fetch failed|timed? ?out|reconnecting|transport channel closed|error sending request|http\/request failed|stream (disconnected|error)|connection (reset|closed|refused|error)|failed to refresh available models|\bebadf\b|\bemfile\b|\benfile\b|spawn \S+ e[a-z]+/;
+const TRANSIENT = /rate.?limit|usage limit|out of usage|quota|too many requests|\b429\b|overloaded|over capacity|try again (later|in)|\b50[234]\b|econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network|fetch failed|timed? ?out|reconnecting|transport channel closed|error sending request|http\/request failed|stream (disconnected|error)|connection (reset|closed|refused|error)|failed to refresh available models|\bebadf\b|\bemfile\b|\benfile\b|spawn \S+ e[a-z]+/;
 const classify = (message) => {
   const m = String(message).toLowerCase();
   return FATAL.test(m) ? 'fatal' : TRANSIENT.test(m) ? 'transient' : 'model';
@@ -222,11 +222,61 @@ function scratch() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'knode-worker-'));
 }
 
+/* --------------------------------- usage --------------------------------- */
+// What a call used, as its CLI or endpoint reported it (a copy of src/llm/usage.ts): every token read — cache
+// reads and writes included — as inputTokens, every token written, reasoning included, as outputTokens. It goes
+// back with the answer, so the server's estimates learn from this machine's calls too (docs/design/18).
+
+const count = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
+const counted = (u) => (u.inputTokens > 0 || u.outputTokens > 0 ? u : null);
+
+/** codex exec --json: each turn.completed's usage added up, and a failed turn's reason. */
+function readCodexEvents(stdout) {
+  const u = { inputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  let error = null;
+  for (const line of stdout.split('\n')) {
+    if (!line.startsWith('{')) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event.type === 'turn.completed') {
+      const t = event.usage ?? {};
+      u.inputTokens += count(t.input_tokens);
+      u.cachedInputTokens += count(t.cached_input_tokens);
+      u.cacheWriteTokens += count(t.cache_write_input_tokens);
+      u.outputTokens += count(t.output_tokens);
+      u.reasoningTokens += count(t.reasoning_output_tokens);
+    } else if (event.type === 'turn.failed' && typeof event.error?.message === 'string') error = event.error.message.trim();
+    else if (event.type === 'error' && typeof event.message === 'string') error ??= event.message.trim();
+  }
+  return { usage: counted(u), error };
+}
+
+/** Claude's and Cursor's counts: cache reads and writes beside the input. */
+function cachedUsage(input, read, write, output, cost) {
+  const u = counted({ inputTokens: count(input) + count(read) + count(write), cachedInputTokens: count(read), cacheWriteTokens: count(write), outputTokens: count(output), reasoningTokens: 0 });
+  if (u && count(cost)) u.costUsd = cost;
+  return u;
+}
+
+/** Chat Completions' usage. */
+function chatUsage(body) {
+  const t = body?.usage ?? {};
+  return counted({
+    inputTokens: count(t.prompt_tokens), cachedInputTokens: count(t.prompt_tokens_details?.cached_tokens), cacheWriteTokens: 0,
+    outputTokens: count(t.completion_tokens), reasoningTokens: count(t.completion_tokens_details?.reasoning_tokens),
+  });
+}
+
 /** cursor-agent's NDJSON stream → the answer after its last tool call (a copy of src/llm/cli.ts readCursorStream). */
 function readCursorStream(stdout) {
   const chunks = [];
   let result = '';
   let error;
+  let usage = null;
   for (const line of stdout.split('\n')) {
     if (!line.trim()) continue;
     let event;
@@ -244,9 +294,11 @@ function readCursorStream(stdout) {
     } else if (event.type === 'result') {
       if (event.is_error || event.subtype === 'error') error = String(event.result ?? 'unknown');
       else result = String(event.result ?? '');
+      const t = event.usage ?? {};
+      usage = cachedUsage(t.inputTokens, t.cacheReadTokens, t.cacheWriteTokens, t.outputTokens) ?? usage;
     }
   }
-  return { text: chunks.join('\n').trim() || result.trim(), error };
+  return { text: chunks.join('\n').trim() || result.trim(), error, usage };
 }
 
 // A backend given a model here ignores the server's hint for it (an effort chosen for another model);
@@ -257,7 +309,7 @@ const BACKENDS = {
   codex: {
     bin: () => String(args.codexBin ?? 'codex'),
     label: (hint) => `codex:${args.codexModel ?? own(args.codexModel, hint)?.model ?? 'default'}`,
-    async complete(task, hint) {
+    async complete(task, hint, report) {
       const h = own(args.codexModel, hint);
       const model = args.codexModel ?? h?.model;
       const effort = args.codexEffort ?? h?.effort;
@@ -269,18 +321,21 @@ const BACKENDS = {
       try {
         // plugins on would download ChatGPT's whole plugin catalog (~15 MB) on every call; analytics
         // on uploads ~0.65 MB of metrics at exit. `-c`, unlike --disable, is ignored by a Codex without them.
+        // --json prints the turn's token usage; the answer still comes from --output-last-message.
         const argv = [
           'exec', '--ignore-user-config', '--ephemeral', '-c', 'features.plugins=false', '-c', 'analytics.enabled=false',
-          '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', ws, '--output-last-message', out,
+          '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', ws, '--output-last-message', out, '--json',
         ];
         if (model) argv.push('--model', String(model));
         if (effort) argv.push('-c', `model_reasoning_effort="${effort}"`);
         if (speed) argv.push('-c', `service_tier="${speed}"`);
         argv.push('-');
         const r = await run(this.bin(), argv, task.prompt, ws);
-        if (r.code !== 0) throw new Error(`codex exec exited with code ${r.code}: ${tail(r.stderr, r.stdout)}`);
+        const events = readCodexEvents(r.stdout);
+        if (events.usage) report(events.usage);
+        if (r.code !== 0) throw new Error(`codex exec exited with code ${r.code}: ${events.error ?? tail(r.stderr, r.stdout)}`);
         const text = fs.existsSync(out) ? fs.readFileSync(out, 'utf8').trim() : '';
-        if (!text) throw new Error('codex exec finished but produced no message');
+        if (!text) throw new Error(`codex exec finished but produced no message${events.error ? `: ${events.error}` : ''}`);
         return text;
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
@@ -290,14 +345,15 @@ const BACKENDS = {
   cursor: {
     bin: () => String(args.cursorBin ?? 'cursor-agent'),
     label: (hint) => `cursor:${args.cursorModel ?? hint?.model ?? 'default'}`,
-    async complete(task, hint) {
+    async complete(task, hint, report) {
       const model = args.cursorModel ?? hint?.model;
       const dir = scratch();
       try {
         const argv = ['-p', '--output-format', 'stream-json', '--trust', '--mode', 'ask', '--sandbox', 'enabled', '--workspace', dir];
         if (model) argv.push('--model', String(model));
         const r = await run(this.bin(), argv, task.prompt, dir);
-        const { text, error } = readCursorStream(r.stdout);
+        const { text, error, usage } = readCursorStream(r.stdout);
+        if (usage) report(usage);
         if (error || r.code !== 0) throw new Error(`cursor CLI error: ${error ? error.slice(0, 400) : tail(r.stderr, r.stdout)}`);
         if (!text) throw new Error('cursor-agent finished but produced no message');
         return text;
@@ -309,7 +365,7 @@ const BACKENDS = {
   claude: {
     bin: () => String(args.claudeBin ?? 'claude'),
     label: (hint) => `claude:${args.claudeModel ?? own(args.claudeModel, hint)?.model ?? 'default'}`,
-    async complete(task, hint) {
+    async complete(task, hint, report) {
       const h = own(args.claudeModel, hint);
       const model = args.claudeModel ?? h?.model;
       const effort = args.claudeEffort ?? h?.effort;
@@ -326,6 +382,9 @@ const BACKENDS = {
           // fall through
         }
         if (wrapper && typeof wrapper === 'object' && 'result' in wrapper) {
+          const t = wrapper.usage ?? {};
+          const usage = cachedUsage(t.input_tokens, t.cache_read_input_tokens, t.cache_creation_input_tokens, t.output_tokens, wrapper.total_cost_usd);
+          if (usage) report(usage);
           if (wrapper.is_error || r.code !== 0) throw new Error(`claude CLI error: ${String(wrapper.result ?? 'unknown').slice(0, 400)}`);
           return String(wrapper.result ?? '').trim();
         }
@@ -339,22 +398,26 @@ const BACKENDS = {
   api: {
     bin: () => null,
     label: () => `api:${args.apiModel ?? process.env.KNODE_API_MODEL ?? '?'}`,
-    async complete(task) {
+    async complete(task, hint, report) {
       const baseUrl = String(args.apiBaseUrl ?? process.env.KNODE_API_BASE_URL ?? process.env.OPENAI_BASE_URL ?? '').replace(/\/+$/, '');
       const model = String(args.apiModel ?? process.env.KNODE_API_MODEL ?? '');
       const key = process.env[String(args.apiKeyEnv ?? 'OPENAI_API_KEY')] ?? '';
       if (!baseUrl || !model) throw new Error('api backend needs --api-base-url and --api-model (CLI not found)');
       // a summary is Markdown; only a task that wants JSON (every one from an older server) asks for JSON mode
       const json = task.json !== false;
+      const request = JSON.stringify({ model, messages: task.messages, temperature: 0.2, max_tokens: task.maxTokens, ...(json ? { response_format: { type: 'json_object' } } : {}) });
       const res = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) },
-        body: JSON.stringify({ model, messages: task.messages, temperature: 0.2, max_tokens: task.maxTokens, ...(json ? { response_format: { type: 'json_object' } } : {}) }),
+        body: request,
         signal: AbortSignal.timeout(timeoutMs),
       });
       const body = await res.text();
       if (!res.ok) throw new Error(`chat request failed (${res.status}): ${body.slice(0, 300)}`);
-      const content = JSON.parse(body)?.choices?.[0]?.message?.content;
+      const parsed = JSON.parse(body);
+      const usage = chatUsage(parsed);
+      if (usage) report({ ...usage, bytesUp: Buffer.byteLength(request), bytesDown: Buffer.byteLength(body) });
+      const content = parsed?.choices?.[0]?.message?.content;
       if (typeof content !== 'string' || !content.trim()) throw new Error('chat response had no content');
       return content;
     },
@@ -471,8 +534,10 @@ async function slot(backend, n) {
     const where = describeTask(task);
     const hint = hintFor(task.kind, backend.name);
     let outcome;
+    let usage = null;
+    const report = (u) => { usage = u; };
     try {
-      const text = await backend.impl.complete(task, hint);
+      const text = await backend.impl.complete(task, hint, report);
       outcome = { ok: true, text, model: backend.impl.label(hint) };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -480,6 +545,7 @@ async function slot(backend, n) {
     } finally {
       clearInterval(renew);
     }
+    if (usage) outcome.usage = usage;
     if (stopping && !outcome.ok) break; // killed on shutdown: released below
     backend.health.calls++;
     try {

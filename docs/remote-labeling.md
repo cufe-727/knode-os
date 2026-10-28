@@ -87,7 +87,14 @@ pipeline call, so your `~/.codex/config.toml` (MCP servers, memory, default mode
 prompts. It also keeps tens of thousands of sessions out of `~/.codex/sessions`. Plugins are on by default
 even without that file. Left on, every call would first download ChatGPT's whole plugin catalog (about
 15 MB, ten times the call itself) and start the servers of the plugins on your account. Analytics would
-upload about 0.65 MB of usage metrics as each call exits.
+upload about 0.65 MB of usage metrics as each call exits. `--json` makes Codex print each turn's token usage.
+
+**What each call used.** Every answer, from a local slot or a remote worker, is measured: the time from lease to
+answer, the prompt and reply sizes, and the token count the CLI or endpoint reported (Codex's `turn.completed`,
+Claude Code's result wrapper, Cursor's `result` event, an endpoint's `usage`). The worker script sends its count
+with the answer (`usage` on `…/complete`; a worker from before sends none and is estimated from the text). The
+estimate before Start processing rests on these averages once a route has run a few calls
+([design 18](design/18-estimates.md)); `GET /api/labeling/estimate` returns it.
 
 `GET /api/labeling/status` (UI headers) shows whether processing runs, the extraction queue, the summaries due,
 leases, every worker seen and the local slots' health.

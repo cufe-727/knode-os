@@ -2,6 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { Context, Hono } from 'hono';
+import { CallLedger } from '../estimate/ledger.js';
+import { estimateProcessing } from '../estimate/processing.js';
+import { quotaSources } from '../estimate/quota.js';
+import { estimateStudy } from '../estimate/study.js';
 import { LabelingScheduler } from '../labeling/scheduler.js';
 import { LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
@@ -218,6 +222,8 @@ export interface WorkspaceServices {
   localWorkers?: LocalLabelingWorkers | null;
   /** Starts and stops the slots and the reviews; stopped until someone starts it. */
   processing?: LabelingProcessing | null;
+  /** What answered calls cost, measured by the broker — an estimate's averages (src/estimate/ledger.ts). */
+  calls?: CallLedger | null;
 }
 
 /**
@@ -450,6 +456,8 @@ export function createApp(
   const ingestRunning = new Set<string>();
   /** Who the request acts for: the signed-in account, or (sign-in off) the user the client names. */
   const requestUser = (c: Context<AppEnv>): string | undefined => (auth ? c.get('account')?.username : c.req.header('x-knode-user'));
+  /** An administrator, or anyone with sign-in off: who may see what only the machine's owner should (an account's balance). */
+  const mayChangeSettings = (c: Context<AppEnv>): boolean => !auth || c.get('account')?.role === 'admin';
   const servicesFor = (ctx: AppContext): WorkspaceServices | null => opts.services?.(ctx) ?? null;
 
   const err = (e: unknown) => ({ error: e instanceof Error ? e.message : String(e) });
@@ -2382,6 +2390,18 @@ export function createApp(
     }
   });
 
+  // what the study would take once started, from the studies run here before (docs/design/18)
+  app.get('/api/research/studies/:id/estimate', async (c) => {
+    const ctx = requestCtx(c);
+    const job = await getJob(ctx.store, c.req.param('id'));
+    if (!job || job.kind !== 'study') return c.json({ error: 'no such study' }, 404);
+    try {
+      return c.json(await estimateStudy({ store: ctx.store, config: ctx.config, job, quota: quotaSources(ctx.config), showBalance: mayChangeSettings(c) }));
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
+  });
+
   app.post('/api/research/studies/:id/cancel', async (c) => {
     const ctx = requestCtx(c);
     try {
@@ -2706,6 +2726,44 @@ export function createApp(
   };
   app.post('/api/labeling/start', switchProcessing(true));
   app.post('/api/labeling/stop', switchProcessing(false));
+
+  /* ------------------------------ estimates ------------------------------ */
+
+  const ledgerOf = (ctx: AppContext) => servicesFor(ctx)?.calls ?? CallLedger.forWorkspace(ctx.dataDir);
+
+  // what starting the processing would take — calls, tokens, time, transfer, cost, and each plan's share (docs/design/18)
+  app.get('/api/labeling/estimate', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const work = servicesFor(ctx)?.work;
+      return c.json(await estimateProcessing({
+        store: ctx.store,
+        config: ctx.config,
+        ledger: ledgerOf(ctx),
+        workers: work ? (await work.status()).workers : [],
+        quota: quotaSources(ctx.config),
+        showBalance: mayChangeSettings(c),
+      }));
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
+  });
+
+  // the plans themselves: Codex's windows and credits as Codex reports them, Cursor's tier, and the calls measured here
+  app.get('/api/usage', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const quota = quotaSources(ctx.config);
+      const [codex, cursorPlan] = await Promise.all([quota.codex(), quota.cursorPlan()]);
+      return c.json({
+        codex: codex ? { account: codex.account, calibration: codex.calibration && { rates: codex.calibration.rates, weightPerToken: codex.calibration.weightPerToken }, error: codex.error } : null,
+        cursor: { plan: cursorPlan },
+        calls: ledgerOf(ctx).stats().map(({ ms: _samples, ...s }) => s),
+      });
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
+  });
 
   app.post('/api/dream', async (c) => {
     const ctx = requestCtx(c);

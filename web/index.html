@@ -778,6 +778,14 @@
     </form>
   </dialog>
 
+  <dialog id="estimate-dialog" class="team-dialog estimate-dialog" aria-labelledby="estimate-title">
+    <form id="estimate-form" novalidate>
+      <div class="dialog-head"><p class="eyebrow" id="estimate-eyebrow">BEFORE YOU START</p><h2 id="estimate-title">Start?</h2><p id="estimate-lede"></p></div>
+      <div id="estimate-body" class="estimate-body" aria-live="polite"></div>
+      <div class="dialog-actions"><button id="btn-estimate-cancel" type="button">Cancel</button><button id="btn-estimate-confirm" class="primary" type="submit">Start</button></div>
+    </form>
+  </dialog>
+
   <div id="toast"></div>
   <script src="/app.js"></script>
 </body>

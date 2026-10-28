@@ -1276,15 +1276,175 @@ function paintProcessing() {
 
 $('#processing-toggle').addEventListener('click', async () => {
   const running = processingStatus?.processing?.running === true;
-  if (running && !confirm('Stop processing? Calls in flight finish; nothing new starts until someone starts it again.')) return;
+  if (running) {
+    if (!confirm('Stop processing? Calls in flight finish; nothing new starts until someone starts it again.')) return;
+    try {
+      await api('/api/labeling/stop', { method: 'POST', body: '{}' });
+      toast('Processing stopped — calls in flight finish');
+    } catch (error) {
+      toast(error.message, 5000);
+    }
+    loadProcessing();
+    return;
+  }
+  // starting spends model calls: say how many, and what of each plan, first
+  openEstimate({
+    title: 'Start processing?',
+    lede: 'Extraction of everything waiting, the duplicate reviews after it and the summary pages due — on this machine\'s slots, and on the remote workers taking work.',
+    url: '/api/labeling/estimate',
+    confirm: 'Start processing',
+    run: async () => {
+      await api('/api/labeling/start', { method: 'POST', body: '{}' });
+      toast('Processing started: extraction, reviews and summaries');
+      loadProcessing();
+    },
+  });
+});
+
+/* ------------------------------ estimates ------------------------------ */
+
+/**
+ * What a task will take, shown before it starts (docs/design/18): the work,
+ * its time, tokens, transfer and cost, and each plan's share — Codex's windows
+ * as Codex reports them, the others against what their plans include. The
+ * person starts it from here, or not. An estimate that cannot be made (an
+ * older server) does not stand in the way: the dialog says so and Start
+ * still works.
+ */
+let estimateRun = null;
+
+async function openEstimate({ title, lede, url, confirm, run }) {
+  const dialog = $('#estimate-dialog');
+  $('#estimate-title').textContent = title;
+  $('#estimate-lede').textContent = lede;
+  $('#btn-estimate-confirm').textContent = confirm;
+  $('#btn-estimate-confirm').disabled = false;
+  $('#estimate-body').innerHTML = '<div class="est-loading">Estimating — counting the work and reading the plans…</div>';
+  estimateRun = run;
+  dialog.showModal();
   try {
-    await api(running ? '/api/labeling/stop' : '/api/labeling/start', { method: 'POST', body: '{}' });
-    toast(running ? 'Processing stopped — calls in flight finish' : 'Processing started: extraction, reviews and summaries');
+    const estimate = await api(url);
+    if (dialog.open && estimateRun === run) {
+      $('#estimate-body').innerHTML = renderEstimate(estimate);
+      placeBars($('#estimate-body'));
+    }
+  } catch (error) {
+    if (dialog.open && estimateRun === run) $('#estimate-body').innerHTML = `<div class="est-error">No estimate: ${esc(error.message)}. You can still start.</div>`;
+  }
+}
+
+$('#btn-estimate-cancel').addEventListener('click', () => $('#estimate-dialog').close());
+// Escape closes it too: nothing starts once it is gone
+$('#estimate-dialog').addEventListener('close', () => { estimateRun = null; });
+
+$('#estimate-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const run = estimateRun;
+  if (!run) return;
+  const button = $('#btn-estimate-confirm');
+  button.disabled = true;
+  try {
+    await run();
+    $('#estimate-dialog').close();
   } catch (error) {
     toast(error.message, 5000);
+  } finally {
+    button.disabled = false;
   }
-  loadProcessing();
 });
+
+const estInt = (n) => Math.round(n).toLocaleString();
+
+function estDuration(seconds) {
+  if (!(seconds > 0)) return '0 s';
+  if (seconds < 90) return `${Math.round(seconds)} s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) return `${minutes} min`;
+  const hours = seconds / 3600;
+  if (hours < 48) return `${hours < 10 ? hours.toFixed(1) : Math.round(hours)} h`;
+  const days = hours / 24;
+  return `${days < 10 ? days.toFixed(1) : Math.round(days)} days`;
+}
+
+function estBytes(bytes) {
+  if (!(bytes > 0)) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = bytes;
+  let i = 0;
+  while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+  return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
+function estTokens(n) {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${Math.round(n / 1e3)}k`;
+  return String(Math.round(n));
+}
+
+const estUsd = (usd) => (usd >= 100 ? `$${estInt(usd)}` : usd >= 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(3)}`);
+const estPercent = (p) => (p >= 10 ? `${Math.round(p)}%` : p >= 1 ? `${p.toFixed(1)}%` : `${p.toFixed(2)}%`);
+/** "a – b" under a figure, unless both ends read the same. */
+const estSpread = (r, f) => (f(r.low) === f(r.high) ? '' : `${f(r.low)} – ${f(r.high)}`);
+const estWhen = (iso) => new Date(iso).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+function renderEstimate(e) {
+  const t = e.totals;
+  const tile = (label, value, sub) => `<div class="est-tile"><span>${esc(label)}</span><strong>${value}</strong>${sub ? `<small>${sub}</small>` : ''}</div>`;
+  const tiles = [
+    tile('Time', t.seconds ? `≈ ${esc(estDuration(t.seconds.expected))}` : 'waits', t.seconds ? esc(estSpread(t.seconds, estDuration)) : 'no slot takes it yet'),
+    tile('Model calls', esc(estInt(t.calls)), ''),
+    tile('Tokens', `${esc(estTokens(t.tokens.input.expected))} in · ${esc(estTokens(t.tokens.output.expected))} out`, `${esc(estTokens(t.tokens.cached))} of the input from cache`),
+    tile('Transfer', `↓ ${esc(estBytes(t.bytes.down.expected))}`, `↑ ${esc(estBytes(t.bytes.up.expected))}${t.bytes.remote.expected > 0 ? ` · remote workers ${esc(estBytes(t.bytes.remote.expected))}` : ''}`),
+    tile('At API prices', t.costUsd ? `≈ ${esc(estUsd(t.costUsd.expected))}` : '—', t.costUsd ? `${esc(estSpread(t.costUsd, estUsd))}${t.unpriced.length ? ' · some models unpriced' : ''}` : 'no price known for the model'),
+  ].join('');
+  const work = e.work.map((w) => `<li><b>${esc(w.label)}</b><span>${esc(w.detail)}</span></li>`).join('');
+  const services = e.services.map(renderServiceShare).join('');
+  const notes = e.notes.length ? `<ul class="est-notes">${e.notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : '';
+  const rows = e.lines.map((l) => {
+    const b = l.perCall.basis;
+    const basis = `<span class="${b.tokens === 'measured' ? 'est-measured' : 'est-default'}">${b.tokens === 'measured' ? `measured over ${estInt(b.measuredCalls)} calls` : 'estimated'}</span> · <span class="${b.time === 'measured' ? 'est-measured' : 'est-default'}">${b.time === 'measured' ? 'timed' : 'default time'}</span>`;
+    return `<tr><td>${esc(l.label)}</td><td class="mono">${esc(l.route)}${l.remote ? ' (remote)' : ''}</td><td class="num">${l.slots || '—'}</td><td class="num">${esc(estInt(l.calls))}</td>
+      <td class="num">${esc(estTokens(l.perCall.input))} / ${esc(estTokens(l.perCall.output))}</td><td class="num">${esc(estDuration(l.perCall.seconds.expected))}</td><td>${basis}</td></tr>`;
+  }).join('');
+  return `<ul class="est-work">${work}</ul>
+    <div class="est-tiles">${tiles}</div>
+    ${services}
+    ${notes}
+    ${rows ? `<details class="est-details"><summary>How this was estimated</summary>
+      <table class="est-table"><thead><tr><th>Work</th><th>Route</th><th class="num">Slots</th><th class="num">Calls</th><th class="num">In / out per call</th><th class="num">Each</th><th>From</th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="est-basis">Ranges span what the figures rest on: a route's measured calls once it has run some, its service's defaults before. Each answered call is measured, so the next estimate is closer.</p>
+    </details>` : ''}`;
+}
+
+/** A window bar's segments, sized from their data attributes. */
+function placeBars(root) {
+  root.querySelectorAll('.est-bar > span').forEach((segment) => {
+    segment.style.left = `${Number(segment.dataset.left) || 0}%`;
+    segment.style.width = `${Number(segment.dataset.width) || 0}%`;
+  });
+}
+
+function renderServiceShare(s) {
+  const head = `<div class="est-service-head"><b>${esc(s.label)}</b><span>${s.plan ? `${esc(s.plan)} plan · ` : ''}${esc(estInt(s.calls))} calls · ${esc(estTokens(s.tokens.input))} in / ${esc(estTokens(s.tokens.output))} out${s.costUsd ? ` · ≈ ${esc(estUsd(s.costUsd.expected))} at API prices` : ''}</span></div>`;
+  const windows = s.windows.map((w) => {
+    const used = w.usedPercent ?? 0;
+    const task = w.taskPercent;
+    const over = task && used + task.expected > 100;
+    // widths go on through element.style once drawn (placeBars): the page's policy allows no style attribute
+    const from = Math.min(100, used);
+    const bar = `<div class="est-bar"><span class="used" data-left="0" data-width="${from}"></span>${task ? `<span class="task${over ? ' over' : ''}" data-left="${from}" data-width="${Math.max(0.6, Math.min(100 - from, task.expected))}"></span>` : ''}</div>`;
+    const now = w.usedPercent !== null ? `<b>${esc(estPercent(w.usedPercent))} used</b>${w.resetsAt ? ` · resets ${esc(estWhen(w.resetsAt))}` : ''}` : '';
+    const figure = task
+      ? `This task: <b>≈ ${esc(estPercent(task.expected))}</b>${estSpread(task, estPercent) ? ` (${esc(estSpread(task, estPercent))})` : ''}${over ? ' <span class="over">— past the limit</span>' : ''}`
+      : 'This task: not estimated';
+    return `<div class="est-window"><div class="est-window-label"><span>${esc(w.name[0].toUpperCase() + w.name.slice(1))} window</span><span>${now}</span></div>${bar}<div class="est-window-figure">${figure}</div><div class="est-basis">${esc(w.basis)}</div></div>`;
+  }).join('');
+  const credits = s.credits ? `<div class="est-basis">Credits: ${s.credits.unlimited ? 'unlimited' : s.credits.balance !== null ? esc(estInt(s.credits.balance)) : s.credits.hasCredits ? 'yes' : 'none'}</div>` : '';
+  const alert = s.limitReached ? `<p class="est-alert">${esc(s.label)} says a limit is reached: ${esc(s.limitReached.replace(/_/g, ' '))}.</p>` : '';
+  const notes = s.notes.length ? `<ul class="est-notes">${s.notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : '';
+  return `<div class="est-service">${head}${windows}${credits}${alert}${notes}</div>`;
+}
 
 /* ------------------------------- menus --------------------------------- */
 
@@ -5945,12 +6105,23 @@ function renderDraft(view) {
     toast('brief saved');
     loadStudyList();
   }));
-  el.querySelector('[data-act="start"]').addEventListener('click', () => run('starting…', async () => {
+  const hint = note.textContent;
+  el.querySelector('[data-act="start"]').addEventListener('click', () => run('saving…', async () => {
+    // saved first, so the estimate reads the brief as it stands now
     await api(`/api/research/studies/${view.job.id}`, { method: 'PUT', body: JSON.stringify({ brief: gatherBrief(view) }) });
-    await api(`/api/research/studies/${view.job.id}/start`, { method: 'POST' });
-    toast('research started');
-    await loadStudyList();
-    await openStudy(view.job.id);
+    note.textContent = hint;
+    openEstimate({
+      title: 'Start research?',
+      lede: `${b.pages.length} page${b.pages.length === 1 ? '' : 's'} and a report: a collector gathers each page's sources, an agent writes each page, then the report — measured against the studies run here before.`,
+      url: `/api/research/studies/${view.job.id}/estimate`,
+      confirm: '▶ Start research',
+      run: async () => {
+        await api(`/api/research/studies/${view.job.id}/start`, { method: 'POST' });
+        toast('research started');
+        await loadStudyList();
+        await openStudy(view.job.id);
+      },
+    });
   }));
   el.querySelector('[data-act="delete"]').addEventListener('click', () => run('deleting…', async () => {
     if (!confirm('Delete this draft?')) return;

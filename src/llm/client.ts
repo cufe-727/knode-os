@@ -1,6 +1,7 @@
 import { LlmConfig, LlmProtocol } from '../config.js';
 import { pluginRegistry } from '../plugins/registry.js';
 import type { LlmBackend } from '../plugins/types.js';
+import type { CallUsage } from './usage.js';
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -17,6 +18,12 @@ export interface CompletionOptions {
   maxTokens?: number;
   model?: string;
   images?: ImageAttachment[];
+  /**
+   * Told what the call used, when the provider reports it (src/llm/usage.ts):
+   * the built-in providers do; a plugin's may, and one that does not is
+   * estimated from the text instead.
+   */
+  onUsage?: (usage: CallUsage) => void;
 }
 
 /**
@@ -75,7 +82,7 @@ export class LlmClient {
   }
 
   /** Complete and parse a JSON object, tolerating markdown code fences. */
-  async completeJson<T>(messages: ChatMessage[], opts: { maxTokens?: number; model?: string } = {}): Promise<T> {
+  async completeJson<T>(messages: ChatMessage[], opts: { maxTokens?: number; model?: string; onUsage?: (usage: CallUsage) => void } = {}): Promise<T> {
     return jsonFromReply<T>(await this.complete(messages, { json: true, ...opts }));
   }
 }
