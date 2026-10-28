@@ -20,6 +20,8 @@ struct StudiesView: View {
     @State private var busy = false
     @State private var errorMessage: String?
     @State private var poller: Task<Void, Never>?
+    /// The draft whose Start is being confirmed, with its estimate.
+    @State private var confirming: StudyDetail?
 
     private let stepLabels = ["seed": "Capture seed sources", "collect": "Collect material", "index": "Index what was collected", "pages": "Write the pages", "report": "Write the report"]
 
@@ -53,6 +55,18 @@ struct StudiesView: View {
         .background(Color(nsColor: .textBackgroundColor).opacity(0.22))
         .task { await load() }
         .onDisappear { poller?.cancel() }
+        // a study spends an agent's quota for an hour or more: what it would take, before it starts
+        .sheet(isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
+            if let d = confirming {
+                StudyStartSheet(title: d.payload.brief.title, pages: d.payload.brief.pages.count, id: d.job.id) {
+                    confirming = nil
+                    Task { await start(d) }
+                } cancel: {
+                    confirming = nil
+                }
+                .environmentObject(model)
+            }
+        }
     }
 
     /* ---------------------------------------------------------------- list */
@@ -199,7 +213,7 @@ struct StudiesView: View {
                     .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
                 HStack {
                     Button(L("Refine with my answers")) { Task { await refine(d) } }.disabled(busy)
-                    Button(L("Start research")) { Task { await start(d) } }
+                    Button(L("Start research")) { confirming = d }
                         .buttonStyle(.borderedProminent)
                         .disabled(busy || d.startProblem != nil)
                     if busy { ProgressView().controlSize(.small) }

@@ -143,6 +143,11 @@ struct APIClient {
         try await send(running ? "/api/labeling/start" : "/api/labeling/stop", method: "POST", body: Data("{}".utf8))
     }
 
+    /// What starting the processing would take: calls, tokens, time, transfer, cost, each plan's share.
+    func processingEstimate() async throws -> TaskEstimate {
+        try await send("/api/labeling/estimate")
+    }
+
     /* ------------------------------ sign-in ------------------------------ */
 
     func authState() async throws -> AuthState {
@@ -686,6 +691,11 @@ struct APIClient {
 
     func startStudy(id: String) async throws -> StudyDetail {
         try await send("/api/research/studies/\(id)/start", method: "POST", body: Data("{}".utf8))
+    }
+
+    /// What a draft study would take once started, from the studies run before it.
+    func studyEstimate(id: String) async throws -> TaskEstimate {
+        try await send("/api/research/studies/\(id)/estimate")
     }
 
     func cancelStudy(id: String) async throws -> [String: Int] {
