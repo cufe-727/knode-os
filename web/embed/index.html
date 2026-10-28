@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- the origins that may frame this page, written in by the server (src/server/embed.ts) -->
+  <meta name="knode-embed-origins" content="[]" />
+  <title>knode-os</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/chart.css" />
+  <link rel="stylesheet" href="/embed/embed.css" />
+  <script src="/vendor/marked.js"></script>
+  <script src="/chart.js"></script>
+  <script src="/markdown.js"></script>
+  <script src="/deeplink.js"></script>
+  <script src="/embed/embed.js"></script>
+</head>
+<body>
+  <div id="embed-root" class="embed-root">
+    <header id="embed-bar" class="embed-bar">
+      <button id="embed-back" class="embed-back" type="button" aria-label="Back" title="Back" hidden>‹</button>
+      <div class="embed-heading">
+        <span id="embed-title" class="embed-title">knode-os</span>
+        <span id="embed-path" class="embed-path"></span>
+      </div>
+      <a id="embed-open" class="embed-open" href="/" target="_blank" rel="noopener">Open in knode-os ↗</a>
+    </header>
+    <main id="embed-main" class="embed-main">
+      <p class="embed-loading">Loading…</p>
+    </main>
+  </div>
+</body>
+</html>

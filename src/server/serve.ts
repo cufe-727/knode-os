@@ -26,6 +26,7 @@ import { reconcileViews } from '../wiki/pages.js';
 import { refineWiki } from '../wiki/refine.js';
 import { lintWiki } from '../wiki/lint.js';
 import { createApp, WorkspaceServices } from './app.js';
+import { embedOrigins } from './embed.js';
 import { MCP_TOKEN_FILE, McpWorkspaceTokens } from './mcp-http.js';
 import { isLoopbackAddress } from './public-guard.js';
 import { startResearchLoop } from '../research/service.js';
@@ -94,6 +95,8 @@ function failOnListenError(server: { on: (event: 'error', cb: (err: NodeJS.Errno
 export async function startServer(ctx: AppContext): Promise<void> {
   const log = (msg: string) => console.log(`[knode-os] ${msg}`);
   assertListeners(ctx.config.server);
+  // an entry that is not an exact origin stops serve here, before anything opens
+  const embedAllowed = embedOrigins(ctx.config.server);
   const authConfig = ctx.config.server.auth;
   // browsers share cookies across the ports of a host: one name per port keeps a dev server from signing prod out
   const auth = authConfig?.enabled === false ? null : new AuthService(ctx.dataDir, {
@@ -152,6 +155,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
       log(`mcp endpoint ${mcpBase.url}  (bearer token: ${MCP_TOKEN_FILE}; register with \`knode-os connect <claude|codex|cursor> --http\`)`);
     }
     if (ctx.config.server.remote?.enabled !== false) log(`remote API http://${host}:${info.port}/remote/v1  (tokens: \`knode-os remote token create\`)`);
+    if (embedAllowed.length) log(`embedded reader /embed/v1 may be framed by ${embedAllowed.join(', ')}  (server.embed.allowedOrigins)`);
     if (!auth) log('sign-in is OFF (server.auth.enabled: false): any local client may act as any user — for development only');
     else if (auth.setupRequired()) {
       log(`no accounts yet: create the administrator with \`knode-os user add <name> --admin\`, or open http://${host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host}:${info.port} on this machine`);

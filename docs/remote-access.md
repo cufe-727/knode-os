@@ -194,6 +194,72 @@ A script token acts as its account and expires on the date it was made with. `kn
 <id>` ends it. Remote labeling workers keep their per-machine `knr_…` tokens on `/remote/v1`; see
 [remote-labeling.md](remote-labeling.md).
 
+## Embedding a reader in another app
+
+Every page `serve` answers refuses to be framed, but one: the reader at `/embed/v1`, which another app may put in an
+iframe to show one document, folder or search, drawn by the web UI's own Markdown and chart renderers. List the exact
+origins of the pages that may frame it:
+
+```json
+"server": { "port": 12000, "host": "127.0.0.1",
+            "embed": { "allowedOrigins": ["https://app.example.com", "http://localhost:5173"] } }
+```
+
+An origin is `scheme://host[:port]`, with no path and no wildcard; `serve` refuses to start on anything else. Those
+origins, and knode-os itself, get `frame-ancestors` on `/embed/*` only, under the UI's policy otherwise (no inline
+script or style). Restart `serve` after a change.
+
+```
+/embed/v1?view=doc|folder|search&path=<workspace path>&q=<query>&scope=<folder>
+         &kind=personal|team&ws=<workspace id or Team name>&theme=light|dark&origin=<the host page's origin>#<fragment>
+```
+
+- `doc` shows a file: its frontmatter as a title area (title, type, date, stage, verdict, description, tags), its
+  Markdown and charts, a PDF's or a picture's derived text with a link to the original. A relative link or a
+  `[[wikilink]]` opens inside the frame, with a back button; a web link opens a new tab; `#fragment` scrolls to an
+  export's entry anchor or a heading and lights it up.
+- `folder` lists a folder, folders first, a Markdown file by its frontmatter's title, description and date
+  (`GET /api/tree?depth=1&meta=1`). `search` runs a hybrid search, optionally under `scope`.
+- The page holds nothing and signs in nothing. Its requests carry the browser's session cookie, which an iframe sends
+  only when the host page is on the same site as knode-os (`app.example.com` and `knode.example.com`, or `localhost`
+  on two ports; `127.0.0.1` and `localhost` are different sites). Signed out, it says so, with a button that opens
+  knode-os in a new tab, and loads by itself when the reader comes back signed in. It is read-only: nothing in it
+  changes anything.
+
+It talks to its host with `postMessage`, and only to the `origin` it was given, when that origin is listed (and, where
+the browser can tell, is the frame's parent):
+
+| from the reader `{ source: "knode-embed", version: 1, type, … }` | |
+| --- | --- |
+| `ready { view, path }` | the page is up, before its content: a host that hears nothing in about 8 s should offer a link instead |
+| `resize { height }` | the content's height, whenever it changes |
+| `navigate { view, path, title, fragment? }` | after a move inside the frame (a link, a list entry, back); a search adds `q` and `scope` |
+| `auth { state: "signed-in" \| "signed-out" }` | when known, and when it changes |
+| `error { code: "not-found" \| "forbidden" \| "unavailable", message }` | a file or folder that is not there, not allowed, or a server that does not answer |
+
+| from the host `{ source: "knode-host", version: 1, type, … }` | |
+| --- | --- |
+| `theme { theme: "light" \| "dark", tokens? }` | `tokens`: `background`, `foreground`, `muted`, `mutedForeground`, `border`, `primary`, `radius`, `fontSans`, `fontMono`, `fontHeading` as CSS values (not `var(…)`; a bare HSL triple is read as `hsl(…)`). New tokens replace the old; `{}` clears them. |
+| `navigate { view, path?, q?, scope?, fragment? }` | another file, folder or search without a reload; the back button starts over |
+
+`/embed/sdk.js` is an ES module with no dependencies that does all this for a host page; it goes out with CORS for
+the listed origins only:
+
+```js
+import { mount } from 'https://knode.example.com/embed/sdk.js';
+const embed = mount(element, { baseUrl: 'https://knode.example.com', view: 'doc', path: 'raw/docs/notes/x.md',
+  workspace: { kind: 'personal', id: 'default' }, theme: 'dark', autoHeight: true, minHeight: 320, maxHeight: 2000,
+  onNavigate, onAuth, onError });
+embed.navigate({ view: 'folder', path: 'raw/docs/notes' });
+embed.setTheme('light', tokens);
+embed.destroy();
+```
+
+A link into the full UI opens it at a file or folder: `/?open=<path>&kind=personal|team&ws=<id>#<fragment>`. Once
+signed in, the UI switches to that workspace, shows Library → Files and opens the file at the fragment, or picks the
+folder in the tree. A first sign-in on a browser skips choosing a workspace: the link has chosen. The reader's "Open
+in knode-os" is such a link.
+
 ## Configuration
 
 | key | default | |
@@ -202,6 +268,7 @@ A script token acts as its account and expires on the date it was made with. `kn
 | `server.auth.sessionDays` | `30` | Days a browser or app session lives without use. |
 | `server.auth.allowInsecureRemote` | `false` | Answer other machines over plain HTTP. Use this only on a VPN. |
 | `server.tls` | `null` | `{ port, host, cert, key }`: an HTTPS listener beside the main one. Relative paths are under the data root. |
+| `server.embed.allowedOrigins` | `[]` | Exact origins whose pages may frame the reader at `/embed/v1` and load `/embed/sdk.js`. |
 
 ## HTTP
 
@@ -227,4 +294,5 @@ Administrators:
 - `GET` and `POST /api/auth/gateways`, `DELETE /api/auth/gateways/:id`
 
 Every other `/api` route needs a session and the route's API group. `/mcp` answers this machine only, with its own
-token. `/remote/v1` uses per-machine tokens.
+token. `/remote/v1` uses per-machine tokens. The web UI and `/embed/*` are open, like any page: what they show comes
+from `/api`.

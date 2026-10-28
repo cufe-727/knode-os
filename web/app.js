@@ -47,6 +47,11 @@ let pendingUser = null;
 let pendingPersistence = 'local';
 let statsTimer = null;
 let sessionEndedShown = false;
+/**
+ * A deep link the page was opened with — `/?open=<path>&kind=&ws=#<fragment>`
+ * (web/deeplink.js) — kept until the app is signed in and in that workspace.
+ */
+let pendingOpen = window.knodeDeepLink?.read(location.search, location.hash) ?? null;
 
 const initials = (value) => {
   const parts = String(value || 'You').trim().split(/[\s@._-]+/).filter(Boolean);
@@ -282,7 +287,7 @@ function loadWorkspaceData() {
   showDismissedNotices = false;
   closeNotices();
   loadNotices();
-  loadTree().then(() => openFile('wiki/index.md')).catch(() => {});
+  loadTree().then(openLanding).catch(() => {});
 
   // reload whatever the current host view shows — one list, so it cannot drift
   // out of sync with what navigate() loads on arrival
@@ -309,15 +314,70 @@ function enterApp() {
   sessionEndedShown = false;
   $('#auth-view').hidden = true;
   $('#app-shell').hidden = false;
-  // paints the header, the strip and the visible section from one source
-  navigate(restoreNav());
+  // paints the header, the strip and the visible section from one source; a deep link's file shows in Files
+  navigate(pendingOpen ? 'files' : restoreNav());
   renderWorkspaceUI();
   syncUserWorkspaces()
     .catch((error) => toast(`Could not sync workspaces: ${error.message}`, 5000))
     .finally(() => {
+      useDeepLinkWorkspace();
       renderWorkspaceUI();
       startAppData();
     });
+}
+
+/* ------------------------------ deep links ------------------------------ */
+
+/** The address keeps only the app: a reload opens where you are, not the link again. */
+function clearDeepLink() {
+  if (location.search || location.hash) history.replaceState(null, '', location.pathname);
+}
+
+/**
+ * The workspace a deep link names becomes the open one before anything
+ * loads; a Team the server lets this account open joins the menu. A link to
+ * a workspace the account cannot open says so and opens nothing.
+ */
+function useDeepLinkWorkspace() {
+  if (!pendingOpen?.ws || !authState) return;
+  const named = window.knodeDeepLink.pick(pendingOpen, [...authState.workspaces, ...serverTeams()]);
+  if (!named) {
+    toast(`This link is for ${pendingOpen.kind === 'team' ? 'the Team' : 'the workspace'} “${pendingOpen.ws}”, which this account cannot open`, 6000);
+    pendingOpen = null;
+    clearDeepLink();
+    return;
+  }
+  if (!authState.workspaces.some((workspace) => workspace.id === named.id)) authState.workspaces.push(named);
+  authState.activeWorkspaceId = named.id;
+  saveAuthState();
+}
+
+/** What a workspace opens at: a deep link's file — at its fragment — or folder, once; else the wiki's index. */
+async function openLanding() {
+  const link = pendingOpen;
+  pendingOpen = null;
+  if (!link) return openFile('wiki/index.md');
+  clearDeepLink();
+  if (!link.path) return openFile('wiki/index.md');
+  let node;
+  try {
+    node = await api(`/api/tree?path=${encodeURIComponent(link.path)}&depth=1`);
+  } catch (e) {
+    toast(`${link.path} cannot be opened: ${e.message}`, 6000);
+    return openFile('wiki/index.md');
+  }
+  if (node.kind === 'dir') {
+    reveal(link.path);
+    const parts = link.path.split('/');
+    await Promise.all(['', ...parts.map((_, i) => parts.slice(0, i + 1).join('/'))].map(ensureListing));
+    renderTree();
+    pickDir(link.path);
+    document.querySelector(`#filetree .tree-dir > .tree-label[data-path="${CSS.escape(link.path)}"]`)?.scrollIntoView({ block: 'center' });
+    return;
+  }
+  await showInTree(link.path);
+  await openFile(link.path, null, link.fragment);
+  document.querySelector(`#filetree .tree-file > .tree-label[data-path="${CSS.escape(link.path)}"]`)?.scrollIntoView({ block: 'center' });
 }
 
 function showAuthView() {
@@ -379,6 +439,13 @@ function signedIn(view, persistence) {
   }
   // someone else signed in on this browser: their workspaces are not ours
   forgetAuthState();
+  if (pendingOpen?.ws) {
+    // a deep link has made the choice: start from the personal workspace, and the link's takes over
+    pendingUser = user;
+    pendingPersistence = persistence;
+    completeLogin(personalWorkspace());
+    return;
+  }
   continueToWorkspaceChoice(user, persistence);
 }
 
@@ -1966,10 +2033,14 @@ function renderFileContent(path, content, derived, truncated, bytes) {
   $('#btn-save').disabled = true;
 }
 
-/** `fragment`: where a link pointed inside the file — an export's entry anchor or a heading. */
+/**
+ * `fragment`: where a link pointed inside the file — an export's entry anchor
+ * or a heading. It may lie past the preview cap (a weekly digest's later
+ * entries), so a file opened at one is read whole.
+ */
 async function openFile(path, labelEl, fragment = null) {
   try {
-    const { content, derived, truncated, bytes } = await api(`/api/file?path=${encodeURIComponent(path)}`);
+    const { content, derived, truncated, bytes } = await api(`/api/file?path=${encodeURIComponent(path)}${fragment ? `&maxBytes=${EDIT_BYTE_CAP}` : ''}`);
     currentFile = path;
     editing = false;
     // the create target follows the last thing clicked: a file hands it back

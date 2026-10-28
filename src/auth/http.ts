@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Context, Hono, MiddlewareHandler } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
-import { contentSecurityPolicy } from '../server/csp.js';
+import { contentSecurityPolicy, isEmbedPath } from '../server/csp.js';
 import { ClientInfo, clientInfo, PUBLIC_PREFIX } from '../server/public-guard.js';
 import { accountAllows, accountMayUseGateway, AccountUpdate, MIN_PASSWORD_LENGTH, normalizeUsername, PublicAccount, Role } from './accounts.js';
 import { API_GROUP_NAMES, API_GROUPS, apiGroupOf, ApiGroup } from './apis.js';
@@ -16,6 +16,7 @@ import { resolveWorkspaceScope, workspaceDataDir } from '../server/workspaces.js
  * and the /gw gateway.
  *
  *   the web UI and its assets   open — they hold nothing; the UI signs in itself
+ *   /embed/*                    open, like the UI: the embeddable reader rides the session cookie
  *   /api/health, /api/auth/state, /api/auth/login, /api/auth/setup, /api/auth/logout   open
  *   /api/*, /gw/*               a session: the cookie of a signed-in browser, or
  *                               `Authorization: Bearer knu_…` (also `X-Knode-Token`)
@@ -65,10 +66,13 @@ const isUnder = (p: string, prefix: string) => p === prefix || p.startsWith(`${p
  * No framing (clickjacking), no referrer leaving the origin, no type sniffing,
  * and a page that runs only our own scripts (src/server/csp.ts). A route that
  * sets a policy of its own keeps it: an original page goes out sandboxed
- * (src/server/originals.ts), which the UI's policy would undo.
+ * (src/server/originals.ts), which the UI's policy would undo. The reader
+ * under /embed is the one page that may be framed, by the origins its own
+ * policy names (src/server/embed.ts): X-Frame-Options, which cannot name
+ * them, stays off it.
  */
 function hardenUi(c: Context): void {
-  c.header('x-frame-options', 'DENY');
+  if (!isEmbedPath(c.req.path)) c.header('x-frame-options', 'DENY');
   c.header('referrer-policy', 'same-origin');
   c.header('x-content-type-options', 'nosniff');
   if (!c.res.headers.has('content-security-policy')) c.header('content-security-policy', contentSecurityPolicy(c.res.headers.get('content-type')));

@@ -417,6 +417,20 @@ export interface TlsListenerConfig {
 }
 
 /**
+ * The embeddable reader at /embed/v1 (src/server/embed.ts): the one page
+ * another app may put in an iframe, and the SDK at /embed/sdk.js.
+ */
+export interface EmbedConfig {
+  /**
+   * The exact origins (scheme://host[:port], no path, no wildcard) whose pages
+   * may frame the reader and load the SDK, e.g. "https://app.example.com".
+   * Empty: only knode-os itself may frame it. `serve` refuses to start on an
+   * entry that is not an origin.
+   */
+  allowedOrigins: string[];
+}
+
+/**
  * A folder elsewhere on this machine mirrored into raw/docs and kept in sync
  * while `serve` runs (src/ingest/folders.ts). Written by the folder routes and
  * `knode-os folders link`, never by hand.
@@ -846,7 +860,7 @@ export interface KnodeConfig {
    * kept like `agentLlms`.
    */
   modelAgents?: ModelAgent[];
-  server: { port: number; host: string; mcp: McpServerConfig; remote?: RemoteApiConfig; auth?: AuthConfig; tls?: TlsListenerConfig | null };
+  server: { port: number; host: string; mcp: McpServerConfig; remote?: RemoteApiConfig; auth?: AuthConfig; tls?: TlsListenerConfig | null; embed?: EmbedConfig };
   ingest: IngestConfig;
   extraction: ExtractionConfig;
   retrieval: { sag: SagSearchConfig };
@@ -952,6 +966,7 @@ export function defaultConfig(): KnodeConfig {
       },
       auth: { enabled: true, sessionDays: 30, allowInsecureRemote: false },
       tls: null,
+      embed: { allowedOrigins: [] },
     },
     ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4, convertConcurrency: 2 },
     extraction: {

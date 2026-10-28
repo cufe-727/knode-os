@@ -11,6 +11,7 @@ import { accountMayOpenTeam } from '../auth/accounts.js';
 import { AuthEnv, authMiddleware, existingTeams, mountAuthRoutes, mountGateways } from '../auth/http.js';
 import { AuthService } from '../auth/service.js';
 import { contentSecurityPolicy } from './csp.js';
+import { embedOrigins, mountEmbed } from './embed.js';
 import { findMarkedUmd, findWebDir } from '../web-assets.js';
 import { OriginalError, readOriginal } from './originals.js';
 import { publicGuard } from './public-guard.js';
@@ -45,7 +46,8 @@ import {
   saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS, ExtractionWorkerConfig } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
-import { assertNotPrivate, assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isOwnerRootFile, isPrivatePath, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
+import { assertNotPrivate, assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isOwnerRootFile, isPrivatePath, isRootWritableFile, listTree, makeDir, movePath, pathExists, readFileTextCapped, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
+import { MarkdownMeta, markdownMeta } from '../markdown.js';
 import { FOLDER_ABOUT, hasSidecarSegment, SIDECAR_ROOT, TREE_HIDDEN } from '../fs/layout.js';
 import { listPlaybooks, readPlaybook, resetPlaybook, savePlaybook } from '../fs/playbooks.js';
 import { moveSidecar } from '../fs/sidecar.js';
@@ -156,6 +158,10 @@ import { listNotices } from './notices.js';
 const NO_MCP_HINT = 'Ask needs the MCP endpoint `serve` hosts — start knode-os serve';
 const NO_AGENT_HINT = 'Ask has no agent to run: configure an LLM provider, or name an agent, under Settings → Providers & Agents';
 const NO_BUILTIN_HINT = 'the built-in agent is not installed in this build — point Ask at a coding-agent CLI under Settings → Providers & Agents';
+
+/** `GET /api/tree?meta=1`: the Markdown files of a listing whose frontmatter is read, and how much of each. */
+const TREE_META_FILES = 500;
+const TREE_META_BYTES = 16 * 1024;
 
 /** Comma-separated query parameter → array (absent/empty stays undefined). */
 function csv(value: string | undefined): string[] | undefined {
@@ -444,6 +450,8 @@ export function createApp(
   const app = new Hono<AppEnv>();
   const auth = opts.auth ?? null;
   const mcpPath = rootCtx.config.server.mcp?.path || '/mcp';
+  // who may frame the embedded reader: checked first, so a bad entry stops here (src/server/embed.ts)
+  const embedAllowed = embedOrigins(rootCtx.config.server);
   // before anything else: who is asking, from where, and may they
   if (auth) app.use('*', authMiddleware(auth, { mcpPath }));
   else app.use('*', publicGuard({ allowInsecureRemote: rootCtx.config.server.auth?.allowInsecureRemote }));
@@ -1058,6 +1066,20 @@ export function createApp(
         for (const child of node.children ?? []) mark(child);
       };
       mark(tree);
+      // `meta=1` with `depth=1`: each Markdown file says what its frontmatter
+      // calls it — title, description, date… — the way the embedded reader
+      // lists a folder; read from the head of each file, for a page of them
+      if (depth === 1 && ['1', 'true'].includes(c.req.query('meta') ?? '')) {
+        const files = (tree.children ?? []).filter((n) => n.kind === 'file' && /\.(md|markdown)$/i.test(n.name)).slice(0, TREE_META_FILES);
+        for (const file of files) {
+          try {
+            const meta = markdownMeta(readFileTextCapped(ctx.dataDir, file.path, TREE_META_BYTES).content);
+            if (meta) (file as typeof file & { meta?: MarkdownMeta }).meta = meta;
+          } catch {
+            // a file gone or unreadable since the listing: it lists by name
+          }
+        }
+      }
       return c.json({ ...tree, links: links.map((l) => ({ path: l.dest, source: l.source })) });
     } catch (e) {
       return c.json(err(e), 400);
@@ -2720,6 +2742,8 @@ export function createApp(
   /* ------------------------------ static UI ----------------------------- */
 
   const webDir = findWebDir();
+  // the reader another app may frame, before the UI's catch-all, which must never answer under /embed
+  mountEmbed(app, { webDir, allowedOrigins: embedAllowed });
   const markedJs = findMarkedUmd();
   app.get('/vendor/marked.js', (c) => {
     if (!markedJs) return c.text('window.marked=null;', 200, { 'content-type': 'text/javascript' });
