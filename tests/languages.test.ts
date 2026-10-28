@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultConfig, defaultRoutedLlmConfig, loadConfig, LlmConnection } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
+import { estimateProcessing } from '../src/estimate/processing.js';
 import { readTranslation, readTranslationParts, sidecarHoldsPaidWork } from '../src/fs/sidecar.js';
 import { documentIdFor } from '../src/ingest/apply.js';
 import { loadSourceText, sha256 } from '../src/ingest/source.js';
@@ -363,6 +364,23 @@ describe('the Translate stage as leased work', () => {
     } finally {
       await idle.stop();
       await off.store.close();
+    }
+  });
+});
+
+describe('the processing estimate', () => {
+  it('counts the translations due beside extraction and summaries', async () => {
+    const ctx = await languagesWorkspace('estimate', { enabled: true, primary: 'zh', secondary: ['en'] });
+    try {
+      const noQuota = { codex: async () => null, cursorPlan: async () => null };
+      const e = await estimateProcessing({ store: ctx.store, config: ctx.config, ledger: null, workers: [], quota: noQuota });
+      expect(e.work.find((w) => w.label === 'Translations')?.detail).toMatch(/^1 document due, into Chinese \(Simplified\) first · about \d+ calls/);
+      expect(e.lines.filter((l) => l.kind === 'translate').reduce((n, l) => n + l.calls, 0)).toBeGreaterThanOrEqual(3);
+      // off, there is nothing to translate and no line for it
+      const off = await estimateProcessing({ store: ctx.store, config: { ...ctx.config, languages: { ...ctx.config.languages, enabled: false } }, ledger: null, workers: [], quota: noQuota });
+      expect(off.lines.some((l) => l.kind === 'translate')).toBe(false);
+    } finally {
+      await ctx.store.close();
     }
   });
 });

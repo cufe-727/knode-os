@@ -3,7 +3,9 @@ import { LLM_WIKI_INPUT_CHARS } from '../constants.js';
 import { buildExtractRequest } from '../graph/llm-extract.js';
 import { loadOntology } from '../graph/ontology.js';
 import { extractionSegmentChars } from '../graph/tier1.js';
-import { localJudgeSpec, localSummarySpec, localWorkerSpecs } from '../labeling/local.js';
+import { localJudgeSpec, localSummarySpec, localTranslateSpec, localWorkerSpecs } from '../labeling/local.js';
+import { contentLanguages, languageInfo } from '../lang/languages.js';
+import { dueTranslations, translationSegmentChars } from '../lang/translate.js';
 import { renderCliPrompt } from '../llm/cli.js';
 import { LlmClient } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
@@ -12,7 +14,7 @@ import { summaryPagesByDocument } from '../wiki/pages.js';
 import { summaryMaxSegments, summaryMinChars } from '../wiki/summary.js';
 import { DEFAULT_SHARES, WorkerStatus } from '../work/broker.js';
 import { offeredRemotely } from '../work/config.js';
-import { isSharedKind, SHARED_KINDS } from '../work/kinds.js';
+import { isSharedKind, SHARED_KINDS, SharedKind } from '../work/kinds.js';
 import { costWork, EstimateLine, RouteSpec, serviceShares, TaskEstimate, totalsOf, WorkSpec } from './estimate.js';
 import { CallLedger } from './ledger.js';
 import { QuotaSources } from './quota.js';
@@ -21,8 +23,9 @@ import { modelOfLabel, serviceOfLabel, serviceOfLlm } from './services.js';
 /**
  * What starting the processing would take (docs/design/18): extracting every
  * document in the queue, writing the summary pages that are due and those its
- * documents will be due once extracted, and the judge calls of the duplicate
- * reviews in between — on this machine's slots, which start, and on the
+ * documents will be due once extracted, the judge calls of the duplicate
+ * reviews in between, and — with content languages on — the translations
+ * due (docs/design/17) — on this machine's slots, which start, and on the
  * remote workers already taking work, which share it.
  *
  * Counting reads only the index: the queue's segment counts, the chunks'
@@ -58,6 +61,10 @@ const BYTES_PER_TOKEN = 4.4;
 /** Segments are cut at headings and paragraphs, short of `segmentChars`, until the queue says how short. */
 const SEGMENT_FILL = 0.8;
 const TOKENS_PER_CHAR = 0.3;
+/** A translation call's instructions; its answer runs about as long as its text, in tokens, whichever way it goes. */
+const TRANSLATE_SYSTEM_TOKENS = 400;
+/** Tokens per character of the text a translation reads: CJK about 0.6, Latin script about a quarter. */
+const translationTokensPerChar = (language: string) => (/^(zh|ja|ko)/.test(language) ? 0.6 : 0.25);
 
 export async function estimateProcessing(input: ProcessingEstimateInput): Promise<TaskEstimate> {
   const { store, config } = input;
@@ -160,6 +167,31 @@ export async function estimateProcessing(input: ProcessingEstimateInput): Promis
   if (judging && extractedBefore >= 20) judge.calls = Math.round((judgedBefore / extractedBefore) * segments);
   else if (judging && segments > 0) notes.push('The duplicate reviews add judge calls as extraction finds candidates; they are not counted until a run here has measured how many.');
 
+  /* ---------------------------- translations ---------------------------- */
+  // what the Translate stage would hand out now: requests first, then what is foreign to the primary language
+  const languages = contentLanguages(config);
+  const translation = { docs: 0, calls: 0, prompt: 0, output: 0 };
+  if (languages.on) {
+    const { due } = await dueTranslations(store, languages, { limit: 1_000_000 });
+    for (const { doc } of due) {
+      const source = doc.language || 'en';
+      const chars = doc.chars ?? 0;
+      if (chars <= 0) continue;
+      const calls = Math.max(1, Math.ceil(chars / (translationSegmentChars(source) * SEGMENT_FILL)));
+      const text = chars * translationTokensPerChar(source);
+      translation.docs++;
+      translation.calls += calls;
+      translation.prompt += text + calls * TRANSLATE_SYSTEM_TOKENS;
+      translation.output += text;
+    }
+  }
+  const translate: WorkSpec = {
+    kind: 'translate', label: 'Translations', calls: translation.calls,
+    promptTokens: translation.calls ? translation.prompt / translation.calls : 0,
+    promptBytes: translation.calls ? (translation.prompt / translation.calls) * BYTES_PER_TOKEN : 0,
+    outputTokens: translation.calls ? translation.output / translation.calls : 0,
+  };
+
   /* ------------------------------ routes ------------------------------ */
   const targets = routeTargets(config);
   const local = (specs: ({ slots: number; llm: LlmConfig } | null)[]): RouteSpec[] =>
@@ -169,10 +201,11 @@ export async function estimateProcessing(input: ProcessingEstimateInput): Promis
       return client.enabled ? [{ route: client.label, service: serviceOfLlm(s.llm), model: s.llm.model, slots: s.slots, remote: false }] : [];
     });
   const remote = remoteRoutes(input.workers, config, now);
-  const routes: Record<'extract' | 'summarize' | 'judge', RouteSpec[]> = {
+  const routes: Record<RemoteKind, RouteSpec[]> = {
     extract: [...local(localWorkerSpecs(config)), ...remote.extract],
     summarize: [...local([localSummarySpec(config)]), ...remote.summarize],
     judge: [...local([localJudgeSpec(config)]), ...remote.judge],
+    translate: [...local([localTranslateSpec(config)]), ...remote.translate],
   };
   const stage = (llm: LlmConfig): RouteSpec => {
     const client = new LlmClient(llm);
@@ -182,14 +215,16 @@ export async function estimateProcessing(input: ProcessingEstimateInput): Promis
     extract: stage(resolveRoutedLlmConfig(config.llm, config.extraction.entityLlm, targets, config.extraction.tier1Model)),
     summarize: stage(resolveRoutedLlmConfig(config.llm, config.extraction.summaryLlm, targets)),
     judge: stage(resolveRoutedLlmConfig(config.llm, config.extraction.judgeLlm, targets)),
+    translate: stage(resolveRoutedLlmConfig(config.llm, config.extraction.translateLlm, targets)),
   };
 
   const lines: EstimateLine[] = [
     ...costWork(extract, routes.extract, input.ledger, config, waiting.extract),
     ...costWork(summarize, routes.summarize, input.ledger, config, waiting.summarize),
     ...costWork(judge, routes.judge, input.ledger, config, waiting.judge),
+    ...costWork(translate, routes.translate, input.ledger, config, waiting.translate),
   ];
-  for (const [kind, label] of [['extract', 'Extraction'], ['summarize', 'Summary pages'], ['judge', 'Judge calls']] as const) {
+  for (const [kind, label] of [['extract', 'Extraction'], ['summarize', 'Summary pages'], ['judge', 'Judge calls'], ['translate', 'Translations']] as const) {
     if (lines.some((l) => l.kind === kind && l.slots === 0)) {
       notes.push(`${label}: no slot takes this work now — this machine has none for it and no remote worker asked lately — so it waits, and the time leaves it out.`);
     }
@@ -207,6 +242,10 @@ export async function estimateProcessing(input: ProcessingEstimateInput): Promis
     { label: 'Summary pages', detail: summary.now + summary.later ? `${fmt(summary.now)} due now${summary.later ? ` · ${fmt(summary.later)} more once extracted` : ''} · ${fmt(summary.calls)} calls` : 'none due' },
   ];
   if (judge.calls) work.push({ label: 'Duplicate reviews', detail: `about ${fmt(judge.calls)} judge calls, at the rate earlier runs here needed them` });
+  if (translation.calls) {
+    const into = languages.primary ? languageInfo(languages.primary)?.english ?? languages.primary : '';
+    work.push({ label: 'Translations', detail: `${fmt(translation.docs)} document${translation.docs === 1 ? '' : 's'} due${into ? `, into ${into} first` : ''} · about ${fmt(translation.calls)} calls, one per segment` });
+  }
 
   return {
     task: 'processing',
@@ -249,21 +288,23 @@ function extractTemplate(dataDir: string, config: KnodeConfig): { tokens: number
  * backend and kind. A worker's slot that takes extraction and summaries both
  * splits its time by `server.remote.shares`; judge calls go first and are few.
  */
-function remoteRoutes(workers: WorkerStatus[], config: KnodeConfig, now: number): Record<'extract' | 'summarize' | 'judge', RouteSpec[]> {
+type RemoteKind = 'extract' | 'summarize' | 'judge' | 'translate';
+
+function remoteRoutes(workers: WorkerStatus[], config: KnodeConfig, now: number): Record<RemoteKind, RouteSpec[]> {
   const shares = { ...DEFAULT_SHARES, ...(config.server.remote?.shares ?? {}) };
-  const out: Record<'extract' | 'summarize' | 'judge', Map<string, RouteSpec>> = { extract: new Map(), summarize: new Map(), judge: new Map() };
+  const out: Record<RemoteKind, Map<string, RouteSpec>> = { extract: new Map(), summarize: new Map(), judge: new Map(), translate: new Map() };
   for (const w of workers) {
     if (!w.remote || now - Date.parse(w.lastSeen) > REMOTE_SEEN_MS) continue;
     const shared = w.kinds.filter(isSharedKind);
     const weight = shared.reduce((n, k) => n + (shares[k] ?? 1), 0) || 1;
     for (const kind of w.kinds) {
-      if (kind !== 'extract' && kind !== 'summarize' && kind !== 'judge') continue;
+      if (kind !== 'extract' && kind !== 'summarize' && kind !== 'judge' && kind !== 'translate') continue;
       if (!offeredRemotely(config, kind)) continue;
-      const share = (SHARED_KINDS as readonly string[]).includes(kind) ? (shares[kind as 'extract' | 'summarize'] ?? 1) / weight : 1;
+      const share = (SHARED_KINDS as readonly string[]).includes(kind) ? (shares[kind as SharedKind] ?? 1) / weight : 1;
       const r = out[kind].get(w.backend) ?? { route: w.backend, service: serviceOfLabel(w.backend), model: modelOfLabel(w.backend), slots: 0, remote: true, share };
       r.slots++;
       out[kind].set(w.backend, r);
     }
   }
-  return { extract: [...out.extract.values()], summarize: [...out.summarize.values()], judge: [...out.judge.values()] };
+  return { extract: [...out.extract.values()], summarize: [...out.summarize.values()], judge: [...out.judge.values()], translate: [...out.translate.values()] };
 }
