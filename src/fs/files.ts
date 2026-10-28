@@ -137,6 +137,16 @@ export function readFileTextCapped(dataDir: string, rel: string, maxBytes: numbe
   return { content, bytes, truncated: true };
 }
 
+/** The same cap on a text already in memory (a translation): whole lines, at most `maxBytes` of UTF-8. */
+export function capText(text: string, maxBytes: number): CappedText {
+  const bytes = Buffer.byteLength(text);
+  if (bytes <= maxBytes) return { content: text, bytes, truncated: false };
+  let content = Buffer.from(text).subarray(0, maxBytes).toString('utf8').replace(/\uFFFD+$/, '');
+  const lastNewline = content.lastIndexOf('\n');
+  if (lastNewline > 0) content = content.slice(0, lastNewline);
+  return { content, bytes, truncated: true };
+}
+
 export function writeFileText(dataDir: string, rel: string, content: string): void {
   const abs = safePath(dataDir, rel);
   fs.mkdirSync(path.dirname(abs), { recursive: true });

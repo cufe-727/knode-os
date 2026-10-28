@@ -1,5 +1,6 @@
 import os from 'node:os';
 import { KnodeConfig, LlmConfig, resolveRoutedLlmConfig, routeTargets } from '../config.js';
+import { contentLanguages } from '../lang/languages.js';
 import { LlmClient } from '../llm/client.js';
 import { WorkTask } from '../work/broker.js';
 import { WorkKind } from '../work/kinds.js';
@@ -10,8 +11,9 @@ import { TaskOutcome, WorkerIdentity } from './scheduler.js';
  * `serve`'s own worker slots: slots per backend that take work from the work
  * broker (src/work/broker.ts) and run it on this machine — extraction on a
  * Codex agent and a Cursor agent side by side, say (`extraction.workers`),
- * summary pages on the Summarize stage's route (`summaryConcurrency`) and a
- * review's judge calls on the Judge stage's route (`review.concurrency`).
+ * summary pages on the Summarize stage's route (`summaryConcurrency`), a
+ * review's judge calls on the Judge stage's route (`review.concurrency`) and
+ * translations on the Translate stage's (`translateConcurrency`).
  * Each backend keeps its own health: a rate limit pauses it, a run of bad
  * answers rests it, a missing CLI or expired login parks it for half an hour
  * and then tries again (src/labeling/failures.ts). Settings saves are picked
@@ -95,6 +97,20 @@ export function localJudgeSpec(config: KnodeConfig): LocalWorkerSpec | null {
   if (!(slots > 0)) return null;
   const llm = resolveRoutedLlmConfig(config.llm, config.extraction.judgeLlm, routeTargets(config));
   return { id: 'judge', kinds: ['judge'], slots: Math.min(16, slots), llm };
+}
+
+/**
+ * The translation slots `serve` runs: the Translate stage's route with
+ * `translateConcurrency` slots (default `concurrency`), while the workspace
+ * has content languages on (docs/design/17). 0 turns them off — then only
+ * remote workers translate.
+ */
+export function localTranslateSpec(config: KnodeConfig): LocalWorkerSpec | null {
+  if (!contentLanguages(config).on) return null;
+  const slots = Math.floor(Number(config.extraction.translateConcurrency ?? config.extraction.concurrency ?? 1));
+  if (!(slots > 0)) return null;
+  const llm = resolveRoutedLlmConfig(config.llm, config.extraction.translateLlm, routeTargets(config));
+  return { id: 'translate', kinds: ['translate'], slots: Math.min(16, slots), llm };
 }
 
 /** Whether this machine can answer judge calls itself: judge slots on a Judge route with a model. */
@@ -199,7 +215,7 @@ export class LocalLabelingWorkers {
   reconfigure(): void {
     if (this.stopped) return;
     const config = this.config();
-    const stages = [localSummarySpec(config), localJudgeSpec(config)].filter((s): s is LocalWorkerSpec => s !== null);
+    const stages = [localSummarySpec(config), localJudgeSpec(config), localTranslateSpec(config)].filter((s): s is LocalWorkerSpec => s !== null);
     const specs = [...localWorkerSpecs(config, this.log), ...stages]
       .map((s) => ({ ...s, client: new LlmClient(s.llm) }))
       .filter((s) => s.client.enabled);
@@ -274,7 +290,7 @@ export class LocalLabelingWorkers {
     const renew = setInterval(() => this.work.renew([task.id], who), Math.max(5_000, Math.floor((Number.isFinite(leaseMs) ? leaseMs : 60_000) / 3)));
     renew.unref?.();
     try {
-      this.log(`${task.kind === 'extract' ? 'tier1 extract' : task.kind === 'summarize' ? 'summarize' : 'judge'} ${task.label} · ${backend.id}`);
+      this.log(`${task.kind === 'extract' ? 'tier1 extract' : task.kind} ${task.label} · ${backend.id}`);
       const text = await backend.client.complete(task.messages, { json: task.json, maxTokens: task.maxTokens });
       return { ok: true, text, model: backend.client.label };
     } catch (err) {

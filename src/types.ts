@@ -12,6 +12,8 @@ export interface DocumentRow {
   bytes: number;
   /** Length of the indexed text in characters; null for a row indexed before the column existed (schema v15). */
   chars?: number | null;
+  /** The language of the indexed text (docs/design/17); null when it has none, or for a row indexed before the column existed (schema v17). */
+  language?: string | null;
   status: 'pending' | 'indexed' | 'error' | 'skipped' | 'disposed';
   error: string | null;
   created_at: string;

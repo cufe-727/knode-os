@@ -61,7 +61,7 @@ export interface WorkSource {
   stop(): Promise<void>;
 }
 
-export const DEFAULT_SHARES: Record<SharedKind, number> = { extract: 3, summarize: 1 };
+export const DEFAULT_SHARES: Record<SharedKind, number> = { extract: 3, summarize: 1, translate: 1 };
 
 export interface BrokerOptions {
   /** Read on every lease: a settings save may change them. */

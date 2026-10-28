@@ -107,7 +107,8 @@ The summary pages they write are written either way; what they extract is review
 |---|---|---|
 | `server.remote.offer.summarize` | `true` | remote workers may take summaries here (extraction is always offered) |
 | `server.remote.offer.judge` | `false` | remote workers may take the judge calls a review is waiting on |
-| `server.remote.shares` | `{ "extract": 3, "summarize": 1 }` | a slot that takes both kinds gets them by these weights; judge calls go before either |
+| `server.remote.offer.translate` | `true` | remote workers may take translated segments while the workspace has content languages on ([design 17](design/17-content-languages.md)) |
+| `server.remote.shares` | `{ "extract": 3, "summarize": 1, "translate": 1 }` | a slot that takes several of these kinds gets them by these weights; judge calls go before any |
 | `server.remote.judgeModels` | `[]` | remote models whose verdicts may merge or reject without a person: `"codex:gpt-6.1-sol"`, or a prefix like `"codex:*"` |
 | `server.remote.callDeadlineMinutes` | `20` | longest a review waits for one judge call |
 
@@ -127,7 +128,7 @@ knode-os remote token revoke macbook
 
 | scope | allows |
 |---|---|
-| `label` | lease extraction segments, summaries and judge calls and hand back replies; `--kinds` narrows it to some of them |
+| `label` | lease extraction segments, summaries, judge calls and translated segments and hand back replies; `--kinds` narrows it to some of them |
 | `read` | list/read documents under raw/docs, raw/skills, wiki and playbook content; search; graph; claims |
 | `write` | write or delete documents under raw/docs, wiki and playbooks/packs (never a linked folder's mirror); trigger a sync |
 | `sql` | read-only SQL over the `v_*` catalog views |
@@ -184,8 +185,8 @@ node knode-worker.mjs … --check     # what the token may do, what the server o
 At start, and whenever a lease answer says it changed, the worker reads `GET …/work/config`: the kinds this token
 may take here, how long a lease lasts, the shares, and **hints** — how the server itself runs each kind on codex,
 claude and cursor (the model, and the effort and speed in that CLI's terms), taken from `extraction.workers` and the
-Extract stage's route for extraction, from the Summarize stage's route for summaries, and from the Judge stage's
-route for judge calls. A CLI backend follows the
+Extract stage's route for extraction, from the Summarize stage's route for summaries, from the Judge stage's
+route for judge calls, and from the Translate stage's route for translations. A CLI backend follows the
 hints unless it was given a model of its own (`--codex-model`, `--claude-model`, `--cursor-model`; `--codex-effort`,
 `--codex-speed` and `--claude-effort` override single fields). An `api` backend ignores them: model names differ
 between endpoints. Without `--kinds`, the worker takes every kind the server offers it. Against a server from
@@ -208,7 +209,7 @@ Workspace routes are `/w/<owner>/<workspace>/…`, where `<owner>` is a username
 | `GET /health` | — | `{ ok }` |
 | `GET /whoami` | any | the token's name, scopes, workspaces, kinds |
 | `GET /worker.mjs` | any | the worker script |
-| `GET …/work/config` | label | `{ version, leaseSeconds: { llm }, kinds: { extract, summarize, judge }, shares, hints: { <kind>: { codex?, claude?, cursor? } } }` |
+| `GET …/work/config` | label | `{ version, leaseSeconds: { llm }, kinds: { extract, summarize, judge, translate }, shares, hints: { <kind>: { codex?, claude?, cursor? } } }` |
 | `POST …/work/lease` | label | `{ worker, backend, kinds?, max }` → `{ configVersion, leaseSeconds, tasks: [{ id, kind, label, messages, prompt, json, maxTokens, leaseExpiresAt, document? }] }` |
 | `POST …/work/complete` | label | `{ worker, backend, id, ok, text \| error, kind?, model? }` → `{ accepted, documentWritten? }` (409 when the lease moved on) |
 | `POST …/work/renew` | label | `{ worker, backend, ids }` → `{ renewed, lost }` |

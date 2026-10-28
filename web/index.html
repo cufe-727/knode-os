@@ -172,6 +172,7 @@
           <button id="btn-back" title="Back to the file a link was followed from" hidden>‹</button>
           <span id="file-path" class="mono"></span>
           <span class="spacer"></span>
+          <span id="file-langs" class="file-langs" role="group" aria-label="Reading language" hidden></span>
           <a id="btn-original" class="toolbar-link" target="_blank" rel="noopener" title="The file itself in a new tab: the PDF, the picture, the web page as it was saved" hidden>original ↗</a>
           <button id="btn-edit" disabled>edit</button>
           <button id="btn-save" disabled>save</button>
@@ -180,6 +181,10 @@
         <div id="file-notice" class="file-notice" hidden>
           <span id="file-notice-text"></span>
           <button id="btn-load-full" hidden>load full file</button>
+        </div>
+        <div id="file-lang-notice" class="file-notice file-lang-notice" hidden>
+          <span id="file-lang-notice-text"></span>
+          <button id="btn-translate" hidden>translate</button>
         </div>
         <div id="file-citations" class="file-citations" hidden>
           <span class="eyebrow" title="Wiki pages that cite this file: [[raw/docs/…]] and Markdown links, sources: entries, relations such as tested_by">cited by</span>
@@ -551,6 +556,27 @@
                   <label>Run with<select id="cfg-summary-use" class="cfg-route-use"></select></label>
                   <label>Model<span class="model-field"><input id="cfg-summary-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="summaryLlm" title="List the models this provider offers">⌄</button></span></label>
                   <p class="route-note" id="cfg-summary-note"></p>
+                </div>
+              </div>
+
+              <div class="stage-panel" data-stage="translate" hidden>
+                <div class="stage-panel-copy">
+                  <div class="stage-title"><h4>Translate</h4><span class="section-badge accent2">Languages</span></div>
+                  <p>Every document under <span class="mono">raw/docs</span> written in another language is translated into the primary one, segment by segment; readers switch between the original and its translation.</p>
+                  <p class="stage-req">The Markdown is translated, never the original: a PDF or a web page keeps its file, and links, anchors and code stay exactly as they are. Secondary languages are offered to readers and translated when someone asks. Summary pages are written in the primary language. The interface language is each reader's own, not this setting.</p>
+                  <label class="cfg-check"><input id="cfg-lang-enabled" type="checkbox" /> Translate documents into the primary language</label>
+                  <div class="stage-rates">
+                    <label>Primary language<select id="cfg-lang-primary"></select></label>
+                    <label>Parallel calls<input id="cfg-translate-concurrency" type="number" min="0" max="16" step="1" /></label>
+                    <label>Longest document translated by itself (characters, 0 = any)<input id="cfg-lang-maxchars" type="number" min="0" step="1000" /></label>
+                  </div>
+                  <div class="cfg-lang-secondary"><span class="hint">Secondary languages, translated on request:</span> <span id="cfg-lang-secondary"></span></div>
+                  <p class="stage-req" id="cfg-lang-status"></p>
+                </div>
+                <div class="stage-control">
+                  <label>Run with<select id="cfg-translate-use" class="cfg-route-use"></select></label>
+                  <label>Model<span class="model-field"><input id="cfg-translate-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="translateLlm" title="List the models this provider offers">⌄</button></span></label>
+                  <p class="route-note" id="cfg-translate-note"></p>
                 </div>
               </div>
 

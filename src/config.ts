@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DEFAULT_LANGUAGES, LanguagesConfig, normalizeLanguagesConfig } from './lang/languages.js';
 import type { PluginSpec } from './plugins/types.js';
 import { agentFileNames, isValidAgentName, readAgentFile, renameProfileAgents, upgradeAgentFiles, writeAgentFile } from './research/agent-file.js';
 
@@ -333,6 +334,19 @@ export interface ExtractionConfig {
    * page says how much of it was read (docs/design/14).
    */
   summaryMaxSegments: number;
+  /**
+   * The Translate stage (docs/design/17): a document under raw/docs in
+   * another language than the workspace's primary one is translated into it,
+   * segment by segment, as leased work beside summaries. Runs only while
+   * `languages` is on. A config from before the stage starts as its
+   * `summaryLlm` (`migrateTranslateRoute`).
+   */
+  translateLlm: RoutedLlmConfig;
+  /**
+   * Translation calls `serve`'s own slots run at once (src/labeling/local.ts);
+   * default `concurrency`. 0 leaves translations to remote workers.
+   */
+  translateConcurrency?: number;
 }
 
 /** One kind of local labeling worker: what it runs on and how many calls at once. */
@@ -365,13 +379,13 @@ export interface RemoteApiConfig {
    * may take here (docs/design/12). Summaries default to on, the Judge
    * stage's review calls to off.
    */
-  offer?: { summarize?: boolean; judge?: boolean };
+  offer?: { summarize?: boolean; judge?: boolean; translate?: boolean };
   /**
    * How a slot that takes several kinds of work shares them: tasks handed out
    * per kind, by weight (src/work/broker.ts). Default extraction 3, summaries 1.
    * Judge calls go before either.
    */
-  shares?: { extract?: number; summarize?: number };
+  shares?: { extract?: number; summarize?: number; translate?: number };
   /** Longest a review waits for one judge call to be answered, here or remotely (default 20). */
   callDeadlineMinutes?: number;
   /**
@@ -861,6 +875,8 @@ export interface KnodeConfig {
   review: ReviewConfig;
   /** The chat entry (see src/chat). */
   chat: ChatConfig;
+  /** Content languages: the language the knowledge is read in, and what is translated into it (docs/design/17). */
+  languages: LanguagesConfig;
   trace: {
     /** Where Claude Code stores session transcripts. */
     claudeProjectsDir: string;
@@ -948,7 +964,7 @@ export function defaultConfig(): KnodeConfig {
       mcp: { enabled: true, path: '/mcp' },
       remote: {
         enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15,
-        offer: { summarize: true, judge: false }, shares: { extract: 3, summarize: 1 }, callDeadlineMinutes: 20, judgeModels: [],
+        offer: { summarize: true, judge: false, translate: true }, shares: { extract: 3, summarize: 1, translate: 1 }, callDeadlineMinutes: 20, judgeModels: [],
       },
       auth: { enabled: true, sessionDays: 30, allowInsecureRemote: false },
       tls: null,
@@ -961,6 +977,7 @@ export function defaultConfig(): KnodeConfig {
       documentLlm: defaultRoutedLlmConfig(),
       summaryLlm: defaultRoutedLlmConfig(),
       judgeLlm: defaultRoutedLlmConfig(),
+      translateLlm: defaultRoutedLlmConfig(),
       freshnessBoostDays: 3,
       importance: { docs: 1.0, skills: 0.6 },
       batchSize: 8,
@@ -1036,6 +1053,7 @@ export function defaultConfig(): KnodeConfig {
       external: 'verify',
     },
     chat: { agent: 'default', model: '', historyTurns: 12, keep: 200 },
+    languages: { ...DEFAULT_LANGUAGES, secondary: [] },
     trace: {
       claudeProjectsDir: path.join(home, '.claude', 'projects'),
       codexSessionsDir: path.join(home, '.codex', 'sessions'),
@@ -1163,7 +1181,9 @@ export function loadConfig(dataDir: string): KnodeConfig {
   const unchosen = dropInitExtractionChoice(merged);
   // before routes are lifted and pinned, so the copy is lifted and pinned with them
   const judged = migrateJudgeRoute(merged, raw);
+  const translated = migrateTranslateRoute(merged, raw);
   const unconcepted = dropConceptRoute(merged);
+  merged.languages = normalizeLanguagesConfig(merged.languages);
   merged.agentLlms = base.agentLlms;
   merged.modelAgents = base.modelAgents;
   const renamed = renameRetiredAgents(merged, dataDir, retired);
@@ -1180,7 +1200,7 @@ export function loadConfig(dataDir: string): KnodeConfig {
   // stage, a spec renamed off a retired agent, a dropped token budget or init
   // extraction choice, the Judge route's first copy and the retired concept
   // route are written for the same reason
-  if (movesCli || pinned || renamed || unbudgeted || unchosen || judged || unconcepted) saveConfig(dataDir, config);
+  if (movesCli || pinned || renamed || unbudgeted || unchosen || judged || translated || unconcepted) saveConfig(dataDir, config);
   return config;
 }
 
@@ -1277,6 +1297,18 @@ export function migrateJudgeRoute(config: KnodeConfig, raw: Partial<KnodeConfig>
 }
 
 /**
+ * Give a config from before the Translate stage its route: a copy of
+ * `summaryLlm`. A translation is prose for people to read, like a summary,
+ * so it starts on the agent or model that writes them — the same target,
+ * model, effort and speed — instead of whatever the default is.
+ */
+export function migrateTranslateRoute(config: KnodeConfig, raw: Partial<KnodeConfig>): boolean {
+  if ((raw.extraction as Partial<ExtractionConfig> | undefined)?.translateLlm) return false;
+  config.extraction.translateLlm = { ...config.extraction.summaryLlm };
+  return true;
+}
+
+/**
  * Drop `extraction.conceptLlm` and its legacy `tier2Model`. The Synthesize
  * stage wrote nightly concept-cluster pages; concept pages are research's job
  * now (docs/design/09), so nothing reads either. `deepMerge` would keep them
@@ -1294,7 +1326,7 @@ export function dropConceptRoute(config: KnodeConfig): boolean {
   return dropped;
 }
 
-const ROUTE_KEYS = ['entityLlm', 'documentLlm', 'summaryLlm', 'judgeLlm'] as const;
+const ROUTE_KEYS = ['entityLlm', 'documentLlm', 'summaryLlm', 'judgeLlm', 'translateLlm'] as const;
 
 /**
  * Lift pre-connections route overrides into named connections, in memory, so
@@ -1781,6 +1813,7 @@ export function redactConfig(config: KnodeConfig): KnodeConfig {
     clone.extraction.documentLlm,
     clone.extraction.summaryLlm,
     clone.extraction.judgeLlm,
+    clone.extraction.translateLlm,
     ...(clone.connections ?? []),
     ...(clone.embeddingProviders ?? []),
   ];

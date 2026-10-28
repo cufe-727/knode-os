@@ -26,6 +26,7 @@ import { DocRoot } from '../types.js';
 import { hasProse, hasRegions, stripRegions } from '../wiki/regions.js';
 import { chunkText } from './chunker.js';
 import { docDateOf } from './docdate.js';
+import { detectLanguage } from '../lang/detect.js';
 import { estimateTokens } from '../llm/tokens.js';
 import type { DeferredEmbeddings } from '../context.js';
 import { EmbeddingProvider } from './embeddings.js';
@@ -163,6 +164,9 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const title = titleFromMarkdown(file, parsed);
   const cls = await classify(store, file, root, parsed);
   const docDate = docDateOf(file, parsed.frontmatter);
+  // what a reader would read it as: the Translate stage reads this (docs/design/17);
+  // '' is "read, and in no language", which no backfill needs to read again
+  const language = detectLanguage(raw, parsed.frontmatter) ?? '';
 
   /* ── pure preparation: chunking, embeddings (network, unless deferred), tier-0 plans ── */
   // plugin hooks (docs/design/11) may reshape the chunks and the tier-0 terms
@@ -274,7 +278,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
       // counted afresh on every run: a transaction rolled back for a deadlock runs the body again
       g = { entities: 0, relations: 0 };
       await w.document(
-        { id: docId, path: file, root, title, sha256: sha, mime: guessMime(file), bytes, chars: raw.length, kind: cls.kind, docDate },
+        { id: docId, path: file, root, title, sha256: sha, mime: guessMime(file), bytes, chars: raw.length, language, kind: cls.kind, docDate },
         chunkRows,
         vectors,
         embedder.model,

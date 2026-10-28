@@ -275,8 +275,10 @@ describe('the remote API', () => {
       expect(config).toMatchObject({ kinds: { extract: true, summarize: true, judge: false }, shares: { extract: 3, summarize: 1 }, leaseSeconds: { llm: 900 } });
       expect(config.version).toMatch(/^[0-9a-f]{16}$/);
       // the workspace's models are endpoints, so there is no CLI to hint at
-      expect(config.hints).toEqual({ extract: {}, summarize: {}, judge: {} });
-      expect(((await (await req(`${ws}/work/config`, { token: tok.extractor })).json()) as Config).kinds).toEqual({ extract: true, summarize: false, judge: false });
+      expect(config.hints).toEqual({ extract: {}, summarize: {}, judge: {}, translate: {} });
+      // translations are offered only where the workspace has content languages on (docs/design/17)
+      expect(config.kinds.translate).toBe(false);
+      expect(((await (await req(`${ws}/work/config`, { token: tok.extractor })).json()) as Config).kinds).toEqual({ extract: true, summarize: false, judge: false, translate: false });
       expect((await req(`${ws}/work/config`, { token: tok.reader })).status).toBe(403);
 
       // the workspace stops offering summaries: the config says so under a new version, and none is leased

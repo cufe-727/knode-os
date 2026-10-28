@@ -902,6 +902,34 @@ CREATE OR REPLACE VIEW v_citations AS
   WHERE c.tx_to IS NULL;
 `;
 
+// Content languages (docs/design/17). A document's language beside its
+// length, detected from the indexed text on every apply; rows indexed before
+// it keep NULL until the Translate stage's scan reads the text once. And what
+// that stage made of each document: one row per document and language it was
+// translated into, for the content it translated, so a scan finds what is due
+// without opening a sidecar per document and a reader's file view says how
+// far a translation got. The translations themselves are files in the
+// sidecar (views/translations/); a rebuild loses these rows and the scan
+// writes them again from those files, without a model call.
+const V17_CONTENT_LANGUAGES = `
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS language TEXT;
+CREATE TABLE IF NOT EXISTS translations (
+  document_id  TEXT NOT NULL,
+  language     TEXT NOT NULL,
+  content_sha  TEXT NOT NULL,
+  status       TEXT NOT NULL,
+  parts        INTEGER NOT NULL DEFAULT 0,
+  done         INTEGER NOT NULL DEFAULT 0,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  requested    BOOLEAN NOT NULL DEFAULT false,
+  model        TEXT,
+  error        TEXT,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (document_id, language)
+);
+CREATE INDEX IF NOT EXISTS translations_status_idx ON translations (language, status);
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -936,6 +964,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 14, name: 'claim-kind', up: async (q) => execScript(q, V14_CLAIM_KIND) },
   { version: 15, name: 'document-chars', up: async (q) => execScript(q, V15_DOCUMENT_CHARS) },
   { version: 16, name: 'citations', up: async (q) => execScript(q, V16_CITATIONS) },
+  { version: 17, name: 'content-languages', up: async (q) => execScript(q, V17_CONTENT_LANGUAGES) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

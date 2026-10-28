@@ -9,13 +9,13 @@ import { CATALOG_VIEWS } from '../src/store/catalog.js';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-schema-v7-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16 (wiki research + review + quick answers + claim merges + dispose indexes + derived co-occurrence + claim kind + document chars + citations)', () => {
+describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17 (wiki research + review + quick answers + claim merges + dispose indexes + derived co-occurrence + claim kind + document chars + citations + content languages)', () => {
   it('adds the temporal relation / claim columns, resolution tables and research jobs, and every catalog view resolves', async () => {
     fs.mkdirSync(path.join(tmp, 'ws', '.knode'), { recursive: true });
     const store = await Store.open(path.join(tmp, 'ws'), 3);
     try {
-      expect(SCHEMA_VERSION).toBe(16);
-      expect(store.migration.to).toBe(16);
+      expect(SCHEMA_VERSION).toBe(17);
+      expect(store.migration.to).toBe(17);
       // every foreign key a disposal fires, the merged-entity lookup of the fold, and the
       // document side of derived co-occurrence (v13) have an index to use
       const indexes = (await store.query<{ indexname: string }>(`SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()`)).map((r) => r.indexname);
@@ -33,6 +33,10 @@ describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16 (wiki research + review + qui
       // v16: wiki pages citing raw/docs files, owned by the citing scope (src/graph/citations.ts)
       expect(await columns('citations')).toEqual(expect.arrayContaining(['scope_id', 'source_path', 'target_path', 'type', 'inverse', 'via', 'fragment', 'tx_from', 'tx_to']));
       expect(indexes).toEqual(expect.arrayContaining(['citations_target_idx', 'citations_source_idx', 'citations_scope_idx']));
+      // v17: a document's language, and how far each translation of it got (docs/design/17)
+      expect(await columns('documents')).toContain('language');
+      expect(await columns('translations')).toEqual(expect.arrayContaining(['document_id', 'language', 'content_sha', 'status', 'parts', 'done', 'attempts', 'requested', 'model', 'error']));
+      expect(indexes).toContain('translations_status_idx');
       expect(await columns('entities')).toEqual(expect.arrayContaining(['canonical_id', 'name_key']));
       expect(await columns('entity_alias_keys')).toEqual(expect.arrayContaining(['entity_id', 'alias_key', 'kind']));
       expect(await columns('entity_links')).toEqual(expect.arrayContaining(['entity_id', 'canonical_id', 'scope_id']));

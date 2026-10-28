@@ -361,7 +361,7 @@ describe('the work broker', () => {
     expect(await kindsOf(broker, 3, ['summarize'])).toEqual(['summarize', 'summarize', 'summarize']);
     expect(await kindsOf(broker, 1, [])).toEqual(['none']);
     // an unusable weight falls back to its default
-    expect(new WorkBroker([], { shares: () => ({ extract: 0, summarize: -2 }) }).shares()).toEqual({ extract: 3, summarize: 1 });
+    expect(new WorkBroker([], { shares: () => ({ extract: 0, summarize: -2 }) }).shares()).toEqual({ extract: 3, summarize: 1, translate: 1 });
   });
 
   it('puts the judge calls a review waits on before both, and leaves their shares as they were', async () => {
@@ -413,9 +413,10 @@ describe('worker hints', () => {
       extract: { codex: { model: 'gpt-extract', effort: 'medium', speed: 'fast' }, cursor: { model: 'grok[effort=high]' } },
       summarize: { codex: { model: 'gpt-summary', effort: 'high', speed: 'fast' } },
       judge: { cursor: { model: 'grok[effort=low]' } },
+      translate: {},
     });
     // an endpoint gets no hints: model names differ between them
-    expect(workerHints(base)).toEqual({ extract: {}, summarize: {}, judge: {} });
+    expect(workerHints(base)).toEqual({ extract: {}, summarize: {}, judge: {}, translate: {} });
   });
 });
 

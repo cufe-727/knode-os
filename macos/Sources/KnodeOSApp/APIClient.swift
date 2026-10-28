@@ -253,10 +253,27 @@ struct APIClient {
 
     /// Reads a file. Without `maxBytes` the service caps the read at its preview
     /// limit and answers `truncated`; pass a cap to pull the whole file for editing.
-    func file(at filePath: String, maxBytes: Int? = nil) async throws -> FileResponse {
+    /// `lang` asks for a document in a reading language: its translation when
+    /// there is one, else the original, with `languages.shown` saying which.
+    /// An older service ignores it.
+    func file(at filePath: String, maxBytes: Int? = nil, lang: String? = nil) async throws -> FileResponse {
         var query = [URLQueryItem(name: "path", value: filePath)]
         if let maxBytes { query.append(.init(name: "maxBytes", value: String(maxBytes))) }
+        if let lang, !lang.isEmpty { query.append(.init(name: "lang", value: lang)) }
         return try await send(path("/api/file", query: query))
+    }
+
+    /// Asks for a document in another of the workspace's languages — the
+    /// Translate stage takes it next — or, with `cancel`, withdraws the request.
+    func requestTranslation(path filePath: String, lang: String, cancel: Bool = false) async throws -> TranslationRequestResponse {
+        struct Body: Encodable { var path: String; var lang: String; var cancel: Bool? }
+        return try await send("/api/file/translate", method: "POST", body: encoded(Body(path: filePath, lang: lang, cancel: cancel ? true : nil)))
+    }
+
+    /// The languages knode-os knows and the workspace's content languages. An
+    /// older service answers 404.
+    func languages() async throws -> LanguagesResponse {
+        try await send("/api/languages")
     }
 
     /// The file itself, as bytes: a PDF or a picture as it is, a web page with
@@ -610,7 +627,7 @@ struct APIClient {
     }
 
     /// Models the draft config's provider offers for one route ("embedding",
-    /// "llm", "entityLlm", "documentLlm", "summaryLlm", "judgeLlm"). Inherited routes are
+    /// "llm", "entityLlm", "documentLlm", "summaryLlm", "judgeLlm", "translateLlm"). Inherited routes are
     /// resolved against the draft default provider server-side.
     /// `refresh` asks the provider again instead of taking the service's
     /// cached answer — what the refresh button in the picker sends.

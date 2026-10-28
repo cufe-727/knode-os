@@ -1,10 +1,10 @@
 /**
  * The kinds of work `serve` hands out as leases (docs/design/12): extraction
- * segments, summary pages and the Judge stage's review calls. A worker names
- * the kinds each of its slots takes, the server says which it offers, and a
- * token may be narrowed to some.
+ * segments, summary pages, the Judge stage's review calls and translated
+ * segments (docs/design/17). A worker names the kinds each of its slots
+ * takes, the server says which it offers, and a token may be narrowed to some.
  */
-export const WORK_KINDS = ['extract', 'summarize', 'judge'] as const;
+export const WORK_KINDS = ['extract', 'summarize', 'judge', 'translate'] as const;
 export type WorkKind = (typeof WORK_KINDS)[number];
 
 /**
@@ -12,7 +12,7 @@ export type WorkKind = (typeof WORK_KINDS)[number];
  * go first: a review is waiting on its judge calls, and a round has only a
  * bounded number of them.
  */
-export const SHARED_KINDS = ['extract', 'summarize'] as const;
+export const SHARED_KINDS = ['extract', 'summarize', 'translate'] as const;
 export type SharedKind = (typeof SHARED_KINDS)[number];
 
 export function isWorkKind(value: unknown): value is WorkKind {

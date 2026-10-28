@@ -18,11 +18,13 @@
 //   api     an OpenAI-compatible /chat/completions endpoint (--api-base-url, --api-model;
 //           the key comes from the variable named by --api-key-env, default OPENAI_API_KEY)
 //
-// Kinds of work (--kinds extract,summarize,judge; default: every kind the server offers this token):
+// Kinds of work (--kinds extract,summarize,judge,translate; default: every kind the server offers this token):
 //   extract    extraction segments, answered with a JSON object
 //   summarize  summary pages, answered in Markdown
 //   judge      a review's judge calls (are two entities, or two claims, the same?), answered with
 //              a JSON object; offered only where the server turned them on
+//   translate  a document's segments translated into a content language, answered in Markdown;
+//              offered where the workspace has content languages on (docs/design/17)
 // The rest comes from the server (GET …/work/config): the kinds it offers, how long a lease
 // lasts, and how it runs each kind on codex, claude and cursor — model, effort, speed. A CLI
 // backend follows those unless its model is given here. A server that predates work/* hands
@@ -69,7 +71,7 @@ const workerName = String(args.name ?? process.env.KNODE_WORKER_NAME ?? os.hostn
 const timeoutMs = Number(args.timeoutMs ?? 600_000);
 const backendSpec = String(args.backends ?? process.env.KNODE_BACKENDS ?? 'codex:1');
 const idleMs = Math.max(100, Number(args.idleMs ?? 20_000));
-const KINDS = ['extract', 'summarize', 'judge'];
+const KINDS = ['extract', 'summarize', 'judge', 'translate'];
 const kindSpec = args.kinds ?? process.env.KNODE_KINDS;
 const askedKinds = kindSpec ? String(kindSpec).split(',').map((k) => k.trim()).filter(Boolean) : null;
 for (const k of askedKinds ?? []) if (!KINDS.includes(k)) throw new Error(`unknown kind of work "${k}" — use ${KINDS.join(', ')}`);
@@ -391,6 +393,8 @@ if (args.check) {
     if (summaries) log(`summaries: ${summaries.due} documents due at the last look, ${summaries.leases?.length ?? 0} out`);
     const judge = status.kinds?.judge;
     if (judge) log(`judge calls: ${judge.waiting} waiting on a review, ${judge.leases?.length ?? 0} out`);
+    const translations = status.kinds?.translate;
+    if (translations?.enabled) log(`translations into ${translations.primary}: ${translations.due} due at the last look, ${translations.leases?.length ?? 0} segments out`);
     log(`${status.workers?.length ?? 0} workers seen`);
   } else {
     const { data: status } = await call('GET', `${base}/labeling/status`);
@@ -423,6 +427,7 @@ const sleep = (ms) => new Promise((resolve) => {
 function describeTask(task) {
   const doc = task.document;
   const label = task.label ?? (doc ? `${doc.path}${doc.parts > 1 ? ` [${doc.part}/${doc.parts}]` : ''}` : task.id);
+  if (task.kind === 'translate') return `translation of ${label}`;
   return task.kind === 'summarize' ? `summary of ${label}` : task.kind === 'judge' ? `judge call on ${label}` : label;
 }
 

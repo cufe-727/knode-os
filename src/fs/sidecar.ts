@@ -15,6 +15,8 @@ import { SIDECAR_ROOT, sidecarRelFor } from './layout.js';
  *   tier1.json               LLM extraction, replayable while `contentSha` matches
  *   usage.json               heat snapshot, flushed hourly from the DB
  *   views/source-summary.md  cached LLM source summary (frontmatter = cache key)
+ *   views/translations/      the indexed text translated, per language: <lang>.md (frontmatter = cache key)
+ *                            and <lang>.parts.json (one translation per segment, by segment hash)
  *
  * The sidecar extends gbrain's "files are truth" rule to derived data that is
  * expensive to rebuild: deleting `.knode/` and re-ingesting never re-pays LLM
@@ -227,6 +229,7 @@ const VIEWS_DIR = 'views';
 const SOURCE_SUMMARY_FILE = `${VIEWS_DIR}/source-summary.md`;
 const SOURCE_SUMMARY_PARTS_FILE = `${VIEWS_DIR}/source-summary.parts.json`;
 const SOURCE_SUMMARY_FAILED_FILE = `${VIEWS_DIR}/source-summary.failed.json`;
+const TRANSLATIONS_DIR = `${VIEWS_DIR}/translations`;
 
 /* ------------------------------ low level ------------------------------ */
 
@@ -377,6 +380,7 @@ export function removeSidecar(dataDir: string, key: string): void {
 export function sidecarHoldsPaidWork(dataDir: string, key: string): boolean {
   const dir = sidecarDir(dataDir, key);
   if (isFile(path.join(dir, PART_FILES.tier1)) || isFile(path.join(dir, SOURCE_SUMMARY_FILE)) || isFile(path.join(dir, SOURCE_SUMMARY_PARTS_FILE))) return true;
+  if (translationLanguages(dataDir, key).length > 0) return true;
   if (!isFile(path.join(dir, CONTENT_FILE))) return false;
   return readPartFrom(dir, 'meta')?.conversion?.kind !== 'pdf-text';
 }
@@ -591,6 +595,107 @@ export function recordSourceSummaryFailure(dataDir: string, key: string, content
 
 export function clearSourceSummaryFailure(dataDir: string, key: string): void {
   fs.rmSync(path.join(sidecarDir(dataDir, key), SOURCE_SUMMARY_FAILED_FILE), { force: true });
+}
+
+/* ----------------------------- translations ----------------------------- */
+
+/**
+ * A document's indexed text in another language (docs/design/17): the whole
+ * translation, written once every segment is in, keyed by the content it
+ * translates. The original is never touched; a reader switches to this.
+ */
+export interface TranslationCache {
+  contentSha: string;
+  /** The language translated from, as detected. */
+  source: string;
+  language: string;
+  /** Who translated it; the models of a long document's parts, comma-joined when they differ. */
+  model: string;
+  generatedAt: string;
+  parts: number;
+  body: string;
+}
+
+/** One segment translated, by the hash of the segment's text. */
+export interface TranslationPart {
+  body: string;
+  model: string;
+  generatedAt: string;
+}
+
+/** A language code as a file name: `zh-Hant` stays readable, anything odd cannot climb out of the directory. */
+const languageFile = (language: string) => language.replace(/[^A-Za-z0-9-]/g, '_');
+
+const translationFile = (dataDir: string, key: string, language: string) =>
+  path.join(sidecarDir(dataDir, key), TRANSLATIONS_DIR, `${languageFile(language)}.md`);
+const translationPartsFile = (dataDir: string, key: string, language: string) =>
+  path.join(sidecarDir(dataDir, key), TRANSLATIONS_DIR, `${languageFile(language)}.parts.json`);
+
+export function readTranslation(dataDir: string, key: string, language: string): TranslationCache | null {
+  const cache = readMarkdownCache(translationFile(dataDir, key, language));
+  if (!cache) return null;
+  const contentSha = cacheString(cache.frontmatter.contentSha);
+  const source = cacheString(cache.frontmatter.source);
+  const model = cacheString(cache.frontmatter.model);
+  const generatedAt = cacheString(cache.frontmatter.generatedAt);
+  if (contentSha === null || source === null || model === null || generatedAt === null) return null;
+  const parts = Number(cacheString(cache.frontmatter.parts) ?? '1');
+  return { contentSha, source, language, model, generatedAt, parts: Number.isFinite(parts) && parts >= 1 ? parts : 1, body: cache.body };
+}
+
+export function writeTranslation(dataDir: string, key: string, cache: TranslationCache): void {
+  writeMarkdownCache(
+    translationFile(dataDir, key, cache.language),
+    { contentSha: cache.contentSha, source: cache.source, language: cache.language, model: cache.model, generatedAt: cache.generatedAt, parts: String(cache.parts) },
+    cache.body,
+  );
+}
+
+export function readTranslationParts(dataDir: string, key: string, language: string): Map<string, TranslationPart> {
+  const raw = readJson<{ parts?: Record<string, Partial<TranslationPart>> }>(translationPartsFile(dataDir, key, language));
+  const out = new Map<string, TranslationPart>();
+  if (!raw || typeof raw.parts !== 'object' || raw.parts === null) return out;
+  for (const [sha, p] of Object.entries(raw.parts)) {
+    if (typeof p?.body === 'string') out.set(sha, { body: p.body, model: String(p.model ?? ''), generatedAt: String(p.generatedAt ?? '') });
+  }
+  return out;
+}
+
+/** Keep one translated segment; segments the document no longer has (not in `keep`) are dropped with it. */
+export function writeTranslationPart(dataDir: string, key: string, language: string, sha: string, part: TranslationPart, keep?: Iterable<string>): void {
+  const parts = readTranslationParts(dataDir, key, language);
+  parts.set(sha, part);
+  if (keep) {
+    const current = new Set(keep);
+    for (const s of [...parts.keys()]) if (!current.has(s)) parts.delete(s);
+  }
+  writeAtomic(translationPartsFile(dataDir, key, language), `${JSON.stringify({ parts: Object.fromEntries(parts) }, null, 2)}\n`);
+}
+
+/** The languages a document has a translation (whole or begun) into. */
+export function translationLanguages(dataDir: string, key: string): string[] {
+  let names: string[];
+  try {
+    names = fs.readdirSync(path.join(sidecarDir(dataDir, key), TRANSLATIONS_DIR));
+  } catch {
+    return [];
+  }
+  const out = new Set<string>();
+  for (const name of names) {
+    const m = /^(.+?)(?:\.parts\.json|\.md)$/.exec(name);
+    if (m) out.add(m[1]);
+  }
+  return [...out].sort();
+}
+
+/** Forget a document's translations into `language`, or into every language. */
+export function clearTranslations(dataDir: string, key: string, language?: string): void {
+  if (language === undefined) {
+    fs.rmSync(path.join(sidecarDir(dataDir, key), TRANSLATIONS_DIR), { recursive: true, force: true });
+    return;
+  }
+  fs.rmSync(translationFile(dataDir, key, language), { force: true });
+  fs.rmSync(translationPartsFile(dataDir, key, language), { force: true });
 }
 
 /* ------------------------------- helpers ------------------------------- */
