@@ -32,7 +32,7 @@ export interface PlaybookFile {
   mtime: string;
   /** knode-os ships a version of this file: a reset writes it back. */
   builtin: boolean;
-  /** The file differs from that version (false without one). */
+  /** The file differs from that version (false without one): edited, or seeded from an older one. */
   modified: boolean;
   /** knode-os regenerates the file, so an edit would not last. */
   readonly: boolean;

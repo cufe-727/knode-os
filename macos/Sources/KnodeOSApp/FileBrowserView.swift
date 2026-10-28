@@ -790,14 +790,22 @@ struct FileBrowserView: View {
     }
 
     /// Where a create or an upload goes: the folder last clicked in the tree,
-    /// else the folder of the open file, else the wiki root.
+    /// else the folder of the open file when the tree shows it, else the wiki root.
     private var targetDirectory: String {
         if let selectedDirectory { return selectedDirectory }
         if let selectedPath {
             let parent = parentDirectory(of: selectedPath)
-            if !parent.isEmpty { return parent }
+            if !parent.isEmpty, isShownInTree(parent) { return parent }
         }
         return "wiki"
+    }
+
+    /// Whether the tree shows a folder: its parent's listing has it. The
+    /// service leaves system folders out (a lint report opened from a notice
+    /// lives in one), and a file made there would vanish from view.
+    private func isShownInTree(_ directory: String) -> Bool {
+        guard let entries = listings[parentDirectory(of: directory)] else { return true }
+        return entries.contains { $0.path == directory }
     }
 
     /// The same folder, kept to one an upload may actually land in — a click

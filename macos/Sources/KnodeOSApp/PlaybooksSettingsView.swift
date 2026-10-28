@@ -75,7 +75,7 @@ struct PlaybooksSettingsSection: View {
             Button(L("Reset"), role: .destructive) { Task { await editor.reset(model) } }
             Button(L("Cancel"), role: .cancel) {}
         } message: {
-            Text(L("The version knode-os ships replaces your edits to this file."))
+            Text(L("The version knode-os ships replaces what the file holds now."))
         }
     }
 
@@ -219,7 +219,8 @@ struct PlaybooksSettingsSection: View {
         if file.readonly {
             RouteBadge(label: L("generated"), color: .secondary)
         } else if file.modified {
-            RouteBadge(label: L("edited"), color: .orange)
+            // not what knode-os ships now: an edit, or a copy seeded from an older version
+            RouteBadge(label: L("differs"), color: .orange)
         } else if file.builtin {
             RouteBadge(label: L("built-in"), color: .knodeCyan)
         }
