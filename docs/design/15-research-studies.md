@@ -146,5 +146,6 @@ default) a study's own web choice widens it for that study, as a profile's `sear
 7. The export's figures do not hover: they are the file view's SVG, each value also in the figure's data table (on screen;
    left out of print). Hydrating them would take a script, which the file is held to run none of.
 8. The Mac app's charts keep Swift Charts' axis defaults. With the 26.5 SDK a category axis puts its names on the edges
-   between rows, so an `hbar`'s names sit above their bars; the timeline stands its rows on a numeric axis to keep each
-   name level with its row.
+   between rows, so an `hbar`'s names sat above their bars; the timeline stands its rows on a numeric axis to keep each
+   name level with its row. The `hbar` has done the same since 2026‑10‑28 (a bar for each series in a row; a name is
+   cut at 200 pt, as on the web). Column charts keep their category axis, whose names sit centred under their columns.
