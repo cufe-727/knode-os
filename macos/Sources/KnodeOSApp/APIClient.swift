@@ -431,6 +431,15 @@ struct APIClient {
         try await send("/api/traces/sync", method: "POST", body: Data("{}".utf8))
     }
 
+    /// What a person should know about the workspace: lint findings, trace collection, purpose, initialization, datasources.
+    func notices() async throws -> NoticesResponse {
+        try await send("/api/notices")
+    }
+
+    func syncDatasources() async throws -> DatasourceSyncResponse {
+        try await send("/api/datasources/sync", method: "POST", body: Data("{}".utf8))
+    }
+
     func suggestions() async throws -> [Suggestion] {
         try await send("/api/suggestions")
     }
@@ -604,6 +613,26 @@ struct APIClient {
     /// Deleting a built-in resets it to the template rather than removing it.
     func deleteAgent(_ name: String) async throws -> DeleteAgentResponse {
         try await send("/api/agents/\(name)", method: "DELETE")
+    }
+
+    /* ------------------------------ playbooks ------------------------------ */
+
+    func playbooks() async throws -> PlaybooksResponse {
+        try await send("/api/playbooks")
+    }
+
+    func playbook(at playbookPath: String) async throws -> PlaybookText {
+        try await send(path("/api/playbooks/file", query: [.init(name: "path", value: playbookPath)]))
+    }
+
+    func savePlaybook(path playbookPath: String, text: String) async throws -> PlaybookText {
+        struct Body: Encodable { var path: String; var text: String }
+        return try await send("/api/playbooks/file", method: "PUT", body: encoded(Body(path: playbookPath, text: text)))
+    }
+
+    /// Put the built-in version back in place of an edited one.
+    func resetPlaybook(path playbookPath: String) async throws -> PlaybookText {
+        try await send(path("/api/playbooks/file", query: [.init(name: "path", value: playbookPath)]), method: "DELETE")
     }
 
     func cliTools() async throws -> CliToolsResponse {

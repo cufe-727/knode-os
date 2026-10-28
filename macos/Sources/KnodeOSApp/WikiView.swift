@@ -324,6 +324,8 @@ struct WikiView: View {
             initJob = res.job
             model.showToast(res.created ? L("Initialization queued") : L("Already queued: %@", res.job.id))
             watchInitialization(res.job.id)
+            // a running initialization answers the notice that asked for it
+            await model.refreshNotices()
         } catch {
             isInitializing = false
             model.showToast(L("Could not start: %@", error.localizedDescription))

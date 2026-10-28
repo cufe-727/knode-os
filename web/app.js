@@ -278,21 +278,30 @@ function loadWorkspaceData() {
   $('#suggestions').innerHTML = '';
   $('#cfg-status').innerHTML = '';
   loadStats();
+  notices = [];
+  showDismissedNotices = false;
+  closeNotices();
+  loadNotices();
   loadTree().then(() => openFile('wiki/index.md')).catch(() => {});
 
   // reload whatever the current host view shows — one list, so it cannot drift
   // out of sync with what navigate() loads on arrival
+  playbook = null;
   TAB_LOAD[hostOf(currentTab)]?.();
+  SUBTAB_LOAD[currentTab]?.();
 }
 
 function startAppData() {
   if (!statsTimer) statsTimer = setInterval(loadStats, 15000);
+  if (!noticesTimer) noticesTimer = setInterval(loadNotices, NOTICE_REFRESH_MS);
   loadWorkspaceData();
 }
 
 function stopAppData() {
   if (statsTimer) clearInterval(statsTimer);
   statsTimer = null;
+  if (noticesTimer) clearInterval(noticesTimer);
+  noticesTimer = null;
   stopChatPolling();
 }
 
@@ -605,17 +614,18 @@ const NAV = [
     { id: 'pipeline', title: 'Ingest', hint: 'How documents get processed' },
     { id: 'research', title: 'Research', hint: 'How the wiki gets written' },
     { id: 'chat', title: 'Ask', hint: 'How questions get answered' },
+    { id: 'playbooks', title: 'Playbooks', hint: 'Prompts, templates and vocabularies knode-os works from' },
     { id: 'workspace', title: 'Workspace', hint: 'Clear this workspace' },
     { id: 'access', title: 'Access', hint: 'Your account; users and gateways of this server' },
   ] },
 ];
 
 /**
- * Which `<section class="tab">` shows a tab. Settings' five tabs share one
- * host: keying identity and loaders on the leaf instead would re-run
+ * Which `<section class="tab">` shows a tab. Settings' tabs share one host:
+ * keying identity and loaders on the leaf instead would re-run
  * `loadConfigForm()` on every sub-tab click and throw away unsaved routes.
  */
-const TAB_HOST = { providers: 'settings', pipeline: 'settings', research: 'settings', chat: 'settings', workspace: 'settings' };
+const TAB_HOST = { providers: 'settings', pipeline: 'settings', research: 'settings', chat: 'settings', playbooks: 'settings', workspace: 'settings' };
 const hostOf = (tab) => TAB_HOST[tab] ?? tab;
 
 /**
@@ -640,6 +650,11 @@ const TAB_LOAD = {
   // the box may hold a name another view put there (exploreEntity): arrival runs it
   graph: () => { if (!graphState.loaded) loadGraph($('#graph-q').value.trim()); },
   entities: () => loadEntities(),
+};
+
+/** What a tab inside a shared host loads each time it is shown: Playbooks lists the files again. */
+const SUBTAB_LOAD = {
+  playbooks: () => loadPlaybooks(),
 };
 
 const NAV_KEY = 'knode-os.nav.v1';
@@ -697,6 +712,7 @@ function paintSearchScope() {
 function navigate(tab) {
   const section = sectionOf(tab);
   if (!section) return;
+  const previousTab = currentTab;
   const previousHost = hostOf(currentTab);
   const host = hostOf(tab);
   currentTab = tab;
@@ -712,6 +728,7 @@ function navigate(tab) {
   // an unrelated `if`, which is how this used to silently fire everywhere
   if (previousHost === 'ask' && host !== 'ask') stopChatPolling();
   if (host !== previousHost) TAB_LOAD[host]?.();
+  if (tab !== previousTab || host !== previousHost) SUBTAB_LOAD[tab]?.();
 }
 
 /** Picking a section returns to the tab it was left at, not to its first one. */
@@ -1013,6 +1030,212 @@ async function loadStats() {
   loadProcessing();
 }
 
+/* ------------------------------- notices ------------------------------- */
+
+/**
+ * Notices: what this workspace needs a person to know (src/server/notices.ts)
+ * — the lint report and the datasource failures the file tree no longer
+ * shows, trace collection waiting for a yes, a purpose nobody wrote, a wiki
+ * never initialized. The service sends data; the words, and the one action
+ * each kind offers, are this page's. A dismissal holds until the notice
+ * changes (its key), per workspace.
+ */
+const NOTICES_KEY = 'knode-os.notices.dismissed.v1';
+const NOTICE_REFRESH_MS = 5 * 60 * 1000;
+let notices = [];
+let noticesTimer = null;
+let showDismissedNotices = false;
+const dismissedNotices = (() => {
+  try {
+    return JSON.parse(localStorage.getItem(NOTICES_KEY) ?? '{}') ?? {};
+  } catch {
+    return {};
+  }
+})();
+
+/** Lint finding kinds in words, singular and plural. */
+const LINT_KINDS = {
+  orphan: ['page nothing links to', 'pages nothing links to'],
+  broken_link: ['broken link', 'broken links'],
+  stale_research: ['research page due for a refresh', 'research pages due for a refresh'],
+  unreviewed: ['unreviewed research page', 'unreviewed research pages'],
+  expired: ['expired page', 'expired pages'],
+  superseded_text: ['superseded statement', 'superseded statements'],
+  open_dispute: ['page with open disputes', 'pages with open disputes'],
+};
+
+const noticeScope = () => {
+  const workspace = activeWorkspace();
+  return workspace ? `${workspace.kind}/${workspace.id}` : 'default';
+};
+const isDismissed = (notice) => dismissedNotices[noticeScope()]?.[notice.id] === notice.key;
+/** Whether this account may use an API group; with sign-in off, everything is allowed. */
+const mayUse = (group) => authDisabled || !serverAuth?.groups || serverAuth.groups[group] === true;
+const count = (n, [one, many]) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+
+function dismissNotice(notice) {
+  const scope = noticeScope();
+  dismissedNotices[scope] = { ...(dismissedNotices[scope] ?? {}), [notice.id]: notice.key };
+  try {
+    localStorage.setItem(NOTICES_KEY, JSON.stringify(dismissedNotices));
+  } catch {
+    /* blocked storage: dismissed until the page reloads */
+  }
+  paintNotices();
+}
+
+async function loadNotices() {
+  try {
+    notices = (await api('/api/notices')).notices ?? [];
+  } catch {
+    notices = []; // an older service, or an account without the search group: nothing to say
+  }
+  paintNotices();
+}
+
+/** A notice in words: a title, a body, and its action (`group` is the API group the action needs). */
+function noticeText(notice) {
+  switch (notice.id) {
+    case 'lint': {
+      const { summary, previous } = notice;
+      const kinds = Object.entries(summary.counts).filter(([, n]) => n > 0).map(([kind, n]) => (LINT_KINDS[kind] ? count(n, LINT_KINDS[kind]) : `${n.toLocaleString()} ${kind}`));
+      const change = previous ? summary.findings - previous.summary.findings : 0;
+      const since = previous && change !== 0 ? ` (${change > 0 ? '+' : '−'}${Math.abs(change).toLocaleString()} since ${previous.date})` : '';
+      return {
+        title: `Wiki check: ${summary.findings.toLocaleString()} findings across ${summary.pages.toLocaleString()} pages${since}`,
+        body: `${kinds.join(' · ')}. From the report of ${notice.date}.`,
+        action: { label: 'Open report', group: 'files' },
+      };
+    }
+    case 'traces-off':
+      return {
+        title: "Agent traces aren't collected here",
+        body: `The nightly review learns from your Claude Code and Codex sessions, but this workspace has none. Collecting copies ${notice.sessions.toLocaleString()} sessions (${fmtBytes(notice.bytes)}) from this Mac into raw/traces and keeps adding new ones.`,
+        action: { label: 'Collect traces', group: 'traces' },
+      };
+    case 'purpose':
+      return {
+        title: 'Say what this workspace is for',
+        body: 'purpose.md is still the template. The wiki generator and the nightly review read it to decide what matters.',
+        action: { label: 'Edit purpose.md', group: 'files' },
+      };
+    case 'initialize': {
+      const missing = !notice.overview && !notice.guide ? 'No overview or agent guide yet.' : !notice.overview ? 'No overview yet.' : 'No agent guide yet.';
+      return {
+        title: "This workspace isn't initialized",
+        body: `${missing} Initializing runs an agent that writes them, then queues topic pages.`,
+        action: { label: 'Go to Initialize', group: 'knowledge' },
+      };
+    }
+    case 'datasources':
+      return {
+        title: 'Datasources failed on the last sync',
+        body: `${notice.errors.slice(0, 3).join(' · ')}${notice.errors.length > 3 ? ` · and ${notice.errors.length - 3} more` : ''}. Their dataset pages may be stale.`,
+        action: { label: 'Retry', group: 'datasources' },
+      };
+    default:
+      return null; // a kind this page does not know yet
+  }
+}
+
+function paintNotices() {
+  const button = $('#notices-toggle');
+  const known = notices.map((notice) => ({ notice, text: noticeText(notice) })).filter((n) => n.text);
+  const open = known.filter((n) => !isDismissed(n.notice));
+  const dismissed = known.filter((n) => isDismissed(n.notice));
+  button.hidden = known.length === 0;
+  button.textContent = open.length ? `⚑ ${open.length} ${open.length === 1 ? 'notice' : 'notices'}` : '⚑ notices';
+  button.classList.toggle('has-open', open.length > 0);
+  button.classList.toggle('warn', open.some((n) => n.notice.level === 'warn'));
+  if (known.length === 0) closeNotices();
+
+  const shown = showDismissedNotices ? [...open, ...dismissed] : open;
+  const item = ({ notice, text }) => {
+    const gone = isDismissed(notice);
+    return `<article class="notice ${esc(notice.level)}${gone ? ' dismissed' : ''}" data-notice="${esc(notice.id)}">
+      <b>${esc(text.title)}</b>
+      <p>${esc(text.body)}</p>
+      <div class="notice-actions">
+        <button type="button" data-run="${esc(notice.id)}"${mayUse(text.action.group) ? '' : ` disabled title="your account cannot use ${esc(API_GROUP_LABELS[text.action.group] ?? text.action.group)}"`}>${esc(text.action.label)}</button>
+        ${gone ? '' : `<button type="button" class="quiet" data-dismiss="${esc(notice.id)}">Dismiss</button>`}
+      </div>
+    </article>`;
+  };
+  $('#notices-panel').innerHTML = (shown.length ? shown.map(item).join('') : '<p class="hint">Nothing needs you right now.</p>')
+    + (dismissed.length ? `<button type="button" class="notices-more" data-toggle-dismissed>${showDismissedNotices ? 'Hide dismissed' : `Show ${dismissed.length} dismissed`}</button>` : '');
+}
+
+function closeNotices() {
+  $('#notices-panel').hidden = true;
+  $('#notices-toggle').setAttribute('aria-expanded', 'false');
+}
+
+async function runNotice(notice) {
+  try {
+    switch (notice.id) {
+      case 'lint':
+        closeNotices();
+        navigate('files');
+        await openFile(notice.report);
+        break;
+      case 'purpose':
+        closeNotices();
+        navigate('files');
+        await openFile('purpose.md');
+        if (currentFile === 'purpose.md' && !editing && !$('#btn-edit').disabled) $('#btn-edit').click();
+        break;
+      case 'initialize':
+        closeNotices();
+        navigate('wiki');
+        break;
+      case 'traces-off': {
+        if (!confirm(`Copy ${notice.sessions.toLocaleString()} sessions (${fmtBytes(notice.bytes)}) from this Mac into this workspace? New sessions keep arriving after this.`)) return;
+        const res = await api('/api/traces/sync', { method: 'POST' });
+        toast(`collected ${res.copied} traces and ${res.skills} skill files`);
+        loadStats();
+        await loadNotices();
+        break;
+      }
+      case 'datasources': {
+        const res = await api('/api/datasources/sync', { method: 'POST' });
+        toast(res.errors?.length ? `${res.errors.length} datasource errors remain` : 'datasources synced');
+        await loadNotices();
+        break;
+      }
+    }
+  } catch (error) {
+    toast(`could not ${noticeText(notice)?.action.label.toLowerCase() ?? 'do that'}: ${error.message}`);
+  }
+}
+
+$('#notices-toggle').addEventListener('click', (event) => {
+  event.stopPropagation();
+  const panel = $('#notices-panel');
+  panel.hidden = !panel.hidden;
+  $('#notices-toggle').setAttribute('aria-expanded', String(!panel.hidden));
+  if (!panel.hidden) closeWorkspaceMenu();
+});
+
+$('#notices-panel').addEventListener('click', (event) => {
+  event.stopPropagation();
+  const target = event.target.closest?.('button');
+  if (!target) return;
+  if (target.hasAttribute('data-toggle-dismissed')) {
+    showDismissedNotices = !showDismissedNotices;
+    paintNotices();
+    return;
+  }
+  const notice = notices.find((n) => n.id === (target.dataset.run ?? target.dataset.dismiss));
+  if (!notice) return;
+  if (target.dataset.dismiss) dismissNotice(notice);
+  else runNotice(notice);
+});
+
+document.addEventListener('click', closeNotices);
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closeNotices();
+});
+
 /* ----------------------------- processing ------------------------------ */
 
 /**
@@ -1157,10 +1380,20 @@ const isWritable = (path) => /^(wiki|raw\/docs)(\/|$)/.test(path);
 const parentDir = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
 const baseName = (path) => path.split('/').pop();
 
-/** Where a create or an upload goes: the picked folder, else the open file's folder, else wiki. */
+/**
+ * Whether the tree shows a folder: its parent's listing has it. The service
+ * leaves system folders out (a lint report opened from a notice lives in one),
+ * and a file made there would vanish from view.
+ */
+function shownInTree(dir) {
+  const entries = listings.get(parentDir(dir));
+  return !entries || entries.some((c) => c.path === dir);
+}
+
+/** Where a create or an upload goes: the picked folder, else the open file's folder when the tree shows it, else wiki. */
 function targetDir() {
   if (selectedDir) return selectedDir;
-  if (currentFile && parentDir(currentFile)) return parentDir(currentFile);
+  if (currentFile && parentDir(currentFile) && shownInTree(parentDir(currentFile))) return parentDir(currentFile);
   return 'wiki';
 }
 
@@ -1264,6 +1497,9 @@ function renderEntries(dir, container) {
   }
 }
 
+/** A path under a home directory, as `~/…`: a linked folder's origin is long, and the row is narrow. */
+const homeShort = (p) => String(p).replace(/^\/(Users|home)\/[^/]+(?=\/|$)/, '~');
+
 function treeRow(child) {
   const div = document.createElement('div');
   div.className = child.kind === 'dir' ? 'tree-dir' : 'tree-file';
@@ -1279,10 +1515,22 @@ function treeRow(child) {
     if (expandedDirs.has(child.path)) renderEntries(child.path, kids);
     else div.classList.add('collapsed');
     if (child.path === selectedDir) label.classList.add('picked');
+    const name = document.createElement('span');
+    label.appendChild(name);
+    // what the folder is for: the service's word for the folders it makes, the
+    // origin for a linked one, nothing for a folder someone made
+    const about = child.about || (child.linked ? `linked from ${homeShort(child.linked)}` : '');
+    if (about) {
+      const hint = document.createElement('span');
+      hint.className = 'tree-about';
+      hint.textContent = about;
+      label.appendChild(hint);
+    }
     const paint = () => {
-      label.textContent = `${div.classList.contains('collapsed') ? '▸' : '▾'} ${child.name}${child.linked ? ' 🔗' : ''}`;
+      name.textContent = `${div.classList.contains('collapsed') ? '▸' : '▾'} ${child.name}${child.linked ? ' 🔗' : ''}`;
     };
     if (child.linked) label.title = `linked to ${child.linked} — mirrored from there and kept in sync; edit the originals, not these copies`;
+    else if (child.about) label.title = child.about;
     paint();
     label.addEventListener('click', () => {
       // one click both picks the folder new items go into and opens it
@@ -1959,6 +2207,8 @@ $('#btn-save').addEventListener('click', async () => {
     await api('/api/file', { method: 'PUT', body: JSON.stringify({ path: currentFile, content: $('#file-editor').value }) });
     toast(`saved ${currentFile}`);
     paintFileView(currentFile, $('#file-editor').value);
+    // a written purpose.md, say, answers a notice
+    loadNotices();
   } catch (e) {
     toast(`save failed: ${e.message}`);
   }
@@ -3164,6 +3414,151 @@ $('#btn-init-kb').addEventListener('click', async () => {
   } catch (e) {
     button.disabled = false;
     toast(`could not start: ${e.message}`);
+  }
+});
+
+/* ------------------------------ playbooks ------------------------------ */
+
+/**
+ * Settings → Playbooks: the files under playbooks/, which the file tree
+ * leaves out, grouped the way knode-os reads them (src/fs/playbooks.ts). A
+ * file is edited, reverted, or reset to the version knode-os ships; a group
+ * another page owns points there instead. Saving is an administrator's call,
+ * like every setting.
+ */
+const PLAYBOOK_GROUPS = {
+  research: ['Research templates', 'What a research agent is told for each kind of page, and AGENTS.md, the protocol every research job shares.'],
+  phases: ['Research phases', 'The prompt for each step of a research run: plan, collect, research, synthesize, review, revise.'],
+  packs: ['Context packs', 'How knode gathers context for a question. The nightly review can revise them from what worked.'],
+  intents: ['Intents', 'What an answer to each kind of question needs before it is worth giving.'],
+  ontology: ['Ontology', 'The entity and relation types the knowledge graph uses.'],
+  concepts: ['Concept stop list', 'Words never mined as concepts. frequent.yaml is learned from your documents and regenerated.'],
+  capabilities: ['Capability notes', 'Notes on live datasources: metric definitions, joins, pitfalls.'],
+  chat: ['Ask prompts', 'How Ask behaves (AGENTS.md, its protocol) and the prompt it sends each turn (turn.md).'],
+  agents: ['Agents', 'Who does the work for Ask and Research.'],
+  profiles: ['Research profiles', 'Effort, web access and the sub-agent roles of a research run.'],
+  sources: ['Research sources', 'The web, APIs, MCP servers and sites a study may use.'],
+};
+/** The page that edits a group another page owns: its name and its tab. */
+const PLAYBOOK_OWNERS = {
+  providers: ['Settings → Providers & Agents', 'providers'],
+  research: ['Settings → Research', 'research'],
+  sources: ['Research → Sources', 'sources'],
+};
+
+let playbookGroups = [];
+/** The open file as last read or saved: what Revert returns to and what the textarea is compared with. */
+let playbook = null;
+
+const mayChangeSettings = () => authDisabled || serverAuth?.groups?.settings === true;
+const playbookDirty = () => Boolean(playbook) && $('#pb-text').value !== playbook.text;
+const playbookTags = (file) => (file.readonly ? '<span class="tag">generated</span>' : file.modified ? '<span class="tag">edited</span>' : '');
+
+async function loadPlaybooks() {
+  try {
+    playbookGroups = (await api('/api/playbooks')).groups ?? [];
+  } catch (e) {
+    $('#pb-groups').innerHTML = `<p class="cfg-callout">playbooks unavailable: ${esc(e.message)}</p>`;
+    return;
+  }
+  $('#pb-badge').textContent = mayChangeSettings() ? 'Prompts & vocabularies' : 'Read-only';
+  paintPlaybookGroups();
+  // the open file stays open, unsaved edits and all; otherwise the first file there is
+  if (playbook && playbookGroups.some((g) => g.files.some((f) => f.path === playbook.path))) return;
+  const first = playbookGroups.find((g) => !g.managedIn && g.files.length)?.files[0];
+  if (first) openPlaybook(first.path);
+  else paintPlaybook(null);
+}
+
+function paintPlaybookGroups() {
+  $('#pb-groups').innerHTML = playbookGroups.map((group) => {
+    const [title, about] = PLAYBOOK_GROUPS[group.id] ?? [group.id, ''];
+    const owner = group.managedIn ? PLAYBOOK_OWNERS[group.managedIn] : null;
+    const body = group.managedIn
+      ? `<button type="button" class="pb-owner" data-tab="${esc(owner?.[1] ?? '')}">Edited in ${esc(owner?.[0] ?? group.managedIn)} →</button>`
+      : group.files.length
+        ? group.files.map((f) => `<button type="button" class="pb-file${f.path === playbook?.path ? ' active' : ''}" data-path="${esc(f.path)}"><span>${esc(f.name)}</span>${playbookTags(f)}</button>`).join('')
+        : '<p class="hint">Nothing here yet.</p>';
+    return `<section class="pb-group"><h4>${esc(title)}</h4><p>${esc(about)}</p>${body}</section>`;
+  }).join('');
+}
+
+async function openPlaybook(path) {
+  if (playbookDirty() && playbook.path !== path && !confirm(`Discard your changes to ${playbook.name}?`)) return;
+  try {
+    paintPlaybook(await api(`/api/playbooks/file?path=${encodeURIComponent(path)}`));
+  } catch (e) {
+    toast(`could not open ${path}: ${e.message}`);
+  }
+}
+
+function paintPlaybook(file) {
+  playbook = file;
+  const text = $('#pb-text');
+  text.value = file?.text ?? '';
+  const why = !file ? '' : file.readonly
+    ? 'knode-os regenerates this file from your documents, so it is shown here, not edited.'
+    : mayChangeSettings() ? '' : "Read-only: settings are an administrator's.";
+  text.readOnly = !file || Boolean(why);
+  $('#pb-path').textContent = file?.path ?? 'No playbook open';
+  $('#pb-tags').innerHTML = file ? (file.builtin ? (file.modified ? '<span class="tag">edited</span>' : '<span class="tag">built-in</span>') : '') + (file.readonly ? '<span class="tag">generated</span>' : '') : '';
+  $('#pb-note').hidden = !why;
+  $('#pb-note').textContent = why;
+  $('#pb-reset').hidden = !(file?.builtin && file.modified) || text.readOnly;
+  $('#pb-status').textContent = '';
+  paintPlaybookButtons();
+  for (const b of document.querySelectorAll('#pb-groups .pb-file')) b.classList.toggle('active', b.dataset.path === file?.path);
+}
+
+function paintPlaybookButtons() {
+  const dirty = playbookDirty();
+  $('#pb-save').disabled = !dirty || $('#pb-text').readOnly;
+  $('#pb-revert').disabled = !dirty;
+}
+
+/** Take the service's answer for a saved or reset file into the editor and the list. */
+function playbookSaved(file, message) {
+  for (const group of playbookGroups) {
+    const i = group.files.findIndex((f) => f.path === file.path);
+    if (i >= 0) group.files[i] = { ...group.files[i], ...file, text: undefined };
+  }
+  paintPlaybookGroups();
+  paintPlaybook(file);
+  $('#pb-status').textContent = message;
+}
+
+$('#pb-groups').addEventListener('click', (event) => {
+  const file = event.target.closest?.('.pb-file');
+  if (file) {
+    openPlaybook(file.dataset.path);
+    return;
+  }
+  const owner = event.target.closest?.('.pb-owner');
+  if (owner?.dataset.tab) navigate(owner.dataset.tab);
+});
+
+$('#pb-text').addEventListener('input', paintPlaybookButtons);
+
+$('#pb-save').addEventListener('click', async () => {
+  if (!playbook) return;
+  $('#pb-save').disabled = true;
+  try {
+    const file = await api('/api/playbooks/file', { method: 'PUT', body: JSON.stringify({ path: playbook.path, text: $('#pb-text').value }) });
+    playbookSaved(file, 'saved — the next job that reads it uses it');
+  } catch (e) {
+    $('#pb-status').textContent = `not saved: ${e.message}`;
+    paintPlaybookButtons();
+  }
+});
+
+$('#pb-revert').addEventListener('click', () => paintPlaybook(playbook));
+
+$('#pb-reset').addEventListener('click', async () => {
+  if (!playbook || !confirm(`Put back the version of ${playbook.name} that knode-os ships? Your edits to it are lost.`)) return;
+  try {
+    playbookSaved(await api(`/api/playbooks/file?path=${encodeURIComponent(playbook.path)}`, { method: 'DELETE' }), 'reset to the built-in version');
+  } catch (e) {
+    $('#pb-status').textContent = `not reset: ${e.message}`;
   }
 });
 

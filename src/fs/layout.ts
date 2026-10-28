@@ -50,6 +50,43 @@ export const ATTIC_DIR = `${LEDGER_DIR}/attic`;
 export const DB_DIR = '.knode/db';
 
 /**
+ * Folders the file tree leaves out, though they stay on disk and open by path:
+ * the ledger is machine truth nobody browses, lint reports and datasource
+ * problems reach people as notices (src/server/notices.ts), and playbooks are
+ * edited in Settings. Dataset pages stay searchable and cited.
+ */
+export const TREE_HIDDEN: ReadonlySet<string> = new Set([LEDGER_DIR, `${WIKI_DIR}/lint`, `${WIKI_DIR}/datasets`, CONFIG_DIR]);
+
+/**
+ * What each folder knode-os makes is for, shown beside it in the file tree.
+ * Plain English: the Mac app translates these exact strings, so a change here
+ * wants the same change in its Localization table.
+ */
+export const FOLDER_ABOUT: Readonly<Record<string, string>> = {
+  [RAW_DIR]: 'Originals, never rewritten',
+  [RAW_DOCS]: 'Your documents: uploads, imports, linked folders',
+  [`${RAW_DOCS}/research`]: 'Web pages and files research studies saved',
+  [`${RAW_DOCS}/notes`]: 'Notes agents saved: research logs, what Ask was taught',
+  [`${RAW_DOCS}/okf`]: 'Imported OKF bundles',
+  [RAW_TRACES]: 'Agent sessions, read by the nightly review',
+  [`${RAW_TRACES}/claude`]: 'Claude Code sessions',
+  [`${RAW_TRACES}/codex`]: 'Codex sessions',
+  [RAW_SKILLS]: 'Skills and prompts your agents used',
+  [WIKI_DIR]: 'Curated pages; also an Obsidian vault',
+  [`${WIKI_DIR}/entities`]: 'People, organizations, products',
+  [`${WIKI_DIR}/concepts`]: 'Methods, theories, conventions',
+  [`${WIKI_DIR}/sources`]: 'A summary of each document',
+  [`${WIKI_DIR}/timelines`]: 'Chronologies',
+  [`${WIKI_DIR}/comparisons`]: 'Side-by-side comparisons',
+  [`${WIKI_DIR}/questions`]: 'Researched answers to questions',
+  [`${WIKI_DIR}/reviews`]: 'Fact-checks of existing pages',
+  [`${WIKI_DIR}/research`]: 'Research studies: reports and their sections',
+  [`${WIKI_DIR}/dreams`]: 'Nightly review reports',
+  [`${WIKI_DIR}/learning`]: 'What the planner learned from past answers',
+  [`${WIKI_DIR}/attachments`]: 'Images and files pages embed',
+};
+
+/**
  * Root of the derived layer. `.sidecar/<key>/` holds everything knode-os
  * derives from the source at `<key>` (converted Markdown, chunk map, tier-0/1
  * extraction, usage stats, cached LLM views). Unlike `.knode/`, it is *not*

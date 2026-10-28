@@ -207,7 +207,8 @@ export function matchIntent(intents: IntentSpec[], utterance: string, entityType
   return best ?? { intent: DEFAULT_INTENT, score: 0, reasons: ['no intent matched — using the default slots'] };
 }
 
-const DEFAULT_INTENT_YAML = `# Intent spec: what an answer to this kind of question needs before it is worth giving.
+/** The starter intent seeded as `playbooks/intents/entity-overview.yaml`; Settings resets an edited copy to it. */
+export const DEFAULT_INTENT_YAML = `# Intent spec: what an answer to this kind of question needs before it is worth giving.
 # Copy this file and edit it — \`knode_resolve\` reports a gap for every required
 # slot it could not fill, instead of returning documents and hoping.
 id: entity_overview

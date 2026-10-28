@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG_FILE, defaultConfig, saveConfig } from '../config.js';
@@ -74,12 +75,22 @@ Structural rules the wiki follows. Edit freely — generators respect this file.
 
 ## Page types
 
-| directory        | type    | what goes here                          |
-| ---------------- | ------- | --------------------------------------- |
-| wiki/entities/   | entity  | people, orgs, products, components      |
-| wiki/concepts/   | concept | theories, methods, designs, conventions |
-| wiki/sources/    | source  | one summary page per raw document       |
-| wiki/dreams/     | dream   | nightly trace-analysis reports          |
+| directory          | type                           | what goes here                          |
+| ------------------ | ------------------------------ | --------------------------------------- |
+| wiki/entities/     | person, organization, …        | people, orgs, products, components      |
+| wiki/concepts/     | concept                        | theories, methods, designs, conventions |
+| wiki/timelines/    | timeline                       | an entity's or a topic's chronology     |
+| wiki/comparisons/  | comparison                     | side-by-side comparisons                |
+| wiki/questions/    | question                       | a researched answer to one question     |
+| wiki/reviews/      | review                         | fact-checks of existing pages           |
+| wiki/research/     | research-report, research-page | a study's report and its section pages  |
+| wiki/sources/      | source                         | one summary page per raw document       |
+| wiki/dreams/       | dream                          | nightly trace-analysis reports          |
+
+knode-os writes \`wiki/sources/\` and \`wiki/dreams/\` itself, and three folders
+nobody else writes to: \`wiki/datasets/\` (the tables of live datasources),
+\`wiki/lint/\` (daily health checks) and \`wiki/learning/\` (what the planner
+learned from past answers).
 
 ## Conventions
 
@@ -142,14 +153,50 @@ export const SEED_FILES: Record<string, string> = {
   'wiki/overview.md': OVERVIEW_TEMPLATE,
 };
 
+/**
+ * Earlier versions of the seed templates, as the sha256 of their squashed text.
+ * A file that still equals one was never edited, so `initDataDir` brings it up
+ * to the current template; a file someone changed is left alone.
+ */
+const RETIRED_SEEDS: Record<string, readonly string[]> = {
+  'schema.md': [
+    '693b473349a07811e649343d88710a8c598d8ef47134b8ce52813761e6680d23', // 2026-06-12
+    '3fec35e63f1d588a5f03d3901b18d0f8d871a73fe57b5fe3134646d6104fbdd7', // 2026-09-11
+    '80809395ac2dab81f69ffaa28f8846f5a63d54a6157457d4063ca1ea2c52f3fd', // 2026-09-12, OKF v0.2
+    'b4d6e3f6d966f4a3c9844792d291094cbd7d07bb13201b211449f6c2e752a7d2', // 2026-10-27, citations
+  ],
+};
+
 function squashTemplate(text: string): string {
   return text.replace(/\r\n/g, '\n').split('\n').map((l) => l.trimEnd()).join('\n').trim();
 }
 
-/** True when `text` is still the template `initDataDir` wrote at `rel` (line endings and trailing whitespace ignored). */
+const squashedSha = (text: string) => crypto.createHash('sha256').update(squashTemplate(text)).digest('hex');
+
+/** True when `text` is still a template `initDataDir` wrote at `rel`, current or retired (line endings and trailing whitespace ignored). */
 export function isSeedTemplate(rel: string, text: string): boolean {
-  const template = SEED_FILES[rel.replace(/\\/g, '/').replace(/^\/+/, '')];
-  return template !== undefined && squashTemplate(template) === squashTemplate(text);
+  const clean = rel.replace(/\\/g, '/').replace(/^\/+/, '');
+  const template = SEED_FILES[clean];
+  if (template === undefined) return false;
+  return squashTemplate(template) === squashTemplate(text) || (RETIRED_SEEDS[clean]?.includes(squashedSha(text)) ?? false);
+}
+
+/** Rewrite every seed file that still holds a retired template with the current one. Returns the paths rewritten. */
+export function upgradeRetiredSeeds(dataDir: string): string[] {
+  const upgraded: string[] = [];
+  for (const [rel, hashes] of Object.entries(RETIRED_SEEDS)) {
+    const file = path.join(dataDir, rel);
+    let text: string;
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch {
+      continue;
+    }
+    if (!hashes.includes(squashedSha(text))) continue;
+    fs.writeFileSync(file, SEED_FILES[rel]);
+    upgraded.push(rel);
+  }
+  return upgraded;
 }
 
 /**
@@ -182,6 +229,8 @@ const DIRECTORY_INDEXES: Record<string, string> = {
 
 export interface InitResult {
   created: string[];
+  /** Seed files that still held an earlier template and now hold the current one. */
+  upgraded: string[];
   dataDir: string;
 }
 
@@ -233,6 +282,7 @@ export function initDataDir(dataDir: string): InitResult {
   ensureFile('wiki/overview.md', OVERVIEW_TEMPLATE);
   ensureFile('wiki/log.md', LOG_TEMPLATE);
   for (const [rel, content] of Object.entries(DIRECTORY_INDEXES)) ensureFile(rel, content);
+  const upgraded = upgradeRetiredSeeds(dataDir);
   const obsidian = initObsidianVault(path.join(dataDir, 'wiki'));
   created.push(...obsidian.created.map((rel) => `wiki/${rel}`));
   // starters for the two configurable layers: how to retrieve (playbook) and
@@ -242,7 +292,7 @@ export function initDataDir(dataDir: string): InitResult {
     saveConfig(dataDir, defaultConfig());
     created.push(CONFIG_FILE);
   }
-  return { created, dataDir };
+  return { created, upgraded, dataDir };
 }
 
 /** Append an OKF date-grouped entry to wiki/log.md, newest first. */

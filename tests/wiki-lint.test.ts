@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { sync } from '../src/ingest/sync.js';
 import { listSuggestions } from '../src/store/queries.js';
-import { lintWiki } from '../src/wiki/lint.js';
+import { lintWiki, parseLintSummary } from '../src/wiki/lint.js';
 import { markSupersededClaims } from '../src/wiki/refine.js';
 
 /**
@@ -132,6 +132,9 @@ claims:
     expect(page).toContain('## broken_link (1)');
     expect(page).toContain('## entities without a page (1)');
     expect(page).toContain('- [[比亚迪]] (organization) — linked from 1 page');
+    // the lint notice reads the counts back out of the summary line
+    const nonzero = Object.fromEntries(Object.entries(report.counts).filter(([, n]) => n > 0));
+    expect(parseLintSummary(page)).toEqual({ pages: report.pages, findings: report.issues.length, counts: nonzero });
     expect(await ctx.store.query(`SELECT kind FROM pages WHERE path = $1 AND tx_to IS NULL`, [report.reportPath])).toEqual([{ kind: 'lint' }]);
     const refresh = (await listSuggestions(ctx.store, { status: 'pending' })).find((s) => s.kind === 'wiki' && (s.payload as { target?: string })?.target === 'wiki/entities/宁德时代.md');
     expect(refresh?.payload).toMatchObject({ kind: 'refresh' });

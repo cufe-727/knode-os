@@ -13,7 +13,7 @@ import { optimizePacks } from '../pack/learn.js';
 import { distillRecipes, staleOrphanedRecipeSuggestions } from '../compiler/distill.js';
 import { evaluatePacks, writeEvalReport } from '../compiler/evaluate.js';
 import { writeRankerReport } from '../compiler/ranker.js';
-import { syncTraces } from '../traces/sync.js';
+import { syncTraces, traceCollectionPaused } from '../traces/sync.js';
 import { SuggestionRow, TraceRow } from '../types.js';
 
 /**
@@ -98,7 +98,11 @@ export async function runDream(
       suggestions = heuristicSuggestions(aggregate, skillsOnDisk);
     }
   } else {
-    analysisNote = digests.length === 0 ? 'No traces in window.' : 'No LLM configured; heuristic analysis only.';
+    analysisNote = digests.length > 0
+      ? 'No LLM configured; heuristic analysis only.'
+      : traceCollectionPaused(store.dataDir)
+        ? 'Trace collection is off for this workspace, so there is nothing to analyze. Collect traces from the notice in the app to turn it on.'
+        : 'No traces in window.';
     suggestions = heuristicSuggestions(aggregate, skillsOnDisk);
   }
 

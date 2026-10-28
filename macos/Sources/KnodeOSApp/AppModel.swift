@@ -49,6 +49,8 @@ final class AppModel: ObservableObject {
     /// The folder picked in the Files tree. Shared so Search can scope to it.
     @Published var pickedDirectory: String?
     @Published var workspaceRevision = 0
+    /// What the service says needs attention in the active workspace, less the ones dismissed here (`refreshNotices`).
+    @Published private(set) var notices: [WorkspaceNotice] = []
     @Published var toastMessage: String?
     @Published var globalActivity: String?
     /// Interface language. Every view observes this model, so setting it
@@ -66,6 +68,8 @@ final class AppModel: ObservableObject {
     private let legacyServerKey = "knode-os.macos.server-url.v1"
     private let legacyAccountsKey = "knode-os.macos.accounts.v1"
     private let navKey = "knode-os.macos.nav.v1"
+    /// Dismissed notices: service and workspace → notice kind → the key it had when dismissed.
+    private let dismissedNoticesKey = "knode-os.macos.dismissed-notices.v1"
     private let localService = LocalServiceManager()
     private let tunnel = SSHTunnel()
     /// The session token for `connection`, from `SessionTokens` (or memory, when not remembered).
@@ -438,6 +442,7 @@ final class AppModel: ObservableObject {
         account = nil
         stats = nil
         processing = nil
+        notices = []
         authNotice = message ?? L("Your session ended — sign in again.")
         phase = .signIn
     }
@@ -457,6 +462,7 @@ final class AppModel: ObservableObject {
         pendingGraphQuery = nil
         stats = nil
         processing = nil
+        notices = []
         authNotice = nil
         phase = .signIn
     }
@@ -641,6 +647,71 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /* ------------------------------ notices ------------------------------ */
+
+    /// The service and workspace a dismissal belongs to: the same workspace id on another service is another workspace.
+    private var noticeScope: String? {
+        guard let workspace = activeWorkspace else { return nil }
+        return "\(connection.identity)#\(workspace.kind.rawValue)/\(workspace.id)"
+    }
+
+    private var dismissedNotices: [String: [String: String]] {
+        defaults.dictionary(forKey: dismissedNoticesKey) as? [String: [String: String]] ?? [:]
+    }
+
+    /// Read the workspace's notices again. A dismissed one stays out until its key changes — a new lint report, other errors.
+    func refreshNotices() async {
+        guard phase == .app, let scope = noticeScope else { return }
+        do {
+            let all = try await client().notices().notices
+            let dismissed = dismissedNotices[scope] ?? [:]
+            notices = all.filter { dismissed[$0.id] != $0.key }
+        } catch let error as APIError where error.sessionEnded {
+            sessionEnded()
+        } catch let error as APIError where error.status == 404 {
+            // a service from before notices
+            notices = []
+        } catch {
+            // unreachable for now: keep what is shown; the next refresh tries again
+        }
+    }
+
+    func dismissNotice(_ notice: WorkspaceNotice) {
+        guard let scope = noticeScope else { return }
+        var all = dismissedNotices
+        all[scope, default: [:]][notice.id] = notice.key
+        defaults.set(all, forKey: dismissedNoticesKey)
+        notices.removeAll { $0.id == notice.id }
+    }
+
+    /// Copy the agent sessions on the service's machine into the workspace,
+    /// which lifts the pause a new or cleared workspace starts with.
+    func collectTraces() async {
+        globalActivity = L("Collecting traces…")
+        defer { globalActivity = nil }
+        do {
+            let result = try await client().syncTraces()
+            showToast(L("Collected %@ sessions", String(result.copied)))
+            await refreshNotices()
+            await refreshStats()
+        } catch {
+            showError(error, prefix: L("Collecting traces failed"))
+        }
+    }
+
+    /// Read every configured datasource again, for a notice about the last pass failing.
+    func retryDatasources() async {
+        globalActivity = L("Syncing datasources…")
+        defer { globalActivity = nil }
+        do {
+            let result = try await client().syncDatasources()
+            showToast(result.errors.isEmpty ? L("Datasources synced") : L("Datasources synced with %@ errors", String(result.errors.count)))
+            await refreshNotices()
+        } catch {
+            showError(error, prefix: L("Datasource sync failed"))
+        }
+    }
+
     /// Start or stop the workspace's processing; the service refuses anyone but an administrator.
     func setProcessing(_ running: Bool) async {
         do {
@@ -671,6 +742,7 @@ final class AppModel: ObservableObject {
                 pendingGraphQuery = nil
                 stats = nil
                 processing = nil
+                notices = []
                 workspaceRevision += 1
             }
         } catch let error as APIError where error.sessionEnded {
@@ -730,6 +802,7 @@ final class AppModel: ObservableObject {
         pendingGraphQuery = nil
         stats = nil
         processing = nil
+        notices = []
         workspaceRevision += 1
         showToast(message)
         Task {

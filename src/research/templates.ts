@@ -624,6 +624,19 @@ export const PHASES: Record<PhaseName, string> = {
 `,
 };
 
+/**
+ * What knode-os seeds at `playbooks/research/<rel>` — `AGENTS.md`, `<kind>.md`
+ * or `phases/<name>.md` — so Settings can reset an edited copy; undefined for
+ * a file it never seeds.
+ */
+export function builtinResearchText(rel: string): string | undefined {
+  if (rel === PROTOCOL_FILE) return PROTOCOL;
+  const phase = /^phases\/([^/]+)\.md$/.exec(rel);
+  if (phase) return Object.hasOwn(PHASES, phase[1]) ? PHASES[phase[1] as PhaseName] : undefined;
+  const kind = /^([^/]+)\.md$/.exec(rel);
+  return kind && Object.hasOwn(BUILTIN, kind[1]) ? BUILTIN[kind[1] as ResearchKind] : undefined;
+}
+
 /** Seed the phase prompts once (never overwrites user edits). */
 export function ensureDefaultPhases(dataDir: string): string[] {
   const created: string[] = [];

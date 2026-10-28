@@ -134,7 +134,8 @@ export function renderProbeSql(template: string, entity: Pick<PlaybookEntity, 'n
     .replace(/\{alias\}/g, escape(aliases[0] ?? entity.name));
 }
 
-const DEFAULT_PLAYBOOK = `---
+/** The fallback playbook seeded as `playbooks/packs/default.md`; Settings resets an edited copy to it. */
+export const DEFAULT_PLAYBOOK = `---
 type: playbook
 appliesTo: default
 retrieval:

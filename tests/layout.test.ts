@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { loadIntents } from '../src/compiler/intents.js';
 import { loadRecipes } from '../src/compiler/recipes.js';
 import { createContext } from '../src/context.js';
-import { assertSupportedLayout, initDataDir, LegacyLayoutError } from '../src/fs/datadir.js';
+import { assertSupportedLayout, initDataDir, isSeedTemplate, LegacyLayoutError } from '../src/fs/datadir.js';
 import { assertSourcePath, cleanRelPath, isRootWritableFile, isWritablePath } from '../src/fs/files.js';
 import { loadPlaybooks } from '../src/pack/playbook.js';
 
@@ -19,6 +19,40 @@ function write(root: string, rel: string, content: string): void {
   fs.mkdirSync(path.dirname(abs), { recursive: true });
   fs.writeFileSync(abs, content);
 }
+
+/** schema.md as knode-os seeded it from 2026-09-12 to 2026-10-27, which workspaces of that time still hold. */
+const SCHEMA_2026_09_12 = `# Wiki schema
+
+Structural rules the wiki follows. Edit freely — generators respect this file.
+
+## Page types
+
+| directory        | type    | what goes here                          |
+| ---------------- | ------- | --------------------------------------- |
+| wiki/entities/   | entity  | people, orgs, products, components      |
+| wiki/concepts/   | concept | theories, methods, designs, conventions |
+| wiki/sources/    | source  | one summary page per raw document       |
+| wiki/dreams/     | dream   | nightly trace-analysis reports          |
+
+## Conventions
+
+- The \`wiki/\` directory is an OKF v0.2 knowledge bundle and a standalone
+  Obsidian Vault. Open that folder directly in Obsidian; Vault settings live
+  in \`wiki/.obsidian/\`, and attachments go to \`wiki/attachments/\`.
+- Every concept page starts with YAML frontmatter; \`type\` is required, while
+  \`title\`, \`description\`, \`resource\`, and \`tags\` are recommended.
+- Provenance and trust are optional frontmatter families: \`sources\`,
+  \`generated: { by, at }\`, \`verified\`, \`status\`, \`stale_after\`. \`by\` is an
+  actor: \`human:<id>\`, \`process:<id>\`, or \`<producer>/<version>\`. Generated
+  pages carry \`generated\`; v0.1's bare \`timestamp\` is still read as a fallback.
+- \`index.md\` and \`log.md\` are reserved OKF files. Only the root index may
+  carry frontmatter, where it declares \`okf_version: "0.2"\`.
+- Cross-reference with ordinary markdown links (OKF + Obsidian) or Obsidian
+  \`[[wikilinks]]\`, aliases, heading/block links and embeds; all are understood
+  by the knowledge graph.
+- Relation types: related_to, part_of, uses, depends_on, works_at, authored,
+  mentions, links_to (OKF markdown links).
+`;
 
 const PLAYBOOK = `---
 type: playbook
@@ -38,6 +72,27 @@ slots:
     fill: local
     from: [entity]
 `;
+
+describe('seed files', () => {
+  it('bring an unedited schema.md up to the current template and leave an edited one alone', () => {
+    const fresh = path.join(tmp, 'seeds-fresh');
+    initDataDir(fresh);
+    const current = fs.readFileSync(path.join(fresh, 'schema.md'), 'utf8');
+    expect(current).toContain('wiki/timelines/');
+
+    const old = path.join(tmp, 'seeds-old');
+    write(old, 'schema.md', SCHEMA_2026_09_12.replace(/\n/g, '\r\n'));
+    expect(isSeedTemplate('schema.md', SCHEMA_2026_09_12)).toBe(true);
+    expect(initDataDir(old).upgraded).toEqual(['schema.md']);
+    expect(fs.readFileSync(path.join(old, 'schema.md'), 'utf8')).toBe(current);
+    expect(initDataDir(old).upgraded).toEqual([]);
+
+    const edited = path.join(tmp, 'seeds-edited');
+    write(edited, 'schema.md', `${SCHEMA_2026_09_12}\n- Tickers are written as SH600000.\n`);
+    expect(initDataDir(edited).upgraded).toEqual([]);
+    expect(fs.readFileSync(path.join(edited, 'schema.md'), 'utf8')).toContain('SH600000');
+  });
+});
 
 describe('data layout v3', () => {
   it('refuses a pre-v3 data directory instead of mixing two layouts', async () => {

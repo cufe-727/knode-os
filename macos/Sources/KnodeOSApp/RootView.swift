@@ -62,6 +62,14 @@ private struct MainWorkspaceView: View {
                 try? await Task.sleep(nanoseconds: 15_000_000_000)
             }
         }
+        // notices change slowly — a nightly lint report, a sync — so every five
+        // minutes, and at once when another workspace opens
+        .task(id: "\(model.activeWorkspace?.id ?? "")-\(model.workspaceRevision)") {
+            while !Task.isCancelled {
+                await model.refreshNotices()
+                try? await Task.sleep(nanoseconds: 300_000_000_000)
+            }
+        }
     }
 
     @ViewBuilder
@@ -76,7 +84,7 @@ private struct MainWorkspaceView: View {
         case .entities: EntitiesView()
         case .wiki: WikiView()
         case .dream: DreamView()
-        case .providers, .pipeline, .research, .chat, .workspace: SettingsView()
+        case .providers, .pipeline, .research, .chat, .playbooks, .workspace: SettingsView()
         case .access: AccessView()
         }
     }
@@ -129,6 +137,9 @@ private struct MainWorkspaceView: View {
             sectionTitleItem
         }
         ToolbarItemGroup(placement: .primaryAction) {
+            if !model.notices.isEmpty {
+                NoticesButton()
+            }
             if model.processing != nil {
                 ProcessingButton()
             }

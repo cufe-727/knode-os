@@ -65,9 +65,11 @@ export function assertNotPrivate(rel: string): void {
  * A file or a folder `maxDepth` levels down. A folder past that depth comes
  * back without `children`, so a client can list one level at a time and fetch
  * a folder when it is opened: a whole workspace is tens of thousands of files.
- * `dirsOnly` leaves the files out — the folders a picker offers.
+ * `dirsOnly` leaves the files out — the folders a picker offers. `hide` names
+ * paths left out of every listing below `rel` (the file tree's TREE_HIDDEN);
+ * listing one of them by its own path still works.
  */
-export function listTree(dataDir: string, rel = '.', maxDepth = 8, opts: { dirsOnly?: boolean } = {}): TreeNode {
+export function listTree(dataDir: string, rel = '.', maxDepth = 8, opts: { dirsOnly?: boolean; hide?: ReadonlySet<string> } = {}): TreeNode {
   assertNotPrivate(rel);
   const abs = safePath(dataDir, rel);
   const stat = fs.statSync(abs);
@@ -80,7 +82,10 @@ export function listTree(dataDir: string, rel = '.', maxDepth = 8, opts: { dirsO
   if (maxDepth <= 0) return node;
   const children: TreeNode[] = (node.children = []);
   const entries = fs.readdirSync(abs, { withFileTypes: true })
-    .filter((e) => !HIDDEN.has(e.name) && !e.name.startsWith('.') && !isPrivatePath(relPosix ? `${relPosix}/${e.name}` : e.name))
+    .filter((e) => {
+      const childRel = relPosix ? `${relPosix}/${e.name}` : e.name;
+      return !HIDDEN.has(e.name) && !e.name.startsWith('.') && !isPrivatePath(childRel) && !opts.hide?.has(childRel);
+    })
     .sort((a, b) => (a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1));
   for (const e of entries) {
     const childRel = relPosix ? `${relPosix}/${e.name}` : e.name;
@@ -187,6 +192,13 @@ const WRITABLE_ROOTS = ['wiki', RAW_DOCS, PACKS_DIR];
 const WRITABLE_ROOTS_RE = new RegExp(`^(${WRITABLE_ROOTS.map((r) => r.replace(/\//g, '\\/')).join('|')})(\\/|$)`);
 /** Root-level files an agent may (re)write: the knowledge-base guide and its Claude Code copy. Never sources. */
 export const ROOT_WRITABLE_FILES = new Set(['AGENTS.md', 'CLAUDE.md']);
+/**
+ * Root-level files a person edits from the app and an agent never rewrites:
+ * what the workspace is for and the rules its wiki follows steer every
+ * generator, so they stay the owner's word. The HTTP file API takes them; MCP
+ * does not. Never sources.
+ */
+export const OWNER_ROOT_FILES = new Set(['purpose.md', 'schema.md']);
 
 /**
  * The canonical form of a data-dir-relative path: posix separators, no leading
@@ -205,6 +217,10 @@ export function cleanRelPath(rel: string): string {
 
 export function isRootWritableFile(rel: string): boolean {
   return ROOT_WRITABLE_FILES.has(cleanRelPath(rel));
+}
+
+export function isOwnerRootFile(rel: string): boolean {
+  return OWNER_ROOT_FILES.has(cleanRelPath(rel));
 }
 
 /** The sidecar tree is system-owned: no external write may land there, whatever root it is under; nor in a private path. */

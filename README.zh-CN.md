@@ -70,7 +70,7 @@ node dist/cli.js user add admin --admin --data ~/knode-data
 │   ├── attachments/      # Obsidian 附件
 │   ├── index.md  overview.md  log.md
 │   ├── entities/  concepts/  sources/  dreams/  datasets/
-├── playbooks/          # agent 可编辑的配置
+├── playbooks/          # agent 可编辑的配置（在 设置 → Playbooks 里编辑）
 │   ├── packs/          # context-pack playbook(由学习闭环修订)
 │   ├── capabilities/   # 对实时数据源能力的语义注释
 │   └── intents/        # intent 规格:一个答案需要哪些槽位
@@ -243,7 +243,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
 四个一级区，每区自带二级 tab。
 
 - **Library / 资料** —— 盒子里有什么
-  - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown);**＋ add → Import / Link folder from this Mac** 按路径把本机一个文件夹整体带入并保留目录结构——一次性复制,或"链接"后由 `serve` 持续同步原文件夹的变化(树里带 🔗 标记,只读);打开 `raw/docs` 下的文件时，顶部列出引用它的 wiki 页面(**cited by**:来自它们的 `[[raw/docs/…]]` 与 Markdown 链接、`sources:`(derived from)以及 `tested_by` 等 `relations:`，[写法见此](docs/frontmatter-contract.zh-CN.md))
+  - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown);**＋ add → Import / Link folder from this Mac** 按路径把本机一个文件夹整体带入并保留目录结构——一次性复制,或"链接"后由 `serve` 持续同步原文件夹的变化(树里带 🔗 标记,只读);打开 `raw/docs` 下的文件时，顶部列出引用它的 wiki 页面(**cited by**:来自它们的 `[[raw/docs/…]]` 与 Markdown 链接、`sources:`(derived from)以及 `tested_by` 等 `relations:`，[写法见此](docs/frontmatter-contract.zh-CN.md))；目录树不列系统目录——`ledger/`、`playbooks/`（在 **设置 → Playbooks** 里编辑），以及 `wiki/lint/` 和 `wiki/datasets/`（它们的消息改由通知送达）——并在 knode-os 建的每个目录旁写明它的用途；`purpose.md` 和 `schema.md` 可在这里直接编辑，agent 不会改写它们
   - **Search / 检索** —— hybrid/vector/keyword 检索,展示分数构成;可限定在「文件」里选中的目录
   - **Traces / 轨迹** —— 已收集的 agent 会话;点一行即可打开 `raw/traces/` 下对应的镜像文件
 - **Research / 研究** —— 研究课题:一个主题研究成几页
@@ -254,12 +254,14 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
   - **Graph / 图谱** —— 力导向图谱浏览 + 洞察(枢纽/孤立节点/类型分布)
   - **Wiki** —— 一个按钮完成知识库初始化(通读 → 总览页 + AGENTS.md 指南 + 排队的主题页),并在此发起与审阅深度研究页
   - **Dream / 夜间分析** —— 手动触发 dream,审阅并接受/拒绝建议
-- **Settings / 设置** —— **Providers & Agents**（每个模型端点与密钥只配一次，embedding 与 LLM 同在一张表——`llmUse` 标出哪个 LLM 是默认，所有没有自己指定 provider 的任务都跟着它走；下面第二张表是 agent：跑在这些模型之一上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI（Claude Code / Codex / Cursor）。CLI 是 agent 而不是模型）、**Ingest / 预处理**（独立的 Entity / Concept / 文档视觉阶段路由，每个阶段写明自己跑在哪个模型或 agent 上——任一 agent 都按单次调用使用，阶段不再跟随默认；保存后按需重建 embedding 或刷新转换）、**Research / 研究**、**Ask / 问答**（由哪个 agent 回答、每次回复带上最近几条消息、保留多少个对话）、**Workspace**。中间三页按知识在工作区里的流向排列：进来先预处理，再研究成 wiki，最后用来回答问题
+- **Settings / 设置** —— **Providers & Agents**（每个模型端点与密钥只配一次，embedding 与 LLM 同在一张表——`llmUse` 标出哪个 LLM 是默认，所有没有自己指定 provider 的任务都跟着它走；下面第二张表是 agent：跑在这些模型之一上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI（Claude Code / Codex / Cursor）。CLI 是 agent 而不是模型）、**Ingest / 预处理**（独立的 Entity / Concept / 文档视觉阶段路由，每个阶段写明自己跑在哪个模型或 agent 上——任一 agent 都按单次调用使用，阶段不再跟随默认；保存后按需重建 embedding 或刷新转换）、**Research / 研究**、**Ask / 问答**（由哪个 agent 回答、每次回复带上最近几条消息、保留多少个对话）、**Playbooks**（`playbooks/` 下的文件，按 knode-os 读取它们的方式分组——研究模版与阶段提示词、context pack、intent、本体包、概念停用词表、能力说明、Ask 的协议与每轮提示词——每个文件都能编辑、撤销，或重置为 knode-os 自带的版本，保存前会检查 YAML 与模版；agent、研究 profile 与研究来源指向编辑它们的页面）、**Workspace**。中间三页按知识在工作区里的流向排列：进来先预处理，再研究成 wiki，最后用来回答问题
+
+**通知**（页头的 ⚑）告诉你工作区需要你做什么，每条带一个对应操作：最近一次 wiki 检查（按类别的问题数、与上一份报告相比的变化，**Open report**）、上次同步失败的数据源（**Retry**）、仍在等你同意的 trace 采集（**Collect traces**，会说明要复制多少个会话）、仍是模版的 `purpose.md`（**Edit purpose.md**），以及从未初始化的 wiki（**Go to Initialize**）。关掉的通知在内容变化后会再次出现。
 
 ## REST API
 
-`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/tree[?path&depth&dirs] · /api/file · /api/file/citations?path · /api/search · /api/graph[?limit&types&edges] · /api/graph/insights · /api/entities[?q&type&sort&order&offset&limit&merged] · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
-`PUT /api/config` · `PUT /api/file` · `DELETE /api/file` · `POST /api/config/test | /api/upload | /api/ingest | /api/ask | /api/mv | /api/mkdir | /api/traces/sync | /api/dream | /api/wiki/generate | /api/suggestions/:id/status`
+`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/notices · /api/playbooks · /api/playbooks/file?path · /api/tree[?path&depth&dirs] · /api/file · /api/file/citations?path · /api/search · /api/graph[?limit&types&edges] · /api/graph/insights · /api/entities[?q&type&sort&order&offset&limit&merged] · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
+`PUT /api/config` · `PUT /api/file` · `PUT /api/playbooks/file` · `DELETE /api/playbooks/file`（重置为自带版本） · `DELETE /api/file` · `POST /api/config/test | /api/upload | /api/ingest | /api/ask | /api/mv | /api/mkdir | /api/traces/sync | /api/dream | /api/wiki/generate | /api/suggestions/:id/status`
 
 每个接口都需要登录会话——已登录浏览器的 cookie,或 `Authorization: Bearer knu_…`(应用的,或 `knode-os user token` 签发给脚本的)——以及该接口所属 API 分组的权限;登录本身在 `/api/auth/*` 下([docs/remote-access.md](docs/remote-access.md))。Workspace 范围内的数据 API 另需请求头 `X-Knode-Workspace-Kind`（`personal` 或 `team`）、`X-Knode-Workspace-ID` 和 `X-Knode-Workspace-Name`；Workspace 的主人就是已登录的账号(只有关闭登录时才看 `X-Knode-User`)。`DELETE /api/workspace` 会彻底清空所选 Workspace。
 
@@ -272,7 +274,7 @@ pnpm typecheck && pnpm test            # tsc + vitest
 
 ## 安全说明
 
-服务只绑定 `127.0.0.1`，并要求每个客户端登录——浏览器、应用和脚本，本机也不例外(`src/auth`)：密码用 scrypt 哈希，会话只存哈希，登录按地址和用户名限速，浏览器的写操作有 CSRF 防护。来自其他机器的请求必须走 HTTPS(经隧道,或 `server.tls` 监听)，且只能使用账号允许从外部使用的 API 分组；`/mcp` 只对本机开放；`serve` 拒绝在其他机器能以明文 HTTP 访问的地址上监听。成员不能修改设置，只能打开自己的 Workspace 和分配给他们的 Team——但 Ask 与 Research 会在服务所在的机器上运行编码 agent，只开放给你信得过的人。远程标注工作者在 `/remote/v1` 上使用每台机器各自的 token(哈希存储、按 workspace 与能力限定、限速、留审计日志)，详见 [docs/remote-access.md](docs/remote-access.md) 与 [docs/remote-labeling.md](docs/remote-labeling.md)。API key 支持 `env:VAR` 引用，配置文件可不落盘密钥。文件 API 被限制在当前 Workspace 目录内（防路径穿越）；写入、移动和删除操作（HTTP 与 MCP 一致）仅限 `wiki/`、`raw/docs/` 与 `playbooks/packs/`，且永远不会落到系统专有的 `.sidecar/` 目录。对已配置数据源的原生 SQL 由数据库本身保证只读，而不只靠文本检查：守卫按数据源自己的词法规则读语句（MySQL 用 MySQL 的，TimescaleDB 与 DuckDB 用 PostgreSQL 的），先行拒绝——只允许一条语句、以 SELECT/SHOW/DESCRIBE/EXPLAIN/WITH 开头、不含写关键字；连接器随后让它单独执行，放在一个总会回滚的只读事务里，带语句超时，返回行数有上限；DuckDB 数据源只能读取自己视图背后的文件。即便如此，仍请给 knode-os 配只读的数据库账号：能伸到事务之外的东西（dblink、服务器上的文件）只受数据库用户权限的约束；在 MariaDB 上，一条语句还能自行解除只读（`SET STATEMENT … FOR`、`BEGIN NOT ATOMIC … END`），这只有守卫会拒绝。
+服务只绑定 `127.0.0.1`，并要求每个客户端登录——浏览器、应用和脚本，本机也不例外(`src/auth`)：密码用 scrypt 哈希，会话只存哈希，登录按地址和用户名限速，浏览器的写操作有 CSRF 防护。来自其他机器的请求必须走 HTTPS(经隧道,或 `server.tls` 监听)，且只能使用账号允许从外部使用的 API 分组；`/mcp` 只对本机开放；`serve` 拒绝在其他机器能以明文 HTTP 访问的地址上监听。成员不能修改设置，只能打开自己的 Workspace 和分配给他们的 Team——但 Ask 与 Research 会在服务所在的机器上运行编码 agent，只开放给你信得过的人。远程标注工作者在 `/remote/v1` 上使用每台机器各自的 token(哈希存储、按 workspace 与能力限定、限速、留审计日志)，详见 [docs/remote-access.md](docs/remote-access.md) 与 [docs/remote-labeling.md](docs/remote-labeling.md)。API key 支持 `env:VAR` 引用，配置文件可不落盘密钥。文件 API 被限制在当前 Workspace 目录内（防路径穿越）；写入、移动和删除操作（HTTP 与 MCP 一致）仅限 `wiki/`、`raw/docs/` 与 `playbooks/packs/`（另外 `purpose.md` 和 `schema.md` 只能经 HTTP 写，其余 playbook 只能由管理员在设置里写），且永远不会落到系统专有的 `.sidecar/` 目录。对已配置数据源的原生 SQL 由数据库本身保证只读，而不只靠文本检查：守卫按数据源自己的词法规则读语句（MySQL 用 MySQL 的，TimescaleDB 与 DuckDB 用 PostgreSQL 的），先行拒绝——只允许一条语句、以 SELECT/SHOW/DESCRIBE/EXPLAIN/WITH 开头、不含写关键字；连接器随后让它单独执行，放在一个总会回滚的只读事务里，带语句超时，返回行数有上限；DuckDB 数据源只能读取自己视图背后的文件。即便如此，仍请给 knode-os 配只读的数据库账号：能伸到事务之外的东西（dblink、服务器上的文件）只受数据库用户权限的约束；在 MariaDB 上，一条语句还能自行解除只读（`SET STATEMENT … FOR`、`BEGIN NOT ATOMIC … END`），这只有守卫会拒绝。
 
 ## License
 

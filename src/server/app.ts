@@ -45,8 +45,9 @@ import {
   saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS, ExtractionWorkerConfig } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
-import { assertNotPrivate, assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isPrivatePath, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
-import { hasSidecarSegment, SIDECAR_ROOT } from '../fs/layout.js';
+import { assertNotPrivate, assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, isOwnerRootFile, isPrivatePath, isRootWritableFile, listTree, makeDir, movePath, pathExists, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
+import { FOLDER_ABOUT, hasSidecarSegment, SIDECAR_ROOT, TREE_HIDDEN } from '../fs/layout.js';
+import { listPlaybooks, readPlaybook, resetPlaybook, savePlaybook } from '../fs/playbooks.js';
 import { moveSidecar } from '../fs/sidecar.js';
 import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
 import {
@@ -145,6 +146,7 @@ import { deleteResearchSource, loadResearchSources, redactSource, RESEARCH_SOURC
 import { cancelStudy, createStudy, deleteStudyDraft, listStudies, promoteStudy, refineStudyInBackground, refiningSince, startProblem, startStudy, StudyFiles, studyView, updateStudy, studyPayload } from '../research/study.js';
 import { webSearchEnabled, WEB_SEARCH_PROVIDERS } from '../research/web.js';
 import { lintWiki } from '../wiki/lint.js';
+import { listNotices } from './notices.js';
 
 /**
  * What Ask cannot answer without. Both are states a person fixes in Settings,
@@ -1022,6 +1024,16 @@ export function createApp(
     }
   });
 
+  // what a person should know about the workspace, as data each client words itself (src/server/notices.ts)
+  app.get('/api/notices', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      return c.json({ notices: await listNotices(ctx) });
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
+  });
+
   /* ------------------------------- files -------------------------------- */
 
   app.get('/api/tree', (c) => {
@@ -1032,19 +1044,21 @@ export function createApp(
       const depthArg = c.req.query('depth');
       const depth = depthArg === undefined ? undefined : Number(depthArg);
       if (depth !== undefined && !(Number.isInteger(depth) && depth >= 1)) return c.json({ error: 'depth must be a whole number of levels, 1 or more' }, 400);
-      const tree = listTree(ctx.dataDir, c.req.query('path') ?? '.', depth, { dirsOnly: ['1', 'true'].includes(c.req.query('dirs') ?? '') });
+      // the tree is for knowledge: system folders stay out of it (TREE_HIDDEN)
+      const tree = listTree(ctx.dataDir, c.req.query('path') ?? '.', depth, { dirsOnly: ['1', 'true'].includes(c.req.query('dirs') ?? ''), hide: TREE_HIDDEN });
       // the mirror of a linked folder says where it comes from, so a client can
       // mark it and keep edits off it (the routes refuse them anyway); the list
-      // rides along for files under a mirror whose folder was never listed
+      // rides along for files under a mirror whose folder was never listed. A
+      // folder knode-os makes says what it is for.
       const links = linkedFolders(ctx.config);
-      if (links.length) {
-        const mark = (node: typeof tree): void => {
-          const link = links.find((l) => l.dest === node.path);
-          if (link) (node as typeof tree & { linked?: string }).linked = link.source;
-          for (const child of node.children ?? []) mark(child);
-        };
-        mark(tree);
-      }
+      const mark = (node: typeof tree): void => {
+        const marked = node as typeof tree & { linked?: string; about?: string };
+        const link = links.find((l) => l.dest === node.path);
+        if (link) marked.linked = link.source;
+        if (node.kind === 'dir' && FOLDER_ABOUT[node.path]) marked.about = FOLDER_ABOUT[node.path];
+        for (const child of node.children ?? []) mark(child);
+      };
+      mark(tree);
       return c.json({ ...tree, links: links.map((l) => ({ path: l.dest, source: l.source })) });
     } catch (e) {
       return c.json(err(e), 400);
@@ -1119,7 +1133,8 @@ export function createApp(
     try {
       const { path: p, content } = await c.req.json<{ path: string; content: string }>();
       if (!p || typeof content !== 'string') return c.json({ error: 'path and content required' }, 400);
-      assertWritablePath(p);
+      // purpose.md and schema.md are the owner's to edit here, never an agent's (OWNER_ROOT_FILES)
+      if (!isOwnerRootFile(p)) assertWritablePath(p);
       assertNotConvertedOriginal(p);
       assertNotLinked(ctx.config, p, 'write to');
       writeFileText(ctx.dataDir, p, content);
@@ -2599,6 +2614,42 @@ export function createApp(
       const body = (await c.req.json().catch(() => ({}))) as { text?: string };
       if (typeof body.text !== 'string' || !body.text.trim()) return c.json({ error: 'text is required' }, 400);
       return c.json({ path: saveChatProtocol(ctx.dataDir, body.text), text: loadChatProtocol(ctx.dataDir) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  /* ------------------------------ playbooks ----------------------------- */
+
+  // playbooks/ for Settings, which edits what the file tree no longer shows (src/fs/playbooks.ts)
+  app.get('/api/playbooks', (c) => c.json({ groups: listPlaybooks(requestCtx(c).dataDir) }));
+
+  app.get('/api/playbooks/file', (c) => {
+    const p = c.req.query('path');
+    if (!p) return c.json({ error: 'path required' }, 400);
+    try {
+      return c.json(readPlaybook(requestCtx(c).dataDir, p));
+    } catch (e) {
+      return c.json(err(e), 404);
+    }
+  });
+
+  app.put('/api/playbooks/file', async (c) => {
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { path?: string; text?: string };
+      if (!body.path || typeof body.text !== 'string') return c.json({ error: 'path and text required' }, 400);
+      return c.json(savePlaybook(requestCtx(c).dataDir, body.path, body.text));
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // a delete is a reset: the built-in version goes back in place of the edited one
+  app.delete('/api/playbooks/file', (c) => {
+    const p = c.req.query('path');
+    if (!p) return c.json({ error: 'path required' }, 400);
+    try {
+      return c.json(resetPlaybook(requestCtx(c).dataDir, p));
     } catch (e) {
       return c.json(err(e), 400);
     }
