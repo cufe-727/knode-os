@@ -3452,7 +3452,8 @@ let playbook = null;
 
 const mayChangeSettings = () => authDisabled || serverAuth?.groups?.settings === true;
 const playbookDirty = () => Boolean(playbook) && $('#pb-text').value !== playbook.text;
-const playbookTags = (file) => (file.readonly ? '<span class="tag">generated</span>' : file.modified ? '<span class="tag">edited</span>' : '');
+// `modified` is "not what knode-os ships now": an edit, or a copy seeded from an older version
+const playbookTags = (file) => (file.readonly ? '<span class="tag">generated</span>' : file.modified ? '<span class="tag">differs</span>' : '');
 
 async function loadPlaybooks() {
   try {
@@ -3501,7 +3502,7 @@ function paintPlaybook(file) {
     : mayChangeSettings() ? '' : "Read-only: settings are an administrator's.";
   text.readOnly = !file || Boolean(why);
   $('#pb-path').textContent = file?.path ?? 'No playbook open';
-  $('#pb-tags').innerHTML = file ? (file.builtin ? (file.modified ? '<span class="tag">edited</span>' : '<span class="tag">built-in</span>') : '') + (file.readonly ? '<span class="tag">generated</span>' : '') : '';
+  $('#pb-tags').innerHTML = file ? (file.builtin ? (file.modified ? '<span class="tag">differs from built-in</span>' : '<span class="tag">built-in</span>') : '') + (file.readonly ? '<span class="tag">generated</span>' : '') : '';
   $('#pb-note').hidden = !why;
   $('#pb-note').textContent = why;
   $('#pb-reset').hidden = !(file?.builtin && file.modified) || text.readOnly;
@@ -3554,7 +3555,7 @@ $('#pb-save').addEventListener('click', async () => {
 $('#pb-revert').addEventListener('click', () => paintPlaybook(playbook));
 
 $('#pb-reset').addEventListener('click', async () => {
-  if (!playbook || !confirm(`Put back the version of ${playbook.name} that knode-os ships? Your edits to it are lost.`)) return;
+  if (!playbook || !confirm(`Put back the version of ${playbook.name} that knode-os ships? What the file holds now is lost.`)) return;
   try {
     playbookSaved(await api(`/api/playbooks/file?path=${encodeURIComponent(playbook.path)}`, { method: 'DELETE' }), 'reset to the built-in version');
   } catch (e) {
