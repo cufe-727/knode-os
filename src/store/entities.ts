@@ -80,6 +80,7 @@ export function extractorFamily(extractor: string): string {
   if (extractor === 'tier0.link') return 'link';
   if (extractor === 'tier0.wikilink') return 'wikilink';
   if (extractor === 'tier0.frontmatter') return 'frontmatter';
+  if (extractor === 'tier0.mindmap') return 'mindmap';
   if (extractor.startsWith('tier1.llm')) return 'llm';
   if (extractor === 'human' || extractor === 'datasource') return extractor;
   if (extractor.startsWith('probe.')) return 'probe';

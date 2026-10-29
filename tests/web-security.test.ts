@@ -149,9 +149,9 @@ describe('the page policy', () => {
     expect(html).not.toMatch(/\sstyle\s*=/i);
     expect(html).not.toMatch(/\son[a-z]+\s*=/i);
     expect(html).not.toMatch(/javascript:/i);
-    // the renderer loads after marked and before the app that calls it
+    // the renderers load after marked and before the app that calls them; markdown.js finds chart.js and mindmap.js loaded
     const order = [...html.matchAll(/<script src="([^"]+)"/g)].map((m) => m[1]);
-    expect(order).toEqual(['/vendor/marked.js', '/chart.js', '/markdown.js', '/vendor/d3.js', '/graph.js', '/deeplink.js', '/app.js']);
+    expect(order).toEqual(['/vendor/marked.js', '/chart.js', '/mindmap.js', '/markdown.js', '/vendor/d3.js', '/graph.js', '/deeplink.js', '/app.js']);
     const app = fs.readFileSync(path.join(webDir, 'app.js'), 'utf8');
     expect(app).not.toMatch(/\sstyle="|\son(click|error|load|change|input)="/);
   });

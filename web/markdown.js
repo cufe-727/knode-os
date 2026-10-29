@@ -393,6 +393,9 @@
     function render(text, opts = {}) {
       const src = String(text ?? '');
       const fm = FRONTMATTER_RE.exec(src);
+      // a `type: MindMap` page is an outline web/mindmap.js draws as its tree; one that holds no tree reads as text
+      const map = fm && global.knodeMindmap?.isMindMapYaml(fm[1]) ? global.knodeMindmap.render(src.slice(fm[0].length)) : null;
+      if (map) return frontmatterHtml(fm[1], Boolean(opts.metadataOpen)) + map;
       const tokens = md.lexer(fm ? src.slice(fm[0].length) : src);
       notes = collectNotes(md, tokens);
       try {

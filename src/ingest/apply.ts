@@ -28,6 +28,8 @@ import { chunkText } from './chunker.js';
 import { docDateOf } from './docdate.js';
 import { detectLanguage } from '../lang/detect.js';
 import { estimateTokens } from '../llm/tokens.js';
+import { MindMapPlan, planDocumentMindMap, wireMindMap } from '../mindmap/graph.js';
+import { isMindMapFrontmatter, mindMapChunks, parseMindMap } from '../mindmap/outline.js';
 import type { DeferredEmbeddings } from '../context.js';
 import { EmbeddingProvider } from './embeddings.js';
 import { loadSourceText, sha256 } from './source.js';
@@ -172,7 +174,11 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   // plugin hooks (docs/design/11) may reshape the chunks and the tier-0 terms
   // here, before anything is written; the scope body below stays pure writes
   const registry = pluginRegistry();
-  let pieces = await chunkText(file, parsed.body, config.ingest, { markdown: source.derived || undefined });
+  // a mind map is cut along its branches, each piece under the path it hangs from (docs/design/19)
+  const mindMap = isMindMapFrontmatter(parsed.frontmatter) ? parseMindMap(parsed.body) : null;
+  let pieces = mindMap
+    ? mindMapChunks(mindMap, config.ingest.chunkSize).map((content) => ({ content, tokenCount: estimateTokens(content) }))
+    : await chunkText(file, parsed.body, config.ingest, { markdown: source.derived || undefined });
   if (registry.hasHandlers('chunk')) {
     pieces = (await registry.filter('chunk', pieces, {
       path: file, root, dataDir: store.dataDir, text: parsed.body,
@@ -231,6 +237,10 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     const filtered = await registry.filter('tier0.concepts', tier0.concepts, { path: file, root, dataDir: store.dataDir, text: parsed.body, frontmatter: parsed.frontmatter });
     tier0.concepts = [...new Set((Array.isArray(filtered) ? filtered : []).filter((c) => typeof c === 'string').map((c) => c.trim()).filter(Boolean))];
   }
+  // what the map's tree says about the entities its nodes name; a wiki page's own entity is its root
+  const mindMapPlan: MindMapPlan | null = mindMap && isSource && cls.graph && (root === 'docs' || root === 'wiki')
+    ? await planDocumentMindMap(store, mindMap, parsed.frontmatter, wirePlan?.self ?? null)
+    : null;
   const capabilityNotes = root === 'capabilities' ? parseCapabilityNotes(parsed) : [];
   // Trust follows the *document's* origin, not whoever happened to run this
   // sync. A note an agent wrote stays agent-written; sync is a mechanical
@@ -304,6 +314,10 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
         const cg = await wireConcepts(w, page, tier0?.concepts ?? []);
         g = { entities: g.entities + lg.entities + cg.entities, relations: g.relations };
         if (queueTier1) await w.enqueueTier1(docId, segmentText(raw, config.extraction.segmentChars).length);
+      }
+      if (mindMapPlan) {
+        const mg = await wireMindMap(w, page, mindMapPlan);
+        g = { entities: g.entities + mg.entities, relations: g.relations + mg.relations };
       }
       // a capabilities/*.md file is an ordinary source *and* the semantic layer
       // over the capabilities it names: both halves belong to this one scope,
