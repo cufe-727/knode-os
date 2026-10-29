@@ -28,7 +28,7 @@ import { chunkText } from './chunker.js';
 import { docDateOf } from './docdate.js';
 import { detectLanguage } from '../lang/detect.js';
 import { estimateTokens } from '../llm/tokens.js';
-import { MindMapPlan, planDocumentMindMap, wireMindMap } from '../mindmap/graph.js';
+import { MINDMAP_PLAN_VERSION, MindMapPlan, planDocumentMindMap, wireMindMap, withMindMapSubject } from '../mindmap/graph.js';
 import { isMindMapFrontmatter, mindMapChunks, parseMindMap } from '../mindmap/outline.js';
 import type { DeferredEmbeddings } from '../context.js';
 import { EmbeddingProvider } from './embeddings.js';
@@ -146,7 +146,9 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const citationsStale = root === 'wiki' && live !== null && live.sha === sha && sameModel
     && live.meta.citations !== CITATIONS_VERSION && live.meta.kind !== 'view'
     && !isReservedWikiFile(file) && raw.includes('raw/docs/');
-  if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale) {
+  // a mind map applied by an older planner is read again once (docs/design/19)
+  const mindMapStale = live !== null && live.sha === sha && sameModel && live.meta.mindmap !== MINDMAP_PLAN_VERSION && looksLikeMindMap(raw);
+  if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale && !mindMapStale) {
     // a sidecar may have gained a replayable tier-1 extraction since (copied
     // from another machine, or written by a bench run) — apply it as the
     // document's child scope without re-indexing the document itself
@@ -216,7 +218,8 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   // frontmatter (research pages do), its own entity the default subject. On a
   // wiki page a relation naming a raw/docs file is a citation instead, which
   // needs no entity of the page's own
-  const fm = parsed.frontmatter;
+  // a mind map's subject is declared with its type wherever the document names it
+  const fm = mindMap ? withMindMapSubject(parsed.frontmatter, loadOntology(store.dataDir)) : parsed.frontmatter;
   const declaredWiki = wirePlan && (wirePlan.self || root === 'wiki') && (fm.relations || fm.claims || fm.entities)
     ? frontmatterExtraction(
       { relations: fm.relations, claims: fm.claims, entities: fm.entities },
@@ -228,7 +231,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     const typed = declaredWiki.citations.map((d) => ({ ...relationCitation(ontology, d), chunkId: null }));
     wirePlan.citations = dedupeCitations([...wirePlan.citations, ...typed]);
   }
-  const declared = root === 'docs' && isSource ? frontmatterExtraction(parsed.frontmatter) : null;
+  const declared = root === 'docs' && isSource ? frontmatterExtraction(fm) : null;
   // tier-0 links what the graph already knows and mines the rest; both are
   // planned here (two reads) so the scope body only writes
   const tier0: Tier0Plan | null = root === 'docs' && isSource ? await planTier0(store, parsed, title) : null;
@@ -278,11 +281,15 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     {
       actor,
       at: opts.at,
-      force: Boolean(live && (!sameModel || opts.reapply || citationsStale)),
+      force: Boolean(live && (!sameModel || opts.reapply || citationsStale || mindMapStale)),
       keepProjectionOnReplace: true,
       trust,
       acl: declaredAcl,
-      meta: { documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title, ...(root === 'wiki' ? { citations: CITATIONS_VERSION } : {}) },
+      meta: {
+        documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title,
+        ...(root === 'wiki' ? { citations: CITATIONS_VERSION } : {}),
+        ...(mindMapPlan ? { mindmap: MINDMAP_PLAN_VERSION } : {}),
+      },
     },
     async (w) => {
       // counted afresh on every run: a transaction rolled back for a deadlock runs the body again
@@ -394,6 +401,17 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
 }
 
 /** Grounding ranges for a segmented tier-1 result (see applyExtraction). */
+/**
+ * A mind map, judged from its frontmatter alone: every unchanged document a
+ * sync visits is asked, so the YAML is parsed only when a `type:` line in it
+ * names a mind map.
+ */
+function looksLikeMindMap(raw: string): boolean {
+  if (!raw.startsWith('---')) return false;
+  const end = raw.indexOf('\n---', 3);
+  return /^type:[ \t]*["']?mind[\s_-]*map/im.test(raw.slice(0, end < 0 ? 4_000 : end)) && isMindMapFrontmatter(parseFrontmatter(raw).frontmatter);
+}
+
 function tier1Segments(text: string, tier1: SidecarTier1): { text: string; ranges: { start: number; end: number }[] } | undefined {
   const ranges = segmentRangesOf(tier1);
   return ranges ? { text, ranges } : undefined;

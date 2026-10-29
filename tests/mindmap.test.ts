@@ -13,7 +13,7 @@ import { originalOfTranscript, transcriptPathFor, transcriptToMarkdown } from '.
 import { prepareDocs } from '../src/ingest/prepare.js';
 import { runIngest } from '../src/ingest/pipeline.js';
 import { sync } from '../src/ingest/sync.js';
-import { edgeFor, NodeEntity, planMindMapGraph } from '../src/mindmap/graph.js';
+import { edgeFor, MINDMAP_PLAN_VERSION, NodeEntity, planMindMapGraph } from '../src/mindmap/graph.js';
 import { escapeLabel, isMindMapFrontmatter, labelParts, mindMapChunks, parseMindMap, serializeMindMap, walkMindMap } from '../src/mindmap/outline.js';
 
 /**
@@ -169,6 +169,7 @@ describe('what a map tells the graph', () => {
       华为智驾: { id: 'e-adas', name: '华为智驾', type: 'technology' },
       整车: { id: 'e-auto', name: '整车', type: 'sector' },
       赛力斯: { id: 'e-seres', name: '赛力斯', type: 'organization' },
+      永贵电器: { id: 'e-yonggui', name: '永贵电器', type: 'organization' },
     };
     const subject: NodeEntity = { id: null, name: '华为产业链', type: 'theme' };
     const edges = planMindMapGraph(parseMindMap(HUAWEI)!, (name) => named[name] ?? null, { subject, ontology }).edges
@@ -178,6 +179,8 @@ describe('what a map tells the graph', () => {
       // 整车 —part_of→ 华为智驾 would be true of this map only
       ['赛力斯', 'belongs_to_sector', '整车'],
       ['赛力斯', 'belongs_to_sector', '华为产业链'],
+      // under 液冷超充, which names nothing: nothing said about 华为智驾, only the subject
+      ['永贵电器', 'belongs_to_sector', '华为产业链'],
     ]);
   });
 });
@@ -250,6 +253,8 @@ describe('a reviewed transcript beside its picture', () => {
       '  - { name: 乙公司, type: organization }',
       '  - { name: 液冷, type: sector }',
       '  - { name: 星光一号, type: product }',
+      'relations:',
+      '  - { source: 测试产业链, target: 测试集团, type: related_to }',
       '---',
       '# 测试',
       '',
@@ -264,7 +269,8 @@ describe('a reviewed transcript beside its picture', () => {
 
     // what the graph knew before the map: 丁公司 by its name, and a merge that left 上游 as an alias of 丙集团
     // and 下游, a word some extraction typed as a company
-    fs.writeFileSync(path.join(dir, 'raw/docs/seed.md'), '---\nentities:\n  - { name: 丁公司, type: organization }\n  - { name: 丙集团, type: organization, aliases: [上游] }\n  - { name: 下游, type: organization }\n---\n丁公司与丙集团。\n');
+    // and 测试产业链, an alias some merge gave a company (as 华为产业链 is one of 华为's in finance)
+    fs.writeFileSync(path.join(dir, 'raw/docs/seed.md'), '---\nentities:\n  - { name: 丁公司, type: organization }\n  - { name: 丙集团, type: organization, aliases: [上游] }\n  - { name: 下游, type: organization }\n  - { name: 测试集团, type: organization, aliases: [测试产业链] }\n---\n丁公司与丙集团。\n');
     const pictures = ['chain.png', 'chain.png.md'].map((f) => path.join(dir, 'raw/docs/maps', f));
     const held = pictures.map((p) => [p, fs.readFileSync(p)] as const);
     for (const p of pictures) fs.rmSync(p);
@@ -301,6 +307,21 @@ describe('a reviewed transcript beside its picture', () => {
       ]));
       // known only through an alias: the branch 上游 is no 丙集团; a two-character company name is not trusted either
       expect((await edges()).filter(([s, , t]) => ['丙集团', '下游'].includes(s) || ['丙集团', '下游'].includes(t))).toEqual([]);
+      // the subject keeps its type wherever the document names it: the company with its name as an alias does not capture it
+      expect(await edges()).toEqual(expect.arrayContaining([['测试产业链', 'related_to', '测试集团']]));
+      expect((await edges()).filter(([, type, t]) => t === '测试集团' && type !== 'related_to')).toEqual([]);
+
+      // a map applied by an older planner is read again once, though its text is the same
+      const scopeOf = async () => (await ctx.store.query<{ id: string; meta: { mindmap?: number } }>(
+        `SELECT id, meta FROM scopes WHERE kind = 'doc' AND key = 'raw/docs/maps/chain.png' AND status = 'active' AND parent_id IS NULL`,
+      ))[0];
+      const before = await scopeOf();
+      expect(before.meta.mindmap).toBe(MINDMAP_PLAN_VERSION);
+      await ctx.store.query(`UPDATE scopes SET meta = jsonb_set(meta, '{mindmap}', '1') WHERE id = $1`, [before.id]);
+      const resync = () => sync({ dataDir: dir, config: ctx.config, store: ctx.store, embedder: ctx.embedder, llm: ctx.llm }, { only: ['raw/docs/maps/chain.png'], llmGraph: false, datasources: false });
+      expect((await resync()).applied).toBe(1);
+      expect((await scopeOf()).meta.mindmap).toBe(MINDMAP_PLAN_VERSION);
+      expect((await resync()).applied).toBe(0);
       const [evidence] = await ctx.store.query<{ n: number }>(`SELECT count(*)::int AS n FROM evidence WHERE extractor = 'tier0.mindmap' AND tx_to IS NULL`);
       expect(evidence.n).toBeGreaterThan(0);
 
