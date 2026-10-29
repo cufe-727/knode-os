@@ -312,6 +312,17 @@ describe('a reviewed transcript beside its picture', () => {
       );
       expect(after.map((c) => c.content).join('\n')).toContain('丙公司');
       expect(await edges()).toEqual(expect.arrayContaining([['乙公司', 'belongs_to_sector', '测试产业链']]));
+
+      // a transcript that arrives before its picture is a document of its own, until the picture comes
+      const solo = path.join(dir, 'raw/docs/maps/later.png.md');
+      fs.writeFileSync(solo, '---\ntype: MindMap\n---\n# 后来\n\n- 一\n');
+      const scoped = (only: string) => sync({ dataDir: dir, config: ctx.config, store: ctx.store, embedder: ctx.embedder, llm: ctx.llm }, { only: [only], llmGraph: false, datasources: false });
+      await scoped('raw/docs/maps/later.png.md');
+      const indexed = async () => (await ctx.store.query<{ path: string }>(`SELECT path FROM documents WHERE path LIKE 'raw/docs/maps/later%' AND status = 'indexed' ORDER BY path`)).map((d) => d.path);
+      expect(await indexed()).toEqual(['raw/docs/maps/later.png.md']);
+      fs.writeFileSync(path.join(dir, 'raw/docs/maps/later.png'), PIXEL_PNG);
+      await scoped('raw/docs/maps/later.png');
+      expect(await indexed()).toEqual(['raw/docs/maps/later.png']);
     } finally {
       await ctx.store.close();
     }
