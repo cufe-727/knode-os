@@ -24,10 +24,13 @@ import { MindMap, MindMapNode, TRAIL_SEPARATOR, walkMindMap } from './outline.js
  *   永贵电器 —belongs_to_sector→ 华为产业链
  *     "华为 › 华为智驾 › 液冷超充 › 永贵电器（液冷充电枪）"
  *
- * Two groupings — neither a company — are joined only when the upper one is
- * the subject: 整车 under 华为智驾 is true of this map, not of the auto
- * sector. And a company listed under a segment (赛力斯 under 整车) belongs to
- * the subject too, which is what an industry-chain map is for.
+ * An edge goes to the node right above; past branches nobody names, only to
+ * the subject: 上海沿浦 under 座位 under 华为智驾 says nothing about what it
+ * has to do with 华为智驾. Two groupings — neither a company — are joined
+ * only when the upper one is the subject: 整车 under 华为智驾 is true of this
+ * map, not of the auto sector. And a company listed under a segment (赛力斯
+ * under 整车) belongs to the subject too, which is what an industry-chain map
+ * is for.
  *
  * A node the graph knew is linked the way tier-0 links any name it knows —
  * the fallback type at half weight — so the map never out-votes the type
@@ -36,6 +39,13 @@ import { MindMap, MindMapNode, TRAIL_SEPARATOR, walkMindMap } from './outline.js
  */
 
 export const MINDMAP_EXTRACTOR = 'tier0.mindmap';
+
+/**
+ * The planner's version, kept in a mind map document's scope: one applied by
+ * an older planner is read again once, the next time a sync visits it, so a
+ * change to the rules below reaches the maps already indexed.
+ */
+export const MINDMAP_PLAN_VERSION = 2;
 
 /** An entity a node stands for: a known one carries its id. */
 export interface NodeEntity {
@@ -125,13 +135,19 @@ export function planMindMapGraph(
     const child = byNode.get(node);
     if (!child) continue;
     let parent: NodeEntity | undefined;
-    for (let i = trail.length - 1; i >= 0 && !parent; i--) parent = byNode.get(trail[i]);
+    let direct = false;
+    for (let i = trail.length - 1; i >= 0 && !parent; i--) {
+      parent = byNode.get(trail[i]);
+      direct = i === trail.length - 1;
+    }
     if (!parent) continue;
     const description = [...trail, node].map((n) => n.text).join(TRAIL_SEPARATOR);
-    // two groupings nest only inside this map (整车 under 华为智驾): said of the map's own subject, or not at all
-    if (isSubject(parent) || HOLDERS.has(child.type) || HOLDERS.has(parent.type)) state(child, parent, description);
+    const toSubject = isSubject(parent);
+    // the node right above, unless both are groupings that nest only inside this map (整车 under 华为智驾);
+    // past unnamed branches, only the subject
+    if (toSubject || (direct && (HOLDERS.has(child.type) || HOLDERS.has(parent.type)))) state(child, parent, description);
     // a company the map lists belongs to the map's subject whatever segment it sits in
-    if (subject && !isSubject(parent) && HOLDERS.has(child.type)) state(child, subject, description);
+    if (subject && !toSubject && HOLDERS.has(child.type)) state(child, subject, description);
   }
   return { entities: [...entities.values()], edges };
 }
@@ -198,16 +214,34 @@ export async function planDocumentMindMap(
     return declared.get(k) ?? (k.length >= 2 ? known.get(k) : undefined) ?? null;
   };
 
-  let subject: NodeEntity | null = null;
-  const s = fm.subject;
-  const subjectName = typeof s === 'string' ? wikilinkName(s) : s && typeof s === 'object' && typeof (s as Record<string, unknown>).name === 'string' ? wikilinkName((s as Record<string, unknown>).name as string) : '';
-  if (subjectName) {
-    const typed = s && typeof s === 'object' && typeof (s as Record<string, unknown>).type === 'string' ? ((s as Record<string, unknown>).type as string).trim() : '';
-    subject = resolve(subjectName) ?? { id: null, name: subjectName, type: typed || (ontology.entityTypes.some((t) => t.id === 'theme') ? 'theme' : 'concept') };
-  } else if (self) {
-    subject = { id: null, name: self.name, type: self.type };
-  }
+  const declaredSubject = mindMapSubject(fm, ontology);
+  const subject: NodeEntity | null = declaredSubject
+    ? resolve(declaredSubject.name) ?? { id: null, ...declaredSubject }
+    : self ? { id: null, name: self.name, type: self.type } : null;
   return planMindMapGraph(map, resolve, { subject, ontology });
+}
+
+/** `subject:` as written — `华为产业链`, `[[华为产业链]]` or `{ name, type }` — typed `theme` when the ontology has it and it says nothing. */
+export function mindMapSubject(fm: Record<string, unknown>, ontology?: Ontology): { name: string; type: string } | null {
+  const s = fm.subject;
+  const o = s && typeof s === 'object' ? (s as Record<string, unknown>) : null;
+  const name = typeof s === 'string' ? wikilinkName(s) : typeof o?.name === 'string' ? wikilinkName(o.name) : '';
+  if (!name) return null;
+  const typed = typeof o?.type === 'string' ? o.type.trim() : '';
+  return { name, type: typed || (!ontology || ontology.entityTypes.some((t) => t.id === 'theme') ? 'theme' : 'concept') };
+}
+
+/**
+ * The frontmatter the declared step reads, with the subject among its
+ * `entities:`: a relation the document states about its subject then
+ * resolves it with the subject's type, never as a bare name an alias could
+ * capture (华为产业链 is an alias of the company 华为 in finance).
+ */
+export function withMindMapSubject(fm: Record<string, unknown>, ontology?: Ontology): Record<string, unknown> {
+  const subject = mindMapSubject(fm, ontology);
+  if (!subject) return fm;
+  const entities = Array.isArray(fm.entities) ? fm.entities : [];
+  return { ...fm, entities: [subject, ...entities] };
 }
 
 /** Chunk mentions a node's entity gets at most, as for any tier-0 link. */
