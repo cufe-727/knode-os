@@ -20,7 +20,7 @@ import { Store } from '../store/db.js';
 import { IngestStats } from '../types.js';
 import { reconcileViews } from '../wiki/pages.js';
 import { applyDocScope } from './apply.js';
-import { originalOfTranscript } from './convert.js';
+import { originalOfTranscript, transcriptPathFor } from './convert.js';
 import { prepareEpisodes } from './episode.js';
 import { EmbeddingProvider } from './embeddings.js';
 import { prepareDocs } from './prepare.js';
@@ -123,11 +123,9 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   };
   const progress = opts.onProgress ?? (() => {});
   const actor = opts.actor ?? 'sync';
-  // a reviewed transcript is read as its original's text: a change to it re-prepares the original
-  const prefixes = normalizePrefixes(opts.only)?.flatMap((p) => {
-    const original = originalOfTranscript(p);
-    return original ? [p, original] : [p];
-  });
+  // a reviewed transcript is read as its original's text: a change to either re-prepares both — the
+  // original reads the transcript, and a transcript that came first, indexed alone, steps aside for it
+  const prefixes = normalizePrefixes(opts.only)?.flatMap((p) => [p, originalOfTranscript(p) ?? transcriptPathFor(p)].filter((k): k is string => Boolean(k)));
   const touches = (root: string) => !prefixes || prefixes.some((p) => p === root || p.startsWith(`${root}/`) || root.startsWith(`${p}/`));
   const touchesDocs = touches(RAW_DOCS);
   const touchesTraces = touches(RAW_TRACES);
