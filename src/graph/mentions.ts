@@ -53,8 +53,8 @@ export const MENTION_LIMIT = 400;
 /** The kinds of entity a reader opens a panel for. Datasets, datasources, events and "other" are where extraction leaves its generic words. */
 export const MARKED_TYPES = new Set(['organization', 'person', 'product', 'location', 'technology', 'project', 'component']);
 
-/** Extractors that mean the author named the entity: wikilinks, frontmatter, a person's prose on a generated page. */
-const DECLARING_EXTRACTORS = ['tier0.wikilink', 'tier0.frontmatter', 'human'];
+/** Extractors that mean the author named the entity: wikilinks, frontmatter, a mind map's node, a person's prose on a generated page. */
+const DECLARING_EXTRACTORS = ['tier0.wikilink', 'tier0.frontmatter', 'tier0.mindmap', 'human'];
 
 /** The YAML block at the top of a Markdown file: the views fold it away, so its names are not marked. */
 const FRONTMATTER_RE = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/;

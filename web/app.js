@@ -2098,7 +2098,7 @@ const fmtBytes = (bytes) => (bytes >= 1e6 ? `${(bytes / 1e6).toFixed(1)} MB` : `
  * past the cap. `canLoadFull` says the whole file still fits in one read, so
  * the user can promote the preview to a real edit.
  */
-function readOnlyNotice(derived, truncated, bytes, path = currentFile) {
+function readOnlyNotice(derived, truncated, bytes, path = currentFile, transcript = null) {
   // The mirror of a linked folder follows its source: a save here would be
   // undone by the next sync (and the service refuses it).
   const mirrored = path ? mirroredSource(path) : null;
@@ -2111,6 +2111,13 @@ function readOnlyNotice(derived, truncated, bytes, path = currentFile) {
   // Derived text is knode-os's rendering of a PDF or image. It is read-only
   // whatever its size: writing it back would replace the original's bytes, so
   // this is checked before the size rule and never offers a full load.
+  if (derived && transcript) {
+    // a reviewed transcript beside the original is its text (docs/design/19): the fix is an edit there
+    return {
+      text: `Read from its transcript, ${transcript.split('/').pop()} — edit that file to correct the reading. "original ↗" opens the file itself.`,
+      canLoadFull: false,
+    };
+  }
   if (derived) {
     return {
       text: 'Derived Markdown — knode-os produced this from the original, so it is read-only. "original ↗" opens the file itself; replace it by uploading a new copy.',
@@ -2182,7 +2189,52 @@ function paintFileView(path, content, derived = false) {
   view.innerHTML = renderMd(content, { metadataOpen: metadataOpen() });
   // ```chart blocks render as SVG in renderMd; hover and keyboard are added here (web/chart.js)
   window.knodeChart?.hydrate(view);
+  hydrateMindMaps(view, path);
   markFileMentions(path, content);
+}
+
+/** A picture the browser shows, and so one a mind map may have been read from. */
+const isPicturePath = (path) => /\.(png|jpe?g|gif|webp|avif|bmp|tiff?|heic|heif|svg)$/i.test(path ?? '');
+
+/**
+ * A mind map in the file view (web/mindmap.js): its controls, and — for a map
+ * read off a picture, or the reviewed transcript beside one (`x.webp.md`) — a
+ * button that shows the picture under the map, to check the reading against.
+ */
+function hydrateMindMaps(view, path) {
+  const maps = view.querySelectorAll('.kmindmap');
+  if (!maps.length) return;
+  window.knodeMindmap?.hydrate(view);
+  const picture = isPicturePath(path) ? path : /\.md$/i.test(path ?? '') && isPicturePath(path.slice(0, -3)) ? path.slice(0, -3) : null;
+  if (!picture) return;
+  for (const figure of maps) {
+    const tools = figure.querySelector('.kmm-tools');
+    if (!tools) continue;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'kmm-btn';
+    button.textContent = 'picture';
+    button.title = `Show ${picture.split('/').pop()}, the picture this map was read from`;
+    button.setAttribute('aria-pressed', 'false');
+    button.addEventListener('click', () => {
+      let frame = figure.querySelector('.kmm-picture');
+      if (!frame) {
+        frame = document.createElement('div');
+        frame.className = 'kmm-picture';
+        frame.hidden = true;
+        const img = document.createElement('img');
+        img.alt = `${picture.split('/').pop()}, the picture this map was read from`;
+        img.loading = 'lazy';
+        img.src = originalHref(picture);
+        frame.append(img);
+        figure.append(frame);
+      }
+      frame.hidden = !frame.hidden;
+      button.setAttribute('aria-pressed', String(!frame.hidden));
+      if (!frame.hidden) frame.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
+    tools.prepend(button);
+  }
 }
 
 /** Paint the file pane and decide, from this read alone, whether editing is allowed. */
@@ -2190,7 +2242,9 @@ function renderFileContent(path, content, derived, truncated, bytes) {
   // derived text (a PDF / image's Markdown) is knode-os's, not the user's: readable, never editable here
   paintFileView(path, content, derived);
   $('#file-editor').value = content;
-  const notice = readOnlyNotice(derived, truncated, bytes, path);
+  // the transcript the text was read from, as its frontmatter names it (src/ingest/convert.ts)
+  const transcript = derived ? /^transcript:[ \t]*"([^"\n]+)"/m.exec(/^---\r?\n([\s\S]*?)\r?\n---/.exec(content ?? '')?.[1] ?? '')?.[1] ?? null : null;
+  const notice = readOnlyNotice(derived, truncated, bytes, path, transcript);
   setFileNotice(notice);
   $('#btn-edit').textContent = 'edit';
   $('#btn-edit').disabled = Boolean(notice);

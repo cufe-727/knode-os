@@ -1,0 +1,171 @@
+/* knode-os web UI — mind maps drawn from their outlines (web/mindmap.js) */
+
+/*
+ * The tree is nested lists: each item a row of [node][its branches], the
+ * branches a column. The bracket that joins a node to its branches is drawn
+ * by the branches themselves — each child its share of the vertical bar and
+ * its own stub, the first and the last with a rounded elbow — so nothing is
+ * measured in script and labels size themselves. The markup has no inline
+ * style (the page's policy forbids it): every colour comes from here, on the
+ * app's tokens.
+ */
+.kmindmap {
+  --kmm-line: #4f7cc4;
+  --kmm-stub: 16px;
+  --kmm-gap: 18px;
+  --kmm-surface: var(--bg2, #161a21);
+  --kmm-ink: var(--fg, #d7dde6);
+  --kmm-ink-2: var(--muted, #8b95a5);
+  margin: 4px 0 18px;
+  border: 1px solid var(--border, #262d39);
+  border-radius: 10px;
+  background: var(--kmm-surface);
+}
+
+.kmm-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border, #262d39);
+  font-size: 12px;
+  color: var(--kmm-ink-2);
+}
+.kmm-sum { white-space: nowrap; }
+.kmm-tools { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.kmm-btn {
+  font: inherit;
+  color: var(--kmm-ink);
+  background: var(--bg3, #1e242e);
+  border: 1px solid var(--border-strong, #354052);
+  border-radius: 6px;
+  padding: 2px 9px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.kmm-btn:hover, .kmm-btn[aria-pressed="true"] { border-color: var(--kmm-line); }
+
+.kmm-scroll { overflow: auto; padding: 16px 14px; max-height: 78vh; }
+
+.kmm-tree, .kmm-children { list-style: none; margin: 0; padding: 0; }
+.kmm-tree { width: max-content; }
+
+/* a node and its branches side by side, the node centred on them */
+.kmm-item { display: flex; align-items: center; position: relative; }
+.kmm-children {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  position: relative;
+  margin-left: var(--kmm-gap);
+}
+/* from the node to the bar */
+.kmm-children::before {
+  content: '';
+  position: absolute;
+  left: calc(-1 * var(--kmm-gap));
+  top: 50%;
+  width: var(--kmm-gap);
+  border-top: 1.5px solid var(--kmm-line);
+}
+.kmm-children > .kmm-item { padding: 3px 0 3px var(--kmm-stub); }
+/* each child: its stub, and its share of the bar */
+.kmm-children > .kmm-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: var(--kmm-stub);
+  border-top: 1.5px solid var(--kmm-line);
+}
+.kmm-children > .kmm-item::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-left: 1.5px solid var(--kmm-line);
+}
+/* the first and the last child turn the corner */
+.kmm-children > .kmm-item:first-child::before { display: none; }
+.kmm-children > .kmm-item:first-child::after {
+  top: 50%;
+  width: var(--kmm-stub);
+  border-top: 1.5px solid var(--kmm-line);
+  border-top-left-radius: 8px;
+}
+.kmm-children > .kmm-item:last-child::before { display: none; }
+.kmm-children > .kmm-item:last-child::after {
+  bottom: 50%;
+  width: var(--kmm-stub);
+  border-bottom: 1.5px solid var(--kmm-line);
+  border-bottom-left-radius: 8px;
+}
+/* an only child is one straight line */
+.kmm-children > .kmm-item:only-child::before { display: block; }
+.kmm-children > .kmm-item:only-child::after { display: none; }
+
+.kmm-node {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 6px;
+  color: var(--kmm-ink);
+  line-height: 1.45;
+  max-width: 26em;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.kmm-root > .kmm-node {
+  background: #3f6fbf;
+  color: #f4f7fb;
+  font-weight: 650;
+  font-size: 15px;
+  padding: 8px 16px;
+  border-radius: 8px;
+}
+.kmm-d1 > .kmm-node { font-weight: 600; }
+.kmm-strong > .kmm-node { font-weight: 700; }
+.kmm-num { color: var(--kmm-ink-2); font-variant-numeric: tabular-nums; }
+.kmm-note { color: var(--kmm-ink-2); }
+.kmm-root > .kmm-node .kmm-note { color: inherit; opacity: 0.8; }
+
+/* folding: the button sits on the line, after the node, and says how much is behind it */
+.kmm-fold {
+  flex: none;
+  margin-left: 4px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  font: 600 10px/16px var(--mono, ui-monospace, monospace);
+  color: var(--kmm-ink-2);
+  background: var(--kmm-surface);
+  border: 1px solid var(--kmm-line);
+  border-radius: 9px;
+  cursor: pointer;
+  opacity: 0.45;
+}
+.kmm-item:hover > .kmm-fold, .kmm-fold:focus-visible, .kmm-folded > .kmm-fold { opacity: 1; }
+.kmm-folded > .kmm-fold { color: var(--kmm-ink); background: var(--bg3, #1e242e); }
+.kmm-folded > .kmm-children { display: none; }
+
+/* the same list as an indented outline */
+.kmm-as-outline .kmm-tree { width: auto; }
+.kmm-as-outline .kmm-item { display: block; padding: 1px 0; }
+.kmm-as-outline .kmm-children {
+  display: block;
+  margin-left: 0.55em;
+  padding-left: 1em;
+  border-left: 1px solid var(--border-strong, #354052);
+}
+.kmm-as-outline .kmm-children::before,
+.kmm-as-outline .kmm-children > .kmm-item::before,
+.kmm-as-outline .kmm-children > .kmm-item::after { display: none; }
+.kmm-as-outline .kmm-root > .kmm-node { margin-bottom: 4px; }
+.kmm-as-outline .kmm-node { padding: 1px 4px; max-width: none; }
+
+
+/* the picture a map was read from, under it (app.js adds the button) */
+.kmm-picture { border-top: 1px solid var(--border, #262d39); padding: 12px; }
+.kmm-picture img { display: block; max-width: 100%; height: auto; margin: 0 auto; border-radius: 6px; background: #fff; }

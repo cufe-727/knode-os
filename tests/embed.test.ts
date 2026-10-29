@@ -263,7 +263,7 @@ describe('the reader page', () => {
     expect(html).not.toMatch(/\sstyle\s*=/i);
     expect(html).not.toMatch(/\son[a-z]+\s*=/i);
     expect(html).not.toMatch(/javascript:/i);
-    expect([...html.matchAll(/<script src="([^"]+)"/g)].map((m) => m[1])).toEqual(['/vendor/marked.js', '/chart.js', '/markdown.js', '/deeplink.js', '/embed/embed.js']);
+    expect([...html.matchAll(/<script src="([^"]+)"/g)].map((m) => m[1])).toEqual(['/vendor/marked.js', '/chart.js', '/mindmap.js', '/markdown.js', '/deeplink.js', '/embed/embed.js']);
     // the placeholder the server fills, ahead of the script that reads it
     expect(html.indexOf('<meta name="knode-embed-origins" content="[]" />')).toBeGreaterThan(0);
     expect(html.indexOf('knode-embed-origins')).toBeLessThan(html.indexOf('/embed/embed.js'));

@@ -436,7 +436,8 @@ describe('the loader', () => {
 
   it('keeps the cache key the built-in converters used before converters were plugins', () => {
     expect(conversionCacheKey({}, 'raw/docs/a.pdf')).toBe('v1|no-vision|pages:100|image:2048');
-    expect(conversionCacheKey({ vision: { enabled: true, label: 'gpt-vision', complete: async () => '' } }, 'raw/docs/a.png')).toBe('v1|gpt-vision|pages:100|image:2048');
+    // the format, not the number: images went to version 2 when mind maps began coming back as outlines (docs/design/19)
+    expect(conversionCacheKey({ vision: { enabled: true, label: 'gpt-vision', complete: async () => '' } }, 'raw/docs/a.png')).toBe('v2|gpt-vision|pages:100|image:2048');
     expect(conversionCacheKey({})).toBe('v1|no-vision|pages:100|image:2048');
   });
 });

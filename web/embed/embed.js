@@ -470,6 +470,7 @@
       const body = el('div', 'markdown');
       body.innerHTML = global.knodeMarkdown.render(file.content);
       global.knodeChart?.hydrate(body);
+      global.knodeMindmap?.hydrate(body);
       fixLinks(body, target.path);
       const head = docHead(fields, body);
       title = text(fields?.title, 300) || squash(body.querySelector('h1')?.textContent) || title;

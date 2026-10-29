@@ -11,6 +11,10 @@ import {
   convertDocumentToMarkdown,
   convertedPathForRaw,
   isConvertibleFile,
+  originalOfTranscript,
+  transcriptCacheKey,
+  transcriptPathFor,
+  transcriptToMarkdown,
 } from './convert.js';
 import { pool } from '../pool.js';
 import { loadSourceText, sha256 } from './source.js';
@@ -94,7 +98,17 @@ export function rawDocsUnder(dataDir: string, prefixes: string[] | undefined): s
   return [...out];
 }
 
+function isFile(dataDir: string, rel: string): boolean {
+  try {
+    return fs.statSync(safePath(dataDir, rel)).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function producedBy(conversion: SidecarConversion | undefined): string | undefined {
+  // a transcript is its author's, whoever that was: knode-os produced none of it
+  if (conversion?.kind === 'transcript') return undefined;
   return conversion ? `knode-os/${conversion.model || conversion.kind}` : undefined;
 }
 
@@ -113,6 +127,9 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
   const prepareOne = async (rawRel: string): Promise<void> => {
     const abs = safePath(dataDir, rawRel);
     const st = fs.statSync(abs);
+    // a reviewed transcript is its original's text (prepared with it below), not a document of its own
+    const original = originalOfTranscript(rawRel);
+    if (original && isFile(dataDir, original)) return;
     const text = isTextFile(rawRel);
     const convertible = isConvertibleFile(rawRel);
     const maxBytes = convertible ? MAX_CONVERTIBLE_FILE_BYTES : MAX_FILE_BYTES;
@@ -123,7 +140,9 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
 
     const sourceSha = sha256(fs.readFileSync(abs));
     const meta = readSidecarPart(dataDir, rawRel, 'meta');
-    const cacheKey = convertible ? conversionCacheKey(opts, rawRel) : undefined;
+    const transcriptRel = convertible ? transcriptPathFor(rawRel) : null;
+    const transcript = transcriptRel && isFile(dataDir, transcriptRel) ? fs.readFileSync(safePath(dataDir, transcriptRel)) : null;
+    const cacheKey = convertible ? (transcript ? transcriptCacheKey(transcript) : conversionCacheKey(opts, rawRel)) : undefined;
     const sameSource = meta !== null && meta.sourceSha256 === sourceSha;
     const sameConversion = !convertible || (meta?.conversion?.key === cacheKey && hasContent(dataDir, rawRel));
 
@@ -152,6 +171,11 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
           // only the normalizer changed: re-normalize the existing conversion, never re-convert
           conversion = meta.conversion;
           content = normalizeCookedFrontmatter(normalizeAs, readContent(dataDir, rawRel) ?? '', { producedBy: producedBy(conversion), at });
+        } else if (transcript && transcriptRel) {
+          // its author's text: never attributed to knode-os, and read with no model
+          const result = transcriptToMarkdown(rawRel, transcriptRel, transcript.toString('utf8'));
+          conversion = { key: cacheKey!, kind: result.kind, model: result.model };
+          content = normalizeCookedFrontmatter(normalizeAs, result.markdown, { at });
         } else {
           progress(`converting ${rawRel}`);
           const result = await convertDocumentToMarkdown(abs, rawRel, opts);

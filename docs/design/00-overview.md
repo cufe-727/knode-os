@@ -228,6 +228,10 @@ regeneration and is itself a source.
   — every leased call measured (tokens from Codex, Claude Code, Cursor and endpoints, time, bytes); the processing
   and a study counted and costed before Start; Codex's windows read from Codex and calibrated on the account's
   tokens, Cursor and Claude Code against what their plans include.
+- [19 — Mind maps: pictures of trees read as outlines, drawn as maps, joined to the graph](19-mind-maps.md)
+  — one outline form (`type: MindMap`) for a picture, a person's outline or a reviewed transcript beside the
+  picture; the image converter asks for it; chunks carry their branch's path; named nodes join the graph to the
+  nearest named node above them, typed by the two types; the file view draws the tree with its entity links.
 - [16 — Time in the knowledge base: entries, mention timelines, measures and market data](16-time.md)
   — proposed: time belongs to entries (a post, comment or message at its
   minute, read from the export's headings); a census of mentions per entry;

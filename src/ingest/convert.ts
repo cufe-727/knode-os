@@ -1,6 +1,8 @@
+import crypto from 'node:crypto';
+import path from 'node:path';
 import { pluginRegistry } from '../plugins/registry.js';
 import type { ConverterInput, DocumentConverterPlugin } from '../plugins/types.js';
-import { ConversionResult, DEFAULT_MAX_IMAGE_DIMENSION, DEFAULT_MAX_PDF_PAGES, VisionModel } from './converters/shared.js';
+import { ConversionResult, DEFAULT_MAX_IMAGE_DIMENSION, DEFAULT_MAX_PDF_PAGES, VisionModel, withProvenance } from './converters/shared.js';
 
 /**
  * The Convert stage's front door. Which file types can be converted, and how,
@@ -42,6 +44,25 @@ export function convertedPathForRaw(rawRel: string): string {
   return isConvertibleFile(rawRel) ? `${rawRel}.md` : rawRel;
 }
 
+/**
+ * A reviewed transcript (docs/design/19-mind-maps.md): Markdown a person or an
+ * agent wrote for a converted original, kept beside it under the name its
+ * converted Markdown has — `华为产业链.webp.md` for `华为产业链.webp`. While it
+ * is there it is the original's text: prepare reads it instead of asking a
+ * model, a vision model's misreading is corrected by editing a file, and the
+ * transcript is not a document of its own.
+ */
+export function transcriptPathFor(rawRel: string): string | null {
+  return isConvertibleFile(rawRel) ? `${rawRel}.md` : null;
+}
+
+/** The original a transcript path belongs to, by name alone (whether either exists is the caller's question). */
+export function originalOfTranscript(rel: string): string | null {
+  if (!/\.md$/i.test(rel)) return null;
+  const original = rel.slice(0, -3);
+  return isConvertibleFile(original) ? original : null;
+}
+
 /** Material research captured (src/research/capture.ts): kept whole, because what a study came for is often at the end. */
 const RESEARCH_CAPTURES = 'raw/docs/research/';
 export const RESEARCH_MAX_PDF_PAGES = 1000;
@@ -75,6 +96,38 @@ export function conversionCacheKey(opts: ConversionOptions, rawRel?: string): st
     `pages:${pdfPageLimit(rawRel, opts)}`,
     `image:${opts.maxImageDimension ?? DEFAULT_MAX_IMAGE_DIMENSION}`,
   ].join('|');
+}
+
+/** What a transcript's text is keyed by: its own bytes, so an edit is a new conversion and nothing else is. */
+export function transcriptCacheKey(transcript: string | Uint8Array): string {
+  return `transcript|${crypto.createHash('sha256').update(transcript).digest('hex').slice(0, 16)}`;
+}
+
+/**
+ * The original's Markdown from its transcript: the transcript's own
+ * frontmatter and body as written, with where it came from added — only
+ * added, so whatever the author declared (`type: MindMap`, `subject`,
+ * `entities`) is indexed as written.
+ */
+export function transcriptToMarkdown(rawRel: string, transcriptRel: string, text: string): ConversionResult {
+  const fm = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(text);
+  const yaml = fm ? fm[1] : '';
+  const by = /^transcribed_by:[ \t]*["']?([^"'\n]+?)["']?[ \t]*$/m.exec(yaml)?.[1].trim() || 'transcript';
+  if (!fm) {
+    return { markdown: withProvenance(rawRel, 'transcript', by, text, { transcript: transcriptRel }), kind: 'transcript', model: by, warnings: [] };
+  }
+  const has = (key: string) => new RegExp(`^${key}:`, 'm').test(yaml);
+  const ext = path.extname(rawRel).slice(1).toLowerCase();
+  const added = [
+    !has('title') ? `title: ${JSON.stringify(path.basename(rawRel, path.extname(rawRel)))}` : null,
+    !has('source') ? `source: ${JSON.stringify(rawRel)}` : null,
+    !has('source_type') ? `source_type: ${JSON.stringify(ext)}` : null,
+    !has('conversion') ? 'conversion: "transcript"' : null,
+    !has('conversion_model') ? `conversion_model: ${JSON.stringify(by)}` : null,
+    !has('transcript') ? `transcript: ${JSON.stringify(transcriptRel)}` : null,
+  ].filter((l): l is string => l !== null);
+  const markdown = `---\n${[...added, yaml].filter((s) => s.trim()).join('\n')}\n---\n\n${text.slice(fm[0].length).trim()}\n`;
+  return { markdown, kind: 'transcript', model: by, warnings: [] };
 }
 
 export async function convertDocumentToMarkdown(
