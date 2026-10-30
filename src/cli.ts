@@ -24,7 +24,8 @@ import { runSourceQuery } from './datasource/execute.js';
 import { graphInsights, graphOverview, graphSearch } from './graph/query.js';
 import { applyClaimMerge, listClaimMerges, unmergeClaim } from './graph/claim-merge.js';
 import { auditDuplicateClaims } from './graph/claim-dedupe.js';
-import { applyMerge, listMerges, unmergeEntity } from './graph/merge.js';
+import { applyMerge, correctEntity, listMerges, unmergeEntity } from './graph/merge.js';
+import { readEntityCorrections } from './graph/corrections.js';
 import { auditDuplicateEntities } from './graph/dedupe.js';
 import { reviewClaims } from './graph/claim-review.js';
 import { resolveEntityId } from './graph/resolve.js';
@@ -1530,6 +1531,34 @@ entities
     }
   });
 entities
+  .command('correct <entity>')
+  .description('correct one entity by hand — its type, spellings it does not answer to — in playbooks/entities/corrections.yaml; the fold applies it at once, evidence is untouched, --clear takes it back')
+  .option('--type <type>', 'the type it is (an entity type of the ontology)')
+  .option('--untype', 'take a corrected type back')
+  .option('--not-alias <spelling...>', 'spellings it does not answer to: off its aliases and lookup keys, never resolved or linked onto it')
+  .option('--allow-alias <spelling...>', 'spellings to take off that list again')
+  .option('--clear', 'take the whole correction back')
+  .option('--reason <text>', 'why (kept in the file and the ledger)')
+  .option('--actor <name>', 'who decided', 'user')
+  .action(async (entity: string, opts: { type?: string; untype?: boolean; notAlias?: string[]; allowAlias?: string[]; clear?: boolean; reason?: string; actor: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const type = opts.untype ? null : opts.type;
+      console.log(JSON.stringify(await correctEntity(ctx.store, { entity, type, notAliases: opts.notAlias, allowAliases: opts.allowAlias, clear: opts.clear, reason: opts.reason, actor: opts.actor }), null, 2));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+entities
+  .command('corrections')
+  .description('list the corrections made by hand (playbooks/entities/corrections.yaml)')
+  .action(() => {
+    for (const [id, c] of readEntityCorrections(dataDir())) {
+      const what = [c.type ? `type ${c.type}` : null, c.notAliases?.length ? `not ${c.notAliases.join(', ')}` : null].filter(Boolean).join('; ');
+      console.log(`${id}${c.name && c.name !== id ? ` (${c.name})` : ''}: ${what}${c.reason ? `  — ${c.reason}` : ''}`);
+    }
+  });
+entities
   .command('dedupe')
   .description('find probable duplicate entities now and queue them as merge suggestions (normally nightly)')
   .action(async () => {
@@ -1637,7 +1666,7 @@ entities
   .action(async (name: string, opts: { type?: string }) => {
     const ctx = await createContext(dataDir());
     try {
-      console.log(JSON.stringify(await resolveEntityId(ctx.store, { name, type: opts.type }), null, 2));
+      console.log(JSON.stringify(await resolveEntityId(ctx.store, { name, type: opts.type }, undefined, { corrections: readEntityCorrections(ctx.dataDir) }), null, 2));
     } finally {
       await ctx.store.close();
     }

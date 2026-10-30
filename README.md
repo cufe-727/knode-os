@@ -261,6 +261,8 @@ knode-os chat "<message>" [-c <conversation>]   talk to the configured CLI about
                               and writes what you teach it as a quarantined note); `chat list` shows recent conversations
 knode-os entities merge|unmerge|merges|dedupe|resolve   entity resolution: reversible merges and the duplicate audit
 knode-os entities relink       recompute every document's tier-0 links after a stop-list edit or a surface-rule change
+knode-os entities correct <entity> [--type t] [--not-alias s...] [--clear]   correct one entity by hand: its type, spellings it
+                              does not answer to (playbooks/entities/corrections.yaml); `entities corrections` lists them
 knode-os review entities|claims   the review passes (LLM judge over duplicate candidates; verdicts on disputed / suspected claims)
 knode-os wiki lint             orphans, broken links, stale / unreviewed research pages, expired and superseded text
 knode-os wiki prune-summaries [--dry-run] [--min-chars n]   archive the summary pages of documents under extraction.summaryMinChars

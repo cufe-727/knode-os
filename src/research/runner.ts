@@ -20,6 +20,7 @@ import { markStudyReport, runStudyCollect, studyAgent, studyBriefLines, studyMcp
 import { webSearchEnabled } from './web.js';
 import { ensureRecentResearch } from '../wiki/pages.js';
 import { fileMergeCandidate } from '../graph/dedupe.js';
+import { readEntityCorrections } from '../graph/corrections.js';
 import { resolveEntityId } from '../graph/resolve.js';
 import { wikilinkName } from '../graph/frontmatter.js';
 
@@ -322,7 +323,7 @@ export async function applyIdentityVerdicts(ctx: AppContext, ws: RunWorkspace, f
   const subjectName = typeof fm.subject === 'string' ? fm.subject : title;
   if (!subjectName) return;
   const lite = async (name: string) => {
-    const r = await resolveEntityId(ctx.store, { name }, undefined, { mode: 'suffix' });
+    const r = await resolveEntityId(ctx.store, { name }, undefined, { mode: 'suffix', corrections: readEntityCorrections(ctx.dataDir) });
     const [row] = await ctx.store.query<{ id: string; name: string; type: string; mention_count: number; evidence_count: number }>(
       `SELECT id, name, type, mention_count, evidence_count FROM entities WHERE id = $1 AND tx_to IS NULL`, [r.id],
     );

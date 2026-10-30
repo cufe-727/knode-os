@@ -74,6 +74,14 @@ serve: /api/* + /mcp（Streamable HTTP，按工作区路由，bearer token）◀
 - 重复实体审计（每轮抽取后只看本轮写到的实体，夜间 Tier‑2 全量，见 [09](09-ingest-stage-rework.zh-CN.md) §3）：同 bare 键 / 共享别名键 / 短名是长名前缀（同类型）/ embedding 相似（真实 embedder 时，按 fold_sha 缓存于 `entity_embeddings`）
   → `suggestions` kind `merge`（依赖两个实体，任一 tombstone 即 stale；拒绝过的对不再提出）。接受 → `applyMerge`。
 - 接口：`knode-os entities merge|unmerge|merges|dedupe|resolve`，`POST /api/entities/merge|unmerge|dedupe`，`GET /api/entities/merges`。
+- 人工更正（`src/graph/corrections.ts`，2026‑10‑30 起）：`playbooks/entities/corrections.yaml` 按实体 id 给出 `type` 与
+  `notAliases`（该实体不对应的拼写），由 fold 在证据之上套用。类型取代按优先级选出的类型；按优先级，一票 `organization`
+  就压过上千票 `theme`。被拒拼写（带不带公司后缀都算）退出别名列表和查找键，合并进来的成员带来的键也一样；之后的消歧
+  （`sameAs`、键命中、成员的键）和写入时的本地键索引都不再把它落到该实体上。证据不改写：删掉一条即恢复抽取结果，rebuild
+  保留该文件。`knode-os entities correct <实体> --type … --not-alias … [--clear]` 写入一条、记 `entity.correct` feedback
+  并重新 fold 该实体；`entities corrections` 列出全部。更正之前已应用的文档保留当时的重定向，直到再次应用
+  （`sync --reapply --only <路径>`，Tier‑1 从 sidecar 重放）。2026‑10‑30 在 finance 发现：抽取合并把 创业板 归到 A股、HBM 归到
+  芯片、deepseek 归到 模型，之后的提及经由这些别名落到错误实体上，涉及 312 篇文档。
 
 ## 4. claims 的时间（`src/store/dates.ts` / `src/ingest/docdate.ts`）
 

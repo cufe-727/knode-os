@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { Queryable } from '../store/migrations.js';
 import {
+  EntityAsOf,
   EvidenceAtRow,
   foldClaimEvidence,
   foldEntityEvidence,
@@ -8,6 +9,7 @@ import {
   groupBy,
   Params,
 } from '../store/temporal.js';
+import { EntityCorrection, EntityCorrections, refusedKeys, refuses } from '../graph/corrections.js';
 import { entityKeyKinds, KeyKind, nameKey } from '../graph/normalize.js';
 import { emptyTouched, TouchedSet } from './types.js';
 
@@ -39,6 +41,8 @@ export interface FoldOptions {
   typePrecedence?: readonly string[];
   /** Words an alias may not be (src/graph/concept-stoplist.ts aliasStopKeys); none dropped when absent. */
   aliasStop?: ReadonlySet<string>;
+  /** A person's corrections to single entities (src/graph/corrections.ts readEntityCorrections); none when absent. */
+  corrections?: EntityCorrections;
 }
 
 export async function foldTouched(q: Queryable, touched: TouchedSet, txTime: string, opts: FoldOptions = {}): Promise<FoldResult> {
@@ -46,7 +50,7 @@ export async function foldTouched(q: Queryable, touched: TouchedSet, txTime: str
   const relationIds = new Set(touched.relations);
   const claimIds = new Set(touched.claims);
 
-  await foldEntities(q, [...touched.entities], txTime, result, opts.typePrecedence, opts.aliasStop);
+  await foldEntities(q, [...touched.entities], txTime, result, opts);
 
   // liveness flips cascade to the edges and claims that hang off the entity,
   // but only to the rows whose liveness the flip can change. A tombstone can
@@ -112,7 +116,14 @@ async function liveEvidence(q: Queryable, kind: string, ids: string[]): Promise<
   return groupBy(rows, (r) => r.target_id);
 }
 
-async function foldEntities(q: Queryable, ids: string[], txTime: string, result: FoldResult, precedence?: readonly string[], aliasStop?: ReadonlySet<string>): Promise<void> {
+/** The fold under a person's correction: their type (one the ontology has), and none of the spellings they said the entity does not answer to. */
+function corrected(folded: EntityAsOf | null, fix: EntityCorrection | undefined, refused: ReadonlySet<string>, precedence?: readonly string[]): EntityAsOf | null {
+  if (!folded || !fix) return folded;
+  const type = fix.type && (!precedence || precedence.includes(fix.type)) ? fix.type : folded.type;
+  return { ...folded, type, aliases: folded.aliases.filter((a) => !refuses(refused, a)) };
+}
+
+async function foldEntities(q: Queryable, ids: string[], txTime: string, result: FoldResult, opts: FoldOptions): Promise<void> {
   if (ids.length === 0) return;
   const evidence = await liveEvidence(q, 'entity', ids);
   const mentionRows = await selectIn<{ entity_id: string; n: number }>(
@@ -130,7 +141,9 @@ async function foldEntities(q: Queryable, ids: string[], txTime: string, result:
     const rows = evidence.get(cur.id) ?? [];
     const mentionCount = mentions.get(cur.id) ?? 0;
     const wasLive = cur.tx_to === null;
-    const folded = foldEntityEvidence(cur.id, rows, mentionCount, cur, precedence, aliasStop);
+    const fix = opts.corrections?.get(cur.id);
+    const refused = refusedKeys(fix);
+    const folded = corrected(foldEntityEvidence(cur.id, rows, mentionCount, cur, opts.typePrecedence, opts.aliasStop), fix, refused, opts.typePrecedence);
     if (!folded) {
       if (wasLive) {
         await q.query(
@@ -156,23 +169,27 @@ async function foldEntities(q: Queryable, ids: string[], txTime: string, result:
        WHERE id = $1`,
       [cur.id, folded.name, folded.type, folded.description, JSON.stringify(folded.aliases), mentionCount, folded.evidence_count, foldSha, txTime],
     );
-    await refreshEntityKeys(q, cur.id, folded.name, folded.aliases);
+    await refreshEntityKeys(q, cur.id, folded.name, folded.aliases, refused);
   }
 }
 
 /**
  * The lookup keys an entity answers to (graph/resolve.ts): its own folded
  * name and aliases plus those of every entity merged into it, with and
- * without corporate suffixes. Rebuilt whenever the entity's fold runs.
+ * without corporate suffixes, less the spellings a person said it does not
+ * answer to (never its own name). Rebuilt whenever the entity's fold runs.
  */
-async function refreshEntityKeys(q: Queryable, id: string, name: string, aliases: string[]): Promise<void> {
+async function refreshEntityKeys(q: Queryable, id: string, name: string, aliases: string[], refused: ReadonlySet<string>): Promise<void> {
   const keys = entityKeyKinds(name, aliases);
   const members = await q.query<{ name: string; aliases: string[] }>(`SELECT name, aliases FROM entities WHERE canonical_id = $1 AND tx_to IS NULL`, [id]);
   for (const m of members) {
-    for (const [k, kind] of entityKeyKinds(m.name, Array.isArray(m.aliases) ? m.aliases : [])) {
+    const spellings = [m.name, ...(Array.isArray(m.aliases) ? m.aliases : [])].filter((s) => !refuses(refused, s));
+    for (const [k, kind] of entityKeyKinds('', spellings)) {
       if (!keys.has(k) || (kind === 'exact' && keys.get(k) === 'bare')) keys.set(k, kind);
     }
   }
+  const own = nameKey(name);
+  for (const k of refused) if (k !== own.key && k !== own.bare) keys.delete(k);
   await q.query(`DELETE FROM entity_alias_keys WHERE entity_id = $1`, [id]);
   const list = [...keys.entries()] as [string, KeyKind][];
   if (list.length > 0) {

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG_FILE, loadConfig, ReviewResolution } from '../config.js';
 import { Queryable } from '../store/migrations.js';
+import { EntityCorrections, refusedKeys, refuses } from './corrections.js';
 import { entityKeys, mentionKeys, nameKey, typesCompatible } from './normalize.js';
 import { slugify } from './store.js';
 
@@ -11,7 +12,8 @@ import { slugify } from './store.js';
  * another spelling: an explicit `sameAs` from the extractor, an existing row
  * with the same slug, or a name / alias key match (see normalize.ts). A match
  * returns the *canonical* id, so mentions of an entity that was merged into
- * another land on the survivor.
+ * another land on the survivor — unless a person said that entity does not
+ * answer to the mention's spelling (src/graph/corrections.ts).
  *
  * Only exact key equality merges here. Near-duplicates are the nightly
  * audit's job (dedupe.ts), which proposes rather than decides.
@@ -52,7 +54,7 @@ async function canonicalOf(q: Queryable, row: CandidateRow): Promise<CandidateRo
   return target ?? row;
 }
 
-async function byKeys(q: Queryable, keys: Set<string>, type: string | undefined, mode: ReviewResolution): Promise<CandidateRow | null> {
+async function byKeys(q: Queryable, keys: Set<string>, type: string | undefined, mode: ReviewResolution, refusing?: (id: string) => boolean): Promise<CandidateRow | null> {
   if (keys.size === 0) return null;
   const list = [...keys];
   const ph = list.map((_, i) => `$${i + 1}`).join(',');
@@ -66,12 +68,20 @@ async function byKeys(q: Queryable, keys: Set<string>, type: string | undefined,
     list,
   );
   for (const r of rows) {
-    if (typesCompatible(type, r.type)) return canonicalOf(q, r);
+    if (!typesCompatible(type, r.type)) continue;
+    const canonical = await canonicalOf(q, r);
+    if (!refusing?.(canonical.id)) return canonical;
   }
   return null;
 }
 
-export async function resolveEntityId(q: Queryable, input: ResolveInput, cache?: Map<string, ResolvedEntity>, opts: { mode?: ReviewResolution } = {}): Promise<ResolvedEntity> {
+export async function resolveEntityId(
+  q: Queryable,
+  input: ResolveInput,
+  cache?: Map<string, ResolvedEntity>,
+  /** `corrections`: a person's (src/graph/corrections.ts) — a spelling an entity refuses never resolves onto it. */
+  opts: { mode?: ReviewResolution; corrections?: EntityCorrections } = {},
+): Promise<ResolvedEntity> {
   const mode = opts.mode ?? 'exact';
   const name = input.name.trim();
   const slug = slugify(name);
@@ -83,13 +93,14 @@ export async function resolveEntityId(q: Queryable, input: ResolveInput, cache?:
     cache?.set(cacheKey, r);
     return r;
   };
+  const refusing = opts.corrections?.size ? (id: string) => refuses(refusedKeys(opts.corrections!.get(id)), name) : undefined;
 
   // 1. the extractor named the canonical entity outright
   if (input.sameAs && input.sameAs.trim() && input.sameAs.trim().toLowerCase() !== name.toLowerCase()) {
     const target = (await rowById(q, slugify(input.sameAs))) ?? (await byKeys(q, entityKeys(input.sameAs), input.type, 'suffix'));
     if (target && target.id !== slug) {
       const canonical = await canonicalOf(q, target);
-      return finish({ id: canonical.id, name: canonical.name, resolvedFrom: name });
+      if (!refusing?.(canonical.id)) return finish({ id: canonical.id, name: canonical.name, resolvedFrom: name });
     }
   }
 
@@ -101,7 +112,7 @@ export async function resolveEntityId(q: Queryable, input: ResolveInput, cache?:
   }
 
   // 3. name / alias key match against live entities of a compatible type (exact spellings, or suffix-stripped too in 'suffix' mode)
-  const match = await byKeys(q, mentionKeys(name, input.aliases ?? [], mode), input.type, mode);
+  const match = await byKeys(q, mentionKeys(name, input.aliases ?? [], mode), input.type, mode, refusing);
   if (match) return finish({ id: match.id, name: match.name, resolvedFrom: name });
 
   return finish({ id: slug });
