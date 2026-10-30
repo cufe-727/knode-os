@@ -229,7 +229,7 @@ knode-os plugins [--json]     列出本数据目录加载的插件,以及它们�
 
 > `serve` 运行时会在 `/mcp` 提供 Streamable HTTP 的 MCP 端点（token 在 `<data>/.knode/mcp-token`），`knode-os connect claude|codex|cursor` 默认注册它（`--stdio` 才是独立进程）；`review` 配置块控制审核强度（写入时只按精确拼写合并、LLM 复核合并候选与争议断言、`verify` 任务可联网核实）；`research.pipeline: team` 让研究任务按「规划、并行调查、综合、评审、修订」五个阶段跑（`native` 则把角色注册为 CLI 的原生子代理）；`research.profile` 选一份研究 profile（`playbooks/research/profiles/*.yaml`：推理强度、联网新鲜度、核实门槛，以及每个子代理的 CLI、模型、工具与提示词，内置 default / quick / thorough / native，可在 Settings → Research 里编辑）；`research.agent` / `chat.agent` 现在指向 `playbooks/agents/` 下的具名 agent（Settings → Providers & Agents，内置一个 `deep-agent` 模板）——跑在某个模型上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI；改动前那种直接写 CLI 名或连接 id 的配置继续可用；
 > `knode-os research queue entity 宁德时代 --now` 让配置好的 agent（`research.agent`：一个 coding-agent CLI，或跑在 OpenAI 兼容连接上的内置 agent）研究并写出 wiki 页，页面以隔离状态入库，审核后提升；
-> `knode-os entities dedupe|merge|unmerge`、`knode-os wiki lint`、`knode-os research recommend`、`knode-os research profiles` 见 [docs/design/06](docs/design/06-wiki-research-agent.zh-CN.md);
+> `knode-os entities dedupe|merge|unmerge|correct`、`knode-os wiki lint`、`knode-os research recommend`、`knode-os research profiles` 见 [docs/design/06](docs/design/06-wiki-research-agent.zh-CN.md);
 > 知识库初始化(`research init`)、对话入口(`chat`)与研究 agent 的后续改进见 [docs/design/07](docs/design/07-init-and-chat.zh-CN.md)。
 
 ```bash

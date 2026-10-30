@@ -14,6 +14,7 @@ import {
 import type { PlannedCitation } from '../graph/citations.js';
 import { entityTypeIds, loadOntology, normalizePredicate, Ontology, relationSpec } from '../graph/ontology.js';
 import { resolutionMode, resolveEntityId, ResolvedEntity } from '../graph/resolve.js';
+import { EntityCorrections, readEntityCorrections, refusedKeys, refuses } from '../graph/corrections.js';
 import { entityKeyKinds, KeyKind, mentionKeys, typesCompatible } from '../graph/normalize.js';
 import { ReviewResolution } from '../config.js';
 import { toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
@@ -148,6 +149,8 @@ export class ScopeWriter {
   private readonly localKeys = new Map<string, { id: string; name: string; type: string; kind: KeyKind }>();
   /** review.resolution: 'exact' (spelling must match) or 'suffix' (corporate suffixes ignored). */
   private readonly resolution: ReviewResolution;
+  /** Spellings a person said an entity does not answer to: never resolved onto it, here or in the graph. */
+  private readonly corrections: EntityCorrections;
   /** Ids this body has written outright (a later mention with that slug is the same entity, not a redirect). */
   private readonly localIds = new Set<string>();
   private readonly seenEvidence = new Set<string>();
@@ -166,6 +169,7 @@ export class ScopeWriter {
   ) {
     this.entityTypes = entityTypeIds(ontology);
     this.resolution = resolutionMode(dataDir);
+    this.corrections = readEntityCorrections(dataDir);
   }
 
   /* ------------------------------ evidence ------------------------------ */
@@ -184,7 +188,7 @@ export class ScopeWriter {
       const slug = slugify(name);
       const local = this.localIds.has(slug) ? null : this.findLocal(name, e.aliases ?? [], e.type);
       if (local && local.id !== slug) resolved = { id: local.id, name: local.name, resolvedFrom: name };
-      else resolved = await resolveEntityId(this.q, { name, type: e.type, aliases: e.aliases, sameAs: o.sameAs ?? e.sameAs ?? null }, this.resolveCache, { mode: this.resolution });
+      else resolved = await resolveEntityId(this.q, { name, type: e.type, aliases: e.aliases, sameAs: o.sameAs ?? e.sameAs ?? null }, this.resolveCache, { mode: this.resolution, corrections: this.corrections });
       id = resolved.id;
     }
     const type = this.entityTypes.has(e.type) ? e.type : 'concept';
@@ -204,18 +208,20 @@ export class ScopeWriter {
       aliases,
       ...(redirected ? { resolved_from: resolved!.resolvedFrom } : {}),
     });
-    for (const [k, kind] of entityKeyKinds(evidenceName, aliases)) if (!this.localKeys.has(k)) this.localKeys.set(k, { id, name: evidenceName || id, type, kind });
+    // the evidence keeps what the extractor said; a later mention in this body only lands here under a spelling the entity answers to
+    const refused = refusedKeys(this.corrections.get(id));
+    for (const [k, kind] of entityKeyKinds(evidenceName, aliases.filter((a) => !refuses(refused, a)))) if (!this.localKeys.has(k)) this.localKeys.set(k, { id, name: evidenceName || id, type, kind });
     this.localIds.add(id);
     this.knownEntities.add(id);
     this.touched.entities.add(id);
     return id;
   }
 
-  /** An entity this body already wrote that answers to one of the mention's keys (same type, or an untyped placeholder on either side). */
+  /** An entity this body already wrote that answers to one of the mention's keys (same type, or an untyped placeholder on either side), and not one that refuses its name. */
   private findLocal(name: string, aliases: string[], type: string): { id: string; name: string; type: string } | null {
     for (const k of mentionKeys(name, aliases, this.resolution)) {
       const hit = this.localKeys.get(k);
-      if (hit && (this.resolution === 'suffix' || hit.kind === 'exact') && typesCompatible(type, hit.type)) return hit;
+      if (hit && (this.resolution === 'suffix' || hit.kind === 'exact') && typesCompatible(type, hit.type) && !refuses(refusedKeys(this.corrections.get(hit.id)), name)) return hit;
     }
     return null;
   }

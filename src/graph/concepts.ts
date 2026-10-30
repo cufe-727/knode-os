@@ -1,4 +1,5 @@
 import { foldTouched } from '../lineage/fold.js';
+import { foldOptions } from '../lineage/scope.js';
 import { lockLedger } from '../lineage/ledger.js';
 import { emptyTouched, ScopeRow } from '../lineage/types.js';
 import { ScopeWriter } from '../lineage/writer.js';
@@ -7,7 +8,6 @@ import { ParsedMarkdown, parseFrontmatter, titleFromMarkdown } from '../markdown
 import { Store } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
 import {
-  aliasStopKeys,
   CJK_FUNCTION_CHARS,
   EN_STOP,
   FREQUENT_MIN_CORPUS,
@@ -25,7 +25,7 @@ import {
 import type { TrustTier } from '../lineage/trust.js';
 import { wikilinkName } from './frontmatter.js';
 import { keyOf, mentionKeys } from './normalize.js';
-import { loadOntology, typePrecedence } from './ontology.js';
+import { loadOntology } from './ontology.js';
 import { resolutionMode } from './resolve.js';
 import { PageContext } from './store.js';
 
@@ -804,7 +804,7 @@ export async function wireConcepts(w: ScopeWriter, page: PageContext, concepts: 
  */
 export async function retireTier0Placeholders(store: Store, docScopeId: string, opts: { at?: string } = {}): Promise<{ entities: number }> {
   const txTime = opts.at ?? new Date().toISOString();
-  const precedence = typePrecedence(loadOntology(store.dataDir));
+  const fold = foldOptions(store.dataDir);
   let result = { entities: 0 };
   await store.tx(async (q) => {
     // folds entity rows: queue on the ledger lock like every scope transaction
@@ -826,7 +826,7 @@ export async function retireTier0Placeholders(store: Store, docScopeId: string, 
     );
     for (const id of ids) touched.entities.add(id);
     await q.query(`DELETE FROM entity_mentions WHERE scope_id = $1 AND entity_id IN (${ph(2)})`, [docScopeId, ...ids]);
-    await foldTouched(q, touched, txTime, { typePrecedence: precedence, aliasStop: aliasStopKeys(store.dataDir) });
+    await foldTouched(q, touched, txTime, fold);
     result = { entities: ids.length };
   });
   return result;
@@ -864,8 +864,7 @@ export async function relinkTier0(store: Store, opts: { onProgress?: (msg: strin
   const progress = opts.onProgress ?? (() => {});
   await tier0Known(store, { force: true });
   const ontology = loadOntology(store.dataDir);
-  const precedence = typePrecedence(ontology);
-  const aliasStop = aliasStopKeys(store.dataDir);
+  const fold = foldOptions(store.dataDir, ontology);
   const docs = await store.query<{ id: string; path: string; scope_id: string }>(
     `SELECT d.id, d.path, d.scope_id FROM documents d JOIN scopes s ON s.id = d.scope_id
      WHERE d.root = 'docs' AND d.status = 'indexed' AND d.kind = 'source' AND s.status = 'active'
@@ -928,7 +927,7 @@ export async function relinkTier0(store: Store, opts: { onProgress?: (msg: strin
       await lockLedger(q);
       const t = emptyTouched();
       for (const id of batch) t.entities.add(id);
-      await foldTouched(q, t, txTime, { typePrecedence: precedence, aliasStop });
+      await foldTouched(q, t, txTime, fold);
     });
     progress(`relink: folded ${Math.min(i + RELINK_FOLD_BATCH, ids.length)}/${ids.length} entities`);
   }

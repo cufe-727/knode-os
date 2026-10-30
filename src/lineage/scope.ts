@@ -14,6 +14,7 @@ import { TrustTier, tierForActor } from './trust.js';
 import { DisposeReason, emptyTouched, InverseSpec, ScopeKind, ScopeRow, TouchedSet, WriterStats } from './types.js';
 import { runFsOps, ScopeWriter } from './writer.js';
 import { aliasStopKeys } from '../graph/concept-stoplist.js';
+import { readEntityCorrections } from '../graph/corrections.js';
 import { loadOntology, typePrecedence } from '../graph/ontology.js';
 import { replaceRegion } from '../wiki/regions.js';
 
@@ -253,9 +254,9 @@ export async function disposeScope(store: Store, scopeId: string, opts: DisposeO
   return result;
 }
 
-/** How every fold of one data dir runs: the ontology's type precedence and the words an alias may not be. */
-function foldOptions(dataDir: string, ontology = loadOntology(dataDir)): FoldOptions {
-  return { typePrecedence: typePrecedence(ontology), aliasStop: aliasStopKeys(dataDir) };
+/** How every fold of one data dir runs: the ontology's type precedence, the words an alias may not be, a person's corrections. */
+export function foldOptions(dataDir: string, ontology = loadOntology(dataDir)): FoldOptions {
+  return { typePrecedence: typePrecedence(ontology), aliasStop: aliasStopKeys(dataDir), corrections: readEntityCorrections(dataDir) };
 }
 
 /** Dispose `scope` and its live children (first) inside an open transaction; what is left for after COMMIT goes to `out`. */

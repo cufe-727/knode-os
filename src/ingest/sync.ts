@@ -6,14 +6,12 @@ import { applyDatasourceScopes } from '../datasource/sync.js';
 import { safePath } from '../fs/files.js';
 import { listSidecarKeys, RAW_DOCS, RAW_TRACES } from '../fs/layout.js';
 import { removeSidecar } from '../fs/sidecar.js';
-import { aliasStopKeys } from '../graph/concept-stoplist.js';
 import { invalidateTier0Known, maybeLearnFrequentTerms } from '../graph/concepts.js';
-import { loadOntology, typePrecedence } from '../graph/ontology.js';
 import { buildWikiIndex } from '../graph/wire.js';
 import { DATASOURCES_PREFIX, declaredKey, enumerateDeclared, matchesPrefixes, normalizePrefixes } from '../lineage/declared.js';
 import { recountAll } from '../lineage/fold.js';
 import { appendLedger, nextLedgerSeq, readLedger } from '../lineage/ledger.js';
-import { disposeOrphanDocument, disposeScope } from '../lineage/scope.js';
+import { disposeOrphanDocument, disposeScope, foldOptions } from '../lineage/scope.js';
 import { ScopeKind, ScopeRow } from '../lineage/types.js';
 import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
@@ -313,7 +311,7 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
 }
 
 async function verify(ctx: SyncContext, progress: (m: string) => void): Promise<SyncVerifyReport> {
-  const recount = await ctx.store.tx((q) => recountAll(q, undefined, { typePrecedence: typePrecedence(loadOntology(ctx.dataDir)), aliasStop: aliasStopKeys(ctx.dataDir) }));
+  const recount = await ctx.store.tx((q) => recountAll(q, undefined, foldOptions(ctx.dataDir)));
   if (recount.changed) progress(`verify: fold drift repaired on ${recount.changed} rows`);
 
   // every live scope should have an apply line; backfill missing ones

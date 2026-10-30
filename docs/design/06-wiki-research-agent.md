@@ -78,6 +78,18 @@ nightly tier 2: claim audit (supersession) + full duplicate-entity audit + claim
 - Duplicate audit (after each extraction pass over the entities it wrote, nightly in full — [09](09-ingest-stage-rework.md) §3): same bare key / shared alias key / short name is a prefix of a longer same‑typed name / embedding
   similarity (real embedders, cached in `entity_embeddings` by fold_sha) → `merge` suggestions, never re‑proposed once
   rejected. Surfaces: `knode-os entities merge|unmerge|merges|dedupe|resolve`, `POST /api/entities/*`.
+- Corrections by hand (`src/graph/corrections.ts`, since 2026‑10‑30): `playbooks/entities/corrections.yaml`, keyed by
+  entity id, gives one entity a `type` and `notAliases`, spellings it does not answer to. The fold applies them over the
+  evidence. The type replaces the precedence pick, where one stray `organization` reading outranks a thousand `theme`
+  ones. A refused spelling, with or without a corporate suffix, leaves the alias list and the lookup keys, including
+  keys a merged member brings. Resolution (`sameAs`, a key match, a member's key) and the writer's scope‑local key
+  index never put it on that entity again. Evidence is untouched, so removing an entry restores what the extractors
+  said, and a rebuild keeps the file. `knode-os entities correct <entity> --type … --not-alias … [--clear]` writes an
+  entry, logs `entity.correct` feedback and refolds the entity; `entities corrections` lists them. A document applied
+  before a correction keeps the redirect it made until it is applied again (`sync --reapply --only <paths>`, tier‑1
+  replayed from the sidecar). Found in finance on 2026‑10‑30: extraction merges had filed 创业板 under A股, HBM under 芯片
+  and deepseek under 模型. Later mentions resolved through those aliases and carried them onto the wrong entity in 312
+  documents.
 
 ## 4. Time on claims (`src/store/dates.ts` / `src/ingest/docdate.ts`)
 

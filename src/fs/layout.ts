@@ -36,6 +36,8 @@ export const ONTOLOGY_DIR = `${CONFIG_DIR}/ontology`;
 export const RESEARCH_DIR = `${CONFIG_DIR}/research`;
 /** Tier-0 concept mining: the editable stop list and the learned frequent-term list (see src/graph/concept-stoplist). */
 export const CONCEPTS_DIR = `${CONFIG_DIR}/concepts`;
+/** Corrections a person made to single entities: a type, spellings one does not answer to (see src/graph/corrections). */
+export const ENTITY_CORRECTIONS_DIR = `${CONFIG_DIR}/entities`;
 
 /**
  * Named agents. Not to be confused with the `AGENTS.md` at the data root,
