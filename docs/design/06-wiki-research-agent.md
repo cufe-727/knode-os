@@ -44,7 +44,7 @@ nightly tier 2: claim audit (supersession) + full duplicate-entity audit + claim
   `initDataDir` seeds the built‑ins and never overwrites edits. Relation fields: `id / inverse / symmetric / hierarchical /
   temporal / domain / range / synonyms / inverseSynonyms / description / system`. Entity types carry `label / description /
   examples`, and the tier‑1 prompt lists each type on its own line with them; a later pack may restate a type to sharpen
-  its description without moving it (fold precedence is declaration order).
+  its description without moving it (the declaration order breaks the fold's ties between types).
 - A third built‑in, `finance` (opt‑in, 2026‑10‑23), is the vocabulary of a stock‑market corpus: entity types `market`,
   `index`, `security` (an instrument that is not a company or a fund — a listed company stays `organization` with its
   tickers as aliases), `fund`, `sector`, `theme`, `indicator`, `currency`, `commodity`, `policy`; relations `listed_on`,
@@ -80,8 +80,8 @@ nightly tier 2: claim audit (supersession) + full duplicate-entity audit + claim
   rejected. Surfaces: `knode-os entities merge|unmerge|merges|dedupe|resolve`, `POST /api/entities/*`.
 - Corrections by hand (`src/graph/corrections.ts`, since 2026‑10‑30): `playbooks/entities/corrections.yaml`, keyed by
   entity id, gives one entity a `type` and `notAliases`, spellings it does not answer to. The fold applies them over the
-  evidence. The type replaces the precedence pick, where one stray `organization` reading outranks a thousand `theme`
-  ones. A refused spelling, with or without a corporate suffix, leaves the alias list and the lookup keys, including
+  evidence. The type replaces the fold's pick, the most‑read typed reading ([05](05-agent-context-db.md) §4.3), which
+  extraction can get wrong most of the time: 人工智能 was read as a `product` 2,247 times and as a `theme` 1,090. A refused spelling, with or without a corporate suffix, leaves the alias list and the lookup keys, including
   keys a merged member brings. Resolution (`sameAs`, a key match, a member's key) and the writer's scope‑local key
   index never put it on that entity again. Evidence is untouched, so removing an entry restores what the extractors
   said, and a rebuild keeps the file. `knode-os entities correct <entity> --type … --not-alias … [--clear]` writes an

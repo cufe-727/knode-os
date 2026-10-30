@@ -22,7 +22,7 @@ import { rebuild } from '../src/lineage/rebuild.js';
 
 /**
  * A person's corrections to single entities (src/graph/corrections.ts): a
- * type that overrides the fold's precedence, and spellings an entity does not
+ * type that overrides the fold's pick, and spellings an entity does not
  * answer to — gone from its aliases and lookup keys, never resolved onto it
  * again (by key, by a merged member, by sameAs, or inside one document), with
  * the evidence untouched, so taking the correction back restores what the
@@ -69,11 +69,12 @@ describe('the corrections file', () => {
 describe('correcting an entity', () => {
   it('overrides the type, drops refused spellings everywhere they resolve, and is reversible and rebuilt', async () => {
     const dataDir = path.join(tmp, 'ws');
-    // an extraction merge filed 创业板 and 20cm under A股, and one stray reading typed it a product
+    // an extraction merge filed 创业板 and 20cm under A股, and extraction kept reading it as a data set
+    // (in finance: 3,653 dataset readings to 2,739 market ones)
     write(dataDir, 'raw/docs/a.md', `---
 title: A股周评
 entities:
-  - { name: A股, type: market, aliases: ["创业板", "20cm", "沪深A股"] }
+  - { name: A股, type: dataset, aliases: ["创业板", "20cm", "沪深A股"] }
 claims:
   - { subject: A股, statement: 本周 A股 成交额放大, type: market }
 ---
@@ -82,14 +83,14 @@ claims:
     write(dataDir, 'raw/docs/b.md', `---
 title: 券商晨报
 entities:
-  - { name: A股, type: product }
+  - { name: A股, type: dataset }
 ---
 A股 早盘震荡。
 `);
     write(dataDir, 'raw/docs/c.md', `---
 title: 市场结构
 entities:
-  - { name: A股, type: market }
+  - { name: A股, type: dataset }
   - { name: 沪深股市, type: market, aliases: ["ChiNext"] }
   - { name: 20cm, type: concept }
 claims:
@@ -116,8 +117,8 @@ A股 与 沪深股市，20cm 个股波动大。
         [spelling],
       ))[0].n;
 
-    // before: the precedence picks the stray reading, the wrong spellings are A股's keys
-    expect(await row('a股')).toMatchObject({ type: 'product' });
+    // before: the most-read type is the wrong one, the wrong spellings are A股's keys
+    expect(await row('a股')).toMatchObject({ type: 'dataset' });
     expect((await row('a股')).aliases).toEqual(expect.arrayContaining(['创业板', '20cm']));
     expect(await keys('a股')).toEqual(expect.arrayContaining(['20cm', '创业板']));
     expect((await resolveEntityId(store, { name: '20cm' })).id).toBe('a股');
@@ -132,7 +133,7 @@ A股 与 沪深股市，20cm 个股波动大。
     await expect(correctEntity(store, { entity: 'A股', notAliases: ['a 股'] })).rejects.toThrow(/own name/);
     await expect(correctEntity(store, { entity: '不存在' })).rejects.toThrow(/no live entity/);
     const res = await correctEntity(store, { entity: 'A股', type: 'market', notAliases: ['创业板', '20cm', 'ChiNext'], reason: 'boards are not A股' });
-    expect(res).toMatchObject({ id: 'a股', name: 'A股', mergedInto: null, before: { type: 'product' }, after: { type: 'market' } });
+    expect(res).toMatchObject({ id: 'a股', name: 'A股', mergedInto: null, before: { type: 'dataset' }, after: { type: 'market' } });
     expect(res.after.aliases).not.toContain('创业板');
     expect(res.after.aliases).toContain('沪深A股');
     expect(readEntityCorrections(dataDir).get('a股')).toMatchObject({ name: 'A股', type: 'market', notAliases: ['创业板', '20cm', 'ChiNext'], reason: 'boards are not A股', by: 'user' });
@@ -183,7 +184,7 @@ A股 里 创业板 的 20cm 更活跃。
     // taking it back restores what the extractors said
     await correctEntity(store, { entity: 'a股', clear: true });
     expect(readEntityCorrections(dataDir).has('a股')).toBe(false);
-    expect(await row('a股')).toMatchObject({ type: 'product' });
+    expect(await row('a股')).toMatchObject({ type: 'dataset' });
     expect(await keys('a股')).toEqual(expect.arrayContaining(['20cm', '创业板', 'chinext']));
 
     // corrected again, it survives a rebuild: the file is declared state the fold reads
@@ -198,6 +199,6 @@ A股 里 创业板 的 20cm 更活跃。
 
     // a hand-edited type the ontology does not have is ignored: the fold keeps its own pick
     writeEntityCorrections(dataDir, new Map([['a股', { type: 'board' }]]));
-    expect((await correctEntity(ctx.store, { entity: 'a股' })).after.type).toBe('product');
+    expect((await correctEntity(ctx.store, { entity: 'a股' })).after.type).toBe('dataset');
   });
 });

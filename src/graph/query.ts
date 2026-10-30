@@ -25,6 +25,7 @@ import {
 import { typedDegrees } from '../store/entities.js';
 import { ClaimItem, EntityRow, GraphEdge, GraphNode, GraphSearchResult, RelationRow, SearchResult } from '../types.js';
 import { coOccurrenceEdge, coOccurringEntities, coOccursSql } from './cooccur.js';
+import { loadOntology, typePrecedence } from './ontology.js';
 import { canonicalMap, expandGroups } from './resolve.js';
 
 /** Most nodes a graph read returns: past this a canvas is a ball of edges, and the overview's co-occurrence join is the cost. */
@@ -320,7 +321,7 @@ async function liveRows(store: Store, ids: string[]): Promise<EntityRow[]> {
 
 /** Entity rows as they were at `asOf` (falls back to the current row for wiki_path). */
 async function asOfRows(store: Store, ids: string[], asOf: string, fallback: EntityRow[] = []): Promise<EntityRow[]> {
-  const rows = await entitiesAsOf(store, ids, asOf);
+  const rows = await entitiesAsOf(store, ids, asOf, typePrecedence(loadOntology(store.dataDir)));
   const wiki = new Map(fallback.map((f) => [f.id, f.wiki_path]));
   return rows.map((r) => ({
     id: r.id,
