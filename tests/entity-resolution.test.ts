@@ -151,4 +151,39 @@ claims:
     expect(r.outcome).toBe('merged');
     await expect(applyMerge(ctx.store, { entityId: '宁德时代', canonicalId: '宁德时代新能源科技股份有限公司' })).rejects.toThrow(/itself|already merged/);
   });
+
+  it('resolves a spelling to the entity it names before a hotter entity that carries it as an alias', async () => {
+    const dataDir = path.join(tmp, 'named');
+    // a type apart, so the hub kept HBM as an alias instead of resolving onto it
+    write(dataDir, 'raw/docs/a.md', `---
+title: 芯片周报
+entities:
+  - { name: HBM, type: technology }
+  - { name: 芯片, type: product, aliases: ["HBM", "晶圆"] }
+---
+芯片供不应求，HBM 是瓶颈。
+`);
+    write(dataDir, 'raw/docs/b.md', `---
+title: 芯片
+entities: [{ name: 芯片, type: product }]
+---
+芯片又涨了。
+`);
+    initDataDir(dataDir);
+    const named = await createContext(dataDir);
+    try {
+      await sync(named, { llmGraph: false });
+      const counts = await named.store.query<{ id: string; mention_count: number }>(`SELECT id, mention_count FROM entities WHERE id IN ('hbm', '芯片') ORDER BY mention_count DESC`);
+      expect(counts.map((r) => r.id)).toEqual(['芯片', 'hbm']);
+      // a mention whose type says nothing could be either: its alias names one, the other only carries it
+      expect((await resolveEntityId(named.store, { name: '高带宽内存', aliases: ['HBM'] })).id).toBe('hbm');
+      // the same for the entity sameAs names under another spelling
+      expect((await resolveEntityId(named.store, { name: '高带宽存储器', sameAs: 'H.B.M' })).id).toBe('hbm');
+      // an alias no entity is named by still lands on the entity carrying it
+      expect((await resolveEntityId(named.store, { name: '晶圆' })).id).toBe('芯片');
+    } finally {
+      await named.datasources.closeAll();
+      await named.store.close();
+    }
+  });
 });

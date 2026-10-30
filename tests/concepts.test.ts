@@ -14,7 +14,9 @@ import {
   findLinks,
   frontmatterNames,
   learnFrequentTerms,
+  loadLinkCandidates,
   maskSpans,
+  namedPastLimit,
   relinkTier0,
   selectConcepts,
   stripTemplate,
@@ -237,6 +239,32 @@ describe('linking to what the graph knows', () => {
     const text = '## 11-24 11:18 · 表舅\n\nA股指数走弱，茅台和 iPhone 11 降价；公司观望。';
     expect(findLinks(text, index).map((s) => `${s.candidate.id}:${text.slice(s.start, s.end)}`)).toEqual(['a股:A股', '茅台:茅台', 'iphone-11:iPhone 11']);
   });
+
+  it("gives a spelling to the typed entity it names, not to a hotter entity's alias", () => {
+    // hottest first, as loadLinkCandidates lists them: extraction merges left 存储 and HBM on 半导体
+    const index = buildLinkIndex([
+      { id: '半导体', name: '半导体', type: 'sector', keys: ['半导体', '存储', 'hbm', '晶圆'] },
+      { id: '芯片', name: '芯片', type: 'product', keys: ['芯片', 'hbm', '晶圆'] },
+      { id: '存储', name: '存储', type: 'sector', keys: ['存储', '存储芯片'] },
+      { id: 'hbm', name: 'HBM', type: 'technology', keys: ['hbm'] },
+    ]);
+    const text = '半导体里存储和 HBM 最强，存储芯片涨价，晶圆厂扩产，芯片跟涨。';
+    // an alias no entity is named by still goes to the hottest entity carrying it (晶圆)
+    expect(findLinks(text, index).map((s) => `${s.candidate.id}:${text.slice(s.start, s.end)}`)).toEqual([
+      '半导体:半导体',
+      '存储:存储',
+      'hbm:HBM',
+      '存储:存储芯片',
+      '半导体:晶圆',
+      '芯片:芯片',
+    ]);
+    // a declared name kept only out of the miner's way has no entity to go to: a typed entity's alias still links
+    const extras = buildLinkIndex([
+      { id: '舒九', name: '舒九', type: 'person', keys: ['舒九', '九哥'] },
+      { id: null, name: '九哥', type: 'concept', keys: ['九哥'] },
+    ]);
+    expect(extras.byKey.get('九哥')?.id).toBe('舒九');
+  });
 });
 
 describe('tier-0 through sync', () => {
@@ -408,5 +436,40 @@ describe('tier-0 through sync', () => {
     expect(row.mention_count).toBe(await count(`(SELECT DISTINCT chunk_id FROM entity_mentions WHERE entity_id = '纽约证券交易所') m`));
     // running again changes nothing
     expect(await relinkTier0(ctx.store)).toMatchObject({ documents: 3, linksBefore: stats.linksAfter, linksAfter: stats.linksAfter });
+  });
+
+  it('links a declared author to the entity the name names, not to one that carries it as an alias', async () => {
+    // an organization that took the blogger's handle as an alias, typed apart so the declaration kept it there
+    write(dataDir, 'raw/docs/handles.md', `---\ntitle: 账号\nentities:\n  - { name: 书房的猫先生, type: person }\n  - { name: 爱立信, type: organization, aliases: ["书房的猫先生"] }\n---\n# 账号\n\n书房的猫先生与爱立信。\n`);
+    await sync(ctx, { llmGraph: false });
+    expect(await count(`entity_alias_keys WHERE entity_id = '爱立信' AND alias_key = $1`, [keyOf('书房的猫先生')])).toBe(1);
+    write(dataDir, 'raw/docs/cat.md', `---\ntitle: 猫先生笔记\nsource: "书房的猫先生"\n---\n# 猫先生笔记\n\n今天聊聊光模块。\n`);
+    await sync(ctx, { llmGraph: false });
+    const scope = (await findLiveScope(ctx.store, 'doc', 'raw/docs/cat.md'))!;
+    const links = await ctx.store.query<{ target_id: string }>(
+      `SELECT target_id FROM evidence WHERE scope_id = $1 AND kind = 'entity' AND extractor = 'tier0.link' AND tx_to IS NULL ORDER BY target_id`,
+      [scope.id],
+    );
+    expect(links.map((l) => l.target_id)).toEqual(['书房的猫先生']);
+  });
+
+  it('lists an entity past the candidate limit for its own name when a listed one carries the name as an alias', async () => {
+    write(dataDir, 'raw/docs/fabs-1.md', `---\ntitle: 晶圆\nentities:\n  - { name: 晶圆厂, type: technology }\n  - { name: 半导体, type: product, aliases: ["晶圆厂"] }\n---\n# 晶圆\n\n晶圆厂扩产。\n`);
+    for (const n of [2, 3]) write(dataDir, `raw/docs/fabs-${n}.md`, `---\ntitle: 半导体 ${n}\nentities: [{ name: 半导体, type: product }]\n---\n# 半导体 ${n}\n\n半导体周期。\n`);
+    await sync(ctx, { llmGraph: false });
+    const all = await loadLinkCandidates(ctx.store, dataDir);
+    const hub = all.findIndex((c) => c.name === '半导体');
+    expect(hub).toBeGreaterThanOrEqual(0);
+    expect(all.findIndex((c) => c.name === '晶圆厂')).toBeGreaterThan(hub);
+    // the limit cuts between the hub and the entity it carries by name
+    const listed = await loadLinkCandidates(ctx.store, dataDir, hub + 1);
+    const index = buildLinkIndex(listed);
+    expect(index.byKey.get(keyOf('晶圆厂'))?.name).toBe('半导体');
+    const named = await namedPastLimit(ctx.store, index);
+    expect(named.map((c) => [c.name, c.keys])).toEqual([['晶圆厂', [keyOf('晶圆厂')]]]);
+    const full = buildLinkIndex([...listed, ...named]);
+    expect(full.byKey.get(keyOf('晶圆厂'))?.name).toBe('晶圆厂');
+    // the same spellings link, only to the entity they name
+    expect([...full.byKey.keys()].sort()).toEqual([...index.byKey.keys()].sort());
   });
 });
