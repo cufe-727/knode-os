@@ -926,12 +926,13 @@ export async function relinkTier0(store: Store, opts: { onProgress?: (msg: strin
       if (!scope) return;
       // a mention row is shared by every scope that found the entity in the chunk (one primary key),
       // so the mentions of an entity the document's tier-1 extraction or its own other evidence
-      // supports stay: only what the links alone brought is deleted
+      // supports stay: only what the links alone brought is deleted. What the document supports is
+      // read once from its own scopes: asked per link, it walked each linked hub's whole evidence
       const old = await q.query<{ target_id: string; others: boolean }>(
         `SELECT ev.target_id,
-                EXISTS (SELECT 1 FROM evidence o JOIN scopes s ON s.id = o.scope_id
-                        WHERE (o.scope_id = ev.scope_id OR s.parent_id = ev.scope_id) AND s.status <> 'disposed'
-                          AND o.kind = 'entity' AND o.target_id = ev.target_id AND o.extractor <> $2 AND o.tx_to IS NULL) AS others
+                ev.target_id IN (SELECT o.target_id FROM evidence o JOIN scopes s ON s.id = o.scope_id
+                                 WHERE (s.id = $1 OR s.parent_id = $1) AND s.status <> 'disposed'
+                                   AND o.kind = 'entity' AND o.extractor <> $2 AND o.tx_to IS NULL) AS others
          FROM evidence ev WHERE ev.scope_id = $1 AND ev.kind = 'entity' AND ev.extractor = $2 AND ev.tx_to IS NULL`,
         [scope.id, LINK_EXTRACTOR],
       );
