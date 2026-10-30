@@ -469,8 +469,9 @@ struct FileBrowserView: View {
                 } else {
                     ScrollView {
                         Group {
-                            // a mind map read off a picture is Markdown too: it is drawn as its tree (docs/design/19)
-                            if selectedPath.hasSuffix(".md") || selectedPath.hasSuffix(".markdown") || isDerived && MindMapOutline.isMindMap(page: content) {
+                            // what knode-os derived from a PDF, a saved web page or a picture is Markdown too, shown as
+                            // the web file view shows it; a mind map read off a picture is drawn as its tree (docs/design/19)
+                            if isDerived || selectedPath.hasSuffix(".md") || selectedPath.hasSuffix(".markdown") {
                                 MarkdownText(markdown: content, mentions: mentions, scrollTarget: $scrollTarget, picture: Self.mindMapPicture(for: selectedPath), onOpenEntity: { id, block in
                                     openEntity(id, from: block)
                                 }) { target, block in

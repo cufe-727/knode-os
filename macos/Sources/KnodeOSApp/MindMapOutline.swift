@@ -37,16 +37,6 @@ struct MindMapOutline: Hashable {
         return false
     }
 
-    /// A whole page whose frontmatter says `type: MindMap`; only its first lines are looked at.
-    static func isMindMap(page: String) -> Bool {
-        guard page.hasPrefix("---") else { return false }
-        // the last piece is the rest of the page, unsplit: it never reads as the closing line
-        let lines = page.split(separator: "\n", maxSplits: 400, omittingEmptySubsequences: false)
-        guard lines.first?.trimmingCharacters(in: .whitespaces) == "---",
-              let end = lines.dropFirst().firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "---" }) else { return false }
-        return isMindMap(frontmatter: lines[1..<end].joined(separator: "\n"))
-    }
-
     /**
      * The tree an outline holds, or nil when no node hangs below a root.
      * Without an H1 a lone top-level item is the root; several are children
