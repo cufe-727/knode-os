@@ -42,11 +42,13 @@ import { PageContext } from './store.js';
  *      entities (anything but `concept`) by every spelling the graph knows
  *      for them — names, aliases and the names of entities merged into them,
  *      via entity_alias_keys — plus the author its frontmatter declares in
- *      `source:`. Latin spellings match whole words, CJK spellings match as
- *      substrings. One mention is enough. A spelling that would link on its
- *      own in any text is no surface (weakLinkKey): a number of fewer than
- *      five digits, a one- or two-letter Latin spelling, a stop word, or — as
- *      an alias — a corpus-frequent word. A link writes `tier0.link` evidence
+ *      `source:`. A spelling that is one entity's name and another's alias
+ *      links to the entity it names (buildLinkIndex). Latin spellings match
+ *      whole words, CJK spellings match as substrings. One mention is enough.
+ *      A spelling that would link on its own in any text is no surface
+ *      (weakLinkKey): a number of fewer than five digits, a one- or
+ *      two-letter Latin spelling, a stop word, or — as an alias — a
+ *      corpus-frequent word. A link writes `tier0.link` evidence
  *      and chunk mentions on the existing entity, never a new node, and the
  *      matched text is masked before mining so no fragment of a known name
  *      can become a concept. `relinkTier0` recomputes every document's links
@@ -326,19 +328,30 @@ export function weakLinkKey(key: string, opts: { isName: boolean; stop?: Readonl
   return !opts.isName && Boolean(opts.aliasStop?.has(key));
 }
 
+/**
+ * Each spelling links to one candidate. A typed entity's own name comes
+ * first: 存储 links to the entity named 存储, not to 半导体, which an
+ * extraction merge left carrying 存储 as an alias, however much more the hub
+ * is mentioned. Otherwise the candidate listed first (the hottest) takes it.
+ */
 export function buildLinkIndex(candidates: LinkCandidate[], stop?: ReadonlySet<string>, aliasStop?: ReadonlySet<string>): LinkIndex {
   const byKey = new Map<string, LinkCandidate>();
   const prefixes = new Set<string>();
   let maxChars = 0;
+  const claim = (c: LinkCandidate, k: string, isName: boolean) => {
+    if (k.length < 2 || k.length > MAX_KEY_CHARS || byKey.has(k)) return;
+    if (weakLinkKey(k, { isName, stop, aliasStop })) return;
+    byKey.set(k, c);
+    if (k.length > maxChars) maxChars = k.length;
+    for (let i = 1; i < k.length; i++) prefixes.add(k.slice(0, i));
+  };
   for (const c of candidates) {
     const nameKey = keyOf(c.name);
-    for (const k of c.keys) {
-      if (k.length < 2 || k.length > MAX_KEY_CHARS || byKey.has(k)) continue;
-      if (weakLinkKey(k, { isName: k === nameKey, stop, aliasStop })) continue;
-      byKey.set(k, c);
-      if (k.length > maxChars) maxChars = k.length;
-      for (let i = 1; i < k.length; i++) prefixes.add(k.slice(0, i));
-    }
+    if (c.type !== 'concept' && c.keys.includes(nameKey)) claim(c, nameKey, true);
+  }
+  for (const c of candidates) {
+    const nameKey = keyOf(c.name);
+    for (const k of c.keys) claim(c, k, k === nameKey);
   }
   return { byKey, prefixes, maxChars };
 }
@@ -421,7 +434,7 @@ export function maskSpans(text: string, spans: { start: number; end: number }[])
   return out + text.slice(cursor);
 }
 
-/** Hottest typed entities offered as link targets; the long tail of once-seen entities is left to tier-1. */
+/** Hottest typed entities offered as link targets; the long tail of once-seen entities is left to tier-1, but for names a listed entity carries as aliases (namedPastLimit). */
 export const LINK_CANDIDATE_LIMIT = 10_000;
 
 interface CandidateRow {
@@ -468,6 +481,28 @@ export async function loadLinkCandidates(q: Queryable, dataDir: string, limit = 
     [limit],
   );
   return groupCandidates(rows, resolutionMode(dataDir));
+}
+
+/**
+ * Live typed entities past the candidate limit whose own name a listed
+ * entity carries as an alias (晶圆厂 on 半导体), each with that one key, so
+ * the index gives the spelling to the entity it names. Only spellings the
+ * index already links are looked up: no text links that did not link before.
+ */
+export async function namedPastLimit(q: Queryable, index: LinkIndex): Promise<LinkCandidate[]> {
+  const carried = new Set<string>();
+  for (const [k, c] of index.byKey) if (keyOf(c.name) !== k) carried.add(k);
+  if (carried.size === 0) return [];
+  const rows = await q.query<{ id: string; name: string; type: string; mention_count: number }>(
+    `SELECT id, name, type, mention_count FROM entities
+     WHERE name_key = ANY($1::text[]) AND tx_to IS NULL AND type <> 'concept' AND canonical_id IS NULL
+     ORDER BY mention_count DESC, id`,
+    [[...carried]],
+  );
+  // name_key drops a corporate suffix: the spelling itself must be the name
+  return rows
+    .filter((r) => carried.has(keyOf(r.name)))
+    .map((r) => ({ id: r.id, name: r.name, type: r.type, keys: [keyOf(r.name)], aliases: [], mentions: Number(r.mention_count) || 0 }));
 }
 
 /** Live typed entities answering to any of the given spellings (a document's declared names), hottest first. */
@@ -589,7 +624,9 @@ async function refreshKnown(store: Store, c: KnownCache, force: boolean): Promis
     // often its hub entity, and linking that is the point; an alias that is a
     // frequent word links nothing (weakLinkKey)
     c.linkStop = stopKeySet(editable, null);
-    c.index = buildLinkIndex(c.rows, c.linkStop, c.stop);
+    const index = buildLinkIndex(c.rows, c.linkStop, c.stop);
+    const named = await namedPastLimit(store, index);
+    c.index = named.length > 0 ? buildLinkIndex([...c.rows, ...named], c.linkStop, c.stop) : index;
     c.stopStamp = stopStamp;
   }
   c.probedAt = Date.now();
@@ -706,13 +743,14 @@ export async function planTier0(store: Store, parsed: ParsedMarkdown, title: str
   const text = stripTemplate(parsed.body, { source, title });
 
   // the frontmatter's own names: the author links when the graph knows them as
-  // a typed entity (never typed here — that is tier-1's call); declared
-  // `entities:` were written by the declared step already, so they are only
-  // kept out of the miner's way
+  // a typed entity (never typed here — that is tier-1's call), the one the name
+  // names before any carrying it as an alias; declared `entities:` were written
+  // by the declared step already, so they are only kept out of the miner's way
   const extras: LinkCandidate[] = [];
   if (source) {
     const typed = await typedEntitiesNamed(store, store.dataDir, [source]);
-    if (typed.length > 0) extras.push(...typed);
+    const named = typed.filter((c) => keyOf(c.name) === keyOf(source));
+    if (typed.length > 0) extras.push(...(named.length > 0 ? named : typed));
     else extras.push(maskOnly(source));
   }
   for (const name of declared) extras.push(maskOnly(name));

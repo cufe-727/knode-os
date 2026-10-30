@@ -67,7 +67,12 @@ async function byKeys(q: Queryable, keys: Set<string>, type: string | undefined,
      ORDER BY e.mention_count DESC, e.id`,
     list,
   );
-  for (const r of rows) {
+  // an entity one of the spellings names comes before a bigger one that only carries it as an alias
+  const names = (r: CandidateRow) => {
+    const own = nameKey(r.name);
+    return keys.has(own.key) || (mode === 'suffix' && keys.has(own.bare));
+  };
+  for (const r of [...rows.filter(names), ...rows.filter((r) => !names(r))]) {
     if (!typesCompatible(type, r.type)) continue;
     const canonical = await canonicalOf(q, r);
     if (!refusing?.(canonical.id)) return canonical;
@@ -167,7 +172,8 @@ const NAMED_BATCH = 5_000;
  * The live entity each name stands for — its own spelling or an alias, exact
  * keys only — under the survivor of a merge: what a [[link]] to a name no page
  * answers to points at. Where several entities answer to one spelling a typed
- * one beats a mined concept, then the most mentioned wins. Names no entity
+ * one beats a mined concept, then the entity the spelling names beats one
+ * that carries it as an alias, then the most mentioned wins. Names no entity
  * answers to are absent from the map, and so are entities the graph knows
  * only from links to them — the concept a link to an unwritten page leaves
  * (wire.ts) — or every link would be its own target.
@@ -179,18 +185,22 @@ export async function entitiesNamed(q: Queryable, names: readonly string[]): Pro
     if (key.length >= 2) keyByName.set(n, key);
   }
   const keys = [...new Set(keyByName.values())];
-  const byKey = new Map<string, NamedEntity & { canonicalId: string | null }>();
+  const byKey = new Map<string, NamedEntity & { canonicalId: string | null; rank: number }>();
   for (let i = 0; i < keys.length; i += NAMED_BATCH) {
     const rows = await q.query<{ alias_key: string; id: string; name: string; type: string; wiki_path: string | null; canonical_id: string | null }>(
-      `SELECT DISTINCT ON (k.alias_key) k.alias_key, e.id, e.name, e.type, e.wiki_path, e.canonical_id
+      `SELECT k.alias_key, e.id, e.name, e.type, e.wiki_path, e.canonical_id
        FROM entity_alias_keys k JOIN entities e ON e.id = k.entity_id
        WHERE k.alias_key = ANY($1::text[]) AND k.kind = 'exact' AND e.tx_to IS NULL
          AND (e.wiki_path IS NOT NULL OR e.canonical_id IS NOT NULL OR EXISTS (
            SELECT 1 FROM evidence ev WHERE ev.kind = 'entity' AND ev.target_id = e.id AND ev.tx_to IS NULL AND ev.extractor <> 'tier0.wikilink'))
-       ORDER BY k.alias_key, (e.type = 'concept'), e.mention_count DESC, e.id`,
+       ORDER BY e.mention_count DESC, e.id`,
       [keys.slice(i, i + NAMED_BATCH)],
     );
-    for (const r of rows) byKey.set(r.alias_key, { id: r.id, name: r.name, type: r.type, wikiPath: r.wiki_path ?? null, canonicalId: r.canonical_id });
+    for (const r of rows) {
+      const rank = (r.type === 'concept' ? 2 : 0) + (nameKey(r.name).key === r.alias_key ? 0 : 1);
+      const best = byKey.get(r.alias_key);
+      if (!best || rank < best.rank) byKey.set(r.alias_key, { id: r.id, name: r.name, type: r.type, wikiPath: r.wiki_path ?? null, canonicalId: r.canonical_id, rank });
+    }
   }
   const merged = [...new Set([...byKey.values()].flatMap((e) => (e.canonicalId ? [e.canonicalId] : [])))];
   if (merged.length > 0) {
@@ -201,7 +211,7 @@ export async function entitiesNamed(q: Queryable, names: readonly string[]): Pro
     const byId = new Map(survivors.map((s) => [s.id, s]));
     for (const [key, e] of byKey) {
       const s = e.canonicalId ? byId.get(e.canonicalId) : undefined;
-      if (s) byKey.set(key, { id: s.id, name: s.name, type: s.type, wikiPath: s.wiki_path ?? null, canonicalId: null });
+      if (s) byKey.set(key, { id: s.id, name: s.name, type: s.type, wikiPath: s.wiki_path ?? null, canonicalId: null, rank: e.rank });
     }
   }
   const out = new Map<string, NamedEntity>();

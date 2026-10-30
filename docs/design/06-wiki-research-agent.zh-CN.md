@@ -65,8 +65,14 @@ serve: /api/* + /mcp（Streamable HTTP，按工作区路由，bearer token）◀
 - `nameKey()`：NFKC → 小写 → 去包裹符 → 只留字母数字得 `key`；再剥公司后缀（股份有限公司 / Inc. / Co., Ltd. …）得 `bare`。
   fold 为每个实体维护 `entities.name_key` 与 `entity_alias_keys`（name + aliases 的 key / bare），合并进来的成员实体的键也并入幸存者。
 - 写入时（`ScopeWriter.entity()`）：显式 `sameAs` → 同 slug 的已有行（跟随 `canonical_id`）→ 任一键命中且类型兼容
-  （相同，或任一为 `concept/other`）→ 否则新 slug。命中时该拼写记为别名，evidence attrs 记 `resolved_from`。
+  （相同，或任一为 `concept/other`；以某个拼写为名的实体先于只把它当别名的实体，再按热度）→ 否则新 slug。命中时该拼写记为别名，evidence attrs 记 `resolved_from`。
   同一 scope body 内还有本地键索引（fold 只在提交后发布键），且 frontmatter 声明先于概念挖掘应用。
+- 一个拼写既是某个有类型实体的名字、又是另一个实体的别名时，归以它为名的实体（2026‑10‑30 起）：Tier‑0 链接索引
+  （`buildLinkIndex`），因而视图的提及标注和 Tier‑1 prompt 给出的已知实体，以及 `[[链接]]` 解析（`entitiesNamed`）都如此。
+  候选上限之外的实体，若其名字被上限内某实体当作别名，也以本名列入（只带本名，`namedPastLimit`）；文档声明的作者
+  （`source:`）只链接以该名为名的实体，而非所有带着它的实体。此前热度更高的一方拿走所有键，抽取合并留下的错误别名
+  （芯片 带着 HBM、科技 带着 机器人、半导体 带着 晶圆厂）因此替枢纽实体接走了小实体的链接面，prompt 也把枢纽当成这个
+  拼写的已知名字。finance 图谱上这改变了 61,944 个链接键中的 5,789 个，23,264 篇文档中 19,247 篇的 Tier‑0 链接。
 - 抽取时实体链接：Tier‑1 prompt 注入文中出现的已知实体（名称 / 类型 / 别名，热度前 30），LLM 可用 `sameAs` 指回规范名。
 - 合并：`entity_links` + `entities.canonical_id`，由 `merge` scope 的显式效果写入（inverse `entity_link.remove`），
   `applyMerge / unmergeEntity` 记 ledger feedback（`entity.merge / entity.unmerge`），`rebuild` 按顺序重放。

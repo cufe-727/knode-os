@@ -68,9 +68,18 @@ nightly tier 2: claim audit (supersession) + full duplicate-entity audit + claim
 - `nameKey()` yields `key` (letters and digits after NFKC) and `bare` (corporate suffix stripped). The fold maintains
   `entities.name_key` and `entity_alias_keys` (name + aliases, both forms), including the keys of entities merged into it.
 - Write time (`ScopeWriter.entity()`): explicit `sameAs` → an existing row with the same slug (following `canonical_id`) →
-  any key match with a compatible type → else a new slug. A redirected mention becomes an alias, evidence records
+  any key match with a compatible type (an entity one of the spellings names before one that only carries it as an
+  alias, then the most mentioned) → else a new slug. A redirected mention becomes an alias, evidence records
   `resolved_from`. A scope‑local key index covers the body before the fold publishes keys; declared frontmatter facts
   are applied before concept mining.
+- A spelling that is one typed entity's name and another entity's alias belongs to the entity it names (since
+  2026‑10‑30): in the tier‑0 link index (`buildLinkIndex`), so in the views' mention marking and in the known entities
+  the tier‑1 prompt offers, and in `[[link]]` resolution (`entitiesNamed`). An entity past the index's candidate limit
+  is listed for its own name when a listed one carries that name as an alias (`namedPastLimit`), and a document's
+  declared author (`source:`) links to the entity the name names, not to every entity carrying it. Before, the most
+  mentioned candidate took every key, and the wrong aliases extraction merges leave (HBM on 芯片, 机器人 on 科技, 晶圆厂
+  on 半导体) handed a smaller entity's link surface to the hub, and the prompt named the hub for that spelling. On the
+  finance graph that moved 5,789 of 61,944 link keys and changed the tier‑0 links of 19,247 of 23,264 documents.
 - Extraction‑time linking: the tier‑1 prompt lists known entities present in the text; the LLM answers with `sameAs`.
 - Merges: `entity_links` + `entities.canonical_id`, written by a `merge` scope as an explicit effect (inverse
   `entity_link.remove`); `applyMerge / unmergeEntity` log ledger feedback that `rebuild` replays. Reads (graph search,

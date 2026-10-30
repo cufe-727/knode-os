@@ -87,6 +87,9 @@ relations:
 宁德时代、比亚迪和曾毓群出现在同一段里，Apple 也在。
 `);
   write(ws.dataDir, 'raw/docs/notes.md', `# 笔记\n\n[[动力电池]] 行业里，宁德时代与比亚迪都很强。固态电解质是新方向，固态电解质的成本在降，固态电解质值得跟踪。\n`);
+  // a hotter entity carrying a smaller one's own name as an alias, as extraction merges leave them
+  write(ws.dataDir, 'raw/docs/chips-1.md', `---\ntitle: chips\nentities:\n  - { name: "HBM", type: technology }\n  - { name: "芯片", type: product, aliases: ["HBM"] }\n---\n芯片供不应求，HBM 是瓶颈。\n`);
+  for (const n of [2, 3]) write(ws.dataDir, `raw/docs/chips-${n}.md`, `---\ntitle: chips ${n}\nentities: [{ name: "芯片", type: product }]\n---\n芯片又涨了 ${n} 次。\n`);
   await sync(ws, { llmGraph: false });
   // one entity folded into another: either id opens the survivor
   await applyMerge(ws.store, { entityId: await idOf('宁王'), canonicalId: await idOf('宁德时代'), actor: 'test', log: false });
@@ -172,6 +175,15 @@ describe('POST /api/entities/mentions', () => {
     }
   });
 
+  it('marks a spelling as the entity it names, not as a hotter entity that carries it as an alias', async () => {
+    const [chips] = await ws.store.query<{ aliases: string[]; mention_count: number }>(`SELECT aliases, mention_count FROM entities WHERE id = $1`, [await idOf('芯片')]);
+    const [hbm] = await ws.store.query<{ mention_count: number }>(`SELECT mention_count FROM entities WHERE id = $1`, [await idOf('HBM')]);
+    expect(chips.aliases).toContain('HBM');
+    expect(chips.mention_count).toBeGreaterThan(hbm.mention_count);
+    const { mentions: found } = await mentions('芯片涨价，HBM 缺货，芯片厂扩产。');
+    expect(found.map((m) => `${m.name}:${m.surfaces.join('/')}:${m.count}`)).toEqual(['芯片:芯片:2', 'HBM:HBM:1']);
+  });
+
   it('answers nothing for empty text and refuses a body without text', async () => {
     expect((await mentions('   ')).mentions).toEqual([]);
     const res = await app.request('/api/entities/mentions', { method: 'POST', headers, body: JSON.stringify({ path: 'raw/docs/seed.md' }) });
@@ -225,6 +237,8 @@ describe('GET /api/link/resolve', () => {
     }
     // from a document outside the wiki, too
     expect(await (await resolve('CATL', 'raw/docs/notes.md')).json()).toMatchObject({ entity: { name: '宁德时代' } });
+    // a spelling one entity is named and a hotter one carries as an alias opens the one it names
+    expect(await (await resolve('HBM')).json()).toEqual({ path: null, fragment: null, entity: { id: await idOf('HBM'), name: 'HBM', type: 'technology' } });
   });
 
   it('prefers a note, then the entity’s own page', async () => {
