@@ -14,6 +14,7 @@ import {
   findLinks,
   frontmatterNames,
   learnFrequentTerms,
+  LinkIndex,
   loadLinkCandidates,
   maskSpans,
   namedPastLimit,
@@ -466,10 +467,38 @@ describe('tier-0 through sync', () => {
     const index = buildLinkIndex(listed);
     expect(index.byKey.get(keyOf('晶圆厂'))?.name).toBe('半导体');
     const named = await namedPastLimit(ctx.store, index);
-    expect(named.map((c) => [c.name, c.keys])).toEqual([['晶圆厂', [keyOf('晶圆厂')]]]);
+    expect(named.filter((c) => c.name === '晶圆厂').map((c) => c.keys)).toEqual([[keyOf('晶圆厂')]]);
     const full = buildLinkIndex([...listed, ...named]);
     expect(full.byKey.get(keyOf('晶圆厂'))?.name).toBe('晶圆厂');
-    // the same spellings link, only to the entity they name
-    expect([...full.byKey.keys()].sort()).toEqual([...index.byKey.keys()].sort());
+  });
+
+  it('lists an entity past the candidate limit for its own name when a listed spelling sits inside it', async () => {
+    write(dataDir, 'raw/docs/phoenix-1.md', `---\ntitle: 凤凰\nentities:\n  - { name: 凤凰传媒, type: organization, aliases: ["凤凰出版"] }\n  - { name: 凤凰卫视, type: organization }\n  - { name: 皖新文化, type: organization }\n---\n# 凤凰\n\n凤凰传媒、凤凰卫视与皖新文化。\n`);
+    for (const n of [2, 3, 4]) write(dataDir, `raw/docs/phoenix-${n}.md`, `---\ntitle: 航运 ${n}\nentities: [{ name: 凤凰航运, type: organization, aliases: ["凤凰"] }]\n---\n# 航运 ${n}\n\n凤凰航运运价。\n`);
+    await sync(ctx, { llmGraph: false });
+    const all = await loadLinkCandidates(ctx.store, dataDir);
+    const hub = all.findIndex((c) => c.name === '凤凰航运');
+    expect(hub).toBeGreaterThanOrEqual(0);
+    expect(all.findIndex((c) => c.name === '凤凰传媒')).toBeGreaterThan(hub);
+    const listed = await loadLinkCandidates(ctx.store, dataDir, hub + 1);
+    const index = buildLinkIndex(listed);
+    const linked = (text: string, ix: LinkIndex) => findLinks(text, ix).map((s) => `${text.slice(s.start, s.end)}:${s.candidate.name}`);
+    // the limit cuts between them: the full name falls to the shorter spelling inside it
+    expect(linked('凤凰传媒', index)).toEqual(['凤凰:凤凰航运']);
+
+    const named = await namedPastLimit(ctx.store, index, new Set([keyOf('凤凰卫视')]));
+    expect(named.find((c) => c.name === '凤凰传媒')?.keys).toEqual([keyOf('凤凰传媒')]);
+    // a name that holds no listed spelling stays tier-1's; a corpus-frequent one is held to the alias rule
+    expect(named.map((c) => c.name)).not.toContain('皖新文化');
+    expect(named.map((c) => c.name)).not.toContain('凤凰卫视');
+    // every name listed is, or holds, a spelling the index already links
+    for (const c of named) expect(index.byKey.has(c.keys[0]) || findLinks(c.name, index).length > 0).toBe(true);
+
+    const full = buildLinkIndex([...listed, ...named]);
+    expect(linked('凤凰传媒和凤凰航运', full)).toEqual(['凤凰传媒:凤凰传媒', '凤凰航运:凤凰航运']);
+    expect(linked('凤凰卫视', full)).toEqual(['凤凰:凤凰航运']);
+    expect(linked('皖新文化', full)).toEqual([]);
+    // the name alone: an alias past the limit is still the shorter spelling's
+    expect(linked('凤凰出版', full)).toEqual(['凤凰:凤凰航运']);
   });
 });

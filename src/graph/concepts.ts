@@ -43,7 +43,9 @@ import { PageContext } from './store.js';
  *      for them — names, aliases and the names of entities merged into them,
  *      via entity_alias_keys — plus the author its frontmatter declares in
  *      `source:`. A spelling that is one entity's name and another's alias
- *      links to the entity it names (buildLinkIndex). Latin spellings match
+ *      links to the entity it names (buildLinkIndex), and a typed entity's
+ *      full name keeps its span against a shorter spelling inside it, however
+ *      rarely the entity is mentioned (namedPastLimit). Latin spellings match
  *      whole words, CJK spellings match as substrings. One mention is enough.
  *      A spelling that would link on its own in any text is no surface
  *      (weakLinkKey): a number of fewer than five digits, a one- or
@@ -434,7 +436,7 @@ export function maskSpans(text: string, spans: { start: number; end: number }[])
   return out + text.slice(cursor);
 }
 
-/** Hottest typed entities offered as link targets; the long tail of once-seen entities is left to tier-1, but for names a listed entity carries as aliases (namedPastLimit). */
+/** Hottest typed entities offered as link targets; the long tail of once-seen entities is left to tier-1, but for names that hold a listed spelling (namedPastLimit). */
 export const LINK_CANDIDATE_LIMIT = 10_000;
 
 interface CandidateRow {
@@ -484,25 +486,37 @@ export async function loadLinkCandidates(q: Queryable, dataDir: string, limit = 
 }
 
 /**
- * Live typed entities past the candidate limit whose own name a listed
- * entity carries as an alias (晶圆厂 on 半导体), each with that one key, so
- * the index gives the spelling to the entity it names. Only spellings the
- * index already links are looked up: no text links that did not link before.
+ * Live typed entities past the candidate limit, each listed for its own name
+ * alone when that name is a spelling the index links (晶圆厂, which 半导体
+ * carries as an alias) or holds one (凤凰传媒 holds 凤凰, which links
+ * 凤凰航运; 华强科技 holds the hub 科技). The text names the entity: without
+ * it the shorter spelling takes the span, and which entity a document links
+ * would depend on how often this one was mentioned when the document was
+ * planned. Every span this adds covers one that linked before, so no text
+ * links that did not link before. A name that holds no listed spelling stays
+ * tier-1's, as does every alias past the limit, and a name that is a
+ * corpus-frequent word (in `aliasStop`) is held to the alias rule: an entity
+ * mentioned this rarely is not the corpus's hub.
  */
-export async function namedPastLimit(q: Queryable, index: LinkIndex): Promise<LinkCandidate[]> {
-  const carried = new Set<string>();
-  for (const [k, c] of index.byKey) if (keyOf(c.name) !== k) carried.add(k);
-  if (carried.size === 0) return [];
+export async function namedPastLimit(q: Queryable, index: LinkIndex, aliasStop?: ReadonlySet<string>): Promise<LinkCandidate[]> {
+  const listed = new Set<string>();
+  for (const c of index.byKey.values()) if (c.id) listed.add(c.id);
   const rows = await q.query<{ id: string; name: string; type: string; mention_count: number }>(
     `SELECT id, name, type, mention_count FROM entities
-     WHERE name_key = ANY($1::text[]) AND tx_to IS NULL AND type <> 'concept' AND canonical_id IS NULL
+     WHERE tx_to IS NULL AND type <> 'concept' AND canonical_id IS NULL
      ORDER BY mention_count DESC, id`,
-    [[...carried]],
   );
-  // name_key drops a corporate suffix: the spelling itself must be the name
-  return rows
-    .filter((r) => carried.has(keyOf(r.name)))
-    .map((r) => ({ id: r.id, name: r.name, type: r.type, keys: [keyOf(r.name)], aliases: [], mentions: Number(r.mention_count) || 0 }));
+  const out: LinkCandidate[] = [];
+  for (const r of rows) {
+    if (listed.has(r.id)) continue;
+    const k = keyOf(r.name);
+    if (k.length < 2 || k.length > MAX_KEY_CHARS || aliasStop?.has(k)) continue;
+    const owner = index.byKey.get(k);
+    // a listed entity of the same name keeps it
+    if (owner ? keyOf(owner.name) === k : findLinks(r.name, index).length === 0) continue;
+    out.push({ id: r.id, name: r.name, type: r.type, keys: [k], aliases: [], mentions: Number(r.mention_count) || 0 });
+  }
+  return out;
 }
 
 /** Live typed entities answering to any of the given spellings (a document's declared names), hottest first. */
@@ -625,7 +639,7 @@ async function refreshKnown(store: Store, c: KnownCache, force: boolean): Promis
     // frequent word links nothing (weakLinkKey)
     c.linkStop = stopKeySet(editable, null);
     const index = buildLinkIndex(c.rows, c.linkStop, c.stop);
-    const named = await namedPastLimit(store, index);
+    const named = await namedPastLimit(store, index, c.stop);
     c.index = named.length > 0 ? buildLinkIndex([...c.rows, ...named], c.linkStop, c.stop) : index;
     c.stopStamp = stopStamp;
   }
