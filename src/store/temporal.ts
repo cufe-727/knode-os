@@ -121,6 +121,15 @@ export const TYPE_PRECEDENCE = ['person', 'organization', 'product', 'project', 
  * as_of reads). `aliasStop` names the words an alias may not be (the stop
  * lists, by normalized key): an extractor's "other spelling" that is an
  * ordinary word stays in the evidence but out of the row.
+ *
+ * The type is the one most evidence rows read, among the types `precedence`
+ * lists other than `concept`; the declared order only breaks a tie. `concept`
+ * is the fallback tier-0 links, mind maps and mined terms write without
+ * reading the entity, so it counts only when nothing typed was read, and a
+ * type the ontology no longer has counts after it. Precedence first let one
+ * stray reading decide: in finance (2026-10-30) 14 `organization` readings
+ * outranked 1,090 `theme` ones for 人工智能, and one `product` reading 363
+ * `market` ones for 创业板.
  */
 export function foldEntityEvidence(
   id: string,
@@ -143,11 +152,10 @@ export function foldEntityEvidence(
   }
   let type = fallback?.type ?? 'concept';
   if (typeVotes.size > 0) {
-    type = [...typeVotes.entries()].sort((a, b) => {
-      const pa = precedence.indexOf(a[0]);
-      const pb = precedence.indexOf(b[0]);
-      return (pa === -1 ? precedence.length : pa) - (pb === -1 ? precedence.length : pb) || b[1] - a[1] || a[0].localeCompare(b[0]);
-    })[0][0];
+    const place = (t: string) => (precedence.includes(t) ? precedence.indexOf(t) : precedence.length);
+    const typed = (t: string) => (t === 'concept' ? 1 : precedence.includes(t) ? 0 : 2);
+    type = [...typeVotes.entries()].sort((a, b) =>
+      typed(a[0]) - typed(b[0]) || b[1] - a[1] || place(a[0]) - place(b[0]) || a[0].localeCompare(b[0]))[0][0];
   }
   let description = '';
   for (const r of rows) {
@@ -262,8 +270,13 @@ export function foldClaimEvidence(row: { id: string; subject_id: string; stateme
   };
 }
 
-/** Entities as they were at `asOf`, recomputed from evidence (mention counts are current). */
-export async function entitiesAsOf(q: Queryable, ids: string[], asOf: string): Promise<EntityAsOf[]> {
+/**
+ * Entities as they were at `asOf`, recomputed from evidence (mention counts are
+ * current). `precedence` is the workspace ontology's type order
+ * (graph/ontology.ts typePrecedence), without which a type no core pack
+ * declares counts only after `concept`.
+ */
+export async function entitiesAsOf(q: Queryable, ids: string[], asOf: string, precedence?: readonly string[]): Promise<EntityAsOf[]> {
   if (ids.length === 0) return [];
   const rows = await evidenceAsOf(q, 'entity', ids, asOf);
   const grouped = groupBy(rows, (r) => r.target_id);
@@ -275,7 +288,7 @@ export async function entitiesAsOf(q: Queryable, ids: string[], asOf: string): P
   const out: EntityAsOf[] = [];
   for (const id of ids) {
     const cur = byId.get(id);
-    const folded = foldEntityEvidence(id, grouped.get(id) ?? [], cur?.mention_count ?? 0, cur ?? undefined);
+    const folded = foldEntityEvidence(id, grouped.get(id) ?? [], cur?.mention_count ?? 0, cur ?? undefined, precedence);
     if (folded) out.push({ ...folded, wiki_path: cur?.wiki_path ?? null });
   }
   return out;

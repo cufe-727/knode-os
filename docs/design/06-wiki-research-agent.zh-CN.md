@@ -43,7 +43,7 @@ serve: /api/* + /mcp（Streamable HTTP，按工作区路由，bearer token）◀
 - 本体包 `playbooks/ontology/<pack>.yaml`，按 `graph.ontologyPacks`（默认 `["core","organization"]`）顺序合并；
   `initDataDir` 播种内置包，之后不覆盖用户编辑。关系类型字段：`id / inverse / symmetric / hierarchical / temporal /
   domain / range / synonyms / inverseSynonyms / description / system`。实体类型带 `label / description / examples`，
-  tier‑1 prompt 逐行列出每个类型及其说明；后面的包可以重述一个类型来改写说明，位置（即折叠优先级）不变。
+  tier‑1 prompt 逐行列出每个类型及其说明；后面的包可以重述一个类型来改写说明，位置（即 fold 平票时的先后）不变。
 - 第三个内置包 `finance`（可选启用，2026‑10‑23）是股市语料的词汇：实体类型 `market`、`index`、`security`（不是公司
   也不是基金的可交易工具；上市公司仍是 `organization`，股票代码放 aliases）、`fund`、`sector`、`theme`、`indicator`、
   `currency`、`commodity`、`policy`；关系 `listed_on`、`constituent_of`、`belongs_to_sector`、`tracks`、`issued_by`、
@@ -75,8 +75,8 @@ serve: /api/* + /mcp（Streamable HTTP，按工作区路由，bearer token）◀
   → `suggestions` kind `merge`（依赖两个实体，任一 tombstone 即 stale；拒绝过的对不再提出）。接受 → `applyMerge`。
 - 接口：`knode-os entities merge|unmerge|merges|dedupe|resolve`，`POST /api/entities/merge|unmerge|dedupe`，`GET /api/entities/merges`。
 - 人工更正（`src/graph/corrections.ts`，2026‑10‑30 起）：`playbooks/entities/corrections.yaml` 按实体 id 给出 `type` 与
-  `notAliases`（该实体不对应的拼写），由 fold 在证据之上套用。类型取代按优先级选出的类型；按优先级，一票 `organization`
-  就压过上千票 `theme`。被拒拼写（带不带公司后缀都算）退出别名列表和查找键，合并进来的成员带来的键也一样；之后的消歧
+  `notAliases`（该实体不对应的拼写），由 fold 在证据之上套用。类型取代 fold 选出的类型，即读得最多的类型化读法（见 [05](05-agent-context-db.zh-CN.md) §4.3），
+  而抽取可能多数时候都读错：人工智能 被读成 `product` 2,247 次、`theme` 1,090 次。被拒拼写（带不带公司后缀都算）退出别名列表和查找键，合并进来的成员带来的键也一样；之后的消歧
   （`sameAs`、键命中、成员的键）和写入时的本地键索引都不再把它落到该实体上。证据不改写：删掉一条即恢复抽取结果，rebuild
   保留该文件。`knode-os entities correct <实体> --type … --not-alias … [--clear]` 写入一条、记 `entity.correct` feedback
   并重新 fold 该实体；`entities corrections` 列出全部。更正之前已应用的文档保留当时的重定向，直到再次应用

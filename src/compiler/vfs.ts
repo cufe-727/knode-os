@@ -4,6 +4,7 @@ import { runSourceQuery } from '../datasource/execute.js';
 import { queryClaims } from '../store/claims.js';
 import { entitiesAsOf } from '../store/temporal.js';
 import { graphSearch } from '../graph/query.js';
+import { loadOntology, typePrecedence } from '../graph/ontology.js';
 import { resolveTemporal } from '../store/resolver.js';
 
 /**
@@ -88,7 +89,7 @@ async function renderEntity(ctx: AppContext, id: string, asOf: string | null): P
   }
 
   const [entity] = asOf
-    ? await entitiesAsOf(ctx.store, [id], asOf)
+    ? await entitiesAsOf(ctx.store, [id], asOf, typePrecedence(loadOntology(ctx.dataDir)))
     : await ctx.store.query<{ id: string; name: string; type: string; description: string; aliases: string[]; mention_count: number; evidence_count: number; wiki_path: string | null; canonical_id?: string | null }>(
       `SELECT id, name, type, description, aliases, mention_count, evidence_count, wiki_path, canonical_id FROM entities WHERE id = $1 AND tx_to IS NULL`, [id],
     );

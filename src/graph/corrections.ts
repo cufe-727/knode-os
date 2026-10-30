@@ -10,9 +10,11 @@ import { nameKey } from './normalize.js';
  * `playbooks/entities/corrections.yaml` by entity id. The fold
  * (src/lineage/fold.ts) applies them over whatever the extractors said:
  *
- *   type        replaces the folded type. The fold goes by the ontology's
- *               precedence, where one stray "organization" reading outranks a
- *               thousand "theme" ones (人工智能 in finance, 2026-10-30).
+ *   type        replaces the folded type. The fold takes the most-read typed
+ *               reading, and extraction can misread a name most of the time:
+ *               in finance (2026-10-30) 人工智能 was read as a product 2,247
+ *               times and as a theme 1,090, A股 as a dataset 3,653 times and
+ *               as a market 2,739.
  *   notAliases  spellings the entity does not answer to. They leave its alias
  *               list and its lookup keys — with or without a corporate suffix,
  *               whichever merged member brought them — so nothing links or

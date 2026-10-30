@@ -696,7 +696,8 @@ export function relationSpec(ont: Ontology, id: string): RelationTypeSpec | unde
 
 /**
  * Type precedence for the entity fold: the declared order, with `concept`
- * (the extraction fallback) always losing to anything more specific.
+ * (the extraction fallback) last. The fold takes the most-read type and
+ * consults this order only to break a tie (store/temporal.ts).
  */
 export function typePrecedence(ont: Ontology): string[] {
   const ids = ont.entityTypes.map((t) => t.id).filter((id) => id !== 'concept');

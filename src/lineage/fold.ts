@@ -20,7 +20,9 @@ import { emptyTouched, TouchedSet } from './types.js';
  *
  * Rules are order-independent so a rebuild reproduces the same rows:
  *   entity   name = highest-weight evidence (ties: earliest, then lexicographic),
- *            type by fixed precedence, longest description, alias union,
+ *            type = the most-read typed reading (the ontology's order breaks a
+ *            tie; concept only when nothing typed was read), a person's
+ *            correction over both, longest description, alias union,
  *            mention_count = distinct chunks mentioning it
  *   relation weight = SUM(evidence.weight), longest description
  *   claim    status: all-absent > disputed > fact > suspected; valid_from = MIN;

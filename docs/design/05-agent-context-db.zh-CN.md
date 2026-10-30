@@ -96,10 +96,12 @@ datasets  + scope_id, tx_from, tx_to ；documents + scope_id, kind: source|view�
 
 新模型：实体/关系/断言仍是**内容寻址的共享行**，但每个 source 对它的支持是一条 `evidence`；可见列由 `src/lineage/fold.ts` 在 apply/dispose 的同一事务内**只对被触及的 id** 从活跃 evidence 重算，规则与顺序无关（重建可复现）：
 
-- entity：`name` = 最高权重 evidence 的名字（并列取最早、再字典序）；`type` 按固定优先级；`description` 最长；`aliases` 大小写不敏感并集；`mention_count = COUNT(DISTINCT chunk_id)`。
+- entity：`name` = 最高权重 evidence 的名字（并列取最早、再字典序）；`type` = 活跃 evidence 读得最多的类型，只在本体里除 `concept` 以外的类型中选——声明顺序（`typePrecedence`）只用来打破平票，`concept` 只在没有任何类型化读法时胜出，人工更正（`playbooks/entities/corrections.yaml`，见 [06](06-wiki-research-agent.zh-CN.md) §3）覆盖这个结果；`description` 最长；`aliases` 大小写不敏感并集；`mention_count = COUNT(DISTINCT chunk_id)`。
 - relation：`weight = SUM(evidence.weight)`，每个来源一行，重 ingest 不累加。只有**类型化谓词**落库：`co_occurs` **读时推导、不再存储**（迁移 v13，2026-10-18）——`src/graph/cooccur.ts` 从 `entity_mentions` 计算：同一篮活文档提到两个实体即共现（每个共享文档 0.2），同一 chunk 提到则更强（每个共享 chunk +0.3）；`graphSearch`（跳跃增益 ×0.5）、`graphOverview`、`graphInsights`（孤立实体列表）都从这里读。旧的 co_occurs 行没有任何 mention 之外的信息，却占 finance 工作区 relations 表的 92%（912k 中的 844k，背后 2.0M 条 evidence）；迁移本身只建 mention 按文档的索引并打标记，新代码首次打开后在后台分批删除（`dropStoredCoOccurrence`：每条语句 1 万条关系、各自提交，该工作区的 Postgres 副本上每批约 1 秒、共约 100 秒，打开本身 0.1 秒即返回；`close` 时停下，下次打开续跑），期间读取端忽略该类型的行。
 - claim：任一 disputed → disputed，否则任一 fact → fact，否则 suspected；`valid_from = MIN`；`valid_to` 任一为空则为空（"未注明结束的再次断言 = 仍在断言"），否则 MAX；`primary_scope_id` = 最早的活跃来源。
 - 活跃 evidence 归零，或端点实体 / 主体实体已 tombstone → 行 tombstone（`tx_to`）；重新获得 evidence → 重开（`tx_from` 更新，完整历史在 evidence）。
+
+为什么取读得最多的类型（2026‑10‑30 起）：fold 原先先按优先级、再按票数排，一条偶然的读法就能决定类型。finance 里 14 票 `organization` 压过了 人工智能 的 1,090 票 `theme`，1 票 `product` 压过了 创业板 的 363 票 `market`；1,029 个活实体（其中 496 个提及 ≥ 20 次）的类型不是读得最多的那个——美股、港股 是 organization，中国、美国 也是 organization，重复审计于是把它们和每一家以它们开头的公司配成对，半导体、银行 是 product 或 organization，美联储、SpaceX 是 person。`concept` 是 tier‑0 链接、思维导图和挖出的词不读实体就写下的兜底类型（finance 有 79.3 万条链接 evidence），不能拿来否决真正的读法；tier‑1 自己读出的 `concept` 也不计票：计入会让 230 个实体失去类型、退出链接面，其中有 中特估、基建、LPR。`other` 和其他类型一样计票：抽取器读过这个名字，没有更合适的类型（流动性：634 票 `other`，70 票 `indicator`）。抽取大多数时候都读错的名字，票数最多的仍是错的（A股：3,653 票 `dataset`，2,739 票 `market`），平票仍按顺序落定（券商：`organization`、`sector` 各 364 票）；这些由人工更正解决。
 
 为什么不用视图或增量计数器：全表 `GROUP BY evidence` 会让每个热查询（`graphSignal`、SAG 排序、`matchEntities`）变慢，PGlite 单线程无并行；增量计数器要求所有写者纪律一致，而 touched-id 重算按构造精确且自愈（`sync --verify` 做全量重算并报告漂移）。
 
