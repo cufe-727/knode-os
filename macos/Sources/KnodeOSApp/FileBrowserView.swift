@@ -1097,11 +1097,13 @@ struct FileBrowserView: View {
         }
     }
 
-    private func openFile(_ path: String) async {
+    /// `whole`: read past the preview cap, as far as the edit cap, for a link
+    /// into the file whose #fragment may lie beyond the preview (a filing's later sections).
+    private func openFile(_ path: String, whole: Bool = false) async {
         isWorking = true
         defer { isWorking = false }
         do {
-            let response = try await read(path)
+            let response = try await read(path, maxBytes: whole ? Self.editByteCap : nil)
             // a request's answer was about the file it was made for
             if response.path != selectedPath { translationProcessing = nil }
             selectedPath = response.path
@@ -1123,16 +1125,16 @@ struct FileBrowserView: View {
     /// known, or a pick this workspace does not offer — and reading again
     /// would show something else: a translation that exists, or the original
     /// instead of one.
-    private func read(_ path: String) async throws -> FileResponse {
+    private func read(_ path: String, maxBytes: Int? = nil) async throws -> FileResponse {
         // the originals need no language: the original is what comes without one
         let asked = readingLanguagePick == Self.originalsPick ? nil : readingLanguagePick.isEmpty ? workspacePrimary : readingLanguagePick
-        let response = try await model.client().file(at: path, lang: asked)
+        let response = try await model.client().file(at: path, maxBytes: maxBytes, lang: asked)
         guard let languages = response.languages, let wanted = readingLanguage(for: languages), wanted != asked else { return response }
         let worthReading = ContentLanguage.same(wanted, languages.source)
             ? response.translation != nil
             : ["done", "partial"].contains(languages.translations[wanted]?.status ?? "")
         guard worthReading else { return response }
-        return try await model.client().file(at: path, lang: wanted)
+        return try await model.client().file(at: path, maxBytes: maxBytes, lang: wanted)
     }
 
     /// The language to read a document in: its own for a reader who picked
@@ -1289,7 +1291,8 @@ struct FileBrowserView: View {
             }
             guard let path = resolved.path else { return }
             if path != selectedPath {
-                await leave(for: path, returningTo: block)
+                // the place may lie past the preview cap, so a file opened at one is read whole, as on the web
+                await leave(for: path, returningTo: block, whole: resolved.fragment != nil)
             }
             scrollTarget = resolved.fragment.map(MarkdownScrollTarget.fragment)
         } catch {
@@ -1310,10 +1313,10 @@ struct FileBrowserView: View {
     }
 
     /// Open another file, remembering this one and where in it the reader was, for ‹.
-    private func leave(for path: String, returningTo block: Int?) async {
+    private func leave(for path: String, returningTo block: Int?, whole: Bool = false) async {
         let origin = selectedPath.map { FileReturn(path: $0, block: block) }
         await showInTree(path)
-        await openFile(path)
+        await openFile(path, whole: whole)
         guard let origin, selectedPath == path else { return }
         backTrail.append(origin)
         if backTrail.count > 50 { backTrail.removeFirst() }

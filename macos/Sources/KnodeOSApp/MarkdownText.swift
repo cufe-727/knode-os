@@ -48,6 +48,10 @@ struct MarkdownText: View {
     /// Blocks lit up after a jump, and which jump lit them.
     @State private var flashed: Set<Int> = []
     @State private var flashGeneration = 0
+    /// Counts the times new blocks went to the stack: a jump into a document
+    /// waits for its blocks to be there, since one made the moment they are
+    /// set lands among the previous document's (block ids are positions).
+    @State private var drawn = 0
 
     init(
         markdown: String,
@@ -87,17 +91,19 @@ struct MarkdownText: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .environment(\.openURL, OpenURLAction { url in open(url, proxy) })
             .task(id: RenderKey(markdown: markdown, mentions: mentions)) {
-                await render()
-                reveal(scrollTarget, proxy)
+                // new blocks bring the jump through `drawn` once the stack holds them; without any it can go now
+                if !(await render()) { reveal(scrollTarget, proxy) }
             }
+            .onChange(of: drawn) { reveal(scrollTarget, proxy) }
             .onChange(of: scrollTarget) { _, target in reveal(target, proxy) }
         }
     }
 
-    private func render() async {
+    /// Parse and mark what changed; true when new blocks went to the stack.
+    private func render() async -> Bool {
         let source = markdown
         let marks = mentions
-        guard document.source != source || markedWith != marks || blocks.count != document.blocks.count else { return }
+        guard document.source != source || markedWith != marks || blocks.count != document.blocks.count else { return false }
         let reparse = document.source != source
         if source.count <= Self.asyncParseThreshold {
             if reparse { document = MarkdownDocument(source: source) }
@@ -108,11 +114,13 @@ struct MarkdownText: View {
                 let parsed = reparse ? MarkdownDocument(source: source) : current
                 return (parsed, parsed.marking(marks))
             }.value
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else { return false }
             document = parsed
             blocks = marked
         }
         markedWith = marks
+        drawn &+= 1
+        return true
     }
 
     /// The links the view answers itself — a note, the way back from one, an entity — and the in-app ones it hands up.
