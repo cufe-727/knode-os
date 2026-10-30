@@ -469,8 +469,9 @@ struct FileBrowserView: View {
                 } else {
                     ScrollView {
                         Group {
-                            if selectedPath.hasSuffix(".md") || selectedPath.hasSuffix(".markdown") {
-                                MarkdownText(markdown: content, mentions: mentions, scrollTarget: $scrollTarget, onOpenEntity: { id, block in
+                            // a mind map read off a picture is Markdown too: it is drawn as its tree (docs/design/19)
+                            if selectedPath.hasSuffix(".md") || selectedPath.hasSuffix(".markdown") || isDerived && MindMapOutline.isMindMap(page: content) {
+                                MarkdownText(markdown: content, mentions: mentions, scrollTarget: $scrollTarget, picture: Self.mindMapPicture(for: selectedPath), onOpenEntity: { id, block in
                                     openEntity(id, from: block)
                                 }) { target, block in
                                     Task { await openKnowledgeLink(target, from: selectedPath, block: block) }
@@ -1889,6 +1890,17 @@ struct FileBrowserView: View {
     /// owner writes, which stay out of moves, renames and deletes all the same.
     private func isEditablePath(_ path: String) -> Bool {
         isWritable(path) || TreeNode.ownerRootFiles.contains(path)
+    }
+
+    /// The picture a mind map on `path` was read from, as the web file view
+    /// finds it: the picture itself, its derived Markdown on screen, or the one
+    /// a reviewed transcript (`x.webp.md`) sits beside.
+    private static func mindMapPicture(for path: String) -> String? {
+        let pictures: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tif", "tiff", "heic", "heif", "svg"]
+        let isPicture = { (path: String) in pictures.contains((path as NSString).pathExtension.lowercased()) }
+        if isPicture(path) { return path }
+        let original = String(path.dropLast(3))
+        return path.lowercased().hasSuffix(".md") && isPicture(original) ? original : nil
     }
 }
 

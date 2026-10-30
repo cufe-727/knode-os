@@ -2,7 +2,8 @@
 
 > Status: **implemented** (2026‑10‑30). Canonical form `type: MindMap` (src/mindmap/outline.ts), image
 > converter version 2 (mind maps come back as outlines), reviewed transcripts `<original>.md`, branch-path
-> chunks, extractor `tier0.mindmap` (src/mindmap/graph.ts), web/mindmap.js + web/mindmap.css.
+> chunks, extractor `tier0.mindmap` (src/mindmap/graph.ts), web/mindmap.js + web/mindmap.css; in the Mac app
+> MindMapOutline.swift + MarkdownMindMap.swift.
 
 ## 0. What was there
 
@@ -88,7 +89,11 @@ picture, a transcript, a `raw/docs/…/x.md` a person wrote, or a wiki page (who
   *outline*, and *picture* when there is one. Names the graph knows are entity links in their type's colour,
   first mention each; a click opens the entity panel, whose relations list the map's edges with their paths.
 - **Embed reader** (`/embed/v1`). The same map, read-only.
-- **Mac app, Obsidian.** The outline as a nested list.
+- **Mac app.** The same map, drawn natively (`MarkdownMindMap.swift`, read by `MindMapOutline.swift`, which
+  mirrors web/mindmap.js): *fit*, *unfold all*, *outline* and *picture* (fetched through `/api/file/original`),
+  for a picture's derived Markdown and for a transcript beside one alike. Named nodes are marked through the
+  Markdown view's mention marking, first mention each, and a click opens the entity panel.
+- **Obsidian.** The outline as a nested list.
 - **Search and context packs.** Chunks with their paths: a hit on 永贵电器 shows `华为 › 华为智驾 › 液冷超充`.
 
 ## 5. Known limits
@@ -105,7 +110,6 @@ picture, a transcript, a `raw/docs/…/x.md` a person wrote, or a wiki page (who
   where it has no rule; rules in the ontology pack would be the next step.
 - No native mind-map files yet. `.xmind` (a zip with `content.json`), `.opml`, `.mm` and `.km` hold the tree
   exactly and need no model: a converter plugin (docs/design/11) that writes D1's outline is all they need.
-- The Mac app shows the outline, not the map.
 
 ## 6. Where the changes go
 
@@ -118,4 +122,5 @@ picture, a transcript, a `raw/docs/…/x.md` a person wrote, or a wiki page (who
 | Chunks and tier‑0 for `type: MindMap` | `src/ingest/apply.ts` |
 | Extractor family `mindmap`; node names count as declared | `src/store/entities.ts`, `src/graph/mentions.ts` |
 | The map in the page | `web/mindmap.js`, `web/mindmap.css`, `web/markdown.js`, `web/app.js`, `web/index.html`, `web/embed/` |
+| The map in the Mac app | `macos/Sources/KnodeOSApp/MindMapOutline.swift`, `MarkdownMindMap.swift`, `MarkdownText.swift`, `FileBrowserView.swift` |
 | Tests | `tests/mindmap.test.ts`, `tests/web-mindmap.test.ts` |
