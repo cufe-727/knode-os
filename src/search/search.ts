@@ -23,6 +23,25 @@ export interface SearchOptions {
   asOf?: TimeInput;
   /** Restrict recall to certain source kinds / path prefixes. */
   filter?: ResolvedScopeFilter;
+  /** Give every result its rank in each recall channel (`SearchResult.ranks`), for a view that shows why it matched. */
+  explain?: boolean;
+}
+
+/** What one recall channel of a hybrid search found, and how long it took. */
+export interface SearchChannel {
+  /** Chunks it returned, before fusion. */
+  hits: number;
+  ms: number;
+  /** Set when the channel could not answer (an embedding provider out of quota); hybrid search goes on without it. */
+  error?: string;
+}
+
+export type SearchChannelName = 'vector' | 'keyword' | 'graph';
+
+export interface ExplainedSearch {
+  results: SearchResult[];
+  /** The channels that ran: all three in hybrid mode, one in vector or keyword mode, none for SAG. */
+  channels: Partial<Record<SearchChannelName, SearchChannel>>;
 }
 
 interface RankedChunk {
@@ -206,34 +225,62 @@ export async function search(
   query: string,
   opts: SearchOptions = {},
 ): Promise<SearchResult[]> {
+  return (await searchExplained(store, embedder, query, opts)).results;
+}
+
+/**
+ * `search`, with what each recall channel contributed: how many chunks it
+ * found, how long it took, and whether it failed. With `explain`, every
+ * result also carries its rank in each channel that found it.
+ */
+export async function searchExplained(
+  store: Store,
+  embedder: EmbeddingProvider,
+  query: string,
+  opts: SearchOptions = {},
+): Promise<ExplainedSearch> {
   const k = opts.k ?? 8;
   const mode = opts.mode ?? 'hybrid';
   if (mode === 'sag') {
     const { sagSearch } = await import('./sag.js');
-    return sagSearch(store, embedder, query, opts);
+    return { results: await sagSearch(store, embedder, query, opts), channels: {} };
   }
   const fetchK = Math.max(k * 3, 24);
+  const channels: ExplainedSearch['channels'] = {};
+  const timed = async (name: SearchChannelName, run: () => Promise<RankedChunk[]>, tolerate = false): Promise<RankedChunk[]> => {
+    const started = Date.now();
+    try {
+      const rows = await run();
+      channels[name] = { hits: rows.length, ms: Date.now() - started };
+      return rows;
+    } catch (err) {
+      channels[name] = { hits: 0, ms: Date.now() - started, error: err instanceof Error ? err.message : String(err) };
+      if (tolerate) return [];
+      throw err;
+    }
+  };
 
   // hybrid recall outlives an embedding provider that cannot serve the query
   // (a spent daily quota): keyword and graph still answer; vector mode says so
   const vectorRecall = () => vectorSearch(store, embedder, query, fetchK, opts.queryVector, opts.asOf, opts.filter);
   const [vec, kw, gr] = await Promise.all([
-    mode === 'hybrid' ? vectorRecall().catch(() => [] as RankedChunk[]) : mode === 'vector' ? vectorRecall() : Promise.resolve([]),
-    mode !== 'vector' ? keywordSearch(store, query, fetchK, opts.asOf, opts.filter) : Promise.resolve([]),
-    mode === 'hybrid' ? graphSignal(store, query, fetchK, opts.asOf, opts.filter) : Promise.resolve([]),
+    mode === 'hybrid' || mode === 'vector' ? timed('vector', vectorRecall, mode === 'hybrid') : Promise.resolve([]),
+    mode !== 'vector' ? timed('keyword', () => keywordSearch(store, query, fetchK, opts.asOf, opts.filter)) : Promise.resolve([]),
+    mode === 'hybrid' ? timed('graph', () => graphSignal(store, query, fetchK, opts.asOf, opts.filter)) : Promise.resolve([]),
   ]);
 
   const RRF_K = 60;
   const weights = { vector: 1.0, keyword: 1.0, graph: 0.6 };
   const fused = new Map<string, SearchResult>();
 
-  const fold = (list: RankedChunk[], signal: 'vector' | 'keyword' | 'graph') => {
+  const fold = (list: RankedChunk[], signal: SearchChannelName) => {
     list.forEach((r, rank) => {
       const score = weights[signal] / (RRF_K + rank + 1);
       const prev = fused.get(r.chunk_id);
       if (prev) {
         prev.score += score;
         prev.signals[signal] = r.raw;
+        if (prev.ranks) prev.ranks[signal] = rank + 1;
       } else {
         fused.set(r.chunk_id, {
           chunkId: r.chunk_id,
@@ -244,6 +291,7 @@ export async function search(
           docDate: toDateString(r.doc_date ?? null),
           score,
           signals: { [signal]: r.raw },
+          ...(opts.explain ? { ranks: { [signal]: rank + 1 } } : {}),
         });
       }
     });
@@ -266,5 +314,5 @@ export async function search(
   if (opts.track !== false) {
     await recordChunkHits(store, results.map((r) => ({ chunkId: r.chunkId, documentId: r.documentId })), heatCfg);
   }
-  return results;
+  return { results, channels };
 }

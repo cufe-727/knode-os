@@ -9,6 +9,7 @@ import { isHiddenName } from '../fs/files.js';
 import { RAW_DOCS, RAW_SKILLS, WIKI_DIR } from '../fs/layout.js';
 import { TreeWatcher, watchTree } from '../fs/watch.js';
 import { nightlySchedule, startDreamScheduler } from '../dream/dream.js';
+import { activityOf, describeSync, scopeLabel } from '../activity.js';
 import { CallLedger } from '../estimate/ledger.js';
 import { startFollowUp } from '../labeling/followup.js';
 import { judgesHere, LocalLabelingWorkers } from '../labeling/local.js';
@@ -137,7 +138,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
       services.set(workspaceCtx.dataDir, {
         mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders,
         labeling: started.labeling, work: started.work, localWorkers: started.localWorkers, processing: started.processing, translations: started.translations,
-        calls: started.calls,
+        calls: started.calls, embeddings: started.embeddings,
       });
       return async () => {
         services.delete(workspaceCtx.dataDir);
@@ -380,7 +381,7 @@ export function watchDataDir(ctx: SyncContext, opts: DataDirWatchOptions): TreeW
     fullSync = false;
     void track((async () => {
       try {
-        const stats = await sync(ctx, { only });
+        const stats = await activityOf(ctx.dataDir).run('sync', `Changes to ${scopeLabel(only)}`, () => sync(ctx, { only }), describeSync);
         if (stats.indexed || stats.disposed || stats.pagesRegenerated) summarize(log, 'watch sync', stats);
       } catch (err) {
         log(`watch sync failed: ${err instanceof Error ? err.message : err}`);
@@ -497,6 +498,7 @@ interface StartedServices {
   processing: LabelingProcessing;
   translations: TranslateSource;
   calls: CallLedger;
+  embeddings: EmbeddingBackfill;
 }
 
 function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null; rootDataDir?: string } = {}): StartedServices {
@@ -525,10 +527,11 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   // initial trace sync + full reconciliation (async, doesn't block startup)
   void track((async () => {
     try {
-      const ts = await syncTraces(ctx.store, ctx.config);
+      const activity = activityOf(ctx.dataDir);
+      const ts = await activity.run('traces', 'Collect agent traces', () => syncTraces(ctx.store, ctx.config), (r) => `${r.copied} traces, ${r.skills} skill files`);
       if (disposed) return;
       if (ts.copied || ts.skills) log(`trace sync: ${ts.copied} traces, ${ts.skills} skill files`);
-      summarize(log, 'sync', await sync(ctx, { onProgress: (m) => log(m) }));
+      summarize(log, 'sync', await activity.run('sync', 'Startup sync of the whole workspace', () => sync(ctx, { onProgress: (m) => log(m) }), describeSync));
     } catch (err) {
       log(`startup sync failed: ${err instanceof Error ? err.message : err}`);
     }
@@ -539,7 +542,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     if (disposed || ctx.config.datasources.length === 0) return;
     void track((async () => {
       try {
-        const s = await sync(ctx, { only: ['datasources'], onProgress: log });
+        const s = await activityOf(ctx.dataDir).run('datasources', 'Refresh datasource schemas', () => sync(ctx, { only: ['datasources'], onProgress: log }), (r) => `${r.pagesRegenerated} wiki pages refreshed`);
         if (s.pagesRegenerated > 0) log(`datasource sync: ${s.pagesRegenerated} wiki pages refreshed`);
       } catch (err) {
         log(`datasource sync failed: ${err instanceof Error ? err.message : err}`);
@@ -554,11 +557,12 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     if (disposed) return;
     void track((async () => {
       try {
-        const ts = await syncTraces(ctx.store, ctx.config);
-        if (ts.copied || ts.skills) {
-          log(`trace sync: ${ts.copied} traces, ${ts.skills} skill files`);
-          await sync(ctx, { only: ['raw/skills'] });
-        }
+        const ts = await activityOf(ctx.dataDir).run('traces', 'Collect agent traces', async () => {
+          const copied = await syncTraces(ctx.store, ctx.config);
+          if (copied.copied || copied.skills) await sync(ctx, { only: ['raw/skills'] });
+          return copied;
+        }, (r) => `${r.copied} traces, ${r.skills} skill files`);
+        if (ts.copied || ts.skills) log(`trace sync: ${ts.copied} traces, ${ts.skills} skill files`);
       } catch (err) {
         log(`trace sync failed: ${err instanceof Error ? err.message : err}`);
       }
@@ -658,6 +662,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     processing,
     translations,
     calls,
+    embeddings,
   };
 }
 
@@ -674,6 +679,7 @@ export function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void)
     const today = now.toISOString().slice(0, 10);
     if (hhmm === nightlySchedule(ctx.config)?.tier2 && lastRun !== today) {
       lastRun = today;
+      const end = activityOf(ctx.dataDir).begin('tier2', 'Nightly tier-2 pass: merges, claim reviews, views and the wiki check');
       try {
         const res = await refineWiki(ctx.store, ctx.config, ctx.llm, { onProgress: log, embedder: ctx.embedder });
         log(`tier2 done: ${res.mergeCandidates} merge suggestions, ${res.claimReviews} claim reviews, ${res.recommendations} research recommendations${res.retiredPages ? `, ${res.retiredPages} cluster pages archived` : ''}`);
@@ -681,8 +687,10 @@ export function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void)
         if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
         const lint = await lintWiki(ctx, { onProgress: log });
         log(`wiki lint: ${lint.issues.length} findings → ${lint.reportPath}`);
+        end({ detail: `${res.mergeCandidates} merge suggestions, ${res.claimReviews} claim reviews, ${lint.issues.length} wiki findings` });
       } catch (err) {
         log(`tier2 failed: ${err instanceof Error ? err.message : err}`);
+        end({ ok: false, detail: err instanceof Error ? err.message : String(err) });
       }
     }
   }, 30 * 1000);

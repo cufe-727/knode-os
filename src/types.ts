@@ -134,6 +134,8 @@ export interface SearchResult {
   docDate?: string | null;
   score: number;
   signals: { vector?: number; keyword?: number; graph?: number; structural?: number };
+  /** Its 1-based rank in each recall channel that found it; only when the search was asked to explain. */
+  ranks?: { vector?: number; keyword?: number; graph?: number };
   /** Retrieval provenance. Present for SAG results and omitted by legacy modes. */
   trace?: {
     route: 'direct' | 'sag' | 'both';

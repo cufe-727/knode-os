@@ -6,6 +6,7 @@ import { MAX_CONVERTIBLE_FILE_BYTES, MAX_FILE_BYTES } from '../constants.js';
 import { isHiddenName, isTextFile, safePath, sanitizeRelativePath, walkFiles } from '../fs/files.js';
 import { hasSidecarSegment, RAW_DOCS, SIDECAR_ROOT } from '../fs/layout.js';
 import { TreeWatcher, watchTree } from '../fs/watch.js';
+import { activityOf } from '../activity.js';
 import { isConvertibleFile } from './convert.js';
 import { sync, SyncContext, SyncStats } from './sync.js';
 
@@ -727,6 +728,11 @@ export class LinkedFolders {
     return describeLinkedFolders(this.ctx, this.runtime);
   }
 
+  /** What `status()` adds from this process — watching, last sync, last error — without walking the mirrors. */
+  runtimeStatus(): Map<string, LinkRuntime> {
+    return new Map(linkedFolders(this.ctx.config).map((link) => [link.dest, { ...this.runtimeOf(link.dest), watching: this.watchers.has(link.dest) }]));
+  }
+
   /**
    * Apply a batch of watcher events for one link right away — what a
    * debounced pass does, exposed so it can be driven without a filesystem
@@ -743,7 +749,7 @@ export class LinkedFolders {
       const { changed } = mirrorPaths(this.ctx.dataDir, link, absPaths);
       if (changed.length === 0) return;
       this.log(`linked ${link.dest}: ${changed.length} change(s) from ${link.source}`);
-      await sync(this.ctx, { only: syncScope(link.dest, changed), onProgress: this.log });
+      await activityOf(this.ctx.dataDir).run('folder', `${link.dest}: ${changed.length} change(s) from its source`, () => sync(this.ctx, { only: syncScope(link.dest, changed), onProgress: this.log }));
       this.runtime.set(link.dest, { ...this.runtimeOf(link.dest), lastSyncAt: at, lastError: null, lastChange: { copied: changed.length, removed: 0, at } });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -759,7 +765,12 @@ export class LinkedFolders {
   private async refreshOne(link: LinkedFolder): Promise<RefreshResult> {
     const at = new Date().toISOString();
     try {
-      const result = await refreshLinkedFolder(this.ctx, link, { onProgress: this.log, policy: this.opts.policy });
+      const result = await activityOf(this.ctx.dataDir).run(
+        'folder',
+        `${link.dest}: catching up with ${link.source}`,
+        () => refreshLinkedFolder(this.ctx, link, { onProgress: this.log, policy: this.opts.policy }),
+        (r) => (r.sourceMissing ? 'source folder not found' : `${r.copied.length} copied, ${r.removed.length} removed`),
+      );
       const rt = this.runtimeOf(link.dest);
       this.runtime.set(link.dest, {
         ...rt,
