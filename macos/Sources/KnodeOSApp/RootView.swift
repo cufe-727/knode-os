@@ -20,6 +20,10 @@ struct RootView: View {
 
 private struct MainWorkspaceView: View {
     @EnvironmentObject private var model: AppModel
+    /// Held without observing it: the field and the panel watch it themselves,
+    /// so a keystroke redraws them and not the whole window.
+    @State private var topSearch = TopSearchModel()
+    @State private var detailWidth: CGFloat = 1080
 
     var body: some View {
         NavigationSplitView {
@@ -37,6 +41,17 @@ private struct MainWorkspaceView: View {
                 }
                 destination
                     .id("\(model.activeWorkspace?.id ?? "none")-\(model.workspaceRevision)-\(model.selectedTab.host)")
+            }
+            .background {
+                GeometryReader { geometry in
+                    Color.clear
+                        .onAppear { detailWidth = geometry.size.width }
+                        .onChange(of: geometry.size.width) { _, width in detailWidth = width }
+                }
+            }
+            // the search field's suggestions, under the toolbar and over the screen
+            .overlay(alignment: .top) {
+                TopSearchOverlay(search: topSearch, width: min(580, max(340, detailWidth - 48)))
             }
             .navigationTitle("")
             .toolbar { workspaceToolbar }
@@ -56,6 +71,19 @@ private struct MainWorkspaceView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        .onAppear {
+            let model = model
+            topSearch.onActivate = { item in
+                switch item {
+                case .search(let q): model.runSearch(q)
+                case .ask(let q): model.ask(q)
+                case .research(let q): model.research(q)
+                case .entity(let entity): model.runSearch(entity.name)
+                case .file(let document): model.openFile(document.path)
+                }
+            }
+        }
+        .onChange(of: model.topSearchFocusRequest) { topSearch.focus() }
         .task {
             while !Task.isCancelled {
                 await model.refreshStats()
@@ -76,51 +104,37 @@ private struct MainWorkspaceView: View {
     private var destination: some View {
         switch model.selectedTab {
         case .files: FileBrowserView()
-        case .search: SearchView()
-        case .traces: TracesView()
+        case .search: ExploreSearchView()
         case .ask: AskView()
         case .studies: StudiesView()
         case .graph: KnowledgeGraphView()
         case .entities: EntitiesView()
         case .wiki: WikiView()
+        case .queue: TasksView()
         case .dream: DreamView()
         case .providers, .pipeline, .research, .chat, .playbooks, .workspace: SettingsView()
         case .access: AccessView()
         }
     }
 
-    private var sectionTitleItem: some ToolbarContent {
+    /// Wide enough to read a question, narrow enough to leave the workspace
+    /// switcher and the status on either side of it.
+    private var searchWidth: CGFloat {
+        min(440, max(220, detailWidth - 520))
+    }
+
+    private var searchItem: some ToolbarContent {
         ToolbarItem(placement: .principal) {
-            HStack(spacing: 7) {
-                Image(systemName: model.selectedSection.symbol)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Color.knodeCyan)
-                Text(model.selectedSection.title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .fixedSize()
-                if model.selectedSection.tabs.count > 1 {
-                    Text("›")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.tertiary)
-                    Text(model.selectedTab.title)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .fixedSize()
-                }
-                if let activity = model.globalActivity {
-                    Divider().frame(height: 11)
-                    ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.75)
-                        .frame(width: 12, height: 12)
-                    Text(activity)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .fixedSize()
-                }
-            }
-            .animation(.easeInOut(duration: 0.18), value: model.globalActivity)
+            TopSearchField(search: topSearch, width: searchWidth)
+        }
+    }
+
+    private func activityItem(_ activity: String) -> some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            ProgressView()
+                .controlSize(.small)
+                .help(activity)
+                .accessibilityLabel(activity)
         }
     }
 
@@ -129,12 +143,19 @@ private struct MainWorkspaceView: View {
         ToolbarItem(placement: .navigation) {
             WorkspaceMenu()
         }
-        // A window title, not a control: macOS 26 gives every toolbar item a glass
-        // background, and around a bare word it reads as a stray pill.
+        // The field draws its own rounded box: macOS 26 would put a second,
+        // glass one around it, and around a bare spinner a stray pill.
         if #available(macOS 26.0, *) {
-            sectionTitleItem.sharedBackgroundVisibility(.hidden)
+            searchItem.sharedBackgroundVisibility(.hidden)
         } else {
-            sectionTitleItem
+            searchItem
+        }
+        if let activity = model.globalActivity {
+            if #available(macOS 26.0, *) {
+                activityItem(activity).sharedBackgroundVisibility(.hidden)
+            } else {
+                activityItem(activity)
+            }
         }
         ToolbarItemGroup(placement: .primaryAction) {
             if !model.notices.isEmpty {
@@ -142,17 +163,6 @@ private struct MainWorkspaceView: View {
             }
             if model.processing != nil {
                 ProcessingButton()
-            }
-            if let stats = model.stats {
-                HStack(spacing: 9) {
-                    MetricPill(value: stats.documents, label: L("docs"))
-                    MetricPill(value: stats.chunks, label: L("chunks"))
-                    MetricPill(value: stats.entities, label: L("entities"))
-                    MetricPill(value: stats.relations, label: L("rels"))
-                }
-                .padding(.horizontal, 9)
-                .padding(.vertical, 6)
-                .background(.thinMaterial, in: Capsule())
             }
         }
     }
@@ -256,22 +266,28 @@ private struct AppSidebar: View {
                 Button {
                     model.select(section: section)
                 } label: {
-                    Label {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(section.title)
-                            Text(section.subtitle)
-                                .font(.system(size: 9))
-                                .foregroundStyle(model.selectedSection == section ? .secondary : .tertiary)
-                                .lineLimit(1)
+                    HStack(spacing: 6) {
+                        Label {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(section.title)
+                                Text(section.subtitle)
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(model.selectedSection == section ? .secondary : .tertiary)
+                                    .lineLimit(1)
+                            }
+                        } icon: {
+                            Image(systemName: section.symbol)
+                                .foregroundStyle(model.selectedSection == section ? Color.knodeCyan : Color.secondary)
                         }
-                    } icon: {
-                        Image(systemName: section.symbol)
-                            .foregroundStyle(model.selectedSection == section ? Color.knodeCyan : Color.secondary)
+                        Spacer(minLength: 0)
+                        if section == .tasks { TasksBadge() }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                // the subtitle is cut short in a narrow sidebar
+                .help(section.subtitle)
                 .padding(.vertical, 3)
                 .listRowBackground(
                     RoundedRectangle(cornerRadius: 7)
@@ -573,129 +589,62 @@ private struct WorkspaceMenu: View {
     }
 }
 
-/// Extraction, reviews and summaries spend model calls, so they run only when
-/// someone starts them: the service never does on its own, not even after a
-/// restart. The toolbar shows which it is; the panel starts and stops it.
-private struct ProcessingButton: View {
+/// The Tasks row's glance: a green dot while processing runs, and the Dream
+/// suggestions waiting for review.
+private struct TasksBadge: View {
     @EnvironmentObject private var model: AppModel
-    @State private var showing = false
 
     private var running: Bool { model.processing?.processing?.running == true }
+    private var pending: Int { model.stats?.pendingSuggestions ?? 0 }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            if pending > 0 {
+                HStack(spacing: 3) {
+                    Image(systemName: "moon.stars.fill").font(.system(size: 8, weight: .semibold))
+                    Text("\(pending)").font(.system(size: 10, weight: .bold, design: .monospaced))
+                }
+                .foregroundStyle(Color.knodeViolet)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Color.knodeViolet.opacity(0.16), in: Capsule())
+                .help(pending == 1 ? L("1 Dream suggestion to review") : L("%@ Dream suggestions to review", String(pending)))
+            }
+            if running {
+                StatusDot(color: .knodeGood, size: 6)
+                    .help(L("Processing is running"))
+            }
+        }
+    }
+}
+
+/// Extraction, reviews and summaries spend model calls, so they run only when
+/// someone starts them: the service never does on its own, not even after a
+/// restart. The toolbar shows which it is and how much is out; Tasks → Queue
+/// starts and stops it (docs/design/20 D7).
+private struct ProcessingButton: View {
+    @EnvironmentObject private var model: AppModel
+
+    private var running: Bool { model.processing?.processing?.running == true }
+    private var inFlight: Int { model.processing?.inFlight ?? 0 }
 
     var body: some View {
         Button {
-            showing.toggle()
+            model.select(.queue)
         } label: {
             HStack(spacing: 6) {
                 StatusDot(color: running ? .knodeGood : .secondary)
-                Text(running ? L("Processing") : L("Processing stopped"))
+                Text(running ? (inFlight > 0 ? L("Processing · %@ in flight", inFlight.formatted()) : L("Processing")) : L("Processing stopped"))
                     .font(.system(size: 11, weight: .semibold))
+                    .monospacedDigit()
             }
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .background(.thinMaterial, in: Capsule())
         }
         .buttonStyle(.plain)
-        .help(running ? L("Extraction, reviews and summaries are running") : L("Extraction, reviews and summaries wait until you start them"))
-        .popover(isPresented: $showing, arrowEdge: .bottom) {
-            ProcessingPanel()
-                .environmentObject(model)
-        }
-    }
-}
-
-private struct ProcessingPanel: View {
-    @EnvironmentObject private var model: AppModel
-    @State private var working = false
-
-    private var status: LabelingStatusResponse? { model.processing }
-    private var running: Bool { status?.processing?.running == true }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(L("Processing")).font(.headline)
-                Text(L("Extraction of entities, relations and claims, then duplicate reviews and summary pages. They spend model calls, so they run only after someone starts them — never on their own, not even after a restart."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            HStack(spacing: 8) {
-                StatusDot(color: running ? .knodeGood : .secondary)
-                Text(stateLine).font(.callout.weight(.medium))
-            }
-            if let local = status?.local, !local.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(L("On this service")).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    ForEach(local) { backend in
-                        Text("\(backend.label) × \(backend.slots)\(running && backend.busy > 0 ? " · " + L("%@ busy", String(backend.busy)) : "")\(backend.pauseReason.map { " · " + L("resting: %@", $0) } ?? "")")
-                            .font(.caption.monospaced())
-                    }
-                }
-            }
-            if let scheduler = status?.scheduler {
-                Text(L("%@ documents waiting · last hour: %@ calls, %@ documents written", String(scheduler.queued), String(scheduler.lastHour?.calls ?? 0), String(scheduler.lastHour?.documentsWritten ?? 0)))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            // only where the workspace has content languages on: elsewhere nothing is translated
-            if let translations = status?.translations, translations.enabled {
-                Text(translations.queueLine)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            if let remote = status?.remoteWorkers, remote > 0 {
-                Text(L("%@ remote workers are taking work too — they are started on their own machines.", String(remote)))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            // starting spends model calls: what it would take, before anyone presses Start
-            if !running && status?.processing != nil {
-                Divider()
-                ScrollView {
-                    EstimateSection { try await model.client().processingEstimate() }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 380)
-            }
-            HStack {
-                if !model.maySaveSettings {
-                    Text(L("An administrator starts and stops processing.")).font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                if working { ProgressView().controlSize(.small) }
-                Button(running ? L("Stop processing") : L("Start processing")) {
-                    working = true
-                    Task {
-                        await model.setProcessing(!running)
-                        working = false
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(running ? .knodeBad : .knodeCyan)
-                .disabled(working || !model.maySaveSettings)
-            }
-        }
-        .padding(16)
-        .frame(width: running ? 380 : 460)
-        .task { await model.refreshStats() }
-    }
-
-    private var stateLine: String {
-        guard let state = status?.processing else { return L("Unknown") }
-        let when = state.since.flatMap(Self.time)
-        if state.running {
-            if let when, let by = state.by { return L("Running since %@, started by %@", when, by) }
-            return L("Running")
-        }
-        if let when, let by = state.by { return L("Stopped at %@ by %@", when, by) }
-        return L("Stopped since the service started")
-    }
-
-    private static func time(_ iso: String) -> String? {
-        let parser = ISO8601DateFormatter()
-        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let date = parser.date(from: iso) ?? ISO8601DateFormatter().date(from: iso) else { return nil }
-        return date.formatted(date: .omitted, time: .shortened)
+        .help(running
+            ? L("Extraction, reviews and summaries are running — open Tasks to see the queue")
+            : L("Extraction, reviews and summaries wait until someone starts them — open Tasks to start them"))
     }
 }

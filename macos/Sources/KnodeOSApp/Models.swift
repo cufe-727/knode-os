@@ -4,26 +4,27 @@ import SwiftUI
 /**
  * Navigation is two levels: a section in the sidebar, a tab inside it.
  *
- * The grouping follows what the workspace does with a file rather than what
- * the service implements: material comes in (Library), you ask about it
- * (Ask), and knowledge grows out of it (Knowledge). A section whose `tabs`
- * holds a single entry shows no tab strip.
+ * The grouping follows what the workspace does with material rather than
+ * what the service implements (docs/design/20): material comes in (Library),
+ * you look things up in it (Explore — Search, Ask and Research, one intent at
+ * three depths), knowledge grows out of it (Knowledge), and work runs on it
+ * (Tasks). A section whose `tabs` holds a single entry shows no tab strip.
  */
 enum AppSection: String, CaseIterable, Identifiable, Codable {
     case library
-    case ask
-    case research
+    case explore
     case knowledge
+    case tasks
     case settings
 
     var id: String { rawValue }
 
     var tabs: [AppTab] {
         switch self {
-        case .library: [.files, .search, .traces]
-        case .ask: [.ask]
-        case .research: [.studies]
-        case .knowledge: [.graph, .entities, .wiki, .dream]
+        case .library: [.files]
+        case .explore: [.search, .ask, .studies]
+        case .knowledge: [.graph, .entities, .wiki]
+        case .tasks: [.queue, .dream]
         case .settings: [.providers, .pipeline, .research, .chat, .playbooks, .workspace, .access]
         }
     }
@@ -31,19 +32,20 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
     @MainActor var title: String {
         switch self {
         case .library: L("Library")
-        case .ask: L("Ask")
-        case .research: L("Research")
+        // "Explore" alone is the graph's button, 展开
+        case .explore: L("Explore", context: "section")
         case .knowledge: L("Knowledge")
+        case .tasks: L("Tasks")
         case .settings: L("Settings")
         }
     }
 
     @MainActor var subtitle: String {
         switch self {
-        case .library: L("Files, search, and agent traces")
-        case .ask: L("An agent that answers from your workspace")
-        case .research: L("Research a topic into several wiki pages")
-        case .knowledge: L("Graph, entities, wiki, and nightly review")
+        case .library: L("Files and imported data")
+        case .explore: L("Search, ask, or research your knowledge")
+        case .knowledge: L("Graph, entities, and wiki")
+        case .tasks: L("Processing queue, workers, and Dream")
         case .settings: L("Models, ingest, research, and Ask")
         }
     }
@@ -51,9 +53,9 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
     var symbol: String {
         switch self {
         case .library: "books.vertical"
-        case .ask: "sparkles"
-        case .research: "doc.text.magnifyingglass"
+        case .explore: "sparkle.magnifyingglass"
         case .knowledge: "lightbulb"
+        case .tasks: "list.bullet.clipboard"
         case .settings: "slider.horizontal.3"
         }
     }
@@ -67,16 +69,17 @@ enum AppSection: String, CaseIterable, Identifiable, Codable {
 /// research them into the wiki (Research), and the result answers questions
 /// (Ask). Ids keep their first names, so `pipeline` is titled Ingest; Ask's
 /// settings are `chat` — the config block they edit — because `ask` is the
-/// Ask screen itself.
+/// Ask screen itself; and Explore's Research is `studies`, because `research`
+/// is its settings page.
 enum AppTab: String, CaseIterable, Identifiable, Codable {
     case files
     case search
-    case traces
     case ask
     case studies
     case graph
     case entities
     case wiki
+    case queue
     case dream
     case providers
     case pipeline
@@ -92,18 +95,24 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
      * A tab that used to exist, so a stored navigation still lands somewhere.
      * `agents` was folded into `providers` in 2026-09-19: an agent runs on a
      * provider from the table above it, and the two were never separable in
-     * anything but the tab strip.
+     * anything but the tab strip. `traces` went into Dream in 2026-10-30
+     * (docs/design/20 D8): the traces are what Dream reads.
      */
     static func named(_ raw: String) -> AppTab? {
-        AppTab(rawValue: raw) ?? (raw == "agents" ? .providers : nil)
+        if let tab = AppTab(rawValue: raw) { return tab }
+        switch raw {
+        case "agents": return .providers
+        case "traces": return .dream
+        default: return nil
+        }
     }
 
     var section: AppSection {
         switch self {
-        case .files, .search, .traces: .library
-        case .ask: .ask
-        case .studies: .research
-        case .graph, .entities, .wiki, .dream: .knowledge
+        case .files: .library
+        case .search, .ask, .studies: .explore
+        case .graph, .entities, .wiki: .knowledge
+        case .queue, .dream: .tasks
         case .providers, .pipeline, .research, .chat, .playbooks, .workspace, .access: .settings
         }
     }
@@ -122,12 +131,13 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .files: L("Files")
         case .search: L("Search")
-        case .traces: L("Traces")
         case .ask: L("Ask")
-        case .studies: L("Studies")
+        case .studies: L("Research")
         case .graph: L("Graph")
         case .entities: L("Entities")
         case .wiki: L("Wiki")
+        // "Queue" alone is the verb on Wiki's recommendations
+        case .queue: L("Queue", context: "tab")
         case .dream: L("Dream")
         case .providers: L("Providers & Agents")
         case .pipeline: L("Ingest")
@@ -142,13 +152,13 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
     @MainActor var subtitle: String {
         switch self {
         case .files: L("Browse and edit knowledge")
-        case .search: L("Hybrid, vector, and keyword recall")
-        case .traces: L("Claude Code and Codex sessions")
+        case .search: L("What a query matches, and why")
         case .ask: L("An agent that answers from your workspace")
         case .studies: L("Research a topic into several wiki pages")
         case .graph: L("Entities, relations, and claims")
         case .entities: L("Every entity, filtered and sorted")
         case .wiki: L("Pages researched by agent CLIs")
+        case .queue: L("What runs, waits, and is scheduled")
         case .dream: L("Review agent improvement ideas")
         case .providers: L("Endpoints, credentials, and who does the work")
         case .pipeline: L("How documents get processed")
@@ -164,12 +174,12 @@ enum AppTab: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .files: "doc.text"
         case .search: "magnifyingglass"
-        case .traces: "terminal"
         case .ask: "sparkles"
         case .studies: "doc.text.magnifyingglass"
         case .graph: "point.3.connected.trianglepath.dotted"
         case .entities: "tablecells"
         case .wiki: "book.closed"
+        case .queue: "list.bullet.rectangle"
         case .dream: "moon.stars"
         case .providers: "cable.connector"
         case .pipeline: "tray.and.arrow.down"
@@ -347,6 +357,25 @@ struct LabelingStatusResponse: Decodable, Equatable {
     var local: [LocalBackend]
     /// The Translate stage's leased work (docs/design/17); nil from an older service.
     var translations: Translations?
+    /// Summary pages and judge calls out now; only how many is read.
+    var summaries: Leased?
+    var judge: Leased?
+
+    /// A lease the toolbar only counts: whatever it holds, it decodes.
+    struct CountedLease: Decodable, Equatable {
+        init(from decoder: any Decoder) throws {}
+    }
+
+    struct Leased: Decodable, Equatable {
+        var leases: [CountedLease]?
+    }
+
+    /// Model calls out right now, every kind together — what the toolbar's
+    /// processing pill counts, as the web header does.
+    var inFlight: Int {
+        (scheduler?.leases?.count ?? 0) + (summaries?.leases?.count ?? 0)
+            + (translations?.leases.count ?? 0) + (judge?.leases?.count ?? 0)
+    }
 
     /// Counted in translations — a document into one language — which is
     /// what `due` and the last hour count; a long document's segments can be
@@ -396,6 +425,8 @@ struct LabelingStatusResponse: Decodable, Equatable {
         var queued: Int
         var workers: [Worker]?
         var lastHour: LastHour?
+        /// Extraction segments out now.
+        var leases: [CountedLease]?
     }
 
     struct Worker: Decodable, Equatable {
@@ -2443,4 +2474,655 @@ struct StudyDetail: Decodable {
     var startProblem: String?
 
     var isLive: Bool { ["queued", "running", "validating", "waiting"].contains(job.status) || refining != nil }
+}
+
+/* ------------------------- explore and tasks (docs/design/20) ------------------------- */
+
+// The JSON of these routes is camelCase already, so the snake_case decoder
+// leaves every key as it came. Each decoder fills what is missing with an
+// empty value rather than failing: one odd row must not cost the whole page.
+
+/// `GET /api/search/explore`: the agents' retrieval asked to explain itself —
+/// every passage with its rank in each channel that found it, each channel's
+/// own count, and beside them the graph read: the entities the query names,
+/// their neighbours, the relations between them and the claims about them.
+struct ExploreResponse: Decodable {
+    var query: String
+    var mode: String
+    /// What keyword and entity matching used: the words, and CJK bigrams.
+    var terms: [String]
+    var passages: [ExplorePassage]
+    /// vector, keyword and graph, as the mode ran them; empty in multi-hop.
+    var channels: [String: ExploreChannelStats]
+    var entities: [ExploreEntity]
+    var relations: [ExploreRelation]
+    var claims: [ExploreClaim]
+    var ms: Timing?
+    /// Only the reads that failed: `passages`, `graph`.
+    var errors: [String: String]
+
+    struct Timing: Decodable, Hashable {
+        var total: Int?
+        var passages: Int?
+        var graph: Int?
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        query = try c.decodeIfPresent(String.self, forKey: .query) ?? ""
+        mode = try c.decodeIfPresent(String.self, forKey: .mode) ?? "hybrid"
+        terms = try c.decodeIfPresent([String].self, forKey: .terms) ?? []
+        passages = try c.decodeIfPresent([ExplorePassage].self, forKey: .passages) ?? []
+        channels = try c.decodeIfPresent([String: ExploreChannelStats].self, forKey: .channels) ?? [:]
+        entities = try c.decodeIfPresent([ExploreEntity].self, forKey: .entities) ?? []
+        relations = try c.decodeIfPresent([ExploreRelation].self, forKey: .relations) ?? []
+        claims = try c.decodeIfPresent([ExploreClaim].self, forKey: .claims) ?? []
+        ms = try c.decodeIfPresent(Timing.self, forKey: .ms)
+        errors = (try? c.decodeIfPresent([String: String].self, forKey: .errors)) ?? [:]
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case query, mode, terms, passages, channels, entities, relations, claims, ms, errors
+    }
+}
+
+struct ExploreChannelStats: Decodable, Hashable {
+    var hits: Int
+    var ms: Int?
+    /// Why the channel could not answer — a spent embedding quota, say.
+    var error: String?
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        hits = try c.decodeIfPresent(Int.self, forKey: .hits) ?? 0
+        ms = try c.decodeIfPresent(Int.self, forKey: .ms)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+    }
+
+    private enum CodingKeys: String, CodingKey { case hits, ms, error }
+}
+
+struct ExplorePassage: Decodable, Identifiable, Hashable {
+    var chunkId: String
+    var documentId: String
+    var path: String
+    var title: String?
+    var content: String
+    var docDate: String?
+    var score: Double
+    /// Each channel's own measure: similarity, text rank or terms found, entities mentioned; `structural` in multi-hop.
+    var signals: [String: Double]
+    /// The passage's place in each channel that found it, from 1.
+    var ranks: [String: Int]
+    /// Multi-hop only: how the passage was reached.
+    var trace: Trace?
+
+    struct Trace: Decodable, Hashable {
+        var route: String?
+        var hop: Int?
+        var bridgeEntities: [String]?
+    }
+
+    var id: String { chunkId }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        chunkId = try c.decode(String.self, forKey: .chunkId)
+        documentId = try c.decodeIfPresent(String.self, forKey: .documentId) ?? ""
+        path = try c.decodeIfPresent(String.self, forKey: .path) ?? ""
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        content = try c.decodeIfPresent(String.self, forKey: .content) ?? ""
+        docDate = try c.decodeIfPresent(String.self, forKey: .docDate)
+        score = try c.decodeIfPresent(Double.self, forKey: .score) ?? 0
+        signals = (try? c.decodeIfPresent([String: Double].self, forKey: .signals)) ?? [:]
+        let rawRanks = (try? c.decodeIfPresent([String: Double].self, forKey: .ranks)) ?? [:]
+        ranks = rawRanks.mapValues { Int($0.rounded()) }
+        trace = try? c.decodeIfPresent(Trace.self, forKey: .trace)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case chunkId, documentId, path, title, content, docDate, score, signals, ranks, trace
+    }
+}
+
+struct ExploreEntity: Decodable, Identifiable, Hashable {
+    var id: String
+    var name: String
+    var type: String
+    var description: String
+    var aliases: [String]
+    var mentionCount: Int
+    /// Live typed relations across the whole graph.
+    var degree: Int
+    var wikiPath: String?
+    var score: Double
+    /// Where the query named it; nil for a neighbour reached through a relation.
+    var match: Match?
+
+    struct Match: Decodable, Hashable {
+        /// name, alias or description.
+        var field: String
+        var term: String
+        /// The spelling or text that matched.
+        var text: String
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? id
+        type = try c.decodeIfPresent(String.self, forKey: .type) ?? "concept"
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        aliases = (try? c.decodeIfPresent([String].self, forKey: .aliases)) ?? []
+        mentionCount = try c.decodeIfPresent(Int.self, forKey: .mentionCount) ?? 0
+        degree = try c.decodeIfPresent(Int.self, forKey: .degree) ?? 0
+        wikiPath = try c.decodeIfPresent(String.self, forKey: .wikiPath)
+        score = try c.decodeIfPresent(Double.self, forKey: .score) ?? 0
+        match = try? c.decodeIfPresent(Match.self, forKey: .match)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, type, description, aliases, mentionCount, degree, wikiPath, score, match
+    }
+}
+
+struct ExploreRelation: Decodable, Identifiable, Hashable {
+    /// Entity ids.
+    var source: String
+    var target: String
+    var type: String
+    var description: String
+    var weight: Double
+    var validFrom: String?
+    var validTo: String?
+
+    var id: String { "\(source)-\(type)-\(target)" }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        source = try c.decode(String.self, forKey: .source)
+        target = try c.decode(String.self, forKey: .target)
+        type = try c.decodeIfPresent(String.self, forKey: .type) ?? "related_to"
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        weight = try c.decodeIfPresent(Double.self, forKey: .weight) ?? 0
+        validFrom = try c.decodeIfPresent(String.self, forKey: .validFrom)
+        validTo = try c.decodeIfPresent(String.self, forKey: .validTo)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case source, target, type, description, weight, validFrom, validTo
+    }
+}
+
+struct ExploreClaim: Decodable, Identifiable, Hashable {
+    var id: String
+    var subject: String
+    var statement: String
+    /// fact, disputed, superseded…
+    var status: String
+    var kind: String?
+    var startDate: String?
+    var path: String?
+    var evidenceCount: Int?
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        subject = try c.decodeIfPresent(String.self, forKey: .subject) ?? ""
+        statement = try c.decodeIfPresent(String.self, forKey: .statement) ?? ""
+        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "fact"
+        kind = try c.decodeIfPresent(String.self, forKey: .kind)
+        startDate = try c.decodeIfPresent(String.self, forKey: .startDate)
+        path = try c.decodeIfPresent(String.self, forKey: .path)
+        evidenceCount = try c.decodeIfPresent(Int.self, forKey: .evidenceCount)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, subject, statement, status, kind, startDate, path, evidenceCount
+    }
+}
+
+/// `GET /api/search/suggest`: names and documents for the search field as
+/// someone types — substring reads, no model.
+struct SuggestResponse: Decodable, Equatable {
+    struct Entity: Decodable, Hashable, Identifiable {
+        var id: String
+        var name: String
+        var type: String
+        var mentionCount: Int
+        var wikiPath: String?
+        /// The spelling that matched when the name did not.
+        var alias: String?
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(String.self, forKey: .id)
+            name = try c.decodeIfPresent(String.self, forKey: .name) ?? id
+            type = try c.decodeIfPresent(String.self, forKey: .type) ?? "concept"
+            mentionCount = try c.decodeIfPresent(Int.self, forKey: .mentionCount) ?? 0
+            wikiPath = try c.decodeIfPresent(String.self, forKey: .wikiPath)
+            alias = try c.decodeIfPresent(String.self, forKey: .alias)
+        }
+
+        private enum CodingKeys: String, CodingKey { case id, name, type, mentionCount, wikiPath, alias }
+    }
+
+    struct Document: Decodable, Hashable, Identifiable {
+        var path: String
+        var title: String?
+        var id: String { path }
+    }
+
+    var entities: [Entity]
+    var documents: [Document]
+
+    static let empty = SuggestResponse(entities: [], documents: [])
+
+    init(entities: [Entity], documents: [Document]) {
+        self.entities = entities
+        self.documents = documents
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        entities = (try? c.decodeIfPresent([Entity].self, forKey: .entities)) ?? []
+        documents = (try? c.decodeIfPresent([Document].self, forKey: .documents)) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey { case entities, documents }
+}
+
+/// `GET /api/tasks`: everything the workspace has under way or waiting, in
+/// one read (src/server/tasks.ts). It only reports; starting and stopping
+/// stays with the processing switch, the jobs' own routes and Dream's.
+struct TasksSnapshot: Decodable {
+    var at: String?
+    /// False outside `serve`: no processing switch, no broker, no slots.
+    var serving: Bool
+    var processing: ProcessingState?
+    var stages: [Stage]
+    var inFlight: [InFlight]
+    var workers: [Worker]
+    var jobs: [Job]
+    var activity: Activity
+    var scheduled: [Scheduled]
+    var folders: [Folder]
+    var dream: DreamQueue
+    var documentErrors: [DocumentError]
+
+    struct Stage: Decodable, Identifiable {
+        /// index, embed, extract, summarize, translate, review — in pipeline order.
+        var id: String
+        var enabled: Bool
+        /// documents, chunks, translations or calls.
+        var unit: String
+        var waiting: Int
+        var inFlight: Int
+        var doneLastHour: Int?
+        var callsLastHour: Int?
+        var failed: Int
+        /// What holds it up, in English: the service's own words.
+        var note: String?
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(String.self, forKey: .id)
+            enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+            unit = try c.decodeIfPresent(String.self, forKey: .unit) ?? "documents"
+            waiting = try c.decodeIfPresent(Int.self, forKey: .waiting) ?? 0
+            inFlight = try c.decodeIfPresent(Int.self, forKey: .inFlight) ?? 0
+            doneLastHour = try c.decodeIfPresent(Int.self, forKey: .doneLastHour)
+            callsLastHour = try c.decodeIfPresent(Int.self, forKey: .callsLastHour)
+            failed = try c.decodeIfPresent(Int.self, forKey: .failed) ?? 0
+            note = try c.decodeIfPresent(String.self, forKey: .note)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, enabled, unit, waiting, inFlight, doneLastHour, callsLastHour, failed, note
+        }
+    }
+
+    /// A lease out right now.
+    struct InFlight: Decodable, Identifiable {
+        var id: String
+        /// extract, summarize, translate or judge.
+        var kind: String
+        /// The document, or for a judge call what it decides.
+        var subject: String
+        var detail: String?
+        var worker: String
+        var backend: String
+        var remote: Bool
+        var ageSeconds: Double
+        var expiresInSeconds: Double
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(String.self, forKey: .id)
+            kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "extract"
+            subject = try c.decodeIfPresent(String.self, forKey: .subject) ?? ""
+            detail = try c.decodeIfPresent(String.self, forKey: .detail)
+            worker = try c.decodeIfPresent(String.self, forKey: .worker) ?? ""
+            backend = try c.decodeIfPresent(String.self, forKey: .backend) ?? ""
+            remote = try c.decodeIfPresent(Bool.self, forKey: .remote) ?? false
+            ageSeconds = try c.decodeIfPresent(Double.self, forKey: .ageSeconds) ?? 0
+            expiresInSeconds = try c.decodeIfPresent(Double.self, forKey: .expiresInSeconds) ?? 0
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, kind, subject, detail, worker, backend, remote, ageSeconds, expiresInSeconds
+        }
+    }
+
+    /// This machine's backends, one row each, and every remote worker the broker has seen.
+    struct Worker: Decodable, Identifiable {
+        var id: String
+        var label: String
+        var remote: Bool
+        var kinds: [String]
+        /// Local backends only: the parallel calls it may make.
+        var slots: Int?
+        var busy: Int
+        var ok: Int
+        var failed: Int
+        var lastSeen: String?
+        var online: Bool
+        var pausedUntil: String?
+        var pauseReason: String?
+        var lastError: String?
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(String.self, forKey: .id)
+            label = try c.decodeIfPresent(String.self, forKey: .label) ?? id
+            remote = try c.decodeIfPresent(Bool.self, forKey: .remote) ?? false
+            kinds = (try? c.decodeIfPresent([String].self, forKey: .kinds)) ?? []
+            slots = try c.decodeIfPresent(Int.self, forKey: .slots)
+            busy = try c.decodeIfPresent(Int.self, forKey: .busy) ?? 0
+            ok = try c.decodeIfPresent(Int.self, forKey: .ok) ?? 0
+            failed = try c.decodeIfPresent(Int.self, forKey: .failed) ?? 0
+            lastSeen = try c.decodeIfPresent(String.self, forKey: .lastSeen)
+            online = try c.decodeIfPresent(Bool.self, forKey: .online) ?? false
+            pausedUntil = try c.decodeIfPresent(String.self, forKey: .pausedUntil)
+            pauseReason = try c.decodeIfPresent(String.self, forKey: .pauseReason)
+            lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, label, remote, kinds, slots, busy, ok, failed, lastSeen, online, pausedUntil, pauseReason, lastError
+        }
+    }
+
+    /// A research job, study or Ask turn running, or finished in the last day.
+    struct Job: Decodable, Identifiable {
+        var id: String
+        /// study, research, init or ask.
+        var kind: String
+        var title: String
+        var status: String
+        var stage: String?
+        var createdAt: String?
+        var startedAt: String?
+        var finishedAt: String?
+        var error: String?
+        var outputPath: String?
+
+        var isLive: Bool { ["queued", "running", "validating", "waiting"].contains(status) }
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(String.self, forKey: .id)
+            kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "research"
+            title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+            status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
+            stage = try c.decodeIfPresent(String.self, forKey: .stage)
+            createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
+            startedAt = try c.decodeIfPresent(String.self, forKey: .startedAt)
+            finishedAt = try c.decodeIfPresent(String.self, forKey: .finishedAt)
+            error = try c.decodeIfPresent(String.self, forKey: .error)
+            outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, kind, title, status, stage, createdAt, startedAt, finishedAt, error, outputPath
+        }
+    }
+
+    /// Background work that is not leased model work (src/activity.ts).
+    struct ActivityItem: Decodable, Identifiable {
+        var id: String
+        /// sync, ingest, upload, folder, traces, datasources, dream or tier2.
+        var kind: String
+        /// In English, the service's own words: "Index new and changed files".
+        var label: String
+        var startedAt: String?
+        var finishedAt: String?
+        var ok: Bool?
+        var detail: String?
+    }
+
+    struct Activity: Decodable {
+        var running: [ActivityItem]
+        var recent: [ActivityItem]
+
+        init(running: [ActivityItem] = [], recent: [ActivityItem] = []) {
+            self.running = running
+            self.recent = recent
+        }
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            running = (try? c.decodeIfPresent([ActivityItem].self, forKey: .running)) ?? []
+            recent = (try? c.decodeIfPresent([ActivityItem].self, forKey: .recent)) ?? []
+        }
+
+        private enum CodingKeys: String, CodingKey { case running, recent }
+    }
+
+    /// What runs on a clock: dream, tier2, traces, datasources.
+    struct Scheduled: Decodable, Identifiable {
+        var id: String
+        /// "03:00" for a daily run.
+        var at: String?
+        var everyMinutes: Int?
+        /// The next start, when the clock says.
+        var next: String?
+        var enabled: Bool
+        var running: Bool
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(String.self, forKey: .id)
+            at = try c.decodeIfPresent(String.self, forKey: .at)
+            everyMinutes = try c.decodeIfPresent(Int.self, forKey: .everyMinutes)
+            next = try c.decodeIfPresent(String.self, forKey: .next)
+            enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+            running = try c.decodeIfPresent(Bool.self, forKey: .running) ?? false
+        }
+
+        private enum CodingKeys: String, CodingKey { case id, at, everyMinutes, next, enabled, running }
+    }
+
+    /// A linked folder and how its mirror is doing.
+    struct Folder: Decodable, Identifiable {
+        struct Change: Decodable {
+            var copied: Int?
+            var removed: Int?
+            var at: String?
+        }
+
+        var dest: String
+        var source: String
+        var watching: Bool
+        var lastSyncAt: String?
+        var lastError: String?
+        var lastChange: Change?
+
+        var id: String { dest }
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            dest = try c.decode(String.self, forKey: .dest)
+            source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
+            watching = try c.decodeIfPresent(Bool.self, forKey: .watching) ?? false
+            lastSyncAt = try c.decodeIfPresent(String.self, forKey: .lastSyncAt)
+            lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
+            lastChange = try? c.decodeIfPresent(Change.self, forKey: .lastChange)
+        }
+
+        private enum CodingKeys: String, CodingKey { case dest, source, watching, lastSyncAt, lastError, lastChange }
+    }
+
+    struct DreamQueue: Decodable {
+        var pendingSuggestions: Int
+        var lastSuggestionAt: String?
+        var lookbackDays: Int?
+
+        init(pendingSuggestions: Int = 0, lastSuggestionAt: String? = nil, lookbackDays: Int? = nil) {
+            self.pendingSuggestions = pendingSuggestions
+            self.lastSuggestionAt = lastSuggestionAt
+            self.lookbackDays = lookbackDays
+        }
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            pendingSuggestions = try c.decodeIfPresent(Int.self, forKey: .pendingSuggestions) ?? 0
+            lastSuggestionAt = try c.decodeIfPresent(String.self, forKey: .lastSuggestionAt)
+            lookbackDays = try c.decodeIfPresent(Int.self, forKey: .lookbackDays)
+        }
+
+        private enum CodingKeys: String, CodingKey { case pendingSuggestions, lastSuggestionAt, lookbackDays }
+    }
+
+    struct DocumentError: Decodable, Identifiable {
+        var path: String
+        var error: String?
+        var id: String { path }
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        at = try c.decodeIfPresent(String.self, forKey: .at)
+        serving = try c.decodeIfPresent(Bool.self, forKey: .serving) ?? false
+        processing = try? c.decodeIfPresent(ProcessingState.self, forKey: .processing)
+        stages = (try? c.decodeIfPresent([Stage].self, forKey: .stages)) ?? []
+        inFlight = (try? c.decodeIfPresent([InFlight].self, forKey: .inFlight)) ?? []
+        workers = (try? c.decodeIfPresent([Worker].self, forKey: .workers)) ?? []
+        jobs = (try? c.decodeIfPresent([Job].self, forKey: .jobs)) ?? []
+        activity = (try? c.decodeIfPresent(Activity.self, forKey: .activity)) ?? Activity()
+        scheduled = (try? c.decodeIfPresent([Scheduled].self, forKey: .scheduled)) ?? []
+        folders = (try? c.decodeIfPresent([Folder].self, forKey: .folders)) ?? []
+        dream = (try? c.decodeIfPresent(DreamQueue.self, forKey: .dream)) ?? DreamQueue()
+        documentErrors = (try? c.decodeIfPresent([DocumentError].self, forKey: .documentErrors)) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case at, serving, processing, stages, inFlight, workers, jobs, activity, scheduled, folders, dream, documentErrors
+    }
+}
+
+/// `POST /api/folders/preview`: what linking or importing a folder would
+/// carry, before anything is written.
+struct FolderImportPlan: Decodable, Identifiable {
+    struct Link: Decodable, Hashable {
+        var source: String
+        var dest: String
+    }
+
+    /// The folder on the service's machine, as the service resolved it.
+    var source: String
+    var dest: String
+    var files: Int
+    var bytes: Int
+    /// Files of types knode-os cannot index, left behind.
+    var skippedByType: Int
+    /// Files copied but too large to index.
+    var tooLarge: Int
+    /// The destination exists already: it becomes the mirror, and files only it has go.
+    var exists: Bool
+    /// Set when the destination is already a linked folder's mirror.
+    var linked: Link?
+    var sample: [String]
+
+    var id: String { "\(source)→\(dest)" }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
+        dest = try c.decodeIfPresent(String.self, forKey: .dest) ?? ""
+        files = try c.decodeIfPresent(Int.self, forKey: .files) ?? 0
+        bytes = try c.decodeIfPresent(Int.self, forKey: .bytes) ?? 0
+        skippedByType = try c.decodeIfPresent(Int.self, forKey: .skippedByType) ?? 0
+        tooLarge = try c.decodeIfPresent(Int.self, forKey: .tooLarge) ?? 0
+        exists = try c.decodeIfPresent(Bool.self, forKey: .exists) ?? false
+        linked = try? c.decodeIfPresent(Link.self, forKey: .linked)
+        sample = (try? c.decodeIfPresent([String].self, forKey: .sample)) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey { case source, dest, files, bytes, skippedByType, tooLarge, exists, linked, sample }
+}
+
+/// `POST /api/folders/import`: what the copy did. Indexing usually goes on
+/// in the background after the answer (`indexing`), else `sync` says how it went.
+struct FolderImportResult: Decodable {
+    struct Sync: Decodable {
+        var indexed: Int?
+        var skipped: Int?
+    }
+
+    var dest: String
+    var copied: [String]
+    var sync: Sync?
+    var indexing: Bool
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        dest = try c.decodeIfPresent(String.self, forKey: .dest) ?? ""
+        copied = (try? c.decodeIfPresent([String].self, forKey: .copied)) ?? []
+        sync = try? c.decodeIfPresent(Sync.self, forKey: .sync)
+        indexing = try c.decodeIfPresent(Bool.self, forKey: .indexing) ?? false
+    }
+
+    private enum CodingKeys: String, CodingKey { case dest, copied, sync, indexing }
+}
+
+/// Times the service sends (`toISOString`, with or without milliseconds).
+enum ServiceTime {
+    static func date(_ iso: String?) -> Date? {
+        guard let iso, !iso.isEmpty else { return nil }
+        let precise = ISO8601DateFormatter()
+        precise.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return precise.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
+    }
+
+    /// "45 s", "3 min", "2 h 5 min", "3 days".
+    @MainActor static func span(_ seconds: Double) -> String {
+        let s = max(0, Int(seconds.rounded()))
+        if s < 60 { return L("%@ s", String(s)) }
+        if s < 3600 {
+            let m = s / 60
+            return s < 600 && s % 60 > 0 ? L("%@ min %@ s", String(m), String(s % 60)) : L("%@ min", String(m))
+        }
+        let h = s / 3600
+        let m = (s % 3600) / 60
+        if h >= 48 { return L("%@ days", String(Int((Double(h) / 24).rounded()))) }
+        return m > 0 ? L("%@ h %@ min", String(h), String(m)) : L("%@ h", String(h))
+    }
+
+    /// "5 min ago", or "never" for no time at all.
+    @MainActor static func ago(_ iso: String?, now: Date = Date()) -> String {
+        guard let date = date(iso) else { return L("never") }
+        return L("%@ ago", span(now.timeIntervalSince(date)))
+    }
+
+    /// "in 4 h".
+    @MainActor static func until(_ iso: String?, now: Date = Date()) -> String? {
+        guard let date = date(iso) else { return nil }
+        return L("in %@", span(date.timeIntervalSince(now)))
+    }
+
+    /// "14:02".
+    static func clock(_ iso: String?) -> String? {
+        date(iso)?.formatted(date: .omitted, time: .shortened)
+    }
 }

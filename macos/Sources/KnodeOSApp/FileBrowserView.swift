@@ -28,6 +28,10 @@ struct FileBrowserView: View {
         case newFolder
         case rename(String)
         case destination(DestinationPurpose)
+        /// Link a folder: its path on the service's machine, typed (a service elsewhere).
+        case linkPath
+        /// Link a folder: what it would carry, and the path as it was given.
+        case linkPlan(FolderImportPlan, String)
 
         var id: String {
             switch self {
@@ -35,6 +39,8 @@ struct FileBrowserView: View {
             case .newFolder: "newFolder"
             case .rename(let path): "rename-\(path)"
             case .destination(let purpose): "destination-\(purpose.id)"
+            case .linkPath: "linkPath"
+            case .linkPlan(let plan, _): "linkPlan-\(plan.id)"
             }
         }
     }
@@ -112,6 +118,10 @@ struct FileBrowserView: View {
     /// is on screen drops it silently.
     @State private var destinationPath = "raw/docs"
     @State private var pendingImport: ImportKind?
+    /// The folder last typed for a link, offered again the next time.
+    @State private var linkSourcePath = ""
+    /// Import → Agent traces waits on a yes: it copies every session on the service's machine.
+    @State private var confirmingTraceImport = false
     @State private var expandedPaths: Set<String> = ["wiki"]
     /// The folder clicked in the tree. New files, new folders and uploads
     /// default into it until another row is clicked.
@@ -202,6 +212,8 @@ struct FileBrowserView: View {
             case .newFolder: newFolderSheet
             case .rename(let path): renameSheet(path)
             case .destination(let purpose): destinationSheet(purpose)
+            case .linkPath: linkPathSheet
+            case .linkPlan(let plan, let source): linkPlanSheet(plan, source: source)
             }
         }
         .alert(
@@ -220,6 +232,12 @@ struct FileBrowserView: View {
         } message: {
             Text(L("This removes the selected files from the current workspace. The knowledge extracted from them is disposed; history stays queryable."))
         }
+        .alert(L("Collect agent traces?"), isPresented: $confirmingTraceImport) {
+            Button(L("Cancel"), role: .cancel) {}
+            Button(L("Collect")) { Task { await importTraces() } }
+        } message: {
+            Text(L("Copies your Claude Code and Codex sessions from the service's machine into raw/traces. Dream reads them overnight; new sessions keep arriving after this."))
+        }
     }
 
     private var defaultToolbar: some View {
@@ -227,34 +245,61 @@ struct FileBrowserView: View {
             Button { Task { await loadTree() } } label: { Image(systemName: "arrow.clockwise") }
                 .help(L("Refresh — reread the workspace tree from disk"))
                 .accessibilityLabel("Refresh files")
-            // creating and uploading are the same intent — "put something in
-            // this folder" — so they share one menu instead of two buttons
+            importMenu
+            // bringing material in is one intent, writing a note another: ＋ only creates
             Menu {
-                Button { beginNewFile(in: targetDirectory) } label: { Label("New file…", systemImage: "doc.badge.plus") }
-                Button { beginNewFolder(in: targetDirectory) } label: { Label("New folder…", systemImage: "folder.badge.plus") }
-                Divider()
-                Button { askDestination(for: .upload(.files)) } label: { Label("Upload files…", systemImage: "arrow.up.doc") }
-                Button { askDestination(for: .upload(.folder)) } label: { Label("Upload folder…", systemImage: "arrow.up.folder") }
+                Button { beginNewFile(in: targetDirectory) } label: { Label(L("New file…"), systemImage: "doc.badge.plus") }
+                Button { beginNewFolder(in: targetDirectory) } label: { Label(L("New folder…"), systemImage: "folder.badge.plus") }
             } label: {
                 Image(systemName: "plus")
             }
             .menuStyle(.button)
             .menuIndicator(.hidden)
             .fixedSize()
-            .help(L("Add — a new file or folder, or documents uploaded from disk, into %@/", targetDirectory))
-            .accessibilityLabel(L("Add a file or folder"))
+            .help(L("New — a file or a folder in %@/", targetDirectory))
+            .accessibilityLabel(L("New file or folder"))
             Button { selectionMode = true } label: { Image(systemName: "checklist") }
                 .help(L("Select — tick several files to move or delete them in one go"))
                 .accessibilityLabel("Select multiple files")
             Spacer(minLength: 4)
             Button { Task { await ingest() } } label: {
                 if isWorking { ProgressView().controlSize(.small) }
-                else { Label("Index", systemImage: "arrow.triangle.2.circlepath") }
+                else {
+                    ViewThatFits(in: .horizontal) {
+                        Label("Index", systemImage: "arrow.triangle.2.circlepath")
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                }
             }
             .disabled(isWorking)
-            .fixedSize()
             .help(L("Index — turn new and changed files into knowledge: chunk, embed, extract entities and refresh the wiki. The CLI calls this `ingest` / `sync`."))
         }
+    }
+
+    /// Everything that brings material in (docs/design/20 D10): files or a
+    /// folder uploaded from this Mac, a folder of the service's machine linked
+    /// and kept in sync, and the agent sessions on that machine.
+    private var importMenu: some View {
+        Menu {
+            Button { askDestination(for: .upload(.files)) } label: { Label(L("Files…"), systemImage: "doc.on.doc") }
+            Button { askDestination(for: .upload(.folder)) } label: { Label(L("Folder…"), systemImage: "folder") }
+            Divider()
+            Button { beginLinkFolder() } label: { Label(L("Link a folder (keep in sync)…"), systemImage: "link") }
+                .disabled(!model.maySaveSettings)
+            if !model.maySaveSettings {
+                Text(L("Linking reads the service's own disk: an administrator's call"))
+            }
+            Divider()
+            Button { confirmingTraceImport = true } label: { Label(L("Agent traces (Claude Code, Codex)"), systemImage: "terminal") }
+        } label: {
+            Label(L("Import"), systemImage: "square.and.arrow.down")
+        }
+        .menuStyle(.button)
+        .buttonStyle(.borderedProminent)
+        .tint(.knodeCyan)
+        .fixedSize()
+        .disabled(isWorking)
+        .help(L("Import — files or a folder from this Mac, a folder linked from the service's machine, or agent traces"))
     }
 
     /// A one-line reminder of where a create or an upload lands, so "new file"
@@ -1621,6 +1666,205 @@ struct FileBrowserView: View {
         if let selectedDirectory, let updated = moved(selectedDirectory) { self.selectedDirectory = updated }
         checkedPaths = Set(checkedPaths.map { moved($0) ?? $0 })
         expandedPaths = Set(expandedPaths.map { moved($0) ?? $0 })
+    }
+
+    /* --------------------------- link a folder ---------------------------- */
+
+    /// Where a linked folder's mirror goes: the picked folder when it can take
+    /// one — under raw/docs and not inside another linked folder — else raw/docs.
+    private var linkBase: String {
+        let dir = targetDirectory
+        guard dir == "raw/docs" || dir.hasPrefix("raw/docs/"), !isInsideLinkedFolder(dir) else { return "raw/docs" }
+        return dir
+    }
+
+    private func isInsideLinkedFolder(_ dir: String) -> Bool {
+        let parts = dir.split(separator: "/").map(String.init)
+        guard !parts.isEmpty else { return false }
+        return (1...parts.count).contains { node(at: parts.prefix($0).joined(separator: "/"))?.linked != nil }
+    }
+
+    /// The folder's own name, which its mirror keeps.
+    private func folderName(_ source: String) -> String {
+        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (trimmed as NSString).lastPathComponent
+    }
+
+    /// A folder of the service's machine: picked in a panel when the service
+    /// runs on this Mac, typed when it runs elsewhere — a panel here would
+    /// offer this Mac's folders, which the service cannot read.
+    private func beginLinkFolder() {
+        guard model.maySaveSettings else { return }
+        guard model.serviceIsOnThisMac else {
+            activeSheet = .linkPath
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = L("Link")
+        panel.message = L("Pick a folder to mirror into %@/ and keep in sync: every change there is indexed, and the copies are read-only here.", linkBase)
+        let picked: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in await previewLink(source: url.path) }
+        }
+        if let window = NSApp.keyWindow {
+            panel.beginSheetModal(for: window, completionHandler: picked)
+        } else {
+            panel.begin(completionHandler: picked)
+        }
+    }
+
+    private var linkPathSheet: some View {
+        let trimmed = linkSourcePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let valid = (trimmed.hasPrefix("/") || trimmed.hasPrefix("~/")) && !folderName(trimmed).isEmpty && folderName(trimmed) != "/"
+        return VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 5) {
+                Eyebrow(text: L("Link a folder"))
+                Text(L("Which folder on the service's machine?")).font(.title2.bold())
+                Text(L("The service runs elsewhere (%@), so the folder is one of that machine's: type its absolute path there. Its files are mirrored into %@/ and kept in sync while knode-os runs.", model.serverURLString, linkBase))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            TextField("/Users/…", text: $linkSourcePath)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+            if valid {
+                Label(L("Lands in %@", "\(linkBase)/\(folderName(trimmed))"), systemImage: "folder")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            HStack {
+                Spacer()
+                Button(L("Cancel")) { activeSheet = nil }
+                Button(L("Continue…")) {
+                    activeSheet = nil
+                    Task { await previewLink(source: trimmed) }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.knodeCyan)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!valid)
+            }
+        }
+        .padding(26)
+        .frame(width: 520)
+    }
+
+    /// What the link would carry, before anything is written.
+    private func previewLink(source: String) async {
+        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        linkSourcePath = trimmed
+        let dest = "\(linkBase)/\(folderName(trimmed))"
+        isWorking = true
+        model.globalActivity = L("Reading the folder…")
+        defer {
+            isWorking = false
+            model.globalActivity = nil
+        }
+        do {
+            let plan = try await model.client().previewFolder(source: trimmed, dest: dest)
+            if let linked = plan.linked {
+                model.showToast(L("%@ is already linked to %@", linked.dest, linked.source), duration: 6_000_000_000)
+                return
+            }
+            activeSheet = .linkPlan(plan, trimmed)
+        } catch {
+            model.showError(error, prefix: L("Link failed"))
+        }
+    }
+
+    private func linkPlanSheet(_ plan: FolderImportPlan, source: String) -> some View {
+        let bytes = ByteCountFormatter.string(fromByteCount: Int64(plan.bytes), countStyle: .file)
+        let files = plan.files == 1 ? L("1 file") : L("%@ files", plan.files.formatted())
+        let sample = plan.sample.prefix(3).map { ($0 as NSString).lastPathComponent }
+        return VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 5) {
+                Eyebrow(text: L("Link a folder"))
+                Text(L("Link this folder and keep it in sync?")).font(.title2.bold())
+            }
+            VStack(alignment: .leading, spacing: 5) {
+                Text(plan.source)
+                    .font(.system(size: 12, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                Label(plan.dest, systemImage: "arrow.turn.down.right")
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Color.knodeCyan)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+            Text("\(files), \(bytes)" + (sample.isEmpty ? "." : " — " + L("e.g. %@", sample.joined(separator: ", "))))
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            if plan.tooLarge > 0 {
+                Label(L("%@ of them are too large to index: they are copied, not indexed.", plan.tooLarge.formatted()), systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if plan.skippedByType > 0 {
+                Label(L("%@ files of types knode-os cannot index stay behind.", plan.skippedByType.formatted()), systemImage: "minus.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if plan.exists {
+                Label(L("%@ already exists: it becomes a mirror of this folder, and files only it has are removed.", plan.dest), systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(L("The copies are kept in sync while knode-os runs: every change there is indexed, and the copies are read-only here. Edit the originals, not the copies."))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button(L("Cancel")) { activeSheet = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button(plan.exists ? L("Replace and link") : L("Link folder")) {
+                    activeSheet = nil
+                    Task { await link(plan, source: source) }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(plan.exists ? .orange : .knodeCyan)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(26)
+        .frame(width: 540)
+    }
+
+    private func link(_ plan: FolderImportPlan, source: String) async {
+        isWorking = true
+        model.globalActivity = L("Linking %@ — copying and indexing…", plan.dest)
+        defer {
+            isWorking = false
+            model.globalActivity = nil
+        }
+        do {
+            let result = try await model.client().importFolder(source: source, dest: plan.dest, mode: "link", replace: plan.exists)
+            await loadTree()
+            expand(result.dest)
+            selectedDirectory = result.dest
+            await model.refreshStats()
+            let copied = result.copied.count == 1 ? L("1 file copied") : L("%@ files copied", result.copied.count.formatted())
+            let indexing = result.sync.map { L("%@ indexed", String($0.indexed ?? 0)) } ?? (result.indexing ? L("indexing in the background") : nil)
+            model.showToast(L("Linked %@: %@", result.dest, copied) + (indexing.map { " · \($0)" } ?? ""), duration: 6_000_000_000)
+        } catch {
+            model.showError(error, prefix: L("Link failed"))
+        }
+    }
+
+    /// The Claude Code and Codex sessions on the service's machine, copied into raw/traces/.
+    private func importTraces() async {
+        guard let result = await model.collectTraces() else { return }
+        await loadTree()
+        if result.copied > 0 { expand("raw/traces") }
     }
 
     /// Files upload as themselves, folders upload their whole subtree — the

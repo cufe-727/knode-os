@@ -46,6 +46,21 @@ final class AppModel: ObservableObject {
     @Published var pendingFilePath: String?
     /// An entity name the graph explores when it next appears; set by Entities → Explore in graph.
     @Published var pendingGraphQuery: String?
+    /// What the search field (or an entity's "Search for it") hands Explore → Search to run.
+    @Published var pendingSearch: String?
+    /// A question for Explore → Ask: a new conversation sends it, or the composer holds it when Ask cannot answer.
+    @Published var pendingQuestion: String?
+    /// A topic for Explore → Research's composer. It waits there: refining spends a model call.
+    @Published var pendingResearchTopic: String?
+    /// A study or an Ask conversation Tasks → Queue asked to open.
+    @Published var pendingStudyID: String?
+    @Published var pendingConversationID: String?
+    /// Bumped by ⌘K: the toolbar's search field takes the focus.
+    @Published var topSearchFocusRequest = 0
+    /// The last Explore → Search, so going to a file and back finds it still there. Not published: only that screen reads it.
+    var lastExplore: ExploreMemory?
+    /// The last Tasks → Queue read, shown at once when the screen comes back while the next one loads.
+    var lastTasks: (workspaceID: String?, revision: Int, snapshot: TasksSnapshot)?
     /// The folder picked in the Files tree. Shared so Search can scope to it.
     @Published var pickedDirectory: String?
     @Published var workspaceRevision = 0
@@ -87,10 +102,18 @@ final class AppModel: ObservableObject {
         // the mock accounts of earlier builds had passwords hashed without salt: gone, never migrated
         defaults.removeObject(forKey: legacyAccountsKey)
         if let data = defaults.data(forKey: navKey), let nav = try? JSONDecoder().decode(NavState.self, from: data) {
+            // A tab is remembered under the section it belongs to now: one that
+            // moved (Search, from Library to Explore) follows, a section that is
+            // gone (Ask, Research) leaves nothing behind, and its own section's
+            // entry wins over a moved one.
             lastTab = nav.last.reduce(into: [:]) { out, pair in
-                if let section = AppSection(rawValue: pair.key), let tab = AppTab.named(pair.value) { out[section] = tab }
+                guard let tab = AppTab.named(pair.value) else { return }
+                if AppSection(rawValue: pair.key) == tab.section || out[tab.section] == nil { out[tab.section] = tab }
             }
-            if let tab = AppTab.named(nav.tab) { selectedTab = tab }
+            if let tab = AppTab.named(nav.tab) {
+                selectedTab = tab
+                lastTab[tab.section] = tab
+            }
         }
         token = SessionTokens.read(connection.identity)
         if let data = defaults.data(forKey: sessionKey),
@@ -458,8 +481,7 @@ final class AppModel: ObservableObject {
         defaults.removeObject(forKey: sessionKey)
         session = nil
         pendingUser = nil
-        pendingFilePath = nil
-        pendingGraphQuery = nil
+        forgetHandOffs()
         stats = nil
         processing = nil
         notices = []
@@ -652,6 +674,98 @@ final class AppModel: ObservableObject {
         return pendingGraphQuery
     }
 
+    /* ------------------- Explore: Search, Ask, Research ------------------- */
+
+    /// Search for `query` in Explore → Search, from wherever it was asked.
+    func runSearch(_ query: String) {
+        let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        pendingSearch = text
+        select(.search)
+    }
+
+    /// Put a question to Ask: a new conversation, sent at once when Ask can answer.
+    func ask(_ question: String) {
+        let text = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        pendingQuestion = text
+        select(.ask)
+    }
+
+    /// Take a topic to Research's composer. Nothing starts: refining spends a model call, so that stays a person's click.
+    func research(_ topic: String) {
+        let text = topic.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        pendingResearchTopic = text
+        select(.studies)
+    }
+
+    func openStudy(_ id: String) {
+        pendingStudyID = id
+        select(.studies)
+    }
+
+    func openConversation(_ id: String) {
+        pendingConversationID = id
+        select(.ask)
+    }
+
+    func consumePendingSearch() -> String? {
+        defer { pendingSearch = nil }
+        return pendingSearch
+    }
+
+    func consumePendingQuestion() -> String? {
+        defer { pendingQuestion = nil }
+        return pendingQuestion
+    }
+
+    func consumePendingResearchTopic() -> String? {
+        defer { pendingResearchTopic = nil }
+        return pendingResearchTopic
+    }
+
+    func consumePendingStudy() -> String? {
+        defer { pendingStudyID = nil }
+        return pendingStudyID
+    }
+
+    func consumePendingConversation() -> String? {
+        defer { pendingConversationID = nil }
+        return pendingConversationID
+    }
+
+    /// ⌘K: the search field in the toolbar.
+    func focusTopSearch() {
+        topSearchFocusRequest += 1
+    }
+
+    /// What one workspace handed another screen: none of it applies in the next.
+    private func forgetHandOffs() {
+        pendingFilePath = nil
+        pendingGraphQuery = nil
+        pendingSearch = nil
+        pendingQuestion = nil
+        pendingResearchTopic = nil
+        pendingStudyID = nil
+        pendingConversationID = nil
+        lastExplore = nil
+        lastTasks = nil
+    }
+
+    /// Whether the service runs on this Mac, so a folder of this Mac is one it can read.
+    /// Through an SSH tunnel the address is loopback but the service is not here.
+    var serviceIsOnThisMac: Bool {
+        let raw: String
+        switch connection.mode {
+        case .local: raw = connection.localURL
+        case .remote: raw = connection.remoteURL
+        case .ssh: return false
+        }
+        guard let host = URL(string: ConnectionSettings.trimmed(raw))?.host?.lowercased() else { return false }
+        return ["127.0.0.1", "localhost", "::1", "[::1]"].contains(host)
+    }
+
     func refreshStats() async {
         guard phase == .app else { return }
         do {
@@ -705,16 +819,19 @@ final class AppModel: ObservableObject {
 
     /// Copy the agent sessions on the service's machine into the workspace,
     /// which lifts the pause a new or cleared workspace starts with.
-    func collectTraces() async {
+    @discardableResult
+    func collectTraces() async -> TraceSyncResponse? {
         globalActivity = L("Collecting traces…")
         defer { globalActivity = nil }
         do {
             let result = try await client().syncTraces()
-            showToast(L("Collected %@ sessions", String(result.copied)))
+            showToast(L("Collected %@ sessions · %@ skill files", String(result.copied), String(result.skills)))
             await refreshNotices()
             await refreshStats()
+            return result
         } catch {
             showError(error, prefix: L("Collecting traces failed"))
+            return nil
         }
     }
 
@@ -757,8 +874,7 @@ final class AppModel: ObservableObject {
             }
             setSession(current)
             if previousActiveID != current.activeWorkspaceID {
-                pendingFilePath = nil
-                pendingGraphQuery = nil
+                forgetHandOffs()
                 stats = nil
                 processing = nil
                 notices = []
@@ -817,8 +933,7 @@ final class AppModel: ObservableObject {
     }
 
     private func workspaceDidChange(message: String) {
-        pendingFilePath = nil
-        pendingGraphQuery = nil
+        forgetHandOffs()
         stats = nil
         processing = nil
         notices = []
