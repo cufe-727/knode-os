@@ -122,9 +122,10 @@ struct DreamView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 Text(L("Suggestions")).font(.headline)
-                let pending = suggestions.filter { $0.status == "pending" }.count
+                // the list holds the latest 200; the workspace's own count says how many wait in all
+                let pending = max(suggestions.filter { $0.status == "pending" }.count, model.stats?.pendingSuggestions ?? 0)
                 if pending > 0 {
-                    Text(L("%@ to review", String(pending)))
+                    Text(L("%@ to review", pending.formatted()))
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(Color.knodeViolet)
                 }

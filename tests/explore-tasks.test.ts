@@ -9,7 +9,7 @@ import { sync } from '../src/ingest/sync.js';
 import { createJobRow } from '../src/research/jobs.js';
 import { entityMatch, ExploreResult, SearchSuggestions } from '../src/search/explore.js';
 import { createApp } from '../src/server/app.js';
-import { nextDaily, TasksSnapshot } from '../src/server/tasks.js';
+import { nextDaily, TasksSnapshot, tasksSnapshot } from '../src/server/tasks.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 
 /**
@@ -170,6 +170,31 @@ describe('GET /api/tasks', () => {
     // without serve nothing runs on a clock here
     expect(t.scheduled.find((s) => s.id === 'dream')).toMatchObject({ next: null });
     expect(t.dream.pendingSuggestions).toBe(0);
+  });
+
+  it('says a summary or translation count was not taken yet, rather than showing it as zero', async () => {
+    const totals = { calls: 0, ok: 0, failed: { model: 0, transient: 0, fatal: 0 }, leasesExpired: 0, stale: 0 };
+    const idle = { leases: [], due: 0, scannedAt: null, lastHour: { calls: 0, pagesWritten: 0, documents: 0 } };
+    const services = {
+      mcp: () => null,
+      kickResearch: () => {},
+      track: <T>(job: Promise<T>) => job,
+      processing: { state: () => ({ running: false, since: null, by: null }) },
+      work: {
+        status: async () => ({
+          shares: { extract: 3, summarize: 1, translate: 1 },
+          kinds: {
+            summarize: { ...idle, totals: { ...totals, parts: 0, pagesWritten: 0 } },
+            translate: { ...idle, enabled: true, primary: 'zh', totals: { ...totals, documents: 0 } },
+          },
+          workers: [],
+        }),
+      },
+    } as unknown as Parameters<typeof tasksSnapshot>[1];
+    const t = await tasksSnapshot(ws, services);
+    expect(t.stages.find((s) => s.id === 'summarize')?.note).toBe('not counted until processing starts');
+    expect(t.stages.find((s) => s.id === 'translate')?.note).toBe('not counted until processing starts');
+    expect(t.serving).toBe(true);
   });
 
   it('belongs to the ingest group, as the labeling status does; explore and suggest to search', () => {

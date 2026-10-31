@@ -192,6 +192,8 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
   const processing = services?.processing?.state() ?? null;
   const running = processing?.running === true;
   const stopped = services?.processing ? (running ? null : 'waits for processing to start') : null;
+  // summaries and translations are counted when a slot first asks for one: until then 0 means "not looked yet"
+  const uncounted = 'not counted until processing starts';
   const summaries = work?.kinds.summarize as import('../work/summarize.js').SummaryStatus | undefined;
   const translations = work?.kinds.translate as import('../work/translate.js').TranslateStatus | undefined;
   const judge = work?.kinds.judge as import('../work/judge.js').JudgeStatus | undefined;
@@ -215,12 +217,14 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
     {
       id: 'summarize', enabled: Boolean(summaries), unit: 'documents', waiting: summaries?.due ?? 0, inFlight: summaries?.leases.length ?? 0,
       doneLastHour: summaries?.lastHour.pagesWritten ?? null, callsLastHour: summaries?.lastHour.calls ?? null,
-      failed: sumFailed(summaries?.totals.failed), note: summaries && summaries.due > 0 ? stopped : null,
+      failed: sumFailed(summaries?.totals.failed),
+      note: summaries && summaries.scannedAt === null ? uncounted : summaries && summaries.due > 0 ? stopped : null,
     },
     {
       id: 'translate', enabled: translations?.enabled === true, unit: 'translations', waiting: translations?.due ?? 0, inFlight: translations?.leases.length ?? 0,
       doneLastHour: translations?.lastHour.documents ?? null, callsLastHour: translations?.lastHour.calls ?? null,
-      failed: sumFailed(translations?.totals.failed), note: translations?.enabled && translations.due > 0 ? stopped : null,
+      failed: sumFailed(translations?.totals.failed),
+      note: translations?.enabled && translations.scannedAt === null ? uncounted : translations?.enabled && translations.due > 0 ? stopped : null,
     },
     {
       id: 'review', enabled: Boolean(judge), unit: 'calls', waiting: judge?.waiting ?? 0, inFlight: judge?.leases.length ?? 0,

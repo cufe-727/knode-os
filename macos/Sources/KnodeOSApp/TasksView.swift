@@ -327,10 +327,13 @@ struct TasksView: View {
                     .foregroundStyle(.tertiary)
             }
             if stage.enabled {
-                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                // the count on a line of its own: beside its unit, "2,080" wrapped in a narrow card
+                VStack(alignment: .leading, spacing: 1) {
                     Text(stage.waiting.formatted())
                         .font(.system(size: 24, weight: .semibold, design: .rounded))
                         .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
                     Text(TaskWords.waiting(stage.unit, stage.waiting))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -461,9 +464,11 @@ struct TasksView: View {
         let online = t.workers.filter(\.online).count
         return card(L("Workers"), symbol: "cpu", count: t.workers.isEmpty ? nil : L("%@ of %@ online", String(online), String(t.workers.count))) {
             if t.workers.isEmpty {
-                hint(t.serving
-                    ? L("No model slots on this machine and no remote worker has asked for work. Slots come from the stage routes in Settings → Ingest; remote workers connect with a token (knode-os remote token create).")
-                    : L("Workers run inside knode-os serve."))
+                hint(!t.serving
+                    ? L("Workers run inside knode-os serve.")
+                    : t.processing?.running == false
+                        ? L("This machine's slots start with processing; remote workers appear here once they ask for work.")
+                        : L("No model slots on this machine and no remote worker has asked for work. Slots come from the stage routes in Settings → Ingest; remote workers connect with a token (knode-os remote token create)."))
             }
             ForEach(t.workers) { worker in workerRow(worker) }
         }
