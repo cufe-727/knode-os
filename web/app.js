@@ -276,7 +276,13 @@ function loadWorkspaceData() {
   $('#btn-edit').disabled = true;
   $('#btn-save').disabled = true;
   $('#btn-delete').disabled = true;
+  searchState.result = null;
+  searchState.seq++;
   $('#search-results').innerHTML = '';
+  $('#search-summary').hidden = true;
+  $('#search-main-head').hidden = true;
+  $('#search-side').hidden = true;
+  tasksSnapshot = null;
   $('#graph-side').innerHTML = '';
   resetEntities();
   $('#traces-table tbody').innerHTML = '';
@@ -308,6 +314,7 @@ function stopAppData() {
   if (noticesTimer) clearInterval(noticesTimer);
   noticesTimer = null;
   stopChatPolling();
+  stopTasksPolling();
 }
 
 function enterApp() {
@@ -650,36 +657,40 @@ async function bootAuth() {
 
 /**
  * Two levels: a section in the header, its tabs in the strip below. The
- * grouping follows what you do with a file rather than what the service
- * implements — material comes in (Library), you ask about it (Ask), knowledge
- * grows out of it (Knowledge).
+ * grouping follows what you do with knowledge rather than what the service
+ * implements (docs/design/20) — material comes in (Library), you look things
+ * up in it (Explore: what matches, an answer, a set of pages), knowledge grows
+ * out of it (Knowledge), and the work behind all of it runs (Tasks).
  */
 const NAV = [
   { id: 'library', title: 'Library', tabs: [
-    { id: 'files', title: 'Files', hint: 'Browse and edit knowledge' },
-    { id: 'search', title: 'Search', hint: 'Hybrid, vector, and keyword recall' },
-    { id: 'traces', title: 'Traces', hint: 'Claude Code and Codex sessions' },
+    { id: 'files', title: 'Files', hint: 'Browse, edit and import knowledge' },
   ] },
-  { id: 'ask', title: 'Ask', tabs: [{ id: 'ask', title: 'Ask', hint: 'An agent that answers from your workspace' }] },
-  // a topic researched into several pages: refine it, collect sources, write and review the pages
-  { id: 'studies', title: 'Research', tabs: [
-    { id: 'studies', title: 'Studies', hint: 'Research a topic into several wiki pages' },
-    { id: 'sources', title: 'Sources', hint: 'The web, your APIs, MCP servers and sites a study may use' },
+  { id: 'explore', title: 'Explore', tabs: [
+    { id: 'search', title: 'Search', hint: 'What a query matches: passages by channel, the entities it names, their relations and claims' },
+    { id: 'ask', title: 'Ask', hint: 'An agent that answers from your workspace' },
+    // a topic researched into several pages: refine it, collect sources, write and review the pages
+    { id: 'studies', title: 'Research', hint: 'Research a topic into several wiki pages' },
   ] },
   { id: 'knowledge', title: 'Knowledge', tabs: [
     { id: 'graph', title: 'Graph', hint: 'Entities, relations, and claims' },
     { id: 'entities', title: 'Entities', hint: 'Every entity, filtered and sorted' },
     { id: 'wiki', title: 'Wiki', hint: 'Pages researched by agent CLIs' },
-    { id: 'dream', title: 'Dream', hint: 'Review agent improvement ideas' },
+  ] },
+  { id: 'tasks', title: 'Tasks', tabs: [
+    { id: 'queue', title: 'Queue', hint: 'The pipeline, the calls out now and who holds them, workers, jobs and the schedule' },
+    { id: 'dream', title: 'Dream', hint: 'The nightly review of agent traces, and its suggestions' },
   ] },
   // Settings in the order knowledge moves: processed as it comes in (Ingest),
-  // researched into the wiki (Research), used to answer (Ask). Ids keep their
-  // first names, so `pipeline` is titled Ingest; Ask's settings are `chat`, the
-  // config block they edit, because `ask` is the Ask view itself.
+  // researched into the wiki (Research, and the Sources a study may use), used
+  // to answer (Ask). Ids keep their first names, so `pipeline` is titled
+  // Ingest; Ask's settings are `chat`, the config block they edit, because
+  // `ask` is the Ask view itself.
   { id: 'settings', title: 'Settings', tabs: [
     { id: 'providers', title: 'Providers & Agents', hint: 'Endpoints, credentials, and who does the work' },
     { id: 'pipeline', title: 'Ingest', hint: 'How documents get processed' },
     { id: 'research', title: 'Research', hint: 'How the wiki gets written' },
+    { id: 'sources', title: 'Sources', hint: 'The web, your APIs, MCP servers and sites a study may use' },
     { id: 'chat', title: 'Ask', hint: 'How questions get answered' },
     { id: 'playbooks', title: 'Playbooks', hint: 'Prompts, templates and vocabularies knode-os works from' },
     { id: 'workspace', title: 'Workspace', hint: 'Clear this workspace' },
@@ -699,19 +710,25 @@ const hostOf = (tab) => TAB_HOST[tab] ?? tab;
  * Tabs that used to exist, so a stored navigation still lands somewhere.
  * `agents` was folded into `providers`: an agent runs on a provider from the
  * table above it, and the two were never separable but in the tab strip.
+ * `traces` became the list at the foot of Dream, the job that reads them.
  */
-const NAV_ALIAS = { agents: 'providers' };
+const NAV_ALIAS = { agents: 'providers', traces: 'dream' };
 const aliasOf = (tab) => NAV_ALIAS[tab] ?? tab;
+
+/** The last arrival's load of Ask and of Research: what a question or a topic sent from the search box waits for. */
+let chatLoaded = null;
+let studiesLoaded = null;
 
 /** What a host view loads when you arrive at it. */
 const TAB_LOAD = {
-  search: () => paintSearchScope(),
-  traces: () => loadTraces(),
-  dream: () => loadSuggestions(),
+  search: () => paintSearchArrival(),
+  queue: () => startTasksPolling(),
+  dream: () => loadDream(),
   wiki: () => loadResearch(),
-  studies: () => loadStudies(),
+  // kept, so a question or a topic sent from the search box waits for the list it lands in
+  studies: () => (studiesLoaded = loadStudies()),
   sources: () => loadSources(),
-  ask: () => loadChat(),
+  ask: () => (chatLoaded = loadChat()),
   settings: () => loadConfigForm(),
   access: () => loadAccess(),
   // the box may hold a name another view put there (exploreEntity): arrival runs it
@@ -769,7 +786,7 @@ function paintSearchScope() {
   const select = $('#search-scope');
   const dir = selectedDir;
   const previous = select.value;
-  select.innerHTML = '<option value="">whole base</option>'
+  select.innerHTML = '<option value="">Whole base</option>'
     + ['raw/docs', 'raw/traces', 'wiki', ...(dir && !['raw/docs', 'raw/traces', 'wiki'].includes(dir) ? [dir] : [])]
       .map((d) => `<option value="${esc(d)}">${esc(d)}/</option>`).join('');
   select.value = [...select.options].some((o) => o.value === previous) ? previous : '';
@@ -794,6 +811,8 @@ function navigate(tab) {
   // leaving Ask stops its polling — as its own statement, not as the `else` of
   // an unrelated `if`, which is how this used to silently fire everywhere
   if (previousHost === 'ask' && host !== 'ask') stopChatPolling();
+  if (previousHost === 'queue' && host !== 'queue') stopTasksPolling();
+  closeGlobalSearch();
   if (host !== previousHost) TAB_LOAD[host]?.();
   if (tab !== previousTab || host !== previousHost) SUBTAB_LOAD[tab]?.();
 }
@@ -1087,12 +1106,16 @@ $('#access-gateways').addEventListener('click', async (event) => {
 
 /* ------------------------------- stats --------------------------------- */
 
+/** The last /api/stats: the Tasks header counts and the header's Tasks badge read it. */
+let lastStats = null;
+
 async function loadStats() {
   try {
     const s = await api('/api/stats');
-    $('#statsbar').textContent =
-      `${s.documents} docs · ${s.chunks} chunks · ${s.entities} entities · ${s.relations} rels · ${s.traces} traces` +
-      (s.pending_suggestions ? ` · ☾${s.pending_suggestions}` : '');
+    lastStats = s;
+    const cell = (n, label) => `<div class="metric"><b>${Number(n ?? 0).toLocaleString()}</b><span>${label}</span></div>`;
+    $('#tasks-stats').innerHTML = cell(s.documents, 'documents') + cell(s.chunks, 'chunks') + cell(s.entities, 'entities') + cell(s.relations, 'relations') + cell(s.traces, 'traces');
+    paintTasksBadge(s);
   } catch { /* server still starting */ }
   loadProcessing();
   void loadContentLanguages();
@@ -1322,31 +1345,42 @@ async function loadProcessing() {
   paintProcessing();
 }
 
+/** Model calls out right now, every kind together, from the labeling status. */
+function processingInFlight(status) {
+  return ['scheduler', 'summaries', 'translations', 'judge'].reduce((n, key) => n + (status?.[key]?.leases?.length ?? 0), 0);
+}
+
+/**
+ * The header pill says whether processing runs and how much is out; it opens
+ * Tasks → Queue, where it is started and stopped (docs/design/20 D7).
+ */
 function paintProcessing() {
   const button = $('#processing-toggle');
   const state = processingStatus?.processing;
   button.hidden = !state;
+  paintTasksBadge();
   if (!state) return;
-  const mayChange = authDisabled || serverAuth?.groups?.settings === true;
   const queued = processingStatus.scheduler?.queued;
   const due = processingStatus.summaries?.due;
   const translations = processingStatus.translations?.enabled ? processingStatus.translations : null;
+  const inFlight = processingInFlight(processingStatus);
   button.classList.toggle('running', state.running);
-  button.textContent = state.running ? '● Processing' : '▶ Start processing';
-  button.disabled = !mayChange;
+  button.textContent = state.running ? `● Processing${inFlight ? ` · ${inFlight} in flight` : ''}` : '○ Processing stopped';
   button.title = [
-    state.running ? 'Extraction, reviews and summaries are running — click to stop' : 'Extraction, reviews and summaries wait until someone starts them',
+    state.running ? 'Extraction, reviews and summaries are running' : 'Extraction, reviews and summaries wait until someone starts them',
     queued === undefined ? '' : `${queued} documents waiting`,
     due ? `${due} summaries due` : '',
     translations?.due ? `${translations.due} translations into ${languageInEnglish(translations.primary)} due` : '',
     state.by && state.since ? `${state.running ? 'started' : 'stopped'} by ${state.by} at ${new Date(state.since).toLocaleTimeString()}` : '',
-    mayChange ? '' : 'an administrator starts and stops processing',
+    'open Tasks to see the queue, start or stop',
   ].filter(Boolean).join(' · ');
 }
 
-$('#processing-toggle').addEventListener('click', async () => {
-  const running = processingStatus?.processing?.running === true;
-  if (running) {
+$('#processing-toggle').addEventListener('click', () => navigate('queue'));
+
+/** Start (after the estimate) or stop the processing — Tasks → Queue's switch. */
+async function switchProcessing(on) {
+  if (!on) {
     if (!confirm('Stop processing? Calls in flight finish; nothing new starts until someone starts it again.')) return;
     try {
       await api('/api/labeling/stop', { method: 'POST', body: '{}' });
@@ -1355,6 +1389,7 @@ $('#processing-toggle').addEventListener('click', async () => {
       toast(error.message, 5000);
     }
     loadProcessing();
+    loadTasks();
     return;
   }
   // starting spends model calls: say how many, and what of each plan, first
@@ -1367,9 +1402,326 @@ $('#processing-toggle').addEventListener('click', async () => {
       await api('/api/labeling/start', { method: 'POST', body: '{}' });
       toast('Processing started: extraction, reviews and summaries');
       loadProcessing();
+      loadTasks();
     },
   });
-});
+}
+
+/* -------------------------------- tasks -------------------------------- */
+
+/**
+ * Tasks → Queue (docs/design/20): one read of everything the workspace has
+ * under way — the pipeline by stage, the calls out now and who holds them,
+ * this machine's backends and the remote workers, research and Ask jobs,
+ * background syncs, and what runs on a clock. Polled while it is on screen.
+ */
+let tasksTimer = null;
+let tasksSnapshot = null;
+let tasksSeq = 0;
+const TASKS_POLL_MS = 3000;
+
+const STAGES = {
+  index: { title: 'Index', icon: '⛁', about: 'convert, chunk and apply new and changed files' },
+  embed: { title: 'Embed', icon: '◇', about: 'a vector for every chunk, for semantic search' },
+  extract: { title: 'Extract', icon: '⌬', about: 'entities, relations and claims, by a model' },
+  summarize: { title: 'Summarize', icon: '¶', about: 'one summary page per document' },
+  translate: { title: 'Translate', icon: '文', about: 'into the primary content language' },
+  review: { title: 'Review', icon: '⚖', about: 'judge calls: duplicate entities and claims' },
+};
+const UNIT_WORDS = { documents: ['document', 'documents'], chunks: ['chunk', 'chunks'], translations: ['translation', 'translations'], calls: ['call', 'calls'] };
+const WORK_KIND_WORDS = { extract: 'Extract', summarize: 'Summarize', translate: 'Translate', judge: 'Review' };
+const JOB_KIND_WORDS = { study: 'Study', research: 'Page', init: 'Initialize', ask: 'Ask' };
+const SCHEDULE_WORDS = {
+  dream: ['Dream', 'reviews recent agent traces'],
+  tier2: ['Tier-2 pass', 'merges, claim reviews, views and the wiki check'],
+  traces: ['Agent traces', 'collects new Claude Code and Codex sessions'],
+  datasources: ['Datasources', 'refreshes live schemas into the wiki'],
+};
+const ACTIVITY_ICONS = { sync: '⟳', ingest: '⛁', upload: '⤒', folder: '⇄', traces: '⌁', datasources: '◫', dream: '☾', tier2: '⚙' };
+
+/** "45 s", "3 min 10 s", "2 h 5 min". */
+function spanText(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} min${s % 60 && s < 600 ? ` ${s % 60} s` : ''}`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h < 48 ? `${h} h${m ? ` ${m} min` : ''}` : `${Math.round(h / 24)} days`;
+}
+const agoText = (iso) => (iso ? `${spanText((Date.now() - Date.parse(iso)) / 1000)} ago` : 'never');
+const untilText = (iso) => (iso ? `in ${spanText((Date.parse(iso) - Date.now()) / 1000)}` : '');
+
+function startTasksPolling() {
+  stopTasksPolling();
+  loadTasks();
+  tasksTimer = setInterval(() => { if (!document.hidden) loadTasks(); }, TASKS_POLL_MS);
+}
+
+function stopTasksPolling() {
+  clearInterval(tasksTimer);
+  tasksTimer = null;
+}
+
+async function loadTasks() {
+  const seq = ++tasksSeq;
+  try {
+    const snapshot = await api('/api/tasks');
+    if (seq !== tasksSeq) return;
+    tasksSnapshot = snapshot;
+    renderTasks(snapshot);
+  } catch (e) {
+    if (seq !== tasksSeq) return;
+    $('#tasks-stages').innerHTML = `<p class="hint">The queue could not be read: ${esc(e.message)}</p>`;
+  }
+}
+
+function renderTasks(t) {
+  paintTasksProcessing(t);
+  paintTasksStages(t);
+  paintTasksInFlight(t);
+  paintTasksWorkers(t);
+  paintTasksJobs(t);
+  paintTasksActivity(t);
+  paintTasksSchedule(t);
+  paintTasksErrors(t);
+  wireTaskLinks($('#tab-queue'));
+}
+
+function paintTasksProcessing(t) {
+  const el = $('#tasks-processing');
+  if (!t.processing) {
+    el.innerHTML = `<div class="tp-state"><span class="status-dot"></span><div><b>No processing here</b><p class="hint">${t.serving ? 'This workspace has no processing switch.' : 'Extraction and the other model stages run inside <span class="mono">knode-os serve</span>.'}</p></div></div>`;
+    return;
+  }
+  const p = t.processing;
+  const mayChange = authDisabled || serverAuth?.groups?.settings === true;
+  const since = p.since ? new Date(p.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : null;
+  const line = p.running
+    ? `Running${since ? ` since ${since}` : ''}${p.by ? `, started by ${esc(p.by)}` : ''}`
+    : (since && p.by ? `Stopped at ${since} by ${esc(p.by)}` : 'Stopped since the service started');
+  el.innerHTML = `<div class="tp-state"><span class="status-dot${p.running ? ' live' : ''}"></span>
+      <div><b>${p.running ? 'Processing' : 'Processing is stopped'}</b><p class="hint">${line}. ${p.running ? 'Extraction, reviews, summaries and translations take work as slots free up.' : 'Extraction, reviews, summaries and translations spend model calls, so they wait until someone starts them.'}</p></div></div>
+    <div class="tp-actions">
+      ${mayChange ? '' : '<span class="hint">An administrator starts and stops processing.</span>'}
+      <button type="button" id="btn-tasks-processing" class="${p.running ? 'danger-button' : 'primary'}"${mayChange ? '' : ' disabled'}>${p.running ? 'Stop processing' : 'Start processing…'}</button>
+    </div>`;
+  el.querySelector('#btn-tasks-processing')?.addEventListener('click', () => switchProcessing(!p.running));
+}
+
+function paintTasksStages(t) {
+  const el = $('#tasks-stages');
+  el.innerHTML = t.stages.map((st, i) => {
+    const words = STAGES[st.id] ?? { title: st.id, icon: '•', about: '' };
+    const unit = UNIT_WORDS[st.unit] ?? [st.unit, st.unit];
+    const busy = st.inFlight > 0;
+    const lines = [];
+    if (!st.enabled) lines.push('<span class="hint">off for this workspace</span>');
+    else {
+      if (st.inFlight) lines.push(`<span><span class="status-dot live"></span>${st.inFlight.toLocaleString()} in flight</span>`);
+      if (st.doneLastHour !== null || st.callsLastHour !== null) {
+        const done = st.doneLastHour !== null ? `${st.doneLastHour.toLocaleString()} done` : '';
+        const calls = st.callsLastHour ? `${st.callsLastHour.toLocaleString()} call${st.callsLastHour === 1 ? '' : 's'}` : '';
+        lines.push(`<span class="hint">last hour: ${[done, calls].filter(Boolean).join(' · ') || 'nothing'}</span>`);
+      }
+      if (st.failed) lines.push(`<span class="bad">${st.failed.toLocaleString()} failed</span>`);
+    }
+    return `<div class="stage-card${st.enabled ? '' : ' off'}${busy ? ' busy' : ''}${st.waiting && st.note ? ' blocked' : ''}" title="${esc(words.about)}">
+      <div class="stage-card-head"><span class="stage-icon">${words.icon}</span><b>${esc(words.title)}</b><span class="stage-step">${i + 1}</span></div>
+      <div class="stage-big">${st.enabled ? st.waiting.toLocaleString() : '—'}<small>${st.enabled ? `${st.waiting === 1 ? unit[0] : unit[1]} waiting` : ''}</small></div>
+      <div class="stage-lines">${lines.join('')}</div>
+      ${st.note ? `<p class="stage-note">${esc(st.note)}</p>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function paintTasksInFlight(t) {
+  $('#tasks-inflight-count').textContent = t.inFlight.length ? String(t.inFlight.length) : '';
+  const el = $('#tasks-inflight');
+  if (!t.inFlight.length) {
+    el.innerHTML = `<p class="hint">${t.processing?.running ? 'Nothing out right now — the slots are waiting for work.' : 'No model calls out.'}</p>`;
+    return;
+  }
+  el.innerHTML = `<table class="tasks-table"><thead><tr><th>stage</th><th>document</th><th>part</th><th>worker</th><th class="num">running</th><th class="num">lease ends</th></tr></thead><tbody>
+    ${t.inFlight.map((x) => `<tr>
+      <td><span class="kind-pill k-${esc(x.kind)}">${esc(WORK_KIND_WORDS[x.kind] ?? x.kind)}</span></td>
+      <td class="tasks-subject">${x.kind === 'judge' ? esc(x.subject) : `<a href="#" class="mono" data-open="${esc(x.subject)}">${esc(x.subject)}</a>`}</td>
+      <td class="hint">${esc(x.detail ?? '')}</td>
+      <td><span class="mono">${esc(x.backend)}</span>${x.remote ? ' <span class="tag remote">remote</span>' : ''}<div class="hint mono tasks-worker-id">${esc(x.worker)}</div></td>
+      <td class="num mono">${spanText(x.ageSeconds)}</td>
+      <td class="num mono">${x.expiresInSeconds > 0 ? spanText(x.expiresInSeconds) : 'lapsed'}</td>
+    </tr>`).join('')}
+  </tbody></table>`;
+}
+
+function paintTasksWorkers(t) {
+  const online = t.workers.filter((w) => w.online).length;
+  $('#tasks-workers-count').textContent = t.workers.length ? `${online} of ${t.workers.length} online` : '';
+  const el = $('#tasks-workers');
+  if (!t.workers.length) {
+    el.innerHTML = `<p class="hint">${t.serving ? 'No model slots on this machine and no remote worker has asked for work. Slots come from the stage routes in Settings → Ingest; remote workers connect with a token (knode-os remote token create).' : 'Workers run inside knode-os serve.'}</p>`;
+    return;
+  }
+  el.innerHTML = t.workers.map((w) => {
+    const paused = Boolean(w.pausedUntil);
+    const state = paused ? 'paused' : w.online ? (w.busy ? 'busy' : 'idle') : 'offline';
+    const load = w.slots !== null ? `${w.busy} of ${w.slots} slot${w.slots === 1 ? '' : 's'} busy` : `${w.busy} held`;
+    return `<div class="worker-row">
+      <span class="status-dot${w.online && !paused ? ' live' : ''}${paused ? ' warn' : ''}" title="${state}"></span>
+      <div class="worker-main">
+        <div><b class="mono">${esc(w.label)}</b> <span class="tag${w.remote ? ' remote' : ''}">${w.remote ? 'remote' : 'this machine'}</span>${w.kinds.length ? ` <span class="hint">${esc(w.kinds.map((k) => WORK_KIND_WORDS[k] ?? k).join(' · '))}</span>` : ''}</div>
+        <div class="hint">${state} · ${load} · ${w.ok.toLocaleString()} ok${w.failed ? ` · <span class="bad">${w.failed.toLocaleString()} failed</span>` : ''}${w.remote ? ` · seen ${agoText(w.lastSeen)}` : ''}</div>
+        ${w.remote ? `<div class="hint mono tasks-worker-id">${esc(w.id)}</div>` : ''}
+        ${paused ? `<div class="hint warn">resting until ${new Date(w.pausedUntil).toLocaleTimeString()}${w.pauseReason ? `: ${esc(w.pauseReason)}` : ''}</div>` : ''}
+        ${w.lastError && !paused ? `<div class="hint bad">${esc(w.lastError)}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function paintTasksJobs(t) {
+  const live = t.jobs.filter((j) => ['queued', 'running', 'validating', 'waiting'].includes(j.status));
+  $('#tasks-jobs-count').textContent = live.length ? `${live.length} under way` : '';
+  const el = $('#tasks-jobs');
+  if (!t.jobs.length) {
+    el.innerHTML = '<p class="hint">No research, study or Ask turn is running, and none ended in the last day.</p>';
+    return;
+  }
+  el.innerHTML = t.jobs.map((j) => {
+    const when = j.finishedAt ? `ended ${agoText(j.finishedAt)}` : j.startedAt ? `started ${agoText(j.startedAt)}` : `queued ${agoText(j.createdAt)}`;
+    const action = jobAction(j);
+    return `<div class="job-row" data-job="${esc(j.id)}" data-kind="${esc(j.kind)}">
+      <span class="kind-pill k-${esc(j.kind)}">${esc(JOB_KIND_WORDS[j.kind] ?? j.kind)}</span>
+      <div class="job-main"><a href="#" class="job-title">${esc(j.title)}</a>
+        <div class="hint">${statusChip(j.status)}${j.stage && j.kind !== 'ask' ? ` ${esc(j.stage)}` : ''} · ${when}${j.outputPath ? ` · <a href="#" class="mono" data-open="${esc(j.outputPath)}">${esc(baseName(j.outputPath))}</a>` : ''}</div>
+        ${j.error ? `<div class="hint bad">${esc(j.error.slice(0, 220))}</div>` : ''}</div>
+      ${action ? `<button type="button" class="row-action" data-job-action="${action.verb}">${action.label}</button>` : ''}
+    </div>`;
+  }).join('');
+  el.querySelectorAll('[data-job-action]').forEach((b) => b.addEventListener('click', async () => {
+    const row = b.closest('.job-row');
+    const job = t.jobs.find((j) => j.id === row.dataset.job);
+    if (!job) return;
+    if (b.dataset.jobAction === 'cancel' && job.kind !== 'ask' && !confirm(`Cancel “${job.title}”? A running agent session is stopped.`)) return;
+    b.disabled = true;
+    try {
+      await runJobAction(job, b.dataset.jobAction);
+      toast(`${b.textContent.trim()}: ${job.title}`);
+    } catch (e) {
+      toast(e.message, 5000);
+    }
+    loadTasks();
+  }));
+  el.querySelectorAll('.job-row .job-title').forEach((a) => a.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    const row = a.closest('.job-row');
+    openJob(row.dataset.kind, row.dataset.job);
+  }));
+}
+
+const LIVE_JOB = new Set(['queued', 'running', 'validating', 'waiting']);
+
+/** What a job row offers: stop what runs, run again what failed — if this account may. */
+function jobAction(job) {
+  if (job.kind === 'ask') return job.status === 'running' && mayUse('ask') ? { verb: 'cancel', label: 'Stop' } : null;
+  if (!mayUse('knowledge')) return null;
+  if (LIVE_JOB.has(job.status)) return { verb: 'cancel', label: 'Cancel' };
+  if (job.status === 'failed' || job.status === 'cancelled') return { verb: 'retry', label: 'Retry' };
+  return null;
+}
+
+async function runJobAction(job, verb) {
+  if (job.kind === 'ask') return api(`/api/chat/conversations/${encodeURIComponent(job.id)}/cancel`, { method: 'POST' });
+  const base = job.kind === 'study' ? '/api/research/studies' : '/api/research/jobs';
+  return api(`${base}/${encodeURIComponent(job.id)}/${verb}`, { method: 'POST', body: '{}' });
+}
+
+/** Where a job lives: a study in Research, a page job in the wiki, an Ask turn in its conversation. */
+async function openJob(kind, id) {
+  if (kind === 'study') {
+    navigate('studies');
+    await studiesLoaded?.catch(() => {});
+    openStudy(id);
+  } else if (kind === 'ask') {
+    navigate('ask');
+    await chatLoaded?.catch(() => {});
+    openConversation(id);
+  } else {
+    navigate('wiki');
+  }
+}
+
+function paintTasksActivity(t) {
+  const el = $('#tasks-activity');
+  const running = t.activity.running;
+  const recent = t.activity.recent.slice(0, 8);
+  if (!running.length && !recent.length) {
+    el.innerHTML = '<p class="hint">Nothing has run in the background since the service started.</p>';
+    return;
+  }
+  el.innerHTML = `${running.map((a) => `<div class="activity-row running"><span class="activity-icon spin">${ACTIVITY_ICONS[a.kind] ?? '•'}</span><div><b>${esc(a.label)}</b><div class="hint">running for ${spanText((Date.now() - Date.parse(a.startedAt)) / 1000)}</div></div></div>`).join('')}
+    ${recent.length ? `<details class="activity-recent"${running.length ? '' : ' open'}><summary class="hint">Recent · ${recent.length}</summary>
+      ${recent.map((a) => `<div class="activity-row${a.ok ? '' : ' failed'}"><span class="activity-icon">${a.ok ? '✓' : '✕'}</span><div><span>${esc(a.label)}</span><div class="hint">${a.detail ? `${esc(a.detail)} · ` : ''}${agoText(a.finishedAt)} · took ${spanText((Date.parse(a.finishedAt) - Date.parse(a.startedAt)) / 1000)}</div></div></div>`).join('')}
+    </details>` : ''}`;
+}
+
+function paintTasksSchedule(t) {
+  const rows = t.scheduled.map((x) => {
+    const [title, about] = SCHEDULE_WORDS[x.id] ?? [x.id, ''];
+    const when = !x.enabled ? 'off' : x.at ? `daily at ${x.at}${x.next ? ` · ${untilText(x.next)}` : ''}` : x.everyMinutes ? `every ${x.everyMinutes} min` : '';
+    return `<div class="schedule-row${x.enabled ? '' : ' off'}"><span class="activity-icon${x.running ? ' spin' : ''}">${x.running ? '⟳' : '◷'}</span>
+      <div><b>${esc(title)}</b> <span class="hint">${esc(about)}</span><div class="hint">${x.running ? 'running now · ' : ''}${esc(when)}</div></div></div>`;
+  });
+  const folders = t.folders.map((f) => `<div class="schedule-row"><span class="status-dot${f.watching ? ' live' : ''}" title="${f.watching ? 'watching its source' : 'not watching'}"></span>
+      <div><b class="mono">${esc(f.dest)}</b> <span class="hint">← ${esc(homeShort(f.source))}</span>
+      <div class="hint">${f.lastSyncAt ? `synced ${agoText(f.lastSyncAt)}` : 'not synced since the service started'}${f.lastChange ? ` · last change ${f.lastChange.copied} copied, ${f.lastChange.removed} removed` : ''}</div>
+      ${f.lastError ? `<div class="hint bad">${esc(f.lastError)}</div>` : ''}</div></div>`);
+  const dream = t.dream.pendingSuggestions ? `<p class="hint">Dream has <a href="#" data-goto="dream">${t.dream.pendingSuggestions} suggestion${t.dream.pendingSuggestions === 1 ? '' : 's'}</a> waiting for review.</p>` : '';
+  $('#tasks-schedule').innerHTML = `${rows.join('')}${folders.length ? `<p class="tasks-sub">Linked folders</p>${folders.join('')}` : ''}${dream}`;
+}
+
+function paintTasksErrors(t) {
+  const card = $('#tasks-errors-card');
+  const failed = t.stages.find((s) => s.id === 'index')?.failed ?? 0;
+  card.hidden = t.documentErrors.length === 0;
+  $('#tasks-errors-count').textContent = failed ? String(failed) : '';
+  $('#tasks-errors').innerHTML = t.documentErrors.map((d) => `<div class="error-row"><div class="error-row-main"><a href="#" class="mono" data-open="${esc(d.path)}">${esc(d.path)}</a><div class="hint bad">${esc(d.error ?? 'failed')}</div></div>
+      ${mayUse('ingest') ? `<button type="button" class="row-action" data-reindex="${esc(d.path)}" title="Convert and index this file again">Index again</button>` : ''}</div>`).join('')
+    + (failed > t.documentErrors.length ? `<p class="hint">and ${failed - t.documentErrors.length} more</p>` : '');
+  $('#tasks-errors').querySelectorAll('[data-reindex]').forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    try {
+      const s = await api('/api/sync', { method: 'POST', body: JSON.stringify({ only: [b.dataset.reindex] }) });
+      toast(s.errors ? `${b.dataset.reindex}: still failing` : `${b.dataset.reindex}: indexed`, 4000);
+    } catch (e) {
+      toast(e.message, 5000);
+    }
+    loadTasks();
+  }));
+}
+
+/** Links inside the queue: files open in Library, `data-goto` changes tab. */
+function wireTaskLinks(root) {
+  root.querySelectorAll('a[data-open]').forEach((a) => a.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    navigate('files');
+    openFile(a.dataset.open);
+  }));
+  root.querySelectorAll('a[data-goto]').forEach((a) => a.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    navigate(a.dataset.goto);
+  }));
+}
+
+/** The Tasks button in the header: a dot while processing runs, the Dream suggestions waiting. */
+function paintTasksBadge(stats = lastStats) {
+  const badge = $('#tasks-badge');
+  const pending = stats?.pending_suggestions ?? 0;
+  const running = processingStatus?.processing?.running === true;
+  badge.hidden = !pending && !running;
+  badge.classList.toggle('live', running);
+  badge.textContent = pending ? `☾${pending}` : '';
+  badge.title = [running ? 'processing is running' : '', pending ? `${pending} Dream suggestion${pending === 1 ? '' : 's'} to review` : ''].filter(Boolean).join(' · ');
+}
 
 /* ------------------------------ estimates ------------------------------ */
 
@@ -2763,6 +3115,7 @@ function renderEntityPanel(d) {
       <div class="actions">
         <button data-wiki${e.wikiPath ? ` title="${esc(e.wikiPath)}"` : ' disabled title="no wiki page yet"'}>open wiki page</button>
         <button data-graph>show in graph</button>
+        <button data-search title="Explore → Search: the passages, relations and claims its name finds">search</button>
       </div>
     </div>
     <div class="entity-card"><b>${d.relations.length ? `relations · ${d.relations.length + d.moreRelations}` : 'no typed relations yet'}</b>${groups}
@@ -2783,6 +3136,7 @@ function renderEntityPanel(d) {
   }
   const wiki = body.querySelector('[data-wiki]');
   if (e.wikiPath) wiki.addEventListener('click', () => followTo(e.wikiPath));
+  body.querySelector('[data-search]').addEventListener('click', () => runSearch(e.name));
   body.querySelector('[data-graph]').addEventListener('click', () => {
     navigate('graph');
     loadGraph(e.name);
@@ -2793,21 +3147,27 @@ $('#btn-delete').addEventListener('click', () => {
   if (currentFile) deleteNode({ path: currentFile, kind: 'file' });
 });
 
-// creating and uploading are the same intent — "put something in this folder"
-// — so they share one menu instead of two buttons
+// writing something new and bringing material in are two intents (docs/design/20 D10):
+// ＋ makes a file or folder here, Import data brings files, folders and agent traces in
 $('#btn-add').addEventListener('click', (ev) => {
   const dir = targetDir();
   showMenuUnder(ev.currentTarget, [
     { label: 'New file…', run: () => newFile(dir) },
     { label: 'New folder…', run: () => newFolder(dir) },
+  ]);
+});
+
+$('#btn-import').addEventListener('click', (ev) => {
+  const dir = targetDir();
+  const folders = mayImportFolders();
+  showMenuUnder(ev.currentTarget, [
+    { label: `Files… → ${uploadTarget()}/`, run: () => pickUpload('files') },
+    { label: `Folder… → ${uploadTarget()}/`, run: () => pickUpload('folder') },
     '-',
-    { label: 'Upload files…', run: () => pickUpload('files') },
-    { label: 'Upload folder…', run: () => pickUpload('folder') },
-    ...(mayImportFolders() ? [
-      '-',
-      { label: 'Import folder from this Mac…', run: () => importLocalFolder('copy', dir) },
-      { label: 'Link folder from this Mac (keep in sync)…', run: () => importLocalFolder('link', dir) },
-    ] : []),
+    { label: folders ? 'Folder from this Mac (copy once)…' : 'Folder from this Mac — administrators only', disabled: !folders, run: () => importLocalFolder('copy', dir) },
+    { label: folders ? 'Link a folder from this Mac (keep in sync)…' : 'Link a folder — administrators only', disabled: !folders, run: () => importLocalFolder('link', dir) },
+    '-',
+    { label: 'Agent traces — Claude Code and Codex sessions', disabled: !mayUse('traces'), run: () => collectTraces() },
   ]);
 });
 
@@ -3004,37 +3364,549 @@ $('#btn-ingest').addEventListener('click', async () => {
 
 /* ------------------------------- search -------------------------------- */
 
+/**
+ * Explore → Search (docs/design/20): the retrieval the agents use, asked to
+ * explain itself. Each passage carries its rank in every channel that found
+ * it, each channel says what it found, and beside the passages stand the
+ * entities the query names — with where it named them — their relations and
+ * the claims about them. Either read may fail without blanking the page.
+ */
+const CHANNELS = [
+  { id: 'vector', label: 'Semantic', hint: 'passages whose meaning is close to the query (vector similarity)' },
+  { id: 'keyword', label: 'Keyword', hint: 'passages that contain its words (full text; CJK by substrings)' },
+  { id: 'graph', label: 'Entity', hint: 'passages that mention an entity the query names' },
+];
+const channelLabel = (id) => CHANNELS.find((c) => c.id === id)?.label ?? id;
+const searchState = { result: null, view: 'passages', channel: null, open: new Set(), seq: 0, intro: false };
+const RECENT_SEARCH_KEY = 'knode-os.search.recent.v1';
+
+/** This workspace's last searches, newest first — kept in this browser only. */
+function recentSearches() {
+  try {
+    return JSON.parse(localStorage.getItem(RECENT_SEARCH_KEY) ?? '{}')[noticeScope()] ?? [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberSearch(q) {
+  try {
+    const all = JSON.parse(localStorage.getItem(RECENT_SEARCH_KEY) ?? '{}');
+    all[noticeScope()] = [q, ...(all[noticeScope()] ?? []).filter((x) => x !== q)].slice(0, 8);
+    localStorage.setItem(RECENT_SEARCH_KEY, JSON.stringify(all));
+  } catch {
+    /* blocked storage: nothing remembered */
+  }
+}
+
+/** Arriving at Search: the scope follows the picked folder; an empty page shows what it does. */
+function paintSearchArrival() {
+  paintSearchScope();
+  if (!searchState.result) paintSearchIntro();
+  if (!$('#search-q').value) setTimeout(() => $('#search-q').focus(), 0);
+}
+
+/** Before the first search: the three channels in words, and the workspace's best-known entities to try. */
+async function paintSearchIntro() {
+  $('#search-summary').hidden = true;
+  $('#search-main-head').hidden = true;
+  $('#search-side').hidden = true;
+  const el = $('#search-results');
+  el.innerHTML = `<div class="search-intro">
+    <p class="section-index">EXPLORE · SEARCH</p>
+    <h3>See what a query matches — and why</h3>
+    <p class="hint">Every search runs the retrieval Ask and the research agents use, and shows each channel's part in it:</p>
+    <div class="intro-channels">${CHANNELS.map((c) => `<div class="intro-channel ch-${c.id}"><b>${c.label}</b><span>${esc(c.hint)}</span></div>`).join('')}</div>
+    <p class="hint">Beside the passages: the entities the query names (and whether by name, alias or description), what they are related to, and the claims about them.</p>
+    ${recentSearches().length ? `<div class="intro-try intro-recent"><span class="hint">Recent</span>${recentSearches().map((q) => `<button type="button" class="term-chip" data-recent="${esc(q)}">${esc(q)}</button>`).join('')}</div>` : ''}
+    <div class="intro-try" hidden><span class="hint">Try</span></div>
+  </div>`;
+  el.querySelectorAll('[data-recent]').forEach((b) => b.addEventListener('click', () => runSearch(b.dataset.recent)));
+  if (searchState.intro) return;
+  searchState.intro = true;
+  try {
+    const rows = (await api('/api/entities?limit=8&sort=mentions')).items ?? [];
+    const tryEl = el.querySelector('.intro-try:not(.intro-recent)');
+    if (!tryEl || !rows.length) return;
+    for (const e of rows) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'term-chip';
+      b.textContent = e.name;
+      b.addEventListener('click', () => runSearch(e.name));
+      tryEl.appendChild(b);
+    }
+    tryEl.hidden = false;
+  } catch {
+    /* nothing indexed yet, or no search group: the words above still stand */
+  } finally {
+    searchState.intro = false;
+  }
+}
+
+/** Search for `q` from anywhere: the box, an entity chip, the global search. */
+function runSearch(q) {
+  $('#search-q').value = q;
+  if (currentTab !== 'search') navigate('search');
+  doSearch();
+}
+
 async function doSearch() {
   const q = $('#search-q').value.trim();
   if (!q) return;
   const mode = $('#search-mode').value;
+  const scope = $('#search-scope').value;
+  const seq = ++searchState.seq;
   const el = $('#search-results');
-  el.innerHTML = '<p class="hint">searching…</p>';
+  el.innerHTML = '<p class="hint search-wait">searching — passages and the graph…</p>';
   try {
-    const scope = $('#search-scope').value;
-    const results = await api(`/api/search?q=${encodeURIComponent(q)}&mode=${mode}&k=12${scope ? `&sources=${encodeURIComponent(scope)}` : ''}`);
-    el.innerHTML = results.length ? '' : '<p class="hint">no results — upload docs and index them first.</p>';
-    for (const r of results) {
-      const div = document.createElement('div');
-      div.className = 'result';
-      const route = r.trace?.bridgeEntities?.length
-        ? ` · ${r.trace.bridgeEntities.join(' → ')}`
-        : (r.trace?.route ? ` · ${r.trace.route}` : '');
-      div.innerHTML = `<span class="rscore">${r.score.toFixed(4)} ${Object.keys(r.signals).join('+')}${esc(route)}</span>
-        <div class="rpath">${esc(r.path)}</div>
-        <div class="rsnippet">${esc(r.content.slice(0, 360))}</div>`;
-      div.addEventListener('click', () => {
-        navigate('files');
-        openFile(r.path);
-      });
-      el.appendChild(div);
-    }
+    const params = new URLSearchParams({ q, mode, k: '20' });
+    if (scope) params.set('sources', scope);
+    const result = await api(`/api/search/explore?${params}`);
+    if (seq !== searchState.seq) return;
+    searchState.result = result;
+    rememberSearch(q);
+    searchState.channel = null;
+    searchState.open = new Set();
+    paintSearch();
   } catch (e) {
+    if (seq !== searchState.seq) return;
     el.innerHTML = `<p class="hint">search failed: ${esc(e.message)}</p>`;
   }
 }
-$('#btn-search').addEventListener('click', doSearch);
-$('#search-q').addEventListener('keydown', (e) => e.key === 'Enter' && doSearch());
+
+/** Terms worth marking: a CJK bigram inside a longer term would mark half the text. */
+function markableTerms(terms) {
+  const list = (terms ?? []).filter(Boolean);
+  return list.filter((t) => !list.some((other) => other !== t && other.length > t.length && other.toLowerCase().includes(t.toLowerCase())));
+}
+
+/** `text`, escaped, with every term marked (case-insensitive). */
+function markTerms(text, terms) {
+  if (!terms.length) return esc(text);
+  const re = new RegExp(`(${terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi');
+  return String(text).split(re).map((part, i) => (i % 2 ? `<mark>${esc(part)}</mark>` : esc(part))).join('');
+}
+
+/** A passage as a person reads it: Markdown's marks off — heading hashes, emphasis, link brackets. */
+function plainText(text) {
+  return String(text)
+    .replace(/^---\n[\s\S]*?\n---\n/, '')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]+))?\]\]/g, (_, target, label) => label || target)
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/(\*\*|__)(.+?)\1/g, '$2');
+}
+
+/** Around the first term, not the first characters: the reason the passage is here. */
+function snippetOf(text, terms, size = 300) {
+  const flat = plainText(text).replace(/\s+/g, ' ').trim();
+  if (flat.length <= size) return flat;
+  const low = flat.toLowerCase();
+  const hits = terms.map((t) => low.indexOf(t.toLowerCase())).filter((i) => i >= 0);
+  const first = hits.length ? Math.min(...hits) : 0;
+  const start = Math.max(0, first - Math.round(size * 0.3));
+  const end = Math.min(flat.length, start + size);
+  return `${start > 0 ? '…' : ''}${flat.slice(start, end)}${end < flat.length ? '…' : ''}`;
+}
+
+const passageTitle = (p) => p.title || baseName(p.path).replace(/\.(md|markdown)$/i, '');
+
+function rankBadges(p) {
+  if (p.trace?.bridgeEntities?.length) {
+    return `<span class="rank-badge ch-sag" title="reached ${p.trace.hop ?? 1} hop(s) from a direct match through these entities">via ${esc(p.trace.bridgeEntities.join(' → '))}</span>`;
+  }
+  return CHANNELS.filter((c) => p.ranks?.[c.id] !== undefined || p.signals?.[c.id] !== undefined)
+    .map((c) => `<span class="rank-badge ch-${c.id}" title="${esc(c.hint)}">${c.label}${p.ranks?.[c.id] ? ` #${p.ranks[c.id]}` : ''}</span>`)
+    .join('');
+}
+
+/** How the fused score came about, in words a person can check. */
+function passageExplain(p) {
+  const raw = {
+    vector: (v) => `similarity ${v.toFixed(3)}`,
+    keyword: (v) => (v >= 1 ? `${Math.round(v)} term${Math.round(v) === 1 ? '' : 's'} found` : `text rank ${v.toFixed(3)}`),
+    graph: (v) => `${Math.round(v)} named entit${Math.round(v) === 1 ? 'y' : 'ies'} mentioned`,
+  };
+  const rows = CHANNELS.filter((c) => p.signals?.[c.id] !== undefined)
+    .map((c) => `<li><span class="rank-badge ch-${c.id}">${c.label}${p.ranks?.[c.id] ? ` #${p.ranks[c.id]}` : ''}</span> ${esc(raw[c.id](Number(p.signals[c.id])))}</li>`);
+  if (p.signals?.structural !== undefined) rows.push(`<li><span class="rank-badge ch-sag">multi-hop</span> structural score ${Number(p.signals.structural).toFixed(3)}</li>`);
+  const missing = CHANNELS.filter((c) => p.signals?.[c.id] === undefined && searchState.result?.channels?.[c.id]).map((c) => c.label);
+  return `<ul class="explain">${rows.join('')}</ul>
+    <p class="hint">Fused score ${p.score.toFixed(4)} — each channel adds 1 / (60 + rank) (entity × 0.6), nudged by how often the document is read.${missing.length ? ` Not found by ${esc(missing.join(' or '))}.` : ''}</p>`;
+}
+
+function filteredPassages() {
+  const r = searchState.result;
+  if (!r) return [];
+  const ch = searchState.channel;
+  return ch ? r.passages.filter((p) => p.signals?.[ch] !== undefined) : r.passages;
+}
+
+function paintSearch() {
+  const r = searchState.result;
+  if (!r) return;
+  const docs = new Set(r.passages.map((p) => p.path));
+  const named = r.entities.filter((e) => e.match);
+  const typed = r.relations.filter((x) => x.type !== 'co_occurs');
+  const summary = $('#search-summary');
+  summary.hidden = false;
+  const errors = [
+    r.errors?.passages ? `Passages failed: ${r.errors.passages}` : '',
+    r.errors?.graph ? `The graph read failed: ${r.errors.graph}` : '',
+  ].filter(Boolean);
+  summary.innerHTML = `<div class="ss-line">
+      <b>${r.passages.length}</b> passage${r.passages.length === 1 ? '' : 's'} in <b>${docs.size}</b> document${docs.size === 1 ? '' : 's'}
+      · <b>${named.length}</b> entit${named.length === 1 ? 'y' : 'ies'} named · <b>${typed.length}</b> relation${typed.length === 1 ? '' : 's'}
+      <span class="hint">· ${r.ms.total} ms · ${esc({ hybrid: 'hybrid', sag: 'multi-hop', vector: 'semantic only', keyword: 'keyword only' }[r.mode] ?? r.mode)}</span>
+    </div>
+    <div class="ss-channels">
+      ${CHANNELS.filter((c) => r.channels?.[c.id]).map((c) => {
+        const ch = r.channels[c.id];
+        const title = ch.error ? `${c.label} could not answer: ${ch.error}` : `${c.hint} — ${ch.hits} chunks in ${ch.ms} ms; click to show only its passages`;
+        return `<button type="button" class="channel-chip ch-${c.id}${ch.error ? ' failed' : ''}${searchState.channel === c.id ? ' active' : ''}" data-channel="${c.id}" title="${esc(title)}"${ch.error ? ' disabled' : ''}><span class="dot"></span>${c.label} <b>${ch.error ? 'failed' : ch.hits}</b></button>`;
+      }).join('')}
+      ${r.mode === 'sag' ? '<span class="hint">multi-hop: direct matches, then passages reached through the entities they mention</span>' : ''}
+      <span class="ss-terms">${markableTerms(r.terms).map((t) => `<span class="term">${esc(t)}</span>`).join('')}</span>
+    </div>
+    ${errors.map((e) => `<p class="ss-error">${esc(e)}</p>`).join('')}`;
+  summary.querySelectorAll('[data-channel]').forEach((b) => b.addEventListener('click', () => {
+    searchState.channel = searchState.channel === b.dataset.channel ? null : b.dataset.channel;
+    paintSearch();
+  }));
+  paintPassages();
+  paintSearchSide();
+}
+
+function paintPassages() {
+  const r = searchState.result;
+  const list = filteredPassages();
+  const terms = markableTerms(r.terms);
+  const head = $('#search-main-head');
+  head.hidden = r.passages.length === 0;
+  $('#search-count').textContent = searchState.channel
+    ? `${list.length} of ${r.passages.length} found by ${channelLabel(searchState.channel)}`
+    : `${r.passages.length} ranked passages`;
+  head.querySelectorAll('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === searchState.view));
+  const el = $('#search-results');
+  if (!list.length) {
+    el.innerHTML = r.passages.length
+      ? `<p class="hint">${esc(channelLabel(searchState.channel))} found none of these passages.</p>`
+      : `<div class="search-empty"><b>No passage matched.</b><p class="hint">${r.entities.length ? 'The graph still knows the entities on the right.' : 'Try other words, another mode, the whole base — or index more documents.'}</p></div>`;
+    return;
+  }
+  if (searchState.view === 'documents') {
+    const groups = new Map();
+    for (const p of list) {
+      const g = groups.get(p.path) ?? { path: p.path, title: passageTitle(p), date: p.docDate, best: r.passages.indexOf(p) + 1, passages: [], channels: new Set() };
+      g.passages.push(p);
+      for (const c of CHANNELS) if (p.signals?.[c.id] !== undefined) g.channels.add(c.id);
+      groups.set(p.path, g);
+    }
+    el.innerHTML = [...groups.values()].map((g) => `<article class="doc-group">
+        <div class="passage-head">
+          <span class="passage-rank" title="its best passage's place">${g.best}</span>
+          <div class="passage-title"><b>${esc(g.title)}</b><span class="mono passage-path">${esc(g.path)}</span></div>
+          ${g.date ? `<span class="passage-date">${esc(g.date)}</span>` : ''}
+          <button type="button" class="passage-open" data-open="${esc(g.path)}">Open</button>
+        </div>
+        <div class="passage-foot">${CHANNELS.filter((c) => g.channels.has(c.id)).map((c) => `<span class="rank-badge ch-${c.id}">${c.label}</span>`).join('')}<span class="hint">${g.passages.length} passage${g.passages.length === 1 ? '' : 's'}</span></div>
+        ${g.passages.map((p) => `<p class="doc-group-snippet">${markTerms(snippetOf(p.content, terms, 180), terms)}</p>`).join('')}
+      </article>`).join('');
+  } else {
+    el.innerHTML = list.map((p) => {
+      const i = r.passages.indexOf(p);
+      const open = searchState.open.has(p.chunkId);
+      return `<article class="passage${open ? ' open' : ''}" data-chunk="${esc(p.chunkId)}">
+        <div class="passage-head">
+          <span class="passage-rank">${i + 1}</span>
+          <div class="passage-title"><b>${esc(passageTitle(p))}</b><span class="mono passage-path">${esc(p.path)}</span></div>
+          ${p.docDate ? `<span class="passage-date" title="the source's date">${esc(p.docDate)}</span>` : ''}
+          <button type="button" class="passage-open" data-open="${esc(p.path)}" title="Open the file">Open</button>
+        </div>
+        <div class="passage-text">${open ? markTerms(plainText(p.content).trim(), terms) : markTerms(snippetOf(p.content, terms), terms)}</div>
+        <div class="passage-foot">${rankBadges(p)}<span class="spacer"></span><span class="hint passage-score" title="fused score">${p.score.toFixed(4)}</span></div>
+        ${open ? passageExplain(p) : ''}
+      </article>`;
+    }).join('');
+    el.querySelectorAll('.passage').forEach((card) => card.addEventListener('click', (ev) => {
+      if (ev.target.closest('button, a') || getSelection()?.toString()) return;
+      const id = card.dataset.chunk;
+      if (searchState.open.has(id)) searchState.open.delete(id);
+      else searchState.open.add(id);
+      paintPassages();
+    }));
+  }
+  el.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', () => {
+    navigate('files');
+    openFile(b.dataset.open);
+  }));
+}
+
+$('#search-main-head').addEventListener('click', (ev) => {
+  const b = ev.target.closest('[data-view]');
+  if (!b || !searchState.result) return;
+  searchState.view = b.dataset.view;
+  paintPassages();
+});
+
+/** The relation type in words: `competes_with` → competes with. */
+const relationWords = (type) => String(type).replace(/_/g, ' ');
+
+function entityWhy(e, terms) {
+  if (!e.match) return '';
+  if (e.match.field === 'name') return '<span class="ent-why">its name</span>';
+  if (e.match.field === 'alias') return `<span class="ent-why">alias <q>${markTerms(e.match.text, terms)}</q></span>`;
+  return `<span class="ent-why">its description: ${markTerms(snippetOf(e.match.text, [e.match.term], 90), terms)}</span>`;
+}
+
+function paintSearchSide() {
+  const r = searchState.result;
+  const side = $('#search-side');
+  const terms = markableTerms(r.terms);
+  const byId = new Map(r.entities.map((e) => [e.id, e]));
+  const named = r.entities.filter((e) => e.match);
+  const related = r.entities.filter((e) => !e.match);
+  const typed = r.relations.filter((x) => x.type !== 'co_occurs');
+  const together = r.relations.filter((x) => x.type === 'co_occurs');
+  const entLink = (id) => {
+    const e = byId.get(id);
+    return e ? `<a href="#" class="ent-link" data-entity="${esc(e.id)}" data-type="${esc(e.type)}">${esc(e.name)}</a>` : `<span class="mono">${esc(id)}</span>`;
+  };
+  // claims about what the query names first, then about what is related to it
+  const namedNames = new Set(named.map((e) => e.name));
+  const claims = [...r.claims].sort((a, b) => Number(namedNames.has(b.subject)) - Number(namedNames.has(a.subject)));
+  if (!r.entities.length && !r.claims.length) {
+    side.hidden = false;
+    side.innerHTML = `<section class="side-block"><h4>Entities</h4><p class="hint">${r.errors?.graph ? 'The graph read failed.' : 'The query names no entity the graph knows — no name, alias or description holds its terms.'}</p></section>`;
+    return;
+  }
+  side.hidden = false;
+  side.innerHTML = `
+    <section class="side-block">
+      <h4>Named in the query <span class="count">${named.length}</span></h4>
+      ${named.length ? named.map((e) => `<div class="ent-card" data-type="${esc(e.type)}">
+          <div class="ent-card-head"><span class="ent-dot"></span><a href="#" class="ent-name" data-entity="${esc(e.id)}" title="Open its panel: relations, claims, documents">${esc(e.name)}</a><span class="tpill">${esc(e.type)}</span></div>
+          <div class="ent-card-why">matched by ${entityWhy(e, terms)}</div>
+          ${e.description && e.match.field !== 'description' ? `<p class="ent-desc">${esc(plainText(e.description))}</p>` : ''}
+          <div class="ent-card-foot"><span class="hint">${e.mentionCount.toLocaleString()} mention${e.mentionCount === 1 ? '' : 's'} · ${e.degree} relation${e.degree === 1 ? '' : 's'}</span>
+            <span class="spacer"></span>
+            <button type="button" data-graph="${esc(e.name)}" title="Open the graph around it">Graph</button>
+            ${e.wikiPath ? `<button type="button" data-open="${esc(e.wikiPath)}" title="${esc(e.wikiPath)}">Wiki</button>` : ''}
+            <button type="button" data-search="${esc(e.name)}" title="Search for its name">Search</button></div>
+        </div>`).join('') : '<p class="hint">No entity holds these terms.</p>'}
+    </section>
+    ${related.length ? `<section class="side-block">
+      <h4>One relation away <span class="count">${related.length}</span></h4>
+      <div class="ent-chips">${related.map((e) => `<a href="#" class="ent-chip" data-entity="${esc(e.id)}" data-type="${esc(e.type)}" title="${esc(e.type)} · ${e.mentionCount} mentions"><span class="ent-dot"></span>${esc(e.name)}</a>`).join('')}</div>
+    </section>` : ''}
+    ${typed.length ? `<section class="side-block">
+      <h4>Relations <span class="count">${typed.length}</span></h4>
+      <ul class="rel-list">${typed.slice(0, 40).map((x) => `<li>${entLink(x.source)} <span class="rel-type">${esc(relationWords(x.type))}</span> ${entLink(x.target)}${x.validFrom || x.validTo ? ` <span class="hint">${esc(x.validFrom ?? '…')} – ${esc(x.validTo ?? '…')}</span>` : ''}</li>`).join('')}</ul>
+      ${typed.length > 40 ? `<p class="hint">and ${typed.length - 40} more — open the graph to see them all</p>` : ''}
+    </section>` : ''}
+    ${together.length ? `<section class="side-block">
+      <h4>Often mentioned together <span class="count">${together.length}</span></h4>
+      <ul class="rel-list co">${together.slice(0, 20).map((x) => `<li>${entLink(x.source)} <span class="rel-type">·</span> ${entLink(x.target)}</li>`).join('')}</ul>
+    </section>` : ''}
+    ${claims.length ? `<section class="side-block">
+      <h4>Claims <span class="count">${claims.length}</span></h4>
+      ${claims.map((c) => `<div class="claim${c.status === 'disputed' ? ' disputed' : ''}">
+          <div><span class="claim-subject">${esc(c.subject)}</span> ${esc(c.statement)}</div>
+          <div class="claim-foot"><span class="claim-status ${esc(c.status)}">${esc(c.status)}</span>${c.kind && c.kind !== 'fact' ? `<span class="hint">${esc(c.kind)}</span>` : ''}${c.startDate ? `<span class="hint">${esc(c.startDate)}</span>` : ''}${c.evidenceCount > 1 ? `<span class="hint">${c.evidenceCount} sources</span>` : ''}
+            ${c.path ? `<a href="#" class="mono claim-source" data-open="${esc(c.path)}" title="${esc(c.path)}">${esc(baseName(c.path))}</a>` : ''}</div>
+        </div>`).join('')}
+    </section>` : ''}`;
+  // a type's colour, set the way the page policy allows (no inline style attributes)
+  side.querySelectorAll('[data-type]').forEach((el) => {
+    const dot = el.classList.contains('ent-card') || el.classList.contains('ent-chip') ? el.querySelector('.ent-dot') : null;
+    if (dot) dot.style.background = entityColor(el.dataset.type);
+    else el.style.color = entityColor(el.dataset.type);
+  });
+  side.querySelectorAll('[data-entity]').forEach((a) => a.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    navigate('files');
+    openEntity(a.dataset.entity);
+  }));
+  side.querySelectorAll('[data-graph]').forEach((b) => b.addEventListener('click', () => exploreEntity(b.dataset.graph)));
+  side.querySelectorAll('[data-search]').forEach((b) => b.addEventListener('click', () => runSearch(b.dataset.search)));
+  side.querySelectorAll('[data-open]').forEach((a) => a.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    navigate('files');
+    openFile(a.dataset.open);
+  }));
+}
+
+$('#search-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  doSearch();
+});
+$('#search-mode').addEventListener('change', () => { if (searchState.result) doSearch(); });
+$('#search-scope').addEventListener('change', () => { if (searchState.result) doSearch(); });
+
+/* ---------------------------- global search ----------------------------- */
+
+/**
+ * The box in the header (docs/design/20 D4): while someone types it offers
+ * entities and documents by name — substring reads, no model — and three
+ * things to do with the text: Search it, Ask it, Research it. Return
+ * searches, ⌘/Ctrl+Return asks, Alt+Return researches; ⌘K or / focuses it.
+ */
+const globalSearch = { items: [], active: 0, timer: null, seq: 0, suggestions: null, query: '' };
+
+function globalSearchItems(q, suggestions) {
+  const quoted = q.length > 48 ? `${q.slice(0, 48)}…` : q;
+  const items = [
+    { kind: 'search', label: `Search “${quoted}”`, hint: 'passages, entities and relations', key: '↵' },
+    { kind: 'ask', label: `Ask “${quoted}”`, hint: 'an agent answers from this workspace', key: '⌘↵' },
+    { kind: 'research', label: `Research “${quoted}”`, hint: 'plan a study — you review it before it runs', key: '⌥↵' },
+  ];
+  for (const e of suggestions?.entities ?? []) items.push({ kind: 'entity', group: 'Entities', entity: e });
+  for (const d of suggestions?.documents ?? []) items.push({ kind: 'file', group: 'Files', doc: d });
+  return items;
+}
+
+function paintGlobalSearch() {
+  const menu = $('#global-search-menu');
+  const input = $('#global-search');
+  const q = input.value.trim();
+  const show = Boolean(q) && document.activeElement === input;
+  menu.hidden = !show;
+  input.setAttribute('aria-expanded', String(show));
+  if (!show) return;
+  globalSearch.items = globalSearchItems(q, globalSearch.query === q ? globalSearch.suggestions : null);
+  globalSearch.active = Math.min(globalSearch.active, globalSearch.items.length - 1);
+  let group = null;
+  menu.innerHTML = globalSearch.items.map((item, i) => {
+    const heading = item.group && item.group !== group ? `<p class="gs-group">${esc(item.group)}</p>` : '';
+    group = item.group ?? group;
+    const active = i === globalSearch.active ? ' active' : '';
+    if (item.kind === 'entity') {
+      const e = item.entity;
+      return `${heading}<div class="gs-item${active}" role="option" data-i="${i}"><span class="ent-dot" data-type="${esc(e.type)}"></span><span class="gs-label">${esc(e.name)}${e.alias ? ` <span class="hint">· ${esc(e.alias)}</span>` : ''}</span><span class="gs-hint">${esc(e.type)} · ${e.mentionCount.toLocaleString()}</span></div>`;
+    }
+    if (item.kind === 'file') {
+      const d = item.doc;
+      return `${heading}<div class="gs-item${active}" role="option" data-i="${i}"><span class="gs-icon">▤</span><span class="gs-label">${esc(d.title || baseName(d.path))}<span class="gs-path mono">${esc(d.path)}</span></span></div>`;
+    }
+    return `<div class="gs-item gs-action${active}" role="option" data-i="${i}"><span class="gs-icon">${item.kind === 'search' ? '⌕' : item.kind === 'ask' ? '✦' : '❒'}</span><span class="gs-label">${esc(item.label)} <span class="hint">${esc(item.hint)}</span></span><kbd>${item.key}</kbd></div>`;
+  }).join('') + (globalSearch.query === q || !q ? '' : '<p class="gs-group hint">looking up names…</p>');
+  menu.querySelectorAll('.ent-dot[data-type]').forEach((dot) => { dot.style.background = entityColor(dot.dataset.type); });
+}
+
+function fetchGlobalSuggestions() {
+  clearTimeout(globalSearch.timer);
+  const q = $('#global-search').value.trim();
+  if (!q) return;
+  globalSearch.timer = setTimeout(async () => {
+    const seq = ++globalSearch.seq;
+    try {
+      const suggestions = await api(`/api/search/suggest?q=${encodeURIComponent(q)}&limit=5`);
+      if (seq !== globalSearch.seq) return;
+      globalSearch.suggestions = suggestions;
+    } catch {
+      if (seq !== globalSearch.seq) return;
+      globalSearch.suggestions = { entities: [], documents: [] };
+    }
+    globalSearch.query = q;
+    paintGlobalSearch();
+  }, 140);
+}
+
+/** Close the suggestions: a pick, a click elsewhere, another view. */
+function closeGlobalSearch() {
+  $('#global-search-menu').hidden = true;
+  $('#global-search').setAttribute('aria-expanded', 'false');
+}
+
+function runGlobalSearchItem(item, q) {
+  const input = $('#global-search');
+  input.blur();
+  closeGlobalSearch();
+  if (item.kind === 'search') runSearch(q);
+  else if (item.kind === 'ask') askFromAnywhere(q);
+  else if (item.kind === 'research') researchFromAnywhere(q);
+  else if (item.kind === 'entity') runSearch(item.entity.name);
+  else if (item.kind === 'file') {
+    navigate('files');
+    openFile(item.doc.path);
+  }
+  if (item.kind !== 'file') input.value = '';
+}
+
+$('#global-search').addEventListener('input', () => {
+  globalSearch.active = 0;
+  paintGlobalSearch();
+  fetchGlobalSuggestions();
+});
+$('#global-search').addEventListener('focus', paintGlobalSearch);
+$('#global-search').addEventListener('blur', () => setTimeout(paintGlobalSearch, 0));
+document.addEventListener('mousedown', (ev) => { if (!ev.target.closest?.('.global-search')) closeGlobalSearch(); });
+$('#global-search').addEventListener('keydown', (ev) => {
+  const q = ev.target.value.trim();
+  if (ev.key === 'Escape') {
+    if (ev.target.value) ev.target.value = '';
+    else ev.target.blur();
+    paintGlobalSearch();
+    return;
+  }
+  if (!q) return;
+  if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+    ev.preventDefault();
+    const n = globalSearch.items.length;
+    globalSearch.active = (globalSearch.active + (ev.key === 'ArrowDown' ? 1 : n - 1)) % n;
+    paintGlobalSearch();
+    return;
+  }
+  if (ev.key !== 'Enter' || ev.isComposing) return;
+  ev.preventDefault();
+  if (ev.metaKey || ev.ctrlKey) runGlobalSearchItem({ kind: 'ask' }, q);
+  else if (ev.altKey) runGlobalSearchItem({ kind: 'research' }, q);
+  else runGlobalSearchItem(globalSearch.items[globalSearch.active] ?? { kind: 'search' }, q);
+});
+// a pick happens on mousedown, before the box loses focus and the list goes
+$('#global-search-menu').addEventListener('mousedown', (ev) => {
+  const row = ev.target.closest('.gs-item');
+  ev.preventDefault();
+  if (!row) return;
+  const item = globalSearch.items[Number(row.dataset.i)];
+  if (item) runGlobalSearchItem(item, $('#global-search').value.trim());
+});
+document.addEventListener('keydown', (ev) => {
+  if ($('#app-shell').hidden) return;
+  const typing = ev.target.closest?.('input, textarea, select, [contenteditable="true"]');
+  if ((ev.key === 'k' && (ev.metaKey || ev.ctrlKey)) || (ev.key === '/' && !typing && !ev.metaKey && !ev.ctrlKey && !ev.altKey)) {
+    ev.preventDefault();
+    $('#global-search').focus();
+    $('#global-search').select();
+  }
+});
+
+/** A question from the search box: a new Ask conversation, sent at once — or left in the composer when Ask cannot answer. */
+async function askFromAnywhere(text) {
+  navigate('ask');
+  await chatLoaded?.catch(() => {});
+  if (chatReadiness && chatReadiness.ready === false) {
+    $('#chat-input').value = text;
+    $('#chat-input').focus();
+    toast('Ask has nothing to run on yet — the question waits in the composer', 5000);
+    return;
+  }
+  stopChatPolling();
+  chatActiveId = null;
+  $('#chat-input').value = text;
+  await sendChat();
+}
+
+/** A topic from the search box fills the new-study composer; refining spends a model call, so a person starts it. */
+async function researchFromAnywhere(text) {
+  navigate('studies');
+  await studiesLoaded?.catch(() => {});
+  showComposer();
+  $('#study-topic').value = text;
+  $('#study-topic').focus();
+  toast('Check the options, then Refine the question', 4000);
+}
 
 /* ------------------------------- graph --------------------------------- */
 
@@ -3565,6 +4437,7 @@ async function loadTraces() {
   tbody.innerHTML = '';
   try {
     const traces = await api('/api/traces');
+    $('#traces-count').textContent = traces.length ? `· ${traces.length} sessions · ${traces.filter((t) => t.analyzed_at).length} analyzed` : '· none yet';
     for (const t of traces) {
       const tr = document.createElement('tr');
       tr.innerHTML = `<td>${esc(t.source)}</td><td class="mono">${esc(t.project ?? '-')}</td>
@@ -3583,19 +4456,51 @@ async function loadTraces() {
   }
 }
 
-$('#btn-trace-sync').addEventListener('click', async () => {
-  toast('syncing traces…', 30000);
+/**
+ * Copy new Claude Code and Codex sessions from this Mac into raw/traces —
+ * from Dream, or Library's Import menu. It reads the service machine's home
+ * folders, so it asks first.
+ */
+async function collectTraces() {
+  if (!confirm('Copy your Claude Code and Codex sessions from this Mac into raw/traces?\n\nDream reads them overnight; new sessions keep arriving after this.')) return;
+  toast('collecting agent traces…', 30000);
   try {
     const s = await api('/api/traces/sync', { method: 'POST' });
-    toast(`synced: ${s.copied} traces, ${s.skills} skill files`);
-    loadTraces();
+    toast(`collected ${s.copied} traces and ${s.skills} skill files`);
+    if (currentTab === 'dream') loadTraces();
+    else if (currentTab === 'files' && s.copied) {
+      reveal('raw/traces');
+      await loadTree();
+    }
     loadStats();
+    loadNotices();
   } catch (e) {
-    toast(`sync failed: ${e.message}`);
+    toast(`could not collect traces: ${e.message}`, 5000);
   }
-});
+}
+
+$('#btn-trace-sync').addEventListener('click', collectTraces);
 
 /* -------------------------------- dream -------------------------------- */
+
+/** Tasks → Dream: when it runs, its suggestions, and the traces it reads. */
+function loadDream() {
+  loadSuggestions();
+  loadTraces();
+  loadDreamSchedule();
+}
+
+async function loadDreamSchedule() {
+  try {
+    const t = await api('/api/tasks');
+    const dream = t.scheduled.find((x) => x.id === 'dream');
+    $('#dream-schedule').textContent = dream?.enabled
+      ? `Runs every night at ${dream.at}${dream.next ? ` — next ${untilText(dream.next)}` : ''} — over the last ${t.dream.lookbackDays} days of your Claude Code and Codex sessions, and suggests skills, memory and knowledge to keep.`
+      : 'Reads your recent Claude Code and Codex sessions and suggests skills, memory and knowledge to keep. No nightly run is scheduled (dream.schedule is not a time of day).';
+  } catch {
+    /* an older service or no ingest group: the default line stays */
+  }
+}
 
 async function loadSuggestions() {
   const el = $('#suggestions');
@@ -3603,10 +4508,10 @@ async function loadSuggestions() {
   try {
     const [stats, suggestions] = await Promise.all([api('/api/stats'), api('/api/suggestions')]);
     if (stats.lastDream) {
-      $('#dream-info').textContent = `last dream: ${new Date(stats.lastDream.at).toLocaleString()} over ${stats.lastDream.sessions} sessions → ${stats.lastDream.report}`;
+      $('#dream-info').textContent = `Last run ${new Date(stats.lastDream.at).toLocaleString()} over ${stats.lastDream.sessions} sessions → ${stats.lastDream.report}`;
     }
     if (!suggestions.length) {
-      el.innerHTML = '<p class="hint">no suggestions yet — press “dream now” after a few agent sessions.</p>';
+      el.innerHTML = '<p class="hint">No suggestions yet — collect agent traces, then Dream now (or wait for tonight).</p>';
       return;
     }
     for (const s of suggestions) {
@@ -3791,14 +4696,18 @@ $('#btn-research-queue').addEventListener('click', async () => {
 $('#btn-research-refresh').addEventListener('click', loadResearch);
 
 $('#btn-dream').addEventListener('click', async () => {
+  const button = $('#btn-dream');
+  button.disabled = true;
   toast('dreaming… this can take a minute', 90000);
   try {
     const res = await api('/api/dream', { method: 'POST' });
     toast(`dream complete: ${res.suggestions.length} suggestions (${res.sessions} sessions)`);
-    loadSuggestions();
+    if (currentTab === 'dream') loadDream();
     loadStats();
   } catch (e) {
     toast(`dream failed: ${e.message}`);
+  } finally {
+    button.disabled = false;
   }
 });
 
@@ -3922,7 +4831,7 @@ const PLAYBOOK_GROUPS = {
 const PLAYBOOK_OWNERS = {
   providers: ['Settings → Providers & Agents', 'providers'],
   research: ['Settings → Research', 'research'],
-  sources: ['Research → Sources', 'sources'],
+  sources: ['Settings → Sources', 'sources'],
 };
 
 let playbookGroups = [];
@@ -6284,7 +7193,7 @@ async function loadStudyOptions() {
     : `· Claude Code and Codex search with their own tools${sources.web?.search?.enabled ? `; others through ${sources.web.search.provider}` : ''}; what they cite is captured into raw/docs/research`;
   $('#study-source-list').innerHTML = (sources.sources ?? []).length
     ? sources.sources.map((s) => `<label class="cfg-check"><input type="checkbox" data-source="${esc(s.id)}"${s.enabled ? ' checked' : ''}${s.problem ? ' disabled' : ''} /> ${esc(s.title)} <span class="hint">· ${esc(s.kind)}${s.problem ? ` · ${esc(s.problem)}` : s.description ? ` · ${esc(s.description.slice(0, 90))}` : ''}</span></label>`).join('')
-    : '<p class="hint">No sources of your own yet — add MCP servers, APIs or trusted sites under Research → Sources.</p>';
+    : '<p class="hint">No sources of your own yet — add MCP servers, APIs or trusted sites under Settings → Sources.</p>';
 }
 
 async function loadStudyList() {

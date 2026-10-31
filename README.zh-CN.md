@@ -92,7 +92,7 @@ node dist/cli.js user add admin --admin --data ~/knode-data
 └── teams/<team-name>/                         # 选择同名 Team 的用户共享
 ```
 
-可在 Workspace 菜单中创建和切换空间。使用 **设置 → 清空 Workspace** 时，服务会先关闭该空间的后台任务，再永久删除整个目录（文件、数据库、图谱、trace 和配置），最后在原名称下重建一棵干净的空目录树。新建或刚清空的空间会暂停历史 trace 自动同步；在 **Traces → sync now** 主动同步一次后，才会导入历史并恢复定时同步。
+可在 Workspace 菜单中创建和切换空间。使用 **设置 → 清空 Workspace** 时，服务会先关闭该空间的后台任务，再永久删除整个目录（文件、数据库、图谱、trace 和配置），最后在原名称下重建一棵干净的空目录树。新建或刚清空的空间会暂停历史 trace 自动同步；在 **资料 → 导入数据 → Agent 轨迹**（或 **任务 → Dream → 收集 agent 轨迹**）主动同步一次后，才会导入历史并恢复定时同步。
 
 原来直接位于 `<data>/raw`、`<data>/wiki`、`<data>/.knode` 的数据会原样保留，不会自动迁移。CLI 命令可以直接指定某个隔离目录，例如 `--data ~/.knode-os/users/admin/workspaces/default`。
 
@@ -251,27 +251,27 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
 
 `knode-os serve` → http://127.0.0.1:9100 ——用服务端的账号登录(第一个账号在本机创建:`knode-os user add`,或首屏)。同一套页面也能从其他机器经域名、SSH 隧道或 HTTPS 监听打开([docs/remote-access.md](docs/remote-access.md))。设置里的 **Access / 权限** 用于改自己的密码、管理会话;管理员还能在这里管理用户与网关。成员看到的设置是只读的。
 
-四个一级区，每区自带二级 tab。
+五个一级区，每区自带二级 tab（[设计 20](docs/design/20-explore-and-tasks.md)）。每个视图顶部的搜索框（⌘K 或 `/`）边输入边按名称提示实体和文件，并可把输入的内容交给 **搜索**、**问答** 或 **研究**。
 
 - **Library / 资料** —— 盒子里有什么
-  - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown);开启内容语言后，文档按读者的阅读语言打开——工具栏里的切换器选原文或译文（按浏览器记住），还没有译文时给出 **translate**（译文只读）;**＋ add → Import / Link folder from this Mac** 按路径把本机一个文件夹整体带入并保留目录结构——一次性复制,或"链接"后由 `serve` 持续同步原文件夹的变化(树里带 🔗 标记,只读);打开 `raw/docs` 下的文件时，顶部列出引用它的 wiki 页面(**cited by**:来自它们的 `[[raw/docs/…]]` 与 Markdown 链接、`sources:`(derived from)以及 `tested_by` 等 `relations:`，[写法见此](docs/frontmatter-contract.zh-CN.md))；目录树不列系统目录——`ledger/`、`playbooks/`（在 **设置 → Playbooks** 里编辑），以及 `wiki/lint/` 和 `wiki/datasets/`（它们的消息改由通知送达）——并在 knode-os 建的每个目录旁写明它的用途；`purpose.md` 和 `schema.md` 可在这里直接编辑，agent 不会改写它们
-  - **Search / 检索** —— hybrid/vector/keyword 检索,展示分数构成;可限定在「文件」里选中的目录
-  - **Traces / 轨迹** —— 已收集的 agent 会话;点一行即可打开 `raw/traces/` 下对应的镜像文件
-- **Research / 研究** —— 研究课题:一个主题研究成几页
-  - **Studies** —— 写下你想弄清楚什么,选 agent(或深度研究模型)、深度与来源,点"规划":简报带着更具体的问题、计划的页面、起始来源和要问你的问题回来;编辑、回答、再规划,然后开始。运行中的课题显示各阶段、已收集的资料(标题、站点、日期、文件)、收集笔记、每个分页与总报告——一键提升页面或资料的信任级别,查看各会话日志,并可 **Export ↗** 把总报告和各页导出成一个 HTML 文件,用来阅读、保存或打印成 PDF
-  - **Sources** —— 网络设置(给没有自带搜索的 agent 用的搜索 API、User-Agent、代理)与你自己的来源:MCP 服务器、声明了端点的 JSON API、带种子 URL 的可信站点、实时数据源
-- **Ask / 问答** —— 一个问题，一次 agent 会话。配置好的 agent 通过 MCP 作答，跨多轮追查线索，并把你教它的内容写成隔离笔记（确认后采纳）。没有指定 agent 时跑 01 区的默认连接，所以只要配了模型 Ask 就能用；连这个也没配时，界面会直接说清楚要去配什么。
+  - **Files / 文件** —— 浏览目录树、Markdown 编辑与预览，上传文本/PDF/图片到 raw/docs(自动转换和摄入;PDF/图片命中打开的是转换出的 Markdown);开启内容语言后，文档按读者的阅读语言打开——工具栏里的切换器选原文或译文（按浏览器记住），还没有译文时给出 **translate**（译文只读）;**导入数据** 把资料带进来——从磁盘上传文件或文件夹、按路径导入这台 Mac 上的文件夹并保留目录结构（复制一次，或链接后由 `serve` 与原文件夹保持同步；链接的文件夹在目录树中显示 🔗 且只读），以及把你的 Claude Code 与 Codex 会话收集到 `raw/traces/`；**＋ new** 新建文件或文件夹;打开 `raw/docs` 下的文件时，顶部列出引用它的 wiki 页面(**cited by**:来自它们的 `[[raw/docs/…]]` 与 Markdown 链接、`sources:`(derived from)以及 `tested_by` 等 `relations:`，[写法见此](docs/frontmatter-contract.zh-CN.md))；目录树不列系统目录——`ledger/`、`playbooks/`（在 **设置 → Playbooks** 里编辑），以及 `wiki/lint/` 和 `wiki/datasets/`（它们的消息改由通知送达）——并在 knode-os 建的每个目录旁写明它的用途；`purpose.md` 和 `schema.md` 可在这里直接编辑，agent 不会改写它们
+- **Explore / 探索** —— 三种深度的查找
+  - **Search / 搜索** —— 一个查询按各通道分别命中了什么：每段内容在语义、关键词、实体三个通道里各排第几（多跳检索则显示它经由哪些实体到达），以及融合分数的由来；各通道命中数，可点击筛选；关键词与实体匹配所用的检索词；可按文档分组；旁边是查询命中的实体——并说明是按名称、别名还是描述命中——一跳关系内的实体、它们之间的关系和相关论断。可限定在「文件」里选中的目录
+  - **Ask / 问答** —— 一个问题，一次 agent 会话。配置好的 agent 通过 MCP 作答，跨多轮追查线索，并把你教它的内容写成隔离笔记（确认后采纳）。没有指定 agent 时跑 01 区的默认连接，所以只要配了模型 Ask 就能用；连这个也没配时，界面会直接说清楚要去配什么。
+  - **Research / 研究** —— 研究课题，一个主题研究成几页：写下你想弄清楚什么,选 agent(或深度研究模型)、深度与来源,点"规划":简报带着更具体的问题、计划的页面、起始来源和要问你的问题回来;编辑、回答、再规划,然后开始。运行中的课题显示各阶段、已收集的资料(标题、站点、日期、文件)、收集笔记、每个分页与总报告——一键提升页面或资料的信任级别,查看各会话日志,并可 **Export ↗** 把总报告和各页导出成一个 HTML 文件,用来阅读、保存或打印成 PDF
 - **Knowledge / 知识** —— 从资料里长出来的东西
   - **Graph / 图谱** —— 力导向图谱浏览 + 洞察(枢纽/孤立节点/类型分布)
   - **Wiki** —— 一个按钮完成知识库初始化(通读 → 总览页 + AGENTS.md 指南 + 排队的主题页),并在此发起与审阅深度研究页
-  - **Dream / 夜间分析** —— 手动触发 dream,审阅并接受/拒绝建议
-- **Settings / 设置** —— **Providers & Agents**（每个模型端点与密钥只配一次，embedding 与 LLM 同在一张表——`llmUse` 标出哪个 LLM 是默认，所有没有自己指定 provider 的任务都跟着它走；下面第二张表是 agent：跑在这些模型之一上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI（Claude Code / Codex / Cursor）。CLI 是 agent 而不是模型）、**Ingest / 预处理**（独立的 Entity / Concept / 文档视觉阶段路由，以及带内容语言设置的 Translate 阶段，每个阶段写明自己跑在哪个模型或 agent 上——任一 agent 都按单次调用使用，阶段不再跟随默认；保存后按需重建 embedding 或刷新转换）、**Research / 研究**、**Ask / 问答**（由哪个 agent 回答、每次回复带上最近几条消息、保留多少个对话）、**Playbooks**（`playbooks/` 下的文件，按 knode-os 读取它们的方式分组——研究模版与阶段提示词、context pack、intent、本体包、概念停用词表、能力说明、Ask 的协议与每轮提示词——每个文件都能编辑、撤销，或重置为 knode-os 自带的版本，保存前会检查 YAML 与模版；agent、研究 profile 与研究来源指向编辑它们的页面）、**Workspace**。中间三页按知识在工作区里的流向排列：进来先预处理，再研究成 wiki，最后用来回答问题
+- **Tasks / 任务** —— 正在运行什么、在等什么
+  - **Queue / 队列** —— 处理开关（开始前先估算代价，可随时停止）与逐阶段的流水线——索引、向量、抽取、摘要、翻译、复核——各自在等多少、正在处理多少、最近一小时完成多少；当前每个模型调用的文档、分段和持有它的 worker；本机的处理槽位与远程 worker（在线、忙碌、暂停及原因）；研究、课题与问答任务；后台同步与导入；以及定时任务——Dream、tier-2、轨迹收集、数据源、链接文件夹。页头的处理状态标签显示是否在运行、有多少在处理，点击即打开这里
+  - **Dream / 夜间分析** —— 下次运行时间，立即运行，审阅并接受/拒绝建议，以及它读取的 agent 轨迹（点一行即可打开 `raw/traces/` 下的镜像文件）
+- **Settings / 设置** —— **Providers & Agents**（每个模型端点与密钥只配一次，embedding 与 LLM 同在一张表——`llmUse` 标出哪个 LLM 是默认，所有没有自己指定 provider 的任务都跟着它走；下面第二张表是 agent：跑在这些模型之一上的 deepagents，或带自己路径、模型与推理强度的编码 agent CLI（Claude Code / Codex / Cursor）。CLI 是 agent 而不是模型）、**Ingest / 预处理**（独立的 Entity / Concept / 文档视觉阶段路由，以及带内容语言设置的 Translate 阶段，每个阶段写明自己跑在哪个模型或 agent 上——任一 agent 都按单次调用使用，阶段不再跟随默认；保存后按需重建 embedding 或刷新转换）、**Research / 研究**、**Sources / 来源**（网络设置(给没有自带搜索的 agent 用的搜索 API、User-Agent、代理)与你自己的来源:MCP 服务器、声明了端点的 JSON API、带种子 URL 的可信站点、实时数据源）、**Ask / 问答**（由哪个 agent 回答、每次回复带上最近几条消息、保留多少个对话）、**Playbooks**（`playbooks/` 下的文件，按 knode-os 读取它们的方式分组——研究模版与阶段提示词、context pack、intent、本体包、概念停用词表、能力说明、Ask 的协议与每轮提示词——每个文件都能编辑、撤销，或重置为 knode-os 自带的版本，保存前会检查 YAML 与模版；agent、研究 profile 与研究来源指向编辑它们的页面）、**Workspace**。中间三页按知识在工作区里的流向排列：进来先预处理，再研究成 wiki，最后用来回答问题
 
 **通知**（页头的 ⚑）告诉你工作区需要你做什么，每条带一个对应操作：最近一次 wiki 检查（按类别的问题数、与上一份报告相比的变化，**Open report**）、上次同步失败的数据源（**Retry**）、仍在等你同意的 trace 采集（**Collect traces**，会说明要复制多少个会话）、仍是模版的 `purpose.md`（**Edit purpose.md**），以及从未初始化的 wiki（**Go to Initialize**）。关掉的通知在内容变化后会再次出现。
 
 ## REST API
 
-`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/notices · /api/playbooks · /api/playbooks/file?path · /api/tree[?path&depth&dirs] · /api/file · /api/file/citations?path · /api/search · /api/graph[?limit&types&edges] · /api/graph/insights · /api/entities[?q&type&sort&order&offset&limit&merged] · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
+`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/notices · /api/playbooks · /api/playbooks/file?path · /api/tree[?path&depth&dirs] · /api/file · /api/file/citations?path · /api/search · /api/search/explore?q[&mode&k&sources]（各通道排名的段落、查询命中的实体、它们的关系与论断） · /api/search/suggest?q[&limit] · /api/tasks（队列：阶段、在途调用、worker、任务、后台工作、定时任务） · /api/graph[?limit&types&edges] · /api/graph/insights · /api/entities[?q&type&sort&order&offset&limit&merged] · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
 内容语言：`GET /api/languages` · `GET /api/file?path&lang`（有译文时返回该语言的文档，`languages` 说明各译文进度） · `POST /api/file/translate`（`{ path, lang, cancel? }`）
 `PUT /api/config` · `PUT /api/file` · `PUT /api/playbooks/file` · `DELETE /api/playbooks/file`（重置为自带版本） · `DELETE /api/file` · `POST /api/config/test | /api/upload | /api/ingest | /api/ask | /api/mv | /api/mkdir | /api/traces/sync | /api/dream | /api/wiki/generate | /api/suggestions/:id/status`
 
