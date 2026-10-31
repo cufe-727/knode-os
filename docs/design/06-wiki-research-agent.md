@@ -74,12 +74,21 @@ nightly tier 2: claim audit (supersession) + full duplicate-entity audit + claim
   are applied before concept mining.
 - A spelling that is one typed entity's name and another entity's alias belongs to the entity it names (since
   2026‑10‑30): in the tier‑0 link index (`buildLinkIndex`), so in the views' mention marking and in the known entities
-  the tier‑1 prompt offers, and in `[[link]]` resolution (`entitiesNamed`). An entity past the index's candidate limit
-  is listed for its own name when a listed one carries that name as an alias (`namedPastLimit`), and a document's
-  declared author (`source:`) links to the entity the name names, not to every entity carrying it. Before, the most
-  mentioned candidate took every key, and the wrong aliases extraction merges leave (HBM on 芯片, 机器人 on 科技, 晶圆厂
-  on 半导体) handed a smaller entity's link surface to the hub, and the prompt named the hub for that spelling. On the
-  finance graph that moved 5,789 of 61,944 link keys and changed the tier‑0 links of 19,247 of 23,264 documents.
+  the tier‑1 prompt offers, and in `[[link]]` resolution (`entitiesNamed`). A document's declared author (`source:`)
+  links to the entity the name names, not to every entity carrying it. Before, the most mentioned candidate took every
+  key, and the wrong aliases extraction merges leave (HBM on 芯片, 机器人 on 科技, 晶圆厂 on 半导体) handed a smaller
+  entity's link surface to the hub, and the prompt named the hub for that spelling. On the finance graph that moved
+  5,789 of 61,944 link keys and changed the tier‑0 links of 19,247 of 23,264 documents.
+- A typed entity's full name keeps its span against a shorter spelling inside it, however rarely the entity is
+  mentioned (since 2026‑10‑30): an entity past the link index's candidate limit (the 10,000 most mentioned) is listed
+  for its own name when that name is a spelling the index links or holds one (`namedPastLimit`). 凤凰传媒 links itself,
+  not 凤凰航运 through 凤凰; 净利率 itself, not 利率; 华强科技 itself, not the hub 科技. Every span this adds covers one
+  that linked before. A name that holds no listed spelling stays tier‑1's, as do the aliases of entities past the
+  limit, and a corpus‑frequent name is held to the alias rule. Before, such a span linked the shorter spelling's entity
+  unless this one was among the most mentioned when the document was planned, so a relink, which moves mention
+  counts, could make a document applied after it link worse. On the finance graph: 31,938 names past the limit listed
+  (3,029 before), 59,831 → 88,663 keys, and 12,974 of 23,334 documents change their tier‑0 links. Listing every name
+  past the limit instead linked words tier‑1 had typed once (差不多了, 天来, 一道) in over a hundred documents each.
 - Extraction‑time linking: the tier‑1 prompt lists known entities present in the text; the LLM answers with `sameAs`.
 - Merges: `entity_links` + `entities.canonical_id`, written by a `merge` scope as an explicit effect (inverse
   `entity_link.remove`); `applyMerge / unmergeEntity` log ledger feedback that `rebuild` replays. Reads (graph search,
