@@ -8,8 +8,9 @@ import { Store } from '../store/db.js';
  * configurable half-life. A background task periodically flushes usage back
  * into the sidecars so a DB rebuild never loses history.
  *
- * Heat feeds three places: search ranking (mild RRF boost), the tier-1
- * extraction queue priority, and wiki generation (hot topics / cold demotion).
+ * Heat feeds three places: search ranking (a bounded tie-break, see
+ * heatBoost), the tier-1 extraction queue priority, and wiki generation (hot
+ * topics / cold demotion).
  */
 
 const MS_PER_DAY = 24 * 3600 * 1000;
@@ -24,16 +25,21 @@ export interface ChunkHit {
   documentId: string;
 }
 
-/** Record retrieval hits (called from search/ask/graph with the results actually returned). */
+/**
+ * Record retrieval hits (called from search/ask/graph with the results
+ * actually returned). A chunk counts each time it is returned; a document
+ * counts once per call however many of its chunks came back, so a long
+ * document does not grow hot just by being long.
+ */
 export async function recordChunkHits(store: Store, hits: ChunkHit[], heatCfg?: HeatConfig): Promise<void> {
   if (hits.length === 0) return;
   const cfg = heatCfg ?? defaultConfig().heat;
   const now = new Date();
 
-  const byDoc = new Map<string, number>();
+  const docIds = new Set<string>();
   const byChunk = new Map<string, number>();
   for (const h of hits) {
-    byDoc.set(h.documentId, (byDoc.get(h.documentId) ?? 0) + 1);
+    docIds.add(h.documentId);
     byChunk.set(h.chunkId, (byChunk.get(h.chunkId) ?? 0) + 1);
   }
 
@@ -46,22 +52,49 @@ export async function recordChunkHits(store: Store, hits: ChunkHit[], heatCfg?: 
     );
   }
 
-  for (const [docId, n] of byDoc) {
+  for (const docId of docIds) {
     const [row] = await store.query<{ heat: number; heat_updated: string | null }>(
       `SELECT heat, heat_updated FROM doc_stats WHERE document_id = $1`,
       [docId],
     );
     const prevHeat = row?.heat ?? 0;
     const dt = row?.heat_updated ? now.getTime() - new Date(row.heat_updated).getTime() : 0;
-    const heat = prevHeat * decayFactor(cfg.halfLifeDays, dt) + n;
+    const heat = prevHeat * decayFactor(cfg.halfLifeDays, dt) + 1;
     await store.query(
       `INSERT INTO doc_stats (document_id, hit_count, last_hit_at, heat, heat_updated)
-       VALUES ($1, $2, $3, $4, $3)
+       VALUES ($1, 1, $2, $3, $2)
        ON CONFLICT (document_id) DO UPDATE SET
-         hit_count = doc_stats.hit_count + $2, last_hit_at = $3, heat = $4, heat_updated = $3`,
-      [docId, n, now.toISOString(), heat],
+         hit_count = doc_stats.hit_count + 1, last_hit_at = $2, heat = $3, heat_updated = $2`,
+      [docId, now.toISOString(), heat],
     );
   }
+}
+
+/**
+ * Heat at which a document gets half the search boost. Each search that
+ * returns a document adds 1 to its heat, and heat halves every
+ * `halfLifeDays`, so heat is roughly how many searches returned it in the
+ * last few weeks: one recent search earns a sixth of the boost, one a day
+ * for a few weeks about four fifths of it.
+ */
+export const HALF_BOOST_HEAT = 5;
+
+/**
+ * The fraction a document's heat adds to its fused search score. It grows
+ * with heat and levels off below `searchWeight`, so however hot a document
+ * gets it only overtakes results the recall channels scored within that
+ * fraction of its own: heat breaks near-ties, it never outranks relevance.
+ */
+export function heatBoost(heat: number, heatCfg: HeatConfig): number {
+  if (!(heat > 0) || !(heatCfg.searchWeight > 0)) return 0;
+  return heatCfg.searchWeight * (Number.isFinite(heat) ? heat / (heat + HALF_BOOST_HEAT) : 1);
+}
+
+/** Scale each result's score by its document's heat boost, in place. */
+export async function boostByHeat(store: Store, results: { documentId: string; score: number }[], heatCfg: HeatConfig): Promise<void> {
+  if (results.length === 0 || !(heatCfg.searchWeight > 0)) return;
+  const heat = await getDocHeat(store, [...new Set(results.map((r) => r.documentId))], heatCfg);
+  for (const r of results) r.score *= 1 + heatBoost(heat.get(r.documentId) ?? 0, heatCfg);
 }
 
 /** Current (decay-adjusted) heat for a set of documents. */

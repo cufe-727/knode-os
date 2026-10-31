@@ -355,14 +355,19 @@ CREATE TABLE IF NOT EXISTS extraction_queue (
 heat_new = heat_old * 0.5^(Δt / halfLife) + hits_since_last_update
 ```
 
+（2026‑10‑31 起一次检索对每篇文档只计 1，不论返回了它几个 chunk：长文档不再因为
+长而变热。）
+
 **回刷（冷路径）**：后台任务每小时把 `chunk_stats`/`doc_stats` 聚合回刷到对应
 sidecar 的 `usage` 字段。DB 与 sidecar 之间，DB 是实时账本、sidecar 是持久
 快照，重建时以 sidecar 为底、之后 DB 继续累加。
 
 **热度的三个用途**：
 
-1. **检索排序**：RRF 融合后按 `1 + α·heat` 微调（α 默认 0.1，可配；避免热度
-   垄断，只做 tie-break 级别的提升）。
+1. **检索排序**：RRF 融合后按 `1 + α·heat/(heat + 5)` 微调（α 默认 0.05，可配）：
+   热度最多给融合分加 α（+5%），只在相关性几乎相同的结果之间分先后，压不过
+   明显更相关的结果。（2026‑10‑31 前是 `1 + α·heat`、α 0.1，没有上限，热文档会盖过
+   相关性。）
 2. **抽取调度**：Tier 1 队列优先级、Tier 2 热点子图选择（见第 2 章）。
 3. **wiki 呈现**：
    - `wiki/sources/<slug>.md` frontmatter 写入 `heat`/`lastAccessedAt`，页面
@@ -478,7 +483,7 @@ sidecar 的 `usage` 字段。DB 与 sidecar 之间，DB 是实时账本、sideca
   "heat": {
     "halfLifeDays": 14,            // 热度半衰期
     "flushIntervalMinutes": 60,    // stats 回刷 sidecar 周期
-    "searchWeight": 0.1,           // RRF 热度微调系数 α
+    "searchWeight": 0.05,          // 热度对融合分的最大加成 α（0.05 = +5%）
     "coldThreshold": 0.05          // 低于此热度视为冷文档（wiki 降级）
   }
 }

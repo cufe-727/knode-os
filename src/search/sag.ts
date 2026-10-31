@@ -1,6 +1,6 @@
 import { SagSearchConfig, defaultConfig } from '../config.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
-import { getDocHeat, recordChunkHits } from '../stats/heat.js';
+import { boostByHeat, recordChunkHits } from '../stats/heat.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { NO_FILTER, ResolvedScopeFilter, evidenceFilterSql } from '../store/resolver.js';
 import { Params, TimeInput, rowLiveAt, toIso } from '../store/temporal.js';
@@ -324,12 +324,16 @@ export async function sagSearch(
   const scope: SagScope = { asOf: opts.asOf, filter: opts.filter ?? NO_FILTER };
   const k = boundedInteger(opts.k ?? 8, 8, 1, 100);
   const [queryVector] = opts.queryVector ? [opts.queryVector] : await embedder.embed([query]);
+  const heatCfg = opts.heat ?? defaultConfig().heat;
   const direct = await search(store, embedder, query, {
     ...opts,
     k: Math.max(k, cfg.seedChunks),
     mode: 'hybrid',
     track: false,
     queryVector,
+    // seeds and the direct route rank by relevance alone; heat breaks ties
+    // once, on the merged results
+    heat: { ...heatCfg, searchWeight: 0 },
   });
 
   const [{ count }, queryEntities] = await Promise.all([
@@ -417,12 +421,7 @@ export async function sagSearch(
   const structuralResults = fuseStructuralCandidates(structuralPool, vectorRows);
   const results = mergeRoutes(direct, structuralResults, k, cfg.directRatio);
 
-  const heatCfg = opts.heat ?? defaultConfig().heat;
-  const heat = await getDocHeat(store, [...new Set(results.map((result) => result.documentId))], heatCfg);
-  for (const result of results) {
-    const value = heat.get(result.documentId);
-    if (value) result.score *= 1 + heatCfg.searchWeight * value;
-  }
+  await boostByHeat(store, results, heatCfg);
   results.sort((a, b) => b.score - a.score);
   if (opts.track !== false) {
     await recordChunkHits(store, results.map((result) => ({ chunkId: result.chunkId, documentId: result.documentId })), heatCfg);
