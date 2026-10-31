@@ -3,7 +3,7 @@ import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { NO_FILTER, ResolvedScopeFilter, documentFilterSql } from '../store/resolver.js';
 import { Params, TimeInput, rowLiveAt, toIso, toDateString } from '../store/temporal.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
-import { getDocHeat, recordChunkHits } from '../stats/heat.js';
+import { boostByHeat, recordChunkHits } from '../stats/heat.js';
 import { SearchResult } from '../types.js';
 
 export type SearchMode = 'hybrid' | 'vector' | 'keyword' | 'sag';
@@ -216,8 +216,9 @@ async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput
 /**
  * Hybrid search: reciprocal-rank fusion of vector + keyword + graph-mention
  * signals (RRF, k=60 — the same shape gbrain and most hybrid retrievers use).
- * Fused scores get a mild heat boost (tie-break level, never dominant), and
- * returned hits are recorded into the usage ledger.
+ * Fused scores get a bounded heat boost (at most `heat.searchWeight`, a
+ * tie-break, never dominant), and returned hits are recorded into the usage
+ * ledger.
  */
 export async function search(
   store: Store,
@@ -300,15 +301,11 @@ export async function searchExplained(
   fold(kw, 'keyword');
   fold(gr, 'graph');
 
-  // heat boost: score *= 1 + w * heat (w is small — heat breaks ties, it
-  // never overrides relevance)
+  // heat adds at most heat.searchWeight to a score: it breaks near-ties, it
+  // never lifts a result above one the channels clearly prefer
   const heatCfg = opts.heat ?? defaultConfig().heat;
   const candidates = [...fused.values()];
-  const heat = await getDocHeat(store, [...new Set(candidates.map((c) => c.documentId))], heatCfg);
-  for (const c of candidates) {
-    const h = heat.get(c.documentId);
-    if (h) c.score *= 1 + heatCfg.searchWeight * h;
-  }
+  await boostByHeat(store, candidates, heatCfg);
 
   const results = candidates.sort((a, b) => b.score - a.score).slice(0, k);
   if (opts.track !== false) {

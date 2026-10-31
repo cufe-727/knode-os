@@ -480,7 +480,13 @@ export interface HeatConfig {
   halfLifeDays: number;
   /** Minutes between flushing usage stats from the DB back to sidecars. */
   flushIntervalMinutes: number;
-  /** RRF score multiplier: score *= 1 + searchWeight * heat. */
+  /**
+   * The most usage heat can add to a fused search score, as a fraction
+   * (0.05 = +5%). The boost grows with a document's heat and levels off
+   * below this (heatBoost in src/stats/heat.ts), so heat reorders only
+   * results the recall channels scored within this fraction of each other.
+   * 0 turns it off.
+   */
   searchWeight: number;
   /** Documents below this heat are treated as cold in wiki generation. */
   coldThreshold: number;
@@ -492,7 +498,11 @@ export interface SagSearchConfig {
   seedChunks: number;
   /** Maximum entity nodes expanded at each hop. */
   entityFrontier: number;
-  /** Per-entity cap when expanding back to event chunks. */
+  /**
+   * Per-entity cap when expanding back to event chunks. An entity past it
+   * keeps the chunks where the most of the hop's entities meet, newest first
+   * among equals; usage heat does not choose.
+   */
   maxEventsPerEntity: number;
   /** Maximum structurally discovered chunks sent to vector coarse ranking. */
   candidatePool: number;
@@ -1034,7 +1044,7 @@ export function defaultConfig(): KnodeConfig {
     heat: {
       halfLifeDays: 14,
       flushIntervalMinutes: 60,
-      searchWeight: 0.1,
+      searchWeight: 0.05,
       coldThreshold: 0.05,
     },
     datasources: [],
