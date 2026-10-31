@@ -1,5 +1,5 @@
 import { HeatConfig } from '../config.js';
-import { docLiveAt, queryTerms } from '../search/search.js';
+import { docLiveAt, entityMatchSql, queryTerms } from '../search/search.js';
 import { recordChunkHits } from '../stats/heat.js';
 import { Store } from '../store/db.js';
 import {
@@ -142,16 +142,11 @@ export async function graphSearch(
   const terms = queryTerms(query, 6);
   if (terms.length === 0) return { nodes: [], edges: [], chunks: [] };
   const p = new Params();
-  const conds = terms
-    .map((term) => {
-      const ph = p.add(`%${term}%`);
-      return `(name ILIKE ${ph} OR aliases::text ILIKE ${ph} OR description ILIKE ${ph})`;
-    })
-    .join(' OR ');
+  const named = entityMatchSql(store, 'e', terms, p, ['name', 'aliases', 'description']);
   const liveCond = rowLiveAt('e', 'entity', p, asOf);
   let seeds = await store.query<EntityRow>(
     `SELECT * FROM entities e
-     WHERE (${conds}) AND ${liveCond} AND ${evidenceFilterSql('e.id', 'entity', p, f, asOf)}
+     WHERE ${named} AND ${liveCond} AND ${evidenceFilterSql('e.id', 'entity', p, f, asOf)}
      ORDER BY mention_count DESC LIMIT 10`,
     p.list,
   );

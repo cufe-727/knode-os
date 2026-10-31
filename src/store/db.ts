@@ -1,6 +1,7 @@
 import { DatabaseConfig } from '../config.js';
 import { ClaimTypeRefoldResult, claimTypesStale, refoldClaimTypes } from '../lineage/claim-types.js';
 import { Backend, openBackend } from './backend.js';
+import { ensureMatchIndexes, MatchIndexResult } from './grams.js';
 import { CoOccursCleanupResult, dropStoredCoOccurrence, migrate, MigrationResult, Queryable } from './migrations.js';
 
 /**
@@ -88,12 +89,22 @@ export class Store implements Queryable {
    * once when nothing needs it.
    */
   public retype: Promise<ClaimTypeRefoldResult | null> = Promise.resolve(null);
+  /**
+   * The substring indexes search matches terms through (grams.ts), built in the
+   * background after `cleanup` when missing: settled once each is there, or
+   * when `close` stopped the build. `matchIndexes` names the ones ready.
+   */
+  public indexing: Promise<MatchIndexResult | null> = Promise.resolve(null);
+  public readonly matchIndexes = new Set<string>();
   private stopCleanup = false;
+  /** Backend pid of an index build in flight, for close to cancel; only a server can take that call meanwhile. */
+  private buildPid: number | null = null;
 
   private constructor(
     public readonly db: Backend,
     public readonly dataDir: string,
     public embeddingDim: number,
+    private readonly embedded: boolean,
   ) {}
 
   /**
@@ -110,7 +121,7 @@ export class Store implements Queryable {
         value JSONB NOT NULL
       );
     `);
-    const store = new Store(db, dataDir, embeddingDim);
+    const store = new Store(db, dataDir, embeddingDim, (dbConfig?.kind || 'pglite') === 'pglite');
     store.migration = await migrate(store, (fn) => store.tx(fn));
 
     const prev = await db.query<{ value: { dim: number; type?: string } }>(
@@ -156,6 +167,14 @@ export class Store implements Queryable {
           return null;
         });
     }
+    // building the chunk index takes minutes on a large workspace; searches
+    // scan without it until it is ready, and a stopped build starts over
+    store.indexing = store.cleanup
+      .then(() => ensureMatchIndexes(store, { stop: () => store.stopCleanup, building: (pid) => { store.buildPid = pid; } }))
+      .catch((err: unknown) => {
+        console.warn(`[knode-os] search index build stopped: ${err instanceof Error ? err.message : String(err)}; the next open builds it`);
+        return null;
+      });
     return store;
   }
 
@@ -241,8 +260,13 @@ export class Store implements Queryable {
   async close(): Promise<void> {
     // let the batch in flight finish, then stop: a half-done cleanup or refold resumes at the next open
     this.stopCleanup = true;
+    // an index build is one statement of minutes: cancel it (it rolls back whole); embedded PGlite runs one statement at a time, so it is waited for
+    if (this.buildPid !== null && !this.embedded) {
+      await this.query(`SELECT pg_cancel_backend($1)`, [this.buildPid]).catch(() => undefined);
+    }
     await this.cleanup;
     await this.retype;
+    await this.indexing;
     await this.db.close();
   }
 }

@@ -14,6 +14,7 @@ import type { LlmClient } from '../src/llm/client.js';
 import { resolveWorkspaceScope, WorkspaceContextRegistry } from '../src/server/workspaces.js';
 import { dropBackend, schemaNameFor } from '../src/store/backend.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
+import { ensureMatchIndexes, MATCH_INDEXES } from '../src/store/grams.js';
 import { catalogQuery, catalogReaderRole } from '../src/store/catalog.js';
 
 /**
@@ -419,6 +420,72 @@ describe.skipIf(!ready)('postgres backend', () => {
     } finally {
       warn.mockRestore();
       await store.close();
+    }
+  });
+
+  it('builds the substring indexes once: another process waits for a build in flight, and close cancels one', async () => {
+    const dir = workspaceDir();
+    const schema = schemaNameFor(dir, dbConfig.schemaPrefix);
+    const first = await Store.open(dir, 2048, dbConfig);
+    try {
+      expect((await first.indexing)?.built).toEqual([MATCH_INDEXES.entities.name, MATCH_INDEXES.chunks.name]);
+      // enough text that building the chunk index takes seconds
+      await first.query(
+        `INSERT INTO documents (id, path, root, sha256, status) SELECT 'd' || i, 'raw/docs/' || i || '.md', 'docs', 'sha', 'indexed' FROM generate_series(1, 20000) i`,
+      );
+      await first.query(
+        `INSERT INTO chunks (id, document_id, seq, content) SELECT 'c' || i, 'd' || i, 0, repeat('宁德时代的储能业务增长很快，订单饱满。HBM3E ' || i, 30) FROM generate_series(1, 20000) i`,
+      );
+      await first.query(`DROP INDEX ${MATCH_INDEXES.chunks.name}`);
+      first.matchIndexes.clear();
+
+      // another process holds the build lock: this one waits, then finds the index that process built
+      const other = adminPool(dbConfig.database);
+      const client = await other.connect();
+      try {
+        await client.query(`SET search_path = ${schema}, public`);
+        await client.query(`BEGIN`);
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext(current_schema() || '.match_grams'))`);
+        const waiting = ensureMatchIndexes(first, { pollMs: 100, log: () => {} });
+        await new Promise((r) => setTimeout(r, 400));
+        expect(first.matchIndexes.size).toBe(0);
+        await client.query(`CREATE INDEX ${MATCH_INDEXES.chunks.name} ON chunks USING gin (${MATCH_INDEXES.chunks.expr('chunks')})`);
+        await client.query(`COMMIT`);
+        expect((await waiting).built).toEqual([]);
+        expect([...first.matchIndexes].sort()).toEqual([MATCH_INDEXES.chunks.name, MATCH_INDEXES.entities.name]);
+      } finally {
+        client.release();
+        await other.end();
+      }
+      await first.query(`DROP INDEX ${MATCH_INDEXES.chunks.name}`);
+    } finally {
+      await first.close();
+    }
+
+    // closing while the build runs cancels it, whole, and the next open builds it again
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const second = await Store.open(dir, 2048, dbConfig);
+    const watcher = adminPool(dbConfig.database);
+    try {
+      const building = async () =>
+        (await watcher.query(`SELECT 1 FROM pg_stat_activity WHERE query LIKE 'CREATE INDEX ${MATCH_INDEXES.chunks.name}%' AND state = 'active'`)).rows.length > 0;
+      for (let i = 0; i < 100 && !(await building()); i++) await new Promise((r) => setTimeout(r, 50));
+      expect(await building()).toBe(true);
+      const started = Date.now();
+      await second.close();
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(warn.mock.calls.some(([line]) => String(line).includes('search index build stopped'))).toBe(true);
+      const { rows } = await watcher.query(`SELECT 1 FROM pg_class WHERE relname = $1 AND relnamespace = $2::regnamespace`, [MATCH_INDEXES.chunks.name, schema]);
+      expect(rows).toEqual([]);
+    } finally {
+      warn.mockRestore();
+      await watcher.end();
+    }
+    const third = await Store.open(dir, 2048, dbConfig);
+    try {
+      expect((await third.indexing)?.built).toEqual([MATCH_INDEXES.chunks.name]);
+    } finally {
+      await third.close();
     }
   });
 

@@ -5,7 +5,7 @@ import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { NO_FILTER, ResolvedScopeFilter, evidenceFilterSql } from '../store/resolver.js';
 import { Params, TimeInput, rowLiveAt, toIso } from '../store/temporal.js';
 import { SearchResult } from '../types.js';
-import { SearchOptions, docLiveAt, queryTerms, search } from './search.js';
+import { SearchOptions, docLiveAt, entityMatchSql, queryTerms, search } from './search.js';
 
 interface EntityMentionRow {
   entity_id: string;
@@ -95,18 +95,13 @@ async function queryMatchedEntities(store: Store, query: string, limit: number, 
   const terms = queryTerms(query, 6);
   if (terms.length === 0) return [];
   const p = new Params();
-  const conds = terms
-    .map((term) => {
-      const ph = p.add(`%${term}%`);
-      return `(e.name ILIKE ${ph} OR e.aliases::text ILIKE ${ph})`;
-    })
-    .join(' OR ');
+  const named = entityMatchSql(store, 'e', terms, p);
   const asOf = toIso(scope.asOf);
   const lim = p.add(limit);
   return store.query<EntityRow>(
     `SELECT e.id AS entity_id, e.name, e.mention_count
      FROM entities e
-     WHERE (${conds}) AND ${rowLiveAt('e', 'entity', p, asOf)}
+     WHERE ${named} AND ${rowLiveAt('e', 'entity', p, asOf)}
        AND ${evidenceFilterSql('e.id', 'entity', p, scope.filter, asOf)}
      ORDER BY e.mention_count DESC, e.name ASC
      LIMIT ${lim}`,

@@ -9,13 +9,13 @@ import { CATALOG_VIEWS } from '../src/store/catalog.js';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-schema-v7-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17 (wiki research + review + quick answers + claim merges + dispose indexes + derived co-occurrence + claim kind + document chars + citations + content languages)', () => {
+describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18 (wiki research + review + quick answers + claim merges + dispose indexes + derived co-occurrence + claim kind + document chars + citations + content languages + match grams)', () => {
   it('adds the temporal relation / claim columns, resolution tables and research jobs, and every catalog view resolves', async () => {
     fs.mkdirSync(path.join(tmp, 'ws', '.knode'), { recursive: true });
     const store = await Store.open(path.join(tmp, 'ws'), 3);
     try {
-      expect(SCHEMA_VERSION).toBe(17);
-      expect(store.migration.to).toBe(17);
+      expect(SCHEMA_VERSION).toBe(18);
+      expect(store.migration.to).toBe(18);
       // every foreign key a disposal fires, the merged-entity lookup of the fold, and the
       // document side of derived co-occurrence (v13) have an index to use
       const indexes = (await store.query<{ indexname: string }>(`SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()`)).map((r) => r.indexname);
@@ -37,6 +37,8 @@ describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17 (wiki research + review +
       expect(await columns('documents')).toContain('language');
       expect(await columns('translations')).toEqual(expect.arrayContaining(['document_id', 'language', 'content_sha', 'status', 'parts', 'done', 'attempts', 'requested', 'model', 'error']));
       expect(indexes).toContain('translations_status_idx');
+      // v18: the n-grams substring matching looks terms up by (src/store/grams.ts); open builds the indexes over them in the background
+      expect(await store.query(`SELECT match_grams('宁德时代 HBM3E')::text AS grams`)).toEqual([{ grams: `'3e' 'bm' 'bm3' 'hb' 'hbm' 'm3' 'm3e' '宁德' '德时' '时代'` }]);
       expect(await columns('entities')).toEqual(expect.arrayContaining(['canonical_id', 'name_key']));
       expect(await columns('entity_alias_keys')).toEqual(expect.arrayContaining(['entity_id', 'alias_key', 'kind']));
       expect(await columns('entity_links')).toEqual(expect.arrayContaining(['entity_id', 'canonical_id', 'scope_id']));
