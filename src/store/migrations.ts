@@ -930,6 +930,31 @@ CREATE TABLE IF NOT EXISTS translations (
 CREATE INDEX IF NOT EXISTS translations_status_idx ON translations (language, status);
 `;
 
+// Substring matching through an index (src/store/grams.ts). Search matches
+// query terms as substrings, and the terms of a CJK query are two-character
+// bigrams that no full-text parser and no trigram index can look up, so every
+// such search scanned every chunk (8–20 s on a 370k-chunk workspace). This
+// function reduces a text to the n-grams of its lowercased runs: each bigram of
+// a CJK run, each bigram and trigram of a run of [a-z0-9_.$-], the two
+// character classes queryTerms takes terms from. A GIN index over it answers
+// "holds every gram of the term", which every text containing the term does.
+// The indexes themselves are built in the background after open
+// (ensureMatchIndexes), as that takes minutes on a large workspace. An index
+// stores the function's output, so a change to the grams needs a function and
+// indexes under new names, never a CREATE OR REPLACE of this one. A call takes
+// about 250 µs on a chunk; COST says so, which keeps the planner reading
+// through the index and, where it reads rows one by one, testing the cheap
+// exact match on a row before this.
+const V18_MATCH_GRAMS = `
+CREATE OR REPLACE FUNCTION match_grams(t text) RETURNS tsvector
+  LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE COST 1000 AS $$
+    SELECT array_to_tsvector(coalesce(array_agg(substr(r[1], i, n)), '{}'::text[]))
+    FROM regexp_matches(lower(t), '[一-鿿㐀-䶿]{2,}|[a-z0-9_.$-]{2,}', 'g') AS r,
+         generate_series(2, CASE WHEN ascii(r[1]) < 128 THEN 3 ELSE 2 END) AS n,
+         generate_series(1, length(r[1]) - n + 1) AS i
+  $$;
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -965,6 +990,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 15, name: 'document-chars', up: async (q) => execScript(q, V15_DOCUMENT_CHARS) },
   { version: 16, name: 'citations', up: async (q) => execScript(q, V16_CITATIONS) },
   { version: 17, name: 'content-languages', up: async (q) => execScript(q, V17_CONTENT_LANGUAGES) },
+  { version: 18, name: 'match-grams', up: async (q) => execScript(q, V18_MATCH_GRAMS) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

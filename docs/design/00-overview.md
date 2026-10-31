@@ -101,7 +101,11 @@ they feed the dream cycle only.
 1. **vector** — pgvector cosine over configured embeddings (default: offline
    feature-hashing embedder so the system works with zero keys; configure any
    OpenAI-compatible endpoint for real quality).
-2. **keyword** — Postgres `tsvector`('simple') + ILIKE fallback for CJK.
+2. **keyword** — Postgres `tsvector`('simple'), and where that finds too little
+   (CJK has no word boundaries for it) a substring fallback: chunks ranked by how
+   many query terms they contain, looked up through a GIN index over the n-grams
+   of the text (`match_grams`, `src/store/grams.ts`) that also serves the entity
+   name matching of the graph and SAG routes.
 3. **graph** — chunks mentioning entities whose name/alias matches the query (live
    at `as_of` when one is given), one row per chunk, ranked by how many matching
    entities it mentions, then by their mention counts.

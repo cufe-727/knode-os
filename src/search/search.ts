@@ -1,5 +1,6 @@
 import { HeatConfig, SagSearchConfig, defaultConfig } from '../config.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
+import { gramQuery, MATCH_INDEXES, matchIndexReady, termGrams } from '../store/grams.js';
 import { NO_FILTER, ResolvedScopeFilter, documentFilterSql } from '../store/resolver.js';
 import { Params, TimeInput, rowLiveAt, toIso, toDateString } from '../store/temporal.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
@@ -141,7 +142,7 @@ async function vectorSearch(
   );
 }
 
-/** Keyword recall: Postgres FTS, with an ILIKE fallback that covers CJK queries. */
+/** Keyword recall: Postgres FTS, with a substring fallback that covers CJK queries. */
 async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
   const p = new Params([query]);
   const cond = docLiveAt('d', p, asOf, filter);
@@ -161,22 +162,88 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
   // CJK or rare terms: substring fallback, ranked by how many query terms hit
   const terms = queryTerms(query);
   if (terms.length === 0) return fts;
-  const lp = new Params();
-  const placeholders = terms.map((t) => lp.add(`%${t}%`));
-  const conds = placeholders.map((ph) => `c.content ILIKE ${ph}`).join(' OR ');
-  const hitCount = placeholders.map((ph) => `(c.content ILIKE ${ph})::int`).join(' + ');
-  const lcond = docLiveAt('d', lp, asOf, filter);
-  const llim = lp.add(k);
-  const like = await store.query<RankedChunk>(
-    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, (${hitCount})::float AS raw
-     FROM chunks c JOIN documents d ON d.id = c.document_id
-     WHERE (${conds}) AND ${lcond}
-     ORDER BY raw DESC
-     LIMIT ${llim}`,
-    lp.list,
-  );
+  const like = await substringSearch(store, terms, k, asOf, filter);
   const seen = new Set(fts.map((r) => r.chunk_id));
   return [...fts, ...like.filter((r) => !seen.has(r.chunk_id))].slice(0, k);
+}
+
+/**
+ * The `k` chunks holding the most of `terms` as case-insensitive substrings,
+ * `raw` = how many they hold, ordered by it and then by id.
+ *
+ * Through the gram index (store/grams.ts) this asks for the chunks holding
+ * all n terms, then at least n-1, and so on, each tier one index scan with
+ * LIMIT k under a UNION ALL that stops as soon as k rows are in: a tier only
+ * runs while the tiers above it had fewer than k rows between them, so it
+ * returns no row they hold, and none returns more than k. A query whose
+ * common terms hold a quarter of all chunks ("2026", "AI") no longer reads
+ * them: on a copy of finance (374k chunks) the 43 agent queries of a benchmark
+ * that reach this took 10.7 s at the median and 12.6 s at worst as one ILIKE
+ * scan, 42 ms and 237 ms this way. Of the chunks tying at the last tier, the
+ * index's order picks which come in, where the scan's planner order did. Until
+ * the index is ready, one scan counts every chunk's terms (5–6.5 s there).
+ */
+async function substringSearch(store: Store, terms: string[], k: number, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
+  const grams = terms.map(termGrams);
+  const p = new Params([terms.map((t) => t.toLowerCase())]);
+  // lower() once per chunk, then one strpos per term: the ILIKE this replaces lowercased the text once per term
+  const hits = `(SELECT count(*) FROM (SELECT lower(c.content) AS l OFFSET 0) x, unnest($1::text[]) t WHERE strpos(x.l, t) > 0)`;
+  const cond = docLiveAt('d', p, asOf, filter);
+  const lim = p.add(k);
+  const columns = `c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content`;
+  if (!matchIndexReady(store, 'chunks') || grams.some((g) => g.length === 0)) {
+    return store.query<RankedChunk>(
+      `SELECT * FROM (
+         SELECT ${columns}, ${hits}::float AS raw
+         FROM chunks c JOIN documents d ON d.id = c.document_id
+         WHERE ${cond}
+         OFFSET 0
+       ) scored
+       WHERE raw > 0
+       ORDER BY raw DESC, chunk_id
+       LIMIT ${lim}`,
+      p.list,
+    );
+  }
+  const tiers: string[] = [];
+  for (let m = terms.length; m >= 1; m--) {
+    const q = p.add(gramQuery(grams, m));
+    tiers.push(
+      `(SELECT ${columns}, ${m}::float AS raw
+        FROM chunks c JOIN documents d ON d.id = c.document_id
+        WHERE ${MATCH_INDEXES.chunks.expr('c')} @@ ${q}::tsquery AND ${hits} = ${m} AND ${cond}
+        LIMIT ${lim})`,
+    );
+  }
+  return store.query<RankedChunk>(
+    `SELECT * FROM (SELECT * FROM (${tiers.join(' UNION ALL ')}) tiers LIMIT ${lim}) top
+     ORDER BY raw DESC, chunk_id`,
+    p.list,
+  );
+}
+
+/**
+ * SQL holding when one of `terms` is a case-insensitive substring of one of the
+ * entity's `fields` (as `field ILIKE '%term%'` did), through the entity gram
+ * index once it is ready. The terms become parameters of `p`.
+ */
+export function entityMatchSql(
+  store: Store,
+  alias: string,
+  terms: string[],
+  p: Params,
+  fields: ('name' | 'aliases' | 'description')[] = ['name', 'aliases'],
+): string {
+  const columns = fields.map((f) => (f === 'aliases' ? `lower(${alias}.aliases::text)` : `lower(${alias}.${f})`));
+  const exact = terms
+    .map((t) => {
+      const ph = p.add(t.toLowerCase());
+      return columns.map((col) => `strpos(${col}, ${ph}) > 0`).join(' OR ');
+    })
+    .join(' OR ');
+  const grams = terms.map(termGrams);
+  if (!matchIndexReady(store, 'entities') || grams.some((g) => g.length === 0)) return `(${exact})`;
+  return `(${MATCH_INDEXES.entities.expr(alias)} @@ ${p.add(gramQuery(grams, 1))}::tsquery AND (${exact}))`;
 }
 
 /**
@@ -186,29 +253,49 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
  * id — RRF reads the rank, so the order must not be the planner's. An entity
  * counts when it was live at `asOf` (the evidence test the other graph routes
  * use), not merely now. `raw` is the matching-entity count, as in graphSearch.
+ *
+ * "How often" sums each matching entity's mention_count once per mention row
+ * it has in the chunk. A query term as common as "存储" or "AI" matches
+ * entities with hundreds of thousands of mention rows between them, so the
+ * rows are counted per entity, off its own index, and the live documents
+ * joined by hash, before any chunk text is read: over 47 agent queries on a
+ * copy of finance, 832 ms → 186 ms at the median, 3.0 s → 1.1 s at worst, the
+ * same rankings.
  */
 async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
   const terms = queryTerms(query, 5);
   if (terms.length === 0) return [];
   const p = new Params();
-  const conds = terms.map((t) => {
-    const ph = p.add(`%${t}%`);
-    return `(e.name ILIKE ${ph} OR e.aliases::text ILIKE ${ph})`;
-  }).join(' OR ');
+  const named = entityMatchSql(store, 'e', terms, p);
   const entityLive = rowLiveAt('e', 'entity', p, asOf);
   const cond = docLiveAt('d', p, asOf, filter);
   const lim = p.add(k);
   return store.query<RankedChunk>(
-    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
-            count(DISTINCT e.id)::float AS raw
-     FROM entities e
-     JOIN entity_mentions m ON m.entity_id = e.id
-     JOIN chunks c ON c.id = m.chunk_id
+    `WITH matched AS MATERIALIZED (
+       SELECT e.id, e.mention_count FROM entities e WHERE ${named} AND ${entityLive}
+     ), docs AS MATERIALIZED (
+       SELECT d.id FROM documents d WHERE ${cond}
+     ), per_chunk AS (
+       SELECT x.chunk_id, min(x.document_id) AS document_id,
+              count(*) AS matches, sum(e.mention_count * x.mentions) AS weight
+       FROM matched e
+       CROSS JOIN LATERAL (
+         SELECT m.chunk_id, min(m.document_id) AS document_id, count(*) AS mentions
+         FROM entity_mentions m WHERE m.entity_id = e.id
+         GROUP BY m.chunk_id
+       ) x
+       GROUP BY x.chunk_id
+     ), ranked AS (
+       SELECT pc.chunk_id, pc.matches, pc.weight
+       FROM per_chunk pc JOIN docs ON docs.id = pc.document_id
+       ORDER BY pc.matches DESC, pc.weight DESC, pc.chunk_id
+       LIMIT ${lim}
+     )
+     SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, r.matches::float AS raw
+     FROM ranked r
+     JOIN chunks c ON c.id = r.chunk_id
      JOIN documents d ON d.id = c.document_id
-     WHERE (${conds}) AND ${entityLive} AND ${cond}
-     GROUP BY c.id, d.id
-     ORDER BY count(DISTINCT e.id) DESC, sum(e.mention_count) DESC, c.id
-     LIMIT ${lim}`,
+     ORDER BY r.matches DESC, r.weight DESC, c.id`,
     p.list,
   );
 }
