@@ -133,29 +133,44 @@ async function expandEntities(
   store: Store,
   entities: FrontierEntity[],
   maxEventsPerEntity: number,
+  seenChunks: Set<string>,
   scope: SagScope,
 ): Promise<ExpandedChunkRow[]> {
   if (entities.length === 0) return [];
   const p = new Params();
-  const placeholders = entities.map((entity) => p.add(entity.id)).join(',');
+  const ids = p.add(entities.map((entity) => entity.id));
+  const scores = p.add(entities.map((entity) => entity.score));
+  const seen = p.add([...seenChunks]);
   const asOf = toIso(scope.asOf);
   const docCond = docLiveAt('d', p, asOf, scope.filter);
   const rank = p.add(maxEventsPerEntity);
+  // An entity with more unseen chunks than the cap keeps those where the most
+  // of this hop's entities meet — by the summed scores of the frontier
+  // entities a chunk mentions, the structural score it would earn uncut —
+  // newest first among equals. Usage heat stays out: it would hand every walk
+  // through a busy entity the same documents, and each pick made them hotter.
   return store.query<ExpandedChunkRow>(
-    `WITH mentions AS (
-       SELECT DISTINCT entity_id, chunk_id, document_id FROM entity_mentions WHERE entity_id IN (${placeholders})
+    `WITH frontier AS (
+       SELECT * FROM unnest(${ids}::text[], ${scores}::float8[]) AS f(entity_id, score)
+     ), mentions AS (
+       SELECT DISTINCT m.entity_id, m.chunk_id FROM entity_mentions m
+       WHERE m.entity_id = ANY(${ids}::text[]) AND m.chunk_id <> ALL(${seen}::text[])
+     ), reach AS (
+       SELECT m.chunk_id, sum(f.score) AS reach
+       FROM mentions m JOIN frontier f ON f.entity_id = m.entity_id
+       GROUP BY m.chunk_id
      ), ranked AS (
        SELECT m.entity_id, e.name AS entity_name,
               c.id AS chunk_id, c.document_id, d.path, d.title, c.content,
               row_number() OVER (
                 PARTITION BY m.entity_id
-                ORDER BY COALESCE(ds.heat, 0) DESC, c.seq ASC
+                ORDER BY r.reach DESC, d.doc_date DESC NULLS LAST, d.updated_at DESC, c.seq, c.id
               ) AS event_rank
        FROM mentions m
+       JOIN reach r ON r.chunk_id = m.chunk_id
        JOIN entities e ON e.id = m.entity_id
        JOIN chunks c ON c.id = m.chunk_id
        JOIN documents d ON d.id = c.document_id
-       LEFT JOIN doc_stats ds ON ds.document_id = c.document_id
        WHERE ${rowLiveAt('e', 'entity', p, asOf)} AND ${docCond}
      )
      SELECT entity_id, entity_name, chunk_id, document_id, path, title, content
@@ -364,12 +379,11 @@ export async function sagSearch(
     frontierEntities.forEach((entity) => seenEntities.add(entity.id));
 
     const entityById = new Map(frontierEntities.map((entity) => [entity.id, entity]));
-    const expandedRows = await expandEntities(store, frontierEntities, cfg.maxEventsPerEntity, scope);
-    const seenBeforeHop = new Set(seenChunks);
+    // chunks already reached are left out in SQL, so they take no entity's places
+    const expandedRows = await expandEntities(store, frontierEntities, cfg.maxEventsPerEntity, seenChunks, scope);
     const nextIds = new Set<string>();
 
     for (const row of expandedRows) {
-      if (seenBeforeHop.has(row.chunk_id)) continue;
       const entity = entityById.get(row.entity_id);
       if (!entity) continue;
       const parent = entity.parentChunkId ? frontierProvenance.get(entity.parentChunkId) : undefined;

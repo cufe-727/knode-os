@@ -498,7 +498,11 @@ export interface SagSearchConfig {
   seedChunks: number;
   /** Maximum entity nodes expanded at each hop. */
   entityFrontier: number;
-  /** Per-entity cap when expanding back to event chunks. */
+  /**
+   * Per-entity cap when expanding back to event chunks. An entity past it
+   * keeps the chunks where the most of the hop's entities meet, newest first
+   * among equals; usage heat does not choose.
+   */
   maxEventsPerEntity: number;
   /** Maximum structurally discovered chunks sent to vector coarse ranking. */
   candidatePool: number;
