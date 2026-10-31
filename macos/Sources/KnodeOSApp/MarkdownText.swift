@@ -20,13 +20,17 @@ import SwiftUI
 /// `[^1]: …` below — become superscript markers that jump to a list of notes,
 /// one per line, each with a way back. An export's `<a id="…"></a>` lines are
 /// places a link can land on, and a workspace path written as code (`raw/…`)
-/// opens its file. The entity names the service found in the text
-/// (`mentions`) are marked in their type's colour and open the entity panel.
+/// opens its file. A page whose frontmatter says `type: MindMap` is drawn as
+/// the tree its outline holds (MarkdownMindMap.swift). The entity names the
+/// service found in the text (`mentions`) are marked in their type's colour
+/// and open the entity panel.
 struct MarkdownText: View {
     let markdown: String
     var mentions: [EntityMention]
     /// A place to bring into view, cleared once shown.
     @Binding var scrollTarget: MarkdownScrollTarget?
+    /// The picture the page was read from, by workspace path: a mind map shows it under itself.
+    var picture: String?
     /// An entity id, and the block whose text named it.
     var onOpenEntity: ((String, Int?) -> Void)?
     /// A wikilink or workspace path to follow, and the block it sits in: where a way back returns to.
@@ -44,17 +48,23 @@ struct MarkdownText: View {
     /// Blocks lit up after a jump, and which jump lit them.
     @State private var flashed: Set<Int> = []
     @State private var flashGeneration = 0
+    /// Counts the times new blocks went to the stack: a jump into a document
+    /// waits for its blocks to be there, since one made the moment they are
+    /// set lands among the previous document's (block ids are positions).
+    @State private var drawn = 0
 
     init(
         markdown: String,
         mentions: [EntityMention] = [],
         scrollTarget: Binding<MarkdownScrollTarget?> = .constant(nil),
+        picture: String? = nil,
         onOpenEntity: ((String, Int?) -> Void)? = nil,
         onOpenKnowledgeLink: ((String, Int?) -> Void)? = nil
     ) {
         self.markdown = markdown
         self.mentions = mentions
         _scrollTarget = scrollTarget
+        self.picture = picture
         self.onOpenEntity = onOpenEntity
         self.onOpenKnowledgeLink = onOpenKnowledgeLink
     }
@@ -81,17 +91,19 @@ struct MarkdownText: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .environment(\.openURL, OpenURLAction { url in open(url, proxy) })
             .task(id: RenderKey(markdown: markdown, mentions: mentions)) {
-                await render()
-                reveal(scrollTarget, proxy)
+                // new blocks bring the jump through `drawn` once the stack holds them; without any it can go now
+                if !(await render()) { reveal(scrollTarget, proxy) }
             }
+            .onChange(of: drawn) { reveal(scrollTarget, proxy) }
             .onChange(of: scrollTarget) { _, target in reveal(target, proxy) }
         }
     }
 
-    private func render() async {
+    /// Parse and mark what changed; true when new blocks went to the stack.
+    private func render() async -> Bool {
         let source = markdown
         let marks = mentions
-        guard document.source != source || markedWith != marks || blocks.count != document.blocks.count else { return }
+        guard document.source != source || markedWith != marks || blocks.count != document.blocks.count else { return false }
         let reparse = document.source != source
         if source.count <= Self.asyncParseThreshold {
             if reparse { document = MarkdownDocument(source: source) }
@@ -102,11 +114,13 @@ struct MarkdownText: View {
                 let parsed = reparse ? MarkdownDocument(source: source) : current
                 return (parsed, parsed.marking(marks))
             }.value
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else { return false }
             document = parsed
             blocks = marked
         }
         markedWith = marks
+        drawn &+= 1
+        return true
     }
 
     /// The links the view answers itself — a note, the way back from one, an entity — and the in-app ones it hands up.
@@ -213,6 +227,10 @@ struct MarkdownText: View {
         case .code(let code, let language) where language?.lowercased() == "chart" && ChartSpec.parse(code) != nil:
             // a research page's chart: data in the page, drawn here (MarkdownChart.swift)
             MarkdownChart(spec: ChartSpec.parse(code)!)
+        case .mindMap(let map):
+            // its folds and modes belong to this outline: another page starts afresh
+            MarkdownMindMap(map: map, picture: picture)
+                .id(map.signature)
         case .code(let code, let language):
             ScrollView(.horizontal) {
                 Text(code)
@@ -631,6 +649,7 @@ private struct MarkdownDocument {
             case .quote(let text): kind = .quote(matcher.mark(text, in: block.id, seen: &section))
             case .unordered(let items): kind = .unordered(items.map { $0.with(matcher.mark($0.text, in: block.id, seen: &section)) })
             case .ordered(let items): kind = .ordered(items.map { $0.with(matcher.mark($0.text, in: block.id, seen: &section)) })
+            case .mindMap(let map): kind = .mindMap(map.marking { matcher.mark($0, in: block.id, seen: &section) })
             default: kind = block.kind
             }
             seen[block.section] = section
@@ -652,6 +671,8 @@ private struct MarkdownBlock: Identifiable {
         case code(String, String?)
         case table(Table)
         case frontmatter(Frontmatter)
+        /// A `type: MindMap` page's outline, drawn as its tree.
+        case mindMap(MindMapFigure)
         case note(Note)
         /// An export's `<a id="…"></a>`: nothing to see, somewhere to land.
         case anchor(String)
@@ -858,6 +879,17 @@ private func parseMarkdown(_ source: String) -> ParsedMarkdown {
        let end = lines.dropFirst().firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "---" }) {
         frontmatter = lines[1..<end].joined(separator: "\n")
         index = end + 1
+    }
+
+    // a `type: MindMap` page is an outline drawn as its tree, as on the web; one that holds no tree reads as text
+    if let frontmatter, MindMapOutline.isMindMap(frontmatter: frontmatter),
+       let outline = MindMapOutline.parse(lines[index...].joined(separator: "\n")) {
+        var out = ParsedMarkdown()
+        out.blocks = [
+            MarkdownBlock(id: 0, kind: .frontmatter(frontmatterBlock(frontmatter, block: 0)), section: 0, markable: false),
+            MarkdownBlock(id: 1, kind: .mindMap(MindMapFigure(outline)), section: 0, markable: true),
+        ]
+        return out
     }
 
     let raw = rawBlocks(lines, from: index)

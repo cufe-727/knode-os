@@ -469,8 +469,10 @@ struct FileBrowserView: View {
                 } else {
                     ScrollView {
                         Group {
-                            if selectedPath.hasSuffix(".md") || selectedPath.hasSuffix(".markdown") {
-                                MarkdownText(markdown: content, mentions: mentions, scrollTarget: $scrollTarget, onOpenEntity: { id, block in
+                            // what knode-os derived from a PDF, a saved web page or a picture is Markdown too, shown as
+                            // the web file view shows it; a mind map read off a picture is drawn as its tree (docs/design/19)
+                            if isDerived || selectedPath.hasSuffix(".md") || selectedPath.hasSuffix(".markdown") {
+                                MarkdownText(markdown: content, mentions: mentions, scrollTarget: $scrollTarget, picture: Self.mindMapPicture(for: selectedPath), onOpenEntity: { id, block in
                                     openEntity(id, from: block)
                                 }) { target, block in
                                     Task { await openKnowledgeLink(target, from: selectedPath, block: block) }
@@ -1095,11 +1097,13 @@ struct FileBrowserView: View {
         }
     }
 
-    private func openFile(_ path: String) async {
+    /// `whole`: read past the preview cap, as far as the edit cap, for a link
+    /// into the file whose #fragment may lie beyond the preview (a filing's later sections).
+    private func openFile(_ path: String, whole: Bool = false) async {
         isWorking = true
         defer { isWorking = false }
         do {
-            let response = try await read(path)
+            let response = try await read(path, maxBytes: whole ? Self.editByteCap : nil)
             // a request's answer was about the file it was made for
             if response.path != selectedPath { translationProcessing = nil }
             selectedPath = response.path
@@ -1121,16 +1125,16 @@ struct FileBrowserView: View {
     /// known, or a pick this workspace does not offer — and reading again
     /// would show something else: a translation that exists, or the original
     /// instead of one.
-    private func read(_ path: String) async throws -> FileResponse {
+    private func read(_ path: String, maxBytes: Int? = nil) async throws -> FileResponse {
         // the originals need no language: the original is what comes without one
         let asked = readingLanguagePick == Self.originalsPick ? nil : readingLanguagePick.isEmpty ? workspacePrimary : readingLanguagePick
-        let response = try await model.client().file(at: path, lang: asked)
+        let response = try await model.client().file(at: path, maxBytes: maxBytes, lang: asked)
         guard let languages = response.languages, let wanted = readingLanguage(for: languages), wanted != asked else { return response }
         let worthReading = ContentLanguage.same(wanted, languages.source)
             ? response.translation != nil
             : ["done", "partial"].contains(languages.translations[wanted]?.status ?? "")
         guard worthReading else { return response }
-        return try await model.client().file(at: path, lang: wanted)
+        return try await model.client().file(at: path, maxBytes: maxBytes, lang: wanted)
     }
 
     /// The language to read a document in: its own for a reader who picked
@@ -1287,7 +1291,8 @@ struct FileBrowserView: View {
             }
             guard let path = resolved.path else { return }
             if path != selectedPath {
-                await leave(for: path, returningTo: block)
+                // the place may lie past the preview cap, so a file opened at one is read whole, as on the web
+                await leave(for: path, returningTo: block, whole: resolved.fragment != nil)
             }
             scrollTarget = resolved.fragment.map(MarkdownScrollTarget.fragment)
         } catch {
@@ -1308,10 +1313,10 @@ struct FileBrowserView: View {
     }
 
     /// Open another file, remembering this one and where in it the reader was, for ‹.
-    private func leave(for path: String, returningTo block: Int?) async {
+    private func leave(for path: String, returningTo block: Int?, whole: Bool = false) async {
         let origin = selectedPath.map { FileReturn(path: $0, block: block) }
         await showInTree(path)
-        await openFile(path)
+        await openFile(path, whole: whole)
         guard let origin, selectedPath == path else { return }
         backTrail.append(origin)
         if backTrail.count > 50 { backTrail.removeFirst() }
@@ -1889,6 +1894,17 @@ struct FileBrowserView: View {
     /// owner writes, which stay out of moves, renames and deletes all the same.
     private func isEditablePath(_ path: String) -> Bool {
         isWritable(path) || TreeNode.ownerRootFiles.contains(path)
+    }
+
+    /// The picture a mind map on `path` was read from, as the web file view
+    /// finds it: the picture itself, its derived Markdown on screen, or the one
+    /// a reviewed transcript (`x.webp.md`) sits beside.
+    private static func mindMapPicture(for path: String) -> String? {
+        let pictures: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tif", "tiff", "heic", "heif", "svg"]
+        let isPicture = { (path: String) in pictures.contains((path as NSString).pathExtension.lowercased()) }
+        if isPicture(path) { return path }
+        let original = String(path.dropLast(3))
+        return path.lowercased().hasSuffix(".md") && isPicture(original) ? original : nil
     }
 }
 
