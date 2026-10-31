@@ -112,13 +112,20 @@
     <header>
       <div class="brand"><img src="/favicon.svg" alt="" />knode-os</div>
       <nav id="tabs" aria-label="Primary navigation">
-        <button data-section="library" class="active" title="Files, search, and agent traces">Library</button>
-        <button data-section="ask" title="An agent that answers from your workspace">Ask</button>
-        <button data-section="studies" title="Research a topic into several wiki pages: refine the question, collect sources, write the pages">Research</button>
-        <button data-section="knowledge" title="Graph, wiki, and nightly review">Knowledge</button>
+        <button data-section="library" class="active" title="Files and the data you import">Library</button>
+        <button data-section="explore" title="Search, ask, or research your knowledge">Explore</button>
+        <button data-section="knowledge" title="Graph, entities, and wiki">Knowledge</button>
+        <button data-section="tasks" title="What is processing, who is working on it, and the nightly Dream">Tasks<span id="tasks-badge" class="nav-badge" hidden></span></button>
         <button data-section="settings" title="Model routes and pipeline limits">Settings</button>
       </nav>
-      <div id="statsbar" title="documents / chunks / entities / relations"></div>
+      <!-- One box above every view (docs/design/20): suggestions while typing, then Search, Ask or Research the text. -->
+      <div class="global-search" role="search">
+        <span class="global-search-icon" aria-hidden="true">⌕</span>
+        <input id="global-search" type="search" placeholder="Search, ask, or research…" autocomplete="off" spellcheck="false"
+          role="combobox" aria-label="Search, ask, or research" aria-autocomplete="list" aria-expanded="false" aria-controls="global-search-menu" />
+        <kbd class="global-search-key" title="⌘K or / focuses the box">⌘K</kbd>
+        <div id="global-search-menu" class="global-search-menu" role="listbox" hidden></div>
+      </div>
       <div class="notices-area">
         <button id="notices-toggle" class="notices-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="notices-panel" title="What this workspace needs you to know" hidden></button>
         <div id="notices-panel" class="notices-panel" role="region" aria-label="Notices" hidden></div>
@@ -157,7 +164,8 @@
       <aside id="filetree-pane">
         <div class="pane-actions">
           <button id="btn-refresh-tree" title="Refresh — reread the workspace tree from disk">⟳</button>
-          <button id="btn-add" title="Add — a new file or folder, documents uploaded from disk, or a folder from this Mac (copied once, or linked and kept in sync), into the folder shown below">＋ add</button>
+          <button id="btn-import" class="primary" title="Import data — files or a folder uploaded from disk, a folder linked from the service's machine and kept in sync, or your Claude Code and Codex sessions">⤓ Import data</button>
+          <button id="btn-add" title="New — a file or a folder in the folder shown below">＋ new</button>
           <button id="btn-ingest" title="Index — turn new and changed files into knowledge: chunk, embed, extract entities and refresh the wiki. The CLI calls this ingest / sync.">⛁ index</button>
           <input type="file" id="file-upload" multiple hidden />
           <input type="file" id="folder-upload" webkitdirectory hidden />
@@ -207,22 +215,36 @@
       </aside>
     </section>
 
-    <!-- Search -->
+    <!-- Explore → Search: what a query matches, channel by channel (docs/design/20) -->
     <section id="tab-search" class="tab">
-      <div class="searchbar">
-        <input id="search-q" placeholder="search the knowledge base…" />
-        <select id="search-mode">
-          <option value="hybrid">hybrid</option>
-          <option value="sag">SAG multi-hop</option>
-          <option value="vector">vector</option>
-          <option value="keyword">keyword</option>
+      <form id="search-form" class="searchbar explore-bar" role="search">
+        <input id="search-q" type="search" placeholder="Search the knowledge base — a name, a phrase, a question…" autocomplete="off" />
+        <select id="search-mode" title="How passages are recalled">
+          <option value="hybrid" title="Semantic, keyword and entity channels, fused">Hybrid</option>
+          <option value="sag" title="Direct matches, then passages reached through the entities they mention">Multi-hop</option>
+          <option value="vector" title="Vector similarity only">Semantic only</option>
+          <option value="keyword" title="Full text only (CJK by substrings)">Keyword only</option>
         </select>
-        <select id="search-scope" title="Limit the search to the folder picked in Files">
-          <option value="">whole base</option>
+        <select id="search-scope" title="Limit the search to a folder — the one picked in Files is offered here">
+          <option value="">Whole base</option>
         </select>
-        <button id="btn-search">search</button>
+        <button id="btn-search" type="submit" class="primary">Search</button>
+      </form>
+      <div id="search-summary" class="search-summary" hidden></div>
+      <div id="search-body" class="search-body">
+        <div class="search-main">
+          <div id="search-main-head" class="search-main-head" hidden>
+            <span id="search-count" class="hint"></span>
+            <span class="spacer"></span>
+            <div class="seg" role="group" aria-label="Show">
+              <button type="button" data-view="passages" class="active">Passages</button>
+              <button type="button" data-view="documents">By document</button>
+            </div>
+          </div>
+          <div id="search-results"></div>
+        </div>
+        <aside id="search-side" class="search-side" hidden></aside>
       </div>
-      <div id="search-results"></div>
     </section>
 
     <!-- Ask: every question is one session of the configured agent over MCP. -->
@@ -319,22 +341,64 @@
       </table>
     </section>
 
-    <!-- Traces -->
-    <section id="tab-traces" class="tab">
-      <div class="searchbar">
-        <button id="btn-trace-sync">sync now</button>
-        <span class="hint">Claude Code + Codex session transcripts are mirrored into <span class="mono">raw/traces/</span> — click a row to open it. They feed the nightly dream; turn on <span class="mono">trace.episodes</span> in <span class="mono">knode.config.json</span> to make them searchable too.</span>
+    <!-- Tasks → Queue: everything under way and waiting (docs/design/20) -->
+    <section id="tab-queue" class="tab">
+      <div class="tasks-wrap">
+        <div class="tasks-hero">
+          <div id="tasks-processing" class="tasks-processing"></div>
+          <div id="tasks-stats" class="tasks-stats" title="documents / chunks / entities / relations / traces"></div>
+        </div>
+        <div class="tasks-section-head"><h3>Pipeline</h3><span class="hint">A document moves left to right; each stage says what waits, what is out now and what was done in the last hour.</span></div>
+        <div id="tasks-stages" class="tasks-stages"></div>
+        <div class="tasks-grid">
+          <section class="tasks-card tasks-span">
+            <div class="tasks-card-head"><h3>In flight</h3><span id="tasks-inflight-count" class="tasks-count"></span><span class="hint">model calls out right now, and who holds them</span></div>
+            <div id="tasks-inflight"></div>
+          </section>
+          <section class="tasks-card">
+            <div class="tasks-card-head"><h3>Workers</h3><span id="tasks-workers-count" class="tasks-count"></span></div>
+            <div id="tasks-workers"></div>
+          </section>
+          <section class="tasks-card">
+            <div class="tasks-card-head"><h3>Jobs</h3><span id="tasks-jobs-count" class="tasks-count"></span><span class="hint">research, studies and Ask</span></div>
+            <div id="tasks-jobs"></div>
+          </section>
+          <section class="tasks-card">
+            <div class="tasks-card-head"><h3>Background</h3><span class="hint">syncs, imports, Dream</span></div>
+            <div id="tasks-activity"></div>
+          </section>
+          <section class="tasks-card">
+            <div class="tasks-card-head"><h3>Schedule</h3></div>
+            <div id="tasks-schedule"></div>
+          </section>
+          <section id="tasks-errors-card" class="tasks-card tasks-span" hidden>
+            <div class="tasks-card-head"><h3>Failed to index</h3><span id="tasks-errors-count" class="tasks-count bad"></span></div>
+            <div id="tasks-errors"></div>
+          </section>
+        </div>
       </div>
-      <table id="traces-table"><thead><tr><th>source</th><th>project</th><th>session</th><th>started</th><th>size</th><th>analyzed</th></tr></thead><tbody></tbody></table>
     </section>
 
-    <!-- Dream -->
+    <!-- Tasks → Dream: the nightly review of agent traces, and the traces it reads -->
     <section id="tab-dream" class="tab">
-      <div class="searchbar">
-        <button id="btn-dream">☾ dream now</button>
-        <span class="hint" id="dream-info">analyzes recent traces → suggestions for skills, memory and knowledge</span>
+      <div class="dream-head">
+        <div>
+          <p class="section-index">NIGHTLY REVIEW</p>
+          <h3 class="dream-title">Dream</h3>
+          <p class="hint" id="dream-schedule">Reads your recent Claude Code and Codex sessions and suggests skills, memory and knowledge to keep.</p>
+          <p class="hint" id="dream-info"></p>
+        </div>
+        <div class="dream-actions">
+          <button id="btn-trace-sync" type="button" title="Copy new Claude Code and Codex sessions from this Mac into raw/traces">Collect agent traces</button>
+          <button id="btn-dream" type="button" class="primary">☾ Dream now</button>
+        </div>
       </div>
       <div id="suggestions"></div>
+      <details id="dream-traces" class="dream-traces">
+        <summary>Agent traces Dream reads <span id="traces-count" class="hint"></span></summary>
+        <p class="hint">Claude Code and Codex session transcripts mirrored into <span class="mono">raw/traces/</span> — click a row to open it. Turn on <span class="mono">trace.episodes</span> in <span class="mono">knode.config.json</span> to make them searchable too.</p>
+        <table id="traces-table"><thead><tr><th>source</th><th>project</th><th>session</th><th>started</th><th>size</th><th>analyzed</th></tr></thead><tbody></tbody></table>
+      </details>
     </section>
 
     <!-- Wiki: deep-research pages -->

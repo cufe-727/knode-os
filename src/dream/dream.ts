@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { activityOf } from '../activity.js';
 import { addMinutesToTimeOfDay, KnodeConfig, normalizeTimeOfDay } from '../config.js';
 import { AppContext } from '../context.js';
 import { appendLog } from '../fs/datadir.js';
@@ -468,7 +469,7 @@ export function startDreamScheduler(ctx: AppContext, log: (msg: string) => void)
     if (hhmm === nightlySchedule(ctx.config)?.dream && lastRun !== today) {
       lastRun = today;
       try {
-        const res = await runDream(ctx.store, ctx.config, ctx.llm, { onProgress: log });
+        const res = await activityOf(ctx.dataDir).run('dream', 'Nightly Dream over recent agent traces', () => runDream(ctx.store, ctx.config, ctx.llm, { onProgress: log }), (r) => `${r.suggestions.length} suggestions`);
         log(`nightly dream done: ${res.suggestions.length} suggestions`);
       } catch (err) {
         log(`nightly dream failed: ${err instanceof Error ? err.message : err}`);

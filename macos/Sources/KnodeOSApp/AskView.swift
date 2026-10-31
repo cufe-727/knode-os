@@ -35,6 +35,15 @@ struct AskView: View {
         .background(Color(nsColor: .textBackgroundColor).opacity(0.22))
         .task { await load() }
         .onDisappear { pollTask?.cancel() }
+        // a question from the search field, or a conversation Tasks opened, while this screen is up
+        .onChange(of: model.pendingQuestion) { _, pending in
+            guard pending != nil, let question = model.consumePendingQuestion() else { return }
+            Task { await ask(question) }
+        }
+        .onChange(of: model.pendingConversationID) { _, pending in
+            guard pending != nil, let id = model.consumePendingConversation() else { return }
+            Task { await open(id) }
+        }
     }
 
     private var sidebar: some View {
@@ -268,10 +277,27 @@ struct AskView: View {
         do {
             conversations = try await model.client().chatConversations()
             errorMessage = nil
-            if let id = activeId ?? conversations.first?.id { await open(id) }
+            if let id = model.consumePendingConversation() ?? activeId ?? conversations.first?.id { await open(id) }
         } catch {
             errorMessage = error.localizedDescription
         }
+        if let question = model.consumePendingQuestion() { await ask(question) }
+    }
+
+    /// A question from elsewhere — the search field: a new conversation that
+    /// sends it at once, or, when Ask cannot answer, the composer holding it.
+    private func ask(_ question: String) async {
+        guard isReady else {
+            draft = question
+            composerFocused = true
+            return
+        }
+        guard await newConversation() != nil else {
+            draft = question
+            return
+        }
+        draft = question
+        await send()
     }
 
     private func open(_ id: String) async {

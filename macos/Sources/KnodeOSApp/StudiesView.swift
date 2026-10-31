@@ -53,8 +53,20 @@ struct StudiesView: View {
             }
         }
         .background(Color(nsColor: .textBackgroundColor).opacity(0.22))
-        .task { await load() }
+        .task {
+            await load()
+            await takeHandOffs()
+        }
         .onDisappear { poller?.cancel() }
+        // a topic from the search field, or a study Tasks opened, while this screen is up
+        .onChange(of: model.pendingResearchTopic) { _, pending in
+            guard pending != nil else { return }
+            Task { await takeHandOffs() }
+        }
+        .onChange(of: model.pendingStudyID) { _, pending in
+            guard pending != nil else { return }
+            Task { await takeHandOffs() }
+        }
         // a study spends an agent's quota for an hour or more: what it would take, before it starts
         .sheet(isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
             if let d = confirming {
@@ -321,6 +333,22 @@ struct StudiesView: View {
 
     /* ------------------------------------------------------------- actions */
 
+    /// What another screen handed over: a study to open, or a topic for the
+    /// composer. A topic waits there — refining it spends a model call, so the
+    /// click that starts it stays the person's.
+    private func takeHandOffs() async {
+        if let id = model.consumePendingStudy() {
+            await open(id)
+        }
+        if let pending = model.consumePendingResearchTopic() {
+            poller?.cancel()
+            selected = nil
+            detail = nil
+            topic = pending
+            errorMessage = nil
+        }
+    }
+
     private func load() async {
         guard let api = try? model.client() else { return }
         do {
@@ -428,7 +456,7 @@ struct StudiesView: View {
 }
 
 /// A job or step status as a small coloured label.
-private struct StatusChip: View {
+struct StatusChip: View {
     let status: String
 
     private var color: Color {
@@ -441,7 +469,7 @@ private struct StatusChip: View {
     }
 
     var body: some View {
-        Text(status)
+        Text(L(status))
             .font(.system(size: 10, weight: .semibold, design: .monospaced))
             .foregroundStyle(color)
             .padding(.horizontal, 6)

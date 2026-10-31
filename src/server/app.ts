@@ -100,7 +100,11 @@ import { historyOf, lineageOf } from '../lineage/inspect.js';
 import { forgetSource, purgeArchived, purgeDisposed } from '../lineage/purge.js';
 import { rebuild } from '../lineage/rebuild.js';
 import { ask } from '../search/ask.js';
+import { exploreSearch, searchSuggest } from '../search/explore.js';
 import { search, SearchMode } from '../search/search.js';
+import { activityOf, describeSync } from '../activity.js';
+import type { EmbeddingBackfill } from '../ingest/embed-backfill.js';
+import { tasksSnapshot } from './tasks.js';
 import { planOnly, resolve } from '../compiler/resolve.js';
 import { liveAbsences } from '../compiler/absence.js';
 import { distillRecipes } from '../compiler/distill.js';
@@ -240,6 +244,8 @@ export interface WorkspaceServices {
   translations?: TranslateSource | null;
   /** What answered calls cost, measured by the broker — an estimate's averages (src/estimate/ledger.ts). */
   calls?: CallLedger | null;
+  /** Vectors computed after a document is indexed (src/ingest/embed-backfill.ts): what Tasks shows of embedding. */
+  embeddings?: EmbeddingBackfill | null;
 }
 
 /**
@@ -1050,7 +1056,7 @@ export function createApp(
           // reused, only missing vectors are computed); a new dimension
           // rebuilds the embeddings table first
           if (reembed && dimChanged) await ctx.store.setEmbeddingDimension(next.embedding.dimensions);
-          reindex = await sync(ctx, { onProgress: log });
+          reindex = await activityOf(ctx.dataDir).run('sync', reembed ? 'Re-embed every document for the new model' : 'Re-convert images and scans for the new route', () => sync(ctx, { onProgress: log }), describeSync);
         } finally {
           ingestRunning.delete(ctx.dataDir);
         }
@@ -1451,9 +1457,12 @@ export function createApp(
         };
       const opts = { dest: body.dest, replace: Boolean(body.replace), policy: importPolicy, onProgress: log, background };
       const folders = services?.folders ?? null;
-      const result = mode === 'link' && folders
-        ? await folders.add(String(body.source ?? ''), opts)
-        : await importFolder(ctx, String(body.source ?? ''), { ...opts, mode });
+      const result = await activityOf(ctx.dataDir).run(
+        'folder',
+        `${mode === 'link' ? 'Link' : 'Import'} ${String(body.source ?? '')}`,
+        () => (mode === 'link' && folders ? folders.add(String(body.source ?? ''), opts) : importFolder(ctx, String(body.source ?? ''), { ...opts, mode })),
+        (r) => `${r.copied.length} files copied into ${r.dest}`,
+      );
       return c.json({ ok: true, ...result });
     } catch (e) {
       return c.json(err(e), e instanceof FolderImportConflict ? 409 : 400);
@@ -1502,7 +1511,7 @@ export function createApp(
     if (ingestRunning.has(ctx.dataDir)) return c.json({ error: 'ingest already running' }, 409);
     ingestRunning.add(ctx.dataDir);
     try {
-      const stats = await sync(ctx, { onProgress: log });
+      const stats = await activityOf(ctx.dataDir).run('ingest', 'Index new and changed files', () => sync(ctx, { onProgress: log }), describeSync);
       return c.json(stats);
     } catch (e) {
       return c.json(err(e), 500);
@@ -1517,7 +1526,8 @@ export function createApp(
     ingestRunning.add(ctx.dataDir);
     try {
       const body = (await c.req.json().catch(() => ({}))) as { only?: string[]; verify?: boolean };
-      return c.json(await sync(ctx, { only: Array.isArray(body.only) ? body.only.map(String) : undefined, verify: Boolean(body.verify), onProgress: log }));
+      const only = Array.isArray(body.only) ? body.only.map(String) : undefined;
+      return c.json(await activityOf(ctx.dataDir).run('sync', `Sync ${only?.length ? only.join(', ') : 'everything'}`, () => sync(ctx, { only, verify: Boolean(body.verify), onProgress: log }), describeSync));
     } catch (e) {
       return c.json(err(e), 500);
     } finally {
@@ -1609,6 +1619,38 @@ export function createApp(
       }));
     } catch (e) {
       return c.json(err(e), status(e));
+    }
+  });
+
+  // Explore → Search: passages with their rank in each channel, the entities the query names, their relations and claims
+  app.get('/api/search/explore', async (c) => {
+    const ctx = requestCtx(c);
+    const q = c.req.query('q')?.trim();
+    if (!q) return c.json({ error: 'q required' }, 400);
+    const modeParam = c.req.query('mode') ?? 'hybrid';
+    if (!['hybrid', 'vector', 'keyword', 'sag'].includes(modeParam)) {
+      return c.json({ error: `unsupported search mode: ${modeParam}` }, 400);
+    }
+    try {
+      return c.json(await exploreSearch(ctx.store, ctx.embedder, q, {
+        k: Math.min(50, Math.max(1, Number(c.req.query('k') ?? 20) || 20)),
+        mode: modeParam as SearchMode,
+        heat: ctx.config.heat,
+        sag: ctx.config.retrieval.sag,
+        filter: resolveScopeFilter({ kinds: csv(c.req.query('kinds')), sources: csv(c.req.query('sources')) }),
+      }));
+    } catch (e) {
+      return c.json(err(e), status(e));
+    }
+  });
+
+  // what a search box offers while someone types: entities and documents by name, no model involved
+  app.get('/api/search/suggest', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      return c.json(await searchSuggest(ctx.store, c.req.query('q') ?? '', Number(c.req.query('limit') ?? 6)));
+    } catch (e) {
+      return c.json(err(e), 500);
     }
   });
 
@@ -1974,7 +2016,7 @@ export function createApp(
   app.post('/api/datasources/sync', async (c) => {
     const ctx = requestCtx(c);
     try {
-      const stats = await sync(ctx, { only: ['datasources'], onProgress: log });
+      const stats = await activityOf(ctx.dataDir).run('datasources', 'Refresh datasource schemas', () => sync(ctx, { only: ['datasources'], onProgress: log }), (r) => `${r.pagesRegenerated} wiki pages refreshed`);
       return c.json({ sources: ctx.config.datasources.length, wikiPages: stats.pagesRegenerated, errors: stats.datasourceErrors, disposed: stats.disposed });
     } catch (e) {
       return c.json(err(e), 500);
@@ -2024,7 +2066,7 @@ export function createApp(
   app.post('/api/traces/sync', async (c) => {
     const ctx = requestCtx(c);
     try {
-      return c.json(await syncTraces(ctx.store, ctx.config, { ignoreSince: true }));
+      return c.json(await activityOf(ctx.dataDir).run('traces', 'Collect agent traces', () => syncTraces(ctx.store, ctx.config, { ignoreSince: true }), (r) => `${r.copied} traces, ${r.skills} skill files`));
     } catch (e) {
       return c.json(err(e), 500);
     }
@@ -2823,6 +2865,16 @@ export function createApp(
     }
   });
 
+  // Tasks → Queue: the document pipeline, the calls out now and who holds them, the workers, jobs and what runs on a clock
+  app.get('/api/tasks', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      return c.json(await tasksSnapshot(ctx, servicesFor(ctx)));
+    } catch (e) {
+      return c.json(err(e), 500);
+    }
+  });
+
   // the labeling scheduler, the summary and judge sources and this machine's worker slots, for the UI;
   // `scheduler.workers` lists every worker the broker saw, whatever it took
   app.get('/api/labeling/status', async (c) => {
@@ -2895,7 +2947,7 @@ export function createApp(
   app.post('/api/dream', async (c) => {
     const ctx = requestCtx(c);
     try {
-      const res = await runDream(ctx.store, ctx.config, ctx.llm, { onProgress: log });
+      const res = await activityOf(ctx.dataDir).run('dream', 'Dream over recent agent traces', () => runDream(ctx.store, ctx.config, ctx.llm, { onProgress: log }), (r) => `${r.suggestions.length} suggestions`);
       return c.json(res);
     } catch (e) {
       return c.json(err(e), 500);

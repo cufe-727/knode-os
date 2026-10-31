@@ -17,7 +17,7 @@ export const API_GROUPS = {
   search: 'search, graph, entities, documents, claims, stats, notices, lineage and history',
   ask: 'Ask, chat and context packs',
   knowledge: 'wiki, research, dream, suggestions, merges and reviews',
-  ingest: 'sync, ingest, forget, purge, rebuild and labeling status',
+  ingest: 'sync, ingest, forget, purge, rebuild, labeling status and the task queue',
   traces: 'agent traces',
   datasources: 'configured live datasources and their read-only queries',
   settings: 'workspace settings — models, connections, agents, profiles, playbooks — clearing a workspace, and importing or linking a folder from this machine',
@@ -52,6 +52,8 @@ const RULES: Rule[] = [
   { prefix: '/api/chat/readiness', group: null },
   { prefix: '/api/languages', group: null, methods: READ },
   { prefix: '/api/labeling/status', group: 'ingest' },
+  // what is under way and waiting — the same counts as the labeling status, and the jobs and syncs beside them
+  { prefix: '/api/tasks', group: 'ingest' },
   // what starting it would spend is anyone's to see who may see its status (a balance only an administrator's)
   { prefix: '/api/labeling/estimate', group: 'ingest' },
   // starting the processing spends the machine's model quota: an administrator's call

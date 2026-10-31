@@ -408,6 +408,44 @@ struct APIClient {
         return try await send(path("/api/search", query: items))
     }
 
+    /// Explore → Search: the retrieval the agents use, asked to explain itself
+    /// (docs/design/20 §2). `mode` is hybrid, sag (multi-hop), vector or
+    /// keyword; `sources` a path prefix, as for `search`.
+    func explore(_ query: String, mode: String, limit: Int = 20, sources: String? = nil) async throws -> ExploreResponse {
+        var items: [URLQueryItem] = [
+            .init(name: "q", value: query),
+            .init(name: "mode", value: mode),
+            .init(name: "k", value: String(limit)),
+        ]
+        if let sources, !sources.isEmpty { items.append(.init(name: "sources", value: sources)) }
+        return try await send(path("/api/search/explore", query: items))
+    }
+
+    /// Entities and documents whose names hold `query`, for the search field.
+    func suggest(_ query: String, limit: Int = 5) async throws -> SuggestResponse {
+        try await send(path("/api/search/suggest", query: [
+            .init(name: "q", value: query),
+            .init(name: "limit", value: String(limit)),
+        ]))
+    }
+
+    /// Tasks → Queue: the pipeline, the calls out now, workers, jobs, background work and the schedule.
+    func tasks() async throws -> TasksSnapshot {
+        try await send("/api/tasks")
+    }
+
+    /// What linking (or importing) `source` — a folder on the service's machine — into `dest` would carry.
+    func previewFolder(source: String, dest: String) async throws -> FolderImportPlan {
+        struct Body: Encodable { var source: String; var dest: String }
+        return try await send("/api/folders/preview", method: "POST", body: encoded(Body(source: source, dest: dest)))
+    }
+
+    /// Mirror a folder of the service's machine under raw/docs: `link` keeps it in sync, `copy` copies it once.
+    func importFolder(source: String, dest: String, mode: String, replace: Bool) async throws -> FolderImportResult {
+        struct Body: Encodable { var source: String; var dest: String; var mode: String; var replace: Bool }
+        return try await send("/api/folders/import", method: "POST", body: encoded(Body(source: source, dest: dest, mode: mode, replace: replace)))
+    }
+
     /// An empty query is the overview — the top entities by mentions, `limit`
     /// of them, `types` only, with (`edges` = all) or without (`typed`) the
     /// derived co-occurrence edges. A name is the local graph `depth` hops
