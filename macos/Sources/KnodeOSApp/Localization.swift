@@ -1678,6 +1678,8 @@ private let zhHansPairs: [(String, String)] = [
     ("and %@ more", "还有 %@ 个"),
     // what the service says about a stage or its background work, in its own words
     ("waits for processing to start", "等待处理启动"),
+    ("not counted until processing starts", "处理启动后才会统计"),
+    ("This machine's slots start with processing; remote workers appear here once they ask for work.", "本机的处理槽位随处理启动；远程 worker 领取任务后会出现在这里。"),
     ("The provider could not serve — retrying at %@", "提供方暂时无法服务——将于 %@ 重试"),
     ("syncing now", "正在同步"),
     ("Index new and changed files", "索引新增与改动的文件"),

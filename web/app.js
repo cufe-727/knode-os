@@ -1558,7 +1558,9 @@ function paintTasksWorkers(t) {
   $('#tasks-workers-count').textContent = t.workers.length ? `${online} of ${t.workers.length} online` : '';
   const el = $('#tasks-workers');
   if (!t.workers.length) {
-    el.innerHTML = `<p class="hint">${t.serving ? 'No model slots on this machine and no remote worker has asked for work. Slots come from the stage routes in Settings → Ingest; remote workers connect with a token (knode-os remote token create).' : 'Workers run inside knode-os serve.'}</p>`;
+    el.innerHTML = `<p class="hint">${!t.serving ? 'Workers run inside knode-os serve.'
+      : t.processing && !t.processing.running ? "This machine's slots start with processing; remote workers appear here once they ask for work."
+        : 'No model slots on this machine and no remote worker has asked for work. Slots come from the stage routes in Settings → Ingest; remote workers connect with a token (knode-os remote token create).'}</p>`;
     return;
   }
   el.innerHTML = t.workers.map((w) => {
