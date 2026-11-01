@@ -133,3 +133,96 @@ describe('derived co-occurrence', () => {
     expect((await coOccurringEntities(store, ['alpha'])).find((x) => x.target === 'beta')).toMatchObject({ documents: 1, chunks: 0 });
   });
 });
+
+/**
+ * The derivation reads the seeds' recent documents' own mention rows; this is
+ * what it must equal — the same counts joined against every mention row.
+ */
+const JOIN_EVERY_MENTION = (among: boolean) => `
+  WITH seed_docs AS (
+    SELECT entity_id, document_id FROM (
+      SELECT x.entity_id, x.document_id,
+             row_number() OVER (PARTITION BY x.entity_id ORDER BY x.doc_date DESC NULLS LAST, x.updated_at DESC, x.document_id) AS rn
+      FROM (
+        SELECT DISTINCT m.entity_id, m.document_id, d.doc_date, d.updated_at
+        FROM entity_mentions m JOIN documents d ON d.id = m.document_id
+        WHERE m.entity_id = ANY($1::text[]) AND d.status = 'indexed'
+      ) x
+    ) recent
+    WHERE rn <= $2
+  ),
+  seed AS (
+    SELECT DISTINCT m.entity_id, m.chunk_id, m.document_id
+    FROM seed_docs sd JOIN entity_mentions m ON m.entity_id = sd.entity_id AND m.document_id = sd.document_id
+  ),
+  by_chunk AS (
+    SELECT s.entity_id AS source, o.entity_id AS target, count(DISTINCT s.chunk_id)::int AS chunks
+    FROM seed s JOIN entity_mentions o ON o.chunk_id = s.chunk_id AND o.entity_id <> s.entity_id ${among ? 'AND o.entity_id = ANY($4::text[])' : ''}
+    GROUP BY s.entity_id, o.entity_id
+  ),
+  by_document AS (
+    SELECT s.entity_id AS source, o.entity_id AS target, count(DISTINCT s.document_id)::int AS documents
+    FROM seed_docs s JOIN entity_mentions o ON o.document_id = s.document_id AND o.entity_id <> s.entity_id ${among ? 'AND o.entity_id = ANY($4::text[])' : ''}
+    GROUP BY s.entity_id, o.entity_id
+  ),
+  scored AS (
+    SELECT bd.source, bd.target, bd.documents, COALESCE(bc.chunks, 0) AS chunks,
+           COALESCE(bc.chunks, 0) * ${CO_OCCURS_CHUNK_WEIGHT} + bd.documents * ${CO_OCCURS_DOCUMENT_WEIGHT} AS weight
+    FROM by_document bd LEFT JOIN by_chunk bc ON bc.source = bd.source AND bc.target = bd.target
+    JOIN entities e ON e.id = bd.target
+    WHERE e.tx_to IS NULL
+  ),
+  ranked AS (
+    SELECT source, target, chunks, documents, row_number() OVER (PARTITION BY source ORDER BY weight DESC, target) AS rn
+    FROM scored
+  )
+  SELECT source, target, chunks, documents FROM ranked WHERE rn <= $3 ORDER BY source, rn`;
+
+describe('derived co-occurrence, against every mention row', () => {
+  const dataDir = path.join(tmp, 'ws-many');
+  let ctx: AppContext;
+
+  beforeAll(async () => {
+    initDataDir(dataDir);
+    // five dated reports on the same hubs, each over several chunks, so the
+    // per-source document cap, the shared-chunk counts and the ranking all bite
+    const cast = ['Alpha', 'Beta', 'Gamma', 'Delta', 'Epsilon', 'Zeta'];
+    for (let day = 1; day <= 5; day++) {
+      const a = cast[day % cast.length];
+      const b = cast[(day + 1) % cast.length];
+      const c = cast[(day * 2) % cast.length];
+      write(dataDir, `raw/docs/2026-10-0${day}-report.md`, `# report ${day}\n\n[[Alpha]] and [[${a}]] open it. ${filler('first')}\n\n${filler('second')} [[${b}]] and [[Hub]] close the middle.\n\n${filler('third')} [[Hub]], [[${c}]] and [[Alpha]] end it.\n`);
+    }
+    write(dataDir, 'raw/docs/undated.md', '# undated\n\n[[Hub]] with [[Omega]] and [[Alpha]], no date at all.\n');
+    ctx = await createContext(dataDir);
+    await sync(ctx, { llmGraph: false });
+    await ctx.store.query(`UPDATE entities SET tx_to = now() WHERE id = 'omega'`);
+  });
+  afterAll(async () => {
+    await ctx?.store.close();
+  });
+
+  it('counts and ranks exactly as the full join does, under every cap', async () => {
+    const { store } = ctx;
+    const [{ n }] = await store.query<{ n: number }>(`SELECT count(DISTINCT chunk_id)::int AS n FROM entity_mentions WHERE entity_id = 'hub'`);
+    expect(n).toBeGreaterThanOrEqual(5);
+    const cases: { seeds: string[]; maxDocuments?: number; perEntity?: number; among?: string[] }[] = [
+      { seeds: ['alpha'] },
+      { seeds: ['alpha', 'hub'] },
+      { seeds: ['alpha', 'hub', 'beta'], maxDocuments: 2 },
+      { seeds: ['hub'], maxDocuments: 1 },
+      { seeds: ['alpha', 'hub'], perEntity: 2 },
+      { seeds: ['alpha', 'hub', 'gamma'], among: ['beta', 'gamma', 'hub', 'omega'] },
+      { seeds: ['alpha', 'hub'], maxDocuments: 3, perEntity: 3, among: ['alpha', 'hub', 'delta', 'zeta'] },
+    ];
+    for (const c of cases) {
+      const params: unknown[] = [c.seeds, c.maxDocuments ?? 200, c.perEntity ?? 50];
+      if (c.among) params.push(c.among);
+      const expected = await store.query<{ source: string; target: string; chunks: number; documents: number }>(JOIN_EVERY_MENTION(Boolean(c.among)), params);
+      const got = await coOccurringEntities(store, c.seeds, { maxDocuments: c.maxDocuments, perEntity: c.perEntity, among: c.among });
+      expect(got.map(({ source, target, chunks, documents }) => ({ source, target, chunks, documents })), JSON.stringify(c))
+        .toEqual(expected.map((r) => ({ source: r.source, target: r.target, chunks: Number(r.chunks), documents: Number(r.documents) })));
+      expect(got.length, JSON.stringify(c)).toBeGreaterThan(0);
+    }
+  });
+});

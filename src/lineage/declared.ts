@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { KnodeConfig } from '../config.js';
 import { MAX_FILE_BYTES } from '../constants.js';
-import { isTextFile, safePath, walkFiles } from '../fs/files.js';
+import { isTextFile, safePath, walkFilesUnder } from '../fs/files.js';
 import { CAPABILITIES_DIR, hasSidecarSegment, RAW_DOCS, RAW_SKILLS, RAW_TRACES, WIKI_DIR } from '../fs/layout.js';
 import { DocRoot } from '../types.js';
 import { ScopeKind } from './types.js';
@@ -106,7 +106,9 @@ export function enumerateDeclared(dataDir: string, config: KnodeConfig, opts: De
   }
 
   for (const { rel, root } of WALKED_ROOTS) {
-    const files = walkFiles(dataDir, rel)
+    // a scoped run walks only what sits under its prefixes: a watcher event
+    // on one wiki page must not list every page
+    const files = walkFilesUnder(dataDir, rel, prefixes)
       .filter((f) => !isExcludedFile(f))
       .concat(root === 'wiki' ? ['purpose.md', 'schema.md'].filter((f) => fs.existsSync(safePath(dataDir, f))) : []);
     for (const file of files) {

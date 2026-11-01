@@ -91,6 +91,8 @@ export interface DocOutcome {
   entities: number;
   relations: number;
   scopeId: string | null;
+  /** sha256 of the text the live scope now holds; null when skipped. */
+  sha: string | null;
 }
 
 export function documentIdFor(file: string): string {
@@ -129,7 +131,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const { store, config, embedder } = ctx;
   const progress = opts.onProgress ?? (() => {});
   const actor = opts.actor ?? 'sync';
-  const none = { chunks: 0, entities: 0, relations: 0, scopeId: null };
+  const none = { chunks: 0, entities: 0, relations: 0, scopeId: null, sha: null };
   const source = loadSourceText(store.dataDir, file, root);
   if (!source) return { outcome: 'skipped', ...none };
   const raw = source.text;
@@ -160,7 +162,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
         await enqueueTier1(store, docId, segmentText(raw, config.extraction.segmentChars).length);
       }
     }
-    return { outcome: 'unchanged', ...none, scopeId: live.id };
+    return { outcome: 'unchanged', ...none, scopeId: live.id, sha };
   }
 
   progress(`indexing ${file}`);
@@ -390,7 +392,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     }
   }
 
-  const outcome: DocOutcome = { outcome: 'applied', chunks: chunkRows.length, entities: g.entities, relations: g.relations, scopeId: res.scope.id };
+  const outcome: DocOutcome = { outcome: 'applied', chunks: chunkRows.length, entities: g.entities, relations: g.relations, scopeId: res.scope.id, sha };
   if (registry.hasHandlers('document.applied')) {
     await registry.emit('document.applied', {
       path: file, root, dataDir: store.dataDir, outcome: 'applied',

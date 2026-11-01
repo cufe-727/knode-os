@@ -103,6 +103,11 @@ export async function coOccurringEntities(q: Queryable, ids: readonly string[], 
   const maxDocs = p.add(maxDocuments);
   const targetLive = rowLiveAt('e', 'entity', p, opts.asOf);
   const lim = p.add(perEntity);
+  // Everything after the seeds' recent documents is read from those documents'
+  // own mention rows, fetched once by document id. Joined to entity_mentions
+  // as a whole instead, the planner sorted all of it to merge on (entity,
+  // document): 24 s for ten hub entities on the finance workspace's 3.7M
+  // mentions, against 2 s this way.
   const rows = await q.query<{ source: string; target: string; chunks: number; documents: number }>(
     `WITH seed_docs AS (
        SELECT entity_id, document_id FROM (
@@ -117,21 +122,29 @@ export async function coOccurringEntities(q: Queryable, ids: readonly string[], 
        ) recent
        WHERE rn <= ${maxDocs}
      ),
+     doc_mentions AS MATERIALIZED (
+       SELECT m.document_id, m.entity_id, m.chunk_id
+       FROM entity_mentions m
+       WHERE m.document_id = ANY(ARRAY(SELECT DISTINCT document_id FROM seed_docs))
+     ),
      seed AS (
-       SELECT DISTINCT m.entity_id, m.chunk_id, m.document_id
-       FROM seed_docs sd
-       JOIN entity_mentions m ON m.entity_id = sd.entity_id AND m.document_id = sd.document_id
+       SELECT DISTINCT dm.entity_id, dm.chunk_id
+       FROM doc_mentions dm
+       JOIN seed_docs sd ON sd.document_id = dm.document_id AND sd.entity_id = dm.entity_id
      ),
      by_chunk AS (
        SELECT s.entity_id AS source, o.entity_id AS target, count(DISTINCT s.chunk_id)::int AS chunks
        FROM seed s
-       JOIN entity_mentions o ON o.chunk_id = s.chunk_id AND o.entity_id <> s.entity_id ${amongCond}
+       JOIN doc_mentions o ON o.chunk_id = s.chunk_id AND o.entity_id <> s.entity_id ${amongCond}
        GROUP BY s.entity_id, o.entity_id
      ),
+     doc_entities AS (
+       SELECT DISTINCT document_id, entity_id FROM doc_mentions
+     ),
      by_document AS (
-       SELECT s.entity_id AS source, o.entity_id AS target, count(DISTINCT s.document_id)::int AS documents
+       SELECT s.entity_id AS source, o.entity_id AS target, count(*)::int AS documents
        FROM seed_docs s
-       JOIN entity_mentions o ON o.document_id = s.document_id AND o.entity_id <> s.entity_id ${amongCond}
+       JOIN doc_entities o ON o.document_id = s.document_id AND o.entity_id <> s.entity_id ${amongCond}
        GROUP BY s.entity_id, o.entity_id
      ),
      scored AS (
