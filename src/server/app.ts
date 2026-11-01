@@ -14,7 +14,7 @@ import { WorkBroker } from '../work/broker.js';
 import type { TranslateSource } from '../work/translate.js';
 import type { DocumentRow } from '../types.js';
 import { contentLanguages, LANGUAGES, LanguagesConfig, normalizeLanguage, normalizeLanguagesConfig, sameLanguage } from '../lang/languages.js';
-import { documentLanguages, isDataFile, recordTranslationState, translatedText, translationRow, withdrawTranslationRequest } from '../lang/translate.js';
+import { documentLanguages, isDataFile, recordTranslationState, translatableDocument, translatedText, translationRow, withdrawTranslationRequest } from '../lang/translate.js';
 import { accountMayOpenTeam } from '../auth/accounts.js';
 import { AuthEnv, authMiddleware, existingTeams, mountAuthRoutes, mountGateways } from '../auth/http.js';
 import { AuthService } from '../auth/service.js';
@@ -1186,11 +1186,8 @@ export function createApp(
       if (!languages.on) return c.json({ error: 'content languages are off for this workspace — turn them on in Settings → Ingest → Translate' }, 409);
       const lang = normalizeLanguage(body.lang);
       if (!lang || !languages.offered.includes(lang)) return c.json({ error: `${body.lang ?? '(none)'} is not one of this workspace's languages (${languages.offered.join(', ')})` }, 400);
-      const [doc] = await ctx.store.query<Pick<DocumentRow, 'id' | 'path' | 'root' | 'sha256' | 'language'>>(
-        `SELECT id, path, root, sha256, language FROM documents WHERE path = $1 AND status = 'indexed' AND root = 'docs' AND kind = 'source'`,
-        [p],
-      );
-      if (!doc) return c.json({ error: `${p} is no indexed document under raw/docs` }, 404);
+      const doc = await translatableDocument(ctx.store, p);
+      if (!doc) return c.json({ error: `${p} is neither an indexed document under raw/docs nor a wiki page` }, 404);
       if (isDataFile(p)) return c.json({ error: `${p} is data, not prose: it is not translated` }, 400);
       const current = await documentLanguages(ctx.store, ctx.dataDir, ctx.config, p);
       if (current?.source && sameLanguage(current.source, lang)) return c.json({ error: `${p} is written in ${lang} already` }, 400);

@@ -547,6 +547,10 @@ struct FileLanguages: Decodable, Equatable {
     /// The language `content` is in: the asked one when it is translated,
     /// else the source.
     var shown: String?
+    /// Whether the service translates the document into the primary language
+    /// by itself — a raw/docs source, not a wiki page; nil from a service
+    /// older than the field, which did so for every document it offered.
+    var background: Bool?
     var translations: [String: TranslationState]
 
     init(from decoder: any Decoder) throws {
@@ -555,11 +559,12 @@ struct FileLanguages: Decodable, Equatable {
         primary = try container.decodeIfPresent(String.self, forKey: .primary)
         offered = try container.decodeIfPresent([String].self, forKey: .offered) ?? []
         shown = try container.decodeIfPresent(String.self, forKey: .shown)
+        background = try container.decodeIfPresent(Bool.self, forKey: .background)
         translations = try container.decodeIfPresent([String: TranslationState].self, forKey: .translations) ?? [:]
     }
 
     private enum CodingKeys: String, CodingKey {
-        case source, primary, offered, shown, translations
+        case source, primary, offered, shown, background, translations
     }
 }
 

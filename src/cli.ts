@@ -7,9 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { redactConfig, resolveDataDir, resolveRoutedLlmConfig, routeTargets, CONFIG_FILE, loadConfig, saveConfig } from './config.js';
 import { contentLanguages, normalizeLanguage } from './lang/languages.js';
-import { translateNow } from './lang/translate.js';
+import { translatableDocument, translateNow } from './lang/translate.js';
 import { LlmClient } from './llm/client.js';
-import type { DocumentRow } from './types.js';
 import { createContext } from './context.js';
 import { learnFrequentTerms, relinkTier0 } from './graph/concepts.js';
 import { CONCEPT_FREQUENT_FILE, FREQUENT_MIN_CORPUS } from './graph/concept-stoplist.js';
@@ -209,7 +208,7 @@ program
 program
   .command('translate')
   .description('translate documents into a content language now, on the Translate stage\'s route, segment by segment (docs/design/17); --status: translations by language')
-  .argument('[paths...]', 'documents under raw/docs')
+  .argument('[paths...]', 'documents under raw/docs, or wiki pages')
   .option('--lang <code>', 'the language to translate into (default: the primary content language)')
   .option('--retries <n>', 'tries more per segment whose answer will not do', '1')
   .option('--status', 'print translations by language and status, translate nothing')
@@ -246,9 +245,9 @@ program
         return;
       }
       for (const p of paths) {
-        const [doc] = await ctx.store.query<DocumentRow>(`SELECT * FROM documents WHERE path = $1 AND status = 'indexed' AND root = 'docs'`, [p]);
+        const doc = await translatableDocument(ctx.store, p);
         if (!doc) {
-          console.error(`${p}: no indexed document under raw/docs`);
+          console.error(`${p}: neither an indexed document under raw/docs nor a wiki page`);
           process.exitCode = 1;
           continue;
         }

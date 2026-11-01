@@ -19,8 +19,9 @@ import { noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
  * One per workspace in `serve`, behind the work broker (src/work/broker.ts),
  * idle while the workspace has content languages off. A slot that asks for a
  * translation gets the next segment of the next document due one: a
- * translation someone asked for first, then the documents under raw/docs in
- * another language than the primary one (src/lang/translate.ts). Each
+ * translation someone asked for first — of a wiki page too — then the
+ * documents under raw/docs in another language than the primary one
+ * (src/lang/translate.ts). Each
  * segment is a task of its own, so a long document's segments may be out to
  * several workers at once; whoever holds a lease runs its messages on its own
  * model and hands back the text.

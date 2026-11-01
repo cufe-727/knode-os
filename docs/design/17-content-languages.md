@@ -2,7 +2,8 @@
 
 > Status: **implemented** (2026‑10‑28). Config block `languages`, Translate stage `extraction.translateLlm`,
 > work kind `translate`, schema v17 (`documents.language`, `translations`), `GET /api/languages`,
-> `GET /api/file?lang=`, `POST /api/file/translate`, `knode-os translate`.
+> `GET /api/file?lang=`, `POST /api/file/translate`, `knode-os translate`. Wiki pages on request, and a pick that
+> asks for the open document's translation: 2026‑11‑01 (D11).
 
 ## 0. What was there
 
@@ -34,6 +35,7 @@ Two smaller findings on the way:
 | D8 Progress in a table, truth in files | Schema **v17**: `documents.language` — detected on every apply, `''` for a text without letters, filled in once for older rows by the stage's scan — and `translations (document_id, language, content_sha, status, parts, done, attempts, requested, model, error)`. Statuses: `requested`, `partial`, `done`, `failed`, `skipped` | The scan finds what is due with one query instead of opening a sidecar per document (22,000 of them in finance), and a file view says how far a translation got. A rebuild loses the rows; the scan finds the sidecars' translations again without a model call |
 | D9 Summaries in the primary language | With content languages on, every new summary page is written in the primary language whatever the document's — the scaffold's headings too (zh 要点 / 实体) | A Chinese reader's English filing gets a Chinese page in `wiki/sources/`, and that page is indexed: a Chinese search finds the filing through it. Existing summaries are not rewritten (docs/design/14 D8): their cache stands until the document changes |
 | D10 Detection reads what a reader reads | `src/lang/detect.ts`: frontmatter `lang` / `language` when declared, else the script of the text with frontmatter, code, URLs, link targets, tags and e-mail addresses taken out; Latin script told apart by function words (en, fr, de, es, pt, it), Cyrillic as Russian. The summaries use it too | Fixes the URL miscount; the column and the stage read the same answer |
+| D11 Wiki pages on request; a pick asks | A wiki page (and `purpose.md` / `schema.md`) offers the switcher too and is translated into any offered language **on request only** — never by the background pass, which stays with `raw/docs` sources. Picking a language in the switcher for a document that has no translation into it asks for one, as the *Translate* button does | A reader of a Chinese wiki in English wants its pages, which are where the knowledge is; but most of them are written in the primary language already (summaries are, D9) and the compiler rewrites them often, so translating them unasked would pay again and again for pages nobody opened. A pick that only showed the same original again read as a switcher that did nothing |
 
 ## 2. Config
 
@@ -75,14 +77,16 @@ failure                   bad answer: an attempt (3 per content); rate limit / l
 
 ## 4. Reading
 
-`GET /api/file?path=…&lang=zh` — the file as before, plus, for an indexed document under `raw/docs` in a workspace
-with content languages on:
+`GET /api/file?path=…&lang=zh` — the file as before, plus, for an indexed document under `raw/docs` or a wiki page in
+a workspace with content languages on:
 
 ```jsonc
 "languages": {
   "source": "en",                    // the language the document is written in (null: no letters)
   "primary": "zh",
   "offered": ["zh", "en"],           // the workspace's, and the document's own when it is neither
+  "background": true,                // translated into the primary by the background pass (a raw/docs source in another
+                                     // language, within maxChars); false: only on request — a wiki page, a longer document
   "shown": "zh",                     // the language `content` is in
   "translations": {
     "zh": { "status": "partial", "parts": 12, "done": 5, "model": "codex-cli:gpt-6.1-sol", "requested": false },
@@ -104,9 +108,10 @@ knode-os knows (`code`, `english`, `native`, `prompt`) and the workspace's setti
 `failed`, `documents`, …) and the last hour.
 
 The switcher (web Files view, Mac file browser) lists the offered languages, the document's own marked as the
-original. Picking one sets the reader's reading language for every document; a document without that translation
-shows its original with a line saying so and, for a language the stage does not translate by itself, a *Translate*
-button. A translation is read-only: an edit belongs to the original.
+original. Picking one sets the reader's reading language for every document, and asks for the open document's
+translation into it when it has none (D11); another document without that translation shows its original with a line
+saying so and a *Translate* button (*Translate next* where `background` says the stage gets to it by itself). A
+translation is read-only: an edit belongs to the original.
 
 ## 5. CLI
 
@@ -128,7 +133,8 @@ knode-os translate --status                          translations by language an
 4. **Extraction still writes in the document's language**: claim statements and entity descriptions of an English
    filing are English. An instruction to write them in the primary language is one line in the extraction prompt,
    but it changes what every later extraction writes and deserves its own measurement.
-5. **Only `raw/docs` sources.** Wiki pages, traces and skills are not translated.
+5. **Only `raw/docs` sources and wiki pages.** Traces and skills are not translated, and wiki pages only on request
+   (D11): an English page in a Chinese workspace stays English until someone asks.
 6. **No glossary yet.** A translation names companies the way the model knows them, not necessarily as the graph
    does; summaries hold their links to the graph's names (docs/design/14 D4), translations do not.
 
@@ -139,7 +145,7 @@ knode-os translate --status                          translations by language an
 | `src/lang/languages.ts` (new) | the language catalog, tags normalized (`zh-TW` → `zh-Hant`), the `languages` config and `contentLanguages` |
 | `src/lang/detect.ts` (new) | `detectLanguage` / `detectTextLanguage`: what a reader reads, its script, function words |
 | `src/lang/protect.ts` (new) | `protectSpans` / `restoreSpans`: the tokens |
-| `src/lang/translate.ts` (new) | plan, request, finish, assemble; the `translations` table; the due scan; the file view's languages; `translateNow` |
+| `src/lang/translate.ts` (new) | plan, request, finish, assemble; the `translations` table; the due scan; the file view's languages; `translateNow`; which documents may be translated (`translatableDocument`) |
 | `src/work/translate.ts` (new) | `TranslateSource`, the leased work |
 | `src/work/kinds.ts`, `src/work/broker.ts`, `src/work/config.ts`, `src/labeling/local.ts`, `src/server/serve.ts` | the `translate` kind: shares, remote offer, CLI hints, local slots, wiring |
 | `src/fs/sidecar.ts` | `views/translations/`: read, write, parts, list, clear; counted as paid work |

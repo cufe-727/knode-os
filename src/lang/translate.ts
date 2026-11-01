@@ -49,6 +49,20 @@ export function isDataFile(rel: string): boolean {
   return DATA_FILE.test(rel);
 }
 
+/**
+ * What a reader may have translated: the sources under raw/docs, and wiki
+ * pages. A wiki page is translated only on request — it is mostly written in
+ * the primary language already, and its summary pages are (D9) — so only
+ * raw/docs sources are translated into the primary language in the background.
+ */
+const TRANSLATABLE_SQL = `((d.root = 'docs' AND d.kind = 'source') OR d.root = 'wiki')`;
+
+/** The indexed document at `path` a translation can be asked for, data files among them (`isDataFile` says which); null for any other. */
+export async function translatableDocument(q: Queryable, path: string): Promise<DocumentRow | null> {
+  const [doc] = await q.query<DocumentRow>(`SELECT d.* FROM documents d WHERE d.path = $1 AND d.status = 'indexed' AND ${TRANSLATABLE_SQL}`, [path]);
+  return doc ?? null;
+}
+
 /** A document's attempts at a translation of its current content before the stage gives up on it until it changes. */
 export const MAX_TRANSLATE_ATTEMPTS = 3;
 /** Output budget of one call: a segment's translation runs about as long as the segment, in tokens. */
@@ -367,10 +381,10 @@ export interface DueTranslation {
 
 /**
  * The documents due a translation: someone's requests first (any offered
- * language), then — for the primary language — every source under raw/docs
- * written in another language and no longer than `maxChars`, the
- * translations under way first, then the latest documents. Leaves out what
- * is translated for the current content and what failed on it too often.
+ * language, a wiki page too), then — for the primary language — every source
+ * under raw/docs written in another language and no longer than `maxChars`,
+ * the translations under way first, then the latest documents. Leaves out
+ * what is translated for the current content and what failed on it too often.
  */
 export async function dueTranslations(
   q: Queryable,
@@ -379,11 +393,12 @@ export async function dueTranslations(
 ): Promise<{ due: DueTranslation[]; count: number }> {
   if (!languages.on || !languages.primary) return { due: [], count: 0 };
   const settled = `(t.content_sha = d.sha256 AND (t.status IN ('done', 'skipped') OR (t.status = 'failed' AND t.attempts >= ${MAX_TRANSLATE_ATTEMPTS})))`;
+  const asked = `${TRANSLATABLE_SQL} AND d.status = 'indexed' AND ${DATA_FILE_SQL}`;
   const live = `d.root = 'docs' AND d.status = 'indexed' AND d.kind = 'source' AND ${DATA_FILE_SQL}`;
   const wanted = Math.max(1, opts.limit) + (opts.exclude?.size ?? 0);
   const requested = await q.query<DocumentRow & { t_language: string }>(
     `SELECT d.*, t.language AS t_language FROM translations t JOIN documents d ON d.id = t.document_id
-     WHERE t.requested AND t.language = ANY($1::text[]) AND ${live} AND NOT ${settled}
+     WHERE t.requested AND t.language = ANY($1::text[]) AND ${asked} AND NOT ${settled}
      ORDER BY t.updated_at, d.path
      LIMIT $2`,
     [languages.offered, wanted],
@@ -421,6 +436,12 @@ export interface DocumentLanguages {
   primary: string | null;
   /** The languages a reader may pick: the workspace's offered ones, and the document's own. */
   offered: string[];
+  /**
+   * Whether the stage translates the document into the primary language by
+   * itself (D6): a source under raw/docs in another language, no longer than
+   * `maxChars`. Every other translation waits for someone to ask.
+   */
+  background: boolean;
   translations: Record<string, { status: TranslationStatus | 'none' | 'source'; parts: number; done: number; model?: string | null; generatedAt?: string | null; requested?: boolean; error?: string | null }>;
 }
 
@@ -428,7 +449,7 @@ export interface DocumentLanguages {
 export async function documentLanguages(q: Queryable, dataDir: string, config: { languages?: unknown }, path: string): Promise<DocumentLanguages | null> {
   const languages = contentLanguages(config);
   if (!languages.on || isDataFile(path)) return null;
-  const [doc] = await q.query<DocumentRow>(`SELECT * FROM documents WHERE path = $1 AND status = 'indexed' AND root = 'docs'`, [path]);
+  const doc = await translatableDocument(q, path);
   if (!doc) return null;
   let source = doc.language ?? null;
   if (source === null) {
@@ -443,7 +464,10 @@ export async function documentLanguages(q: Queryable, dataDir: string, config: {
     const code = source && sameLanguage(lang, source) ? source : lang;
     if (!offered.includes(code)) offered.push(code);
   }
-  const out: DocumentLanguages = { source: source || null, primary: languages.primary, offered, translations: {} };
+  // the same rule as dueTranslations' background pass
+  const background = doc.root === 'docs' && Boolean(source) && !sameLanguage(source, languages.primary)
+    && (languages.maxChars <= 0 || doc.chars == null || doc.chars <= languages.maxChars);
+  const out: DocumentLanguages = { source: source || null, primary: languages.primary, offered, background, translations: {} };
   for (const lang of offered) {
     if (source && sameLanguage(lang, source)) {
       out.translations[lang] = { status: 'source', parts: 0, done: 0 };
