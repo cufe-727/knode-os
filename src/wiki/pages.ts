@@ -11,6 +11,8 @@ import { clearSourceSummaryFailure, readSourceSummary, readSourceSummaryFailure,
 import { slugify } from '../graph/store.js';
 import { applyDocScope } from '../ingest/apply.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
+import { noteOwnWrite } from '../ingest/own-writes.js';
+import { matchesPrefixes } from '../lineage/declared.js';
 import { readDeps } from '../lineage/deps.js';
 import { archivedPath, disposeScope, findLiveScope } from '../lineage/scope.js';
 import { DepDecl } from '../lineage/types.js';
@@ -404,19 +406,45 @@ export interface HotEntity {
   fold_sha: string;
 }
 
-/** Top-K live entities scored by mentions + heat of the documents mentioning them. */
+/**
+ * Top-K live entities scored by mentions + heat of the documents mentioning
+ * them (heat summed over their mention rows), among those mentioned at all.
+ *
+ * Heat is never negative, so only two kinds of entity can make the top K:
+ * one with heat — mentioned in a document with usage stats, a few hundred
+ * documents — and one whose mention count alone reaches the K-th highest.
+ * Scoring just those reads the mentions of the used documents instead of
+ * grouping every mention in the base (5.5 s on a 3.7M-mention workspace,
+ * which every small sync paid while a top entity kept gaining mentions).
+ * The sum is taken in double precision, so the same stats give the same
+ * heat whatever order the rows come in.
+ */
 export async function hotEntities(store: Store, limit: number): Promise<HotEntity[]> {
   return store.query<HotEntity>(
-    `SELECT e.id, e.name, e.type, e.description, e.mention_count, e.fold_sha,
-            COALESCE(sum(ds.heat), 0)::float AS heat
-     FROM entities e
-     JOIN entity_mentions m ON m.entity_id = e.id
-     LEFT JOIN doc_stats ds ON ds.document_id = m.document_id
+    `WITH heated AS (
+       SELECT m.entity_id, sum(ds.heat::float8) AS heat
+       FROM doc_stats ds JOIN entity_mentions m ON m.document_id = ds.document_id
+       GROUP BY m.entity_id
+     ), cutoff AS (
+       SELECT e.mention_count FROM entities e
+       WHERE e.tx_to IS NULL AND e.canonical_id IS NULL AND EXISTS (SELECT 1 FROM entity_mentions m WHERE m.entity_id = e.id)
+       ORDER BY e.mention_count DESC OFFSET $1::int - 1 LIMIT 1
+     ), candidates AS (
+       SELECT e.id FROM entities e
+       WHERE e.tx_to IS NULL AND e.canonical_id IS NULL
+         AND e.mention_count >= COALESCE((SELECT mention_count FROM cutoff), e.mention_count)
+         AND EXISTS (SELECT 1 FROM entity_mentions m WHERE m.entity_id = e.id)
+       UNION
+       SELECT entity_id FROM heated
+     )
+     SELECT e.id, e.name, e.type, e.description, e.mention_count, e.fold_sha, COALESCE(h.heat, 0)::float AS heat
+     FROM candidates c
+     JOIN entities e ON e.id = c.id
+     LEFT JOIN heated h ON h.entity_id = e.id
      WHERE e.tx_to IS NULL AND e.canonical_id IS NULL
-     GROUP BY e.id, e.name, e.type, e.description, e.mention_count, e.fold_sha
-     ORDER BY (e.mention_count + COALESCE(sum(ds.heat), 0) * 5) DESC, e.name ASC
+     ORDER BY (e.mention_count + COALESCE(h.heat, 0) * 5) DESC, e.name ASC
      LIMIT $1`,
-    [limit],
+    [Math.max(1, Math.floor(limit))],
   );
 }
 
@@ -616,8 +644,9 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
     else await w.writeRegion(file, region ?? 'body', regionContent ?? '');
   });
 
-  // search projection of the (re)written file
-  await applyDocScope(ctx, file, 'wiki', { queueTier1: false, actor });
+  // search projection of the (re)written file; the watcher's report of the write has nothing left to sync
+  const indexed = await applyDocScope(ctx, file, 'wiki', { queueTier1: false, actor });
+  if (indexed.sha) noteOwnWrite(ctx.dataDir, file, 'wiki', indexed.sha);
   return 'regenerated';
 }
 
@@ -650,7 +679,8 @@ export async function archivePage(ctx: PagesContext, pagePath: string, actor = '
     const doc = await findLiveScope(store, 'doc', file);
     if (doc) await disposeScope(store, doc.id, { actor, reason: 'removed' });
   } else if (fs.existsSync(safePath(ctx.dataDir, file))) {
-    await applyDocScope(ctx, file, 'wiki', { queueTier1: false, actor });
+    const indexed = await applyDocScope(ctx, file, 'wiki', { queueTier1: false, actor });
+    if (indexed.sha) noteOwnWrite(ctx.dataDir, file, 'wiki', indexed.sha);
   }
 }
 
@@ -683,12 +713,16 @@ export async function reconcileViews(
     stats.archived++;
   }
 
-  // drift: file gone → archive; file edited inside our regions → dirty
+  // drift: file gone → archive; file edited inside our regions → dirty. A
+  // scoped pass reads only the page files under its prefixes: an edit or a
+  // removal anywhere else is reported by the watcher and synced on its own,
+  // and a full pass reads them all
   const live = await store.query<{ path: string; kind: PageKind; status: string; file_sha: string | null; regions: { id: string; sha: string }[] }>(
     `SELECT path, kind, status, file_sha, regions FROM pages WHERE status IN ('active', 'dirty')`,
   );
   for (const p of live) {
     const { file } = splitPagePath(p.path);
+    if (!matchesPrefixes(file, opts.prefixes)) continue;
     const abs = safePath(ctx.dataDir, file);
     if (!fs.existsSync(abs)) {
       progress(`page file missing, archiving ${p.path}`);

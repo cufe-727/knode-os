@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { MAX_CONVERTIBLE_FILE_BYTES, MAX_FILE_BYTES } from '../constants.js';
-import { isHiddenName, isTextFile, safePath, walkFiles } from '../fs/files.js';
+import { isTextFile, safePath, walkFilesUnder } from '../fs/files.js';
 import { RAW_DOCS } from '../fs/layout.js';
 import { hasContent, readContent, readSidecarPart, SidecarConversion, writeContent, writeSidecarPart } from '../fs/sidecar.js';
 import { NORMALIZER_VERSION, normalizeCookedFrontmatter } from '../okf/normalize.js';
@@ -81,21 +81,7 @@ export interface PrepareOptions extends ConversionOptions {
  * hidden path is never a source.
  */
 export function rawDocsUnder(dataDir: string, prefixes: string[] | undefined): string[] {
-  if (!prefixes) return walkFiles(dataDir, RAW_DOCS);
-  const out = new Set<string>();
-  for (const p of prefixes) {
-    if (p === RAW_DOCS || RAW_DOCS.startsWith(`${p}/`)) return walkFiles(dataDir, RAW_DOCS);
-    if (!p.startsWith(`${RAW_DOCS}/`) || p.split('/').some(isHiddenName)) continue;
-    let st: fs.Stats;
-    try {
-      st = fs.statSync(safePath(dataDir, p));
-    } catch {
-      continue;
-    }
-    if (st.isDirectory()) for (const f of walkFiles(dataDir, p)) out.add(f);
-    else if (st.isFile()) out.add(p);
-  }
-  return [...out];
+  return walkFilesUnder(dataDir, RAW_DOCS, prefixes);
 }
 
 function isFile(dataDir: string, rel: string): boolean {

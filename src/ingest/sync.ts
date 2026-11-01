@@ -97,6 +97,22 @@ export async function sync(ctx: SyncContext, opts: SyncOptions = {}): Promise<Sy
   return run;
 }
 
+/** Resolves once every sync started so far has ended, however it ended. */
+export function syncsSettled(): Promise<void> {
+  return syncChain.then(() => undefined);
+}
+
+/** SQL for `matchesPrefixes`: `col` is one of the prefixes bound at `ph` (a text[]) or lies below one. */
+function underPrefixesSql(col: string, ph: string): string {
+  return `(${col} = ANY(${ph}::text[]) OR EXISTS (SELECT 1 FROM unnest(${ph}::text[]) AS u(prefix) WHERE starts_with(${col}, u.prefix || '/')))`;
+}
+
+/** Source keys with a sidecar under `root`; on a scoped run only those under its prefixes, without walking the rest. */
+function sidecarKeysUnder(dataDir: string, root: string, prefixes: string[] | undefined): string[] {
+  if (!prefixes || prefixes.some((p) => p === root || root.startsWith(`${p}/`))) return listSidecarKeys(dataDir, root);
+  return [...new Set(prefixes.filter((p) => p.startsWith(`${root}/`)).flatMap((p) => listSidecarKeys(dataDir, p)))];
+}
+
 /** Former entry point; kept so existing callers and tests keep working. Does not touch datasources. */
 export async function runIngest(
   store: Store,
@@ -171,7 +187,7 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
     } else {
       preparedTraces = new Map();
     }
-    for (const key of listSidecarKeys(ctx.dataDir, RAW_TRACES)) {
+    for (const key of sidecarKeysUnder(ctx.dataDir, RAW_TRACES, prefixes)) {
       if (preparedTraces.has(key) || !matchesPrefixes(key, prefixes)) continue;
       removeSidecar(ctx.dataDir, key);
     }
@@ -185,8 +201,11 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
     failed,
   });
 
+  // a scoped run reads the live scopes under its prefixes, not the whole
+  // workspace's (tens of thousands of rows on every watcher event)
   const runningRows = await store.query<ScopeRow>(
-    `SELECT * FROM scopes WHERE status = 'active' AND parent_id IS NULL AND kind IN ('doc', 'datasource')`,
+    `SELECT * FROM scopes WHERE status = 'active' AND parent_id IS NULL AND kind IN ('doc', 'datasource')${prefixes ? ` AND (kind = 'datasource' OR ${underPrefixesSql('key', '$1')})` : ''}`,
+    prefixes ? [prefixes] : [],
   );
   const running = new Map<string, ScopeRow>();
   for (const s of runningRows) {
@@ -216,13 +235,15 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   const unowned = await store.query<{ path: string }>(
     `SELECT d.path FROM documents d
      WHERE (d.status <> 'disposed' OR EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.id))
-       AND NOT EXISTS (SELECT 1 FROM scopes s WHERE s.kind = 'doc' AND s.key = d.path AND s.status <> 'disposed')`,
+       AND NOT EXISTS (SELECT 1 FROM scopes s WHERE s.kind = 'doc' AND s.key = d.path AND s.status <> 'disposed')${prefixes ? `
+       AND ${underPrefixesSql('d.path', '$1')}` : ''}`,
+    prefixes ? [prefixes] : [],
   );
   for (const { path: key } of unowned) {
     if (matchesPrefixes(key, prefixes) && !declared.has(declaredKey('doc', key)) && !failed.has(key)) orphans.add(key);
   }
   if (touchesDocs && preparedDocs) {
-    for (const key of listSidecarKeys(ctx.dataDir, RAW_DOCS)) {
+    for (const key of sidecarKeysUnder(ctx.dataDir, RAW_DOCS, prefixes)) {
       if (preparedDocs.has(key) || failed.has(key) || running.has(declaredKey('doc', key)) || !matchesPrefixes(key, prefixes)) continue;
       orphans.add(key);
     }
@@ -235,8 +256,8 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   }
 
   // added / replaced documents
-  const wikiIndex = buildWikiIndex(ctx.dataDir, 'wiki');
   const docs = [...declared.values()].filter((d) => d.kind === 'doc');
+  const wikiIndex = docs.length > 0 ? buildWikiIndex(ctx.dataDir, 'wiki') : undefined;
   const processOne = async (d: (typeof docs)[number]) => {
     stats.scanned++;
     try {

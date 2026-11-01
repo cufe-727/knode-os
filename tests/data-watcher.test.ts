@@ -2,12 +2,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { activityOf } from '../src/activity.js';
 import { AppContext, createContext } from '../src/context.js';
 import { watchTree, WatchTreeOptions } from '../src/fs/watch.js';
 import { LinkedFolders } from '../src/ingest/folders.js';
+import { isOwnWrite } from '../src/ingest/own-writes.js';
 import { sync } from '../src/ingest/sync.js';
 import { findLiveScope } from '../src/lineage/scope.js';
 import { watchDataDir } from '../src/server/serve.js';
+import { ensureHotTopics, ensureSourcesIndex } from '../src/wiki/pages.js';
 
 /**
  * serve's data-dir watcher (src/server/serve.ts) and the moment it is blind:
@@ -174,5 +177,52 @@ describe('the data-dir watcher', () => {
     } finally {
       await links.stop();
     }
+  });
+});
+
+describe('the data-dir watcher and the pages a sync writes', () => {
+  const data = path.join(tmp, 'pages');
+  let ctx: AppContext;
+  let watcher: ReturnType<typeof watchDataDir> = null;
+  beforeAll(async () => {
+    ctx = await createContext(data);
+    write(data, 'raw/docs/notes/a.md', '# A\n\n[[Alpha]] and [[Beta]] meet.\n');
+    write(data, 'raw/docs/notes/b.md', '# B\n\n[[Alpha]] again.\n');
+    await sync(ctx, { llmGraph: false });
+    await ensureSourcesIndex(ctx);
+    await ensureHotTopics(ctx);
+    watcher = watchDataDir(ctx, { log: () => {}, track: (job) => job, debounceMs: 150 });
+    await sleep(300);
+  });
+  afterAll(async () => {
+    watcher?.close();
+    await ctx.store.close();
+  });
+
+  const syncs = () => {
+    const { running, recent } = activityOf(data).snapshot();
+    return [...running, ...recent].filter((a) => a.kind === 'sync');
+  };
+  const finished = (label: string) => syncs().some((a) => a.label === label && a.finishedAt);
+  const read = (rel: string) => fs.readFileSync(path.join(data, rel), 'utf8');
+
+  it('does not sync again the index a sync regenerated, and syncs a person editing it', async () => {
+    const index = 'wiki/sources/index.md';
+    const before = read(index);
+    write(data, 'raw/docs/notes/a.md', '# A, renamed\n\n[[Alpha]] and [[Beta]] meet again.\n');
+    await eventually(() => finished('Changes to raw/docs/notes/a.md'), 'the edited source to be synced');
+    // the source's sync rewrote the index around its new title and indexed it itself
+    expect(read(index)).not.toBe(before);
+    expect(read(index)).toContain('A, renamed');
+    expect(isOwnWrite(data, index)).toBe(true);
+    await sleep(1500);
+    expect(syncs().map((a) => a.label).filter((l) => l.includes('wiki/'))).toEqual([]);
+
+    // a person's note below the generated list is theirs: synced as always
+    const indexed = (await findLiveScope(ctx.store, 'doc', index))?.sha;
+    fs.appendFileSync(path.join(data, index), '\nA note a person keeps under the list.\n');
+    expect(isOwnWrite(data, index)).toBe(false);
+    await eventually(() => finished(`Changes to ${index}`), 'the edited index to be synced');
+    expect((await findLiveScope(ctx.store, 'doc', index))?.sha).not.toBe(indexed);
   });
 });

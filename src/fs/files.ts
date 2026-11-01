@@ -351,3 +351,27 @@ export function walkFiles(dataDir: string, rel: string): string[] {
   visit(rel.replace(/\\/g, '/').replace(/\/+$/, ''));
   return out;
 }
+
+/**
+ * `walkFiles(dataDir, root)` restricted to what sits under `prefixes`,
+ * without walking the rest: a prefix at or above `root` covers it whole, a
+ * directory below it is walked, a file is taken as it is. A path that no
+ * longer exists, or is hidden, yields nothing. No prefixes: all of `root`.
+ */
+export function walkFilesUnder(dataDir: string, root: string, prefixes: string[] | undefined): string[] {
+  if (!prefixes) return walkFiles(dataDir, root);
+  const out = new Set<string>();
+  for (const p of prefixes) {
+    if (p === root || root.startsWith(`${p}/`)) return walkFiles(dataDir, root);
+    if (!p.startsWith(`${root}/`) || p.split('/').some(isHiddenName)) continue;
+    let st: fs.Stats;
+    try {
+      st = fs.statSync(safePath(dataDir, p));
+    } catch {
+      continue;
+    }
+    if (st.isDirectory()) for (const f of walkFiles(dataDir, p)) out.add(f);
+    else if (st.isFile()) out.add(p);
+  }
+  return [...out];
+}

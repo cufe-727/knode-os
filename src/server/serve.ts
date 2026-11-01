@@ -17,7 +17,8 @@ import { LabelingProcessing } from '../labeling/processing.js';
 import { LabelingScheduler } from '../labeling/scheduler.js';
 import { EmbeddingBackfill } from '../ingest/embed-backfill.js';
 import { LinkedFolders, linkedFolders, linkOwning, syncedByFolders } from '../ingest/folders.js';
-import { sync, SyncContext, SyncStats } from '../ingest/sync.js';
+import { isOwnWrite } from '../ingest/own-writes.js';
+import { sync, SyncContext, syncsSettled, SyncStats } from '../ingest/sync.js';
 import { WorkBroker } from '../work/broker.js';
 import { offeredRemotely } from '../work/config.js';
 import { JudgeSource } from '../work/judge.js';
@@ -375,12 +376,20 @@ export function watchDataDir(ctx: SyncContext, opts: DataDirWatchOptions): TreeW
       return;
     }
     running = true;
-    // a burst under one folder syncs that folder, never the whole data dir
-    const only = fullSync ? undefined : coveringPrefixes(pending, WATCH_SCOPE_MAX);
+    const paths = [...pending];
+    const everything = fullSync;
     pending.clear();
     fullSync = false;
     void track((async () => {
       try {
+        // a page this process wrote and indexed itself (an index or summary a
+        // sync regenerated) needs no sync of its own: it is noted once the
+        // sync writing it has indexed it, so look after the running ones end
+        await syncsSettled();
+        const changed = everything ? paths : paths.filter((rel) => !isOwnWrite(ctx.dataDir, rel));
+        if (!everything && changed.length === 0) return;
+        // a burst under one folder syncs that folder, never the whole data dir
+        const only = everything ? undefined : coveringPrefixes(changed, WATCH_SCOPE_MAX);
         const stats = await activityOf(ctx.dataDir).run('sync', `Changes to ${scopeLabel(only)}`, () => sync(ctx, { only }), describeSync);
         if (stats.indexed || stats.disposed || stats.pagesRegenerated) summarize(log, 'watch sync', stats);
       } catch (err) {
