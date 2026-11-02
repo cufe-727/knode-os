@@ -55,7 +55,7 @@ import { REMOTE_SCOPES, RemoteScope, RemoteTokenStore } from './remote/tokens.js
 import { WORK_KINDS } from './work/kinds.js';
 import { registerAuthCommands } from './auth/cli.js';
 import { describeLinkedFolders, importFolder, refreshLinkedFolders, unlinkFolder } from './ingest/folders.js';
-import { describeFeishuLinks, feishuClient, FeishuSignIn, importFeishuDocument, refreshFeishuLinks, unlinkFeishuDocument } from './ingest/feishu/docs.js';
+import { describeFeishuLinks, feishuCheckTime, feishuClient, FeishuPlaced, FeishuSignIn, importFeishuBatch, lastFeishuCheck, refreshFeishuLinks, splitFeishuInputs, unlinkFeishuDocument } from './ingest/feishu/docs.js';
 import { requeueFailedExtractions } from './graph/tier1.js';
 import { sync } from './ingest/sync.js';
 import { historyOf, lineageOf } from './lineage/inspect.js';
@@ -435,7 +435,7 @@ const feishu = program
   .command('feishu')
   .description('import Feishu (Lark) documents into raw/docs with their pictures, once or kept in sync — read through lark-cli as the signed-in Feishu user (see src/ingest/feishu/docs.ts)');
 
-const FEISHU_SERVE_HINT = 'note: a running `knode-os serve` keeps its own copy of the config — restart it, or link through the app, for it to poll this document';
+const FEISHU_SERVE_HINT = 'note: a running `knode-os serve` keeps its own copy of the config — restart it, or link through the app, for its daily check to include this';
 
 feishu
   .command('status')
@@ -454,6 +454,10 @@ feishu
       console.log(status.missingScopes.length ? `missing scopes: ${status.missingScopes.join(', ')} — run \`knode-os feishu login\`` : 'every scope knode-os needs is granted');
       if (status.refreshExpiresAt) console.log(`stays signed in while used before ${status.refreshExpiresAt} (each use renews it)`);
     }
+    const config = loadConfig(dataDir());
+    const at = feishuCheckTime(config);
+    const last = lastFeishuCheck(dataDir());
+    console.log(`${at ? `\`serve\` checks linked documents daily at ${at}` : 'the daily check is off (ingest.feishu.checkAt)'}; last checked ${last ?? 'never'}`);
   });
 
 feishu
@@ -483,19 +487,38 @@ feishu
     const links = describeFeishuLinks(ctx);
     if (opts.json) console.log(JSON.stringify(links, null, 2));
     else if (links.length === 0) console.log('no linked Feishu documents — `knode-os feishu link <url>` mirrors one under raw/docs and keeps it in sync');
-    else for (const l of links) console.log(`${l.dest}  ←  ${l.url}  "${l.title}", revision ${l.revision ?? '?'}, edited ${l.modifiedAt ?? '?'}, ${l.images} pictures, ${l.attachments} attachments${l.failed ? `, ${l.failed} not downloaded yet` : ''}`);
+    else {
+      for (const l of links) {
+        console.log(l.type === 'wiki-tree'
+          ? `${l.dest}  ←  ${l.url}  "${l.title}", a wiki tree of ${l.pages ?? '?'} pages (${l.documents ?? '?'} documents)`
+          : `${l.dest}  ←  ${l.url}  "${l.title}", revision ${l.revision ?? '?'}, edited ${l.modifiedAt ?? '?'}, ${l.images} pictures, ${l.attachments} attachments${l.failed ? `, ${l.failed} not downloaded yet` : ''}`);
+      }
+    }
     await ctx.store.close();
   });
 
-const feishuImportAction = (mode: 'copy' | 'link') => async (url: string, opts: { to?: string; llm?: boolean }) => {
+const describePlaced = (r: FeishuPlaced, mode: 'copy' | 'link') => {
+  const verb = r.refreshed ? 'refreshed' : mode === 'link' ? 'linked' : 'imported';
+  const what = r.pages ? `a wiki tree of ${r.pages.total} pages (${r.pages.documents} documents, ${r.pages.fetched} fetched)` : `revision ${r.revision}`;
+  return `${verb} "${r.title}" — ${what} → ${r.file ?? r.dest}\n  ${r.images} pictures, ${r.attachments} attachments${r.keptInFeishu ? `, ${r.keptInFeishu} kept in Feishu` : ''}; ${r.written.length} written, ${r.removed.length} removed`;
+};
+
+const feishuImportAction = (mode: 'copy' | 'link') => async (urls: string[], opts: { to?: string; llm?: boolean; subpages?: boolean }) => {
   const ctx = await createContext(dataDir());
   try {
-    const r = await importFeishuDocument(ctx, feishuClient(ctx.config), url, { dest: opts.to, mode, llmGraph: opts.llm, onProgress: (m) => console.log(`  ${m}`) });
-    console.log(`${r.refreshed ? 'refreshed' : mode === 'link' ? 'linked' : 'imported'} "${r.title}" (revision ${r.revision}) → ${r.file}`);
-    console.log(`  ${r.images} pictures, ${r.attachments} attachments${r.keptInFeishu ? `, ${r.keptInFeishu} kept in Feishu` : ''}; ${r.written.length} written, ${r.removed.length} removed`);
-    for (const w of r.warnings) console.log(`  warning: ${w}`);
-    if (r.sync) console.log(`indexed: ${r.sync.indexed} applied, ${r.sync.unchanged} unchanged, ${r.sync.skipped} skipped, ${r.sync.errors} errors`);
-    if (mode === 'link') console.log(FEISHU_SERVE_HINT);
+    const inputs = splitFeishuInputs(urls);
+    const out = await importFeishuBatch(ctx, feishuClient(ctx.config), inputs, { dest: opts.to, mode, subpages: opts.subpages, llmGraph: opts.llm, onProgress: (m) => console.log(`  ${m}`) });
+    for (const item of out.items) {
+      if (!item.ok) {
+        console.log(`${item.input}: ${item.error}`);
+        continue;
+      }
+      console.log(describePlaced(item.result!, mode));
+      for (const w of item.result!.warnings) console.log(`  warning: ${w}`);
+    }
+    if (out.sync) console.log(`indexed: ${out.sync.indexed} applied, ${out.sync.unchanged} unchanged, ${out.sync.skipped} skipped, ${out.sync.errors} errors`);
+    if (mode === 'link' && out.items.some((x) => x.ok)) console.log(FEISHU_SERVE_HINT);
+    if (out.items.some((x) => !x.ok)) process.exitCode = 1;
   } finally {
     await ctx.datasources.closeAll();
     await ctx.store.close();
@@ -503,16 +526,18 @@ const feishuImportAction = (mode: 'copy' | 'link') => async (url: string, opts: 
 };
 
 feishu
-  .command('import <url>')
-  .description('copy a Feishu document once into raw/docs/feishu/<title>__<token>/ (pictures and indexable attachments beside it) and index it')
-  .option('--to <dest>', 'destination under raw/docs (default raw/docs/feishu/<title>__<token>)')
+  .command('import <url...>')
+  .description('copy Feishu documents once into raw/docs/feishu/<title>__<token>/ (pictures and indexable attachments beside them) and index them; a wiki space comes with all its pages, a wiki page with --subpages with those under it, as folders that keep the wiki\'s structure')
+  .option('--to <dest>', 'destination under raw/docs, for one link (default raw/docs/feishu/<title>__<token>)')
+  .option('--subpages', 'bring a wiki page with the pages under it')
   .option('--no-llm', 'do not queue the documents for tier-1 LLM extraction')
   .action(feishuImportAction('copy'));
 
 feishu
-  .command('link <url>')
-  .description('mirror a Feishu document and keep it in sync: `serve` asks Feishu every few minutes whether it was edited')
-  .option('--to <dest>', 'destination under raw/docs (default raw/docs/feishu/<title>__<token>)')
+  .command('link <url...>')
+  .description('mirror Feishu documents (or, with --subpages, wiki pages with the pages under them; a wiki space whole) and keep them in sync: `serve` asks Feishu once a day which were edited')
+  .option('--to <dest>', 'destination under raw/docs, for one link (default raw/docs/feishu/<title>__<token>)')
+  .option('--subpages', 'follow a wiki page with the pages under it')
   .option('--no-llm', 'do not queue the documents for tier-1 LLM extraction')
   .action(feishuImportAction('link'));
 
@@ -526,7 +551,8 @@ feishu
       const results = await refreshFeishuLinks(ctx, feishuClient(ctx.config), { dest, force: Boolean(opts.force), onProgress: (m) => console.log(`  ${m}`) });
       if (results.length === 0) console.log('no linked Feishu documents');
       for (const r of results) {
-        console.log(r.error ? `${r.dest}: ${r.error}` : r.fetched ? `${r.dest}: fetched — ${r.written} written, ${r.removed} removed${r.sync ? `; ${r.sync.indexed} applied, ${r.sync.disposed} disposed` : ''}` : `${r.dest}: unchanged since ${r.modifiedAt ?? 'the last fetch'}`);
+        const pages = r.pages ? ` (${r.pages.fetched} of ${r.pages.total} pages fetched, ${r.pages.moved} moved, ${r.pages.removed} gone)` : '';
+        console.log(r.error ? `${r.dest}: ${r.error}` : r.fetched ? `${r.dest}: fetched${pages} — ${r.written} written, ${r.removed} removed${r.sync ? `; ${r.sync.indexed} applied, ${r.sync.disposed} disposed` : ''}` : `${r.dest}: unchanged since ${r.modifiedAt ?? 'the last fetch'}`);
         for (const w of r.warnings) console.log(`  warning: ${w}`);
       }
     } finally {

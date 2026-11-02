@@ -15,7 +15,8 @@
 
 /** A document reference as a person pastes it. */
 export interface FeishuRef {
-  kind: 'docx' | 'wiki';
+  /** A Docs page, a wiki page (its node token), or a whole wiki space (its id). */
+  kind: 'docx' | 'wiki' | 'space';
   token: string;
   /** The tenant host the link was on (my.feishu.cn, xxx.larksuite.com); null for a bare token. */
   host: string | null;
@@ -40,7 +41,8 @@ const UNSUPPORTED: Record<string, string> = {
 
 /**
  * Read a Feishu document link — `https://<tenant>.feishu.cn/docx/<token>`,
- * `/wiki/<token>`, the Lark equivalents — or a bare docx token.
+ * `/wiki/<token>`, a wiki space's `/wiki/space/<id>` (or its
+ * `/wiki/settings/<id>`), the Lark equivalents — or a bare docx token.
  */
 export function parseFeishuRef(input: string): FeishuRef {
   const text = String(input ?? '').trim();
@@ -58,10 +60,11 @@ export function parseFeishuRef(input: string): FeishuRef {
     const kind = segments[i].toLowerCase();
     const token = segments[i + 1];
     if (!TOKEN.test(token)) continue;
+    if ((kind === 'space' || kind === 'settings') && segments[i - 1]?.toLowerCase() === 'wiki') return { kind: 'space', token, host: url.hostname.toLowerCase() };
     if (kind === 'docx' || kind === 'wiki') return { kind, token, host: url.hostname.toLowerCase() };
     if (UNSUPPORTED[kind]) throw new Error(`${text} is ${UNSUPPORTED[kind]} — only Feishu Docs (docx), directly or in a wiki, can be imported`);
   }
-  throw new Error(`no document in ${text} — paste the link of a Feishu Docs page (…/docx/… or …/wiki/…)`);
+  throw new Error(`no document in ${text} — paste the link of a Feishu Docs page (…/docx/… or …/wiki/…) or of a wiki space (…/wiki/space/…)`);
 }
 
 /** Something a document references that lives in Feishu, not in its text. */

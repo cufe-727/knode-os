@@ -1,35 +1,32 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { FeishuLink, KnodeConfig, saveConfig } from '../../config.js';
-import { MAX_CONVERTIBLE_FILE_BYTES, MAX_FILE_BYTES } from '../../constants.js';
+import { FeishuLink, KnodeConfig, normalizeTimeOfDay, saveConfig } from '../../config.js';
 import { activityOf } from '../../activity.js';
-import { safePath, sanitizeRelativePath, walkFiles } from '../../fs/files.js';
-import { RAW_DOCS } from '../../fs/layout.js';
-import { isConvertibleFile, originalOfTranscript } from '../convert.js';
-import { FolderImportConflict, holdDest, isImportable, linkOwning, linksUnder, mirrorLinks } from '../folders.js';
+import { safePath } from '../../fs/files.js';
+import { FolderImportConflict, holdDest, linkOwning, linksUnder, mirrorLinks } from '../folders.js';
 import { sync, SyncContext, SyncStats } from '../sync.js';
 import { DocumentMeta, FeishuAuthStatus, FeishuError, LarkCli, LarkRunner } from './client.js';
-import { FeishuRef, parseFeishuRef, renderFeishuMarkdown, scanFeishuMarkdown } from './markdown.js';
+import { parseFeishuRef } from './markdown.js';
+import { FeishuTarget, feishuDestFor, feishuLinks, findFeishuMirror, mirrorFeishuDocument, readManifest, resolveFeishuTarget } from './mirror.js';
+import { FeishuTreeResult, isMirroredPage, listWikiTree, mirrorFeishuTree, readTreeManifest, resolveWikiTree, WikiTreePage, WikiTreeRoot } from './tree.js';
 
 /**
- * Feishu documents as a source — one person's Feishu Docs (directly or in a
- * wiki) mirrored into `raw/docs/feishu/<title>__<token>/`, once or kept in
- * sync, the way a folder from this machine is (src/ingest/folders.ts):
+ * Feishu documents as a source — one person's Feishu Docs, directly or in a
+ * wiki, mirrored into `raw/docs/feishu/`, once or kept in sync, the way a
+ * folder from this machine is (src/ingest/folders.ts). A document becomes a
+ * folder of its own (./mirror.ts); a wiki page with the pages under it, or a
+ * whole wiki space, becomes a tree of such folders that keeps the wiki's
+ * structure (./tree.ts). Several links can be imported in one batch.
  *
- *   <dest>/<title>.md        the document as Markdown, frontmatter saying where it came from
- *   <dest>/assets/<token>.*  its pictures and whiteboards — each one a source of its own,
- *                            transcribed by the vision model like any image
- *   <dest>/files/<name>      its attachments of a type knode-os indexes (PDF, text…);
- *                            the rest stay in Feishu, named in the text
- *   <dest>/.feishu.json      the manifest: which token each file came from, the revision held
- *
- * **One-time import** (`copy`) writes the mirror and forgets the document:
- * from then on it is ordinary workspace content. **Link** remembers it in
- * `ingest.feishuDocs`; while `serve` runs, a poller asks Feishu every few
- * minutes when each linked document was last edited (one metadata call per
- * 200 documents) and re-mirrors the ones that moved, syncing only the files
- * that changed. Pictures are downloaded once: Feishu gives a replaced picture
- * a new token, so a token already on disk is never fetched again.
+ * **One-time import** (`copy`) writes the mirror and forgets the source: from
+ * then on it is ordinary workspace content. **Link** remembers it in
+ * `ingest.feishuDocs`; while `serve` runs, it asks Feishu once a day
+ * (`ingest.feishu.checkAt`, 06:00 by default, and at startup when that time
+ * passed while it was down) when each linked document was last edited — one
+ * metadata call per 200 documents, one listing per wiki page with pages under
+ * it — and re-mirrors what changed, syncing only the files that changed. The
+ * Check now buttons in the app and the web UI (POST /api/feishu/sync) ask at
+ * once.
  *
  * Reading goes through lark-cli as the signed-in Feishu user (./client.ts).
  * That is why polling, not push: Feishu sends edit events only to a
@@ -44,24 +41,10 @@ import { FeishuRef, parseFeishuRef, renderFeishuMarkdown, scanFeishuMarkdown } f
  */
 
 export type { FeishuLink };
-
-export const FEISHU_ROOT = `${RAW_DOCS}/feishu`;
-const MANIFEST = '.feishu.json';
-
-export interface FeishuManifest {
-  token: string;
-  type: string;
-  url: string;
-  title: string;
-  /** The Markdown file's name inside the mirror — kept when the document is renamed, so its knowledge stays put. */
-  file: string;
-  revision: number;
-  modifiedAt: string | null;
-  /** media token → its path inside the mirror */
-  media: Record<string, string>;
-  /** Media that failed to download, with why, retried on the next pass. */
-  failed?: Record<string, string>;
-}
+export { FEISHU_ROOT, feishuDestFor, feishuLinks, findFeishuMirror, mirrorFeishuDocument, readManifest, resolveFeishuTarget } from './mirror.js';
+export type { FeishuManifest, FeishuMirrorResult, FeishuTarget } from './mirror.js';
+export { isMirroredPage, listWikiTree, MAX_TREE_PAGES, mirrorFeishuTree, readTreeManifest, resolveWikiTree } from './tree.js';
+export type { FeishuTreeResult, WikiTreePage, WikiTreeRoot } from './tree.js';
 
 /* ------------------------------ the client ------------------------------- */
 
@@ -76,306 +59,16 @@ export function feishuClient(config: KnodeConfig): LarkCli {
   return new LarkCli({ cli: config.ingest.feishu?.cli, runner: runnerOverride ?? undefined });
 }
 
-export function feishuLinks(config: KnodeConfig): FeishuLink[] {
-  return Array.isArray(config.ingest.feishuDocs) ? config.ingest.feishuDocs : [];
-}
-
-/* ------------------------------ targets ---------------------------------- */
-
-/** A document resolved to what Feishu stores it as: wiki links name a node, not the document. */
-export interface FeishuTarget {
-  ref: FeishuRef;
-  /** The docx token. */
-  token: string;
-  type: 'docx';
-  url: string;
-  title: string;
-  modifiedAt: string | null;
-  ownerId: string | null;
-  /** The wiki node a wiki link named. */
-  wiki?: string;
-}
-
-/** Read a link and ask Feishu what it is — which also proves the signed-in user may read it. */
-export async function resolveFeishuTarget(client: LarkCli, input: string): Promise<FeishuTarget> {
-  const ref = parseFeishuRef(input);
-  let token = ref.token;
-  let wiki: string | undefined;
-  let title = '';
-  if (ref.kind === 'wiki') {
-    const node = await client.wikiNode(ref.token);
-    if (node.objType !== 'docx') throw new FeishuError(`${input} is a wiki page holding a ${node.objType || 'non-document'} — only Docs (docx) pages can be imported`, 'other');
-    token = node.objToken;
-    wiki = ref.token;
-    title = node.title;
-  }
-  const { metas, failed } = await client.metas([{ token, type: 'docx' }]);
-  const meta = metas.get(token);
-  if (!meta) {
-    const code = failed.get(token);
-    throw new FeishuError(`cannot read ${input}${code ? ` (Feishu code ${code})` : ''}`, 'forbidden', 'check that the link is right and that the signed-in Feishu user can open it');
-  }
-  const host = ref.host ?? (meta.url ? new URL(meta.url).hostname : 'feishu.cn');
-  const url = wiki ? `https://${host}/wiki/${wiki}` : meta.url ?? `https://${host}/docx/${token}`;
-  return { ref, token, type: 'docx', url, title: meta.title || title || token, modifiedAt: meta.modifiedAt, ownerId: meta.ownerId, wiki };
-}
-
-/** A name that is safe as one path segment on every filesystem knode-os runs on. */
-function segmentName(title: string, fallback: string): string {
-  const clean = title
-    .replace(/[\\/:*?"<>|#^[\]\u0000-\u001f]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/^\.+/, '')
-    .slice(0, 80)
-    .trim();
-  return clean || fallback;
-}
-
-/** The mirror's folder: `raw/docs/feishu/<title>__<token>`, or a folder under raw/docs the caller names. */
-export function feishuDestFor(target: { title: string; token: string }, dest?: string): string {
-  if (dest?.trim()) {
-    const name = sanitizeRelativePath(dest.trim());
-    const rel = name === RAW_DOCS || name.startsWith(`${RAW_DOCS}/`) ? name : `${RAW_DOCS}/${name}`;
-    if (rel === RAW_DOCS) throw new Error(`the destination must be a folder under ${RAW_DOCS}/, not ${RAW_DOCS} itself`);
-    return rel;
-  }
-  return `${FEISHU_ROOT}/${segmentName(target.title, 'document')}__${target.token}`;
-}
-
-export function readManifest(dataDir: string, dest: string): FeishuManifest | null {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(safePath(dataDir, dest), MANIFEST), 'utf8')) as FeishuManifest;
-  } catch {
-    return null;
-  }
-}
-
-/** Where a document was imported before, by its token: its link, else a mirror under raw/docs/feishu named for it. */
-export function findFeishuMirror(dataDir: string, config: KnodeConfig, token: string): string | null {
-  const link = feishuLinks(config).find((l) => l.token === token);
-  if (link) return link.dest;
-  const root = safePath(dataDir, FEISHU_ROOT);
-  try {
-    for (const e of fs.readdirSync(root, { withFileTypes: true })) {
-      if (e.isDirectory() && e.name.endsWith(`__${token}`)) return `${FEISHU_ROOT}/${e.name}`;
-    }
-  } catch {
-    // no Feishu documents yet
-  }
-  return null;
-}
-
-/* ------------------------------ mirroring -------------------------------- */
-
-export interface FeishuMirrorResult {
-  dest: string;
-  /** The Markdown file's key. */
-  file: string;
-  title: string;
-  revision: number;
-  modifiedAt: string | null;
-  /** Keys written this pass: the Markdown when it changed, and new pictures and attachments. */
-  written: string[];
-  /** Keys removed because the document no longer references them. */
-  removed: string[];
-  images: number;
-  attachments: number;
-  /** Attachments and embeds that stay in Feishu (a type knode-os does not index, or too large). */
-  keptInFeishu: number;
-  warnings: string[];
-}
-
-const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|tiff?|avif|heic|heif|svg)$/i;
-
-/** A relative link target Markdown reads whole: angle brackets when the path has spaces or parentheses. */
-const href = (rel: string) => (/[\s()<>]/.test(rel) ? `<${rel}>` : rel);
-
-/** The local name of an attachment: its own name, made unique within the mirror. */
-function attachmentName(name: string, token: string, taken: Set<string>): string {
-  const ext = path.extname(name);
-  const base = segmentName(path.basename(name, ext), token);
-  let candidate = `files/${base}${ext.toLowerCase()}`;
-  if (taken.has(candidate)) candidate = `files/${base}-${token.slice(0, 8)}${ext.toLowerCase()}`;
-  taken.add(candidate);
-  return candidate;
-}
-
-/** Write through a hidden temporary name and rename into place, only when the bytes differ. */
-function writeIfChanged(abs: string, content: string): boolean {
-  try {
-    if (fs.readFileSync(abs, 'utf8') === content) return false;
-  } catch {
-    // new
-  }
-  fs.mkdirSync(path.dirname(abs), { recursive: true });
-  const tmp = path.join(path.dirname(abs), `.${path.basename(abs)}.${process.pid}.tmp`);
-  try {
-    fs.writeFileSync(tmp, content);
-    fs.renameSync(tmp, abs);
-  } finally {
-    fs.rmSync(tmp, { force: true });
-  }
-  return true;
-}
-
-function yamlString(value: string): string {
-  return JSON.stringify(value);
-}
-
-/** The document as knode-os keeps it: provenance in the frontmatter, the title as its heading. */
-function composeMarkdown(target: FeishuTarget, revision: number, body: string): string {
-  const lines = [
-    '---',
-    `title: ${yamlString(target.title)}`,
-    'platform: feishu',
-    `source_url: ${yamlString(target.url)}`,
-    `feishu_token: ${yamlString(target.token)}`,
-    ...(target.wiki ? [`feishu_wiki_node: ${yamlString(target.wiki)}`] : []),
-    `feishu_revision: ${revision}`,
-    // the text is as of the last edit Feishu reports
-    ...(target.modifiedAt ? [`as_of: ${yamlString(target.modifiedAt)}`] : []),
-    'tags: ["platform/feishu"]',
-    '---',
-    '',
-    `# ${target.title}`,
-    '',
-    body,
-    '',
-  ];
-  return lines.join('\n');
-}
-
-/**
- * Bring the mirror at `dest` up to the document's current content: fetch it,
- * download what it references that is not on disk yet, write the Markdown
- * when it changed, and remove what it no longer references. Idempotent: a
- * second pass over an unchanged document writes nothing.
- */
-export async function mirrorFeishuDocument(dataDir: string, client: LarkCli, target: FeishuTarget, dest: string, opts: { onProgress?: (m: string) => void } = {}): Promise<FeishuMirrorResult> {
-  const progress = opts.onProgress ?? (() => {});
-  const destAbs = safePath(dataDir, dest);
-  const before = readManifest(dataDir, dest);
-  const doc = await client.fetchDocument(target.token);
-  const scanned = scanFeishuMarkdown(doc.content);
-  fs.mkdirSync(destAbs, { recursive: true });
-
-  const warnings: string[] = [];
-  const written: string[] = [];
-  const media: Record<string, string> = {};
-  const failed: Record<string, string> = {};
-  const taken = new Set<string>(Object.values(before?.media ?? {}).filter((rel) => rel.startsWith('files/')));
-  // downloads land in a hidden folder first: no walker or watcher sees a half-written file
-  const staging = path.join(destAbs, `.download-${process.pid}`);
-  let keptInFeishu = 0;
-  try {
-    for (const m of scanned.media) {
-      const known = before?.media[m.token];
-      if (known && fs.existsSync(path.join(destAbs, known))) {
-        media[m.token] = known;
-        continue;
-      }
-      if (m.kind === 'file') {
-        const name = m.name ?? m.token;
-        if (!isImportable(name)) {
-          keptInFeishu++;
-          continue;
-        }
-        if ((m.bytes ?? 0) > MAX_CONVERTIBLE_FILE_BYTES || (!isConvertibleFile(name) && (m.bytes ?? 0) > MAX_FILE_BYTES)) {
-          keptInFeishu++;
-          warnings.push(`${name}: too large to index — kept in Feishu`);
-          continue;
-        }
-      }
-      try {
-        fs.mkdirSync(staging, { recursive: true });
-        const got = await client.download(m.token, path.join(staging, m.token), m.kind === 'whiteboard' ? 'whiteboard' : 'media');
-        const ext = path.extname(got.path).toLowerCase();
-        let rel: string;
-        if (m.kind === 'file') {
-          rel = attachmentName(m.name ?? `${m.token}${ext}`, m.token, taken);
-        } else {
-          rel = `assets/${m.token}${ext || '.png'}`;
-          if (!IMAGE_EXT.test(rel)) warnings.push(`${m.token}: Feishu served ${got.contentType || 'an unknown type'} for a picture`);
-        }
-        const abs = path.join(destAbs, rel);
-        fs.mkdirSync(path.dirname(abs), { recursive: true });
-        fs.renameSync(got.path, abs);
-        media[m.token] = rel;
-        written.push(`${dest}/${rel}`);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        failed[m.token] = message;
-        warnings.push(`${m.name ?? m.token}: ${message}`);
-      }
-    }
-  } finally {
-    fs.rmSync(staging, { recursive: true, force: true });
-  }
-  if (written.length) progress(`feishu ${dest}: ${written.length} picture(s) and attachment(s) downloaded`);
-
-  const rendered = renderFeishuMarkdown(doc.content, (m) => (media[m.token] ? { href: href(media[m.token]) } : null), { host: target.ref.host ?? new URL(target.url).hostname });
-  const title = target.title || rendered.title || target.token;
-  const file = before?.file ?? `${segmentName(title, 'document')}.md`;
-  const fileKey = `${dest}/${file}`;
-  if (writeIfChanged(path.join(destAbs, file), composeMarkdown({ ...target, title }, doc.revisionId, rendered.body))) written.unshift(fileKey);
-
-  // what the document stopped referencing goes; so does a stray file the manifest never named
-  const keep = new Set([file, ...Object.values(media)]);
-  const removed: string[] = [];
-  for (const key of walkFiles(dataDir, dest)) {
-    const rel = key.slice(dest.length + 1);
-    if (keep.has(rel)) continue;
-    // a reviewed transcript beside a picture (docs/design/19) is a person's reading of it: it stays while the picture does
-    const original = originalOfTranscript(rel);
-    if (original && keep.has(original)) continue;
-    fs.rmSync(safePath(dataDir, key), { force: true });
-    removed.push(key);
-  }
-  for (const sub of ['assets', 'files']) {
-    try {
-      fs.rmdirSync(path.join(destAbs, sub));
-    } catch {
-      // not empty, or not there
-    }
-  }
-
-  const manifest: FeishuManifest = {
-    token: target.token,
-    type: target.type,
-    url: target.url,
-    title,
-    file,
-    revision: doc.revisionId,
-    modifiedAt: target.modifiedAt,
-    media,
-    ...(Object.keys(failed).length ? { failed } : {}),
-  };
-  writeIfChanged(path.join(destAbs, MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`);
-  const images = Object.values(media).filter((rel) => rel.startsWith('assets/')).length;
-  return {
-    dest,
-    file: fileKey,
-    title,
-    revision: doc.revisionId,
-    modifiedAt: target.modifiedAt,
-    written,
-    removed,
-    images,
-    attachments: Object.keys(media).length - images,
-    keptInFeishu: keptInFeishu + (doc.content.match(/<(bitable|sheet)\b/gi)?.length ?? 0),
-    warnings,
-  };
-}
-
 /* ------------------------------ import / link ---------------------------- */
 
 export type FeishuImportMode = 'copy' | 'link';
 
 export interface FeishuImportOptions {
   mode: FeishuImportMode;
-  /** Destination folder under raw/docs; default raw/docs/feishu/<title>__<token>. */
+  /** Destination folder under raw/docs; default raw/docs/feishu/<title>__<token>. One import's, never a batch's. */
   dest?: string;
+  /** A wiki page comes with the pages under it, as a tree of folders (a wiki space always does). */
+  subpages?: boolean;
   llmGraph?: boolean;
   onProgress?: (msg: string) => void;
   /** As for a folder import: return once the mirror is written and index it afterwards. */
@@ -385,14 +78,42 @@ export interface FeishuImportOptions {
   };
 }
 
-export interface FeishuImportResult extends FeishuMirrorResult {
+/** What one import wrote: a document, or a wiki tree. */
+export interface FeishuPlaced {
+  kind: 'document' | 'tree';
   url: string;
   token: string;
+  title: string;
+  dest: string;
   mode: FeishuImportMode;
-  /** The document was imported here before: this import refreshed that copy. */
+  /** It was imported here before: this import refreshed that copy. */
   refreshed: boolean;
+  /** The document's Markdown; null for a tree. */
+  file: string | null;
+  revision: number | null;
+  modifiedAt: string | null;
+  /** Keys written this pass: the Markdown when it changed, and new pictures and attachments. */
+  written: string[];
+  /** Keys removed because the source no longer references them. */
+  removed: string[];
+  images: number;
+  attachments: number;
+  /** Attachments, embeds and wiki pages of another kind that stay in Feishu. */
+  keptInFeishu: number;
+  /** A tree's pages: in all, how many are Docs documents, how many were fetched. */
+  pages: { total: number; documents: number; fetched: number } | null;
+  warnings: string[];
+}
+
+export interface FeishuImportResult extends FeishuPlaced {
   sync: SyncStats | null;
   indexing: boolean;
+}
+
+/** Placed and waiting to be indexed: the folder stays held until then. */
+interface Placement {
+  result: FeishuPlaced;
+  release: () => void;
 }
 
 /** The `only` list for a sync after a pass: each key while there are few, the whole mirror otherwise. */
@@ -403,76 +124,395 @@ function persistLinks(ctx: SyncContext, links: FeishuLink[]): void {
   saveConfig(ctx.dataDir, ctx.config);
 }
 
-/**
- * Import a Feishu document: resolve the link, mirror it, remember it when
- * linking, and index what was written. Importing a document that is already
- * here refreshes that copy instead of making a second one.
- */
-export async function importFeishuDocument(ctx: SyncContext, client: LarkCli, input: string, opts: FeishuImportOptions): Promise<FeishuImportResult> {
-  const target = await resolveFeishuTarget(client, input);
-  const links = feishuLinks(ctx.config);
-  const existingLink = links.find((l) => l.token === target.token);
-  if (existingLink && opts.mode === 'link') throw new FolderImportConflict(`${target.title} is already linked at ${existingLink.dest}`);
-  if (existingLink) throw new FolderImportConflict(`${target.title} is linked at ${existingLink.dest} and kept in sync already — sync it instead`);
-  const previous = opts.dest ? null : findFeishuMirror(ctx.dataDir, ctx.config, target.token);
-  const dest = previous ?? feishuDestFor(target, opts.dest);
+/** Where an import goes, refusing what would clash with a link or another source's mirror. */
+function placeFor(ctx: SyncContext, source: { token: string; title: string }, opts: FeishuImportOptions, holds: (dest: string) => boolean): { dest: string; existed: boolean } {
+  const existingLink = feishuLinks(ctx.config).find((l) => l.token === source.token);
+  if (existingLink && opts.mode === 'link') throw new FolderImportConflict(`${source.title} is already linked at ${existingLink.dest}`);
+  if (existingLink) throw new FolderImportConflict(`${source.title} is linked at ${existingLink.dest} and kept in sync already — sync it instead`);
+  const previous = opts.dest ? null : findFeishuMirror(ctx.dataDir, ctx.config, source.token);
+  const dest = previous ?? feishuDestFor(source, opts.dest);
   const owner = linkOwning(mirrorLinks(ctx.config), dest);
   if (owner) throw new FolderImportConflict(`${dest} is inside ${owner.dest}, which is mirrored from ${owner.source}`);
   const inside = linksUnder(mirrorLinks(ctx.config), dest);
   if (inside.length) throw new FolderImportConflict(`${dest} would contain the linked ${inside[0].dest} — pick another destination`);
   const destAbs = safePath(ctx.dataDir, dest);
-  const manifest = readManifest(ctx.dataDir, dest);
-  if (fs.existsSync(destAbs) && fs.readdirSync(destAbs).length && manifest?.token !== target.token) {
-    throw new FolderImportConflict(`${dest} already exists and holds something else — pick another destination`);
-  }
+  const occupied = fs.existsSync(destAbs) && fs.readdirSync(destAbs).length > 0;
+  if (occupied && !holds(dest)) throw new FolderImportConflict(`${dest} already exists and holds something else — pick another destination`);
+  return { dest, existed: occupied };
+}
 
-  const progress = opts.onProgress ?? (() => {});
-  progress(`${opts.mode === 'link' ? 'linking' : 'importing'} ${target.url} → ${dest}`);
+async function placeDocument(ctx: SyncContext, client: LarkCli, target: FeishuTarget, opts: FeishuImportOptions): Promise<Placement> {
+  const { dest, existed } = placeFor(ctx, target, opts, (d) => readManifest(ctx.dataDir, d)?.token === target.token);
+  opts.onProgress?.(`${opts.mode === 'link' ? 'linking' : 'importing'} ${target.url} → ${dest}`);
   const release = holdDest(ctx.dataDir, dest);
-  let handedOff = false;
   try {
     const mirrored = await mirrorFeishuDocument(ctx.dataDir, client, target, dest, { onProgress: opts.onProgress });
     if (opts.mode === 'link') {
-      persistLinks(ctx, [...links, { url: target.url, token: target.token, type: target.type, ...(target.wiki ? { wiki: target.wiki } : {}), title: mirrored.title, dest, createdAt: new Date().toISOString() }]);
+      persistLinks(ctx, [...feishuLinks(ctx.config), { url: target.url, token: target.token, type: 'docx', ...(target.wiki ? { wiki: target.wiki } : {}), title: mirrored.title, dest, createdAt: new Date().toISOString() }]);
     }
-    const changed = [...mirrored.written, ...mirrored.removed];
-    const base = { ...mirrored, url: target.url, token: target.token, mode: opts.mode, refreshed: Boolean(manifest) };
-    if (changed.length === 0) return { ...base, sync: null, indexing: false };
-    const indexing = sync(ctx, { only: syncScope(dest, changed), llmGraph: opts.llmGraph, onProgress: opts.onProgress });
-    if (opts.background) {
-      const { track = (job) => job, onIndexed } = opts.background;
-      handedOff = true;
-      void track(indexing.finally(release)).then(
-        (stats) => onIndexed?.({ dest, sync: stats }),
-        (err) => onIndexed?.({ dest, sync: null, error: err instanceof Error ? err.message : String(err) }),
-      );
-      return { ...base, sync: null, indexing: true };
-    }
-    return { ...base, sync: await indexing, indexing: false };
-  } finally {
-    if (!handedOff) release();
+    const { file, revision, modifiedAt, written, removed, images, attachments, keptInFeishu, warnings, title } = mirrored;
+    return {
+      result: { kind: 'document', url: target.url, token: target.token, title, dest, mode: opts.mode, refreshed: existed, file, revision, modifiedAt, written, removed, images, attachments, keptInFeishu, pages: null, warnings },
+      release,
+    };
+  } catch (err) {
+    release();
+    throw err;
   }
+}
+
+async function placeTree(ctx: SyncContext, client: LarkCli, root: WikiTreeRoot, opts: FeishuImportOptions): Promise<Placement> {
+  const { dest, existed } = placeFor(ctx, root, opts, (d) => {
+    const manifest = readTreeManifest(ctx.dataDir, d);
+    return Boolean(manifest) && (manifest!.root ?? manifest!.spaceId) === root.token;
+  });
+  opts.onProgress?.(`${opts.mode === 'link' ? 'linking' : 'importing'} ${root.url} with its pages → ${dest}`);
+  const release = holdDest(ctx.dataDir, dest);
+  try {
+    const pages = await treePages(client, root, { reuse: true });
+    const tree = await mirrorFeishuTree(ctx.dataDir, client, root, dest, { onProgress: opts.onProgress, pages });
+    if (opts.mode === 'link') {
+      persistLinks(ctx, [
+        ...feishuLinks(ctx.config),
+        { url: root.url, token: root.token, type: 'wiki-tree', space: root.spaceId, ...(root.node ? { wiki: root.node.nodeToken } : {}), title: root.title, dest, createdAt: new Date().toISOString() },
+      ]);
+    }
+    return { result: { ...fromTree(tree), mode: opts.mode, token: root.token, refreshed: existed }, release };
+  } catch (err) {
+    release();
+    throw err;
+  }
+}
+
+function fromTree(tree: FeishuTreeResult): Omit<FeishuPlaced, 'mode' | 'token' | 'refreshed'> {
+  return {
+    kind: 'tree',
+    url: tree.url,
+    title: tree.title,
+    dest: tree.dest,
+    file: null,
+    revision: null,
+    modifiedAt: null,
+    written: tree.written,
+    removed: tree.removed,
+    images: tree.images,
+    attachments: tree.attachments,
+    keptInFeishu: tree.keptInFeishu.length,
+    pages: { total: tree.pages, documents: tree.documents, fetched: tree.fetched },
+    warnings: tree.warnings,
+  };
+}
+
+/** Trees listed for a preview lately, so the import right after it does not list them again (once). */
+const listings = new Map<string, { at: number; pages: WikiTreePage[] }>();
+const LISTING_REUSE_MS = 10 * 60_000;
+
+async function treePages(client: LarkCli, root: WikiTreeRoot, opts: { reuse: boolean }): Promise<WikiTreePage[]> {
+  const cached = listings.get(root.token);
+  listings.delete(root.token);
+  if (opts.reuse && cached && Date.now() - cached.at < LISTING_REUSE_MS) return cached.pages;
+  const pages = await listWikiTree(client, root);
+  if (!opts.reuse) listings.set(root.token, { at: Date.now(), pages });
+  for (const [token, l] of listings) if (Date.now() - l.at > LISTING_REUSE_MS) listings.delete(token);
+  return pages;
+}
+
+/** What importing one link would bring, before anything is written — and proof the signed-in account may read it. */
+export interface FeishuPreview {
+  input: string;
+  kind: 'document' | 'tree';
+  url: string;
+  token: string;
+  title: string;
+  /** A document's last edit; a tree's latest among its pages. */
+  modifiedAt: string | null;
+  wiki: string | null;
+  dest: string;
+  /** A tree's pages: in all, Docs documents among them, pages of other kinds and shortcuts left in Feishu, how many levels of folders. */
+  pages: { total: number; documents: number; keptInFeishu: number; levels: number } | null;
+  existing: { dest: string; revision: number | null; modifiedAt: string | null } | null;
+  linked: { dest: string } | null;
+}
+
+export async function previewFeishu(ctx: { dataDir: string; config: KnodeConfig }, client: LarkCli, input: string, opts: { subpages?: boolean; dest?: string } = {}): Promise<FeishuPreview> {
+  const ref = parseFeishuRef(input);
+  if (ref.kind === 'space' || (ref.kind === 'wiki' && opts.subpages)) {
+    const root = await resolveWikiTree(client, input);
+    if (!root.node || root.node.hasChild) {
+      const pages = await treePages(client, root, { reuse: false });
+      const dest = (opts.dest ? null : findFeishuMirror(ctx.dataDir, ctx.config, root.token)) ?? feishuDestFor(root, opts.dest);
+      const link = feishuLinks(ctx.config).find((l) => l.token === root.token);
+      const documents = pages.filter(isMirroredPage).length;
+      return {
+        input,
+        kind: 'tree',
+        url: root.url,
+        token: root.token,
+        title: root.title,
+        modifiedAt: pages.map((p) => p.editedAt).filter((t): t is string => Boolean(t)).sort().at(-1) ?? null,
+        wiki: root.node?.nodeToken ?? null,
+        dest,
+        pages: { total: pages.length, documents, keptInFeishu: pages.length - documents, levels: 1 + Math.max(0, ...pages.map((p) => p.depth)) },
+        existing: readTreeManifest(ctx.dataDir, dest) ? { dest, revision: null, modifiedAt: null } : null,
+        linked: link ? { dest: link.dest } : null,
+      };
+    }
+  }
+  const target = await resolveFeishuTarget(client, input);
+  const dest = (opts.dest ? null : findFeishuMirror(ctx.dataDir, ctx.config, target.token)) ?? feishuDestFor(target, opts.dest);
+  const manifest = readManifest(ctx.dataDir, dest);
+  const link = feishuLinks(ctx.config).find((l) => l.token === target.token);
+  return {
+    input,
+    kind: 'document',
+    url: target.url,
+    token: target.token,
+    title: target.title,
+    modifiedAt: target.modifiedAt,
+    wiki: target.wiki ?? null,
+    dest,
+    pages: null,
+    existing: manifest ? { dest, revision: manifest.revision, modifiedAt: manifest.modifiedAt } : null,
+    linked: link ? { dest: link.dest } : null,
+  };
+}
+
+/** Resolve a link and write its mirror: a wiki space, or a wiki page with `subpages` that has some, as a tree; anything else as one document. */
+async function place(ctx: SyncContext, client: LarkCli, input: string, opts: FeishuImportOptions): Promise<Placement> {
+  const ref = parseFeishuRef(input);
+  if (ref.kind === 'space' || (ref.kind === 'wiki' && opts.subpages)) {
+    const root = await resolveWikiTree(client, input);
+    if (!root.node || root.node.hasChild) return placeTree(ctx, client, root, opts);
+  }
+  return placeDocument(ctx, client, await resolveFeishuTarget(client, input), opts);
+}
+
+/** Index what the placements wrote, at once or (with `background`) after returning; their folders are released once it is done. */
+async function indexPlaced(ctx: SyncContext, placements: Placement[], opts: FeishuImportOptions): Promise<{ sync: SyncStats | null; indexing: boolean }> {
+  const releaseAll = () => placements.forEach((p) => p.release());
+  const touched = placements.filter((p) => p.result.written.length + p.result.removed.length > 0);
+  if (touched.length === 0) {
+    releaseAll();
+    return { sync: null, indexing: false };
+  }
+  const keys = touched.flatMap((p) => [...p.result.written, ...p.result.removed]);
+  const only = keys.length > 200 ? touched.map((p) => p.result.dest) : keys;
+  const indexing = sync(ctx, { only, llmGraph: opts.llmGraph, onProgress: opts.onProgress });
+  if (opts.background) {
+    const { track = (job) => job, onIndexed } = opts.background;
+    const dest = touched.map((p) => p.result.dest).join(', ');
+    void track(indexing.finally(releaseAll)).then(
+      (stats) => onIndexed?.({ dest, sync: stats }),
+      (err) => onIndexed?.({ dest, sync: null, error: err instanceof Error ? err.message : String(err) }),
+    );
+    return { sync: null, indexing: true };
+  }
+  try {
+    return { sync: await indexing, indexing: false };
+  } finally {
+    releaseAll();
+  }
+}
+
+/**
+ * Import a Feishu document — or, with `subpages`, a wiki page with the pages
+ * under it; a wiki space always comes whole — then remember it when linking,
+ * and index what was written. Importing what is already here refreshes that
+ * copy instead of making a second one.
+ */
+export async function importFeishuDocument(ctx: SyncContext, client: LarkCli, input: string, opts: FeishuImportOptions): Promise<FeishuImportResult> {
+  const placed = await place(ctx, client, input, opts);
+  return { ...placed.result, ...(await indexPlaced(ctx, [placed], opts)) };
+}
+
+export interface FeishuBatchItem {
+  input: string;
+  ok: boolean;
+  result: FeishuPlaced | null;
+  error: string | null;
+  /** Refused because it clashes with something here (linked already, a folder taken). */
+  conflict: boolean;
+}
+
+/** The links of a batch: one per line or comma, each once. */
+export function splitFeishuInputs(inputs: string | string[]): string[] {
+  const all = (Array.isArray(inputs) ? inputs : [inputs]).flatMap((s) => String(s ?? '').split(/[\s,]+/));
+  return [...new Set(all.map((s) => s.trim()).filter(Boolean))];
+}
+
+/**
+ * Import several links in one go, each as `importFeishuDocument` would; one
+ * that fails is reported and the rest go on, until Feishu wants a new
+ * sign-in, which ends the batch. What was written is indexed in one sync.
+ */
+export async function importFeishuBatch(
+  ctx: SyncContext,
+  client: LarkCli,
+  inputs: string[],
+  opts: FeishuImportOptions & { onItem?: (index: number, item: FeishuBatchItem | null) => void },
+): Promise<{ items: FeishuBatchItem[]; sync: SyncStats | null; indexing: boolean }> {
+  if (opts.dest && inputs.length > 1) throw new Error('a destination names one import\'s folder — leave it out to import several');
+  const placements: Placement[] = [];
+  const items: FeishuBatchItem[] = [];
+  let stop: string | null = null;
+  for (const [i, input] of inputs.entries()) {
+    if (stop) {
+      items.push({ input, ok: false, result: null, error: stop, conflict: false });
+      continue;
+    }
+    opts.onItem?.(i, null);
+    try {
+      const placed = await place(ctx, client, input, opts);
+      placements.push(placed);
+      items.push({ input, ok: true, result: placed.result, error: null, conflict: false });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      items.push({ input, ok: false, result: null, error: message, conflict: err instanceof FolderImportConflict });
+      if (err instanceof FeishuError && (err.kind === 'auth' || err.kind === 'not-installed')) stop = message;
+    }
+    opts.onItem?.(i, items[i]);
+  }
+  return { items, ...(await indexPlaced(ctx, placements, opts)) };
+}
+
+/* ------------------------------ background imports ----------------------- */
+
+/** A batch (or a tree) imported in the background, as the web UI follows it. */
+export interface FeishuImportJob {
+  id: string;
+  mode: FeishuImportMode;
+  subpages: boolean;
+  state: 'running' | 'done' | 'failed';
+  startedAt: string;
+  finishedAt: string | null;
+  inputs: string[];
+  /** Links finished so far, and the one under way. */
+  done: number;
+  current: string | null;
+  items: FeishuBatchItem[];
+  /** What was written is being indexed still. */
+  indexing: boolean;
+  sync: SyncStats | null;
+  error: string | null;
+}
+
+const importJobs = new Map<string, FeishuImportJob[]>();
+const KEPT_JOBS = 10;
+
+export function feishuImportJobs(dataDir: string): FeishuImportJob[] {
+  return importJobs.get(dataDir) ?? [];
+}
+
+/**
+ * Start importing `inputs` in the background, as an activity of the
+ * workspace: returned at once, filled in as it goes. One runs at a time per
+ * workspace. `done` settles when the links are written (indexing may go on).
+ */
+export function startFeishuImport(
+  ctx: SyncContext,
+  client: LarkCli,
+  inputs: string[],
+  opts: { mode: FeishuImportMode; subpages?: boolean; llmGraph?: boolean; log?: (m: string) => void; track?: <T>(job: Promise<T>) => Promise<T>; onDone?: (job: FeishuImportJob) => void },
+): { job: FeishuImportJob; done: Promise<FeishuImportJob> } {
+  if (inputs.length === 0) throw new Error('no Feishu links to import');
+  const jobs = feishuImportJobs(ctx.dataDir);
+  if (jobs.some((j) => j.state === 'running')) throw new FolderImportConflict('a Feishu import is under way in this workspace — wait for it to end');
+  const job: FeishuImportJob = {
+    id: `feishu-${Date.now().toString(36)}`,
+    mode: opts.mode,
+    subpages: Boolean(opts.subpages),
+    state: 'running',
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    inputs,
+    done: 0,
+    current: inputs[0],
+    items: [],
+    indexing: false,
+    sync: null,
+    error: null,
+  };
+  importJobs.set(ctx.dataDir, [job, ...jobs].slice(0, KEPT_JOBS));
+  const track = opts.track ?? ((p) => p);
+  let indexed = false;
+  const verb = opts.mode === 'link' ? 'Link' : 'Import';
+  const label = inputs.length === 1 ? `${verb} ${inputs[0]}${opts.subpages ? ' with its pages' : ''}` : `${verb} ${inputs.length} Feishu links${opts.subpages ? ' with their pages' : ''}`;
+  const work = activityOf(ctx.dataDir).run(
+    'feishu',
+    label,
+    (progress) =>
+      importFeishuBatch(ctx, client, inputs, {
+        mode: opts.mode,
+        subpages: opts.subpages,
+        llmGraph: opts.llmGraph,
+        onProgress: (m) => {
+          opts.log?.(m);
+          progress(inputs.length > 1 ? `${job.done + 1} of ${inputs.length} · ${m}` : m);
+        },
+        onItem: (i, item) => {
+          if (item) {
+            job.items[i] = item;
+            job.done = i + 1;
+            job.current = inputs[i + 1] ?? null;
+          } else {
+            job.current = inputs[i];
+          }
+        },
+        background: {
+          track,
+          onIndexed: (d) => {
+            indexed = true;
+            job.indexing = false;
+            job.sync = d.sync;
+            opts.log?.(d.error ? `feishu ${d.dest}: indexing failed: ${d.error}` : `feishu ${d.dest}: ${d.sync!.indexed} indexed, ${d.sync!.unchanged} unchanged, ${d.sync!.errors} errors`);
+          },
+        },
+      }),
+    (out) => {
+      const ok = out.items.filter((x) => x.ok).length;
+      const failed = out.items.length - ok;
+      return `${ok} of ${out.items.length} written${failed ? `, ${failed} failed` : ''}${out.indexing ? ' · indexing' : ''}`;
+    },
+  );
+  const done = work.then(
+    (out) => {
+      Object.assign(job, { items: out.items, indexing: out.indexing && !indexed, sync: job.sync ?? out.sync, state: 'done', current: null, finishedAt: new Date().toISOString() });
+      opts.onDone?.(job);
+      return job;
+    },
+    (err) => {
+      Object.assign(job, { state: 'failed', error: err instanceof Error ? err.message : String(err), current: null, finishedAt: new Date().toISOString() });
+      return job;
+    },
+  );
+  void track(done);
+  return { job, done };
 }
 
 export interface FeishuRefreshResult {
   dest: string;
   url: string;
   title: string;
-  /** Feishu says it changed (or the refresh was forced), so it was fetched again. */
+  kind: 'document' | 'tree';
+  /** Feishu says it changed (or the refresh was forced), so it was fetched again — for a tree, some of its pages. */
   fetched: boolean;
   written: number;
   removed: number;
+  /** A document's last edit; a tree's latest one among its pages. */
   modifiedAt: string | null;
+  /** A tree's pages: in all, Docs documents among them, fetched, moved to follow the wiki, gone from it. */
+  pages: { total: number; documents: number; fetched: number; moved: number; removed: number } | null;
   sync: SyncStats | null;
-  /** Why the document could not be read; the mirror was left alone. */
+  /** Why it could not be read; the mirror was left alone. */
   error: string | null;
   warnings: string[];
 }
 
 /**
- * Bring linked documents (all, or the one at `dest`) up to date: one
- * metadata call says which changed since their mirror was written, and only
- * those are fetched. `force` fetches every one regardless.
+ * Bring linked documents and trees (all, or the one at `dest`) up to date:
+ * one metadata call says which documents changed since their mirror was
+ * written, a tree's listing which of its pages did, and only those are
+ * fetched. `force` fetches every one regardless.
  */
 export async function refreshFeishuLinks(
   ctx: SyncContext,
@@ -482,12 +522,17 @@ export async function refreshFeishuLinks(
   const links = feishuLinks(ctx.config).filter((l) => !opts.dest || l.dest === opts.dest);
   if (opts.dest && links.length === 0) throw new Error(`no linked Feishu document at ${opts.dest}`);
   if (links.length === 0) return [];
-  const { metas, failed } = await client.metas(links.map((l) => ({ token: l.token, type: l.type })));
+  const docs = links.filter((l) => l.type !== 'wiki-tree');
+  const { metas, failed } = docs.length ? await client.metas(docs.map((l) => ({ token: l.token, type: 'docx' }))) : { metas: new Map<string, DocumentMeta>(), failed: new Map<string, number>() };
   const out: FeishuRefreshResult[] = [];
   for (const link of links) {
-    out.push(await refreshOne(ctx, client, link, metas.get(link.token) ?? null, failed.get(link.token), opts));
+    out.push(link.type === 'wiki-tree' ? await refreshTree(ctx, client, link, opts) : await refreshOne(ctx, client, link, metas.get(link.token) ?? null, failed.get(link.token), opts));
   }
   return out;
+}
+
+function renamed(ctx: SyncContext, link: FeishuLink, title: string): void {
+  if (title && title !== link.title) persistLinks(ctx, feishuLinks(ctx.config).map((l) => (l.dest === link.dest ? { ...l, title } : l)));
 }
 
 async function refreshOne(
@@ -498,7 +543,7 @@ async function refreshOne(
   failedCode: number | undefined,
   opts: { force?: boolean; onProgress?: (m: string) => void },
 ): Promise<FeishuRefreshResult> {
-  const base = { dest: link.dest, url: link.url, title: link.title, fetched: false, written: 0, removed: 0, modifiedAt: meta?.modifiedAt ?? null, sync: null, warnings: [] as string[] };
+  const base = { dest: link.dest, url: link.url, title: link.title, kind: 'document' as const, fetched: false, written: 0, removed: 0, modifiedAt: meta?.modifiedAt ?? null, pages: null, sync: null, warnings: [] as string[] };
   if (!meta) {
     return { ...base, error: `Feishu would not return this document${failedCode ? ` (code ${failedCode})` : ''} — deleted, or no longer shared with the signed-in user; the mirror was left as it was` };
   }
@@ -511,10 +556,47 @@ async function refreshOne(
   try {
     const mirrored = await mirrorFeishuDocument(ctx.dataDir, client, target, link.dest, { onProgress: opts.onProgress });
     const changed = [...mirrored.written, ...mirrored.removed];
-    if (mirrored.title !== link.title) persistLinks(ctx, feishuLinks(ctx.config).map((l) => (l.dest === link.dest ? { ...l, title: mirrored.title } : l)));
+    renamed(ctx, link, mirrored.title);
     const stats = changed.length ? await sync(ctx, { only: syncScope(link.dest, changed), onProgress: opts.onProgress }) : null;
     if (changed.length) opts.onProgress?.(`feishu ${link.dest}: ${mirrored.written.length} written, ${mirrored.removed.length} removed`);
     return { ...base, title: mirrored.title, fetched: true, written: mirrored.written.length, removed: mirrored.removed.length, sync: stats, error: null, warnings: mirrored.warnings };
+  } finally {
+    release();
+  }
+}
+
+async function refreshTree(ctx: SyncContext, client: LarkCli, link: FeishuLink, opts: { force?: boolean; onProgress?: (m: string) => void }): Promise<FeishuRefreshResult> {
+  const base = { dest: link.dest, url: link.url, title: link.title, kind: 'tree' as const, fetched: false, written: 0, removed: 0, modifiedAt: null, pages: null, sync: null, warnings: [] as string[] };
+  let root: WikiTreeRoot;
+  let pages: WikiTreePage[];
+  try {
+    root = await resolveWikiTree(client, link.url);
+    pages = await listWikiTree(client, root);
+  } catch (err) {
+    // a lapsed sign-in fails the whole check, as it does for documents; a page gone or unshared fails this tree
+    if (err instanceof FeishuError && (err.kind === 'auth' || err.kind === 'not-installed')) throw err;
+    return { ...base, error: `${err instanceof Error ? err.message : String(err)} — the copy was left as it was` };
+  }
+  const release = holdDest(ctx.dataDir, link.dest);
+  try {
+    const tree = await mirrorFeishuTree(ctx.dataDir, client, root, link.dest, { force: opts.force, onProgress: opts.onProgress, pages });
+    renamed(ctx, link, tree.title);
+    const changed = [...tree.written, ...tree.removed];
+    const stats = changed.length ? await sync(ctx, { only: syncScope(link.dest, changed), onProgress: opts.onProgress }) : null;
+    if (changed.length) opts.onProgress?.(`feishu ${link.dest}: ${tree.fetched} page(s) fetched, ${tree.moved} moved, ${tree.removedPages} gone`);
+    const latest = pages.map((p) => p.editedAt).filter((t): t is string => Boolean(t)).sort().at(-1) ?? null;
+    return {
+      ...base,
+      title: tree.title,
+      fetched: tree.fetched + tree.moved + tree.removedPages > 0,
+      written: tree.written.length,
+      removed: tree.removed.length,
+      modifiedAt: latest,
+      pages: { total: tree.pages, documents: tree.documents, fetched: tree.fetched, moved: tree.moved, removed: tree.removedPages },
+      sync: stats,
+      error: null,
+      warnings: tree.warnings,
+    };
   } finally {
     release();
   }
@@ -552,10 +634,13 @@ export interface FeishuLinkRuntime {
 }
 
 export interface FeishuLinkStatus extends FeishuLink, FeishuLinkRuntime {
-  /** The revision and last edit the mirror holds. */
+  /** The revision and last edit a document's mirror holds; null for a tree. */
   revision: number | null;
   modifiedAt: string | null;
   file: string | null;
+  /** A tree's pages, and the Docs documents among them; null for a document. */
+  pages: number | null;
+  documents: number | null;
   images: number;
   attachments: number;
   /** Media a pass could not download, retried on the next. */
@@ -564,23 +649,66 @@ export interface FeishuLinkStatus extends FeishuLink, FeishuLinkRuntime {
 
 export function describeFeishuLinks(ctx: { dataDir: string; config: KnodeConfig }, runtime?: Map<string, FeishuLinkRuntime>): FeishuLinkStatus[] {
   return feishuLinks(ctx.config).map((link) => {
+    const rt = runtime?.get(link.dest);
+    const run = { lastCheckAt: rt?.lastCheckAt ?? null, lastSyncAt: rt?.lastSyncAt ?? null, lastError: rt?.lastError ?? null, lastChange: rt?.lastChange ?? null };
+    if (link.type === 'wiki-tree') {
+      const tree = readTreeManifest(ctx.dataDir, link.dest);
+      const nodes = Object.values(tree?.nodes ?? {});
+      return { ...link, ...run, revision: null, modifiedAt: null, file: null, pages: tree ? nodes.length : null, documents: tree ? nodes.filter(isMirroredPage).length : null, images: 0, attachments: 0, failed: 0 };
+    }
     const manifest = readManifest(ctx.dataDir, link.dest);
     const media = Object.values(manifest?.media ?? {});
-    const rt = runtime?.get(link.dest);
     return {
       ...link,
+      ...run,
+      // links made before trees name no type: a document
+      type: 'docx' as const,
       revision: manifest?.revision ?? null,
       modifiedAt: manifest?.modifiedAt ?? null,
       file: manifest ? `${link.dest}/${manifest.file}` : null,
+      pages: null,
+      documents: null,
       images: media.filter((rel) => rel.startsWith('assets/')).length,
       attachments: media.filter((rel) => rel.startsWith('files/')).length,
       failed: Object.keys(manifest?.failed ?? {}).length,
-      lastCheckAt: rt?.lastCheckAt ?? null,
-      lastSyncAt: rt?.lastSyncAt ?? null,
-      lastError: rt?.lastError ?? null,
-      lastChange: rt?.lastChange ?? null,
     };
   });
+}
+
+/* ------------------------------ the daily check -------------------------- */
+
+export const DEFAULT_FEISHU_CHECK_AT = '06:00';
+const CHECKED_AT_FILE = '.knode/feishu-checked-at';
+
+/** When `serve` asks Feishu about linked documents each day ("HH:MM"); null when that is off. */
+export function feishuCheckTime(config: KnodeConfig): string | null {
+  const value = config.ingest.feishu?.checkAt;
+  if (typeof value === 'string' && value.trim().toLowerCase() === 'off') return null;
+  return normalizeTimeOfDay(value ?? DEFAULT_FEISHU_CHECK_AT) ?? DEFAULT_FEISHU_CHECK_AT;
+}
+
+/** When every linked document was last checked, here or by a Check now; null before the first. */
+export function lastFeishuCheck(dataDir: string): string | null {
+  try {
+    const text = fs.readFileSync(path.join(dataDir, CHECKED_AT_FILE), 'utf8').trim();
+    return Number.isFinite(Date.parse(text)) ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+function noteFeishuCheck(dataDir: string, at: string): void {
+  fs.mkdirSync(path.dirname(path.join(dataDir, CHECKED_AT_FILE)), { recursive: true });
+  fs.writeFileSync(path.join(dataDir, CHECKED_AT_FILE), `${at}\n`);
+}
+
+/** The last time the daily check fell due: today's when it has come, else yesterday's. */
+export function lastDailyDue(hhmm: string, now = new Date()): Date {
+  const [h, m] = hhmm.split(':').map(Number);
+  const due = new Date(now);
+  due.setHours(h, m, 0, 0);
+  if (due.getTime() > now.getTime()) due.setDate(due.getDate() - 1);
+  return due;
 }
 
 /* ------------------------------ sign-in ---------------------------------- */
@@ -638,28 +766,30 @@ export class FeishuSignIn {
   }
 }
 
-/* ------------------------------ the poller ------------------------------- */
+/* ------------------------------ the scheduler ---------------------------- */
 
 export interface FeishuDocsOptions {
   log?: (msg: string) => void;
   track?: <T>(job: Promise<T>) => Promise<T>;
-  /** Minutes between asking Feishu which linked documents changed; 0 disables. Default ingest.feishu.pollMinutes, else 10. */
-  pollMinutes?: number;
-  /** Seconds after start before the first check (the startup sync goes first). */
+  /** Seconds after start before the first look at the clock (the startup sync goes first). */
   firstCheckSeconds?: number;
 }
 
+/** After a check that failed outright (a lapsed sign-in, Feishu down), how long until the clock tries again. */
+const RETRY_MS = 60 * 60_000;
+
 /**
- * What `serve` runs per workspace for its linked Feishu documents: a check
- * shortly after startup for whatever changed while knode-os was down, then
- * one every few minutes. A check is one metadata call for all of them; only
- * documents edited since their mirror was written are fetched.
+ * What `serve` runs per workspace for its linked Feishu documents: once a
+ * day at `ingest.feishu.checkAt`, and shortly after startup when that time
+ * passed while knode-os was down, it asks Feishu which of them changed and
+ * fetches those. `checkNow` does the same when a person asks.
  */
 export class FeishuDocs {
   private readonly runtime = new Map<string, FeishuLinkRuntime>();
   private timer: NodeJS.Timeout | null = null;
   private first: NodeJS.Timeout | null = null;
   private running: Promise<FeishuRefreshResult[]> | null = null;
+  private retryAfter = 0;
   private stopped = false;
   private readonly log: (msg: string) => void;
   private readonly track: <T>(job: Promise<T>) => Promise<T>;
@@ -674,16 +804,15 @@ export class FeishuDocs {
   }
 
   start(): void {
-    const minutes = this.opts.pollMinutes ?? this.ctx.config.ingest.feishu?.pollMinutes ?? 10;
-    if (minutes <= 0) return;
-    const check = () => {
-      if (this.stopped || feishuLinks(this.ctx.config).length === 0) return;
-      void this.track(this.refresh().catch((err) => this.log(`feishu: check failed: ${err instanceof Error ? err.message : err}`)));
+    const tick = () => {
+      if (!this.stopped && this.due()) this.checkNow({ scheduled: true });
     };
-    this.first = setTimeout(check, (this.opts.firstCheckSeconds ?? 20) * 1000);
+    this.first = setTimeout(() => {
+      tick();
+      this.timer = setInterval(tick, 60_000);
+      this.timer.unref?.();
+    }, (this.opts.firstCheckSeconds ?? 20) * 1000);
     this.first.unref?.();
-    this.timer = setInterval(check, minutes * 60_000);
-    this.timer.unref?.();
   }
 
   async stop(): Promise<void> {
@@ -693,14 +822,62 @@ export class FeishuDocs {
     await this.running?.catch(() => {});
   }
 
-  /** Import a document once, or link it. */
+  /** Whether the daily check is owed: links to check, the clock past today's time (or yesterday's) since the last check, no check under way. */
+  due(now = new Date()): boolean {
+    const at = feishuCheckTime(this.ctx.config);
+    if (!at || this.running || now.getTime() < this.retryAfter || feishuLinks(this.ctx.config).length === 0) return false;
+    const last = lastFeishuCheck(this.ctx.dataDir);
+    return !last || Date.parse(last) < lastDailyDue(at, now).getTime();
+  }
+
+  /** When the next daily check comes; null while it is off or nothing is linked. */
+  nextCheck(now = new Date()): string | null {
+    const at = feishuCheckTime(this.ctx.config);
+    if (!at || feishuLinks(this.ctx.config).length === 0) return null;
+    const last = lastFeishuCheck(this.ctx.dataDir);
+    if (!last || Date.parse(last) < lastDailyDue(at, now).getTime()) return new Date(Math.max(now.getTime(), this.retryAfter)).toISOString();
+    const next = lastDailyDue(at, now);
+    next.setDate(next.getDate() + 1);
+    return next.toISOString();
+  }
+
+  /** Start checking every link in the background; false when a check is under way already. */
+  checkNow(opts: { force?: boolean; scheduled?: boolean } = {}): boolean {
+    if (this.running) return false;
+    void this.track(
+      this.refresh(undefined, { force: opts.force }).catch((err) => {
+        if (opts.scheduled) this.retryAfter = Date.now() + RETRY_MS;
+        this.log(`feishu: check failed: ${err instanceof Error ? err.message : err}${opts.scheduled ? ' — trying again in an hour' : ''}`);
+      }),
+    );
+    return true;
+  }
+
+  /** Import a document (or a tree) once, or link it. */
   async add(input: string, opts: FeishuImportOptions): Promise<FeishuImportResult> {
     const result = await importFeishuDocument(this.ctx, this.client, input, { ...opts, onProgress: opts.onProgress ?? this.log });
-    if (opts.mode === 'link') {
-      const at = new Date().toISOString();
-      this.runtime.set(result.dest, { lastCheckAt: at, lastSyncAt: result.indexing ? null : at, lastError: null, lastChange: { written: result.written.length, removed: result.removed.length, at } });
-    }
+    if (opts.mode === 'link') this.linked(result, result.indexing);
     return result;
+  }
+
+  /** Import several links (or a tree) in the background; see startFeishuImport. */
+  startImport(inputs: string[], opts: { mode: FeishuImportMode; subpages?: boolean; llmGraph?: boolean }): ReturnType<typeof startFeishuImport> {
+    return startFeishuImport(this.ctx, this.client, inputs, {
+      ...opts,
+      log: this.log,
+      track: this.track,
+      onDone: (job) => {
+        if (job.mode !== 'link') return;
+        for (const item of job.items) if (item.result) this.linked(item.result, job.indexing);
+      },
+    });
+  }
+
+  /** A link just made counts as checked; the first one starts the daily clock. */
+  private linked(result: FeishuPlaced, indexing: boolean): void {
+    const at = new Date().toISOString();
+    this.runtime.set(result.dest, { lastCheckAt: at, lastSyncAt: indexing ? null : at, lastError: null, lastChange: { written: result.written.length, removed: result.removed.length, at } });
+    if (!lastFeishuCheck(this.ctx.dataDir)) noteFeishuCheck(this.ctx.dataDir, at);
   }
 
   async remove(dest: string, opts: { removeFiles?: boolean } = {}): Promise<Awaited<ReturnType<typeof unlinkFeishuDocument>>> {
@@ -714,7 +891,15 @@ export class FeishuDocs {
     const job = activityOf(this.ctx.dataDir).run(
       'feishu',
       dest ? `${dest}: checking Feishu for edits` : 'Linked Feishu documents: checking for edits',
-      () => refreshFeishuLinks(this.ctx, this.client, { dest, force: opts.force, onProgress: this.log }),
+      (progress) =>
+        refreshFeishuLinks(this.ctx, this.client, {
+          dest,
+          force: opts.force,
+          onProgress: (m) => {
+            this.log(m);
+            progress(m);
+          },
+        }),
       (results) => {
         const fetched = results.filter((r) => r.fetched).length;
         const failed = results.filter((r) => r.error).length;
@@ -735,6 +920,11 @@ export class FeishuDocs {
         });
         if (r.error) this.log(`feishu ${r.dest}: ${r.error}`);
       }
+      // a check of every link is the daily one, whoever asked for it
+      if (!dest) {
+        noteFeishuCheck(this.ctx.dataDir, at);
+        this.retryAfter = 0;
+      }
       return results;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -745,6 +935,11 @@ export class FeishuDocs {
     } finally {
       if (this.running === job) this.running = null;
     }
+  }
+
+  /** A check is under way. */
+  get checking(): boolean {
+    return this.running !== null;
   }
 
   status(): FeishuLinkStatus[] {

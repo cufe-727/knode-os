@@ -2,6 +2,7 @@ import { activityOf, ActivityItem } from '../activity.js';
 import { AppContext } from '../context.js';
 import { nightlySchedule } from '../dream/dream.js';
 import { pendingEmbeddings } from '../ingest/embed-backfill.js';
+import { feishuCheckTime, feishuLinks, lastFeishuCheck } from '../ingest/feishu/docs.js';
 import { linkedFolders } from '../ingest/folders.js';
 import { FailureKind } from '../labeling/failures.js';
 import { LIVE_STATUSES } from '../research/jobs.js';
@@ -95,6 +96,8 @@ export interface ScheduledTask {
   everyMinutes: number | null;
   /** The next start, when the clock says; null while it cannot run. */
   next: string | null;
+  /** When it last ran, for a task that keeps that across restarts (Feishu); null otherwise. */
+  last: string | null;
   enabled: boolean;
   running: boolean;
 }
@@ -288,13 +291,22 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
 
   const nightly = nightlySchedule(config);
   const traceEvery = Math.max(1, config.trace.syncIntervalMinutes);
-  const feishuPoll = config.ingest.feishu?.pollMinutes ?? 10;
+  const feishuAt = feishuCheckTime(config);
+  const feishuLinked = feishuLinks(config).length > 0;
   const scheduled: ScheduledTask[] = [
-    { id: 'dream', at: nightly?.dream ?? null, everyMinutes: null, next: services && nightly ? nextDaily(nightly.dream) : null, enabled: Boolean(nightly), running: busy('dream') },
-    { id: 'tier2', at: nightly?.tier2 ?? null, everyMinutes: null, next: services && nightly ? nextDaily(nightly.tier2) : null, enabled: Boolean(nightly), running: busy('tier2') },
-    { id: 'traces', at: null, everyMinutes: traceEvery, next: null, enabled: Boolean(services), running: busy('traces') },
-    { id: 'datasources', at: null, everyMinutes: 30, next: null, enabled: Boolean(services) && config.datasources.length > 0, running: busy('datasources') },
-    { id: 'feishu', at: null, everyMinutes: feishuPoll, next: null, enabled: Boolean(services) && feishuPoll > 0 && (config.ingest.feishuDocs?.length ?? 0) > 0, running: busy('feishu') },
+    { id: 'dream', at: nightly?.dream ?? null, everyMinutes: null, next: services && nightly ? nextDaily(nightly.dream) : null, last: null, enabled: Boolean(nightly), running: busy('dream') },
+    { id: 'tier2', at: nightly?.tier2 ?? null, everyMinutes: null, next: services && nightly ? nextDaily(nightly.tier2) : null, last: null, enabled: Boolean(nightly), running: busy('tier2') },
+    { id: 'traces', at: null, everyMinutes: traceEvery, next: null, last: null, enabled: Boolean(services), running: busy('traces') },
+    { id: 'datasources', at: null, everyMinutes: 30, next: null, last: null, enabled: Boolean(services) && config.datasources.length > 0, running: busy('datasources') },
+    {
+      id: 'feishu',
+      at: feishuAt,
+      everyMinutes: null,
+      next: services?.feishu ? services.feishu.nextCheck() : null,
+      last: lastFeishuCheck(ctx.dataDir),
+      enabled: Boolean(services) && Boolean(feishuAt) && feishuLinked,
+      running: busy('feishu'),
+    },
   ];
 
   const runtime = services?.folders?.runtimeStatus() ?? new Map();

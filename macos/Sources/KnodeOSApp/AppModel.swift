@@ -149,6 +149,9 @@ final class AppModel: ObservableObject {
     /// May the signed-in account change settings from where it is?
     var maySaveSettings: Bool { account?.groups?["settings"] ?? isAdmin }
 
+    /// May it work with the workspace's files from where it is (sync a linked mirror, upload…)?
+    var mayUseFiles: Bool { account?.groups?["files"] ?? true }
+
     func client() throws -> APIClient {
         guard let baseURL = effectiveBaseURL ?? Self.configuredURL(connection),
               let user = currentUser,
