@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { parseYaml } from '../compiler/intents.js';
 import { AGENTS_DIR, RESEARCH_DIR } from '../fs/layout.js';
+import { writeMatter } from '../markdown.js';
 
 /**
  * The files under `playbooks/agents/`, read and written as plain records.
@@ -45,7 +45,7 @@ export function readAgentFile(dataDir: string, name: string): Record<string, unk
 
 /** YAML without the front-matter fences, the way every agent file is written. */
 export function agentYamlText(data: Record<string, unknown>): string {
-  return matter.stringify('', data).replace(/^---\n/, '').replace(/---\n*$/, '');
+  return writeMatter('', data).replace(/^---\n/, '').replace(/---\n*$/, '');
 }
 
 export function writeAgentFile(dataDir: string, name: string, data: Record<string, unknown>): void {
@@ -192,9 +192,7 @@ export function renameProfileAgents(dataDir: string, renamed: Map<string, string
   for (const entry of fs.readdirSync(dir)) {
     if (!/\.ya?ml$/i.test(entry)) continue;
     const file = path.join(dir, entry);
-    // a copy: gray-matter caches what it parses by content, so editing its
-    // result in place would change every later parse of the same text
-    const profile = structuredClone(parseYaml(fs.readFileSync(file, 'utf8')));
+    const profile = parseYaml(fs.readFileSync(file, 'utf8'));
     let moved = false;
     for (const role of Array.isArray(profile.roles) ? profile.roles : []) {
       const to = isRecord(role) && typeof role.agent === 'string' ? renamed.get(role.agent.trim()) : undefined;

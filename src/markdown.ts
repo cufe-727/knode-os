@@ -11,10 +11,32 @@ export interface ParsedMarkdown {
   body: string;
 }
 
+/*
+ * gray-matter, called without options, keeps every text it parses — and a
+ * Buffer copy of it — in a module-level object keyed by the whole text, for
+ * the life of the process; `matter.stringify` parses its body the same way.
+ * `serve` reads and writes pages all day: on 2026-11-02 that cache held 17k
+ * texts, 1.6 GB of a 2 GB heap two hours after a start, and the service had
+ * died at the 4 GB heap limit twice. The cache also handed every caller of
+ * one text the same `data` object, and answered a second parse of malformed
+ * frontmatter with `{}` instead of the error. Options, even empty, skip it:
+ * every gray-matter call goes through these two.
+ */
+
+/** gray-matter's parse, uncached: a fresh result each call, and malformed frontmatter throws every time. */
+export function readMatter(text: string): matter.GrayMatterFile<string> {
+  return matter(text, {});
+}
+
+/** `body` under a YAML frontmatter block of `data` (gray-matter's stringify, uncached). */
+export function writeMatter(body: string, data: object): string {
+  return matter.stringify(body, data, {});
+}
+
 /** Parse YAML frontmatter; malformed frontmatter degrades to a plain body. */
 export function parseFrontmatter(raw: string): ParsedMarkdown {
   try {
-    const p = matter(raw);
+    const p = readMatter(raw);
     return { frontmatter: p.data as Record<string, unknown>, body: p.content };
   } catch {
     return { frontmatter: {}, body: raw };
@@ -64,8 +86,7 @@ export function markdownMeta(head: string): MarkdownMeta | null {
   let fields: Record<string, unknown> = {};
   if (block) {
     try {
-      // options, even empty, keep gray-matter from caching every head it is given
-      fields = (matter(block[0], {}).data ?? {}) as Record<string, unknown>;
+      fields = (readMatter(block[0]).data ?? {}) as Record<string, unknown>;
     } catch {
       fields = {};
     }

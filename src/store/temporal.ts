@@ -140,11 +140,17 @@ export function foldEntityEvidence(
   aliasStop?: ReadonlySet<string>,
 ): EntityAsOf | null {
   if (rows.length === 0) return null;
-  const sorted = [...rows].sort((a, b) =>
-    b.weight - a.weight
-    || new Date(a.tx_from).getTime() - new Date(b.tx_from).getTime()
-    || String(a.attrs.name ?? '').localeCompare(String(b.attrs.name ?? '')));
-  const name = sorted.map((r) => str(r.attrs.name)).find(Boolean) ?? fallback?.name ?? id;
+  // the name the heaviest reading gives, the earliest of equal weight: one pass,
+  // not a sort of every row with two dates made per comparison — a hub entity
+  // folds tens of thousands of rows each time a document names it
+  let named: { weight: number; at: number; name: string } | null = null;
+  for (const r of rows) {
+    const n = str(r.attrs.name);
+    if (!n) continue;
+    const at = new Date(r.tx_from).getTime();
+    if (!named || (named.weight - r.weight || at - named.at || n.localeCompare(named.name)) < 0) named = { weight: r.weight, at, name: n };
+  }
+  const name = named?.name ?? fallback?.name ?? id;
   const typeVotes = new Map<string, number>();
   for (const r of rows) {
     const t = str(r.attrs.type);

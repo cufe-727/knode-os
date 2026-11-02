@@ -1,12 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { AppContext } from '../context.js';
 import { safePath } from '../fs/files.js';
 import { recordOrigin } from '../fs/sidecar.js';
 import { frontmatterExtraction } from '../graph/frontmatter.js';
 import { loadOntology, normalizePredicate } from '../graph/ontology.js';
 import { buildWikiIndex, extractObsidianLinks } from '../graph/wire.js';
+import { readMatter, writeMatter } from '../markdown.js';
 import { validateOkfBundle } from '../okf/index.js';
 import { normalizeDateExpr } from '../store/dates.js';
 import { ResearchJob } from './jobs.js';
@@ -62,7 +62,7 @@ export async function validateResearchPage(
   let text = fs.readFileSync(abs, 'utf8');
   let parsed: { data: Record<string, unknown>; content: string };
   try {
-    const p = matter(text);
+    const p = readMatter(text);
     parsed = { data: { ...(p.data as Record<string, unknown>) }, content: p.content };
   } catch (err) {
     return { ok: false, errors: [`frontmatter is not valid YAML: ${err instanceof Error ? err.message : err}`], warnings, frontmatter: {}, normalized: false };
@@ -178,7 +178,7 @@ export async function validateResearchPage(
   }
 
   if (normalized) {
-    text = matter.stringify(parsed.content.replace(/^\n+/, ''), fm).replace(/\n{3,}/g, '\n\n');
+    text = writeMatter(parsed.content.replace(/^\n+/, ''), fm).replace(/\n{3,}/g, '\n\n');
     if (!text.endsWith('\n')) text += '\n';
   }
   // the agent's page, as it wrote it or as stamped here: on record before it is rewritten

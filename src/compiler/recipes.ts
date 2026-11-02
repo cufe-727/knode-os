@@ -1,10 +1,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { sqlStringLiteral } from '../datasource/guard.js';
 import { PACKS_DIR } from '../fs/layout.js';
 import { Locator } from '../capability/store.js';
+import { readMatter } from '../markdown.js';
 import { Playbook, entitySymbol, loadPlaybooks, renderProbeSql } from '../pack/playbook.js';
 import { PlanNode } from './plan.js';
 
@@ -73,7 +73,7 @@ export function parseRecipe(raw: string, relPath: string): Recipe | null {
   let fm: Record<string, unknown>;
   let body: string;
   try {
-    const parsed = matter(raw);
+    const parsed = readMatter(raw);
     fm = parsed.data as Record<string, unknown>;
     body = parsed.content;
   } catch {

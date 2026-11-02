@@ -1,10 +1,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { PACKS_DIR } from '../fs/layout.js';
 import { assertReadOnlySql } from '../datasource/guard.js';
 import { assertWritablePath } from '../fs/files.js';
+import { writeMatter } from '../markdown.js';
 import { Store } from '../store/db.js';
 import { SuggestionRow } from '../types.js';
 import { Plan, PlanNode } from './plan.js';
@@ -214,7 +214,7 @@ Edit freely: this is a starting point taken from what worked, not a rule. The
 placeholders \`{name}\` / \`{symbol}\` / \`{locator}\` are bound per entity when the
 recipe runs.
 `;
-  return matter.stringify(body, frontmatter);
+  return writeMatter(body, frontmatter);
 }
 
 /** Replace bound entity values with the placeholders a recipe binds per entity. */

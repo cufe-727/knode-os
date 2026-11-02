@@ -99,6 +99,34 @@ export interface FinishedBatch {
   failed: number;
 }
 
+/**
+ * Paths and ids kept for the next review, per list; past this the oldest go
+ * first. The reviews take them only while processing is started
+ * (src/labeling/followup.ts), and remote workers write while it is stopped:
+ * finance kept every claim id written since the start, 35k in two hours on
+ * 2026-11-02, and would have until the next restart.
+ */
+export const FINISHED_KEEP = 100_000;
+
+interface Finished {
+  documents: Set<string>;
+  entityIds: Set<string>;
+  claimIds: Set<string>;
+  written: number;
+  failed: number;
+}
+
+const noneFinished = (): Finished => ({ documents: new Set(), entityIds: new Set(), claimIds: new Set(), written: 0, failed: 0 });
+
+/** Add `items` as the newest of `kept` (an entity named by many documents is kept once), dropping the oldest past FINISHED_KEEP. */
+export function keepNewest(kept: Set<string>, items: Iterable<string>): void {
+  for (const item of items) {
+    kept.delete(item);
+    kept.add(item);
+  }
+  while (kept.size > FINISHED_KEEP) kept.delete(kept.values().next().value!);
+}
+
 export interface LabelingStatus {
   queued: number;
   openDocuments: number;
@@ -172,7 +200,7 @@ export class LabelingScheduler {
   private stopped = false;
   private priorityRefreshedAt = 0;
   private ontology: { at: number; value: Ontology } | null = null;
-  private finished: FinishedBatch = { documents: [], entityIds: [], claimIds: [], written: 0, failed: 0 };
+  private finished = noneFinished();
   private readonly totals: LabelingStatus['totals'] = {
     calls: 0, ok: 0, failed: { model: 0, transient: 0, fatal: 0 }, leasesExpired: 0, documentsWritten: 0, documentsFailed: 0, replayed: 0, stale: 0,
   };
@@ -295,9 +323,9 @@ export class LabelingScheduler {
 
   /** What was written (or given up on) since the last call — the duplicate review's and the summaries' input. */
   takeFinished(): FinishedBatch {
-    const out = this.finished;
-    this.finished = { documents: [], entityIds: [], claimIds: [], written: 0, failed: 0 };
-    return out;
+    const { documents, entityIds, claimIds, written, failed } = this.finished;
+    this.finished = noneFinished();
+    return { documents: [...documents], entityIds: [...entityIds], claimIds: [...claimIds], written, failed };
   }
 
   async status(): Promise<LabelingStatus> {
@@ -566,9 +594,9 @@ export class LabelingScheduler {
     this.totals.documentsWritten++;
     this.recentDocs.push(Date.now());
     this.finished.written++;
-    this.finished.documents.push(path);
-    this.finished.entityIds.push(...applied.entityIds);
-    this.finished.claimIds.push(...applied.claimIds);
+    keepNewest(this.finished.documents, [path]);
+    keepNewest(this.finished.entityIds, applied.entityIds);
+    keepNewest(this.finished.claimIds, applied.claimIds);
     this.ctx.onWritten?.(path);
   }
 }
