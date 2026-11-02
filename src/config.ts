@@ -457,6 +457,34 @@ export interface LinkedFolder {
   createdAt: string;
 }
 
+/**
+ * A Feishu document mirrored into raw/docs and kept in sync while `serve`
+ * runs (src/ingest/feishu/docs.ts). Written by the Feishu routes and
+ * `knode-os feishu link`, never by hand.
+ */
+export interface FeishuLink {
+  /** The document's link as Feishu reports it (a wiki link when it was linked through one). */
+  url: string;
+  /** The docx token: what Feishu stores the document under. */
+  token: string;
+  type: 'docx';
+  /** The wiki node token, when the link named a wiki page. */
+  wiki?: string;
+  /** The title when last mirrored. */
+  title: string;
+  /** Its mirror inside the workspace, a folder under raw/docs. */
+  dest: string;
+  createdAt: string;
+}
+
+/** How knode-os reaches Feishu: lark-cli, signed in as the person whose documents these are. */
+export interface FeishuConfig {
+  /** The lark-cli executable; default the one on PATH, else ~/.local/bin/lark-cli. */
+  cli?: string;
+  /** Minutes between asking Feishu which linked documents changed; 0 turns the polling off. Default 10. */
+  pollMinutes?: number;
+}
+
 export interface IngestConfig {
   chunkSize: number;
   chunkOverlap: number;
@@ -464,6 +492,9 @@ export interface IngestConfig {
   watch: boolean;
   /** Folders mirrored from elsewhere on this machine; absent or empty when none is linked. */
   linkedFolders?: LinkedFolder[];
+  /** Feishu documents mirrored and kept in sync; absent or empty when none is linked. */
+  feishuDocs?: FeishuLink[];
+  feishu?: FeishuConfig;
   /** Parallel documents in flight during the index pass; embedding round-trips dominate. */
   concurrency?: number;
   /**

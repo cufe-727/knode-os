@@ -16,7 +16,8 @@ import { judgesHere, LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
 import { LabelingScheduler } from '../labeling/scheduler.js';
 import { EmbeddingBackfill } from '../ingest/embed-backfill.js';
-import { LinkedFolders, linkedFolders, linkOwning, syncedByFolders } from '../ingest/folders.js';
+import { LinkedFolders, linkOwning, mirrorLinks, syncedByFolders } from '../ingest/folders.js';
+import { FeishuDocs } from '../ingest/feishu/docs.js';
 import { isOwnWrite } from '../ingest/own-writes.js';
 import { sync, SyncContext, syncsSettled, SyncStats } from '../ingest/sync.js';
 import { WorkBroker } from '../work/broker.js';
@@ -137,7 +138,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
         throw err;
       }
       services.set(workspaceCtx.dataDir, {
-        mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders,
+        mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders, feishu: started.feishu,
         labeling: started.labeling, work: started.work, localWorkers: started.localWorkers, processing: started.processing, translations: started.translations,
         calls: started.calls, embeddings: started.embeddings,
       });
@@ -188,15 +189,17 @@ export async function startServer(ctx: AppContext): Promise<void> {
 }
 
 /**
- * Open, at startup, every workspace that follows a linked folder: its watchers,
- * extraction and summaries must not wait for someone to open it in the UI —
- * after a restart they would otherwise sit idle until then.
+ * Open, at startup, every workspace that follows a linked folder or a linked
+ * Feishu document: its watchers, pollers, extraction and summaries must not
+ * wait for someone to open it in the UI — after a restart they would otherwise
+ * sit idle until then.
  */
 function autostartWorkspaces(root: string, registry: WorkspaceContextRegistry, log: (msg: string) => void): void {
   const linked = (dataDir: string) => {
     try {
-      const config = JSON.parse(fs.readFileSync(path.join(dataDir, 'knode.config.json'), 'utf8')) as { ingest?: { linkedFolders?: unknown[] } };
-      return Array.isArray(config.ingest?.linkedFolders) && config.ingest.linkedFolders.length > 0;
+      const config = JSON.parse(fs.readFileSync(path.join(dataDir, 'knode.config.json'), 'utf8')) as { ingest?: { linkedFolders?: unknown[]; feishuDocs?: unknown[] } };
+      const some = (list: unknown[] | undefined) => Array.isArray(list) && list.length > 0;
+      return some(config.ingest?.linkedFolders) || some(config.ingest?.feishuDocs);
     } catch {
       return false;
     }
@@ -210,7 +213,7 @@ function autostartWorkspaces(root: string, registry: WorkspaceContextRegistry, l
   };
   const open = (label: string, scope: Parameters<WorkspaceContextRegistry['get']>[0]) => {
     void registry.get(scope).then(
-      () => log(`[${label}] opened at startup: it follows linked folders`),
+      () => log(`[${label}] opened at startup: it follows linked folders or Feishu documents`),
       (err) => log(`[${label}] could not open at startup: ${err instanceof Error ? err.message : err}`),
     );
   };
@@ -409,8 +412,8 @@ export function watchDataDir(ctx: SyncContext, opts: DataDirWatchOptions): TreeW
     // an event naming no path (the data dir itself) is no source
     if (!rel) return;
     const outside = rel.startsWith('..');
-    // a linked mirror is synced by its link (src/ingest/folders.ts)
-    if (!outside && linkOwning(linkedFolders(ctx.config), rel)) return;
+    // a linked mirror is synced by its link (src/ingest/folders.ts, src/ingest/feishu/docs.ts)
+    if (!outside && linkOwning(mirrorLinks(ctx.config), rel)) return;
     // seen: synced from here on — by the sync below, or by the import or
     // unlink writing that folder, which syncs what it writes itself
     reported.set(outside ? '.' : rel, Date.now());
@@ -501,6 +504,7 @@ interface StartedServices {
   kickResearch: () => void;
   track: <T>(job: Promise<T>) => Promise<T>;
   folders: LinkedFolders;
+  feishu: FeishuDocs;
   labeling: LabelingScheduler;
   work: WorkBroker;
   localWorkers: LocalLabelingWorkers;
@@ -632,6 +636,10 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   const folders = new LinkedFolders(ctx, { log, track, policy: { protectedRoots: opts.rootDataDir ? [opts.rootDataDir] : [] } });
   folders.start();
 
+  // linked Feishu documents: asked every few minutes which changed, those re-mirrored (src/ingest/feishu/docs.ts)
+  const feishu = new FeishuDocs(ctx, { log, track });
+  feishu.start();
+
   // nightly dream + the tier-2 pass
   const dreamTimer = startDreamScheduler(ctx, log);
   const nightly = nightlySchedule(ctx.config);
@@ -657,6 +665,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       clearInterval(tier2Timer);
       clearInterval(dsTimer);
       await folders.stop();
+      await feishu.stop();
       await Promise.allSettled([...activeJobs]);
       await embeddings.stop();
       ctx.embeddings = undefined;
@@ -665,6 +674,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     kickResearch: () => research?.kick(),
     track,
     folders,
+    feishu,
     labeling,
     work,
     localWorkers,

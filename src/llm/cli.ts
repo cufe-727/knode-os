@@ -211,7 +211,8 @@ async function runCodex(cfg: LlmConfig, prompt: string, model: string | undefine
 
 async function runClaude(cfg: LlmConfig, prompt: string, model: string | undefined, images: string[], report: (usage: CallUsage) => void): Promise<string> {
   const cmd = cliCommand('claude-cli', cfg.cliPath);
-  const args = ['-p', '--output-format', 'json', '--max-turns', images.length ? '3' : '1'];
+  // one turn to read each picture (or all of them at once) and one to answer
+  const args = ['-p', '--output-format', 'json', '--max-turns', images.length ? String(Math.max(3, images.length + 2)) : '1'];
   if (model) args.push('--model', model);
   const effort = effortFor('claude-cli', cfg.effort);
   if (effort) args.push('--effort', effort);

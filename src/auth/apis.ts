@@ -13,14 +13,14 @@
  */
 
 export const API_GROUPS = {
-  files: 'browse, read, edit, upload and move files; sync and unlink linked folders',
+  files: 'browse, read, edit, upload and move files; sync and unlink linked folders and Feishu documents',
   search: 'search, graph, entities, documents, claims, stats, notices, lineage and history',
   ask: 'Ask, chat and context packs',
   knowledge: 'wiki, research, dream, suggestions, merges and reviews',
   ingest: 'sync, ingest, forget, purge, rebuild, labeling status and the task queue',
   traces: 'agent traces',
   datasources: 'configured live datasources and their read-only queries',
-  settings: 'workspace settings — models, connections, agents, profiles, playbooks — clearing a workspace, and importing or linking a folder from this machine',
+  settings: 'workspace settings — models, connections, agents, profiles, playbooks — clearing a workspace, importing or linking a folder from this machine, and signing in to Feishu and importing its documents',
   gateway: 'local services published through /gw/<id>',
 } as const;
 
@@ -64,6 +64,10 @@ const RULES: Rule[] = [
   // so is reading a folder off this machine's disk, which holds far more than this workspace
   { prefix: '/api/folders/import', group: 'settings' },
   { prefix: '/api/folders/preview', group: 'settings' },
+  // and reading Feishu as this machine's signed-in Feishu user: signing in, looking a document up, importing it
+  { prefix: '/api/feishu/auth', group: 'settings' },
+  { prefix: '/api/feishu/preview', group: 'settings' },
+  { prefix: '/api/feishu/import', group: 'settings' },
 
   { prefix: '/api/config', group: 'settings' },
   { prefix: '/api/agents', group: 'settings' },
@@ -81,6 +85,7 @@ const RULES: Rule[] = [
   { prefix: '/api/mkdir', group: 'files' },
   { prefix: '/api/grep', group: 'files' },
   { prefix: '/api/folders', group: 'files' },
+  { prefix: '/api/feishu', group: 'files' },
   { prefix: '/api/link/', group: 'files' },
   { prefix: '/api/vfs', group: 'files' },
   { prefix: '/api/okf/', group: 'files' },

@@ -106,6 +106,7 @@ enum TaskWords {
         case "tier2": (L("Tier-2 pass"), L("merges, claim reviews, views and the wiki check"))
         case "traces": (L("Agent traces"), L("collects new Claude Code and Codex sessions"))
         case "datasources": (L("Datasources"), L("refreshes live schemas into the wiki"))
+        case "feishu": (L("Feishu documents"), L("asks Feishu which linked documents were edited, and fetches those"))
         default: (id, "")
         }
     }
@@ -116,6 +117,7 @@ enum TaskWords {
         case "ingest": "tray.and.arrow.down"
         case "upload": "arrow.up.doc"
         case "folder": "folder"
+        case "feishu": "doc.text"
         case "traces": "terminal"
         case "datasources": "cylinder"
         case "dream": "moon.stars"

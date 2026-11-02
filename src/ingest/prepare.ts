@@ -8,6 +8,7 @@ import { NORMALIZER_VERSION, normalizeCookedFrontmatter } from '../okf/normalize
 import {
   ConversionOptions,
   conversionCacheKey,
+  conversionVariant,
   convertDocumentToMarkdown,
   convertedPathForRaw,
   isConvertibleFile,
@@ -128,7 +129,8 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
     const meta = readSidecarPart(dataDir, rawRel, 'meta');
     const transcriptRel = convertible ? transcriptPathFor(rawRel) : null;
     const transcript = transcriptRel && isFile(dataDir, transcriptRel) ? fs.readFileSync(safePath(dataDir, transcriptRel)) : null;
-    const cacheKey = convertible ? (transcript ? transcriptCacheKey(transcript) : conversionCacheKey(opts, rawRel)) : undefined;
+    const variant = convertible && !transcript ? await conversionVariant(abs, rawRel, opts) : null;
+    const cacheKey = convertible ? (transcript ? transcriptCacheKey(transcript) : conversionCacheKey(opts, rawRel, variant)) : undefined;
     const sameSource = meta !== null && meta.sourceSha256 === sourceSha;
     const sameConversion = !convertible || (meta?.conversion?.key === cacheKey && hasContent(dataDir, rawRel));
 

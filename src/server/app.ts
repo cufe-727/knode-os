@@ -69,11 +69,27 @@ import {
   linkedFolders,
   LinkedFolders,
   linkOwning,
+  mirrorLinks,
   planFolderImport,
   refreshLinkedFolders,
   resolveImportSource,
   unlinkFolder,
 } from '../ingest/folders.js';
+import { FeishuError } from '../ingest/feishu/client.js';
+import {
+  describeFeishuLinks,
+  feishuClient,
+  feishuDestFor,
+  FeishuDocs,
+  feishuLinks,
+  FeishuSignIn,
+  findFeishuMirror,
+  importFeishuDocument,
+  readManifest as readFeishuManifest,
+  refreshFeishuLinks,
+  resolveFeishuTarget,
+  unlinkFeishuDocument,
+} from '../ingest/feishu/docs.js';
 import { documentMentions } from '../graph/mentions.js';
 import { entityDetail, graphInsights, graphOverview, graphSearch } from '../graph/query.js';
 import { entitiesNamed } from '../graph/resolve.js';
@@ -233,6 +249,8 @@ export interface WorkspaceServices {
   track: <T>(job: Promise<T>) => Promise<T>;
   /** The linked-folder watchers of this workspace; absent outside `serve`, where links are refreshed on demand only. */
   folders?: LinkedFolders | null;
+  /** The poller of this workspace's linked Feishu documents; absent outside `serve`, where they are synced on demand only. */
+  feishu?: FeishuDocs | null;
   /** Extraction as leased work (src/labeling): local slots and remote workers take segments from it. */
   labeling?: LabelingScheduler | null;
   /** Every kind of leased work — segments and summaries — behind one lease protocol (src/work/broker.ts). */
@@ -1110,7 +1128,8 @@ export function createApp(
       // mark it and keep edits off it (the routes refuse them anyway); the list
       // rides along for files under a mirror whose folder was never listed. A
       // folder knode-os makes says what it is for.
-      const links = linkedFolders(ctx.config);
+      const links = mirrorLinks(ctx.config);
+      const feishuDests = new Set(feishuLinks(ctx.config).map((l) => l.dest));
       const mark = (node: typeof tree): void => {
         const marked = node as typeof tree & { linked?: string; about?: string };
         const link = links.find((l) => l.dest === node.path);
@@ -1133,7 +1152,7 @@ export function createApp(
           }
         }
       }
-      return c.json({ ...tree, links: links.map((l) => ({ path: l.dest, source: l.source })) });
+      return c.json({ ...tree, links: links.map((l) => ({ path: l.dest, source: l.source, kind: feishuDests.has(l.dest) ? 'feishu' : 'folder' })) });
     } catch (e) {
       return c.json(err(e), 400);
     }
@@ -1496,6 +1515,135 @@ export function createApp(
       const removeFiles = c.req.query('removeFiles') === '1' || c.req.query('removeFiles') === 'true';
       const folders = servicesFor(ctx)?.folders ?? null;
       const result = folders ? await folders.remove(dest, { removeFiles }) : await unlinkFolder(ctx, dest, { removeFiles, onProgress: log });
+      return c.json({ ok: true, ...result });
+    } catch (e) {
+      return c.json(err(e), 400);
+    } finally {
+      ingestRunning.delete(ctx.dataDir);
+    }
+  });
+
+  /* --------------------------- Feishu documents --------------------------- */
+
+  // Feishu Docs mirrored under raw/docs, once or kept in sync (src/ingest/feishu/docs.ts).
+  // Reading goes out as this machine's signed-in Feishu user (lark-cli), so signing in,
+  // previewing and importing are an administrator's call (src/auth/apis.ts); syncing and
+  // unlinking what is linked already are a files matter, like a linked folder's.
+  const feishuSignIn = new FeishuSignIn(() => feishuClient(rootCtx.config), log);
+  /** A Feishu failure as a response: what went wrong, and whether signing in again would fix it. */
+  const feishuErr = (e: unknown) => ({ ...err(e), ...(e instanceof FeishuError ? { reason: `feishu-${e.kind}` } : {}) });
+
+  app.get('/api/feishu', (c) => {
+    const ctx = requestCtx(c);
+    const feishu = servicesFor(ctx)?.feishu ?? null;
+    return c.json({ links: feishu ? feishu.status() : describeFeishuLinks(ctx) });
+  });
+
+  // who lark-cli is signed in as, what it may read, and a sign-in under way
+  app.get('/api/feishu/auth', async (c) => {
+    const status = await feishuClient(requestCtx(c).config).status();
+    return c.json({ ...status, signIn: feishuSignIn.state() });
+  });
+
+  // the one-time authorization: a device-flow link to open on any device
+  app.post('/api/feishu/auth/login', async (c) => {
+    try {
+      const status = await feishuClient(requestCtx(c).config).status();
+      if (!status.installed) return c.json({ error: status.error ?? 'lark-cli is not installed', reason: 'feishu-not-installed' }, 400);
+      return c.json({ ok: true, signIn: await feishuSignIn.begin(status) });
+    } catch (e) {
+      return c.json(feishuErr(e), 400);
+    }
+  });
+
+  // what an import would bring, before anything is written — and proof the document is readable
+  app.post('/api/feishu/preview', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { url?: string; dest?: string };
+      const target = await resolveFeishuTarget(feishuClient(ctx.config), String(body.url ?? ''));
+      const existing = body.dest ? null : findFeishuMirror(ctx.dataDir, ctx.config, target.token);
+      const dest = existing ?? feishuDestFor(target, body.dest);
+      const manifest = readFeishuManifest(ctx.dataDir, dest);
+      const link = feishuLinks(ctx.config).find((l) => l.token === target.token) ?? null;
+      return c.json({
+        url: target.url,
+        token: target.token,
+        title: target.title,
+        modifiedAt: target.modifiedAt,
+        wiki: target.wiki ?? null,
+        dest,
+        existing: manifest ? { dest, revision: manifest.revision, modifiedAt: manifest.modifiedAt } : null,
+        linked: link ? { dest: link.dest } : null,
+      });
+    } catch (e) {
+      return c.json(feishuErr(e), 400);
+    }
+  });
+
+  app.post('/api/feishu/import', async (c) => {
+    const ctx = requestCtx(c);
+    if (ingestRunning.has(ctx.dataDir)) return c.json({ error: 'ingest running — try again shortly' }, 409);
+    // held while the document is written and the link saved, as for a folder import
+    ingestRunning.add(ctx.dataDir);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { url?: string; dest?: string; mode?: string; wait?: boolean };
+      const mode = body.mode === 'link' ? 'link' : body.mode === 'copy' || body.mode === undefined ? 'copy' : null;
+      if (!mode) return c.json({ error: 'mode must be copy or link' }, 400);
+      const services = servicesFor(ctx);
+      const background = body.wait === true
+        ? undefined
+        : {
+          track: services?.track,
+          onIndexed: (done: { dest: string; sync: SyncStats | null; error?: string }) =>
+            log(done.error
+              ? `feishu ${done.dest}: indexing failed: ${done.error}`
+              : `feishu ${done.dest}: ${done.sync!.indexed} indexed, ${done.sync!.unchanged} unchanged, ${done.sync!.errors} errors, ${done.sync!.chunks} chunks`),
+        };
+      const url = String(body.url ?? '');
+      const opts = { mode, dest: body.dest, onProgress: log, background } as const;
+      const feishu = services?.feishu ?? null;
+      const result = await activityOf(ctx.dataDir).run(
+        'feishu',
+        `${mode === 'link' ? 'Link' : 'Import'} ${url}`,
+        () => (feishu ? feishu.add(url, opts) : importFeishuDocument(ctx, feishuClient(ctx.config), url, opts)),
+        (r) => `${r.title}: ${r.written.length} files written into ${r.dest}`,
+      );
+      return c.json({ ok: true, ...result });
+    } catch (e) {
+      return c.json(feishuErr(e), e instanceof FolderImportConflict ? 409 : 400);
+    } finally {
+      ingestRunning.delete(ctx.dataDir);
+    }
+  });
+
+  // ask Feishu now which linked documents changed (one with `dest`), and re-mirror those; `force` fetches regardless
+  app.post('/api/feishu/sync', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { dest?: string; force?: boolean };
+      const dest = typeof body.dest === 'string' && body.dest.trim() ? cleanRelPath(body.dest) : undefined;
+      const feishu = servicesFor(ctx)?.feishu ?? null;
+      const results = feishu
+        ? await feishu.refresh(dest, { force: body.force === true })
+        : await refreshFeishuLinks(ctx, feishuClient(ctx.config), { dest, force: body.force === true, onProgress: log });
+      return c.json({ ok: true, results });
+    } catch (e) {
+      return c.json(feishuErr(e), 400);
+    }
+  });
+
+  // forget a linked document; the mirror stays unless removeFiles=1
+  app.delete('/api/feishu', async (c) => {
+    const ctx = requestCtx(c);
+    if (ingestRunning.has(ctx.dataDir)) return c.json({ error: 'ingest running — try again shortly' }, 409);
+    ingestRunning.add(ctx.dataDir);
+    try {
+      const dest = cleanRelPath(c.req.query('dest') ?? '');
+      if (!dest) return c.json({ error: 'dest required' }, 400);
+      const removeFiles = c.req.query('removeFiles') === '1' || c.req.query('removeFiles') === 'true';
+      const feishu = servicesFor(ctx)?.feishu ?? null;
+      const result = feishu ? await feishu.remove(dest, { removeFiles }) : await unlinkFeishuDocument(ctx, dest, { removeFiles, onProgress: log });
       return c.json({ ok: true, ...result });
     } catch (e) {
       return c.json(err(e), 400);

@@ -1436,8 +1436,9 @@ const SCHEDULE_WORDS = {
   tier2: ['Tier-2 pass', 'merges, claim reviews, views and the wiki check'],
   traces: ['Agent traces', 'collects new Claude Code and Codex sessions'],
   datasources: ['Datasources', 'refreshes live schemas into the wiki'],
+  feishu: ['Feishu documents', 'asks Feishu which linked documents were edited, and fetches those'],
 };
-const ACTIVITY_ICONS = { sync: '⟳', ingest: '⛁', upload: '⤒', folder: '⇄', traces: '⌁', datasources: '◫', dream: '☾', tier2: '⚙' };
+const ACTIVITY_ICONS = { sync: '⟳', ingest: '⛁', upload: '⤒', folder: '⇄', feishu: '⇅', traces: '⌁', datasources: '◫', dream: '☾', tier2: '⚙' };
 
 /** "45 s", "3 min 10 s", "2 h 5 min". */
 function spanText(seconds) {
@@ -1953,8 +1954,12 @@ function mirroredSource(path) {
   for (const [dest, source] of linkedDests) if (path === dest || path.startsWith(`${dest}/`)) return source;
   return null;
 }
+/** Linked Feishu documents in the tree: mirror path → the document's link. A subset of linkedDests. */
+const feishuDests = new Map();
 /** The last path typed into an import, offered again next time. */
 let lastImportSource = '';
+/** The last Feishu link typed into an import. */
+let lastFeishuUrl = '';
 
 /** How many files and bytes go into one upload request — a folder can hold thousands. */
 const UPLOAD_BATCH_FILES = 40;
@@ -2008,7 +2013,11 @@ async function fetchListing(dir) {
   try {
     const node = await api(`/api/tree?path=${encodeURIComponent(dir || '.')}&depth=1`);
     linkedDests.clear();
-    for (const link of node.links || []) linkedDests.set(link.path, link.source);
+    feishuDests.clear();
+    for (const link of node.links || []) {
+      linkedDests.set(link.path, link.source);
+      if (link.kind === 'feishu') feishuDests.set(link.path, link.source);
+    }
     return node.children || [];
   } catch {
     return null;
@@ -2166,7 +2175,14 @@ function nodeMenu(node) {
     }
     items.push('-');
   }
-  if (linkRoot) {
+  if (linkRoot && feishuDests.has(node.path)) {
+    items.push({ label: 'Check Feishu for edits now', run: () => syncFeishuDoc(node.path) });
+    items.push({ label: 'Fetch again from Feishu', run: () => syncFeishuDoc(node.path, true) });
+    items.push({ label: 'Open in Feishu', run: () => window.open(feishuDests.get(node.path), '_blank', 'noopener') });
+    items.push({ label: 'Unlink (keep the copies)…', run: () => unlinkFeishuNode(node, false) });
+    items.push({ label: 'Unlink and remove the copies…', danger: true, run: () => unlinkFeishuNode(node, true) });
+    items.push('-');
+  } else if (linkRoot) {
     items.push({ label: 'Sync linked folder now', run: () => syncLinkedFolder(node.path) });
     items.push({ label: 'Unlink (keep the copies)…', run: () => unlinkFolderNode(node, false) });
     items.push({ label: 'Unlink and remove the copies…', danger: true, run: () => unlinkFolderNode(node, true) });
@@ -2541,10 +2557,38 @@ function paintFileView(path, content, derived = false) {
     return;
   }
   view.innerHTML = renderMd(content, { metadataOpen: metadataOpen() });
+  showPicturesBeside(view, path);
   // ```chart blocks render as SVG in renderMd; hover and keyboard are added here (web/chart.js)
   window.knodeChart?.hydrate(view);
   hydrateMindMaps(view, path);
   markFileMentions(path, content);
+}
+
+/**
+ * A picture a page names by a path beside it — `assets/x.png` in an imported
+ * Feishu document — is shown from the workspace: the page's own address is
+ * the app's, where that path means nothing.
+ */
+function showPicturesBeside(view, path) {
+  const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+  for (const img of view.querySelectorAll('img[src]')) {
+    const src = img.getAttribute('src');
+    if (!src || /^[a-z][a-z\d+.-]*:/i.test(src) || src.startsWith('/') || src.startsWith('#')) continue;
+    let rel;
+    try {
+      rel = decodeURI(src);
+    } catch {
+      continue;
+    }
+    const parts = [];
+    for (const seg of `${dir}/${rel}`.split('/')) {
+      if (!seg || seg === '.') continue;
+      if (seg === '..') parts.pop();
+      else parts.push(seg);
+    }
+    img.src = originalHref(parts.join('/'));
+    img.loading = 'lazy';
+  }
 }
 
 /** A picture the browser shows, and so one a mind map may have been read from. */
@@ -3169,6 +3213,9 @@ $('#btn-import').addEventListener('click', (ev) => {
     { label: folders ? 'Folder from this Mac (copy once)…' : 'Folder from this Mac — administrators only', disabled: !folders, run: () => importLocalFolder('copy', dir) },
     { label: folders ? 'Link a folder from this Mac (keep in sync)…' : 'Link a folder — administrators only', disabled: !folders, run: () => importLocalFolder('link', dir) },
     '-',
+    { label: folders ? 'Feishu document (import once)…' : 'Feishu document — administrators only', disabled: !folders, run: () => importFeishuDoc('copy') },
+    { label: folders ? 'Link a Feishu document (keep in sync)…' : 'Link a Feishu document — administrators only', disabled: !folders, run: () => importFeishuDoc('link') },
+    '-',
     { label: 'Agent traces — Claude Code and Codex sessions', disabled: !mayUse('traces'), run: () => collectTraces() },
   ]);
 });
@@ -3263,6 +3310,159 @@ async function unlinkFolderNode(node, removeFiles) {
   toast(removeFiles ? `unlinking and removing ${node.path}…` : `unlinking ${node.path}…`, 600000);
   try {
     await api(`/api/folders?dest=${encodeURIComponent(node.path)}&removeFiles=${removeFiles ? 1 : 0}`, { method: 'DELETE' });
+    if (removeFiles && currentFile && (currentFile === node.path || currentFile.startsWith(`${node.path}/`))) {
+      currentFile = null;
+      $('#file-path').textContent = '';
+      $('#file-view').innerHTML = '';
+      setFileNotice(null);
+      clearFileCitations();
+      $('#btn-edit').disabled = true;
+      $('#btn-delete').disabled = true;
+    }
+    await loadTree();
+    loadStats();
+    toast(removeFiles ? `unlinked and removed ${node.path}` : `unlinked ${node.path} — its files stay as ordinary documents`, 5000);
+  } catch (e) {
+    toast(`unlink failed: ${e.message}`, 5000);
+  }
+}
+
+/* ---------------------------- Feishu documents --------------------------- */
+
+/**
+ * Feishu is read as this machine's signed-in Feishu user (lark-cli, see
+ * src/ingest/feishu/client.ts). With nobody signed in, or a scope missing,
+ * this runs the one-time authorization: a Feishu page to approve on, then a
+ * wait until lark-cli holds the token. True once reading can start.
+ */
+async function ensureFeishuSignedIn() {
+  let status;
+  try {
+    status = await api('/api/feishu/auth');
+  } catch (e) {
+    toast(`Feishu: ${e.message}`, 6000);
+    return false;
+  }
+  if (!status.installed) {
+    alert(`lark-cli, which knode-os reads Feishu through, is not installed where the service runs.\n\n${status.error || ''}\n\nInstall it (https://github.com/larksuite/cli), then try again.`);
+    return false;
+  }
+  if (status.signedIn && !status.missingScopes.length) return true;
+  const why = status.signedIn
+    ? `Feishu is signed in as ${status.user?.name || 'someone'}, without leave to ${status.missingScopes.join(', ')}.`
+    : 'No Feishu account is signed in on this machine yet.';
+  if (!confirm(`${why}\n\nAuthorize once: a Feishu page opens where you let knode-os read documents — with their pictures and attachments — as your Feishu account. It stays authorized as long as knode-os keeps using it.\n\nContinue?`)) return false;
+  let begun;
+  try {
+    begun = await api('/api/feishu/auth/login', { method: 'POST' });
+  } catch (e) {
+    toast(`Feishu sign-in failed: ${e.message}`, 6000);
+    return false;
+  }
+  const link = begun.signIn.verificationUrl;
+  // after an await a browser may refuse a new tab: then the link is handed over to open by hand
+  if (!window.open(link, '_blank', 'noopener')) prompt('Open this link to approve knode-os in Feishu (on any device):', link);
+  toast('approve knode-os on the Feishu page — waiting…', 600000);
+  const deadline = Date.parse(begun.signIn.expiresAt) || Date.now() + 600000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 2500));
+    let now;
+    try {
+      now = await api('/api/feishu/auth');
+    } catch {
+      continue;
+    }
+    if (now.signIn.state === 'done' && now.signedIn) {
+      toast(`signed in to Feishu as ${now.user?.name || 'you'}`, 4000);
+      return true;
+    }
+    if (now.signIn.state === 'failed') {
+      toast(`Feishu sign-in failed: ${now.signIn.error}`, 6000);
+      return false;
+    }
+  }
+  toast('the Feishu sign-in link expired before it was approved', 6000);
+  return false;
+}
+
+/**
+ * Bring a Feishu document in by its link: copied once (`copy`) or mirrored
+ * and kept in sync (`link`). The service looks it up first — which also
+ * proves the signed-in account may read it — and says what it would bring.
+ */
+async function importFeishuDoc(mode) {
+  const input = prompt(
+    mode === 'link'
+      ? 'Link of the Feishu document to link (…/docx/… or …/wiki/…).\nIt is mirrored into raw/docs with its pictures, and kept in sync: while knode-os runs it asks Feishu every few minutes whether the document was edited.'
+      : 'Link of the Feishu document to import (…/docx/… or …/wiki/…).\nIt is copied once into raw/docs with its pictures and attachments.',
+    lastFeishuUrl,
+  );
+  if (input === null) return;
+  const url = input.trim();
+  if (!url) return;
+  lastFeishuUrl = url;
+  if (!(await ensureFeishuSignedIn())) return;
+  toast('looking the document up in Feishu…', 60000);
+  let plan;
+  try {
+    plan = await api('/api/feishu/preview', { method: 'POST', body: JSON.stringify({ url }) });
+  } catch (e) {
+    toast(`${mode === 'link' ? 'link' : 'import'} failed: ${e.message}`, 8000);
+    return;
+  }
+  if (plan.linked) {
+    reveal(plan.linked.dest);
+    toast(`"${plan.title}" is linked already at ${plan.linked.dest} — right-click it to check Feishu for edits`, 6000);
+    return;
+  }
+  const lines = [
+    `${mode === 'link' ? 'Link' : 'Import'} "${plan.title}"`,
+    plan.url,
+    `→ ${plan.dest}`,
+    '',
+    plan.modifiedAt ? `Last edited ${new Date(plan.modifiedAt).toLocaleString()}.` : '',
+    'Its pictures come along, each read by the vision model as a document of its own; so do PDF and text attachments. Other attachments, embedded bases and sheets stay in Feishu, linked from the text.',
+  ];
+  if (plan.existing) lines.push('', `It was imported before (revision ${plan.existing.revision}): ${mode === 'link' ? 'that copy becomes the linked mirror.' : 'that copy is brought up to date.'}`);
+  if (mode === 'link') lines.push('', 'Edit it in Feishu: the copy here is read-only and follows the original.');
+  lines.push('', 'Continue?');
+  if (!confirm(lines.filter((l, i) => l || lines[i - 1]).join('\n'))) return;
+  toast(`${mode === 'link' ? 'linking' : 'importing'} "${plan.title}" — fetching it and its pictures…`, 600000);
+  try {
+    const res = await api('/api/feishu/import', { method: 'POST', body: JSON.stringify({ url, mode }) });
+    reveal(res.dest);
+    await loadTree();
+    loadStats();
+    const verb = res.refreshed ? 'refreshed' : mode === 'link' ? 'linked' : 'imported';
+    toast(`${verb} "${res.title}": ${fmtCount(res.images, 'picture')}, ${fmtCount(res.attachments, 'attachment')}${res.indexing ? ' · indexing in the background' : ''}${res.warnings.length ? ` · ${fmtCount(res.warnings.length, 'warning')} in the log` : ''}`, 8000);
+  } catch (e) {
+    toast(`${mode === 'link' ? 'link' : 'import'} failed: ${e.message}`, 8000);
+  }
+}
+
+async function syncFeishuDoc(dest, force = false) {
+  toast(force ? `fetching ${dest} from Feishu again…` : `asking Feishu whether ${dest} was edited…`, 600000);
+  try {
+    const { results } = await api('/api/feishu/sync', { method: 'POST', body: JSON.stringify({ dest, force }) });
+    const r = results[0];
+    await loadTree();
+    loadStats();
+    if (!r) toast('nothing to sync');
+    else if (r.error) toast(`${dest}: ${r.error}`, 8000);
+    else if (!r.fetched) toast(`${dest}: not edited since ${r.modifiedAt ? new Date(r.modifiedAt).toLocaleString() : 'the last fetch'}`, 5000);
+    else toast(`${dest}: fetched — ${r.written} written, ${r.removed} removed${r.sync ? ` · ${r.sync.indexed} indexed` : ' · nothing changed'}`, 5000);
+  } catch (e) {
+    toast(`sync failed: ${e.message}`, 6000);
+  }
+}
+
+async function unlinkFeishuNode(node, removeFiles) {
+  const question = removeFiles
+    ? `Stop following ${feishuDests.get(node.path)} and delete its copy at ${node.path}?\n\nIts knowledge is disposed (history stays in the ledger). The document in Feishu is not touched.`
+    : `Stop following ${feishuDests.get(node.path)}?\n\nThe copy at ${node.path} stays as ordinary documents and no longer follows the original.`;
+  if (!confirm(question)) return;
+  try {
+    await api(`/api/feishu?dest=${encodeURIComponent(node.path)}&removeFiles=${removeFiles ? 1 : 0}`, { method: 'DELETE' });
     if (removeFiles && currentFile && (currentFile === node.path || currentFile.startsWith(`${node.path}/`))) {
       currentFile = null;
       $('#file-path').textContent = '';

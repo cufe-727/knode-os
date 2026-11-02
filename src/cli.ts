@@ -55,6 +55,7 @@ import { REMOTE_SCOPES, RemoteScope, RemoteTokenStore } from './remote/tokens.js
 import { WORK_KINDS } from './work/kinds.js';
 import { registerAuthCommands } from './auth/cli.js';
 import { describeLinkedFolders, importFolder, refreshLinkedFolders, unlinkFolder } from './ingest/folders.js';
+import { describeFeishuLinks, feishuClient, FeishuSignIn, importFeishuDocument, refreshFeishuLinks, unlinkFeishuDocument } from './ingest/feishu/docs.js';
 import { requeueFailedExtractions } from './graph/tier1.js';
 import { sync } from './ingest/sync.js';
 import { historyOf, lineageOf } from './lineage/inspect.js';
@@ -422,6 +423,128 @@ folders
       const r = await unlinkFolder(ctx, dest, { removeFiles: Boolean(opts.removeFiles), onProgress: (m) => console.log(`  ${m}`) });
       console.log(r.removedFiles ? `unlinked ${r.dest} and removed its files (${r.sync?.disposed ?? 0} disposed)` : `unlinked ${r.dest}; its files stay as ordinary documents`);
       console.log(SERVE_HINT);
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+/* ------------------------------ Feishu documents ------------------------------ */
+
+const feishu = program
+  .command('feishu')
+  .description('import Feishu (Lark) documents into raw/docs with their pictures, once or kept in sync — read through lark-cli as the signed-in Feishu user (see src/ingest/feishu/docs.ts)');
+
+const FEISHU_SERVE_HINT = 'note: a running `knode-os serve` keeps its own copy of the config — restart it, or link through the app, for it to poll this document';
+
+feishu
+  .command('status')
+  .description('who lark-cli is signed in as, and whether it may read what knode-os needs')
+  .option('--json', 'raw JSON output')
+  .action(async (opts) => {
+    const status = await feishuClient(loadConfig(dataDir())).status();
+    if (opts.json) {
+      console.log(JSON.stringify(status, null, 2));
+      return;
+    }
+    if (!status.installed) console.log(`lark-cli: not found (${status.cli}) — ${status.error}`);
+    else if (!status.signedIn) console.log(`lark-cli ${status.cli}: no Feishu user signed in — run \`knode-os feishu login\``);
+    else {
+      console.log(`signed in to ${status.brand ?? 'feishu'} as ${status.user?.name} (${status.user?.openId}) through app ${status.appId}`);
+      console.log(status.missingScopes.length ? `missing scopes: ${status.missingScopes.join(', ')} — run \`knode-os feishu login\`` : 'every scope knode-os needs is granted');
+      if (status.refreshExpiresAt) console.log(`stays signed in while used before ${status.refreshExpiresAt} (each use renews it)`);
+    }
+  });
+
+feishu
+  .command('login')
+  .description('authorize knode-os once: prints a Feishu link to open on any device, then waits until it is approved')
+  .action(async () => {
+    const client = feishuClient(loadConfig(dataDir()));
+    const status = await client.status();
+    if (!status.installed) throw new Error(status.error ?? 'lark-cli is not installed');
+    const signIn = new FeishuSignIn(() => client);
+    const state = await signIn.begin(status);
+    console.log(`open this link and approve: ${state.verificationUrl}`);
+    console.log(`(it expires ${state.expiresAt})`);
+    await signIn.settled();
+    const done = signIn.state();
+    if (done.state !== 'done') throw new Error(done.error ?? 'sign-in did not finish');
+    const after = await client.status();
+    console.log(`signed in as ${after.user?.name ?? 'the approving user'}${after.missingScopes.length ? `; still missing ${after.missingScopes.join(', ')}` : ''}`);
+  });
+
+feishu
+  .command('list')
+  .description('linked Feishu documents and the revision each mirror holds')
+  .option('--json', 'raw JSON output')
+  .action(async (opts) => {
+    const ctx = await createContext(dataDir());
+    const links = describeFeishuLinks(ctx);
+    if (opts.json) console.log(JSON.stringify(links, null, 2));
+    else if (links.length === 0) console.log('no linked Feishu documents — `knode-os feishu link <url>` mirrors one under raw/docs and keeps it in sync');
+    else for (const l of links) console.log(`${l.dest}  ←  ${l.url}  "${l.title}", revision ${l.revision ?? '?'}, edited ${l.modifiedAt ?? '?'}, ${l.images} pictures, ${l.attachments} attachments${l.failed ? `, ${l.failed} not downloaded yet` : ''}`);
+    await ctx.store.close();
+  });
+
+const feishuImportAction = (mode: 'copy' | 'link') => async (url: string, opts: { to?: string; llm?: boolean }) => {
+  const ctx = await createContext(dataDir());
+  try {
+    const r = await importFeishuDocument(ctx, feishuClient(ctx.config), url, { dest: opts.to, mode, llmGraph: opts.llm, onProgress: (m) => console.log(`  ${m}`) });
+    console.log(`${r.refreshed ? 'refreshed' : mode === 'link' ? 'linked' : 'imported'} "${r.title}" (revision ${r.revision}) → ${r.file}`);
+    console.log(`  ${r.images} pictures, ${r.attachments} attachments${r.keptInFeishu ? `, ${r.keptInFeishu} kept in Feishu` : ''}; ${r.written.length} written, ${r.removed.length} removed`);
+    for (const w of r.warnings) console.log(`  warning: ${w}`);
+    if (r.sync) console.log(`indexed: ${r.sync.indexed} applied, ${r.sync.unchanged} unchanged, ${r.sync.skipped} skipped, ${r.sync.errors} errors`);
+    if (mode === 'link') console.log(FEISHU_SERVE_HINT);
+  } finally {
+    await ctx.datasources.closeAll();
+    await ctx.store.close();
+  }
+};
+
+feishu
+  .command('import <url>')
+  .description('copy a Feishu document once into raw/docs/feishu/<title>__<token>/ (pictures and indexable attachments beside it) and index it')
+  .option('--to <dest>', 'destination under raw/docs (default raw/docs/feishu/<title>__<token>)')
+  .option('--no-llm', 'do not queue the documents for tier-1 LLM extraction')
+  .action(feishuImportAction('copy'));
+
+feishu
+  .command('link <url>')
+  .description('mirror a Feishu document and keep it in sync: `serve` asks Feishu every few minutes whether it was edited')
+  .option('--to <dest>', 'destination under raw/docs (default raw/docs/feishu/<title>__<token>)')
+  .option('--no-llm', 'do not queue the documents for tier-1 LLM extraction')
+  .action(feishuImportAction('link'));
+
+feishu
+  .command('sync [dest]')
+  .description('ask Feishu now which linked documents were edited and re-mirror those (one link with <dest>)')
+  .option('--force', 'fetch every linked document, edited or not')
+  .action(async (dest: string | undefined, opts: { force?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const results = await refreshFeishuLinks(ctx, feishuClient(ctx.config), { dest, force: Boolean(opts.force), onProgress: (m) => console.log(`  ${m}`) });
+      if (results.length === 0) console.log('no linked Feishu documents');
+      for (const r of results) {
+        console.log(r.error ? `${r.dest}: ${r.error}` : r.fetched ? `${r.dest}: fetched — ${r.written} written, ${r.removed} removed${r.sync ? `; ${r.sync.indexed} applied, ${r.sync.disposed} disposed` : ''}` : `${r.dest}: unchanged since ${r.modifiedAt ?? 'the last fetch'}`);
+        for (const w of r.warnings) console.log(`  warning: ${w}`);
+      }
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+feishu
+  .command('unlink <dest>')
+  .description('stop following a Feishu document; the mirror stays as ordinary documents unless --remove-files')
+  .option('--remove-files', 'also delete the mirror and dispose its documents')
+  .action(async (dest: string, opts: { removeFiles?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const r = await unlinkFeishuDocument(ctx, dest, { removeFiles: Boolean(opts.removeFiles), onProgress: (m) => console.log(`  ${m}`) });
+      console.log(r.removedFiles ? `unlinked ${r.dest} and removed its files (${r.sync?.disposed ?? 0} disposed)` : `unlinked ${r.dest}; its files stay as ordinary documents`);
+      console.log(FEISHU_SERVE_HINT);
     } finally {
       await ctx.datasources.closeAll();
       await ctx.store.close();

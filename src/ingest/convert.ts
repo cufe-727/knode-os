@@ -80,11 +80,12 @@ export function pdfPageLimit(rawRel: string | undefined, opts: ConversionOptions
 
 /**
  * What a cached conversion is keyed by: the converter and its version, the
- * vision model when the converter uses one, and the size limits. A different
- * key means the conversion is redone; a knob that is only a rate (concurrency)
- * must never be part of it.
+ * vision model when the converter uses one, the size limits, and the file's
+ * own variant when its converter reads it a way of its own (`variant` on the
+ * converter). A different key means the conversion is redone; a knob that is
+ * only a rate (concurrency) must never be part of it.
  */
-export function conversionCacheKey(opts: ConversionOptions, rawRel?: string): string {
+export function conversionCacheKey(opts: ConversionOptions, rawRel?: string, variant?: string | null): string {
   const converter = rawRel ? converterFor(rawRel) : undefined;
   const version = converter?.version ?? 1;
   const head = !converter || LEGACY_KEY_CONVERTERS.has(converter.id) ? `v${version}` : `${converter.id}@${version}`;
@@ -95,7 +96,20 @@ export function conversionCacheKey(opts: ConversionOptions, rawRel?: string): st
     vision,
     `pages:${pdfPageLimit(rawRel, opts)}`,
     `image:${opts.maxImageDimension ?? DEFAULT_MAX_IMAGE_DIMENSION}`,
+    ...(variant ? [variant] : []),
   ].join('|');
+}
+
+/** The file's own part of its conversion key (DocumentConverterPlugin.variant); null when it has none or it cannot be read. */
+export async function conversionVariant(absPath: string, rawRel: string, opts: ConversionOptions): Promise<string | null> {
+  const converter = converterFor(rawRel);
+  if (!converter?.variant) return null;
+  try {
+    return await converter.variant({ absPath, rel: rawRel, maxImageDimension: opts.maxImageDimension });
+  } catch {
+    // an unreadable file fails in the conversion itself, with a message saying so
+    return null;
+  }
 }
 
 /** What a transcript's text is keyed by: its own bytes, so an edit is a new conversion and nothing else is. */
