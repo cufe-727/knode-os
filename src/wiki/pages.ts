@@ -1,7 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { KnodeConfig } from '../config.js';
 import { summaryLlmClient } from '../context.js';
 import { DataSourceRegistry } from '../datasource/registry.js';
@@ -19,6 +18,7 @@ import { DepDecl } from '../lineage/types.js';
 import { classifyFailure } from '../labeling/failures.js';
 import { LlmClient } from '../llm/client.js';
 import { applyScope } from '../lineage/scope.js';
+import { readMatter, writeMatter } from '../markdown.js';
 import { isGeneratedConcept, okfGenerated } from '../okf/index.js';
 import { getDocHeat } from '../stats/heat.js';
 import { Store } from '../store/db.js';
@@ -545,13 +545,13 @@ const FRONTMATTER_RE = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/;
 /** Merge generated frontmatter keys and regions into an existing page (or build a fresh one). */
 export function composePage(existing: string | null, frontmatter: Record<string, unknown>, regions: Record<string, string>): string {
   if (!existing) {
-    const front = Object.keys(frontmatter).length ? matter.stringify('', frontmatter).trimEnd() : '';
+    const front = Object.keys(frontmatter).length ? writeMatter('', frontmatter).trimEnd() : '';
     const body = Object.entries(regions).map(([id, c]) => renderRegion(id, c)).join('\n\n');
     return `${front ? front + '\n\n' : ''}${body}\n`;
   }
   let parsed: { data: Record<string, unknown>; content: string };
   try {
-    const p = matter(existing);
+    const p = readMatter(existing);
     parsed = { data: p.data as Record<string, unknown>, content: p.content };
   } catch {
     parsed = { data: {}, content: existing };
@@ -574,7 +574,7 @@ export function composePage(existing: string | null, frontmatter: Record<string,
     const front = hadFrontmatter ? FRONTMATTER_RE.exec(existing)![0].trimEnd() : '';
     return `${front ? front + '\n\n' : ''}${body}\n`;
   }
-  return matter.stringify('\n' + body, data).replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
+  return writeMatter('\n' + body, data).replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
 }
 
 /* ----------------------------- regeneration ----------------------------- */
@@ -618,7 +618,7 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
   if (gen.mode === 'file' && existing && !row) {
     let generated = false;
     try {
-      generated = isGeneratedConcept(matter(existing).data as Record<string, unknown>);
+      generated = isGeneratedConcept(readMatter(existing).data as Record<string, unknown>);
     } catch {
       generated = false;
     }

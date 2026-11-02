@@ -1,7 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { AppContext } from '../context.js';
 import { assertWritablePath, safePath, writeFileBytes } from '../fs/files.js';
 import { RAW_DOCS, sidecarRelFor } from '../fs/layout.js';
@@ -13,6 +12,7 @@ import { meaningfulLength } from '../ingest/converters/shared.js';
 import { sync } from '../ingest/sync.js';
 import { decodeText, FetchedResponse, guardedFetch } from './fetch.js';
 import { researchSlug } from './templates.js';
+import { readMatter } from '../markdown.js';
 
 /**
  * Web material a study relies on, kept as a source of the knowledge base.
@@ -366,7 +366,7 @@ function resultFrom(dataDir: string, e: ManifestEntry, asked: string, reused: bo
     const text = fs.existsSync(derived) ? fs.readFileSync(derived, 'utf8') : e.kind === 'text' || e.kind === 'excerpt' ? fs.readFileSync(safePath(dataDir, e.path), 'utf8') : '';
     if (text) {
       chars = text.length;
-      outline = outlineOf(matter(text).content);
+      outline = outlineOf(readMatter(text).content);
     }
   } catch {
     /* the outline is a convenience */
@@ -491,7 +491,7 @@ export async function captureUrl(ctx: AppContext, req: CaptureRequest): Promise<
       bytes = res.body;
     } else if (kind === 'text') {
       const { text } = decodeText(res.body, res.charset, res.contentType);
-      const fm = matter(text);
+      const fm = readMatter(text);
       const body = [
         '---',
         `title: ${JSON.stringify(title ?? (typeof fm.data.title === 'string' ? fm.data.title : siteOf(finalUrl)))}`,

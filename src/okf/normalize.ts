@@ -1,6 +1,6 @@
 import path from 'node:path';
-import matter from 'gray-matter';
 import { isReservedWikiFile } from '../lineage/declared.js';
+import { readMatter } from '../markdown.js';
 
 /**
  * OKF conformance for the indexed view (L0 → L1).
@@ -113,7 +113,7 @@ function parse(markdown: string): { frontmatter: Record<string, unknown>; body: 
   if (!hasFrontmatter) return { frontmatter: {}, body: markdown, hasFrontmatter: false };
   if (!/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.test(markdown)) return null;
   try {
-    const p = matter(markdown);
+    const p = readMatter(markdown);
     return { frontmatter: p.data as Record<string, unknown>, body: p.content, hasFrontmatter: true };
   } catch {
     return null;

@@ -1,11 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { parseYaml } from '../compiler/intents.js';
 import { HttpEndpointConfig, KnodeConfig, resolveSecret } from '../config.js';
 import { RESEARCH_DIR } from '../fs/layout.js';
 import { extractRecords } from '../datasource/http.js';
 import { guardedFetch } from './fetch.js';
+import { writeMatter } from '../markdown.js';
 
 /**
  * Research sources — where a study may look besides the knowledge base and
@@ -182,7 +182,7 @@ export function sourceYaml(source: ResearchSource): string {
   } else {
     data.datasource = source.datasource;
   }
-  return matter.stringify('', JSON.parse(JSON.stringify(data))).replace(/^---\n/, '').replace(/---\n*$/, '');
+  return writeMatter('', JSON.parse(JSON.stringify(data))).replace(/^---\n/, '').replace(/---\n*$/, '');
 }
 
 export function saveResearchSource(dataDir: string, input: Record<string, unknown> & { id: string }, config?: KnodeConfig): ResearchSource {

@@ -1,10 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { CHAT_PROTOCOL, CHAT_PROTOCOL_FILE, CHAT_TURN, CHAT_TURN_FILE } from '../chat/templates.js';
 import { DEFAULT_INTENT_YAML } from '../compiler/intents.js';
 import { STOPLIST_TEMPLATE } from '../graph/concept-stoplist.js';
 import { builtinPackYaml } from '../graph/ontology.js';
+import { readMatter } from '../markdown.js';
 import { DEFAULT_PLAYBOOK } from '../pack/playbook.js';
 import { builtinResearchText, parseResearchTemplate, PROTOCOL_FILE } from '../research/templates.js';
 import { cleanRelPath, safePath } from './files.js';
@@ -136,8 +136,8 @@ export function readPlaybook(dataDir: string, rel: string): PlaybookFile & { tex
 /** Why `text` would break the playbook at `name`, or null when it reads. */
 function problem(spec: GroupSpec, name: string, text: string): string | null {
   try {
-    if (/\.ya?ml$/.test(name)) matter(`---\n${text.replace(/^﻿/, '').replace(/^---\s*\n/, '')}\n---\n`);
-    else if (/^﻿?---\s*\n/.test(text)) matter(text);
+    if (/\.ya?ml$/.test(name)) readMatter(`---\n${text.replace(/^﻿/, '').replace(/^---\s*\n/, '')}\n---\n`);
+    else if (/^﻿?---\s*\n/.test(text)) readMatter(text);
   } catch (e) {
     // js-yaml's first line ends where its excerpt of the text begins
     return `${name} does not parse as YAML: ${e instanceof Error ? e.message.split('\n')[0].replace(/:\s*$/, '') : e}`;

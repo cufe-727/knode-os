@@ -1,11 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { parseYaml } from '../compiler/intents.js';
 import { KnodeConfig, LLM_EFFORTS, LLM_SPEEDS, LlmEffort, LlmSpeed } from '../config.js';
 import { RESEARCH_DIR } from '../fs/layout.js';
 import { agentWebCapable, ResearchAgent } from './agent.js';
 import { PHASES, PhaseName, ResearchTemplate } from './templates.js';
+import { writeMatter } from '../markdown.js';
 
 /**
  * Research profiles — the harness-independent description of *how* a deep
@@ -240,7 +240,7 @@ function profileFile(dataDir: string, name: string): string {
 /** YAML body of a profile (the file never carries its own path). */
 export function profileYaml(profile: ResearchProfile): string {
   const { path: _path, ...data } = profile;
-  return matter.stringify('', data).replace(/^---\n/, '').replace(/---\n*$/, '');
+  return writeMatter('', data).replace(/^---\n/, '').replace(/---\n*$/, '');
 }
 
 /** Seed the built-in profiles once (never overwrites user edits). */

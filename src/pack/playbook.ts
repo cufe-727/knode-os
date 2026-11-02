@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { PACKS_DIR } from '../fs/layout.js';
+import { readMatter } from '../markdown.js';
 
 /**
  * Playbooks are the "script" form of a context pack: agent-readable,
@@ -63,7 +63,7 @@ export function parsePlaybook(raw: string, relPath: string): Playbook | null {
   let fm: Record<string, unknown>;
   let body: string;
   try {
-    const p = matter(raw);
+    const p = readMatter(raw);
     fm = p.data as Record<string, unknown>;
     body = p.content;
   } catch {

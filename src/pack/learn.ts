@@ -5,10 +5,10 @@ import { queueJob } from '../research/jobs.js';
 import { ResearchKind } from '../research/templates.js';
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { KnodeConfig } from '../config.js';
 import { assertWritablePath, writeFileText } from '../fs/files.js';
 import { LlmClient } from '../llm/client.js';
+import { readMatter, writeMatter } from '../markdown.js';
 import { Store } from '../store/db.js';
 import { getSuggestion } from '../store/queries.js';
 import { SuggestionRow } from '../types.js';
@@ -204,11 +204,11 @@ function heuristicRevision(stats: PlaybookStats, current: string): { content: st
   const broken = [...stats.probeRuns.entries()].filter(([, r]) => r.runs >= 2 && r.failures / r.runs >= 0.5);
   if (broken.length === 0) return null;
   const brokenIds = new Set(broken.map(([probeId]) => probeId));
-  const parsed = matter(current);
+  const parsed = readMatter(current);
   const probes = Array.isArray(parsed.data.probes) ? parsed.data.probes : [];
   const kept = probes.filter((p: { id?: string }) => !p?.id || !brokenIds.has(p.id));
   if (kept.length === probes.length) return null;
-  const content = matter.stringify(parsed.content, { ...parsed.data, probes: kept });
+  const content = writeMatter(parsed.content, { ...parsed.data, probes: kept });
   return {
     content,
     rationale: `Probes ${[...brokenIds].join(', ')} failed in ≥50% of recent context packs (${stats.uses} uses). Removing them until the source is fixed keeps packs fast and noise-free.`,

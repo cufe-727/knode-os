@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { INTENTS_DIR } from '../fs/layout.js';
+import { readMatter } from '../markdown.js';
 
 /**
  * Intent specs — the configurable half of the Context Compiler.
@@ -82,7 +82,7 @@ export const DEFAULT_INTENT: IntentSpec = {
 export function parseYaml(text: string): Record<string, unknown> {
   const body = text.replace(/^﻿/, '').replace(/^---\s*\n/, '');
   try {
-    return matter(`---\n${body}\n---\n`).data as Record<string, unknown>;
+    return readMatter(`---\n${body}\n---\n`).data as Record<string, unknown>;
   } catch {
     return {};
   }

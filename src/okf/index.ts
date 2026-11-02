@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import { safePath } from '../fs/files.js';
+import { readMatter } from '../markdown.js';
 import { initObsidianVault } from '../obsidian/vault.js';
 import { normalizeCookedFrontmatter } from './normalize.js';
 
@@ -459,7 +459,7 @@ function parseOkfFile(raw: string): ParsedOkfFile {
     };
   }
   try {
-    const parsed = matter(raw);
+    const parsed = readMatter(raw);
     return { frontmatter: parsed.data as Record<string, unknown>, body: parsed.content, hasFrontmatter: true };
   } catch (error) {
     return {

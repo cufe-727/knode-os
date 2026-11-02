@@ -9,7 +9,7 @@ import { runTier1Pass } from '../src/graph/tier1.js';
 import { sync } from '../src/ingest/sync.js';
 import { classifyFailure, newBackendHealth, recordBackendOutcome } from '../src/labeling/failures.js';
 import { LocalLabelingWorkers, localSummarySpec, localWorkerSpecs } from '../src/labeling/local.js';
-import { LabelingScheduler, LabelingTask, WorkerIdentity } from '../src/labeling/scheduler.js';
+import { FINISHED_KEEP, keepNewest, LabelingScheduler, LabelingTask, WorkerIdentity } from '../src/labeling/scheduler.js';
 import { ensureDefaultAgents } from '../src/research/agents.js';
 import { WorkBroker, WorkSource, WorkTask } from '../src/work/broker.js';
 import { workerHints } from '../src/work/config.js';
@@ -239,6 +239,18 @@ describe('the labeling scheduler', () => {
     } finally {
       await solo.stop();
     }
+  });
+});
+
+describe('what the scheduler keeps for the next review', () => {
+  it('keeps an id once, as the newest, and drops the oldest past the limit — reviews may not come while processing is stopped', () => {
+    const kept = new Set<string>();
+    keepNewest(kept, ['e1', 'e2', 'e1']);
+    expect([...kept]).toEqual(['e2', 'e1']);
+    keepNewest(kept, Array.from({ length: FINISHED_KEEP - 1 }, (_, i) => `c${i}`));
+    expect(kept.size).toBe(FINISHED_KEEP);
+    expect([...kept].slice(0, 2)).toEqual(['e1', 'c0']);
+    expect([...kept].at(-1)).toBe(`c${FINISHED_KEEP - 2}`);
   });
 });
 
