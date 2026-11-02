@@ -197,7 +197,7 @@ function renderWorkspaceUI() {
   $('#workspace-context').classList.toggle('team', !personal);
   $('#account-avatar').textContent = userInitials;
   $('#account-name').textContent = user.name;
-  const role = serverAuth?.account?.role === 'admin' ? ' · administrator' : '';
+  const role = serverAuth?.account?.role === 'admin' ? ' · administrator' : serverAuth?.account?.readOnly ? ' · read-only' : '';
   $('#account-email').textContent = user.username ? `@${user.username}${role}` : user.email;
   document.body.dataset.workspace = workspace.kind;
   document.body.dataset.role = serverAuth?.account?.role || 'member';
@@ -874,7 +874,7 @@ async function loadAccess() {
 function renderAccount(me) {
   const a = me.account;
   $('#access-summary').textContent = `Signed in as ${a.name || a.username} (@${a.username}), ${me.local ? 'on this machine' : 'from another machine'}.`;
-  $('#access-role').textContent = a.role === 'admin' ? 'administrator' : 'member';
+  $('#access-role').textContent = a.role === 'admin' ? 'administrator' : a.readOnly ? 'member, read-only — you may look, not change anything' : 'member';
   $('#access-groups').innerHTML = Object.entries(me.groups || {})
     .map(([group, ok]) => `<span class="access-chip${ok ? ' ok' : ''}" title="${esc(me.apiGroups?.[group] || '')}">${ok ? '✓' : '✕'} ${esc(API_GROUP_LABELS[group] || group)}</span>`)
     .join('');
@@ -947,7 +947,7 @@ function renderUsers(data) {
   const me = serverAuth?.account?.username;
   $('#access-users').innerHTML = data.users.map((u) => `<tr${u.disabled ? ' class="disabled"' : ''}>
       <td><b>${esc(u.username)}</b>${u.name && u.name !== u.username ? `<small>${esc(u.name)}</small>` : ''}${u.disabled ? '<small class="bad">disabled</small>' : ''}</td>
-      <td>${u.role === 'admin' ? 'administrator' : 'member'}</td>
+      <td>${u.role === 'admin' ? 'administrator' : 'member'}${u.readOnly ? '<small>read-only</small>' : ''}</td>
       <td>${u.role === 'admin' ? 'all' : esc(u.teams.join(', ') || '—')}</td>
       <td>${u.remoteApis.includes('*') ? 'everything' : esc(u.remoteApis.map((g) => API_GROUP_LABELS[g] || g).join(', ') || 'nothing')}</td>
       <td>${u.role === 'admin' ? 'all' : esc(u.gateways.join(', ') || '—')}</td>
@@ -986,6 +986,8 @@ function openUserDialog(username) {
   $('#user-password').disabled = self;
   $('#user-role').value = u?.role || 'member';
   $('#user-role').disabled = self;
+  $('#user-readonly').checked = Boolean(u?.readOnly);
+  $('#user-readonly-row').hidden = $('#user-role').value === 'admin';
   $('#user-teams').value = (u?.teams || []).join(', ');
   $('#user-gateways').value = (u?.gateways || []).join(', ');
   $('#user-disabled').checked = Boolean(u?.disabled);
@@ -998,6 +1000,8 @@ function openUserDialog(username) {
 }
 
 $('#btn-add-user').addEventListener('click', () => openUserDialog(null));
+// an administrator is never read-only
+$('#user-role').addEventListener('change', () => { $('#user-readonly-row').hidden = $('#user-role').value === 'admin'; });
 $('#btn-cancel-user').addEventListener('click', () => $('#user-dialog').close());
 
 $('#access-users').addEventListener('click', async (event) => {
@@ -1027,6 +1031,7 @@ $('#user-form').addEventListener('submit', async (event) => {
     teams: csvList($('#user-teams').value),
     gateways: csvList($('#user-gateways').value),
     remoteApis,
+    readOnly: $('#user-role').value === 'member' && $('#user-readonly').checked,
   };
   const password = $('#user-password').value;
   try {

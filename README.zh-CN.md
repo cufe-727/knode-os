@@ -180,7 +180,7 @@ knode-os extract [--batch n]  跑一轮后台文档轮次:抽取一批、复核�
 knode-os translate <path…> [--lang zh] | --status   立即在 Translate 路由上翻译文档 / 按语言列出译文
 knode-os remote token create --name <机器> --scope label,read,write,sql --workspace <用户>/<workspace>
                               为远程 API 签发每台机器各自的 token(另有 `remote token list | revoke`)
-knode-os user add <名字> [--admin] [--team t] [--remote-apis 分组] [--gateway id]
+knode-os user add <名字> [--admin] [--read-only] [--team t] [--remote-apis 分组] [--gateway id]
                               可以登录的账号(另有 `user list | set | passwd | signout | remove | token | sessions`)
 knode-os gateway add <id> <http://127.0.0.1:端口/路径>   把本机服务发布在 /gw/<id> 下(另有 `gateway list | remove`)
 knode-os tls init [--host IP或域名]   为 HTTPS 监听(server.tls)生成自签名证书
@@ -286,7 +286,7 @@ pnpm typecheck && pnpm test            # tsc + vitest
 
 ## 安全说明
 
-服务只绑定 `127.0.0.1`，并要求每个客户端登录——浏览器、应用和脚本，本机也不例外(`src/auth`)：密码用 scrypt 哈希，会话只存哈希，登录按地址和用户名限速，浏览器的写操作有 CSRF 防护。来自其他机器的请求必须走 HTTPS(经隧道,或 `server.tls` 监听)，且只能使用账号允许从外部使用的 API 分组；`/mcp` 只对本机开放；`serve` 拒绝在其他机器能以明文 HTTP 访问的地址上监听。成员不能修改设置，只能打开自己的 Workspace 和分配给他们的 Team——但 Ask 与 Research 会在服务所在的机器上运行编码 agent，只开放给你信得过的人。远程标注工作者在 `/remote/v1` 上使用每台机器各自的 token(哈希存储、按 workspace 与能力限定、限速、留审计日志)，详见 [docs/remote-access.md](docs/remote-access.md) 与 [docs/remote-labeling.md](docs/remote-labeling.md)。API key 支持 `env:VAR` 引用，配置文件可不落盘密钥。文件 API 被限制在当前 Workspace 目录内（防路径穿越）；写入、移动和删除操作（HTTP 与 MCP 一致）仅限 `wiki/`、`raw/docs/` 与 `playbooks/packs/`（另外 `purpose.md` 和 `schema.md` 只能经 HTTP 写，其余 playbook 只能由管理员在设置里写），且永远不会落到系统专有的 `.sidecar/` 目录。对已配置数据源的原生 SQL 由数据库本身保证只读，而不只靠文本检查：守卫按数据源自己的词法规则读语句（MySQL 用 MySQL 的，TimescaleDB 与 DuckDB 用 PostgreSQL 的），先行拒绝——只允许一条语句、以 SELECT/SHOW/DESCRIBE/EXPLAIN/WITH 开头、不含写关键字；连接器随后让它单独执行，放在一个总会回滚的只读事务里，带语句超时，返回行数有上限；DuckDB 数据源只能读取自己视图背后的文件。即便如此，仍请给 knode-os 配只读的数据库账号：能伸到事务之外的东西（dblink、服务器上的文件）只受数据库用户权限的约束；在 MariaDB 上，一条语句还能自行解除只读（`SET STATEMENT … FOR`、`BEGIN NOT ATOMIC … END`），这只有守卫会拒绝。
+服务只绑定 `127.0.0.1`，并要求每个客户端登录——浏览器、应用和脚本，本机也不例外(`src/auth`)：密码用 scrypt 哈希，会话只存哈希，登录按地址和用户名限速，浏览器的写操作有 CSRF 防护。来自其他机器的请求必须走 HTTPS(经隧道,或 `server.tls` 监听)，且只能使用账号允许从外部使用的 API 分组；`/mcp` 只对本机开放；`serve` 拒绝在其他机器能以明文 HTTP 访问的地址上监听。成员不能修改设置，只能打开自己的 Workspace 和分配给他们的 Team;只读成员什么都不能改——但 Ask 与 Research 会在服务所在的机器上运行编码 agent，只开放给你信得过的人。远程标注工作者在 `/remote/v1` 上使用每台机器各自的 token(哈希存储、按 workspace 与能力限定、限速、留审计日志)，详见 [docs/remote-access.md](docs/remote-access.md) 与 [docs/remote-labeling.md](docs/remote-labeling.md)。API key 支持 `env:VAR` 引用，配置文件可不落盘密钥。文件 API 被限制在当前 Workspace 目录内（防路径穿越）；写入、移动和删除操作（HTTP 与 MCP 一致）仅限 `wiki/`、`raw/docs/` 与 `playbooks/packs/`（另外 `purpose.md` 和 `schema.md` 只能经 HTTP 写，其余 playbook 只能由管理员在设置里写），且永远不会落到系统专有的 `.sidecar/` 目录。对已配置数据源的原生 SQL 由数据库本身保证只读，而不只靠文本检查：守卫按数据源自己的词法规则读语句（MySQL 用 MySQL 的，TimescaleDB 与 DuckDB 用 PostgreSQL 的），先行拒绝——只允许一条语句、以 SELECT/SHOW/DESCRIBE/EXPLAIN/WITH 开头、不含写关键字；连接器随后让它单独执行，放在一个总会回滚的只读事务里，带语句超时，返回行数有上限；DuckDB 数据源只能读取自己视图背后的文件。即便如此，仍请给 knode-os 配只读的数据库账号：能伸到事务之外的东西（dblink、服务器上的文件）只受数据库用户权限的约束；在 MariaDB 上，一条语句还能自行解除只读（`SET STATEMENT … FOR`、`BEGIN NOT ATOMIC … END`），这只有守卫会拒绝。
 
 ## License
 

@@ -83,7 +83,7 @@ function describe(u: PublicAccount, sessions: SessionStore): string {
   const live = sessions.list(u.username);
   const last = live.map((s) => s.lastSeenAt).sort().pop();
   return [
-    `${u.username}${u.name && u.name !== u.username ? ` (${u.name})` : ''}  ${u.role}${u.disabled ? '  DISABLED' : ''}`,
+    `${u.username}${u.name && u.name !== u.username ? ` (${u.name})` : ''}  ${u.role}${u.readOnly ? ', read-only' : ''}${u.disabled ? '  DISABLED' : ''}`,
     `    teams: ${u.role === 'admin' ? 'all' : u.teams.join(', ') || '—'}`,
     `    from other machines: ${u.remoteApis.includes('*') ? 'every group' : u.remoteApis.join(', ') || 'nothing'}`,
     `    gateways: ${u.role === 'admin' ? 'all' : u.gateways.join(', ') || '—'}`,
@@ -108,18 +108,20 @@ export function registerAuthCommands(program: Command, dataDir: () => string): v
     .option('--team <team...>', 'team workspaces a member may open (repeat or comma-separate; * = all)', collect)
     .option('--remote-apis <group...>', `API groups usable from other machines: ${groupsHelp}`, collect)
     .option('--gateway <id...>', 'gateways (local services) a member may reach (* = all)', collect)
+    .option('--read-only', 'a member who may look and not change anything')
     .option('--password-stdin', 'read the password from stdin (one line) instead of prompting')
-    .action(async (username: string, opts: { admin?: boolean; name?: string; team?: string[]; remoteApis?: string[]; gateway?: string[]; passwordStdin?: boolean }) => {
+    .action(async (username: string, opts: { admin?: boolean; name?: string; team?: string[]; remoteApis?: string[]; gateway?: string[]; readOnly?: boolean; passwordStdin?: boolean }) => {
+      if (opts.admin && opts.readOnly) throw new Error('an administrator cannot be read-only — leave out --admin or --read-only');
       const accounts = new AccountStore(dataDir());
       if (accounts.get(username)) throw new Error(`user "${username}" exists — \`knode-os user passwd ${username}\` changes the password`);
       const password = await newPassword(Boolean(opts.passwordStdin));
       const account = await accounts.create({
         username, name: opts.name, password, role: opts.admin ? 'admin' : 'member',
-        teams: opts.team, remoteApis: listOption(opts.remoteApis), gateways: opts.gateway,
+        teams: opts.team, remoteApis: listOption(opts.remoteApis), gateways: opts.gateway, readOnly: opts.readOnly,
       });
       console.log(`created ${account.role} ${account.username}. A running \`serve\` accepts it at once.`);
       console.log(describe(account, new SessionStore(dataDir())));
-      if (account.role === 'member' && (account.remoteApis.includes('ask') || account.remoteApis.includes('knowledge') || account.remoteApis.includes('*'))) {
+      if (account.role === 'member' && !account.readOnly && (account.remoteApis.includes('ask') || account.remoteApis.includes('knowledge') || account.remoteApis.includes('*'))) {
         console.log('note: Ask and Research run coding agents on this machine, which can read files outside the workspace — give them only to people you trust with that.');
       }
     });
@@ -138,17 +140,20 @@ export function registerAuthCommands(program: Command, dataDir: () => string): v
 
   user
     .command('set <username>')
-    .description('change an account: role, name, teams, remote API groups, gateways, disabled')
+    .description('change an account: role, name, teams, remote API groups, gateways, read-only, disabled')
     .option('--admin', 'make an administrator')
     .option('--member', 'make a member')
     .option('--name <name>', 'display name')
     .option('--team <team...>', 'replace the team list (* = all, none = no teams)', collect)
     .option('--remote-apis <group...>', `replace the groups usable from other machines: ${groupsHelp}`, collect)
     .option('--gateway <id...>', 'replace the gateway list (* = all, none)', collect)
+    .option('--read-only', 'let a member look and not change anything')
+    .option('--read-write', 'let a member change things again')
     .option('--disable', 'refuse sign-in and end the account\'s sessions')
     .option('--enable', 'allow sign-in again')
-    .action(async (username: string, opts: { admin?: boolean; member?: boolean; name?: string; team?: string[]; remoteApis?: string[]; gateway?: string[]; disable?: boolean; enable?: boolean }) => {
+    .action(async (username: string, opts: { admin?: boolean; member?: boolean; name?: string; team?: string[]; remoteApis?: string[]; gateway?: string[]; readOnly?: boolean; readWrite?: boolean; disable?: boolean; enable?: boolean }) => {
       if (opts.admin && opts.member) throw new Error('--admin or --member, not both');
+      if (opts.readOnly && opts.readWrite) throw new Error('--read-only or --read-write, not both');
       if (opts.disable && opts.enable) throw new Error('--disable or --enable, not both');
       const changes: AccountUpdate = {};
       if (opts.admin) changes.role = 'admin';
@@ -157,6 +162,8 @@ export function registerAuthCommands(program: Command, dataDir: () => string): v
       if (opts.team) changes.teams = listOption(opts.team);
       if (opts.remoteApis) changes.remoteApis = listOption(opts.remoteApis);
       if (opts.gateway) changes.gateways = listOption(opts.gateway);
+      if (opts.readOnly) changes.readOnly = true;
+      if (opts.readWrite) changes.readOnly = false;
       if (opts.disable) changes.disabled = true;
       if (opts.enable) changes.disabled = false;
       if (Object.keys(changes).length === 0) throw new Error('nothing to change — see `knode-os user set --help`');

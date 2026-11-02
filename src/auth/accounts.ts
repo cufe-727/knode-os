@@ -17,6 +17,9 @@ import { ApiGroup, API_GROUP_NAMES, DEFAULT_MEMBER_REMOTE_APIS } from './apis.js
  *   member  their own personal workspaces and the teams listed for them;
  *           every group but `settings`, and from outside this machine only
  *           the groups in `remoteApis`
+ *
+ * A member may also be read-only: they see what their groups and teams show
+ * them, and change nothing (`onlyReads` in src/auth/apis.ts).
  */
 
 export type Role = 'admin' | 'member';
@@ -41,6 +44,8 @@ export interface AccountRecord {
   remoteApis: string[];
   /** Gateway ids (local services) the user may reach; "*" = all. */
   gateways: string[];
+  /** A member who may look and not change anything; an administrator never is. */
+  readOnly?: boolean;
   disabled?: boolean;
   createdAt: string;
   passwordChangedAt: string;
@@ -111,6 +116,7 @@ export interface AccountInput {
   teams?: string[] | string;
   remoteApis?: string[] | string;
   gateways?: string[] | string;
+  readOnly?: boolean;
 }
 
 export interface AccountUpdate {
@@ -120,8 +126,13 @@ export interface AccountUpdate {
   teams?: string[] | string;
   remoteApis?: string[] | string;
   gateways?: string[] | string;
+  readOnly?: boolean;
   disabled?: boolean;
 }
+
+const assertReadOnlyMember = (role: Role, readOnly: boolean) => {
+  if (role === 'admin' && readOnly) throw new Error('an administrator cannot be read-only — make the account a member, or turn read-only off');
+};
 
 export class AccountStore {
   private cache: { mtimeMs: number; size: number; file: AccountsFile } | null = null;
@@ -151,6 +162,7 @@ export class AccountStore {
     const file = this.read();
     if (file.users.some((u) => u.username === username)) throw new Error(`user "${username}" exists`);
     const role: Role = input.role === 'admin' ? 'admin' : 'member';
+    assertReadOnlyMember(role, Boolean(input.readOnly));
     const now = new Date().toISOString();
     const record: AccountRecord = {
       username,
@@ -160,6 +172,7 @@ export class AccountStore {
       teams: cleanTeams(input.teams),
       remoteApis: input.remoteApis === undefined ? (role === 'admin' ? ['*'] : [...DEFAULT_MEMBER_REMOTE_APIS]) : cleanList(input.remoteApis, API_GROUP_NAMES),
       gateways: cleanList(input.gateways),
+      ...(input.readOnly ? { readOnly: true } : {}),
       createdAt: now,
       passwordChangedAt: now,
     };
@@ -179,11 +192,16 @@ export class AccountStore {
     if (!u) throw new Error(`no user "${name}"`);
     const demoting = (changes.role !== undefined && changes.role !== 'admin' && u.role === 'admin') || (changes.disabled === true && u.role === 'admin');
     if (demoting && file.users.filter((x) => x.role === 'admin' && !x.disabled).length <= 1) throw new Error('the last administrator cannot be demoted or disabled');
+    assertReadOnlyMember(
+      changes.role === undefined ? u.role : changes.role === 'admin' ? 'admin' : 'member',
+      changes.readOnly === undefined ? Boolean(u.readOnly) : Boolean(changes.readOnly),
+    );
     if (changes.name !== undefined) u.name = String(changes.name).trim() || u.username;
     if (changes.role !== undefined) u.role = changes.role === 'admin' ? 'admin' : 'member';
     if (changes.teams !== undefined) u.teams = cleanTeams(changes.teams);
     if (changes.remoteApis !== undefined) u.remoteApis = cleanList(changes.remoteApis, API_GROUP_NAMES);
     if (changes.gateways !== undefined) u.gateways = cleanList(changes.gateways);
+    if (changes.readOnly !== undefined) u.readOnly = Boolean(changes.readOnly) || undefined;
     if (changes.disabled !== undefined) u.disabled = Boolean(changes.disabled) || undefined;
     if (password) {
       u.password = password;
