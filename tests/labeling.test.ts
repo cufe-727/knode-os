@@ -7,6 +7,8 @@ import { AppContext, createContext } from '../src/context.js';
 import { readSidecarPart, readSourceSummary, readSourceSummaryFailure } from '../src/fs/sidecar.js';
 import { runTier1Pass } from '../src/graph/tier1.js';
 import { sync } from '../src/ingest/sync.js';
+import { findLiveScope } from '../src/lineage/scope.js';
+import type { Queryable } from '../src/store/migrations.js';
 import { classifyFailure, newBackendHealth, recordBackendOutcome } from '../src/labeling/failures.js';
 import { LocalLabelingWorkers, localSummarySpec, localWorkerSpecs } from '../src/labeling/local.js';
 import { LabelingScheduler, LabelingTask, WorkerIdentity } from '../src/labeling/scheduler.js';
@@ -220,6 +222,79 @@ describe('the labeling scheduler', () => {
     const [again] = await scheduler.lease(mac, 1);
     expect(again.messages.at(-1)!.content).toContain('第二版');
     expect(await scheduler.complete(again.id, mac, { ok: true, text: reply(again) })).toEqual({ accepted: true, documentWritten: true });
+  });
+
+  /** A scheduler on `ctx.store`, where a re-index can be set to land right before the next transaction starts or right after it commits. */
+  function racing() {
+    let next: { when: 'before' | 'after'; reindex: () => Promise<void> } | null = null;
+    const store = new Proxy(ctx.store, {
+      get(target, prop) {
+        if (prop === 'tx') {
+          return async <T>(fn: (q: Queryable) => Promise<T>): Promise<T> => {
+            const armed = next;
+            next = null;
+            if (armed?.when === 'before') await armed.reindex();
+            const out = await target.tx(fn);
+            if (armed?.when === 'after') await armed.reindex();
+            return out;
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const logs: string[] = [];
+    const s = new LabelingScheduler({ dataDir: ctx.dataDir, store, config: () => ctx.config, log: (m) => logs.push(m) }, { priorityRefreshMs: 0 });
+    const rewrite = (rel: string, content: string) => async () => {
+      write(ctx.dataDir, rel, content);
+      await sync(ctx, { only: [rel] });
+    };
+    return { scheduler: s, logs, arm: (when: 'before' | 'after', reindex: () => Promise<void>) => { next = { when, reindex }; }, rewrite };
+  }
+
+  it('checks again under the lock a re-index takes, so one landing after the first look leaves nothing half written; the new text goes back in line', async () => {
+    write(ctx.dataDir, 'raw/docs/h.md', '# 辛\n\n第一版。\n');
+    await sync(ctx, { only: ['raw/docs/h.md'] });
+    const race = racing();
+    try {
+      const [task] = await race.scheduler.lease(mac, 1);
+      expect(task.document.path).toBe('raw/docs/h.md');
+      // the write waits on the ledger lock while the re-index replaces the chunks its mentions name
+      race.arm('before', race.rewrite('raw/docs/h.md', '# 辛\n\n第二版，内容变了。\n'));
+      expect(await race.scheduler.complete(task.id, mac, { ok: true, text: reply(task) })).toEqual({ accepted: true, documentWritten: false });
+      expect(race.logs.filter((m) => m.includes('failed'))).toEqual([]);
+      expect((await race.scheduler.status()).totals.stale).toBe(1);
+      expect(await findLiveScope(ctx.store, 'tier1', 'raw/docs/h.md')).toBeNull();
+      expect(await queued(ctx)).toEqual(['raw/docs/h.md']);
+
+      const [again] = await race.scheduler.lease(mac, 1);
+      expect(again.messages.at(-1)!.content).toContain('第二版');
+      expect(await race.scheduler.complete(again.id, mac, { ok: true, text: reply(again) })).toEqual({ accepted: true, documentWritten: true });
+      expect(await queued(ctx)).toEqual([]);
+    } finally {
+      await race.scheduler.stop();
+    }
+  });
+
+  it('takes a written document off the queue in the same transaction, so a re-index landing right after it keeps its new text in line', async () => {
+    write(ctx.dataDir, 'raw/docs/i.md', '# 壬\n\n第一版。\n');
+    await sync(ctx, { only: ['raw/docs/i.md'] });
+    const race = racing();
+    try {
+      const [task] = await race.scheduler.lease(mac, 1);
+      expect(task.document.path).toBe('raw/docs/i.md');
+      race.arm('after', race.rewrite('raw/docs/i.md', '# 壬\n\n第二版，内容变了。\n'));
+      // the first version was current when it was written
+      expect(await race.scheduler.complete(task.id, mac, { ok: true, text: reply(task) })).toEqual({ accepted: true, documentWritten: true });
+      expect(await queued(ctx)).toEqual(['raw/docs/i.md']);
+
+      const [again] = await race.scheduler.lease(mac, 1);
+      expect(again.messages.at(-1)!.content).toContain('第二版');
+      expect(await race.scheduler.complete(again.id, mac, { ok: true, text: reply(again) })).toEqual({ accepted: true, documentWritten: true });
+      expect(await queued(ctx)).toEqual([]);
+    } finally {
+      await race.scheduler.stop();
+    }
   });
 
   it('shares the queue with the batch pass without either taking the other\'s document', async () => {

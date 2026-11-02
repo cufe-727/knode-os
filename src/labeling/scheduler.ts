@@ -407,6 +407,8 @@ export class LabelingScheduler {
         if (planned.kind === 'replayed') {
           this.totals.replayed++;
           this.noteWritten(row.path, planned.applied);
+        } else if (planned.kind === 'stale') {
+          this.totals.stale++;
         }
         releaseDocument(this.ctx.dataDir, row.document_id, this.owner);
         continue;
@@ -541,6 +543,11 @@ export class LabelingScheduler {
         }
         const fallback = [...plan.results].reverse().find((r) => r?.model)?.model ?? 'labeling';
         const done = await finishPlan(this.ctx.store, plan, fallback);
+        if (done.kind === 'stale') {
+          // the same, landing after the look above: finishPlan looks again under the ledger lock every re-index takes
+          this.totals.stale++;
+          return false;
+        }
         if (done.kind === 'failed') {
           this.totals.documentsFailed++;
           this.finished.failed++;

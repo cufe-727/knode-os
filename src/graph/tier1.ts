@@ -112,11 +112,19 @@ export async function refreshQueuePriorities(store: Store, config: KnodeConfig):
   );
 }
 
+/** Thrown inside the tier-1 transaction to roll it back: the document is no longer the text that was read. */
+class StaleDocument extends Error {}
+
 /**
  * Apply a tier-1 extraction as a child scope of the document's live scope.
  * Once it is in, the document's tier-0 concept placeholders that did not
  * resolve to a typed entity are retired (src/graph/concepts.ts): tier-1 has
  * now said what the document is about.
+ *
+ * `stale` means nothing was written: a re-index replaced the document (and
+ * the chunks `page` names) after the caller read it. The check runs inside
+ * the transaction, under the ledger lock every re-index takes too, so no
+ * re-index lands between it and the write.
  */
 export async function applyTier1Scope(
   store: Store,
@@ -134,29 +142,47 @@ export async function applyTier1Scope(
     force?: boolean;
     /** The sidecar result's `extractedAt`, kept on the scope so a replay can tell a newer result for the same content. */
     extractedAt?: string;
+    /** Take the document off the extraction queue in the same transaction as the write. */
+    dequeue?: boolean;
   },
-): Promise<{ entities: number; relations: number; claims: number; entityIds: string[]; claimIds: string[]; outcome: 'applied' | 'unchanged' | 'orphan' }> {
+): Promise<{ entities: number; relations: number; claims: number; entityIds: string[]; claimIds: string[]; outcome: 'applied' | 'unchanged' | 'orphan' | 'stale' }> {
+  const nothing = { entities: 0, relations: 0, claims: 0, entityIds: [] as string[], claimIds: [] as string[] };
   const parent = await findLiveScope(store, 'doc', doc.path);
-  if (!parent) return { entities: 0, relations: 0, claims: 0, entityIds: [], claimIds: [], outcome: 'orphan' };
-  let g = { entities: 0, relations: 0, claims: 0, entityIds: [] as string[], claimIds: [] as string[] };
-  const res = await applyScope(
-    store,
-    { kind: 'tier1', key: doc.path },
-    doc.sha256,
-    {
-      parentId: parent.id,
-      actor: opts.actor ?? 'tier1',
-      at: opts.at,
-      force: opts.force,
-      meta: { documentId: page.documentId, model: opts.model, ...(opts.extractedAt ? { extractedAt: opts.extractedAt } : {}) },
-    },
-    async (w) => {
-      g = await applyExtraction(w, page, extracted.entities, extracted.relations, extracted.claims ?? [], `tier1.llm:${opts.model}`, {
-        docDate: opts.docDate ?? null,
-        segments: opts.segments,
-      });
-    },
-  );
+  if (!parent) return { ...nothing, outcome: 'orphan' };
+  let g = nothing;
+  let res: Awaited<ReturnType<typeof applyScope>>;
+  try {
+    res = await applyScope(
+      store,
+      { kind: 'tier1', key: doc.path },
+      doc.sha256,
+      {
+        parentId: parent.id,
+        actor: opts.actor ?? 'tier1',
+        at: opts.at,
+        force: opts.force,
+        meta: { documentId: page.documentId, model: opts.model, ...(opts.extractedAt ? { extractedAt: opts.extractedAt } : {}) },
+      },
+      async (w) => {
+        // a re-index that committed since the caller looked replaced the
+        // document's scope and its chunks: the mentions below would name
+        // chunks that are gone, under a parent that is disposed
+        const [current] = await w.q.query<{ sha256: string }>(`SELECT sha256 FROM documents WHERE id = $1`, [page.documentId]);
+        const live = await findLiveScope(w.q, 'doc', doc.path);
+        if (current?.sha256 !== doc.sha256 || live?.id !== parent.id) throw new StaleDocument();
+        g = await applyExtraction(w, page, extracted.entities, extracted.relations, extracted.claims ?? [], `tier1.llm:${opts.model}`, {
+          docDate: opts.docDate ?? null,
+          segments: opts.segments,
+        });
+        // here rather than after COMMIT: a re-index waiting on the lock queues
+        // its new text once this commits, and a later dequeue would take that away
+        if (opts.dequeue) await w.q.query(`DELETE FROM extraction_queue WHERE document_id = $1`, [page.documentId]);
+      },
+    );
+  } catch (err) {
+    if (err instanceof StaleDocument) return { ...nothing, outcome: 'stale' };
+    throw err;
+  }
   if (res.outcome === 'applied') {
     await retireTier0Placeholders(store, parent.id, { at: res.scope.applied_at });
     // the claims a model read out of a quarantined source are quarantined too
@@ -294,6 +320,8 @@ export type PlannedDocument =
   | { kind: 'dropped' }
   /** The sidecar held a whole extraction of this content, applied for free: dequeued. */
   | { kind: 'replayed'; applied: AppliedTier1 }
+  /** A re-index replaced it while it was being opened: still queued, for its new text. */
+  | { kind: 'stale' }
   | { kind: 'plan'; plan: DocPlan };
 
 /**
@@ -330,8 +358,10 @@ export async function planQueuedDocument(
       force: true,
       extractedAt: replay.extractedAt,
       segments: ranges ? { text, ranges } : undefined,
+      dequeue: true,
     });
-    await dequeueDocument(store, row.document_id);
+    if (applied.outcome === 'stale') return { kind: 'stale' };
+    if (applied.outcome !== 'applied') await dequeueDocument(store, row.document_id);
     opts.onProgress?.(`tier1 replay ${row.path} (${applied.entities} entities, ${applied.claims} claims)`);
     return { kind: 'replayed', applied };
   }
@@ -455,9 +485,11 @@ export function persistPlan(dataDir: string, plan: DocPlan, model: string): void
 export type FinishedDocument =
   /** Every segment failed: given up like a failed single call (a content change retries). */
   | { kind: 'failed' }
+  /** A re-index replaced the document while it was being read: nothing written, still queued for its new text. */
+  | { kind: 'stale' }
   | { kind: 'written'; applied: AppliedTier1; segments: number; failedSegments: number[]; model: string };
 
-/** Write a settled document: merge its segments, persist the result, apply it, dequeue. */
+/** Write a settled document: merge its segments, persist the result, apply and dequeue it — unless a re-index replaced it meanwhile. */
 export async function finishPlan(store: Store, plan: DocPlan, fallbackModel: string): Promise<FinishedDocument> {
   const { row } = plan;
   const ok = plan.results.filter((r): r is SidecarSegment => r?.status === 'done');
@@ -502,8 +534,11 @@ export async function finishPlan(store: Store, plan: DocPlan, fallbackModel: str
     force: true,
     extractedAt: now,
     segments: single ? undefined : { text: plan.text, ranges: plan.segments.map((s) => ({ start: s.start, end: s.end })) },
+    dequeue: true,
   });
-  await dequeueDocument(store, row.document_id);
+  // the sidecar keeps the segments by their text: reopened, it re-reads only what changed
+  if (applied.outcome === 'stale') return { kind: 'stale' };
+  if (applied.outcome !== 'applied') await dequeueDocument(store, row.document_id);
   return { kind: 'written', applied, segments: plan.segments.length, failedSegments, model };
 }
 
@@ -646,6 +681,10 @@ async function runTier1PassUnlocked(
         const finished = await finishPlan(store, plan, entityLlm.label);
         if (finished.kind === 'failed') {
           stats.failed++;
+          continue;
+        }
+        if (finished.kind === 'stale') {
+          progress(`tier1 ${plan.row.path} changed while it was read; its new text stays queued`);
           continue;
         }
         done(plan.row.path, finished.applied);
