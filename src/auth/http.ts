@@ -5,7 +5,7 @@ import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import { contentSecurityPolicy, isEmbedPath } from '../server/csp.js';
 import { ClientInfo, clientInfo, PUBLIC_PREFIX } from '../server/public-guard.js';
 import { accountAllows, accountMayUseGateway, AccountUpdate, MIN_PASSWORD_LENGTH, normalizeUsername, PublicAccount, Role } from './accounts.js';
-import { API_GROUP_NAMES, API_GROUPS, apiGroupOf, ApiGroup } from './apis.js';
+import { API_GROUP_NAMES, API_GROUPS, apiGroupOf, ApiGroup, onlyReads } from './apis.js';
 import { forwardToGateway } from './gateways.js';
 import { AuthError, AuthService } from './service.js';
 import { looksLikeSessionToken, PublicSession, SessionKind } from './sessions.js';
@@ -27,7 +27,9 @@ import { resolveWorkspaceScope, workspaceDataDir } from '../server/workspaces.js
  * `server.tls`), unless `server.auth.allowInsecureRemote` says the network
  * encrypts by itself, and an account may use only the API groups in its
  * `remoteApis` (src/auth/apis.ts). A browser's state-changing request must
- * carry `X-Knode-CSRF: 1`, which a page on another site cannot send.
+ * carry `X-Knode-CSRF: 1`, which a page on another site cannot send. A
+ * read-only account may send only what reads (`onlyReads`), here and through
+ * /gw, besides managing its own sign-in under /api/auth.
  */
 
 export type AuthEnv = {
@@ -121,6 +123,10 @@ export function authMiddleware(auth: AuthService, opts: { mcpPath?: string } = {
     const group = apiGroupOf(c.req.method, p);
     if (group && !accountAllows(identity.account, group, !client.local)) {
       return c.json({ error: forbidden(group, identity.account, client), reason: 'forbidden', group }, 403);
+    }
+    // its own password and sessions are a read-only account's to change
+    if (identity.account.readOnly && !isUnder(p, '/api/auth') && !onlyReads(c.req.method, p, new URL(c.req.url).searchParams)) {
+      return c.json({ error: `your account is read-only: it may look, not change anything — an administrator can change that (knode-os user set ${identity.account.username} --read-write)`, reason: 'read-only' }, 403);
     }
     c.set('account', identity.account);
     c.set('session', identity.session);
@@ -328,12 +334,12 @@ export function mountAuthRoutes(app: Hono<any>, auth: AuthService, deps: AuthRou
   app.post('/api/auth/users', async (c) => {
     try {
       const me = admin(c);
-      const input = await body<{ username?: string; name?: string; password?: string; role?: Role; teams?: string[]; remoteApis?: string[]; gateways?: string[] }>(c);
+      const input = await body<{ username?: string; name?: string; password?: string; role?: Role; teams?: string[]; remoteApis?: string[]; gateways?: string[]; readOnly?: boolean }>(c);
       const account = await auth.hashed(() => auth.accounts.create({
         username: input.username ?? '', name: input.name, password: input.password ?? '', role: input.role,
-        teams: input.teams, remoteApis: input.remoteApis, gateways: input.gateways,
+        teams: input.teams, remoteApis: input.remoteApis, gateways: input.gateways, readOnly: input.readOnly === true,
       }));
-      log(`auth: ${me.username} created ${account.role} "${account.username}"`);
+      log(`auth: ${me.username} created ${account.readOnly ? 'read-only ' : ''}${account.role} "${account.username}"`);
       return c.json(account, 201);
     } catch (e) {
       return fail(c, e);
@@ -350,7 +356,7 @@ export function mountAuthRoutes(app: Hono<any>, auth: AuthService, deps: AuthRou
         throw new AuthError(400, 'you cannot disable or demote yourself — ask another administrator');
       }
       const changes: AccountUpdate = {};
-      for (const key of ['name', 'password', 'role', 'teams', 'remoteApis', 'gateways', 'disabled'] as const) {
+      for (const key of ['name', 'password', 'role', 'teams', 'remoteApis', 'gateways', 'readOnly', 'disabled'] as const) {
         if (input[key] !== undefined) (changes as Record<string, unknown>)[key] = input[key];
       }
       const { account, credentialsChanged } = await auth.hashed(() => auth.accounts.update(username, changes));

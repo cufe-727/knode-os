@@ -138,6 +138,31 @@ const RULES: Rule[] = [
   { prefix: '/api/datasources', group: 'datasources' },
 ];
 
+/**
+ * The POSTs that only read — a question or a text in the body, nothing kept —
+ * and so are open to a read-only account. Every other POST, PUT, PATCH and
+ * DELETE changes something, or starts an agent or a job that may.
+ */
+const READS_BY_POST: RegExp[] = [
+  /^\/api\/entities\/mentions$/,
+  /^\/api\/plan$/,
+  /^\/api\/ask$/,
+  /^\/api\/datasources\/[^/]+\/query$/,
+];
+
+/** GETs that change something when asked to. */
+const WRITES_BY_GET: { path: string; param: string }[] = [
+  // files fresh recommendations as suggestions
+  { path: '/api/research/recommendations', param: 'refresh' },
+];
+
+/** Whether a request only reads: all a read-only account may send (src/auth/accounts.ts). */
+export function onlyReads(method: string, path: string, query: URLSearchParams = new URLSearchParams()): boolean {
+  const m = method.toUpperCase();
+  if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return !WRITES_BY_GET.some((w) => w.path === path && query.has(w.param));
+  return m === 'POST' && READS_BY_POST.some((re) => re.test(path));
+}
+
 const matches = (path: string, prefix: string) =>
   prefix.endsWith('/') ? path.startsWith(prefix) : path === prefix || path.startsWith(`${prefix}/`) || path.startsWith(`${prefix}?`);
 

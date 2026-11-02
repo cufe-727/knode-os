@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AccountStore, accountAllows } from '../src/auth/accounts.js';
 import { existingTeams } from '../src/auth/http.js';
-import { apiGroupOf } from '../src/auth/apis.js';
+import { apiGroupOf, onlyReads } from '../src/auth/apis.js';
 import { normalizeGatewayTarget } from '../src/auth/gateways.js';
 import { AuthService } from '../src/auth/service.js';
 import { SessionStore } from '../src/auth/sessions.js';
@@ -85,6 +85,17 @@ describe('accounts and sessions on disk', () => {
     fs.writeFileSync(auth.sessions.file, JSON.stringify(raw));
     expect(auth.identify(expired.token)).toBeNull();
   });
+
+  it('keeps read-only to members', async () => {
+    const accounts = new AccountStore(root);
+    await expect(accounts.create({ username: 'boss', password: PASSWORD, role: 'admin', readOnly: true })).rejects.toThrow(/cannot be read-only/);
+    expect(accounts.get('boss')).toBeNull();
+    expect(await accounts.create({ username: 'viewer', password: PASSWORD, readOnly: true })).toMatchObject({ role: 'member', readOnly: true });
+    await expect(accounts.update('viewer', { role: 'admin' })).rejects.toThrow(/cannot be read-only/);
+    expect(accounts.get('viewer')).toMatchObject({ role: 'member', readOnly: true });
+    expect((await accounts.update('viewer', { readOnly: false })).account.readOnly).toBeUndefined();
+    expect((await accounts.update('viewer', { readOnly: true })).account.readOnly).toBe(true);
+  });
 });
 
 describe('API groups', () => {
@@ -125,6 +136,22 @@ describe('API groups', () => {
     expect(accountAllows(member, 'datasources', true)).toBe(false);
     expect(accountAllows(member, 'files', true)).toBe(true);
     expect(accountAllows({ ...member, role: 'admin', remoteApis: ['*'] }, 'settings', true)).toBe(true);
+  });
+
+  it('tells a request that only reads from one that changes something', () => {
+    expect(onlyReads('GET', '/api/file')).toBe(true);
+    expect(onlyReads('HEAD', '/gw/svc/x')).toBe(true);
+    expect(onlyReads('POST', '/api/entities/mentions')).toBe(true);
+    expect(onlyReads('POST', '/api/datasources/sales/query')).toBe(true);
+    expect(onlyReads('POST', '/api/datasources/sync')).toBe(false);
+    expect(onlyReads('PUT', '/api/file')).toBe(false);
+    expect(onlyReads('DELETE', '/api/file')).toBe(false);
+    // a resolve or a pack is recorded as a receipt
+    expect(onlyReads('POST', '/api/resolve')).toBe(false);
+    expect(onlyReads('POST', '/api/pack')).toBe(false);
+    expect(onlyReads('POST', '/gw/svc/items')).toBe(false);
+    expect(onlyReads('GET', '/api/research/recommendations')).toBe(true);
+    expect(onlyReads('GET', '/api/research/recommendations', new URLSearchParams('refresh=1'))).toBe(false);
   });
 });
 
@@ -397,6 +424,46 @@ describe('sign-in in front of serve', () => {
     expect((await req('/gw/svc/hello', { token: bob, remote: true })).status).toBe(403);
     expect((await req('/gw/nope/x', { token: admin })).status).toBe(404);
     expect((await req('/gw/svc/hello')).status).toBe(401);
+  });
+
+  it('lets a read-only member look and change nothing, until an administrator says otherwise', async () => {
+    const admin = await login('admin');
+    const created = await req('/api/auth/users', { method: 'POST', token: admin, body: JSON.stringify({ username: 'carol', password: PASSWORD, readOnly: true, gateways: ['svc'] }) });
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ role: 'member', readOnly: true });
+    expect((await req('/api/auth/users', { method: 'POST', token: admin, body: JSON.stringify({ username: 'dave', password: PASSWORD, role: 'admin', readOnly: true }) })).status).toBe(400);
+    let carol = await login('carol');
+    expect((await (await req('/api/auth/me', { token: carol })).json()).account).toMatchObject({ username: 'carol', readOnly: true });
+
+    expect((await req('/api/workspaces', { token: carol })).status).toBe(200);
+    expect((await req('/api/stats', { token: carol, headers: ws() })).status).toBe(200);
+    expect((await req('/api/entities/mentions', { method: 'POST', token: carol, headers: ws(), body: JSON.stringify({ text: 'nothing known here' }) })).status).toBe(200);
+    expect((await req('/gw/svc/hello', { token: carol })).status).toBe(200);
+
+    const put = await req('/api/file', { method: 'PUT', token: carol, headers: ws(), body: JSON.stringify({ path: 'wiki/note.md', content: '# note' }) });
+    expect(put.status).toBe(403);
+    expect(await put.json()).toMatchObject({ reason: 'read-only' });
+    expect(fs.existsSync(path.join(root, 'users', 'carol', 'workspaces', 'default', 'wiki', 'note.md'))).toBe(false);
+    const writes = [
+      ['POST', '/api/workspaces'], ['POST', '/api/mkdir'], ['POST', '/api/upload'], ['POST', '/api/ingest'], ['POST', '/api/resolve'],
+      ['POST', '/api/chat/conversations'], ['POST', '/api/research/jobs'], ['DELETE', '/api/file?path=wiki/x.md'],
+      ['GET', '/api/research/recommendations?refresh=1'], ['POST', '/gw/svc/items'],
+    ] as const;
+    for (const [method, p] of writes) {
+      const res = await req(p, { method, token: carol, headers: ws(), body: method === 'POST' ? '{}' : undefined });
+      expect(res.status, `${method} ${p}`).toBe(403);
+      expect((await res.json()).reason, `${method} ${p}`).toBe('read-only');
+    }
+
+    // their own sign-in is still theirs to manage
+    const others = await req('/api/auth/signout-others', { method: 'POST', token: carol, body: '{}' });
+    expect(others.status).toBe(200);
+    carol = (await others.json()).token;
+
+    expect((await req('/api/auth/users/carol', { method: 'PATCH', token: admin, body: JSON.stringify({ role: 'admin' }) })).status).toBe(400);
+    expect((await req('/api/auth/users/carol', { method: 'PATCH', token: admin, body: JSON.stringify({ readOnly: false }) })).status).toBe(200);
+    // the same session, at once
+    expect((await req('/api/workspaces', { method: 'POST', token: carol, body: JSON.stringify({ name: 'Notes' }) })).status).toBe(201);
   });
 
   it('puts every /api route in a group on purpose: nothing lands in settings by omission', () => {

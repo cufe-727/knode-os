@@ -15,6 +15,16 @@ The code is in `src/auth/`: accounts, sessions, API groups, gateways, the HTTP s
 | --- | --- |
 | **admin** | every Team, every API group, settings, users and gateways |
 | **member** | their own personal workspaces, the Teams listed for them, every API group except `settings`. From other machines, only the groups in their `remoteApis`. |
+| **member, read-only** | what a member may see, and nothing that changes anything |
+
+**Read-only.** A read-only member may open everything their Teams, groups and gateways allow, and read it: `GET`
+and `HEAD` requests, plus the few `POST`s that carry only a question (`/api/entities/mentions`, `/api/plan`,
+`/api/ask`, `/api/datasources/<id>/query`; `onlyReads` in `src/auth/apis.ts`). Every other request is answered `403`
+with `reason: "read-only"`: editing, uploading, moving or deleting files, creating a workspace, wiki and review
+changes, ingest and sync, Ask conversations and Research jobs (their agents can write), receipts from `/api/resolve`
+and `/api/pack`, `?refresh` on research recommendations, and every write through a gateway. They may still change
+their own password and end their own sessions. The flag takes effect on the next request, for sessions already open
+too. An administrator is never read-only: making one a member comes first.
 
 Each user's personal workspaces are under `users/<name>/workspaces/`. **Name the first administrator after the folder
 that holds your existing workspaces** (the old mock sign-in used `admin`), so they stay yours.
@@ -35,6 +45,7 @@ knode-os user list
 knode-os user add alice --name "Alice" --team research-lab           # a member
 knode-os user set alice --remote-apis files,search,ask               # what she may use from other machines
 knode-os user set alice --gateway homebook                           # a local service she may reach
+knode-os user set alice --read-only | --read-write                   # look, not change
 knode-os user set alice --disable | --enable
 knode-os user passwd alice                                           # her sessions end
 knode-os user signout alice                                          # every session ends
