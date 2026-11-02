@@ -2899,6 +2899,8 @@ struct TasksSnapshot: Decodable {
         var finishedAt: String?
         var ok: Bool?
         var detail: String?
+        /// While it runs, where it is: "2 of 5 · fetching Meeting notes".
+        var progress: String?
     }
 
     struct Activity: Decodable {
@@ -2927,6 +2929,8 @@ struct TasksSnapshot: Decodable {
         var everyMinutes: Int?
         /// The next start, when the clock says.
         var next: String?
+        /// When it last ran, for a task that keeps that across restarts (the Feishu check).
+        var last: String?
         var enabled: Bool
         var running: Bool
 
@@ -2936,11 +2940,12 @@ struct TasksSnapshot: Decodable {
             at = try c.decodeIfPresent(String.self, forKey: .at)
             everyMinutes = try c.decodeIfPresent(Int.self, forKey: .everyMinutes)
             next = try c.decodeIfPresent(String.self, forKey: .next)
+            last = try c.decodeIfPresent(String.self, forKey: .last)
             enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
             running = try c.decodeIfPresent(Bool.self, forKey: .running) ?? false
         }
 
-        private enum CodingKeys: String, CodingKey { case id, at, everyMinutes, next, enabled, running }
+        private enum CodingKeys: String, CodingKey { case id, at, everyMinutes, next, last, enabled, running }
     }
 
     /// A linked folder and how its mirror is doing.
@@ -3084,6 +3089,57 @@ struct FolderImportResult: Decodable {
     }
 
     private enum CodingKeys: String, CodingKey { case dest, copied, sync, indexing }
+}
+
+/// `POST /api/feishu/sync`: a check of every link starts in the background
+/// (`started`, or a check was under way already); one of a single mirror
+/// answers with what it found.
+struct FeishuCheck: Decodable {
+    struct Pages: Decodable {
+        var total: Int?
+        var documents: Int?
+        var fetched: Int?
+        var moved: Int?
+        var removed: Int?
+    }
+
+    struct Result: Decodable {
+        var dest: String
+        var title: String?
+        var fetched: Bool
+        var written: Int
+        var removed: Int
+        var modifiedAt: String?
+        var pages: Pages?
+        var error: String?
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            dest = try c.decodeIfPresent(String.self, forKey: .dest) ?? ""
+            title = try c.decodeIfPresent(String.self, forKey: .title)
+            fetched = try c.decodeIfPresent(Bool.self, forKey: .fetched) ?? false
+            written = try c.decodeIfPresent(Int.self, forKey: .written) ?? 0
+            removed = try c.decodeIfPresent(Int.self, forKey: .removed) ?? 0
+            modifiedAt = try c.decodeIfPresent(String.self, forKey: .modifiedAt)
+            pages = try? c.decodeIfPresent(Pages.self, forKey: .pages)
+            error = try c.decodeIfPresent(String.self, forKey: .error)
+        }
+
+        private enum CodingKeys: String, CodingKey { case dest, title, fetched, written, removed, modifiedAt, pages, error }
+    }
+
+    var started: Bool
+    var links: Int?
+    var results: [Result]
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        started = try c.decodeIfPresent(Bool.self, forKey: .started) ?? false
+        links = try c.decodeIfPresent(Int.self, forKey: .links)
+        results = (try? c.decodeIfPresent([Result].self, forKey: .results)) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey { case started, links, results }
 }
 
 /// Times the service sends (`toISOString`, with or without milliseconds).

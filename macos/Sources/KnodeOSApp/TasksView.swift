@@ -106,7 +106,7 @@ enum TaskWords {
         case "tier2": (L("Tier-2 pass"), L("merges, claim reviews, views and the wiki check"))
         case "traces": (L("Agent traces"), L("collects new Claude Code and Codex sessions"))
         case "datasources": (L("Datasources"), L("refreshes live schemas into the wiki"))
-        case "feishu": (L("Feishu documents"), L("asks Feishu which linked documents were edited, and fetches those"))
+        case "feishu": (L("Feishu documents"), L("asks Feishu which linked documents and wiki pages were edited, and fetches those"))
         default: (id, "")
         }
     }
@@ -141,6 +141,7 @@ struct TasksView: View {
     @State private var confirmingStart = false
     @State private var confirmingStop = false
     @State private var switching = false
+    @State private var checkingFeishu = false
     /// Nil until someone opens or closes it: open by default while nothing runs.
     @State private var recentOpen: Bool?
 
@@ -610,6 +611,9 @@ struct TasksView: View {
                         Text(L("running for %@", ServiceTime.span(Date().timeIntervalSince(ServiceTime.date(item.startedAt) ?? Date()))))
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        if let progress = item.progress, !progress.isEmpty {
+                            Text(progress).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        }
                     }
                     Spacer(minLength: 0)
                 }
@@ -693,6 +697,7 @@ struct TasksView: View {
         } else if let at = item.at {
             when = L("daily at %@", at)
             if let next = ServiceTime.until(item.next) { when += " · " + L("next %@", next) }
+            if item.last != nil { when += " · " + L("last %@", ServiceTime.ago(item.last)) }
         } else if let every = item.everyMinutes {
             when = L("every %@ min", String(every))
         } else {
@@ -719,8 +724,31 @@ struct TasksView: View {
                 Text(when).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
+            // the Feishu check also runs when asked
+            if item.id == "feishu", item.enabled, model.mayUseFiles {
+                Button(L("Check now")) { Task { await checkFeishu() } }
+                    .controlSize(.small)
+                    .disabled(item.running || checkingFeishu)
+                    .help(L("Ask Feishu now which linked documents were edited, and fetch those"))
+            }
         }
         .opacity(item.enabled ? 1 : 0.5)
+    }
+
+    private func checkFeishu() async {
+        checkingFeishu = true
+        defer { checkingFeishu = false }
+        do {
+            let answer = try await model.client().checkFeishu()
+            model.showToast(answer.started
+                ? L("Asking Feishu which linked documents were edited — it shows under Background")
+                : L("A Feishu check is under way already"))
+        } catch let error as APIError where error.sessionEnded {
+            model.sessionEnded()
+        } catch {
+            model.showError(error, prefix: L("Feishu check failed"))
+        }
+        await load()
     }
 
     private func folderRow(_ folder: TasksSnapshot.Folder) -> some View {

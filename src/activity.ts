@@ -23,6 +23,8 @@ export interface ActivityItem {
   ok?: boolean;
   /** One line on how it went: counts on success, the message on failure. */
   detail?: string;
+  /** While it runs, where it is: "page 3 of 12: Meeting notes". */
+  progress?: string;
 }
 
 /** Finished items kept for the Tasks view. */
@@ -43,16 +45,23 @@ export class ActivityLog {
       if (ended) return;
       ended = true;
       this.active.delete(id);
-      this.finished.unshift({ ...item, finishedAt: new Date().toISOString(), ok: end.ok ?? true, ...(end.detail ? { detail: end.detail } : {}) });
+      const { progress: _progress, ...done } = item;
+      this.finished.unshift({ ...done, finishedAt: new Date().toISOString(), ok: end.ok ?? true, ...(end.detail ? { detail: end.detail } : {}) });
       this.finished.length = Math.min(this.finished.length, RECENT);
     };
   }
 
-  /** Run `fn` as an activity: ended when it settles, with `describe`'s line on success and the error's on failure. */
-  async run<T>(kind: ActivityKind, label: string, fn: () => Promise<T>, describe?: (result: T) => string | null | undefined): Promise<T> {
+  /**
+   * Run `fn` as an activity: ended when it settles, with `describe`'s line on
+   * success and the error's on failure. `fn` may say where it is as it goes.
+   */
+  async run<T>(kind: ActivityKind, label: string, fn: (progress: (text: string) => void) => Promise<T>, describe?: (result: T) => string | null | undefined): Promise<T> {
     const end = this.begin(kind, label);
+    const item = [...this.active.values()].at(-1)!;
     try {
-      const result = await fn();
+      const result = await fn((text) => {
+        item.progress = text;
+      });
       end({ ok: true, detail: describe?.(result) ?? undefined });
       return result;
     } catch (err) {
@@ -69,7 +78,7 @@ export class ActivityLog {
 
   snapshot(): { running: ActivityItem[]; recent: ActivityItem[] } {
     return {
-      running: [...this.active.values()].sort((a, b) => a.startedAt.localeCompare(b.startedAt)),
+      running: [...this.active.values()].map((item) => ({ ...item })).sort((a, b) => a.startedAt.localeCompare(b.startedAt)),
       recent: this.finished.map((item) => ({ ...item })),
     };
   }

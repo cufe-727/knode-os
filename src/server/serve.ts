@@ -636,7 +636,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   const folders = new LinkedFolders(ctx, { log, track, policy: { protectedRoots: opts.rootDataDir ? [opts.rootDataDir] : [] } });
   folders.start();
 
-  // linked Feishu documents: asked every few minutes which changed, those re-mirrored (src/ingest/feishu/docs.ts)
+  // linked Feishu documents and wiki trees: asked once a day which changed, those re-mirrored (src/ingest/feishu/docs.ts)
   const feishu = new FeishuDocs(ctx, { log, track });
   feishu.start();
 

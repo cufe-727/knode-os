@@ -1436,7 +1436,7 @@ const SCHEDULE_WORDS = {
   tier2: ['Tier-2 pass', 'merges, claim reviews, views and the wiki check'],
   traces: ['Agent traces', 'collects new Claude Code and Codex sessions'],
   datasources: ['Datasources', 'refreshes live schemas into the wiki'],
-  feishu: ['Feishu documents', 'asks Feishu which linked documents were edited, and fetches those'],
+  feishu: ['Feishu documents', 'asks Feishu which linked documents and wiki pages were edited, and fetches those'],
 };
 const ACTIVITY_ICONS = { sync: '⟳', ingest: '⛁', upload: '⤒', folder: '⇄', feishu: '⇅', traces: '⌁', datasources: '◫', dream: '☾', tier2: '⚙' };
 
@@ -1661,7 +1661,7 @@ function paintTasksActivity(t) {
     el.innerHTML = '<p class="hint">Nothing has run in the background since the service started.</p>';
     return;
   }
-  el.innerHTML = `${running.map((a) => `<div class="activity-row running"><span class="activity-icon spin">${ACTIVITY_ICONS[a.kind] ?? '•'}</span><div><b>${esc(a.label)}</b><div class="hint">running for ${spanText((Date.now() - Date.parse(a.startedAt)) / 1000)}</div></div></div>`).join('')}
+  el.innerHTML = `${running.map((a) => `<div class="activity-row running"><span class="activity-icon spin">${ACTIVITY_ICONS[a.kind] ?? '•'}</span><div><b>${esc(a.label)}</b><div class="hint">running for ${spanText((Date.now() - Date.parse(a.startedAt)) / 1000)}${a.progress ? ` · ${esc(a.progress)}` : ''}</div></div></div>`).join('')}
     ${recent.length ? `<details class="activity-recent"${running.length ? '' : ' open'}><summary class="hint">Recent · ${recent.length}</summary>
       ${recent.map((a) => `<div class="activity-row${a.ok ? '' : ' failed'}"><span class="activity-icon">${a.ok ? '✓' : '✕'}</span><div><span>${esc(a.label)}</span><div class="hint">${a.detail ? `${esc(a.detail)} · ` : ''}${agoText(a.finishedAt)} · took ${spanText((Date.parse(a.finishedAt) - Date.parse(a.startedAt)) / 1000)}</div></div></div>`).join('')}
     </details>` : ''}`;
@@ -1670,9 +1670,14 @@ function paintTasksActivity(t) {
 function paintTasksSchedule(t) {
   const rows = t.scheduled.map((x) => {
     const [title, about] = SCHEDULE_WORDS[x.id] ?? [x.id, ''];
-    const when = !x.enabled ? 'off' : x.at ? `daily at ${x.at}${x.next ? ` · ${untilText(x.next)}` : ''}` : x.everyMinutes ? `every ${x.everyMinutes} min` : '';
+    let when = !x.enabled ? 'off' : x.at ? `daily at ${x.at}${x.next ? ` · ${untilText(x.next)}` : ''}` : x.everyMinutes ? `every ${x.everyMinutes} min` : '';
+    if (x.last) when += ` · last ${agoText(x.last)}`;
+    // the Feishu check also runs when asked: whoever may sync the files may ask
+    const checkNow = x.id === 'feishu' && x.enabled && mayUse('files')
+      ? `<button type="button" class="row-action" data-feishu-check ${x.running ? 'disabled' : ''} title="Ask Feishu now which linked documents were edited, and fetch those">Check now</button>`
+      : '';
     return `<div class="schedule-row${x.enabled ? '' : ' off'}"><span class="activity-icon${x.running ? ' spin' : ''}">${x.running ? '⟳' : '◷'}</span>
-      <div><b>${esc(title)}</b> <span class="hint">${esc(about)}</span><div class="hint">${x.running ? 'running now · ' : ''}${esc(when)}</div></div></div>`;
+      <div><b>${esc(title)}</b> <span class="hint">${esc(about)}</span><div class="hint">${x.running ? 'running now · ' : ''}${esc(when)}</div></div>${checkNow}</div>`;
   });
   const folders = t.folders.map((f) => `<div class="schedule-row"><span class="status-dot${f.watching ? ' live' : ''}" title="${f.watching ? 'watching its source' : 'not watching'}"></span>
       <div><b class="mono">${esc(f.dest)}</b> <span class="hint">← ${esc(homeShort(f.source))}</span>
@@ -1680,6 +1685,19 @@ function paintTasksSchedule(t) {
       ${f.lastError ? `<div class="hint bad">${esc(f.lastError)}</div>` : ''}</div></div>`);
   const dream = t.dream.pendingSuggestions ? `<p class="hint">Dream has <a href="#" data-goto="dream">${t.dream.pendingSuggestions} suggestion${t.dream.pendingSuggestions === 1 ? '' : 's'}</a> waiting for review.</p>` : '';
   $('#tasks-schedule').innerHTML = `${rows.join('')}${folders.length ? `<p class="tasks-sub">Linked folders</p>${folders.join('')}` : ''}${dream}`;
+  $('#tasks-schedule').querySelector('[data-feishu-check]')?.addEventListener('click', (ev) => checkFeishuNow(ev.currentTarget));
+}
+
+/** Tasks → Feishu documents → Check now: every linked document and tree, in the background. */
+async function checkFeishuNow(button) {
+  if (button) button.disabled = true;
+  try {
+    const res = await api('/api/feishu/sync', { method: 'POST', body: JSON.stringify({}) });
+    toast(res.started ? 'asking Feishu which linked documents were edited — it shows under Tasks → Background' : res.links === 0 ? 'no Feishu documents are linked' : 'a check is under way already', 5000);
+  } catch (e) {
+    toast(`Feishu check failed: ${e.message}`, 6000);
+  }
+  loadTasks();
 }
 
 function paintTasksErrors(t) {
@@ -3213,8 +3231,8 @@ $('#btn-import').addEventListener('click', (ev) => {
     { label: folders ? 'Folder from this Mac (copy once)…' : 'Folder from this Mac — administrators only', disabled: !folders, run: () => importLocalFolder('copy', dir) },
     { label: folders ? 'Link a folder from this Mac (keep in sync)…' : 'Link a folder — administrators only', disabled: !folders, run: () => importLocalFolder('link', dir) },
     '-',
-    { label: folders ? 'Feishu document (import once)…' : 'Feishu document — administrators only', disabled: !folders, run: () => importFeishuDoc('copy') },
-    { label: folders ? 'Link a Feishu document (keep in sync)…' : 'Link a Feishu document — administrators only', disabled: !folders, run: () => importFeishuDoc('link') },
+    { label: folders ? 'Feishu documents or a wiki (import once)…' : 'Feishu documents — administrators only', disabled: !folders, run: () => importFeishuDoc('copy') },
+    { label: folders ? 'Link Feishu documents or a wiki (keep in sync)…' : 'Link Feishu documents — administrators only', disabled: !folders, run: () => importFeishuDoc('link') },
     '-',
     { label: 'Agent traces — Claude Code and Codex sessions', disabled: !mayUse('traces'), run: () => collectTraces() },
   ]);
@@ -3386,59 +3404,217 @@ async function ensureFeishuSignedIn() {
 }
 
 /**
- * Bring a Feishu document in by its link: copied once (`copy`) or mirrored
- * and kept in sync (`link`). The service looks it up first — which also
- * proves the signed-in account may read it — and says what it would bring.
+ * Bring Feishu documents in by their links: copied once (`copy`) or mirrored
+ * and kept in sync (`link`). Several links go in one batch; a wiki page can
+ * bring the pages under it, and a wiki space all of its pages, as folders
+ * that keep the wiki's structure. The service looks each link up first —
+ * which also proves the signed-in account may read it — and says what it
+ * would bring; a batch or a tree then imports in the background, followed
+ * here until it ends.
  */
 async function importFeishuDoc(mode) {
-  const input = prompt(
-    mode === 'link'
-      ? 'Link of the Feishu document to link (…/docx/… or …/wiki/…).\nIt is mirrored into raw/docs with its pictures, and kept in sync: while knode-os runs it asks Feishu every few minutes whether the document was edited.'
-      : 'Link of the Feishu document to import (…/docx/… or …/wiki/…).\nIt is copied once into raw/docs with its pictures and attachments.',
-    lastFeishuUrl,
-  );
-  if (input === null) return;
-  const url = input.trim();
-  if (!url) return;
-  lastFeishuUrl = url;
   if (!(await ensureFeishuSignedIn())) return;
-  toast('looking the document up in Feishu…', 60000);
-  let plan;
-  try {
-    plan = await api('/api/feishu/preview', { method: 'POST', body: JSON.stringify({ url }) });
-  } catch (e) {
-    toast(`${mode === 'link' ? 'link' : 'import'} failed: ${e.message}`, 8000);
+  feishuDialog.mode = mode;
+  feishuDialog.plan = null;
+  feishuDialog.job = null;
+  $('#feishu-dialog-title').textContent = mode === 'link' ? 'Link Feishu documents' : 'Import Feishu documents';
+  $('#feishu-dialog-hint').textContent = mode === 'link'
+    ? 'Each is mirrored into raw/docs with its pictures and kept in sync: once a day knode-os asks Feishu which were edited and fetches those (Tasks → Check now asks at once). The copies here are read-only; edit them in Feishu.'
+    : 'Each is copied once into raw/docs with its pictures and its PDF and text attachments; from then on the copies are ordinary documents.';
+  $('#feishu-urls').value = lastFeishuUrl;
+  $('#feishu-urls').disabled = false;
+  $('#feishu-subpages').disabled = false;
+  $('#feishu-plan').hidden = true;
+  $('#feishu-plan').innerHTML = '';
+  $('#feishu-error').textContent = '';
+  paintFeishuButtons();
+  $('#feishu-dialog').showModal();
+  setTimeout(() => $('#feishu-urls').focus(), 0);
+}
+
+const feishuDialog = { mode: 'copy', plan: null, job: null, busy: false };
+
+/** The links typed, one per line (or separated by spaces or commas), each once. */
+const feishuLinksTyped = () => [...new Set($('#feishu-urls').value.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean))];
+
+/** The looked-up links that would import: readable, not linked already, and not the same document or wiki as a link above. */
+function feishuReady(plan) {
+  const seen = new Set();
+  return plan.items.filter((i) => {
+    if (!i.ok || i.preview.linked) return false;
+    i.repeat = seen.has(i.preview.token);
+    seen.add(i.preview.token);
+    return !i.repeat;
+  });
+}
+
+function paintFeishuButtons() {
+  const { mode, plan, job, busy } = feishuDialog;
+  const go = $('#btn-feishu-go');
+  const ready = plan ? feishuReady(plan) : [];
+  const finished = job && job.state !== 'running';
+  $('#btn-feishu-lookup').hidden = Boolean(job);
+  $('#btn-feishu-lookup').disabled = busy;
+  $('#btn-feishu-cancel').textContent = job && !finished ? 'Close — it goes on' : finished ? 'Close' : 'Cancel';
+  go.hidden = Boolean(job);
+  go.disabled = busy || ready.length === 0;
+  const verb = mode === 'link' ? 'Link' : 'Import';
+  const pages = ready.reduce((n, i) => n + (i.preview.pages ? i.preview.pages.documents : 1), 0);
+  go.textContent = ready.length === 0 ? verb : ready.length === 1 && !ready[0].preview.pages ? verb : `${verb} ${fmtCount(pages, 'document')}`;
+}
+
+function feishuItemHtml(cls, mark, title, lines) {
+  return `<div class="feishu-item ${cls}"><span class="mark">${mark}</span><div><b>${esc(title)}</b>${lines.filter(Boolean).map((l) => `<div class="hint">${l}</div>`).join('')}</div></div>`;
+}
+
+function paintFeishuPlan() {
+  const { plan } = feishuDialog;
+  const el = $('#feishu-plan');
+  el.hidden = !plan;
+  if (!plan) return;
+  el.innerHTML = plan.items.map((i) => {
+    if (!i.ok) return feishuItemHtml('bad', '✕', i.input, [esc(i.error)]);
+    const p = i.preview;
+    const what = p.pages
+      ? `a wiki ${p.wiki ? 'page' : 'space'} with ${fmtCount(p.pages.total, 'page')} — ${fmtCount(p.pages.documents, 'document')} come${p.pages.documents === 1 ? 's' : ''} as folders${p.pages.levels > 1 ? `, ${p.pages.levels} levels deep` : ' side by side'}${p.pages.keptInFeishu ? `; ${p.pages.keptInFeishu} of another kind (sheets, bases…) stay in Feishu` : ''}`
+      : `last edited ${p.modifiedAt ? new Date(p.modifiedAt).toLocaleString() : 'at an unknown time'}`;
+    if (p.linked) return feishuItemHtml('', '•', p.title, [`linked already at <span class="mono">${esc(p.linked.dest)}</span> — left out; right-click it there to check for edits`]);
+    if (i.repeat) return feishuItemHtml('', '•', p.title, ['the same as a link above — left out']);
+    return feishuItemHtml('ok', '✓', p.title, [
+      esc(what),
+      `→ <span class="mono">${esc(p.dest)}</span>`,
+      p.existing ? (feishuDialog.mode === 'link' ? 'imported before: that copy becomes the linked mirror' : 'imported before: that copy is brought up to date') : '',
+    ]);
+  }).join('');
+}
+
+function paintFeishuJob() {
+  const { job } = feishuDialog;
+  const el = $('#feishu-plan');
+  el.hidden = false;
+  const head = job.state === 'running'
+    ? `${feishuDialog.mode === 'link' ? 'Linking' : 'Importing'} — ${job.done} of ${job.inputs.length} done`
+    : job.state === 'failed'
+      ? `Stopped: ${job.error}`
+      : `Done${job.indexing ? ' — indexing in the background' : ''}`;
+  el.innerHTML = `<p class="hint">${esc(head)}</p>` + job.inputs.map((input, n) => {
+    const item = job.items[n];
+    if (item && !item.ok) return feishuItemHtml('bad', '✕', input, [esc(item.error)]);
+    if (item) {
+      const r = item.result;
+      const what = r.pages ? `${fmtCount(r.pages.documents, 'document')} of ${fmtCount(r.pages.total, 'page')}, ${r.pages.fetched} fetched` : `revision ${r.revision}`;
+      return feishuItemHtml('ok', '✓', r.title, [`${esc(what)} · ${fmtCount(r.images, 'picture')}, ${fmtCount(r.attachments, 'attachment')}${r.warnings.length ? ` · ${fmtCount(r.warnings.length, 'warning')} in the log` : ''}`, `→ <span class="mono">${esc(r.dest)}</span>`]);
+    }
+    return feishuItemHtml('', job.current === input ? '⟳' : '·', input, [job.current === input ? 'fetching it and its pictures…' : 'waiting']);
+  }).join('');
+}
+
+async function lookUpFeishuLinks() {
+  const urls = feishuLinksTyped();
+  $('#feishu-error').textContent = '';
+  if (!urls.length) {
+    $('#feishu-error').textContent = 'Paste at least one Feishu link.';
     return;
   }
-  if (plan.linked) {
-    reveal(plan.linked.dest);
-    toast(`"${plan.title}" is linked already at ${plan.linked.dest} — right-click it to check Feishu for edits`, 6000);
-    return;
-  }
-  const lines = [
-    `${mode === 'link' ? 'Link' : 'Import'} "${plan.title}"`,
-    plan.url,
-    `→ ${plan.dest}`,
-    '',
-    plan.modifiedAt ? `Last edited ${new Date(plan.modifiedAt).toLocaleString()}.` : '',
-    'Its pictures come along, each read by the vision model as a document of its own; so do PDF and text attachments. Other attachments, embedded bases and sheets stay in Feishu, linked from the text.',
-  ];
-  if (plan.existing) lines.push('', `It was imported before (revision ${plan.existing.revision}): ${mode === 'link' ? 'that copy becomes the linked mirror.' : 'that copy is brought up to date.'}`);
-  if (mode === 'link') lines.push('', 'Edit it in Feishu: the copy here is read-only and follows the original.');
-  lines.push('', 'Continue?');
-  if (!confirm(lines.filter((l, i) => l || lines[i - 1]).join('\n'))) return;
-  toast(`${mode === 'link' ? 'linking' : 'importing'} "${plan.title}" — fetching it and its pictures…`, 600000);
+  lastFeishuUrl = urls.join('\n');
+  const subpages = $('#feishu-subpages').checked;
+  feishuDialog.busy = true;
+  feishuDialog.plan = null;
+  paintFeishuButtons();
+  $('#feishu-plan').hidden = false;
+  $('#feishu-plan').innerHTML = `<p class="hint">looking ${fmtCount(urls.length, 'link')} up in Feishu${subpages ? ', with the pages under wiki pages' : ''}…</p>`;
   try {
-    const res = await api('/api/feishu/import', { method: 'POST', body: JSON.stringify({ url, mode }) });
-    reveal(res.dest);
-    await loadTree();
-    loadStats();
-    const verb = res.refreshed ? 'refreshed' : mode === 'link' ? 'linked' : 'imported';
-    toast(`${verb} "${res.title}": ${fmtCount(res.images, 'picture')}, ${fmtCount(res.attachments, 'attachment')}${res.indexing ? ' · indexing in the background' : ''}${res.warnings.length ? ` · ${fmtCount(res.warnings.length, 'warning')} in the log` : ''}`, 8000);
+    const { items } = await api('/api/feishu/preview', { method: 'POST', body: JSON.stringify({ urls, subpages }) });
+    feishuDialog.plan = { urls, subpages, items };
+    feishuReady(feishuDialog.plan);
+    paintFeishuPlan();
   } catch (e) {
-    toast(`${mode === 'link' ? 'link' : 'import'} failed: ${e.message}`, 8000);
+    $('#feishu-plan').hidden = true;
+    $('#feishu-error').textContent = e.message;
+  } finally {
+    feishuDialog.busy = false;
+    paintFeishuButtons();
   }
 }
+
+async function runFeishuImport() {
+  const { plan, mode } = feishuDialog;
+  if (!plan || plan.urls.join('\n') !== feishuLinksTyped().join('\n') || plan.subpages !== $('#feishu-subpages').checked) return lookUpFeishuLinks();
+  const urls = feishuReady(plan).map((i) => i.input);
+  if (!urls.length) return;
+  feishuDialog.busy = true;
+  paintFeishuButtons();
+  $('#feishu-error').textContent = '';
+  try {
+    const res = await api('/api/feishu/import', { method: 'POST', body: JSON.stringify({ urls, mode, subpages: plan.subpages }) });
+    if (!res.job) {
+      // one document: written already, indexed in the background
+      $('#feishu-dialog').close();
+      reveal(res.dest);
+      await loadTree();
+      loadStats();
+      const verb = res.refreshed ? 'refreshed' : mode === 'link' ? 'linked' : 'imported';
+      toast(`${verb} "${res.title}": ${fmtCount(res.images, 'picture')}, ${fmtCount(res.attachments, 'attachment')}${res.indexing ? ' · indexing in the background' : ''}${res.warnings.length ? ` · ${fmtCount(res.warnings.length, 'warning')} in the log` : ''}`, 8000);
+      return;
+    }
+    $('#feishu-urls').disabled = true;
+    $('#feishu-subpages').disabled = true;
+    await followFeishuJob(res.job);
+  } catch (e) {
+    $('#feishu-error').textContent = e.message;
+  } finally {
+    feishuDialog.busy = false;
+    if ($('#feishu-dialog').open) paintFeishuButtons();
+  }
+}
+
+/** Follow a background import while the dialog is open; closing it leaves the import running (Tasks → Background). */
+async function followFeishuJob(job) {
+  feishuDialog.job = job;
+  paintFeishuButtons();
+  while (feishuDialog.job === job && job.state === 'running') {
+    paintFeishuJob();
+    await new Promise((r) => setTimeout(r, 1500));
+    if (!$('#feishu-dialog').open || feishuDialog.job !== job) return;
+    try {
+      job = await api(`/api/feishu/import/${encodeURIComponent(job.id)}`);
+      feishuDialog.job = job;
+    } catch {
+      // the next round asks again
+    }
+  }
+  paintFeishuJob();
+  paintFeishuButtons();
+  await loadTree();
+  loadStats();
+  const ok = job.items.filter((i) => i.ok);
+  if (ok.length === 1) reveal(ok[0].result.dest);
+  const failed = job.items.length - ok.length;
+  toast(`${feishuDialog.mode === 'link' ? 'linked' : 'imported'} ${fmtCount(ok.length, 'link')}${failed ? `, ${failed} failed` : ''}${job.indexing ? ' · indexing in the background' : ''}`, 8000);
+}
+
+$('#btn-feishu-cancel').addEventListener('click', () => {
+  if (feishuDialog.job?.state === 'running') toast('the import goes on in the background — Tasks → Background shows it', 5000);
+  feishuDialog.job = null;
+  $('#feishu-dialog').close();
+});
+$('#btn-feishu-lookup').addEventListener('click', () => lookUpFeishuLinks());
+$('#feishu-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  runFeishuImport();
+});
+// a changed list is looked up again before it imports
+$('#feishu-urls').addEventListener('input', () => {
+  if (!feishuDialog.plan) return;
+  feishuDialog.plan = null;
+  paintFeishuPlan();
+  paintFeishuButtons();
+});
+$('#feishu-subpages').addEventListener('change', () => {
+  feishuDialog.plan = null;
+  paintFeishuPlan();
+  paintFeishuButtons();
+});
 
 async function syncFeishuDoc(dest, force = false) {
   toast(force ? `fetching ${dest} from Feishu again…` : `asking Feishu whether ${dest} was edited…`, 600000);
@@ -3449,7 +3625,8 @@ async function syncFeishuDoc(dest, force = false) {
     loadStats();
     if (!r) toast('nothing to sync');
     else if (r.error) toast(`${dest}: ${r.error}`, 8000);
-    else if (!r.fetched) toast(`${dest}: not edited since ${r.modifiedAt ? new Date(r.modifiedAt).toLocaleString() : 'the last fetch'}`, 5000);
+    else if (!r.fetched) toast(`${dest}: not edited since ${r.modifiedAt ? new Date(r.modifiedAt).toLocaleString() : 'the last fetch'}${r.pages ? ` (${fmtCount(r.pages.total, 'page')})` : ''}`, 5000);
+    else if (r.pages) toast(`${dest}: ${r.pages.fetched} of ${fmtCount(r.pages.documents, 'document')} fetched${r.pages.moved ? `, ${r.pages.moved} moved` : ''}${r.pages.removed ? `, ${r.pages.removed} gone` : ''} — ${r.written} written, ${r.removed} removed${r.sync ? ` · ${r.sync.indexed} indexed` : ''}`, 6000);
     else toast(`${dest}: fetched — ${r.written} written, ${r.removed} removed${r.sync ? ` · ${r.sync.indexed} indexed` : ' · nothing changed'}`, 5000);
   } catch (e) {
     toast(`sync failed: ${e.message}`, 6000);

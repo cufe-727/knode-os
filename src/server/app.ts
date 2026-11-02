@@ -79,17 +79,19 @@ import { FeishuError } from '../ingest/feishu/client.js';
 import {
   describeFeishuLinks,
   feishuClient,
-  feishuDestFor,
   FeishuDocs,
+  feishuImportJobs,
   feishuLinks,
   FeishuSignIn,
-  findFeishuMirror,
+  importFeishuBatch,
   importFeishuDocument,
-  readManifest as readFeishuManifest,
+  previewFeishu,
   refreshFeishuLinks,
-  resolveFeishuTarget,
+  splitFeishuInputs,
+  startFeishuImport,
   unlinkFeishuDocument,
 } from '../ingest/feishu/docs.js';
+import { parseFeishuRef } from '../ingest/feishu/markdown.js';
 import { documentMentions } from '../graph/mentions.js';
 import { entityDetail, graphInsights, graphOverview, graphSearch } from '../graph/query.js';
 import { entitiesNamed } from '../graph/resolve.js';
@@ -1556,41 +1558,78 @@ export function createApp(
     }
   });
 
-  // what an import would bring, before anything is written — and proof the document is readable
+  // what an import would bring, before anything is written — and proof it is readable: one link
+  // (`url`, the answer is its preview) or several (`urls`, one line each; the answer lists them)
   app.post('/api/feishu/preview', async (c) => {
     const ctx = requestCtx(c);
-    try {
-      const body = (await c.req.json().catch(() => ({}))) as { url?: string; dest?: string };
-      const target = await resolveFeishuTarget(feishuClient(ctx.config), String(body.url ?? ''));
-      const existing = body.dest ? null : findFeishuMirror(ctx.dataDir, ctx.config, target.token);
-      const dest = existing ?? feishuDestFor(target, body.dest);
-      const manifest = readFeishuManifest(ctx.dataDir, dest);
-      const link = feishuLinks(ctx.config).find((l) => l.token === target.token) ?? null;
-      return c.json({
-        url: target.url,
-        token: target.token,
-        title: target.title,
-        modifiedAt: target.modifiedAt,
-        wiki: target.wiki ?? null,
-        dest,
-        existing: manifest ? { dest, revision: manifest.revision, modifiedAt: manifest.modifiedAt } : null,
-        linked: link ? { dest: link.dest } : null,
-      });
-    } catch (e) {
-      return c.json(feishuErr(e), 400);
+    const body = (await c.req.json().catch(() => ({}))) as { url?: string; urls?: string | string[]; dest?: string; subpages?: boolean };
+    const client = feishuClient(ctx.config);
+    const subpages = body.subpages === true;
+    if (body.urls === undefined) {
+      try {
+        return c.json(await previewFeishu(ctx, client, String(body.url ?? ''), { subpages, dest: body.dest }));
+      } catch (e) {
+        return c.json(feishuErr(e), 400);
+      }
     }
+    const inputs = splitFeishuInputs(body.urls);
+    if (inputs.length === 0) return c.json({ error: 'paste at least one Feishu link' }, 400);
+    const items = [];
+    for (const input of inputs) {
+      try {
+        items.push({ input, ok: true, preview: await previewFeishu(ctx, client, input, { subpages }), error: null });
+      } catch (e) {
+        items.push({ input, ok: false, preview: null, ...feishuErr(e) });
+        // without a working sign-in every other link fails the same way
+        if (e instanceof FeishuError && (e.kind === 'auth' || e.kind === 'not-installed')) break;
+      }
+    }
+    return c.json({ items });
   });
 
+  // import or link: one document at once (its indexing goes on in the background); several
+  // links, or a wiki tree, as a background job to follow at GET /api/feishu/import/:id —
+  // or all of it before answering with `wait`
   app.post('/api/feishu/import', async (c) => {
     const ctx = requestCtx(c);
     if (ingestRunning.has(ctx.dataDir)) return c.json({ error: 'ingest running — try again shortly' }, 409);
-    // held while the document is written and the link saved, as for a folder import
+    const body = (await c.req.json().catch(() => ({}))) as { url?: string; urls?: string | string[]; dest?: string; mode?: string; wait?: boolean; subpages?: boolean };
+    const mode = body.mode === 'link' ? 'link' : body.mode === 'copy' || body.mode === undefined ? 'copy' : null;
+    if (!mode) return c.json({ error: 'mode must be copy or link' }, 400);
+    const inputs = splitFeishuInputs(body.urls ?? body.url ?? '');
+    if (inputs.length === 0) return c.json({ error: 'a Feishu link is required' }, 400);
+    const subpages = body.subpages === true;
+    const services = servicesFor(ctx);
+    const feishu = services?.feishu ?? null;
+    const client = feishuClient(ctx.config);
+    let ref: ReturnType<typeof parseFeishuRef> | null = null;
+    try {
+      ref = parseFeishuRef(inputs[0]);
+    } catch {
+      // reported by the import itself
+    }
+    const tree = ref?.kind === 'space' || (ref?.kind === 'wiki' && subpages);
+    if ((inputs.length > 1 || tree) && body.wait !== true) {
+      try {
+        const opts = { mode, subpages } as const;
+        const { job } = feishu ? feishu.startImport(inputs, opts) : startFeishuImport(ctx, client, inputs, { ...opts, log, track: services?.track });
+        return c.json({ ok: true, job }, 202);
+      } catch (e) {
+        return c.json(feishuErr(e), e instanceof FolderImportConflict ? 409 : 400);
+      }
+    }
+    // held while the documents are written and the links saved, as for a folder import
     ingestRunning.add(ctx.dataDir);
     try {
-      const body = (await c.req.json().catch(() => ({}))) as { url?: string; dest?: string; mode?: string; wait?: boolean };
-      const mode = body.mode === 'link' ? 'link' : body.mode === 'copy' || body.mode === undefined ? 'copy' : null;
-      if (!mode) return c.json({ error: 'mode must be copy or link' }, 400);
-      const services = servicesFor(ctx);
+      if (inputs.length > 1 || tree) {
+        const out = await activityOf(ctx.dataDir).run(
+          'feishu',
+          `${mode === 'link' ? 'Link' : 'Import'} ${inputs.length === 1 ? inputs[0] : `${inputs.length} Feishu links`}`,
+          () => importFeishuBatch(ctx, client, inputs, { mode, subpages, dest: body.dest, onProgress: log }),
+          (r) => `${r.items.filter((x) => x.ok).length} of ${r.items.length} written`,
+        );
+        return c.json({ ok: true, ...out });
+      }
       const background = body.wait === true
         ? undefined
         : {
@@ -1600,13 +1639,12 @@ export function createApp(
               ? `feishu ${done.dest}: indexing failed: ${done.error}`
               : `feishu ${done.dest}: ${done.sync!.indexed} indexed, ${done.sync!.unchanged} unchanged, ${done.sync!.errors} errors, ${done.sync!.chunks} chunks`),
         };
-      const url = String(body.url ?? '');
-      const opts = { mode, dest: body.dest, onProgress: log, background } as const;
-      const feishu = services?.feishu ?? null;
+      const url = inputs[0];
+      const opts = { mode, dest: body.dest, subpages, onProgress: log, background } as const;
       const result = await activityOf(ctx.dataDir).run(
         'feishu',
         `${mode === 'link' ? 'Link' : 'Import'} ${url}`,
-        () => (feishu ? feishu.add(url, opts) : importFeishuDocument(ctx, feishuClient(ctx.config), url, opts)),
+        () => (feishu ? feishu.add(url, opts) : importFeishuDocument(ctx, client, url, opts)),
         (r) => `${r.title}: ${r.written.length} files written into ${r.dest}`,
       );
       return c.json({ ok: true, ...result });
@@ -1617,16 +1655,30 @@ export function createApp(
     }
   });
 
-  // ask Feishu now which linked documents changed (one with `dest`), and re-mirror those; `force` fetches regardless
+  // background imports of this workspace, latest first, and one of them as it goes
+  app.get('/api/feishu/import', (c) => c.json({ jobs: feishuImportJobs(requestCtx(c).dataDir) }));
+  app.get('/api/feishu/import/:id', (c) => {
+    const job = feishuImportJobs(requestCtx(c).dataDir).find((j) => j.id === c.req.param('id'));
+    return job ? c.json(job) : c.json({ error: 'no such import' }, 404);
+  });
+
+  // ask Feishu now which linked documents changed, and re-mirror those; `force` fetches regardless.
+  // Every link (the Check now buttons) is checked in the background unless `wait`; one with `dest`, before answering.
   app.post('/api/feishu/sync', async (c) => {
     const ctx = requestCtx(c);
     try {
-      const body = (await c.req.json().catch(() => ({}))) as { dest?: string; force?: boolean };
+      const body = (await c.req.json().catch(() => ({}))) as { dest?: string; force?: boolean; wait?: boolean };
       const dest = typeof body.dest === 'string' && body.dest.trim() ? cleanRelPath(body.dest) : undefined;
+      const force = body.force === true;
       const feishu = servicesFor(ctx)?.feishu ?? null;
+      if (!dest && feishu && body.wait !== true) {
+        if (feishuLinks(ctx.config).length === 0) return c.json({ ok: true, started: false, running: false, links: 0 });
+        const started = feishu.checkNow({ force });
+        return c.json({ ok: true, started, running: true, links: feishuLinks(ctx.config).length }, started ? 202 : 200);
+      }
       const results = feishu
-        ? await feishu.refresh(dest, { force: body.force === true })
-        : await refreshFeishuLinks(ctx, feishuClient(ctx.config), { dest, force: body.force === true, onProgress: log });
+        ? await feishu.refresh(dest, { force })
+        : await refreshFeishuLinks(ctx, feishuClient(ctx.config), { dest, force, onProgress: log });
       return c.json({ ok: true, results });
     } catch (e) {
       return c.json(feishuErr(e), 400);

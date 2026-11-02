@@ -1503,6 +1503,34 @@ struct FileBrowserView: View {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(node.path, forType: .string)
             model.showToast("Copied \(node.path)")
+        case .checkFeishu:
+            Task { await checkFeishu(node.path, force: false) }
+        case .fetchFeishu:
+            Task { await checkFeishu(node.path, force: true) }
+        }
+    }
+
+    /// One linked Feishu mirror brought up to date now: what changed in Feishu
+    /// since its last fetch (everything, `force`), then the tree read again.
+    private func checkFeishu(_ dest: String, force: Bool) async {
+        model.showToast(force ? L("Fetching %@ from Feishu again…", dest) : L("Asking Feishu whether %@ was edited…", dest))
+        do {
+            let answer = try await model.client().checkFeishu(dest: dest, force: force)
+            await loadTree()
+            guard let r = answer.results.first else { return model.showToast(L("Nothing to check")) }
+            if let error = r.error {
+                model.showToast("\(dest): \(error)", duration: 8_000_000_000)
+            } else if !r.fetched {
+                model.showToast(L("%@: not edited since the last fetch", dest))
+            } else if let pages = r.pages {
+                model.showToast(L("%@: %@ of %@ pages fetched, %@ moved, %@ gone", dest, String(pages.fetched ?? 0), String(pages.total ?? 0), String(pages.moved ?? 0), String(pages.removed ?? 0)))
+            } else {
+                model.showToast(L("%@: fetched — %@ written, %@ removed", dest, String(r.written), String(r.removed)))
+            }
+        } catch let error as APIError where error.sessionEnded {
+            model.sessionEnded()
+        } catch {
+            model.showError(error, prefix: L("Feishu check failed"))
         }
     }
 
@@ -2202,6 +2230,9 @@ private enum NodeAction {
     case delete
     case select
     case copyPath
+    /// A linked Feishu document's or wiki's mirror: ask Feishu for edits now, or fetch it all again.
+    case checkFeishu
+    case fetchFeishu
 }
 
 /// One row of the file tree as it shows: an entry, or a note in a folder that
@@ -2260,6 +2291,14 @@ private struct FileTreeRow: View {
             Divider()
             Button(L("Upload files here…")) { perform(.uploadFiles, node) }
             Button(L("Upload folder here…")) { perform(.uploadFolder, node) }
+            Divider()
+        }
+        if let source = node.linked, source.hasPrefix("http") {
+            Button(L("Check Feishu for edits now")) { perform(.checkFeishu, node) }
+            Button(L("Fetch again from Feishu")) { perform(.fetchFeishu, node) }
+            if let url = URL(string: source) {
+                Button(L("Open in Feishu")) { NSWorkspace.shared.open(url) }
+            }
             Divider()
         }
         // what is below is read when asked: the folder's listing is one level

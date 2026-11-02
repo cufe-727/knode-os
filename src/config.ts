@@ -458,18 +458,22 @@ export interface LinkedFolder {
 }
 
 /**
- * A Feishu document mirrored into raw/docs and kept in sync while `serve`
- * runs (src/ingest/feishu/docs.ts). Written by the Feishu routes and
+ * A Feishu document — or a wiki page with the pages under it, or a whole wiki
+ * space — mirrored into raw/docs and kept in sync while `serve` runs
+ * (src/ingest/feishu/docs.ts, ./tree.ts). Written by the Feishu routes and
  * `knode-os feishu link`, never by hand.
  */
 export interface FeishuLink {
-  /** The document's link as Feishu reports it (a wiki link when it was linked through one). */
+  /** The document's link as Feishu reports it (a wiki link when it was linked through one; a space's link for a whole space). */
   url: string;
-  /** The docx token: what Feishu stores the document under. */
+  /** What Feishu stores it under: the docx token of a document; for a tree, its top page's node token, or the space id. */
   token: string;
-  type: 'docx';
-  /** The wiki node token, when the link named a wiki page. */
+  /** One document, or a wiki tree mirrored folder by folder. Absent in links made before trees: a document. */
+  type: 'docx' | 'wiki-tree';
+  /** The wiki node token, when the link named a wiki page (a tree's top page). */
   wiki?: string;
+  /** A tree's wiki space. */
+  space?: string;
   /** The title when last mirrored. */
   title: string;
   /** Its mirror inside the workspace, a folder under raw/docs. */
@@ -481,8 +485,12 @@ export interface FeishuLink {
 export interface FeishuConfig {
   /** The lark-cli executable; default the one on PATH, else ~/.local/bin/lark-cli. */
   cli?: string;
-  /** Minutes between asking Feishu which linked documents changed; 0 turns the polling off. Default 10. */
-  pollMinutes?: number;
+  /**
+   * When `serve` asks Feishu which linked documents changed: once a day at
+   * this local time ("HH:MM", default "06:00"), and at startup when that
+   * time passed while it was down. "off" leaves it to the Check now buttons.
+   */
+  checkAt?: string;
 }
 
 export interface IngestConfig {

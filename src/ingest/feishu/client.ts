@@ -94,10 +94,26 @@ export interface DocumentMeta {
   ownerId: string | null;
 }
 
+/** A page of a wiki: a node, holding a document (or a sheet, a base…) and maybe pages under it. */
 export interface WikiNode {
+  nodeToken: string;
+  spaceId: string;
+  /** The node above it; empty at the top of the space. */
+  parent: string;
   objToken: string;
+  /** docx, sheet, bitable, mindnote, file, slides, doc (the old format)… */
   objType: string;
+  /** origin, or shortcut: a pointer to a page that lives elsewhere. */
+  nodeType: string;
   title: string;
+  hasChild: boolean;
+  /** ISO time of the document's last edit, as the wiki reports it. */
+  editedAt: string | null;
+}
+
+export interface WikiSpace {
+  spaceId: string;
+  name: string;
 }
 
 export interface DeviceLogin {
@@ -177,6 +193,20 @@ const secondsToIso = (value: unknown): string | null => {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? new Date(n * 1000).toISOString() : null;
 };
+
+function wikiNodeFrom(node: Record<string, unknown>): WikiNode {
+  return {
+    nodeToken: String(node.node_token ?? ''),
+    spaceId: String(node.space_id ?? ''),
+    parent: String(node.parent_node_token ?? ''),
+    objToken: String(node.obj_token ?? ''),
+    objType: String(node.obj_type ?? ''),
+    nodeType: String(node.node_type ?? 'origin'),
+    title: String(node.title ?? ''),
+    hasChild: node.has_child === true,
+    editedAt: secondsToIso(node.obj_edit_time),
+  };
+}
 
 /** A Feishu client that drives lark-cli. */
 export class LarkCli {
@@ -274,13 +304,32 @@ export class LarkCli {
     return { documentId: String(doc.document_id ?? ref), revisionId: Number(doc.revision_id ?? 0), content: doc.content };
   }
 
-  /** The document a wiki node holds. */
+  /** A wiki node: the document it holds, and where it sits. */
   async wikiNode(token: string): Promise<WikiNode> {
     const data = await this.call(['wiki', 'spaces', 'get_node', '--params', JSON.stringify({ token }), '--as', 'user'], `resolve wiki node ${token}`);
-    const node = (data.node ?? data) as Record<string, unknown>;
-    const objToken = String(node.obj_token ?? '');
-    if (!objToken) throw new FeishuError(`resolve wiki node ${token}: no document behind it`, 'not-found');
-    return { objToken, objType: String(node.obj_type ?? ''), title: String(node.title ?? '') };
+    const node = wikiNodeFrom((data.node ?? data) as Record<string, unknown>);
+    if (!node.objToken) throw new FeishuError(`resolve wiki node ${token}: no document behind it`, 'not-found');
+    return node;
+  }
+
+  /** The pages directly under `parent` (the top of the space without one), every page of the listing. */
+  async wikiChildren(spaceId: string, parent?: string): Promise<WikiNode[]> {
+    const out: WikiNode[] = [];
+    let pageToken = '';
+    for (let page = 0; page < 1000; page++) {
+      const params = { space_id: spaceId, page_size: 50, ...(parent ? { parent_node_token: parent } : {}), ...(pageToken ? { page_token: pageToken } : {}) };
+      const data = await this.call(['wiki', 'nodes', 'list', '--params', JSON.stringify(params), '--as', 'user'], `list the wiki pages under ${parent ?? `space ${spaceId}`}`);
+      for (const item of (data.items ?? []) as Record<string, unknown>[]) out.push(wikiNodeFrom(item));
+      pageToken = typeof data.page_token === 'string' ? data.page_token : '';
+      if (data.has_more !== true || !pageToken) break;
+    }
+    return out;
+  }
+
+  async wikiSpace(spaceId: string): Promise<WikiSpace> {
+    const data = await this.call(['wiki', 'spaces', 'get', '--params', JSON.stringify({ space_id: spaceId }), '--as', 'user'], `read wiki space ${spaceId}`);
+    const space = (data.space ?? data) as Record<string, unknown>;
+    return { spaceId: String(space.space_id ?? spaceId), name: String(space.name ?? '') };
   }
 
   /**

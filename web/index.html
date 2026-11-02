@@ -871,6 +871,18 @@
     </form>
   </dialog>
 
+  <dialog id="feishu-dialog" class="team-dialog feishu-dialog" aria-labelledby="feishu-dialog-title">
+    <form id="feishu-form" novalidate>
+      <div class="dialog-head"><p class="eyebrow">FEISHU</p><h2 id="feishu-dialog-title">Import Feishu documents</h2><p id="feishu-dialog-hint"></p></div>
+      <label for="feishu-urls">Links, one per line — Docs pages (…/docx/…), wiki pages (…/wiki/…) or a wiki space (…/wiki/space/…)</label>
+      <textarea id="feishu-urls" rows="5" spellcheck="false" autocomplete="off" placeholder="https://my.feishu.cn/wiki/…"></textarea>
+      <label class="check-row"><input id="feishu-subpages" type="checkbox" checked /> Bring the pages under each wiki page, as folders that keep the wiki's structure</label>
+      <div id="feishu-plan" class="feishu-plan" hidden></div>
+      <p id="feishu-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="btn-feishu-cancel" type="button">Cancel</button><button id="btn-feishu-lookup" type="button">Look up</button><button id="btn-feishu-go" class="primary" type="submit" disabled>Import</button></div>
+    </form>
+  </dialog>
+
   <dialog id="estimate-dialog" class="team-dialog estimate-dialog" aria-labelledby="estimate-title">
     <form id="estimate-form" novalidate>
       <div class="dialog-head"><p class="eyebrow" id="estimate-eyebrow">BEFORE YOU START</p><h2 id="estimate-title">Start?</h2><p id="estimate-lede"></p></div>

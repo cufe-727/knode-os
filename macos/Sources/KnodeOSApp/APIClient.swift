@@ -446,6 +446,14 @@ struct APIClient {
         return try await send("/api/folders/import", method: "POST", body: encoded(Body(source: source, dest: dest, mode: mode, replace: replace)))
     }
 
+    /// Ask Feishu now which linked documents (and wiki pages) were edited, and
+    /// fetch those: every link in the background, or the one mirrored at
+    /// `dest` before answering; `force` fetches regardless of edits.
+    func checkFeishu(dest: String? = nil, force: Bool = false) async throws -> FeishuCheck {
+        struct Body: Encodable { var dest: String?; var force: Bool }
+        return try await send("/api/feishu/sync", method: "POST", body: encoded(Body(dest: dest, force: force)))
+    }
+
     /// An empty query is the overview — the top entities by mentions, `limit`
     /// of them, `types` only, with (`edges` = all) or without (`typed`) the
     /// derived co-occurrence edges. A name is the local graph `depth` hops

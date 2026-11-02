@@ -417,6 +417,8 @@ describe('sign-in in front of serve', () => {
       'GET /api/auth/users',
       // the machine's own Feishu sign-in (lark-cli): who it is, and signing in as someone
       'GET /api/feishu/auth',
+      'GET /api/feishu/import',
+      'GET /api/feishu/import/:id',
       // the machine's own Codex and Cursor accounts: plan, windows, credits
       'GET /api/usage',
       'PATCH /api/auth/users/:username',
