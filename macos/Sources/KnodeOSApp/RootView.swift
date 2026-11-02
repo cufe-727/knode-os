@@ -355,7 +355,7 @@ private struct ConnectionPanel: View {
                 Text(ConnectionSheet.modeTitle(model.connection.mode)).font(.caption).foregroundStyle(.secondary)
                 Text(model.serverURLString).font(.callout.monospaced()).textSelection(.enabled)
                 if let account = model.account?.account {
-                    Text(L("Signed in as %@ (%@)", account.username, account.isAdmin ? L("administrator") : L("member")))
+                    Text(L("Signed in as %@ (%@)", account.username, account.roleTitle))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

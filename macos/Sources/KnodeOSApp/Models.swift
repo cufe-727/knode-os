@@ -245,12 +245,15 @@ struct AuthAccount: Codable, Hashable, Identifiable {
     var teams: [String]
     var remoteApis: [String]
     var gateways: [String]
+    /// A member who may look and not change anything.
+    var readOnly: Bool?
     var disabled: Bool?
     var createdAt: String?
     var passwordChangedAt: String?
 
     var id: String { username }
     var isAdmin: Bool { role == "admin" }
+    @MainActor var roleTitle: String { isAdmin ? L("administrator") : readOnly == true ? L("member, read-only") : L("member") }
 }
 
 struct AuthTeam: Decodable, Hashable {
@@ -310,6 +313,7 @@ struct AdminUser: Decodable, Identifiable, Hashable {
     var teams: [String]
     var remoteApis: [String]
     var gateways: [String]
+    var readOnly: Bool?
     var disabled: Bool?
     var sessions: Sessions
 
@@ -337,6 +341,7 @@ struct AdminUserDraft: Encodable {
     var teams: [String]?
     var remoteApis: [String]?
     var gateways: [String]?
+    var readOnly: Bool?
     var disabled: Bool?
 }
 

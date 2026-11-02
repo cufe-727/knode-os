@@ -78,6 +78,11 @@ struct AccessView: View {
                     Text(L("Signed in as %@ (@%@), %@.", account.name, account.username, me?.local == true ? L("on the machine the service runs on") : L("from another machine")))
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if account.readOnly == true {
+                        Text(L("Your account is read-only: you may look, not change anything."))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             HStack(alignment: .top, spacing: 14) {
@@ -171,6 +176,7 @@ struct AccessView: View {
                             HStack(spacing: 6) {
                                 Text(user.username).font(.callout.weight(.semibold))
                                 Text(user.role == "admin" ? L("administrator") : L("member")).font(.caption).foregroundStyle(.secondary)
+                                if user.readOnly == true { Text(L("read-only")).font(.caption).foregroundStyle(.secondary) }
                                 if user.disabled == true { Text(L("disabled")).font(.caption).foregroundStyle(Color.knodeBad) }
                             }
                             Text(summary(user)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
@@ -389,6 +395,7 @@ private struct UserEditorSheet: View {
     @State private var gateways = ""
     @State private var everything = false
     @State private var remote: Set<String> = []
+    @State private var readOnly = false
     @State private var disabled = false
     @State private var error = ""
     @State private var saving = false
@@ -432,6 +439,10 @@ private struct UserEditorSheet: View {
                         .disabled(everything)
                     }
                 }
+                // an administrator is never read-only
+                if !editor.isSelf && role == "member" {
+                    Toggle(L("Read-only — may look, not change anything"), isOn: $readOnly)
+                }
                 if editor.user != nil && !editor.isSelf {
                     Toggle(L("Disabled — refuse sign-in"), isOn: $disabled)
                 }
@@ -462,6 +473,7 @@ private struct UserEditorSheet: View {
             gateways = user.gateways.joined(separator: ", ")
             everything = user.remoteApis.contains("*")
             remote = Set(user.remoteApis)
+            readOnly = user.readOnly ?? false
             disabled = user.disabled ?? false
         }
     }
@@ -481,6 +493,7 @@ private struct UserEditorSheet: View {
         )
         if !editor.isSelf {
             draft.role = role
+            draft.readOnly = role == "member" && readOnly
             if editor.user != nil { draft.disabled = disabled }
             if !password.isEmpty || editor.user == nil {
                 guard password.count >= 8 else {
