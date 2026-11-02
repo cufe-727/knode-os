@@ -415,6 +415,8 @@ describe('sign-in in front of serve', () => {
       'DELETE /api/workspace',
       'GET /api/auth/gateways',
       'GET /api/auth/users',
+      // the machine's own Feishu sign-in (lark-cli): who it is, and signing in as someone
+      'GET /api/feishu/auth',
       // the machine's own Codex and Cursor accounts: plan, windows, credits
       'GET /api/usage',
       'PATCH /api/auth/users/:username',
@@ -424,6 +426,10 @@ describe('sign-in in front of serve', () => {
       'POST /api/config/embedding-test',
       'POST /api/config/models',
       'POST /api/config/test',
+      'POST /api/feishu/auth/login',
+      // reading Feishu as the machine's Feishu user
+      'POST /api/feishu/import',
+      'POST /api/feishu/preview',
       'POST /api/folders/import',
       'POST /api/folders/preview',
       'POST /api/labeling/start',

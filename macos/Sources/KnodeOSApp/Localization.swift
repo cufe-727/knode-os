@@ -1601,6 +1601,8 @@ private let zhHansPairs: [(String, String)] = [
     ("Agent traces", "Agent 轨迹"),
     ("collects new Claude Code and Codex sessions", "收集新的 Claude Code 与 Codex 会话"),
     ("refreshes live schemas into the wiki", "把实时数据结构刷新进 wiki"),
+    ("Feishu documents", "飞书文档"),
+    ("asks Feishu which linked documents were edited, and fetches those", "询问飞书哪些关联文档被编辑过，并重新获取这些文档"),
     ("The queue could not be read", "无法读取队列"),
     ("Reading the queue…", "正在读取队列…"),
     ("Stop processing?", "停止处理？"),

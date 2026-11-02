@@ -40,10 +40,12 @@ const MINDMAP_INSTRUCTIONS = [
 ].join(' ');
 
 /**
- * Ask the Convert stage's vision model for the Markdown of one image.
+ * Ask the Convert stage's vision model for the Markdown of one image — or of
+ * consecutive parts of one, top to bottom, read in a single call.
  * `mindMaps`: a picture of a hierarchy comes back as a marked outline instead of a description.
  */
-export async function transcribeImage(vision: VisionModel, imagePath: string, context: string, opts: { mindMaps?: boolean } = {}): Promise<string> {
+export async function transcribeImage(vision: VisionModel, imagePath: string | string[], context: string, opts: { mindMaps?: boolean } = {}): Promise<string> {
+  const paths = Array.isArray(imagePath) ? imagePath : [imagePath];
   const response = await vision.complete([
     {
       role: 'system',
@@ -55,9 +57,9 @@ export async function transcribeImage(vision: VisionModel, imagePath: string, co
         ...(opts.mindMaps ? [MINDMAP_INSTRUCTIONS] : []),
       ].join(' '),
     },
-    { role: 'user', content: `${context}\n\nTranscribe and describe this image as Markdown.` },
+    { role: 'user', content: `${context}\n\nTranscribe and describe ${paths.length > 1 ? 'these images, in order, as one Markdown text' : 'this image as Markdown'}.` },
     // an outline of a few hundred nodes runs past what a page of prose needs
-  ], { images: [{ path: imagePath, mimeType: 'image/png' }], maxTokens: opts.mindMaps ? 16_000 : 8_000 });
+  ], { images: paths.map((p) => ({ path: p, mimeType: 'image/png' })), maxTokens: opts.mindMaps || paths.length > 1 ? 16_000 : 8_000 });
   const markdown = stripOuterFence(response).trim();
   if (!markdown) throw new Error(`vision model ${vision.label} returned empty Markdown`);
   return markdown;

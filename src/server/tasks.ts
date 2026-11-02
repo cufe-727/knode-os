@@ -89,7 +89,7 @@ export interface TaskJob {
 }
 
 export interface ScheduledTask {
-  id: 'dream' | 'tier2' | 'traces' | 'datasources';
+  id: 'dream' | 'tier2' | 'traces' | 'datasources' | 'feishu';
   /** "03:00" for a daily run, else the interval in minutes. */
   at: string | null;
   everyMinutes: number | null;
@@ -288,11 +288,13 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
 
   const nightly = nightlySchedule(config);
   const traceEvery = Math.max(1, config.trace.syncIntervalMinutes);
+  const feishuPoll = config.ingest.feishu?.pollMinutes ?? 10;
   const scheduled: ScheduledTask[] = [
     { id: 'dream', at: nightly?.dream ?? null, everyMinutes: null, next: services && nightly ? nextDaily(nightly.dream) : null, enabled: Boolean(nightly), running: busy('dream') },
     { id: 'tier2', at: nightly?.tier2 ?? null, everyMinutes: null, next: services && nightly ? nextDaily(nightly.tier2) : null, enabled: Boolean(nightly), running: busy('tier2') },
     { id: 'traces', at: null, everyMinutes: traceEvery, next: null, enabled: Boolean(services), running: busy('traces') },
     { id: 'datasources', at: null, everyMinutes: 30, next: null, enabled: Boolean(services) && config.datasources.length > 0, running: busy('datasources') },
+    { id: 'feishu', at: null, everyMinutes: feishuPoll, next: null, enabled: Boolean(services) && feishuPoll > 0 && (config.ingest.feishuDocs?.length ?? 0) > 0, running: busy('feishu') },
   ];
 
   const runtime = services?.folders?.runtimeStatus() ?? new Map();

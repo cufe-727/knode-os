@@ -236,6 +236,10 @@ regeneration and is itself a source.
   — one outline form (`type: MindMap`) for a picture, a person's outline or a reviewed transcript beside the
   picture; the image converter asks for it; chunks carry their branch's path; named nodes join the graph to the
   nearest named node above them, typed by the two types; the file view draws the tree with its entity links.
+- [21 — Feishu documents: imported once or kept in sync, pictures included](21-feishu-documents.md)
+  — a Docs or wiki link mirrored under raw/docs/feishu with its pictures and attachments, through lark-cli as the
+  signed-in Feishu user (one device-flow authorization); linked documents polled by last-edit time, the changed
+  ones re-fetched; long screenshots read in bands.
 - [16 — Time in the knowledge base: entries, mention timelines, measures and market data](16-time.md)
   — proposed: time belongs to entries (a post, comment or message at its
   minute, read from the export's headings); a census of mentions per entry;

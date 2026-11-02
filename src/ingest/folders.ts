@@ -119,6 +119,16 @@ export function linkedFolders(config: KnodeConfig): LinkedFolder[] {
   return Array.isArray(config.ingest.linkedFolders) ? config.ingest.linkedFolders : [];
 }
 
+/**
+ * Every mirror a link writes: the linked folders, and the Feishu documents
+ * kept in sync (src/ingest/feishu/docs.ts), whose `source` is the document's
+ * link. What guards a linked folder's mirror guards these the same way.
+ */
+export function mirrorLinks(config: KnodeConfig): LinkedFolder[] {
+  const feishu = Array.isArray(config.ingest.feishuDocs) ? config.ingest.feishuDocs : [];
+  return [...linkedFolders(config), ...feishu.map((d) => ({ source: d.url, dest: d.dest, createdAt: d.createdAt }))];
+}
+
 /** The link whose mirror is `rel` or contains it, if any. */
 export function linkOwning(links: LinkedFolder[], rel: string): LinkedFolder | null {
   const clean = rel.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
@@ -134,7 +144,7 @@ export function linkOwning(links: LinkedFolder[], rel: string): LinkedFolder | n
 const inFlight = new Map<string, Map<string, number>>();
 const SETTLE_MS = 10_000;
 
-function holdDest(dataDir: string, dest: string): () => void {
+export function holdDest(dataDir: string, dest: string): () => void {
   const held = inFlight.get(dataDir) ?? new Map<string, number>();
   inFlight.set(dataDir, held);
   held.set(dest, Infinity);
@@ -150,7 +160,7 @@ function holdDest(dataDir: string, dest: string): () => void {
  */
 export function syncedByFolders(dataDir: string, config: KnodeConfig, rel: string): boolean {
   const clean = rel.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-  if (linkOwning(linkedFolders(config), clean)) return true;
+  if (linkOwning(mirrorLinks(config), clean)) return true;
   const held = inFlight.get(dataDir);
   if (!held) return false;
   const now = Date.now();
@@ -177,7 +187,7 @@ export function linksUnder(links: LinkedFolder[], rel: string): LinkedFolder[] {
  * undone by the next sync, and a rename or delete of it would be re-copied.
  */
 export function assertNotLinked(config: KnodeConfig, rel: string, what = 'write to'): void {
-  const links = linkedFolders(config);
+  const links = mirrorLinks(config);
   const owner = linkOwning(links, rel);
   if (owner) {
     throw new Error(`${rel} is mirrored from ${owner.source} — edit the original instead, or unlink ${owner.dest} first (cannot ${what} it)`);
@@ -443,9 +453,9 @@ export async function importFolder(ctx: FolderContext, source: string, opts: Imp
   const src = resolveImportSource(ctx.dataDir, source, opts.policy);
   const dest = importDestFor(src, opts.dest);
   const links = linkedFolders(ctx.config);
-  const owner = linkOwning(links, dest);
+  const owner = linkOwning(mirrorLinks(ctx.config), dest);
   if (owner) throw new FolderImportConflict(`${owner.dest} is already linked to ${owner.source} — unlink it first`);
-  const inside = linksUnder(links, dest);
+  const inside = linksUnder(mirrorLinks(ctx.config), dest);
   if (inside.length) throw new FolderImportConflict(`${dest} would contain the linked folder ${inside[0].dest} — pick another destination`);
   if (opts.mode === 'link') {
     const twin = links.find((l) => l.source === src);

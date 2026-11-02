@@ -1,12 +1,14 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import sharp from 'sharp';
 import { afterAll, describe, expect, it } from 'vitest';
 import { defaultConfig, saveConfig } from '../src/config.js';
 import { createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
-import { readSidecarPart } from '../src/fs/sidecar.js';
-import { convertDocumentToMarkdown } from '../src/ingest/convert.js';
+import { readSidecarPart, writeSidecarPart } from '../src/fs/sidecar.js';
+import { conversionCacheKey, convertDocumentToMarkdown } from '../src/ingest/convert.js';
+import type { VisionModel } from '../src/ingest/converters/shared.js';
 import { prepareDocs } from '../src/ingest/prepare.js';
 import { runIngest } from '../src/ingest/pipeline.js';
 import { textPdf } from './helpers/pdf.js';
@@ -117,4 +119,60 @@ printf '# Visual transcription\\n\\nThe image contains a green status indicator.
       await ctx.store.close();
     }
   }, 20_000);
+});
+
+describe('long screenshots', () => {
+  /** A white picture `height` rows tall with a dark line of "text" every 60 rows. */
+  async function screenshot(file: string, width: number, height: number): Promise<void> {
+    const pixels = Buffer.alloc(width * height, 255);
+    for (let y = 30; y < height; y += 60) for (let dy = 0; dy < 12 && y + dy < height; dy++) pixels.fill(0, (y + dy) * width + 8, (y + dy) * width + width - 8);
+    await sharp(pixels, { raw: { width, height, channels: 1 } }).png().toFile(file);
+  }
+
+  /** A vision model that says which parts it was handed, and how wide the first one was. */
+  function countingVision(calls: { parts: number; width: number }[]): VisionModel {
+    return {
+      enabled: true,
+      label: 'fake-vision',
+      complete: async (_messages, options) => {
+        const images = options?.images ?? [];
+        const meta = await sharp(images[0].path).metadata();
+        calls.push({ parts: images.length, width: meta.width ?? 0 });
+        return `parts read: ${images.length}`;
+      },
+    } as VisionModel;
+  }
+
+  it('reads a screenshot too tall for the frame in bands, a few a call, at its own width', async () => {
+    const file = path.join(tmp, 'long.png');
+    await screenshot(file, 400, 6000);
+    const calls: { parts: number; width: number }[] = [];
+    const result = await convertDocumentToMarkdown(file, 'raw/docs/long.png', { vision: countingVision(calls) });
+    // 6000 rows in bands of about 600: ten parts, read three at a time
+    const parts = calls.reduce((n, c) => n + c.parts, 0);
+    expect(parts).toBeGreaterThanOrEqual(10);
+    expect(calls.every((c) => c.parts <= 3 && c.width === 400)).toBe(true);
+    expect(result.kind).toBe('image-vision');
+    expect(result.markdown).toContain(`read_in_parts: "${parts}"`);
+  });
+
+  it('keys a banded conversion apart, so one squeezed before bands existed is read again and nothing else is', async () => {
+    const dir = path.join(tmp, 'bands-key');
+    initDataDir(dir);
+    await screenshot(path.join(dir, 'raw/docs/long.png'), 400, 6000);
+    await screenshot(path.join(dir, 'raw/docs/square.png'), 400, 400);
+    const calls: { parts: number; width: number }[] = [];
+    const vision = countingVision(calls);
+    expect((await prepareDocs(dir, { vision })).stats).toMatchObject({ prepared: 2 });
+    const longMeta = readSidecarPart(dir, 'raw/docs/long.png', 'meta');
+    expect(longMeta?.conversion?.key).toBe(`${conversionCacheKey({ vision }, 'raw/docs/long.png')}|bands`);
+    expect(readSidecarPart(dir, 'raw/docs/square.png', 'meta')?.conversion?.key).toBe(conversionCacheKey({ vision }, 'raw/docs/square.png'));
+
+    // what a version without bands left behind: the same file under the plain key
+    writeSidecarPart(dir, 'raw/docs/long.png', 'meta', { ...longMeta!, conversion: { ...longMeta!.conversion!, key: conversionCacheKey({ vision }, 'raw/docs/long.png') } });
+    calls.length = 0;
+    expect((await prepareDocs(dir, { vision })).stats).toMatchObject({ prepared: 1, unchanged: 1 });
+    expect(calls.length).toBeGreaterThan(1);
+    expect(readSidecarPart(dir, 'raw/docs/long.png', 'meta')?.conversion?.key).toMatch(/\|bands$/);
+  });
 });

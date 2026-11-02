@@ -113,6 +113,14 @@ export interface DocumentConverterPlugin {
   version?: string | number;
   /** The conversion depends on the Convert stage's vision model. */
   usesVision?: boolean;
+  /**
+   * A part of the cache key the file itself decides, when the converter reads
+   * some files of its type differently from the rest (the image converter
+   * reads a long screenshot in bands): those files get a key of their own,
+   * so a change of method re-converts them and leaves every other file's
+   * conversion in place. Null for a file read the ordinary way.
+   */
+  variant?(input: { absPath: string; rel: string; maxImageDimension?: number }): Promise<string | null>;
   convert(input: ConverterInput): Promise<ConversionResult>;
 }
 
