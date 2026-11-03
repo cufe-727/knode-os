@@ -136,6 +136,41 @@ describe('workspace paths and anchors', () => {
     expect(md.render('`raw/"onclick=x.md`')).not.toContain('path-link');
   });
 
+  const pathLink = (p: string) => `<a class="path-link" href="#" data-wikilink="${p}">${p}</a>`;
+
+  it('opens a workspace path written as plain text, as research pages cite, and reads as written', () => {
+    const a = 'raw/docs/research/五家/files/2026-04-03-www1-hkexnews-hk-2026040801181.pdf';
+    const b = 'raw/docs/content-markdown/舒九__d8191118556d/zsxq/唯有业绩永恒__54f6ae47272e/2024/2024-06-19.md';
+    expect(md.render(`收入增长。（来源：${a}；${b}）`)).toBe(`<p>收入增长。（来源：${pathLink(a)}；${pathLink(b)}）</p>\n`);
+    expect(md.render(`- ${a}\n- ${b}`)).toBe(`<ul>\n<li>${pathLink(a)}</li>\n<li>${pathLink(b)}</li>\n</ul>\n`);
+    expect(md.render('Revenue grew (Source: raw/docs/a.md; wiki/research/b.md#e-1f).')).toBe(`<p>Revenue grew (Source: ${pathLink('raw/docs/a.md')}; ${pathLink('wiki/research/b.md#e-1f')}).</p>\n`);
+    expect(md.render('| 公司 | 来源 |\n|---|---|\n| 寒武纪 | raw/docs/c.pdf |')).toContain(`<td>${pathLink('raw/docs/c.pdf')}</td>`);
+    expect(md.render('见raw/docs/a.md。')).toBe(`<p>见${pathLink('raw/docs/a.md')}。</p>\n`);
+  });
+
+  it('splits paths a claim in the metadata lists together', () => {
+    const html = md.render('---\nclaims:\n  - {"statement":"x","source":"raw/docs/a.pdf；raw/docs/b.pdf"}\n---\n正文', { metadataOpen: true });
+    expect(html).toContain(`&quot;source&quot;:&quot;${pathLink('raw/docs/a.pdf')}；${pathLink('raw/docs/b.pdf')}&quot;}`);
+  });
+
+  it('keeps a parenthesis inside a name while its pair is there too', () => {
+    const p = 'raw/docs/content-markdown/AI产业链（光+存）__df3dc76c1c5d/2026/2026-W45.md';
+    expect(md.render(`（来源：${p}）`)).toBe(`<p>（来源：${pathLink(p)}）</p>\n`);
+    expect(md.render('(see raw/docs/report(1).pdf)')).toBe(`<p>(see ${pathLink('raw/docs/report(1).pdf')})</p>\n`);
+    // a space ends it, and what comes before is no file
+    expect(md.render('(see raw/docs/report (1).pdf)')).not.toContain('path-link');
+  });
+
+  it('leaves a path that does not start a word, one already a link, and code alone', () => {
+    expect(md.render('x/raw/docs/a.md and xraw/docs/a.md')).toBe('<p>x/raw/docs/a.md and xraw/docs/a.md</p>\n');
+    expect(md.render('a raw/derived export and raw/ranked/z-scored data under raw/docs/research/...')).not.toContain('path-link');
+    expect(md.render('https://example.com/raw/docs/a.md')).not.toContain('path-link');
+    expect(md.render('[raw/docs/a.md](https://example.com/x)')).toBe('<p><a href="https://example.com/x">raw/docs/a.md</a></p>\n');
+    expect(md.render('[[raw/docs/a.md]] then raw/')).toBe('<p><a class="wikilink" href="#" data-wikilink="raw/docs/a.md">a</a> then raw/</p>\n');
+    expect(md.render('```\nraw/docs/a.md\n```')).not.toContain('path-link');
+    expect(md.render('**raw/docs/a.md**')).toBe(`<p><strong>${pathLink('raw/docs/a.md')}</strong></p>\n`);
+  });
+
   it('turns an export entry anchor into a marker a link can land on', () => {
     const html = md.render('---\n\n<a id="e-32817015"></a>\n## 09:06 · 舒九\n\n正文\n\n<a id="e-121bbd7c"></a>\n### 09:10 · 回复\n');
     expect(html).toContain('<span class="md-anchor" data-anchor="e-32817015"></span><h2>09:06 · 舒九</h2>');

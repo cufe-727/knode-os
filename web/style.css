@@ -423,7 +423,7 @@ main { flex: 1; min-height: 0; overflow: hidden; display: flex; }
 .markdown .fn-back:hover { color: var(--accent); }
 .markdown .path-link { text-decoration: none; }
 .markdown .path-link code { color: var(--accent); }
-.markdown .path-link:hover code { text-decoration: underline; }
+.markdown .path-link:hover, .markdown .path-link:hover code { text-decoration: underline; }
 .markdown a.entity-mention {
   color: inherit; border-radius: 3px;
   text-decoration: underline dotted var(--entity, var(--accent)); text-decoration-thickness: 1.5px; text-underline-offset: 3px;
