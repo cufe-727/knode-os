@@ -815,15 +815,36 @@ export async function summaryPagesByDocument(store: Store): Promise<Map<string, 
   return new Map(rows.map((r) => [r.doc, { path: r.path, status: r.status }]));
 }
 
+/**
+ * The most of a title's slug a summary page's name takes, in UTF-8 bytes: a
+ * GitHub page's title carries the whole repository description, and a file
+ * name stops at 255 bytes — less the hash, `.md` and a temporary write's suffix.
+ */
+const SUMMARY_SLUG_MAX_BYTES = 120;
+
+/** A document's title as a summary page's name: its slug, cut to SUMMARY_SLUG_MAX_BYTES at a word where one is near. */
+function summarySlug(doc: DocumentRow): string {
+  const slug = slugify(doc.title ?? path.basename(doc.path));
+  if (Buffer.byteLength(slug) <= SUMMARY_SLUG_MAX_BYTES) return slug;
+  let cut = '';
+  let bytes = 0;
+  for (const ch of slug) {
+    bytes += Buffer.byteLength(ch);
+    if (bytes > SUMMARY_SLUG_MAX_BYTES) break;
+    cut += ch;
+  }
+  const word = cut.lastIndexOf('-');
+  return (word > cut.length / 2 ? cut.slice(0, word) : cut).replace(/[-.]+$/, '');
+}
+
 /** `wiki/sources/<title slug>-<path hash>.md`: where a summary goes when its title's path belongs to someone else. */
 function hashedSummaryPath(doc: DocumentRow): string {
-  const slug = slugify(doc.title ?? path.basename(doc.path));
-  return `wiki/sources/${slug}-${crypto.createHash('sha256').update(doc.path).digest('hex').slice(0, 6)}.md`;
+  return `wiki/sources/${summarySlug(doc)}-${crypto.createHash('sha256').update(doc.path).digest('hex').slice(0, 6)}.md`;
 }
 
 /** `wiki/sources/<title slug>.md`: where a document's first summary page goes, unless another document holds it. */
 function plainSummaryPath(doc: DocumentRow): string {
-  return `wiki/sources/${slugify(doc.title ?? path.basename(doc.path))}.md`;
+  return `wiki/sources/${summarySlug(doc)}.md`;
 }
 
 /** Summaries that failed this often on a document's current content wait for new content. */
