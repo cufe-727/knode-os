@@ -12,8 +12,8 @@
  *     links to land on, which becomes an invisible marker;
  *   - a link keeps its target only when it is relative or http(s) / mailto
  *     (an image also data:image/…), so a `javascript:` link becomes its label;
- *   - `[[wikilinks]]` and workspace paths in code spans (`raw/…`, `wiki/…`)
- *     become in-app links the file view resolves.
+ *   - `[[wikilinks]]` and workspace paths (`raw/…`, `wiki/…`), in code spans
+ *     or as plain text, become in-app links the file view resolves.
  *
  * A page's own parts are read too: the YAML frontmatter folds into a
  * metadata panel with a one-line summary, and GFM footnotes (`[^1]` with a
@@ -56,6 +56,59 @@
 
   /** A workspace file as a page names it: a path under raw/ or wiki/, maybe with an #anchor. */
   const WORKSPACE_PATH = /^(?:raw|wiki)\/[^\s`"'<>]+$/;
+
+  /** What ends a path written as plain text: a space, a quote or bracket, the punctuation between citations. */
+  const PATH_STOP = /[\s`"'<>[\]{}|\\*,;:，；：。、！？「」『』【】《》“”‘’]/;
+
+  /**
+   * The length of the workspace path `src` opens with when written as plain
+   * text, or 0. A parenthesis belongs to the path while its pair does too —
+   * `AI产业链（光+存）__…/…` is one name — so the `）` closing
+   * `（来源：raw/docs/…）` is not; a full stop after it is the sentence's.
+   */
+  function barePathLength(src, from = 0) {
+    let depth = 0;
+    let end = from;
+    for (let i = from; i < src.length; i++) {
+      const c = src[i];
+      if (PATH_STOP.test(c)) break;
+      if (c === '(' || c === '（') depth++;
+      else if ((c === ')' || c === '）') && --depth < 0) break;
+      end = i + 1;
+    }
+    while (end > from && /[.!?~]/.test(src[end - 1])) end--;
+    return /^(?:raw|wiki)\/./.test(src.slice(from, end)) ? end - from : 0;
+  }
+
+  /** A file rather than a pair of words (`raw/derived export`): its last part has an extension. */
+  const FILE_PATH = /\.[A-Za-z0-9]{1,10}(?:#[^/]*)?$/;
+
+  /**
+   * A workspace path written as plain text, the way research pages cite —
+   * `（来源：raw/docs/…；raw/docs/…）`, `(Source: raw/docs/…; raw/docs/…)` —
+   * opens its file as one in a code span does, and reads as written. It
+   * starts a word: `x/raw/…` and a URL's `…/raw/…` stay text, as does a path
+   * that is already a link's label.
+   */
+  const workspacePath = {
+    name: 'workspacePath',
+    level: 'inline',
+    start(src) {
+      // marked hands this the text after the current character, so a match at 0 is checked again below
+      const match = /(?:^|[^\w/.-])(?=(?:raw|wiki)\/)/.exec(src);
+      return match ? match.index + match[0].length : undefined;
+    },
+    tokenizer(src, tokens) {
+      if (this.lexer.state.inLink) return undefined;
+      if (/[\w/.-]$/.test(tokens?.at(-1)?.raw ?? '')) return undefined;
+      const path = src.slice(0, barePathLength(src));
+      if (!path || !FILE_PATH.test(path)) return undefined;
+      return { type: 'workspacePath', raw: path, path };
+    },
+    renderer(token) {
+      return `<a class="path-link" href="#" data-wikilink="${escapeHtml(token.path)}">${escapeHtml(token.path)}</a>`;
+    },
+  };
 
   /** `[[note]]`, `[[folder/note|label]]`, `[[note#heading]]` — Obsidian's wikilinks. */
   const wikilink = {
@@ -265,19 +318,23 @@
     return parts;
   }
 
-  /** The YAML as written, with its wikilinks and workspace paths made links. */
+  /** The YAML as written, with its wikilinks and workspace paths made links: a claim's `"source":"raw/…；raw/…"` is two. */
   function frontmatterBody(yaml) {
     const out = [];
     let last = 0;
-    for (const m of yaml.matchAll(/\[\[([^\]\n]+)\]\]|(?<![\w/.-])((?:raw|wiki)\/[^\s"'<>[\]{},|]+)/g)) {
+    for (const m of yaml.matchAll(/\[\[([^\]\n]+)\]\]|(?<![\w/.-])(?=(?:raw|wiki)\/)/g)) {
+      if (m.index < last) continue;
+      const length = m[1] !== undefined ? m[0].length : barePathLength(yaml, m.index);
+      if (!length) continue;
+      const text = yaml.slice(m.index, m.index + length);
       out.push(escapeHtml(yaml.slice(last, m.index)));
       if (m[1] !== undefined) {
         const target = m[1].split('|')[0].trim();
-        out.push(`<a class="wikilink" href="#" data-wikilink="${escapeHtml(target)}">${escapeHtml(m[0])}</a>`);
+        out.push(`<a class="wikilink" href="#" data-wikilink="${escapeHtml(target)}">${escapeHtml(text)}</a>`);
       } else {
-        out.push(`<a class="path-link" href="#" data-wikilink="${escapeHtml(m[2])}">${escapeHtml(m[2])}</a>`);
+        out.push(`<a class="path-link" href="#" data-wikilink="${escapeHtml(text)}">${escapeHtml(text)}</a>`);
       }
-      last = m.index + m[0].length;
+      last = m.index + length;
     }
     out.push(escapeHtml(yaml.slice(last)));
     return out.join('');
@@ -386,7 +443,7 @@
           return global.knodeChart.render(token.text);
         },
       },
-      extensions: [anchor, footnoteDef, wikilink, footnoteRef],
+      extensions: [anchor, footnoteDef, wikilink, footnoteRef, workspacePath],
     });
 
     /** `opts.metadataOpen` unfolds the frontmatter panel. */

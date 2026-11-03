@@ -19,8 +19,8 @@ import SwiftUI
 /// metadata panel with a one-line summary. GFM footnotes — `[^1]` in the text,
 /// `[^1]: …` below — become superscript markers that jump to a list of notes,
 /// one per line, each with a way back. An export's `<a id="…"></a>` lines are
-/// places a link can land on, and a workspace path written as code (`raw/…`)
-/// opens its file. A page whose frontmatter says `type: MindMap` is drawn as
+/// places a link can land on, and a workspace path (`raw/…`), in a code span
+/// or as plain text, opens its file. A page whose frontmatter says `type: MindMap` is drawn as
 /// the tree its outline holds (MarkdownMindMap.swift). The entity names the
 /// service found in the text (`mentions`) are marked in their type's colour
 /// and open the entity panel.
@@ -462,11 +462,66 @@ private enum MarkdownLink {
             .replacingOccurrences(of: "]", with: "\\]")
         return "[\(escaped)](<\(url.absoluteString)>)"
     }
+
+    /// The same for a label shown exactly as written: every ASCII punctuation mark escaped, so `__` in a name stays two underscores.
+    static func markdown(literal: some StringProtocol, url: URL?) -> String? {
+        guard let url else { return nil }
+        var escaped = ""
+        for c in literal {
+            if c.isASCII, c.isPunctuation || c.isSymbol { escaped.append("\\") }
+            escaped.append(c)
+        }
+        return "[\(escaped)](<\(url.absoluteString)>)"
+    }
 }
 
 /// A file in the workspace as a page names it: a path under raw/ or wiki/, maybe with an #anchor.
 private func isWorkspacePath(_ text: String) -> Bool {
     text.range(of: #"^(?:raw|wiki)/[^\s`"'<>]+$"#, options: .regularExpression) != nil
+}
+
+/// What ends a path written as plain text: a space, a quote or bracket, the punctuation between citations.
+private let pathStops = Set("`\"'<>[]{}|\\*,;:，；：。、！？「」『』【】《》“”‘’")
+
+/// Whether a path at `index` starts a word: not `x/raw/…`, nor a URL's `…/raw/…`.
+private func startsWord(_ text: String, at index: String.Index) -> Bool {
+    guard index > text.startIndex else { return true }
+    let before = text[text.index(before: index)]
+    return !((before.isASCII && (before.isLetter || before.isNumber)) || "_/.-".contains(before))
+}
+
+/**
+ * Where the workspace path at `start` ends when written as plain text, or nil
+ * when none starts there. A parenthesis belongs to the path while its pair
+ * does too — `AI产业链（光+存）__…/…` is one name — so the `）` closing
+ * `（来源：raw/docs/…）` is not; a full stop after it is the sentence's.
+ */
+private func barePathEnd(in text: String, from start: String.Index) -> String.Index? {
+    let rest = text[start...]
+    let root = rest.hasPrefix("raw/") ? 4 : rest.hasPrefix("wiki/") ? 5 : 0
+    guard root > 0 else { return nil }
+    var depth = 0
+    var end = start
+    var cursor = start
+    while cursor < text.endIndex {
+        let c = text[cursor]
+        if c.isWhitespace || pathStops.contains(c) { break }
+        if c == "(" || c == "（" {
+            depth += 1
+        } else if c == ")" || c == "）" {
+            depth -= 1
+            if depth < 0 { break }
+        }
+        cursor = text.index(after: cursor)
+        end = cursor
+    }
+    while end > start, ".!?~".contains(text[text.index(before: end)]) { end = text.index(before: end) }
+    return text.distance(from: start, to: end) > root ? end : nil
+}
+
+/// A file rather than a pair of words (`raw/derived export`): its last part has an extension.
+private func isFilePath(_ path: Substring) -> Bool {
+    path.range(of: #"\.[A-Za-z0-9]{1,10}(?:#[^/]*)?$"#, options: .regularExpression) != nil
 }
 
 /// A long path shows its last two parts; the link still carries all of it.
@@ -496,9 +551,11 @@ private func wikiMarkdownLink(destination: String, customLabel: String?, block: 
 /**
  * One run of inline text as the Markdown SwiftUI parses, with the app's links
  * written in: wikilinks, footnote markers (numbered by `notes`, label →
- * number; a marker without a note stays as written) and workspace paths in
- * code spans. Other code spans are copied untouched. A link that leaves the
- * file carries `block`, the block it sits in, for the way back.
+ * number; a marker without a note stays as written) and workspace paths, in
+ * code spans or as plain text the way research pages cite them —
+ * `（来源：raw/docs/…；raw/docs/…）`. Other code spans, and links already
+ * written, are copied untouched. A link that leaves the file carries `block`,
+ * the block it sits in, for the way back.
  */
 private func inlineSource(_ source: String, notes: [String: Int], block: Int?) -> String {
     var output = ""
@@ -550,6 +607,22 @@ private func inlineSource(_ source: String, notes: [String: Int], block: Int?) -
                 cursor = close.upperBound
                 continue
             }
+        }
+
+        // a link already written, `[label](target)` or `<target>`, is the writer's: nothing in it becomes another
+        if rest.hasPrefix("[") || rest.hasPrefix("![") || rest.hasPrefix("<"),
+           let written = rest.prefixMatch(of: #/!?\[[^\]\n]*\]\([^)\n]*\)|<[^>\s]+>/#) {
+            output += written.output
+            cursor = written.range.upperBound
+            continue
+        }
+
+        if rest.hasPrefix("raw/") || rest.hasPrefix("wiki/"), startsWord(source, at: cursor),
+           let end = barePathEnd(in: source, from: cursor), isFilePath(source[cursor..<end]),
+           let link = MarkdownLink.markdown(literal: source[cursor..<end], url: MarkdownLink.url(MarkdownLink.wiki, ("target", String(source[cursor..<end])), ("from", block.map(String.init)))) {
+            output += link
+            cursor = end
+            continue
         }
 
         output.append(source[cursor])
@@ -1190,31 +1263,33 @@ private func flowCount(_ value: String) -> Int {
     return content ? commas + 1 : 0
 }
 
-/// The YAML as written, with its wikilinks and workspace paths made links.
+/// The YAML as written, with its wikilinks and workspace paths made links: a claim's `"source":"raw/…；raw/…"` is two.
 private func frontmatterBody(_ yaml: String, block: Int) -> AttributedString {
     var out = AttributedString()
+    var written = yaml.startIndex
     var cursor = yaml.startIndex
-    for match in yaml.matches(of: #/\[\[([^\]\n]+)\]\]|((?:raw|wiki)\/[^\s"'<>\[\]{},|]+)/#) {
-        let destination: String
-        if let target = match.output.1 {
-            destination = target.split(separator: "|", maxSplits: 1).first.map { String($0).trimmingCharacters(in: .whitespaces) } ?? ""
-        } else if let path = match.output.2 {
-            // a path starts the value or follows a space, a quote or a bracket — not the middle of another word
-            if match.range.lowerBound > yaml.startIndex {
-                let before = yaml[yaml.index(before: match.range.lowerBound)]
-                if before.isLetter || before.isNumber || "_/.-".contains(before) { continue }
-            }
-            destination = String(path)
-        } else {
-            continue
-        }
-        out.append(AttributedString(String(yaml[cursor..<match.range.lowerBound])))
-        var link = AttributedString(String(yaml[match.range]))
+    func link(_ range: Range<String.Index>, to destination: String) {
+        out.append(AttributedString(String(yaml[written..<range.lowerBound])))
+        var link = AttributedString(String(yaml[range]))
         link.link = MarkdownLink.url(MarkdownLink.wiki, ("target", destination), ("from", String(block)))
         out.append(link)
-        cursor = match.range.upperBound
+        written = range.upperBound
     }
-    out.append(AttributedString(String(yaml[cursor...])))
+    while cursor < yaml.endIndex {
+        let rest = yaml[cursor...]
+        if rest.hasPrefix("[["), let match = rest.prefixMatch(of: #/\[\[([^\]\n]+)\]\]/#) {
+            let destination = match.output.1.split(separator: "|", maxSplits: 1).first.map { String($0).trimmingCharacters(in: .whitespaces) } ?? ""
+            link(match.range, to: destination)
+            cursor = match.range.upperBound
+        } else if startsWord(yaml, at: cursor), let end = barePathEnd(in: yaml, from: cursor) {
+            // a path starts the value or follows a space, a quote or a bracket — not the middle of another word
+            link(cursor..<end, to: String(yaml[cursor..<end]))
+            cursor = end
+        } else {
+            cursor = yaml.index(after: cursor)
+        }
+    }
+    out.append(AttributedString(String(yaml[written...])))
     return out
 }
 
