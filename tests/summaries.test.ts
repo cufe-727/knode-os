@@ -4,11 +4,12 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultConfig, defaultRoutedLlmConfig, ExtractionConfig, LlmConnection } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
-import { readSourceSummary, readSourceSummaryParts } from '../src/fs/sidecar.js';
+import { readSourceSummary, readSourceSummaryFailure, readSourceSummaryParts } from '../src/fs/sidecar.js';
 import { segmentText } from '../src/graph/segment.js';
 import { loadSourceText } from '../src/ingest/source.js';
 import { sync } from '../src/ingest/sync.js';
 import { WorkerIdentity } from '../src/labeling/scheduler.js';
+import { parseFrontmatter } from '../src/markdown.js';
 import { ensureDefaultAgents } from '../src/research/agents.js';
 import { dueSummaryDocuments, ensureSourceSummaries, ensureSourcesIndex, pruneShortSummaries } from '../src/wiki/pages.js';
 import { channelNames, detectSummaryLanguage, LinkVocabulary, normalizeLinks, sampleSegments } from '../src/wiki/summary.js';
@@ -376,6 +377,48 @@ describe('the Summarize stage', () => {
     expect(fake.calls.length).toBe(calls);
     expect(fs.existsSync(path.join(ctx.dataDir, 'wiki/sources/短文.md'))).toBe(true);
     ctx.config.extraction.summaryMinChars = 200;
+  });
+});
+
+describe('summary page names', () => {
+  let fake: FakeOpenAi;
+  let ctx: AppContext;
+
+  // a GitHub page's title carries the repository's whole description
+  const QLIB = 'GitHub - microsoft/qlib: Qlib is an AI-oriented Quant investment platform that aims to use AI tech to empower Quant Research, from exploring ideas to implementing productions. Qlib supports diverse ML modeling paradigms, including supervised learning, market dynamics modeling, and RL, and is now equipped with https://github.com/microsoft/RD-Agent to automate R&D process. · GitHub';
+  const CJK = '量化'.repeat(60);
+  const doc = (title: string) => `---\ntitle: ${JSON.stringify(title)}\n---\n# ${title}\n\n${'Qlib turns research ideas into production pipelines for quant teams. '.repeat(6)}\n`;
+
+  beforeAll(async () => {
+    fake = await startFakeOpenAi({ answer });
+    const dataDir = await workspace('names', fake);
+    write(dataDir, 'raw/docs/web/qlib.md', doc(QLIB));
+    write(dataDir, 'raw/docs/web/qlib-again.md', doc(QLIB));
+    write(dataDir, 'raw/docs/web/cjk.md', doc(CJK));
+    ctx = await createContext(dataDir);
+    await sync(ctx, { llmGraph: false });
+  });
+
+  afterAll(async () => {
+    await ctx?.datasources.closeAll();
+    await ctx?.store.close();
+    await fake?.close();
+  });
+
+  it('names a page after the first 120 bytes of its title, cut at a word, and keeps the whole title in the page', async () => {
+    await ensureSourceSummaries(ctx, { limit: 20 });
+    const pages = await summaryPages(ctx);
+    const plain = 'wiki/sources/github-microsoft-qlib-qlib-is-an-ai-oriented-quant-investment-platform-that-aims-to-use-ai-tech-to-empower-quant.md';
+    expect(pages.get('raw/docs/web/qlib.md')).toBe(plain);
+    // one title for two documents: the second takes the hashed path, under the same bound
+    expect(pages.get('raw/docs/web/qlib-again.md')).toMatch(/^wiki\/sources\/github-microsoft-qlib-.*-to-empower-quant-[0-9a-f]{6}\.md$/);
+    // three bytes a character: 40 of them, with no word to cut at
+    expect(pages.get('raw/docs/web/cjk.md')).toBe(`wiki/sources/${'量化'.repeat(20)}.md`);
+    for (const [rel, at] of pages) {
+      expect(Buffer.byteLength(path.posix.basename(at, '.md'))).toBeLessThanOrEqual(120 + '-123456'.length);
+      expect(readSourceSummaryFailure(ctx.dataDir, rel)).toBeNull();
+    }
+    expect(parseFrontmatter(page(ctx, plain)).frontmatter.title).toBe(QLIB);
   });
 });
 
