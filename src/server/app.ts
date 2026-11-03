@@ -175,7 +175,7 @@ import { McpEndpoint, runsRoot } from '../research/workspace.js';
 import { recommendWikiTopics, refreshRecommendations } from '../research/recommend.js';
 import { captureUrl, readManifest } from '../research/capture.js';
 import { deleteResearchSource, loadResearchSources, redactSource, RESEARCH_SOURCE_KINDS, saveResearchSource, sourceProblem } from '../research/sources.js';
-import { cancelStudy, createStudy, deleteStudyDraft, listStudies, promoteStudy, refineStudyInBackground, refiningSince, startProblem, startStudy, StudyFiles, studyView, updateStudy, studyPayload } from '../research/study.js';
+import { cancelStudy, createStudy, deleteStudyDraft, listStudies, promoteStudy, refineStudyInBackground, refiningSince, retryStudy, startProblem, startStudy, StudyFiles, studyView, updateStudy, studyPayload } from '../research/study.js';
 import { EXPORT_POLICY, exportStudy, StudyExportError } from '../research/export.js';
 import { webSearchEnabled, WEB_SEARCH_PROVIDERS } from '../research/web.js';
 import { lintWiki } from '../wiki/lint.js';
@@ -2785,16 +2785,9 @@ export function createApp(
     const job = await studyOr404(ctx, c.req.param('id'));
     if (!job) return c.json({ error: 'no such study' }, 404);
     if (!['failed', 'cancelled'].includes(job.status)) return c.json({ error: `a ${job.status} study is not retried` }, 400);
-    const children = await listJobs(ctx.store, { study: job.id, limit: 100 });
-    for (const child of children) if (child.status === 'failed' || child.status === 'cancelled') await retryJob(ctx.store, child.id);
-    const p = studyPayload(job);
-    const stage = p.stage === 'pages' ? (children.length ? 'pages' : 'collect') : p.stage;
-    await updateJob(ctx.store, job.id, {
-      status: stage === 'pages' ? 'waiting' : 'queued', error: null, finishedAt: null, attempts: 0,
-      payload: { ...job.payload, stage, rejections: [] },
-    });
+    const retried = await retryStudy(ctx, job);
     servicesFor(ctx)?.kickResearch();
-    return c.json(await studyView(ctx, (await getJob(ctx.store, job.id))!));
+    return c.json(await studyView(ctx, retried));
   });
 
   app.delete('/api/research/studies/:id', async (c) => {

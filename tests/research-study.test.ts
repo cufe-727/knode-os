@@ -10,7 +10,7 @@ import { AppContext, createContext } from '../src/context.js';
 import { saveAgent } from '../src/research/agents.js';
 import { readManifest, registerPath, waitForCaptureIndexing } from '../src/research/capture.js';
 import { checkCharts, parseChart, timelineDate } from '../src/research/chart.js';
-import { claimNextJob, getJob, listJobs } from '../src/research/jobs.js';
+import { claimNextJob, getJob, listJobs, updateJob } from '../src/research/jobs.js';
 import { localizeNoteHeadings, normalizeBrief, noteHeadings, refineBrief, sourceMarker, sourcesHeading } from '../src/research/refine.js';
 import { runResearchJob } from '../src/research/runner.js';
 import { continueStudies, createStudy, refineStudy, startProblem, startStudy, studyPayload, studyView, updateStudy } from '../src/research/study.js';
@@ -484,5 +484,79 @@ describe('a study export', () => {
     expect(full).toContain('<a class="wikilink" href="#d1">份额</a>');
     expect(full).toContain('<a class="wikilink" href="#d2">HBM 路线图</a>');
     expect(full).not.toContain('尚未写成');
+  });
+});
+
+describe('a study the agent could not finish', () => {
+  const twoPages = (title: string, seed?: string) => normalizeBrief({
+    title, language: 'en', objective: 'Check that a failed run picks up where it stopped.',
+    pages: [{ id: 'p1', title: 'First page', slug: 'first', sections: ['## Numbers'] }, { id: 'p2', title: 'Second page', slug: 'second', sections: ['## More'] }],
+    questions: [{ id: 'q1', text: 'What are the numbers?', page: 'p1' }, { id: 'q2', text: 'What else?', page: 'p2' }],
+    seedUrls: seed ? [{ url: seed, why: 'a seed' }] : [],
+  }, { topic: 'x', maxPages: 4 });
+  const retry = (id: string) => app.request(`/api/research/studies/${id}/retry`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json', 'x-knode-csrf': '1' }, body: '{}' });
+
+  it('stops at collect when the collectors hit the usage limit, keeps no note of it, and collects again on retry', async () => {
+    const draft = await createStudy(ctx, { topic: 'A study whose collectors all ran out of usage.', refine: false, runner: { agent: 'fake' }, sources: { web: true } });
+    const job = await updateStudy(ctx, draft.id, { brief: twoPages('Usage limit', `${webBase}/limit-seed`) });
+    await startStudy(ctx, draft.id);
+    process.env.FAKE_AGENT_MODE = 'limit';
+    let failed;
+    try {
+      failed = await runResearchJob(ctx, (await getJob(ctx.store, draft.id))!, { mcp, log: () => {} });
+    } finally {
+      delete process.env.FAKE_AGENT_MODE;
+    }
+    // the seed was captured, but a seed alone is no collection: the error is the CLI's, not a note
+    expect(failed.status).toBe('failed');
+    expect(failed.error).toMatch(/nothing was gathered — claude: You've hit your 5-hour limit/);
+    const p = studyPayload(failed);
+    expect(p.stage).toBe('collect');
+    expect(p.steps.find((s) => s.name === 'seed')?.status).toBe('done');
+    expect(p.steps.find((s) => s.name === 'collect')?.status).toBe('failed');
+    expect(fs.existsSync(path.join(wsDir, 'raw/docs/research', job.target!, 'notes'))).toBe(false);
+    expect(await listJobs(ctx.store, { study: draft.id })).toHaveLength(0);
+
+    const res = await retry(draft.id);
+    expect(res.status).toBe(200);
+    const queued = (await getJob(ctx.store, draft.id))!;
+    expect(queued.status).toBe('queued');
+    expect(studyPayload(queued).stage).toBe('collect');
+    const collected = await runResearchJob(ctx, queued, { mcp, log: () => {} });
+    expect(collected.status).toBe('waiting');
+    expect(studyPayload(collected).notes).toHaveLength(2);
+  });
+
+  it('sends a study whose report failed with a page missing back to its pages, so the report is written last', async () => {
+    const draft = await createStudy(ctx, { topic: 'A study whose report failed with a page missing.', refine: false, runner: { agent: 'fake' }, sources: { web: false } });
+    await updateStudy(ctx, draft.id, { brief: twoPages('Report retry') });
+    await startStudy(ctx, draft.id);
+    const collected = await runResearchJob(ctx, (await getJob(ctx.store, draft.id))!, { mcp, log: () => {} });
+    expect(collected.status).toBe('waiting');
+    const [written, missing] = await listJobs(ctx.store, { study: draft.id });
+    // the night the usage ran out: one page written, the other and then the report failed
+    await updateJob(ctx.store, written.id, { status: 'done' });
+    await updateJob(ctx.store, missing.id, { status: 'failed', error: 'claude: limit', attempts: 2, payload: { ...missing.payload, rejections: ['claude: limit', 'claude: limit'] } });
+    await updateJob(ctx.store, draft.id, { status: 'failed', error: 'claude: limit', payload: { ...collected.payload, stage: 'report' } });
+
+    expect((await retry(draft.id)).status).toBe(200);
+    const waiting = (await getJob(ctx.store, draft.id))!;
+    expect(waiting.status).toBe('waiting');
+    const p = studyPayload(waiting);
+    expect(p.stage).toBe('pages');
+    expect(p.steps.find((s) => s.name === 'pages')).toEqual({ name: 'pages', status: 'running', detail: '1/2 page(s) written' });
+    expect(p.steps.find((s) => s.name === 'report')?.status).toBe('pending');
+    const page = (await getJob(ctx.store, missing.id))!;
+    expect(page.status).toBe('queued');
+    expect(page.attempts).toBe(0);
+    expect(page.payload.rejections).toEqual([]);
+    expect((await getJob(ctx.store, written.id))!.status).toBe('done');
+    // the report waits for the page, and is queued once the page is written
+    expect(await continueStudies(ctx)).toBe(0);
+    await updateJob(ctx.store, missing.id, { status: 'done' });
+    expect(await continueStudies(ctx)).toBe(1);
+    const report = (await getJob(ctx.store, draft.id))!;
+    expect(report.status).toBe('queued');
+    expect(studyPayload(report).stage).toBe('report');
   });
 });

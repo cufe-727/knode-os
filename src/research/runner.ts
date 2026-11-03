@@ -115,6 +115,8 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
       return await runStudyCollect(ctx, job, { mcp: opts.mcp, agent, profile, readDirs, log });
     } catch (err) {
       if (err instanceof JobCancelledError) return markCancelled(ctx, job.id, log);
+      // collect saved its steps as it went: fail on top of them, not on the payload it started from
+      job = (await getJob(ctx.store, job.id)) ?? job;
       return fail(`study: ${err instanceof Error ? err.message : err}`, false);
     }
   }

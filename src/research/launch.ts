@@ -522,8 +522,10 @@ async function launchCliSession(input: CliSessionInput): Promise<SessionResult> 
         if (ev.type === 'result') {
           result.turns = typeof ev.num_turns === 'number' ? ev.num_turns : result.turns;
           result.costUsd = typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : result.costUsd;
-          result.text = typeof ev.result === 'string' ? ev.result : result.text;
+          // a failed run's `result` is its error message ("You've hit your 5-hour limit"), not an
+          // answer: it goes to `error` only, so no caller keeps it as notes, findings or a reply
           if (ev.is_error) result.error = `claude: ${String(ev.result ?? ev.subtype ?? 'error').slice(0, 300)}`;
+          else if (typeof ev.result === 'string') result.text = ev.result;
         }
       } catch {
         // progress lines

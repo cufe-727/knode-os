@@ -367,6 +367,31 @@ export async function cancelStudy(ctx: AppContext, id: string): Promise<{ cancel
   return { cancelled: rows.length > 0, killed, pages };
 }
 
+/**
+ * Queue a failed or cancelled study again from where it stopped. Its failed
+ * pages go back in line with a fresh attempt count and no rejections (a page's
+ * brief tells the agent why its last attempt was refused, and "usage limit" is
+ * no reason to change the page). A study whose report failed with pages
+ * missing waits for them instead: the queue takes the oldest job first, and a
+ * study is older than its pages, so the report would otherwise be written
+ * before them.
+ */
+export async function retryStudy(ctx: AppContext, job: ResearchJob): Promise<ResearchJob> {
+  const children = await listJobs(ctx.store, { study: job.id, limit: 100 });
+  const again = children.filter((c) => c.status === 'failed' || c.status === 'cancelled');
+  for (const child of again) {
+    await updateJob(ctx.store, child.id, { status: 'queued', error: null, finishedAt: null, attempts: 0, payload: { ...child.payload, rejections: [] } });
+  }
+  const p = studyPayload(job);
+  const stage: StudyStage = p.stage === 'pages' || (p.stage === 'report' && again.length) ? (children.length ? 'pages' : 'collect') : p.stage;
+  const done = children.filter((c) => c.status === 'done').length;
+  const steps = stage === 'pages' ? setStep(setStep(p.steps, 'pages', 'running', `${done}/${children.length} page(s) written`), 'report', 'pending') : p.steps;
+  return (await updateJob(ctx.store, job.id, {
+    status: stage === 'pages' ? 'waiting' : 'queued', error: null, finishedAt: null, attempts: 0,
+    payload: { ...job.payload, stage, steps, rejections: [] },
+  }))!;
+}
+
 /** A draft nobody started can go; a study that ran stays, with its pages and sources. */
 export async function deleteStudyDraft(ctx: AppContext, id: string): Promise<boolean> {
   const rows = await ctx.store.query<{ id: string }>(`DELETE FROM research_jobs WHERE id = $1 AND kind = 'study' AND status IN ('draft', 'cancelled') AND COALESCE(payload ->> 'stage', 'draft') = 'draft' RETURNING id`, [id]);
@@ -713,6 +738,7 @@ export async function runStudyCollect(ctx: AppContext, jobIn: ResearchJob, deps:
     await save({ steps: setStep(p.steps, 'seed', 'skipped', seeds.length ? 'the web is off for this study' : 'no seed URLs') });
   }
   if (await cancelled()) throw new JobCancelledError(job.id);
+  const seeded = studyCaptures(ctx.dataDir, job.id).length;
 
   /* ---- collect ---- */
   const lang = p.brief.language;
@@ -800,8 +826,10 @@ export async function runStudyCollect(ctx: AppContext, jobIn: ResearchJob, deps:
   }
   if (await cancelled()) throw new JobCancelledError(job.id);
   const captured = studyCaptures(ctx.dataDir, job.id).length;
-  if (notes.length === 0 && captured === 0) {
-    const errors = phases.map((ph) => ph.error).filter(Boolean);
+  const errors = phases.map((ph) => ph.error).filter(Boolean);
+  // the seed URLs alone are no collection when the collectors failed (a spent usage limit fails
+  // every one of them in seconds): the study stops here, and a retry collects again
+  if (notes.length === 0 && (captured === 0 || (captured === seeded && errors.length > 0))) {
     await save({ collect: phases, steps: setStep(p.steps, 'collect', 'failed', errors[0] ?? 'nothing was collected') });
     throw new Error(`collect: nothing was gathered${errors.length ? ` — ${errors[0]}` : ''}`);
   }
