@@ -89,9 +89,9 @@ export function registerEvalCommands(program: Command): void {
   systems
     .command('install <id>')
     .description('install an external system (graphrag | lightrag | hipporag) into ~/knode-eval/venvs/<id> with uv')
-    .option('--version <v>', 'package version to pin (default: the recipe pin)')
+    .option('--pin <version>', 'package version to install (default: the newest release at least two weeks old)')
     .action(async (id: string, opts) => {
-      const r = await installExternal(id, { version: opts.version, log: (m) => console.log(`  ${m}`) });
+      const r = await installExternal(id, { version: opts.pin, log: (m) => console.log(`  ${m}`) });
       console.log(`\n${id} ${r.version} installed in ${r.dir}`);
     });
 

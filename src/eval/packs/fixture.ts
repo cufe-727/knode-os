@@ -78,7 +78,7 @@ export function buildFixturePack(dir: string): ReturnType<PackWriter['finish']> 
   const ev = (doc: string, quote?: string) => ({ doc, ...(quote ? { quote } : {}) });
   w.addTask({ id: 'q1', suite: 'usage', type: 'single-hop', lang: 'zh', question: '林晓在澜舟科技担任什么岗位？', answer: '高级数据工程师', scoring: 'exact', evidence: [ev('email/2026-03-05.md', '岗位为高级数据工程师')], primary: true });
   w.addTask({ id: 'q2', suite: 'usage', type: 'multi-hop', lang: 'zh', question: '林晓新公司的技术总监叫什么名字？他所在公司正在做什么数据平台迁移？', answer: '陈刚；从 Hive 迁移到 Iceberg', keypoints: ['陈刚', 'Hive 迁移到 Iceberg'], scoring: 'judge', evidence: [ev('email/2026-03-05.md'), ev('email/2026-03-22.md')], primary: true });
-  w.addTask({ id: 'q3', suite: 'usage', type: 'temporal', lang: 'zh', question: '林晓离开星河数据和入职澜舟科技之间隔了多少天？', answer: '11 天（3 月 20 日最后一天，4 月 1 日入职）', scoring: 'judge', evidence: [ev('chat/2026-03-02.md'), ev('email/2026-03-05.md')] });
+  w.addTask({ id: 'q3', suite: 'usage', type: 'temporal', lang: 'zh', question: '林晓离开星河数据和入职澜舟科技之间隔了多少天？', answer: '12 天（3 月 20 日最后一天，4 月 1 日入职）', scoring: 'judge', evidence: [ev('chat/2026-03-02.md'), ev('email/2026-03-05.md')] });
   w.addTask({ id: 'q4', suite: 'usage', type: 'unanswerable', lang: 'zh', question: '林晓在澜舟科技的年终奖是多少？', scoring: 'abstain' });
   w.addTask({ id: 'q5', suite: 'usage', type: 'numeric', lang: 'zh', question: '林晓在苏州的房子月租多少元？', answer: '4800 元', answers: ['4800', '4800元'], scoring: 'exact', evidence: [ev('chat/2026-03-12.md', '月租 4800')] });
   w.addTask({ id: 'e1', suite: 'emergence', type: 'affect', lang: 'zh', question: '根据 3 月份的日记和聊天，林晓这段时间的整体情绪状态更接近哪一种？', choices: ['平静满足', '焦虑疲惫', '兴奋期待', '愤怒'], answer: '焦虑疲惫', scoring: 'choice', evidence: [ev('diary/2026-03-08.md'), ev('diary/2026-03-20.md')], primary: true });

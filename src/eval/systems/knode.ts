@@ -202,7 +202,9 @@ export function knodeAsk(): SystemUnderTest {
       const ctx = await open(s);
       const llm = shimClient(env, { system: 'knode-ask', stage: 'answer', task: task.id });
       const res = await ask(ctx.store, ctx.config, ctx.embedder, llm, prompt, { mode: 'hybrid' });
-      const citations: Citation[] = [...new Set(res.citations.flatMap((c) => toCorpus(s, c.path)))].map((doc) => ({ doc }));
+      // ask's own [n] citations, and any [doc: path] the answer wrote under the shared output rules
+      const docs = new Set(env.staged.docs.map((d) => d.path));
+      const citations: Citation[] = [...new Set([...res.citations.flatMap((c) => toCorpus(s, c.path)), ...citationsIn(res.answer, docs).map((c) => c.doc)])].map((doc) => ({ doc }));
       return { text: res.answer, citations, retrieved: [...new Set(res.contexts.flatMap((c) => toCorpus(s, c.path)))] };
     },
     async retrieve(query, k, env) {
@@ -336,7 +338,8 @@ async function exportUnits(s: KnodeState): Promise<KnowledgeUnit[]> {
   }
   const wiki = path.join(s.ws, 'wiki');
   for (const rel of listFiles(wiki).filter((f) => f.endsWith('.md'))) {
-    if (rel.startsWith('.obsidian') || ['log.md', 'index.md'].includes(rel)) continue;
+    // navigation pages (the generated indexes, the overview) are not knowledge units
+    if (rel.startsWith('.obsidian') || /(^|\/)(index|log|overview)\.md$/.test(rel)) continue;
     const kind: KnowledgeUnit['kind'] = rel.startsWith('sources/') ? 'summary' : rel.startsWith('concepts/') ? 'community' : 'page';
     const body = parseFrontmatter(fs.readFileSync(path.join(wiki, rel), 'utf8')).body.replace(/<!--[^>]*-->/g, '').trim();
     if (!body) continue;

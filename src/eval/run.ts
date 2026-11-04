@@ -188,6 +188,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       const groups = new Map<string, SystemUnderTest[]>();
       for (const s of systems) (groups.get(s.group) ?? groups.set(s.group, []).get(s.group)!).push(s);
 
+      const failed = new Set<string>();
       const allTasks = selectTasks(staged.tasks.filter((t) => !t.afterUpdate), suites, opts.limit, seed);
       const updateTasks = suites.has('update') ? staged.tasks.filter((t) => t.afterUpdate) : [];
 
@@ -203,7 +204,10 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           models,
           log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`),
         };
-        await buildGroup(store, meter, env, group, members, fraction, seed, progress);
+        if (!(await buildGroup(store, meter, env, group, members, fraction, seed, progress))) {
+          failed.add(group);
+          continue;
+        }
         for (const s of members) {
           for (const other of members) if (other !== s) await other.release?.();
           await answerAll(store, meter, env, s, isAgent(s) ? selectTasks(allTasks, suites, opts.agentLimit ?? 30, seed) : allTasks, fraction, seed, opts.answerConcurrency ?? 3, progress);
@@ -229,6 +233,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         for (const f of files) corpusDocs.get(pack.manifest.id)!.add(f);
         const tasks = updateTasks.filter((t) => t.afterUpdate === batch);
         for (const [group, members] of groups) {
+          if (failed.has(group)) continue;
           const env: SystemEnv = { runId: meta.id, pack, staged, workDir: store.workDir(pack.manifest.id, group), shim, meter, quota, models, log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`) };
           const updater = members.find((s) => s.update);
           const key = recordKey('update', pack.manifest.id, group, batch, fraction, seed);
@@ -268,15 +273,16 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   return { runDir, builds: store.allBuilds().length, answers: store.allAnswers().length, scores: store.allScores().length };
 }
 
-async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: string, members: SystemUnderTest[], fraction: number, seed: string | number, progress: (m: string) => void): Promise<void> {
+/** Build (or reopen) a group's knowledge base; false when it failed, so the run goes on without it. */
+async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: string, members: SystemUnderTest[], fraction: number, seed: string | number, progress: (m: string) => void): Promise<boolean> {
   const builder = members.find((s) => s.build);
-  if (!builder) return;
+  if (!builder) return true;
   const key = recordKey('build', env.pack.manifest.id, env.pack.manifest.version, group, fraction, seed);
   const done = store.build(key);
   if (done?.ok) {
     progress(`[${env.pack.manifest.id}/${group}] reusing build from ${done.at}`);
     await builder.reopen?.(env);
-    return;
+    return true;
   }
   progress(`[${env.pack.manifest.id}/${group}] building`);
   const mark = meter.mark();
@@ -301,7 +307,11 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
     clearInterval(sampler);
   }
   store.putBuild(rec);
-  if (!rec.ok) throw new Error(`build of ${group} on ${env.pack.manifest.id} failed: ${rec.error}`);
+  if (!rec.ok) {
+    store.log('build failed', { pack: env.pack.manifest.id, group, error: rec.error });
+    for (const s of members) await s.release?.();
+  }
+  return rec.ok;
 }
 
 function kbBytes(group: string, dir: string): number {

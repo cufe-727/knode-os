@@ -98,15 +98,42 @@ export function searchTokens(s: string): string[] {
   return out;
 }
 
-/** The JSON object inside a reply (fenced or not), or null. */
-export function jsonIn(text: string): Record<string, unknown> | null {
-  const stripped = text.replace(/```(?:json)?/gi, '');
-  const start = stripped.indexOf('{');
-  const end = stripped.lastIndexOf('}');
-  if (start < 0 || end <= start) return null;
-  try {
-    return JSON.parse(stripped.slice(start, end + 1)) as Record<string, unknown>;
-  } catch {
-    return null;
+/** Every balanced top-level JSON object in a text that parses, in order. */
+export function jsonObjects(text: string): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  const s = text.replace(/```(?:json)?/gi, '');
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '{') continue;
+    let depth = 0;
+    let inString = false;
+    for (let j = i; j < s.length; j++) {
+      const c = s[j];
+      if (inString) {
+        if (c === '\\') j++;
+        else if (c === '"') inString = false;
+      } else if (c === '"') inString = true;
+      else if (c === '{') depth++;
+      else if (c === '}' && --depth === 0) {
+        try {
+          const v = JSON.parse(s.slice(i, j + 1));
+          if (v && typeof v === 'object' && !Array.isArray(v)) out.push(v as Record<string, unknown>);
+          i = j;
+        } catch {
+          /* not JSON from here */
+        }
+        break;
+      }
+    }
   }
+  return out;
+}
+
+/**
+ * The JSON object a reply carries: the last one holding `items`, `label` or
+ * `choice` when there is one (knode's ask ends its answer with a citations
+ * object of its own), else the last object, else null.
+ */
+export function jsonIn(text: string): Record<string, unknown> | null {
+  const all = jsonObjects(text);
+  return [...all].reverse().find((o) => 'items' in o || 'label' in o || 'choice' in o) ?? all.at(-1) ?? null;
 }

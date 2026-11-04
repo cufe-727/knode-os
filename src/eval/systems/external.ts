@@ -12,7 +12,8 @@ import { SystemEnv, SystemUnderTest } from './types.js';
  * External knowledge-base systems (Microsoft GraphRAG, LightRAG, HippoRAG 2)
  * behind one JSON-lines protocol (docs/design/23 §3). Each runs in its own
  * virtualenv under `~/knode-eval/venvs/<id>` (`knode-os eval systems
- * install`), through an adapter script in `eval/adapters/` that speaks:
+ * install`), through `eval/adapters/<id>_adapter.py` (named so it does not shadow
+ * the package it wraps), which speaks:
  *
  *   → {"id":1,"op":"build","corpus_dir":…,"work_dir":…,"language":…,"api_key":…}
  *   ← {"id":1,"ok":true,"result":{…}}
@@ -55,7 +56,7 @@ class AdapterProcess {
     if (this.child && this.child.exitCode === null) return this.child;
     const python = venvPython(this.id);
     if (!fs.existsSync(python)) throw new Error(`${this.id} is not installed — run \`knode-os eval systems install ${this.id}\``);
-    const child = spawn(python, [path.join(adaptersDir(), `${this.id}.py`)], { env: this.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(python, [path.join(adaptersDir(), `${this.id}_adapter.py`)], { env: this.env, stdio: ['pipe', 'pipe', 'pipe'] });
     child.stdout!.on('data', (d: Buffer) => {
       this.buffer += d.toString('utf8');
       let nl: number;
@@ -164,6 +165,12 @@ export function externalSystem(id: ExternalId): SystemUnderTest {
       const work = path.join(env.workDir, 'index');
       if (!fs.existsSync(work)) throw new Error(`no ${id} index to reopen at ${work}`);
       await adapter(id, env).call('open', { work_dir: work, corpus_dir: env.staged.dir, language: languageOf(env.pack), embedding_dim: env.shim.embedder?.dimensions ?? 1024 }, 30 * 60_000);
+    },
+    async update(files, env) {
+      await adapter(id, env).call('update', {
+        files, corpus_dir: env.staged.dir, work_dir: path.join(env.workDir, 'index'), language: languageOf(env.pack),
+        api_key: formatTag({ system: id, stage: 'update' }), embedding_dim: env.shim.embedder?.dimensions ?? 1024,
+      }, 24 * 3600_000);
     },
     async answer(task, prompt, env) {
       await env.quota.wait();
