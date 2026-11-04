@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,6 +7,7 @@ import { listFiles } from '../pack.js';
 import { citationsIn } from '../prompts.js';
 import type { KnowledgeUnit } from '../types.js';
 import { AGENT_BRIEF } from './agents.js';
+import type { MeterEvent } from '../meter.js';
 import { recordAgent, SystemEnv, SystemUnderTest } from './types.js';
 
 /**
@@ -56,44 +58,75 @@ export function llmWikiBuild(env: SystemEnv, perSession = 3): Promise<{ notes: R
   return buildWiki(env, perSession);
 }
 
+/** How far a build got: the sources ingested from the front of the order, and what each finished session used. */
+interface WikiProgress {
+  order: string;
+  done: number;
+  failed: number;
+  capped: number;
+  sessions: Omit<MeterEvent, 'at'>[];
+}
+
+/**
+ * Each build works in a fixed directory beside a progress file, so a run that
+ * stops mid-build goes on from the last finished session instead of starting
+ * over; the sessions it skips are metered again as replays at their original
+ * cost, as the shim does for cached replies, so the build reports its full cost.
+ */
 async function buildWiki(env: SystemEnv, perSession: number): Promise<{ notes: Record<string, unknown>; kbDir: string }> {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-wiki-'));
-  try {
+  const root = path.join(os.tmpdir(), `knode-eval-wiki-${crypto.createHash('sha256').update(env.workDir).digest('hex').slice(0, 16)}`);
+  const progressFile = `${root}.progress.json`;
+  const order = ingestOrder(env);
+  const fingerprint = crypto.createHash('sha256').update(order.join('\n')).digest('hex');
+  let progress = readProgress(progressFile);
+  if (!progress || progress.order !== fingerprint || !fs.existsSync(path.join(root, 'wiki', 'index.md'))) {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.mkdirSync(root, { recursive: true });
     fs.cpSync(env.staged.dir, path.join(root, 'raw'), { recursive: true });
     fs.mkdirSync(path.join(root, 'wiki', 'sources'), { recursive: true });
     fs.writeFileSync(path.join(root, 'AGENTS.md'), WIKI_SCHEMA + '\n');
     fs.writeFileSync(path.join(root, 'wiki', 'index.md'), '# Index\n');
     fs.writeFileSync(path.join(root, 'wiki', 'log.md'), '# Log\n');
-    const order = ingestOrder(env);
-    let sessions = 0;
-    let failed = 0;
-    let capped = 0;
-    for (let i = 0; i < order.length; i += perSession) {
-      const files = order.slice(i, i + perSession);
-      await env.quota.wait();
-      const r = await runAgent({
-        cwd: root,
-        sandbox: 'workspace-write',
-        model: env.models.model,
-        effort: env.models.buildEffort,
-        maxSteps: 80,
-        timeoutMs: 30 * 60_000,
-        prompt: INGEST_PROMPT(files),
-      });
-      sessions++;
-      if (r.error) failed++;
-      if (r.capped) capped++;
-      recordAgent(env.meter, { system: 'llm-wiki', stage: 'build' }, env.models.model, r);
-      if (sessions % 5 === 0) env.log(`llm-wiki: ${Math.min(order.length, i + perSession)}/${order.length} sources ingested`);
-    }
-    const out = path.join(env.workDir, 'wiki');
-    fs.rmSync(out, { recursive: true, force: true });
-    fs.cpSync(path.join(root, 'wiki'), out, { recursive: true });
-    wikiDirs.set(env.workDir, out);
-    const pages = listFiles(out).filter((f) => f.endsWith('.md'));
-    return { kbDir: out, notes: { sessions, failedSessions: failed, cappedSessions: capped, pages: pages.length } };
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    progress = { order: fingerprint, done: 0, failed: 0, capped: 0, sessions: [] };
+  } else {
+    env.log(`llm-wiki: resuming at ${progress.done}/${order.length} sources`);
+    for (const ev of progress.sessions) env.meter.record({ ...ev, replayed: true });
+  }
+  for (let i = progress.done; i < order.length; i += perSession) {
+    const files = order.slice(i, i + perSession);
+    await env.quota.wait();
+    const r = await runAgent({
+      cwd: root,
+      sandbox: 'workspace-write',
+      model: env.models.model,
+      effort: env.models.buildEffort,
+      maxSteps: 80,
+      timeoutMs: 30 * 60_000,
+      prompt: INGEST_PROMPT(files),
+    });
+    recordAgent(env.meter, { system: 'llm-wiki', stage: 'build' }, env.models.model, r);
+    progress.done = i + files.length;
+    if (r.error) progress.failed++;
+    if (r.capped) progress.capped++;
+    progress.sessions.push({ system: 'llm-wiki', stage: 'build', model: env.models.model || 'codex', ms: r.ms, ok: !r.error, replayed: false, usage: r.usage });
+    fs.writeFileSync(progressFile, JSON.stringify(progress));
+    if (progress.sessions.length % 5 === 0) env.log(`llm-wiki: ${progress.done}/${order.length} sources ingested`);
+  }
+  const out = path.join(env.workDir, 'wiki');
+  fs.rmSync(out, { recursive: true, force: true });
+  fs.cpSync(path.join(root, 'wiki'), out, { recursive: true });
+  wikiDirs.set(env.workDir, out);
+  const pages = listFiles(out).filter((f) => f.endsWith('.md'));
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(progressFile, { force: true });
+  return { kbDir: out, notes: { sessions: progress.sessions.length, failedSessions: progress.failed, cappedSessions: progress.capped, pages: pages.length } };
+}
+
+function readProgress(file: string): WikiProgress | null {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as WikiProgress;
+  } catch {
+    return null;
   }
 }
 

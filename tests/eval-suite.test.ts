@@ -6,7 +6,7 @@ import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { LlmClient } from '../src/llm/client.js';
 import { leakedPaths, pathTokens } from '../src/eval/agent.js';
 import { Meter, parseTag, formatTag } from '../src/eval/meter.js';
-import { loadPack, validatePack } from '../src/eval/pack.js';
+import { loadPack, stageCorpus, validatePack } from '../src/eval/pack.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { buildReportData, writeReport } from '../src/eval/report.js';
 import { runEval } from '../src/eval/run.js';
@@ -17,6 +17,9 @@ import { bootstrapMean, holm, pairedBootstrap, wilson } from '../src/eval/metric
 import { characteristicTerms, directions, profileText } from '../src/eval/metrics/stylometry.js';
 import { exactMatch, extractFinalAnswer, stripMarkers, tokenF1 } from '../src/eval/metrics/text.js';
 import { QuotaGuard } from '../src/eval/quota.js';
+import { llmWikiBuild } from '../src/eval/systems/llm-wiki.js';
+import type { SystemEnv } from '../src/eval/systems/types.js';
+import type { CodexAccount } from '../src/estimate/codex.js';
 
 /** docs/design/23: the benchmark suite end to end on the fixture pack, with no network and no real model. */
 
@@ -278,6 +281,26 @@ describe('a run on the fixture pack', () => {
     expect(md).toContain('Build cost');
     expect(buildReportData(res.runDir).pooled.some((p) => p.system === 'knode-ask')).toBe(true);
   }, 120_000);
+
+  it('goes on with an LLM-wiki build from its last finished session', async () => {
+    const pack = loadPack(packDir);
+    const workDir = path.join(tmp, 'wiki-resume');
+    const meter = new Meter();
+    const lines: string[] = [];
+    const env = (quota: QuotaGuard) => ({ runId: 'resume', pack, staged: stageCorpus(pack), workDir, meter, quota, models: { model: '', buildEffort: 'low' }, log: (m: string) => lines.push(m) }) as unknown as SystemEnv;
+    // the quota runs out before the third session: the build stops with two done
+    let reads = 0;
+    const tight = new QuotaGuard({ policy: { maxWaitMs: -1 }, sleep: async () => {}, read: async () => ({ windows: [{ minutes: 10080, usedPercent: ++reads > 2 ? 99 : 0, resetsAt: null }], limitReached: null }) as unknown as CodexAccount });
+    const wiki = llmWikiBuild;
+    await expect(wiki(env(tight), 2)).rejects.toThrow(/quota guard gave up/);
+    expect(meter.all((e) => e.system === 'llm-wiki' && !e.replayed)).toHaveLength(2);
+    const res = await wiki(env(new QuotaGuard({ enabled: false })), 2);
+    expect(lines).toContain('llm-wiki: resuming at 4/7 sources');
+    expect(res.notes.sessions).toBe(4);
+    expect(meter.all((e) => e.system === 'llm-wiki' && e.replayed)).toHaveLength(2);
+    expect(meter.all((e) => e.system === 'llm-wiki' && !e.replayed)).toHaveLength(4);
+    expect(fs.readdirSync(path.join(res.kbDir, 'sources'))).toHaveLength(7);
+  });
 
   it('runs two packs at once without one closing the other\'s index', async () => {
     const twin = path.join(tmp, 'packs', 'fixture-twin');
