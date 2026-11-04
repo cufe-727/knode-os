@@ -146,6 +146,8 @@ export function registerEvalCommands(program: Command): void {
       });
       const report = writeReport(res.runDir);
       console.log(`\n${res.builds} builds, ${res.answers} answers, ${res.scores} scores\nreport: ${report.md}`);
+      // child processes and embedder timers can keep the loop alive after a run: it is over
+      process.exit(process.exitCode ?? 0);
     });
   evalCmd
     .command('report <runDir>')

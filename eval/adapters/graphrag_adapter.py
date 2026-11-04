@@ -23,6 +23,22 @@ def _env():
     return {**os.environ, "GRAPHRAG_API_KEY": key()}
 
 
+def _point_at_shim(root: Path) -> None:
+    """Each run's shim listens on a new port: rewrite the models' api_base before using a built index."""
+    import yaml
+
+    f = root / "settings.yaml"
+    s = yaml.safe_load(f.read_text())
+    changed = False
+    for group in ("completion_models", "embedding_models"):
+        for m in s.get(group, {}).values():
+            if m.get("api_base") != BASE_URL:
+                m["api_base"] = BASE_URL
+                changed = True
+    if changed:
+        f.write_text(yaml.safe_dump(s, allow_unicode=True, sort_keys=False))
+
+
 def _flat(path: str) -> str:
     return path.replace("/", "__") + ".txt"
 
@@ -76,6 +92,7 @@ def _counts(root: Path) -> dict:
 
 def update(req):
     root = Path(req["work_dir"])
+    _point_at_shim(root)
     for p in req.get("files", []):
         src = Path(req["corpus_dir"]) / p
         if src.exists():
@@ -89,10 +106,12 @@ def update(req):
 def open_(req):
     if not (Path(req["work_dir"]) / "output").exists():
         raise RuntimeError("no GraphRAG index in the work directory")
+    _point_at_shim(Path(req["work_dir"]))
     return {"ok": True}
 
 
 def answer(req):
+    _point_at_shim(Path(req["work_dir"]))
     method = "global" if req.get("mode") == "global" else "local"
     r = subprocess.run([str(BIN), "query", "--root", req["work_dir"], "--method", method, req["question"]], text=True, capture_output=True, env=_env())
     if r.returncode != 0:

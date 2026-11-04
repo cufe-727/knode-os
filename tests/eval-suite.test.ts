@@ -246,10 +246,25 @@ describe('a run on the fixture pack', () => {
     expect(buildReportData(res.runDir).pooled.some((p) => p.system === 'knode-ask')).toBe(true);
   }, 120_000);
 
+  it('runs two packs at once without one closing the other\'s index', async () => {
+    const twin = path.join(tmp, 'packs', 'fixture-twin');
+    fs.cpSync(packDir, twin, { recursive: true });
+    const manifest = JSON.parse(fs.readFileSync(path.join(twin, 'pack.json'), 'utf8'));
+    fs.writeFileSync(path.join(twin, 'pack.json'), JSON.stringify({ ...manifest, id: 'fixture-twin' }));
+    const res = await runEval({
+      packs: [packDir, twin], systems: ['knode-ask', 'rag-hybrid'], runDir: path.join(tmp, 'runs', 'two'), quota: false, packConcurrency: 2,
+      overrides: { chat: backend, judge, embedder },
+    });
+    const store = new RunStore(res.runDir);
+    expect(store.allBuilds().filter((b) => b.system === 'knode').map((b) => [b.pack, b.ok]).sort()).toEqual([['fixture-life', true], ['fixture-twin', true]]);
+    expect(store.allAnswers().filter((a) => a.system === 'knode-ask' && !a.error).map((a) => a.pack).filter((p, i, xs) => xs.indexOf(p) === i).sort()).toEqual(['fixture-life', 'fixture-twin']);
+  }, 120_000);
+
   it('resumes without asking anything again', async () => {
     const calls = backend.calls;
     const judged = judge.calls;
     const before = new RunStore(runDir).allAnswers().length;
+    expect(new RunStore(runDir).allAnswers().filter((a) => a.error).map((a) => `${a.system}/${a.taskId}: ${a.error}`)).toEqual([]);
     await runEval({ packs: [packDir], systems, runDir, quota: false, overrides: { chat: backend, judge, embedder } });
     expect(new RunStore(runDir).allAnswers().length).toBe(before);
     expect(backend.calls).toBe(calls);

@@ -67,8 +67,8 @@ export interface SystemUnderTest {
   exportKnowledge?(env: SystemEnv): Promise<KnowledgeUnit[]>;
   /** Apply an update batch already copied into the staged corpus. */
   update?(files: string[], env: SystemEnv): Promise<void>;
-  /** Close what it holds open before another system of its group needs exclusive access. */
-  release?(): Promise<void>;
+  /** Close what it holds open for this pack before another system of its group needs exclusive access (packs run concurrently). */
+  release?(env: SystemEnv): Promise<void>;
   /** Agents answer one task at a time per pack (an exclusive index). */
   serial?: boolean;
 }

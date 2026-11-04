@@ -44,7 +44,7 @@ Read each one, write its source page, create or update the entity and concept pa
 const wikiDirs = new Map<string, string>();
 
 function wikiDir(env: SystemEnv): string {
-  return wikiDirs.get(env.pack.manifest.id) ?? path.join(env.workDir, 'wiki');
+  return wikiDirs.get(env.workDir) ?? path.join(env.workDir, 'wiki');
 }
 
 /** Sources in the order they were written (date, then path), so the wiki grows the way a person's would. */
@@ -89,7 +89,7 @@ async function buildWiki(env: SystemEnv, perSession: number): Promise<{ notes: R
     const out = path.join(env.workDir, 'wiki');
     fs.rmSync(out, { recursive: true, force: true });
     fs.cpSync(path.join(root, 'wiki'), out, { recursive: true });
-    wikiDirs.set(env.pack.manifest.id, out);
+    wikiDirs.set(env.workDir, out);
     const pages = listFiles(out).filter((f) => f.endsWith('.md'));
     return { kbDir: out, notes: { sessions, failedSessions: failed, cappedSessions: capped, pages: pages.length } };
   } finally {
@@ -109,7 +109,7 @@ export function llmWiki(): SystemUnderTest {
     async reopen(env) {
       const dir = path.join(env.workDir, 'wiki');
       if (!fs.existsSync(dir)) throw new Error(`no llm-wiki build to reopen at ${dir}`);
-      wikiDirs.set(env.pack.manifest.id, dir);
+      wikiDirs.set(env.workDir, dir);
     },
     async answer(task, prompt, env) {
       await env.quota.wait();

@@ -119,7 +119,7 @@ class AdapterProcess {
 const processes = new Map<string, AdapterProcess>();
 
 function adapter(id: ExternalId, env: SystemEnv): AdapterProcess {
-  const key = `${id}|${env.pack.manifest.id}`;
+  const key = `${id}|${env.workDir}`;
   let p = processes.get(key);
   if (!p) {
     p = new AdapterProcess(id, {
@@ -192,13 +192,10 @@ export function externalSystem(id: ExternalId): SystemUnderTest {
       const r = await adapter(id, env).call<{ units: KnowledgeUnit[] }>('export', { work_dir: path.join(env.workDir, 'index'), corpus_dir: env.staged.dir }, 60 * 60_000);
       return r.units;
     },
-    async release() {
-      for (const [key, p] of processes) {
-        if (key.startsWith(`${id}|`)) {
-          p.close();
-          processes.delete(key);
-        }
-      }
+    async release(env) {
+      const key = `${id}|${env.workDir}`;
+      processes.get(key)?.close();
+      processes.delete(key);
     },
   };
 }

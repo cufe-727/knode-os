@@ -24,12 +24,12 @@ async function buildIndex(env: SystemEnv): Promise<RagIndex> {
   const bm25 = new Bm25(chunks, (c) => c.text);
   const vectors = await VectorIndex.build(chunks, (c) => c.text, taggedEmbedder(env, { system: 'rag', stage: 'embed' }));
   const idx = { chunks, bm25, vectors };
-  indexes.set(env.pack.manifest.id, idx);
+  indexes.set(env.workDir, idx);
   return idx;
 }
 
 async function ranked(mode: 'bm25' | 'vector' | 'hybrid', query: string, k: number, env: SystemEnv): Promise<Chunk[]> {
-  const idx = indexes.get(env.pack.manifest.id) ?? (await buildIndex(env));
+  const idx = indexes.get(env.workDir) ?? (await buildIndex(env));
   const byId = new Map(idx.chunks.map((c) => [c.id, c]));
   const lexical = idx.bm25.search(query, k * 3).map((h) => h.item.id);
   if (mode === 'bm25') return lexical.slice(0, k).map((id) => byId.get(id)!);

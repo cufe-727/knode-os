@@ -215,7 +215,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           continue;
         }
         for (const s of members) {
-          for (const other of members) if (other !== s) await other.release?.();
+          for (const other of members) if (other !== s) await other.release?.(env);
           await answerAll(store, meter, env, s, isAgent(s) ? selectTasks(allTasks, suites, opts.agentLimit ?? 30, seed) : allTasks, fraction, seed, opts.answerConcurrency ?? 3, progress);
           await retrieveAll(store, env, s, allTasks, fraction, seed);
         }
@@ -229,7 +229,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
             for (const r of await scoreGeneration(pack, exporter.id, units, judge, taggedEmbedder(env, { system: '__score__', stage: 'embed' }), { seed })) store.putScore(r);
           }
         }
-        for (const s of members) await s.release?.();
+        for (const s of members) await s.release?.(env);
       }
 
       // update batches: apply each to the staged corpus, let every system that can update, then ask its tasks
@@ -259,7 +259,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
             for (const s of members) await s.reopen?.(env).catch(() => {});
           }
           for (const s of members) await answerAll(store, meter, env, s, tasks, fraction, seed, 1, progress, batch);
-          for (const s of members) await s.release?.();
+          for (const s of members) await s.release?.(env);
         }
       }
     };
@@ -323,7 +323,7 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
   store.putBuild(rec);
   if (!rec.ok) {
     store.log('build failed', { pack: env.pack.manifest.id, group, error: rec.error });
-    for (const s of members) await s.release?.();
+    for (const s of members) await s.release?.(env);
   }
   return rec.ok;
 }

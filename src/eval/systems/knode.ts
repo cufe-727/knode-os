@@ -48,11 +48,16 @@ export const KNODE_AGENT_TOOLS = ['knode_search', 'knode_graph_search', 'knode_r
 
 const STAGES = ['extract', 'summary', 'kb-judge', 'document', 'translate'] as const;
 
+/** Document-pass settings of the workspaces under test, recorded in every build's notes. */
+export const KNODE_EVAL_CONCURRENCY = Number(process.env.KNODE_EVAL_KNODE_CONCURRENCY ?? 6);
+export const KNODE_EVAL_BATCH = Number(process.env.KNODE_EVAL_KNODE_BATCH ?? 16);
+
+/** One state per working directory: a run's pack, never another run's of the same pack. */
 function stateFor(env: SystemEnv): KnodeState {
-  let s = states.get(env.pack.manifest.id);
+  let s = states.get(env.workDir);
   if (!s) {
     s = { ws: path.join(env.workDir, 'ws'), ctx: null, pageSources: new Map() };
-    states.set(env.pack.manifest.id, s);
+    states.set(env.workDir, s);
   }
   return s;
 }
@@ -91,6 +96,9 @@ export function evalWorkspaceConfig(env: Pick<SystemEnv, 'shim' | 'pack'>, syste
       judgeLlm: route('kb-judge'),
       translateLlm: route('translate'),
       workers: [],
+      // a benchmark build may use more of the shim's slots than the product default (3 calls, 8 documents a pass)
+      concurrency: KNODE_EVAL_CONCURRENCY,
+      batchSize: KNODE_EVAL_BATCH,
     },
   } as KnodeConfig;
 }
@@ -178,7 +186,7 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
       );
       return {
         kbDir: s.ws,
-        notes: { ...counts, ...passes, wikiPages: pages.length, refined, indexed: synced.indexed, stageMs: { sync: tSync, documentPasses: tPasses, wiki: Date.now() - t0 - tSync - tPasses } },
+        notes: { ...counts, ...passes, passConcurrency: KNODE_EVAL_CONCURRENCY, passBatch: KNODE_EVAL_BATCH, wikiPages: pages.length, refined, indexed: synced.indexed, stageMs: { sync: tSync, documentPasses: tPasses, wiki: Date.now() - t0 - tSync - tPasses } },
       };
     },
     async reopen(env) {
@@ -188,8 +196,8 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
       fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(evalWorkspaceConfig(env), null, 2));
       readPageSources(s);
     },
-    async release() {
-      for (const s of states.values()) await close(s);
+    async release(env) {
+      await close(stateFor(env));
     },
     ...extra,
   };
