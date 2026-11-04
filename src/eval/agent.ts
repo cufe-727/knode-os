@@ -1,0 +1,225 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import type { ChildProcess } from 'node:child_process';
+import type { LlmEffort } from '../config.js';
+import { cliCommand, effortFor, runProcess } from '../llm/cli.js';
+import { CallUsage, readCodexEvents } from '../llm/usage.js';
+import { EVAL_HOME } from './pack.js';
+
+/**
+ * One Codex agent session over a folder (docs/design/23 §3): the grep
+ * baseline, the agents that read a generated wiki, the agent with knode's
+ * MCP tools, and the llm-wiki builder are all this one runner with a
+ * different folder, sandbox and tool set — so the comparison is between
+ * knowledge sources, not between agent harnesses.
+ *
+ * `codex exec` has no turn limit; the runner counts the session's command
+ * and tool events as they stream and stops it at the cap. Codex's read-only
+ * sandbox blocks writes, not reads, so every command line is also audited:
+ * a path outside the session's folder that leads into the benchmark's own
+ * files (packs, runs — the gold) voids the answer.
+ */
+
+export interface McpServerSpec {
+  name: string;
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+  /** Only these tools are offered (Codex `enabled_tools`). */
+  enabledTools?: string[];
+}
+
+export interface AgentRunOptions {
+  cwd: string;
+  prompt: string;
+  sandbox: 'read-only' | 'workspace-write';
+  model?: string;
+  effort?: LlmEffort;
+  /** Command and tool events before the session is stopped (default 25). */
+  maxSteps?: number;
+  timeoutMs?: number;
+  command?: string;
+  mcp?: McpServerSpec;
+  /** Extra roots a command may touch without voiding the answer. */
+  allowRoots?: string[];
+}
+
+export interface AgentRunResult {
+  text: string;
+  usage: CallUsage | null;
+  /** Command lines the agent ran, in order. */
+  commands: string[];
+  toolCalls: number;
+  capped: boolean;
+  /** Paths outside the folder that lead into benchmark files. */
+  leaked: string[];
+  /** Corpus files the agent's commands named, relative to cwd. */
+  filesTouched: string[];
+  ms: number;
+  error?: string;
+}
+
+const toml = (v: unknown) => JSON.stringify(v);
+
+export function agentArgs(opts: AgentRunOptions, outFile: string): string[] {
+  const args = [
+    'exec', '--ignore-user-config', '--ephemeral', '-c', 'features.plugins=false', '-c', 'analytics.enabled=false',
+    '-c', 'web_search="disabled"', '--skip-git-repo-check', '--sandbox', opts.sandbox, '--cd', opts.cwd,
+    '--output-last-message', outFile, '--json',
+  ];
+  if (opts.model) args.push('--model', opts.model);
+  const effort = effortFor('codex-cli', opts.effort);
+  if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);
+  if (opts.mcp) {
+    const key = `mcp_servers.${opts.mcp.name}`;
+    args.push('-c', `${key}.command=${toml(opts.mcp.command)}`, '-c', `${key}.args=${toml(opts.mcp.args)}`);
+    if (opts.mcp.env && Object.keys(opts.mcp.env).length) {
+      args.push('-c', `${key}.env={${Object.entries(opts.mcp.env).map(([k, v]) => `${k}=${toml(v)}`).join(',')}}`);
+    }
+    if (opts.mcp.enabledTools?.length) args.push('-c', `${key}.enabled_tools=${toml(opts.mcp.enabledTools)}`);
+    args.push('-c', `${key}.default_tools_approval_mode="approve"`, '-c', `${key}.tool_timeout_sec=300`);
+  }
+  args.push('-');
+  return args;
+}
+
+/** Path-like tokens of a command line: absolute, home-relative, or climbing out with `..`. */
+export function pathTokens(command: string): string[] {
+  const out: string[] = [];
+  for (const m of command.matchAll(/(?:^|[\s'"=(:])((?:\/|~\/|\.\.(?:\/|$))[^\s'"|;&<>()]*)/g)) out.push(m[1]);
+  return out;
+}
+
+const SYSTEM_PREFIXES = ['/usr/', '/bin/', '/sbin/', '/opt/homebrew/', '/dev/', '/System/', '/Library/', '/private/etc/', '/etc/'];
+
+/**
+ * Which of a command's paths reach benchmark files: anything under the eval
+ * home (packs, runs, sources) or the person's home outside the folder.
+ * System binaries and devices are fine; so is the folder itself.
+ */
+export function leakedPaths(command: string, cwd: string, allowRoots: string[] = []): string[] {
+  const root = path.resolve(cwd);
+  const home = os.homedir();
+  const leaks: string[] = [];
+  for (const tok of pathTokens(command)) {
+    const expanded = tok.startsWith('~/') ? path.join(home, tok.slice(2)) : tok;
+    const abs = path.resolve(root, expanded);
+    if (abs === root || abs.startsWith(root + path.sep)) continue;
+    if (allowRoots.some((r) => abs === r || abs.startsWith(r + path.sep))) continue;
+    if (SYSTEM_PREFIXES.some((p) => abs.startsWith(p))) continue;
+    // the staged folder's parent holds nothing but the folder, so climbing one level is harmless
+    if (abs === path.dirname(root)) continue;
+    if (abs.startsWith(EVAL_HOME) || abs.startsWith(home) || abs.includes('knode-eval')) leaks.push(tok);
+  }
+  return leaks;
+}
+
+/** Corpus-relative files a command names (rg/grep/cat/sed/head arguments that exist under cwd). */
+export function touchedFiles(command: string, cwd: string): string[] {
+  const out = new Set<string>();
+  for (const tok of command.split(/[\s'"|;&<>()]+/)) {
+    if (!tok || tok.startsWith('-')) continue;
+    const abs = path.resolve(cwd, tok);
+    if (!abs.startsWith(path.resolve(cwd) + path.sep)) continue;
+    try {
+      if (fs.statSync(abs).isFile()) out.add(path.relative(cwd, abs).split(path.sep).join('/'));
+    } catch {
+      /* not a file */
+    }
+  }
+  return [...out];
+}
+
+interface CodexItem {
+  type?: string;
+  command?: string;
+  server?: string;
+  tool?: string;
+  arguments?: unknown;
+}
+
+export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-agent-out-'));
+  const outFile = path.join(outDir, 'answer.txt');
+  const maxSteps = opts.maxSteps ?? 25;
+  const commands: string[] = [];
+  const leaked: string[] = [];
+  const touched = new Set<string>();
+  let steps = 0;
+  let capped = false;
+  let child: ChildProcess | null = null;
+  let buffer = '';
+  const t0 = Date.now();
+
+  const onLine = (line: string) => {
+    if (!line.startsWith('{')) return;
+    let ev: { type?: string; item?: CodexItem };
+    try {
+      ev = JSON.parse(line) as { type?: string; item?: CodexItem };
+    } catch {
+      return;
+    }
+    if (ev.type !== 'item.started' || !ev.item) return;
+    const item = ev.item;
+    if (item.type === 'command_execution' && typeof item.command === 'string') {
+      steps++;
+      commands.push(item.command);
+      leaked.push(...leakedPaths(item.command, opts.cwd, opts.allowRoots));
+      for (const f of touchedFiles(item.command, opts.cwd)) touched.add(f);
+    } else if (item.type === 'mcp_tool_call') {
+      steps++;
+      commands.push(`mcp:${item.server ?? ''}.${item.tool ?? ''} ${JSON.stringify(item.arguments ?? {}).slice(0, 300)}`);
+    }
+    if (steps > maxSteps && !capped) {
+      capped = true;
+      child?.kill('SIGTERM');
+    }
+  };
+
+  try {
+    let stdout = '';
+    let error: string | undefined;
+    try {
+      const r = await runProcess(cliCommand('codex-cli', opts.command ?? ''), agentArgs(opts, outFile), opts.prompt, opts.timeoutMs ?? 15 * 60_000, {
+        cwd: opts.cwd,
+        onSpawn: (c) => (child = c),
+        onStdout: (chunk) => {
+          buffer += chunk;
+          let nl: number;
+          while ((nl = buffer.indexOf('\n')) >= 0) {
+            onLine(buffer.slice(0, nl));
+            buffer = buffer.slice(nl + 1);
+          }
+        },
+      });
+      stdout = r.stdout;
+      if (r.code !== 0 && !capped) error = `codex exec exited with ${r.code}: ${readCodexEvents(r.stdout).error ?? r.stderr.slice(-300)}`;
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+    const events = readCodexEvents(stdout);
+    const text = fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8').trim() : '';
+    return {
+      text,
+      usage: events.usage,
+      commands,
+      toolCalls: steps,
+      capped,
+      leaked: [...new Set(leaked)],
+      filesTouched: [...touched],
+      ms: Date.now() - t0,
+      ...(error && !text ? { error } : {}),
+    };
+  } finally {
+    fs.rmSync(outDir, { recursive: true, force: true });
+  }
+}
+
+/** A copy of `src` in a fresh temp directory with nothing beside it, for an agent to read. */
+export function isolatedCopy(src: string, name = 'kb'): { dir: string; cleanup: () => void } {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-ro-'));
+  const dir = path.join(root, name);
+  fs.cpSync(src, dir, { recursive: true });
+  return { dir, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+}
