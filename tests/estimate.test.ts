@@ -112,6 +112,12 @@ describe('a refusal for usage', () => {
     expect(isRefusal(cursor)).toBe(true);
     expect(isRefusal('connection reset by peer')).toBe(false);
   });
+
+  it('Claude\'s "hit your weekly limit" is a limit too', () => {
+    const claude = "claude CLI error: You've hit your weekly limit · resets 6am (Asia/Shanghai)";
+    expect(classifyFailure(claude)).toBe('transient');
+    expect(isRefusal(claude)).toBe(true);
+  });
 });
 
 describe('the call ledger', () => {
