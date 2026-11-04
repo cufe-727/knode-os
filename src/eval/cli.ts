@@ -5,6 +5,7 @@ import type { LlmEffort } from '../config.js';
 import { LlmClient } from '../llm/client.js';
 import { exportAudit, importAudit } from './audit.js';
 import { installExternal } from './install.js';
+import { QuotaGuard, withRefusalRetry } from './quota.js';
 import { loadPack, packsDir, validatePack } from './pack.js';
 import { listRecipes, recipe } from './packs/index.js';
 import './packs/recipes.js';
@@ -53,7 +54,8 @@ export function registerEvalCommands(program: Command): void {
     .action(async (id: string, opts) => {
       const r = recipe(id);
       const out = path.resolve(opts.out ?? path.join(packsDir(), id));
-      const author = r.needsAuthor ? new LlmClient({ provider: opts.author, baseUrl: '', apiKey: '', model: opts.authorModel, cliPath: '', cliTimeoutMs: 900_000 }) : undefined;
+      const guard = new QuotaGuard({ enabled: false, log: (m) => console.log(`  ${m}`) });
+      const author = r.needsAuthor ? withRefusalRetry(new LlmClient({ provider: opts.author, baseUrl: '', apiKey: '', model: opts.authorModel, cliPath: '', cliTimeoutMs: 900_000 }), guard) : undefined;
       const issues = await r.build(out, { limit: opts.limit ? Number(opts.limit) : undefined, seed: opts.seed, author, options: JSON.parse(opts.options), log: (m) => console.log(`  ${m}`) });
       for (const w of issues.warnings) console.log(`  warning: ${w}`);
       if (issues.errors.length) {
@@ -114,6 +116,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--fraction <f>', 'share of the corpus to use (scale curves)', '1')
     .option('--seed <seed>', 'sampling seed', '0')
     .option('--slots <n>', 'concurrent model calls', '6')
+    .option('--pack-concurrency <n>', 'packs worked on at once', '1')
     .option('--embedding-cap <tokens>', 'stop embedding after this many tokens in the run')
     .option('--no-quota', 'do not pause for Codex plan windows')
     .option('--skip-scoring', 'answer only; score later with `eval run --run-dir`')
@@ -135,6 +138,7 @@ export function registerEvalCommands(program: Command): void {
         fraction: Number(opts.fraction),
         seed: opts.seed,
         slots: Number(opts.slots),
+        packConcurrency: Number(opts.packConcurrency),
         embeddingTokenCap: opts.embeddingCap ? Number(opts.embeddingCap) : undefined,
         quota: opts.quota,
         skipScoring: opts.skipScoring,

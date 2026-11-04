@@ -1,5 +1,6 @@
 import { CodexAccount, readCodexAccount } from '../estimate/codex.js';
 import { isRefusal } from '../estimate/ledger.js';
+import type { LlmClient } from '../llm/client.js';
 
 /**
  * Keeps a long benchmark run inside the person's plans (docs/design/23 §4).
@@ -109,4 +110,18 @@ export class QuotaGuard {
       }
     }
   }
+}
+
+/**
+ * A client whose calls wait out a refused call (a plan's rate or usage
+ * limit) instead of failing — for the pack author and anything else that
+ * talks to a plan-limited CLI for hours.
+ */
+export function withRefusalRetry(client: LlmClient, guard: QuotaGuard, tries = 72): LlmClient {
+  const complete = client.complete.bind(client);
+  const completeJson = client.completeJson.bind(client);
+  return Object.assign(Object.create(client) as LlmClient, {
+    complete: (messages: Parameters<LlmClient['complete']>[0], opts?: Parameters<LlmClient['complete']>[1]) => guard.retryRefused(() => complete(messages, opts), tries),
+    completeJson: <T>(messages: Parameters<LlmClient['completeJson']>[0], opts?: Parameters<LlmClient['completeJson']>[1]) => guard.retryRefused(() => completeJson<T>(messages, opts), tries),
+  });
 }

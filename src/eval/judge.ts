@@ -84,7 +84,8 @@ export class Judge {
       );
       let reply: { verdicts?: (V & { id?: string })[] };
       try {
-        reply = this.opts.quota ? await this.opts.quota.retryRefused(call) : await call();
+        // a plan's limit can last hours: wait it out (6 h at the guard's 5-minute poll) rather than lose the batch
+        reply = this.opts.quota ? await this.opts.quota.retryRefused(call, 72) : await call();
         this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: true, replayed: false, usage });
       } catch (err) {
         this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: false, replayed: false, usage });

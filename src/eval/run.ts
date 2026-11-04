@@ -53,6 +53,8 @@ export interface RunOptions {
   seed?: string | number;
   slots?: number;
   answerConcurrency?: number;
+  /** Packs worked on at once (each builds and answers on its own; the shim's slots bound the model calls). */
+  packConcurrency?: number;
   quota?: boolean;
   embeddingTokenCap?: number;
   /** Skip scoring (answers only) or answering (score what is there). */
@@ -172,11 +174,15 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const loaded: { pack: LoadedPack; staged: StagedCorpus }[] = [];
 
   try {
-    for (const packDir of opts.packs) {
-      const pack = loadPack(packDir);
+    // every pack is validated before anything is spent on any of them
+    const packs = opts.packs.map((dir) => {
+      const pack = loadPack(dir);
       const issues = validatePack(pack);
       if (issues.errors.length) throw new Error(`pack ${pack.manifest.id} is invalid:\n- ${issues.errors.slice(0, 20).join('\n- ')}`);
       for (const w of issues.warnings) store.log('pack warning', { pack: pack.manifest.id, warning: w });
+      return pack;
+    });
+    const runPack = async (pack: LoadedPack) => {
       const staged = stageCorpus(pack, { fraction, seed });
       loaded.push({ pack, staged });
       corpusDocs.set(pack.manifest.id, new Set(staged.docs.map((d) => d.path)));
@@ -256,7 +262,11 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           for (const s of members) await s.release?.();
         }
       }
-    }
+    };
+    await mapLimit(packs, opts.packConcurrency ?? 1, runPack, (err, pack) => {
+      progress(`pack ${pack.manifest.id} stopped: ${err instanceof Error ? err.message : String(err)}`);
+      store.log('pack failed', { pack: pack.manifest.id, error: err instanceof Error ? err.message : String(err) });
+    });
 
     if (!opts.skipScoring) {
       const answers = store.allAnswers().filter((a) => !store.score(recordKey('score', a.pack, a.system, a.taskId, 'latency_ms')));

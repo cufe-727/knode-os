@@ -104,7 +104,8 @@ export function llmWiki(): SystemUnderTest {
     group: 'llm-wiki',
     kind: 'kb',
     answers: true,
-    build: (env) => buildWiki(env, 3),
+    // five sources a session: the pattern's ingest, at a cost a pilot can carry (each session is a long agent run)
+    build: (env) => buildWiki(env, Number(process.env.KNODE_EVAL_WIKI_PER_SESSION ?? 5)),
     async reopen(env) {
       const dir = path.join(env.workDir, 'wiki');
       if (!fs.existsSync(dir)) throw new Error(`no llm-wiki build to reopen at ${dir}`);
