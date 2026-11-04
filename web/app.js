@@ -1600,8 +1600,8 @@ function paintTasksJobs(t) {
     return `<div class="job-row" data-job="${esc(j.id)}" data-kind="${esc(j.kind)}">
       <span class="kind-pill k-${esc(j.kind)}">${esc(JOB_KIND_WORDS[j.kind] ?? j.kind)}</span>
       <div class="job-main"><a href="#" class="job-title">${esc(j.title)}</a>
-        <div class="hint">${statusChip(j.status)}${j.stage && j.kind !== 'ask' ? ` ${esc(j.stage)}` : ''} · ${when}${j.outputPath ? ` · <a href="#" class="mono" data-open="${esc(j.outputPath)}">${esc(baseName(j.outputPath))}</a>` : ''}</div>
-        ${j.error ? `<div class="hint bad">${esc(j.error.slice(0, 220))}</div>` : ''}</div>
+        <div class="hint">${j.pausedUntil ? pauseChip({ until: j.pausedUntil, reason: j.pauseReason ?? '' }) : statusChip(j.status)}${j.stage && j.kind !== 'ask' ? ` ${esc(j.stage)}` : ''} · ${when}${j.outputPath ? ` · <a href="#" class="mono" data-open="${esc(j.outputPath)}">${esc(baseName(j.outputPath))}</a>` : ''}</div>
+        ${j.error ? `<div class="hint${j.pausedUntil ? '' : ' bad'}">${esc(j.error.slice(0, 220))}</div>` : ''}</div>
       ${action ? `<button type="button" class="row-action" data-job-action="${action.verb}">${action.label}</button>` : ''}
     </div>`;
   }).join('');
@@ -1628,10 +1628,11 @@ function paintTasksJobs(t) {
 
 const LIVE_JOB = new Set(['queued', 'running', 'validating', 'waiting']);
 
-/** What a job row offers: stop what runs, run again what failed — if this account may. */
+/** What a job row offers: run now what waits out a pause, stop what runs, run again what failed — if this account may. */
 function jobAction(job) {
   if (job.kind === 'ask') return job.status === 'running' && mayUse('ask') ? { verb: 'cancel', label: 'Stop' } : null;
   if (!mayUse('knowledge')) return null;
+  if (job.pausedUntil) return { verb: 'resume', label: 'Resume now' };
   if (LIVE_JOB.has(job.status)) return { verb: 'cancel', label: 'Cancel' };
   if (job.status === 'failed' || job.status === 'cancelled') return { verb: 'retry', label: 'Retry' };
   return null;
@@ -4961,15 +4962,28 @@ async function loadResearchJobs() {
       const what = `${esc(j.kind)} · ${esc(j.target ?? j.query ?? '')}`;
       const when = new Date(j.finishedAt ?? j.startedAt ?? j.createdAt).toLocaleString();
       const actions = [];
-      if (j.status === 'queued' || j.status === 'running') actions.push(`<button data-cancel="${esc(j.id)}">cancel</button>`);
-      if (j.status === 'failed' || j.status === 'cancelled') actions.push(`<button data-retry="${esc(j.id)}">retry</button>`);
+      // a study's pages are archived and removed with their study, on its page
+      const own = !j.payload?.study;
+      if (j.pause) actions.push(`<button data-act="resume">resume now</button>`);
+      if (j.status === 'queued' || j.status === 'running') actions.push(`<button data-act="cancel">cancel</button>`);
+      if (j.status === 'failed' || j.status === 'cancelled') actions.push(`<button data-act="retry">retry</button>`);
+      if (own && ['done', 'failed', 'cancelled'].includes(j.status)) actions.push(`<button data-act="archive" title="take it off this list; its page stays">archive</button>`);
+      if (own && (j.status === 'failed' || j.status === 'cancelled')) actions.push(`<button data-act="remove" title="remove the job and its session log">remove</button>`);
       actions.push(`<button data-log="${esc(j.id)}">log</button>`);
-      div.innerHTML = `<span class="jstatus ${esc(j.status)}">${esc(j.status)}</span>
+      div.innerHTML = `${j.pause ? pauseChip(j.pause) : `<span class="jstatus ${esc(j.status)}">${esc(j.status)}</span>`}
         <span>${what}${j.outputPath ? ` → ${pageLink(j.outputPath)}` : ''} <span class="hint mono">${when}${j.turns ? ` · ${j.turns} turns` : ''}${j.agent ? ` · ${esc(j.agent)}` : ''}</span></span>
         <span class="jactions">${actions.join('')}</span>
         ${j.error ? `<div class="jerr">${esc(j.error)}</div>` : ''}`;
-      div.querySelector('button[data-cancel]')?.addEventListener('click', async () => { await api(`/api/research/jobs/${j.id}/cancel`, { method: 'POST' }); loadResearchJobs(); });
-      div.querySelector('button[data-retry]')?.addEventListener('click', async () => { await api(`/api/research/jobs/${j.id}/retry`, { method: 'POST' }); loadResearchJobs(); });
+      div.querySelectorAll('button[data-act]').forEach((b) => b.addEventListener('click', async () => {
+        const act = b.dataset.act;
+        if (act === 'remove' && !confirm('Remove this job and its session log? A page it wrote stays.')) return;
+        try {
+          await api(`/api/research/jobs/${j.id}${act === 'remove' ? '' : `/${act}`}`, { method: act === 'remove' ? 'DELETE' : 'POST' });
+        } catch (e) {
+          toast(`${act}: ${e.message}`, 5000);
+        }
+        loadResearchJobs();
+      }));
       div.querySelector('button[data-log]')?.addEventListener('click', async () => {
         const full = await api(`/api/research/jobs/${j.id}?log=1`);
         const pre = document.createElement('pre');
@@ -7543,10 +7557,27 @@ $('#clear-workspace-form').addEventListener('submit', async (event) => {
 
 const STUDY_STEP_LABELS = { seed: 'Capture seed sources', collect: 'Collect material', index: 'Index what was collected', pages: 'Write the pages', report: 'Write the report' };
 const STUDY_LIVE = new Set(['queued', 'running', 'validating', 'waiting']);
-const study = { id: null, view: null, timer: null, options: null, busy: false };
+const study = { id: null, view: null, timer: null, options: null, busy: false, archived: false };
 
 const lines = (v) => String(v || '').split('\n').map((x) => x.trim()).filter(Boolean);
 const statusChip = (s) => `<span class="jstatus ${esc(s)}">${esc(s)}</span>`;
+
+const PAUSE_WORDS = { quota: 'usage limit', transient: 'agent busy', setup: 'agent not set up' };
+
+/** When a pause ends: the time today, else the day and time. */
+function pauseEnd(iso) {
+  const d = new Date(iso);
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+/** "paused until 01:32 · usage limit": a job that waits out a spent limit (docs/design/22), the agent's words on hover. */
+function pauseChip(pause) {
+  if (!pause) return '';
+  const why = PAUSE_WORDS[pause.kind] ?? '';
+  return `<span class="jstatus paused" title="${esc(pause.reason || '')}">paused until ${esc(pauseEnd(pause.until))}${why ? ` · ${esc(why)}` : ''}</span>`;
+}
 
 async function loadStudies() {
   await loadStudyOptions().catch((e) => toast(`research options: ${e.message}`));
@@ -7582,15 +7613,20 @@ async function loadStudyOptions() {
 
 async function loadStudyList() {
   const el = $('#study-items');
+  const toggle = $('#btn-study-archived');
+  toggle.setAttribute('aria-pressed', String(study.archived));
+  toggle.textContent = study.archived ? '← Studies' : 'Archived';
   try {
-    const rows = await api('/api/research/studies?limit=80');
+    const rows = await api(`/api/research/studies?limit=80${study.archived ? '&archived=1' : ''}`);
     if (!rows.length) {
-      el.innerHTML = '<p class="hint">No studies yet. Describe a topic on the right to start one.</p>';
+      el.innerHTML = study.archived
+        ? '<p class="hint">Nothing archived. Archive a finished study from its page to take it off the list.</p>'
+        : '<p class="hint">No studies yet. Describe a topic on the right to start one.</p>';
       return;
     }
     el.innerHTML = rows.map((r) => `<button type="button" class="study-item${r.id === study.id ? ' active' : ''}" data-study="${esc(r.id)}">
         <span class="study-item-title">${esc(r.title || r.topic)}</span>
-        <span class="study-item-meta">${statusChip(r.status)} <span class="hint">${esc(r.stage)} · ${esc(new Date(r.createdAt).toLocaleDateString())}${r.pages ? ` · ${r.pages} pages` : ''}</span></span>
+        <span class="study-item-meta">${r.pause ? pauseChip(r.pause) : statusChip(r.status)} <span class="hint">${esc(r.stage)} · ${esc(new Date(r.createdAt).toLocaleDateString())}${r.pages ? ` · ${r.pages} pages` : ''}</span></span>
       </button>`).join('');
     el.querySelectorAll('[data-study]').forEach((b) => b.addEventListener('click', () => openStudy(b.dataset.study)));
   } catch (e) {
@@ -7615,6 +7651,10 @@ function showComposer() {
 $('#btn-study-new').addEventListener('click', () => {
   showComposer();
   $('#study-topic').focus();
+});
+$('#btn-study-archived').addEventListener('click', () => {
+  study.archived = !study.archived;
+  loadStudyList();
 });
 $('#study-mode').addEventListener('change', () => {
   const deep = $('#study-mode').value === 'deep-research';
@@ -7923,12 +7963,16 @@ function renderStudy(view) {
   el.innerHTML = `<div class="study-card">
     <div class="study-head">
       <div><p class="section-index">STUDY · ${esc(job.id)}</p><h3 class="study-title">${esc(p.brief.title)}</h3>
-        <p class="hint">${statusChip(job.status)} ${esc(p.stage)} · ${runner} · web ${p.sources.web ? 'on' : 'off'}${job.startedAt ? ` · started ${esc(new Date(job.startedAt).toLocaleString())}` : ''}${job.finishedAt ? ` · finished ${esc(new Date(job.finishedAt).toLocaleString())}` : ''}</p>
-        ${job.error ? `<p class="jerr">${esc(job.error)}</p>` : ''}
+        <p class="hint">${statusChip(job.status)} ${esc(p.stage)} · ${runner} · web ${p.sources.web ? 'on' : 'off'}${job.startedAt ? ` · started ${esc(new Date(job.startedAt).toLocaleString())}` : ''}${job.finishedAt ? ` · finished ${esc(new Date(job.finishedAt).toLocaleString())}` : ''}${view.archivedAt ? ` · archived ${esc(new Date(view.archivedAt).toLocaleDateString())}` : ''}</p>
+        ${view.pause ? `<p class="hint">${pauseChip(view.pause)} — it goes on by itself then, from where it stopped. <span class="mono">${esc(view.pause.reason)}</span></p>` : job.error ? `<p class="jerr">${esc(job.error)}</p>` : ''}
       </div>
       <div class="study-head-actions">
+        ${view.pause ? '<button type="button" data-act="resume" title="the limit is lifted: run it now instead of when the pause ends">Resume now</button>' : ''}
         ${live ? '<button type="button" data-act="cancel">Cancel</button>' : ''}
         ${job.status === 'failed' || job.status === 'cancelled' ? '<button type="button" data-act="retry">Retry</button>' : ''}
+        ${!live && !view.archivedAt ? '<button type="button" data-act="archive" title="take it off the list; its report, pages and sources stay where they are">Archive</button>' : ''}
+        ${view.archivedAt ? '<button type="button" data-act="unarchive">Unarchive</button>' : ''}
+        ${job.status === 'failed' || job.status === 'cancelled' ? '<button type="button" data-act="remove" title="remove the study\'s jobs and session logs; what it wrote into the knowledge base stays">Remove</button>' : ''}
         ${tiers.pages.quarantined ? `<button type="button" data-act="promote-pages" title="mark the pages and the report trusted: their facts become the knowledge base's position">Promote pages (${tiers.pages.quarantined})</button>` : ''}
         ${tiers.sources.quarantined ? `<button type="button" data-act="promote-sources" title="mark the captured sources, the notes and the register trusted">Promote sources (${tiers.sources.quarantined})</button>` : ''}
         ${view.reportExists || view.pages.some((pg) => pg.status === 'done') ? `<a class="study-link" href="${esc(studyExportHref(job.id))}" target="_blank" rel="noopener" title="the report and its pages as one HTML file, its charts as figures: read it, save it, or print it to PDF">Export ↗</a>` : ''}
@@ -7939,7 +7983,7 @@ function renderStudy(view) {
       ${view.reportExists ? `<div class="rpage"><span><a href="#" data-open="${esc(view.reportPath)}">${esc(p.brief.report.title)}</a> <span class="hint mono">${esc(view.reportPath)}</span></span>${trustChip(view.reportTrust)}<span></span></div>` : `<p class="hint">${esc(view.reportPath)} — written once the pages are done.</p>`}
     </div>
     <div class="study-block"><h4>Pages</h4>
-      ${view.pages.map((pg) => `<div class="rpage"><span>${pg.status === 'done' ? `<a href="#" data-open="${esc(pg.path)}">${esc(pg.title)}</a>` : esc(pg.title)} <span class="hint mono">${esc(pg.path.split('/').pop())}${pg.warnings.length ? ` · ${pg.warnings.length} warnings` : ''}</span>${pg.error ? `<span class="jerr">${esc(pg.error.slice(0, 300))}</span>` : ''}</span>${trustChip(pg.trust)}${statusChip(pg.status)}</div>`).join('')}
+      ${view.pages.map((pg) => `<div class="rpage"><span>${pg.status === 'done' ? `<a href="#" data-open="${esc(pg.path)}">${esc(pg.title)}</a>` : esc(pg.title)} <span class="hint mono">${esc(pg.path.split('/').pop())}${pg.warnings.length ? ` · ${pg.warnings.length} warnings` : ''}</span>${pg.error ? `<span class="jerr">${esc(pg.error.slice(0, 300))}</span>` : ''}</span>${trustChip(pg.trust)}${pg.pause ? pauseChip(pg.pause) : statusChip(pg.status)}</div>`).join('')}
     </div>
     <div class="study-block"><h4>Sources <span class="hint">· ${view.captures.length} captured into the knowledge base${view.captures.length ? ` · ${sourcesTier(tiers.sources)}` : ''} · register ${pageLink(view.registerPath)}</span></h4>
       ${view.captures.length ? `<table class="study-table"><thead><tr><th>Title</th><th>Site</th><th>Published</th><th>Type</th><th>File</th></tr></thead><tbody>${view.captures.map((c) => `<tr>
@@ -7971,6 +8015,21 @@ function renderStudy(view) {
   el.querySelector('[data-act="retry"]')?.addEventListener('click', () => act('retry', async () => {
     await api(`/api/research/studies/${job.id}/retry`, { method: 'POST' });
     openStudy(job.id);
+    loadStudyList();
+  }));
+  for (const verb of ['resume', 'archive', 'unarchive']) {
+    el.querySelector(`[data-act="${verb}"]`)?.addEventListener('click', () => act(verb, async () => {
+      await api(`/api/research/studies/${job.id}/${verb}`, { method: 'POST' });
+      if (verb === 'archive') toast('Archived — the Archived list keeps it');
+      openStudy(job.id);
+      loadStudyList();
+    }));
+  }
+  el.querySelector('[data-act="remove"]')?.addEventListener('click', () => act('remove', async () => {
+    if (!confirm('Remove this study? Its jobs and session logs go; the pages, notes and sources it already wrote stay in the knowledge base.')) return;
+    const r = await api(`/api/research/studies/${job.id}`, { method: 'DELETE' });
+    toast(r.kept?.length ? `Removed — kept in the knowledge base: ${r.kept.length} file(s) and folders` : 'Removed', 4000);
+    showComposer();
     loadStudyList();
   }));
   for (const [sel, what] of [['[data-act="promote-pages"]', 'pages'], ['[data-act="promote-sources"]', 'sources']]) {

@@ -22,6 +22,10 @@ struct StudiesView: View {
     @State private var poller: Task<Void, Never>?
     /// The draft whose Start is being confirmed, with its estimate.
     @State private var confirming: StudyDetail?
+    /// The list shows the archived studies instead.
+    @State private var showArchived = false
+    /// The study whose Remove is being confirmed.
+    @State private var removing: StudyDetail?
 
     private let stepLabels = ["seed": "Capture seed sources", "collect": "Collect material", "index": "Index what was collected", "pages": "Write the pages", "report": "Write the report"]
 
@@ -67,6 +71,11 @@ struct StudiesView: View {
             guard pending != nil else { return }
             Task { await takeHandOffs() }
         }
+        .confirmationDialog(L("Remove this study?"), isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), presenting: removing) { d in
+            Button(L("Remove"), role: .destructive) { Task { await remove(d) } }
+        } message: { _ in
+            Text(L("Its jobs and session logs go; the pages, notes and sources it already wrote stay in the knowledge base."))
+        }
         // a study spends an agent's quota for an hour or more: what it would take, before it starts
         .sheet(isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
             if let d = confirming {
@@ -86,8 +95,14 @@ struct StudiesView: View {
     private var list: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(L("Studies")).font(.headline)
+                Text(showArchived ? L("Archived") : L("Studies")).font(.headline)
                 Spacer()
+                Button(showArchived ? L("Studies") : L("Archived")) {
+                    showArchived.toggle()
+                    Task { await load() }
+                }
+                .controlSize(.small)
+                .help(L("Finished studies taken off the list"))
                 Button {
                     poller?.cancel()
                     selected = nil
@@ -101,7 +116,7 @@ struct StudiesView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 6) {
                     if studies.isEmpty {
-                        Text(L("No studies yet. Describe a topic on the right to start one.")).font(.callout).foregroundStyle(.secondary)
+                        Text(showArchived ? L("Nothing archived. Archive a finished study from its page to take it off the list.") : L("No studies yet. Describe a topic on the right to start one.")).font(.callout).foregroundStyle(.secondary)
                     }
                     ForEach(studies) { s in
                         Button {
@@ -110,7 +125,7 @@ struct StudiesView: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(s.title.isEmpty ? s.topic : s.title).font(.system(size: 12.5, weight: .medium)).lineLimit(2)
                                 HStack(spacing: 6) {
-                                    StatusChip(status: s.status)
+                                    if let pause = s.pause { PauseChip(pause: pause) } else { StatusChip(status: s.status) }
                                     Text("\(s.stage) · \(s.pages) \(L("pages"))").font(.system(size: 10.5)).foregroundStyle(.secondary)
                                 }
                             }
@@ -251,8 +266,22 @@ struct StudiesView: View {
                 StatusChip(status: d.job.status)
                 Text("\(d.payload.stage) · \(d.job.agent ?? d.payload.runner.agent)").font(.caption).foregroundStyle(.secondary)
                 Spacer()
+                if d.pause != nil {
+                    Button(L("Resume now")) { Task { await resume(d) } }
+                        .help(L("The limit is lifted: run it now instead of when the pause ends"))
+                }
                 if d.isLive {
                     Button(L("Cancel")) { Task { await cancel(d) } }
+                }
+                if d.job.status == "failed" || d.job.status == "cancelled" {
+                    Button(L("Retry")) { Task { await retry(d) } }
+                }
+                if !d.isLive {
+                    Button(d.archivedAt == nil ? L("Archive") : L("Unarchive")) { Task { await archive(d, archived: d.archivedAt == nil) } }
+                        .help(L("Take it off the list; its report, pages and sources stay where they are"))
+                }
+                if d.job.status == "failed" || d.job.status == "cancelled" {
+                    Button(L("Remove"), role: .destructive) { removing = d }
                 }
                 if let n = d.tiers?.pages.quarantined, n > 0 {
                     Button(L("Promote pages (%@)", String(n))) { Task { await promote(d, what: "pages") } }
@@ -265,7 +294,15 @@ struct StudiesView: View {
                         .help(L("The report and its pages as one HTML file, its charts as numbered figures: read it, save it, or print it to PDF"))
                 }
             }
-            if let error = d.job.error {
+            if let pause = d.pause {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        PauseChip(pause: pause)
+                        Text(L("It goes on by itself then, from where it stopped.")).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text(pause.reason).font(.caption).foregroundStyle(.secondary).textSelection(.enabled).lineLimit(3)
+                }
+            } else if let error = d.job.error {
                 Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
             }
             VStack(alignment: .leading, spacing: 4) {
@@ -296,7 +333,7 @@ struct StudiesView: View {
                         }
                         Spacer()
                         if let trust = page.trust { Text(L(trust)).font(.caption).foregroundStyle(trust == "trusted" ? .green : .orange) }
-                        StatusChip(status: page.status)
+                        if let pause = page.pause { PauseChip(pause: pause) } else { StatusChip(status: page.status) }
                     }
                     if let error = page.error { Text(error).font(.caption).foregroundStyle(.secondary).lineLimit(3) }
                 }
@@ -352,7 +389,7 @@ struct StudiesView: View {
     private func load() async {
         guard let api = try? model.client() else { return }
         do {
-            async let list = api.studies()
+            async let list = api.studies(archived: showArchived)
             async let available = api.availableAgents()
             studies = try await list
             agents = (try? await available)?.agents ?? []
@@ -436,6 +473,40 @@ struct StudiesView: View {
         }
     }
 
+    private func retry(_ d: StudyDetail) async {
+        await run { api in
+            detail = try await api.retryStudy(id: d.job.id)
+            await load()
+            watch(d.job.id)
+        }
+    }
+
+    private func resume(_ d: StudyDetail) async {
+        await run { api in
+            _ = try await api.resumeStudy(id: d.job.id)
+            await open(d.job.id)
+        }
+    }
+
+    private func archive(_ d: StudyDetail, archived: Bool) async {
+        await run { api in
+            detail = try await api.archiveStudy(id: d.job.id, archived: archived)
+            await load()
+            if archived { model.showToast(L("Archived — the Archived list keeps it"), duration: 3_000_000_000) }
+        }
+    }
+
+    private func remove(_ d: StudyDetail) async {
+        await run { api in
+            let r = try await api.removeStudy(id: d.job.id)
+            removing = nil
+            selected = nil
+            detail = nil
+            await load()
+            model.showToast(r.kept.isEmpty ? L("Removed") : L("Removed — what it wrote stays in the knowledge base"), duration: 4_000_000_000)
+        }
+    }
+
     private func promote(_ d: StudyDetail, what: String) async {
         await run { api in
             let r = try await api.promoteStudy(id: d.job.id, what: what)
@@ -455,6 +526,35 @@ struct StudiesView: View {
     }
 }
 
+/// "paused until 01:32 · usage limit": a job waiting out a pause, the agent's words on hover.
+struct PauseChip: View {
+    let pause: RunPause
+
+    private var when: String {
+        guard let date = ServiceTime.date(pause.until) else { return pause.until }
+        return Calendar.current.isDateInToday(date) ? date.formatted(date: .omitted, time: .shortened) : date.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    private var why: String {
+        switch pause.kind {
+        case "quota": L("usage limit")
+        case "transient": L("agent busy")
+        case "setup": L("agent not set up")
+        default: ""
+        }
+    }
+
+    var body: some View {
+        Text(why.isEmpty ? L("paused until %@", when) : "\(L("paused until %@", when)) · \(why)")
+            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.orange)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background(Color.orange.opacity(0.12), in: Capsule())
+            .help(pause.reason)
+    }
+}
+
 /// A job or step status as a small coloured label.
 struct StatusChip: View {
     let status: String
@@ -464,6 +564,7 @@ struct StatusChip: View {
         case "done": .green
         case "failed", "cancelled": .red
         case "running", "validating", "waiting", "queued": .knodeCyan
+        case "paused": .orange
         default: .secondary
         }
     }

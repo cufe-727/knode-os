@@ -12,7 +12,8 @@ import { Params } from '../store/temporal.js';
 import { agentForSpec, ResearchAgent, resolveResearchAgent } from './agent.js';
 import { captureUrl, registerPath, studyCaptures, studyFolder, waitForCaptureIndexing } from './capture.js';
 import { runDeepResearch } from './deep-research.js';
-import { createJobRow, getJob, listJobs, ResearchJob, TERMINAL_STATUSES, updateJob } from './jobs.js';
+import { activePause, AgentUnavailableError, classifyFailure, RunPause } from './failure.js';
+import { archiveJobs, createJobRow, deleteJobs, getJob, listJobs, ResearchJob, resumeJob, TERMINAL_STATUSES, updateJob } from './jobs.js';
 import { isCancelled, JobCancelledError, killAgentsFor, launchSession } from './launch.js';
 import { PhaseRecord } from './pipeline.js';
 import { activeProfile, effectiveEffort, effectiveSpeed, loadProfile, ResearchProfile, webAllowed } from './profile.js';
@@ -71,7 +72,8 @@ export type StudyStepName = 'seed' | 'collect' | 'index' | 'pages' | 'report';
 
 export interface StudyStep {
   name: StudyStepName;
-  status: 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+  /** paused: the agent could not serve it (a spent usage limit); it goes on by itself once that lifts. */
+  status: 'pending' | 'running' | 'paused' | 'done' | 'failed' | 'skipped';
   detail?: string;
 }
 
@@ -380,16 +382,86 @@ export async function retryStudy(ctx: AppContext, job: ResearchJob): Promise<Res
   const children = await listJobs(ctx.store, { study: job.id, limit: 100 });
   const again = children.filter((c) => c.status === 'failed' || c.status === 'cancelled');
   for (const child of again) {
-    await updateJob(ctx.store, child.id, { status: 'queued', error: null, finishedAt: null, attempts: 0, payload: { ...child.payload, rejections: [] } });
+    const { pause: _pause, archivedAt: _archived, ...payload } = child.payload;
+    await updateJob(ctx.store, child.id, { status: 'queued', error: null, finishedAt: null, attempts: 0, payload: { ...payload, rejections: [] } });
   }
+  // a page waiting out a pause goes with the retry too: the person says now
+  for (const child of children) if (child.status === 'queued' && child.payload.pause) await resumeJob(ctx.store, child.id);
   const p = studyPayload(job);
   const stage: StudyStage = p.stage === 'pages' || (p.stage === 'report' && again.length) ? (children.length ? 'pages' : 'collect') : p.stage;
   const done = children.filter((c) => c.status === 'done').length;
   const steps = stage === 'pages' ? setStep(setStep(p.steps, 'pages', 'running', `${done}/${children.length} page(s) written`), 'report', 'pending') : p.steps;
+  const { pause: _pause, archivedAt: _archived, ...payload } = job.payload;
   return (await updateJob(ctx.store, job.id, {
     status: stage === 'pages' ? 'waiting' : 'queued', error: null, finishedAt: null, attempts: 0,
-    payload: { ...job.payload, stage, steps, rejections: [] },
+    payload: { ...payload, stage, steps, rejections: [] },
   }))!;
+}
+
+/**
+ * Where a study waits out a pause (docs/design/22): its own, while it collects
+ * or writes its report, else the first of its queued pages to run again. Null
+ * when nothing in it is paused.
+ */
+export async function studyPause(ctx: AppContext, job: ResearchJob, children?: ResearchJob[]): Promise<RunPause | null> {
+  if (job.status === 'queued') return activePause(job.payload);
+  if (job.status !== 'waiting') return null;
+  const pages = (children ?? await listJobs(ctx.store, { study: job.id, limit: 100 })).filter((c) => c.status === 'queued');
+  const paused = pages.map((c) => activePause(c.payload)).filter((x): x is RunPause => x !== null);
+  // a page that can run now means the study is not waiting on the pause
+  if (paused.length === 0 || paused.length < pages.length) return null;
+  return paused.sort((a, b) => Date.parse(a.until) - Date.parse(b.until))[0];
+}
+
+/** A paused study (or its paused pages) runs at the next tick instead of when the pause ends. */
+export async function resumeStudy(ctx: AppContext, job: ResearchJob): Promise<{ resumed: number }> {
+  let resumed = 0;
+  if (job.status === 'queued' && (await resumeJob(ctx.store, job.id))) resumed++;
+  for (const child of await listJobs(ctx.store, { study: job.id, status: 'queued', limit: 100 })) {
+    if (await resumeJob(ctx.store, child.id)) resumed++;
+  }
+  return { resumed };
+}
+
+/**
+ * Archive a finished study with its pages' jobs: it leaves the lists and
+ * keeps everything — its report, pages, sources and jobs stay where they are,
+ * and unarchiving brings it back. Null when the study is still under way.
+ */
+export async function archiveStudy(ctx: AppContext, job: ResearchJob, archived = true): Promise<ResearchJob | null> {
+  if (!TERMINAL_STATUSES.includes(job.status)) return null;
+  const children = await listJobs(ctx.store, { study: job.id, limit: 100 });
+  await archiveJobs(ctx.store, [job.id, ...children.map((c) => c.id)], archived);
+  return getJob(ctx.store, job.id);
+}
+
+/**
+ * Remove a study that did not finish (failed or cancelled), or a draft: its
+ * job, its pages' jobs and their run directories (briefs, transcripts). What
+ * it already put in the knowledge base stays — the pages it wrote, the
+ * sources it captured, its notes and register — since those are documents
+ * like any other now, and may be cited elsewhere. Null when it may not go.
+ */
+export async function removeStudy(ctx: AppContext, id: string): Promise<{ removed: string[]; kept: string[] } | null> {
+  const job = await getJob(ctx.store, id);
+  if (!job || job.kind !== 'study') return null;
+  if (job.status === 'draft') return (await deleteStudyDraft(ctx, id)) ? { removed: [id], kept: [] } : null;
+  if (job.status !== 'failed' && job.status !== 'cancelled') return null;
+  const children = await listJobs(ctx.store, { study: id, limit: 100 });
+  // a page still running belongs to nothing once its study is gone: it is cancelled first
+  for (const child of children) if (!TERMINAL_STATUSES.includes(child.status)) await cancelJobRow(ctx, child.id);
+  const removed = await deleteJobs(ctx.store, [id, ...children.map((c) => c.id)]);
+  const root = runsRoot(ctx.dataDir, ctx.config.research.runsDir ?? '.runs');
+  for (const runId of [...removed, `${id}-collect`]) fs.rmSync(path.join(root, runId), { recursive: true, force: true });
+  const p = studyPayload(job);
+  const slug = job.target ?? p.brief.slug;
+  const kept = [...p.brief.pages.map((page) => pagePathFor(slug, page)), reportPathFor(slug), studyFolder(slug)].filter((rel) => fs.existsSync(safePath(ctx.dataDir, rel)));
+  return { removed, kept };
+}
+
+async function cancelJobRow(ctx: AppContext, id: string): Promise<void> {
+  await ctx.store.query(`UPDATE research_jobs SET status = 'cancelled', finished_at = now() WHERE id = $1 AND status NOT IN ('done', 'failed', 'cancelled')`, [id]);
+  killAgentsFor(id);
 }
 
 /** A draft nobody started can go; a study that ran stays, with its pages and sources. */
@@ -409,6 +481,8 @@ export interface StudyPageView {
   trust: string | null;
   error: string | null;
   warnings: string[];
+  /** When the page's job waits out a pause, until when and why. */
+  pause: RunPause | null;
 }
 
 export interface StudyView {
@@ -423,6 +497,9 @@ export interface StudyView {
   notes: string[];
   /** The files each Promote covers, by tier: `quarantined` is what it would make trusted; `unindexed` it cannot promote yet. */
   tiers: Record<Exclude<StudyFiles, 'all'>, { trusted: number; quarantined: number; unindexed: number }>;
+  /** What the study waits for, when it waits out a pause (`studyPause`). */
+  pause: RunPause | null;
+  archivedAt: string | null;
 }
 
 /** What a Promote covers: the pages and the report, the sources (captures, notes, register), or both. */
@@ -477,6 +554,7 @@ export async function studyView(ctx: AppContext, job: ResearchJob): Promise<Stud
       id: page.id, title: page.title, path: rel, job: child?.id ?? null, status: child?.status ?? (job.status === 'draft' ? 'planned' : 'pending'),
       trust: tierOf(rel),
       error: child?.error ?? null, warnings: Array.isArray(child?.payload.warnings) ? (child!.payload.warnings as string[]) : [],
+      pause: child && child.status === 'queued' ? activePause(child.payload) : null,
     };
   });
   const report = reportPathFor(slug);
@@ -491,6 +569,8 @@ export async function studyView(ctx: AppContext, job: ResearchJob): Promise<Stud
     registerPath: registerPath(slug),
     notes: p.notes,
     tiers: { pages: tiers(files.pages), sources: tiers(files.sources) },
+    pause: await studyPause(ctx, job, children),
+    archivedAt: typeof job.payload.archivedAt === 'string' ? job.payload.archivedAt : null,
   };
 }
 
@@ -525,8 +605,9 @@ export async function promoteStudy(ctx: AppContext, job: ResearchJob, opts: { wh
   return out;
 }
 
-export async function listStudies(ctx: AppContext, limit = 50): Promise<ResearchJob[]> {
-  return listJobs(ctx.store, { kind: 'study', limit });
+/** Studies, newest first: those not archived, or (`archived`) only the archived ones. */
+export async function listStudies(ctx: AppContext, limit = 50, opts: { archived?: boolean } = {}): Promise<ResearchJob[]> {
+  return listJobs(ctx.store, { kind: 'study', limit, archived: opts.archived ?? false });
 }
 
 /* --------------------------------------------------------------- brief */
@@ -721,7 +802,11 @@ export async function runStudyCollect(ctx: AppContext, jobIn: ResearchJob, deps:
     ...sources.filter((s) => s.kind === 'site').flatMap((s) => s.urls.map((url) => ({ url, why: `${s.title}（预置来源）` }))),
   ];
   const fetchAllowed = p.sources.web && (ctx.config.review?.external ?? 'verify') !== 'off';
-  if (seeds.length && fetchAllowed) {
+  // a study that goes on after a pause or a restart has its seeds already
+  const seededBefore = p.steps.find((s) => s.name === 'seed')?.status === 'done';
+  if (seededBefore) {
+    log(`study ${job.id}: seeds captured before — collect goes on from where it stopped`);
+  } else if (seeds.length && fetchAllowed) {
     await save({ steps: setStep(p.steps, 'seed', 'running', `${seeds.length} URL(s)`) });
     const outcomes = await pool(seeds, 3, async (s) => {
       try {
@@ -745,6 +830,8 @@ export async function runStudyCollect(ctx: AppContext, jobIn: ResearchJob, deps:
   const zh = lang.startsWith('zh');
   const notes: string[] = [];
   const phases: PhaseRecord[] = [];
+  /** Collectors the agent could not serve (a spent usage limit, a lost login): not ones that found nothing. */
+  const refused: PhaseRecord[] = [];
   await save({ steps: setStep(p.steps, 'collect', 'running', p.runner.mode === 'deep-research' ? `deep research (${p.runner.deepResearch?.model})` : `${p.brief.pages.length} collector(s) on ${deps.agent.provider}`) });
   if (p.runner.mode === 'deep-research') {
     const dr = p.runner.deepResearch!;
@@ -780,8 +867,18 @@ export async function runStudyCollect(ctx: AppContext, jobIn: ResearchJob, deps:
     }
   } else {
     const dir = path.join(runsRoot(ctx.dataDir, ctx.config.research.runsDir ?? '.runs'), `${job.id}-collect`);
-    fs.rmSync(dir, { recursive: true, force: true });
+    // a page whose note an earlier run wrote is collected: only the others run again (after a
+    // spent usage limit or a restart), and their transcripts stay next to the new ones
+    const noteRel = (page: StudyPage, i: number) => `${studyFolder(slug)}/notes/${String(i + 1).padStart(2, '0')}-${page.slug}.md`;
+    const collected = new Set(p.brief.pages.map((page, i) => noteRel(page, i)).filter((rel) => fs.existsSync(safePath(ctx.dataDir, rel))));
+    if (collected.size === 0) fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });
+    notes.push(...collected);
+    phases.push(...p.collect.filter((ph) => {
+      const i = Number(/^collect-(\d+)$/.exec(ph.label)?.[1] ?? 0) - 1;
+      return i >= 0 && p.brief.pages[i] && collected.has(noteRel(p.brief.pages[i], i));
+    }));
+    if (collected.size) log(`study ${job.id}: ${collected.size}/${p.brief.pages.length} page(s) collected before — collecting the rest`);
     const workset = (await checkout(ctx.store, { actor, note: `study ${job.id}: collect` })).id;
     const extraMcp = studyMcpServers(ctx, job);
     writeAgentFiles(dir, {
@@ -794,6 +891,7 @@ export async function runStudyCollect(ctx: AppContext, jobIn: ResearchJob, deps:
     const collectors = Math.max(1, ctx.config.research.study.collectors);
     const perCollector = Math.max(4, Math.ceil(maxCaptures / Math.max(1, p.brief.pages.length)));
     const results = await pool(p.brief.pages, collectors, async (page, i) => {
+      if (collected.has(noteRel(page, i))) return null;
       if (await cancelled()) return null;
       const questions = page.questions.map((qid) => p.brief.questions.find((q) => q.id === qid)).filter(Boolean);
       const prompt = loadPhasePrompt(ctx.dataDir, 'collect', {
@@ -811,13 +909,15 @@ export async function runStudyCollect(ctx: AppContext, jobIn: ResearchJob, deps:
         effort: effectiveEffort(deps.profile, null), speed: effectiveSpeed(deps.profile, null), webFreshness: deps.profile.search.freshness,
         extraMcp, label,
       });
-      phases.push({ name: 'collect', label, role: 'collector', agent: deps.agent.provider, turns: r.turns, costUsd: r.costUsd, error: r.error, ms: Date.now() - t0 });
+      const phase: PhaseRecord = { name: 'collect', label, role: 'collector', agent: deps.agent.provider, turns: r.turns, costUsd: r.costUsd, error: r.error, ms: Date.now() - t0 };
+      phases.push(phase);
       const text = r.text.trim();
+      if (!text && r.error && classifyFailure(r.error).kind !== 'other') refused.push(phase);
       if (!text) {
         log(`study ${job.id}: ${label} (${page.title}) returned nothing${r.error ? `: ${r.error}` : ''}`);
         return null;
       }
-      const rel = `${studyFolder(slug)}/notes/${String(i + 1).padStart(2, '0')}-${page.slug}.md`;
+      const rel = noteRel(page, i);
       notesFile(ctx.dataDir, { rel, title: `${zh ? '收集笔记' : 'Notes'} — ${page.title}`, study: job.id, page: page.id, actor, sources: citedPaths(text), body: localizeNoteHeadings(text, lang), language: lang });
       return rel;
     });
@@ -826,6 +926,13 @@ export async function runStudyCollect(ctx: AppContext, jobIn: ResearchJob, deps:
   }
   if (await cancelled()) throw new JobCancelledError(job.id);
   const captured = studyCaptures(ctx.dataDir, job.id).length;
+  // the study waits, keeping the notes it has, and collects the refused pages once the agent can serve
+  if (refused.length) {
+    const failure = classifyFailure(refused[0].error!);
+    const detail = `${notes.length}/${p.brief.pages.length} page(s) collected; ${refused.length} waiting — ${refused[0].error}`;
+    await save({ collect: phases, notes, steps: setStep(p.steps, 'collect', 'paused', detail.slice(0, 300)) });
+    throw new AgentUnavailableError(failure, `collect: ${refused.length} collector(s) could not run — ${refused[0].error}`);
+  }
   const errors = phases.map((ph) => ph.error).filter(Boolean);
   // the seed URLs alone are no collection when the collectors failed (a spent usage limit fails
   // every one of them in seconds): the study stops here, and a retry collects again

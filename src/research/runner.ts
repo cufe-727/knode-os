@@ -8,9 +8,10 @@ import { safePath } from '../fs/files.js';
 import { sync } from '../ingest/sync.js';
 import { agentForSpec, agentWebCapable, ResearchAgent, resolveResearchAgent } from './agent.js';
 import { finalizeInit, prepareInit, topicsFrom } from './init.js';
-import { clearCancelled, isCancelled, JobCancelledError, launchAgent, LaunchResult } from './launch.js';
-import { runNativePipeline, runTeamPipeline } from './pipeline.js';
-import { getJob, ResearchJob, updateJob } from './jobs.js';
+import { activePause, AgentUnavailableError, agentKey, pauseFor, pausingFailure, RunPause } from './failure.js';
+import { clearCancelled, isCancelled, JobCancelledError, JobInterruptedError, launchAgent, LaunchResult } from './launch.js';
+import { PhaseRecord, runNativePipeline, runTeamPipeline } from './pipeline.js';
+import { getJob, listJobs, ResearchJob, setJobPause, updateJob } from './jobs.js';
 import { activeProfile, effectivePipeline, ResearchProfile, webAllowed } from './profile.js';
 import { renderSurvey } from './survey.js';
 import { ResearchTemplate, templateFor } from './templates.js';
@@ -62,6 +63,82 @@ async function markCancelled(ctx: AppContext, jobId: string, log: (m: string) =>
   return row;
 }
 
+/** A run a restart stopped goes back in line, with the attempt its claim charged handed back. */
+async function markInterrupted(ctx: AppContext, jobId: string, log: (m: string) => void): Promise<ResearchJob> {
+  log(`research ${jobId}: interrupted by a restart — queued again`);
+  const now = await getJob(ctx.store, jobId);
+  const row = (await updateJob(ctx.store, jobId, { status: 'queued', attempts: Math.max(0, (now?.attempts ?? 1) - 1) }))!;
+  clearCancelled(jobId);
+  return row;
+}
+
+const PAUSE_WORDS: Record<RunPause['kind'], string> = {
+  quota: 'the agent\'s usage limit is spent',
+  transient: 'the agent could not serve the run',
+  setup: 'the agent cannot run until it is set up again',
+};
+
+/** The payload a run that ended leaves: its pause, if it had one, is over. */
+function withoutPause(payload: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...payload };
+  delete out.pause;
+  return out;
+}
+
+/**
+ * A run that ended without its page. When the agent could not serve it — a
+ * spent usage limit, a rate limit, a lost login (failure.ts; `agentErrors` are
+ * the sessions' own messages, the only ones read for that) — the job waits
+ * instead, its attempts and its brief untouched, and so does everything queued
+ * on the same account. Otherwise it goes again with the reason in its brief,
+ * once, or fails.
+ */
+async function failRun(ctx: AppContext, job: ResearchJob, input: { error: string; retry: boolean; agent: ResearchAgent; agentErrors: (string | null | undefined)[]; log: (m: string) => void }): Promise<ResearchJob> {
+  const { log } = input;
+  if (await wasCancelled(ctx, job.id)) return markCancelled(ctx, job.id, log);
+  const failure = pausingFailure(input.agentErrors);
+  const pause = failure ? pauseFor(failure, (job.payload.pause as RunPause | undefined) ?? null, agentKey(input.agent)) : null;
+  if (failure && pause) {
+    log(`research ${job.id}: ${PAUSE_WORDS[pause.kind]} (${pause.reason.slice(0, 160)}) — waits until ${pause.until}`);
+    const row = (await updateJob(ctx.store, job.id, { status: 'queued', error: failure.message, attempts: Math.max(0, job.attempts - 1), payload: { ...job.payload, pause } }))!;
+    if (pause.kind !== 'transient') {
+      const n = await pauseAgentQueue(ctx, pause, job.id).catch(() => 0);
+      if (n) log(`research: ${n} more queued job(s) on ${pause.agent} wait with it`);
+    }
+    return row;
+  }
+  const rejections = [...(Array.isArray(job.payload.rejections) ? (job.payload.rejections as string[]) : []), input.error];
+  if (input.retry && job.attempts < MAX_ATTEMPTS) {
+    log(`research ${job.id}: rejected (${input.error.slice(0, 160)}) — requeued for one more attempt`);
+    return (await updateJob(ctx.store, job.id, { status: 'queued', error: input.error, payload: { ...withoutPause(job.payload), rejections } }))!;
+  }
+  log(`research ${job.id}: failed — ${input.error.slice(0, 200)}`);
+  return (await updateJob(ctx.store, job.id, { status: 'failed', error: input.error, finishedAt: new Date().toISOString(), payload: { ...withoutPause(job.payload), rejections } }))!;
+}
+
+/**
+ * Every other queued job on the account whose quota ran out (or whose login
+ * lapsed) waits with it: claimed now, it would only fail the same way, one
+ * after another. A job already waiting longer keeps its own pause.
+ */
+async function pauseAgentQueue(ctx: AppContext, pause: RunPause, except: string): Promise<number> {
+  let n = 0;
+  for (const j of await listJobs(ctx.store, { status: 'queued', limit: 500 })) {
+    if (j.id === except) continue;
+    const current = activePause(j.payload);
+    if (current && Date.parse(current.until) >= Date.parse(pause.until)) continue;
+    let agent: ResearchAgent | null = null;
+    try {
+      agent = agentForJob(ctx, j);
+    } catch {
+      continue;
+    }
+    if (!agent || agentKey(agent) !== pause.agent) continue;
+    if (await setJobPause(ctx.store, j.id, { ...pause }, { onlyQueued: true })) n++;
+  }
+  return n;
+}
+
 /** A study and its pages carry their own runner; every other job runs on research.agent. */
 function isStudyJob(job: ResearchJob): boolean {
   return job.kind === 'study' || job.kind === 'section';
@@ -90,16 +167,8 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
     .map((d) => safePath(ctx.dataDir, d))
     .filter((d) => fs.existsSync(d));
 
-  const fail = async (error: string, retry: boolean): Promise<ResearchJob> => {
-    if (await wasCancelled(ctx, job.id)) return markCancelled(ctx, job.id, log);
-    const rejections = [...(Array.isArray(job.payload.rejections) ? (job.payload.rejections as string[]) : []), error];
-    if (retry && job.attempts < MAX_ATTEMPTS) {
-      log(`research ${job.id}: rejected (${error.slice(0, 160)}) — requeued for one more attempt`);
-      return (await updateJob(ctx.store, job.id, { status: 'queued', error, payload: { ...job.payload, rejections } }))!;
-    }
-    log(`research ${job.id}: failed — ${error.slice(0, 200)}`);
-    return (await updateJob(ctx.store, job.id, { status: 'failed', error, finishedAt: new Date().toISOString(), payload: { ...job.payload, rejections } }))!;
-  };
+  // `agentErrors`: what the agent said, when it is the agent that failed (a pause may follow)
+  const fail = (error: string, retry: boolean, agentErrors: (string | null | undefined)[] = []) => failRun(ctx, job, { error, retry, agent, agentErrors, log });
 
   const profile = opts.profile ?? (isStudyJob(job) ? studyProfile(ctx, job) : activeProfile(ctx.dataDir, ctx.config));
   const webGate = ctx.config.review?.external ?? 'verify';
@@ -115,9 +184,10 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
       return await runStudyCollect(ctx, job, { mcp: opts.mcp, agent, profile, readDirs, log });
     } catch (err) {
       if (err instanceof JobCancelledError) return markCancelled(ctx, job.id, log);
+      if (err instanceof JobInterruptedError) return markInterrupted(ctx, job.id, log);
       // collect saved its steps as it went: fail on top of them, not on the payload it started from
       job = (await getJob(ctx.store, job.id)) ?? job;
-      return fail(`study: ${err instanceof Error ? err.message : err}`, false);
+      return fail(`study: ${err instanceof Error ? err.message : err}`, false, err instanceof AgentUnavailableError ? [err.failure.message] : []);
     }
   }
 
@@ -178,7 +248,10 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
     }
   } catch (err) {
     if (err instanceof JobCancelledError) return markCancelled(ctx, job.id, log);
-    return fail(`launch: ${err instanceof Error ? err.message : err}`, false);
+    if (err instanceof JobInterruptedError) return markInterrupted(ctx, job.id, log);
+    // what failed to start the agent ("claude CLI not found", a spawn error) is the agent's failure
+    const message = err instanceof Error ? err.message : String(err);
+    return fail(`launch: ${message}`, false, [message]);
   }
   const done = await finalizeResearchJob(ctx, job, ws, launched, { ...opts, agent, template, profile });
   clearCancelled(job.id);
@@ -203,16 +276,11 @@ export async function finalizeResearchJob(
   const template = opts.template ?? templateFor(ctx.dataDir, jobIn.kind, jobIn.template);
   const profile = opts.profile ?? activeProfile(ctx.dataDir, ctx.config);
   let job = jobIn;
-  const fail = async (error: string, retry: boolean): Promise<ResearchJob> => {
-    if (await wasCancelled(ctx, job.id)) return markCancelled(ctx, job.id, log);
-    const rejections = [...(Array.isArray(job.payload.rejections) ? (job.payload.rejections as string[]) : []), error];
-    if (retry && job.attempts < MAX_ATTEMPTS) {
-      log(`research ${job.id}: rejected (${error.slice(0, 160)}) — requeued for one more attempt`);
-      return (await updateJob(ctx.store, job.id, { status: 'queued', error, payload: { ...job.payload, rejections } }))!;
-    }
-    log(`research ${job.id}: failed — ${error.slice(0, 200)}`);
-    return (await updateJob(ctx.store, job.id, { status: 'failed', error, finishedAt: new Date().toISOString(), payload: { ...job.payload, rejections } }))!;
-  };
+  const fail = (error: string, retry: boolean, agentErrors: (string | null | undefined)[] = []) => failRun(ctx, job, { error, retry, agent: opts.agent, agentErrors, log });
+  // the sessions' own errors: a team's phases each, else the one session's (a team's summary error
+  // quotes its critics, who may write about rate limits; it is no word from the agent)
+  const phases = (launched as { phases?: PhaseRecord[] }).phases;
+  const agentErrors = phases ? phases.map((ph) => ph.error) : [launched.error];
 
   if (await wasCancelled(ctx, job.id)) return markCancelled(ctx, job.id, log);
   const usage = { turns: launched.turns, costUsd: launched.costUsd };
@@ -247,7 +315,7 @@ export async function finalizeResearchJob(
       if (c.backupPath && fs.existsSync(c.backupPath)) fs.copyFileSync(c.backupPath, absC);
     }
     const reason = [launched.error, ...report.errors].filter(Boolean).join('; ');
-    return fail(reason || 'validation failed', true);
+    return fail(reason || 'validation failed', true, agentErrors);
   }
 
   if (await wasCancelled(ctx, job.id)) return markCancelled(ctx, job.id, log);
@@ -286,11 +354,13 @@ export async function finalizeResearchJob(
   } else {
     appendLog(ctx.dataDir, 'research', `${job.kind} ${job.target ?? job.query ?? ''} → ${ws.outputPath} (${opts.agent.provider}${usage.turns ? `, ${usage.turns} turns` : ''}${report.warnings.length ? `, ${report.warnings.length} warnings` : ''})`);
   }
+  const finished = withoutPause(job.payload);
+  delete finished.interruptions;
   const done = (await updateJob(ctx.store, job.id, {
     status: 'done',
     error: launched.error,
     finishedAt: new Date().toISOString(),
-    payload: { ...job.payload, ...initPayload, warnings: report.warnings, resultText: launched.resultText.slice(0, 2000) },
+    payload: { ...finished, ...initPayload, warnings: report.warnings, resultText: launched.resultText.slice(0, 2000) },
   }))!;
   try {
     pruneRuns(ctx.dataDir, research?.runsDir ?? '.runs', research?.keepRuns ?? 20);

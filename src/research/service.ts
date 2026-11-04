@@ -18,6 +18,8 @@ export function startResearchLoop(
   let disposed = false;
   let running = 0;
   const inflight = new Set<Promise<unknown>>();
+  /** The jobs those promises run: a stop interrupts them, so they go back in line instead of failing. */
+  const inflightJobs = new Set<string>();
   let warnedNoAgent = false;
 
   void requeueStale(ctx.store).then((n) => n && opts.log(`research: ${n} interrupted job(s) queued again`)).catch(() => {});
@@ -70,6 +72,7 @@ export function startResearchLoop(
       }
       if (!job) return;
       running++;
+      inflightJobs.add(job.id);
       const p = runResearchJob(ctx, job, { mcp, log: opts.log })
         .catch(async (err) => {
           opts.log(`research ${job.id} crashed: ${err instanceof Error ? err.message : err}`);
@@ -78,6 +81,7 @@ export function startResearchLoop(
         .finally(() => {
           running--;
           inflight.delete(p);
+          inflightJobs.delete(job.id);
           // a page of a study may have been its last: let the study go on, and claim what is next
           if (!disposed) void tick();
         });
@@ -92,7 +96,7 @@ export function startResearchLoop(
     stop: async () => {
       disposed = true;
       clearInterval(timer);
-      killActiveAgents();
+      killActiveAgents(inflightJobs);
       await Promise.allSettled([...inflight]);
     },
     /** Claim queued work now instead of at the next tick (a job was just queued from the UI). */

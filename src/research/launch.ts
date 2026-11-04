@@ -1,7 +1,7 @@
 import { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { cliCommand, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess, speedFor } from '../llm/cli.js';
+import { cliCommand, cliFailureText, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess, speedFor } from '../llm/cli.js';
 import { AgentProvider, CliAgent, ResearchAgent } from './agent.js';
 import { Effort, Freshness, NativeAgentSpec, Speed } from './profile.js';
 import type { ExtraMcpServer } from './sources.js';
@@ -71,11 +71,21 @@ export interface RunningSession {
 const byJob = new Map<string, Set<RunningSession>>();
 /** Jobs whose sessions were killed: nothing more is launched for them until the runner clears the flag. */
 const cancelledJobs = new Set<string>();
+/** Jobs stopped because serve is shutting down: like cancelled, but they go back in line. */
+const interruptedJobs = new Set<string>();
 
 export class JobCancelledError extends Error {
   constructor(public readonly jobId: string) {
     super(`job ${jobId} was cancelled`);
     this.name = 'JobCancelledError';
+  }
+}
+
+/** A session ended because serve stopped it (a restart, a deploy): the job is requeued with its attempts, not failed. */
+export class JobInterruptedError extends Error {
+  constructor(public readonly jobId: string) {
+    super(`job ${jobId} was interrupted by a restart`);
+    this.name = 'JobInterruptedError';
   }
 }
 
@@ -114,10 +124,18 @@ export function registerSession(jobId: string, session: RunningSession): () => v
   };
 }
 
-/** Kill every agent this process launched (serve shutdown). */
-export function killActiveAgents(): number {
+/**
+ * Kill every agent this process launched (serve shutdown). Their jobs, and
+ * `also` (jobs between two sessions), launch nothing more: each ends with
+ * `JobInterruptedError`, and the runner puts it back in line.
+ */
+export function killActiveAgents(also: Iterable<string> = []): number {
+  for (const id of also) interruptedJobs.add(id);
   let n = 0;
-  for (const set of byJob.values()) for (const session of set) if (session.stop()) n++;
+  for (const [jobId, set] of byJob) {
+    interruptedJobs.add(jobId);
+    for (const session of set) if (session.stop()) n++;
+  }
   byJob.clear();
   return n;
 }
@@ -141,6 +159,7 @@ export function killAgentsFor(jobId: string): number {
 
 export function clearCancelled(jobId: string): void {
   cancelledJobs.delete(jobId);
+  interruptedJobs.delete(jobId);
 }
 
 export function isCancelled(jobId: string): boolean {
@@ -451,11 +470,22 @@ export function stderrPathFor(cwd: string, label: string): string {
  */
 export async function launchSession(input: SessionInput): Promise<SessionResult> {
   if (cancelledJobs.has(input.jobId)) throw new JobCancelledError(input.jobId);
-  if (input.agent.kind === 'builtin') {
-    const { runBuiltinSession } = await loadBuiltin();
-    return runBuiltinSession({ ...input, agent: input.agent });
+  if (interruptedJobs.has(input.jobId)) throw new JobInterruptedError(input.jobId);
+  let result: SessionResult;
+  try {
+    if (input.agent.kind === 'builtin') {
+      const { runBuiltinSession } = await loadBuiltin();
+      result = await runBuiltinSession({ ...input, agent: input.agent });
+    } else {
+      result = await launchCliSession({ ...input, agent: input.agent });
+    }
+  } catch (err) {
+    if (interruptedJobs.has(input.jobId) && !(err instanceof JobCancelledError)) throw new JobInterruptedError(input.jobId);
+    throw err;
   }
-  return launchCliSession({ ...input, agent: input.agent });
+  // a session serve stopped ends like any other, with whatever error the kill left: this says why
+  if (interruptedJobs.has(input.jobId)) throw new JobInterruptedError(input.jobId);
+  return result;
 }
 
 /**
@@ -534,13 +564,25 @@ async function launchCliSession(input: CliSessionInput): Promise<SessionResult> 
     if (res.code !== 0 && !result.error) result.error = `claude exited with code ${res.code}: ${(res.stderr || res.stdout).trim().slice(0, 300)}`;
   } else if (provider === 'codex-cli') {
     result.text = outFile && fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8').trim() : '';
-    if (res.code !== 0) result.error = `codex exec exited with code ${res.code}: ${(res.stderr || res.stdout).trim().slice(0, 300)}`;
+    if (res.code !== 0) result.error = `codex exec exited with code ${res.code}: ${codexFailure(res.stderr, res.stdout)}`;
   } else {
     const parsed = readCursorStream(res.stdout);
     result.text = parsed.text;
     if (parsed.error || res.code !== 0) result.error = `cursor: ${(parsed.error || res.stderr || res.stdout).trim().slice(0, 300)}`;
   }
   return result;
+}
+
+/**
+ * Why a codex session failed. Its stderr opens with a banner and the echoed
+ * prompt, so the reason (a spent usage limit, an expired login) is its last
+ * ERROR line, else the tail — never the head, which only ever said "OpenAI
+ * Codex v…" and hid the reason from everything that reads it.
+ */
+export function codexFailure(stderr: string, stdout: string): string {
+  const lines = stderr.split('\n').map((l) => l.trim()).filter(Boolean);
+  const error = [...lines].reverse().find((l) => /^(?:\[[^\]]*\]\s*)?(?:error|fatal)\b/i.test(l) || /\bERROR\b/.test(l));
+  return error ? error.slice(0, 300) : cliFailureText(stderr, stdout, 300);
 }
 
 /** The argv of the single-session run (kept for `research export`). */

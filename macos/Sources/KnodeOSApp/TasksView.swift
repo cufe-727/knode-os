@@ -551,7 +551,11 @@ struct TasksView: View {
                     .lineLimit(2)
                     .help(openHelp(job))
                 HStack(spacing: 6) {
-                    StatusChip(status: job.status)
+                    if let until = job.pausedUntil {
+                        PauseChip(pause: RunPause(kind: "", reason: job.pauseReason ?? "", until: until))
+                    } else {
+                        StatusChip(status: job.status)
+                    }
                     Text(TaskWords.job(job.kind)).font(.caption).foregroundStyle(.tertiary)
                     if let stage = job.stage, job.kind != "ask", stage != job.kind {
                         Text(stage).font(.caption).foregroundStyle(.secondary)
@@ -568,7 +572,7 @@ struct TasksView: View {
                 if let error = job.error {
                     Text(String(error.prefix(240)))
                         .font(.caption)
-                        .foregroundStyle(Color.knodeBad)
+                        .foregroundStyle(job.pausedUntil == nil ? Color.knodeBad : Color.secondary)
                         .lineLimit(3)
                         .help(error)
                 }
