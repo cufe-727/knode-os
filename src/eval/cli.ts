@@ -120,6 +120,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--slots <n>', 'concurrent model calls', '6')
     .option('--pack-concurrency <n>', 'packs worked on at once', '1')
     .option('--embedding-cap <tokens>', 'stop embedding after this many tokens in the run')
+    .option('--embedding-daily-cap <tokens>', 'embed at most this many tokens per UTC day; past it, packs wait for the next day')
     .option('--no-quota', 'do not pause for Codex plan windows')
     .option('--skip-scoring', 'answer only; score later with `eval run --run-dir`')
     .action(async (opts) => {
@@ -142,6 +143,7 @@ export function registerEvalCommands(program: Command): void {
         slots: Number(opts.slots),
         packConcurrency: Number(opts.packConcurrency),
         embeddingTokenCap: opts.embeddingCap ? Number(opts.embeddingCap) : undefined,
+        embeddingDailyCap: opts.embeddingDailyCap ? Number(opts.embeddingDailyCap) : undefined,
         quota: opts.quota,
         skipScoring: opts.skipScoring,
         onProgress: (m) => console.log(`  ${m}`),

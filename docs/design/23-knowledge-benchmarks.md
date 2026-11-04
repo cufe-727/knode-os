@@ -134,6 +134,7 @@ knode-os eval report ~/knode-eval/runs/<stamp>
 - Agents answer at most 30 stratified tasks per pack (`--agent-limit`).
 - `--fraction` and `--seed` give scale curves and run-to-run variance.
 - `--embedding-cap` bounds what a run takes from the shared pool.
+- `--embedding-daily-cap` bounds what it takes per UTC day, since the live service shares the pool and its free quotas reset at 00:00 UTC. Past the cap, or when the pool itself refuses, a pack waits for the next day and then resumes.
 
 ## 6. Not done
 

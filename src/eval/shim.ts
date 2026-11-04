@@ -13,6 +13,7 @@ import { CallUsage, readCodexEvents } from '../llm/usage.js';
 import { isRefusal } from '../estimate/ledger.js';
 import { classifyFailure } from '../labeling/failures.js';
 import { Meter, MeterTag, parseTag } from './meter.js';
+import type { EmbeddingBudget } from './quota.js';
 
 /**
  * The model gateway every system under test talks to (docs/design/23 §4).
@@ -200,6 +201,7 @@ export class MeteredEmbedder implements EmbeddingProvider {
     private readonly meter: Meter,
     private readonly tag: () => MeterTag,
     private readonly cap: { tokens: number; used: number } = { tokens: Infinity, used: 0 },
+    private readonly budget: EmbeddingBudget | null = null,
   ) {}
 
   get model(): string {
@@ -222,8 +224,17 @@ export class MeteredEmbedder implements EmbeddingProvider {
       const batch = missing.map((k) => byKey.get(k)!);
       const tokens = batch.reduce((s, t) => s + estimateEmbeddingTokens(t), 0);
       if (this.cap.used + tokens > this.cap.tokens) throw new Error(`embedding token cap reached (${this.cap.tokens} for this run)`);
+      const why = this.budget?.check(tokens);
+      if (why) throw this.budget!.refuse(why);
       const t0 = Date.now();
-      const vectors = await this.inner.embed(batch);
+      let vectors: number[][];
+      try {
+        vectors = await this.inner.embed(batch);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/daily quota|pool unavailable|\b429\b/i.test(msg)) this.budget?.poolRefused(msg);
+        throw err;
+      }
       this.cap.used += tokens;
       missing.forEach((k, i) => this.cache.put(k, vectors[i]));
       this.meter.record({ ...tag, model: this.inner.model, ms: Date.now() - t0, ok: true, replayed: false, usage: null, embeddingTokens: tokens, embeddingCalls: 1 });
@@ -243,6 +254,8 @@ export interface ShimOptions {
   buildEffort?: LlmEffort;
   answerEffort?: LlmEffort;
   embeddingTokenCap?: number;
+  /** A daily budget on a shared embedding pool; refused embeddings are counted on it. */
+  embeddingBudget?: EmbeddingBudget;
   keepAliveMs?: number;
   /** Tries again after a passing failure: the first wait, doubling up to 5 min (default 30 s). */
   retryBaseMs?: number;
@@ -300,7 +313,7 @@ export async function startShim(opts: ShimOptions): Promise<Shim> {
   const keepAlive = opts.keepAliveMs ?? 20_000;
   const retryBase = opts.retryBaseMs ?? 30_000;
   const retries = opts.retries ?? 5;
-  const embedder = opts.embedder ? new MeteredEmbedder(opts.embedder, vectors, opts.meter, () => ({ system: 'unknown', stage: 'embed' }), cap) : null;
+  const embedder = opts.embedder ? new MeteredEmbedder(opts.embedder, vectors, opts.meter, () => ({ system: 'unknown', stage: 'embed' }), cap, opts.embeddingBudget ?? null) : null;
 
   const chat = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const body = JSON.parse((await readBody(req)) || '{}') as Record<string, unknown>;

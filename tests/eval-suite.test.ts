@@ -16,7 +16,7 @@ import { retrievalScores } from '../src/eval/metrics/retrieval.js';
 import { bootstrapMean, holm, pairedBootstrap, wilson } from '../src/eval/metrics/stats.js';
 import { characteristicTerms, directions, profileText } from '../src/eval/metrics/stylometry.js';
 import { exactMatch, extractFinalAnswer, stripMarkers, tokenF1 } from '../src/eval/metrics/text.js';
-import { QuotaGuard } from '../src/eval/quota.js';
+import { EmbeddingBudget, QuotaGuard } from '../src/eval/quota.js';
 import { llmWikiBuild } from '../src/eval/systems/llm-wiki.js';
 import type { SystemEnv } from '../src/eval/systems/types.js';
 import type { CodexAccount } from '../src/estimate/codex.js';
@@ -150,6 +150,47 @@ describe('agent audit and metering', () => {
     await guard.wait();
     expect(reads).toBe(2);
     expect(slept).toHaveLength(1);
+  });
+
+  it('keeps embeddings inside a daily budget and waits for the next UTC day', async () => {
+    let now = Date.parse('2026-11-04T18:00:00Z');
+    const slept: number[] = [];
+    const meter = new Meter();
+    const budget = new EmbeddingBudget({
+      dailyTokens: 30,
+      usedToday: (day) => meter.all((e) => e.at.startsWith(day)).reduce((s, e) => s + (e.embeddingTokens ?? 0), 0),
+      now: () => now,
+      sleep: async (ms) => {
+        slept.push(ms);
+        now += ms;
+      },
+    });
+    let poolSays: string | null = null;
+    const inner = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 8, batchSize: 8, sendDimensions: false });
+    const pool = { ...inner, model: inner.model, dimensions: inner.dimensions, embed: async (t: string[]) => {
+      if (poolSays) throw new Error(poolSays);
+      return inner.embed(t);
+    } } as typeof inner;
+    const shim = await startShim({ backend: new ScriptedBackend(), embedder: pool, meter, embeddingBudget: budget });
+    try {
+      const embed = (texts: string[]) => shim.embedder!.embedAs({ system: 's', stage: 'embed' }, texts);
+      await embed(['alpha beta gamma delta epsilon zeta eta theta']);
+      await expect(embed(Array.from({ length: 20 }, (_, i) => `text number ${i} with several words in it`))).rejects.toThrow(/daily budget reached/);
+      expect(budget.refusals).toBe(1);
+      await budget.wait();
+      expect(new Date(now).toISOString()).toBe('2026-11-05T00:05:00.000Z');
+      // the pool's own refusal: a spent daily quota closes it until the next day too
+      poolSays = 'embedding request failed (429): Embedding pool unavailable: Cloudflare · a: daily quota reached';
+      await expect(embed(['one more'])).rejects.toThrow(/429/);
+      expect(budget.refusals).toBe(2);
+      poolSays = null;
+      await expect(embed(['and another'])).rejects.toThrow(/closed until 2026-11-06T00:05/);
+      await budget.wait();
+      expect(await embed(['and another'])).toHaveLength(1);
+      expect(slept).toHaveLength(2);
+    } finally {
+      await shim.close();
+    }
   });
 
   it('serves chat and embeddings through the shim, metered by tag', async () => {

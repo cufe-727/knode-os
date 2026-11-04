@@ -113,6 +113,61 @@ export class QuotaGuard {
 }
 
 /**
+ * Keeps a run's embeddings inside a daily budget on a shared pool (docs/design/23 §4).
+ *
+ * The bge-m3 pool serves the live service too, and its free accounts reset
+ * at 00:00 UTC. The budget counts the run's embedding tokens per UTC day (from
+ * the meter, so a restart keeps the day's count). Over the budget — or when
+ * the pool itself turns a call down — an embedding is refused at once, and a
+ * pack that was cut short waits in `wait()` until the budget opens again.
+ */
+export class EmbeddingBudget {
+  /** Refusals so far, by the budget or the pool: a pack compares it before and after to tell it was cut short. */
+  refusals = 0;
+  private closedUntil = 0;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly now: () => number;
+
+  constructor(private readonly opts: { dailyTokens?: number; usedToday: (day: string) => number; sleep?: (ms: number) => Promise<void>; now?: () => number; log?: (msg: string, detail?: Record<string, unknown>) => void }) {
+    this.sleep = opts.sleep ?? realSleep;
+    this.now = opts.now ?? Date.now;
+  }
+
+  /** Why `tokens` more may not be embedded now, or null when they may. */
+  check(tokens: number): string | null {
+    if (this.now() < this.closedUntil) return `embedding budget closed until ${new Date(this.closedUntil).toISOString()}`;
+    const cap = this.opts.dailyTokens ?? Infinity;
+    const used = this.opts.usedToday(utcDay(this.now()));
+    return used + tokens > cap ? `embedding daily budget reached (${used} of ${cap} tokens today, UTC)` : null;
+  }
+
+  /** Turn an embedding down: the budget stays closed until the next UTC day. */
+  refuse(why: string): Error {
+    this.refusals++;
+    this.closedUntil = Math.max(this.closedUntil, nextUtcDay(this.now()));
+    return new Error(why);
+  }
+
+  /** The pool turned a call down: a spent daily quota closes the budget until the next UTC day, anything else for ten minutes. */
+  poolRefused(message: string): void {
+    this.refusals++;
+    this.closedUntil = Math.max(this.closedUntil, /daily quota/i.test(message) ? nextUtcDay(this.now()) : this.now() + 10 * 60_000);
+  }
+
+  /** Sleep until the budget opens again. */
+  async wait(): Promise<void> {
+    while (this.now() < this.closedUntil) {
+      this.opts.log?.('paused for embedding budget', { until: new Date(this.closedUntil).toISOString() });
+      await this.sleep(this.closedUntil - this.now());
+    }
+  }
+}
+
+const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+/** Five minutes past the next 00:00 UTC, when the pool's daily quotas have reset. */
+const nextUtcDay = (ms: number) => Date.parse(`${utcDay(ms)}T00:00:00Z`) + 86_400_000 + 5 * 60_000;
+
+/**
  * A client whose calls wait out a refused call (a plan's rate or usage
  * limit) instead of failing — for the pack author and anything else that
  * talks to a plan-limited CLI for hours.

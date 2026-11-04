@@ -11,7 +11,7 @@ import { Judge } from './judge.js';
 import { Meter } from './meter.js';
 import { dirBytes, listFiles, loadPack, LoadedPack, packsDir, runsDir, seededKey, stageCorpus, StagedCorpus, stageUpdate, validatePack } from './pack.js';
 import { citationsIn, taskPrompt } from './prompts.js';
-import { QuotaGuard } from './quota.js';
+import { EmbeddingBudget, QuotaGuard } from './quota.js';
 import { recordKey, RunMeta, RunStore } from './runstore.js';
 import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
@@ -57,6 +57,8 @@ export interface RunOptions {
   packConcurrency?: number;
   quota?: boolean;
   embeddingTokenCap?: number;
+  /** At most this many embedding tokens per UTC day (a shared pool's free quotas reset at 00:00 UTC). */
+  embeddingDailyCap?: number;
   /** Skip scoring (answers only) or answering (score what is there). */
   skipScoring?: boolean;
   /** Tests: stand-ins for Codex, the judge and the embedder. */
@@ -129,6 +131,15 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     store.log(m, d);
   } });
 
+  const budget = new EmbeddingBudget({
+    dailyTokens: opts.embeddingDailyCap,
+    usedToday: (day) => meter.all((e) => e.at.startsWith(day)).reduce((s, e) => s + (e.embeddingTokens ?? 0), 0),
+    log: (m, d) => {
+      progress(`${m}${d ? ` ${JSON.stringify(d)}` : ''}`);
+      store.log(m, d);
+    },
+  });
+
   const workspaceConfig = opts.configFrom ? loadConfig(opts.configFrom) : null;
   const embedder = opts.overrides?.embedder
     ?? (opts.embedding === 'local' || !workspaceConfig
@@ -148,6 +159,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     buildEffort: models.buildEffort,
     answerEffort: models.answerEffort,
     embeddingTokenCap: opts.embeddingTokenCap,
+    embeddingBudget: budget,
   });
 
   const meta: RunMeta = store.meta() ?? {
@@ -263,7 +275,21 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         }
       }
     };
-    await mapLimit(packs, opts.packConcurrency ?? 1, runPack, (err, pack) => {
+    // a pack the embedding budget cut short waits for it to open, then goes on where it stopped
+    const runPackWithinBudget = async (pack: LoadedPack) => {
+      for (;;) {
+        const before = budget.refusals;
+        try {
+          await runPack(pack);
+        } catch (err) {
+          if (budget.refusals === before) throw err;
+        }
+        if (budget.refusals === before) return;
+        progress(`[${pack.manifest.id}] cut short by the embedding budget: going on once it opens`);
+        await budget.wait();
+      }
+    };
+    await mapLimit(packs, opts.packConcurrency ?? 1, runPackWithinBudget, (err, pack) => {
       progress(`pack ${pack.manifest.id} stopped: ${err instanceof Error ? err.message : String(err)}`);
       store.log('pack failed', { pack: pack.manifest.id, error: err instanceof Error ? err.message : String(err) });
     });
