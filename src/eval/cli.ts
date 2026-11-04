@@ -10,7 +10,7 @@ import { loadPack, packsDir, validatePack } from './pack.js';
 import { listRecipes, recipe } from './packs/index.js';
 import './packs/recipes.js';
 import { writeReport } from './report.js';
-import { runEval } from './run.js';
+import { runEval, scoreRun } from './run.js';
 import { Meter, sumEvents } from './meter.js';
 import { RunStore } from './runstore.js';
 import { DEFAULT_SYSTEMS, SYSTEMS } from './systems/index.js';
@@ -150,6 +150,17 @@ export function registerEvalCommands(program: Command): void {
       console.log(`\n${res.builds} builds, ${res.answers} answers, ${res.scores} scores\nreport: ${report.md}`);
       // child processes and embedder timers can keep the loop alive after a run: it is over
       process.exit(process.exitCode ?? 0);
+    });
+  evalCmd
+    .command('score <runDir>')
+    .description('judge what a stopped run has answered so far (Claude), then render its report')
+    .option('--judge <provider>', 'judge CLI provider', 'claude-cli')
+    .option('--judge-model <model>', 'judge model', '')
+    .action(async (runDir: string, opts) => {
+      const n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`) });
+      const r = writeReport(path.resolve(runDir));
+      console.log(`\n${n} answers scored\nreport: ${r.md}`);
+      process.exit(0);
     });
   evalCmd
     .command('status <runDir>')

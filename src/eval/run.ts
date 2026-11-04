@@ -9,7 +9,7 @@ import { createConfiguredEmbeddingProvider } from '../ingest/embedding-router.js
 import { LlmClient } from '../llm/client.js';
 import { Judge } from './judge.js';
 import { Meter } from './meter.js';
-import { dirBytes, loadPack, LoadedPack, runsDir, seededKey, stageCorpus, StagedCorpus, stageUpdate, validatePack } from './pack.js';
+import { dirBytes, listFiles, loadPack, LoadedPack, packsDir, runsDir, seededKey, stageCorpus, StagedCorpus, stageUpdate, validatePack } from './pack.js';
 import { citationsIn, taskPrompt } from './prompts.js';
 import { QuotaGuard } from './quota.js';
 import { recordKey, RunMeta, RunStore } from './runstore.js';
@@ -268,18 +268,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       store.log('pack failed', { pack: pack.manifest.id, error: err instanceof Error ? err.message : String(err) });
     });
 
-    if (!opts.skipScoring) {
-      // what is not scored yet, or was answered again after its score
-      const answers = store.allAnswers().filter((a) => {
-        const scored = store.score(recordKey('score', a.pack, a.system, a.taskId, 'latency_ms'));
-        return !scored || scored.at < a.at;
-      });
-      if (answers.length) {
-        progress(`scoring ${answers.length} answers`);
-        for (const r of await scoreUsage({ answers, tasks: tasksByKey, citing }, judge)) store.putScore(r);
-        for (const r of await scoreEmergence({ answers, tasks: tasksByKey, corpusDocs }, judge)) store.putScore(r);
-      }
-    }
+    if (!opts.skipScoring) await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing }, progress);
   } finally {
     await shim.close();
     for (const l of loaded) l.staged.cleanup();
@@ -288,6 +277,56 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
 }
 
 /** Build (or reopen) a group's knowledge base; false when it failed, so the run goes on without it. */
+/**
+ * Judge every answer not scored yet, or answered again since its score: one
+ * blind pass over all systems at once (usage), then the emergence probes.
+ * The judge is Claude, so this runs while Codex is paused for its plan window.
+ */
+export async function scoreAnswers(
+  store: RunStore, judge: Judge,
+  ctx: { tasks: Map<string, Task>; corpusDocs: Map<string, Set<string>>; citing: Set<string> },
+  progress: (m: string) => void = () => {},
+): Promise<number> {
+  const answers = store.allAnswers().filter((a) => {
+    if (!ctx.tasks.has(`${a.pack}|${a.taskId}`)) return false;
+    const scored = store.score(recordKey('score', a.pack, a.system, a.taskId, 'latency_ms'));
+    return !scored || scored.at < a.at;
+  });
+  if (!answers.length) return 0;
+  progress(`scoring ${answers.length} answers`);
+  for (const r of await scoreUsage({ answers, tasks: ctx.tasks, citing: ctx.citing }, judge)) store.putScore(r);
+  for (const r of await scoreEmergence({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge)) store.putScore(r);
+  return answers.length;
+}
+
+/**
+ * `knode-os eval score <runDir>`: judge what a run has answered so far, from
+ * its records and the packs it names — with no model of its own running, so
+ * only while the run itself is stopped.
+ */
+export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; onProgress?: (m: string) => void } = {}): Promise<number> {
+  const store = new RunStore(runDir);
+  const meta = store.meta();
+  if (!meta) throw new Error(`not a run directory: ${runDir}`);
+  const meter = new Meter(path.join(runDir, 'meter.jsonl'));
+  const quota = new QuotaGuard({ enabled: false, log: (m, d) => opts.onProgress?.(`${m}${d ? ` ${JSON.stringify(d)}` : ''}`) });
+  const client = new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 });
+  const judge = new Judge({ client, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
+  const tasks = new Map<string, Task>();
+  const corpusDocs = new Map<string, Set<string>>();
+  for (const name of meta.packs) {
+    const dir = path.isAbsolute(name) ? name : path.join(packsDir(), name);
+    if (!fs.existsSync(path.join(dir, 'pack.json'))) continue;
+    const pack = loadPack(dir);
+    for (const t of pack.tasks) tasks.set(`${pack.manifest.id}|${t.id}`, t);
+    const docs = new Set(pack.docs.map((d) => d.path));
+    for (const batch of pack.updates) for (const f of listFiles(path.join(pack.dir, 'updates', batch))) docs.add(f);
+    corpusDocs.set(pack.manifest.id, docs);
+  }
+  const citing = new Set(makeSystems(meta.systems).filter((s) => s.answers && s.kind !== 'reference').map((s) => s.id));
+  return scoreAnswers(store, judge, { tasks, corpusDocs, citing }, opts.onProgress);
+}
+
 async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: string, members: SystemUnderTest[], fraction: number, seed: string | number, progress: (m: string) => void): Promise<boolean> {
   const builder = members.find((s) => s.build);
   if (!builder) return true;
@@ -349,6 +388,8 @@ async function answerAll(
   let done = 0;
   await mapLimit(todo, s.serial ? 1 : concurrency, async (t) => {
     const key = recordKey('answer', env.pack.manifest.id, s.id, t.id, fraction, seed, batch);
+    // every answer, not only agents': one-shot systems spend the same plan
+    await env.quota.wait();
     const mark = meter.mark();
     const t0 = Date.now();
     let rec: AnswerRecord;

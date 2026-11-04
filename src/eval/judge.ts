@@ -74,7 +74,6 @@ export class Judge {
     const batches: I[][] = [];
     for (let i = 0; i < todo.length; i += this.batchSize) batches.push(todo.slice(i, i + this.batchSize));
     await mapLimit(batches, this.opts.concurrency ?? 2, async (group) => {
-      await this.opts.quota?.wait();
       const user = JSON.stringify({ items: group.map((item) => ({ id: item.id, ...(render(item) as object) })) }, null, 1);
       let usage: CallUsage | null = null;
       const t0 = Date.now();
