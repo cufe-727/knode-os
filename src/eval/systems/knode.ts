@@ -9,6 +9,7 @@ import { sync } from '../../ingest/sync.js';
 import { parseFrontmatter } from '../../markdown.js';
 import { ask } from '../../search/ask.js';
 import { search } from '../../search/search.js';
+import type { ChatMessage, LlmClient } from '../../llm/client.js';
 import { generateWiki } from '../../wiki/generate.js';
 import { refineWiki } from '../../wiki/refine.js';
 import { isolatedCopy, runAgent } from '../agent.js';
@@ -205,11 +206,15 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
 
 export function knodeAsk(): SystemUnderTest {
   return knodeSystem('knode-ask', 'knode-os ask (hybrid retrieval, cited answer)', 'kb', true, {
+    // the embedded PGlite index blocks the process under overlapping ask() queries now and then: one at a time
+    serial: true,
     async answer(task, prompt, env) {
       const s = stateFor(env);
       const ctx = await open(s);
-      const llm = shimClient(env, { system: 'knode-ask', stage: 'answer', task: task.id });
-      const res = await ask(ctx.store, ctx.config, ctx.embedder, llm, prompt, { mode: 'hybrid' });
+      // ask retrieves with its question: give it the question alone, and the shared output rules to its model call
+      const rules = prompt.startsWith(task.question) ? prompt.slice(task.question.length) : '';
+      const llm = withAppendedRules(shimClient(env, { system: 'knode-ask', stage: 'answer', task: task.id }), rules);
+      const res = await ask(ctx.store, ctx.config, ctx.embedder, llm, task.question, { mode: 'hybrid' });
       // ask's own [n] citations, and any [doc: path] the answer wrote under the shared output rules
       const docs = new Set(env.staged.docs.map((d) => d.path));
       const citations: Citation[] = [...new Set([...res.citations.flatMap((c) => toCorpus(s, c.path)), ...citationsIn(res.answer, docs).map((c) => c.doc)])].map((doc) => ({ doc }));
@@ -308,6 +313,21 @@ export function agentKnodeWiki(): SystemUnderTest {
         copy.cleanup();
       }
     },
+  });
+}
+
+/** A client that adds `rules` to the last user message of every call — the output contract every system answers under. */
+function withAppendedRules(client: LlmClient, rules: string): LlmClient {
+  if (!rules.trim()) return client;
+  const add = (messages: ChatMessage[]): ChatMessage[] => {
+    const i = messages.map((m) => m.role).lastIndexOf('user');
+    return i < 0 ? [...messages, { role: 'user', content: rules.trim() }] : messages.map((m, k) => (k === i ? { ...m, content: `${m.content}${rules}` } : m));
+  };
+  const complete = client.complete.bind(client);
+  const completeJson = client.completeJson.bind(client);
+  return Object.assign(Object.create(client) as LlmClient, {
+    complete: (messages: ChatMessage[], opts?: Parameters<LlmClient['complete']>[1]) => complete(add(messages), opts),
+    completeJson: <T>(messages: ChatMessage[], opts?: Parameters<LlmClient['completeJson']>[1]) => completeJson<T>(add(messages), opts),
   });
 }
 
