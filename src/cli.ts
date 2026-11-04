@@ -29,7 +29,8 @@ import { readEntityCorrections } from './graph/corrections.js';
 import { auditDuplicateEntities } from './graph/dedupe.js';
 import { reviewClaims } from './graph/claim-review.js';
 import { resolveEntityId } from './graph/resolve.js';
-import { cancelJob, getJob, listJobs, queueJob, retryJob, ResearchJob, ResearchStatus } from './research/jobs.js';
+import { cancelJob, getJob, listJobs, queueJob, resumeJob, retryJob, ResearchJob, ResearchStatus } from './research/jobs.js';
+import { activePause } from './research/failure.js';
 import { killAgentsFor } from './research/launch.js';
 import { McpEndpoint } from './research/workspace.js';
 import { runChatTurn } from './chat/runner.js';
@@ -42,7 +43,7 @@ import { launchArgs } from './research/launch.js';
 import { loadProfile, loadProfiles, profileYaml } from './research/profile.js';
 import { captureUrl } from './research/capture.js';
 import { loadResearchSources, sourceProblem } from './research/sources.js';
-import { continueStudies, createStudy, listStudies, refineStudy, startProblem, startStudy, cancelStudy, studyPayload, studyView, StudyRunner } from './research/study.js';
+import { archiveStudy, continueStudies, createStudy, listStudies, refineStudy, removeStudy, resumeStudy, retryStudy, startProblem, startStudy, cancelStudy, studyPause, studyPayload, studyView, StudyRunner } from './research/study.js';
 import type { StudyBrief } from './research/refine.js';
 import { runDocumentPass } from './ingest/background.js';
 import type { TaskEstimate } from './estimate/estimate.js';
@@ -1983,13 +1984,20 @@ async function runStudyNow(ctx: Awaited<ReturnType<typeof createContext>>, id: s
       await continueStudies(ctx, log);
       const study = await getJob(ctx.store, id);
       if (!study) throw new Error(`no study ${id}`);
+      // a pause outlasts this process: say when, and leave it to serve (or to another run then)
+      const pause = await studyPause(ctx, study);
+      if (pause) {
+        log(`paused until ${new Date(pause.until).toLocaleString()} — ${pause.reason}`);
+        log(`serve goes on by itself then; or run \`research study resume ${id}\` once the limit is lifted`);
+        return;
+      }
       if (study.status === 'queued') {
         const [claimed] = await ctx.store.query<{ id: string }>(`UPDATE research_jobs SET status = 'running', started_at = now(), attempts = attempts + 1 WHERE id = $1 AND status = 'queued' RETURNING id`, [id]);
         if (claimed) await runResearchJob(ctx, (await getJob(ctx.store, id))!, { mcp, log });
         continue;
       }
       if (study.status !== 'waiting') return;
-      const pages = await listJobs(ctx.store, { study: id, status: 'queued', limit: 100 });
+      const pages = (await listJobs(ctx.store, { study: id, status: 'queued', limit: 100 })).filter((pg) => !activePause(pg.payload));
       if (pages.length === 0) return;
       for (const page of pages) {
         const [claimed] = await ctx.store.query<{ id: string }>(`UPDATE research_jobs SET status = 'running', started_at = now(), attempts = attempts + 1 WHERE id = $1 AND status = 'queued' RETURNING id`, [page.id]);
@@ -2106,6 +2114,8 @@ study
       }
       printBrief(job.id, job.status, view.payload.brief, job.status === 'draft' ? startProblem(ctx, job) : null);
       console.log(`\nstages: ${view.payload.steps.map((st) => `${st.name}=${st.status}${st.detail ? ` (${st.detail})` : ''}`).join('  ')}`);
+      if (view.pause) console.log(`paused until ${new Date(view.pause.until).toLocaleString()} (${view.pause.kind}): ${view.pause.reason}`);
+      if (view.archivedAt) console.log(`archived ${new Date(view.archivedAt).toLocaleString()}`);
       console.log(`\npages:${view.pages.map((pg) => `\n  ${pg.status.padEnd(10)} ${pg.path}${pg.trust ? `  [${pg.trust}]` : ''}${pg.error ? `  ✗ ${pg.error.slice(0, 100)}` : ''}`).join('')}`);
       console.log(`report: ${view.reportPath}${view.reportExists ? '' : ' (not yet)'}`);
       console.log(`sources: ${view.captures.length} captured — ${view.registerPath}`);
@@ -2115,15 +2125,75 @@ study
   });
 study
   .command('list')
-  .action(async () => {
+  .option('--archived', 'the archived studies instead')
+  .action(async (opts: { archived?: boolean }) => {
     const ctx = await createContext(dataDir());
     try {
-      const jobs = await listStudies(ctx, 50);
+      const jobs = await listStudies(ctx, 50, { archived: Boolean(opts.archived) });
       for (const j of jobs) {
         const p = studyPayload(j);
-        console.log(`${j.id}  ${j.status.padEnd(10)} ${p.stage.padEnd(8)} ${p.brief.title.slice(0, 70)}`);
+        const pause = await studyPause(ctx, j);
+        console.log(`${j.id}  ${j.status.padEnd(10)} ${p.stage.padEnd(8)} ${p.brief.title.slice(0, 70)}${pause ? `  ⏸ until ${new Date(pause.until).toLocaleString()} (${pause.kind})` : ''}`);
       }
-      if (jobs.length === 0) console.log('(no studies)');
+      if (jobs.length === 0) console.log(opts.archived ? '(no archived studies)' : '(no studies)');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+study
+  .command('retry <id>')
+  .description('queue a failed or cancelled study again from where it stopped: its failed pages, then its report')
+  .action(async (id: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const job = await getJob(ctx.store, id);
+      if (!job || job.kind !== 'study') throw new Error(`no study ${id}`);
+      if (job.status !== 'failed' && job.status !== 'cancelled') throw new Error(`a ${job.status} study is not retried${job.status === 'queued' || job.status === 'waiting' ? ' — `research study resume` runs a paused one now' : ''}`);
+      const next = await retryStudy(ctx, job);
+      console.log(`${next.id}: ${next.status} (${studyPayload(next).stage}) — serve picks it up`);
+    } finally {
+      await ctx.store.close();
+    }
+  });
+study
+  .command('resume <id>')
+  .description('run a study that waits out a pause (a spent usage limit) now, instead of when the pause ends')
+  .action(async (id: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const job = await getJob(ctx.store, id);
+      if (!job || job.kind !== 'study') throw new Error(`no study ${id}`);
+      const { resumed } = await resumeStudy(ctx, job);
+      console.log(resumed ? `${resumed} paused job(s) queued to run now` : 'nothing in this study is paused');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+for (const [action, archived] of [['archive', true], ['unarchive', false]] as const) {
+  study
+    .command(`${action} <id>`)
+    .description(archived ? 'take a finished study off the list; its report, pages and sources stay where they are' : 'bring an archived study back to the list')
+    .action(async (id: string) => {
+      const ctx = await createContext(dataDir());
+      try {
+        const job = await getJob(ctx.store, id);
+        if (!job || job.kind !== 'study') throw new Error(`no study ${id}`);
+        if (!(await archiveStudy(ctx, job, archived))) throw new Error(`a ${job.status} study is not ${action}d — only a finished one`);
+        console.log(`${id}: ${action}d`);
+      } finally {
+        await ctx.store.close();
+      }
+    });
+}
+study
+  .command('remove <id>')
+  .description('remove a draft, or a study that failed or was cancelled: its jobs and run logs. What it wrote into the knowledge base stays')
+  .action(async (id: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const r = await removeStudy(ctx, id);
+      if (!r) throw new Error('only a draft, or a study that failed or was cancelled, can be removed — archive a finished one, cancel a running one');
+      console.log(`removed ${r.removed.length} job(s)${r.kept.length ? `; kept in the knowledge base: ${r.kept.join(', ')}` : ''}`);
     } finally {
       await ctx.store.close();
     }
@@ -2191,6 +2261,17 @@ research
     const ctx = await createContext(dataDir());
     try {
       console.log((await retryJob(ctx.store, id)) ? 'queued again' : 'not retryable');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+research
+  .command('resume <id>')
+  .description('run a job that waits out a pause (a spent usage limit) now')
+  .action(async (id: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log((await resumeJob(ctx.store, id)) ? 'queued to run now' : 'not paused');
     } finally {
       await ctx.store.close();
     }

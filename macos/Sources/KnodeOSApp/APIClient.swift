@@ -731,8 +731,9 @@ struct APIClient {
 
     /* ------------------------------ research studies ------------------------------ */
 
-    func studies() async throws -> [StudySummary] {
-        try await send("/api/research/studies?limit=80")
+    /// The studies not archived, or (`archived`) only the archived ones.
+    func studies(archived: Bool = false) async throws -> [StudySummary] {
+        try await send("/api/research/studies?limit=80\(archived ? "&archived=1" : "")")
     }
 
     func study(id: String) async throws -> StudyDetail {
@@ -763,6 +764,26 @@ struct APIClient {
 
     func cancelStudy(id: String) async throws -> [String: Int] {
         try await send("/api/research/studies/\(id)/cancel", method: "POST", body: Data("{}".utf8))
+    }
+
+    /// A failed or cancelled study, queued again from where it stopped.
+    func retryStudy(id: String) async throws -> StudyDetail {
+        try await send("/api/research/studies/\(id)/retry", method: "POST", body: Data("{}".utf8))
+    }
+
+    /// A study waiting out a pause (a spent usage limit) runs now.
+    func resumeStudy(id: String) async throws -> StudyDetail {
+        try await send("/api/research/studies/\(id)/resume", method: "POST", body: Data("{}".utf8))
+    }
+
+    /// A finished study off the list (or back on it); it keeps everything.
+    func archiveStudy(id: String, archived: Bool) async throws -> StudyDetail {
+        try await send("/api/research/studies/\(id)/\(archived ? "archive" : "unarchive")", method: "POST", body: Data("{}".utf8))
+    }
+
+    /// A failed or cancelled study's jobs and logs; what it wrote stays in the knowledge base.
+    func removeStudy(id: String) async throws -> StudyRemoval {
+        try await send("/api/research/studies/\(id)", method: "DELETE")
     }
 
     /// Mark a study's pages (or its captured sources) trusted.

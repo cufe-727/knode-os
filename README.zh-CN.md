@@ -210,7 +210,8 @@ knode-os trace sync           拉取新的 Claude Code / Codex trace 与 skills
 knode-os dream [--lookback d] 先同步 trace,再分析 → skills/memory/知识库建议
 knode-os research study new "<主题>" [--agent codex-cli] [--no-web] [--sources a,b] [--deep-research 连接:模型] [--start | --now]
                               研究课题:主题 → 研究简报(问题、页面、起始来源);--start 排队,--now 在本进程跑完 收集 → 分页 → 总报告
-                              (另有 study refine <id> [意见] [--answer "问题=回答"]、study start | run | show | list | cancel)
+                              (另有 study refine <id> [意见] [--answer "问题=回答"]、study start | run | show | list [--archived] | cancel | retry | resume | archive | unarchive | remove；
+                              agent 额度用完时任务会暂停到额度重置再自动继续，不算失败——见设计 22)
 knode-os research capture <url> [--study <id>]   把网页 / PDF / 数据文件存进 raw/docs/research,转换并索引
 knode-os research sources     playbooks/research/sources 下的研究来源(MCP 服务器、API、站点、数据源)
 knode-os research init [--now]  初始化知识库:先索引与抽取,再由 agent 写出 wiki/overview.md 与

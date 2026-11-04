@@ -240,6 +240,10 @@ regeneration and is itself a source.
   — a Docs or wiki link mirrored under raw/docs/feishu with its pictures and attachments, through lark-cli as the
   signed-in Feishu user (one device-flow authorization); linked documents polled by last-edit time, the changed
   ones re-fetched; long screenshots read in bands.
+- [22 — Research that waits out a usage limit, resumes where it stopped, and is put away](22-research-pauses-and-housekeeping.md)
+  — a session refused for a spent quota, a rate limit or a lost login pauses its job (and the account's queue)
+  until the reset the agent named, its attempts untouched; a restart requeues instead of failing; collect keeps
+  the notes it has; finished studies are archived, failed ones removed with their jobs and logs.
 - [16 — Time in the knowledge base: entries, mention timelines, measures and market data](16-time.md)
   — proposed: time belongs to entries (a post, comment or message at its
   minute, read from the export's headings); a census of mentions per entry;

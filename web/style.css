@@ -588,6 +588,7 @@ td.mono { font-size: 12px; }
 .job .jstatus.done { color: var(--good); }
 .job .jstatus.failed { color: var(--bad, #c0392b); }
 .job .jstatus.running, .job .jstatus.validating { color: var(--accent); }
+.jstatus.paused { color: var(--warn, #d08a1d); white-space: nowrap; }
 .job .jerr { color: var(--muted); font-size: 12px; grid-column: 2 / -1; }
 .job .jactions { display: flex; gap: 6px; }
 .job .jactions button, .rpage .ractions button, .rec .recactions button { padding: 2px 8px; font-size: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); cursor: pointer; }
@@ -1152,6 +1153,9 @@ body[data-role="member"] #btn-cfg-save, body[data-role="member"] #btn-cfg-test, 
 .study-steps li[data-status="done"] { border-left-color: var(--good); }
 .study-steps li[data-status="running"] { border-left-color: var(--accent); }
 .study-steps li[data-status="failed"] { border-left-color: var(--bad); }
+.study-steps li[data-status="paused"] { border-left-color: var(--warn, #d08a1d); }
+.study-list-buttons { display: inline-flex; gap: 6px; }
+#btn-study-archived[aria-pressed="true"] { border-color: var(--accent); }
 .study-steps li[data-status="skipped"], .study-steps li[data-status="pending"] { opacity: 0.7; }
 .study-block .rpage .jerr { display: block; color: var(--muted); font-size: 12px; }
 .jerr-inline { color: var(--bad); }

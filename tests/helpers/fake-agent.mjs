@@ -6,6 +6,8 @@
 //   FAKE_AGENT_MODE   good (default) | bad (missing sections) | contradict | drop-human
 //                     | bad-guide (init: the guide misses a section) | no-guide (init: only the overview is written)
 //                     | slow (sleeps 3 s first — cancel tests)
+//                     | limit (fails at once with claude's usage-limit result, as a spent 5-hour limit does)
+//   FAKE_AGENT_LIMIT_MATCH  with limit: only a prompt this pattern matches hits the limit (one collector of several)
 //                     | teach (chat: writes a note through knode_write + knode_sync)
 //   FAKE_AGENT_REVIEW critique → the first review of a run fails once, forcing a revise round
 //   FAKE_AGENT_SLEEP_MS  how long `slow` sleeps (default 3000)
@@ -42,6 +44,10 @@ try {
   // read-only workspace in some tests
 }
 if (mode === 'slow') await new Promise((resolve) => setTimeout(resolve, Number(process.env.FAKE_AGENT_SLEEP_MS ?? 3000)));
+if (mode === 'limit' && (!process.env.FAKE_AGENT_LIMIT_MATCH || new RegExp(process.env.FAKE_AGENT_LIMIT_MATCH).test(prompt))) {
+  emit({ type: 'result', subtype: 'success', is_error: true, result: "You've hit your 5-hour limit · resets 1:30am (Asia/Shanghai)", num_turns: 1, total_cost_usd: 0 });
+  process.exit(1);
+}
 
 if (phase === 'plan') {
   const sections = requiredSections.filter((s) => !/来源/.test(s)).slice(0, 2).map((title) => ({

@@ -250,12 +250,13 @@ knode-os research init [--now]   initialize the knowledge base: sync + extractio
                               wiki/overview.md and the AGENTS.md / CLAUDE.md guide later agents read, and queues topic pages
 knode-os research queue <kind> <target> [--now]   have the research agent write a wiki page (entity|concept|comparison|timeline|question|refresh|init)
 knode-os research ask "<question>"   answer a question and file it as wiki/questions/<slug>.md
-knode-os research list|show|run|cancel|retry|recommend|templates|export|reclaim
+knode-os research list|show|run|cancel|retry|resume|recommend|templates|export|reclaim
 knode-os research profiles | profile <name> [--use]   research profiles: effort, web search, verification, sub-agent roles and prompts
 knode-os research study new "<topic>" [--agent codex-cli] [--no-web] [--sources a,b] [--deep-research conn:model] [--start | --now]
                               a study: the topic refined into a brief (questions, pages, seed sources); --start queues it,
                               --now runs collect → pages → report here (also: study refine <id> [feedback] [--answer "q=a"],
-                              study start | run | show | list | cancel)
+                              study start | run | show | list [--archived] | cancel | retry | resume | archive | unarchive | remove;
+                              a run refused for a spent usage limit waits for its reset instead of failing — design 22)
 knode-os research capture <url> [--study <id>]   keep a web page / PDF / data file under raw/docs/research, converted and indexed
 knode-os research sources     the research sources under playbooks/research/sources (MCP servers, APIs, sites, datasources)
 knode-os chat "<message>" [-c <conversation>]   talk to the configured CLI about the knowledge base (it answers over MCP

@@ -162,7 +162,8 @@ import { applyClaimMerge, listClaimMerges, unmergeClaim } from '../graph/claim-m
 import { applyMerge, listMerges, unmergeEntity } from '../graph/merge.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { reviewClaims } from '../graph/claim-review.js';
-import { cancelJob, getJob, latestJob, listJobs, queueJob, retryJob, ResearchStatus, updateJob } from '../research/jobs.js';
+import { archiveJobs, cancelJob, deleteJobs, getJob, latestJob, listJobs, queueJob, resumeJob, retryJob, ResearchStatus, updateJob } from '../research/jobs.js';
+import { activePause } from '../research/failure.js';
 import { builtinAvailable, killAgentsFor } from '../research/launch.js';
 import { loadResearchTemplates, PHASES, RESEARCH_KINDS, ResearchKind } from '../research/templates.js';
 import { activeProfile, BUILTIN_PROFILES, deleteProfile, EFFORTS, effectivePipeline, isValidProfileName, loadProfile, loadProfiles, PIPELINE_MODES, profileSummary, ResearchProfile, rolePromptText, saveProfile, writeRolePrompt } from '../research/profile.js';
@@ -175,7 +176,7 @@ import { McpEndpoint, runsRoot } from '../research/workspace.js';
 import { recommendWikiTopics, refreshRecommendations } from '../research/recommend.js';
 import { captureUrl, readManifest } from '../research/capture.js';
 import { deleteResearchSource, loadResearchSources, redactSource, RESEARCH_SOURCE_KINDS, saveResearchSource, sourceProblem } from '../research/sources.js';
-import { cancelStudy, createStudy, deleteStudyDraft, listStudies, promoteStudy, refineStudyInBackground, refiningSince, startProblem, startStudy, StudyFiles, studyView, updateStudy, studyPayload } from '../research/study.js';
+import { archiveStudy, cancelStudy, createStudy, listStudies, promoteStudy, refineStudyInBackground, refiningSince, removeStudy, resumeStudy, retryStudy, startProblem, startStudy, StudyFiles, studyPause, studyView, updateStudy, studyPayload } from '../research/study.js';
 import { EXPORT_POLICY, exportStudy, StudyExportError } from '../research/export.js';
 import { webSearchEnabled, WEB_SEARCH_PROVIDERS } from '../research/web.js';
 import { lintWiki } from '../wiki/lint.js';
@@ -2376,13 +2377,16 @@ export function createApp(
 
   /* ------------------------------ research -------------------------------- */
 
+  // archived jobs are left out unless asked for (`archived=1` lists only them); a paused job carries `pause`
   app.get('/api/research/jobs', async (c) => {
     const ctx = requestCtx(c);
     const status = c.req.query('status');
-    return c.json(await listJobs(ctx.store, {
+    const jobs = await listJobs(ctx.store, {
       status: status ? (status.split(',').map((s) => s.trim()).filter(Boolean) as ResearchStatus[]) : undefined,
+      archived: c.req.query('archived') === '1',
       limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
-    }));
+    });
+    return c.json(jobs.map((j) => ({ ...j, pause: j.status === 'queued' ? activePause(j.payload) : null })));
   });
 
   app.post('/api/research/jobs', async (c) => {
@@ -2674,8 +2678,42 @@ export function createApp(
   });
 
   app.post('/api/research/jobs/:id/retry', async (c) => {
-    const job = await retryJob(requestCtx(c).store, c.req.param('id'));
+    const ctx = requestCtx(c);
+    const job = await retryJob(ctx.store, c.req.param('id'));
+    if (job) servicesFor(ctx)?.kickResearch();
     return job ? c.json(job) : c.json({ error: 'job is not in a retryable state' }, 400);
+  });
+
+  // a job waiting out a pause (a spent usage limit, docs/design/22) runs now
+  app.post('/api/research/jobs/:id/resume', async (c) => {
+    const ctx = requestCtx(c);
+    const job = await resumeJob(ctx.store, c.req.param('id'));
+    if (job) servicesFor(ctx)?.kickResearch();
+    return job ? c.json(job) : c.json({ error: 'job is not paused' }, 400);
+  });
+
+  // a finished job leaves the lists, and comes back; a study's page goes with its study
+  for (const [action, archived] of [['archive', true], ['unarchive', false]] as const) {
+    app.post(`/api/research/jobs/:id/${action}`, async (c) => {
+      const ctx = requestCtx(c);
+      const job = await getJob(ctx.store, c.req.param('id'));
+      if (!job) return c.json({ error: 'no such job' }, 404);
+      if (job.kind === 'study' || typeof job.payload.study === 'string') return c.json({ error: `a study and its pages are ${action}d together: use /api/research/studies/<id>/${action}` }, 400);
+      const [done] = await archiveJobs(ctx.store, [job.id], archived);
+      return done ? c.json(await getJob(ctx.store, done)) : c.json({ error: `a ${job.status} job is not ${action}d — only a finished one` }, 400);
+    });
+  }
+
+  // a job that failed or was cancelled goes, with its run directory; the page it wrote, if any, stays
+  app.delete('/api/research/jobs/:id', async (c) => {
+    const ctx = requestCtx(c);
+    const job = await getJob(ctx.store, c.req.param('id'));
+    if (!job) return c.json({ error: 'no such job' }, 404);
+    if (job.kind === 'study' || typeof job.payload.study === 'string') return c.json({ error: 'a study and its pages are removed together: DELETE /api/research/studies/<id>' }, 400);
+    if (job.status !== 'failed' && job.status !== 'cancelled') return c.json({ error: `a ${job.status} job is not removed — only a failed or cancelled one (archive a finished one)` }, 400);
+    const removed = await deleteJobs(ctx.store, [job.id]);
+    fs.rmSync(path.join(runsRoot(ctx.dataDir, ctx.config.research?.runsDir ?? '.runs'), job.id), { recursive: true, force: true });
+    return c.json({ removed });
   });
 
 
@@ -2688,18 +2726,21 @@ export function createApp(
     return job && job.kind === 'study' ? job : null;
   };
 
+  // the studies not archived, newest first (`archived=1`: only the archived ones)
   app.get('/api/research/studies', async (c) => {
     const ctx = requestCtx(c);
-    const jobs = await listStudies(ctx, Math.min(200, Number(c.req.query('limit') ?? 50) || 50));
-    return c.json(jobs.map((j) => {
+    const jobs = await listStudies(ctx, Math.min(200, Number(c.req.query('limit') ?? 50) || 50), { archived: c.req.query('archived') === '1' });
+    return c.json(await Promise.all(jobs.map(async (j) => {
       const p = studyPayload(j);
       return {
         id: j.id, status: j.status, stage: p.stage, title: p.brief.title, slug: j.target, topic: p.topic.slice(0, 400),
         pages: p.brief.pages.length, children: p.children.length, runner: p.runner, web: p.sources.web,
         createdAt: j.createdAt, startedAt: j.startedAt, finishedAt: j.finishedAt, error: j.error, steps: p.steps,
         outputPath: j.outputPath,
+        pause: await studyPause(ctx, j),
+        archivedAt: typeof j.payload.archivedAt === 'string' ? new Date(j.payload.archivedAt).toISOString() : null,
       };
-    }));
+    })));
   });
 
   app.post('/api/research/studies', async (c) => {
@@ -2785,22 +2826,38 @@ export function createApp(
     const job = await studyOr404(ctx, c.req.param('id'));
     if (!job) return c.json({ error: 'no such study' }, 404);
     if (!['failed', 'cancelled'].includes(job.status)) return c.json({ error: `a ${job.status} study is not retried` }, 400);
-    const children = await listJobs(ctx.store, { study: job.id, limit: 100 });
-    for (const child of children) if (child.status === 'failed' || child.status === 'cancelled') await retryJob(ctx.store, child.id);
-    const p = studyPayload(job);
-    const stage = p.stage === 'pages' ? (children.length ? 'pages' : 'collect') : p.stage;
-    await updateJob(ctx.store, job.id, {
-      status: stage === 'pages' ? 'waiting' : 'queued', error: null, finishedAt: null, attempts: 0,
-      payload: { ...job.payload, stage, rejections: [] },
-    });
+    const retried = await retryStudy(ctx, job);
     servicesFor(ctx)?.kickResearch();
-    return c.json(await studyView(ctx, (await getJob(ctx.store, job.id))!));
+    return c.json(await studyView(ctx, retried));
   });
 
+  // a paused study (its collect, its report, or its pages) runs now instead of when its pause ends
+  app.post('/api/research/studies/:id/resume', async (c) => {
+    const ctx = requestCtx(c);
+    const job = await studyOr404(ctx, c.req.param('id'));
+    if (!job) return c.json({ error: 'no such study' }, 404);
+    const { resumed } = await resumeStudy(ctx, job);
+    if (resumed === 0) return c.json({ error: 'nothing in this study is paused' }, 400);
+    servicesFor(ctx)?.kickResearch();
+    return c.json({ ...(await studyView(ctx, (await getJob(ctx.store, job.id))!)), resumed });
+  });
+
+  // a finished study leaves the list with its pages' jobs, and keeps everything (unarchive brings it back)
+  for (const [action, archived] of [['archive', true], ['unarchive', false]] as const) {
+    app.post(`/api/research/studies/:id/${action}`, async (c) => {
+      const ctx = requestCtx(c);
+      const job = await studyOr404(ctx, c.req.param('id'));
+      if (!job) return c.json({ error: 'no such study' }, 404);
+      const next = await archiveStudy(ctx, job, archived);
+      return next ? c.json(await studyView(ctx, next)) : c.json({ error: `a ${job.status} study is not ${action}d — cancel it first, or wait for it to finish` }, 400);
+    });
+  }
+
+  // a draft, or a study that failed or was cancelled: its jobs and run logs go; what it wrote into the knowledge base stays
   app.delete('/api/research/studies/:id', async (c) => {
     const ctx = requestCtx(c);
-    const removed = await deleteStudyDraft(ctx, c.req.param('id'));
-    return removed ? c.json({ removed }) : c.json({ error: 'only a draft that never started can be deleted — cancel a running study instead' }, 400);
+    const removed = await removeStudy(ctx, c.req.param('id'));
+    return removed ? c.json(removed) : c.json({ error: 'only a draft, or a study that failed or was cancelled, can be removed — archive a finished one, cancel a running one' }, 400);
   });
 
   // a person's review of what a study produced: its pages, and the sources it captured

@@ -63,7 +63,8 @@ topic ──refine (one call, no tools)──▶ brief (draft) ──edit / refi
 Statuses: `draft` → `queued` → `running` (collect) → `waiting` (pages) → `queued` → `running` (report) → `done`.
 `continueStudies` runs on every tick of the research loop and when any job ends, so a study never waits on a page
 that is gone; a cancelled study cancels its unfinished pages. Retry puts a failed study back at the stage it failed
-in, with its failed pages.
+in, with its failed pages. A study whose agent ran out of usage waits for the reset instead of failing, and goes on
+from where it stopped; a finished study can be archived, a failed one removed (docs/design/22).
 
 ## 3. Layout
 
@@ -116,14 +117,14 @@ default) a study's own web choice widens it for that study, as a profile's `sear
 - Web UI: **Research → Studies** (compose, refine with answers and edits, start, watch the stages, open the report
   and pages, promote pages or sources, session logs, **Export ↗**) and **Research → Sources** (web settings, research sources).
 - HTTP: `GET/POST /api/research/studies`, `GET/PUT/DELETE /api/research/studies/:id`,
-  `POST /api/research/studies/:id/{refine,start,cancel,retry,promote}`, `GET /api/research/studies/:id/log?label=`,
+  `POST /api/research/studies/:id/{refine,start,cancel,retry,resume,archive,unarchive,promote}`, `GET /api/research/studies/:id/log?label=`,
   `GET /api/research/studies/:id/export[?download=1]`,
   `POST /api/research/capture`, `GET /api/research/captures`, `GET /api/research/sources`, `PUT/DELETE /api/research/sources/:id`.
 - MCP: `knode_capture`, `knode_web_fetch`, `knode_web_search` (configured only), `knode_api`, `knode_chart`, `knode_study`
   (list / show for every caller; create / refine / start from this machine's own clients only), `knode_read` with
   `section` / `offset` / `limit` / `outline`.
 - CLI: `knode-os research study new "<topic>" [--agent codex-cli] [--no-web] [--sources a,b] [--deep-research conn:model] [--start | --now]`,
-  `research study refine <id> [feedback] [--answer "q=a"]`, `research study start|run|show|list|cancel`,
+  `research study refine <id> [feedback] [--answer "q=a"]`, `research study start|run|show|list [--archived]|cancel|retry|resume|archive|unarchive|remove`,
   `research capture <url> [--study id]`, `research sources`.
 
 ## 6. Open items
