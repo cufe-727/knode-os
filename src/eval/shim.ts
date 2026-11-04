@@ -10,6 +10,8 @@ import type { EmbeddingProvider } from '../ingest/embeddings.js';
 import { cliCommand, codexExecArgs, renderCliPrompt, runProcess } from '../llm/cli.js';
 import type { ChatMessage, LlmClient } from '../llm/client.js';
 import { CallUsage, readCodexEvents } from '../llm/usage.js';
+import { isRefusal } from '../estimate/ledger.js';
+import { classifyFailure } from '../labeling/failures.js';
 import { Meter, MeterTag, parseTag } from './meter.js';
 
 /**
@@ -26,6 +28,8 @@ import { Meter, MeterTag, parseTag } from './meter.js';
  * A Codex call can take minutes. Headers go out at once and whitespace keeps
  * the body alive (fetch's body timeout is 300 s), and a failure after Codex
  * spent tokens is reported in a 200 body, never a 5xx a client would retry.
+ * A failure that spent nothing and should pass (the model at capacity, the
+ * network) is tried again here, outside the slot, after a backoff.
  */
 
 export interface ChatRequest {
@@ -240,6 +244,9 @@ export interface ShimOptions {
   answerEffort?: LlmEffort;
   embeddingTokenCap?: number;
   keepAliveMs?: number;
+  /** Tries again after a passing failure: the first wait, doubling up to 5 min (default 30 s). */
+  retryBaseMs?: number;
+  retries?: number;
 }
 
 export interface Shim {
@@ -252,6 +259,16 @@ export interface Shim {
 }
 
 const ANSWER_STAGES = new Set(['answer', 'agent', 'query', 'emergence']);
+
+/**
+ * Worth another try: Codex spent nothing and the cause should pass. A quota
+ * refusal is not — the quota guard waits that out between batches.
+ */
+export function retryableFailure(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  if ((err as { usage?: CallUsage | null }).usage || isRefusal(msg)) return false;
+  return /at capacity/i.test(msg) || classifyFailure(msg) === 'transient';
+}
 
 function textOf(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -281,6 +298,8 @@ export async function startShim(opts: ShimOptions): Promise<Shim> {
   const vectors = new VectorCache(opts.cacheDir ? path.join(opts.cacheDir, 'vectors.jsonl') : null);
   const cap = { tokens: opts.embeddingTokenCap ?? Infinity, used: 0 };
   const keepAlive = opts.keepAliveMs ?? 20_000;
+  const retryBase = opts.retryBaseMs ?? 30_000;
+  const retries = opts.retries ?? 5;
   const embedder = opts.embedder ? new MeteredEmbedder(opts.embedder, vectors, opts.meter, () => ({ system: 'unknown', stage: 'embed' }), cap) : null;
 
   const chat = async (req: http.IncomingMessage, res: http.ServerResponse) => {
@@ -318,15 +337,18 @@ export async function startShim(opts: ShimOptions): Promise<Shim> {
       if (reply) {
         opts.meter.record({ ...tag, model: reply.model, ms: reply.ms, ok: true, replayed: true, usage: reply.usage });
       } else {
-        const t0 = Date.now();
-        try {
-          const r = await slots.run(() => opts.backend.complete(request));
-          reply = { k: key, text: r.text, usage: r.usage, model: r.model, ms: Date.now() - t0 };
-          replies.put(reply);
-          opts.meter.record({ ...tag, model: r.model, ms: reply.ms, ok: true, replayed: false, usage: r.usage });
-        } catch (err) {
-          opts.meter.record({ ...tag, model: opts.backend.label, ms: Date.now() - t0, ok: false, replayed: false, usage: (err as { usage?: CallUsage | null }).usage ?? null });
-          throw err;
+        for (let attempt = 0; !reply; attempt++) {
+          const t0 = Date.now();
+          try {
+            const r = await slots.run(() => opts.backend.complete(request));
+            reply = { k: key, text: r.text, usage: r.usage, model: r.model, ms: Date.now() - t0 };
+            replies.put(reply);
+            opts.meter.record({ ...tag, model: r.model, ms: reply.ms, ok: true, replayed: false, usage: r.usage });
+          } catch (err) {
+            opts.meter.record({ ...tag, model: opts.backend.label, ms: Date.now() - t0, ok: false, replayed: false, usage: (err as { usage?: CallUsage | null }).usage ?? null });
+            if (attempt >= retries || !retryableFailure(err)) throw err;
+            await new Promise((resolve) => setTimeout(resolve, Math.min(5 * 60_000, retryBase * 2 ** attempt)));
+          }
         }
       }
       const usage = { prompt_tokens: reply.usage?.inputTokens ?? 0, completion_tokens: reply.usage?.outputTokens ?? 0, total_tokens: (reply.usage?.inputTokens ?? 0) + (reply.usage?.outputTokens ?? 0) };

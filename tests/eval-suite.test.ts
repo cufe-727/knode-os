@@ -11,7 +11,7 @@ import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { buildReportData, writeReport } from '../src/eval/report.js';
 import { runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
-import { ChatBackend, ChatRequest, decodeVector, startShim } from '../src/eval/shim.js';
+import { ChatBackend, ChatRequest, decodeVector, retryableFailure, startShim } from '../src/eval/shim.js';
 import { retrievalScores } from '../src/eval/metrics/retrieval.js';
 import { bootstrapMean, holm, pairedBootstrap, wilson } from '../src/eval/metrics/stats.js';
 import { characteristicTerms, directions, profileText } from '../src/eval/metrics/stylometry.js';
@@ -167,6 +167,36 @@ describe('agent audit and metering', () => {
       expect(u.calls).toBe(1);
       expect(u.embeddingCalls).toBe(1);
       expect(meter.all((e) => e.task === 't1')).toHaveLength(2);
+    } finally {
+      await shim.close();
+    }
+  });
+
+  it('tries a call again when the model is at capacity, not when the quota is spent', async () => {
+    const meter = new Meter();
+    const failures = ['codex exec failed (1): Selected model is at capacity. Please try a different model.', 'codex exec failed (1): You have hit your usage limit.'];
+    let calls = 0;
+    const backend: ChatBackend = {
+      label: 'flaky',
+      async complete() {
+        calls++;
+        if (calls === 1) throw new Error(failures[0]);
+        if (calls === 3) throw new Error(failures[1]);
+        return { text: `reply ${calls}`, usage: null, model: 'flaky' };
+      },
+    };
+    expect(retryableFailure(new Error(failures[0]))).toBe(true);
+    expect(retryableFailure(Object.assign(new Error('codex exec failed (1): stream disconnected'), { usage: { inputTokens: 10 } }))).toBe(false);
+    const shim = await startShim({ backend, meter, keepAliveMs: 5, retryBaseMs: 1 });
+    try {
+      const ask = async (content: string) => {
+        const res = await fetch(`${shim.baseUrl}/chat/completions`, { method: 'POST', headers: { authorization: `Bearer ${formatTag({ system: 's1', stage: 'answer' })}`, 'content-type': 'application/json' }, body: JSON.stringify({ messages: [{ role: 'user', content }] }) });
+        return JSON.parse(await res.text()) as { choices?: { message: { content: string } }[]; error?: { message: string } };
+      };
+      expect((await ask('one')).choices?.[0].message.content).toBe('reply 2');
+      expect((await ask('two')).error?.message).toContain('usage limit');
+      expect(calls).toBe(3);
+      expect(meter.usage(() => true).failedCalls).toBe(2);
     } finally {
       await shim.close();
     }
