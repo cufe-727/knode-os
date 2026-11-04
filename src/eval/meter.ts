@@ -39,15 +39,26 @@ export function parseTag(raw: string | undefined | null, fallbackStage = 'call')
     const [k, ...rest] = part.split('=');
     const v = rest.join('=').trim();
     if (!v) continue;
-    if (k.trim() === 'sys') out.system = v;
-    else if (k.trim() === 'stage') out.stage = v;
-    else if (k.trim() === 'task') out.task = v;
+    const value = safeDecode(v);
+    if (k.trim() === 'sys') out.system = value;
+    else if (k.trim() === 'stage') out.stage = value;
+    else if (k.trim() === 'task') out.task = value;
   }
   return out;
 }
 
+/** The tag as a bearer token: percent-encoded, since a header holds ASCII only and task ids may be Chinese. */
 export function formatTag(tag: MeterTag): string {
-  return [`sys=${tag.system}`, `stage=${tag.stage}`, ...(tag.task ? [`task=${tag.task}`] : [])].join(';');
+  const enc = encodeURIComponent;
+  return [`sys=${enc(tag.system)}`, `stage=${enc(tag.stage)}`, ...(tag.task ? [`task=${enc(tag.task)}`] : [])].join(';');
+}
+
+function safeDecode(v: string): string {
+  try {
+    return decodeURIComponent(v);
+  } catch {
+    return v;
+  }
 }
 
 export class Meter {

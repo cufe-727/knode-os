@@ -132,6 +132,9 @@ describe('agent audit and metering', () => {
   it('round-trips meter tags', () => {
     expect(parseTag(formatTag({ system: 'knode', stage: 'extract', task: 'q1' }))).toEqual({ system: 'knode', stage: 'extract', task: 'q1' });
     expect(parseTag('nonsense', 'call').stage).toBe('call');
+    const zh = formatTag({ system: 'knode-ask', stage: 'answer', task: 'q-e1-chat-远帆数据的高' });
+    expect(/^[\x20-\x7e]+$/.test(zh)).toBe(true);
+    expect(parseTag(zh).task).toBe('q-e1-chat-远帆数据的高');
   });
 
   it('pauses on a full window and goes on after it resets', async () => {
