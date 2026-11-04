@@ -269,7 +269,11 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     });
 
     if (!opts.skipScoring) {
-      const answers = store.allAnswers().filter((a) => !store.score(recordKey('score', a.pack, a.system, a.taskId, 'latency_ms')));
+      // what is not scored yet, or was answered again after its score
+      const answers = store.allAnswers().filter((a) => {
+        const scored = store.score(recordKey('score', a.pack, a.system, a.taskId, 'latency_ms'));
+        return !scored || scored.at < a.at;
+      });
       if (answers.length) {
         progress(`scoring ${answers.length} answers`);
         for (const r of await scoreUsage({ answers, tasks: tasksByKey, citing }, judge)) store.putScore(r);
@@ -335,7 +339,11 @@ async function answerAll(
 ): Promise<void> {
   if (!s.answers || !s.answer) return;
   const docs = new Set(env.staged.docs.map((d) => d.path));
-  const todo = tasks.filter((t) => !store.answer(recordKey('answer', env.pack.manifest.id, s.id, t.id, fraction, seed, batch)));
+  // an answer that ended in an error is asked again on resume (a timeout, a backend that was down)
+  const todo = tasks.filter((t) => {
+    const prev = store.answer(recordKey('answer', env.pack.manifest.id, s.id, t.id, fraction, seed, batch));
+    return !prev || Boolean(prev.error);
+  });
   if (!todo.length) return;
   progress(`[${env.pack.manifest.id}/${s.id}] answering ${todo.length} tasks`);
   let done = 0;

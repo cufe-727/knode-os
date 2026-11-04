@@ -158,7 +158,10 @@ Answer with JSON: {"tasks":[{"question":"…","keypoints":["…"],"facts":["<fac
     }
   }
 
-  const kept = await oracleCheck(author, drafts, docText, lang, opts.log);
+  // the author may write two questions for one fact or pair: the first is kept
+  const seenIds = new Set<string>();
+  const unique = drafts.filter((d) => (seenIds.has(d.id) ? false : (seenIds.add(d.id), true)));
+  const kept = await oracleCheck(author, unique, docText, lang, opts.log);
 
   // unanswerable: plausible questions the corpus does not answer, confirmed against the likeliest passages
   if (opts.plan.unanswerable) {

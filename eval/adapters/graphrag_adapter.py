@@ -94,7 +94,7 @@ def open_(req):
 
 def answer(req):
     method = "global" if req.get("mode") == "global" else "local"
-    r = subprocess.run([str(BIN), "query", "--root", req["work_dir"], "--method", method, "--query", req["question"]], text=True, capture_output=True, env=_env())
+    r = subprocess.run([str(BIN), "query", "--root", req["work_dir"], "--method", method, req["question"]], text=True, capture_output=True, env=_env())
     if r.returncode != 0:
         raise RuntimeError(f"graphrag query failed ({r.returncode}): {(r.stderr or r.stdout)[-1200:]}")
     return {"text": r.stdout.strip(), "contexts": []}
