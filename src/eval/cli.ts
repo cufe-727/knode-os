@@ -11,6 +11,8 @@ import { listRecipes, recipe } from './packs/index.js';
 import './packs/recipes.js';
 import { writeReport } from './report.js';
 import { runEval } from './run.js';
+import { Meter, sumEvents } from './meter.js';
+import { RunStore } from './runstore.js';
 import { DEFAULT_SYSTEMS, SYSTEMS } from './systems/index.js';
 import { EXTERNAL_SYSTEMS, externalPacks, venvPython } from './systems/external.js';
 import { Suite, SUITES } from './types.js';
@@ -148,6 +150,33 @@ export function registerEvalCommands(program: Command): void {
       console.log(`\n${res.builds} builds, ${res.answers} answers, ${res.scores} scores\nreport: ${report.md}`);
       // child processes and embedder timers can keep the loop alive after a run: it is over
       process.exit(process.exitCode ?? 0);
+    });
+  evalCmd
+    .command('status <runDir>')
+    .description('how far a run has got: builds, answers and scores per pack and system, and what it has used')
+    .action((runDir: string) => {
+      const store = new RunStore(path.resolve(runDir));
+      const meter = new Meter(path.join(path.resolve(runDir), 'meter.jsonl'));
+      const builds = store.allBuilds();
+      const answers = store.allAnswers();
+      const packs = [...new Set([...builds.map((b) => b.pack), ...answers.map((a) => a.pack)])].sort();
+      for (const pack of packs) {
+        const b = builds.filter((x) => x.pack === pack).map((x) => `${x.system}${x.ok ? '' : ' (failed)'}`);
+        const bySystem = new Map<string, { n: number; errors: number }>();
+        for (const a of answers.filter((x) => x.pack === pack)) {
+          const c = bySystem.get(a.system) ?? { n: 0, errors: 0 };
+          c.n++;
+          if (a.error) c.errors++;
+          bySystem.set(a.system, c);
+        }
+        console.log(`${pack}\n  built: ${b.join(', ') || '—'}\n  answered: ${[...bySystem].map(([sys, c]) => `${sys} ${c.n}${c.errors ? ` (${c.errors} errors)` : ''}`).join(', ') || '—'}`);
+      }
+      const all = meter.all();
+      const codex = sumEvents(all.filter((e) => e.system !== '__judge__'));
+      const judge = sumEvents(all.filter((e) => e.system === '__judge__'));
+      console.log(`\nmodel calls ${codex.calls} (${codex.failedCalls} failed, ${codex.replayedCalls} replayed), weighted tokens ${Math.round(codex.weightedTokens).toLocaleString()}, embedding tokens ${codex.embeddingTokens.toLocaleString()}`);
+      console.log(`judge calls ${judge.calls}, weighted tokens ${Math.round(judge.weightedTokens).toLocaleString()}; scores ${store.allScores().length}`);
+      if (all.length) console.log(`last activity ${all[all.length - 1].at}`);
     });
   evalCmd
     .command('report <runDir>')
