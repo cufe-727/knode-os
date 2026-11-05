@@ -1,0 +1,522 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { runProcess } from '../../llm/cli.js';
+import { foldSpace, seededKey } from '../pack.js';
+import type { CorpusDoc, Task } from '../types.js';
+import { finishDocpack } from './docpack.js';
+import { fetchCached, hfRows } from './fetch.js';
+import type { TaskPlan } from './gold.js';
+import { registerRecipe, RecipeContext } from './index.js';
+import { PackWriter } from './writer.js';
+
+/**
+ * Law packs (docs/design/23 §2).
+ *
+ * `law-cn`: Chinese national laws in force — the Civil Code's general part
+ * and contract book, the company, securities, labour contract, personal
+ * information, data security and cybersecurity laws — from the
+ * twang2218/chinese-law-and-regulations dataset, one document per chapter.
+ * Statutes cite each other by article, so the gold links come without a
+ * model: every explicit cross-reference (本法第X条, 本编第X条, 《…法》) is a
+ * `refers_to` link. When each law was adopted or last amended (its header)
+ * and when it took effect (its final article) give model-free temporal tasks.
+ *
+ * `law-us`: commercial contracts from CUAD v1 (The Atticus Project, CC BY
+ * 4.0), each split into parts. Lawyers annotated 41 clause types in every
+ * contract; the crisp ones become model-free tasks — governing law, the
+ * agreement date, and yes/no questions on clauses whose presence or absence
+ * the annotation settles.
+ *
+ * Both packs add author-drafted QA (docpack) on top.
+ */
+
+type Doc = CorpusDoc & { text: string };
+
+const hid = (...parts: string[]) => crypto.createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 10);
+
+const bySeed = <T>(items: T[], seed: string | number, key: (t: T) => string) =>
+  [...items].sort((a, b) => seededKey(seed, key(a)).localeCompare(seededKey(seed, key(b))));
+
+/** A small build drafts proportionally fewer tasks. */
+function scaledPlan(plan: TaskPlan, docs: number, full: number): TaskPlan {
+  const f = Math.min(1, docs / full);
+  return Object.fromEntries(Object.entries(plan).map(([k, n]) => [k, n ? Math.max(1, Math.round(n * f)) : 0]));
+}
+
+/* --------------------------------- law-cn --------------------------------- */
+
+const CN_DATASET = 'twang2218/chinese-law-and-regulations';
+const CN_LICENSE = 'Apache-2.0 (dataset); statute texts are not subject to copyright (著作权法第五条)';
+const CN_LAWS = ['中华人民共和国民法典', '中华人民共和国公司法', '中华人民共和国证券法', '中华人民共和国劳动合同法', '中华人民共和国个人信息保护法', '中华人民共和国数据安全法', '中华人民共和国网络安全法'];
+/** The Civil Code's books (编) kept: the general part and contracts. */
+const CIVIL_CODE_BOOKS = ['总则', '合同'];
+
+interface LawRow {
+  publish_date: string;
+  effective_date: string;
+  type: string;
+  status: string;
+  title: string;
+  office: string;
+  content?: string;
+}
+
+const NUM = '[零〇一二三四五六七八九十百千两]+';
+const HEADING = new RegExp(`^第(${NUM})(编|分编|章|节)\\s*(.*)$`);
+const ARTICLE = new RegExp(`^第(${NUM})条\\s`);
+const REF = new RegExp(`(?:本法|本编)((?:第${NUM}条(?:第${NUM}款)?(?:第${NUM}项)?(?:[、和或及至]|或者|以及)*)+)`, 'g');
+
+function cnNumber(s: string): number {
+  const digit: Record<string, number> = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  const unit: Record<string, number> = { 十: 10, 百: 100, 千: 1000 };
+  let total = 0;
+  let cur = 0;
+  for (const ch of s) {
+    if (ch in digit) cur = digit[ch];
+    else if (ch in unit) {
+      total += (cur || 1) * unit[ch];
+      cur = 0;
+    }
+  }
+  return total + cur;
+}
+
+const cnDate = (iso: string) => `${Number(iso.slice(0, 4))}年${Number(iso.slice(5, 7))}月${Number(iso.slice(8, 10))}日`;
+const squash = (s: string) => s.replace(/\s+/g, '');
+const shortName = (title: string) => title.replace(/^中华人民共和国/, '');
+
+interface Article {
+  no: string;
+  lines: string[];
+}
+
+/** An article, or a section (节) heading. */
+interface Block {
+  lines: string[];
+  article?: Article;
+  heading?: boolean;
+}
+
+interface Chapter {
+  book?: { no: string; title: string };
+  no: number;
+  label: string;
+  title: string;
+  blocks: Block[];
+}
+
+interface ParsedLaw {
+  row: LawRow;
+  short: string;
+  header: string;
+  chapters: Chapter[];
+}
+
+/** A statute's header (adoption and amendment history) and its chapters, in order. */
+function parseLaw(row: LawRow): ParsedLaw {
+  const lines = (row.content ?? '')
+    .replace(/\\([<>])/g, '$1')
+    .split('\n')
+    .map((l) => l.replace(/^[>\s]+/, '').replace(/\s+$/, ''))
+    .filter(Boolean);
+  const firstArticle = lines.findIndex((l) => ARTICLE.test(l));
+  if (firstArticle < 0) throw new Error(`${row.title}: no articles found`);
+  const firstHeading = lines.findIndex((l) => HEADING.test(l));
+  let start = firstArticle;
+  if (firstHeading >= 0 && firstHeading < firstArticle) {
+    // a table of contents repeats the first heading before the body begins
+    const again = lines.findIndex((l, i) => i > firstHeading && i < firstArticle && squash(l) === squash(lines[firstHeading]));
+    start = again >= 0 ? again : firstHeading;
+  }
+  const titleAt = lines.findIndex((l) => squash(l) === squash(row.title));
+  const preamble = lines.slice(titleAt + 1, start);
+  const toc = preamble.findIndex((l) => squash(l) === '目录');
+  const header = (toc >= 0 ? preamble.slice(0, toc) : preamble.filter((l) => !HEADING.test(l))).join('');
+
+  const chapters: Chapter[] = [];
+  let book: Chapter['book'];
+  let chapter: Chapter | undefined;
+  let block: Block | undefined;
+  const open = (no: number, label: string, title: string) => {
+    chapter = { book, no, label, title, blocks: [] };
+    chapters.push(chapter);
+    block = undefined;
+  };
+  for (const line of lines.slice(start)) {
+    const h = line.match(HEADING);
+    if (h) {
+      const [, no, level, rawTitle] = h;
+      const title = squash(rawTitle);
+      if (level === '编') {
+        book = { no, title };
+        chapter = undefined;
+      } else if (level === '章') open(cnNumber(no), `第${no}章 ${title}`, title);
+      else if (chapter) {
+        block = undefined;
+        chapter.blocks.push({ lines: [`## 第${no}${level} ${title}`], heading: true });
+      }
+      continue;
+    }
+    if (squash(line) === '附则') {
+      open((chapters.at(-1)?.no ?? 0) + 1, '附则', '附则');
+      continue;
+    }
+    if (!chapter) open(1, '正文', '正文');
+    const a = line.match(ARTICLE);
+    if (a || !block) {
+      block = { lines: [], ...(a ? { article: { no: a[1], lines: [] } } : {}) };
+      chapter!.blocks.push(block);
+    }
+    block.lines.push(line);
+    block.article?.lines.push(line);
+  }
+  return { row, short: shortName(row.title), header, chapters };
+}
+
+/** A chapter as one document, or — when long — as runs of articles, cut preferably at a section heading. */
+function pieces(c: Chapter, max = 6000): Block[][] {
+  const len = (b: Block) => b.lines.join('').length;
+  if (c.blocks.reduce((n, b) => n + len(b), 0) <= max * 1.5) return [c.blocks];
+  const out: Block[][] = [[]];
+  let size = 0;
+  for (const b of c.blocks) {
+    if (size && (size + len(b) > max || (b.heading && size > max / 2))) {
+      out.push([]);
+      size = 0;
+    }
+    out.at(-1)!.push(b);
+    size += len(b);
+  }
+  return out;
+}
+
+function lawDocs(law: ParsedLaw, books: string[]): { doc: Doc; articles: Article[] }[] {
+  const kept = law.chapters.filter((c) => !c.book || books.includes(c.book.title));
+  return kept.flatMap((c, ci) => {
+    const bookPart = c.book ? `第${c.book.no}编 ${c.book.title} · ` : '';
+    const dir = c.book ? `${law.short}/${String(cnNumber(c.book.no)).padStart(2, '0')}-${c.book.title}` : law.short;
+    const runs = pieces(c);
+    return runs.map((blocks, k) => {
+      const articles = blocks.flatMap((b) => (b.article ? [b.article] : []));
+      const range = runs.length > 1 && articles.length ? `（第${articles[0].no}条至第${articles.at(-1)!.no}条）` : '';
+      const p = `${dir}/${String(c.no).padStart(2, '0')}-${c.title.replace(/[\\/:*?"<>|]/g, '')}${runs.length > 1 ? `-${k + 1}` : ''}.md`;
+      const label = `${law.row.title} · ${bookPart}${c.label}${range}`;
+      const body = blocks.flatMap((b) => b.lines).join('\n\n');
+      const text = [`# ${label}`, ci === 0 && k === 0 && law.header ? law.header : '', body].filter(Boolean).join('\n\n') + '\n';
+      return { doc: { path: p, title: label, date: law.row.publish_date.slice(0, 10), lang: 'zh', source: `${CN_DATASET}: ${law.row.title}`, kind: 'statute', text }, articles };
+    });
+  });
+}
+
+/** Explicit cross-references in an article: to articles of the same law, and to other laws by name. */
+function crossRefs(law: ParsedLaw, a: Article): { tail: string; internal: boolean }[] {
+  const text = a.lines.join('');
+  const out: { tail: string; internal: boolean }[] = [];
+  for (const m of text.matchAll(REF)) {
+    for (const t of m[1].matchAll(new RegExp(`第(${NUM})条`, 'g'))) if (t[1] !== a.no) out.push({ tail: `${law.short} 第${t[1]}条`, internal: true });
+  }
+  for (const m of text.matchAll(/《([^》]+)》/g)) {
+    const name = shortName(m[1]);
+    if (!m[1].startsWith('关于') && name !== law.short) out.push({ tail: name, internal: false });
+  }
+  return out;
+}
+
+/** The header's last clause — adoption, or the latest amendment — as a dated event. */
+function lastEnactment(header: string): { quote: string; date: string; meeting: string; act: string } | undefined {
+  const parts = header.replace(/^[（(]|[）)]$/g, '').split(/\s+/).filter(Boolean);
+  const last = parts.at(-1);
+  const m = last?.match(/^(?:根据)?(\d{4}年\d{1,2}月\d{1,2}日)(.+?会议)(.*)$/);
+  return m ? { quote: last!, date: m[1], meeting: m[2], act: m[3] } : undefined;
+}
+
+async function buildLawCn(dir: string, ctx: RecipeContext) {
+  const laws = (ctx.options.laws as string[] | undefined) ?? CN_LAWS;
+  const books = (ctx.options.civilCodeBooks as string[] | undefined) ?? CIVIL_CODE_BOOKS;
+  const writer = new PackWriter(dir, {
+    id: 'law-cn',
+    version: 1,
+    title: 'Chinese civil, commercial and data laws in force',
+    domain: 'law',
+    languages: ['zh'],
+    description: `National laws with status 有效 from twang2218/chinese-law-and-regulations (${laws.map(shortName).join('、')}; Civil Code books ${books.join('、')}), one document per chapter; cross-references between articles as model-free links, enactment and commencement dates as model-free temporal tasks.`,
+    builder: { recipe: 'law-cn', options: { laws, civilCodeBooks: books, limit: ctx.limit } },
+  });
+
+  // national laws come first in the dataset; the metadata split finds their rows without their texts
+  const meta = await hfRows<LawRow>(CN_DATASET, { config: 'metadata', limit: 600, license: CN_LICENSE });
+  writer.addSource({ ...meta.record, note: `metadata of the first ${meta.rows.length} rows (national laws), to locate the selected laws` });
+  const parsed: ParsedLaw[] = [];
+  for (const title of laws) {
+    const idx = meta.rows.findIndex((r) => r.title === title && r.type === '法律' && r.status === '有效');
+    if (idx < 0) throw new Error(`law-cn: ${title} is not among the national laws in force`);
+    const { rows, record } = await hfRows<LawRow>(CN_DATASET, { offset: idx, limit: 1, license: CN_LICENSE });
+    const row = rows[0];
+    if (row?.title !== title || !row.content) throw new Error(`law-cn: row ${idx} is ${row?.title ?? 'missing'}, expected ${title}`);
+    writer.addSource({ ...record, note: `${title} (row ${idx}, ${row.content.length} chars, published ${row.publish_date.slice(0, 10)}, effective ${row.effective_date.slice(0, 10)})` });
+    parsed.push(parseLaw(row));
+  }
+
+  const perLaw = parsed.map((l) => lawDocs(l, books));
+  const all = perLaw.flat();
+  // a limited build still spans every law: chapters are taken round-robin
+  const keep = new Set<string>();
+  for (let i = 0; keep.size < (ctx.limit ?? all.length) && i < Math.max(...perLaw.map((x) => x.length)); i++) {
+    for (const list of perLaw) if (list[i] && keep.size < (ctx.limit ?? all.length)) keep.add(list[i].doc.path);
+  }
+  const chosen = all.filter((x) => keep.has(x.doc.path));
+  const docs = chosen.map((x) => x.doc);
+  const docOfArticle = new Map<string, string>();
+  for (const [li, list] of perLaw.entries()) {
+    for (const x of list) if (keep.has(x.doc.path)) for (const a of x.articles) docOfArticle.set(`${parsed[li].short}|${a.no}`, x.doc.path);
+  }
+
+  const seenLink = new Set<string>();
+  for (const [li, law] of parsed.entries()) {
+    writer.addAlias({ canonical: law.short, aliases: [law.row.title] });
+    for (const x of perLaw[li]) {
+      if (!keep.has(x.doc.path)) continue;
+      for (const a of x.articles) {
+        const head = `${law.short} 第${a.no}条`;
+        for (const r of crossRefs(law, a)) {
+          if (seenLink.has(`${head}|${r.tail}`)) continue;
+          seenLink.add(`${head}|${r.tail}`);
+          writer.addLink({ head, relation: 'refers_to', tail: r.tail, doc: x.doc.path, origin: 'model-free' });
+        }
+      }
+    }
+  }
+  for (const name of new Set([...seenLink].map((k) => k.split('|')[1]).filter((t) => !t.includes(' 第')))) {
+    if (!parsed.some((l) => l.short === name)) writer.addAlias({ canonical: name, aliases: [`中华人民共和国${name}`] });
+  }
+
+  const tasks: Task[] = [];
+  const commenced: { law: ParsedLaw; date: string; doc: string; quote: string }[] = [];
+  for (const [li, law] of parsed.entries()) {
+    const headerDoc = perLaw[li][0]?.doc.path;
+    const e = lastEnactment(law.header);
+    if (e && headerDoc && keep.has(headerDoc) && e.date === cnDate(law.row.publish_date)) {
+      const adopted = e.act.endsWith('通过');
+      tasks.push({
+        id: `law-cn-date-${hid(law.row.title, 'enacted')}`, suite: 'usage', type: 'temporal', lang: 'zh',
+        question: adopted ? `《${law.row.title}》是在哪一天、由哪次会议通过的？` : `《${law.row.title}》现行文本最近一次修正或修订是在哪一天、由哪次会议作出的？`,
+        answer: `${e.date}，${e.meeting}${e.act}`, scoring: 'judge',
+        evidence: [{ doc: headerDoc, quote: e.quote }], meta: { origin: 'model-free', publish_date: law.row.publish_date.slice(0, 10) },
+      });
+    }
+    // the commencement article states the date the law (as first enacted) took effect: a task only when it is still the effective date
+    for (const a of law.chapters.flatMap((c) => c.blocks.flatMap((b) => (b.article ? [b.article] : [])))) {
+      const m = a.lines.join('').match(/本法自(\d{4}年\d{1,2}月\d{1,2}日)起施行/);
+      const doc = docOfArticle.get(`${law.short}|${a.no}`);
+      if (!m || !doc || m[1] !== cnDate(law.row.effective_date)) continue;
+      commenced.push({ law, date: m[1], doc, quote: m[0] });
+      tasks.push({
+        id: `law-cn-date-${hid(law.row.title, 'effective')}`, suite: 'usage', type: 'temporal', lang: 'zh',
+        question: `《${law.row.title}》自何时起施行？`, answer: m[1], answers: [m[1], law.row.effective_date.slice(0, 10)], scoring: 'exact',
+        evidence: [{ doc, quote: m[0] }], meta: { origin: 'model-free', effective_date: law.row.effective_date.slice(0, 10) },
+      });
+    }
+  }
+  const pairs = commenced.flatMap((a, i) => commenced.slice(i + 1).map((b) => [a, b] as const)).filter(([a, b]) => a.date !== b.date);
+  for (const [a, b] of bySeed(pairs, ctx.seed ?? 0, ([x, y]) => x.law.short + y.law.short).slice(0, 3)) {
+    const [first, second] = a.law.row.effective_date < b.law.row.effective_date ? [a, b] : [b, a];
+    tasks.push({
+      id: `law-cn-order-${hid(a.law.short, b.law.short)}`, suite: 'usage', type: 'temporal', lang: 'zh',
+      question: `《${a.law.row.title}》和《${b.law.row.title}》哪一部先施行？`,
+      answer: `《${first.law.row.title}》先施行（${first.date}起施行），《${second.law.row.title}》${second.date}起施行。`, keypoints: [first.law.short, first.date, second.date], scoring: 'judge',
+      evidence: [{ doc: a.doc, quote: a.quote }, { doc: b.doc, quote: b.quote }], meta: { origin: 'model-free' },
+    });
+  }
+  ctx.log(`law-cn: ${docs.length} chapters from ${parsed.length} laws, ${seenLink.size} cross-reference links, ${tasks.length} model-free date tasks`);
+  return finishDocpack({ writer, docs, lang: 'zh', tasks, plan: scaledPlan({ single: 20, multi: 10, temporal: 3, unanswerable: 6, global: 4 }, docs.length, 100), perDoc: 5 }, ctx);
+}
+
+/* --------------------------------- law-us --------------------------------- */
+
+const CUAD_URL = 'https://github.com/TheAtticusProject/cuad/raw/main/data.zip';
+const CUAD_LICENSE = 'CC BY 4.0 (The Atticus Project, CUAD v1)';
+
+interface CuadQa {
+  id: string;
+  answers: { text: string; answer_start: number }[];
+}
+interface CuadContract {
+  title: string;
+  paragraphs: { context: string; qas: CuadQa[] }[];
+}
+
+/** Clause types whose annotation settles a yes/no question about the contract. */
+const YES_NO: Record<string, string> = {
+  'Non-Compete': 'Does {c} restrict a party from competing with the counterparty or operating in a field or territory (a non-compete clause)?',
+  Exclusivity: 'Does {c} contain an exclusivity commitment (exclusive rights or exclusive dealing)?',
+  'Change Of Control': 'Does {c} give a party rights (such as termination or consent) when the other party undergoes a change of control?',
+  'Audit Rights': "Does {c} give a party the right to audit the other party's books, records or compliance?",
+  'Cap On Liability': "Does {c} cap or limit a party's liability?",
+  'Termination For Convenience': 'Can a party terminate {c} for convenience, without cause?',
+};
+
+const ORG = /\b(Inc|Incorporated|Corp|Corporation|LLC|L\.L\.C|Ltd|Limited|Company|Co|LP|L\.P|LLP|plc|PLC|GmbH|S\.A|N\.V|AG|AB|Trust|Bank|Holdings|Group)\b\.?/;
+
+function titleCase(s: string): string {
+  const small = new Set(['of', 'and', 'the', 'for', 'to', 'in', 'on', 'a', 'an', 'or', 'by', 'with']);
+  return s.toLowerCase().replace(/[a-z][a-z'’]*/g, (w, i: number) => (i > 0 && small.has(w) ? w : w[0].toUpperCase() + w.slice(1)));
+}
+
+const cleanText = (s: string) => s.replace(/[ \t\u00a0\f\v]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+
+/** A quote no longer than `max` characters around position `at` of a folded span, cut at word boundaries. */
+function clip(span: string, max = 240, at = 0): string {
+  const s = foldSpace(span);
+  if (s.length <= max) return s;
+  let from = Math.max(0, Math.min(at - 80, s.length - max));
+  let to = from + max;
+  while (from > 0 && s[from - 1] !== ' ') from++;
+  while (to < s.length && s[to] !== ' ') to--;
+  return s.slice(from, to).trim();
+}
+
+/** Parts of at most about `max` characters, cut between paragraphs (between lines in a paragraph too long for one part). */
+function splitContract(text: string, max = 7000): string[] {
+  const out: string[] = [];
+  let cur = '';
+  for (const p of text.split(/\n\n+/).flatMap((x) => (x.length > max ? x.split('\n') : [x]))) {
+    if (cur && cur.length + p.length + 2 > max) {
+      out.push(cur);
+      cur = '';
+    }
+    cur = cur ? `${cur}\n\n${p}` : p;
+  }
+  if (cur && out.length && cur.length < max / 5) out[out.length - 1] += `\n\n${cur}`;
+  else if (cur) out.push(cur);
+  return out;
+}
+
+function jurisdiction(span: string): string | undefined {
+  const s = foldSpace(span);
+  const states = [...new Set([...s.matchAll(/\b(?:State|Commonwealth|Province) of ([A-Z][a-z]+(?: [A-Z][a-z]+)?)/g)].map((m) => m[1]))];
+  if (states.length > 1) return undefined;
+  if (states.length === 1) return states[0];
+  const m = s.match(/\blaws? of (?:the )?((?:People's Republic of )?[A-Z][a-z]+(?: (?:and |of )?[A-Z][a-z]+)*)/);
+  return m && !/^(United States|Federal)$/.test(m[1]) ? m[1] : undefined;
+}
+
+async function loadCuad(writer: PackWriter): Promise<CuadContract[]> {
+  const { file, record } = await fetchCached(CUAD_URL, { license: CUAD_LICENSE, name: 'cuad-v1-data.zip', maxBytes: 60 * 1024 * 1024 });
+  writer.addSource({ ...record, note: 'CUAD v1: 510 contracts with 41 clause categories (CUADv1.json, SQuAD format)' });
+  const out = `${file}.d`;
+  const json = path.join(out, 'CUADv1.json');
+  if (!fs.existsSync(json)) {
+    fs.mkdirSync(out, { recursive: true });
+    const r = await runProcess('unzip', ['-o', '-q', file, 'CUADv1.json', '-d', out], '', 120_000);
+    if (r.code !== 0) throw new Error(`unzip failed (${r.code}): ${r.stderr.slice(-300)}`);
+  }
+  return (JSON.parse(fs.readFileSync(json, 'utf8')) as { data: CuadContract[] }).data;
+}
+
+async function buildLawUs(dir: string, ctx: RecipeContext) {
+  const count = Number(ctx.options.contracts ?? 40);
+  const writer = new PackWriter(dir, {
+    id: 'law-us',
+    version: 1,
+    title: 'US commercial contracts (CUAD)',
+    domain: 'law',
+    languages: ['en'],
+    description: `${count} commercial contracts from CUAD v1 (EDGAR filings annotated by lawyers for 41 clause types), split into parts; model-free tasks from the clause annotations (governing law, agreement date, presence of ${Object.keys(YES_NO).join(', ')}).`,
+    builder: { recipe: 'law-us', options: { contracts: count, limit: ctx.limit } },
+  });
+  const seed = ctx.seed ?? 0;
+  const contracts = await loadCuad(writer);
+
+  const spans = (c: CuadContract, cat: string) => c.paragraphs[0].qas.find((q) => q.id.endsWith(`__${cat}`))?.answers ?? [];
+  type Selected = { c: CuadContract; name: string; label: string; parties: string[]; parts: { path: string; text: string }[] };
+  const selected: Selected[] = [];
+  const perType = new Map<string, number>();
+  const labels = new Set<string>();
+  let docCount = 0;
+  for (const c of bySeed(contracts, seed, (x) => x.title)) {
+    if (selected.length >= count || (ctx.limit && docCount >= ctx.limit)) break;
+    const context = c.paragraphs[0].context;
+    const docName = spans(c, 'Document Name')[0]?.text;
+    if (context.length < 6000 || context.length > 20000 || !docName || !spans(c, 'Governing Law').length) continue;
+    const name = titleCase(foldSpace(docName).replace(/^["'“]+|[\s"'”(,.;:]+$/g, ''));
+    if ((perType.get(name) ?? 0) >= 2) continue;
+    // named companies, not the defined terms ("Company", "Distributor") the annotation also marks
+    const parties = [...new Map(spans(c, 'Parties')
+      .map((s) => foldSpace(s.text).replace(/^[^:]*:\s*/, '').replace(/^["“(]+|["”),.;:(]+$/g, '').replace(/^the /i, ''))
+      .filter((s) => ORG.test(s) && /[A-Z]\w/.test(s.replace(new RegExp(ORG.source, 'g'), '')) && s.length <= 80 && !/["“”]/.test(s))
+      .map((s) => [s.toLowerCase().replace(new RegExp(ORG.source, 'gi'), '').replace(/[^a-z0-9]/g, ''), s] as const)).values()].slice(0, 2);
+    if (!parties.length) continue;
+    const label = parties.length === 2 ? `the ${name} between ${parties[0]} and ${parties[1]}` : `the ${name} of ${parties[0]}`;
+    if (labels.has(label)) continue;
+    const parts = splitContract(cleanText(context));
+    if (ctx.limit && selected.length && docCount + parts.length > ctx.limit) continue;
+    const slug = c.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 80);
+    selected.push({ c, name, label, parties, parts: parts.map((text, i) => ({ text, path: `cuad/${slug}/part-${i + 1}.md` })) });
+    perType.set(name, (perType.get(name) ?? 0) + 1);
+    labels.add(label);
+    docCount += parts.length;
+  }
+
+  const docs: Doc[] = selected.flatMap((s) => s.parts.map((p, i) => ({
+    path: p.path, title: `${s.name} (${s.parties.join(' / ')})${s.parts.length > 1 ? `, part ${i + 1} of ${s.parts.length}` : ''}`,
+    lang: 'en', source: `CUAD v1: ${s.c.title}`, kind: 'contract',
+    text: `# ${s.name} — ${s.parties.join(' / ')}${s.parts.length > 1 ? ` (part ${i + 1} of ${s.parts.length})` : ''}\n\n${p.text}\n`,
+  })));
+
+  /** A quote of an annotated span, and the part that holds it. */
+  const locate = (s: Selected, span: string, at = 0) => {
+    const quote = clip(span, 240, at);
+    const part = s.parts.find((p) => foldSpace(p.text).includes(quote));
+    return part && quote.length >= 8 ? { doc: part.path, quote } : undefined;
+  };
+
+  const law: Task[] = [];
+  const dates: Task[] = [];
+  const yesNo = new Map<string, { yes: Task[]; no: Task[] }>(Object.keys(YES_NO).map((k) => [k, { yes: [], no: [] }]));
+  for (const s of selected) {
+    for (const p of s.parties) writer.addLink({ head: p, relation: 'party_to', tail: s.name, doc: s.parts[0].path, origin: 'model-free' });
+    const gov = spans(s.c, 'Governing Law')[0];
+    const j = gov && jurisdiction(gov.text);
+    const govAt = j ? foldSpace(gov.text).indexOf(j) : 0;
+    const govEv = gov && locate(s, gov.text, govAt);
+    if (j && govEv && govEv.quote.includes(j)) {
+      law.push({
+        id: `law-us-gov-${hid(s.c.title)}`, suite: 'usage', type: 'single-hop', lang: 'en',
+        question: `Which jurisdiction's law governs ${s.label}?`, answer: j, answers: [j, `${j} law`, `the laws of ${j}`], scoring: 'exact',
+        evidence: [govEv], primary: true, meta: { origin: 'model-free', cuad: 'Governing Law' },
+      });
+    }
+    const date = spans(s.c, 'Agreement Date')[0];
+    const dateEv = date && date.text.length <= 60 && !/_|\[/.test(date.text) && locate(s, date.text);
+    if (dateEv) {
+      dates.push({
+        id: `law-us-date-${hid(s.c.title)}`, suite: 'usage', type: 'temporal', lang: 'en',
+        question: `What is the agreement date of ${s.label}?`, answer: foldSpace(date.text).replace(/[\s.,;:(]+$/, ''), scoring: 'judge',
+        evidence: [dateEv], meta: { origin: 'model-free', cuad: 'Agreement Date' },
+      });
+    }
+    for (const [cat, q] of Object.entries(YES_NO)) {
+      const found = spans(s.c, cat);
+      const ev = found.map((a) => locate(s, a.text)).find(Boolean);
+      if (found.length && !ev) continue;
+      const task: Task = {
+        id: `law-us-clause-${hid(s.c.title, cat)}`, suite: 'usage', type: 'single-hop', lang: 'en',
+        question: q.replace('{c}', s.label), answer: found.length ? 'Yes' : 'No', scoring: 'exact',
+        // absence rests on the whole contract
+        evidence: ev ? [ev] : s.parts.map((p) => ({ doc: p.path })), meta: { origin: 'model-free', cuad: cat },
+      };
+      yesNo.get(cat)![found.length ? 'yes' : 'no'].push(task);
+    }
+  }
+  const tasks = [...bySeed(law, seed, (t) => t.id).slice(0, 12), ...bySeed(dates, seed, (t) => t.id).slice(0, 8)];
+  for (const { yes, no } of yesNo.values()) tasks.push(...bySeed(yes, seed, (t) => t.id).slice(0, 2), ...bySeed(no, seed, (t) => t.id).slice(0, 2));
+  ctx.log(`law-us: ${selected.length} contracts in ${docs.length} parts, ${tasks.length} model-free clause tasks`);
+  return finishDocpack({ writer, docs, lang: 'en', tasks, plan: scaledPlan({ single: 6, multi: 6, unanswerable: 4, global: 3 }, docs.length, 100), perDoc: 5 }, ctx);
+}
+
+/** Pack recipes for the law domain (docs/design/23 §2). */
+export function registerLawRecipes(): void {
+  registerRecipe({ id: 'law-cn', title: 'Chinese national laws in force (civil, company, securities, labour, data), by chapter', domain: 'law', network: true, needsAuthor: true, build: buildLawCn });
+  registerRecipe({ id: 'law-us', title: 'US commercial contracts from CUAD v1 with clause-annotation tasks', domain: 'law', network: true, needsAuthor: true, build: buildLawUs });
+}

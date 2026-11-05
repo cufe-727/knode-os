@@ -20,6 +20,7 @@ import { benchAnswer } from './bench/answer.js';
 import { benchBuild } from './bench/build.js';
 import { benchExtractCompare } from './bench/extract-compare.js';
 import { benchQaGen, benchRetrieval, RetrievalMode } from './bench/qa.js';
+import { registerEvalCommands } from './eval/cli.js';
 import { runSourceQuery } from './datasource/execute.js';
 import { entityDetail, graphInsights, graphOverview, graphSearch } from './graph/query.js';
 import { applyClaimMerge, listClaimMerges, unmergeClaim } from './graph/claim-merge.js';
@@ -1395,6 +1396,8 @@ bench
     console.log(`\nreport: ${report.reportPaths?.mdPath}`);
     await ctx.store.close();
   });
+
+registerEvalCommands(program);
 
 const obsidian = program.command('obsidian').description('Obsidian Vault compatibility');
 obsidian

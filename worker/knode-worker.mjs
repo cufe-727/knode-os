@@ -161,7 +161,7 @@ const hintFor = (kind, backend) => work?.hints?.[kind ?? 'extract']?.[backend] ?
 // a copy of src/labeling/failures.ts
 
 const FATAL = /cli not found|\benoent\b|not logged in|login required|please (log|sign) ?in|unauthori[sz]ed|authentication (failed|required)|invalid api key|incorrect api key|\b401\b|\b403\b|forbidden|subscription (has )?expired/;
-const TRANSIENT = /rate.?limit|usage limit|out of usage|quota|too many requests|\b429\b|overloaded|over capacity|try again (later|in)|\b50[234]\b|econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network|fetch failed|timed? ?out|reconnecting|transport channel closed|error sending request|http\/request failed|stream (disconnected|error)|connection (reset|closed|refused|error)|failed to refresh available models|\bebadf\b|\bemfile\b|\benfile\b|spawn \S+ e[a-z]+/;
+const TRANSIENT = /rate.?limit|usage limit|out of usage|hit your \w+ limit|quota|too many requests|\b429\b|overloaded|over capacity|try again (later|in)|\b50[234]\b|econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network|fetch failed|timed? ?out|reconnecting|transport channel closed|error sending request|http\/request failed|stream (disconnected|error)|connection (reset|closed|refused|error)|failed to refresh available models|\bebadf\b|\bemfile\b|\benfile\b|spawn \S+ e[a-z]+/;
 const classify = (message) => {
   const m = String(message).toLowerCase();
   return FATAL.test(m) ? 'fatal' : TRANSIENT.test(m) ? 'transient' : 'model';

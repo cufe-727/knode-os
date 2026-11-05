@@ -375,14 +375,47 @@ export async function applyExtraction(
   return { entities: entities.length, relations: relCount, claims: claimCount, entityIds: [...touched], claimIds };
 }
 
-/** Ground a claim statement to the chunk with the highest token overlap. */
-function bestChunkFor(statement: string, chunks: { id: string; content: string }[]): string | null {
-  const tokens = [...new Set(statement.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t.length >= 2))];
-  if (tokens.length === 0 || chunks.length === 0) return chunks[0]?.id ?? null;
+/** CJK runs, the character classes `match_grams` and `queryTerms` take. */
+const CJK_RUN = /[一-鿿㐀-䶿]+/g;
+
+/** Add the bigrams of every CJK run in `lower` to `into`; returns the text with those runs blanked out. */
+function cjkBigrams(lower: string, into: Set<string>): string {
+  return lower.replace(CJK_RUN, (run) => {
+    for (let i = 0; i + 2 <= run.length; i++) into.add(run.slice(i, i + 2));
+    return ' ';
+  });
+}
+
+/** A chunk's lowercased text and CJK bigrams, worked out once however many claims it is scored for. */
+const groundingIndex = new WeakMap<ChunkRef, { text: string; bigrams: Set<string> }>();
+
+function groundingIndexOf(c: ChunkRef): { text: string; bigrams: Set<string> } {
+  let ix = groundingIndex.get(c);
+  if (!ix) {
+    const text = c.content.toLowerCase();
+    const bigrams = new Set<string>();
+    cjkBigrams(text, bigrams);
+    groundingIndex.set(c, (ix = { text, bigrams }));
+  }
+  return ix;
+}
+
+/**
+ * Ground a claim statement to the chunk sharing most of its words: Latin and
+ * number tokens, and the bigrams of its CJK runs. A CJK run carries no spaces,
+ * so taken whole it is a clause no chunk repeats verbatim — a statement written
+ * in Chinese then matched nothing and fell back to the first chunk.
+ */
+function bestChunkFor(statement: string, chunks: ChunkRef[]): string | null {
+  const bigrams = new Set<string>();
+  const words = [...new Set(cjkBigrams(statement.toLowerCase(), bigrams).split(/[^\p{L}\p{N}]+/u).filter((t) => t.length >= 2))];
+  if ((words.length === 0 && bigrams.size === 0) || chunks.length === 0) return chunks[0]?.id ?? null;
   let best: { id: string; score: number } | null = null;
   for (const c of chunks) {
-    const lc = c.content.toLowerCase();
-    const score = tokens.reduce((s, t) => s + (lc.includes(t) ? 1 : 0), 0);
+    const ix = groundingIndexOf(c);
+    let score = 0;
+    for (const w of words) if (ix.text.includes(w)) score++;
+    for (const b of bigrams) if (ix.bigrams.has(b)) score++;
     if (!best || score > best.score) best = { id: c.id, score };
   }
   return best && best.score > 0 ? best.id : chunks[0]?.id ?? null;

@@ -19,8 +19,8 @@
 export type FailureKind = 'model' | 'transient' | 'fatal';
 
 const FATAL = /cli not found|\benoent\b|not logged in|login required|please (log|sign) ?in|unauthori[sz]ed|authentication (failed|required)|invalid api key|incorrect api key|\b401\b|\b403\b|forbidden|subscription (has )?expired/;
-// "out of usage" is Cursor's refusal once a plan's included usage is spent (2026-10)
-const TRANSIENT = /rate.?limit|usage limit|out of usage|quota|too many requests|\b429\b|overloaded|over capacity|try again (later|in)|\b50[234]\b|econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network|fetch failed|timed? ?out|reconnecting|transport channel closed|error sending request|http\/request failed|stream (disconnected|error)|connection (reset|closed|refused|error)|failed to refresh available models|\bebadf\b|\bemfile\b|\benfile\b|spawn \S+ e[a-z]+/;
+// "out of usage" is Cursor's refusal once a plan's included usage is spent (2026-10); "hit your weekly limit" is Claude's (2026-11)
+const TRANSIENT = /rate.?limit|usage limit|out of usage|hit your \w+ limit|quota|too many requests|\b429\b|overloaded|over capacity|try again (later|in)|\b50[234]\b|econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network|fetch failed|timed? ?out|reconnecting|transport channel closed|error sending request|http\/request failed|stream (disconnected|error)|connection (reset|closed|refused|error)|failed to refresh available models|\bebadf\b|\bemfile\b|\benfile\b|spawn \S+ e[a-z]+/;
 
 export function classifyFailure(message: string): FailureKind {
   const m = message.toLowerCase();

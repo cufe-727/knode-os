@@ -1,0 +1,250 @@
+import { z } from 'zod';
+
+/**
+ * The benchmark suite's data model (docs/design/23).
+ *
+ * A pack is a portable directory: the sources every system reads, the gold
+ * no system sees, and the tasks they are scored on. Everything a run produces
+ * — builds, answers, scores — is a JSONL record keyed so that a resumed run
+ * skips what is done.
+ */
+
+export const SUITES = ['generation', 'usage', 'emergence', 'update', 'robustness'] as const;
+export type Suite = (typeof SUITES)[number];
+
+export const TASK_TYPES = [
+  'single-hop', 'multi-hop', 'aggregation', 'comparison', 'temporal', 'unanswerable', 'global', 'numeric',
+  'style', 'attribution', 'themes', 'forecast', 'affect', 'needs',
+  'update', 'conflict', 'injection', 'cross-lingual', 'counterfactual',
+] as const;
+export type TaskType = (typeof TASK_TYPES)[number];
+
+/**
+ * How a task is scored:
+ * - judge      the judge grades the answer 0–2 against `answer` (and `keypoints`)
+ * - exact      EM/F1 of the `Final answer:` line against `answer` / `answers`, judge as fallback
+ * - keypoints  share of `keypoints` the answer covers (judged)
+ * - set        the answer's JSON items matched one-to-one against `items`
+ * - label      one categorical label (an emotion, a valence) compared without a model
+ * - choice     one of `choices` (authorship attribution), compared without a model
+ * - abstain    the right answer is to say the sources do not tell
+ */
+export const SCORINGS = ['judge', 'exact', 'keypoints', 'set', 'label', 'choice', 'abstain'] as const;
+export type Scoring = (typeof SCORINGS)[number];
+
+export const DOMAINS = ['research', 'medicine', 'law', 'finance', 'literature', 'personal', 'synthetic', 'public', 'fixture'] as const;
+
+export const SourceRecordSchema = z.object({
+  url: z.string(),
+  license: z.string(),
+  sha256: z.string().optional(),
+  bytes: z.number().int().nonnegative().optional(),
+  retrievedAt: z.string().optional(),
+  note: z.string().optional(),
+});
+export type SourceRecord = z.infer<typeof SourceRecordSchema>;
+
+export const PackManifestSchema = z.object({
+  id: z.string().regex(/^[a-z0-9][a-z0-9-]*$/),
+  version: z.number().int().positive(),
+  title: z.string(),
+  domain: z.enum(DOMAINS),
+  languages: z.array(z.string()).min(1),
+  description: z.string(),
+  builder: z.object({ recipe: z.string(), options: z.record(z.string(), z.unknown()).default({}), builtAt: z.string() }),
+  sources: z.array(SourceRecordSchema).default([]),
+  stats: z.object({ documents: z.number(), chars: z.number(), tasks: z.number(), facts: z.number() }).partial().optional(),
+  /** What the holdout holds and why no system may see it. */
+  holdout: z.string().optional(),
+});
+export type PackManifest = z.infer<typeof PackManifestSchema>;
+
+export const CorpusDocSchema = z.object({
+  /** Relative to corpus/ — also the document's id in every citation. */
+  path: z.string(),
+  title: z.string().optional(),
+  date: z.string().optional(),
+  author: z.string().optional(),
+  lang: z.string().optional(),
+  source: z.string().optional(),
+  kind: z.string().optional(),
+});
+export type CorpusDoc = z.infer<typeof CorpusDocSchema>;
+
+export const EvidenceRefSchema = z.object({ doc: z.string(), quote: z.string().optional() });
+export type EvidenceRef = z.infer<typeof EvidenceRefSchema>;
+
+/** How directly a synthetic signal is written into the sources. */
+export const SIGNALS = ['explicit', 'implicit', 'latent'] as const;
+
+export const GoldFactSchema = z.object({
+  id: z.string(),
+  text: z.string(),
+  doc: z.string(),
+  quote: z.string().optional(),
+  entities: z.array(z.string()).default([]),
+  date: z.string().optional(),
+  kind: z.string().optional(),
+  signal: z.enum(SIGNALS).optional(),
+});
+export type GoldFact = z.infer<typeof GoldFactSchema>;
+
+export const GoldLinkSchema = z.object({
+  head: z.string(),
+  relation: z.string(),
+  tail: z.string(),
+  doc: z.string().optional(),
+  /** model-free (a regex, a dataset's own annotation), planted (synthetic), or model (extracted, verified). */
+  origin: z.enum(['model-free', 'planted', 'model']),
+});
+export type GoldLink = z.infer<typeof GoldLinkSchema>;
+
+export const GoldAliasSchema = z.object({ canonical: z.string(), aliases: z.array(z.string()).min(1) });
+export type GoldAlias = z.infer<typeof GoldAliasSchema>;
+
+/** One expected item of a set-scored task: a theme, a need, a characteristic word. */
+export const GoldItemSchema = z.object({
+  label: z.string(),
+  aliases: z.array(z.string()).default([]),
+  signal: z.enum(SIGNALS).optional(),
+  weight: z.number().positive().default(1),
+});
+export type GoldItem = z.infer<typeof GoldItemSchema>;
+
+export const TaskSchema = z.object({
+  id: z.string(),
+  suite: z.enum(SUITES),
+  type: z.enum(TASK_TYPES),
+  question: z.string(),
+  lang: z.string().optional(),
+  answer: z.string().optional(),
+  answers: z.array(z.string()).optional(),
+  evidence: z.array(EvidenceRefSchema).default([]),
+  asOf: z.string().optional(),
+  keypoints: z.array(z.string()).optional(),
+  items: z.array(GoldItemSchema).optional(),
+  choices: z.array(z.string()).optional(),
+  scoring: z.enum(SCORINGS),
+  /** The suite's pre-registered primary metric is computed over tasks marked primary (all, when none is). */
+  primary: z.boolean().optional(),
+  /** Update tasks: the batch (updates/NN) that must be applied before asking. */
+  afterUpdate: z.string().optional(),
+  meta: z.record(z.string(), z.unknown()).optional(),
+});
+export type Task = z.infer<typeof TaskSchema>;
+
+/* ------------------------------ run records ------------------------------ */
+
+/** What a system's model calls used, summed — the shim fills it for every system the same way. */
+export interface Usage {
+  calls: number;
+  failedCalls: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  /** Codex's plan weighting (src/estimate/codex.ts weightedTokens). */
+  weightedTokens: number;
+  /** At published API prices, where the model has one. */
+  costUsd: number;
+  /** Time spent inside model calls (summed across concurrent calls). */
+  llmMs: number;
+  embeddingTokens: number;
+  embeddingCalls: number;
+  /** Calls answered from the response cache: counted at their original cost. */
+  replayedCalls: number;
+}
+
+export function emptyUsage(): Usage {
+  return {
+    calls: 0, failedCalls: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0,
+    weightedTokens: 0, costUsd: 0, llmMs: 0, embeddingTokens: 0, embeddingCalls: 0, replayedCalls: 0,
+  };
+}
+
+export function addUsage(into: Usage, u: Partial<Usage>): Usage {
+  for (const k of Object.keys(into) as (keyof Usage)[]) into[k] += u[k] ?? 0;
+  return into;
+}
+
+export interface Citation {
+  /** A corpus document path. */
+  doc: string;
+  quote?: string;
+}
+
+export interface Answer {
+  text: string;
+  /** The line after `Final answer:`, or the whole text when there is none. */
+  finalAnswer: string;
+  citations: Citation[];
+  /** Documents the system looked at or retrieved, best first (agents: files they read). */
+  retrieved: string[];
+  toolCalls: number;
+  /** An agent stopped at its step cap. */
+  capped?: boolean;
+  /** An agent touched a path outside its corpus copy: the answer is void. */
+  leaked?: string[];
+  error?: string;
+  usage: Usage;
+  ms: number;
+}
+
+export interface AnswerRecord extends Answer {
+  key: string;
+  pack: string;
+  system: string;
+  taskId: string;
+  at: string;
+}
+
+export interface BuildRecord {
+  key: string;
+  pack: string;
+  system: string;
+  ok: boolean;
+  error?: string;
+  /** Wall time of the build. */
+  ms: number;
+  usage: Usage;
+  /** Usage per stage (extract, summary, judge, wiki, embed …). */
+  stages: Record<string, Usage>;
+  /** Bytes the built knowledge base takes on disk. */
+  bytes: number;
+  /** Peak resident memory of the build process, when measured. */
+  peakRssBytes?: number;
+  notes?: Record<string, unknown>;
+  at: string;
+}
+
+export interface ScoreRecord {
+  key: string;
+  pack: string;
+  system: string;
+  suite: Suite | 'ops';
+  metric: string;
+  /** Per-task scores carry the task; aggregate scores do not. */
+  taskId?: string;
+  taskType?: TaskType;
+  value: number | null;
+  n?: number;
+  ci?: [number, number];
+  detail?: Record<string, unknown>;
+  at: string;
+}
+
+/** A unit of what a system generated — never a raw source passage (docs/design/23 §5). */
+export interface KnowledgeUnit {
+  id: string;
+  kind: 'page' | 'claim' | 'entity' | 'relation' | 'summary' | 'community';
+  title?: string;
+  text: string;
+  /** Corpus documents the unit says it comes from. */
+  sources: string[];
+  /** Ids of the units it links to. */
+  links: string[];
+  /** For relation units: the two ends, by name. */
+  head?: string;
+  tail?: string;
+  relation?: string;
+}

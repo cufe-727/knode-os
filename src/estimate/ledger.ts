@@ -80,7 +80,7 @@ interface LedgerFile {
 /** Durations kept per route for percentiles. */
 const MS_SAMPLES = 200;
 /** A refusal is a rate or usage limit, not a network blip: what an estimate warns about. */
-const REFUSAL = /rate.?limit|usage limit|out of usage|quota|too many requests|\b429\b|limit reached|credits/i;
+const REFUSAL = /rate.?limit|usage limit|out of usage|hit your \w+ limit|quota|too many requests|\b429\b|limit reached|credits/i;
 
 export function isRefusal(error: string): boolean {
   return REFUSAL.test(error);
