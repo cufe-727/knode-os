@@ -195,7 +195,8 @@ export class KnodeClient {
     }
     const answer = (parsed && typeof parsed === 'object' ? parsed : {}) as { error?: string; reason?: string };
     if (res.status === 401 && answer.reason === 'auth') {
-      throw new ServerError(`${answer.error ?? 'signed out'} — sign in again: knode-os login ${this.url}`, 401, 'auth');
+      // the server says which: "sign in first", or "your session has ended — sign in again"
+      throw new ServerError(`${answer.error ?? 'sign in first'}: knode-os login ${this.url}`, 401, 'auth');
     }
     // Cloudflare's own pages: the tunnel gave up waiting, or could not reach serve
     if (res.status === 524) throw new ServerError(`${this.url} took longer than its tunnel waits (about 100 s) to answer`, 524);
