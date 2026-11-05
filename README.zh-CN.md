@@ -222,9 +222,18 @@ knode-os mcp                  在 stdio 上运行 MCP 服务
 knode-os connect claude|codex 把 MCP 服务注册到 agent CLI
 knode-os config               查看当前配置(密钥已脱敏)
 knode-os plugins [--json]     列出本数据目录加载的插件,以及它们和内建实现提供的 provider、后端、转换器与钩子
+knode-os ls|tree|stat|read|grep [path]   把 Workspace 当文件系统用:列目录、画树、看属性、打印文件(PDF 与图片打印
+                              其派生的 Markdown)、搜索文件内容
+knode-os stats | survey | entities list|show   知识库的数字概览;实体列表与详情
+
+knode-os login <server> [--user u] [--workspace finance]   从另一台机器登录 knode-os 服务端:上面这些命令,以及
+                              search、ask、graph、claims、sync、研究与 chat,都改由服务端的 Workspace 作答
+knode-os whoami | workspaces | use <workspace> | logout   当前的服务端、账号与 Workspace;切换;退出登录
+knode-os get <path…> | put <file…> [--to raw/docs/x] | write | mkdir | mv | rm   在服务端下载、上传、改动文件
+knode-os tasks | sessions | password | api <route>   服务端在做什么;自己的会话与密码;调用任意 REST 接口
 ```
 
-所有命令都支持 `--data <path>`(或设置 `KNODE_OS_DATA`)。
+所有命令都支持 `--data <path>`(或设置 `KNODE_OS_DATA`);登录了服务端时,它也让命令留在本机。从其他机器使用 CLI 见 [docs/remote-access.md](docs/remote-access.md#from-the-command-line-on-another-machine)。
 
 ## 在 Claude Code / Codex 中使用
 
