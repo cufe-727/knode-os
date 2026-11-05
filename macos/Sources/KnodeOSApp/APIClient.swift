@@ -454,6 +454,13 @@ struct APIClient {
         return try await send("/api/feishu/sync", method: "POST", body: encoded(Body(dest: dest, force: force)))
     }
 
+    /// Add the new exchanges of every followed agent conversation now, in the
+    /// background, without waiting for them to go quiet (docs/design/24).
+    func checkConversations() async throws -> ConversationCheck {
+        struct Body: Encodable {}
+        return try await send("/api/conversations/sync", method: "POST", body: encoded(Body()))
+    }
+
     /// An empty query is the overview — the top entities by mentions, `limit`
     /// of them, `types` only, with (`edges` = all) or without (`typed`) the
     /// derived co-occurrence edges. A name is the local graph `depth` hops

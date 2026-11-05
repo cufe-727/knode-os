@@ -2,6 +2,7 @@ import { activityOf, ActivityItem } from '../activity.js';
 import { AppContext } from '../context.js';
 import { nightlySchedule } from '../dream/dream.js';
 import { pendingEmbeddings } from '../ingest/embed-backfill.js';
+import { conversationCheckMinutes, conversationLinks } from '../ingest/conversations/follow.js';
 import { feishuCheckTime, feishuLinks, lastFeishuCheck } from '../ingest/feishu/docs.js';
 import { linkedFolders } from '../ingest/folders.js';
 import { FailureKind } from '../labeling/failures.js';
@@ -94,13 +95,13 @@ export interface TaskJob {
 }
 
 export interface ScheduledTask {
-  id: 'dream' | 'tier2' | 'traces' | 'datasources' | 'feishu';
+  id: 'dream' | 'tier2' | 'traces' | 'datasources' | 'feishu' | 'conversations';
   /** "03:00" for a daily run, else the interval in minutes. */
   at: string | null;
   everyMinutes: number | null;
   /** The next start, when the clock says; null while it cannot run. */
   next: string | null;
-  /** When it last ran, for a task that keeps that across restarts (Feishu); null otherwise. */
+  /** When it last ran, for a task that keeps that across restarts (Feishu) or knows it (followed conversations); null otherwise. */
   last: string | null;
   enabled: boolean;
   running: boolean;
@@ -313,6 +314,15 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
       last: lastFeishuCheck(ctx.dataDir),
       enabled: Boolean(services) && Boolean(feishuAt) && feishuLinked,
       running: busy('feishu'),
+    },
+    {
+      id: 'conversations',
+      at: null,
+      everyMinutes: conversationCheckMinutes(config),
+      next: services?.conversations ? services.conversations.nextCheck() : null,
+      last: services?.conversations?.lastCheck() ?? null,
+      enabled: Boolean(services) && conversationLinks(config).length > 0,
+      running: busy('conversations'),
     },
   ];
 

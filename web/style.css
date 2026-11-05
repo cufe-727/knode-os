@@ -906,6 +906,19 @@ td.mono { font-size: 12px; }
 .feishu-item.ok .mark { color: var(--good); }
 .feishu-item.bad .mark { color: var(--bad); }
 .feishu-item .hint { overflow-wrap: anywhere; }
+.agentconv-dialog { width: min(720px, calc(100vw - 32px)); }
+.agentconv-search { display: flex; gap: 8px; align-items: stretch; margin: 0 0 10px; }
+.team-dialog .agentconv-search input { flex: 1 1 auto; width: auto; min-width: 0; margin: 0; }
+.team-dialog .agentconv-search select { flex: 0 0 auto; width: auto; margin: 0; }
+.agentconv-list { max-height: min(360px, 48vh); }
+.agentconv-list .feishu-item { cursor: pointer; }
+.agentconv-list .feishu-item.held { cursor: default; opacity: 0.75; }
+.agentconv-list .feishu-item input { margin: 2px 0 0; flex: none; }
+.agentconv-list .feishu-item > div { min-width: 0; flex: 1; }
+.agentconv-list .prompt { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.agentconv-list .row-action { flex: none; align-self: center; }
+.agentconv-list pre { margin: 6px 0 0; max-height: 220px; overflow: auto; white-space: pre-wrap; font-size: 11px; background: var(--panel, transparent); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+@media (max-width: 560px) { .agentconv-search { flex-direction: column; } }
 
 /* the estimate before a task starts (processing, a study) */
 .estimate-dialog { width: min(680px, calc(100vw - 32px)); max-height: calc(100vh - 48px); overflow: hidden; }

@@ -17,6 +17,7 @@ import { LabelingProcessing } from '../labeling/processing.js';
 import { LabelingScheduler } from '../labeling/scheduler.js';
 import { EmbeddingBackfill } from '../ingest/embed-backfill.js';
 import { LinkedFolders, linkOwning, mirrorLinks, syncedByFolders } from '../ingest/folders.js';
+import { AgentConversations } from '../ingest/conversations/follow.js';
 import { FeishuDocs } from '../ingest/feishu/docs.js';
 import { isOwnWrite } from '../ingest/own-writes.js';
 import { sync, SyncContext, syncsSettled, SyncStats } from '../ingest/sync.js';
@@ -138,7 +139,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
         throw err;
       }
       services.set(workspaceCtx.dataDir, {
-        mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders, feishu: started.feishu,
+        mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders, feishu: started.feishu, conversations: started.conversations,
         labeling: started.labeling, work: started.work, localWorkers: started.localWorkers, processing: started.processing, translations: started.translations,
         calls: started.calls, embeddings: started.embeddings,
       });
@@ -189,17 +190,17 @@ export async function startServer(ctx: AppContext): Promise<void> {
 }
 
 /**
- * Open, at startup, every workspace that follows a linked folder or a linked
- * Feishu document: its watchers, pollers, extraction and summaries must not
+ * Open, at startup, every workspace that follows a linked folder, a linked
+ * Feishu document or an agent conversation: its watchers, pollers, extraction and summaries must not
  * wait for someone to open it in the UI — after a restart they would otherwise
  * sit idle until then.
  */
 function autostartWorkspaces(root: string, registry: WorkspaceContextRegistry, log: (msg: string) => void): void {
   const linked = (dataDir: string) => {
     try {
-      const config = JSON.parse(fs.readFileSync(path.join(dataDir, 'knode.config.json'), 'utf8')) as { ingest?: { linkedFolders?: unknown[]; feishuDocs?: unknown[] } };
+      const config = JSON.parse(fs.readFileSync(path.join(dataDir, 'knode.config.json'), 'utf8')) as { ingest?: { linkedFolders?: unknown[]; feishuDocs?: unknown[]; conversations?: unknown[] } };
       const some = (list: unknown[] | undefined) => Array.isArray(list) && list.length > 0;
-      return some(config.ingest?.linkedFolders) || some(config.ingest?.feishuDocs);
+      return some(config.ingest?.linkedFolders) || some(config.ingest?.feishuDocs) || some(config.ingest?.conversations);
     } catch {
       return false;
     }
@@ -213,7 +214,7 @@ function autostartWorkspaces(root: string, registry: WorkspaceContextRegistry, l
   };
   const open = (label: string, scope: Parameters<WorkspaceContextRegistry['get']>[0]) => {
     void registry.get(scope).then(
-      () => log(`[${label}] opened at startup: it follows linked folders or Feishu documents`),
+      () => log(`[${label}] opened at startup: it follows linked folders, Feishu documents or agent conversations`),
       (err) => log(`[${label}] could not open at startup: ${err instanceof Error ? err.message : err}`),
     );
   };
@@ -412,7 +413,7 @@ export function watchDataDir(ctx: SyncContext, opts: DataDirWatchOptions): TreeW
     // an event naming no path (the data dir itself) is no source
     if (!rel) return;
     const outside = rel.startsWith('..');
-    // a linked mirror is synced by its link (src/ingest/folders.ts, src/ingest/feishu/docs.ts)
+    // a linked mirror is synced by its link (src/ingest/folders.ts, src/ingest/feishu/docs.ts, src/ingest/conversations/follow.ts)
     if (!outside && linkOwning(mirrorLinks(ctx.config), rel)) return;
     // seen: synced from here on — by the sync below, or by the import or
     // unlink writing that folder, which syncs what it writes itself
@@ -505,6 +506,7 @@ interface StartedServices {
   track: <T>(job: Promise<T>) => Promise<T>;
   folders: LinkedFolders;
   feishu: FeishuDocs;
+  conversations: AgentConversations;
   labeling: LabelingScheduler;
   work: WorkBroker;
   localWorkers: LocalLabelingWorkers;
@@ -640,6 +642,10 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   const feishu = new FeishuDocs(ctx, { log, track });
   feishu.start();
 
+  // followed agent conversations: looked at every few minutes, re-rendered once quiet (src/ingest/conversations/follow.ts)
+  const conversations = new AgentConversations(ctx, { log, track });
+  conversations.start();
+
   // nightly dream + the tier-2 pass
   const dreamTimer = startDreamScheduler(ctx, log);
   const nightly = nightlySchedule(ctx.config);
@@ -666,6 +672,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       clearInterval(dsTimer);
       await folders.stop();
       await feishu.stop();
+      await conversations.stop();
       await Promise.allSettled([...activeJobs]);
       await embeddings.stop();
       ctx.embeddings = undefined;
@@ -675,6 +682,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     track,
     folders,
     feishu,
+    conversations,
     labeling,
     work,
     localWorkers,
