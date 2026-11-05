@@ -142,9 +142,20 @@ async function vectorSearch(
   );
 }
 
+/**
+ * The query as `websearch_to_tsquery` should read it. A `-` that starts a word
+ * excludes the word there, and every other `-` still takes a place on the
+ * parser's operator stack, which holds 32: a question quoting a passage under
+ * a rule of hyphens failed with "tsquery stack too small", and a table's
+ * `|---|` excluded the word after it. Only a `-` starting a word stays.
+ */
+export function websearchText(query: string): string {
+  return query.replace(/-{2,}|-(?![\p{L}\p{N}])/gu, ' ');
+}
+
 /** Keyword recall: Postgres FTS, with a substring fallback that covers CJK queries. */
 async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
-  const p = new Params([query]);
+  const p = new Params([websearchText(query)]);
   const cond = docLiveAt('d', p, asOf, filter);
   const lim = p.add(k);
   const fts = await store.query<RankedChunk>(

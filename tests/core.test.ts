@@ -12,7 +12,7 @@ import { slugify } from '../src/graph/store.js';
 import { extractWikilinks } from '../src/graph/wire.js';
 import { codexExecArgs, completeViaCli, renderCliPrompt } from '../src/llm/cli.js';
 import { LlmClient } from '../src/llm/client.js';
-import { queryTerms } from '../src/search/search.js';
+import { queryTerms, websearchText } from '../src/search/search.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-test-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -98,6 +98,15 @@ describe('queryTerms', () => {
     expect(terms).toContain('LME');
     expect(terms).toContain('铜价');
     expect(terms).toContain('squeeze');
+  });
+});
+
+describe('websearchText', () => {
+  it('keeps a hyphen that starts or joins a word, and drops rules and dangling hyphens', () => {
+    expect(websearchText('copper -futures e-mail')).toBe('copper -futures e-mail');
+    expect(websearchText(`第十六回\n${'-'.repeat(62)}\n話說`)).toBe('第十六回\n \n話說');
+    expect(websearchText('| a |\n|---|---|\n| b |')).toBe('| a |\n| | |\n| b |');
+    expect(websearchText('x - y -， z-')).toBe('x   y  ， z ');
   });
 });
 
