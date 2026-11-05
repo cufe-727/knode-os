@@ -8,6 +8,7 @@ import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
 import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
 import { applyClaimMerge, reanchorClaimGroups } from './claim-merge.js';
+import { alikeWording, Wording, wordingOf, wordingPrefixLength } from './wording.js';
 
 /**
  * Duplicate-claim audit (docs/design/10 §4). A claim's id is its subject plus
@@ -218,15 +219,6 @@ export function negated(s: string): boolean {
   return NEGATION.test(s.normalize('NFKC'));
 }
 
-function tokens(s: string): Set<string> {
-  return new Set(s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t.length >= 2));
-}
-
-function overlap(ta: Set<string>, tb: Set<string>): number {
-  const inter = [...ta].filter((t) => tb.has(t)).length;
-  return inter / Math.max(1, Math.min(ta.size, tb.size));
-}
-
 /* ----------------------------- candidate lookup ----------------------------- */
 
 /** `fn` of a claim's statement, worked out once per statement. */
@@ -243,7 +235,7 @@ function perStatement<T>(fn: (s: string) => T): (c: ClaimLite) => T {
 interface Readings {
   key: (c: ClaimLite) => string;
   numbers: (c: ClaimLite) => KeyNumber[];
-  words: (c: ClaimLite) => Set<string>;
+  wording: (c: ClaimLite) => Wording;
 }
 
 /** A figure rounded to `p` decimal places, as sameNumber rounds it. */
@@ -276,25 +268,47 @@ function figureProbes(n: KeyNumber): string[] {
  * number or — for the wording overlap, without real vectors — a word. The
  * lookup gives the positions of the claims that share any of them with `f`, in
  * block order: the only ones the text checks can bring up.
+ *
+ * Words are also filed by prefix (wordingPrefixLength): a statement's rarest
+ * words in the block, of which the shorter of two statements worded alike
+ * shares at least one with the other. Looked up by every word, CJK bigrams such
+ * as 公司 or 同比 put nearly every Chinese claim of a block in reach of every
+ * other: for 3,000 of finance's claims (2026-11-04) that gave 3.7 million claims
+ * to check, the prefixes 34,378, and the whole-clause words before bigrams 67,035.
  */
 function indexBlock(block: ClaimLite[], read: Readings, words: boolean): (f: ClaimLite) => number[] {
   const byKey = new Map<string, number[]>();
   const byNumber = new Map<string, number[]>();
   const byWord = words ? new Map<string, number[]>() : null;
+  const byPrefix = words ? new Map<string, number[]>() : null;
   const file = (map: Map<string, number[]>, k: string, i: number) => {
     const at = map.get(k);
     if (!at) map.set(k, [i]);
     else if (at[at.length - 1] !== i) at.push(i);
   };
+  // the claims of the block that use each word: rarer words lead, then by spelling
+  const uses = new Map<string, number>();
+  if (words) for (const c of block) for (const w of read.wording(c).words) uses.set(w, (uses.get(w) ?? 0) + 1);
+  const prefix = (w: Wording): string[] =>
+    [...w.words].sort((x, y) => (uses.get(x) ?? 0) - (uses.get(y) ?? 0) || (x < y ? -1 : x > y ? 1 : 0)).slice(0, wordingPrefixLength(w));
   block.forEach((c, i) => {
     file(byKey, read.key(c), i);
     for (const n of read.numbers(c)) for (const k of figureKeys(n)) file(byNumber, k, i);
-    if (byWord) for (const w of read.words(c)) file(byWord, w, i);
+    if (byWord && byPrefix) {
+      const w = read.wording(c);
+      for (const x of w.words) file(byWord, x, i);
+      for (const x of prefix(w)) file(byPrefix, x, i);
+    }
   });
   return (f) => {
     const at = new Set(byKey.get(read.key(f)));
     for (const n of read.numbers(f)) for (const k of figureProbes(n)) for (const i of byNumber.get(k) ?? []) at.add(i);
-    if (byWord) for (const w of read.words(f)) for (const i of byWord.get(w) ?? []) at.add(i);
+    if (byWord && byPrefix) {
+      // a shorter claim's prefix holds one of f's words; a longer one holds a word of f's prefix
+      const w = read.wording(f);
+      for (const x of w.words) for (const i of byPrefix.get(x) ?? []) at.add(i);
+      for (const x of prefix(w)) for (const i of byWord.get(x) ?? []) at.add(i);
+    }
     return [...at].sort((x, y) => x - y);
   };
 }
@@ -319,7 +333,7 @@ async function textCandidates(
   propose: Propose,
   opts: { words: boolean; pause: () => Promise<void> },
 ): Promise<void> {
-  const read: Readings = { key: perStatement(statementKey), numbers: perStatement(numbersOf), words: perStatement(tokens) };
+  const read: Readings = { key: perStatement(statementKey), numbers: perStatement(numbersOf), wording: perStatement(wordingOf) };
   const indexes = new Map<ClaimLite[], (f: ClaimLite) => number[]>();
   for (const f of focus) {
     const fKey = read.key(f);
@@ -336,8 +350,8 @@ async function textCandidates(
         const shared = read.numbers(c).filter((n) => fNums.some((m) => sameNumber(n, m)));
         if (shared.length > 0) propose(f, c, `数字相同 ${shared.slice(0, 3).map((n) => `${n.value}${n.unit}`).join('、')}`, { shared: shared.length });
         else if (opts.words) {
-          const words = overlap(read.words(f), read.words(c));
-          if (words >= 0.6) propose(f, c, '措辞重叠', { similarity: words });
+          const alike = alikeWording(read.wording(f), read.wording(c));
+          if (alike !== null) propose(f, c, '措辞重叠', { similarity: alike });
         }
       }
     }

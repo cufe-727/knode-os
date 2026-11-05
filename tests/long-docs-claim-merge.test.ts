@@ -4,17 +4,21 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultConfig, defaultRoutedLlmConfig, LlmConnection } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
+import { initDataDir } from '../src/fs/datadir.js';
 import { readSidecarPart, writeSidecarPart } from '../src/fs/sidecar.js';
-import { claimPairId, keyNumbers, negated, numbersOf, periodsDisjoint, periodsOf, sameNumber, statementKey } from '../src/graph/claim-dedupe.js';
+import { auditDuplicateClaims, claimPairId, keyNumbers, negated, numbersOf, periodsDisjoint, periodsOf, sameNumber, statementKey } from '../src/graph/claim-dedupe.js';
 import { listClaimMerges, unmergeClaim } from '../src/graph/claim-merge.js';
 import { mergeSegmentResults, segmentText } from '../src/graph/segment.js';
+import { alikeWording, wordingOf } from '../src/graph/wording.js';
 import { runDocumentPass } from '../src/ingest/background.js';
 import { rebuild } from '../src/lineage/rebuild.js';
 import { sync } from '../src/ingest/sync.js';
+import { LlmClient } from '../src/llm/client.js';
 import { applySuggestion } from '../src/pack/learn.js';
 import { ensureDefaultAgents } from '../src/research/agents.js';
 import { queryClaims } from '../src/store/claims.js';
 import { listSuggestions } from '../src/store/queries.js';
+import { refineWiki } from '../src/wiki/refine.js';
 import { startFakeOpenAi, type ChatRequest, type FakeOpenAi } from './helpers/fake-openai.js';
 
 /** docs/design/10: long documents read in segments, duplicate claims merged. */
@@ -135,6 +139,23 @@ describe('telling claims apart', () => {
     expect(negated('公司尚未计划回购')).toBe(true);
     expect(negated('业绩不及预期')).toBe(false);
     expect(claimPairId('b', 'a')).toBe(claimPairId('a', 'b'));
+  });
+
+  it('compares Chinese wording by its bigrams, at a threshold of its own', () => {
+    const alike = (a: string, b: string) => alikeWording(wordingOf(a), wordingOf(b));
+    // one clause each: as whole words these two shared nothing
+    expect(alike('本轮30年期国债期货持仓的边际增量资金主要来自以量价信号入场的CTA趋势型资金', '30年期国债期货本轮边际增量资金主要来自以量价信号入场的CTA趋势型资金')).toBeGreaterThan(0.9);
+    expect(alike('甲公司计划扩大海外产能，重点布局东南亚市场', '甲公司计划在东南亚市场扩大海外产能')).toBeGreaterThanOrEqual(0.8);
+    // one topic, saying different things: under the CJK threshold (the shared clause made it 0.67 as whole words)
+    expect(alike('英特尔将为英伟达定制x86 CPU，并供应集成RTX GPU的x86 SOC芯片', '英特尔将为英伟达定制x86 CPU，由英伟达将其集成至人工智能基础设施平台')).toBeNull();
+    expect(alike('甲公司计划回购股份', '甲公司计划扩大海外产能')).toBeNull();
+    // Latin wording keeps its threshold
+    expect(alike(
+      'Volatility-managed portfolios do not systematically outperform their original counterparts on a Sharpe ratio basis.',
+      'Volatility-managed portfolios do not systematically outperform their corresponding unmanaged portfolios in direct comparisons.',
+    )).toBeCloseTo(8 / 13);
+    expect(wordingOf('德明利2025年营收107.89亿元').words).toEqual(new Set(['德明', '明利', '年营', '营收', '亿元', '2025', '107', '89']));
+    expect(wordingOf('Revenue grew 20%').cjk).toBe(false);
   });
 });
 
@@ -267,6 +288,99 @@ describe('extracting a long document in segments', () => {
     );
     expect(queued).toEqual([expect.objectContaining({ path: rel })]);
     expect(queued[0].segments_total).toBeGreaterThan(1);
+  });
+});
+
+/** A document declaring `statements` as claims about `subject`. */
+const claimsDoc = (subject: string, statements: string[]) =>
+  [
+    '---',
+    `title: ${subject}`,
+    'entities:',
+    `  - { name: ${subject}, type: organization }`,
+    'claims:',
+    ...statements.map((s) => `  - { subject: ${subject}, statement: ${JSON.stringify(s)} }`),
+    '---',
+    `# ${subject}`,
+    '',
+  ].join('\n');
+
+/** A judge that calls every pair it is shown the same, and records them. */
+function sameJudge(shown: string[]): LlmClient {
+  const complete = async (messages: { role: string; content: string }[]) => {
+    const user = messages.find((m) => m.role === 'user')?.content ?? '';
+    const pairs = [...user.matchAll(/Pair \d+ — subject: [^\n]*\nA: "([^"]*)"[\s\S]*?\nB: "([^"]*)"/g)].map((m) => [m[1], m[2]].sort().join(' | '));
+    shown.push(...pairs);
+    return JSON.stringify({ verdicts: pairs.map((_, i) => ({ pair: i + 1, relation: 'same', confidence: 0.95, reason: '测试' })) });
+  };
+  return { enabled: true, label: 'stub', provider: 'openai', model: 'stub', complete } as unknown as LlmClient;
+}
+
+describe('Chinese restatements without real vectors', () => {
+  const dataDir = path.join(tmp, 'cjk-wording');
+  let ctx: AppContext;
+  // no number with a unit and no period in common: only the wording brings these up
+  const restated = ['甲公司计划扩大海外产能，重点布局东南亚市场', '甲公司计划在东南亚市场扩大海外产能'];
+  // worded alike, about different years
+  const years = ['甲公司2024年海外收入占比提升', '甲公司2025年海外收入占比提升'];
+  // worded alike, with different figures
+  const figures = ['甲公司在隔夜交易中收跌2.15%', '甲公司在隔夜交易中收涨0.45%'];
+  const other = '甲公司计划回购股份';
+
+  beforeAll(async () => {
+    initDataDir(dataDir);
+    write(dataDir, 'raw/docs/one.md', claimsDoc('甲公司', [restated[0], years[0], figures[0], other]));
+    write(dataDir, 'raw/docs/two.md', claimsDoc('甲公司', [restated[1], years[1], figures[1]]));
+    ctx = await createContext(dataDir);
+    await sync(ctx, { llmGraph: false });
+  });
+  afterAll(async () => {
+    await ctx?.datasources.closeAll();
+    await ctx?.store.close();
+  });
+
+  it('merges a restatement, keeps other years apart without a model, and leaves other figures to a person', async () => {
+    expect(ctx.embedder.model).toBe('local-hash-v1');
+    const shown: string[] = [];
+    const stats = await auditDuplicateClaims({ store: ctx.store, embedder: ctx.embedder, config: ctx.config, llm: sameJudge(shown) });
+    expect(stats).toMatchObject({ candidates: 3, differentTime: 1, judged: 2, merged: 1, suggested: 1, conflicts: 0 });
+    // the pair no guard holds back goes first
+    expect(shown).toEqual([restated.slice().sort().join(' | '), figures.slice().sort().join(' | ')]);
+
+    const merges = await listClaimMerges(ctx.store);
+    expect(merges).toHaveLength(1);
+    expect(new Set([merges[0].statement, merges[0].canonicalStatement])).toEqual(new Set(restated));
+    const pending = (await listSuggestions(ctx.store, {})).filter((s) => s.kind === 'claim-merge' && s.status === 'pending');
+    expect(pending).toHaveLength(1);
+    expect(pending[0].body).toContain(figures[0]);
+    const live = (await queryClaims(ctx.store, { subject: '甲公司', limit: 50 })).claims.map((c) => c.statement);
+    for (const s of [...years, ...figures, other]) expect(live).toContain(s);
+  });
+});
+
+describe('near-duplicate statements while claim merging is off', () => {
+  const dataDir = path.join(tmp, 'cjk-near-duplicates');
+  let ctx: AppContext;
+
+  beforeAll(async () => {
+    initDataDir(dataDir);
+    write(dataDir, 'raw/docs/one.md', claimsDoc('乙公司', ['乙公司计划扩大海外产能，重点布局东南亚市场', '乙公司计划回购股份']));
+    write(dataDir, 'raw/docs/two.md', claimsDoc('乙公司', ['乙公司计划在东南亚市场扩大海外产能', '乙公司计划提高分红比例']));
+    ctx = await createContext(dataDir);
+    ctx.config.review.claimMerge = 'off';
+    await sync(ctx, { llmGraph: false });
+  });
+  afterAll(async () => {
+    await ctx?.datasources.closeAll();
+    await ctx?.store.close();
+  });
+
+  it('flags a Chinese restatement from another source, and no other pair', async () => {
+    await refineWiki(ctx.store, ctx.config, ctx.llm, { embedder: ctx.embedder });
+    const flagged = (await listSuggestions(ctx.store, {})).filter((s) => s.title.startsWith('多来源相似断言待核对'));
+    expect(flagged).toHaveLength(1);
+    expect(flagged[0].body).toContain('乙公司计划扩大海外产能，重点布局东南亚市场');
+    expect(flagged[0].body).toContain('乙公司计划在东南亚市场扩大海外产能');
   });
 });
 
