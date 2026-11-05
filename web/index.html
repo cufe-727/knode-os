@@ -887,6 +887,21 @@
     </form>
   </dialog>
 
+  <dialog id="agentconv-dialog" class="team-dialog feishu-dialog agentconv-dialog" aria-labelledby="agentconv-dialog-title">
+    <form id="agentconv-form" novalidate>
+      <div class="dialog-head"><p class="eyebrow">AGENT CONVERSATIONS</p><h2 id="agentconv-dialog-title">Import agent conversations</h2><p>Claude Code and Codex sessions on the machine knode-os runs on. Each one ticked is kept as dialogue — your prompts and the agent's replies, without its thinking or tool output, secrets redacted — in <span class="mono">raw/docs/conversations/&lt;project&gt;/</span>.</p></div>
+      <div class="agentconv-search">
+        <input id="agentconv-q" type="search" autocomplete="off" spellcheck="false" placeholder="Search titles and prompts — every word must match" aria-label="Search conversations" />
+        <select id="agentconv-agent" aria-label="Agent"><option value="">Both agents</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select>
+      </div>
+      <label class="check-row"><input id="agentconv-automated" type="checkbox" /> Include one-shot runs by programs (<span class="mono">claude -p</span> in a temporary folder, <span class="mono">codex exec</span>)</label>
+      <div id="agentconv-list" class="feishu-plan agentconv-list" aria-live="polite"></div>
+      <label class="check-row"><input id="agentconv-follow" type="checkbox" checked /> Keep in sync — exchanges added later are brought in once the conversation has been quiet for a few minutes</label>
+      <p id="agentconv-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="btn-agentconv-cancel" type="button">Cancel</button><button id="btn-agentconv-go" class="primary" type="submit" disabled>Import</button></div>
+    </form>
+  </dialog>
+
   <dialog id="estimate-dialog" class="team-dialog estimate-dialog" aria-labelledby="estimate-title">
     <form id="estimate-form" novalidate>
       <div class="dialog-head"><p class="eyebrow" id="estimate-eyebrow">BEFORE YOU START</p><h2 id="estimate-title">Start?</h2><p id="estimate-lede"></p></div>

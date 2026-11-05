@@ -13,14 +13,14 @@
  */
 
 export const API_GROUPS = {
-  files: 'browse, read, edit, upload and move files; sync and unlink linked folders and Feishu documents',
+  files: 'browse, read, edit, upload and move files; sync and unlink linked folders, Feishu documents and followed agent conversations',
   search: 'search, graph, entities, documents, claims, stats, notices, lineage and history',
   ask: 'Ask, chat and context packs',
   knowledge: 'wiki, research, dream, suggestions, merges and reviews',
   ingest: 'sync, ingest, forget, purge, rebuild, labeling status and the task queue',
   traces: 'agent traces',
   datasources: 'configured live datasources and their read-only queries',
-  settings: 'workspace settings — models, connections, agents, profiles, playbooks — clearing a workspace, importing or linking a folder from this machine, and signing in to Feishu and importing its documents',
+  settings: 'workspace settings — models, connections, agents, profiles, playbooks — clearing a workspace, importing or linking a folder from this machine, signing in to Feishu and importing its documents, and listing and importing this machine\'s agent conversations',
   gateway: 'local services published through /gw/<id>',
 } as const;
 
@@ -68,6 +68,10 @@ const RULES: Rule[] = [
   { prefix: '/api/feishu/auth', group: 'settings' },
   { prefix: '/api/feishu/preview', group: 'settings' },
   { prefix: '/api/feishu/import', group: 'settings' },
+  // and this machine's agent conversations: the catalog shows every session's prompts
+  { prefix: '/api/conversations/catalog', group: 'settings' },
+  { prefix: '/api/conversations/preview', group: 'settings' },
+  { prefix: '/api/conversations/import', group: 'settings' },
 
   { prefix: '/api/config', group: 'settings' },
   { prefix: '/api/agents', group: 'settings' },
@@ -86,6 +90,7 @@ const RULES: Rule[] = [
   { prefix: '/api/grep', group: 'files' },
   { prefix: '/api/folders', group: 'files' },
   { prefix: '/api/feishu', group: 'files' },
+  { prefix: '/api/conversations', group: 'files' },
   { prefix: '/api/link/', group: 'files' },
   { prefix: '/api/vfs', group: 'files' },
   { prefix: '/api/okf/', group: 'files' },

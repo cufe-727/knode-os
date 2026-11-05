@@ -3121,6 +3121,22 @@ struct FolderImportResult: Decodable {
     private enum CodingKeys: String, CodingKey { case dest, copied, sync, indexing }
 }
 
+/// `POST /api/conversations/sync` without a copy named: a check of every
+/// followed conversation starts in the background (`started`), unless one is
+/// under way already.
+struct ConversationCheck: Decodable {
+    var started: Bool
+    var links: Int
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        started = try c.decodeIfPresent(Bool.self, forKey: .started) ?? false
+        links = try c.decodeIfPresent(Int.self, forKey: .links) ?? 0
+    }
+
+    private enum CodingKeys: String, CodingKey { case started, links }
+}
+
 /// `POST /api/feishu/sync`: a check of every link starts in the background
 /// (`started`, or a check was under way already); one of a single mirror
 /// answers with what it found.

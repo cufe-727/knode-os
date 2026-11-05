@@ -75,6 +75,18 @@ import {
   resolveImportSource,
   unlinkFolder,
 } from '../ingest/folders.js';
+import { listConversations as listAgentConversations } from '../ingest/conversations/catalog.js';
+import {
+  AgentConversations,
+  conversationCopies,
+  conversationLinks,
+  ConversationRef,
+  describeConversationLinks,
+  importConversations,
+  previewConversation,
+  refreshConversations,
+  unfollowConversation,
+} from '../ingest/conversations/follow.js';
 import { FeishuError } from '../ingest/feishu/client.js';
 import {
   describeFeishuLinks,
@@ -254,6 +266,8 @@ export interface WorkspaceServices {
   folders?: LinkedFolders | null;
   /** The poller of this workspace's linked Feishu documents; absent outside `serve`, where they are synced on demand only. */
   feishu?: FeishuDocs | null;
+  /** The checker of this workspace's followed agent conversations; absent outside `serve`, where they are synced on demand only. */
+  conversations?: AgentConversations | null;
   /** Extraction as leased work (src/labeling): local slots and remote workers take segments from it. */
   labeling?: LabelingScheduler | null;
   /** Every kind of leased work — segments and summaries — behind one lease protocol (src/work/broker.ts). */
@@ -1133,6 +1147,7 @@ export function createApp(
       // folder knode-os makes says what it is for.
       const links = mirrorLinks(ctx.config);
       const feishuDests = new Set(feishuLinks(ctx.config).map((l) => l.dest));
+      const conversationDests = new Set(conversationLinks(ctx.config).map((l) => l.dest));
       const mark = (node: typeof tree): void => {
         const marked = node as typeof tree & { linked?: string; about?: string };
         const link = links.find((l) => l.dest === node.path);
@@ -1155,7 +1170,7 @@ export function createApp(
           }
         }
       }
-      return c.json({ ...tree, links: links.map((l) => ({ path: l.dest, source: l.source, kind: feishuDests.has(l.dest) ? 'feishu' : 'folder' })) });
+      return c.json({ ...tree, links: links.map((l) => ({ path: l.dest, source: l.source, kind: feishuDests.has(l.dest) ? 'feishu' : conversationDests.has(l.dest) ? 'conversation' : 'folder' })) });
     } catch (e) {
       return c.json(err(e), 400);
     }
@@ -1697,6 +1712,135 @@ export function createApp(
       const removeFiles = c.req.query('removeFiles') === '1' || c.req.query('removeFiles') === 'true';
       const feishu = servicesFor(ctx)?.feishu ?? null;
       const result = feishu ? await feishu.remove(dest, { removeFiles }) : await unlinkFeishuDocument(ctx, dest, { removeFiles, onProgress: log });
+      return c.json({ ok: true, ...result });
+    } catch (e) {
+      return c.json(err(e), 400);
+    } finally {
+      ingestRunning.delete(ctx.dataDir);
+    }
+  });
+
+  /* --------------------------- agent conversations ------------------------ */
+
+  // Claude Code and Codex sessions on this machine, picked one by one and rendered into raw/docs as
+  // dialogue, once or followed (src/ingest/conversations, docs/design/24). The catalog shows every
+  // session's prompts, so it, a preview and importing are an administrator's; what is followed is
+  // anyone's who may sync the files.
+
+  const agentOf = (v: unknown): 'claude' | 'codex' | null => (v === 'claude' || v === 'codex' ? v : null);
+
+  // what is followed here, with when each was last checked
+  app.get('/api/conversations', (c) => {
+    const ctx = requestCtx(c);
+    const conversations = servicesFor(ctx)?.conversations ?? null;
+    return c.json({ links: conversations ? conversations.status() : describeConversationLinks(ctx), checking: conversations?.checking ?? false });
+  });
+
+  // this machine's conversations, newest first; each says whether this workspace holds a copy
+  app.get('/api/conversations/catalog', (c) => {
+    const ctx = requestCtx(c);
+    const truthy = (v: string | undefined) => v === '1' || v === 'true';
+    const limit = Number(c.req.query('limit') ?? '');
+    const result = listAgentConversations(ctx.config, {
+      q: c.req.query('q') ?? undefined,
+      agent: agentOf(c.req.query('agent')) ?? undefined,
+      project: c.req.query('project') || undefined,
+      automated: truthy(c.req.query('automated')),
+      id: c.req.query('id') || undefined,
+      limit: Number.isFinite(limit) && limit > 0 ? Math.min(limit, 1000) : undefined,
+    });
+    const copies = conversationCopies(ctx.dataDir, ctx.config);
+    const followed = new Set(conversationLinks(ctx.config).map((l) => `${l.agent}:${l.id}`));
+    return c.json({
+      ...result,
+      conversations: result.conversations.map((s) => {
+        const key = `${s.agent}:${s.id}`;
+        return { ...s, copy: copies.get(key) ?? null, followed: followed.has(key) };
+      }),
+    });
+  });
+
+  // what importing one would write, without writing it
+  app.get('/api/conversations/preview', (c) => {
+    const ctx = requestCtx(c);
+    const agent = agentOf(c.req.query('agent'));
+    const id = c.req.query('id') ?? '';
+    if (!agent || !id) return c.json({ error: 'agent (claude or codex) and id are required' }, 400);
+    try {
+      return c.json(previewConversation(ctx, { agent, id }, c.req.query('folder') || undefined));
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // import (copy) or follow conversations, then index what was written
+  app.post('/api/conversations/import', async (c) => {
+    const ctx = requestCtx(c);
+    if (ingestRunning.has(ctx.dataDir)) return c.json({ error: 'ingest running — try again shortly' }, 409);
+    const body = (await c.req.json().catch(() => ({}))) as { sessions?: unknown; mode?: string; folder?: string };
+    const mode = body.mode === 'follow' ? 'follow' : body.mode === 'copy' || body.mode === undefined ? 'copy' : null;
+    if (!mode) return c.json({ error: 'mode must be copy or follow' }, 400);
+    const refs: ConversationRef[] = (Array.isArray(body.sessions) ? body.sessions : [])
+      .map((x) => (x && typeof x === 'object' ? (x as { agent?: unknown; id?: unknown }) : {}))
+      .flatMap((x) => {
+        const agent = agentOf(x.agent);
+        return agent && typeof x.id === 'string' && x.id.trim() ? [{ agent, id: x.id.trim() }] : [];
+      });
+    if (refs.length === 0) return c.json({ error: 'name at least one conversation: sessions [{ agent, id }]' }, 400);
+    const folder = typeof body.folder === 'string' && body.folder.trim() ? body.folder : undefined;
+    const conversations = servicesFor(ctx)?.conversations ?? null;
+    ingestRunning.add(ctx.dataDir);
+    try {
+      const opts = { mode, folder, onProgress: log } as const;
+      const result = await activityOf(ctx.dataDir).run(
+        'conversations',
+        `${mode === 'follow' ? 'Follow' : 'Import'} ${refs.length === 1 ? 'a conversation' : `${refs.length} conversations`}`,
+        () => (conversations ? conversations.add(refs, opts) : importConversations(ctx, refs, opts)),
+        (r) => `${r.items.filter((i) => i.ok).length} of ${r.items.length} written`,
+      );
+      return c.json({ ok: result.items.some((i) => i.ok), ...result });
+    } catch (e) {
+      return c.json(err(e), 400);
+    } finally {
+      ingestRunning.delete(ctx.dataDir);
+    }
+  });
+
+  // look at every followed conversation now (in the background unless `wait`), or the one at `dest` before answering;
+  // a person asking does not wait for a conversation to go quiet; `force` renders even unchanged ones
+  app.post('/api/conversations/sync', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { dest?: string; force?: boolean; wait?: boolean };
+      const dest = typeof body.dest === 'string' && body.dest.trim() ? cleanRelPath(body.dest) : undefined;
+      const force = body.force === true;
+      const conversations = servicesFor(ctx)?.conversations ?? null;
+      const followed = conversationLinks(ctx.config).length;
+      if (!dest && conversations && body.wait !== true) {
+        if (followed === 0) return c.json({ ok: true, started: false, running: false, links: 0 });
+        const started = conversations.checkNow({ force });
+        return c.json({ ok: true, started, running: true, links: followed }, started ? 202 : 200);
+      }
+      const results = conversations
+        ? await conversations.refresh(dest, { force })
+        : await refreshConversations(ctx, { dest, force, onProgress: log });
+      return c.json({ ok: true, results });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // stop following a conversation; its copy stays unless removeFiles=1
+  app.delete('/api/conversations', async (c) => {
+    const ctx = requestCtx(c);
+    if (ingestRunning.has(ctx.dataDir)) return c.json({ error: 'ingest running — try again shortly' }, 409);
+    ingestRunning.add(ctx.dataDir);
+    try {
+      const dest = cleanRelPath(c.req.query('dest') ?? '');
+      if (!dest) return c.json({ error: 'dest required' }, 400);
+      const removeFiles = c.req.query('removeFiles') === '1' || c.req.query('removeFiles') === 'true';
+      const conversations = servicesFor(ctx)?.conversations ?? null;
+      const result = conversations ? await conversations.remove(dest, { removeFiles }) : await unfollowConversation(ctx, dest, { removeFiles, onProgress: log });
       return c.json({ ok: true, ...result });
     } catch (e) {
       return c.json(err(e), 400);

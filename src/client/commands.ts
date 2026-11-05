@@ -423,6 +423,7 @@ export const SERVER_COMMANDS = new Set([
   'research study list', 'research study show', 'research study new', 'research study refine', 'research study start',
   'research study cancel', 'research study retry', 'research study remove', 'research study report',
   'chat send', 'chat list',
+  'conversations list', 'conversations show', 'conversations import', 'conversations followed', 'conversations sync', 'conversations unfollow',
 ]);
 
 /** "research study list" for the command an action belongs to. */

@@ -63,6 +63,8 @@ import { humanBytes, registerFileCommands } from './client/files.js';
 import { queryEntities } from './store/entities.js';
 import { surveyKnowledgeBase } from './research/survey.js';
 import { describeLinkedFolders, importFolder, refreshLinkedFolders, unlinkFolder } from './ingest/folders.js';
+import { listConversations as listAgentConversations } from './ingest/conversations/catalog.js';
+import { conversationCopies, ConversationImportResult, ConversationRef, ConversationRefreshResult, ConversationStatus, describeConversationLinks, importConversations, previewConversation, refreshConversations, unfollowConversation } from './ingest/conversations/follow.js';
 import { describeFeishuLinks, feishuCheckTime, feishuClient, FeishuPlaced, FeishuSignIn, importFeishuBatch, lastFeishuCheck, refreshFeishuLinks, splitFeishuInputs, unlinkFeishuDocument } from './ingest/feishu/docs.js';
 import { requeueFailedExtractions } from './graph/tier1.js';
 import { sync } from './ingest/sync.js';
@@ -607,6 +609,200 @@ feishu
       await ctx.datasources.closeAll();
       await ctx.store.close();
     }
+  });
+
+/* ------------------------------ agent conversations ------------------------------ */
+
+const conversations = program
+  .command('conversations')
+  .description('pick Claude Code and Codex conversations and keep them in raw/docs/conversations as dialogue, once or followed (see docs/design/24) — signed in to a server, it lists and imports the conversations on the server\'s machine');
+
+type CatalogRow = Awaited<ReturnType<typeof listAgentConversations>>['conversations'][number] & { copy?: string | null; followed?: boolean };
+
+/** This machine's (or the server's) conversations matching the query. */
+async function conversationCatalog(query: { q?: string; agent?: string; project?: string; automated?: boolean; id?: string; limit?: number }): Promise<{ conversations: CatalogRow[]; total: number; automatedHidden: number }> {
+  const srv = server();
+  if (srv) {
+    return srv.get('/api/conversations/catalog', { q: query.q, agent: query.agent, project: query.project, automated: query.automated ? '1' : undefined, id: query.id, limit: query.limit ? String(query.limit) : undefined });
+  }
+  const ctx = await createContext(dataDir());
+  try {
+    const agent = query.agent === 'claude' || query.agent === 'codex' ? query.agent : undefined;
+    const result = listAgentConversations(ctx.config, { ...query, agent });
+    const copies = conversationCopies(ctx.dataDir, ctx.config);
+    const followed = new Set(ctx.config.ingest.conversations?.map((l) => `${l.agent}:${l.id}`) ?? []);
+    return { ...result, conversations: result.conversations.map((c) => ({ ...c, copy: copies.get(`${c.agent}:${c.id}`) ?? null, followed: followed.has(`${c.agent}:${c.id}`) })) };
+  } finally {
+    await ctx.store.close();
+  }
+}
+
+/** Session ids as typed — whole, or a start of one at least six characters long — read against the catalog. */
+async function resolveConversations(ids: string[], agent?: string): Promise<ConversationRef[]> {
+  const refs: ConversationRef[] = [];
+  for (const typed of ids) {
+    const want = typed.trim().toLowerCase();
+    if (want.length < 6) throw new Error(`${typed}: type at least six characters of the session id`);
+    const { conversations: found } = await conversationCatalog({ agent, automated: true, id: want, limit: 20 });
+    const exact = found.filter((c) => c.id.toLowerCase() === want);
+    const hits = exact.length ? exact : found;
+    if (hits.length === 0) throw new Error(`no conversation ${typed}${agent ? ` of ${agent}` : ''} — \`knode-os conversations list\` shows them`);
+    if (hits.length > 1) throw new Error(`${typed} names ${hits.length} conversations — type more of its id, or add --agent`);
+    refs.push({ agent: hits[0].agent, id: hits[0].id });
+  }
+  return refs;
+}
+
+const shortDate = (iso: string | null) => (iso ? iso.slice(0, 16).replace('T', ' ') : '—');
+
+conversations
+  .command('list [words...]')
+  .description('this machine\'s conversations, newest first — words must all appear in the title, project or one of the prompts')
+  .option('--agent <agent>', 'claude or codex')
+  .option('--project <name>', 'only conversations in this repository')
+  .option('--all', 'include one-shot runs by programs (claude -p in a temporary folder, codex exec)')
+  .option('--limit <n>', 'at most this many', '50')
+  .option('--json', 'raw JSON output')
+  .action(async (words: string[], opts: { agent?: string; project?: string; all?: boolean; limit: string; json?: boolean }) => {
+    const out = await conversationCatalog({ q: words.join(' ') || undefined, agent: opts.agent, project: opts.project, automated: Boolean(opts.all), limit: Number(opts.limit) || 50 });
+    if (opts.json) {
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    for (const c of out.conversations) {
+      const held = c.followed ? '  [followed]' : c.copy ? '  [imported]' : '';
+      console.log(`${c.agent.padEnd(6)} ${c.id}  ${shortDate(c.updatedAt)}  ${String(c.exchanges).padStart(3)} ex  ${(c.project ?? '—').padEnd(14)} ${c.title}${held}`);
+    }
+    const more = out.total > out.conversations.length ? `, ${out.total - out.conversations.length} more (--limit)` : '';
+    console.log(`\n${out.conversations.length} shown${more}${out.automatedHidden && !opts.all ? `; ${out.automatedHidden} one-shot runs left out (--all)` : ''}`);
+  });
+
+conversations
+  .command('show <id>')
+  .description('print the Markdown importing a conversation would write (id: whole, or its first six characters or more)')
+  .option('--agent <agent>', 'claude or codex, when an id start names both')
+  .option('--to <folder>', 'a folder under raw/docs it would go in')
+  .action(async (id: string, opts: { agent?: string; to?: string }) => {
+    const [ref] = await resolveConversations([id], opts.agent);
+    const srv = server();
+    const out = srv
+      ? await srv.get<ReturnType<typeof previewConversation>>('/api/conversations/preview', { agent: ref.agent, id: ref.id, folder: opts.to })
+      : await (async () => {
+        const ctx = await createContext(dataDir());
+        try {
+          return previewConversation(ctx, ref, opts.to);
+        } finally {
+          await ctx.store.close();
+        }
+      })();
+    process.stdout.write(out.markdown);
+    console.error(`\n→ ${out.dest}: ${out.exchanges} exchanges, ${(out.bytes / 1024).toFixed(1)} KB${out.redactions ? `, ${out.redactions} secrets redacted` : ''}`);
+  });
+
+const CONVERSATION_SERVE_HINT = 'note: a running `knode-os serve` keeps its own copy of the config — restart it, or follow through the app or a signed-in CLI, for it to keep this in sync';
+
+conversations
+  .command('import <ids...>')
+  .description('render conversations into raw/docs/conversations/<project>/ as dialogue and index them; --follow keeps each in sync while `serve` runs')
+  .option('--follow', 'keep the copies in sync as the conversations go on')
+  .option('--agent <agent>', 'claude or codex, when an id start names both')
+  .option('--to <folder>', 'a folder under raw/docs for new copies (default raw/docs/conversations/<project>)')
+  .option('--no-llm', 'do not queue the copies for tier-1 LLM extraction')
+  .action(async (ids: string[], opts: { follow?: boolean; agent?: string; to?: string; llm?: boolean }) => {
+    const refs = await resolveConversations(ids, opts.agent);
+    const mode = opts.follow ? 'follow' : 'copy';
+    const srv = server();
+    let out: ConversationImportResult;
+    if (srv) {
+      hereOnly({ llm: opts.llm === false ? true : undefined }, { llm: '--no-llm' });
+      out = await srv.post<ConversationImportResult>('/api/conversations/import', { sessions: refs, mode, folder: opts.to });
+    } else {
+      const ctx = await createContext(dataDir());
+      try {
+        out = await importConversations(ctx, refs, { mode, folder: opts.to, llmGraph: opts.llm, onProgress: (m) => console.log(`  ${m}`) });
+      } finally {
+        await ctx.datasources.closeAll();
+        await ctx.store.close();
+      }
+    }
+    for (const item of out.items) {
+      if (!item.ok || !item.result) {
+        console.log(`${item.agent} ${item.id}: ${item.error}`);
+        continue;
+      }
+      const r = item.result;
+      const what = r.refreshed ? (r.written ? 'brought up to date' : 'unchanged') : 'written';
+      console.log(`${r.mode === 'follow' ? 'following' : 'imported'} “${r.title}” → ${r.dest} (${what}; ${r.exchanges} exchanges${r.redactions ? `, ${r.redactions} secrets redacted` : ''})`);
+    }
+    if (out.sync) console.log(`indexed: ${out.sync.indexed} applied, ${out.sync.unchanged} unchanged, ${out.sync.skipped} skipped, ${out.sync.errors} errors`);
+    if (mode === 'follow' && !srv && out.items.some((x) => x.ok)) console.log(CONVERSATION_SERVE_HINT);
+    if (out.items.some((x) => !x.ok)) process.exitCode = 1;
+  });
+
+conversations
+  .command('followed')
+  .description('the conversations followed here, and how current their copies are')
+  .option('--json', 'raw JSON output')
+  .action(async (opts: { json?: boolean }) => {
+    const srv = server();
+    let links: ConversationStatus[];
+    if (srv) links = (await srv.get<{ links: ConversationStatus[] }>('/api/conversations')).links;
+    else {
+      const ctx = await createContext(dataDir());
+      links = describeConversationLinks(ctx);
+      await ctx.store.close();
+    }
+    if (opts.json) console.log(JSON.stringify(links, null, 2));
+    else if (links.length === 0) console.log('no conversations followed — `knode-os conversations import <id> --follow` follows one');
+    else {
+      for (const l of links) {
+        console.log(`${l.dest}  ←  ${l.agent} ${l.id}  ${l.exchanges ?? '?'} exchanges, last ${shortDate(l.asOf)}${l.sourcePresent ? '' : '  (transcript gone from this machine — copy kept)'}${l.waiting ? '  (being written; synced once quiet)' : ''}${l.lastError ? `  error: ${l.lastError}` : ''}`);
+      }
+    }
+  });
+
+conversations
+  .command('sync [dest]')
+  .description('bring followed conversations up to date now, without waiting for them to go quiet (one with <dest>)')
+  .option('--force', 'render every followed conversation again, changed or not')
+  .action(async (dest: string | undefined, opts: { force?: boolean }) => {
+    const srv = server();
+    let results: ConversationRefreshResult[];
+    if (srv) results = (await srv.post<{ results: ConversationRefreshResult[] }>('/api/conversations/sync', { dest, force: Boolean(opts.force), wait: true })).results;
+    else {
+      const ctx = await createContext(dataDir());
+      try {
+        results = await refreshConversations(ctx, { dest, force: Boolean(opts.force), onProgress: (m) => console.log(`  ${m}`) });
+      } finally {
+        await ctx.datasources.closeAll();
+        await ctx.store.close();
+      }
+    }
+    if (results.length === 0) console.log('no conversations followed');
+    for (const r of results) {
+      console.log(r.error ? `${r.dest}: ${r.error}` : r.written ? `${r.dest}: updated — ${r.exchanges} exchanges` : r.changed ? `${r.dest}: re-read, nothing new to keep` : `${r.dest}: unchanged`);
+    }
+  });
+
+conversations
+  .command('unfollow <dest>')
+  .description('stop following a conversation; its copy stays as an ordinary document unless --remove-files')
+  .option('--remove-files', 'also delete the copy and dispose its knowledge')
+  .action(async (dest: string, opts: { removeFiles?: boolean }) => {
+    const srv = server();
+    const r = srv
+      ? await srv.delete<{ dest: string; removedFiles: boolean }>('/api/conversations', { dest, removeFiles: opts.removeFiles ? '1' : undefined })
+      : await (async () => {
+        const ctx = await createContext(dataDir());
+        try {
+          return await unfollowConversation(ctx, dest, { removeFiles: Boolean(opts.removeFiles), onProgress: (m) => console.log(`  ${m}`) });
+        } finally {
+          await ctx.datasources.closeAll();
+          await ctx.store.close();
+        }
+      })();
+    console.log(r.removedFiles ? `unfollowed ${r.dest} and removed its copy` : `unfollowed ${r.dest}; its copy stays as an ordinary document`);
+    if (!srv) console.log(CONVERSATION_SERVE_HINT);
   });
 
 program

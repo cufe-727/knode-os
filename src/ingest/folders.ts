@@ -120,13 +120,20 @@ export function linkedFolders(config: KnodeConfig): LinkedFolder[] {
 }
 
 /**
- * Every mirror a link writes: the linked folders, and the Feishu documents
- * kept in sync (src/ingest/feishu/docs.ts), whose `source` is the document's
- * link. What guards a linked folder's mirror guards these the same way.
+ * Every mirror a link writes: the linked folders, the Feishu documents kept
+ * in sync (src/ingest/feishu/docs.ts), whose `source` is the document's link,
+ * and the agent conversations followed (src/ingest/conversations/follow.ts),
+ * whose `dest` is one Markdown file and `source` its transcript. What guards a
+ * linked folder's mirror guards these the same way.
  */
 export function mirrorLinks(config: KnodeConfig): LinkedFolder[] {
   const feishu = Array.isArray(config.ingest.feishuDocs) ? config.ingest.feishuDocs : [];
-  return [...linkedFolders(config), ...feishu.map((d) => ({ source: d.url, dest: d.dest, createdAt: d.createdAt }))];
+  const conversations = Array.isArray(config.ingest.conversations) ? config.ingest.conversations : [];
+  return [
+    ...linkedFolders(config),
+    ...feishu.map((d) => ({ source: d.url, dest: d.dest, createdAt: d.createdAt })),
+    ...conversations.map((c) => ({ source: c.source, dest: c.dest, createdAt: c.createdAt })),
+  ];
 }
 
 /** The link whose mirror is `rel` or contains it, if any. */
