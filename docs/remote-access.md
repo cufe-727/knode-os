@@ -191,6 +191,57 @@ What the service sees and returns:
 
 An administrator can also manage gateways under **Settings → Access**.
 
+## From the command line, on another machine
+
+The `knode-os` CLI can sign in to a server too. Its reading and file commands then answer from a workspace on that
+server, as the signed-in account, under the same rules as the web UI and the app.
+
+```bash
+git clone https://github.com/wangning19940904/knode-os.git && cd knode-os
+pnpm install && pnpm build && npm link                         # Node 20+; puts `knode-os` on the PATH
+
+knode-os login https://knode.example.com --user alice --workspace finance   # asks for the password
+knode-os whoami                                                 # server, account, workspace, what it may use
+knode-os workspaces                                             # personal ones and Teams; * marks the current one
+knode-os use team/finance                                       # switch
+knode-os logout                                                 # ends the session on the server too
+```
+
+A machine that only talks to a server needs no database and no data directory. `login` asks for the password at a
+hidden prompt, or reads it from stdin with `--password-stdin`. `--token-stdin` signs in with a script token from
+`knode-os user token` instead. The session is a normal app session (`knode-os CLI on <hostname>` under **Settings →
+Access**) that lasts `server.auth.sessionDays` after its last use. It is kept in `~/.config/knode-os/servers.json`
+(mode 0600; `$XDG_CONFIG_HOME` or `KNODE_OS_SIGNINS` move it), along with the workspace each server's commands use.
+Running `login` again for a server that has a session reuses it. Signing in to a second server makes that one current.
+Plain `http://` is accepted only for this machine, which is what an SSH tunnel's local end is
+(`knode-os login http://127.0.0.1:12000`). Everything else goes over HTTPS. For a server whose certificate this
+machine does not trust, such as the self-signed `server.tls` listener, set `NODE_EXTRA_CA_CERTS=<cert.pem>`.
+
+While a server is current, these commands go to it:
+
+| commands | what they do there |
+| --- | --- |
+| `ls [path]`, `tree [path] -L n`, `stat <path>` | list a folder, draw a tree, describe a path |
+| `read <path>` (`cat`) | print a file; a PDF or picture prints its derived Markdown; `--lang zh` reads a translation |
+| `grep <pattern> [path]` | search file contents (a regular expression, ignoring case) |
+| `get <path…> [-o dir]` (`download`) | save files or whole folders here: originals for PDFs, web pages and pictures, other files as text (up to 4 MB) |
+| `put <file\|folder…> [--to raw/docs/x]` (`upload`) | upload into raw/docs or wiki, then index what came in |
+| `write <path>`, `mkdir <path>`, `mv <from> <to>`, `rm <path>` | change files under wiki/ and raw/docs/ |
+| `search`, `ask`, `graph`, `claims`, `stats`, `survey`, `entities list\|show`, `suggestions list` | the same as on the server's machine |
+| `sync [--only p…] [--verify]`, `tasks` | index now; what the server is working on |
+| `research study list\|show\|new\|refine\|start\|cancel\|retry\|resume\|archive\|unarchive\|remove\|report` | studies, run by the server; `report` saves the HTML export |
+| `chat "<message>" [-c id]`, `chat list` | Ask conversations, answered by the server's agent |
+| `sessions [--revoke id]`, `password` | your sessions; change your password |
+| `api <route> [-X method] [-f k=v] [-q k=v] [--input file]` | any other REST route, as `gh api` does: settings, users, Feishu, everything the app does |
+
+`--data <dir>` or `KNODE_OS_DATA` keeps a command on this machine's data directory, signed in or not. A command
+that has no server side, such as `serve`, `init`, `rebuild` or `user`, always works here, and while a server is current
+it says so on stderr. Flags that only a local index understands (`--trust`, `--actor`, `sync --reapply`, `--now`) are
+refused rather than dropped. A read-only account is held to looking, as everywhere: `write`, `put`, `mv`, `rm`, `sync`,
+chat and studies come back with `403 read-only`, while `ask` (a one-shot answer) still works. When a request goes
+through Cloudflare, the tunnel gives up after about 100 seconds. A long `ask` can hit that limit. Conversations and
+studies do not, because they run in the background on the server.
+
 ## Scripts
 
 ```bash
