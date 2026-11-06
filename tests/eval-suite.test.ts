@@ -10,7 +10,7 @@ import { loadPack, stageCorpus, validatePack } from '../src/eval/pack.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { buildReportData, writeReport } from '../src/eval/report.js';
 import { runEval } from '../src/eval/run.js';
-import { RunStore } from '../src/eval/runstore.js';
+import { fileLines, RunStore } from '../src/eval/runstore.js';
 import { ChatBackend, ChatRequest, decodeVector, retryableFailure, startShim } from '../src/eval/shim.js';
 import { retrievalScores } from '../src/eval/metrics/retrieval.js';
 import { bootstrapMean, holm, pairedBootstrap, wilson } from '../src/eval/metrics/stats.js';
@@ -133,6 +133,16 @@ describe('metrics', () => {
     expect(citationsIn(text, docs, byFileName(docs, ['证券法/01-总则.md'])).map((c) => c.doc)).toEqual(['民法典/01-总则/01-基本规定.md', '证券法/01-总则.md', 'chat/w01-2026-03-03-1.md']);
     expect(byFileName(docs, ['证券法/01-总则.md', '公司法/01-总则.md'])('01-总则.md')).toBeUndefined();
     expect(byFileName(docs, [])('x/01-基本规定.md')).toBeUndefined();
+  });
+
+  it('reads a file line by line across read blocks', () => {
+    const file = path.join(tmp, 'lines.jsonl');
+    const lines = ['{"k":"第一行"}', '', 'x'.repeat(40), '民法典第十六条', 'last without newline'];
+    fs.writeFileSync(file, lines.join('\n'));
+    // blocks of 7 bytes split lines and the three bytes of a Chinese character alike
+    expect([...fileLines(file, 7)]).toEqual(lines);
+    fs.writeFileSync(file, 'a\nb\n');
+    expect([...fileLines(file, 7)]).toEqual(['a', 'b']);
   });
 });
 

@@ -14,6 +14,7 @@ import { isRefusal } from '../estimate/ledger.js';
 import { classifyFailure } from '../labeling/failures.js';
 import { Meter, MeterTag, parseTag } from './meter.js';
 import type { EmbeddingBudget } from './quota.js';
+import { fileLines } from './runstore.js';
 
 /**
  * The model gateway every system under test talks to (docs/design/23 §4).
@@ -137,7 +138,7 @@ class ReplyCache {
 
   constructor(private readonly file: string | null) {
     if (file && fs.existsSync(file)) {
-      for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+      for (const line of fileLines(file)) {
         if (!line.trim()) continue;
         try {
           const r = JSON.parse(line) as CachedReply;
@@ -159,17 +160,21 @@ class ReplyCache {
   }
 }
 
-/** Vectors by text, shared by every system so the shared embedding pool embeds each text once per run. */
+/**
+ * Vectors by text, shared by every system so the shared embedding pool embeds
+ * each text once per run. They are kept as the Float32 they are stored as: a
+ * pilot's cache holds over a hundred thousand.
+ */
 export class VectorCache {
-  private map = new Map<string, number[]>();
+  private map = new Map<string, Float32Array>();
 
   constructor(private readonly file: string | null) {
     if (file && fs.existsSync(file)) {
-      for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+      for (const line of fileLines(file)) {
         if (!line.trim()) continue;
         try {
           const r = JSON.parse(line) as { k: string; v: string };
-          this.map.set(r.k, decodeVector(r.v));
+          this.map.set(r.k, float32Of(r.v));
         } catch {
           /* torn line */
         }
@@ -178,19 +183,25 @@ export class VectorCache {
   }
 
   get(k: string): number[] | undefined {
-    return this.map.get(k);
+    const v = this.map.get(k);
+    return v && Array.from(v);
   }
 
   put(k: string, v: number[]): void {
-    this.map.set(k, v);
-    if (this.file) fs.appendFileSync(this.file, JSON.stringify({ k, v: Buffer.from(new Float32Array(v).buffer).toString('base64') }) + '\n');
+    const f = Float32Array.from(v);
+    this.map.set(k, f);
+    if (this.file) fs.appendFileSync(this.file, JSON.stringify({ k, v: Buffer.from(f.buffer).toString('base64') }) + '\n');
   }
 }
 
 /** A base64 Float32 vector — read from the buffer's own bytes, not the pool Node may have put it in. */
-export function decodeVector(b64: string): number[] {
+function float32Of(b64: string): Float32Array {
   const buf = Buffer.from(b64, 'base64');
-  return [...new Float32Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength))];
+  return new Float32Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+}
+
+export function decodeVector(b64: string): number[] {
+  return Array.from(float32Of(b64));
 }
 
 /** An embedder that consults the run's vector cache and meters what it actually sends. */

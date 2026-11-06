@@ -11,6 +11,31 @@ import { AnswerRecord, BuildRecord, ScoreRecord } from './types.js';
  * not at the start.
  */
 
+/**
+ * A file's lines, read a block at a time: a JSONL cache can outgrow the longest
+ * string V8 can make (about 512 MB), and a run's embedding cache did.
+ */
+export function* fileLines(file: string, blockBytes = 16 << 20): Generator<string> {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const block = Buffer.allocUnsafe(blockBytes);
+    let rest = Buffer.alloc(0);
+    for (let n; (n = fs.readSync(fd, block, 0, blockBytes, null)) > 0; ) {
+      const data = rest.length ? Buffer.concat([rest, block.subarray(0, n)]) : block.subarray(0, n);
+      let start = 0;
+      for (let nl = data.indexOf(10); nl >= 0; nl = data.indexOf(10, start)) {
+        yield data.toString('utf8', start, nl);
+        start = nl + 1;
+      }
+      // a copy: the block is read into again
+      rest = Buffer.from(data.subarray(start));
+    }
+    if (rest.length) yield rest.toString('utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 export function recordKey(...parts: (string | number | undefined | null)[]): string {
   return crypto.createHash('sha1').update(parts.map((p) => String(p ?? '')).join('␟')).digest('hex').slice(0, 20);
 }
@@ -51,7 +76,7 @@ export class RunStore {
     const file = path.join(this.dir, name);
     if (!fs.existsSync(file)) return [];
     const out: T[] = [];
-    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    for (const line of fileLines(file)) {
       if (!line.trim()) continue;
       // a line cut by a crash mid-write is the only record that can be lost
       try {
