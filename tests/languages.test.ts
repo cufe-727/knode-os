@@ -324,6 +324,29 @@ describe('the Translate stage as leased work', () => {
     expect(due).toEqual([]);
   });
 
+  it('leaves a wiki page to a request, then translates it the way it does a source', async () => {
+    write(ctx.dataDir, 'wiki/concepts/momentum.md', '---\ntitle: Momentum\n---\n# Momentum\n\nThe strategy buys the stocks that went up the most over the last year and sells the ones that fell, and the paper says that the effect is strongest in small companies. See [[raw/docs/filing.md]] for the figures.\n');
+    await sync(ctx, { only: ['wiki/concepts/momentum.md'] });
+    const [page] = await ctx.store.query<DocumentRow>(`SELECT * FROM documents WHERE path = 'wiki/concepts/momentum.md'`);
+    expect(page).toMatchObject({ root: 'wiki', language: 'en' });
+    // English in a Chinese workspace, but a wiki page: nothing by itself
+    source.wake();
+    expect(await source.lease(mac, 8)).toEqual([]);
+    await recordTranslationState(ctx.store, page, 'zh', { status: 'requested', requested: true });
+    source.wake();
+    const [task, ...rest] = await source.lease(mac, 8);
+    expect(rest).toEqual([]);
+    expect(task.label).toBe('wiki/concepts/momentum.md → zh');
+    // the wikilink is out of the model's reach
+    expect(requestText(task.messages)).not.toContain('raw/docs/filing.md');
+    expect(await source.complete(task.id, mac, { ok: true, text: toChinese(requestText(task.messages)) })).toEqual({ accepted: true });
+    expect(await translationRow(ctx.store, page.id, 'zh')).toMatchObject({ status: 'done', requested: true });
+    const translation = readTranslation(ctx.dataDir, 'wiki/concepts/momentum.md', 'zh')!;
+    expect(translation.body.startsWith('---\ntitle: Momentum\n---\n')).toBe(true);
+    expect(translation.body).toContain('[[raw/docs/filing.md]]');
+    expect(translation.body).not.toContain('strategy');
+  });
+
   it('drops an answer for a document that changed while it was out', async () => {
     write(ctx.dataDir, 'raw/docs/memo.md', '# Memo\n\nThe board approved the plan to expand capacity in the next quarter, and the company said that demand was strong.\n');
     await sync(ctx, { only: ['raw/docs/memo.md'] });
@@ -510,6 +533,23 @@ describe('reading a document in another language', () => {
     const cancel = await app.request('/api/file/translate', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ path: 'raw/docs/post.md', lang: 'en', cancel: true }) });
     expect(cancel.status).toBe(200);
     expect((await file('raw/docs/post.md')).languages.translations.en.requested).toBe(false);
+  });
+
+  it('offers a wiki page\'s languages too, translated only on request', async () => {
+    write(workspaceDir, 'wiki/concepts/packaging.md', '---\ntitle: 先进封装\n---\n# 先进封装\n\n先进封装把多颗芯片放进一个封装，宁德时代的季度报告也提到了相关的需求。\n');
+    expect((await app.request('/api/sync', { method: 'POST', headers: jsonHeaders, body: '{}' })).status).toBe(200);
+    const page = await file('wiki/concepts/packaging.md', 'en');
+    expect(page.languages).toMatchObject({ source: 'zh', offered: ['zh', 'en'], background: false, shown: 'zh', translations: { zh: { status: 'source' }, en: { status: 'none' } } });
+    expect(page.translation).toBeUndefined();
+    // a source in another language than the primary is the background's; one in the primary has nothing for it
+    expect((await file('raw/docs/filing.md')).languages.background).toBe(true);
+    expect((await file('raw/docs/post.md')).languages.background).toBe(false);
+    const r = await app.request('/api/file/translate', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ path: 'wiki/concepts/packaging.md', lang: 'en' }) });
+    expect(r.status).toBe(200);
+    expect(await r.json()).toMatchObject({ ok: true, status: 'requested' });
+    expect((await file('wiki/concepts/packaging.md', 'en')).languages.translations.en).toMatchObject({ status: 'requested', requested: true });
+    const missing = await app.request('/api/file/translate', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ path: 'wiki/concepts/missing.md', lang: 'en' }) });
+    expect(missing.status).toBe(404);
   });
 
   it('lists a workspace language the document is written in already as the document\'s own', async () => {

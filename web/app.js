@@ -2797,6 +2797,8 @@ function fileUrl(path, { maxBytes } = {}) {
 }
 
 let languageRefresh = null;
+/** The open file's language as the switcher last painted it: the one asked for and where its translation stands. */
+let paintedLanguage = null;
 
 /**
  * The switcher and what it says about the open file: the original and the
@@ -2813,6 +2815,7 @@ function paintLanguages(path, file) {
     box.hidden = true;
     box.innerHTML = '';
     notice.hidden = true;
+    paintedLanguage = null;
     return;
   }
   const pick = readingLanguage();
@@ -2823,11 +2826,12 @@ function paintLanguages(path, file) {
   const button = (value, code, label, title) =>
     `<button type="button" data-reading="${esc(value)}" class="${code === asked ? 'selected' : ''}" title="${esc(title)}">${esc(label)}</button>`;
   box.innerHTML = button('original', langs.source, `${languageName(langs.source)} · original`, 'Read every document in the language it was written in')
-    + others.map((code) => button(code, code, languageName(code), `Read documents in ${languageInEnglish(code)} where a translation exists`)).join('');
+    + others.map((code) => button(code, code, languageName(code), `Read documents in ${languageInEnglish(code)} where a translation exists, and ask for this one's if it has none`)).join('');
   box.hidden = false;
 
   const state = langs.translations?.[asked];
   const translation = file.translation;
+  paintedLanguage = { path, asked, status: state?.status ?? null };
   let text = '';
   let action = '';
   if (translation) {
@@ -2847,8 +2851,10 @@ function paintLanguages(path, file) {
     } else if (state.status === 'skipped') {
       text = `Nothing in this document to translate into ${into}.`;
     } else {
-      text = `Not translated into ${into} yet${asked === langs.primary ? ' — documents in other languages are translated in the background, the newest first' : ''}. Showing the original.`;
-      action = asked === langs.primary ? 'translate next' : 'translate';
+      // the primary language is the background's — for a raw/docs source, not a wiki page (an older service has no `background`)
+      const background = asked === langs.primary && langs.background !== false;
+      text = `Not translated into ${into} yet${background ? ' — documents in other languages are translated in the background, the newest first' : ''}. Showing the original.`;
+      action = background ? 'translate next' : 'translate';
     }
   }
   notice.hidden = !text;
@@ -2881,17 +2887,24 @@ async function refreshLanguages(path, doneBefore) {
   }
 }
 
-$('#file-langs').addEventListener('click', (event) => {
+/**
+ * A pick is the reader's for every document from now on. A language the open
+ * document has no translation into yet is asked for: picking it is wanting
+ * this document in it, and without the request the pick would only show the
+ * same original again.
+ */
+$('#file-langs').addEventListener('click', async (event) => {
   const value = event.target.closest?.('[data-reading]')?.dataset.reading;
   if (!value || !currentFile || editing) return;
   setReadingLanguage(value);
-  void openFile(currentFile);
+  const path = currentFile;
+  await openFile(path);
+  const painted = paintedLanguage;
+  if (currentFile === path && !editing && painted?.path === path && painted.asked === value && painted.status === 'none') await requestTranslation(path, value);
 });
 
-$('#btn-translate').addEventListener('click', async () => {
-  const path = currentFile;
-  const lang = $('#btn-translate').dataset.lang;
-  if (!path || !lang) return;
+/** Ask for the open document in `lang`: the Translate stage takes it next. */
+async function requestTranslation(path, lang) {
   try {
     const r = await api('/api/file/translate', { method: 'POST', body: JSON.stringify({ path, lang }) });
     toast(r.status === 'done' ? 'Already translated' : r.processing ? `Queued: the ${languageInEnglish(lang)} translation is next` : `Queued — it is translated once processing is started, or when a remote worker takes it`, 5000);
@@ -2899,6 +2912,12 @@ $('#btn-translate').addEventListener('click', async () => {
   } catch (e) {
     toast(e.message, 5000);
   }
+}
+
+$('#btn-translate').addEventListener('click', () => {
+  const path = currentFile;
+  const lang = $('#btn-translate').dataset.lang;
+  if (path && lang) void requestTranslation(path, lang);
 });
 
 /** Draw the eye to what a jump landed on. */

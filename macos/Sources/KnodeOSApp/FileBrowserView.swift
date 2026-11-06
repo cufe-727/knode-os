@@ -158,8 +158,8 @@ struct FileBrowserView: View {
     /// until then.
     @AppStorage(FileBrowserView.readingLanguageKey) private var readingLanguagePick = ""
     /// The open document's languages as its last read told them; nil for a
-    /// file that has none — anything outside raw/docs, a workspace with
-    /// content languages off, an older service.
+    /// file that has none — anything outside raw/docs and wiki/, a workspace
+    /// with content languages off, an older service.
     @State private var fileLanguages: FileLanguages?
     /// Set while the text on screen is a translation: read-only, since an
     /// edit belongs to the original.
@@ -662,8 +662,8 @@ struct FileBrowserView: View {
             let name = spokenName(wanted)
             switch state.status {
             case "none":
-                // the primary language is the background's anyway: asking only moves the document up
-                let background = wanted == languages.primary
+                // the primary language is the background's anyway — for a raw/docs source, not a wiki page: asking only moves the document up
+                let background = wanted == languages.primary && languages.background != false
                 languageLine(
                     background
                         ? L("Not translated into %@ yet — documents in other languages are translated in the background, the newest first", name)
@@ -1253,13 +1253,21 @@ struct FileBrowserView: View {
     }
 
     /// The reader picked a language, or the originals: theirs for every
-    /// document from now on, and the open one is read again when that changes it.
+    /// document from now on, and the open one is read again when that changes
+    /// it. A language the open document has no translation into yet is asked
+    /// for: picking it here is wanting this document in it, and without the
+    /// request the pick would only show the same original again.
     private func pickReadingLanguage(_ pick: String) {
-        guard !pick.isEmpty else { return }
+        guard !pick.isEmpty, let path = selectedPath else { return }
         let before = fileLanguages.flatMap(readingLanguage(for:))
         readingLanguagePick = pick
-        guard fileLanguages.flatMap(readingLanguage(for:)) != before else { return }
-        Task { await rereadOpenFile() }
+        let changed = fileLanguages.flatMap(readingLanguage(for:)) != before
+        Task {
+            if changed { await rereadOpenFile() }
+            guard selectedPath == path, !isEditing, let languages = fileLanguages, let wanted = readingLanguage(for: languages),
+                  languages.translations[wanted]?.status == "none" else { return }
+            await requestTranslation(into: wanted)
+        }
     }
 
     /// Ask for the open document in `language`; the Translate stage takes it
