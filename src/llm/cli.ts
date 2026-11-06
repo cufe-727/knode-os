@@ -107,7 +107,8 @@ export function cursorModel(model: string, effort: LlmEffort | undefined): strin
 /**
  * What every knode Codex process turns off: ChatGPT's plugins and apps
  * (connectors), and analytics. Each costs a download or an upload per process
- * that no knode call uses (see `codexExecArgs`).
+ * that no knode call uses (see `codexExecArgs`). Research sessions, which keep
+ * the rest of the person's config, turn them off too (src/research/launch.ts).
  */
 export const CODEX_SERVICES_OFF = ['-c', 'features.plugins=false', '-c', 'features.apps=false', '-c', 'analytics.enabled=false'];
 

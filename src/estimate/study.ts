@@ -44,10 +44,35 @@ const DEFAULTS = {
   sessionInput: 3_000_000,
   sessionCachedShare: 0.94,
   sessionOutput: 15_000,
+  /** Model requests a session makes (its turns and tool calls): about what 3M tokens of a growing conversation take. */
+  sessionRequests: 50,
   capturedBytesPerPage: 3_000_000,
 };
-/** Each turn sends its conversation again; compressed on the wire, by an unknown amount. */
+/**
+ * Each request sends its conversation again; compressed on the wire, by an
+ * unknown amount. A four-request Codex session sent 1.51 bytes a token
+ * (2026-11-06).
+ */
 const BYTES_PER_INPUT_TOKEN = { low: 0.6, expected: 1.5, high: 4 };
+
+/**
+ * What `calls` agent sessions move on the wire (docs/design/18, D9): each
+ * one's start-up and each model request's download beside its output
+ * (`SERVICE_PROFILES[service].session`), the conversation every request sends
+ * again, and Codex's model catalog for the sessions that start before a copy
+ * is there (`catalogStarts`: the first phase's, starting together).
+ */
+export function sessionTransfer(
+  service: ServiceId,
+  t: { calls: number; requestsPerSession: number; input: Range; output: number; catalogStarts: number },
+): { up: Range; down: Range } {
+  const profile = SERVICE_PROFILES[service];
+  const start = t.calls * profile.session.bytesUp;
+  const up = range(start + t.input.low * BYTES_PER_INPUT_TOKEN.low, start + t.input.expected * BYTES_PER_INPUT_TOKEN.expected, start + t.input.high * BYTES_PER_INPUT_TOKEN.high);
+  const base = t.calls * (profile.session.bytesDown + t.requestsPerSession * profile.session.requestBytesDown) + t.output * 4;
+  const catalog = t.catalogStarts * profile.catalogBytes;
+  return { up, down: range(base * 0.6, base + catalog, base * 2 + catalog) };
+}
 
 interface Phase {
   seconds: number[];
@@ -76,20 +101,21 @@ export async function estimateStudy(input: StudyEstimateInput): Promise<TaskEsti
   const deep = p.runner.mode === 'deep-research';
 
   const lines: EstimateLine[] = [];
-  const phase = (kind: string, label: string, calls: number, slots: number, h: Phase, defaultSeconds: number, extraDown: Range = range(0, 0, 0)) => {
+  const phase = (kind: string, label: string, calls: number, slots: number, h: Phase, defaultSeconds: number, extraDown: Range = range(0, 0, 0), first = false) => {
     const measuredTime = h.seconds.length >= 2;
     const s = measuredTime ? stats(h.seconds) : range(defaultSeconds * 0.5, defaultSeconds, defaultSeconds * 2);
     const measuredTokens = h.tokens.length >= 1;
+    const n = h.tokens.length;
     const per = measuredTokens
-      ? h.tokens.reduce((a, t) => ({ input: a.input + t.input / h.tokens.length, cached: a.cached + t.cached / h.tokens.length, output: a.output + t.output / h.tokens.length }), { input: 0, cached: 0, output: 0 })
-      : { input: DEFAULTS.sessionInput, cached: DEFAULTS.sessionInput * DEFAULTS.sessionCachedShare, output: DEFAULTS.sessionOutput };
+      ? h.tokens.reduce((a, t) => ({ input: a.input + t.input / n, cached: a.cached + t.cached / n, output: a.output + t.output / n, requests: a.requests + t.requests / n }), { input: 0, cached: 0, output: 0, requests: 0 })
+      : { input: DEFAULTS.sessionInput, cached: DEFAULTS.sessionInput * DEFAULTS.sessionCachedShare, output: DEFAULTS.sessionOutput, requests: DEFAULTS.sessionRequests };
     const spread = measuredTokens ? [0.6, 1.8] : [0.3, 3];
     const input = range(per.input * calls * spread[0], per.input * calls, per.input * calls * spread[1]);
     const output = range(per.output * calls * spread[0], per.output * calls, per.output * calls * spread[1]);
-    const profile = SERVICE_PROFILES[service];
-    const up = range(input.low * BYTES_PER_INPUT_TOKEN.low, input.expected * BYTES_PER_INPUT_TOKEN.expected, input.high * BYTES_PER_INPUT_TOKEN.high);
-    const downBase = calls * profile.bytesDown + per.output * calls * 4;
-    const down = range(downBase * 0.6 + extraDown.low, downBase + extraDown.expected, downBase * 2 + extraDown.high);
+    // the first phase's sessions start together, before any has copied Codex's catalog; the later ones find the copy
+    const wire = sessionTransfer(service, { calls, requestsPerSession: per.requests, input, output: per.output * calls, catalogStarts: first ? Math.min(calls, slots) : 0 });
+    const up = wire.up;
+    const down = range(wire.down.low + extraDown.low, wire.down.expected + extraDown.expected, wire.down.high + extraDown.high);
     let costUsd: Range | null = null;
     let priceSource: EstimateLine['priceSource'] = null;
     if (h.costs.length >= 1) {
@@ -122,9 +148,9 @@ export async function estimateStudy(input: StudyEstimateInput): Promise<TaskEsti
   if (deep) {
     notes.push(`The sources are collected by one deep-research call on ${p.runner.deepResearch?.model || 'its model'}; its size is not estimated.`);
   } else {
-    phase('collect', 'Collect sources', pages, collectors, history.collect, DEFAULTS.collectSeconds, sources);
+    phase('collect', 'Collect sources', pages, collectors, history.collect, DEFAULTS.collectSeconds, sources, true);
   }
-  phase('pages', 'Write pages', pages, writers, history.pages, DEFAULTS.pageSeconds);
+  phase('pages', 'Write pages', pages, writers, history.pages, DEFAULTS.pageSeconds, range(0, 0, 0), deep);
   phase('report', 'Report', 1, 1, history.report, DEFAULTS.reportSeconds);
 
   const totals = totalsOf(lines);
@@ -214,7 +240,10 @@ async function studyHistory(store: Store, config: KnodeConfig, provider: string 
     const collectRun = runOf(`${st.id}-collect`);
     if (collectRun && collectRun.sessions > 0) {
       for (let i = 0; i < collectRun.sessions; i++) {
-        out.collect.tokens.push({ ...collectRun, input: collectRun.input / collectRun.sessions, cached: collectRun.cached / collectRun.sessions, output: collectRun.output / collectRun.sessions, sessions: 1 });
+        out.collect.tokens.push({
+          ...collectRun, input: collectRun.input / collectRun.sessions, cached: collectRun.cached / collectRun.sessions, output: collectRun.output / collectRun.sessions,
+          requests: collectRun.requests / collectRun.sessions, sessions: 1,
+        });
       }
     }
     // the report runs after the last page: from its end to the study's

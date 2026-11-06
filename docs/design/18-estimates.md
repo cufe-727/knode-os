@@ -12,7 +12,8 @@ Starting the processing, or a research study, spends model calls on somebody's p
 login through Codex and a Cursor Ultra login — and until now nothing said how much. The finance workspace had 2,777
 documents waiting (10,604 extraction segments) and 6,161 summary pages due (34,688 calls) on 2026‑10‑28; pressing Start
 would have used about six weeks of the Codex plan's weekly window (+620%, 330–1,130%) and, on the way, downloaded about
-45 GB — a one-shot `codex exec` fetches ~1.5 MB of its own on every call. A person should see that, and what a task
+45 GB — a one-shot `codex exec` then fetched ~1.5 MB of its own on every call (↓58 KB since 2026‑11‑06, D9). A person
+should see that, and what a task
 of theirs takes of Codex, Claude Code, Cursor or an API key, before they press Start.
 
 ## 1. Decisions
@@ -27,8 +28,8 @@ of theirs takes of Codex, Claude Code, Cursor or an API key, before they press S
 | D6 A short window through the long one | A five-hour window's rate is the weekly one's scaled by how far each moved over the same stretch, from readings that carry both | Daily totals are too coarse for five hours |
 | D7 Other plans by what they include | Cursor's tier comes from `cursor-agent about` (`subscriptionTier`, nothing else of the account); its share is the task's cost at API prices against what the plan includes per month (published, mid-2025: Pro $20, Pro+ $70, Ultra $400 — `usage.allowances.cursor.monthlyUsd` overrides). Claude Code reports a price per call; its plan windows are not readable, so a share needs `usage.allowances.claude` | Neither CLI reports its plan's use. A price is known only for models in the table (Anthropic's 2026‑10 list, OpenAI's 2025 list) or `usage.prices`; for others — gpt-6.x, Cursor's own models — the estimate says "no price known" instead of guessing |
 | D8 Refusals are signals | A call turned away for a limit (`usage limit`, Cursor's `out of usage`) is counted per route with its message; the estimate shows the latest. Cursor's `out of usage` is now a transient failure, as Codex's limit was | On 2026‑10‑28 Cursor refused every non-Auto call on this machine; until now that cost each segment one of its three attempts |
-| D9 Transfer from the wire | Per call: an endpoint's own bodies; for Codex ↓1.5 MB ↑0.05 MB beside the prompt (measured 2026‑10‑28 with plugins and analytics off); a remote worker's leases (messages and prompt) and answers on this machine's link, its model traffic on its own. Agent sessions re-send their conversation each turn; the range spans how much the wire compresses it | "Data transfer" is mostly a CLI's start-up, not the text |
-| D10 Studies from studies | A study is a collector per page (`research.study.collectors` at once), a page job per page (`research.concurrency` at once), then the report. Times come from finished studies here (the collectors' own times, the page jobs', the report from the last page to the study's end); tokens from what Codex logged per run folder (`.runs/<job>`); Claude Code's prices from the jobs; captured sources' size from earlier studies' folders | An agent session's size cannot be read off its prompt. On the finance workspace a six-page study came out at ≈63 min (43–124) and ≈4% of the weekly window (2–8%) |
+| D9 Transfer from the wire | One-shot calls and agent sessions apart (`SERVICE_PROFILES`: `bytesUp`/`bytesDown`, `catalogBytes`, `session`). Per call: an endpoint's own bodies; for Codex ↓58 KB ↑37 KB beside the prompt (2026‑11‑06, plugins, apps and analytics off, the model catalog from knode's copy; ↓1.5 MB until then), and the catalog's 650 KB for the first call of a day on each slot (that call moved ↓706 KB). Per Codex research session (plugins, apps and analytics off since 2026‑11‑06, the copy pinned): ↓20 KB ↑10 KB to start and ↓34 KB a model request beside its output (one request ↓43 KB ↑41 KB, four ↓160 KB ↑111 KB), the requests counted from what Codex logged per run folder (50 a session until one has run). Each request re-sends its conversation; the range spans how much the wire compresses it (a four-request session sent 1.51 bytes a token). A remote worker's leases (messages and prompt) and answers on this machine's link, its model traffic on its own | "Data transfer" is mostly what a CLI adds around the text. With plugins, apps and analytics on, as research sessions ran until 2026‑11‑06, a one-word session downloaded 11–15 MB (the plugin catalog, still downloading when it ended: 29 MB in two minutes) and uploaded 0.7–1.3 MB of analytics |
+| D10 Studies from studies | A study is a collector per page (`research.study.collectors` at once), a page job per page (`research.concurrency` at once), then the report. Times come from finished studies here (the collectors' own times, the page jobs', the report from the last page to the study's end); tokens and model requests from what Codex logged per run folder (`.runs/<job>`); Claude Code's prices from the jobs; captured sources' size from earlier studies' folders | An agent session's size cannot be read off its prompt. On the finance workspace a six-page study came out at ≈63 min (43–124) and ≈4% of the weekly window (2–8%) |
 | D11 It never blocks Start | The web dialog and the Mac app show the estimate while it loads and Start stays available; an older server (404) shows "No estimate" | An estimate is advice; a person who knows what they want should not wait three seconds for it |
 
 ## 2. One call
@@ -44,7 +45,12 @@ of theirs takes of Codex, Claude Code, Cursor or an API key, before they press S
 - **time** = the 25th, mean and 90th percentile of answered calls, else start-up + output ÷ rate
   (Codex 8 s + 60 tokens/s), ×0.6–×2.
 - **transfer** = measured bodies + headers, else prompt bytes + the service's start-up traffic, and the answer
-  streamed at ~4 bytes a token.
+  streamed at ~4 bytes a token. A Codex line adds the model catalog once per slot and started day (0 at the low end:
+  a copy may be there already).
+
+An agent session (src/estimate/study.ts `sessionTransfer`) is costed as its start-up, its model requests'
+downloads, its conversation re-sent with every request, and the catalog for the first phase's sessions only: the
+later ones find the copy those made.
 
 Calls of a kind spread over the routes that take it by how many each finishes per second (slots ÷ seconds a call,
 a remote slot's share of its time by `server.remote.shares`); work no slot takes is costed on its stage's route and

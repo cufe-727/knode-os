@@ -275,6 +275,8 @@ export interface PairedReading {
 
 export interface RunTotals extends TokenTotals {
   sessions: number;
+  /** Model requests: a `token_count` event each, the request's own usage in it. */
+  requests: number;
   first: number;
   last: number;
 }
@@ -297,6 +299,7 @@ interface FileScan {
   snapshots: LimitSnapshot[];
   pairs: PairedReading[];
   totals: TokenTotals;
+  requests: number;
   daily: Record<string, number>;
   first: number;
   last: number;
@@ -328,9 +331,10 @@ export async function scanCodexSessions(dir: string, opts: { sinceMs: number; ma
     addTotals(out.mix, s.totals);
     for (const [day, n] of Object.entries(s.daily)) out.daily.set(day, (out.daily.get(day) ?? 0) + n);
     if (s.cwd && s.first) {
-      const run = out.byCwd.get(s.cwd) ?? { ...emptyTotals(), sessions: 0, first: s.first, last: s.last };
+      const run = out.byCwd.get(s.cwd) ?? { ...emptyTotals(), sessions: 0, requests: 0, first: s.first, last: s.last };
       addTotals(run, s.totals);
       run.sessions++;
+      run.requests += s.requests;
       run.first = Math.min(run.first, s.first);
       run.last = Math.max(run.last, s.last);
       out.byCwd.set(s.cwd, run);
@@ -374,7 +378,7 @@ function listSessionFiles(dir: string, sinceMs: number): { path: string; mtimeMs
 }
 
 async function scanFile(file: string): Promise<FileScan> {
-  const out: FileScan = { cwd: null, snapshots: [], pairs: [], totals: emptyTotals(), daily: {}, first: 0, last: 0 };
+  const out: FileScan = { cwd: null, snapshots: [], pairs: [], totals: emptyTotals(), requests: 0, daily: {}, first: 0, last: 0 };
   // per window life, the first and last reading of this session; per pair of lives, likewise
   const ends = new Map<string, [LimitSnapshot, LimitSnapshot]>();
   const pairEnds = new Map<string, [PairedReading, PairedReading]>();
@@ -400,6 +404,7 @@ async function scanFile(file: string): Promise<FileScan> {
     const input = finite(last.input_tokens) ?? 0;
     const output = finite(last.output_tokens) ?? 0;
     if (input || output) {
+      out.requests++;
       out.totals.input += input;
       out.totals.cached += finite(last.cached_input_tokens) ?? 0;
       out.totals.cacheWrite += finite(last.cache_write_input_tokens) ?? 0;

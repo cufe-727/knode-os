@@ -5,12 +5,13 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultConfig, defaultRoutedLlmConfig, KnodeConfig, LlmConfig, LlmConnection } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
 import { calibrateCodex, LimitSnapshot, PairedReading, scanCodexSessions, tokensBetween, weightedTokens } from '../src/estimate/codex.js';
-import { costWork, perCall, RouteSpec, serviceShares, totalsOf, WorkSpec } from '../src/estimate/estimate.js';
+import { costWork, perCall, range, RouteSpec, serviceShares, totalsOf, WorkSpec } from '../src/estimate/estimate.js';
 import { formatEstimate } from '../src/estimate/format.js';
 import { CallLedger, isRefusal } from '../src/estimate/ledger.js';
 import { estimateProcessing } from '../src/estimate/processing.js';
 import { CodexQuota, QuotaSources } from '../src/estimate/quota.js';
 import { modelOfLabel, priceOf, serviceOfLabel } from '../src/estimate/services.js';
+import { sessionTransfer } from '../src/estimate/study.js';
 import { sync } from '../src/ingest/sync.js';
 import { classifyFailure } from '../src/labeling/failures.js';
 import { LocalLabelingWorkers } from '../src/labeling/local.js';
@@ -218,7 +219,27 @@ describe('Codex\'s windows, calibrated', () => {
     // the first and last reading of the window's life, not every one
     expect(scan.snapshots.map((s) => s.usedPercent)).toEqual([10, 12]);
     expect(scan.mix).toMatchObject({ input: 180_000, cached: 177_000, output: 2100 });
-    expect(scan.byCwd.get('/data/.runs/r_1')).toMatchObject({ sessions: 1, input: 180_000, output: 2100 });
+    expect(scan.byCwd.get('/data/.runs/r_1')).toMatchObject({ sessions: 1, requests: 3, input: 180_000, output: 2100 });
+  });
+});
+
+describe('an agent session on the wire', () => {
+  const input = range(1_000_000, 2_000_000, 4_000_000);
+
+  it('a Codex research session: its start, a download per model request, and the catalog for the first ones', () => {
+    // six sessions of 50 requests, three starting together before any has copied the catalog
+    const wire = sessionTransfer('codex', { calls: 6, requestsPerSession: 50, input, output: 6 * 15_000, catalogStarts: 3 });
+    const base = 6 * (20_000 + 50 * 34_000) + 6 * 15_000 * 4;
+    expect(wire.down).toEqual({ low: base * 0.6, expected: base + 3 * 650_000, high: base * 2 + 3 * 650_000 });
+    // ↑10 KB each to start, then the conversation every request sends again (1.51 bytes a token, measured)
+    expect(wire.up).toEqual({ low: 60_000 + 600_000, expected: 60_000 + 3_000_000, high: 60_000 + 16_000_000 });
+    // the later phases find the copy; before it was 1.5 MB of start-up a session, whatever it did
+    expect(sessionTransfer('codex', { calls: 6, requestsPerSession: 50, input, output: 0, catalogStarts: 0 }).down.expected).toBe(6 * (20_000 + 50 * 34_000));
+  });
+
+  it('a service whose sessions are not measured gets its floor', () => {
+    const wire = sessionTransfer('claude', { calls: 2, requestsPerSession: 40, input, output: 1000, catalogStarts: 2 });
+    expect(wire.down.expected).toBe(2 * 50_000 + 4000);
   });
 });
 
@@ -237,8 +258,16 @@ describe('costing the work', () => {
     expect(onCodex.seconds!.expected).toBeCloseTo(onApi.seconds!.expected, -2);
     expect(onApi.costUsd).not.toBeNull();
     expect(onCodex.costUsd).toBeNull();
-    // ↓ 1.5 MB a Codex call: its own start-up traffic dwarfs the text
-    expect(onCodex.bytes.down.expected).toBeGreaterThan(onCodex.calls * 1_500_000);
+    // a Codex call moves ↓58 KB ↑37 KB beside its prompt and answer (2026-11-06: the catalog from knode's
+    // copy, plugins, apps and analytics off), and the first call of the day on each slot downloads the catalog
+    expect(onCodex.perCall.bytesUp).toBe(spec.promptBytes + 37_000);
+    expect(onCodex.perCall.bytesDown).toBe(4500 * 4 + 58_000);
+    expect(onCodex.bytes.down.expected).toBe(onCodex.calls * (4500 * 4 + 58_000) + 3 * 650_000);
+    expect(onCodex.bytes.down.low).toBeCloseTo(onCodex.calls * (4500 * 4 + 58_000) * 0.8, 0);
+    expect(onApi.bytes.down.expected).toBe(onApi.calls * onApi.perCall.bytesDown);
+    // 2,000 calls of 83 s on one slot take two days: a download a day
+    const long = costWork({ ...spec, calls: 2000 }, [{ ...codex, slots: 1 }], null, config, null)[0];
+    expect(long.bytes.down.expected - long.calls * long.perCall.bytesDown).toBe(2 * 650_000);
 
     const waiting = costWork(spec, [{ ...codex, slots: 0 }], null, config, codex);
     expect(waiting).toHaveLength(1);
