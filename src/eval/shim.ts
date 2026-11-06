@@ -100,7 +100,7 @@ export class ClientBackend implements ChatBackend {
     const messages = req.schema
       ? [...req.messages, { role: 'user' as const, content: `Reply with JSON matching this schema:\n${JSON.stringify(req.schema)}` }]
       : req.messages;
-    const text = await this.client.complete(messages, { json: req.json || Boolean(req.schema), onUsage: (u) => (usage = u) });
+    const text = await this.client.complete(messages, { json: req.json || Boolean(req.schema), effort: req.effort, onUsage: (u) => (usage = u) });
     return { text, usage, model: this.client.model };
   }
 }

@@ -287,7 +287,8 @@ describe('costing the work', () => {
     expect(priceOf('claude-opus-4-8[effort=high]')?.price.input).toBe(5);
     expect(priceOf('gpt-5-codex')?.price.input).toBe(1.25);
     expect(priceOf('gpt-5.2')).toBeNull();
-    expect(priceOf('gpt-6.1-sol')).toBeNull();
+    expect(priceOf('gpt-6-sol')).toBeNull();
+    expect(priceOf('gpt-6.1-sol')).toEqual({ price: { input: 2, cachedInput: 0.1, cacheWrite: 2.5, output: 10 }, source: 'published' });
     const own = { usage: { prices: { 'gpt-6*': { input: 2, cachedInput: 0.2, output: 16 } } } } as Pick<KnodeConfig, 'usage'>;
     expect(priceOf('gpt-6.1-sol', own)).toEqual({ price: { input: 2, cachedInput: 0.2, output: 16 }, source: 'config' });
   });

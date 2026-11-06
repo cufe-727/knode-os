@@ -97,11 +97,13 @@ export interface ModelPrice {
 /**
  * Published API prices, matched by prefix on the model name (longest first).
  * Anthropic's from its model table of 2026-10-06; OpenAI's from its 2025
- * price list. A model not here — the Codex and Cursor models of late 2026
- * among them — has no price until `usage.prices` gives one, and an estimate
- * says so instead of guessing.
+ * price list, and gpt-6.1-sol's (standard tier, prompts up to 272K tokens,
+ * a 30-minute cache write) from its pricing page of 2026-11-06. A model not
+ * here — most Codex and Cursor models of late 2026 among them — has no price
+ * until `usage.prices` gives one, and an estimate says so instead of guessing.
  */
 const PRICES: Record<string, ModelPrice> = {
+  'gpt-6.1-sol': { input: 2, cachedInput: 0.1, cacheWrite: 2.5, output: 10 },
   'claude-fable-5-1': { input: 10, cachedInput: 0.25, cacheWrite: 12.5, output: 50 },
   'claude-fable-5': { input: 10, cachedInput: 1, cacheWrite: 12.5, output: 50 },
   'claude-opus-5-5': { input: 4, cachedInput: 0.2, cacheWrite: 5, output: 20 },
