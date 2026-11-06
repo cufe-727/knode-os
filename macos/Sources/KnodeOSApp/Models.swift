@@ -2432,6 +2432,23 @@ struct StudySummary: Decodable, Identifiable, Hashable {
     var createdAt: String
     var error: String?
     var steps: [Step]
+    var pause: RunPause?
+    var archivedAt: String?
+}
+
+/// A job waiting out a spent usage limit, a rate limit or a lost login (docs/design/22): it goes on by itself at `until`.
+struct RunPause: Decodable, Hashable {
+    /// quota, transient or setup.
+    var kind: String
+    /// The agent's own words.
+    var reason: String
+    var until: String
+}
+
+/// What removing a study took away (its jobs) and left in the knowledge base.
+struct StudyRemoval: Decodable {
+    var removed: [String]
+    var kept: [String]
 }
 
 /// One study (GET /api/research/studies/:id): its brief, stages, pages, sources and report.
@@ -2460,7 +2477,7 @@ struct StudyDetail: Decodable {
         var steps: [StudySummary.Step]
         var runner: Runner
     }
-    struct PageState: Decodable, Identifiable, Hashable { var id: String; var title: String; var path: String; var status: String; var trust: String?; var error: String? }
+    struct PageState: Decodable, Identifiable, Hashable { var id: String; var title: String; var path: String; var status: String; var trust: String?; var error: String?; var pause: RunPause? }
     struct Capture: Decodable, Identifiable, Hashable {
         var path: String; var title: String?; var site: String; var kind: String; var published: String?; var url: String
         var id: String { path }
@@ -2477,6 +2494,9 @@ struct StudyDetail: Decodable {
     var tiers: Tiers?
     var refining: String?
     var startProblem: String?
+    /// What the study waits for, when it waits out a pause.
+    var pause: RunPause?
+    var archivedAt: String?
 
     var isLive: Bool { ["queued", "running", "validating", "waiting"].contains(job.status) || refining != nil }
 }
@@ -2871,6 +2891,9 @@ struct TasksSnapshot: Decodable {
         var finishedAt: String?
         var error: String?
         var outputPath: String?
+        /// A queued job waiting out a pause (a spent usage limit): until when, and the agent's words.
+        var pausedUntil: String?
+        var pauseReason: String?
 
         var isLive: Bool { ["queued", "running", "validating", "waiting"].contains(status) }
 
@@ -2886,10 +2909,12 @@ struct TasksSnapshot: Decodable {
             finishedAt = try c.decodeIfPresent(String.self, forKey: .finishedAt)
             error = try c.decodeIfPresent(String.self, forKey: .error)
             outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
+            pausedUntil = try c.decodeIfPresent(String.self, forKey: .pausedUntil)
+            pauseReason = try c.decodeIfPresent(String.self, forKey: .pauseReason)
         }
 
         private enum CodingKeys: String, CodingKey {
-            case id, kind, title, status, stage, createdAt, startedAt, finishedAt, error, outputPath
+            case id, kind, title, status, stage, createdAt, startedAt, finishedAt, error, outputPath, pausedUntil, pauseReason
         }
     }
 
@@ -3094,6 +3119,22 @@ struct FolderImportResult: Decodable {
     }
 
     private enum CodingKeys: String, CodingKey { case dest, copied, sync, indexing }
+}
+
+/// `POST /api/conversations/sync` without a copy named: a check of every
+/// followed conversation starts in the background (`started`), unless one is
+/// under way already.
+struct ConversationCheck: Decodable {
+    var started: Bool
+    var links: Int
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        started = try c.decodeIfPresent(Bool.self, forKey: .started) ?? false
+        links = try c.decodeIfPresent(Int.self, forKey: .links) ?? 0
+    }
+
+    private enum CodingKeys: String, CodingKey { case started, links }
 }
 
 /// `POST /api/feishu/sync`: a check of every link starts in the background

@@ -2,9 +2,11 @@ import { activityOf, ActivityItem } from '../activity.js';
 import { AppContext } from '../context.js';
 import { nightlySchedule } from '../dream/dream.js';
 import { pendingEmbeddings } from '../ingest/embed-backfill.js';
+import { conversationCheckMinutes, conversationLinks } from '../ingest/conversations/follow.js';
 import { feishuCheckTime, feishuLinks, lastFeishuCheck } from '../ingest/feishu/docs.js';
 import { linkedFolders } from '../ingest/folders.js';
 import { FailureKind } from '../labeling/failures.js';
+import { activePause } from '../research/failure.js';
 import { LIVE_STATUSES } from '../research/jobs.js';
 import { WorkKind } from '../work/kinds.js';
 import type { WorkspaceServices } from './app.js';
@@ -87,16 +89,19 @@ export interface TaskJob {
   finishedAt: string | null;
   error: string | null;
   outputPath: string | null;
+  /** A queued job waiting out a pause (a spent usage limit, docs/design/22): until when, and why. */
+  pausedUntil?: string | null;
+  pauseReason?: string | null;
 }
 
 export interface ScheduledTask {
-  id: 'dream' | 'tier2' | 'traces' | 'datasources' | 'feishu';
+  id: 'dream' | 'tier2' | 'traces' | 'datasources' | 'feishu' | 'conversations';
   /** "03:00" for a daily run, else the interval in minutes. */
   at: string | null;
   everyMinutes: number | null;
   /** The next start, when the clock says; null while it cannot run. */
   next: string | null;
-  /** When it last ran, for a task that keeps that across restarts (Feishu); null otherwise. */
+  /** When it last ran, for a task that keeps that across restarts (Feishu) or knows it (followed conversations); null otherwise. */
   last: string | null;
   enabled: boolean;
   running: boolean;
@@ -181,7 +186,7 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
     }>(
       `(SELECT * FROM research_jobs WHERE status = ANY($1::text[]) ORDER BY created_at DESC LIMIT 40)
        UNION ALL
-       (SELECT * FROM research_jobs WHERE status IN ('done', 'failed', 'cancelled') AND finished_at > now() - interval '24 hours' ORDER BY finished_at DESC LIMIT 10)`,
+       (SELECT * FROM research_jobs WHERE status IN ('done', 'failed', 'cancelled') AND finished_at > now() - interval '24 hours' AND NOT (payload ? 'archivedAt') ORDER BY finished_at DESC LIMIT 10)`,
       [LIVE_STATUSES],
     ),
     ctx.store.query<{ id: string; title: string; created_at: string | Date; updated_at: string | Date }>(
@@ -274,6 +279,7 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
     })),
     ...jobRows.filter((j) => j.status !== 'draft').map((j) => {
       const payload = j.payload ?? {};
+      const pause = j.status === 'queued' ? activePause(payload) : null;
       return {
         id: j.id,
         kind: j.kind === 'study' ? 'study' as const : j.kind === 'init' ? 'init' as const : 'research' as const,
@@ -285,6 +291,8 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
         finishedAt: iso(j.finished_at),
         error: j.error,
         outputPath: j.output_path,
+        pausedUntil: pause?.until ?? null,
+        pauseReason: pause?.reason ?? null,
       };
     }),
   ];
@@ -306,6 +314,15 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
       last: lastFeishuCheck(ctx.dataDir),
       enabled: Boolean(services) && Boolean(feishuAt) && feishuLinked,
       running: busy('feishu'),
+    },
+    {
+      id: 'conversations',
+      at: null,
+      everyMinutes: conversationCheckMinutes(config),
+      next: services?.conversations ? services.conversations.nextCheck() : null,
+      last: services?.conversations?.lastCheck() ?? null,
+      enabled: Boolean(services) && conversationLinks(config).length > 0,
+      running: busy('conversations'),
     },
   ];
 

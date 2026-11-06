@@ -3,7 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import type { ChildProcess } from 'node:child_process';
 import type { LlmEffort } from '../config.js';
-import { cliCommand, effortFor, runProcess } from '../llm/cli.js';
+import { cliCommand, CODEX_SERVICES_OFF, effortFor, resolveExecutable, runProcess } from '../llm/cli.js';
+import { catalogArgs, exitFailure, withCodexCatalog } from '../llm/codex-catalog.js';
 import { CallUsage, readCodexEvents } from '../llm/usage.js';
 import { EVAL_HOME } from './pack.js';
 
@@ -62,9 +63,15 @@ export interface AgentRunResult {
 
 const toml = (v: unknown) => JSON.stringify(v);
 
-export function agentArgs(opts: AgentRunOptions, outFile: string): string[] {
+/**
+ * The session's `codex exec` arguments: the one-shot call's (src/llm/cli.ts
+ * `codexExecArgs`) — user config, plugins, apps and analytics off, the model
+ * catalog from a local copy when `catalog` names one — with the sandbox, the
+ * folder and knode's MCP server where the session has it.
+ */
+export function agentArgs(opts: AgentRunOptions, outFile: string, catalog: string | null = null): string[] {
   const args = [
-    'exec', '--ignore-user-config', '--ephemeral', '-c', 'features.plugins=false', '-c', 'analytics.enabled=false',
+    'exec', '--ignore-user-config', '--ephemeral', ...CODEX_SERVICES_OFF, ...catalogArgs(catalog),
     '-c', 'web_search="disabled"', '--skip-git-repo-check', '--sandbox', opts.sandbox, '--cd', opts.cwd,
     '--output-last-message', outFile, '--json',
   ];
@@ -181,18 +188,28 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
     let stdout = '';
     let error: string | undefined;
     try {
-      const r = await runProcess(cliCommand('codex-cli', opts.command ?? ''), agentArgs(opts, outFile), opts.prompt, opts.timeoutMs ?? 15 * 60_000, {
-        cwd: opts.cwd,
-        onSpawn: (c) => (child = c),
-        onStdout: (chunk) => {
-          buffer += chunk;
-          let nl: number;
-          while ((nl = buffer.indexOf('\n')) >= 0) {
-            onLine(buffer.slice(0, nl));
-            buffer = buffer.slice(nl + 1);
-          }
-        },
-      });
+      const cmd = cliCommand('codex-cli', opts.command ?? '');
+      const r = await withCodexCatalog(resolveExecutable(cmd), opts.model, (catalog) => {
+        // a repeat (Codex could not read the catalog copy) starts from nothing, as the first try did
+        commands.length = 0;
+        leaked.length = 0;
+        touched.clear();
+        steps = 0;
+        capped = false;
+        buffer = '';
+        return runProcess(cmd, agentArgs(opts, outFile, catalog), opts.prompt, opts.timeoutMs ?? 15 * 60_000, {
+          cwd: opts.cwd,
+          onSpawn: (c) => (child = c),
+          onStdout: (chunk) => {
+            buffer += chunk;
+            let nl: number;
+            while ((nl = buffer.indexOf('\n')) >= 0) {
+              onLine(buffer.slice(0, nl));
+              buffer = buffer.slice(nl + 1);
+            }
+          },
+        });
+      }, exitFailure);
       stdout = r.stdout;
       if (r.code !== 0 && !capped) error = `codex exec exited with ${r.code}: ${readCodexEvents(r.stdout).error ?? r.stderr.slice(-300)}`;
     } catch (err) {

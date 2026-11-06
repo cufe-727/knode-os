@@ -1,7 +1,8 @@
 import { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { cliCommand, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess, speedFor } from '../llm/cli.js';
+import { cliCommand, cliFailureText, CODEX_SERVICES_OFF, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess, speedFor } from '../llm/cli.js';
+import { catalogArgs, codexCatalog, configuredCodexModel, withCodexCatalog } from '../llm/codex-catalog.js';
 import { AgentProvider, CliAgent, ResearchAgent } from './agent.js';
 import { Effort, Freshness, NativeAgentSpec, Speed } from './profile.js';
 import type { ExtraMcpServer } from './sources.js';
@@ -71,11 +72,21 @@ export interface RunningSession {
 const byJob = new Map<string, Set<RunningSession>>();
 /** Jobs whose sessions were killed: nothing more is launched for them until the runner clears the flag. */
 const cancelledJobs = new Set<string>();
+/** Jobs stopped because serve is shutting down: like cancelled, but they go back in line. */
+const interruptedJobs = new Set<string>();
 
 export class JobCancelledError extends Error {
   constructor(public readonly jobId: string) {
     super(`job ${jobId} was cancelled`);
     this.name = 'JobCancelledError';
+  }
+}
+
+/** A session ended because serve stopped it (a restart, a deploy): the job is requeued with its attempts, not failed. */
+export class JobInterruptedError extends Error {
+  constructor(public readonly jobId: string) {
+    super(`job ${jobId} was interrupted by a restart`);
+    this.name = 'JobInterruptedError';
   }
 }
 
@@ -114,10 +125,18 @@ export function registerSession(jobId: string, session: RunningSession): () => v
   };
 }
 
-/** Kill every agent this process launched (serve shutdown). */
-export function killActiveAgents(): number {
+/**
+ * Kill every agent this process launched (serve shutdown). Their jobs, and
+ * `also` (jobs between two sessions), launch nothing more: each ends with
+ * `JobInterruptedError`, and the runner puts it back in line.
+ */
+export function killActiveAgents(also: Iterable<string> = []): number {
+  for (const id of also) interruptedJobs.add(id);
   let n = 0;
-  for (const set of byJob.values()) for (const session of set) if (session.stop()) n++;
+  for (const [jobId, set] of byJob) {
+    interruptedJobs.add(jobId);
+    for (const session of set) if (session.stop()) n++;
+  }
   byJob.clear();
   return n;
 }
@@ -141,6 +160,7 @@ export function killAgentsFor(jobId: string): number {
 
 export function clearCancelled(jobId: string): void {
   cancelledJobs.delete(jobId);
+  interruptedJobs.delete(jobId);
 }
 
 export function isCancelled(jobId: string): boolean {
@@ -345,8 +365,12 @@ export function writeCodexAgentLayers(cwd: string, agents: NativeAgentSpec[], fr
 /** A session that is going to be spawned as a process — the only kind `sessionArgs` can describe. */
 export type CliSessionInput = Omit<SessionInput, 'agent'> & { agent: CliAgent };
 
-/** The argv a session is launched with (exported so tests and `research export` can print it). */
-export function sessionArgs(input: CliSessionInput): { cmd: string; args: string[]; stdin: string; outFile?: string } {
+/**
+ * The argv a session is launched with (exported so tests and `research export`
+ * can print it). `catalog`: the copy of Codex's model catalog a codex session
+ * reads instead of downloading it (src/llm/codex-catalog.ts).
+ */
+export function sessionArgs(input: CliSessionInput, catalog: string | null = null): { cmd: string; args: string[]; stdin: string; outFile?: string } {
   const { provider, cliPath, model } = input.agent;
   const cmd = cliCommand(provider, cliPath);
   const files = input.files !== false;
@@ -397,6 +421,15 @@ export function sessionArgs(input: CliSessionInput): { cmd: string; args: string
       cmd,
       args: [
         'exec', '-', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', input.cwd,
+        // The person's ~/.codex/config.toml applies (the comments below rely on its
+        // approval policy), but not ChatGPT's plugins, apps and analytics: a session
+        // with them kept downloading the plugin catalog for as long as it ran (11–15 MB
+        // in a 30 s session, 29 MB in two minutes), fetched the apps listing (0.64 MB)
+        // and uploaded 0.7–1.3 MB of analytics, and every turn carried ~3,200 tokens of
+        // plugin skills (Codex 0.166, 2026-11-06). Without them and with the catalog copy
+        // a one-word session moved ↓43 KB ↑41 KB.
+        ...CODEX_SERVICES_OFF,
+        ...catalogArgs(catalog),
         '-c', `mcp_servers.knode-os.url=${JSON.stringify(mcpUrlWithWorkspace(input.mcp))}`,
         '-c', 'mcp_servers.knode-os.bearer_token_env_var="KNODE_MCP_TOKEN"',
         // codex gates MCP tools per server; under approval_policy = "never" (a common
@@ -451,11 +484,22 @@ export function stderrPathFor(cwd: string, label: string): string {
  */
 export async function launchSession(input: SessionInput): Promise<SessionResult> {
   if (cancelledJobs.has(input.jobId)) throw new JobCancelledError(input.jobId);
-  if (input.agent.kind === 'builtin') {
-    const { runBuiltinSession } = await loadBuiltin();
-    return runBuiltinSession({ ...input, agent: input.agent });
+  if (interruptedJobs.has(input.jobId)) throw new JobInterruptedError(input.jobId);
+  let result: SessionResult;
+  try {
+    if (input.agent.kind === 'builtin') {
+      const { runBuiltinSession } = await loadBuiltin();
+      result = await runBuiltinSession({ ...input, agent: input.agent });
+    } else {
+      result = await launchCliSession({ ...input, agent: input.agent });
+    }
+  } catch (err) {
+    if (interruptedJobs.has(input.jobId) && !(err instanceof JobCancelledError)) throw new JobInterruptedError(input.jobId);
+    throw err;
   }
-  return launchCliSession({ ...input, agent: input.agent });
+  // a session serve stopped ends like any other, with whatever error the kill left: this says why
+  if (interruptedJobs.has(input.jobId)) throw new JobInterruptedError(input.jobId);
+  return result;
 }
 
 /**
@@ -483,33 +527,40 @@ export async function builtinAvailable(): Promise<boolean> {
 
 let builtinOk: Promise<boolean> | null = null;
 
+type ProcessResult = { code: number; stdout: string; stderr: string };
+
 async function launchCliSession(input: CliSessionInput): Promise<SessionResult> {
   const { provider } = input.agent;
-  const { cmd, args, stdin, outFile } = sessionArgs(input);
-  if (!resolveExecutable(cmd)) throw new Error(`${cmd} CLI not found — install it or set cliPath for the research agent`);
+  const { cmd, outFile } = sessionArgs(input);
+  const binary = resolveExecutable(cmd);
+  if (!binary) throw new Error(`${cmd} CLI not found — install it or set cliPath for the research agent`);
   if (provider === 'codex-cli' && input.agents?.length) writeCodexAgentLayers(input.cwd, input.agents, input.webFreshness);
   const transcriptPath = transcriptPathFor(input.cwd, input.label);
   const stderrPath = stderrPathFor(input.cwd, input.label);
-  const out = fs.openSync(transcriptPath, 'w');
-  const errOut = fs.openSync(stderrPath, 'w');
-  // a no-op default: the assignment happens inside onSpawn, which TS's flow analysis cannot see
-  let unregister = () => {};
-  let res: { code: number; stdout: string; stderr: string };
-  try {
-    res = await runProcess(cmd, args, stdin, input.timeoutMs, {
-      cwd: input.cwd,
-      env: sessionEnv(input),
-      onStdout: (chunk) => fs.writeSync(out, chunk),
-      onStderr: (chunk) => fs.writeSync(errOut, chunk),
-      onSpawn: (c) => {
-        unregister = registerSession(input.jobId, processSession(c));
-      },
-    });
-  } finally {
-    fs.closeSync(out);
-    fs.closeSync(errOut);
-    unregister();
-  }
+  // one run of the CLI; a repeat (codex refused its catalog copy) writes both files anew
+  const run = async (catalog: string | null): Promise<ProcessResult> => {
+    const { args, stdin } = sessionArgs(input, catalog);
+    const out = fs.openSync(transcriptPath, 'w');
+    const errOut = fs.openSync(stderrPath, 'w');
+    // a no-op default: the assignment happens inside onSpawn, which TS's flow analysis cannot see
+    let unregister = () => {};
+    try {
+      return await runProcess(cmd, args, stdin, input.timeoutMs, {
+        cwd: input.cwd,
+        env: sessionEnv(input),
+        onStdout: (chunk) => fs.writeSync(out, chunk),
+        onStderr: (chunk) => fs.writeSync(errOut, chunk),
+        onSpawn: (c) => {
+          unregister = registerSession(input.jobId, processSession(c));
+        },
+      });
+    } finally {
+      fs.closeSync(out);
+      fs.closeSync(errOut);
+      unregister();
+    }
+  };
+  const res = provider === 'codex-cli' ? await runCodexSession(binary, input, run) : await run(null);
   // a killed session exits like any other; the flag says why
   if (cancelledJobs.has(input.jobId)) throw new JobCancelledError(input.jobId);
 
@@ -522,8 +573,10 @@ async function launchCliSession(input: CliSessionInput): Promise<SessionResult> 
         if (ev.type === 'result') {
           result.turns = typeof ev.num_turns === 'number' ? ev.num_turns : result.turns;
           result.costUsd = typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : result.costUsd;
-          result.text = typeof ev.result === 'string' ? ev.result : result.text;
+          // a failed run's `result` is its error message ("You've hit your 5-hour limit"), not an
+          // answer: it goes to `error` only, so no caller keeps it as notes, findings or a reply
           if (ev.is_error) result.error = `claude: ${String(ev.result ?? ev.subtype ?? 'error').slice(0, 300)}`;
+          else if (typeof ev.result === 'string') result.text = ev.result;
         }
       } catch {
         // progress lines
@@ -532,13 +585,62 @@ async function launchCliSession(input: CliSessionInput): Promise<SessionResult> 
     if (res.code !== 0 && !result.error) result.error = `claude exited with code ${res.code}: ${(res.stderr || res.stdout).trim().slice(0, 300)}`;
   } else if (provider === 'codex-cli') {
     result.text = outFile && fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8').trim() : '';
-    if (res.code !== 0) result.error = `codex exec exited with code ${res.code}: ${(res.stderr || res.stdout).trim().slice(0, 300)}`;
+    if (res.code !== 0) result.error = `codex exec exited with code ${res.code}: ${codexFailure(res.stderr, res.stdout)}`;
   } else {
     const parsed = readCursorStream(res.stdout);
     result.text = parsed.text;
     if (parsed.error || res.code !== 0) result.error = `cursor: ${(parsed.error || res.stderr || res.stdout).trim().slice(0, 300)}`;
   }
   return result;
+}
+
+/**
+ * A codex session with knode's copy of Codex's model catalog
+ * (src/llm/codex-catalog.ts), for the model it runs: the agent's, else the one
+ * the person's config.toml names. A session whose model is not known, or whose
+ * sub-agents run a model the copy does not list, downloads the catalog as
+ * before. Only a session that failed before it started can have been refused
+ * for its copy (`codexStartFailure`), and only then is it repeated without it:
+ * never after a timeout, a cancellation, or a failure once it ran.
+ */
+async function runCodexSession(binary: string, input: CliSessionInput, run: (catalog: string | null) => Promise<ProcessResult>): Promise<ProcessResult> {
+  const model = input.agent.model || configuredCodexModel() || undefined;
+  const others = [...new Set((input.agents ?? []).map((a) => a.model).filter((m) => m && m !== model))];
+  const stopped = () => cancelledJobs.has(input.jobId) || interruptedJobs.has(input.jobId);
+  const settled = await withCodexCatalog<{ result: ProcessResult } | { error: unknown }>(
+    binary,
+    model,
+    (catalog) => run(catalog && codexCatalog.lists(catalog, others) ? catalog : null).then((result) => ({ result }), (error: unknown) => ({ error })),
+    (s) => ('error' in s || stopped() ? null : codexStartFailure(s.result)),
+    codexCatalog,
+    { long: true },
+  );
+  if ('error' in settled) throw settled.error;
+  return settled.result;
+}
+
+/**
+ * What a codex session that failed before it started printed on stderr, or
+ * null. Codex prints its banner ("OpenAI Codex v…") once it has read its
+ * configuration, then echoes the prompt and the session's progress; a catalog
+ * copy it cannot read stops it before the banner, with one `Error:` line. So a
+ * session's own transcript, which may well name model_catalog_json, never
+ * counts.
+ */
+export function codexStartFailure(result: { code: number; stderr: string }): string | null {
+  return result.code !== 0 && !/^OpenAI Codex v/m.test(result.stderr) ? result.stderr : null;
+}
+
+/**
+ * Why a codex session failed. Its stderr opens with a banner and the echoed
+ * prompt, so the reason (a spent usage limit, an expired login) is its last
+ * ERROR line, else the tail — never the head, which only ever said "OpenAI
+ * Codex v…" and hid the reason from everything that reads it.
+ */
+export function codexFailure(stderr: string, stdout: string): string {
+  const lines = stderr.split('\n').map((l) => l.trim()).filter(Boolean);
+  const error = [...lines].reverse().find((l) => /^(?:\[[^\]]*\]\s*)?(?:error|fatal)\b/i.test(l) || /\bERROR\b/.test(l));
+  return error ? error.slice(0, 300) : cliFailureText(stderr, stdout, 300);
 }
 
 /** The argv of the single-session run (kept for `research export`). */

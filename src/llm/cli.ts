@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { LlmConfig, LlmEffort, LlmSpeed } from '../config.js';
 import type { ChatMessage } from './client.js';
+import { catalogArgs, exitFailure, withCodexCatalog } from './codex-catalog.js';
 import { CallUsage, readCodexEvents, usageFromClaudeResult, usageFromCursorResult } from './usage.js';
 
 /**
@@ -15,8 +16,9 @@ import { CallUsage, readCodexEvents, usageFromClaudeResult, usageFromCursorResul
  * All run in non-interactive one-shot mode with the OS temp dir as cwd so
  * the CLIs don't pick up repo instructions (AGENTS.md / CLAUDE.md) or try to
  * touch the workspace:
- *   - codex:  `codex exec --ignore-user-config --ephemeral -c features.plugins=false -c analytics.enabled=false
- *             --sandbox read-only --output-last-message <f> --json -`
+ *   - codex:  `codex exec --ignore-user-config --ephemeral -c features.plugins=false -c features.apps=false
+ *             -c analytics.enabled=false [-c model_catalog_json=<copy>] --sandbox read-only
+ *             --output-last-message <f> --json -`
  *   - claude: `claude -p --output-format json --max-turns 1`
  *   - cursor: `cursor-agent -p --output-format json --trust <prompt>` (`--trust` answers the
  *             workspace-trust prompt newer CLIs raise for the temp cwd; the model still
@@ -102,6 +104,14 @@ export function cursorModel(model: string, effort: LlmEffort | undefined): strin
   return `${model}[effort=${level}]`;
 }
 
+/**
+ * What every knode Codex process turns off: ChatGPT's plugins and apps
+ * (connectors), and analytics. Each costs a download or an upload per process
+ * that no knode call uses (see `codexExecArgs`). Research sessions, which keep
+ * the rest of the person's config, turn them off too (src/research/launch.ts).
+ */
+export const CODEX_SERVICES_OFF = ['-c', 'features.plugins=false', '-c', 'features.apps=false', '-c', 'analytics.enabled=false'];
+
 /** What a JSON request adds to the prompt where the wire has no JSON mode: an agent's loop. */
 export const JSON_DIRECTIVE = 'Respond with a single JSON object only — no prose, no markdown code fences.';
 
@@ -156,19 +166,26 @@ export async function completeViaCli(
  * or not, and with them every start downloads ChatGPT's whole plugin catalog
  * (about 15 MB in Codex 0.161, ten times the call itself) and starts the MCP
  * servers of the plugins installed on the account, none of which a one-shot
- * call uses. Analytics off drops the usage metrics (about 0.65 MB) each
- * process uploads as it exits. Both go through `-c`: a Codex without the
- * setting ignores it there, while `--disable <feature>` would fail the call.
+ * call uses. ChatGPT apps (connectors) off drops the apps listing each start
+ * fetches (0.6–1 MB in Codex 0.166). Analytics off drops the usage metrics
+ * (about 0.65 MB) each process uploads as it exits. All three go through `-c`:
+ * a Codex without the setting ignores it there, while `--disable <feature>`
+ * would fail the call.
+ *
+ * `catalog` pins a local copy of Codex's model catalog (src/llm/codex-catalog.ts),
+ * which every start would otherwise download: 650 KB, once or twice per call.
  *
  * `--json` prints the run as events, the last turn's token usage among them;
  * the answer still comes from `--output-last-message`, and a failure's reason
  * from the `error` / `turn.failed` event instead of a banner and the echoed
  * prompt on stderr.
  */
-export function codexExecArgs(opts: { outFile: string; cwd: string; model?: string; effort?: LlmEffort; speed?: LlmSpeed; images?: string[] }): string[] {
+export function codexExecArgs(opts: {
+  outFile: string; cwd: string; model?: string; effort?: LlmEffort; speed?: LlmSpeed; images?: string[]; catalog?: string | null;
+}): string[] {
   // --output-last-message gives the bare final message without parsing JSONL events
   const args = [
-    'exec', '--ignore-user-config', '--ephemeral', '-c', 'features.plugins=false', '-c', 'analytics.enabled=false',
+    'exec', '--ignore-user-config', '--ephemeral', ...CODEX_SERVICES_OFF, ...catalogArgs(opts.catalog ?? null),
     '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', opts.cwd, '--output-last-message', opts.outFile, '--json',
   ];
   if (opts.model) args.push('--model', opts.model);
@@ -194,9 +211,11 @@ export function cliFailureText(stderr: string, stdout: string, max = 400): strin
 async function runCodex(cfg: LlmConfig, prompt: string, model: string | undefined, images: string[], report: (usage: CallUsage) => void): Promise<string> {
   const cmd = cliCommand('codex-cli', cfg.cliPath);
   const outFile = path.join(os.tmpdir(), `knode-codex-${crypto.randomUUID()}.txt`);
-  const args = codexExecArgs({ outFile, cwd: os.tmpdir(), model, effort: cfg.effort, speed: cfg.speed, images });
   try {
-    const r = await runProcess(cmd, args, prompt, cfg.cliTimeoutMs);
+    const r = await withCodexCatalog(resolveExecutable(cmd), model, (catalog) => {
+      const args = codexExecArgs({ outFile, cwd: os.tmpdir(), model, effort: cfg.effort, speed: cfg.speed, images, catalog });
+      return runProcess(cmd, args, prompt, cfg.cliTimeoutMs);
+    }, exitFailure);
     const events = readCodexEvents(r.stdout);
     // a failed turn used tokens too, and they count against the plan all the same
     if (events.usage) report(events.usage);

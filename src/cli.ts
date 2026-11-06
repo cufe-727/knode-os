@@ -22,7 +22,7 @@ import { benchExtractCompare } from './bench/extract-compare.js';
 import { benchQaGen, benchRetrieval, RetrievalMode } from './bench/qa.js';
 import { registerEvalCommands } from './eval/cli.js';
 import { runSourceQuery } from './datasource/execute.js';
-import { graphInsights, graphOverview, graphSearch } from './graph/query.js';
+import { entityDetail, graphInsights, graphOverview, graphSearch } from './graph/query.js';
 import { applyClaimMerge, listClaimMerges, unmergeClaim } from './graph/claim-merge.js';
 import { auditDuplicateClaims } from './graph/claim-dedupe.js';
 import { applyMerge, correctEntity, listMerges, unmergeEntity } from './graph/merge.js';
@@ -30,11 +30,12 @@ import { readEntityCorrections } from './graph/corrections.js';
 import { auditDuplicateEntities } from './graph/dedupe.js';
 import { reviewClaims } from './graph/claim-review.js';
 import { resolveEntityId } from './graph/resolve.js';
-import { cancelJob, getJob, listJobs, queueJob, retryJob, ResearchJob, ResearchStatus } from './research/jobs.js';
+import { cancelJob, getJob, listJobs, queueJob, resumeJob, retryJob, ResearchJob, ResearchStatus } from './research/jobs.js';
+import { activePause } from './research/failure.js';
 import { killAgentsFor } from './research/launch.js';
 import { McpEndpoint } from './research/workspace.js';
 import { runChatTurn } from './chat/runner.js';
-import { createConversation, getConversation, listConversations } from './chat/store.js';
+import { ChatMessage, createConversation, getConversation, listConversations } from './chat/store.js';
 import { finalizeResearchJob, resolveResearchAgent, runResearchJob, workspaceFromJob } from './research/runner.js';
 import { loadResearchTemplates, RESEARCH_KINDS, ResearchKind } from './research/templates.js';
 import { prepareRunWorkspace, runsRoot } from './research/workspace.js';
@@ -42,8 +43,9 @@ import { recommendWikiTopics, refreshRecommendations } from './research/recommen
 import { launchArgs } from './research/launch.js';
 import { loadProfile, loadProfiles, profileYaml } from './research/profile.js';
 import { captureUrl } from './research/capture.js';
+import { exportStudy } from './research/export.js';
 import { loadResearchSources, sourceProblem } from './research/sources.js';
-import { continueStudies, createStudy, listStudies, refineStudy, startProblem, startStudy, cancelStudy, studyPayload, studyView, StudyRunner } from './research/study.js';
+import { archiveStudy, continueStudies, createStudy, listStudies, refineStudy, removeStudy, resumeStudy, retryStudy, startProblem, startStudy, cancelStudy, studyPause, studyPayload, studyView, StudyRunner } from './research/study.js';
 import type { StudyBrief } from './research/refine.js';
 import { runDocumentPass } from './ingest/background.js';
 import type { TaskEstimate } from './estimate/estimate.js';
@@ -55,7 +57,14 @@ import { estimateStudy } from './estimate/study.js';
 import { REMOTE_SCOPES, RemoteScope, RemoteTokenStore } from './remote/tokens.js';
 import { WORK_KINDS } from './work/kinds.js';
 import { registerAuthCommands } from './auth/cli.js';
+import type { KnodeClient } from './client/client.js';
+import { noteLocalCommands, registerClientCommands, serverClient } from './client/commands.js';
+import { humanBytes, registerFileCommands } from './client/files.js';
+import { queryEntities } from './store/entities.js';
+import { surveyKnowledgeBase } from './research/survey.js';
 import { describeLinkedFolders, importFolder, refreshLinkedFolders, unlinkFolder } from './ingest/folders.js';
+import { listConversations as listAgentConversations } from './ingest/conversations/catalog.js';
+import { conversationCopies, ConversationImportResult, ConversationRef, ConversationRefreshResult, ConversationStatus, describeConversationLinks, importConversations, previewConversation, refreshConversations, unfollowConversation } from './ingest/conversations/follow.js';
 import { describeFeishuLinks, feishuCheckTime, feishuClient, FeishuPlaced, FeishuSignIn, importFeishuBatch, lastFeishuCheck, refreshFeishuLinks, splitFeishuInputs, unlinkFeishuDocument } from './ingest/feishu/docs.js';
 import { requeueFailedExtractions } from './graph/tier1.js';
 import { sync } from './ingest/sync.js';
@@ -65,7 +74,7 @@ import { rebuild } from './lineage/rebuild.js';
 import { pruneShortSummaries, reconcileViews } from './wiki/pages.js';
 import { buildContextPack } from './pack/pack.js';
 import { applySuggestion, optimizePacks } from './pack/learn.js';
-import { listSuggestions, setSuggestionStatus } from './store/queries.js';
+import { knowledgeStats, listSuggestions, setSuggestionStatus } from './store/queries.js';
 import { seedStockDemo } from './demo/stock.js';
 import { refineWiki } from './wiki/refine.js';
 import { lintWiki } from './wiki/lint.js';
@@ -110,6 +119,24 @@ program
 
 const dataDir = () => resolveDataDir(program.opts().data);
 
+/**
+ * The server `knode-os login` made current: the commands that have a server
+ * side answer from its workspace, unless --data or KNODE_OS_DATA names a data
+ * directory on this machine (src/client).
+ */
+const server = (): KnodeClient | null => (program.opts().data || process.env.KNODE_OS_DATA ? null : serverClient());
+
+/** A flag a server's route does not take: refused rather than quietly dropped. */
+const hereOnly = (opts: Record<string, unknown>, flags: Record<string, string>) => {
+  for (const [key, flag] of Object.entries(flags)) {
+    if (opts[key] !== undefined && opts[key] !== false) throw new Error(`${flag} works on a data directory here, not on a server — add --data <dir> to use one`);
+  }
+};
+
+registerClientCommands(program, dataDir);
+registerFileCommands(program, { server, dataDir });
+noteLocalCommands(program, dataDir);
+
 program
   .command('init')
   .description('initialize the data directory (raw/, wiki/, config) and the database')
@@ -133,6 +160,12 @@ program
   });
 
 const syncCommand = async (opts: { llm?: boolean; datasources?: boolean; only?: string[]; verify?: boolean; reapply?: boolean; deferEmbeddings?: boolean }) => {
+  const srv = server();
+  if (srv) {
+    hereOnly({ noLlm: opts.llm === false || undefined, noDatasources: opts.datasources === false || undefined, reapply: opts.reapply, deferEmbeddings: opts.deferEmbeddings }, { noLlm: '--no-llm', noDatasources: '--no-datasources', reapply: '--reapply', deferEmbeddings: '--defer-embeddings' });
+    console.log(JSON.stringify(await srv.post('/api/sync', { only: opts.only?.length ? opts.only : undefined, verify: opts.verify }), null, 2));
+    return;
+  }
   const ctx = await createContext(dataDir());
   // deferred: chunks are written without vectors and the running server's
   // background embedder fills them in, so a CLI pass never competes with it
@@ -578,6 +611,200 @@ feishu
     }
   });
 
+/* ------------------------------ agent conversations ------------------------------ */
+
+const conversations = program
+  .command('conversations')
+  .description('pick Claude Code and Codex conversations and keep them in raw/docs/conversations as dialogue, once or followed (see docs/design/24) — signed in to a server, it lists and imports the conversations on the server\'s machine');
+
+type CatalogRow = Awaited<ReturnType<typeof listAgentConversations>>['conversations'][number] & { copy?: string | null; followed?: boolean };
+
+/** This machine's (or the server's) conversations matching the query. */
+async function conversationCatalog(query: { q?: string; agent?: string; project?: string; automated?: boolean; id?: string; limit?: number }): Promise<{ conversations: CatalogRow[]; total: number; automatedHidden: number }> {
+  const srv = server();
+  if (srv) {
+    return srv.get('/api/conversations/catalog', { q: query.q, agent: query.agent, project: query.project, automated: query.automated ? '1' : undefined, id: query.id, limit: query.limit ? String(query.limit) : undefined });
+  }
+  const ctx = await createContext(dataDir());
+  try {
+    const agent = query.agent === 'claude' || query.agent === 'codex' ? query.agent : undefined;
+    const result = listAgentConversations(ctx.config, { ...query, agent });
+    const copies = conversationCopies(ctx.dataDir, ctx.config);
+    const followed = new Set(ctx.config.ingest.conversations?.map((l) => `${l.agent}:${l.id}`) ?? []);
+    return { ...result, conversations: result.conversations.map((c) => ({ ...c, copy: copies.get(`${c.agent}:${c.id}`) ?? null, followed: followed.has(`${c.agent}:${c.id}`) })) };
+  } finally {
+    await ctx.store.close();
+  }
+}
+
+/** Session ids as typed — whole, or a start of one at least six characters long — read against the catalog. */
+async function resolveConversations(ids: string[], agent?: string): Promise<ConversationRef[]> {
+  const refs: ConversationRef[] = [];
+  for (const typed of ids) {
+    const want = typed.trim().toLowerCase();
+    if (want.length < 6) throw new Error(`${typed}: type at least six characters of the session id`);
+    const { conversations: found } = await conversationCatalog({ agent, automated: true, id: want, limit: 20 });
+    const exact = found.filter((c) => c.id.toLowerCase() === want);
+    const hits = exact.length ? exact : found;
+    if (hits.length === 0) throw new Error(`no conversation ${typed}${agent ? ` of ${agent}` : ''} — \`knode-os conversations list\` shows them`);
+    if (hits.length > 1) throw new Error(`${typed} names ${hits.length} conversations — type more of its id, or add --agent`);
+    refs.push({ agent: hits[0].agent, id: hits[0].id });
+  }
+  return refs;
+}
+
+const shortDate = (iso: string | null) => (iso ? iso.slice(0, 16).replace('T', ' ') : '—');
+
+conversations
+  .command('list [words...]')
+  .description('this machine\'s conversations, newest first — words must all appear in the title, project or one of the prompts')
+  .option('--agent <agent>', 'claude or codex')
+  .option('--project <name>', 'only conversations in this repository')
+  .option('--all', 'include one-shot runs by programs (claude -p in a temporary folder, codex exec)')
+  .option('--limit <n>', 'at most this many', '50')
+  .option('--json', 'raw JSON output')
+  .action(async (words: string[], opts: { agent?: string; project?: string; all?: boolean; limit: string; json?: boolean }) => {
+    const out = await conversationCatalog({ q: words.join(' ') || undefined, agent: opts.agent, project: opts.project, automated: Boolean(opts.all), limit: Number(opts.limit) || 50 });
+    if (opts.json) {
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    for (const c of out.conversations) {
+      const held = c.followed ? '  [followed]' : c.copy ? '  [imported]' : '';
+      console.log(`${c.agent.padEnd(6)} ${c.id}  ${shortDate(c.updatedAt)}  ${String(c.exchanges).padStart(3)} ex  ${(c.project ?? '—').padEnd(14)} ${c.title}${held}`);
+    }
+    const more = out.total > out.conversations.length ? `, ${out.total - out.conversations.length} more (--limit)` : '';
+    console.log(`\n${out.conversations.length} shown${more}${out.automatedHidden && !opts.all ? `; ${out.automatedHidden} one-shot runs left out (--all)` : ''}`);
+  });
+
+conversations
+  .command('show <id>')
+  .description('print the Markdown importing a conversation would write (id: whole, or its first six characters or more)')
+  .option('--agent <agent>', 'claude or codex, when an id start names both')
+  .option('--to <folder>', 'a folder under raw/docs it would go in')
+  .action(async (id: string, opts: { agent?: string; to?: string }) => {
+    const [ref] = await resolveConversations([id], opts.agent);
+    const srv = server();
+    const out = srv
+      ? await srv.get<ReturnType<typeof previewConversation>>('/api/conversations/preview', { agent: ref.agent, id: ref.id, folder: opts.to })
+      : await (async () => {
+        const ctx = await createContext(dataDir());
+        try {
+          return previewConversation(ctx, ref, opts.to);
+        } finally {
+          await ctx.store.close();
+        }
+      })();
+    process.stdout.write(out.markdown);
+    console.error(`\n→ ${out.dest}: ${out.exchanges} exchanges, ${(out.bytes / 1024).toFixed(1)} KB${out.redactions ? `, ${out.redactions} secrets redacted` : ''}`);
+  });
+
+const CONVERSATION_SERVE_HINT = 'note: a running `knode-os serve` keeps its own copy of the config — restart it, or follow through the app or a signed-in CLI, for it to keep this in sync';
+
+conversations
+  .command('import <ids...>')
+  .description('render conversations into raw/docs/conversations/<project>/ as dialogue and index them; --follow keeps each in sync while `serve` runs')
+  .option('--follow', 'keep the copies in sync as the conversations go on')
+  .option('--agent <agent>', 'claude or codex, when an id start names both')
+  .option('--to <folder>', 'a folder under raw/docs for new copies (default raw/docs/conversations/<project>)')
+  .option('--no-llm', 'do not queue the copies for tier-1 LLM extraction')
+  .action(async (ids: string[], opts: { follow?: boolean; agent?: string; to?: string; llm?: boolean }) => {
+    const refs = await resolveConversations(ids, opts.agent);
+    const mode = opts.follow ? 'follow' : 'copy';
+    const srv = server();
+    let out: ConversationImportResult;
+    if (srv) {
+      hereOnly({ llm: opts.llm === false ? true : undefined }, { llm: '--no-llm' });
+      out = await srv.post<ConversationImportResult>('/api/conversations/import', { sessions: refs, mode, folder: opts.to });
+    } else {
+      const ctx = await createContext(dataDir());
+      try {
+        out = await importConversations(ctx, refs, { mode, folder: opts.to, llmGraph: opts.llm, onProgress: (m) => console.log(`  ${m}`) });
+      } finally {
+        await ctx.datasources.closeAll();
+        await ctx.store.close();
+      }
+    }
+    for (const item of out.items) {
+      if (!item.ok || !item.result) {
+        console.log(`${item.agent} ${item.id}: ${item.error}`);
+        continue;
+      }
+      const r = item.result;
+      const what = r.refreshed ? (r.written ? 'brought up to date' : 'unchanged') : 'written';
+      console.log(`${r.mode === 'follow' ? 'following' : 'imported'} “${r.title}” → ${r.dest} (${what}; ${r.exchanges} exchanges${r.redactions ? `, ${r.redactions} secrets redacted` : ''})`);
+    }
+    if (out.sync) console.log(`indexed: ${out.sync.indexed} applied, ${out.sync.unchanged} unchanged, ${out.sync.skipped} skipped, ${out.sync.errors} errors`);
+    if (mode === 'follow' && !srv && out.items.some((x) => x.ok)) console.log(CONVERSATION_SERVE_HINT);
+    if (out.items.some((x) => !x.ok)) process.exitCode = 1;
+  });
+
+conversations
+  .command('followed')
+  .description('the conversations followed here, and how current their copies are')
+  .option('--json', 'raw JSON output')
+  .action(async (opts: { json?: boolean }) => {
+    const srv = server();
+    let links: ConversationStatus[];
+    if (srv) links = (await srv.get<{ links: ConversationStatus[] }>('/api/conversations')).links;
+    else {
+      const ctx = await createContext(dataDir());
+      links = describeConversationLinks(ctx);
+      await ctx.store.close();
+    }
+    if (opts.json) console.log(JSON.stringify(links, null, 2));
+    else if (links.length === 0) console.log('no conversations followed — `knode-os conversations import <id> --follow` follows one');
+    else {
+      for (const l of links) {
+        console.log(`${l.dest}  ←  ${l.agent} ${l.id}  ${l.exchanges ?? '?'} exchanges, last ${shortDate(l.asOf)}${l.sourcePresent ? '' : '  (transcript gone from this machine — copy kept)'}${l.waiting ? '  (being written; synced once quiet)' : ''}${l.lastError ? `  error: ${l.lastError}` : ''}`);
+      }
+    }
+  });
+
+conversations
+  .command('sync [dest]')
+  .description('bring followed conversations up to date now, without waiting for them to go quiet (one with <dest>)')
+  .option('--force', 'render every followed conversation again, changed or not')
+  .action(async (dest: string | undefined, opts: { force?: boolean }) => {
+    const srv = server();
+    let results: ConversationRefreshResult[];
+    if (srv) results = (await srv.post<{ results: ConversationRefreshResult[] }>('/api/conversations/sync', { dest, force: Boolean(opts.force), wait: true })).results;
+    else {
+      const ctx = await createContext(dataDir());
+      try {
+        results = await refreshConversations(ctx, { dest, force: Boolean(opts.force), onProgress: (m) => console.log(`  ${m}`) });
+      } finally {
+        await ctx.datasources.closeAll();
+        await ctx.store.close();
+      }
+    }
+    if (results.length === 0) console.log('no conversations followed');
+    for (const r of results) {
+      console.log(r.error ? `${r.dest}: ${r.error}` : r.written ? `${r.dest}: updated — ${r.exchanges} exchanges` : r.changed ? `${r.dest}: re-read, nothing new to keep` : `${r.dest}: unchanged`);
+    }
+  });
+
+conversations
+  .command('unfollow <dest>')
+  .description('stop following a conversation; its copy stays as an ordinary document unless --remove-files')
+  .option('--remove-files', 'also delete the copy and dispose its knowledge')
+  .action(async (dest: string, opts: { removeFiles?: boolean }) => {
+    const srv = server();
+    const r = srv
+      ? await srv.delete<{ dest: string; removedFiles: boolean }>('/api/conversations', { dest, removeFiles: opts.removeFiles ? '1' : undefined })
+      : await (async () => {
+        const ctx = await createContext(dataDir());
+        try {
+          return await unfollowConversation(ctx, dest, { removeFiles: Boolean(opts.removeFiles), onProgress: (m) => console.log(`  ${m}`) });
+        } finally {
+          await ctx.datasources.closeAll();
+          await ctx.store.close();
+        }
+      })();
+    console.log(r.removedFiles ? `unfollowed ${r.dest} and removed its copy` : `unfollowed ${r.dest}; its copy stays as an ordinary document`);
+    if (!srv) console.log(CONVERSATION_SERVE_HINT);
+  });
+
 program
   .command('search <query>')
   .description('search the knowledge base; sag adds query-time chunk/entity multi-hop expansion')
@@ -590,6 +817,23 @@ program
   .option('--actor <name>', 'who is asking — restricted sources answer only to actors on their ACL')
   .option('--json', 'raw JSON output')
   .action(async (query, opts) => {
+    const print = (results: Awaited<ReturnType<typeof search>>, hint: string) => {
+      if (opts.json) {
+        console.log(JSON.stringify(results, null, 2));
+        return;
+      }
+      for (const r of results) {
+        console.log(`\n— ${r.path}  (score ${r.score.toFixed(4)})`);
+        console.log(`  ${r.content.replace(/\s+/g, ' ').slice(0, 240)}`);
+      }
+      if (results.length === 0) console.log(hint);
+    };
+    const srv = server();
+    if (srv) {
+      hereOnly(opts, { trust: '--trust', actor: '--actor' });
+      print(await srv.get('/api/search', { q: query, k: opts.k, mode: opts.mode, as_of: opts.asOf, kinds: opts.kinds, sources: opts.sources }), `no results in ${srv.url}'s ${srv.workspace?.name ?? ''} workspace`);
+      return;
+    }
     const ctx = await createContext(dataDir());
     const results = await search(ctx.store, ctx.embedder, query, {
       k: Number(opts.k),
@@ -599,15 +843,7 @@ program
       asOf: opts.asOf,
       filter: resolveScopeFilter({ kinds: list(opts.kinds), sources: list(opts.sources), trust: opts.trust, actor: opts.actor }),
     });
-    if (opts.json) {
-      console.log(JSON.stringify(results, null, 2));
-    } else {
-      for (const r of results) {
-        console.log(`\n— ${r.path}  (score ${r.score.toFixed(4)})`);
-        console.log(`  ${r.content.replace(/\s+/g, ' ').slice(0, 240)}`);
-      }
-      if (results.length === 0) console.log('no results — did you run `knode-os ingest`?');
-    }
+    print(results, 'no results — did you run `knode-os ingest`?');
     await ctx.store.close();
   });
 
@@ -615,15 +851,24 @@ program
   .command('ask <question>')
   .description('answer a question from the knowledge base with citations (runs on the Judge stage, extraction.judgeLlm)')
   .option('-m, --mode <mode>', 'retrieval mode: hybrid | vector | keyword | sag', 'hybrid')
+  .option('--json', 'raw JSON output')
   .action(async (question, opts) => {
+    const print = (res: Awaited<ReturnType<typeof ask>>) => {
+      if (opts.json) {
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      console.log(`\n${res.answer}\n`);
+      for (const c of res.citations) console.log(`  [${c.ref}] ${c.path}`);
+      if (res.gaps.length) {
+        console.log('\ngaps:');
+        for (const g of res.gaps) console.log(`  - ${g}`);
+      }
+    };
+    const srv = server();
+    if (srv) return print(await srv.post('/api/ask', { question, mode: opts.mode }));
     const ctx = await createContext(dataDir());
-    const res = await ask(ctx.store, ctx.config, ctx.embedder, ctx.llm, question, { mode: opts.mode as SearchMode });
-    console.log(`\n${res.answer}\n`);
-    for (const c of res.citations) console.log(`  [${c.ref}] ${c.path}`);
-    if (res.gaps.length) {
-      console.log('\ngaps:');
-      for (const g of res.gaps) console.log(`  - ${g}`);
-    }
+    print(await ask(ctx.store, ctx.config, ctx.embedder, ctx.llm, question, { mode: opts.mode as SearchMode }));
     await ctx.store.close();
   });
 
@@ -641,6 +886,27 @@ program
   .option('--actor <name>', 'who is asking (ACL)')
   .option('--json', 'raw JSON output')
   .action(async (query, opts) => {
+    const print = (res: Awaited<ReturnType<typeof graphSearch>>) => {
+      if (opts.json) {
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      console.log(`\nentities (${res.nodes.length}):`);
+      for (const n of res.nodes.slice(0, 20)) {
+        console.log(`  ${n.name}  [${n.type}]  score=${n.score.toFixed(2)} mentions=${n.mentionCount}${n.description ? '  — ' + n.description.slice(0, 80) : ''}`);
+      }
+      console.log(`\nrelations (${res.edges.length}):`);
+      for (const e of res.edges.slice(0, 20)) console.log(`  ${e.source} —${e.type}→ ${e.target}`);
+      console.log(`\ngrounding chunks: ${res.chunks.map((c) => c.path).join(', ') || '(none)'}`);
+    };
+    const srv = server();
+    if (srv) {
+      hereOnly(opts, { trust: '--trust', actor: '--actor' });
+      if (opts.insights) console.log(JSON.stringify(await srv.get('/api/graph/insights'), null, 2));
+      else if (!query) console.log(JSON.stringify(await srv.get('/api/graph'), null, 2));
+      else print(await srv.get('/api/graph', { q: query, depth: opts.depth, as_of: opts.asOf, valid_at: opts.validAt, valid_range: opts.validRange, kinds: opts.kinds, sources: opts.sources }));
+      return;
+    }
     const ctx = await createContext(dataDir());
     if (opts.insights) {
       console.log(JSON.stringify(await graphInsights(ctx.store), null, 2));
@@ -648,25 +914,43 @@ program
       // same default as GET /api/graph and the web UI: top-entity overview
       console.log(JSON.stringify(await graphOverview(ctx.store), null, 2));
     } else {
-      const res = await graphSearch(ctx.store, query, {
+      print(await graphSearch(ctx.store, query, {
         depth: Number(opts.depth),
         heat: ctx.config.heat,
         temporal: resolveTemporal({ asOf: opts.asOf, validAt: opts.validAt, validRange: opts.validRange }),
         filter: resolveScopeFilter({ kinds: list(opts.kinds), sources: list(opts.sources), trust: opts.trust, actor: opts.actor }),
-      });
-      if (opts.json) {
-        console.log(JSON.stringify(res, null, 2));
-      } else {
-        console.log(`\nentities (${res.nodes.length}):`);
-        for (const n of res.nodes.slice(0, 20)) {
-          console.log(`  ${n.name}  [${n.type}]  score=${n.score.toFixed(2)} mentions=${n.mentionCount}${n.description ? '  — ' + n.description.slice(0, 80) : ''}`);
-        }
-        console.log(`\nrelations (${res.edges.length}):`);
-        for (const e of res.edges.slice(0, 20)) console.log(`  ${e.source} —${e.type}→ ${e.target}`);
-        console.log(`\ngrounding chunks: ${res.chunks.map((c) => c.path).join(', ') || '(none)'}`);
-      }
+      }));
     }
     await ctx.store.close();
+  });
+
+program
+  .command('stats')
+  .description('the knowledge base in a few numbers: documents, chunks, entities, relations, claims, pages, the models')
+  .action(async () => {
+    const srv = server();
+    if (srv) return console.log(JSON.stringify(await srv.get('/api/stats'), null, 2));
+    const ctx = await createContext(dataDir());
+    try {
+      console.log(JSON.stringify({ ...(await knowledgeStats(ctx.store)), embeddingModel: ctx.embedder.model, llmModel: ctx.llm.enabled ? ctx.llm.label : null }, null, 2));
+    } finally {
+      await ctx.store.close();
+    }
+  });
+
+program
+  .command('survey')
+  .description('what the base holds: documents by folder, entities by type, predicates, claims, wiki pages, the guide — where to start in an unfamiliar workspace')
+  .action(async () => {
+    const srv = server();
+    if (srv) return console.log(JSON.stringify(await srv.get('/api/survey'), null, 2));
+    const ctx = await createContext(dataDir());
+    try {
+      console.log(JSON.stringify(await surveyKnowledgeBase(ctx), null, 2));
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
   });
 
 const datasource = program.command('datasource').description('live external data sources (mysql / timescale / duckdb-parquet)');
@@ -767,15 +1051,18 @@ suggestions
   .option('--status <status>', 'pending | accepted | rejected | stale', 'pending')
   .option('-n, --limit <n>', 'max rows', '50')
   .action(async (opts) => {
-    const ctx = await createContext(dataDir());
-    const rows = await listSuggestions(ctx.store, { status: opts.status, limit: Number(opts.limit) });
+    const srv = server();
+    const ctx = srv ? null : await createContext(dataDir());
+    const rows: Awaited<ReturnType<typeof listSuggestions>> = srv
+      ? (await srv.get<Awaited<ReturnType<typeof listSuggestions>>>('/api/suggestions', { status: opts.status })).slice(0, Number(opts.limit))
+      : await listSuggestions(ctx!.store, { status: opts.status, limit: Number(opts.limit) });
     for (const r of rows) {
       console.log(`\n${r.id}  [${r.kind}]  ${r.title}`);
       console.log(`  ${r.body.replace(/\s+/g, ' ').slice(0, 200)}`);
       if (r.payload?.path) console.log(`  writes ${r.payload.path} on accept`);
     }
     if (rows.length === 0) console.log(`no ${opts.status} suggestions`);
-    await ctx.store.close();
+    await ctx?.store.close();
   });
 suggestions
   .command('accept <id>')
@@ -1134,18 +1421,29 @@ program
   .option('--actor <name>', 'who is asking (ACL)')
   .option('--json', 'raw JSON output')
   .action(async (subject, opts) => {
-    const ctx = await createContext(dataDir());
-    const res = await queryClaims(ctx.store, {
-      subject,
-      object: opts.object,
-      types: list(opts.types),
-      statuses: list(opts.status),
-      kinds: list(opts.kind),
-      text: opts.text,
-      limit: Number(opts.limit),
-      temporal: resolveTemporal({ asOf: opts.asOf, validAt: opts.validAt, validRange: opts.validRange }),
-      filter: resolveScopeFilter({ kinds: list(opts.kinds), sources: list(opts.sources), trust: opts.trust, actor: opts.actor }),
-    });
+    const srv = server();
+    let res: Awaited<ReturnType<typeof queryClaims>>;
+    if (srv) {
+      hereOnly(opts, { trust: '--trust', actor: '--actor' });
+      res = await srv.get('/api/claims', {
+        subject, object: opts.object, types: opts.types, status: opts.status, claim_kind: opts.kind, text: opts.text, limit: opts.limit,
+        as_of: opts.asOf, valid_at: opts.validAt, valid_range: opts.validRange, kinds: opts.kinds, sources: opts.sources,
+      });
+    } else {
+      const ctx = await createContext(dataDir());
+      res = await queryClaims(ctx.store, {
+        subject,
+        object: opts.object,
+        types: list(opts.types),
+        statuses: list(opts.status),
+        kinds: list(opts.kind),
+        text: opts.text,
+        limit: Number(opts.limit),
+        temporal: resolveTemporal({ asOf: opts.asOf, validAt: opts.validAt, validRange: opts.validRange }),
+        filter: resolveScopeFilter({ kinds: list(opts.kinds), sources: list(opts.sources), trust: opts.trust, actor: opts.actor }),
+      });
+      await ctx.store.close();
+    }
     if (opts.json) {
       console.log(JSON.stringify(res, null, 2));
     } else {
@@ -1159,7 +1457,6 @@ program
       }
       if (res.claims.length === 0) console.log('  (none)');
     }
-    await ctx.store.close();
   });
 
 program
@@ -1645,7 +1942,56 @@ program
     }
   });
 
-const entities = program.command('entities').description('entity resolution: merge duplicates, undo merges, run the duplicate audit');
+const entities = program.command('entities').description('the graph\'s entities: list and open them, merge duplicates, undo merges, run the duplicate audit');
+entities
+  .command('list [query]')
+  .description('entities by name or alias, most mentioned first (the Entities table of the app)')
+  .option('--type <list>', 'comma-separated entity types, e.g. company,person')
+  .option('--sort <key>', 'mentions | name | type | evidence | updated | created')
+  .option('--order <order>', 'asc | desc')
+  .option('-n, --limit <n>', 'max rows (up to 500)', '50')
+  .option('--offset <n>', 'skip this many')
+  .option('--merged', 'include entities merged into another')
+  .option('--json', 'raw JSON output')
+  .action(async (q: string | undefined, opts: { type?: string; sort?: string; order?: string; limit: string; offset?: string; merged?: boolean; json?: boolean }) => {
+    const srv = server();
+    let page: Awaited<ReturnType<typeof queryEntities>>;
+    if (srv) page = await srv.get('/api/entities', { q, type: opts.type, sort: opts.sort, order: opts.order, limit: opts.limit, offset: opts.offset, merged: opts.merged ? 1 : undefined });
+    else {
+      const ctx = await createContext(dataDir());
+      try {
+        page = await queryEntities(ctx.store, { q, types: list(opts.type), sort: opts.sort, order: opts.order, limit: Number(opts.limit), offset: Number(opts.offset), merged: opts.merged });
+      } finally {
+        await ctx.store.close();
+      }
+    }
+    if (opts.json) return console.log(JSON.stringify(page, null, 2));
+    for (const e of page.items) console.log(`${e.id}  ${e.name}  [${e.type}]  ${e.mentions} mentions, ${e.documents} docs, ${e.relations} relations${e.wikiPath ? `  → ${e.wikiPath}` : ''}`);
+    console.log(`\n${page.items.length ? `${page.offset + 1}–${page.offset + page.items.length}` : '0'} of ${page.total}`);
+  });
+entities
+  .command('show <id>')
+  .description('one entity: its relations, the entities it appears with, its claims and documents')
+  .option('--json', 'raw JSON output')
+  .action(async (id: string, opts: { json?: boolean }) => {
+    const srv = server();
+    let detail: Awaited<ReturnType<typeof entityDetail>>;
+    if (srv) detail = await srv.get('/api/entities/detail', { id });
+    else {
+      const ctx = await createContext(dataDir());
+      try {
+        detail = await entityDetail(ctx.store, id);
+      } finally {
+        await ctx.store.close();
+      }
+    }
+    if (!detail) throw new Error(`no live entity ${id}`);
+    if (opts.json) return console.log(JSON.stringify(detail, null, 2));
+    const e = detail.entity;
+    console.log(`${e.name}  [${e.type}]  ${e.id}${e.aliases.length ? `\n  also: ${e.aliases.join(', ')}` : ''}${e.description ? `\n  ${e.description}` : ''}`);
+    console.log(`  ${e.mentionCount} mentions in ${e.documentCount} documents, ${e.degree} relations${e.wikiPath ? `; page ${e.wikiPath}` : ''}`);
+    console.log(JSON.stringify({ relations: detail.relations, cooccurring: detail.cooccurring, claims: detail.claims }, null, 2));
+  });
 entities
   .command('merge <entity> <into>')
   .description('record that <entity> is the same as <into>; reads redirect to <into>, evidence is untouched, reversible with unmerge')
@@ -1976,6 +2322,36 @@ function printBrief(id: string, status: string, brief: StudyBrief, problem: stri
   if (problem) console.log(`\ncannot start yet: ${problem}`);
 }
 
+/** A study's stages, pages, report and sources, under its brief. */
+function printStudyProgress(view: Awaited<ReturnType<typeof studyView>>): void {
+  console.log(`\nstages: ${view.payload.steps.map((st) => `${st.name}=${st.status}${st.detail ? ` (${st.detail})` : ''}`).join('  ')}`);
+  if (view.pause) console.log(`paused until ${new Date(view.pause.until).toLocaleString()} (${view.pause.kind}): ${view.pause.reason}`);
+  if (view.archivedAt) console.log(`archived ${new Date(view.archivedAt).toLocaleString()}`);
+  console.log(`\npages:${view.pages.map((pg) => `\n  ${pg.status.padEnd(10)} ${pg.path}${pg.trust ? `  [${pg.trust}]` : ''}${pg.error ? `  ✗ ${pg.error.slice(0, 100)}` : ''}`).join('')}`);
+  console.log(`report: ${view.reportPath}${view.reportExists ? '' : ' (not yet)'}`);
+  console.log(`sources: ${view.captures.length} captured — ${view.registerPath}`);
+}
+
+/** A study as GET /api/research/studies/:id answers it. */
+type RemoteStudy = Awaited<ReturnType<typeof studyView>> & { refining?: string | null; startProblem?: string | null };
+
+/** The server refines in the background: the draft comes back at once, the brief when the refiner is done. */
+async function settledStudy(srv: KnodeClient, view: RemoteStudy): Promise<RemoteStudy> {
+  const until = Date.now() + 20 * 60_000;
+  while (view.refining && Date.now() < until) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    view = await srv.get<RemoteStudy>(`/api/research/studies/${encodeURIComponent(view.job.id)}`);
+  }
+  return view;
+}
+
+function printRemoteBrief(view: RemoteStudy): void {
+  const last = view.payload.refinements[view.payload.refinements.length - 1];
+  if (last?.error) console.log(`refiner (${last.refiner}): ${last.error}`);
+  if (view.refining) console.log(`(still refining on the server — \`knode-os research study show ${view.job.id}\` later)`);
+  printBrief(view.job.id, view.job.status, view.payload.brief, view.startProblem ?? null);
+}
+
 /**
  * A whole study, here: collect, every page, the report — what `serve`'s queue
  * would do over its ticks, one job at a time, against a temporary MCP endpoint.
@@ -1986,13 +2362,20 @@ async function runStudyNow(ctx: Awaited<ReturnType<typeof createContext>>, id: s
       await continueStudies(ctx, log);
       const study = await getJob(ctx.store, id);
       if (!study) throw new Error(`no study ${id}`);
+      // a pause outlasts this process: say when, and leave it to serve (or to another run then)
+      const pause = await studyPause(ctx, study);
+      if (pause) {
+        log(`paused until ${new Date(pause.until).toLocaleString()} — ${pause.reason}`);
+        log(`serve goes on by itself then; or run \`research study resume ${id}\` once the limit is lifted`);
+        return;
+      }
       if (study.status === 'queued') {
         const [claimed] = await ctx.store.query<{ id: string }>(`UPDATE research_jobs SET status = 'running', started_at = now(), attempts = attempts + 1 WHERE id = $1 AND status = 'queued' RETURNING id`, [id]);
         if (claimed) await runResearchJob(ctx, (await getJob(ctx.store, id))!, { mcp, log });
         continue;
       }
       if (study.status !== 'waiting') return;
-      const pages = await listJobs(ctx.store, { study: id, status: 'queued', limit: 100 });
+      const pages = (await listJobs(ctx.store, { study: id, status: 'queued', limit: 100 })).filter((pg) => !activePause(pg.payload));
       if (pages.length === 0) return;
       for (const page of pages) {
         const [claimed] = await ctx.store.query<{ id: string }>(`UPDATE research_jobs SET status = 'running', started_at = now(), attempts = attempts + 1 WHERE id = $1 AND status = 'queued' RETURNING id`, [page.id]);
@@ -2017,19 +2400,26 @@ study
   .option('--start', 'queue it right away')
   .option('--now', 'run the whole study in this process (implies --start)')
   .action(async (parts: string[], opts: { agent?: string; model?: string; profile?: string; web: boolean; sources?: string; deepResearch?: string; language?: string; refine: boolean; start?: boolean; now?: boolean }) => {
+    const runner: Partial<StudyRunner> = { agent: opts.agent ?? '', model: opts.model ?? '', profile: opts.profile ?? '' };
+    if (opts.deepResearch) {
+      const at = opts.deepResearch.indexOf(':');
+      if (at < 1) throw new Error('--deep-research takes <connection>:<model>');
+      Object.assign(runner, { mode: 'deep-research', deepResearch: { connection: opts.deepResearch.slice(0, at), model: opts.deepResearch.slice(at + 1) } });
+    }
+    const sources = { web: opts.web, ...(opts.sources ? { ids: opts.sources.split(',').map((x) => x.trim()).filter(Boolean) } : {}) };
+    const srv = server();
+    if (srv) {
+      hereOnly(opts, { now: '--now' });
+      console.log('refining…');
+      const view = await settledStudy(srv, await srv.post<RemoteStudy>('/api/research/studies', { topic: parts.join(' '), runner, sources, language: opts.language, refine: opts.refine }));
+      printRemoteBrief(view);
+      if (opts.start) console.log(`\nstarted ${(await srv.post<RemoteStudy>(`/api/research/studies/${encodeURIComponent(view.job.id)}/start`)).job.id} — ${srv.url} runs it`);
+      return;
+    }
     const ctx = await createContext(dataDir());
     try {
-      const runner: Partial<StudyRunner> = { agent: opts.agent ?? '', model: opts.model ?? '', profile: opts.profile ?? '' };
-      if (opts.deepResearch) {
-        const at = opts.deepResearch.indexOf(':');
-        if (at < 1) throw new Error('--deep-research takes <connection>:<model>');
-        Object.assign(runner, { mode: 'deep-research', deepResearch: { connection: opts.deepResearch.slice(0, at), model: opts.deepResearch.slice(at + 1) } });
-      }
       console.log('refining…');
-      let job = await createStudy(ctx, {
-        topic: parts.join(' '), runner, requestedBy: 'cli', language: opts.language, refine: opts.refine,
-        sources: { web: opts.web, ...(opts.sources ? { ids: opts.sources.split(',').map((x) => x.trim()).filter(Boolean) } : {}) },
-      });
+      let job = await createStudy(ctx, { topic: parts.join(' '), runner, requestedBy: 'cli', language: opts.language, refine: opts.refine, sources });
       const p = studyPayload(job);
       const last = p.refinements[p.refinements.length - 1];
       if (last?.error) console.log(`refiner (${last.refiner}): ${last.error}`);
@@ -2049,12 +2439,18 @@ study
   .description('refine a draft: what to change, and answers to its clarifications')
   .option('--answer <q=a...>', 'answer a clarification ("<question>=<answer>"; repeatable)', (v: string, all: string[] = []) => [...all, v])
   .action(async (id: string, parts: string[], opts: { answer?: string[] }) => {
+    const answers = Object.fromEntries((opts.answer ?? []).map((a) => {
+      const at = a.indexOf('=');
+      return at > 0 ? [a.slice(0, at).trim(), a.slice(at + 1).trim()] : [a.trim(), ''];
+    }));
+    const srv = server();
+    if (srv) {
+      console.log('refining…');
+      printRemoteBrief(await settledStudy(srv, await srv.post<RemoteStudy>(`/api/research/studies/${encodeURIComponent(id)}/refine`, { feedback: parts.join(' '), answers })));
+      return;
+    }
     const ctx = await createContext(dataDir());
     try {
-      const answers = Object.fromEntries((opts.answer ?? []).map((a) => {
-        const at = a.indexOf('=');
-        return at > 0 ? [a.slice(0, at).trim(), a.slice(at + 1).trim()] : [a.trim(), ''];
-      }));
       console.log('refining…');
       const job = await refineStudy(ctx, id, { feedback: parts.join(' '), answers });
       const p = studyPayload(job);
@@ -2070,6 +2466,12 @@ study
   .description('queue a draft study (serve runs it); --now runs it here')
   .option('--now', 'run the whole study in this process')
   .action(async (id: string, opts: { now?: boolean }) => {
+    const srv = server();
+    if (srv) {
+      hereOnly(opts, { now: '--now' });
+      console.log(`started ${(await srv.post<RemoteStudy>(`/api/research/studies/${encodeURIComponent(id)}/start`)).job.id} — ${srv.url} runs it`);
+      return;
+    }
     const ctx = await createContext(dataDir());
     try {
       const job = await startStudy(ctx, id);
@@ -2098,6 +2500,14 @@ study
   .command('show <id>')
   .option('--json', 'the whole view as JSON')
   .action(async (id: string, opts: { json?: boolean }) => {
+    const srv = server();
+    if (srv) {
+      const view = await srv.get<RemoteStudy>(`/api/research/studies/${encodeURIComponent(id)}`);
+      if (opts.json) return console.log(JSON.stringify(view, null, 2));
+      printBrief(view.job.id, view.job.status, view.payload.brief, view.startProblem ?? null);
+      printStudyProgress(view);
+      return;
+    }
     const ctx = await createContext(dataDir());
     try {
       const job = await getJob(ctx.store, id);
@@ -2108,39 +2518,152 @@ study
         return;
       }
       printBrief(job.id, job.status, view.payload.brief, job.status === 'draft' ? startProblem(ctx, job) : null);
-      console.log(`\nstages: ${view.payload.steps.map((st) => `${st.name}=${st.status}${st.detail ? ` (${st.detail})` : ''}`).join('  ')}`);
-      console.log(`\npages:${view.pages.map((pg) => `\n  ${pg.status.padEnd(10)} ${pg.path}${pg.trust ? `  [${pg.trust}]` : ''}${pg.error ? `  ✗ ${pg.error.slice(0, 100)}` : ''}`).join('')}`);
-      console.log(`report: ${view.reportPath}${view.reportExists ? '' : ' (not yet)'}`);
-      console.log(`sources: ${view.captures.length} captured — ${view.registerPath}`);
+      printStudyProgress(view);
     } finally {
       await ctx.store.close();
     }
   });
 study
   .command('list')
-  .action(async () => {
+  .option('--archived', 'the archived studies instead')
+  .action(async (opts: { archived?: boolean }) => {
+    const srv = server();
+    if (srv) {
+      const rows = await srv.get<{ id: string; status: string; stage: string; title: string; pause: { until: string; kind: string } | null }[]>('/api/research/studies', { archived: opts.archived ? 1 : undefined });
+      for (const r of rows) console.log(`${r.id}  ${r.status.padEnd(10)} ${r.stage.padEnd(8)} ${r.title.slice(0, 70)}${r.pause ? `  ⏸ until ${new Date(r.pause.until).toLocaleString()} (${r.pause.kind})` : ''}`);
+      if (rows.length === 0) console.log(opts.archived ? '(no archived studies)' : '(no studies)');
+      return;
+    }
     const ctx = await createContext(dataDir());
     try {
-      const jobs = await listStudies(ctx, 50);
+      const jobs = await listStudies(ctx, 50, { archived: Boolean(opts.archived) });
       for (const j of jobs) {
         const p = studyPayload(j);
-        console.log(`${j.id}  ${j.status.padEnd(10)} ${p.stage.padEnd(8)} ${p.brief.title.slice(0, 70)}`);
+        const pause = await studyPause(ctx, j);
+        console.log(`${j.id}  ${j.status.padEnd(10)} ${p.stage.padEnd(8)} ${p.brief.title.slice(0, 70)}${pause ? `  ⏸ until ${new Date(pause.until).toLocaleString()} (${pause.kind})` : ''}`);
       }
-      if (jobs.length === 0) console.log('(no studies)');
+      if (jobs.length === 0) console.log(opts.archived ? '(no archived studies)' : '(no studies)');
     } finally {
       await ctx.store.close();
+    }
+  });
+study
+  .command('retry <id>')
+  .description('queue a failed or cancelled study again from where it stopped: its failed pages, then its report')
+  .action(async (id: string) => {
+    const srv = server();
+    if (srv) {
+      const view = await srv.post<RemoteStudy>(`/api/research/studies/${encodeURIComponent(id)}/retry`);
+      console.log(`${view.job.id}: ${view.job.status} (${view.payload.stage}) — ${srv.url} picks it up`);
+      return;
+    }
+    const ctx = await createContext(dataDir());
+    try {
+      const job = await getJob(ctx.store, id);
+      if (!job || job.kind !== 'study') throw new Error(`no study ${id}`);
+      if (job.status !== 'failed' && job.status !== 'cancelled') throw new Error(`a ${job.status} study is not retried${job.status === 'queued' || job.status === 'waiting' ? ' — `research study resume` runs a paused one now' : ''}`);
+      const next = await retryStudy(ctx, job);
+      console.log(`${next.id}: ${next.status} (${studyPayload(next).stage}) — serve picks it up`);
+    } finally {
+      await ctx.store.close();
+    }
+  });
+study
+  .command('resume <id>')
+  .description('run a study that waits out a pause (a spent usage limit) now, instead of when the pause ends')
+  .action(async (id: string) => {
+    const srv = server();
+    if (srv) {
+      const res = await srv.post<{ resumed: number }>(`/api/research/studies/${encodeURIComponent(id)}/resume`);
+      console.log(`${res.resumed} paused job(s) queued to run now`);
+      return;
+    }
+    const ctx = await createContext(dataDir());
+    try {
+      const job = await getJob(ctx.store, id);
+      if (!job || job.kind !== 'study') throw new Error(`no study ${id}`);
+      const { resumed } = await resumeStudy(ctx, job);
+      console.log(resumed ? `${resumed} paused job(s) queued to run now` : 'nothing in this study is paused');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+for (const [action, archived] of [['archive', true], ['unarchive', false]] as const) {
+  study
+    .command(`${action} <id>`)
+    .description(archived ? 'take a finished study off the list; its report, pages and sources stay where they are' : 'bring an archived study back to the list')
+    .action(async (id: string) => {
+      const srv = server();
+      if (srv) {
+        await srv.post(`/api/research/studies/${encodeURIComponent(id)}/${action}`);
+        console.log(`${id}: ${action}d`);
+        return;
+      }
+      const ctx = await createContext(dataDir());
+      try {
+        const job = await getJob(ctx.store, id);
+        if (!job || job.kind !== 'study') throw new Error(`no study ${id}`);
+        if (!(await archiveStudy(ctx, job, archived))) throw new Error(`a ${job.status} study is not ${action}d — only a finished one`);
+        console.log(`${id}: ${action}d`);
+      } finally {
+        await ctx.store.close();
+      }
+    });
+}
+study
+  .command('remove <id>')
+  .description('remove a draft, or a study that failed or was cancelled: its jobs and run logs. What it wrote into the knowledge base stays')
+  .action(async (id: string) => {
+    const srv = server();
+    const ctx = srv ? null : await createContext(dataDir());
+    try {
+      const r = srv ? await srv.delete<Awaited<ReturnType<typeof removeStudy>>>(`/api/research/studies/${encodeURIComponent(id)}`) : await removeStudy(ctx!, id);
+      if (!r) throw new Error('only a draft, or a study that failed or was cancelled, can be removed — archive a finished one, cancel a running one');
+      console.log(`removed ${r.removed.length} job(s)${r.kept.length ? `; kept in the knowledge base: ${r.kept.join(', ')}` : ''}`);
+    } finally {
+      await ctx?.store.close();
     }
   });
 study
   .command('cancel <id>')
   .description('cancel a study and the pages it has not finished')
   .action(async (id: string) => {
+    const srv = server();
+    if (srv) return console.log(JSON.stringify(await srv.post(`/api/research/studies/${encodeURIComponent(id)}/cancel`)));
     const ctx = await createContext(dataDir());
     try {
       console.log(JSON.stringify(await cancelStudy(ctx, id)));
     } finally {
       await ctx.store.close();
     }
+  });
+study
+  .command('report <id>')
+  .description('save the study\'s report and pages as one HTML file to read, share or print to PDF (the app\'s Export)')
+  .option('-o, --out <file>', 'where to save it (default: the export\'s own name, here)')
+  .action(async (id: string, opts: { out?: string }) => {
+    const srv = server();
+    let html: string;
+    let filename: string;
+    if (srv) {
+      const res = await srv.send('GET', `/api/research/studies/${encodeURIComponent(id)}/export`, { query: { download: 1 }, workspace: true, accept: 'text/html' });
+      html = await res.text();
+      const disposition = res.headers.get('content-disposition') ?? '';
+      const utf8 = /filename\*=UTF-8''([^;]+)/i.exec(disposition)?.[1];
+      filename = utf8 ? decodeURIComponent(utf8) : /filename="([^"]+)"/i.exec(disposition)?.[1] ?? `study-${id}.html`;
+    } else {
+      const ctx = await createContext(dataDir());
+      try {
+        const job = await getJob(ctx.store, id);
+        if (!job || job.kind !== 'study') throw new Error(`no study ${id}`);
+        ({ html, filename } = await exportStudy(ctx, job));
+      } finally {
+        await ctx.store.close();
+      }
+    }
+    const to = path.resolve(opts.out ?? path.basename(filename));
+    fs.writeFileSync(to, html);
+    console.log(`saved ${to} (${humanBytes(Buffer.byteLength(html))})`);
   });
 research
   .command('capture <url>')
@@ -2194,6 +2717,17 @@ research
     const ctx = await createContext(dataDir());
     try {
       console.log((await retryJob(ctx.store, id)) ? 'queued again' : 'not retryable');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+research
+  .command('resume <id>')
+  .description('run a job that waits out a pause (a spent usage limit) now')
+  .action(async (id: string) => {
+    const ctx = await createContext(dataDir());
+    try {
+      console.log((await resumeJob(ctx.store, id)) ? 'queued to run now' : 'not paused');
     } finally {
       await ctx.store.close();
     }
@@ -2318,6 +2852,29 @@ chat
   .option('-c, --conversation <id>', 'continue an existing conversation')
   .option('--json', 'print the assistant message as JSON')
   .action(async (parts: string[], opts: { conversation?: string; json?: boolean }) => {
+    const srv = server();
+    if (srv) {
+      // the server runs the turn in the background: the message is taken at once, the reply lands when the agent is done
+      type Conversation = { id: string; messages: ChatMessage[] };
+      const text = parts.join(' ');
+      const id = opts.conversation ?? (await srv.post<{ id: string }>('/api/chat/conversations', {})).id;
+      const route = `/api/chat/conversations/${encodeURIComponent(id)}`;
+      const { seq } = await srv.post<{ seq: number }>(`${route}/messages`, { text });
+      console.error(`(${srv.url} is answering…)`);
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const status = await srv.get<{ status: string }>(`${route}/status`);
+        if (status.status !== 'running') break;
+      }
+      const conversation = await srv.get<Conversation>(route);
+      const reply = conversation.messages.filter((m) => m.role === 'assistant' && m.seq > seq).pop();
+      if (opts.json) return console.log(JSON.stringify({ conversation: id, ...reply }, null, 2));
+      console.log(reply ? reply.content || (reply.error ? `(no reply: ${reply.error})` : '(empty reply)') : '(no reply)');
+      const tools = (reply?.events ?? []).filter((e) => e.tool !== 'wrote');
+      if (tools.length) console.error(`\n[${tools.map((e) => `${e.tool}${e.summary ? `: ${e.summary}` : ''}`).join(' · ')}]`);
+      console.error(`conversation ${id} — continue with: knode-os chat -c ${id} "…"`);
+      return;
+    }
     const ctx = await createContext(dataDir());
     try {
       const text = parts.join(' ');
@@ -2341,6 +2898,13 @@ chat
   .command('list')
   .description('recent conversations')
   .action(async () => {
+    const srv = server();
+    if (srv) {
+      const rows = await srv.get<{ id: string; status: string; updatedAt: string; title: string | null }[]>('/api/chat/conversations', { limit: 50 });
+      for (const r of rows) console.log(`${r.id}  ${r.status.padEnd(8)} ${r.updatedAt.slice(0, 16)}  ${r.title || '(untitled)'}`);
+      if (rows.length === 0) console.log('(no conversations)');
+      return;
+    }
     const ctx = await createContext(dataDir());
     try {
       const rows = await listConversations(ctx.store, { limit: 50 });

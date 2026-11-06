@@ -60,10 +60,26 @@ export function modelOfLabel(label: string): string {
  *   Claude Code is assumed alike until a call is measured.
  * - `startupSeconds` / `tokensPerSecond`: how long a call takes, as starting
  *   the CLI and then writing at that rate.
- * - `bytesUp` / `bytesDown`: traffic beyond the prompt and the answer. A Codex
- *   one-shot fetches its model list and more: ↓1.2–1.7 MB and ↑0.05 MB a call
- *   with plugins and analytics off (measured 2026-10-28). Cursor's and Claude
- *   Code's are not measured, an HTTP call's are its headers.
+ * - `bytesUp` / `bytesDown`: a one-shot call's traffic beyond the prompt and
+ *   the answer. A Codex one-shot (plugins, apps and analytics off, the model
+ *   catalog read from knode's copy) moved ↓58 KB ↑37 KB for a one-word
+ *   prompt, Codex's own instructions and the answer's framing; before the
+ *   copy it moved ↓1.2–1.7 MB (measured 2026-11-06 and 10-28).
+ * - `catalogBytes`: what a call adds when it has no copy of Codex's model
+ *   catalog (src/llm/codex-catalog.ts) and downloads it: the first calls of a
+ *   day on a model, one per slot starting before the first has made the copy
+ *   (that call moved ↓706 KB).
+ * - `session`: an agent session's (a research run) instead: as it starts, and
+ *   per model request beyond what the request sends (the conversation, costed
+ *   per input token) and writes. A Codex research session with plugins, apps
+ *   and analytics off and the copy moved ↓43 KB ↑41 KB for one request and
+ *   ↓160 KB ↑111 KB for four: ↓20 KB ↑10 KB to start and ↓34 KB a request,
+ *   the response events echoing Codex's instructions (2026-11-06). With them
+ *   on, as research sessions ran until then, it downloaded the plugin catalog
+ *   for as long as it ran (11–15 MB in 30 s) and uploaded 0.7–1.3 MB of
+ *   analytics.
+ *
+ * Cursor's and Claude Code's are not measured, an HTTP call's are its headers.
  */
 export interface ServiceProfile {
   promptTokens: number;
@@ -72,16 +88,35 @@ export interface ServiceProfile {
   tokensPerSecond: number;
   bytesUp: number;
   bytesDown: number;
+  catalogBytes: number;
+  session: { bytesUp: number; bytesDown: number; requestBytesDown: number };
   /** Whether the transfer figures were measured, or are a floor. */
   transferMeasured: boolean;
 }
 
 export const SERVICE_PROFILES: Record<ServiceId, ServiceProfile> = {
-  codex: { promptTokens: 15_400, cachedTokens: 12_000, startupSeconds: 8, tokensPerSecond: 60, bytesUp: 50_000, bytesDown: 1_500_000, transferMeasured: true },
-  cursor: { promptTokens: 15_150, cachedTokens: 15_000, startupSeconds: 6, tokensPerSecond: 70, bytesUp: 20_000, bytesDown: 50_000, transferMeasured: false },
-  claude: { promptTokens: 15_000, cachedTokens: 14_000, startupSeconds: 6, tokensPerSecond: 60, bytesUp: 20_000, bytesDown: 50_000, transferMeasured: false },
-  api: { promptTokens: 0, cachedTokens: 0, startupSeconds: 2, tokensPerSecond: 60, bytesUp: 2_000, bytesDown: 2_000, transferMeasured: true },
-  other: { promptTokens: 0, cachedTokens: 0, startupSeconds: 2, tokensPerSecond: 60, bytesUp: 2_000, bytesDown: 2_000, transferMeasured: false },
+  codex: {
+    promptTokens: 15_400, cachedTokens: 12_000, startupSeconds: 8, tokensPerSecond: 60,
+    bytesUp: 37_000, bytesDown: 58_000, catalogBytes: 650_000,
+    session: { bytesUp: 10_000, bytesDown: 20_000, requestBytesDown: 34_000 },
+    transferMeasured: true,
+  },
+  cursor: {
+    promptTokens: 15_150, cachedTokens: 15_000, startupSeconds: 6, tokensPerSecond: 70,
+    bytesUp: 20_000, bytesDown: 50_000, catalogBytes: 0, session: { bytesUp: 20_000, bytesDown: 50_000, requestBytesDown: 0 }, transferMeasured: false,
+  },
+  claude: {
+    promptTokens: 15_000, cachedTokens: 14_000, startupSeconds: 6, tokensPerSecond: 60,
+    bytesUp: 20_000, bytesDown: 50_000, catalogBytes: 0, session: { bytesUp: 20_000, bytesDown: 50_000, requestBytesDown: 0 }, transferMeasured: false,
+  },
+  api: {
+    promptTokens: 0, cachedTokens: 0, startupSeconds: 2, tokensPerSecond: 60,
+    bytesUp: 2_000, bytesDown: 2_000, catalogBytes: 0, session: { bytesUp: 0, bytesDown: 0, requestBytesDown: 2_000 }, transferMeasured: true,
+  },
+  other: {
+    promptTokens: 0, cachedTokens: 0, startupSeconds: 2, tokensPerSecond: 60,
+    bytesUp: 2_000, bytesDown: 2_000, catalogBytes: 0, session: { bytesUp: 0, bytesDown: 0, requestBytesDown: 2_000 }, transferMeasured: false,
+  },
 };
 
 /* -------------------------------- prices -------------------------------- */

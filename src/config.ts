@@ -481,6 +481,35 @@ export interface FeishuLink {
   createdAt: string;
 }
 
+/**
+ * A Claude Code or Codex conversation on this machine, rendered into raw/docs
+ * as dialogue and kept current while `serve` runs (src/ingest/conversations,
+ * docs/design/24). Written by the conversation routes and `knode-os
+ * conversations import --follow`, never by hand.
+ */
+export interface ConversationLink {
+  agent: 'claude' | 'codex';
+  /** The session id the agent keeps it under. */
+  id: string;
+  /** Where its transcript was last found; found again by id when it moves. */
+  source: string;
+  /** The title when last rendered. */
+  title: string;
+  /** The repository it ran in, when known. */
+  project: string | null;
+  /** Its Markdown inside the workspace: a file under raw/docs. */
+  dest: string;
+  createdAt: string;
+}
+
+/** How `serve` keeps followed conversations current (docs/design/24 D8). */
+export interface ConversationSyncConfig {
+  /** Minutes between looks at the followed transcripts (default 10). */
+  everyMinutes?: number;
+  /** A transcript changed less than this many minutes ago waits: the agent may still be writing (default 10). */
+  quietMinutes?: number;
+}
+
 /** How knode-os reaches Feishu: lark-cli, signed in as the person whose documents these are. */
 export interface FeishuConfig {
   /** The lark-cli executable; default the one on PATH, else ~/.local/bin/lark-cli. */
@@ -503,6 +532,9 @@ export interface IngestConfig {
   /** Feishu documents mirrored and kept in sync; absent or empty when none is linked. */
   feishuDocs?: FeishuLink[];
   feishu?: FeishuConfig;
+  /** Agent conversations followed and kept in sync; absent or empty when none is. */
+  conversations?: ConversationLink[];
+  conversationSync?: ConversationSyncConfig;
   /** Parallel documents in flight during the index pass; embedding round-trips dominate. */
   concurrency?: number;
   /**

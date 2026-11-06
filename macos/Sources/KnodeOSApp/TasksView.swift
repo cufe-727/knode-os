@@ -107,6 +107,7 @@ enum TaskWords {
         case "traces": (L("Agent traces"), L("collects new Claude Code and Codex sessions"))
         case "datasources": (L("Datasources"), L("refreshes live schemas into the wiki"))
         case "feishu": (L("Feishu documents"), L("asks Feishu which linked documents and wiki pages were edited, and fetches those"))
+        case "conversations": (L("Agent conversations"), L("adds new exchanges of followed Claude Code and Codex conversations once they go quiet"))
         default: (id, "")
         }
     }
@@ -118,6 +119,7 @@ enum TaskWords {
         case "upload": "arrow.up.doc"
         case "folder": "folder"
         case "feishu": "doc.text"
+        case "conversations": "bubble.left.and.bubble.right"
         case "traces": "terminal"
         case "datasources": "cylinder"
         case "dream": "moon.stars"
@@ -142,6 +144,7 @@ struct TasksView: View {
     @State private var confirmingStop = false
     @State private var switching = false
     @State private var checkingFeishu = false
+    @State private var checkingConversations = false
     /// Nil until someone opens or closes it: open by default while nothing runs.
     @State private var recentOpen: Bool?
 
@@ -551,7 +554,11 @@ struct TasksView: View {
                     .lineLimit(2)
                     .help(openHelp(job))
                 HStack(spacing: 6) {
-                    StatusChip(status: job.status)
+                    if let until = job.pausedUntil {
+                        PauseChip(pause: RunPause(kind: "", reason: job.pauseReason ?? "", until: until))
+                    } else {
+                        StatusChip(status: job.status)
+                    }
                     Text(TaskWords.job(job.kind)).font(.caption).foregroundStyle(.tertiary)
                     if let stage = job.stage, job.kind != "ask", stage != job.kind {
                         Text(stage).font(.caption).foregroundStyle(.secondary)
@@ -568,7 +575,7 @@ struct TasksView: View {
                 if let error = job.error {
                     Text(String(error.prefix(240)))
                         .font(.caption)
-                        .foregroundStyle(Color.knodeBad)
+                        .foregroundStyle(job.pausedUntil == nil ? Color.knodeBad : Color.secondary)
                         .lineLimit(3)
                         .help(error)
                 }
@@ -731,6 +738,13 @@ struct TasksView: View {
                     .disabled(item.running || checkingFeishu)
                     .help(L("Ask Feishu now which linked documents were edited, and fetch those"))
             }
+            // so does the look at followed agent conversations, without waiting for them to go quiet
+            if item.id == "conversations", item.enabled, model.mayUseFiles {
+                Button(L("Check now")) { Task { await checkConversations() } }
+                    .controlSize(.small)
+                    .disabled(item.running || checkingConversations)
+                    .help(L("Add the new exchanges of every followed conversation now, without waiting for it to go quiet"))
+            }
         }
         .opacity(item.enabled ? 1 : 0.5)
     }
@@ -747,6 +761,22 @@ struct TasksView: View {
             model.sessionEnded()
         } catch {
             model.showError(error, prefix: L("Feishu check failed"))
+        }
+        await load()
+    }
+
+    private func checkConversations() async {
+        checkingConversations = true
+        defer { checkingConversations = false }
+        do {
+            let answer = try await model.client().checkConversations()
+            model.showToast(answer.started
+                ? L("Checking followed conversations for new exchanges — it shows under Background")
+                : L("A check of followed conversations is under way already"))
+        } catch let error as APIError where error.sessionEnded {
+            model.sessionEnded()
+        } catch {
+            model.showError(error, prefix: L("Conversation check failed"))
         }
         await load()
     }

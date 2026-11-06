@@ -1442,8 +1442,9 @@ const SCHEDULE_WORDS = {
   traces: ['Agent traces', 'collects new Claude Code and Codex sessions'],
   datasources: ['Datasources', 'refreshes live schemas into the wiki'],
   feishu: ['Feishu documents', 'asks Feishu which linked documents and wiki pages were edited, and fetches those'],
+  conversations: ['Agent conversations', 'adds new exchanges of followed Claude Code and Codex conversations once they go quiet'],
 };
-const ACTIVITY_ICONS = { sync: '⟳', ingest: '⛁', upload: '⤒', folder: '⇄', feishu: '⇅', traces: '⌁', datasources: '◫', dream: '☾', tier2: '⚙' };
+const ACTIVITY_ICONS = { sync: '⟳', ingest: '⛁', upload: '⤒', folder: '⇄', feishu: '⇅', conversations: '❝', traces: '⌁', datasources: '◫', dream: '☾', tier2: '⚙' };
 
 /** "45 s", "3 min 10 s", "2 h 5 min". */
 function spanText(seconds) {
@@ -1600,8 +1601,8 @@ function paintTasksJobs(t) {
     return `<div class="job-row" data-job="${esc(j.id)}" data-kind="${esc(j.kind)}">
       <span class="kind-pill k-${esc(j.kind)}">${esc(JOB_KIND_WORDS[j.kind] ?? j.kind)}</span>
       <div class="job-main"><a href="#" class="job-title">${esc(j.title)}</a>
-        <div class="hint">${statusChip(j.status)}${j.stage && j.kind !== 'ask' ? ` ${esc(j.stage)}` : ''} · ${when}${j.outputPath ? ` · <a href="#" class="mono" data-open="${esc(j.outputPath)}">${esc(baseName(j.outputPath))}</a>` : ''}</div>
-        ${j.error ? `<div class="hint bad">${esc(j.error.slice(0, 220))}</div>` : ''}</div>
+        <div class="hint">${j.pausedUntil ? pauseChip({ until: j.pausedUntil, reason: j.pauseReason ?? '' }) : statusChip(j.status)}${j.stage && j.kind !== 'ask' ? ` ${esc(j.stage)}` : ''} · ${when}${j.outputPath ? ` · <a href="#" class="mono" data-open="${esc(j.outputPath)}">${esc(baseName(j.outputPath))}</a>` : ''}</div>
+        ${j.error ? `<div class="hint${j.pausedUntil ? '' : ' bad'}">${esc(j.error.slice(0, 220))}</div>` : ''}</div>
       ${action ? `<button type="button" class="row-action" data-job-action="${action.verb}">${action.label}</button>` : ''}
     </div>`;
   }).join('');
@@ -1628,10 +1629,11 @@ function paintTasksJobs(t) {
 
 const LIVE_JOB = new Set(['queued', 'running', 'validating', 'waiting']);
 
-/** What a job row offers: stop what runs, run again what failed — if this account may. */
+/** What a job row offers: run now what waits out a pause, stop what runs, run again what failed — if this account may. */
 function jobAction(job) {
   if (job.kind === 'ask') return job.status === 'running' && mayUse('ask') ? { verb: 'cancel', label: 'Stop' } : null;
   if (!mayUse('knowledge')) return null;
+  if (job.pausedUntil) return { verb: 'resume', label: 'Resume now' };
   if (LIVE_JOB.has(job.status)) return { verb: 'cancel', label: 'Cancel' };
   if (job.status === 'failed' || job.status === 'cancelled') return { verb: 'retry', label: 'Retry' };
   return null;
@@ -1680,7 +1682,9 @@ function paintTasksSchedule(t) {
     // the Feishu check also runs when asked: whoever may sync the files may ask
     const checkNow = x.id === 'feishu' && x.enabled && mayUse('files')
       ? `<button type="button" class="row-action" data-feishu-check ${x.running ? 'disabled' : ''} title="Ask Feishu now which linked documents were edited, and fetch those">Check now</button>`
-      : '';
+      : x.id === 'conversations' && x.enabled && mayUse('files')
+        ? `<button type="button" class="row-action" data-conversations-check ${x.running ? 'disabled' : ''} title="Add the new exchanges of every followed conversation now, without waiting for it to go quiet">Check now</button>`
+        : '';
     return `<div class="schedule-row${x.enabled ? '' : ' off'}"><span class="activity-icon${x.running ? ' spin' : ''}">${x.running ? '⟳' : '◷'}</span>
       <div><b>${esc(title)}</b> <span class="hint">${esc(about)}</span><div class="hint">${x.running ? 'running now · ' : ''}${esc(when)}</div></div>${checkNow}</div>`;
   });
@@ -1691,6 +1695,7 @@ function paintTasksSchedule(t) {
   const dream = t.dream.pendingSuggestions ? `<p class="hint">Dream has <a href="#" data-goto="dream">${t.dream.pendingSuggestions} suggestion${t.dream.pendingSuggestions === 1 ? '' : 's'}</a> waiting for review.</p>` : '';
   $('#tasks-schedule').innerHTML = `${rows.join('')}${folders.length ? `<p class="tasks-sub">Linked folders</p>${folders.join('')}` : ''}${dream}`;
   $('#tasks-schedule').querySelector('[data-feishu-check]')?.addEventListener('click', (ev) => checkFeishuNow(ev.currentTarget));
+  $('#tasks-schedule').querySelector('[data-conversations-check]')?.addEventListener('click', (ev) => checkConversationsNow(ev.currentTarget));
 }
 
 /** Tasks → Feishu documents → Check now: every linked document and tree, in the background. */
@@ -1979,6 +1984,8 @@ function mirroredSource(path) {
 }
 /** Linked Feishu documents in the tree: mirror path → the document's link. A subset of linkedDests. */
 const feishuDests = new Map();
+/** Followed agent conversations in the tree: copy path → its transcript. A subset of linkedDests. */
+const conversationDests = new Map();
 /** The last path typed into an import, offered again next time. */
 let lastImportSource = '';
 /** The last Feishu link typed into an import. */
@@ -2037,9 +2044,11 @@ async function fetchListing(dir) {
     const node = await api(`/api/tree?path=${encodeURIComponent(dir || '.')}&depth=1`);
     linkedDests.clear();
     feishuDests.clear();
+    conversationDests.clear();
     for (const link of node.links || []) {
       linkedDests.set(link.path, link.source);
       if (link.kind === 'feishu') feishuDests.set(link.path, link.source);
+      if (link.kind === 'conversation') conversationDests.set(link.path, link.source);
     }
     return node.children || [];
   } catch {
@@ -2163,7 +2172,8 @@ function treeRow(child) {
       paint();
     });
   } else {
-    label.textContent = `· ${child.name}`;
+    label.textContent = `· ${child.name}${child.linked ? ' 🔗' : ''}`;
+    if (child.linked) label.title = `follows the agent conversation in ${child.linked} — new exchanges are added as it goes on`;
     if (child.path === currentFile) label.classList.add('selected');
     label.addEventListener('click', () => openFile(child.path, label));
   }
@@ -2196,6 +2206,13 @@ function nodeMenu(node) {
       items.push({ label: 'Import folder from this Mac here…', run: () => { pickDir(node.path); importLocalFolder('copy', node.path); } });
       items.push({ label: 'Link folder from this Mac here…', run: () => { pickDir(node.path); importLocalFolder('link', node.path); } });
     }
+    items.push('-');
+  }
+  if (!dir && conversationDests.has(node.path)) {
+    items.push({ label: 'Check for new exchanges now', run: () => syncAgentConversation(node.path) });
+    items.push({ label: 'Render again from the transcript', run: () => syncAgentConversation(node.path, true) });
+    items.push({ label: 'Unfollow (keep the copy)…', run: () => unfollowAgentConversation(node, false) });
+    items.push({ label: 'Unfollow and remove the copy…', danger: true, run: () => unfollowAgentConversation(node, true) });
     items.push('-');
   }
   if (linkRoot && feishuDests.has(node.path)) {
@@ -2495,6 +2512,12 @@ function readOnlyNotice(derived, truncated, bytes, path = currentFile, transcrip
   // The mirror of a linked folder follows its source: a save here would be
   // undone by the next sync (and the service refuses it).
   const mirrored = path ? mirroredSource(path) : null;
+  if (mirrored && conversationDests.has(path)) {
+    return {
+      text: `Follows an agent conversation (${homeShort(mirrored)}) — rendered from its transcript and kept in sync, so it is read-only here. Right-click it in Files to check for new exchanges or unfollow it.`,
+      canLoadFull: false,
+    };
+  }
   if (mirrored) {
     return {
       text: `Mirrored from ${mirrored} — kept in sync with the original there, so it is read-only here. Edit the original instead.`,
@@ -3239,7 +3262,8 @@ $('#btn-import').addEventListener('click', (ev) => {
     { label: folders ? 'Feishu documents or a wiki (import once)…' : 'Feishu documents — administrators only', disabled: !folders, run: () => importFeishuDoc('copy') },
     { label: folders ? 'Link Feishu documents or a wiki (keep in sync)…' : 'Link Feishu documents — administrators only', disabled: !folders, run: () => importFeishuDoc('link') },
     '-',
-    { label: 'Agent traces — Claude Code and Codex sessions', disabled: !mayUse('traces'), run: () => collectTraces() },
+    { label: folders ? 'Agent conversations — pick Claude Code and Codex sessions…' : 'Agent conversations — administrators only', disabled: !folders, run: () => openAgentConversations() },
+    { label: 'Agent traces — every Claude Code and Codex session, for Dream', disabled: !mayUse('traces'), run: () => collectTraces() },
   ]);
 });
 
@@ -3620,6 +3644,221 @@ $('#feishu-subpages').addEventListener('change', () => {
   paintFeishuPlan();
   paintFeishuButtons();
 });
+
+/* ------------------------- agent conversations --------------------------- */
+
+/**
+ * Pick Claude Code and Codex conversations to keep as dialogue (docs/design/24):
+ * search this machine's sessions, tick the ones wanted, import them once or
+ * follow them. The catalog shows every session's prompts, so this is an
+ * administrator's (the service puts it under `settings`); a followed copy is
+ * then checked, synced and unfollowed from its menu in Files.
+ */
+const agentConv = { selected: new Map(), rows: [], busy: false, seq: 0, timer: null };
+const AGENT_WORDS = { claude: 'Claude Code', codex: 'Codex' };
+
+function openAgentConversations() {
+  agentConv.selected.clear();
+  $('#agentconv-error').textContent = '';
+  $('#agentconv-follow').checked = true;
+  paintAgentConvButtons();
+  $('#agentconv-dialog').showModal();
+  loadAgentConversations();
+  setTimeout(() => $('#agentconv-q').focus(), 0);
+}
+
+async function loadAgentConversations() {
+  const seq = ++agentConv.seq;
+  const params = new URLSearchParams({ limit: '100' });
+  const q = $('#agentconv-q').value.trim();
+  if (q) params.set('q', q);
+  if ($('#agentconv-agent').value) params.set('agent', $('#agentconv-agent').value);
+  if ($('#agentconv-automated').checked) params.set('automated', '1');
+  const list = $('#agentconv-list');
+  if (!agentConv.rows.length) list.innerHTML = '<p class="hint">reading this machine\'s conversations…</p>';
+  try {
+    const res = await api(`/api/conversations/catalog?${params}`);
+    if (seq !== agentConv.seq) return;
+    agentConv.rows = res.conversations;
+    paintAgentConversations(res);
+  } catch (e) {
+    if (seq !== agentConv.seq) return;
+    list.innerHTML = '';
+    $('#agentconv-error').textContent = e.message;
+  }
+}
+
+const convKey = (c) => `${c.agent}:${c.id}`;
+
+function paintAgentConversations(res) {
+  const list = $('#agentconv-list');
+  if (!res.conversations.length) {
+    list.innerHTML = `<p class="hint">${$('#agentconv-q').value.trim() ? 'No conversation matches every word.' : 'No conversations found on this machine.'}${res.automatedHidden && !$('#agentconv-automated').checked ? ` ${fmtCount(res.automatedHidden, 'one-shot run')} by programs left out.` : ''}</p>`;
+    return;
+  }
+  const more = res.total > res.conversations.length ? `<p class="hint">${res.total - res.conversations.length} more — narrow the search to see them.</p>` : '';
+  list.innerHTML = res.conversations.map((c, n) => {
+    const held = c.followed;
+    const when = new Date(c.updatedAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+    const status = c.followed
+      ? `followed at <span class="mono">${esc(c.copy)}</span>`
+      : c.copy ? `imported before at <span class="mono">${esc(c.copy)}</span> — importing again brings it up to date` : '';
+    return `<div class="feishu-item${held ? ' held' : ''}" data-n="${n}">
+      <input type="checkbox" ${held ? 'disabled checked' : agentConv.selected.has(convKey(c)) ? 'checked' : ''} aria-label="${esc(c.title)}" />
+      <div><b>${esc(c.title)}</b>
+        <div class="hint">${esc(AGENT_WORDS[c.agent] || c.agent)} · ${esc(c.project || 'no project')} · ${fmtCount(c.exchanges, 'exchange')} · ${esc(when)}${c.automated ? ' · run by a program' : ''}</div>
+        ${c.named ? `<div class="hint prompt">${esc(c.firstPrompt)}</div>` : ''}
+        ${status ? `<div class="hint">${status}</div>` : ''}
+        <pre hidden></pre>
+      </div>
+      <button type="button" class="row-action" data-preview>Preview</button>
+    </div>`;
+  }).join('') + more;
+  list.querySelectorAll('.feishu-item').forEach((row) => {
+    const c = res.conversations[Number(row.dataset.n)];
+    const box = row.querySelector('input');
+    const toggle = (on) => {
+      if (c.followed) return;
+      if (on) agentConv.selected.set(convKey(c), { agent: c.agent, id: c.id, title: c.title });
+      else agentConv.selected.delete(convKey(c));
+      box.checked = on;
+      paintAgentConvButtons();
+    };
+    box.addEventListener('change', () => toggle(box.checked));
+    row.addEventListener('click', (ev) => {
+      if (ev.target.closest('input, button, pre')) return;
+      toggle(!box.checked);
+    });
+    row.querySelector('[data-preview]').addEventListener('click', (ev) => previewAgentConversation(c, row.querySelector('pre'), ev.currentTarget));
+  });
+}
+
+/** The Markdown an import would write, shown in the row (the first part of it). */
+async function previewAgentConversation(c, pre, button) {
+  if (!pre.hidden) {
+    pre.hidden = true;
+    button.textContent = 'Preview';
+    return;
+  }
+  button.disabled = true;
+  try {
+    const p = await api(`/api/conversations/preview?agent=${encodeURIComponent(c.agent)}&id=${encodeURIComponent(c.id)}`);
+    const body = p.markdown.slice(p.markdown.indexOf('\n---\n') + 5).trim();
+    pre.textContent = `→ ${p.dest} · ${(p.bytes / 1024).toFixed(1)} KB${p.redactions ? ` · ${fmtCount(p.redactions, 'secret')} redacted` : ''}\n\n${body.length > 6000 ? `${body.slice(0, 6000)}\n…` : body}`;
+    pre.hidden = false;
+    button.textContent = 'Hide';
+  } catch (e) {
+    toast(`preview failed: ${e.message}`, 5000);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function paintAgentConvButtons() {
+  const n = agentConv.selected.size;
+  const go = $('#btn-agentconv-go');
+  const verb = $('#agentconv-follow').checked ? 'Follow' : 'Import';
+  go.textContent = n ? `${verb} ${fmtCount(n, 'conversation')}` : verb;
+  go.disabled = agentConv.busy || n === 0;
+}
+
+async function runAgentConversationImport() {
+  const sessions = [...agentConv.selected.values()].map(({ agent, id }) => ({ agent, id }));
+  if (!sessions.length) return;
+  const mode = $('#agentconv-follow').checked ? 'follow' : 'copy';
+  agentConv.busy = true;
+  paintAgentConvButtons();
+  $('#agentconv-error').textContent = '';
+  try {
+    const res = await api('/api/conversations/import', { method: 'POST', body: JSON.stringify({ sessions, mode }) });
+    const ok = res.items.filter((i) => i.ok);
+    const failed = res.items.filter((i) => !i.ok);
+    if (failed.length) {
+      $('#agentconv-error').textContent = failed.map((i) => `${agentConv.selected.get(`${i.agent}:${i.id}`)?.title || i.id}: ${i.error}`).join(' · ');
+      for (const i of ok) agentConv.selected.delete(`${i.agent}:${i.id}`);
+      loadAgentConversations();
+    } else $('#agentconv-dialog').close();
+    // the folders above the first copy open with the tree drawn next
+    if (ok.length) reveal(parentDir(ok[0].result.dest));
+    await loadTree();
+    loadStats();
+    if (ok.length) {
+      if (!$('#agentconv-dialog').open) openFile(ok[0].result.dest);
+      toast(`${mode === 'follow' ? 'following' : 'imported'} ${fmtCount(ok.length, 'conversation')}${res.sync ? ` · ${res.sync.indexed} indexed` : ''}${mode === 'follow' ? ' — new exchanges are added as they come' : ''}`, 7000);
+    }
+  } catch (e) {
+    $('#agentconv-error').textContent = e.message;
+  } finally {
+    agentConv.busy = false;
+    if ($('#agentconv-dialog').open) paintAgentConvButtons();
+  }
+}
+
+$('#btn-agentconv-cancel').addEventListener('click', () => $('#agentconv-dialog').close());
+$('#agentconv-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  runAgentConversationImport();
+});
+$('#agentconv-q').addEventListener('input', () => {
+  clearTimeout(agentConv.timer);
+  agentConv.timer = setTimeout(loadAgentConversations, 250);
+});
+$('#agentconv-agent').addEventListener('change', loadAgentConversations);
+$('#agentconv-automated').addEventListener('change', loadAgentConversations);
+$('#agentconv-follow').addEventListener('change', paintAgentConvButtons);
+
+/** A followed conversation's menu → check now: its new exchanges, without waiting for it to go quiet. */
+async function syncAgentConversation(dest, force = false) {
+  toast(`checking ${dest} for new exchanges…`, 600000);
+  try {
+    const { results } = await api('/api/conversations/sync', { method: 'POST', body: JSON.stringify({ dest, force }) });
+    const r = results[0];
+    if (currentFile === dest) openFile(dest);
+    loadStats();
+    if (!r) toast('nothing to check');
+    else if (r.error) toast(`${dest}: ${r.error}`, 8000);
+    else if (r.written) toast(`${dest}: updated — ${fmtCount(r.exchanges, 'exchange')}`, 5000);
+    else toast(`${dest}: no new exchanges`, 4000);
+  } catch (e) {
+    toast(`check failed: ${e.message}`, 6000);
+  }
+}
+
+async function unfollowAgentConversation(node, removeFiles) {
+  const question = removeFiles
+    ? `Stop following this conversation and delete its copy at ${node.path}?\n\nIts knowledge is disposed (history stays in the ledger). The transcript itself is not touched.`
+    : `Stop following this conversation?\n\nThe copy at ${node.path} stays as an ordinary document and no longer gains new exchanges.`;
+  if (!confirm(question)) return;
+  try {
+    await api(`/api/conversations?dest=${encodeURIComponent(node.path)}&removeFiles=${removeFiles ? 1 : 0}`, { method: 'DELETE' });
+    if (removeFiles && currentFile === node.path) {
+      currentFile = null;
+      $('#file-path').textContent = '';
+      $('#file-view').innerHTML = '';
+      setFileNotice(null);
+      clearFileCitations();
+      $('#btn-edit').disabled = true;
+      $('#btn-delete').disabled = true;
+    }
+    await loadTree();
+    loadStats();
+    toast(removeFiles ? `unfollowed and removed ${node.path}` : `unfollowed ${node.path} — the copy stays as an ordinary document`, 5000);
+  } catch (e) {
+    toast(`unfollow failed: ${e.message}`, 5000);
+  }
+}
+
+/** Tasks → Agent conversations → Check now: every followed conversation, in the background. */
+async function checkConversationsNow(button) {
+  if (button) button.disabled = true;
+  try {
+    const res = await api('/api/conversations/sync', { method: 'POST', body: JSON.stringify({}) });
+    toast(res.started ? 'checking followed conversations for new exchanges — it shows under Tasks → Background' : res.links === 0 ? 'no conversations are followed' : 'a check is under way already', 5000);
+  } catch (e) {
+    toast(`check failed: ${e.message}`, 6000);
+  }
+  loadTasks();
+}
 
 async function syncFeishuDoc(dest, force = false) {
   toast(force ? `fetching ${dest} from Feishu again…` : `asking Feishu whether ${dest} was edited…`, 600000);
@@ -4961,15 +5200,28 @@ async function loadResearchJobs() {
       const what = `${esc(j.kind)} · ${esc(j.target ?? j.query ?? '')}`;
       const when = new Date(j.finishedAt ?? j.startedAt ?? j.createdAt).toLocaleString();
       const actions = [];
-      if (j.status === 'queued' || j.status === 'running') actions.push(`<button data-cancel="${esc(j.id)}">cancel</button>`);
-      if (j.status === 'failed' || j.status === 'cancelled') actions.push(`<button data-retry="${esc(j.id)}">retry</button>`);
+      // a study's pages are archived and removed with their study, on its page
+      const own = !j.payload?.study;
+      if (j.pause) actions.push(`<button data-act="resume">resume now</button>`);
+      if (j.status === 'queued' || j.status === 'running') actions.push(`<button data-act="cancel">cancel</button>`);
+      if (j.status === 'failed' || j.status === 'cancelled') actions.push(`<button data-act="retry">retry</button>`);
+      if (own && ['done', 'failed', 'cancelled'].includes(j.status)) actions.push(`<button data-act="archive" title="take it off this list; its page stays">archive</button>`);
+      if (own && (j.status === 'failed' || j.status === 'cancelled')) actions.push(`<button data-act="remove" title="remove the job and its session log">remove</button>`);
       actions.push(`<button data-log="${esc(j.id)}">log</button>`);
-      div.innerHTML = `<span class="jstatus ${esc(j.status)}">${esc(j.status)}</span>
+      div.innerHTML = `${j.pause ? pauseChip(j.pause) : `<span class="jstatus ${esc(j.status)}">${esc(j.status)}</span>`}
         <span>${what}${j.outputPath ? ` → ${pageLink(j.outputPath)}` : ''} <span class="hint mono">${when}${j.turns ? ` · ${j.turns} turns` : ''}${j.agent ? ` · ${esc(j.agent)}` : ''}</span></span>
         <span class="jactions">${actions.join('')}</span>
         ${j.error ? `<div class="jerr">${esc(j.error)}</div>` : ''}`;
-      div.querySelector('button[data-cancel]')?.addEventListener('click', async () => { await api(`/api/research/jobs/${j.id}/cancel`, { method: 'POST' }); loadResearchJobs(); });
-      div.querySelector('button[data-retry]')?.addEventListener('click', async () => { await api(`/api/research/jobs/${j.id}/retry`, { method: 'POST' }); loadResearchJobs(); });
+      div.querySelectorAll('button[data-act]').forEach((b) => b.addEventListener('click', async () => {
+        const act = b.dataset.act;
+        if (act === 'remove' && !confirm('Remove this job and its session log? A page it wrote stays.')) return;
+        try {
+          await api(`/api/research/jobs/${j.id}${act === 'remove' ? '' : `/${act}`}`, { method: act === 'remove' ? 'DELETE' : 'POST' });
+        } catch (e) {
+          toast(`${act}: ${e.message}`, 5000);
+        }
+        loadResearchJobs();
+      }));
       div.querySelector('button[data-log]')?.addEventListener('click', async () => {
         const full = await api(`/api/research/jobs/${j.id}?log=1`);
         const pre = document.createElement('pre');
@@ -7543,10 +7795,27 @@ $('#clear-workspace-form').addEventListener('submit', async (event) => {
 
 const STUDY_STEP_LABELS = { seed: 'Capture seed sources', collect: 'Collect material', index: 'Index what was collected', pages: 'Write the pages', report: 'Write the report' };
 const STUDY_LIVE = new Set(['queued', 'running', 'validating', 'waiting']);
-const study = { id: null, view: null, timer: null, options: null, busy: false };
+const study = { id: null, view: null, timer: null, options: null, busy: false, archived: false };
 
 const lines = (v) => String(v || '').split('\n').map((x) => x.trim()).filter(Boolean);
 const statusChip = (s) => `<span class="jstatus ${esc(s)}">${esc(s)}</span>`;
+
+const PAUSE_WORDS = { quota: 'usage limit', transient: 'agent busy', setup: 'agent not set up' };
+
+/** When a pause ends: the time today, else the day and time. */
+function pauseEnd(iso) {
+  const d = new Date(iso);
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+/** "paused until 01:32 · usage limit": a job that waits out a spent limit (docs/design/22), the agent's words on hover. */
+function pauseChip(pause) {
+  if (!pause) return '';
+  const why = PAUSE_WORDS[pause.kind] ?? '';
+  return `<span class="jstatus paused" title="${esc(pause.reason || '')}">paused until ${esc(pauseEnd(pause.until))}${why ? ` · ${esc(why)}` : ''}</span>`;
+}
 
 async function loadStudies() {
   await loadStudyOptions().catch((e) => toast(`research options: ${e.message}`));
@@ -7582,15 +7851,20 @@ async function loadStudyOptions() {
 
 async function loadStudyList() {
   const el = $('#study-items');
+  const toggle = $('#btn-study-archived');
+  toggle.setAttribute('aria-pressed', String(study.archived));
+  toggle.textContent = study.archived ? '← Studies' : 'Archived';
   try {
-    const rows = await api('/api/research/studies?limit=80');
+    const rows = await api(`/api/research/studies?limit=80${study.archived ? '&archived=1' : ''}`);
     if (!rows.length) {
-      el.innerHTML = '<p class="hint">No studies yet. Describe a topic on the right to start one.</p>';
+      el.innerHTML = study.archived
+        ? '<p class="hint">Nothing archived. Archive a finished study from its page to take it off the list.</p>'
+        : '<p class="hint">No studies yet. Describe a topic on the right to start one.</p>';
       return;
     }
     el.innerHTML = rows.map((r) => `<button type="button" class="study-item${r.id === study.id ? ' active' : ''}" data-study="${esc(r.id)}">
         <span class="study-item-title">${esc(r.title || r.topic)}</span>
-        <span class="study-item-meta">${statusChip(r.status)} <span class="hint">${esc(r.stage)} · ${esc(new Date(r.createdAt).toLocaleDateString())}${r.pages ? ` · ${r.pages} pages` : ''}</span></span>
+        <span class="study-item-meta">${r.pause ? pauseChip(r.pause) : statusChip(r.status)} <span class="hint">${esc(r.stage)} · ${esc(new Date(r.createdAt).toLocaleDateString())}${r.pages ? ` · ${r.pages} pages` : ''}</span></span>
       </button>`).join('');
     el.querySelectorAll('[data-study]').forEach((b) => b.addEventListener('click', () => openStudy(b.dataset.study)));
   } catch (e) {
@@ -7615,6 +7889,10 @@ function showComposer() {
 $('#btn-study-new').addEventListener('click', () => {
   showComposer();
   $('#study-topic').focus();
+});
+$('#btn-study-archived').addEventListener('click', () => {
+  study.archived = !study.archived;
+  loadStudyList();
 });
 $('#study-mode').addEventListener('change', () => {
   const deep = $('#study-mode').value === 'deep-research';
@@ -7923,12 +8201,16 @@ function renderStudy(view) {
   el.innerHTML = `<div class="study-card">
     <div class="study-head">
       <div><p class="section-index">STUDY · ${esc(job.id)}</p><h3 class="study-title">${esc(p.brief.title)}</h3>
-        <p class="hint">${statusChip(job.status)} ${esc(p.stage)} · ${runner} · web ${p.sources.web ? 'on' : 'off'}${job.startedAt ? ` · started ${esc(new Date(job.startedAt).toLocaleString())}` : ''}${job.finishedAt ? ` · finished ${esc(new Date(job.finishedAt).toLocaleString())}` : ''}</p>
-        ${job.error ? `<p class="jerr">${esc(job.error)}</p>` : ''}
+        <p class="hint">${statusChip(job.status)} ${esc(p.stage)} · ${runner} · web ${p.sources.web ? 'on' : 'off'}${job.startedAt ? ` · started ${esc(new Date(job.startedAt).toLocaleString())}` : ''}${job.finishedAt ? ` · finished ${esc(new Date(job.finishedAt).toLocaleString())}` : ''}${view.archivedAt ? ` · archived ${esc(new Date(view.archivedAt).toLocaleDateString())}` : ''}</p>
+        ${view.pause ? `<p class="hint">${pauseChip(view.pause)} — it goes on by itself then, from where it stopped. <span class="mono">${esc(view.pause.reason)}</span></p>` : job.error ? `<p class="jerr">${esc(job.error)}</p>` : ''}
       </div>
       <div class="study-head-actions">
+        ${view.pause ? '<button type="button" data-act="resume" title="the limit is lifted: run it now instead of when the pause ends">Resume now</button>' : ''}
         ${live ? '<button type="button" data-act="cancel">Cancel</button>' : ''}
         ${job.status === 'failed' || job.status === 'cancelled' ? '<button type="button" data-act="retry">Retry</button>' : ''}
+        ${!live && !view.archivedAt ? '<button type="button" data-act="archive" title="take it off the list; its report, pages and sources stay where they are">Archive</button>' : ''}
+        ${view.archivedAt ? '<button type="button" data-act="unarchive">Unarchive</button>' : ''}
+        ${job.status === 'failed' || job.status === 'cancelled' ? '<button type="button" data-act="remove" title="remove the study\'s jobs and session logs; what it wrote into the knowledge base stays">Remove</button>' : ''}
         ${tiers.pages.quarantined ? `<button type="button" data-act="promote-pages" title="mark the pages and the report trusted: their facts become the knowledge base's position">Promote pages (${tiers.pages.quarantined})</button>` : ''}
         ${tiers.sources.quarantined ? `<button type="button" data-act="promote-sources" title="mark the captured sources, the notes and the register trusted">Promote sources (${tiers.sources.quarantined})</button>` : ''}
         ${view.reportExists || view.pages.some((pg) => pg.status === 'done') ? `<a class="study-link" href="${esc(studyExportHref(job.id))}" target="_blank" rel="noopener" title="the report and its pages as one HTML file, its charts as figures: read it, save it, or print it to PDF">Export ↗</a>` : ''}
@@ -7939,7 +8221,7 @@ function renderStudy(view) {
       ${view.reportExists ? `<div class="rpage"><span><a href="#" data-open="${esc(view.reportPath)}">${esc(p.brief.report.title)}</a> <span class="hint mono">${esc(view.reportPath)}</span></span>${trustChip(view.reportTrust)}<span></span></div>` : `<p class="hint">${esc(view.reportPath)} — written once the pages are done.</p>`}
     </div>
     <div class="study-block"><h4>Pages</h4>
-      ${view.pages.map((pg) => `<div class="rpage"><span>${pg.status === 'done' ? `<a href="#" data-open="${esc(pg.path)}">${esc(pg.title)}</a>` : esc(pg.title)} <span class="hint mono">${esc(pg.path.split('/').pop())}${pg.warnings.length ? ` · ${pg.warnings.length} warnings` : ''}</span>${pg.error ? `<span class="jerr">${esc(pg.error.slice(0, 300))}</span>` : ''}</span>${trustChip(pg.trust)}${statusChip(pg.status)}</div>`).join('')}
+      ${view.pages.map((pg) => `<div class="rpage"><span>${pg.status === 'done' ? `<a href="#" data-open="${esc(pg.path)}">${esc(pg.title)}</a>` : esc(pg.title)} <span class="hint mono">${esc(pg.path.split('/').pop())}${pg.warnings.length ? ` · ${pg.warnings.length} warnings` : ''}</span>${pg.error ? `<span class="jerr">${esc(pg.error.slice(0, 300))}</span>` : ''}</span>${trustChip(pg.trust)}${pg.pause ? pauseChip(pg.pause) : statusChip(pg.status)}</div>`).join('')}
     </div>
     <div class="study-block"><h4>Sources <span class="hint">· ${view.captures.length} captured into the knowledge base${view.captures.length ? ` · ${sourcesTier(tiers.sources)}` : ''} · register ${pageLink(view.registerPath)}</span></h4>
       ${view.captures.length ? `<table class="study-table"><thead><tr><th>Title</th><th>Site</th><th>Published</th><th>Type</th><th>File</th></tr></thead><tbody>${view.captures.map((c) => `<tr>
@@ -7971,6 +8253,21 @@ function renderStudy(view) {
   el.querySelector('[data-act="retry"]')?.addEventListener('click', () => act('retry', async () => {
     await api(`/api/research/studies/${job.id}/retry`, { method: 'POST' });
     openStudy(job.id);
+    loadStudyList();
+  }));
+  for (const verb of ['resume', 'archive', 'unarchive']) {
+    el.querySelector(`[data-act="${verb}"]`)?.addEventListener('click', () => act(verb, async () => {
+      await api(`/api/research/studies/${job.id}/${verb}`, { method: 'POST' });
+      if (verb === 'archive') toast('Archived — the Archived list keeps it');
+      openStudy(job.id);
+      loadStudyList();
+    }));
+  }
+  el.querySelector('[data-act="remove"]')?.addEventListener('click', () => act('remove', async () => {
+    if (!confirm('Remove this study? Its jobs and session logs go; the pages, notes and sources it already wrote stay in the knowledge base.')) return;
+    const r = await api(`/api/research/studies/${job.id}`, { method: 'DELETE' });
+    toast(r.kept?.length ? `Removed — kept in the knowledge base: ${r.kept.length} file(s) and folders` : 'Removed', 4000);
+    showComposer();
     loadStudyList();
   }));
   for (const [sel, what] of [['[data-act="promote-pages"]', 'pages'], ['[data-act="promote-sources"]', 'sources']]) {

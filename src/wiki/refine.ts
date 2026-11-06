@@ -9,6 +9,7 @@ import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings
 import { writeDeps } from '../lineage/deps.js';
 import { LlmClient } from '../llm/client.js';
 import { CLAIM_TYPES } from '../graph/store.js';
+import { alikeWording, wordingOf } from '../graph/wording.js';
 import { Store } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
 import { ensureHotTopics, PagesContext, retireConceptClusterPages } from './pages.js';
@@ -240,7 +241,6 @@ async function auditClaims(store: Store, progress: (msg: string) => void, opts: 
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key)!.push(c);
   }
-  const tokenize = (s: string) => new Set(s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t.length >= 2));
   for (const group of groups.values()) {
     if (group.length < 2) continue;
     const hasFact = group.some((c) => c.status === 'fact');
@@ -258,14 +258,12 @@ async function auditClaims(store: Store, progress: (msg: string) => void, opts: 
     }
     // near-duplicate statements from different sources — possible divergence
     if (!opts.nearDuplicates) continue;
+    const wordings = group.map((c) => wordingOf(c.statement));
     for (let i = 0; i < group.length; i++) {
       for (let j = i + 1; j < group.length; j++) {
         const a = group[i], b = group[j];
         if (!a.primary_scope_id || a.primary_scope_id === b.primary_scope_id || a.statement === b.statement) continue;
-        const ta = tokenize(a.statement), tb = tokenize(b.statement);
-        const inter = [...ta].filter((t) => tb.has(t)).length;
-        const overlap = inter / Math.max(1, Math.min(ta.size, tb.size));
-        if (overlap >= 0.6) {
+        if (alikeWording(wordings[i], wordings[j]) !== null) {
           issues.push({
             title: `多来源相似断言待核对: ${a.subject}`,
             body: `不同文档对 "${a.subject}" 有相似但不一致的表述：\n- ${a.statement} (${a.path ?? '?'})\n- ${b.statement} (${b.path ?? '?'})\n可能是同一事实的不同版本，建议在 wiki 中统一。`,

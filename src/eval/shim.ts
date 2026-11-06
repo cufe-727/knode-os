@@ -7,8 +7,9 @@ import path from 'node:path';
 import type { LlmEffort, LlmSpeed } from '../config.js';
 import { estimateEmbeddingTokens } from '../ingest/embedding-tokens.js';
 import type { EmbeddingProvider } from '../ingest/embeddings.js';
-import { cliCommand, codexExecArgs, renderCliPrompt, runProcess } from '../llm/cli.js';
+import { cliCommand, codexExecArgs, renderCliPrompt, resolveExecutable, runProcess } from '../llm/cli.js';
 import type { ChatMessage, LlmClient } from '../llm/client.js';
+import { exitFailure, withCodexCatalog } from '../llm/codex-catalog.js';
 import { CallUsage, readCodexEvents } from '../llm/usage.js';
 import { isRefusal } from '../estimate/ledger.js';
 import { classifyFailure } from '../labeling/failures.js';
@@ -66,13 +67,15 @@ export class CodexBackend implements ChatBackend {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-codex-'));
     const outFile = path.join(cwd, 'reply.txt');
     try {
-      const args = codexExecArgs({ outFile, cwd, model: this.opts.model, effort: req.effort, speed: this.opts.speed });
-      if (req.schema) {
-        const schemaFile = path.join(cwd, 'schema.json');
-        fs.writeFileSync(schemaFile, JSON.stringify(req.schema));
-        args.splice(args.length - 1, 0, '--output-schema', schemaFile);
-      }
-      const r = await runProcess(cliCommand('codex-cli', this.opts.command ?? ''), args, renderCliPrompt(req.messages, req.json), this.opts.timeoutMs ?? 900_000);
+      const schemaFile = path.join(cwd, 'schema.json');
+      if (req.schema) fs.writeFileSync(schemaFile, JSON.stringify(req.schema));
+      const cmd = cliCommand('codex-cli', this.opts.command ?? '');
+      // the model catalog from a local copy (src/llm/codex-catalog.ts): a run can make a thousand calls an hour
+      const r = await withCodexCatalog(resolveExecutable(cmd), this.opts.model, (catalog) => {
+        const args = codexExecArgs({ outFile, cwd, model: this.opts.model, effort: req.effort, speed: this.opts.speed, catalog });
+        if (req.schema) args.splice(args.length - 1, 0, '--output-schema', schemaFile);
+        return runProcess(cmd, args, renderCliPrompt(req.messages, req.json), this.opts.timeoutMs ?? 900_000);
+      }, exitFailure);
       const events = readCodexEvents(r.stdout);
       const text = fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8').trim() : '';
       if (r.code !== 0 || !text) {

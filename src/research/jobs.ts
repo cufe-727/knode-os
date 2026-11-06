@@ -128,7 +128,11 @@ export async function getJob(store: Store, id: string): Promise<ResearchJob | nu
   return row ? project(row) : null;
 }
 
-export async function listJobs(store: Store, opts: { status?: ResearchStatus | ResearchStatus[]; kind?: ResearchKind; requestedBy?: string; study?: string; limit?: number } = {}): Promise<ResearchJob[]> {
+/**
+ * `archived`: false leaves archived jobs out (what the lists show), true lists
+ * only them; unset lists every job (what the queue and a study's own reads need).
+ */
+export async function listJobs(store: Store, opts: { status?: ResearchStatus | ResearchStatus[]; kind?: ResearchKind; requestedBy?: string; study?: string; archived?: boolean; limit?: number } = {}): Promise<ResearchJob[]> {
   const statuses = opts.status ? (Array.isArray(opts.status) ? opts.status : [opts.status]) : null;
   const params: unknown[] = [];
   const conds: string[] = [];
@@ -147,6 +151,7 @@ export async function listJobs(store: Store, opts: { status?: ResearchStatus | R
     params.push(opts.study);
     conds.push(`payload ->> 'study' = $${params.length}`);
   }
+  if (opts.archived !== undefined) conds.push(opts.archived ? `payload ? 'archivedAt'` : `NOT (payload ? 'archivedAt')`);
   params.push(opts.limit ?? 100);
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const rows = await store.query<Row>(`SELECT ${COLS} FROM research_jobs ${where} ORDER BY created_at DESC LIMIT $${params.length}`, params);
@@ -189,9 +194,12 @@ export async function updateJob(store: Store, id: string, patch: Partial<{
   return row ? project(row) : null;
 }
 
+/** SQL: the job is not waiting out a pause (`payload.pause.until`, docs/design/22). */
+export const NOT_PAUSED = `COALESCE((payload -> 'pause' ->> 'until')::timestamptz <= now(), true)`;
+
 /**
- * Atomically take the oldest queued job (null when the queue is empty).
- * `ownRunnerOnly`: only a job that names its own agent (a study's, in
+ * Atomically take the oldest queued job that is not paused (null when none
+ * is). `ownRunnerOnly`: only a job that names its own agent (a study's, in
  * `payload.runner.agent`) — what the loop may still run when research.agent
  * is not configured.
  */
@@ -199,10 +207,41 @@ export async function claimNextJob(store: Store, opts: { ownRunnerOnly?: boolean
   const own = opts.ownRunnerOnly ? `AND COALESCE(payload -> 'runner' ->> 'agent', '') <> ''` : '';
   const [row] = await store.query<Row>(
     `UPDATE research_jobs SET status = 'running', started_at = now(), attempts = attempts + 1
-     WHERE id = (SELECT id FROM research_jobs WHERE status = 'queued' ${own} ORDER BY created_at LIMIT 1)
+     WHERE id = (SELECT id FROM research_jobs WHERE status = 'queued' AND ${NOT_PAUSED} ${own} ORDER BY created_at LIMIT 1)
      RETURNING ${COLS}`,
   );
   return row ? project(row) : null;
+}
+
+/**
+ * Set or clear a job's pause without touching the rest of its payload (the
+ * runner may be writing it): `pause` null clears it.
+ */
+export async function setJobPause(store: Store, id: string, pause: Record<string, unknown> | null, opts: { onlyQueued?: boolean } = {}): Promise<boolean> {
+  const set = pause ? `payload = payload || jsonb_build_object('pause', $2::jsonb)` : `payload = payload - 'pause'`;
+  const rows = await store.query<{ id: string }>(
+    `UPDATE research_jobs SET ${set} WHERE id = $1${opts.onlyQueued ? ` AND status = 'queued'` : ''} RETURNING id`,
+    pause ? [id, JSON.stringify(pause)] : [id],
+  );
+  return rows.length > 0;
+}
+
+/** Archive (or bring back) finished jobs: they keep everything, and leave the lists. */
+export async function archiveJobs(store: Store, ids: string[], archived = true): Promise<string[]> {
+  if (ids.length === 0) return [];
+  const set = archived ? `payload = payload || jsonb_build_object('archivedAt', now())` : `payload = payload - 'archivedAt'`;
+  const rows = await store.query<{ id: string }>(
+    `UPDATE research_jobs SET ${set} WHERE id = ANY($1::text[]) AND status IN ('done', 'failed', 'cancelled') RETURNING id`,
+    [ids],
+  );
+  return rows.map((r) => r.id);
+}
+
+/** Remove finished jobs' rows (a run's files are the caller's to remove). */
+export async function deleteJobs(store: Store, ids: string[]): Promise<string[]> {
+  if (ids.length === 0) return [];
+  const rows = await store.query<{ id: string }>(`DELETE FROM research_jobs WHERE id = ANY($1::text[]) AND status IN ('done', 'failed', 'cancelled') RETURNING id`, [ids]);
+  return rows.map((r) => r.id);
 }
 
 export async function cancelJob(store: Store, id: string): Promise<boolean> {
@@ -213,19 +252,36 @@ export async function cancelJob(store: Store, id: string): Promise<boolean> {
   return rows.length > 0;
 }
 
-/** Put a failed / cancelled job back in the queue. */
+/** Put a failed / cancelled job back in the queue (out of the archive, with no pause left over). */
 export async function retryJob(store: Store, id: string): Promise<ResearchJob | null> {
   const [row] = await store.query<Row>(
-    `UPDATE research_jobs SET status = 'queued', error = NULL, finished_at = NULL WHERE id = $1 AND status IN ('failed', 'cancelled', 'done') RETURNING ${COLS}`,
+    `UPDATE research_jobs SET status = 'queued', error = NULL, finished_at = NULL, payload = payload - 'pause' - 'archivedAt'
+     WHERE id = $1 AND status IN ('failed', 'cancelled', 'done') RETURNING ${COLS}`,
     [id],
   );
   return row ? project(row) : null;
 }
 
-/** Jobs left 'running' by a crashed serve are queued again on startup. */
+/** A paused job runs at the next tick instead of at the end of its pause; the limit it waited on is no error now. */
+export async function resumeJob(store: Store, id: string): Promise<ResearchJob | null> {
+  const [row] = await store.query<Row>(`UPDATE research_jobs SET payload = payload - 'pause', error = NULL WHERE id = $1 AND status = 'queued' AND payload ? 'pause' RETURNING ${COLS}`, [id]);
+  return row ? project(row) : null;
+}
+
+/** Stops in a row a crashed serve may cost a job before they count as its attempts (a job that crashes it every time). */
+const FREE_INTERRUPTIONS = 3;
+
+/**
+ * Jobs left 'running' by a crashed serve are queued again on startup. The
+ * crash was no fault of theirs, so it costs no attempt — up to
+ * FREE_INTERRUPTIONS times, in case the job is what brings serve down.
+ */
 export async function requeueStale(store: Store): Promise<number> {
   const rows = await store.query<{ id: string }>(
-    `UPDATE research_jobs SET status = 'queued' WHERE status IN ('running', 'validating') RETURNING id`,
+    `UPDATE research_jobs SET status = 'queued',
+       attempts = CASE WHEN COALESCE((payload ->> 'interruptions')::int, 0) < ${FREE_INTERRUPTIONS} THEN GREATEST(attempts - 1, 0) ELSE attempts END,
+       payload = payload || jsonb_build_object('interruptions', COALESCE((payload ->> 'interruptions')::int, 0) + 1)
+     WHERE status IN ('running', 'validating') RETURNING id`,
   );
   return rows.length;
 }

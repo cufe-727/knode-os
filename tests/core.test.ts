@@ -249,10 +249,11 @@ echo -n '{"entities":[{"name":"PGlite","type":"technology"}]}' > "$out"
     expect(res.entities[0].name).toBe('PGlite');
   });
 
-  it('codex-cli: turns plugins and analytics off for a one-shot call', () => {
-    // with plugins on, every start downloads ChatGPT's whole plugin catalog (~15 MB)
+  it('codex-cli: turns plugins, apps and analytics off for a one-shot call', () => {
+    // with plugins on, every start downloads ChatGPT's whole plugin catalog (~15 MB); apps, the apps listing (~1 MB)
     const args = codexExecArgs({ outFile: '/tmp/out.txt', cwd: '/tmp', images: ['/tmp/page.png'] }).join(' ');
-    expect(args).toContain('--ignore-user-config --ephemeral -c features.plugins=false -c analytics.enabled=false');
+    expect(args).toContain('--ignore-user-config --ephemeral -c features.plugins=false -c features.apps=false -c analytics.enabled=false');
+    expect(args).not.toContain('model_catalog_json'); // no copy given (tests/codex-catalog.test.ts)
     expect(args).not.toContain('--disable'); // fails the call on a Codex that lacks the feature
     expect(args).toMatch(/--image \/tmp\/page\.png -$/);
   });

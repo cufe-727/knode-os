@@ -4,8 +4,9 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
-import { auditDuplicateClaims, claimPairId, ClaimRelation } from '../src/graph/claim-dedupe.js';
+import { auditDuplicateClaims, claimPairId, ClaimRelation, numbersOf, sameNumber, statementKey } from '../src/graph/claim-dedupe.js';
 import { auditDuplicateEntities, mergeSuggestionId } from '../src/graph/dedupe.js';
+import { alikeWording, wordingOf } from '../src/graph/wording.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import { sync } from '../src/ingest/sync.js';
 import { LlmClient } from '../src/llm/client.js';
@@ -324,6 +325,52 @@ describe('the claim audit\'s per-run judge limit', () => {
     const later = await run(embedder, realVectors());
     expect(later.stats).toMatchObject({ embedded: 2, candidates: 1 });
     expect(later.shown).toEqual([pairLabel(twins[0], twins[1])]);
+  });
+});
+
+describe('the claim audit\'s wording lookup', () => {
+  const dataDir = path.join(tmp, 'wording');
+  let ctx: AppContext;
+  // statements of one subject made of shared phrases, so that many pairs overlap partly and some are worded alike
+  const phrases = ['计划扩大海外产能', '重点布局东南亚市场', '海外收入占比提升', '毛利率同比改善', '研发投入持续增加', '计划回购股份', '提高分红比例', '新开十家门店', '产能利用率回升', '订单需求旺盛', '库存压力缓解', '净利润同比增长', 'HBM产品放量', 'AI服务器订单增加'];
+  const statements = (() => {
+    let seed = 7;
+    const rand = () => (seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31;
+    const pick = <T>(xs: T[]) => xs[Math.floor(rand() * xs.length)];
+    const byKey = new Map<string, string>();
+    while (byKey.size < 160) {
+      const parts = Array.from({ length: 1 + Math.floor(rand() * 4) }, () => pick(phrases));
+      if (rand() < 0.2) parts.push(`增长${pick([10, 20, 35])}%`);
+      const s = '庚公司' + parts.join(pick(['，', '', '、']));
+      byKey.set(statementKey(s), s);
+    }
+    return [...byKey.values()];
+  })();
+
+  beforeAll(async () => {
+    initDataDir(dataDir);
+    write(dataDir, 'raw/docs/geng.md', claimsDoc('庚公司', statements));
+    ctx = await createContext(dataDir);
+    await sync(ctx, { llmGraph: false });
+  });
+  afterAll(async () => {
+    await ctx?.datasources.closeAll();
+    await ctx?.store.close();
+  });
+
+  it('brings up every pair worded alike that comparing each claim with every other would', async () => {
+    let alike = 0;
+    let numbers = 0;
+    for (let i = 0; i < statements.length; i++) {
+      for (let j = i + 1; j < statements.length; j++) {
+        const [a, b] = [statements[i], statements[j]];
+        if (numbersOf(a).some((n) => numbersOf(b).some((m) => sameNumber(n, m)))) numbers++;
+        else if (alikeWording(wordingOf(a), wordingOf(b)) !== null) alike++;
+      }
+    }
+    expect(alike).toBeGreaterThan(500);
+    const stats = await auditDuplicateClaims({ store: ctx.store, embedder: ctx.embedder, config: ctx.config });
+    expect(stats.candidates).toBe(alike + numbers);
   });
 });
 

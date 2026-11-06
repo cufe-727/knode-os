@@ -261,7 +261,10 @@ function line(spec: WorkSpec, route: RouteSpec, call: PerCall, calls: number, co
   const seconds = capacity > 0 ? scale(call.seconds, calls / capacity) : null;
   const b = SPREAD.bytes[call.basis.transfer];
   const up = scale(range(b[0], 1, b[1]), call.bytesUp * calls);
-  const down = scale(range(b[0], 1, b[1]), call.bytesDown * calls);
+  // Codex's model catalog, where no copy is there yet: the first call of a day on each slot downloads it
+  const days = seconds ? Math.max(1, Math.ceil(seconds.expected / 86_400)) : 1;
+  const catalog = SERVICE_PROFILES[route.service].catalogBytes * Math.min(calls, Math.max(1, route.slots)) * days;
+  const down = add(scale(range(b[0], 1, b[1]), call.bytesDown * calls), range(0, catalog, catalog));
   // a remote worker's lease carries the messages and the flattened prompt; its answer comes back
   const relayBytes = route.remote ? { up: calls * (spec.promptBytes * 2 + 2_000), down: calls * (call.output * 3 + 1_000) } : { up: 0, down: 0 };
 

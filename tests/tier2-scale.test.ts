@@ -58,9 +58,11 @@ describe('the tier-2 pass at scale', () => {
       [['丙公司', '宁德时代', '宁德时代新能源科技']],
     );
     // claims about 丙公司 that share no wording and no figure, and four that do: two wordings
-    // of one plan (identical once normalized) and one revenue figure rounded two ways
+    // of one plan (identical once normalized) and one revenue figure rounded two ways. Each of
+    // the n has three characters of its own, so it shares only the bigrams of 丙公司 with another.
+    const own = (i: number) => String.fromCodePoint(...[0, 1, 2].map((k) => 0x4e00 + 3 * i + k));
     const statements = [
-      ...Array.from({ length: n }, (_, i) => `丙公司第${i}个项目进展顺利`),
+      ...Array.from({ length: n }, (_, i) => `丙公司${own(i)}`),
       '丙公司计划回购股份。', '丙公司 计划回购股份',
       '丙公司2025年营收36.19亿元', '丙公司全年收入36.2亿',
     ];
