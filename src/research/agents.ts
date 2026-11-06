@@ -39,14 +39,20 @@ export interface AgentDefinition {
   name: string;
   title: string;
   /**
-   * What actually runs it. 'claude-cli' | 'codex-cli' | 'cursor-cli': that CLI,
-   * from `cliPath`. Anything else runs the built-in deepagents loop on a model:
-   * 'default' follows the default LLM, a connection id pins one. Empty = not
-   * runnable, which the UI states.
+   * What actually runs it. 'claude-cli' | 'codex-cli' | 'cursor-cli' |
+   * 'opencode-cli': that CLI, from `cliPath`. Anything else runs the built-in
+   * deepagents loop on a model: 'default' follows the default LLM, a
+   * connection id pins one. Empty = not runnable, which the UI states.
    */
   executor: string;
   /** A CLI agent's executable, path or name. Empty = the CLI's own name on PATH. */
   cliPath: string;
+  /**
+   * opencode-cli only: the model connection OpenCode runs on — its endpoint,
+   * key and wire. '' or 'default' = the default LLM's connection. The other
+   * CLIs bring their own login and ignore it.
+   */
+  connection: string;
   /** Empty = the CLI's own default, or the connection's model. */
   model: string;
   effort: Effort;
@@ -64,6 +70,7 @@ function agent(patch: Partial<AgentDefinition> & Pick<AgentDefinition, 'name'>):
     title: patch.name,
     executor: 'default',
     cliPath: '',
+    connection: '',
     model: '',
     effort: 'default',
     speed: 'default',
@@ -95,8 +102,11 @@ function agentFile(dataDir: string, name: string): string {
 }
 
 export function agentYaml(definition: AgentDefinition): string {
-  const { path: _path, ...data } = definition;
-  return agentYamlText(data);
+  const { path: _path, connection, ...rest } = definition;
+  // only an opencode agent runs on a connection; the others' files stay as they were
+  if (!connection && definition.executor !== 'opencode-cli') return agentYamlText(rest);
+  const { name, title, executor, cliPath, ...after } = rest;
+  return agentYamlText({ name, title, executor, cliPath, connection, ...after });
 }
 
 /** Seed the built-ins once; a user edit is never overwritten. */
@@ -179,6 +189,7 @@ export function normalizeAgent(raw: Record<string, unknown>, name: string, fileP
     title: str(raw.title, base.title),
     executor: str(raw.executor, base.executor).trim(),
     cliPath: str(raw.cliPath, base.cliPath).trim(),
+    connection: str(raw.connection, base.connection).trim(),
     model: str(raw.model, base.model).trim(),
     effort: oneOf(raw.effort, EFFORTS, base.effort),
     speed: oneOf(raw.speed, SPEEDS, base.speed),

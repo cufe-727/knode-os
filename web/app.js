@@ -5874,12 +5874,14 @@ const providerNames = {
   'codex-cli': 'Codex CLI',
   'claude-cli': 'Claude Code CLI',
   'cursor-cli': 'Cursor Agent CLI',
+  'opencode-cli': 'OpenCode CLI',
 };
 
 const cliMeta = {
   'codex-cli': { command: 'codex exec', path: 'codex', note: 'Uses your existing Codex login in read-only one-shot mode.' },
   'claude-cli': { command: 'claude -p', path: 'claude', note: 'Uses your existing Claude Code login for one non-interactive turn.' },
   'cursor-cli': { command: 'cursor-agent -p', path: 'cursor-agent', note: 'Uses your existing Cursor Agent login in headless print mode.' },
+  'opencode-cli': { command: 'opencode run', path: 'opencode', note: 'Runs OpenCode headlessly on one of your model connections — its endpoint, key and model.' },
 };
 
 /**
@@ -6040,6 +6042,11 @@ function openModelPicker(anchor, input, spec) {
 function executorModelRoute(spec) {
   const agent = agentDrafts.find((a) => a.name === spec);
   if (agent) {
+    // OpenCode runs the models of its connection, so that endpoint lists them
+    if (agent.executor === 'opencode-cli') {
+      const connection = opencodeConnection(agent);
+      return connection ? { route: `connection:${connection.id}` } : { route: 'llm', provider: agent.executor, cliPath: agent.cliPath || '' };
+    }
     if (CLI_PROVIDERS.includes(agent.executor)) return { route: 'llm', provider: agent.executor, cliPath: agent.cliPath || '' };
     const endpoint = modelEndpoint(agent);
     return endpoint ? { route: `connection:${endpoint.id}` } : { route: 'llm' };
@@ -6097,7 +6104,7 @@ function agentTarget(agent) {
     id: agent.name,
     label: (agent.title || '').trim() || agent.name,
     provider: agent.executor,
-    model: agent.model || '',
+    model: agent.model || opencodeConnection(agent)?.model || '',
     cliPath: agent.cliPath || '',
     effort: agent.effort || 'default',
     agent: true,
@@ -6127,6 +6134,18 @@ function targetById(id) {
 function defaultConnection() {
   const targets = llmTargets();
   return targets.find((c) => c.id === llmUse) ?? targets[0] ?? null;
+}
+
+/**
+ * The connection an OpenCode agent runs on: the one it names, or the default
+ * while that is a model — the mirror of the service's `modelConnectionFor`.
+ * null for any other agent, or when there is no model to run on.
+ */
+function opencodeConnection(agent) {
+  if (agent.executor !== 'opencode-cli') return null;
+  // among the models only, never `defaultConnection()`: that lists the agents, this one included
+  const named = connectionById(agent.connection && agent.connection !== 'default' ? agent.connection : llmUse);
+  return named?.provider === 'openai' && named.baseUrl ? named : null;
 }
 
 /** The model a deepagents agent runs on: the one it pins, or the default while that is a model. */
@@ -6874,7 +6893,7 @@ const AGENT_EFFORTS = [
   ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max'], ['ultra', 'Ultra (codex)'],
 ];
 const AGENT_WEB = [['inherit', 'Follow review.external'], ['on', 'On (within review.external)'], ['off', 'Off']];
-const AGENT_TYPES = { 'claude-cli': 'Claude Code', 'codex-cli': 'Codex', 'cursor-cli': 'Cursor' };
+const AGENT_TYPES = { 'claude-cli': 'Claude Code', 'codex-cli': 'Codex', 'cursor-cli': 'Cursor', 'opencode-cli': 'OpenCode' };
 
 const isCliAgent = (agent) => CLI_PROVIDERS.includes(agent.executor);
 
@@ -6884,6 +6903,12 @@ function agentById(name) {
 
 /** Where an agent runs, by the names the tables use. */
 function agentRunsOn(agent) {
+  if (agent.executor === 'opencode-cli') {
+    const connection = opencodeConnection(agent);
+    if (!connection) return { name: 'No model connection', help: 'OpenCode has no login of its own: pick the connection it runs on.' };
+    const follows = !agent.connection || agent.connection === 'default';
+    return { name: connection.label || connection.id, note: follows ? 'follows default' : '', help: `OpenCode on ${connection.baseUrl}` };
+  }
   if (isCliAgent(agent)) {
     const command = cliMeta[agent.executor]?.path ?? agent.executor;
     return agent.cliPath ? { name: agent.cliPath, help: agent.cliPath } : { name: 'From PATH', help: `${command}, found on the service PATH` };
@@ -6902,11 +6927,19 @@ function agentModelSummary(agent) {
   if (agent.model) return { text: agent.model, help: agent.model, pinned: true };
   const endpoint = modelEndpoint(agent);
   if (endpoint?.model) return { text: endpoint.model, help: `Inherited from ${endpoint.label || endpoint.id}` };
+  const connection = opencodeConnection(agent);
+  if (connection?.model) return { text: connection.model, help: `Inherited from ${connection.label || connection.id}` };
   return { text: isCliAgent(agent) ? 'CLI default' : 'its own default', help: '' };
 }
 
 /** Why an agent cannot run, in words that say what to change; '' when it can. */
 function agentProblem(agent) {
+  if (agent.executor === 'opencode-cli') {
+    const connection = opencodeConnection(agent);
+    if (!connection) return 'OpenCode runs on a model connection — pick one for it.';
+    if (!connection.model && !agent.model) return `${connection.label || connection.id} has no model set.`;
+    return '';
+  }
   if (isCliAgent(agent)) return '';
   const endpoint = modelEndpoint(agent);
   if (agent.executor === 'default' && !endpoint) return 'deepagents runs on a model, and the default is a CLI agent — pick a model for it.';
@@ -6928,9 +6961,16 @@ function deepagentsFields(agent) {
 
 function cliFields(agent) {
   const cliOptions = CLI_PROVIDERS.map((p) => `<option value="${p}"${p === agent.executor ? ' selected' : ''}>${esc(providerNames[p])}</option>`).join('');
+  const opencode = agent.executor === 'opencode-cli';
+  const def = defaultConnection();
+  const follows = !agent.connection || agent.connection === 'default';
+  const connectionOptions = [`<option value="default"${follows ? ' selected' : ''}>Follow the default LLM${def ? ` · ${esc(def.label || def.id)}` : ''}</option>`]
+    .concat(connectionDrafts.filter((c) => c.provider === 'openai').map((c) => `<option value="${esc(c.id)}"${c.id === agent.connection ? ' selected' : ''}>${esc(c.label || c.id)}</option>`))
+    .join('');
   return `<div class="cfg-grid cfg-grid-2">
       <label>CLI<select data-field="executor">${cliOptions}</select></label>
-      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="Use CLI default" />${modelChevron(executorModelRoute(agent.name))}</span></label>
+      ${opencode ? `<label>Runs on<select data-field="connection">${connectionOptions}</select></label>` : ''}
+      <label>Model<span class="model-field"><input data-field="model" value="${esc(agent.model || '')}" placeholder="${esc(opencode ? opencodeConnection(agent)?.model || 'The connection\'s model' : 'Use CLI default')}" />${modelChevron(executorModelRoute(agent.name))}</span></label>
       <label>Reasoning effort<select data-field="effort">${optionList(AGENT_EFFORTS, agent.effort || 'default')}</select></label>
       <label>Web access<select data-field="web">${optionList(AGENT_WEB, agent.tools?.web ?? 'inherit')}</select></label>
       <label class="cfg-span-2">CLI executable<input data-field="cliPath" value="${esc(agent.cliPath || '')}" placeholder="Default: ${esc(cliMeta[agent.executor]?.path ?? '')} from PATH" /></label>
@@ -6997,7 +7037,8 @@ async function addAgent(runtime) {
   while (taken.has(`${base}-${suffix}`)) suffix += 1;
   const name = `${base}-${suffix}`;
   const def = defaultConnection();
-  const executor = cli ? runtime : def?.provider === 'openai' ? 'default' : (connectionDrafts[0]?.id ?? 'default');
+  const model = def?.provider === 'openai' ? 'default' : (connectionDrafts.find((c) => c.provider === 'openai')?.id ?? 'default');
+  const executor = cli ? runtime : model;
   try {
     await api(`/api/agents/${name}`, {
       method: 'PUT',
@@ -7005,6 +7046,8 @@ async function addAgent(runtime) {
         agent: {
           title: cli ? providerNames[runtime] : 'New deepagents agent',
           executor,
+          // OpenCode brings no login: it starts on the model deepagents would
+          ...(runtime === 'opencode-cli' ? { connection: model } : {}),
         },
       }),
     });
@@ -7050,6 +7093,7 @@ async function saveAgents() {
           title: (agent.title || '').trim() || agent.name,
           executor: agent.executor,
           cliPath: agent.cliPath ?? '',
+          connection: agent.connection ?? '',
           model: agent.model ?? '',
           effort: agent.effort ?? 'default',
           // set in the macOS app's effort chip; kept, not edited, here
@@ -7104,9 +7148,9 @@ $('#cfg-agents').addEventListener('change', (event) => {
     agent.tools = { ...agent.tools, web: event.target.value };
     return;
   }
-  if (field !== 'executor' && field !== 'effort') return;
+  if (field !== 'executor' && field !== 'effort' && field !== 'connection') return;
   agent[field] = event.target.value;
-  if (field === 'executor') {
+  if (field === 'executor' || field === 'connection') {
     renderAgents();
     fillRouteOptions();
     updateConfigSummaries();
@@ -7126,12 +7170,12 @@ $('#cfg-agents').addEventListener('click', (event) => {
 });
 
 /* ---------- Settings · research: pipeline, initialization, profile; and Ask's chat block ---------- */
-const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli'];
+const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli', 'opencode-cli'];
 const PROTOCOL_OPTIONS = [
   ['auto', 'Auto (Responses, else Chat)'], ['responses', 'Responses only'], ['chat', 'Chat Completions only'],
 ];
 const EFFORT_OPTIONS = [
-  ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (claude & codex; cursor → high)'], ['ultra', 'Ultra (codex; claude → max)'],
+  ['default', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (claude & codex; cursor, opencode → high)'], ['ultra', 'Ultra (codex; claude → max)'],
 ];
 const ROLE_PHASES = [
   ['plan', 'Plan · outline the page'], ['research', 'Research · one section'], ['synthesize', 'Synthesize · write the page'], ['review', 'Review · critique'], ['revise', 'Revise · fix issues'],

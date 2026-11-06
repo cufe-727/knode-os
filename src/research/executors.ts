@@ -1,4 +1,4 @@
-import { isCliProvider, KnodeConfig, llmProviderLabel } from '../config.js';
+import { bindAgentEndpoints, isCliProvider, KnodeConfig, llmProviderLabel } from '../config.js';
 import { cliToolStatus } from '../llm/models.js';
 import { AGENT_PROVIDERS, agentForSpec, DEFAULT_CONNECTION } from './agent.js';
 import { builtinAvailable } from './launch.js';
@@ -31,14 +31,16 @@ export async function availableAgents(config: KnodeConfig): Promise<AvailableAge
 
   for (const provider of AGENT_PROVIDERS) {
     const tool = onPath.get(provider);
+    // OpenCode has no login: bare, it runs only on what an opencode agent names
+    const unbound = provider === 'opencode-cli' && !agentForSpec(config, provider);
     agents.push({
       id: provider,
       kind: 'cli',
       label: `${llmProviderLabel(provider)} · from PATH`,
-      available: Boolean(tool?.path),
+      available: Boolean(tool?.path) && !unbound,
       command: tool?.command,
       path: tool?.path ?? null,
-      ...(tool?.path ? {} : { reason: `${tool?.command ?? provider} was not found on the service PATH` }),
+      ...(!tool?.path ? { reason: `${tool?.command ?? provider} was not found on the service PATH` } : unbound ? { reason: 'OpenCode runs on a model connection: add an OpenCode agent that names one' } : {}),
     });
   }
 
@@ -60,17 +62,18 @@ export async function availableAgents(config: KnodeConfig): Promise<AvailableAge
     agents.push(asBuiltin(connection.id, connection.label || connection.id, Boolean(connection.model && connection.baseUrl)));
   }
   // the CLI agents in playbooks/agents/, each with the path it pins, if any
-  for (const cli of config.agentLlms ?? []) {
+  for (const cli of bindAgentEndpoints(config.agentLlms ?? [], config.connections ?? [], config.llmUse)) {
     const tool = onPath.get(cli.provider);
     const resolved = cli.cliPath || tool?.path;
+    const unbound = cli.provider === 'opencode-cli' && !cli.baseUrl;
     agents.push({
       id: cli.id,
       kind: 'cli',
       label: `${cli.label || cli.id} · ${llmProviderLabel(cli.provider)}`,
-      available: Boolean(resolved),
+      available: Boolean(resolved) && !unbound,
       command: cli.cliPath || tool?.command,
       path: resolved ?? null,
-      ...(resolved ? {} : { reason: `${tool?.command ?? cli.provider} was not found on the service PATH` }),
+      ...(!resolved ? { reason: `${tool?.command ?? cli.provider} was not found on the service PATH` } : unbound ? { reason: 'this OpenCode agent names no model connection' } : {}),
     });
   }
   return agents;

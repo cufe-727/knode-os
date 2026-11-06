@@ -5,15 +5,17 @@ import { CLI_COMMANDS, completeViaCli } from '../cli.js';
 
 /**
  * The built-in coding-agent CLI providers (`codex-cli`, `claude-cli`,
- * `cursor-cli`): one non-interactive turn of a locally installed CLI, on its
- * own login (src/llm/cli.ts). They work without a model — the CLI's default
- * is used — so a configuration is always enabled.
+ * `cursor-cli`, `opencode-cli`): one non-interactive turn of a locally
+ * installed CLI, on its own login (src/llm/cli.ts) — or, for OpenCode, on the
+ * connection its agent names. The login CLIs work without a model — the CLI's
+ * default is used — so a configuration is always enabled; an OpenCode one
+ * only with an endpoint to run on.
  */
 class CliBackend implements LlmBackend {
   constructor(private readonly cfg: LlmConfig) {}
 
   get enabled(): boolean {
-    return true;
+    return this.cfg.provider !== 'opencode-cli' || Boolean(this.cfg.baseUrl);
   }
 
   /** "codex-cli", or "claude-cli:opus" with a model. */
@@ -31,6 +33,7 @@ const NOTES: Record<CliProvider, string> = {
   'codex-cli': 'Uses your existing Codex login in read-only one-shot mode (`codex exec`).',
   'claude-cli': 'Uses your existing Claude Code login for one non-interactive turn (`claude -p`).',
   'cursor-cli': 'Uses your existing Cursor Agent login in headless print mode (`cursor-agent -p`).',
+  'opencode-cli': 'Runs OpenCode headlessly (`opencode run`) on the model connection its agent names: that endpoint, key and model.',
 };
 
 export function cliProviders(): LlmProviderPlugin[] {

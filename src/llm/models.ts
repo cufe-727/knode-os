@@ -82,6 +82,15 @@ export async function listChatModels(cfg: LlmConfig): Promise<ModelListResult> {
   if (cfg.provider === 'command') {
     return { ok: true, source: 'builtin', models: [], note: 'A command takes any model name: it is passed through as `model` in the request and as $KNODE_LLM_MODEL.' };
   }
+  if (cfg.provider === 'opencode-cli') {
+    // OpenCode runs the models of the connection it names, so that endpoint is what lists them
+    if (!cfg.baseUrl) return { ok: true, source: 'builtin', models: [], note: 'Pick the connection this OpenCode agent runs on to list its models.' };
+    try {
+      return await listOpenAiModels(cfg.baseUrl, cfg.apiKey);
+    } catch (e) {
+      return { ok: false, source: 'api', models: [], error: message(e) };
+    }
+  }
   if (!isCliProvider(cfg.provider)) {
     return plugin
       ? { ok: true, source: 'builtin', models: [], note: `${plugin.label} lists no models — type a model id.` }

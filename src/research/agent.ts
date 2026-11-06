@@ -1,10 +1,10 @@
-import { isCliProvider, KnodeConfig, LlmConfig, llmTargets, LlmProtocol } from '../config.js';
+import { isCliProvider, KnodeConfig, LlmConfig, llmTargets, LlmProtocol, modelConnectionFor } from '../config.js';
 import { AgentDefinition, loadAgent } from './agents.js';
 
 /** The coding-agent CLIs a session can be launched on. */
-export type AgentProvider = 'claude-cli' | 'codex-cli' | 'cursor-cli';
+export type AgentProvider = 'claude-cli' | 'codex-cli' | 'cursor-cli' | 'opencode-cli';
 
-export const AGENT_PROVIDERS: AgentProvider[] = ['claude-cli', 'codex-cli', 'cursor-cli'];
+export const AGENT_PROVIDERS: AgentProvider[] = ['claude-cli', 'codex-cli', 'cursor-cli', 'opencode-cli'];
 
 /** The in-process executor's stable name — what `actor:` and the page's `agent:` record. */
 export const BUILTIN_AGENT = 'deep-agents';
@@ -12,12 +12,25 @@ export const BUILTIN_AGENT = 'deep-agents';
 /** What ran a session, as recorded on a phase, a transcript or a page. */
 export type ExecutorId = AgentProvider | typeof BUILTIN_AGENT;
 
+/**
+ * The model endpoint a CLI runs on when it brings no login of its own
+ * (opencode-cli): a connection's URL, key and wire.
+ */
+export interface CliEndpoint {
+  baseUrl: string;
+  /** Kept in its raw `env:VAR` form; resolved only into the process environment, never logged. */
+  apiKey: string;
+  protocol?: LlmProtocol;
+}
+
 /** One coding-agent CLI, launched headlessly once per session. */
 export interface CliAgent {
   kind: 'cli';
   provider: AgentProvider;
   cliPath: string;
   model: string;
+  /** opencode-cli: the connection it loops on. The other CLIs log in themselves and carry none. */
+  endpoint?: CliEndpoint;
 }
 
 /** An in-process agent loop driven by an OpenAI-compatible endpoint. */
@@ -49,7 +62,18 @@ export function withModel(agent: ResearchAgent, model: string): ResearchAgent {
 /** The spec that names the default LLM connection (section 01) rather than a named one. */
 export const DEFAULT_CONNECTION = 'default';
 
+/** What an opencode agent row carries of its connection, or null when it has none to run on. */
+function endpointOf(cfg: Pick<LlmConfig, 'baseUrl' | 'apiKey' | 'protocol'> | null | undefined): CliEndpoint | null {
+  return cfg?.baseUrl ? { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, protocol: cfg.protocol } : null;
+}
+
 function fromLlm(cfg: LlmConfig, model: string): ResearchAgent | null {
+  if (cfg.provider === 'opencode-cli') {
+    // OpenCode is a loop without a model: no connection, or none with a model, nothing to run
+    const endpoint = endpointOf(cfg);
+    const chosen = model || cfg.model;
+    return endpoint && chosen ? { kind: 'cli', provider: 'opencode-cli', cliPath: cfg.cliPath, model: chosen, endpoint } : null;
+  }
   if ((AGENT_PROVIDERS as string[]).includes(cfg.provider)) {
     return { kind: 'cli', provider: cfg.provider as AgentProvider, cliPath: cfg.cliPath, model: model || cfg.model };
   }
@@ -74,6 +98,8 @@ function fromLlm(cfg: LlmConfig, model: string): ResearchAgent | null {
  *   'default'          → the default LLM, whatever kind it is
  *   <connection id>    → the built-in agent on that model endpoint
  *   'claude-cli' | 'codex-cli' | 'cursor-cli' → that CLI, found on PATH
+ *   'opencode-cli'     → OpenCode, borrowing the path, model and connection of
+ *                        an opencode agent (it has no login of its own)
  *
  * There is deliberately no bare 'deep-agents' spec: a CLI name is meaningful on
  * its own, but a built-in agent without an endpoint is not an executor.
@@ -111,15 +137,30 @@ export function resolveAgentSpec(config: KnodeConfig, spec: string, model = '', 
   if (dataDir) {
     const definition = loadAgent(dataDir, wanted);
     if (definition) {
-      const agent = isCliProvider(definition.executor)
-        ? // a CLI agent carries its own path; it borrows nothing from anyone
-          { kind: 'cli' as const, provider: definition.executor, cliPath: definition.cliPath, model: model || definition.model }
-        : builtinOnly(bareAgentFor(config, definition.executor, model || definition.model));
+      const agent = definition.executor === 'opencode-cli'
+        ? opencodeAgent(config, definition, model)
+        : isCliProvider(definition.executor)
+          ? // a CLI agent carries its own path; it borrows nothing from anyone
+            { kind: 'cli' as const, provider: definition.executor, cliPath: definition.cliPath, model: model || definition.model }
+          : builtinOnly(bareAgentFor(config, definition.executor, model || definition.model));
       return agent ? { agent, definition } : null;
     }
   }
   const agent = bareAgentFor(config, wanted, model);
   return agent ? { agent, definition: null } : null;
+}
+
+/**
+ * An opencode agent: its own path, on the model connection it names (the
+ * default LLM's when it names none), with that connection's model unless it
+ * pins one. Not runnable without a model endpoint — OpenCode has no login.
+ */
+function opencodeAgent(config: KnodeConfig, definition: Pick<AgentDefinition, 'connection' | 'cliPath' | 'model'>, model: string): CliAgent | null {
+  const connection = modelConnectionFor(config.connections ?? [], definition.connection, config.llmUse ?? '');
+  const endpoint = endpointOf(connection);
+  const chosen = model || definition.model || connection?.model || '';
+  if (!endpoint || !chosen) return null;
+  return { kind: 'cli', provider: 'opencode-cli', cliPath: definition.cliPath, model: chosen, endpoint };
 }
 
 /**
@@ -146,6 +187,7 @@ function bareAgentFor(config: KnodeConfig, spec: string, model: string): Researc
   if (connection) return fromLlm(connection, model);
   if ((AGENT_PROVIDERS as string[]).includes(wanted)) {
     const same = config.llm.provider === wanted ? config.llm : targets.find((c) => c.provider === wanted);
+    if (wanted === 'opencode-cli') return same ? fromLlm(same, model) : null;
     return { kind: 'cli', provider: wanted as AgentProvider, cliPath: same?.cliPath ?? '', model: model || same?.model || '' };
   }
   return null;

@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { cliCommand, cliFailureText, CODEX_SERVICES_OFF, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess, speedFor } from '../llm/cli.js';
 import { catalogArgs, codexCatalog, configuredCodexModel, withCodexCatalog } from '../llm/codex-catalog.js';
-import { AgentProvider, CliAgent, ResearchAgent } from './agent.js';
+import { externalDirs, opencodeConfig, OpencodeAgentConfig, opencodeEffort, opencodeEnv, opencodeModelRef, OpencodeRule, opencodeRunArgs, readOpencodeStream } from '../llm/opencode.js';
+import { AgentProvider, CliAgent, CliEndpoint, ResearchAgent } from './agent.js';
 import { Effort, Freshness, NativeAgentSpec, Speed } from './profile.js';
 import type { ExtraMcpServer } from './sources.js';
 import { McpEndpoint, RunWorkspace } from './workspace.js';
@@ -15,7 +16,8 @@ import { McpEndpoint, RunWorkspace } from './workspace.js';
  * read roots are mounted read-only, and the agent has no write or shell tool
  * (pages travel back through `knode_write`). Kept in one place because CLI
  * flags drift between releases; `GET /api/config/cli-tools` reports what is
- * installed.
+ * installed. OpenCode takes all of it — its model connection included — as one
+ * generated config in its environment (`opencodeSessionConfig`).
  *
  * The built-in agent is not a process, so its recipe lives in `deepagents.ts`
  * and is loaded lazily; `launchSession` dispatches on the agent kind. Both
@@ -201,7 +203,7 @@ export function extraToolNames(servers: ExtraMcpServer[] | undefined): string[] 
   return (servers ?? []).flatMap((s) => (s.tools.length ? s.tools.map((t) => `mcp__${s.id}__${t}`) : [`mcp__${s.id}__*`]));
 }
 
-/** An environment variable name for one secret of one source's server (codex reads headers and env from the environment). */
+/** An environment variable name for one secret of one source's server (codex and opencode read headers and env from the environment). */
 function secretVar(id: string, key: string, i: number): string {
   return `KNODE_SRC_${id.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}_${i}_${key.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}`.slice(0, 100);
 }
@@ -365,12 +367,125 @@ export function writeCodexAgentLayers(cwd: string, agents: NativeAgentSpec[], fr
 /** A session that is going to be spawned as a process — the only kind `sessionArgs` can describe. */
 export type CliSessionInput = Omit<SessionInput, 'agent'> & { agent: CliAgent };
 
+/** How OpenCode names an MCP server's tools: `<server>_<tool>`, each with anything but [A-Za-z0-9_-] as `_`. */
+function opencodeToolName(server: string, tool: string): string {
+  const clean = (v: string) => v.replace(/[^a-zA-Z0-9_-]/g, '_');
+  return `${clean(server)}_${clean(tool)}`;
+}
+
+/**
+ * OpenCode substitutes `{env:…}` and `{file:…}` anywhere in its config text,
+ * so a role prompt that happened to quote one would be rewritten — or fail
+ * the load on a file that is not there. A space keeps it as written.
+ */
+function opencodeLiteral(text: string): string {
+  return text.replace(/\{(env|file):/g, '{ $1:');
+}
+
+/** knode's tools a session may call, as OpenCode rules: all of them for a writer, the read set otherwise. */
+function opencodeKnodeRules(write: boolean): Record<string, OpencodeRule> {
+  if (write) return { 'knode-os_*': 'allow' };
+  return {
+    'knode-os_*': 'deny',
+    ...Object.fromEntries(READ_TOOLS.map((t) => [opencodeToolName('knode-os', t.replace(/^mcp__knode-os__/, '')), 'allow' as const])),
+  };
+}
+
+/**
+ * What a session (or one of its native roles) may do, as OpenCode
+ * permissions. Everything is denied first — shell and edits never come back
+ * — then knode's tools, the read tools over the run workspace and the read
+ * roots (`external_directory`), and the web fetch when web tools are on. The
+ * last matching rule wins, so the order here is the precedence.
+ */
+function opencodePermission(opts: { write: boolean; files: boolean; web: boolean; readDirs: string[]; extraMcp?: ExtraMcpServer[]; roles?: string[] }): Record<string, OpencodeRule> {
+  const rules: Record<string, OpencodeRule> = { '*': 'deny' };
+  if (opts.files) {
+    for (const tool of ['read', 'grep', 'glob', 'list']) rules[tool] = 'allow';
+    rules.external_directory = externalDirs(opts.readDirs);
+  }
+  if (opts.web) {
+    // websearch only exists on OpenCode's own provider or with Exa; webfetch works on any model
+    rules.webfetch = 'allow';
+    rules.websearch = 'allow';
+  }
+  rules.todowrite = 'allow';
+  if (opts.roles?.length) rules.task = { '*': 'deny', ...Object.fromEntries(opts.roles.map((id) => [id, 'allow' as const])) };
+  Object.assign(rules, opencodeKnodeRules(opts.write));
+  for (const server of opts.extraMcp ?? []) {
+    if (!server.tools.length) rules[`${opencodeToolName(server.id, '')}*`] = 'allow';
+    else for (const tool of server.tools) rules[opencodeToolName(server.id, tool)] = 'allow';
+  }
+  return rules;
+}
+
+/**
+ * The MCP servers of a session as OpenCode config: knode's, with the bearer
+ * token read from `KNODE_MCP_TOKEN`, then the sources'. Their header and
+ * environment values are read from the variables `codexExtraMcpArgs` puts in
+ * the session's environment, so no secret sits in the config.
+ *
+ * OpenCode gives an MCP request 5 s unless told otherwise; a capture fetches
+ * and converts a whole filing, so every server gets five minutes, as codex does.
+ */
+function opencodeMcp(mcp: McpEndpoint, extra: ExtraMcpServer[] | undefined): Record<string, unknown> {
+  const servers: Record<string, unknown> = {
+    'knode-os': { type: 'remote', url: mcp.url, headers: { Authorization: 'Bearer {env:KNODE_MCP_TOKEN}', ...mcp.headers }, oauth: false, timeout: 300_000 },
+  };
+  for (const s of extra ?? []) {
+    if (s.url) {
+      const headers = Object.fromEntries(Object.keys(s.headers ?? {}).map((h, i) => [h, `{env:${secretVar(s.id, h, i)}}`]));
+      servers[s.id] = { type: 'remote', url: s.url, headers, oauth: false, timeout: 300_000 };
+    } else if (s.command) {
+      const environment = Object.fromEntries(Object.keys(s.env ?? {}).map((k) => [k, `{env:${k}}`]));
+      servers[s.id] = { type: 'local', command: [s.command, ...(s.args ?? [])], environment, timeout: 300_000 };
+    }
+  }
+  return servers;
+}
+
+/**
+ * A session's whole OpenCode config: the agent's connection as the `knode`
+ * provider, knode's MCP endpoint and the sources', the permissions, the turn
+ * cap on the `build` agent it runs as, and each native role as a sub-agent
+ * the `task` tool may start — with its own prompt, model (on the same
+ * connection), effort and tools.
+ */
+export function opencodeSessionConfig(input: CliSessionInput, endpoint: CliEndpoint): Record<string, unknown> {
+  const roles = input.agents ?? [];
+  const files = input.files !== false;
+  const agent: Record<string, OpencodeAgentConfig> = {
+    build: input.maxTurns > 0 ? { steps: input.maxTurns } : {},
+  };
+  for (const role of roles) {
+    const effort = opencodeEffort(role.effort);
+    agent[role.id] = {
+      description: opencodeLiteral(role.description || role.title || role.id),
+      mode: 'subagent',
+      prompt: opencodeLiteral(role.prompt),
+      ...(role.model ? { model: opencodeModelRef(role.model) } : {}),
+      ...(effort ? { reasoningEffort: effort } : {}),
+      permission: opencodePermission({ write: role.write, files: role.files, web: role.web && Boolean(input.allowNetwork), readDirs: input.readDirs, extraMcp: input.extraMcp }),
+    };
+  }
+  return opencodeConfig({
+    endpoint,
+    model: input.agent.model,
+    extraModels: roles.map((r) => r.model),
+    effort: input.effort,
+    permission: opencodePermission({ write: input.tools === 'write', files, web: Boolean(input.allowNetwork), readDirs: input.readDirs, extraMcp: input.extraMcp, roles: roles.map((r) => r.id) }),
+    mcp: opencodeMcp(input.mcp, input.extraMcp),
+    agent: agent.build.steps || roles.length ? agent : undefined,
+  });
+}
+
 /**
  * The argv a session is launched with (exported so tests and `research export`
  * can print it). `catalog`: the copy of Codex's model catalog a codex session
- * reads instead of downloading it (src/llm/codex-catalog.ts).
+ * reads instead of downloading it (src/llm/codex-catalog.ts). `env`: variables
+ * the process needs on top of the session's (OpenCode's generated config).
  */
-export function sessionArgs(input: CliSessionInput, catalog: string | null = null): { cmd: string; args: string[]; stdin: string; outFile?: string } {
+export function sessionArgs(input: CliSessionInput, catalog: string | null = null): { cmd: string; args: string[]; stdin: string; outFile?: string; env?: Record<string, string> } {
   const { provider, cliPath, model } = input.agent;
   const cmd = cliCommand(provider, cliPath);
   const files = input.files !== false;
@@ -464,6 +579,17 @@ export function sessionArgs(input: CliSessionInput, catalog: string | null = nul
       stdin: '',
     };
   }
+  if (provider === 'opencode-cli') {
+    const endpoint = input.agent.endpoint;
+    if (!endpoint?.baseUrl) throw new Error('opencode-cli runs on a model connection and this agent names none — pick one for it (Settings → Providers & Agents)');
+    if (!model) throw new Error('opencode-cli needs a model — set one on the agent or on its connection');
+    return {
+      cmd,
+      args: opencodeRunArgs(model, `knode ${input.label}`),
+      stdin: input.prompt,
+      env: opencodeEnv(opencodeSessionConfig(input, endpoint), endpoint),
+    };
+  }
   // every CLI is spelled out above, so a new one is a compile error rather than a cursor session
   throw new Error(`no launch recipe for ${String(provider satisfies never)}`);
 }
@@ -539,7 +665,7 @@ async function launchCliSession(input: CliSessionInput): Promise<SessionResult> 
   const stderrPath = stderrPathFor(input.cwd, input.label);
   // one run of the CLI; a repeat (codex refused its catalog copy) writes both files anew
   const run = async (catalog: string | null): Promise<ProcessResult> => {
-    const { args, stdin } = sessionArgs(input, catalog);
+    const { args, stdin, env } = sessionArgs(input, catalog);
     const out = fs.openSync(transcriptPath, 'w');
     const errOut = fs.openSync(stderrPath, 'w');
     // a no-op default: the assignment happens inside onSpawn, which TS's flow analysis cannot see
@@ -547,7 +673,7 @@ async function launchCliSession(input: CliSessionInput): Promise<SessionResult> 
     try {
       return await runProcess(cmd, args, stdin, input.timeoutMs, {
         cwd: input.cwd,
-        env: sessionEnv(input),
+        env: { ...sessionEnv(input), ...env },
         onStdout: (chunk) => fs.writeSync(out, chunk),
         onStderr: (chunk) => fs.writeSync(errOut, chunk),
         onSpawn: (c) => {
@@ -586,6 +712,16 @@ async function launchCliSession(input: CliSessionInput): Promise<SessionResult> 
   } else if (provider === 'codex-cli') {
     result.text = outFile && fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8').trim() : '';
     if (res.code !== 0) result.error = `codex exec exited with code ${res.code}: ${codexFailure(res.stderr, res.stdout)}`;
+  } else if (provider === 'opencode-cli') {
+    const parsed = readOpencodeStream(res.stdout);
+    result.text = parsed.text;
+    result.turns = parsed.steps || null;
+    result.costUsd = parsed.costUsd || null;
+    // like claude's, a failed run's text is no answer
+    if (parsed.error || res.code !== 0) {
+      result.error = `opencode: ${(parsed.error || cliFailureText(res.stderr, res.stdout, 300) || `exited with code ${res.code}`).slice(0, 300)}`;
+      result.text = '';
+    }
   } else {
     const parsed = readCursorStream(res.stdout);
     result.text = parsed.text;
@@ -644,7 +780,7 @@ export function codexFailure(stderr: string, stdout: string): string {
 }
 
 /** The argv of the single-session run (kept for `research export`). */
-export function launchArgs(input: LaunchInput & { agent: CliAgent }): { cmd: string; args: string[]; stdin: string; outFile?: string } {
+export function launchArgs(input: LaunchInput & { agent: CliAgent }): ReturnType<typeof sessionArgs> {
   return sessionArgs({ ...sessionFrom(input), agent: input.agent, prompt: fs.readFileSync(input.ws.briefPath, 'utf8') });
 }
 
