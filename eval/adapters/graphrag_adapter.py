@@ -98,8 +98,16 @@ def build(req):
     log(f"indexing {len(docs)} documents")
     r = subprocess.run([str(BIN), "index", "--root", str(root)], text=True, capture_output=True, env=_env())
     if r.returncode != 0:
-        raise RuntimeError(f"graphrag index failed ({r.returncode}): {(r.stderr or r.stdout)[-1500:]}")
+        raise RuntimeError(f"graphrag index failed ({r.returncode}): {_failure(root, r)}")
     return {"documents": len(docs), **_counts(root)}
+
+
+def _failure(root: Path, r: subprocess.CompletedProcess) -> str:
+    """Why `graphrag index` stopped: the first error its log names (the warnings it
+    prints afterwards fill its stderr's tail), then that tail."""
+    f = root / "logs" / "indexing-engine.log"
+    errors = [line for line in f.read_text(encoding="utf-8", errors="replace").splitlines() if " - ERROR - " in line] if f.exists() else []
+    return (errors[0][:600] + "\n" if errors else "") + (r.stderr or r.stdout)[-1200:]
 
 
 def _counts(root: Path) -> dict:
