@@ -19,13 +19,15 @@ import { CallUsage } from './usage.js';
  *   - permissions, MCP servers and agents, which a research session sets and
  *     a one-shot call leaves at "deny everything".
  *
- * Checked against OpenCode 1.19.4 (2026-10-22): `run --format json` prints
+ * Written against OpenCode 1.19.4's source and run against that release
+ * (2026-11-06, docs/design/06 open item 8): `run --format json` prints
  * one JSON event per line — `step_start`, `text` (a finished text part),
  * `tool_use` (a finished tool call), `step_finish` (that step's tokens and
  * cost), `reasoning`, `error` — and exits 1 when the session errored. A
  * permission that would ask is rejected in `run` mode, so a denied tool fails
  * the call instead of hanging. Piped stdin is appended to the message, which
- * is how the prompt travels.
+ * is how the prompt travels. Only the main session's events are printed, so
+ * a sub-agent's steps and tokens never reach knode.
  */
 
 /** The provider id the generated config defines; models are `knode/<model>`. */

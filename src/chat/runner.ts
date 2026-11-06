@@ -195,7 +195,9 @@ export function opencodeActivity(transcript: string): ChatEvent[] {
       continue;
     }
     if (ev.type !== 'tool_use' || typeof ev.part?.tool !== 'string') continue;
-    const { summary, path: p } = summarize(ev.part.state?.input);
+    // OpenCode's own file tools name their file `filePath`
+    const input = ev.part.state?.input as Record<string, unknown> | undefined;
+    const { summary, path: p } = summarize(input && typeof input.filePath === 'string' && input.path === undefined ? { ...input, path: input.filePath } : input);
     events.push({ tool: ev.part.tool.replace(/^knode-os_/, ''), summary, ...(p ? { path: p } : {}), ok: ev.part.state?.status === 'completed' });
   }
   return events;

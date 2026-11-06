@@ -104,6 +104,9 @@ describe('opencode: reading `run --format json`', () => {
     expect(parsed.error).toBeUndefined();
     expect(parsed.usage).toEqual({ inputTokens: 100 + 900 + 50 + 10 + 1000, cachedInputTokens: 1900, cacheWriteTokens: 50, outputTokens: 20 + 5 + 30, reasoningTokens: 5, costUsd: 0.01 });
     expect(opencodeActivity(lines)).toEqual([{ tool: 'knode_search', summary: '宁德时代', ok: true }]);
+    // OpenCode's read tool, as the real CLI reports it
+    const read = JSON.stringify({ type: 'tool_use', part: { type: 'tool', tool: 'read', state: { status: 'error', input: { filePath: '/data/raw/docs/a.md' } } } });
+    expect(opencodeActivity(read)).toEqual([{ tool: 'read', summary: '/data/raw/docs/a.md', path: '/data/raw/docs/a.md', ok: false }]);
   });
 
   it('surfaces an error event with its message', () => {
