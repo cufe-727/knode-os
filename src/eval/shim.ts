@@ -160,6 +160,11 @@ class ReplyCache {
   }
 }
 
+/** The vector cache's key for a text under an embedding identity. */
+export function vectorKey(model: string, text: string): string {
+  return crypto.createHash('sha256').update(`${model}|${text}`).digest('hex');
+}
+
 /**
  * Vectors by text, shared by every system so the shared embedding pool embeds
  * each text once per run. They are kept as the Float32 they are stored as: a
@@ -228,7 +233,7 @@ export class MeteredEmbedder implements EmbeddingProvider {
   }
 
   async embedAs(tag: MeterTag, texts: string[]): Promise<number[][]> {
-    const keys = texts.map((t) => crypto.createHash('sha256').update(`${this.inner.model}|${t}`).digest('hex'));
+    const keys = texts.map((t) => vectorKey(this.inner.model, t));
     const missing = [...new Set(keys.filter((k) => !this.cache.get(k)))];
     if (missing.length) {
       const byKey = new Map(keys.map((k, i) => [k, texts[i]]));

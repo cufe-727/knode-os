@@ -1,22 +1,28 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import type { Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { serve } from '@hono/node-server';
+import { Hono } from 'hono';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { LlmClient } from '../src/llm/client.js';
 import { leakedPaths, pathTokens } from '../src/eval/agent.js';
 import { Meter, parseTag, formatTag } from '../src/eval/meter.js';
-import { loadPack, stageCorpus, validatePack } from '../src/eval/pack.js';
+import { docText, loadPack, stageCorpus, validatePack } from '../src/eval/pack.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { buildReportData, writeReport } from '../src/eval/report.js';
 import { runEval } from '../src/eval/run.js';
 import { fileLines, RunStore } from '../src/eval/runstore.js';
-import { ChatBackend, ChatRequest, decodeVector, retryableFailure, startShim } from '../src/eval/shim.js';
+import { ChatBackend, ChatRequest, decodeVector, retryableFailure, startShim, VectorCache, vectorKey } from '../src/eval/shim.js';
 import { retrievalScores } from '../src/eval/metrics/retrieval.js';
 import { bootstrapMean, holm, pairedBootstrap, wilson } from '../src/eval/metrics/stats.js';
 import { characteristicTerms, directions, profileText } from '../src/eval/metrics/stylometry.js';
 import { exactMatch, extractFinalAnswer, stripMarkers, tokenF1 } from '../src/eval/metrics/text.js';
+import { checkEndpoint, endpointUnder } from '../src/eval/endpoint.js';
 import { EmbeddingBudget, QuotaGuard } from '../src/eval/quota.js';
+import { chunkDocs } from '../src/eval/retrieval.js';
 import { byFileName } from '../src/eval/systems/external.js';
 import { llmWikiBuild } from '../src/eval/systems/llm-wiki.js';
 import { citationsIn } from '../src/eval/prompts.js';
@@ -391,4 +397,42 @@ describe('a run on the fixture pack', () => {
     expect(backend.calls).toBe(calls);
     expect(judge.calls).toBe(judged);
   }, 120_000);
+});
+
+describe("an embedding endpoint of the run's own", () => {
+  it('embeds under the identity once it reproduces the vectors the run holds, and is refused otherwise', async () => {
+    const dir = path.join(tmp, 'endpoint-pack');
+    buildFixturePack(dir);
+    const pack = loadPack(dir);
+    // a text's vector, or a different model's: half its coordinates flipped
+    let other = false;
+    const vector = (text: string) => [...crypto.createHash('sha256').update(text).digest().subarray(0, 8)].map((b, i) => (b - 127.5) * (other && i % 2 ? -1 : 1));
+    const app = new Hono();
+    app.post('/v1/embeddings', async (c) => {
+      const body = (await c.req.json()) as { input: string[] };
+      return c.json({ data: body.input.map((t, index) => ({ index, embedding: vector(t) })) });
+    });
+    let server: Server;
+    const port = await new Promise<number>((resolve) => {
+      server = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' }, (info) => resolve(info.port)) as Server;
+    });
+    try {
+      const identity = { model: 'pool:fake:8:l2-v1', dimensions: 8, embed: async (): Promise<number[][]> => { throw new Error('the pool is not called'); } };
+      const held = new VectorCache(null);
+      for (const c of chunkDocs(pack.docs.map((d) => ({ path: d.path, text: docText(pack, d.path) })))) held.put(vectorKey(identity.model, c.text), vector(c.text));
+      const embedder = endpointUnder(identity, `http://127.0.0.1:${port}/v1`);
+      expect(embedder.model).toBe(identity.model);
+      const check = await checkEndpoint(embedder, held, [pack]);
+      expect(check.texts).toBeGreaterThanOrEqual(5);
+      expect(check.lowest).toBeGreaterThan(0.9999);
+      // what comes back is a unit vector, as a pool's is
+      const [v] = await embedder.embed(['anything']);
+      expect(Math.hypot(...v)).toBeCloseTo(1, 6);
+      other = true;
+      await expect(checkEndpoint(embedder, held, [pack])).rejects.toThrow(/does not reproduce pool:fake:8:l2-v1/);
+      await expect(checkEndpoint(embedder, new VectorCache(null), [pack])).rejects.toThrow(/only 0 texts/);
+    } finally {
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+    }
+  });
 });

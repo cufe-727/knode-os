@@ -10,6 +10,7 @@ import { LlmClient } from '../llm/client.js';
 import { Judge } from './judge.js';
 import { Meter } from './meter.js';
 import { dirBytes, listFiles, loadPack, LoadedPack, packsDir, runsDir, seededKey, stageCorpus, StagedCorpus, stageUpdate, validatePack } from './pack.js';
+import { checkEndpoint, endpointUnder } from './endpoint.js';
 import { citationsIn, taskPrompt } from './prompts.js';
 import { EmbeddingBudget, QuotaGuard } from './quota.js';
 import { recordKey, RunMeta, RunStore } from './runstore.js';
@@ -45,6 +46,12 @@ export interface RunOptions {
   chatConnection?: string;
   /** The model every system builds and answers with ('' = Codex's default, or the connection's). */
   model?: string;
+  /**
+   * An OpenAI-compatible embedding endpoint (a local bge-m3, say) that embeds in
+   * place of the workspace's embedder, under its identity, once it reproduces the
+   * vectors the run holds (`checkEndpoint`).
+   */
+  embeddingEndpoint?: string;
   buildEffort?: LlmEffort;
   answerEffort?: LlmEffort;
   /** Judge: a CLI provider ('claude-cli') and model. */
@@ -155,10 +162,11 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   });
 
   const workspaceConfig = opts.configFrom ? loadConfig(opts.configFrom) : null;
-  const embedder = opts.overrides?.embedder
+  const configured = opts.overrides?.embedder
     ?? (opts.embedding === 'local' || !workspaceConfig
       ? createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false })
       : createConfiguredEmbeddingProvider(workspaceConfig));
+  const embedder = opts.embeddingEndpoint ? endpointUnder(configured, opts.embeddingEndpoint) : configured;
   const backend = opts.overrides?.chat ?? (opts.chatConnection ? connectionBackend(workspaceConfig, opts.chatConnection, opts.model) : new CodexBackend({ model: opts.model }));
   const judgeClient = opts.overrides?.judge ?? new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 });
   const judge = new Judge({ client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
@@ -208,6 +216,11 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       for (const w of issues.warnings) store.log('pack warning', { pack: pack.manifest.id, warning: w });
       return pack;
     });
+    if (opts.embeddingEndpoint) {
+      const check = await checkEndpoint(embedder, shim.vectors, packs);
+      progress(`embedding on ${opts.embeddingEndpoint} as ${embedder.model}: ${check.texts} texts the run holds came back at cosine ${check.lowest.toFixed(5)} or more`);
+      store.log('embedding endpoint', { url: opts.embeddingEndpoint, identity: embedder.model, ...check });
+    }
     const runPack = async (pack: LoadedPack) => {
       const staged = stageCorpus(pack, { fraction, seed });
       loaded.push({ pack, staged });
