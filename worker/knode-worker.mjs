@@ -11,8 +11,9 @@
 //     --workspace admin/finance --backends codex:2,cursor:2
 //
 // Backends (slots after the colon):
-//   codex   codex exec, read-only sandbox, ~/.codex/config.toml ignored, plugins and analytics off
-//           (--codex-model, --codex-effort, --codex-speed)
+//   codex   codex exec, read-only sandbox, ~/.codex/config.toml ignored, plugins, apps and analytics off,
+//           Codex's model catalog read from a local copy (--codex-model, --codex-effort, --codex-speed,
+//           --codex-catalog-hours: how long a copy lasts, default 24, 0 = download it on every call)
 //   cursor  cursor-agent -p in ask mode (--cursor-model)
 //   claude  claude -p, one turn (--claude-model, --claude-effort)
 //   api     an OpenAI-compatible /chat/completions endpoint (--api-base-url, --api-model;
@@ -224,6 +225,131 @@ function scratch() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'knode-worker-'));
 }
 
+/* ------------------------ codex's model catalog ------------------------- */
+// A copy of src/llm/codex-catalog.ts. Every codex exec downloads Codex's whole model catalog as it starts (650 KB,
+// once or twice a call; it changes about once a day), so a call reads it from a local copy instead, passed as
+// -c model_catalog_json. The copy is Codex's own cache ($CODEX_HOME/models_cache.json) — its whole model list —
+// taken after a call without a copy, if Codex wrote it in the last ten minutes, for this binary's version, with
+// the call's model in it. It belongs to one binary (real path, size, mtime) and model, lasts --codex-catalog-hours
+// (default 24; 0 = off) and lives in ~/.knode-os/codex-catalog (KNODE_CODEX_CATALOG_DIR). A copy Codex cannot read
+// is dropped and the call repeated once without it.
+
+const catalogHours = (() => {
+  const v = args.codexCatalogHours ?? process.env.KNODE_CODEX_CATALOG_HOURS;
+  const h = v === undefined || String(v).trim() === '' ? NaN : Number(v);
+  return Number.isFinite(h) && h >= 0 ? h : 24;
+})();
+const catalogDir = process.env.KNODE_CODEX_CATALOG_DIR || path.join(os.homedir(), '.knode-os', 'codex-catalog');
+const codexVersions = new Map(); // binary stamp → Promise<last word of `codex --version`>
+const sha = (text) => crypto.createHash('sha256').update(text).digest('hex');
+
+function which(bin) {
+  const candidates = bin.includes('/') ? [path.resolve(bin)] : (process.env.PATH ?? '').split(path.delimiter).filter(Boolean).map((d) => path.join(d, bin));
+  for (const c of candidates) {
+    try {
+      fs.accessSync(c, fs.constants.X_OK);
+      if (fs.statSync(c).isFile()) return c;
+    } catch {
+      // keep looking
+    }
+  }
+  return null;
+}
+
+/** Where the copy for this binary and model lives, or null (no model named, copies off, binary not found). */
+function codexCatalog(bin, model) {
+  if (!model || catalogHours <= 0) return null;
+  const found = which(bin);
+  if (!found) return null;
+  try {
+    const real = fs.realpathSync(found);
+    const st = fs.statSync(real, { bigint: true });
+    const stamp = sha(`${real}\0${st.size}\0${st.mtimeNs}`).slice(0, 16);
+    return { real, stamp, model, file: path.join(catalogDir, `codex-models-${stamp}-${sha(model).slice(0, 8)}.json`) };
+  } catch {
+    return null;
+  }
+}
+
+function pinnedCatalog(catalog) {
+  if (!catalog) return null;
+  try {
+    const age = Date.now() - fs.statSync(catalog.file).mtimeMs;
+    return age > -1000 && age < catalogHours * 3_600_000 ? catalog.file : null;
+  } catch {
+    return null;
+  }
+}
+
+function codexVersion(real) {
+  return new Promise((resolve) => {
+    let out = '';
+    const child = spawn(real, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const timer = setTimeout(() => child.kill('SIGKILL'), 30_000);
+    child.stdout.on('data', (d) => (out += d));
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const words = out.trim().split(/\s+/).filter(Boolean);
+      resolve(code === 0 && words.length ? words[words.length - 1] : null);
+    });
+  });
+}
+
+/** After a call without a copy: copy Codex's cache if it is usable. */
+async function refreshCatalog(catalog) {
+  if (!catalog) return;
+  let cache;
+  try {
+    const source = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'models_cache.json');
+    if (Date.now() - fs.statSync(source).mtimeMs > 600_000) return;
+    cache = JSON.parse(fs.readFileSync(source, 'utf8'));
+  } catch {
+    return;
+  }
+  const models = cache?.models;
+  if (!Array.isArray(models) || !models.some((m) => m?.slug === catalog.model)) return;
+  if (!codexVersions.has(catalog.stamp)) codexVersions.set(catalog.stamp, codexVersion(catalog.real));
+  const version = await codexVersions.get(catalog.stamp);
+  if (!version) codexVersions.delete(catalog.stamp);
+  if (!version || cache.client_version !== version) return;
+  // a temp file and a rename: other slots may be starting codex with this copy right now
+  const partial = `${catalog.file}.${process.pid}-${crypto.randomUUID().slice(0, 8)}.part`;
+  try {
+    fs.mkdirSync(catalogDir, { recursive: true });
+    fs.writeFileSync(partial, JSON.stringify({ models }));
+    fs.renameSync(partial, catalog.file);
+  } catch (err) {
+    fs.rmSync(partial, { force: true });
+    log(`codex model catalog not saved: ${err.message}`);
+    return;
+  }
+  // copies long past their lifetime (another binary's or model's), and temp files a crashed writer left
+  const keep = Math.max(2 * catalogHours, catalogHours + 1) * 3_600_000;
+  for (const name of fs.readdirSync(catalogDir)) {
+    if (!name.startsWith('codex-models-')) continue;
+    try {
+      const age = Date.now() - fs.statSync(path.join(catalogDir, name)).mtimeMs;
+      if (age > (name.endsWith('.part') ? 3_600_000 : keep)) fs.rmSync(path.join(catalogDir, name), { force: true });
+    } catch {
+      // gone already
+    }
+  }
+  log(`codex model catalog saved for ${catalogHours} h: ${models.length} models for ${catalog.model}, codex ${version}`);
+}
+
+/** Whether a failed call failed because of its copy: Codex could not parse it (dropped) or it was gone. */
+function catalogRejected(file, stderr) {
+  if (stderr.includes('model_catalog_json')) {
+    fs.rmSync(file, { force: true });
+    return true;
+  }
+  return !fs.existsSync(file);
+}
+
 /* --------------------------------- usage --------------------------------- */
 // What a call used, as its CLI or endpoint reported it (a copy of src/llm/usage.ts): every token read — cache
 // reads and writes included — as inputTokens, every token written, reasoning included, as outputTokens. It goes
@@ -320,19 +446,33 @@ const BACKENDS = {
       const out = path.join(dir, 'answer.txt');
       const ws = path.join(dir, 'workspace');
       fs.mkdirSync(ws);
+      const catalog = codexCatalog(this.bin(), model ? String(model) : '');
+      let pinned = pinnedCatalog(catalog);
       try {
-        // plugins on would download ChatGPT's whole plugin catalog (~15 MB) on every call; analytics
-        // on uploads ~0.65 MB of metrics at exit. `-c`, unlike --disable, is ignored by a Codex without them.
+        // plugins on would download ChatGPT's whole plugin catalog (~15 MB) on every call, apps on the apps
+        // listing (~1 MB); analytics on uploads ~0.65 MB of metrics at exit. `-c`, unlike --disable, is ignored
+        // by a Codex without them. The model catalog comes from the local copy when there is one (above).
         // --json prints the turn's token usage; the answer still comes from --output-last-message.
-        const argv = [
-          'exec', '--ignore-user-config', '--ephemeral', '-c', 'features.plugins=false', '-c', 'analytics.enabled=false',
+        const argv = () => [
+          'exec', '--ignore-user-config', '--ephemeral', '-c', 'features.plugins=false', '-c', 'features.apps=false',
+          '-c', 'analytics.enabled=false', ...(pinned ? ['-c', `model_catalog_json=${JSON.stringify(pinned)}`] : []),
           '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', ws, '--output-last-message', out, '--json',
+          ...(model ? ['--model', String(model)] : []),
+          ...(effort ? ['-c', `model_reasoning_effort="${effort}"`] : []),
+          ...(speed ? ['-c', `service_tier="${speed}"`] : []),
+          '-',
         ];
-        if (model) argv.push('--model', String(model));
-        if (effort) argv.push('-c', `model_reasoning_effort="${effort}"`);
-        if (speed) argv.push('-c', `service_tier="${speed}"`);
-        argv.push('-');
-        const r = await run(this.bin(), argv, task.prompt, ws);
+        let r;
+        for (;;) {
+          try {
+            r = await run(this.bin(), argv(), task.prompt, ws);
+          } finally {
+            if (!pinned) await refreshCatalog(catalog);
+          }
+          if (!pinned || r.code === 0 || !catalogRejected(pinned, r.stderr)) break;
+          log(`codex could not read the saved model catalog, calling without it: ${tail(r.stderr, '')}`);
+          pinned = null;
+        }
         const events = readCodexEvents(r.stdout);
         if (events.usage) report(events.usage);
         if (r.code !== 0) throw new Error(`codex exec exited with code ${r.code}: ${events.error ?? tail(r.stderr, r.stdout)}`);

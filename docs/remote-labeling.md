@@ -82,12 +82,17 @@ Without `workers`, the Extract stage's own route runs with `extraction.concurren
 only hands that work to remote workers. Judge calls run on the Judge stage's route, `review.concurrency` at a time
 (default 2); 0 leaves them to remote workers. Saving settings
 (`PUT /api/config`) takes effect within a minute. No restart is needed. Codex runs as
-`codex exec --ignore-user-config --ephemeral -c features.plugins=false -c analytics.enabled=false` for every
-pipeline call, so your `~/.codex/config.toml` (MCP servers, memory, default model) stays out of extraction
-prompts. It also keeps tens of thousands of sessions out of `~/.codex/sessions`. Plugins are on by default
-even without that file. Left on, every call would first download ChatGPT's whole plugin catalog (about
-15 MB, ten times the call itself) and start the servers of the plugins on your account. Analytics would
-upload about 0.65 MB of usage metrics as each call exits. `--json` makes Codex print each turn's token usage.
+`codex exec --ignore-user-config --ephemeral -c features.plugins=false -c features.apps=false -c analytics.enabled=false`
+for every pipeline call, so your `~/.codex/config.toml` (MCP servers, memory, default model) stays out of extraction
+prompts. It also keeps tens of thousands of sessions out of `~/.codex/sessions`. Plugins and ChatGPT apps are on by
+default even without that file. Left on, every call would first download ChatGPT's whole plugin catalog (about
+15 MB, ten times the call itself), start the servers of the plugins on your account and fetch the apps listing
+(0.6–1 MB). Analytics would upload about 0.65 MB of usage metrics as each call exits. Codex's model catalog,
+which every Codex process downloads as it starts (about 650 KB, once or twice a call), comes from a local copy
+(`-c model_catalog_json=<copy>`): Codex's own cache, copied after a call made without one, kept per codex binary
+and model in `~/.knode-os/codex-catalog` (`KNODE_CODEX_CATALOG_DIR`) and renewed after a day
+(`KNODE_CODEX_CATALOG_HOURS`; 0 turns copies off). A one-word call took ↓58 KB ↑37 KB this way, against
+↓1.34 MB ↑47 KB before (Codex 0.166, 2026-11-06). `--json` makes Codex print each turn's token usage.
 
 **What each call used.** Every answer, from a local slot or a remote worker, is measured: the time from lease to
 answer, the prompt and reply sizes, and the token count the CLI or endpoint reported (Codex's `turn.completed`,
@@ -188,6 +193,10 @@ KNODE_TOKEN=knr_… OPENAI_API_KEY=… node knode-worker.mjs --server https://kn
 
 node knode-worker.mjs … --check     # what the token may do, what the server offers, the queues, which CLIs are installed
 ```
+
+A `codex` backend runs Codex the way the server does (plugins, apps and analytics off) and keeps its own copy of
+Codex's model catalog in `~/.knode-os/codex-catalog` on its machine (`--codex-catalog-hours`, default 24; 0 downloads
+the catalog on every call). A worker downloaded before 2026-11-06 lacks both: download it again.
 
 At start, and whenever a lease answer says it changed, the worker reads `GET …/work/config`: the kinds this token
 may take here, how long a lease lasts, the shares, and **hints** — how the server itself runs each kind on codex,
