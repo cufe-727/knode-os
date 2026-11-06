@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
+import { CODEX_SERVICES_OFF, resolveExecutable } from '../llm/cli.js';
+import { ANY_MODEL, catalogArgs, withCodexCatalog } from '../llm/codex-catalog.js';
 
 /**
  * Codex's own account of a plan's limits, and what a task would take of them
@@ -88,13 +90,20 @@ const accountCache = new Map<string, { at: number; value: Promise<CodexAccount> 
 
 /**
  * Read the account through `codex app-server`, at most once a minute per
- * executable. Plugins and analytics are off for it as for a one-shot call
- * (src/llm/cli.ts): reading two numbers must not download a plugin catalog.
+ * executable. Plugins, apps and analytics are off for it as for a one-shot
+ * call (src/llm/cli.ts): reading two numbers must not download a plugin
+ * catalog. Nor Codex's model catalog: the app-server downloads all 650 KB of
+ * it as it starts, and was killed mid-download once the account answered (at
+ * about 2.4 s; the catalog finished at 4.3 s, measured 2026-11-06). Any local
+ * copy of this binary's catalog serves (src/llm/codex-catalog.ts), since a
+ * read names no model; with one, the read took ↓19 KB and fetched no catalog.
  */
 export function readCodexAccount(command = 'codex', opts: { timeoutMs?: number; fresh?: boolean } = {}): Promise<CodexAccount> {
   const cached = accountCache.get(command);
   if (cached && !opts.fresh && Date.now() - cached.at < ACCOUNT_TTL_MS) return cached.value;
-  const value = queryAppServer(command, opts.timeoutMs ?? 20_000).then((account) => {
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  // a failed read throws, with the app-server's stderr on the error
+  const value = withCodexCatalog(resolveExecutable(command), ANY_MODEL, (catalog) => queryAppServer(command, timeoutMs, catalog), () => null).then((account) => {
     rememberAccount(account);
     return account;
   });
@@ -107,9 +116,9 @@ type Json = Record<string, unknown>;
 const obj = (v: unknown): Json => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Json) : {});
 const finite = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
-function queryAppServer(command: string, timeoutMs: number): Promise<CodexAccount> {
+function queryAppServer(command: string, timeoutMs: number, catalog: string | null): Promise<CodexAccount> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, ['app-server', '-c', 'features.plugins=false', '-c', 'analytics.enabled=false'], {
+    const child = spawn(command, ['app-server', ...CODEX_SERVICES_OFF, ...catalogArgs(catalog)], {
       cwd: os.tmpdir(), env: process.env, stdio: ['pipe', 'pipe', 'pipe'],
     });
     const answers = new Map<number, Json>();
@@ -125,7 +134,10 @@ function queryAppServer(command: string, timeoutMs: number): Promise<CodexAccoun
     const timer = setTimeout(() => finish(() => reject(new Error(`codex app-server did not answer within ${Math.round(timeoutMs / 1000)}s`))), timeoutMs);
     const send = (message: Json) => child.stdin.write(`${JSON.stringify(message)}\n`);
     child.on('error', (err: NodeJS.ErrnoException) => finish(() => reject(err.code === 'ENOENT' ? new Error(`${command} not found`) : err)));
-    child.on('close', (code) => finish(() => reject(new Error(`codex app-server exited (${code}) before answering${stderr.trim() ? `: ${stderr.trim().slice(-300)}` : ''}`))));
+    child.on('close', (code) => finish(() => reject(Object.assign(
+      new Error(`codex app-server exited (${code}) before answering${stderr.trim() ? `: ${stderr.trim().slice(-300)}` : ''}`),
+      { stderr },
+    ))));
     child.stderr.on('data', (d: Buffer) => { stderr = (stderr + d.toString('utf8')).slice(-2000); });
     child.stdin.on('error', () => {});
     const lines = readline.createInterface({ input: child.stdout });
