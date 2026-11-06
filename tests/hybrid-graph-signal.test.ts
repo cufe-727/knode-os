@@ -108,6 +108,12 @@ describe('the hybrid graph signal', () => {
     results.forEach((r, rank) => expect(r.score).toBeCloseTo(0.6 / (61 + rank), 12));
   });
 
+  it('answers a query quoting a passage under a rule of hyphens', async () => {
+    // websearch_to_tsquery read each hyphen as an operator and overflowed its stack
+    const results = await search(store, embedder, `Kestrel\n${'-'.repeat(62)}\n- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -`, { k: 10, track: false, mode: 'keyword' });
+    expect(Array.isArray(results)).toBe(true);
+  });
+
   it('counts the entities that were live at asOf, not the ones live now', async () => {
     const results = await search(store, embedder, 'Kestrel', { k: 10, track: false, asOf: AS_OF });
     // Kestrel Nest was not known yet; Old Kestrel still was

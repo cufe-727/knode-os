@@ -9,6 +9,7 @@ import type { KnowledgeUnit } from '../types.js';
 import { AGENT_BRIEF } from './agents.js';
 import type { MeterEvent } from '../meter.js';
 import { recordAgent, SystemEnv, SystemUnderTest } from './types.js';
+import { evalTempDir } from '../tmp.js';
 
 /**
  * The LLM Wiki pattern (Karpathy, April 2026) built faithfully and plainly
@@ -182,7 +183,8 @@ export function llmWiki(): SystemUnderTest {
     },
     async update(files, env) {
       // ingest the new or changed sources into the existing wiki, as the pattern does
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-wiki-'));
+      const tmp = evalTempDir('wiki');
+      const root = tmp.root;
       try {
         fs.cpSync(env.staged.dir, path.join(root, 'raw'), { recursive: true });
         fs.cpSync(wikiDir(env), path.join(root, 'wiki'), { recursive: true });
@@ -193,7 +195,7 @@ export function llmWiki(): SystemUnderTest {
         fs.rmSync(wikiDir(env), { recursive: true, force: true });
         fs.cpSync(path.join(root, 'wiki'), wikiDir(env), { recursive: true });
       } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        tmp.cleanup();
       }
     },
   };

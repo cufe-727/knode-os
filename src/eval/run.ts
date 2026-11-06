@@ -3,21 +3,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mapLimit } from '../bench/util.js';
-import { LlmEffort, loadConfig } from '../config.js';
+import { isCliProvider, KnodeConfig, LlmEffort, loadConfig } from '../config.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { createConfiguredEmbeddingProvider } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
 import { Judge } from './judge.js';
 import { Meter } from './meter.js';
 import { dirBytes, listFiles, loadPack, LoadedPack, packsDir, runsDir, seededKey, stageCorpus, StagedCorpus, stageUpdate, validatePack } from './pack.js';
+import { checkEndpoint, endpointUnder } from './endpoint.js';
 import { citationsIn, taskPrompt } from './prompts.js';
 import { EmbeddingBudget, QuotaGuard } from './quota.js';
 import { recordKey, RunMeta, RunStore } from './runstore.js';
 import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
 import { scoreUsage } from './score/usage.js';
-import { ChatBackend, CodexBackend, startShim } from './shim.js';
+import { ChatBackend, ClientBackend, CodexBackend, startShim } from './shim.js';
+import { closeAdapters } from './systems/external.js';
 import { makeSystems } from './systems/index.js';
+import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
 import { SystemEnv, SystemUnderTest, taggedEmbedder } from './systems/types.js';
 import { extractFinalAnswer } from './metrics/text.js';
 import { AnswerRecord, BuildRecord, emptyUsage, Suite, SUITES, Task } from './types.js';
@@ -36,10 +39,21 @@ export interface RunOptions {
   suites?: Suite[];
   /** Resume this run directory instead of starting a new one. */
   runDir?: string;
-  /** A knode workspace whose config supplies the embedder (and, read-only, nothing else). */
+  /** A knode workspace whose config supplies the embedder and, with `chatConnection`, the chat endpoint (read-only). */
   configFrom?: string;
-  /** The Codex model every system builds and answers with ('' = Codex's default). */
+  /**
+   * A connection of that workspace — an API endpoint — that answers the shim's
+   * chat calls instead of `codex exec`. Agents stay Codex sessions.
+   */
+  chatConnection?: string;
+  /** The model every system builds and answers with ('' = Codex's default, or the connection's). */
   model?: string;
+  /**
+   * An OpenAI-compatible embedding endpoint (a local bge-m3, say) that embeds in
+   * place of the workspace's embedder, under its identity, once it reproduces the
+   * vectors the run holds (`checkEndpoint`).
+   */
+  embeddingEndpoint?: string;
   buildEffort?: LlmEffort;
   answerEffort?: LlmEffort;
   /** Judge: a CLI provider ('claude-cli') and model. */
@@ -117,6 +131,15 @@ export function selectTasks(tasks: Task[], suites: Set<string>, limit: number | 
 
 const isAgent = (s: SystemUnderTest) => s.kind === 'agent' || s.id.startsWith('agent-');
 
+/** A workspace connection as the shim's backend, at the run's model when it names one. */
+function connectionBackend(config: KnodeConfig | null, id: string, model?: string): ChatBackend {
+  if (!config) throw new Error('--chat-connection names a connection of the --config-from workspace');
+  const connection = config.connections.find((c) => c.id === id);
+  if (!connection) throw new Error(`no connection "${id}" in the --config-from workspace (it has: ${config.connections.map((c) => c.id).join(', ')})`);
+  if (isCliProvider(connection.provider)) throw new Error(`connection "${id}" is a CLI; --chat-connection takes an API endpoint`);
+  return new ClientBackend(new LlmClient({ ...connection, model: model || connection.model }));
+}
+
 export async function runEval(opts: RunOptions): Promise<RunResult> {
   const progress = opts.onProgress ?? (() => {});
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
@@ -141,11 +164,12 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   });
 
   const workspaceConfig = opts.configFrom ? loadConfig(opts.configFrom) : null;
-  const embedder = opts.overrides?.embedder
+  const configured = opts.overrides?.embedder
     ?? (opts.embedding === 'local' || !workspaceConfig
       ? createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false })
       : createConfiguredEmbeddingProvider(workspaceConfig));
-  const backend = opts.overrides?.chat ?? new CodexBackend({ model: opts.model });
+  const embedder = opts.embeddingEndpoint ? endpointUnder(configured, opts.embeddingEndpoint) : configured;
+  const backend = opts.overrides?.chat ?? (opts.chatConnection ? connectionBackend(workspaceConfig, opts.chatConnection, opts.model) : new CodexBackend({ model: opts.model }));
   const judgeClient = opts.overrides?.judge ?? new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 });
   const judge = new Judge({ client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
   const models = { model: opts.model ?? '', buildEffort: opts.buildEffort ?? 'low', answerEffort: opts.answerEffort ?? 'medium' };
@@ -170,7 +194,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     packs: opts.packs.map((p) => path.basename(p)),
     systems: opts.systems,
     suites: [...suites],
-    model: { connection: 'codex-cli', label: backend.label, buildEffort: models.buildEffort, answerEffort: models.answerEffort },
+    model: { connection: opts.chatConnection ?? 'codex-cli', label: backend.label, buildEffort: models.buildEffort, answerEffort: models.answerEffort },
     judge: { connection: opts.judgeProvider ?? 'claude-cli', label: judgeClient.label },
     embedding: `${embedder.model} (${embedder.dimensions})`,
     fraction,
@@ -185,6 +209,18 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const citing = new Set<string>();
   const loaded: { pack: LoadedPack; staged: StagedCorpus }[] = [];
 
+  // a run stopped by a signal takes down what it started and the temp directories it holds;
+  // one killed outright leaves them for the next run's sweep
+  const swept = sweepStaleTempDirs();
+  if (swept) progress(`removed ${swept} temp directories of runs that are gone`);
+  const onSignal = (signal: NodeJS.Signals) => {
+    closeAdapters();
+    removeHeldTempDirs();
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+
   try {
     // every pack is validated before anything is spent on any of them
     const packs = opts.packs.map((dir) => {
@@ -194,6 +230,11 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       for (const w of issues.warnings) store.log('pack warning', { pack: pack.manifest.id, warning: w });
       return pack;
     });
+    if (opts.embeddingEndpoint) {
+      const check = await checkEndpoint(embedder, shim.vectors, packs);
+      progress(`embedding on ${opts.embeddingEndpoint} as ${embedder.model}: ${check.texts} texts the run holds came back at cosine ${check.lowest.toFixed(5)} or more`);
+      store.log('embedding endpoint', { url: opts.embeddingEndpoint, identity: embedder.model, ...check });
+    }
     const runPack = async (pack: LoadedPack) => {
       const staged = stageCorpus(pack, { fraction, seed });
       loaded.push({ pack, staged });
@@ -202,7 +243,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       progress(`pack ${pack.manifest.id}: ${staged.docs.length} documents, ${staged.tasks.length} tasks`);
 
       const systems = makeSystems(opts.systems).filter((s) => s.applicable?.(pack) ?? true);
-      for (const s of systems) if (s.answers && s.kind !== 'reference') citing.add(s.id);
+      for (const s of systems) if (s.answers && s.kind !== 'reference' && s.cites !== false) citing.add(s.id);
       const groups = new Map<string, SystemUnderTest[]>();
       for (const s of systems) (groups.get(s.group) ?? groups.set(s.group, []).get(s.group)!).push(s);
 
@@ -296,6 +337,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
 
     if (!opts.skipScoring) await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing }, progress);
   } finally {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+    closeAdapters();
     await shim.close();
     for (const l of loaded) l.staged.cleanup();
   }
@@ -349,7 +393,7 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
     for (const batch of pack.updates) for (const f of listFiles(path.join(pack.dir, 'updates', batch))) docs.add(f);
     corpusDocs.set(pack.manifest.id, docs);
   }
-  const citing = new Set(makeSystems(meta.systems).filter((s) => s.answers && s.kind !== 'reference').map((s) => s.id));
+  const citing = new Set(makeSystems(meta.systems).filter((s) => s.answers && s.kind !== 'reference' && s.cites !== false).map((s) => s.id));
   return scoreAnswers(store, judge, { tasks, corpusDocs, citing }, opts.onProgress);
 }
 

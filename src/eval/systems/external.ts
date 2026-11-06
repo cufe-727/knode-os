@@ -56,7 +56,9 @@ class AdapterProcess {
     if (this.child && this.child.exitCode === null) return this.child;
     const python = venvPython(this.id);
     if (!fs.existsSync(python)) throw new Error(`${this.id} is not installed — run \`knode-os eval systems install ${this.id}\``);
-    const child = spawn(python, [path.join(adaptersDir(), `${this.id}_adapter.py`)], { env: this.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    // a process group of its own: what the adapter starts (GraphRAG's `graphrag index`,
+    // HippoRAG's worker processes) stops with it, and a terminal's Ctrl-C reaches only the runner
+    const child = spawn(python, [path.join(adaptersDir(), `${this.id}_adapter.py`)], { env: this.env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     child.stdout!.on('data', (d: Buffer) => {
       this.buffer += d.toString('utf8');
       let nl: number;
@@ -86,6 +88,8 @@ class AdapterProcess {
       this.stderr = (this.stderr + d.toString('utf8')).slice(-8000);
     });
     child.on('exit', (code) => {
+      // whatever it started outlives it otherwise
+      stopGroup(child);
       for (const [, p] of this.pending) {
         clearTimeout(p.timer);
         p.reject(new Error(`${this.id} adapter exited (${code}): ${this.stderr.slice(-600)}`));
@@ -110,13 +114,30 @@ class AdapterProcess {
   }
 
   close(): void {
-    this.child?.stdin?.end();
-    this.child?.kill('SIGTERM');
+    if (!this.child) return;
+    this.child.stdin?.end();
+    stopGroup(this.child);
     this.child = null;
   }
 }
 
+/** SIGTERM to an adapter's process group: the adapter and everything it started. */
+function stopGroup(child: ChildProcess): void {
+  if (!child.pid) return;
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+  } catch {
+    // the whole group is gone already
+  }
+}
+
 const processes = new Map<string, AdapterProcess>();
+
+/** Stop every adapter this process started, as a run ends or is stopped. */
+export function closeAdapters(): void {
+  for (const p of processes.values()) p.close();
+  processes.clear();
+}
 
 function adapter(id: ExternalId, env: SystemEnv): AdapterProcess {
   const key = `${id}|${env.workDir}`;
@@ -139,6 +160,25 @@ function languageOf(pack: LoadedPack): string {
   return pack.manifest.languages[0] === 'zh' ? 'Chinese' : 'English';
 }
 
+/**
+ * The document a citation names by its file name alone, as LightRAG shows its
+ * model only basenames: the retrieved document of that name, else the one corpus
+ * document of that name. A name several documents share stays unresolved unless
+ * exactly one of them was retrieved.
+ */
+export function byFileName(docs: Iterable<string>, retrieved: string[]): (cited: string) => string | undefined {
+  const base = (p: string) => p.slice(p.lastIndexOf('/') + 1);
+  const named = new Map<string, string[]>();
+  for (const d of docs) (named.get(base(d)) ?? named.set(base(d), []).get(base(d))!).push(d);
+  return (cited) => {
+    if (cited.includes('/')) return undefined;
+    const seen = retrieved.filter((d) => base(d) === cited);
+    if (seen.length === 1) return seen[0];
+    const all = named.get(cited) ?? [];
+    return all.length === 1 ? all[0] : undefined;
+  };
+}
+
 export function externalSystem(id: ExternalId): SystemUnderTest {
   const labels: Record<ExternalId, string> = { graphrag: 'Microsoft GraphRAG', lightrag: 'LightRAG', hipporag: 'HippoRAG 2' };
   return {
@@ -147,6 +187,9 @@ export function externalSystem(id: ExternalId): SystemUnderTest {
     group: id,
     kind: 'kb',
     answers: true,
+    // GraphRAG's answers cite its own records ([Data: Entities (375, 376)]), and its
+    // query returns no ranked documents, so it is scored on neither
+    cites: id !== 'graphrag',
     applicable: (pack) => externalPacks().includes(pack.manifest.id),
     async build(env) {
       const work = path.join(env.workDir, 'index');
@@ -182,12 +225,16 @@ export function externalSystem(id: ExternalId): SystemUnderTest {
       }, 60 * 60_000);
       const docs = new Set(env.staged.docs.map((d) => d.path));
       const retrieved = [...new Set((r.contexts ?? []).map((c) => c.doc).filter((d): d is string => Boolean(d && docs.has(d))))];
-      return { text: r.text, citations: citationsIn(r.text, docs), retrieved };
+      return { text: r.text, citations: citationsIn(r.text, docs, byFileName(docs, retrieved)), retrieved };
     },
-    async retrieve(query, k, env) {
-      const r = await adapter(id, env).call<{ docs: string[] }>('retrieve', { question: query, k, work_dir: path.join(env.workDir, 'index'), api_key: formatTag({ system: id, stage: 'retrieve' }) }, 30 * 60_000);
-      return r.docs.slice(0, k);
-    },
+    ...(id === 'graphrag'
+      ? {}
+      : {
+          async retrieve(query: string, k: number, env: SystemEnv) {
+            const r = await adapter(id, env).call<{ docs: string[] }>('retrieve', { question: query, k, work_dir: path.join(env.workDir, 'index'), api_key: formatTag({ system: id, stage: 'retrieve' }) }, 30 * 60_000);
+            return r.docs.slice(0, k);
+          },
+        }),
     async exportKnowledge(env) {
       const r = await adapter(id, env).call<{ units: KnowledgeUnit[] }>('export', { work_dir: path.join(env.workDir, 'index'), corpus_dir: env.staged.dir }, 60 * 60_000);
       return r.units;

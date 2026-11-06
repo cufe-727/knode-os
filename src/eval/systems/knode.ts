@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultConfig, defaultRoutedLlmConfig, KnodeConfig, LlmConnection } from '../../config.js';
@@ -19,6 +18,7 @@ import { citationsIn } from '../prompts.js';
 import type { Citation, KnowledgeUnit } from '../types.js';
 import { AGENT_BRIEF } from './agents.js';
 import { recordAgent, shimClient, SystemEnv, SystemUnderTest } from './types.js';
+import { evalTempDir } from '../tmp.js';
 
 /**
  * knode-os as a system under test (docs/design/23 §3): a fresh workspace per
@@ -259,7 +259,8 @@ export function agentKnode(): SystemUnderTest {
       const s = stateFor(env);
       await close(s);
       await env.quota.wait();
-      const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-mcp-'));
+      const tmp = evalTempDir('mcp');
+      const empty = tmp.root;
       try {
         const r = await runAgent({
           cwd: empty,
@@ -277,7 +278,7 @@ export function agentKnode(): SystemUnderTest {
         ])].map((doc) => ({ doc }));
         return { text: r.text, citations, toolCalls: r.toolCalls, capped: r.capped, leaked: r.leaked, error: r.error };
       } finally {
-        fs.rmSync(empty, { recursive: true, force: true });
+        tmp.cleanup();
       }
     },
   });

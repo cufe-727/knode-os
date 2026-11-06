@@ -30,12 +30,16 @@ export function taskPrompt(task: Task): string {
   return `${task.question}${asOf}\n\n${OUTPUT_RULES}`;
 }
 
-/** Document paths an answer cites, kept only when they name a corpus document. */
-export function citationsIn(text: string, docs: Set<string>): Citation[] {
+/**
+ * Document paths an answer cites, kept only when they name a corpus document,
+ * or one `resolve` finds for a name that is not a corpus path.
+ */
+export function citationsIn(text: string, docs: Set<string>, resolve?: (cited: string) => string | undefined): Citation[] {
   const out = new Set<string>();
   const add = (raw: string) => {
     const p = raw.trim().replace(/^\.\//, '').replace(/^(?:raw\/docs|raw|corpus)\//, '').replace(/[)\].,;:，。]+$/, '');
-    if (docs.has(p)) out.add(p);
+    const doc = docs.has(p) ? p : resolve?.(p);
+    if (doc) out.add(doc);
   };
   for (const m of text.matchAll(/\[doc:\s*([^\]]+)\]/gi)) m[1].split(/[,;，]/).forEach(add);
   // a bare path the system wrote without the bracket form

@@ -10,6 +10,7 @@ meter tag as the API key — set per request, so a task's calls are its own.
 import asyncio
 import json
 import os
+import signal
 import sys
 import traceback
 from pathlib import Path
@@ -99,3 +100,8 @@ def serve(handlers: dict) -> None:
             emit({"id": rid, "ok": True, "result": result})
         except Exception as e:  # noqa: BLE001 — every failure goes back to the runner
             emit({"id": rid, "ok": False, "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-3000:]})
+    # stdin closed: the runner is done with this adapter, or gone. What the adapter
+    # started (HippoRAG's worker processes) would outlive it, so it ends the process
+    # group it leads, itself included — only when it leads one, as the runner starts it.
+    if os.getpgrp() == os.getpid():
+        os.killpg(os.getpgrp(), signal.SIGTERM)

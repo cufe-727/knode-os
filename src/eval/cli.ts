@@ -108,7 +108,9 @@ export function registerEvalCommands(program: Command): void {
     .option('--run-dir <dir>', 'resume this run directory')
     .option('--config-from <workspace>', 'knode workspace whose embedder the run uses (read-only)')
     .option('--embedding <kind>', 'workspace | local', 'workspace')
-    .option('--model <model>', 'Codex model every system uses', '')
+    .option('--embedding-endpoint <url>', "embed on this OpenAI-compatible endpoint (a local bge-m3, say) under the workspace embedder's identity, once it reproduces the vectors the run holds")
+    .option('--chat-connection <id>', 'answer model calls from this connection of the --config-from workspace (an API endpoint) instead of codex exec')
+    .option('--model <model>', 'model every system uses (Codex\'s, or the connection\'s)', '')
     .option('--build-effort <e>', 'reasoning effort for building', 'low')
     .option('--answer-effort <e>', 'reasoning effort for answering', 'medium')
     .option('--judge <provider>', 'judge CLI provider', 'claude-cli')
@@ -130,7 +132,9 @@ export function registerEvalCommands(program: Command): void {
         suites: (csv(opts.suites) as Suite[] | undefined) ?? [...SUITES],
         runDir: opts.runDir,
         configFrom: opts.configFrom,
+        chatConnection: opts.chatConnection,
         embedding: opts.embedding,
+        embeddingEndpoint: opts.embeddingEndpoint,
         model: opts.model,
         buildEffort: opts.buildEffort as LlmEffort,
         answerEffort: opts.answerEffort as LlmEffort,

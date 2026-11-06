@@ -56,6 +56,8 @@ export interface SystemUnderTest {
   kind: 'reference' | 'agent' | 'pipeline' | 'kb';
   /** Does it produce answers (false: scored on retrieval only). */
   answers: boolean;
+  /** Do its answers cite corpus documents (false: they cite records of its own, and citation scores do not apply). */
+  cites?: boolean;
   /** Can it run on this pack at all (a corpus too large for long context, an external system off this pack). */
   applicable?(pack: LoadedPack): boolean;
   /** Build the group's knowledge base; called once per pack for the first system of its group. */

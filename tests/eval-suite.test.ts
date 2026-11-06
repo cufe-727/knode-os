@@ -1,23 +1,33 @@
+import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import type { Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { serve } from '@hono/node-server';
+import { Hono } from 'hono';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { LlmClient } from '../src/llm/client.js';
 import { leakedPaths, pathTokens } from '../src/eval/agent.js';
 import { Meter, parseTag, formatTag } from '../src/eval/meter.js';
-import { loadPack, stageCorpus, validatePack } from '../src/eval/pack.js';
+import { docText, loadPack, stageCorpus, validatePack } from '../src/eval/pack.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { buildReportData, writeReport } from '../src/eval/report.js';
 import { runEval } from '../src/eval/run.js';
-import { RunStore } from '../src/eval/runstore.js';
-import { ChatBackend, ChatRequest, decodeVector, retryableFailure, startShim } from '../src/eval/shim.js';
+import { fileLines, RunStore } from '../src/eval/runstore.js';
+import { ChatBackend, ChatRequest, decodeVector, retryableFailure, startShim, VectorCache, vectorKey } from '../src/eval/shim.js';
 import { retrievalScores } from '../src/eval/metrics/retrieval.js';
 import { bootstrapMean, holm, pairedBootstrap, wilson } from '../src/eval/metrics/stats.js';
 import { characteristicTerms, directions, profileText } from '../src/eval/metrics/stylometry.js';
 import { exactMatch, extractFinalAnswer, stripMarkers, tokenF1 } from '../src/eval/metrics/text.js';
+import { checkEndpoint, endpointUnder } from '../src/eval/endpoint.js';
 import { EmbeddingBudget, QuotaGuard } from '../src/eval/quota.js';
+import { chunkDocs } from '../src/eval/retrieval.js';
+import { evalTempDir, removeHeldTempDirs, sweepStaleTempDirs } from '../src/eval/tmp.js';
+import { byFileName } from '../src/eval/systems/external.js';
 import { llmWikiBuild } from '../src/eval/systems/llm-wiki.js';
+import { citationsIn } from '../src/eval/prompts.js';
 import type { SystemEnv } from '../src/eval/systems/types.js';
 import type { CodexAccount } from '../src/estimate/codex.js';
 
@@ -119,6 +129,28 @@ describe('metrics', () => {
     expect(terms.some((t) => ['sister', 'obliged', 'truth', 'universally', 'acknowledged', 'indeed'].includes(t))).toBe(true);
     const zh = characteristicTerms('宝玉笑道：“好妹妹。”黛玉听了。'.repeat(30), '曹操大怒，引兵而去。'.repeat(30), { lang: 'zh', k: 5 }).map((t) => t.term);
     expect(zh.some((t) => ['宝玉', '黛玉', '妹妹'].includes(t))).toBe(true);
+  });
+
+  it('reads citations that name a document by its file name alone', () => {
+    // LightRAG shows its model basenames, and law-cn has an 01-总则.md for each law
+    const docs = new Set(['民法典/01-总则/01-基本规定.md', '证券法/01-总则.md', '公司法/01-总则.md', 'chat/w01-2026-03-03-1.md']);
+    const text = '依照规定。[doc: 01-基本规定.md] 另见 [doc: 01-总则.md]\n\n### References\n* [1] w01-2026-03-03-1.md\n* [2] 02-附则.md';
+    expect(citationsIn(text, docs).map((c) => c.doc)).toEqual([]);
+    expect(citationsIn(text, docs, byFileName(docs, [])).map((c) => c.doc)).toEqual(['民法典/01-总则/01-基本规定.md', 'chat/w01-2026-03-03-1.md']);
+    // a shared name resolves to the one document of that name the answer retrieved
+    expect(citationsIn(text, docs, byFileName(docs, ['证券法/01-总则.md'])).map((c) => c.doc)).toEqual(['民法典/01-总则/01-基本规定.md', '证券法/01-总则.md', 'chat/w01-2026-03-03-1.md']);
+    expect(byFileName(docs, ['证券法/01-总则.md', '公司法/01-总则.md'])('01-总则.md')).toBeUndefined();
+    expect(byFileName(docs, [])('x/01-基本规定.md')).toBeUndefined();
+  });
+
+  it('reads a file line by line across read blocks', () => {
+    const file = path.join(tmp, 'lines.jsonl');
+    const lines = ['{"k":"第一行"}', '', 'x'.repeat(40), '民法典第十六条', 'last without newline'];
+    fs.writeFileSync(file, lines.join('\n'));
+    // blocks of 7 bytes split lines and the three bytes of a Chinese character alike
+    expect([...fileLines(file, 7)]).toEqual(lines);
+    fs.writeFileSync(file, 'a\nb\n');
+    expect([...fileLines(file, 7)]).toEqual(['a', 'b']);
   });
 });
 
@@ -328,7 +360,8 @@ describe('a run on the fixture pack', () => {
     const workDir = path.join(tmp, 'wiki-resume');
     const meter = new Meter();
     const lines: string[] = [];
-    const env = (quota: QuotaGuard) => ({ runId: 'resume', pack, staged: stageCorpus(pack), workDir, meter, quota, models: { model: '', buildEffort: 'low' }, log: (m: string) => lines.push(m) }) as unknown as SystemEnv;
+    const staged = stageCorpus(pack);
+    const env = (quota: QuotaGuard) => ({ runId: 'resume', pack, staged, workDir, meter, quota, models: { model: '', buildEffort: 'low' }, log: (m: string) => lines.push(m) }) as unknown as SystemEnv;
     // the quota runs out before the third session: the build stops with two done
     let reads = 0;
     const tight = new QuotaGuard({ policy: { maxWaitMs: -1 }, sleep: async () => {}, read: async () => ({ windows: [{ minutes: 10080, usedPercent: ++reads > 2 ? 99 : 0, resetsAt: null }], limitReached: null }) as unknown as CodexAccount });
@@ -341,6 +374,7 @@ describe('a run on the fixture pack', () => {
     expect(meter.all((e) => e.system === 'llm-wiki' && e.replayed)).toHaveLength(2);
     expect(meter.all((e) => e.system === 'llm-wiki' && !e.replayed)).toHaveLength(4);
     expect(fs.readdirSync(path.join(res.kbDir, 'sources'))).toHaveLength(7);
+    staged.cleanup();
   });
 
   it('runs two packs at once without one closing the other\'s index', async () => {
@@ -367,4 +401,62 @@ describe('a run on the fixture pack', () => {
     expect(backend.calls).toBe(calls);
     expect(judge.calls).toBe(judged);
   }, 120_000);
+});
+
+describe("an embedding endpoint of the run's own", () => {
+  it('embeds under the identity once it reproduces the vectors the run holds, and is refused otherwise', async () => {
+    const dir = path.join(tmp, 'endpoint-pack');
+    buildFixturePack(dir);
+    const pack = loadPack(dir);
+    // a text's vector, or a different model's: half its coordinates flipped
+    let other = false;
+    const vector = (text: string) => [...crypto.createHash('sha256').update(text).digest().subarray(0, 8)].map((b, i) => (b - 127.5) * (other && i % 2 ? -1 : 1));
+    const app = new Hono();
+    app.post('/v1/embeddings', async (c) => {
+      const body = (await c.req.json()) as { input: string[] };
+      return c.json({ data: body.input.map((t, index) => ({ index, embedding: vector(t) })) });
+    });
+    let server: Server;
+    const port = await new Promise<number>((resolve) => {
+      server = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' }, (info) => resolve(info.port)) as Server;
+    });
+    try {
+      const identity = { model: 'pool:fake:8:l2-v1', dimensions: 8, embed: async (): Promise<number[][]> => { throw new Error('the pool is not called'); } };
+      const held = new VectorCache(null);
+      for (const c of chunkDocs(pack.docs.map((d) => ({ path: d.path, text: docText(pack, d.path) })))) held.put(vectorKey(identity.model, c.text), vector(c.text));
+      const embedder = endpointUnder(identity, `http://127.0.0.1:${port}/v1`);
+      expect(embedder.model).toBe(identity.model);
+      const check = await checkEndpoint(embedder, held, [pack]);
+      expect(check.texts).toBeGreaterThanOrEqual(5);
+      expect(check.lowest).toBeGreaterThan(0.9999);
+      // what comes back is a unit vector, as a pool's is
+      const [v] = await embedder.embed(['anything']);
+      expect(Math.hypot(...v)).toBeCloseTo(1, 6);
+      other = true;
+      await expect(checkEndpoint(embedder, held, [pack])).rejects.toThrow(/does not reproduce pool:fake:8:l2-v1/);
+      await expect(checkEndpoint(embedder, new VectorCache(null), [pack])).rejects.toThrow(/only 0 texts/);
+    } finally {
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+    }
+  });
+});
+
+describe("a run's temp directories", () => {
+  it('are named for their process, and a sweep removes only those whose process is gone', () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'sweep-'));
+    const dead = spawnSync(process.execPath, ['-e', 'console.log(process.pid)']).stdout.toString().trim();
+    const kept = [`knode-eval-ro-${process.pid}-AbC123`, 'knode-eval-test-AbC123', 'knode-eval-wiki-0123456789abcdef'];
+    for (const name of [`knode-eval-corpus-${dead}-AbC123`, `knode-eval-agent-out-${dead}-xyz789`, ...kept]) fs.mkdirSync(path.join(dir, name));
+    expect(sweepStaleTempDirs(dir)).toBe(2);
+    expect(fs.readdirSync(dir).sort()).toEqual([...kept].sort());
+
+    const held = evalTempDir('corpus');
+    expect(path.basename(held.root)).toMatch(new RegExp(`^knode-eval-corpus-${process.pid}-[A-Za-z0-9]{6}$`));
+    const done = evalTempDir('ro');
+    done.cleanup();
+    expect(fs.existsSync(done.root)).toBe(false);
+    // what is still held goes when a stopped run lets go of everything
+    removeHeldTempDirs();
+    expect(fs.existsSync(held.root)).toBe(false);
+  });
 });
