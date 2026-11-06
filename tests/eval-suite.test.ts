@@ -17,7 +17,9 @@ import { bootstrapMean, holm, pairedBootstrap, wilson } from '../src/eval/metric
 import { characteristicTerms, directions, profileText } from '../src/eval/metrics/stylometry.js';
 import { exactMatch, extractFinalAnswer, stripMarkers, tokenF1 } from '../src/eval/metrics/text.js';
 import { EmbeddingBudget, QuotaGuard } from '../src/eval/quota.js';
+import { byFileName } from '../src/eval/systems/external.js';
 import { llmWikiBuild } from '../src/eval/systems/llm-wiki.js';
+import { citationsIn } from '../src/eval/prompts.js';
 import type { SystemEnv } from '../src/eval/systems/types.js';
 import type { CodexAccount } from '../src/estimate/codex.js';
 
@@ -119,6 +121,18 @@ describe('metrics', () => {
     expect(terms.some((t) => ['sister', 'obliged', 'truth', 'universally', 'acknowledged', 'indeed'].includes(t))).toBe(true);
     const zh = characteristicTerms('宝玉笑道：“好妹妹。”黛玉听了。'.repeat(30), '曹操大怒，引兵而去。'.repeat(30), { lang: 'zh', k: 5 }).map((t) => t.term);
     expect(zh.some((t) => ['宝玉', '黛玉', '妹妹'].includes(t))).toBe(true);
+  });
+
+  it('reads citations that name a document by its file name alone', () => {
+    // LightRAG shows its model basenames, and law-cn has an 01-总则.md for each law
+    const docs = new Set(['民法典/01-总则/01-基本规定.md', '证券法/01-总则.md', '公司法/01-总则.md', 'chat/w01-2026-03-03-1.md']);
+    const text = '依照规定。[doc: 01-基本规定.md] 另见 [doc: 01-总则.md]\n\n### References\n* [1] w01-2026-03-03-1.md\n* [2] 02-附则.md';
+    expect(citationsIn(text, docs).map((c) => c.doc)).toEqual([]);
+    expect(citationsIn(text, docs, byFileName(docs, [])).map((c) => c.doc)).toEqual(['民法典/01-总则/01-基本规定.md', 'chat/w01-2026-03-03-1.md']);
+    // a shared name resolves to the one document of that name the answer retrieved
+    expect(citationsIn(text, docs, byFileName(docs, ['证券法/01-总则.md'])).map((c) => c.doc)).toEqual(['民法典/01-总则/01-基本规定.md', '证券法/01-总则.md', 'chat/w01-2026-03-03-1.md']);
+    expect(byFileName(docs, ['证券法/01-总则.md', '公司法/01-总则.md'])('01-总则.md')).toBeUndefined();
+    expect(byFileName(docs, [])('x/01-基本规定.md')).toBeUndefined();
   });
 });
 

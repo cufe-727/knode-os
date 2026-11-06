@@ -139,6 +139,25 @@ function languageOf(pack: LoadedPack): string {
   return pack.manifest.languages[0] === 'zh' ? 'Chinese' : 'English';
 }
 
+/**
+ * The document a citation names by its file name alone, as LightRAG shows its
+ * model only basenames: the retrieved document of that name, else the one corpus
+ * document of that name. A name several documents share stays unresolved unless
+ * exactly one of them was retrieved.
+ */
+export function byFileName(docs: Iterable<string>, retrieved: string[]): (cited: string) => string | undefined {
+  const base = (p: string) => p.slice(p.lastIndexOf('/') + 1);
+  const named = new Map<string, string[]>();
+  for (const d of docs) (named.get(base(d)) ?? named.set(base(d), []).get(base(d))!).push(d);
+  return (cited) => {
+    if (cited.includes('/')) return undefined;
+    const seen = retrieved.filter((d) => base(d) === cited);
+    if (seen.length === 1) return seen[0];
+    const all = named.get(cited) ?? [];
+    return all.length === 1 ? all[0] : undefined;
+  };
+}
+
 export function externalSystem(id: ExternalId): SystemUnderTest {
   const labels: Record<ExternalId, string> = { graphrag: 'Microsoft GraphRAG', lightrag: 'LightRAG', hipporag: 'HippoRAG 2' };
   return {
@@ -147,6 +166,9 @@ export function externalSystem(id: ExternalId): SystemUnderTest {
     group: id,
     kind: 'kb',
     answers: true,
+    // GraphRAG's answers cite its own records ([Data: Entities (375, 376)]), and its
+    // query returns no ranked documents, so it is scored on neither
+    cites: id !== 'graphrag',
     applicable: (pack) => externalPacks().includes(pack.manifest.id),
     async build(env) {
       const work = path.join(env.workDir, 'index');
@@ -182,12 +204,16 @@ export function externalSystem(id: ExternalId): SystemUnderTest {
       }, 60 * 60_000);
       const docs = new Set(env.staged.docs.map((d) => d.path));
       const retrieved = [...new Set((r.contexts ?? []).map((c) => c.doc).filter((d): d is string => Boolean(d && docs.has(d))))];
-      return { text: r.text, citations: citationsIn(r.text, docs), retrieved };
+      return { text: r.text, citations: citationsIn(r.text, docs, byFileName(docs, retrieved)), retrieved };
     },
-    async retrieve(query, k, env) {
-      const r = await adapter(id, env).call<{ docs: string[] }>('retrieve', { question: query, k, work_dir: path.join(env.workDir, 'index'), api_key: formatTag({ system: id, stage: 'retrieve' }) }, 30 * 60_000);
-      return r.docs.slice(0, k);
-    },
+    ...(id === 'graphrag'
+      ? {}
+      : {
+          async retrieve(query: string, k: number, env: SystemEnv) {
+            const r = await adapter(id, env).call<{ docs: string[] }>('retrieve', { question: query, k, work_dir: path.join(env.workDir, 'index'), api_key: formatTag({ system: id, stage: 'retrieve' }) }, 30 * 60_000);
+            return r.docs.slice(0, k);
+          },
+        }),
     async exportKnowledge(env) {
       const r = await adapter(id, env).call<{ units: KnowledgeUnit[] }>('export', { work_dir: path.join(env.workDir, 'index'), corpus_dir: env.staged.dir }, 60 * 60_000);
       return r.units;

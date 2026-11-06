@@ -202,7 +202,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       progress(`pack ${pack.manifest.id}: ${staged.docs.length} documents, ${staged.tasks.length} tasks`);
 
       const systems = makeSystems(opts.systems).filter((s) => s.applicable?.(pack) ?? true);
-      for (const s of systems) if (s.answers && s.kind !== 'reference') citing.add(s.id);
+      for (const s of systems) if (s.answers && s.kind !== 'reference' && s.cites !== false) citing.add(s.id);
       const groups = new Map<string, SystemUnderTest[]>();
       for (const s of systems) (groups.get(s.group) ?? groups.set(s.group, []).get(s.group)!).push(s);
 
@@ -349,7 +349,7 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
     for (const batch of pack.updates) for (const f of listFiles(path.join(pack.dir, 'updates', batch))) docs.add(f);
     corpusDocs.set(pack.manifest.id, docs);
   }
-  const citing = new Set(makeSystems(meta.systems).filter((s) => s.answers && s.kind !== 'reference').map((s) => s.id));
+  const citing = new Set(makeSystems(meta.systems).filter((s) => s.answers && s.kind !== 'reference' && s.cites !== false).map((s) => s.id));
   return scoreAnswers(store, judge, { tasks, corpusDocs, citing }, opts.onProgress);
 }
 

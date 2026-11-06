@@ -3,6 +3,7 @@
 Build runs GraphRAG's own CLI on a project it initialises in the work directory:
 models pointed at the run's shim (api_base, the meter tag as GRAPHRAG_API_KEY),
 gleaning off (its yes/no check relies on logit_bias, which a CLI model ignores),
+index prompts asking for the corpus's language instead of English,
 every corpus document copied into input/ as text (`a/b.md` → `a__b.md.txt`, so a
 document title maps back to its corpus path). Local search answers questions,
 global search answers corpus-wide ones. Export reads the parquet tables.
@@ -48,6 +49,27 @@ def _unflat(title: str) -> str:
     return t.replace("__", "/")
 
 
+def _write_in(root: Path, language: str) -> None:
+    """GraphRAG's index prompts ask for English: ask for the corpus's language instead,
+    in the words its own prompt tuning (`graphrag prompt-tune --language`) uses."""
+    if language == "English":
+        return
+    report = ("Return output as a well-formed JSON", f"Your answers should be in {language}.\n\nReturn output as a well-formed JSON")
+    edits = {
+        "extract_graph.txt": ("Return output in English", f"Return output in {language}"),
+        "extract_claims.txt": ("Return output in English", f"Return output in {language}"),
+        "summarize_descriptions.txt": ("into a single, comprehensive description.", f"into a single, comprehensive description in {language}."),
+        "community_report_graph.txt": report,
+        "community_report_text.txt": report,
+    }
+    for name, (old, new) in edits.items():
+        f = root / "prompts" / name
+        text = f.read_text(encoding="utf-8")
+        if old not in text:
+            raise RuntimeError(f"GraphRAG's {name} no longer says {old!r}: update the language edit")
+        f.write_text(text.replace(old, new), encoding="utf-8")
+
+
 def build(req):
     import yaml
 
@@ -67,6 +89,7 @@ def build(req):
             s[section]["max_gleanings"] = 0
     s["input"] = {**s.get("input", {}), "type": "text", "file_pattern": ".*\\.txt$$"}  # "$$": GraphRAG expands $ in settings
     settings_file.write_text(yaml.safe_dump(s, allow_unicode=True, sort_keys=False))
+    _write_in(root, req.get("language", "English"))
     inp = root / "input"
     inp.mkdir(exist_ok=True)
     docs = read_corpus(req["corpus_dir"])

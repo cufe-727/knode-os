@@ -3,7 +3,7 @@
 Build inserts every corpus document (id and file path = its corpus path), with
 gleaning off and the summary language set to the corpus's. Answers use LightRAG's
 own query ("mix" for questions, "global" for corpus-wide ones); retrieval and
-answer contexts come from `aquery_data`'s chunks and their file paths. Export
+answer contexts come from `aquery_data`'s chunks, traced to their documents. Export
 reads the entity–relation graph LightRAG keeps in `graph_chunk_entity_relation.graphml`.
 """
 import os
@@ -77,16 +77,34 @@ async def open_(req):
     return {"ok": True}
 
 
-def _docs_of(data) -> list[str]:
-    chunks = (data or {}).get("data", {}).get("chunks", []) or []
+def _split(s) -> list[str]:
+    return [x.strip() for x in (s or "").split("<SEP>") if x.strip()]
+
+
+# LightRAG keeps only a document's basename as its file_path, and basenames repeat
+# across a corpus (law-cn has an 01-总则.md for each law), so every chunk is traced
+# to the id its document was inserted under instead: its corpus path.
+
+
+async def _docs_of(rag, data) -> list[str]:
+    """Corpus paths of an `aquery_data` result's chunks, in rank order."""
     out = []
-    for c in chunks:
-        fp = c.get("file_path") or ""
-        for p in fp.split("<SEP>"):
-            p = p.strip()
-            if p and p not in out:
-                out.append(p)
+    for c in (data or {}).get("data", {}).get("chunks", []) or []:
+        stored = await rag.text_chunks.get_by_id(c["chunk_id"]) if c.get("chunk_id") else None
+        p = (stored or {}).get("full_doc_id")
+        if p and p not in out:
+            out.append(p)
     return out
+
+
+def _chunk_docs(work_dir: str) -> dict[str, str]:
+    """Chunk id → corpus path, from the chunk store of a built index."""
+    import json
+
+    f = Path(work_dir) / "kv_store_text_chunks.json"
+    if not f.exists():
+        return {}
+    return {k: v["full_doc_id"] for k, v in json.loads(f.read_text(encoding="utf-8")).items() if v.get("full_doc_id")}
 
 
 async def answer(req):
@@ -96,7 +114,7 @@ async def answer(req):
     mode = "global" if req.get("mode") == "global" else "mix"
     text = await rag.aquery(req["question"], param=QueryParam(mode=mode))
     data = await rag.aquery_data(req["question"], param=QueryParam(mode=mode))
-    return {"text": text if isinstance(text, str) else str(text), "contexts": [{"doc": d} for d in _docs_of(data)]}
+    return {"text": text if isinstance(text, str) else str(text), "contexts": [{"doc": d} for d in await _docs_of(rag, data)]}
 
 
 async def retrieve(req):
@@ -104,7 +122,7 @@ async def retrieve(req):
 
     rag = _rags[req["work_dir"]]
     data = await rag.aquery_data(req["question"], param=QueryParam(mode="mix"))
-    return {"docs": _docs_of(data)[: int(req.get("k", 10))]}
+    return {"docs": (await _docs_of(rag, data))[: int(req.get("k", 10))]}
 
 
 def export(req):
@@ -114,12 +132,13 @@ def export(req):
     if not f.exists():
         return {"units": []}
     g = nx.read_graphml(f)
-    split = lambda s: [x.strip() for x in (s or "").split("<SEP>") if x.strip()]  # noqa: E731
+    doc_of = _chunk_docs(req["work_dir"])
+    sources = lambda a: sorted({doc_of[c] for c in _split(a.get("source_id")) if c in doc_of})  # noqa: E731
     units = []
     for name, a in g.nodes(data=True):
-        units.append({"id": f"entity:{name}", "kind": "entity", "title": name, "text": f"{name} ({a.get('entity_type', '')}): {a.get('description', '')}".strip(), "sources": split(a.get("file_path")), "links": []})
+        units.append({"id": f"entity:{name}", "kind": "entity", "title": name, "text": f"{name} ({a.get('entity_type', '')}): {a.get('description', '')}".strip(), "sources": sources(a), "links": []})
     for s, t, a in g.edges(data=True):
-        units.append({"id": f"relation:{s}|{t}", "kind": "relation", "head": s, "tail": t, "relation": a.get("keywords", "related"), "text": f"{s} —{a.get('keywords', 'related')}→ {t}: {a.get('description', '')}", "sources": split(a.get("file_path")), "links": [f"entity:{s}", f"entity:{t}"]})
+        units.append({"id": f"relation:{s}|{t}", "kind": "relation", "head": s, "tail": t, "relation": a.get("keywords", "related"), "text": f"{s} —{a.get('keywords', 'related')}→ {t}: {a.get('description', '')}", "sources": sources(a), "links": [f"entity:{s}", f"entity:{t}"]})
     return {"units": units}
 
 
