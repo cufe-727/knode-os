@@ -6,6 +6,7 @@ import { EmbeddingConnection, defaultConfig, embeddingIdentity, syncActiveEmbedd
 import { DEFAULT_EMBEDDING_LIMITS, EmbeddingQuotaLedger, PooledEmbeddingProvider, poolMembers, retryAfterMs } from '../src/ingest/embedding-router.js';
 import { estimateEmbeddingTokens } from '../src/ingest/embedding-tokens.js';
 import { listEmbeddingModels } from '../src/llm/models.js';
+import { checkVectors, cutBatches, embedBatchPlan, postprocessFor } from '../src/work/embed.js';
 
 const dirs: string[] = [];
 const ledgerFile = () => {
@@ -161,6 +162,49 @@ describe('real request routing contract', () => {
   it('parses date and seconds Retry-After values', () => {
     expect(retryAfterMs('120', 0)).toBe(120_000);
     expect(retryAfterMs('Thu, 01 Jan 1970 00:02:00 GMT', 0)).toBe(120_000);
+  });
+});
+
+// Embedding as leased work (src/work/embed.ts) cuts batches and finishes vectors as the pool does,
+// so a vector from a remote worker is the one this machine would have made.
+describe('the pool and leased embed work agree', () => {
+  it('cut the same batches: the smallest member\'s batch size, within its minute-token allowance', async () => {
+    const sizes: number[] = [];
+    const fetcher = vi.fn().mockImplementation(async (_url, init) => {
+      const { input } = JSON.parse(init.body);
+      sizes.push(input.length);
+      return Response.json({ data: input.map((_t: string, index: number) => ({ index, embedding: [3, 4] })) });
+    });
+    const entries = [entry('a', { batchSize: 3, limits: { ...DEFAULT_EMBEDDING_LIMITS, tokensPerMinute: 60 } }), entry('b', { batchSize: 8 })];
+    const texts = ['一', 'two', '三四五六七八九十'.repeat(4), 'four', 'five', 'six', 'seven', 'eight', 'x'.repeat(120), 'ten'];
+    await new PooledEmbeddingProvider({ ...pool, batchSize: 5 }, entries, new EmbeddingQuotaLedger(ledgerFile()), fetcher, 0).embed(texts);
+    const config = { ...defaultConfig(), embeddingPool: { ...pool, batchSize: 5 }, embeddingProviders: entries };
+    expect(cutBatches(texts, embedBatchPlan(config)).map((b) => b.end - b.start)).toEqual(sizes);
+  });
+  it('finish a remote worker\'s raw vector as the pool finishes its own', async () => {
+    const embedder = new PooledEmbeddingProvider(pool, [entry('a')], new EmbeddingQuotaLedger(ledgerFile()), vi.fn().mockResolvedValue(good()), 0);
+    const [own] = await embedder.embed(['t']);
+    expect(postprocessFor(embedder.model)).toBe('l2');
+    expect(checkVectors([[3, 4]], 1, 2, postprocessFor(embedder.model))).toEqual([own]);
+  });
+  it('the worker\'s copy of the failure classifier is the server\'s', () => {
+    const server = fs.readFileSync(path.resolve('src/labeling/failures.ts'), 'utf8');
+    const worker = fs.readFileSync(path.resolve('worker/knode-worker.mjs'), 'utf8');
+    for (const name of ['FATAL', 'TRANSIENT']) {
+      const pattern = new RegExp(`^const ${name} = (/.+/);$`, 'm');
+      const theirs = pattern.exec(server)?.[1];
+      expect(theirs, name).toBeTruthy();
+      expect(pattern.exec(worker)?.[1], name).toBe(theirs);
+    }
+  });
+  it('the worker sends the pool\'s embedding request: the same fields, the dimensions and upstream pin as the key says', () => {
+    const worker = fs.readFileSync(path.resolve('worker/knode-worker.mjs'), 'utf8');
+    const router = fs.readFileSync(path.resolve('src/ingest/embedding-router.ts'), 'utf8');
+    // the pool's request body, and the worker's copy of it, field by field
+    for (const field of [/model: \w+\.model, input: \w+, encoding_format: 'float'/, /\.\.\.\(\w+\.sendDimensions \? \{ dimensions: this\.dimensions|\.\.\.\(\w+\.sendDimensions \? \{ dimensions: \w+\.dimensions/, /\.\.\.\(\w+\.upstream \? \{ provider: \{ only: \[\w+\.upstream\], allow_fallbacks: false \} \} : \{\}\)/]) {
+      expect(router, String(field)).toMatch(field);
+      expect(worker, String(field)).toMatch(field);
+    }
   });
 });
 

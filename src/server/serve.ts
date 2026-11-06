@@ -21,8 +21,10 @@ import { AgentConversations } from '../ingest/conversations/follow.js';
 import { FeishuDocs } from '../ingest/feishu/docs.js';
 import { isOwnWrite } from '../ingest/own-writes.js';
 import { sync, SyncContext, syncsSettled, SyncStats } from '../ingest/sync.js';
+import { embeddingDeferred } from '../config.js';
 import { WorkBroker } from '../work/broker.js';
 import { offeredRemotely } from '../work/config.js';
+import { BrokeredEmbedder, embedOffered, EmbedSource, LocalEmbedSlots, localEmbedSlots } from '../work/embed.js';
 import { JudgeSource } from '../work/judge.js';
 import { SummarySource } from '../work/summarize.js';
 import { TranslateSource } from '../work/translate.js';
@@ -141,7 +143,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
       services.set(workspaceCtx.dataDir, {
         mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders, feishu: started.feishu, conversations: started.conversations,
         labeling: started.labeling, work: started.work, localWorkers: started.localWorkers, processing: started.processing, translations: started.translations,
-        calls: started.calls, embeddings: started.embeddings,
+        calls: started.calls, embeddings: started.embeddings, embedWork: started.embedWork, embedSlots: started.embedSlots,
       });
       return async () => {
         services.delete(workspaceCtx.dataDir);
@@ -514,6 +516,8 @@ interface StartedServices {
   translations: TranslateSource;
   calls: CallLedger;
   embeddings: EmbeddingBackfill;
+  embedWork: EmbedSource;
+  embedSlots: LocalEmbedSlots;
 }
 
 function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null; rootDataDir?: string } = {}): StartedServices {
@@ -522,8 +526,22 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   // import or sync does not wait on the rate-limited pool, and a spent daily
   // quota leaves chunks pending instead of documents unindexed
   const embeddings = new EmbeddingBackfill(ctx, { log, concurrency: Math.max(1, ctx.config.ingest.concurrency ?? 4) });
-  ctx.embeddings = embeddings;
+  // in deferred mode (docs/design/12 §3.3) the same backlog is leased work instead: this machine's
+  // embed slots and remote workers drain it, and the duplicate audits' vectors go the same way
+  const embedWork = new EmbedSource({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, embedder: () => ctx.embedder, log });
+  let embedSlots: LocalEmbedSlots | null = null;
+  ctx.embeddings = {
+    kick: () => {
+      embeddings.kick();
+      embedWork.kick();
+      embedSlots?.kick();
+    },
+  };
   embeddings.start();
+  const remoteEmbed = { askedLately: () => false };
+  // the audits' vectors: on the embed queue while someone can take them, else straight from the embedder
+  const auditEmbedder = new BrokeredEmbedder(embedWork, () => ctx.embedder, () =>
+    embeddingDeferred(ctx.config) && (localEmbedSlots(ctx.config) > 0 || (embedOffered(ctx.config) && remoteEmbed.askedLately())));
   // deep-research jobs: an external CLI writes wiki pages through the MCP endpoint serve hosts
   const research = opts.mcp ? startResearchLoop(ctx, { mcp: opts.mcp, log }) : null;
   // a chat turn only lives in one process: whatever a previous serve left mid-answer is idle now
@@ -604,15 +622,19 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     deadlineMs: () => Math.max(1, ctx.config.server.remote?.callDeadlineMinutes ?? 20) * 60_000,
     log,
   }, { leaseMs });
-  const followUp = startFollowUp(ctx, labeling, { log, track, active: false, judge: judges, onPause: () => judges.cancelWaiting('processing stopped') });
+  const followUp = startFollowUp(ctx, labeling, { log, track, active: false, judge: judges, embedder: auditEmbedder, onPause: () => judges.cancelWaiting('processing stopped') });
   summaries = new SummarySource(ctx, { serialize: followUp.serialize, log }, { leaseMs });
   // translations into the content languages (docs/design/17): idle while they are off
   const translations = new TranslateSource({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, log }, { leaseMs });
   void translations.backfill();
   // every answered call is measured, so the next estimate learns from it (docs/design/18)
   const calls = CallLedger.forWorkspace(ctx.dataDir, { log });
-  const work = new WorkBroker([labeling, summaries, judges, translations], { shares: () => ctx.config.server.remote?.shares, ledger: calls });
+  const work = new WorkBroker([labeling, summaries, judges, translations, embedWork], { shares: () => ctx.config.server.remote?.shares, ledger: calls });
   remoteJudge.askedLately = () => work.askedLately('judge', 2 * 60_000);
+  remoteEmbed.askedLately = () => work.askedLately('embed', 2 * 60_000);
+  // this machine's embed slots run whether or not processing is started, as embedding always has
+  embedSlots = new LocalEmbedSlots(work, () => ctx.embedder, () => ctx.config, { log, source: embedWork });
+  embedSlots.start();
   const localWorkers = new LocalLabelingWorkers(work, () => ctx.config, { log });
   const processing = new LabelingProcessing(localWorkers, followUp, log);
   log('processing is stopped until an administrator starts it (the Processing button in the app or the web UI, or POST /api/labeling/start)');
@@ -664,6 +686,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
       clearInterval(syncTimer);
       followUp.stop();
       localWorkers.stop();
+      embedSlots?.stop();
       await work.stop();
       calls.flush();
       clearInterval(flushTimer);
@@ -690,6 +713,8 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
     translations,
     calls,
     embeddings,
+    embedWork,
+    embedSlots,
   };
 }
 

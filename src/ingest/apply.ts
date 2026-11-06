@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { KnodeConfig } from '../config.js';
+import { embeddingDeferred, KnodeConfig } from '../config.js';
 import { MAX_FILE_BYTES } from '../constants.js';
 import { originOf, readSidecarPart, replayableTier1, SidecarTier1, truncatedTier1, updateSidecarPart } from '../fs/sidecar.js';
 import { CITATIONS_VERSION, dedupeCitations, rawDocValue, relationCitation } from '../graph/citations.js';
@@ -41,7 +41,11 @@ import { loadSourceText, sha256 } from './source.js';
  * placeholders — src/graph/concepts.ts), all inside one scope transaction.
  * Under `serve` the embed step is left to the background embedder
  * (`ctx.embeddings`): an apply never waits on the rate-limited pool, and never
- * fails because its daily quota is spent. Tier-1 sidecar replays and the
+ * fails because its daily quota is spent. In deferred mode
+ * (`ingest.embedding: "deferred"`, docs/design/12 §3.3) no apply embeds, the
+ * CLI's included: the chunks wait in the embed backlog that `serve`'s embed
+ * slots and remote workers drain (src/work/embed.ts), and a new embedding
+ * model re-applies nothing — the backlog refills for it instead. Tier-1 sidecar replays and the
  * human-written parts of generated pages become child scopes of the document's
  * scope.
  *
@@ -64,7 +68,7 @@ export interface ApplyDocContext {
   store: Store;
   config: KnodeConfig;
   embedder: EmbeddingProvider;
-  /** When set, chunks are written without vectors and embedded later (src/ingest/embed-backfill.ts). */
+  /** When set, chunks are written without vectors and embedded later (src/ingest/embed-backfill.ts, src/work/embed.ts). */
   embeddings?: DeferredEmbeddings;
 }
 
@@ -141,7 +145,9 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const docId = documentIdFor(file);
 
   const live = await findLiveScope(store, 'doc', file);
-  const sameModel = live?.meta.embedModel === embedder.model;
+  // deferred: vectors are the backlog's business, so another model is no reason to re-apply
+  const deferred = embeddingDeferred(config);
+  const sameModel = deferred || live?.meta.embedModel === embedder.model;
   // a wiki page applied before pages could cite raw/docs files is read again
   // once — unless it is a generated view: the summaries cite their documents
   // in machine-written regions, which never count
@@ -199,7 +205,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
         .map((r) => r.chunk_id),
     );
     const missing = chunkRows.filter((c) => !have.has(c.id));
-    if (missing.length > 0 && !ctx.embeddings) {
+    if (missing.length > 0 && !ctx.embeddings && !deferred) {
       const vecs = await embedder.embed(missing.map((c) => c.content));
       missing.forEach((c, i) => vectors.set(c.id, vecs[i]));
     }

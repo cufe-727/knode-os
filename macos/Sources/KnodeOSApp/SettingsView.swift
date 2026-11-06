@@ -192,6 +192,7 @@ struct SettingsView: View {
                 detail: L("Each model endpoint and its key, once. Ingest stages pick from this list, and a deepagents agent below runs on one of them.")
             )
             EmbeddingRoutingSection(config: $config)
+            LocalEmbeddingSection(config: $config)
             VStack(spacing: 0) {
                 providerTableHeader
                 ForEach(Array((config?.embeddingProviders ?? []).enumerated()), id: \.element.id) { index, entry in

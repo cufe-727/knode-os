@@ -1069,6 +1069,11 @@ td.mono { font-size: 12px; }
 .embedding-pool { margin-bottom: 20px; border-color: var(--accent); }
 .embedding-pool-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 10px 0; }
 .embedding-pool-head h4 { margin: 0; }
+.embedding-local ol { margin: 8px 0 12px; padding-left: 20px; display: grid; gap: 8px; font-size: 12px; }
+.embedding-local ol li p { margin: 4px 0 0; color: var(--muted); }
+.embedding-local pre { margin: 4px 0 0; padding: 6px 8px; overflow-x: auto; background: var(--surface-2, rgba(127, 127, 127, 0.08)); border-radius: 4px; font-size: 11px; }
+.embedding-local .embed-check.good { color: var(--good, #2f9e5b); }
+.embedding-local .embed-check.bad { color: var(--bad, #d14343); }
 .embedding-key-limits { border-top: 1px solid var(--border); padding-top: 14px; margin-top: 14px; }
 .embedding-catalog { line-height: 1.8; overflow-wrap: anywhere; font-size: 12px; }
 .embedding-usage { overflow-x: auto; margin-top: 12px; }

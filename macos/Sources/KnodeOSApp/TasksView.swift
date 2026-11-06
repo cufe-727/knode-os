@@ -59,6 +59,7 @@ enum TaskWords {
         case "summarize": L("Summarize")
         case "translate": L("Translate")
         case "judge": L("Review")
+        case "embed": L("Embed")
         default: kind
         }
     }
@@ -69,6 +70,7 @@ enum TaskWords {
         case "summarize": .knodeGood
         case "translate": .orange
         case "judge": .knodeViolet
+        case "embed": .knodeCyan
         default: .secondary
         }
     }

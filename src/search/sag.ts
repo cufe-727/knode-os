@@ -232,16 +232,18 @@ function chooseFrontierEntities(
 async function coarseVectorRank(
   store: Store,
   queryVector: number[],
+  model: string,
   chunkIds: string[],
 ): Promise<VectorRankRow[]> {
   if (chunkIds.length === 0) return [];
-  const placeholders = chunkIds.map((_, i) => `$${i + 2}`).join(',');
+  const placeholders = chunkIds.map((_, i) => `$${i + 3}`).join(',');
+  // the query's own vector space only: another model's vector of the same chunk measures nothing
   return store.query<VectorRankRow>(
     `SELECT e.chunk_id, 1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw
      FROM embeddings e
-     WHERE e.chunk_id IN (${placeholders})
+     WHERE e.model = $2 AND e.chunk_id IN (${placeholders})
      ORDER BY e.embedding <=> $1::${VECTOR_TYPE}`,
-    [toVectorLiteral(queryVector), ...chunkIds],
+    [toVectorLiteral(queryVector), model, ...chunkIds],
   );
 }
 
@@ -426,7 +428,7 @@ export async function sagSearch(
   const structuralPool = [...structural.values()]
     .sort((a, b) => b.structuralScore - a.structuralScore)
     .slice(0, cfg.candidatePool);
-  const vectorRows = await coarseVectorRank(store, queryVector, structuralPool.map((item) => item.result.chunkId));
+  const vectorRows = await coarseVectorRank(store, queryVector, embedder.model, structuralPool.map((item) => item.result.chunkId));
   const structuralResults = fuseStructuralCandidates(structuralPool, vectorRows);
   const results = mergeRoutes(direct, structuralResults, k, cfg.directRatio);
 

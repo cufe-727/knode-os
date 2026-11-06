@@ -66,16 +66,23 @@ export interface WorkerIdentity {
   remote: boolean;
 }
 
-/** `usage` is what the provider said the call used, when it said (src/llm/usage.ts). */
+/**
+ * `usage` is what the provider said the call used, when it said (src/llm/usage.ts).
+ * An embed task answers with `vectors` (one per input, raw as the endpoint made
+ * them) and an empty `text`; `http` is what an embedding endpoint answered
+ * when it refused (src/work/embed.ts).
+ */
 export type TaskOutcome =
-  | { ok: true; text: string; model?: string; usage?: CallUsage }
-  | { ok: false; error: string; kind?: FailureKind; model?: string; usage?: CallUsage };
+  | { ok: true; text: string; model?: string; usage?: CallUsage; vectors?: number[][]; endpointModel?: string }
+  | { ok: false; error: string; kind?: FailureKind; model?: string; usage?: CallUsage; http?: { status: number; retryAfterMs?: number } };
 
 export interface CompleteResult {
   accepted: boolean;
   reason?: string;
   /** The answer was the document's last segment and the document is now in the graph. */
   documentWritten?: boolean;
+  /** An embed batch of backlog chunks: how many of its vectors were written (src/work/embed.ts). */
+  vectorsWritten?: number;
 }
 
 export interface SchedulerOptions {

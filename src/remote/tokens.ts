@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { isWorkKind, WORK_KINDS, WorkKind } from '../work/kinds.js';
+import { isLlmKind, LLM_KINDS, WorkKind } from '../work/kinds.js';
 
 /**
  * Tokens for the remote API (src/remote/api.ts) — one per machine or
@@ -14,14 +14,16 @@ import { isWorkKind, WORK_KINDS, WorkKind } from '../work/kinds.js';
  * created or revoked with the CLI takes effect in a running `serve` at once.
  */
 
-export const REMOTE_SCOPES = ['label', 'read', 'write', 'sql'] as const;
+export const REMOTE_SCOPES = ['label', 'read', 'write', 'sql', 'embed', 'embed-keys'] as const;
 export type RemoteScope = (typeof REMOTE_SCOPES)[number];
 
 export const REMOTE_SCOPE_HELP: Record<RemoteScope, string> = {
-  label: `take leased work and hand back results (remote workers): ${WORK_KINDS.join(', ')}, or the kinds the token names`,
+  label: `take leased model calls and hand back results (remote workers): ${LLM_KINDS.join(', ')}, or the kinds the token names`,
   read: 'list, read and search documents; read the graph and claims',
   write: 'write and delete documents under raw/docs, wiki and playbooks/packs; trigger a sync',
   sql: 'read-only SQL over the catalog views (v_*)',
+  embed: 'take embed batches and hand back vectors made on the worker\'s own endpoint, once it passes calibration (docs/design/12)',
+  'embed-keys': 'also receive the embedding keys marked "Lend to remote workers", and embed on them under this machine\'s quota ledger',
 };
 
 export interface RemoteTokenRecord {
@@ -32,7 +34,7 @@ export interface RemoteTokenRecord {
   scopes: RemoteScope[];
   /** Workspaces it may use: "<user>/<workspace-id>", "team/<name>", or "*". */
   workspaces: string[];
-  /** The kinds of work `label` covers for it; absent, every kind (src/work/kinds.ts). */
+  /** The kinds of model call `label` covers for it; absent, every kind (src/work/kinds.ts). */
   kinds?: WorkKind[];
   createdAt: string;
   lastUsedAt?: string;
@@ -83,8 +85,12 @@ export class RemoteTokenStore {
     for (const s of scopes) if (!(REMOTE_SCOPES as readonly string[]).includes(s)) throw new Error(`unknown scope "${s}" — scopes are ${REMOTE_SCOPES.join(', ')}`);
     const workspaces = [...new Set(opts.workspaces.map(normalizeWorkspaceSpec))];
     if (workspaces.length === 0) throw new Error('name the workspaces the token may use (e.g. admin/finance), or *');
+    if (scopes.includes('embed-keys') && !scopes.includes('embed')) throw new Error('"embed-keys" lends keys to embed slots — give the token the "embed" scope too');
     const kinds = [...new Set(opts.kinds ?? [])];
-    for (const k of kinds) if (!isWorkKind(k)) throw new Error(`unknown kind of work "${k}" — kinds are ${WORK_KINDS.join(', ')}`);
+    for (const k of kinds) {
+      if (k === 'embed') throw new Error('embed work has a scope of its own — give the token the "embed" scope instead of the kind');
+      if (!isLlmKind(k)) throw new Error(`unknown kind of work "${k}" — kinds are ${LLM_KINDS.join(', ')}`);
+    }
     if (kinds.length > 0 && !scopes.includes('label')) throw new Error('kinds narrow the "label" scope — give the token that scope too');
     const file = this.read();
     if (file.tokens.some((t) => t.name === name && !t.revokedAt)) throw new Error(`a live token named "${name}" exists — revoke it first or pick another name`);
@@ -169,7 +175,11 @@ export function tokenAllows(record: RemoteTokenRecord, scope: RemoteScope, works
   return record.workspaces.some((w) => w === '*' || w === ws);
 }
 
-/** May the token take this kind of work in this workspace? `label`, narrowed by its kinds when it names any. */
+/**
+ * May the token take this kind of work in this workspace? A model call needs
+ * `label`, narrowed by its kinds when it names any; an embed batch needs `embed`.
+ */
 export function tokenAllowsKind(record: RemoteTokenRecord, kind: WorkKind, workspace: string): boolean {
+  if (kind === 'embed') return tokenAllows(record, 'embed', workspace);
   return tokenAllows(record, 'label', workspace) && (!record.kinds?.length || record.kinds.includes(kind));
 }

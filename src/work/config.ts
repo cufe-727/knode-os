@@ -1,7 +1,9 @@
 import crypto from 'node:crypto';
 import { KnodeConfig, LlmConfig, LlmProvider, resolveRoutedLlmConfig, routeTargets } from '../config.js';
+import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { contentLanguages } from '../lang/languages.js';
 import { cursorModel, effortFor, speedFor } from '../llm/cli.js';
+import { DEFAULT_PROBE_COSINE, embedBatchPlan, embedOffered, poolModelOf, postprocessFor, PROBE_TEXTS } from './embed.js';
 import { SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
 
 /**
@@ -31,14 +33,38 @@ export interface BackendHint {
 
 export type WorkerHints = Partial<Record<WorkKind, Partial<Record<CliFamily, BackendHint>>>>;
 
+/**
+ * What an embed slot needs to know (docs/design/12 §4.1): the vector space,
+ * how the server cuts batches and finishes vectors, and — for an own endpoint
+ * — whether it may use one here and the probe set it must pass first. Sent
+ * only to a token with the `embed` scope, where the workspace offers embed work.
+ */
+export interface WorkerEmbedding {
+  /** The identity every vector must belong to, e.g. `pool:bge-m3:1024:l2-v1`. */
+  vectorModel: string;
+  /** The model it stands for: an own endpoint must serve one with the same canonical name. */
+  model: string;
+  dimensions: number;
+  batchSize: number;
+  inputChars: number;
+  /** What the server does to a vector it takes: "l2" for a pool (workers return raw vectors). */
+  postprocess: 'l2' | 'none';
+  /** Whether a worker may embed on an endpoint of its own here: pool identities only. */
+  ownEndpoints: boolean;
+  /** The texts an own endpoint embeds to calibrate, and the cosine each vector must reach. */
+  probe: { texts: readonly string[]; minCosine: number } | null;
+}
+
 export interface WorkerConfig {
   /** A hash of everything else here: every lease answer carries it, and a worker reads this again when it changes. */
   version: string;
-  leaseSeconds: { llm: number };
+  leaseSeconds: { llm: number; embed?: number };
   /** The kinds this token may take here and the workspace offers remote workers. */
   kinds: Record<WorkKind, boolean>;
   shares: Record<SharedKind, number>;
   hints: WorkerHints;
+  /** Present when the token may take embed work here. */
+  embedding?: WorkerEmbedding;
 }
 
 const FAMILY: Partial<Record<LlmProvider, CliFamily>> = { 'codex-cli': 'codex', 'claude-cli': 'claude', 'cursor-cli': 'cursor' };
@@ -53,7 +79,26 @@ export function offeredRemotely(config: KnodeConfig, kind: WorkKind): boolean {
   if (kind === 'summarize') return config.server.remote?.offer?.summarize !== false;
   if (kind === 'judge') return config.server.remote?.offer?.judge === true;
   if (kind === 'translate') return contentLanguages(config).on && config.server.remote?.offer?.translate !== false;
+  // vectors are leased work only in deferred mode (docs/design/12 §3.3)
+  if (kind === 'embed') return embedOffered(config);
   return true;
+}
+
+/** The embedding section of `work/config` for the workspace's embedder. */
+export function workerEmbedding(config: KnodeConfig, embedder: Pick<EmbeddingProvider, 'model' | 'dimensions'>): WorkerEmbedding {
+  const plan = embedBatchPlan(config);
+  const poolModel = poolModelOf(embedder.model);
+  const threshold = Number(config.server.remote?.embedProbeCosine);
+  return {
+    vectorModel: embedder.model,
+    model: poolModel ?? embedder.model,
+    dimensions: embedder.dimensions,
+    batchSize: plan.batchSize,
+    inputChars: plan.inputChars,
+    postprocess: postprocessFor(embedder.model),
+    ownEndpoints: poolModel !== null,
+    probe: poolModel ? { texts: PROBE_TEXTS, minCosine: Number.isFinite(threshold) && threshold > 0 && threshold <= 1 ? threshold : DEFAULT_PROBE_COSINE } : null,
+  };
 }
 
 export function workerHints(config: KnodeConfig): WorkerHints {
@@ -102,12 +147,21 @@ function hintsFrom(configs: LlmConfig[]): Partial<Record<CliFamily, BackendHint>
 }
 
 /** The configuration a worker holding a token that may take `allowed` reads for this workspace. */
-export function workerConfig(config: KnodeConfig, opts: { allowed: readonly WorkKind[]; leaseMs: number; shares: Record<SharedKind, number> }): WorkerConfig {
+export function workerConfig(config: KnodeConfig, opts: {
+  allowed: readonly WorkKind[];
+  leaseMs: number;
+  shares: Record<SharedKind, number>;
+  /** The workspace's embedder and how long an embed lease lasts, for a token that may take embed work. */
+  embed?: { embedder: Pick<EmbeddingProvider, 'model' | 'dimensions'>; leaseMs: number } | null;
+}): WorkerConfig {
+  const kinds = Object.fromEntries(WORK_KINDS.map((k) => [k, opts.allowed.includes(k) && offeredRemotely(config, k)])) as Record<WorkKind, boolean>;
+  const embedding = kinds.embed && opts.embed ? workerEmbedding(config, opts.embed.embedder) : undefined;
   const body = {
-    leaseSeconds: { llm: Math.round(opts.leaseMs / 1000) },
-    kinds: Object.fromEntries(WORK_KINDS.map((k) => [k, opts.allowed.includes(k) && offeredRemotely(config, k)])) as Record<WorkKind, boolean>,
+    leaseSeconds: { llm: Math.round(opts.leaseMs / 1000), ...(embedding && opts.embed ? { embed: Math.round(opts.embed.leaseMs / 1000) } : {}) },
+    kinds,
     shares: opts.shares,
     hints: workerHints(config),
+    ...(embedding ? { embedding } : {}),
   };
   const version = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex').slice(0, 16);
   return { version, ...body };

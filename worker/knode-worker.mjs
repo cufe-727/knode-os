@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // knode-os remote labeling worker — one file, no dependencies, Node 20+.
 //
-// Takes work from a knode-os server (POST /remote/v1/.../work/lease) — extraction segments
-// and summary pages — runs each call on a model available on this machine, and hands back
-// the raw reply (…/work/complete). The server builds every prompt and checks every reply;
-// this script only runs the calls. Leases are renewed while a call runs and handed back
-// when the worker stops, so a stopped or crashed worker never strands work.
+// Takes work from a knode-os server (POST /remote/v1/.../work/lease) — extraction segments,
+// summary pages, judge calls, translations and batches of texts to embed — runs each call on
+// a model available on this machine, and hands back the raw reply or the raw vectors
+// (…/work/complete). The server builds every prompt and every embedding input, and checks
+// every reply and vector; this script only runs the calls. Leases are renewed while a call
+// runs and handed back when the worker stops, so a stopped or crashed worker never strands work.
 //
 //   KNODE_TOKEN=knr_… node knode-worker.mjs --server https://knode-os.example \
 //     --workspace admin/finance --backends codex:2,cursor:2
@@ -18,6 +19,14 @@
 //   claude  claude -p, one turn (--claude-model, --claude-effort)
 //   api     an OpenAI-compatible /chat/completions endpoint (--api-base-url, --api-model;
 //           the key comes from the variable named by --api-key-env, default OPENAI_API_KEY)
+//   embed   batches of texts to embed, on an OpenAI-compatible /embeddings endpoint of this machine's
+//           own: --embed-base-url http://127.0.0.1:12020/v1 --embed-model BAAI/bge-m3 (a local
+//           bge-m3, TEI, vLLM, Ollama, or an account of your own; a key, if it needs one, from the
+//           variable named by --embed-key-env). The token needs the "embed" scope, and the server
+//           takes the vectors only for its pool's model (canonical name: BAAI/bge-m3 = bge-m3) and
+//           only once the endpoint passes calibration: it embeds the server's 16 probe texts at
+//           startup and after every configuration change, and every vector must come within the
+//           server's cosine (0.98) of the server's own. Spot checks follow; a miss parks the slots.
 //
 // Kinds of work (--kinds extract,summarize,judge,translate; default: every kind the server offers this token):
 //   extract    extraction segments, answered with a JSON object
@@ -34,7 +43,8 @@
 // Other options: --name <worker> (default: hostname), --timeout-ms <ms> (default 600000), --idle-ms <ms> (poll wait),
 // --header "Name: value" (repeatable; e.g. a Cloudflare Access service token),
 // --token-file <path> (instead of KNODE_TOKEN), --once (exit when there is no work),
-// --check (show what the token may do, what the server offers and which backends are installed, then exit).
+// --check (show what the token may do, what the server offers, which backends are installed and — for embed —
+// the embedding identity and whether the endpoint passes calibration, then exit).
 
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -75,7 +85,10 @@ const idleMs = Math.max(100, Number(args.idleMs ?? 20_000));
 const KINDS = ['extract', 'summarize', 'judge', 'translate'];
 const kindSpec = args.kinds ?? process.env.KNODE_KINDS;
 const askedKinds = kindSpec ? String(kindSpec).split(',').map((k) => k.trim()).filter(Boolean) : null;
-for (const k of askedKinds ?? []) if (!KINDS.includes(k)) throw new Error(`unknown kind of work "${k}" — use ${KINDS.join(', ')}`);
+for (const k of askedKinds ?? []) {
+  if (k === 'embed') throw new Error('embed work is taken by embed slots: use --backends embed:N with --embed-base-url and --embed-model');
+  if (!KINDS.includes(k)) throw new Error(`unknown kind of work "${k}" — use ${KINDS.join(', ')}`);
+}
 if (!server || !/^https?:\/\//.test(server)) throw new Error('--server http(s)://… required (or KNODE_SERVER)');
 if (!/^[^/]+\/[^/]+$/.test(workspace)) throw new Error('--workspace <user>/<workspace-id> required (or KNODE_WORKSPACE)');
 if (!token) throw new Error('a token is required: KNODE_TOKEN=knr_… or --token-file <path>');
@@ -88,6 +101,18 @@ const extraHeaders = Object.fromEntries(args.headers.map((h) => {
   return [h.slice(0, i).trim(), h.slice(i + 1).trim()];
 }));
 const base = `${server}/remote/v1/w/${workspace.split('/').map(encodeURIComponent).join('/')}`;
+
+// an own embedding endpoint (the embed backend)
+const isLoopback = (url) => /^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(url);
+const embedBaseUrl = String(args.embedBaseUrl ?? process.env.KNODE_EMBED_BASE_URL ?? '').replace(/\/+$/, '');
+const embedModel = String(args.embedModel ?? process.env.KNODE_EMBED_MODEL ?? '');
+const embedKey = args.embedKeyEnv ? String(process.env[String(args.embedKeyEnv)] ?? '') : '';
+if (embedBaseUrl && !/^https?:\/\//.test(embedBaseUrl)) throw new Error('--embed-base-url http(s)://…/v1 required');
+if (embedBaseUrl && !embedModel) throw new Error('--embed-base-url needs --embed-model (the model the endpoint serves, e.g. BAAI/bge-m3)');
+if (args.embedKeyEnv && !embedKey) throw new Error(`--embed-key-env names ${args.embedKeyEnv}, which is not set`);
+if (embedKey && embedBaseUrl.startsWith('http://') && !isLoopback(embedBaseUrl)) {
+  throw new Error('refusing to send the embedding key over plain http to a remote host — use https');
+}
 
 /* ------------------------------- logging -------------------------------- */
 
@@ -137,7 +162,11 @@ async function readWorkConfig() {
 /** Read the config again (a lease answer said it changed); one read at a time, failures logged. */
 function rereadWorkConfig() {
   reading ??= readWorkConfig()
-    .then(() => log(`server configuration changed: ${describeKinds()}`))
+    .then(() => {
+      // every configuration change means calibrating again before the next embed batch
+      calibration = null;
+      log(`server configuration changed: ${describeKinds()}`);
+    })
     .catch((err) => log(`could not read the server configuration: ${err.message}`))
     .finally(() => (reading = null));
   return reading;
@@ -151,8 +180,9 @@ function kindsNow() {
 
 function describeKinds() {
   if (!work) return 'a server from before work/* — extraction only';
-  const offered = KINDS.filter((k) => work.kinds?.[k] === true);
-  return `offers ${offered.join(', ') || 'nothing to this token'}; this worker takes ${kindsNow().join(', ') || 'nothing'}`;
+  const offered = [...KINDS, 'embed'].filter((k) => work.kinds?.[k] === true);
+  const takes = [...kindsNow(), ...(hasEmbedSlots && work.kinds?.embed === true ? ['embed'] : [])];
+  return `offers ${offered.join(', ') || 'nothing to this token'}; this worker takes ${takes.join(', ') || 'nothing'}`;
 }
 
 /** How the server runs this kind of work on this CLI, unless this worker was given a model of its own. */
@@ -182,6 +212,80 @@ function rest(health, kind) {
   }
   if (ms) health.pausedUntil = Math.max(health.pausedUntil, Date.now() + ms);
   return ms;
+}
+
+/* ------------------------------- embedding ------------------------------- */
+// An embed slot's call: OpenAI-compatible /embeddings with encoding_format "float", `dimensions` when the key
+// sends them and OpenRouter's provider pin when it has an upstream — a copy of PooledEmbeddingProvider's
+// request (src/ingest/embedding-router.ts). The vectors go back raw, as little-endian float32 in base64;
+// the server checks and finishes them. An error body is never read: it may echo the key.
+
+async function embedRequest(endpoint, inputs) {
+  const res = await fetch(`${endpoint.baseUrl.replace(/\/+$/, '')}/embeddings`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(endpoint.apiKey ? { authorization: `Bearer ${endpoint.apiKey}` } : {}) },
+    body: JSON.stringify({
+      model: endpoint.model, input: inputs, encoding_format: 'float',
+      ...(endpoint.sendDimensions ? { dimensions: endpoint.dimensions } : {}),
+      ...(endpoint.upstream ? { provider: { only: [endpoint.upstream], allow_fallbacks: false } } : {}),
+    }),
+    signal: AbortSignal.timeout(Math.min(timeoutMs, 120_000)),
+  });
+  if (!res.ok) {
+    await res.body?.cancel();
+    const err = new Error(`embedding endpoint returned HTTP ${res.status}`);
+    err.http = { status: res.status };
+    throw err;
+  }
+  const body = await res.json();
+  const data = Array.isArray(body?.data) ? [...body.data].sort((a, b) => a.index - b.index) : null;
+  if (!data || data.length !== inputs.length) throw new Error(`embedding response has ${data?.length ?? 'no'} vectors for ${inputs.length} inputs`);
+  const vectors = data.map((d) => d?.embedding);
+  if (!vectors.every((v) => Array.isArray(v) && v.length > 0)) throw new Error('embedding response has a vector that is no array of numbers');
+  const tokens = body.usage?.prompt_tokens ?? body.usage?.total_tokens;
+  return { vectors, endpointModel: typeof body.model === 'string' ? body.model : null, tokens: count(tokens) || null };
+}
+
+/** Vectors as the server takes them: little-endian float32, n × dimensions, base64. */
+function encodeVectors(vectors) {
+  const dims = vectors[0]?.length ?? 0;
+  const buf = Buffer.alloc(vectors.length * dims * 4);
+  vectors.forEach((v, i) => v.forEach((x, j) => buf.writeFloatLE(Number(x), (i * dims + j) * 4)));
+  return { vectors: buf.toString('base64'), dimensions: dims };
+}
+
+const ownEndpoint = embedBaseUrl ? { baseUrl: embedBaseUrl, model: embedModel, apiKey: embedKey, sendDimensions: false, upstream: null } : null;
+let calibration = null; // the id the server gave this endpoint's calibration; null until it passes
+let calibrating = null;
+let embedParkedUntil = 0;
+let embedNote = '';
+
+/** Embed the server's probe set on the own endpoint and hand it in; true when the server takes the endpoint. */
+async function calibrate() {
+  const probe = work?.embedding?.probe;
+  if (!ownEndpoint || !probe?.texts?.length) return false;
+  let made;
+  try {
+    made = await embedRequest(ownEndpoint, probe.texts);
+  } catch (err) {
+    log(`embed: calibration could not reach ${ownEndpoint.baseUrl}: ${err.message} — trying again in 1 min`);
+    embedParkedUntil = Date.now() + 60_000;
+    return false;
+  }
+  const { data } = await call('POST', `${base}/work/calibrate`, {
+    worker: workerName, model: ownEndpoint.model, ...(made.endpointModel ? { endpointModel: made.endpointModel } : {}), ...encodeVectors(made.vectors),
+  });
+  if (data.ok) {
+    calibration = data.calibration;
+    log(`embed: ${ownEndpoint.model} passed calibration for ${work.embedding.vectorModel} (cosine ≥ ${Number(data.minCosine).toFixed(4)}, mean ${Number(data.meanCosine).toFixed(4)})`);
+    return true;
+  }
+  calibration = null;
+  const waitMs = Math.max(60_000, Number(data.retryAfterSeconds ?? 900) * 1000);
+  embedParkedUntil = Date.now() + waitMs;
+  embedNote = data.reason ?? 'refused';
+  log(`embed: the server refused ${ownEndpoint.model} at ${ownEndpoint.baseUrl}: ${embedNote}${Number.isFinite(data.minCosine) ? ` (lowest cosine ${Number(data.minCosine).toFixed(4)})` : ''} — calibrating again in ${Math.round(waitMs / 60_000)} min`);
+  return false;
 }
 
 /* ------------------------------- backends ------------------------------- */
@@ -537,6 +641,13 @@ const BACKENDS = {
       }
     },
   },
+  embed: {
+    bin: () => null,
+    label: () => `embed:${embedModel || 'no endpoint'}`,
+    complete() {
+      throw new Error('embed slots take only embed batches');
+    },
+  },
   api: {
     bin: () => null,
     label: () => `api:${args.apiModel ?? process.env.KNODE_API_MODEL ?? '?'}`,
@@ -574,6 +685,10 @@ const backends = backendSpec.split(',').map((part) => {
   return { name, slots, impl: BACKENDS[name], health: newHealth() };
 }).filter((b) => b.slots > 0);
 if (backends.length === 0) throw new Error('no backend has a slot');
+const hasEmbedSlots = backends.some((b) => b.name === 'embed');
+if (hasEmbedSlots && !ownEndpoint) {
+  throw new Error('embed slots need an endpoint of this machine\'s own: --embed-base-url http://…/v1 --embed-model <model> (lent keys are not taken yet)');
+}
 
 /* ------------------------------ check mode ------------------------------ */
 
@@ -598,12 +713,26 @@ if (args.check) {
     if (judge) log(`judge calls: ${judge.waiting} waiting on a review, ${judge.leases?.length ?? 0} out`);
     const translations = status.kinds?.translate;
     if (translations?.enabled) log(`translations into ${translations.primary}: ${translations.due} due at the last look, ${translations.leases?.length ?? 0} segments out`);
+    const vectors = status.kinds?.embed;
+    if (vectors?.mode === 'deferred') log(`embedding: ${vectors.backlog ?? '?'} chunks without a vector, ${vectors.leases?.length ?? 0} batches out`);
     log(`${status.workers?.length ?? 0} workers seen`);
+    const emb = work.embedding;
+    if (hasEmbedSlots) {
+      if (!emb) log('embed: not offered to this token here (it needs the "embed" scope, and the workspace ingest.embedding "deferred")');
+      else {
+        log(`embed: vectors as ${emb.vectorModel} (${emb.dimensions} dimensions, batches of ${emb.batchSize}); own endpoints ${emb.ownEndpoints ? 'taken' : 'not taken for this identity'}`);
+        if (emb.ownEndpoints) await calibrate();
+      }
+    }
   } else {
     const { data: status } = await call('GET', `${base}/labeling/status`);
     log(`${workspace}: ${status.queued} documents queued, ${status.leases?.length ?? 0} segments out, ${status.workers?.length ?? 0} workers seen`);
   }
   for (const b of backends) {
+    if (b.name === 'embed') {
+      log(`backend embed × ${b.slots}: ${ownEndpoint.baseUrl} (${ownEndpoint.model})${calibration ? ' — calibrated' : embedNote ? ` — refused: ${embedNote}` : ''}`);
+      continue;
+    }
     const runs = kindsNow().map((kind) => `${kind} on ${b.impl.label(hintFor(kind, b.name))}`);
     log(`backend ${b.name} × ${b.slots}: ${onPath(b.impl.bin()) ? 'installed' : 'NOT FOUND on PATH'} (${runs.join(', ') || b.impl.label(null)})`);
   }
@@ -714,6 +843,106 @@ async function slot(backend, n) {
   }
 }
 
+/** An embed slot: lease a batch, embed it on the own endpoint, hand back the raw vectors. */
+async function embedSlot(backend, n) {
+  const identity = { worker: `${workerName}/embed#${n}`, backend: backend.impl.label() };
+  let idleRounds = 0;
+  while (!stopping) {
+    const pause = Math.max(backend.health.pausedUntil, embedParkedUntil) - Date.now();
+    if (pause > 0) {
+      if (args.once && embedParkedUntil > Date.now()) break;
+      await sleep(Math.min(pause, 15_000));
+      continue;
+    }
+    if (reading) await reading;
+    if (!work?.kinds?.embed || !work.embedding) {
+      if (args.once && ++idleRounds >= 2) break;
+      await sleep(idleMs * (0.75 + Math.random() * 0.5));
+      continue;
+    }
+    if (!calibration) {
+      calibrating ??= calibrate().catch((err) => {
+        log(`embed: calibration failed: ${err.message}`);
+        embedParkedUntil = Date.now() + 60_000;
+        return false;
+      }).finally(() => (calibrating = null));
+      if (!(await calibrating)) continue;
+    }
+    let task;
+    let leaseSeconds = 120;
+    try {
+      const { data } = await call('POST', `${base}/work/lease`, { ...identity, kinds: ['embed'], max: 1, calibration });
+      if (data.configVersion && data.configVersion !== work.version) void rereadWorkConfig();
+      if (data.embed?.calibrate) {
+        log(`embed: ${data.embed.reason}${data.embed.parkedUntil ? ` (until ${data.embed.parkedUntil})` : ''}`);
+        calibration = null;
+        // parked: wait it out; otherwise calibrate again, a moment later (a server that restarted forgot the calibration)
+        embedParkedUntil = data.embed.parkedUntil ? Math.max(Date.now() + 60_000, Date.parse(data.embed.parkedUntil) || 0) : Date.now() + 5_000;
+        if (args.once && ++idleRounds >= 2) break;
+        continue;
+      }
+      task = data.tasks?.[0];
+      leaseSeconds = data.leaseSeconds ?? leaseSeconds;
+    } catch (err) {
+      log(`${identity.worker}: lease failed: ${err.message}`);
+      if (err.status === 401 || err.status === 403) {
+        stopping = true;
+        break;
+      }
+      await sleep(30_000);
+      continue;
+    }
+    if (!task) {
+      if (args.once && ++idleRounds >= 2) break;
+      await sleep(idleMs * (0.75 + Math.random() * 0.5));
+      continue;
+    }
+    idleRounds = 0;
+    held.set(task.id, { identity, route: 'work' });
+    const renew = setInterval(() => {
+      call('POST', `${base}/work/renew`, { ...identity, ids: [task.id] }).catch((err) => log(`${identity.worker}: renew failed: ${err.message}`));
+    }, Math.max(10_000, (leaseSeconds * 1000) / 3));
+    const started = Date.now();
+    let outcome;
+    try {
+      const made = await embedRequest(ownEndpoint, task.inputs);
+      outcome = {
+        ok: true, text: '', model: ownEndpoint.model, ...(made.endpointModel ? { endpointModel: made.endpointModel } : {}), ...encodeVectors(made.vectors),
+        ...(made.tokens ? { usage: { inputTokens: made.tokens, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 } } : {}),
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const status = err?.http?.status;
+      const kind = status === 401 || status === 403 ? 'fatal' : status === 429 || status >= 500 ? 'transient' : classify(message);
+      outcome = { ok: false, error: message, kind, model: ownEndpoint.model };
+    } finally {
+      clearInterval(renew);
+    }
+    if (stopping && !outcome.ok) break;
+    backend.health.calls++;
+    try {
+      const { data } = await call('POST', `${base}/work/complete`, { ...identity, id: task.id, ...outcome });
+      held.delete(task.id);
+      const secs = ((Date.now() - started) / 1000).toFixed(1);
+      if (!data.accepted) {
+        log(`${identity.worker}: ${task.label} not taken back: ${data.reason}`);
+        if (/parked/.test(data.reason ?? '')) calibration = null;
+      } else if (outcome.ok) log(`${identity.worker}: ${task.label} embedded in ${secs}s${data.vectorsWritten !== undefined ? ` — ${data.vectorsWritten} vectors written` : ''}`);
+      else log(`${identity.worker}: ${task.label} failed (${outcome.kind}) in ${secs}s: ${outcome.error.slice(0, 200)}`);
+    } catch (err) {
+      log(`${identity.worker}: could not hand back ${task.label}: ${err.message}`);
+    }
+    if (outcome.ok) {
+      backend.health.ok++;
+      Object.assign(backend.health, { transientStreak: 0, modelStreak: 0, fatalStreak: 0 });
+    } else {
+      backend.health.failed++;
+      const ms = rest(backend.health, outcome.kind);
+      if (ms) log(`embed: resting ${Math.ceil(ms / 60_000)} min after a ${outcome.kind} failure`);
+    }
+  }
+}
+
 async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
@@ -746,6 +975,8 @@ for (;;) {
 }
 log(`knode worker ${workerName} → ${server} ${workspace}: ${backends.map((b) => `${b.name} × ${b.slots}`).join(', ')} (session ${crypto.randomUUID().slice(0, 8)})`);
 log(`${workspace}: ${describeKinds()}`);
-if (kindsNow().length === 0) log('nothing to take here — check --kinds, the token\'s kinds and what the server offers');
-await Promise.all(backends.flatMap((b) => Array.from({ length: b.slots }, (_, i) => slot(b, i + 1))));
+const llmSlots = backends.some((b) => b.name !== 'embed');
+if (llmSlots && kindsNow().length === 0) log('nothing to take here — check --kinds, the token\'s kinds and what the server offers');
+if (hasEmbedSlots && !work?.kinds?.embed) log('embed: not offered to this token here — it needs the "embed" scope, and the workspace ingest.embedding "deferred"');
+await Promise.all(backends.flatMap((b) => Array.from({ length: b.slots }, (_, i) => (b.name === 'embed' ? embedSlot(b, i + 1) : slot(b, i + 1)))));
 log('no more work — exiting');

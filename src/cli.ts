@@ -54,7 +54,7 @@ import { estimateProcessing } from './estimate/processing.js';
 import { quotaSources } from './estimate/quota.js';
 import { estimateStudy } from './estimate/study.js';
 import { REMOTE_SCOPES, RemoteScope, RemoteTokenStore } from './remote/tokens.js';
-import { WORK_KINDS } from './work/kinds.js';
+import { LLM_KINDS } from './work/kinds.js';
 import { registerAuthCommands } from './auth/cli.js';
 import type { KnodeClient } from './client/client.js';
 import { noteLocalCommands, registerClientCommands, serverClient } from './client/commands.js';
@@ -340,7 +340,7 @@ remoteTokens
   .requiredOption('--name <name>', 'who uses it, e.g. macbook-labeler or aliyun-sg')
   .option('--scope <scope...>', `what it may do: ${REMOTE_SCOPES.join(', ')} (repeat or comma-separate)`, collect, [] as string[])
   .option('--workspace <workspace...>', 'workspaces it may use: <user>/<workspace-id>, team/<name>, or * (repeat or comma-separate)', collect, [] as string[])
-  .option('--kinds <kind...>', `the kinds of work "label" covers for it: ${WORK_KINDS.join(', ')} (default: all)`, collect, [] as string[])
+  .option('--kinds <kind...>', `the kinds of model call "label" covers for it: ${LLM_KINDS.join(', ')} (default: all; embed work has the "embed" scope)`, collect, [] as string[])
   .action((opts: { name: string; scope: string[]; workspace: string[]; kinds: string[] }) => {
     const store = new RemoteTokenStore(dataDir());
     const { token, record } = store.create({ name: opts.name, scopes: opts.scope as RemoteScope[], workspaces: opts.workspace, kinds: opts.kinds });

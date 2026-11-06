@@ -127,6 +127,9 @@ async function vectorSearch(
 ): Promise<RankedChunk[]> {
   const qv = queryVector ?? (await embedder.embed([query]))[0];
   const p = new Params([toVectorLiteral(qv)]);
+  // only vectors of the query's own space: while a new model's vectors are still coming in
+  // (a re-embed, or the deferred backlog) the table holds two (docs/design/12 §3.3)
+  const model = p.add(embedder.model);
   const cond = docLiveAt('d', p, asOf, filter);
   const lim = p.add(k);
   return store.query<RankedChunk>(
@@ -135,7 +138,7 @@ async function vectorSearch(
      FROM embeddings e
      JOIN chunks c ON c.id = e.chunk_id
      JOIN documents d ON d.id = c.document_id
-     WHERE ${cond}
+     WHERE e.model = ${model} AND ${cond}
      ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
      LIMIT ${lim}`,
     p.list,

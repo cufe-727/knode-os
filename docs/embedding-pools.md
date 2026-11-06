@@ -16,6 +16,39 @@ These are **application caps**, not a live view of the provider's billing balanc
 
 The configuration API redacts keys as `***`, preserving the stored secret when the UI saves the placeholder. Key values stay in user configuration files outside the repository. `GET /api/config/embedding-usage` returns counters (requests, tokens, and how many of the tokens are estimates) and cooldowns; `POST /api/config/embedding-test` tests a draft pool or one named key without running the LLM stages.
 
+## Deferred embedding and endpoints of your own
+
+`ingest.embedding` says when a document's vectors are made ([design 12](design/12-remote-processing.md) §3.3):
+
+- `"inline"`, the default: the CLI embeds while it applies a document; `serve` applies without them and its
+  background embedder fills them in right after (`src/ingest/embed-backfill.ts`).
+- `"deferred"`: no sync embeds. A document is keyword-searchable once synced and vector-searchable once its batch
+  lands. The chunks without a vector for the workspace's identity are a backlog, newest documents first, which
+  `serve`'s embed slots (`ingest.embedSlots`, default 8, `0` for none) and remote workers drain as leased work
+  (`src/work/embed.ts`). The duplicate audits' entity and claim vectors go on the same queue, ahead of the backlog.
+  Changing the embedding model re-applies nothing: the backlog refills for the new identity and drains.
+
+Vector search reads only vectors of the query's own identity (`WHERE e.model = …`), so while a new model's vectors
+are coming in, recall comes from those already there.
+
+**An endpoint of your own.** Every vector the pool makes counts against its daily caps. A bge-m3 on your own
+hardware has none. Settings → Providers & Agents → *Embedding on this machine* walks through running one on the
+service's machine (Ollama, Text Embeddings Inference, or a small transformers server: the CLS token's vector,
+L2-normalized, 1024 dimensions), then takes its URL and model (`ingest.embedEndpoint`). **Check endpoint** embeds the
+16 probe texts there and compares each with the pool's vectors for them; every cosine must reach
+`server.remote.embedProbeCosine` (0.98), and the model must have the pool's canonical name. Saving checks it again
+and turns on deferred mode. The embed slots then embed on it, with one batch in 100 spot-checked; when it is
+refused, parked by a missed spot check or unreachable, they embed on the pool. Another machine's model works the
+same way through the remote worker (`--backends embed:N --embed-base-url … --embed-model …`, a token with the `embed`
+scope: [remote workers](remote-labeling.md#embedding-on-a-workers-own-endpoint)).
+
+The reference vectors come from the pool once per identity (16 texts) and stay in `<workspace>/.knode/embedding-probe.json`.
+A different model, however small, makes vectors in another space and cannot join a bge-m3 pool; to use one, make it
+the pool model, which re-embeds the workspace.
+
+**Lending keys to workers** (design 12 §4.2) is not built. It would only move calls: a lent key's call counts against
+the same daily cap wherever it runs. The `lendToWorkers` key field and the `embed-keys` token scope are reserved for it.
+
 ## Token counts: reported and estimated
 
 The token caps count the provider's own number where a response has one and an estimate where it does not. Whether a response has one depends on the provider (checked 2026-10-18 with one request to one key of each):

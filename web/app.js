@@ -1434,7 +1434,7 @@ const STAGES = {
   review: { title: 'Review', icon: '⚖', about: 'judge calls: duplicate entities and claims' },
 };
 const UNIT_WORDS = { documents: ['document', 'documents'], chunks: ['chunk', 'chunks'], translations: ['translation', 'translations'], calls: ['call', 'calls'] };
-const WORK_KIND_WORDS = { extract: 'Extract', summarize: 'Summarize', translate: 'Translate', judge: 'Review' };
+const WORK_KIND_WORDS = { extract: 'Extract', summarize: 'Summarize', translate: 'Translate', judge: 'Review', embed: 'Embed' };
 const JOB_KIND_WORDS = { study: 'Study', research: 'Page', init: 'Initialize', ask: 'Ask' };
 const SCHEDULE_WORDS = {
   dream: ['Dream', 'reviews recent agent traces'],
@@ -1551,7 +1551,7 @@ function paintTasksInFlight(t) {
   el.innerHTML = `<table class="tasks-table"><thead><tr><th>stage</th><th>document</th><th>part</th><th>worker</th><th class="num">running</th><th class="num">lease ends</th></tr></thead><tbody>
     ${t.inFlight.map((x) => `<tr>
       <td><span class="kind-pill k-${esc(x.kind)}">${esc(WORK_KIND_WORDS[x.kind] ?? x.kind)}</span></td>
-      <td class="tasks-subject">${x.kind === 'judge' ? esc(x.subject) : `<a href="#" class="mono" data-open="${esc(x.subject)}">${esc(x.subject)}</a>`}</td>
+      <td class="tasks-subject">${x.kind === 'judge' || x.kind === 'embed' ? esc(x.subject) : `<a href="#" class="mono" data-open="${esc(x.subject)}">${esc(x.subject)}</a>`}</td>
       <td class="hint">${esc(x.detail ?? '')}</td>
       <td><span class="mono">${esc(x.backend)}</span>${x.remote ? ' <span class="tag remote">remote</span>' : ''}<div class="hint mono tasks-worker-id">${esc(x.worker)}</div></td>
       <td class="num mono">${spanText(x.ageSeconds)}</td>
@@ -6075,6 +6075,8 @@ let connectionDrafts = [];
 let embeddingDrafts = [];
 let embeddingUse = '';
 let embeddingPoolDraft = { enabled: false, model: 'bge-m3', dimensions: 1024, batchSize: 16 };
+// when vectors are made, and an embeddings endpoint of this machine's own for serve's embed slots (docs/design/12 §3.3, §4.3)
+let embedLocalDraft = { embedding: 'inline', embedSlots: 8, baseUrl: '', model: '', apiKey: '', checked: null };
 let embeddingUsage = [];
 const defaultEmbeddingLimits = { requestsPerMinute: 60, tokensPerMinute: 100000, requestsPerDay: 5000, tokensPerDay: 1000000, concurrency: 2, resetTimezone: 'UTC' };
 /** Which connection is the default — the mirror of `embeddingUse`. */
@@ -6307,6 +6309,42 @@ function renderEmbeddingPool() {
       const source = embeddingTokenSource(u);
       return `<div><span>${esc(e.label)}</span><span>${u.requestsToday || 0} / ${limit.requestsPerDay} req</span><span title="${esc(source.title)}">${u.tokensToday || 0} / ${limit.tokensPerDay} tokens${source.tag ? ` · ${source.tag}` : ''}</span><span>${u.cooldownUntil > Date.now() ? 'Cooling down' : esc(limit.resetTimezone)}</span></div>`;
     }).join('')}</div><p class="cfg-callout">App usage persists across restarts. Tokens are the provider's own count when its response includes one (SiliconFlow, OpenRouter), otherwise an estimate for the model (Cloudflare reports none). Other apps are not included. Zero limits block requests.</p></details>`;
+}
+
+const embedEndpointKey = (d) => `${d.baseUrl.trim().replace(/\/+$/, '')}|${d.model.trim()}|${d.apiKey}`;
+
+function renderEmbeddingLocal() {
+  const d = embedLocalDraft;
+  const check = d.checked;
+  const checkLine = !check ? '' : check.ok
+    ? `<span class="embed-check good">Passed: the lowest probe cosine against the pool's vectors is ${Number(check.minCosine).toFixed(4)} (needs ${check.threshold}) · ${check.ms} ms.${check.saved ? '' : ' Save &amp; apply to use it.'}</span>`
+    : `<span class="embed-check bad">Refused: ${esc(check.reason || check.error || 'the check failed')}</span>`;
+  $('#cfg-embedding-local').innerHTML = `<div class="embedding-pool-head"><h4>Embedding on this machine</h4>
+      <span class="mono">${d.baseUrl ? esc(d.baseUrl) : 'no endpoint of its own'} · ${d.embedding}</span></div>
+    <p class="cfg-callout">Run the pool's model on this machine and the embed slots use it instead of the pool's daily quota. Its vectors are taken only once they match the pool's, checked with 16 fixed texts, and spot-checked after; when they stop matching, the slots go back to the pool.</p>
+    <details${d.baseUrl ? '' : ' open'}><summary>Set up a local embedding model, step by step</summary><ol>
+      <li><strong>Run an OpenAI-compatible embeddings server on this machine</strong> that serves the pool's model (${esc(embeddingPoolDraft.model || 'bge-m3')}, ${embeddingPoolDraft.dimensions || 1024} dimensions), on 127.0.0.1 only. Any of these works:
+        <p><b>Ollama</b> (lightest to set up): install it, then <code>ollama pull bge-m3</code>. URL <code>http://127.0.0.1:11434/v1</code>, model <code>bge-m3</code>.</p>
+        <p><b>Text Embeddings Inference</b> (Hugging Face): <code>text-embeddings-router --model-id BAAI/bge-m3 --hostname 127.0.0.1 --port 12020</code>, or its Docker image with the port bound to 127.0.0.1. URL <code>http://127.0.0.1:12020/v1</code>, model <code>BAAI/bge-m3</code>.</p>
+        <p><b>A small Python server</b>, what was tested here: BAAI/bge-m3 with transformers on the Apple GPU (MPS) in fp16, the CLS token's vector L2-normalized, 1024 dimensions, up to 8,192 tokens, behind <code>POST /v1/embeddings</code>. About 4 GB of memory and 17,500 tokens/s on an M5 Pro; its vectors matched the pool's at cosine 0.9999 or better.</p>
+        <p>A different or smaller model (bge-small, nomic-embed…) makes vectors in another space and cannot share this pool: the check refuses it. To use one, make it the pool model instead, which re-embeds the workspace.</p></li>
+      <li><strong>See that it answers</strong>, with 1024 numbers per text:<pre>curl -s http://127.0.0.1:12020/v1/embeddings -H 'content-type: application/json' \\
+  -d '{"model":"BAAI/bge-m3","input":["你好","hello"]}'</pre></li>
+      <li><strong>Enter its URL and model below and press Check endpoint.</strong> It embeds the probe texts there and compares each vector with the pool's; every one must reach cosine ${esc(String(loadedConfig?.server?.remote?.embedProbeCosine ?? 0.98))}.</li>
+      <li><strong>Save &amp; apply.</strong> The workspace switches to deferred embedding: a sync writes chunks at once and the embed slots fill in their vectors on your endpoint. The save checks the endpoint once more.</li>
+      <li>Other machines can lend theirs too, with the worker: <code>node knode-worker.mjs --backends embed:2 --embed-base-url http://127.0.0.1:12020/v1 --embed-model BAAI/bge-m3</code> and a token with the <code>embed</code> scope (<code>knode-os remote token create --scope embed</code>).</li>
+    </ol></details>
+    <div class="cfg-grid cfg-grid-3">
+      <label>Endpoint URL<input data-embed-local="baseUrl" placeholder="http://127.0.0.1:12020/v1" value="${esc(d.baseUrl)}" spellcheck="false" /></label>
+      <label>Model<input data-embed-local="model" placeholder="BAAI/bge-m3" value="${esc(d.model)}" spellcheck="false" /></label>
+      <label>Key (optional)<input data-embed-local="apiKey" type="password" placeholder="none, or env:VAR" value="${esc(d.apiKey)}" autocomplete="off" /></label>
+      <label>Vectors made<select data-embed-local="embedding">
+        <option value="inline"${d.embedding === 'inline' ? ' selected' : ''}>while syncing (inline)</option>
+        <option value="deferred"${d.embedding === 'deferred' ? ' selected' : ''}>by embed slots, after (deferred)</option></select></label>
+      <label>Embed slots here<input data-embed-local="embedSlots" type="number" min="0" max="32" value="${d.embedSlots}" /></label>
+    </div>
+    <div class="embedding-pool-head"><span id="cfg-embed-local-status" role="status">${checkLine}</span>
+      <div class="cfg-actions"><button data-embed-local-action="check"${d.baseUrl && d.model ? '' : ' disabled'}>Check endpoint</button><button data-embed-local-action="remove"${d.baseUrl ? '' : ' disabled'}>Remove</button></div></div>`;
 }
 
 // Which of today's tokens a provider counted. A day recorded before the split existed has none, so no tag.
@@ -6643,6 +6681,16 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     embeddingDrafts = (cfg.embeddingProviders ?? []).map((e) => ({ ...e }));
     embeddingUse = cfg.embeddingUse || embeddingDrafts[0]?.id || '';
     embeddingPoolDraft = { enabled: false, model: 'bge-m3', dimensions: 1024, batchSize: 16, ...cfg.embeddingPool };
+    {
+      const e = cfg.ingest?.embedEndpoint;
+      embedLocalDraft = {
+        embedding: cfg.ingest?.embedding === 'deferred' ? 'deferred' : 'inline', embedSlots: cfg.ingest?.embedSlots ?? 8,
+        baseUrl: e?.baseUrl ?? '', model: e?.model ?? '', apiKey: e?.apiKey ?? '', checked: null,
+      };
+      // what is saved passed the check when it was saved
+      if (e) embedLocalDraft.saved = embedEndpointKey(embedLocalDraft);
+      renderEmbeddingLocal();
+    }
     embeddingUsage = [];
     void refreshEmbeddingUsage().catch(() => {});
     connectionDrafts = (cfg.connections ?? []).map((c) => ({ ...c }));
@@ -6773,6 +6821,12 @@ function gatherConfig() {
     ingest: {
       concurrency: Number($('#cfg-ingest-concurrency').value) || undefined,
       convertConcurrency: Number($('#cfg-ingest-convert').value) || undefined,
+      embedding: embedLocalDraft.embedding,
+      embedSlots: embedLocalDraft.embedSlots,
+      // checked again by the server on save when it changed; null removes it
+      embedEndpoint: embedLocalDraft.baseUrl.trim()
+        ? { baseUrl: embedLocalDraft.baseUrl.trim(), model: embedLocalDraft.model.trim(), apiKey: embedLocalDraft.apiKey }
+        : null,
     },
     connections: connectionDrafts.map((c) => ({ ...c, label: c.label.trim() || c.id })),
     llmUse,
@@ -7707,6 +7761,46 @@ $('#cfg-embedding-pool').addEventListener('click', async (event) => {
     } else { await refreshEmbeddingUsage(); }
   } catch (error) { status(error.message); }
   finally { event.target.disabled = false; }
+});
+
+$('#cfg-embedding-local').addEventListener('input', (event) => {
+  const field = event.target.dataset.embedLocal;
+  if (!field) return;
+  embedLocalDraft[field] = field === 'embedSlots' ? Math.max(0, Math.min(32, Number(event.target.value) || 0)) : event.target.value;
+  if (['baseUrl', 'model', 'apiKey'].includes(field)) {
+    embedLocalDraft.checked = null;
+    $('#cfg-embed-local-status').innerHTML = embedLocalDraft.saved && embedLocalDraft.saved !== embedEndpointKey(embedLocalDraft) ? 'Changed: check it before saving.' : '';
+    $('#cfg-embedding-local [data-embed-local-action="check"]').disabled = !(embedLocalDraft.baseUrl.trim() && embedLocalDraft.model.trim());
+  }
+});
+
+$('#cfg-embedding-local').addEventListener('click', async (event) => {
+  const action = event.target.dataset.embedLocalAction;
+  if (!action) return;
+  if (action === 'remove') {
+    Object.assign(embedLocalDraft, { baseUrl: '', model: '', apiKey: '', checked: null });
+    renderEmbeddingLocal();
+    $('#cfg-embed-local-status').textContent = 'Removed. Save & apply to embed on the pool only.';
+    return;
+  }
+  const scope = activeWorkspace()?.id;
+  event.target.disabled = true;
+  $('#cfg-embed-local-status').textContent = 'Embedding the 16 probe texts on the endpoint and comparing them with the pool…';
+  try {
+    const d = embedLocalDraft;
+    const result = await api('/api/config/embedding-endpoint/check', {
+      method: 'POST', body: JSON.stringify({ baseUrl: d.baseUrl.trim(), model: d.model.trim(), apiKey: d.apiKey }),
+    });
+    if (activeWorkspace()?.id !== scope) return;
+    d.checked = { ...result, saved: d.saved === embedEndpointKey(d) && result.ok };
+    // an endpoint is used by the embed slots, which run in deferred mode
+    if (result.ok && d.embedding !== 'deferred') d.embedding = 'deferred';
+    if (result.ok && d.embedSlots < 1) d.embedSlots = 2;
+    renderEmbeddingLocal();
+  } catch (error) {
+    $('#cfg-embed-local-status').textContent = error.message;
+    event.target.disabled = false;
+  }
 });
 
 function setConfigBusy(busy) {

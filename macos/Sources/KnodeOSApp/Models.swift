@@ -1466,15 +1466,38 @@ struct LLMConnection: Codable, Equatable, Identifiable {
 /// The per-stage rates the pipeline runs at. The service owns the rest of its
 /// `ingest` block (chunk size, watch); those fields are left out deliberately,
 /// and it keeps whatever this client does not send.
+/// An OpenAI-compatible embeddings endpoint on the service's machine, for its
+/// embed slots (`ingest.embedEndpoint`, docs/design/12 §4.3). The service
+/// takes its vectors only once they pass calibration against the pool's.
+struct EmbedEndpointConfig: Codable, Equatable {
+    var baseUrl: String
+    var model: String
+    /// Optional; "***" from the service means "keep the saved one".
+    var apiKey: String?
+}
+
 struct IngestConfig: Codable, Equatable {
     /// Parallel documents in flight during the index pass.
     var concurrency: Int
     /// Parallel document conversions in the prepare pass.
     var convertConcurrency: Int
+    /// "inline" (vectors while syncing) or "deferred" (embed slots fill them in after).
+    var embedding: String
+    /// The service's own embed slots in deferred mode.
+    var embedSlots: Int
+    /// Nil: none. Sent as null then, which removes a saved one.
+    var embedEndpoint: EmbedEndpointConfig?
 
-    init(concurrency: Int = 4, convertConcurrency: Int = 2) {
+    enum CodingKeys: String, CodingKey {
+        case concurrency, convertConcurrency, embedding, embedSlots, embedEndpoint
+    }
+
+    init(concurrency: Int = 4, convertConcurrency: Int = 2, embedding: String = "inline", embedSlots: Int = 8, embedEndpoint: EmbedEndpointConfig? = nil) {
         self.concurrency = concurrency
         self.convertConcurrency = convertConcurrency
+        self.embedding = embedding
+        self.embedSlots = embedSlots
+        self.embedEndpoint = embedEndpoint
     }
 
     init(from decoder: any Decoder) throws {
@@ -1482,7 +1505,33 @@ struct IngestConfig: Codable, Equatable {
         let fallback = IngestConfig()
         concurrency = try container.decodeIfPresent(Int.self, forKey: .concurrency) ?? fallback.concurrency
         convertConcurrency = try container.decodeIfPresent(Int.self, forKey: .convertConcurrency) ?? fallback.convertConcurrency
+        embedding = try container.decodeIfPresent(String.self, forKey: .embedding) ?? fallback.embedding
+        embedSlots = try container.decodeIfPresent(Int.self, forKey: .embedSlots) ?? fallback.embedSlots
+        embedEndpoint = try container.decodeIfPresent(EmbedEndpointConfig.self, forKey: .embedEndpoint)
     }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(concurrency, forKey: .concurrency)
+        try container.encode(convertConcurrency, forKey: .convertConcurrency)
+        try container.encode(embedding, forKey: .embedding)
+        try container.encode(embedSlots, forKey: .embedSlots)
+        // an explicit null removes the endpoint; a missing key would keep it
+        try container.encode(embedEndpoint, forKey: .embedEndpoint)
+    }
+}
+
+/// `POST /api/config/embedding-endpoint/check`: the probe set embedded on the endpoint, against the pool's vectors.
+struct EmbedEndpointCheck: Decodable {
+    var ok: Bool
+    var reason: String?
+    var error: String?
+    var vectorModel: String?
+    var endpointModel: String?
+    var minCosine: Double?
+    var meanCosine: Double?
+    var threshold: Double?
+    var ms: Int?
 }
 
 struct ExtractionConfig: Codable, Equatable {

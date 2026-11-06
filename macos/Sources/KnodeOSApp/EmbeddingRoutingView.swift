@@ -151,6 +151,180 @@ struct EmbeddingRoutingSection: View {
     }
 }
 
+/// An embedding model on the service's own machine (docs/design/12 §4.3): a
+/// guide to running one, and its endpoint for the service's embed slots. The
+/// service takes its vectors only once they match the pool's — checked here
+/// before saving, and again when saved — and spot-checks them after.
+struct LocalEmbeddingSection: View {
+    @EnvironmentObject private var app: AppModel
+    @Binding var config: KnodeConfig?
+    @State private var baseUrl = ""
+    @State private var model = ""
+    @State private var apiKey = ""
+    @State private var loadedFrom: EmbedEndpointConfig?
+    @State private var check: EmbedEndpointCheck?
+    @State private var status = ""
+    @State private var working = false
+    @State private var showGuide = false
+
+    private var ingest: Binding<IngestConfig> {
+        Binding(get: { config?.ingest ?? IngestConfig() }, set: { config?.ingest = $0 })
+    }
+    private var poolModel: String { config?.embeddingPool?.model.isEmpty == false ? config!.embeddingPool!.model : "bge-m3" }
+    private var draft: EmbedEndpointConfig? {
+        let url = baseUrl.trimmingCharacters(in: .whitespaces)
+        guard !url.isEmpty else { return nil }
+        return EmbedEndpointConfig(baseUrl: url, model: model.trimmingCharacters(in: .whitespaces), apiKey: apiKey.isEmpty ? nil : apiKey)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label(L("Embedding on this machine"), systemImage: "cpu")
+                    .font(.headline).foregroundStyle(Color.knodeCyan)
+                Spacer()
+                Text(ingest.wrappedValue.embedEndpoint?.baseUrl ?? L("no endpoint of its own"))
+                    .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+            }
+            Text(L("Run the pool's model on the service's machine and its embed slots use it instead of the pool's daily quota. Its vectors are taken only once they match the pool's, checked with 16 fixed texts, and spot-checked after; when they stop matching, the slots go back to the pool."))
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            DisclosureGroup(L("Set up a local embedding model, step by step"), isExpanded: $showGuide) {
+                VStack(alignment: .leading, spacing: 10) {
+                    step(1, L("Run an OpenAI-compatible embeddings server on the service's machine that serves the pool's model (%@, 1024 dimensions), on 127.0.0.1 only. Any of these works:", poolModel))
+                    option(L("Ollama — the lightest to set up"), L("Install it, then run the command below. URL http://127.0.0.1:11434/v1, model bge-m3."), "ollama pull bge-m3")
+                    option(L("Text Embeddings Inference (Hugging Face)"), L("Or its Docker image, with the port bound to 127.0.0.1. URL http://127.0.0.1:12020/v1, model BAAI/bge-m3."), "text-embeddings-router --model-id BAAI/bge-m3 --hostname 127.0.0.1 --port 12020")
+                    option(L("A small Python server — what was tested here"), L("BAAI/bge-m3 with transformers on the Apple GPU (MPS) in fp16: the CLS token's vector, L2-normalized, 1024 dimensions, up to 8,192 tokens, behind POST /v1/embeddings. About 4 GB of memory and 17,500 tokens/s on an M5 Pro; its vectors matched the pool's at cosine 0.9999 or better."), nil)
+                    Text(L("A different or smaller model (bge-small, nomic-embed…) makes vectors in another space and cannot share this pool: the check refuses it. To use one, make it the pool model instead, which re-embeds the workspace."))
+                        .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    step(2, L("See that it answers, with 1024 numbers per text:"))
+                    code("curl -s http://127.0.0.1:12020/v1/embeddings -H 'content-type: application/json' -d '{\"model\":\"BAAI/bge-m3\",\"input\":[\"你好\",\"hello\"]}'")
+                    step(3, L("Enter its URL and model below and press Check endpoint. It embeds the probe texts there and compares each vector with the pool's; every one must reach cosine 0.98."))
+                    step(4, L("Save & apply. The workspace switches to deferred embedding: a sync writes chunks at once and the embed slots fill in their vectors on your endpoint. The save checks the endpoint once more."))
+                    step(5, L("Other machines can lend theirs too, with the worker and a token with the embed scope:"))
+                    code("node knode-worker.mjs --backends embed:2 --embed-base-url http://127.0.0.1:12020/v1 --embed-model BAAI/bge-m3")
+                }.padding(.top, 8)
+            }.font(.caption)
+            HStack(alignment: .top, spacing: 12) {
+                field(L("Endpoint URL"), TextField("http://127.0.0.1:12020/v1", text: $baseUrl))
+                field(L("Model"), TextField("BAAI/bge-m3", text: $model)).frame(width: 160)
+                field(L("Key (optional)"), SecureField(L("none, or env:VAR"), text: $apiKey)).frame(width: 150)
+            }
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(L("Vectors made")).font(.caption).foregroundStyle(.secondary)
+                    Picker("", selection: ingest.embedding) {
+                        Text(L("while syncing (inline)")).tag("inline")
+                        Text(L("by embed slots, after (deferred)")).tag("deferred")
+                    }.labelsHidden().frame(width: 240)
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(L("Embed slots here")).font(.caption).foregroundStyle(.secondary)
+                    TextField("8", value: ingest.embedSlots, format: .number).frame(width: 70)
+                }
+                Spacer()
+                Button(L("Check endpoint")) { Task { await runCheck() } }
+                    .disabled(working || draft == nil || model.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button(L("Remove")) { remove() }.disabled(working || ingest.wrappedValue.embedEndpoint == nil && baseUrl.isEmpty)
+            }
+            if !status.isEmpty {
+                Text(status).font(.caption).textSelection(.enabled)
+                    .foregroundStyle(check?.ok == true ? Color.knodeGood : check == nil ? Color.secondary : Color.orange)
+            }
+        }
+        .padding(18)
+        .background(Color.knodeCyan.opacity(0.03), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.knodeCyan.opacity(0.15)))
+        .onAppear { load() }
+        .onChange(of: config?.ingest.embedEndpoint) { _, saved in
+            // a reload from the service (another workspace, a save) replaces the fields
+            if saved != loadedFrom { load() }
+        }
+        .onChange(of: baseUrl) { _, _ in edited() }
+        .onChange(of: model) { _, _ in edited() }
+        .onChange(of: apiKey) { _, _ in edited() }
+    }
+
+    private func step(_ n: Int, _ text: String) -> some View {
+        Text("\(n). \(text)").font(.caption).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func option(_ title: String, _ detail: String, _ command: String?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.caption).bold()
+            if let command { code(command) }
+            Text(detail).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }.padding(.leading, 14)
+    }
+
+    private func code(_ text: String) -> some View {
+        Text(text).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+            .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
+    }
+
+    private func field<Content: View>(_ title: String, _ content: Content) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            content.textFieldStyle(.roundedBorder)
+        }
+    }
+
+    private func load() {
+        let saved = config?.ingest.embedEndpoint
+        loadedFrom = saved
+        baseUrl = saved?.baseUrl ?? ""
+        model = saved?.model ?? ""
+        apiKey = saved?.apiKey ?? ""
+        check = nil
+        status = ""
+    }
+
+    /// The fields changed: the draft forgets its endpoint until it is checked again.
+    private func edited() {
+        guard let draft else {
+            if config?.ingest.embedEndpoint != nil, baseUrl.isEmpty { config?.ingest.embedEndpoint = nil }
+            return
+        }
+        if draft == loadedFrom { config?.ingest.embedEndpoint = loadedFrom; return }
+        check = nil
+        status = L("Changed: check it before saving.")
+        // only a checked endpoint goes into the draft config; Save & apply checks it once more
+        config?.ingest.embedEndpoint = loadedFrom
+    }
+
+    private func remove() {
+        loadedFrom = nil
+        baseUrl = ""; model = ""; apiKey = ""
+        check = nil
+        config?.ingest.embedEndpoint = nil
+        status = L("Removed. Save & apply to embed on the pool only.")
+    }
+
+    private func runCheck() async {
+        guard let draft else { return }
+        working = true
+        defer { working = false }
+        status = L("Embedding the 16 probe texts on the endpoint and comparing them with the pool…")
+        do {
+            let result = try await app.client().checkEmbedEndpoint(draft)
+            check = result
+            if result.ok {
+                config?.ingest.embedEndpoint = draft
+                if config?.ingest.embedding != "deferred" { config?.ingest.embedding = "deferred" }
+                if (config?.ingest.embedSlots ?? 0) < 1 { config?.ingest.embedSlots = 2 }
+                loadedFrom = draft
+                status = L("Passed: the lowest probe cosine against the pool's vectors is %@ (needs %@) · %@ ms. Save & apply to use it.",
+                           String(format: "%.4f", result.minCosine ?? 0), String(format: "%.2f", result.threshold ?? 0.98), String(result.ms ?? 0))
+            } else {
+                status = L("Refused: %@", result.reason ?? result.error ?? L("the check failed"))
+            }
+        } catch {
+            check = EmbedEndpointCheck(ok: false, reason: error.localizedDescription)
+            status = L("Refused: %@", error.localizedDescription)
+        }
+    }
+}
+
 struct EmbeddingKeyRoutingFields: View {
     @Binding var entry: EmbeddingConnection
     let load: (Bool) async throws -> ModelListResponse
