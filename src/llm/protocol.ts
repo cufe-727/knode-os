@@ -99,7 +99,27 @@ export function demoteToChat(baseUrl: string): void {
   negotiated.set(endpointKey(baseUrl), Promise.resolve('chat'));
 }
 
+/**
+ * Parameters a call can do without, and the models on an endpoint that refused
+ * one. Reasoning models take no sampling temperature (OpenAI's answer
+ * "Unsupported parameter: 'temperature'", Claude from 5 on "`temperature` is
+ * deprecated"), and Anthropic's OpenAI-compatible endpoint takes no
+ * `response_format` but a JSON schema. The first refusal is answered by sending
+ * the call again without it, and every call after it goes without from the start.
+ */
+export const OPTIONAL_PARAMETERS = new Set(['temperature', 'response_format']);
+const refused = new Set<string>();
+
+export function takesParameter(baseUrl: string, model: string, parameter: string): boolean {
+  return !refused.has(`${endpointKey(baseUrl)}|${model}|${parameter}`);
+}
+
+export function refusedParameter(baseUrl: string, model: string, parameter: string): void {
+  refused.add(`${endpointKey(baseUrl)}|${model}|${parameter}`);
+}
+
 /** Tests share a process; a verdict from one fake endpoint must not leak into the next. */
 export function resetProtocolCache(): void {
   negotiated.clear();
+  refused.clear();
 }

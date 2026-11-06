@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { LlmConfig, LlmProtocol, resolveSecret } from '../../config.js';
+import { LlmConfig, LlmEffort, LlmProtocol, resolveSecret } from '../../config.js';
 import type { LlmBackend, LlmProviderPlugin } from '../../plugins/types.js';
 import type { ChatMessage, CompletionOptions, ImageAttachment } from '../client.js';
-import { demoteToChat, negotiateProtocol } from '../protocol.js';
+import { demoteToChat, negotiateProtocol, OPTIONAL_PARAMETERS, refusedParameter, takesParameter } from '../protocol.js';
 import { usageFromOpenAi } from '../usage.js';
 
 /**
@@ -64,16 +64,37 @@ export class OpenAiCompatibleBackend implements LlmBackend {
     };
   }
 
+  /**
+   * POST a request with a temperature of 0.2, without the optional parameters
+   * this model has refused (see `OPTIONAL_PARAMETERS`): a 400 that names one
+   * is sent again without it.
+   */
+  private async post(route: string, model: string, body: Record<string, unknown>): Promise<{ res: Response; request: string }> {
+    const sent: Record<string, unknown> = { ...body, temperature: 0.2 };
+    const optional = () => Object.keys(sent).filter((key) => OPTIONAL_PARAMETERS.has(key));
+    for (const key of optional()) if (!takesParameter(this.baseUrl, model, key)) delete sent[key];
+    for (;;) {
+      const request = JSON.stringify(sent);
+      const res = await fetch(`${this.baseUrl}${route}`, { method: 'POST', headers: this.headers(), body: request });
+      if (res.status !== 400) return { res, request };
+      const error = await res.clone().text();
+      const named = optional().find((key) => error.includes(key));
+      if (!named) return { res, request };
+      refusedParameter(this.baseUrl, model, named);
+      delete sent[named];
+    }
+  }
+
   /** The Responses wire. `null` = no such route here; the caller falls back. */
   private async viaResponses(messages: ChatMessage[], opts: CompletionOptions, model: string): Promise<string | null> {
-    const request = JSON.stringify({
+    const effort = apiEffort(opts.effort);
+    const { res, request } = await this.post('/responses', model, {
       model,
       input: withResponsesImages(messages, opts.images ?? []),
-      temperature: 0.2,
       ...(opts.maxTokens ? { max_output_tokens: opts.maxTokens + REASONING_ALLOWANCE } : {}),
       ...(opts.json ? { text: { format: { type: 'json_object' } } } : {}),
+      ...(effort ? { reasoning: { effort } } : {}),
     });
-    const res = await fetch(`${this.baseUrl}/responses`, { method: 'POST', headers: this.headers(), body: request });
     if (ROUTE_MISSING.has(res.status)) {
       await res.text().catch(() => '');
       // a pinned wire reports the missing route instead of quietly changing wires
@@ -92,14 +113,14 @@ export class OpenAiCompatibleBackend implements LlmBackend {
 
   /** The Chat Completions wire: what most "OpenAI-compatible" endpoints mean. */
   private async viaChatCompletions(messages: ChatMessage[], opts: CompletionOptions, model: string): Promise<string> {
-    const request = JSON.stringify({
+    const effort = apiEffort(opts.effort);
+    const { res, request } = await this.post('/chat/completions', model, {
       model,
       messages: withOpenAiImages(messages, opts.images ?? []),
-      temperature: 0.2,
       ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
       ...(opts.json ? { response_format: { type: 'json_object' } } : {}),
+      ...(effort ? { reasoning_effort: effort } : {}),
     });
-    const res = await fetch(`${this.baseUrl}/chat/completions`, { method: 'POST', headers: this.headers(), body: request });
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`chat request failed (${res.status}): ${body.slice(0, 300)}`);
@@ -131,6 +152,12 @@ export function openAiProvider(): LlmProviderPlugin {
 
 /** Statuses that mean "this endpoint has no such route", as opposed to "your request was wrong". */
 const ROUTE_MISSING = new Set([404, 405, 501]);
+
+/** A call's effort as OpenAI's API spells it; the CLIs' higher tiers are its highest. None for 'default'. */
+function apiEffort(effort: LlmEffort | undefined): string | undefined {
+  if (!effort || effort === 'default') return undefined;
+  return effort === 'max' || effort === 'ultra' ? 'xhigh' : effort;
+}
 
 /**
  * Chat Completions' `max_tokens` bounds the visible answer; Responses'
