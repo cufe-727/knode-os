@@ -2,7 +2,6 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 import type { LlmEffort, LlmSpeed } from '../config.js';
 import { estimateEmbeddingTokens } from '../ingest/embedding-tokens.js';
@@ -16,6 +15,7 @@ import { classifyFailure } from '../labeling/failures.js';
 import { Meter, MeterTag, parseTag } from './meter.js';
 import type { EmbeddingBudget } from './quota.js';
 import { fileLines } from './runstore.js';
+import { evalTempDir } from './tmp.js';
 
 /**
  * The model gateway every system under test talks to (docs/design/23 §4).
@@ -64,7 +64,8 @@ export class CodexBackend implements ChatBackend {
   }
 
   async complete(req: ChatRequest): Promise<ChatResult> {
-    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-codex-'));
+    const tmp = evalTempDir('codex');
+    const cwd = tmp.root;
     const outFile = path.join(cwd, 'reply.txt');
     try {
       const schemaFile = path.join(cwd, 'schema.json');
@@ -85,7 +86,7 @@ export class CodexBackend implements ChatBackend {
       }
       return { text, usage: events.usage, model: this.opts.model || 'codex' };
     } finally {
-      fs.rmSync(cwd, { recursive: true, force: true });
+      tmp.cleanup();
     }
   }
 }

@@ -18,7 +18,9 @@ import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
 import { scoreUsage } from './score/usage.js';
 import { ChatBackend, ClientBackend, CodexBackend, startShim } from './shim.js';
+import { closeAdapters } from './systems/external.js';
 import { makeSystems } from './systems/index.js';
+import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
 import { SystemEnv, SystemUnderTest, taggedEmbedder } from './systems/types.js';
 import { extractFinalAnswer } from './metrics/text.js';
 import { AnswerRecord, BuildRecord, emptyUsage, Suite, SUITES, Task } from './types.js';
@@ -207,6 +209,18 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const citing = new Set<string>();
   const loaded: { pack: LoadedPack; staged: StagedCorpus }[] = [];
 
+  // a run stopped by a signal takes down what it started and the temp directories it holds;
+  // one killed outright leaves them for the next run's sweep
+  const swept = sweepStaleTempDirs();
+  if (swept) progress(`removed ${swept} temp directories of runs that are gone`);
+  const onSignal = (signal: NodeJS.Signals) => {
+    closeAdapters();
+    removeHeldTempDirs();
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+
   try {
     // every pack is validated before anything is spent on any of them
     const packs = opts.packs.map((dir) => {
@@ -323,6 +337,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
 
     if (!opts.skipScoring) await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing }, progress);
   } finally {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+    closeAdapters();
     await shim.close();
     for (const l of loaded) l.staged.cleanup();
   }

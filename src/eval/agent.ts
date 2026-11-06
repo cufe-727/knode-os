@@ -7,6 +7,7 @@ import { cliCommand, CODEX_SERVICES_OFF, effortFor, resolveExecutable, runProces
 import { catalogArgs, exitFailure, withCodexCatalog } from '../llm/codex-catalog.js';
 import { CallUsage, readCodexEvents } from '../llm/usage.js';
 import { EVAL_HOME } from './pack.js';
+import { evalTempDir } from './tmp.js';
 
 /**
  * One Codex agent session over a folder (docs/design/23 §3): the grep
@@ -147,7 +148,8 @@ interface CodexItem {
 }
 
 export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
-  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-agent-out-'));
+  const out = evalTempDir('agent-out');
+  const outDir = out.root;
   const outFile = path.join(outDir, 'answer.txt');
   const maxSteps = opts.maxSteps ?? 25;
   const commands: string[] = [];
@@ -229,14 +231,14 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
       ...(error && !text ? { error } : {}),
     };
   } finally {
-    fs.rmSync(outDir, { recursive: true, force: true });
+    out.cleanup();
   }
 }
 
 /** A copy of `src` in a fresh temp directory with nothing beside it, for an agent to read. */
 export function isolatedCopy(src: string, name = 'kb'): { dir: string; cleanup: () => void } {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-ro-'));
+  const { root, cleanup } = evalTempDir('ro');
   const dir = path.join(root, name);
   fs.cpSync(src, dir, { recursive: true });
-  return { dir, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+  return { dir, cleanup };
 }

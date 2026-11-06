@@ -56,7 +56,9 @@ class AdapterProcess {
     if (this.child && this.child.exitCode === null) return this.child;
     const python = venvPython(this.id);
     if (!fs.existsSync(python)) throw new Error(`${this.id} is not installed — run \`knode-os eval systems install ${this.id}\``);
-    const child = spawn(python, [path.join(adaptersDir(), `${this.id}_adapter.py`)], { env: this.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    // a process group of its own: what the adapter starts (GraphRAG's `graphrag index`,
+    // HippoRAG's worker processes) stops with it, and a terminal's Ctrl-C reaches only the runner
+    const child = spawn(python, [path.join(adaptersDir(), `${this.id}_adapter.py`)], { env: this.env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     child.stdout!.on('data', (d: Buffer) => {
       this.buffer += d.toString('utf8');
       let nl: number;
@@ -86,6 +88,8 @@ class AdapterProcess {
       this.stderr = (this.stderr + d.toString('utf8')).slice(-8000);
     });
     child.on('exit', (code) => {
+      // whatever it started outlives it otherwise
+      stopGroup(child);
       for (const [, p] of this.pending) {
         clearTimeout(p.timer);
         p.reject(new Error(`${this.id} adapter exited (${code}): ${this.stderr.slice(-600)}`));
@@ -110,13 +114,30 @@ class AdapterProcess {
   }
 
   close(): void {
-    this.child?.stdin?.end();
-    this.child?.kill('SIGTERM');
+    if (!this.child) return;
+    this.child.stdin?.end();
+    stopGroup(this.child);
     this.child = null;
   }
 }
 
+/** SIGTERM to an adapter's process group: the adapter and everything it started. */
+function stopGroup(child: ChildProcess): void {
+  if (!child.pid) return;
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+  } catch {
+    // the whole group is gone already
+  }
+}
+
 const processes = new Map<string, AdapterProcess>();
+
+/** Stop every adapter this process started, as a run ends or is stopped. */
+export function closeAdapters(): void {
+  for (const p of processes.values()) p.close();
+  processes.clear();
+}
 
 function adapter(id: ExternalId, env: SystemEnv): AdapterProcess {
   const key = `${id}|${env.workDir}`;

@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import type { Server } from 'node:http';
@@ -23,6 +24,7 @@ import { exactMatch, extractFinalAnswer, stripMarkers, tokenF1 } from '../src/ev
 import { checkEndpoint, endpointUnder } from '../src/eval/endpoint.js';
 import { EmbeddingBudget, QuotaGuard } from '../src/eval/quota.js';
 import { chunkDocs } from '../src/eval/retrieval.js';
+import { evalTempDir, removeHeldTempDirs, sweepStaleTempDirs } from '../src/eval/tmp.js';
 import { byFileName } from '../src/eval/systems/external.js';
 import { llmWikiBuild } from '../src/eval/systems/llm-wiki.js';
 import { citationsIn } from '../src/eval/prompts.js';
@@ -358,7 +360,8 @@ describe('a run on the fixture pack', () => {
     const workDir = path.join(tmp, 'wiki-resume');
     const meter = new Meter();
     const lines: string[] = [];
-    const env = (quota: QuotaGuard) => ({ runId: 'resume', pack, staged: stageCorpus(pack), workDir, meter, quota, models: { model: '', buildEffort: 'low' }, log: (m: string) => lines.push(m) }) as unknown as SystemEnv;
+    const staged = stageCorpus(pack);
+    const env = (quota: QuotaGuard) => ({ runId: 'resume', pack, staged, workDir, meter, quota, models: { model: '', buildEffort: 'low' }, log: (m: string) => lines.push(m) }) as unknown as SystemEnv;
     // the quota runs out before the third session: the build stops with two done
     let reads = 0;
     const tight = new QuotaGuard({ policy: { maxWaitMs: -1 }, sleep: async () => {}, read: async () => ({ windows: [{ minutes: 10080, usedPercent: ++reads > 2 ? 99 : 0, resetsAt: null }], limitReached: null }) as unknown as CodexAccount });
@@ -371,6 +374,7 @@ describe('a run on the fixture pack', () => {
     expect(meter.all((e) => e.system === 'llm-wiki' && e.replayed)).toHaveLength(2);
     expect(meter.all((e) => e.system === 'llm-wiki' && !e.replayed)).toHaveLength(4);
     expect(fs.readdirSync(path.join(res.kbDir, 'sources'))).toHaveLength(7);
+    staged.cleanup();
   });
 
   it('runs two packs at once without one closing the other\'s index', async () => {
@@ -434,5 +438,25 @@ describe("an embedding endpoint of the run's own", () => {
     } finally {
       await new Promise<void>((resolve) => server!.close(() => resolve()));
     }
+  });
+});
+
+describe("a run's temp directories", () => {
+  it('are named for their process, and a sweep removes only those whose process is gone', () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'sweep-'));
+    const dead = spawnSync(process.execPath, ['-e', 'console.log(process.pid)']).stdout.toString().trim();
+    const kept = [`knode-eval-ro-${process.pid}-AbC123`, 'knode-eval-test-AbC123', 'knode-eval-wiki-0123456789abcdef'];
+    for (const name of [`knode-eval-corpus-${dead}-AbC123`, `knode-eval-agent-out-${dead}-xyz789`, ...kept]) fs.mkdirSync(path.join(dir, name));
+    expect(sweepStaleTempDirs(dir)).toBe(2);
+    expect(fs.readdirSync(dir).sort()).toEqual([...kept].sort());
+
+    const held = evalTempDir('corpus');
+    expect(path.basename(held.root)).toMatch(new RegExp(`^knode-eval-corpus-${process.pid}-[A-Za-z0-9]{6}$`));
+    const done = evalTempDir('ro');
+    done.cleanup();
+    expect(fs.existsSync(done.root)).toBe(false);
+    // what is still held goes when a stopped run lets go of everything
+    removeHeldTempDirs();
+    expect(fs.existsSync(held.root)).toBe(false);
   });
 });

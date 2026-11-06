@@ -7,6 +7,7 @@ import {
   CorpusDoc, CorpusDocSchema, GoldAlias, GoldAliasSchema, GoldFact, GoldFactSchema, GoldLink, GoldLinkSchema,
   PackManifest, PackManifestSchema, Task, TaskSchema,
 } from './types.js';
+import { evalTempDir } from './tmp.js';
 
 /**
  * Benchmark packs on disk (docs/design/23 §1).
@@ -208,7 +209,7 @@ export function stageCorpus(pack: LoadedPack, opts: { fraction?: number; seed?: 
     : [...pack.docs].sort((a, b) => seededKey(seed, a.path).localeCompare(seededKey(seed, b.path)))
       .slice(0, Math.max(1, Math.round(pack.docs.length * fraction)));
   const kept = new Set(keep.map((d) => d.path));
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-'));
+  const { root, cleanup } = evalTempDir('corpus');
   const dir = path.join(root, 'corpus');
   for (const d of keep) {
     const to = path.join(dir, d.path);
@@ -216,7 +217,7 @@ export function stageCorpus(pack: LoadedPack, opts: { fraction?: number; seed?: 
     fs.copyFileSync(path.join(pack.dir, 'corpus', d.path), to);
   }
   const tasks = pack.tasks.filter((t) => t.afterUpdate || t.evidence.every((e) => kept.has(e.doc)));
-  return { dir, docs: keep, tasks, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+  return { dir, docs: keep, tasks, cleanup };
 }
 
 /** Copy an update batch into a staged corpus; returns the documents it added or replaced. */
