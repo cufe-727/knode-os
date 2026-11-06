@@ -1,7 +1,8 @@
 import { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { cliCommand, cliFailureText, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess, speedFor } from '../llm/cli.js';
+import { cliCommand, cliFailureText, CODEX_SERVICES_OFF, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess, speedFor } from '../llm/cli.js';
+import { catalogArgs, codexCatalog, configuredCodexModel, withCodexCatalog } from '../llm/codex-catalog.js';
 import { AgentProvider, CliAgent, ResearchAgent } from './agent.js';
 import { Effort, Freshness, NativeAgentSpec, Speed } from './profile.js';
 import type { ExtraMcpServer } from './sources.js';
@@ -364,8 +365,12 @@ export function writeCodexAgentLayers(cwd: string, agents: NativeAgentSpec[], fr
 /** A session that is going to be spawned as a process — the only kind `sessionArgs` can describe. */
 export type CliSessionInput = Omit<SessionInput, 'agent'> & { agent: CliAgent };
 
-/** The argv a session is launched with (exported so tests and `research export` can print it). */
-export function sessionArgs(input: CliSessionInput): { cmd: string; args: string[]; stdin: string; outFile?: string } {
+/**
+ * The argv a session is launched with (exported so tests and `research export`
+ * can print it). `catalog`: the copy of Codex's model catalog a codex session
+ * reads instead of downloading it (src/llm/codex-catalog.ts).
+ */
+export function sessionArgs(input: CliSessionInput, catalog: string | null = null): { cmd: string; args: string[]; stdin: string; outFile?: string } {
   const { provider, cliPath, model } = input.agent;
   const cmd = cliCommand(provider, cliPath);
   const files = input.files !== false;
@@ -416,6 +421,15 @@ export function sessionArgs(input: CliSessionInput): { cmd: string; args: string
       cmd,
       args: [
         'exec', '-', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', input.cwd,
+        // The person's ~/.codex/config.toml applies (the comments below rely on its
+        // approval policy), but not ChatGPT's plugins, apps and analytics: a session
+        // with them kept downloading the plugin catalog for as long as it ran (11–15 MB
+        // in a 30 s session, 29 MB in two minutes), fetched the apps listing (0.64 MB)
+        // and uploaded 0.7–1.3 MB of analytics, and every turn carried ~3,200 tokens of
+        // plugin skills (Codex 0.166, 2026-11-06). Without them and with the catalog copy
+        // a one-word session moved ↓43 KB ↑41 KB.
+        ...CODEX_SERVICES_OFF,
+        ...catalogArgs(catalog),
         '-c', `mcp_servers.knode-os.url=${JSON.stringify(mcpUrlWithWorkspace(input.mcp))}`,
         '-c', 'mcp_servers.knode-os.bearer_token_env_var="KNODE_MCP_TOKEN"',
         // codex gates MCP tools per server; under approval_policy = "never" (a common
@@ -513,33 +527,40 @@ export async function builtinAvailable(): Promise<boolean> {
 
 let builtinOk: Promise<boolean> | null = null;
 
+type ProcessResult = { code: number; stdout: string; stderr: string };
+
 async function launchCliSession(input: CliSessionInput): Promise<SessionResult> {
   const { provider } = input.agent;
-  const { cmd, args, stdin, outFile } = sessionArgs(input);
-  if (!resolveExecutable(cmd)) throw new Error(`${cmd} CLI not found — install it or set cliPath for the research agent`);
+  const { cmd, outFile } = sessionArgs(input);
+  const binary = resolveExecutable(cmd);
+  if (!binary) throw new Error(`${cmd} CLI not found — install it or set cliPath for the research agent`);
   if (provider === 'codex-cli' && input.agents?.length) writeCodexAgentLayers(input.cwd, input.agents, input.webFreshness);
   const transcriptPath = transcriptPathFor(input.cwd, input.label);
   const stderrPath = stderrPathFor(input.cwd, input.label);
-  const out = fs.openSync(transcriptPath, 'w');
-  const errOut = fs.openSync(stderrPath, 'w');
-  // a no-op default: the assignment happens inside onSpawn, which TS's flow analysis cannot see
-  let unregister = () => {};
-  let res: { code: number; stdout: string; stderr: string };
-  try {
-    res = await runProcess(cmd, args, stdin, input.timeoutMs, {
-      cwd: input.cwd,
-      env: sessionEnv(input),
-      onStdout: (chunk) => fs.writeSync(out, chunk),
-      onStderr: (chunk) => fs.writeSync(errOut, chunk),
-      onSpawn: (c) => {
-        unregister = registerSession(input.jobId, processSession(c));
-      },
-    });
-  } finally {
-    fs.closeSync(out);
-    fs.closeSync(errOut);
-    unregister();
-  }
+  // one run of the CLI; a repeat (codex refused its catalog copy) writes both files anew
+  const run = async (catalog: string | null): Promise<ProcessResult> => {
+    const { args, stdin } = sessionArgs(input, catalog);
+    const out = fs.openSync(transcriptPath, 'w');
+    const errOut = fs.openSync(stderrPath, 'w');
+    // a no-op default: the assignment happens inside onSpawn, which TS's flow analysis cannot see
+    let unregister = () => {};
+    try {
+      return await runProcess(cmd, args, stdin, input.timeoutMs, {
+        cwd: input.cwd,
+        env: sessionEnv(input),
+        onStdout: (chunk) => fs.writeSync(out, chunk),
+        onStderr: (chunk) => fs.writeSync(errOut, chunk),
+        onSpawn: (c) => {
+          unregister = registerSession(input.jobId, processSession(c));
+        },
+      });
+    } finally {
+      fs.closeSync(out);
+      fs.closeSync(errOut);
+      unregister();
+    }
+  };
+  const res = provider === 'codex-cli' ? await runCodexSession(binary, input, run) : await run(null);
   // a killed session exits like any other; the flag says why
   if (cancelledJobs.has(input.jobId)) throw new JobCancelledError(input.jobId);
 
@@ -571,6 +592,43 @@ async function launchCliSession(input: CliSessionInput): Promise<SessionResult> 
     if (parsed.error || res.code !== 0) result.error = `cursor: ${(parsed.error || res.stderr || res.stdout).trim().slice(0, 300)}`;
   }
   return result;
+}
+
+/**
+ * A codex session with knode's copy of Codex's model catalog
+ * (src/llm/codex-catalog.ts), for the model it runs: the agent's, else the one
+ * the person's config.toml names. A session whose model is not known, or whose
+ * sub-agents run a model the copy does not list, downloads the catalog as
+ * before. Only a session that failed before it started can have been refused
+ * for its copy (`codexStartFailure`), and only then is it repeated without it:
+ * never after a timeout, a cancellation, or a failure once it ran.
+ */
+async function runCodexSession(binary: string, input: CliSessionInput, run: (catalog: string | null) => Promise<ProcessResult>): Promise<ProcessResult> {
+  const model = input.agent.model || configuredCodexModel() || undefined;
+  const others = [...new Set((input.agents ?? []).map((a) => a.model).filter((m) => m && m !== model))];
+  const stopped = () => cancelledJobs.has(input.jobId) || interruptedJobs.has(input.jobId);
+  const settled = await withCodexCatalog<{ result: ProcessResult } | { error: unknown }>(
+    binary,
+    model,
+    (catalog) => run(catalog && codexCatalog.lists(catalog, others) ? catalog : null).then((result) => ({ result }), (error: unknown) => ({ error })),
+    (s) => ('error' in s || stopped() ? null : codexStartFailure(s.result)),
+    codexCatalog,
+    { long: true },
+  );
+  if ('error' in settled) throw settled.error;
+  return settled.result;
+}
+
+/**
+ * What a codex session that failed before it started printed on stderr, or
+ * null. Codex prints its banner ("OpenAI Codex v…") once it has read its
+ * configuration, then echoes the prompt and the session's progress; a catalog
+ * copy it cannot read stops it before the banner, with one `Error:` line. So a
+ * session's own transcript, which may well name model_catalog_json, never
+ * counts.
+ */
+export function codexStartFailure(result: { code: number; stderr: string }): string | null {
+  return result.code !== 0 && !/^OpenAI Codex v/m.test(result.stderr) ? result.stderr : null;
 }
 
 /**

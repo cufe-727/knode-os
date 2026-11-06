@@ -31,7 +31,12 @@ import path from 'node:path';
  * wrote it in the last ten minutes, for this binary's version (the desktop
  * app's own Codex writes the same file at its own version), with the model in
  * it. A copy Codex cannot read is dropped and the call repeated once without
- * it (`withCodexCatalog`).
+ * it (`withCodexCatalog`). A research session can run for an hour, long past
+ * those ten minutes, so it copies the cache as soon as Codex has rewritten it.
+ * A session that names no model runs the one the person's config.toml names
+ * (`configuredCodexModel`), and pins that model's copy: a copy made for
+ * another model (ANY_MODEL) would only prove that model was listed, and a
+ * model that came out since would run on Codex's fallback metadata.
  *
  * worker/knode-worker.mjs keeps its own copy of this for remote workers, which
  * run without the rest of knode.
@@ -42,9 +47,13 @@ export const CODEX_CACHE_FRESH_MS = 10 * 60_000;
 export const DEFAULT_CATALOG_HOURS = 24;
 /** For a process that runs no model (the app-server's account read): any copy of the binary will do. */
 export const ANY_MODEL = '*';
+/** When a long process without a copy checks whether Codex has rewritten its cache: after 1, 2, 4 … 64 s. */
+const EARLY_COPY_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000];
 
 const PREFIX = 'codex-models-';
 const HOUR_MS = 3_600_000;
+
+const defaultCodexHome = () => process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 
 export interface CodexCatalogOptions {
   /** Where copies are kept (default $KNODE_CODEX_CATALOG_DIR, else ~/.knode-os/codex-catalog). */
@@ -117,7 +126,7 @@ export class CodexCatalog {
   }
 
   private get codexHome(): string {
-    return this.opts.codexHome ?? (process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
+    return this.opts.codexHome ?? defaultCodexHome();
   }
 
   log(message: string): void {
@@ -234,6 +243,45 @@ export class CodexCatalog {
   }
 
   /**
+   * For a process that may outlive the ten minutes a cache counts as fresh (a
+   * research session runs up to an hour): copy Codex's cache as soon as Codex
+   * has rewritten it, checking after 1, 2, 4 … 64 s, until a copy is there.
+   * Returns what stops the checks.
+   */
+  copyWhenWritten(binary: string | null, model: string | undefined): () => void {
+    if (!binary || !model || this.maxAgeMs <= 0) return () => {};
+    let stopped = false;
+    let timer: NodeJS.Timeout | undefined;
+    const next = (i: number) => {
+      if (stopped || i >= EARLY_COPY_MS.length) return;
+      timer = setTimeout(() => {
+        void this.refresh(binary, model).then(() => {
+          if (!this.pinned(binary, model)) next(i + 1);
+        });
+      }, EARLY_COPY_MS[i]);
+      timer.unref();
+    };
+    next(0);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }
+
+  /** Whether a copy lists each of `models` (a session's sub-agents may run models of their own); false when it cannot be read. */
+  lists(file: string, models: string[]): boolean {
+    if (!models.length) return true;
+    try {
+      const { models: list } = JSON.parse(fs.readFileSync(file, 'utf8')) as { models?: unknown };
+      if (!Array.isArray(list)) return false;
+      const slugs = new Set(list.map((m) => (m && typeof m === 'object' ? (m as { slug?: unknown }).slug : undefined)));
+      return models.every((m) => slugs.has(m));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Drop copies long past their lifetime (another binary's or model's; twice
    * the lifetime, so none goes while a call that pinned it still runs) and
    * temp files a crashed writer left.
@@ -281,7 +329,9 @@ const errorText = (err: unknown) =>
  * it is. `failed` says what a finished run printed on stderr if it failed,
  * null if it did not; a thrown error carries its stderr as `stderr` or in its
  * message. `binary` is the resolved codex path: null, nothing is pinned and
- * the run fails as it always did.
+ * the run fails as it always did. `long`: the run may outlive the ten minutes
+ * a cache counts as fresh, so the copy is made as soon as Codex rewrites its
+ * cache (`copyWhenWritten`), and again at the end if that found none.
  */
 export async function withCodexCatalog<R>(
   binary: string | null,
@@ -289,12 +339,15 @@ export async function withCodexCatalog<R>(
   run: (catalog: string | null) => Promise<R>,
   failed: (result: R) => string | null,
   catalog: CodexCatalog = codexCatalog,
+  opts: { long?: boolean } = {},
 ): Promise<R> {
   const pinned = catalog.pinned(binary, model);
   const unpinned = async () => {
+    const stop = opts.long ? catalog.copyWhenWritten(binary, model) : () => {};
     try {
       return await run(null);
     } finally {
+      stop();
       await catalog.refresh(binary, model);
     }
   };
@@ -316,4 +369,61 @@ export async function withCodexCatalog<R>(
 /** `withCodexCatalog` for a process result: failed when its exit code is not 0. */
 export function exitFailure(result: { code: number; stderr: string }): string | null {
   return result.code === 0 ? null : result.stderr;
+}
+
+/**
+ * The model a Codex process that names none runs, from the person's
+ * configuration: `model` in $CODEX_HOME/config.toml, or in the
+ * `[profiles.<name>]` table its `profile` picks. Null when the file names
+ * none, or picks a profile it does not hold, or cannot be read: Codex then
+ * runs a default of its own, which no copy can be checked for.
+ */
+export function configuredCodexModel(codexHome = defaultCodexHome()): string | null {
+  try {
+    return modelFromCodexConfig(fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/** A TOML basic string's escapes, as far as JSON shares them; anything else is kept as written. */
+function unescapeBasic(text: string): string {
+  try {
+    return JSON.parse(`"${text}"`) as string;
+  } catch {
+    return text;
+  }
+}
+
+/** `configuredCodexModel` for the text of a config.toml: the top-level keys and the profile tables, nothing else of TOML. */
+export function modelFromCodexConfig(toml: string): string | null {
+  const top: { model?: string; profile?: string } = {};
+  const profiles = new Map<string, string | null>();
+  let table: string | null = '';
+  for (const raw of toml.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    if (line.startsWith('[')) {
+      const header = /^\[\s*([^[\]]+?)\s*\](?:\s*#.*)?$/.exec(line);
+      // an array of tables, or a header this reader does not follow: nothing under it is read
+      table = header ? header[1] : null;
+      const profile = table ? /^profiles\s*\.\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))$/.exec(table) : null;
+      if (profile) {
+        table = `profile:${profile[1] ?? profile[2] ?? profile[3]}`;
+        if (!profiles.has(table)) profiles.set(table, null);
+      }
+      continue;
+    }
+    const kv = /^(model|profile)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')\s*(?:#.*)?$/.exec(line);
+    if (!kv || table === null) continue;
+    const value = kv[3] ?? unescapeBasic(kv[2]);
+    if (table === '') top[kv[1] as 'model' | 'profile'] = value;
+    else if (table.startsWith('profile:') && kv[1] === 'model') profiles.set(table, value);
+  }
+  if (top.profile) {
+    const key = `profile:${top.profile}`;
+    if (!profiles.has(key)) return null;
+    return profiles.get(key) || top.model || null;
+  }
+  return top.model || null;
 }

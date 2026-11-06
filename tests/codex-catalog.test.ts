@@ -10,14 +10,17 @@ import { readCodexAccount } from '../src/estimate/codex.js';
 import { agentArgs, runAgent } from '../src/eval/agent.js';
 import { CodexBackend } from '../src/eval/shim.js';
 import { codexExecArgs, completeViaCli, runProcess } from '../src/llm/cli.js';
-import { ANY_MODEL, catalogHoursFromEnv, CodexCatalog, exitFailure, withCodexCatalog } from '../src/llm/codex-catalog.js';
+import { ANY_MODEL, catalogHoursFromEnv, CodexCatalog, configuredCodexModel, exitFailure, modelFromCodexConfig, withCodexCatalog } from '../src/llm/codex-catalog.js';
+import type { NativeAgentSpec } from '../src/research/profile.js';
+import { codexStartFailure, launchSession, type SessionInput } from '../src/research/launch.js';
 
 /**
  * Codex calls read Codex's model catalog from a local copy instead of
  * downloading it on every start (src/llm/codex-catalog.ts), and turn ChatGPT's
- * apps off. A fake codex stands in: it answers --version, and a run without
- * `-c model_catalog_json` "downloads" the catalog by rewriting
- * $CODEX_HOME/models_cache.json, as Codex does. No model, no network.
+ * apps off; research sessions, which keep the person's config, turn plugins,
+ * apps and analytics off too. A fake codex stands in: it answers --version,
+ * and a run without `-c model_catalog_json` "downloads" the catalog by
+ * rewriting $CODEX_HOME/models_cache.json, as Codex does. No model, no network.
  */
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-codex-catalog-'));
@@ -83,8 +86,16 @@ if (argv[0] === 'app-server') {
 } else {
   process.stdin.resume();
   process.stdin.on('end', () => {
-    fs.writeFileSync(argv[argv.indexOf('--output-last-message') + 1], 'answer');
-    console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 2 } }));
+    setTimeout(() => {
+      // a session that ran past the ten minutes its cache counts as fresh
+      const cache = path.join(process.env.CODEX_HOME, 'models_cache.json');
+      if (process.env.FAKE_CODEX_AGE_CACHE && fs.existsSync(cache)) {
+        const hourAgo = new Date(Date.now() - 3600000);
+        fs.utimesSync(cache, hourAgo, hourAgo);
+      }
+      fs.writeFileSync(argv[argv.indexOf('--output-last-message') + 1], 'answer');
+      console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 2 } }));
+    }, Number(process.env.FAKE_CODEX_SESSION_MS || 0));
   });
 }
 `;
@@ -379,6 +390,147 @@ describe('every knode Codex call site', () => {
     fs.writeFileSync(exec, 'not json');
     expect((await read()).plan).toBe('pro');
     expect(codex.pins().slice(4)).toEqual([exec, null]);
+  });
+});
+
+describe('research sessions', () => {
+  let jobs = 0;
+  /** One research session on the fake codex, as the study, pipeline and chat runners launch them. */
+  const session = (codex: FakeCodex, over: Partial<SessionInput> = {}) => launchSession({
+    agent: { kind: 'cli', provider: 'codex-cli', cliPath: codex.binary, model: 'm' },
+    maxTurns: 5,
+    timeoutMs: 20_000,
+    cwd: fs.mkdtempSync(path.join(codex.dir, 'run-')),
+    prompt: 'say ok',
+    mcp: { url: 'http://127.0.0.1:9/mcp', token: 'tok', headers: {} },
+    readDirs: [],
+    jobId: `r_catalog_${++jobs}`,
+    outputPath: '',
+    worksetId: 'w',
+    tools: 'read',
+    label: 'agent',
+    ...over,
+  });
+  const subAgent = (model: string): NativeAgentSpec => ({ id: 'critic', title: 'critic', description: 'd', prompt: 'p', write: false, files: false, web: false, model, effort: 'default', speed: 'default' });
+
+  it('keep the person\'s config, turn plugins, apps and analytics off, and pin the copy', async () => {
+    const codex = new FakeCodex();
+    expect(await session(codex)).toMatchObject({ text: 'answer', error: null, exitCode: 0 });
+    expect(await session(codex)).toMatchObject({ text: 'answer', error: null });
+    const [copy] = codex.saved();
+    expect(codex.pins()).toEqual([null, copy]);
+    for (const argv of codex.calls()) {
+      const flags = argv.join(' ');
+      expect(flags).toContain(OFF);
+      // ~/.codex/config.toml still applies (its approval policy), and the session is kept
+      expect(flags).not.toContain('--ignore-user-config');
+      expect(flags).not.toContain('--ephemeral');
+    }
+    expect(codex.calls()[1].join(' ')).toContain(`-c model_catalog_json="${copy}"`);
+  });
+
+  it('a session that names no model pins the copy of the model config.toml names, and none when it names none', async () => {
+    const codex = new FakeCodex();
+    const config = path.join(codex.home, 'config.toml');
+    fs.writeFileSync(config, 'approval_policy = "never"\nmodel = "helper"  # the person\'s own\n\n[features]\nmemories = true\n');
+    expect(configuredCodexModel()).toBe('helper');
+    await session(codex, { agent: { kind: 'cli', provider: 'codex-cli', cliPath: codex.binary, model: '' } });
+    await session(codex, { agent: { kind: 'cli', provider: 'codex-cli', cliPath: codex.binary, model: '' } });
+    const [helper] = codex.saved();
+    expect(codex.pins()).toEqual([null, helper]);
+    // the agent's own model goes first: a copy of its own
+    await session(codex);
+    expect(codex.pins()[2]).toBeNull();
+    expect(codex.saved()).toHaveLength(2);
+
+    // a profile's model wins over the top-level one
+    fs.writeFileSync(config, 'profile = "deep"\nmodel = "helper"\n[profiles.deep]\nmodel = "m"\n');
+    await session(codex, { agent: { kind: 'cli', provider: 'codex-cli', cliPath: codex.binary, model: '' } });
+    const m = codex.saved().find((f) => f !== helper);
+    expect(codex.pins()[3]).toBe(m);
+
+    // no model anywhere: Codex runs a default of its own, so nothing is pinned or saved
+    fs.writeFileSync(config, 'approval_policy = "never"\n');
+    for (const f of codex.saved()) fs.rmSync(f);
+    await session(codex, { agent: { kind: 'cli', provider: 'codex-cli', cliPath: codex.binary, model: '' } });
+    await session(codex, { agent: { kind: 'cli', provider: 'codex-cli', cliPath: codex.binary, model: '' } });
+    expect(codex.pins().slice(4)).toEqual([null, null]);
+    expect(codex.saved()).toEqual([]);
+  });
+
+  it('reads the model out of config.toml the way Codex picks it', () => {
+    expect(modelFromCodexConfig('model = "gpt-6-astra"\nmodel_reasoning_effort = "xhigh"\n')).toBe('gpt-6-astra');
+    expect(modelFromCodexConfig("model = 'literal'")).toBe('literal');
+    // only the top level: a table's `model` is somebody else's
+    expect(modelFromCodexConfig('[mcp_servers.x]\nmodel = "not-this"\n')).toBeNull();
+    expect(modelFromCodexConfig('[[skills]]\nmodel = "not-this"\n[tui]\nx = 1\n')).toBeNull();
+    expect(modelFromCodexConfig('profile = "fast one"\nmodel = "base"\n[profiles."fast one"]\nmodel = "quick"\n')).toBe('quick');
+    // a profile without a model of its own runs the top-level one
+    expect(modelFromCodexConfig('profile = "p"\nmodel = "base"\n[profiles.p]\nmodel_reasoning_effort = "low"\n')).toBe('base');
+    // a profile the file does not hold: cannot tell
+    expect(modelFromCodexConfig('profile = "elsewhere"\nmodel = "base"\n')).toBeNull();
+    expect(modelFromCodexConfig('')).toBeNull();
+    expect(configuredCodexModel(path.join(root, 'no-such-codex-home'))).toBeNull();
+  });
+
+  it('copies the cache as soon as Codex has written it, for a session that outlives its freshness', async () => {
+    // the session rewrites the cache as it starts, and has run past its ten minutes when it ends;
+    // it lasts past the checks at 1 and 3 s
+    Object.assign(process.env, { FAKE_CODEX_SESSION_MS: '3500', FAKE_CODEX_AGE_CACHE: '1' });
+    const codex = new FakeCodex();
+    await session(codex);
+    const [copy] = codex.saved();
+    expect(copy).toBeDefined();
+    delete process.env.FAKE_CODEX_SESSION_MS;
+    await session(codex);
+    expect(codex.pins()).toEqual([null, copy]);
+
+    // what a call that copies only at its end makes of the same session: nothing
+    const late = new FakeCodex();
+    const outFile = path.join(late.dir, 'out.txt');
+    const r = await withCodexCatalog(late.binary, 'm', (file) => runProcess(late.binary, codexExecArgs({ outFile, cwd: late.dir, model: 'm', catalog: file }), 'say ok', 20_000), exitFailure);
+    expect(r.code).toBe(0);
+    expect(late.saved()).toEqual([]);
+  });
+
+  it('runs a session Codex refused at start once more without the copy, and never one that ran', async () => {
+    const codex = new FakeCodex();
+    await session(codex);
+    const [copy] = codex.saved();
+    fs.writeFileSync(copy, '{}');
+    const repeated = await session(codex);
+    expect(repeated).toMatchObject({ text: 'answer', error: null, exitCode: 0 });
+    expect(codex.pins()).toEqual([null, copy, null]);
+    expect(fs.readFileSync(repeated.transcriptPath, 'utf8')).toContain('turn.completed'); // the repeat's own transcript
+    expect(JSON.parse(fs.readFileSync(copy, 'utf8'))).toEqual({ models: MODELS });
+
+    // a session that started and then failed keeps its copy, though its transcript names the flag
+    codex.fail({ code: 1, stderr: 'OpenAI Codex v0.166.0\n--------\nuser\nWhy does knode pass model_catalog_json?\nERROR: You\'ve hit your usage limit. Try again in 3 hours.' });
+    const failed = await session(codex);
+    expect(failed.error).toMatch(/usage limit/);
+    expect(codex.pins().slice(3)).toEqual([copy]);
+    expect(codex.saved()).toEqual([copy]);
+
+    // a timeout is the session's own too, even with its copy gone meanwhile
+    process.env.FAKE_CODEX_SESSION_MS = '5000';
+    const removed = setTimeout(() => fs.rmSync(copy, { force: true }), 400);
+    await expect(session(codex, { timeoutMs: 1000 })).rejects.toThrow(/timed out/);
+    clearTimeout(removed);
+    expect(codex.pins().slice(4)).toEqual([copy]);
+
+    expect(codexStartFailure({ code: 1, stderr: 'Error: No such file or directory (os error 2)\n' })).toMatch(/os error 2/);
+    expect(codexStartFailure({ code: 1, stderr: 'OpenAI Codex v0.166.0\n--------\nERROR: stream disconnected\n' })).toBeNull();
+    expect(codexStartFailure({ code: 0, stderr: '' })).toBeNull();
+  });
+
+  it('pins no copy for sub-agents on a model the copy does not list', async () => {
+    const codex = new FakeCodex();
+    await session(codex);
+    const [copy] = codex.saved();
+    await session(codex, { agents: [subAgent('helper')] });
+    await session(codex, { agents: [subAgent('newer-than-the-copy')] });
+    await session(codex, { agents: [subAgent('')] });
+    expect(codex.pins()).toEqual([null, copy, null, copy]);
   });
 });
 

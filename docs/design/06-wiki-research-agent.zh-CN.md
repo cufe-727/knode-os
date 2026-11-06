@@ -193,6 +193,7 @@ profile 把「怎么研究」从 harness 里抽出来：一份 YAML 同时回答
 | 轮数上限 | `--max-turns` | 无 | 无 |
 | 写页工具 | 只读角色的 `--allowedTools` 不含 `knode_write` | 无（所有 MCP 工具可见，靠提示） | 无（`--approve-mcps`，靠提示） |
 | 原生子代理 | `--agents <json>`，并放开 `Agent` / `Task` | `agents.enabled`、`agents.max_concurrent_threads_per_session`、`agents.default_subagent_reasoning_effort`、`agents.<id>.description`、`agents.<id>.config_file` | 不支持（退回单会话） |
+| 启动下载 | 无 | 仍用本人的 `~/.codex/config.toml`，但加 `-c features.plugins=false -c features.apps=false -c analytics.enabled=false`（2026‑11‑06：开着时一句话的会话下载 11–15 MB，关掉后 ↓43 KB），并用 `-c model_catalog_json=<副本>` 读 Codex 模型目录的本地副本：agent 的模型，没填则用 config.toml 里的模型（src/llm/codex-catalog.ts，docs/design/18 D9） | 无 |
 
 macOS 设置里所有填模型的地方（阶段、agent、研究执行卡片、角色）是同一个模型框（2026‑09‑30）：点输入框就弹出该提供方或 CLI 列出的模型，直接输入即过滤——id 以输入开头的排最前，其次是 id 某一段以它开头（`sol` 能找到 `gpt-6.1-sol`）——↑↓ 选、↩ 确认、⎋ 关闭并保留输入。列表第一行「默认 · …」清空字段，写明留空时跑什么。模型跑在 CLI 上时框尾有一个强度 chip（例如「⚡ 高」），点开是滑杆：档位取自 `codex debug models` 里该模型的 `supported_reasoning_levels`（带说明与 `default_reasoning_level`），Fast 取自 `additional_speed_tiers` 与 `service_tiers`；没有逐模型信息的 CLI 用 `effortFor` 能传下去的档位。chip 灰色时显示的是实际生效的回落值：阶段跟随 agent，角色跟随 profile，执行卡片上的 chip 就是 profile 的 `reasoning`，再往下是 `~/.codex/config.toml` 的 `model_reasoning_effort` / `service_tier`（模型列表接口的 `defaults` 字段），最后是模型自己的默认档。API 模型端点不接收强度，框尾不显示 chip。
 
