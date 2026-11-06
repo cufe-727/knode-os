@@ -1,6 +1,7 @@
 import { AppContext } from '../context.js';
 import { auditDuplicateClaims } from '../graph/claim-dedupe.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
+import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { reconcileViews } from '../wiki/pages.js';
 import { JudgeRunner } from '../work/judge.js';
 import { LabelingScheduler } from './scheduler.js';
@@ -45,6 +46,12 @@ export interface FollowUpOptions {
   judge?: JudgeRunner;
   /** Called when the reviews are paused — the judge source gives up the calls nobody has taken. */
   onPause?: () => void;
+  /**
+   * What the audits embed entities and claims with: in deferred mode the
+   * embed queue, so `serve`'s embed slots and remote workers make those
+   * vectors too (src/work/embed.ts). Absent, `ctx.embedder`.
+   */
+  embedder?: EmbeddingProvider;
 }
 
 export interface FollowUp {
@@ -76,7 +83,7 @@ export function startFollowUp(ctx: AppContext, scheduler: LabelingScheduler, opt
     const batch = scheduler.takeFinished();
     if (batch.written === 0 && batch.failed === 0) return;
     const parts = [`${batch.written} written${batch.failed ? `, ${batch.failed} given up` : ''}`];
-    const reviewCtx = { store: ctx.store, embedder: ctx.embedder, config: ctx.config, llm: ctx.llm, judge: opts.judge };
+    const reviewCtx = { store: ctx.store, embedder: opts.embedder ?? ctx.embedder, config: ctx.config, llm: ctx.llm, judge: opts.judge };
     if (batch.entityIds.length) {
       try {
         const r = await auditDuplicateEntities(reviewCtx, { focus: [...new Set(batch.entityIds)], onProgress: log });

@@ -285,6 +285,8 @@ export class LocalLabelingWorkers {
   }
 
   private async run(backend: Backend, task: WorkTask, who: WorkerIdentity): Promise<TaskOutcome> {
+    // embed batches go to the embed slots (src/work/embed.ts), which these never ask for
+    if (task.kind === 'embed') return { ok: false, error: 'an LLM slot cannot embed', kind: 'fatal', model: backend.client.label };
     backend.busy++;
     // keep the lease while the call runs; a CLI call may take minutes
     const leaseMs = Date.parse(task.leaseExpiresAt) - Date.now();

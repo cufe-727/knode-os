@@ -1,7 +1,7 @@
 # Remote workers and the remote API
 
-`knode-os serve` runs tier-1 extraction ("labeling"), summary pages and the duplicate reviews' judge calls as
-**leased work** ([design 12](design/12-remote-processing.md)). Per workspace, a scheduler
+`knode-os serve` runs tier-1 extraction ("labeling"), summary pages, the duplicate reviews' judge calls and — in
+deferred embedding mode — chunk and audit vectors as **leased work** ([design 12](design/12-remote-processing.md)). Per workspace, a scheduler
 (`src/labeling/scheduler.ts`) takes documents off the extraction queue, cuts them into segments and hands segments
 out one at a time; a summary source (`src/work/summarize.ts`) hands out the documents due a summary page; and a
 judge source (`src/work/judge.ts`) hands out the calls a review is waiting on. A work broker (`src/work/broker.ts`)
@@ -123,6 +123,8 @@ The summary pages they write are written either way; what they extract is review
 | `server.remote.shares` | `{ "extract": 3, "summarize": 1, "translate": 1 }` | a slot that takes several of these kinds gets them by these weights; judge calls go before any |
 | `server.remote.judgeModels` | `[]` | remote models whose verdicts may merge or reject without a person: `"codex:gpt-6.1-sol"`, or a prefix like `"codex:*"` |
 | `server.remote.callDeadlineMinutes` | `20` | longest a review waits for one judge call |
+| `server.remote.offer.embed` | `true` | remote embed slots may take embed batches — only where `ingest.embedding` is `"deferred"` |
+| `server.remote.embedProbeCosine` | `0.98` | the cosine every probe vector of an own endpoint must reach against the pool's, at calibration and in spot checks |
 
 The share keeps summaries moving while an import's extraction backlog is out, and extraction moving while summaries
 pile up. A kind that had nothing to give banks no credit for it: when it has work again, it takes its share from
@@ -134,6 +136,7 @@ there, not everything until it has caught up.
 knode-os remote token create --name macbook --scope label --workspace admin/finance
 knode-os remote token create --name old-mac --scope label --kinds extract --workspace admin/finance
 knode-os remote token create --name analytics --scope read,sql --workspace admin/finance
+knode-os remote token create --name gpu-box --scope embed --workspace admin/finance
 knode-os remote token list
 knode-os remote token revoke macbook
 ```
@@ -144,6 +147,8 @@ knode-os remote token revoke macbook
 | `read` | list/read documents under raw/docs, raw/skills, wiki and playbook content; search; graph; claims |
 | `write` | write or delete documents under raw/docs, wiki and playbooks/packs (never a linked folder's mirror); trigger a sync |
 | `sql` | read-only SQL over the `v_*` catalog views |
+| `embed` | lease embed batches and hand back vectors made on the worker's own endpoint, once it passes calibration; read the embedding section of `work/config` |
+| `embed-keys` | reserved for lending pool keys to workers (design 12 §4.2), which is not built: it grants nothing yet, and needs `embed` |
 
 A token's workspaces can be `<user>/<workspace-id>`, `team/<name>` or `*`. Tokens live hashed in
 `<data root>/.knode/remote-tokens.json` (0600). Only the secret's SHA-256 is stored, and a token is shown
@@ -212,6 +217,34 @@ The worker renews its leases while calls run. It backs off per backend under the
 SIGTERM it kills its calls and hands its leases back. It refuses to send a token over plain HTTP to anything
 but loopback. Run it under launchd or systemd for a permanent worker.
 
+## Embedding on a worker's own endpoint
+
+Where a workspace embeds in deferred mode (`ingest.embedding: "deferred"`, [embedding pools](embedding-pools.md)),
+its chunk backlog and its duplicate audits' vectors are embed work. A worker with an embedding model of its own —
+a bge-m3 on a GPU, a TEI, vLLM or Ollama, an account of its own — adds capacity the pool's daily caps don't have:
+
+```bash
+KNODE_TOKEN=knr_… node knode-worker.mjs --server https://knode-os.lemoncheese.cc --workspace admin/finance \
+  --backends embed:2 --embed-base-url http://127.0.0.1:12020/v1 --embed-model BAAI/bge-m3
+# add --embed-key-env NAME when the endpoint needs a key; it is never sent over plain http to another host
+```
+
+The token needs the `embed` scope. The server takes the vectors only when
+
+- the workspace embeds with a model pool, and `--embed-model` (and the model the endpoint names in its answers) has
+  the pool's canonical name: `BAAI/bge-m3`, `bge-m3`, `@cf/baai/bge-m3` and `bge-m3:latest` all are bge-m3;
+- the endpoint passed **calibration**: at start, and after every configuration change, the worker embeds the
+  server's 16 probe texts (Chinese and English) and hands them in (`POST …/work/calibrate`). The server compares
+  each with reference vectors it made once with its own pool and keeps per identity in
+  `<workspace>/.knode/embedding-probe.json`. Every cosine must reach `server.remote.embedProbeCosine` (0.98);
+- **spot checks** keep passing: one batch in 100 carries a probe text at a random place. A miss parks every embed
+  slot of that worker for 30 minutes, and its batch goes back in line.
+
+The worker hands back raw vectors as base64 float32. The server checks the count, the dimension, finite values and
+a non-zero norm, L2-normalizes them as the pool does, drops a batch whose embedding identity changed since the
+lease, and writes a batch's chunk vectors in one transaction. An embed lease lasts 120 seconds and is renewed while
+the call runs. `--check` shows the embedding identity and whether the endpoint passes calibration.
+
 The models a worker uses count against that machine's own accounts. A worker on a machine that shares an
 account with another job (rookie-trade's review runner uses Codex and Cursor too) shares that account's limits.
 
@@ -225,12 +258,13 @@ Workspace routes are `/w/<owner>/<workspace>/…`, where `<owner>` is a username
 | `GET /health` | — | `{ ok }` |
 | `GET /whoami` | any | the token's name, scopes, workspaces, kinds |
 | `GET /worker.mjs` | any | the worker script |
-| `GET …/work/config` | label | `{ version, leaseSeconds: { llm }, kinds: { extract, summarize, judge, translate }, shares, hints: { <kind>: { codex?, claude?, cursor? } } }` |
-| `POST …/work/lease` | label | `{ worker, backend, kinds?, max }` → `{ configVersion, leaseSeconds, tasks: [{ id, kind, label, messages, prompt, json, maxTokens, leaseExpiresAt, document? }] }` |
-| `POST …/work/complete` | label | `{ worker, backend, id, ok, text \| error, kind?, model? }` → `{ accepted, documentWritten? }` (409 when the lease moved on) |
-| `POST …/work/renew` | label | `{ worker, backend, ids }` → `{ renewed, lost }` |
-| `POST …/work/release` | label | `{ worker, backend, ids }` → `{ released }` |
-| `GET …/work/status` | label / read | per kind (queue, due or waiting; leases; totals), shares, workers |
+| `GET …/work/config` | label / embed | `{ version, leaseSeconds: { llm, embed? }, kinds: { extract, summarize, judge, translate, embed }, shares, hints: { <kind>: { codex?, claude?, cursor? } }, embedding? }`; `embedding` (embed scope, deferred mode): `{ vectorModel, model, dimensions, batchSize, inputChars, postprocess, ownEndpoints, probe: { texts, minCosine } }` |
+| `POST …/work/lease` | label / embed | `{ worker, backend, kinds?, max, calibration? }` → `{ configVersion, leaseSeconds, tasks: [{ id, kind, label, messages, prompt, json, maxTokens, leaseExpiresAt, document? }], embed? }`. An embed task is `{ id, kind: "embed", label, vectorModel, dimensions, credential: null, inputs, leaseExpiresAt }`; `embed: { calibrate: true, reason, parkedUntil? }` tells an embed slot to calibrate (again). A lease that names no kinds gets no embed batch |
+| `POST …/work/calibrate` | embed | `{ worker, model, endpointModel?, vectors, dimensions }` (the probe texts' vectors, base64 float32) → `{ ok, calibration, minCosine, meanCosine }` or `{ ok: false, reason, minCosine?, retryAfterSeconds? }` |
+| `POST …/work/complete` | label / embed | `{ worker, backend, id, ok, text \| error, kind?, model? }`, an embed batch with `vectors` (base64 float32), `dimensions`, `endpointModel?`, `usage?` → `{ accepted, documentWritten?, vectorsWritten? }` (409 when the lease moved on or the batch was refused) |
+| `POST …/work/renew` | label / embed | `{ worker, backend, ids }` → `{ renewed, lost }` |
+| `POST …/work/release` | label / embed | `{ worker, backend, ids }` → `{ released }` |
+| `GET …/work/status` | label / embed / read | per kind (queue, due or waiting; leases; totals; for embed the backlog, calibrated endpoints and parked workers), shares, workers |
 | `POST …/labeling/lease` | label (extract) | the same as `work/lease` with `kinds: ["extract"]`, answered `{ leaseSeconds, tasks }` |
 | `POST …/labeling/complete`, `…/renew`, `…/release` | label | the same as `work/*` |
 | `GET …/labeling/status` | label / read | extraction's queue, leases, workers, totals |

@@ -20,8 +20,9 @@ import { CATALOG_VIEWS, catalogQuery } from '../store/catalog.js';
 import { queryClaims } from '../store/claims.js';
 import { listEntities } from '../store/queries.js';
 import { clientInfo } from '../server/public-guard.js';
-import { WorkBroker } from '../work/broker.js';
+import { LeaseRequest, WorkBroker } from '../work/broker.js';
 import { offeredRemotely, workerConfig } from '../work/config.js';
+import { decodeVectors, EmbedSource } from '../work/embed.js';
 import { isWorkKind, WORK_KINDS, WorkKind } from '../work/kinds.js';
 import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows, tokenAllowsKind } from './tokens.js';
 
@@ -34,7 +35,8 @@ import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows, tokenAll
  *   GET  /worker.mjs                               the remote worker script (worker/knode-worker.mjs)
  *   /w/<owner>/<workspace>/…                       <owner> = a username, or "team" for a team workspace
  *     work       GET work/config, POST work/lease | complete | renew | release,
- *                GET work/status — every kind of leased work (docs/design/12)       (scope label)
+ *                GET work/status — every kind of leased work (docs/design/12)       (scope label or embed)
+ *                POST work/calibrate — an own embedding endpoint's probe vectors    (scope embed)
  *     labeling   POST labeling/lease | complete | renew | release, GET labeling/status:
  *                the same for extraction only, as workers before work/* speak it    (scope label)
  *     documents  GET documents, GET document?path=                                      (scope read)
@@ -102,6 +104,21 @@ function clientOf(c: Context): string {
 }
 
 const text = (value: unknown, max: number) => String(value ?? '').slice(0, max);
+
+/** Vectors as a worker sends them: base64 little-endian float32 with their dimension, or arrays of numbers. */
+function vectorsOf(value: unknown, dimensions: unknown): number[][] {
+  if (Array.isArray(value)) return value as number[][];
+  if (typeof value !== 'string') throw new HttpError(400, 'vectors (base64 float32, or arrays) required');
+  const dims = Math.floor(Number(dimensions));
+  if (!(dims > 0 && dims <= 16_384)) throw new HttpError(400, 'dimensions required with base64 vectors');
+  const bytes = Math.floor((value.length * 3) / 4) - (value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0);
+  if (bytes % (dims * 4) !== 0) throw new HttpError(400, `the vectors are not whole ${dims}-dimension float32 rows`);
+  try {
+    return decodeVectors(value, bytes / (dims * 4), dims);
+  } catch (err) {
+    throw new HttpError(400, err instanceof Error ? err.message : String(err));
+  }
+}
 
 export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
   const log = deps.log ?? (() => {});
@@ -207,6 +224,14 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     if (!tokenAllows(c.get('token'), scope, c.get('workspace'))) throw new HttpError(403, `this token lacks the "${scope}" scope here`);
     return c.get('ctx');
   };
+  /** Leased work: model calls under `label`, embed batches under `embed`. */
+  const needWork = (c: Context<RemoteEnv>) => {
+    const token = c.get('token');
+    if (!tokenAllows(token, 'label', c.get('workspace')) && !tokenAllows(token, 'embed', c.get('workspace'))) {
+      throw new HttpError(403, 'this token lacks the "label" or "embed" scope here');
+    }
+    return c.get('ctx');
+  };
   const broker = (ctx: AppContext) => {
     const b = deps.work(ctx);
     if (!b) throw new HttpError(503, 'leased work runs only inside `knode-os serve`');
@@ -215,8 +240,16 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
   /** The kinds the token may take here that the workspace offers remote workers. */
   const allowedKinds = (c: Context<RemoteEnv>): WorkKind[] =>
     WORK_KINDS.filter((k) => tokenAllowsKind(c.get('token'), k, c.get('workspace')) && offeredRemotely(c.get('ctx').config, k));
-  const configFor = (c: Context<RemoteEnv>, b: WorkBroker) =>
-    workerConfig(c.get('ctx').config, { allowed: allowedKinds(c), leaseMs: b.leaseDurationMs(), shares: b.shares() });
+  const configFor = (c: Context<RemoteEnv>, b: WorkBroker) => {
+    const ctx = c.get('ctx');
+    const allowed = allowedKinds(c);
+    const embed = allowed.includes('embed') && b.source('embed') ? { embedder: ctx.embedder, leaseMs: b.leaseDurationMs('embed') } : null;
+    return workerConfig(ctx.config, { allowed, leaseMs: b.leaseDurationMs(), shares: b.shares(), embed });
+  };
+  const embedSource = (b: WorkBroker): EmbedSource | null => {
+    const source = b.source('embed');
+    return source instanceof EmbedSource ? source : null;
+  };
   const whoOf = (c: Context<RemoteEnv>, body: Record<string, unknown>): WorkerIdentity => ({
     worker: `${c.get('token').name}/${text(body.worker || 'worker', 80)}`,
     backend: text(body.backend || 'unknown', 80),
@@ -231,54 +264,87 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
 
   /* ----------------------------- leased work ---------------------------- */
 
-  const complete = async (c: Context<RemoteEnv>) => {
-    const ctx = need(c, 'label');
+  const complete = (scope: 'label' | 'work') => async (c: Context<RemoteEnv>) => {
+    const ctx = scope === 'label' ? need(c, 'label') : needWork(c);
     const b = await body(c);
     const id = text(b.id, 64);
     if (!id) throw new HttpError(400, 'id required');
     const kind = ['model', 'transient', 'fatal'].includes(String(b.kind)) ? (b.kind as FailureKind) : undefined;
     // what the worker's CLI or endpoint said the call used (a worker from before this sends none)
     const usage = sanitizeUsage(b.usage) ?? undefined;
+    const model = b.model ? text(b.model, 120) : undefined;
+    // an embed batch's vectors: base64 float32 (n × dimensions), or plain arrays
+    let vectors: number[][] | undefined;
+    if (b.ok === true && b.vectors !== undefined) vectors = vectorsOf(b.vectors, b.dimensions);
     const outcome: TaskOutcome = b.ok === true
-      ? { ok: true, text: text(b.text, 2 * 1024 * 1024), model: b.model ? text(b.model, 120) : undefined, usage }
-      : { ok: false, error: text(b.error || 'failed without a message', 2000), kind, model: b.model ? text(b.model, 120) : undefined, usage };
+      ? { ok: true, text: text(b.text, 2 * 1024 * 1024), model, usage, ...(vectors ? { vectors } : {}), ...(b.endpointModel ? { endpointModel: text(b.endpointModel, 120) } : {}) }
+      : { ok: false, error: text(b.error || 'failed without a message', 2000), kind, model, usage };
     const result = await broker(ctx).complete(id, whoOf(c, b), outcome);
     return c.json(result, result.accepted ? 200 : 409);
   };
-  const renew = async (c: Context<RemoteEnv>) => {
-    const ctx = need(c, 'label');
+  const renew = (scope: 'label' | 'work') => async (c: Context<RemoteEnv>) => {
+    const ctx = scope === 'label' ? need(c, 'label') : needWork(c);
     const b = await body(c);
     return c.json(broker(ctx).renew(ids(b.ids), whoOf(c, b)));
   };
-  const release = async (c: Context<RemoteEnv>) => {
-    const ctx = need(c, 'label');
+  const release = (scope: 'label' | 'work') => async (c: Context<RemoteEnv>) => {
+    const ctx = scope === 'label' ? need(c, 'label') : needWork(c);
     const b = await body(c);
     return c.json({ released: await broker(ctx).release(ids(b.ids), whoOf(c, b)) });
   };
   const watching = (c: Context<RemoteEnv>) => {
     const token = c.get('token');
-    if (!tokenAllows(token, 'label', c.get('workspace')) && !tokenAllows(token, 'read', c.get('workspace'))) {
-      throw new HttpError(403, 'this token lacks the "label" or "read" scope here');
+    if (!(['label', 'embed', 'read'] as const).some((scope) => tokenAllows(token, scope, c.get('workspace')))) {
+      throw new HttpError(403, 'this token lacks the "label", "embed" or "read" scope here');
     }
     return broker(c.get('ctx'));
   };
 
-  // what a worker reads instead of being told by hand: the kinds it may take, lease, shares, model hints
-  api.get('/w/:owner/:workspace/work/config', (c) => c.json(configFor(c, broker(need(c, 'label')))));
+  // what a worker reads instead of being told by hand: the kinds it may take, lease, shares, model hints, the embedding identity
+  api.get('/w/:owner/:workspace/work/config', (c) => c.json(configFor(c, broker(needWork(c)))));
 
   api.post('/w/:owner/:workspace/work/lease', async (c) => {
-    const ctx = need(c, 'label');
+    const ctx = needWork(c);
     const b = await body(c);
     const s = broker(ctx);
     const allowed = allowedKinds(c);
-    const asked = Array.isArray(b.kinds) ? b.kinds.filter(isWorkKind) : allowed;
+    // embed batches go only to a slot that asks for them: an LLM slot from before them asks for nothing in particular
+    const asked = Array.isArray(b.kinds) ? b.kinds.filter(isWorkKind) : allowed.filter((k) => k !== 'embed');
     const kinds = asked.filter((k) => allowed.includes(k));
-    const tasks = kinds.length ? await s.lease(whoOf(c, b), kinds, Number(b.max ?? 1) || 1) : [];
-    return c.json({ configVersion: configFor(c, s).version, leaseSeconds: Math.round(s.leaseDurationMs() / 1000), tasks });
+    const who = whoOf(c, b);
+    const request: LeaseRequest = { calibration: b.calibration ? text(b.calibration, 64) : undefined };
+    // an embed slot on its own endpoint that is not (or no longer) calibrated is told so, and gets nothing
+    let embed: { calibrate: true; reason: string; parkedUntil?: string } | undefined;
+    if (kinds.includes('embed')) {
+      const source = embedSource(s);
+      const problem = source ? source.calibrationProblem(who, request.calibration) : { reason: 'embed work is not leased here' };
+      if (problem) embed = { calibrate: true, ...problem };
+    }
+    // a slot that may not embed yet is not counted as asking for embed work: the audits would wait on it in vain
+    const leasing = embed ? kinds.filter((k) => k !== 'embed') : kinds;
+    const tasks = leasing.length ? await s.lease(who, leasing, Number(b.max ?? 1) || 1, request) : [];
+    return c.json({
+      configVersion: configFor(c, s).version, leaseSeconds: Math.round(s.leaseDurationMs(kinds[0] ?? 'extract') / 1000), tasks,
+      ...(embed ? { embed } : {}),
+    });
   });
-  api.post('/w/:owner/:workspace/work/complete', complete);
-  api.post('/w/:owner/:workspace/work/renew', renew);
-  api.post('/w/:owner/:workspace/work/release', release);
+  // an own embedding endpoint's vectors for the probe set: passing is what lets its vectors in (docs/design/12 §4.3)
+  api.post('/w/:owner/:workspace/work/calibrate', async (c) => {
+    const ctx = need(c, 'embed');
+    if (!offeredRemotely(ctx.config, 'embed')) throw new HttpError(409, 'this workspace does not offer embed work (ingest.embedding is not "deferred", or server.remote.offer.embed is off)');
+    const b = await body(c);
+    const source = embedSource(broker(ctx));
+    if (!source) throw new HttpError(503, 'embed work is not leased here');
+    const worker = `${c.get('token').name}/${text(b.worker || 'worker', 80)}`;
+    return c.json(await source.calibrate(worker, {
+      model: text(b.model, 120),
+      endpointModel: b.endpointModel ? text(b.endpointModel, 120) : undefined,
+      vectors: vectorsOf(b.vectors, b.dimensions),
+    }));
+  });
+  api.post('/w/:owner/:workspace/work/complete', complete('work'));
+  api.post('/w/:owner/:workspace/work/renew', renew('work'));
+  api.post('/w/:owner/:workspace/work/release', release('work'));
   api.get('/w/:owner/:workspace/work/status', async (c) => c.json(await watching(c).status()));
 
   // extraction only, as workers that predate work/* speak it
@@ -290,9 +356,9 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     const tasks = await s.lease(whoOf(c, b), ['extract'], Number(b.max ?? 1) || 1);
     return c.json({ leaseSeconds: Math.round(s.leaseDurationMs('extract') / 1000), tasks });
   });
-  api.post('/w/:owner/:workspace/labeling/complete', complete);
-  api.post('/w/:owner/:workspace/labeling/renew', renew);
-  api.post('/w/:owner/:workspace/labeling/release', release);
+  api.post('/w/:owner/:workspace/labeling/complete', complete('label'));
+  api.post('/w/:owner/:workspace/labeling/renew', renew('label'));
+  api.post('/w/:owner/:workspace/labeling/release', release('label'));
   api.get('/w/:owner/:workspace/labeling/status', async (c) => {
     const extract = watching(c).source('extract');
     if (!extract) throw new HttpError(503, 'extraction is not leased here');

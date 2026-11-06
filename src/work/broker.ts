@@ -3,7 +3,7 @@ import { ChatMessage } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { FailureKind } from '../labeling/failures.js';
 import { CompleteResult, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
-import { isSharedKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
+import { isSharedKind, LlmKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
 
 /**
  * The work broker — every kind of leased work behind one lease protocol
@@ -13,13 +13,15 @@ import { isSharedKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './
  * and knows what an answer means: the labeling scheduler for extraction
  * segments (src/labeling/scheduler.ts), the summary source for summary pages
  * (src/work/summarize.ts), the judge source for a review's judge calls
- * (src/work/judge.ts). A slot — one of `serve`'s own (src/labeling/local.ts)
+ * (src/work/judge.ts), the embed source for batches of texts to embed
+ * (src/work/embed.ts). A slot — one of `serve`'s own (src/labeling/local.ts)
  * or one on a remote worker (src/remote) — asks for the kinds it takes, and
  * the broker picks which source serves it. Answers, renewals and releases go
  * back to the source that issued the lease.
  *
  * Judge calls go first: a review is waiting on them, and a round has only a
- * bounded number. A slot that takes several of the other kinds gets them by
+ * bounded number. Embed batches are taken only by embed slots, which ask for
+ * nothing else. A slot that takes several of the other kinds gets them by
  * weight (`server.remote.shares`, extraction 3 : summaries 1 by default): each
  * kind's count of tasks handed out, divided by its weight, decides who is
  * next. A kind that had nothing to give banks no credit for it — when it has
@@ -33,20 +35,47 @@ import { isSharedKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './
  * estimate learns from remote workers' calls as well as this machine's.
  */
 
-export interface WorkTask {
+/** What every task carries, whatever its kind. */
+interface TaskBase {
   id: string;
   kind: WorkKind;
   /** What the task is about, for a worker's log: a document's path, with the part for a segment. */
   label: string;
+  leaseExpiresAt: string;
+}
+
+/** A model call: extraction, a summary, a judge call, a translation. */
+export interface LlmWorkTask extends TaskBase {
+  kind: LlmKind;
   messages: ChatMessage[];
   /** The same messages flattened the way a one-shot CLI takes them. */
   prompt: string;
   /** The answer must be a JSON object. */
   json: boolean;
   maxTokens: number;
-  leaseExpiresAt: string;
   /** Extraction segments only: the document and part, as `/labeling/*` has always sent it. */
   document?: { path: string; title: string; part: number; parts: number };
+}
+
+/** A batch of texts to embed (src/work/embed.ts): the answer is one raw vector per input. */
+export interface EmbedWorkTask extends TaskBase {
+  kind: 'embed';
+  /** The vector space the answer must belong to: the workspace's embedding identity at lease time. */
+  vectorModel: string;
+  dimensions: number;
+  /** A lent key and its reservation (docs/design/12 §4.2); null on this machine's slots and on an own endpoint. */
+  credential: { id: string; reservation: string } | null;
+  inputs: string[];
+}
+
+export type WorkTask = LlmWorkTask | EmbedWorkTask;
+
+/** What a slot says about itself beyond its identity, for the kinds that need it (embed: src/work/embed.ts). */
+export interface LeaseRequest {
+  /** The calibration an own embedding endpoint passed (docs/design/12 §4.3). */
+  calibration?: string;
+  /** The slot embeds on lent keys, and its token may hold them (§4.2). */
+  lentKeys?: boolean;
 }
 
 /** What every source reports about its leases; the rest of its status is its own. */
@@ -58,7 +87,7 @@ export interface SourceStatus {
 export interface WorkSource {
   readonly kind: WorkKind;
   readonly leaseDurationMs: number;
-  lease(who: WorkerIdentity, max: number): Promise<WorkTask[]>;
+  lease(who: WorkerIdentity, max: number, request?: LeaseRequest): Promise<WorkTask[]>;
   complete(taskId: string, who: WorkerIdentity, outcome: TaskOutcome): Promise<CompleteResult>;
   renew(taskIds: string[], who: WorkerIdentity): { renewed: string[]; lost: string[] };
   release(taskIds: string[], who: WorkerIdentity): Promise<number>;
@@ -159,12 +188,12 @@ export class WorkBroker {
   }
 
   /** Up to `max` tasks of one of `kinds` for `who` — judge calls first, then a shared kind by share; empty when none has work. */
-  async lease(who: WorkerIdentity, kinds: readonly WorkKind[], max = 1): Promise<WorkTask[]> {
+  async lease(who: WorkerIdentity, kinds: readonly WorkKind[], max = 1, request?: LeaseRequest): Promise<WorkTask[]> {
     const wanted = WORK_KINDS.filter((k) => kinds.includes(k) && this.sources.has(k));
     this.seen(who, wanted);
     if (wanted.length === 0) return [];
     for (const kind of wanted.filter((k) => !isSharedKind(k))) {
-      const tasks = await this.sources.get(kind)!.lease(who, max);
+      const tasks = await this.sources.get(kind)!.lease(who, max, request);
       if (tasks.length) return this.issue(tasks);
     }
     const shares = this.shares();
@@ -175,7 +204,7 @@ export class WorkBroker {
     });
     const idle: SharedKind[] = [];
     for (const kind of order) {
-      const tasks = await this.sources.get(kind)!.lease(who, max);
+      const tasks = await this.sources.get(kind)!.lease(who, max, request);
       if (tasks.length === 0) {
         idle.push(kind);
         continue;
@@ -255,7 +284,8 @@ export class WorkBroker {
     if (!this.opts.ledger) return tasks;
     const now = Date.now();
     for (const [id, i] of this.issued) if (now - i.at > ISSUED_TTL_MS) this.issued.delete(id);
-    for (const task of tasks) this.issued.set(task.id, { kind: task.kind, at: now, promptTokens: estimateTokens(task.prompt) });
+    // the ledger measures model calls; a batch of vectors is no call it estimates
+    for (const task of tasks) if (task.kind !== 'embed') this.issued.set(task.id, { kind: task.kind, at: now, promptTokens: estimateTokens(task.prompt) });
     return tasks;
   }
 

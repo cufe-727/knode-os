@@ -206,6 +206,10 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
   const translations = work?.kinds.translate as import('../work/translate.js').TranslateStatus | undefined;
   const judge = work?.kinds.judge as import('../work/judge.js').JudgeStatus | undefined;
   const backfill = services?.embeddings?.status() ?? null;
+  // deferred mode: vectors as leased work, made by this machine's embed slots and remote workers
+  const embedWork = work?.kinds.embed as import('../work/embed.js').EmbedStatus | undefined;
+  const deferred = embedWork?.mode === 'deferred';
+  const embedSlots = services?.embedSlots?.status() ?? null;
 
   const stages: TaskStage[] = [
     {
@@ -213,7 +217,13 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
       failed: docCount('error'),
       note: busy('sync', 'ingest', 'upload', 'folder') ? 'syncing now' : null,
     },
-    {
+    deferred && embedWork ? {
+      id: 'embed', enabled: true, unit: 'chunks', waiting: vectors, inFlight: embedWork.leases.length,
+      doneLastHour: embedWork.lastHour.vectors, callsLastHour: embedWork.lastHour.batches, failed: sumFailed(embedWork.totals.failed),
+      note: embedSlots?.pausedUntil ? `local embed slots rest until ${embedSlots.pausedUntil}: ${embedSlots.lastError ?? ''}`
+        : embedWork.parked.length ? `${embedWork.parked.map((p) => p.worker).join(', ')} parked: ${embedWork.parked[0].reason}`
+          : vectors > 0 && (embedSlots?.slots ?? 0) === 0 && embedWork.endpoints.length === 0 ? 'no embed slots here and no calibrated worker' : null,
+    } : {
       id: 'embed', enabled: true, unit: 'chunks', waiting: vectors, inFlight: 0, doneLastHour: null, callsLastHour: null, failed: 0,
       note: backfill?.retryAt ? `the provider could not serve: retrying at ${backfill.retryAt}` : backfill?.lastError ? backfill.lastError : null,
     },
@@ -258,6 +268,10 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
       id: l.id, kind: 'judge' as const, subject: l.call, detail: null,
       worker: l.worker, backend: l.backend, remote: l.remote, ageSeconds: l.ageSeconds, expiresInSeconds: l.expiresInSeconds,
     })),
+    ...(embedWork?.leases ?? []).map((l) => ({
+      id: l.id, kind: 'embed' as const, subject: l.label, detail: null,
+      worker: l.worker, backend: l.backend, remote: l.remote, ageSeconds: l.ageSeconds, expiresInSeconds: l.expiresInSeconds,
+    })),
   ].sort((a, b) => b.ageSeconds - a.ageSeconds);
 
   // this machine's backends, one row each with its slots; remote workers as the broker last saw them
@@ -266,6 +280,12 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
       id: b.id, label: b.label, remote: false, kinds: [] as WorkKind[], slots: b.slots, busy: b.busy, ok: b.ok, failed: sumFailed(b.failed),
       lastSeen: null, online: running, pausedUntil: b.pausedUntil, pauseReason: b.pauseReason, lastError: b.lastError,
     })),
+    // this machine's embed slots run whether or not processing does
+    ...(embedSlots && embedSlots.slots > 0 ? [{
+      id: 'embed', label: embedSlots.endpoint?.calibrated ? `embed:${embedSlots.endpoint.model} at ${embedSlots.endpoint.baseUrl}` : `embed:${ctx.embedder.model}`, remote: false, kinds: ['embed'] as WorkKind[], slots: embedSlots.slots, busy: embedSlots.busy,
+      ok: embedSlots.batches, failed: embedSlots.failed, lastSeen: null, online: true, pausedUntil: embedSlots.pausedUntil,
+      pauseReason: embedSlots.pausedUntil ? 'the embedder could not serve' : null, lastError: embedSlots.lastError,
+    }] : []),
     ...(work?.workers ?? []).filter((w) => w.remote).map((w) => ({
       id: w.worker, label: w.backend, remote: true, kinds: w.kinds, slots: null, busy: w.leased, ok: w.ok, failed: w.failed,
       lastSeen: w.lastSeen, online: now - Date.parse(w.lastSeen) < ONLINE_MS, pausedUntil: null, pauseReason: null, lastError: null,

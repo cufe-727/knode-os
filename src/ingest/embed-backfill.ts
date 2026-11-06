@@ -1,3 +1,4 @@
+import { embeddingDeferred, KnodeConfig } from '../config.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { EmbeddingProvider } from './embeddings.js';
 
@@ -6,7 +7,10 @@ import { EmbeddingProvider } from './embeddings.js';
  *
  * Inside `serve`, applying a document writes its chunks, their full-text index
  * and its graph evidence without waiting for vectors; this fills in every chunk
- * that has no vector for the current model, in the background. A document is
+ * that has no vector for the current model, in the background. That is the
+ * inline mode (`ingest.embedding`, the default); in deferred mode the embed
+ * slots and remote workers drain the same backlog as leased work
+ * (src/work/embed.ts), and this does nothing. A document is
  * searchable by keyword and part of the graph the moment it is applied, and
  * joins vector recall when its vectors land.
  *
@@ -21,6 +25,8 @@ export interface EmbeddingBackfillContext {
   store: Store;
   /** Read on every round: a settings change may swap the provider. */
   embedder: EmbeddingProvider;
+  /** Read on every round: in deferred mode the embed slots (src/work/embed.ts) drain the backlog instead, and this stands aside. */
+  config?: Pick<KnodeConfig, 'ingest'>;
 }
 
 export interface EmbeddingBackfillOptions {
@@ -132,6 +138,7 @@ export class EmbeddingBackfill {
    */
   async runOnce(): Promise<number | null> {
     const { store, embedder } = this.ctx;
+    if (this.ctx.config && embeddingDeferred(this.ctx.config)) return 0;
     const model = embedder.model;
     const rows = await missingChunks(store, model, this.batch * this.concurrency);
     if (rows.length === 0) return 0;

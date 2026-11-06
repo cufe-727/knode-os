@@ -6,19 +6,23 @@ import path from 'node:path';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { defaultConfig, defaultRoutedLlmConfig, LlmConnection } from '../src/config.js';
+import { defaultConfig, defaultRoutedLlmConfig, EmbeddingConnection, LlmConnection } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
 import { readSidecarPart, readSourceSummary } from '../src/fs/sidecar.js';
+import { pendingEmbeddings } from '../src/ingest/embed-backfill.js';
+import { DEFAULT_EMBEDDING_LIMITS } from '../src/ingest/embedding-router.js';
 import { sync } from '../src/ingest/sync.js';
 import { LabelingScheduler } from '../src/labeling/scheduler.js';
 import { REMOTE_TOKENS_FILE, RemoteTokenStore } from '../src/remote/tokens.js';
 import { createApp } from '../src/server/app.js';
 import { hostnameOf, isPublicRequest } from '../src/server/public-guard.js';
-import { resolveWorkspaceScope, WorkspaceContextRegistry } from '../src/server/workspaces.js';
+import { resolveWorkspaceScope, WorkspaceContextRegistry, workspaceDataDir } from '../src/server/workspaces.js';
 import { CallLedger } from '../src/estimate/ledger.js';
 import { WorkBroker } from '../src/work/broker.js';
+import { EmbedSource, PROBE_TEXTS } from '../src/work/embed.js';
 import { JudgeSource } from '../src/work/judge.js';
 import { SummarySource } from '../src/work/summarize.js';
+import { startFakeEmbeddings, type FakeEmbeddings } from './helpers/fake-embeddings.js';
 import { startFakeOpenAi, type ChatRequest, type FakeOpenAi } from './helpers/fake-openai.js';
 
 /**
@@ -30,6 +34,8 @@ import { startFakeOpenAi, type ChatRequest, type FakeOpenAi } from './helpers/fa
  */
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-remote-'));
+// the embedding pool's quota ledger is machine-wide: never the real one
+process.env.KNODE_EMBEDDING_USAGE_FILE = path.join(tmp, 'embedding-usage.json');
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 function write(root: string, rel: string, content: string): void {
@@ -76,6 +82,13 @@ describe('the remote API', () => {
   let fake: FakeOpenAi;
   let rootCtx: AppContext;
   let fin: AppContext;
+  /** A workspace on a bge-m3 pool with its vectors deferred: what remote embed slots work for. */
+  let vec: AppContext;
+  /** The pool's one key, an own endpoint serving the same model, and one serving another. */
+  let poolEndpoint: FakeEmbeddings;
+  let ownEndpoint: FakeEmbeddings;
+  let otherEndpoint: FakeEmbeddings;
+  const embedSources = new Map<string, EmbedSource>();
   let registry: WorkspaceContextRegistry;
   let app: ReturnType<typeof createApp>;
   const schedulers = new Map<string, LabelingScheduler>();
@@ -100,6 +113,9 @@ describe('the remote API', () => {
 
   beforeAll(async () => {
     fake = await startFakeOpenAi({ answer });
+    poolEndpoint = await startFakeEmbeddings({ space: 'bge-m3' });
+    ownEndpoint = await startFakeEmbeddings({ space: 'bge-m3', noise: 0.01, model: 'bge-m3' });
+    otherEndpoint = await startFakeEmbeddings({ space: 'another-model', model: 'bge-m3' });
     const model: LlmConnection = {
       id: 'connection-1', label: 'fake', provider: 'openai', baseUrl: fake.url, apiKey: 'sk-test',
       protocol: 'chat', model: 'fake-model', cliPath: '', effort: 'default', cliTimeoutMs: 30_000,
@@ -121,8 +137,11 @@ describe('the remote API', () => {
         const scheduler = new LabelingScheduler({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, onWritten: (p) => summaries?.prefer(p) }, { priorityRefreshMs: 0 });
         summaries = new SummarySource(ctx, {}, { idleScanMs: 0 });
         const judges = new JudgeSource({ enabled: () => true }, { modelRetryMs: 0, transientRetryMs: 0 });
+        // one batch in two carries a probe text, so the worker meets spot checks within a few batches
+        const embeds = new EmbedSource({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, embedder: () => ctx.embedder }, { idleScanMs: 0, spotCheckEvery: 2 });
         const ledger = CallLedger.forWorkspace(ctx.dataDir, { flushMs: 60_000 });
-        const broker = new WorkBroker([scheduler, summaries, judges], { shares: () => ctx.config.server.remote?.shares, ledger });
+        const broker = new WorkBroker([scheduler, summaries, judges, embeds], { shares: () => ctx.config.server.remote?.shares, ledger });
+        embedSources.set(ctx.dataDir, embeds);
         schedulers.set(ctx.dataDir, scheduler);
         brokers.set(ctx.dataDir, broker);
         judgeSources.set(ctx.dataDir, judges);
@@ -137,6 +156,25 @@ describe('the remote API', () => {
     });
     registry.createUserWorkspace('admin', 'finance');
     fin = await registry.get(resolveWorkspaceScope({ user: 'admin', kind: 'personal', id: 'finance', name: 'finance' }));
+    // a second workspace whose vectors are leased work: a bge-m3 pool with one key, deferred, no embed slots here
+    registry.createUserWorkspace('admin', 'vectors');
+    const vecScope = resolveWorkspaceScope({ user: 'admin', kind: 'personal', id: 'vectors', name: 'vectors' });
+    {
+      const configFile = path.join(workspaceDataDir(root, vecScope), 'knode.config.json');
+      const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+      const key: EmbeddingConnection = {
+        id: 'pool-a', label: 'pool a', provider: 'openai', baseUrl: poolEndpoint.url, apiKey: 'sk-pool', model: 'BAAI/bge-m3',
+        dimensions: 1024, batchSize: 16, sendDimensions: false, limits: { ...DEFAULT_EMBEDDING_LIMITS, requestsPerMinute: 10_000, concurrency: 8 },
+      };
+      fs.writeFileSync(configFile, JSON.stringify({
+        ...config, embeddingProviders: [key], embeddingUse: 'pool-a',
+        embeddingPool: { enabled: true, model: 'bge-m3', dimensions: 1024, batchSize: 4 },
+        ingest: { ...config.ingest, watch: false, embedding: 'deferred', embedSlots: 0 },
+      }));
+    }
+    vec = await registry.get(vecScope);
+    for (let i = 1; i <= 9; i++) write(vec.dataDir, `raw/docs/v${i}.md`, `# 向量 ${i}\n\n第${i}份等待向量的文档：光伏组件与储能电池的价格走势。\n`);
+    await sync(vec, {});
     write(fin.dataDir, 'raw/docs/a.md', '# 甲\n\n宁德时代发布季度报告。\n');
     write(fin.dataDir, 'raw/docs/b.md', '# 乙\n\n比亚迪出货量增长。\n');
     write(fin.dataDir, 'raw/traces/claude/s.jsonl', '{"type":"user"}\n');
@@ -157,12 +195,15 @@ describe('the remote API', () => {
     tok.everywhere = tokens.create({ name: 'everywhere', scopes: ['read'], workspaces: ['*'] }).token;
     tok.revoked = tokens.create({ name: 'revoked', scopes: ['read'], workspaces: ['*'] }).token;
     tokens.revoke('revoked');
+    tok.embedder = tokens.create({ name: 'embedder', scopes: ['embed'], workspaces: ['admin/vectors'] }).token;
+    tok.both = tokens.create({ name: 'both', scopes: ['label', 'embed'], workspaces: ['admin/vectors', 'admin/finance'] }).token;
   });
 
   afterAll(async () => {
     await registry?.closeAll();
     await rootCtx?.store.close();
     await fake?.close();
+    await Promise.all([poolEndpoint, ownEndpoint, otherEndpoint].map((e) => e?.close()));
   });
 
   describe('the public boundary', () => {
@@ -220,6 +261,9 @@ describe('the remote API', () => {
     it('may be narrowed to some kinds of work, which only the "label" scope has', () => {
       const tokens = new RemoteTokenStore(root);
       expect(() => tokens.create({ name: 'odd', scopes: ['label'], workspaces: ['admin/finance'], kinds: ['dream'] })).toThrow(/unknown kind/);
+      // embed work has a scope of its own, and lent keys only go with it
+      expect(() => tokens.create({ name: 'odd', scopes: ['label'], workspaces: ['admin/finance'], kinds: ['embed'] })).toThrow(/"embed" scope/);
+      expect(() => tokens.create({ name: 'odd', scopes: ['label', 'embed-keys'], workspaces: ['admin/finance'] })).toThrow(/"embed" scope too/);
       expect(() => tokens.create({ name: 'odd', scopes: ['read'], workspaces: ['admin/finance'], kinds: ['extract'] })).toThrow(/"label" scope/);
       expect(tokens.list().find((t) => t.name === 'extractor')?.kinds).toEqual(['extract']);
       expect(tokens.list().find((t) => t.name === 'labeler')).not.toHaveProperty('kinds');
@@ -282,7 +326,10 @@ describe('the remote API', () => {
       expect(config.hints).toEqual({ extract: {}, summarize: {}, judge: {}, translate: {} });
       // translations are offered only where the workspace has content languages on (docs/design/17)
       expect(config.kinds.translate).toBe(false);
-      expect(((await (await req(`${ws}/work/config`, { token: tok.extractor })).json()) as Config).kinds).toEqual({ extract: true, summarize: false, judge: false, translate: false });
+      expect(((await (await req(`${ws}/work/config`, { token: tok.extractor })).json()) as Config).kinds).toEqual({ extract: true, summarize: false, judge: false, translate: false, embed: false });
+      // vectors are not leased work on a workspace that embeds inline, the default
+      expect(config.kinds.embed).toBe(false);
+      expect(config).not.toHaveProperty('embedding');
       expect((await req(`${ws}/work/config`, { token: tok.reader })).status).toBe(403);
 
       // the workspace stops offering summaries: the config says so under a new version, and none is leased
@@ -326,6 +373,46 @@ describe('the remote API', () => {
       expect(status.kinds.summarize.totals).toMatchObject({ ok: 2, pagesWritten: 2 });
       expect(status.workers.find((w) => w.worker === 'labeler/mac-1')).toMatchObject({ kinds: ['summarize'] });
       expect((await req(`${ws}/work/status`, { token: tok.reader })).status).toBe(200);
+    });
+  });
+
+  describe('embed work over HTTP', () => {
+    const vws = '/remote/v1/w/admin/vectors';
+    type EmbedConfig = { version: string; kinds: Record<string, boolean>; leaseSeconds: { llm: number; embed?: number }; embedding?: Record<string, unknown> & { probe: { texts: string[]; minCosine: number } } };
+
+    it('tells an embed token the vector space, the batches and the probe set — and an LLM token none of it', async () => {
+      const config = await (await req(`${vws}/work/config`, { token: tok.embedder })).json() as EmbedConfig;
+      expect(config.kinds).toEqual({ extract: false, summarize: false, judge: false, translate: false, embed: true });
+      expect(config.leaseSeconds).toEqual({ llm: 900, embed: 120 });
+      expect(config.embedding).toMatchObject({
+        vectorModel: 'pool:bge-m3:1024:l2-v1', model: 'bge-m3', dimensions: 1024, batchSize: 4, inputChars: 8000, postprocess: 'l2', ownEndpoints: true,
+      });
+      expect(config.embedding!.probe).toEqual({ texts: [...PROBE_TEXTS], minCosine: 0.98 });
+      // nothing about keys: lending is not this token's
+      expect(JSON.stringify(config)).not.toContain('sk-pool');
+      expect(config.embedding).not.toHaveProperty('credentials');
+      // the embed token reaches nothing else here
+      expect((await req(`${vws}/documents`, { token: tok.embedder })).status).toBe(403);
+      expect((await req(`${vws}/labeling/lease`, { method: 'POST', token: tok.embedder, body: '{}' })).status).toBe(403);
+      const extract = await req(`${vws}/work/lease`, { method: 'POST', token: tok.embedder, body: JSON.stringify({ worker: 'x', backend: 'codex', kinds: ['extract'] }) });
+      expect(((await extract.json()) as { tasks: unknown[] }).tasks).toEqual([]);
+      expect((await req(`${vws}/work/status`, { token: tok.embedder })).status).toBe(200);
+      // a worker that names no kinds is an LLM slot from before embed work: it gets no batch
+      const unnamed = await req(`${vws}/work/lease`, { method: 'POST', token: tok.both, body: JSON.stringify({ worker: 'old', backend: 'codex' }) });
+      expect(((await unnamed.json()) as { tasks: { kind: string }[] }).tasks.every((t) => t.kind !== 'embed')).toBe(true);
+      // the label token on an inline workspace: no embedding section
+      expect((await (await req(`${ws}/work/config`, { token: tok.both })).json() as EmbedConfig).embedding).toBeUndefined();
+    });
+
+    it('turns away an embed slot that has not passed calibration', async () => {
+      const lease = await req(`${vws}/work/lease`, { method: 'POST', token: tok.embedder, body: JSON.stringify({ worker: 'raw/embed#1', backend: 'embed', kinds: ['embed'] }) });
+      expect(await lease.json()).toMatchObject({ tasks: [], leaseSeconds: 120, embed: { calibrate: true, reason: expect.stringMatching(/not calibrated/) } });
+      // and it does not count as a worker taking embed work, so the audits keep embedding directly
+      expect(brokers.get(vec.dataDir)!.askedLately('embed', 60_000)).toBe(false);
+      const bad = await req(`${vws}/work/calibrate`, { method: 'POST', token: tok.embedder, body: JSON.stringify({ worker: 'raw', model: 'BAAI/bge-m3', vectors: 'AAAA', dimensions: 1024 }) });
+      expect(bad.status).toBe(400);
+      expect((await req(`${ws}/work/calibrate`, { method: 'POST', token: tok.both, body: JSON.stringify({ worker: 'x', model: 'BAAI/bge-m3', vectors: [] }) })).status).toBe(409);
+      expect((await req(`${vws}/work/calibrate`, { method: 'POST', token: tok.labeler, body: '{}' })).status).toBe(403);
     });
   });
 
@@ -396,6 +483,43 @@ describe('the remote API', () => {
       // no summary slots here: remote workers write the summaries
       await req('/api/config', { method: 'PUT', headers, body: JSON.stringify({ extraction: { summaryConcurrency: 0 } }) });
       expect(fin.config.extraction.summaryConcurrency).toBe(0);
+    });
+  });
+
+  describe('an embedding endpoint of this machine\'s own, in Settings', () => {
+    const headers = { 'x-knode-user': 'admin', 'x-knode-workspace-kind': 'personal', 'x-knode-workspace-id': 'vectors', 'x-knode-workspace-name': 'vectors' };
+
+    it('is checked with the probe set, refused unless it passes, and saved with its key redacted', async () => {
+      const check = await req('/api/config/embedding-endpoint/check', { method: 'POST', headers, body: JSON.stringify({ baseUrl: `${ownEndpoint.url}/`, model: 'BAAI/bge-m3' }) });
+      expect(await check.json()).toMatchObject({ ok: true, vectorModel: 'pool:bge-m3:1024:l2-v1', threshold: 0.98 });
+      const failing = await req('/api/config/embedding-endpoint/check', { method: 'POST', headers, body: JSON.stringify({ baseUrl: otherEndpoint.url, model: 'BAAI/bge-m3' }) });
+      expect(await failing.json()).toMatchObject({ ok: false, reason: expect.stringMatching(/below 0\.98/) });
+      expect((await req('/api/config/embedding-endpoint/check', { method: 'POST', headers, body: JSON.stringify({ baseUrl: 'ftp://x', model: 'm' }) })).status).toBe(400);
+
+      // saving an endpoint that fails calibration is refused, and nothing changes
+      const refused = await req('/api/config', { method: 'PUT', headers, body: JSON.stringify({ ingest: { embedEndpoint: { baseUrl: otherEndpoint.url, model: 'BAAI/bge-m3' } } }) });
+      expect(refused.status).toBe(400);
+      expect(((await refused.json()) as { error: string }).error).toMatch(/did not pass calibration: probe \d+ reached cosine/);
+      expect(vec.config.ingest.embedEndpoint).toBeUndefined();
+      // workspaces that embed with no pool take none
+      const finHeaders = { ...headers, 'x-knode-workspace-id': 'finance', 'x-knode-workspace-name': 'finance' };
+      expect((await req('/api/config', { method: 'PUT', headers: finHeaders, body: JSON.stringify({ ingest: { embedEndpoint: { baseUrl: ownEndpoint.url, model: 'BAAI/bge-m3' } } }) })).status).toBe(400);
+
+      const saved = await req('/api/config', { method: 'PUT', headers, body: JSON.stringify({ ingest: { embedding: 'deferred', embedSlots: 2, embedEndpoint: { baseUrl: ownEndpoint.url, model: 'BAAI/bge-m3', apiKey: 'sk-local' } } }) });
+      expect(saved.status).toBe(200);
+      expect(vec.config.ingest).toMatchObject({ embedding: 'deferred', embedSlots: 2, embedEndpoint: { baseUrl: ownEndpoint.url, model: 'BAAI/bge-m3', apiKey: 'sk-local' } });
+      const shown = await (await req('/api/config', { headers })).json() as { ingest: { embedEndpoint: { apiKey: string } } };
+      expect(shown.ingest.embedEndpoint.apiKey).toBe('***');
+      // '***' keeps the key; an unchanged endpoint is not checked again
+      const calls = ownEndpoint.calls.length;
+      await req('/api/config', { method: 'PUT', headers, body: JSON.stringify({ ingest: { embedEndpoint: { baseUrl: ownEndpoint.url, model: 'BAAI/bge-m3', apiKey: '***' } } }) });
+      expect(vec.config.ingest.embedEndpoint?.apiKey).toBe('sk-local');
+      expect(ownEndpoint.calls.length).toBe(calls);
+      expect((await req('/api/config', { method: 'PUT', headers, body: JSON.stringify({ ingest: { embedding: 'sideways' } }) })).status).toBe(400);
+      // and null removes it; the workspace keeps embedding without serve's slots here
+      await req('/api/config', { method: 'PUT', headers, body: JSON.stringify({ ingest: { embedSlots: 0, embedEndpoint: null } }) });
+      expect(vec.config.ingest.embedEndpoint).toBeUndefined();
+      expect(vec.config.ingest.embedSlots).toBe(0);
     });
   });
 
@@ -483,6 +607,121 @@ describe('the remote API', () => {
         expect(judgeCall).toHaveProperty('response_format');
       } finally {
         fin.config.server.remote = remote;
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    it('embeds the backlog on its own endpoint once it passes calibration, and its vectors land', async () => {
+      const before = await pendingEmbeddings(vec.store, vec.embedder.model);
+      expect(before).toBeGreaterThan(9);
+      // the probe reference is made at most once (Settings may have made it already)
+      const poolBefore = poolEndpoint.texts();
+      expect(poolBefore).toBeLessThanOrEqual(PROBE_TEXTS.length);
+      const ownBefore = ownEndpoint.texts();
+      const server = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' });
+      await new Promise<void>((resolve) => server.once('listening', () => resolve()));
+      try {
+        const port = (server.address() as AddressInfo).port;
+        const worker = spawn(process.execPath, [
+          path.resolve('worker/knode-worker.mjs'),
+          '--server', `http://127.0.0.1:${port}`, '--workspace', 'admin/vectors', '--name', 'gpu-box',
+          '--backends', 'embed:2', '--embed-base-url', ownEndpoint.url, '--embed-model', 'BAAI/bge-m3', '--once', '--idle-ms', '150',
+        ], { env: { ...process.env, KNODE_TOKEN: tok.embedder }, stdio: ['ignore', 'pipe', 'pipe'] });
+        let output = '';
+        worker.stdout.on('data', (d) => (output += d));
+        worker.stderr.on('data', (d) => (output += d));
+        const killer = setTimeout(() => worker.kill('SIGKILL'), 30_000);
+        const code = await new Promise<number | null>((resolve) => worker.on('close', resolve));
+        clearTimeout(killer);
+        expect(code, output).toBe(0);
+        expect(output).toContain('this worker takes embed');
+        expect(output).toMatch(/BAAI\/bge-m3 passed calibration for pool:bge-m3:1024:l2-v1 \(cosine ≥ 0\.99/);
+        expect(output).toMatch(/embedded in [\d.]+s — \d vectors written/);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+      expect(await pendingEmbeddings(vec.store, vec.embedder.model)).toBe(0);
+      // every vector the worker made, finished here: unit length, in the pool's space
+      const rows = await vec.store.query<{ model: string; embedding: string }>(`SELECT model, embedding::text AS embedding FROM embeddings`);
+      expect(rows.length).toBe(before);
+      for (const r of rows) {
+        expect(r.model).toBe('pool:bge-m3:1024:l2-v1');
+        expect(Math.hypot(...(JSON.parse(r.embedding) as number[]))).toBeCloseTo(1, 2);
+      }
+      // the pool made only the probe reference; the chunks were embedded on the worker's endpoint
+      expect(poolEndpoint.texts()).toBe(PROBE_TEXTS.length);
+      expect(ownEndpoint.texts() - ownBefore).toBeGreaterThanOrEqual(before + PROBE_TEXTS.length);
+      // the worker's request is the pool's: the same fields, no dimensions, no upstream pin
+      const poolCall = poolEndpoint.calls[0];
+      for (const c of ownEndpoint.calls) {
+        expect(Object.keys(c).sort()).toEqual(Object.keys(poolCall).sort());
+        expect(c).toMatchObject({ model: 'BAAI/bge-m3', encoding_format: 'float' });
+      }
+      const status = await embedSources.get(vec.dataDir)!.status();
+      expect(status.totals).toMatchObject({ written: before, spotMisses: 0 });
+      expect(status.totals.spotChecks).toBeGreaterThan(0);
+      expect(status.endpoints).toEqual([expect.objectContaining({ worker: 'embedder/gpu-box', model: 'BAAI/bge-m3', vectors: before })]);
+      expect(status.endpoints[0].usageTokens).toBeGreaterThan(0);
+    });
+
+    it('is refused on an endpoint that serves another model, by its vectors or by its name', async () => {
+      write(vec.dataDir, 'raw/docs/late.md', '# 迟到\n\n校准之后才写下的文档。\n');
+      await sync(vec, { only: ['raw/docs/late.md'] });
+      const pending = await pendingEmbeddings(vec.store, vec.embedder.model);
+      expect(pending).toBeGreaterThan(0);
+      const otherBefore = otherEndpoint.texts();
+      const server = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' });
+      await new Promise<void>((resolve) => server.once('listening', () => resolve()));
+      const run = async (name: string, url: string, model: string) => {
+        const port = (server.address() as AddressInfo).port;
+        const worker = spawn(process.execPath, [
+          path.resolve('worker/knode-worker.mjs'),
+          '--server', `http://127.0.0.1:${port}`, '--workspace', 'admin/vectors', '--name', name,
+          '--backends', 'embed:1', '--embed-base-url', url, '--embed-model', model, '--once', '--idle-ms', '150',
+        ], { env: { ...process.env, KNODE_TOKEN: tok.embedder }, stdio: ['ignore', 'pipe', 'pipe'] });
+        let output = '';
+        worker.stdout.on('data', (d) => (output += d));
+        worker.stderr.on('data', (d) => (output += d));
+        const killer = setTimeout(() => worker.kill('SIGKILL'), 30_000);
+        const code = await new Promise<number | null>((resolve) => worker.on('close', resolve));
+        clearTimeout(killer);
+        return { code, output };
+      };
+      try {
+        const vectors = await run('impostor', otherEndpoint.url, 'BAAI/bge-m3');
+        expect(vectors.code, vectors.output).toBe(0);
+        expect(vectors.output).toMatch(/the server refused BAAI\/bge-m3 at .*: probe \d+ reached cosine -?0\.\d+, below 0\.98/);
+        expect(vectors.output).not.toContain('embedded in');
+        const named = await run('renamed', ownEndpoint.url, 'nomic-embed-text');
+        expect(named.code, named.output).toBe(0);
+        expect(named.output).toContain('the endpoint serves nomic-embed-text, not bge-m3');
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+      // nothing either of them made was written
+      expect(await pendingEmbeddings(vec.store, vec.embedder.model)).toBe(pending);
+      expect(otherEndpoint.texts() - otherBefore).toBe(PROBE_TEXTS.length);
+    });
+
+    it('shows the embedding identity and the calibration in --check', async () => {
+      const server = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' });
+      await new Promise<void>((resolve) => server.once('listening', () => resolve()));
+      try {
+        const port = (server.address() as AddressInfo).port;
+        const worker = spawn(process.execPath, [
+          path.resolve('worker/knode-worker.mjs'), '--server', `http://127.0.0.1:${port}`, '--workspace', 'admin/vectors',
+          '--backends', 'embed:1', '--embed-base-url', ownEndpoint.url, '--embed-model', 'BAAI/bge-m3', '--check',
+        ], { env: { ...process.env, KNODE_TOKEN: tok.embedder }, stdio: ['ignore', 'pipe', 'pipe'] });
+        let output = '';
+        worker.stdout.on('data', (d) => (output += d));
+        worker.stderr.on('data', (d) => (output += d));
+        const code = await new Promise<number | null>((resolve) => worker.on('close', resolve));
+        expect(code, output).toBe(0);
+        expect(output).toContain('scopes embed');
+        expect(output).toContain('embed: vectors as pool:bge-m3:1024:l2-v1 (1024 dimensions, batches of 4); own endpoints taken');
+        expect(output).toMatch(/embedding: \d+ chunks without a vector/);
+        expect(output).toContain(`backend embed × 1: ${ownEndpoint.url} (BAAI/bge-m3) — calibrated`);
+      } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
     });

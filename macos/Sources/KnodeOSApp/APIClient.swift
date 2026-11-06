@@ -679,6 +679,11 @@ struct APIClient {
         try await send("/api/config/embedding-usage")
     }
 
+    /// Embed the probe texts on an endpoint of the service's machine and compare them with the pool's (nothing is saved).
+    func checkEmbedEndpoint(_ endpoint: EmbedEndpointConfig) async throws -> EmbedEndpointCheck {
+        try await send("/api/config/embedding-endpoint/check", method: "POST", body: encoded(endpoint))
+    }
+
     func testEmbedding(_ config: KnodeConfig, id: String? = nil) async throws -> EmbeddingTestResponse {
         struct Body: Encodable { var config: KnodeConfig; var id: String? }
         return try await send("/api/config/embedding-test", method: "POST", body: encoded(Body(config: config, id: id)))

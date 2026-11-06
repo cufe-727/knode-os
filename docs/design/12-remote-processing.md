@@ -2,7 +2,12 @@
 
 > Status: **phases 1 and 2 implemented** (2026‑10‑18): the work broker, summaries as leased work, `work/*` with
 > `work/config`, worker kinds and hints, and the Judge stage's review calls fanned out to `serve`'s judge slots and
-> remote workers (§9). Phases 3–4 are proposed. Extends [remote labeling](../remote-labeling.md),
+> remote workers (§9). **Phases 3 and 4 implemented except lent keys** (2026‑11‑06, `src/work/embed.ts`): the
+> `deferred` embedding mode with the chunk backlog and audit requests as `embed` work, `serve`'s embed slots, the
+> identity filter in vector queries, the `embed` scope, and own endpoints with calibration and spot checks — on a
+> remote worker (`--backends embed:N`) and on `serve`'s own machine (`ingest.embedEndpoint`, set and checked in
+> Settings). Lent keys (§4.2) are not built: the `embed-keys` scope exists and grants nothing yet. What differs from
+> the plan is in §12. Extends [remote labeling](../remote-labeling.md),
 > which leased only tier-1 extraction, to the Index stage's vectors, the Summarize stage and the Judge stage's review
 > calls. Workers read the embedding configuration, and hints for the LLM stages, from the server instead of being
 > configured by hand.
@@ -415,6 +420,36 @@ capacity.
   and a restart drops them. Reviews run again on the next round, and the chunk backlog is rebuilt from the tables.
 - **Write load.** Every vector still lands in the same Postgres through serve, one transaction per batch. HNSW inserts
   cost what they cost now; only the rate changes.
+
+## 12. Phases 3 and 4 as built (2026‑11‑06)
+
+- **`inline` was already half deferred.** Since 8cf2d66 (2026‑10‑18) `serve` applies a document without its
+  vectors and a background embedder (`src/ingest/embed-backfill.ts`) fills them in; only the CLI embeds while it
+  applies. `inline` keeps exactly that. `deferred` makes the same backlog leased work, the CLI's sync included, and
+  the background embedder stands aside.
+- **Embed work exists only in `deferred` mode.** `work/config` offers `embed` (and an `embedding` section) only
+  there, to a token with the `embed` scope, unless `server.remote.offer.embed` is off. The audits' vectors go through
+  the `BrokeredEmbedder` only in `deferred` mode, and only while someone can take them — embed slots here, or a
+  remote worker that asked for embed work in the last two minutes; otherwise they are embedded directly, as before.
+- **An own endpoint on `serve`'s machine** (not in the plan): `ingest.embedEndpoint { baseUrl, model, apiKey? }`.
+  `serve`'s embed slots calibrate it like a remote worker's endpoint and embed there, spot-checked; while it is
+  refused or parked they embed on the pool. Settings (web and app) guides setting one up, checks it with the probe
+  set (`POST /api/config/embedding-endpoint/check`), and a save checks it again.
+- **Calibration** is a route of its own, `POST work/calibrate`, answered with a calibration id the worker leases
+  with. A worker is `<token>/<name>`; its slots share the calibration. A spot-check miss ends it and parks the
+  worker for 30 minutes, calibrations included. A lease answer says `embed: { calibrate: true, reason, parkedUntil? }`
+  when the slot must calibrate again.
+- **Model names.** An endpoint's model must have the pool's canonical name (`canonicalEmbeddingModel`, an
+  Ollama-style `:tag` aside), both as the worker names it and as the endpoint answers.
+- **Not built:** lent keys (§4.2) and with them reservations at lease time, the per-key *Lend to remote workers*
+  switch's effect (`lendToWorkers` is in the config type only), `PooledEmbeddingProvider`'s split into reserve, call,
+  check and settle, and showing the keys a token received in `remote token list`. §0 explains why lending adds no
+  capacity.
+- **Tested on 2026‑11‑06** against a local bge-m3 (PyTorch on MPS, fp16, 127.0.0.1:12020): a scratch `serve` in
+  deferred mode, the real worker with `--backends embed:2` calibrated at cosine 1.0000 and embedded the backlog; a
+  worker naming `nomic-embed-text` and an endpoint answering as bge-m3 from another vector space (lowest cosine −0.05)
+  were refused and wrote nothing; `serve`'s own slots drained the backlog through the pool and, once Settings had
+  checked and saved the endpoint, on it.
 
 ## 11. Where the changes go
 

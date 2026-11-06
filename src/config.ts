@@ -60,6 +60,12 @@ export interface EmbeddingConnection extends EmbeddingConfig {
   catalog?: string[];
   /** OpenRouter upstream pin, for example deepinfra/fp32. */
   upstream?: string;
+  /**
+   * Lend this key to remote workers that hold the `embed-keys` scope
+   * (docs/design/12 §4.2): they embed on it under reservations this machine's
+   * quota ledger makes. Off unless turned on, key by key.
+   */
+  lendToWorkers?: boolean;
 }
 
 export interface EmbeddingLimits {
@@ -379,7 +385,7 @@ export interface RemoteApiConfig {
    * may take here (docs/design/12). Summaries default to on, the Judge
    * stage's review calls to off.
    */
-  offer?: { summarize?: boolean; judge?: boolean; translate?: boolean };
+  offer?: { summarize?: boolean; judge?: boolean; translate?: boolean; embed?: boolean };
   /**
    * How a slot that takes several kinds of work shares them: tasks handed out
    * per kind, by weight (src/work/broker.ts). Default extraction 3, summaries 1.
@@ -395,6 +401,12 @@ export interface RemoteApiConfig {
    * Any other remote verdict is filed as a suggestion with the verdict attached.
    */
   judgeModels?: string[];
+  /**
+   * The cosine every probe vector a remote worker's own embedding endpoint
+   * makes must reach against this machine's reference vectors before its
+   * vectors are taken, and every spot check after (default 0.98, docs/design/12 §4.3).
+   */
+  embedProbeCosine?: number;
 }
 
 /**
@@ -544,6 +556,31 @@ export interface IngestConfig {
    * multiplied would blow a rate limit on a single scanned book.
    */
   convertConcurrency?: number;
+  /**
+   * When a document's vectors are made (docs/design/12 §3.3). "inline", the
+   * default: while the document is applied (by the CLI), or right after by
+   * `serve`'s background embedder (src/ingest/embed-backfill.ts). "deferred":
+   * never by the sync; the chunks wait in a backlog that `serve`'s embed slots
+   * and remote workers drain as leased work (src/work/embed.ts), the
+   * duplicate audits' vectors go the same way, and changing the embedding
+   * model refills the backlog instead of re-applying every document.
+   */
+  embedding?: 'inline' | 'deferred';
+  /** `serve`'s own embed slots in deferred mode (default 8); 0 leaves the backlog to remote workers. */
+  embedSlots?: number;
+  /**
+   * An OpenAI-compatible embeddings endpoint on this machine (a local bge-m3,
+   * TEI, Ollama…) for `serve`'s embed slots in deferred mode. Its vectors are
+   * taken once it passes the same calibration as a remote worker's own
+   * endpoint (src/work/embed.ts); until then, and whenever it is refused, the
+   * slots embed on the pool. Settings checks it before saving.
+   */
+  embedEndpoint?: { baseUrl: string; model: string; apiKey?: string } | null;
+}
+
+/** Whether vectors are leased work here (docs/design/12 §3.3): `ingest.embedding: "deferred"`. */
+export function embeddingDeferred(config: Pick<KnodeConfig, 'ingest'>): boolean {
+  return config.ingest?.embedding === 'deferred';
 }
 
 export interface HeatConfig {
@@ -1078,13 +1115,14 @@ export function defaultConfig(): KnodeConfig {
       mcp: { enabled: true, path: '/mcp' },
       remote: {
         enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15,
-        offer: { summarize: true, judge: false, translate: true }, shares: { extract: 3, summarize: 1, translate: 1 }, callDeadlineMinutes: 20, judgeModels: [],
+        offer: { summarize: true, judge: false, translate: true, embed: true }, shares: { extract: 3, summarize: 1, translate: 1 }, callDeadlineMinutes: 20, judgeModels: [],
+        embedProbeCosine: 0.98,
       },
       auth: { enabled: true, sessionDays: 30, allowInsecureRemote: false },
       tls: null,
       embed: { allowedOrigins: [] },
     },
-    ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4, convertConcurrency: 2 },
+    ingest: { chunkSize: 1200, chunkOverlap: 150, watch: true, concurrency: 4, convertConcurrency: 2, embedding: 'inline', embedSlots: 8 },
     extraction: {
       claims: true,
       tier1Model: '',
@@ -1937,6 +1975,8 @@ export function redactConfig(config: KnodeConfig): KnodeConfig {
   }
   const search = clone.research?.web?.search;
   if (search?.apiKey && !search.apiKey.startsWith('env:')) search.apiKey = '***';
+  const endpoint = clone.ingest?.embedEndpoint;
+  if (endpoint?.apiKey && !endpoint.apiKey.startsWith('env:')) endpoint.apiKey = '***';
   if (clone.research?.web?.proxy) clone.research.web.proxy = redactConnectionUrl(clone.research.web.proxy);
   const literal = (value: unknown) => !(typeof value === 'string' && (value === '' || value.startsWith('env:')));
   for (const ds of clone.datasources ?? []) {

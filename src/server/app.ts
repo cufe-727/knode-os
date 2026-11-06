@@ -51,7 +51,7 @@ import {
   syncActiveLlm,
   defaultConfig,
   isCliProvider,
-  saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS, ExtractionWorkerConfig } from '../config.js';
+  saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS, ExtractionWorkerConfig, embeddingDeferred } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
 import { assertNotPrivate, assertSourcePath, assertWritablePath, capText, cleanRelPath, grepFiles, isOwnerRootFile, isPrivatePath, isRootWritableFile, listTree, makeDir, movePath, pathExists, readFileTextCapped, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
@@ -134,6 +134,8 @@ import { exploreSearch, searchSuggest } from '../search/explore.js';
 import { search, SearchMode } from '../search/search.js';
 import { activityOf, describeSync } from '../activity.js';
 import type { EmbeddingBackfill } from '../ingest/embed-backfill.js';
+import type { EmbedSource, LocalEmbedSlots } from '../work/embed.js';
+import { checkEmbedEndpoint, EmbedEndpoint } from '../work/embed.js';
 import { tasksSnapshot } from './tasks.js';
 import { planOnly, resolve } from '../compiler/resolve.js';
 import { liveAbsences } from '../compiler/absence.js';
@@ -206,6 +208,21 @@ const NO_BUILTIN_HINT = 'the built-in agent is not installed in this build — p
 const TREE_META_FILES = 500;
 const TREE_META_BYTES = 16 * 1024;
 
+/**
+ * An embeddings endpoint as Settings sends it: an http(s) URL up to /v1 and a
+ * model. A key of '***' keeps the one saved (GET /api/config redacts it).
+ */
+function embedEndpointOf(value: unknown, saved: EmbedEndpoint | null | undefined): EmbedEndpoint {
+  const v = (value ?? {}) as { baseUrl?: unknown; model?: unknown; apiKey?: unknown };
+  const baseUrl = String(v.baseUrl ?? '').trim().replace(/\/+$/, '');
+  const model = String(v.model ?? '').trim();
+  if (!/^https?:\/\/[^\s/]+(\/\S*)?$/.test(baseUrl)) throw new Error('the endpoint needs an http(s) URL, e.g. http://127.0.0.1:12020/v1');
+  if (!model) throw new Error('name the model the endpoint serves, e.g. BAAI/bge-m3');
+  const key = typeof v.apiKey === 'string' ? v.apiKey.trim() : '';
+  const apiKey = key === '***' ? saved?.apiKey : key || undefined;
+  return { baseUrl, model, ...(apiKey ? { apiKey } : {}) };
+}
+
 /** Comma-separated query parameter → array (absent/empty stays undefined). */
 function csv(value: string | undefined): string[] | undefined {
   if (!value) return undefined;
@@ -235,7 +252,7 @@ type ModelConfigDraft = {
   embeddingProviders?: Partial<EmbeddingConnection>[];
   embeddingUse?: string;
   embeddingPool?: Partial<EmbeddingPoolConfig>;
-  ingest?: { concurrency?: number; convertConcurrency?: number };
+  ingest?: { concurrency?: number; convertConcurrency?: number; embedding?: string; embedSlots?: number; embedEndpoint?: { baseUrl?: string; model?: string; apiKey?: string } | null };
   llm?: Partial<LlmConfig>;
   connections?: Partial<LlmConnection>[];
   llmUse?: string;
@@ -281,6 +298,10 @@ export interface WorkspaceServices {
   calls?: CallLedger | null;
   /** Vectors computed after a document is indexed (src/ingest/embed-backfill.ts): what Tasks shows of embedding. */
   embeddings?: EmbeddingBackfill | null;
+  /** In deferred mode, vectors as leased work (src/work/embed.ts): the backlog, audit requests, own endpoints. */
+  embedWork?: EmbedSource | null;
+  /** This machine's embed slots (`ingest.embedSlots`). */
+  embedSlots?: LocalEmbedSlots | null;
 }
 
 /**
@@ -706,6 +727,17 @@ export function createApp(
     } catch (e) { return c.json({ ok: false, ...err(e) }, 400); }
   });
 
+  // Check an embeddings endpoint of this machine before Settings saves it (docs/design/12 §4.3): it embeds the
+  // probe set and every vector must come within server.remote.embedProbeCosine of the pool's own. Nothing is saved.
+  app.post('/api/config/embedding-endpoint/check', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = await c.req.json() as { baseUrl?: unknown; model?: unknown; apiKey?: unknown };
+      const endpoint = embedEndpointOf(body, ctx.config.ingest.embedEndpoint);
+      return c.json(await checkEmbedEndpoint(ctx, endpoint));
+    } catch (e) { return c.json({ ok: false, ...err(e) }, 400); }
+  });
+
   // Test a draft model configuration without persisting it. An apiKey of '***'
   // means "keep the current secret" (GET /api/config redacts literal keys).
   app.post('/api/config/test', async (c) => {
@@ -941,6 +973,17 @@ export function createApp(
         };
         setInt('concurrency', 1, 32);
         setInt('convertConcurrency', 1, 16);
+        // when vectors are made: by the sync (inline) or as leased work (deferred, docs/design/12 §3.3)
+        const mode = incoming.ingest.embedding;
+        if (mode !== undefined) {
+          if (mode !== 'inline' && mode !== 'deferred') return c.json({ error: `ingest.embedding is "inline" or "deferred", not ${JSON.stringify(mode)}` }, 400);
+          next.ingest.embedding = mode;
+        }
+        const slots = Number(incoming.ingest.embedSlots);
+        if (incoming.ingest.embedSlots !== undefined && Number.isFinite(slots)) next.ingest.embedSlots = Math.min(32, Math.max(0, Math.floor(slots)));
+        // an embeddings endpoint of this machine's own for the embed slots: null removes it
+        if (incoming.ingest.embedEndpoint === null) delete next.ingest.embedEndpoint;
+        else if (incoming.ingest.embedEndpoint !== undefined) next.ingest.embedEndpoint = embedEndpointOf(incoming.ingest.embedEndpoint, ctx.config.ingest.embedEndpoint);
       }
       if (incoming.research) {
         const r = incoming.research;
@@ -1065,6 +1108,7 @@ export function createApp(
       }
 
       const reembed = embeddingIdentity(next.embedding) !== embeddingIdentity(ctx.config.embedding);
+      const modeChanged = embeddingDeferred(next) !== embeddingDeferred(ctx.config);
       const dimChanged = next.embedding.dimensions !== ctx.config.embedding.dimensions;
       const previousDocumentLlm = resolveRoutedLlmConfig(ctx.config.llm, ctx.config.extraction.documentLlm, routeTargets(ctx.config));
       const nextDocumentLlm = resolveRoutedLlmConfig(next.llm, next.extraction.documentLlm, routeTargets(next));
@@ -1076,6 +1120,14 @@ export function createApp(
 
       validateEmbeddingPool(next);
       const nextEmbedder = createConfiguredEmbeddingProvider(next);
+      // a new or changed endpoint of this machine's own is saved only once it passes calibration
+      const endpoint = next.ingest.embedEndpoint;
+      const before = ctx.config.ingest.embedEndpoint;
+      if (endpoint && (endpoint.baseUrl !== before?.baseUrl || endpoint.model !== before?.model || endpoint.apiKey !== before?.apiKey
+          || embeddingIdentity(next.embedding) !== embeddingIdentity(ctx.config.embedding))) {
+        const check = await checkEmbedEndpoint({ dataDir: ctx.dataDir, config: next, embedder: nextEmbedder }, endpoint);
+        if (!check.ok) return c.json({ error: `the embedding endpoint did not pass calibration: ${check.reason}`, check }, 400);
+      }
       saveConfig(ctx.dataDir, next);
       ctx.config = next;
       ctx.llm = judgeLlmClient(next);
@@ -1084,7 +1136,10 @@ export function createApp(
       servicesFor(ctx)?.translations?.wake();
 
       let reindex: Awaited<ReturnType<typeof sync>> | null = null;
-      if (reembed || reconvert) {
+      // deferred: a new model needs no re-apply — the embed backlog refills for it and drains
+      const resync = reconvert || (reembed && !embeddingDeferred(next));
+      if (reembed && dimChanged && !resync) await ctx.store.setEmbeddingDimension(next.embedding.dimensions);
+      if (resync) {
         ingestRunning.add(ctx.dataDir);
         try {
           // a new embedding model re-applies every document scope (chunks are
@@ -1096,6 +1151,8 @@ export function createApp(
           ingestRunning.delete(ctx.dataDir);
         }
       }
+      // the backlog for a new model, or the other embedder for a new mode, starts now
+      if (reembed || modeChanged) ctx.embeddings?.kick();
       return c.json({ ok: true, config: redactConfig(next), reembedded: reembed, reconverted: reconvert, reindex });
     } catch (e) {
       return c.json(err(e), 400);
