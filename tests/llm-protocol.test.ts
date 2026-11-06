@@ -17,10 +17,17 @@ interface Fake {
   /** Every request, in order, as `<METHOD> <path>` plus its body. */
   hits: { path: string; body: Record<string, unknown> }[];
   responsesRoute: boolean;
+  /** Answer a temperature the way a reasoning model does. */
+  refuseTemperature: boolean;
+  /** Answer json_object mode the way Anthropic's OpenAI-compatible endpoint does. */
+  refuseResponseFormat: boolean;
 }
 
+const TEMPERATURE_REFUSED = { error: { message: "Unsupported parameter: 'temperature' is not supported with this model.", type: 'invalid_request_error', param: 'temperature' } };
+const RESPONSE_FORMAT_REFUSED = { error: { code: 'invalid_request_error', message: "response_format.type: Input should be 'json_schema'", type: 'invalid_request_error', param: null } };
+
 async function startFake(opts: { responses?: boolean } = {}): Promise<Fake> {
-  const state: Fake = { url: '', close: async () => {}, hits: [], responsesRoute: opts.responses ?? true };
+  const state: Fake = { url: '', close: async () => {}, hits: [], responsesRoute: opts.responses ?? true, refuseTemperature: false, refuseResponseFormat: false };
   const app = new Hono();
 
   app.post('/v1/responses', async (c) => {
@@ -28,6 +35,7 @@ async function startFake(opts: { responses?: boolean } = {}): Promise<Fake> {
     state.hits.push({ path: '/responses', body });
     // the route is gone: what a plain Chat-Completions endpoint answers
     if (!state.responsesRoute) return c.json({ error: { message: 'Not found' } }, 404);
+    if (state.refuseTemperature && 'temperature' in body) return c.json(TEMPERATURE_REFUSED, 400);
     // the probe sends a model and no input; a real endpoint validates and complains
     if (!body.input) return c.json({ error: { message: 'missing input' } }, 400);
     return c.json({
@@ -44,6 +52,8 @@ async function startFake(opts: { responses?: boolean } = {}): Promise<Fake> {
   app.post('/v1/chat/completions', async (c) => {
     const body = (await c.req.json()) as Record<string, unknown>;
     state.hits.push({ path: '/chat/completions', body });
+    if (state.refuseTemperature && 'temperature' in body) return c.json(TEMPERATURE_REFUSED, 400);
+    if (state.refuseResponseFormat && 'response_format' in body) return c.json(RESPONSE_FORMAT_REFUSED, 400);
     return c.json({ choices: [{ index: 0, message: { role: 'assistant', content: 'from chat' }, finish_reason: 'stop' }] });
   });
 
@@ -151,5 +161,50 @@ describe('llm protocol negotiation', () => {
     expect(call.path).toBe('/chat/completions');
     expect(call.body.max_tokens).toBe(300);
     expect(call.body.response_format).toEqual({ type: 'json_object' });
+  });
+
+  it('sends no temperature to a model that refuses one, and remembers that', async () => {
+    fake.refuseTemperature = true;
+    const client = clientFor(fake);
+    expect(await client.complete([{ role: 'user', content: 'one' }])).toBe('from responses');
+    expect(await client.complete([{ role: 'user', content: 'two' }])).toBe('from responses');
+    expect(fake.hits.map((h) => [h.path, 'temperature' in h.body])).toEqual([
+      ['/responses', false], // the probe
+      ['/responses', true], // refused
+      ['/responses', false], // sent again without it
+      ['/responses', false], // remembered
+    ]);
+  });
+
+  it('keeps the temperature where it is taken, and drops it on chat completions too when refused', async () => {
+    await clientFor(fake, { protocol: 'chat' }).complete([{ role: 'user', content: 'hi' }]);
+    expect(fake.hits.at(-1)!.body.temperature).toBe(0.2);
+    fake.refuseTemperature = true;
+    expect(await clientFor(fake, { protocol: 'chat', model: 'claude-sonnet-5-5' }).complete([{ role: 'user', content: 'hi' }])).toBe('from chat');
+    expect(fake.hits.slice(-2).map((h) => 'temperature' in h.body)).toEqual([true, false]);
+  });
+
+  it('drops each refused parameter in turn: json mode on an endpoint that takes only a schema', async () => {
+    fake.refuseTemperature = true;
+    fake.refuseResponseFormat = true;
+    const client = clientFor(fake, { protocol: 'chat', model: 'claude-sonnet-5-5' });
+    expect(await client.complete([{ role: 'user', content: 'Reply in JSON.' }], { json: true })).toBe('from chat');
+    await client.complete([{ role: 'user', content: 'Reply in JSON.' }], { json: true });
+    expect(fake.hits.map((h) => ['temperature' in h.body, 'response_format' in h.body])).toEqual([
+      [true, true],
+      [false, true],
+      [false, false],
+      [false, false], // both remembered
+    ]);
+  });
+
+  it("puts a call's reasoning effort on either wire, and none for the default", async () => {
+    await clientFor(fake).complete([{ role: 'user', content: 'hi' }], { effort: 'low' });
+    expect(fake.hits.at(-1)!.body.reasoning).toEqual({ effort: 'low' });
+    const chat = clientFor(fake, { protocol: 'chat' });
+    await chat.complete([{ role: 'user', content: 'hi' }], { effort: 'max' });
+    expect(fake.hits.at(-1)!.body.reasoning_effort).toBe('xhigh');
+    await chat.complete([{ role: 'user', content: 'hi' }], { effort: 'default' });
+    expect(fake.hits.at(-1)!.body.reasoning_effort).toBeUndefined();
   });
 });
