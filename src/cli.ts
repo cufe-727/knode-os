@@ -2818,6 +2818,13 @@ research
         const shown = provider === 'cursor-cli' ? [...args.slice(0, -1), '"$(cat brief.md)"'] : args;
         lines.push(`## ${provider}`, '', '```bash', `cd ${JSON.stringify(dir)}`, provider === 'cursor-cli' ? '' : 'export KNODE_MCP_TOKEN=' + token, `${cmd} ${shown.map((a) => (/[\s"]/.test(a) ? JSON.stringify(a) : a)).join(' ')}${provider === 'cursor-cli' ? '' : ' < brief.md'}`, '```', '');
       }
+      if (agent.kind === 'cli' && agent.provider === 'opencode-cli' && agent.endpoint) {
+        // OpenCode's whole setup is one config; it names its key by variable, so the file holds no secret
+        const { cmd, args, env } = launchArgs({ agent, maxTurns: template.maxTurns ?? ctx.config.research?.maxTurns ?? 40, timeoutMs: 0, ws, mcp, readDirs, jobId: job.id });
+        fs.writeFileSync(path.join(dir, 'opencode-knode.json'), JSON.stringify(JSON.parse(env?.OPENCODE_CONFIG_CONTENT ?? '{}'), null, 2) + '\n');
+        const flags = Object.entries(env ?? {}).filter(([k]) => k.startsWith('OPENCODE_DISABLE_')).map(([k, v]) => `export ${k}=${v}`);
+        lines.push('## opencode-cli', '', `Runs on ${agent.endpoint.baseUrl}; put that connection's key in KNODE_OPENCODE_API_KEY.`, '', '```bash', `cd ${JSON.stringify(dir)}`, 'export KNODE_MCP_TOKEN=' + token, 'export KNODE_OPENCODE_API_KEY=…', 'export OPENCODE_CONFIG_CONTENT="$(cat opencode-knode.json)"', ...flags, `${cmd} ${args.map((a) => (/[\s"]/.test(a) ? JSON.stringify(a) : a)).join(' ')} < brief.md`, '```', '');
+      }
       lines.push('When the agent has finished, validate and index the page:', '', '```bash', `knode-os research reclaim ${job.id}`, '```', '');
       fs.writeFileSync(path.join(dir, 'RUN.md'), lines.join('\n'));
       console.log(`exported to ${dir} — see RUN.md`);

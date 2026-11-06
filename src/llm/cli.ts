@@ -6,12 +6,14 @@ import path from 'node:path';
 import { LlmConfig, LlmEffort, LlmSpeed } from '../config.js';
 import type { ChatMessage } from './client.js';
 import { catalogArgs, exitFailure, withCodexCatalog } from './codex-catalog.js';
+import { externalDirs, opencodeConfig, opencodeEffort, opencodeEnv, OpencodeRule, opencodeRunArgs, readOpencodeStream } from './opencode.js';
 import { CallUsage, readCodexEvents, usageFromClaudeResult, usageFromCursorResult } from './usage.js';
 
 /**
  * Chat-completion backends that shell out to a locally installed coding-agent
  * CLI instead of an HTTP API. They reuse the CLI's own login (ChatGPT plan /
- * Anthropic account), so no API key is configured in knode.
+ * Anthropic account), so no API key is configured in knode — except OpenCode,
+ * which has no login and runs on a connection's endpoint and key (src/llm/opencode.ts).
  *
  * All run in non-interactive one-shot mode with the OS temp dir as cwd so
  * the CLIs don't pick up repo instructions (AGENTS.md / CLAUDE.md) or try to
@@ -23,6 +25,9 @@ import { CallUsage, readCodexEvents, usageFromClaudeResult, usageFromCursorResul
  *   - cursor: `cursor-agent -p --output-format json --trust <prompt>` (`--trust` answers the
  *             workspace-trust prompt newer CLIs raise for the temp cwd; the model still
  *             gets no tool grants beyond that directory)
+ *   - opencode: `opencode run --format json --model knode/<model> --title knode` with the
+ *             prompt on stdin and a generated config in the environment that denies
+ *             every tool (but `read`, on the images' folders, when there are images)
  *
  * Images reach each one differently: codex takes `--image`, while claude and
  * cursor have no such flag and instead read the paths listed in the prompt with
@@ -41,6 +46,7 @@ export const CLI_COMMANDS: Record<string, string> = {
   'codex-cli': 'codex',
   'claude-cli': 'claude',
   'cursor-cli': 'cursor-agent',
+  'opencode-cli': 'opencode',
 };
 
 /** The command a CLI provider spawns: an explicit `cliPath`, else the default name looked up on PATH. */
@@ -77,6 +83,7 @@ export function resolveExecutable(command: string): string | null {
 export function effortFor(provider: string, effort: LlmEffort | undefined): string | null {
   if (!effort || effort === 'default') return null;
   if (provider === 'cursor-cli') return effort === 'max' || effort === 'xhigh' || effort === 'ultra' ? 'high' : effort;
+  if (provider === 'opencode-cli') return opencodeEffort(effort);
   if (provider === 'claude-cli' && effort === 'ultra') return 'max';
   return effort;
 }
@@ -148,6 +155,12 @@ export async function completeViaCli(
       prompt += `\n\nRead these image files before answering:\n${images.map((image) => `- ${image}`).join('\n')}`;
     }
     return runCursor(cfg, prompt, model, report);
+  }
+  if (cfg.provider === 'opencode-cli') {
+    if (images.length) {
+      prompt += `\n\nUse the read tool to inspect these image files before answering:\n${images.map((image) => `- ${image}`).join('\n')}`;
+    }
+    return runOpencode(cfg, prompt, model, images, report);
   }
   throw new Error(`not a CLI provider: ${cfg.provider}`);
 }
@@ -274,6 +287,29 @@ async function runCursor(cfg: LlmConfig, prompt: string, model: string | undefin
     throw new Error(`cursor CLI error: ${error ? error.trim().slice(0, 400) : cliFailureText(stderr, stdout)}`);
   }
   if (!text) throw new Error('cursor-agent finished but produced no message');
+  return text;
+}
+
+/**
+ * One `opencode run` on the connection the agent names. Every tool is denied,
+ * the way the other CLIs get none: a stage sends its prompt and wants one
+ * answer. Images are the exception — OpenCode attaches local files as text,
+ * so the model reads them with its `read` tool, allowed on their folders only.
+ */
+async function runOpencode(cfg: LlmConfig, prompt: string, model: string | undefined, images: string[], report: (usage: CallUsage) => void): Promise<string> {
+  if (!cfg.baseUrl) throw new Error('opencode CLI error: this OpenCode agent names no model connection — pick one for it (Settings → Providers & Agents)');
+  if (!model) throw new Error('opencode CLI error: no model — set one on the agent or on its connection');
+  const cmd = cliCommand('opencode-cli', cfg.cliPath);
+  const dirs = [...new Set(images.map((image) => path.dirname(path.resolve(image))))];
+  const permission: Record<string, OpencodeRule> = dirs.length ? { '*': 'deny', read: 'allow', external_directory: externalDirs(dirs) } : { '*': 'deny' };
+  const config = opencodeConfig({ endpoint: cfg, model, label: cfg.label, effort: cfg.effort, images: images.length > 0, permission });
+  const { code, stdout, stderr } = await runProcess(cmd, opencodeRunArgs(model, 'knode'), prompt, cfg.cliTimeoutMs, {
+    env: { ...process.env, ...opencodeEnv(config, cfg, { oneShot: true }) },
+  });
+  const { text, error, usage } = readOpencodeStream(stdout);
+  if (usage) report(usage);
+  if (error || code !== 0) throw new Error(`opencode CLI error: ${error ? error.slice(0, 400) : cliFailureText(stderr, stdout)}`);
+  if (!text) throw new Error('opencode finished but produced no message');
   return text;
 }
 

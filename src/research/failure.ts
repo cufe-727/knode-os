@@ -90,6 +90,8 @@ export function pausingFailure(errors: (string | null | undefined)[], now = new 
 /** The account a usage limit belongs to: every model of one CLI login shares it. */
 export function agentKey(agent: ResearchAgent): string {
   if (agent.kind === 'builtin') return `builtin:${agent.baseUrl.replace(/\/+$/, '')}`;
+  // OpenCode has no login: its limit is the endpoint's, shared with the built-in agent on it
+  if (agent.endpoint) return `builtin:${agent.endpoint.baseUrl.replace(/\/+$/, '')}`;
   return agent.cliPath?.trim() ? `${agent.provider}:${agent.cliPath.trim()}` : agent.provider;
 }
 

@@ -13,6 +13,11 @@
 //   FAKE_AGENT_SLEEP_MS  how long `slow` sleeps (default 3000)
 //   FAKE_CAPTURE_URL  a study's collector (phase collect) captures <url>?part=<n> through knode_capture
 //   FAKE_STUDY_CHART  bad → a study page carries a chart block the validator must refuse
+//
+// Started as `opencode run …` (fake-opencode.sh), it speaks OpenCode instead: the MCP
+// endpoint comes from the generated config in OPENCODE_CONFIG_CONTENT ({env:…} filled
+// in as OpenCode would), and what it prints are `opencode run --format json` events.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -20,8 +25,12 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 
 const prompt = fs.readFileSync(0, 'utf8');
 const phase = /<!--\s*knode-phase:\s*(\w+)\s*-->/.exec(prompt)?.[1] ?? null;
-const mcpConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.mcp.json'), 'utf8'));
-const server = mcpConfig.mcpServers['knode-os'];
+const opencode = process.argv[2] === 'run';
+const substitute = (text) => text.replace(/\{env:([^}]+)\}/g, (_, name) => process.env[name] ?? '');
+const opencodeConfig = opencode ? JSON.parse(substitute(process.env.OPENCODE_CONFIG_CONTENT ?? '{}')) : null;
+const server = opencode
+  ? opencodeConfig.mcp['knode-os']
+  : JSON.parse(fs.readFileSync(path.join(process.cwd(), '.mcp.json'), 'utf8')).mcpServers['knode-os'];
 const outputPath = process.env.KNODE_OUTPUT_PATH ?? /输出路径[^`]*`([^`]+)`/.exec(prompt)?.[1];
 const mode = process.env.FAKE_AGENT_MODE ?? 'good';
 const target = /- 目标：(.+)/.exec(prompt)?.[1]?.trim() ?? 'unknown';
@@ -33,13 +42,42 @@ const companion = /- 附加输出[^\n]*?：`([^`]+)`；必需章节：(.+)/.exec
 const guidePath = companion?.[1] ?? null;
 const guideSections = (companion?.[2] ?? '').split(' / ').map((s) => s.trim()).filter((s) => s.startsWith('#'));
 
-const emit = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
+const write = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
+// claude's stream-json, put into OpenCode's events when started as opencode: a tool call
+// is one `tool_use` once it finished, the result a `text` part and the step's `step_finish`
+const pendingTools = new Map();
+const opencodeEvent = (obj) => {
+  const base = { timestamp: Date.now(), sessionID: 'ses_fake' };
+  const block = obj.message?.content?.[0];
+  if (obj.type === 'system') return write({ ...base, type: 'step_start', part: { type: 'step-start' } });
+  if (obj.type === 'assistant' && block?.type === 'tool_use') return void pendingTools.set(block.id, block);
+  if (obj.type === 'user' && block?.type === 'tool_result') {
+    const call = pendingTools.get(block.tool_use_id);
+    const state = block.is_error ? { status: 'error', input: call?.input ?? {}, error: 'tool failed' } : { status: 'completed', input: call?.input ?? {}, output: '', title: '' };
+    return write({ ...base, type: 'tool_use', part: { type: 'tool', callID: block.tool_use_id, tool: String(call?.name ?? '').replace(/^mcp__knode-os__/, 'knode-os_'), state } });
+  }
+  if (obj.type === 'result') {
+    if (obj.is_error) return write({ ...base, type: 'error', error: { name: 'APIError', data: { message: String(obj.result) } } });
+    write({ ...base, type: 'text', part: { type: 'text', text: String(obj.result), time: { start: 1, end: 2 } } });
+    const steps = Math.max(1, obj.num_turns ?? 1);
+    for (let i = 0; i < steps; i++) write({ ...base, type: 'step_finish', part: { type: 'step-finish', reason: 'stop', cost: 0, tokens: { input: 1000, output: 40, reasoning: 10, cache: { read: 500, write: 0 } } } });
+  }
+};
+const emit = (obj) => (opencode ? opencodeEvent(obj) : write(obj));
 const finish = (text, turns) => emit({ type: 'result', subtype: 'success', is_error: false, result: text, num_turns: turns, total_cost_usd: 0.0123 });
 emit({ type: 'system', subtype: 'init', cwd: process.cwd(), phase });
 // what the harness launched us with, so tests can check the adapter flags and the prompt
 try {
   fs.writeFileSync(path.join(process.cwd(), `argv-${phase ?? 'agent'}.json`), JSON.stringify(process.argv.slice(2)));
   fs.writeFileSync(path.join(process.cwd(), `prompt-${phase ?? 'agent'}.md`), prompt);
+  if (opencode) {
+    // the config as OpenCode received it (no secret in it), and whether the key arrived beside it
+    fs.writeFileSync(path.join(process.cwd(), `opencode-config-${phase ?? 'agent'}.json`), process.env.OPENCODE_CONFIG_CONTENT ?? '');
+    // the key only as its hash, so a test can look for the key itself in every file a run leaves
+    const flags = Object.fromEntries(Object.entries(process.env).filter(([k]) => k.startsWith('OPENCODE_DISABLE_')));
+    const key = process.env.KNODE_OPENCODE_API_KEY;
+    fs.writeFileSync(path.join(process.cwd(), `opencode-env-${phase ?? 'agent'}.json`), JSON.stringify({ ...flags, keySha256: key ? crypto.createHash('sha256').update(key).digest('hex') : null }));
+  }
 } catch {
   // read-only workspace in some tests
 }

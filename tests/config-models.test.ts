@@ -104,8 +104,9 @@ describe('GET /api/config/cli-tools', () => {
     const res = await app.request('/api/config/cli-tools', { headers });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { tools: Array<{ provider: string; command: string; path: string | null }> };
-    expect(body.tools.map((t) => t.provider).sort()).toEqual(['claude-cli', 'codex-cli', 'cursor-cli']);
+    expect(body.tools.map((t) => t.provider).sort()).toEqual(['claude-cli', 'codex-cli', 'cursor-cli', 'opencode-cli']);
     expect(body.tools.find((t) => t.provider === 'cursor-cli')?.command).toBe('cursor-agent');
+    expect(body.tools.find((t) => t.provider === 'opencode-cli')?.command).toBe('opencode');
     for (const tool of body.tools) expect(tool.path === null || path.isAbsolute(tool.path)).toBe(true);
   });
 });

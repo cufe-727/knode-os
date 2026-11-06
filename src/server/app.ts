@@ -2658,7 +2658,10 @@ export function createApp(
     if (!isValidAgentName(name)) return c.json({ error: 'agent names use letters, digits, - and _ (max 41 chars)' }, 400);
     try {
       const body = (await c.req.json().catch(() => ({}))) as { agent?: Record<string, unknown> };
-      const saved = saveAgent(ctx.dataDir, { ...(body.agent ?? {}), name });
+      const incoming = { ...(body.agent ?? {}) };
+      // a client that predates OpenCode agents saves without the field; keep the connection it does not know about
+      if (!('connection' in incoming)) incoming.connection = loadAgent(ctx.dataDir, name)?.connection ?? '';
+      const saved = saveAgent(ctx.dataDir, { ...incoming, name });
       refreshAgentLlms(ctx);
       return c.json(agentDetail(ctx, saved));
     } catch (e) {

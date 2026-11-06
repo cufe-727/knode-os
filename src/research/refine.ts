@@ -1,6 +1,6 @@
 import { AppContext } from '../context.js';
 import { resolve } from '../compiler/resolve.js';
-import { LlmConfig, llmTargets } from '../config.js';
+import { isCliProvider, LlmConfig, llmTargets } from '../config.js';
 import { LlmClient } from '../llm/client.js';
 import { agentForSpec, ResearchAgent } from './agent.js';
 import { extractJson } from './pipeline.js';
@@ -299,19 +299,21 @@ export function refinerClient(ctx: AppContext, agent: ResearchAgent | null | und
     if (!a) return null;
     const base: LlmConfig = { ...ctx.config.llm, provider: a.provider === 'deep-agents' ? 'openai' : a.provider, model: a.model, cliPath: a.kind === 'cli' ? a.cliPath : '', effort: 'medium', speed: 'default', cliTimeoutMs: Math.max(ctx.config.llm.cliTimeoutMs ?? 0, 600_000) };
     if (a.kind === 'builtin') Object.assign(base, { baseUrl: a.baseUrl, apiKey: a.apiKey, protocol: a.protocol });
+    // OpenCode runs on its own connection, not on whatever the default is
+    else if (a.endpoint) Object.assign(base, a.endpoint);
     const client = new LlmClient(base);
     return client.enabled ? client : null;
   };
   if (spec) {
     const connection = llmTargets(ctx.config).find((c) => c.id === spec);
-    if (connection && !['claude-cli', 'codex-cli', 'cursor-cli'].includes(connection.provider)) {
+    if (connection && !isCliProvider(connection.provider)) {
       const client = new LlmClient(connection);
       if (client.enabled) return client;
     }
     const named = fromAgent(agentForSpec(ctx.config, spec, '', ctx.dataDir));
     if (named) return named;
   }
-  if (ctx.llm.enabled && !['claude-cli', 'codex-cli', 'cursor-cli'].includes(ctx.llm.provider)) return ctx.llm;
+  if (ctx.llm.enabled && !isCliProvider(ctx.llm.provider)) return ctx.llm;
   return fromAgent(agent ?? null) ?? (ctx.llm.enabled ? ctx.llm : null);
 }
 

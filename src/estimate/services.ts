@@ -21,7 +21,8 @@ export function serviceOfLlm(llm: Pick<LlmConfig, 'provider'>): ServiceId {
   if (llm.provider === 'codex-cli') return 'codex';
   if (llm.provider === 'claude-cli') return 'claude';
   if (llm.provider === 'cursor-cli') return 'cursor';
-  if (llm.provider === 'openai' || !llm.provider) return 'api';
+  // OpenCode has no plan of its own: it bills the key of the connection it runs on
+  if (llm.provider === 'openai' || llm.provider === 'opencode-cli' || !llm.provider) return 'api';
   return 'other';
 }
 

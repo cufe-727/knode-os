@@ -130,10 +130,14 @@ export interface DatabaseConfig {
 export type LlmProvider = string;
 
 /** The LLM providers knode-os ships with. `command` runs any executable as a model (src/llm/providers/command.ts). */
-export const BUILTIN_LLM_PROVIDERS = ['openai', 'codex-cli', 'claude-cli', 'cursor-cli', 'command'] as const;
+export const BUILTIN_LLM_PROVIDERS = ['openai', 'codex-cli', 'claude-cli', 'cursor-cli', 'opencode-cli', 'command'] as const;
 
-/** The coding-agent CLIs: agents that bring their own loop, kept in `playbooks/agents/`. */
-export const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli'] as const;
+/**
+ * The coding-agent CLIs: agents that bring their own loop, kept in `playbooks/agents/`.
+ * `opencode-cli` is the one that brings no login of its own: it runs on a model
+ * connection's endpoint and key (see `bindAgentEndpoints`).
+ */
+export const CLI_PROVIDERS = ['claude-cli', 'codex-cli', 'cursor-cli', 'opencode-cli'] as const;
 export type CliProvider = (typeof CLI_PROVIDERS)[number];
 
 export function isCliProvider(provider: unknown): provider is CliProvider {
@@ -183,17 +187,19 @@ export interface LlmConfig {
    * 'codex-cli'  = shell out to the local `codex exec` CLI (reuses its login, no key);
    * 'claude-cli' = shell out to the local `claude -p` CLI (reuses its login, no key);
    * 'cursor-cli' = shell out to the local `cursor-agent -p` CLI (reuses its login, no key);
+   * 'opencode-cli' = shell out to the local `opencode run` CLI on `baseUrl` / `apiKey` /
+   *                `protocol`, copied from the connection its agent file names;
    * 'command'    = run the executable at `cliPath` once per call (JSON on stdin, reply on stdout);
    * anything else = an LLM provider a plugin registered.
    */
   provider: LlmProvider;
-  /** OpenAI-compatible endpoint. Ignored by CLI providers. */
+  /** OpenAI-compatible endpoint. Ignored by CLI providers, except opencode-cli, which runs on it. */
   baseUrl: string;
-  /** Ignored by CLI providers. */
+  /** Ignored by CLI providers, except opencode-cli. */
   apiKey: string;
   /**
    * Which wire to speak to an OpenAI-compatible endpoint on. Absent = 'auto'.
-   * Ignored by CLI providers.
+   * Ignored by CLI providers, except opencode-cli (see `opencodeProviderNpm`).
    */
   protocol?: LlmProtocol;
   /**
@@ -215,6 +221,14 @@ export interface LlmConfig {
   cliTimeoutMs: number;
   /** Shown in the UI. Empty = llmProviderLabel(provider). */
   label?: string;
+  /**
+   * opencode-cli only: the model connection the agent file names (`connection`),
+   * whose endpoint, key and protocol `bindAgentEndpoints` copies in. '' or
+   * 'default' = the default LLM's connection. Read from the agent file; only
+   * the `llm` mirror of a default that is an OpenCode agent carries it into
+   * the config.
+   */
+  connection?: string;
   /**
    * 'deepagents' = run the deepagents loop on this endpoint and hand back its
    * final answer, instead of calling the model directly: how a pipeline stage
@@ -707,7 +721,7 @@ export interface McpServerConfig {
 export interface ResearchConfig {
   /**
    * Which agent runs jobs: a connection id from `connections`, a CLI provider
-   * name ('claude-cli' | 'codex-cli' | 'cursor-cli'), or 'default' for the
+   * name ('claude-cli' | 'codex-cli' | 'cursor-cli' | 'opencode-cli'), or 'default' for the
    * section-01 connection. An OpenAI-compatible connection runs the built-in
    * agent. Empty = not configured, and research is disabled — there is no
    * fallback, because one that only worked when the default provider happened
@@ -1532,10 +1546,41 @@ export function syncActiveLlm(config: KnodeConfig): KnodeConfig {
  * agents, called one-shot. An endpoint wins an id clash, since it is what the
  * config itself names. A pipeline route can run on more — see `routeTargets`.
  */
-export function llmTargets(config: Pick<KnodeConfig, 'connections' | 'agentLlms'>): LlmConnection[] {
+export function llmTargets(config: Pick<KnodeConfig, 'connections' | 'agentLlms'> & { llmUse?: string }): LlmConnection[] {
   const connections = config.connections ?? [];
   const agents = (config.agentLlms ?? []).filter((a) => !connections.some((c) => c.id === a.id));
-  return [...connections, ...agents];
+  return [...connections, ...bindAgentEndpoints(agents, connections, config.llmUse ?? '')];
+}
+
+/**
+ * The model connection an opencode-cli agent runs on: the one it names, or
+ * the default LLM's for '' and 'default'. Only a model endpoint qualifies —
+ * never another agent, so a default that is this very agent binds nothing
+ * rather than going round in a circle.
+ */
+export function modelConnectionFor(connections: LlmConnection[], spec: string, llmUse: string): LlmConnection | null {
+  const wanted = spec.trim();
+  const id = !wanted || wanted === 'default' ? llmUse : wanted;
+  const connection = connections.find((c) => c.id === id);
+  return connection && connection.provider === 'openai' && connection.baseUrl ? connection : null;
+}
+
+/**
+ * Give every opencode-cli agent row the endpoint, key and protocol of the
+ * connection it names, and that connection's model when it names none of its
+ * own. OpenCode brings no login: it is a loop, and the model it loops on is
+ * one of `connections`. The key stays in its raw form (`env:VAR` or the
+ * literal); the launcher hands it to the process in the environment, never in
+ * argv or a file. A row whose connection is gone keeps an empty `baseUrl`, and
+ * running it says so.
+ */
+export function bindAgentEndpoints(rows: LlmConnection[], connections: LlmConnection[], llmUse: string): LlmConnection[] {
+  return rows.map((row) => {
+    if (row.provider !== 'opencode-cli') return row;
+    const endpoint = modelConnectionFor(connections, row.connection ?? '', llmUse);
+    if (!endpoint) return { ...row, baseUrl: '', apiKey: '' };
+    return { ...row, baseUrl: endpoint.baseUrl, apiKey: endpoint.apiKey, protocol: endpoint.protocol ?? 'auto', model: row.model || endpoint.model };
+  });
 }
 
 /**
@@ -1625,6 +1670,8 @@ export function readAgentLlms(dataDir: string): LlmConnection[] {
       effort: LLM_EFFORTS.includes(raw.effort as LlmEffort) ? (raw.effort as LlmEffort) : 'default',
       speed: LLM_SPEEDS.includes(raw.speed as LlmSpeed) ? (raw.speed as LlmSpeed) : 'default',
       cliTimeoutMs: CLI_ONE_SHOT_TIMEOUT_MS,
+      // which model endpoint it loops on; `llmTargets` fills in the rest
+      ...(executor === 'opencode-cli' ? { connection: text('connection') } : {}),
     });
   }
   return out;
@@ -1864,6 +1911,7 @@ export function llmProviderLabel(provider: LlmProvider): string {
     case 'codex-cli': return 'Codex CLI';
     case 'claude-cli': return 'Claude Code CLI';
     case 'cursor-cli': return 'Cursor Agent CLI';
+    case 'opencode-cli': return 'OpenCode CLI';
     case 'command': return 'Command · any executable';
     default: return provider;
   }

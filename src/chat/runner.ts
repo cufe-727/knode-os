@@ -143,10 +143,12 @@ function summarize(input: unknown): { summary: string; path?: string } {
  * Tool activity from a claude / cursor stream-json transcript: every
  * `tool_use` block of an assistant message, with `ok` filled in from the
  * matching `tool_result`. Other providers give no event stream → []. The
- * built-in agent writes the same shape, so it parses like claude does.
+ * built-in agent writes the same shape, so it parses like claude does;
+ * OpenCode prints one `tool_use` event per finished call (`opencodeActivity`).
  */
 export function parseActivity(transcriptPath: string, provider: ExecutorId): ChatEvent[] {
   if (provider === 'codex-cli' || !fs.existsSync(transcriptPath)) return [];
+  if (provider === 'opencode-cli') return opencodeActivity(fs.readFileSync(transcriptPath, 'utf8'));
   const events: ChatEvent[] = [];
   const byId = new Map<string, ChatEvent>();
   for (const line of fs.readFileSync(transcriptPath, 'utf8').split('\n')) {
@@ -173,6 +175,28 @@ export function parseActivity(transcriptPath: string, provider: ExecutorId): Cha
         if (event) event.ok = !block.is_error;
       }
     }
+  }
+  return events;
+}
+
+/**
+ * `opencode run --format json` reports a tool call once, when it has finished:
+ * a `tool_use` event whose part names the tool (`knode-os_knode_search` for
+ * knode's) and carries its input and whether it completed or failed.
+ */
+export function opencodeActivity(transcript: string): ChatEvent[] {
+  const events: ChatEvent[] = [];
+  for (const line of transcript.split('\n')) {
+    if (!line.startsWith('{')) continue;
+    let ev: { type?: string; part?: { tool?: unknown; state?: { status?: unknown; input?: unknown } } };
+    try {
+      ev = JSON.parse(line) as typeof ev;
+    } catch {
+      continue;
+    }
+    if (ev.type !== 'tool_use' || typeof ev.part?.tool !== 'string') continue;
+    const { summary, path: p } = summarize(ev.part.state?.input);
+    events.push({ tool: ev.part.tool.replace(/^knode-os_/, ''), summary, ...(p ? { path: p } : {}), ok: ev.part.state?.status === 'completed' });
   }
   return events;
 }
