@@ -1,4 +1,4 @@
-import { LlmConfig, LlmProtocol } from '../config.js';
+import { LlmConfig, LlmEffort, LlmProtocol } from '../config.js';
 import { pluginRegistry } from '../plugins/registry.js';
 import type { LlmBackend } from '../plugins/types.js';
 import type { CallUsage } from './usage.js';
@@ -18,6 +18,11 @@ export interface CompletionOptions {
   maxTokens?: number;
   model?: string;
   images?: ImageAttachment[];
+  /**
+   * How hard a reasoning model thinks on this call, for an OpenAI-compatible
+   * endpoint that takes it (`reasoning.effort`). Absent or 'default' sends none.
+   */
+  effort?: LlmEffort;
   /**
    * Told what the call used, when the provider reports it (src/llm/usage.ts):
    * the built-in providers do; a plugin's may, and one that does not is
