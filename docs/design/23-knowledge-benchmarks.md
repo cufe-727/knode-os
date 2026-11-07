@@ -267,4 +267,17 @@ bills the API key (one session ≈ $0.04).
 As run: the OpenAI key ran out of credit at 09:27Z with $184 on the ledger (OpenAI answered 429, so the chains moved to Codex before
 D18's 95% stop). On Codex an agent answer took a median 172 s instead of 46 s. With one pack left, the default of three answers at a
 time left the run about 0.9 answers a minute. It was stopped at 12:58Z and resumed with `--answer-concurrency 8`, which now also applies
-to update batches (they were answered one task at a time).
+to update batches (they were answered one task at a time). agent-knode and knode-ask still answer one at a time (`serial`: the embedded
+index allows one process).
+
+Phase 2 finished 2026‑11‑08 18:36Z: 2,969 answers, no errors, 42 builds, 237 judge calls; Anthropic $19.40 in all.
+
+- Pooled over 277 paired tasks, compared with agent-grep (all significant after Holm correction): agent-wiki-sources −0.02,
+  agent-knode-wiki-sources −0.03, agent-knode −0.04, agent-wiki −0.09, long-context −0.10, rag-hybrid −0.34, knode-ask −0.40,
+  agent-knode-wiki −0.42.
+- Corpus-level lists rank the systems the same way. On the year of weekly reports: agent-grep 0.81, agent-wiki-sources 0.78,
+  agent-wiki 0.77, agent-knode 0.66.
+- At 1× scale, no pack shows a wiki beating raw sources. A wiki is worth about as much as the sources kept next to it.
+- Wiki agents read more per query (≈ 60k against 36k weighted tokens on the reports) and never break even with agent-grep.
+- knode's own wiki is thin (38 pages on the reports pack against the LLM Wiki's 694), so agent-knode-wiki refuses often.
+- Phases 2b and 3 (the scale curves, where a wiki might start to pay) were not run.
