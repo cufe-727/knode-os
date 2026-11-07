@@ -5,6 +5,43 @@ import { foldSpace, seededKey } from '../pack.js';
 import type { GoldFact, GoldItem, ListSpec, Task } from '../types.js';
 import { CORPUS_TASK_MIN_DOCS, DEEP_HOP_MIN } from '../types.js';
 import { DocText, oracleCheck } from './gold.js';
+import { parseLooseDate } from '../score/lists.js';
+
+/**
+ * Ask about a group of units; when the reply does not parse (a long list cut
+ * off, two objects), ask again about each half, down to one unit, which is
+ * tried twice. What still fails is logged and left out.
+ */
+async function askSplitting<U>(group: U[], ask: (g: U[]) => Promise<void>, log?: (m: string) => void, what = 'batch'): Promise<void> {
+  try {
+    await ask(group);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (group.length > 1) {
+      const half = Math.ceil(group.length / 2);
+      await askSplitting(group.slice(0, half), ask, log, what);
+      await askSplitting(group.slice(half), ask, log, what);
+      return;
+    }
+    try {
+      await ask(group);
+    } catch {
+      log?.(`${what} failed for one unit: ${msg.slice(0, 120)}`);
+    }
+  }
+}
+
+/** A drafted date as YYYY-MM-DD / YYYY-MM / YYYY: as written when it already is one, read loosely otherwise, else the document's. */
+export function draftedDate(raw: string | undefined, docDate: string | undefined): string | undefined {
+  const d = (raw ?? '').trim();
+  if (/^\d{4}(-\d{2}){0,2}$/.test(d)) return d;
+  const loose = d ? parseLooseDate(d) : null;
+  const year = loose?.y ?? (docDate ? Number(docDate.slice(0, 4)) : undefined);
+  if (loose && year) return `${year}-${String(loose.m).padStart(2, '0')}${loose.d ? `-${String(loose.d).padStart(2, '0')}` : ''}`;
+  const y = d.match(/\b(\d{4})\b/)?.[1];
+  if (y) return y;
+  return docDate && /^\d{4}/.test(docDate) ? docDate.slice(0, 10) : undefined;
+}
 
 /**
  * Corpus-level tasks for packs whose sources come without a script
@@ -157,12 +194,12 @@ export async function sweepStatements(author: LlmClient, entities: Entity[], doc
   }).filter((u) => u.text);
   const out: Statement[] = [];
   let rejected = 0;
-  await mapLimit(packed(units, (u) => u.text.length + 200, 12_000), 3, async (group) => {
+  await mapLimit(packed(units, (u) => u.text.length + 200, 9_000), 3, (batch) => askSplitting(batch, async (group) => {
     const r = await author.completeJson<{ statements?: { doc?: string; entity?: string; text?: string; quote?: string; date?: string }[] }>([
       { role: 'system', content: `For each document excerpt, list EVERY distinct statement it makes about each entity listed for it: one checkable claim each (what, when, how much, who said or did it), self-contained, in ${langName(opts.lang)}. Give "quote": a short span copied EXACTLY from the excerpt that states it (8–80 characters), and "date": the date the statement is about (YYYY-MM-DD, YYYY-MM or YYYY) when the excerpt gives or implies one, else "". Skip passing mentions that say nothing about the entity.
 Answer with JSON: {"statements":[{"doc":"<path>","entity":"<entity name>","text":"…","quote":"…","date":"…"}]}` },
       { role: 'user', content: group.map((u) => `<excerpt path="${u.doc.path}"${u.doc.date ? ` date="${u.doc.date}"` : ''} entities="${u.here.map((e) => e.name).join('; ')}">\n${u.text}\n</excerpt>`).join('\n\n') },
-    ], { maxTokens: 6000 });
+    ], { maxTokens: 8000 });
     for (const s of r.statements ?? []) {
       const u = group.find((x) => x.doc.path === s.doc);
       const ent = u?.here.find((e) => norm(e.name) === norm(s.entity ?? '') || e.aliases.some((a) => norm(a) === norm(s.entity ?? '')));
@@ -171,9 +208,10 @@ Answer with JSON: {"statements":[{"doc":"<path>","entity":"<entity name>","text"
         rejected++;
         continue;
       }
-      out.push({ id: `s${out.length + 1}`, entity: ent.name, doc: u.doc.path, text: s.text.trim(), quote: s.quote, ...(s.date && /^\d{4}(-\d{2}){0,2}$/.test(s.date) ? { date: s.date } : {}) });
+      const date = draftedDate(s.date, u.doc.date);
+      out.push({ id: `s${out.length + 1}`, entity: ent.name, doc: u.doc.path, text: s.text.trim(), quote: s.quote, ...(s.date && date ? { date } : {}) });
     }
-  }, (err) => opts.log?.(`statement sweep failed: ${err instanceof Error ? err.message : String(err)}`));
+  }, opts.log, 'statement sweep'), (err) => opts.log?.(`statement sweep failed: ${err instanceof Error ? err.message : String(err)}`));
   opts.log?.(`corpus tasks: ${out.length} statements about ${entities.length} entities (${rejected} quotes not in their document)`);
   return out;
 }
@@ -202,14 +240,15 @@ export async function assembleEntityTasks(author: LlmClient, entities: Entity[],
   const counts = { profile: 0, timeline: 0, contradiction: 0 };
   const groups: Entity[][] = [];
   for (let i = 0; i < usable.length; i += 2) groups.push(usable.slice(i, i + 2));
-  const assemblies = await mapLimit(groups, 3, async (group) => author.completeJson<{ entities?: Assembly[] }>([
+  const assemblies: { entities?: Assembly[] }[] = [];
+  await mapLimit(groups, 3, (batch) => askSplitting(batch, async (group) => { assemblies.push(await author.completeJson<{ entities?: Assembly[] }>([
     { role: 'system', content: `Each entity comes with the statements a document collection makes about it (id, document, document date, date, text). For each entity:
 - "facts": merge statements that say the same thing; one entry per distinct fact (a short label in ${langName(opts.lang)}, and the ids of the statements behind it). At most 25, the most informative first.
 - "timeline": the entity's state, role or figures as they change over time — one entry per change, in chronological order, each with its date (YYYY-MM-DD or YYYY-MM) and statement ids. Only real changes of the same thing (a price target raised, a role taken, a rule amended); [] when there are fewer than five.
 - "conflicts": where statements contradict each other (different numbers, opposite claims or forecasts about the same thing, different dates for the same event) — "about" what, and each side's label and statement ids. [] when none do. Differences of opinion on the same question count; statements about different times do not.
 Answer with JSON: {"entities":[{"entity":"<name>","facts":[{"label":"…","statements":["s1"]}],"timeline":[{"label":"…","date":"…","statements":["s2"]}],"conflicts":[{"about":"…","sides":[{"label":"…","statements":["s3"]}]}]}]}` },
     { role: 'user', content: JSON.stringify(group.map((e) => ({ entity: e.name, statements: (of.get(e.name) ?? []).map((s) => ({ id: s.id, doc: s.doc, docDate: docDate.get(s.doc) ?? '', date: s.date ?? '', text: s.text })) }))) },
-  ], { maxTokens: 8000 }), (err) => opts.log?.(`assembly failed: ${err instanceof Error ? err.message : String(err)}`));
+  ], { maxTokens: 10000 })); }, opts.log, 'assembly'), (err) => opts.log?.(`assembly failed: ${err instanceof Error ? err.message : String(err)}`));
 
   const docsOf = (ids: string[] | undefined, entity: string) => [...new Set((ids ?? []).map((i) => byId.get(i)).filter((s): s is Statement => Boolean(s) && s!.entity === entity).map((s) => s.doc))];
   const ordered = [...usable].sort((a, b) => seededKey(opts.seed, a.name).localeCompare(seededKey(opts.seed, b.name)));
@@ -230,7 +269,12 @@ Answer with JSON: {"entities":[{"entity":"<name>","facts":[{"label":"…","state
         list: spec({ primary: 'recall', maxItems: Math.min(40, facts.length + 10) }), closedWorld: { terms, prefixes: [] }, evidence: evidenceOf(factDocs), meta: { entity: e.name, origin: 'drafted' } });
     }
     // timeline: dated changes in order
-    const steps: GoldItem[] = (a.timeline ?? []).filter((t) => t.label && t.date && /^\d{4}(-\d{2}){0,2}$/.test(t.date)).map((t) => ({ label: t.label!, aliases: [], weight: 1, date: t.date!, docs: docsOf(t.statements, e.name) })).filter((t) => t.docs!.length)
+    // a step's date as drafted, read loosely, else its first statement's, else that document's
+    const stepDate = (t: { date?: string; statements?: string[] }) => {
+      const st = (t.statements ?? []).map((i) => byId.get(i)).find((x): x is Statement => Boolean(x));
+      return draftedDate(t.date, st?.date ?? (st ? docDate.get(st.doc) : undefined));
+    };
+    const steps: GoldItem[] = (a.timeline ?? []).filter((t) => t.label).map((t) => ({ label: t.label!, aliases: [], weight: 1, date: stepDate(t) ?? '', docs: docsOf(t.statements, e.name) })).filter((t) => t.docs!.length && t.date)
       .sort((x, y) => x.date!.localeCompare(y.date!));
     const stepDocs = [...new Set(steps.flatMap((s) => s.docs!))];
     if (counts.timeline < (opts.plan.timeline ?? 0) && steps.length >= CORPUS_TASK_MIN_DOCS && stepDocs.length >= CORPUS_TASK_MIN_DOCS) {
@@ -276,19 +320,19 @@ Answer with JSON: {"questions":[{"question":"…","predicate":"…","keywords":[
     return { doc, here, text: excerpt(doc.text, here.flatMap((q) => q.keywords), 800, 6000) };
   });
   const found = new Map<string, { name: string; doc: string; quote: string }[]>();
-  await mapLimit(packed(units, (u) => u.text.length + 300, 12_000), 3, async (group) => {
+  await mapLimit(packed(units, (u) => u.text.length + 300, 9_000), 3, (batch) => askSplitting(batch, async (group) => {
     const r = await author.completeJson<{ items?: { doc?: string; predicate?: string; name?: string; quote?: string }[] }>([
       { role: 'system', content: `For each excerpt, check each predicate listed for it and list every item the excerpt shows satisfying it: "name" as the excerpt writes it, and "quote": a short span copied EXACTLY from the excerpt that shows it (8–80 characters). List nothing for a predicate the excerpt does not satisfy.
 Answer with JSON: {"items":[{"doc":"<path>","predicate":"<predicate id>","name":"…","quote":"…"}]}` },
       { role: 'user', content: group.map((u) => `<excerpt path="${u.doc.path}">\n${u.text}\n</excerpt>\n<predicates path="${u.doc.path}">\n${u.here.map((q) => `${q.key}: ${q.predicate} (items: ${q.item ?? 'names'})`).join('\n')}\n</predicates>`).join('\n\n') },
-    ], { maxTokens: 6000 });
+    ], { maxTokens: 8000 });
     for (const it of r.items ?? []) {
       const u = group.find((x) => x.doc.path === it.doc);
       if (!u || !it.name || !it.quote || !it.predicate || !u.here.some((q) => q.key === it.predicate)) continue;
       if (!foldSpace(u.doc.text).includes(foldSpace(it.quote))) continue;
       (found.get(it.predicate) ?? found.set(it.predicate, []).get(it.predicate)!).push({ name: it.name.trim(), doc: u.doc.path, quote: it.quote });
     }
-  }, (err) => opts.log?.(`aggregate sweep failed: ${err instanceof Error ? err.message : String(err)}`));
+  }, opts.log, 'aggregate sweep'), (err) => opts.log?.(`aggregate sweep failed: ${err instanceof Error ? err.message : String(err)}`));
   // the same item under different names: merged once for all predicates
   const merge = await author.completeJson<{ predicates?: { predicate?: string; items?: { name?: string; aliases?: string[] }[] }[] }>([
     { role: 'system', content: 'For each predicate, merge the names that refer to the same item; give each item one name and its other names. Answer with JSON: {"predicates":[{"predicate":"<id>","items":[{"name":"…","aliases":["…"]}]}]}' },

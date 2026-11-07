@@ -42,7 +42,7 @@ import { calibrateEndpoint, preferEndpoint } from '../src/eval/endpoint.js';
 import { researchEmergence } from '../src/eval/packs/research.js';
 import type { KnodeConfig } from '../src/config.js';
 import '../src/eval/packs/recipes.js';
-import { draftCorpusTasks } from '../src/eval/packs/corpus-tasks.js';
+import { draftCorpusTasks, draftedDate, sweepStatements } from '../src/eval/packs/corpus-tasks.js';
 import { PackWriter } from '../src/eval/packs/writer.js';
 import { CORPUS_TASK_TYPES, emptyUsage, type GoldFact, type ListSpec, type Task } from '../src/eval/types.js';
 
@@ -755,6 +755,26 @@ describe('corpus-level tasks: packs', () => {
     expect(pack.tasks.some((t) => t.id === 't-bp')).toBe(true);
     expect(logs.some((l) => l.includes('dropped') && l.includes('3公里'))).toBe(true);
   }, 60_000);
+
+  it('reads drafted dates loosely and splits a batch whose reply does not parse', async () => {
+    expect(draftedDate('2025-07', undefined)).toBe('2025-07');
+    expect(draftedDate('7月15日', '2025-08-01')).toBe('2025-07-15');
+    expect(draftedDate('2025年第三季度', undefined)).toBe('2025');
+    expect(draftedDate('', '2025-08-01')).toBe('2025-08-01');
+    expect(draftedDate('soon', undefined)).toBeUndefined();
+    const docs = Array.from({ length: 6 }, (_, i) => ({ path: `d${i}.md`, text: `星河资本在第${i}期把目标价定为${100 + i}元。` }));
+    let calls = 0;
+    const author = { label: 'a', model: 'a', enabled: true, async completeJson(messages: { role: string; content: string }[]) {
+      calls++;
+      const paths = [...messages[1].content.matchAll(/path="([^"]+)"/g)].map((m) => m[1]);
+      // a reply for more than two excerpts comes back cut off
+      if (paths.length > 2) throw new Error("Expected ',' or ']' after array element in JSON at position 4796");
+      return { statements: paths.map((p) => ({ doc: p, entity: '星河资本', text: 't', quote: docs.find((d) => d.path === p)!.text.match(/目标价定为\d+元/)![0] })) };
+    } } as unknown as LlmClient;
+    const st = await sweepStatements(author, [{ name: '星河资本', aliases: [], type: 'company', docs: docs.map((d) => d.path) }], docs, { lang: 'zh' });
+    expect(st).toHaveLength(6);
+    expect(calls).toBeGreaterThan(1);
+  });
 
   it('drafts profiles, timelines, contradictions, aggregates and chains with every quote checked', async () => {
     const docs = Array.from({ length: 7 }, (_, i) => ({
