@@ -157,7 +157,7 @@ describe('GET /api/file/original', () => {
     put('wiki/note.md', '# Note\n');
     const text = await original('wiki/note.md');
     expect(text.status).toBe(400);
-    expect((await text.json()).error).toMatch(/not a PDF, a web page or a picture/);
+    expect((await text.json()).error).toMatch(/not a PDF, a book, a web page or a picture/);
     expect((await original('knode.config.json')).status).toBe(403);
     put('raw/docs/.hidden/x.pdf', textPdf('x'));
     expect((await original('raw/docs/.hidden/x.pdf')).status).toBe(403);

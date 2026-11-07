@@ -31,6 +31,23 @@ export function sha256(value: string | Uint8Array): string {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
+/** sha256 of a file's bytes, read a megabyte at a time: a 170 MB book is hashed without being held. */
+export function sha256File(abs: string): string {
+  const hash = crypto.createHash('sha256');
+  const fd = fs.openSync(abs, 'r');
+  try {
+    const buf = Buffer.alloc(1024 * 1024);
+    for (;;) {
+      const n = fs.readSync(fd, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      hash.update(buf.subarray(0, n));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest('hex');
+}
+
 /** True when the indexed text of `rel` is derived Markdown in the sidecar. */
 export function isDerivedTextSource(rel: string): boolean {
   if (rel.startsWith(`${RAW_TRACES}/`)) return rel.endsWith('.jsonl');

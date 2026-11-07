@@ -160,6 +160,14 @@ interface El {
 }
 type Child = El | string;
 
+/**
+ * The parsed tree, for a converter that reads a document's parts itself
+ * before it is rendered (src/ingest/converters/epub.ts: a book's notes,
+ * headings and pictures). Names and attribute keys are lower-case.
+ */
+export type HtmlElement = El;
+export type HtmlNode = Child;
+
 const VOID = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'keygen', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
 /** Elements whose content is text up to their own end tag. */
 const RAW_TEXT = new Set(['script', 'style', 'textarea', 'title', 'xmp', 'noscript', 'iframe', 'noembed', 'noframes', 'template']);
@@ -335,6 +343,11 @@ function parse(html: string): Parsed {
   return { root, jsonLd, scripts };
 }
 
+/** The tree of a document — a page, or XML read the same tolerant way (an EPUB's package and table of contents). */
+export function parseHtml(html: string): HtmlElement {
+  return parse(html).root;
+}
+
 /* ────────────────────────────── selection ───────────────────────────── */
 
 /** Never content: scripts, forms, media players, the hidden XBRL header of an SEC filing … */
@@ -424,8 +437,16 @@ interface Ctx {
   scopeText: number;
   /** No article / main was found: header, footer and aside are the page's chrome, not the article's. */
   mainIsBody: boolean;
+  /** Everything in the body is the text (a book's chapter): no chrome or boilerplate is left out. */
+  whole: boolean;
+  resolveUrl?: HtmlToMarkdownOptions['resolveUrl'];
   links: number;
   tables: number;
+}
+
+/** Where a link or a picture points: the caller's resolver when it has one, else the address against the page's base. */
+function target(url: string, kind: 'a' | 'img', ctx: Ctx): string | null {
+  return ctx.resolveUrl ? ctx.resolveUrl(url, kind) : absolute(url, ctx);
 }
 
 function absolute(url: string, ctx: Ctx): string | null {
@@ -441,6 +462,7 @@ function absolute(url: string, ctx: Ctx): string | null {
 /** An element the renderer leaves out where it stands (hidden, chrome, boilerplate). */
 function skipped(el: El, ctx: Ctx): boolean {
   if (DROP.has(el.name) || isHidden(el)) return true;
+  if (ctx.whole) return false;
   const role = (el.attrs.role ?? '').toLowerCase();
   // an article's own <header> holds its title and byline; the page's holds the site's menu
   const pageChrome = ctx.mainIsBody && (el.name === 'header' || el.name === 'footer' || el.name === 'aside');
@@ -490,9 +512,10 @@ function inlineEl(el: El, ctx: Ctx): string {
     case 'img': {
       const alt = collapse(el.attrs.alt ?? el.attrs.title ?? '').trim();
       const src = el.attrs.src ?? '';
-      if (!alt || (el.attrs.width === '1' && el.attrs.height === '1')) return '';
+      // a page's picture without words is decoration; a book's is a figure, a plate, a photograph
+      if ((!alt && !ctx.whole) || (el.attrs.width === '1' && el.attrs.height === '1')) return '';
       if (/^data:/i.test(src) && src.length > 2048) return '';
-      const abs = absolute(src, ctx);
+      const abs = target(src, 'img', ctx);
       return abs ? `![${alt.replace(/[[\]]/g, '')}](${abs.replace(/\)/g, '%29').replace(/ /g, '%20')})` : '';
     }
     case 'strong':
@@ -521,7 +544,7 @@ function inlineEl(el: El, ctx: Ctx): string {
       const text = collapse(label).trim();
       if (!text) return label.includes('![') ? label : '';
       if (!href || href.startsWith('#')) return label;
-      const abs = absolute(href, ctx);
+      const abs = target(href, 'a', ctx);
       if (!abs || /^javascript:/i.test(abs)) return label;
       ctx.links++;
       if (text === abs || text === href) return `<${abs}>`;
@@ -833,7 +856,9 @@ function blocks(el: El, ctx: Ctx, out: string[]): void {
 function block(el: El, ctx: Ctx, out: string[]): void {
   const name = el.name;
   if (/^h[1-6]$/.test(name)) {
-    const text = finish(inline(el, ctx)).replace(/ {2}\n/g, ' ');
+    let text = finish(inline(el, ctx)).replace(/ {2}\n/g, ' ');
+    // a book that bolds its headings, one character at a time at that (**版****权**), means no emphasis by it
+    if (ctx.whole) text = text.replace(/\*\*/g, '').trim();
     if (text) out.push(`${'#'.repeat(Number(name[1]))} ${text}`);
     return;
   }
@@ -1007,8 +1032,34 @@ function stripSgmlWrapper(html: string): string {
   return end > at ? html.slice(at, end + 7) : html.slice(at);
 }
 
-export function htmlToMarkdown(html: string, opts: { baseUrl?: string } = {}): HtmlConversion {
+export interface HtmlToMarkdownOptions {
+  /** The address the page came from: relative links and pictures resolve against it. */
+  baseUrl?: string;
+  /**
+   * Everything in the body is the text — a book's chapter, not a web page: no
+   * main content is picked out, no header, aside or "sidebar" is dropped as
+   * chrome, a picture is kept without alt text, and no bold line is promoted
+   * to a heading.
+   */
+  whole?: boolean;
+  /** With `whole`, still read a fully bold one-line paragraph as a heading — for a book with no table of contents to go by. */
+  boldHeadings?: boolean;
+  /**
+   * Where a link or a picture points, in place of resolving it against
+   * `baseUrl`. Null keeps a link's label alone and leaves a picture out.
+   */
+  resolveUrl?: (url: string, kind: 'a' | 'img') => string | null;
+  /** Called with the parsed tree before anything is rendered; may change it. */
+  prepare?: (root: HtmlElement) => void;
+}
+
+function contextFor(base: URL | null, scope: El, cache: Map<El, number>, mainIsBody: boolean, opts: HtmlToMarkdownOptions): Ctx {
+  return { base, cache, scopeText: textLength(scope, cache), mainIsBody, whole: Boolean(opts.whole), resolveUrl: opts.resolveUrl, links: 0, tables: 0 };
+}
+
+export function htmlToMarkdown(html: string, opts: HtmlToMarkdownOptions = {}): HtmlConversion {
   const parsed = parse(stripSgmlWrapper(html).replace(/\u0001/g, ''));
+  opts.prepare?.(parsed.root);
   const cache = new Map<El, number>();
   let base: URL | null = null;
   const baseHref = find(parsed.root, (e) => e.name === 'base' && Boolean(e.attrs.href))?.attrs.href;
@@ -1020,12 +1071,14 @@ export function htmlToMarkdown(html: string, opts: { baseUrl?: string } = {}): H
   const body = find(parsed.root, (e) => e.name === 'body') ?? parsed.root;
   const bodyText = textLength(body, cache);
   const warnings: string[] = [];
-  const candidates = findAll(body, isCandidate).filter((e) => !isHidden(e));
   let main = body;
-  const best = candidates.sort((a, b) => textLength(b, cache) - textLength(a, cache))[0];
-  if (best && textLength(best, cache) >= bodyText * 0.3) main = best;
-  else if (candidates.length) warnings.push('no main content found, used the whole body');
-  const ctx: Ctx = { base, cache, scopeText: textLength(main, cache), mainIsBody: main === body, links: 0, tables: 0 };
+  if (!opts.whole) {
+    const candidates = findAll(body, isCandidate).filter((e) => !isHidden(e));
+    const best = candidates.sort((a, b) => textLength(b, cache) - textLength(a, cache))[0];
+    if (best && textLength(best, cache) >= bodyText * 0.3) main = best;
+    else if (candidates.length) warnings.push('no main content found, used the whole body');
+  }
+  const ctx = contextFor(base, main, cache, main === body, opts);
   const out: string[] = [];
   block(main === body ? { ...main, name: 'body' } : main, ctx, out);
   // a page with no headings of its own (a filing printed to HTML) gets its fully bold one-line paragraphs as headings
@@ -1035,7 +1088,7 @@ export function htmlToMarkdown(html: string, opts: { baseUrl?: string } = {}): H
     const text = b.replace(HEADING_CANDIDATE, '');
     const plain = text.replace(/^\*\*|\*\*$/g, '').replace(/\*\*/g, '').trim();
     // a bold year over a column, a bold figure, a bold "Table of Contents" on every page: no section titles
-    if (!candidate || ownHeadings >= 3 || /[.,;]\*\*$/.test(text) || !/\p{L}{3}/u.test(plain) || /^table of contents$/i.test(plain)) return text;
+    if (!candidate || (opts.whole && !opts.boldHeadings) || ownHeadings >= 3 || /[.,;]\*\*$/.test(text) || !/\p{L}{3}/u.test(plain) || /^table of contents$/i.test(plain)) return text;
     return `${/[a-z]/.test(plain) ? '###' : '##'} ${plain}`;
   });
   const markdown = blocksOut.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
@@ -1048,6 +1101,16 @@ export function htmlToMarkdown(html: string, opts: { baseUrl?: string } = {}): H
     if (m) outline.push({ level: m[1].length, text: m[2].trim(), line: i + 1 });
   });
   return { markdown, meta: readMeta(parsed, ctx, main), outline, tables: ctx.tables, links: ctx.links, warnings };
+}
+
+/**
+ * The Markdown of one element of a parsed tree, whole — a note lifted out of
+ * a book's chapter, say. Links and pictures resolve the way `opts` says.
+ */
+export function elementToMarkdown(el: HtmlElement, opts: Pick<HtmlToMarkdownOptions, 'resolveUrl'> = {}): string {
+  const out: string[] = [];
+  block(el, contextFor(null, el, new Map(), false, { ...opts, whole: true }), out);
+  return out.map((b) => b.replace(HEADING_CANDIDATE, '')).join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 /**

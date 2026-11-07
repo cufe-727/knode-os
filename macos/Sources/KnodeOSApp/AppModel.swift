@@ -616,10 +616,15 @@ final class AppModel: ObservableObject {
         select(.files)
     }
 
-    /// Files a browser shows as they are: the file view shows what knode-os read out of them.
+    /// Files a browser shows as they are, and books, which Books opens: the file view shows what knode-os read out of them.
     static func hasOriginal(_ path: String) -> Bool {
-        let originals: Set<String> = ["pdf", "html", "htm", "xhtml", "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tif", "tiff", "heic", "heif", "svg"]
+        let originals: Set<String> = ["pdf", "html", "htm", "xhtml", "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tif", "tiff", "heic", "heif", "svg", "epub"]
         return originals.contains((path as NSString).pathExtension.lowercased())
+    }
+
+    /// An EPUB: read whole, with its chapters in a Contents menu.
+    static func isBook(_ path: String) -> Bool {
+        (path as NSString).pathExtension.lowercased() == "epub"
     }
 
     /// Open the file itself in the app that reads it (Preview, the browser),

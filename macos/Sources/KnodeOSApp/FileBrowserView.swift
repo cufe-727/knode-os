@@ -97,6 +97,8 @@ struct FileBrowserView: View {
     @State private var writableDirectories: [String] = []
     @State private var selectedPath: String?
     @State private var content = ""
+    /// The open book's headings of the first three levels, for its Contents menu (EPUB only).
+    @State private var bookOutline: [BookHeading] = []
     @State private var editorContent = ""
     @State private var isEditing = false
     @State private var isLoading = true
@@ -452,11 +454,16 @@ struct FileBrowserView: View {
                     if let languages = switchableLanguages {
                         readingLanguageMenu(languages)
                     }
+                    if !bookOutline.isEmpty {
+                        bookContentsMenu
+                    }
                     if AppModel.hasOriginal(selectedPath) {
                         Button { Task { await model.openOriginal(selectedPath) } } label: {
                             Label(L("Open Original"), systemImage: "arrow.up.forward.app")
                         }
-                        .help(L("The file itself, in the app that reads it: the PDF, the picture, the web page as it was saved"))
+                        .help(AppModel.isBook(selectedPath)
+                            ? L("The book itself, in Books or the app that reads EPUB")
+                            : L("The file itself, in the app that reads it: the PDF, the picture, the web page as it was saved"))
                     }
                     Button(isEditing ? "Preview" : "Edit") { isEditing.toggle() }
                         .disabled(!isEditablePath(selectedPath) || isWorking || !isEditable)
@@ -1171,6 +1178,8 @@ struct FileBrowserView: View {
     /// would show something else: a translation that exists, or the original
     /// instead of one.
     private func read(_ path: String, maxBytes: Int? = nil) async throws -> FileResponse {
+        // a book is read, not previewed: its text whole, never its first 256 KB
+        let maxBytes = maxBytes ?? (AppModel.isBook(path) ? Self.editByteCap : nil)
         // the originals need no language: the original is what comes without one
         let asked = readingLanguagePick == Self.originalsPick ? nil : readingLanguagePick.isEmpty ? workspacePrimary : readingLanguagePick
         let response = try await model.client().file(at: path, maxBytes: maxBytes, lang: asked)
@@ -1204,6 +1213,7 @@ struct FileBrowserView: View {
     /// Put a read on screen: its text, what may be done with it, and its languages.
     private func show(_ response: FileResponse) {
         content = response.content
+        bookOutline = AppModel.isBook(response.path) ? Self.outline(of: response.content) : []
         // A capped read must never round-trip through the editor: saving it
         // back would rewrite the file with only the previewed prefix.
         isTruncated = response.truncated ?? false
@@ -2056,9 +2066,52 @@ struct FileBrowserView: View {
         return "\(head) Files over \(limit) cannot be edited here."
     }
 
+    /// A book's Contents: its chapters and sections, indented by depth; picking one goes to it.
+    private var bookContentsMenu: some View {
+        let top = bookOutline.map(\.level).min() ?? 1
+        return Menu {
+            ForEach(bookOutline) { heading in
+                Button(String(repeating: "    ", count: max(0, heading.level - top)) + heading.title) {
+                    scrollTarget = .heading(heading.id)
+                }
+            }
+        } label: {
+            Label(L("Contents"), systemImage: "list.bullet.indent")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help(L("The book's chapters and sections: pick one to go to it"))
+    }
+
+    /// Headings of the first three levels, read the way MarkdownText reads
+    /// them (a line of one to six `#` and a space, outside ``` fences, after
+    /// the frontmatter), so the n-th here is the n-th it jumps to.
+    static func outline(of markdown: String) -> [BookHeading] {
+        var lines = markdown.split(separator: "\n", omittingEmptySubsequences: false)
+        if lines.first?.trimmingCharacters(in: .whitespaces) == "---",
+           let end = lines.dropFirst().firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "---" }) {
+            lines = Array(lines[(end + 1)...])
+        }
+        var out: [BookHeading] = []
+        var fenced = false
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") { fenced.toggle(); continue }
+            if fenced { continue }
+            let hashes = trimmed.prefix(while: { $0 == "#" }).count
+            guard hashes > 0, hashes <= 6, trimmed.dropFirst(hashes).first == " " else { continue }
+            guard hashes <= 3 else { continue }
+            var title = String(trimmed.dropFirst(hashes + 1)).trimmingCharacters(in: .whitespaces)
+            if title.count > 80 { title = String(title.prefix(79)) + "…" }
+            out.append(BookHeading(id: out.count, level: hashes, title: title))
+        }
+        return out.count >= 2 ? out : []
+    }
+
     private func clearOpenFile() {
         selectedPath = nil
         content = ""
+        bookOutline = []
         editorContent = ""
         isTruncated = false
         isDerived = false
@@ -2445,4 +2498,11 @@ private extension TreeNode {
     var isMovable: Bool {
         isWritable && path != "wiki" && path != "raw/docs"
     }
+}
+
+/// One entry of a book's Contents: the n-th heading of the first three levels.
+struct BookHeading: Identifiable, Hashable {
+    let id: Int
+    let level: Int
+    let title: String
 }

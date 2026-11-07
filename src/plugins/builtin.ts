@@ -1,4 +1,5 @@
 import { embeddingProviderLabel } from '../config.js';
+import { epubConverter } from '../ingest/converters/epub.js';
 import { htmlConverter } from '../ingest/converters/html.js';
 import { imageConverter } from '../ingest/converters/image.js';
 import { pdfConverter } from '../ingest/converters/pdf.js';
@@ -66,6 +67,6 @@ export function registerBuiltins(registry: PluginRegistry): void {
         drop: (dataDir, cfg) => dropPostgres(dataDir, cfg),
       },
     ],
-    converters: [pdfConverter, imageConverter, htmlConverter],
+    converters: [pdfConverter, imageConverter, htmlConverter, epubConverter],
   }, BUILTIN_PLUGIN);
 }

@@ -2,12 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { KnodeConfig, LinkedFolder, saveConfig } from '../config.js';
-import { MAX_CONVERTIBLE_FILE_BYTES, MAX_FILE_BYTES } from '../constants.js';
+import { MAX_FILE_BYTES } from '../constants.js';
 import { isHiddenName, isTextFile, safePath, sanitizeRelativePath, walkFiles } from '../fs/files.js';
 import { hasSidecarSegment, RAW_DOCS, SIDECAR_ROOT } from '../fs/layout.js';
 import { TreeWatcher, watchTree } from '../fs/watch.js';
 import { activityOf } from '../activity.js';
-import { isConvertibleFile } from './convert.js';
+import { isConvertibleFile, maxConvertibleBytes } from './convert.js';
 import { sync, SyncContext, SyncStats } from './sync.js';
 
 /**
@@ -282,7 +282,7 @@ export function isImportable(rel: string): boolean {
 }
 
 function indexLimit(rel: string): number {
-  return isConvertibleFile(rel) ? MAX_CONVERTIBLE_FILE_BYTES : MAX_FILE_BYTES;
+  return isConvertibleFile(rel) ? maxConvertibleBytes(rel) : MAX_FILE_BYTES;
 }
 
 /** Walk the source and decide, file by file, what the mirror carries. Deterministic order (sorted names). */
