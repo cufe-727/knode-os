@@ -1,7 +1,7 @@
 # 23 — Knowledge benchmarks: comparing knowledge-base approaches on the same sources
 
 > Status: **implemented** (2026‑11‑04); pilot run 2026‑11‑06. Corpus-level tasks, wiki-with-sources agents, scale padding,
-> the update stream and cost-normalized reporting added 2026‑11‑07 (§2.1, §4); their run is proposed in §7, not yet run. `src/eval/` (packs, shim, meter, quota, agent runner, judge,
+> the update stream and cost-normalized reporting added 2026‑11‑07 (§2.1, §4); their run is in §7 (phase 2 done 2026‑11‑08; the 3× scale point running). `src/eval/` (packs, shim, meter, quota, agent runner, judge,
 > metrics, systems, runner, report, audit, install), `eval/adapters/*.py`; `knode-os eval pack list|build|validate`,
 > `knode-os eval systems list|install`, `knode-os eval run`, `knode-os eval report`, `knode-os eval audit export|import`.
 > Data lives outside the repository in `~/knode-eval/` (`$KNODE_EVAL_HOME`): `sources/` (downloads), `packs/`,
@@ -242,7 +242,7 @@ knode-os eval report ~/knode-eval/runs/<stamp>
   keyword bound; profiles are scored on recall for that reason. No human audit of it yet.
 - law-cn has few disagreements and no timelines inside one law: its corpus-level tasks are mostly aggregates.
 
-## 7. Corpus-level run (revised 2026‑11‑07; phases 0–1 done, phase 2 running since 04:15Z)
+## 7. Corpus-level run (revised 2026‑11‑08; phases 0–2 done, phase 3 at 3× running)
 
 Approved 2026‑11‑07. Phases 0, 0b and 1 are done: bge-m3 serves on 127.0.0.1:12020; synthetic-life-zh v2 (41 corpus-level tasks),
 finance-cn (+31 corpus-level, 10 chains; padding stops at 1.3× because most same-workspace documents name a closed-world entity),
@@ -270,7 +270,7 @@ time left the run about 0.9 answers a minute. It was stopped at 12:58Z and resum
 to update batches (they were answered one task at a time). agent-knode and knode-ask still answer one at a time (`serial`: the embedded
 index allows one process).
 
-Phase 2 finished 2026‑11‑08 18:36Z: 2,969 answers, no errors, 42 builds, 237 judge calls; Anthropic $19.40 in all.
+Phase 2 finished 2026‑11‑07 18:36Z: 2,969 answers, no errors, 42 builds, 237 judge calls; Anthropic $19.40 in all.
 
 - Pooled over 277 paired tasks, compared with agent-grep (all significant after Holm correction): agent-wiki-sources −0.02,
   agent-knode-wiki-sources −0.03, agent-knode −0.04, agent-wiki −0.09, long-context −0.10, rag-hybrid −0.34, knode-ask −0.40,
@@ -280,4 +280,8 @@ Phase 2 finished 2026‑11‑08 18:36Z: 2,969 answers, no errors, 42 builds, 237
 - At 1× scale, no pack shows a wiki beating raw sources. A wiki is worth about as much as the sources kept next to it.
 - Wiki agents read more per query (≈ 60k against 36k weighted tokens on the reports) and never break even with agent-grep.
 - knode's own wiki is thin (38 pages on the reports pack against the LLM Wiki's 694), so agent-knode-wiki refuses often.
-- Phases 2b and 3 (the scale curves, where a wiki might start to pay) were not run.
+- Phase 2b and the 10× scale point were not run.
+
+Phase 3, the 3× point, started 2026‑11‑07 22:14Z from `…/corpus-2026-11/phase3-3x.sh` into `…/corpus-2026-11/run-3x`: synthetic-reports-zh
+with 282 padding documents (423 in all), the phase 2 systems without closed-book, builds and answers on Codex CLI only. The judge
+stays on Anthropic, then Codex, as in phase 2, so both points are scored alike. `eval scale …/run …/run-3x` compares them.
