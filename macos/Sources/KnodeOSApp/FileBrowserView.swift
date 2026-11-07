@@ -197,6 +197,13 @@ struct FileBrowserView: View {
             guard path != nil, let requested = model.consumePendingFile() else { return }
             Task { await openFile(requested) }
         }
+        // the workspace button, or picking the open workspace: read it again in place
+        .onChange(of: model.reloadRequest) {
+            Task {
+                await loadTree()
+                await rereadOpenFile(quietly: true)
+            }
+        }
         .onChange(of: model.connectionState) { _, state in
             if case .connected = state, listings[""] == nil {
                 Task { await initialLoad() }
