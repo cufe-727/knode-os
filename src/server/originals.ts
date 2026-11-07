@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { assertNotPrivate, safePath } from '../fs/files.js';
+import { isEpubFile, pictureEntry, splitBookPath } from '../ingest/converters/epub.js';
 import { decodeSavedHtml, isHtmlFile, readCaptureComment } from '../ingest/converters/html.js';
 
 /**
@@ -18,6 +19,12 @@ import { decodeSavedHtml, isHtmlFile, readCaptureComment } from '../ingest/conve
  * and images, fetched by whoever reads it; a `<meta http-equiv="refresh">`,
  * which would carry the reader off to the live site, is dropped. Its text goes
  * out as UTF-8 behind a BOM, whatever the page declared.
+ *
+ * An EPUB goes out as a download (no browser shows one; the Mac app hands it
+ * to Books), and a book is a folder of its own pictures: a path through it,
+ * `raw/docs/x.epub/OEBPS/images/fig1.jpg`, answers with that picture from
+ * inside the book — what the Markdown derived from it shows (src/ingest/
+ * converters/epub.ts). Only pictures: a chapter's XHTML never goes out as a page.
  */
 
 export class OriginalError extends Error {
@@ -44,6 +51,7 @@ const TYPES: Record<string, string> = {
   '.heic': 'image/heic',
   '.heif': 'image/heif',
   '.svg': 'image/svg+xml',
+  '.epub': 'application/epub+zip',
 };
 
 /** The type a file goes out as, or null when it is not one a browser shows as it is. */
@@ -110,14 +118,16 @@ export function readOriginal(dataDir: string, rel: string): { body: Uint8Array<A
   } catch (e) {
     throw new OriginalError((e as Error).message, 403);
   }
+  const inBook = splitBookPath(rel);
+  if (inBook && !fs.existsSync(safePath(dataDir, rel))) return readBookPicture(dataDir, rel, inBook);
   const type = originalType(rel);
-  if (!type) throw new OriginalError(`${rel} is not a PDF, a web page or a picture: open it in the file view`, 400);
+  if (!type) throw new OriginalError(`${rel} is not a PDF, a book, a web page or a picture: open it in the file view`, 400);
   const abs = safePath(dataDir, rel);
   const stat = fs.existsSync(abs) ? fs.statSync(abs) : null;
   if (!stat?.isFile()) throw new OriginalError(`${rel} does not exist`, 404);
   const headers: Record<string, string> = {
     'content-type': type,
-    'content-disposition': contentDisposition(rel, true),
+    'content-disposition': contentDisposition(rel, !isEpubFile(rel)),
     'content-security-policy': OTHER_POLICY,
     'x-content-type-options': 'nosniff',
     'x-frame-options': 'DENY',
@@ -132,4 +142,37 @@ export function readOriginal(dataDir: string, rel: string): { body: Uint8Array<A
   if (type === 'image/svg+xml') headers['content-security-policy'] = SVG_POLICY;
   const body = Readable.toWeb(fs.createReadStream(abs)) as unknown as ReadableStream;
   return { body, headers: { ...headers, 'content-length': String(stat.size) } };
+}
+
+/** A picture from inside a book, for the Markdown derived from it to show. */
+function readBookPicture(dataDir: string, rel: string, at: { book: string; entry: string }): { body: Uint8Array<ArrayBuffer>; headers: Record<string, string> } {
+  try {
+    assertNotPrivate(at.book);
+  } catch (e) {
+    throw new OriginalError((e as Error).message, 403);
+  }
+  const abs = safePath(dataDir, at.book);
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new OriginalError(`${at.book} does not exist`, 404);
+  let picture: { bytes: Buffer; type: string };
+  try {
+    picture = pictureEntry(abs, at.entry);
+  } catch (e) {
+    throw new OriginalError(`${rel}: ${(e as Error).message}`, 404);
+  }
+  const body = new Uint8Array(picture.bytes.buffer as ArrayBuffer, picture.bytes.byteOffset, picture.bytes.byteLength);
+  return {
+    body,
+    headers: {
+      'content-type': picture.type,
+      'content-disposition': contentDisposition(at.entry, true),
+      'content-security-policy': picture.type === 'image/svg+xml' ? SVG_POLICY : OTHER_POLICY,
+      'x-content-type-options': 'nosniff',
+      'x-frame-options': 'DENY',
+      'referrer-policy': 'no-referrer',
+      'cross-origin-resource-policy': 'same-origin',
+      // the book's bytes decide the picture: unchanged book, unchanged picture
+      'cache-control': 'private, no-cache',
+      'content-length': String(body.byteLength),
+    },
+  };
 }

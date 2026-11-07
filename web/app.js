@@ -2551,6 +2551,7 @@ function clearOpenFile() {
   editing = false;
   $('#file-path').textContent = '';
   showOriginalLink(null);
+  paintContents(null);
   $('#file-view').innerHTML = '';
   $('#file-view').hidden = false;
   $('#file-editor').value = '';
@@ -2563,8 +2564,11 @@ function clearOpenFile() {
   $('#btn-delete').disabled = true;
 }
 
-/** Files a browser shows as they are (src/server/originals.ts): the file view shows what knode-os read out of them. */
-const hasOriginal = (path) => /\.(pdf|html?|xhtml|png|jpe?g|gif|webp|avif|bmp|tiff?|heic|heif|svg)$/i.test(path ?? '');
+/** Files a browser shows as they are, or downloads (a book), from src/server/originals.ts: the file view shows what knode-os read out of them. */
+const hasOriginal = (path) => /\.(pdf|html?|xhtml|png|jpe?g|gif|webp|avif|bmp|tiff?|heic|heif|svg|epub)$/i.test(path ?? '');
+
+/** An EPUB: read whole, with its contents to jump through and its pictures read from inside it. */
+const isBookPath = (path) => /\.epub$/i.test(path ?? '');
 
 /** The file itself, to open in a tab: a link sends no headers, so it names the workspace in its query. */
 function originalHref(path) {
@@ -2594,10 +2598,15 @@ function studyExportHref(id) {
   return `/api/research/studies/${encodeURIComponent(id)}/export${query ? `?${query}` : ''}`;
 }
 
-/** "original ↗" in the file toolbar, for a PDF, a picture or a web page. */
+/** "original ↗" in the file toolbar, for a PDF, a picture or a web page; "original ↓" saves a book, which no browser shows. */
 function showOriginalLink(path) {
   const link = $('#btn-original');
   link.hidden = !hasOriginal(path);
+  const book = isBookPath(path);
+  link.textContent = book ? 'original ↓' : 'original ↗';
+  link.title = book
+    ? 'The book itself, as an .epub file to open in a reader (Books, Calibre, an e-reader)'
+    : 'The file itself in a new tab: the PDF, the picture, the web page as it was saved';
   if (link.hidden) link.removeAttribute('href');
   else link.href = originalHref(path);
 }
@@ -2640,6 +2649,12 @@ function readOnlyNotice(derived, truncated, bytes, path = currentFile, transcrip
     // a reviewed transcript beside the original is its text (docs/design/19): the fix is an edit there
     return {
       text: `Read from its transcript, ${transcript.split('/').pop()} — edit that file to correct the reading. "original ↗" opens the file itself.`,
+      canLoadFull: false,
+    };
+  }
+  if (derived && isBookPath(path)) {
+    return {
+      text: 'Read out of the book — knode-os produced this text from the .epub, so it is read-only. "original ↓" saves the book itself; replace it by uploading a new copy.',
       canLoadFull: false,
     };
   }
@@ -2709,10 +2724,12 @@ function paintFileView(path, content, derived = false) {
   const view = $('#file-view');
   if (!isMarkdownPath(path) && !derived) {
     view.innerHTML = `<pre>${esc(content)}</pre>`;
+    paintContents(null);
     return;
   }
   view.innerHTML = renderMd(content, { metadataOpen: metadataOpen() });
   showPicturesBeside(view, path);
+  paintContents(path);
   // ```chart blocks render as SVG in renderMd; hover and keyboard are added here (web/chart.js)
   window.knodeChart?.hydrate(view);
   hydrateMindMaps(view, path);
@@ -2725,13 +2742,15 @@ function paintFileView(path, content, derived = false) {
  * the app's, where that path means nothing.
  */
 function showPicturesBeside(view, path) {
-  const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+  // a book's pictures are inside it (src/ingest/converters/epub.ts): the .epub is their folder, each part of the path escaped on its own
+  const book = isBookPath(path);
+  const dir = book ? path : path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
   for (const img of view.querySelectorAll('img[src]')) {
     const src = img.getAttribute('src');
     if (!src || /^[a-z][a-z\d+.-]*:/i.test(src) || src.startsWith('/') || src.startsWith('#')) continue;
     let rel;
     try {
-      rel = decodeURI(src);
+      rel = book ? src.split('/').map(decodeURIComponent).join('/') : decodeURI(src);
     } catch {
       continue;
     }
@@ -2899,6 +2918,8 @@ function setReadingLanguage(value) {
 /** The file API for `path`, asking for the reader's language. */
 function fileUrl(path, { maxBytes } = {}) {
   const q = new URLSearchParams({ path });
+  // a book is read, not previewed: its text whole (a few hundred KB to a couple of MB), never its first 256 KB
+  if (!maxBytes && isBookPath(path)) maxBytes = EDIT_BYTE_CAP;
   if (maxBytes) q.set('maxBytes', String(maxBytes));
   const lang = readingLanguage();
   if (lang && lang !== 'original') q.set('lang', lang);
@@ -3058,6 +3079,39 @@ function scrollToCitation(label) {
  * Where a link's #fragment points: an export's entry anchor, which lights up
  * the whole entry (up to the next anchor or rule), else a heading with that text.
  */
+/** The headings the Contents list names, in its order. */
+let contentsHeadings = [];
+
+/**
+ * A book's chapters and sections in the toolbar (EPUB): its headings to the
+ * third level, indented by depth. Picking one goes to it; the list then reads
+ * "Contents" again, ready for the next jump.
+ */
+function paintContents(path) {
+  const select = $('#file-contents');
+  const headings = isBookPath(path) ? [...$('#file-view').querySelectorAll('h1, h2, h3')] : [];
+  contentsHeadings = headings.length >= 2 ? headings : [];
+  select.hidden = contentsHeadings.length === 0;
+  if (select.hidden) {
+    select.innerHTML = '';
+    return;
+  }
+  const top = Math.min(...headings.map((h) => Number(h.tagName[1])));
+  select.innerHTML = `<option value="" selected>Contents · ${headings.length}</option>` + headings.map((h, i) => {
+    const text = h.textContent.trim().replace(/\s+/g, ' ');
+    const label = text.length > 80 ? `${text.slice(0, 79)}…` : text;
+    return `<option value="${i}">${' '.repeat(Number(h.tagName[1]) - top)}${esc(label)}</option>`;
+  }).join('');
+}
+
+$('#file-contents').addEventListener('change', (event) => {
+  const heading = contentsHeadings[Number(event.target.value)];
+  event.target.value = '';
+  if (!heading) return;
+  heading.scrollIntoView({ block: 'start' });
+  flash(heading);
+});
+
 function scrollToFragment(fragment) {
   const view = $('#file-view');
   const anchor = view.querySelector(`[data-anchor="${CSS.escape(fragment)}"]`);

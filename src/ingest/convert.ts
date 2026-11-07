@@ -1,13 +1,14 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { MAX_CONVERTIBLE_FILE_BYTES } from '../constants.js';
 import { pluginRegistry } from '../plugins/registry.js';
 import type { ConverterInput, DocumentConverterPlugin } from '../plugins/types.js';
 import { ConversionResult, DEFAULT_MAX_IMAGE_DIMENSION, DEFAULT_MAX_PDF_PAGES, VisionModel, withProvenance } from './converters/shared.js';
 
 /**
  * The Convert stage's front door. Which file types can be converted, and how,
- * is decided by the converters in the plugin registry: the built-in PDF and
- * image converters (src/ingest/converters), and whatever a plugin adds
+ * is decided by the converters in the plugin registry: the built-in PDF,
+ * image, HTML and EPUB converters (src/ingest/converters), and whatever a plugin adds
  * (docs/design/11). Everything that asks "is this a convertible original?" —
  * prepare, the source reader, folder import, grep — asks here.
  */
@@ -16,6 +17,7 @@ export type { ConversionKind, ConversionResult, VisionModel } from './converters
 export { withProvenance } from './converters/shared.js';
 export { isPdfFile } from './converters/pdf.js';
 export { IMAGE_EXTENSIONS, isImageFile } from './converters/image.js';
+export { isEpubFile } from './converters/epub.js';
 
 export interface ConversionOptions {
   vision?: VisionModel;
@@ -37,6 +39,12 @@ export function isConvertibleFile(file: string): boolean {
 /** The converter that owns a source key's extension, if any. */
 export function converterFor(file: string): DocumentConverterPlugin | undefined {
   return pluginRegistry().converterFor(file);
+}
+
+/** The largest original of this type the Convert stage takes (its converter's `maxBytes`, else 50 MB). */
+export function maxConvertibleBytes(file: string): number {
+  const own = converterFor(file)?.maxBytes;
+  return typeof own === 'number' && Number.isFinite(own) && own > 0 ? own : MAX_CONVERTIBLE_FILE_BYTES;
 }
 
 /** Keep the original extension in the generated name to avoid foo.pdf/foo.md collisions. */
