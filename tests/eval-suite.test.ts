@@ -34,7 +34,8 @@ import { Judge } from '../src/eval/judge.js';
 import { containsTerm, matchByAlias, matchByDocs, orderAccuracy, sameDate, scoreLists } from '../src/eval/score/lists.js';
 import { firstNumber } from '../src/eval/score/usage.js';
 import { buildScaleData, efficiencyOf, renderScale } from '../src/eval/report.js';
-import { recipe } from '../src/eval/packs/index.js';
+import { recipe, registerRecipe } from '../src/eval/packs/index.js';
+import { extendPack } from '../src/eval/packs/extend.js';
 import '../src/eval/packs/recipes.js';
 import { draftCorpusTasks } from '../src/eval/packs/corpus-tasks.js';
 import { PackWriter } from '../src/eval/packs/writer.js';
@@ -116,6 +117,19 @@ function draftingAuthor(docs: { path: string; text: string }[]): LlmClient {
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-test-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+// every test, in every block, reaches the stand-in codex: an agent system must never start the real CLI from a test
+const fakeBin = path.join(tmp, 'fake-bin');
+fs.mkdirSync(fakeBin, { recursive: true });
+fs.writeFileSync(path.join(fakeBin, 'codex'), `#!/bin/sh\nexec node "${path.resolve('tests/helpers/fake-codex.mjs')}" "$@"\n`);
+fs.chmodSync(path.join(fakeBin, 'codex'), 0o755);
+const realPath = process.env.PATH;
+beforeAll(() => {
+  process.env.PATH = `${fakeBin}:${realPath}`;
+});
+afterAll(() => {
+  process.env.PATH = realPath;
+});
 
 /** Answers every prompt the systems send, by what the prompt is for. */
 class ScriptedBackend implements ChatBackend {
@@ -511,6 +525,31 @@ describe('a run on the fixture pack', () => {
   }, 120_000);
 });
 
+const answersOf = (dir: string) => new RunStore(dir).allAnswers();
+
+describe('reusing builds', () => {
+  it("starts a new run from an earlier run's builds of the same pack, and refuses one embedded differently", async () => {
+    const packDir = path.join(tmp, 'packs', 'fixture-life');
+    const first = path.join(tmp, 'runs', 'r1');
+    const backend = new ScriptedBackend();
+    const judge = scriptedJudge();
+    const embedder = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false });
+    const res = await runEval({ packs: [packDir], systems: ['knode-ask', 'agent-wiki-sources', 'rag-hybrid'], runDir: path.join(tmp, 'runs', 'reuse'), quota: false, types: ['aggregate', 'single-hop'], suites: ['usage'], reuseBuildsFrom: first, overrides: { chat: backend, judge, embedder } });
+    // the stand-in codex answered, not the real one
+    expect(answersOf(res.runDir).filter((a) => a.system === 'agent-wiki-sources').every((a) => a.text.includes('Final answer: 高级数据工程师'))).toBe(true);
+    const store = new RunStore(res.runDir);
+    const builds = store.allBuilds();
+    expect(builds.map((b) => b.system).sort()).toEqual(['knode', 'llm-wiki', 'rag']);
+    expect(builds.every((b) => (b.notes as { reusedFrom?: string }).reusedFrom === 'r1')).toBe(true);
+    // nothing was built again: every model call answered a question
+    const answered = store.allAnswers().filter((a) => a.system !== 'agent-wiki-sources').length;
+    expect(backend.calls).toBe(answered);
+    expect(store.allAnswers().some((a) => a.system === 'agent-wiki-sources' && !a.error)).toBe(true);
+    const small = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 64, batchSize: 64, sendDimensions: false });
+    await expect(runEval({ packs: [packDir], systems: ['rag-hybrid'], runDir: path.join(tmp, 'runs', 'reuse-64'), quota: false, reuseBuildsFrom: first, overrides: { chat: backend, judge, embedder: small } })).rejects.toThrow(/embedded with .*\(384\); this run embeds with .*\(64\)/);
+  }, 120_000);
+});
+
 describe("an embedding endpoint of the run's own", () => {
   it('embeds under the identity once it reproduces the vectors the run holds, and is refused otherwise', async () => {
     const dir = path.join(tmp, 'endpoint-pack');
@@ -724,6 +763,35 @@ describe('corpus-level tasks: packs', () => {
     for (const f of facts) w.addFact(f);
     for (const t of tasks) w.addTask(t);
     expect(w.finish().errors).toEqual([]);
+  });
+});
+
+describe('extending a built pack', () => {
+  it('adds model-free corpus tasks and padding from a rebuild, leaving the corpus and the other tasks as they are', async () => {
+    const dir = path.join(tmp, 'old-pack');
+    buildFixturePack(dir);
+    // an older pack: no corpus-level tasks, no padding
+    const usage = fs.readFileSync(path.join(dir, 'tasks', 'usage.jsonl'), 'utf8').split('\n').filter((l) => l && !/"type":"(aggregate|timeline|contradiction|profile|deep-hop)"/.test(l));
+    fs.writeFileSync(path.join(dir, 'tasks', 'usage.jsonl'), usage.join('\n') + '\n');
+    fs.rmSync(path.join(dir, 'padding'), { recursive: true });
+    fs.rmSync(path.join(dir, 'padding.jsonl'));
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'pack.json'), 'utf8'));
+    fs.writeFileSync(path.join(dir, 'pack.json'), JSON.stringify({ ...manifest, builder: { ...manifest.builder, recipe: 'fixture-rebuilt' } }));
+    registerRecipe({ id: 'fixture-rebuilt', title: 't', domain: 'fixture', network: false, needsAuthor: false, modelFreeCorpus: true, padding: 'local', build: async (out) => buildFixturePack(out) });
+    const before = loadPack(dir);
+    const logs: string[] = [];
+    const r = await extendPack(dir, { seed: 0, options: {}, log: (m) => logs.push(m), padding: 2 });
+    expect(r.errors).toEqual([]);
+    const after = loadPack(dir);
+    expect(r.added).toBe(6);
+    expect(after.tasks.length).toBe(before.tasks.length + 6);
+    expect(after.docs.map((d) => d.path)).toEqual(before.docs.map((d) => d.path));
+    expect(after.padding).toHaveLength(12);
+    expect(after.manifest.stats?.paddingDocuments).toBe(12);
+    // extending again replaces, never duplicates
+    const again = await extendPack(dir, { seed: 0, options: {}, log: () => {}, padding: 2 });
+    expect(again.errors).toEqual([]);
+    expect(loadPack(dir).tasks.length).toBe(after.tasks.length);
   });
 });
 

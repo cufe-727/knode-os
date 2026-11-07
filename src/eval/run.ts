@@ -13,7 +13,7 @@ import { dirBytes, listFiles, loadPack, LoadedPack, packsDir, runsDir, seededKey
 import { checkEndpoint, endpointUnder } from './endpoint.js';
 import { citationsIn, taskPrompt } from './prompts.js';
 import { EmbeddingBudget, QuotaGuard } from './quota.js';
-import { recordKey, RunMeta, RunStore } from './runstore.js';
+import { fileLines, recordKey, RunMeta, RunStore } from './runstore.js';
 import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
 import { scoreLists } from './score/lists.js';
@@ -78,6 +78,13 @@ export interface RunOptions {
   embeddingDailyCap?: number;
   /** Skip scoring (answers only) or answering (score what is there). */
   skipScoring?: boolean;
+  /**
+   * Start from another run's builds of the same packs (same id, version,
+   * fraction and seed) and its embedding vectors: their work directories are
+   * copied and their build records kept, cost included — so a new task set
+   * over an unchanged corpus does not pay for the builds again.
+   */
+  reuseBuildsFrom?: string;
   /** Tests: stand-ins for Codex, the judge and the embedder. */
   overrides?: { chat?: ChatBackend; judge?: LlmClient; embedder?: EmbeddingProvider };
   onProgress?: (msg: string) => void;
@@ -176,6 +183,13 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const judgeClient = opts.overrides?.judge ?? new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 });
   const judge = new Judge({ client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
   const models = { model: opts.model ?? '', buildEffort: opts.buildEffort ?? 'low', answerEffort: opts.answerEffort ?? 'medium' };
+
+  if (opts.reuseBuildsFrom) {
+    const groups = new Set(makeSystems(opts.systems).map((sys) => sys.group));
+    const n = reuseBuilds(store, path.resolve(opts.reuseBuildsFrom), opts.packs, `${embedder.model} (${embedder.dimensions})`, fraction, seed, groups);
+    progress(`reusing ${n.builds} builds and ${n.vectors} embedding vectors from ${opts.reuseBuildsFrom}`);
+    store.log('builds reused', { from: opts.reuseBuildsFrom, ...n });
+  }
 
   const shim = await startShim({
     backend,
@@ -355,6 +369,44 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     for (const l of loaded) l.staged.cleanup();
   }
   return { runDir, builds: store.allBuilds().length, answers: store.allAnswers().length, scores: store.allScores().length };
+}
+
+/**
+ * Copy another run's finished builds of these packs, and its embedding
+ * vectors, into this run. Refused when the other run embedded with another
+ * model: a knode index or a RAG index answers queries only in its own space.
+ */
+export function reuseBuilds(store: RunStore, from: string, packDirs: string[], embedding: string, fraction: number, seed: string | number, groups?: Set<string>): { builds: number; vectors: number } {
+  const src = new RunStore(from);
+  const meta = src.meta();
+  if (!meta) throw new Error(`--reuse-builds-from: not a run directory: ${from}`);
+  if (meta.embedding !== embedding) throw new Error(`--reuse-builds-from: ${meta.id} embedded with ${meta.embedding}; this run embeds with ${embedding}`);
+  let builds = 0;
+  for (const dir of packDirs) {
+    const pack = loadPack(dir);
+    for (const b of src.allBuilds().filter((x) => x.ok && x.pack === pack.manifest.id && !x.system.includes('@') && (!groups || groups.has(x.system)))) {
+      if (b.key !== recordKey('build', pack.manifest.id, pack.manifest.version, b.system, fraction, seed) || store.build(b.key)) continue;
+      const work = path.join(from, 'work', pack.manifest.id, b.system);
+      if (fs.existsSync(work)) fs.cpSync(work, store.workDir(pack.manifest.id, b.system), { recursive: true });
+      store.putBuild({ ...b, notes: { ...b.notes, reusedFrom: meta.id, builtAt: b.at } });
+      builds++;
+    }
+  }
+  // the vectors the reused indexes were built with, so a reopened RAG index embeds nothing again
+  let vectors = 0;
+  const from_ = path.join(from, 'cache', 'vectors.jsonl');
+  const to = path.join(store.cacheDir(), 'vectors.jsonl');
+  if (builds && fs.existsSync(from_) && !fs.existsSync(to)) {
+    fs.copyFileSync(from_, to);
+    vectors = fileLineCount(to);
+  }
+  return { builds, vectors };
+}
+
+function fileLineCount(file: string): number {
+  let n = 0;
+  for (const line of fileLines(file)) if (line.trim()) n++;
+  return n;
 }
 
 /** Build (or reopen) a group's knowledge base; false when it failed, so the run goes on without it. */

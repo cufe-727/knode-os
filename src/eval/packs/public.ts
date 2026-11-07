@@ -62,7 +62,8 @@ async function buildMusique(dir: string, ctx: RecipeContext) {
   const limit = ctx.limit ?? Infinity;
   const seed = ctx.seed ?? 0;
   const writer = new PackWriter(dir, {
-    id: 'public-musique',
+    // only 3–4-hop questions: a pack of its own, beside the pilot's
+    id: minHops >= 3 ? 'public-musique-deep' : 'public-musique',
     version: 1,
     title: 'MuSiQue multi-hop questions over Wikipedia paragraphs',
     domain: 'public',

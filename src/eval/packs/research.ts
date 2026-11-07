@@ -27,6 +27,9 @@ interface Paper {
   authors: string[];
 }
 
+/** Corpus-level tasks for research-ai: methods and benchmarks recur across papers; findings disagree. */
+export const RESEARCH_AI_CORPUS = { profile: 12, timeline: 6, contradiction: 10, aggregate: 14, deep: 10 };
+
 const QUERY = '(cat:cs.CL OR cat:cs.AI OR cat:cs.MA) AND (abs:agent OR abs:agents OR abs:"large language model")';
 
 export function parseAtom(xml: string): Paper[] {
@@ -69,7 +72,7 @@ async function buildResearch(dir: string, ctx: RecipeContext) {
   const n = ctx.limit ?? 100;
   const writer = new PackWriter(dir, {
     id: 'research-ai',
-    version: 2,
+    version: 1,
     title: 'Research on AI agents and LLMs (arXiv, 2025-H2)',
     domain: 'research',
     languages: ['en'],
@@ -141,9 +144,9 @@ async function buildResearch(dir: string, ctx: RecipeContext) {
     }
     writer.setProfile({ limits, problems, themes: themes.themes ?? [] });
   }
-  return finishDocpack({ writer, docs, lang: 'en', tasks, plan: { single: 20, multi: 10, unanswerable: 5, global: 3 }, perDoc: 5, corpus: { profile: 12, timeline: 6, contradiction: 10, aggregate: 14, deep: 10 } }, ctx);
+  return finishDocpack({ writer, docs, lang: 'en', tasks, plan: { single: 20, multi: 10, unanswerable: 5, global: 3 }, perDoc: 5, corpus: RESEARCH_AI_CORPUS }, ctx);
 }
 
 export function registerResearchRecipes(): void {
-  registerRecipe({ id: 'research-ai', title: 'arXiv papers on AI agents and LLMs, 2025-H2, with a 2026 holdout', domain: 'research', network: true, needsAuthor: true, build: buildResearch });
+  registerRecipe({ id: 'research-ai', title: 'arXiv papers on AI agents and LLMs, 2025-H2, with a 2026 holdout', domain: 'research', network: true, needsAuthor: true, build: buildResearch, corpusPlan: RESEARCH_AI_CORPUS });
 }

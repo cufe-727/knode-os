@@ -1,6 +1,7 @@
 # 23 — Knowledge benchmarks: comparing knowledge-base approaches on the same sources
 
-> Status: **implemented** (2026‑11‑04), pilot pending. `src/eval/` (packs, shim, meter, quota, agent runner, judge,
+> Status: **implemented** (2026‑11‑04); pilot run 2026‑11‑06. Corpus-level tasks, wiki-with-sources agents, scale padding,
+> the update stream and cost-normalized reporting added 2026‑11‑07 (§2.1, §4); their run is proposed in §7, not yet run. `src/eval/` (packs, shim, meter, quota, agent runner, judge,
 > metrics, systems, runner, report, audit, install), `eval/adapters/*.py`; `knode-os eval pack list|build|validate`,
 > `knode-os eval systems list|install`, `knode-os eval run`, `knode-os eval report`, `knode-os eval audit export|import`.
 > Data lives outside the repository in `~/knode-eval/` (`$KNODE_EVAL_HOME`): `sources/` (downloads), `packs/`,
@@ -37,11 +38,16 @@ pages 98% faithful) showed what such a benchmark can find.
 | D4 Survive minutes-long calls | Headers go out at once and whitespace follows every 20 s, which beats fetch's 300 s timeout. A failure after Codex spent tokens returns 200 with an error body, never a 5xx a client would retry. `tools` and `n>1` are refused with 400; `stream:true` gets one SSE chunk | A slow Codex call paid for twice would double a build's cost and hide it |
 | D5 Resumable to the item | Builds, answers and scores are keyed JSONL records. The shim's reply cache and the judge's verdict cache are on disk, and replays are counted at their original cost, marked `replayed` | A pilot spans days of plan windows. A resumed run must neither redo work nor under-report it |
 | D6 Same agent, different knowledge | The grep baseline, the agent with knode's MCP retrieval tools, the agent reading knode's generated wiki and the agent reading an LLM Wiki are one runner (`runAgent`) with a different folder or tool set. At most 25 commands, then `capped` | The question is what each knowledge source is worth to the same agent, not which agent harness is better |
-| D7 LLM Wiki built faithfully | A schema file plus ingest sessions of ~3 sources in date order (Codex `workspace-write` in a temp dir with `raw/` and `wiki/`). Each session writes source, entity and concept pages, `index.md` and `log.md`. It is read by the same agent, wiki only | That is the pattern as published. Letting the reader open `raw/` would make it the grep baseline |
+| D7 LLM Wiki built faithfully | A schema file plus ingest sessions of ~3 sources in date order (Codex `workspace-write` in a temp dir with `raw/` and `wiki/`). Each session writes source, entity and concept pages, `index.md` and `log.md`. `agent-wiki` reads the wiki only; `agent-wiki-sources` (and `agent-knode-wiki-sources`) reads it with `raw/` beside it | Wiki-only measures what the wiki holds. In practice a wiki is a navigation layer over the sources, and that use is a separate system, not a relaxation of the first |
 | D8 Blind, batched, cross-family judge | Claude Code judges Codex's answers, ≤8 items per call. Ids are opaque, system markers are stripped, and systems are shuffled within a batch. Gold-building and the oracle check use Claude too | A judge grading its own family's answers, or one that can tell systems apart, is not a judge. Batching keeps a pilot inside a plan |
 | D9 Gold without a model where possible | Synthetic life is scored from its script. CUAD, EnronQA, FinanceBench, LongMemEval and MuSiQue bring their own answers. Law cross-references come from a regex. Style comes from stylometry (log-odds terms, profile directions). Model-drafted gold has an exact quote checked against its document, and an oracle check drops any task its evidence does not answer | Gold an oracle cannot recover is noise. A quote that is not in its document is a hallucinated fact |
 | D10 Contamination is measured, not hoped away | Literature names are consistently renamed (map in the holdout), the research forecast uses a 2026 holdout, and a `closed-book` reference answers every task | Models have read the classics. A pack the model answers from memory measures memory |
 | D11 Generated units only | `exportKnowledge` returns what a system generated (entities, relations, claims, pages, summaries, communities), never raw passages. Coverage is looked up within a fixed budget (6,000 characters, ≤10 units) by the same BM25 + bge-m3 retrievers for every system | A system that stores chunks would otherwise cover everything by definition, and a verbose one would win by size |
+| D13 Corpus-level tasks are set-scored | `aggregate`, `timeline`, `contradiction` and `profile` tasks have evidence in ≥5 documents (`validatePack` refuses fewer) and gold that is a list: matched by alias or by cited documents without a model where the gold allows, by the judge otherwise; a count is checked as a number | The pilot's tasks were 1–2-document lookups (median 2 evidence documents), where a compiled wiki cannot help. The `global` type's 0/0.5/1 keypoint grade could not separate systems on the 43 tasks that needed 3+ documents |
+| D14 Padding is closed-world checked | A pack may hold `padding/`, staged only above `--fraction 1`. A corpus-level task names its closed world (terms, path prefixes); `validatePack` refuses padding that contains a term or lies under a prefix | Scale curves need more of the same kind of source without changing the gold. A padding document that lists one more run, article or company would make the task wrong at 10× and right at 1× |
+| D15 The update stream is cumulative and costed | Batches apply in order up to the last one a task asks after; every group's update is a build record (`<group>@NN`) and every answer after a batch carries it | "Latest state after each batch" means batch 03's answers see 01–03, and incremental cost is the wiki pattern's selling point |
+| D16 Extend, do not rebuild | `eval pack extend` adds corpus-level tasks and padding to a built pack, leaving its corpus (and version) as it is; `eval run --reuse-builds-from` copies another run's builds of the same pack versions | finance-cn is a slice of a live workspace that has grown since; rebuilding it would re-sample it. The pilot's knode and LLM Wiki builds of finance-cn, research-ai and law-cn cost ~50M weighted tokens |
+| D17 Cost is part of the result | Correctness per 1k query tokens, with the build spread over 100 and 1000 queries, and break-even per system against agent-grep | A wiki that is as correct as grep at a higher query cost and never pays back its build (the pilot's agent-wiki) has not added value |
 | D12 A quota guard, not a hope | Before each batch `readCodexAccount()` reads Codex's windows (no model call). A run pauses above 92% (five-hour) or 90% (weekly) and resumes after the reset. A refused judge call sleeps and retries | On 2026‑11‑04 the weekly window was 72% used with five days to its reset, and the finance workspace's extraction uses the same plan |
 
 ## 2. Packs (`src/eval/packs/`)
@@ -59,7 +65,38 @@ pages 98% faithful) showed what such a benchmark can find.
 | `public-musique` / `-multihoprag` | HippoRAG 2 MuSiQue release; MultiHop-RAG (ODC-BY) | Published multi-hop questions with supporting passages, bridge links |
 
 Every recipe ends in `finishDocpack`: write the documents, draft facts and tasks (`gold.ts`), add the recipe's own
-model-free tasks, validate.
+model-free tasks, draft corpus-level tasks (§2.1), choose padding, validate.
+
+### 2.1 Corpus-level tasks (2026‑11‑07)
+
+| Type | Asks | Gold | Scored |
+| --- | --- | --- | --- |
+| `aggregate` | list (or count) every X across the corpus | every item, each with the documents that state it | set F1; a count by its number (`count` scoring) |
+| `timeline` | how an entity's state, role or figures changed | items with dates, in order | F1 × pairwise order accuracy; date accuracy reported |
+| `contradiction` | which sources disagree about X, and how | each side with the documents that take it | F1, a side counts only with one of its documents cited |
+| `profile` | everything the corpus says about X | distinct facts with their documents | recall (drafted gold is a sample, not all there is) |
+| `deep-hop` | a 3–4-fact chain whose bridges sit in different documents | the last fact's answer | judged 0–2 |
+
+Where the gold comes from:
+
+- **synthetic-life-zh/-en v2** (`life-ledger.ts`, no model): a seeded ledger on top of the script — about 21 runs with distances, ten weekly
+  blood-pressure readings and a drug change, nine meals out at named restaurants, seven purchases with prices, five trips home, five book-club
+  meetings, job milestones, four planted disagreements (which knee, the team's size, the book club's day, the partner's hometown: one side in
+  four documents, the other in one), four chains of 3–4 hops, and an update stream of four batches (start date; race date; follow-up and drug;
+  the race event and a project lead). Each event is rendered in a document of its own with an exact phrase. 41 corpus-level tasks, 4 deep hops,
+  10 update tasks; a rendered document that adds a distance or a reading no event planted drops that series' tasks (checked by regex).
+  `--options '{"padding":10}'` renders noise (newsletters, notices, other people's chats) that names nobody in the cast.
+- **law-cn** (no model): which articles of a law mention a term (lists and counts over 5–25 articles in ≥5 chapters), the laws in order of
+  commencement, and 3-hop chains through internal cross-references (A cites B, B cites C, each in another chapter). 38 tasks plus 4 chains;
+  drafted profiles and contradictions on top. Padding: chapters of other national laws in force (a download).
+- **finance-cn, research-ai** (`corpus-tasks.ts`, author model): entities clustered once and found in the documents by name (5–30 documents);
+  every statement about them swept from excerpts, each with an exact quote checked against its document; profiles, timelines and contradictions
+  assembled from those statements; aggregates proposed with keywords any qualifying document must contain, every such document read, so the
+  gold is complete within that bound and padding without the keywords cannot change it; chains drawn from the fact graph, written with the
+  bridges unnamed, kept by the oracle check. finance-cn's padding is more of the same workspace (local).
+- **public-musique-deep**: `--options '{"minHops":3}'` keeps MuSiQue's 3- and 4-hop questions only, typed `deep-hop`.
+
+`knode-os eval pack extend <pack>` adds all of this to a pack already built (D16).
 
 ## 3. Systems (`src/eval/systems/`)
 
@@ -70,6 +107,7 @@ model-free tasks, validate.
 | `rag-hybrid` (`rag-bm25`, `rag-vector` retrieval only) | `rag` | Top-8 chunks by BM25 (CJK bigrams) + bge-m3, RRF, one answer call |
 | `knode-ask` (`knode-sag` retrieval only), `agent-knode`, `agent-knode-wiki` | `knode` | knode's `ask`; the agent with knode's MCP retrieval tools (`knode_search`, `knode_graph_search`, `knode_claims`, `knode_read`, `knode_grep`, `knode_ls`); the agent in the generated wiki |
 | `agent-wiki` | `llm-wiki` | The agent in the LLM Wiki |
+| `agent-wiki-sources`, `agent-knode-wiki-sources` | `llm-wiki`, `knode` | The same agent with the wiki and `raw/` side by side: the wiki as a navigation layer (D7) |
 | `graphrag`, `lightrag`, `hipporag` | each | Their own query through `eval/adapters/<id>.py` (JSON lines), in a uv venv, by default on 3 packs (`KNODE_EVAL_EXTERNAL_PACKS`) |
 
 The knode build is the one `serve` runs: `sync`, document passes until the queue and summaries are done (tier-1,
@@ -97,6 +135,22 @@ Each suite has one pre-registered primary metric (in bold). The rest are reporte
 - Injection success.
 - Retrieval Recall@k, All@5, MRR@10, nDCG@10 over multiple gold documents.
 - Latency, tool calls, weighted tokens and USD per query.
+
+**Use: corpus-level lists** (`score/lists.ts`). Every system answers the same JSON list (`label`, `date` for a timeline, `evidence`):
+- match by `alias` (a gold name occurs in the predicted label; a number is not matched inside a longer one, `8公里` ≠ `18公里`), by `docs`
+  (the item cites every document of the gold item), or by the judge (`LIST_MATCH_SYSTEM`: same name, number and date; a merged entry
+  matches one gold entry);
+- **correctness** = set F1, or recall for a profile, × order accuracy for a timeline — so lists enter the pooled comparison with the rest;
+- set precision / recall, order accuracy, date accuracy, attribution recall (share of an item's documents cited), items returned.
+
+**Cost-normalized** (report "Correctness for its cost"): correctness per 1k weighted query tokens; the same with the build's weighted tokens
+spread over 100 and 1000 queries; break-even queries per answering system against agent-grep (a system that costs more per query never
+breaks even). A system's build is its group's (agent-wiki-sources pays for the llm-wiki build).
+
+**Update stream** (report "Update stream"): per batch, each group's incremental weighted tokens and each system's correctness after it.
+
+**Scale curves** (`knode-os eval scale <runDirs…>`): runs of the same packs at several `--fraction`s side by side — correctness overall and on
+lists, tokens per query, build tokens, by corpus size (staged documents and characters recorded in `run.json`).
 
 **Emergence.** Every system answers the same probes in the same JSON (items with confidence and evidence). Items are matched one-to-one against fixed gold, by the judge for themes and needs and without a model for terms, labels and attribution:
 - set precision, **recall**, F1;
@@ -132,7 +186,11 @@ knode-os eval report ~/knode-eval/runs/<stamp>
 - `--config-from` names the workspace whose embedder (the bge-m3 pool) the run borrows. Its config is only read.
 - Build effort defaults to low and answer effort to medium.
 - Agents answer at most 30 stratified tasks per pack (`--agent-limit`).
-- `--fraction` and `--seed` give scale curves and run-to-run variance.
+- `--fraction` and `--seed` give scale curves and run-to-run variance. Above 1, `--fraction` stages the pack's padding (10 = ten times the
+  documents); a pack with too little padding is refused. Long-context is applicable by the staged size.
+- `--types aggregate,timeline,contradiction,profile,deep-hop,update` runs only those tasks; `--reuse-builds-from <run>` starts from another
+  run's builds of the same pack versions (refused when it embedded with another model).
+- `knode-os eval pack extend <pack> [--corpus <json>] [--padding <n>] [--no-author]` adds corpus-level tasks and padding to a built pack.
 - `--embedding-cap` bounds what a run takes from the shared pool.
 - `--embedding-daily-cap` bounds what it takes per UTC day, since the live service shares the pool and its free quotas reset at 00:00 UTC. Past the cap, or when the pool itself refuses, a pack waits for the next day and then resumes.
 
@@ -143,3 +201,25 @@ knode-os eval report ~/knode-eval/runs/<stamp>
 - No HTML export of the report: Markdown with chart blocks, plus JSON.
 - The research forecast's gold is the author model's reading of the 2026 holdout. It is a weak target, reported with the closed-book control.
 - Scale curves, variance runs and noise injection exist as flags; the pilot does not run them.
+- The vector cache is shared across systems, so a group's embedding tokens depend on which group embedded a text first (a RAG update after
+  knode's embeds nothing new). Builds compare fairly on model tokens; embedding tokens are indicative.
+- Drafted corpus-level gold (finance-cn, research-ai) is checked quote by quote, but its completeness rests on the author's reading within the
+  keyword bound; profiles are scored on recall for that reason. No human audit of it yet.
+- law-cn has few disagreements and no timelines inside one law: its corpus-level tasks are mostly aggregates.
+
+## 7. Proposed corpus-level run (2026‑11‑07, awaiting approval)
+
+Nothing below has been run; each phase needs the user's go-ahead. Estimates come from the pilot: 335M Codex weighted tokens in all
+(builds 260M, 3,550 answers 75M); about $1.4 per 1M weighted tokens where the pilot was priced; agents at ~1.5× their pilot cost per query,
+since a list needs more reading.
+
+| Phase | What | Model use | Downloads |
+| --- | --- | --- | --- |
+| 0 | `pack build public-musique --out …/public-musique-deep --options '{"minHops":3,"questions":30}'`; `pack extend law-cn --no-author` (38 statute tasks, 4 chains) | none | none (cached) |
+| 1 | `pack build synthetic-life-zh --seed 7` (v2); `pack extend finance-cn`, `research-ai`, `law-cn` (drafted part) | Claude author ≈ 75 + 75 + 75 + 20 ≈ **245 calls** (long-input) | none |
+| 2 | `eval run --pack synthetic-life-zh,finance-cn,research-ai,law-cn --types aggregate,timeline,contradiction,profile,deep-hop,update --suites usage,update --agent-limit 60 --config-from ~/.knode-os/users/admin/workspaces/finance --reuse-builds-from ~/knode-eval/runs/pilot-2026-11 --judge codex-cli --judge-model <not the answerer>`; systems agent-grep, agent-wiki, agent-wiki-sources, agent-knode-wiki, agent-knode-wiki-sources, agent-knode, knode-ask, rag-hybrid, long-context, closed-book | ≈ 210 tasks × 10 systems ≈ 2,100 answers ≈ **63M** weighted; new builds only for synthetic v2 (≈ 12M) and its four update batches (≈ 2M) → **≈ 77M ≈ $105**; judge ≈ 150 calls (most lists are matched without it) | none; ≈ 60k bge-m3 tokens |
+| 2b (optional) | public-musique-deep, same systems | ≈ 25M build + 8M answers ≈ **33M ≈ $45** | none |
+| 3 (optional) | scale: synthetic-life-zh at 3× and 10× (`--options '{"padding":10}'`, ≈ 110 more Claude calls) and finance-cn at 3× (`pack extend finance-cn --padding 3`, local) | synthetic 3× ≈ 50M, 10× ≈ 130M; finance-cn 3× ≈ 80M weighted (≈ $70 / $180 / $110) | bge-m3 ≈ 0.5M (synthetic 10×) and ≈ 2M tokens (finance 3×): past the pool's daily caps, so a local endpoint or `--embedding-daily-cap` |
+
+Wall time follows the pilot: about two days for phase 2 under the plan windows, the quota guard pausing it. Before phase 2, reopen one
+reused build (`--limit 2`) to check that a copied knode workspace opens at its new path.

@@ -223,6 +223,9 @@ function crossRefs(law: ParsedLaw, a: Article): { tail: string; internal: boolea
   return out;
 }
 
+/** Drafted corpus-level tasks for law-cn, beside its model-free ones: profiles of legal subjects, the rare disagreement, chains. */
+export const LAW_CN_CORPUS = { profile: 8, timeline: 0, contradiction: 4, aggregate: 0, deep: 4 };
+
 /** Legal terms whose articles a corpus-level task lists: spread across chapters, so the list needs many documents. */
 const LAW_TERMS = [
   '国务院', '书面', '公告', '登记', '股东会', '董事会', '监事会', '职工', '工会', '劳动报酬', '经济补偿', '违约金', '期限届满', '三十日', '十五日', '六个月', '诉讼时效',
@@ -360,7 +363,7 @@ async function buildLawCn(dir: string, ctx: RecipeContext) {
   const books = (ctx.options.civilCodeBooks as string[] | undefined) ?? CIVIL_CODE_BOOKS;
   const writer = new PackWriter(dir, {
     id: 'law-cn',
-    version: 2,
+    version: 1,
     title: 'Chinese civil, commercial and data laws in force',
     domain: 'law',
     languages: ['zh'],
@@ -483,7 +486,7 @@ async function buildLawCn(dir: string, ctx: RecipeContext) {
   }
   return finishDocpack({
     writer, docs, lang: 'zh', tasks, plan: scaledPlan({ single: 20, multi: 10, temporal: 3, unanswerable: 6, global: 4 }, docs.length, 100), perDoc: 5,
-    corpus: { profile: 8, timeline: 0, contradiction: 4, aggregate: 0, deep: 4 },
+    corpus: LAW_CN_CORPUS,
     ...(padding > 1 ? { padding: { candidates, multiple: padding } } : {}),
   }, ctx);
 }
@@ -673,6 +676,6 @@ async function buildLawUs(dir: string, ctx: RecipeContext) {
 
 /** Pack recipes for the law domain (docs/design/23 §2). */
 export function registerLawRecipes(): void {
-  registerRecipe({ id: 'law-cn', title: 'Chinese national laws in force (civil, company, securities, labour, data), by chapter', domain: 'law', network: true, needsAuthor: true, build: buildLawCn });
+  registerRecipe({ id: 'law-cn', title: 'Chinese national laws in force (civil, company, securities, labour, data), by chapter', domain: 'law', network: true, needsAuthor: true, build: buildLawCn, corpusPlan: LAW_CN_CORPUS, modelFreeCorpus: true, padding: 'download' });
   registerRecipe({ id: 'law-us', title: 'US commercial contracts from CUAD v1 with clause-annotation tasks', domain: 'law', network: true, needsAuthor: true, build: buildLawUs });
 }

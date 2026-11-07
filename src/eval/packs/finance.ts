@@ -114,6 +114,9 @@ async function buildFinanceUs(dir: string, ctx: RecipeContext) {
 
 /* -------------------------------- finance-cn -------------------------------- */
 
+/** Corpus-level tasks for finance-cn: commentary disagrees and targets move, so contradictions and timelines are plentiful. */
+export const FINANCE_CN_CORPUS = { profile: 12, timeline: 10, contradiction: 10, aggregate: 12, deep: 10 };
+
 const MAX_CHARS = 40_000;
 const MIN_CHARS = 300;
 
@@ -159,7 +162,7 @@ async function buildFinanceCn(dir: string, ctx: RecipeContext) {
   if (!fs.existsSync(raw)) throw new Error(`finance-cn reads a local knode workspace; none at ${workspace} (set --options '{"workspace":"…"}')`);
   const writer = new PackWriter(dir, {
     id: 'finance-cn',
-    version: 2,
+    version: 1,
     title: 'Private: a frozen slice of the local finance knowledge base (zh)',
     domain: 'finance',
     languages: ['zh'],
@@ -213,12 +216,12 @@ async function buildFinanceCn(dir: string, ctx: RecipeContext) {
   ctx.log(`finance workspace: ${docs.length} documents from ${new Set(docs.map((d) => d.source)).size} sub-folders (${skipped} skipped: too long, too short, not Chinese or not text)${spare.length ? `; ${spare.length} padding candidates` : ''}`);
   return finishDocpack({
     writer, docs, lang: 'zh', plan: { single: 20, multi: 12, temporal: 8, unanswerable: 5, global: 3 }, perDoc: 5,
-    corpus: { profile: 12, timeline: 10, contradiction: 10, aggregate: 12, deep: 10 },
+    corpus: FINANCE_CN_CORPUS,
     ...(padding > 1 ? { padding: { candidates: spare, multiple: padding } } : {}),
   }, ctx);
 }
 
 export function registerFinanceRecipes(): void {
   registerRecipe({ id: 'finance-us', title: 'FinanceBench questions over the US filing pages they cite', domain: 'finance', network: true, needsAuthor: true, build: buildFinanceUs });
-  registerRecipe({ id: 'finance-cn', title: 'PRIVATE frozen slice of the local zh finance workspace (never share)', domain: 'finance', network: false, needsAuthor: true, build: buildFinanceCn });
+  registerRecipe({ id: 'finance-cn', title: 'PRIVATE frozen slice of the local zh finance workspace (never share)', domain: 'finance', network: false, needsAuthor: true, build: buildFinanceCn, corpusPlan: FINANCE_CN_CORPUS, padding: 'local' });
 }

@@ -8,6 +8,7 @@ import { installExternal } from './install.js';
 import { QuotaGuard, withRefusalRetry } from './quota.js';
 import { loadPack, packsDir, validatePack } from './pack.js';
 import { listRecipes, recipe } from './packs/index.js';
+import { extendPack } from './packs/extend.js';
 import './packs/recipes.js';
 import { buildScaleData, renderScale, writeReport } from './report.js';
 import { runEval, scoreRun } from './run.js';
@@ -68,6 +69,29 @@ export function registerEvalCommands(program: Command): void {
       console.log(`\n${p.manifest.id}: ${p.docs.length} documents, ${p.tasks.length} tasks, ${p.facts.length} gold facts → ${out}`);
     });
   pack
+    .command('extend <pack>')
+    .description('add corpus-level tasks (aggregate, timeline, contradiction, profile, deep chains) and padding to a built pack, leaving its corpus as it is')
+    .option('--author <provider>', 'model that drafts the tasks: claude-cli | codex-cli', 'claude-cli')
+    .option('--author-model <model>', 'its model (default: the CLI default)', '')
+    .option('--corpus <json>', 'corpus plan, e.g. {"profile":12,"timeline":10,"contradiction":10,"aggregate":12,"deep":10} (default: the recipe\'s; {} drafts nothing)')
+    .option('--padding <multiple>', 'padding for scale curves, as a multiple of the corpus (10 = nine times its documents again)', '0')
+    .option('--no-author', 'draft nothing: model-free tasks and padding only')
+    .option('--seed <seed>', 'sampling seed', '0')
+    .option('--options <json>', 'recipe options for the rebuild that supplies model-free tasks and padding', '{}')
+    .action(async (arg: string, opts) => {
+      const dir = resolvePack(arg);
+      const guard = new QuotaGuard({ enabled: false, log: (m) => console.log(`  ${m}`) });
+      const author = opts.author === false ? undefined : withRefusalRetry(new LlmClient({ provider: opts.author, baseUrl: '', apiKey: '', model: opts.authorModel, cliPath: '', cliTimeoutMs: 900_000 }), guard);
+      const r = await extendPack(dir, {
+        author, seed: opts.seed, options: JSON.parse(opts.options), log: (m) => console.log(`  ${m}`),
+        corpus: opts.corpus ? JSON.parse(opts.corpus) : undefined, padding: Number(opts.padding),
+      });
+      for (const w of r.warnings) console.log(`  warning: ${w}`);
+      for (const e of r.errors.slice(0, 30)) console.log(`  error: ${e}`);
+      if (r.errors.length) process.exitCode = 1;
+      console.log(`\n${path.basename(dir)}: ${r.added} corpus-level tasks added, ${r.padded} padding documents`);
+    });
+  pack
     .command('validate <dir>')
     .description('check a pack: evidence quotes, duplicate ids, scoring gold')
     .action((dir: string) => {
@@ -126,6 +150,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--embedding-daily-cap <tokens>', 'embed at most this many tokens per UTC day; past it, packs wait for the next day')
     .option('--no-quota', 'do not pause for Codex plan windows')
     .option('--skip-scoring', 'answer only; score later with `eval run --run-dir`')
+    .option('--reuse-builds-from <runDir>', "start from another run's builds of the same pack versions (and its embedding vectors), instead of building again")
     .action(async (opts) => {
       const res = await runEval({
         packs: csv(opts.pack)!.map(resolvePack),
@@ -157,6 +182,7 @@ export function registerEvalCommands(program: Command): void {
         embeddingDailyCap: opts.embeddingDailyCap ? Number(opts.embeddingDailyCap) : undefined,
         quota: opts.quota,
         skipScoring: opts.skipScoring,
+        reuseBuildsFrom: opts.reuseBuildsFrom,
         onProgress: (m) => console.log(`  ${m}`),
       });
       const report = writeReport(res.runDir);
