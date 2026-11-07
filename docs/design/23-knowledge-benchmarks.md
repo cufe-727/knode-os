@@ -242,9 +242,12 @@ knode-os eval report ~/knode-eval/runs/<stamp>
   keyword bound; profiles are scored on recall for that reason. No human audit of it yet.
 - law-cn has few disagreements and no timelines inside one law: its corpus-level tasks are mostly aggregates.
 
-## 7. Proposed corpus-level run (revised 2026‑11‑07, awaiting approval)
+## 7. Corpus-level run (revised 2026‑11‑07; phases 0–1 done, phase 2 running since 04:15Z)
 
-Nothing below has been run. Money: the OpenAI key has ≈ $200 left and the Anthropic key ≈ $100 (D18 stops each at 95%); Codex CLI's plan is
+Approved 2026‑11‑07. Phases 0, 0b and 1 are done: bge-m3 serves on 127.0.0.1:12020; synthetic-life-zh v2 (41 corpus-level tasks),
+finance-cn (+31 corpus-level, 10 chains; padding stops at 1.3× because most same-workspace documents name a closed-world entity),
+research-ai (+26 corpus-level, 2 chains, the field review and directions), law-cn (+55), synthetic-reports-zh/-en and public-musique-deep.
+Phase 2 runs from `~/knode-eval/runs/corpus-2026-11/phase2.sh` (resumable) into `…/corpus-2026-11/run`. What follows is the plan as approved. Money: the OpenAI key has ≈ $200 left and the Anthropic key ≈ $100 (D18 stops each at 95%); Codex CLI's plan is
 the fallback for both chains. Prices: gpt-6.1-sol and claude-sonnet-5-5 at $2 / $0.10–0.20 cached / $10 per 1M tokens. Per-query cost from
 the pilot's token profiles at those prices, agents at 1.5× for corpus-level tasks: agents $0.044–0.07, knode-ask $0.018, rag-hybrid $0.015,
 long-context ≈ $0.12, closed-book $0.007 — about $0.50 per task across the ten systems.
