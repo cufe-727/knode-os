@@ -902,6 +902,48 @@ export type ReviewLlmMode = 'off' | 'suggest' | 'auto';
 export type ReviewExternal = 'off' | 'verify' | 'research';
 
 /**
+ * This machine's processing: the extraction, summary, translation and judge
+ * slots `serve` runs (src/labeling/local.ts) and the reviews after them.
+ */
+export interface ProcessingConfig {
+  /**
+   * Start processing when `serve` starts, instead of waiting for someone to
+   * press Start processing. The button still stops and starts it until the
+   * next start of the service. Default off.
+   */
+  autoStart: boolean;
+  /**
+   * Model calls this machine's slots run at once, every stage together —
+   * extraction, summaries, translations and review calls. Each stage's own
+   * slot count still applies under it. 0: no cap beyond those. Default 2.
+   */
+  maxLocalCalls: number;
+  /**
+   * A stage running on a plan-metered CLI (Codex, Claude) takes no new work
+   * while the plan has less than this percent left in any of its windows,
+   * and takes work again once that window resets above it
+   * (src/labeling/plan-quota.ts). 0 turns the floor off. Default 20.
+   */
+  minQuotaPercent: number;
+}
+
+export const DEFAULT_PROCESSING: ProcessingConfig = { autoStart: false, maxLocalCalls: 2, minQuotaPercent: 20 };
+
+/** A workspace's processing settings, a missing or unusable one at its default. */
+export function processingSettings(config: Pick<KnodeConfig, 'processing'>): ProcessingConfig {
+  const p = config.processing ?? DEFAULT_PROCESSING;
+  const count = (v: unknown, fallback: number, max: number) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? Math.min(max, Math.floor(n)) : fallback;
+  };
+  return {
+    autoStart: p.autoStart === true,
+    maxLocalCalls: count(p.maxLocalCalls, DEFAULT_PROCESSING.maxLocalCalls, 64),
+    minQuotaPercent: count(p.minQuotaPercent, DEFAULT_PROCESSING.minQuotaPercent, 100),
+  };
+}
+
+/**
  * How much checking sits between extraction and the graph. Three layers, each
  * with its own knob, so a workspace can be strict (nothing merges without a
  * person) or hands-off (the LLM judge merges what it is sure about).
@@ -1019,6 +1061,13 @@ export interface KnodeConfig {
   graph: GraphConfig;
   /** Review strength between extraction and the graph (entity merges, claims, external verification). */
   review: ReviewConfig;
+  /**
+   * This machine's processing (src/labeling/processing.ts): whether it starts
+   * with the service, how many model calls its slots run at once, and the
+   * plan quota it leaves alone. Absent in a config written before it: the
+   * defaults (`processingSettings`).
+   */
+  processing?: ProcessingConfig;
   /** The chat entry (see src/chat). */
   chat: ChatConfig;
   /** Content languages: the language the knowledge is read in, and what is translated into it (docs/design/17). */
@@ -1219,6 +1268,7 @@ export function defaultConfig(): KnodeConfig {
       claimMergeMaxJudgedPerRun: 1200,
       external: 'verify',
     },
+    processing: { ...DEFAULT_PROCESSING },
     chat: { agent: 'default', model: '', historyTurns: 12, keep: 200 },
     languages: { ...DEFAULT_LANGUAGES, secondary: [] },
     trace: {

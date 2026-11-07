@@ -335,6 +335,11 @@ Embed slots take only `embed`, audit requests before the chunk backlog.
 machine's accounts. Lent keys are the exception, since they spend the server's quota, but embedding has never been
 behind the switch.
 
+Since 2026‑11‑07 the switch has limits (`processing`; [remote labeling](../remote-labeling.md#local-worker-slots)):
+serve's LLM slots run at most `maxLocalCalls` calls at once (default 2, judge calls first in line), a slot on a Codex
+or Claude plan with less than `minQuotaPercent` left (default 20%) rests until the window resets, and `autoStart`
+lets the switch start with the service.
+
 ## 7. The worker (`worker/knode-worker.mjs`)
 
 - `--backends codex:2,cursor:2,embed:4`: `embed` is a new backend whose slots take only embed tasks.

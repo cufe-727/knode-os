@@ -1603,6 +1603,14 @@ function renderTasks(t) {
   wireTaskLinks($('#tab-queue'));
 }
 
+/** When a rest ends: the time today, with the day when it is not today (a plan's window may reset days out). */
+function restingUntil(iso) {
+  const at = new Date(iso);
+  return at.toDateString() === new Date().toDateString()
+    ? at.toLocaleTimeString()
+    : at.toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
 function paintTasksProcessing(t) {
   const el = $('#tasks-processing');
   if (!t.processing) {
@@ -1615,8 +1623,15 @@ function paintTasksProcessing(t) {
   const line = p.running
     ? `Running${since ? ` since ${since}` : ''}${p.by ? `, started by ${esc(p.by)}` : ''}`
     : (since && p.by ? `Stopped at ${since} by ${esc(p.by)}` : 'Stopped since the service started');
+  // the limits over this machine's slots (src/labeling/local.ts): calls at once, and the plan quota they leave alone
+  const max = p.calls?.max ?? 0;
+  const limits = [
+    max > 0 ? `At most ${max} model call${max === 1 ? '' : 's'} at once here${p.running ? ` (${p.calls.inFlight} now)` : ''}.` : '',
+    p.minQuotaPercent > 0 ? `A Codex or Claude stage rests while its plan has less than ${p.minQuotaPercent}% left.` : '',
+  ].filter(Boolean).join(' ');
+  const holds = (p.quotaHolds ?? []).map((h) => `${esc(h.id)} rests${h.until ? ` until ${esc(restingUntil(h.until))}` : ''}: ${esc(h.reason)}`);
   el.innerHTML = `<div class="tp-state"><span class="status-dot${p.running ? ' live' : ''}"></span>
-      <div><b>${p.running ? 'Processing' : 'Processing is stopped'}</b><p class="hint">${line}. ${p.running ? 'Extraction, reviews, summaries and translations take work as slots free up.' : 'Extraction, reviews, summaries and translations spend model calls, so they wait until someone starts them.'}</p></div></div>
+      <div><b>${p.running ? 'Processing' : 'Processing is stopped'}</b><p class="hint">${line}. ${p.running ? 'Extraction, reviews, summaries and translations take work as slots free up.' : 'Extraction, reviews, summaries and translations spend model calls, so they wait until someone starts them.'}${limits ? ` ${limits}` : ''}</p>${holds.length ? `<p class="hint warn">${holds.join('<br>')}</p>` : ''}</div></div>
     <div class="tp-actions">
       ${mayChange ? '' : '<span class="hint">An administrator starts and stops processing.</span>'}
       <button type="button" id="btn-tasks-processing" class="${p.running ? 'danger-button' : 'primary'}"${mayChange ? '' : ' disabled'}>${p.running ? 'Stop processing' : 'Start processing…'}</button>
@@ -1689,7 +1704,7 @@ function paintTasksWorkers(t) {
         <div><b class="mono">${esc(w.label)}</b> <span class="tag${w.remote ? ' remote' : ''}">${w.remote ? 'remote' : 'this machine'}</span>${w.kinds.length ? ` <span class="hint">${esc(w.kinds.map((k) => WORK_KIND_WORDS[k] ?? k).join(' · '))}</span>` : ''}</div>
         <div class="hint">${state} · ${load} · ${w.ok.toLocaleString()} ok${w.failed ? ` · <span class="bad">${w.failed.toLocaleString()} failed</span>` : ''}${w.remote ? ` · seen ${agoText(w.lastSeen)}` : ''}</div>
         ${w.remote ? `<div class="hint mono tasks-worker-id">${esc(w.id)}</div>` : ''}
-        ${paused ? `<div class="hint warn">resting until ${new Date(w.pausedUntil).toLocaleTimeString()}${w.pauseReason ? `: ${esc(w.pauseReason)}` : ''}</div>` : ''}
+        ${paused ? `<div class="hint warn">resting until ${esc(restingUntil(w.pausedUntil))}${w.pauseReason ? `: ${esc(w.pauseReason)}` : ''}</div>` : ''}
         ${w.lastError && !paused ? `<div class="hint bad">${esc(w.lastError)}</div>` : ''}
       </div>
     </div>`;
@@ -6833,6 +6848,10 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-extraction-batch').value = cfg.extraction?.batchSize ?? 8;
     $('#cfg-extraction-concurrency').value = cfg.extraction?.concurrency ?? 1;
     $('#cfg-extraction-claims').checked = cfg.extraction?.claims !== false;
+    // this machine's processing: auto-start, calls at once, the quota floor (src/labeling/local.ts)
+    $('#cfg-processing-autostart').checked = cfg.processing?.autoStart === true;
+    $('#cfg-processing-max-calls').value = cfg.processing?.maxLocalCalls ?? 2;
+    $('#cfg-processing-min-quota').value = cfg.processing?.minQuotaPercent ?? 20;
     await fillLanguagesForm(cfg);
     if (activeWorkspace()?.id !== workspaceId) return;
     $('#cfg-review-judge').value = cfg.review?.llmJudge ?? 'suggest';
@@ -6970,6 +6989,11 @@ function gatherConfig() {
       claims: $('#cfg-extraction-claims').checked,
     },
     languages: gatherLanguages(),
+    processing: {
+      autoStart: $('#cfg-processing-autostart').checked,
+      maxLocalCalls: Number($('#cfg-processing-max-calls').value),
+      minQuotaPercent: Number($('#cfg-processing-min-quota').value),
+    },
     // what the Judge stage does with its verdicts
     review: {
       llmJudge: $('#cfg-review-judge').value,

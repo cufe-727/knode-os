@@ -146,7 +146,8 @@ describe('processing', () => {
 
     await sleep(100);
     expect(asked).toEqual([]);
-    expect(processing.state()).toEqual({ running: false, since: null, by: null });
+    // the cap applies before the first start; the floor is the processing's own (none given here)
+    expect(processing.state()).toEqual({ running: false, since: null, by: null, calls: { inFlight: 0, max: 2 }, minQuotaPercent: 0, quotaHolds: [] });
 
     expect(processing.start('admin')).toBe(true);
     expect(processing.start('admin')).toBe(false);

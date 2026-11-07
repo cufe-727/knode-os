@@ -81,7 +81,36 @@ Without `workers`, the Extract stage's own route runs with `extraction.concurren
 `"slots": 0` turn this machine's extraction slots off, and `"summaryConcurrency": 0` its summary slots: it then
 only hands that work to remote workers. Judge calls run on the Judge stage's route, `review.concurrency` at a time
 (default 2); 0 leaves them to remote workers. Saving settings
-(`PUT /api/config`) takes effect within a minute. No restart is needed. Codex runs as
+(`PUT /api/config`) takes effect within a minute. No restart is needed.
+
+**Limits over every local slot** (`processing`, Settings → Ingest → Processing on this machine):
+
+```jsonc
+"processing": {
+  "autoStart": false,      // start processing with the service, instead of waiting for Start processing
+  "maxLocalCalls": 2,      // model calls at once, every stage together (0: each stage's own count only)
+  "minQuotaPercent": 20    // a Codex or Claude stage rests while its plan has less left than this (0: never)
+}
+```
+
+`maxLocalCalls` caps the calls this machine's slots run at once, extraction, summaries, translations and
+review calls together; each stage's own slot count still applies under it. A free call goes to a review's judge
+calls first, since a review waits on them, and to the other slots by turns. Remote workers are not counted.
+
+`minQuotaPercent` is the share of a plan processing leaves alone. Before each call, a stage on `codex-cli` or
+`claude-cli` checks what is left of its plan, at most every two minutes. While any window (five-hour or weekly)
+has less than the floor left, or the provider says a limit is reached, the stage takes no new work. Tasks shows
+it resting until the window resets, with the reason. It takes work again on its own once the window resets above
+the floor. Codex's windows are read through `codex app-server`, with no model call. Claude has no such read, so
+each Claude Code call knode makes runs with `--output-format stream-json` and keeps the `rate_limit_event` it
+reports in `~/.knode-os/claude-limits.json` (`KNODE_CLAUDE_LIMITS_FILE`). A Claude stage therefore goes by its
+last call here; use only grows within a window, so an old reading can only say more is left than is. Cursor,
+OpenCode and API endpoints have no reading and are never held: a refused call rests them as before. A Judge route
+held this way counts as unavailable, so a review files its candidates unjudged instead of waiting out each call.
+
+`autoStart` starts processing when `serve` starts (the Tasks view says it was started by the service). Without
+it, processing waits for someone to start it after every restart, as before. Stop processing still stops it
+until the next start. Codex runs as
 `codex exec --ignore-user-config --ephemeral -c features.plugins=false -c features.apps=false -c analytics.enabled=false`
 for every pipeline call, so your `~/.codex/config.toml` (MCP servers, memory, default model) stays out of extraction
 prompts. It also keeps tens of thousands of sessions out of `~/.codex/sessions`. Plugins and ChatGPT apps are on by
