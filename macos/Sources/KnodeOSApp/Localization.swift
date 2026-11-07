@@ -783,6 +783,8 @@ private let zhHansPairs: [(String, String)] = [
     ("Stopped since the service started", "服务启动以来一直停止"),
     ("Processing started", "处理已开始"),
     ("Processing stopped — calls in flight finish", "处理已停止——进行中的调用会完成"),
+    // picking the workspace already open (AppModel.switchWorkspace)
+    ("Reloaded %@", "已重新载入 %@"),
     // the estimate before a task starts (EstimateView.swift)
     ("Before you start", "开始之前"),
     ("Estimating — counting the work and reading the plans…", "正在估算——统计工作量并读取各套餐用量…"),

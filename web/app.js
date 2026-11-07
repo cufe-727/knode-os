@@ -211,16 +211,62 @@ function syncUserWorkspaces({ access = false, notWithin = 0 } = {}) {
   return workspaceSync;
 }
 
-/** Back on the page, or opening the workspace menu: take in Teams shared or withdrawn since the list was read. */
+/**
+ * Back on the page, or opening the workspace menu: take in Teams shared or
+ * withdrawn since the list was read. Resolves to the workspace that had to give
+ * way (and was replaced by a fresh one), else null.
+ */
 function refreshAccess(notWithin = 0) {
-  if (!authState?.user || $('#app-shell').hidden) return;
-  syncUserWorkspaces({ access: true, notWithin })
+  if (!authState?.user || $('#app-shell').hidden) return Promise.resolve(null);
+  return syncUserWorkspaces({ access: true, notWithin })
     .then((left) => {
-      if (!left) return;
+      if (!left) return null;
       loadWorkspaceData();
       toast(`${workspaceLabel(left)} is no longer open to you — switched to ${workspaceLabel(activeWorkspace())}`, 5000);
+      return left;
     })
-    .catch(() => { /* the list stays as it was; the next refresh asks again */ });
+    .catch(() => null /* the list stays as it was; the next refresh asks again */);
+}
+
+/**
+ * Read the open workspace again without losing your place: the counts, the
+ * notices, the open folders and the open file (unless it is being edited).
+ * Unlike switching workspaces nothing is cleared, so an open file, a search
+ * or a draft stays as it is.
+ */
+async function reloadWorkspace() {
+  const workspace = activeWorkspace()?.id;
+  loadStats();
+  loadNotices();
+  // Files is read only once a tree is on screen; until then it loads when it first opens
+  if (!listings.size) return;
+  try {
+    await loadTree();
+  } catch {
+    return; // the folders stay as they were
+  }
+  if (activeWorkspace()?.id === workspace) await rereadOpenFile();
+}
+
+/** Read the open file again, keeping the reader's place; a file being edited is left as it is. */
+async function rereadOpenFile() {
+  const path = currentFile;
+  if (!path || editing) return;
+  try {
+    const file = await api(fileUrl(path));
+    // the reader may have moved on, or started editing, meanwhile
+    if (currentFile !== path || editing) return;
+    if (file.content !== $('#file-editor').value) {
+      const view = $('#file-view');
+      const top = view.scrollTop;
+      renderFileContent(path, file.content, file.derived, file.truncated, file.bytes);
+      view.scrollTop = top;
+      loadFileCitations(path);
+    }
+    paintLanguages(path, file);
+  } catch {
+    // gone or unreachable: what is on screen stays; opening it again says why
+  }
 }
 
 function renderWorkspaceUI() {
@@ -269,6 +315,13 @@ function closeWorkspaceMenu() {
 
 function switchWorkspace(id) {
   if (!authState || !authState.workspaces.some((workspace) => workspace.id === id)) return;
+  // picking the workspace already open reads it again, keeping your place
+  if (id === authState.activeWorkspaceId) {
+    closeWorkspaceMenu();
+    reloadWorkspace();
+    toast(`Reloaded ${workspaceLabel(activeWorkspace())}`);
+    return;
+  }
   authState.activeWorkspaceId = id;
   saveAuthState();
   renderWorkspaceUI();
@@ -589,8 +642,9 @@ $('#workspace-trigger').addEventListener('click', (event) => {
   const menu = $('#workspace-menu');
   menu.hidden = !menu.hidden;
   $('#workspace-trigger').setAttribute('aria-expanded', String(!menu.hidden));
-  // the list shows at once, and takes in any Team shared since it was last read
-  if (!menu.hidden) refreshAccess();
+  // the list shows at once and takes in any Team shared since it was last read;
+  // the open workspace is read again in place (a fresh one opened instead needs no second read)
+  if (!menu.hidden) refreshAccess().then((left) => { if (!left) reloadWorkspace(); });
 });
 
 // coming back to the page: Teams shared or withdrawn meanwhile show without a reload

@@ -64,6 +64,8 @@ final class AppModel: ObservableObject {
     /// The folder picked in the Files tree. Shared so Search can scope to it.
     @Published var pickedDirectory: String?
     @Published var workspaceRevision = 0
+    /// Bumped by `reloadWorkspace`: the screen on show re-reads its data in place, keeping your place.
+    @Published private(set) var reloadRequest = 0
     /// What the service says needs attention in the active workspace, less the ones dismissed here (`refreshNotices`).
     @Published private(set) var notices: [WorkspaceNotice] = []
     @Published var toastMessage: String?
@@ -585,10 +587,36 @@ final class AppModel: ObservableObject {
     }
 
     func switchWorkspace(to workspace: Workspace) {
-        guard var current = session, current.activeWorkspaceID != workspace.id else { return }
+        guard var current = session else { return }
+        // picking the workspace already open reads it again
+        guard current.activeWorkspaceID != workspace.id else {
+            reloadWorkspace()
+            showToast(L("Reloaded %@", workspace.displayName))
+            return
+        }
         current.activeWorkspaceID = workspace.id
         setSession(current)
         workspaceDidChange(message: "Switched to \(workspace.displayName)")
+    }
+
+    /// Read the open workspace again without losing your place: the counts in the toolbar, the
+    /// notices, and what the screen on show re-reads when `reloadRequest` changes (Files: the
+    /// open folders, and the open file unless it is being edited). Unlike Refresh Workspace (⌘R)
+    /// nothing is rebuilt, so an open file, a search or a draft stays as it is.
+    func reloadWorkspace() {
+        reloadRequest += 1
+        Task {
+            await refreshStats()
+            await refreshNotices()
+        }
+    }
+
+    /// The workspace button: ask what this account may open, then read the open workspace again.
+    /// A workspace that had to give way meanwhile (a Team withdrawn) opens fresh instead.
+    func workspaceButtonClicked() async {
+        let opened = activeWorkspace?.id
+        await refreshAccess()
+        if activeWorkspace?.id == opened { reloadWorkspace() }
     }
 
     func createWorkspace(named name: String) async throws {
