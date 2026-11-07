@@ -79,7 +79,9 @@ own route, `summaryConcurrency` at a time:
 
 Without `workers`, the Extract stage's own route runs with `extraction.concurrency` slots. Workers listed with
 `"slots": 0` turn this machine's extraction slots off, and `"summaryConcurrency": 0` its summary slots: it then
-only hands that work to remote workers. Judge calls run on the Judge stage's route, `review.concurrency` at a time
+only hands that work to remote workers. A document's summary waits for its extraction unless
+`"summaryAfterExtraction": false`, which lets a large library get its summary pages long before its extraction is
+done (they link only what the graph has by then). Judge calls run on the Judge stage's route, `review.concurrency` at a time
 (default 2); 0 leaves them to remote workers. Saving settings
 (`PUT /api/config`) takes effect within a minute. No restart is needed.
 
@@ -108,7 +110,8 @@ last call here; use only grows within a window, so an old reading can only say m
 OpenCode and API endpoints have no reading and are never held: a refused call rests them as before. A Judge route
 held this way counts as unavailable, so a review files its candidates unjudged instead of waiting out each call.
 
-`autoStart` starts processing when `serve` starts (the Tasks view says it was started by the service). Without
+`autoStart` starts processing when `serve` starts (the Tasks view says it was started by the service), and the
+workspace opens at startup for it, so its embedding and processing run without anyone opening it. Without
 it, processing waits for someone to start it after every restart, as before. Stop processing still stops it
 until the next start. Codex runs as
 `codex exec --ignore-user-config --ephemeral -c features.plugins=false -c features.apps=false -c analytics.enabled=false`

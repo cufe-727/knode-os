@@ -67,11 +67,14 @@ sources index marks a document under the threshold `` `short` `` instead of show
 ```jsonc
 "extraction": {
   "summaryMinChars": 1500,      // no summary page under this many characters of indexed text; 0 = every document
-  "summaryMaxSegments": 12      // segments one summary reads at most; past it, sampled evenly and the page says so
+  "summaryMaxSegments": 12,     // segments one summary reads at most; past it, sampled evenly and the page says so
+  "summaryAfterExtraction": true // false: summarize documents still queued for extraction (their pages link only what the graph has)
 }
 ```
 
-Both are accepted by `PUT /api/config`. Schema **v15** adds `documents.chars` (the indexed text's length), written by
+All three are accepted by `PUT /api/config`. `summaryAfterExtraction` (2026‑11‑08) is for a library whose extraction
+would take far longer than its summaries: its summaries go first, and since a summary is cached by the document's
+content, extraction landing later does not redo one. Schema **v15** adds `documents.chars` (the indexed text's length), written by
 every apply; rows from before it are filled in lazily by the Summarize stage's scan.
 
 ```

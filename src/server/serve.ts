@@ -193,18 +193,26 @@ export async function startServer(ctx: AppContext): Promise<void> {
 
 /**
  * Open, at startup, every workspace that follows a linked folder, a linked
- * Feishu document or an agent conversation: its watchers, pollers, extraction and summaries must not
- * wait for someone to open it in the UI — after a restart they would otherwise
- * sit idle until then.
+ * Feishu document or an agent conversation, or that starts its processing on
+ * its own (`processing.autoStart`): its watchers, pollers, embedding,
+ * extraction and summaries must not wait for someone to open it in the UI —
+ * after a restart they would otherwise sit idle until then.
  */
-function autostartWorkspaces(root: string, registry: WorkspaceContextRegistry, log: (msg: string) => void): void {
-  const linked = (dataDir: string) => {
+export function autostartWorkspaces(root: string, registry: Pick<WorkspaceContextRegistry, 'get'>, log: (msg: string) => void): void {
+  /** Why a workspace opens at startup, or null when it waits to be opened. */
+  const linked = (dataDir: string): string | null => {
     try {
-      const config = JSON.parse(fs.readFileSync(path.join(dataDir, 'knode.config.json'), 'utf8')) as { ingest?: { linkedFolders?: unknown[]; feishuDocs?: unknown[]; conversations?: unknown[] } };
+      const config = JSON.parse(fs.readFileSync(path.join(dataDir, 'knode.config.json'), 'utf8')) as {
+        ingest?: { linkedFolders?: unknown[]; feishuDocs?: unknown[]; conversations?: unknown[] };
+        processing?: { autoStart?: unknown };
+      };
       const some = (list: unknown[] | undefined) => Array.isArray(list) && list.length > 0;
-      return some(config.ingest?.linkedFolders) || some(config.ingest?.feishuDocs) || some(config.ingest?.conversations);
+      if (some(config.ingest?.linkedFolders) || some(config.ingest?.feishuDocs) || some(config.ingest?.conversations)) {
+        return 'it follows linked folders, Feishu documents or agent conversations';
+      }
+      return config.processing?.autoStart === true ? 'its processing starts with the service' : null;
     } catch {
-      return false;
+      return null;
     }
   };
   const dirs = (abs: string) => {
@@ -214,28 +222,30 @@ function autostartWorkspaces(root: string, registry: WorkspaceContextRegistry, l
       return [];
     }
   };
-  const open = (label: string, scope: Parameters<WorkspaceContextRegistry['get']>[0]) => {
+  const open = (label: string, scope: Parameters<WorkspaceContextRegistry['get']>[0], why: string) => {
     void registry.get(scope).then(
-      () => log(`[${label}] opened at startup: it follows linked folders, Feishu documents or agent conversations`),
+      () => log(`[${label}] opened at startup: ${why}`),
       (err) => log(`[${label}] could not open at startup: ${err instanceof Error ? err.message : err}`),
     );
   };
   for (const user of dirs(path.join(root, 'users'))) {
     for (const id of dirs(path.join(root, 'users', user, 'workspaces'))) {
       const dataDir = path.join(root, 'users', user, 'workspaces', id);
-      if (!linked(dataDir)) continue;
+      const why = linked(dataDir);
+      if (!why) continue;
       try {
         const manifest = JSON.parse(fs.readFileSync(path.join(dataDir, '.workspace.json'), 'utf8')) as { name?: string };
-        open(`users/${user}/workspaces/${id}`, resolveWorkspaceScope({ user, kind: 'personal', id, name: manifest.name || id }));
+        open(`users/${user}/workspaces/${id}`, resolveWorkspaceScope({ user, kind: 'personal', id, name: manifest.name || id }), why);
       } catch (err) {
         log(`[users/${user}/workspaces/${id}] could not open at startup: ${err instanceof Error ? err.message : err}`);
       }
     }
   }
   for (const team of dirs(path.join(root, 'teams'))) {
-    if (!linked(path.join(root, 'teams', team))) continue;
+    const why = linked(path.join(root, 'teams', team));
+    if (!why) continue;
     try {
-      open(`teams/${team}`, resolveWorkspaceScope({ user: 'autostart', kind: 'team', name: team }));
+      open(`teams/${team}`, resolveWorkspaceScope({ user: 'autostart', kind: 'team', name: team }), why);
     } catch (err) {
       log(`[teams/${team}] could not open at startup: ${err instanceof Error ? err.message : err}`);
     }

@@ -608,6 +608,27 @@ describe('the summary source', () => {
     expect(readSourceSummary(ctx.dataDir, 'raw/docs/e.md')).toBeNull();
     expect(await source.lease(mac, 8)).toEqual([]);
   });
+
+  it('summarizes documents still queued for extraction when the workspace puts summaries first, and extraction landing later does not redo them', async () => {
+    write(ctx.dataDir, 'raw/docs/f.md', '# 己\n\n一本还在排队等抽取的书。\n');
+    await sync(ctx, { only: ['raw/docs/f.md'] });
+    // e.md's second version is still queued too: neither is due while summaries wait
+    expect(await source.lease(mac, 8)).toEqual([]);
+    ctx.config.extraction.summaryAfterExtraction = false;
+    try {
+      const tasks = await source.lease(mac, 8);
+      expect(tasks.map((t) => t.label).sort()).toEqual(['raw/docs/e.md', 'raw/docs/f.md']);
+      for (const t of tasks) expect(await source.complete(t.id, mac, { ok: true, text: `# 摘要\n\n${t.label} 先写的摘要。` })).toEqual({ accepted: true });
+      await until(async () => (await summaryPages(ctx)).has('raw/docs/f.md') && (await summaryPages(ctx)).has('raw/docs/e.md'), 10_000, 'the summaries written first');
+      const calls = (await source.status()).totals.calls;
+      await extractAll();
+      expect(await source.lease(mac, 8)).toEqual([]);
+      expect((await source.status()).totals.calls).toBe(calls);
+      expect(readSourceSummary(ctx.dataDir, 'raw/docs/f.md')?.body).toContain('raw/docs/f.md 先写的摘要。');
+    } finally {
+      delete ctx.config.extraction.summaryAfterExtraction;
+    }
+  });
 });
 
 describe('summaries while the model is out of reach', () => {

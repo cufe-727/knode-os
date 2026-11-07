@@ -6,7 +6,7 @@ import { renderCliPrompt } from '../llm/cli.js';
 import { LlmClient } from '../llm/client.js';
 import { DocumentRow } from '../types.js';
 import { dueSummaryDocuments, MAX_SUMMARY_ATTEMPTS, PagesContext, writeSourceSummaryPage } from '../wiki/pages.js';
-import { finishSummary, pendingSteps, planSummary, stepLabel, summaryMinChars, SummaryStep, summaryStepRequest, SummaryWork } from '../wiki/summary.js';
+import { finishSummary, pendingSteps, planSummary, stepLabel, summaryAfterExtraction, summaryMinChars, SummaryStep, summaryStepRequest, SummaryWork } from '../wiki/summary.js';
 import { noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
 
 /**
@@ -14,7 +14,8 @@ import { noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
  *
  * One per workspace in `serve`, behind the work broker (src/work/broker.ts).
  * A slot that asks for a summary gets the next call of the next document due
- * one — an indexed source no longer waiting for extraction, long enough for a
+ * one — an indexed source no longer waiting for extraction (unless
+ * `extraction.summaryAfterExtraction` is false), long enough for a
  * page, whose page is missing or dirty, the ones extracted most lately first.
  * A document that fits one call is one task; a long one is a task per
  * segment, which several workers can hold at once, and then one task that
@@ -324,7 +325,7 @@ export class SummarySource implements WorkSource {
     const { docs, due } = await dueSummaryDocuments(this.ctx.store, this.ctx.dataDir, {
       limit: SCAN_SIZE,
       prefer: [...this.recent].reverse(),
-      skipQueued: true,
+      skipQueued: summaryAfterExtraction(this.ctx.config),
       exclude,
       minChars: summaryMinChars(this.ctx.config),
     });
@@ -343,7 +344,7 @@ export class SummarySource implements WorkSource {
       `SELECT d.sha256, d.status, EXISTS (SELECT 1 FROM extraction_queue q WHERE q.document_id = d.id) AS queued FROM documents d WHERE d.id = $1`,
       [doc.id],
     );
-    if (!row || row.status !== 'indexed' || row.sha256 !== doc.sha256 || row.queued) return false;
+    if (!row || row.status !== 'indexed' || row.sha256 !== doc.sha256 || (row.queued && summaryAfterExtraction(this.ctx.config))) return false;
     if (readSourceSummary(this.ctx.dataDir, doc.path)?.contentSha === doc.sha256) {
       // summarized already — the page was not written yet, or another pass wrote the cache
       this.queuePage(doc);
