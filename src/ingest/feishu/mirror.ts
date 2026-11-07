@@ -1,10 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { FeishuLink, KnodeConfig } from '../../config.js';
-import { MAX_CONVERTIBLE_FILE_BYTES, MAX_FILE_BYTES } from '../../constants.js';
+import { MAX_FILE_BYTES } from '../../constants.js';
 import { safePath, sanitizeRelativePath, walkFiles } from '../../fs/files.js';
 import { RAW_DOCS } from '../../fs/layout.js';
-import { isConvertibleFile, originalOfTranscript } from '../convert.js';
+import { isConvertibleFile, maxConvertibleBytes, originalOfTranscript } from '../convert.js';
 import { isImportable } from '../folders.js';
 import { FeishuError, LarkCli } from './client.js';
 import { FeishuRef, parseFeishuRef, renderFeishuMarkdown, scanFeishuMarkdown } from './markdown.js';
@@ -259,7 +259,7 @@ export async function mirrorFeishuDocument(
           keptInFeishu++;
           continue;
         }
-        if ((m.bytes ?? 0) > MAX_CONVERTIBLE_FILE_BYTES || (!isConvertibleFile(name) && (m.bytes ?? 0) > MAX_FILE_BYTES)) {
+        if ((m.bytes ?? 0) > (isConvertibleFile(name) ? maxConvertibleBytes(name) : MAX_FILE_BYTES)) {
           keptInFeishu++;
           warnings.push(`${name}: too large to index — kept in Feishu`);
           continue;

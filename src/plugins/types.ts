@@ -114,6 +114,12 @@ export interface DocumentConverterPlugin {
   /** The conversion depends on the Convert stage's vision model. */
   usesVision?: boolean;
   /**
+   * The largest original this converter takes, in bytes; default
+   * MAX_CONVERTIBLE_FILE_BYTES (50 MB). Larger only for a type the converter
+   * reads in part — an EPUB's pictures are never read to get its text.
+   */
+  maxBytes?: number;
+  /**
    * A part of the cache key the file itself decides, when the converter reads
    * some files of its type differently from the rest (the image converter
    * reads a long screenshot in bands): those files get a key of their own,

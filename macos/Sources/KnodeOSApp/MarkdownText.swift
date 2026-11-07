@@ -157,6 +157,12 @@ struct MarkdownText: View {
             }
         case .block(let id):
             if blocks.indices.contains(id) { jump(to: [id], proxy, anchor: .center) }
+        case .heading(let n):
+            let headings = document.blocks.compactMap { block -> Int? in
+                guard case .heading(let level, _) = block.kind, level <= 3 else { return nil }
+                return block.id
+            }
+            if headings.indices.contains(n) { jump(to: [headings[n]], proxy, anchor: .top) }
         }
         scrollTarget = nil
     }
@@ -424,6 +430,8 @@ enum MarkdownScrollTarget: Equatable {
     case fragment(String)
     /// A block of the document, by id: where a way back returns to.
     case block(Int)
+    /// The n-th heading of the first three levels, from the top: a book's Contents.
+    case heading(Int)
 }
 
 /* ------------------------------ links ------------------------------ */

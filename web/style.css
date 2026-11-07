@@ -348,6 +348,13 @@ main { flex: 1; min-height: 0; overflow: hidden; display: flex; }
 }
 .file-toolbar .toolbar-link:hover { border-color: var(--accent); }
 .file-toolbar .toolbar-link[hidden] { display: none; }
+/* a book's chapters and sections, to jump to (EPUB) */
+.file-toolbar select.file-contents {
+  background: var(--bg3); border: 1px solid var(--border); color: var(--fg);
+  border-radius: 6px; padding: 4px 8px; max-width: 260px; cursor: pointer;
+}
+.file-toolbar select.file-contents:hover { border-color: var(--accent); }
+.file-toolbar select.file-contents[hidden] { display: none; }
 /* the reading language (docs/design/17): one segmented control, the reader's pick lit */
 .file-langs { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .file-toolbar .file-langs button { border: 0; border-radius: 0; padding: 4px 10px; white-space: nowrap; }

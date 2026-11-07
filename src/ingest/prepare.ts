@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { MAX_CONVERTIBLE_FILE_BYTES, MAX_FILE_BYTES } from '../constants.js';
+import { MAX_FILE_BYTES } from '../constants.js';
 import { isTextFile, safePath, walkFilesUnder } from '../fs/files.js';
 import { RAW_DOCS } from '../fs/layout.js';
 import { hasContent, readContent, readSidecarPart, SidecarConversion, writeContent, writeSidecarPart } from '../fs/sidecar.js';
@@ -12,13 +12,14 @@ import {
   convertDocumentToMarkdown,
   convertedPathForRaw,
   isConvertibleFile,
+  maxConvertibleBytes,
   originalOfTranscript,
   transcriptCacheKey,
   transcriptPathFor,
   transcriptToMarkdown,
 } from './convert.js';
 import { pool } from '../pool.js';
-import { loadSourceText, sha256 } from './source.js';
+import { loadSourceText, sha256, sha256File } from './source.js';
 
 /**
  * Prepare — the raw → derived step that runs before every sync touching
@@ -119,13 +120,13 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
     if (original && isFile(dataDir, original)) return;
     const text = isTextFile(rawRel);
     const convertible = isConvertibleFile(rawRel);
-    const maxBytes = convertible ? MAX_CONVERTIBLE_FILE_BYTES : MAX_FILE_BYTES;
+    const maxBytes = convertible ? maxConvertibleBytes(rawRel) : MAX_FILE_BYTES;
     if ((!text && !convertible) || st.size > maxBytes) {
       stats.skipped++;
       return;
     }
 
-    const sourceSha = sha256(fs.readFileSync(abs));
+    const sourceSha = sha256File(abs);
     const meta = readSidecarPart(dataDir, rawRel, 'meta');
     const transcriptRel = convertible ? transcriptPathFor(rawRel) : null;
     const transcript = transcriptRel && isFile(dataDir, transcriptRel) ? fs.readFileSync(safePath(dataDir, transcriptRel)) : null;
