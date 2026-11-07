@@ -9,13 +9,13 @@ import { QuotaGuard, withRefusalRetry } from './quota.js';
 import { loadPack, packsDir, validatePack } from './pack.js';
 import { listRecipes, recipe } from './packs/index.js';
 import './packs/recipes.js';
-import { writeReport } from './report.js';
+import { buildScaleData, renderScale, writeReport } from './report.js';
 import { runEval, scoreRun } from './run.js';
 import { Meter, sumEvents } from './meter.js';
 import { RunStore } from './runstore.js';
 import { DEFAULT_SYSTEMS, SYSTEMS } from './systems/index.js';
 import { EXTERNAL_SYSTEMS, externalPacks, venvPython } from './systems/external.js';
-import { Suite, SUITES } from './types.js';
+import { Suite, SUITES, TASK_TYPES, TaskType } from './types.js';
 
 /**
  * `knode-os eval …` (docs/design/23 §7): build and validate benchmark packs,
@@ -116,8 +116,9 @@ export function registerEvalCommands(program: Command): void {
     .option('--judge <provider>', 'judge CLI provider', 'claude-cli')
     .option('--judge-model <model>', 'judge model', '')
     .option('--limit <n>', 'tasks per pack (stratified by type)')
+    .option('--types <list>', `only these task types, comma-separated (e.g. aggregate,timeline,contradiction,profile,deep-hop,update)`)
     .option('--agent-limit <n>', 'tasks per pack for agent systems', '30')
-    .option('--fraction <f>', 'share of the corpus to use (scale curves)', '1')
+    .option('--fraction <f>', 'share of the corpus to use; above 1, that many times its size with the pack\'s padding (scale curves)', '1')
     .option('--seed <seed>', 'sampling seed', '0')
     .option('--slots <n>', 'concurrent model calls', '6')
     .option('--pack-concurrency <n>', 'packs worked on at once', '1')
@@ -141,6 +142,12 @@ export function registerEvalCommands(program: Command): void {
         judgeProvider: opts.judge,
         judgeModel: opts.judgeModel,
         limit: opts.limit ? Number(opts.limit) : undefined,
+        types: (() => {
+          const types = csv(opts.types);
+          const unknown = types?.filter((t) => !(TASK_TYPES as readonly string[]).includes(t)) ?? [];
+          if (unknown.length) throw new Error(`unknown task types: ${unknown.join(', ')} (known: ${TASK_TYPES.join(', ')})`);
+          return types as TaskType[] | undefined;
+        })(),
         agentLimit: Number(opts.agentLimit),
         fraction: Number(opts.fraction),
         seed: opts.seed,
@@ -201,6 +208,17 @@ export function registerEvalCommands(program: Command): void {
     .action((runDir: string) => {
       const r = writeReport(path.resolve(runDir));
       console.log(r.md);
+    });
+  evalCmd
+    .command('scale <runDirs...>')
+    .description('scale curves: read runs of the same packs at several --fraction values side by side')
+    .option('--out <file>', 'write the Markdown here (default: print it)')
+    .action((runDirs: string[], opts) => {
+      const md = renderScale(buildScaleData(runDirs.map((d) => path.resolve(d))));
+      if (opts.out) {
+        fs.writeFileSync(path.resolve(opts.out), md);
+        console.log(path.resolve(opts.out));
+      } else console.log(md);
     });
   const audit = evalCmd.command('audit').description('human audit of judge verdicts');
   audit

@@ -4,7 +4,8 @@ import { mdTable } from '../bench/util.js';
 import { chartBlock } from '../research/chart.js';
 import { bootstrapMean, holm, mean, pairedBootstrap, round, wilson } from './metrics/stats.js';
 import { RunStore } from './runstore.js';
-import type { BuildRecord, ScoreRecord } from './types.js';
+import { SYSTEMS } from './systems/index.js';
+import { CORPUS_TASK_TYPES, type BuildRecord, type ScoreRecord } from './types.js';
 
 /**
  * `knode-os eval report` (docs/design/23 §8): everything a run measured,
@@ -17,6 +18,18 @@ const GROUP_ANSWERER: Record<string, string> = { knode: 'knode-ask', 'llm-wiki':
 export const BASELINE = 'agent-grep';
 
 const USAGE_METRICS = ['correctness', 'em', 'f1', 'keypoint_recall', 'citation_precision', 'citation_recall', 'abstain_correct', 'false_refusal', 'truthfulness', 'hallucinated', 'injection_success'] as const;
+const LIST_METRICS = ['correctness', 'set_precision', 'set_recall', 'set_f1', 'order_accuracy', 'date_accuracy', 'attribution_recall', 'items_returned', 'em'] as const;
+/** Queries a build is amortized over in the cost-normalized table. */
+export const AMORTIZE_AT = [100, 1000] as const;
+
+/** The build group a system answers from (its build's cost is its own), or none. */
+export function groupOf(system: string): string | null {
+  try {
+    return SYSTEMS[system]?.().group ?? null;
+  } catch {
+    return null;
+  }
+}
 const RETRIEVAL_METRICS = ['recall@2', 'recall@5', 'all@5', 'mrr@10', 'ndcg@10'] as const;
 const EMERGENCE_METRICS = ['label_correct', 'set_recall', 'set_precision', 'set_f1', 'set_recall_latent', 'terms_precision_at_10', 'grounded_share', 'brier'] as const;
 const GENERATION_METRICS = ['coverage', 'precision', 'attribution_precision', 'link_precision', 'link_recall', 'duplicate_rate', 'over_merge', 'contradiction_rate', 'contradicted_rate', 'compression', 'units', 'units_with_sources', 'links_per_page', 'orphan_page_rate'] as const;
@@ -25,6 +38,18 @@ export interface Cell {
   value: number | null;
   n: number;
   ci?: [number, number];
+}
+
+export interface Efficiency {
+  correctness: number | null;
+  /** Mean weighted tokens per query over the system's own answers. */
+  queryTokens: number;
+  per1k: number | null;
+  buildTokens: number;
+  /** null: the build never pays back (the system costs as much per query as agent-grep, or more). */
+  breakEven: number | null;
+  amortized: Record<string, number | null>;
+  n: number;
 }
 
 export interface ReportData {
@@ -38,6 +63,17 @@ export interface ReportData {
   perQuery: Record<string, Record<string, { latencyP50: number; toolCalls: number; weightedTokens: number; costUsd: number; n: number; capped: number; leaked: number; errors: number }>>;
   builds: BuildRecord[];
   breakEven: Record<string, Record<string, number | null>>;
+  /** Corpus-level list tasks (aggregate, timeline, contradiction, profile) per pack and system. */
+  lists: Record<string, Record<string, Record<string, Cell>>>;
+  /**
+   * Correctness for what it costs, per pack and system: correctness per 1k
+   * query weighted tokens, the build's weighted tokens, the queries after
+   * which the build has paid for itself against agent-grep, and correctness
+   * per 1k tokens with the build spread over 100 and 1000 queries.
+   */
+  efficiency: Record<string, Record<string, Efficiency>>;
+  /** Update batches: what each group's incremental build cost, and how each system answered after it. */
+  updates: Record<string, { batch: string; builds: { group: string; ok: boolean; ms: number; weightedTokens: number; embeddingTokens: number; calls: number }[]; correctness: Record<string, Cell> }[]>;
   pooled: { system: string; diff: number; ci: [number, number]; p: number; n: number; significant: boolean }[];
   byType: Record<string, Record<string, Cell>>;
   judgeUsage: { calls: number; weightedTokens: number; costUsd: number };
@@ -132,6 +168,11 @@ export function buildReportData(runDir: string): ReportData {
   const sig = holm(comparisons.map((c) => c.p));
   const pooled = comparisons.map((c, i) => ({ ...c, significant: sig[i] }));
 
+  const corpusTypes = new Set<string>(CORPUS_TASK_TYPES);
+  const lists = grouped(scores, LIST_METRICS, (s) => s.suite === 'usage' && Boolean(s.taskType && corpusTypes.has(s.taskType)));
+  const efficiency = efficiencyOf(usage, perQuery, builds);
+  const updates = updatesOf(builds, answers, scores);
+
   const byType: ReportData['byType'] = {};
   const typeAcc = new Map<string, number[]>();
   for (const s of scores) {
@@ -147,7 +188,58 @@ export function buildReportData(runDir: string): ReportData {
   const judgeEvents = fs.existsSync(path.join(runDir, 'meter.jsonl'))
     ? fs.readFileSync(path.join(runDir, 'meter.jsonl'), 'utf8').split('\n').filter((l) => l.includes('"__judge__"')).length
     : 0;
-  return { run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, builds, breakEven, pooled, byType, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 } };
+  return { run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, builds, breakEven, lists, efficiency, updates, pooled, byType, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 } };
+}
+
+/** Correctness per 1k query tokens, and with the build counted: break-even against agent-grep and amortized over 100 / 1000 queries. */
+export function efficiencyOf(
+  usage: ReportData['usage'], perQuery: ReportData['perQuery'], builds: BuildRecord[],
+): ReportData['efficiency'] {
+  const out: ReportData['efficiency'] = {};
+  for (const [pack, bySystem] of Object.entries(perQuery)) {
+    const grep = bySystem[BASELINE]?.weightedTokens;
+    for (const [system, p] of Object.entries(bySystem)) {
+      const correctness = usage[pack]?.[system]?.correctness?.value ?? null;
+      const group = groupOf(system);
+      const build = group ? builds.find((b) => b.pack === pack && b.system === group && b.ok) : undefined;
+      const buildTokens = build?.usage.weightedTokens ?? 0;
+      const per1k = (tokens: number) => (correctness === null || tokens <= 0 ? null : correctness / (tokens / 1000));
+      const breakEven = grep === undefined || system === BASELINE ? null : p.weightedTokens < grep ? buildTokens / (grep - p.weightedTokens) : null;
+      (out[pack] ??= {})[system] = {
+        correctness, queryTokens: p.weightedTokens, per1k: per1k(p.weightedTokens), buildTokens,
+        breakEven: system === BASELINE ? 0 : breakEven,
+        amortized: Object.fromEntries(AMORTIZE_AT.map((q) => [String(q), per1k(p.weightedTokens + buildTokens / q)])),
+        n: p.n,
+      };
+    }
+  }
+  return out;
+}
+
+/** Per update batch: the incremental build of every group, and correctness of the answers given after it. */
+function updatesOf(builds: BuildRecord[], answers: ReturnType<RunStore['allAnswers']>, scores: ScoreRecord[]): ReportData['updates'] {
+  const out: ReportData['updates'] = {};
+  const batchOf = new Map<string, string>();
+  for (const a of answers) if (a.batch) batchOf.set(`${a.pack}|${a.system}|${a.taskId}`, a.batch);
+  const packs = new Set([...builds.filter((b) => b.system.includes('@')).map((b) => b.pack), ...answers.filter((a) => a.batch).map((a) => a.pack)]);
+  for (const pack of packs) {
+    const batches = [...new Set([...builds.filter((b) => b.pack === pack && b.system.includes('@')).map((b) => b.system.split('@')[1]), ...answers.filter((a) => a.pack === pack && a.batch).map((a) => a.batch!)])].sort();
+    out[pack] = batches.map((batch) => {
+      const acc = new Map<string, number[]>();
+      for (const s of scores) {
+        if (s.pack !== pack || s.metric !== 'correctness' || s.value === null || batchOf.get(`${s.pack}|${s.system}|${s.taskId}`) !== batch) continue;
+        (acc.get(s.system) ?? acc.set(s.system, []).get(s.system)!).push(s.value);
+      }
+      return {
+        batch,
+        builds: builds.filter((b) => b.pack === pack && b.system.endsWith(`@${batch}`)).map((b) => ({
+          group: b.system.split('@')[0], ok: b.ok, ms: b.ms, weightedTokens: b.usage.weightedTokens, embeddingTokens: b.usage.embeddingTokens, calls: b.usage.calls,
+        })),
+        correctness: Object.fromEntries([...acc].map(([sys, vs]) => [sys, cell(vs)])),
+      };
+    });
+  }
+  return out;
 }
 
 const fmt = (c: Cell | undefined, digits = 2) => {
@@ -203,6 +295,33 @@ export function renderReport(d: ReportData): string {
         ], source: 'answers.jsonl, scores.jsonl' }), '');
       }
     }
+    const l = d.lists[pack];
+    if (l) lines.push('### Use: corpus-level lists (aggregate, timeline, contradiction, profile)', '', 'Correctness here is set F1 (recall where the gold is a sample), times order accuracy for a timeline; em is a count\'s exact number.', '', table(l, LIST_METRICS), '');
+    const eff = d.efficiency[pack];
+    if (eff && Object.values(eff).some((x) => x.correctness !== null)) {
+      lines.push('### Correctness for its cost', '');
+      lines.push(`Per 1k weighted query tokens; "with build @ N" spreads the build's weighted tokens over N queries; break-even is the queries after which the build has cost less than answering with ${BASELINE}.`, '');
+      lines.push(mdTable(['system', 'correctness', 'tokens / query', 'per 1k tokens', 'build tokens', ...AMORTIZE_AT.map((q) => `with build @ ${q}`), 'break-even queries'],
+        Object.entries(eff).sort().map(([s, x]) => [
+          s, x.correctness === null ? '—' : round(x.correctness, 3).toFixed(3), fmtNum(x.queryTokens), x.per1k === null ? '—' : round(x.per1k, 4).toFixed(4), fmtNum(x.buildTokens),
+          ...AMORTIZE_AT.map((q) => (x.amortized[String(q)] === null ? '—' : round(x.amortized[String(q)]!, 4).toFixed(4))),
+          s === BASELINE ? '—' : x.breakEven === null ? 'never' : fmtNum(x.breakEven),
+        ])), '');
+    }
+    const ups = d.updates[pack];
+    if (ups?.length) {
+      lines.push('### Update stream', '');
+      const sys = [...new Set(ups.flatMap((u) => Object.keys(u.correctness)))].sort();
+      const groups = [...new Set(ups.flatMap((u) => u.builds.map((b) => b.group)))].sort();
+      lines.push(mdTable(['batch', ...groups.map((g) => `${g} weighted tokens`), ...sys.map((x) => `${x} correctness`)], ups.map((u) => [
+        u.batch,
+        ...groups.map((g) => {
+          const b = u.builds.find((x) => x.group === g);
+          return b ? (b.ok ? fmtNum(b.weightedTokens) : 'failed') : '—';
+        }),
+        ...sys.map((x) => fmt(u.correctness[x])),
+      ])), '');
+    }
     const e = d.emergence[pack];
     if (e) lines.push('### Emergence', '', table(e, EMERGENCE_METRICS), '');
     const g = d.generation[pack];
@@ -238,4 +357,83 @@ export function writeReport(runDir: string): { md: string; json: string; data: R
   fs.writeFileSync(md, renderReport(data));
   fs.writeFileSync(json, JSON.stringify(data, null, 2));
   return { md, json, data };
+}
+
+/* -------------------------------- scale curves -------------------------------- */
+
+export interface ScalePoint {
+  run: string;
+  fraction: number;
+  documents: number | null;
+  chars: number | null;
+  correctness: Cell;
+  /** Correctness on the corpus-level lists alone. */
+  listCorrectness: Cell;
+  queryTokens: number | null;
+  buildTokens: number | null;
+  capped: number;
+  n: number;
+}
+
+/**
+ * Scale curves (docs/design/23 §4): the same packs and systems run at several
+ * `--fraction`s (1, 3, 10 — padding above 1), one run directory each, read
+ * side by side — where agent-grep and long-context degrade, and whether a
+ * wiki holds.
+ */
+export function buildScaleData(runDirs: string[]): Record<string, Record<string, ScalePoint[]>> {
+  const out: Record<string, Record<string, ScalePoint[]>> = {};
+  for (const dir of runDirs) {
+    const d = buildReportData(dir);
+    const fraction = Number(d.run?.fraction ?? 1);
+    for (const pack of d.packs) {
+      const staged = d.run?.staged?.[pack];
+      const systems = new Set([...Object.keys(d.usage[pack] ?? {}), ...Object.keys(d.perQuery[pack] ?? {})]);
+      for (const system of systems) {
+        const pq = d.perQuery[pack]?.[system];
+        ((out[pack] ??= {})[system] ??= []).push({
+          run: d.run?.id ?? path.basename(dir), fraction, documents: staged?.documents ?? null, chars: staged?.chars ?? null,
+          correctness: d.usage[pack]?.[system]?.correctness ?? { value: null, n: 0 },
+          listCorrectness: d.lists[pack]?.[system]?.correctness ?? { value: null, n: 0 },
+          queryTokens: pq?.weightedTokens ?? null, buildTokens: d.efficiency[pack]?.[system]?.buildTokens ?? null,
+          capped: pq?.capped ?? 0, n: pq?.n ?? 0,
+        });
+      }
+    }
+  }
+  for (const bySystem of Object.values(out)) for (const pts of Object.values(bySystem)) pts.sort((a, b) => a.fraction - b.fraction);
+  return out;
+}
+
+export function renderScale(data: Record<string, Record<string, ScalePoint[]>>): string {
+  const lines: string[] = ['# Knowledge benchmark — scale curves', ''];
+  lines.push('One run per corpus size (`--fraction`; above 1 the pack\'s padding is added). Correctness over all usage tasks, and over the corpus-level lists alone; weighted tokens per query; the build\'s weighted tokens. A system missing at a size was not applicable there (long-context past its window) or its build failed.', '');
+  for (const [pack, bySystem] of Object.entries(data).sort()) {
+    const fractions = [...new Set(Object.values(bySystem).flatMap((p) => p.map((x) => x.fraction)))].sort((a, b) => a - b);
+    const sizeOf = (f: number) => Object.values(bySystem).flatMap((p) => p).find((x) => x.fraction === f && x.documents !== null);
+    lines.push(`## ${pack}`, '');
+    lines.push(fractions.map((f) => {
+      const s = sizeOf(f);
+      return `- ${f}×: ${s ? `${s.documents} documents, ${fmtNum(s.chars)} characters` : 'size not recorded'}`;
+    }).join('\n'), '');
+    const at = (system: string, f: number) => bySystem[system].find((x) => x.fraction === f);
+    const systems = Object.keys(bySystem).sort();
+    lines.push(mdTable(['system', ...fractions.map((f) => `correctness @${f}×`), ...fractions.map((f) => `lists @${f}×`), ...fractions.map((f) => `tokens/query @${f}×`), ...fractions.map((f) => `build tokens @${f}×`)],
+      systems.map((sys) => [
+        sys,
+        ...fractions.map((f) => fmt(at(sys, f)?.correctness)),
+        ...fractions.map((f) => fmt(at(sys, f)?.listCorrectness)),
+        ...fractions.map((f) => fmtNum(at(sys, f)?.queryTokens)),
+        ...fractions.map((f) => fmtNum(at(sys, f)?.buildTokens || null)),
+      ])), '');
+    if (fractions.length >= 2) {
+      const plotted = systems.filter((sys) => bySystem[sys].some((x) => x.correctness.value !== null)).slice(0, 8);
+      lines.push(chartBlock({
+        type: fractions.length >= 3 ? 'line' : 'bar', title: `${pack}: correctness by corpus size`, unit: 'correctness (0–1)', x: fractions.map((f) => `${f}×`),
+        series: plotted.map((sys) => ({ name: sys, values: fractions.map((f) => (at(sys, f)?.correctness.value === null || at(sys, f) === undefined ? null : round(at(sys, f)!.correctness.value!, 3))) })),
+        source: 'scores.jsonl of each run',
+      }), '');
+    }
+  }
+  return lines.join('\n');
 }

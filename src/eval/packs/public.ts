@@ -57,6 +57,8 @@ const MUSIQUE_LICENSE = 'CC-BY-4.0 (MuSiQue; HippoRAG 2 release)';
 
 async function buildMusique(dir: string, ctx: RecipeContext) {
   const want = Number(ctx.options.questions ?? 25);
+  // deeper questions only: 3hop1, 3hop2, 4hop1 … (the composition type's leading digit)
+  const minHops = Number(ctx.options.minHops ?? 2);
   const limit = ctx.limit ?? Infinity;
   const seed = ctx.seed ?? 0;
   const writer = new PackWriter(dir, {
@@ -66,7 +68,7 @@ async function buildMusique(dir: string, ctx: RecipeContext) {
     domain: 'public',
     languages: ['en'],
     description: `About ${want} MuSiQue questions (2–4 hops, drawn across composition types) with every paragraph they come with — supporting and distractor Wikipedia paragraphs, one document each — from the HippoRAG 2 release. Gold answers with their aliases (exact match), supporting paragraphs as evidence, and the bridges between consecutive hops as gold links.`,
-    builder: { recipe: 'public-musique', options: { questions: want } },
+    builder: { recipe: 'public-musique', options: { questions: want, minHops } },
   });
   const qs = await fetchJson<MusiqueQuestion[]>(`${HIPPO}/musique.json`, { license: MUSIQUE_LICENSE });
   const corpus = await fetchJson<{ title: string; text: string }[]>(`${HIPPO}/musique_corpus.json`, { license: MUSIQUE_LICENSE });
@@ -87,7 +89,8 @@ async function buildMusique(dir: string, ctx: RecipeContext) {
 
   // questions across composition types (2hop, 3hop1, 3hop2, 4hop1…) whose supporting paragraphs fit the budget
   const chosen: MusiqueQuestion[] = [];
-  for (const q of stratified(qs.json.filter((x) => x.answerable), (x) => x.id.split('__')[0], (x) => x.id, seed)) {
+  const hopsOf = (q: MusiqueQuestion) => Number(q.id.match(/^(\d)hop/)?.[1] ?? q.question_decomposition.length);
+  for (const q of stratified(qs.json.filter((x) => x.answerable && hopsOf(x) >= minHops), (x) => x.id.split('__')[0], (x) => x.id, seed)) {
     if (chosen.length >= want) break;
     const support = q.paragraphs.filter((p) => p.is_supporting);
     const fresh = support.filter((p) => !docs.has(keyOf(p))).length;
@@ -105,10 +108,12 @@ async function buildMusique(dir: string, ctx: RecipeContext) {
     const hops = q.question_decomposition.map((h) => (h.paragraph_support_idx != null ? byIdx.get(h.paragraph_support_idx) : undefined));
     const support = [...hops.filter((p): p is NonNullable<typeof p> => Boolean(p)), ...q.paragraphs.filter((p) => p.is_supporting)];
     const evidence = [...new Set(support.map((p) => docOf(p).path))].map((doc) => ({ doc }));
+    // a question of three or four hops over as many paragraphs is a deep hop
+    const deep = hopsOf(q) >= 3 && evidence.length >= 3;
     tasks.push({
-      id: `musique-${q.id}`, suite: 'usage', type: 'multi-hop', lang: 'en', question: q.question, answer: q.answer,
+      id: `musique-${q.id}`, suite: 'usage', type: deep ? 'deep-hop' : 'multi-hop', lang: 'en', question: q.question, answer: q.answer,
       answers: [...new Set([q.answer, ...q.answer_aliases])], scoring: 'exact', evidence, primary: true,
-      meta: { source: 'musique', composition: q.id.split('__')[0], hops: q.question_decomposition.map((h) => ({ question: h.question, answer: h.answer })) },
+      meta: { source: 'musique', composition: q.id.split('__')[0], hops: hopsOf(q), decomposition: q.question_decomposition.map((h) => ({ question: h.question, answer: h.answer })) },
     });
     if (q.answer_aliases.length) writer.addAlias({ canonical: q.answer, aliases: q.answer_aliases });
     // a hop that refers to an earlier one (#1, #2 …) bridges their paragraphs

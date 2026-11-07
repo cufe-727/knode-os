@@ -17,6 +17,7 @@ import { dirBytes, listFiles } from '../pack.js';
 import { citationsIn } from '../prompts.js';
 import type { Citation, KnowledgeUnit } from '../types.js';
 import { AGENT_BRIEF } from './agents.js';
+import { WIKI_SOURCES_BRIEF, wikiWithSources } from './llm-wiki.js';
 import { recordAgent, shimClient, SystemEnv, SystemUnderTest } from './types.js';
 import { evalTempDir } from '../tmp.js';
 
@@ -27,11 +28,12 @@ import { evalTempDir } from '../tmp.js';
  * built the way `serve` builds — sync, then document passes until the queue
  * and the summaries are done, then wiki generation and refinement.
  *
- * One build, four ways to use it: `knode-ask` (the cited-answer pipeline),
+ * One build, five ways to use it: `knode-ask` (the cited-answer pipeline),
  * `knode-sag` (multi-hop retrieval, scored on retrieval), `agent-knode` (the
  * same Codex agent as the grep baseline, given knode's MCP retrieval tools
- * instead of the files), and `agent-knode-wiki` (that agent reading the
- * generated wiki). PGlite admits one process at a time, so the in-process
+ * instead of the files), `agent-knode-wiki` (that agent reading the
+ * generated wiki) and `agent-knode-wiki-sources` (reading the wiki with the
+ * sources beside it, the wiki as a navigation layer). PGlite admits one process at a time, so the in-process
  * context is closed before an MCP agent opens the index.
  */
 
@@ -305,6 +307,39 @@ export function agentKnodeWiki(): SystemUnderTest {
           text: r.text,
           citations: citationsIn(r.text, docs),
           retrieved: [...new Set(viaPages)],
+          toolCalls: r.toolCalls,
+          capped: r.capped,
+          leaked: r.leaked,
+          error: r.error,
+        };
+      } finally {
+        copy.cleanup();
+      }
+    },
+  });
+}
+
+export function agentKnodeWikiSources(): SystemUnderTest {
+  return knodeSystem('agent-knode-wiki-sources', 'Codex agent reading the knode-generated wiki and the sources', 'agent', true, {
+    async answer(task, prompt, env) {
+      const s = stateFor(env);
+      await env.quota.wait();
+      // the pages cite raw/docs/<path>: the sources sit where those links point
+      const copy = wikiWithSources(path.join(s.ws, 'wiki'), env.staged.dir, 'wiki', 'raw/docs');
+      try {
+        const r = await runAgent({
+          cwd: copy.dir,
+          sandbox: 'read-only',
+          model: env.models.model,
+          effort: env.models.answerEffort,
+          prompt: `${WIKI_SOURCES_BRIEF('wiki/, generated pages; sources/ holds one summary per document', 'raw/docs/')}\n\n${prompt}`,
+        });
+        recordAgent(env.meter, { system: 'agent-knode-wiki-sources', stage: 'agent', task: task.id }, env.models.model, r);
+        const docs = new Set(env.staged.docs.map((d) => d.path));
+        return {
+          text: r.text,
+          citations: citationsIn(r.text, docs),
+          retrieved: [...new Set(r.filesTouched.flatMap((f) => toCorpus(s, f)))],
           toolCalls: r.toolCalls,
           capped: r.capped,
           leaked: r.leaked,

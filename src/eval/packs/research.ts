@@ -69,7 +69,7 @@ async function buildResearch(dir: string, ctx: RecipeContext) {
   const n = ctx.limit ?? 100;
   const writer = new PackWriter(dir, {
     id: 'research-ai',
-    version: 1,
+    version: 2,
     title: 'Research on AI agents and LLMs (arXiv, 2025-H2)',
     domain: 'research',
     languages: ['en'],
@@ -141,7 +141,7 @@ async function buildResearch(dir: string, ctx: RecipeContext) {
     }
     writer.setProfile({ limits, problems, themes: themes.themes ?? [] });
   }
-  return finishDocpack({ writer, docs, lang: 'en', tasks, plan: { single: 20, multi: 10, unanswerable: 5, global: 3 }, perDoc: 5 }, ctx);
+  return finishDocpack({ writer, docs, lang: 'en', tasks, plan: { single: 20, multi: 10, unanswerable: 5, global: 3 }, perDoc: 5, corpus: { profile: 12, timeline: 6, contradiction: 10, aggregate: 14, deep: 10 } }, ctx);
 }
 
 export function registerResearchRecipes(): void {

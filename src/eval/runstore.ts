@@ -55,6 +55,10 @@ export interface RunMeta {
   seed: string | number;
   limit: number | null;
   versions: Record<string, string>;
+  /** What each pack staged: documents (padding among them, for a fraction above 1) and characters. */
+  staged?: Record<string, { documents: number; padded: number; chars: number; tasks: number }>;
+  /** Task types the run was limited to (`--types`). */
+  types?: string[];
   notes?: string;
 }
 

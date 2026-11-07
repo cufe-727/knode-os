@@ -159,12 +159,12 @@ async function buildFinanceCn(dir: string, ctx: RecipeContext) {
   if (!fs.existsSync(raw)) throw new Error(`finance-cn reads a local knode workspace; none at ${workspace} (set --options '{"workspace":"…"}')`);
   const writer = new PackWriter(dir, {
     id: 'finance-cn',
-    version: 1,
+    version: 2,
     title: 'Private: a frozen slice of the local finance knowledge base (zh)',
     domain: 'finance',
     languages: ['zh'],
     description: `PRIVATE — DO NOT SHARE. A frozen slice of the user's own local knode finance workspace (${n} documents, read-only copies): research notes and captured web pages, filings and reports (converted text) from raw/docs/research, and Chinese market commentary from raw/docs/content-markdown, drawn across sub-folders by seed. The corpus is personal material: keep this pack, its runs and reports on this machine; never upload, publish or share them. All gold is drafted by the author model.`,
-    builder: { recipe: 'finance-cn', options: { documents: n } },
+    builder: { recipe: 'finance-cn', options: { documents: n, padding: Number(ctx.options.padding ?? 0) } },
   });
   writer.addSource({ url: `file://${raw}`, license: 'private: the user\'s own knowledge base — must not be shared', retrievedAt: new Date().toISOString(), note: 'raw/docs/research and raw/docs/content-markdown; sidecar content.md preferred where it exists' });
 
@@ -179,12 +179,17 @@ async function buildFinanceCn(dir: string, ctx: RecipeContext) {
   // research by project (or its web captures), commentary by author
   const stratum = (rel: string) => rel.split('/').slice(0, 2).join('/');
   const quotas: [string, number][] = [['research/', Math.round(n * 0.4)], ['content-markdown/', n - Math.round(n * 0.4)]];
+  // padding for scale curves: more of the same workspace, read the same way (local files: nothing is downloaded)
+  const padding = Number(ctx.options.padding ?? 0);
   const docs: Doc[] = [];
+  const spare: Doc[] = [];
   let skipped = 0;
   for (const [prefix, quota] of quotas) {
     let taken = 0;
+    let extra = 0;
+    const spareQuota = padding > 1 ? Math.ceil(quota * (padding - 1) * 1.5) + 20 : 0;
     for (const rel of stratified(files.filter((f) => f.startsWith(prefix)), stratum, (f) => f, seed)) {
-      if (taken >= quota) break;
+      if (taken >= quota && extra >= spareQuota) break;
       const text = textOf(rel)?.trim();
       if (!text || text.length < MIN_CHARS || text.length > MAX_CHARS || cjkShare(text) < 0.2) {
         skipped++;
@@ -192,15 +197,25 @@ async function buildFinanceCn(dir: string, ctx: RecipeContext) {
       }
       const date = workspaceDate(rel, text);
       const title = text.match(/^title:\s*["']?(.+?)["']?\s*$/m)?.[1] ?? text.match(/^#\s+(.+)$/m)?.[1] ?? path.basename(rel);
-      docs.push({
+      const doc: Doc = {
         path: rel.endsWith('.md') ? rel : `${rel}.md`, title: title.slice(0, 160), ...(date ? { date } : {}), lang: 'zh',
         source: stratum(rel), kind: prefix === 'research/' ? 'research' : 'commentary', text: `${text}\n`,
-      });
-      taken++;
+      };
+      if (taken < quota) {
+        docs.push(doc);
+        taken++;
+      } else {
+        spare.push(doc);
+        extra++;
+      }
     }
   }
-  ctx.log(`finance workspace: ${docs.length} documents from ${new Set(docs.map((d) => d.source)).size} sub-folders (${skipped} skipped: too long, too short, not Chinese or not text)`);
-  return finishDocpack({ writer, docs, lang: 'zh', plan: { single: 20, multi: 12, temporal: 8, unanswerable: 5, global: 3 }, perDoc: 5 }, ctx);
+  ctx.log(`finance workspace: ${docs.length} documents from ${new Set(docs.map((d) => d.source)).size} sub-folders (${skipped} skipped: too long, too short, not Chinese or not text)${spare.length ? `; ${spare.length} padding candidates` : ''}`);
+  return finishDocpack({
+    writer, docs, lang: 'zh', plan: { single: 20, multi: 12, temporal: 8, unanswerable: 5, global: 3 }, perDoc: 5,
+    corpus: { profile: 12, timeline: 10, contradiction: 10, aggregate: 12, deep: 10 },
+    ...(padding > 1 ? { padding: { candidates: spare, multiple: padding } } : {}),
+  }, ctx);
 }
 
 export function registerFinanceRecipes(): void {

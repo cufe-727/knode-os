@@ -16,6 +16,7 @@ import { EmbeddingBudget, QuotaGuard } from './quota.js';
 import { recordKey, RunMeta, RunStore } from './runstore.js';
 import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
+import { scoreLists } from './score/lists.js';
 import { scoreUsage } from './score/usage.js';
 import { ChatBackend, ClientBackend, CodexBackend, startShim } from './shim.js';
 import { closeAdapters } from './systems/external.js';
@@ -23,7 +24,7 @@ import { makeSystems } from './systems/index.js';
 import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
 import { SystemEnv, SystemUnderTest, taggedEmbedder } from './systems/types.js';
 import { extractFinalAnswer } from './metrics/text.js';
-import { AnswerRecord, BuildRecord, emptyUsage, Suite, SUITES, Task } from './types.js';
+import { AnswerRecord, BuildRecord, emptyUsage, Suite, SUITES, Task, TaskType } from './types.js';
 
 /**
  * `knode-os eval run` (docs/design/23 §7). For each pack: stage the corpus,
@@ -62,6 +63,8 @@ export interface RunOptions {
   embedding?: 'workspace' | 'local';
   /** At most this many tasks per pack (stratified by type), and fewer for agents. */
   limit?: number;
+  /** Only tasks of these types (a focused run: the corpus-level types, deep hops, updates). */
+  types?: TaskType[];
   agentLimit?: number;
   fraction?: number;
   seed?: string | number;
@@ -201,6 +204,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     seed,
     limit: opts.limit ?? null,
     versions: {},
+    ...(opts.types?.length ? { types: opts.types } : {}),
   };
   store.writeMeta(meta);
 
@@ -240,16 +244,20 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       loaded.push({ pack, staged });
       corpusDocs.set(pack.manifest.id, new Set(staged.docs.map((d) => d.path)));
       for (const t of pack.tasks) tasksByKey.set(`${pack.manifest.id}|${t.id}`, t);
-      progress(`pack ${pack.manifest.id}: ${staged.docs.length} documents, ${staged.tasks.length} tasks`);
+      progress(`pack ${pack.manifest.id}: ${staged.docs.length} documents${staged.padded ? ` (${staged.padded} of them padding)` : ''}, ${staged.tasks.length} tasks`);
+      const chars = staged.docs.reduce((n, d) => n + fs.readFileSync(path.join(staged.dir, d.path), 'utf8').length, 0);
+      meta.staged = { ...meta.staged, [pack.manifest.id]: { documents: staged.docs.length, padded: staged.padded, chars, tasks: staged.tasks.length } };
+      store.writeMeta(meta);
 
-      const systems = makeSystems(opts.systems).filter((s) => s.applicable?.(pack) ?? true);
+      const systems = makeSystems(opts.systems).filter((s) => s.applicable?.(pack, staged) ?? true);
       for (const s of systems) if (s.answers && s.kind !== 'reference' && s.cites !== false) citing.add(s.id);
       const groups = new Map<string, SystemUnderTest[]>();
       for (const s of systems) (groups.get(s.group) ?? groups.set(s.group, []).get(s.group)!).push(s);
 
       const failed = new Set<string>();
-      const allTasks = selectTasks(staged.tasks.filter((t) => !t.afterUpdate), suites, opts.limit, seed);
-      const updateTasks = suites.has('update') ? staged.tasks.filter((t) => t.afterUpdate) : [];
+      const typed = opts.types?.length ? staged.tasks.filter((t) => opts.types!.includes(t.type)) : staged.tasks;
+      const allTasks = selectTasks(typed.filter((t) => !t.afterUpdate), suites, opts.limit, seed);
+      const updateTasks = suites.has('update') ? typed.filter((t) => t.afterUpdate) : [];
 
       for (const [group, members] of groups) {
         const env: SystemEnv = {
@@ -285,8 +293,10 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         for (const s of members) await s.release?.(env);
       }
 
-      // update batches: apply each to the staged corpus, let every system that can update, then ask its tasks
-      const batches = [...new Set(updateTasks.map((t) => t.afterUpdate!))].sort();
+      // update batches, in order and cumulatively up to the last one a task asks after: apply each to the
+      // staged corpus, let every system that can update (its cost recorded per batch), then ask that batch's tasks
+      const last = updateTasks.map((t) => t.afterUpdate!).sort().at(-1);
+      const batches = last ? pack.updates.filter((b) => b <= last) : [];
       for (const batch of batches) {
         const files = stageUpdate(pack, staged, batch);
         for (const f of files) corpusDocs.get(pack.manifest.id)!.add(f);
@@ -307,8 +317,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
               ok = false;
               error = err instanceof Error ? err.message : String(err);
             }
-            store.putBuild({ key, pack: pack.manifest.id, system: `${group}@${batch}`, ok, error, ms: Date.now() - t0, usage: meter.usage((e) => e.system === group, mark), stages: meter.stages(group, mark), bytes: 0, notes: { batch, files: files.length }, at: new Date().toISOString() });
-          } else if (!updater) {
+            store.putBuild({ key, pack: pack.manifest.id, system: `${group}@${batch}`, ok, error, ms: Date.now() - t0, usage: meter.usage((e) => e.system === group, mark), stages: meter.stages(group, mark), bytes: 0, notes: { batch, files: files.length, tasks: tasks.length }, at: new Date().toISOString() });
+          } else {
+            // nothing to update, or a resumed run that updated already: reopen on the staged corpus as it now is
             for (const s of members) await s.reopen?.(env).catch(() => {});
           }
           for (const s of members) await answerAll(store, meter, env, s, tasks, fraction, seed, 1, progress, batch);
@@ -365,6 +376,7 @@ export async function scoreAnswers(
   if (!answers.length) return 0;
   progress(`scoring ${answers.length} answers`);
   for (const r of await scoreUsage({ answers, tasks: ctx.tasks, citing: ctx.citing }, judge)) store.putScore(r);
+  for (const r of await scoreLists({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge)) store.putScore(r);
   for (const r of await scoreEmergence({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge)) store.putScore(r);
   return answers.length;
 }
@@ -466,7 +478,7 @@ async function answerAll(
     try {
       const a = await s.answer!(t, taskPrompt(t), env);
       rec = {
-        key, pack: env.pack.manifest.id, system: s.id, taskId: t.id, at: new Date().toISOString(),
+        key, pack: env.pack.manifest.id, system: s.id, taskId: t.id, ...(batch ? { batch } : {}), at: new Date().toISOString(),
         text: a.text, finalAnswer: extractFinalAnswer(a.text),
         citations: a.citations ?? citationsIn(a.text, docs), retrieved: a.retrieved ?? [], toolCalls: a.toolCalls ?? 0,
         ...(a.capped ? { capped: true } : {}), ...(a.leaked?.length ? { leaked: a.leaked } : {}), ...(a.error ? { error: a.error } : {}),
@@ -474,7 +486,7 @@ async function answerAll(
       };
     } catch (err) {
       rec = {
-        key, pack: env.pack.manifest.id, system: s.id, taskId: t.id, at: new Date().toISOString(),
+        key, pack: env.pack.manifest.id, system: s.id, taskId: t.id, ...(batch ? { batch } : {}), at: new Date().toISOString(),
         text: '', finalAnswer: '', citations: [], retrieved: [], toolCalls: 0, error: err instanceof Error ? err.message : String(err),
         usage: meter.usage((e) => e.system === s.id && e.task === t.id, mark), ms: Date.now() - t0,
       };

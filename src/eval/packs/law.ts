@@ -223,6 +223,130 @@ function crossRefs(law: ParsedLaw, a: Article): { tail: string; internal: boolea
   return out;
 }
 
+/** Legal terms whose articles a corpus-level task lists: spread across chapters, so the list needs many documents. */
+const LAW_TERMS = [
+  '国务院', '书面', '公告', '登记', '股东会', '董事会', '监事会', '职工', '工会', '劳动报酬', '经济补偿', '违约金', '期限届满', '三十日', '十五日', '六个月', '诉讼时效',
+  '法定代表人', '个人信息处理者', '网络运营者', '关键信息基础设施', '数据处理', '未成年人', '监护人', '代理人', '解除合同', '不可抗力', '信息披露', '证券交易所', '上市公司',
+  '内幕信息', '试用期', '劳务派遣', '竞业限制', '网信部门', '公安机关', '责令改正', '没收违法所得', '有关主管部门', '国家标准', '合法权益', '损害赔偿', '善意相对人', '担保',
+  '人民法院', '仲裁', '县级以上', '行政法规', '处分', '罚款', '警告', '吊销', '营业执照', '注册资本', '出资', '清算', '分立', '合并', '债权人', '债务人', '抵押', '质押',
+  '要约', '格式条款', '撤销', '无效', '追认', '公示', '备案', '许可', '保密', '安全评估', '出境', '敏感个人信息', '删除', '社会保险', '工资', '加班', '国务院证券监督管理机构',
+  '投资者', '中介机构', '会计师事务所', '公司章程', '有限责任公司', '股份有限公司', '国家机关', '个人信息', '重要数据', '网络产品', '监督管理', '民事法律行为', '相对人', '第三人',
+];
+
+interface LawArticle {
+  law: ParsedLaw;
+  no: string;
+  text: string;
+  first: string;
+  doc: string;
+}
+
+/** `第六十八条` → `第68条`: the other way an answer writes an article number. */
+const arabicArticle = (no: string) => `第${cnNumber(no)}条`;
+
+/**
+ * Corpus-level tasks from the statutes themselves, without a model: which
+ * articles of a law mention a term (an exact list, and a count), the laws in
+ * order of commencement and of their latest amendment, and chains through
+ * internal cross-references (article A cites B, B cites C, each in another
+ * chapter). A law-scoped task's gold is closed under its law's folder, so
+ * padding from other laws cannot change it.
+ */
+function statuteCorpusTasks(parsed: ParsedLaw[], articles: LawArticle[], headerDocs: { law: ParsedLaw; doc: string; quote: string; date: string }[], commenced: { law: ParsedLaw; date: string; doc: string; quote: string }[], seed: string | number): Task[] {
+  const tasks: Task[] = [];
+  const dirOf = (law: ParsedLaw) => `${law.short}/`;
+  const ev = (a: LawArticle) => ({ doc: a.doc, quote: a.first });
+  const candidates: { law: ParsedLaw; term: string; hits: LawArticle[] }[] = [];
+  for (const law of parsed) {
+    const own = articles.filter((a) => a.law === law);
+    for (const term of LAW_TERMS) {
+      const hits = own.filter((a) => a.text.includes(term));
+      if (hits.length >= 5 && hits.length <= 25 && new Set(hits.map((a) => a.doc)).size >= 5) candidates.push({ law, term, hits });
+    }
+  }
+  const ordered = bySeed(candidates, seed, (c) => `${c.law.short}|${c.term}`);
+  // lists first, a law at a time; counts from the rest
+  const perLaw = new Map<string, number>();
+  const listed: typeof candidates = [];
+  for (const c of ordered) {
+    if ((perLaw.get(c.law.short) ?? 0) >= 6 || listed.length >= 26) continue;
+    perLaw.set(c.law.short, (perLaw.get(c.law.short) ?? 0) + 1);
+    listed.push(c);
+  }
+  for (const c of listed) {
+    tasks.push({
+      id: `law-cn-terms-${hid(c.law.short, c.term)}`, suite: 'usage', type: 'aggregate', lang: 'zh',
+      question: `在收录的《${c.law.row.title}》条文中，哪些条文提到了“${c.term}”？请列出全部条号。`, scoring: 'set',
+      items: c.hits.map((a) => ({ label: `第${a.no}条`, aliases: [arabicArticle(a.no)], weight: 1, docs: [a.doc] })),
+      list: { match: 'alias', ordered: false, maxItems: Math.min(40, c.hits.length + 10), requireDocs: false, primary: 'f1' },
+      closedWorld: { terms: [], prefixes: [dirOf(c.law)] }, evidence: c.hits.map(ev), primary: tasks.length < 6, meta: { origin: 'model-free', term: c.term },
+    });
+  }
+  // counts: terms no list asks about first, then listed ones (a count is a different question of the same gold)
+  for (const c of [...ordered.filter((x) => !listed.includes(x)), ...listed].slice(0, 10)) {
+    tasks.push({
+      id: `law-cn-count-${hid(c.law.short, c.term)}`, suite: 'usage', type: 'aggregate', lang: 'zh',
+      question: `在收录的《${c.law.row.title}》条文中，提到“${c.term}”的条文一共有几条？`, answer: String(c.hits.length), scoring: 'count',
+      closedWorld: { terms: [], prefixes: [dirOf(c.law)] }, evidence: c.hits.map(ev), meta: { origin: 'model-free', term: c.term },
+    });
+  }
+  // the laws in order: of commencement, and of the latest adoption or amendment
+  if (new Set(commenced.map((c) => c.doc)).size >= 5) {
+    const items = [...commenced].sort((a, b) => a.law.row.effective_date.localeCompare(b.law.row.effective_date));
+    tasks.push({
+      id: 'law-cn-commenced-order', suite: 'usage', type: 'timeline', lang: 'zh',
+      question: '按施行日期从早到晚，列出收录的这些法律，并注明各自的施行日期。', scoring: 'set',
+      items: items.map((c) => ({ label: c.law.short, aliases: [c.law.row.title], weight: 1, date: c.law.row.effective_date.slice(0, 10), docs: [c.doc] })),
+      list: { match: 'alias', ordered: true, maxItems: 15, requireDocs: false, primary: 'f1' }, closedWorld: { terms: [], prefixes: items.map((c) => dirOf(c.law)) },
+      evidence: items.map((c) => ({ doc: c.doc, quote: c.quote })), meta: { origin: 'model-free' },
+    });
+  }
+  const isoOf = (cn: string) => {
+    const m = cn.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+    return m ? `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}` : '';
+  };
+  const amended = headerDocs.filter((h) => isoOf(h.date));
+  if (new Set(amended.map((h) => h.doc)).size >= 5) {
+    const items = [...amended].sort((a, b) => isoOf(a.date).localeCompare(isoOf(b.date)));
+    tasks.push({
+      id: 'law-cn-amended-order', suite: 'usage', type: 'timeline', lang: 'zh',
+      question: '按最近一次通过、修正或修订的时间从早到晚，列出收录的这些法律，并注明日期。', scoring: 'set',
+      items: items.map((h) => ({ label: h.law.short, aliases: [h.law.row.title], weight: 1, date: isoOf(h.date), docs: [h.doc] })),
+      list: { match: 'alias', ordered: true, maxItems: 15, requireDocs: false, primary: 'f1' }, closedWorld: { terms: [], prefixes: items.map((h) => dirOf(h.law)) },
+      evidence: items.map((h) => ({ doc: h.doc, quote: h.quote })), meta: { origin: 'model-free' },
+    });
+    const years = items.map((h) => Number(isoOf(h.date).slice(0, 4))).sort((a, b) => a - b);
+    const cut = years[Math.floor(years.length / 2)];
+    const after = items.filter((h) => Number(isoOf(h.date).slice(0, 4)) >= cut);
+    tasks.push({
+      id: 'law-cn-amended-since', suite: 'usage', type: 'aggregate', lang: 'zh',
+      question: `收录的法律中，哪些是在${cut}年或之后通过或最近一次修改的？`, scoring: 'set',
+      items: after.map((h) => ({ label: h.law.short, aliases: [h.law.row.title], weight: 1, docs: [h.doc] })),
+      list: { match: 'alias', ordered: false, maxItems: 15, requireDocs: false, primary: 'f1' }, closedWorld: { terms: [], prefixes: items.map((h) => dirOf(h.law)) },
+      evidence: items.map((h) => ({ doc: h.doc, quote: h.quote })), meta: { origin: 'model-free' },
+    });
+  }
+  // chains through cross-references: A → B → C, each article in another chapter
+  const byNo = new Map(articles.map((a) => [`${a.law.short}|${a.no}`, a]));
+  const refsOf = (a: LawArticle) => crossRefs(a.law, { no: a.no, lines: [a.text] }).filter((r) => r.internal).map((r) => byNo.get(`${a.law.short}|${r.tail.split(' 第')[1].replace(/条$/, '')}`)).filter((x): x is LawArticle => Boolean(x));
+  let chains = 0;
+  for (const a of bySeed(articles, seed, (x) => `${x.law.short}|${x.no}`)) {
+    if (chains >= 8) break;
+    const b = refsOf(a).find((x) => x.doc !== a.doc);
+    const c = b ? refsOf(b).find((x) => x.doc !== a.doc && x.doc !== b.doc && x.no !== a.no) : undefined;
+    if (!b || !c) continue;
+    chains++;
+    const body = c.text.replace(/^第[零〇一二三四五六七八九十百千两]+条\s*/, '').slice(0, 160);
+    tasks.push({
+      id: `law-cn-chain-${hid(a.law.short, a.no, b.no, c.no)}`, suite: 'usage', type: 'deep-hop', lang: 'zh',
+      question: `《${a.law.row.title}》第${a.no}条引用了本法的另一个条文，那个条文又引用了本法的第三个条文。第三个条文是第几条，规定了什么？`,
+      answer: `第${c.no}条：${body}`, keypoints: [`第${c.no}条`], scoring: 'judge',
+      evidence: [ev(a), ev(b), ev(c)], meta: { origin: 'model-free', hops: 3, bridges: [`第${b.no}条`] },
+    });
+  }
+  return tasks;
+}
+
 /** The header's last clause — adoption, or the latest amendment — as a dated event. */
 function lastEnactment(header: string): { quote: string; date: string; meeting: string; act: string } | undefined {
   const parts = header.replace(/^[（(]|[）)]$/g, '').split(/\s+/).filter(Boolean);
@@ -236,12 +360,12 @@ async function buildLawCn(dir: string, ctx: RecipeContext) {
   const books = (ctx.options.civilCodeBooks as string[] | undefined) ?? CIVIL_CODE_BOOKS;
   const writer = new PackWriter(dir, {
     id: 'law-cn',
-    version: 1,
+    version: 2,
     title: 'Chinese civil, commercial and data laws in force',
     domain: 'law',
     languages: ['zh'],
     description: `National laws with status 有效 from twang2218/chinese-law-and-regulations (${laws.map(shortName).join('、')}; Civil Code books ${books.join('、')}), one document per chapter; cross-references between articles as model-free links, enactment and commencement dates as model-free temporal tasks.`,
-    builder: { recipe: 'law-cn', options: { laws, civilCodeBooks: books, limit: ctx.limit } },
+    builder: { recipe: 'law-cn', options: { laws, civilCodeBooks: books, limit: ctx.limit, padding: Number(ctx.options.padding ?? 0) } },
   });
 
   // national laws come first in the dataset; the metadata split finds their rows without their texts
@@ -293,9 +417,11 @@ async function buildLawCn(dir: string, ctx: RecipeContext) {
 
   const tasks: Task[] = [];
   const commenced: { law: ParsedLaw; date: string; doc: string; quote: string }[] = [];
+  const headers: { law: ParsedLaw; doc: string; quote: string; date: string }[] = [];
   for (const [li, law] of parsed.entries()) {
     const headerDoc = perLaw[li][0]?.doc.path;
     const e = lastEnactment(law.header);
+    if (e && headerDoc && keep.has(headerDoc)) headers.push({ law, doc: headerDoc, quote: e.quote, date: e.date });
     if (e && headerDoc && keep.has(headerDoc) && e.date === cnDate(law.row.publish_date)) {
       const adopted = e.act.endsWith('通过');
       tasks.push({
@@ -328,8 +454,38 @@ async function buildLawCn(dir: string, ctx: RecipeContext) {
       evidence: [{ doc: a.doc, quote: a.quote }, { doc: b.doc, quote: b.quote }], meta: { origin: 'model-free' },
     });
   }
-  ctx.log(`law-cn: ${docs.length} chapters from ${parsed.length} laws, ${seenLink.size} cross-reference links, ${tasks.length} model-free date tasks`);
-  return finishDocpack({ writer, docs, lang: 'zh', tasks, plan: scaledPlan({ single: 20, multi: 10, temporal: 3, unanswerable: 6, global: 4 }, docs.length, 100), perDoc: 5 }, ctx);
+  const lawArticles: LawArticle[] = perLaw.flatMap((list, li) => list.filter((x) => keep.has(x.doc.path)).flatMap((x) => x.articles.map((a) => ({
+    law: parsed[li], no: a.no, text: a.lines.join(''), first: a.lines[0].slice(0, 40), doc: x.doc.path,
+  }))));
+  const corpusLevel = statuteCorpusTasks(parsed, lawArticles, headers, commenced, ctx.seed ?? 0);
+  ctx.log(`law-cn: ${docs.length} chapters from ${parsed.length} laws, ${seenLink.size} cross-reference links, ${tasks.length} model-free date tasks, ${corpusLevel.length} model-free corpus-level tasks`);
+  tasks.push(...corpusLevel);
+
+  // padding for scale curves: chapters of other national laws in force (each fetched once, then cached)
+  const padding = Number(ctx.options.padding ?? 0);
+  const candidates: Doc[] = [];
+  if (padding > 1) {
+    const want = Math.ceil(docs.length * (padding - 1) * 1.3);
+    const others = bySeed(meta.rows.map((r, idx) => ({ r, idx })).filter(({ r }) => r.type === '法律' && r.status === '有效' && !laws.includes(r.title)), ctx.seed ?? 0, ({ r }) => r.title);
+    for (const { r, idx } of others) {
+      if (candidates.length >= want) break;
+      try {
+        const { rows, record } = await hfRows<LawRow>(CN_DATASET, { offset: idx, limit: 1, license: CN_LICENSE });
+        if (rows[0]?.title !== r.title || !rows[0].content) continue;
+        writer.addSource({ ...record, note: `padding: ${r.title} (row ${idx})` });
+        const other = parseLaw(rows[0]);
+        for (const x of lawDocs(other, other.chapters.flatMap((c) => (c.book ? [c.book.title] : [])))) candidates.push(x.doc);
+      } catch (err) {
+        ctx.log(`padding: ${r.title} skipped (${err instanceof Error ? err.message : String(err)})`);
+      }
+    }
+    ctx.log(`padding: ${candidates.length} chapters of other laws as candidates`);
+  }
+  return finishDocpack({
+    writer, docs, lang: 'zh', tasks, plan: scaledPlan({ single: 20, multi: 10, temporal: 3, unanswerable: 6, global: 4 }, docs.length, 100), perDoc: 5,
+    corpus: { profile: 8, timeline: 0, contradiction: 4, aggregate: 0, deep: 4 },
+    ...(padding > 1 ? { padding: { candidates, multiple: padding } } : {}),
+  }, ctx);
 }
 
 /* --------------------------------- law-us --------------------------------- */

@@ -135,6 +135,14 @@ export class Judge {
     }));
   }
 
+  /** Corpus-level lists (aggregate, timeline, contradiction, profile): a stricter match than themes — same name, number and date. */
+  async matchList(items: { id: string; predicted: string[]; gold: string[] }[]): Promise<Verdicts<{ pairs: [number, number][] }>> {
+    return this.batch('list', LIST_MATCH_SYSTEM, items, (i) => ({
+      predicted: i.predicted.map((p, n) => `${n}: ${p.slice(0, 400)}`),
+      gold: i.gold.map((g, n) => `${n}: ${g.slice(0, 400)}`),
+    }));
+  }
+
   async linkCorrect(items: { id: string; head: string; relation: string; tail: string; sources: string[] }[]): Promise<Verdicts<{ correct: boolean }>> {
     return this.batch('link', LINK_SYSTEM, items, (i) => ({ link: `${i.head} —${i.relation}→ ${i.tail}`, sources: i.sources.map((s, n) => `[${n}] ${s.slice(0, 1200)}`) }));
   }
@@ -202,6 +210,9 @@ export const DECOMPOSE_SYSTEM = `Split each text into atomic claims: one checkab
 ${JSON_SHAPE('"claims":["…"]')}`;
 
 export const MATCH_SYSTEM = `Each item has predicted entries and gold entries. Pair a predicted entry with a gold entry when it expresses the same theme, need or item (wording and language may differ; a broader or vaguer entry does not match a specific gold one). Each entry is used at most once.
+${JSON_SHAPE('"pairs":[[<predicted index>,<gold index>], …]')}`;
+
+export const LIST_MATCH_SYSTEM = `Each item has the list an answer gave and the gold list (one entry per line; gold entries may give alternative names after " / " and a date in parentheses). Pair a predicted entry with a gold entry when they state the same thing: the same listed thing, fact, event, change of state or side of a disagreement. Wording and language may differ. Do not pair when the predicted entry names a different person, figure or date, when it is broader or vaguer than the gold entry, or when it merges several gold entries into one (pair it with at most one of them). Each entry is used at most once.
 ${JSON_SHAPE('"pairs":[[<predicted index>,<gold index>], …]')}`;
 
 export const LINK_SYSTEM = `Each item is a link a knowledge base drew between two things, with the source passages. Decide whether the sources support that relation between them (the relation label may be loose; the connection must be real and of that kind).
