@@ -14,6 +14,10 @@ struct KnodeOSApp: App {
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                     model.shutdown()
                 }
+                // coming back to the app: Teams shared or withdrawn meanwhile show without reopening it
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    Task { await model.refreshAccess(notWithin: 30) }
+                }
         }
         .defaultSize(width: 1320, height: 820)
         .commands {

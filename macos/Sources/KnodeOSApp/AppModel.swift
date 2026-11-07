@@ -64,6 +64,8 @@ final class AppModel: ObservableObject {
     /// The folder picked in the Files tree. Shared so Search can scope to it.
     @Published var pickedDirectory: String?
     @Published var workspaceRevision = 0
+    /// Bumped by `reloadWorkspace`: the screen on show re-reads its data in place, keeping your place.
+    @Published private(set) var reloadRequest = 0
     /// What the service says needs attention in the active workspace, less the ones dismissed here (`refreshNotices`).
     @Published private(set) var notices: [WorkspaceNotice] = []
     @Published var toastMessage: String?
@@ -92,6 +94,9 @@ final class AppModel: ObservableObject {
     /// The URL requests go to: the configured one, or the local end of the SSH tunnel.
     private var effectiveBaseURL: URL?
     private var toastTask: Task<Void, Never>?
+    /// The account and workspace refresh in flight, and when the last one finished (`refreshAccess`).
+    private var accessRefresh: Task<Void, Never>?
+    private var lastAccessRefresh: Date?
     /// Where each section was left, so switching away and back does not lose your place.
     private var lastTab: [AppSection: AppTab] = [:]
 
@@ -444,9 +449,11 @@ final class AppModel: ObservableObject {
 
     /// Ask the service who we are; a session it no longer knows ends here.
     func verifySession() async {
-        guard token != nil else { return }
+        guard let asked = token else { return }
         do {
             let view = try await bareClient().me()
+            // signed out, or in as someone else, while the answer was on its way
+            guard token == asked else { return }
             account = view
             if var stored = session {
                 stored.user.role = view.account.role
@@ -454,10 +461,32 @@ final class AppModel: ObservableObject {
                 setSession(stored)
             }
         } catch let error as APIError where error.sessionEnded {
+            guard token == asked else { return }
             sessionEnded()
         } catch {
             // unreachable for now: the connection state says so already
         }
+    }
+
+    /// Ask again what this account may open, then refresh the workspace list. The Teams come
+    /// with the account, which is otherwise read only at launch and sign-in. Without this, a
+    /// Team shared or withdrawn while the app is open would not show until it was reopened.
+    /// Calls that overlap share one round trip; `notWithin` skips a refresh made that recently.
+    func refreshAccess(notWithin interval: TimeInterval = 0) async {
+        if let running = accessRefresh {
+            await running.value
+            return
+        }
+        guard phase == .app, token != nil, case .connected = connectionState else { return }
+        if let last = lastAccessRefresh, Date().timeIntervalSince(last) < interval { return }
+        let task = Task { @MainActor in
+            await verifySession()
+            if phase == .app { await refreshWorkspaces() }
+        }
+        accessRefresh = task
+        await task.value
+        accessRefresh = nil
+        lastAccessRefresh = Date()
     }
 
     /// The service no longer accepts our token: back to sign-in, keeping which workspaces were open.
@@ -558,10 +587,36 @@ final class AppModel: ObservableObject {
     }
 
     func switchWorkspace(to workspace: Workspace) {
-        guard var current = session, current.activeWorkspaceID != workspace.id else { return }
+        guard var current = session else { return }
+        // picking the workspace already open reads it again
+        guard current.activeWorkspaceID != workspace.id else {
+            reloadWorkspace()
+            showToast(L("Reloaded %@", workspace.displayName))
+            return
+        }
         current.activeWorkspaceID = workspace.id
         setSession(current)
         workspaceDidChange(message: "Switched to \(workspace.displayName)")
+    }
+
+    /// Read the open workspace again without losing your place: the counts in the toolbar, the
+    /// notices, and what the screen on show re-reads when `reloadRequest` changes (Files: the
+    /// open folders, and the open file unless it is being edited). Unlike Refresh Workspace (⌘R)
+    /// nothing is rebuilt, so an open file, a search or a draft stays as it is.
+    func reloadWorkspace() {
+        reloadRequest += 1
+        Task {
+            await refreshStats()
+            await refreshNotices()
+        }
+    }
+
+    /// The workspace button: ask what this account may open, then read the open workspace again.
+    /// A workspace that had to give way meanwhile (a Team withdrawn) opens fresh instead.
+    func workspaceButtonClicked() async {
+        let opened = activeWorkspace?.id
+        await refreshAccess()
+        if activeWorkspace?.id == opened { reloadWorkspace() }
     }
 
     func createWorkspace(named name: String) async throws {
@@ -869,9 +924,12 @@ final class AppModel: ObservableObject {
     }
 
     func refreshWorkspaces() async {
-        guard var current = session else { return }
+        guard let asked = session?.user.username else { return }
         do {
             let owned = try await client().workspaces()
+            // Read the session after the answer: a workspace picked meanwhile stays picked,
+            // and someone else's sign-in meanwhile is not given these workspaces.
+            guard var current = session, current.user.username == asked else { return }
             let teams = allowedTeams(current.workspaces.filter { $0.kind == .team })
             let merged = owned + teams.filter { team in !owned.contains(where: { $0.id == team.id }) }
             let previousActiveID = current.activeWorkspaceID

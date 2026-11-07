@@ -163,17 +163,110 @@ function workspaceRequestHeaders() {
   };
 }
 
-async function syncUserWorkspaces() {
-  if (!authState?.user) return;
-  const previous = activeWorkspace();
-  const owned = await api('/api/workspaces');
-  const teams = allowedTeams(authState.workspaces.filter((workspace) => workspace.kind === 'team'));
-  authState.workspaces = [...owned, ...teams];
-  if (!authState.workspaces.some((workspace) => workspace.id === authState.activeWorkspaceId)) {
-    authState.activeWorkspaceId = owned[0]?.id || teams[0]?.id;
+let workspaceSync = null;
+let workspaceSyncedAt = 0;
+
+/** What the workspace menu and header show, to tell whether a sync changed any of it. */
+const workspaceView = () => JSON.stringify([
+  authState?.activeWorkspaceId,
+  (authState?.workspaces || []).map((workspace) => [workspace.id, workspace.name]),
+  serverAuth?.account?.role,
+  serverAuth?.account?.readOnly,
+]);
+
+/**
+ * The workspaces this account may open: its own (/api/workspaces), the Teams
+ * the server gives it, and any Team an administrator joined by code. With
+ * `access`, first ask the server again what the account may open. Otherwise
+ * that is read only when the page loads, and a Team shared or withdrawn later
+ * would not show until a reload. Overlapping calls share one round trip, and
+ * `notWithin` (ms) skips a sync made that recently. Resolves to the workspace
+ * that was open when it had to give way (no longer open to this account),
+ * else null.
+ */
+function syncUserWorkspaces({ access = false, notWithin = 0 } = {}) {
+  if (workspaceSync) return workspaceSync;
+  if (!authState?.user || Date.now() - workspaceSyncedAt < notWithin) return Promise.resolve(null);
+  const asked = authState.user;
+  workspaceSync = (async () => {
+    const me = access && !authDisabled ? await api('/api/auth/me') : null;
+    const owned = await api('/api/workspaces');
+    // signed out, or in again, while the answers were on their way
+    if (authState?.user !== asked) return null;
+    if (me) serverAuth = { ...serverAuth, ...me };
+    const before = workspaceView();
+    const previous = activeWorkspace();
+    const teams = allowedTeams(authState.workspaces.filter((workspace) => workspace.kind === 'team'));
+    authState.workspaces = [...owned, ...teams];
+    if (!authState.workspaces.some((workspace) => workspace.id === authState.activeWorkspaceId)) {
+      authState.activeWorkspaceId = owned[0]?.id || teams[0]?.id;
+    }
+    saveAuthState();
+    if (workspaceView() !== before) renderWorkspaceUI();
+    return previous && previous.id !== activeWorkspace()?.id ? previous : null;
+  })().finally(() => {
+    workspaceSync = null;
+    workspaceSyncedAt = Date.now();
+  });
+  return workspaceSync;
+}
+
+/**
+ * Back on the page, or opening the workspace menu: take in Teams shared or
+ * withdrawn since the list was read. Resolves to the workspace that had to give
+ * way (and was replaced by a fresh one), else null.
+ */
+function refreshAccess(notWithin = 0) {
+  if (!authState?.user || $('#app-shell').hidden) return Promise.resolve(null);
+  return syncUserWorkspaces({ access: true, notWithin })
+    .then((left) => {
+      if (!left) return null;
+      loadWorkspaceData();
+      toast(`${workspaceLabel(left)} is no longer open to you — switched to ${workspaceLabel(activeWorkspace())}`, 5000);
+      return left;
+    })
+    .catch(() => null /* the list stays as it was; the next refresh asks again */);
+}
+
+/**
+ * Read the open workspace again without losing your place: the counts, the
+ * notices, the open folders and the open file (unless it is being edited).
+ * Unlike switching workspaces nothing is cleared, so an open file, a search
+ * or a draft stays as it is.
+ */
+async function reloadWorkspace() {
+  const workspace = activeWorkspace()?.id;
+  loadStats();
+  loadNotices();
+  // Files is read only once a tree is on screen; until then it loads when it first opens
+  if (!listings.size) return;
+  try {
+    await loadTree();
+  } catch {
+    return; // the folders stay as they were
   }
-  saveAuthState();
-  if (previous?.id !== activeWorkspace()?.id) renderWorkspaceUI();
+  if (activeWorkspace()?.id === workspace) await rereadOpenFile();
+}
+
+/** Read the open file again, keeping the reader's place; a file being edited is left as it is. */
+async function rereadOpenFile() {
+  const path = currentFile;
+  if (!path || editing) return;
+  try {
+    const file = await api(fileUrl(path));
+    // the reader may have moved on, or started editing, meanwhile
+    if (currentFile !== path || editing) return;
+    if (file.content !== $('#file-editor').value) {
+      const view = $('#file-view');
+      const top = view.scrollTop;
+      renderFileContent(path, file.content, file.derived, file.truncated, file.bytes);
+      view.scrollTop = top;
+      loadFileCitations(path);
+    }
+    paintLanguages(path, file);
+  } catch {
+    // gone or unreachable: what is on screen stays; opening it again says why
+  }
 }
 
 function renderWorkspaceUI() {
@@ -222,6 +315,13 @@ function closeWorkspaceMenu() {
 
 function switchWorkspace(id) {
   if (!authState || !authState.workspaces.some((workspace) => workspace.id === id)) return;
+  // picking the workspace already open reads it again, keeping your place
+  if (id === authState.activeWorkspaceId) {
+    closeWorkspaceMenu();
+    reloadWorkspace();
+    toast(`Reloaded ${workspaceLabel(activeWorkspace())}`);
+    return;
+  }
   authState.activeWorkspaceId = id;
   saveAuthState();
   renderWorkspaceUI();
@@ -542,6 +642,15 @@ $('#workspace-trigger').addEventListener('click', (event) => {
   const menu = $('#workspace-menu');
   menu.hidden = !menu.hidden;
   $('#workspace-trigger').setAttribute('aria-expanded', String(!menu.hidden));
+  // the list shows at once and takes in any Team shared since it was last read;
+  // the open workspace is read again in place (a fresh one opened instead needs no second read)
+  if (!menu.hidden) refreshAccess().then((left) => { if (!left) reloadWorkspace(); });
+});
+
+// coming back to the page: Teams shared or withdrawn meanwhile show without a reload
+window.addEventListener('focus', () => refreshAccess(30_000));
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refreshAccess(30_000);
 });
 
 $('#workspace-menu').addEventListener('click', (event) => event.stopPropagation());
