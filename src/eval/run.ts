@@ -82,6 +82,7 @@ export interface RunOptions {
   fraction?: number;
   seed?: string | number;
   slots?: number;
+  /** Tasks one system answers at once in each pack, update batches included (default 3). */
   answerConcurrency?: number;
   /** Packs worked on at once (each builds and answers on its own; the shim's slots bound the model calls). */
   packConcurrency?: number;
@@ -385,7 +386,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
             // nothing to update, or a resumed run that updated already: reopen on the staged corpus as it now is
             for (const s of members) await s.reopen?.(env).catch(() => {});
           }
-          for (const s of members) await answerAll(store, meter, env, s, tasks, fraction, seed, 1, progress, batch);
+          for (const s of members) await answerAll(store, meter, env, s, tasks, fraction, seed, opts.answerConcurrency ?? 3, progress, batch);
           for (const s of members) await s.release?.(env);
         }
       }

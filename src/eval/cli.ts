@@ -167,6 +167,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--seed <seed>', 'sampling seed', '0')
     .option('--slots <n>', 'concurrent model calls', '6')
     .option('--pack-concurrency <n>', 'packs worked on at once', '1')
+    .option('--answer-concurrency <n>', 'tasks one system answers at once in each pack (update batches too)', '3')
     .option('--embedding-cap <tokens>', 'stop embedding after this many tokens in the run')
     .option('--embedding-daily-cap <tokens>', 'embed at most this many tokens per UTC day; past it, packs wait for the next day')
     .option('--no-quota', 'do not pause for Codex plan windows')
@@ -203,6 +204,7 @@ export function registerEvalCommands(program: Command): void {
         seed: opts.seed,
         slots: Number(opts.slots),
         packConcurrency: Number(opts.packConcurrency),
+        answerConcurrency: Number(opts.answerConcurrency),
         embeddingTokenCap: opts.embeddingCap ? Number(opts.embeddingCap) : undefined,
         embeddingDailyCap: opts.embeddingDailyCap ? Number(opts.embeddingDailyCap) : undefined,
         quota: opts.quota,

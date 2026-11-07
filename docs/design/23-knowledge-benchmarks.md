@@ -263,3 +263,8 @@ long-context ≈ $0.12, closed-book $0.007 — about $0.50 per task across the t
 
 Before phase 2, a smoke run (`--limit 2`, one pack) checks that a reused knode workspace opens at its new path and that an agent session
 bills the API key (one session ≈ $0.04).
+
+As run: the OpenAI key ran out of credit at 09:27Z with $184 on the ledger (OpenAI answered 429, so the chains moved to Codex before
+D18's 95% stop). On Codex an agent answer took a median 172 s instead of 46 s. With one pack left, the default of three answers at a
+time left the run about 0.9 answers a minute. It was stopped at 12:58Z and resumed with `--answer-concurrency 8`, which now also applies
+to update batches (they were answered one task at a time).
