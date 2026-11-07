@@ -731,6 +731,21 @@ describe('corpus-level tasks: packs', () => {
     expect(pack.tasks.find((t) => t.id === 'c-knee')!.items!.map((it) => [it.label, it.docs!.length])).toEqual([['右膝', 1], ['左膝', 4]]);
   }, 60_000);
 
+  it('asks a week again when its reply is not one JSON object, instead of losing the week', async () => {
+    const inner = standInAuthor('zh');
+    let failed = 0;
+    const flaky = { ...inner, label: 'flaky', model: 'flaky', enabled: true, async completeJson(messages: { role: string; content: string }[]) {
+      if (messages[0].content.includes('realistic personal documents') && messages[1].content.includes('"week":4') && failed++ === 0) throw new Error('Unexpected non-whitespace character after JSON at position 625');
+      return (inner.completeJson as (m: unknown) => Promise<unknown>)(messages);
+    } } as unknown as LlmClient;
+    const out = path.join(tmp, 'synthetic-flaky');
+    const logs: string[] = [];
+    expect((await recipe('synthetic-life-zh').build(out, { author: flaky, seed: 7, log: (m) => logs.push(m), options: {} })).errors).toEqual([]);
+    expect(failed).toBeGreaterThan(1);
+    expect(logs.some((l) => l.includes('in no document'))).toBe(false);
+    expect(loadPack(out).tasks.some((t) => t.id === 'l-runs-3')).toBe(true);
+  }, 60_000);
+
   it('drops the runs a filler adds to, and keeps the rest', async () => {
     const out = path.join(tmp, 'synthetic-broken');
     const logs: string[] = [];

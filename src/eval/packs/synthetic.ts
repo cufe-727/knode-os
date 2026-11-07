@@ -264,7 +264,17 @@ async function renderWeekAll(author: LlmClient, script: Script, week: number, mo
   for (let i = 0; i < events.length; i += 5) chunks.push(events.slice(i, i + 5));
   if (!chunks.length) chunks.push([]);
   const docs: RenderedDoc[] = [];
-  for (const [i, chunk] of chunks.entries()) docs.push(...await renderWeek(author, script, week, mood, i === 0 ? fillers + (events.length ? 0 : 2) : 0, chunk));
+  for (const [i, chunk] of chunks.entries()) {
+    // a reply that is not one JSON object (two objects, prose after it) is asked again, not a lost week
+    for (let attempt = 1; ; attempt++) {
+      try {
+        docs.push(...await renderWeek(author, script, week, mood, i === 0 ? fillers + (events.length ? 0 : 2) : 0, chunk));
+        break;
+      } catch (err) {
+        if (attempt >= 3) throw err;
+      }
+    }
+  }
   return docs;
 }
 
