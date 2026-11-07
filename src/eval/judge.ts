@@ -73,13 +73,15 @@ export class Judge {
     }
     const batches: I[][] = [];
     for (let i = 0; i < todo.length; i += this.batchSize) batches.push(todo.slice(i, i + this.batchSize));
-    await mapLimit(batches, this.opts.concurrency ?? 2, async (group) => {
+    // a reply that does not parse (cut off at its token budget, prose around it) is asked again in halves, down to
+    // one item, which is tried twice and then left unjudged: one bad reply must not stop a pack
+    const ask = async (group: I[], tries = 1): Promise<void> => {
       const user = JSON.stringify({ items: group.map((item) => ({ id: item.id, ...(render(item) as object) })) }, null, 1);
       let usage: CallUsage | null = null;
       const t0 = Date.now();
       const call = () => this.opts.client.completeJson<{ verdicts?: (V & { id?: string })[] }>(
         [{ role: 'system', content: system }, { role: 'user', content: user }],
-        { maxTokens: 400 * group.length + 400, onUsage: (u) => (usage = u) },
+        { maxTokens: 900 * group.length + 600, onUsage: (u) => (usage = u) },
       );
       let reply: { verdicts?: (V & { id?: string })[] };
       try {
@@ -88,7 +90,15 @@ export class Judge {
         this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: true, replayed: false, usage });
       } catch (err) {
         this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: false, replayed: false, usage });
-        throw err;
+        if (!(err instanceof SyntaxError) && !/json/i.test(err instanceof Error ? err.message : String(err))) throw err;
+        if (group.length > 1) {
+          const half = Math.ceil(group.length / 2);
+          await ask(group.slice(0, half));
+          await ask(group.slice(half));
+        } else if (tries < 2) {
+          await ask(group, tries + 1);
+        }
+        return;
       }
       const byId = new Map((reply.verdicts ?? []).filter((v) => v && typeof v.id === 'string').map((v) => [v.id as string, v]));
       for (const item of group) {
@@ -97,7 +107,8 @@ export class Judge {
         this.remember(keyOf(item), v);
         out.set(item.id, v as V);
       }
-    }, (err) => {
+    };
+    await mapLimit(batches, this.opts.concurrency ?? 2, (group) => ask(group), (err) => {
       throw err;
     });
     return out;

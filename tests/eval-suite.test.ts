@@ -873,6 +873,23 @@ describe('corpus-level tasks: cost and scale', () => {
   }, 120_000);
 });
 
+describe('the judge', () => {
+  it('asks a batch again in halves when its reply does not parse, instead of stopping', async () => {
+    let calls = 0;
+    const client = { label: 'j', model: 'j', enabled: true, async completeJson(messages: { role: string; content: string }[]) {
+      calls++;
+      const items = (JSON.parse(messages[1].content) as { items: { id: string }[] }).items;
+      // more than two items: the reply is cut off at its token budget
+      if (items.length > 2) throw new SyntaxError('Unterminated string in JSON at position 699');
+      return { verdicts: items.map((i) => ({ id: i.id, score: 2, keypoints: [], abstained: false, hallucinated: false })) };
+    } } as unknown as LlmClient;
+    const judge = new Judge({ client, meter: new Meter() });
+    const v = await judge.gradeAnswers(Array.from({ length: 8 }, (_, i) => ({ id: `g${i}`, question: 'q', reference: 'r', answer: 'a' })));
+    expect(v.size).toBe(8);
+    expect(calls).toBe(7);
+  });
+});
+
 describe('budgeted model chains', () => {
   const usage = (input: number, output: number) => ({ inputTokens: input, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: output, reasoningTokens: 0 });
   const stub = (model: string, behave: () => string) => ({
