@@ -407,6 +407,8 @@ private struct WorkspaceMenu: View {
     var body: some View {
         Button {
             showingWorkspacePicker.toggle()
+            // the list shows at once, and takes in any Team shared since it was last read
+            if showingWorkspacePicker { Task { await model.refreshAccess() } }
         } label: {
             HStack(spacing: 9) {
                 InitialsBadge(

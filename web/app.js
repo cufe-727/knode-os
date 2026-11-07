@@ -163,17 +163,64 @@ function workspaceRequestHeaders() {
   };
 }
 
-async function syncUserWorkspaces() {
-  if (!authState?.user) return;
-  const previous = activeWorkspace();
-  const owned = await api('/api/workspaces');
-  const teams = allowedTeams(authState.workspaces.filter((workspace) => workspace.kind === 'team'));
-  authState.workspaces = [...owned, ...teams];
-  if (!authState.workspaces.some((workspace) => workspace.id === authState.activeWorkspaceId)) {
-    authState.activeWorkspaceId = owned[0]?.id || teams[0]?.id;
-  }
-  saveAuthState();
-  if (previous?.id !== activeWorkspace()?.id) renderWorkspaceUI();
+let workspaceSync = null;
+let workspaceSyncedAt = 0;
+
+/** What the workspace menu and header show, to tell whether a sync changed any of it. */
+const workspaceView = () => JSON.stringify([
+  authState?.activeWorkspaceId,
+  (authState?.workspaces || []).map((workspace) => [workspace.id, workspace.name]),
+  serverAuth?.account?.role,
+  serverAuth?.account?.readOnly,
+]);
+
+/**
+ * The workspaces this account may open: its own (/api/workspaces), the Teams
+ * the server gives it, and any Team an administrator joined by code. With
+ * `access`, first ask the server again what the account may open. Otherwise
+ * that is read only when the page loads, and a Team shared or withdrawn later
+ * would not show until a reload. Overlapping calls share one round trip, and
+ * `notWithin` (ms) skips a sync made that recently. Resolves to the workspace
+ * that was open when it had to give way (no longer open to this account),
+ * else null.
+ */
+function syncUserWorkspaces({ access = false, notWithin = 0 } = {}) {
+  if (workspaceSync) return workspaceSync;
+  if (!authState?.user || Date.now() - workspaceSyncedAt < notWithin) return Promise.resolve(null);
+  const asked = authState.user;
+  workspaceSync = (async () => {
+    const me = access && !authDisabled ? await api('/api/auth/me') : null;
+    const owned = await api('/api/workspaces');
+    // signed out, or in again, while the answers were on their way
+    if (authState?.user !== asked) return null;
+    if (me) serverAuth = { ...serverAuth, ...me };
+    const before = workspaceView();
+    const previous = activeWorkspace();
+    const teams = allowedTeams(authState.workspaces.filter((workspace) => workspace.kind === 'team'));
+    authState.workspaces = [...owned, ...teams];
+    if (!authState.workspaces.some((workspace) => workspace.id === authState.activeWorkspaceId)) {
+      authState.activeWorkspaceId = owned[0]?.id || teams[0]?.id;
+    }
+    saveAuthState();
+    if (workspaceView() !== before) renderWorkspaceUI();
+    return previous && previous.id !== activeWorkspace()?.id ? previous : null;
+  })().finally(() => {
+    workspaceSync = null;
+    workspaceSyncedAt = Date.now();
+  });
+  return workspaceSync;
+}
+
+/** Back on the page, or opening the workspace menu: take in Teams shared or withdrawn since the list was read. */
+function refreshAccess(notWithin = 0) {
+  if (!authState?.user || $('#app-shell').hidden) return;
+  syncUserWorkspaces({ access: true, notWithin })
+    .then((left) => {
+      if (!left) return;
+      loadWorkspaceData();
+      toast(`${workspaceLabel(left)} is no longer open to you — switched to ${workspaceLabel(activeWorkspace())}`, 5000);
+    })
+    .catch(() => { /* the list stays as it was; the next refresh asks again */ });
 }
 
 function renderWorkspaceUI() {
@@ -542,6 +589,14 @@ $('#workspace-trigger').addEventListener('click', (event) => {
   const menu = $('#workspace-menu');
   menu.hidden = !menu.hidden;
   $('#workspace-trigger').setAttribute('aria-expanded', String(!menu.hidden));
+  // the list shows at once, and takes in any Team shared since it was last read
+  if (!menu.hidden) refreshAccess();
+});
+
+// coming back to the page: Teams shared or withdrawn meanwhile show without a reload
+window.addEventListener('focus', () => refreshAccess(30_000));
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refreshAccess(30_000);
 });
 
 $('#workspace-menu').addEventListener('click', (event) => event.stopPropagation());
