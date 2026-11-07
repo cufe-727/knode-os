@@ -11,7 +11,7 @@ import { LlmClient } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { Store } from '../store/db.js';
 import { summaryPagesByDocument } from '../wiki/pages.js';
-import { summaryMaxSegments, summaryMinChars } from '../wiki/summary.js';
+import { summaryAfterExtraction, summaryMaxSegments, summaryMinChars } from '../wiki/summary.js';
 import { DEFAULT_SHARES, WorkerStatus } from '../work/broker.js';
 import { offeredRemotely } from '../work/config.js';
 import { isSharedKind, SHARED_KINDS, SharedKind } from '../work/kinds.js';
@@ -125,13 +125,15 @@ export async function estimateProcessing(input: ProcessingEstimateInput): Promis
   const known = docs.filter((d) => d.chars !== null && Number(d.tokens) > 0);
   const tokensPerChar = known.length ? known.reduce((n, d) => n + textTokens(d), 0) / known.reduce((n, d) => n + d.chars!, 0) : TOKENS_PER_CHAR;
   const summary = { now: 0, later: 0, calls: 0, prompt: 0, output: 0 };
+  // a workspace that writes summaries before extraction (`summaryAfterExtraction: false`) has its queued documents due now
+  const waits = summaryAfterExtraction(config);
   for (const d of docs) {
     const page = pages.get(d.path);
     if (page && page.status !== 'dirty') continue;
     const tokens = textTokens(d);
     const chars = d.chars ?? tokens / Math.max(0.05, tokensPerChar);
     if (chars < minChars || tokens <= 0) continue;
-    if (d.queued) summary.later++;
+    if (d.queued && waits) summary.later++;
     else summary.now++;
     if (chars <= LLM_WIKI_INPUT_CHARS) {
       summary.calls += 1;

@@ -371,6 +371,9 @@ describe('the processing estimate', () => {
     // both documents are due a summary once extracted; the long one in parts and a merge
     expect(e.work[1].detail).toMatch(/0 due now · 2 more once extracted/);
     expect(e.lines.find((l) => l.kind === 'summarize')!.calls).toBeGreaterThanOrEqual(3);
+    // a workspace that writes summaries first has them due now
+    const first = await estimateProcessing({ store: ctx.store, config: { ...ctx.config, extraction: { ...ctx.config.extraction, summaryAfterExtraction: false } }, ledger: null, workers: [], quota: noQuota });
+    expect(first.work[1].detail).toMatch(/^2 due now · /);
     expect(e.totals.costUsd?.expected).toBeGreaterThan(0);
     expect(e.services.map((s) => s.service)).toEqual(['api']);
     expect(formatEstimate(e)).toMatch(/Extraction: 2 documents waiting/);
