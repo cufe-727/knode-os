@@ -355,6 +355,16 @@ export interface ExtractionConfig {
    */
   summaryMaxSegments: number;
   /**
+   * Whether a document's summary page waits for its extraction (absent or
+   * true: it does). A page links only names the graph already has, so a
+   * summary written first misses the entities extraction finds. false writes
+   * the summary pages of documents still queued for extraction too — for a
+   * library whose extraction would take far longer than its summaries. The
+   * summary is cached by the document's content, so extraction landing later
+   * does not redo it: the page keeps the links it had (docs/design/14).
+   */
+  summaryAfterExtraction?: boolean;
+  /**
    * The Translate stage (docs/design/17): a document under raw/docs in
    * another language than the workspace's primary one is translated into it,
    * segment by segment, as leased work beside summaries. Runs only while

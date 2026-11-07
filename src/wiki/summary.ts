@@ -285,6 +285,11 @@ export function summaryMinChars(config: KnodeConfig): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
+/** `extraction.summaryAfterExtraction`: whether a document's summary waits for its extraction (default true). */
+export function summaryAfterExtraction(config: KnodeConfig): boolean {
+  return config.extraction.summaryAfterExtraction !== false;
+}
+
 /** `extraction.summaryMaxSegments`: segments one summary reads at most. */
 export function summaryMaxSegments(config: KnodeConfig): number {
   const n = Number(config.extraction.summaryMaxSegments);
