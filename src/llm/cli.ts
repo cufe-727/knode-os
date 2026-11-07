@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { LlmConfig, LlmEffort, LlmSpeed } from '../config.js';
+import { lastRateLimitInfo, recordClaudeLimits } from '../estimate/claude-limits.js';
 import type { ChatMessage } from './client.js';
 import { catalogArgs, exitFailure, withCodexCatalog } from './codex-catalog.js';
 import { externalDirs, opencodeConfig, opencodeEffort, opencodeEnv, OpencodeRule, opencodeRunArgs, readOpencodeStream } from './opencode.js';
@@ -21,7 +22,8 @@ import { CallUsage, readCodexEvents, usageFromClaudeResult, usageFromCursorResul
  *   - codex:  `codex exec --ignore-user-config --ephemeral -c features.plugins=false -c features.apps=false
  *             -c analytics.enabled=false [-c model_catalog_json=<copy>] --sandbox read-only
  *             --output-last-message <f> --json -`
- *   - claude: `claude -p --output-format json --max-turns 1`
+ *   - claude: `claude -p --output-format stream-json --verbose --max-turns 1` (the answer is its
+ *             `result` event; its `rate_limit_event` is kept for the quota floor)
  *   - cursor: `cursor-agent -p --output-format json --trust <prompt>` (`--trust` answers the
  *             workspace-trust prompt newer CLIs raise for the temp cwd; the model still
  *             gets no tool grants beyond that directory)
@@ -241,10 +243,39 @@ async function runCodex(cfg: LlmConfig, prompt: string, model: string | undefine
   }
 }
 
+/**
+ * The result wrapper of a claude run: the last `result` event of its
+ * stream-json output, or — from a CLI that printed one JSON document — that
+ * document. Null when stdout holds neither.
+ */
+export function claudeResultOf(stdout: string): Record<string, unknown> | null {
+  const lines = stdout.trim().split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line.startsWith('{')) continue;
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      if (event && typeof event === 'object' && 'result' in event && (event.type === 'result' || event.type === undefined)) return event;
+    } catch {
+      // a partial line
+    }
+  }
+  try {
+    const whole = JSON.parse(stdout) as unknown;
+    return whole && typeof whole === 'object' && 'result' in whole ? (whole as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function runClaude(cfg: LlmConfig, prompt: string, model: string | undefined, images: string[], report: (usage: CallUsage) => void): Promise<string> {
   const cmd = cliCommand('claude-cli', cfg.cliPath);
-  // one turn to read each picture (or all of them at once) and one to answer
-  const args = ['-p', '--output-format', 'json', '--max-turns', images.length ? String(Math.max(3, images.length + 2)) : '1'];
+  // one turn to read each picture (or all of them at once) and one to answer;
+  // stream-json (which needs --verbose in print mode) because its
+  // rate_limit_event says how far the plan's windows are used, which the
+  // quota floor reads (src/estimate/claude-limits.ts); the answer is the same
+  // result event `--output-format json` prints alone
+  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--max-turns', images.length ? String(Math.max(3, images.length + 2)) : '1'];
   if (model) args.push('--model', model);
   const effort = effortFor('claude-cli', cfg.effort);
   if (effort) args.push('--effort', effort);
@@ -254,14 +285,11 @@ async function runClaude(cfg: LlmConfig, prompt: string, model: string | undefin
     args.push('--add-dir', ...dirs);
   }
   const { code, stdout, stderr } = await runProcess(cmd, args, prompt, cfg.cliTimeoutMs);
+  const limits = lastRateLimitInfo(stdout);
+  if (limits) recordClaudeLimits(limits);
   // even on failure claude prints a result wrapper — prefer its message over raw output
-  let wrapper: unknown;
-  try {
-    wrapper = JSON.parse(stdout);
-  } catch {
-    wrapper = null;
-  }
-  if (wrapper && typeof wrapper === 'object' && 'result' in wrapper) {
+  const wrapper = claudeResultOf(stdout);
+  if (wrapper) {
     const w = wrapper as { result?: unknown; is_error?: boolean };
     const usage = usageFromClaudeResult(wrapper);
     if (usage) report(usage);

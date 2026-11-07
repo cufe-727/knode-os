@@ -202,6 +202,11 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
   const stopped = services?.processing ? (running ? null : 'waits for processing to start') : null;
   // summaries and translations are counted when a slot first asks for one: until then 0 means "not looked yet"
   const uncounted = 'not counted until processing starts';
+  // a stage whose every slot here rests for its plan's quota (src/labeling/plan-quota.ts) says so before anything else
+  const resting = (kind: WorkKind): string | null => {
+    const hold = running ? services?.localWorkers?.quotaHoldFor(kind) ?? null : null;
+    return hold ? `this machine's slots rest: ${hold.reason}` : null;
+  };
   const summaries = work?.kinds.summarize as import('../work/summarize.js').SummaryStatus | undefined;
   const translations = work?.kinds.translate as import('../work/translate.js').TranslateStatus | undefined;
   const judge = work?.kinds.judge as import('../work/judge.js').JudgeStatus | undefined;
@@ -230,24 +235,24 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
     {
       id: 'extract', enabled: true, unit: 'documents', waiting: labeling?.queued ?? 0, inFlight: labeling?.leases.length ?? 0,
       doneLastHour: labeling?.lastHour.documentsWritten ?? null, callsLastHour: labeling?.lastHour.calls ?? null,
-      failed: sumFailed(labeling?.totals.failed), note: labeling && labeling.queued > 0 ? stopped : null,
+      failed: sumFailed(labeling?.totals.failed), note: resting('extract') ?? (labeling && labeling.queued > 0 ? stopped : null),
     },
     {
       id: 'summarize', enabled: Boolean(summaries), unit: 'documents', waiting: summaries?.due ?? 0, inFlight: summaries?.leases.length ?? 0,
       doneLastHour: summaries?.lastHour.pagesWritten ?? null, callsLastHour: summaries?.lastHour.calls ?? null,
       failed: sumFailed(summaries?.totals.failed),
-      note: summaries && summaries.scannedAt === null ? uncounted : summaries && summaries.due > 0 ? stopped : null,
+      note: resting('summarize') ?? (summaries && summaries.scannedAt === null ? uncounted : summaries && summaries.due > 0 ? stopped : null),
     },
     {
       id: 'translate', enabled: translations?.enabled === true, unit: 'translations', waiting: translations?.due ?? 0, inFlight: translations?.leases.length ?? 0,
       doneLastHour: translations?.lastHour.documents ?? null, callsLastHour: translations?.lastHour.calls ?? null,
       failed: sumFailed(translations?.totals.failed),
-      note: translations?.enabled && translations.scannedAt === null ? uncounted : translations?.enabled && translations.due > 0 ? stopped : null,
+      note: (translations?.enabled ? resting('translate') : null) ?? (translations?.enabled && translations.scannedAt === null ? uncounted : translations?.enabled && translations.due > 0 ? stopped : null),
     },
     {
       id: 'review', enabled: Boolean(judge), unit: 'calls', waiting: judge?.waiting ?? 0, inFlight: judge?.leases.length ?? 0,
       doneLastHour: null, callsLastHour: judge?.lastHour.calls ?? null,
-      failed: sumFailed(judge?.totals.failed), note: null,
+      failed: sumFailed(judge?.totals.failed), note: resting('judge'),
     },
   ];
 

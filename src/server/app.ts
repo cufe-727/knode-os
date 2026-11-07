@@ -51,7 +51,7 @@ import {
   syncActiveLlm,
   defaultConfig,
   isCliProvider,
-  saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS, ExtractionWorkerConfig, embeddingDeferred } from '../config.js';
+  saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS, ExtractionWorkerConfig, embeddingDeferred, ProcessingConfig, processingSettings } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
 import { assertNotPrivate, assertSourcePath, assertWritablePath, capText, cleanRelPath, grepFiles, isOwnerRootFile, isPrivatePath, isRootWritableFile, listTree, makeDir, movePath, pathExists, readFileTextCapped, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
@@ -269,6 +269,8 @@ type ModelConfigDraft = {
   review?: Partial<Pick<ReviewConfig, 'llmJudge' | 'claims' | 'claimMerge' | 'external'>>;
   /** Content languages (docs/design/17). */
   languages?: Partial<LanguagesConfig>;
+  /** This machine's processing: auto-start, the cap on calls at once, the quota floor. */
+  processing?: Partial<ProcessingConfig>;
 };
 
 /** What `serve` runs per workspace beside the routes; absent in tests and CLI-hosted apps. */
@@ -1081,6 +1083,22 @@ export function createApp(
         if (claims === 'off' || claims === 'suggest') next.review.claims = claims;
         if (claimMerge === 'off' || claimMerge === 'suggest' || claimMerge === 'auto') next.review.claimMerge = claimMerge;
         if (external === 'off' || external === 'verify' || external === 'research') next.review.external = external;
+      }
+      if (incoming.processing) {
+        // this machine's processing (src/labeling/local.ts): the slots read the cap and the floor within a minute,
+        // auto-start at the service's next start
+        const p = incoming.processing;
+        const current = processingSettings(next);
+        const count = (v: unknown, max: number, fallback: number) => {
+          if (v === undefined) return fallback;
+          const n = Number(v);
+          return Number.isFinite(n) && n >= 0 ? Math.min(max, Math.floor(n)) : NaN;
+        };
+        const maxLocalCalls = count(p.maxLocalCalls, 64, current.maxLocalCalls);
+        const minQuotaPercent = count(p.minQuotaPercent, 100, current.minQuotaPercent);
+        if (Number.isNaN(maxLocalCalls)) return c.json({ error: 'processing.maxLocalCalls must be a whole number from 0 (no cap) up' }, 400);
+        if (Number.isNaN(minQuotaPercent)) return c.json({ error: 'processing.minQuotaPercent must be a percentage from 0 (off) to 100' }, 400);
+        next.processing = { autoStart: typeof p.autoStart === 'boolean' ? p.autoStart : current.autoStart, maxLocalCalls, minQuotaPercent };
       }
       if (incoming.languages) {
         // content languages (docs/design/17): a language knode-os does not know is refused, not dropped in silence

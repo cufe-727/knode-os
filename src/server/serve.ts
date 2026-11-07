@@ -21,7 +21,7 @@ import { AgentConversations } from '../ingest/conversations/follow.js';
 import { FeishuDocs } from '../ingest/feishu/docs.js';
 import { isOwnWrite } from '../ingest/own-writes.js';
 import { sync, SyncContext, syncsSettled, SyncStats } from '../ingest/sync.js';
-import { embeddingDeferred } from '../config.js';
+import { embeddingDeferred, processingSettings } from '../config.js';
 import { WorkBroker } from '../work/broker.js';
 import { offeredRemotely } from '../work/config.js';
 import { BrokeredEmbedder, embedOffered, EmbedSource, LocalEmbedSlots, localEmbedSlots } from '../work/embed.js';
@@ -609,16 +609,21 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   // the slowest call; the duplicate audit of what was written and the views
   // that depend on it follow on their own loop (docs/design/09, 10, 11). This
   // machine's slots and the reviews spend model calls, so none of them starts
-  // on its own: someone starts the processing (the app, POST
-  // /api/labeling/start) and it runs until stopped or shut down.
+  // on its own unless the workspace says so (`processing.autoStart`): someone
+  // starts the processing (the app, POST /api/labeling/start) and it runs
+  // until stopped or shut down, at most `processing.maxLocalCalls` calls at
+  // once and none on a plan under the quota floor (src/labeling/local.ts).
   const leaseMs = Math.max(1, ctx.config.server.remote?.leaseMinutes ?? 15) * 60_000;
   let summaries: SummarySource | null = null;
   const remoteJudge = { askedLately: () => false };
+  const localJudge = { heldForQuota: () => false };
   const labeling = new LabelingScheduler({ dataDir: ctx.dataDir, store: ctx.store, config: () => ctx.config, log, onWritten: (p) => summaries?.prefer(p) }, { leaseMs });
   // a review's judge calls: this machine's judge slots answer them, and remote
   // workers too where the workspace offers them and one asked lately
+  // a judge route held by the quota floor answers nothing until its window resets:
+  // a review files its candidates unjudged instead of waiting out each call
   const judges = new JudgeSource({
-    enabled: () => judgesHere(ctx.config) || (offeredRemotely(ctx.config, 'judge') && remoteJudge.askedLately()),
+    enabled: () => (judgesHere(ctx.config) && !localJudge.heldForQuota()) || (offeredRemotely(ctx.config, 'judge') && remoteJudge.askedLately()),
     deadlineMs: () => Math.max(1, ctx.config.server.remote?.callDeadlineMinutes ?? 20) * 60_000,
     log,
   }, { leaseMs });
@@ -636,8 +641,10 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   embedSlots = new LocalEmbedSlots(work, () => ctx.embedder, () => ctx.config, { log, source: embedWork });
   embedSlots.start();
   const localWorkers = new LocalLabelingWorkers(work, () => ctx.config, { log });
-  const processing = new LabelingProcessing(localWorkers, followUp, log);
-  log('processing is stopped until an administrator starts it (the Processing button in the app or the web UI, or POST /api/labeling/start)');
+  localJudge.heldForQuota = () => localWorkers.heldForQuota('judge');
+  const processing = new LabelingProcessing(localWorkers, followUp, log, () => processingSettings(ctx.config).minQuotaPercent);
+  if (processingSettings(ctx.config).autoStart) processing.start('the service (processing.autoStart)');
+  else log('processing is stopped until an administrator starts it (the Processing button in the app or the web UI, or POST /api/labeling/start)');
 
   // usage stats → sidecar flush
   const flushInterval = Math.max(1, ctx.config.heat.flushIntervalMinutes) * 60_000;

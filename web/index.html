@@ -672,6 +672,16 @@
               </div>
             </div>
           </div>
+
+          <div class="cfg-card-title"><div><b>Processing on this machine</b><small>Extraction, summaries, translations and review calls on this machine's own slots — what the Processing button starts. Remote workers are not counted.</small></div><span class="section-badge accent2">Limits</span></div>
+          <fieldset class="cfg-card cfg-card-wide">
+            <label class="cfg-check"><input id="cfg-processing-autostart" type="checkbox" /> Start processing when the service starts</label>
+            <div class="cfg-grid cfg-grid-3">
+              <label>Model calls at once, every stage together (0 = each stage's own count)<input id="cfg-processing-max-calls" type="number" min="0" max="64" step="1" /></label>
+              <label>Rest a Codex or Claude stage while its plan has less than this % left (0 = never)<input id="cfg-processing-min-quota" type="number" min="0" max="100" step="1" /></label>
+            </div>
+            <p class="cfg-callout">A stage that rests takes work again once the plan's window resets above the floor; Tasks shows it resting until then. Codex's windows are read without a model call; Claude's are what its last call here reported. Starting with the service takes effect at the next start — use Start processing in Tasks to start now.</p>
+          </fieldset>
         </section>
 
         <section class="settings-section" data-subtab="research" aria-labelledby="research-title">

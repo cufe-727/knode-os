@@ -1,4 +1,4 @@
-import { KnodeConfig, LlmConfig, resolveRoutedLlmConfig, routeTargets } from '../config.js';
+import { KnodeConfig, LlmConfig, processingSettings, resolveRoutedLlmConfig, routeTargets } from '../config.js';
 import { LLM_WIKI_INPUT_CHARS } from '../constants.js';
 import { buildExtractRequest } from '../graph/llm-extract.js';
 import { loadOntology } from '../graph/ontology.js';
@@ -202,11 +202,14 @@ export async function estimateProcessing(input: ProcessingEstimateInput): Promis
 
   /* ------------------------------ routes ------------------------------ */
   const targets = routeTargets(config);
+  // no stage here runs more calls at once than the machine's cap, every stage together (src/labeling/local.ts)
+  const cap = processingSettings(config).maxLocalCalls;
   const local = (specs: ({ slots: number; llm: LlmConfig } | null)[]): RouteSpec[] =>
     specs.flatMap((s) => {
       if (!s) return [];
       const client = new LlmClient(s.llm);
-      return client.enabled ? [{ route: client.label, service: serviceOfLlm(s.llm), model: s.llm.model, slots: s.slots, remote: false }] : [];
+      const slots = cap > 0 ? Math.min(s.slots, cap) : s.slots;
+      return client.enabled ? [{ route: client.label, service: serviceOfLlm(s.llm), model: s.llm.model, slots, remote: false }] : [];
     });
   const remote = remoteRoutes(input.workers, config, now);
   const routes: Record<RemoteKind, RouteSpec[]> = {
@@ -236,6 +239,9 @@ export async function estimateProcessing(input: ProcessingEstimateInput): Promis
     if (lines.some((l) => l.kind === kind && l.slots === 0)) {
       notes.push(`${label}: no slot takes this work now — this machine has none for it and no remote worker asked lately — so it waits, and the time leaves it out.`);
     }
+  }
+  if (cap > 0 && new Set(lines.filter((l) => !l.remote && l.slots > 0).map((l) => l.kind)).size > 1) {
+    notes.push(`This machine runs at most ${cap} model call${cap === 1 ? '' : 's'} at once, every stage together: stages that have work at the same time share them, so they take longer than each one's time says.`);
   }
   if (lines.some((l) => l.remote)) notes.push('Remote workers that asked for work in the last ten minutes take part of it, whether or not processing runs here; their calls are paid from their own machines\' logins, counted here under the same services.');
 

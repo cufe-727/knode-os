@@ -1,11 +1,13 @@
 import os from 'node:os';
-import { KnodeConfig, LlmConfig, resolveRoutedLlmConfig, routeTargets } from '../config.js';
+import { KnodeConfig, LlmConfig, processingSettings, resolveRoutedLlmConfig, routeTargets } from '../config.js';
 import { contentLanguages } from '../lang/languages.js';
+import { cliCommand } from '../llm/cli.js';
 import { LlmClient } from '../llm/client.js';
 import type { CallUsage } from '../llm/usage.js';
 import { WorkTask } from '../work/broker.js';
 import { WorkKind } from '../work/kinds.js';
 import { BackendHealth, classifyFailure, newBackendHealth, recordBackendOutcome } from './failures.js';
+import { meteredPlan, PlanQuotaReader, QuotaHold, quotaHold, readPlanQuota } from './plan-quota.js';
 import { TaskOutcome, WorkerIdentity } from './scheduler.js';
 
 /**
@@ -19,6 +21,14 @@ import { TaskOutcome, WorkerIdentity } from './scheduler.js';
  * answers rests it, a missing CLI or expired login parks it for half an hour
  * and then tries again (src/labeling/failures.ts). Settings saves are picked
  * up within a minute.
+ *
+ * Two limits sit over every backend (`processing`): at most
+ * `maxLocalCalls` calls run at once, every stage together — a review's judge
+ * calls first in line for a free one, since a review waits on them, the
+ * rest by turns — and a backend on a plan-metered CLI (Codex, Claude) takes
+ * no new work while its plan has less than `minQuotaPercent` left in any
+ * window (src/labeling/plan-quota.ts). It takes work again once the window
+ * resets above the floor; the Tasks view shows it resting until then.
  *
  * The slots run only between `start()` and `stop()`, as often as someone
  * starts and stops them (src/labeling/processing.ts): `serve` never starts
@@ -131,6 +141,8 @@ export interface LocalBackendStatus {
   pausedUntil: string | null;
   pauseReason: string | null;
   lastError: string | null;
+  /** Set while its plan is under the quota floor (also shown as its pause). */
+  quotaHold: QuotaHold | null;
 }
 
 interface Backend {
@@ -140,6 +152,10 @@ interface Backend {
   slots: number;
   busy: number;
   health: BackendHealth;
+  /** The CLI provider and the executable its plan is read through. */
+  provider: string;
+  command: string;
+  quota: { checkedAt: number; hold: QuotaHold | null; pending: Promise<QuotaHold | null> | null };
 }
 
 export interface LocalWorkersOptions {
@@ -148,6 +164,65 @@ export interface LocalWorkersOptions {
   /** How often the config is checked for changed workers. */
   reconfigureMs?: number;
   log?: (msg: string) => void;
+  /** How a backend's plan is read for the quota floor (tests hand their own). */
+  readQuota?: PlanQuotaReader;
+  /** How often a backend's plan is read again, held or not (default 2 minutes). */
+  quotaCheckMs?: number;
+}
+
+/**
+ * At most `capacity` calls at once (0: no cap, only counted). Whoever waits
+ * for a free call is served in turn, except that urgent ones — a review's
+ * judge calls — go ahead of the rest.
+ */
+export class CallLimiter {
+  private capacity = 0;
+  private held = 0;
+  private readonly waiting: { urgent: boolean; grant: (ok: boolean) => void }[] = [];
+
+  get inUse(): number {
+    return this.held;
+  }
+
+  get limit(): number {
+    return this.capacity;
+  }
+
+  setCapacity(n: number): void {
+    this.capacity = Math.max(0, Math.floor(n));
+    this.drain();
+  }
+
+  /** Resolves true once a call may start, false when the wait was called off. */
+  acquire(urgent = false): Promise<boolean> {
+    if (this.waiting.length === 0 && (this.capacity === 0 || this.held < this.capacity)) {
+      this.held++;
+      return Promise.resolve(true);
+    }
+    return new Promise((grant) => {
+      const entry = { urgent, grant };
+      const after = urgent ? this.waiting.findIndex((w) => !w.urgent) : -1;
+      if (after >= 0) this.waiting.splice(after, 0, entry);
+      else this.waiting.push(entry);
+    });
+  }
+
+  release(): void {
+    this.held = Math.max(0, this.held - 1);
+    this.drain();
+  }
+
+  /** Turn away everyone waiting: the slots are stopping. */
+  cancel(): void {
+    for (const w of this.waiting.splice(0)) w.grant(false);
+  }
+
+  private drain(): void {
+    while (this.waiting.length > 0 && (this.capacity === 0 || this.held < this.capacity)) {
+      this.held++;
+      this.waiting.shift()!.grant(true);
+    }
+  }
 }
 
 export class LocalLabelingWorkers {
@@ -158,6 +233,9 @@ export class LocalLabelingWorkers {
   private timer: NodeJS.Timeout | null = null;
   private readonly sleepers = new Set<() => void>();
   private readonly log: (msg: string) => void;
+  private readonly limiter = new CallLimiter();
+  private readonly readQuota: PlanQuotaReader;
+  private readonly quotaCheckMs: number;
 
   constructor(
     private readonly work: WorkLeaser,
@@ -165,6 +243,30 @@ export class LocalLabelingWorkers {
     private readonly opts: LocalWorkersOptions = {},
   ) {
     this.log = opts.log ?? (() => {});
+    this.readQuota = opts.readQuota ?? ((provider, command) => readPlanQuota(provider, command));
+    this.quotaCheckMs = opts.quotaCheckMs ?? 120_000;
+  }
+
+  /** Calls this machine's slots run now, and the most they may (0: no cap beyond each stage's slots). */
+  calls(): { inFlight: number; max: number } {
+    // the configured cap, before the first start has applied it too
+    return { inFlight: this.limiter.inUse, max: processingSettings(this.config()).maxLocalCalls };
+  }
+
+  /** The backends whose plans are under the quota floor now. */
+  quotaHolds(): { id: string; label: string; reason: string; until: string | null }[] {
+    return this.backends.filter((b) => b.quota.hold).map((b) => ({ id: b.id, label: b.client.label, reason: b.quota.hold!.reason, until: b.quota.hold!.until }));
+  }
+
+  /** Whether every backend here that takes `kind` is held by the quota floor (false when none takes it). */
+  heldForQuota(kind: WorkKind): boolean {
+    return this.quotaHoldFor(kind) !== null;
+  }
+
+  /** The hold on `kind` when every backend here that takes it is held, else null. */
+  quotaHoldFor(kind: WorkKind): QuotaHold | null {
+    const taking = this.backends.filter((b) => b.kinds.includes(kind));
+    return taking.length > 0 && taking.every((b) => b.quota.hold !== null) ? taking[0].quota.hold : null;
   }
 
   /** Whether the slots are taking work. */
@@ -194,28 +296,37 @@ export class LocalLabelingWorkers {
     this.timer = null;
     for (const wake of this.sleepers) wake();
     this.sleepers.clear();
+    this.limiter.cancel();
   }
 
   status(): LocalBackendStatus[] {
     const now = Date.now();
-    return this.backends.map((b) => ({
-      id: b.id,
-      label: b.client.label,
-      slots: b.slots,
-      busy: b.busy,
-      calls: b.health.calls,
-      ok: b.health.ok,
-      failed: { ...b.health.failed },
-      pausedUntil: b.health.pausedUntil > now ? new Date(b.health.pausedUntil).toISOString() : null,
-      pauseReason: b.health.pausedUntil > now ? b.health.pauseReason : null,
-      lastError: b.health.lastError,
-    }));
+    return this.backends.map((b) => {
+      const resting = b.health.pausedUntil > now;
+      const hold = b.quota.hold;
+      // a quota hold shows as a rest until the window resets (or the next reading, where none says when)
+      const holdUntil = hold ? hold.until ?? new Date(b.quota.checkedAt + this.quotaCheckMs).toISOString() : null;
+      return {
+        id: b.id,
+        label: b.client.label,
+        slots: b.slots,
+        busy: b.busy,
+        calls: b.health.calls,
+        ok: b.health.ok,
+        failed: { ...b.health.failed },
+        pausedUntil: resting ? new Date(b.health.pausedUntil).toISOString() : holdUntil,
+        pauseReason: resting ? b.health.pauseReason : hold?.reason ?? null,
+        lastError: b.health.lastError,
+        quotaHold: hold,
+      };
+    });
   }
 
   /** Rebuild the slots when the configured workers changed; old slots finish their call and stop. */
   reconfigure(): void {
     if (this.stopped) return;
     const config = this.config();
+    this.limiter.setCapacity(processingSettings(config).maxLocalCalls);
     const stages = [localSummarySpec(config), localJudgeSpec(config), localTranslateSpec(config)].filter((s): s is LocalWorkerSpec => s !== null);
     const specs = [...localWorkerSpecs(config, this.log), ...stages]
       .map((s) => ({ ...s, client: new LlmClient(s.llm) }))
@@ -224,12 +335,19 @@ export class LocalLabelingWorkers {
     if (signature === this.signature) return;
     this.signature = signature;
     const generation = ++this.generation;
-    this.backends = specs.map((s) => ({ id: s.id, kinds: s.kinds, client: s.client, slots: s.slots, busy: 0, health: newBackendHealth() }));
+    this.backends = specs.map((s) => ({
+      id: s.id, kinds: s.kinds, client: s.client, slots: s.slots, busy: 0, health: newBackendHealth(),
+      provider: s.llm.provider, command: cliCommand(s.llm.provider, s.llm.cliPath ?? ''),
+      quota: { checkedAt: 0, hold: null, pending: null },
+    }));
     for (const backend of this.backends) {
       for (let n = 1; n <= backend.slots; n++) void this.slot(backend, n, generation);
     }
+    const limits = processingSettings(config);
     this.log(this.backends.length
       ? `labeling: local workers ${this.backends.map((b) => `${b.id} (${b.client.label}) × ${b.slots}`).join(', ')}`
+        + `${limits.maxLocalCalls > 0 ? `; at most ${limits.maxLocalCalls} calls at once` : ''}`
+        + `${limits.minQuotaPercent > 0 && this.backends.some((b) => meteredPlan(b.provider)) ? `; a Codex or Claude plan under ${limits.minQuotaPercent}% left holds its stages` : ''}`
       : 'labeling: no local workers (no stage has a model here) — remote workers can still take work');
   }
 
@@ -251,29 +369,89 @@ export class LocalLabelingWorkers {
     return !this.stopped && generation === this.generation;
   }
 
+  /**
+   * Whether a backend's plan is under the quota floor, read at most every
+   * `quotaCheckMs` however many of its slots ask. A backend with no plan
+   * reading (an API key, Cursor) is never held; nor is one whose read failed
+   * with nothing remembered — a refused call still rests it (src/labeling/failures.ts).
+   */
+  private async quotaHoldOf(backend: Backend): Promise<QuotaHold | null> {
+    const floor = processingSettings(this.config()).minQuotaPercent;
+    const q = backend.quota;
+    if (!(floor > 0) || !meteredPlan(backend.provider)) {
+      if (q.hold) this.noteHold(backend, null);
+      return null;
+    }
+    if (q.pending) return q.pending;
+    if (q.checkedAt > 0 && Date.now() - q.checkedAt < this.quotaCheckMs) return q.hold;
+    const pending = (async () => {
+      let hold = q.hold;
+      try {
+        hold = quotaHold(await this.readQuota(backend.provider, backend.command), floor);
+      } catch (err) {
+        // what it knew stands until a read succeeds
+        this.log(`labeling: could not read the ${backend.client.label} plan: ${err instanceof Error ? err.message : err}`);
+      }
+      q.checkedAt = Date.now();
+      this.noteHold(backend, hold);
+      return hold;
+    })();
+    q.pending = pending;
+    try {
+      return await pending;
+    } finally {
+      q.pending = null;
+    }
+  }
+
+  private noteHold(backend: Backend, hold: QuotaHold | null): void {
+    const was = backend.quota.hold;
+    backend.quota.hold = hold;
+    if (hold && !was) this.log(`labeling: ${backend.id} (${backend.client.label}) takes no new work: ${hold.reason}${hold.until ? `, until ${hold.until}` : ''}`);
+    else if (!hold && was) this.log(`labeling: ${backend.id} (${backend.client.label}) takes work again: its plan is over the quota floor`);
+  }
+
   private async slot(backend: Backend, n: number, generation: number): Promise<void> {
     const who: WorkerIdentity = { worker: `${os.hostname()}/${backend.id}#${n}`, backend: backend.client.label, remote: false };
     const idleMs = this.opts.idleMs ?? 20_000;
+    const urgent = backend.kinds.includes('judge');
     while (this.live(generation)) {
       const pause = backend.health.pausedUntil - Date.now();
       if (pause > 0) {
         await this.sleep(Math.min(pause, 15_000));
         continue;
       }
+      // the plan before a call: a held backend waits without taking one of the calls
+      if (await this.quotaHoldOf(backend)) {
+        await this.sleep(this.quotaCheckMs);
+        continue;
+      }
+      if (!(await this.limiter.acquire(urgent))) break;
+      if (!this.live(generation)) {
+        this.limiter.release();
+        break;
+      }
       let task: WorkTask | undefined;
       try {
         [task] = await this.work.lease(who, backend.kinds, 1);
       } catch (err) {
+        this.limiter.release();
         this.log(`labeling: ${who.worker} could not take work: ${err instanceof Error ? err.message : err}`);
         await this.sleep(30_000);
         continue;
       }
       if (!task) {
+        this.limiter.release();
         // jittered, so slots do not poll in lockstep
         await this.sleep(Math.round(idleMs * (0.75 + Math.random() * 0.5)));
         continue;
       }
-      const outcome = await this.run(backend, task, who);
+      let outcome: TaskOutcome;
+      try {
+        outcome = await this.run(backend, task, who);
+      } finally {
+        this.limiter.release();
+      }
       try {
         await this.work.complete(task.id, who, outcome);
       } catch (err) {

@@ -431,6 +431,27 @@ describe('PUT /api/config with embedding providers', () => {
   });
 });
 
+describe('PUT /api/config with processing settings', () => {
+  it('stores auto-start, the cap on calls at once and the quota floor, refusing a value that is none', async () => {
+    const save = async (body: unknown) => app.request('/api/config', { method: 'PUT', headers, body: JSON.stringify(body) });
+    const fresh = (await (await app.request('/api/config', { headers })).json()) as KnodeConfig;
+    expect(fresh.processing).toEqual({ autoStart: false, maxLocalCalls: 2, minQuotaPercent: 20 });
+
+    const saved = await save({ processing: { autoStart: true, maxLocalCalls: 3 } });
+    expect(saved.status).toBe(200);
+    expect(((await saved.json()) as { config: KnodeConfig }).config.processing).toEqual({ autoStart: true, maxLocalCalls: 3, minQuotaPercent: 20 });
+    // a save that sends no processing keeps it
+    await save({ review: { llmJudge: 'suggest' } });
+    const kept = (await (await app.request('/api/config', { headers })).json()) as KnodeConfig;
+    expect(kept.processing).toEqual({ autoStart: true, maxLocalCalls: 3, minQuotaPercent: 20 });
+
+    expect((await save({ processing: { minQuotaPercent: -5 } })).status).toBe(400);
+    expect((await save({ processing: { maxLocalCalls: 'many' } })).status).toBe(400);
+    const capped = ((await (await save({ processing: { autoStart: false, maxLocalCalls: 0, minQuotaPercent: 150 } })).json()) as { config: KnodeConfig }).config;
+    expect(capped.processing).toEqual({ autoStart: false, maxLocalCalls: 0, minQuotaPercent: 100 });
+  });
+});
+
 describe('PUT /api/config with connections', () => {
   it('stores the list, redacts its keys, and keeps a secret the client echoes back', async () => {
     const save = async (body: unknown) =>
