@@ -48,7 +48,7 @@ export interface RunMeta {
   packs: string[];
   systems: string[];
   suites: string[];
-  model: { connection: string; label: string; buildEffort: string; answerEffort: string };
+  model: { connection: string; label: string; buildEffort: string; answerEffort: string; agents?: string };
   judge: { connection: string; label: string };
   embedding: string;
   fraction: number;

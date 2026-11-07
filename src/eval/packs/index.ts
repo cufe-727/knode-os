@@ -1,5 +1,6 @@
 import type { LlmClient } from '../../llm/client.js';
-import type { PackIssues } from '../pack.js';
+import type { LoadedPack, PackIssues } from '../pack.js';
+import type { Task } from '../types.js';
 import type { CorpusPlan } from './corpus-tasks.js';
 import { buildFixturePack } from './fixture.js';
 
@@ -34,6 +35,8 @@ export interface Recipe {
   modelFreeCorpus?: boolean;
   /** `extend` can take padding from a build with `padding` set, without a model (local or cached sources). */
   padding?: 'local' | 'download' | 'author';
+  /** Tasks of the recipe's own that `extend` drafts for a built pack (research-ai's field review and directions). */
+  extendTasks?(pack: LoadedPack, ctx: RecipeContext): Promise<Task[]>;
 }
 
 const recipes: Recipe[] = [

@@ -8,9 +8,11 @@ import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings
 import { createConfiguredEmbeddingProvider } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
 import { Judge } from './judge.js';
+import { ModelChain, parseChain, SpendLedger } from './chain.js';
+import { setAgentRouting } from './agent.js';
 import { Meter } from './meter.js';
 import { dirBytes, listFiles, loadPack, LoadedPack, packsDir, runsDir, seededKey, stageCorpus, StagedCorpus, stageUpdate, validatePack } from './pack.js';
-import { checkEndpoint, endpointUnder } from './endpoint.js';
+import { calibrateEndpoint, checkEndpoint, endpointUnder, preferEndpoint } from './endpoint.js';
 import { citationsIn, taskPrompt } from './prompts.js';
 import { EmbeddingBudget, QuotaGuard } from './quota.js';
 import { fileLines, recordKey, RunMeta, RunStore } from './runstore.js';
@@ -55,11 +57,22 @@ export interface RunOptions {
    * vectors the run holds (`checkEndpoint`).
    */
   embeddingEndpoint?: string;
+  /** With `embeddingEndpoint`: embed on the workspace's embedder while the endpoint is unreachable (a local bge-m3 first, the pool after). */
+  embeddingFallback?: boolean;
   buildEffort?: LlmEffort;
   answerEffort?: LlmEffort;
   /** Judge: a CLI provider ('claude-cli') and model. */
   judgeProvider?: string;
   judgeModel?: string;
+  /**
+   * Budgeted model chains (D18), e.g. `openai-api:200,codex-cli`: the model
+   * calls of every system (`chatChain`), the agent sessions (`agentChain`,
+   * API links billed through Codex, then the login) and the judge
+   * (`judgeChain`). Connections come from `configFrom`.
+   */
+  chatChain?: string;
+  agentChain?: string;
+  judgeChain?: string;
   embedding?: 'workspace' | 'local';
   /** At most this many tasks per pack (stratified by type), and fewer for agents. */
   limit?: number;
@@ -178,9 +191,34 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     ?? (opts.embedding === 'local' || !workspaceConfig
       ? createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false })
       : createConfiguredEmbeddingProvider(workspaceConfig));
-  const embedder = opts.embeddingEndpoint ? endpointUnder(configured, opts.embeddingEndpoint) : configured;
-  const backend = opts.overrides?.chat ?? (opts.chatConnection ? connectionBackend(workspaceConfig, opts.chatConnection, opts.model) : new CodexBackend({ model: opts.model }));
-  const judgeClient = opts.overrides?.judge ?? new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 });
+  const onEndpoint = opts.embeddingEndpoint ? endpointUnder(configured, opts.embeddingEndpoint) : null;
+  const embedder = !onEndpoint ? configured
+    : opts.embeddingFallback ? preferEndpoint(onEndpoint, configured, (m) => {
+      progress(m);
+      store.log(m);
+    }) : onEndpoint;
+  const ledger = new SpendLedger();
+  const chainLog = (m: string) => {
+    progress(m);
+    store.log(m);
+  };
+  const chain = (spec: string) => new ModelChain(parseChain(spec, workspaceConfig, { ledger, model: opts.model }), ledger, chainLog);
+  const backend = opts.overrides?.chat
+    ?? (opts.chatChain ? chain(opts.chatChain).asBackend()
+      : opts.chatConnection ? connectionBackend(workspaceConfig, opts.chatConnection, opts.model) : new CodexBackend({ model: opts.model }));
+  const judgeClient = opts.overrides?.judge
+    ?? (opts.judgeChain ? chain(opts.judgeChain).asClient()
+      : new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 }));
+  if (opts.agentChain) {
+    const agents = chain(opts.agentChain);
+    const bad = agents.links.find((l) => !l.api && l.name !== 'codex-cli');
+    if (bad) throw new Error(`--agent-chain: agents run in Codex; "${bad.name}" is neither an API connection nor codex-cli`);
+    setAgentRouting({
+      pick: () => agents.pick(),
+      charge: (name, model, usage) => void agents.charge(agents.links.find((l) => l.name === name)!, model, usage, { role: 'agent' }),
+      exhaust: (name, why) => agents.exhaust(agents.links.find((l) => l.name === name)!, why),
+    });
+  }
   const judge = new Judge({ client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
   const models = { model: opts.model ?? '', buildEffort: opts.buildEffort ?? 'low', answerEffort: opts.answerEffort ?? 'medium' };
 
@@ -211,8 +249,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     packs: opts.packs.map((p) => path.basename(p)),
     systems: opts.systems,
     suites: [...suites],
-    model: { connection: opts.chatConnection ?? 'codex-cli', label: backend.label, buildEffort: models.buildEffort, answerEffort: models.answerEffort },
-    judge: { connection: opts.judgeProvider ?? 'claude-cli', label: judgeClient.label },
+    model: { connection: opts.chatChain ?? opts.chatConnection ?? 'codex-cli', label: backend.label, buildEffort: models.buildEffort, answerEffort: models.answerEffort, ...(opts.agentChain ? { agents: opts.agentChain } : {}) },
+    judge: { connection: opts.judgeChain ?? opts.judgeProvider ?? 'claude-cli', label: judgeClient.label },
     embedding: `${embedder.model} (${embedder.dimensions})`,
     fraction,
     seed,
@@ -248,10 +286,21 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       for (const w of issues.warnings) store.log('pack warning', { pack: pack.manifest.id, warning: w });
       return pack;
     });
-    if (opts.embeddingEndpoint) {
-      const check = await checkEndpoint(embedder, shim.vectors, packs);
-      progress(`embedding on ${opts.embeddingEndpoint} as ${embedder.model}: ${check.texts} texts the run holds came back at cosine ${check.lowest.toFixed(5)} or more`);
-      store.log('embedding endpoint', { url: opts.embeddingEndpoint, identity: embedder.model, ...check });
+    if (opts.embeddingEndpoint && onEndpoint) {
+      // against the vectors the run holds; a run that holds too few is checked against the workspace's embedder itself
+      try {
+        const check = await checkEndpoint(onEndpoint, shim.vectors, packs).catch(async (err) => {
+          if (!/can be checked against only/.test(String(err))) throw err;
+          return calibrateEndpoint(onEndpoint, configured, packs);
+        });
+        progress(`embedding on ${opts.embeddingEndpoint} as ${embedder.model}: ${check.texts} texts came back at cosine ${check.lowest.toFixed(5)} or more`);
+        store.log('embedding endpoint', { url: opts.embeddingEndpoint, identity: embedder.model, ...check });
+      } catch (err) {
+        // unreachable: the fallback takes over; a model that does not reproduce the vectors is refused either way
+        if (!opts.embeddingFallback || !/econnrefused|fetch failed|etimedout|enotfound|socket hang up|connection (refused|reset)|network/i.test(String(err))) throw err;
+        progress(`embedding endpoint ${opts.embeddingEndpoint} unreachable: embedding on ${configured.model}`);
+        store.log('embedding endpoint unreachable', { url: opts.embeddingEndpoint, error: String(err).slice(0, 200) });
+      }
     }
     const runPack = async (pack: LoadedPack) => {
       const staged = stageCorpus(pack, { fraction, seed });
@@ -362,6 +411,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
 
     if (!opts.skipScoring) await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing }, progress);
   } finally {
+    setAgentRouting(null);
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);
     closeAdapters();

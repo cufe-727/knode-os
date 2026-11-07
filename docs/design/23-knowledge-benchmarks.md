@@ -48,6 +48,7 @@ pages 98% faithful) showed what such a benchmark can find.
 | D15 The update stream is cumulative and costed | Batches apply in order up to the last one a task asks after; every group's update is a build record (`<group>@NN`) and every answer after a batch carries it | "Latest state after each batch" means batch 03's answers see 01–03, and incremental cost is the wiki pattern's selling point |
 | D16 Extend, do not rebuild | `eval pack extend` adds corpus-level tasks and padding to a built pack, leaving its corpus (and version) as it is; `eval run --reuse-builds-from` copies another run's builds of the same pack versions | finance-cn is a slice of a live workspace that has grown since; rebuilding it would re-sample it. The pilot's knode and LLM Wiki builds of finance-cn, research-ai and law-cn cost ~50M weighted tokens |
 | D17 Cost is part of the result | Correctness per 1k query tokens, with the build spread over 100 and 1000 queries, and break-even per system against agent-grep | A wiki that is as correct as grep at a higher query cost and never pays back its build (the pilot's agent-wiki) has not added value |
+| D18 Budgeted model chains, a local embedder first | Every model role takes a chain: `openai-api:200,codex-cli` for the systems (one-shot calls through the shim, agent sessions through Codex with the API key as a custom model provider, the key only in the child's environment), `anthropic-api:100,codex-cli` for the author and the judge. A paid link is priced from reported usage into one ledger all eval processes share (`~/knode-eval/spend.jsonl`, budgets in `budgets.json`) and passed over at 95% of its budget, or at once when the provider says the credit is gone. Embeddings go to a local bge-m3 (`eval/embed_server.py`, `--embedding-endpoint … --embedding-fallback`), checked against the pool's vectors, with the pool behind it | API money is finite and shared with other work; Codex's plan is the fallback. Systems stay on one model (gpt-6.1-sol on the API and on Codex), so a switch mid-run does not change who answers; the author and judge stay in another family (D8) |
 | D12 A quota guard, not a hope | Before each batch `readCodexAccount()` reads Codex's windows (no model call). A run pauses above 92% (five-hour) or 90% (weekly) and resumes after the reset. A refused judge call sleeps and retries | On 2026‑11‑04 the weekly window was 72% used with five days to its reset, and the finance workspace's extraction uses the same plan |
 
 ## 2. Packs (`src/eval/packs/`)
@@ -95,8 +96,38 @@ Where the gold comes from:
   gold is complete within that bound and padding without the keywords cannot change it; chains drawn from the fact graph, written with the
   bridges unnamed, kept by the oracle check. finance-cn's padding is more of the same workspace (local).
 - **public-musique-deep**: `--options '{"minHops":3}'` keeps MuSiQue's 3- and 4-hop questions only, typed `deep-hop`.
+- **research-ai, field-level emergence** (`researchEmergence`, drafted at `extend`): the field's main lines of work (each paper's approach named,
+  grouped into lines of ≥3 papers: the backbone of a review, set-scored with ≥2 cited papers per item), the open problems the 2026 holdout
+  papers actually advance (promising directions, decided by what came next, not by the author's opinion), and a structured review graded on
+  keypoints covering both.
+
+A sixth type, `ambiguous`, asks about a name that means two things (two people, a renamed project, a redefined metric): a list of readings, or
+a judged answer whose keypoints include the ambiguity.
 
 `knode-os eval pack extend <pack>` adds all of this to a pack already built (D16).
+
+### 2.2 A year of weekly reports (`synthetic-reports-zh/-en`, 2026‑11‑07)
+
+Three teams of one company write a report every week and a PMO sums them up every month, all rendered from a seeded script in templates
+(no model, built in under a second at any size). The script decides people (hires, departures, transfers, a lead who steps down halfway),
+projects (progress each week, planned and actual launch, a rename in week 20, owners taking over), incidents (severity, customer escalations,
+root cause and fixer in the next week's postmortem), risks (raised, owned, handed over, closed months later), each team's metric (one
+redefined in week 30), overtime, and how each lead writes (four styles). Most of each report is everyday work — members' work items, meeting
+notes, customer feedback, next week's plan — that is gold for nothing: the haystack.
+
+- weeks 1–44 are the corpus (≈140 documents, 74k characters in Chinese, 167k in English), 45–48 four update batches, 49–52 the holdout;
+- 42 corpus-level tasks (every P1 of a team, every customer that escalated, every transfer, open risks, month-end figures, project progress,
+  risk lifecycles, the PMO's disagreements with the teams, profiles of people and projects);
+- deep hops: five-hop chains in five reports (a customer's escalation → the incident → its fixer → their transfer → the project they took
+  over → its launch; a risk → who raised it → the escalated incident they fixed → the same customer's incident in another team → its fixer)
+  and four-hop ones;
+- ambiguity: two people named 陈伟 (Alex Chen) in two teams, Atlas renamed Orion, weekly active users redefined;
+- traceback: when and by whom a risk was first raised, 6–20 weeks before it closed;
+- emergence: each team's state per quarter (健康 / 吃紧 / 透支, never named, from overtime, P1s and departures), each lead's style (a gold list
+  of its features), unsigned holdout excerpts with every name blanked to attribute, and which projects will miss their week after week 44
+  (the holdout decides);
+- scale: `--options '{"scale":10}'` adds other teams of the same company (disjoint names, projects and customers) as padding for
+  `--fraction 10` — 0.8M characters in Chinese, 1.7M in English — so long-context falls out and grep has 30 teams' reports to search.
 
 ## 3. Systems (`src/eval/systems/`)
 
@@ -191,6 +222,10 @@ knode-os eval report ~/knode-eval/runs/<stamp>
 - `--types aggregate,timeline,contradiction,profile,deep-hop,update` runs only those tasks; `--reuse-builds-from <run>` starts from another
   run's builds of the same pack versions (refused when it embedded with another model).
 - `knode-os eval pack extend <pack> [--corpus <json>] [--padding <n>] [--no-author]` adds corpus-level tasks and padding to a built pack.
+- `--chat-chain`, `--agent-chain`, `--judge-chain` (run) and `--author-chain` (pack build, extend) take budgeted chains such as
+  `openai-api:200,codex-cli` over the `--config-from` workspace's connections (D18); spend lands in `~/knode-eval/spend.jsonl`.
+- `--embedding-endpoint http://127.0.0.1:12020/v1 --embedding-fallback` embeds on a local bge-m3 (`uv run eval/embed_server.py`), checked
+  against the pool, and on the pool while it is down.
 - `--embedding-cap` bounds what a run takes from the shared pool.
 - `--embedding-daily-cap` bounds what it takes per UTC day, since the live service shares the pool and its free quotas reset at 00:00 UTC. Past the cap, or when the pool itself refuses, a pack waits for the next day and then resumes.
 
@@ -207,19 +242,21 @@ knode-os eval report ~/knode-eval/runs/<stamp>
   keyword bound; profiles are scored on recall for that reason. No human audit of it yet.
 - law-cn has few disagreements and no timelines inside one law: its corpus-level tasks are mostly aggregates.
 
-## 7. Proposed corpus-level run (2026‑11‑07, awaiting approval)
+## 7. Proposed corpus-level run (revised 2026‑11‑07, awaiting approval)
 
-Nothing below has been run; each phase needs the user's go-ahead. Estimates come from the pilot: 335M Codex weighted tokens in all
-(builds 260M, 3,550 answers 75M); about $1.4 per 1M weighted tokens where the pilot was priced; agents at ~1.5× their pilot cost per query,
-since a list needs more reading.
+Nothing below has been run. Money: the OpenAI key has ≈ $200 left and the Anthropic key ≈ $100 (D18 stops each at 95%); Codex CLI's plan is
+the fallback for both chains. Prices: gpt-6.1-sol and claude-sonnet-5-5 at $2 / $0.10–0.20 cached / $10 per 1M tokens. Per-query cost from
+the pilot's token profiles at those prices, agents at 1.5× for corpus-level tasks: agents $0.044–0.07, knode-ask $0.018, rag-hybrid $0.015,
+long-context ≈ $0.12, closed-book $0.007 — about $0.50 per task across the ten systems.
 
-| Phase | What | Model use | Downloads |
+| Phase | What | Model use | Money |
 | --- | --- | --- | --- |
-| 0 | `pack build public-musique --out …/public-musique-deep --options '{"minHops":3,"questions":30}'`; `pack extend law-cn --no-author` (38 statute tasks, 4 chains) | none | none (cached) |
-| 1 | `pack build synthetic-life-zh --seed 7` (v2); `pack extend finance-cn`, `research-ai`, `law-cn` (drafted part) | Claude author ≈ 75 + 75 + 75 + 20 ≈ **245 calls** (long-input) | none |
-| 2 | `eval run --pack synthetic-life-zh,finance-cn,research-ai,law-cn --types aggregate,timeline,contradiction,profile,deep-hop,update --suites usage,update --agent-limit 60 --config-from ~/.knode-os/users/admin/workspaces/finance --reuse-builds-from ~/knode-eval/runs/pilot-2026-11 --judge codex-cli --judge-model <not the answerer>`; systems agent-grep, agent-wiki, agent-wiki-sources, agent-knode-wiki, agent-knode-wiki-sources, agent-knode, knode-ask, rag-hybrid, long-context, closed-book | ≈ 210 tasks × 10 systems ≈ 2,100 answers ≈ **63M** weighted; new builds only for synthetic v2 (≈ 12M) and its four update batches (≈ 2M) → **≈ 77M ≈ $105**; judge ≈ 150 calls (most lists are matched without it) | none; ≈ 60k bge-m3 tokens |
-| 2b (optional) | public-musique-deep, same systems | ≈ 25M build + 8M answers ≈ **33M ≈ $45** | none |
-| 3 (optional) | scale: synthetic-life-zh at 3× and 10× (`--options '{"padding":10}'`, ≈ 110 more Claude calls) and finance-cn at 3× (`pack extend finance-cn --padding 3`, local) | synthetic 3× ≈ 50M, 10× ≈ 130M; finance-cn 3× ≈ 80M weighted (≈ $70 / $180 / $110) | bge-m3 ≈ 0.5M (synthetic 10×) and ≈ 2M tokens (finance 3×): past the pool's daily caps, so a local endpoint or `--embedding-daily-cap` |
+| 0 | `eval pack build synthetic-reports-zh` (and `-en`) with `--options '{"scale":10}'`; `pack build public-musique --out …/public-musique-deep --options '{"minHops":3,"questions":30}'`; `pack extend law-cn --no-author` | none | $0; no download (cached) |
+| 0b | local bge-m3: `uv run eval/embed_server.py --port 12020` (registered in service-config) | none | **downloads BAAI/bge-m3 ≈ 2.3 GB and torch/transformers** — needs approval |
+| 1 | `pack build synthetic-life-zh --seed 7` (v2); `pack extend finance-cn`, `research-ai` (+ field review, directions), `law-cn` — all with `--author-chain anthropic-api,codex-cli --config-from <finance workspace>` | ≈ 270 author calls | ≈ $20 Anthropic |
+| 2 | `eval run --pack synthetic-life-zh,finance-cn,research-ai,law-cn,synthetic-reports-zh --types aggregate,timeline,contradiction,profile,deep-hop,ambiguous,temporal,update,affect,style,attribution,forecast,themes --agent-limit 100 --model gpt-6.1-sol --reuse-builds-from ~/knode-eval/runs/pilot-2026-11 --chat-chain openai-api,codex-cli --agent-chain openai-api,codex-cli --judge-chain anthropic-api,codex-cli --embedding-endpoint http://127.0.0.1:12020/v1 --embedding-fallback --config-from <finance workspace>`; systems agent-grep, agent-wiki, agent-wiki-sources, agent-knode-wiki, agent-knode-wiki-sources, agent-knode, knode-ask, rag-hybrid, long-context, closed-book | ≈ 306 tasks × 10 systems; new builds only for synthetic-life v2 and the reports (≈ 26M tokens) and eight update batches | ≈ $150 answers + $43 builds on OpenAI (the last part may spill to Codex); judge ≈ 290 calls ≈ $20 Anthropic |
+| 2b (optional) | public-musique-deep, same systems | ≈ 30 tasks + its builds | ≈ $15 + builds; Codex once OpenAI is spent |
+| 3 (optional) | scale curves: synthetic-reports-zh at `--fraction 3` and `10` (padding from phase 0), finance-cn at 3 (`pack extend finance-cn --padding 3`) | builds grow with the corpus (reports 10×: ≈ 56M knode, ≈ 40M LLM Wiki weighted tokens) | Codex plan quota (OpenAI will be spent); bge-m3 local |
 
-Wall time follows the pilot: about two days for phase 2 under the plan windows, the quota guard pausing it. Before phase 2, reopen one
-reused build (`--limit 2`) to check that a copied knode workspace opens at its new path.
+Before phase 2, a smoke run (`--limit 2`, one pack) checks that a reused knode workspace opens at its new path and that an agent session
+bills the API key (one session ≈ $0.04).

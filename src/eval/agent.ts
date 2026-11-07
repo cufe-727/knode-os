@@ -32,6 +32,34 @@ export interface McpServerSpec {
   enabledTools?: string[];
 }
 
+/**
+ * Where agent sessions run (docs/design/23 D18): a model chain's API links
+ * become a Codex model provider billed to the key, a CLI link the Codex login.
+ * Set once per run by `runEval`; absent, every session uses the login.
+ */
+export interface AgentRouting {
+  pick(): { name: string; api?: { baseUrl: string; apiKey: string; model: string } } | null;
+  charge(name: string, model: string, usage: CallUsage | null): void;
+  exhaust(name: string, why: string): void;
+}
+
+let routing: AgentRouting | null = null;
+
+export function setAgentRouting(r: AgentRouting | null): void {
+  routing = r;
+}
+
+/** The env var a session reads its API key from: never on the command line, where `ps` would show it. */
+export const AGENT_KEY_ENV = 'KNODE_EVAL_AGENT_API_KEY';
+
+/** Codex arguments that send a session to an OpenAI-compatible API (Responses) instead of the login. */
+export function apiProviderArgs(baseUrl: string): string[] {
+  return [
+    '-c', 'model_provider="knode_eval_api"',
+    '-c', `model_providers.knode_eval_api={ name = "knode eval API", base_url = ${JSON.stringify(baseUrl.replace(/\/$/, ''))}, env_key = "${AGENT_KEY_ENV}", wire_api = "responses" }`,
+  ];
+}
+
 export interface AgentRunOptions {
   cwd: string;
   prompt: string;
@@ -148,6 +176,22 @@ interface CodexItem {
 }
 
 export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
+  // down the chain: an API link until its budget or credit is gone, then the next
+  for (;;) {
+    const link = routing?.pick() ?? null;
+    if (routing && !link) throw new Error('agent sessions: every model in the chain is spent');
+    const r = await runAgentOnce(opts, link?.api);
+    const model = link?.api?.model ?? opts.model ?? '';
+    if (link) routing!.charge(link.name, model, r.usage);
+    if (link && r.error && /insufficient_quota|exceeded your current quota|credit balance is too low|billing|payment required|\b402\b/i.test(r.error)) {
+      routing!.exhaust(link.name, r.error.slice(0, 120));
+      continue;
+    }
+    return r;
+  }
+}
+
+async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiKey: string; model: string }): Promise<AgentRunResult> {
   const out = evalTempDir('agent-out');
   const outDir = out.root;
   const outFile = path.join(outDir, 'answer.txt');
@@ -199,8 +243,11 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
         steps = 0;
         capped = false;
         buffer = '';
-        return runProcess(cmd, agentArgs(opts, outFile, catalog), opts.prompt, opts.timeoutMs ?? 15 * 60_000, {
+        const args = agentArgs(api ? { ...opts, model: api.model || opts.model } : opts, outFile, catalog);
+        if (api) args.splice(args.length - 1, 0, ...apiProviderArgs(api.baseUrl));
+        return runProcess(cmd, args, opts.prompt, opts.timeoutMs ?? 15 * 60_000, {
           cwd: opts.cwd,
+          ...(api ? { env: { ...process.env, [AGENT_KEY_ENV]: api.apiKey } } : {}),
           onSpawn: (c) => (child = c),
           onStdout: (chunk) => {
             buffer += chunk;

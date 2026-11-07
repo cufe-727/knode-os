@@ -57,3 +57,46 @@ export async function checkEndpoint(embedder: EmbeddingProvider, vectors: Vector
   if (!(lowest >= minCosine)) throw new Error(`the embedding endpoint does not reproduce ${embedder.model}: cosine ${lowest.toFixed(4)} on one of ${probes.length} texts, under ${minCosine}`);
   return { texts: probes.length, lowest };
 }
+
+const DOWN = /econnrefused|fetch failed|etimedout|enotfound|socket hang up|connection (refused|reset)|network/i;
+
+/**
+ * The endpoint first, the workspace's embedder when it is down (D18: a local
+ * bge-m3 before the pool). Both embed under one identity, so a vector from
+ * either serves the same index; once the endpoint fails to connect, the rest
+ * of the run stays on the fallback.
+ */
+export function preferEndpoint(endpoint: EmbeddingProvider, fallback: EmbeddingProvider, log: (m: string) => void = () => {}): EmbeddingProvider & { usingFallback: () => boolean } {
+  let down = false;
+  return {
+    model: endpoint.model,
+    dimensions: endpoint.dimensions,
+    usingFallback: () => down,
+    embed: async (texts) => {
+      if (!down) {
+        try {
+          return await endpoint.embed(texts);
+        } catch (err) {
+          if (!DOWN.test(err instanceof Error ? err.message : String(err))) throw err;
+          down = true;
+          log(`embedding endpoint unreachable (${err instanceof Error ? err.message.slice(0, 80) : String(err)}): embedding on ${fallback.model} from now on`);
+        }
+      }
+      return fallback.embed(texts);
+    },
+  };
+}
+
+/**
+ * Check an endpoint against the reference embedder itself, on a few chunk texts
+ * of the packs: for a run that holds no vectors yet. It spends the reference's
+ * embedding on those texts (8 by default).
+ */
+export async function calibrateEndpoint(endpoint: EmbeddingProvider, reference: EmbeddingProvider, packs: LoadedPack[], n = 8, minCosine = ENDPOINT_MIN_COSINE): Promise<{ texts: number; lowest: number }> {
+  const texts = packs.flatMap((pack) => chunkDocs(pack.docs.slice(0, 10).map((d) => ({ path: d.path, text: docText(pack, d.path) }))).slice(0, Math.ceil(n / packs.length)).map((c) => c.text)).slice(0, n);
+  if (!texts.length) throw new Error('no texts to calibrate the embedding endpoint on');
+  const [mine, theirs] = [await endpoint.embed(texts), await reference.embed(texts)];
+  const lowest = Math.min(...mine.map((v, i) => unit(v).reduce((s, x, j) => s + x * unit(theirs[i])[j], 0)));
+  if (!(lowest >= minCosine)) throw new Error(`the embedding endpoint does not reproduce ${reference.model}: cosine ${lowest.toFixed(4)} on one of ${texts.length} texts, under ${minCosine}`);
+  return { texts: texts.length, lowest };
+}

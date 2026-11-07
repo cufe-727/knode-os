@@ -36,6 +36,11 @@ import { firstNumber } from '../src/eval/score/usage.js';
 import { buildScaleData, efficiencyOf, renderScale } from '../src/eval/report.js';
 import { recipe, registerRecipe } from '../src/eval/packs/index.js';
 import { extendPack } from '../src/eval/packs/extend.js';
+import { ModelChain, parseChain, SpendLedger } from '../src/eval/chain.js';
+import { runAgent, setAgentRouting } from '../src/eval/agent.js';
+import { calibrateEndpoint, preferEndpoint } from '../src/eval/endpoint.js';
+import { researchEmergence } from '../src/eval/packs/research.js';
+import type { KnodeConfig } from '../src/config.js';
 import '../src/eval/packs/recipes.js';
 import { draftCorpusTasks } from '../src/eval/packs/corpus-tasks.js';
 import { PackWriter } from '../src/eval/packs/writer.js';
@@ -831,4 +836,161 @@ describe('corpus-level tasks: cost and scale', () => {
     expect(md).toContain('correctness @2×');
     expect(md).toContain('24 documents');
   }, 120_000);
+});
+
+describe('budgeted model chains', () => {
+  const usage = (input: number, output: number) => ({ inputTokens: input, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: output, reasoningTokens: 0 });
+  const stub = (model: string, behave: () => string) => ({
+    model, label: model, enabled: true, provider: 'stub',
+    async complete(_m: unknown, opts: { onUsage?: (u: ReturnType<typeof usage>) => void } = {}) {
+      opts.onUsage?.(usage(100_000, 10_000));
+      return behave();
+    },
+  }) as unknown as LlmClient;
+
+  it('spends a link down to 95% of its budget, then the next; a spent account is passed over at once', async () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'ledger-'));
+    const ledger = new SpendLedger(path.join(dir, 'spend.jsonl'), path.join(dir, 'budgets.json'), 0);
+    const used: string[] = [];
+    // each call: 100k input at $2/M + 10k output at $10/M = $0.30
+    const chain = new ModelChain([
+      { name: 'openai-api', budget: 1, client: stub('gpt-6.1-sol', () => (used.push('openai'), 'a')) },
+      { name: 'anthropic-api', budget: 1, client: stub('claude-sonnet-5-5', () => { used.push('anthropic'); throw new Error('400 Your credit balance is too low to access the Anthropic API'); }) },
+      { name: 'codex-cli', budget: null, client: stub('gpt-6.1-sol', () => (used.push('codex'), 'c')) },
+    ], ledger);
+    for (let i = 0; i < 5; i++) await chain.asClient().complete([{ role: 'user', content: 'hi' }]);
+    expect(used).toEqual(['openai', 'openai', 'openai', 'openai', 'anthropic', 'codex']);
+    expect(ledger.spent('openai-api')).toBeCloseTo(1.2, 6);
+    // the failed Anthropic call reported usage: it is paid for
+    expect(ledger.spent('anthropic-api')).toBeCloseTo(0.3, 6);
+    // another process reading the same ledger sees what was spent
+    expect(new SpendLedger(ledger.file, ledger.budgetsFile, 0).spent('openai-api')).toBeCloseTo(1.2, 6);
+    const backend = chain.asBackend();
+    expect((await backend.complete({ messages: [{ role: 'user', content: 'x' }], json: false })).text).toBe('c');
+  });
+
+  it('refuses a paid link without a budget and reads budgets from the file', () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'budgets-'));
+    const ledger = new SpendLedger(path.join(dir, 'spend.jsonl'), path.join(dir, 'budgets.json'));
+    const config = { connections: [{ id: 'openai-api', label: 'o', provider: 'openai', baseUrl: 'https://api.example.test/v1', apiKey: 'sk-test', model: 'gpt-6.1-sol', cliPath: '', cliTimeoutMs: 1000 }] } as unknown as KnodeConfig;
+    expect(() => parseChain('openai-api,codex-cli', config, { ledger })).toThrow(/has no budget/);
+    fs.writeFileSync(ledger.budgetsFile, JSON.stringify({ 'openai-api': { usd: 200, since: '2026-11-07' } }));
+    const links = parseChain('openai-api,codex-cli', config, { ledger, model: 'gpt-6.1-sol' });
+    expect(links.map((l) => [l.name, l.budget])).toEqual([['openai-api', 200], ['codex-cli', null]]);
+    expect(links[0].api).toEqual({ baseUrl: 'https://api.example.test/v1', apiKey: 'sk-test', model: 'gpt-6.1-sol' });
+    expect(parseChain('openai-api:50', config, { ledger })[0].budget).toBe(50);
+    expect(() => parseChain('nope', config, { ledger })).toThrow(/no connection "nope"/);
+  });
+
+  it('bills an agent session to an API key through Codex, the key in the environment only', async () => {
+    const bin = fs.mkdtempSync(path.join(tmp, 'argv-codex-'));
+    // a codex that answers with what it was given
+    fs.writeFileSync(path.join(bin, 'codex'), `#!/bin/sh\nexec node -e '
+const a = process.argv.slice(1); const out = a[a.indexOf("--output-last-message") + 1];
+process.stdin.resume(); process.stdin.on("end", () => {
+  require("fs").writeFileSync(out, JSON.stringify({ args: a, key: process.env.KNODE_EVAL_AGENT_API_KEY || null }));
+  console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1000, cached_input_tokens: 0, output_tokens: 100 } }));
+});' -- "$@"\n`);
+    fs.chmodSync(path.join(bin, 'codex'), 0o755);
+    const saved = process.env.PATH;
+    process.env.PATH = `${bin}:${saved}`;
+    const charged: [string, string, number][] = [];
+    setAgentRouting({ pick: () => ({ name: 'openai-api', api: { baseUrl: 'https://api.example.test/v1/', apiKey: 'sk-secret', model: 'gpt-6.1-sol' } }), charge: (n, m, u) => void charged.push([n, m, u?.inputTokens ?? 0]), exhaust: () => {} });
+    try {
+      const cwd = fs.mkdtempSync(path.join(tmp, 'agent-cwd-'));
+      const r = await runAgent({ cwd, prompt: 'hi', sandbox: 'read-only' });
+      const seen = JSON.parse(r.text) as { args: string[]; key: string };
+      expect(seen.key).toBe('sk-secret');
+      expect(seen.args.join(' ')).toContain('model_provider="knode_eval_api"');
+      expect(seen.args.join(' ')).toContain('base_url = "https://api.example.test/v1"');
+      expect(seen.args.join(' ')).not.toContain('sk-secret');
+      expect(charged).toEqual([['openai-api', 'gpt-6.1-sol', 1000]]);
+    } finally {
+      setAgentRouting(null);
+      process.env.PATH = saved;
+    }
+  });
+
+  it('embeds on the endpoint first and on the fallback once it is down; refuses one that does not reproduce', async () => {
+    const make = (name: string, flip = false) => ({ model: 'pool:bge-m3:1024:l2-v1', dimensions: 4, embed: async (t: string[]) => t.map((x) => [x.length, 1, flip ? -2 : 2, 3]), name });
+    let up = true;
+    const endpoint = { ...make('endpoint'), embed: async (t: string[]) => {
+      if (!up) throw new Error('fetch failed: connect ECONNREFUSED 127.0.0.1:12020');
+      return t.map((x) => [x.length, 1, 2, 3]);
+    } };
+    const logs: string[] = [];
+    const e = preferEndpoint(endpoint, make('pool'), (m) => logs.push(m));
+    expect(await e.embed(['ab'])).toEqual([[2, 1, 2, 3]]);
+    up = false;
+    expect(await e.embed(['abc'])).toEqual([[3, 1, 2, 3]]);
+    expect(e.usingFallback()).toBe(true);
+    expect(logs[0]).toContain('unreachable');
+    const packDir = path.join(tmp, 'calibrate-pack');
+    buildFixturePack(packDir);
+    const pack = loadPack(packDir);
+    expect((await calibrateEndpoint(make('a'), make('b'), [pack])).lowest).toBeGreaterThan(0.999);
+    await expect(calibrateEndpoint(make('a'), make('b', true), [pack])).rejects.toThrow(/does not reproduce/);
+  });
+});
+
+describe('a year of weekly reports', () => {
+  it('builds from its script with long-range, five-hop, ambiguous and emergent tasks, and pads at scale', async () => {
+    const out = path.join(tmp, 'reports');
+    const logs: string[] = [];
+    const issues = await recipe('synthetic-reports-zh').build(out, { seed: 0, log: (m) => logs.push(m), options: { scale: 3 } });
+    expect(issues.errors).toEqual([]);
+    const pack = loadPack(out);
+    const pmo = pack.docs.filter((d) => d.kind === 'pmo-summary').length;
+    expect(pmo).toBeGreaterThanOrEqual(9);
+    expect(pack.docs.length).toBe(3 * 44 + pmo);
+    expect(pack.updates).toEqual(['01', '02', '03', '04']);
+    expect(pack.padding.length).toBeGreaterThanOrEqual(pack.docs.length * 2);
+    const corpus = pack.tasks.filter((t) => (CORPUS_TASK_TYPES as readonly string[]).includes(t.type));
+    expect(corpus.length).toBeGreaterThanOrEqual(40);
+    const five = pack.tasks.filter((t) => t.type === 'deep-hop' && t.meta?.hops === 5);
+    expect(five.length).toBeGreaterThanOrEqual(2);
+    expect(five.every((t) => new Set(t.evidence.map((e) => e.doc)).size === 5)).toBe(true);
+    const twins = pack.tasks.find((t) => t.id === 'a-twins')!;
+    expect(new Set(twins.items!.map((i) => i.label)).size).toBe(2);
+    expect(pack.tasks.some((t) => t.id === 'a-renamed') && pack.tasks.some((t) => t.id === 'a-redefined')).toBe(true);
+    // the traceback spans months
+    expect(pack.tasks.filter((t) => t.id.startsWith('r-trace-')).every((t) => Number(t.meta?.span) >= 6)).toBe(true);
+    // attribution excerpts carry style, not names
+    const script = JSON.parse(fs.readFileSync(path.join(out, 'holdout', 'script.json'), 'utf8')) as { people: { name: string }[] };
+    for (const t of pack.tasks.filter((x) => x.type === 'attribution')) {
+      expect(script.people.some((p) => t.question.includes(p.name)), t.id).toBe(false);
+      expect(t.choices).toContain(t.answer);
+    }
+    expect(pack.tasks.filter((t) => t.type === 'style')).toHaveLength(4);
+    expect(pack.tasks.filter((t) => t.type === 'affect')).toHaveLength(9);
+    // what the script says is what the corpus says
+    const mover = pack.tasks.find((t) => t.id === 'r-moved')!;
+    for (const it of mover.items!) expect(it.docs!.every((d) => fs.readFileSync(path.join(out, 'corpus', d), 'utf8').includes(it.label))).toBe(true);
+    const staged = stageCorpus(pack, { fraction: 3 });
+    expect(staged.docs.length).toBe(pack.docs.length * 3);
+    staged.cleanup();
+  });
+
+  it('drafts a field review and promising directions from a research pack and its 2026 holdout', async () => {
+    const out = path.join(tmp, 'research-mini');
+    const w = new PackWriter(out, { id: 'research-ai', version: 1, title: 't', domain: 'research', languages: ['en'], description: 'd', builder: { recipe: 'research-ai' } });
+    for (let i = 0; i < 9; i++) w.addDoc({ path: `papers/${i}.md` }, `# Paper ${i}\n\nWe study ${i < 3 ? 'retrieval agents' : i < 6 ? 'verifiable rewards' : 'tool use'}.`);
+    w.setProfile({ problems: [{ label: 'long-horizon planning', aliases: [] }, { label: 'reward hacking', aliases: [] }, { label: 'evaluation contamination', aliases: [] }] });
+    w.addHoldout('papers-2026.json', JSON.stringify(Array.from({ length: 8 }, (_, i) => ({ id: `h${i}`, title: `H${i}`, abstract: 'x' }))));
+    w.finish();
+    const author = {
+      label: 'a', model: 'a', enabled: true,
+      async completeJson(messages: { role: string; content: string }[]) {
+        const sys = messages[0].content;
+        if (sys.startsWith('For each paper, name')) return { papers: [...messages[1].content.matchAll(/path="([^"]+)"/g)].map((m) => ({ paper: m[1], approach: Number(m[1].match(/\d/)![0]) < 3 ? 'retrieval agents' : Number(m[1].match(/\d/)![0]) < 6 ? 'verifiable rewards' : 'tool use' })) };
+        if (sys.startsWith('Group these papers')) return { lines: [{ label: 'retrieval agents', papers: ['papers/0.md', 'papers/1.md', 'papers/2.md'] }, { label: 'verifiable rewards', papers: ['papers/3.md', 'papers/4.md', 'papers/5.md'] }, { label: 'tool use', papers: ['papers/6.md', 'papers/7.md', 'papers/8.md', 'papers/nope.md'] }] };
+        if (sys.startsWith('Each abstract is from a 2026 paper')) return { matches: [0, 1, 2, 3].flatMap((i) => [{ paper: `h${i}`, problem: 1 }, { paper: `h${i + 4}`, problem: 0 }]) };
+        return {};
+      },
+    } as unknown as LlmClient;
+    const tasks = await researchEmergence(loadPack(out), { author, seed: 0, log: () => {}, options: {} });
+    expect(tasks.map((t) => t.id).sort()).toEqual(['emerge-promising', 'emerge-review', 'emerge-review-lines']);
+    expect(tasks.find((t) => t.id === 'emerge-review-lines')!.items!.find((i) => i.label === 'tool use')!.docs).toHaveLength(3);
+    expect(tasks.find((t) => t.id === 'emerge-promising')!.items!.map((i) => i.label).sort()).toEqual(['long-horizon planning', 'reward hacking']);
+  });
 });

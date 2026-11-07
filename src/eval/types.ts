@@ -18,8 +18,10 @@ export const TASK_TYPES = [
   'update', 'conflict', 'injection', 'cross-lingual', 'counterfactual',
   // corpus-level use (docs/design/23 §2.1): evidence spread over at least CORPUS_TASK_MIN_DOCS documents
   'aggregate', 'timeline', 'contradiction', 'profile',
-  // 3–4 hops whose bridge entities sit in different documents
+  // 3–5 hops whose bridge entities sit in different documents
   'deep-hop',
+  // a name that means two things (two people, a renamed project, a redefined metric): the answer must say so
+  'ambiguous',
 ] as const;
 export type TaskType = (typeof TASK_TYPES)[number];
 

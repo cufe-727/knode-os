@@ -76,6 +76,7 @@ export async function extendPack(dir: string, opts: ExtendOptions): Promise<Pack
   } else if (Object.values(plan).some((n) => Number(n) > 0)) {
     log('no author model: drafted corpus-level tasks skipped');
   }
+  if (opts.author && r.extendTasks) fresh.push(...await r.extendTasks(pack, opts));
 
   // replace earlier tasks of the same ids, keep everything else
   const ids = new Set(fresh.map((t) => t.id));

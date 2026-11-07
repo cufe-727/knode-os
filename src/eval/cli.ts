@@ -17,6 +17,19 @@ import { RunStore } from './runstore.js';
 import { DEFAULT_SYSTEMS, SYSTEMS } from './systems/index.js';
 import { EXTERNAL_SYSTEMS, externalPacks, venvPython } from './systems/external.js';
 import { Suite, SUITES, TASK_TYPES, TaskType } from './types.js';
+import { loadConfig } from '../config.js';
+import { ModelChain, parseChain, SpendLedger } from './chain.js';
+
+/** The author model: a budgeted chain over a workspace's connections, or one CLI (docs/design/23 D18). */
+function authorClient(opts: { author: string | false; authorModel?: string; authorChain?: string; configFrom?: string }, guard: QuotaGuard): LlmClient | undefined {
+  if (opts.author === false) return undefined;
+  if (opts.authorChain) {
+    const ledger = new SpendLedger();
+    const config = opts.configFrom ? loadConfig(opts.configFrom) : null;
+    return new ModelChain(parseChain(opts.authorChain, config, { ledger }), ledger, (m) => console.log(`  ${m}`)).asClient();
+  }
+  return withRefusalRetry(new LlmClient({ provider: opts.author, baseUrl: '', apiKey: '', model: opts.authorModel ?? '', cliPath: '', cliTimeoutMs: 900_000 }), guard);
+}
 
 /**
  * `knode-os eval …` (docs/design/23 §7): build and validate benchmark packs,
@@ -53,12 +66,14 @@ export function registerEvalCommands(program: Command): void {
     .option('--seed <seed>', 'sampling seed', '0')
     .option('--author <provider>', 'model that drafts gold and tasks: claude-cli | codex-cli', 'claude-cli')
     .option('--author-model <model>', 'its model (default: the CLI default)', '')
+    .option('--author-chain <chain>', 'budgeted chain instead, e.g. anthropic-api:100,codex-cli (connections of --config-from)')
+    .option('--config-from <workspace>', 'workspace whose connections the author chain uses (read-only)')
     .option('--options <json>', 'recipe options as JSON', '{}')
     .action(async (id: string, opts) => {
       const r = recipe(id);
       const out = path.resolve(opts.out ?? path.join(packsDir(), id));
       const guard = new QuotaGuard({ enabled: false, log: (m) => console.log(`  ${m}`) });
-      const author = r.needsAuthor ? withRefusalRetry(new LlmClient({ provider: opts.author, baseUrl: '', apiKey: '', model: opts.authorModel, cliPath: '', cliTimeoutMs: 900_000 }), guard) : undefined;
+      const author = r.needsAuthor ? authorClient(opts, guard) : undefined;
       const issues = await r.build(out, { limit: opts.limit ? Number(opts.limit) : undefined, seed: opts.seed, author, options: JSON.parse(opts.options), log: (m) => console.log(`  ${m}`) });
       for (const w of issues.warnings) console.log(`  warning: ${w}`);
       if (issues.errors.length) {
@@ -76,12 +91,14 @@ export function registerEvalCommands(program: Command): void {
     .option('--corpus <json>', 'corpus plan, e.g. {"profile":12,"timeline":10,"contradiction":10,"aggregate":12,"deep":10} (default: the recipe\'s; {} drafts nothing)')
     .option('--padding <multiple>', 'padding for scale curves, as a multiple of the corpus (10 = nine times its documents again)', '0')
     .option('--no-author', 'draft nothing: model-free tasks and padding only')
+    .option('--author-chain <chain>', 'budgeted chain instead, e.g. anthropic-api:100,codex-cli (connections of --config-from)')
+    .option('--config-from <workspace>', 'workspace whose connections the author chain uses (read-only)')
     .option('--seed <seed>', 'sampling seed', '0')
     .option('--options <json>', 'recipe options for the rebuild that supplies model-free tasks and padding', '{}')
     .action(async (arg: string, opts) => {
       const dir = resolvePack(arg);
       const guard = new QuotaGuard({ enabled: false, log: (m) => console.log(`  ${m}`) });
-      const author = opts.author === false ? undefined : withRefusalRetry(new LlmClient({ provider: opts.author, baseUrl: '', apiKey: '', model: opts.authorModel, cliPath: '', cliTimeoutMs: 900_000 }), guard);
+      const author = authorClient(opts, guard);
       const r = await extendPack(dir, {
         author, seed: opts.seed, options: JSON.parse(opts.options), log: (m) => console.log(`  ${m}`),
         corpus: opts.corpus ? JSON.parse(opts.corpus) : undefined, padding: Number(opts.padding),
@@ -133,12 +150,16 @@ export function registerEvalCommands(program: Command): void {
     .option('--config-from <workspace>', 'knode workspace whose embedder the run uses (read-only)')
     .option('--embedding <kind>', 'workspace | local', 'workspace')
     .option('--embedding-endpoint <url>', "embed on this OpenAI-compatible endpoint (a local bge-m3, say) under the workspace embedder's identity, once it reproduces the vectors the run holds")
+    .option('--embedding-fallback', "with --embedding-endpoint: use the workspace's embedder while the endpoint is unreachable")
     .option('--chat-connection <id>', 'answer model calls from this connection of the --config-from workspace (an API endpoint) instead of codex exec')
     .option('--model <model>', 'model every system uses (Codex\'s, or the connection\'s)', '')
     .option('--build-effort <e>', 'reasoning effort for building', 'low')
     .option('--answer-effort <e>', 'reasoning effort for answering', 'medium')
     .option('--judge <provider>', 'judge CLI provider', 'claude-cli')
     .option('--judge-model <model>', 'judge model', '')
+    .option('--chat-chain <chain>', 'budgeted chain for every model call, e.g. openai-api:200,codex-cli (connections of --config-from; budgets also in ~/knode-eval/budgets.json)')
+    .option('--agent-chain <chain>', 'budgeted chain for agent sessions: API connections billed through Codex, then codex-cli')
+    .option('--judge-chain <chain>', 'budgeted chain for the judge, e.g. anthropic-api:100,codex-cli')
     .option('--limit <n>', 'tasks per pack (stratified by type)')
     .option('--types <list>', `only these task types, comma-separated (e.g. aggregate,timeline,contradiction,profile,deep-hop,update)`)
     .option('--agent-limit <n>', 'tasks per pack for agent systems', '30')
@@ -161,11 +182,15 @@ export function registerEvalCommands(program: Command): void {
         chatConnection: opts.chatConnection,
         embedding: opts.embedding,
         embeddingEndpoint: opts.embeddingEndpoint,
+        embeddingFallback: opts.embeddingFallback,
         model: opts.model,
         buildEffort: opts.buildEffort as LlmEffort,
         answerEffort: opts.answerEffort as LlmEffort,
         judgeProvider: opts.judge,
         judgeModel: opts.judgeModel,
+        chatChain: opts.chatChain,
+        agentChain: opts.agentChain,
+        judgeChain: opts.judgeChain,
         limit: opts.limit ? Number(opts.limit) : undefined,
         types: (() => {
           const types = csv(opts.types);
