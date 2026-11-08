@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { assertNotPrivate, CappedText, isTextFile, readFileTextCapped, safePath } from '../fs/files.js';
 import { RAW_DOCS, RAW_TRACES, sidecarRelFor } from '../fs/layout.js';
 import { readContent } from '../fs/sidecar.js';
+import { storableText } from '../markdown.js';
 import { normalizeCookedFrontmatter } from '../okf/normalize.js';
 import { pluginRegistry } from '../plugins/registry.js';
 import { DocRoot } from '../types.js';
@@ -82,13 +83,20 @@ export function normalizeSourceText(rel: string, text: string): string {
  * `source.text` plugin hooks run last, on every read: what they return is the
  * content — hashed, chunked, extracted and replayed as such — so a hook that
  * changes its mind changes the document, which is the honest outcome.
+ *
+ * Whatever the source kind, the text is made storable here, after the hooks
+ * (`storableText`: no U+0000, no unpaired surrogate). Everything that reaches
+ * PostgreSQL from a document — its row, chunks, title, entities and claims —
+ * is read from this text, and the content hash is of the text the rows hold.
+ * Its frontmatter is decoded by `parseFrontmatter`, which does the same to
+ * what a YAML escape (`"\0"`) spells.
  */
 export function loadSourceText(dataDir: string, rel: string, root: DocRoot): SourceText | null {
   const loaded = readSource(dataDir, rel, root);
   if (!loaded) return null;
   const registry = pluginRegistry();
-  if (!registry.hasHandlers('source.text')) return loaded;
-  return { ...loaded, text: registry.filterSync('source.text', loaded.text, { path: rel, root, dataDir }) };
+  const text = registry.hasHandlers('source.text') ? registry.filterSync('source.text', loaded.text, { path: rel, root, dataDir }) : loaded.text;
+  return { ...loaded, text: storableText(text) };
 }
 
 function readSource(dataDir: string, rel: string, root: DocRoot): SourceText | null {

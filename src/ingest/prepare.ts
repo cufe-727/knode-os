@@ -4,6 +4,7 @@ import { MAX_FILE_BYTES } from '../constants.js';
 import { isTextFile, safePath, walkFilesUnder } from '../fs/files.js';
 import { RAW_DOCS } from '../fs/layout.js';
 import { hasContent, readContent, readSidecarPart, SidecarConversion, writeContent, writeSidecarPart } from '../fs/sidecar.js';
+import { storableText } from '../markdown.js';
 import { NORMALIZER_VERSION, normalizeCookedFrontmatter } from '../okf/normalize.js';
 import {
   ConversionOptions,
@@ -171,6 +172,8 @@ export async function prepareDocs(dataDir: string, opts: PrepareOptions = {}): P
           conversion = { key: cacheKey!, kind: result.kind, model: result.model, warnings: result.warnings.length ? result.warnings : undefined };
           content = normalizeCookedFrontmatter(normalizeAs, result.markdown, { producedBy: producedBy(conversion), at });
         }
+        // stored as it will be read (loadSourceText), so the hash below is the indexed text's
+        content = storableText(content);
         writeContent(dataDir, rawRel, content);
       } else {
         content = loadSourceText(dataDir, rawRel, 'docs')?.text ?? '';
