@@ -1,7 +1,7 @@
 # 23 — Knowledge benchmarks: comparing knowledge-base approaches on the same sources
 
 > Status: **implemented** (2026‑11‑04); pilot run 2026‑11‑06. Corpus-level tasks, wiki-with-sources agents, scale padding,
-> the update stream and cost-normalized reporting added 2026‑11‑07 (§2.1, §4); their run is in §7 (phase 2 done 2026‑11‑08; the 3× scale point running). `src/eval/` (packs, shim, meter, quota, agent runner, judge,
+> the update stream and cost-normalized reporting added 2026‑11‑07 (§2.1, §4); their run is in §7 (phase 2 and the 3× scale point done 2026‑11‑08). `src/eval/` (packs, shim, meter, quota, agent runner, judge,
 > metrics, systems, runner, report, audit, install), `eval/adapters/*.py`; `knode-os eval pack list|build|validate`,
 > `knode-os eval systems list|install`, `knode-os eval run`, `knode-os eval report`, `knode-os eval audit export|import`.
 > Data lives outside the repository in `~/knode-eval/` (`$KNODE_EVAL_HOME`): `sources/` (downloads), `packs/`,
@@ -242,7 +242,7 @@ knode-os eval report ~/knode-eval/runs/<stamp>
   keyword bound; profiles are scored on recall for that reason. No human audit of it yet.
 - law-cn has few disagreements and no timelines inside one law: its corpus-level tasks are mostly aggregates.
 
-## 7. Corpus-level run (revised 2026‑11‑08; phases 0–2 done, phase 3 at 3× running)
+## 7. Corpus-level run (revised 2026‑11‑08; phases 0–2 and the 3× point done)
 
 Approved 2026‑11‑07. Phases 0, 0b and 1 are done: bge-m3 serves on 127.0.0.1:12020; synthetic-life-zh v2 (41 corpus-level tasks),
 finance-cn (+31 corpus-level, 10 chains; padding stops at 1.3× because most same-workspace documents name a closed-world entity),
@@ -285,3 +285,34 @@ Phase 2 finished 2026‑11‑07 18:36Z: 2,969 answers, no errors, 42 builds, 237
 Phase 3, the 3× point, started 2026‑11‑07 22:14Z from `…/corpus-2026-11/phase3-3x.sh` into `…/corpus-2026-11/run-3x`: synthetic-reports-zh
 with 282 padding documents (423 in all), the phase 2 systems without closed-book, builds and answers on Codex CLI only. The judge
 stays on Anthropic, then Codex, as in phase 2, so both points are scored alike. `eval scale …/run …/run-3x` compares them.
+
+It finished 2026‑11‑08 14:53Z: 837 answers, no errors, 16 builds, 54 judge calls ($0.60). Codex's weekly window went from 18% to 51%.
+
+| reports, 1× → 3× | correctness | lists | tokens / query | build tokens |
+| --- | --- | --- | --- | --- |
+| agent-grep | 0.85 → 0.74 | 0.81 → 0.62 | 36.0k → 55.6k | — |
+| agent-wiki-sources | 0.82 → 0.74 | 0.78 → 0.63 | 58.7k → 65.2k | 2.80M → 8.89M |
+| agent-wiki | 0.83 → 0.70 | 0.77 → 0.60 | 60.9k → 60.4k | 2.80M → 8.89M |
+| agent-knode-wiki-sources | 0.75 → 0.73 | 0.64 → 0.63 | 57.4k → 65.8k | 5.62M → 18.29M |
+| agent-knode | 0.75 → 0.70 | 0.66 → 0.58 | 65.7k → 67.5k | 5.62M → 18.29M |
+| long-context | 0.76 → 0.68 | 0.65 → 0.55 | 16.1k → 180.8k | — |
+| rag-hybrid | 0.40 → 0.40 | 0.40 → 0.36 | 10.0k → 9.9k | — |
+| knode-ask | 0.39 → 0.42 | 0.38 → 0.34 | 11.4k → 11.9k | 5.62M → 18.29M |
+| agent-knode-wiki | 0.27 → 0.15 | 0.26 → 0.13 | 71.6k → 83.5k | 5.62M → 18.29M |
+
+- At 3×, agent-grep, agent-wiki-sources and agent-knode-wiki-sources tie (0.742, 0.741, 0.735; paired Δ −0.001 and −0.007, not
+  significant). On lists the two wiki + sources agents are a point ahead (0.63 against 0.62), inside the noise.
+- **Confound:** at 1× agent-grep, agent-wiki and agent-wiki-sources answered on the OpenAI API (before 09:27Z); every other 1× reports
+  answer, and every 3× answer, came from Codex CLI on the same model. Gaps within one backend are clean:
+  - agent-wiki-sources against agent-grep stays flat (−0.004 at 1×, −0.002 at 3×, on the same 61 tasks).
+  - The knode agents' gap to agent-grep closes from −0.10 to +0.02 (+0.12 [0.05, 0.21]; +0.17 on lists). Part of that may be
+    agent-grep moving from the API to Codex rather than scale.
+  - The same applies to phase 2's pooled deltas wherever one group answered before the switch and another after.
+- Builds grow linearly (3.2× and 3.3×). Both wikis came out smaller: LLM Wiki 525 pages against 694, knode 30 against 38.
+- Every agent reads more per query, agent-grep most (+54%), so the per-query gap to the wiki agents narrows (≈ 10k from ≈ 22k). It is
+  still positive, so the wiki agents still never break even. long-context still fits but costs 11× as much per query.
+- Update batches cost the same at 3× as at 1× (≈ 95–175k weighted tokens per group per batch).
+- Emergence on reports fell most for agent-grep (labels 0.87 → 0.67, set recall 0.44 → 0.06); long-context leads at 3× (labels 0.80).
+  n = 18–19, so this is indicative only.
+- So far a wiki keeps its value as the corpus grows but does not overtake raw sources at 3×. Raw grep degrades fastest. A clean test
+  needs the 1× API-answered systems answered again on Codex, or the 10× point.
