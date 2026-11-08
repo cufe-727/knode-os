@@ -33,11 +33,53 @@ export function writeMatter(body: string, data: object): string {
   return matter.stringify(body, data, {});
 }
 
-/** Parse YAML frontmatter; malformed frontmatter degrades to a plain body. */
+/** U+0000, and a surrogate without its pair. */
+const UNSTORABLE = /\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
+/**
+ * A text as PostgreSQL can store it. A text value cannot hold U+0000 (the
+ * write fails with `invalid byte sequence for encoding "UTF8": 0x00`, or in
+ * jsonb `unsupported Unicode escape sequence`), and PDF text extraction emits
+ * it for glyphs it cannot map — `su\0cient` for an "ffi" ligature, `V\01`
+ * for a minus sign — so it is dropped. A surrogate without its pair becomes
+ * U+FFFD: the UTF-8 encoder sends that for it to a text column anyway, but
+ * JSON.stringify keeps it as an escape jsonb rejects. A text with neither
+ * comes back as it was, so its hash does not change.
+ */
+export function storableText(text: string): string {
+  return text.replace(UNSTORABLE, (c) => (c === '\u0000' ? '' : '\ufffd'));
+}
+
+/** `storableText` on every key and string of a parsed YAML value, in place (gray-matter's result is fresh, see readMatter). */
+function storableYaml(value: unknown, seen = new Set<object>()): unknown {
+  if (typeof value === 'string') return storableText(value);
+  if (value === null || typeof value !== 'object' || seen.has(value)) return value;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) value[i] = storableYaml(value[i], seen);
+  } else if (Object.getPrototypeOf(value) === Object.prototype) {
+    const record = value as Record<string, unknown>;
+    for (const key of Object.keys(record)) {
+      const v = storableYaml(record[key], seen);
+      const k = storableText(key);
+      if (k !== key) delete record[key];
+      record[k] = v;
+    }
+  }
+  return value;
+}
+
+/**
+ * Parse YAML frontmatter; malformed frontmatter degrades to a plain body.
+ * Its values are storable (`storableText`): a YAML escape spells U+0000 as
+ * `"\0"` or `"\u0000"` — the normalizer writes the latter itself when it
+ * copies a heading holding one into `title:` — and a title or a declared
+ * entity holding it would fail the document's whole scope.
+ */
 export function parseFrontmatter(raw: string): ParsedMarkdown {
   try {
     const p = readMatter(raw);
-    return { frontmatter: p.data as Record<string, unknown>, body: p.content };
+    return { frontmatter: storableYaml(p.data) as Record<string, unknown>, body: p.content };
   } catch {
     return { frontmatter: {}, body: raw };
   }
