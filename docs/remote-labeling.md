@@ -82,38 +82,56 @@ Without `workers`, the Extract stage's own route runs with `extraction.concurren
 only hands that work to remote workers. A document's summary waits for its extraction unless
 `"summaryAfterExtraction": false`, which lets a large library get its summary pages long before its extraction is
 done (they link only what the graph has by then). Judge calls run on the Judge stage's route, `review.concurrency` at a time
-(default 2); 0 leaves them to remote workers. Saving settings
-(`PUT /api/config`) takes effect within a minute. No restart is needed.
+(default 2); 0 leaves them to remote workers. These slots and the stage routes are the server's, the same in
+every workspace ([server-wide settings](#server-wide-settings)). Saving settings (`PUT /api/config`) takes effect
+within a minute, in every workspace. No restart is needed.
 
-**Limits over every local slot** (`processing`, Settings → Ingest → Processing on this machine):
+**Limits over every local slot** (`processing`, Settings → Ingest → Processing on this server):
 
 ```jsonc
 "processing": {
-  "autoStart": false,      // start processing with the service, instead of waiting for Start processing
-  "maxLocalCalls": 2,      // model calls at once, every stage together (0: each stage's own count only)
-  "minQuotaPercent": 20    // a Codex or Claude stage rests while its plan has less left than this (0: never)
+  "maxLocalCalls": 2,      // model calls at once on this machine, every workspace and stage together (0: each stage's own count only)
+  "minQuotaPercent": 20    // background work on a Codex or Claude plan stops while it has less left than this (0: never)
 }
 ```
 
-`maxLocalCalls` caps the calls this machine's slots run at once, extraction, summaries, translations and
-review calls together; each stage's own slot count still applies under it. A free call goes to a review's judge
-calls first, since a review waits on them, and to the other slots by turns. Remote workers are not counted.
+`maxLocalCalls` caps the calls this machine's slots run at once: extraction, summaries, translations and review
+calls together, and every workspace's slots together, since `serve` hands them all one limiter. Each stage's own
+slot count still applies under it. A free call goes to a review's judge calls first, since a review waits on them,
+and to the other slots by turns, whichever workspace they belong to. The Tasks view shows the calls out on the
+machine and how many of them are this workspace's. Remote workers are not counted, and neither are research
+sessions, Dream, the tier-2 pass or Ask.
 
-`minQuotaPercent` is the share of a plan processing leaves alone. Before each call, a stage on `codex-cli` or
-`claude-cli` checks what is left of its plan, at most every two minutes. While any window (five-hour or weekly)
-has less than the floor left, or the provider says a limit is reached, the stage takes no new work. Tasks shows
-it resting until the window resets, with the reason. It takes work again on its own once the window resets above
-the floor. Codex's windows are read through `codex app-server`, with no model call. Claude has no such read, so
-each Claude Code call knode makes runs with `--output-format stream-json` and keeps the `rate_limit_event` it
-reports in `~/.knode-os/claude-limits.json` (`KNODE_CLAUDE_LIMITS_FILE`). A Claude stage therefore goes by its
-last call here; use only grows within a window, so an old reading can only say more is left than is. Cursor,
-OpenCode and API endpoints have no reading and are never held: a refused call rests them as before. A Judge route
-held this way counts as unavailable, so a review files its candidates unjudged instead of waiting out each call.
+`minQuotaPercent` is the share of a plan background work leaves alone. While any window of a Codex or Claude plan
+(five-hour or weekly) has less than the floor left, or the provider says a limit is reached, nothing that runs on
+its own spends it:
 
-`autoStart` starts processing when `serve` starts (the Tasks view says it was started by the service), and the
-workspace opens at startup for it, so its embedding and processing run without anyone opening it. Without
-it, processing waits for someone to start it after every restart, as before. Stop processing still stops it
-until the next start. Codex runs as
+- the processing slots of every workspace take no new work: a stage on `codex-cli` or `claude-cli` checks what is
+  left of its plan before each call. Tasks shows it resting until the window resets, with the reason. A Judge route
+  held this way counts as unavailable, so a review files its candidates unjudged instead of waiting out each call.
+- research jobs and studies on that plan's agent go back in line, paused until the window resets (the same pause a
+  spent usage limit leaves, [design 22](design/22-research-pauses-and-housekeeping.md)); so does every job queued on the same
+  account. Their attempts are handed back.
+- the nightly Dream is skipped while the Judge stage's plan is under the floor, and the tier-2 pass while the Judge
+  or the Summarize stage's is, each with a line in the log.
+
+Everything takes work again on its own once the window resets above the floor. Ask is never held, since someone is
+waiting on it, and nor are the image conversions of an import someone started (the Convert stage runs inside that
+import). Each plan is read at most every two minutes for the whole machine, however many workspaces ask. Codex's
+windows are read through `codex app-server`, with no model call. Claude has no such read, so each Claude Code call
+knode makes runs with `--output-format stream-json` and keeps the `rate_limit_event` it reports in
+`~/.knode-os/claude-limits.json` (`KNODE_CLAUDE_LIMITS_FILE`). A Claude plan therefore goes by its last call here;
+use only grows within a window, so an old reading can only say more is left than is. A window whose reset has
+passed since its reading counts as fresh. Cursor, OpenCode and API endpoints have no reading and are never held: a
+refused call rests them as before.
+
+Processing starts with the service in every workspace, and every workspace opens at startup for it, so its
+embedding and processing run without anyone opening it. There is no switch for that any more: a config written
+before 2026-11-08 may still say `processing.autoStart`, which is read past and dropped at the next save. Stop
+processing (Tasks, the app's toolbar, `POST /api/labeling/stop`) still pauses one workspace's processing until
+someone starts it again or the service restarts.
+
+Codex runs as
 `codex exec --ignore-user-config --ephemeral -c features.plugins=false -c features.apps=false -c analytics.enabled=false`
 for every pipeline call, so your `~/.codex/config.toml` (MCP servers, memory, default model) stays out of extraction
 prompts. It also keeps tens of thousands of sessions out of `~/.codex/sessions`. Plugins and ChatGPT apps are on by
@@ -136,14 +154,42 @@ estimate before Start processing rests on these averages once a route has run a 
 `GET /api/labeling/status` (UI headers) shows whether processing runs, the extraction queue, the summaries due,
 leases, every worker seen and the local slots' health.
 
-**Starting and stopping.** The local slots and the duplicate reviews spend model calls, so `serve` never starts
-them on its own, not at startup and not after a restart. An administrator
-starts them from the app (the *Processing* button in the toolbar), from the web UI (the button in the header) or with
-`POST /api/labeling/start`. They then run until stopped (`POST /api/labeling/stop`) or until the service stops.
-Stopping lets calls in flight finish; a review gives up the judge calls nobody has taken yet and goes on with the
+**Starting and stopping.** `serve` starts the local slots and the duplicate reviews in every workspace when it
+starts, within the limits above. An administrator can stop a workspace's processing from the app (the
+*Processing* button in the toolbar), from the web UI (the button in the header) or with `POST /api/labeling/stop`,
+and start it again the same ways or with `POST /api/labeling/start`; a stop lasts until the next start of the
+service. Stopping lets calls in flight finish; a review gives up the judge calls nobody has taken yet and goes on with the
 verdicts it has. Importing, watching and embedding go on either way. Remote workers can still
 lease segments and summaries while processing is stopped, because they are started by hand on their own machines.
 The summary pages they write are written either way; what they extract is reviewed once processing is started.
+
+### Server-wide settings
+
+Processing and the stage models are one setting for the whole server, not one per workspace:
+
+- `processing` (`maxLocalCalls`, `minQuotaPercent`);
+- the five stage routes `extraction.entityLlm`, `documentLlm`, `summaryLlm`, `judgeLlm`, `translateLlm` (and the
+  legacy `tier1Model`);
+- `extraction.workers`, `extraction.concurrency`, `extraction.summaryConcurrency`,
+  `extraction.translateConcurrency` and `review.concurrency`.
+
+The server root's `knode.config.json` (`~/.knode-os/knode.config.json`, the folder `serve --data` names) holds
+them. Every workspace's own file carries a copy, written when the workspace opens (a new one is made from the
+root's config) and again in every workspace — closed ones included, and the open ones reloaded — when an
+administrator changes one of them in any workspace's settings (`PUT /api/config`, or an edit of an agent a stage
+runs on). Settings marks these fields *server-wide*. A stage names what it runs on by id, so what it names travels
+with it: an agent file from `playbooks/agents/` is copied, a connection row is merged (with its key), and so is the
+row an agent loops on. A workspace's own agent or row with the same id is replaced by the shared one, unless the
+workspace uses it for itself — as its default model, research's or Ask's agent. Ids like `openai-1` are made per
+workspace and mean something else in each, so a stage set to run on such an id is shared as a copy under an id of
+its own (`openai-1-server`), and a workspace whose own default has a shared id when it opens keeps it as
+`<id>-own`. Its other agents and rows are left alone. Everything else stays each workspace's own: data sources, research, Ask, languages,
+embedding, the Judge stage's review modes, `summaryAfterExtraction`, batch sizes and the import's parallel
+conversions.
+
+A hand edit of a workspace's file is overwritten the next time it opens; edit the root's file and restart, or
+change the setting in any workspace's Settings. A new route for the Convert stage applies to new imports in the
+other workspaces; only the workspace it was saved in re-converts what it has.
 
 ## What remote workers may take
 

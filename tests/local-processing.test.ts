@@ -7,7 +7,7 @@ import { claudeLimitsFrom, lastRateLimitInfo, readClaudeLimits, recordClaudeLimi
 import { accountFrom } from '../src/estimate/codex.js';
 import { claudeResultOf, completeViaCli } from '../src/llm/cli.js';
 import { CallLimiter, LocalLabelingWorkers } from '../src/labeling/local.js';
-import { codexQuota, PlanQuota, quotaHold, readPlanQuota } from '../src/labeling/plan-quota.js';
+import { codexQuota, PlanQuota, PlanReadings, quotaAt, quotaHold, readPlanQuota } from '../src/labeling/plan-quota.js';
 import { TaskOutcome, WorkerIdentity } from '../src/labeling/scheduler.js';
 import { WorkTask } from '../src/work/broker.js';
 import { WorkKind } from '../src/work/kinds.js';
@@ -73,11 +73,12 @@ function configWith(endpoint: LlmConnection, opts: { slots?: number; processing?
 }
 
 describe('the processing settings', () => {
-  it('default to two calls at once and a 20% floor, not starting on their own', () => {
-    expect(processingSettings(defaultConfig())).toEqual({ autoStart: false, maxLocalCalls: 2, minQuotaPercent: 20 });
+  it('default to two calls at once and a 20% floor', () => {
+    expect(processingSettings(defaultConfig())).toEqual({ maxLocalCalls: 2, minQuotaPercent: 20 });
     // a config from before the section, or with a value that is no count
-    expect(processingSettings({})).toEqual({ autoStart: false, maxLocalCalls: 2, minQuotaPercent: 20 });
-    expect(processingSettings({ processing: { autoStart: true, maxLocalCalls: -1, minQuotaPercent: 250 } })).toEqual({ autoStart: true, maxLocalCalls: 2, minQuotaPercent: 100 });
+    expect(processingSettings({})).toEqual({ maxLocalCalls: 2, minQuotaPercent: 20 });
+    // an old file's `autoStart` is read past: processing starts with the service everywhere
+    expect(processingSettings({ processing: { autoStart: true, maxLocalCalls: -1, minQuotaPercent: 250 } as never })).toEqual({ maxLocalCalls: 2, minQuotaPercent: 100 });
   });
 });
 
@@ -101,6 +102,32 @@ describe('the call limiter', () => {
     limiter.cancel();
     await b;
     expect(order).toEqual(['judge:true', 'extract:true', 'summarize:false']);
+  });
+
+  it('turns away only the waiters of the owner that stops, and counts each owner\'s calls', async () => {
+    const limiter = new CallLimiter();
+    limiter.setCapacity(1);
+    const finance = {};
+    const shelf = {};
+    expect(await limiter.acquire(false, finance)).toBe(true);
+    const order: string[] = [];
+    const a = limiter.acquire(false, shelf).then((ok) => order.push(`shelf:${ok}`));
+    const b = limiter.acquire(false, finance).then((ok) => order.push(`finance:${ok}`));
+    const j = limiter.acquire(true, shelf).then((ok) => order.push(`shelf judge:${ok}`));
+    expect([limiter.inUseBy(finance), limiter.inUseBy(shelf)]).toEqual([1, 0]);
+    // finance stops: its own waiter is turned away, shelf's keep their place
+    limiter.cancel(finance);
+    await b;
+    expect(order).toEqual(['finance:false']);
+    limiter.release(finance);
+    await j;
+    expect(order).toEqual(['finance:false', 'shelf judge:true']);
+    expect([limiter.inUse, limiter.inUseBy(finance), limiter.inUseBy(shelf)]).toEqual([1, 0, 1]);
+    limiter.release(shelf);
+    await a;
+    expect(order).toEqual(['finance:false', 'shelf judge:true', 'shelf:true']);
+    limiter.release(shelf);
+    expect(limiter.inUse).toBe(0);
   });
 
   it('counts without a cap at 0, and lets more through when the cap is raised', async () => {
@@ -173,6 +200,44 @@ describe('this machine\'s slots under the processing limits', () => {
     }
   });
 
+  it('share one cap across workspaces, and a workspace that stops leaves the other\'s slots running', async () => {
+    const config = configWith(endpoint(), { slots: 3, processing: { maxLocalCalls: 3 } });
+    const limiter = new CallLimiter();
+    let out = 0;
+    let most = 0;
+    const counting = (leaser: FakeLeaser) => ({
+      lease: async (who: WorkerIdentity, kinds: readonly WorkKind[]) => {
+        const tasks = await leaser.lease(who, kinds);
+        if (tasks.length) most = Math.max(most, ++out);
+        return tasks;
+      },
+      complete: async (id: string, who: WorkerIdentity, outcome: TaskOutcome) => {
+        out--;
+        return leaser.complete(id, who, outcome);
+      },
+      renew: () => leaser.renew(),
+    });
+    const financeWork = new FakeLeaser({ extract: 8, summarize: 8 });
+    const shelfWork = new FakeLeaser({ extract: 8, summarize: 8 });
+    const finance = new LocalLabelingWorkers(counting(financeWork), () => config, { idleMs: 20, limiter });
+    const shelf = new LocalLabelingWorkers(counting(shelfWork), () => config, { idleMs: 20, limiter });
+    finance.start();
+    shelf.start();
+    try {
+      await until(() => financeWork.completed.length >= 2 && shelfWork.completed.length >= 2, 10_000, 'both workspaces at work');
+      // twelve slots in each workspace, three calls on the machine
+      expect(finance.calls().max).toBe(3);
+      expect(finance.calls().inFlight).toBe(limiter.inUse);
+      finance.stop();
+      await until(() => shelfWork.completed.length === 16, 20_000, 'shelf after finance stopped');
+      expect(most).toBe(3);
+      expect(finance.calls().workspace).toBe(0);
+    } finally {
+      finance.stop();
+      shelf.stop();
+    }
+  });
+
   it('leave a plan under the quota floor alone, and take work again once it is over it', async () => {
     // a Claude CLI stand-in: one result event, nothing about its plan
     const stub = path.join(tmp, 'claude-ok.sh');
@@ -214,6 +279,33 @@ describe('this machine\'s slots under the processing limits', () => {
     }
   });
 
+  it('read a plan once for every workspace that shares the readings', async () => {
+    const stub = path.join(tmp, 'claude-shared.sh');
+    fs.writeFileSync(stub, `#!/bin/sh\ncat > /dev/null\necho '{"type":"result","is_error":false,"result":"ok"}'\n`, { mode: 0o755 });
+    const claude: LlmConnection = { id: 'claude', label: 'Claude', provider: 'claude-cli', baseUrl: '', apiKey: '', protocol: 'auto', model: '', cliPath: stub, effort: 'default', cliTimeoutMs: 30_000 };
+    const config = configWith(claude, { slots: 1, processing: { maxLocalCalls: 2, minQuotaPercent: 10 } });
+    let reads = 0;
+    const plans = new PlanReadings({
+      checkMs: 60_000,
+      read: async () => {
+        reads++;
+        return { plan: 'Claude', windows: [{ name: 'weekly', leftPercent: 8, resetsAt: '2026-11-13T06:00:00.000Z' }], limitReached: null, readAt: new Date().toISOString() };
+      },
+    });
+    const a = new LocalLabelingWorkers(new FakeLeaser({ extract: 1 }), () => config, { idleMs: 20, plans });
+    const b = new LocalLabelingWorkers(new FakeLeaser({ extract: 1 }), () => config, { idleMs: 20, plans });
+    a.start();
+    b.start();
+    try {
+      await until(() => a.quotaHolds().length === 4 && b.quotaHolds().length === 4, 5_000, 'both held');
+      expect(reads).toBe(1);
+      expect(b.quotaHolds()[0].reason).toBe('Claude weekly window has 8% left, under the 10% floor');
+    } finally {
+      a.stop();
+      b.stop();
+    }
+  });
+
   it('never hold a backend without a plan reading, nor any with the floor at 0', async () => {
     const reads: string[] = [];
     const readQuota = async (provider: string) => {
@@ -250,6 +342,23 @@ describe('a plan\'s quota', () => {
     expect(quotaHold(quota, 20)).toEqual({ reason: 'Codex weekly window has 17% left, under the 20% floor', until: '2026-11-13T06:38:16.000Z' });
     expect(quotaHold(quota, 15)).toBeNull();
     expect(quotaHold(quota, 0)).toBeNull();
+  });
+
+  it('forgets, in a reading kept for a while, a window or a limit whose reset has passed', () => {
+    const quota: PlanQuota = {
+      plan: 'Codex',
+      windows: [
+        { name: 'five-hour', leftPercent: 3, resetsAt: '2026-11-07T14:00:00.000Z' },
+        { name: 'weekly', leftPercent: 40, resetsAt: '2026-11-13T00:00:00.000Z' },
+      ],
+      limitReached: 'five-hour',
+      limitResetsAt: '2026-11-07T14:00:00.000Z',
+      readAt: '',
+    };
+    expect(quotaHold(quotaAt(quota, Date.parse('2026-11-07T13:00:00Z')), 10)?.reason).toBe('Codex limit reached (five-hour)');
+    const later = quotaAt(quota, Date.parse('2026-11-07T15:00:00Z'));
+    expect(later?.windows.map((w) => w.name)).toEqual(['weekly']);
+    expect(quotaHold(later, 10)).toBeNull();
   });
 
   it('holds until every short window resets, and while a limit is reached', () => {

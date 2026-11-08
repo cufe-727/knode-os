@@ -15,13 +15,15 @@ function workspace(dir: string, config: unknown, name?: string): void {
 }
 
 describe('workspaces opened at startup', () => {
-  it('opens those that follow linked folders or start their processing on their own, and leaves the rest to be opened', async () => {
+  it('opens every workspace, since processing starts with the service in each one', async () => {
     workspace('users/ann/workspaces/notes', { ingest: { linkedFolders: [{ path: '/Users/ann/Notes' }] } }, 'Notes');
-    workspace('users/ann/workspaces/shelf', { processing: { autoStart: true } }, 'Shelf');
+    // an old file's `autoStart: false` no longer keeps a workspace closed
     workspace('users/ann/workspaces/idle', { processing: { autoStart: false } }, 'Idle');
-    workspace('users/bob/workspaces/default', {}, 'Default');
-    workspace('teams/research', { processing: { autoStart: true } });
-    workspace('teams/archive', { ingest: { linkedFolders: [] } });
+    workspace('users/bob/workspaces/default', {});
+    workspace('teams/research', {});
+    fs.symlinkSync('../users/ann/workspaces/notes', path.join(root, 'teams/shared-notes'));
+    // a folder nothing made a workspace yet waits to be asked for
+    fs.mkdirSync(path.join(root, 'users/bob/workspaces/empty'), { recursive: true });
     fs.mkdirSync(path.join(root, 'users/bob/workspaces/broken'), { recursive: true });
     fs.writeFileSync(path.join(root, 'users/bob/workspaces/broken/knode.config.json'), '{ not json');
 
@@ -30,8 +32,13 @@ describe('workspaces opened at startup', () => {
     autostartWorkspaces(root, { get: async (scope) => { opened.push(scope); return {} as never; } }, (msg) => logs.push(msg));
     await new Promise((resolve) => setImmediate(resolve));
 
-    expect(opened.map((s) => s.relativeDir).sort()).toEqual(['teams/research', 'users/ann/workspaces/notes', 'users/ann/workspaces/shelf']);
-    expect(logs).toContain('[users/ann/workspaces/shelf] opened at startup: its processing starts with the service');
-    expect(logs).toContain('[users/ann/workspaces/notes] opened at startup: it follows linked folders, Feishu documents or agent conversations');
+    // a Team shared from a personal workspace is that workspace: it opens once, as the owner's
+    expect(opened.map((s) => s.relativeDir).sort()).toEqual([
+      'teams/research', 'users/ann/workspaces/idle', 'users/ann/workspaces/notes', 'users/bob/workspaces/broken', 'users/bob/workspaces/default',
+    ]);
+    expect(opened.find((s) => s.relativeDir === 'users/ann/workspaces/notes')).toMatchObject({ user: 'ann', kind: 'personal', id: 'notes', name: 'Notes' });
+    // no manifest: named after its folder
+    expect(opened.find((s) => s.relativeDir === 'users/bob/workspaces/default')).toMatchObject({ id: 'default' });
+    expect(logs).toContain('[users/ann/workspaces/idle] opened at startup: processing starts with the service in every workspace');
   });
 });

@@ -1444,9 +1444,10 @@ document.addEventListener('keydown', (event) => {
 /* ----------------------------- processing ------------------------------ */
 
 /**
- * Extraction, reviews and summaries spend model calls, so the service never
- * starts them on its own, not even after a restart: someone starts them here
- * (or in the app) and they run until stopped. An administrator's switch.
+ * Extraction, reviews, summaries and translations start with the service in
+ * every workspace, within the server's limits. An administrator may stop a
+ * workspace's here (or in the app); it stays stopped until someone starts it
+ * again or the service restarts.
  */
 let processingStatus = null;
 
@@ -1481,7 +1482,7 @@ function paintProcessing() {
   button.classList.toggle('running', state.running);
   button.textContent = state.running ? `● Processing${inFlight ? ` · ${inFlight} in flight` : ''}` : '○ Processing stopped';
   button.title = [
-    state.running ? 'Extraction, reviews and summaries are running' : 'Extraction, reviews and summaries wait until someone starts them',
+    state.running ? 'Extraction, reviews and summaries are running' : 'Extraction, reviews and summaries wait until someone starts them again, or the service restarts',
     queued === undefined ? '' : `${queued} documents waiting`,
     due ? `${due} summaries due` : '',
     translations?.due ? `${translations.due} translations into ${languageInEnglish(translations.primary)} due` : '',
@@ -1495,7 +1496,7 @@ $('#processing-toggle').addEventListener('click', () => navigate('queue'));
 /** Start (after the estimate) or stop the processing — Tasks → Queue's switch. */
 async function switchProcessing(on) {
   if (!on) {
-    if (!confirm('Stop processing? Calls in flight finish; nothing new starts until someone starts it again.')) return;
+    if (!confirm('Stop processing in this workspace? Calls in flight finish; nothing new starts here until someone starts it again or the service restarts.')) return;
     try {
       await api('/api/labeling/stop', { method: 'POST', body: '{}' });
       toast('Processing stopped — calls in flight finish');
@@ -1622,16 +1623,18 @@ function paintTasksProcessing(t) {
   const since = p.since ? new Date(p.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : null;
   const line = p.running
     ? `Running${since ? ` since ${since}` : ''}${p.by ? `, started by ${esc(p.by)}` : ''}`
-    : (since && p.by ? `Stopped at ${since} by ${esc(p.by)}` : 'Stopped since the service started');
-  // the limits over this machine's slots (src/labeling/local.ts): calls at once, and the plan quota they leave alone
+    : (since && p.by ? `Stopped at ${since} by ${esc(p.by)}, until someone starts it again or the service restarts` : 'Stopped');
+  // the server's limits over this machine's slots (src/labeling/local.ts): calls at once, every workspace
+  // together, and the plan quota background work leaves alone
   const max = p.calls?.max ?? 0;
+  const here = p.calls?.workspace;
   const limits = [
-    max > 0 ? `At most ${max} model call${max === 1 ? '' : 's'} at once here${p.running ? ` (${p.calls.inFlight} now)` : ''}.` : '',
-    p.minQuotaPercent > 0 ? `A Codex or Claude stage rests while its plan has less than ${p.minQuotaPercent}% left.` : '',
+    max > 0 ? `At most ${max} model call${max === 1 ? '' : 's'} at once on this machine, every workspace together (${p.calls.inFlight} now${here !== undefined ? `, ${here} of them here` : ''}).` : '',
+    p.minQuotaPercent > 0 ? `Background work — processing, research, Dream and the tier-2 pass — stops while a Codex or Claude plan has less than ${p.minQuotaPercent}% left.` : '',
   ].filter(Boolean).join(' ');
   const holds = (p.quotaHolds ?? []).map((h) => `${esc(h.id)} rests${h.until ? ` until ${esc(restingUntil(h.until))}` : ''}: ${esc(h.reason)}`);
   el.innerHTML = `<div class="tp-state"><span class="status-dot${p.running ? ' live' : ''}"></span>
-      <div><b>${p.running ? 'Processing' : 'Processing is stopped'}</b><p class="hint">${line}. ${p.running ? 'Extraction, reviews, summaries and translations take work as slots free up.' : 'Extraction, reviews, summaries and translations spend model calls, so they wait until someone starts them.'}${limits ? ` ${limits}` : ''}</p>${holds.length ? `<p class="hint warn">${holds.join('<br>')}</p>` : ''}</div></div>
+      <div><b>${p.running ? 'Processing' : 'Processing is stopped'}</b><p class="hint">${line}. ${p.running ? 'Extraction, reviews, summaries and translations take work as slots free up.' : 'Extraction, reviews, summaries and translations wait in this workspace until processing starts again.'}${limits ? ` ${limits}` : ''}</p>${holds.length ? `<p class="hint warn">${holds.join('<br>')}</p>` : ''}</div></div>
     <div class="tp-actions">
       ${mayChange ? '' : '<span class="hint">An administrator starts and stops processing.</span>'}
       <button type="button" id="btn-tasks-processing" class="${p.running ? 'danger-button' : 'primary'}"${mayChange ? '' : ' disabled'}>${p.running ? 'Stop processing' : 'Start processing…'}</button>
@@ -6902,8 +6905,7 @@ async function loadConfigForm({ preserveStatus = false } = {}) {
     $('#cfg-extraction-batch').value = cfg.extraction?.batchSize ?? 8;
     $('#cfg-extraction-concurrency').value = cfg.extraction?.concurrency ?? 1;
     $('#cfg-extraction-claims').checked = cfg.extraction?.claims !== false;
-    // this machine's processing: auto-start, calls at once, the quota floor (src/labeling/local.ts)
-    $('#cfg-processing-autostart').checked = cfg.processing?.autoStart === true;
+    // the server's processing, the same in every workspace: calls at once, the quota floor (src/labeling/local.ts)
     $('#cfg-processing-max-calls').value = cfg.processing?.maxLocalCalls ?? 2;
     $('#cfg-processing-min-quota').value = cfg.processing?.minQuotaPercent ?? 20;
     await fillLanguagesForm(cfg);
@@ -7044,7 +7046,6 @@ function gatherConfig() {
     },
     languages: gatherLanguages(),
     processing: {
-      autoStart: $('#cfg-processing-autostart').checked,
       maxLocalCalls: Number($('#cfg-processing-max-calls').value),
       minQuotaPercent: Number($('#cfg-processing-min-quota').value),
     },
@@ -8080,6 +8081,8 @@ $('#btn-cfg-save').addEventListener('click', async () => {
     let html = `<div class="cfg-line good"><b>Configuration saved for ${esc(selectedWorkspaceLabel)}</b> · routes applied</div>`;
     if (r.reembedded && r.reindex) html += `<div class="cfg-line">re-embedded: ${r.reindex.indexed} docs · ${r.reindex.chunks} chunks</div>`;
     else if (r.reconverted && r.reindex) html += `<div class="cfg-line">document conversion refreshed: ${r.reindex.indexed} docs · ${r.reindex.errors} errors</div>`;
+    // processing and the stage models are server-wide: the save went to every workspace
+    if (r.shared) html += `<div class="cfg-line">processing and stage settings applied to every workspace on this server${r.shared.written ? ` · ${r.shared.written} other workspace${r.shared.written === 1 ? '' : 's'} updated` : ''}${r.shared.failed ? ` · <span class="bad">${r.shared.failed} could not take them (see the service log)</span>` : ''}</div>`;
     html += agentLine + profileLine;
     $('#cfg-status').innerHTML = html;
     toast(`configuration saved for ${selectedWorkspaceLabel}`);

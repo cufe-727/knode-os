@@ -348,7 +348,8 @@ struct AdminUserDraft: Encodable {
 /* ------------------------------ processing ------------------------------ */
 
 /// Whether the workspace's processing runs: extraction slots, reviews and
-/// summary pages. The service never starts it on its own.
+/// summary pages. The service starts it in every workspace; a stop lasts
+/// until someone starts it again or the service restarts.
 struct ProcessingState: Decodable, Equatable {
     var running: Bool
     var since: String?

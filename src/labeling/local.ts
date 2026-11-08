@@ -7,7 +7,7 @@ import type { CallUsage } from '../llm/usage.js';
 import { WorkTask } from '../work/broker.js';
 import { WorkKind } from '../work/kinds.js';
 import { BackendHealth, classifyFailure, newBackendHealth, recordBackendOutcome } from './failures.js';
-import { meteredPlan, PlanQuotaReader, QuotaHold, quotaHold, readPlanQuota } from './plan-quota.js';
+import { meteredPlan, PlanQuotaReader, PlanReadings, QuotaHold } from './plan-quota.js';
 import { TaskOutcome, WorkerIdentity } from './scheduler.js';
 
 /**
@@ -22,17 +22,20 @@ import { TaskOutcome, WorkerIdentity } from './scheduler.js';
  * and then tries again (src/labeling/failures.ts). Settings saves are picked
  * up within a minute.
  *
- * Two limits sit over every backend (`processing`): at most
- * `maxLocalCalls` calls run at once, every stage together — a review's judge
- * calls first in line for a free one, since a review waits on them, the
- * rest by turns — and a backend on a plan-metered CLI (Codex, Claude) takes
- * no new work while its plan has less than `minQuotaPercent` left in any
- * window (src/labeling/plan-quota.ts). It takes work again once the window
- * resets above the floor; the Tasks view shows it resting until then.
+ * Two limits sit over every backend (`processing`, one setting for the
+ * whole server): at most `maxLocalCalls` calls run at once on this machine,
+ * every workspace's slots and every stage together — `serve` hands each
+ * workspace's slots the same `CallLimiter`; a review's judge calls are first
+ * in line for a free one, since a review waits on them, the rest by turns —
+ * and a backend on a plan-metered CLI (Codex, Claude) takes no new work while
+ * its plan has less than `minQuotaPercent` left in any window
+ * (src/labeling/plan-quota.ts; the readings are shared too). It takes work
+ * again once the window resets above the floor; the Tasks view shows it
+ * resting until then.
  *
- * The slots run only between `start()` and `stop()`, as often as someone
- * starts and stops them (src/labeling/processing.ts): `serve` never starts
- * them on its own.
+ * The slots run between `start()` and `stop()`: `serve` starts them with the
+ * service in every workspace, and the Processing button stops and starts
+ * them again until the next restart (src/labeling/processing.ts).
  */
 
 export interface LocalWorkerSpec {
@@ -155,7 +158,7 @@ interface Backend {
   /** The CLI provider and the executable its plan is read through. */
   provider: string;
   command: string;
-  quota: { checkedAt: number; hold: QuotaHold | null; pending: Promise<QuotaHold | null> | null };
+  quota: { checkedAt: number; hold: QuotaHold | null };
 }
 
 export interface LocalWorkersOptions {
@@ -164,6 +167,13 @@ export interface LocalWorkersOptions {
   /** How often the config is checked for changed workers. */
   reconfigureMs?: number;
   log?: (msg: string) => void;
+  /**
+   * The calls at once this machine allows, shared by every workspace's slots
+   * (`serve` makes one). Without it the slots have a limiter of their own.
+   */
+  limiter?: CallLimiter;
+  /** The plan readings this machine shares; without them the slots read plans themselves (`readQuota`, `quotaCheckMs`). */
+  plans?: PlanReadings;
   /** How a backend's plan is read for the quota floor (tests hand their own). */
   readQuota?: PlanQuotaReader;
   /** How often a backend's plan is read again, held or not (default 2 minutes). */
@@ -171,15 +181,19 @@ export interface LocalWorkersOptions {
 }
 
 /**
- * At most `capacity` calls at once (0: no cap, only counted). Whoever waits
- * for a free call is served in turn, except that urgent ones — a review's
- * judge calls — go ahead of the rest.
+ * At most `capacity` calls at once (0: no cap, only counted), for whoever
+ * shares it — under `serve`, every workspace's slots. Whoever waits for a free
+ * call is served in turn, except that urgent ones — a review's judge calls —
+ * go ahead of the rest. Each call is held by an owner (a workspace's slots),
+ * so one owner stopping turns away its own waiters and nobody else's.
  */
 export class CallLimiter {
   private capacity = 0;
   private held = 0;
-  private readonly waiting: { urgent: boolean; grant: (ok: boolean) => void }[] = [];
+  private readonly heldBy = new Map<unknown, number>();
+  private readonly waiting: { urgent: boolean; owner: unknown; grant: (ok: boolean) => void }[] = [];
 
+  /** Calls held now, by everyone. */
   get inUse(): number {
     return this.held;
   }
@@ -188,39 +202,58 @@ export class CallLimiter {
     return this.capacity;
   }
 
+  /** Calls `owner` holds now. */
+  inUseBy(owner: unknown): number {
+    return this.heldBy.get(owner) ?? 0;
+  }
+
   setCapacity(n: number): void {
     this.capacity = Math.max(0, Math.floor(n));
     this.drain();
   }
 
   /** Resolves true once a call may start, false when the wait was called off. */
-  acquire(urgent = false): Promise<boolean> {
+  acquire(urgent = false, owner: unknown = null): Promise<boolean> {
     if (this.waiting.length === 0 && (this.capacity === 0 || this.held < this.capacity)) {
-      this.held++;
+      this.take(owner);
       return Promise.resolve(true);
     }
     return new Promise((grant) => {
-      const entry = { urgent, grant };
+      const entry = { urgent, owner, grant };
       const after = urgent ? this.waiting.findIndex((w) => !w.urgent) : -1;
       if (after >= 0) this.waiting.splice(after, 0, entry);
       else this.waiting.push(entry);
     });
   }
 
-  release(): void {
-    this.held = Math.max(0, this.held - 1);
+  release(owner: unknown = null): void {
+    if (this.held > 0) this.held--;
+    const n = this.heldBy.get(owner) ?? 0;
+    if (n > 1) this.heldBy.set(owner, n - 1);
+    else this.heldBy.delete(owner);
     this.drain();
   }
 
-  /** Turn away everyone waiting: the slots are stopping. */
-  cancel(): void {
-    for (const w of this.waiting.splice(0)) w.grant(false);
+  /** Turn away `owner`'s waiters (its slots are stopping); with no owner given, everyone's. */
+  cancel(...owner: [unknown?]): void {
+    const all = owner.length === 0;
+    for (let i = this.waiting.length - 1; i >= 0; i--) {
+      if (!all && this.waiting[i].owner !== owner[0]) continue;
+      const [w] = this.waiting.splice(i, 1);
+      w.grant(false);
+    }
+  }
+
+  private take(owner: unknown): void {
+    this.held++;
+    this.heldBy.set(owner, (this.heldBy.get(owner) ?? 0) + 1);
   }
 
   private drain(): void {
     while (this.waiting.length > 0 && (this.capacity === 0 || this.held < this.capacity)) {
-      this.held++;
-      this.waiting.shift()!.grant(true);
+      const w = this.waiting.shift()!;
+      this.take(w.owner);
+      w.grant(true);
     }
   }
 }
@@ -233,8 +266,8 @@ export class LocalLabelingWorkers {
   private timer: NodeJS.Timeout | null = null;
   private readonly sleepers = new Set<() => void>();
   private readonly log: (msg: string) => void;
-  private readonly limiter = new CallLimiter();
-  private readonly readQuota: PlanQuotaReader;
+  private readonly limiter: CallLimiter;
+  private readonly plans: PlanReadings;
   private readonly quotaCheckMs: number;
 
   constructor(
@@ -243,14 +276,19 @@ export class LocalLabelingWorkers {
     private readonly opts: LocalWorkersOptions = {},
   ) {
     this.log = opts.log ?? (() => {});
-    this.readQuota = opts.readQuota ?? ((provider, command) => readPlanQuota(provider, command));
-    this.quotaCheckMs = opts.quotaCheckMs ?? 120_000;
+    this.limiter = opts.limiter ?? new CallLimiter();
+    this.plans = opts.plans ?? new PlanReadings({ read: opts.readQuota, checkMs: opts.quotaCheckMs, log: (m) => this.log(`labeling: ${m}`) });
+    this.quotaCheckMs = this.plans.checkMs;
   }
 
-  /** Calls this machine's slots run now, and the most they may (0: no cap beyond each stage's slots). */
-  calls(): { inFlight: number; max: number } {
+  /**
+   * Calls this machine's slots run now, every workspace's together, and the
+   * most they may (0: no cap beyond each stage's slots); `workspace`: this
+   * workspace's own share of them.
+   */
+  calls(): { inFlight: number; max: number; workspace: number } {
     // the configured cap, before the first start has applied it too
-    return { inFlight: this.limiter.inUse, max: processingSettings(this.config()).maxLocalCalls };
+    return { inFlight: this.limiter.inUse, max: processingSettings(this.config()).maxLocalCalls, workspace: this.limiter.inUseBy(this) };
   }
 
   /** The backends whose plans are under the quota floor now. */
@@ -296,7 +334,8 @@ export class LocalLabelingWorkers {
     this.timer = null;
     for (const wake of this.sleepers) wake();
     this.sleepers.clear();
-    this.limiter.cancel();
+    // only this workspace's waiters: the other workspaces' slots share the limiter
+    this.limiter.cancel(this);
   }
 
   status(): LocalBackendStatus[] {
@@ -338,15 +377,16 @@ export class LocalLabelingWorkers {
     this.backends = specs.map((s) => ({
       id: s.id, kinds: s.kinds, client: s.client, slots: s.slots, busy: 0, health: newBackendHealth(),
       provider: s.llm.provider, command: cliCommand(s.llm.provider, s.llm.cliPath ?? ''),
-      quota: { checkedAt: 0, hold: null, pending: null },
+      quota: { checkedAt: 0, hold: null },
     }));
     for (const backend of this.backends) {
       for (let n = 1; n <= backend.slots; n++) void this.slot(backend, n, generation);
     }
     const limits = processingSettings(config);
+    const shared = this.opts.limiter ? ' on this machine, every workspace together' : '';
     this.log(this.backends.length
       ? `labeling: local workers ${this.backends.map((b) => `${b.id} (${b.client.label}) × ${b.slots}`).join(', ')}`
-        + `${limits.maxLocalCalls > 0 ? `; at most ${limits.maxLocalCalls} calls at once` : ''}`
+        + `${limits.maxLocalCalls > 0 ? `; at most ${limits.maxLocalCalls} calls at once${shared}` : ''}`
         + `${limits.minQuotaPercent > 0 && this.backends.some((b) => meteredPlan(b.provider)) ? `; a Codex or Claude plan under ${limits.minQuotaPercent}% left holds its stages` : ''}`
       : 'labeling: no local workers (no stage has a model here) — remote workers can still take work');
   }
@@ -371,37 +411,17 @@ export class LocalLabelingWorkers {
 
   /**
    * Whether a backend's plan is under the quota floor, read at most every
-   * `quotaCheckMs` however many of its slots ask. A backend with no plan
-   * reading (an API key, Cursor) is never held; nor is one whose read failed
-   * with nothing remembered — a refused call still rests it (src/labeling/failures.ts).
+   * `quotaCheckMs` however many slots — of this workspace or another — ask
+   * (`PlanReadings`). A backend with no plan reading (an API key, Cursor) is
+   * never held; nor is one whose read failed with nothing remembered — a
+   * refused call still rests it (src/labeling/failures.ts).
    */
   private async quotaHoldOf(backend: Backend): Promise<QuotaHold | null> {
     const floor = processingSettings(this.config()).minQuotaPercent;
-    const q = backend.quota;
-    if (!(floor > 0) || !meteredPlan(backend.provider)) {
-      if (q.hold) this.noteHold(backend, null);
-      return null;
-    }
-    if (q.pending) return q.pending;
-    if (q.checkedAt > 0 && Date.now() - q.checkedAt < this.quotaCheckMs) return q.hold;
-    const pending = (async () => {
-      let hold = q.hold;
-      try {
-        hold = quotaHold(await this.readQuota(backend.provider, backend.command), floor);
-      } catch (err) {
-        // what it knew stands until a read succeeds
-        this.log(`labeling: could not read the ${backend.client.label} plan: ${err instanceof Error ? err.message : err}`);
-      }
-      q.checkedAt = Date.now();
-      this.noteHold(backend, hold);
-      return hold;
-    })();
-    q.pending = pending;
-    try {
-      return await pending;
-    } finally {
-      q.pending = null;
-    }
+    const hold = await this.plans.hold(backend.provider, backend.command, floor);
+    backend.quota.checkedAt = this.plans.checkedAt(backend.provider, backend.command);
+    this.noteHold(backend, hold);
+    return hold;
   }
 
   private noteHold(backend: Backend, hold: QuotaHold | null): void {
@@ -415,6 +435,7 @@ export class LocalLabelingWorkers {
     const who: WorkerIdentity = { worker: `${os.hostname()}/${backend.id}#${n}`, backend: backend.client.label, remote: false };
     const idleMs = this.opts.idleMs ?? 20_000;
     const urgent = backend.kinds.includes('judge');
+    const owner = this;
     while (this.live(generation)) {
       const pause = backend.health.pausedUntil - Date.now();
       if (pause > 0) {
@@ -426,22 +447,22 @@ export class LocalLabelingWorkers {
         await this.sleep(this.quotaCheckMs);
         continue;
       }
-      if (!(await this.limiter.acquire(urgent))) break;
+      if (!(await this.limiter.acquire(urgent, owner))) break;
       if (!this.live(generation)) {
-        this.limiter.release();
+        this.limiter.release(owner);
         break;
       }
       let task: WorkTask | undefined;
       try {
         [task] = await this.work.lease(who, backend.kinds, 1);
       } catch (err) {
-        this.limiter.release();
+        this.limiter.release(owner);
         this.log(`labeling: ${who.worker} could not take work: ${err instanceof Error ? err.message : err}`);
         await this.sleep(30_000);
         continue;
       }
       if (!task) {
-        this.limiter.release();
+        this.limiter.release(owner);
         // jittered, so slots do not poll in lockstep
         await this.sleep(Math.round(idleMs * (0.75 + Math.random() * 0.5)));
         continue;
@@ -450,7 +471,7 @@ export class LocalLabelingWorkers {
       try {
         outcome = await this.run(backend, task, who);
       } finally {
-        this.limiter.release();
+        this.limiter.release(owner);
       }
       try {
         await this.work.complete(task.id, who, outcome);

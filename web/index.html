@@ -560,6 +560,7 @@
 
         <section class="settings-section" data-subtab="pipeline" aria-labelledby="pipeline-title">
           <div class="settings-section-head"><div><p class="section-index">02 · INGEST</p><h3 id="pipeline-title">How documents get processed</h3><p>A document moves down this list. The stages ask different things of a model, which is why each one can run somewhere else.</p></div><span class="section-badge accent2">Per stage</span></div>
+          <p class="cfg-callout" id="cfg-server-wide-stages"><b>Server-wide: every workspace on this server.</b> What each model stage runs with and its model, Extract's, Translate's and the review's parallel calls, the slots per agent (<span class="mono">extraction.workers</span>) and the processing limits below are one setting for the whole server: saving them here changes them in every workspace, new ones included. Which documents get processed, the languages, embedding and research stay this workspace's own.</p>
 
           <div class="stage-board">
             <div id="stage-flow" class="stage-flow"></div>
@@ -574,7 +575,7 @@
                   </div>
                 </div>
                 <div class="stage-control">
-                  <label>Run with<select id="cfg-document-use" class="cfg-route-use"></select></label>
+                  <label title="Server-wide: every workspace on this server">Run with · server-wide<select id="cfg-document-use" class="cfg-route-use"></select></label>
                   <label>Model<span class="model-field"><input id="cfg-document-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="documentLlm" title="List the models this provider offers">⌄</button></span></label>
                   <p class="route-note" id="cfg-document-note"></p>
                 </div>
@@ -602,7 +603,7 @@
                   <p>Names entities, relations and factual claims in changed documents, a long one in segments; what it finds is checked for duplicates right away.</p>
                   <p class="stage-req">The busiest stage — it runs on every changed document, a long one in segments, bounded by the calls per pass here. A fast, cheap model that returns clean JSON is usually the right trade.</p>
                   <div class="stage-rates">
-                    <label>Parallel calls<input id="cfg-extraction-concurrency" type="number" min="1" step="1" /></label>
+                    <label title="Server-wide: every workspace on this server">Parallel calls · server-wide<input id="cfg-extraction-concurrency" type="number" min="1" step="1" /></label>
                     <label>Calls per pass<input id="cfg-extraction-batch" type="number" min="1" step="1" /></label>
                     <label>Catch-up before initializing (minutes)<input id="cfg-init-maxms" type="number" min="1" max="60" step="1" /></label>
                   </div>
@@ -611,7 +612,7 @@
                   <label class="cfg-check"><input id="cfg-extraction-claims" type="checkbox" /> Extract factual claims alongside entities</label>
                 </div>
                 <div class="stage-control">
-                  <label>Run with<select id="cfg-entity-use" class="cfg-route-use"></select></label>
+                  <label title="Server-wide: every workspace on this server">Run with · server-wide<select id="cfg-entity-use" class="cfg-route-use"></select></label>
                   <label>Model<span class="model-field"><input id="cfg-entity-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="entityLlm" title="List the models this provider offers">⌄</button></span></label>
                   <p class="route-note" id="cfg-entity-note"></p>
                 </div>
@@ -625,7 +626,7 @@
                   <p class="stage-req">Runs in Extract's background pass, with its calls per pass and parallel calls.</p>
                 </div>
                 <div class="stage-control">
-                  <label>Run with<select id="cfg-summary-use" class="cfg-route-use"></select></label>
+                  <label title="Server-wide: every workspace on this server">Run with · server-wide<select id="cfg-summary-use" class="cfg-route-use"></select></label>
                   <label>Model<span class="model-field"><input id="cfg-summary-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="summaryLlm" title="List the models this provider offers">⌄</button></span></label>
                   <p class="route-note" id="cfg-summary-note"></p>
                 </div>
@@ -639,14 +640,14 @@
                   <label class="cfg-check"><input id="cfg-lang-enabled" type="checkbox" /> Translate documents into the primary language</label>
                   <div class="stage-rates">
                     <label>Primary language<select id="cfg-lang-primary"></select></label>
-                    <label>Parallel calls<input id="cfg-translate-concurrency" type="number" min="0" max="16" step="1" /></label>
+                    <label title="Server-wide: every workspace on this server">Parallel calls · server-wide<input id="cfg-translate-concurrency" type="number" min="0" max="16" step="1" /></label>
                     <label>Longest document translated by itself (characters, 0 = any)<input id="cfg-lang-maxchars" type="number" min="0" step="1000" /></label>
                   </div>
                   <div class="cfg-lang-secondary"><span class="hint">Secondary languages, translated on request:</span> <span id="cfg-lang-secondary"></span></div>
                   <p class="stage-req" id="cfg-lang-status"></p>
                 </div>
                 <div class="stage-control">
-                  <label>Run with<select id="cfg-translate-use" class="cfg-route-use"></select></label>
+                  <label title="Server-wide: every workspace on this server">Run with · server-wide<select id="cfg-translate-use" class="cfg-route-use"></select></label>
                   <label>Model<span class="model-field"><input id="cfg-translate-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="translateLlm" title="List the models this provider offers">⌄</button></span></label>
                   <p class="route-note" id="cfg-translate-note"></p>
                 </div>
@@ -665,7 +666,7 @@
                   <p class="stage-req">After each extraction pass the entities and claims it wrote are checked for duplicates, and everything again overnight; a merge can always be undone. Disputed claims are reviewed overnight.</p>
                 </div>
                 <div class="stage-control">
-                  <label>Run with<select id="cfg-judge-use" class="cfg-route-use"></select></label>
+                  <label title="Server-wide: every workspace on this server">Run with · server-wide<select id="cfg-judge-use" class="cfg-route-use"></select></label>
                   <label>Model<span class="model-field"><input id="cfg-judge-model" placeholder="Optional · use its model" /><button type="button" class="model-chevron" data-route="judgeLlm" title="List the models this provider offers">⌄</button></span></label>
                   <p class="route-note" id="cfg-judge-note"></p>
                 </div>
@@ -673,14 +674,13 @@
             </div>
           </div>
 
-          <div class="cfg-card-title"><div><b>Processing on this machine</b><small>Extraction, summaries, translations and review calls on this machine's own slots — what the Processing button starts. Remote workers are not counted.</small></div><span class="section-badge accent2">Limits</span></div>
+          <div class="cfg-card-title"><div><b>Processing on this server</b><small>Server-wide: every workspace on this server. Extraction, summaries, translations and review calls on this machine's own slots start with the service in every workspace. Remote workers are not counted.</small></div><span class="section-badge accent2">Server-wide</span></div>
           <fieldset class="cfg-card cfg-card-wide">
-            <label class="cfg-check"><input id="cfg-processing-autostart" type="checkbox" /> Start processing when the service starts</label>
             <div class="cfg-grid cfg-grid-3">
-              <label>Model calls at once, every stage together (0 = each stage's own count)<input id="cfg-processing-max-calls" type="number" min="0" max="64" step="1" /></label>
-              <label>Rest a Codex or Claude stage while its plan has less than this % left (0 = never)<input id="cfg-processing-min-quota" type="number" min="0" max="100" step="1" /></label>
+              <label>Model calls at once on this machine, every workspace and stage together (0 = each stage's own count)<input id="cfg-processing-max-calls" type="number" min="0" max="64" step="1" /></label>
+              <label>Stop background work while a Codex or Claude plan has less than this % left (0 = never)<input id="cfg-processing-min-quota" type="number" min="0" max="100" step="1" /></label>
             </div>
-            <p class="cfg-callout">A stage that rests takes work again once the plan's window resets above the floor; Tasks shows it resting until then. Codex's windows are read without a model call; Claude's are what its last call here reported. Starting with the service takes effect at the next start — use Start processing in Tasks to start now.</p>
+            <p class="cfg-callout">Under the floor, nothing that runs on its own spends the plan: extraction, summaries, translations, reviews, research jobs and studies, the nightly Dream and the tier-2 pass all wait until the plan's window resets above it, and Tasks says so. Ask still answers. Codex's windows are read without a model call; Claude's are what its last call here reported. Processing starts with the service in every workspace; Stop processing in Tasks pauses one workspace until the next restart.</p>
           </fieldset>
         </section>
 
@@ -869,7 +869,7 @@
 
   <dialog id="create-workspace-dialog" class="team-dialog">
     <form id="create-workspace-form" novalidate>
-      <div class="dialog-head"><p class="eyebrow">NEW CONTEXT</p><h2>Create a workspace</h2><p>Each workspace has its own complete directory tree, index, graph, and model settings.</p></div>
+      <div class="dialog-head"><p class="eyebrow">NEW CONTEXT</p><h2>Create a workspace</h2><p>Each workspace has its own complete directory tree, index, graph, research and Ask settings. Processing and the stage models are the server's, the same in every workspace.</p></div>
       <label for="create-workspace-name">Workspace name</label>
       <input id="create-workspace-name" maxlength="128" placeholder="e.g. Product research" required />
       <p id="create-workspace-error" class="form-error" role="alert"></p>

@@ -12,7 +12,9 @@ import { nightlySchedule, startDreamScheduler } from '../dream/dream.js';
 import { activityOf, describeSync, scopeLabel } from '../activity.js';
 import { CallLedger } from '../estimate/ledger.js';
 import { startFollowUp } from '../labeling/followup.js';
-import { judgesHere, LocalLabelingWorkers } from '../labeling/local.js';
+import { backgroundHold, BackgroundHold, routesHold } from '../labeling/background-floor.js';
+import { CallLimiter, judgesHere, LocalLabelingWorkers } from '../labeling/local.js';
+import { PlanReadings } from '../labeling/plan-quota.js';
 import { LabelingProcessing } from '../labeling/processing.js';
 import { LabelingScheduler } from '../labeling/scheduler.js';
 import { EmbeddingBackfill } from '../ingest/embed-backfill.js';
@@ -22,6 +24,7 @@ import { FeishuDocs } from '../ingest/feishu/docs.js';
 import { isOwnWrite } from '../ingest/own-writes.js';
 import { sync, SyncContext, syncsSettled, SyncStats } from '../ingest/sync.js';
 import { embeddingDeferred, processingSettings } from '../config.js';
+import { workspaceDirs } from '../global-settings.js';
 import { WorkBroker } from '../work/broker.js';
 import { offeredRemotely } from '../work/config.js';
 import { BrokeredEmbedder, embedOffered, EmbedSource, LocalEmbedSlots, localEmbedSlots } from '../work/embed.js';
@@ -99,6 +102,11 @@ function failOnListenError(server: { on: (event: 'error', cb: (err: NodeJS.Errno
  * `server.auth.enabled` is false. The main listener is plain HTTP, for this
  * machine and the tunnels in front of it; `server.tls` adds an HTTPS one for
  * other machines.
+ *
+ * Processing and the stage models are the server's (src/global-settings.ts):
+ * every workspace opens at startup and starts its processing, and they all
+ * share one cap on model calls at once (one `CallLimiter`) and one set of plan
+ * readings for the quota floor over background work.
  */
 export async function startServer(ctx: AppContext): Promise<void> {
   const log = (msg: string) => console.log(`[knode-os] ${msg}`);
@@ -121,8 +129,16 @@ export async function startServer(ctx: AppContext): Promise<void> {
   const mcpTokens = new McpWorkspaceTokens();
   // per-workspace background services the routes may poke (queue a job and run it now; the MCP endpoint a chat turn attaches to)
   const services = new Map<string, WorkspaceServices>();
+  // this machine's calls at once and its plan readings, for every workspace together
+  const machine: MachineProcessing = {
+    limiter: new CallLimiter(),
+    plans: new PlanReadings({ log: (msg) => log(`processing: ${msg}`) }),
+  };
+  machine.limiter.setCapacity(processingSettings(ctx.config).maxLocalCalls);
   const workspaceContexts = new WorkspaceContextRegistry(ctx.dataDir, {
-    templateConfig: ctx.config,
+    // read on every open: a shared setting an administrator changed reaches the root's copy first
+    templateConfig: () => ctx.config,
+    log,
     onCreate: (workspaceCtx, scope) => {
       const workspaceLog = (msg: string) => log(`[${scope.relativeDir}] ${msg}`);
       const agentToken = mcpTokens.mint(scope);
@@ -135,7 +151,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
         : null;
       let started: StartedServices;
       try {
-        started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp, rootDataDir: ctx.dataDir });
+        started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp, rootDataDir: ctx.dataDir, machine });
       } catch (err) {
         mcpTokens.revoke(agentToken);
         throw err;
@@ -192,62 +208,40 @@ export async function startServer(ctx: AppContext): Promise<void> {
 }
 
 /**
- * Open, at startup, every workspace that follows a linked folder, a linked
- * Feishu document or an agent conversation, or that starts its processing on
- * its own (`processing.autoStart`): its watchers, pollers, embedding,
+ * Open every workspace at startup: processing starts with the service in
+ * each one (src/global-settings.ts), and its watchers, pollers, embedding,
  * extraction and summaries must not wait for someone to open it in the UI —
- * after a restart they would otherwise sit idle until then.
+ * after a restart they would otherwise sit idle until then. A Team shared
+ * from a personal workspace is a symlink to it and opens as that workspace.
  */
 export function autostartWorkspaces(root: string, registry: Pick<WorkspaceContextRegistry, 'get'>, log: (msg: string) => void): void {
-  /** Why a workspace opens at startup, or null when it waits to be opened. */
-  const linked = (dataDir: string): string | null => {
-    try {
-      const config = JSON.parse(fs.readFileSync(path.join(dataDir, 'knode.config.json'), 'utf8')) as {
-        ingest?: { linkedFolders?: unknown[]; feishuDocs?: unknown[]; conversations?: unknown[] };
-        processing?: { autoStart?: unknown };
-      };
-      const some = (list: unknown[] | undefined) => Array.isArray(list) && list.length > 0;
-      if (some(config.ingest?.linkedFolders) || some(config.ingest?.feishuDocs) || some(config.ingest?.conversations)) {
-        return 'it follows linked folders, Feishu documents or agent conversations';
-      }
-      return config.processing?.autoStart === true ? 'its processing starts with the service' : null;
-    } catch {
-      return null;
-    }
-  };
-  const dirs = (abs: string) => {
-    try {
-      return fs.readdirSync(abs, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.name.startsWith('.')).map((e) => e.name);
-    } catch {
-      return [];
-    }
-  };
-  const open = (label: string, scope: Parameters<WorkspaceContextRegistry['get']>[0], why: string) => {
+  const why = 'processing starts with the service in every workspace';
+  const open = (label: string, scope: Parameters<WorkspaceContextRegistry['get']>[0]) => {
     void registry.get(scope).then(
       () => log(`[${label}] opened at startup: ${why}`),
       (err) => log(`[${label}] could not open at startup: ${err instanceof Error ? err.message : err}`),
     );
   };
-  for (const user of dirs(path.join(root, 'users'))) {
-    for (const id of dirs(path.join(root, 'users', user, 'workspaces'))) {
-      const dataDir = path.join(root, 'users', user, 'workspaces', id);
-      const why = linked(dataDir);
-      if (!why) continue;
-      try {
-        const manifest = JSON.parse(fs.readFileSync(path.join(dataDir, '.workspace.json'), 'utf8')) as { name?: string };
-        open(`users/${user}/workspaces/${id}`, resolveWorkspaceScope({ user, kind: 'personal', id, name: manifest.name || id }), why);
-      } catch (err) {
-        log(`[users/${user}/workspaces/${id}] could not open at startup: ${err instanceof Error ? err.message : err}`);
-      }
-    }
-  }
-  for (const team of dirs(path.join(root, 'teams'))) {
-    const why = linked(path.join(root, 'teams', team));
-    if (!why) continue;
+  for (const dataDir of workspaceDirs(root)) {
+    const label = path.relative(root, dataDir).split(path.sep).join('/');
+    const [area, ...rest] = label.split('/');
     try {
-      open(`teams/${team}`, resolveWorkspaceScope({ user: 'autostart', kind: 'team', name: team }), why);
+      // a folder without a config is no workspace yet (nothing made it one); it opens when someone asks for it
+      if (!fs.existsSync(path.join(dataDir, 'knode.config.json'))) continue;
+      if (area === 'users') {
+        const [user, , id] = rest;
+        let name = id;
+        try {
+          name = (JSON.parse(fs.readFileSync(path.join(dataDir, '.workspace.json'), 'utf8')) as { name?: string }).name || id;
+        } catch {
+          // a missing manifest is repaired from the folder's id when it opens
+        }
+        open(label, resolveWorkspaceScope({ user, kind: 'personal', id, name }));
+      } else {
+        open(label, resolveWorkspaceScope({ user: 'autostart', kind: 'team', name: rest[0] }));
+      }
     } catch (err) {
-      log(`[teams/${team}] could not open at startup: ${err instanceof Error ? err.message : err}`);
+      log(`[${label}] could not open at startup: ${err instanceof Error ? err.message : err}`);
     }
   }
 }
@@ -530,8 +524,23 @@ interface StartedServices {
   embedSlots: LocalEmbedSlots;
 }
 
-function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opts: { mcp?: () => McpEndpoint | null; rootDataDir?: string } = {}): StartedServices {
+/** What every workspace's processing shares on this machine (`startServer` makes one). */
+export interface MachineProcessing {
+  /** The cap on model calls at once, every workspace's slots together (`processing.maxLocalCalls`). */
+  limiter: CallLimiter;
+  /** Plan readings for the quota floor, each plan read at most every two minutes for everyone. */
+  plans: PlanReadings;
+}
+
+function startWorkspaceServices(
+  ctx: AppContext,
+  log: (msg: string) => void,
+  opts: { mcp?: () => McpEndpoint | null; rootDataDir?: string; machine?: MachineProcessing } = {},
+): StartedServices {
   let disposed = false;
+  const machine = opts.machine ?? { limiter: new CallLimiter(), plans: new PlanReadings({ log }) };
+  // the quota floor over this workspace's background work: its slots, research, Dream and the tier-2 pass
+  const floor = backgroundHold(machine.plans, () => ctx.config);
   // vectors are computed after a document is indexed, never while it is: an
   // import or sync does not wait on the rate-limited pool, and a spent daily
   // quota leaves chunks pending instead of documents unindexed
@@ -553,7 +562,7 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   const auditEmbedder = new BrokeredEmbedder(embedWork, () => ctx.embedder, () =>
     embeddingDeferred(ctx.config) && (localEmbedSlots(ctx.config) > 0 || (embedOffered(ctx.config) && remoteEmbed.askedLately())));
   // deep-research jobs: an external CLI writes wiki pages through the MCP endpoint serve hosts
-  const research = opts.mcp ? startResearchLoop(ctx, { mcp: opts.mcp, log }) : null;
+  const research = opts.mcp ? startResearchLoop(ctx, { mcp: opts.mcp, log, hold: floor }) : null;
   // a chat turn only lives in one process: whatever a previous serve left mid-answer is idle now
   void resetRunningConversations(ctx.store)
     .then((n) => n && log(`chat: ${n} conversation(s) left answering by a previous run are idle again`))
@@ -617,12 +626,12 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   // src/work): this machine's slots and remote workers take segments,
   // summaries and a review's judge calls as they free up, nothing waits for
   // the slowest call; the duplicate audit of what was written and the views
-  // that depend on it follow on their own loop (docs/design/09, 10, 11). This
-  // machine's slots and the reviews spend model calls, so none of them starts
-  // on its own unless the workspace says so (`processing.autoStart`): someone
-  // starts the processing (the app, POST /api/labeling/start) and it runs
-  // until stopped or shut down, at most `processing.maxLocalCalls` calls at
-  // once and none on a plan under the quota floor (src/labeling/local.ts).
+  // that depend on it follow on their own loop (docs/design/09, 10, 11). The
+  // processing starts with the service, in every workspace, and runs until
+  // someone stops it (the app, POST /api/labeling/stop: until the next start
+  // of the service) or the service stops — at most `processing.maxLocalCalls`
+  // calls at once on this machine, every workspace together, and none on a
+  // plan under the quota floor (src/labeling/local.ts).
   const leaseMs = Math.max(1, ctx.config.server.remote?.leaseMinutes ?? 15) * 60_000;
   let summaries: SummarySource | null = null;
   const remoteJudge = { askedLately: () => false };
@@ -650,11 +659,10 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   // this machine's embed slots run whether or not processing is started, as embedding always has
   embedSlots = new LocalEmbedSlots(work, () => ctx.embedder, () => ctx.config, { log, source: embedWork });
   embedSlots.start();
-  const localWorkers = new LocalLabelingWorkers(work, () => ctx.config, { log });
+  const localWorkers = new LocalLabelingWorkers(work, () => ctx.config, { log, limiter: machine.limiter, plans: machine.plans });
   localJudge.heldForQuota = () => localWorkers.heldForQuota('judge');
   const processing = new LabelingProcessing(localWorkers, followUp, log, () => processingSettings(ctx.config).minQuotaPercent);
-  if (processingSettings(ctx.config).autoStart) processing.start('the service (processing.autoStart)');
-  else log('processing is stopped until an administrator starts it (the Processing button in the app or the web UI, or POST /api/labeling/start)');
+  processing.start('the service');
 
   // usage stats → sidecar flush
   const flushInterval = Math.max(1, ctx.config.heat.flushIntervalMinutes) * 60_000;
@@ -685,12 +693,12 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
   const conversations = new AgentConversations(ctx, { log, track });
   conversations.start();
 
-  // nightly dream + the tier-2 pass
-  const dreamTimer = startDreamScheduler(ctx, log);
+  // nightly dream + the tier-2 pass; a night whose plan is under the quota floor skips them
+  const dreamTimer = startDreamScheduler(ctx, log, { hold: () => routesHold(ctx.config, ['judgeLlm'], floor) });
   const nightly = nightlySchedule(ctx.config);
   if (nightly) log(`dream scheduled daily at ${nightly.dream} (lookback ${ctx.config.dream.lookbackDays}d)`);
   else log(`dream.schedule ${JSON.stringify(ctx.config.dream.schedule)} is not a 24-hour "HH:MM" time: the nightly dream and tier-2 pass will not run`);
-  const tier2Timer = startTier2Scheduler(ctx, log);
+  const tier2Timer = startTier2Scheduler(ctx, log, { hold: floor });
 
   // watch docs + wiki for changes → debounced scoped sync
   const dataWatcher = ctx.config.ingest.watch ? watchDataDir(ctx, { log, track }) : null;
@@ -739,8 +747,13 @@ function startWorkspaceServices(ctx: AppContext, log: (msg: string) => void, opt
  * Run the tier-2 pass daily, a few minutes after the dream schedule
  * (`nightlySchedule`). Like Dream's, it reads the schedule on every tick, so the
  * pass keeps following Dream when the config changes. Exported for tests.
+ *
+ * `hold` is the quota floor over background work
+ * (src/labeling/background-floor.ts): while the plan the Judge or the
+ * Summarize stage runs on is under it — the pass writes with both — that
+ * night's pass is skipped, with a log line.
  */
-export function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void): NodeJS.Timeout {
+export function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void, opts: { hold?: BackgroundHold } = {}): NodeJS.Timeout {
   let lastRun = '';
   const timer = setInterval(async () => {
     const now = new Date();
@@ -748,6 +761,11 @@ export function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void)
     const today = now.toISOString().slice(0, 10);
     if (hhmm === nightlySchedule(ctx.config)?.tier2 && lastRun !== today) {
       lastRun = today;
+      const held = opts.hold ? await routesHold(ctx.config, ['judgeLlm', 'summaryLlm'], opts.hold).catch(() => null) : null;
+      if (held) {
+        log(`tier2 skipped: ${held.reason} (processing.minQuotaPercent)${held.until ? `; the window resets ${held.until}` : ''}`);
+        return;
+      }
       const end = activityOf(ctx.dataDir).begin('tier2', 'Nightly tier-2 pass: merges, claim reviews, views and the wiki check');
       try {
         const res = await refineWiki(ctx.store, ctx.config, ctx.llm, { onProgress: log, embedder: ctx.embedder });

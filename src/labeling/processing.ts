@@ -3,16 +3,17 @@ import { LocalLabelingWorkers } from './local.js';
 
 /**
  * A workspace's processing: the work that spends this machine's model calls
- * once documents are in — its extraction and summary slots
- * (src/labeling/local.ts) and the duplicate reviews after them
+ * once documents are in — its extraction, summary, translation and judge
+ * slots (src/labeling/local.ts) and the duplicate reviews after them
  * (src/labeling/followup.ts).
  *
- * `serve` starts it on its own only where the workspace says so
- * (`processing.autoStart`); otherwise someone starts it (the app, the web UI,
- * POST /api/labeling/start). Either way it runs until someone stops it or the
- * service stops, within the workspace's limits: at most
- * `processing.maxLocalCalls` calls at once, and none on a Codex or Claude plan
- * under `processing.minQuotaPercent` left (src/labeling/local.ts). Importing,
+ * `serve` starts it with the service in every workspace. Someone may stop it
+ * (the app, the web UI, POST /api/labeling/stop) and start it again; a stop
+ * lasts until the next start of the service. It runs within the server's
+ * limits (`processing`, the same for every workspace): at most
+ * `processing.maxLocalCalls` calls at once on this machine, every workspace
+ * together, and none on a Codex or Claude plan under
+ * `processing.minQuotaPercent` left (src/labeling/local.ts). Importing,
  * watching and embedding documents go on regardless, and remote workers may
  * still lease segments and summaries: they are started by hand on their own
  * machines.
@@ -23,8 +24,12 @@ export interface ProcessingState {
   /** When it was last started or stopped, and by whom. */
   since: string | null;
   by: string | null;
-  /** Calls this machine's slots run now, and the most they may at once (0: no cap beyond each stage's slots). */
-  calls: { inFlight: number; max: number };
+  /**
+   * Calls this machine's slots run now, every workspace's together, and the
+   * most they may at once (0: no cap beyond each stage's slots); `workspace`:
+   * this workspace's own share of them.
+   */
+  calls: { inFlight: number; max: number; workspace: number };
   /** The quota floor in percent (0: off), and the backends it holds now. */
   minQuotaPercent: number;
   quotaHolds: { id: string; label: string; reason: string; until: string | null }[];
@@ -51,7 +56,11 @@ export class LabelingProcessing {
     this.workers.start();
     this.followUp.setActive(true);
     this.mark(by);
-    this.log(`processing started by ${by}: extraction, reviews and summaries`);
+    const { max } = this.workers.calls();
+    const floor = this.minQuotaPercent();
+    this.log(`processing started by ${by}: extraction, summaries, translations and reviews`
+      + (max > 0 ? `; at most ${max} model calls at once on this machine, every workspace together` : '')
+      + (floor > 0 ? `; background work stops while a Codex or Claude plan has under ${floor}% left` : ''));
     return true;
   }
 

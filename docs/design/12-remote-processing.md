@@ -336,9 +336,45 @@ machine's accounts. Lent keys are the exception, since they spend the server's q
 behind the switch.
 
 Since 2026‑11‑07 the switch has limits (`processing`; [remote labeling](../remote-labeling.md#local-worker-slots)):
-serve's LLM slots run at most `maxLocalCalls` calls at once (default 2, judge calls first in line), a slot on a Codex
-or Claude plan with less than `minQuotaPercent` left (default 20%) rests until the window resets, and `autoStart`
-lets the switch start with the service.
+serve's LLM slots run at most `maxLocalCalls` calls at once (default 2, judge calls first in line), and a slot on a
+Codex or Claude plan with less than `minQuotaPercent` left (default 20%) rests until the window resets.
+
+Since 2026‑11‑08 the switch is on from the start, in every workspace: `serve` opens every workspace at startup and
+starts its processing, with no setting to say otherwise (`autoStart` is gone; an old file's is read past). The
+button stays as a pause: it stops one workspace's processing until someone starts it again or the service restarts.
+
+### 6.1 Server-wide processing and stage models (2026‑11‑08)
+
+Every workspace on a machine spends the same plans, so what processing may spend is the machine's to say, not each
+workspace's. `processing`, the five stage routes (`extraction.{entityLlm,documentLlm,summaryLlm,judgeLlm,
+translateLlm}`, with `tier1Model`), `extraction.workers`, `extraction.concurrency`, `summaryConcurrency`,
+`translateConcurrency` and `review.concurrency` are one setting for the server (`src/global-settings.ts`):
+
+- **Where they live.** The server root's `knode.config.json` is the source. Each workspace's file keeps a copy, so
+  whatever reads a workspace's config — `serve`, the CLI, a test — reads the shared values. The copy is written when
+  the workspace opens (`WorkspaceContextRegistry.open`, before `createContext`; a new workspace is made from the
+  root's config and takes it then too) and, when an administrator changes one of them through `PUT /api/config` or
+  edits an agent a stage runs on, in the root, in every workspace folder (`users/*/workspaces/*`, and a Team that
+  is a folder of its own; a shared Team is a symlink to its owner's) and in every open context, which reloads
+  (`ctx.config`, `ctx.llm`). The response says how many workspaces took it.
+- **What travels with them.** A stage names an agent file or a connection row by id. The agent file is copied and
+  the row merged, with the row an agent loops on, before the workspace's config is read: `loadConfig` pins a route
+  whose target it cannot find back to the workspace's default. A same-named agent or row of the workspace is
+  replaced, unless the workspace uses that id for itself (default model, research or Ask agent): ids such as
+  `openai-1` are minted per workspace. Publishing then shares a copy under a fresh id (`settleSharedIds`,
+  `<id>-server`), and a workspace opening with such a clash moves its own aside (`<id>-own`).
+- **One cap for the machine.** `serve` makes one `CallLimiter` and hands it to every workspace's slots, so
+  `maxLocalCalls` counts every workspace's calls together. Its waiters belong to an owner (a workspace's slots), so
+  a workspace that stops turns away only its own; judge calls stay first in line. `calls()` reports the machine's
+  calls out and the workspace's share.
+- **One floor for all background work.** The plan readings are shared too (`PlanReadings`, each plan read at most
+  every two minutes for the machine). Under `minQuotaPercent` the processing slots take nothing, a research job on
+  that plan goes back in line with a `quota` pause until the window resets (with every job queued on the same
+  account), and the nightly Dream (Judge route) and tier-2 pass (Judge and Summarize routes) skip the night with a
+  log line. Ask is not held, and nor are an import's image conversions.
+
+Not counted under the cap: remote workers, research sessions, Dream, the tier-2 pass and Ask. Content settings stay
+per workspace: data sources, research, Ask, languages, embedding, the review modes and `summaryAfterExtraction`.
 
 ## 7. The worker (`worker/knode-worker.mjs`)
 

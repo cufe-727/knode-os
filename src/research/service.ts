@@ -1,8 +1,9 @@
 import { AppContext } from '../context.js';
+import type { BackgroundHold } from '../labeling/background-floor.js';
 import { claimNextJob, requeueStale, updateJob } from './jobs.js';
 import { killActiveAgents } from './launch.js';
 import { autoAcceptRecommendations } from './recommend.js';
-import { resolveResearchAgent, runResearchJob } from './runner.js';
+import { agentForJob, holdJobForQuota, resolveResearchAgent, ResearchAgent, runResearchJob } from './runner.js';
 import { continueStudies } from './study.js';
 import { McpEndpoint } from './workspace.js';
 
@@ -10,10 +11,15 @@ import { McpEndpoint } from './workspace.js';
  * The queue loop `serve` runs per workspace: claim the oldest queued job when
  * a slot is free, run it, repeat. Jobs left `running` by a previous process
  * are queued again at start.
+ *
+ * `hold` is the quota floor over background work
+ * (src/labeling/background-floor.ts): a job whose agent runs on a Codex or
+ * Claude plan under it is put back, paused until the window resets, with
+ * every job queued on the same account (`holdJobForQuota`).
  */
 export function startResearchLoop(
   ctx: AppContext,
-  opts: { mcp: () => McpEndpoint | null; log: (msg: string) => void; intervalMs?: number },
+  opts: { mcp: () => McpEndpoint | null; log: (msg: string) => void; intervalMs?: number; hold?: BackgroundHold },
 ): { stop: () => Promise<void>; kick: () => void } {
   let disposed = false;
   let running = 0;
@@ -71,6 +77,26 @@ export function startResearchLoop(
         if (n > 0) job = await claimNextJob(ctx.store).catch(() => null);
       }
       if (!job) return;
+      if (opts.hold) {
+        let runner: ResearchAgent | null = null;
+        try {
+          runner = agentForJob(ctx, job);
+        } catch {
+          // the run says why it cannot start
+        }
+        const held = runner?.kind === 'cli' ? await opts.hold(runner).catch(() => null) : null;
+        if (held && runner) {
+          const claimed = job;
+          const paused = await holdJobForQuota(ctx, claimed, runner, held, opts.log).then(() => true, async (err) => {
+            opts.log(`research ${claimed.id}: could not wait for the quota floor: ${err instanceof Error ? err.message : err}`);
+            await updateJob(ctx.store, claimed.id, { status: 'queued', attempts: Math.max(0, claimed.attempts - 1) }).catch(() => {});
+            return false;
+          });
+          // paused, it is out of line: the next one may be on another account; otherwise wait for the next tick
+          if (paused) continue;
+          return;
+        }
+      }
       running++;
       inflightJobs.add(job.id);
       const p = runResearchJob(ctx, job, { mcp, log: opts.log })

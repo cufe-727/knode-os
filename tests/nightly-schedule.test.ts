@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { addMinutesToTimeOfDay, loadConfig, normalizeTimeOfDay } from '../src/config.js';
+import { addMinutesToTimeOfDay, defaultConfig, loadConfig, normalizeTimeOfDay } from '../src/config.js';
 import type { AppContext } from '../src/context.js';
 import { nightlySchedule, startDreamScheduler } from '../src/dream/dream.js';
 import { startTier2Scheduler } from '../src/server/serve.js';
@@ -123,6 +123,52 @@ describe('the nightly schedulers', () => {
     await vi.advanceTimersByTimeAsync(30_000);
     expect(syncTraces).toHaveBeenCalledTimes(1);
     await vi.waitFor(() => expect(log.some((m) => m.startsWith('nightly dream failed: store stub'))).toBe(true));
+  });
+
+  it('skip the night\'s Dream and tier-2 pass while the plan they run on is under the quota floor', async () => {
+    vi.useFakeTimers();
+    const log: string[] = [];
+    const ctx = stubContext('03:00');
+    // the tier-2 pass reads the Judge and Summarize stages' routes to know which plan to ask about
+    ctx.config = { ...defaultConfig(), dream: ctx.config.dream };
+    const held = { reason: 'Codex weekly window has 8% left, under the 10% floor', until: '2026-10-22T06:00:00.000Z' };
+    const asked: string[] = [];
+    vi.setSystemTime(at(3, 0));
+    const dream = startDreamScheduler(ctx, (m) => log.push(m), { hold: async () => held });
+    timer = startTier2Scheduler(ctx, (m) => log.push(m), { hold: async (user) => { asked.push(user.provider); return held; } });
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      vi.setSystemTime(at(3, 10));
+      await vi.advanceTimersByTimeAsync(30_000);
+      // the next night again, still under the floor
+      vi.setSystemTime(new Date(2026, 9, 20, 3, 0, 0));
+      await vi.advanceTimersByTimeAsync(30_000);
+    } finally {
+      clearInterval(dream);
+    }
+    expect(syncTraces).not.toHaveBeenCalled();
+    expect(refineWiki).not.toHaveBeenCalled();
+    expect(asked.length).toBeGreaterThan(0);
+    expect(log.filter((m) => m.startsWith('nightly dream skipped: Codex weekly window has 8% left, under the 10% floor (processing.minQuotaPercent); the window resets 2026-10-22T06:00:00.000Z'))).toHaveLength(2);
+    expect(log).toContain('tier2 skipped: Codex weekly window has 8% left, under the 10% floor (processing.minQuotaPercent); the window resets 2026-10-22T06:00:00.000Z');
+  });
+
+  it('run them as before while the plan is over the floor', async () => {
+    vi.useFakeTimers();
+    const ctx = stubContext('03:00');
+    ctx.config = { ...defaultConfig(), dream: ctx.config.dream };
+    vi.setSystemTime(at(3, 0));
+    const dream = startDreamScheduler(ctx, () => {}, { hold: async () => null });
+    timer = startTier2Scheduler(ctx, () => {}, { hold: async () => null });
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      vi.setSystemTime(at(3, 10));
+      await vi.advanceTimersByTimeAsync(30_000);
+    } finally {
+      clearInterval(dream);
+    }
+    expect(syncTraces).toHaveBeenCalledTimes(1);
+    expect(refineWiki).toHaveBeenCalledTimes(1);
   });
 
   it('start nothing while the schedule is not a time of day', async () => {
