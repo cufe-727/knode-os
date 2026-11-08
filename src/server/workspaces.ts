@@ -3,6 +3,7 @@ import path from 'node:path';
 import { AppContext, createContext } from '../context.js';
 import { CONFIG_FILE, DatabaseConfig, defaultConfig, KnodeConfig, loadConfig, saveConfig } from '../config.js';
 import { initDataDir } from '../fs/datadir.js';
+import { syncWorkspaceSettings } from '../global-settings.js';
 import { loadPlugins } from '../plugins/loader.js';
 import { assertBackendDroppable, dropBackend } from '../store/backend.js';
 
@@ -34,7 +35,14 @@ export interface WorkspaceHeaders {
 type WorkspaceCleanup = () => void | Promise<void>;
 
 export interface WorkspaceContextRegistryOptions {
-  templateConfig?: KnodeConfig;
+  /**
+   * The root's config: a new workspace starts as a copy of it, and every
+   * workspace takes its shared settings — processing and the stage models —
+   * whenever it opens (src/global-settings.ts). A function is read each time,
+   * so a change `serve` publishes to the root reaches the next one opened.
+   */
+  templateConfig?: KnodeConfig | (() => KnodeConfig);
+  log?: (msg: string) => void;
   onCreate?: (ctx: AppContext, scope: WorkspaceScope) => void | WorkspaceCleanup | Promise<void | WorkspaceCleanup>;
 }
 
@@ -212,6 +220,18 @@ export class WorkspaceContextRegistry {
     return summary;
   }
 
+  /** The root config new workspaces are made from and take their shared settings from. */
+  template(): KnodeConfig | undefined {
+    const t = this.options.templateConfig;
+    return typeof t === 'function' ? t() : t;
+  }
+
+  /** The workspaces open now (one still opening, or one that failed to, is left out). */
+  async openContexts(): Promise<AppContext[]> {
+    const settled = await Promise.allSettled([...this.contexts.values()]);
+    return settled.filter((r): r is PromiseFulfilledResult<AppContext> => r.status === 'fulfilled').map((r) => r.value);
+  }
+
   get(scope: WorkspaceScope): Promise<AppContext> {
     const dataDir = workspaceDataDir(this.rootDataDir, scope);
     if (this.resetting.has(dataDir)) return Promise.reject(new Error('workspace is being cleared'));
@@ -272,8 +292,11 @@ export class WorkspaceContextRegistry {
   private initialize(dataDir: string, scope: WorkspaceScope, createdAt: string): void {
     const isNew = !fs.existsSync(dataDir);
     initDataDir(dataDir);
-    if (this.options.templateConfig) {
-      saveConfig(dataDir, JSON.parse(JSON.stringify(this.options.templateConfig)) as KnodeConfig);
+    const template = this.template();
+    if (template) {
+      saveConfig(dataDir, JSON.parse(JSON.stringify(template)) as KnodeConfig);
+      // and the agents its stages run on, which the copy names but does not hold
+      this.shareSettings(dataDir);
     }
     if (scope.kind === 'personal') {
       this.writeManifest(dataDir, {
@@ -296,7 +319,7 @@ export class WorkspaceContextRegistry {
   private async databaseConfig(dataDir: string): Promise<DatabaseConfig> {
     const open = await this.contexts.get(dataDir)?.catch(() => undefined);
     if (open) return open.config.database;
-    let config = this.options.templateConfig ?? defaultConfig();
+    let config = this.template() ?? defaultConfig();
     if (fs.existsSync(path.join(dataDir, CONFIG_FILE))) {
       try {
         config = loadConfig(dataDir);
@@ -307,6 +330,28 @@ export class WorkspaceContextRegistry {
     // the backend `database.kind` names may come from a plugin no open context has loaded yet
     await loadPlugins(dataDir, config.plugins, { log: (msg) => console.log(`[knode-os] ${msg}`), roots: [this.rootDataDir] });
     return config.database;
+  }
+
+  /**
+   * Write the root's shared settings into a workspace's files. A failure is
+   * said and the workspace opens on what it has: the next open, or the next
+   * change of a shared setting, tries again.
+   */
+  private shareSettings(dataDir: string): void {
+    const template = this.template();
+    if (!template) return;
+    const label = path.relative(this.rootDataDir, dataDir);
+    try {
+      if (syncWorkspaceSettings(this.rootDataDir, template, dataDir, (m) => this.log(`[${label}] ${m}`))) {
+        this.log(`[${label}] took the server's processing and stage settings`);
+      }
+    } catch (err) {
+      this.log(`[${label}] could not take the server's processing and stage settings: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  private log(msg: string): void {
+    (this.options.log ?? ((m: string) => console.log(`[knode-os] ${m}`)))(msg);
   }
 
   private writeManifest(dataDir: string, manifest: WorkspaceManifest): void {
@@ -332,6 +377,8 @@ export class WorkspaceContextRegistry {
   private async open(dataDir: string, scope: WorkspaceScope): Promise<AppContext> {
     const configFile = path.join(dataDir, CONFIG_FILE);
     if (!fs.existsSync(configFile)) this.initialize(dataDir, scope, new Date().toISOString());
+    // the server's processing and stage models, before anything reads the config
+    else this.shareSettings(dataDir);
     // a workspace's config is a copy of the root's: a plugin it names by a
     // relative path lives beside the root config, not in every workspace
     const ctx = await createContext(dataDir, { pluginRoots: [this.rootDataDir] });

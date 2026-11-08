@@ -432,23 +432,34 @@ describe('PUT /api/config with embedding providers', () => {
 });
 
 describe('PUT /api/config with processing settings', () => {
-  it('stores auto-start, the cap on calls at once and the quota floor, refusing a value that is none', async () => {
+  it('stores the cap on calls at once and the quota floor, refusing a value that is none and ignoring an old auto-start', async () => {
     const save = async (body: unknown) => app.request('/api/config', { method: 'PUT', headers, body: JSON.stringify(body) });
     const fresh = (await (await app.request('/api/config', { headers })).json()) as KnodeConfig;
-    expect(fresh.processing).toEqual({ autoStart: false, maxLocalCalls: 2, minQuotaPercent: 20 });
+    expect(fresh.processing).toEqual({ maxLocalCalls: 2, minQuotaPercent: 20 });
 
+    // a client from before sends `autoStart`: processing starts with the service anyway, so it is dropped
     const saved = await save({ processing: { autoStart: true, maxLocalCalls: 3 } });
     expect(saved.status).toBe(200);
-    expect(((await saved.json()) as { config: KnodeConfig }).config.processing).toEqual({ autoStart: true, maxLocalCalls: 3, minQuotaPercent: 20 });
+    expect(((await saved.json()) as { config: KnodeConfig }).config.processing).toEqual({ maxLocalCalls: 3, minQuotaPercent: 20 });
     // a save that sends no processing keeps it
     await save({ review: { llmJudge: 'suggest' } });
     const kept = (await (await app.request('/api/config', { headers })).json()) as KnodeConfig;
-    expect(kept.processing).toEqual({ autoStart: true, maxLocalCalls: 3, minQuotaPercent: 20 });
+    expect(kept.processing).toEqual({ maxLocalCalls: 3, minQuotaPercent: 20 });
+    // the server's setting: the root config holds it too
+    expect(loadConfig(root).processing).toEqual({ maxLocalCalls: 3, minQuotaPercent: 20 });
 
     expect((await save({ processing: { minQuotaPercent: -5 } })).status).toBe(400);
     expect((await save({ processing: { maxLocalCalls: 'many' } })).status).toBe(400);
-    const capped = ((await (await save({ processing: { autoStart: false, maxLocalCalls: 0, minQuotaPercent: 150 } })).json()) as { config: KnodeConfig }).config;
-    expect(capped.processing).toEqual({ autoStart: false, maxLocalCalls: 0, minQuotaPercent: 100 });
+    const capped = ((await (await save({ processing: { maxLocalCalls: 0, minQuotaPercent: 150 } })).json()) as { config: KnodeConfig }).config;
+    expect(capped.processing).toEqual({ maxLocalCalls: 0, minQuotaPercent: 100 });
+    await save({ processing: { maxLocalCalls: 2, minQuotaPercent: 20 } });
+  });
+
+  it('reads an old file\'s auto-start past', () => {
+    const dir = path.join(tmp, 'old-processing');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'knode.config.json'), JSON.stringify({ processing: { autoStart: true, maxLocalCalls: 4 } }));
+    expect(loadConfig(dir).processing).toEqual({ maxLocalCalls: 4, minQuotaPercent: 20 });
   });
 });
 
@@ -487,8 +498,12 @@ describe('PUT /api/config with connections', () => {
     // clearing the list drops the extras but never the default: something has
     // to answer, so the row `llmUse` names comes back from the mirror
     const dropped = ((await (await save({ connections: [] })).json()) as { config: KnodeConfig }).config;
-    expect(dropped.connections.map((c) => c.id)).toEqual([dropped.llmUse]);
+    expect(dropped.connections.some((c) => c.id === dropped.llmUse)).toBe(true);
     expect(dropped.llm.label).toBe('工作密钥');
+    // the stages that fell back to the default are the server's, while the root's own default is another
+    // endpoint: they run on a server-wide copy of this one (src/global-settings.ts); every other row went
+    const extras = dropped.connections.filter((c) => c.id !== dropped.llmUse);
+    expect(extras.every((c) => c.id.startsWith(`${dropped.llmUse}-server`) && Object.values(dropped.extraction).some((r) => (r as { use?: string })?.use === c.id))).toBe(true);
   });
 
   it('makes another connection the default by pointing at it, without retyping the endpoint', async () => {

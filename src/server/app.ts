@@ -24,6 +24,7 @@ import { findMarkedUmd, findWebDir } from '../web-assets.js';
 import { OriginalError, readOriginal } from './originals.js';
 import { publicGuard } from './public-guard.js';
 import { AppContext, judgeLlmClient } from '../context.js';
+import { shareSettingsEverywhere, sharedSnapshot } from '../global-settings.js';
 import {
   EmbeddingConfig,
   EmbeddingPoolConfig,
@@ -270,7 +271,7 @@ type ModelConfigDraft = {
   review?: Partial<Pick<ReviewConfig, 'llmJudge' | 'claims' | 'claimMerge' | 'external'>>;
   /** Content languages (docs/design/17). */
   languages?: Partial<LanguagesConfig>;
-  /** This machine's processing: auto-start, the cap on calls at once, the quota floor. */
+  /** This machine's processing, for every workspace on the server: the cap on calls at once, the quota floor. */
   processing?: Partial<ProcessingConfig>;
 };
 
@@ -519,7 +520,7 @@ async function testLlmConfig(config: LlmConfig): Promise<unknown> {
 export function createApp(
   rootCtx: AppContext,
   log: (msg: string) => void = console.log,
-  workspaceContexts = new WorkspaceContextRegistry(rootCtx.dataDir, { templateConfig: rootCtx.config }),
+  workspaceContexts = new WorkspaceContextRegistry(rootCtx.dataDir, { templateConfig: () => rootCtx.config }),
   opts: {
     services?: (ctx: AppContext) => WorkspaceServices | null;
     /** Sign-in (src/auth); absent, the app trusts the workspace headers and only the remote API is reachable from outside. */
@@ -663,6 +664,30 @@ export function createApp(
       return c.json(err(e), 500);
     }
   });
+
+  /**
+   * After a settings save in `ctx`: when it changed processing, a stage's model
+   * or slots, or an agent or row a stage runs on, the root and every other
+   * workspace take the change now (src/global-settings.ts), open ones reloaded.
+   */
+  const shareIfChanged = async (ctx: AppContext, before: string) => {
+    if (sharedSnapshot(ctx.dataDir, ctx.config) === before) return null;
+    const root = { dataDir: workspaceContexts.rootDataDir, config: workspaceContexts.template() ?? rootCtx.config };
+    const change = shareSettingsEverywhere({ root, from: ctx, open: await workspaceContexts.openContexts(), log: (m) => log(`settings: ${m}`) });
+    const here = path.relative(root.dataDir, ctx.dataDir) || '.';
+    // a stage target renamed so it takes over no other workspace's own: this workspace's Judge client follows
+    if (Object.keys(change.renamed).length > 0) {
+      ctx.llm = judgeLlmClient(ctx.config);
+      log(`settings: ${Object.entries(change.renamed).map(([a, b]) => `"${a}" is shared as "${b}"`).join(', ')}, since another workspace uses its own "${Object.keys(change.renamed)[0]}" for itself`);
+    }
+    log(`settings: the processing and stage settings saved in ${here} apply to every workspace now (${change.written.length} written, ${change.reloaded.length} open reloaded)`);
+    for (const f of change.failed) log(`settings: ${path.relative(root.dataDir, f.dataDir)} could not take them: ${f.error}`);
+    for (const dataDir of change.reloaded) {
+      const open = (await workspaceContexts.openContexts()).find((o) => o.dataDir === dataDir);
+      if (open) servicesFor(open)?.translations?.wake();
+    }
+    return { written: change.written.length, reloaded: change.reloaded.length, failed: change.failed.length, renamed: change.renamed };
+  };
 
   app.get('/api/config', (c) => {
     const ctx = requestCtx(c);
@@ -877,6 +902,8 @@ export function createApp(
     try {
       const incoming = (await c.req.json()) as ModelConfigDraft;
       const next: KnodeConfig = JSON.parse(JSON.stringify(ctx.config));
+      // processing and the stage models are the server's (src/global-settings.ts): what this save changes of them goes everywhere
+      const sharedBefore = sharedSnapshot(ctx.dataDir, ctx.config);
 
       // Unconditional: this is also what repairs a dangling embeddingUse, and
       // it flattens the mirror before the re-embed diff below reads it.
@@ -1087,8 +1114,8 @@ export function createApp(
         if (external === 'off' || external === 'verify' || external === 'research') next.review.external = external;
       }
       if (incoming.processing) {
-        // this machine's processing (src/labeling/local.ts): the slots read the cap and the floor within a minute,
-        // auto-start at the service's next start
+        // this machine's processing (src/labeling/local.ts), for every workspace on the server: the slots
+        // read the cap and the floor within a minute; an old client's `autoStart` is ignored
         const p = incoming.processing;
         const current = processingSettings(next);
         const count = (v: unknown, max: number, fallback: number) => {
@@ -1100,7 +1127,7 @@ export function createApp(
         const minQuotaPercent = count(p.minQuotaPercent, 100, current.minQuotaPercent);
         if (Number.isNaN(maxLocalCalls)) return c.json({ error: 'processing.maxLocalCalls must be a whole number from 0 (no cap) up' }, 400);
         if (Number.isNaN(minQuotaPercent)) return c.json({ error: 'processing.minQuotaPercent must be a percentage from 0 (off) to 100' }, 400);
-        next.processing = { autoStart: typeof p.autoStart === 'boolean' ? p.autoStart : current.autoStart, maxLocalCalls, minQuotaPercent };
+        next.processing = { maxLocalCalls, minQuotaPercent };
       }
       if (incoming.languages) {
         // content languages (docs/design/17): a language knode-os does not know is refused, not dropped in silence
@@ -1154,6 +1181,7 @@ export function createApp(
       ctx.embedder = nextEmbedder;
       // a new primary language, or the languages turned on: the Translate stage looks again
       servicesFor(ctx)?.translations?.wake();
+      const shared = await shareIfChanged(ctx, sharedBefore);
 
       let reindex: Awaited<ReturnType<typeof sync>> | null = null;
       // deferred: a new model needs no re-apply — the embed backlog refills for it and drains
@@ -1173,7 +1201,7 @@ export function createApp(
       }
       // the backlog for a new model, or the other embedder for a new mode, starts now
       if (reembed || modeChanged) ctx.embeddings?.kick();
-      return c.json({ ok: true, config: redactConfig(next), reembedded: reembed, reconverted: reconvert, reindex });
+      return c.json({ ok: true, config: redactConfig(next), reembedded: reembed, reconverted: reconvert, reindex, ...(shared ? { shared } : {}) });
     } catch (e) {
       return c.json(err(e), 400);
     }
@@ -2735,8 +2763,11 @@ export function createApp(
       const incoming = { ...(body.agent ?? {}) };
       // a client that predates OpenCode agents saves without the field; keep the connection it does not know about
       if (!('connection' in incoming)) incoming.connection = loadAgent(ctx.dataDir, name)?.connection ?? '';
+      const sharedBefore = sharedSnapshot(ctx.dataDir, ctx.config);
       const saved = saveAgent(ctx.dataDir, { ...incoming, name });
       refreshAgentLlms(ctx);
+      // an agent a stage runs on is the server's: every workspace takes the edit
+      await shareIfChanged(ctx, sharedBefore);
       return c.json(agentDetail(ctx, saved));
     } catch (e) {
       return c.json(err(e), 400);
@@ -2744,9 +2775,10 @@ export function createApp(
   });
 
   // Deleting a built-in resets it, the way a built-in profile behaves.
-  app.delete('/api/agents/:name', (c) => {
+  app.delete('/api/agents/:name', async (c) => {
     const ctx = requestCtx(c);
     const name = c.req.param('name');
+    const sharedBefore = sharedSnapshot(ctx.dataDir, ctx.config);
     if (!deleteAgent(ctx.dataDir, name)) return c.json({ error: 'no such agent' }, 404);
     const reset = Boolean(BUILTIN_AGENTS[name]);
     // A config still naming a deleted agent would stall the queue with an
@@ -2766,6 +2798,8 @@ export function createApp(
       }
     }
     refreshAgentLlms(ctx, moved);
+    // a stage that ran on it moved to the default: so it does everywhere
+    await shareIfChanged(ctx, sharedBefore);
     return c.json({ ok: true, reset });
   });
 

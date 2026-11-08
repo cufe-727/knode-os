@@ -122,3 +122,76 @@ export function quotaHold(quota: PlanQuota | null, minPercent: number): QuotaHol
   const tightest = short.reduce((a, b) => (a.leftPercent <= b.leftPercent ? a : b));
   return { reason: `${quota.plan} ${tightest.name} window has ${tightest.leftPercent}% left, under the ${minPercent}% floor`, until: latest };
 }
+
+/**
+ * A reading as it stands at `now`: a window whose reset has passed since says
+ * nothing more, and a reached limit whose reset has passed is over.
+ */
+export function quotaAt(quota: PlanQuota | null, now = Date.now()): PlanQuota | null {
+  if (!quota) return null;
+  const live = (t: string | null | undefined) => !t || !(Date.parse(t) <= now);
+  const windows = quota.windows.filter((w) => live(w.resetsAt));
+  const lifted = quota.limitReached && quota.limitResetsAt && !live(quota.limitResetsAt);
+  return { ...quota, windows, limitReached: lifted ? null : quota.limitReached };
+}
+
+/**
+ * The plan readings this machine shares (`serve` holds one for every
+ * workspace): each plan — a provider and the CLI it is read through — is read
+ * at most every `checkMs`, however many slots, workspaces and nightly passes
+ * ask, and the last reading that succeeded stands in while a read fails.
+ * What a reading holds depends on the floor each caller asks with.
+ */
+export class PlanReadings {
+  readonly checkMs: number;
+  private readonly read: PlanQuotaReader;
+  private readonly log: (msg: string) => void;
+  private readonly plans = new Map<string, { reading: PlanQuota | null; checkedAt: number; pending: Promise<PlanQuota | null> | null }>();
+
+  constructor(opts: { read?: PlanQuotaReader; checkMs?: number; log?: (msg: string) => void } = {}) {
+    this.read = opts.read ?? ((provider, command) => readPlanQuota(provider, command));
+    this.checkMs = opts.checkMs ?? 120_000;
+    this.log = opts.log ?? (() => {});
+  }
+
+  /**
+   * The hold on the plan `provider` runs on under `minPercent`, or null: off
+   * (0), a provider with no reading, or a plan over the floor. Never throws.
+   */
+  async hold(provider: string, command: string, minPercent: number): Promise<QuotaHold | null> {
+    if (!(minPercent > 0) || !meteredPlan(provider)) return null;
+    return quotaHold(quotaAt(await this.reading(provider, command)), minPercent);
+  }
+
+  /** When the plan was last read (0: never), for how long a hold without a reset time shows. */
+  checkedAt(provider: string, command: string): number {
+    return this.plans.get(`${provider}\u0000${command}`)?.checkedAt ?? 0;
+  }
+
+  private async reading(provider: string, command: string): Promise<PlanQuota | null> {
+    const key = `${provider}\u0000${command}`;
+    let plan = this.plans.get(key);
+    if (!plan) {
+      plan = { reading: null, checkedAt: 0, pending: null };
+      this.plans.set(key, plan);
+    }
+    if (plan.pending) return plan.pending;
+    if (plan.checkedAt > 0 && Date.now() - plan.checkedAt < this.checkMs) return plan.reading;
+    const entry = plan;
+    entry.pending = (async () => {
+      try {
+        entry.reading = await this.read(provider, command);
+      } catch (err) {
+        // what it knew stands until a read succeeds
+        this.log(`could not read the ${provider} plan: ${err instanceof Error ? err.message : err}`);
+      }
+      entry.checkedAt = Date.now();
+      return entry.reading;
+    })();
+    try {
+      return await entry.pending;
+    } finally {
+      entry.pending = null;
+    }
+  }
+}

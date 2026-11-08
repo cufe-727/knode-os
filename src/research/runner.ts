@@ -8,7 +8,8 @@ import { safePath } from '../fs/files.js';
 import { sync } from '../ingest/sync.js';
 import { agentForSpec, agentWebCapable, ResearchAgent, resolveResearchAgent } from './agent.js';
 import { finalizeInit, prepareInit, topicsFrom } from './init.js';
-import { activePause, AgentUnavailableError, agentKey, pauseFor, pausingFailure, RunPause } from './failure.js';
+import { activePause, AgentUnavailableError, agentKey, PAUSE, pauseFor, pausingFailure, RunPause } from './failure.js';
+import type { QuotaHold } from '../labeling/plan-quota.js';
 import { clearCancelled, isCancelled, JobCancelledError, JobInterruptedError, launchAgent, LaunchResult } from './launch.js';
 import { PhaseRecord, runNativePipeline, runTeamPipeline } from './pipeline.js';
 import { getJob, listJobs, ResearchJob, setJobPause, updateJob } from './jobs.js';
@@ -137,6 +138,39 @@ async function pauseAgentQueue(ctx: AppContext, pause: RunPause, except: string)
     if (await setJobPause(ctx.store, j.id, { ...pause }, { onlyQueued: true })) n++;
   }
   return n;
+}
+
+/** How long a job held by the quota floor waits when the plan's reading names no reset: then it looks again. */
+const FLOOR_RECHECK_MS = 10 * 60_000;
+
+/**
+ * A claimed job whose agent's plan is under the quota floor
+ * (`processing.minQuotaPercent`, src/labeling/background-floor.ts): it goes
+ * back in line with its attempt handed back, paused (a `quota` pause, as a
+ * spent limit would leave) until the window resets, and so does every job
+ * queued on the same account. Once the pause runs out it is claimed again,
+ * and runs if the plan is over the floor by then.
+ */
+export async function holdJobForQuota(ctx: AppContext, job: ResearchJob, agent: ResearchAgent, hold: QuotaHold, log: (m: string) => void = () => {}): Promise<ResearchJob> {
+  const now = Date.now();
+  const reset = hold.until ? Date.parse(hold.until) : NaN;
+  const until = Number.isFinite(reset) && reset > now ? Math.min(reset + PAUSE.marginMs, now + PAUSE.maxWaitMs) : now + FLOOR_RECHECK_MS;
+  const prev = activePause(job.payload, 0);
+  const pause: RunPause = {
+    kind: 'quota',
+    reason: `${hold.reason} (processing.minQuotaPercent)`,
+    since: prev?.kind === 'quota' ? prev.since : new Date(now).toISOString(),
+    until: new Date(until).toISOString(),
+    // the floor is no failure: it never counts towards giving the job up
+    count: prev?.kind === 'quota' ? prev.count : 0,
+    agent: agentKey(agent),
+    resetKnown: Number.isFinite(reset) && reset > now,
+  };
+  log(`research ${job.id}: waits until ${pause.until}: ${pause.reason}`);
+  const row = (await updateJob(ctx.store, job.id, { status: 'queued', attempts: Math.max(0, job.attempts - 1), payload: { ...job.payload, pause } }))!;
+  const n = await pauseAgentQueue(ctx, pause, job.id).catch(() => 0);
+  if (n) log(`research: ${n} more queued job(s) on ${pause.agent} wait with it`);
+  return row;
 }
 
 /** A study and its pages carry their own runner; every other job runs on research.agent. */

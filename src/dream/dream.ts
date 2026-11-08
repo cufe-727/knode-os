@@ -8,6 +8,7 @@ import { safePath, walkFiles } from '../fs/files.js';
 import { applyDocScope } from '../ingest/apply.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { applyScope } from '../lineage/scope.js';
+import type { QuotaHold } from '../labeling/plan-quota.js';
 import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
 import { optimizePacks } from '../pack/learn.js';
@@ -459,8 +460,16 @@ export function nightlySchedule(config: Pick<KnodeConfig, 'dream'>): { dream: st
  * Minute-resolution scheduler: fires runDream once per day at the configured
  * time. Reads `ctx.config`/`ctx.llm` on every tick so runtime config changes
  * (e.g. from the Settings UI) take effect without a restart.
+ *
+ * `hold` is the quota floor over background work
+ * (src/labeling/background-floor.ts): while the plan the Judge stage runs on
+ * is under it, that night's Dream is skipped, with a log line.
  */
-export function startDreamScheduler(ctx: AppContext, log: (msg: string) => void): NodeJS.Timeout {
+export function startDreamScheduler(
+  ctx: AppContext,
+  log: (msg: string) => void,
+  opts: { hold?: () => Promise<QuotaHold | null> } = {},
+): NodeJS.Timeout {
   let lastRun = '';
   const tick = async () => {
     const now = new Date();
@@ -468,6 +477,11 @@ export function startDreamScheduler(ctx: AppContext, log: (msg: string) => void)
     const today = now.toISOString().slice(0, 10);
     if (hhmm === nightlySchedule(ctx.config)?.dream && lastRun !== today) {
       lastRun = today;
+      const held = await opts.hold?.().catch(() => null);
+      if (held) {
+        log(`nightly dream skipped: ${held.reason} (processing.minQuotaPercent)${held.until ? `; the window resets ${held.until}` : ''}`);
+        return;
+      }
       try {
         const res = await activityOf(ctx.dataDir).run('dream', 'Nightly Dream over recent agent traces', () => runDream(ctx.store, ctx.config, ctx.llm, { onProgress: log }), (r) => `${r.suggestions.length} suggestions`);
         log(`nightly dream done: ${res.suggestions.length} suggestions`);
