@@ -14,7 +14,7 @@ import { Meter, parseTag, formatTag } from '../src/eval/meter.js';
 import { docText, loadPack, stageCorpus, validatePack } from '../src/eval/pack.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { buildReportData, writeReport } from '../src/eval/report.js';
-import { runEval } from '../src/eval/run.js';
+import { reuseBuilds, runEval } from '../src/eval/run.js';
 import { fileLines, RunStore } from '../src/eval/runstore.js';
 import { ChatBackend, ChatRequest, decodeVector, retryableFailure, startShim, VectorCache, vectorKey } from '../src/eval/shim.js';
 import { retrievalScores } from '../src/eval/metrics/retrieval.js';
@@ -535,17 +535,19 @@ const answersOf = (dir: string) => new RunStore(dir).allAnswers();
 describe('reusing builds', () => {
   it("starts a new run from an earlier run's builds of the same pack, and refuses one embedded differently", async () => {
     const packDir = path.join(tmp, 'packs', 'fixture-life');
-    const first = path.join(tmp, 'runs', 'r1');
-    const backend = new ScriptedBackend();
     const judge = scriptedJudge();
     const embedder = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false });
+    // an earlier run that applied no update batches, so its builds are still the base builds
+    const first = path.join(tmp, 'runs', 'r0');
+    await runEval({ packs: [packDir], systems: ['knode-ask', 'agent-wiki-sources', 'rag-hybrid'], runDir: first, quota: false, types: ['single-hop'], suites: ['usage'], overrides: { chat: new ScriptedBackend(), judge, embedder } });
+    const backend = new ScriptedBackend();
     const res = await runEval({ packs: [packDir], systems: ['knode-ask', 'agent-wiki-sources', 'rag-hybrid'], runDir: path.join(tmp, 'runs', 'reuse'), quota: false, types: ['aggregate', 'single-hop'], suites: ['usage'], reuseBuildsFrom: first, overrides: { chat: backend, judge, embedder } });
     // the stand-in codex answered, not the real one
     expect(answersOf(res.runDir).filter((a) => a.system === 'agent-wiki-sources').every((a) => a.text.includes('Final answer: 高级数据工程师'))).toBe(true);
     const store = new RunStore(res.runDir);
     const builds = store.allBuilds();
     expect(builds.map((b) => b.system).sort()).toEqual(['knode', 'llm-wiki', 'rag']);
-    expect(builds.every((b) => (b.notes as { reusedFrom?: string }).reusedFrom === 'r1')).toBe(true);
+    expect(builds.every((b) => (b.notes as { reusedFrom?: string }).reusedFrom === 'r0')).toBe(true);
     // nothing was built again: every model call answered a question
     const answered = store.allAnswers().filter((a) => a.system !== 'agent-wiki-sources').length;
     expect(backend.calls).toBe(answered);
@@ -553,6 +555,22 @@ describe('reusing builds', () => {
     const small = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 64, batchSize: 64, sendDimensions: false });
     await expect(runEval({ packs: [packDir], systems: ['rag-hybrid'], runDir: path.join(tmp, 'runs', 'reuse-64'), quota: false, reuseBuildsFrom: first, overrides: { chat: backend, judge, embedder: small } })).rejects.toThrow(/embedded with .*\(384\); this run embeds with .*\(64\)/);
   }, 120_000);
+
+  it('builds again what the earlier run went on to update, since update batches change its work directory in place', () => {
+    const packDir = path.join(tmp, 'packs', 'fixture-life');
+    // the fixture run answered the update suite: its batches (knode@01, llm-wiki@01, rag@01, …) changed its work directories
+    const updated = new RunStore(path.join(tmp, 'runs', 'r1'));
+    const meta = updated.meta()!;
+    expect(updated.allBuilds().filter((b) => b.system.includes('@')).length).toBeGreaterThan(0);
+    // a base build it did not update is still reused (long-context has no update step)
+    const partial = new RunStore(path.join(tmp, 'runs', 'r1-partial'));
+    partial.writeMeta({ ...meta, id: 'r1-partial' });
+    for (const b of updated.allBuilds().filter((x) => !x.system.startsWith('rag@'))) partial.putBuild(b);
+    const into = new RunStore(path.join(tmp, 'runs', 'reuse-updated'));
+    const n = reuseBuilds(into, partial.dir, [packDir], meta.embedding, meta.fraction, meta.seed);
+    expect(n.updated.sort()).toEqual(['fixture-life/knode', 'fixture-life/llm-wiki']);
+    expect(into.allBuilds().map((b) => b.system).sort()).toEqual(['long-context', 'rag']);
+  });
 });
 
 describe("an embedding endpoint of the run's own", () => {

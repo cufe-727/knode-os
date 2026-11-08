@@ -96,7 +96,9 @@ export interface RunOptions {
    * Start from another run's builds of the same packs (same id, version,
    * fraction and seed) and its embedding vectors: their work directories are
    * copied and their build records kept, cost included — so a new task set
-   * over an unchanged corpus does not pay for the builds again.
+   * over an unchanged corpus does not pay for the builds again. A build the
+   * other run went on to update is built again: update batches change its
+   * work directory in place, so what is there is no longer the base build.
    */
   reuseBuildsFrom?: string;
   /** Tests: stand-ins for Codex, the judge and the embedder. */
@@ -227,6 +229,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     const groups = new Set(makeSystems(opts.systems).map((sys) => sys.group));
     const n = reuseBuilds(store, path.resolve(opts.reuseBuildsFrom), opts.packs, `${embedder.model} (${embedder.dimensions})`, fraction, seed, groups);
     progress(`reusing ${n.builds} builds and ${n.vectors} embedding vectors from ${opts.reuseBuildsFrom}`);
+    if (n.updated.length) progress(`building again, since ${opts.reuseBuildsFrom} updated them after building: ${n.updated.join(', ')}`);
     store.log('builds reused', { from: opts.reuseBuildsFrom, ...n });
   }
 
@@ -426,17 +429,25 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
  * Copy another run's finished builds of these packs, and its embedding
  * vectors, into this run. Refused when the other run embedded with another
  * model: a knode index or a RAG index answers queries only in its own space.
+ * A build the other run updated (`<group>@<batch>`, applied in place) is left
+ * out and listed in `updated`: its work directory holds the updated corpus.
  */
-export function reuseBuilds(store: RunStore, from: string, packDirs: string[], embedding: string, fraction: number, seed: string | number, groups?: Set<string>): { builds: number; vectors: number } {
+export function reuseBuilds(store: RunStore, from: string, packDirs: string[], embedding: string, fraction: number, seed: string | number, groups?: Set<string>): { builds: number; vectors: number; updated: string[] } {
   const src = new RunStore(from);
   const meta = src.meta();
   if (!meta) throw new Error(`--reuse-builds-from: not a run directory: ${from}`);
   if (meta.embedding !== embedding) throw new Error(`--reuse-builds-from: ${meta.id} embedded with ${meta.embedding}; this run embeds with ${embedding}`);
   let builds = 0;
+  const updated: string[] = [];
   for (const dir of packDirs) {
     const pack = loadPack(dir);
-    for (const b of src.allBuilds().filter((x) => x.ok && x.pack === pack.manifest.id && !x.system.includes('@') && (!groups || groups.has(x.system)))) {
+    const all = src.allBuilds().filter((x) => x.pack === pack.manifest.id);
+    for (const b of all.filter((x) => x.ok && !x.system.includes('@') && (!groups || groups.has(x.system)))) {
       if (b.key !== recordKey('build', pack.manifest.id, pack.manifest.version, b.system, fraction, seed) || store.build(b.key)) continue;
+      if (all.some((x) => x.system.startsWith(`${b.system}@`))) {
+        updated.push(`${pack.manifest.id}/${b.system}`);
+        continue;
+      }
       const work = path.join(from, 'work', pack.manifest.id, b.system);
       if (fs.existsSync(work)) fs.cpSync(work, store.workDir(pack.manifest.id, b.system), { recursive: true });
       store.putBuild({ ...b, notes: { ...b.notes, reusedFrom: meta.id, builtAt: b.at } });
@@ -451,7 +462,7 @@ export function reuseBuilds(store: RunStore, from: string, packDirs: string[], e
     fs.copyFileSync(from_, to);
     vectors = fileLineCount(to);
   }
-  return { builds, vectors };
+  return { builds, vectors, updated };
 }
 
 function fileLineCount(file: string): number {
