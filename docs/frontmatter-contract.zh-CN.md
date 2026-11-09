@@ -41,11 +41,14 @@ wiki/<...>
 raw/docs/okf/<bundle>/<...>
 ```
 
-| 落点 | 怎么进去 | `type` `aliases` bundle 内链 | `title` | `entities` `claims` | `trust` `actor` `acl` |
+| 落点 | 怎么进去 | `type` `aliases` bundle 内链 | `title` | `entities` `relations` `claims` | `trust` `actor` `acl` |
 | --- | --- | :-: | :-: | :-: | :-: |
 | `raw/docs/<任意目录>/` | 拖拽上传、`POST /api/upload` | ✗ | ✓ | ✓ | ✓ |
-| `raw/docs/okf/<bundle>/` | `knode-os okf import` | ✓ | ✓ | ✓ | ✓ |
-| `wiki/` | 原生页、`knode_write` | ✓ | ✓ | ✗ | ✓ |
+| `raw/docs/okf/<bundle>/` | `knode-os okf import` | ✓ | ✓ | ✓¹ | ✓ |
+| `wiki/` | 原生页、`knode_write` | ✓ | ✓ | ✓¹ | ✓ |
+
+¹ bundle 页的缺省主语是页面自身实体：`claims` 不写 `subject`、`relations` 不写 `source` 时，
+都落到这一页的实体上。`wiki/` 里写了 `selfEntity: false` 的页面没有自身实体，这三个键都会被忽略。
 
 同一份 frontmatter（`type` + `title` + `aliases`）过 `planWireFromMarkdown` 的实测：
 
