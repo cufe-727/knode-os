@@ -29,11 +29,12 @@ struct KnodeLogo: View {
 struct Eyebrow: View {
     var text: String
     var color: Color = .knodeCyan
+    var size: CGFloat = 10
 
     var body: some View {
         Text(text.uppercased())
-            .font(.system(size: 10, weight: .bold, design: .monospaced))
-            .tracking(1.4)
+            .font(.system(size: size, weight: .bold, design: .monospaced))
+            .tracking(size * 0.14)
             .foregroundStyle(color)
     }
 }
