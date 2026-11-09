@@ -43,6 +43,8 @@
 // Other options: --name <worker> (default: hostname), --timeout-ms <ms> (default 600000), --idle-ms <ms> (poll wait),
 // --header "Name: value" (repeatable; e.g. a Cloudflare Access service token),
 // --token-file <path> (instead of KNODE_TOKEN), --once (exit when there is no work),
+// --extract-first (do not lease summaries while extraction is queued or in flight;
+//                  recheck before each lease, without cancelling calls already running),
 // --check (show what the token may do, what the server offers, which backends are installed and — for embed —
 // the embedding identity and whether the endpoint passes calibration, then exit).
 
@@ -60,7 +62,7 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (!arg.startsWith('--')) throw new Error(`unexpected argument: ${arg}`);
     const [key, inline] = arg.slice(2).split(/=(.*)/s, 2);
-    const flag = ['once', 'check', 'help'].includes(key);
+    const flag = ['once', 'check', 'help', 'extract-first'].includes(key);
     const value = flag ? true : inline ?? argv[++i];
     if (value === undefined) throw new Error(`--${key} needs a value`);
     if (key === 'header') opts.headers.push(value);
@@ -176,6 +178,30 @@ function rereadWorkConfig() {
 function kindsNow() {
   const offered = work ? KINDS.filter((k) => work.kinds?.[k] === true) : ['extract'];
   return askedKinds ? askedKinds.filter((k) => offered.includes(k)) : offered;
+}
+
+let extractionPhase = null;
+
+/** A failed or incomplete status read must never open the summary gate. */
+async function kindsForLease() {
+  const kinds = kindsNow();
+  if (!args.extractFirst || !work || !kinds.includes('summarize')) return kinds;
+  if (!kinds.includes('extract')) throw new Error('--extract-first requires permission to take extraction work');
+  const { data } = await call('GET', `${base}/work/status`);
+  const extract = data.kinds?.extract;
+  const counts = [extract?.queued, extract?.openDocuments, extract?.readySegments];
+  if (!counts.every((n) => Number.isSafeInteger(n) && n >= 0) || !Array.isArray(extract?.leases)) {
+    throw new Error('cannot confirm extraction is drained: incomplete work status');
+  }
+  const pending = counts.some((n) => n > 0) || extract.leases.length > 0;
+  const phase = pending ? 'extract' : 'summarize';
+  if (extractionPhase !== phase) {
+    extractionPhase = phase;
+    log(pending
+      ? `extract-first: extraction pending (${extract.queued} queued, ${extract.leases.length} leased); summaries wait`
+      : 'extract-first: extraction drained; summaries may run');
+  }
+  return pending ? kinds.filter((kind) => kind !== 'summarize') : kinds;
 }
 
 function describeKinds() {
@@ -775,10 +801,10 @@ async function slot(backend, n) {
     if (reading) await reading;
     // work/* on a server that has it; extraction over labeling/* on one from before
     const route = work ? 'work' : 'labeling';
-    const kinds = kindsNow();
     let task;
     let leaseSeconds = 900;
     try {
+      const kinds = await kindsForLease();
       if (kinds.length) {
         const { data } = await call('POST', `${base}/${route}/lease`, route === 'work' ? { ...identity, kinds, max: 1 } : { ...identity, max: 1 });
         task = data.tasks?.[0];
@@ -975,6 +1001,7 @@ for (;;) {
 }
 log(`knode worker ${workerName} → ${server} ${workspace}: ${backends.map((b) => `${b.name} × ${b.slots}`).join(', ')} (session ${crypto.randomUUID().slice(0, 8)})`);
 log(`${workspace}: ${describeKinds()}`);
+if (args.extractFirst) log('extract-first enabled: summaries wait for the extraction queue and in-flight work to drain');
 const llmSlots = backends.some((b) => b.name !== 'embed');
 if (llmSlots && kindsNow().length === 0) log('nothing to take here — check --kinds, the token\'s kinds and what the server offers');
 if (hasEmbedSlots && !work?.kinds?.embed) log('embed: not offered to this token here — it needs the "embed" scope, and the workspace ingest.embedding "deferred"');
