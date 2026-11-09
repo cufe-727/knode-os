@@ -175,6 +175,10 @@ KNODE_TOKEN=knr_… OPENAI_API_KEY=… node knode-worker.mjs --server https://kn
 node knode-worker.mjs … --check     # what the token may do, what the server offers, the queues, which CLIs are installed
 ```
 
+Use `--extract-first --kinds extract,summarize` to finish queued and in-flight extraction before taking summaries.
+The worker checks extraction status before each lease; if new extraction arrives, it stops taking new summaries
+until extraction drains again. Calls already running finish normally. If status cannot be read, summaries wait.
+
 At start, and whenever a lease answer says it changed, the worker reads `GET …/work/config`: the kinds this token
 may take here, how long a lease lasts, the shares, and **hints** — how the server itself runs each kind on codex,
 claude and cursor (the model, and the effort and speed in that CLI's terms), taken from `extraction.workers` and the
