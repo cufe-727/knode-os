@@ -8,6 +8,7 @@ import { normalizeCookedFrontmatter } from '../okf/normalize.js';
 import { pluginRegistry } from '../plugins/registry.js';
 import { DocRoot } from '../types.js';
 import { isConvertibleFile } from './convert.js';
+import { isCodebaseFile } from './codebase/files.js';
 
 /**
  * The indexed text of a source — the one place that knows where it lives.
@@ -104,7 +105,8 @@ function readSource(dataDir: string, rel: string, root: DocRoot): SourceText | n
     const text = readContent(dataDir, rel);
     return text === null ? null : { text, derived: true };
   }
-  if (!isTextFile(rel)) return null;
+  // a repository's file is read as it is: source code has no frontmatter to normalize
+  if (root === 'codebase' ? !isCodebaseFile(rel) : !isTextFile(rel)) return null;
   const abs = safePath(dataDir, rel);
   if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return null;
   const raw = fs.readFileSync(abs, 'utf8');

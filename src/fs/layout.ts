@@ -5,7 +5,7 @@ import path from 'node:path';
  * Data-directory layout — the one place directory names are declared.
  *
  *   <data>/
- *   ├── raw/{docs,traces,skills}   originals; the raw path is the canonical key of every source
+ *   ├── raw/{docs,traces,skills,codebase}   originals; the raw path is the canonical key of every source
  *   ├── .sidecar/<key>/            derived, system-owned state mirroring the data dir (keep it)
  *   ├── wiki/                      curated knowledge (OKF bundle + Obsidian vault)
  *   ├── playbooks/{packs,capabilities,intents,ontology,research,concepts}   agent-editable configuration
@@ -20,6 +20,10 @@ export const RAW_DIR = 'raw';
 export const RAW_DOCS = 'raw/docs';
 export const RAW_TRACES = 'raw/traces';
 export const RAW_SKILLS = 'raw/skills';
+/** Code repositories, one folder per repository (src/ingest/codebase, docs/design/25). */
+export const RAW_CODEBASE = 'raw/codebase';
+/** The card knode-os writes for each repository under raw/codebase: one Markdown file the full pipeline reads. */
+export const CODEBASE_CARDS = `${RAW_DOCS}/codebase`;
 export const WIKI_DIR = 'wiki';
 
 /** Agent-editable configuration, all Markdown/YAML. */
@@ -74,6 +78,8 @@ export const FOLDER_ABOUT: Readonly<Record<string, string>> = {
   [`${RAW_TRACES}/claude`]: 'Claude Code sessions',
   [`${RAW_TRACES}/codex`]: 'Codex sessions',
   [RAW_SKILLS]: 'Skills and prompts your agents used',
+  [RAW_CODEBASE]: 'Code repositories, kept at one commit',
+  [CODEBASE_CARDS]: 'One card per code repository: its layout, docs and symbols',
   [WIKI_DIR]: 'Curated pages; also an Obsidian vault',
   [`${WIKI_DIR}/entities`]: 'People, organizations, products',
   [`${WIKI_DIR}/concepts`]: 'Methods, theories, conventions',

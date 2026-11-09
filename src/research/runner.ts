@@ -197,7 +197,9 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
     attempts: jobIn.status === 'running' ? jobIn.attempts : jobIn.attempts + 1,
   }))!;
   const template = templateFor(ctx.dataDir, job.kind, job.template);
-  const readDirs = (research?.readDirs ?? ['raw/docs', 'wiki', '.sidecar'])
+  // a repository is source material like a document: wherever raw/docs is readable, so is raw/codebase (docs/design/25)
+  const declaredDirs = research?.readDirs ?? ['raw/docs', 'raw/codebase', 'wiki', '.sidecar'];
+  const readDirs = (declaredDirs.includes('raw/docs') && !declaredDirs.includes('raw/codebase') ? [...declaredDirs, 'raw/codebase'] : declaredDirs)
     .map((d) => safePath(ctx.dataDir, d))
     .filter((d) => fs.existsSync(d));
 

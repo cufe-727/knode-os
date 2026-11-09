@@ -70,7 +70,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: Kno
   const validAtSchema = z.string().optional().describe('World time (ISO 8601): only claims whose validity window contains this instant');
   const validRangeSchema = z.string().optional().describe('World time window instead of an instant: "2026-01-01..2026-06-30", "2026-08" (that month), "2026" (that year), or "2026-03-01.." (open ended). Mutually exclusive with valid_at.');
   const kindsSchema = z.array(z.enum(SOURCE_KINDS)).optional()
-    .describe('Restrict to source kinds: doc = raw/docs, wiki = human-written wiki prose, view = generated wiki page, skill = raw/skills, trace = raw/traces (only present when trace.episodes is on)');
+    .describe('Restrict to source kinds: doc = raw/docs, wiki = human-written wiki prose, view = generated wiki page, skill = raw/skills, trace = raw/traces (only present when trace.episodes is on), code = raw/codebase (code repositories: source files cut along their definitions, each chunk headed by its file)');
   const sourcesSchema = z.array(z.string()).optional()
     .describe('Restrict to path prefixes, e.g. ["raw/docs/reports"]');
   const freshnessSchema = z.string().optional().describe('Max age of live/federated reads: "30s", "15m", "2h", "7d". Cached probe answers older than this are re-run.');
@@ -160,7 +160,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: Kno
     'knode_ls',
     {
       title: 'List knowledge files',
-      description: 'List the data directory tree (raw/docs, raw/traces, raw/skills, wiki, playbooks, ledger).',
+      description: 'List the data directory tree (raw/docs, raw/codebase, raw/traces, raw/skills, wiki, playbooks, ledger).',
       inputSchema: { path: z.string().optional().describe('Subdirectory, e.g. "wiki" (default: root)') },
     },
     async ({ path: p }) => json(listTree(ctx.dataDir, p ?? '.')),
@@ -887,7 +887,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: Kno
     'knode_grep',
     {
       title: 'Grep the knowledge files',
-      description: 'Regex search across wiki, raw/docs (including the Markdown derived from PDFs and images), raw/skills and playbooks/packs (like grep -rn). Complements knode_search for exact strings, symbols and tickers.',
+      description: 'Regex search across wiki, raw/docs (including the Markdown derived from PDFs and images), raw/skills, playbooks/packs and raw/codebase (code repositories; pass path="raw/codebase/<repo>" to search one) (like grep -rn). Complements knode_search for exact strings, symbols and tickers.',
       inputSchema: {
         pattern: z.string().describe('JavaScript regular expression'),
         path: z.string().optional().describe('Restrict to a subtree, e.g. "wiki/datasets"'),

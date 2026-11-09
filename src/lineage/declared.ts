@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import { KnodeConfig } from '../config.js';
 import { MAX_FILE_BYTES } from '../constants.js';
 import { isTextFile, safePath, walkFilesUnder } from '../fs/files.js';
-import { CAPABILITIES_DIR, hasSidecarSegment, RAW_DOCS, RAW_SKILLS, RAW_TRACES, WIKI_DIR } from '../fs/layout.js';
+import { CAPABILITIES_DIR, hasSidecarSegment, RAW_CODEBASE, RAW_DOCS, RAW_SKILLS, RAW_TRACES, WIKI_DIR } from '../fs/layout.js';
+import { DEFAULT_CODE_FILE_BYTES, isCodebaseFile } from '../ingest/codebase/files.js';
 import { DocRoot } from '../types.js';
 import { ScopeKind } from './types.js';
 
@@ -82,10 +83,12 @@ export function fileSha(abs: string): string {
 }
 
 /** Roots enumerated by walking; raw/docs and raw/traces come from the prepare maps instead. */
-const WALKED_ROOTS: { rel: string; root: DocRoot }[] = [
-  { rel: RAW_SKILLS, root: 'skills' },
-  { rel: CAPABILITIES_DIR, root: 'capabilities' },
-  { rel: WIKI_DIR, root: 'wiki' },
+const WALKED_ROOTS: { rel: string; root: DocRoot; accepts: (rel: string) => boolean; maxBytes: number }[] = [
+  { rel: RAW_SKILLS, root: 'skills', accepts: isTextFile, maxBytes: MAX_FILE_BYTES },
+  { rel: CAPABILITIES_DIR, root: 'capabilities', accepts: isTextFile, maxBytes: MAX_FILE_BYTES },
+  { rel: WIKI_DIR, root: 'wiki', accepts: isTextFile, maxBytes: MAX_FILE_BYTES },
+  // repositories: source, configuration and prose by the codebase rules (src/ingest/codebase/files.ts)
+  { rel: RAW_CODEBASE, root: 'codebase', accepts: isCodebaseFile, maxBytes: DEFAULT_CODE_FILE_BYTES },
 ];
 const PREPARED_ROOTS: { rel: string; root: DocRoot; map: 'docs' | 'traces' }[] = [
   { rel: RAW_DOCS, root: 'docs', map: 'docs' },
@@ -105,7 +108,7 @@ export function enumerateDeclared(dataDir: string, config: KnodeConfig, opts: De
     }
   }
 
-  for (const { rel, root } of WALKED_ROOTS) {
+  for (const { rel, root, accepts, maxBytes } of WALKED_ROOTS) {
     // a scoped run walks only what sits under its prefixes: a watcher event
     // on one wiki page must not list every page
     const files = walkFilesUnder(dataDir, rel, prefixes)
@@ -113,7 +116,7 @@ export function enumerateDeclared(dataDir: string, config: KnodeConfig, opts: De
       .concat(root === 'wiki' ? ['purpose.md', 'schema.md'].filter((f) => fs.existsSync(safePath(dataDir, f))) : []);
     for (const file of files) {
       if (!matchesPrefixes(file, prefixes)) continue;
-      if (!isTextFile(file)) continue;
+      if (!accepts(file)) continue;
       const abs = safePath(dataDir, file);
       let stat: fs.Stats;
       try {
@@ -121,7 +124,7 @@ export function enumerateDeclared(dataDir: string, config: KnodeConfig, opts: De
       } catch {
         continue;
       }
-      if (!stat.isFile() || stat.size > MAX_FILE_BYTES) continue;
+      if (!stat.isFile() || stat.size > maxBytes) continue;
       out.set(declaredKey('doc', file), { kind: 'doc', key: file, sha: fileSha(abs), root, bytes: stat.size });
     }
   }

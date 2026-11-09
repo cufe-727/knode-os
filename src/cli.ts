@@ -62,6 +62,7 @@ import { humanBytes, registerFileCommands } from './client/files.js';
 import { queryEntities } from './store/entities.js';
 import { surveyKnowledgeBase } from './research/survey.js';
 import { describeLinkedFolders, importFolder, refreshLinkedFolders, unlinkFolder } from './ingest/folders.js';
+import { addCodebase, CodebaseResult, describeCodebases, editCodebase, removeCodebase, updateCodebases } from './ingest/codebase/codebases.js';
 import { listConversations as listAgentConversations } from './ingest/conversations/catalog.js';
 import { conversationCopies, ConversationImportResult, ConversationRef, ConversationRefreshResult, ConversationStatus, describeConversationLinks, importConversations, previewConversation, refreshConversations, unfollowConversation } from './ingest/conversations/follow.js';
 import { describeFeishuLinks, feishuCheckTime, feishuClient, FeishuPlaced, FeishuSignIn, importFeishuBatch, lastFeishuCheck, refreshFeishuLinks, splitFeishuInputs, unlinkFeishuDocument } from './ingest/feishu/docs.js';
@@ -456,6 +457,126 @@ folders
       const r = await unlinkFolder(ctx, dest, { removeFiles: Boolean(opts.removeFiles), onProgress: (m) => console.log(`  ${m}`) });
       console.log(r.removedFiles ? `unlinked ${r.dest} and removed its files (${r.sync?.disposed ?? 0} disposed)` : `unlinked ${r.dest}; its files stay as ordinary documents`);
       console.log(SERVE_HINT);
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+/* ------------------------------ code repositories ------------------------------ */
+
+const codebase = program
+  .command('codebase')
+  .description('code repositories under raw/codebase: one commit of each, source cut along its definitions and searchable as kind "code", plus a card under raw/docs/codebase that extraction and summaries read (see src/ingest/codebase, docs/design/25)');
+
+const describeCodebase = (r: CodebaseResult) => {
+  const skipped = Object.entries(r.skipped).filter(([, n]) => n > 0).map(([why, n]) => `${n} ${why}`).join(', ');
+  return `${r.dir} at ${r.commit.slice(0, 12)} (${r.committedAt.slice(0, 10)}): ${r.files} files, ${(r.bytes / 1e6).toFixed(1)} MB — ${r.copied.length} copied, ${r.removed.length} removed, ${r.unchanged} unchanged${skipped ? `; left behind: ${skipped}` : ''}`;
+};
+
+const CODEBASE_SERVE_HINT = 'note: a running `knode-os serve` keeps its own copy of the config — restart it for its daily check to follow this repository';
+
+codebase
+  .command('add <repository>')
+  .description('fetch one commit of a repository (owner/repo, a git URL, or a working copy on this machine), keep its source under raw/codebase/<name> and index it')
+  .option('--name <name>', 'folder name under raw/codebase (default: owner-repo)')
+  .option('--ref <ref>', 'branch, tag or commit to track (default: the default branch)')
+  .option('--include <glob...>', 'carry only files matching these globs, e.g. "src/**" (repeat or comma-separate)', collect, [] as string[])
+  .option('--exclude <glob...>', 'leave files matching these globs behind, on top of the built-in rules', collect, [] as string[])
+  .option('--follow', 'have `serve` fetch the ref again once a day and index what changed')
+  .option('--max-files <n>', 'refuse a repository carrying more files than this (default 25000)')
+  .option('--no-docs', 'do not copy its documentation (README, docs/) to raw/docs/codebase/<name>/ for extraction and summaries')
+  .option('--no-llm', 'do not queue the card and documentation for tier-1 LLM extraction')
+  .action(async (repository: string, opts: { name?: string; ref?: string; include: string[]; exclude: string[]; follow?: boolean; maxFiles?: string; docs?: boolean; llm?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const r = await addCodebase(ctx, repository, {
+        name: opts.name, ref: opts.ref, include: opts.include, exclude: opts.exclude, follow: Boolean(opts.follow), docs: opts.docs !== false, allowLocal: true,
+        maxFiles: opts.maxFiles ? Number(opts.maxFiles) : undefined, llmGraph: opts.llm, onProgress: (m) => console.log(`  ${m}`),
+      });
+      console.log(`added ${describeCodebase(r)}`);
+      console.log(`card: ${r.card}${r.docs ? `; ${r.docs} documentation files under raw/docs/codebase/${r.name}/` : ''}`);
+      if (r.sync) console.log(`indexed: ${r.sync.indexed} applied, ${r.sync.unchanged} unchanged, ${r.sync.skipped} skipped, ${r.sync.errors} errors`);
+      if (opts.follow) console.log(CODEBASE_SERVE_HINT);
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+codebase
+  .command('update [name]')
+  .description('fetch the tracked ref of one repository (or all of them) again and index what changed')
+  .option('--followed', 'only the repositories marked --follow')
+  .option('--reindex', 'sync the repository even when the commit did not change')
+  .option('--no-llm', 'do not queue a changed card for tier-1 LLM extraction')
+  .action(async (name: string | undefined, opts: { followed?: boolean; reindex?: boolean; llm?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const results = await updateCodebases(ctx, name, { followedOnly: Boolean(opts.followed), force: Boolean(opts.reindex), llmGraph: opts.llm, onProgress: (m) => console.log(`  ${m}`) });
+      if (results.length === 0) console.log('no repositories — `knode-os codebase add <owner/repo>` keeps one under raw/codebase');
+      for (const r of results) {
+        if ('error' in r) console.log(`${r.name}: ${r.error}`);
+        else console.log(`${r.changed ? 'updated' : 'unchanged'} ${describeCodebase(r)}${r.sync ? `; ${r.sync.indexed} applied, ${r.sync.disposed} disposed` : ''}`);
+      }
+      if (results.some((r) => 'error' in r)) process.exitCode = 1;
+    } finally {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+codebase
+  .command('list')
+  .description('the repositories this workspace keeps, with their commit and size')
+  .option('--json', 'raw JSON output')
+  .action(async (opts: { json?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const rows = describeCodebases(ctx);
+      if (opts.json) console.log(JSON.stringify(rows, null, 2));
+      else if (rows.length === 0) console.log('no repositories — `knode-os codebase add <owner/repo>` keeps one under raw/codebase');
+      else for (const r of rows) console.log(`${r.dir}  ←  ${r.web ?? r.url}${r.ref ? ` @ ${r.ref}` : ''}  ${r.commit?.slice(0, 12) ?? '?'} (${r.committedAt?.slice(0, 10) ?? '?'})  ${r.files} files, ${(r.bytes / 1e6).toFixed(1)} MB${r.follow ? '  followed' : ''}${r.include?.length ? `  include ${r.include.join(',')}` : ''}${r.exclude?.length ? `  exclude ${r.exclude.join(',')}` : ''}`);
+    } finally {
+      await ctx.store.close();
+    }
+  });
+
+codebase
+  .command('edit <name>')
+  .description('change what a repository entry tracks; `codebase update <name>` applies it')
+  .option('--ref <ref>', 'branch, tag or commit ("" for the default branch)')
+  .option('--include <glob...>', 'replace the include globs (repeat or comma-separate; "" for none)', collect)
+  .option('--exclude <glob...>', 'replace the exclude globs (repeat or comma-separate; "" for none)', collect)
+  .option('--follow', 'fetch it again once a day')
+  .option('--no-follow', 'stop fetching it daily')
+  .option('--docs', 'copy its documentation for extraction and summaries')
+  .option('--no-docs', 'stop copying its documentation (the copies are removed at the next update)')
+  .action(async (name: string, opts: { ref?: string; include?: string[]; exclude?: string[]; follow?: boolean; docs?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const next = editCodebase(ctx, name, {
+        ...(opts.ref !== undefined ? { ref: opts.ref } : {}),
+        ...(opts.include !== undefined ? { include: opts.include.filter(Boolean) } : {}),
+        ...(opts.exclude !== undefined ? { exclude: opts.exclude.filter(Boolean) } : {}),
+        ...(opts.follow !== undefined ? { follow: opts.follow } : {}),
+        ...(opts.docs !== undefined ? { docs: opts.docs } : {}),
+      });
+      console.log(`${next.name}: ${next.ref ?? 'default branch'}${next.follow ? ', followed' : ''}${next.include?.length ? `, include ${next.include.join(',')}` : ''}${next.exclude?.length ? `, exclude ${next.exclude.join(',')}` : ''} — \`knode-os codebase update ${next.name}\` applies it`);
+    } finally {
+      await ctx.store.close();
+    }
+  });
+
+codebase
+  .command('remove <name>')
+  .description('forget a repository and remove its files, card and clone (their documents are disposed)')
+  .option('--keep-files', 'keep raw/codebase/<name> and its card as plain workspace content')
+  .action(async (name: string, opts: { keepFiles?: boolean }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const r = await removeCodebase(ctx, name, { keepFiles: Boolean(opts.keepFiles), onProgress: (m) => console.log(`  ${m}`) });
+      console.log(r.removedFiles ? `removed ${name} (${r.sync?.disposed ?? 0} documents disposed)` : `forgot ${name}; its files stay`);
     } finally {
       await ctx.datasources.closeAll();
       await ctx.store.close();

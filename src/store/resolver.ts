@@ -203,7 +203,7 @@ export function overlapsValidWindow(claim: { valid_from: string | null; valid_to
  * is a knowledge source. `trace` only ever matches when `trace.episodes` is on:
  * without it synced transcripts are never prepared into searchable episodes.
  */
-export const SOURCE_KINDS = ['doc', 'wiki', 'view', 'skill', 'trace'] as const;
+export const SOURCE_KINDS = ['doc', 'wiki', 'view', 'skill', 'trace', 'code'] as const;
 export type SourceKind = (typeof SOURCE_KINDS)[number];
 
 export interface ScopeFilterRequest {
@@ -234,7 +234,7 @@ export function resolveScopeFilter(req: ScopeFilterRequest = {}): ResolvedScopeF
     const seen = new Set<SourceKind>();
     for (const raw of req.kinds) {
       const k = String(raw).trim().toLowerCase();
-      const norm = k === 'docs' ? 'doc' : k === 'skills' ? 'skill' : k === 'views' ? 'view' : k;
+      const norm = k === 'docs' ? 'doc' : k === 'skills' ? 'skill' : k === 'views' ? 'view' : k === 'codebase' ? 'code' : k;
       if (!(SOURCE_KINDS as readonly string[]).includes(norm)) {
         throw new TemporalError(`unknown source kind "${raw}" — expected one of ${SOURCE_KINDS.join(', ')}`);
       }
@@ -290,6 +290,7 @@ const KIND_SQL: Record<SourceKind, (a: string) => string> = {
   view: (a) => `${a}.kind = 'view'`,
   skill: (a) => `${a}.root = 'skills'`,
   trace: (a) => `${a}.root = 'traces'`,
+  code: (a) => `${a}.root = 'codebase'`,
 };
 
 /** Path-prefix predicate over any column holding a source path (document path or scope key). */
