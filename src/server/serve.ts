@@ -21,6 +21,7 @@ import { EmbeddingBackfill } from '../ingest/embed-backfill.js';
 import { LinkedFolders, linkOwning, mirrorLinks, syncedByFolders } from '../ingest/folders.js';
 import { AgentConversations } from '../ingest/conversations/follow.js';
 import { FeishuDocs } from '../ingest/feishu/docs.js';
+import { Codebases } from '../ingest/codebase/codebases.js';
 import { isOwnWrite } from '../ingest/own-writes.js';
 import { sync, SyncContext, syncsSettled, SyncStats } from '../ingest/sync.js';
 import { embeddingDeferred, processingSettings } from '../config.js';
@@ -157,7 +158,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
         throw err;
       }
       services.set(workspaceCtx.dataDir, {
-        mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders, feishu: started.feishu, conversations: started.conversations,
+        mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders, feishu: started.feishu, conversations: started.conversations, codebases: started.codebases,
         labeling: started.labeling, work: started.work, localWorkers: started.localWorkers, processing: started.processing, translations: started.translations,
         calls: started.calls, embeddings: started.embeddings, embedWork: started.embedWork, embedSlots: started.embedSlots,
       });
@@ -513,6 +514,7 @@ interface StartedServices {
   folders: LinkedFolders;
   feishu: FeishuDocs;
   conversations: AgentConversations;
+  codebases: Codebases;
   labeling: LabelingScheduler;
   work: WorkBroker;
   localWorkers: LocalLabelingWorkers;
@@ -693,6 +695,10 @@ function startWorkspaceServices(
   const conversations = new AgentConversations(ctx, { log, track });
   conversations.start();
 
+  // followed code repositories: fetched again once a day, what changed indexed (src/ingest/codebase)
+  const codebases = new Codebases(ctx, { log, track });
+  codebases.start();
+
   // nightly dream + the tier-2 pass; a night whose plan is under the quota floor skips them
   const dreamTimer = startDreamScheduler(ctx, log, { hold: () => routesHold(ctx.config, ['judgeLlm'], floor) });
   const nightly = nightlySchedule(ctx.config);
@@ -721,6 +727,7 @@ function startWorkspaceServices(
       await folders.stop();
       await feishu.stop();
       await conversations.stop();
+      await codebases.stop();
       await Promise.allSettled([...activeJobs]);
       await embeddings.stop();
       ctx.embeddings = undefined;
@@ -731,6 +738,7 @@ function startWorkspaceServices(
     folders,
     feishu,
     conversations,
+    codebases,
     labeling,
     work,
     localWorkers,

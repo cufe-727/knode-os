@@ -24,7 +24,7 @@ import { readMatter } from '../markdown.js';
  *     actor — the same line `migrateWikiToOkf` draws.
  */
 
-const MARKDOWN_EXT = new Set(['.md', '.markdown']);
+const MARKDOWN_EXT = new Set(['.md', '.markdown', '.mdx']);
 
 /**
  * Version of the normalization rules, recorded in every sidecar's meta.json.

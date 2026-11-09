@@ -61,7 +61,7 @@ export const PROTOCOL_FILE = 'AGENTS.md';
 
 const PROTOCOL = `# knode-os 研究协议（所有研究任务共用）
 
-你在为一个本地知识库（knode-os）撰写或刷新一页 wiki。知识库通过名为 \`knode-os\` 的 MCP 服务器暴露给你；文件系统里以**只读**方式挂载了 \`raw/docs\`（原始文档）、\`wiki\`（现有页面）和 \`.sidecar\`（PDF / 图片转出的 Markdown，在 \`.sidecar/<原路径>/content.md\`）。
+你在为一个本地知识库（knode-os）撰写或刷新一页 wiki。知识库通过名为 \`knode-os\` 的 MCP 服务器暴露给你；文件系统里以**只读**方式挂载了 \`raw/docs\`（原始文档）、\`raw/codebase\`（代码仓库，每个仓库一个目录，固定在一个 commit；仓库概览卡片在 \`raw/docs/codebase/<仓库>.md\`）、\`wiki\`（现有页面）和 \`.sidecar\`（PDF / 图片转出的 Markdown，在 \`.sidecar/<原路径>/content.md\`）。
 
 ## 工作流程
 
@@ -73,6 +73,7 @@ const PROTOCOL = `# knode-os 研究协议（所有研究任务共用）
    - \`knode_graph_search\` 看实体的关系网（可带 valid_at / valid_range 看某个时点的关系）；
    - \`knode_claims\`（order=timeline 看时间线，include_superseded=true 看被替换的旧事实，subject 传实体名或别名）；
    - \`knode_read\` 读原文（\`raw/docs/...\`；PDF 读 \`.sidecar/<路径>/content.md\`；\`/entities/<id>.md\` 是实体的机器视图）；\`knode_grep\` 查精确字符串、代码、代号；
+   - 代码问题读代码本身：先读仓库卡片 \`raw/docs/codebase/<仓库>.md\`（布局、依赖、代码地图），再 \`knode_grep\`（path="raw/codebase/<仓库>"）查符号、\`knode_search\`（kinds=["code"]）按语义找实现，\`knode_read\` 读文件；默认检索不含代码。
    - \`knode_disputes\` 看已记录的矛盾，\`knode_absences\` 看已知"查过但没有"的空档。
    所有读取都带 brief 给的 \`workset\`，这样整个任务看到的是同一时刻的知识库。
 4. 写页：**只**用 \`knode_write\` 写到 brief 指定的输出路径。不要用文件工具写，不要写到别的路径，不要修改 raw/docs 或其他 wiki 页。
@@ -80,7 +81,7 @@ const PROTOCOL = `# knode-os 研究协议（所有研究任务共用）
 
 ## 写作规范
 
-- 每条事实给出来源：正文里写 \`（来源：raw/docs/…）\`，引用其他 wiki 页用 \`[[实体名]]\`。找不到证据的判断写成"疑似 / 据称"，并在 frontmatter 的 claims 里标 \`status: suspected\`。
+- 每条事实给出来源：正文里写 \`（来源：raw/docs/…）\`；出自代码的写文件路径和行号 \`（来源：raw/codebase/<仓库>/<路径>#L12-L40）\`；引用其他 wiki 页用 \`[[实体名]]\`。找不到证据的判断写成"疑似 / 据称"，并在 frontmatter 的 claims 里标 \`status: suspected\`。
 - frontmatter 必须包含 brief 列出的键。其中：
   - \`aliases\`：别名、简称、英文名、股票代码等；
   - \`relations\`：只写有证据的关系，谓词用 brief 列出的本体 id（如 subsidiary_of / supplies_to / competes_with），方向读作"本页实体 <谓词> 目标"，可带 \`from\` / \`to\`；映射写法：\`supplies_to: ["[[特斯拉]]", { target: 蔚来, from: "2020-01-01" }]\`；
@@ -571,7 +572,7 @@ export const PHASES: Record<PhaseName, string> = {
 
 ## 步骤
 
-1. **先查知识库**：knode_resolve / knode_search（mode=sag）/ knode_claims。已经在库里的资料不必再收集，直接引用它的路径。
+1. **先查知识库**：knode_resolve / knode_search（mode=sag）/ knode_claims。已经在库里的资料不必再收集，直接引用它的路径。库里有代码仓库时（raw/codebase，卡片在 raw/docs/codebase），实现层面的问题直接读代码：knode_grep（path="raw/codebase/<仓库>"）、knode_search（kinds=["code"]）、knode_read，引用 raw/codebase/… 路径与行号。
 2. **再查网络与其他来源**（见 brief 的「资料来源」）：一手资料优先——监管文件（如 SEC EDGAR 的 S-1 / 10-K / 424B）、公司公告与招股书、财报、官方博客与投资者关系页、权威数据库；其次是可靠媒体、研究机构与分析师报告。时间敏感的信息以最新日期为准，并记下日期。
 3. **保存要依赖的资料**：每一份你会引用的网页 / PDF / 数据，用 knode_capture（url、study="{study}"、why 一句话）。它返回的 path（raw/docs/research/…）就是以后引用的来源；返回的 outline 是文档的章节，长文档用 knode_read 的 section 分段读。抓取失败（403、需要登录、只有脚本）时换一个来源（同一文件的 PDF / 其他镜像），实在不行再把你读到的要点作为 content 传给 knode_capture，存成摘录。
 4. **不要保存**搜索结果页、目录页、与问题无关的页面；同一事实已有一手来源就不必再存转载。最多保存 {maxCaptures} 份。

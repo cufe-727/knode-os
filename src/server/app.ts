@@ -76,6 +76,8 @@ import {
   resolveImportSource,
   unlinkFolder,
 } from '../ingest/folders.js';
+import { addCodebase, assertFetchable, checkRef, CodebaseConflict, Codebases, describeCodebases, editCodebase, removeCodebase, updateCodebases } from '../ingest/codebase/codebases.js';
+import { parseRepoSpec } from '../ingest/codebase/git.js';
 import { listConversations as listAgentConversations } from '../ingest/conversations/catalog.js';
 import {
   AgentConversations,
@@ -289,6 +291,8 @@ export interface WorkspaceServices {
   feishu?: FeishuDocs | null;
   /** The checker of this workspace's followed agent conversations; absent outside `serve`, where they are synced on demand only. */
   conversations?: AgentConversations | null;
+  /** This workspace's code repositories: one fetch at a time, followed ones daily; absent outside `serve`. */
+  codebases?: Codebases | null;
   /** Extraction as leased work (src/labeling): local slots and remote workers take segments from it. */
   labeling?: LabelingScheduler | null;
   /** Every kind of leased work — segments and summaries — behind one lease protocol (src/work/broker.ts). */
@@ -1640,6 +1644,84 @@ export function createApp(
       return c.json(err(e), 400);
     } finally {
       ingestRunning.delete(ctx.dataDir);
+    }
+  });
+
+  /* --------------------------- code repositories --------------------------- */
+
+  // Repositories under raw/codebase (src/ingest/codebase, docs/design/25). Adding
+  // one fetches from the network onto the server's disk, so it is an
+  // administrator's call (src/auth/apis.ts) and only remote URLs are taken.
+  app.get('/api/codebases', (c) => {
+    const ctx = requestCtx(c);
+    const running = servicesFor(ctx)?.codebases?.busy ?? false;
+    return c.json({ codebases: describeCodebases(ctx), running });
+  });
+
+  app.post('/api/codebases/add', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { repository?: string; name?: string; ref?: string; include?: string[]; exclude?: string[]; follow?: boolean; docs?: boolean; wait?: boolean };
+      const spec = String(body.repository ?? '').trim();
+      const strings = (v: unknown) => (Array.isArray(v) ? v.map(String).map((x) => x.trim()).filter(Boolean) : []);
+      const opts = { name: body.name, ref: body.ref, include: strings(body.include), exclude: strings(body.exclude), follow: Boolean(body.follow), docs: body.docs !== false, allowLocal: false };
+      // refuse what is wrong before answering, so the person hears it now rather than in the log
+      assertFetchable(parseRepoSpec(spec).url, false);
+      checkRef(opts.ref);
+      const services = servicesFor(ctx);
+      const run = () => activityOf(ctx.dataDir).run('codebase', `Add repository ${spec}`,
+        () => (services?.codebases ? services.codebases.add(spec, opts) : addCodebase(ctx, spec, { ...opts, onProgress: log })),
+        (r) => `${r.dir} at ${r.commit.slice(0, 12)}: ${r.files} files`);
+      if (body.wait === true) return c.json({ ok: true, ...(await run()) });
+      void run().catch((e) => log(`codebase ${spec}: ${e instanceof Error ? e.message : e}`));
+      return c.json({ ok: true, started: true }, 202);
+    } catch (e) {
+      return c.json(err(e), e instanceof CodebaseConflict ? 409 : 400);
+    }
+  });
+
+  app.post('/api/codebases/update', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { name?: string; reindex?: boolean };
+      const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
+      const services = servicesFor(ctx);
+      const results = services?.codebases
+        ? await services.codebases.update(name, { force: Boolean(body.reindex) })
+        : await updateCodebases(ctx, name, { force: Boolean(body.reindex), onProgress: log });
+      return c.json({ ok: true, results: results.map((r) => ('error' in r ? r : { ...r, copied: r.copied.length, removed: r.removed.length })) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.patch('/api/codebases', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { name?: string; ref?: string; include?: string[]; exclude?: string[]; follow?: boolean; docs?: boolean };
+      const patch: Parameters<typeof editCodebase>[2] = {};
+      if (typeof body.ref === 'string') patch.ref = body.ref;
+      if (Array.isArray(body.include)) patch.include = body.include.map(String).filter(Boolean);
+      if (Array.isArray(body.exclude)) patch.exclude = body.exclude.map(String).filter(Boolean);
+      if (typeof body.follow === 'boolean') patch.follow = body.follow;
+      if (typeof body.docs === 'boolean') patch.docs = body.docs;
+      return c.json({ ok: true, codebase: editCodebase(ctx, String(body.name ?? ''), patch) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  app.delete('/api/codebases', async (c) => {
+    const ctx = requestCtx(c);
+    try {
+      const name = String(c.req.query('name') ?? '').trim();
+      if (!name) return c.json({ error: 'name required' }, 400);
+      const keepFiles = c.req.query('keepFiles') === '1' || c.req.query('keepFiles') === 'true';
+      const services = servicesFor(ctx);
+      const result = services?.codebases ? await services.codebases.remove(name, { keepFiles }) : await removeCodebase(ctx, name, { keepFiles, onProgress: log });
+      return c.json({ ok: true, ...result });
+    } catch (e) {
+      return c.json(err(e), 400);
     }
   });
 
