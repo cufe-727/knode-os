@@ -119,13 +119,37 @@ mv "$STAGE/new.app" "$TARGET"
 "$LSREGISTER" -f "$TARGET"
 
 # --- Launch the fixed path and check that it actually came up.
+# An app connected over SSH runs no bundled service: its service answers at the
+# app's own `ssh -L 127.0.0.1:<free port>:…` forward, a port chosen at launch.
+tunnel_health_url() {
+  local pid child port
+  for pid in $(app_pids); do
+    for child in $(pgrep -P "$pid" ssh || true); do
+      port="$(ps -o args= -p "$child" 2>/dev/null | sed -nE 's/.* -L 127\.0\.0\.1:([0-9]+):.*/\1/p' || true)"
+      if [[ -n "$port" ]]; then
+        echo "http://127.0.0.1:$port/api/health"
+        return 0
+      fi
+    done
+  done
+  return 0
+}
+answers() { curl -fsS --noproxy '*' -m 2 "$1" >/dev/null 2>&1; }
 log "launching $TARGET"
 open "$TARGET"
 healthy=0
 for ((i = 0; i < 120; i++)); do
-  if [[ -n "$(app_pids)" ]] && curl -fsS --noproxy '*' -m 2 "$HEALTH_URL" >/dev/null 2>&1; then
-    healthy=1
-    break
+  if [[ -n "$(app_pids)" ]]; then
+    if answers "$HEALTH_URL"; then
+      healthy=1
+      break
+    fi
+    tunnel="$(tunnel_health_url)"
+    if [[ -n "$tunnel" ]] && answers "$tunnel"; then
+      HEALTH_URL="$tunnel"
+      healthy=1
+      break
+    fi
   fi
   sleep 0.5
 done
