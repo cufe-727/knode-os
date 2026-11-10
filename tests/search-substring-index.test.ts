@@ -4,16 +4,16 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { graphSearch } from '../src/graph/query.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { queryTerms, search } from '../src/search/search.js';
+import { keywordTerms, queryTerms, search, termCount } from '../src/search/search.js';
 import { Store } from '../src/store/db.js';
 import { gramQuery, MATCH_INDEXES, termGrams } from '../src/store/grams.js';
 
 /**
- * Substring matching through the gram index (src/store/grams.ts): the keyword
- * fallback CJK queries take, and the entity name / alias matching of the graph
- * signal, SAG and graph search. The index only narrows; strpos on the
- * lowercased text decides. So with the index and without it, the answers are
- * the ones `ILIKE '%term%'` gave: the same chunks, counts and order.
+ * Substring matching through the gram index (src/store/grams.ts): the
+ * candidates of keyword recall, and the entity name / alias matching of the
+ * graph signal, SAG and graph search. The index only narrows; the text
+ * decides. So with the index and without it, keyword recall finds the same
+ * chunks, and entity matching the ones `ILIKE '%term%'` gave.
  */
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-substring-index-'));
@@ -44,19 +44,18 @@ async function addChunk(id: string, content: string, status = 'indexed'): Promis
   if (status === 'indexed') corpus.push({ id, content });
 }
 
-/** What the fallback ranks by: how many of the query's terms a chunk holds, case-insensitively; ties by id. */
-function expectedRanking(query: string): { id: string; n: number }[] {
-  const terms = queryTerms(query).map((t) => t.toLowerCase());
-  return corpus
-    .map((c) => ({ id: c.id, n: terms.filter((t) => c.content.toLowerCase().includes(t)).length }))
-    .filter((r) => r.n > 0)
-    .sort((a, b) => b.n - a.n || (a.id < b.id ? -1 : 1));
+/** The chunks keyword recall can return for a query: the ones holding at least one of its terms. */
+function holders(query: string): string[] {
+  const terms = keywordTerms(query);
+  return corpus.filter((c) => terms.some((t) => termCount(c.content.toLowerCase(), t) > 0)).map((c) => c.id).sort();
 }
 
-async function keywordRanking(query: string, k: number): Promise<{ id: string; n: number }[]> {
+async function keywordRanking(query: string, k: number): Promise<{ id: string; score: number }[]> {
   const results = await search(store, embedder, query, { mode: 'keyword', k, track: false });
-  return results.map((r) => ({ id: r.chunkId, n: r.signals.keyword }));
+  return results.map((r) => ({ id: r.chunkId, score: r.signals.keyword! }));
 }
+
+const idsOf = (ranked: { id: string }[]) => ranked.map((r) => r.id);
 
 /** Run `fn` as if the indexes were still being built. */
 async function withoutIndexes<T>(fn: () => Promise<T>): Promise<T> {
@@ -116,7 +115,10 @@ beforeAll(async () => {
   await addChunk('k10', '天气晴朗，无关的内容。');
   // the same text in a document that is not indexed never answers
   await addChunk('k11', '据报道，宁德时代的储能业务增长很快。', 'pending');
-  // 60 chunks holding one term each, more than the fallback returns
+  // an English question's one rare name, and 40 chunks that repeat the rest of its words
+  await addChunk('n01', 'The Nintendo Entertainment System held each developer to five games a year.');
+  for (let i = 0; i < 40; i++) await addChunk(`n1${String(i).padStart(2, '0')}`, `Report ${i}: what was the limit on items per year for the platform, and who set the limit for the year.`);
+  // 60 chunks holding one common term each
   for (let i = 0; i < 60; i++) await addChunk(`t${String(60 - i).padStart(3, '0')}`, `第${i}条：业务往来记录。`);
 });
 
@@ -172,41 +174,90 @@ describe('the grams a term needs', () => {
   });
 });
 
-describe('the keyword fallback', () => {
+describe('keyword recall', () => {
+  it('looks its terms up in the index in a workspace never analyzed, as PGlite leaves one', async () => {
+    // before any test here runs ANALYZE: without statistics a planner joining documents first read every chunk
+    const sent: { sql: string; params?: unknown[] }[] = [];
+    const query = store.query.bind(store);
+    store.query = (async (sql: string, params?: unknown[]) => {
+      sent.push({ sql, params });
+      return query(sql, params);
+    }) as typeof store.query;
+    try {
+      await keywordRanking('宁德时代的储能业务', 8);
+    } finally {
+      store.query = query;
+    }
+    const lookups = sent.filter((x) => x.sql.includes('match_grams(c.content)'));
+    // one statement counts each term's chunks and lists the rarest terms'
+    expect(lookups).toHaveLength(1);
+    for (const { sql, params } of lookups) {
+      const plan = (await store.query<{ 'QUERY PLAN': string }>(`EXPLAIN ${sql}`, params)).map((r) => r['QUERY PLAN']).join('\n');
+      expect(plan).toContain(MATCH_INDEXES.chunks.name);
+      expect(plan).not.toMatch(/Seq Scan on chunks/);
+      expect(plan).not.toMatch(/Filter: \(match_grams/);
+    }
+  });
+
   it.each([
     ['宁德时代的储能业务'],
     ['海力士 HBM3E 认证'],
     ['hbm4 量产'],
-  ])('ranks chunks by how many terms of %s they hold, through the index and without it', async (query) => {
-    // k = 30 fetches 90 from the channel, more than match: every tie is in, in id order
-    const expected = expectedRanking(query).slice(0, 30);
-    expect(await keywordRanking(query, 30)).toEqual(expected);
-    expect(await withoutIndexes(() => keywordRanking(query, 30))).toEqual(expected);
+  ])('finds every chunk holding a term of %s, through the index and without it', async (query) => {
+    // k = 100 asks the channel for 300, more than hold a term
+    expect(idsOf(await keywordRanking(query, 100)).sort()).toEqual(holders(query));
+    expect(idsOf(await withoutIndexes(() => keywordRanking(query, 100))).sort()).toEqual(holders(query));
   });
 
-  it('fills the last tier with as many of its ties as fit, each holding what it says', async () => {
-    // fetchK is 24 for k = 8: k01..k04 rank above 60 chunks that hold only 业务
-    const query = '宁德时代的储能业务';
-    const truth = new Map(expectedRanking(query).map((r) => [r.id, r.n]));
-    const ranked = await keywordRanking(query, 8);
-    expect(ranked.slice(0, 4).map((r) => r.id)).toEqual(['k01', 'k02', 'k03', 'k04']);
-    expect(ranked.map((r) => r.n)).toEqual(expectedRanking(query).slice(0, 8).map((r) => r.n));
-    for (const r of ranked) expect(truth.get(r.id)).toBe(r.n);
-    // the scan takes the ties in id order
-    expect(await withoutIndexes(() => keywordRanking(query, 8))).toEqual(expectedRanking(query).slice(0, 8));
+  it('puts the chunks holding the rare terms above the ones holding a common one', async () => {
+    // 业务 is in 63 chunks; the company's name and 储能 in two or three
+    for (const ranked of [await keywordRanking('宁德时代的储能业务', 8), await withoutIndexes(() => keywordRanking('宁德时代的储能业务', 8))]) {
+      expect(ranked[0].id).toBe('k01');
+      expect(idsOf(ranked.slice(0, 4)).sort()).toEqual(['k01', 'k02', 'k03', 'k04']);
+      for (const r of ranked.slice(4)) expect(r.id).toMatch(/^t\d+$/);
+    }
+  });
+
+  it('scores best first, and equal scores in id order', async () => {
+    const ranked = await keywordRanking('宁德时代的储能业务', 100);
+    for (let i = 1; i < ranked.length; i++) {
+      expect(ranked[i - 1].score).toBeGreaterThanOrEqual(ranked[i].score);
+      if (ranked[i - 1].score === ranked[i].score) expect(ranked[i - 1].id < ranked[i].id).toBe(true);
+    }
+    // the two-digit rows are one length, so they tie
+    expect(new Set(ranked.filter((r) => /^t0[0-4]\d$/.test(r.id)).map((r) => r.score)).size).toBe(1);
+  });
+
+  it('answers an English question by its rare word, not by the words every chunk has', async () => {
+    const question = "What was Nintendo's limit on games per developer per year for the platform?";
+    expect(keywordTerms(question)).toEqual(['nintendo', 'limit', 'games', 'per', 'developer', 'year', 'platform']);
+    for (const ranked of [await keywordRanking(question, 8), await withoutIndexes(() => keywordRanking(question, 8))]) {
+      expect(ranked[0].id).toBe('n01');
+    }
   });
 
   it('reads a term as literal text, an underscore included', async () => {
     // ILIKE took the underscore for any character and matched k09's x as well
-    expect(await keywordRanking('r_6f406e239a', 8)).toEqual([{ id: 'k08', n: 1 }]);
-    expect(await withoutIndexes(() => keywordRanking('r_6f406e239a', 8))).toEqual([{ id: 'k08', n: 1 }]);
+    expect(idsOf(await keywordRanking('r_6f406e239a', 8))).toEqual(['k08']);
+    expect(idsOf(await withoutIndexes(() => keywordRanking('r_6f406e239a', 8)))).toEqual(['k08']);
   });
 
-  it('answers each tier from the index', async () => {
+  it('keeps what an exclusion or a quoted phrase matched in front', async () => {
+    // the reports say "year" twice and n01 once: scored alone, they come first
+    expect((await keywordRanking('year', 8))[0].id).toMatch(/^n1\d\d$/);
+    expect(keywordTerms('year -report')).toEqual(['year']);
+    expect((await keywordRanking('year -report', 8))[0].id).toBe('n01');
+    // only n01 holds the phrase; "year" alone would again put the reports first
+    expect((await keywordRanking('"games a year" year', 8))[0].id).toBe('n01');
+  });
+
+  it('answers from the index with statistics too', async () => {
     const plans = await plansOf('match_grams(c.content)', () => keywordRanking('宁德时代的储能业务', 8));
     expect(plans).toHaveLength(1);
-    expect(plans[0]).toContain(MATCH_INDEXES.chunks.name);
-    expect(plans[0]).not.toMatch(/Seq Scan on chunks/);
+    for (const plan of plans) {
+      expect(plan).toContain(MATCH_INDEXES.chunks.name);
+      expect(plan).not.toMatch(/Seq Scan on chunks/);
+    }
   });
 });
 

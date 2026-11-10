@@ -2,7 +2,7 @@ import { AppContext } from '../context.js';
 import { auditDuplicateClaims, ClaimDedupeStats } from '../graph/claim-dedupe.js';
 import { auditDuplicateEntities, DedupeStats } from '../graph/dedupe.js';
 import { runTier1Pass, Tier1Stats } from '../graph/tier1.js';
-import { ensureSourceSummaries } from '../wiki/pages.js';
+import { ensureEntityStubs, ensureSourceSummaries } from '../wiki/pages.js';
 
 /** A tier-1 pass's stats, plus what the resolve and summary steps did. */
 export interface DocumentPassStats extends Tier1Stats {
@@ -12,6 +12,8 @@ export interface DocumentPassStats extends Tier1Stats {
   claims: ClaimDedupeStats | null;
   /** Summary pages written. */
   summaries: string[];
+  /** Entity pages created for the entities this pass wrote. */
+  entityPages: string[];
 }
 
 export interface DocumentPassOptions {
@@ -21,6 +23,9 @@ export interface DocumentPassOptions {
   /** Parallel model calls; default `extraction.concurrency`. */
   concurrency?: number;
 }
+
+/** Entity pages one pass creates at most: each is a file the next sync indexes and embeds. */
+const ENTITY_PAGES_PER_PASS = 30;
 
 // One pass at a time per data dir: serve's timer, `knode-os extract` and an
 // initialization must not audit the same entities or summarize the same
@@ -42,6 +47,10 @@ const passChains = new Map<string, Promise<unknown>>();
  *    wrote, in `review.claimMerge`'s mode (docs/design/10).
  * 4. Summarize — a summary page for up to `batchSize` documents, the ones
  *    this pass extracted first, on the Summarize stage's route.
+ * 5. Entity pages — a page for each entity this pass wrote that claims from
+ *    two documents or more now speak of: what no single document holds. No
+ *    model: the page lists the entity's claims with their sources. Existing
+ *    pages are brought up to date by the next sync, as any view is.
  *
  * Serve runs it every `extraction.intervalMinutes`, `knode-os extract` runs it
  * once, and an initialization runs it until the extraction queue is empty.
@@ -96,7 +105,17 @@ async function runDocumentPassUnlocked(ctx: AppContext, opts: DocumentPassOption
     progress(`summaries failed: ${err instanceof Error ? err.message : err}`);
   }
 
-  return { ...extracted, resolve, claims, summaries };
+  let entityPages: string[] = [];
+  if (extracted.touched.length > 0) {
+    try {
+      // only what a second document now speaks of: a page per entity of every new document would grow without end
+      entityPages = await ensureEntityStubs({ ...ctx, config }, { focus: extracted.touched, minClaims: null, minMentions: null, max: ENTITY_PAGES_PER_PASS, actor: 'entities' });
+    } catch (err) {
+      progress(`entity pages failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  return { ...extracted, resolve, claims, summaries, entityPages };
 }
 
 /** One log line for a pass, or null when it did nothing worth a line. */
@@ -112,5 +131,6 @@ export function describeDocumentPass(s: DocumentPassStats): string | null {
     parts.push(`claims: ${s.claims.merged} merged, ${s.claims.suggested} suggestions, ${s.claims.conflicts} contradictions`);
   }
   if (s.summaries.length) parts.push(`${s.summaries.length} summaries`);
+  if (s.entityPages.length) parts.push(`${s.entityPages.length} entity pages`);
   return parts.length ? `document pass: ${parts.join('; ')}` : null;
 }

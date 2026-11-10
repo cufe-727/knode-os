@@ -101,11 +101,13 @@ they feed the dream cycle only.
 1. **vector** — pgvector cosine over configured embeddings (default: offline
    feature-hashing embedder so the system works with zero keys; configure any
    OpenAI-compatible endpoint for real quality).
-2. **keyword** — Postgres `tsvector`('simple'), and where that finds too little
-   (CJK has no word boundaries for it) a substring fallback: chunks ranked by how
-   many query terms they contain, looked up through a GIN index over the n-grams
-   of the text (`match_grams`, `src/store/grams.ts`) that also serves the entity
-   name matching of the graph and SAG routes.
+2. **keyword** — BM25 over the chunks holding the query's terms: its words and
+   CJK bigrams, without stopwords, each weighted by how rare it is in the corpus.
+   Candidates are the chunks Postgres `tsvector`('simple') finds holding every
+   word, and the chunks of the rarest terms, looked up through a GIN index over
+   the n-grams of the text (`match_grams`, `src/store/grams.ts`) that also serves
+   the entity name matching of the graph and SAG routes. A quoted phrase or an
+   excluded word keeps what full-text search matched in front.
 3. **graph** — chunks mentioning entities whose name/alias matches the query (live
    at `as_of` when one is given), one row per chunk, ranked by how many matching
    entities it mentions, then by their mention counts.
@@ -113,13 +115,20 @@ they feed the dream cycle only.
    unit and `entity_mentions` is the event/entity join. Direct hits seed up to
    two `chunk → entity → chunk` rounds; rare/shared entities score the structural
    pool, embeddings coarse-rank it, and RRF merges it with a reserved direct route.
-5. Hybrid signals are fused with reciprocal-rank fusion (RRF, k=60; graph weighted 0.6).
+5. Hybrid signals are fused with reciprocal-rank fusion (RRF, k=60; graph weighted 0.2:
+   it lifts a chunk the other two found and fills in when they found too few).
 6. `graph search` does seeded BFS over persistent `relations` with per-hop decay 0.5;
    `co_occurs` edges are derived from shared chunk mentions at query time (never
    stored, see `src/graph/cooccur.ts`) and discounted ×0.5.
 7. `ask` defaults to hybrid + graph retrieval; `--mode sag` swaps in the SAG
    route without changing existing defaults. SAG results expose hop count,
    seed chunk, bridge entities, and direct/SAG/both provenance.
+8. Beside the chunks, `ask` lists up to 24 known facts (`src/search/facts.ts`):
+   the claims about the entities the question names, as subject or object, and
+   about the entities the retrieved chunks mention — ranked by the question's
+   terms and its embedding, taken a few per source so a list question reaches
+   many documents, each with its date and source and a reference number the
+   answer cites like a chunk's. `knode_resolve` picks its claims the same way.
 
 See [04 — SAG query-time event retrieval](04-sag-query-time-events.md) for the
 mapping, scoring, configuration, and phase-two event model.
@@ -147,8 +156,16 @@ Tiered extraction (details in [01](01-doc-processing-graph-wiki.md)):
   its documents' summary pages ([09](09-ingest-stage-rework.md)).
 
 The background pass writes `wiki/sources/<slug>.md` summaries (LLM; `wiki
-generate` fills gaps by hand) and `wiki generate` writes entity stub pages, as
-materialized views with declared inputs: they regenerate when
+generate` fills gaps by hand) and entity pages (no model), as materialized
+views with declared inputs. An entity page lists everything the knowledge
+base holds about its entity, each line with the document it comes from:
+standing facts, views and forecasts, a dated timeline, disagreements, what
+claims about other entities say of it, and its relations (up to 300 claims;
+past that it says how many there are). The pass writes one for each entity
+it touched that claims from two or more documents now speak of; `wiki
+generate` writes them for the best documented entities first (one page per
+four documents a call, 30 to 300) and keeps `wiki/entities/index.md`, which
+lists every entity page with what it is and how much it holds. Pages regenerate when
 the entities/claims/documents they depend on change, and are archived when a
 required input is disposed. Human prose outside the managed regions survives
 regeneration and is itself a source.

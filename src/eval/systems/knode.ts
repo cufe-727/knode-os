@@ -44,8 +44,15 @@ interface KnodeState {
 
 const states = new Map<string, KnodeState>();
 
-/** Tools an agent may use against the knowledge base — retrieval and reading only, nothing that calls a model or writes. */
-export const KNODE_AGENT_TOOLS = ['knode_search', 'knode_graph_search', 'knode_read', 'knode_ls', 'knode_grep', 'knode_claims'];
+/**
+ * Tools an agent may use against the knowledge base — retrieval and reading
+ * only, nothing that calls a model or writes knowledge. `knode_resolve` is the
+ * call the server's own instructions tell an agent to start with (entities,
+ * ranked claims and passages for a question in one answer) and `knode_survey`
+ * the one they name for orientation: an agent told to start with tools it was
+ * not given searched and grepped instead, 11 calls a question against grep's 5.
+ */
+export const KNODE_AGENT_TOOLS = ['knode_resolve', 'knode_survey', 'knode_search', 'knode_graph_search', 'knode_read', 'knode_ls', 'knode_grep', 'knode_claims'];
 
 const STAGES = ['extract', 'summary', 'kb-judge', 'document', 'translate'] as const;
 
@@ -120,6 +127,20 @@ async function close(s: KnodeState): Promise<void> {
 function toCorpus(s: KnodeState, p: string): string[] {
   if (p.startsWith('raw/docs/')) return [p.slice('raw/docs/'.length)];
   return s.pageSources.get(p) ?? [];
+}
+
+/**
+ * The document a search hit stands for when ranking documents: a source chunk's
+ * own, a summary page's one source, and none for a page made from several (an
+ * entity page cites every document that mentions the entity). Counting such a
+ * page as all of them put a dozen documents the search never ranked ahead of
+ * the ones it did: on the pilot's MuSiQue questions knode's vector channel
+ * scored 0.47 recall@5 that way and 0.60 by its source chunks, against 0.58
+ * for the RAG baseline on the same vectors.
+ */
+function rankedDocument(s: KnodeState, p: string): string[] {
+  const docs = toCorpus(s, p);
+  return p.startsWith('raw/docs/') || docs.length === 1 ? docs : [];
 }
 
 function readPageSources(s: KnodeState): void {
@@ -223,7 +244,7 @@ export function knodeAsk(): SystemUnderTest {
     async retrieve(query, k, env) {
       const ctx = await open(stateFor(env));
       const hits = await search(ctx.store, ctx.embedder, query, { k: k * 3, mode: 'hybrid', track: false, heat: ctx.config.heat });
-      return [...new Set(hits.flatMap((h) => toCorpus(stateFor(env), h.path)))].slice(0, k);
+      return [...new Set(hits.flatMap((h) => rankedDocument(stateFor(env), h.path)))].slice(0, k);
     },
     async exportKnowledge(env) {
       return exportUnits(stateFor(env));
@@ -245,7 +266,7 @@ export function knodeSag(): SystemUnderTest {
       const s = stateFor(env);
       const ctx = await open(s);
       const hits = await search(ctx.store, ctx.embedder, query, { k: k * 3, mode: 'sag', track: false, heat: ctx.config.heat, sag: ctx.config.retrieval.sag });
-      return [...new Set(hits.flatMap((h) => toCorpus(s, h.path)))].slice(0, k);
+      return [...new Set(hits.flatMap((h) => rankedDocument(s, h.path)))].slice(0, k);
     },
   });
 }
@@ -267,7 +288,7 @@ export function agentKnode(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
-          prompt: `${AGENT_BRIEF('The documents are not in the current directory: search them with the knode MCP tools (knode_search, knode_graph_search, knode_claims, knode_read, knode_grep, knode_ls). Source documents live under raw/docs/; generated pages under wiki/.')}\n\n${prompt}`,
+          prompt: `${AGENT_BRIEF('The documents are not in the current directory: use the knode MCP tools. Start with knode_resolve on the question: one call returns the entities it names, the claims extracted about them across all documents (each with its source) and the best passages. Then fill what is missing with knode_claims (every claim about an entity, by date), knode_search, knode_graph_search, knode_read, knode_grep and knode_ls. Source documents live under raw/docs/; generated pages under wiki/.')}\n\n${prompt}`,
           mcp: { name: 'knode', command: process.execPath, args: [CLI_JS, '--data', s.ws, 'mcp'], enabledTools: KNODE_AGENT_TOOLS },
         });
         recordAgent(env.meter, { system: 'agent-knode', stage: 'agent', task: task.id }, env.models.model, r);

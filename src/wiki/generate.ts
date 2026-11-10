@@ -4,7 +4,7 @@ import { appendLog } from '../fs/datadir.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
-import { ensureEntityStubs, ensureSourceSummaries, ensureSourcesIndex, PagesContext, reconcileViews } from './pages.js';
+import { ensureEntitiesIndex, ensureEntityStubs, ensureSourceSummaries, ensureSourcesIndex, PagesContext, reconcileViews } from './pages.js';
 
 /**
  * Wiki generation (llm_wiki's two-step ingest, generation half) on top of
@@ -12,7 +12,8 @@ import { ensureEntityStubs, ensureSourceSummaries, ensureSourcesIndex, PagesCont
  * - summary pages under wiki/sources/ for documents still missing one, up to
  *   `limit` — the background document pass writes them as documents arrive
  *   (docs/design/09); this fills gaps by hand
- * - one stub page per live extracted entity under wiki/entities/
+ * - a page per live entity worth one under wiki/entities/ (several documents
+ *   speak of it, or it holds a few claims), listed in wiki/entities/index.md
  * - a managed "sources" region in wiki/sources/index.md listing every document
  * Every page declares its inputs; later syncs regenerate or archive it as the
  * graph changes. Returns the paths generated in this run.
@@ -44,6 +45,8 @@ export async function generateWiki(
   created.push(...await ensureEntityStubs(ctx, { actor: 'wiki' }));
   await ensureSourcesIndex(ctx, { actor: 'wiki' });
   const rec = await reconcileViews(ctx, { actor: 'wiki', llm: true, onProgress: progress });
+  // after the pages are in their current form: the index lists what each one now holds
+  await ensureEntitiesIndex(ctx, { actor: 'wiki' });
   if (created.length > 0 || rec.regenerated > 0) {
     appendLog(store.dataDir, 'wiki', `${created.length} pages created, ${rec.regenerated} regenerated, ${rec.archived} archived`);
   }

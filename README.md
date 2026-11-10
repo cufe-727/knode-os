@@ -254,7 +254,7 @@ knode-os codebase add <owner/repo|url|path> [--ref r] [--include g] [--exclude g
                               keep one commit of a code repository under raw/codebase/<name> (code searchable as kind
                               "code"), its card and documentation under raw/docs/codebase (also: update [name] | list |
                               edit <name> | remove <name> [--keep-files]; design 25)
-knode-os wiki generate        summary pages still missing + entity stubs
+knode-os wiki generate        summary pages still missing + entity pages (every claim with its source) and their index
 knode-os wiki refine          tier-2: claim audit + full duplicate audit + claim review + hot topics + research recommendations
 knode-os trace sync           pull new Claude Code / Codex traces + skills
 knode-os dream [--lookback d] sync traces, then analyze → skills/memory/knowledge suggestions

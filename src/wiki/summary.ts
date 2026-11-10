@@ -460,6 +460,15 @@ export interface SummaryCall {
 
 const SUMMARIZE = 'You maintain a personal wiki. Summarize the document into a wiki source page.';
 
+/**
+ * What a key point has to keep. A reader of the wiki who has only the page —
+ * an agent that was not given the sources, a person skimming — answered half
+ * as many questions as one with the documents (0.27–0.54 against 0.64–0.91 on
+ * the benchmark's packs), and what the pages lacked was the particular: the
+ * number, the date, the name. Not yet measured with a model.
+ */
+const SPECIFICS = '- Key points carry the document\'s specifics, not a gist of them: each figure with its unit, what it measures and the date it is of; each date; each name as the document writes it. Someone looking for a number the document gives should find it here.';
+
 const describeEntity = (e: SummaryEntity) => (e.aliases.length ? `${e.name} (also ${e.aliases.slice(0, 4).join(', ')})` : e.name);
 
 function linkRule(entities: SummaryEntity[]): string {
@@ -482,6 +491,7 @@ function pageSystem(work: SummaryWork, entities: SummaryEntity[], part: { index:
   const rules = [
     '- Markdown only, no preamble, no title line.',
     `- Start with a one-paragraph abstract, then a "## ${s.keyPoints}" section of ${part ? 'up to 8 bullets' : 'bullets'}, then a "## ${s.entities}" section listing the important entities as [[Entity Name]] wikilinks. Use exactly these two headings.`,
+    SPECIFICS,
     `- Write in ${work.writeIn ?? s.name}.`,
     linkRule(entities),
     channelRule(work),
@@ -496,6 +506,7 @@ function mergeSystem(work: SummaryWork, read: number): string {
   const rules = [
     '- Markdown only, no preamble, no title line.',
     `- Start with a one-paragraph abstract of the whole document, then a "## ${s.keyPoints}" section of up to 12 bullets in the document's order, then a "## ${s.entities}" section listing the important entities as [[Entity Name]] wikilinks. Use exactly these two headings.`,
+    '- Keep the figures, dates and names the parts give: merging drops repetition, not specifics.',
     `- Write in ${work.writeIn ?? s.name}.`,
     '- Keep the [[wikilinks]] exactly as the parts spell them and add no new ones; list each entity once.',
     '- Write about the document, not about the parts or the merging.',

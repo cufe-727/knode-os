@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { search } from '../src/search/search.js';
+import { FUSION_WEIGHTS, search } from '../src/search/search.js';
 import { Store } from '../src/store/db.js';
 
 /**
@@ -13,7 +13,7 @@ import { Store } from '../src/store/db.js';
  * `asOf` — count only entities the knowledge base held at that time.
  *
  * No chunk text contains the query and no chunk has a vector, so the graph
- * signal is the only one that answers: rank r scores exactly 0.6 / (61 + r).
+ * signal is the only one that answers: rank r scores exactly FUSION_WEIGHTS.graph / (61 + r).
  */
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-graph-signal-'));
@@ -105,7 +105,7 @@ describe('the hybrid graph signal', () => {
       ['c3', { graph: 1 }],
       ['c6', { graph: 1 }],
     ]);
-    results.forEach((r, rank) => expect(r.score).toBeCloseTo(0.6 / (61 + rank), 12));
+    results.forEach((r, rank) => expect(r.score).toBeCloseTo(FUSION_WEIGHTS.graph / (61 + rank), 12));
   });
 
   it('answers a query quoting a passage under a rule of hyphens', async () => {
@@ -118,6 +118,6 @@ describe('the hybrid graph signal', () => {
     const results = await search(store, embedder, 'Kestrel', { k: 10, track: false, asOf: AS_OF });
     // Kestrel Nest was not known yet; Old Kestrel still was
     expect(results.map((r) => r.chunkId)).toEqual(['c2', 'c1', 'c5', 'c3', 'c6']);
-    results.forEach((r, rank) => expect(r.score).toBeCloseTo(0.6 / (61 + rank), 12));
+    results.forEach((r, rank) => expect(r.score).toBeCloseTo(FUSION_WEIGHTS.graph / (61 + rank), 12));
   });
 });

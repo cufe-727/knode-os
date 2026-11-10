@@ -22,7 +22,7 @@ import { readMatter, writeMatter } from '../markdown.js';
 import { isGeneratedConcept, okfGenerated } from '../okf/index.js';
 import { getDocHeat } from '../stats/heat.js';
 import { Store } from '../store/db.js';
-import { toDateString, toIso } from '../store/temporal.js';
+import { Params, toDateString, toIso } from '../store/temporal.js';
 import { DocumentRow } from '../types.js';
 import { hasRegions, renderRegion, replaceRegion, splitRegions } from './regions.js';
 import { asSummaryLanguage, detectSummaryLanguage, documentChars, isShortDocument, planSummary, produceSummary, shortByRow, summaryMinChars, summaryScaffold } from './summary.js';
@@ -46,7 +46,7 @@ import { asSummaryLanguage, detectSummaryLanguage, documentChars, isShortDocumen
  * job (docs/design/09) — but rows of that kind may still exist until
  * `retireConceptClusterPages` archives them.
  */
-export type PageKind = 'entity_stub' | 'source_summary' | 'dataset' | 'sources_index' | 'hot_topics' | 'concept_cluster' | 'dream' | 'research_index';
+export type PageKind = 'entity_stub' | 'source_summary' | 'dataset' | 'sources_index' | 'entities_index' | 'hot_topics' | 'concept_cluster' | 'dream' | 'research_index';
 
 export interface PagesContext {
   store: Store;
@@ -105,9 +105,36 @@ function knodeMeta(view: PageKind, inputs: Record<string, string[]>): Record<str
 
 /* ------------------------------ generators ------------------------------ */
 
+/** Claims an entity page lists at most, newest first; past these it says how many there are and where to ask. */
+export const ENTITY_PAGE_CLAIMS = 300;
+/** Claims about other entities that name this one, and relations, listed at most. */
+const ENTITY_PAGE_LINKED = 60;
+
+interface PageClaim {
+  id: string; statement: string; status: string; kind?: string; valid_from: string | null; valid_to: string | null;
+  event_at?: string | null; superseded_by?: string | null; fold_sha?: string; path?: string | null;
+}
+interface PageMention extends PageClaim { subject: string; subject_page: string | null }
+interface PageRelation { id: string; type: string; description: string; out: boolean; other: string; other_page: string | null; path: string | null }
+interface PageConflict { a: string; a_path: string | null; b: string; b_path: string | null; reason: string }
+
+/**
+ * An entity's page: everything the knowledge base holds about it, each line
+ * with the document it comes from.
+ *
+ * It is the one place where what many documents say about one thing stands
+ * together, which no search over the documents assembles: its facts, the
+ * views and forecasts about it, its dated history in order, what sources
+ * disagree on, what claims about other entities say of it, and its
+ * relations. Every line names its source, so a
+ * reader can cite the document and open it. The page used to list the newest
+ * thirty claims without sources: for a person with 119 claims from 53
+ * documents it held a quarter of what was known and could not say where any
+ * of it came from.
+ */
 const entityStub: PageGenerator = {
   kind: 'entity_stub',
-  version: 2,
+  version: 4,
   llm: false,
   mode: 'file',
   async plan(ctx, pagePath) {
@@ -123,33 +150,81 @@ const entityStub: PageGenerator = {
       if (!c) return null;
       return {
         deps: [{ kind: 'entity', id, required: true, sha: e.fold_sha }, { kind: 'entity', id: c.id, sha: c.fold_sha }],
-        inputsSha: sha16(['entity_stub@2', 'redirect', e.fold_sha, c.id]),
+        inputsSha: sha16(['entity_stub@4', 'redirect', e.fold_sha, c.id]),
         data: { entity: e, claims: [], redirect: { id: c.id, name: c.name } },
       };
     }
-    const claims = await ctx.store.query<{ id: string; statement: string; status: string; kind: string; valid_from: string | null; valid_to: string | null; event_at: string | null; superseded_by: string | null; fold_sha: string }>(
-      `SELECT id, statement, status, kind, valid_from, valid_to, event_at, superseded_by, fold_sha FROM claims
-       WHERE subject_id = $1 AND tx_to IS NULL AND canonical_id IS NULL ORDER BY COALESCE(event_at, valid_from) DESC NULLS LAST, tx_from DESC, id LIMIT 30`,
+    const claims = await ctx.store.query<PageClaim>(
+      `SELECT cl.id, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at, cl.superseded_by, cl.fold_sha, s.key AS path
+       FROM claims cl LEFT JOIN scopes s ON s.id = cl.primary_scope_id
+       WHERE cl.subject_id = $1 AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
+       ORDER BY COALESCE(cl.event_at, cl.valid_from) DESC NULLS LAST, cl.tx_from DESC, cl.id LIMIT $2`,
+      [id, ENTITY_PAGE_CLAIMS],
+    );
+    const [{ n: total }] = await ctx.store.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM claims WHERE subject_id = $1 AND tx_to IS NULL AND canonical_id IS NULL`,
       [id],
+    );
+    const mentions = await ctx.store.query<PageMention>(
+      `SELECT cl.id, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at, cl.superseded_by, cl.fold_sha, s.key AS path,
+              se.name AS subject, se.wiki_path AS subject_page
+       FROM claims cl JOIN entities se ON se.id = cl.subject_id LEFT JOIN scopes s ON s.id = cl.primary_scope_id
+       WHERE cl.object_id = $1 AND cl.subject_id <> $1 AND cl.tx_to IS NULL AND cl.canonical_id IS NULL AND cl.superseded_by IS NULL
+       ORDER BY COALESCE(cl.event_at, cl.valid_from) DESC NULLS LAST, cl.tx_from DESC, cl.id LIMIT $2`,
+      [id, ENTITY_PAGE_LINKED],
+    );
+    const relations = await ctx.store.query<PageRelation & { fold_sha: string }>(
+      `SELECT r.id, r.type, r.description, (r.source_id = $1) AS out, o.name AS other, o.wiki_path AS other_page, r.fold_sha,
+              COALESCE(d.path, (
+                SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
+                WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL AND s.kind = 'doc'
+                ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
+       FROM relations r
+       JOIN entities o ON o.id = CASE WHEN r.source_id = $1 THEN r.target_id ELSE r.source_id END
+       LEFT JOIN documents d ON d.id = r.document_id
+       WHERE (r.source_id = $1 OR r.target_id = $1) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
+       ORDER BY r.weight DESC, r.id LIMIT $2`,
+      [id, ENTITY_PAGE_LINKED],
+    );
+    const ids = claims.map((c) => c.id);
+    const conflicts = ids.length === 0 ? [] : await ctx.store.query<PageConflict>(
+      `SELECT a.statement AS a, sa.key AS a_path, b.statement AS b, sb.key AS b_path, v.reason
+       FROM claim_pair_verdicts v
+       JOIN claims a ON a.id = v.a_id AND a.tx_to IS NULL
+       JOIN claims b ON b.id = v.b_id AND b.tx_to IS NULL
+       LEFT JOIN scopes sa ON sa.id = a.primary_scope_id LEFT JOIN scopes sb ON sb.id = b.primary_scope_id
+       WHERE v.relation = 'conflict' AND (v.a_id = ANY($1::text[]) OR v.b_id = ANY($1::text[]))
+       ORDER BY v.judged_at DESC, v.pair_id LIMIT 30`,
+      [ids],
     );
     return {
       deps: [
         { kind: 'entity', id, required: true, sha: e.fold_sha },
-        ...claims.map((c) => ({ kind: 'claim' as const, id: c.id, sha: c.fold_sha })),
+        ...claims.map((c) => ({ kind: 'claim' as const, id: c.id, sha: c.fold_sha! })),
+        ...mentions.map((c) => ({ kind: 'claim' as const, id: c.id, sha: c.fold_sha! })),
+        ...relations.map((r) => ({ kind: 'relation' as const, id: r.id, sha: r.fold_sha })),
       ],
-      inputsSha: sha16(['entity_stub@3', e.fold_sha, claims.map((c) => [c.fold_sha, c.superseded_by])]),
-      data: { entity: e, claims },
+      inputsSha: sha16([
+        'entity_stub@4', e.fold_sha, total,
+        claims.map((c) => [c.fold_sha, c.superseded_by, c.path]),
+        mentions.map((c) => [c.fold_sha, c.path, c.subject, c.subject_page]),
+        relations.map((r) => [r.fold_sha, r.other, r.other_page, r.path]),
+        conflicts.map((c) => [c.a, c.b, c.reason]),
+      ]),
+      data: { entity: e, claims, total, mentions, relations, conflicts },
     };
   },
   async render(_ctx, _pagePath, plan) {
     const e = plan.data.entity as { id: string; name: string; type: string; description: string; aliases: string[] };
-    const claims = plan.data.claims as { id: string; statement: string; status: string; kind?: string; valid_from: string | null; valid_to: string | null; event_at?: string | null; superseded_by?: string | null }[];
+    const claims = plan.data.claims as PageClaim[];
+    const total = (plan.data.total as number | undefined) ?? claims.length;
+    const mentions = (plan.data.mentions as PageMention[] | undefined) ?? [];
+    const relations = (plan.data.relations as PageRelation[] | undefined) ?? [];
+    const conflicts = (plan.data.conflicts as PageConflict[] | undefined) ?? [];
     const redirect = plan.data.redirect as { id: string; name: string } | undefined;
     const lines = redirect
       ? [`# ${e.name}`, '', `→ 已合并到 [[${redirect.name}]]（merged into; \`knode-os entities unmerge ${e.id}\` reverts it）`]
       : [`# ${e.name}`, '', e.description || '_No description yet — fill me in._'];
-    // gbrain's split: the compiled truth (what holds now) above, the dated history below;
-    // views, forecasts and rumours are not facts and get their own list, tagged by kind
     const now = new Date().toISOString();
     const kindOf = (c: { kind?: string }) => c.kind ?? 'fact';
     const periodOf = (c: { valid_from: string | null; valid_to: string | null }) => {
@@ -157,16 +232,30 @@ const entityStub: PageGenerator = {
       const to = toDateString(c.valid_to);
       return from || to ? ` \`${from ?? '?'} ~ ${to ?? ''}\`` : '';
     };
+    const from = (p?: string | null) => (p ? ` — ${p}` : '');
+    const linked = (name: string, page: string | null) => (page ? `[[${name}]]` : name);
+    const sources = new Map<string, number>();
+    for (const c of claims) if (c.path) sources.set(c.path, (sources.get(c.path) ?? 0) + 1);
+    if (!redirect && total > 0) {
+      const docs = sources.size;
+      lines.push('', total > claims.length
+        ? `_${total} claims; the newest ${claims.length} are listed here from ${docs} ${docs === 1 ? 'document' : 'documents'} — \`knode_claims\` with subject "${e.name}" returns the rest._`
+        : `_${total} ${total === 1 ? 'claim' : 'claims'} from ${docs} ${docs === 1 ? 'document' : 'documents'}._`);
+    }
+    // gbrain's split: the compiled truth (what holds now) above, the dated history below;
+    // views, forecasts and rumours are not facts and get their own list, tagged by kind.
+    // Something that happened on a day is history: it stands in the timeline alone.
+    const happened = (c: PageClaim) => Boolean(toIso(c.event_at ?? null));
     const live = claims.filter((c) => !c.superseded_by && !(toIso(c.valid_to) && toIso(c.valid_to)! < now));
-    const current = live.filter((c) => kindOf(c) === 'fact');
+    const current = live.filter((c) => kindOf(c) === 'fact' && !happened(c));
     if (current.length > 0) {
       lines.push('', '## Facts (current)', '');
-      for (const c of current) lines.push(`- ${c.statement} \`${c.status}\`${periodOf(c)}`);
+      for (const c of current) lines.push(`- ${c.statement} \`${c.status}\`${periodOf(c)}${from(c.path)}`);
     }
-    const views = live.filter((c) => kindOf(c) !== 'fact');
+    const views = live.filter((c) => kindOf(c) !== 'fact' && !happened(c));
     if (views.length > 0) {
       lines.push('', '## Views and forecasts', '');
-      for (const c of views) lines.push(`- ${c.statement} \`${kindOf(c)}\`${c.status === 'fact' ? '' : ` \`${c.status}\``}${periodOf(c)}`);
+      for (const c of views) lines.push(`- ${c.statement} \`${kindOf(c)}\`${c.status === 'fact' ? '' : ` \`${c.status}\``}${periodOf(c)}${from(c.path)}`);
     }
     const dated = claims
       .filter((c) => toIso(c.event_at ?? null) || toIso(c.valid_from))
@@ -175,7 +264,28 @@ const entityStub: PageGenerator = {
       lines.push('', '## Timeline', '');
       for (const c of dated) {
         const when = toDateString(c.event_at ?? null) ?? toDateString(c.valid_from);
-        lines.push(`- ${when} · ${c.statement} \`${c.status}\`${kindOf(c) === 'fact' ? '' : ` \`${kindOf(c)}\``}${c.superseded_by ? ' _(superseded)_' : ''}`);
+        lines.push(`- ${when} · ${c.statement} \`${c.status}\`${kindOf(c) === 'fact' ? '' : ` \`${kindOf(c)}\``}${c.superseded_by ? ' _(superseded)_' : ''}${from(c.path)}`);
+      }
+    }
+    const disputed = claims.filter((c) => c.status === 'disputed');
+    if (conflicts.length > 0 || disputed.length > 0) {
+      lines.push('', '## Disagreements', '');
+      for (const c of conflicts) lines.push(`- ${c.a}${from(c.a_path)} ⟷ ${c.b}${from(c.b_path)}${c.reason ? ` (${c.reason})` : ''}`);
+      for (const c of disputed) lines.push(`- ${c.statement} \`disputed\`${from(c.path)}`);
+    }
+    if (mentions.length > 0) {
+      lines.push('', '## In claims about others', '');
+      for (const c of mentions) {
+        const when = toDateString(c.event_at ?? null);
+        lines.push(`- ${when ? `${when} · ` : ''}${linked(c.subject, c.subject_page)}: ${c.statement} \`${kindOf(c) === 'fact' ? c.status : kindOf(c)}\`${from(c.path)}`);
+      }
+    }
+    if (relations.length > 0) {
+      lines.push('', '## Relations', '');
+      for (const r of relations) {
+        const other = linked(r.other, r.other_page);
+        const type = r.type.replace(/_/g, ' ');
+        lines.push(`- ${r.out ? `${type} → ${other}` : `${other} → ${type}`}${r.description ? `: ${r.description}` : ''}${from(r.path)}`);
       }
     }
     return {
@@ -184,7 +294,9 @@ const entityStub: PageGenerator = {
         type: e.type,
         aliases: Array.isArray(e.aliases) ? e.aliases : [],
         generated: okfGenerated('knode-os/entity_stub'),
-        knode: knodeMeta('entity_stub', { entities: [e.id], claims: claims.map((c) => c.id) }),
+        // the claims and documents behind the page are its deps (`knode_lineage` lists them), and every
+        // line names its source: three hundred ids here would be a fifth of the file
+        knode: knodeMeta('entity_stub', { entities: [e.id] }),
       },
       regions: { body: lines.join('\n') },
     };
@@ -448,6 +560,60 @@ export async function hotEntities(store: Store, limit: number): Promise<HotEntit
   );
 }
 
+interface IndexedEntity { id: string; name: string; type: string; description: string; wiki_path: string; fold_sha: string; claims: number; docs: number }
+
+/** Entity pages the index lists at most, the best documented first. */
+const ENTITIES_INDEX_LIMIT = 2000;
+
+/**
+ * The contents of wiki/entities/: every entity page with what it is and how
+ * much stands on it. A directory listing shows slugs; this is what tells a
+ * reader — a person or an agent — which page holds the answer before opening
+ * any.
+ */
+const entitiesIndex: PageGenerator = {
+  kind: 'entities_index',
+  version: 1,
+  llm: false,
+  mode: 'region',
+  async plan(ctx) {
+    const rows = await ctx.store.query<IndexedEntity>(
+      `SELECT e.id, e.name, e.type, e.description, e.wiki_path, e.fold_sha, COALESCE(c.claims, 0)::int AS claims, COALESCE(c.docs, 0)::int AS docs
+       FROM entities e
+       LEFT JOIN LATERAL (
+         SELECT count(*) AS claims, count(DISTINCT cl.primary_scope_id) AS docs
+         FROM claims cl WHERE cl.subject_id = e.id AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
+       ) c ON true
+       WHERE e.wiki_path LIKE 'wiki/entities/%' AND e.tx_to IS NULL AND e.canonical_id IS NULL
+       ORDER BY COALESCE(c.docs, 0) DESC, COALESCE(c.claims, 0) DESC, e.name
+       LIMIT $1`,
+      [ENTITIES_INDEX_LIMIT],
+    );
+    if (rows.length === 0) return null;
+    const setSha = sha16(rows.map((r) => [r.id, r.fold_sha, r.wiki_path, r.claims, r.docs]));
+    return {
+      deps: [{ kind: 'set', id: 'entity-pages', sha: setSha }],
+      inputsSha: sha16(['entities_index@1', setSha]),
+      data: { rows },
+    };
+  },
+  async render(_ctx, _pagePath, plan) {
+    const rows = plan.data.rows as IndexedEntity[];
+    const lines = [
+      '## Entity pages',
+      '',
+      'Every entity with a page, the ones the most documents speak of first. A page lists what the knowledge base holds about its entity — facts, dated history, disagreements, relations — each with the document it comes from.',
+      '',
+      ...rows.map((r) => {
+        const about = r.description ? ` — ${r.description.replace(/\s+/g, ' ').slice(0, 160)}` : '';
+        const held = r.claims > 0 ? ` \`${r.claims} ${r.claims === 1 ? 'claim' : 'claims'}, ${r.docs} ${r.docs === 1 ? 'document' : 'documents'}\`` : '';
+        return `* [${r.name}](${path.posix.basename(r.wiki_path)}) (${r.type})${about}${held}`;
+      }),
+    ];
+    return { frontmatter: {}, regions: { entities: lines.join('\n') } };
+  },
+};
+
 const hotTopics: PageGenerator = {
   kind: 'hot_topics',
   version: 2,
@@ -535,6 +701,7 @@ export const GENERATORS: Partial<Record<PageKind, PageGenerator>> = {
   source_summary: sourceSummary,
   dataset,
   sources_index: sourcesIndex,
+  entities_index: entitiesIndex,
   hot_topics: hotTopics,
 };
 
@@ -591,7 +758,7 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
   if (!gen) return 'deferred';
   const actor = opts.actor ?? 'pages';
   const { store } = ctx;
-  const [row] = await store.query<{ path: string; status: string }>(`SELECT path, status FROM pages WHERE path = $1`, [pagePath]);
+  const [row] = await store.query<{ path: string; status: string; generator: string | null }>(`SELECT path, status, generator FROM pages WHERE path = $1`, [pagePath]);
 
   const plan = await gen.plan(ctx, pagePath, opts.hint);
   if (!plan) {
@@ -600,7 +767,9 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
     return 'archived';
   }
   const live = await findLiveScope(store, 'page', pagePath);
-  if (live && live.sha === plan.inputsSha && !opts.force) {
+  // the same inputs through a newer generator make a different page; one a model writes waits for its inputs to change
+  const outdated = !gen.llm && Boolean(row?.generator) && row!.generator !== `${kind}@${gen.version}`;
+  if (live && live.sha === plan.inputsSha && !opts.force && !outdated) {
     if (row?.status === 'dirty') await store.query(`UPDATE pages SET status = 'active', dirty_reason = NULL WHERE path = $1`, [pagePath]);
     return 'unchanged';
   }
@@ -636,7 +805,8 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
   const fileSha = sha256(text);
   const regions = Object.entries(rendered.regions).map(([id, c]) => ({ id, sha: sha16(c) }));
 
-  await applyScope(store, { kind: 'page', key: pagePath }, plan.inputsSha, { actor, at: opts.at, meta: { kind, file } }, async (w) => {
+  // the same inputs through a newer generator are a new version of the page
+  await applyScope(store, { kind: 'page', key: pagePath }, plan.inputsSha, { actor, at: opts.at, meta: { kind, file }, force: outdated }, async (w) => {
     await w.page({ path: pagePath, kind, generator: `${kind}@${gen.version}`, inputs_sha: plan.inputsSha, file_sha: fileSha, regions });
     await w.deps({ kind: 'page', id: pagePath }, plan.deps);
     if (kind === 'entity_stub') await w.setWikiPath((plan.data.entity as { id: string }).id, pagePath);
@@ -717,12 +887,19 @@ export async function reconcileViews(
   // scoped pass reads only the page files under its prefixes: an edit or a
   // removal anywhere else is reported by the watcher and synced on its own,
   // and a full pass reads them all
-  const live = await store.query<{ path: string; kind: PageKind; status: string; file_sha: string | null; regions: { id: string; sha: string }[] }>(
-    `SELECT path, kind, status, file_sha, regions FROM pages WHERE status IN ('active', 'dirty')`,
+  const live = await store.query<{ path: string; kind: PageKind; status: string; file_sha: string | null; generator: string | null; regions: { id: string; sha: string }[] }>(
+    `SELECT path, kind, status, file_sha, generator, regions FROM pages WHERE status IN ('active', 'dirty')`,
   );
   for (const p of live) {
     const { file } = splitPagePath(p.path);
     if (!matchesPrefixes(file, opts.prefixes)) continue;
+    // a page a model did not write, written by an older version of its generator, is written again:
+    // it costs nothing, and otherwise it keeps the old layout until one of its inputs happens to change
+    const gen = GENERATORS[p.kind];
+    if (gen && !gen.llm && p.status === 'active' && p.generator && p.generator !== `${p.kind}@${gen.version}`) {
+      await store.query(`UPDATE pages SET status = 'dirty', dirty_reason = $2::jsonb WHERE path = $1`, [p.path, JSON.stringify({ generator: `${p.kind}@${gen.version}` })]);
+      p.status = 'dirty';
+    }
     const abs = safePath(ctx.dataDir, file);
     if (!fs.existsSync(abs)) {
       progress(`page file missing, archiving ${p.path}`);
@@ -779,11 +956,53 @@ export async function reconcileViews(
 
 /* ------------------------------ creation rules -------------------------- */
 
-/** Create stub pages for high-mention live entities that don't have a wiki page yet. */
-export async function ensureEntityStubs(ctx: PagesContext, opts: { minMentions?: number; max?: number; actor?: string } = {}): Promise<string[]> {
+/**
+ * Create pages for the live entities worth one that have none yet, the best
+ * documented first: an entity several documents make claims about, one with
+ * at least `minClaims` claims (default 3), or one mentioned at least
+ * `minMentions` times (default 2); null leaves a test out. The ones with the
+ * most documents behind their claims come first, so the pages a call can
+ * write go to what the knowledge base knows most about, not to the words it
+ * met most often.
+ *
+ * Mentions alone used to decide, thirty pages a call, and nothing called it
+ * but `wiki generate` and an initialization: a workspace of 27,000 documents
+ * had eight entity pages. `focus` restricts the pass to those entities — the
+ * ones a document pass has just written — so pages come as documents do.
+ * Without `max`, a call writes up to one page for every four documents, 30
+ * at least and 300 at most: a page is a file the next sync indexes and embeds.
+ */
+export async function ensureEntityStubs(
+  ctx: PagesContext,
+  opts: { minMentions?: number | null; minClaims?: number | null; max?: number; actor?: string; focus?: string[] } = {},
+): Promise<string[]> {
+  if (opts.focus && opts.focus.length === 0) return [];
+  let max = opts.max;
+  if (max === undefined) {
+    const [{ n }] = await ctx.store.query<{ n: number }>(`SELECT count(*)::int AS n FROM documents WHERE root = 'docs' AND status = 'indexed'`);
+    max = Math.min(300, Math.max(30, Math.ceil(n / 4)));
+  }
+  const p = new Params();
+  const tests = ['COALESCE(c.docs, 0) >= 2'];
+  const minClaims = opts.minClaims === undefined ? 3 : opts.minClaims;
+  const minMentions = opts.minMentions === undefined ? 2 : opts.minMentions;
+  if (minClaims !== null) tests.push(`COALESCE(c.claims, 0) >= ${p.add(minClaims)}`);
+  if (minMentions !== null) tests.push(`e.mention_count >= ${p.add(minMentions)}`);
+  const focus = opts.focus ? p.add(opts.focus) : null;
   const entities = await ctx.store.query<{ id: string }>(
-    `SELECT id FROM entities WHERE wiki_path IS NULL AND mention_count >= $1 AND tx_to IS NULL AND canonical_id IS NULL ORDER BY mention_count DESC LIMIT $2`,
-    [opts.minMentions ?? 2, opts.max ?? 30],
+    `SELECT e.id
+     FROM entities e
+     LEFT JOIN (
+       SELECT cl.subject_id, count(*) AS claims, count(DISTINCT cl.primary_scope_id) AS docs
+       FROM claims cl
+       WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL ${focus ? `AND cl.subject_id = ANY(${focus}::text[])` : ''}
+       GROUP BY cl.subject_id
+     ) c ON c.subject_id = e.id
+     WHERE e.wiki_path IS NULL AND e.tx_to IS NULL AND e.canonical_id IS NULL ${focus ? `AND e.id = ANY(${focus}::text[])` : ''}
+       AND (${tests.join(' OR ')})
+     ORDER BY COALESCE(c.docs, 0) DESC, COALESCE(c.claims, 0) DESC, e.mention_count DESC, e.id
+     LIMIT ${p.add(max)}`,
+    p.list,
   );
   const created: string[] = [];
   for (const e of entities) {
@@ -792,6 +1011,7 @@ export async function ensureEntityStubs(ctx: PagesContext, opts: { minMentions?:
     const r = await regeneratePage(ctx, pagePath, 'entity_stub', { actor: opts.actor });
     if (r === 'regenerated') created.push(pagePath);
   }
+  if (created.length > 0) await ensureEntitiesIndex(ctx, { actor: opts.actor });
   return created;
 }
 
@@ -1059,6 +1279,10 @@ export async function pruneShortSummaries(
 
 export async function ensureSourcesIndex(ctx: PagesContext, opts: { actor?: string } = {}): Promise<RegenerateOutcome> {
   return regeneratePage(ctx, 'wiki/sources/index.md#sources', 'sources_index', { actor: opts.actor });
+}
+
+export async function ensureEntitiesIndex(ctx: PagesContext, opts: { actor?: string } = {}): Promise<RegenerateOutcome> {
+  return regeneratePage(ctx, 'wiki/entities/index.md#entities', 'entities_index', { actor: opts.actor });
 }
 
 export async function ensureHotTopics(ctx: PagesContext, opts: { actor?: string; force?: boolean } = {}): Promise<RegenerateOutcome> {
