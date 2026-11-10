@@ -97,13 +97,16 @@ interface ChatOptions {
   lookbackDays: number;
   maxPages: number;
   relayTimestamps: boolean;
+  /** A relay group: who wrote each post and where it came from are in its text (see `relaySignature`). */
+  relay: boolean;
 }
 
 function optionsOf(params: Record<string, unknown>): ChatOptions {
   return {
     lookbackDays: numberParam(params.lookbackDays, 2, 0, 60),
     maxPages: Math.round(numberParam(params.maxPages, 20, 1, 1000)),
-    relayTimestamps: params.relayTimestamps === true || params.relayTimestamps === 'true',
+    relayTimestamps: params.relayTimestamps === true || params.relayTimestamps === 'true' || params.relay === true || params.relay === 'true',
+    relay: params.relay === true || params.relay === 'true',
   };
 }
 
@@ -303,6 +306,47 @@ export function relayOrigin(text: string): { origin: FeedOrigin; visibility?: 'p
     }
   }
   return { origin, ...(m[1] ? { visibility: m[1] === '付费' ? ('paid' as const) : ('free' as const) } : {}) };
+}
+
+const ORIGIN_HOSTS: Array<[RegExp, string]> = [
+  [/(^|\.)weibo\.(com|cn)$/, 'weibo'],
+  [/(^|\.)xueqiu\.com$/, 'xueqiu'],
+  [/(^|\.)zsxq\.com$/, 'zsxq'],
+  [/(^|\.)(x|twitter)\.com$/, 'x'],
+  [/(^|\.)mp\.weixin\.qq\.com$/, 'wechat'],
+  [/(^|\.)taoguba\.com\.cn$/, 'taoguba'],
+];
+
+/**
+ * A relay bot's signature: the post's last line names its author and links the
+ * original — `@ 混沌20000  https://weibo.com/混沌20000/5362582648784375` — and
+ * its text often starts with the same name (`混沌20000：…`). Then the author is
+ * that account, not the bot, the link is the item's origin (its id tells the
+ * same post relayed into two groups apart), and both the signature and the
+ * name prefix leave the text. Null when the last line is not such a signature.
+ */
+export function relaySignature(text: string): { account: string; platform: string; url: string; id?: string; rest: string } | null {
+  const lines = text.replace(/\s+$/, '').split('\n');
+  const last = lines[lines.length - 1] ?? '';
+  const m = /^\s*@\s*(\S{1,40}?)\s+(https?:\/\/\S+)\s*$/.exec(last);
+  if (!m) return null;
+  let host = '';
+  let segments: string[] = [];
+  try {
+    const u = new URL(m[2]);
+    host = u.hostname.toLowerCase();
+    segments = u.pathname.split('/').filter(Boolean);
+  } catch {
+    return null;
+  }
+  const platform = ORIGIN_HOSTS.find(([re]) => re.test(host))?.[1] ?? host.replace(/^www\./, '');
+  const account = m[1];
+  const tail = segments[segments.length - 1] ?? '';
+  const id = /^[A-Za-z0-9]{6,}$/.test(tail) && decodeURIComponent(tail) !== account ? tail : undefined;
+  let rest = lines.slice(0, -1).join('\n').trim();
+  const prefix = new RegExp(`^${account.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*[：:]\\s*`);
+  rest = rest.replace(prefix, '');
+  return { account, platform, url: m[2], ...(id ? { id } : {}), rest };
 }
 
 /* -------------------------------- content -------------------------------- */
@@ -631,7 +675,7 @@ function minuteOrder(): (ms: number) => number {
   };
 }
 
-function itemOf(m: Json, chat: ChatInfo, relay: boolean, order: (ms: number) => number, host?: { id: string; threadId?: string }): FeedItem | null {
+function itemOf(m: Json, chat: ChatInfo, relay: boolean, order: (ms: number) => number, host?: { id: string; threadId?: string }, signatures = false): FeedItem | null {
   const id = str(m.message_id).trim();
   if (!id) return null;
   const msgType = str(m.msg_type) || 'text';
@@ -661,8 +705,19 @@ function itemOf(m: Json, chat: ChatInfo, relay: boolean, order: (ms: number) => 
     }
   }
   const sender = obj(m.sender);
-  const senderId = str(sender.id);
-  const senderName = str(sender.name) || str(sender.sender_name);
+  let senderId = str(sender.id);
+  let senderName = str(sender.name) || str(sender.sender_name);
+  if (signatures && !deleted) {
+    const sig = relaySignature(text);
+    if (sig) {
+      text = sig.rest;
+      if (senderName) meta.relayedBy = senderName;
+      senderName = sig.account;
+      senderId = `${sig.platform}:${sig.account}`;
+      origin = { ...(origin ?? {}), platform: origin?.platform ?? sig.platform, account: sig.account, url: origin?.url ?? sig.url, ...(origin?.id ?? sig.id ? { id: origin?.id ?? sig.id } : {}) };
+      if (!dedupeKey && origin.id) dedupeKey = `${origin.platform}:${origin.id}`;
+    }
+  }
   if (str(sender.sender_type)) meta.senderType = str(sender.sender_type);
   const names = mentions.map((x) => str(x.name)).filter(Boolean);
   if (names.length) meta.mentions = names;
@@ -699,7 +754,7 @@ function itemOf(m: Json, chat: ChatInfo, relay: boolean, order: (ms: number) => 
  * replyTo the thread's first message). `lastMs` is the create_time of the
  * last top-level message, the chat's next cursor.
  */
-export function feishuMessageItems(messages: unknown[], chat: ChatInfo, opts: { relayTimestamps?: boolean } = {}): { items: FeedItem[]; lastMs: number | null; threadsCut: number } {
+export function feishuMessageItems(messages: unknown[], chat: ChatInfo, opts: { relayTimestamps?: boolean; relay?: boolean } = {}): { items: FeedItem[]; lastMs: number | null; threadsCut: number } {
   const items: FeedItem[] = [];
   const seen = new Set<string>();
   const order = minuteOrder();
@@ -707,7 +762,7 @@ export function feishuMessageItems(messages: unknown[], chat: ChatInfo, opts: { 
   let threadsCut = 0;
   for (const raw of messages) {
     const m = obj(raw);
-    const item = itemOf(m, chat, opts.relayTimestamps === true, order);
+    const item = itemOf(m, chat, opts.relayTimestamps === true, order, undefined, opts.relay === true);
     if (!item || seen.has(item.id)) continue;
     seen.add(item.id);
     items.push(item);
@@ -718,14 +773,70 @@ export function feishuMessageItems(messages: unknown[], chat: ChatInfo, opts: { 
     // replies get their own ordering, so a new reply never shifts the top-level messages' times
     const replyOrder = minuteOrder();
     for (const r of replies) {
-      const reply = itemOf(obj(r), chat, opts.relayTimestamps === true, replyOrder, { id: item.id, threadId: item.threadId });
+      const reply = itemOf(obj(r), chat, opts.relayTimestamps === true, replyOrder, { id: item.id, threadId: item.threadId }, opts.relay === true);
       // a thread's listing can start with its own first message
       if (!reply || seen.has(reply.id)) continue;
       seen.add(reply.id);
       items.push(reply);
     }
   }
-  return { items, lastMs, threadsCut };
+  return { items: opts.relay ? foldCardPictures(items) : items, lastMs, threadsCut };
+}
+
+const CARD_GAP_MS = 90_000;
+
+/**
+ * A relay bot sends a card as two messages, a picture and then its text, a
+ * moment apart. In a relay group the picture joins the text it belongs to —
+ * the next message from the same sender within 90 s (or else the one just
+ * before it) — so a post is one item with its picture, not a post and a
+ * bare picture.
+ */
+export function foldCardPictures(items: FeedItem[]): FeedItem[] {
+  const pictureOnly = (i: FeedItem) => !i.deleted && !i.text?.trim() && (i.attachments ?? []).length > 0 && !i.replyTo;
+  // who sent the message in the group: the bot, for a post whose author came from its signature
+  const senderOf = (i: FeedItem) => String(i.meta?.relayedBy ?? i.author?.name ?? '');
+  const sameCard = (a: FeedItem, b: FeedItem | undefined): b is FeedItem =>
+    b !== undefined && !b.deleted && Boolean(b.text?.trim()) && !b.replyTo && senderOf(a) !== '' && senderOf(a) === senderOf(b)
+    && Math.abs(deliveredAt(a) - deliveredAt(b)) <= CARD_GAP_MS;
+  // when they reached the group: a relay header may have moved publishedAt to the original post's time
+  function deliveredAt(i: FeedItem): number {
+    return Date.parse(String(i.meta?.deliveredAt ?? i.publishedAt));
+  }
+  const out: FeedItem[] = [];
+  const folded = new Set<number>();
+  // per text: how many pictures sent before it have been put in front of its own
+  const before = new Map<number, number>();
+  // the text a picture belongs to: past the card's other pictures to its text (a card may carry several), else the post just before
+  const textFor = (i: number): number => {
+    const item = items[i];
+    for (let j = i + 1; j < items.length; j++) {
+      if (sameCard(item, items[j])) return j;
+      if (!(pictureOnly(items[j]) && senderOf(items[j]) === senderOf(item) && Math.abs(deliveredAt(items[j]) - deliveredAt(item)) <= CARD_GAP_MS)) break;
+    }
+    return sameCard(item, items[i - 1]) ? i - 1 : -1;
+  };
+  items.forEach((item, i) => {
+    if (!pictureOnly(item)) return;
+    const target = textFor(i);
+    if (target < 0) return;
+    const host = items[target];
+    const atts = [...(host.attachments ?? [])];
+    if (target > i) {
+      // pictures sent before their text go first, in the order they came
+      const at = before.get(target) ?? 0;
+      atts.splice(at, 0, ...item.attachments!);
+      before.set(target, at + item.attachments!.length);
+    } else {
+      atts.push(...item.attachments!);
+    }
+    items[target] = { ...host, attachments: atts };
+    folded.add(i);
+  });
+  items.forEach((item, i) => {
+    if (!folded.has(i)) out.push(item);
+  });
+  return out;
 }
 
 /* ---------------------------------- pull --------------------------------- */
@@ -759,7 +870,7 @@ async function pullChat(ctx: ConnectorContext, run: LarkRunner, chatId: string, 
   }
 
   const messages = messagesOf(env);
-  const { items, lastMs, threadsCut } = feishuMessageItems(messages, { id: chatId, name, kind }, { relayTimestamps: opts.relayTimestamps });
+  const { items, lastMs, threadsCut } = feishuMessageItems(messages, { id: chatId, name, kind }, { relayTimestamps: opts.relayTimestamps, relay: opts.relay });
   const cursor = lastMs !== null ? new Date(lastMs).toISOString() : prev.cursor;
   const label = name ? `${name} (${chatId})` : chatId;
   notes.push(`${label}: ${messages.length} message(s) since ${new Date(startMs).toISOString()}${more ? `; stopped at ${opts.maxPages} page(s), more to read` : ''}`);
@@ -909,6 +1020,7 @@ export const feishuChatConnector: FeedConnector = {
     { name: 'chatIds', label: 'More chat ids (several chats in one feed)', type: 'string[]' },
     { name: 'lookbackDays', label: 'Days read again before the cursor, for edits, recalls and late replies (default 2)', type: 'number' },
     { name: 'maxPages', label: 'Pages of 50 messages per chat per pull (default 20)', type: 'number' },
+    { name: 'relay', label: 'Relay group: a bot reposts other platforms\' posts — each post\'s author and origin come from its "@ account link" signature, its picture joins its text, and a leading original time is read (default false)', type: 'boolean' },
     { name: 'relayTimestamps', label: "Relay group: a first line like 2026-09-30 10:46:51 is the original post's time (default false)", type: 'boolean' },
     { name: 'cli', label: 'lark-cli path (default ingest.feishu.cli, else the one on PATH)', type: 'string' },
   ],

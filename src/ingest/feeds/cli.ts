@@ -204,14 +204,16 @@ export function registerFeedCommands(program: Command, deps: Deps): void {
   feeds
     .command('run <id>')
     .description('pull now, decide what is new and write it')
-    .action(async (id: string) => {
+    .option('--no-index', 'write the documents and leave indexing them to the `serve` that watches this data directory')
+    .action(async (id: string, opts: { index?: boolean }) => {
       const srv = deps.server();
+      if (srv && opts.index === false) throw new Error('--no-index works on a data directory here, not on a server — add --data <dir>');
       const r = srv
         ? (await srv.post<{ result: FeedRunResult }>(`/api/feeds/${encodeURIComponent(id)}/run`, { wait: true })).result
         : await withContext(deps.dataDir(), async (ctx) => {
           const feed = loadFeed(ctx.dataDir, id);
           if (!feed) throw new Error(`no feed "${id}"`);
-          return runFeed(ctx, feed, { onProgress: (m) => console.error(`  ${m}`) });
+          return runFeed(ctx, feed, { sync: opts.index !== false, onProgress: (m) => console.error(`  ${m}`) });
         });
       printRun(r);
       if (r.error) process.exitCode = 1;

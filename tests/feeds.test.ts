@@ -235,7 +235,7 @@ describe('the pipeline', () => {
     expect(r.documents).toEqual([{ path: doc, written: true, units: 2 }]);
     const text = read(doc);
     expect(text).toMatch(/^---\ntype: FeedDigest\ntitle: 混沌 · 2026-11-09\ndate: '2026-11-09'\nplatform: feishu\nfeed: hundun/);
-    expect(text).toContain('## 10:30–10:31 · V+ · 2 messages');
+    expect(text).toContain('## 10:30–10:31 · V+ · trs主要是海外的杠杆 (2 messages)');
     expect(text).toContain('- 10:30:00 V+：trs主要是海外的杠杆');
     expect(text).toContain('## 16:00 · 张三 · 地产政策是重大利好');
     expect(text).not.toContain('嗯');

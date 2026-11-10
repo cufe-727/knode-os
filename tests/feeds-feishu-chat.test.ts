@@ -15,6 +15,8 @@ import {
   pullStart,
   renderFeishuContent,
   setFeishuChatRunner,
+  foldCardPictures,
+  relaySignature,
 } from '../src/ingest/feeds/connectors/feishu-chat.js';
 import { FeedLedger } from '../src/ingest/feeds/ledger.js';
 import type { ConnectorContext, FeedDefinition, FeedItem } from '../src/ingest/feeds/types.js';
@@ -422,5 +424,45 @@ describe('download', () => {
     // voice and video are left alone, as is anything that is not a Feishu reference
     expect(await feishuChatConnector.download!(ctxFor({ chatId: CHAT }), item, { kind: 'audio', url: 'feishu:file:om_4:file_v3_voice' }, dest)).toBeNull();
     expect(await feishuChatConnector.download!(ctxFor({ chatId: CHAT }), item, { kind: 'image', url: 'https://example.com/a.png' }, dest)).toBeNull();
+  });
+});
+
+
+describe('relay groups', () => {
+  it('reads the author and origin from a relay bot\'s signature line', () => {
+    const sig = relaySignature('混沌20000：红果看多了 ?\n@ 混沌20000  https://weibo.com/混沌20000/5362615943430722');
+    expect(sig).toEqual({ account: '混沌20000', platform: 'weibo', url: 'https://weibo.com/混沌20000/5362615943430722', id: '5362615943430722', rest: '红果看多了 ?' });
+    expect(relaySignature('注意：明天开会\n@ 张三 一起')).toBeNull();
+    expect(relaySignature('plain text')).toBeNull();
+  });
+
+  it('turns a bot\'s picture-then-text card into one post by its author', () => {
+    const chat = { id: 'oc_1', name: '混沌', kind: 'group' };
+    const bot = { id: 'cli_bot', name: '自定义机器人', sender_type: 'app' };
+    const { items } = feishuMessageItems([
+      { message_id: 'om_1', msg_type: 'image', create_time: '2026-11-07 11:40', sender: bot, content: '[Image: img_v3_abc]' },
+      { message_id: 'om_2', msg_type: 'text', create_time: '2026-11-07 11:40', sender: bot, content: '混沌20000：大家说这个项链好看吗 ?\n@ 混沌20000  https://weibo.com/混沌20000/5362582648784375' },
+      { message_id: 'om_3', msg_type: 'text', create_time: '2026-11-07 13:52', sender: bot, content: '混沌20000：红果看多了 ?\n@ 混沌20000  https://weibo.com/混沌20000/5362615943430722' },
+    ], chat, { relay: true });
+    expect(items.map((i) => i.id)).toEqual(['om_2', 'om_3']);
+    expect(items[0]).toMatchObject({
+      text: '大家说这个项链好看吗 ?',
+      author: { name: '混沌20000', id: 'weibo:混沌20000' },
+      origin: { platform: 'weibo', account: '混沌20000', id: '5362582648784375' },
+      dedupeKey: 'weibo:5362582648784375',
+      meta: { relayedBy: '自定义机器人' },
+    });
+    expect(items[0].attachments?.[0]).toMatchObject({ kind: 'image' });
+    // without relay, the same messages stay as they were sent
+    expect(feishuMessageItems([{ message_id: 'om_3', msg_type: 'text', create_time: '2026-11-07 13:52', sender: bot, content: '混沌20000：x\n@ 混沌20000  https://weibo.com/混沌20000/5362615943430722' }], chat).items[0].author?.name).toBe('自定义机器人');
+    expect(foldCardPictures([])).toEqual([]);
+    // a card of two pictures and its text is one post, its pictures in order
+    const two = feishuMessageItems([
+      { message_id: 'om_a', msg_type: 'image', create_time: '2026-11-07 17:01', sender: bot, content: '[Image: img_v3_first]' },
+      { message_id: 'om_b', msg_type: 'image', create_time: '2026-11-07 17:01', sender: bot, content: '[Image: img_v3_second]' },
+      { message_id: 'om_c', msg_type: 'text', create_time: '2026-11-07 17:01', sender: bot, content: '混沌20000：两张图\n@ 混沌20000  https://weibo.com/混沌20000/5362663370785277' },
+    ], chat, { relay: true }).items;
+    expect(two.map((i) => i.id)).toEqual(['om_c']);
+    expect(two[0].attachments?.map((a) => a.url)).toEqual([expect.stringContaining('img_v3_first'), expect.stringContaining('img_v3_second')]);
   });
 });
