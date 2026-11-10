@@ -486,6 +486,8 @@ export class LocalLabelingWorkers {
   private async run(backend: Backend, task: WorkTask, who: WorkerIdentity): Promise<TaskOutcome> {
     // embed batches go to the embed slots (src/work/embed.ts), which these never ask for
     if (task.kind === 'embed') return { ok: false, error: 'an LLM slot cannot embed', kind: 'fatal', model: backend.client.label };
+    // research sessions go to remote session slots (src/work/session.ts), which these never ask for either
+    if (task.kind === 'session') return { ok: false, error: 'an LLM slot cannot run a research session', kind: 'fatal', model: backend.client.label };
     backend.busy++;
     // keep the lease while the call runs; a CLI call may take minutes
     const leaseMs = Date.parse(task.leaseExpiresAt) - Date.now();

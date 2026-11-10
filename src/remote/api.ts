@@ -23,7 +23,9 @@ import { clientInfo } from '../server/public-guard.js';
 import { LeaseRequest, WorkBroker } from '../work/broker.js';
 import { offeredRemotely, workerConfig } from '../work/config.js';
 import { decodeVectors, EmbedSource } from '../work/embed.js';
-import { isWorkKind, WORK_KINDS, WorkKind } from '../work/kinds.js';
+import { ASKED_ONLY_KINDS, isWorkKind, WORK_KINDS, WorkKind } from '../work/kinds.js';
+import { SessionSource } from '../work/session.js';
+import { answerSessionMcp, describeMcpRequest } from './session-mcp.js';
 import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows, tokenAllowsKind } from './tokens.js';
 
 /**
@@ -35,7 +37,9 @@ import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows, tokenAll
  *   GET  /worker.mjs                               the remote worker script (worker/knode-worker.mjs)
  *   /w/<owner>/<workspace>/…                       <owner> = a username, or "team" for a team workspace
  *     work       GET work/config, POST work/lease | complete | renew | release,
- *                GET work/status — every kind of leased work (docs/design/12)       (scope label or embed)
+ *                GET work/status — every kind of leased work (docs/design/12)       (scope label, embed or research)
+ *     sessions   POST sessions/<id>/mcp — knode's tools for one research session
+ *                a worker holds (docs/design/27): the session's own token, not a knr_ one
  *                POST work/calibrate — an own embedding endpoint's probe vectors    (scope embed)
  *     labeling   POST labeling/lease | complete | renew | release, GET labeling/status:
  *                the same for extraction only, as workers before work/* speak it    (scope label)
@@ -152,15 +156,63 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
 
   api.get('/health', (c) => c.json({ ok: true, service: 'knode-os remote', version: 1 }));
 
+  const blocked = (client: string) => (failures.get(client)?.blockedUntil ?? 0) > Date.now();
+  /** One failed authentication: ten in ten minutes turn the client away for a while. */
+  const refused = (client: string) => {
+    const now = Date.now();
+    const f = failures.get(client);
+    const entry = f && now - f.since < AUTH_WINDOW_MS ? f : { count: 0, since: now, blockedUntil: 0 };
+    entry.count++;
+    if (entry.count >= AUTH_FAILURE_LIMIT) {
+      entry.blockedUntil = now + AUTH_BLOCK_MS;
+      log(`remote: ${client} blocked for ${AUTH_BLOCK_MS / 60_000} min after ${entry.count} failed authentications`);
+    }
+    failures.set(client, entry);
+  };
+  const presentedToken = (c: Context) => /^bearer\s+(.+)$/i.exec(c.req.header('authorization') ?? '')?.[1] ?? c.req.header('x-knode-token') ?? null;
+  /** A workspace by its route segments, opened through the same registry as the UI's. */
+  const openWorkspace = async (owner: string, workspace: string): Promise<{ spec: string; ctx: AppContext }> => {
+    const spec = `${owner}/${workspace}`.toLowerCase();
+    let scope: WorkspaceScope;
+    try {
+      scope = owner.toLowerCase() === 'team'
+        ? resolveWorkspaceScope({ user: 'remote', kind: 'team', name: workspace })
+        : resolveWorkspaceScope({ user: owner, kind: 'personal', id: workspace, name: workspace });
+    } catch (err) {
+      throw new HttpError(400, err instanceof Error ? err.message : String(err));
+    }
+    if (!deps.registry.exists(scope)) throw new HttpError(404, `no workspace ${spec}`);
+    return { spec, ctx: await deps.registry.get(scope) };
+  };
+
+  // knode's tools for one research session a worker holds (docs/design/27 §4): the agent on the worker
+  // presents the session's own token, minted with its lease and dropped when the lease ends — never a knr_ one
+  api.all('/w/:owner/:workspace/sessions/:id/mcp', async (c) => {
+    const client = clientOf(c);
+    if (blocked(client)) return c.json({ error: 'too many failed authentications — try again later' }, 429);
+    const { spec, ctx } = await openWorkspace(c.req.param('owner'), c.req.param('workspace'));
+    const source = deps.work(ctx)?.source('session');
+    const id = text(c.req.param('id'), 64);
+    const binding = source instanceof SessionSource ? source.authorize(id, presentedToken(c)) : null;
+    const asked = await describeMcpRequest(c.req.raw);
+    if (!binding) {
+      refused(client);
+      audit({ client, workspace: spec, session: id, method: c.req.method, ...asked, status: 401 });
+      return c.json({ error: 'no live research session with this token' }, 401);
+    }
+    failures.delete(client);
+    const started = Date.now();
+    const res = await answerSessionMcp(c.req.raw, ctx, binding);
+    audit({ client, workspace: spec, session: id, job: binding.job, worker: binding.worker, method: c.req.method, ...asked, status: res.status, ms: Date.now() - started });
+    return res;
+  });
+
   // authentication, rate-limited per client, and an audit line for every answer
   api.use('*', async (c, next) => {
     if (c.req.path.endsWith('/remote/v1/health')) return next();
     const client = clientOf(c);
-    const now = Date.now();
-    const f = failures.get(client);
-    if (f && f.blockedUntil > now) return c.json({ error: 'too many failed authentications — try again later' }, 429);
-    const header = c.req.header('authorization') ?? '';
-    const presented = /^bearer\s+(.+)$/i.exec(header)?.[1] ?? c.req.header('x-knode-token') ?? null;
+    if (blocked(client)) return c.json({ error: 'too many failed authentications — try again later' }, 429);
+    const presented = presentedToken(c);
     let record: RemoteTokenRecord | null = null;
     try {
       record = tokens.verify(presented);
@@ -169,13 +221,7 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
       return c.json({ error: 'authentication unavailable' }, 503);
     }
     if (!record) {
-      const entry = f && now - f.since < AUTH_WINDOW_MS ? f : { count: 0, since: now, blockedUntil: 0 };
-      entry.count++;
-      if (entry.count >= AUTH_FAILURE_LIMIT) {
-        entry.blockedUntil = now + AUTH_BLOCK_MS;
-        log(`remote: ${client} blocked for ${AUTH_BLOCK_MS / 60_000} min after ${entry.count} failed authentications`);
-      }
-      failures.set(client, entry);
+      refused(client);
       audit({ client, method: c.req.method, path: c.req.path, status: 401 });
       return c.json({ error: 'missing or invalid token' }, 401);
     }
@@ -201,22 +247,12 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
 
   // a workspace the token may use, opened through the same registry as the UI's
   api.use('/w/:owner/:workspace/*', async (c, next) => {
-    const owner = c.req.param('owner');
-    const workspace = c.req.param('workspace');
-    const spec = `${owner}/${workspace}`.toLowerCase();
+    const spec = `${c.req.param('owner')}/${c.req.param('workspace')}`.toLowerCase();
     const token = c.get('token');
     if (!token.workspaces.some((w) => w === '*' || w === spec)) throw new HttpError(403, `this token may not use ${spec}`);
-    let scope: WorkspaceScope;
-    try {
-      scope = owner.toLowerCase() === 'team'
-        ? resolveWorkspaceScope({ user: 'remote', kind: 'team', name: workspace })
-        : resolveWorkspaceScope({ user: owner, kind: 'personal', id: workspace, name: workspace });
-    } catch (err) {
-      throw new HttpError(400, err instanceof Error ? err.message : String(err));
-    }
-    if (!deps.registry.exists(scope)) throw new HttpError(404, `no workspace ${spec}`);
-    c.set('workspace', spec);
-    c.set('ctx', await deps.registry.get(scope));
+    const opened = await openWorkspace(c.req.param('owner'), c.req.param('workspace'));
+    c.set('workspace', opened.spec);
+    c.set('ctx', opened.ctx);
     await next();
   });
 
@@ -224,11 +260,11 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     if (!tokenAllows(c.get('token'), scope, c.get('workspace'))) throw new HttpError(403, `this token lacks the "${scope}" scope here`);
     return c.get('ctx');
   };
-  /** Leased work: model calls under `label`, embed batches under `embed`. */
+  /** Leased work: model calls under `label`, embed batches under `embed`, research sessions under `research`. */
   const needWork = (c: Context<RemoteEnv>) => {
     const token = c.get('token');
-    if (!tokenAllows(token, 'label', c.get('workspace')) && !tokenAllows(token, 'embed', c.get('workspace'))) {
-      throw new HttpError(403, 'this token lacks the "label" or "embed" scope here');
+    if (!(['label', 'embed', 'research'] as const).some((scope) => tokenAllows(token, scope, c.get('workspace')))) {
+      throw new HttpError(403, 'this token lacks the "label", "embed" or "research" scope here');
     }
     return c.get('ctx');
   };
@@ -244,7 +280,12 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     const ctx = c.get('ctx');
     const allowed = allowedKinds(c);
     const embed = allowed.includes('embed') && b.source('embed') ? { embedder: ctx.embedder, leaseMs: b.leaseDurationMs('embed') } : null;
-    return workerConfig(ctx.config, { allowed, leaseMs: b.leaseDurationMs(), shares: b.shares(), embed });
+    const sessionLeaseMs = b.source('session') ? b.leaseDurationMs('session') : null;
+    return workerConfig(ctx.config, { allowed, leaseMs: b.leaseDurationMs(), shares: b.shares(), embed, sessionLeaseMs });
+  };
+  const sessionSource = (b: WorkBroker): SessionSource | null => {
+    const source = b.source('session');
+    return source instanceof SessionSource ? source : null;
   };
   const embedSource = (b: WorkBroker): EmbedSource | null => {
     const source = b.source('embed');
@@ -276,8 +317,20 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     // an embed batch's vectors: base64 float32 (n × dimensions), or plain arrays
     let vectors: number[][] | undefined;
     if (b.ok === true && b.vectors !== undefined) vectors = vectorsOf(b.vectors, b.dimensions);
+    // a research session's answer: the CLI's raw output since the last renewal, its exit code and stderr's end
+    const session = b.ok === true && b.session && typeof b.session === 'object' && !Array.isArray(b.session)
+      ? (() => {
+        const v = b.session as Record<string, unknown>;
+        return {
+          exitCode: Number.isFinite(Number(v.exitCode)) ? Math.trunc(Number(v.exitCode)) : -1,
+          output: text(v.output, 4 * 1024 * 1024),
+          stderr: text(v.stderr, 64 * 1024),
+          lastMessage: typeof v.lastMessage === 'string' ? text(v.lastMessage, 2 * 1024 * 1024) : null,
+        };
+      })()
+      : undefined;
     const outcome: TaskOutcome = b.ok === true
-      ? { ok: true, text: text(b.text, 2 * 1024 * 1024), model, usage, ...(vectors ? { vectors } : {}), ...(b.endpointModel ? { endpointModel: text(b.endpointModel, 120) } : {}) }
+      ? { ok: true, text: text(b.text, 2 * 1024 * 1024), model, usage, ...(vectors ? { vectors } : {}), ...(b.endpointModel ? { endpointModel: text(b.endpointModel, 120) } : {}), ...(session ? { session } : {}) }
       : { ok: false, error: text(b.error || 'failed without a message', 2000), kind, model, usage };
     const result = await broker(ctx).complete(id, whoOf(c, b), outcome);
     return c.json(result, result.accepted ? 200 : 409);
@@ -285,7 +338,16 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
   const renew = (scope: 'label' | 'work') => async (c: Context<RemoteEnv>) => {
     const ctx = scope === 'label' ? need(c, 'label') : needWork(c);
     const b = await body(c);
-    return c.json(broker(ctx).renew(ids(b.ids), whoOf(c, b)));
+    const s = broker(ctx);
+    const who = whoOf(c, b);
+    // a research session's stdout since the last renewal, for its transcript (docs/design/27 D10)
+    const sessions = sessionSource(s);
+    if (sessions && b.output && typeof b.output === 'object' && !Array.isArray(b.output)) {
+      for (const [id, chunk] of Object.entries(b.output as Record<string, unknown>).slice(0, 64)) {
+        if (typeof chunk === 'string' && chunk) sessions.output(text(id, 64), who, chunk);
+      }
+    }
+    return c.json(s.renew(ids(b.ids), who));
   };
   const release = (scope: 'label' | 'work') => async (c: Context<RemoteEnv>) => {
     const ctx = scope === 'label' ? need(c, 'label') : needWork(c);
@@ -294,8 +356,8 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
   };
   const watching = (c: Context<RemoteEnv>) => {
     const token = c.get('token');
-    if (!(['label', 'embed', 'read'] as const).some((scope) => tokenAllows(token, scope, c.get('workspace')))) {
-      throw new HttpError(403, 'this token lacks the "label", "embed" or "read" scope here');
+    if (!(['label', 'embed', 'research', 'read'] as const).some((scope) => tokenAllows(token, scope, c.get('workspace')))) {
+      throw new HttpError(403, 'this token lacks the "label", "embed", "research" or "read" scope here');
     }
     return broker(c.get('ctx'));
   };
@@ -308,8 +370,8 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     const b = await body(c);
     const s = broker(ctx);
     const allowed = allowedKinds(c);
-    // embed batches go only to a slot that asks for them: an LLM slot from before them asks for nothing in particular
-    const asked = Array.isArray(b.kinds) ? b.kinds.filter(isWorkKind) : allowed.filter((k) => k !== 'embed');
+    // embed batches and research sessions go only to a slot that asks for them: an LLM slot from before them asks for nothing in particular
+    const asked = Array.isArray(b.kinds) ? b.kinds.filter(isWorkKind) : allowed.filter((k) => !ASKED_ONLY_KINDS.includes(k));
     const kinds = asked.filter((k) => allowed.includes(k));
     const who = whoOf(c, b);
     const request: LeaseRequest = { calibration: b.calibration ? text(b.calibration, 64) : undefined };

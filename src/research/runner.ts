@@ -10,7 +10,7 @@ import { agentForSpec, agentWebCapable, ResearchAgent, resolveResearchAgent } fr
 import { finalizeInit, prepareInit, topicsFrom } from './init.js';
 import { activePause, AgentUnavailableError, agentKey, PAUSE, pauseFor, pausingFailure, RunPause } from './failure.js';
 import type { QuotaHold } from '../labeling/plan-quota.js';
-import { clearCancelled, isCancelled, JobCancelledError, JobInterruptedError, launchAgent, LaunchResult } from './launch.js';
+import { clearCancelled, isCancelled, JobCancelledError, JobInterruptedError, launchAgent, LaunchResult, SessionDispatch } from './launch.js';
 import { PhaseRecord, runNativePipeline, runTeamPipeline } from './pipeline.js';
 import { getJob, listJobs, ResearchJob, setJobPause, updateJob } from './jobs.js';
 import { activeProfile, effectivePipeline, ResearchProfile, webAllowed } from './profile.js';
@@ -42,6 +42,8 @@ export { resolveResearchAgent } from './agent.js';
 
 export interface RunOptions {
   mcp: McpEndpoint;
+  /** Remote workers that may run the job's sessions (src/research/remote.ts, docs/design/27). */
+  sessions?: SessionDispatch;
   log?: (msg: string) => void;
   /** Override the agent (tests point it at a fake CLI). */
   agent?: ResearchAgent;
@@ -217,7 +219,7 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
   // a study's first stage gathers material and queues its pages; only its report is a page of its own
   if (job.kind === 'study' && studyPayload(job).stage !== 'report') {
     try {
-      return await runStudyCollect(ctx, job, { mcp: opts.mcp, agent, profile, readDirs, log });
+      return await runStudyCollect(ctx, job, { mcp: opts.mcp, agent, profile, readDirs, log, sessions: opts.sessions });
     } catch (err) {
       if (err instanceof JobCancelledError) return markCancelled(ctx, job.id, log);
       if (err instanceof JobInterruptedError) return markInterrupted(ctx, job.id, log);
@@ -260,7 +262,7 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
   let launched: LaunchResult;
   try {
     if (pipeline === 'team' || pipeline === 'native') {
-      const pipelineInput = { job, template, ws, agent, mcp: opts.mcp, readDirs, profile, webGate, webSearch, extraMcp, log, agentFor: (spec: string, model: string) => agentForSpec(ctx.config, spec, model, ctx.dataDir) };
+      const pipelineInput = { job, template, ws, agent, mcp: opts.mcp, readDirs, profile, webGate, webSearch, extraMcp, log, sessions: opts.sessions, agentFor: (spec: string, model: string) => agentForSpec(ctx.config, spec, model, ctx.dataDir) };
       const team = pipeline === 'team' ? await runTeamPipeline(ctx, pipelineInput) : await runNativePipeline(ctx, pipelineInput);
       launched = team;
       const topics = job.kind === 'init' ? topicsFrom(team.planText || team.resultText) : undefined;
@@ -279,7 +281,10 @@ export async function runResearchJob(ctx: AppContext, jobIn: ResearchJob, opts: 
         speed: profile.reasoning.speed,
         webFreshness: profile.search.freshness,
         extraMcp,
+        sessions: opts.sessions,
       });
+      // where the single session ran, when a remote worker ran it
+      if (launched.worker) job = (await updateJob(ctx.store, job.id, { payload: { ...job.payload, worker: launched.worker } }))!;
       if (job.kind === 'init') job = (await updateJob(ctx.store, job.id, { payload: { ...job.payload, topics: topicsFrom(launched.resultText) } }))!;
     }
   } catch (err) {

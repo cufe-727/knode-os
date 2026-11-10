@@ -261,3 +261,8 @@ regeneration and is itself a source.
   shelf lives for undated claims; numbers as measures checked against the
   market; rookie-trade's prices and statements read in place, point in time,
   with instruments and market events as producer documents.
+- [27 — Research sessions on remote workers, and evaluation runs on other machines](27-remote-research-and-eval.md)
+  — phase 1 built: a research job stays on the server and only its agent sessions lease out, as a new `session` kind,
+  to a worker running its own Codex or Claude account; the agent reaches knode through a lease-bound route
+  under /remote/v1 (never /mcp) and reads through knode's tools, with no data files on the worker; evaluation
+  moves whole by pack and is merged into one run.

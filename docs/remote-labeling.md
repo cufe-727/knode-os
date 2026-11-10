@@ -10,6 +10,10 @@ raw reply. That can be one of `serve`'s own worker slots or a worker on another 
 reply and keeps it in the document's sidecar. It writes a document to the graph once its last segment is in,
 and a summary page as soon as its summary is in.
 
+Where a workspace offers them, research **sessions** are leased too ([design 27](design/27-remote-research-and-eval.md)):
+a research job stays on this machine, and only its agent sessions — a page's single session, a team's phases, a
+study's collectors — run on a worker's own Codex or Claude account ([below](#research-sessions-on-a-worker)).
+
 The same port also serves a **remote API** under `/remote/v1`, authenticated by per-machine tokens. It covers
 leased work, reading and writing documents, search, the graph and claims, and read-only SQL over the catalog views.
 
@@ -203,6 +207,10 @@ other workspaces; only the workspace it was saved in re-converts what it has.
 | `server.remote.callDeadlineMinutes` | `20` | longest a review waits for one judge call |
 | `server.remote.offer.embed` | `true` | remote embed slots may take embed batches — only where `ingest.embedding` is `"deferred"` |
 | `server.remote.embedProbeCosine` | `0.98` | the cosine every probe vector of an own endpoint must reach against the pool's, at calibration and in spot checks |
+| `server.remote.offer.session` | `false` | remote session slots may run research sessions ([below](#research-sessions-on-a-worker)) |
+| `server.remote.sessionOfferSeconds` | `30` | how long a session waits for an online worker that takes its CLI before it runs here |
+| `server.remote.sessionWaitMinutes` | `30` | how long a session this machine may not run waits for a worker before its job pauses |
+| `research.localSessions` | unset | research sessions this machine runs at once while sessions are offered: unset, no limit; `0`, workers only |
 
 The share keeps summaries moving while an import's extraction backlog is out, and extraction moving while summaries
 pile up. A kind that had nothing to give banks no credit for it: when it has work again, it takes its share from
@@ -215,6 +223,7 @@ knode-os remote token create --name macbook --scope label --workspace admin/fina
 knode-os remote token create --name old-mac --scope label --kinds extract --workspace admin/finance
 knode-os remote token create --name analytics --scope read,sql --workspace admin/finance
 knode-os remote token create --name gpu-box --scope embed --workspace admin/finance
+knode-os remote token create --name laptop --scope research --workspace admin/finance
 knode-os remote token list
 knode-os remote token revoke macbook
 ```
@@ -227,6 +236,7 @@ knode-os remote token revoke macbook
 | `sql` | read-only SQL over the `v_*` catalog views |
 | `embed` | lease embed batches and hand back vectors made on the worker's own endpoint, once it passes calibration; read the embedding section of `work/config` |
 | `embed-keys` | reserved for lending pool keys to workers (design 12 §4.2), which is not built: it grants nothing yet, and needs `embed` |
+| `research` | lease research sessions and hand back their output; each session's agent reaches knode with a token of the session's own |
 
 A token's workspaces can be `<user>/<workspace-id>`, `team/<name>` or `*`. Tokens live hashed in
 `<data root>/.knode/remote-tokens.json` (0600). Only the secret's SHA-256 is stored, and a token is shown
@@ -326,6 +336,46 @@ the call runs. `--check` shows the embedding identity and whether the endpoint p
 The models a worker uses count against that machine's own accounts. A worker on a machine that shares an
 account with another job (rookie-trade's review runner uses Codex and Cursor too) shares that account's limits.
 
+## Research sessions on a worker
+
+A research job's sessions are where a Codex or Claude plan runs out (an xhigh study can spend a five-hour window).
+A worker with an account of its own can take them. The job stays here: its brief, its pipeline, the validation and
+the page all happen on this machine; only the agent sessions go out.
+
+```bash
+knode-os remote token create --name laptop --scope research --workspace admin/finance
+# in admin/finance's knode.config.json: "server": { "remote": { "offer": { "session": true } } }
+KNODE_TOKEN=knr_… node knode-worker.mjs --server https://knode-os.lemoncheese.cc --workspace admin/finance \
+  --sessions codex:1,claude:1
+```
+
+- **Which sessions go.** Codex and Claude sessions of the `single` and `team` pipelines and a study's collectors.
+  Sessions of the `native` pipeline (sub-agents), sessions that attach a study's MCP sources, the built-in agent,
+  OpenCode, deep-research mode, a study's refinement and Ask stay here.
+- **Where each runs.** A session goes to a session slot of its CLI that asked in the last two minutes, if one
+  takes it within `server.remote.sessionOfferSeconds`; otherwise it runs here as before. While a worker for the
+  job's CLI is online, the research loop no longer holds the job for this machine's quota floor: each session
+  checks the floor itself, and a session that may not run here (under the floor, or `research.localSessions`
+  reached) waits for a worker. One that waits `server.remote.sessionWaitMinutes` in vain ends its run as a quota
+  pause (the floor) or a short transient pause, as [design 22](design/22-research-pauses-and-housekeeping.md) says.
+- **What the agent can do.** It reaches knode at `/remote/v1/w/<workspace>/sessions/<id>/mcp` with the session's
+  own token, minted with the lease and dropped when the session ends or the job is cancelled. It gets knode's
+  read tools (`knode_read`, `knode_grep`, `knode_ls`, search, `knode_capture` …); a writing session also gets
+  `knode_write` for its job's own page and `knode_commit` for its job's workset, nothing else. No data folder is
+  copied to the worker: its brief tells it to read through the tools. Every tool call is a line in the audit log,
+  with the tool and the path, never the content. `/mcp` itself still answers this machine only.
+- **On the worker.** Each session runs in a fresh temporary folder with knode's MCP server as its only tool
+  server and no file, edit or shell tools (Claude), or Codex's read-only sandbox, its user config ignored. The
+  worker builds the command from the task's checked fields — CLI, model, effort, turns, tools, web — and never
+  runs a command line the server sent. Codex's sandbox can still read the worker's own files, so run a session
+  worker as a user with nothing to hide.
+- **Output and failures.** Every 30 s the worker renews the lease and sends the stdout since the last renewal,
+  which lands in the run folder's transcript here, so the live activity view works. A renewal the server refuses
+  (cancelled, restarted) kills the CLI. A session the worker could not serve — its account's limit, a lost login,
+  a missing CLI, a lapsed lease — goes back in line with the job's attempt untouched, and that CLI rests on the
+  worker; after three such failures in a row the session runs here if it may. Tasks lists sessions out under
+  "Research", with their worker, and a job's phases record which worker ran them.
+
 ## API
 
 All paths are under `/remote/v1`, and every route except `/health` needs `Authorization: Bearer knr_…`.
@@ -336,13 +386,17 @@ Workspace routes are `/w/<owner>/<workspace>/…`, where `<owner>` is a username
 | `GET /health` | — | `{ ok }` |
 | `GET /whoami` | any | the token's name, scopes, workspaces, kinds |
 | `GET /worker.mjs` | any | the worker script |
-| `GET …/work/config` | label / embed | `{ version, leaseSeconds: { llm, embed? }, kinds: { extract, summarize, judge, translate, embed }, shares, hints: { <kind>: { codex?, claude?, cursor? } }, embedding? }`; `embedding` (embed scope, deferred mode): `{ vectorModel, model, dimensions, batchSize, inputChars, postprocess, ownEndpoints, probe: { texts, minCosine } }` |
+| `GET …/work/config` | label / embed / research | `{ version, leaseSeconds: { llm, embed?, session? }, kinds: { extract, summarize, judge, translate, embed, session }, shares, hints: { <kind>: { codex?, claude?, cursor? } }, embedding? }`; `embedding` (embed scope, deferred mode): `{ vectorModel, model, dimensions, batchSize, inputChars, postprocess, ownEndpoints, probe: { texts, minCosine } }` |
 | `POST …/work/lease` | label / embed | `{ worker, backend, kinds?, max, calibration? }` → `{ configVersion, leaseSeconds, tasks: [{ id, kind, label, messages, prompt, json, maxTokens, leaseExpiresAt, document? }], embed? }`. An embed task is `{ id, kind: "embed", label, vectorModel, dimensions, credential: null, inputs, leaseExpiresAt }`; `embed: { calibrate: true, reason, parkedUntil? }` tells an embed slot to calibrate (again). A lease that names no kinds gets no embed batch |
 | `POST …/work/calibrate` | embed | `{ worker, model, endpointModel?, vectors, dimensions }` (the probe texts' vectors, base64 float32) → `{ ok, calibration, minCosine, meanCosine }` or `{ ok: false, reason, minCosine?, retryAfterSeconds? }` |
 | `POST …/work/complete` | label / embed | `{ worker, backend, id, ok, text \| error, kind?, model? }`, an embed batch with `vectors` (base64 float32), `dimensions`, `endpointModel?`, `usage?` → `{ accepted, documentWritten?, vectorsWritten? }` (409 when the lease moved on or the batch was refused) |
 | `POST …/work/renew` | label / embed | `{ worker, backend, ids }` → `{ renewed, lost }` |
 | `POST …/work/release` | label / embed | `{ worker, backend, ids }` → `{ released }` |
-| `GET …/work/status` | label / embed / read | per kind (queue, due or waiting; leases; totals; for embed the backlog, calibrated endpoints and parked workers), shares, workers |
+| `GET …/work/status` | label / embed / research / read | per kind (queue, due or waiting; leases; totals; for embed the backlog, calibrated endpoints and parked workers), shares, workers |
+| `POST …/work/lease` with `kinds: ["session"]` | research | `{ worker, backend: "codex" \| "claude", kinds, max }` → a session task `{ id, kind: "session", label, job, agent: { family, model, effort, speed }, maxTurns, timeoutMs, tools, web, webFreshness, schema, prompt, mcpToken, leaseExpiresAt }`; a session lease lasts 120 s, renewed while it runs |
+| `POST …/work/renew` for a session | research | `{ worker, backend, ids, output: { <id>: "<stdout since the last renewal>" } }` → `{ renewed, lost }` |
+| `POST …/work/complete` for a session | research | `{ worker, backend, id, ok: true, session: { exitCode, output, stderr, lastMessage } }` or `{ ok: false, error, kind }` → `{ accepted, failure? }`; `failure` says the server read the answer as the worker's own failure, and the worker rests that CLI |
+| `POST …/sessions/<id>/mcp` | the session's `kms_` token | MCP Streamable HTTP for that session's tools, answered as an event stream with a keep-alive comment every 20 s |
 | `POST …/labeling/lease` | label (extract) | the same as `work/lease` with `kinds: ["extract"]`, answered `{ leaseSeconds, tasks }` |
 | `POST …/labeling/complete`, `…/renew`, `…/release` | label | the same as `work/*` |
 | `GET …/labeling/status` | label / read | extraction's queue, leases, workers, totals |

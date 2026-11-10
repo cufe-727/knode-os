@@ -58,7 +58,7 @@ export interface WorkerEmbedding {
 export interface WorkerConfig {
   /** A hash of everything else here: every lease answer carries it, and a worker reads this again when it changes. */
   version: string;
-  leaseSeconds: { llm: number; embed?: number };
+  leaseSeconds: { llm: number; embed?: number; session?: number };
   /** The kinds this token may take here and the workspace offers remote workers. */
   kinds: Record<WorkKind, boolean>;
   shares: Record<SharedKind, number>;
@@ -71,13 +71,14 @@ const FAMILY: Partial<Record<LlmProvider, CliFamily>> = { 'codex-cli': 'codex', 
 
 /**
  * Whether the workspace offers this kind of work to remote workers:
- * extraction always, summaries unless turned off, judge calls only when
- * turned on, translations while content languages are on (docs/design/17)
- * unless turned off.
+ * extraction always, summaries unless turned off, judge calls and research
+ * sessions only when turned on, translations while content languages are on
+ * (docs/design/17) unless turned off.
  */
 export function offeredRemotely(config: KnodeConfig, kind: WorkKind): boolean {
   if (kind === 'summarize') return config.server.remote?.offer?.summarize !== false;
   if (kind === 'judge') return config.server.remote?.offer?.judge === true;
+  if (kind === 'session') return config.server.remote?.offer?.session === true;
   if (kind === 'translate') return contentLanguages(config).on && config.server.remote?.offer?.translate !== false;
   // vectors are leased work only in deferred mode (docs/design/12 §3.3)
   if (kind === 'embed') return embedOffered(config);
@@ -153,11 +154,18 @@ export function workerConfig(config: KnodeConfig, opts: {
   shares: Record<SharedKind, number>;
   /** The workspace's embedder and how long an embed lease lasts, for a token that may take embed work. */
   embed?: { embedder: Pick<EmbeddingProvider, 'model' | 'dimensions'>; leaseMs: number } | null;
+  /** How long a research session's lease lasts (renewed while it runs), where sessions are leased. */
+  sessionLeaseMs?: number | null;
 }): WorkerConfig {
   const kinds = Object.fromEntries(WORK_KINDS.map((k) => [k, opts.allowed.includes(k) && offeredRemotely(config, k)])) as Record<WorkKind, boolean>;
   const embedding = kinds.embed && opts.embed ? workerEmbedding(config, opts.embed.embedder) : undefined;
+  const session = kinds.session && opts.sessionLeaseMs ? Math.round(opts.sessionLeaseMs / 1000) : null;
   const body = {
-    leaseSeconds: { llm: Math.round(opts.leaseMs / 1000), ...(embedding && opts.embed ? { embed: Math.round(opts.embed.leaseMs / 1000) } : {}) },
+    leaseSeconds: {
+      llm: Math.round(opts.leaseMs / 1000),
+      ...(embedding && opts.embed ? { embed: Math.round(opts.embed.leaseMs / 1000) } : {}),
+      ...(session ? { session } : {}),
+    },
     kinds,
     shares: opts.shares,
     hints: workerHints(config),

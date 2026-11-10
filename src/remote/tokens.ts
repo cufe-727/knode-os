@@ -14,7 +14,7 @@ import { isLlmKind, LLM_KINDS, WorkKind } from '../work/kinds.js';
  * created or revoked with the CLI takes effect in a running `serve` at once.
  */
 
-export const REMOTE_SCOPES = ['label', 'read', 'write', 'sql', 'embed', 'embed-keys'] as const;
+export const REMOTE_SCOPES = ['label', 'read', 'write', 'sql', 'embed', 'embed-keys', 'research'] as const;
 export type RemoteScope = (typeof REMOTE_SCOPES)[number];
 
 export const REMOTE_SCOPE_HELP: Record<RemoteScope, string> = {
@@ -24,6 +24,7 @@ export const REMOTE_SCOPE_HELP: Record<RemoteScope, string> = {
   sql: 'read-only SQL over the catalog views (v_*)',
   embed: 'take embed batches and hand back vectors made on the worker\'s own endpoint, once it passes calibration (docs/design/12)',
   'embed-keys': 'also receive the embedding keys marked "Lend to remote workers", and embed on them under this machine\'s quota ledger',
+  research: 'take research agent sessions and run them on the worker\'s own Codex or Claude account; each session reaches knode through a token of its own (docs/design/27)',
 };
 
 export interface RemoteTokenRecord {
@@ -89,6 +90,7 @@ export class RemoteTokenStore {
     const kinds = [...new Set(opts.kinds ?? [])];
     for (const k of kinds) {
       if (k === 'embed') throw new Error('embed work has a scope of its own — give the token the "embed" scope instead of the kind');
+      if (k === 'session') throw new Error('research sessions have a scope of their own — give the token the "research" scope instead of the kind');
       if (!isLlmKind(k)) throw new Error(`unknown kind of work "${k}" — kinds are ${LLM_KINDS.join(', ')}`);
     }
     if (kinds.length > 0 && !scopes.includes('label')) throw new Error('kinds narrow the "label" scope — give the token that scope too');
@@ -177,9 +179,11 @@ export function tokenAllows(record: RemoteTokenRecord, scope: RemoteScope, works
 
 /**
  * May the token take this kind of work in this workspace? A model call needs
- * `label`, narrowed by its kinds when it names any; an embed batch needs `embed`.
+ * `label`, narrowed by its kinds when it names any; an embed batch needs
+ * `embed`; a research session needs `research`.
  */
 export function tokenAllowsKind(record: RemoteTokenRecord, kind: WorkKind, workspace: string): boolean {
   if (kind === 'embed') return tokenAllows(record, 'embed', workspace);
+  if (kind === 'session') return tokenAllows(record, 'research', workspace);
   return tokenAllows(record, 'label', workspace) && (!record.kinds?.length || record.kinds.includes(kind));
 }

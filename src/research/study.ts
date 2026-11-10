@@ -14,7 +14,7 @@ import { captureUrl, registerPath, studyCaptures, studyFolder, waitForCaptureInd
 import { runDeepResearch } from './deep-research.js';
 import { activePause, AgentUnavailableError, classifyFailure, RunPause } from './failure.js';
 import { archiveJobs, createJobRow, deleteJobs, getJob, listJobs, ResearchJob, resumeJob, TERMINAL_STATUSES, updateJob } from './jobs.js';
-import { isCancelled, JobCancelledError, killAgentsFor, launchSession } from './launch.js';
+import { isCancelled, JobCancelledError, killAgentsFor, launchSession, SessionDispatch } from './launch.js';
 import { PhaseRecord } from './pipeline.js';
 import { activeProfile, effectiveEffort, effectiveSpeed, loadProfile, ResearchProfile, webAllowed } from './profile.js';
 import { detectLanguage, localizeNoteHeadings, normalizeBrief, noteHeadings, refineBrief, sourceMarker, sourcesHeading, StudyBrief, StudyPage, templateBrief } from './refine.js';
@@ -722,6 +722,8 @@ export interface CollectDeps {
   profile: ResearchProfile;
   readDirs: string[];
   log: (msg: string) => void;
+  /** Remote workers that may run the collectors (docs/design/27). */
+  sessions?: SessionDispatch;
 }
 
 /** raw/docs paths a collector's notes cite. */
@@ -907,9 +909,9 @@ export async function runStudyCollect(ctx: AppContext, jobIn: ResearchJob, deps:
         cwd: dir, prompt: `${prompt}\n\n---\n\n${document}`, mcp: deps.mcp, readDirs: deps.readDirs, jobId: job.id,
         outputPath: '', worksetId: workset, allowNetwork: web, tools: 'read', files: true,
         effort: effectiveEffort(deps.profile, null), speed: effectiveSpeed(deps.profile, null), webFreshness: deps.profile.search.freshness,
-        extraMcp, label,
+        extraMcp, label, sessions: deps.sessions,
       });
-      const phase: PhaseRecord = { name: 'collect', label, role: 'collector', agent: deps.agent.provider, turns: r.turns, costUsd: r.costUsd, error: r.error, ms: Date.now() - t0 };
+      const phase: PhaseRecord = { name: 'collect', label, role: 'collector', agent: deps.agent.provider, turns: r.turns, costUsd: r.costUsd, error: r.error, ms: Date.now() - t0, ...(r.worker ? { worker: r.worker } : {}) };
       phases.push(phase);
       const text = r.text.trim();
       if (!text && r.error && classifyFailure(r.error).kind !== 'other') refused.push(phase);

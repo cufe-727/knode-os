@@ -5,7 +5,7 @@ import { safePath } from '../fs/files.js';
 import { pool } from '../pool.js';
 import { ResearchAgent, withModel } from './agent.js';
 import { getJob, ResearchJob } from './jobs.js';
-import { isCancelled, JobCancelledError, LaunchResult, launchSession, SessionResult } from './launch.js';
+import { isCancelled, JobCancelledError, LaunchResult, launchSession, SessionDispatch, SessionResult } from './launch.js';
 import { effectiveEffort, effectiveSpeed, NativeAgentSpec, requiredSections, ResearchProfile, ResearchRole, revisionRounds, rolePrompt, rolesFor, webAllowed } from './profile.js';
 import { loadPhasePrompt, PhaseName, ResearchTemplate, researchSlug, subjectOf } from './templates.js';
 import type { ExtraMcpServer } from './sources.js';
@@ -45,6 +45,8 @@ export interface PhaseRecord {
   costUsd: number | null;
   error: string | null;
   ms: number;
+  /** The remote worker that ran the session (docs/design/27); absent when it ran here. */
+  worker?: string;
 }
 
 export interface PipelineResult extends LaunchResult {
@@ -72,6 +74,8 @@ export interface PipelineInput {
   webSearch?: boolean;
   /** A study's research sources: MCP servers attached to every session. */
   extraMcp?: ExtraMcpServer[];
+  /** Remote workers that may run the sessions (docs/design/27). */
+  sessions?: SessionDispatch;
   log: (m: string) => void;
 }
 
@@ -193,8 +197,10 @@ function sessions(ctx: AppContext, input: PipelineInput): Sessions {
       agents: opts.agents,
       extraMcp: input.extraMcp,
       label,
+      companions: ws.companions.map((c) => c.path),
+      sessions: input.sessions,
     });
-    phases.push({ name, label, role: role.id, agent: agent.provider, turns: r.turns, costUsd: r.costUsd, error: r.error, ms: Date.now() - t0 });
+    phases.push({ name, label, role: role.id, agent: agent.provider, turns: r.turns, costUsd: r.costUsd, error: r.error, ms: Date.now() - t0, ...(r.worker ? { worker: r.worker } : {}) });
     totals.turns += r.turns ?? 0;
     totals.cost += r.costUsd ?? 0;
     fs.writeFileSync(path.join(ws.dir, 'phases.json'), JSON.stringify(phases, null, 2) + '\n');

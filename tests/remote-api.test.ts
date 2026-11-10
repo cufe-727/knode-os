@@ -326,7 +326,7 @@ describe('the remote API', () => {
       expect(config.hints).toEqual({ extract: {}, summarize: {}, judge: {}, translate: {} });
       // translations are offered only where the workspace has content languages on (docs/design/17)
       expect(config.kinds.translate).toBe(false);
-      expect(((await (await req(`${ws}/work/config`, { token: tok.extractor })).json()) as Config).kinds).toEqual({ extract: true, summarize: false, judge: false, translate: false, embed: false });
+      expect(((await (await req(`${ws}/work/config`, { token: tok.extractor })).json()) as Config).kinds).toEqual({ extract: true, summarize: false, judge: false, translate: false, embed: false, session: false });
       // vectors are not leased work on a workspace that embeds inline, the default
       expect(config.kinds.embed).toBe(false);
       expect(config).not.toHaveProperty('embedding');
@@ -382,7 +382,7 @@ describe('the remote API', () => {
 
     it('tells an embed token the vector space, the batches and the probe set — and an LLM token none of it', async () => {
       const config = await (await req(`${vws}/work/config`, { token: tok.embedder })).json() as EmbedConfig;
-      expect(config.kinds).toEqual({ extract: false, summarize: false, judge: false, translate: false, embed: true });
+      expect(config.kinds).toEqual({ extract: false, summarize: false, judge: false, translate: false, embed: true, session: false });
       expect(config.leaseSeconds).toEqual({ llm: 900, embed: 120 });
       expect(config.embedding).toMatchObject({
         vectorModel: 'pool:bge-m3:1024:l2-v1', model: 'bge-m3', dimensions: 1024, batchSize: 4, inputChars: 8000, postprocess: 'l2', ownEndpoints: true,
