@@ -110,6 +110,7 @@ enum TaskWords {
         case "datasources": (L("Datasources"), L("refreshes live schemas into the wiki"))
         case "feishu": (L("Feishu documents"), L("asks Feishu which linked documents and wiki pages were edited, and fetches those"))
         case "conversations": (L("Agent conversations"), L("adds new exchanges of followed Claude Code and Codex conversations once they go quiet"))
+        case "codebases": (L("Code repositories"), L("fetches followed repositories again and indexes what changed"))
         default: (id, "")
         }
     }
@@ -148,6 +149,7 @@ struct TasksView: View {
     @State private var switching = false
     @State private var checkingFeishu = false
     @State private var checkingConversations = false
+    @State private var checkingCodebases = false
     /// Nil until someone opens or closes it: open by default while nothing runs.
     @State private var recentOpen: Bool?
 
@@ -748,6 +750,13 @@ struct TasksView: View {
                     .disabled(item.running || checkingConversations)
                     .help(L("Add the new exchanges of every followed conversation now, without waiting for it to go quiet"))
             }
+            // and the daily fetch of followed code repositories
+            if item.id == "codebases", item.enabled, model.mayUseFiles {
+                Button(L("Check now")) { Task { await checkCodebases() } }
+                    .controlSize(.small)
+                    .disabled(item.running || checkingCodebases)
+                    .help(L("Fetch every followed repository again now, and index what changed"))
+            }
         }
         .opacity(item.enabled ? 1 : 0.5)
     }
@@ -780,6 +789,27 @@ struct TasksView: View {
             model.sessionEnded()
         } catch {
             model.showError(error, prefix: L("Conversation check failed"))
+        }
+        await load()
+    }
+
+    private func checkCodebases() async {
+        checkingCodebases = true
+        defer { checkingCodebases = false }
+        do {
+            let answer = try await model.client().checkCodebases()
+            let what = answer.repositories == 1
+                ? L("1 followed repository")
+                : L("%@ followed repositories", String(answer.repositories))
+            model.showToast(!answer.started
+                ? L("No repository is followed")
+                : answer.queued
+                    ? L("Fetching %@ again once the fetch under way ends — it shows under Background", what)
+                    : L("Fetching %@ again — it shows under Background", what))
+        } catch let error as APIError where error.sessionEnded {
+            model.sessionEnded()
+        } catch {
+            model.showError(error, prefix: L("Repository check failed"))
         }
         await load()
     }

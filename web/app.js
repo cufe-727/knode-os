@@ -1553,6 +1553,7 @@ const SCHEDULE_WORDS = {
   datasources: ['Datasources', 'refreshes live schemas into the wiki'],
   feishu: ['Feishu documents', 'asks Feishu which linked documents and wiki pages were edited, and fetches those'],
   conversations: ['Agent conversations', 'adds new exchanges of followed Claude Code and Codex conversations once they go quiet'],
+  codebases: ['Code repositories', 'fetches followed repositories again and indexes what changed'],
 };
 const ACTIVITY_ICONS = { sync: '⟳', ingest: '⛁', upload: '⤒', folder: '⇄', feishu: '⇅', conversations: '❝', codebase: '⎇', traces: '⌁', datasources: '◫', dream: '☾', tier2: '⚙' };
 
@@ -1811,7 +1812,9 @@ function paintTasksSchedule(t) {
       ? `<button type="button" class="row-action" data-feishu-check ${x.running ? 'disabled' : ''} title="Ask Feishu now which linked documents were edited, and fetch those">Check now</button>`
       : x.id === 'conversations' && x.enabled && mayUse('files')
         ? `<button type="button" class="row-action" data-conversations-check ${x.running ? 'disabled' : ''} title="Add the new exchanges of every followed conversation now, without waiting for it to go quiet">Check now</button>`
-        : '';
+        : x.id === 'codebases' && x.enabled && mayUse('files')
+          ? `<button type="button" class="row-action" data-codebases-check ${x.running ? 'disabled' : ''} title="Fetch every followed repository again now, and index what changed">Check now</button>`
+          : '';
     return `<div class="schedule-row${x.enabled ? '' : ' off'}"><span class="activity-icon${x.running ? ' spin' : ''}">${x.running ? '⟳' : '◷'}</span>
       <div><b>${esc(title)}</b> <span class="hint">${esc(about)}</span><div class="hint">${x.running ? 'running now · ' : ''}${esc(when)}</div></div>${checkNow}</div>`;
   });
@@ -1823,6 +1826,23 @@ function paintTasksSchedule(t) {
   $('#tasks-schedule').innerHTML = `${rows.join('')}${folders.length ? `<p class="tasks-sub">Linked folders</p>${folders.join('')}` : ''}${dream}`;
   $('#tasks-schedule').querySelector('[data-feishu-check]')?.addEventListener('click', (ev) => checkFeishuNow(ev.currentTarget));
   $('#tasks-schedule').querySelector('[data-conversations-check]')?.addEventListener('click', (ev) => checkConversationsNow(ev.currentTarget));
+  $('#tasks-schedule').querySelector('[data-codebases-check]')?.addEventListener('click', (ev) => checkCodebasesNow(ev.currentTarget));
+}
+
+/** Tasks → Code repositories → Check now: every followed repository, fetched again in the background. */
+async function checkCodebasesNow(button) {
+  if (button) button.disabled = true;
+  try {
+    const res = await api('/api/codebases/update', { method: 'POST', body: JSON.stringify({ followed: true, wait: false }) });
+    const n = res.repositories ?? 0;
+    const what = `${n} followed ${n === 1 ? 'repository' : 'repositories'}`;
+    toast(!res.started ? 'no repository is followed'
+      : res.queued ? `fetching ${what} again once the fetch under way ends — it shows under Tasks → Background`
+        : `fetching ${what} again — it shows under Tasks → Background`, 5000);
+  } catch (e) {
+    toast(`repository check failed: ${e.message}`, 6000);
+  }
+  loadTasks();
 }
 
 /** Tasks → Feishu documents → Check now: every linked document and tree, in the background. */

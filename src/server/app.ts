@@ -1696,23 +1696,28 @@ export function createApp(
     }
   });
 
-  // fetch one repository (or every one) again; `wait: false` answers 202 at once and the
-  // fetch shows as a `codebase` activity — a large repository takes minutes to index
+  // fetch one repository (or every one, or with `followed` every followed one — Tasks → Check now) again;
+  // `wait: false` answers 202 at once, saying how many it fetches and whether it waits behind a fetch
+  // under way, and the fetch shows as a `codebase` activity — a large repository takes minutes to index
   app.post('/api/codebases/update', async (c) => {
     const ctx = requestCtx(c);
     try {
-      const body = (await c.req.json().catch(() => ({}))) as { name?: string; reindex?: boolean; wait?: boolean };
+      const body = (await c.req.json().catch(() => ({}))) as { name?: string; reindex?: boolean; wait?: boolean; followed?: boolean };
       const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
       if (name && !codebaseLinks(ctx.config).some((l) => l.name === name)) return c.json({ error: `no repository named ${name}` }, 404);
       const force = Boolean(body.reindex);
+      const followedOnly = !name && body.followed === true;
+      const repositories = name ? 1 : codebaseLinks(ctx.config).filter((l) => !followedOnly || l.follow).length;
       const services = servicesFor(ctx);
       const run = () => (services?.codebases
-        ? services.codebases.update(name, { force })
-        : updateActivity(ctx, name ? `${name}: fetching again from its repository` : 'Every repository: fetching again', log,
-          (progress) => updateCodebases(ctx, name, { force, onProgress: progress })));
+        ? services.codebases.update(name, { force, followedOnly })
+        : updateActivity(ctx, name ? `${name}: fetching again from its repository` : followedOnly ? 'Followed repositories: fetching again' : 'Every repository: fetching again', log,
+          (progress) => updateCodebases(ctx, name, { force, followedOnly, onProgress: progress })));
       if (body.wait === false) {
-        void run().catch((e) => log(`codebase ${name ?? '(all)'}: ${e instanceof Error ? e.message : e}`));
-        return c.json({ ok: true, started: true }, 202);
+        if (repositories === 0) return c.json({ ok: true, started: false, repositories });
+        const queued = services?.codebases?.busy ?? false;
+        void run().catch((e) => log(`codebase ${name ?? (followedOnly ? '(followed)' : '(all)')}: ${e instanceof Error ? e.message : e}`));
+        return c.json({ ok: true, started: true, repositories, queued }, 202);
       }
       const results = await run();
       return c.json({ ok: true, results: results.map((r) => ('error' in r ? r : { ...r, copied: r.copied.length, removed: r.removed.length })) });

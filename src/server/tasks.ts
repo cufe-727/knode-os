@@ -2,6 +2,7 @@ import { activityOf, ActivityItem } from '../activity.js';
 import { AppContext } from '../context.js';
 import { nightlySchedule } from '../dream/dream.js';
 import { pendingEmbeddings } from '../ingest/embed-backfill.js';
+import { codebaseCheckTime, codebaseLinks, lastCodebaseCheck } from '../ingest/codebase/codebases.js';
 import { conversationCheckMinutes, conversationLinks } from '../ingest/conversations/follow.js';
 import { feishuCheckTime, feishuLinks, lastFeishuCheck } from '../ingest/feishu/docs.js';
 import { linkedFolders } from '../ingest/folders.js';
@@ -95,13 +96,13 @@ export interface TaskJob {
 }
 
 export interface ScheduledTask {
-  id: 'dream' | 'tier2' | 'traces' | 'datasources' | 'feishu' | 'conversations';
+  id: 'dream' | 'tier2' | 'traces' | 'datasources' | 'feishu' | 'conversations' | 'codebases';
   /** "03:00" for a daily run, else the interval in minutes. */
   at: string | null;
   everyMinutes: number | null;
   /** The next start, when the clock says; null while it cannot run. */
   next: string | null;
-  /** When it last ran, for a task that keeps that across restarts (Feishu) or knows it (followed conversations); null otherwise. */
+  /** When it last ran, for a task that keeps that across restarts (Feishu, followed repositories) or knows it (followed conversations); null otherwise. */
   last: string | null;
   enabled: boolean;
   running: boolean;
@@ -326,6 +327,8 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
   const traceEvery = Math.max(1, config.trace.syncIntervalMinutes);
   const feishuAt = feishuCheckTime(config);
   const feishuLinked = feishuLinks(config).length > 0;
+  const codebaseAt = codebaseCheckTime(config);
+  const codebasesFollowed = codebaseLinks(config).some((l) => l.follow);
   const scheduled: ScheduledTask[] = [
     { id: 'dream', at: nightly?.dream ?? null, everyMinutes: null, next: services && nightly ? nextDaily(nightly.dream) : null, last: null, enabled: Boolean(nightly), running: busy('dream') },
     { id: 'tier2', at: nightly?.tier2 ?? null, everyMinutes: null, next: services && nightly ? nextDaily(nightly.tier2) : null, last: null, enabled: Boolean(nightly), running: busy('tier2') },
@@ -348,6 +351,17 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
       last: services?.conversations?.lastCheck() ?? null,
       enabled: Boolean(services) && conversationLinks(config).length > 0,
       running: busy('conversations'),
+    },
+    {
+      // followed code repositories, fetched again daily (src/ingest/codebase, docs/design/25 D8); an add,
+      // update or removal holds the same one-at-a-time slot, so it shows as running too
+      id: 'codebases',
+      at: codebaseAt,
+      everyMinutes: null,
+      next: services?.codebases ? services.codebases.nextCheck() : null,
+      last: lastCodebaseCheck(config),
+      enabled: Boolean(services?.codebases) && Boolean(codebaseAt) && codebasesFollowed,
+      running: (services?.codebases?.busy ?? false) || busy('codebase'),
     },
   ];
 

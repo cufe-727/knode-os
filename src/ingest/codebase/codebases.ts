@@ -406,15 +406,29 @@ export function describeCodebases(ctx: { dataDir: string; config: KnodeConfig })
 
 const DEFAULT_CHECK_AT = '05:00';
 
-/** The next local time `HH:MM` falls at, after `from`; null when checks are off. */
-export function nextCodebaseCheck(config: KnodeConfig, from: Date): Date | null {
+/** The local time of day followed repositories are fetched again, as "HH:MM"; null when checks are off. A time that does not read as one is the default. */
+export function codebaseCheckTime(config: KnodeConfig): string | null {
   const at = (config.ingest.codebaseCheckAt ?? DEFAULT_CHECK_AT).trim();
   if (at === 'off') return null;
   const m = /^(\d{1,2}):(\d{2})$/.exec(at) ?? /^(\d{1,2}):(\d{2})$/.exec(DEFAULT_CHECK_AT)!;
+  return `${m[1].padStart(2, '0')}:${m[2]}`;
+}
+
+/** The next local time `HH:MM` falls at, after `from`; null when checks are off. */
+export function nextCodebaseCheck(config: KnodeConfig, from: Date): Date | null {
+  const at = codebaseCheckTime(config);
+  if (!at) return null;
+  const [h, m] = at.split(':').map(Number);
   const next = new Date(from);
-  next.setHours(Number(m[1]), Number(m[2]), 0, 0);
+  next.setHours(h, m, 0, 0);
   if (next <= from) next.setDate(next.getDate() + 1);
   return next;
+}
+
+/** When a followed repository was last looked at (fetched, or tried): the newest `checkedAt`; null when none is followed or none was. */
+export function lastCodebaseCheck(config: KnodeConfig): string | null {
+  const times = codebaseLinks(config).filter((l) => l.follow && l.checkedAt).map((l) => Date.parse(l.checkedAt!)).filter(Number.isFinite);
+  return times.length ? new Date(Math.max(...times)).toISOString() : null;
 }
 
 /** True when a followed repository has not been looked at since the last scheduled time. */
@@ -478,6 +492,20 @@ export class Codebases {
 
   get busy(): boolean {
     return this.running !== null;
+  }
+
+  /**
+   * When the daily fetch of followed repositories next starts: while one is
+   * owed, at the next tick (or once an hour's retry wait is over); otherwise
+   * at the next `codebaseCheckAt`. Null when checks are off, nothing is
+   * followed or the service has stopped.
+   */
+  nextCheck(now = new Date()): string | null {
+    if (this.stopped || !codebaseLinks(this.ctx.config).some((l) => l.follow)) return null;
+    const next = nextCodebaseCheck(this.ctx.config, now);
+    if (!next) return null;
+    if (codebaseCheckOwed(this.ctx.config, now)) return new Date(Math.max(now.getTime(), this.retryAfter)).toISOString();
+    return next.toISOString();
   }
 
   /** One operation at a time: a second waits for the first. */

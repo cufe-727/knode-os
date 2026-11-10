@@ -472,6 +472,12 @@ struct APIClient {
         return try await send("/api/codebases/update", method: "POST", body: encoded(Body(name: name, reindex: reindex, wait: false)))
     }
 
+    /// Tasks → Code repositories → Check now: every followed repository, fetched again in the background.
+    func checkCodebases() async throws -> CodebaseStarted {
+        struct Body: Encodable { var followed: Bool; var wait: Bool }
+        return try await send("/api/codebases/update", method: "POST", body: encoded(Body(followed: true, wait: false)))
+    }
+
     /// Change what a repository tracks; the next update applies it.
     func editCodebase(_ patch: CodebasePatch) async throws -> ActionResponse {
         try await send("/api/codebases", method: "PATCH", body: encoded(patch))

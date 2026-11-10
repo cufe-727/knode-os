@@ -75,7 +75,7 @@ Extraction names the project, its components and what it uses, and the summary b
 
 **D7 — Ownership.** The mirror, the card and the docs copy belong to the entry (`mirrorLinks`), so writes into them are refused. `codebase remove` deletes them, disposes their documents and drops the clone; `--keep-files` keeps them as plain content.
 
-**D8 — Following.** `--follow` entries are fetched again daily at `ingest.codebaseCheckAt` (default `05:00`; `off` disables) by `serve` (`Codebases`, one operation at a time per workspace). A failed check retries after an hour. The card's extraction waits in the ordinary queue, under the quota floor.
+**D8 — Following.** `--follow` entries are fetched again daily at `ingest.codebaseCheckAt` (default `05:00`; `off` disables) by `serve` (`Codebases`, one operation at a time per workspace). A failed check retries after an hour. The card's extraction waits in the ordinary queue, under the quota floor. Tasks → Schedule shows it as `codebases` in both clients — the time, the next run (at once while a check is owed), the newest `checkedAt` of a followed entry, and running while any repository operation holds the slot — with Check now, which posts `/api/codebases/update` with `followed: true, wait: false`.
 
 **D9 — Safety.** HTTP routes take only https/ssh URLs. Adding is an administrator's call (`/api/codebases/add` → settings group); the CLI may also name a local working copy. Refs are validated (no leading `-`, no `..`). `protocol.ext.allow=never` is set, git never prompts for credentials, and every git command has a timeout.
 
@@ -96,7 +96,7 @@ knode-os codebase list | edit <name> [--ref r] [--include g…] [--exclude g…]
 
 GET    /api/codebases                      entries, sizes, whether a fetch is running, the codebase activity (running, last 5)
 POST   /api/codebases/add                  {repository, name?, ref?, include?, exclude?, follow?, docs?, wait?}  (202 unless wait)
-POST   /api/codebases/update               {name?, reindex?, wait?}  (202 when wait is false)
+POST   /api/codebases/update               {name?, reindex?, wait?, followed?}  (202 when wait is false: {started, repositories, queued})
 PATCH  /api/codebases                      {name, ref?, include?, exclude?, follow?, docs?}
 DELETE /api/codebases?name=…[&keepFiles=1]
 ```

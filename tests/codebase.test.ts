@@ -17,6 +17,7 @@ import {
   Codebases,
   describeCodebases,
   editCodebase,
+  nextCodebaseCheck,
   planCodebase,
   removeCodebase,
   updateCodebases,
@@ -29,6 +30,9 @@ import { sync } from '../src/ingest/sync.js';
 import { search } from '../src/search/search.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
 import { folderOf } from '../src/research/survey.js';
+import { createApp, WorkspaceServices } from '../src/server/app.js';
+import { tasksSnapshot } from '../src/server/tasks.js';
+import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 
 /**
  * Code repositories as a source (src/ingest/codebase, docs/design/25): which
@@ -297,6 +301,64 @@ describe('a repository from add to remove', () => {
     expect(codebases.busy).toBe(false);
     editCodebase(ctx, 'agent-harness', { ref: '' });
     expect(codebaseLinks(ctx.config)[0].ref).toBeUndefined();
+  });
+
+  it('reports the daily check in Tasks → Schedule, and fetches the followed ones when asked', async () => {
+    const codebases = new Codebases(ctx);
+    const services = { codebases } as unknown as WorkspaceServices;
+    const row = async (s: WorkspaceServices | null = services) => (await tasksSnapshot(ctx, s)).scheduled.find((x) => x.id === 'codebases')!;
+    const link = codebaseLinks(ctx.config)[0];
+    expect(link.follow).toBe(true);
+    // looked at just now: the next run is the next 05:00, the last one the entry's
+    expect(await row()).toEqual({
+      id: 'codebases', at: '05:00', everyMinutes: null, next: nextCodebaseCheck(ctx.config, new Date())!.toISOString(),
+      last: link.checkedAt, enabled: true, running: false,
+    });
+    // outside serve nothing runs on a clock, though when it last looked still shows
+    expect(await row(null)).toMatchObject({ next: null, last: link.checkedAt, enabled: false });
+
+    const saved = ctx.config.ingest.codebases;
+    try {
+      // owed since a check was missed: due at once
+      ctx.config.ingest.codebases = [{ ...link, checkedAt: new Date(Date.now() - 3 * 86400_000).toISOString() }];
+      expect(Date.parse((await row()).next!)).toBeLessThanOrEqual(Date.now());
+      ctx.config.ingest.codebaseCheckAt = '7:30';
+      expect(await row()).toMatchObject({ at: '07:30', enabled: true });
+      ctx.config.ingest.codebaseCheckAt = 'off';
+      expect(await row()).toMatchObject({ at: null, next: null, enabled: false });
+      delete ctx.config.ingest.codebaseCheckAt;
+      // nothing followed: off, and no followed repository was looked at
+      ctx.config.ingest.codebases = [{ ...link, follow: false }];
+      expect(await row()).toMatchObject({ at: '05:00', next: null, last: null, enabled: false });
+    } finally {
+      ctx.config.ingest.codebases = saved;
+      delete ctx.config.ingest.codebaseCheckAt;
+    }
+
+    // Check now: every followed repository, in the background, running until it ends
+    const registry = { exists: () => true, get: async () => ctx } as unknown as WorkspaceContextRegistry;
+    const app = createApp(ctx, () => {}, registry, { services: () => services });
+    const check = () => app.request('/api/codebases/update', {
+      method: 'POST',
+      headers: { 'x-knode-user': 'admin', 'x-knode-workspace-kind': 'personal', 'x-knode-workspace-id': 'default', 'content-type': 'application/json' },
+      body: JSON.stringify({ followed: true, wait: false }),
+    });
+    const res = await check();
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({ started: true, repositories: 1, queued: false });
+    expect(await row()).toMatchObject({ running: true });
+    for (let i = 0; i < 200 && codebases.busy; i++) await new Promise((r) => setTimeout(r, 25));
+    expect(await row()).toMatchObject({ running: false });
+    expect(activityOf(ctx.dataDir).snapshot().recent.find((a) => a.kind === 'codebase')).toMatchObject({ label: 'Followed repositories: fetching again', ok: true });
+    expect(Date.parse((await row()).last!)).toBeGreaterThan(Date.parse(link.checkedAt!));
+
+    editCodebase(ctx, 'agent-harness', { follow: false });
+    const none = await check();
+    expect(none.status).toBe(200);
+    expect(await none.json()).toMatchObject({ started: false, repositories: 0 });
+    editCodebase(ctx, 'agent-harness', { follow: true });
+    await codebases.stop();
+    expect(codebases.nextCheck()).toBeNull();
   });
 
   it('removes it with its files, card, clone and documents', async () => {

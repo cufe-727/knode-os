@@ -3027,7 +3027,7 @@ struct TasksSnapshot: Decodable {
         var everyMinutes: Int?
         /// The next start, when the clock says.
         var next: String?
-        /// When it last ran, for a task that keeps that across restarts (the Feishu check).
+        /// When it last ran, for a task that keeps that across restarts (the Feishu check, followed repositories).
         var last: String?
         var enabled: Bool
         var running: Bool
@@ -3353,16 +3353,21 @@ struct CodebasePatch: Encodable {
     var docs: Bool
 }
 
-/// `POST /api/codebases/add` or `/update` without waiting: the fetch started in the background.
+/// `POST /api/codebases/add` or `/update` without waiting: the fetch started in the background
+/// (an update also says how many repositories it fetches, and whether it waits behind a fetch under way).
 struct CodebaseStarted: Decodable {
     var started: Bool
+    var repositories: Int
+    var queued: Bool
 
     init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         started = try c.decodeIfPresent(Bool.self, forKey: .started) ?? false
+        repositories = try c.decodeIfPresent(Int.self, forKey: .repositories) ?? 0
+        queued = try c.decodeIfPresent(Bool.self, forKey: .queued) ?? false
     }
 
-    private enum CodingKeys: String, CodingKey { case started }
+    private enum CodingKeys: String, CodingKey { case started, repositories, queued }
 }
 
 /// `DELETE /api/codebases`: whether the files went with the entry.
