@@ -1819,7 +1819,7 @@ function paintTasksSchedule(t) {
       <div><b class="mono">${esc(f.dest)}</b> <span class="hint">← ${esc(homeShort(f.source))}</span>
       <div class="hint">${f.lastSyncAt ? `synced ${agoText(f.lastSyncAt)}` : 'not synced since the service started'}${f.lastChange ? ` · last change ${f.lastChange.copied} copied, ${f.lastChange.removed} removed` : ''}</div>
       ${f.lastError ? `<div class="hint bad">${esc(f.lastError)}</div>` : ''}</div></div>`);
-  // feeds: sources that keep producing items (docs/design/25); whoever may ingest may run one now
+  // feeds: sources that keep producing items (docs/design/26); whoever may ingest may run one now
   const feeds = (t.feeds ?? []).map((f) => `<div class="schedule-row${f.enabled ? '' : ' off'}"><span class="activity-icon${f.running ? ' spin' : ''}">${f.running ? '⟳' : '⇶'}</span>
       <div><b>${esc(f.title)}</b> <span class="hint">${esc(f.connector)} → <span class="mono">${esc(f.dest)}</span></span>
       <div class="hint">${f.running ? 'running now · ' : ''}${f.enabled ? esc(f.schedule) : 'off'}${f.nextRunAt && f.enabled && !f.running ? ` · next ${untilText(f.nextRunAt)}` : ''}${f.lastRunAt ? ` · last ${agoText(f.lastRunAt)}` : ''} · ${f.items} item${f.items === 1 ? '' : 's'}</div>

@@ -7,7 +7,7 @@ import type { FeedConnector, FeedDefinition, FeedItem, FeedUnit, TransformOutput
 import { feedTimezone, Period, periodOf, zonedDate, zonedIso, zonedTime } from './units.js';
 
 /**
- * Units → Markdown documents (docs/design/25 §5, after docs/design/08 §4–5).
+ * Units → Markdown documents (docs/design/26 §5, after docs/design/08 §4–5).
  *
  * A period document holds one `##` section per kept unit, oldest first; an
  * item document is one unit. Rendering is stable: a section's bytes depend on

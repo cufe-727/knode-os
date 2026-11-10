@@ -8,7 +8,7 @@ import type { ConnectorContext, FeedAttachment, FeedConnector, FeedItem, PullRes
  * (`since_id`), so an idle account costs one request.
  *
  * Without an API plan the same accounts can be followed two other ways,
- * documented in docs/design/25 §2: an `rss` feed on a self-hosted RSSHub's
+ * documented in docs/design/26 §2: an `rss` feed on a self-hosted RSSHub's
  * /twitter/user/<name> route, or an `opencli` feed (`twitter tweets`) on the
  * logged-in browser session.
  *

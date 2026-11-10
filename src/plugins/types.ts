@@ -17,7 +17,7 @@ import type { DocRoot } from '../types.js';
  *   - embedding providers: the same for the Index stage;
  *   - storage backends: what `database.kind` may name beyond pglite / postgres;
  *   - document converters: file types the Convert stage turns into Markdown;
- *   - feed connectors: kinds of source a feed pulls from (docs/design/25);
+ *   - feed connectors: kinds of source a feed pulls from (docs/design/26);
  *   - feed stages: user-defined filters and transforms a feed's stages name;
  *   - pipeline hooks: user-defined functions at the processing stages.
  *
@@ -207,7 +207,7 @@ export interface PluginApi {
   registerEmbeddingProvider(plugin: EmbeddingProviderPlugin): void;
   registerStorageBackend(plugin: StorageBackendPlugin): void;
   registerConverter(plugin: DocumentConverterPlugin): void;
-  /** A kind of source feeds can pull from (docs/design/25). */
+  /** A kind of source feeds can pull from (docs/design/26). */
   registerFeedConnector(connector: FeedConnector): void;
   /** A filter or transform a feed's `udf` stage names. */
   registerFeedStage(stage: FeedStagePlugin): void;

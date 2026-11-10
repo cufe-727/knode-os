@@ -702,7 +702,7 @@ function startWorkspaceServices(
   codebases.start();
 
   // feeds: sources that keep producing items, pulled on their schedules, filtered, transformed and
-  // written as documents (src/ingest/feeds, docs/design/25). Their model stages are background work:
+  // written as documents (src/ingest/feeds, docs/design/26). Their model stages are background work:
   // they share the machine's call cap and rest under the quota floor like the processing slots
   const feeds = new FeedRunner(ctx, {
     log,

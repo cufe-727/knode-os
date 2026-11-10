@@ -66,7 +66,7 @@ export default {
   embeddingProviders: [],       // EmbeddingProviderPlugin[]
   storageBackends: [],          // StorageBackendPlugin[]
   converters: [],               // DocumentConverterPlugin[]
-  feedConnectors: [],           // FeedConnector[]: kinds of source feeds pull from (docs/design/25)
+  feedConnectors: [],           // FeedConnector[]: kinds of source feeds pull from (docs/design/26)
   feedStages: [],               // FeedStagePlugin[]: filters and transforms a feed's `udf` stage names
   hooks: {},                    // { [hookName]: handler }
   async setup(api, options) {   // the same registrations, imperatively

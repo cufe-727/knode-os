@@ -3,7 +3,7 @@ import path from 'node:path';
 import { resolveSecret } from '../../config.js';
 
 /**
- * Running another program as part of a feed (docs/design/25 §6): a command
+ * Running another program as part of a feed (docs/design/26 §6): a command
  * connector (`knode-feed/1`, JSON Lines out) or a command stage
  * (`knode-feed-stage/1`, one JSON object out). The program gets one JSON
  * object on stdin and a small environment — PATH, HOME, LANG, TZ and what

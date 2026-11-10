@@ -24,7 +24,7 @@ import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 
 /**
- * Feeds (src/ingest/feeds, docs/design/25): definitions, units and periods,
+ * Feeds (src/ingest/feeds, docs/design/26): definitions, units and periods,
  * the filter and transform layers with every kind of stage, the pipeline from
  * pushed and pulled items to indexed documents, the connectors' parsers, the
  * scheduler's arithmetic, and the HTTP routes.

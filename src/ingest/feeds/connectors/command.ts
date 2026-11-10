@@ -2,7 +2,7 @@ import { runCommand, runJsonCommand } from '../command.js';
 import type { ConnectorContext, FeedConnector, FeedItem, PullResult } from '../types.js';
 
 /**
- * Two connectors that let other programs feed a workspace (docs/design/25 §6).
+ * Two connectors that let other programs feed a workspace (docs/design/26 §6).
  *
  * `push` never pulls: items arrive through POST /api/feeds/<id>/items,
  * `knode-os feeds push` or the knode_feed_push MCP tool — a crawler that
@@ -94,7 +94,7 @@ async function pullCommand(ctx: ConnectorContext): Promise<PullResult> {
 export const commandConnector: FeedConnector = {
   id: 'command',
   label: 'A program (knode-feed/1)',
-  note: 'Runs a program of yours — a scraper in any language — that writes items as JSON Lines and checkpoints its cursor (docs/design/25 §6). It runs in the data directory with a minimal environment plus the env you give it.',
+  note: 'Runs a program of yours — a scraper in any language — that writes items as JSON Lines and checkpoints its cursor (docs/design/26 §6). It runs in the data directory with a minimal environment plus the env you give it.',
   platform: 'command',
   params: [
     { name: 'command', label: 'Executable (absolute, ~/…, ./… under the data dir, or a name on PATH)', type: 'string', required: true, example: '~/Projects/rookie-trade/crawler/knode-feed.mjs' },

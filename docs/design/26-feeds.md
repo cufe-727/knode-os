@@ -1,4 +1,4 @@
-# 25 — Feeds: connectors, filter and transform layers, and a protocol to push and pull
+# 26 — Feeds: connectors, filter and transform layers, and a protocol to push and pull
 
 > Status: **phase 1 implemented** (2026‑11‑09). Source: src/ingest/feeds/ — types.ts (items, units, stages,
 > connectors), definitions.ts (playbooks/feeds/<id>.yaml), ledger.ts (ledger/feeds/<id>/), units.ts (windows,
