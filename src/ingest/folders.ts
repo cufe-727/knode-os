@@ -4,7 +4,7 @@ import path from 'node:path';
 import { KnodeConfig, LinkedFolder, saveConfig } from '../config.js';
 import { MAX_FILE_BYTES } from '../constants.js';
 import { isHiddenName, isTextFile, safePath, sanitizeRelativePath, walkFiles } from '../fs/files.js';
-import { hasSidecarSegment, RAW_DOCS, SIDECAR_ROOT } from '../fs/layout.js';
+import { CODEBASE_CARDS, hasSidecarSegment, RAW_CODEBASE, RAW_DOCS, SIDECAR_ROOT } from '../fs/layout.js';
 import { TreeWatcher, watchTree } from '../fs/watch.js';
 import { activityOf } from '../activity.js';
 import { isConvertibleFile, maxConvertibleBytes } from './convert.js';
@@ -129,10 +129,17 @@ export function linkedFolders(config: KnodeConfig): LinkedFolder[] {
 export function mirrorLinks(config: KnodeConfig): LinkedFolder[] {
   const feishu = Array.isArray(config.ingest.feishuDocs) ? config.ingest.feishuDocs : [];
   const conversations = Array.isArray(config.ingest.conversations) ? config.ingest.conversations : [];
+  const codebases = Array.isArray(config.ingest.codebases) ? config.ingest.codebases : [];
   return [
     ...linkedFolders(config),
     ...feishu.map((d) => ({ source: d.url, dest: d.dest, createdAt: d.createdAt })),
     ...conversations.map((c) => ({ source: c.source, dest: c.dest, createdAt: c.createdAt })),
+    // a repository's mirror and its card are written by `codebase update` alone (src/ingest/codebase)
+    ...codebases.flatMap((c) => [
+      { source: c.web ?? c.url, dest: `${RAW_CODEBASE}/${c.name}`, createdAt: c.createdAt },
+      { source: c.web ?? c.url, dest: `${CODEBASE_CARDS}/${c.name}.md`, createdAt: c.createdAt },
+      { source: c.web ?? c.url, dest: `${CODEBASE_CARDS}/${c.name}`, createdAt: c.createdAt },
+    ]),
   ];
 }
 
@@ -376,7 +383,11 @@ function pruneEmptyDirs(dir: string, stopAt: string): void {
  * itself). Idempotent — a second pass over an unchanged source copies nothing.
  */
 export function mirrorFolder(dataDir: string, source: string, dest: string, opts: { prune: boolean }): MirrorResult {
-  const plan = planFolderImport(source);
+  return mirrorPlan(dataDir, planFolderImport(source), dest, opts);
+}
+
+/** `mirrorFolder` over a plan the caller made — a repository's carries only what the codebase rules let through (src/ingest/codebase). */
+export function mirrorPlan(dataDir: string, plan: FolderPlan, dest: string, opts: { prune: boolean }): MirrorResult {
   const destAbs = safePath(dataDir, dest);
   fs.mkdirSync(destAbs, { recursive: true });
   const keep = new Set<string>();

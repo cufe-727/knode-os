@@ -1,6 +1,6 @@
 /** Shared domain types for knode-os. */
 
-export type DocRoot = 'docs' | 'wiki' | 'skills' | 'traces' | 'capabilities';
+export type DocRoot = 'docs' | 'wiki' | 'skills' | 'traces' | 'capabilities' | 'codebase';
 
 export interface DocumentRow {
   id: string;

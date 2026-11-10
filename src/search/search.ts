@@ -2,6 +2,7 @@ import { HeatConfig, SagSearchConfig, defaultConfig } from '../config.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { gramQuery, MATCH_INDEXES, matchIndexReady, termGrams } from '../store/grams.js';
 import { NO_FILTER, ResolvedScopeFilter, documentFilterSql } from '../store/resolver.js';
+import { RAW_CODEBASE } from '../fs/layout.js';
 import { Params, TimeInput, rowLiveAt, toIso, toDateString } from '../store/temporal.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { boostByHeat, recordChunkHits } from '../stats/heat.js';
@@ -112,7 +113,16 @@ export function docLiveAt(alias: string, p: Params, asOf?: TimeInput, filter: Re
   }
   const scoped = documentFilterSql(alias, p, filter);
   if (scoped !== 'TRUE') parts.push(scoped);
+  // a repository is thousands of chunks of code: it answers when asked for (kind
+  // `code`, or a source under raw/codebase), never by outnumbering the prose
+  if (!wantsCode(filter)) parts.push(`${alias}.root <> 'codebase'`);
   return parts.join(' AND ');
+}
+
+/** True when a search asked for code: kind `code`, or a source prefix inside raw/codebase. */
+export function wantsCode(filter: ResolvedScopeFilter): boolean {
+  if (filter.kinds?.includes('code')) return true;
+  return Boolean(filter.sources?.some((s) => s === RAW_CODEBASE || s.startsWith(`${RAW_CODEBASE}/`)));
 }
 
 /** Pure vector recall: cosine distance over pgvector. */

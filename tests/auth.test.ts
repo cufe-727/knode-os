@@ -497,6 +497,8 @@ describe('sign-in in front of serve', () => {
       'POST /api/auth/gateways',
       'POST /api/auth/users',
       'POST /api/auth/users/:username/signout',
+      // fetches a repository from the network onto this machine's disk
+      'POST /api/codebases/add',
       // calls the embeddings endpoint it is given, as the embedding test calls the keys
       'POST /api/config/embedding-endpoint/check',
       'POST /api/config/embedding-test',

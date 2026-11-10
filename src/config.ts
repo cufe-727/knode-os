@@ -538,6 +538,40 @@ export interface ConversationLink {
   createdAt: string;
 }
 
+/**
+ * A code repository kept under raw/codebase/<name>/ at one commit, with its
+ * card at raw/docs/codebase/<name>.md (src/ingest/codebase, docs/design/25).
+ * Written by `knode-os codebase add` and the codebase routes, never by hand.
+ */
+export interface CodebaseLink {
+  /** Folder name under raw/codebase. */
+  name: string;
+  /** What git fetches from: an https / ssh URL or a path on this machine. */
+  url: string;
+  /** The repository's web page, when it has one. */
+  web?: string | null;
+  /** Branch, tag or commit to track; absent = the remote's default branch. */
+  ref?: string;
+  /** Globs (gitignore-style) a file must match to be carried; empty = all. */
+  include?: string[];
+  /** Globs that leave files behind, on top of the built-in rules. */
+  exclude?: string[];
+  /** `serve` fetches the ref again once a day and indexes what changed. */
+  follow: boolean;
+  /**
+   * Copy the repository's documentation (top-level Markdown, docs/ folders)
+   * to raw/docs/codebase/<name>/, where extraction and summaries read it.
+   * Absent = true.
+   */
+  docs?: boolean;
+  /** The commit the mirror holds, and its date. */
+  commit?: string;
+  committedAt?: string;
+  /** When knode-os last looked at the remote, whatever it found. */
+  checkedAt?: string;
+  createdAt: string;
+}
+
 /** How `serve` keeps followed conversations current (docs/design/24 D8). */
 export interface ConversationSyncConfig {
   /** Minutes between looks at the followed transcripts (default 10). */
@@ -571,6 +605,13 @@ export interface IngestConfig {
   /** Agent conversations followed and kept in sync; absent or empty when none is. */
   conversations?: ConversationLink[];
   conversationSync?: ConversationSyncConfig;
+  /** Code repositories under raw/codebase; absent or empty when none is added. */
+  codebases?: CodebaseLink[];
+  /**
+   * When `serve` fetches followed repositories again: once a day at this
+   * local time ("HH:MM", default "05:00"), "off" for never.
+   */
+  codebaseCheckAt?: string;
   /** Parallel documents in flight during the index pass; embedding round-trips dominate. */
   concurrency?: number;
   /**
@@ -1246,7 +1287,7 @@ export function defaultConfig(): KnodeConfig {
       concurrency: 1,
       runsDir: '.runs',
       keepRuns: 20,
-      readDirs: ['raw/docs', 'wiki', '.sidecar'],
+      readDirs: ['raw/docs', 'raw/codebase', 'wiki', '.sidecar'],
       auto: { enabled: false, dailyJobs: 3 },
       pipeline: 'native',
       profile: 'default',

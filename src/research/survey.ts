@@ -81,6 +81,8 @@ export function readGuideStamp(text: string): GuideStamp | null {
 export function folderOf(docPath: string): string {
   const parts = docPath.split('/');
   if (parts[0] === 'raw' && parts[1] === 'docs') return parts.length > 3 ? parts.slice(0, 3).join('/') : 'raw/docs';
+  // one row per repository
+  if (parts[0] === 'raw' && parts[1] === 'codebase' && parts.length > 3) return parts.slice(0, 3).join('/');
   if (parts.length > 2) return parts.slice(0, 2).join('/');
   return parts.length > 1 ? parts[0] : '.';
 }
@@ -89,6 +91,7 @@ export function folderOf(docPath: string): string {
 const FOLDER_SQL = `CASE
     WHEN path LIKE 'raw/docs/%/%' THEN regexp_replace(path, '^(raw/docs/[^/]+)/.*$', '\\1')
     WHEN path LIKE 'raw/docs/%' THEN 'raw/docs'
+    WHEN path LIKE 'raw/codebase/%/%' THEN regexp_replace(path, '^(raw/codebase/[^/]+)/.*$', '\\1')
     WHEN path LIKE '%/%/%' THEN regexp_replace(path, '^([^/]+/[^/]+)/.*$', '\\1')
     WHEN path LIKE '%/%' THEN split_part(path, '/', 1)
     ELSE '.'

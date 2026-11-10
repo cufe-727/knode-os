@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { hasSidecarSegment, listSidecarKeys, PACKS_DIR, RAW_DOCS, RAW_SKILLS, SIDECAR_ROOT_SEGMENT, sidecarRelFor } from './layout.js';
+import { hasSidecarSegment, listSidecarKeys, PACKS_DIR, RAW_CODEBASE, RAW_DOCS, RAW_SKILLS, SIDECAR_ROOT_SEGMENT, sidecarRelFor } from './layout.js';
+import { isCodebaseFile } from '../ingest/codebase/files.js';
 
 /** Path-safe file operations confined to the data directory. */
 
@@ -250,7 +251,7 @@ export function assertSourcePath(rel: string): void {
   if (isRootWritableFile(rel)) throw new Error(`${rel} is the knowledge-base guide, not a source`);
 }
 
-const TEXT_EXT = new Set(['.md', '.markdown', '.txt', '.text', '.json', '.jsonl', '.yaml', '.yml', '.csv', '.tsv', '.html', '.htm', '.xml', '.rst', '.org']);
+const TEXT_EXT = new Set(['.md', '.markdown', '.mdx', '.txt', '.text', '.json', '.jsonl', '.yaml', '.yml', '.csv', '.tsv', '.html', '.htm', '.xml', '.rst', '.org']);
 
 export function isTextFile(file: string): boolean {
   return TEXT_EXT.has(path.extname(file).toLowerCase());
@@ -283,7 +284,8 @@ export interface GrepMatch {
   text: string;
 }
 
-const GREP_ROOTS = ['wiki', RAW_DOCS, RAW_SKILLS, PACKS_DIR];
+// repositories last: a pattern that matches prose and code shows the prose first
+const GREP_ROOTS = ['wiki', RAW_DOCS, RAW_SKILLS, PACKS_DIR, RAW_CODEBASE];
 const MAX_GREP_FILE_BYTES = 2 * 1024 * 1024;
 
 /**
@@ -312,7 +314,7 @@ export function grepFiles(
     const single = fs.statSync(rootAbs).isFile();
     const targets: { read: string; report: string }[] = [];
     for (const file of single ? [root] : walkFiles(dataDir, root)) {
-      if (isTextFile(file)) targets.push({ read: file, report: file });
+      if (isTextFile(file) || isCodebaseFile(file)) targets.push({ read: file, report: file });
     }
     for (const key of single ? [root] : listSidecarKeys(dataDir, root)) {
       const derived = `${sidecarRelFor(key)}/content.md`;

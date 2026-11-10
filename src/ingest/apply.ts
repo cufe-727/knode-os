@@ -24,7 +24,8 @@ import { restoreUsageFromSidecar } from '../stats/heat.js';
 import { Store } from '../store/db.js';
 import { DocRoot } from '../types.js';
 import { hasProse, hasRegions, stripRegions } from '../wiki/regions.js';
-import { chunkText } from './chunker.js';
+import { chunkCode, chunkText } from './chunker.js';
+import { splitCodebaseKey } from './codebase/files.js';
 import { docDateOf } from './docdate.js';
 import { detectLanguage } from '../lang/detect.js';
 import { estimateTokens } from '../llm/tokens.js';
@@ -99,6 +100,12 @@ export interface DocOutcome {
   sha: string | null;
 }
 
+/** A repository file's title: `<repository>/<path inside it>`, which is what a reader searches and recognizes. */
+function codebaseTitle(file: string): string {
+  const key = splitCodebaseKey(file);
+  return key ? `${key.name}/${key.path}` : path.basename(file);
+}
+
 export function documentIdFor(file: string): string {
   return crypto.createHash('sha256').update(file).digest('hex').slice(0, 24);
 }
@@ -116,6 +123,9 @@ interface Classification {
 }
 
 async function classify(store: Store, file: string, root: DocRoot, parsed: ParsedMarkdown): Promise<Classification> {
+  // a repository's file is searchable text, never graph evidence: `[[x]]` in a
+  // shell test or a Python index is not a link, and the card speaks for the repository
+  if (root === 'codebase') return { kind: 'source', graph: false, selfEntity: false, humanBody: parsed.body };
   if (root !== 'wiki') return { kind: 'source', graph: true, selfEntity: undefined, humanBody: parsed.body };
   if (isReservedWikiFile(file)) return { kind: 'source', graph: false, selfEntity: false, humanBody: parsed.body };
   const [pageRow] = await store.query<{ status: string }>(`SELECT status FROM pages WHERE path = $1 AND tx_to IS NULL`, [file]);
@@ -172,13 +182,15 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   }
 
   progress(`indexing ${file}`);
-  const parsed = parseFrontmatter(raw);
-  const title = titleFromMarkdown(file, parsed);
+  // source code has no frontmatter: a YAML file or a README's own header is its text, not knode metadata
+  const code = root === 'codebase';
+  const parsed: ParsedMarkdown = code ? { frontmatter: {}, body: raw } : parseFrontmatter(raw);
+  const title = code ? codebaseTitle(file) : titleFromMarkdown(file, parsed);
   const cls = await classify(store, file, root, parsed);
   const docDate = docDateOf(file, parsed.frontmatter);
   // what a reader would read it as: the Translate stage reads this (docs/design/17);
-  // '' is "read, and in no language", which no backfill needs to read again
-  const language = detectLanguage(raw, parsed.frontmatter) ?? '';
+  // '' is "read, and in no language", which no backfill needs to read again — and code is never translated
+  const language = code ? '' : detectLanguage(raw, parsed.frontmatter) ?? '';
 
   /* ── pure preparation: chunking, embeddings (network, unless deferred), tier-0 plans ── */
   // plugin hooks (docs/design/11) may reshape the chunks and the tier-0 terms
@@ -188,7 +200,9 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const mindMap = isMindMapFrontmatter(parsed.frontmatter) ? parseMindMap(parsed.body) : null;
   let pieces = mindMap
     ? mindMapChunks(mindMap, config.ingest.chunkSize).map((content) => ({ content, tokenCount: estimateTokens(content) }))
-    : await chunkText(file, parsed.body, config.ingest, { markdown: source.derived || undefined });
+    : code
+      ? await chunkCode(file, parsed.body, config.ingest)
+      : await chunkText(file, parsed.body, config.ingest, { markdown: source.derived || undefined });
   if (registry.hasHandlers('chunk')) {
     pieces = (await registry.filter('chunk', pieces, {
       path: file, root, dataDir: store.dataDir, text: parsed.body,

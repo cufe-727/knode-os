@@ -72,6 +72,8 @@ const RULES: Rule[] = [
   { prefix: '/api/conversations/catalog', group: 'settings' },
   { prefix: '/api/conversations/preview', group: 'settings' },
   { prefix: '/api/conversations/import', group: 'settings' },
+  // and fetching a repository from the network onto this machine's disk
+  { prefix: '/api/codebases/add', group: 'settings' },
   // defining a feed can make the server run a program or a model (src/ingest/feeds)
   { prefix: '/api/feeds/preview', group: 'settings' },
   { prefix: '/api/feeds/check', group: 'settings' },
@@ -97,6 +99,7 @@ const RULES: Rule[] = [
   { prefix: '/api/folders', group: 'files' },
   { prefix: '/api/feishu', group: 'files' },
   { prefix: '/api/conversations', group: 'files' },
+  { prefix: '/api/codebases', group: 'files' },
   { prefix: '/api/link/', group: 'files' },
   { prefix: '/api/vfs', group: 'files' },
   { prefix: '/api/okf/', group: 'files' },
