@@ -2044,7 +2044,7 @@ export function createApp(
 
   // Sources that keep producing items — chats, mailboxes, accounts, searches, repositories —
   // pulled on a schedule or pushed in, filtered and transformed by the feed's stages and written
-  // under raw/docs (src/ingest/feeds, docs/design/25). Defining a feed can make the server run a
+  // under raw/docs (src/ingest/feeds, docs/design/26). Defining a feed can make the server run a
   // program or a model, so writing one, previewing one and checking its source are an
   // administrator's; running, pushing and rendering again are anyone's who may ingest.
 

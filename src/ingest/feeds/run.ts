@@ -22,7 +22,7 @@ import type { ConnectorContext, FeedAttachment, FeedConnector, FeedDefinition, F
 import { buildUnits, Period } from './units.js';
 
 /**
- * One run of a feed (docs/design/25 §3):
+ * One run of a feed (docs/design/26 §3):
  *
  *   pull (connector, from its cursor) + pushed items
  *     → normalize → keep in the ledger (new items and new revisions only)

@@ -10,7 +10,7 @@ import type { FeedDefinition, FeedUnit, FilterVerdict, RuleCondition, StageSpec,
 import { feedTimezone, zonedDate, zonedTime } from './units.js';
 
 /**
- * The filter and transform layers (docs/design/25 §4). Each is an ordered
+ * The filter and transform layers (docs/design/26 §4). Each is an ordered
  * list of stages; a stage is built in (rules, dedupe, template, fetch,
  * redact), a function a plugin registered (udf), a program speaking
  * knode-feed-stage/1 (command), or a model or agent with a prompt (llm,

@@ -214,7 +214,7 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: Kno
     'knode_feeds',
     {
       title: 'List feeds',
-      description: 'The feeds of this knowledge base (docs/design/25): sources that keep producing items — group chats, mailboxes, accounts, arXiv searches, repositories, RSS — with their connector, schedule, the folder they write in, and how their last run went. Feeds of connector "push" take items through knode_feed_push.',
+      description: 'The feeds of this knowledge base (docs/design/26): sources that keep producing items — group chats, mailboxes, accounts, arXiv searches, repositories, RSS — with their connector, schedule, the folder they write in, and how their last run went. Feeds of connector "push" take items through knode_feed_push.',
       inputSchema: {},
     },
     async () => json(describeFeeds(ctx.dataDir).map((f) => ({ id: f.id, title: f.title, description: f.description, connector: f.connector, enabled: f.enabled, dest: f.dest, items: f.items, lastRunAt: f.state.lastRunAt ?? null, lastError: f.state.lastError ?? null }))),

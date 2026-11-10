@@ -245,7 +245,7 @@ regeneration and is itself a source.
   raw/docs/conversations/<project> as exchanges (prompt, replies, answers, tools used) without thinking or tool
   output, secrets redacted; imported once or followed, re-rendered once quiet; stable rendering, so a growing
   conversation pays only for its new exchanges.
-- [25 — Feeds: connectors, filter and transform layers, and a protocol to push and pull](25-feeds.md)
+- [26 — Feeds: connectors, filter and transform layers, and a protocol to push and pull](26-feeds.md)
   — one module for every source that keeps producing (Feishu groups, IMAP mail, X, arXiv, GitHub, RSS/RSSHub,
   OpenCLI sites, web pages, programs, pushes): items kept with every stage's decision in a ledger, judged as units
   (items, threads, conversation windows) by rules, plugins, programs, models or agents, rendered as stable dated

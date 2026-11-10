@@ -8,7 +8,7 @@ import { FeedRunOptions, FeedRunResult, pushToFeed, runFeed } from './run.js';
 import type { FeedDefinition } from './types.js';
 
 /**
- * What `serve` runs per workspace for its feeds (docs/design/25 §7): a look
+ * What `serve` runs per workspace for its feeds (docs/design/26 §7): a look
  * every minute at which feeds are due — by `schedule.every`, by
  * `schedule.at` (and at startup when one of those times passed while knode-os
  * was down), or soon again when a connector said more is waiting — and one

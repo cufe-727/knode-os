@@ -365,7 +365,7 @@ export function saveFeed(dataDir: string, id: string, input: Record<string, unkn
   const file = feedFile(dataDir, id) ?? path.join(dataDir, FEEDS_DIR, `${id}.yaml`);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const yaml = writeMatter('', feedData(feed)).replace(/^---\n/, '').replace(/---\n*$/, '');
-  fs.writeFileSync(file, `# Feed "${feed.title}" — docs/design/25. Secrets may be written as env:VAR.\n${yaml}`, { mode: 0o600 });
+  fs.writeFileSync(file, `# Feed "${feed.title}" — docs/design/26. Secrets may be written as env:VAR.\n${yaml}`, { mode: 0o600 });
   return { ...feed, path: path.relative(dataDir, file).split(path.sep).join('/') };
 }
 

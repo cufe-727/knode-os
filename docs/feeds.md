@@ -4,7 +4,7 @@ A **feed** follows something that keeps producing items — a Feishu group, a ma
 GitHub repositories, an RSS feed, web pages, or a program of yours — and writes what is worth keeping into the
 workspace as Markdown documents, which knode-os then indexes like anything else. Each feed has a **filter** layer
 (is this item worth keeping?) and a **transform** layer (what should it look like?), and both can be rules, your
-own functions or programs, models, or agents. Design and rationale: [docs/design/25](design/25-feeds.md).
+own functions or programs, models, or agents. Design and rationale: [docs/design/26](design/26-feeds.md).
 
 ## Quick start
 

@@ -1,7 +1,7 @@
 import type { KnodeConfig } from '../../config.js';
 
 /**
- * Feeds — sources that keep producing items (docs/design/25): a group chat, a
+ * Feeds — sources that keep producing items (docs/design/26): a group chat, a
  * mailbox, an account's posts, a search on arXiv, a repository's releases, a
  * web page that changes. A feed pulls new items through a **connector**,
  * decides which belong in the workspace (the **filter** layer), turns them
@@ -159,7 +159,7 @@ export interface UnitDecision {
 
 /* ------------------------------ definitions ------------------------------ */
 
-/** A filter or transform stage (docs/design/25 §4). */
+/** A filter or transform stage (docs/design/26 §4). */
 export interface StageSpec {
   kind: 'rules' | 'dedupe' | 'udf' | 'command' | 'llm' | 'agent' | 'template' | 'redact' | 'fetch';
   /** Shown in decisions and logs; default derived from the kind. */
@@ -180,7 +180,7 @@ export interface StageSpec {
   name?: string;
   options?: Record<string, unknown>;
 
-  /* command: an executable speaking knode-feed-stage/1 (docs/design/25 §6) */
+  /* command: an executable speaking knode-feed-stage/1 (docs/design/26 §6) */
   command?: string;
   args?: string[];
   env?: Record<string, string>;

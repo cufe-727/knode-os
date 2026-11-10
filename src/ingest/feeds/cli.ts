@@ -10,7 +10,7 @@ import { describeFeeds, FeedStatus } from './runner.js';
 import type { FeedDefinition } from './types.js';
 
 /**
- * `knode-os feeds …` (docs/design/25 §7). Each command talks to the server a
+ * `knode-os feeds …` (docs/design/26 §7). Each command talks to the server a
  * signed-in CLI points at, or works on a data directory here (--data) — the
  * same split as `conversations`.
  */
@@ -86,7 +86,7 @@ function printRun(r: FeedRunResult, preview = false): void {
 }
 
 export function registerFeedCommands(program: Command, deps: Deps): void {
-  const feeds = program.command('feeds').description('sources that keep producing items — chats, mail, accounts, arXiv, GitHub, RSS — pulled, filtered, transformed and written as documents (docs/design/25)');
+  const feeds = program.command('feeds').description('sources that keep producing items — chats, mail, accounts, arXiv, GitHub, RSS — pulled, filtered, transformed and written as documents (docs/design/26)');
 
   feeds
     .command('list')

@@ -99,7 +99,7 @@ export class PluginRegistry {
     return [...this.byExtension.keys()].sort();
   }
 
-  /** A kind of source a feed's `connector` names (docs/design/25). */
+  /** A kind of source a feed's `connector` names (docs/design/26). */
   feedConnector(id: string): FeedConnector | undefined {
     return this.connectors.get(id);
   }
