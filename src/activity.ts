@@ -11,7 +11,7 @@
  * reads it to decide what runs.
  */
 
-export type ActivityKind = 'sync' | 'ingest' | 'upload' | 'folder' | 'feishu' | 'conversations' | 'traces' | 'datasources' | 'dream' | 'tier2';
+export type ActivityKind = 'sync' | 'ingest' | 'upload' | 'folder' | 'feishu' | 'conversations' | 'feeds' | 'traces' | 'datasources' | 'dream' | 'tier2';
 
 export interface ActivityItem {
   id: string;

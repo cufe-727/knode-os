@@ -1554,7 +1554,7 @@ const SCHEDULE_WORDS = {
   feishu: ['Feishu documents', 'asks Feishu which linked documents and wiki pages were edited, and fetches those'],
   conversations: ['Agent conversations', 'adds new exchanges of followed Claude Code and Codex conversations once they go quiet'],
 };
-const ACTIVITY_ICONS = { sync: '⟳', ingest: '⛁', upload: '⤒', folder: '⇄', feishu: '⇅', conversations: '❝', traces: '⌁', datasources: '◫', dream: '☾', tier2: '⚙' };
+const ACTIVITY_ICONS = { sync: '⟳', ingest: '⛁', upload: '⤒', folder: '⇄', feishu: '⇅', conversations: '❝', feeds: '⇶', traces: '⌁', datasources: '◫', dream: '☾', tier2: '⚙' };
 
 /** "45 s", "3 min 10 s", "2 h 5 min". */
 function spanText(seconds) {
@@ -1819,10 +1819,31 @@ function paintTasksSchedule(t) {
       <div><b class="mono">${esc(f.dest)}</b> <span class="hint">← ${esc(homeShort(f.source))}</span>
       <div class="hint">${f.lastSyncAt ? `synced ${agoText(f.lastSyncAt)}` : 'not synced since the service started'}${f.lastChange ? ` · last change ${f.lastChange.copied} copied, ${f.lastChange.removed} removed` : ''}</div>
       ${f.lastError ? `<div class="hint bad">${esc(f.lastError)}</div>` : ''}</div></div>`);
+  // feeds: sources that keep producing items (docs/design/25); whoever may ingest may run one now
+  const feeds = (t.feeds ?? []).map((f) => `<div class="schedule-row${f.enabled ? '' : ' off'}"><span class="activity-icon${f.running ? ' spin' : ''}">${f.running ? '⟳' : '⇶'}</span>
+      <div><b>${esc(f.title)}</b> <span class="hint">${esc(f.connector)} → <span class="mono">${esc(f.dest)}</span></span>
+      <div class="hint">${f.running ? 'running now · ' : ''}${f.enabled ? esc(f.schedule) : 'off'}${f.nextRunAt && f.enabled && !f.running ? ` · next ${untilText(f.nextRunAt)}` : ''}${f.lastRunAt ? ` · last ${agoText(f.lastRunAt)}` : ''} · ${f.items} item${f.items === 1 ? '' : 's'}</div>
+      ${f.problem ? `<div class="hint bad">${esc(f.problem)}</div>` : f.lastError ? `<div class="hint bad">${esc(f.lastError)}</div>` : ''}</div>
+      ${f.enabled && !f.problem && !f.pushOnly && mayUse('ingest') ? `<button type="button" class="row-action" data-feed-run="${esc(f.id)}" ${f.running ? 'disabled' : ''} title="Pull this feed now, decide what is new and write it">Run now</button>` : ''}</div>`);
   const dream = t.dream.pendingSuggestions ? `<p class="hint">Dream has <a href="#" data-goto="dream">${t.dream.pendingSuggestions} suggestion${t.dream.pendingSuggestions === 1 ? '' : 's'}</a> waiting for review.</p>` : '';
-  $('#tasks-schedule').innerHTML = `${rows.join('')}${folders.length ? `<p class="tasks-sub">Linked folders</p>${folders.join('')}` : ''}${dream}`;
+  $('#tasks-schedule').innerHTML = `${rows.join('')}${folders.length ? `<p class="tasks-sub">Linked folders</p>${folders.join('')}` : ''}${feeds.length ? `<p class="tasks-sub">Feeds</p>${feeds.join('')}` : ''}${dream}`;
+  for (const b of $('#tasks-schedule').querySelectorAll('[data-feed-run]')) b.addEventListener('click', (ev) => runFeedNow(ev.currentTarget));
   $('#tasks-schedule').querySelector('[data-feishu-check]')?.addEventListener('click', (ev) => checkFeishuNow(ev.currentTarget));
   $('#tasks-schedule').querySelector('[data-conversations-check]')?.addEventListener('click', (ev) => checkConversationsNow(ev.currentTarget));
+}
+
+/** Tasks → Feeds → Run now: one feed, in the background; the activity list shows how it went. */
+async function runFeedNow(button) {
+  const id = button?.dataset.feedRun;
+  if (!id) return;
+  button.disabled = true;
+  try {
+    const res = await api(`/api/feeds/${encodeURIComponent(id)}/run`, { method: 'POST', body: JSON.stringify({}) });
+    toast(res.started === false ? `${id} is running already` : `pulling ${id} — it shows under Tasks → Background`, 5000);
+  } catch (e) {
+    toast(`run failed: ${e.message}`, 6000);
+  }
+  loadTasks();
 }
 
 /** Tasks → Feishu documents → Check now: every linked document and tree, in the background. */

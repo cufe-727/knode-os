@@ -1,5 +1,6 @@
 import { embeddingProviderLabel } from '../config.js';
 import { epubConverter } from '../ingest/converters/epub.js';
+import { builtinFeedConnectors } from '../ingest/feeds/connectors/index.js';
 import { htmlConverter } from '../ingest/converters/html.js';
 import { imageConverter } from '../ingest/converters/image.js';
 import { pdfConverter } from '../ingest/converters/pdf.js';
@@ -23,7 +24,7 @@ export const BUILTIN_PLUGIN = 'builtin';
 export function registerBuiltins(registry: PluginRegistry): void {
   registry.installSync({
     name: BUILTIN_PLUGIN,
-    description: 'The providers, storage backends and converters knode-os ships with.',
+    description: 'The providers, storage backends, converters and feed connectors knode-os ships with.',
     llmProviders: [openAiProvider(), ...cliProviders(), commandProvider()],
     embeddingProviders: [
       {
@@ -68,5 +69,6 @@ export function registerBuiltins(registry: PluginRegistry): void {
       },
     ],
     converters: [pdfConverter, imageConverter, htmlConverter, epubConverter],
+    feedConnectors: builtinFeedConnectors(),
   }, BUILTIN_PLUGIN);
 }

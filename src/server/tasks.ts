@@ -5,6 +5,7 @@ import { pendingEmbeddings } from '../ingest/embed-backfill.js';
 import { conversationCheckMinutes, conversationLinks } from '../ingest/conversations/follow.js';
 import { feishuCheckTime, feishuLinks, lastFeishuCheck } from '../ingest/feishu/docs.js';
 import { linkedFolders } from '../ingest/folders.js';
+import { describeFeeds } from '../ingest/feeds/runner.js';
 import { FailureKind } from '../labeling/failures.js';
 import { activePause } from '../research/failure.js';
 import { LIVE_STATUSES } from '../research/jobs.js';
@@ -116,6 +117,22 @@ export interface LinkedFolderRuntime {
   lastChange: { copied: number; removed: number; at: string } | null;
 }
 
+export interface FeedRow {
+  id: string;
+  title: string;
+  connector: string;
+  pushOnly: boolean;
+  enabled: boolean;
+  schedule: string;
+  dest: string;
+  items: number;
+  running: boolean;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastError: string | null;
+  problem: string | null;
+}
+
 export interface TasksSnapshot {
   at: string;
   /** False outside `serve`: no processing switch, no broker, no slots. */
@@ -128,6 +145,8 @@ export interface TasksSnapshot {
   activity: { running: ActivityItem[]; recent: ActivityItem[] };
   scheduled: ScheduledTask[];
   folders: LinkedFolderRuntime[];
+  /** The workspace's feeds (src/ingest/feeds): when each runs next and how its last run went. */
+  feeds: FeedRow[];
   dream: { pendingSuggestions: number; lastSuggestionAt: string | null; lookbackDays: number };
   /** Documents that failed to convert or index, newest first (a few). */
   documentErrors: { path: string; error: string | null }[];
@@ -360,6 +379,22 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
     };
   });
 
+  const feeds: FeedRow[] = (services?.feeds ? services.feeds.status() : describeFeeds(ctx.dataDir)).map((f) => ({
+    id: f.id,
+    title: f.title,
+    connector: f.connectorLabel,
+    pushOnly: f.pushOnly,
+    enabled: f.enabled,
+    schedule: f.pushOnly ? 'takes pushed items' : f.schedule.every ? `every ${f.schedule.every}` : f.schedule.at?.length ? `daily at ${f.schedule.at.join(', ')}` : 'by hand or push',
+    dest: f.dest,
+    items: f.items,
+    running: f.running,
+    nextRunAt: services?.feeds ? f.nextRunAt : null,
+    lastRunAt: f.state.lastRunAt ?? null,
+    lastError: f.state.lastError ?? null,
+    problem: f.problem,
+  }));
+
   return {
     at: new Date(now).toISOString(),
     serving: Boolean(services?.work),
@@ -371,6 +406,7 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
     activity,
     scheduled,
     folders,
+    feeds,
     dream: { pendingSuggestions: suggestionRow[0]?.n ?? 0, lastSuggestionAt: iso(suggestionRow[0]?.last ?? null), lookbackDays: config.dream.lookbackDays },
     documentErrors,
   };

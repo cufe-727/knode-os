@@ -3,6 +3,7 @@ import type { ExtractRequest, ExtractResult } from '../graph/llm-extract.js';
 import type { ChunkPiece } from '../ingest/chunker.js';
 import type { ConversionResult, VisionModel } from '../ingest/converters/shared.js';
 import type { EmbeddingProvider } from '../ingest/embeddings.js';
+import type { FeedConnector, FeedStagePlugin } from '../ingest/feeds/types.js';
 import type { ChatMessage, CompletionOptions } from '../llm/client.js';
 import type { ModelListResult } from '../llm/models.js';
 import type { Backend } from '../store/backend.js';
@@ -16,6 +17,8 @@ import type { DocRoot } from '../types.js';
  *   - embedding providers: the same for the Index stage;
  *   - storage backends: what `database.kind` may name beyond pglite / postgres;
  *   - document converters: file types the Convert stage turns into Markdown;
+ *   - feed connectors: kinds of source a feed pulls from (docs/design/25);
+ *   - feed stages: user-defined filters and transforms a feed's stages name;
  *   - pipeline hooks: user-defined functions at the processing stages.
  *
  * Every built-in is registered through this same API (src/plugins/builtin.ts),
@@ -204,6 +207,10 @@ export interface PluginApi {
   registerEmbeddingProvider(plugin: EmbeddingProviderPlugin): void;
   registerStorageBackend(plugin: StorageBackendPlugin): void;
   registerConverter(plugin: DocumentConverterPlugin): void;
+  /** A kind of source feeds can pull from (docs/design/25). */
+  registerFeedConnector(connector: FeedConnector): void;
+  /** A filter or transform a feed's `udf` stage names. */
+  registerFeedStage(stage: FeedStagePlugin): void;
   on<K extends HookName>(hook: K, handler: PipelineHooks[K]): void;
   /** A line in the service log, prefixed with the plugin's name. */
   log(message: string): void;
@@ -222,6 +229,8 @@ export interface KnodePlugin {
   embeddingProviders?: EmbeddingProviderPlugin[];
   storageBackends?: StorageBackendPlugin[];
   converters?: DocumentConverterPlugin[];
+  feedConnectors?: FeedConnector[];
+  feedStages?: FeedStagePlugin[];
   hooks?: Partial<PipelineHooks>;
   setup?(api: PluginApi, options: Record<string, unknown>): void | Promise<void>;
 }
@@ -251,5 +260,7 @@ export interface PluginSummary {
   embeddingProviders: string[];
   storageBackends: string[];
   converters: string[];
+  feedConnectors: string[];
+  feedStages: string[];
   hooks: HookName[];
 }

@@ -20,6 +20,7 @@ import { LabelingScheduler } from '../labeling/scheduler.js';
 import { EmbeddingBackfill } from '../ingest/embed-backfill.js';
 import { LinkedFolders, linkOwning, mirrorLinks, syncedByFolders } from '../ingest/folders.js';
 import { AgentConversations } from '../ingest/conversations/follow.js';
+import { FeedRunner } from '../ingest/feeds/runner.js';
 import { FeishuDocs } from '../ingest/feishu/docs.js';
 import { isOwnWrite } from '../ingest/own-writes.js';
 import { sync, SyncContext, syncsSettled, SyncStats } from '../ingest/sync.js';
@@ -157,7 +158,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
         throw err;
       }
       services.set(workspaceCtx.dataDir, {
-        mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders, feishu: started.feishu, conversations: started.conversations,
+        mcp, kickResearch: started.kickResearch, track: started.track, folders: started.folders, feishu: started.feishu, conversations: started.conversations, feeds: started.feeds,
         labeling: started.labeling, work: started.work, localWorkers: started.localWorkers, processing: started.processing, translations: started.translations,
         calls: started.calls, embeddings: started.embeddings, embedWork: started.embedWork, embedSlots: started.embedSlots,
       });
@@ -513,6 +514,7 @@ interface StartedServices {
   folders: LinkedFolders;
   feishu: FeishuDocs;
   conversations: AgentConversations;
+  feeds: FeedRunner;
   labeling: LabelingScheduler;
   work: WorkBroker;
   localWorkers: LocalLabelingWorkers;
@@ -693,6 +695,17 @@ function startWorkspaceServices(
   const conversations = new AgentConversations(ctx, { log, track });
   conversations.start();
 
+  // feeds: sources that keep producing items, pulled on their schedules, filtered, transformed and
+  // written as documents (src/ingest/feeds, docs/design/25). Their model stages are background work:
+  // they share the machine's call cap and rest under the quota floor like the processing slots
+  const feeds = new FeedRunner(ctx, {
+    log,
+    track,
+    limiter: machine.limiter,
+    hold: async (llm) => (await floor({ provider: llm.provider, cliPath: llm.cliPath }))?.reason ?? null,
+  });
+  feeds.start();
+
   // nightly dream + the tier-2 pass; a night whose plan is under the quota floor skips them
   const dreamTimer = startDreamScheduler(ctx, log, { hold: () => routesHold(ctx.config, ['judgeLlm'], floor) });
   const nightly = nightlySchedule(ctx.config);
@@ -721,6 +734,7 @@ function startWorkspaceServices(
       await folders.stop();
       await feishu.stop();
       await conversations.stop();
+      await feeds.stop();
       await Promise.allSettled([...activeJobs]);
       await embeddings.stop();
       ctx.embeddings = undefined;
@@ -731,6 +745,7 @@ function startWorkspaceServices(
     folders,
     feishu,
     conversations,
+    feeds,
     labeling,
     work,
     localWorkers,
