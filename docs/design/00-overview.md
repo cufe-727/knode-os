@@ -245,6 +245,11 @@ regeneration and is itself a source.
   raw/docs/conversations/<project> as exchanges (prompt, replies, answers, tools used) without thinking or tool
   output, secrets redacted; imported once or followed, re-rendered once quiet; stable rendering, so a growing
   conversation pays only for its new exchanges.
+- [25 — Feeds: connectors, filter and transform layers, and a protocol to push and pull](25-feeds.md)
+  — one module for every source that keeps producing (Feishu groups, IMAP mail, X, arXiv, GitHub, RSS/RSSHub,
+  OpenCLI sites, web pages, programs, pushes): items kept with every stage's decision in a ledger, judged as units
+  (items, threads, conversation windows) by rules, plugins, programs, models or agents, rendered as stable dated
+  documents; knode-feed/1 for programs as connectors, a push API and MCP tool, scheduled under `serve`.
 - [22 — Research that waits out a usage limit, resumes where it stopped, and is put away](22-research-pauses-and-housekeeping.md)
   — a session refused for a spent quota, a rate limit or a lost login pauses its job (and the account's queue)
   until the reset the agent named, its attempts untouched; a restart requeues instead of failing; collect keeps

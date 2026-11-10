@@ -476,6 +476,8 @@ describe('sign-in in front of serve', () => {
       'DELETE /api/agents/:name',
       'DELETE /api/auth/gateways/:id',
       'DELETE /api/auth/users/:username',
+      // a feed's definition can make the server run a program or a model (src/ingest/feeds)
+      'DELETE /api/feeds/:id',
       'DELETE /api/playbooks/file',
       'DELETE /api/research/profiles/:name',
       'DELETE /api/research/sources/:id',
@@ -503,6 +505,8 @@ describe('sign-in in front of serve', () => {
       'POST /api/config/models',
       'POST /api/config/test',
       'POST /api/conversations/import',
+      'POST /api/feeds/check',
+      'POST /api/feeds/preview',
       'POST /api/feishu/auth/login',
       // reading Feishu as the machine's Feishu user
       'POST /api/feishu/import',
@@ -514,6 +518,7 @@ describe('sign-in in front of serve', () => {
       'PUT /api/agents/:name',
       'PUT /api/chat/protocol',
       'PUT /api/config',
+      'PUT /api/feeds/:id',
       'PUT /api/playbooks/file',
       'PUT /api/research/profiles/:name',
       'PUT /api/research/sources/:id',

@@ -20,6 +20,7 @@ import { benchBuild } from './bench/build.js';
 import { benchExtractCompare } from './bench/extract-compare.js';
 import { benchQaGen, benchRetrieval, RetrievalMode } from './bench/qa.js';
 import { registerEvalCommands } from './eval/cli.js';
+import { registerFeedCommands } from './ingest/feeds/cli.js';
 import { runSourceQuery } from './datasource/execute.js';
 import { entityDetail, graphInsights, graphOverview, graphSearch } from './graph/query.js';
 import { applyClaimMerge, listClaimMerges, unmergeClaim } from './graph/claim-merge.js';
@@ -134,6 +135,7 @@ const hereOnly = (opts: Record<string, unknown>, flags: Record<string, string>) 
 };
 
 registerClientCommands(program, dataDir);
+registerFeedCommands(program, { dataDir, server });
 registerFileCommands(program, { server, dataDir });
 noteLocalCommands(program, dataDir);
 

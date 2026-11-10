@@ -2,7 +2,9 @@
 
 knode-os can be extended without forking it: a plugin module adds **LLM
 providers**, **embedding providers**, **storage backends**, **document
-converters** and **hooks** at the document-processing stages. The built-ins
+converters**, **feed connectors** and **feed stages** (user-defined filters and
+transforms, [docs/feeds.md](feeds.md)) and **hooks** at the document-processing
+stages. The built-ins
 are registered through the same API, so anything they do a plugin can do too.
 Design and rationale: [docs/design/11](design/11-plugins-and-udfs.md).
 
@@ -64,6 +66,8 @@ export default {
   embeddingProviders: [],       // EmbeddingProviderPlugin[]
   storageBackends: [],          // StorageBackendPlugin[]
   converters: [],               // DocumentConverterPlugin[]
+  feedConnectors: [],           // FeedConnector[]: kinds of source feeds pull from (docs/design/25)
+  feedStages: [],               // FeedStagePlugin[]: filters and transforms a feed's `udf` stage names
   hooks: {},                    // { [hookName]: handler }
   async setup(api, options) {   // the same registrations, imperatively
     api.registerLlmProvider(...); api.on('chunk', ...); api.log('ready');

@@ -79,6 +79,10 @@ import {
 import { addCodebase, assertFetchable, checkRef, CodebaseConflict, Codebases, describeCodebases, editCodebase, removeCodebase, updateCodebases } from '../ingest/codebase/codebases.js';
 import { parseRepoSpec } from '../ingest/codebase/git.js';
 import { listConversations as listAgentConversations } from '../ingest/conversations/catalog.js';
+import { deleteFeed, feedConnectorCatalog, feedItems, checkFeed } from '../ingest/feeds/manage.js';
+import { feedProblem, isValidFeedId, loadFeed, normalizeFeed, redactFeed, saveFeed } from '../ingest/feeds/definitions.js';
+import { previewFeed, pushToFeed, runFeed } from '../ingest/feeds/run.js';
+import { describeFeeds, FeedRunner } from '../ingest/feeds/runner.js';
 import {
   AgentConversations,
   conversationCopies,
@@ -293,6 +297,8 @@ export interface WorkspaceServices {
   conversations?: AgentConversations | null;
   /** This workspace's code repositories: one fetch at a time, followed ones daily; absent outside `serve`. */
   codebases?: Codebases | null;
+  /** This workspace's feeds (src/ingest/feeds): scheduled runs, Run now and pushes; absent outside `serve`. */
+  feeds?: FeedRunner | null;
   /** Extraction as leased work (src/labeling): local slots and remote workers take segments from it. */
   labeling?: LabelingScheduler | null;
   /** Every kind of leased work — segments and summaries — behind one lease protocol (src/work/broker.ts). */
@@ -2030,6 +2036,175 @@ export function createApp(
       return c.json(err(e), 400);
     } finally {
       ingestRunning.delete(ctx.dataDir);
+    }
+  });
+
+
+  /* --------------------------------- feeds -------------------------------- */
+
+  // Sources that keep producing items — chats, mailboxes, accounts, searches, repositories —
+  // pulled on a schedule or pushed in, filtered and transformed by the feed's stages and written
+  // under raw/docs (src/ingest/feeds, docs/design/25). Defining a feed can make the server run a
+  // program or a model, so writing one, previewing one and checking its source are an
+  // administrator's; running, pushing and rendering again are anyone's who may ingest.
+
+  const feedRunner = (ctx: AppContext) => servicesFor(ctx)?.feeds ?? null;
+
+  app.get('/api/feeds', (c) => {
+    const ctx = requestCtx(c);
+    const runner = feedRunner(ctx);
+    return c.json({ feeds: runner ? runner.status() : describeFeeds(ctx.dataDir) });
+  });
+
+  // the kinds of source and the user-defined stages this server can run
+  app.get('/api/feeds/connectors', (c) => c.json(feedConnectorCatalog()));
+
+  app.get('/api/feeds/:id', (c) => {
+    const ctx = requestCtx(c);
+    const feed = loadFeed(ctx.dataDir, c.req.param('id'));
+    if (!feed) return c.json({ error: 'no such feed' }, 404);
+    const runner = feedRunner(ctx);
+    const status = (runner ? runner.status() : describeFeeds(ctx.dataDir)).find((f) => f.id === feed.id) ?? null;
+    return c.json({ feed: redactFeed(feed), status });
+  });
+
+  // what the feed kept, dropped and is waiting on, newest first — to see whether a filter does what it should
+  app.get('/api/feeds/:id/items', (c) => {
+    const ctx = requestCtx(c);
+    const feed = loadFeed(ctx.dataDir, c.req.param('id'));
+    if (!feed) return c.json({ error: 'no such feed' }, 404);
+    const status = c.req.query('status');
+    const limit = Number(c.req.query('limit') ?? '');
+    return c.json({
+      items: feedItems(ctx.dataDir, feed, {
+        status: status === 'keep' || status === 'drop' || status === 'pending' ? status : undefined,
+        limit: Number.isFinite(limit) && limit > 0 ? Math.min(limit, 500) : 50,
+      }),
+    });
+  });
+
+  // create or replace a feed's definition (the body is the feed as GET shows it; masked secrets keep their values)
+  app.put('/api/feeds/:id', async (c) => {
+    const ctx = requestCtx(c);
+    const id = c.req.param('id');
+    if (!isValidFeedId(id)) return c.json({ error: 'a feed id is lower-case letters, digits, - and _' }, 400);
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+      const feed = saveFeed(ctx.dataDir, id, body);
+      return c.json({ ok: true, feed: redactFeed(feed) });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // stop and forget a feed; removeFiles=1 also removes what it wrote, forget=1 its ledger
+  app.delete('/api/feeds/:id', async (c) => {
+    const ctx = requestCtx(c);
+    const truthy = (v: string | undefined) => v === '1' || v === 'true';
+    try {
+      const result = await deleteFeed(ctx, c.req.param('id'), { removeFiles: truthy(c.req.query('removeFiles')), forgetLedger: truthy(c.req.query('forget')), onProgress: log });
+      return c.json({ ok: true, ...result });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // what a run would pull, keep and write, without keeping or writing anything — for a stored feed ({ id })
+  // or a definition being written ({ id, feed }); model and command stages do run
+  app.post('/api/feeds/preview', async (c) => {
+    const ctx = requestCtx(c);
+    const body = (await c.req.json().catch(() => ({}))) as { id?: string; feed?: Record<string, unknown>; items?: unknown[]; pull?: boolean };
+    const id = typeof body.id === 'string' && isValidFeedId(body.id) ? body.id : 'preview-feed';
+    const feed = body.feed ? normalizeFeed(body.feed, id) : loadFeed(ctx.dataDir, id);
+    if (!feed) return c.json({ error: 'name a stored feed (id) or send a definition (feed)' }, 400);
+    const problem = feedProblem(feed);
+    if (problem) return c.json({ error: problem }, 400);
+    try {
+      const result = await previewFeed(ctx, feed, { items: Array.isArray(body.items) ? body.items : undefined, pull: body.pull, onProgress: log });
+      return c.json({ preview: true, ...result });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // can the feed reach its source with these params?
+  app.post('/api/feeds/check', async (c) => {
+    const ctx = requestCtx(c);
+    const body = (await c.req.json().catch(() => ({}))) as { id?: string; feed?: Record<string, unknown> };
+    const id = typeof body.id === 'string' && isValidFeedId(body.id) ? body.id : 'check-feed';
+    const feed = body.feed ? normalizeFeed(body.feed, id) : loadFeed(ctx.dataDir, id);
+    if (!feed) return c.json({ error: 'name a stored feed (id) or send a definition (feed)' }, 400);
+    try {
+      return c.json(await checkFeed(ctx, feed));
+    } catch (e) {
+      return c.json({ ok: false, message: e instanceof Error ? e.message : String(e) });
+    }
+  });
+
+  // run now: in the background (202) unless wait is set
+  app.post('/api/feeds/:id/run', async (c) => {
+    const ctx = requestCtx(c);
+    const id = c.req.param('id');
+    const feed = loadFeed(ctx.dataDir, id);
+    if (!feed) return c.json({ error: 'no such feed' }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as { wait?: boolean };
+    const runner = feedRunner(ctx);
+    try {
+      if (runner && body.wait !== true) {
+        const started = runner.runNow(id);
+        return c.json({ ok: true, started, running: true }, started ? 202 : 200);
+      }
+      const result = runner ? await (runner.runNow(id, {}, true) as Promise<unknown>) : await runFeed(ctx, feed, { onProgress: log });
+      return c.json({ ok: true, result });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // push items in: a JSON body { items: [...] } (or one item), or NDJSON — one item per line
+  app.post('/api/feeds/:id/items', async (c) => {
+    const ctx = requestCtx(c);
+    const id = c.req.param('id');
+    const feed = loadFeed(ctx.dataDir, id);
+    if (!feed) return c.json({ error: 'no such feed' }, 404);
+    if (!feed.enabled) return c.json({ error: `feed ${id} is disabled` }, 409);
+    const raw = await c.req.text();
+    let items: unknown[] = [];
+    try {
+      const type = (c.req.header('content-type') ?? '').toLowerCase();
+      if (type.includes('ndjson') || type.includes('jsonl')) items = raw.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+      else {
+        const body = JSON.parse(raw || '{}') as { items?: unknown[] } | unknown[];
+        items = Array.isArray(body) ? body : Array.isArray(body.items) ? body.items : body && typeof body === 'object' && 'id' in body ? [body] : [];
+      }
+    } catch {
+      return c.json({ error: 'send JSON ({ "items": [...] }) or NDJSON (one item per line)' }, 400);
+    }
+    if (items.length === 0) return c.json({ error: 'no items in the body' }, 400);
+    if (items.length > 5000) return c.json({ error: 'at most 5000 items per request' }, 413);
+    try {
+      const runner = feedRunner(ctx);
+      const result = runner ? await runner.push(id, items) : await pushToFeed(ctx, feed, items, { onProgress: log });
+      return c.json({ ok: true, result });
+    } catch (e) {
+      return c.json(err(e), 400);
+    }
+  });
+
+  // render the feed's documents again from its ledger: all periods, or those that changed; redecide asks the stages again
+  app.post('/api/feeds/:id/rerender', async (c) => {
+    const ctx = requestCtx(c);
+    const id = c.req.param('id');
+    const feed = loadFeed(ctx.dataDir, id);
+    if (!feed) return c.json({ error: 'no such feed' }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as { redecide?: boolean };
+    try {
+      const runner = feedRunner(ctx);
+      const opts = { pull: false, all: true, redecide: body.redecide === true };
+      const result = runner ? await (runner.runNow(id, opts, true) as Promise<unknown>) : await runFeed(ctx, feed, { ...opts, onProgress: log });
+      return c.json({ ok: true, result });
+    } catch (e) {
+      return c.json(err(e), 400);
     }
   });
 

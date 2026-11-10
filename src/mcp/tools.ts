@@ -41,6 +41,9 @@ import { callApiSource, loadResearchSource } from '../research/sources.js';
 import { createStudy, listStudies, startStudy, studyAgent, studyView, refineStudy } from '../research/study.js';
 import { webSearch, webSearchEnabled } from '../research/web.js';
 import { readSection } from '../research/read.js';
+import { loadFeed } from '../ingest/feeds/definitions.js';
+import { pushToFeed } from '../ingest/feeds/run.js';
+import { describeFeeds } from '../ingest/feeds/runner.js';
 
 /** Who wrote what an MCP client writes: an agent's text, quarantined until a person promotes it (src/lineage/trust.ts). */
 export const MCP_WRITER = 'mcp';
@@ -204,6 +207,37 @@ export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: Kno
       recordOrigin(ctx.dataDir, cleanRelPath(p), content, MCP_WRITER);
       writeFileText(ctx.dataDir, p, content);
       return json({ ok: true, path: p });
+    },
+  );
+
+  server.registerTool(
+    'knode_feeds',
+    {
+      title: 'List feeds',
+      description: 'The feeds of this knowledge base (docs/design/25): sources that keep producing items — group chats, mailboxes, accounts, arXiv searches, repositories, RSS — with their connector, schedule, the folder they write in, and how their last run went. Feeds of connector "push" take items through knode_feed_push.',
+      inputSchema: {},
+    },
+    async () => json(describeFeeds(ctx.dataDir).map((f) => ({ id: f.id, title: f.title, description: f.description, connector: f.connector, enabled: f.enabled, dest: f.dest, items: f.items, lastRunAt: f.state.lastRunAt ?? null, lastError: f.state.lastError ?? null }))),
+  );
+
+  server.registerTool(
+    'knode_feed_push',
+    {
+      title: 'Push items into a feed',
+      description: 'Hand items — a post, an article, a message, a link worth keeping — to a feed of connector "push". They go through the feed\'s filter and transform stages like pulled ones, and the kept ones are written into its documents. Each item: { id (stable; a URL works), title?, text (Markdown), url?, author?, publishedAt? (ISO 8601), tags? }. An agent may only push into a feed whose trust is "quarantine", so what it hands in waits for a person\'s review.',
+      inputSchema: {
+        feed: z.string().describe('The feed id (see knode_feeds)'),
+        items: z.array(z.record(z.string(), z.unknown())).min(1).max(200),
+      },
+    },
+    async ({ feed: id, items }) => {
+      const feed = loadFeed(ctx.dataDir, id);
+      if (!feed) throw new Error(`no feed "${id}" — knode_feeds lists them`);
+      if (feed.connector !== 'push') throw new Error(`feed ${id} pulls from ${feed.connector}; only feeds of connector "push" take items from MCP`);
+      if (!feed.enabled) throw new Error(`feed ${id} is disabled`);
+      if (agent && feed.trust !== 'quarantine') throw new Error(`feed ${id} writes trusted documents; an agent may push only into a feed with trust: quarantine`);
+      const r = await pushToFeed(ctx, feed, items.map((i) => ({ ...i, meta: { ...((i.meta as Record<string, unknown>) ?? {}), pushedBy: agent ? 'agent' : MCP_WRITER } })));
+      return json({ ok: true, pushed: r.pushed, changed: r.changed, kept: r.kept, dropped: r.dropped, pending: r.pending, decisions: r.decisions, documents: r.documents.map((d) => d.path) });
     },
   );
 

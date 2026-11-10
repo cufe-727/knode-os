@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { registerBuiltins } from './builtin.js';
+import type { FeedConnector, FeedStagePlugin } from '../ingest/feeds/types.js';
 import {
   DocumentConverterPlugin,
   EmbeddingProviderPlugin,
@@ -45,6 +46,8 @@ export class PluginRegistry {
   private readonly storage = new Map<string, StorageBackendPlugin>();
   private readonly converters = new Map<string, DocumentConverterPlugin>();
   private readonly byExtension = new Map<string, DocumentConverterPlugin>();
+  private readonly connectors = new Map<string, FeedConnector>();
+  private readonly feedStageMap = new Map<string, FeedStagePlugin>();
   private readonly handlers = new Map<HookName, HookHandler[]>();
   private readonly summaries = new Map<string, PluginSummary>();
   /** Where a provider id came from, so a replacement can name what it replaced. */
@@ -96,13 +99,31 @@ export class PluginRegistry {
     return [...this.byExtension.keys()].sort();
   }
 
+  /** A kind of source a feed's `connector` names (docs/design/25). */
+  feedConnector(id: string): FeedConnector | undefined {
+    return this.connectors.get(id);
+  }
+
+  feedConnectors(): FeedConnector[] {
+    return [...this.connectors.values()];
+  }
+
+  /** A user-defined filter or transform a feed's `udf` stage names. */
+  feedStage(id: string): FeedStagePlugin | undefined {
+    return this.feedStageMap.get(id);
+  }
+
+  feedStages(): FeedStagePlugin[] {
+    return [...this.feedStageMap.values()];
+  }
+
   hasHandlers(hook: HookName): boolean {
     return (this.handlers.get(hook)?.length ?? 0) > 0;
   }
 
   /** What was registered, in installation order (built-ins first). */
   describe(): PluginSummary[] {
-    return [...this.summaries.values()].map((s) => ({ ...s, hooks: [...s.hooks] }));
+    return [...this.summaries.values()].map((s) => ({ ...s, feedConnectors: [...s.feedConnectors], feedStages: [...s.feedStages], hooks: [...s.hooks] }));
   }
 
   /* ---------------------------- registration ---------------------------- */
@@ -114,6 +135,8 @@ export class PluginRegistry {
       registerEmbeddingProvider: (plugin) => this.registerEmbeddingProvider(plugin, pluginName),
       registerStorageBackend: (plugin) => this.registerStorageBackend(plugin, pluginName),
       registerConverter: (plugin) => this.registerConverter(plugin, pluginName),
+      registerFeedConnector: (connector) => this.registerFeedConnector(connector, pluginName),
+      registerFeedStage: (stage) => this.registerFeedStage(stage, pluginName),
       on: (hook, handler) => this.on(hook, handler, pluginName),
       log: (message) => log(`plugin ${pluginName}: ${message}`),
     };
@@ -165,6 +188,23 @@ export class PluginRegistry {
     this.summary(owner).converters.push(id);
   }
 
+  registerFeedConnector(connector: FeedConnector, owner = 'api'): void {
+    const id = this.validId(connector.id, 'feed connector', owner);
+    if (!connector.pushOnly && typeof connector.pull !== 'function') throw new Error(`plugin ${owner}: feed connector "${id}" has no pull() and is not pushOnly`);
+    this.replacing('connector', id, owner);
+    this.connectors.set(id, { ...connector, id, params: Array.isArray(connector.params) ? connector.params : [] });
+    this.summary(owner).feedConnectors.push(id);
+  }
+
+  registerFeedStage(stage: FeedStagePlugin, owner = 'api'): void {
+    const id = this.validId(stage.id, 'feed stage', owner);
+    if (typeof stage.run !== 'function') throw new Error(`plugin ${owner}: feed stage "${id}" has no run()`);
+    if (stage.kind !== 'filter' && stage.kind !== 'transform') throw new Error(`plugin ${owner}: feed stage "${id}" must be of kind filter or transform`);
+    this.replacing('stage', id, owner);
+    this.feedStageMap.set(id, { ...stage, id });
+    this.summary(owner).feedStages.push(id);
+  }
+
   on<K extends HookName>(hook: K, handler: PipelineHooks[K], owner = 'api'): void {
     if (!HOOK_NAMES.includes(hook)) throw new Error(`plugin ${owner}: unknown hook "${String(hook)}" (known: ${HOOK_NAMES.join(', ')})`);
     if (typeof handler !== 'function') throw new Error(`plugin ${owner}: the handler for "${hook}" is not a function`);
@@ -187,6 +227,8 @@ export class PluginRegistry {
     for (const p of plugin.embeddingProviders ?? []) this.registerEmbeddingProvider(p, name);
     for (const p of plugin.storageBackends ?? []) this.registerStorageBackend(p, name);
     for (const p of plugin.converters ?? []) this.registerConverter(p, name);
+    for (const p of plugin.feedConnectors ?? []) this.registerFeedConnector(p, name);
+    for (const p of plugin.feedStages ?? []) this.registerFeedStage(p, name);
     for (const [hook, handler] of Object.entries(plugin.hooks ?? {})) {
       if (handler) this.on(hook as HookName, handler as PipelineHooks[HookName], name);
     }
@@ -253,14 +295,15 @@ export class PluginRegistry {
     return value;
   }
 
-  private replacing(kind: 'llm' | 'embedding' | 'storage' | 'converter', id: string, owner: string): void {
+  private replacing(kind: 'llm' | 'embedding' | 'storage' | 'converter' | 'connector' | 'stage', id: string, owner: string): void {
     const key = `${kind}:${id}`;
     const previous = this.owners.get(key);
     if (previous && previous !== owner) {
-      this.warnings.push(`${owner} replaces ${kind === 'llm' ? 'LLM provider' : kind === 'embedding' ? 'embedding provider' : kind === 'storage' ? 'storage backend' : 'converter'} "${id}" from ${previous}`);
+      const what = { llm: 'LLM provider', embedding: 'embedding provider', storage: 'storage backend', converter: 'converter', connector: 'feed connector', stage: 'feed stage' }[kind];
+      this.warnings.push(`${owner} replaces ${what} "${id}" from ${previous}`);
       const summary = this.summaries.get(previous);
       if (summary) {
-        const list = kind === 'llm' ? summary.llmProviders : kind === 'embedding' ? summary.embeddingProviders : kind === 'storage' ? summary.storageBackends : summary.converters;
+        const list = { llm: summary.llmProviders, embedding: summary.embeddingProviders, storage: summary.storageBackends, converter: summary.converters, connector: summary.feedConnectors, stage: summary.feedStages }[kind];
         const at = list.indexOf(id);
         if (at >= 0) list.splice(at, 1);
       }
@@ -271,7 +314,7 @@ export class PluginRegistry {
   private summary(name: string): PluginSummary {
     let summary = this.summaries.get(name);
     if (!summary) {
-      summary = { name, source: 'api', llmProviders: [], embeddingProviders: [], storageBackends: [], converters: [], hooks: [] };
+      summary = { name, source: 'api', llmProviders: [], embeddingProviders: [], storageBackends: [], converters: [], feedConnectors: [], feedStages: [], hooks: [] };
       this.summaries.set(name, summary);
     }
     return summary;

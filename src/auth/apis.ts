@@ -13,14 +13,14 @@
  */
 
 export const API_GROUPS = {
-  files: 'browse, read, edit, upload and move files; sync and unlink linked folders, Feishu documents and followed agent conversations',
+  files: 'browse, read, edit, upload and move files; sync and unlink linked folders, Feishu documents and followed agent conversations; see feeds and what they kept',
   search: 'search, graph, entities, documents, claims, stats, notices, lineage and history',
   ask: 'Ask, chat and context packs',
   knowledge: 'wiki, research, dream, suggestions, merges and reviews',
-  ingest: 'sync, ingest, forget, purge, rebuild, labeling status and the task queue',
+  ingest: 'sync, ingest, forget, purge, rebuild, labeling status and the task queue; run feeds, push items into them and render them again',
   traces: 'agent traces',
   datasources: 'configured live datasources and their read-only queries',
-  settings: 'workspace settings — models, connections, agents, profiles, playbooks — clearing a workspace, importing or linking a folder from this machine, signing in to Feishu and importing its documents, and listing and importing this machine\'s agent conversations',
+  settings: 'workspace settings — models, connections, agents, profiles, playbooks — clearing a workspace, importing or linking a folder from this machine, signing in to Feishu and importing its documents, listing and importing this machine\'s agent conversations, and defining, previewing and checking feeds',
   gateway: 'local services published through /gw/<id>',
 } as const;
 
@@ -74,6 +74,12 @@ const RULES: Rule[] = [
   { prefix: '/api/conversations/import', group: 'settings' },
   // and fetching a repository from the network onto this machine's disk
   { prefix: '/api/codebases/add', group: 'settings' },
+  // defining a feed can make the server run a program or a model (src/ingest/feeds)
+  { prefix: '/api/feeds/preview', group: 'settings' },
+  { prefix: '/api/feeds/check', group: 'settings' },
+  { prefix: '/api/feeds', group: 'settings', methods: ['PUT', 'DELETE', 'PATCH'] },
+  { prefix: '/api/feeds', group: 'ingest', methods: ['POST'] },
+  { prefix: '/api/feeds', group: 'files' },
 
   { prefix: '/api/config', group: 'settings' },
   { prefix: '/api/agents', group: 'settings' },
