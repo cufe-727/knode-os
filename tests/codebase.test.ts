@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { activityOf } from '../src/activity.js';
 import { AppContext, createContext } from '../src/context.js';
 import { grepFiles } from '../src/fs/files.js';
 import { chunkCode } from '../src/ingest/chunker.js';
@@ -13,6 +14,7 @@ import {
   checkRef,
   codebaseCheckOwed,
   codebaseLinks,
+  Codebases,
   describeCodebases,
   editCodebase,
   planCodebase,
@@ -275,6 +277,26 @@ describe('a repository from add to remove', () => {
     const now = new Date();
     expect(codebaseCheckOwed({ ...ctx.config, ingest: { ...ctx.config.ingest, codebases: [{ ...codebaseLinks(ctx.config)[0], checkedAt: new Date(now.getTime() - 3 * 86400_000).toISOString() }] } }, now)).toBe(true);
     expect(codebaseCheckOwed(ctx.config, now)).toBe(false);
+  });
+
+  it('shows what serve fetches as codebase activity, failed when nothing came through', async () => {
+    const codebases = new Codebases(ctx);
+    const progress: string[] = [];
+    const [r] = await codebases.update('agent-harness', { onProgress: (m) => progress.push(m) });
+    if ('error' in r) throw new Error(r.error);
+    expect(progress[0]).toMatch(/^fetching /);
+    const last = () => activityOf(ctx.dataDir).snapshot().recent.find((a) => a.kind === 'codebase');
+    expect(last()).toMatchObject({ label: 'agent-harness: fetching again from its repository', ok: true, detail: `unchanged at ${r.commit.slice(0, 12)}` });
+
+    // a ref the remote lacks: the result still says why, and the activity ends failed
+    editCodebase(ctx, 'agent-harness', { ref: 'no-such-branch' });
+    const [bad] = await codebases.update('agent-harness', { onProgress: () => {} });
+    expect('error' in bad).toBe(true);
+    expect(last()).toMatchObject({ ok: false });
+    expect(last()?.detail).toMatch(/^agent-harness: /);
+    expect(codebases.busy).toBe(false);
+    editCodebase(ctx, 'agent-harness', { ref: '' });
+    expect(codebaseLinks(ctx.config)[0].ref).toBeUndefined();
   });
 
   it('removes it with its files, card, clone and documents', async () => {

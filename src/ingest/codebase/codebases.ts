@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { activityOf } from '../../activity.js';
 import { CodebaseLink, KnodeConfig, saveConfig } from '../../config.js';
 import { safePath } from '../../fs/files.js';
 import { CODEBASE_CARDS, RAW_CODEBASE } from '../../fs/layout.js';
@@ -492,12 +493,18 @@ export class Codebases {
   }
 
   add(spec: string, opts: AddCodebaseOptions): Promise<CodebaseResult> {
-    return this.serial(() => addCodebase(this.ctx, spec, { ...opts, onProgress: opts.onProgress ?? ((m) => this.log(`codebase: ${m}`)) }));
+    return this.serial(() => codebaseActivity(this.ctx, `Add repository ${spec}`, this.reporter(opts.onProgress),
+      (progress) => addCodebase(this.ctx, spec, { ...opts, onProgress: progress }),
+      describeAdd));
   }
 
-  update(name?: string, opts: { followedOnly?: boolean; force?: boolean; scheduled?: boolean } = {}): Promise<(CodebaseResult | { name: string; error: string })[]> {
+  update(name?: string, opts: { followedOnly?: boolean; force?: boolean; scheduled?: boolean; onProgress?: (m: string) => void } = {}): Promise<UpdateResults> {
     return this.serial(async () => {
-      const results = await updateCodebases(this.ctx, name, { followedOnly: opts.followedOnly, force: opts.force, onProgress: (m) => this.log(`codebase: ${m}`) });
+      const label = name
+        ? `${name}: fetching again from its repository`
+        : opts.scheduled ? 'Followed repositories: daily fetch' : opts.followedOnly ? 'Followed repositories: fetching again' : 'Every repository: fetching again';
+      const results = await updateActivity(this.ctx, label, this.reporter(opts.onProgress),
+        (progress) => updateCodebases(this.ctx, name, { followedOnly: opts.followedOnly, force: opts.force, onProgress: progress }));
       for (const r of results) {
         this.log('error' in r
           ? `codebase ${r.name}: update failed: ${r.error}`
@@ -508,7 +515,80 @@ export class Codebases {
     });
   }
 
-  remove(name: string, opts: { keepFiles?: boolean } = {}): ReturnType<typeof removeCodebase> {
-    return this.serial(() => removeCodebase(this.ctx, name, { ...opts, onProgress: (m) => this.log(`codebase: ${m}`) }));
+  remove(name: string, opts: { keepFiles?: boolean; onProgress?: (m: string) => void } = {}): ReturnType<typeof removeCodebase> {
+    return this.serial(() => codebaseActivity(this.ctx, `Remove repository ${name}${opts.keepFiles ? ', keeping its files' : ''}`, this.reporter(opts.onProgress),
+      (progress) => removeCodebase(this.ctx, name, { keepFiles: opts.keepFiles, onProgress: progress }),
+      describeRemoval));
   }
+
+  /** Where a step's progress goes: the caller's listener, else the service log. */
+  private reporter(onProgress?: (m: string) => void): (m: string) => void {
+    return onProgress ?? ((m) => this.log(`codebase: ${m}`));
+  }
+}
+
+type UpdateResults = (CodebaseResult | { name: string; error: string })[];
+
+/**
+ * One fetch, update or removal as a `codebase` activity (src/activity.ts), so
+ * Tasks and the clients' Code repositories sections see it while it runs and
+ * how it ended; its progress lines go to `log` as well.
+ */
+export function codebaseActivity<T>(
+  ctx: { dataDir: string },
+  label: string,
+  log: (m: string) => void,
+  fn: (progress: (m: string) => void) => Promise<T>,
+  describe?: (result: T) => string,
+): Promise<T> {
+  return activityOf(ctx.dataDir).run('codebase', label, (progress) => fn((m) => {
+    log(m);
+    progress(m);
+  }), describe);
+}
+
+/**
+ * An update as an activity. `updateCodebases` keeps one repository's failure
+ * from stopping the rest and reports it in its result; the activity still
+ * ends failed when no repository came through, and the results are returned
+ * either way.
+ */
+export async function updateActivity(
+  ctx: { dataDir: string },
+  label: string,
+  log: (m: string) => void,
+  fn: (progress: (m: string) => void) => Promise<UpdateResults>,
+): Promise<UpdateResults> {
+  let results: UpdateResults | null = null;
+  try {
+    return await codebaseActivity(ctx, label, log, async (progress) => {
+      results = await fn(progress);
+      const failed = results.filter((r): r is { name: string; error: string } => 'error' in r);
+      if (failed.length > 0 && failed.length === results.length) throw new Error(failed.map((f) => `${f.name}: ${f.error}`).join('; '));
+      return results;
+    }, describeUpdate);
+  } catch (e) {
+    if (results) return results;
+    throw e;
+  }
+}
+
+/** One line for a repository added: where, at which commit, how many files. */
+export function describeAdd(r: CodebaseResult): string {
+  return `${r.dir} at ${r.commit.slice(0, 12)}: ${r.files} file${r.files === 1 ? '' : 's'}`;
+}
+
+function describeUpdate(results: UpdateResults): string {
+  if (results.length === 1) {
+    const r = results[0];
+    if ('error' in r) return `failed: ${r.error}`;
+    return r.changed ? `now at ${r.commit.slice(0, 12)}: ${r.copied.length} copied, ${r.removed.length} removed` : `unchanged at ${r.commit.slice(0, 12)}`;
+  }
+  const failed = results.filter((r) => 'error' in r).length;
+  const changed = results.filter((r) => !('error' in r) && r.changed).length;
+  return `${results.length} fetched, ${changed} changed${failed ? `, ${failed} failed` : ''}`;
+}
+
+function describeRemoval(r: Awaited<ReturnType<typeof removeCodebase>>): string {
+  return r.removedFiles ? `its files removed${r.sync ? `, ${r.sync.disposed} disposed` : ''}` : 'its files kept as plain content';
 }

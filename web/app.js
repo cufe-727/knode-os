@@ -1554,7 +1554,7 @@ const SCHEDULE_WORDS = {
   feishu: ['Feishu documents', 'asks Feishu which linked documents and wiki pages were edited, and fetches those'],
   conversations: ['Agent conversations', 'adds new exchanges of followed Claude Code and Codex conversations once they go quiet'],
 };
-const ACTIVITY_ICONS = { sync: '⟳', ingest: '⛁', upload: '⤒', folder: '⇄', feishu: '⇅', conversations: '❝', traces: '⌁', datasources: '◫', dream: '☾', tier2: '⚙' };
+const ACTIVITY_ICONS = { sync: '⟳', ingest: '⛁', upload: '⤒', folder: '⇄', feishu: '⇅', conversations: '❝', codebase: '⎇', traces: '⌁', datasources: '◫', dream: '☾', tier2: '⚙' };
 
 /** "45 s", "3 min 10 s", "2 h 5 min". */
 function spanText(seconds) {
@@ -2113,6 +2113,8 @@ function mirroredSource(path) {
 const feishuDests = new Map();
 /** Followed agent conversations in the tree: copy path → its transcript. A subset of linkedDests. */
 const conversationDests = new Map();
+/** Code repositories in the tree: mirror, card or docs path → the repository's name. A subset of linkedDests. */
+const codebaseDests = new Map();
 /** The last path typed into an import, offered again next time. */
 let lastImportSource = '';
 /** The last Feishu link typed into an import. */
@@ -2172,10 +2174,12 @@ async function fetchListing(dir) {
     linkedDests.clear();
     feishuDests.clear();
     conversationDests.clear();
+    codebaseDests.clear();
     for (const link of node.links || []) {
       linkedDests.set(link.path, link.source);
       if (link.kind === 'feishu') feishuDests.set(link.path, link.source);
       if (link.kind === 'conversation') conversationDests.set(link.path, link.source);
+      if (link.kind === 'codebase') codebaseDests.set(link.path, link.name);
     }
     return node.children || [];
   } catch {
@@ -2342,7 +2346,17 @@ function nodeMenu(node) {
     items.push({ label: 'Unfollow and remove the copy…', danger: true, run: () => unfollowAgentConversation(node, true) });
     items.push('-');
   }
-  if (linkRoot && feishuDests.has(node.path)) {
+  if (codebaseDests.has(node.path)) {
+    // a repository's mirror, card or docs copy: the repository's actions, not a linked folder's
+    const name = codebaseDests.get(node.path);
+    const source = linkedDests.get(node.path);
+    items.push({ label: 'Update from the repository now', run: () => updateCodebase(name) });
+    if (/^https:\/\//.test(source ?? '')) items.push({ label: 'Open the repository page', run: () => window.open(source, '_blank', 'noopener') });
+    items.push({ label: 'Code repository settings…', run: () => openCodebases({ edit: name }) });
+    items.push({ label: 'Remove repository (keep the files)…', run: () => removeCodebaseNode(name, true) });
+    items.push({ label: 'Remove repository and its files…', danger: true, run: () => removeCodebaseNode(name, false) });
+    items.push('-');
+  } else if (linkRoot && feishuDests.has(node.path)) {
     items.push({ label: 'Check Feishu for edits now', run: () => syncFeishuDoc(node.path) });
     items.push({ label: 'Fetch again from Feishu', run: () => syncFeishuDoc(node.path, true) });
     items.push({ label: 'Open in Feishu', run: () => window.open(feishuDests.get(node.path), '_blank', 'noopener') });
@@ -3462,6 +3476,9 @@ $('#btn-import').addEventListener('click', (ev) => {
     { label: folders ? 'Feishu documents or a wiki (import once)…' : 'Feishu documents — administrators only', disabled: !folders, run: () => importFeishuDoc('copy') },
     { label: folders ? 'Link Feishu documents or a wiki (keep in sync)…' : 'Link Feishu documents — administrators only', disabled: !folders, run: () => importFeishuDoc('link') },
     '-',
+    { label: folders ? 'Code repository from GitHub or a git URL…' : 'Code repository — administrators only', disabled: !folders, run: () => openCodebases({ add: true }) },
+    { label: 'Code repositories — update, edit or remove…', disabled: !mayUse('files'), run: () => openCodebases() },
+    '-',
     { label: folders ? 'Agent conversations — pick Claude Code and Codex sessions…' : 'Agent conversations — administrators only', disabled: !folders, run: () => openAgentConversations() },
     { label: 'Agent traces — every Claude Code and Codex session, for Dream', disabled: !mayUse('traces'), run: () => collectTraces() },
   ]);
@@ -3843,6 +3860,334 @@ $('#feishu-subpages').addEventListener('change', () => {
   feishuDialog.plan = null;
   paintFeishuPlan();
   paintFeishuButtons();
+});
+
+/* -------------------------- code repositories ---------------------------- */
+
+/**
+ * Library → Import data → Code repositories (docs/design/25): repositories
+ * kept at one commit under raw/codebase/<name>/, each with a card and its
+ * documentation in raw/docs/codebase/. Adding fetches from the network onto
+ * the service's machine, so it is an administrator's call; whoever may sync
+ * the files may update, edit and remove what is there. A fetch runs in the
+ * background as a `codebase` activity, which the dialog follows while open.
+ */
+const codebaseState = { entries: [], running: false, activity: [], recent: [], editing: null, confirming: null, busy: false, timer: null, seq: 0, wasRunning: false };
+const CODEBASE_POLL_MS = 2500;
+
+/** Globs typed one per line (or comma-separated), as the routes take them. */
+const globsTyped = (sel) => [...new Set($(sel).value.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean))];
+
+function openCodebases({ add = false, edit = null } = {}) {
+  codebaseState.editing = null;
+  codebaseState.confirming = null;
+  // only a fetch watched from here ends with a toast and a redrawn tree
+  codebaseState.wasRunning = false;
+  $('#codebase-error').textContent = '';
+  resetCodebaseForm();
+  $('#codebase-dialog').showModal();
+  loadCodebases().then(() => {
+    if (edit) beginCodebaseEdit(edit);
+  });
+  if (add && mayImportFolders()) setTimeout(() => $('#codebase-repo').focus(), 0);
+}
+
+function resetCodebaseForm() {
+  for (const id of ['#codebase-repo', '#codebase-name', '#codebase-ref', '#codebase-include', '#codebase-exclude']) $(id).value = '';
+  $('#codebase-follow').checked = false;
+  $('#codebase-docs').checked = true;
+  paintCodebaseForm();
+}
+
+async function loadCodebases() {
+  const seq = ++codebaseState.seq;
+  try {
+    const res = await api('/api/codebases');
+    if (seq !== codebaseState.seq) return;
+    const finished = codebaseState.wasRunning && !res.running;
+    Object.assign(codebaseState, { entries: res.codebases, running: res.running, activity: res.activity ?? [], recent: res.recent ?? [], wasRunning: res.running });
+    paintCodebases();
+    if (finished) codebaseFetchEnded();
+  } catch (e) {
+    if (seq !== codebaseState.seq) return;
+    $('#codebase-list').innerHTML = '';
+    $('#codebase-error').textContent = e.message;
+  }
+  scheduleCodebasePoll();
+}
+
+/** Look again in a moment while something is fetching and the dialog is open. */
+function scheduleCodebasePoll() {
+  clearTimeout(codebaseState.timer);
+  if (!codebaseState.running || !$('#codebase-dialog').open) return;
+  codebaseState.timer = setTimeout(() => { if (!document.hidden) loadCodebases(); else scheduleCodebasePoll(); }, CODEBASE_POLL_MS);
+}
+
+/** A fetch the dialog watched has ended: the tree and the counts change with it, and a failure is said. */
+async function codebaseFetchEnded() {
+  const last = codebaseState.recent[0];
+  if (last && !last.ok) $('#codebase-error').textContent = `${last.label}: ${last.detail ?? 'failed'}`;
+  else if (last) toast(`${last.label} — ${last.detail ?? 'done'}`, 6000);
+  await loadTree();
+  loadStats();
+}
+
+function paintCodebases() {
+  paintCodebaseActivity();
+  const list = $('#codebase-list');
+  const { entries } = codebaseState;
+  if (!entries.length) {
+    list.innerHTML = `<p class="hint">No repository is kept in this workspace yet.${mayImportFolders() ? ' Add one below.' : ''}</p>`;
+    paintCodebaseForm();
+    return;
+  }
+  const mayChange = mayUse('files');
+  list.innerHTML = entries.map((e, n) => {
+    const confirming = codebaseState.confirming === e.name;
+    const where = e.web ? `<a href="${esc(e.web)}" target="_blank" rel="noopener">${esc(e.web.replace(/^https:\/\//, ''))} ↗</a>` : `<span class="mono">${esc(e.url)}</span>`;
+    const commit = e.commit
+      ? `<span class="mono" title="${esc(e.commit)}">${esc(e.commit.slice(0, 12))}</span>${e.committedAt ? ` of ${esc(new Date(e.committedAt).toLocaleDateString([], { dateStyle: 'medium' }))}` : ''}`
+      : 'not fetched yet';
+    const narrowed = [
+      e.include?.length ? `only ${e.include.map((g) => `<span class="mono">${esc(g)}</span>`).join(', ')}` : '',
+      e.exclude?.length ? `without ${e.exclude.map((g) => `<span class="mono">${esc(g)}</span>`).join(', ')}` : '',
+      e.docs === false ? 'documentation not copied' : '',
+    ].filter(Boolean).join(' · ');
+    const actions = mayChange && !confirming
+      ? `<div class="codebase-actions">
+          <button type="button" class="row-action" data-update ${codebaseState.busy ? 'disabled' : ''} title="Fetch ${esc(e.ref || 'its default branch')} again and index what changed">Update now</button>
+          <button type="button" class="row-action" data-edit ${codebaseState.busy ? 'disabled' : ''} title="Change the branch, the globs, following or the documentation copy">Edit</button>
+          <button type="button" class="row-action danger" data-remove ${codebaseState.busy ? 'disabled' : ''}>Remove…</button>
+        </div>`
+      : '';
+    const confirm = confirming
+      ? `<div class="codebase-confirm">
+          <b>Remove ${esc(e.name)}?</b>
+          <label class="check-row"><input type="checkbox" data-keep /> Keep its files, card and documentation as plain workspace content</label>
+          <div class="hint" data-keep-hint>Its ${fmtCount(e.files, 'file')} in <span class="mono">${esc(e.dir)}</span>, its card and documentation copy are deleted and their knowledge disposed (history stays in the ledger). The repository itself is not touched.</div>
+          <div class="codebase-actions"><button type="button" class="row-action" data-cancel-remove>Cancel</button><button type="button" class="row-action danger" data-confirm-remove ${codebaseState.busy ? 'disabled' : ''}>Remove</button></div>
+        </div>`
+      : '';
+    return `<div class="feishu-item codebase-item${codebaseState.editing === e.name ? ' editing' : ''}" data-n="${n}">
+      <span class="mark" title="${e.follow ? 'followed: fetched again daily' : 'kept at its commit'}">${e.follow ? '⟳' : '⎇'}</span>
+      <div>
+        <b><a href="#" data-open-card title="Open its card, ${esc(e.card)}">${esc(e.name)}</a></b> <span class="hint">${where}</span>
+        <div class="hint">${esc(e.ref || 'default branch')} · ${commit} · ${fmtCount(e.files, 'file')}, ${fmtBytes(e.bytes)}</div>
+        <div class="hint">${e.follow ? 'followed — fetched again daily' : 'not followed'}${e.checkedAt ? ` · checked ${agoText(e.checkedAt)}` : ''}${narrowed ? ` · ${narrowed}` : ''}</div>
+        ${confirm}
+      </div>
+      ${actions}
+    </div>`;
+  }).join('');
+  list.querySelectorAll('.codebase-item').forEach((row) => {
+    const e = entries[Number(row.dataset.n)];
+    row.querySelector('[data-open-card]').addEventListener('click', (ev) => {
+      ev.preventDefault();
+      $('#codebase-dialog').close();
+      reveal(parentDir(e.card));
+      loadTree().then(() => openFile(e.card));
+    });
+    row.querySelector('[data-update]')?.addEventListener('click', () => updateCodebase(e.name));
+    row.querySelector('[data-edit]')?.addEventListener('click', () => beginCodebaseEdit(e.name));
+    row.querySelector('[data-remove]')?.addEventListener('click', () => {
+      codebaseState.confirming = e.name;
+      paintCodebases();
+    });
+    row.querySelector('[data-cancel-remove]')?.addEventListener('click', () => {
+      codebaseState.confirming = null;
+      paintCodebases();
+    });
+    const keep = row.querySelector('[data-keep]');
+    keep?.addEventListener('change', () => {
+      row.querySelector('[data-keep-hint]').innerHTML = keep.checked
+        ? `It stops being a repository here: <span class="mono">${esc(e.dir)}</span>, its card and documentation stay as ordinary files and are no longer updated.`
+        : `Its ${fmtCount(e.files, 'file')} in <span class="mono">${esc(e.dir)}</span>, its card and documentation copy are deleted and their knowledge disposed (history stays in the ledger). The repository itself is not touched.`;
+    });
+    row.querySelector('[data-confirm-remove]')?.addEventListener('click', () => removeCodebase(e.name, Boolean(keep?.checked)));
+  });
+  paintCodebaseForm();
+}
+
+/** What is fetching now, else how the last fetch ended (a background add that failed says so here). */
+function paintCodebaseActivity() {
+  const el = $('#codebase-activity');
+  const { activity, recent, running } = codebaseState;
+  if (activity.length) {
+    el.hidden = false;
+    el.innerHTML = activity.map((a) => `<div class="activity-row running"><span class="activity-icon spin">${ACTIVITY_ICONS.codebase}</span><div><b>${esc(a.label)}</b><div class="hint">running for ${spanText((Date.now() - Date.parse(a.startedAt)) / 1000)}${a.progress ? ` · ${esc(a.progress)}` : ''}</div></div></div>`).join('');
+    return;
+  }
+  if (running) {
+    el.hidden = false;
+    el.innerHTML = `<div class="activity-row running"><span class="activity-icon spin">${ACTIVITY_ICONS.codebase}</span><div><b>Waiting for the fetch before it</b></div></div>`;
+    return;
+  }
+  const last = recent[0];
+  el.hidden = !last;
+  if (last) el.innerHTML = `<div class="activity-row${last.ok ? '' : ' failed'}"><span class="activity-icon">${last.ok ? '✓' : '✕'}</span><div><span>${esc(last.label)}</span><div class="hint">${last.detail ? `${esc(last.detail)} · ` : ''}${agoText(last.finishedAt)}</div></div></div>`;
+}
+
+/** The form below the list: adding (administrators), or editing the entry picked. */
+function paintCodebaseForm() {
+  const editing = codebaseState.editing;
+  const entry = editing ? codebaseState.entries.find((e) => e.name === editing) : null;
+  const mayAdd = mayImportFolders();
+  const shown = Boolean(entry) || mayAdd;
+  $('#codebase-add').hidden = !shown;
+  $('#codebase-admin-hint').hidden = shown || !mayUse('files');
+  $('#codebase-add-title').textContent = entry ? `Edit ${entry.name}` : 'Add a repository';
+  $('#codebase-repo').disabled = Boolean(entry);
+  $('#codebase-name').disabled = Boolean(entry);
+  $('#btn-codebase-cancel-edit').hidden = !entry;
+  const go = $('#btn-codebase-go');
+  go.hidden = !shown;
+  go.textContent = entry ? 'Save' : codebaseState.busy ? 'Adding…' : 'Add repository';
+  go.disabled = codebaseState.busy;
+}
+
+function beginCodebaseEdit(name) {
+  const e = codebaseState.entries.find((x) => x.name === name);
+  if (!e) return;
+  codebaseState.editing = name;
+  codebaseState.confirming = null;
+  $('#codebase-error').textContent = '';
+  $('#codebase-repo').value = e.web || e.url;
+  $('#codebase-name').value = e.name;
+  $('#codebase-ref').value = e.ref ?? '';
+  $('#codebase-include').value = (e.include ?? []).join('\n');
+  $('#codebase-exclude').value = (e.exclude ?? []).join('\n');
+  $('#codebase-follow').checked = Boolean(e.follow);
+  $('#codebase-docs').checked = e.docs !== false;
+  paintCodebases();
+  $('#codebase-add').scrollIntoView({ block: 'nearest' });
+  $('#codebase-ref').focus();
+}
+
+function endCodebaseEdit() {
+  codebaseState.editing = null;
+  resetCodebaseForm();
+  paintCodebases();
+}
+
+async function submitCodebaseForm() {
+  if (codebaseState.busy) return;
+  $('#codebase-error').textContent = '';
+  if (codebaseState.editing) return saveCodebaseEdit(codebaseState.editing);
+  const repository = $('#codebase-repo').value.trim();
+  if (!repository) {
+    $('#codebase-error').textContent = 'Name a repository: owner/repo, or an https or ssh git URL.';
+    $('#codebase-repo').focus();
+    return;
+  }
+  const body = {
+    repository,
+    ...($('#codebase-name').value.trim() ? { name: $('#codebase-name').value.trim() } : {}),
+    ...($('#codebase-ref').value.trim() ? { ref: $('#codebase-ref').value.trim() } : {}),
+    include: globsTyped('#codebase-include'),
+    exclude: globsTyped('#codebase-exclude'),
+    follow: $('#codebase-follow').checked,
+    docs: $('#codebase-docs').checked,
+  };
+  codebaseState.busy = true;
+  paintCodebaseForm();
+  try {
+    await api('/api/codebases/add', { method: 'POST', body: JSON.stringify(body) });
+    resetCodebaseForm();
+    toast(`fetching ${repository} — it shows here and under Tasks → Background until it is indexed`, 6000);
+    codebaseState.wasRunning = true;
+  } catch (e) {
+    $('#codebase-error').textContent = e.message;
+  } finally {
+    codebaseState.busy = false;
+    paintCodebaseForm();
+  }
+  await loadCodebases();
+}
+
+async function saveCodebaseEdit(name) {
+  const before = codebaseState.entries.find((e) => e.name === name);
+  if (!before) return endCodebaseEdit();
+  const patch = {
+    name,
+    ref: $('#codebase-ref').value.trim(),
+    include: globsTyped('#codebase-include'),
+    exclude: globsTyped('#codebase-exclude'),
+    follow: $('#codebase-follow').checked,
+    docs: $('#codebase-docs').checked,
+  };
+  const same = (a, b) => JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
+  // what is fetched changed: only an update applies it, so one follows the save
+  const refetch = patch.ref !== (before.ref ?? '') || !same(patch.include, before.include) || !same(patch.exclude, before.exclude) || patch.docs !== (before.docs !== false);
+  codebaseState.busy = true;
+  paintCodebaseForm();
+  try {
+    await api('/api/codebases', { method: 'PATCH', body: JSON.stringify(patch) });
+    codebaseState.editing = null;
+    resetCodebaseForm();
+    if (refetch) {
+      await api('/api/codebases/update', { method: 'POST', body: JSON.stringify({ name, wait: false }) });
+      codebaseState.wasRunning = true;
+      toast(`saved ${name} — fetching it again to apply the change`, 5000);
+    } else toast(`saved ${name}`, 3000);
+  } catch (e) {
+    $('#codebase-error').textContent = e.message;
+  } finally {
+    codebaseState.busy = false;
+  }
+  await loadCodebases();
+}
+
+/** Update now: fetch the tracked ref again in the background and index what changed. */
+async function updateCodebase(name) {
+  try {
+    await api('/api/codebases/update', { method: 'POST', body: JSON.stringify({ name, wait: false }) });
+    if ($('#codebase-dialog').open) codebaseState.wasRunning = true;
+    toast(`fetching ${name} again — it shows under Tasks → Background`, 5000);
+  } catch (e) {
+    if ($('#codebase-dialog').open) $('#codebase-error').textContent = e.message;
+    else toast(`update failed: ${e.message}`, 6000);
+  }
+  if ($('#codebase-dialog').open) await loadCodebases();
+}
+
+async function removeCodebase(name, keepFiles) {
+  codebaseState.busy = true;
+  paintCodebases();
+  $('#codebase-error').textContent = '';
+  toast(keepFiles ? `removing ${name}, keeping its files…` : `removing ${name} and its files…`, 600000);
+  try {
+    await api(`/api/codebases?name=${encodeURIComponent(name)}&keepFiles=${keepFiles ? 1 : 0}`, { method: 'DELETE' });
+    codebaseState.confirming = null;
+    if (codebaseState.editing === name) endCodebaseEdit();
+    // the open file, the picked folder and open folders inside what was deleted
+    if (!keepFiles) for (const [path, owner] of codebaseDests) if (owner === name) forget(path);
+    toast(keepFiles ? `removed ${name} — its files stay as ordinary content` : `removed ${name} and its files`, 5000);
+    await loadTree();
+    loadStats();
+  } catch (e) {
+    toast(`remove failed: ${e.message}`, 6000);
+    if ($('#codebase-dialog').open) $('#codebase-error').textContent = e.message;
+  } finally {
+    codebaseState.busy = false;
+  }
+  if ($('#codebase-dialog').open) await loadCodebases();
+}
+
+/** A repository's menu in Files → Remove: asked here, since the dialog is not open. */
+async function removeCodebaseNode(name, keepFiles) {
+  const question = keepFiles
+    ? `Remove the repository ${name}, keeping its files?\n\nraw/codebase/${name}, its card and documentation stay as ordinary files and are no longer updated.`
+    : `Remove the repository ${name} and its files?\n\nraw/codebase/${name}, its card and documentation copy are deleted and their knowledge disposed (history stays in the ledger). The repository itself is not touched.`;
+  if (!confirm(question)) return;
+  await removeCodebase(name, keepFiles);
+}
+
+$('#btn-codebase-close').addEventListener('click', () => $('#codebase-dialog').close());
+$('#btn-codebase-cancel-edit').addEventListener('click', endCodebaseEdit);
+$('#codebase-dialog').addEventListener('close', () => clearTimeout(codebaseState.timer));
+$('#codebase-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  submitCodebaseForm();
 });
 
 /* ------------------------- agent conversations --------------------------- */

@@ -79,6 +79,14 @@ Extraction names the project, its components and what it uses, and the summary b
 
 **D9 — Safety.** HTTP routes take only https/ssh URLs. Adding is an administrator's call (`/api/codebases/add` → settings group); the CLI may also name a local working copy. Refs are validated (no leading `-`, no `..`). `protocol.ext.allow=never` is set, git never prompts for credentials, and every git command has a timeout.
 
+**D10 — In the clients.** Library → Import data → Code repositories, in the web UI and the Mac app, is one dialog (sheet):
+- the entries, each with its ref, commit and date, file count and size, whether it is followed, when it was last checked, and its globs;
+- per entry, *Update now* (a background fetch), *Edit* (ref, globs, follow, docs — a change to what is fetched is applied by an update started right after the save), and *Remove…*, confirmed in the row, with a keep-files option;
+- the add form (owner/repo or URL, name, ref, include/exclude globs, follow, docs), for administrators only;
+- the `codebase` activity: the fetch running now with its progress line, else how the last one ended — a background add that failed says so here.
+
+A fetch, update or removal is a `codebase` activity (src/activity.ts) when `serve` runs it — an HTTP route or the daily check — so Tasks → Background shows it too. In Files, the tree marks a repository's mirror, card and docs copy (`links[].kind = 'codebase'` with its `name`), and their menu offers the repository's actions instead of a linked folder's sync and unlink.
+
 ## Interfaces
 
 ```
@@ -86,9 +94,9 @@ knode-os codebase add <owner/repo | url | path> [--name n] [--ref r] [--include 
 knode-os codebase update [name] [--followed] [--reindex]
 knode-os codebase list | edit <name> [--ref r] [--include g…] [--exclude g…] [--[no-]follow] [--[no-]docs] | remove <name> [--keep-files]
 
-GET    /api/codebases                      entries, sizes, whether a fetch is running
+GET    /api/codebases                      entries, sizes, whether a fetch is running, the codebase activity (running, last 5)
 POST   /api/codebases/add                  {repository, name?, ref?, include?, exclude?, follow?, docs?, wait?}  (202 unless wait)
-POST   /api/codebases/update               {name?, reindex?}
+POST   /api/codebases/update               {name?, reindex?, wait?}  (202 when wait is false)
 PATCH  /api/codebases                      {name, ref?, include?, exclude?, follow?, docs?}
 DELETE /api/codebases?name=…[&keepFiles=1]
 ```
@@ -100,5 +108,4 @@ MCP: `knode_search` takes kind `code`; `knode_grep` covers `raw/codebase`; `knod
 - A symbol index in the database (definitions and references as rows, a "find references" tool). The card's code map and grep cover this for now. tree-sitter would bring native or WASM dependencies.
 - Per-file or per-module LLM summaries (DeepWiki-style module pages). Research studies over `raw/codebase` play that role on demand.
 - Pinning citations to `path#Lstart-Lend@sha` automatically. Templates ask agents to cite path and lines, and the card records the commit.
-- A web / Mac UI for adding repositories. The API is ready; for now the CLI is the way in.
 - Secret scanning of carried files.

@@ -164,7 +164,7 @@
       <aside id="filetree-pane">
         <div class="pane-actions">
           <button id="btn-refresh-tree" title="Refresh — reread the workspace tree from disk">⟳</button>
-          <button id="btn-import" class="primary" title="Import data — files or a folder uploaded from disk, a folder linked from the service's machine and kept in sync, or your Claude Code and Codex sessions">⤓ Import data</button>
+          <button id="btn-import" class="primary" title="Import data — files or a folder uploaded from disk, a folder linked from the service's machine and kept in sync, Feishu documents, code repositories, or your Claude Code and Codex sessions">⤓ Import data</button>
           <button id="btn-add" title="New — a file or a folder in the folder shown below">＋ new</button>
           <button id="btn-ingest" title="Index — turn new and changed files into knowledge: chunk, embed, extract entities and refresh the wiki. The CLI calls this ingest / sync.">⛁ index</button>
           <input type="file" id="file-upload" multiple hidden />
@@ -896,6 +896,33 @@
       <div id="feishu-plan" class="feishu-plan" hidden></div>
       <p id="feishu-error" class="form-error" role="alert"></p>
       <div class="dialog-actions"><button id="btn-feishu-cancel" type="button">Cancel</button><button id="btn-feishu-lookup" type="button">Look up</button><button id="btn-feishu-go" class="primary" type="submit" disabled>Import</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="codebase-dialog" class="team-dialog feishu-dialog codebase-dialog" aria-labelledby="codebase-dialog-title">
+    <form id="codebase-form" novalidate>
+      <div class="dialog-head"><p class="eyebrow">CODE REPOSITORIES</p><h2 id="codebase-dialog-title">Code repositories</h2><p>Each is kept at one commit in <span class="mono">raw/codebase/&lt;name&gt;/</span> — source, configuration and prose, not dependencies, build output or binaries. Code turns up when a search asks for it (kind <span class="mono">code</span>) and agents read and grep it; the repository's card and its documentation in <span class="mono">raw/docs/codebase/</span> are learned from like any document.</p></div>
+      <div id="codebase-activity" class="codebase-activity" aria-live="polite" hidden></div>
+      <div id="codebase-list" class="feishu-plan codebase-list" aria-live="polite"></div>
+      <fieldset id="codebase-add" class="codebase-add">
+        <legend id="codebase-add-title">Add a repository</legend>
+        <label for="codebase-repo">Repository — <span class="mono">owner/repo</span> on GitHub, or an https or ssh git URL</label>
+        <input id="codebase-repo" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="openai/codex · https://gitlab.com/group/project.git" />
+        <div class="codebase-grid">
+          <label>Name in raw/codebase<input id="codebase-name" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="the repository's own" /></label>
+          <label>Branch, tag or commit<input id="codebase-ref" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="its default branch" /></label>
+        </div>
+        <div class="codebase-grid">
+          <label>Only files matching<textarea id="codebase-include" rows="2" spellcheck="false" placeholder="src/**&#10;docs/**"></textarea></label>
+          <label>Leave out, besides the built-in rules<textarea id="codebase-exclude" rows="2" spellcheck="false" placeholder="**/*.test.ts&#10;examples"></textarea></label>
+        </div>
+        <p class="hint codebase-globs">Globs as in <span class="mono">.gitignore</span>, one per line. A repository over 25,000 files or 300 MB is refused — narrow it here.</p>
+        <label class="check-row"><input id="codebase-follow" type="checkbox" /> Follow — fetch it again every day and index what changed</label>
+        <label class="check-row"><input id="codebase-docs" type="checkbox" checked /> <span>Copy its documentation (README, <span class="mono">docs/</span>…) to <span class="mono">raw/docs/codebase/&lt;name&gt;/</span>, where extraction and summaries read it</span></label>
+      </fieldset>
+      <p id="codebase-admin-hint" class="hint" hidden>Adding a repository fetches it from the network onto the service's machine: an administrator's call.</p>
+      <p id="codebase-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="btn-codebase-cancel-edit" type="button" hidden>Cancel edit</button><span class="spacer"></span><button id="btn-codebase-close" type="button">Close</button><button id="btn-codebase-go" class="primary" type="submit">Add repository</button></div>
     </form>
   </dialog>
 

@@ -122,6 +122,7 @@ enum TaskWords {
         case "folder": "folder"
         case "feishu": "doc.text"
         case "conversations": "bubble.left.and.bubble.right"
+        case "codebase": "chevron.left.forwardslash.chevron.right"
         case "traces": "terminal"
         case "datasources": "cylinder"
         case "dream": "moon.stars"
