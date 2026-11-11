@@ -24,6 +24,7 @@ import { ChatBackend, ClientBackend, CodexBackend, startShim } from './shim.js';
 import { closeAdapters } from './systems/external.js';
 import { makeSystems } from './systems/index.js';
 import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
+import { boundedTrace } from './trace.js';
 import { SystemEnv, SystemUnderTest, taggedEmbedder } from './systems/types.js';
 import { extractFinalAnswer } from './metrics/text.js';
 import { AnswerRecord, BuildRecord, emptyUsage, Suite, SUITES, Task, TaskType } from './types.js';
@@ -101,6 +102,14 @@ export interface RunOptions {
    * work directory in place, so what is there is no longer the base build.
    */
   reuseBuildsFrom?: string;
+  /**
+   * Build groups (`knode`, `llm-wiki`, `rag`, …) not taken from
+   * `reuseBuildsFrom`, built afresh: a build's key names the pack and its
+   * version, not the code that built it, so after a change to how a group
+   * builds (knode's retrieval, entity pages, summaries) its old build would
+   * otherwise come back.
+   */
+  rebuild?: string[];
   /** Tests: stand-ins for Codex, the judge and the embedder. */
   overrides?: { chat?: ChatBackend; judge?: LlmClient; embedder?: EmbeddingProvider };
   onProgress?: (msg: string) => void;
@@ -226,9 +235,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const models = { model: opts.model ?? '', buildEffort: opts.buildEffort ?? 'low', answerEffort: opts.answerEffort ?? 'medium' };
 
   if (opts.reuseBuildsFrom) {
-    const groups = new Set(makeSystems(opts.systems).map((sys) => sys.group));
+    const groups = new Set(makeSystems(opts.systems).map((sys) => sys.group).filter((g) => !opts.rebuild?.includes(g)));
     const n = reuseBuilds(store, path.resolve(opts.reuseBuildsFrom), opts.packs, `${embedder.model} (${embedder.dimensions})`, fraction, seed, groups);
-    progress(`reusing ${n.builds} builds and ${n.vectors} embedding vectors from ${opts.reuseBuildsFrom}`);
+    progress(`reusing ${n.builds} builds and ${n.vectors} embedding vectors from ${opts.reuseBuildsFrom}${opts.rebuild?.length ? `; building ${opts.rebuild.join(', ')} afresh` : ''}`);
     if (n.updated.length) progress(`building again, since ${opts.reuseBuildsFrom} updated them after building: ${n.updated.join(', ')}`);
     store.log('builds reused', { from: opts.reuseBuildsFrom, ...n });
   }
@@ -595,6 +604,7 @@ async function answerAll(
         key, pack: env.pack.manifest.id, system: s.id, taskId: t.id, ...(batch ? { batch } : {}), at: new Date().toISOString(),
         text: a.text, finalAnswer: extractFinalAnswer(a.text),
         citations: a.citations ?? citationsIn(a.text, docs), retrieved: a.retrieved ?? [], toolCalls: a.toolCalls ?? 0,
+        ...(a.commands ? { commands: boundedTrace(a.commands) } : {}),
         ...(a.capped ? { capped: true } : {}), ...(a.leaked?.length ? { leaked: a.leaked } : {}), ...(a.error ? { error: a.error } : {}),
         usage: meter.usage((e) => e.system === s.id && e.task === t.id, mark), ms: Date.now() - t0,
       };

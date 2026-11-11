@@ -43,6 +43,8 @@ export interface SystemAnswer {
   citations?: Citation[];
   retrieved?: string[];
   toolCalls?: number;
+  /** An agent's command lines and MCP tool calls, in order (src/eval/trace.ts); bounded when the record is written. */
+  commands?: string[];
   capped?: boolean;
   leaked?: string[];
   error?: string;

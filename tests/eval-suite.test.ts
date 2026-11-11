@@ -38,6 +38,7 @@ import { recipe, registerRecipe } from '../src/eval/packs/index.js';
 import { extendPack } from '../src/eval/packs/extend.js';
 import { ModelChain, parseChain, SpendLedger } from '../src/eval/chain.js';
 import { runAgent, setAgentRouting } from '../src/eval/agent.js';
+import { boundedTrace, toolsOf, toolUse } from '../src/eval/trace.js';
 import { calibrateEndpoint, preferEndpoint } from '../src/eval/endpoint.js';
 import { researchEmergence } from '../src/eval/packs/research.js';
 import type { KnodeConfig } from '../src/config.js';
@@ -267,6 +268,23 @@ describe('agent audit and metering', () => {
     expect(leakedPaths('ls /usr/bin', cwd)).toEqual([]);
   });
 
+  it('reads the programs and knode tools out of an agent trace', () => {
+    expect(toolsOf('rg -n 林晓 .')).toEqual(['rg']);
+    expect(toolsOf(`/bin/zsh -lc "rg -l '林晓' . | head -n 5"`)).toEqual(['rg', 'head']);
+    expect(toolsOf("bash -lc 'cd chat && LC_ALL=C grep -rn \"a|b\" . ; sed -n 1,20p x.md'")).toEqual(['cd', 'grep', 'sed']);
+    expect(toolsOf('/usr/bin/cat a.md && (ls wiki || true)')).toEqual(['cat', 'ls', 'true']);
+    expect(toolsOf('mcp:knode.knode_resolve {"query":"林晓"}')).toEqual(['knode_resolve']);
+    // an entry cut mid-quote still reads
+    expect(toolsOf(`bash -lc 'rg -n "unterminated`)).toEqual(['rg']);
+    const long = Array.from({ length: 80 }, (_, i) => `cat ${'x'.repeat(400)}${i}`);
+    const t = boundedTrace(long);
+    expect(t).toHaveLength(50);
+    expect(t.every((c) => c.length === 300)).toBe(true);
+    // records written before traces were kept count as untraced, not as zero calls
+    const use = toolUse([{ toolCalls: 3, commands: ['rg -n a .', 'rg -n b . | head', 'cat a.md'] }, { toolCalls: 7 }]);
+    expect(use).toEqual({ n: 2, traced: 1, calls: 3, perTool: { rg: 2, cat: 1, head: 1 } });
+  });
+
   it('round-trips meter tags', () => {
     expect(parseTag(formatTag({ system: 'knode', stage: 'extract', task: 'q1' }))).toEqual({ system: 'knode', stage: 'extract', task: 'q1' });
     expect(parseTag('nonsense', 'call').stage).toBe('call');
@@ -389,7 +407,7 @@ describe('a run on the fixture pack', () => {
   const backend = new ScriptedBackend();
   const judge = scriptedJudge();
   const embedder = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false });
-  const systems = ['knode-ask', 'knode-sag', 'agent-knode-wiki', 'agent-knode-wiki-sources', 'agent-wiki', 'agent-wiki-sources', 'agent-grep', 'rag-hybrid', 'rag-bm25', 'closed-book', 'long-context'];
+  const systems = ['knode-ask', 'knode-sag', 'agent-knode', 'agent-knode-wiki', 'agent-knode-wiki-sources', 'agent-wiki', 'agent-wiki-sources', 'agent-grep', 'rag-hybrid', 'rag-bm25', 'closed-book', 'long-context'];
   let oldPath: string | undefined;
 
   beforeAll(() => {
@@ -445,6 +463,15 @@ describe('a run on the fixture pack', () => {
     const grep = answers.find((a) => a.system === 'agent-grep' && a.taskId === 'q1')!;
     expect(grep.citations.map((c) => c.doc)).toContain('email/2026-03-05.md');
     expect(grep.usage.calls).toBe(1);
+    // each agent session's trace is on its record: shell commands as run, MCP calls with their arguments
+    expect(grep.commands).toEqual(['rg -n 林晓 .', `/bin/zsh -lc "rg -l '林晓' . | head -n 5"`]);
+    expect(grep.toolCalls).toBe(2);
+    const mcp = answers.find((a) => a.system === 'agent-knode' && a.taskId === 'q1')!;
+    expect(mcp.commands).toEqual(['mcp:knode.knode_resolve {"query":"林晓的岗位"}', 'mcp:knode.knode_read {"path":"raw/docs/email/2026-03-05.md"}']);
+    for (const s of ['agent-knode-wiki', 'agent-knode-wiki-sources', 'agent-wiki', 'agent-wiki-sources']) {
+      expect(answers.filter((a) => a.system === s).every((a) => a.commands?.length === 2), s).toBe(true);
+    }
+    expect(answers.filter((a) => !a.system.startsWith('agent-')).every((a) => a.commands === undefined)).toBe(true);
 
     const scores = store.allScores();
     const metric = (system: string, m: string) => scores.filter((s) => s.system === system && s.metric === m);
@@ -475,12 +502,35 @@ describe('a run on the fixture pack', () => {
     expect(md).toContain('Use: corpus-level lists');
     expect(md).toContain('Correctness for its cost');
     expect(md).toContain('Update stream');
+    expect(md).toContain('### Agent tool use');
+    const tools = report.data.tools['fixture-life'];
+    expect(Object.keys(tools).sort()).toEqual(['agent-grep', 'agent-knode', 'agent-knode-wiki', 'agent-knode-wiki-sources', 'agent-wiki', 'agent-wiki-sources']);
+    expect(tools['agent-grep']).toMatchObject({ traced: tools['agent-grep'].n, calls: 2, perTool: { rg: 2, head: 1 } });
+    expect(tools['agent-knode']).toMatchObject({ calls: 2, perTool: { knode_resolve: 1, knode_read: 1 } });
+    expect(md).not.toContain('No trace on');
     const eff = report.data.efficiency['fixture-life'];
     expect(eff['agent-grep'].per1k).toBeGreaterThan(0);
     expect(eff['agent-wiki-sources'].buildTokens).toBe(eff['agent-wiki'].buildTokens);
     expect(eff['agent-wiki'].buildTokens).toBeGreaterThan(0);
     expect(buildReportData(res.runDir).pooled.some((p) => p.system === 'knode-ask')).toBe(true);
   }, 120_000);
+
+  it('reports a run whose agent answers were recorded before traces were kept', () => {
+    const old = path.join(tmp, 'runs', 'untraced');
+    fs.mkdirSync(old, { recursive: true });
+    const lines = [...fileLines(path.join(runDir, 'answers.jsonl'))].filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>)
+      .map((a) => (a.system === 'agent-grep' ? (({ commands: _, ...rest }) => rest)(a) : a));
+    fs.writeFileSync(path.join(old, 'answers.jsonl'), lines.map((a) => JSON.stringify(a)).join('\n') + '\n');
+    const data = buildReportData(old);
+    const grep = data.tools['fixture-life']['agent-grep'];
+    expect(grep.traced).toBe(0);
+    expect(grep.n).toBeGreaterThan(0);
+    expect(grep.perTool).toEqual({});
+    expect(data.tools['fixture-life']['agent-knode'].traced).toBeGreaterThan(0);
+    const md = fs.readFileSync(writeReport(old).md, 'utf8');
+    expect(md).toMatch(/\| agent-grep \| 0\/\d+ \| — \|/);
+    expect(md).toContain(`No trace on agent-grep (${grep.n} of ${grep.n})`);
+  });
 
   it('goes on with an LLM-wiki build from its last finished session', async () => {
     const pack = loadPack(packDir);
@@ -552,6 +602,12 @@ describe('reusing builds', () => {
     const answered = store.allAnswers().filter((a) => a.system !== 'agent-wiki-sources').length;
     expect(backend.calls).toBe(answered);
     expect(store.allAnswers().some((a) => a.system === 'agent-wiki-sources' && !a.error)).toBe(true);
+    // --rebuild knode: the other groups come from r0, knode is built by this run
+    const fresh = await runEval({ packs: [packDir], systems: ['knode-ask', 'rag-hybrid'], runDir: path.join(tmp, 'runs', 'reuse-rebuild'), quota: false, types: ['single-hop'], suites: ['usage'], reuseBuildsFrom: first, rebuild: ['knode'], overrides: { chat: new ScriptedBackend(), judge, embedder } });
+    const rebuilt = new RunStore(fresh.runDir).allBuilds();
+    expect(rebuilt.find((b) => b.system === 'rag')!.notes).toMatchObject({ reusedFrom: 'r0' });
+    expect((rebuilt.find((b) => b.system === 'knode')!.notes as { reusedFrom?: string }).reusedFrom).toBeUndefined();
+    expect(rebuilt.find((b) => b.system === 'knode')!.ok).toBe(true);
     const small = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 64, batchSize: 64, sendDimensions: false });
     await expect(runEval({ packs: [packDir], systems: ['rag-hybrid'], runDir: path.join(tmp, 'runs', 'reuse-64'), quota: false, reuseBuildsFrom: first, overrides: { chat: backend, judge, embedder: small } })).rejects.toThrow(/embedded with .*\(384\); this run embeds with .*\(64\)/);
   }, 120_000);

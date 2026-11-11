@@ -173,6 +173,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--no-quota', 'do not pause for Codex plan windows')
     .option('--skip-scoring', 'answer only; score later with `eval run --run-dir`')
     .option('--reuse-builds-from <runDir>', "start from another run's builds of the same pack versions (and its embedding vectors), instead of building again")
+    .option('--rebuild <groups>', 'with --reuse-builds-from: build these groups afresh (knode, llm-wiki, rag, …), e.g. after a change to how they build')
     .action(async (opts) => {
       const res = await runEval({
         packs: csv(opts.pack)!.map(resolvePack),
@@ -210,6 +211,7 @@ export function registerEvalCommands(program: Command): void {
         quota: opts.quota,
         skipScoring: opts.skipScoring,
         reuseBuildsFrom: opts.reuseBuildsFrom,
+        rebuild: csv(opts.rebuild),
         onProgress: (m) => console.log(`  ${m}`),
       });
       const report = writeReport(res.runDir);

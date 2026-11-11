@@ -235,6 +235,12 @@ export interface Answer {
   /** Documents the system looked at or retrieved, best first (agents: files they read). */
   retrieved: string[];
   toolCalls: number;
+  /**
+   * An agent's trace: its command lines and `mcp:<server>.<tool> <args>`
+   * calls, in order, at most 50 of 300 characters each (src/eval/trace.ts).
+   * Absent on non-agent systems and on records written before traces were kept.
+   */
+  commands?: string[];
   /** An agent stopped at its step cap. */
   capped?: boolean;
   /** An agent touched a path outside its corpus copy: the answer is void. */

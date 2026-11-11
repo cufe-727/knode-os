@@ -5,6 +5,7 @@ import { chartBlock } from '../research/chart.js';
 import { bootstrapMean, holm, mean, pairedBootstrap, round, wilson } from './metrics/stats.js';
 import { RunStore } from './runstore.js';
 import { SYSTEMS } from './systems/index.js';
+import { toolUse, type ToolUse } from './trace.js';
 import { CORPUS_TASK_TYPES, type BuildRecord, type ScoreRecord } from './types.js';
 
 /**
@@ -61,6 +62,12 @@ export interface ReportData {
   emergence: Record<string, Record<string, Record<string, Cell>>>;
   generation: Record<string, Record<string, Record<string, Cell>>>;
   perQuery: Record<string, Record<string, { latencyP50: number; toolCalls: number; weightedTokens: number; costUsd: number; n: number; capped: number; leaked: number; errors: number }>>;
+  /**
+   * What the agents did, per pack and agent system: tool calls per answer and
+   * the programs (shell agents) or knode tools (the MCP agent) behind them,
+   * from the traces on the answer records.
+   */
+  tools: Record<string, Record<string, ToolUse>>;
   builds: BuildRecord[];
   breakEven: Record<string, Record<string, number | null>>;
   /** Corpus-level list tasks (aggregate, timeline, contradiction, profile) per pack and system. */
@@ -138,6 +145,19 @@ export function buildReportData(runDir: string): ReportData {
     }
   }
 
+  // every agent-* system, and anything else that left a trace; records from before traces count as untraced
+  const tools: ReportData['tools'] = {};
+  const agentAnswers = new Map<string, typeof answers>();
+  for (const a of answers) {
+    if (!a.system.startsWith('agent-') && !a.commands) continue;
+    const k = `${a.pack}\u0000${a.system}`;
+    (agentAnswers.get(k) ?? agentAnswers.set(k, []).get(k)!).push(a);
+  }
+  for (const [k, as] of agentAnswers) {
+    const [pack, system] = k.split('\u0000');
+    (tools[pack] ??= {})[system] = toolUse(as);
+  }
+
   // queries after which a build has paid for itself against the grep agent's per-query cost
   const breakEven: ReportData['breakEven'] = {};
   for (const b of builds.filter((x) => x.ok && !x.system.includes('@'))) {
@@ -188,7 +208,7 @@ export function buildReportData(runDir: string): ReportData {
   const judgeEvents = fs.existsSync(path.join(runDir, 'meter.jsonl'))
     ? fs.readFileSync(path.join(runDir, 'meter.jsonl'), 'utf8').split('\n').filter((l) => l.includes('"__judge__"')).length
     : 0;
-  return { run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, builds, breakEven, lists, efficiency, updates, pooled, byType, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 } };
+  return { run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, tools, builds, breakEven, lists, efficiency, updates, pooled, byType, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 } };
 }
 
 /** Correctness per 1k query tokens, and with the build counted: break-even against agent-grep and amortized over 100 / 1000 queries. */
@@ -257,6 +277,34 @@ function table(rows: Record<string, Record<string, Cell>>, metrics: readonly str
   return mdTable(['system', ...used, 'n'], systems.map((s) => [s, ...used.map((m) => fmt(rows[s][m], digits)), String(Math.max(...used.map((m) => rows[s][m]?.n ?? 0)))]));
 }
 
+/** Programs shown by name in the agent tool-use table, beside every knode tool used; the rest are summed as "other". */
+const TOOL_COLUMNS = 8;
+
+/**
+ * Agent tool use: calls per answer, then the most used programs and knode
+ * tools as uses per answer (a pipeline `rg … | head` is one call and two
+ * uses), over the answers that carry a trace.
+ */
+function toolTable(tu: Record<string, ToolUse>): string[] {
+  const systems = Object.keys(tu).sort();
+  const total = new Map<string, number>();
+  for (const s of systems) for (const [t, v] of Object.entries(tu[s].perTool)) total.set(t, (total.get(t) ?? 0) + v);
+  const ranked = [...total].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([t]) => t);
+  // knode's tools are what the table is for: never folded into "other" behind the shell agents' programs
+  const shown = [...ranked.filter((t) => !t.startsWith('knode_')).slice(0, TOOL_COLUMNS), ...ranked.filter((t) => t.startsWith('knode_'))];
+  const others = [...total.keys()].filter((t) => !shown.includes(t));
+  const out = ['### Agent tool use', '', 'Per answer, over the answers that carry a trace: tool calls (shell commands and MCP calls), then uses of each program (shell agents) or knode tool (MCP agent). A pipeline such as `rg … | head` is one call and two uses.', ''];
+  out.push(mdTable(['system', 'traced', 'calls', ...shown, ...(others.length ? ['other'] : [])], systems.map((s) => {
+    const x = tu[s];
+    if (!x.traced) return [s, `0/${x.n}`, '—', ...shown.map(() => '—'), ...(others.length ? ['—'] : [])];
+    const f = (v: number | undefined) => (v ? v.toFixed(1) : '0');
+    return [s, `${x.traced}/${x.n}`, x.calls.toFixed(1), ...shown.map((t) => f(x.perTool[t])), ...(others.length ? [f(others.reduce((sum, t) => sum + (x.perTool[t] ?? 0), 0))] : [])];
+  })), '');
+  const untraced = systems.filter((s) => tu[s].traced < tu[s].n);
+  if (untraced.length) out.push(`No trace on ${untraced.map((s) => `${s} (${tu[s].n - tu[s].traced} of ${tu[s].n})`).join(', ')}: answers recorded before agent traces were kept, or that failed before the session ran.`, '');
+  return out;
+}
+
 export function renderReport(d: ReportData): string {
   const meta = d.run;
   const lines: string[] = [];
@@ -295,6 +343,8 @@ export function renderReport(d: ReportData): string {
         ], source: 'answers.jsonl, scores.jsonl' }), '');
       }
     }
+    const tu = d.tools[pack];
+    if (tu) lines.push(...toolTable(tu));
     const l = d.lists[pack];
     if (l) lines.push('### Use: corpus-level lists (aggregate, timeline, contradiction, profile)', '', 'Correctness here is set F1 (recall where the gold is a sample), times order accuracy for a timeline; em is a count\'s exact number.', '', table(l, LIST_METRICS), '');
     const eff = d.efficiency[pack];

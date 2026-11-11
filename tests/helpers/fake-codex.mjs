@@ -17,7 +17,14 @@ process.stdin.on('data', (d) => (prompt += d));
 process.stdin.on('end', () => {
   const emit = (e) => process.stdout.write(JSON.stringify(e) + '\n');
   emit({ type: 'thread.started', thread_id: 'fake-thread' });
-  emit({ type: 'item.started', item: { type: 'command_execution', command: 'rg -n 林晓 .' } });
+  // the session's trace: knode's tools when it has the MCP server, else a search and a wrapped pipeline
+  if (args.some((a) => a.startsWith('mcp_servers.knode.'))) {
+    emit({ type: 'item.started', item: { type: 'mcp_tool_call', server: 'knode', tool: 'knode_resolve', arguments: { query: '林晓的岗位' } } });
+    emit({ type: 'item.started', item: { type: 'mcp_tool_call', server: 'knode', tool: 'knode_read', arguments: { path: 'raw/docs/email/2026-03-05.md' } } });
+  } else {
+    emit({ type: 'item.started', item: { type: 'command_execution', command: 'rg -n 林晓 .' } });
+    emit({ type: 'item.started', item: { type: 'command_execution', command: `/bin/zsh -lc "rg -l '林晓' . | head -n 5"` } });
+  }
   let answer;
   const ingest = /Ingest these new sources into the wiki now: (.+)\./.exec(prompt);
   if (ingest) {

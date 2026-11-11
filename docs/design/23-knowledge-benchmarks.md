@@ -220,7 +220,11 @@ knode-os eval report ~/knode-eval/runs/<stamp>
 - `--fraction` and `--seed` give scale curves and run-to-run variance. Above 1, `--fraction` stages the pack's padding (10 = ten times the
   documents); a pack with too little padding is refused. Long-context is applicable by the staged size.
 - `--types aggregate,timeline,contradiction,profile,deep-hop,update` runs only those tasks; `--reuse-builds-from <run>` starts from another
-  run's builds of the same pack versions (refused when it embedded with another model).
+  run's builds of the same pack versions (refused when it embedded with another model). A build's key names the pack version, not the
+  code that built it: `--rebuild knode` (groups, comma-separated) builds those groups afresh after a change to how they build.
+- Every agent answer keeps its trace (`commands` on the answer record: the session's shell command lines and `mcp:<server>.<tool> <args>`
+  calls, in order, at most 50 of 300 characters each). The report's "Agent tool use" table turns it into calls per answer and uses
+  per program (`rg`, `sed`, `cat`, …) or knode tool; answers recorded before traces were kept are counted and named as untraced.
 - `knode-os eval pack extend <pack> [--corpus <json>] [--padding <n>] [--no-author]` adds corpus-level tasks and padding to a built pack.
 - `--chat-chain`, `--agent-chain`, `--judge-chain` (run) and `--author-chain` (pack build, extend) take budgeted chains such as
   `openai-api:200,codex-cli` over the `--config-from` workspace's connections (D18); spend lands in `~/knode-eval/spend.jsonl`.
