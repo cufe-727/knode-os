@@ -4,6 +4,7 @@ import { appendLog } from '../fs/datadir.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
+import { ensureCorpusPages } from './corpus.js';
 import { ensureEntitiesIndex, ensureEntityStubs, ensureSourceSummaries, ensureSourcesIndex, PagesContext, reconcileViews } from './pages.js';
 
 /**
@@ -15,6 +16,9 @@ import { ensureEntitiesIndex, ensureEntityStubs, ensureSourceSummaries, ensureSo
  * - a page per live entity worth one under wiki/entities/ (several documents
  *   speak of it, or it holds a few claims), listed in wiki/entities/index.md
  * - a managed "sources" region in wiki/sources/index.md listing every document
+ * - pages across documents (./corpus.ts): where each well-documented name is
+ *   mentioned (wiki/mentions/), the dated claims of every entity by period
+ *   (wiki/timelines/), and where the sources disagree (wiki/disagreements/)
  * Every page declares its inputs; later syncs regenerate or archive it as the
  * graph changes. Returns the paths generated in this run.
  */
@@ -43,6 +47,7 @@ export async function generateWiki(
   // on the Summarize stage's own route, which says whether it can run
   created.push(...await ensureSourceSummaries(ctx, { limit: opts.limit ?? 20, actor: 'wiki', onProgress: progress }));
   created.push(...await ensureEntityStubs(ctx, { actor: 'wiki' }));
+  created.push(...await ensureCorpusPages(ctx, { actor: 'wiki' }));
   await ensureSourcesIndex(ctx, { actor: 'wiki' });
   const rec = await reconcileViews(ctx, { actor: 'wiki', llm: true, onProgress: progress });
   // after the pages are in their current form: the index lists what each one now holds
