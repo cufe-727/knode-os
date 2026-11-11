@@ -7,6 +7,7 @@ import { Params, TimeInput, rowLiveAt, toIso, toDateString } from '../store/temp
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { boostByHeat, recordChunkHits } from '../stats/heat.js';
 import { SearchResult } from '../types.js';
+import { longestSpans, spellingSpans, weakSpelling } from '../graph/normalize.js';
 
 export type SearchMode = 'hybrid' | 'vector' | 'keyword' | 'sag';
 
@@ -501,71 +502,156 @@ export function entityMatchSql(
   return `(${MATCH_INDEXES.entities.expr(alias)} @@ ${p.add(gramQuery(grams, 1))}::tsquery AND (${exact}))`;
 }
 
+/** Units of a query read for the entities it names: a pasted paragraph is read by its start. */
+const NAMED_UNITS_MAX = 120;
+
 /**
- * Chunks mentioning entities whose name/alias matches the query (graph
- * signal): one row per chunk, ranked by how many matching entities it
- * mentions, then by how often those entities are mentioned overall, then by
- * id — RRF reads the rank, so the order must not be the planner's. An entity
- * counts when it was live at `asOf` (the evidence test the other graph routes
- * use), not merely now. `raw` is the matching-entity count, as in graphSearch.
+ * The entities a query names, live at `asOf`: every run of its words (or of
+ * its CJK characters) that is one of an entity's spellings, looked up by the
+ * normalized keys entity resolution keeps (`entity_alias_keys`, on its
+ * index), with the entities merged into them. The rules are `findLinks`':
+ * a Latin spelling matches whole words, a CJK one anywhere in a run, a
+ * number of fewer than five digits or a Latin spelling of fewer than three
+ * letters names nothing, and where two spellings overlap the longer wins
+ * ("Large Language Models", not "Language Models" beside it). Unlike the link
+ * index it reads every type of entity: law-cn's statutes and its 本法 are
+ * concepts.
  *
- * "How often" sums each matching entity's mention_count once per mention row
- * it has in the chunk. A query term as common as "存储" or "AI" matches
- * entities with hundreds of thousands of mention rows between them, so the
- * rows are counted per entity, off its own index, and the live documents
- * joined by hash, before any chunk text is read: over 47 agent queries on a
- * copy of finance, 832 ms → 186 ms at the median, 3.0 s → 1.1 s at worst, the
- * same rankings.
+ * Keys are kept for live entities only, so an entity retired since `asOf`
+ * is not found here; the term match the channel falls back on still finds it.
  */
-async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
+async function namedInQuery(store: Store, query: string, asOf?: TimeInput): Promise<string[]> {
+  const spans = spellingSpans(query, NAMED_UNITS_MAX).filter((s) => !weakSpelling(s.key));
+  if (spans.length === 0) return [];
+  const p = new Params([[...new Set(spans.map((s) => s.key))]]);
+  const entityLive = rowLiveAt('e', 'entity', p, asOf);
+  const rows = await store.query<{ alias_key: string; id: string }>(
+    `SELECT k.alias_key, e.id FROM entity_alias_keys k JOIN entities e ON e.id = k.entity_id
+     WHERE k.alias_key = ANY($1::text[]) AND ${entityLive}`,
+    p.list,
+  );
+  const byKey = new Map<string, string[]>();
+  for (const r of rows) byKey.set(r.alias_key, [...(byKey.get(r.alias_key) ?? []), r.id]);
+  const ids = new Set(longestSpans(spans.filter((s) => byKey.has(s.key))).flatMap((s) => byKey.get(s.key)!));
+  if (ids.size === 0) return [];
+  // a merged entity's mentions may still be filed under its own id
+  const q = new Params([[...ids]]);
+  const memberLive = rowLiveAt('e', 'entity', q, asOf);
+  for (const r of await store.query<{ id: string }>(`SELECT e.id FROM entities e WHERE e.canonical_id = ANY($1::text[]) AND ${memberLive}`, q.list)) ids.add(r.id);
+  return [...ids];
+}
+
+/** Live entities (at `asOf`) whose name or alias holds one of the query's terms: what the graph channel matched before it read names. */
+async function entitiesHoldingTerms(store: Store, query: string, asOf?: TimeInput): Promise<string[]> {
   const terms = queryTerms(query, 5);
   if (terms.length === 0) return [];
   const p = new Params();
-  const named = entityMatchSql(store, 'e', terms, p);
+  const holding = entityMatchSql(store, 'e', terms, p);
   const entityLive = rowLiveAt('e', 'entity', p, asOf);
+  return (await store.query<{ id: string }>(`SELECT e.id FROM entities e WHERE ${holding} AND ${entityLive}`, p.list)).map((r) => r.id);
+}
+
+/**
+ * Chunks mentioning the entities the query names (graph signal): one row per
+ * chunk, ranked by the summed rarity of the named entities it mentions — each
+ * weighted by the BM25 IDF of the chunks it is mentioned in, as the keyword
+ * channel weighs a term — then by how many it mentions, then by id: RRF reads
+ * the rank, so the order must not be the planner's. A query that names no
+ * entity is matched as before, by the entities whose name or alias holds one
+ * of its terms. An entity counts when it was live at `asOf` (the evidence
+ * test the other graph routes use), not merely now. `raw` is the summed IDF.
+ *
+ * It used to match every entity holding a query term as a substring and rank
+ * by how many such entities a chunk mentions, then by their summed mention
+ * counts: fragments of the question's words, and a preference for the chunks
+ * about the most popular entities. On copies of the 2026-11 pilot's five
+ * public packs (180 questions, recall@5 of gold documents among the channel's
+ * own hits) that put 0.28 in the top five; naming plus rarity puts 0.51
+ * there (public-musique 0.21 → 0.40, research-ai 0.40 → 0.74, medicine-us
+ * 0.20 → 0.68, synthetic-life-zh 0.17 → 0.30, law-cn 0.40 → 0.44); names
+ * alone, without the fallback, 0.49. Measured and left out, each costing
+ * hybrid recall somewhere against this channel: normalising by how many
+ * entities a chunk mentions (0.50 alone; synthetic-life-zh and medicine-us
+ * lower), letting overlapping spellings all count (0.55; public-musique
+ * lower), the term match beside the names at a tenth of their weight (0.54;
+ * law-cn lower), one hop through relations to the named entities'
+ * neighbours at 0.1 or 0.3 of their weight (0.55 and 0.54;
+ * synthetic-life-zh and public-musique lower), and letting chunks of equal
+ * score share one rank (synthetic-life-zh lower).
+ *
+ * The mention rows are read per entity, off its own index, and the live
+ * documents joined by hash, before any chunk text is read: a hub such as
+ * "AI" has hundreds of thousands of mention rows (over 47 agent queries on a
+ * copy of finance, that shape took the old query from 832 ms to 186 ms at the
+ * median). The same rows give each entity's chunk count for its IDF.
+ */
+async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
+  let seeds = await namedInQuery(store, query, asOf);
+  if (seeds.length === 0) seeds = await entitiesHoldingTerms(store, query, asOf);
+  if (seeds.length === 0) return [];
+  const p = new Params([seeds]);
   const cond = docLiveAt('d', p, asOf, filter);
+  const total = p.add(await chunkTotal(store));
   const lim = p.add(k);
   return store.query<RankedChunk>(
-    `WITH matched AS MATERIALIZED (
-       SELECT e.id, e.mention_count FROM entities e WHERE ${named} AND ${entityLive}
+    `WITH seeds AS MATERIALIZED (
+       SELECT DISTINCT unnest($1::text[]) AS id
      ), docs AS MATERIALIZED (
        SELECT d.id FROM documents d WHERE ${cond}
-     ), per_chunk AS (
-       SELECT x.chunk_id, min(x.document_id) AS document_id,
-              count(*) AS matches, sum(e.mention_count * x.mentions) AS weight
-       FROM matched e
+     ), hits AS MATERIALIZED (
+       SELECT s.id AS entity_id, x.chunk_id, x.document_id, count(*) OVER (PARTITION BY s.id)::float AS df
+       FROM seeds s
        CROSS JOIN LATERAL (
-         SELECT m.chunk_id, min(m.document_id) AS document_id, count(*) AS mentions
-         FROM entity_mentions m WHERE m.entity_id = e.id
+         SELECT m.chunk_id, min(m.document_id) AS document_id
+         FROM entity_mentions m WHERE m.entity_id = s.id
          GROUP BY m.chunk_id
        ) x
-       GROUP BY x.chunk_id
+     ), per_chunk AS (
+       SELECT h.chunk_id, min(h.document_id) AS document_id, count(*) AS matches,
+              sum(ln(1 + (greatest(${total}::float, h.df) - h.df + 0.5) / (h.df + 0.5))) AS weight
+       FROM hits h
+       GROUP BY h.chunk_id
      ), ranked AS (
        SELECT pc.chunk_id, pc.matches, pc.weight
        FROM per_chunk pc JOIN docs ON docs.id = pc.document_id
-       ORDER BY pc.matches DESC, pc.weight DESC, pc.chunk_id
+       ORDER BY pc.weight DESC, pc.matches DESC, pc.chunk_id
        LIMIT ${lim}
      )
-     SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, r.matches::float AS raw
+     SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, r.weight AS raw
      FROM ranked r
      JOIN chunks c ON c.id = r.chunk_id
      JOIN documents d ON d.id = c.document_id
-     ORDER BY r.matches DESC, r.weight DESC, c.id`,
+     ORDER BY r.weight DESC, r.matches DESC, c.id`,
     p.list,
   );
 }
+
 
 /**
  * What a rank in each recall channel is worth in the fusion.
  *
  * The graph channel ranks chunks by the entities they mention, not by what
- * they say: alone it puts 32% of the benchmark's gold documents in its top
- * five, where vectors put 79% and keywords 75% (the 2026-11 pilot's
- * workspaces for five public packs, 180 questions). At 0.6 its ranks outvoted the other two often enough to
- * cost the fusion five points (0.75 against 0.79 without it). At 0.2 it costs
- * nothing measurable and still does what only it can: it lifts a chunk the
- * others found that also names the query's entity, and it brings in a chunk
- * that names it under another spelling when they found too few.
+ * they say. Measured on copies of the 2026-11 pilot's workspaces for five
+ * public packs (180 questions, recall@5 of gold source documents): vectors
+ * alone 0.79, keywords alone 0.75, the graph channel alone 0.51 (0.28 when it
+ * matched entities by fragments of the query's terms). Hybrid recall by graph
+ * weight, mean over the packs (synthetic-life-zh / research-ai / law-cn /
+ * medicine-us / public-musique):
+ *
+ *   0    0.793  (0.717 / 0.966 / 0.897 / 0.845 / 0.540)
+ *   0.1  0.801  (0.742 / 0.966 / 0.889 / 0.869 / 0.540)
+ *   0.2  0.802  (0.742 / 0.966 / 0.890 / 0.869 / 0.540)
+ *   0.3  0.800  (0.742 / 0.966 / 0.887 / 0.873 / 0.530)
+ *   0.4  0.802  (0.742 / 0.966 / 0.887 / 0.873 / 0.540)
+ *   0.6  0.795  (0.742 / 0.966 / 0.867 / 0.861 / 0.540)
+ *   1.0  0.798  (0.755 / 0.961 / 0.867 / 0.856 / 0.550)
+ *
+ * The old channel gave 0.787 at 0.2 (0.717 / 0.966 / 0.890 / 0.822 / 0.540)
+ * and 0.773 at 0.4. At 0.2 no pack is below that; from 0.3 on law-cn is,
+ * where the statute a question names is in fifty chunks and the article it
+ * asks about in one. What the channel adds is mostly medicine-us and
+ * synthetic-life-zh: a question naming a trial or a person gets the chunks
+ * about it lifted over chunks that only resemble it.
  */
 export const FUSION_WEIGHTS: Record<SearchChannelName, number> = { vector: 1.0, keyword: 1.0, graph: 0.2 };
 

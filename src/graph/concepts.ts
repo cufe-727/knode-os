@@ -24,7 +24,7 @@ import {
 } from './concept-stoplist.js';
 import type { TrustTier } from '../lineage/trust.js';
 import { wikilinkName } from './frontmatter.js';
-import { keyOf, mentionKeys } from './normalize.js';
+import { SPELLING_MAX_CHARS, keyOf, longestSpans, mentionKeys, textUnits, unitsJoin, weakSpelling } from './normalize.js';
 import { loadOntology } from './ontology.js';
 import { resolutionMode } from './resolve.js';
 import { PageContext } from './store.js';
@@ -300,17 +300,7 @@ export interface LinkIndex {
   maxChars: number;
 }
 
-const MAX_KEY_CHARS = 32;
-/** Latin words of one name may be separated by this much (a space, a hyphen, "C. A. T. L"). CJK keys match without gaps. */
-const LATIN_GAP = 2;
-const GAP_RE = /^[\s\-.·'’&]*$/;
-
-/** A number of fewer than this many digits is a date, a count or a price before it is a ticker. */
-const MIN_NUMERIC_KEY = 5;
-/** A Latin spelling shorter than this is an abbreviation that turns up in any text. */
-const MIN_LATIN_KEY = 3;
-const DIGITS_RE = /^\d+$/;
-const ASCII_KEY_RE = /^[a-z0-9]+$/;
+const MAX_KEY_CHARS = SPELLING_MAX_CHARS;
 
 /**
  * A spelling that must not link a document on its own, whatever entity it
@@ -324,8 +314,9 @@ const ASCII_KEY_RE = /^[a-z0-9]+$/;
  * corpus's hub and linking it is the point.
  */
 export function weakLinkKey(key: string, opts: { isName: boolean; stop?: ReadonlySet<string>; aliasStop?: ReadonlySet<string> }): boolean {
-  if (DIGITS_RE.test(key)) return key.length < MIN_NUMERIC_KEY;
-  if (ASCII_KEY_RE.test(key) && key.length < MIN_LATIN_KEY) return true;
+  if (weakSpelling(key)) return true;
+  // a long number is a ticker or a code, whatever the stop list says
+  if (/^\d+$/.test(key)) return false;
   if (opts.stop?.has(key)) return true;
   return !opts.isName && Boolean(opts.aliasStop?.has(key));
 }
@@ -365,27 +356,6 @@ export interface LinkSpan {
   candidate: LinkCandidate;
 }
 
-interface Unit {
-  key: string;
-  start: number;
-  end: number;
-  han: boolean;
-}
-
-/** A Han character, or a run of other letters and digits: the atoms a key is matched from (NFKC-folded per atom, offsets kept). */
-const UNIT_RE = /\p{Script=Han}|(?:(?!\p{Script=Han})[\p{L}\p{N}])+/gu;
-
-function unitsOf(text: string): Unit[] {
-  const out: Unit[] = [];
-  for (const m of text.matchAll(UNIT_RE)) {
-    const raw = m[0];
-    const key = keyOf(raw);
-    if (!key) continue;
-    out.push({ key, start: m.index!, end: m.index! + raw.length, han: HAN_RE.test(raw) });
-  }
-  return out;
-}
-
 /**
  * Every place a known spelling occurs in the text. Latin spellings match whole
  * words (a name of several words may be split by a space or a hyphen), CJK
@@ -395,17 +365,13 @@ export function findLinks(text: string, index: LinkIndex, extra?: LinkIndex): Li
   const indexes = extra ? [index, extra] : [index];
   const maxChars = Math.max(...indexes.map((ix) => ix.maxChars));
   if (maxChars === 0) return [];
-  const units = unitsOf(text);
+  const units = textUnits(text);
   const found: LinkSpan[] = [];
   for (let i = 0; i < units.length; i++) {
     let acc = '';
     for (let j = i; j < units.length; j++) {
       const u = units[j];
-      if (j > i) {
-        const prev = units[j - 1];
-        const gap = u.start - prev.end;
-        if (gap > 0 && (u.han || prev.han || gap > LATIN_GAP || !GAP_RE.test(text.slice(prev.end, u.start)))) break;
-      }
+      if (j > i && !unitsJoin(text, units[j - 1], u)) break;
       acc += u.key;
       if (acc.length > maxChars) break;
       let alive = false;
@@ -417,10 +383,7 @@ export function findLinks(text: string, index: LinkIndex, extra?: LinkIndex): Li
       if (!alive) break;
     }
   }
-  found.sort((a, b) => b.end - b.start - (a.end - a.start) || a.start - b.start);
-  const taken: LinkSpan[] = [];
-  for (const s of found) if (!taken.some((t) => s.start < t.end && t.start < s.end)) taken.push(s);
-  return taken.sort((a, b) => a.start - b.start);
+  return longestSpans(found);
 }
 
 /** The text with the given spans blanked (same length, so offsets stay valid). */
