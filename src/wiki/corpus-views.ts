@@ -45,8 +45,13 @@ const linked = (name: string, page: string | null | undefined) => (page ? `[[${n
 
 /* -------------------------------- mentions ------------------------------- */
 
-/** Documents a mention page lists at most, by path; past that it says how many it found. */
-export const MENTION_PAGE_DOCS = 200;
+/**
+ * Documents a mention page lists at most — the ones that use the names most,
+ * shown by path; past that it says how many it found. At ~400 bytes a line,
+ * 300 pages of 100 lines are 12 MB on a workspace of 27,000 documents, under
+ * the 19 MB its 13,606 summary pages take; at 200 they would be more.
+ */
+export const MENTION_PAGE_DOCS = 100;
 /** Chunks naming the family read at most for one page: past that the page says "at least". */
 const MENTION_SCAN_CHUNKS = 4000;
 /** Variants a family takes at most, the most mentioned first. */
@@ -253,7 +258,9 @@ const mentions: PageGenerator = {
     // chapter, an alias such as 本法) lists nearly everything: the sources index does that already
     const [{ n: corpus }] = await ctx.store.query<{ n: number }>(`SELECT count(*)::int AS n FROM documents WHERE root = 'docs' AND status = 'indexed'`);
     if (corpus >= MENTION_BROAD_CORPUS && docs.length > corpus * MENTION_BROAD_SHARE) return null;
-    const listed = docs.slice(0, MENTION_PAGE_DOCS);
+    const uses = (d: MentionDoc) => d.names.reduce((a, [, n]) => a + n, 0);
+    const listed = docs.length <= MENTION_PAGE_DOCS ? docs
+      : [...docs].sort((a, b) => uses(b) - uses(a) || (a.path < b.path ? -1 : 1)).slice(0, MENTION_PAGE_DOCS).sort((a, b) => (a.path < b.path ? -1 : 1));
     const page: PagePlan = {
       deps: [
         { kind: 'entity', id: e.id, required: true, sha: e.fold_sha },
@@ -276,7 +283,7 @@ const mentions: PageGenerator = {
     const lines = [
       `# ${e.name} — where it is mentioned`,
       '',
-      `_${count} name ${e.name}${family}${total > docs.length ? `; the first ${docs.length} by path are listed — \`knode_search\` for "${e.name}" finds the rest` : ''}._`,
+      `_${count} name ${e.name}${family}${total > docs.length ? `; the ${docs.length} that use the names most are listed — \`knode_search\` for "${e.name}" finds the rest` : ''}._`,
       `Each line: the document, the names it uses and how often, the articles or sections they are in, and its first passage.${e.wiki_path ? ` What is claimed about it: [[${e.name}]].` : ''}`,
       '',
       ...docs.map((d) => {
