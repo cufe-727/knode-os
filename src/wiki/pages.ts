@@ -175,9 +175,10 @@ const entityStub: PageGenerator = {
     );
     const relations = await ctx.store.query<PageRelation & { fold_sha: string }>(
       `SELECT r.id, r.type, r.description, (r.source_id = $1) AS out, o.name AS other, o.wiki_path AS other_page, r.fold_sha,
+              -- a relation a document declares is evidence of its doc scope, one the model extracted of its tier1 scope: both are keyed by the document's path
               COALESCE(d.path, (
                 SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
-                WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL AND s.kind = 'doc'
+                WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL AND s.kind IN ('doc', 'tier1')
                 ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
        FROM relations r
        JOIN entities o ON o.id = CASE WHEN r.source_id = $1 THEN r.target_id ELSE r.source_id END
