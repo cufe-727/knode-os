@@ -566,8 +566,8 @@ async function entitiesHoldingTerms(store: Store, query: string, asOf?: TimeInpu
  * counts: fragments of the question's words, and a preference for the chunks
  * about the most popular entities. On copies of the 2026-11 pilot's five
  * public packs (180 questions, recall@5 of gold documents among the channel's
- * own hits) that put 0.29 in the top five; naming plus rarity puts 0.51
- * there (public-musique 0.21 → 0.40, research-ai 0.44 → 0.74, medicine-us
+ * own hits) that put 0.28 in the top five; naming plus rarity puts 0.51
+ * there (public-musique 0.21 → 0.40, research-ai 0.40 → 0.74, medicine-us
  * 0.20 → 0.68, synthetic-life-zh 0.17 → 0.30, law-cn 0.40 → 0.44); names
  * alone, without the fallback, 0.49. Measured and left out, each costing
  * hybrid recall somewhere against this channel: normalising by how many
@@ -633,22 +633,25 @@ async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput
  * The graph channel ranks chunks by the entities they mention, not by what
  * they say. Measured on copies of the 2026-11 pilot's workspaces for five
  * public packs (180 questions, recall@5 of gold source documents): vectors
- * alone 0.79, keywords alone 0.75, the graph channel alone 0.51 (0.29 when it
+ * alone 0.79, keywords alone 0.75, the graph channel alone 0.51 (0.28 when it
  * matched entities by fragments of the query's terms). Hybrid recall by graph
  * weight, mean over the packs (synthetic-life-zh / research-ai / law-cn /
  * medicine-us / public-musique):
  *
  *   0    0.793  (0.717 / 0.966 / 0.897 / 0.845 / 0.540)
+ *   0.1  0.801  (0.742 / 0.966 / 0.889 / 0.869 / 0.540)
  *   0.2  0.802  (0.742 / 0.966 / 0.890 / 0.869 / 0.540)
+ *   0.3  0.800  (0.742 / 0.966 / 0.887 / 0.873 / 0.530)
  *   0.4  0.802  (0.742 / 0.966 / 0.887 / 0.873 / 0.540)
+ *   0.6  0.795  (0.742 / 0.966 / 0.867 / 0.861 / 0.540)
+ *   1.0  0.798  (0.755 / 0.961 / 0.867 / 0.856 / 0.550)
  *
- * and with names alone (no term fallback) 0.801 at 0.3, 0.797 at 0.6, 0.795
- * at 1.0, law-cn falling to 0.867. The old channel gave 0.787 at 0.2 and
- * 0.775 at 0.4. At 0.2 no pack is below the old channel's hybrid recall; at
- * 0.4 law-cn is, where the statute a question names is in fifty chunks and
- * the article it asks about in one. What the channel adds is mostly
- * medicine-us and synthetic-life-zh: a question naming a trial or a person
- * gets the chunks about it lifted over chunks that only resemble it.
+ * The old channel gave 0.787 at 0.2 (0.717 / 0.966 / 0.890 / 0.822 / 0.540)
+ * and 0.773 at 0.4. At 0.2 no pack is below that; from 0.3 on law-cn is,
+ * where the statute a question names is in fifty chunks and the article it
+ * asks about in one. What the channel adds is mostly medicine-us and
+ * synthetic-life-zh: a question naming a trial or a person gets the chunks
+ * about it lifted over chunks that only resemble it.
  */
 export const FUSION_WEIGHTS: Record<SearchChannelName, number> = { vector: 1.0, keyword: 1.0, graph: 0.2 };
 
