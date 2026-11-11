@@ -40,7 +40,8 @@ export async function scoreEmergence(input: EmergenceInput, judge: Judge): Promi
       if (parsed.confidence !== null) put(a, t, 'brier', (parsed.confidence - (ok ? 1 : 0)) ** 2);
       continue;
     }
-    if (t.scoring !== 'set' || !t.items?.length) continue;
+    // corpus-level lists (a list spec) are scored by score/lists.ts
+    if (t.scoring !== 'set' || !t.items?.length || t.list) continue;
     const docs = input.corpusDocs.get(a.pack) ?? new Set();
     const minEvidence = Number(t.meta?.minEvidence ?? 1);
     const items = parsed.items.slice(0, 10);

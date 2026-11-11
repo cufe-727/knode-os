@@ -53,6 +53,10 @@ function rag(mode: 'bm25' | 'vector' | 'hybrid'): SystemUnderTest {
     async reopen(env) {
       await buildIndex(env);
     },
+    // an update batch re-indexes the staged corpus: the shim's vector cache embeds only the new chunks
+    async update(_files, env) {
+      await buildIndex(env);
+    },
     async retrieve(query, k, env) {
       return [...new Set((await ranked(mode, query, k * 2, env)).map((c) => c.doc))].slice(0, k);
     },

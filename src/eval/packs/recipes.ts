@@ -4,6 +4,7 @@ import { registerLiteratureRecipes } from './literature.js';
 import { registerMedicineRecipes } from './medicine.js';
 import { registerPersonalRecipes } from './personal.js';
 import { registerPublicRecipes } from './public.js';
+import { registerReportRecipes } from './reports.js';
 import { registerResearchRecipes } from './research.js';
 import { registerSyntheticRecipes } from './synthetic.js';
 
@@ -20,3 +21,4 @@ registerMedicineRecipes();
 registerPersonalRecipes();
 registerFinanceRecipes();
 registerPublicRecipes();
+registerReportRecipes();

@@ -16,20 +16,34 @@ export const TASK_TYPES = [
   'single-hop', 'multi-hop', 'aggregation', 'comparison', 'temporal', 'unanswerable', 'global', 'numeric',
   'style', 'attribution', 'themes', 'forecast', 'affect', 'needs',
   'update', 'conflict', 'injection', 'cross-lingual', 'counterfactual',
+  // corpus-level use (docs/design/23 §2.1): evidence spread over at least CORPUS_TASK_MIN_DOCS documents
+  'aggregate', 'timeline', 'contradiction', 'profile',
+  // 3–5 hops whose bridge entities sit in different documents
+  'deep-hop',
+  // a name that means two things (two people, a renamed project, a redefined metric): the answer must say so
+  'ambiguous',
 ] as const;
 export type TaskType = (typeof TASK_TYPES)[number];
+
+/** Task types that ask about the corpus as a whole: what a compiled wiki should answer better than a lookup. */
+export const CORPUS_TASK_TYPES: readonly TaskType[] = ['aggregate', 'timeline', 'contradiction', 'profile'];
+/** The fewest distinct documents a corpus-level task's evidence may span. */
+export const CORPUS_TASK_MIN_DOCS = 5;
+/** The fewest hops (and distinct evidence documents) of a deep-hop task. */
+export const DEEP_HOP_MIN = 3;
 
 /**
  * How a task is scored:
  * - judge      the judge grades the answer 0–2 against `answer` (and `keypoints`)
  * - exact      EM/F1 of the `Final answer:` line against `answer` / `answers`, judge as fallback
+ * - count      the first number on the `Final answer:` line equals `answer` (a count), judge as fallback
  * - keypoints  share of `keypoints` the answer covers (judged)
- * - set        the answer's JSON items matched one-to-one against `items`
+ * - set        the answer's JSON items matched one-to-one against `items` (how: `list`)
  * - label      one categorical label (an emotion, a valence) compared without a model
  * - choice     one of `choices` (authorship attribution), compared without a model
  * - abstain    the right answer is to say the sources do not tell
  */
-export const SCORINGS = ['judge', 'exact', 'keypoints', 'set', 'label', 'choice', 'abstain'] as const;
+export const SCORINGS = ['judge', 'exact', 'count', 'keypoints', 'set', 'label', 'choice', 'abstain'] as const;
 export type Scoring = (typeof SCORINGS)[number];
 
 export const DOMAINS = ['research', 'medicine', 'law', 'finance', 'literature', 'personal', 'synthetic', 'public', 'fixture'] as const;
@@ -53,7 +67,7 @@ export const PackManifestSchema = z.object({
   description: z.string(),
   builder: z.object({ recipe: z.string(), options: z.record(z.string(), z.unknown()).default({}), builtAt: z.string() }),
   sources: z.array(SourceRecordSchema).default([]),
-  stats: z.object({ documents: z.number(), chars: z.number(), tasks: z.number(), facts: z.number() }).partial().optional(),
+  stats: z.object({ documents: z.number(), chars: z.number(), tasks: z.number(), facts: z.number(), paddingDocuments: z.number(), paddingChars: z.number() }).partial().optional(),
   /** What the holdout holds and why no system may see it. */
   holdout: z.string().optional(),
 });
@@ -102,14 +116,50 @@ export type GoldLink = z.infer<typeof GoldLinkSchema>;
 export const GoldAliasSchema = z.object({ canonical: z.string(), aliases: z.array(z.string()).min(1) });
 export type GoldAlias = z.infer<typeof GoldAliasSchema>;
 
-/** One expected item of a set-scored task: a theme, a need, a characteristic word. */
+/** One expected item of a set-scored task: a theme, a need, a characteristic word, a listed fact or event. */
 export const GoldItemSchema = z.object({
   label: z.string(),
   aliases: z.array(z.string()).default([]),
   signal: z.enum(SIGNALS).optional(),
   weight: z.number().positive().default(1),
+  /** When the item holds (timeline): YYYY, YYYY-MM or YYYY-MM-DD. */
+  date: z.string().optional(),
+  /** Corpus (or update) documents that state the item. */
+  docs: z.array(z.string()).optional(),
 });
 export type GoldItem = z.infer<typeof GoldItemSchema>;
+
+/**
+ * How a set-scored usage task's list is read and matched (docs/design/23 §4):
+ * - match      judge (same item in other words), alias (label or an alias occurs in the
+ *              predicted label, numbers bounded — no model), docs (the predicted item's
+ *              evidence covers every document the gold item names — no model)
+ * - ordered    the items form a timeline: order accuracy over matched pairs, dates compared
+ * - maxItems   how many items the answer may list
+ * - requireDocs a match also needs one of the gold item's documents among the predicted
+ *              item's evidence ("which sources disagree" is part of the answer)
+ * - primary    which set metric is the task's correctness: f1, or recall where the gold
+ *              is not exhaustive (a profile drafted from sampled statements)
+ */
+export const ListSpecSchema = z.object({
+  match: z.enum(['judge', 'alias', 'docs']).default('judge'),
+  ordered: z.boolean().default(false),
+  maxItems: z.number().int().positive().max(60).default(10),
+  requireDocs: z.boolean().default(false),
+  primary: z.enum(['f1', 'recall']).default('f1'),
+});
+export type ListSpec = z.infer<typeof ListSpecSchema>;
+
+/**
+ * What a task's gold depends on not occurring anywhere else: a padding document
+ * (scale curves, `--fraction` above 1) may contain none of `terms` and lie under
+ * none of `prefixes`, so adding it cannot change the task's gold.
+ */
+export const ClosedWorldSchema = z.object({
+  terms: z.array(z.string()).default([]),
+  prefixes: z.array(z.string()).default([]),
+});
+export type ClosedWorld = z.infer<typeof ClosedWorldSchema>;
 
 export const TaskSchema = z.object({
   id: z.string(),
@@ -125,6 +175,10 @@ export const TaskSchema = z.object({
   items: z.array(GoldItemSchema).optional(),
   choices: z.array(z.string()).optional(),
   scoring: z.enum(SCORINGS),
+  /** Set-scored usage tasks: how the answer's list is matched (default: judge, at most 10 items). */
+  list: ListSpecSchema.optional(),
+  /** Corpus-level tasks whose gold padding must not touch (see ClosedWorldSchema). */
+  closedWorld: ClosedWorldSchema.optional(),
   /** The suite's pre-registered primary metric is computed over tasks marked primary (all, when none is). */
   primary: z.boolean().optional(),
   /** Update tasks: the batch (updates/NN) that must be applied before asking. */
@@ -195,6 +249,8 @@ export interface AnswerRecord extends Answer {
   pack: string;
   system: string;
   taskId: string;
+  /** The update batch applied (cumulatively) before this answer, for update tasks. */
+  batch?: string;
   at: string;
 }
 

@@ -19,7 +19,9 @@ import { evalTempDir } from '../tmp.js';
  * and a `log.md` of what each ingest changed — following a schema file, and
  * ingests a few sources per session in date order, so later sources update
  * pages earlier ones wrote. Answers come from the same Codex agent as the
- * grep baseline, reading the wiki alone (`agent-wiki`).
+ * grep baseline, reading the wiki alone (`agent-wiki`) — or reading the wiki
+ * as a navigation layer with the sources beside it (`agent-wiki-sources`), the
+ * way a maintained wiki is used in practice.
  */
 
 export const WIKI_SCHEMA = `# Wiki maintenance rules
@@ -196,6 +198,55 @@ export function llmWiki(): SystemUnderTest {
         fs.cpSync(path.join(root, 'wiki'), wikiDir(env), { recursive: true });
       } finally {
         tmp.cleanup();
+      }
+    },
+  };
+}
+
+/** Brief for an agent that has a wiki and the sources it was compiled from. */
+export const WIKI_SOURCES_BRIEF = (wiki: string, raw: string) => AGENT_BRIEF(`The current directory holds a wiki compiled from the documents (${wiki}; start from its index.md) and the source documents themselves (${raw}). Use the wiki to find your way — which sources bear on the question and how they connect — and open the sources to check details or find what the wiki leaves out. Cite source documents by their paths under ${raw}.`);
+
+/**
+ * A wiki and the sources side by side in a fresh directory with nothing else
+ * beside it: `<root>/kb/<wikiAs>` and `<root>/kb/<rawAs>`, as the wiki's own
+ * links expect them.
+ */
+export function wikiWithSources(wiki: string, sources: string, wikiAs: string, rawAs: string): { dir: string; cleanup: () => void } {
+  const { root, cleanup } = evalTempDir('ro');
+  const dir = path.join(root, 'kb');
+  fs.cpSync(wiki, path.join(dir, wikiAs), { recursive: true });
+  fs.cpSync(sources, path.join(dir, rawAs), { recursive: true });
+  return { dir, cleanup };
+}
+
+/**
+ * `agent-wiki-sources`: the same LLM Wiki build, read by the same agent, which
+ * may also open `raw/` — the wiki as a navigation layer (D7 forbids this for
+ * `agent-wiki`, which measures the wiki alone).
+ */
+export function llmWikiSources(): SystemUnderTest {
+  const base = llmWiki();
+  return {
+    ...base,
+    id: 'agent-wiki-sources',
+    label: 'LLM Wiki as a navigation layer, Codex agent reading it and the sources',
+    async answer(task, prompt, env) {
+      await env.quota.wait();
+      const copy = wikiWithSources(wikiDir(env), env.staged.dir, 'wiki', 'raw');
+      try {
+        const r = await runAgent({
+          cwd: copy.dir,
+          sandbox: 'read-only',
+          model: env.models.model,
+          effort: env.models.answerEffort,
+          prompt: `${WIKI_SOURCES_BRIEF('wiki/', 'raw/')}\n\n${prompt}`,
+        });
+        recordAgent(env.meter, { system: 'agent-wiki-sources', stage: 'agent', task: task.id }, env.models.model, r);
+        const docs = new Set(env.staged.docs.map((d) => d.path));
+        const opened = r.filesTouched.filter((f) => f.startsWith('raw/')).map((f) => f.slice('raw/'.length)).filter((f) => docs.has(f));
+        return { text: r.text, citations: citationsIn(r.text, docs), retrieved: [...new Set(opened)], toolCalls: r.toolCalls, capped: r.capped, leaked: r.leaked, error: r.error };
+      } finally {
+        copy.cleanup();
       }
     },
   };

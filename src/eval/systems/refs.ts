@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { LoadedPack } from '../pack.js';
+import type { LoadedPack, StagedCorpus } from '../pack.js';
 import { chat, SystemUnderTest } from './types.js';
 
 /**
@@ -30,10 +30,12 @@ export function closedBook(): SystemUnderTest {
   };
 }
 
-function corpusChars(pack: LoadedPack): number {
-  return pack.docs.reduce((s, d) => {
+/** File bytes of what a system would read: the staged corpus (padding included), else the pack's corpus. */
+function corpusChars(pack: LoadedPack, staged?: StagedCorpus): number {
+  const [dir, docs] = staged ? [staged.dir, staged.docs] : [path.join(pack.dir, 'corpus'), pack.docs];
+  return docs.reduce((s, d) => {
     try {
-      return s + fs.statSync(path.join(pack.dir, 'corpus', d.path)).size;
+      return s + fs.statSync(path.join(dir, d.path)).size;
     } catch {
       return s;
     }
@@ -49,7 +51,7 @@ export function longContext(limit = LONG_CONTEXT_CHARS): SystemUnderTest {
     kind: 'reference',
     answers: true,
     // file bytes over-count Chinese characters three to one: a conservative test
-    applicable: (pack) => corpusChars(pack) <= limit * 1.5,
+    applicable: (pack, staged) => corpusChars(pack, staged) <= limit * 1.5,
     async build(env) {
       const parts: string[] = [];
       for (const d of env.staged.docs) parts.push(`<document path="${d.path}">\n${fs.readFileSync(path.join(env.staged.dir, d.path), 'utf8')}\n</document>`);
