@@ -7,6 +7,7 @@ import { entityKeyKinds } from '../src/graph/normalize.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { ChatMessage, LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
+import { excerptOf, excerptsForQuestion, isListQuestion, quotedTerms } from '../src/search/excerpts.js';
 import { factsForQuestion } from '../src/search/facts.js';
 import { search } from '../src/search/search.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
@@ -130,6 +131,107 @@ describe('factsForQuestion', () => {
   });
 });
 
+describe('list questions', () => {
+  beforeAll(async () => {
+    // a paper that cites Acme Robotics in passing: no claim is about it
+    await addDoc('related-work', 'Related work.\nPrior planners (Acme Robotics, 2025) were tested in depots.\nWe propose a new planner for drones.');
+    // a variant of Acme Robotics, and a supplier one relation away, each with a claim
+    await addEntity('acme-mk2', 'Acme Robotics Mk2', 'product');
+    await addDoc('mk2', 'Mk2 notes.');
+    await addClaim('mk2-upgrade', 'acme-mk2', 'Acme Robotics Mk2 shipped with a lidar upgrade', 'mk2');
+    await addEntity('vexa', 'Vexa Sensors');
+    await addDoc('vexa', 'Vexa notes.');
+    await addClaim('vexa-upgrade', 'vexa', 'Vexa Sensors released a lidar upgrade for robot arms', 'vexa');
+    await addClaim('vexa-office', 'vexa', 'Vexa Sensors moved its office', 'vexa');
+    await store.query(`INSERT INTO relations (id, source_id, target_id, type, description) VALUES ('r-vexa', 'vexa', 'acme', 'supplies', 'Vexa Sensors supplies the lidar of every Acme Robotics product.')`);
+    // a relation's evidence sits on the tier-1 scope of the document it was read from
+    await store.query(`INSERT INTO scopes (id, kind, key, sha, status, applied_at) VALUES ('t1-vexa', 'tier1', 'raw/docs/vexa.md', 'sha-vexa', 'active', now())`);
+    await store.query(`INSERT INTO evidence (kind, target_id, scope_id, extractor, tx_from) VALUES ('relation', 'r-vexa', 't1-vexa', 'test', now())`);
+    // a statute: which of its articles mention 注册资本; another law says it too
+    await addEntity('company-law', '公司法', 'other');
+    await addDoc('statute', '第一条　为了规范公司的组织和行为，制定本法。\n\n第二条　公司章程应当载明下列事项：\n\n（一）公司名称；\n\n（二）公司注册资本；\n\n第三条　公司应当依法纳税。');
+    await store.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id, scope_id) VALUES ('company-law', 'c-statute', 'statute', 's-statute')`);
+    await addDoc('other-law', '第九条　合伙企业的注册资本由合伙人约定。');
+  });
+
+  it('tells a question asking for every case from one asking for an answer', () => {
+    for (const q of [
+      'Which papers build their method on retrieval-augmented generation?',
+      'What do these documents say about OpenAI? List every distinct fact.',
+      'Which documents disagree about GPT?',
+      'How many papers evaluate GPT-5?',
+      '在收录的《中华人民共和国公司法》条文中，哪些条文提到了“注册资本”？',
+      '提到“担保”的条文一共有几条？',
+      '这些材料里关于“证券交易所”都说了些什么？逐条列出每个不同的事实。',
+      '按最近一次通过、修正或修订的时间从早到晚，列出收录的这些法律。',
+    ]) expect(isListQuestion(q), q).toBe(true);
+    for (const q of [
+      'Which GitHub repository hosts the FoldAct code?',
+      'What three roles do the three LLMs in the T3LLM framework play?',
+      '《中华人民共和国证券法》自何时起施行？',
+      '陈悦在新公司向谁汇报？',
+    ]) expect(isListQuestion(q), q).toBe(false);
+    expect(quotedTerms('哪些条文提到了“注册资本”？以及"GitHub"')).toEqual(['注册资本', 'GitHub']);
+  });
+
+  it('cuts a chunk to the lines holding the term, a list item behind the line that introduces it', () => {
+    const law = '第二条　公司章程应当载明下列事项：\n\n（一）公司名称；\n\n（二）公司注册资本；\n\n第三条　公司应当依法纳税。';
+    expect(excerptOf(law, ['注册资本'])).toEqual(['第二条　公司章程应当载明下列事项： … （二）公司注册资本；']);
+    const long = `${'Background sentence. '.repeat(30)}We compare against Gemini on every task. ${'More text follows here. '.repeat(30)}`;
+    const [w] = excerptOf(long, ['gemini']);
+    expect(w).toContain('We compare against Gemini on every task.');
+    expect(w.length).toBeLessThan(370);
+    expect(w.startsWith('…') && w.endsWith('…')).toBe(true);
+    // a name inside another word is not a hit (search's rule, termCount)
+    expect(excerptOf('The BiGemini model was visible.', ['gemini'])).toEqual([]);
+  });
+
+  it('gives the lines of documents that only cite what the question names', async () => {
+    const ex = await excerptsForQuestion(store, 'Which papers compare against Acme Robotics?', [], { names: ['Acme Robotics'] });
+    const related = ex.find((e) => e.path === 'raw/docs/related-work.md')!;
+    expect(related).toMatchObject({ chunkId: 'c-related-work', excerpt: true });
+    expect(related.content).toBe('Prior planners (Acme Robotics, 2025) were tested in depots.');
+    // the chunks the search returned are not repeated
+    const again = await excerptsForQuestion(store, 'Which papers compare against Acme Robotics?', [related], { names: ['Acme Robotics'] });
+    expect(again.map((e) => e.chunkId)).not.toContain('c-related-work');
+  });
+
+  it('looks for a quoted term in the documents of the entity the question names', async () => {
+    const ex = await excerptsForQuestion(store, '在《公司法》条文中，哪些条文提到了“注册资本”？', [], { names: ['公司法'], namedDocs: ['statute'] });
+    expect(ex.map((e) => e.path)).toEqual(['raw/docs/statute.md']);
+    expect(ex[0].content).toBe('第二条　公司章程应当载明下列事项： … （二）公司注册资本；');
+    // without the named entity's documents, every law that says it
+    const all = await excerptsForQuestion(store, '哪些条文提到了“注册资本”？', [], { names: [] });
+    expect(all.map((e) => e.path).sort()).toEqual(['raw/docs/other-law.md', 'raw/docs/statute.md']);
+  });
+
+  it('keeps to its budget, one document at a time', async () => {
+    const ex = await excerptsForQuestion(store, 'Which weeks did Acme Robotics have an outage?', [], { names: ['Acme Robotics'], budget: 200 });
+    expect(ex.length).toBeGreaterThanOrEqual(2);
+    expect(ex.reduce((n, e) => n + e.content.length, 0)).toBeLessThanOrEqual(200);
+    expect(new Set(ex.map((e) => e.path)).size).toBe(ex.length);
+    expect(await excerptsForQuestion(store, 'Which weeks?', [], { names: ['Acme Robotics'], budget: 0 })).toEqual([]);
+  });
+
+  it('adds relations, variants and neighbours of what a list question names to its facts', async () => {
+    const q = 'List every Acme Robotics product upgrade.';
+    const facts = await factsForQuestion(store, q, [], { limit: 40, list: true });
+    const ids = facts.map((f) => f.id);
+    expect(ids).toEqual(expect.arrayContaining(['mk2-upgrade', 'vexa-upgrade', 'relation:r-vexa']));
+    // a neighbour's claim that says nothing of the question stays out
+    expect(ids).not.toContain('vexa-office');
+    expect(facts.find((f) => f.id === 'relation:r-vexa')).toMatchObject({
+      statement: 'Vexa Sensors supplies Acme Robotics: Vexa Sensors supplies the lidar of every Acme Robotics product.',
+      path: 'raw/docs/vexa.md',
+      chunkId: null,
+    });
+    // any other question keeps to the claims about what it names
+    const plain = (await factsForQuestion(store, q, [], { limit: 40 })).map((f) => f.id);
+    expect(plain).not.toContain('mk2-upgrade');
+    expect(plain).not.toContain('relation:r-vexa');
+  });
+});
+
 describe('ask', () => {
   function recordingLlm(reply: (prompt: string) => string): { llm: LlmClient; prompts: string[] } {
     const prompts: string[] = [];
@@ -158,7 +260,9 @@ describe('ask', () => {
     expect(embedder.calls).toBe(before + 1);
     const report = `report-${String(week).padStart(2, '0')}`;
     expect(prompts[0]).toContain(`[fact] Acme Robotics had a warehouse outage in week ${week} (2026-01-${String(week).padStart(2, '0')}) — raw/docs/${report}.md`);
-    expect(res.contexts.map((c) => c.path)).not.toContain(`raw/docs/${report}.md`);
+    // the search did not return that report; a list question gets its line as an excerpt
+    expect(res.contexts.filter((c) => !c.excerpt).map((c) => c.path)).not.toContain(`raw/docs/${report}.md`);
+    expect(prompts[0]).toMatch(/\(raw\/docs\/report-\d\d\.md, excerpt\)\nWeekly report \d+\. Acme Robotics had a warehouse outage/);
     expect(res.answer).toBe(`Week ${week} [${res.citations[0].ref}].`);
     expect(res.citations).toEqual([{ ref: expect.any(Number), path: `raw/docs/${report}.md`, chunkId: `c-${report}` }]);
     expect(res.citations[0].ref).toBeGreaterThan(res.contexts.length);

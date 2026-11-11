@@ -129,6 +129,36 @@ they feed the dream cycle only.
    terms and its embedding, taken a few per source so a list question reaches
    many documents, each with its date and source and a reference number the
    answer cites like a chunk's. `knode_resolve` picks its claims the same way.
+   A question that asks for every case — which…s, list/every, how many, what
+   the documents say about, disagreements, timelines; 哪些, 列出, 全部, 一共有几条,
+   都说了些什么, 矛盾, 从早到晚 (`isListQuestion`) — gets two more things in the
+   same single call. Its facts also draw on the named entities' relations, read
+   as facts with their source, and on the claims about the entities one relation
+   away and about the named entities' variants ("Gemini-3 Pro" for "Gemini").
+   And it gets excerpts (`src/search/excerpts.ts`): the lines of further
+   documents that hold what the question names, found through the chunk gram
+   index. These are the named entities' names; or the quoted term inside the
+   named entities' documents ("《公司法》哪些条文提到了“注册资本”"); or, when
+   nothing is named, the question's rarest word. A list item is shown with the
+   line introducing it, and a paragraph with the opening line of its article
+   (第X条, Article N), also when that line ended the chunk before. Documents take
+   turns, up to 6,000 characters. On the benchmark's corpus-level questions,
+   the share of gold evidence quotes in the prompt went from 0.567 to 0.861
+   (law-cn) and from 0.356 to 0.834 (research-ai). Over those questions the
+   prompt grew by 2,000–4,400 characters and ask took 20–30 ms longer.
+   Single-fact and multi-hop questions did not lose. What a bounded prompt still
+   cannot hold is an exhaustive list longer than the excerpt budget, and a fact
+   no document's wording names: a count over every article, a finance topic
+   spread over papers that never say "finance". Those need an agent with search,
+   or a page computed ahead of time.
+
+   Nearest claims by embedding over all of `claim_embeddings` added 0.009 of
+   research-ai's evidence and cost law-cn 0.007. That is a sequential scan
+   (22–64 ms on 1–2k claims; linear in a workspace of hundreds of thousands),
+   and it is left out. Should it be wanted, it needs an HNSW index like
+   `embeddings_hnsw_idx`: `CREATE INDEX claim_embeddings_hnsw_idx ON
+   claim_embeddings USING hnsw (embedding vector_cosine_ops)`, under the same
+   `HNSW_MAX_DIM` guard, with the model filter applied after the index scan.
 
 See [04 — SAG query-time event retrieval](04-sag-query-time-events.md) for the
 mapping, scoring, configuration, and phase-two event model.

@@ -4,7 +4,8 @@ import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
 import { ClaimItem, SearchResult } from '../types.js';
 import { graphSearch } from '../graph/query.js';
-import { factsForQuestion, QuestionFact } from './facts.js';
+import { EXCERPT_CHARS, excerptsForQuestion, isListQuestion } from './excerpts.js';
+import { factsForQuestion, namedEntities, namedSurface, QuestionFact } from './facts.js';
 import { search, SearchMode } from './search.js';
 
 export interface AskResult {
@@ -16,7 +17,7 @@ export interface AskResult {
   facts: ClaimItem[];
 }
 
-const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are given retrieved context chunks, each tagged [n], and optionally a "Known facts" list: claims extracted from the whole knowledge base, each tagged [n] too, with its date and the document it comes from. The facts reach documents the chunks do not; a question that asks for every case, a list or a history is answered from both.
+const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are given retrieved context chunks, each tagged [n] — one marked "excerpt" holds only the lines of its document that name what the question asks about — and optionally a "Known facts" list: claims extracted from the whole knowledge base, each tagged [n] too, with its date and the document it comes from. The facts reach documents the chunks do not; a question that asks for every case, a list or a history is answered from both.
 
 Rules:
 - Answer in the question's language, concise but complete.
@@ -54,7 +55,7 @@ export async function ask(
   embedder: EmbeddingProvider,
   llm: LlmClient,
   question: string,
-  opts: { k?: number; mode?: SearchMode; /** The question's embedding, when the caller has it already. */ queryVector?: number[]; /** Known facts listed at most (default 24). */ facts?: number } = {},
+  opts: { k?: number; mode?: SearchMode; /** The question's embedding, when the caller has it already. */ queryVector?: number[]; /** Known facts listed at most (default 24). */ facts?: number; /** Characters of excerpts for a list question at most (default `EXCERPT_CHARS`; 0 for none). */ excerpts?: number } = {},
 ): Promise<AskResult> {
   const k = opts.k ?? 8;
   const mode = opts.mode ?? 'hybrid';
@@ -67,13 +68,24 @@ export async function ask(
       queryVector = undefined;
     }
   }
-  const [retrieved, graph] = await Promise.all([
+  const [retrieved, graph, named] = await Promise.all([
     search(store, embedder, question, { k, mode, heat: config.heat, sag: config.retrieval.sag, queryVector }),
     graphSearch(store, question, { depth: 2, chunkLimit: 4, heat: config.heat }),
+    namedEntities(store, question),
   ]);
   const seen = new Set(retrieved.map((r) => r.chunkId));
-  const contexts = [...retrieved, ...graph.chunks.filter((c) => !seen.has(c.chunkId))].slice(0, k + 4);
-  const facts: QuestionFact[] = await factsForQuestion(store, question, contexts, { limit: opts.facts, queryVector, model: embedder.model });
+  const found = [...retrieved, ...graph.chunks.filter((c) => !seen.has(c.chunkId))].slice(0, k + 4);
+  // a question asking for every case is answered from many documents: more kinds of fact, and the lines of
+  // further documents that name what it asks about
+  const list = isListQuestion(question);
+  const excerptBudget = list ? (opts.excerpts ?? EXCERPT_CHARS) : 0;
+  const [facts, excerpts]: [QuestionFact[], SearchResult[]] = await Promise.all([
+    factsForQuestion(store, question, found, { limit: opts.facts, queryVector, model: embedder.model, named, list }),
+    excerptBudget > 0
+      ? namedSurface(store, named).then((s) => excerptsForQuestion(store, question, found, { budget: excerptBudget, names: s.names, namedDocs: s.docs }))
+      : Promise.resolve([]),
+  ]);
+  const contexts = [...found, ...excerpts];
   // what a reference number stands for: the chunks first, then the facts
   const refs = [
     ...contexts.map((c) => ({ path: c.path, chunkId: c.chunkId })),
@@ -91,7 +103,7 @@ export async function ask(
   }
 
   const contextBlock = contexts
-    .map((c, i) => `[${i + 1}] (${c.path})\n${c.content.slice(0, 1500)}`)
+    .map((c, i) => `[${i + 1}] (${c.path}${c.excerpt ? ', excerpt' : ''})\n${c.content.slice(0, 1500)}`)
     .join('\n\n');
   const raw = await llm.complete([
     { role: 'system', content: ASK_SYSTEM },
