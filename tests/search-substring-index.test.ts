@@ -84,7 +84,7 @@ async function plansOf(pattern: string, fn: () => Promise<unknown>): Promise<str
   const plans: string[] = [];
   // the state autovacuum keeps a workspace in: statistics (a table the planner believes empty is
   // read any way at all) and the rows inserted since the indexes were built merged into them
-  await store.query(`VACUUM ANALYZE chunks, documents, entities, entity_mentions`);
+  await store.query(`VACUUM ANALYZE chunks, documents, entities, entity_mentions, entity_alias_keys`);
   await store.query(`SET enable_seqscan = off`);
   try {
     for (const { sql, params } of sent.filter((s) => s.sql.includes(pattern))) {
@@ -264,7 +264,13 @@ describe('keyword recall', () => {
 describe('entity matching', () => {
   const MENTIONED = ['g1', 'g2', 'g3', 'g4', 'g5', 'g6', 'g7', 'g8'];
 
-  async function addEntity(id: string, name: string, mentionCount: number, chunks: string[], extra: { aliases?: string[]; description?: string; retired?: boolean } = {}): Promise<void> {
+  async function addEntity(
+    id: string,
+    name: string,
+    mentionCount: number,
+    chunks: string[],
+    extra: { aliases?: string[]; description?: string; retired?: boolean; keys?: string[] } = {},
+  ): Promise<void> {
     await store.query(
       `INSERT INTO entities (id, name, type, mention_count, aliases, description, tx_to) VALUES ($1, $2, 'concept', $3, $4::jsonb, $5, $6)`,
       [id, name, mentionCount, JSON.stringify(extra.aliases ?? []), extra.description ?? '', extra.retired ? '2026-01-01T00:00:00Z' : null],
@@ -272,6 +278,7 @@ describe('entity matching', () => {
     for (const chunk of chunks) {
       await store.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id) VALUES ($1, $2, $3)`, [id, chunk, `d-${chunk}`]);
     }
+    for (const key of extra.keys ?? []) await store.query(`INSERT INTO entity_alias_keys (entity_id, alias_key) VALUES ($1, $2)`, [id, key]);
   }
 
   beforeAll(async () => {
@@ -287,21 +294,34 @@ describe('entity matching', () => {
     await addEntity('e-other', '无关', 80, ['g1']);
     await addEntity('e-described', 'Cobalt', 3, [], { description: '储能 materials supplier' });
     // the entities no query here names, as a workspace has thousands of
-    for (let i = 0; i < 300; i++) await addEntity(`e-filler-${i}`, `Filler ${i}`, 1, []);
+    // the one entity here with lookup keys: the fixtures above are found by their terms alone
+    await addEntity('e-cathode', 'Cathode Works', 2, ['g8'], { keys: ['cathodeworks'] });
+    for (let i = 0; i < 300; i++) await addEntity(`e-filler-${i}`, `Filler ${i}`, 1, [], { keys: [`filler${i}`] });
   });
 
   /** The graph channel's order: the keyword fixtures above answer this query too, the mentioned chunks only through the graph. */
-  async function graphRanking(): Promise<[string, number][]> {
-    const results = await search(store, embedder, '储能 HBM', { k: 30, track: false });
-    return results.filter((r) => r.signals.graph !== undefined).map((r) => [r.chunkId, r.signals.graph]);
+  async function graphRanking(query = '储能 HBM'): Promise<[string, number][]> {
+    const results = await search(store, embedder, query, { k: 30, track: false });
+    return results.filter((r) => r.signals.graph !== undefined).map((r) => [r.chunkId, r.signals.graph!]);
   }
 
-  it('ranks chunks by matching entities, then their mention rows weighted by mention count, then id', async () => {
-    // g1: HBM + 储能电池 (50 + 30); g2: HBM + Battery Corp by alias (50 + 7);
-    // g3: 储能电池 on two rows (2 × 30) above 储能系统 (45); g6's entity is retired, g7's document not indexed
-    const expected: [string, number][] = [['g1', 2], ['g2', 2], ['g3', 1], ['g8', 1], ['g4', 1], ['g5', 1]];
-    expect(await graphRanking()).toEqual(expected);
-    expect(await withoutIndexes(graphRanking)).toEqual(expected);
+  it('matches a query naming no entity by the entities holding its terms, the rarest first', async () => {
+    // the summed IDF of the chunks each entity is mentioned in: g1 HBM (3 chunks) + 储能电池 (2);
+    // g2 HBM + Battery Corp by alias (2); then HBM3E and 储能系统 (1 each, ties by id);
+    // then 储能电池 and Battery Corp alone. 储能电池's two rows in g3 are one chunk;
+    // g6's entity is retired, g7's document not indexed, Cobalt matches by description only
+    const ranked = await graphRanking();
+    expect(ranked.map(([id]) => id)).toEqual(['g1', 'g2', 'g5', 'g8', 'g3', 'g4']);
+    for (let i = 1; i < ranked.length; i++) expect(ranked[i - 1][1]).toBeGreaterThanOrEqual(ranked[i][1]);
+    expect(ranked[0][1]).toBeCloseTo(ranked[1][1], 12);
+    expect(ranked[4][1]).toBeCloseTo(ranked[5][1], 12);
+    expect(await withoutIndexes(graphRanking)).toEqual(ranked);
+  });
+
+  it('reads the entities a query names, as whole words, and only them', async () => {
+    // "Works" alone is a term several fixtures could hold; the name is one entity's key
+    expect((await graphRanking('Who supplies Cathode Works with HBM?')).map(([id]) => id)).toEqual(['g8']);
+    expect(await graphRanking('Who supplies CathodeWorkshop?')).not.toContainEqual(['g8', expect.any(Number)]);
   });
 
   it('seeds graph search from a name, an alias or a description', async () => {
@@ -310,10 +330,13 @@ describe('entity matching', () => {
     expect(await withoutIndexes(seeds)).toEqual(await seeds());
   });
 
-  it('looks entities up through the index', async () => {
-    const plans = await plansOf('match_grams(e.name', graphRanking);
+  it('looks entities up through the indexes', async () => {
+    const plans = await plansOf('match_grams(e.name', () => graphRanking());
     expect(plans).toHaveLength(1);
     expect(plans[0]).toContain(MATCH_INDEXES.entities.name);
+    const named = await plansOf('entity_alias_keys', () => graphRanking('Who supplies Cathode Works?'));
+    expect(named).toHaveLength(1);
+    expect(named[0]).toContain('entity_alias_keys_key_idx');
   });
 });
 

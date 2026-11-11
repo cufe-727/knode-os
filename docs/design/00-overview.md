@@ -108,15 +108,24 @@ they feed the dream cycle only.
    the n-grams of the text (`match_grams`, `src/store/grams.ts`) that also serves
    the entity name matching of the graph and SAG routes. A quoted phrase or an
    excluded word keeps what full-text search matched in front.
-3. **graph** — chunks mentioning entities whose name/alias matches the query (live
-   at `as_of` when one is given), one row per chunk, ranked by how many matching
-   entities it mentions, then by their mention counts.
+3. **graph** — chunks mentioning the entities the query names (live at `as_of`
+   when one is given): runs of its words or CJK characters that are an entity's
+   spelling, looked up by the normalized keys entity resolution keeps
+   (`entity_alias_keys`), whole words only, the longer spelling winning where
+   two overlap. One row per chunk, ranked by the summed rarity (BM25 IDF over
+   the chunks each entity is mentioned in) of the named entities it mentions,
+   then by how many. A query that names none falls back to the entities whose
+   name or alias holds one of its terms, through the same gram index.
 4. **sag** — opt-in query-time event retrieval. A chunk is the phase-one event
    unit and `entity_mentions` is the event/entity join. Direct hits seed up to
    two `chunk → entity → chunk` rounds; rare/shared entities score the structural
    pool, embeddings coarse-rank it, and RRF merges it with a reserved direct route.
 5. Hybrid signals are fused with reciprocal-rank fusion (RRF, k=60; graph weighted 0.2:
-   it lifts a chunk the other two found and fills in when they found too few).
+   alone it puts about half the benchmark's gold documents in its top five, where
+   vectors and keywords put about four in five, so it lifts the chunks about the
+   entity a question names over chunks that only resemble the question, and a
+   heavier weight starts to outvote them where one statute is in fifty chunks;
+   the measurements are in `FUSION_WEIGHTS`, `src/search/search.ts`).
 6. `graph search` does seeded BFS over persistent `relations` with per-hop decay 0.5;
    `co_occurs` edges are derived from shared chunk mentions at query time (never
    stored, see `src/graph/cooccur.ts`) and discounted ×0.5.
