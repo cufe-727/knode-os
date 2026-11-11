@@ -2,6 +2,7 @@ import { AppContext } from '../context.js';
 import { auditDuplicateClaims, ClaimDedupeStats } from '../graph/claim-dedupe.js';
 import { auditDuplicateEntities, DedupeStats } from '../graph/dedupe.js';
 import { runTier1Pass, Tier1Stats } from '../graph/tier1.js';
+import { refreshNavigationIfChanged } from '../wiki/navigation.js';
 import { ensureEntityStubs, ensureSourceSummaries } from '../wiki/pages.js';
 
 /** A tier-1 pass's stats, plus what the resolve and summary steps did. */
@@ -51,6 +52,9 @@ const passChains = new Map<string, Promise<unknown>>();
  *    two documents or more now speak of: what no single document holds. No
  *    model: the page lists the entity's claims with their sources. Existing
  *    pages are brought up to date by the next sync, as any view is.
+ * 6. Navigation — the indexes, the contents of wiki/index.md and the
+ *    overview's holdings (src/wiki/navigation.ts), when the pass wrote
+ *    anything and what they count has changed.
  *
  * Serve runs it every `extraction.intervalMinutes`, `knode-os extract` runs it
  * once, and an initialization runs it until the extraction queue is empty.
@@ -112,6 +116,15 @@ async function runDocumentPassUnlocked(ctx: AppContext, opts: DocumentPassOption
       entityPages = await ensureEntityStubs({ ...ctx, config }, { focus: extracted.touched, minClaims: null, minMentions: null, max: ENTITY_PAGES_PER_PASS, actor: 'entities' });
     } catch (err) {
       progress(`entity pages failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  if (extracted.processed || summaries.length || entityPages.length) {
+    try {
+      const nav = await refreshNavigationIfChanged({ ...ctx, config }, { actor: 'entities' });
+      if (nav.written.length || nav.archived.length) progress(`navigation: ${nav.written.length} index pages written, ${nav.archived.length} archived`);
+    } catch (err) {
+      progress(`navigation failed: ${err instanceof Error ? err.message : err}`);
     }
   }
 

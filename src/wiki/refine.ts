@@ -12,6 +12,7 @@ import { CLAIM_TYPES } from '../graph/store.js';
 import { alikeWording, wordingOf } from '../graph/wording.js';
 import { Store } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
+import { refreshNavigationIfChanged } from './navigation.js';
 import { ensureHotTopics, PagesContext, retireConceptClusterPages } from './pages.js';
 
 /**
@@ -127,6 +128,11 @@ export async function refineWiki(
   }
 
   await ensureHotTopics(ctx, { actor: 'tier2', force: true });
+  try {
+    await refreshNavigationIfChanged(ctx, { actor: 'tier2' });
+  } catch (err) {
+    progress(`navigation failed: ${err instanceof Error ? err.message : err}`);
+  }
   try {
     stats.recommendations = (await refreshRecommendations({ ...ctx, datasources: ctx.datasources! } as never)).suggested;
   } catch (err) {

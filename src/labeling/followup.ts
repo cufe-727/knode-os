@@ -2,6 +2,7 @@ import { AppContext } from '../context.js';
 import { auditDuplicateClaims } from '../graph/claim-dedupe.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
+import { refreshNavigationIfChanged } from '../wiki/navigation.js';
 import { reconcileViews } from '../wiki/pages.js';
 import { JudgeRunner } from '../work/judge.js';
 import { LabelingScheduler } from './scheduler.js';
@@ -25,6 +26,11 @@ import { LabelingScheduler } from './scheduler.js';
  * queued on a clock used to pile up until nothing else got a turn
  * (2026-10-15: no summary for nine hours). A page write waits for at most
  * the review in progress.
+ *
+ * Each round also refreshes the wiki's navigation (src/wiki/navigation.ts)
+ * when what it counts has changed — documents synced, summaries the slots
+ * wrote, claims extracted — even a round with nothing to review: nothing else
+ * in `serve` lists a new document or a new summary page.
  *
  * Reviews are model calls, so they run only while the workspace's processing
  * is started (`setActive`, src/labeling/processing.ts). Page writes run either
@@ -79,9 +85,18 @@ export function startFollowUp(ctx: AppContext, scheduler: LabelingScheduler, opt
     return run;
   };
 
+  const navigation = async () => {
+    try {
+      const nav = await refreshNavigationIfChanged(ctx, { actor: 'tier1' });
+      if (nav.written.length || nav.archived.length) log(`navigation: ${nav.written.length} index pages written, ${nav.archived.length} archived`);
+    } catch (err) {
+      log(`navigation failed: ${err instanceof Error ? err.message : err}`);
+    }
+  };
+
   const review = async () => {
     const batch = scheduler.takeFinished();
-    if (batch.written === 0 && batch.failed === 0) return;
+    if (batch.written === 0 && batch.failed === 0) return navigation();
     const parts = [`${batch.written} written${batch.failed ? `, ${batch.failed} given up` : ''}`];
     const reviewCtx = { store: ctx.store, embedder: opts.embedder ?? ctx.embedder, config: ctx.config, llm: ctx.llm, judge: opts.judge };
     if (batch.entityIds.length) {
@@ -103,6 +118,7 @@ export function startFollowUp(ctx: AppContext, scheduler: LabelingScheduler, opt
     log(`document pass: ${parts.join('; ')}`);
     const views = await reconcileViews(ctx, { actor: 'tier1', llm: false, onProgress: log });
     if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
+    await navigation();
   };
 
   // one review at a time, the next one an interval after the last ended

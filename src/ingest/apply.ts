@@ -137,8 +137,9 @@ async function classify(store: Store, file: string, root: DocRoot, parsed: Parse
     const graph = hasProse(humanBody);
     return { kind: 'view', graph, selfEntity: graph, humanBody };
   }
-  // `selfEntity: false` in frontmatter: a hub page (the overview) that is about the whole base, not one entity
-  return { kind: 'source', graph: true, selfEntity: parsed.frontmatter.selfEntity === false ? false : undefined, humanBody: parsed.body };
+  // `selfEntity: false` in frontmatter: a hub page (the overview) that is about the whole base, not one entity.
+  // A generated region in a person's page (the overview's holdings) is no one's assertion: the graph reads the rest
+  return { kind: 'source', graph: true, selfEntity: parsed.frontmatter.selfEntity === false ? false : undefined, humanBody: hasRegions(parsed.body) ? stripRegions(parsed.body) : parsed.body };
 }
 
 export async function applyDocScope(ctx: ApplyDocContext, file: string, root: DocRoot, opts: ApplyDocOptions = {}): Promise<DocOutcome> {
