@@ -2,7 +2,7 @@ import { AppContext } from '../context.js';
 import { auditDuplicateClaims, ClaimDedupeStats } from '../graph/claim-dedupe.js';
 import { auditDuplicateEntities, DedupeStats } from '../graph/dedupe.js';
 import { runTier1Pass, Tier1Stats } from '../graph/tier1.js';
-import { ensureEntityStubs, ensureSourceSummaries } from '../wiki/pages.js';
+import { ensureEntityStubs, ensureSourceSummaries, refreshSummaryClaims } from '../wiki/pages.js';
 
 /** A tier-1 pass's stats, plus what the resolve and summary steps did. */
 export interface DocumentPassStats extends Tier1Stats {
@@ -103,6 +103,13 @@ async function runDocumentPassUnlocked(ctx: AppContext, opts: DocumentPassOption
     );
   } catch (err) {
     progress(`summaries failed: ${err instanceof Error ? err.message : err}`);
+  }
+  try {
+    // the claims just extracted go on their documents' existing summary pages, from the cached summaries
+    // (a page written above is already current: its regeneration is 'unchanged')
+    await refreshSummaryClaims({ ...ctx, config }, extracted.documents, { actor: 'summarize' });
+  } catch (err) {
+    progress(`summary claims failed: ${err instanceof Error ? err.message : err}`);
   }
 
   let entityPages: string[] = [];

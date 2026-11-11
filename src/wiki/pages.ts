@@ -6,7 +6,7 @@ import { summaryLlmClient } from '../context.js';
 import { DataSourceRegistry } from '../datasource/registry.js';
 import { QueryResult } from '../datasource/types.js';
 import { safePath } from '../fs/files.js';
-import { clearSourceSummaryFailure, readSourceSummary, readSourceSummaryFailure, recordSourceSummaryFailure } from '../fs/sidecar.js';
+import { clearSourceSummaryFailure, readSourceSummary, readSourceSummaryFailure, recordSourceSummaryFailure, SourceSummaryCache, writeSourceSummary } from '../fs/sidecar.js';
 import { slugify } from '../graph/store.js';
 import { applyDocScope } from '../ingest/apply.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
@@ -68,7 +68,8 @@ export interface PagePlan {
 
 export interface PageRender {
   frontmatter: Record<string, unknown>;
-  regions: Record<string, string>;
+  /** null removes the region: a section with nothing to show this time. */
+  regions: Record<string, string | null>;
 }
 
 export interface PageGenerator {
@@ -306,14 +307,126 @@ const entityStub: PageGenerator = {
 };
 
 /**
+ * Claims a summary page lists at most, and the bytes their section may take.
+ * A summary keeps the gist and drops the particular: on the pilot's pages the
+ * model's text held 13% of a law chapter's figures and dates (2% of its
+ * article numbers), 28% of a paper's, 52% of a drug label's. The claims
+ * extracted from the document carry them, so the page lists those below the
+ * model's text. In these packs a document has 13–24 claims (25 at most), and
+ * all of them cost 1.6–4.6 KB a page; with the figures first, 20 already held
+ * nearly all a page gains (docs/design/14 §6). 30 and 6 KB bound a long
+ * document's hundreds.
+ */
+export const SUMMARY_PAGE_CLAIMS = 30;
+const SUMMARY_CLAIMS_BYTES = 6000;
+
+interface SummaryClaim {
+  id: string; statement: string; status: string; kind: string | null; valid_from: string | null; valid_to: string | null;
+  event_at: string | null; superseded_by: string | null; fold_sha: string; seq: number | null;
+}
+
+/** A figure in a statement: a digit, or a Chinese numeral with what it counts. */
+const CLAIM_FIGURE_RE = /\d|[零〇一二两三四五六七八九十百千万亿]+(?:年|个?月|日|号|条|款|项|章|节|元|人|次|个|倍|天|周|岁|%)/;
+
+/**
+ * The claims of the page's document, the most informative first: those with
+ * a figure and a date, then a figure, then a date, each group in the
+ * document's order; within the bounds, listed in the document's order.
+ * Claims are found through the document's chunks (`claims.document_id` is
+ * not filled by tier 1; `chunk_id` always is, and both lookups are indexed).
+ */
+async function summaryClaims(store: Store, doc: DocumentRow): Promise<{ claims: SummaryClaim[]; total: number }> {
+  const all = await store.query<SummaryClaim>(
+    `SELECT cl.id, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at, cl.superseded_by, cl.fold_sha, ch.seq
+     FROM chunks ch JOIN claims cl ON cl.chunk_id = ch.id
+     WHERE ch.document_id = $1 AND cl.tx_to IS NULL
+     ORDER BY ch.seq, cl.tx_from, cl.id`,
+    [doc.id],
+  );
+  const dated = (c: SummaryClaim) => Boolean(toIso(c.event_at) || toIso(c.valid_from) || toIso(c.valid_to));
+  const weight = (c: SummaryClaim) => (CLAIM_FIGURE_RE.test(c.statement) ? 2 : 0) + (dated(c) ? 1 : 0);
+  const ranked = all.map((c, i) => ({ c, i, w: weight(c) })).sort((a, b) => b.w - a.w || a.i - b.i);
+  const picked: { c: SummaryClaim; i: number }[] = [];
+  let bytes = 0;
+  for (const r of ranked) {
+    if (picked.length >= SUMMARY_PAGE_CLAIMS) break;
+    const b = Buffer.byteLength(r.c.statement) + 40;
+    if (bytes + b > SUMMARY_CLAIMS_BYTES && picked.length > 0) continue;
+    bytes += b;
+    picked.push(r);
+  }
+  return { claims: picked.sort((a, b) => a.i - b.i).map((r) => r.c), total: all.length };
+}
+
+/** The claims section: each claim with its date, tagged when it is a view, a forecast, disputed or superseded. */
+function renderSummaryClaims(claims: SummaryClaim[], total: number, heading: string): string | null {
+  if (claims.length === 0) return null;
+  const lines = [`## ${heading}`, ''];
+  if (total > claims.length) lines.push(`_${claims.length} of ${total} claims extracted from this document, those with figures and dates first; \`knode_claims\` returns the rest._`, '');
+  for (const c of claims) {
+    const when = toDateString(c.event_at);
+    const from = toDateString(c.valid_from);
+    const to = toDateString(c.valid_to);
+    const date = when ? ` \`${when}\`` : from || to ? ` \`${from ?? '?'} ~ ${to ?? ''}\`` : '';
+    const kind = c.kind && c.kind !== 'fact' ? ` \`${c.kind}\`` : '';
+    const status = c.status !== 'fact' ? ` \`${c.status}\`` : '';
+    lines.push(`- ${c.statement.replace(/\s+/g, ' ').trim()}${date}${kind}${status}${c.superseded_by ? ' _(superseded)_' : ''}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * The model-written body of a document's summary page: the sidecar's cache
+ * for the document's content, else — a workspace whose sidecars were not
+ * kept, or a cache lost — the body region of the page already written for
+ * that same content (its document dep carries the hash it was written from).
+ * `restore` writes that body back to the cache, so the next render reads it
+ * there. Either way no model is called.
+ */
+async function summaryBody(ctx: PagesContext, pagePath: string, doc: DocumentRow, restore: boolean): Promise<SourceSummaryCache | null> {
+  const cached = readSourceSummary(ctx.dataDir, doc.path);
+  if (cached && cached.contentSha === doc.sha256) return cached;
+  const deps = await readDeps(ctx.store, { kind: 'page', id: pagePath });
+  if (deps.find((d) => d.input_kind === 'document' && d.input_id === doc.path)?.input_sha !== doc.sha256) return null;
+  const abs = safePath(ctx.dataDir, pagePath);
+  if (!fs.existsSync(abs)) return null;
+  const text = fs.readFileSync(abs, 'utf8');
+  const body = splitRegions(text).regions.get('body')?.trim();
+  if (!body) return null;
+  let front: Record<string, unknown> = {};
+  try {
+    front = readMatter(text).data as Record<string, unknown>;
+  } catch {
+    front = {};
+  }
+  const generated = (front.generated ?? {}) as { by?: unknown; at?: unknown };
+  const coverage = front.coverage as SourceSummaryCache['coverage'] | undefined;
+  const adopted: SourceSummaryCache = {
+    contentSha: doc.sha256,
+    model: typeof generated.by === 'string' ? generated.by.replace(/^knode-os\//, '') : 'unknown',
+    generatedAt: typeof generated.at === 'string' ? generated.at : new Date().toISOString(),
+    body,
+    language: detectSummaryLanguage(body),
+    ...(coverage && typeof coverage === 'object' ? { coverage } : {}),
+  };
+  if (restore) writeSourceSummary(ctx.dataDir, doc.path, adopted);
+  return adopted;
+}
+
+/**
  * The Summarize stage's page (docs/design/14). What it asks a model and what
  * it makes of the answer lives in ./summary.ts, shared with the leased work
  * source (src/work/summarize.ts); the one-shot pass calls the model from
  * `render`, through `produceSummary`.
+ *
+ * Below the model's text (region `body`, cached by the document's content)
+ * the page lists the document's claims (region `claims`), generated from the
+ * database: they are the page's deps, so a re-extraction re-renders the page
+ * from the cached body without a model call.
  */
 const sourceSummary: PageGenerator = {
   kind: 'source_summary',
-  version: 2,
+  version: 3,
   llm: true,
   client: (ctx) => documentSummaryLlm(ctx),
   mode: 'file',
@@ -329,19 +442,23 @@ const sourceSummary: PageGenerator = {
     // a document under the size threshold gets no page: one written before the
     // threshold is archived when its document next changes (`wiki prune-summaries` sweeps the rest)
     if (await isShortDocument(ctx.store, ctx.dataDir, doc, summaryMinChars(ctx.config))) return null;
+    const { claims, total } = await summaryClaims(ctx.store, doc);
     return {
-      deps: [{ kind: 'document', id: doc.path, required: true, sha: doc.sha256 }],
-      inputsSha: sha16(['source_summary@2', doc.sha256]),
-      data: { doc },
+      deps: [
+        { kind: 'document', id: doc.path, required: true, sha: doc.sha256 },
+        ...claims.map((c) => ({ kind: 'claim' as const, id: c.id, sha: c.fold_sha })),
+      ],
+      inputsSha: sha16(['source_summary@3', doc.sha256, total, claims.map((c) => [c.fold_sha, c.superseded_by])]),
+      data: { doc, claims, total },
     };
   },
-  async render(ctx, _pagePath, plan) {
+  async render(ctx, pagePath, plan) {
     const doc = plan.data.doc as DocumentRow;
     const llm = documentSummaryLlm(ctx);
     // generated.by/at describe the body we are about to write, so a cache hit
     // reports the model and instant that produced it, not this regeneration.
-    let cached = readSourceSummary(ctx.dataDir, doc.path);
-    if (!cached || cached.contentSha !== doc.sha256) {
+    let cached = await summaryBody(ctx, pagePath, doc, true);
+    if (!cached) {
       if (!llm.enabled) return null;
       const work = await planSummary(ctx.store, ctx.dataDir, ctx.config, doc);
       if (work.kind === 'none') return null;
@@ -351,6 +468,8 @@ const sourceSummary: PageGenerator = {
     const language = asSummaryLanguage(cached.language) ?? detectSummaryLanguage(cached.body);
     const heat = (await getDocHeat(ctx.store, [doc.id], ctx.config.heat)).get(doc.id) ?? 0;
     const title = doc.title ?? path.basename(doc.path);
+    const claims = (plan.data.claims as SummaryClaim[] | undefined) ?? [];
+    const total = (plan.data.total as number | undefined) ?? claims.length;
     return {
       frontmatter: {
         title,
@@ -362,7 +481,8 @@ const sourceSummary: PageGenerator = {
         generated: okfGenerated(`knode-os/${cached.model}`, cached.generatedAt),
         knode: knodeMeta('source_summary', { documents: [doc.path] }),
       },
-      regions: { body: cached.body.trim() },
+      // a document without claims has no section, and one that had a section loses it
+      regions: { body: cached.body.trim(), claims: renderSummaryClaims(claims, total, summaryScaffold(language).claims) },
     };
   },
 };
@@ -712,10 +832,10 @@ export const GENERATORS: Partial<Record<PageKind, PageGenerator>> = {
 const FRONTMATTER_RE = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/;
 
 /** Merge generated frontmatter keys and regions into an existing page (or build a fresh one). */
-export function composePage(existing: string | null, frontmatter: Record<string, unknown>, regions: Record<string, string>): string {
+export function composePage(existing: string | null, frontmatter: Record<string, unknown>, regions: Record<string, string | null>): string {
   if (!existing) {
     const front = Object.keys(frontmatter).length ? writeMatter('', frontmatter).trimEnd() : '';
-    const body = Object.entries(regions).map(([id, c]) => renderRegion(id, c)).join('\n\n');
+    const body = Object.entries(regions).flatMap(([id, c]) => (c === null ? [] : [renderRegion(id, c)])).join('\n\n');
     return `${front ? front + '\n\n' : ''}${body}\n`;
   }
   let parsed: { data: Record<string, unknown>; content: string };
@@ -753,6 +873,8 @@ export interface RegenerateOptions {
   at?: string;
   force?: boolean;
   hint?: Record<string, unknown>;
+  /** A page a model writes is written only when its render needs no model (its answer is cached), else deferred. */
+  cachedOnly?: boolean;
 }
 
 export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: PageKind, opts: RegenerateOptions = {}): Promise<RegenerateOutcome> {
@@ -778,7 +900,7 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
   // the model this generator writes with — the Summarize stage for a summary,
   // not `ctx.llm` — decides whether an uncached page can be written now
   const client = gen.client?.(ctx) ?? ctx.llm;
-  if (gen.llm && !client.enabled && !(await cachedRenderAvailable(ctx, gen, pagePath, plan))) return 'deferred';
+  if (gen.llm && (!client.enabled || opts.cachedOnly) && !(await cachedRenderAvailable(ctx, gen, pagePath, plan))) return 'deferred';
 
   const rendered = await gen.render(ctx, pagePath, plan);
   if (!rendered) return 'deferred';
@@ -805,7 +927,7 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
     text = replaceRegion(existing ?? '', region ?? 'body', regionContent);
   }
   const fileSha = sha256(text);
-  const regions = Object.entries(rendered.regions).map(([id, c]) => ({ id, sha: sha16(c) }));
+  const regions = Object.entries(rendered.regions).flatMap(([id, c]) => (c === null ? [] : [{ id, sha: sha16(c) }]));
 
   // the same inputs through a newer generator are a new version of the page
   await applyScope(store, { kind: 'page', key: pagePath }, plan.inputsSha, { actor, at: opts.at, meta: { kind, file }, force: outdated }, async (w) => {
@@ -822,11 +944,11 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
   return 'regenerated';
 }
 
-async function cachedRenderAvailable(ctx: PagesContext, gen: PageGenerator, _pagePath: string, plan: PagePlan): Promise<boolean> {
+async function cachedRenderAvailable(ctx: PagesContext, gen: PageGenerator, pagePath: string, plan: PagePlan): Promise<boolean> {
   if (gen.kind === 'source_summary') {
     const doc = plan.data.doc as DocumentRow | undefined;
     if (!doc) return false;
-    return readSourceSummary(ctx.dataDir, doc.path)?.contentSha === doc.sha256;
+    return (await summaryBody(ctx, pagePath, doc, false)) !== null;
   }
   return false;
 }
@@ -897,8 +1019,10 @@ export async function reconcileViews(
     if (!matchesPrefixes(file, opts.prefixes)) continue;
     // a page a model did not write, written by an older version of its generator, is written again:
     // it costs nothing, and otherwise it keeps the old layout until one of its inputs happens to change
+    // — so is a summary page: its model-written body is cached, and the rest is generated (a page whose cache is
+    // gone waits for a pass that may call the model)
     const gen = GENERATORS[p.kind];
-    if (gen && !gen.llm && p.status === 'active' && p.generator && p.generator !== `${p.kind}@${gen.version}`) {
+    if (gen && (!gen.llm || gen.kind === 'source_summary') && p.status === 'active' && p.generator && p.generator !== `${p.kind}@${gen.version}`) {
       await store.query(`UPDATE pages SET status = 'dirty', dirty_reason = $2::jsonb WHERE path = $1`, [p.path, JSON.stringify({ generator: `${p.kind}@${gen.version}` })]);
       p.status = 'dirty';
     }
@@ -933,14 +1057,15 @@ export async function reconcileViews(
     for (const p of dirty) {
       const gen = GENERATORS[p.kind];
       if (!gen) continue;
-      if (gen.llm && !opts.llm) {
+      // a summary page whose claims changed is re-rendered from its cached body without a model
+      if (gen.llm && !opts.llm && gen.kind !== 'source_summary') {
         if (!processed.has(p.path)) stats.deferred++;
         processed.add(p.path);
         continue;
       }
       processed.add(p.path);
       try {
-        const r = await regeneratePage(ctx, p.path, p.kind, { actor });
+        const r = await regeneratePage(ctx, p.path, p.kind, { actor, cachedOnly: gen.llm && !opts.llm });
         if (r === 'regenerated') {
           stats.regenerated++;
           progress(`regenerated ${p.path}`);
@@ -1139,6 +1264,29 @@ export async function writeSourceSummaryPage(
 }
 
 /** Where one document's summary page goes: where it is, else the title's path unless another document's page holds that. */
+/**
+ * Re-render, from their cached bodies, the summary pages of documents whose
+ * extraction just landed: a page lists its document's claims, and one written
+ * before them (`extraction.summaryAfterExtraction: false`, or a document
+ * extracted again) has no dep on the claims it does not list yet. No model
+ * is called; a page whose cache is gone is left for the Summarize stage.
+ */
+export async function refreshSummaryClaims(ctx: PagesContext, documents: string[], opts: { actor?: string } = {}): Promise<string[]> {
+  if (documents.length === 0) return [];
+  const rows = await ctx.store.query<{ page: string; doc: string }>(
+    `SELECT d.artifact_id AS page, d.input_id AS doc FROM deps d JOIN pages p ON p.path = d.artifact_id
+     WHERE d.artifact_kind = 'page' AND d.input_kind = 'document' AND d.input_id = ANY($1::text[])
+       AND p.kind = 'source_summary' AND p.status <> 'archived'`,
+    [documents],
+  );
+  const written: string[] = [];
+  for (const r of rows) {
+    const outcome = await regeneratePage(ctx, r.page, 'source_summary', { actor: opts.actor ?? 'summarize', hint: { documentPath: r.doc }, cachedOnly: true });
+    if (outcome === 'regenerated') written.push(r.page);
+  }
+  return written;
+}
+
 async function summaryPagePath(store: Store, doc: DocumentRow): Promise<string> {
   const pages = await summaryPagesByDocument(store);
   const own = pages.get(doc.path)?.path;

@@ -46,6 +46,8 @@ interface Scaffold {
   name: string;
   keyPoints: string;
   entities: string;
+  /** The heading of the claims the page lists from the database, below the model's summary. */
+  claims: string;
   description: (docPath: string) => string;
   coverage: (c: SourceSummaryCoverage) => string;
 }
@@ -58,6 +60,7 @@ const SCAFFOLDS: Record<SummaryLanguage, Scaffold> = {
     name: "Chinese, in the document's own variety (simplified or traditional)",
     keyPoints: '要点',
     entities: '实体',
+    claims: '文中论断',
     description: (p) => `${p} 的摘要。`,
     coverage: (c) => c.read >= c.parts
       ? `分段摘要：全文约 ${fmt(c.chars)} 字、${c.parts} 段，逐段摘要后合并。`
@@ -67,6 +70,7 @@ const SCAFFOLDS: Record<SummaryLanguage, Scaffold> = {
     name: 'Japanese',
     keyPoints: '要点',
     entities: '関連エンティティ',
+    claims: '文中の主張',
     description: (p) => `${p} の要約。`,
     coverage: (c) => c.read >= c.parts
       ? `分割要約：全文約 ${fmt(c.chars)} 文字・${c.parts} 部分を部分ごとに要約して統合。`
@@ -76,6 +80,7 @@ const SCAFFOLDS: Record<SummaryLanguage, Scaffold> = {
     name: 'Korean',
     keyPoints: '핵심 요점',
     entities: '엔티티',
+    claims: '문서의 주장',
     description: (p) => `${p} 요약.`,
     coverage: (c) => c.read >= c.parts
       ? `분할 요약: 전문 약 ${fmt(c.chars)}자, ${c.parts}개 부분을 각각 요약한 뒤 병합.`
@@ -85,6 +90,7 @@ const SCAFFOLDS: Record<SummaryLanguage, Scaffold> = {
     name: 'English',
     keyPoints: 'Key points',
     entities: 'Entities',
+    claims: 'Claims in this document',
     description: (p) => `Summary of ${p}.`,
     coverage: (c) => c.read >= c.parts
       ? `Segmented summary: the full text (about ${fmt(c.chars)} characters in ${c.parts} parts) was summarized part by part and merged.`
@@ -92,7 +98,7 @@ const SCAFFOLDS: Record<SummaryLanguage, Scaffold> = {
   },
 };
 
-export function summaryScaffold(language: SummaryLanguage): { keyPoints: string; entities: string; description: (docPath: string) => string; coverage: (c: SourceSummaryCoverage) => string } {
+export function summaryScaffold(language: SummaryLanguage): { keyPoints: string; entities: string; claims: string; description: (docPath: string) => string; coverage: (c: SourceSummaryCoverage) => string } {
   return SCAFFOLDS[language];
 }
 
