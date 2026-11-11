@@ -48,13 +48,17 @@ export interface RunMeta {
   packs: string[];
   systems: string[];
   suites: string[];
-  model: { connection: string; label: string; buildEffort: string; answerEffort: string };
+  model: { connection: string; label: string; buildEffort: string; answerEffort: string; agents?: string };
   judge: { connection: string; label: string };
   embedding: string;
   fraction: number;
   seed: string | number;
   limit: number | null;
   versions: Record<string, string>;
+  /** What each pack staged: documents (padding among them, for a fraction above 1) and characters. */
+  staged?: Record<string, { documents: number; padded: number; chars: number; tasks: number }>;
+  /** Task types the run was limited to (`--types`). */
+  types?: string[];
   notes?: string;
 }
 

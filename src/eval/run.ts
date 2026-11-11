@@ -8,22 +8,26 @@ import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings
 import { createConfiguredEmbeddingProvider } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
 import { Judge } from './judge.js';
+import { ModelChain, parseChain, SpendLedger } from './chain.js';
+import { setAgentRouting } from './agent.js';
 import { Meter } from './meter.js';
 import { dirBytes, listFiles, loadPack, LoadedPack, packsDir, runsDir, seededKey, stageCorpus, StagedCorpus, stageUpdate, validatePack } from './pack.js';
-import { checkEndpoint, endpointUnder } from './endpoint.js';
+import { calibrateEndpoint, checkEndpoint, endpointUnder, preferEndpoint } from './endpoint.js';
 import { citationsIn, taskPrompt } from './prompts.js';
 import { EmbeddingBudget, QuotaGuard } from './quota.js';
-import { recordKey, RunMeta, RunStore } from './runstore.js';
+import { fileLines, recordKey, RunMeta, RunStore } from './runstore.js';
 import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
+import { scoreLists } from './score/lists.js';
 import { scoreUsage } from './score/usage.js';
 import { ChatBackend, ClientBackend, CodexBackend, startShim } from './shim.js';
 import { closeAdapters } from './systems/external.js';
 import { makeSystems } from './systems/index.js';
 import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
+import { boundedTrace } from './trace.js';
 import { SystemEnv, SystemUnderTest, taggedEmbedder } from './systems/types.js';
 import { extractFinalAnswer } from './metrics/text.js';
-import { AnswerRecord, BuildRecord, emptyUsage, Suite, SUITES, Task } from './types.js';
+import { AnswerRecord, BuildRecord, emptyUsage, Suite, SUITES, Task, TaskType } from './types.js';
 
 /**
  * `knode-os eval run` (docs/design/23 §7). For each pack: stage the corpus,
@@ -54,18 +58,32 @@ export interface RunOptions {
    * vectors the run holds (`checkEndpoint`).
    */
   embeddingEndpoint?: string;
+  /** With `embeddingEndpoint`: embed on the workspace's embedder while the endpoint is unreachable (a local bge-m3 first, the pool after). */
+  embeddingFallback?: boolean;
   buildEffort?: LlmEffort;
   answerEffort?: LlmEffort;
   /** Judge: a CLI provider ('claude-cli') and model. */
   judgeProvider?: string;
   judgeModel?: string;
+  /**
+   * Budgeted model chains (D18), e.g. `openai-api:200,codex-cli`: the model
+   * calls of every system (`chatChain`), the agent sessions (`agentChain`,
+   * API links billed through Codex, then the login) and the judge
+   * (`judgeChain`). Connections come from `configFrom`.
+   */
+  chatChain?: string;
+  agentChain?: string;
+  judgeChain?: string;
   embedding?: 'workspace' | 'local';
   /** At most this many tasks per pack (stratified by type), and fewer for agents. */
   limit?: number;
+  /** Only tasks of these types (a focused run: the corpus-level types, deep hops, updates). */
+  types?: TaskType[];
   agentLimit?: number;
   fraction?: number;
   seed?: string | number;
   slots?: number;
+  /** Tasks one system answers at once in each pack, update batches included (default 3). */
   answerConcurrency?: number;
   /** Packs worked on at once (each builds and answers on its own; the shim's slots bound the model calls). */
   packConcurrency?: number;
@@ -75,6 +93,23 @@ export interface RunOptions {
   embeddingDailyCap?: number;
   /** Skip scoring (answers only) or answering (score what is there). */
   skipScoring?: boolean;
+  /**
+   * Start from another run's builds of the same packs (same id, version,
+   * fraction and seed) and its embedding vectors: their work directories are
+   * copied and their build records kept, cost included — so a new task set
+   * over an unchanged corpus does not pay for the builds again. A build the
+   * other run went on to update is built again: update batches change its
+   * work directory in place, so what is there is no longer the base build.
+   */
+  reuseBuildsFrom?: string;
+  /**
+   * Build groups (`knode`, `llm-wiki`, `rag`, …) not taken from
+   * `reuseBuildsFrom`, built afresh: a build's key names the pack and its
+   * version, not the code that built it, so after a change to how a group
+   * builds (knode's retrieval, entity pages, summaries) its old build would
+   * otherwise come back.
+   */
+  rebuild?: string[];
   /** Tests: stand-ins for Codex, the judge and the embedder. */
   overrides?: { chat?: ChatBackend; judge?: LlmClient; embedder?: EmbeddingProvider };
   onProgress?: (msg: string) => void;
@@ -168,11 +203,44 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     ?? (opts.embedding === 'local' || !workspaceConfig
       ? createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false })
       : createConfiguredEmbeddingProvider(workspaceConfig));
-  const embedder = opts.embeddingEndpoint ? endpointUnder(configured, opts.embeddingEndpoint) : configured;
-  const backend = opts.overrides?.chat ?? (opts.chatConnection ? connectionBackend(workspaceConfig, opts.chatConnection, opts.model) : new CodexBackend({ model: opts.model }));
-  const judgeClient = opts.overrides?.judge ?? new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 });
+  const onEndpoint = opts.embeddingEndpoint ? endpointUnder(configured, opts.embeddingEndpoint) : null;
+  const embedder = !onEndpoint ? configured
+    : opts.embeddingFallback ? preferEndpoint(onEndpoint, configured, (m) => {
+      progress(m);
+      store.log(m);
+    }) : onEndpoint;
+  const ledger = new SpendLedger();
+  const chainLog = (m: string) => {
+    progress(m);
+    store.log(m);
+  };
+  const chain = (spec: string) => new ModelChain(parseChain(spec, workspaceConfig, { ledger, model: opts.model }), ledger, chainLog);
+  const backend = opts.overrides?.chat
+    ?? (opts.chatChain ? chain(opts.chatChain).asBackend()
+      : opts.chatConnection ? connectionBackend(workspaceConfig, opts.chatConnection, opts.model) : new CodexBackend({ model: opts.model }));
+  const judgeClient = opts.overrides?.judge
+    ?? (opts.judgeChain ? chain(opts.judgeChain).asClient()
+      : new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 }));
+  if (opts.agentChain) {
+    const agents = chain(opts.agentChain);
+    const bad = agents.links.find((l) => !l.api && l.name !== 'codex-cli');
+    if (bad) throw new Error(`--agent-chain: agents run in Codex; "${bad.name}" is neither an API connection nor codex-cli`);
+    setAgentRouting({
+      pick: () => agents.pick(),
+      charge: (name, model, usage) => void agents.charge(agents.links.find((l) => l.name === name)!, model, usage, { role: 'agent' }),
+      exhaust: (name, why) => agents.exhaust(agents.links.find((l) => l.name === name)!, why),
+    });
+  }
   const judge = new Judge({ client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
   const models = { model: opts.model ?? '', buildEffort: opts.buildEffort ?? 'low', answerEffort: opts.answerEffort ?? 'medium' };
+
+  if (opts.reuseBuildsFrom) {
+    const groups = new Set(makeSystems(opts.systems).map((sys) => sys.group).filter((g) => !opts.rebuild?.includes(g)));
+    const n = reuseBuilds(store, path.resolve(opts.reuseBuildsFrom), opts.packs, `${embedder.model} (${embedder.dimensions})`, fraction, seed, groups);
+    progress(`reusing ${n.builds} builds and ${n.vectors} embedding vectors from ${opts.reuseBuildsFrom}${opts.rebuild?.length ? `; building ${opts.rebuild.join(', ')} afresh` : ''}`);
+    if (n.updated.length) progress(`building again, since ${opts.reuseBuildsFrom} updated them after building: ${n.updated.join(', ')}`);
+    store.log('builds reused', { from: opts.reuseBuildsFrom, ...n });
+  }
 
   const shim = await startShim({
     backend,
@@ -194,13 +262,14 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     packs: opts.packs.map((p) => path.basename(p)),
     systems: opts.systems,
     suites: [...suites],
-    model: { connection: opts.chatConnection ?? 'codex-cli', label: backend.label, buildEffort: models.buildEffort, answerEffort: models.answerEffort },
-    judge: { connection: opts.judgeProvider ?? 'claude-cli', label: judgeClient.label },
+    model: { connection: opts.chatChain ?? opts.chatConnection ?? 'codex-cli', label: backend.label, buildEffort: models.buildEffort, answerEffort: models.answerEffort, ...(opts.agentChain ? { agents: opts.agentChain } : {}) },
+    judge: { connection: opts.judgeChain ?? opts.judgeProvider ?? 'claude-cli', label: judgeClient.label },
     embedding: `${embedder.model} (${embedder.dimensions})`,
     fraction,
     seed,
     limit: opts.limit ?? null,
     versions: {},
+    ...(opts.types?.length ? { types: opts.types } : {}),
   };
   store.writeMeta(meta);
 
@@ -230,26 +299,41 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       for (const w of issues.warnings) store.log('pack warning', { pack: pack.manifest.id, warning: w });
       return pack;
     });
-    if (opts.embeddingEndpoint) {
-      const check = await checkEndpoint(embedder, shim.vectors, packs);
-      progress(`embedding on ${opts.embeddingEndpoint} as ${embedder.model}: ${check.texts} texts the run holds came back at cosine ${check.lowest.toFixed(5)} or more`);
-      store.log('embedding endpoint', { url: opts.embeddingEndpoint, identity: embedder.model, ...check });
+    if (opts.embeddingEndpoint && onEndpoint) {
+      // against the vectors the run holds; a run that holds too few is checked against the workspace's embedder itself
+      try {
+        const check = await checkEndpoint(onEndpoint, shim.vectors, packs).catch(async (err) => {
+          if (!/can be checked against only/.test(String(err))) throw err;
+          return calibrateEndpoint(onEndpoint, configured, packs);
+        });
+        progress(`embedding on ${opts.embeddingEndpoint} as ${embedder.model}: ${check.texts} texts came back at cosine ${check.lowest.toFixed(5)} or more`);
+        store.log('embedding endpoint', { url: opts.embeddingEndpoint, identity: embedder.model, ...check });
+      } catch (err) {
+        // unreachable: the fallback takes over; a model that does not reproduce the vectors is refused either way
+        if (!opts.embeddingFallback || !/econnrefused|fetch failed|etimedout|enotfound|socket hang up|connection (refused|reset)|network/i.test(String(err))) throw err;
+        progress(`embedding endpoint ${opts.embeddingEndpoint} unreachable: embedding on ${configured.model}`);
+        store.log('embedding endpoint unreachable', { url: opts.embeddingEndpoint, error: String(err).slice(0, 200) });
+      }
     }
     const runPack = async (pack: LoadedPack) => {
       const staged = stageCorpus(pack, { fraction, seed });
       loaded.push({ pack, staged });
       corpusDocs.set(pack.manifest.id, new Set(staged.docs.map((d) => d.path)));
       for (const t of pack.tasks) tasksByKey.set(`${pack.manifest.id}|${t.id}`, t);
-      progress(`pack ${pack.manifest.id}: ${staged.docs.length} documents, ${staged.tasks.length} tasks`);
+      progress(`pack ${pack.manifest.id}: ${staged.docs.length} documents${staged.padded ? ` (${staged.padded} of them padding)` : ''}, ${staged.tasks.length} tasks`);
+      const chars = staged.docs.reduce((n, d) => n + fs.readFileSync(path.join(staged.dir, d.path), 'utf8').length, 0);
+      meta.staged = { ...meta.staged, [pack.manifest.id]: { documents: staged.docs.length, padded: staged.padded, chars, tasks: staged.tasks.length } };
+      store.writeMeta(meta);
 
-      const systems = makeSystems(opts.systems).filter((s) => s.applicable?.(pack) ?? true);
+      const systems = makeSystems(opts.systems).filter((s) => s.applicable?.(pack, staged) ?? true);
       for (const s of systems) if (s.answers && s.kind !== 'reference' && s.cites !== false) citing.add(s.id);
       const groups = new Map<string, SystemUnderTest[]>();
       for (const s of systems) (groups.get(s.group) ?? groups.set(s.group, []).get(s.group)!).push(s);
 
       const failed = new Set<string>();
-      const allTasks = selectTasks(staged.tasks.filter((t) => !t.afterUpdate), suites, opts.limit, seed);
-      const updateTasks = suites.has('update') ? staged.tasks.filter((t) => t.afterUpdate) : [];
+      const typed = opts.types?.length ? staged.tasks.filter((t) => opts.types!.includes(t.type)) : staged.tasks;
+      const allTasks = selectTasks(typed.filter((t) => !t.afterUpdate), suites, opts.limit, seed);
+      const updateTasks = suites.has('update') ? typed.filter((t) => t.afterUpdate) : [];
 
       for (const [group, members] of groups) {
         const env: SystemEnv = {
@@ -285,8 +369,10 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         for (const s of members) await s.release?.(env);
       }
 
-      // update batches: apply each to the staged corpus, let every system that can update, then ask its tasks
-      const batches = [...new Set(updateTasks.map((t) => t.afterUpdate!))].sort();
+      // update batches, in order and cumulatively up to the last one a task asks after: apply each to the
+      // staged corpus, let every system that can update (its cost recorded per batch), then ask that batch's tasks
+      const last = updateTasks.map((t) => t.afterUpdate!).sort().at(-1);
+      const batches = last ? pack.updates.filter((b) => b <= last) : [];
       for (const batch of batches) {
         const files = stageUpdate(pack, staged, batch);
         for (const f of files) corpusDocs.get(pack.manifest.id)!.add(f);
@@ -307,11 +393,12 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
               ok = false;
               error = err instanceof Error ? err.message : String(err);
             }
-            store.putBuild({ key, pack: pack.manifest.id, system: `${group}@${batch}`, ok, error, ms: Date.now() - t0, usage: meter.usage((e) => e.system === group, mark), stages: meter.stages(group, mark), bytes: 0, notes: { batch, files: files.length }, at: new Date().toISOString() });
-          } else if (!updater) {
+            store.putBuild({ key, pack: pack.manifest.id, system: `${group}@${batch}`, ok, error, ms: Date.now() - t0, usage: meter.usage((e) => e.system === group, mark), stages: meter.stages(group, mark), bytes: 0, notes: { batch, files: files.length, tasks: tasks.length }, at: new Date().toISOString() });
+          } else {
+            // nothing to update, or a resumed run that updated already: reopen on the staged corpus as it now is
             for (const s of members) await s.reopen?.(env).catch(() => {});
           }
-          for (const s of members) await answerAll(store, meter, env, s, tasks, fraction, seed, 1, progress, batch);
+          for (const s of members) await answerAll(store, meter, env, s, tasks, fraction, seed, opts.answerConcurrency ?? 3, progress, batch);
           for (const s of members) await s.release?.(env);
         }
       }
@@ -337,6 +424,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
 
     if (!opts.skipScoring) await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing }, progress);
   } finally {
+    setAgentRouting(null);
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);
     closeAdapters();
@@ -344,6 +432,52 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     for (const l of loaded) l.staged.cleanup();
   }
   return { runDir, builds: store.allBuilds().length, answers: store.allAnswers().length, scores: store.allScores().length };
+}
+
+/**
+ * Copy another run's finished builds of these packs, and its embedding
+ * vectors, into this run. Refused when the other run embedded with another
+ * model: a knode index or a RAG index answers queries only in its own space.
+ * A build the other run updated (`<group>@<batch>`, applied in place) is left
+ * out and listed in `updated`: its work directory holds the updated corpus.
+ */
+export function reuseBuilds(store: RunStore, from: string, packDirs: string[], embedding: string, fraction: number, seed: string | number, groups?: Set<string>): { builds: number; vectors: number; updated: string[] } {
+  const src = new RunStore(from);
+  const meta = src.meta();
+  if (!meta) throw new Error(`--reuse-builds-from: not a run directory: ${from}`);
+  if (meta.embedding !== embedding) throw new Error(`--reuse-builds-from: ${meta.id} embedded with ${meta.embedding}; this run embeds with ${embedding}`);
+  let builds = 0;
+  const updated: string[] = [];
+  for (const dir of packDirs) {
+    const pack = loadPack(dir);
+    const all = src.allBuilds().filter((x) => x.pack === pack.manifest.id);
+    for (const b of all.filter((x) => x.ok && !x.system.includes('@') && (!groups || groups.has(x.system)))) {
+      if (b.key !== recordKey('build', pack.manifest.id, pack.manifest.version, b.system, fraction, seed) || store.build(b.key)) continue;
+      if (all.some((x) => x.system.startsWith(`${b.system}@`))) {
+        updated.push(`${pack.manifest.id}/${b.system}`);
+        continue;
+      }
+      const work = path.join(from, 'work', pack.manifest.id, b.system);
+      if (fs.existsSync(work)) fs.cpSync(work, store.workDir(pack.manifest.id, b.system), { recursive: true });
+      store.putBuild({ ...b, notes: { ...b.notes, reusedFrom: meta.id, builtAt: b.at } });
+      builds++;
+    }
+  }
+  // the vectors the reused indexes were built with, so a reopened RAG index embeds nothing again
+  let vectors = 0;
+  const from_ = path.join(from, 'cache', 'vectors.jsonl');
+  const to = path.join(store.cacheDir(), 'vectors.jsonl');
+  if (builds && fs.existsSync(from_) && !fs.existsSync(to)) {
+    fs.copyFileSync(from_, to);
+    vectors = fileLineCount(to);
+  }
+  return { builds, vectors, updated };
+}
+
+function fileLineCount(file: string): number {
+  let n = 0;
+  for (const line of fileLines(file)) if (line.trim()) n++;
+  return n;
 }
 
 /** Build (or reopen) a group's knowledge base; false when it failed, so the run goes on without it. */
@@ -365,6 +499,7 @@ export async function scoreAnswers(
   if (!answers.length) return 0;
   progress(`scoring ${answers.length} answers`);
   for (const r of await scoreUsage({ answers, tasks: ctx.tasks, citing: ctx.citing }, judge)) store.putScore(r);
+  for (const r of await scoreLists({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge)) store.putScore(r);
   for (const r of await scoreEmergence({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge)) store.putScore(r);
   return answers.length;
 }
@@ -466,15 +601,16 @@ async function answerAll(
     try {
       const a = await s.answer!(t, taskPrompt(t), env);
       rec = {
-        key, pack: env.pack.manifest.id, system: s.id, taskId: t.id, at: new Date().toISOString(),
+        key, pack: env.pack.manifest.id, system: s.id, taskId: t.id, ...(batch ? { batch } : {}), at: new Date().toISOString(),
         text: a.text, finalAnswer: extractFinalAnswer(a.text),
         citations: a.citations ?? citationsIn(a.text, docs), retrieved: a.retrieved ?? [], toolCalls: a.toolCalls ?? 0,
+        ...(a.commands ? { commands: boundedTrace(a.commands) } : {}),
         ...(a.capped ? { capped: true } : {}), ...(a.leaked?.length ? { leaked: a.leaked } : {}), ...(a.error ? { error: a.error } : {}),
         usage: meter.usage((e) => e.system === s.id && e.task === t.id, mark), ms: Date.now() - t0,
       };
     } catch (err) {
       rec = {
-        key, pack: env.pack.manifest.id, system: s.id, taskId: t.id, at: new Date().toISOString(),
+        key, pack: env.pack.manifest.id, system: s.id, taskId: t.id, ...(batch ? { batch } : {}), at: new Date().toISOString(),
         text: '', finalAnswer: '', citations: [], retrieved: [], toolCalls: 0, error: err instanceof Error ? err.message : String(err),
         usage: meter.usage((e) => e.system === s.id && e.task === t.id, mark), ms: Date.now() - t0,
       };

@@ -1,5 +1,7 @@
 import type { LlmClient } from '../../llm/client.js';
-import type { PackIssues } from '../pack.js';
+import type { LoadedPack, PackIssues } from '../pack.js';
+import type { Task } from '../types.js';
+import type { CorpusPlan } from './corpus-tasks.js';
 import { buildFixturePack } from './fixture.js';
 
 /**
@@ -27,6 +29,14 @@ export interface Recipe {
   /** Needs a model to write gold or tasks. */
   needsAuthor: boolean;
   build(dir: string, ctx: RecipeContext): Promise<PackIssues>;
+  /** Corpus-level tasks `eval pack extend` drafts for a built pack of this recipe. */
+  corpusPlan?: CorpusPlan;
+  /** A build without an author already writes corpus-level tasks (law-cn's statutes): `extend` takes them from one. */
+  modelFreeCorpus?: boolean;
+  /** `extend` can take padding from a build with `padding` set, without a model (local or cached sources). */
+  padding?: 'local' | 'download' | 'author';
+  /** Tasks of the recipe's own that `extend` drafts for a built pack (research-ai's field review and directions). */
+  extendTasks?(pack: LoadedPack, ctx: RecipeContext): Promise<Task[]>;
 }
 
 const recipes: Recipe[] = [

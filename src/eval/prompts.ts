@@ -22,9 +22,31 @@ const LABEL_RULES = (choices?: string[]) => `Rules:
 - Base the answer on the available knowledge and cite the documents behind it.
 - End with a JSON object on its own lines: {"label":"<answer>","confidence":<0-1>,"evidence":["<path>", …]}${choices?.length ? ` where label is one of: ${choices.map((c) => JSON.stringify(c)).join(', ')}` : ''}.`;
 
+/**
+ * Rules for a corpus-level list (aggregate, timeline, contradiction, profile):
+ * every item it should hold, not the top few, in the same JSON as a set probe.
+ */
+const LIST_RULES = (task: Task) => {
+  const n = task.list?.maxItems ?? 10;
+  const what = {
+    aggregate: 'one item per thing asked for — list every one the documents support, not a sample',
+    timeline: 'one item per change or state, in chronological order, each with its date ("date": "YYYY-MM-DD", or YYYY-MM when only the month is known)',
+    contradiction: 'one item per side of each disagreement: what that side says, with the documents that say it as its evidence',
+    profile: 'one item per distinct fact the documents state — cover all of them, not a summary',
+  }[task.type as 'aggregate' | 'timeline' | 'contradiction' | 'profile'] ?? 'one item per thing asked for';
+  const shape = task.list?.ordered
+    ? '{"items":[{"label":"<item>","date":"YYYY-MM-DD","confidence":<0-1>,"evidence":["<path>", …]}, …]}'
+    : '{"items":[{"label":"<item>","confidence":<0-1>,"evidence":["<path>", …]}, …]}';
+  return `Rules:
+- Base every item on the available knowledge and cite the documents behind it by their paths.
+- Items: ${what}. Keep each label short and specific (names, numbers and dates as the documents give them).
+- End with a JSON object on its own lines: ${shape} — at most ${n} items.`;
+};
+
 /** The task as a system sees it: question, the as-of date when there is one, and the output rules for its scoring. */
 export function taskPrompt(task: Task): string {
   const asOf = task.asOf ? `\n(Answer as of ${task.asOf}.)` : '';
+  if (task.scoring === 'set' && task.list) return `${task.question}${asOf}\n\n${LIST_RULES(task)}`;
   if (task.scoring === 'set') return `${task.question}${asOf}\n\n${SET_RULES}`;
   if (task.scoring === 'label' || task.scoring === 'choice') return `${task.question}${asOf}\n\n${LABEL_RULES(task.choices)}`;
   return `${task.question}${asOf}\n\n${OUTPUT_RULES}`;
@@ -49,7 +71,7 @@ export function citationsIn(text: string, docs: Set<string>, resolve?: (cited: s
 }
 
 export interface ParsedItems {
-  items: { label: string; confidence: number | null; evidence: string[] }[];
+  items: { label: string; confidence: number | null; evidence: string[]; date?: string }[];
   label: string | null;
   confidence: number | null;
 }
@@ -63,7 +85,10 @@ export function parseStructured(text: string): ParsedItems {
     items: rawItems
       .map((it) => (typeof it === 'string' ? { label: it } : (it as Record<string, unknown>)))
       .filter((it) => typeof it.label === 'string' && it.label.trim())
-      .map((it) => ({ label: String(it.label).trim(), confidence: conf(it.confidence), evidence: Array.isArray(it.evidence) ? it.evidence.map(String) : [] })),
+      .map((it) => ({
+        label: String(it.label).trim(), confidence: conf(it.confidence), evidence: Array.isArray(it.evidence) ? it.evidence.map(String) : [],
+        ...(typeof it.date === 'string' && it.date.trim() ? { date: it.date.trim() } : {}),
+      })),
     label: typeof json.label === 'string' ? json.label.trim() : typeof json.choice === 'string' ? json.choice.trim() : null,
     confidence: conf(json.confidence),
   };

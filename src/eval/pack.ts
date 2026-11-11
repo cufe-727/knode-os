@@ -4,8 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 import {
-  CorpusDoc, CorpusDocSchema, GoldAlias, GoldAliasSchema, GoldFact, GoldFactSchema, GoldLink, GoldLinkSchema,
-  PackManifest, PackManifestSchema, Task, TaskSchema,
+  CORPUS_TASK_MIN_DOCS, CORPUS_TASK_TYPES, CorpusDoc, CorpusDocSchema, DEEP_HOP_MIN, GoldAlias, GoldAliasSchema, GoldFact, GoldFactSchema,
+  GoldLink, GoldLinkSchema, PackManifest, PackManifestSchema, Task, TaskSchema,
 } from './types.js';
 import { evalTempDir } from './tmp.js';
 
@@ -13,7 +13,7 @@ import { evalTempDir } from './tmp.js';
  * Benchmark packs on disk (docs/design/23 §1).
  *
  *   pack.json  corpus/ corpus.jsonl  holdout/  gold/{facts,links,aliases}.jsonl gold/profile.json
- *   tasks/*.jsonl  updates/NN/  injections/
+ *   tasks/*.jsonl  updates/NN/  injections/  padding/ padding.jsonl
  *
  * Packs live outside the repository (`~/knode-eval/packs`): they hold
  * downloaded third-party text. A system under test never reads the pack
@@ -39,6 +39,11 @@ export interface LoadedPack {
   updates: string[];
   /** Documents planted to attack the system (prompt injection), relative to injections/. */
   injections: string[];
+  /**
+   * Documents that only scale curves stage (`--fraction` above 1): more of the
+   * same kind of source, chosen so that no closed-world task's gold changes.
+   */
+  padding: CorpusDoc[];
 }
 
 export function readJsonl<T>(file: string, schema: z.ZodType<T>): T[] {
@@ -100,7 +105,23 @@ export function loadPack(dir: string): LoadedPack {
       ? fs.readdirSync(updatesDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort()
       : [],
     injections: listFiles(path.join(abs, 'injections')),
+    padding: (() => {
+      const listedPad = readJsonl(path.join(abs, 'padding.jsonl'), CorpusDocSchema);
+      const knownPad = new Set(listedPad.map((d) => d.path));
+      return [...listedPad, ...listFiles(path.join(abs, 'padding')).filter((p) => !knownPad.has(p)).map((p) => ({ path: p }))];
+    })(),
   };
+}
+
+/** Text of a document of an update batch (updates/<batch>/<doc>), or '' when the batch does not hold it. */
+export function updateText(pack: LoadedPack, batch: string, doc: string): string {
+  const file = path.join(pack.dir, 'updates', batch, doc);
+  return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+}
+
+/** Distinct documents a task's evidence names. */
+export function evidenceDocs(t: Task): string[] {
+  return [...new Set(t.evidence.map((e) => e.doc))];
 }
 
 export function docText(pack: LoadedPack, doc: string): string {
@@ -137,24 +158,80 @@ export function validatePack(pack: LoadedPack): PackIssues {
   for (const d of pack.docs) if (!fs.existsSync(path.join(pack.dir, 'corpus', d.path))) errors.push(`corpus.jsonl lists ${d.path}, which is not in corpus/`);
 
   const ids = new Set<string>();
+  // an update task's evidence may lie in its batch or an earlier one (batches apply cumulatively)
+  const updateHolding = (doc: string, upTo: string) => pack.updates.filter((b) => b <= upTo && updateText(pack, b, doc));
+  const known = (doc: string, afterUpdate?: string) => docs.has(doc) || (afterUpdate ? updateHolding(doc, afterUpdate).length > 0 : pack.updates.some((b) => updateText(pack, b, doc)));
   for (const t of pack.tasks) {
     if (ids.has(t.id)) errors.push(`duplicate task id ${t.id}`);
     ids.add(t.id);
     for (const e of t.evidence) {
-      // update tasks may cite a document that only an update batch adds
       if (!docs.has(e.doc)) {
-        if (!t.afterUpdate) errors.push(`task ${t.id}: evidence doc ${e.doc} is not in the corpus`);
+        const batches = t.afterUpdate ? updateHolding(e.doc, t.afterUpdate) : [];
+        if (!batches.length) {
+          errors.push(t.afterUpdate ? `task ${t.id}: evidence doc ${e.doc} is neither in the corpus nor in an update batch up to ${t.afterUpdate}` : `task ${t.id}: evidence doc ${e.doc} is not in the corpus`);
+        } else if (e.quote && !batches.some((b) => foldSpace(updateText(pack, b, e.doc)).includes(foldSpace(e.quote!)))) {
+          errors.push(`task ${t.id}: quote not found in update ${e.doc}: "${e.quote.slice(0, 60)}"`);
+        }
         continue;
       }
       if (e.quote && !text(e.doc).includes(foldSpace(e.quote))) errors.push(`task ${t.id}: quote not found in ${e.doc}: "${e.quote.slice(0, 60)}"`);
     }
     if ((t.scoring === 'judge' || t.scoring === 'exact') && !t.answer && !t.answers?.length) errors.push(`task ${t.id}: ${t.scoring} scoring needs an answer`);
+    if (t.scoring === 'count' && !/^\d+(\.\d+)?$/.test((t.answer ?? '').trim())) errors.push(`task ${t.id}: count scoring needs a number as the answer`);
     if (t.scoring === 'set' && !t.items?.length) errors.push(`task ${t.id}: set scoring needs items`);
     if (t.scoring === 'choice' && (!t.choices?.length || !t.answer || !t.choices.includes(t.answer))) errors.push(`task ${t.id}: choice scoring needs choices that include the answer`);
     if (t.scoring === 'keypoints' && !t.keypoints?.length) errors.push(`task ${t.id}: keypoints scoring needs keypoints`);
     if (t.scoring === 'label' && !t.answer) errors.push(`task ${t.id}: label scoring needs an answer`);
     if (t.afterUpdate && !pack.updates.includes(t.afterUpdate)) errors.push(`task ${t.id}: update batch ${t.afterUpdate} does not exist`);
     if (t.type === 'unanswerable' && t.scoring !== 'abstain') warnings.push(`task ${t.id}: unanswerable but scored ${t.scoring}`);
+    for (const it of t.items ?? []) for (const d of it.docs ?? []) if (!known(d, t.afterUpdate)) errors.push(`task ${t.id}: item "${it.label.slice(0, 30)}" names ${d}, which is not in the corpus`);
+    if (t.list && t.scoring !== 'set') errors.push(`task ${t.id}: a list spec needs set scoring`);
+    if (t.list && (t.list.match === 'docs' || t.list.requireDocs) && t.items?.some((it) => !it.docs?.length)) errors.push(`task ${t.id}: matching by documents needs every item's docs`);
+    if (t.list && t.items && t.items.length > t.list.maxItems) errors.push(`task ${t.id}: ${t.items.length} gold items but the answer may list only ${t.list.maxItems}`);
+
+    // corpus-level tasks: set-scored (or a count), spread over many documents
+    if (CORPUS_TASK_TYPES.includes(t.type)) {
+      const spread = evidenceDocs(t).length;
+      if (spread < CORPUS_TASK_MIN_DOCS) errors.push(`task ${t.id}: a ${t.type} task needs evidence in at least ${CORPUS_TASK_MIN_DOCS} documents (has ${spread})`);
+      if (t.scoring !== 'set' && t.scoring !== 'count') errors.push(`task ${t.id}: a ${t.type} task is scored as a set or a count, not ${t.scoring}`);
+      if (t.scoring === 'set' && !t.list) errors.push(`task ${t.id}: a ${t.type} task needs a list spec`);
+    }
+    if (t.type === 'timeline' && t.scoring === 'set') {
+      if (!t.list?.ordered) errors.push(`task ${t.id}: a timeline is an ordered list`);
+      if (t.items?.some((it) => !it.date)) errors.push(`task ${t.id}: every timeline item needs a date`);
+    }
+    if (t.type === 'contradiction' && t.scoring === 'set' && (t.items?.length ?? 0) < 2) errors.push(`task ${t.id}: a contradiction needs at least two sides`);
+    if (t.type === 'deep-hop') {
+      const hops = Number(t.meta?.hops ?? 0);
+      if (hops < DEEP_HOP_MIN) errors.push(`task ${t.id}: a deep-hop task needs meta.hops ≥ ${DEEP_HOP_MIN}`);
+      if (evidenceDocs(t).length < DEEP_HOP_MIN) errors.push(`task ${t.id}: a deep-hop task's hops lie in at least ${DEEP_HOP_MIN} different documents`);
+    }
+  }
+
+  // padding (scale curves) must leave every closed-world task's gold as it is
+  if (pack.padding.length) {
+    const padTexts = pack.padding.map((d) => {
+      const file = path.join(pack.dir, 'padding', d.path);
+      if (!fs.existsSync(file)) errors.push(`padding.jsonl lists ${d.path}, which is not in padding/`);
+      if (docs.has(d.path)) errors.push(`padding document ${d.path} has the path of a corpus document`);
+      return { path: d.path, text: fs.existsSync(file) ? foldSpace(fs.readFileSync(file, 'utf8')) : '' };
+    });
+    for (const t of pack.tasks) {
+      if (!t.closedWorld) continue;
+      for (const pre of t.closedWorld.prefixes) {
+        const under = padTexts.find((p) => p.path.startsWith(pre));
+        if (under) errors.push(`task ${t.id}: padding document ${under.path} lies under its closed-world prefix ${pre}`);
+      }
+      for (const term of t.closedWorld.terms) {
+        // one CJK character is a word (膝); one Latin letter is not
+        if (foldSpace(term).length < 2 && !/[\u3400-\u9fff]/.test(term)) {
+          warnings.push(`task ${t.id}: closed-world term "${term}" is too short to check`);
+          continue;
+        }
+        const hit = padTexts.find((p) => p.text.includes(foldSpace(term)));
+        if (hit) errors.push(`task ${t.id}: padding document ${hit.path} mentions its closed-world term "${term}"`);
+      }
+    }
   }
 
   const factIds = new Set<string>();
@@ -192,42 +269,67 @@ export interface StagedCorpus {
   docs: CorpusDoc[];
   /** Tasks whose evidence is all inside the staged documents. */
   tasks: Task[];
+  /** Padding documents among `docs` (scale curves). */
+  padded: number;
   cleanup: () => void;
 }
 
 /**
  * Copy the corpus — or a seeded fraction of it — to a new directory under the
  * OS temp dir. Tasks whose evidence falls outside the fraction are dropped
- * (an unanswerable task stays: it has none). Update batches are not copied;
- * `stageUpdate` adds one when an update suite asks for it.
+ * (an unanswerable task stays: it has none). A fraction above 1 stages the
+ * whole corpus plus that many times its size again in seeded padding
+ * documents (`fraction` 10 → ten times the documents), and keeps every task:
+ * `validatePack` has checked that padding cannot change a closed-world task's
+ * gold. A pack without enough padding is an error, not a smaller curve.
+ * Update batches are not copied; `stageUpdate` adds one when an update suite
+ * asks for it.
  */
 export function stageCorpus(pack: LoadedPack, opts: { fraction?: number; seed?: string | number } = {}): StagedCorpus {
   const fraction = opts.fraction ?? 1;
   const seed = opts.seed ?? 0;
-  const keep = fraction >= 1
-    ? pack.docs
-    : [...pack.docs].sort((a, b) => seededKey(seed, a.path).localeCompare(seededKey(seed, b.path)))
-      .slice(0, Math.max(1, Math.round(pack.docs.length * fraction)));
+  if (!(fraction > 0) || !Number.isFinite(fraction)) throw new Error(`--fraction must be a positive number (got ${fraction})`);
+  const bySeed = (docs: CorpusDoc[]) => [...docs].sort((a, b) => seededKey(seed, a.path).localeCompare(seededKey(seed, b.path)));
+  let keep: CorpusDoc[];
+  let padding: CorpusDoc[] = [];
+  if (fraction <= 1) {
+    keep = fraction === 1 ? pack.docs : bySeed(pack.docs).slice(0, Math.max(1, Math.round(pack.docs.length * fraction)));
+  } else {
+    keep = pack.docs;
+    const want = Math.round(pack.docs.length * (fraction - 1));
+    if (pack.padding.length < want) {
+      throw new Error(`pack ${pack.manifest.id} has ${pack.padding.length} padding documents; --fraction ${fraction} needs ${want} (rebuild the pack with more padding)`);
+    }
+    padding = bySeed(pack.padding).slice(0, want);
+  }
   const kept = new Set(keep.map((d) => d.path));
   const { root, cleanup } = evalTempDir('corpus');
   const dir = path.join(root, 'corpus');
-  for (const d of keep) {
+  const copy = (from: string, d: CorpusDoc) => {
     const to = path.join(dir, d.path);
     fs.mkdirSync(path.dirname(to), { recursive: true });
-    fs.copyFileSync(path.join(pack.dir, 'corpus', d.path), to);
-  }
+    fs.copyFileSync(path.join(pack.dir, from, d.path), to);
+  };
+  for (const d of keep) copy('corpus', d);
+  for (const d of padding) copy('padding', d);
   const tasks = pack.tasks.filter((t) => t.afterUpdate || t.evidence.every((e) => kept.has(e.doc)));
-  return { dir, docs: keep, tasks, cleanup };
+  return { dir, docs: [...keep, ...padding], tasks, padded: padding.length, cleanup };
 }
 
-/** Copy an update batch into a staged corpus; returns the documents it added or replaced. */
+/**
+ * Copy an update batch into a staged corpus and list its documents among the
+ * staged ones (so answers may cite them and a rebuilt index reads them);
+ * returns the documents it added or replaced. Batches apply cumulatively.
+ */
 export function stageUpdate(pack: LoadedPack, staged: StagedCorpus, batch: string): string[] {
   const from = path.join(pack.dir, 'updates', batch);
   const files = listFiles(from);
+  const present = new Set(staged.docs.map((d) => d.path));
   for (const f of files) {
     const to = path.join(staged.dir, f);
     fs.mkdirSync(path.dirname(to), { recursive: true });
     fs.copyFileSync(path.join(from, f), to);
+    if (!present.has(f)) staged.docs.push({ path: f, kind: 'update' });
   }
   return files;
 }

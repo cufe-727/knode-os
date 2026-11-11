@@ -1,5 +1,7 @@
-import { seededKey } from '../pack.js';
-import type { GoldItem } from '../types.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { docText, LoadedPack, seededKey } from '../pack.js';
+import type { GoldItem, Task } from '../types.js';
 import { finishDocpack } from './docpack.js';
 import { fetchText, htmlToText } from './fetch.js';
 import { registerRecipe, RecipeContext } from './index.js';
@@ -26,6 +28,9 @@ interface Paper {
   published: string;
   authors: string[];
 }
+
+/** Corpus-level tasks for research-ai: methods and benchmarks recur across papers; findings disagree. */
+export const RESEARCH_AI_CORPUS = { profile: 12, timeline: 6, contradiction: 10, aggregate: 14, deep: 10 };
 
 const QUERY = '(cat:cs.CL OR cat:cs.AI OR cat:cs.MA) AND (abs:agent OR abs:agents OR abs:"large language model")';
 
@@ -141,9 +146,81 @@ async function buildResearch(dir: string, ctx: RecipeContext) {
     }
     writer.setProfile({ limits, problems, themes: themes.themes ?? [] });
   }
-  return finishDocpack({ writer, docs, lang: 'en', tasks, plan: { single: 20, multi: 10, unanswerable: 5, global: 3 }, perDoc: 5 }, ctx);
+  return finishDocpack({ writer, docs, lang: 'en', tasks, plan: { single: 20, multi: 10, unanswerable: 5, global: 3 }, perDoc: 5, corpus: RESEARCH_AI_CORPUS }, ctx);
+}
+
+/**
+ * Emergence over a whole field (docs/design/23 §2.1), for a built pack:
+ * - the main lines of work (a review's backbone): each paper's approach, named
+ *   by the author, grouped into lines with at least three papers each;
+ * - promising directions: which of the field's recurring open problems the
+ *   2026 holdout papers make progress on — what happened next decides, not
+ *   the author's opinion;
+ * - a review that covers both, graded on keypoints.
+ */
+export async function researchEmergence(pack: LoadedPack, ctx: RecipeContext): Promise<Task[]> {
+  const author = ctx.author!;
+  const docs = pack.docs.map((d) => ({ path: d.path, text: docText(pack, d.path) }));
+  const approaches: { paper: string; approach: string }[] = [];
+  for (let i = 0; i < docs.length; i += 8) {
+    const group = docs.slice(i, i + 8);
+    const r = await author.completeJson<{ papers?: { paper?: string; approach?: string }[] }>([
+      { role: 'system', content: 'For each paper, name the main approach or line of work it belongs to in 3–8 words, general enough that papers taking the same approach get the same name (e.g. "retrieval-augmented agents", "reinforcement learning from verifiable rewards"). Answer with JSON: {"papers":[{"paper":"<path>","approach":"…"}]}' },
+      { role: 'user', content: group.map((d) => `<paper path="${d.path}">\n${d.text.slice(0, 3000)}\n</paper>`).join('\n\n') },
+    ], { maxTokens: 2000 });
+    for (const p of r.papers ?? []) if (p.paper && p.approach && group.some((d) => d.path === p.paper)) approaches.push({ paper: p.paper, approach: p.approach });
+  }
+  const grouped = await author.completeJson<{ lines?: { label?: string; aliases?: string[]; papers?: string[] }[] }>([
+    { role: 'system', content: 'Group these papers into the main lines of work of their field. Keep lines with at least three papers; give each a short label, two other phrasings, and its papers. At most 10, largest first. Answer with JSON: {"lines":[{"label":"…","aliases":["…"],"papers":["<path>"]}]}' },
+    { role: 'user', content: JSON.stringify(approaches) },
+  ], { maxTokens: 4000 });
+  const known = new Set(docs.map((d) => d.path));
+  const lines = (grouped.lines ?? []).map((l) => ({ ...l, papers: [...new Set((l.papers ?? []).filter((p) => known.has(p)))] })).filter((l) => l.label && l.papers.length >= 3);
+  const tasks: Task[] = [];
+  if (lines.length >= 3) {
+    tasks.push({
+      id: 'emerge-review-lines', suite: 'emergence', type: 'themes', lang: 'en', scoring: 'set', primary: true,
+      question: 'Write the backbone of a review of the field these papers cover: what are its main lines of work? Name each and cite the papers that represent it.',
+      items: lines.map((l) => ({ label: l.label!, aliases: (l.aliases ?? []).slice(0, 3), signal: 'implicit' as const, weight: 1, docs: l.papers })),
+      evidence: [...new Set(lines.flatMap((l) => l.papers))].slice(0, 30).map((doc) => ({ doc })), meta: { minEvidence: 2 },
+    });
+  }
+  // promising directions: open problems the next half-year's papers actually advance
+  const problems = ((pack.profile.problems as { label?: string; aliases?: string[]; papers?: string[] }[] | undefined) ?? []).filter((p) => p.label);
+  const holdoutFile = path.join(pack.dir, 'holdout', 'papers-2026.json');
+  if (problems.length >= 3 && fs.existsSync(holdoutFile)) {
+    const holdout = JSON.parse(fs.readFileSync(holdoutFile, 'utf8')) as { id: string; title: string; abstract: string }[];
+    const hits = new Map<number, Set<string>>();
+    for (let i = 0; i < holdout.length; i += 40) {
+      const group = holdout.slice(i, i + 40);
+      const r = await author.completeJson<{ matches?: { paper?: string; problem?: number }[] }>([
+        { role: 'system', content: 'Each abstract is from a 2026 paper. For each, list which of the numbered open problems it makes concrete progress on (a new method, result or benchmark that addresses it — not a passing mention). Most papers address none. Answer with JSON: {"matches":[{"paper":"<id>","problem":<number>}]}' },
+        { role: 'user', content: JSON.stringify({ problems: problems.map((p, n) => `${n}: ${p.label}`), papers: group.map((p) => ({ id: p.id, title: p.title, abstract: p.abstract.slice(0, 800) })) }) },
+      ], { maxTokens: 3000 });
+      for (const m of r.matches ?? []) if (typeof m.problem === 'number' && problems[m.problem] && m.paper) (hits.get(m.problem) ?? hits.set(m.problem, new Set()).get(m.problem)!).add(m.paper);
+    }
+    const advanced = [...hits.entries()].filter(([, ps]) => ps.size >= 3).sort((a, b) => b[1].size - a[1].size).map(([n, ps]) => ({ problem: problems[n], papers: ps.size }));
+    if (advanced.length >= 2) {
+      tasks.push({
+        id: 'emerge-promising', suite: 'emergence', type: 'forecast', lang: 'en', scoring: 'set',
+        question: 'Of the unresolved problems these papers raise, which are most likely to see real progress in the following half-year? Name them, and ground each in the papers that point to it.',
+        items: advanced.map((a) => ({ label: a.problem.label!, aliases: (a.problem.aliases ?? []).slice(0, 3), signal: 'latent' as const, weight: 1 })),
+        evidence: [], meta: { minEvidence: 1, holdoutPapers: Object.fromEntries(advanced.map((a) => [a.problem.label, a.papers])) },
+      });
+    }
+    if (lines.length >= 3) {
+      tasks.push({
+        id: 'emerge-review', suite: 'emergence', type: 'themes', lang: 'en', scoring: 'keypoints',
+        question: 'Write a short structured review of the field these papers cover: its main lines of work, its open problems, and which of those problems look most promising to work on next. Cite papers throughout.',
+        keypoints: [...lines.slice(0, 4).map((l) => l.label!), ...problems.slice(0, 3).map((p) => p.label!), ...advanced.slice(0, 2).map((a) => `promising: ${a.problem.label}`)],
+        answer: 'see keypoints', evidence: [...new Set(lines.flatMap((l) => l.papers))].slice(0, 20).map((doc) => ({ doc })),
+      });
+    }
+  }
+  ctx.log(`research emergence: ${lines.length} lines of work, ${tasks.length} tasks`);
+  return tasks;
 }
 
 export function registerResearchRecipes(): void {
-  registerRecipe({ id: 'research-ai', title: 'arXiv papers on AI agents and LLMs, 2025-H2, with a 2026 holdout', domain: 'research', network: true, needsAuthor: true, build: buildResearch });
+  registerRecipe({ id: 'research-ai', title: 'arXiv papers on AI agents and LLMs, 2025-H2, with a 2026 holdout', domain: 'research', network: true, needsAuthor: true, build: buildResearch, corpusPlan: RESEARCH_AI_CORPUS, extendTasks: researchEmergence });
 }
