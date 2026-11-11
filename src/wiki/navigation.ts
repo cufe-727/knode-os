@@ -1,11 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { safePath } from '../fs/files.js';
+import { applyDocScope } from '../ingest/apply.js';
+import { noteOwnWrite } from '../ingest/own-writes.js';
 import { disposeScope, findLiveScope } from '../lineage/scope.js';
 import {
   entitiesTree, layoutTree, pageDirs, pagesTree, SHELF_REGION, sourcesTree, TreeSpec, treeRows, withTreeRows,
 } from './nav-views.js';
 import { archivePage, PagesContext, RegenerateOutcome, regeneratePage } from './pages.js';
+import { replaceRegion } from './regions.js';
 
 /**
  * Keeping the wiki's navigation current (the views are in ./nav-views.ts):
@@ -30,10 +33,26 @@ export interface NavigationStats {
   skipped?: boolean;
 }
 
-/** Remove a paged file an archived view left empty, its folders if they are empty too, and its search projection. */
-async function removeIfEmpty(ctx: PagesContext, file: string, actor: string): Promise<void> {
+/**
+ * Take an archived page of a list out of its file. Disposing a region view
+ * puts back what the region held before its last write — the list as it was
+ * one refresh earlier — so the region is removed here, and the file with it
+ * when nothing else is in it (a person's notes keep it), with its folders if
+ * they are empty too and its search projection.
+ */
+async function removeShelf(ctx: PagesContext, file: string, actor: string): Promise<void> {
   const abs = safePath(ctx.dataDir, file);
-  if (!fs.existsSync(abs) || fs.readFileSync(abs, 'utf8').trim() !== '') return;
+  if (!fs.existsSync(abs)) return;
+  const text = fs.readFileSync(abs, 'utf8');
+  const rest = replaceRegion(text, SHELF_REGION, null);
+  if (rest.trim() !== '') {
+    if (rest !== text) {
+      fs.writeFileSync(abs, rest);
+      const indexed = await applyDocScope(ctx, file, 'wiki', { queueTier1: false, actor });
+      if (indexed.sha) noteOwnWrite(ctx.dataDir, file, 'wiki', indexed.sha);
+    }
+    return;
+  }
   fs.unlinkSync(abs);
   const doc = await findLiveScope(ctx.store, 'doc', file);
   if (doc) await disposeScope(ctx.store, doc.id, { actor, reason: 'removed' });
@@ -76,7 +95,7 @@ async function refreshTreeIn(ctx: PagesContext, spec: TreeSpec, opts: { actor?: 
       await archivePage(ctx, p.path, actor);
       stats.archived.push(file);
     }
-    await removeIfEmpty(ctx, file, actor);
+    await removeShelf(ctx, file, actor);
   }
   return hub;
 }
