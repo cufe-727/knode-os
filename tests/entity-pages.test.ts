@@ -3,8 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
+import { applyTier1Scope } from '../src/graph/tier1.js';
+import { documentIdFor } from '../src/ingest/apply.js';
 import { sync } from '../src/ingest/sync.js';
-import { ensureEntitiesIndex, ensureEntityStubs, reconcileViews } from '../src/wiki/pages.js';
+import { ensureEntitiesIndex, ensureEntityStubs, reconcileViews, regeneratePage } from '../src/wiki/pages.js';
 
 /**
  * Entity pages (src/wiki/pages.ts): everything the knowledge base holds about
@@ -124,7 +126,7 @@ describe('entity pages', () => {
     expect(stats.regenerated).toBeGreaterThanOrEqual(1);
     expect(page('atlas-depot')).toContain('Atlas Depot has twelve loading bays');
     const [row] = await ctx.store.query<{ generator: string; status: string }>(`SELECT generator, status FROM pages WHERE path = 'wiki/entities/atlas-depot.md'`);
-    expect(row).toEqual({ generator: 'entity_stub@4', status: 'active' });
+    expect(row).toEqual({ generator: 'entity_stub@5', status: 'active' });
     // a page written before the entity it names had one links it once it is written again
     expect(page('harbor-freight-lines')).not.toContain('[[Atlas Depot]]');
     await ctx.store.query(`UPDATE pages SET generator = 'entity_stub@2' WHERE path = 'wiki/entities/harbor-freight-lines.md'`);
@@ -132,5 +134,32 @@ describe('entity pages', () => {
     expect(page('harbor-freight-lines')).toContain('- [[Atlas Depot]]: Atlas Depot leases two bays to Harbor Freight Lines `fact` — raw/docs/notes/atlas.md');
     // nothing left to do
     expect((await reconcileViews(ctx, { llm: false })).regenerated).toBe(0);
+  });
+
+  it('name the document a tier-1 relation comes from', async () => {
+    // tier 1 writes a relation's evidence on a tier1 scope under the document, with no document on the relation
+    const file = 'raw/docs/notes/atlas.md';
+    const documentId = documentIdFor(file);
+    const [doc] = await ctx.store.query<{ sha256: string }>(`SELECT sha256 FROM documents WHERE id = $1`, [documentId]);
+    const chunkIds = await ctx.store.query<{ id: string; content: string }>(`SELECT id, content FROM chunks WHERE document_id = $1 ORDER BY seq`, [documentId]);
+    const res = await applyTier1Scope(
+      ctx.store,
+      { path: file, sha256: doc.sha256 },
+      { documentId, path: file, title: 'Atlas Depot', chunkIds },
+      {
+        entities: [{ name: 'Atlas Depot', type: 'organization' }, { name: 'Quay Nine', type: 'location' }],
+        relations: [{ source: 'Atlas Depot', target: 'Quay Nine', type: 'related_to', description: 'next door' }],
+      },
+      { model: 'test-model' },
+    );
+    expect(res.outcome).toBe('applied');
+    expect(res.relations).toBe(1);
+    const [ev] = await ctx.store.query<{ kind: string; document_id: string | null }>(
+      `SELECT s.kind, r.document_id FROM relations r JOIN evidence ev ON ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL
+       JOIN scopes s ON s.id = ev.scope_id WHERE r.description = 'next door' AND r.tx_to IS NULL`,
+    );
+    expect(ev).toEqual({ kind: 'tier1', document_id: null });
+    await regeneratePage(ctx, 'wiki/entities/atlas-depot.md', 'entity_stub');
+    expect(page('atlas-depot')).toMatch(/- related to → Quay Nine: next door — raw\/docs\/notes\/atlas\.md/);
   });
 });
