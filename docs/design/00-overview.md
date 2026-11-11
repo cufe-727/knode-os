@@ -81,6 +81,7 @@ knode-os combines three ideas:
 │   ├── attachments/    Obsidian attachments
 │   ├── index.md  log.md  overview.md
 │   ├── entities/  concepts/  sources/  dreams/  datasets/
+│   ├── mentions/  timelines/  disagreements/   pages across documents
 ├── playbooks/          agent-editable configuration: packs/ capabilities/ intents/
 ├── ledger/             events.jsonl (machine truth) + attic/ (sidecars of removed sources)
 └── .knode/             local state; with PGlite also the index itself (L2, db/)
@@ -213,6 +214,82 @@ lists every entity page with what it is and how much it holds. Pages regenerate 
 the entities/claims/documents they depend on change, and are archived when a
 required input is disposed. Human prose outside the managed regions survives
 regeneration and is itself a source.
+
+### Pages across documents
+
+A corpus-level question — which papers use Gemini, which articles name 国务院,
+the laws in the order they were last amended, which sources disagree — has
+its answer on a dozen entity pages, or on none: a paper that evaluates
+"Gemini-3 Pro" in passing gets no claim about Gemini. Three kinds of page,
+none written by a model, gather such answers (`src/wiki/corpus-views.ts`,
+created and refreshed by `src/wiki/corpus.ts`). Each line names its source,
+as on an entity page:
+
+- `wiki/mentions/<entity>.md`: every source document that names an entity or
+  a name that extends it ("Gemini 1.5", "Qwen3", "Llama3.2": Latin names
+  only, since a CJK name that begins with another is usually something else).
+  Each document's line gives the names it uses and how often, the article or
+  section numbers they appear in (第二十五条, Article 12), and a passage of
+  about 240 bytes. The text is searched through the chunk gram index, with a
+  Latin name matched as a whole word and the longer name counted first. The
+  families the graph's mentions put in the most documents get pages, at least
+  three documents each, as many as entity pages get (one per four documents,
+  30 to 300). A variant goes under its root. A family named in more than
+  half of a corpus of twenty documents or more gets no page: 中华人民共和国 in
+  every chapter of a statute, or an alias such as 本法, lists what the sources
+  index lists already. A page lists at most 100 documents, the ones that use
+  the names most.
+- `wiki/timelines/<period>.md`: every dated claim of every entity (its event,
+  else the start of its window), in order. The period is the coarsest that
+  holds at most 400 claims: `all` while everything fits, else a decade
+  (`2020s`), else a year, else a month. A month past 400 lists the oldest
+  400 and says how many more there are. A page per year gave law-cn sixteen
+  pages of one to three claims.
+- `wiki/disagreements/<n>.md`: two claims the Judge found in conflict
+  (`claim_pair_verdicts`, with its reason) and claims extracted as disputed,
+  by subject, 200 to a page. The claim audit's other findings (similar
+  wordings from two sources, expired facts) stay in the suggestions queue:
+  they are leads to check, 207 and 1,710 of them on two benchmark builds,
+  not statements that two sources disagree.
+
+Each directory's `index.md` lists its pages in a managed region (OKF allows
+frontmatter only on the root index). `wiki generate` writes them all. The
+background document pass writes them for what it has just written: the
+families its entities belong to (up to 30 new pages a pass), the periods its
+dated claims fall in, and the disagreement pages when one of its claims is in
+a conflict or disputed. Between passes they are views like any other page:
+an entity, claim or document they list changing makes them dirty. What their
+deps cannot show (a new document naming the family, a new dated claim, a new
+verdict) waits for the next pass.
+
+Measured with `listcov.ts` (the model-free benchmark harness), which counts
+the share of a list task's gold items that one page holds. An item counts
+when a line names it, or cites its document if no other item shares that
+document, and the line, a heading above it or the page's title names what
+the question asks about. Before → after, on one page / on the best three:
+
+| pack | tasks | before | after | pages, bytes added |
+| --- | --- | --- | --- | --- |
+| research-ai | 13 aggregate | 0.438 / 0.682 | 0.771 / 0.869 | 34 pages, 158 KB (wiki 507 → 665 KB) |
+| research-ai | 12 profile | 0.205 / 0.348 | 0.594 / 0.688 | |
+| law-cn | 26 articles naming a term | 0.334 / 0.401 | 0.419 / 0.514 | 20 pages, 110 KB (wiki 559 → 669 KB) |
+| law-cn | 10 article counts | 0.293 / 0.336 | 0.425 / 0.482 | |
+| law-cn | 1 timeline (laws by last amendment) | 0.429 / 0.714 | 0.857 / 1.000 | |
+| synthetic-life-zh | no list tasks | | | 17 pages, 68 KB (wiki 53 → 121 KB) |
+
+What these pages leave unanswered:
+
+- Questions about a word the graph has no entity for. law-cn's "which
+  articles of 公司法 mention 注册资本" asks about about 30 terms, and 28 of
+  them are no entity. research-ai's GitHub, ablation, hallucination,
+  multi-agent and finance are no entity either. A term index would have to
+  choose its vocabulary. Mining one from n-grams without a model gives mostly
+  function words (应当, 依照本法), and a list of each term's articles comes to
+  about 80 KB per statute for the 300 most frequent terms, more than the
+  statute itself. These are full-text questions: ask's excerpts answer them
+  at question time (docs above), and an agent greps.
+- Disagreements the Judge has not judged. law-cn's 核准 versus 注册 (公司法
+  2018 against 证券法 2019) is in no verdict, and finding it takes a model.
 
 ## Navigation
 

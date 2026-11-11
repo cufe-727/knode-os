@@ -26,6 +26,7 @@ import { Params, toDateString, toIso } from '../store/temporal.js';
 import { DocumentRow } from '../types.js';
 import { entitiesIndex, entitiesShelf, NavPageKind, overviewHoldings, pagesIndex, pagesShelf, sourcesIndex, sourcesShelf, wikiContents } from './nav-views.js';
 import { hasRegions, renderRegion, replaceRegion, splitRegions } from './regions.js';
+import { CORPUS_GENERATORS, CorpusPageKind } from './corpus-views.js';
 import { asSummaryLanguage, detectSummaryLanguage, documentChars, isShortDocument, planSummary, produceSummary, shortByRow, summaryMinChars, summaryScaffold } from './summary.js';
 
 /**
@@ -47,7 +48,7 @@ import { asSummaryLanguage, detectSummaryLanguage, documentChars, isShortDocumen
  * job (docs/design/09) — but rows of that kind may still exist until
  * `retireConceptClusterPages` archives them.
  */
-export type PageKind = 'entity_stub' | 'source_summary' | 'dataset' | 'sources_index' | 'entities_index' | 'hot_topics' | 'concept_cluster' | 'dream' | 'research_index' | NavPageKind;
+export type PageKind = 'entity_stub' | 'source_summary' | 'dataset' | 'sources_index' | 'entities_index' | 'hot_topics' | 'concept_cluster' | 'dream' | 'research_index' | NavPageKind | CorpusPageKind;
 
 export interface PagesContext {
   store: Store;
@@ -739,6 +740,7 @@ export const GENERATORS: Partial<Record<PageKind, PageGenerator>> = {
   pages_shelf: pagesShelf,
   wiki_contents: wikiContents,
   overview_holdings: overviewHoldings,
+  ...CORPUS_GENERATORS,
 };
 
 /* ----------------------------- composition ------------------------------ */

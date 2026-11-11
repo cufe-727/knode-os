@@ -2,6 +2,7 @@ import { AppContext } from '../context.js';
 import { auditDuplicateClaims, ClaimDedupeStats } from '../graph/claim-dedupe.js';
 import { auditDuplicateEntities, DedupeStats } from '../graph/dedupe.js';
 import { runTier1Pass, Tier1Stats } from '../graph/tier1.js';
+import { ensureCorpusPages } from '../wiki/corpus.js';
 import { refreshNavigationIfChanged } from '../wiki/navigation.js';
 import { ensureEntityStubs, ensureSourceSummaries, refreshSummaryClaims } from '../wiki/pages.js';
 
@@ -15,6 +16,8 @@ export interface DocumentPassStats extends Tier1Stats {
   summaries: string[];
   /** Entity pages created for the entities this pass wrote. */
   entityPages: string[];
+  /** Pages across documents (mentions, timelines, disagreements) written for what this pass wrote. */
+  corpusPages: string[];
 }
 
 export interface DocumentPassOptions {
@@ -52,7 +55,11 @@ const passChains = new Map<string, Promise<unknown>>();
  *    two documents or more now speak of: what no single document holds. No
  *    model: the page lists the entity's claims with their sources. Existing
  *    pages are brought up to date by the next sync, as any view is.
- * 6. Navigation — the indexes, the contents of wiki/index.md and the
+ * 6. Pages across documents — the mention pages of the families its
+ *    entities belong to (created for those three documents or more name),
+ *    the timeline periods its dated claims fall in, and the disagreement
+ *    pages when one of its claims is in a conflict or disputed. No model.
+ * 7. Navigation — the indexes, the contents of wiki/index.md and the
  *    overview's holdings (src/wiki/navigation.ts), when the pass wrote
  *    anything and what they count has changed.
  *
@@ -126,7 +133,16 @@ async function runDocumentPassUnlocked(ctx: AppContext, opts: DocumentPassOption
     }
   }
 
-  if (extracted.processed || summaries.length || entityPages.length) {
+  let corpusPages: string[] = [];
+  if (extracted.touched.length > 0 || extracted.touchedClaims.length > 0) {
+    try {
+      corpusPages = await ensureCorpusPages({ ...ctx, config }, { focus: { entities: extracted.touched, claims: extracted.touchedClaims }, actor: 'corpus' });
+    } catch (err) {
+      progress(`corpus pages failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  if (extracted.processed || summaries.length || entityPages.length || corpusPages.length) {
     try {
       const nav = await refreshNavigationIfChanged({ ...ctx, config }, { actor: 'entities' });
       if (nav.written.length || nav.archived.length) progress(`navigation: ${nav.written.length} index pages written, ${nav.archived.length} archived`);
@@ -135,7 +151,7 @@ async function runDocumentPassUnlocked(ctx: AppContext, opts: DocumentPassOption
     }
   }
 
-  return { ...extracted, resolve, claims, summaries, entityPages };
+  return { ...extracted, resolve, claims, summaries, entityPages, corpusPages };
 }
 
 /** One log line for a pass, or null when it did nothing worth a line. */
@@ -152,5 +168,6 @@ export function describeDocumentPass(s: DocumentPassStats): string | null {
   }
   if (s.summaries.length) parts.push(`${s.summaries.length} summaries`);
   if (s.entityPages.length) parts.push(`${s.entityPages.length} entity pages`);
+  if (s.corpusPages?.length) parts.push(`${s.corpusPages.length} cross-document pages`);
   return parts.length ? `document pass: ${parts.join('; ')}` : null;
 }
