@@ -196,7 +196,12 @@ Tiered extraction (details in [01](01-doc-processing-graph-wiki.md)):
 
 The background pass writes `wiki/sources/<slug>.md` summaries (LLM; `wiki
 generate` fills gaps by hand) and entity pages (no model), as materialized
-views with declared inputs. An entity page lists everything the knowledge
+views with declared inputs. Below the model's summary, cached by the
+document's content, a summary page lists the document's own claims from the
+database (up to 30, those with figures and dates first, each with its date and
+tagged when it is a view or a forecast): the figures, dates and article numbers
+a 400-word summary drops, re-rendered without a model whenever the claims change
+([14 §6](14-summary-pages-worth-their-cost.md)). An entity page lists everything the knowledge
 base holds about its entity, each line with the document it comes from:
 standing facts, views and forecasts, a dated timeline, disagreements, what
 claims about other entities say of it, and its relations (up to 300 claims;
@@ -325,6 +330,11 @@ reads through knode every line said `cold` (09 said the index shows heat).
   trust tier; `known_at`, a fourth time axis that reads only what was available
   at a decision time; market data and a run registry read in place as
   datasources; experiments and author track records written back as sources.
+- [14 — Summary pages worth their cost](14-summary-pages-worth-their-cost.md)
+  — no page under 1,500 characters, the scaffold in the document's language,
+  links only to the graph's names, long documents segment by segment; and the
+  specifics a summary drops put back without a model: the document's claims
+  listed below the summary, a compact figures list in the model's own output.
 - [15 — Research studies: from a topic to a set of wiki pages, with the sources kept](15-research-studies.md)
   — a topic refined into a brief the person edits, then collected (web, the
   base, MCP / API / site sources, or a deep-research model) into originals
