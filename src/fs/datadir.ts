@@ -11,6 +11,7 @@ import { ensureDefaultResearchTemplates } from '../research/templates.js';
 import { ensureDefaultChatPlaybooks } from '../chat/templates.js';
 import { ensureDefaultAgents } from '../research/agents.js';
 import { ensureDefaultProfiles } from '../research/profile.js';
+import { stripRegions } from '../wiki/regions.js';
 import { CAPABILITIES_DIR, DB_DIR, INTENTS_DIR, LEGACY_TOP_LEVEL, PACKS_DIR } from './layout.js';
 
 /**
@@ -173,11 +174,17 @@ function squashTemplate(text: string): string {
 
 const squashedSha = (text: string) => crypto.createHash('sha256').update(squashTemplate(text)).digest('hex');
 
-/** True when `text` is still a template `initDataDir` wrote at `rel`, current or retired (line endings and trailing whitespace ignored). */
+/**
+ * True when `text` is still a template `initDataDir` wrote at `rel`, current
+ * or retired (line endings and trailing whitespace ignored). Managed regions
+ * are not anyone's writing: the generated account of what the base holds
+ * (`wiki/overview.md#holdings`) leaves an overview nobody initialized a seed.
+ */
 export function isSeedTemplate(rel: string, text: string): boolean {
   const clean = rel.replace(/\\/g, '/').replace(/^\/+/, '');
   const template = SEED_FILES[clean];
   if (template === undefined) return false;
+  text = stripRegions(text);
   return squashTemplate(template) === squashTemplate(text) || (RETIRED_SEEDS[clean]?.includes(squashedSha(text)) ?? false);
 }
 

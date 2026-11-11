@@ -9,6 +9,7 @@ import { isReservedWikiFile } from '../lineage/declared.js';
 import { listDisputes } from '../lineage/trust.js';
 import { LlmClient } from '../llm/client.js';
 import { parseFrontmatter } from '../markdown.js';
+import { Store } from '../store/db.js';
 import { knowledgeStats, KnowledgeStats, listDatasets } from '../store/queries.js';
 import { toIso } from '../store/temporal.js';
 
@@ -35,12 +36,17 @@ export interface KbSurvey {
     total: number;
     byFolder: { folder: string; n: number; latest: string | null }[];
     dateRange: { from: string | null; to: string | null };
+    /** By file extension (`md`, `pdf`, …), the most first. */
+    byType: { type: string; n: number }[];
     recent: { path: string; title: string | null; docDate: string | null }[];
   };
   entities: {
     total: number;
     byType: { type: string; n: number }[];
     top: { id: string; name: string; type: string; mentions: number; wikiPath: string | null }[];
+    /** The entity pages whose claims come from the most documents. */
+    topByDocuments: DocumentedEntity[];
+    pages: number;
     isolated: number;
     merged: number;
     mergeCandidates: number;
@@ -102,20 +108,78 @@ function day(v: string | Date | null | undefined): string | null {
   return iso ? iso.slice(0, 10) : null;
 }
 
-export async function surveyKnowledgeBase(ctx: AppContext): Promise<KbSurvey> {
-  const { store, dataDir, config } = ctx;
-  const stats = await knowledgeStats(store);
-  const insights = await graphInsights(store);
+/** An entity with a page, and how many claims from how many documents stand on it. */
+export interface DocumentedEntity { id: string; name: string; type: string; wikiPath: string; claims: number; docs: number }
 
+/**
+ * What a knowledge base holds, in numbers: the part of the survey the
+ * generated overview (`wiki/overview.md#holdings`) shows, without the graph
+ * health queries (`graphInsights`: hubs, isolated entities) that only an
+ * initialization brief needs. Plain counts and GROUP BYs over indexed
+ * columns — one sort of the document rows per folder grouping — so it can run
+ * whenever the navigation is refreshed.
+ */
+export interface KbHoldings {
+  stats: KnowledgeStats;
+  documents: { total: number; byFolder: KbSurvey['documents']['byFolder']; dateRange: { from: string | null; to: string | null }; byType: { type: string; n: number }[] };
+  entities: { total: number; byType: { type: string; n: number }[]; pages: number; topByDocuments: DocumentedEntity[] };
+  relations: { total: number; byType: { type: string; n: number }[] };
+  claims: { total: number; byStatus: { status: string; n: number }[]; byKind: { kind: string; n: number }[]; eventRange: { from: string | null; to: string | null }; openDisputes: number };
+}
+
+/** Entity pages listed as the best documented. */
+const TOP_DOCUMENTED = 20;
+
+export async function surveyHoldings(store: Store, opts: { topByDocuments?: DocumentedEntity[] } = {}): Promise<KbHoldings> {
+  const stats = await knowledgeStats(store);
   const folderRows = await store.query<{ folder: string; n: number; latest: string | Date | null }>(
     `SELECT ${FOLDER_SQL} AS folder, count(*)::int AS n, max(doc_date) AS latest
      FROM documents WHERE status = 'indexed' AND root <> 'traces'
      GROUP BY 1 ORDER BY n DESC, folder`,
   );
-  const byFolder = folderRows.map((r) => ({ folder: r.folder, n: r.n, latest: day(r.latest) }));
   const [docRange] = await store.query<{ n: number; lo: string | Date | null; hi: string | Date | null }>(
     `SELECT count(*)::int AS n, min(doc_date) AS lo, max(doc_date) AS hi FROM documents WHERE status = 'indexed' AND root = 'docs'`,
   );
+  const docTypes = await store.query<{ type: string; n: number }>(
+    `SELECT COALESCE(lower(substring(path from '\\.([A-Za-z0-9]+)$')), '(none)') AS type, count(*)::int AS n
+     FROM documents WHERE status = 'indexed' AND root = 'docs' GROUP BY 1 ORDER BY n DESC, type`,
+  );
+  const entityTypes = await store.query<{ type: string; n: number }>(`SELECT type, count(*)::int AS n FROM entities WHERE tx_to IS NULL GROUP BY type ORDER BY n DESC`);
+  const relationTypes = await store.query<{ type: string; n: number }>(
+    `SELECT type, count(*)::int AS n FROM relations WHERE tx_to IS NULL AND type <> 'co_occurs' GROUP BY type ORDER BY n DESC`,
+  );
+  const [{ pages }] = await store.query<{ pages: number }>(
+    `SELECT count(*)::int AS pages FROM entities WHERE wiki_path LIKE 'wiki/entities/%' AND tx_to IS NULL AND canonical_id IS NULL`,
+  );
+  const topByDocuments = opts.topByDocuments?.slice(0, TOP_DOCUMENTED) ?? (await store.query<DocumentedEntity>(
+    `SELECT e.id, e.name, e.type, e.wiki_path AS "wikiPath", c.claims, c.docs
+     FROM entities e
+     JOIN LATERAL (
+       SELECT count(*)::int AS claims, count(DISTINCT cl.primary_scope_id)::int AS docs
+       FROM claims cl WHERE cl.subject_id = e.id AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
+     ) c ON c.claims > 0
+     WHERE e.wiki_path LIKE 'wiki/entities/%' AND e.tx_to IS NULL AND e.canonical_id IS NULL
+     ORDER BY c.docs DESC, c.claims DESC, e.name LIMIT $1`,
+    [TOP_DOCUMENTED],
+  ));
+  const claimStatus = await store.query<{ status: string; n: number }>(`SELECT status, count(*)::int AS n FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL GROUP BY status ORDER BY n DESC`);
+  const claimKind = await store.query<{ kind: string; n: number }>(`SELECT kind, count(*)::int AS n FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL GROUP BY kind ORDER BY n DESC`);
+  const [claimRange] = await store.query<{ lo: string | Date | null; hi: string | Date | null }>(`SELECT min(event_at) AS lo, max(event_at) AS hi FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL`);
+  const openDisputes = (await listDisputes(store, { status: 'open' })).length;
+  return {
+    stats,
+    documents: { total: docRange?.n ?? 0, byFolder: folderRows.map((r) => ({ folder: r.folder, n: r.n, latest: day(r.latest) })), dateRange: { from: day(docRange?.lo), to: day(docRange?.hi) }, byType: docTypes },
+    entities: { total: stats.entities, byType: entityTypes, pages, topByDocuments },
+    relations: { total: stats.relations, byType: relationTypes },
+    claims: { total: stats.claims, byStatus: claimStatus, byKind: claimKind, eventRange: { from: day(claimRange?.lo), to: day(claimRange?.hi) }, openDisputes },
+  };
+}
+
+export async function surveyKnowledgeBase(ctx: AppContext): Promise<KbSurvey> {
+  const { store, dataDir, config } = ctx;
+  const holdings = await surveyHoldings(store);
+  const { stats } = holdings;
+  const insights = await graphInsights(store);
   const recentRows = await store.query<{ path: string; title: string | null; doc_date: string | Date | null }>(
     `SELECT path, title, doc_date FROM documents WHERE status = 'indexed' AND root = 'docs'
      ORDER BY doc_date DESC NULLS LAST, updated_at DESC LIMIT 15`,
@@ -125,10 +189,6 @@ export async function surveyKnowledgeBase(ctx: AppContext): Promise<KbSurvey> {
   const top = await store.query<{ id: string; name: string; type: string; mention_count: number; wiki_path: string | null }>(
     `SELECT id, name, type, mention_count, wiki_path FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL ORDER BY mention_count DESC, evidence_count DESC LIMIT 20`,
   );
-  const claimStatus = await store.query<{ status: string; n: number }>(`SELECT status, count(*)::int AS n FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL GROUP BY status ORDER BY n DESC`);
-  const claimKind = await store.query<{ kind: string; n: number }>(`SELECT kind, count(*)::int AS n FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL GROUP BY kind ORDER BY n DESC`);
-  const [claimRange] = await store.query<{ lo: string | Date | null; hi: string | Date | null }>(`SELECT min(event_at) AS lo, max(event_at) AS hi FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL`);
-  const openDisputes = (await listDisputes(store, { status: 'open' })).length;
 
   // index.md / log.md are OKF navigation files, not anyone's prose
   const wikiDocs = await store.query<{ path: string; kind: string }>(`SELECT path, kind FROM documents WHERE status = 'indexed' AND root = 'wiki'`);
@@ -180,17 +240,19 @@ export async function surveyKnowledgeBase(ctx: AppContext): Promise<KbSurvey> {
     at: new Date().toISOString(),
     stats,
     extraction: { queued: stats.extraction_queue, llmEnabled: entityLlm.enabled },
-    documents: { total: docRange?.n ?? 0, byFolder, dateRange: { from: day(docRange?.lo), to: day(docRange?.hi) }, recent },
+    documents: { ...holdings.documents, recent },
     entities: {
       total: insights.totals.entities,
       byType: insights.typeCounts,
       top: top.map((e) => ({ id: e.id, name: e.name, type: e.type, mentions: e.mention_count, wikiPath: e.wiki_path })),
+      topByDocuments: holdings.entities.topByDocuments,
+      pages: holdings.entities.pages,
       isolated: insights.isolated.length,
       merged: insights.merged,
       mergeCandidates: insights.mergeCandidates,
     },
     relations: { total: insights.totals.relations, byType: insights.relationTypeCounts, unknownPredicates: insights.unknownPredicates },
-    claims: { total: stats.claims, byStatus: claimStatus, byKind: claimKind, eventRange: { from: day(claimRange?.lo), to: day(claimRange?.hi) }, openDisputes },
+    claims: holdings.claims,
     wiki: { views, humanPages: Math.max(0, wikiSources - researchPages), researchPages, overview },
     guide,
     ontology: {
@@ -218,6 +280,11 @@ export function renderSurvey(s: KbSurvey): string {
     for (const f of s.documents.byFolder.slice(0, 30)) lines.push(`- ${f.folder === '.' ? '（数据目录根：purpose.md / schema.md）' : f.folder}：${f.n} 篇${f.latest ? `，最新 ${f.latest}` : ''}`);
     lines.push('');
   }
+  if (s.documents.byType?.length) {
+    lines.push('### 文件类型', '');
+    lines.push(s.documents.byType.map((t) => `${t.type} ${t.n}`).join(' · '));
+    lines.push('');
+  }
   if (s.documents.recent.length) {
     lines.push('### 最近的文档（按文档日期）', '');
     for (const d of s.documents.recent) lines.push(`- ${d.path}${d.title ? ` — ${d.title}` : ''}${d.docDate ? `（${d.docDate}）` : ''}`);
@@ -232,6 +299,11 @@ export function renderSurvey(s: KbSurvey): string {
     lines.push('### 提及最多的实体', '');
     for (const e of s.entities.top) lines.push(`- ${e.name}（${e.type}，${e.mentions} 次提及${e.wikiPath ? `，页面 ${e.wikiPath}` : ''}）`);
     lines.push(`（孤立实体 ${s.entities.isolated}，已合并 ${s.entities.merged}，待审合并 ${s.entities.mergeCandidates}）`, '');
+  }
+  if (s.entities.topByDocuments?.length) {
+    lines.push(`### 资料最多的实体页（共 ${s.entities.pages} 页）`, '');
+    for (const e of s.entities.topByDocuments) lines.push(`- ${e.name}（${e.type}，${e.docs} 篇文档的 ${e.claims} 条 claims，页面 ${e.wikiPath}）`);
+    lines.push('');
   }
   if (s.relations.byType.length) {
     lines.push('### 关系谓词', '');

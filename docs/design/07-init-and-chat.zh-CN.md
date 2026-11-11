@@ -60,6 +60,13 @@ POST /api/research/init ─▶ research_jobs(kind=init) ─kick─▶ service �
 **种子模板不算人写的。** `humanParagraphsOf` 会保护现有页面里 ≥40 字的段落；`initDataDir` 写的
 `wiki/overview.md` 正文恰好够长，所以 `isSeedTemplate`（`src/fs/datadir.ts`）判断文件是否仍等于模板，是则不保护。
 
+**总览里的生成区（2026-11-11）。** 总览另有一个托管区 `holdings`：库里有什么的数字（文档按类型、目录与日期，实体按类型
+及被最多文档谈到的实体，claims、关系、各索引在哪），由 `surveyHoldings`（survey 自己的查询，去掉图健康部分）计算，
+随文档到达重写（[00 — Navigation](00-overview.md#navigation)）。正文仍归初始化。三点含义不变：`isSeedTemplate`
+比较时去掉托管区，种子模板加这个区仍算种子（survey 的 `overview.seeded` 与"初始化"提示照旧）；agent 重写页面时
+丢掉这个区，对账的漂移检查会发现并把它补回到正文之后；人写页面只把托管区之外的正文当图谱证据
+（`classify`，src/ingest/apply.ts），这些数字不构成断言。
+
 **失败回滚。** 校验不过时：页面移到 `.runs/<id>/rejected.md`、指南移到 `rejected-AGENTS.md`，两者都从备份恢复，
 任务退回重试一次（`MAX_ATTEMPTS = 2`）。
 
@@ -72,7 +79,7 @@ POST /api/research/init ─▶ research_jobs(kind=init) ─kick─▶ service �
 
 ## 3. `knode_survey` / `GET /api/survey`
 
-`src/research/survey.ts`，确定性、无 LLM、约十条查询：文档按目录与日期范围、实体按类型与提及排名、
+`src/research/survey.ts`，确定性、无 LLM、约十条查询：文档按目录、类型与日期范围、实体按类型与提及排名（以及实体页按其 claims 来自多少篇文档排名）、
 关系谓词（含 `unknownPredicates`）、claims 按状态与事件范围、wiki 页（生成 / 人写 / 研究）、本体包、
 外部数据源、抽取积压、指南与总览的状态、`purpose.md` / `schema.md` 是否仍是模板。
 `renderSurvey` 把它渲染成 brief 里的 `## 知识库概况`，UI 的初始化卡片直接用数字部分。

@@ -209,6 +209,52 @@ the entities/claims/documents they depend on change, and are archived when a
 required input is disposed. Human prose outside the managed regions survives
 regeneration and is itself a source.
 
+## Navigation
+
+The wiki is navigable from `wiki/index.md` at any size, without a model
+(`src/wiki/nav-views.ts`, `navigation.ts`). Its `contents` region links the
+overview, every index with its counts and the 20 entity pages the most
+documents speak of. `wiki/sources/index.md` lists every document, and
+`wiki/entities/index.md` every entity page; a list longer than 200 rows is
+cut into pages of 200, by folder (`sources/by-folder/<folder>/[<n>/]index.md`,
+in the order documents were dated or, undated, added, so an arrival rewrites
+only its folder's last page) and by type (`entities/by-type/<type>/…`, the
+best documented first). Every other wiki folder (concepts, dreams, datasets,
+research) gets the same list in its own `index.md`. A hub links every page
+of its list while there are at most 400, so 80,000 documents or entity pages
+stay three links from the front page; past that it links each folder's list,
+one step more. No index file holds more than 200 rows or 400 links. The
+smallest folders past 200 share one `_other` list. The pages are reserved
+`index.md` region views: OKF allows no frontmatter there, and the lint and
+the evaluation count no index as knowledge.
+
+Measured with `~/knode-eval/bench/reach.ts` on the five pilot packs, every
+page is reachable from `index.md` within three links (before: 1–20 entity
+pages and `datasets/index.md` were linked from nowhere); with
+`navscale.ts` at the real workspace's size — 26,878 documents, 17,250
+summary pages, 3,000 entity pages — all of them are linked within three
+steps, from 174 index files of at most 28.7 KB (the old single list: 2,000
+rows, about 400 KB, the rest unlisted). The first build took 36 s (each file
+is indexed and embedded like any wiki page), a new document 0.8 s and five
+files, a refresh with nothing changed 10 ms.
+
+`wiki/overview.md` keeps initialization's prose (07) and gains a generated
+region, `holdings`: what the base holds — documents by kind, folder and
+date, entities by type and the ones the most documents speak of (linked),
+claims by kind and status, relations, where the indexes are — counted by
+`surveyHoldings`, the part of `knode_survey` without the graph-health
+queries. `isSeedTemplate` ignores managed regions, so an overview nobody
+initialized still reads as the seed and the "initialize" notice stays.
+
+New documents and summary pages are inputs no index depends on yet, so the
+paths that run anyway refresh the navigation: `wiki generate`, the nightly
+refine, initialization, `knode-os extract`'s document pass, and `serve`'s
+follow-up review every `extraction.intervalMinutes` (also when it has
+nothing to review). Each refresh first compares a few counts and skips when
+none moved; otherwise it reads the rows once and writes only the pages
+whose text changed. The sources lists no longer show heat: on a base nobody
+reads through knode every line said `cold` (09 said the index shows heat).
+
 ## Dream cycle
 
 `knode-os dream` (CLI, `POST /api/dream`, or nightly at `dream.schedule` while

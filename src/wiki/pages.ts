@@ -24,6 +24,7 @@ import { getDocHeat } from '../stats/heat.js';
 import { Store } from '../store/db.js';
 import { Params, toDateString, toIso } from '../store/temporal.js';
 import { DocumentRow } from '../types.js';
+import { entitiesIndex, entitiesShelf, NavPageKind, overviewHoldings, pagesIndex, pagesShelf, sourcesIndex, sourcesShelf, wikiContents } from './nav-views.js';
 import { hasRegions, renderRegion, replaceRegion, splitRegions } from './regions.js';
 import { asSummaryLanguage, detectSummaryLanguage, documentChars, isShortDocument, planSummary, produceSummary, shortByRow, summaryMinChars, summaryScaffold } from './summary.js';
 
@@ -46,7 +47,7 @@ import { asSummaryLanguage, detectSummaryLanguage, documentChars, isShortDocumen
  * job (docs/design/09) — but rows of that kind may still exist until
  * `retireConceptClusterPages` archives them.
  */
-export type PageKind = 'entity_stub' | 'source_summary' | 'dataset' | 'sources_index' | 'entities_index' | 'hot_topics' | 'concept_cluster' | 'dream' | 'research_index';
+export type PageKind = 'entity_stub' | 'source_summary' | 'dataset' | 'sources_index' | 'entities_index' | 'hot_topics' | 'concept_cluster' | 'dream' | 'research_index' | NavPageKind;
 
 export interface PagesContext {
   store: Store;
@@ -462,54 +463,6 @@ function renderDatasetBody(
   return lines.join('\n');
 }
 
-const sourcesIndex: PageGenerator = {
-  kind: 'sources_index',
-  version: 2,
-  llm: false,
-  mode: 'region',
-  async plan(ctx) {
-    const docs = await ctx.store.query<DocumentRow>(
-      `SELECT * FROM documents WHERE root = 'docs' AND status = 'indexed' AND kind = 'source' ORDER BY updated_at DESC LIMIT 2000`,
-    );
-    if (docs.length === 0) return null;
-    const heat = await getDocHeat(ctx.store, docs.map((d) => d.id), ctx.config.heat);
-    const pages = await summaryPagesByDocument(ctx.store);
-    const minChars = summaryMinChars(ctx.config);
-    const rows = docs.map((d) => {
-      const h = heat.get(d.id) ?? 0;
-      const page = pages.get(d.path)?.path ?? null;
-      // under the size threshold by its row alone; a row without `chars` that its bytes do not
-      // settle reads as merely unsummarized until the Summarize stage's scan fills the column in
-      const short = !page && shortByRow(d, minChars) === true;
-      return { path: d.path, title: d.title ?? path.basename(d.path), page: page ? path.posix.basename(page) : null, heat: h, cold: h < ctx.config.heat.coldThreshold, short, sha: d.sha256 };
-    });
-    const setSha = sha16(rows.map((r) => [r.path, r.sha, r.page, r.cold, r.short, Math.round(r.heat * 100)]));
-    return {
-      deps: [
-        { kind: 'set', id: 'docs', sha: setSha },
-        ...docs.map((d) => ({ kind: 'document' as const, id: d.path, sha: d.sha256 })),
-      ],
-      inputsSha: sha16(['sources_index@2', setSha]),
-      data: { rows },
-    };
-  },
-  async render(_ctx, _pagePath, plan) {
-    const rows = plan.data.rows as { path: string; title: string; page: string | null; heat: number; cold: boolean; short?: boolean }[];
-    const lines = [
-      '## Sources index',
-      '',
-      'Every indexed document, most recently updated first, linked to its summary page once the Summarize stage has written one. A document under `extraction.summaryMinChars` (`short`) gets none: search finds the document itself.',
-      '',
-      ...rows.map((r) => {
-        const link = r.page ? `[${r.title}](${r.page})` : r.title;
-        const badge = r.cold ? ' `cold`' : ` \`heat ${r.heat.toFixed(2)}\``;
-        return `* ${link} - \`${r.path}\`${badge}${r.short ? ' `short`' : ''}`;
-      }),
-    ];
-    return { frontmatter: {}, regions: { sources: lines.join('\n') } };
-  },
-};
-
 export interface HotEntity {
   id: string;
   name: string;
@@ -562,63 +515,9 @@ export async function hotEntities(store: Store, limit: number): Promise<HotEntit
   );
 }
 
-interface IndexedEntity { id: string; name: string; type: string; description: string; wiki_path: string; fold_sha: string; claims: number; docs: number }
-
-/** Entity pages the index lists at most, the best documented first. */
-const ENTITIES_INDEX_LIMIT = 2000;
-
-/**
- * The contents of wiki/entities/: every entity page with what it is and how
- * much stands on it. A directory listing shows slugs; this is what tells a
- * reader — a person or an agent — which page holds the answer before opening
- * any.
- */
-const entitiesIndex: PageGenerator = {
-  kind: 'entities_index',
-  version: 1,
-  llm: false,
-  mode: 'region',
-  async plan(ctx) {
-    const rows = await ctx.store.query<IndexedEntity>(
-      `SELECT e.id, e.name, e.type, e.description, e.wiki_path, e.fold_sha, COALESCE(c.claims, 0)::int AS claims, COALESCE(c.docs, 0)::int AS docs
-       FROM entities e
-       LEFT JOIN LATERAL (
-         SELECT count(*) AS claims, count(DISTINCT cl.primary_scope_id) AS docs
-         FROM claims cl WHERE cl.subject_id = e.id AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
-       ) c ON true
-       WHERE e.wiki_path LIKE 'wiki/entities/%' AND e.tx_to IS NULL AND e.canonical_id IS NULL
-       ORDER BY COALESCE(c.docs, 0) DESC, COALESCE(c.claims, 0) DESC, e.name
-       LIMIT $1`,
-      [ENTITIES_INDEX_LIMIT],
-    );
-    if (rows.length === 0) return null;
-    const setSha = sha16(rows.map((r) => [r.id, r.fold_sha, r.wiki_path, r.claims, r.docs]));
-    return {
-      deps: [{ kind: 'set', id: 'entity-pages', sha: setSha }],
-      inputsSha: sha16(['entities_index@1', setSha]),
-      data: { rows },
-    };
-  },
-  async render(_ctx, _pagePath, plan) {
-    const rows = plan.data.rows as IndexedEntity[];
-    const lines = [
-      '## Entity pages',
-      '',
-      'Every entity with a page, the ones the most documents speak of first. A page lists what the knowledge base holds about its entity — facts, dated history, disagreements, relations — each with the document it comes from.',
-      '',
-      ...rows.map((r) => {
-        const about = r.description ? ` — ${r.description.replace(/\s+/g, ' ').slice(0, 160)}` : '';
-        const held = r.claims > 0 ? ` \`${r.claims} ${r.claims === 1 ? 'claim' : 'claims'}, ${r.docs} ${r.docs === 1 ? 'document' : 'documents'}\`` : '';
-        return `* [${r.name}](${path.posix.basename(r.wiki_path)}) (${r.type})${about}${held}`;
-      }),
-    ];
-    return { frontmatter: {}, regions: { entities: lines.join('\n') } };
-  },
-};
-
 const hotTopics: PageGenerator = {
   kind: 'hot_topics',
-  version: 2,
+  version: 3,
   llm: false,
   mode: 'region',
   async plan(ctx) {
@@ -636,7 +535,8 @@ const hotTopics: PageGenerator = {
   },
   async render(_ctx, _pagePath, plan) {
     const hot = plan.data.hot as HotEntity[];
-    const lines = ['## Hot topics', '', ...hot.map((e) => `- [[${e.name}]] — ${e.type}, mentions ${e.mention_count}, heat ${e.heat.toFixed(2)}`)];
+    // heat is what reading through knode adds: zero on a base nobody has read yet, and then it says nothing
+    const lines = ['## Hot topics', '', ...hot.map((e) => `- [[${e.name}]] — ${e.type}, mentions ${e.mention_count}${e.heat > 0 ? `, heat ${e.heat.toFixed(2)}` : ''}`)];
     return { frontmatter: {}, regions: { 'hot-topics': lines.join('\n') } };
   },
 };
@@ -705,6 +605,12 @@ export const GENERATORS: Partial<Record<PageKind, PageGenerator>> = {
   sources_index: sourcesIndex,
   entities_index: entitiesIndex,
   hot_topics: hotTopics,
+  sources_shelf: sourcesShelf,
+  entities_shelf: entitiesShelf,
+  pages_index: pagesIndex,
+  pages_shelf: pagesShelf,
+  wiki_contents: wikiContents,
+  overview_holdings: overviewHoldings,
 };
 
 /* ----------------------------- composition ------------------------------ */
@@ -1279,12 +1185,14 @@ export async function pruneShortSummaries(
   return { minChars, archived, kept };
 }
 
+/** `wiki/sources/index.md` and the pages it is cut into (./navigation.ts, loaded here: it imports this module). */
 export async function ensureSourcesIndex(ctx: PagesContext, opts: { actor?: string } = {}): Promise<RegenerateOutcome> {
-  return regeneratePage(ctx, 'wiki/sources/index.md#sources', 'sources_index', { actor: opts.actor });
+  return (await import('./navigation.js')).refreshSourcesTree(ctx, opts);
 }
 
+/** `wiki/entities/index.md` and the pages it is cut into. */
 export async function ensureEntitiesIndex(ctx: PagesContext, opts: { actor?: string } = {}): Promise<RegenerateOutcome> {
-  return regeneratePage(ctx, 'wiki/entities/index.md#entities', 'entities_index', { actor: opts.actor });
+  return (await import('./navigation.js')).refreshEntitiesTree(ctx, opts);
 }
 
 export async function ensureHotTopics(ctx: PagesContext, opts: { actor?: string; force?: boolean } = {}): Promise<RegenerateOutcome> {
