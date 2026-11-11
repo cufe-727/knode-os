@@ -134,7 +134,7 @@ interface PageConflict { a: string; a_path: string | null; b: string; b_path: st
  */
 const entityStub: PageGenerator = {
   kind: 'entity_stub',
-  version: 4,
+  version: 5,
   llm: false,
   mode: 'file',
   async plan(ctx, pagePath) {
@@ -150,7 +150,7 @@ const entityStub: PageGenerator = {
       if (!c) return null;
       return {
         deps: [{ kind: 'entity', id, required: true, sha: e.fold_sha }, { kind: 'entity', id: c.id, sha: c.fold_sha }],
-        inputsSha: sha16(['entity_stub@4', 'redirect', e.fold_sha, c.id]),
+        inputsSha: sha16(['entity_stub@5', 'redirect', e.fold_sha, c.id]),
         data: { entity: e, claims: [], redirect: { id: c.id, name: c.name } },
       };
     }
@@ -173,11 +173,13 @@ const entityStub: PageGenerator = {
        ORDER BY COALESCE(cl.event_at, cl.valid_from) DESC NULLS LAST, cl.tx_from DESC, cl.id LIMIT $2`,
       [id, ENTITY_PAGE_LINKED],
     );
+    // a relation's source: its document, else the document its evidence came
+    // from — tier 1 writes that evidence on a `tier1` scope keyed by the path
     const relations = await ctx.store.query<PageRelation & { fold_sha: string }>(
       `SELECT r.id, r.type, r.description, (r.source_id = $1) AS out, o.name AS other, o.wiki_path AS other_page, r.fold_sha,
               COALESCE(d.path, (
                 SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
-                WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL AND s.kind = 'doc'
+                WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL AND s.kind IN ('doc', 'tier1')
                 ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
        FROM relations r
        JOIN entities o ON o.id = CASE WHEN r.source_id = $1 THEN r.target_id ELSE r.source_id END
@@ -205,7 +207,7 @@ const entityStub: PageGenerator = {
         ...relations.map((r) => ({ kind: 'relation' as const, id: r.id, sha: r.fold_sha })),
       ],
       inputsSha: sha16([
-        'entity_stub@4', e.fold_sha, total,
+        'entity_stub@5', e.fold_sha, total,
         claims.map((c) => [c.fold_sha, c.superseded_by, c.path]),
         mentions.map((c) => [c.fold_sha, c.path, c.subject, c.subject_page]),
         relations.map((r) => [r.fold_sha, r.other, r.other_page, r.path]),
