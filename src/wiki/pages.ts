@@ -332,16 +332,24 @@ const CLAIM_FIGURE_RE = /\d|[零〇一二两三四五六七八九十百千万亿
  * The claims of the page's document, the most informative first: those with
  * a figure and a date, then a figure, then a date, each group in the
  * document's order; within the bounds, listed in the document's order.
- * Claims are found through the document's chunks (`claims.document_id` is
- * not filled by tier 1; `chunk_id` always is, and both lookups are indexed).
+ * A claim is the document's when the document's own scopes (its apply,
+ * its tier-1 extraction) are evidence for it — which covers its frontmatter's
+ * claims, that have no chunk — or when it was extracted from one of its
+ * chunks (`claims.document_id` is not filled by tier 1; `chunk_id` is). Both
+ * lookups are indexed. A claim another document states too is listed on both
+ * pages: each says it.
  */
 async function summaryClaims(store: Store, doc: DocumentRow): Promise<{ claims: SummaryClaim[]; total: number }> {
   const all = await store.query<SummaryClaim>(
-    `SELECT cl.id, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at, cl.superseded_by, cl.fold_sha, ch.seq
-     FROM chunks ch JOIN claims cl ON cl.chunk_id = ch.id
-     WHERE ch.document_id = $1 AND cl.tx_to IS NULL
-     ORDER BY ch.seq, cl.tx_from, cl.id`,
-    [doc.id],
+    `WITH own AS (SELECT id FROM scopes WHERE key = $1 AND kind IN ('doc', 'tier1') AND status <> 'disposed'),
+          ids AS (SELECT ev.target_id AS id FROM evidence ev JOIN own ON ev.scope_id = own.id WHERE ev.kind = 'claim' AND ev.tx_to IS NULL
+                  UNION SELECT cl.id FROM chunks ch JOIN claims cl ON cl.chunk_id = ch.id WHERE ch.document_id = $2)
+     SELECT cl.id, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at, cl.superseded_by, cl.fold_sha,
+            CASE WHEN ch.document_id = $2 THEN ch.seq END AS seq
+     FROM ids JOIN claims cl ON cl.id = ids.id LEFT JOIN chunks ch ON ch.id = cl.chunk_id
+     WHERE cl.tx_to IS NULL
+     ORDER BY 10 NULLS FIRST, cl.tx_from, cl.id`,
+    [doc.path, doc.id],
   );
   const dated = (c: SummaryClaim) => Boolean(toIso(c.event_at) || toIso(c.valid_from) || toIso(c.valid_to));
   const weight = (c: SummaryClaim) => (CLAIM_FIGURE_RE.test(c.statement) ? 2 : 0) + (dated(c) ? 1 : 0);
@@ -891,8 +899,9 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
     return 'archived';
   }
   const live = await findLiveScope(store, 'page', pagePath);
-  // the same inputs through a newer generator make a different page; one a model writes waits for its inputs to change
-  const outdated = !gen.llm && Boolean(row?.generator) && row!.generator !== `${kind}@${gen.version}`;
+  // the same inputs through a newer generator make a different page; one a model writes waits for its inputs to
+  // change, except a summary, whose model-written body is cached (a summary without its cache goes through the model)
+  const outdated = (!gen.llm || kind === 'source_summary') && Boolean(row?.generator) && row!.generator !== `${kind}@${gen.version}`;
   if (live && live.sha === plan.inputsSha && !opts.force && !outdated) {
     if (row?.status === 'dirty') await store.query(`UPDATE pages SET status = 'active', dirty_reason = NULL WHERE path = $1`, [pagePath]);
     return 'unchanged';

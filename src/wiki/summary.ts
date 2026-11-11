@@ -46,6 +46,8 @@ interface Scaffold {
   name: string;
   keyPoints: string;
   entities: string;
+  /** The model's compact list of the figures its key points do not hold. */
+  figures: string;
   /** The heading of the claims the page lists from the database, below the model's summary. */
   claims: string;
   description: (docPath: string) => string;
@@ -60,6 +62,7 @@ const SCAFFOLDS: Record<SummaryLanguage, Scaffold> = {
     name: "Chinese, in the document's own variety (simplified or traditional)",
     keyPoints: '要点',
     entities: '实体',
+    figures: '数据',
     claims: '文中论断',
     description: (p) => `${p} 的摘要。`,
     coverage: (c) => c.read >= c.parts
@@ -70,6 +73,7 @@ const SCAFFOLDS: Record<SummaryLanguage, Scaffold> = {
     name: 'Japanese',
     keyPoints: '要点',
     entities: '関連エンティティ',
+    figures: '数値',
     claims: '文中の主張',
     description: (p) => `${p} の要約。`,
     coverage: (c) => c.read >= c.parts
@@ -80,6 +84,7 @@ const SCAFFOLDS: Record<SummaryLanguage, Scaffold> = {
     name: 'Korean',
     keyPoints: '핵심 요점',
     entities: '엔티티',
+    figures: '수치',
     claims: '문서의 주장',
     description: (p) => `${p} 요약.`,
     coverage: (c) => c.read >= c.parts
@@ -90,6 +95,7 @@ const SCAFFOLDS: Record<SummaryLanguage, Scaffold> = {
     name: 'English',
     keyPoints: 'Key points',
     entities: 'Entities',
+    figures: 'Figures',
     claims: 'Claims in this document',
     description: (p) => `Summary of ${p}.`,
     coverage: (c) => c.read >= c.parts
@@ -98,7 +104,7 @@ const SCAFFOLDS: Record<SummaryLanguage, Scaffold> = {
   },
 };
 
-export function summaryScaffold(language: SummaryLanguage): { keyPoints: string; entities: string; claims: string; description: (docPath: string) => string; coverage: (c: SourceSummaryCoverage) => string } {
+export function summaryScaffold(language: SummaryLanguage): { keyPoints: string; entities: string; figures: string; claims: string; description: (docPath: string) => string; coverage: (c: SourceSummaryCoverage) => string } {
   return SCAFFOLDS[language];
 }
 
@@ -471,9 +477,21 @@ const SUMMARIZE = 'You maintain a personal wiki. Summarize the document into a w
  * an agent that was not given the sources, a person skimming — answered half
  * as many questions as one with the documents (0.27–0.54 against 0.64–0.91 on
  * the benchmark's packs), and what the pages lacked was the particular: the
- * number, the date, the name. Not yet measured with a model.
+ * number, the date, the name. Measured on the pilot's pages (written before
+ * this rule; ~/knode-eval/bench/specifics.ts), the model's text held 13% of a
+ * law chapter's figures, dates and article numbers (2% of the article
+ * numbers alone), 28% of a paper's, 52% of a drug label's. The page stayed at
+ * 1.8–2.5 KB however many specifics its document had, and the share kept fell
+ * as they grew (a paper: 54% in the third with the fewest, 32% in the third
+ * with the most), so the word limit binds: the figures it cannot hold go to a
+ * compact list of their own (`figuresRule`), one line each, outside the limit.
  */
-const SPECIFICS = '- Key points carry the document\'s specifics, not a gist of them: each figure with its unit, what it measures and the date it is of; each date; each name as the document writes it. Someone looking for a number the document gives should find it here.';
+const SPECIFICS = '- Key points carry the document\'s specifics, not a gist of them: each figure with its unit, what it measures and the date it is of; each date; each name as the document writes it; each article, section or clause by its number (Article 63, 第六十三条). Someone looking for a number the document gives should find it here.';
+
+/** The figures the key points do not hold, as a list a reader can scan; not counted in the word limit. */
+function figuresRule(heading: string, max: number): string {
+  return `- When the document gives more figures, dates or numbered provisions than the key points hold, add after the key points a "## ${heading}" section: up to ${max} lines, each one figure as \`value unit — what it measures (date)\` or one numbered provision as \`number — what it says\`, a few words each, none repeating a key point; leave the section out when the key points hold them all. It does not count toward the word limit.`;
+}
 
 const describeEntity = (e: SummaryEntity) => (e.aliases.length ? `${e.name} (also ${e.aliases.slice(0, 4).join(', ')})` : e.name);
 
@@ -496,8 +514,9 @@ function pageSystem(work: SummaryWork, entities: SummaryEntity[], part: { index:
     : SUMMARIZE;
   const rules = [
     '- Markdown only, no preamble, no title line.',
-    `- Start with a one-paragraph abstract, then a "## ${s.keyPoints}" section of ${part ? 'up to 8 bullets' : 'bullets'}, then a "## ${s.entities}" section listing the important entities as [[Entity Name]] wikilinks. Use exactly these two headings.`,
+    `- Start with a one-paragraph abstract, then a "## ${s.keyPoints}" section of ${part ? 'up to 8 bullets' : 'bullets'}, then a "## ${s.entities}" section listing the important entities as [[Entity Name]] wikilinks. Use exactly these headings.`,
     SPECIFICS,
+    figuresRule(s.figures, part ? 8 : 15),
     `- Write in ${work.writeIn ?? s.name}.`,
     linkRule(entities),
     channelRule(work),
@@ -511,8 +530,9 @@ function mergeSystem(work: SummaryWork, read: number): string {
   const total = work.coverage?.parts ?? read;
   const rules = [
     '- Markdown only, no preamble, no title line.',
-    `- Start with a one-paragraph abstract of the whole document, then a "## ${s.keyPoints}" section of up to 12 bullets in the document's order, then a "## ${s.entities}" section listing the important entities as [[Entity Name]] wikilinks. Use exactly these two headings.`,
-    '- Keep the figures, dates and names the parts give: merging drops repetition, not specifics.',
+    `- Start with a one-paragraph abstract of the whole document, then a "## ${s.keyPoints}" section of up to 12 bullets in the document's order, then a "## ${s.entities}" section listing the important entities as [[Entity Name]] wikilinks. Use exactly these headings.`,
+    '- Keep the figures, dates, names and numbered provisions the parts give: merging drops repetition, not specifics.',
+    `- Merge the parts' "## ${s.figures}" sections into one after the key points, up to 20 lines, each figure once, in the document's order; it does not count toward the word limit.`,
     `- Write in ${work.writeIn ?? s.name}.`,
     '- Keep the [[wikilinks]] exactly as the parts spell them and add no new ones; list each entity once.',
     '- Write about the document, not about the parts or the merging.',
@@ -542,7 +562,7 @@ export async function summaryStepRequest(work: SummaryWork, step: SummaryStep, d
     text = parts.map((s) => `### Part ${s.index + 1} of ${total}${s.heading ? ` — ${s.heading}` : ''}\n\n${work.cached.get(s.sha)!.body.trim()}`).join('\n\n');
     system = mergeSystem(work, parts.length);
     user = `Source file: ${work.doc.path}\nTitle: ${work.title}\n\n${text}`;
-    maxTokens = 1500;
+    maxTokens = 1800;
   } else if (step.kind === 'part') {
     const seg = segmentOf(work, step.sha);
     const total = work.coverage?.parts ?? work.segments.length;
@@ -551,13 +571,13 @@ export async function summaryStepRequest(work: SummaryWork, step: SummaryStep, d
     text = seg.text;
     system = pageSystem(work, entities, segment);
     user = `Source file: ${work.doc.path} (part ${seg.index + 1} of ${total}${seg.heading ? `, section: ${seg.heading}` : ''})\n\n${text}`;
-    maxTokens = 900;
+    maxTokens = 1100;
   } else {
     entities = work.vocabulary.entities.slice(0, 60);
     text = work.segments[0]?.text ?? work.text.slice(0, LLM_WIKI_INPUT_CHARS);
     system = pageSystem(work, entities, null);
     user = `Source file: ${work.doc.path}\n\n${text}`;
-    maxTokens = 1200;
+    maxTokens = 1500;
   }
   const messages = await pluginRegistry().filter('summary.request', [
     { role: 'system', content: system },
@@ -573,6 +593,10 @@ export async function summaryStepRequest(work: SummaryWork, step: SummaryStep, d
 
 const KEY_POINT_HEADINGS = new Set(
   ['key points', 'key takeaways', 'main points', 'highlights', 'takeaways', 'summary points', '要点', '关键要点', '核心要点', '主要观点', '要点总结', '重点', '核心观点', '主要内容', '要約', '主なポイント', '핵심 요점', '주요 내용', '핵심 내용']
+    .map(keyOf),
+);
+const FIGURE_HEADINGS = new Set(
+  ['figures', 'key figures', 'numbers', 'key numbers', 'data', 'key data', 'figures and dates', '数据', '关键数据', '数字', '关键数字', '数值', '主要数据', '数値', '主な数値', '수치', '주요 수치']
     .map(keyOf),
 );
 const ENTITY_HEADINGS = new Set(
@@ -591,6 +615,7 @@ function normalizeHeadings(body: string, scaffold: Scaffold): string {
   return body.replace(/^(#{2,3})[ \t]+(.+?)[ \t]*#*[ \t]*$/gm, (line, _hashes: string, title: string) => {
     const k = keyOf(title);
     if (KEY_POINT_HEADINGS.has(k)) return `## ${scaffold.keyPoints}`;
+    if (FIGURE_HEADINGS.has(k)) return `## ${scaffold.figures}`;
     if (ENTITY_HEADINGS.has(k)) return `## ${scaffold.entities}`;
     return line;
   });
