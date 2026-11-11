@@ -67,6 +67,16 @@ new guide verbatim (`carryOverHumanNotes`); the agent only keeps the heading. Li
 page, and the `wiki/overview.md` `initDataDir` writes is long enough to qualify — so `isSeedTemplate`
 (`src/fs/datadir.ts`) checks whether the file still equals its template and, if so, protects nothing.
 
+**The overview's generated region (2026-11-11).** The overview also holds a managed region, `holdings`: what
+the base holds, in numbers (documents by kind, folder and date, entities by type and the ones the most documents
+speak of, claims, relations, where the indexes are), counted by `surveyHoldings` — the survey's own queries,
+without the graph-health ones — and rewritten as documents arrive ([00 — Navigation](00-overview.md#navigation)).
+The prose stays initialization's. Three things keep their meaning: `isSeedTemplate` compares the text with the
+managed regions removed, so a seed overview plus the region is still the seed (the survey's `overview.seeded`
+and the "initialize" notice say so); the agent may rewrite the page without the region, and reconciliation's
+drift check sees it gone and appends it after the agent's prose; and a person's page indexes only the prose
+outside its regions as graph evidence (`classify`, src/ingest/apply.ts), so the counts assert nothing.
+
 **Rollback.** When validation fails the page moves to `.runs/<id>/rejected.md` and the guide to
 `rejected-AGENTS.md`, both are restored from their backups, and the job is requeued for one more attempt.
 
@@ -82,8 +92,8 @@ page, and the `wiki/overview.md` `initDataDir` writes is long enough to qualify 
 
 ## 3. `knode_survey` / `GET /api/survey`
 
-`src/research/survey.ts` — deterministic, no LLM, about ten queries: documents by folder and date range,
-entities by type with the top ones, relation predicates (including `unknownPredicates`), claims by status and
+`src/research/survey.ts` — deterministic, no LLM, about ten queries: documents by folder, type and date range,
+entities by type with the top ones (by mentions, and the entity pages by how many documents their claims come from), relation predicates (including `unknownPredicates`), claims by status and
 event range, wiki pages (generated / written / researched), ontology packs, live datasources, the extraction
 backlog, the state of the guide and the overview, and whether `purpose.md` / `schema.md` are still
 templates. `renderSurvey` turns it into the brief's `## 知识库概况`; the initialization card uses the numbers.
