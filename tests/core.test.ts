@@ -12,7 +12,7 @@ import { slugify } from '../src/graph/store.js';
 import { extractWikilinks } from '../src/graph/wire.js';
 import { codexExecArgs, completeViaCli, renderCliPrompt } from '../src/llm/cli.js';
 import { LlmClient } from '../src/llm/client.js';
-import { queryTerms, websearchText } from '../src/search/search.js';
+import { keywordTerms, queryTerms, termCount, websearchText } from '../src/search/search.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-test-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -98,6 +98,39 @@ describe('queryTerms', () => {
     expect(terms).toContain('LME');
     expect(terms).toContain('铜价');
     expect(terms).toContain('squeeze');
+  });
+
+  it('drops English function words and the punctuation a sentence leaves on a word', () => {
+    expect(queryTerms('Who is the director of the film that won in 2019?')).toEqual(['director', 'film', 'won', '2019']);
+    expect(queryTerms('What happened at the end.')).toEqual(['happened', 'end']);
+    // a name written in capitals is not the word it spells
+    expect(queryTerms('Is the US in the WHO?')).toEqual(['US', 'WHO']);
+    expect(queryTerms('$NVDA a.b-c_d r_6f406e239a')).toEqual(['$NVDA', 'a.b-c_d', 'r_6f406e239a']);
+    // an excluded word is not looked for; a hyphen inside a word is part of it
+    expect(queryTerms('storage -flash 2026-10-28')).toEqual(['storage', '2026-10-28']);
+  });
+});
+
+describe('keywordTerms', () => {
+  it('keeps every word and CJK bigram, lowercased, without stopwords', () => {
+    expect(keywordTerms('LME 铜价 squeeze')).toEqual(['lme', 'squeeze', '铜价']);
+    expect(keywordTerms('印度的战略石油储备是什么')).toEqual(['印度', '度的', '的战', '战略', '略石', '石油', '油储', '储备', '备是', '是什']);
+    expect(keywordTerms('who is it')).toEqual([]);
+  });
+});
+
+describe('termCount', () => {
+  it('counts a CJK term wherever it stands', () => {
+    expect(termCount('储能业务与储能电池', '储能')).toBe(2);
+  });
+
+  it('counts a Latin term at the start of a word, and a short one or a number only as a whole word', () => {
+    expect(termCount('the limit, its limits, unlimited', 'limit')).toBe(2);
+    expect(termCount('ai aims at ai.', 'ai')).toBe(2);
+    expect(termCount('in 2026 and 20261', '2026')).toBe(1);
+    // CJK beside it is no letter
+    expect(termCount('海力士的hbm4在量产', 'hbm4')).toBe(1);
+    expect(termCount('编号rx6f406e239a', 'r_6f406e239a')).toBe(0);
   });
 });
 

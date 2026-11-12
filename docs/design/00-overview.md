@@ -81,6 +81,7 @@ knode-os combines three ideas:
 │   ├── attachments/    Obsidian attachments
 │   ├── index.md  log.md  overview.md
 │   ├── entities/  concepts/  sources/  dreams/  datasets/
+│   ├── mentions/  timelines/  disagreements/   pages across documents
 ├── playbooks/          agent-editable configuration: packs/ capabilities/ intents/
 ├── ledger/             events.jsonl (machine truth) + attic/ (sidecars of removed sources)
 └── .knode/             local state; with PGlite also the index itself (L2, db/)
@@ -101,25 +102,73 @@ they feed the dream cycle only.
 1. **vector** — pgvector cosine over configured embeddings (default: offline
    feature-hashing embedder so the system works with zero keys; configure any
    OpenAI-compatible endpoint for real quality).
-2. **keyword** — Postgres `tsvector`('simple'), and where that finds too little
-   (CJK has no word boundaries for it) a substring fallback: chunks ranked by how
-   many query terms they contain, looked up through a GIN index over the n-grams
-   of the text (`match_grams`, `src/store/grams.ts`) that also serves the entity
-   name matching of the graph and SAG routes.
-3. **graph** — chunks mentioning entities whose name/alias matches the query (live
-   at `as_of` when one is given), one row per chunk, ranked by how many matching
-   entities it mentions, then by their mention counts.
+2. **keyword** — BM25 over the chunks holding the query's terms: its words and
+   CJK bigrams, without stopwords, each weighted by how rare it is in the corpus.
+   Candidates are the chunks Postgres `tsvector`('simple') finds holding every
+   word, and the chunks of the rarest terms, looked up through a GIN index over
+   the n-grams of the text (`match_grams`, `src/store/grams.ts`) that also serves
+   the entity name matching of the graph and SAG routes. A quoted phrase or an
+   excluded word keeps what full-text search matched in front.
+3. **graph** — chunks mentioning the entities the query names (live at `as_of`
+   when one is given): runs of its words or CJK characters that are an entity's
+   spelling, looked up by the normalized keys entity resolution keeps
+   (`entity_alias_keys`), whole words only, the longer spelling winning where
+   two overlap. One row per chunk, ranked by the summed rarity (BM25 IDF over
+   the chunks each entity is mentioned in) of the named entities it mentions,
+   then by how many. A query that names none falls back to the entities whose
+   name or alias holds one of its terms, through the same gram index.
 4. **sag** — opt-in query-time event retrieval. A chunk is the phase-one event
    unit and `entity_mentions` is the event/entity join. Direct hits seed up to
    two `chunk → entity → chunk` rounds; rare/shared entities score the structural
    pool, embeddings coarse-rank it, and RRF merges it with a reserved direct route.
-5. Hybrid signals are fused with reciprocal-rank fusion (RRF, k=60; graph weighted 0.6).
+5. Hybrid signals are fused with reciprocal-rank fusion (RRF, k=60; graph weighted 0.2:
+   alone it puts about half the benchmark's gold documents in its top five, where
+   vectors and keywords put about four in five, so it lifts the chunks about the
+   entity a question names over chunks that only resemble the question, and a
+   heavier weight starts to outvote them where one statute is in fifty chunks;
+   the measurements are in `FUSION_WEIGHTS`, `src/search/search.ts`).
 6. `graph search` does seeded BFS over persistent `relations` with per-hop decay 0.5;
    `co_occurs` edges are derived from shared chunk mentions at query time (never
    stored, see `src/graph/cooccur.ts`) and discounted ×0.5.
 7. `ask` defaults to hybrid + graph retrieval; `--mode sag` swaps in the SAG
    route without changing existing defaults. SAG results expose hop count,
    seed chunk, bridge entities, and direct/SAG/both provenance.
+8. Beside the chunks, `ask` lists up to 24 known facts (`src/search/facts.ts`):
+   the claims about the entities the question names, as subject or object, and
+   about the entities the retrieved chunks mention — ranked by the question's
+   terms and its embedding, taken a few per source so a list question reaches
+   many documents, each with its date and source and a reference number the
+   answer cites like a chunk's. `knode_resolve` picks its claims the same way.
+   A question that asks for every case — which…s, list/every, how many, what
+   the documents say about, disagreements, timelines; 哪些, 列出, 全部, 一共有几条,
+   都说了些什么, 矛盾, 从早到晚 (`isListQuestion`) — gets two more things in the
+   same single call. Its facts also draw on the named entities' relations, read
+   as facts with their source, and on the claims about the entities one relation
+   away and about the named entities' variants ("Gemini-3 Pro" for "Gemini").
+   And it gets excerpts (`src/search/excerpts.ts`): the lines of further
+   documents that hold what the question names, found through the chunk gram
+   index. These are the named entities' names; or the quoted term inside the
+   named entities' documents ("《公司法》哪些条文提到了“注册资本”"); or, when
+   nothing is named, the question's rarest word. A list item is shown with the
+   line introducing it, and a paragraph with the opening line of its article
+   (第X条, Article N), also when that line ended the chunk before. Documents take
+   turns, up to 6,000 characters. On the benchmark's corpus-level questions,
+   the share of gold evidence quotes in the prompt went from 0.567 to 0.861
+   (law-cn) and from 0.356 to 0.834 (research-ai). Over those questions the
+   prompt grew by 2,000–4,400 characters and ask took 20–30 ms longer.
+   Single-fact and multi-hop questions did not lose. What a bounded prompt still
+   cannot hold is an exhaustive list longer than the excerpt budget, and a fact
+   no document's wording names: a count over every article, a finance topic
+   spread over papers that never say "finance". Those need an agent with search,
+   or a page computed ahead of time.
+
+   Nearest claims by embedding over all of `claim_embeddings` added 0.009 of
+   research-ai's evidence and cost law-cn 0.007. That is a sequential scan
+   (22–64 ms on 1–2k claims; linear in a workspace of hundreds of thousands),
+   and it is left out. Should it be wanted, it needs an HNSW index like
+   `embeddings_hnsw_idx`: `CREATE INDEX claim_embeddings_hnsw_idx ON
+   claim_embeddings USING hnsw (embedding vector_cosine_ops)`, under the same
+   `HNSW_MAX_DIM` guard, with the model filter applied after the index scan.
 
 See [04 — SAG query-time event retrieval](04-sag-query-time-events.md) for the
 mapping, scoring, configuration, and phase-two event model.
@@ -147,11 +196,146 @@ Tiered extraction (details in [01](01-doc-processing-graph-wiki.md)):
   its documents' summary pages ([09](09-ingest-stage-rework.md)).
 
 The background pass writes `wiki/sources/<slug>.md` summaries (LLM; `wiki
-generate` fills gaps by hand) and `wiki generate` writes entity stub pages, as
-materialized views with declared inputs: they regenerate when
+generate` fills gaps by hand) and entity pages (no model), as materialized
+views with declared inputs. Below the model's summary, cached by the
+document's content, a summary page lists the document's own claims from the
+database (up to 30, those with figures and dates first, each with its date and
+tagged when it is a view or a forecast): the figures, dates and article numbers
+a 400-word summary drops, re-rendered without a model whenever the claims change
+([14 §6](14-summary-pages-worth-their-cost.md)). An entity page lists everything the knowledge
+base holds about its entity, each line with the document it comes from:
+standing facts, views and forecasts, a dated timeline, disagreements, what
+claims about other entities say of it, and its relations (up to 300 claims;
+past that it says how many there are). The pass writes one for each entity
+it touched that claims from two or more documents now speak of; `wiki
+generate` writes them for the best documented entities first (one page per
+four documents a call, 30 to 300) and keeps `wiki/entities/index.md`, which
+lists every entity page with what it is and how much it holds. Pages regenerate when
 the entities/claims/documents they depend on change, and are archived when a
 required input is disposed. Human prose outside the managed regions survives
 regeneration and is itself a source.
+
+### Pages across documents
+
+A corpus-level question — which papers use Gemini, which articles name 国务院,
+the laws in the order they were last amended, which sources disagree — has
+its answer on a dozen entity pages, or on none: a paper that evaluates
+"Gemini-3 Pro" in passing gets no claim about Gemini. Three kinds of page,
+none written by a model, gather such answers (`src/wiki/corpus-views.ts`,
+created and refreshed by `src/wiki/corpus.ts`). Each line names its source,
+as on an entity page:
+
+- `wiki/mentions/<entity>.md`: every source document that names an entity or
+  a name that extends it ("Gemini 1.5", "Qwen3", "Llama3.2": Latin names
+  only, since a CJK name that begins with another is usually something else).
+  Each document's line gives the names it uses and how often, the article or
+  section numbers they appear in (第二十五条, Article 12), and a passage of
+  about 240 bytes. The text is searched through the chunk gram index, with a
+  Latin name matched as a whole word and the longer name counted first. The
+  families the graph's mentions put in the most documents get pages, at least
+  three documents each, as many as entity pages get (one per four documents,
+  30 to 300). A variant goes under its root. A family named in more than
+  half of a corpus of twenty documents or more gets no page: 中华人民共和国 in
+  every chapter of a statute, or an alias such as 本法, lists what the sources
+  index lists already. A page lists at most 100 documents, the ones that use
+  the names most.
+- `wiki/timelines/<period>.md`: every dated claim of every entity (its event,
+  else the start of its window), in order. The period is the coarsest that
+  holds at most 400 claims: `all` while everything fits, else a decade
+  (`2020s`), else a year, else a month. A month past 400 lists the oldest
+  400 and says how many more there are. A page per year gave law-cn sixteen
+  pages of one to three claims.
+- `wiki/disagreements/<n>.md`: two claims the Judge found in conflict
+  (`claim_pair_verdicts`, with its reason) and claims extracted as disputed,
+  by subject, 200 to a page. The claim audit's other findings (similar
+  wordings from two sources, expired facts) stay in the suggestions queue:
+  they are leads to check, 207 and 1,710 of them on two benchmark builds,
+  not statements that two sources disagree.
+
+Each directory's `index.md` lists its pages in a managed region (OKF allows
+frontmatter only on the root index). `wiki generate` writes them all. The
+background document pass writes them for what it has just written: the
+families its entities belong to (up to 30 new pages a pass), the periods its
+dated claims fall in, and the disagreement pages when one of its claims is in
+a conflict or disputed. Between passes they are views like any other page:
+an entity, claim or document they list changing makes them dirty. What their
+deps cannot show (a new document naming the family, a new dated claim, a new
+verdict) waits for the next pass.
+
+Measured with `listcov.ts` (the model-free benchmark harness), which counts
+the share of a list task's gold items that one page holds. An item counts
+when a line names it, or cites its document if no other item shares that
+document, and the line, a heading above it or the page's title names what
+the question asks about. Before → after, on one page / on the best three:
+
+| pack | tasks | before | after | pages, bytes added |
+| --- | --- | --- | --- | --- |
+| research-ai | 13 aggregate | 0.438 / 0.682 | 0.771 / 0.869 | 34 pages, 158 KB (wiki 507 → 665 KB) |
+| research-ai | 12 profile | 0.205 / 0.348 | 0.594 / 0.688 | |
+| law-cn | 26 articles naming a term | 0.334 / 0.401 | 0.419 / 0.514 | 20 pages, 110 KB (wiki 559 → 669 KB) |
+| law-cn | 10 article counts | 0.293 / 0.336 | 0.425 / 0.482 | |
+| law-cn | 1 timeline (laws by last amendment) | 0.429 / 0.714 | 0.857 / 1.000 | |
+| synthetic-life-zh | no list tasks | | | 17 pages, 68 KB (wiki 53 → 121 KB) |
+
+What these pages leave unanswered:
+
+- Questions about a word the graph has no entity for. law-cn's "which
+  articles of 公司法 mention 注册资本" asks about about 30 terms, and 28 of
+  them are no entity. research-ai's GitHub, ablation, hallucination,
+  multi-agent and finance are no entity either. A term index would have to
+  choose its vocabulary. Mining one from n-grams without a model gives mostly
+  function words (应当, 依照本法), and a list of each term's articles comes to
+  about 80 KB per statute for the 300 most frequent terms, more than the
+  statute itself. These are full-text questions: ask's excerpts answer them
+  at question time (docs above), and an agent greps.
+- Disagreements the Judge has not judged. law-cn's 核准 versus 注册 (公司法
+  2018 against 证券法 2019) is in no verdict, and finding it takes a model.
+
+## Navigation
+
+The wiki is navigable from `wiki/index.md` at any size, without a model
+(`src/wiki/nav-views.ts`, `navigation.ts`). Its `contents` region links the
+overview, every index with its counts and the 20 entity pages the most
+documents speak of. `wiki/sources/index.md` lists every document, and
+`wiki/entities/index.md` every entity page; a list longer than 200 rows is
+cut into pages of 200, by folder (`sources/by-folder/<folder>/[<n>/]index.md`,
+in the order documents were dated or, undated, added, so an arrival rewrites
+only its folder's last page) and by type (`entities/by-type/<type>/…`, the
+best documented first). Every other wiki folder (concepts, dreams, datasets,
+research) gets the same list in its own `index.md`. A hub links every page
+of its list while there are at most 400, so 80,000 documents or entity pages
+stay three links from the front page; past that it links each folder's list,
+one step more. No index file holds more than 200 rows or 400 links. The
+smallest folders past 200 share one `_other` list. The pages are reserved
+`index.md` region views: OKF allows no frontmatter there, and the lint and
+the evaluation count no index as knowledge.
+
+Measured with `~/knode-eval/bench/reach.ts` on the five pilot packs, every
+page is reachable from `index.md` within three links (before: 1–20 entity
+pages and `datasets/index.md` were linked from nowhere); with
+`navscale.ts` at the real workspace's size — 26,878 documents, 17,250
+summary pages, 3,000 entity pages — all of them are linked within three
+steps, from 174 index files of at most 28.7 KB (the old single list: 2,000
+rows, about 400 KB, the rest unlisted). The first build took 36 s (each file
+is indexed and embedded like any wiki page), a new document 0.8 s and five
+files, a refresh with nothing changed 10 ms.
+
+`wiki/overview.md` keeps initialization's prose (07) and gains a generated
+region, `holdings`: what the base holds — documents by kind, folder and
+date, entities by type and the ones the most documents speak of (linked),
+claims by kind and status, relations, where the indexes are — counted by
+`surveyHoldings`, the part of `knode_survey` without the graph-health
+queries. `isSeedTemplate` ignores managed regions, so an overview nobody
+initialized still reads as the seed and the "initialize" notice stays.
+
+New documents and summary pages are inputs no index depends on yet, so the
+paths that run anyway refresh the navigation: `wiki generate`, the nightly
+refine, initialization, `knode-os extract`'s document pass, and `serve`'s
+follow-up review every `extraction.intervalMinutes` (also when it has
+nothing to review). Each refresh first compares a few counts and skips when
+none moved; otherwise it reads the rows once and writes only the pages
+whose text changed. The sources lists no longer show heat: on a base nobody
+reads through knode every line said `cold` (09 said the index shows heat).
 
 ## Dream cycle
 
@@ -223,6 +407,11 @@ regeneration and is itself a source.
   trust tier; `known_at`, a fourth time axis that reads only what was available
   at a decision time; market data and a run registry read in place as
   datasources; experiments and author track records written back as sources.
+- [14 — Summary pages worth their cost](14-summary-pages-worth-their-cost.md)
+  — no page under 1,500 characters, the scaffold in the document's language,
+  links only to the graph's names, long documents segment by segment; and the
+  specifics a summary drops put back without a model: the document's claims
+  listed below the summary, a compact figures list in the model's own output.
 - [15 — Research studies: from a topic to a set of wiki pages, with the sources kept](15-research-studies.md)
   — a topic refined into a brief the person edits, then collected (web, the
   base, MCP / API / site sources, or a deep-research model) into originals

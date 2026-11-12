@@ -4,14 +4,17 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultConfig, defaultRoutedLlmConfig, ExtractionConfig, LlmConnection } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
-import { readSourceSummary, readSourceSummaryFailure, readSourceSummaryParts } from '../src/fs/sidecar.js';
+import { readSourceSummary, readSourceSummaryFailure, readSourceSummaryParts, sidecarDir } from '../src/fs/sidecar.js';
 import { segmentText } from '../src/graph/segment.js';
 import { loadSourceText } from '../src/ingest/source.js';
+import { runDocumentPass } from '../src/ingest/background.js';
 import { sync } from '../src/ingest/sync.js';
+import { readDeps } from '../src/lineage/deps.js';
 import { WorkerIdentity } from '../src/labeling/scheduler.js';
 import { parseFrontmatter } from '../src/markdown.js';
+import { splitRegions } from '../src/wiki/regions.js';
 import { ensureDefaultAgents } from '../src/research/agents.js';
-import { dueSummaryDocuments, ensureSourceSummaries, ensureSourcesIndex, pruneShortSummaries } from '../src/wiki/pages.js';
+import { dueSummaryDocuments, ensureSourceSummaries, ensureSourcesIndex, pruneShortSummaries, reconcileViews } from '../src/wiki/pages.js';
 import { channelNames, detectSummaryLanguage, LinkVocabulary, normalizeLinks, sampleSegments } from '../src/wiki/summary.js';
 import { SummarySource } from '../src/work/summarize.js';
 import { startFakeOpenAi, type ChatRequest, type FakeOpenAi } from './helpers/fake-openai.js';
@@ -86,7 +89,7 @@ function answer(request: ChatRequest): string {
       '- [[保证金交易]]',
     ].join('\n');
   }
-  if (user.includes('Source file: raw/docs/en.md')) return 'An English summary.\n\n## Key points\n\n- Rates\n\n## Entities\n\n- [[Nobody]]';
+  if (user.includes('Source file: raw/docs/en.md')) return 'An English summary.\n\n## Key points\n\n- Rates\n\n## Key figures\n\n- 25 bp — the rate cut priced in (2026-03)\n\n## Entities\n\n- [[Nobody]]';
   return '摘要。\n\n## 要点\n\n- 要点\n\n## 实体\n\n- 无';
 }
 
@@ -221,6 +224,28 @@ describe('the Summarize stage', () => {
     expect(page(ctx, 'wiki/sources/声明语言.md')).toContain('description: Summary of raw/docs/declared.md.');
   });
 
+  it('asks every call for the specifics, and for a compact list of the figures the key points cannot hold', async () => {
+    const single = systemOf(fake.calls.find((c) => userOf(c).includes('Source file: raw/docs/zh.md'))!);
+    const part = systemOf(fake.calls.find((c) => kindOf(c) === 'part')!);
+    const merge = systemOf(fake.calls.find((c) => kindOf(c) === 'merge')!);
+    for (const system of [single, part]) {
+      expect(system).toContain("Key points carry the document's specifics");
+      expect(system).toContain('each article, section or clause by its number (Article 63, 第六十三条)');
+      expect(system).toContain('add after the key points a "## 数据" section');
+      expect(system).toContain('It does not count toward the word limit.');
+    }
+    // a part has less room than a whole document
+    expect(single).toContain('up to 15 lines');
+    expect(part).toContain('up to 8 lines');
+    expect(merge).toContain('Keep the figures, dates, names and numbered provisions the parts give');
+    expect(merge).toContain('Merge the parts\' "## 数据" sections into one after the key points, up to 20 lines');
+    // the heading follows the document's language, and the model's own spelling of it becomes the scaffold's
+    expect(systemOf(fake.calls.find((c) => userOf(c).includes('Source file: raw/docs/en.md'))!)).toContain('"## Figures" section');
+    const en = page(ctx, 'wiki/sources/weekly-review.md');
+    expect(en).toContain('\n## Figures\n\n- 25 bp — the rate cut priced in (2026-03)');
+    expect(en).not.toContain('Key figures');
+  });
+
   it("links only the graph's names, under the graph's spelling, and keeps the document's channel out of the entities", async () => {
     const call = fake.calls.find((c) => userOf(c).includes('Source file: raw/docs/zh.md'))!;
     const system = systemOf(call);
@@ -317,7 +342,7 @@ describe('the Summarize stage', () => {
       expect(second).toHaveLength(4);
       for (const t of [...first, ...second]) {
         expect(t.label).toMatch(new RegExp(`^raw/docs/leased\\.md \\[\\d+/${segments.length}\\]$`));
-        expect(t).toMatchObject({ kind: 'summarize', json: false, maxTokens: 900 });
+        expect(t).toMatchObject({ kind: 'summarize', json: false, maxTokens: 1100 });
         expect(t.messages[0].content).toContain('This call reads part');
       }
       // every part is out: nothing more until one lands
@@ -329,7 +354,7 @@ describe('the Summarize stage', () => {
       // the parts are in: the merge goes out, carrying them
       const [merge, ...rest] = await source.lease(mac, 8);
       expect(rest).toEqual([]);
-      expect(merge).toMatchObject({ label: 'raw/docs/leased.md [merge]', maxTokens: 1500 });
+      expect(merge).toMatchObject({ label: 'raw/docs/leased.md [merge]', maxTokens: 1800 });
       expect(merge.messages[0].content).toContain('Merge them into one page');
       expect(merge.messages[1].content).toContain(`### Part 1 of ${segments.length}`);
       expect(merge.messages[1].content).toContain('raw/docs/leased.md [1/');
@@ -461,3 +486,84 @@ describe('summary helpers', () => {
     expect(channelNames({})).toEqual([]);
   });
 });
+
+describe('claims on a summary page', () => {
+  let fake: FakeOpenAi;
+  let ctx: AppContext;
+
+  /** Three sections, so extraction reads three segments of 25 claims each: 75 claims, 9 of them with a figure. */
+  const MANY = ['---\ntitle: 年度报告\n---\n# 年度报告', ...['甲', '乙', '丙'].map((m) => `## 段${m}\n\n${`段${m}的内容。`.repeat(130)}`)].join('\n\n');
+  const PLAIN = `---\ntitle: 闲谈\n---\n# 闲谈\n\n${'今天天气不错，大家聊了聊周末去哪里。'.repeat(20)}\n`;
+  const extraction = (user: string): string => {
+    if (!user.includes('raw/docs/many.md')) return JSON.stringify({ entities: [], relations: [], claims: [] });
+    const m = /段([甲乙丙])的内容/.exec(user)?.[1] ?? '甲';
+    const claims = Array.from({ length: 25 }, (_, i) => i < 22
+      ? { subject: '测试公司', type: 'fact', kind: 'fact', statement: `段${m}的说法${'ABCDEFGHIJKLMNOPQRSTUV'[i]}`, status: 'fact', eventDate: null, startDate: null, endDate: null }
+      : { subject: '测试公司', type: 'fact', kind: i === 24 ? 'prediction' : 'fact', statement: `段${m}营收增长 ${i}%`, status: 'fact', eventDate: i === 24 ? '2026-03-31' : null, startDate: null, endDate: null });
+    return JSON.stringify({ entities: [{ name: '测试公司', type: 'organization', description: '一家公司', aliases: [] }], relations: [], claims });
+  };
+
+  beforeAll(async () => {
+    fake = await startFakeOpenAi({ answer: (r) => (kindOf(r) === 'other' ? extraction(userOf(r)) : '模型写的摘要。\n\n## 要点\n\n- 要点\n\n## 实体\n\n- 无') });
+    // summaries before extraction, so a page is written before its document has claims
+    const dataDir = await workspace('claims', fake, { summaryAfterExtraction: false });
+    write(dataDir, 'raw/docs/many.md', MANY);
+    write(dataDir, 'raw/docs/plain.md', PLAIN);
+    ctx = await createContext(dataDir);
+    await sync(ctx, {});
+  });
+
+  afterAll(async () => {
+    await ctx?.datasources.closeAll();
+    await ctx?.store.close();
+    await fake?.close();
+  });
+
+  it("lists the document's claims below the model's summary once they are extracted, without another summary call", async () => {
+    expect((await ensureSourceSummaries(ctx, { limit: 20 })).sort()).toEqual(['wiki/sources/年度报告.md', 'wiki/sources/闲谈.md']);
+    const before = page(ctx, 'wiki/sources/年度报告.md');
+    expect(before).not.toContain('## 文中论断');
+    const summaryCalls = () => fake.calls.filter((c) => kindOf(c) === 'single').length;
+    const calls = summaryCalls();
+
+    await runDocumentPass(ctx);
+    expect(summaryCalls()).toBe(calls);
+    const after = page(ctx, 'wiki/sources/年度报告.md');
+    const { regions } = splitRegions(after);
+    // the model's text is the cached one, untouched
+    expect(regions.get('body')!.trim()).toBe(readSourceSummary(ctx.dataDir, 'raw/docs/many.md')!.body.trim());
+    const section = regions.get('claims')!;
+    expect(section).toContain('## 文中论断');
+    // bounded, those with figures first: all nine are among the thirty listed
+    expect(section).toContain('_30 of 75 claims extracted from this document, those with figures and dates first; `knode_claims` returns the rest._');
+    expect(section.split('\n').filter((l) => l.startsWith('- '))).toHaveLength(30);
+    for (const m of ['甲', '乙', '丙']) for (const n of [22, 23, 24]) expect(section).toContain(`段${m}营收增长 ${n}%`);
+    // dated, and tagged when it is a forecast; listed in the document's order
+    expect(section).toContain('- 段丙营收增长 24% `2026-03-31` `prediction`');
+    expect(section.indexOf('段甲营收增长 22%')).toBeLessThan(section.indexOf('段丙营收增长 22%'));
+    // the listed claims are the page's inputs, so a change to one re-renders it
+    const deps = await readDeps(ctx.store, { kind: 'page', id: 'wiki/sources/年度报告.md' });
+    expect(deps.filter((d) => d.input_kind === 'claim')).toHaveLength(30);
+
+    // a document without claims has no section
+    expect(page(ctx, 'wiki/sources/闲谈.md')).not.toContain('## 文中论断');
+    expect(splitRegions(page(ctx, 'wiki/sources/闲谈.md')).regions.has('claims')).toBe(false);
+  });
+
+  it('re-renders a page from the body already on disk when the cache is gone, and restores the cache', async () => {
+    const rel = 'wiki/sources/年度报告.md';
+    const body = readSourceSummary(ctx.dataDir, 'raw/docs/many.md')!.body;
+    fs.rmSync(path.join(sidecarDir(ctx.dataDir, 'raw/docs/many.md'), 'views/source-summary.md'), { force: true });
+    expect(readSourceSummary(ctx.dataDir, 'raw/docs/many.md')).toBeNull();
+    // an older generator's page is written again by a pass that may not call a model
+    await ctx.store.query(`UPDATE pages SET generator = 'source_summary@2' WHERE path = $1`, [rel]);
+    const calls = fake.calls.length;
+    const stats = await reconcileViews(ctx, { llm: false });
+    expect(stats.regenerated).toBeGreaterThanOrEqual(1);
+    expect(fake.calls.length).toBe(calls);
+    expect((await ctx.store.query<{ generator: string }>(`SELECT generator FROM pages WHERE path = $1`, [rel]))[0].generator).toBe('source_summary@3');
+    expect(readSourceSummary(ctx.dataDir, 'raw/docs/many.md')!.body.trim()).toBe(body.trim());
+    expect(splitRegions(page(ctx, rel)).regions.get('claims')).toContain('## 文中论断');
+  });
+});
+

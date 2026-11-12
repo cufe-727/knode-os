@@ -43,6 +43,8 @@ export interface SystemAnswer {
   citations?: Citation[];
   retrieved?: string[];
   toolCalls?: number;
+  /** An agent's command lines and MCP tool calls, in order (src/eval/trace.ts); bounded when the record is written. */
+  commands?: string[];
   capped?: boolean;
   leaked?: string[];
   error?: string;
@@ -58,8 +60,8 @@ export interface SystemUnderTest {
   answers: boolean;
   /** Do its answers cite corpus documents (false: they cite records of its own, and citation scores do not apply). */
   cites?: boolean;
-  /** Can it run on this pack at all (a corpus too large for long context, an external system off this pack). */
-  applicable?(pack: LoadedPack): boolean;
+  /** Can it run on this pack at all (a staged corpus too large for long context, an external system off this pack). */
+  applicable?(pack: LoadedPack, staged?: StagedCorpus): boolean;
   /** Build the group's knowledge base; called once per pack for the first system of its group. */
   build?(env: SystemEnv): Promise<{ notes?: Record<string, unknown>; kbDir?: string }>;
   /** Reopen an earlier build (a resumed run) without rebuilding. */

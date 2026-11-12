@@ -14,7 +14,7 @@ import { Meter, parseTag, formatTag } from '../src/eval/meter.js';
 import { docText, loadPack, stageCorpus, validatePack } from '../src/eval/pack.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { buildReportData, writeReport } from '../src/eval/report.js';
-import { runEval } from '../src/eval/run.js';
+import { reuseBuilds, runEval } from '../src/eval/run.js';
 import { fileLines, RunStore } from '../src/eval/runstore.js';
 import { ChatBackend, ChatRequest, decodeVector, retryableFailure, startShim, VectorCache, vectorKey } from '../src/eval/shim.js';
 import { retrievalScores } from '../src/eval/metrics/retrieval.js';
@@ -30,11 +30,112 @@ import { llmWikiBuild } from '../src/eval/systems/llm-wiki.js';
 import { citationsIn } from '../src/eval/prompts.js';
 import type { SystemEnv } from '../src/eval/systems/types.js';
 import type { CodexAccount } from '../src/estimate/codex.js';
+import { Judge } from '../src/eval/judge.js';
+import { containsTerm, matchByAlias, matchByDocs, orderAccuracy, sameDate, scoreLists } from '../src/eval/score/lists.js';
+import { firstNumber } from '../src/eval/score/usage.js';
+import { buildScaleData, efficiencyOf, renderScale } from '../src/eval/report.js';
+import { recipe, registerRecipe } from '../src/eval/packs/index.js';
+import { extendPack } from '../src/eval/packs/extend.js';
+import { ModelChain, parseChain, SpendLedger } from '../src/eval/chain.js';
+import { runAgent, setAgentRouting } from '../src/eval/agent.js';
+import { boundedTrace, toolsOf, toolUse } from '../src/eval/trace.js';
+import { calibrateEndpoint, preferEndpoint } from '../src/eval/endpoint.js';
+import { researchEmergence } from '../src/eval/packs/research.js';
+import type { KnodeConfig } from '../src/config.js';
+import '../src/eval/packs/recipes.js';
+import { draftCorpusTasks, draftedDate, sweepStatements } from '../src/eval/packs/corpus-tasks.js';
+import { PackWriter } from '../src/eval/packs/writer.js';
+import { CORPUS_TASK_TYPES, emptyUsage, type GoldFact, type ListSpec, type Task } from '../src/eval/types.js';
+
+/** An author that renders each planted event as its own document, adds plain fillers (or `filler`), and drafts nothing. */
+function standInAuthor(lang: 'zh' | 'en', filler?: string): LlmClient {
+  return {
+    label: 'stand-in', model: 'stand-in', enabled: true,
+    async completeJson(messages: { role: string; content: string }[]) {
+      const system = messages[0].content;
+      const user = messages[1]?.content ?? '';
+      if (system.includes('realistic personal documents')) {
+        const p = JSON.parse(user) as { events: { type: string; date: string; what: string; phrase: string }[] };
+        const fillers = Number(system.match(/plus (\d+) ordinary documents/)?.[1] ?? 0);
+        const docs = p.events.map((e, i) => ({ type: e.type, date: e.date, title: `event ${i}`, text: `${e.what}\n\n${e.phrase}` }));
+        for (let i = 0; i < fillers; i++) docs.push({ type: 'chat', date: p.events[0]?.date ?? '2026-03-02', title: `filler ${i}`, text: filler ?? (lang === 'zh' ? '今天下雨了，在家做饭。' : 'It rained; cooked at home.') });
+        return { docs };
+      }
+      if (system.includes('background noise')) {
+        const n = Number(system.match(/Write (\d+) documents/)?.[1] ?? 1);
+        return { docs: Array.from({ length: n }, (_, i) => ({ type: i % 2 ? 'email' : 'chat', date: '2026-03-02', title: `notice ${i}`, text: `快递已签收，单号${1000 + i}。` })) };
+      }
+      return {};
+    },
+  } as unknown as LlmClient;
+}
+
+/** An author for drafted corpus tasks over the test's documents: real quotes where they exist, and one invented quote per document. */
+function draftingAuthor(docs: { path: string; text: string }[]): LlmClient {
+  return {
+    label: 'drafting', model: 'drafting', enabled: true,
+    async completeJson(messages: { role: string; content: string }[]) {
+      const system = messages[0].content;
+      const user = messages[1]?.content ?? '';
+      const paths = [...user.matchAll(/path="([^"]+)"/g)].map((m) => m[1]).filter((p, i, xs) => xs.indexOf(p) === i);
+      if (system.startsWith('These names were extracted')) return { entities: [{ name: '星河资本', aliases: ['星河'], type: 'company' }, { name: '顾明', aliases: [], type: 'person' }, { name: '市场', aliases: [], type: 'other' }] };
+      if (system.startsWith('For each document excerpt')) {
+        return { statements: paths.flatMap((p) => {
+          const text = docs.find((d) => d.path === p)!.text;
+          const target = text.match(/目标价定为\d+元/)![0];
+          const hq = text.match(/总部在\S{2}/)![0];
+          return [
+            { doc: p, entity: '星河资本', text: target, quote: target, date: p.slice(6, 13) },
+            { doc: p, entity: '星河', text: hq, quote: hq, date: '' },
+            { doc: p, entity: '星河资本', text: '编造', quote: '这句话不在文档里', date: '' },
+          ];
+        }) };
+      }
+      if (system.startsWith('Each entity comes with the statements')) {
+        const input = JSON.parse(user) as { entity: string; statements: { id: string; doc: string; date: string; text: string }[] }[];
+        return { entities: input.map((e) => {
+          const targets = e.statements.filter((s) => s.text.includes('目标价'));
+          const hq = e.statements.filter((s) => s.text.includes('总部'));
+          return {
+            entity: e.entity,
+            facts: [...targets.map((s) => ({ label: s.text, statements: [s.id] })), { label: '总部', statements: hq.map((s) => s.id) }],
+            timeline: [...targets].reverse().map((s) => ({ label: s.text, date: s.date, statements: [s.id] })),
+            conflicts: [{ about: '总部', sides: [{ label: '苏州', statements: hq.filter((s) => s.text.includes('苏州')).map((s) => s.id) }, { label: '上海', statements: hq.filter((s) => s.text.includes('上海')).map((s) => s.id) }] }],
+          };
+        }) };
+      }
+      if (system.startsWith('Propose')) return { questions: [{ question: '列出每一个增持计划。', predicate: '提到增持计划', keywords: ['增持计划'], item: '计划编号' }, { question: '列出每一个火星基地。', predicate: '火星', keywords: ['火星基地'], item: '基地' }] };
+      if (system.startsWith('For each excerpt, check each predicate')) {
+        return { items: paths.map((p) => ({ doc: p, predicate: 'q0', name: docs.find((d) => d.path === p)!.text.match(/增持计划\d号/)![0], quote: docs.find((d) => d.path === p)!.text.match(/增持计划\d号/)![0] })) };
+      }
+      if (system.startsWith('For each predicate, merge')) return { predicates: [] };
+      if (system.startsWith('Each chain is a sequence')) {
+        const chains = JSON.parse(user) as { chain: number; bridges: string[] }[];
+        return { tasks: chains.flatMap((c) => [{ chain: c.chain, question: `从${c.bridges[0]}出发的问题？`, answer: 'x' }, { chain: c.chain, question: '不点名的问题？', answer: 'y' }]) };
+      }
+      if (system.startsWith('For each item, read only the evidence')) return { verdicts: (JSON.parse(user) as { i: number }[]).map((it) => ({ i: it.i, consistent: true })) };
+      return {};
+    },
+  } as unknown as LlmClient;
+}
 
 /** docs/design/23: the benchmark suite end to end on the fixture pack, with no network and no real model. */
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-test-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+// every test, in every block, reaches the stand-in codex: an agent system must never start the real CLI from a test
+const fakeBin = path.join(tmp, 'fake-bin');
+fs.mkdirSync(fakeBin, { recursive: true });
+fs.writeFileSync(path.join(fakeBin, 'codex'), `#!/bin/sh\nexec node "${path.resolve('tests/helpers/fake-codex.mjs')}" "$@"\n`);
+fs.chmodSync(path.join(fakeBin, 'codex'), 0o755);
+const realPath = process.env.PATH;
+beforeAll(() => {
+  process.env.PATH = `${fakeBin}:${realPath}`;
+});
+afterAll(() => {
+  process.env.PATH = realPath;
+});
 
 /** Answers every prompt the systems send, by what the prompt is for. */
 class ScriptedBackend implements ChatBackend {
@@ -60,6 +161,9 @@ class ScriptedBackend implements ChatBackend {
       text = '林晓的近况。\n\n## Key points\n\n- 林晓将入职澜舟科技';
     } else if (system.includes('You answer questions from a personal knowledge base')) {
       text = '林晓的岗位是高级数据工程师 [1]。\nFinal answer: 高级数据工程师\n{"citations":[1],"gaps":[]}';
+    } else if (user.includes('"items":[{"label"')) {
+      // a list: two of March's runs, and the left knee with a document that says so
+      text = '三月的记录如下。\n{"items":[{"label":"5公里","confidence":0.9,"evidence":["diary/2026-03-04.md"]},{"label":"8公里","confidence":0.8,"evidence":["chat/2026-03-09.md"]},{"label":"左膝","confidence":0.7,"evidence":["diary/2026-03-04.md"]}]}';
     } else if (req.json) {
       text = '{}';
     } else {
@@ -162,6 +266,23 @@ describe('agent audit and metering', () => {
     expect(leakedPaths('cat chat/a.md', cwd)).toEqual([]);
     expect(leakedPaths(`cat ${os.homedir()}/knode-eval/packs/p/tasks/usage.jsonl`, cwd)).toHaveLength(1);
     expect(leakedPaths('ls /usr/bin', cwd)).toEqual([]);
+  });
+
+  it('reads the programs and knode tools out of an agent trace', () => {
+    expect(toolsOf('rg -n 林晓 .')).toEqual(['rg']);
+    expect(toolsOf(`/bin/zsh -lc "rg -l '林晓' . | head -n 5"`)).toEqual(['rg', 'head']);
+    expect(toolsOf("bash -lc 'cd chat && LC_ALL=C grep -rn \"a|b\" . ; sed -n 1,20p x.md'")).toEqual(['cd', 'grep', 'sed']);
+    expect(toolsOf('/usr/bin/cat a.md && (ls wiki || true)')).toEqual(['cat', 'ls', 'true']);
+    expect(toolsOf('mcp:knode.knode_resolve {"query":"林晓"}')).toEqual(['knode_resolve']);
+    // an entry cut mid-quote still reads
+    expect(toolsOf(`bash -lc 'rg -n "unterminated`)).toEqual(['rg']);
+    const long = Array.from({ length: 80 }, (_, i) => `cat ${'x'.repeat(400)}${i}`);
+    const t = boundedTrace(long);
+    expect(t).toHaveLength(50);
+    expect(t.every((c) => c.length === 300)).toBe(true);
+    // records written before traces were kept count as untraced, not as zero calls
+    const use = toolUse([{ toolCalls: 3, commands: ['rg -n a .', 'rg -n b . | head', 'cat a.md'] }, { toolCalls: 7 }]);
+    expect(use).toEqual({ n: 2, traced: 1, calls: 3, perTool: { rg: 2, cat: 1, head: 1 } });
   });
 
   it('round-trips meter tags', () => {
@@ -286,7 +407,7 @@ describe('a run on the fixture pack', () => {
   const backend = new ScriptedBackend();
   const judge = scriptedJudge();
   const embedder = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false });
-  const systems = ['knode-ask', 'knode-sag', 'agent-knode-wiki', 'agent-wiki', 'agent-grep', 'rag-hybrid', 'rag-bm25', 'closed-book', 'long-context'];
+  const systems = ['knode-ask', 'knode-sag', 'agent-knode', 'agent-knode-wiki', 'agent-knode-wiki-sources', 'agent-wiki', 'agent-wiki-sources', 'agent-grep', 'rag-hybrid', 'rag-bm25', 'closed-book', 'long-context'];
   let oldPath: string | undefined;
 
   beforeAll(() => {
@@ -305,9 +426,11 @@ describe('a run on the fixture pack', () => {
     const issues = buildFixturePack(packDir);
     expect(issues.errors).toEqual([]);
     const pack = loadPack(packDir);
-    expect(pack.docs.length).toBe(7);
-    expect(pack.updates).toEqual(['01']);
-    expect(validatePack(pack).errors).toEqual([]);
+    expect(pack.docs.length).toBe(12);
+    expect(pack.updates).toEqual(['01', '02']);
+    expect(pack.padding).toHaveLength(12);
+    expect(validatePack(pack)).toEqual({ errors: [], warnings: [] });
+    for (const type of ['aggregate', 'timeline', 'contradiction', 'profile', 'deep-hop'] as const) expect(pack.tasks.some((t) => t.type === type), type).toBe(true);
   });
 
   it('runs every native system, scores it and reports', async () => {
@@ -327,14 +450,28 @@ describe('a run on the fixture pack', () => {
     expect(wiki.usage.calls).toBeGreaterThan(0);
 
     const answers = store.allAnswers();
-    for (const s of ['knode-ask', 'agent-knode-wiki', 'agent-wiki', 'agent-grep', 'rag-hybrid', 'closed-book', 'long-context']) {
+    for (const s of ['knode-ask', 'agent-knode-wiki', 'agent-knode-wiki-sources', 'agent-wiki', 'agent-wiki-sources', 'agent-grep', 'rag-hybrid', 'closed-book', 'long-context']) {
       expect(answers.filter((a) => a.system === s).length, s).toBeGreaterThan(0);
     }
     expect(answers.some((a) => a.taskId === 'u1')).toBe(true);
+    // the update stream: both batches applied in order, each answer marked with the batch before it, each group's cost per batch
+    expect(answers.filter((a) => a.system === 'rag-hybrid' && a.batch).map((a) => `${a.taskId}@${a.batch}`).sort()).toEqual(['u1@01', 'u2@02', 'u3@02']);
+    expect(builds.filter((b) => b.system.includes('@')).map((b) => b.system).sort()).toEqual(expect.arrayContaining(['knode@01', 'knode@02', 'llm-wiki@01', 'llm-wiki@02', 'rag@01', 'rag@02']));
+    expect(builds.filter((b) => b.system.includes('@')).every((b) => b.ok)).toBe(true);
+    expect(builds.find((b) => b.system === 'knode@02')!.usage.calls).toBeGreaterThan(0);
     expect(answers.filter((a) => a.leaked?.length)).toEqual([]);
     const grep = answers.find((a) => a.system === 'agent-grep' && a.taskId === 'q1')!;
     expect(grep.citations.map((c) => c.doc)).toContain('email/2026-03-05.md');
     expect(grep.usage.calls).toBe(1);
+    // each agent session's trace is on its record: shell commands as run, MCP calls with their arguments
+    expect(grep.commands).toEqual(['rg -n 林晓 .', `/bin/zsh -lc "rg -l '林晓' . | head -n 5"`]);
+    expect(grep.toolCalls).toBe(2);
+    const mcp = answers.find((a) => a.system === 'agent-knode' && a.taskId === 'q1')!;
+    expect(mcp.commands).toEqual(['mcp:knode.knode_resolve {"query":"林晓的岗位"}', 'mcp:knode.knode_read {"path":"raw/docs/email/2026-03-05.md"}']);
+    for (const s of ['agent-knode-wiki', 'agent-knode-wiki-sources', 'agent-wiki', 'agent-wiki-sources']) {
+      expect(answers.filter((a) => a.system === s).every((a) => a.commands?.length === 2), s).toBe(true);
+    }
+    expect(answers.filter((a) => !a.system.startsWith('agent-')).every((a) => a.commands === undefined)).toBe(true);
 
     const scores = store.allScores();
     const metric = (system: string, m: string) => scores.filter((s) => s.system === system && s.metric === m);
@@ -347,13 +484,53 @@ describe('a run on the fixture pack', () => {
     expect(metric('closed-book', 'citation_precision').every((s) => s.value === null)).toBe(true);
     expect(scores.some((s) => s.metric === 'injection_success')).toBe(true);
     expect(scores.some((s) => s.metric === 'label_correct' && s.taskId === 'e1')).toBe(true);
+    // corpus-level lists, without a model: two of five runs, every listed item a run; one side of the knee, cited
+    const list = (system: string, task: string, m: string) => scores.find((s) => s.system === system && s.taskId === task && s.metric === m)?.value;
+    expect(list('rag-hybrid', 'c-runs', 'set_recall')).toBeCloseTo(0.4, 6);
+    expect(list('rag-hybrid', 'c-runs', 'set_precision')).toBeCloseTo(2 / 3, 6);
+    expect(list('rag-hybrid', 'c-runs', 'correctness')).toBeCloseTo(0.5, 6);
+    expect(list('rag-hybrid', 'c-knee', 'set_recall')).toBeCloseTo(0.5, 6);
+    expect(list('rag-hybrid', 'c-knee', 'attribution_recall')).toBeCloseTo(0.25, 6);
+    expect(list('rag-hybrid', 'c-bp', 'correctness')).toBe(0);
+    expect(scores.some((s) => s.taskId === 'c-runs-count' && s.metric === 'em')).toBe(true);
+    expect(scores.some((s) => s.taskId === 'c-chain' && s.metric === 'correctness')).toBe(true);
 
     const report = writeReport(res.runDir);
     const md = fs.readFileSync(report.md, 'utf8');
     expect(md).toContain('## fixture-life');
     expect(md).toContain('Build cost');
+    expect(md).toContain('Use: corpus-level lists');
+    expect(md).toContain('Correctness for its cost');
+    expect(md).toContain('Update stream');
+    expect(md).toContain('### Agent tool use');
+    const tools = report.data.tools['fixture-life'];
+    expect(Object.keys(tools).sort()).toEqual(['agent-grep', 'agent-knode', 'agent-knode-wiki', 'agent-knode-wiki-sources', 'agent-wiki', 'agent-wiki-sources']);
+    expect(tools['agent-grep']).toMatchObject({ traced: tools['agent-grep'].n, calls: 2, perTool: { rg: 2, head: 1 } });
+    expect(tools['agent-knode']).toMatchObject({ calls: 2, perTool: { knode_resolve: 1, knode_read: 1 } });
+    expect(md).not.toContain('No trace on');
+    const eff = report.data.efficiency['fixture-life'];
+    expect(eff['agent-grep'].per1k).toBeGreaterThan(0);
+    expect(eff['agent-wiki-sources'].buildTokens).toBe(eff['agent-wiki'].buildTokens);
+    expect(eff['agent-wiki'].buildTokens).toBeGreaterThan(0);
     expect(buildReportData(res.runDir).pooled.some((p) => p.system === 'knode-ask')).toBe(true);
   }, 120_000);
+
+  it('reports a run whose agent answers were recorded before traces were kept', () => {
+    const old = path.join(tmp, 'runs', 'untraced');
+    fs.mkdirSync(old, { recursive: true });
+    const lines = [...fileLines(path.join(runDir, 'answers.jsonl'))].filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>)
+      .map((a) => (a.system === 'agent-grep' ? (({ commands: _, ...rest }) => rest)(a) : a));
+    fs.writeFileSync(path.join(old, 'answers.jsonl'), lines.map((a) => JSON.stringify(a)).join('\n') + '\n');
+    const data = buildReportData(old);
+    const grep = data.tools['fixture-life']['agent-grep'];
+    expect(grep.traced).toBe(0);
+    expect(grep.n).toBeGreaterThan(0);
+    expect(grep.perTool).toEqual({});
+    expect(data.tools['fixture-life']['agent-knode'].traced).toBeGreaterThan(0);
+    const md = fs.readFileSync(writeReport(old).md, 'utf8');
+    expect(md).toMatch(/\| agent-grep \| 0\/\d+ \| — \|/);
+    expect(md).toContain(`No trace on agent-grep (${grep.n} of ${grep.n})`);
+  });
 
   it('goes on with an LLM-wiki build from its last finished session', async () => {
     const pack = loadPack(packDir);
@@ -369,11 +546,11 @@ describe('a run on the fixture pack', () => {
     await expect(wiki(env(tight), 2)).rejects.toThrow(/quota guard gave up/);
     expect(meter.all((e) => e.system === 'llm-wiki' && !e.replayed)).toHaveLength(2);
     const res = await wiki(env(new QuotaGuard({ enabled: false })), 2);
-    expect(lines).toContain('llm-wiki: resuming at 4/7 sources');
-    expect(res.notes.sessions).toBe(4);
+    expect(lines).toContain('llm-wiki: resuming at 4/12 sources');
+    expect(res.notes.sessions).toBe(6);
     expect(meter.all((e) => e.system === 'llm-wiki' && e.replayed)).toHaveLength(2);
-    expect(meter.all((e) => e.system === 'llm-wiki' && !e.replayed)).toHaveLength(4);
-    expect(fs.readdirSync(path.join(res.kbDir, 'sources'))).toHaveLength(7);
+    expect(meter.all((e) => e.system === 'llm-wiki' && !e.replayed)).toHaveLength(6);
+    expect(fs.readdirSync(path.join(res.kbDir, 'sources'))).toHaveLength(12);
     staged.cleanup();
   });
 
@@ -401,6 +578,69 @@ describe('a run on the fixture pack', () => {
     expect(backend.calls).toBe(calls);
     expect(judge.calls).toBe(judged);
   }, 120_000);
+});
+
+const answersOf = (dir: string) => new RunStore(dir).allAnswers();
+
+describe('reusing builds', () => {
+  it("starts a new run from an earlier run's builds of the same pack, and refuses one embedded differently", async () => {
+    const packDir = path.join(tmp, 'packs', 'fixture-life');
+    const judge = scriptedJudge();
+    const embedder = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false });
+    // an earlier run that applied no update batches, so its builds are still the base builds
+    const first = path.join(tmp, 'runs', 'r0');
+    await runEval({ packs: [packDir], systems: ['knode-ask', 'agent-wiki-sources', 'rag-hybrid'], runDir: first, quota: false, types: ['single-hop'], suites: ['usage'], overrides: { chat: new ScriptedBackend(), judge, embedder } });
+    const backend = new ScriptedBackend();
+    const res = await runEval({ packs: [packDir], systems: ['knode-ask', 'agent-wiki-sources', 'rag-hybrid'], runDir: path.join(tmp, 'runs', 'reuse'), quota: false, types: ['aggregate', 'single-hop'], suites: ['usage'], reuseBuildsFrom: first, overrides: { chat: backend, judge, embedder } });
+    // the stand-in codex answered, not the real one
+    expect(answersOf(res.runDir).filter((a) => a.system === 'agent-wiki-sources').every((a) => a.text.includes('Final answer: 高级数据工程师'))).toBe(true);
+    const store = new RunStore(res.runDir);
+    const builds = store.allBuilds();
+    expect(builds.map((b) => b.system).sort()).toEqual(['knode', 'llm-wiki', 'rag']);
+    expect(builds.every((b) => (b.notes as { reusedFrom?: string }).reusedFrom === 'r0')).toBe(true);
+    // nothing was built again: every model call answered a question
+    const answered = store.allAnswers().filter((a) => a.system !== 'agent-wiki-sources').length;
+    expect(backend.calls).toBe(answered);
+    expect(store.allAnswers().some((a) => a.system === 'agent-wiki-sources' && !a.error)).toBe(true);
+    // --rebuild knode: the other groups come from r0, knode is built by this run
+    const fresh = await runEval({ packs: [packDir], systems: ['knode-ask', 'rag-hybrid'], runDir: path.join(tmp, 'runs', 'reuse-rebuild'), quota: false, types: ['single-hop'], suites: ['usage'], reuseBuildsFrom: first, rebuild: ['knode'], overrides: { chat: new ScriptedBackend(), judge, embedder } });
+    const rebuilt = new RunStore(fresh.runDir).allBuilds();
+    expect(rebuilt.find((b) => b.system === 'rag')!.notes).toMatchObject({ reusedFrom: 'r0' });
+    expect((rebuilt.find((b) => b.system === 'knode')!.notes as { reusedFrom?: string }).reusedFrom).toBeUndefined();
+    expect(rebuilt.find((b) => b.system === 'knode')!.ok).toBe(true);
+    const small = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 64, batchSize: 64, sendDimensions: false });
+    await expect(runEval({ packs: [packDir], systems: ['rag-hybrid'], runDir: path.join(tmp, 'runs', 'reuse-64'), quota: false, reuseBuildsFrom: first, overrides: { chat: backend, judge, embedder: small } })).rejects.toThrow(/embedded with .*\(384\); this run embeds with .*\(64\)/);
+  }, 120_000);
+
+  it('builds again what the earlier run went on to update, since update batches change its work directory in place', () => {
+    const packDir = path.join(tmp, 'packs', 'fixture-life');
+    // the fixture run answered the update suite: its batches (knode@01, llm-wiki@01, rag@01, …) changed its work directories
+    const updated = new RunStore(path.join(tmp, 'runs', 'r1'));
+    const meta = updated.meta()!;
+    expect(updated.allBuilds().filter((b) => b.system.includes('@')).length).toBeGreaterThan(0);
+    // a base build it did not update is still reused (long-context has no update step)
+    const partial = new RunStore(path.join(tmp, 'runs', 'r1-partial'));
+    partial.writeMeta({ ...meta, id: 'r1-partial' });
+    for (const b of updated.allBuilds().filter((x) => !x.system.startsWith('rag@'))) partial.putBuild(b);
+    const into = new RunStore(path.join(tmp, 'runs', 'reuse-updated'));
+    const n = reuseBuilds(into, partial.dir, [packDir], meta.embedding, meta.fraction, meta.seed);
+    expect(n.updated.sort()).toEqual(['fixture-life/knode', 'fixture-life/llm-wiki']);
+    expect(into.allBuilds().map((b) => b.system).sort()).toEqual(['long-context', 'rag']);
+  });
+
+  it('brings the earlier run\'s vectors along even when it reuses none of its builds', () => {
+    // --rebuild knode beside systems that build nothing: no build to reuse, but an embedding
+    // endpoint is still checked against these vectors rather than against the workspace's embedder
+    const packDir = path.join(tmp, 'packs', 'fixture-life');
+    const earlier = new RunStore(path.join(tmp, 'runs', 'r1'));
+    const meta = earlier.meta()!;
+    expect(fs.existsSync(path.join(earlier.dir, 'cache', 'vectors.jsonl'))).toBe(true);
+    const into = new RunStore(path.join(tmp, 'runs', 'reuse-vectors-only'));
+    const n = reuseBuilds(into, earlier.dir, [packDir], meta.embedding, meta.fraction, meta.seed, new Set(['no-such-group']));
+    expect(n.builds).toBe(0);
+    expect(n.vectors).toBeGreaterThan(0);
+    expect(fs.existsSync(path.join(into.cacheDir(), 'vectors.jsonl'))).toBe(true);
+  });
 });
 
 describe("an embedding endpoint of the run's own", () => {
@@ -458,5 +698,439 @@ describe("a run's temp directories", () => {
     // what is still held goes when a stopped run lets go of everything
     removeHeldTempDirs();
     expect(fs.existsSync(held.root)).toBe(false);
+  });
+});
+
+describe('corpus-level tasks: matching without a model', () => {
+  it('finds a term as a whole number or word, not inside a longer one', () => {
+    expect(containsTerm('4月12日 跑了 18 公里', '18公里')).toBe(true);
+    expect(containsTerm('跑了18公里', '8公里')).toBe(false);
+    expect(containsTerm('血压150/95，好多了', '150/95')).toBe(true);
+    expect(containsTerm('血压150/950', '150/95')).toBe(false);
+    expect(containsTerm('Dinner with Tom Becker', 'Tom')).toBe(true);
+    expect(containsTerm('Tomas came', 'Tom')).toBe(false);
+    expect(containsTerm('ran 12 km on Sunday', '12km')).toBe(true);
+    expect(containsTerm('第一百一十条', '第十条')).toBe(false);
+    expect(containsTerm('见第110条', '第10条')).toBe(false);
+  });
+
+  it('pairs items by alias, by documents, and reads order and dates', () => {
+    const gold = [
+      { label: '5公里', aliases: [], weight: 1, date: '2026-03-04', docs: ['a.md'] },
+      { label: '15公里', aliases: [], weight: 1, date: '2026-03-23', docs: ['b.md'] },
+      { label: '8公里', aliases: ['8 km'], weight: 1, date: '2026-03-09', docs: ['c.md'] },
+    ];
+    expect(matchByAlias(['3月23日 15公里', '3月4日 5公里', '18公里'], gold)).toEqual([[0, 1], [1, 0]]);
+    expect(matchByDocs([['raw/c.md'], ['corpus/a.md', 'x.md']], gold, new Set(['a.md', 'b.md', 'c.md']))).toEqual([[0, 2], [1, 0]]);
+    // listed 15 before 5: one of the three dated pairs out of order
+    expect(orderAccuracy([[0, 1], [1, 0], [2, 2]], gold)).toBeCloseTo(1 / 3, 6);
+    expect(sameDate('3月23日', '2026-03-23')).toBe(true);
+    expect(sameDate('2026年3月23日', '2026-03-23')).toBe(true);
+    expect(sameDate('March 23, 2026', '2026-03-23')).toBe(true);
+    expect(sameDate('2026-03', '2026-03')).toBe(true);
+    expect(sameDate('3月24日', '2026-03-23')).toBe(false);
+    expect(firstNumber('一共 5 次')).toBe(5);
+    expect(firstNumber('十二次')).toBe(12);
+    expect(firstNumber('二十三条')).toBe(23);
+    expect(firstNumber('没有')).toBeNull();
+    expect(firstNumber('一共五次')).toBe(5);
+  });
+
+  it('scores a list: F1, recall where the gold is a sample, order for a timeline, sides only with their documents', async () => {
+    const meter = new Meter();
+    const judge = new Judge({ client: scriptedJudge(), meter });
+    const task = (id: string, type: Task['type'], list: Partial<ListSpec>): Task => ({
+      id, suite: 'usage', type, question: '?', scoring: 'set', evidence: [],
+      items: [
+        { label: '左膝', aliases: ['left knee'], weight: 1, date: '2026-03-04', docs: ['a.md', 'b.md'] },
+        { label: '右膝', aliases: [], weight: 1, date: '2026-03-09', docs: ['c.md'] },
+      ],
+      list: { match: 'alias', ordered: false, maxItems: 10, requireDocs: false, primary: 'f1', ...list },
+    });
+    const tasks = new Map([['p|k1', task('k1', 'contradiction', { requireDocs: true })], ['p|k2', task('k2', 'profile', { primary: 'recall' })], ['p|k3', task('k3', 'timeline', { ordered: true })]]);
+    const answer = (taskId: string, text: string) => ({ key: taskId, pack: 'p', system: 's', taskId, at: '', text, finalAnswer: '', citations: [], retrieved: [], toolCalls: 0, usage: emptyUsage(), ms: 1 });
+    const items = '{"items":[{"label":"右膝","date":"3月9日","evidence":["corpus/c.md"]},{"label":"左膝","date":"2026-03-04","evidence":["x.md"]},{"label":"脚踝","evidence":[]}]}';
+    const scores = await scoreLists({ answers: [answer('k1', items), answer('k2', items), answer('k3', items)], tasks, corpusDocs: new Map([['p', new Set(['a.md', 'b.md', 'c.md', 'x.md'])]]) }, judge);
+    const v = (task: string, m: string) => scores.find((s) => s.taskId === task && s.metric === m)?.value;
+    // the left knee was named without one of its documents: not found
+    expect(v('k1', 'set_recall')).toBe(0.5);
+    expect(v('k1', 'correctness')).toBeCloseTo((2 * (1 / 3) * 0.5) / (1 / 3 + 0.5), 6);
+    expect(v('k2', 'correctness')).toBe(1);
+    expect(v('k3', 'order_accuracy')).toBe(0);
+    expect(v('k3', 'correctness')).toBe(0);
+    expect(v('k3', 'date_accuracy')).toBe(1);
+  });
+});
+
+describe('corpus-level tasks: packs', () => {
+  const dir = path.join(tmp, 'corpus-pack');
+  beforeAll(() => {
+    buildFixturePack(dir);
+  });
+
+  it('refuses corpus-level gold that is too narrow, undated, shallow or open to padding', () => {
+    const pack = loadPack(dir);
+    const runs = pack.tasks.find((t) => t.id === 'c-runs')!;
+    const narrow = { ...runs, id: 'narrow', evidence: runs.evidence.slice(0, 3) };
+    const undated = { ...pack.tasks.find((t) => t.id === 'c-bp')!, id: 'undated', items: pack.tasks.find((t) => t.id === 'c-bp')!.items!.map(({ date: _d, ...it }) => it) };
+    const shallow = { ...pack.tasks.find((t) => t.id === 'c-chain')!, id: 'shallow', evidence: pack.tasks.find((t) => t.id === 'c-chain')!.evidence.slice(0, 2) };
+    const count = { ...pack.tasks.find((t) => t.id === 'c-runs-count')!, id: 'count', answer: '五次' };
+    fs.mkdirSync(path.join(dir, 'padding', 'diary'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'padding', 'diary', 'extra.md'), '# 日记\n\n今天又跑了20公里。\n');
+    const errors = validatePack({ ...pack, tasks: [...pack.tasks, narrow, undated, shallow, count], padding: [...pack.padding, { path: 'diary/extra.md' }] }).errors.join('\n');
+    expect(errors).toContain('task narrow: a aggregate task needs evidence in at least 5 documents (has 3)');
+    expect(errors).toContain('task undated: every timeline item needs a date');
+    expect(errors).toContain("task shallow: a deep-hop task's hops lie in at least 3 different documents");
+    expect(errors).toContain('task count: count scoring needs a number as the answer');
+    expect(errors).toContain('task c-runs: padding document diary/extra.md mentions its closed-world term "公里"');
+    fs.rmSync(path.join(dir, 'padding', 'diary'), { recursive: true });
+  });
+
+  it('stages padding above fraction 1 and refuses a fraction the padding cannot fill', () => {
+    const pack = loadPack(dir);
+    const two = stageCorpus(pack, { fraction: 2, seed: 1 });
+    expect(two.docs).toHaveLength(24);
+    expect(two.padded).toBe(12);
+    expect(two.tasks.length).toBe(pack.tasks.length);
+    expect(fs.existsSync(path.join(two.dir, 'newsletter'))).toBe(true);
+    two.cleanup();
+    expect(() => stageCorpus(pack, { fraction: 3 })).toThrow(/has 12 padding documents; --fraction 3 needs 24/);
+  });
+
+  it('builds a synthetic life whose corpus-level gold comes from its script', async () => {
+    const out = path.join(tmp, 'synthetic');
+    const logs: string[] = [];
+    const issues = await recipe('synthetic-life-zh').build(out, { author: standInAuthor('zh'), seed: 7, log: (m) => logs.push(m), options: { padding: 2 } });
+    expect(issues.errors).toEqual([]);
+    const pack = loadPack(out);
+    const corpus = pack.tasks.filter((t) => (CORPUS_TASK_TYPES as readonly string[]).includes(t.type));
+    expect(corpus.length).toBeGreaterThanOrEqual(40);
+    for (const type of CORPUS_TASK_TYPES) expect(corpus.some((t) => t.type === type), type).toBe(true);
+    expect(Math.min(...corpus.map((t) => new Set(t.evidence.map((e) => e.doc)).size))).toBeGreaterThanOrEqual(5);
+    expect(pack.tasks.filter((t) => t.type === 'deep-hop').length).toBeGreaterThanOrEqual(4);
+    expect(pack.updates).toEqual(['01', '02', '03', '04']);
+    expect(pack.tasks.filter((t) => t.afterUpdate).map((t) => t.afterUpdate)).toEqual(expect.arrayContaining(['01', '02', '03', '04']));
+    expect(pack.padding.length).toBe(pack.docs.length);
+    // what the script says: the runs of March, the blood-pressure readings, the knee
+    const marchRuns = pack.tasks.find((t) => t.id === 'l-runs-3')!;
+    expect(marchRuns.items!.every((it) => /^\d+公里$/.test(it.label))).toBe(true);
+    expect(pack.tasks.find((t) => t.id === 'n-runs-3')!.answer).toBe(String(marchRuns.items!.length));
+    expect(pack.tasks.find((t) => t.id === 't-bp')!.items!.map((it) => it.label)[0]).toBe('152/96');
+    expect(pack.tasks.find((t) => t.id === 'c-knee')!.items!.map((it) => [it.label, it.docs!.length])).toEqual([['右膝', 1], ['左膝', 4]]);
+  }, 60_000);
+
+  it('asks a week again when its reply is not one JSON object, instead of losing the week', async () => {
+    const inner = standInAuthor('zh');
+    let failed = 0;
+    const flaky = { ...inner, label: 'flaky', model: 'flaky', enabled: true, async completeJson(messages: { role: string; content: string }[]) {
+      if (messages[0].content.includes('realistic personal documents') && messages[1].content.includes('"week":4') && failed++ === 0) throw new Error('Unexpected non-whitespace character after JSON at position 625');
+      return (inner.completeJson as (m: unknown) => Promise<unknown>)(messages);
+    } } as unknown as LlmClient;
+    const out = path.join(tmp, 'synthetic-flaky');
+    const logs: string[] = [];
+    expect((await recipe('synthetic-life-zh').build(out, { author: flaky, seed: 7, log: (m) => logs.push(m), options: {} })).errors).toEqual([]);
+    expect(failed).toBeGreaterThan(1);
+    expect(logs.some((l) => l.includes('in no document'))).toBe(false);
+    expect(loadPack(out).tasks.some((t) => t.id === 'l-runs-3')).toBe(true);
+  }, 60_000);
+
+  it('drops the runs a filler adds to, and keeps the rest', async () => {
+    const out = path.join(tmp, 'synthetic-broken');
+    const logs: string[] = [];
+    await recipe('synthetic-life-zh').build(out, { author: standInAuthor('zh', '晚上又跑了3公里。'), seed: 7, log: (m) => logs.push(m), options: {} });
+    const pack = loadPack(out);
+    expect(pack.tasks.some((t) => /^(l-runs|n-runs|t-long-runs)/.test(t.id))).toBe(false);
+    expect(pack.tasks.some((t) => t.id === 't-bp')).toBe(true);
+    expect(logs.some((l) => l.includes('dropped') && l.includes('3公里'))).toBe(true);
+  }, 60_000);
+
+  it('reads drafted dates loosely and splits a batch whose reply does not parse', async () => {
+    expect(draftedDate('2025-07', undefined)).toBe('2025-07');
+    expect(draftedDate('7月15日', '2025-08-01')).toBe('2025-07-15');
+    expect(draftedDate('2025年第三季度', undefined)).toBe('2025');
+    expect(draftedDate('', '2025-08-01')).toBe('2025-08-01');
+    expect(draftedDate('soon', undefined)).toBeUndefined();
+    const docs = Array.from({ length: 6 }, (_, i) => ({ path: `d${i}.md`, text: `星河资本在第${i}期把目标价定为${100 + i}元。` }));
+    let calls = 0;
+    const author = { label: 'a', model: 'a', enabled: true, async completeJson(messages: { role: string; content: string }[]) {
+      calls++;
+      const paths = [...messages[1].content.matchAll(/path="([^"]+)"/g)].map((m) => m[1]);
+      // a reply for more than two excerpts comes back cut off
+      if (paths.length > 2) throw new Error("Expected ',' or ']' after array element in JSON at position 4796");
+      return { statements: paths.map((p) => ({ doc: p, entity: '星河资本', text: 't', quote: docs.find((d) => d.path === p)!.text.match(/目标价定为\d+元/)![0] })) };
+    } } as unknown as LlmClient;
+    const st = await sweepStatements(author, [{ name: '星河资本', aliases: [], type: 'company', docs: docs.map((d) => d.path) }], docs, { lang: 'zh' });
+    expect(st).toHaveLength(6);
+    expect(calls).toBeGreaterThan(1);
+  });
+
+  it('drafts profiles, timelines, contradictions, aggregates and chains with every quote checked', async () => {
+    const docs = Array.from({ length: 7 }, (_, i) => ({
+      path: `notes/2026-0${i + 1}-01.md`, date: `2026-0${i + 1}-01`,
+      text: `# 第${i + 1}期\n\n星河资本在${i + 1}月把目标价定为${100 + i * 10}元。${i % 2 ? '分析师看多。' : '分析师看空。'}本期还提到了增持计划${i}号。顾明说星河资本的总部在${i < 3 ? '苏州' : '上海'}。`,
+    }));
+    const facts: GoldFact[] = docs.map((d, i) => ({ id: `f${i}`, text: `星河资本目标价${100 + i * 10}元`, doc: d.path, quote: `目标价定为${100 + i * 10}元`, entities: ['星河资本', i < 3 ? '顾明' : '上海', i < 3 ? '苏州' : '增持计划'] }));
+    const author = draftingAuthor(docs);
+    const logs: string[] = [];
+    const tasks = await draftCorpusTasks(author, facts, docs, { lang: 'zh', plan: { profile: 2, timeline: 2, contradiction: 2, aggregate: 2, deep: 2, maxDocs: 10 }, seed: 1, log: (m) => logs.push(m) });
+    const byType = (t: string) => tasks.filter((x) => x.type === t);
+    expect(byType('profile')).toHaveLength(1);
+    expect(byType('timeline')).toHaveLength(1);
+    expect(byType('contradiction')).toHaveLength(1);
+    expect(byType('aggregate')).toHaveLength(1);
+    expect(logs.some((l) => l.includes('(7 quotes not in their document)'))).toBe(true);
+    expect(byType('timeline')[0].items!.map((it) => it.date)).toEqual([...byType('timeline')[0].items!.map((it) => it.date)].sort());
+    expect(byType('contradiction')[0].list?.requireDocs).toBe(true);
+    expect(byType('aggregate')[0].closedWorld?.terms).toEqual(['增持计划']);
+    // a chain whose question names its bridge is not a chain
+    expect(byType('deep-hop').every((t) => !String(t.question).includes('苏州'))).toBe(true);
+    // what was drafted holds up in a pack
+    const out = path.join(tmp, 'drafted');
+    const w = new PackWriter(out, { id: 'drafted', version: 1, title: 't', domain: 'fixture', languages: ['zh'], description: 'd', builder: { recipe: 'test' } });
+    for (const d of docs) w.addDoc({ path: d.path, date: d.date }, d.text);
+    for (const f of facts) w.addFact(f);
+    for (const t of tasks) w.addTask(t);
+    expect(w.finish().errors).toEqual([]);
+  });
+});
+
+describe('extending a built pack', () => {
+  it('adds model-free corpus tasks and padding from a rebuild, leaving the corpus and the other tasks as they are', async () => {
+    const dir = path.join(tmp, 'old-pack');
+    buildFixturePack(dir);
+    // an older pack: no corpus-level tasks, no padding
+    const usage = fs.readFileSync(path.join(dir, 'tasks', 'usage.jsonl'), 'utf8').split('\n').filter((l) => l && !/"type":"(aggregate|timeline|contradiction|profile|deep-hop)"/.test(l));
+    fs.writeFileSync(path.join(dir, 'tasks', 'usage.jsonl'), usage.join('\n') + '\n');
+    fs.rmSync(path.join(dir, 'padding'), { recursive: true });
+    fs.rmSync(path.join(dir, 'padding.jsonl'));
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'pack.json'), 'utf8'));
+    fs.writeFileSync(path.join(dir, 'pack.json'), JSON.stringify({ ...manifest, builder: { ...manifest.builder, recipe: 'fixture-rebuilt' } }));
+    registerRecipe({ id: 'fixture-rebuilt', title: 't', domain: 'fixture', network: false, needsAuthor: false, modelFreeCorpus: true, padding: 'local', build: async (out) => buildFixturePack(out) });
+    const before = loadPack(dir);
+    const logs: string[] = [];
+    const r = await extendPack(dir, { seed: 0, options: {}, log: (m) => logs.push(m), padding: 2 });
+    expect(r.errors).toEqual([]);
+    const after = loadPack(dir);
+    expect(r.added).toBe(6);
+    expect(after.tasks.length).toBe(before.tasks.length + 6);
+    expect(after.docs.map((d) => d.path)).toEqual(before.docs.map((d) => d.path));
+    expect(after.padding).toHaveLength(12);
+    expect(after.manifest.stats?.paddingDocuments).toBe(12);
+    // extending again replaces, never duplicates
+    const again = await extendPack(dir, { seed: 0, options: {}, log: () => {}, padding: 2 });
+    expect(again.errors).toEqual([]);
+    expect(loadPack(dir).tasks.length).toBe(after.tasks.length);
+  });
+});
+
+describe('corpus-level tasks: cost and scale', () => {
+  it('counts the build in correctness per token and in break-even', () => {
+    const perQuery = { p: {
+      'agent-grep': { latencyP50: 0, toolCalls: 0, weightedTokens: 20_000, costUsd: 0, n: 30, capped: 0, leaked: 0, errors: 0 },
+      'agent-wiki': { latencyP50: 0, toolCalls: 0, weightedTokens: 15_000, costUsd: 0, n: 30, capped: 0, leaked: 0, errors: 0 },
+      'agent-wiki-sources': { latencyP50: 0, toolCalls: 0, weightedTokens: 25_000, costUsd: 0, n: 30, capped: 0, leaked: 0, errors: 0 },
+    } };
+    const usage = { p: { 'agent-grep': { correctness: { value: 0.6, n: 30 } }, 'agent-wiki': { correctness: { value: 0.6, n: 30 } }, 'agent-wiki-sources': { correctness: { value: 0.75, n: 30 } } } };
+    const build = { key: 'b', pack: 'p', system: 'llm-wiki', ok: true, ms: 1, usage: { ...emptyUsage(), weightedTokens: 1_000_000 }, stages: {}, bytes: 0, at: '' };
+    const e = efficiencyOf(usage, perQuery, [build]).p;
+    expect(e['agent-grep'].per1k).toBeCloseTo(0.03, 6);
+    expect(e['agent-wiki'].breakEven).toBeCloseTo(200, 6);
+    expect(e['agent-wiki'].amortized['100']).toBeCloseTo(0.6 / 25, 6);
+    expect(e['agent-wiki-sources'].buildTokens).toBe(1_000_000);
+    expect(e['agent-wiki-sources'].breakEven).toBeNull();
+  });
+
+  it('reads runs at two corpus sizes side by side', async () => {
+    const packDir = path.join(tmp, 'scale-pack');
+    buildFixturePack(packDir);
+    const backend = new ScriptedBackend();
+    const judge = scriptedJudge();
+    const embedder = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 64, batchSize: 64, sendDimensions: false });
+    const dirs: string[] = [];
+    for (const fraction of [1, 2]) {
+      const res = await runEval({ packs: [packDir], systems: ['rag-hybrid', 'long-context', 'closed-book'], runDir: path.join(tmp, 'runs', `scale-${fraction}`), quota: false, fraction, types: ['aggregate', 'timeline', 'contradiction', 'profile', 'single-hop'], overrides: { chat: backend, judge, embedder } });
+      dirs.push(res.runDir);
+    }
+    expect(new RunStore(dirs[1]).meta()!.staged!['fixture-life']).toMatchObject({ documents: 24, padded: 12 });
+    expect(new RunStore(dirs[1]).allAnswers().every((a) => ['aggregate', 'timeline', 'contradiction', 'profile', 'single-hop'].includes(loadPack(packDir).tasks.find((t) => t.id === a.taskId)!.type))).toBe(true);
+    const data = buildScaleData(dirs);
+    expect(data['fixture-life']['rag-hybrid'].map((p) => p.fraction)).toEqual([1, 2]);
+    const md = renderScale(data);
+    expect(md).toContain('correctness @2×');
+    expect(md).toContain('24 documents');
+  }, 120_000);
+});
+
+describe('the judge', () => {
+  it('asks a batch again in halves when its reply does not parse, instead of stopping', async () => {
+    let calls = 0;
+    const client = { label: 'j', model: 'j', enabled: true, async completeJson(messages: { role: string; content: string }[]) {
+      calls++;
+      const items = (JSON.parse(messages[1].content) as { items: { id: string }[] }).items;
+      // more than two items: the reply is cut off at its token budget
+      if (items.length > 2) throw new SyntaxError('Unterminated string in JSON at position 699');
+      return { verdicts: items.map((i) => ({ id: i.id, score: 2, keypoints: [], abstained: false, hallucinated: false })) };
+    } } as unknown as LlmClient;
+    const judge = new Judge({ client, meter: new Meter() });
+    const v = await judge.gradeAnswers(Array.from({ length: 8 }, (_, i) => ({ id: `g${i}`, question: 'q', reference: 'r', answer: 'a' })));
+    expect(v.size).toBe(8);
+    expect(calls).toBe(7);
+  });
+});
+
+describe('budgeted model chains', () => {
+  const usage = (input: number, output: number) => ({ inputTokens: input, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: output, reasoningTokens: 0 });
+  const stub = (model: string, behave: () => string) => ({
+    model, label: model, enabled: true, provider: 'stub',
+    async complete(_m: unknown, opts: { onUsage?: (u: ReturnType<typeof usage>) => void } = {}) {
+      opts.onUsage?.(usage(100_000, 10_000));
+      return behave();
+    },
+  }) as unknown as LlmClient;
+
+  it('spends a link down to 95% of its budget, then the next; a spent account is passed over at once', async () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'ledger-'));
+    const ledger = new SpendLedger(path.join(dir, 'spend.jsonl'), path.join(dir, 'budgets.json'), 0);
+    const used: string[] = [];
+    // each call: 100k input at $2/M + 10k output at $10/M = $0.30
+    const chain = new ModelChain([
+      { name: 'openai-api', budget: 1, client: stub('gpt-6.1-sol', () => (used.push('openai'), 'a')) },
+      { name: 'anthropic-api', budget: 1, client: stub('claude-sonnet-5-5', () => { used.push('anthropic'); throw new Error('400 Your credit balance is too low to access the Anthropic API'); }) },
+      { name: 'codex-cli', budget: null, client: stub('gpt-6.1-sol', () => (used.push('codex'), 'c')) },
+    ], ledger);
+    for (let i = 0; i < 5; i++) await chain.asClient().complete([{ role: 'user', content: 'hi' }]);
+    expect(used).toEqual(['openai', 'openai', 'openai', 'openai', 'anthropic', 'codex']);
+    expect(ledger.spent('openai-api')).toBeCloseTo(1.2, 6);
+    // the failed Anthropic call reported usage: it is paid for
+    expect(ledger.spent('anthropic-api')).toBeCloseTo(0.3, 6);
+    // another process reading the same ledger sees what was spent
+    expect(new SpendLedger(ledger.file, ledger.budgetsFile, 0).spent('openai-api')).toBeCloseTo(1.2, 6);
+    const backend = chain.asBackend();
+    expect((await backend.complete({ messages: [{ role: 'user', content: 'x' }], json: false })).text).toBe('c');
+  });
+
+  it('refuses a paid link without a budget and reads budgets from the file', () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'budgets-'));
+    const ledger = new SpendLedger(path.join(dir, 'spend.jsonl'), path.join(dir, 'budgets.json'));
+    const config = { connections: [{ id: 'openai-api', label: 'o', provider: 'openai', baseUrl: 'https://api.example.test/v1', apiKey: 'sk-test', model: 'gpt-6.1-sol', cliPath: '', cliTimeoutMs: 1000 }] } as unknown as KnodeConfig;
+    expect(() => parseChain('openai-api,codex-cli', config, { ledger })).toThrow(/has no budget/);
+    fs.writeFileSync(ledger.budgetsFile, JSON.stringify({ 'openai-api': { usd: 200, since: '2026-11-07' } }));
+    const links = parseChain('openai-api,codex-cli', config, { ledger, model: 'gpt-6.1-sol' });
+    expect(links.map((l) => [l.name, l.budget])).toEqual([['openai-api', 200], ['codex-cli', null]]);
+    expect(links[0].api).toEqual({ baseUrl: 'https://api.example.test/v1', apiKey: 'sk-test', model: 'gpt-6.1-sol' });
+    expect(parseChain('openai-api:50', config, { ledger })[0].budget).toBe(50);
+    expect(() => parseChain('nope', config, { ledger })).toThrow(/no connection "nope"/);
+  });
+
+  it('bills an agent session to an API key through Codex, the key in the environment only', async () => {
+    const bin = fs.mkdtempSync(path.join(tmp, 'argv-codex-'));
+    // a codex that answers with what it was given
+    fs.writeFileSync(path.join(bin, 'codex'), `#!/bin/sh\nexec node -e '
+const a = process.argv.slice(1); const out = a[a.indexOf("--output-last-message") + 1];
+process.stdin.resume(); process.stdin.on("end", () => {
+  require("fs").writeFileSync(out, JSON.stringify({ args: a, key: process.env.KNODE_EVAL_AGENT_API_KEY || null }));
+  console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1000, cached_input_tokens: 0, output_tokens: 100 } }));
+});' -- "$@"\n`);
+    fs.chmodSync(path.join(bin, 'codex'), 0o755);
+    const saved = process.env.PATH;
+    process.env.PATH = `${bin}:${saved}`;
+    const charged: [string, string, number][] = [];
+    setAgentRouting({ pick: () => ({ name: 'openai-api', api: { baseUrl: 'https://api.example.test/v1/', apiKey: 'sk-secret', model: 'gpt-6.1-sol' } }), charge: (n, m, u) => void charged.push([n, m, u?.inputTokens ?? 0]), exhaust: () => {} });
+    try {
+      const cwd = fs.mkdtempSync(path.join(tmp, 'agent-cwd-'));
+      const r = await runAgent({ cwd, prompt: 'hi', sandbox: 'read-only' });
+      const seen = JSON.parse(r.text) as { args: string[]; key: string };
+      expect(seen.key).toBe('sk-secret');
+      expect(seen.args.join(' ')).toContain('model_provider="knode_eval_api"');
+      expect(seen.args.join(' ')).toContain('base_url = "https://api.example.test/v1"');
+      expect(seen.args.join(' ')).not.toContain('sk-secret');
+      expect(charged).toEqual([['openai-api', 'gpt-6.1-sol', 1000]]);
+    } finally {
+      setAgentRouting(null);
+      process.env.PATH = saved;
+    }
+  });
+
+  it('embeds on the endpoint first and on the fallback once it is down; refuses one that does not reproduce', async () => {
+    const make = (name: string, flip = false) => ({ model: 'pool:bge-m3:1024:l2-v1', dimensions: 4, embed: async (t: string[]) => t.map((x) => [x.length, 1, flip ? -2 : 2, 3]), name });
+    let up = true;
+    const endpoint = { ...make('endpoint'), embed: async (t: string[]) => {
+      if (!up) throw new Error('fetch failed: connect ECONNREFUSED 127.0.0.1:12020');
+      return t.map((x) => [x.length, 1, 2, 3]);
+    } };
+    const logs: string[] = [];
+    const e = preferEndpoint(endpoint, make('pool'), (m) => logs.push(m));
+    expect(await e.embed(['ab'])).toEqual([[2, 1, 2, 3]]);
+    up = false;
+    expect(await e.embed(['abc'])).toEqual([[3, 1, 2, 3]]);
+    expect(e.usingFallback()).toBe(true);
+    expect(logs[0]).toContain('unreachable');
+    const packDir = path.join(tmp, 'calibrate-pack');
+    buildFixturePack(packDir);
+    const pack = loadPack(packDir);
+    expect((await calibrateEndpoint(make('a'), make('b'), [pack])).lowest).toBeGreaterThan(0.999);
+    await expect(calibrateEndpoint(make('a'), make('b', true), [pack])).rejects.toThrow(/does not reproduce/);
+  });
+});
+
+describe('a year of weekly reports', () => {
+  it('builds from its script with long-range, five-hop, ambiguous and emergent tasks, and pads at scale', async () => {
+    const out = path.join(tmp, 'reports');
+    const logs: string[] = [];
+    const issues = await recipe('synthetic-reports-zh').build(out, { seed: 0, log: (m) => logs.push(m), options: { scale: 3 } });
+    expect(issues.errors).toEqual([]);
+    const pack = loadPack(out);
+    const pmo = pack.docs.filter((d) => d.kind === 'pmo-summary').length;
+    expect(pmo).toBeGreaterThanOrEqual(9);
+    expect(pack.docs.length).toBe(3 * 44 + pmo);
+    expect(pack.updates).toEqual(['01', '02', '03', '04']);
+    expect(pack.padding.length).toBeGreaterThanOrEqual(pack.docs.length * 2);
+    const corpus = pack.tasks.filter((t) => (CORPUS_TASK_TYPES as readonly string[]).includes(t.type));
+    expect(corpus.length).toBeGreaterThanOrEqual(40);
+    const five = pack.tasks.filter((t) => t.type === 'deep-hop' && t.meta?.hops === 5);
+    expect(five.length).toBeGreaterThanOrEqual(2);
+    expect(five.every((t) => new Set(t.evidence.map((e) => e.doc)).size === 5)).toBe(true);
+    const twins = pack.tasks.find((t) => t.id === 'a-twins')!;
+    expect(new Set(twins.items!.map((i) => i.label)).size).toBe(2);
+    expect(pack.tasks.some((t) => t.id === 'a-renamed') && pack.tasks.some((t) => t.id === 'a-redefined')).toBe(true);
+    // the traceback spans months
+    expect(pack.tasks.filter((t) => t.id.startsWith('r-trace-')).every((t) => Number(t.meta?.span) >= 6)).toBe(true);
+    // attribution excerpts carry style, not names
+    const script = JSON.parse(fs.readFileSync(path.join(out, 'holdout', 'script.json'), 'utf8')) as { people: { name: string }[] };
+    for (const t of pack.tasks.filter((x) => x.type === 'attribution')) {
+      expect(script.people.some((p) => t.question.includes(p.name)), t.id).toBe(false);
+      expect(t.choices).toContain(t.answer);
+    }
+    expect(pack.tasks.filter((t) => t.type === 'style')).toHaveLength(4);
+    expect(pack.tasks.filter((t) => t.type === 'affect')).toHaveLength(9);
+    // what the script says is what the corpus says
+    const mover = pack.tasks.find((t) => t.id === 'r-moved')!;
+    for (const it of mover.items!) expect(it.docs!.every((d) => fs.readFileSync(path.join(out, 'corpus', d), 'utf8').includes(it.label))).toBe(true);
+    const staged = stageCorpus(pack, { fraction: 3 });
+    expect(staged.docs.length).toBe(pack.docs.length * 3);
+    staged.cleanup();
+  });
+
+  it('drafts a field review and promising directions from a research pack and its 2026 holdout', async () => {
+    const out = path.join(tmp, 'research-mini');
+    const w = new PackWriter(out, { id: 'research-ai', version: 1, title: 't', domain: 'research', languages: ['en'], description: 'd', builder: { recipe: 'research-ai' } });
+    for (let i = 0; i < 9; i++) w.addDoc({ path: `papers/${i}.md` }, `# Paper ${i}\n\nWe study ${i < 3 ? 'retrieval agents' : i < 6 ? 'verifiable rewards' : 'tool use'}.`);
+    w.setProfile({ problems: [{ label: 'long-horizon planning', aliases: [] }, { label: 'reward hacking', aliases: [] }, { label: 'evaluation contamination', aliases: [] }] });
+    w.addHoldout('papers-2026.json', JSON.stringify(Array.from({ length: 8 }, (_, i) => ({ id: `h${i}`, title: `H${i}`, abstract: 'x' }))));
+    w.finish();
+    const author = {
+      label: 'a', model: 'a', enabled: true,
+      async completeJson(messages: { role: string; content: string }[]) {
+        const sys = messages[0].content;
+        if (sys.startsWith('For each paper, name')) return { papers: [...messages[1].content.matchAll(/path="([^"]+)"/g)].map((m) => ({ paper: m[1], approach: Number(m[1].match(/\d/)![0]) < 3 ? 'retrieval agents' : Number(m[1].match(/\d/)![0]) < 6 ? 'verifiable rewards' : 'tool use' })) };
+        if (sys.startsWith('Group these papers')) return { lines: [{ label: 'retrieval agents', papers: ['papers/0.md', 'papers/1.md', 'papers/2.md'] }, { label: 'verifiable rewards', papers: ['papers/3.md', 'papers/4.md', 'papers/5.md'] }, { label: 'tool use', papers: ['papers/6.md', 'papers/7.md', 'papers/8.md', 'papers/nope.md'] }] };
+        if (sys.startsWith('Each abstract is from a 2026 paper')) return { matches: [0, 1, 2, 3].flatMap((i) => [{ paper: `h${i}`, problem: 1 }, { paper: `h${i + 4}`, problem: 0 }]) };
+        return {};
+      },
+    } as unknown as LlmClient;
+    const tasks = await researchEmergence(loadPack(out), { author, seed: 0, log: () => {}, options: {} });
+    expect(tasks.map((t) => t.id).sort()).toEqual(['emerge-promising', 'emerge-review', 'emerge-review-lines']);
+    expect(tasks.find((t) => t.id === 'emerge-review-lines')!.items!.find((i) => i.label === 'tool use')!.docs).toHaveLength(3);
+    expect(tasks.find((t) => t.id === 'emerge-promising')!.items!.map((i) => i.label).sort()).toEqual(['long-horizon planning', 'reward hacking']);
   });
 });

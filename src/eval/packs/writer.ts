@@ -11,6 +11,8 @@ import { CorpusDoc, GoldAlias, GoldFact, GoldLink, PackManifest, SourceRecord, T
  */
 export class PackWriter {
   private docs: CorpusDoc[] = [];
+  private padding: CorpusDoc[] = [];
+  private paddingChars = 0;
   private facts: GoldFact[] = [];
   private links: GoldLink[] = [];
   private aliases: GoldAlias[] = [];
@@ -67,6 +69,28 @@ export class PackWriter {
     fs.writeFileSync(file, text);
   }
 
+  /**
+   * A document only scale curves stage (`--fraction` above 1, padding/<path>):
+   * more of the same kind of source, which must leave every closed-world
+   * task's gold as it is (validatePack checks its terms and prefixes).
+   */
+  addPadding(doc: CorpusDoc, text: string): void {
+    const file = path.join(this.dir, 'padding', doc.path);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, text);
+    this.padding.push(doc);
+    this.paddingChars += text.length;
+  }
+
+  get docCount(): number {
+    return this.docs.length;
+  }
+
+  /** Tasks added so far (a recipe choosing padding reads their closed-world terms). */
+  get taskList(): readonly Task[] {
+    return this.tasks;
+  }
+
   /** Material no system may see (future events, the rename map, later papers). */
   addHoldout(p: string, text: string): void {
     const file = path.join(this.dir, 'holdout', p);
@@ -80,6 +104,7 @@ export class PackWriter {
 
   finish(): PackIssues {
     writeJsonl(path.join(this.dir, 'corpus.jsonl'), this.docs);
+    if (this.padding.length) writeJsonl(path.join(this.dir, 'padding.jsonl'), this.padding);
     writeJsonl(path.join(this.dir, 'gold', 'facts.jsonl'), this.facts);
     writeJsonl(path.join(this.dir, 'gold', 'links.jsonl'), this.links);
     writeJsonl(path.join(this.dir, 'gold', 'aliases.jsonl'), this.aliases);
@@ -91,7 +116,7 @@ export class PackWriter {
       ...this.manifest,
       builder: { recipe: this.manifest.builder.recipe, options: this.manifest.builder.options ?? {}, builtAt: new Date().toISOString() },
       sources: this.sources,
-      stats: { documents: this.docs.length, chars: this.chars, tasks: this.tasks.length, facts: this.facts.length },
+      stats: { documents: this.docs.length, chars: this.chars, tasks: this.tasks.length, facts: this.facts.length, ...(this.padding.length ? { paddingDocuments: this.padding.length, paddingChars: this.paddingChars } : {}) },
     });
     return validatePack(loadPack(this.dir));
   }

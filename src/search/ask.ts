@@ -2,53 +2,29 @@ import { KnodeConfig } from '../config.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
-import { toDateString } from '../store/temporal.js';
 import { ClaimItem, SearchResult } from '../types.js';
 import { graphSearch } from '../graph/query.js';
+import { EXCERPT_CHARS, excerptsForQuestion, isListQuestion } from './excerpts.js';
+import { factsForQuestion, namedEntities, namedSurface, QuestionFact } from './facts.js';
 import { search, SearchMode } from './search.js';
 
 export interface AskResult {
   answer: string;
+  /** What the answer cited: a retrieved chunk, or a known fact by its source (then `chunkId` is the chunk it was read from, '' when that is gone). */
   citations: { ref: number; path: string; chunkId: string }[];
   gaps: string[];
   contexts: SearchResult[];
   facts: ClaimItem[];
 }
 
-const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are given retrieved context chunks, each tagged [n], and optionally a "Known facts" list of extracted claims.
+const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are given retrieved context chunks, each tagged [n] — one marked "excerpt" holds only the lines of its document that name what the question asks about — and optionally a "Known facts" list: claims extracted from the whole knowledge base, each tagged [n] too, with its date and the document it comes from. The facts reach documents the chunks do not; a question that asks for every case, a list or a history is answered from both.
 
 Rules:
 - Answer in the question's language, concise but complete.
-- Cite evidence inline as [n] after the claims it supports. Only cite chunks you actually used.
+- Cite evidence inline as [n] after the claims it supports. Only cite chunks and facts you actually used.
 - Known facts marked [suspected] or [disputed] are unverified — if you use one, explicitly flag the uncertainty in your answer. One marked [opinion], [prediction] or [rumor] is a view, a forecast or hearsay from the sources, not an established fact: say so when you use it.
 - If the context is insufficient or contradictory, say so explicitly.
 - End with a JSON line: {"citations":[n,...],"gaps":["what the knowledge base is missing to answer better", ...]} (gaps may be empty).`;
-
-/** Claims about entities mentioned in the retrieved chunks — structured evidence for the answer. */
-async function factsForContexts(store: Store, chunkIds: string[], limit = 8): Promise<ClaimItem[]> {
-  if (chunkIds.length === 0) return [];
-  const ph = chunkIds.map((_, i) => `$${i + 1}`).join(',');
-  const rows = await store.query<{
-    id: string; subject: string; object: string | null; type: string; statement: string;
-    status: string; kind: string; valid_from: string | null; valid_to: string | null; path: string | null; evidence_count: number;
-  }>(
-    `SELECT DISTINCT cl.id, se.name AS subject, oe.name AS object, cl.type, cl.statement,
-            cl.status, cl.kind, cl.valid_from, cl.valid_to, s.key AS path, cl.evidence_count
-     FROM entity_mentions m
-     JOIN claims cl ON cl.subject_id = m.entity_id AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
-     JOIN entities se ON se.id = cl.subject_id AND se.tx_to IS NULL
-     LEFT JOIN entities oe ON oe.id = cl.object_id
-     LEFT JOIN scopes s ON s.id = cl.primary_scope_id
-     WHERE m.chunk_id IN (${ph})
-     LIMIT $${chunkIds.length + 1}`,
-    [...chunkIds, limit],
-  );
-  return rows.map((r) => ({
-    id: r.id, subject: r.subject, object: r.object, type: r.type, statement: r.statement,
-    status: r.status, kind: r.kind, startDate: toDateString(r.valid_from), endDate: toDateString(r.valid_to), path: r.path,
-    evidenceCount: r.evidence_count,
-  }));
-}
 
 /** `[fact]` / `[suspected]` for a fact; a view, forecast or rumour is tagged by its kind, with the status when hedged. */
 export function claimTag(c: { status: string; kind?: string | null }): string {
@@ -57,11 +33,13 @@ export function claimTag(c: { status: string; kind?: string | null }): string {
   return c.status === 'fact' ? kind : `${kind}, ${c.status}`;
 }
 
-function renderFacts(facts: ClaimItem[]): string {
+/** The facts as the prompt lists them: numbered on from the chunks, each with its tag, date and source. */
+function renderFacts(facts: ClaimItem[], firstRef: number): string {
   if (facts.length === 0) return '';
-  const lines = facts.map((f) => {
+  const lines = facts.map((f, i) => {
     const period = f.startDate || f.endDate ? ` (${f.startDate ?? '?'} ~ ${f.endDate ?? ''})` : '';
-    return `- [${claimTag(f)}] ${f.statement}${period}`;
+    const when = f.eventDate ? ` (${f.eventDate})` : period;
+    return `[${firstRef + i}] [${claimTag(f)}] ${f.statement}${when}${f.path ? ` — ${f.path}` : ''}`;
   });
   return `\n\n# Known facts\n${lines.join('\n')}`;
 }
@@ -77,17 +55,42 @@ export async function ask(
   embedder: EmbeddingProvider,
   llm: LlmClient,
   question: string,
-  opts: { k?: number; mode?: SearchMode } = {},
+  opts: { k?: number; mode?: SearchMode; /** The question's embedding, when the caller has it already. */ queryVector?: number[]; /** Known facts listed at most (default 24). */ facts?: number; /** Characters of excerpts for a list question at most (default `EXCERPT_CHARS`; 0 for none). */ excerpts?: number } = {},
 ): Promise<AskResult> {
   const k = opts.k ?? 8;
   const mode = opts.mode ?? 'hybrid';
-  const [retrieved, graph] = await Promise.all([
-    search(store, embedder, question, { k, mode, heat: config.heat, sag: config.retrieval.sag }),
+  // embedded once, for the search and for ranking the facts; a provider that cannot serve it leaves both to their other signals
+  let queryVector = opts.queryVector;
+  if (!queryVector && mode !== 'keyword') {
+    try {
+      queryVector = (await embedder.embed([question]))[0];
+    } catch {
+      queryVector = undefined;
+    }
+  }
+  const [retrieved, graph, named] = await Promise.all([
+    search(store, embedder, question, { k, mode, heat: config.heat, sag: config.retrieval.sag, queryVector }),
     graphSearch(store, question, { depth: 2, chunkLimit: 4, heat: config.heat }),
+    namedEntities(store, question),
   ]);
   const seen = new Set(retrieved.map((r) => r.chunkId));
-  const contexts = [...retrieved, ...graph.chunks.filter((c) => !seen.has(c.chunkId))].slice(0, k + 4);
-  const facts = await factsForContexts(store, contexts.map((c) => c.chunkId));
+  const found = [...retrieved, ...graph.chunks.filter((c) => !seen.has(c.chunkId))].slice(0, k + 4);
+  // a question asking for every case is answered from many documents: more kinds of fact, and the lines of
+  // further documents that name what it asks about
+  const list = isListQuestion(question);
+  const excerptBudget = list ? (opts.excerpts ?? EXCERPT_CHARS) : 0;
+  const [facts, excerpts]: [QuestionFact[], SearchResult[]] = await Promise.all([
+    factsForQuestion(store, question, found, { limit: opts.facts, queryVector, model: embedder.model, named, list }),
+    excerptBudget > 0
+      ? namedSurface(store, named).then((s) => excerptsForQuestion(store, question, found, { budget: excerptBudget, names: s.names, namedDocs: s.docs }))
+      : Promise.resolve([]),
+  ]);
+  const contexts = [...found, ...excerpts];
+  // what a reference number stands for: the chunks first, then the facts
+  const refs = [
+    ...contexts.map((c) => ({ path: c.path, chunkId: c.chunkId })),
+    ...facts.map((f) => ({ path: f.path ?? '', chunkId: f.chunkId ?? '' })),
+  ];
 
   if (!llm.enabled) {
     return {
@@ -100,11 +103,11 @@ export async function ask(
   }
 
   const contextBlock = contexts
-    .map((c, i) => `[${i + 1}] (${c.path})\n${c.content.slice(0, 1500)}`)
+    .map((c, i) => `[${i + 1}] (${c.path}${c.excerpt ? ', excerpt' : ''})\n${c.content.slice(0, 1500)}`)
     .join('\n\n');
   const raw = await llm.complete([
     { role: 'system', content: ASK_SYSTEM },
-    { role: 'user', content: `# Context\n${contextBlock}${renderFacts(facts)}\n\n# Question\n${question}` },
+    { role: 'user', content: `# Context\n${contextBlock}${renderFacts(facts, contexts.length + 1)}\n\n# Question\n${question}` },
   ], { maxTokens: 1500 });
 
   let answer = raw.trim();
@@ -114,7 +117,7 @@ export async function ask(
   if (jsonMatch) {
     try {
       const meta = JSON.parse(jsonMatch[0]) as { citations?: number[]; gaps?: string[] };
-      cited = (meta.citations ?? []).filter((n) => Number.isInteger(n) && n >= 1 && n <= contexts.length);
+      cited = (meta.citations ?? []).filter((n) => Number.isInteger(n) && n >= 1 && n <= refs.length);
       gaps = (meta.gaps ?? []).map(String).slice(0, 5);
       answer = answer.slice(0, jsonMatch.index).trim();
     } catch {
@@ -122,11 +125,12 @@ export async function ask(
     }
   }
   if (cited.length === 0) {
-    cited = [...new Set([...answer.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])))].filter((n) => n >= 1 && n <= contexts.length);
+    cited = [...new Set([...answer.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])))].filter((n) => n >= 1 && n <= refs.length);
   }
   return {
     answer,
-    citations: cited.map((n) => ({ ref: n, path: contexts[n - 1].path, chunkId: contexts[n - 1].chunkId })),
+    // a fact whose source is no longer known has nothing to cite
+    citations: cited.filter((n) => refs[n - 1].path).map((n) => ({ ref: n, ...refs[n - 1] })),
     gaps,
     contexts,
     facts,

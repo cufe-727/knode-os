@@ -7,6 +7,7 @@ import { Params, TimeInput, rowLiveAt, toIso, toDateString } from '../store/temp
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { boostByHeat, recordChunkHits } from '../stats/heat.js';
 import { SearchResult } from '../types.js';
+import { longestSpans, spellingSpans, weakSpelling } from '../graph/normalize.js';
 
 export type SearchMode = 'hybrid' | 'vector' | 'keyword' | 'sag';
 
@@ -27,6 +28,8 @@ export interface SearchOptions {
   filter?: ResolvedScopeFilter;
   /** Give every result its rank in each recall channel (`SearchResult.ranks`), for a view that shows why it matched. */
   explain?: boolean;
+  /** Fusion weight per recall channel, over `FUSION_WEIGHTS`; 0 leaves a channel out of the ranking. For measuring a channel's worth. */
+  weights?: Partial<Record<SearchChannelName, number>>;
 }
 
 /** What one recall channel of a hybrid search found, and how long it took. */
@@ -63,10 +66,47 @@ const CJK_QUERY_STOP = new Set([
 ]);
 
 /**
- * Terms for substring-based recall (keyword ILIKE fallback + graph entity
- * matching). Whitespace tokens cover Latin; CJK runs — which carry no spaces,
- * so a natural-language question would never match as a whole — are broken
- * into overlapping bigrams with question-word stopwords removed.
+ * English function and question words: in a natural-language question they
+ * are most of the tokens, hold nothing to look for, and as substrings ("is",
+ * "on", "the") sit in nearly every chunk and many entity names. A token
+ * written in capitals stays (US, IT, WHO are names).
+ */
+const LATIN_QUERY_STOP = new Set([
+  'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'from', 'by', 'with', 'about', 'as', 'into', 'than', 'between', 'during',
+  'and', 'or', 'but', 'not', 'no', 'nor', 'if', 'then', 'so', 'such', 'also', 'both', 'either', 'each', 'any', 'all', 'some',
+  'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am', 'do', 'does', 'did', 'done', 'has', 'have', 'had', 'having',
+  'will', 'would', 'can', 'could', 'should', 'may', 'might', 'must', 'shall',
+  'this', 'that', 'these', 'those', 'it', 'its', 'they', 'them', 'their', 'he', 'she', 'his', 'her', 'him', 'we', 'us', 'our', 'you', 'your', 'my', 'me',
+  'who', 'whom', 'whose', 'what', 'which', 'when', 'where', 'why', 'how', 'there', 'here',
+]);
+
+/**
+ * The Latin tokens of a query worth looking for: runs of [a-zA-Z0-9_.$-]
+ * without the punctuation a sentence leaves at their ends ("show." would only
+ * match before a full stop), stopwords dropped, each spelling once. A word the
+ * query excludes (`-word`) is not one to look for.
+ */
+function latinTokens(query: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of query.matchAll(/[a-zA-Z0-9_.$-]{2,}/g)) {
+    if (/^-[a-zA-Z0-9]/.test(m[0]) && (m.index === 0 || /\s/.test(query[m.index - 1]))) continue;
+    const t = m[0].replace(/^[._-]+|[._$-]+$/g, '');
+    if (t.length < 2) continue;
+    const k = t.toLowerCase();
+    if (seen.has(k)) continue;
+    if (LATIN_QUERY_STOP.has(k) && t !== t.toUpperCase()) continue;
+    seen.add(k);
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * Terms for substring-based recall (graph entity matching, SAG, explore).
+ * Whitespace tokens cover Latin; CJK runs — which carry no spaces, so a
+ * natural-language question would never match as a whole — are broken into
+ * overlapping bigrams with question-word stopwords removed.
  */
 export function queryTerms(query: string, max = 8): string[] {
   const terms: string[] = [];
@@ -79,7 +119,7 @@ export function queryTerms(query: string, max = 8): string[] {
     }
   };
 
-  for (const m of query.matchAll(/[a-zA-Z0-9_.$-]{2,}/g)) push(m[0]);
+  for (const t of latinTokens(query)) push(t);
 
   const bigrams = new Map<string, number>();
   for (const run of query.matchAll(/[一-鿿㐀-䶿]{2,}/g)) {
@@ -95,6 +135,30 @@ export function queryTerms(query: string, max = 8): string[] {
     push(b);
   }
   return terms.slice(0, max);
+}
+
+/** Terms the keyword channel scores at most: a pasted paragraph is read by its first ones. */
+const KEYWORD_TERMS_MAX = 24;
+
+/**
+ * Every term the keyword channel scores a chunk by, lowercased: the Latin
+ * tokens, and each CJK run as its bigrams (a run of up to four characters
+ * also whole, so the chunk that spells the name outranks one holding its
+ * halves apart). Unlike `queryTerms` it keeps them all, in query order: which
+ * of them matter is decided by how rare each is in the corpus.
+ */
+export function keywordTerms(query: string, max = KEYWORD_TERMS_MAX): string[] {
+  const terms = new Set<string>();
+  for (const t of latinTokens(query)) terms.add(t.toLowerCase());
+  for (const run of query.matchAll(/[一-鿿㐀-䶿]{2,}/g)) {
+    const s = run[0];
+    if (s.length <= 4 && !CJK_QUERY_STOP.has(s)) terms.add(s);
+    for (let i = 0; i + 2 <= s.length; i++) {
+      const b = s.slice(i, i + 2);
+      if (!CJK_QUERY_STOP.has(b)) terms.add(b);
+    }
+  }
+  return [...terms].slice(0, max);
 }
 
 /**
@@ -166,7 +230,91 @@ export function websearchText(query: string): string {
   return query.replace(/-{2,}|-(?![\p{L}\p{N}])/gu, ' ');
 }
 
-/** Keyword recall: Postgres FTS, with a substring fallback that covers CJK queries. */
+/** Terms whose chunks are listed as candidates: the rarest ones. */
+const KEYWORD_FETCH_TERMS = 8;
+/** A term found in this many chunks is counted, and listed, no further. */
+const KEYWORD_DF_CAP = 1000;
+const BM25_K1 = 1.2;
+const BM25_B = 0.75;
+
+const chunkTotals = new WeakMap<object, { n: number; at: number }>();
+
+/** How many chunks the index holds, counted at most once a minute per store. */
+async function chunkTotal(store: Store): Promise<number> {
+  const hit = chunkTotals.get(store);
+  if (hit && Date.now() - hit.at < 60_000) return hit.n;
+  const [row] = await store.query<{ n: number }>(`SELECT count(*)::int AS n FROM chunks`);
+  const n = row?.n ?? 0;
+  chunkTotals.set(store, { n, at: Date.now() });
+  return n;
+}
+
+const isAlnum = (ch: string | undefined) => ch !== undefined && ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'));
+
+/**
+ * How often `term` occurs in lowercased `text`. A CJK term counts wherever it
+ * stands. A Latin one must start a word, and end one too when it is short or
+ * a number ("ai" is not in "aim", "2026" not in "20261"); a longer word also
+ * counts with an ending on it (limit: limits, limited).
+ */
+export function termCount(text: string, term: string): number {
+  const cjk = term.charCodeAt(0) >= 0x3400;
+  const whole = !cjk && (term.length < 4 || /^[\d.,_-]+$/.test(term));
+  let n = 0;
+  for (let i = text.indexOf(term); i >= 0; i = text.indexOf(term, i + term.length)) {
+    if (cjk) n++;
+    else if (!(isAlnum(term[0]) && isAlnum(text[i - 1])) && !(whole && isAlnum(term[term.length - 1]) && isAlnum(text[i + term.length]))) n++;
+  }
+  return n;
+}
+
+const idfOf = (df: number, total: number) => Math.log(1 + (Math.max(total, df) - df + 0.5) / (df + 0.5));
+
+/**
+ * BM25 over `rows` for weighted `terms`, best first, ties by id; rows holding
+ * none of the terms are left out. Length is in characters against the rows'
+ * own average: the chunker keeps chunks near one size, so what this corrects
+ * is the short tail of a document against a full chunk.
+ */
+function rankBm25(rows: RankedChunk[], terms: { term: string; idf: number }[]): RankedChunk[] {
+  if (rows.length === 0) return rows;
+  const avg = rows.reduce((sum, r) => sum + r.content.length, 0) / rows.length || 1;
+  const scored: RankedChunk[] = [];
+  for (const r of rows) {
+    const text = r.content.toLowerCase();
+    const norm = BM25_K1 * (1 - BM25_B + (BM25_B * r.content.length) / avg);
+    let score = 0;
+    for (const t of terms) {
+      const tf = termCount(text, t.term);
+      if (tf > 0) score += (t.idf * tf * (BM25_K1 + 1)) / (tf + norm);
+    }
+    if (score > 0) scored.push({ ...r, raw: score });
+  }
+  return scored.sort((a, b) => b.raw - a.raw || (a.chunk_id < b.chunk_id ? -1 : a.chunk_id > b.chunk_id ? 1 : 0));
+}
+
+/** A quoted phrase or an excluded word: the asker's own filter, which full-text search applies and BM25 does not. */
+const hasSearchOperators = (query: string) => /"[^"]+"|(^|\s)-[\p{L}\p{N}]/u.test(query);
+
+/**
+ * Keyword recall: BM25 over the chunks that hold the query's terms.
+ *
+ * The terms are the query's words and CJK bigrams without stopwords
+ * (`keywordTerms`), each weighted by how rare it is in the corpus. Candidates
+ * come from two index lookups: full-text search for the chunks holding every
+ * word, and `listedCandidates` for the chunks holding the rarest terms. BM25
+ * then orders them, so a chunk with the one rare name the question turns on
+ * outranks chunks that repeat its common words — which counting matched
+ * terms, with ties by id, could not do: on the benchmark's English multi-hop
+ * questions (MuSiQue, on the workspace the 2026-11 pilot built) this channel
+ * alone found 8% of the gold documents in its top five where BM25 over the
+ * same text finds 36%; it now finds 39%.
+ *
+ * A query with a quoted phrase or an excluded word keeps what full-text
+ * search matched in front, in its order. Until the gram index is ready, one
+ * scan finds the candidates and the terms are weighted by how rare they are
+ * among those.
+ */
 async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
   const p = new Params([websearchText(query)]);
   const cond = docLiveAt('d', p, asOf, filter);
@@ -181,67 +329,151 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
      LIMIT ${lim}`,
     p.list,
   );
-  if (fts.length >= Math.min(3, k)) return fts;
 
-  // CJK or rare terms: substring fallback, ranked by how many query terms hit
-  const terms = queryTerms(query);
+  const terms = keywordTerms(query);
   if (terms.length === 0) return fts;
-  const like = await substringSearch(store, terms, k, asOf, filter);
+  const size = Math.max(k * 4, 120);
+  let weighted: { term: string; idf: number | null }[];
+  let like: RankedChunk[];
+  if (matchIndexReady(store, 'chunks') && terms.every((t) => termGrams(t).length > 0)) {
+    const total = await chunkTotal(store);
+    const lists = await termLists(store, terms, asOf, filter);
+    // a term no chunk holds finds nothing and weighs nothing
+    weighted = terms.map((term, i) => ({ term, idf: lists.df[i] > 0 ? idfOf(lists.df[i] >= KEYWORD_DF_CAP ? Math.max(KEYWORD_DF_CAP, Math.round(Math.sqrt(KEYWORD_DF_CAP * Math.max(total, KEYWORD_DF_CAP)))) : lists.df[i], total) : 0 }));
+    like = await listedCandidates(store, terms, weighted.map((t) => t.idf ?? 0), lists, size, asOf, filter);
+    weighted = weighted.filter((t) => t.idf !== 0);
+  } else {
+    weighted = terms.map((term) => ({ term, idf: null }));
+    like = await scannedCandidates(store, terms.slice(0, KEYWORD_FETCH_TERMS), size, asOf, filter);
+  }
+
   const seen = new Set(fts.map((r) => r.chunk_id));
-  return [...fts, ...like.filter((r) => !seen.has(r.chunk_id))].slice(0, k);
+  const pool = [...fts, ...like.filter((r) => !seen.has(r.chunk_id))];
+  // uncounted terms take their weight from the candidates themselves: rare among them, rare enough
+  const lowered = weighted.some((t) => t.idf === null) ? pool.map((r) => r.content.toLowerCase()) : [];
+  const scoredTerms = weighted.map((t) => ({
+    term: t.term,
+    idf: t.idf ?? idfOf(lowered.filter((text) => termCount(text, t.term) > 0).length, pool.length),
+  }));
+  const ranked = rankBm25(pool, scoredTerms);
+  if (!hasSearchOperators(query)) return ranked.slice(0, k);
+  return [...fts, ...ranked.filter((r) => !seen.has(r.chunk_id))].slice(0, k);
+}
+
+const CANDIDATE_COLUMNS = `c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content`;
+
+interface TermLists {
+  /** Chunks holding each term, counted up to `KEYWORD_DF_CAP`. */
+  df: number[];
+  /** The live chunks of the `KEYWORD_FETCH_TERMS` rarest terms: term index, chunk id. */
+  listed: { i: number; id: string }[];
+  /** The terms whose chunks are in `listed`. */
+  picked: number[];
 }
 
 /**
- * The `k` chunks holding the most of `terms` as case-insensitive substrings,
- * `raw` = how many they hold, ordered by it and then by id.
+ * Each term's chunks, read off the gram index (store/grams.ts) once, at most
+ * `KEYWORD_DF_CAP` per term: how many there are (a count stopped at the cap
+ * means "common"), and for the rarest terms which they are, among documents
+ * live and in scope. The index holds a superset of the substring matches (a
+ * Latin term's trigrams can sit in different words), near enough for a weight
+ * and corrected when the text is scored.
  *
- * Through the gram index (store/grams.ts) this asks for the chunks holding
- * all n terms, then at least n-1, and so on, each tier one index scan with
- * LIMIT k under a UNION ALL that stops as soon as k rows are in: a tier only
- * runs while the tiers above it had fewer than k rows between them, so it
- * returns no row they hold, and none returns more than k. A query whose
- * common terms hold a quarter of all chunks ("2026", "AI") no longer reads
- * them: on a copy of finance (374k chunks) the 43 agent queries of a benchmark
- * that reach this took 10.7 s at the median and 12.6 s at worst as one ILIKE
- * scan, 42 ms and 237 ms this way. Of the chunks tying at the last tier, the
- * index's order picks which come in, where the scan's planner order did. Until
- * the index is ready, one scan counts every chunk's terms (5–6.5 s there).
+ * The index lookups run in a materialized CTE, away from the join with
+ * `documents`. Joined directly, a planner without statistics (PGlite never
+ * analyzes) starts from `documents` and evaluates `match_grams` on every
+ * chunk as a filter: 1,050 ms for a lookup the index answers in 3 ms on 1,759
+ * chunks.
  */
-async function substringSearch(store: Store, terms: string[], k: number, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
-  const grams = terms.map(termGrams);
-  const p = new Params([terms.map((t) => t.toLowerCase())]);
-  // lower() once per chunk, then one strpos per term: the ILIKE this replaces lowercased the text once per term
-  const hits = `(SELECT count(*) FROM (SELECT lower(c.content) AS l OFFSET 0) x, unnest($1::text[]) t WHERE strpos(x.l, t) > 0)`;
+async function termLists(store: Store, terms: string[], asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<TermLists> {
+  const p = new Params();
+  const expr = MATCH_INDEXES.chunks.expr('c');
+  const cap = p.add(KEYWORD_DF_CAP);
+  const lists = terms.map((t, i) => `(SELECT ${i} AS i, c.id, c.document_id FROM chunks c WHERE ${expr} @@ ${p.add(gramQuery([termGrams(t)], 1))}::tsquery LIMIT ${cap})`);
+  const fetch = p.add(KEYWORD_FETCH_TERMS);
   const cond = docLiveAt('d', p, asOf, filter);
-  const lim = p.add(k);
-  const columns = `c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content`;
-  if (!matchIndexReady(store, 'chunks') || grams.some((g) => g.length === 0)) {
-    return store.query<RankedChunk>(
-      `SELECT * FROM (
-         SELECT ${columns}, ${hits}::float AS raw
-         FROM chunks c JOIN documents d ON d.id = c.document_id
-         WHERE ${cond}
-         OFFSET 0
-       ) scored
-       WHERE raw > 0
-       ORDER BY raw DESC, chunk_id
-       LIMIT ${lim}`,
+  const rows = await store.query<{ i: number; id: string | null; df: number | null }>(
+    `WITH hit AS MATERIALIZED (${lists.join(' UNION ALL ')}),
+          n AS MATERIALIZED (SELECT i, count(*)::int AS df FROM hit GROUP BY i),
+          pick AS MATERIALIZED (SELECT i FROM n ORDER BY df, i LIMIT ${fetch})
+     SELECT n.i, NULL::text AS id, n.df FROM n
+     UNION ALL
+     SELECT h.i, h.id, NULL::int AS df
+     FROM hit h JOIN pick ON pick.i = h.i JOIN documents d ON d.id = h.document_id
+     WHERE ${cond}`,
+    p.list,
+  );
+  const df = terms.map(() => 0);
+  const listed: { i: number; id: string }[] = [];
+  for (const r of rows) {
+    if (r.id === null) df[r.i] = r.df ?? 0;
+    else listed.push({ i: r.i, id: r.id });
+  }
+  const picked = df.map((n, i) => ({ n, i })).filter((x) => x.n > 0).sort((a, b) => a.n - b.n || a.i - b.i).slice(0, KEYWORD_FETCH_TERMS).map((x) => x.i);
+  return { df, listed, picked };
+}
+
+/**
+ * About `pool` chunks worth scoring: the ones the listed terms weigh the most
+ * in together. A chunk is put forward by the summed weight of the terms whose
+ * lists hold it — BM25 with every count taken as one, which is what an
+ * inverted index can say before any text is read — and the text of the best
+ * `pool` is fetched for the caller to score exactly.
+ *
+ * A list cut at the cap holds some of its term's chunks, so two such terms
+ * would meet in a chunk only by chance: when one of the picked terms is that
+ * common, the chunks holding all of them are asked for as well.
+ */
+async function listedCandidates(
+  store: Store,
+  terms: string[],
+  idf: number[],
+  lists: TermLists,
+  pool: number,
+  asOf?: TimeInput,
+  filter?: ResolvedScopeFilter,
+): Promise<RankedChunk[]> {
+  const weight = new Map<string, number>();
+  for (const r of lists.listed) weight.set(r.id, (weight.get(r.id) ?? 0) + idf[r.i]);
+  if (lists.picked.length > 1 && lists.picked.some((i) => lists.df[i] >= KEYWORD_DF_CAP)) {
+    const p = new Params([gramQuery(lists.picked.map((i) => termGrams(terms[i])), lists.picked.length)]);
+    const lim = p.add(pool);
+    const cond = docLiveAt('d', p, asOf, filter);
+    const all = lists.picked.reduce((sum, i) => sum + idf[i], 0);
+    const rows = await store.query<{ id: string }>(
+      `WITH hit AS MATERIALIZED (SELECT c.id, c.document_id FROM chunks c WHERE ${MATCH_INDEXES.chunks.expr('c')} @@ $1::tsquery LIMIT ${lim})
+       SELECT h.id FROM hit h JOIN documents d ON d.id = h.document_id WHERE ${cond}`,
       p.list,
     );
+    for (const r of rows) weight.set(r.id, all);
   }
-  const tiers: string[] = [];
-  for (let m = terms.length; m >= 1; m--) {
-    const q = p.add(gramQuery(grams, m));
-    tiers.push(
-      `(SELECT ${columns}, ${m}::float AS raw
-        FROM chunks c JOIN documents d ON d.id = c.document_id
-        WHERE ${MATCH_INDEXES.chunks.expr('c')} @@ ${q}::tsquery AND ${hits} = ${m} AND ${cond}
-        LIMIT ${lim})`,
-    );
-  }
+  const ids = [...weight.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, pool).map(([id]) => id);
+  if (ids.length === 0) return [];
   return store.query<RankedChunk>(
-    `SELECT * FROM (SELECT * FROM (${tiers.join(' UNION ALL ')}) tiers LIMIT ${lim}) top
-     ORDER BY raw DESC, chunk_id`,
+    `SELECT ${CANDIDATE_COLUMNS}, 0::float AS raw
+     FROM chunks c JOIN documents d ON d.id = c.document_id
+     WHERE c.id = ANY($1::text[])`,
+    [ids],
+  );
+}
+
+/** The `pool` chunks holding the most of `terms` as substrings, by one scan: what answers while the gram index is being built. */
+async function scannedCandidates(store: Store, terms: string[], pool: number, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
+  const p = new Params([terms.map((t) => t.toLowerCase())]);
+  // lower() once per chunk, then one strpos per term
+  const hits = `(SELECT count(*) FROM (SELECT lower(c.content) AS l OFFSET 0) x, unnest($1::text[]) t WHERE strpos(x.l, t) > 0)`;
+  const cond = docLiveAt('d', p, asOf, filter);
+  const lim = p.add(pool);
+  return store.query<RankedChunk>(
+    `SELECT * FROM (
+       SELECT ${CANDIDATE_COLUMNS}, ${hits}::float AS raw
+       FROM chunks c JOIN documents d ON d.id = c.document_id
+       WHERE ${cond}
+       OFFSET 0
+     ) scored
+     WHERE raw > 0
+     ORDER BY raw DESC, chunk_id
+     LIMIT ${lim}`,
     p.list,
   );
 }
@@ -270,63 +502,163 @@ export function entityMatchSql(
   return `(${MATCH_INDEXES.entities.expr(alias)} @@ ${p.add(gramQuery(grams, 1))}::tsquery AND (${exact}))`;
 }
 
+/** Units of a query read for the entities it names: a pasted paragraph is read by its start. */
+const NAMED_UNITS_MAX = 120;
+
 /**
- * Chunks mentioning entities whose name/alias matches the query (graph
- * signal): one row per chunk, ranked by how many matching entities it
- * mentions, then by how often those entities are mentioned overall, then by
- * id — RRF reads the rank, so the order must not be the planner's. An entity
- * counts when it was live at `asOf` (the evidence test the other graph routes
- * use), not merely now. `raw` is the matching-entity count, as in graphSearch.
+ * The entities a query names, live at `asOf`: every run of its words (or of
+ * its CJK characters) that is one of an entity's spellings, looked up by the
+ * normalized keys entity resolution keeps (`entity_alias_keys`, on its
+ * index), with the entities merged into them. The rules are `findLinks`':
+ * a Latin spelling matches whole words, a CJK one anywhere in a run, a
+ * number of fewer than five digits or a Latin spelling of fewer than three
+ * letters names nothing, and where two spellings overlap the longer wins
+ * ("Large Language Models", not "Language Models" beside it). Unlike the link
+ * index it reads every type of entity: law-cn's statutes and its 本法 are
+ * concepts.
  *
- * "How often" sums each matching entity's mention_count once per mention row
- * it has in the chunk. A query term as common as "存储" or "AI" matches
- * entities with hundreds of thousands of mention rows between them, so the
- * rows are counted per entity, off its own index, and the live documents
- * joined by hash, before any chunk text is read: over 47 agent queries on a
- * copy of finance, 832 ms → 186 ms at the median, 3.0 s → 1.1 s at worst, the
- * same rankings.
+ * Keys are kept for live entities only, so an entity retired since `asOf`
+ * is not found here; the term match the channel falls back on still finds it.
  */
-async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
+async function namedInQuery(store: Store, query: string, asOf?: TimeInput): Promise<string[]> {
+  const spans = spellingSpans(query, NAMED_UNITS_MAX).filter((s) => !weakSpelling(s.key));
+  if (spans.length === 0) return [];
+  const p = new Params([[...new Set(spans.map((s) => s.key))]]);
+  const entityLive = rowLiveAt('e', 'entity', p, asOf);
+  const rows = await store.query<{ alias_key: string; id: string }>(
+    `SELECT k.alias_key, e.id FROM entity_alias_keys k JOIN entities e ON e.id = k.entity_id
+     WHERE k.alias_key = ANY($1::text[]) AND ${entityLive}`,
+    p.list,
+  );
+  const byKey = new Map<string, string[]>();
+  for (const r of rows) byKey.set(r.alias_key, [...(byKey.get(r.alias_key) ?? []), r.id]);
+  const ids = new Set(longestSpans(spans.filter((s) => byKey.has(s.key))).flatMap((s) => byKey.get(s.key)!));
+  if (ids.size === 0) return [];
+  // a merged entity's mentions may still be filed under its own id
+  const q = new Params([[...ids]]);
+  const memberLive = rowLiveAt('e', 'entity', q, asOf);
+  for (const r of await store.query<{ id: string }>(`SELECT e.id FROM entities e WHERE e.canonical_id = ANY($1::text[]) AND ${memberLive}`, q.list)) ids.add(r.id);
+  return [...ids];
+}
+
+/** Live entities (at `asOf`) whose name or alias holds one of the query's terms: what the graph channel matched before it read names. */
+async function entitiesHoldingTerms(store: Store, query: string, asOf?: TimeInput): Promise<string[]> {
   const terms = queryTerms(query, 5);
   if (terms.length === 0) return [];
   const p = new Params();
-  const named = entityMatchSql(store, 'e', terms, p);
+  const holding = entityMatchSql(store, 'e', terms, p);
   const entityLive = rowLiveAt('e', 'entity', p, asOf);
+  return (await store.query<{ id: string }>(`SELECT e.id FROM entities e WHERE ${holding} AND ${entityLive}`, p.list)).map((r) => r.id);
+}
+
+/**
+ * Chunks mentioning the entities the query names (graph signal): one row per
+ * chunk, ranked by the summed rarity of the named entities it mentions — each
+ * weighted by the BM25 IDF of the chunks it is mentioned in, as the keyword
+ * channel weighs a term — then by how many it mentions, then by id: RRF reads
+ * the rank, so the order must not be the planner's. A query that names no
+ * entity is matched as before, by the entities whose name or alias holds one
+ * of its terms. An entity counts when it was live at `asOf` (the evidence
+ * test the other graph routes use), not merely now. `raw` is the summed IDF.
+ *
+ * It used to match every entity holding a query term as a substring and rank
+ * by how many such entities a chunk mentions, then by their summed mention
+ * counts: fragments of the question's words, and a preference for the chunks
+ * about the most popular entities. On copies of the 2026-11 pilot's five
+ * public packs (180 questions, recall@5 of gold documents among the channel's
+ * own hits) that put 0.28 in the top five; naming plus rarity puts 0.51
+ * there (public-musique 0.21 → 0.40, research-ai 0.40 → 0.74, medicine-us
+ * 0.20 → 0.68, synthetic-life-zh 0.17 → 0.30, law-cn 0.40 → 0.44); names
+ * alone, without the fallback, 0.49. Measured and left out, each costing
+ * hybrid recall somewhere against this channel: normalising by how many
+ * entities a chunk mentions (0.50 alone; synthetic-life-zh and medicine-us
+ * lower), letting overlapping spellings all count (0.55; public-musique
+ * lower), the term match beside the names at a tenth of their weight (0.54;
+ * law-cn lower), one hop through relations to the named entities'
+ * neighbours at 0.1 or 0.3 of their weight (0.55 and 0.54;
+ * synthetic-life-zh and public-musique lower), and letting chunks of equal
+ * score share one rank (synthetic-life-zh lower).
+ *
+ * The mention rows are read per entity, off its own index, and the live
+ * documents joined by hash, before any chunk text is read: a hub such as
+ * "AI" has hundreds of thousands of mention rows (over 47 agent queries on a
+ * copy of finance, that shape took the old query from 832 ms to 186 ms at the
+ * median). The same rows give each entity's chunk count for its IDF.
+ */
+async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
+  let seeds = await namedInQuery(store, query, asOf);
+  if (seeds.length === 0) seeds = await entitiesHoldingTerms(store, query, asOf);
+  if (seeds.length === 0) return [];
+  const p = new Params([seeds]);
   const cond = docLiveAt('d', p, asOf, filter);
+  const total = p.add(await chunkTotal(store));
   const lim = p.add(k);
   return store.query<RankedChunk>(
-    `WITH matched AS MATERIALIZED (
-       SELECT e.id, e.mention_count FROM entities e WHERE ${named} AND ${entityLive}
+    `WITH seeds AS MATERIALIZED (
+       SELECT DISTINCT unnest($1::text[]) AS id
      ), docs AS MATERIALIZED (
        SELECT d.id FROM documents d WHERE ${cond}
-     ), per_chunk AS (
-       SELECT x.chunk_id, min(x.document_id) AS document_id,
-              count(*) AS matches, sum(e.mention_count * x.mentions) AS weight
-       FROM matched e
+     ), hits AS MATERIALIZED (
+       SELECT s.id AS entity_id, x.chunk_id, x.document_id, count(*) OVER (PARTITION BY s.id)::float AS df
+       FROM seeds s
        CROSS JOIN LATERAL (
-         SELECT m.chunk_id, min(m.document_id) AS document_id, count(*) AS mentions
-         FROM entity_mentions m WHERE m.entity_id = e.id
+         SELECT m.chunk_id, min(m.document_id) AS document_id
+         FROM entity_mentions m WHERE m.entity_id = s.id
          GROUP BY m.chunk_id
        ) x
-       GROUP BY x.chunk_id
+     ), per_chunk AS (
+       SELECT h.chunk_id, min(h.document_id) AS document_id, count(*) AS matches,
+              sum(ln(1 + (greatest(${total}::float, h.df) - h.df + 0.5) / (h.df + 0.5))) AS weight
+       FROM hits h
+       GROUP BY h.chunk_id
      ), ranked AS (
        SELECT pc.chunk_id, pc.matches, pc.weight
        FROM per_chunk pc JOIN docs ON docs.id = pc.document_id
-       ORDER BY pc.matches DESC, pc.weight DESC, pc.chunk_id
+       ORDER BY pc.weight DESC, pc.matches DESC, pc.chunk_id
        LIMIT ${lim}
      )
-     SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, r.matches::float AS raw
+     SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, r.weight AS raw
      FROM ranked r
      JOIN chunks c ON c.id = r.chunk_id
      JOIN documents d ON d.id = c.document_id
-     ORDER BY r.matches DESC, r.weight DESC, c.id`,
+     ORDER BY r.weight DESC, r.matches DESC, c.id`,
     p.list,
   );
 }
 
+
+/**
+ * What a rank in each recall channel is worth in the fusion.
+ *
+ * The graph channel ranks chunks by the entities they mention, not by what
+ * they say. Measured on copies of the 2026-11 pilot's workspaces for five
+ * public packs (180 questions, recall@5 of gold source documents): vectors
+ * alone 0.79, keywords alone 0.75, the graph channel alone 0.51 (0.28 when it
+ * matched entities by fragments of the query's terms). Hybrid recall by graph
+ * weight, mean over the packs (synthetic-life-zh / research-ai / law-cn /
+ * medicine-us / public-musique):
+ *
+ *   0    0.793  (0.717 / 0.966 / 0.897 / 0.845 / 0.540)
+ *   0.1  0.801  (0.742 / 0.966 / 0.889 / 0.869 / 0.540)
+ *   0.2  0.802  (0.742 / 0.966 / 0.890 / 0.869 / 0.540)
+ *   0.3  0.800  (0.742 / 0.966 / 0.887 / 0.873 / 0.530)
+ *   0.4  0.802  (0.742 / 0.966 / 0.887 / 0.873 / 0.540)
+ *   0.6  0.795  (0.742 / 0.966 / 0.867 / 0.861 / 0.540)
+ *   1.0  0.798  (0.755 / 0.961 / 0.867 / 0.856 / 0.550)
+ *
+ * The old channel gave 0.787 at 0.2 (0.717 / 0.966 / 0.890 / 0.822 / 0.540)
+ * and 0.773 at 0.4. At 0.2 no pack is below that; from 0.3 on law-cn is,
+ * where the statute a question names is in fifty chunks and the article it
+ * asks about in one. What the channel adds is mostly medicine-us and
+ * synthetic-life-zh: a question naming a trial or a person gets the chunks
+ * about it lifted over chunks that only resemble it.
+ */
+export const FUSION_WEIGHTS: Record<SearchChannelName, number> = { vector: 1.0, keyword: 1.0, graph: 0.2 };
+
 /**
  * Hybrid search: reciprocal-rank fusion of vector + keyword + graph-mention
- * signals (RRF, k=60 — the same shape gbrain and most hybrid retrievers use).
+ * signals (RRF, k=60 — the same shape gbrain and most hybrid retrievers use),
+ * each weighted by `FUSION_WEIGHTS`.
  * Fused scores get a bounded heat boost (at most `heat.searchWeight`, a
  * tie-break, never dominant), and returned hits are recorded into the usage
  * ledger.
@@ -382,7 +714,7 @@ export async function searchExplained(
   ]);
 
   const RRF_K = 60;
-  const weights = { vector: 1.0, keyword: 1.0, graph: 0.6 };
+  const weights = { ...FUSION_WEIGHTS, ...opts.weights };
   const fused = new Map<string, SearchResult>();
 
   const fold = (list: RankedChunk[], signal: SearchChannelName) => {

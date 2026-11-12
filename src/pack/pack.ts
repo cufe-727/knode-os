@@ -5,6 +5,7 @@ import { boundStatement, dialectForKind, escapeForDialect, runSourceQuery } from
 import { SourceDialect } from '../config.js';
 import { claimsForEntities } from '../graph/query.js';
 import { docLiveAt, search } from '../search/search.js';
+import { pickRelevant } from '../search/facts.js';
 import { datasetsForEntity } from '../store/queries.js';
 import {
   NO_FILTER,
@@ -127,6 +128,9 @@ export interface PackOptions {
   filter?: ResolvedScopeFilter;
 }
 
+/** Claims read per pack before the ones that answer the utterance are picked: a hub entity has thousands. */
+const PACK_CLAIM_POOL = 300;
+
 export async function buildContextPack(
   ctx: AppContext,
   utterance: string,
@@ -158,7 +162,8 @@ export async function buildContextPack(
   const retrievalMode = [...usedPlaybooks.values()][0]?.retrieval.mode ?? 'hybrid';
 
   const docs = await collectDocs(ctx, utterance, entityIds, retrievalK, retrievalMode, t.txTime, f);
-  const claims = annotateClaims(await claimsForEntities(store, entityIds, cfg.maxClaims, { temporal: t, filter: f }));
+  // the newest claims of the matched entities, then the ones that answer this utterance, spread over their sources
+  const claims = annotateClaims(pickRelevant(utterance, await claimsForEntities(store, entityIds, PACK_CLAIM_POOL, { temporal: t, filter: f }), cfg.maxClaims, { named: () => true }));
 
   const datasets: PackDataset[] = [];
   const datasetsByEntity = new Map<string, PackDataset[]>();
@@ -247,9 +252,12 @@ export async function matchEntities(
         OR (a.alias IS NOT NULL AND length(a.alias) >= 2 AND position(lower(a.alias) IN lower($1)) > 0))`,
     p.list,
   );
+  const said = utterance.toLowerCase();
   const ranked = rows
     // tier-0 concept fragments (e.g. 2-char co-occurrence tokens) are too noisy to anchor a pack
     .filter((e) => e.type !== 'concept' || e.name.length >= 4)
+    // a Latin name is a word of the utterance, not letters inside one: "PE" is not in "papers", "IC" not in "which"
+    .filter((e) => [e.name, ...(Array.isArray(e.aliases) ? e.aliases : [])].some((n) => typeof n === 'string' && n.length >= 2 && namedIn(said, n.toLowerCase())))
     .sort((a, b) => typeRank(a.type) - typeRank(b.type) || b.name.length - a.name.length || b.mention_count - a.mention_count);
   const kept: EntityRow[] = [];
   for (const e of ranked) {
@@ -283,6 +291,15 @@ export async function matchEntities(
     wikiPath: e.wiki_path,
     mentionCount: e.mention_count,
   }));
+}
+
+/** True when lowercased `name` stands in lowercased `text` as written: anywhere for a CJK name, as whole words for a Latin one. */
+function namedIn(text: string, name: string): boolean {
+  const alnum = (ch: string | undefined) => ch !== undefined && /[a-z0-9]/.test(ch);
+  for (let i = text.indexOf(name); i >= 0; i = text.indexOf(name, i + 1)) {
+    if (!(alnum(name[0]) && alnum(text[i - 1])) && !(alnum(name[name.length - 1]) && alnum(text[i + name.length]))) return true;
+  }
+  return false;
 }
 
 function typeRank(type: string): number {

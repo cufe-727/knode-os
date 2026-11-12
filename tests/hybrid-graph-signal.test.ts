@@ -3,17 +3,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { search } from '../src/search/search.js';
+import { FUSION_WEIGHTS, search } from '../src/search/search.js';
 import { Store } from '../src/store/db.js';
 
 /**
- * The graph signal of hybrid search: chunks that mention an entity whose name
- * matches the query. RRF scores a chunk by its rank in each signal's list, so
- * that list must be ordered on purpose, hold each chunk once, and — under
- * `asOf` — count only entities the knowledge base held at that time.
+ * The graph signal of hybrid search: chunks that mention the entities the
+ * query names, the rarer ones weighing more. RRF scores a chunk by its rank in
+ * each signal's list, so that list must be ordered on purpose, hold each chunk
+ * once, and — under `asOf` — count only entities the knowledge base held at
+ * that time.
  *
  * No chunk text contains the query and no chunk has a vector, so the graph
- * signal is the only one that answers: rank r scores exactly 0.6 / (61 + r).
+ * signal is the only one that answers: rank r scores exactly FUSION_WEIGHTS.graph / (61 + r).
  */
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-graph-signal-'));
@@ -53,7 +54,7 @@ async function addChunk(id: string): Promise<void> {
   );
 }
 
-/** An entity with a corpus-wide mention count, the chunks it is mentioned in, and its evidence window. */
+/** An entity with a corpus-wide mention count, the chunks it is mentioned in, its evidence window, and — while live — its lookup key. */
 async function addEntity(
   id: string,
   name: string,
@@ -72,19 +73,32 @@ async function addEntity(
     `INSERT INTO evidence (kind, target_id, scope_id, extractor, tx_from, tx_to) VALUES ('entity', $1, $2, 'test', $3, $4)`,
     [id, `scope-d-${chunks[0]}`, window.from, window.to ?? null],
   );
+  // a retired entity's keys are dropped (src/lineage/fold.ts)
+  if (!window.to) await store.query(`INSERT INTO entity_alias_keys (entity_id, alias_key) VALUES ($1, $2)`, [id, name.toLowerCase().replace(/\s+/g, '')]);
 }
+
+/** The rank-ordered chunk ids and the graph signal (summed IDF) of a hybrid search. */
+async function ranking(query: string, asOf?: string): Promise<{ ids: string[]; raw: number[] }> {
+  const results = await search(store, embedder, query, { k: 10, track: false, asOf });
+  results.forEach((r, rank) => expect(r.score).toBeCloseTo(FUSION_WEIGHTS.graph / (61 + rank), 12));
+  return { ids: results.map((r) => r.chunkId), raw: results.map((r) => r.signals.graph!) };
+}
+
+/** The IDF the channel gives an entity mentioned in `df` of the fixture's eight chunks. */
+const idf = (df: number) => Math.log(1 + (8 - df + 0.5) / (df + 0.5));
 
 beforeAll(async () => {
   fs.mkdirSync(path.join(tmp, '.knode'), { recursive: true });
   store = await Store.open(tmp, embedder.dimensions);
   // inserted against the order they rank in
-  for (const id of ['c6', 'c5', 'c4', 'c3', 'c2', 'c1']) await addChunk(id);
+  for (const id of ['c8', 'c7', 'c6', 'c5', 'c4', 'c3', 'c2', 'c1']) await addChunk(id);
   await addEntity('e-owl', 'Kestrel Owl', 2, ['c6'], { from: SOURCES_APPLIED });
   await addEntity('e-labs', 'Kestrel Labs', 2, ['c3', 'c2'], { from: SOURCES_APPLIED });
-  await addEntity('e-kestrel', 'Kestrel', 9, ['c2', 'c1'], { from: SOURCES_APPLIED });
-  // learned after AS_OF: matches now, not then
+  // the most mentioned, in the most chunks: the least telling
+  await addEntity('e-kestrel', 'Kestrel', 90, ['c8', 'c7', 'c2', 'c1'], { from: SOURCES_APPLIED });
+  // learned after AS_OF: named now, not then
   await addEntity('e-nest', 'Kestrel Nest', 4, ['c4'], { from: NEST_LEARNED });
-  // retired after AS_OF: matched then, not now
+  // retired after AS_OF: live then, not now
   await addEntity('e-old', 'Old Kestrel', 4, ['c5'], { from: SOURCES_APPLIED, to: OLD_RETIRED });
 });
 
@@ -94,18 +108,20 @@ afterAll(async () => {
 });
 
 describe('the hybrid graph signal', () => {
-  it('ranks chunks by matching entities, then their mention counts, then id, and counts each chunk once', async () => {
-    const results = await search(store, embedder, 'Kestrel', { k: 10, track: false });
-    // c2 mentions two matching entities (9 + 2 mentions); c1, c4, c3 and c6 one
-    // each (9, 4, 2, 2 — the tie between c3 and c6 goes by id)
-    expect(results.map((r) => [r.chunkId, r.signals])).toEqual([
-      ['c2', { graph: 2 }],
-      ['c1', { graph: 1 }],
-      ['c4', { graph: 1 }],
-      ['c3', { graph: 1 }],
-      ['c6', { graph: 1 }],
-    ]);
-    results.forEach((r, rank) => expect(r.score).toBeCloseTo(0.6 / (61 + rank), 12));
+  it('ranks chunks by the summed rarity of the entities the query names, then by how many, then by id', async () => {
+    // "Kestrel Labs" names the Labs, not Kestrel inside it; "the Kestrel" names Kestrel; Kestrel Owl is not named.
+    // c2 mentions both; c3 the Labs (in two chunks) alone; c1, c7, c8 Kestrel (in four) alone, by id
+    const { ids, raw } = await ranking('What did Kestrel Labs say about the Kestrel?');
+    expect(ids).toEqual(['c2', 'c3', 'c1', 'c7', 'c8']);
+    expect(raw[0]).toBeCloseTo(idf(2) + idf(4), 12);
+    expect(raw[1]).toBeCloseTo(idf(2), 12);
+    for (const r of raw.slice(2)) expect(r).toBeCloseTo(idf(4), 12);
+  });
+
+  it('matches a query that names no entity by the entities holding its terms', async () => {
+    // "Kestr" is no entity's spelling; every live entity holding it counts, the rarest first
+    const { ids } = await ranking('Kestr');
+    expect(ids).toEqual(['c2', 'c4', 'c6', 'c3', 'c1', 'c7', 'c8']);
   });
 
   it('answers a query quoting a passage under a rule of hyphens', async () => {
@@ -115,9 +131,10 @@ describe('the hybrid graph signal', () => {
   });
 
   it('counts the entities that were live at asOf, not the ones live now', async () => {
-    const results = await search(store, embedder, 'Kestrel', { k: 10, track: false, asOf: AS_OF });
-    // Kestrel Nest was not known yet; Old Kestrel still was
-    expect(results.map((r) => r.chunkId)).toEqual(['c2', 'c1', 'c5', 'c3', 'c6']);
-    results.forEach((r, rank) => expect(r.score).toBeCloseTo(0.6 / (61 + rank), 12));
+    // now "Kestrel Nest" names the Nest; at AS_OF it named nothing yet, and the Kestrel inside it counts
+    expect((await ranking('Kestrel Nest')).ids).toEqual(['c4']);
+    expect((await ranking('Kestrel Nest', AS_OF)).ids).toEqual(['c1', 'c2', 'c7', 'c8']);
+    // Old Kestrel's keys went with it; the term match still finds it at AS_OF, and not now
+    expect((await ranking('Kestr', AS_OF)).ids).toEqual(['c2', 'c5', 'c6', 'c3', 'c1', 'c7', 'c8']);
   });
 });

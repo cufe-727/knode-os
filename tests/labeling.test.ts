@@ -536,7 +536,7 @@ describe('the summary source', () => {
     expect(tasks.map((t) => t.label)[0]).toBe('raw/docs/b.md');
     expect(tasks.map((t) => t.label).sort()).toEqual(['raw/docs/a.md', 'raw/docs/b.md', 'raw/docs/long.md']);
     const [first] = tasks;
-    expect(first).toMatchObject({ kind: 'summarize', json: false, maxTokens: 1200 });
+    expect(first).toMatchObject({ kind: 'summarize', json: false, maxTokens: 1500 });
     expect(first.messages[0].content).toContain('Summarize the document');
     expect(first.prompt).toContain('Source file: raw/docs/b.md');
     expect(first.prompt).not.toContain('single JSON object');

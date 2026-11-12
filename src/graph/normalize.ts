@@ -99,3 +99,78 @@ export function typesCompatible(a?: string | null, b?: string | null): boolean {
   if (!a || !b || a === b) return true;
   return a === 'concept' || a === 'other' || b === 'concept' || b === 'other';
 }
+
+/* ──────────────────── spellings as they stand in a text ──────────────────── */
+
+/** The longest key a spelling is looked up by (link index, the graph recall channel). */
+export const SPELLING_MAX_CHARS = 32;
+
+/** A Han character, or a run of other letters and digits: the atoms a key is matched from (NFKC-folded per atom, offsets kept). */
+const UNIT_RE = /\p{Script=Han}|(?:(?!\p{Script=Han})[\p{L}\p{N}])+/gu;
+const HAN_UNIT_RE = /\p{Script=Han}/u;
+/** Latin words of one name may be separated by this much (a space, a hyphen, "C. A. T. L"). CJK keys match without gaps. */
+const LATIN_GAP = 2;
+const GAP_RE = /^[\s\-.·'’&]*$/;
+
+export interface TextUnit {
+  key: string;
+  start: number;
+  end: number;
+  han: boolean;
+}
+
+export function textUnits(text: string): TextUnit[] {
+  const out: TextUnit[] = [];
+  for (const m of text.matchAll(UNIT_RE)) {
+    const raw = m[0];
+    const key = keyOf(raw);
+    if (!key) continue;
+    out.push({ key, start: m.index!, end: m.index! + raw.length, han: HAN_UNIT_RE.test(raw) });
+  }
+  return out;
+}
+
+/** Whether `next` continues a spelling that reached `prev`: CJK without a gap, Latin words across a space, a hyphen or a dot. */
+export function unitsJoin(text: string, prev: TextUnit, next: TextUnit): boolean {
+  const gap = next.start - prev.end;
+  if (gap <= 0) return true;
+  return !next.han && !prev.han && gap <= LATIN_GAP && GAP_RE.test(text.slice(prev.end, next.start));
+}
+
+/** Of overlapping spans the longest, then the earliest, in text order. */
+export function longestSpans<T extends { start: number; end: number }>(spans: T[]): T[] {
+  const sorted = [...spans].sort((a, b) => b.end - b.start - (a.end - a.start) || a.start - b.start);
+  const taken: T[] = [];
+  for (const s of sorted) if (!taken.some((t) => s.start < t.end && t.start < s.end)) taken.push(s);
+  return taken.sort((a, b) => a.start - b.start);
+}
+
+/**
+ * Every run of a text's units that a spelling could be, with where it stands:
+ * the keys `findLinks` tries, without a link index to stop at the ones no
+ * spelling continues. From the first `maxUnits` units.
+ */
+export function spellingSpans(text: string, maxUnits = Infinity, maxChars = SPELLING_MAX_CHARS): { key: string; start: number; end: number }[] {
+  const units = textUnits(text).slice(0, maxUnits);
+  const out: { key: string; start: number; end: number }[] = [];
+  for (let i = 0; i < units.length; i++) {
+    let acc = '';
+    for (let j = i; j < units.length; j++) {
+      if (j > i && !unitsJoin(text, units[j - 1], units[j])) break;
+      acc += units[j].key;
+      if (acc.length > maxChars) break;
+      if (acc.length >= 2) out.push({ key: acc, start: units[i].start, end: units[j].end });
+    }
+  }
+  return out;
+}
+
+/**
+ * A spelling too weak to name anything on its own: a number of fewer than five
+ * digits (a date, a count or a price before it is a ticker), a Latin one of
+ * fewer than three letters (an abbreviation found inside any text).
+ */
+export function weakSpelling(key: string): boolean {
+  if (/^\d+$/.test(key)) return key.length < 5;
+  return /^[a-z0-9]+$/.test(key) && key.length < 3;
+}

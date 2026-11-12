@@ -4,16 +4,16 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { graphSearch } from '../src/graph/query.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { queryTerms, search } from '../src/search/search.js';
+import { keywordTerms, queryTerms, search, termCount } from '../src/search/search.js';
 import { Store } from '../src/store/db.js';
 import { gramQuery, MATCH_INDEXES, termGrams } from '../src/store/grams.js';
 
 /**
- * Substring matching through the gram index (src/store/grams.ts): the keyword
- * fallback CJK queries take, and the entity name / alias matching of the graph
- * signal, SAG and graph search. The index only narrows; strpos on the
- * lowercased text decides. So with the index and without it, the answers are
- * the ones `ILIKE '%term%'` gave: the same chunks, counts and order.
+ * Substring matching through the gram index (src/store/grams.ts): the
+ * candidates of keyword recall, and the entity name / alias matching of the
+ * graph signal, SAG and graph search. The index only narrows; the text
+ * decides. So with the index and without it, keyword recall finds the same
+ * chunks, and entity matching the ones `ILIKE '%term%'` gave.
  */
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-substring-index-'));
@@ -44,19 +44,18 @@ async function addChunk(id: string, content: string, status = 'indexed'): Promis
   if (status === 'indexed') corpus.push({ id, content });
 }
 
-/** What the fallback ranks by: how many of the query's terms a chunk holds, case-insensitively; ties by id. */
-function expectedRanking(query: string): { id: string; n: number }[] {
-  const terms = queryTerms(query).map((t) => t.toLowerCase());
-  return corpus
-    .map((c) => ({ id: c.id, n: terms.filter((t) => c.content.toLowerCase().includes(t)).length }))
-    .filter((r) => r.n > 0)
-    .sort((a, b) => b.n - a.n || (a.id < b.id ? -1 : 1));
+/** The chunks keyword recall can return for a query: the ones holding at least one of its terms. */
+function holders(query: string): string[] {
+  const terms = keywordTerms(query);
+  return corpus.filter((c) => terms.some((t) => termCount(c.content.toLowerCase(), t) > 0)).map((c) => c.id).sort();
 }
 
-async function keywordRanking(query: string, k: number): Promise<{ id: string; n: number }[]> {
+async function keywordRanking(query: string, k: number): Promise<{ id: string; score: number }[]> {
   const results = await search(store, embedder, query, { mode: 'keyword', k, track: false });
-  return results.map((r) => ({ id: r.chunkId, n: r.signals.keyword }));
+  return results.map((r) => ({ id: r.chunkId, score: r.signals.keyword! }));
 }
+
+const idsOf = (ranked: { id: string }[]) => ranked.map((r) => r.id);
 
 /** Run `fn` as if the indexes were still being built. */
 async function withoutIndexes<T>(fn: () => Promise<T>): Promise<T> {
@@ -85,7 +84,7 @@ async function plansOf(pattern: string, fn: () => Promise<unknown>): Promise<str
   const plans: string[] = [];
   // the state autovacuum keeps a workspace in: statistics (a table the planner believes empty is
   // read any way at all) and the rows inserted since the indexes were built merged into them
-  await store.query(`VACUUM ANALYZE chunks, documents, entities, entity_mentions`);
+  await store.query(`VACUUM ANALYZE chunks, documents, entities, entity_mentions, entity_alias_keys`);
   await store.query(`SET enable_seqscan = off`);
   try {
     for (const { sql, params } of sent.filter((s) => s.sql.includes(pattern))) {
@@ -116,7 +115,10 @@ beforeAll(async () => {
   await addChunk('k10', '天气晴朗，无关的内容。');
   // the same text in a document that is not indexed never answers
   await addChunk('k11', '据报道，宁德时代的储能业务增长很快。', 'pending');
-  // 60 chunks holding one term each, more than the fallback returns
+  // an English question's one rare name, and 40 chunks that repeat the rest of its words
+  await addChunk('n01', 'The Nintendo Entertainment System held each developer to five games a year.');
+  for (let i = 0; i < 40; i++) await addChunk(`n1${String(i).padStart(2, '0')}`, `Report ${i}: what was the limit on items per year for the platform, and who set the limit for the year.`);
+  // 60 chunks holding one common term each
   for (let i = 0; i < 60; i++) await addChunk(`t${String(60 - i).padStart(3, '0')}`, `第${i}条：业务往来记录。`);
 });
 
@@ -172,48 +174,103 @@ describe('the grams a term needs', () => {
   });
 });
 
-describe('the keyword fallback', () => {
+describe('keyword recall', () => {
+  it('looks its terms up in the index in a workspace never analyzed, as PGlite leaves one', async () => {
+    // before any test here runs ANALYZE: without statistics a planner joining documents first read every chunk
+    const sent: { sql: string; params?: unknown[] }[] = [];
+    const query = store.query.bind(store);
+    store.query = (async (sql: string, params?: unknown[]) => {
+      sent.push({ sql, params });
+      return query(sql, params);
+    }) as typeof store.query;
+    try {
+      await keywordRanking('宁德时代的储能业务', 8);
+    } finally {
+      store.query = query;
+    }
+    const lookups = sent.filter((x) => x.sql.includes('match_grams(c.content)'));
+    // one statement counts each term's chunks and lists the rarest terms'
+    expect(lookups).toHaveLength(1);
+    for (const { sql, params } of lookups) {
+      const plan = (await store.query<{ 'QUERY PLAN': string }>(`EXPLAIN ${sql}`, params)).map((r) => r['QUERY PLAN']).join('\n');
+      expect(plan).toContain(MATCH_INDEXES.chunks.name);
+      expect(plan).not.toMatch(/Seq Scan on chunks/);
+      expect(plan).not.toMatch(/Filter: \(match_grams/);
+    }
+  });
+
   it.each([
     ['宁德时代的储能业务'],
     ['海力士 HBM3E 认证'],
     ['hbm4 量产'],
-  ])('ranks chunks by how many terms of %s they hold, through the index and without it', async (query) => {
-    // k = 30 fetches 90 from the channel, more than match: every tie is in, in id order
-    const expected = expectedRanking(query).slice(0, 30);
-    expect(await keywordRanking(query, 30)).toEqual(expected);
-    expect(await withoutIndexes(() => keywordRanking(query, 30))).toEqual(expected);
+  ])('finds every chunk holding a term of %s, through the index and without it', async (query) => {
+    // k = 100 asks the channel for 300, more than hold a term
+    expect(idsOf(await keywordRanking(query, 100)).sort()).toEqual(holders(query));
+    expect(idsOf(await withoutIndexes(() => keywordRanking(query, 100))).sort()).toEqual(holders(query));
   });
 
-  it('fills the last tier with as many of its ties as fit, each holding what it says', async () => {
-    // fetchK is 24 for k = 8: k01..k04 rank above 60 chunks that hold only 业务
-    const query = '宁德时代的储能业务';
-    const truth = new Map(expectedRanking(query).map((r) => [r.id, r.n]));
-    const ranked = await keywordRanking(query, 8);
-    expect(ranked.slice(0, 4).map((r) => r.id)).toEqual(['k01', 'k02', 'k03', 'k04']);
-    expect(ranked.map((r) => r.n)).toEqual(expectedRanking(query).slice(0, 8).map((r) => r.n));
-    for (const r of ranked) expect(truth.get(r.id)).toBe(r.n);
-    // the scan takes the ties in id order
-    expect(await withoutIndexes(() => keywordRanking(query, 8))).toEqual(expectedRanking(query).slice(0, 8));
+  it('puts the chunks holding the rare terms above the ones holding a common one', async () => {
+    // 业务 is in 63 chunks; the company's name and 储能 in two or three
+    for (const ranked of [await keywordRanking('宁德时代的储能业务', 8), await withoutIndexes(() => keywordRanking('宁德时代的储能业务', 8))]) {
+      expect(ranked[0].id).toBe('k01');
+      expect(idsOf(ranked.slice(0, 4)).sort()).toEqual(['k01', 'k02', 'k03', 'k04']);
+      for (const r of ranked.slice(4)) expect(r.id).toMatch(/^t\d+$/);
+    }
+  });
+
+  it('scores best first, and equal scores in id order', async () => {
+    const ranked = await keywordRanking('宁德时代的储能业务', 100);
+    for (let i = 1; i < ranked.length; i++) {
+      expect(ranked[i - 1].score).toBeGreaterThanOrEqual(ranked[i].score);
+      if (ranked[i - 1].score === ranked[i].score) expect(ranked[i - 1].id < ranked[i].id).toBe(true);
+    }
+    // the two-digit rows are one length, so they tie
+    expect(new Set(ranked.filter((r) => /^t0[0-4]\d$/.test(r.id)).map((r) => r.score)).size).toBe(1);
+  });
+
+  it('answers an English question by its rare word, not by the words every chunk has', async () => {
+    const question = "What was Nintendo's limit on games per developer per year for the platform?";
+    expect(keywordTerms(question)).toEqual(['nintendo', 'limit', 'games', 'per', 'developer', 'year', 'platform']);
+    for (const ranked of [await keywordRanking(question, 8), await withoutIndexes(() => keywordRanking(question, 8))]) {
+      expect(ranked[0].id).toBe('n01');
+    }
   });
 
   it('reads a term as literal text, an underscore included', async () => {
     // ILIKE took the underscore for any character and matched k09's x as well
-    expect(await keywordRanking('r_6f406e239a', 8)).toEqual([{ id: 'k08', n: 1 }]);
-    expect(await withoutIndexes(() => keywordRanking('r_6f406e239a', 8))).toEqual([{ id: 'k08', n: 1 }]);
+    expect(idsOf(await keywordRanking('r_6f406e239a', 8))).toEqual(['k08']);
+    expect(idsOf(await withoutIndexes(() => keywordRanking('r_6f406e239a', 8)))).toEqual(['k08']);
   });
 
-  it('answers each tier from the index', async () => {
+  it('keeps what an exclusion or a quoted phrase matched in front', async () => {
+    // the reports say "year" twice and n01 once: scored alone, they come first
+    expect((await keywordRanking('year', 8))[0].id).toMatch(/^n1\d\d$/);
+    expect(keywordTerms('year -report')).toEqual(['year']);
+    expect((await keywordRanking('year -report', 8))[0].id).toBe('n01');
+    // only n01 holds the phrase; "year" alone would again put the reports first
+    expect((await keywordRanking('"games a year" year', 8))[0].id).toBe('n01');
+  });
+
+  it('answers from the index with statistics too', async () => {
     const plans = await plansOf('match_grams(c.content)', () => keywordRanking('宁德时代的储能业务', 8));
     expect(plans).toHaveLength(1);
-    expect(plans[0]).toContain(MATCH_INDEXES.chunks.name);
-    expect(plans[0]).not.toMatch(/Seq Scan on chunks/);
+    for (const plan of plans) {
+      expect(plan).toContain(MATCH_INDEXES.chunks.name);
+      expect(plan).not.toMatch(/Seq Scan on chunks/);
+    }
   });
 });
 
 describe('entity matching', () => {
   const MENTIONED = ['g1', 'g2', 'g3', 'g4', 'g5', 'g6', 'g7', 'g8'];
 
-  async function addEntity(id: string, name: string, mentionCount: number, chunks: string[], extra: { aliases?: string[]; description?: string; retired?: boolean } = {}): Promise<void> {
+  async function addEntity(
+    id: string,
+    name: string,
+    mentionCount: number,
+    chunks: string[],
+    extra: { aliases?: string[]; description?: string; retired?: boolean; keys?: string[] } = {},
+  ): Promise<void> {
     await store.query(
       `INSERT INTO entities (id, name, type, mention_count, aliases, description, tx_to) VALUES ($1, $2, 'concept', $3, $4::jsonb, $5, $6)`,
       [id, name, mentionCount, JSON.stringify(extra.aliases ?? []), extra.description ?? '', extra.retired ? '2026-01-01T00:00:00Z' : null],
@@ -221,6 +278,7 @@ describe('entity matching', () => {
     for (const chunk of chunks) {
       await store.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id) VALUES ($1, $2, $3)`, [id, chunk, `d-${chunk}`]);
     }
+    for (const key of extra.keys ?? []) await store.query(`INSERT INTO entity_alias_keys (entity_id, alias_key) VALUES ($1, $2)`, [id, key]);
   }
 
   beforeAll(async () => {
@@ -236,21 +294,34 @@ describe('entity matching', () => {
     await addEntity('e-other', '无关', 80, ['g1']);
     await addEntity('e-described', 'Cobalt', 3, [], { description: '储能 materials supplier' });
     // the entities no query here names, as a workspace has thousands of
-    for (let i = 0; i < 300; i++) await addEntity(`e-filler-${i}`, `Filler ${i}`, 1, []);
+    // the one entity here with lookup keys: the fixtures above are found by their terms alone
+    await addEntity('e-cathode', 'Cathode Works', 2, ['g8'], { keys: ['cathodeworks'] });
+    for (let i = 0; i < 300; i++) await addEntity(`e-filler-${i}`, `Filler ${i}`, 1, [], { keys: [`filler${i}`] });
   });
 
   /** The graph channel's order: the keyword fixtures above answer this query too, the mentioned chunks only through the graph. */
-  async function graphRanking(): Promise<[string, number][]> {
-    const results = await search(store, embedder, '储能 HBM', { k: 30, track: false });
-    return results.filter((r) => r.signals.graph !== undefined).map((r) => [r.chunkId, r.signals.graph]);
+  async function graphRanking(query = '储能 HBM'): Promise<[string, number][]> {
+    const results = await search(store, embedder, query, { k: 30, track: false });
+    return results.filter((r) => r.signals.graph !== undefined).map((r) => [r.chunkId, r.signals.graph!]);
   }
 
-  it('ranks chunks by matching entities, then their mention rows weighted by mention count, then id', async () => {
-    // g1: HBM + 储能电池 (50 + 30); g2: HBM + Battery Corp by alias (50 + 7);
-    // g3: 储能电池 on two rows (2 × 30) above 储能系统 (45); g6's entity is retired, g7's document not indexed
-    const expected: [string, number][] = [['g1', 2], ['g2', 2], ['g3', 1], ['g8', 1], ['g4', 1], ['g5', 1]];
-    expect(await graphRanking()).toEqual(expected);
-    expect(await withoutIndexes(graphRanking)).toEqual(expected);
+  it('matches a query naming no entity by the entities holding its terms, the rarest first', async () => {
+    // the summed IDF of the chunks each entity is mentioned in: g1 HBM (3 chunks) + 储能电池 (2);
+    // g2 HBM + Battery Corp by alias (2); then HBM3E and 储能系统 (1 each, ties by id);
+    // then 储能电池 and Battery Corp alone. 储能电池's two rows in g3 are one chunk;
+    // g6's entity is retired, g7's document not indexed, Cobalt matches by description only
+    const ranked = await graphRanking();
+    expect(ranked.map(([id]) => id)).toEqual(['g1', 'g2', 'g5', 'g8', 'g3', 'g4']);
+    for (let i = 1; i < ranked.length; i++) expect(ranked[i - 1][1]).toBeGreaterThanOrEqual(ranked[i][1]);
+    expect(ranked[0][1]).toBeCloseTo(ranked[1][1], 12);
+    expect(ranked[4][1]).toBeCloseTo(ranked[5][1], 12);
+    expect(await withoutIndexes(graphRanking)).toEqual(ranked);
+  });
+
+  it('reads the entities a query names, as whole words, and only them', async () => {
+    // "Works" alone is a term several fixtures could hold; the name is one entity's key
+    expect((await graphRanking('Who supplies Cathode Works with HBM?')).map(([id]) => id)).toEqual(['g8']);
+    expect(await graphRanking('Who supplies CathodeWorkshop?')).not.toContainEqual(['g8', expect.any(Number)]);
   });
 
   it('seeds graph search from a name, an alias or a description', async () => {
@@ -259,10 +330,13 @@ describe('entity matching', () => {
     expect(await withoutIndexes(seeds)).toEqual(await seeds());
   });
 
-  it('looks entities up through the index', async () => {
-    const plans = await plansOf('match_grams(e.name', graphRanking);
+  it('looks entities up through the indexes', async () => {
+    const plans = await plansOf('match_grams(e.name', () => graphRanking());
     expect(plans).toHaveLength(1);
     expect(plans[0]).toContain(MATCH_INDEXES.entities.name);
+    const named = await plansOf('entity_alias_keys', () => graphRanking('Who supplies Cathode Works?'));
+    expect(named).toHaveLength(1);
+    expect(named[0]).toContain('entity_alias_keys_key_idx');
   });
 });
 

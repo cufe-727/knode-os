@@ -8,14 +8,28 @@ import { installExternal } from './install.js';
 import { QuotaGuard, withRefusalRetry } from './quota.js';
 import { loadPack, packsDir, validatePack } from './pack.js';
 import { listRecipes, recipe } from './packs/index.js';
+import { extendPack } from './packs/extend.js';
 import './packs/recipes.js';
-import { writeReport } from './report.js';
+import { buildScaleData, renderScale, writeReport } from './report.js';
 import { runEval, scoreRun } from './run.js';
 import { Meter, sumEvents } from './meter.js';
 import { RunStore } from './runstore.js';
 import { DEFAULT_SYSTEMS, SYSTEMS } from './systems/index.js';
 import { EXTERNAL_SYSTEMS, externalPacks, venvPython } from './systems/external.js';
-import { Suite, SUITES } from './types.js';
+import { Suite, SUITES, TASK_TYPES, TaskType } from './types.js';
+import { loadConfig } from '../config.js';
+import { ModelChain, parseChain, SpendLedger } from './chain.js';
+
+/** The author model: a budgeted chain over a workspace's connections, or one CLI (docs/design/23 D18). */
+function authorClient(opts: { author: string | false; authorModel?: string; authorChain?: string; configFrom?: string }, guard: QuotaGuard): LlmClient | undefined {
+  if (opts.author === false) return undefined;
+  if (opts.authorChain) {
+    const ledger = new SpendLedger();
+    const config = opts.configFrom ? loadConfig(opts.configFrom) : null;
+    return new ModelChain(parseChain(opts.authorChain, config, { ledger }), ledger, (m) => console.log(`  ${m}`)).asClient();
+  }
+  return withRefusalRetry(new LlmClient({ provider: opts.author, baseUrl: '', apiKey: '', model: opts.authorModel ?? '', cliPath: '', cliTimeoutMs: 900_000 }), guard);
+}
 
 /**
  * `knode-os eval …` (docs/design/23 §7): build and validate benchmark packs,
@@ -52,12 +66,14 @@ export function registerEvalCommands(program: Command): void {
     .option('--seed <seed>', 'sampling seed', '0')
     .option('--author <provider>', 'model that drafts gold and tasks: claude-cli | codex-cli', 'claude-cli')
     .option('--author-model <model>', 'its model (default: the CLI default)', '')
+    .option('--author-chain <chain>', 'budgeted chain instead, e.g. anthropic-api:100,codex-cli (connections of --config-from)')
+    .option('--config-from <workspace>', 'workspace whose connections the author chain uses (read-only)')
     .option('--options <json>', 'recipe options as JSON', '{}')
     .action(async (id: string, opts) => {
       const r = recipe(id);
       const out = path.resolve(opts.out ?? path.join(packsDir(), id));
       const guard = new QuotaGuard({ enabled: false, log: (m) => console.log(`  ${m}`) });
-      const author = r.needsAuthor ? withRefusalRetry(new LlmClient({ provider: opts.author, baseUrl: '', apiKey: '', model: opts.authorModel, cliPath: '', cliTimeoutMs: 900_000 }), guard) : undefined;
+      const author = r.needsAuthor ? authorClient(opts, guard) : undefined;
       const issues = await r.build(out, { limit: opts.limit ? Number(opts.limit) : undefined, seed: opts.seed, author, options: JSON.parse(opts.options), log: (m) => console.log(`  ${m}`) });
       for (const w of issues.warnings) console.log(`  warning: ${w}`);
       if (issues.errors.length) {
@@ -66,6 +82,31 @@ export function registerEvalCommands(program: Command): void {
       }
       const p = loadPack(out);
       console.log(`\n${p.manifest.id}: ${p.docs.length} documents, ${p.tasks.length} tasks, ${p.facts.length} gold facts → ${out}`);
+    });
+  pack
+    .command('extend <pack>')
+    .description('add corpus-level tasks (aggregate, timeline, contradiction, profile, deep chains) and padding to a built pack, leaving its corpus as it is')
+    .option('--author <provider>', 'model that drafts the tasks: claude-cli | codex-cli', 'claude-cli')
+    .option('--author-model <model>', 'its model (default: the CLI default)', '')
+    .option('--corpus <json>', 'corpus plan, e.g. {"profile":12,"timeline":10,"contradiction":10,"aggregate":12,"deep":10} (default: the recipe\'s; {} drafts nothing)')
+    .option('--padding <multiple>', 'padding for scale curves, as a multiple of the corpus (10 = nine times its documents again)', '0')
+    .option('--no-author', 'draft nothing: model-free tasks and padding only')
+    .option('--author-chain <chain>', 'budgeted chain instead, e.g. anthropic-api:100,codex-cli (connections of --config-from)')
+    .option('--config-from <workspace>', 'workspace whose connections the author chain uses (read-only)')
+    .option('--seed <seed>', 'sampling seed', '0')
+    .option('--options <json>', 'recipe options for the rebuild that supplies model-free tasks and padding', '{}')
+    .action(async (arg: string, opts) => {
+      const dir = resolvePack(arg);
+      const guard = new QuotaGuard({ enabled: false, log: (m) => console.log(`  ${m}`) });
+      const author = authorClient(opts, guard);
+      const r = await extendPack(dir, {
+        author, seed: opts.seed, options: JSON.parse(opts.options), log: (m) => console.log(`  ${m}`),
+        corpus: opts.corpus ? JSON.parse(opts.corpus) : undefined, padding: Number(opts.padding),
+      });
+      for (const w of r.warnings) console.log(`  warning: ${w}`);
+      for (const e of r.errors.slice(0, 30)) console.log(`  error: ${e}`);
+      if (r.errors.length) process.exitCode = 1;
+      console.log(`\n${path.basename(dir)}: ${r.added} corpus-level tasks added, ${r.padded} padding documents`);
     });
   pack
     .command('validate <dir>')
@@ -109,22 +150,30 @@ export function registerEvalCommands(program: Command): void {
     .option('--config-from <workspace>', 'knode workspace whose embedder the run uses (read-only)')
     .option('--embedding <kind>', 'workspace | local', 'workspace')
     .option('--embedding-endpoint <url>', "embed on this OpenAI-compatible endpoint (a local bge-m3, say) under the workspace embedder's identity, once it reproduces the vectors the run holds")
+    .option('--embedding-fallback', "with --embedding-endpoint: use the workspace's embedder while the endpoint is unreachable")
     .option('--chat-connection <id>', 'answer model calls from this connection of the --config-from workspace (an API endpoint) instead of codex exec')
     .option('--model <model>', 'model every system uses (Codex\'s, or the connection\'s)', '')
     .option('--build-effort <e>', 'reasoning effort for building', 'low')
     .option('--answer-effort <e>', 'reasoning effort for answering', 'medium')
     .option('--judge <provider>', 'judge CLI provider', 'claude-cli')
     .option('--judge-model <model>', 'judge model', '')
+    .option('--chat-chain <chain>', 'budgeted chain for every model call, e.g. openai-api:200,codex-cli (connections of --config-from; budgets also in ~/knode-eval/budgets.json)')
+    .option('--agent-chain <chain>', 'budgeted chain for agent sessions: API connections billed through Codex, then codex-cli')
+    .option('--judge-chain <chain>', 'budgeted chain for the judge, e.g. anthropic-api:100,codex-cli')
     .option('--limit <n>', 'tasks per pack (stratified by type)')
+    .option('--types <list>', `only these task types, comma-separated (e.g. aggregate,timeline,contradiction,profile,deep-hop,update)`)
     .option('--agent-limit <n>', 'tasks per pack for agent systems', '30')
-    .option('--fraction <f>', 'share of the corpus to use (scale curves)', '1')
+    .option('--fraction <f>', 'share of the corpus to use; above 1, that many times its size with the pack\'s padding (scale curves)', '1')
     .option('--seed <seed>', 'sampling seed', '0')
     .option('--slots <n>', 'concurrent model calls', '6')
     .option('--pack-concurrency <n>', 'packs worked on at once', '1')
+    .option('--answer-concurrency <n>', 'tasks one system answers at once in each pack (update batches too)', '3')
     .option('--embedding-cap <tokens>', 'stop embedding after this many tokens in the run')
     .option('--embedding-daily-cap <tokens>', 'embed at most this many tokens per UTC day; past it, packs wait for the next day')
     .option('--no-quota', 'do not pause for Codex plan windows')
     .option('--skip-scoring', 'answer only; score later with `eval run --run-dir`')
+    .option('--reuse-builds-from <runDir>', "start from another run's builds of the same pack versions (and its embedding vectors), instead of building again")
+    .option('--rebuild <groups>', 'with --reuse-builds-from: build these groups afresh (knode, llm-wiki, rag, …), e.g. after a change to how they build')
     .action(async (opts) => {
       const res = await runEval({
         packs: csv(opts.pack)!.map(resolvePack),
@@ -135,21 +184,34 @@ export function registerEvalCommands(program: Command): void {
         chatConnection: opts.chatConnection,
         embedding: opts.embedding,
         embeddingEndpoint: opts.embeddingEndpoint,
+        embeddingFallback: opts.embeddingFallback,
         model: opts.model,
         buildEffort: opts.buildEffort as LlmEffort,
         answerEffort: opts.answerEffort as LlmEffort,
         judgeProvider: opts.judge,
         judgeModel: opts.judgeModel,
+        chatChain: opts.chatChain,
+        agentChain: opts.agentChain,
+        judgeChain: opts.judgeChain,
         limit: opts.limit ? Number(opts.limit) : undefined,
+        types: (() => {
+          const types = csv(opts.types);
+          const unknown = types?.filter((t) => !(TASK_TYPES as readonly string[]).includes(t)) ?? [];
+          if (unknown.length) throw new Error(`unknown task types: ${unknown.join(', ')} (known: ${TASK_TYPES.join(', ')})`);
+          return types as TaskType[] | undefined;
+        })(),
         agentLimit: Number(opts.agentLimit),
         fraction: Number(opts.fraction),
         seed: opts.seed,
         slots: Number(opts.slots),
         packConcurrency: Number(opts.packConcurrency),
+        answerConcurrency: Number(opts.answerConcurrency),
         embeddingTokenCap: opts.embeddingCap ? Number(opts.embeddingCap) : undefined,
         embeddingDailyCap: opts.embeddingDailyCap ? Number(opts.embeddingDailyCap) : undefined,
         quota: opts.quota,
         skipScoring: opts.skipScoring,
+        reuseBuildsFrom: opts.reuseBuildsFrom,
+        rebuild: csv(opts.rebuild),
         onProgress: (m) => console.log(`  ${m}`),
       });
       const report = writeReport(res.runDir);
@@ -201,6 +263,17 @@ export function registerEvalCommands(program: Command): void {
     .action((runDir: string) => {
       const r = writeReport(path.resolve(runDir));
       console.log(r.md);
+    });
+  evalCmd
+    .command('scale <runDirs...>')
+    .description('scale curves: read runs of the same packs at several --fraction values side by side')
+    .option('--out <file>', 'write the Markdown here (default: print it)')
+    .action((runDirs: string[], opts) => {
+      const md = renderScale(buildScaleData(runDirs.map((d) => path.resolve(d))));
+      if (opts.out) {
+        fs.writeFileSync(path.resolve(opts.out), md);
+        console.log(path.resolve(opts.out));
+      } else console.log(md);
     });
   const audit = evalCmd.command('audit').description('human audit of judge verdicts');
   audit

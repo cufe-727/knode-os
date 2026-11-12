@@ -204,7 +204,7 @@ knode-os folders import <文件夹> [--to d] [--replace]  把本机一个文件�
 knode-os folders link <文件夹> [--to d]    同上但记住它：`serve` 监听该文件夹，新增、修改、删除都即时镜像进索引
 knode-os folders list | sync [dest] | unlink <dest> [--remove-files]
 knode-os okf export <dir>                校验并导出原生 wiki bundle
-knode-os wiki generate        补齐缺失的文档摘要页与实体页
+knode-os wiki generate        补齐缺失的文档摘要页与实体页（逐条主张附来源）及实体页索引
 knode-os wiki refine          tier-2:断言审计 + 全量重复实体审计 + 断言复核 + 热门话题块 + 研究推荐
 knode-os trace sync           拉取新的 Claude Code / Codex trace 与 skills
 knode-os dream [--lookback d] 先同步 trace,再分析 → skills/memory/知识库建议

@@ -73,13 +73,15 @@ export class Judge {
     }
     const batches: I[][] = [];
     for (let i = 0; i < todo.length; i += this.batchSize) batches.push(todo.slice(i, i + this.batchSize));
-    await mapLimit(batches, this.opts.concurrency ?? 2, async (group) => {
+    // a reply that does not parse (cut off at its token budget, prose around it) is asked again in halves, down to
+    // one item, which is tried twice and then left unjudged: one bad reply must not stop a pack
+    const ask = async (group: I[], tries = 1): Promise<void> => {
       const user = JSON.stringify({ items: group.map((item) => ({ id: item.id, ...(render(item) as object) })) }, null, 1);
       let usage: CallUsage | null = null;
       const t0 = Date.now();
       const call = () => this.opts.client.completeJson<{ verdicts?: (V & { id?: string })[] }>(
         [{ role: 'system', content: system }, { role: 'user', content: user }],
-        { maxTokens: 400 * group.length + 400, onUsage: (u) => (usage = u) },
+        { maxTokens: 900 * group.length + 600, onUsage: (u) => (usage = u) },
       );
       let reply: { verdicts?: (V & { id?: string })[] };
       try {
@@ -88,7 +90,15 @@ export class Judge {
         this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: true, replayed: false, usage });
       } catch (err) {
         this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: false, replayed: false, usage });
-        throw err;
+        if (!(err instanceof SyntaxError) && !/json/i.test(err instanceof Error ? err.message : String(err))) throw err;
+        if (group.length > 1) {
+          const half = Math.ceil(group.length / 2);
+          await ask(group.slice(0, half));
+          await ask(group.slice(half));
+        } else if (tries < 2) {
+          await ask(group, tries + 1);
+        }
+        return;
       }
       const byId = new Map((reply.verdicts ?? []).filter((v) => v && typeof v.id === 'string').map((v) => [v.id as string, v]));
       for (const item of group) {
@@ -97,7 +107,8 @@ export class Judge {
         this.remember(keyOf(item), v);
         out.set(item.id, v as V);
       }
-    }, (err) => {
+    };
+    await mapLimit(batches, this.opts.concurrency ?? 2, (group) => ask(group), (err) => {
       throw err;
     });
     return out;
@@ -132,6 +143,14 @@ export class Judge {
     return this.batch('match', MATCH_SYSTEM, items, (i) => ({
       predicted: i.predicted.map((p, n) => `${n}: ${p}`),
       gold: i.gold.map((g, n) => `${n}: ${g}`),
+    }));
+  }
+
+  /** Corpus-level lists (aggregate, timeline, contradiction, profile): a stricter match than themes — same name, number and date. */
+  async matchList(items: { id: string; predicted: string[]; gold: string[] }[]): Promise<Verdicts<{ pairs: [number, number][] }>> {
+    return this.batch('list', LIST_MATCH_SYSTEM, items, (i) => ({
+      predicted: i.predicted.map((p, n) => `${n}: ${p.slice(0, 400)}`),
+      gold: i.gold.map((g, n) => `${n}: ${g.slice(0, 400)}`),
     }));
   }
 
@@ -202,6 +221,9 @@ export const DECOMPOSE_SYSTEM = `Split each text into atomic claims: one checkab
 ${JSON_SHAPE('"claims":["…"]')}`;
 
 export const MATCH_SYSTEM = `Each item has predicted entries and gold entries. Pair a predicted entry with a gold entry when it expresses the same theme, need or item (wording and language may differ; a broader or vaguer entry does not match a specific gold one). Each entry is used at most once.
+${JSON_SHAPE('"pairs":[[<predicted index>,<gold index>], …]')}`;
+
+export const LIST_MATCH_SYSTEM = `Each item has the list an answer gave and the gold list (one entry per line; gold entries may give alternative names after " / " and a date in parentheses). Pair a predicted entry with a gold entry when they state the same thing: the same listed thing, fact, event, change of state or side of a disagreement. Wording and language may differ. Do not pair when the predicted entry names a different person, figure or date, when it is broader or vaguer than the gold entry, or when it merges several gold entries into one (pair it with at most one of them). Each entry is used at most once.
 ${JSON_SHAPE('"pairs":[[<predicted index>,<gold index>], …]')}`;
 
 export const LINK_SYSTEM = `Each item is a link a knowledge base drew between two things, with the source passages. Decide whether the sources support that relation between them (the relation label may be loose; the connection must be real and of that kind).

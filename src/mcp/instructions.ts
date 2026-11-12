@@ -12,12 +12,24 @@ import { GUIDE_FILE } from '../fs/datadir.js';
 
 const MAX_GUIDE_CHARS = 6_000;
 
-const PREAMBLE = [
-  'knode-os is a local knowledge base: documents → entities / relations / claims → wiki pages. For a question start with knode_resolve; knode_search (mode=sag) finds passages, knode_claims dated facts, knode_graph_search relations; as_of / valid_at travel in time.',
-  `Read the base's own guide first — knode_read "${GUIDE_FILE}" (what it holds, how things are named, which tool answers which question) — and knode_survey for the current numbers.`,
-  'Writes go through knode_write (wiki/, raw/docs/, playbooks/packs/) and land quarantined until a person promotes them; a contradiction opens a dispute instead of overwriting.',
-  'Web material you rely on goes in with knode_capture: knode fetches the URL itself, keeps the original under raw/docs/research/ (converted and indexed like any document) and returns the path to cite. knode_study shows multi-page research studies.',
-].join('\n');
+/**
+ * The preamble. Its second line used to tell every agent to read the guide
+ * first, whether or not one existed: in a benchmark run on a base nobody had
+ * initialised, the agent spent a call on `knode_read "AGENTS.md"` in two
+ * questions of four and got nothing. With a guide the text follows right
+ * here, so reading it again is a call for what the agent already holds.
+ */
+function preamble(guide: 'none' | 'whole' | 'cut'): string {
+  const second = guide === 'none'
+    ? `knode_survey says what this base holds, in numbers. It has no guide of its own yet (${GUIDE_FILE}, written by an initialization).`
+    : `The base's own guide (${GUIDE_FILE}: what it holds, how things are named, which tool answers which question) follows${guide === 'cut' ? ', cut short' : ''}; knode_survey has the current numbers.`;
+  return [
+    'knode-os is a local knowledge base: documents → entities / relations / claims → wiki pages. For a question start with knode_resolve; knode_search (mode=sag) finds passages, knode_claims dated facts, knode_graph_search relations; as_of / valid_at travel in time.',
+    second,
+    'Writes go through knode_write (wiki/, raw/docs/, playbooks/packs/) and land quarantined until a person promotes them; a contradiction opens a dispute instead of overwriting.',
+    'Web material you rely on goes in with knode_capture: knode fetches the URL itself, keeps the original under raw/docs/research/ (converted and indexed like any document) and returns the path to cite. knode_study shows multi-page research studies.',
+  ].join('\n');
+}
 
 const cache = new Map<string, { key: string; text: string }>();
 
@@ -32,13 +44,14 @@ export function mcpInstructions(dataDir: string): string {
   }
   const hit = cache.get(dataDir);
   if (hit && hit.key === key) return hit.text;
-  let text = PREAMBLE;
+  let text = preamble('none');
   if (key !== 'none') {
     try {
       const guide = fs.readFileSync(file, 'utf8').trim();
       if (guide) {
-        const body = guide.length > MAX_GUIDE_CHARS ? `${guide.slice(0, MAX_GUIDE_CHARS)}\n…（截断；完整指南用 knode_read ${GUIDE_FILE} 读取）` : guide;
-        text = `${PREAMBLE}\n\n--- ${GUIDE_FILE} (this knowledge base's guide) ---\n${body}`;
+        const cut = guide.length > MAX_GUIDE_CHARS;
+        const body = cut ? `${guide.slice(0, MAX_GUIDE_CHARS)}\n…（截断；完整指南用 knode_read ${GUIDE_FILE} 读取）` : guide;
+        text = `${preamble(cut ? 'cut' : 'whole')}\n\n--- ${GUIDE_FILE} (this knowledge base's guide) ---\n${body}`;
       }
     } catch {
       /* unreadable guide: preamble only */

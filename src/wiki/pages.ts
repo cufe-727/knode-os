@@ -6,7 +6,7 @@ import { summaryLlmClient } from '../context.js';
 import { DataSourceRegistry } from '../datasource/registry.js';
 import { QueryResult } from '../datasource/types.js';
 import { safePath } from '../fs/files.js';
-import { clearSourceSummaryFailure, readSourceSummary, readSourceSummaryFailure, recordSourceSummaryFailure } from '../fs/sidecar.js';
+import { clearSourceSummaryFailure, readSourceSummary, readSourceSummaryFailure, recordSourceSummaryFailure, SourceSummaryCache, writeSourceSummary } from '../fs/sidecar.js';
 import { slugify } from '../graph/store.js';
 import { applyDocScope } from '../ingest/apply.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
@@ -22,9 +22,11 @@ import { readMatter, writeMatter } from '../markdown.js';
 import { isGeneratedConcept, okfGenerated } from '../okf/index.js';
 import { getDocHeat } from '../stats/heat.js';
 import { Store } from '../store/db.js';
-import { toDateString, toIso } from '../store/temporal.js';
+import { Params, toDateString, toIso } from '../store/temporal.js';
 import { DocumentRow } from '../types.js';
+import { entitiesIndex, entitiesShelf, NavPageKind, overviewHoldings, pagesIndex, pagesShelf, sourcesIndex, sourcesShelf, wikiContents } from './nav-views.js';
 import { hasRegions, renderRegion, replaceRegion, splitRegions } from './regions.js';
+import { CORPUS_GENERATORS, CorpusPageKind } from './corpus-views.js';
 import { asSummaryLanguage, detectSummaryLanguage, documentChars, isShortDocument, planSummary, produceSummary, shortByRow, summaryMinChars, summaryScaffold } from './summary.js';
 
 /**
@@ -46,7 +48,7 @@ import { asSummaryLanguage, detectSummaryLanguage, documentChars, isShortDocumen
  * job (docs/design/09) — but rows of that kind may still exist until
  * `retireConceptClusterPages` archives them.
  */
-export type PageKind = 'entity_stub' | 'source_summary' | 'dataset' | 'sources_index' | 'hot_topics' | 'concept_cluster' | 'dream' | 'research_index';
+export type PageKind = 'entity_stub' | 'source_summary' | 'dataset' | 'sources_index' | 'entities_index' | 'hot_topics' | 'concept_cluster' | 'dream' | 'research_index' | NavPageKind | CorpusPageKind;
 
 export interface PagesContext {
   store: Store;
@@ -68,7 +70,8 @@ export interface PagePlan {
 
 export interface PageRender {
   frontmatter: Record<string, unknown>;
-  regions: Record<string, string>;
+  /** null removes the region: a section with nothing to show this time. */
+  regions: Record<string, string | null>;
 }
 
 export interface PageGenerator {
@@ -105,9 +108,36 @@ function knodeMeta(view: PageKind, inputs: Record<string, string[]>): Record<str
 
 /* ------------------------------ generators ------------------------------ */
 
+/** Claims an entity page lists at most, newest first; past these it says how many there are and where to ask. */
+export const ENTITY_PAGE_CLAIMS = 300;
+/** Claims about other entities that name this one, and relations, listed at most. */
+const ENTITY_PAGE_LINKED = 60;
+
+interface PageClaim {
+  id: string; statement: string; status: string; kind?: string; valid_from: string | null; valid_to: string | null;
+  event_at?: string | null; superseded_by?: string | null; fold_sha?: string; path?: string | null;
+}
+interface PageMention extends PageClaim { subject: string; subject_page: string | null }
+interface PageRelation { id: string; type: string; description: string; out: boolean; other: string; other_page: string | null; path: string | null }
+interface PageConflict { a: string; a_path: string | null; b: string; b_path: string | null; reason: string }
+
+/**
+ * An entity's page: everything the knowledge base holds about it, each line
+ * with the document it comes from.
+ *
+ * It is the one place where what many documents say about one thing stands
+ * together, which no search over the documents assembles: its facts, the
+ * views and forecasts about it, its dated history in order, what sources
+ * disagree on, what claims about other entities say of it, and its
+ * relations. Every line names its source, so a
+ * reader can cite the document and open it. The page used to list the newest
+ * thirty claims without sources: for a person with 119 claims from 53
+ * documents it held a quarter of what was known and could not say where any
+ * of it came from.
+ */
 const entityStub: PageGenerator = {
   kind: 'entity_stub',
-  version: 2,
+  version: 5,
   llm: false,
   mode: 'file',
   async plan(ctx, pagePath) {
@@ -123,33 +153,83 @@ const entityStub: PageGenerator = {
       if (!c) return null;
       return {
         deps: [{ kind: 'entity', id, required: true, sha: e.fold_sha }, { kind: 'entity', id: c.id, sha: c.fold_sha }],
-        inputsSha: sha16(['entity_stub@2', 'redirect', e.fold_sha, c.id]),
+        inputsSha: sha16(['entity_stub@5', 'redirect', e.fold_sha, c.id]),
         data: { entity: e, claims: [], redirect: { id: c.id, name: c.name } },
       };
     }
-    const claims = await ctx.store.query<{ id: string; statement: string; status: string; kind: string; valid_from: string | null; valid_to: string | null; event_at: string | null; superseded_by: string | null; fold_sha: string }>(
-      `SELECT id, statement, status, kind, valid_from, valid_to, event_at, superseded_by, fold_sha FROM claims
-       WHERE subject_id = $1 AND tx_to IS NULL AND canonical_id IS NULL ORDER BY COALESCE(event_at, valid_from) DESC NULLS LAST, tx_from DESC, id LIMIT 30`,
+    const claims = await ctx.store.query<PageClaim>(
+      `SELECT cl.id, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at, cl.superseded_by, cl.fold_sha, s.key AS path
+       FROM claims cl LEFT JOIN scopes s ON s.id = cl.primary_scope_id
+       WHERE cl.subject_id = $1 AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
+       ORDER BY COALESCE(cl.event_at, cl.valid_from) DESC NULLS LAST, cl.tx_from DESC, cl.id LIMIT $2`,
+      [id, ENTITY_PAGE_CLAIMS],
+    );
+    const [{ n: total }] = await ctx.store.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM claims WHERE subject_id = $1 AND tx_to IS NULL AND canonical_id IS NULL`,
       [id],
+    );
+    const mentions = await ctx.store.query<PageMention>(
+      `SELECT cl.id, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at, cl.superseded_by, cl.fold_sha, s.key AS path,
+              se.name AS subject, se.wiki_path AS subject_page
+       FROM claims cl JOIN entities se ON se.id = cl.subject_id LEFT JOIN scopes s ON s.id = cl.primary_scope_id
+       WHERE cl.object_id = $1 AND cl.subject_id <> $1 AND cl.tx_to IS NULL AND cl.canonical_id IS NULL AND cl.superseded_by IS NULL
+       ORDER BY COALESCE(cl.event_at, cl.valid_from) DESC NULLS LAST, cl.tx_from DESC, cl.id LIMIT $2`,
+      [id, ENTITY_PAGE_LINKED],
+    );
+    // a relation's source: its document, else the document its evidence came
+    // from — tier 1 writes that evidence on a `tier1` scope keyed by the path
+    const relations = await ctx.store.query<PageRelation & { fold_sha: string }>(
+      `SELECT r.id, r.type, r.description, (r.source_id = $1) AS out, o.name AS other, o.wiki_path AS other_page, r.fold_sha,
+              COALESCE(d.path, (
+                SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
+                WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL AND s.kind IN ('doc', 'tier1')
+                ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
+       FROM relations r
+       JOIN entities o ON o.id = CASE WHEN r.source_id = $1 THEN r.target_id ELSE r.source_id END
+       LEFT JOIN documents d ON d.id = r.document_id
+       WHERE (r.source_id = $1 OR r.target_id = $1) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
+       ORDER BY r.weight DESC, r.id LIMIT $2`,
+      [id, ENTITY_PAGE_LINKED],
+    );
+    const ids = claims.map((c) => c.id);
+    const conflicts = ids.length === 0 ? [] : await ctx.store.query<PageConflict>(
+      `SELECT a.statement AS a, sa.key AS a_path, b.statement AS b, sb.key AS b_path, v.reason
+       FROM claim_pair_verdicts v
+       JOIN claims a ON a.id = v.a_id AND a.tx_to IS NULL
+       JOIN claims b ON b.id = v.b_id AND b.tx_to IS NULL
+       LEFT JOIN scopes sa ON sa.id = a.primary_scope_id LEFT JOIN scopes sb ON sb.id = b.primary_scope_id
+       WHERE v.relation = 'conflict' AND (v.a_id = ANY($1::text[]) OR v.b_id = ANY($1::text[]))
+       ORDER BY v.judged_at DESC, v.pair_id LIMIT 30`,
+      [ids],
     );
     return {
       deps: [
         { kind: 'entity', id, required: true, sha: e.fold_sha },
-        ...claims.map((c) => ({ kind: 'claim' as const, id: c.id, sha: c.fold_sha })),
+        ...claims.map((c) => ({ kind: 'claim' as const, id: c.id, sha: c.fold_sha! })),
+        ...mentions.map((c) => ({ kind: 'claim' as const, id: c.id, sha: c.fold_sha! })),
+        ...relations.map((r) => ({ kind: 'relation' as const, id: r.id, sha: r.fold_sha })),
       ],
-      inputsSha: sha16(['entity_stub@3', e.fold_sha, claims.map((c) => [c.fold_sha, c.superseded_by])]),
-      data: { entity: e, claims },
+      inputsSha: sha16([
+        'entity_stub@5', e.fold_sha, total,
+        claims.map((c) => [c.fold_sha, c.superseded_by, c.path]),
+        mentions.map((c) => [c.fold_sha, c.path, c.subject, c.subject_page]),
+        relations.map((r) => [r.fold_sha, r.other, r.other_page, r.path]),
+        conflicts.map((c) => [c.a, c.b, c.reason]),
+      ]),
+      data: { entity: e, claims, total, mentions, relations, conflicts },
     };
   },
   async render(_ctx, _pagePath, plan) {
     const e = plan.data.entity as { id: string; name: string; type: string; description: string; aliases: string[] };
-    const claims = plan.data.claims as { id: string; statement: string; status: string; kind?: string; valid_from: string | null; valid_to: string | null; event_at?: string | null; superseded_by?: string | null }[];
+    const claims = plan.data.claims as PageClaim[];
+    const total = (plan.data.total as number | undefined) ?? claims.length;
+    const mentions = (plan.data.mentions as PageMention[] | undefined) ?? [];
+    const relations = (plan.data.relations as PageRelation[] | undefined) ?? [];
+    const conflicts = (plan.data.conflicts as PageConflict[] | undefined) ?? [];
     const redirect = plan.data.redirect as { id: string; name: string } | undefined;
     const lines = redirect
       ? [`# ${e.name}`, '', `→ 已合并到 [[${redirect.name}]]（merged into; \`knode-os entities unmerge ${e.id}\` reverts it）`]
       : [`# ${e.name}`, '', e.description || '_No description yet — fill me in._'];
-    // gbrain's split: the compiled truth (what holds now) above, the dated history below;
-    // views, forecasts and rumours are not facts and get their own list, tagged by kind
     const now = new Date().toISOString();
     const kindOf = (c: { kind?: string }) => c.kind ?? 'fact';
     const periodOf = (c: { valid_from: string | null; valid_to: string | null }) => {
@@ -157,16 +237,30 @@ const entityStub: PageGenerator = {
       const to = toDateString(c.valid_to);
       return from || to ? ` \`${from ?? '?'} ~ ${to ?? ''}\`` : '';
     };
+    const from = (p?: string | null) => (p ? ` — ${p}` : '');
+    const linked = (name: string, page: string | null) => (page ? `[[${name}]]` : name);
+    const sources = new Map<string, number>();
+    for (const c of claims) if (c.path) sources.set(c.path, (sources.get(c.path) ?? 0) + 1);
+    if (!redirect && total > 0) {
+      const docs = sources.size;
+      lines.push('', total > claims.length
+        ? `_${total} claims; the newest ${claims.length} are listed here from ${docs} ${docs === 1 ? 'document' : 'documents'} — \`knode_claims\` with subject "${e.name}" returns the rest._`
+        : `_${total} ${total === 1 ? 'claim' : 'claims'} from ${docs} ${docs === 1 ? 'document' : 'documents'}._`);
+    }
+    // gbrain's split: the compiled truth (what holds now) above, the dated history below;
+    // views, forecasts and rumours are not facts and get their own list, tagged by kind.
+    // Something that happened on a day is history: it stands in the timeline alone.
+    const happened = (c: PageClaim) => Boolean(toIso(c.event_at ?? null));
     const live = claims.filter((c) => !c.superseded_by && !(toIso(c.valid_to) && toIso(c.valid_to)! < now));
-    const current = live.filter((c) => kindOf(c) === 'fact');
+    const current = live.filter((c) => kindOf(c) === 'fact' && !happened(c));
     if (current.length > 0) {
       lines.push('', '## Facts (current)', '');
-      for (const c of current) lines.push(`- ${c.statement} \`${c.status}\`${periodOf(c)}`);
+      for (const c of current) lines.push(`- ${c.statement} \`${c.status}\`${periodOf(c)}${from(c.path)}`);
     }
-    const views = live.filter((c) => kindOf(c) !== 'fact');
+    const views = live.filter((c) => kindOf(c) !== 'fact' && !happened(c));
     if (views.length > 0) {
       lines.push('', '## Views and forecasts', '');
-      for (const c of views) lines.push(`- ${c.statement} \`${kindOf(c)}\`${c.status === 'fact' ? '' : ` \`${c.status}\``}${periodOf(c)}`);
+      for (const c of views) lines.push(`- ${c.statement} \`${kindOf(c)}\`${c.status === 'fact' ? '' : ` \`${c.status}\``}${periodOf(c)}${from(c.path)}`);
     }
     const dated = claims
       .filter((c) => toIso(c.event_at ?? null) || toIso(c.valid_from))
@@ -175,7 +269,28 @@ const entityStub: PageGenerator = {
       lines.push('', '## Timeline', '');
       for (const c of dated) {
         const when = toDateString(c.event_at ?? null) ?? toDateString(c.valid_from);
-        lines.push(`- ${when} · ${c.statement} \`${c.status}\`${kindOf(c) === 'fact' ? '' : ` \`${kindOf(c)}\``}${c.superseded_by ? ' _(superseded)_' : ''}`);
+        lines.push(`- ${when} · ${c.statement} \`${c.status}\`${kindOf(c) === 'fact' ? '' : ` \`${kindOf(c)}\``}${c.superseded_by ? ' _(superseded)_' : ''}${from(c.path)}`);
+      }
+    }
+    const disputed = claims.filter((c) => c.status === 'disputed');
+    if (conflicts.length > 0 || disputed.length > 0) {
+      lines.push('', '## Disagreements', '');
+      for (const c of conflicts) lines.push(`- ${c.a}${from(c.a_path)} ⟷ ${c.b}${from(c.b_path)}${c.reason ? ` (${c.reason})` : ''}`);
+      for (const c of disputed) lines.push(`- ${c.statement} \`disputed\`${from(c.path)}`);
+    }
+    if (mentions.length > 0) {
+      lines.push('', '## In claims about others', '');
+      for (const c of mentions) {
+        const when = toDateString(c.event_at ?? null);
+        lines.push(`- ${when ? `${when} · ` : ''}${linked(c.subject, c.subject_page)}: ${c.statement} \`${kindOf(c) === 'fact' ? c.status : kindOf(c)}\`${from(c.path)}`);
+      }
+    }
+    if (relations.length > 0) {
+      lines.push('', '## Relations', '');
+      for (const r of relations) {
+        const other = linked(r.other, r.other_page);
+        const type = r.type.replace(/_/g, ' ');
+        lines.push(`- ${r.out ? `${type} → ${other}` : `${other} → ${type}`}${r.description ? `: ${r.description}` : ''}${from(r.path)}`);
       }
     }
     return {
@@ -184,7 +299,9 @@ const entityStub: PageGenerator = {
         type: e.type,
         aliases: Array.isArray(e.aliases) ? e.aliases : [],
         generated: okfGenerated('knode-os/entity_stub'),
-        knode: knodeMeta('entity_stub', { entities: [e.id], claims: claims.map((c) => c.id) }),
+        // the claims and documents behind the page are its deps (`knode_lineage` lists them), and every
+        // line names its source: three hundred ids here would be a fifth of the file
+        knode: knodeMeta('entity_stub', { entities: [e.id] }),
       },
       regions: { body: lines.join('\n') },
     };
@@ -192,14 +309,134 @@ const entityStub: PageGenerator = {
 };
 
 /**
+ * Claims a summary page lists at most, and the bytes their section may take.
+ * A summary keeps the gist and drops the particular: on the pilot's pages the
+ * model's text held 13% of a law chapter's figures and dates (2% of its
+ * article numbers), 28% of a paper's, 52% of a drug label's. The claims
+ * extracted from the document carry them, so the page lists those below the
+ * model's text. In these packs a document has 13–24 claims (25 at most), and
+ * all of them cost 1.6–4.6 KB a page; with the figures first, 20 already held
+ * nearly all a page gains (docs/design/14 §6). 30 and 6 KB bound a long
+ * document's hundreds.
+ */
+export const SUMMARY_PAGE_CLAIMS = 30;
+const SUMMARY_CLAIMS_BYTES = 6000;
+
+interface SummaryClaim {
+  id: string; statement: string; status: string; kind: string | null; valid_from: string | null; valid_to: string | null;
+  event_at: string | null; superseded_by: string | null; fold_sha: string; seq: number | null;
+}
+
+/** A figure in a statement: a digit, or a Chinese numeral with what it counts. */
+const CLAIM_FIGURE_RE = /\d|[零〇一二两三四五六七八九十百千万亿]+(?:年|个?月|日|号|条|款|项|章|节|元|人|次|个|倍|天|周|岁|%)/;
+
+/**
+ * The claims of the page's document, the most informative first: those with
+ * a figure and a date, then a figure, then a date, each group in the
+ * document's order; within the bounds, listed in the document's order.
+ * A claim is the document's when the document's own scopes (its apply,
+ * its tier-1 extraction) are evidence for it — which covers its frontmatter's
+ * claims, that have no chunk — or when it was extracted from one of its
+ * chunks (`claims.document_id` is not filled by tier 1; `chunk_id` is). Both
+ * lookups are indexed. A claim another document states too is listed on both
+ * pages: each says it.
+ */
+async function summaryClaims(store: Store, doc: DocumentRow): Promise<{ claims: SummaryClaim[]; total: number }> {
+  const all = await store.query<SummaryClaim>(
+    `WITH own AS (SELECT id FROM scopes WHERE key = $1 AND kind IN ('doc', 'tier1') AND status <> 'disposed'),
+          ids AS (SELECT ev.target_id AS id FROM evidence ev JOIN own ON ev.scope_id = own.id WHERE ev.kind = 'claim' AND ev.tx_to IS NULL
+                  UNION SELECT cl.id FROM chunks ch JOIN claims cl ON cl.chunk_id = ch.id WHERE ch.document_id = $2)
+     SELECT cl.id, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at, cl.superseded_by, cl.fold_sha,
+            CASE WHEN ch.document_id = $2 THEN ch.seq END AS seq
+     FROM ids JOIN claims cl ON cl.id = ids.id LEFT JOIN chunks ch ON ch.id = cl.chunk_id
+     WHERE cl.tx_to IS NULL
+     ORDER BY 10 NULLS FIRST, cl.tx_from, cl.id`,
+    [doc.path, doc.id],
+  );
+  const dated = (c: SummaryClaim) => Boolean(toIso(c.event_at) || toIso(c.valid_from) || toIso(c.valid_to));
+  const weight = (c: SummaryClaim) => (CLAIM_FIGURE_RE.test(c.statement) ? 2 : 0) + (dated(c) ? 1 : 0);
+  const ranked = all.map((c, i) => ({ c, i, w: weight(c) })).sort((a, b) => b.w - a.w || a.i - b.i);
+  const picked: { c: SummaryClaim; i: number }[] = [];
+  let bytes = 0;
+  for (const r of ranked) {
+    if (picked.length >= SUMMARY_PAGE_CLAIMS) break;
+    const b = Buffer.byteLength(r.c.statement) + 40;
+    if (bytes + b > SUMMARY_CLAIMS_BYTES && picked.length > 0) continue;
+    bytes += b;
+    picked.push(r);
+  }
+  return { claims: picked.sort((a, b) => a.i - b.i).map((r) => r.c), total: all.length };
+}
+
+/** The claims section: each claim with its date, tagged when it is a view, a forecast, disputed or superseded. */
+function renderSummaryClaims(claims: SummaryClaim[], total: number, heading: string): string | null {
+  if (claims.length === 0) return null;
+  const lines = [`## ${heading}`, ''];
+  if (total > claims.length) lines.push(`_${claims.length} of ${total} claims extracted from this document, those with figures and dates first; \`knode_claims\` returns the rest._`, '');
+  for (const c of claims) {
+    const when = toDateString(c.event_at);
+    const from = toDateString(c.valid_from);
+    const to = toDateString(c.valid_to);
+    const date = when ? ` \`${when}\`` : from || to ? ` \`${from ?? '?'} ~ ${to ?? ''}\`` : '';
+    const kind = c.kind && c.kind !== 'fact' ? ` \`${c.kind}\`` : '';
+    const status = c.status !== 'fact' ? ` \`${c.status}\`` : '';
+    lines.push(`- ${c.statement.replace(/\s+/g, ' ').trim()}${date}${kind}${status}${c.superseded_by ? ' _(superseded)_' : ''}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * The model-written body of a document's summary page: the sidecar's cache
+ * for the document's content, else — a workspace whose sidecars were not
+ * kept, or a cache lost — the body region of the page already written for
+ * that same content (its document dep carries the hash it was written from).
+ * `restore` writes that body back to the cache, so the next render reads it
+ * there. Either way no model is called.
+ */
+async function summaryBody(ctx: PagesContext, pagePath: string, doc: DocumentRow, restore: boolean): Promise<SourceSummaryCache | null> {
+  const cached = readSourceSummary(ctx.dataDir, doc.path);
+  if (cached && cached.contentSha === doc.sha256) return cached;
+  const deps = await readDeps(ctx.store, { kind: 'page', id: pagePath });
+  if (deps.find((d) => d.input_kind === 'document' && d.input_id === doc.path)?.input_sha !== doc.sha256) return null;
+  const abs = safePath(ctx.dataDir, pagePath);
+  if (!fs.existsSync(abs)) return null;
+  const text = fs.readFileSync(abs, 'utf8');
+  const body = splitRegions(text).regions.get('body')?.trim();
+  if (!body) return null;
+  let front: Record<string, unknown> = {};
+  try {
+    front = readMatter(text).data as Record<string, unknown>;
+  } catch {
+    front = {};
+  }
+  const generated = (front.generated ?? {}) as { by?: unknown; at?: unknown };
+  const coverage = front.coverage as SourceSummaryCache['coverage'] | undefined;
+  const adopted: SourceSummaryCache = {
+    contentSha: doc.sha256,
+    model: typeof generated.by === 'string' ? generated.by.replace(/^knode-os\//, '') : 'unknown',
+    generatedAt: typeof generated.at === 'string' ? generated.at : new Date().toISOString(),
+    body,
+    language: detectSummaryLanguage(body),
+    ...(coverage && typeof coverage === 'object' ? { coverage } : {}),
+  };
+  if (restore) writeSourceSummary(ctx.dataDir, doc.path, adopted);
+  return adopted;
+}
+
+/**
  * The Summarize stage's page (docs/design/14). What it asks a model and what
  * it makes of the answer lives in ./summary.ts, shared with the leased work
  * source (src/work/summarize.ts); the one-shot pass calls the model from
  * `render`, through `produceSummary`.
+ *
+ * Below the model's text (region `body`, cached by the document's content)
+ * the page lists the document's claims (region `claims`), generated from the
+ * database: they are the page's deps, so a re-extraction re-renders the page
+ * from the cached body without a model call.
  */
 const sourceSummary: PageGenerator = {
   kind: 'source_summary',
-  version: 2,
+  version: 3,
   llm: true,
   client: (ctx) => documentSummaryLlm(ctx),
   mode: 'file',
@@ -215,19 +452,23 @@ const sourceSummary: PageGenerator = {
     // a document under the size threshold gets no page: one written before the
     // threshold is archived when its document next changes (`wiki prune-summaries` sweeps the rest)
     if (await isShortDocument(ctx.store, ctx.dataDir, doc, summaryMinChars(ctx.config))) return null;
+    const { claims, total } = await summaryClaims(ctx.store, doc);
     return {
-      deps: [{ kind: 'document', id: doc.path, required: true, sha: doc.sha256 }],
-      inputsSha: sha16(['source_summary@2', doc.sha256]),
-      data: { doc },
+      deps: [
+        { kind: 'document', id: doc.path, required: true, sha: doc.sha256 },
+        ...claims.map((c) => ({ kind: 'claim' as const, id: c.id, sha: c.fold_sha })),
+      ],
+      inputsSha: sha16(['source_summary@3', doc.sha256, total, claims.map((c) => [c.fold_sha, c.superseded_by])]),
+      data: { doc, claims, total },
     };
   },
-  async render(ctx, _pagePath, plan) {
+  async render(ctx, pagePath, plan) {
     const doc = plan.data.doc as DocumentRow;
     const llm = documentSummaryLlm(ctx);
     // generated.by/at describe the body we are about to write, so a cache hit
     // reports the model and instant that produced it, not this regeneration.
-    let cached = readSourceSummary(ctx.dataDir, doc.path);
-    if (!cached || cached.contentSha !== doc.sha256) {
+    let cached = await summaryBody(ctx, pagePath, doc, true);
+    if (!cached) {
       if (!llm.enabled) return null;
       const work = await planSummary(ctx.store, ctx.dataDir, ctx.config, doc);
       if (work.kind === 'none') return null;
@@ -237,6 +478,8 @@ const sourceSummary: PageGenerator = {
     const language = asSummaryLanguage(cached.language) ?? detectSummaryLanguage(cached.body);
     const heat = (await getDocHeat(ctx.store, [doc.id], ctx.config.heat)).get(doc.id) ?? 0;
     const title = doc.title ?? path.basename(doc.path);
+    const claims = (plan.data.claims as SummaryClaim[] | undefined) ?? [];
+    const total = (plan.data.total as number | undefined) ?? claims.length;
     return {
       frontmatter: {
         title,
@@ -248,7 +491,8 @@ const sourceSummary: PageGenerator = {
         generated: okfGenerated(`knode-os/${cached.model}`, cached.generatedAt),
         knode: knodeMeta('source_summary', { documents: [doc.path] }),
       },
-      regions: { body: cached.body.trim() },
+      // a document without claims has no section, and one that had a section loses it
+      regions: { body: cached.body.trim(), claims: renderSummaryClaims(claims, total, summaryScaffold(language).claims) },
     };
   },
 };
@@ -348,54 +592,6 @@ function renderDatasetBody(
   return lines.join('\n');
 }
 
-const sourcesIndex: PageGenerator = {
-  kind: 'sources_index',
-  version: 2,
-  llm: false,
-  mode: 'region',
-  async plan(ctx) {
-    const docs = await ctx.store.query<DocumentRow>(
-      `SELECT * FROM documents WHERE root = 'docs' AND status = 'indexed' AND kind = 'source' ORDER BY updated_at DESC LIMIT 2000`,
-    );
-    if (docs.length === 0) return null;
-    const heat = await getDocHeat(ctx.store, docs.map((d) => d.id), ctx.config.heat);
-    const pages = await summaryPagesByDocument(ctx.store);
-    const minChars = summaryMinChars(ctx.config);
-    const rows = docs.map((d) => {
-      const h = heat.get(d.id) ?? 0;
-      const page = pages.get(d.path)?.path ?? null;
-      // under the size threshold by its row alone; a row without `chars` that its bytes do not
-      // settle reads as merely unsummarized until the Summarize stage's scan fills the column in
-      const short = !page && shortByRow(d, minChars) === true;
-      return { path: d.path, title: d.title ?? path.basename(d.path), page: page ? path.posix.basename(page) : null, heat: h, cold: h < ctx.config.heat.coldThreshold, short, sha: d.sha256 };
-    });
-    const setSha = sha16(rows.map((r) => [r.path, r.sha, r.page, r.cold, r.short, Math.round(r.heat * 100)]));
-    return {
-      deps: [
-        { kind: 'set', id: 'docs', sha: setSha },
-        ...docs.map((d) => ({ kind: 'document' as const, id: d.path, sha: d.sha256 })),
-      ],
-      inputsSha: sha16(['sources_index@2', setSha]),
-      data: { rows },
-    };
-  },
-  async render(_ctx, _pagePath, plan) {
-    const rows = plan.data.rows as { path: string; title: string; page: string | null; heat: number; cold: boolean; short?: boolean }[];
-    const lines = [
-      '## Sources index',
-      '',
-      'Every indexed document, most recently updated first, linked to its summary page once the Summarize stage has written one. A document under `extraction.summaryMinChars` (`short`) gets none: search finds the document itself.',
-      '',
-      ...rows.map((r) => {
-        const link = r.page ? `[${r.title}](${r.page})` : r.title;
-        const badge = r.cold ? ' `cold`' : ` \`heat ${r.heat.toFixed(2)}\``;
-        return `* ${link} - \`${r.path}\`${badge}${r.short ? ' `short`' : ''}`;
-      }),
-    ];
-    return { frontmatter: {}, regions: { sources: lines.join('\n') } };
-  },
-};
-
 export interface HotEntity {
   id: string;
   name: string;
@@ -450,7 +646,7 @@ export async function hotEntities(store: Store, limit: number): Promise<HotEntit
 
 const hotTopics: PageGenerator = {
   kind: 'hot_topics',
-  version: 2,
+  version: 3,
   llm: false,
   mode: 'region',
   async plan(ctx) {
@@ -468,7 +664,8 @@ const hotTopics: PageGenerator = {
   },
   async render(_ctx, _pagePath, plan) {
     const hot = plan.data.hot as HotEntity[];
-    const lines = ['## Hot topics', '', ...hot.map((e) => `- [[${e.name}]] — ${e.type}, mentions ${e.mention_count}, heat ${e.heat.toFixed(2)}`)];
+    // heat is what reading through knode adds: zero on a base nobody has read yet, and then it says nothing
+    const lines = ['## Hot topics', '', ...hot.map((e) => `- [[${e.name}]] — ${e.type}, mentions ${e.mention_count}${e.heat > 0 ? `, heat ${e.heat.toFixed(2)}` : ''}`)];
     return { frontmatter: {}, regions: { 'hot-topics': lines.join('\n') } };
   },
 };
@@ -535,7 +732,15 @@ export const GENERATORS: Partial<Record<PageKind, PageGenerator>> = {
   source_summary: sourceSummary,
   dataset,
   sources_index: sourcesIndex,
+  entities_index: entitiesIndex,
   hot_topics: hotTopics,
+  sources_shelf: sourcesShelf,
+  entities_shelf: entitiesShelf,
+  pages_index: pagesIndex,
+  pages_shelf: pagesShelf,
+  wiki_contents: wikiContents,
+  overview_holdings: overviewHoldings,
+  ...CORPUS_GENERATORS,
 };
 
 /* ----------------------------- composition ------------------------------ */
@@ -543,10 +748,10 @@ export const GENERATORS: Partial<Record<PageKind, PageGenerator>> = {
 const FRONTMATTER_RE = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/;
 
 /** Merge generated frontmatter keys and regions into an existing page (or build a fresh one). */
-export function composePage(existing: string | null, frontmatter: Record<string, unknown>, regions: Record<string, string>): string {
+export function composePage(existing: string | null, frontmatter: Record<string, unknown>, regions: Record<string, string | null>): string {
   if (!existing) {
     const front = Object.keys(frontmatter).length ? writeMatter('', frontmatter).trimEnd() : '';
-    const body = Object.entries(regions).map(([id, c]) => renderRegion(id, c)).join('\n\n');
+    const body = Object.entries(regions).flatMap(([id, c]) => (c === null ? [] : [renderRegion(id, c)])).join('\n\n');
     return `${front ? front + '\n\n' : ''}${body}\n`;
   }
   let parsed: { data: Record<string, unknown>; content: string };
@@ -584,6 +789,8 @@ export interface RegenerateOptions {
   at?: string;
   force?: boolean;
   hint?: Record<string, unknown>;
+  /** A page a model writes is written only when its render needs no model (its answer is cached), else deferred. */
+  cachedOnly?: boolean;
 }
 
 export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: PageKind, opts: RegenerateOptions = {}): Promise<RegenerateOutcome> {
@@ -591,7 +798,7 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
   if (!gen) return 'deferred';
   const actor = opts.actor ?? 'pages';
   const { store } = ctx;
-  const [row] = await store.query<{ path: string; status: string }>(`SELECT path, status FROM pages WHERE path = $1`, [pagePath]);
+  const [row] = await store.query<{ path: string; status: string; generator: string | null }>(`SELECT path, status, generator FROM pages WHERE path = $1`, [pagePath]);
 
   const plan = await gen.plan(ctx, pagePath, opts.hint);
   if (!plan) {
@@ -600,14 +807,17 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
     return 'archived';
   }
   const live = await findLiveScope(store, 'page', pagePath);
-  if (live && live.sha === plan.inputsSha && !opts.force) {
+  // the same inputs through a newer generator make a different page; one a model writes waits for its inputs to
+  // change, except a summary, whose model-written body is cached (a summary without its cache goes through the model)
+  const outdated = (!gen.llm || kind === 'source_summary') && Boolean(row?.generator) && row!.generator !== `${kind}@${gen.version}`;
+  if (live && live.sha === plan.inputsSha && !opts.force && !outdated) {
     if (row?.status === 'dirty') await store.query(`UPDATE pages SET status = 'active', dirty_reason = NULL WHERE path = $1`, [pagePath]);
     return 'unchanged';
   }
   // the model this generator writes with — the Summarize stage for a summary,
   // not `ctx.llm` — decides whether an uncached page can be written now
   const client = gen.client?.(ctx) ?? ctx.llm;
-  if (gen.llm && !client.enabled && !(await cachedRenderAvailable(ctx, gen, pagePath, plan))) return 'deferred';
+  if (gen.llm && (!client.enabled || opts.cachedOnly) && !(await cachedRenderAvailable(ctx, gen, pagePath, plan))) return 'deferred';
 
   const rendered = await gen.render(ctx, pagePath, plan);
   if (!rendered) return 'deferred';
@@ -634,9 +844,10 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
     text = replaceRegion(existing ?? '', region ?? 'body', regionContent);
   }
   const fileSha = sha256(text);
-  const regions = Object.entries(rendered.regions).map(([id, c]) => ({ id, sha: sha16(c) }));
+  const regions = Object.entries(rendered.regions).flatMap(([id, c]) => (c === null ? [] : [{ id, sha: sha16(c) }]));
 
-  await applyScope(store, { kind: 'page', key: pagePath }, plan.inputsSha, { actor, at: opts.at, meta: { kind, file } }, async (w) => {
+  // the same inputs through a newer generator are a new version of the page
+  await applyScope(store, { kind: 'page', key: pagePath }, plan.inputsSha, { actor, at: opts.at, meta: { kind, file }, force: outdated }, async (w) => {
     await w.page({ path: pagePath, kind, generator: `${kind}@${gen.version}`, inputs_sha: plan.inputsSha, file_sha: fileSha, regions });
     await w.deps({ kind: 'page', id: pagePath }, plan.deps);
     if (kind === 'entity_stub') await w.setWikiPath((plan.data.entity as { id: string }).id, pagePath);
@@ -650,11 +861,11 @@ export async function regeneratePage(ctx: PagesContext, pagePath: string, kind: 
   return 'regenerated';
 }
 
-async function cachedRenderAvailable(ctx: PagesContext, gen: PageGenerator, _pagePath: string, plan: PagePlan): Promise<boolean> {
+async function cachedRenderAvailable(ctx: PagesContext, gen: PageGenerator, pagePath: string, plan: PagePlan): Promise<boolean> {
   if (gen.kind === 'source_summary') {
     const doc = plan.data.doc as DocumentRow | undefined;
     if (!doc) return false;
-    return readSourceSummary(ctx.dataDir, doc.path)?.contentSha === doc.sha256;
+    return (await summaryBody(ctx, pagePath, doc, false)) !== null;
   }
   return false;
 }
@@ -717,12 +928,21 @@ export async function reconcileViews(
   // scoped pass reads only the page files under its prefixes: an edit or a
   // removal anywhere else is reported by the watcher and synced on its own,
   // and a full pass reads them all
-  const live = await store.query<{ path: string; kind: PageKind; status: string; file_sha: string | null; regions: { id: string; sha: string }[] }>(
-    `SELECT path, kind, status, file_sha, regions FROM pages WHERE status IN ('active', 'dirty')`,
+  const live = await store.query<{ path: string; kind: PageKind; status: string; file_sha: string | null; generator: string | null; regions: { id: string; sha: string }[] }>(
+    `SELECT path, kind, status, file_sha, generator, regions FROM pages WHERE status IN ('active', 'dirty')`,
   );
   for (const p of live) {
     const { file } = splitPagePath(p.path);
     if (!matchesPrefixes(file, opts.prefixes)) continue;
+    // a page a model did not write, written by an older version of its generator, is written again:
+    // it costs nothing, and otherwise it keeps the old layout until one of its inputs happens to change
+    // — so is a summary page: its model-written body is cached, and the rest is generated (a page whose cache is
+    // gone waits for a pass that may call the model)
+    const gen = GENERATORS[p.kind];
+    if (gen && (!gen.llm || gen.kind === 'source_summary') && p.status === 'active' && p.generator && p.generator !== `${p.kind}@${gen.version}`) {
+      await store.query(`UPDATE pages SET status = 'dirty', dirty_reason = $2::jsonb WHERE path = $1`, [p.path, JSON.stringify({ generator: `${p.kind}@${gen.version}` })]);
+      p.status = 'dirty';
+    }
     const abs = safePath(ctx.dataDir, file);
     if (!fs.existsSync(abs)) {
       progress(`page file missing, archiving ${p.path}`);
@@ -754,14 +974,15 @@ export async function reconcileViews(
     for (const p of dirty) {
       const gen = GENERATORS[p.kind];
       if (!gen) continue;
-      if (gen.llm && !opts.llm) {
+      // a summary page whose claims changed is re-rendered from its cached body without a model
+      if (gen.llm && !opts.llm && gen.kind !== 'source_summary') {
         if (!processed.has(p.path)) stats.deferred++;
         processed.add(p.path);
         continue;
       }
       processed.add(p.path);
       try {
-        const r = await regeneratePage(ctx, p.path, p.kind, { actor });
+        const r = await regeneratePage(ctx, p.path, p.kind, { actor, cachedOnly: gen.llm && !opts.llm });
         if (r === 'regenerated') {
           stats.regenerated++;
           progress(`regenerated ${p.path}`);
@@ -779,11 +1000,53 @@ export async function reconcileViews(
 
 /* ------------------------------ creation rules -------------------------- */
 
-/** Create stub pages for high-mention live entities that don't have a wiki page yet. */
-export async function ensureEntityStubs(ctx: PagesContext, opts: { minMentions?: number; max?: number; actor?: string } = {}): Promise<string[]> {
+/**
+ * Create pages for the live entities worth one that have none yet, the best
+ * documented first: an entity several documents make claims about, one with
+ * at least `minClaims` claims (default 3), or one mentioned at least
+ * `minMentions` times (default 2); null leaves a test out. The ones with the
+ * most documents behind their claims come first, so the pages a call can
+ * write go to what the knowledge base knows most about, not to the words it
+ * met most often.
+ *
+ * Mentions alone used to decide, thirty pages a call, and nothing called it
+ * but `wiki generate` and an initialization: a workspace of 27,000 documents
+ * had eight entity pages. `focus` restricts the pass to those entities — the
+ * ones a document pass has just written — so pages come as documents do.
+ * Without `max`, a call writes up to one page for every four documents, 30
+ * at least and 300 at most: a page is a file the next sync indexes and embeds.
+ */
+export async function ensureEntityStubs(
+  ctx: PagesContext,
+  opts: { minMentions?: number | null; minClaims?: number | null; max?: number; actor?: string; focus?: string[] } = {},
+): Promise<string[]> {
+  if (opts.focus && opts.focus.length === 0) return [];
+  let max = opts.max;
+  if (max === undefined) {
+    const [{ n }] = await ctx.store.query<{ n: number }>(`SELECT count(*)::int AS n FROM documents WHERE root = 'docs' AND status = 'indexed'`);
+    max = Math.min(300, Math.max(30, Math.ceil(n / 4)));
+  }
+  const p = new Params();
+  const tests = ['COALESCE(c.docs, 0) >= 2'];
+  const minClaims = opts.minClaims === undefined ? 3 : opts.minClaims;
+  const minMentions = opts.minMentions === undefined ? 2 : opts.minMentions;
+  if (minClaims !== null) tests.push(`COALESCE(c.claims, 0) >= ${p.add(minClaims)}`);
+  if (minMentions !== null) tests.push(`e.mention_count >= ${p.add(minMentions)}`);
+  const focus = opts.focus ? p.add(opts.focus) : null;
   const entities = await ctx.store.query<{ id: string }>(
-    `SELECT id FROM entities WHERE wiki_path IS NULL AND mention_count >= $1 AND tx_to IS NULL AND canonical_id IS NULL ORDER BY mention_count DESC LIMIT $2`,
-    [opts.minMentions ?? 2, opts.max ?? 30],
+    `SELECT e.id
+     FROM entities e
+     LEFT JOIN (
+       SELECT cl.subject_id, count(*) AS claims, count(DISTINCT cl.primary_scope_id) AS docs
+       FROM claims cl
+       WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL ${focus ? `AND cl.subject_id = ANY(${focus}::text[])` : ''}
+       GROUP BY cl.subject_id
+     ) c ON c.subject_id = e.id
+     WHERE e.wiki_path IS NULL AND e.tx_to IS NULL AND e.canonical_id IS NULL ${focus ? `AND e.id = ANY(${focus}::text[])` : ''}
+       AND (${tests.join(' OR ')})
+     ORDER BY COALESCE(c.docs, 0) DESC, COALESCE(c.claims, 0) DESC, e.mention_count DESC, e.id
+     LIMIT ${p.add(max)}`,
+    p.list,
   );
   const created: string[] = [];
   for (const e of entities) {
@@ -792,6 +1055,7 @@ export async function ensureEntityStubs(ctx: PagesContext, opts: { minMentions?:
     const r = await regeneratePage(ctx, pagePath, 'entity_stub', { actor: opts.actor });
     if (r === 'regenerated') created.push(pagePath);
   }
+  if (created.length > 0) await ensureEntitiesIndex(ctx, { actor: opts.actor });
   return created;
 }
 
@@ -917,6 +1181,29 @@ export async function writeSourceSummaryPage(
 }
 
 /** Where one document's summary page goes: where it is, else the title's path unless another document's page holds that. */
+/**
+ * Re-render, from their cached bodies, the summary pages of documents whose
+ * extraction just landed: a page lists its document's claims, and one written
+ * before them (`extraction.summaryAfterExtraction: false`, or a document
+ * extracted again) has no dep on the claims it does not list yet. No model
+ * is called; a page whose cache is gone is left for the Summarize stage.
+ */
+export async function refreshSummaryClaims(ctx: PagesContext, documents: string[], opts: { actor?: string } = {}): Promise<string[]> {
+  if (documents.length === 0) return [];
+  const rows = await ctx.store.query<{ page: string; doc: string }>(
+    `SELECT d.artifact_id AS page, d.input_id AS doc FROM deps d JOIN pages p ON p.path = d.artifact_id
+     WHERE d.artifact_kind = 'page' AND d.input_kind = 'document' AND d.input_id = ANY($1::text[])
+       AND p.kind = 'source_summary' AND p.status <> 'archived'`,
+    [documents],
+  );
+  const written: string[] = [];
+  for (const r of rows) {
+    const outcome = await regeneratePage(ctx, r.page, 'source_summary', { actor: opts.actor ?? 'summarize', hint: { documentPath: r.doc }, cachedOnly: true });
+    if (outcome === 'regenerated') written.push(r.page);
+  }
+  return written;
+}
+
 async function summaryPagePath(store: Store, doc: DocumentRow): Promise<string> {
   const pages = await summaryPagesByDocument(store);
   const own = pages.get(doc.path)?.path;
@@ -1057,8 +1344,14 @@ export async function pruneShortSummaries(
   return { minChars, archived, kept };
 }
 
+/** `wiki/sources/index.md` and the pages it is cut into (./navigation.ts, loaded here: it imports this module). */
 export async function ensureSourcesIndex(ctx: PagesContext, opts: { actor?: string } = {}): Promise<RegenerateOutcome> {
-  return regeneratePage(ctx, 'wiki/sources/index.md#sources', 'sources_index', { actor: opts.actor });
+  return (await import('./navigation.js')).refreshSourcesTree(ctx, opts);
+}
+
+/** `wiki/entities/index.md` and the pages it is cut into. */
+export async function ensureEntitiesIndex(ctx: PagesContext, opts: { actor?: string } = {}): Promise<RegenerateOutcome> {
+  return (await import('./navigation.js')).refreshEntitiesTree(ctx, opts);
 }
 
 export async function ensureHotTopics(ctx: PagesContext, opts: { actor?: string; force?: boolean } = {}): Promise<RegenerateOutcome> {

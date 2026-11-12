@@ -6,6 +6,7 @@ import { GUIDE_COPY, GUIDE_FILE } from '../fs/datadir.js';
 import { runDocumentPass } from '../ingest/background.js';
 import { sync } from '../ingest/sync.js';
 import { LlmClient } from '../llm/client.js';
+import { ensureNavigation } from '../wiki/navigation.js';
 import { ensureEntityStubs, ensureHotTopics, ensureSourcesIndex, reconcileViews } from '../wiki/pages.js';
 import { queueJob, ResearchJob, updateJob } from './jobs.js';
 import { extractJson } from './pipeline.js';
@@ -141,7 +142,8 @@ export async function prepareInit(ctx: AppContext, jobIn: ResearchJob, opts: { l
     const stubs = await ensureEntityStubs(ctx, { actor: 'init' });
     await ensureHotTopics(ctx, { actor: 'init', force: true });
     await ensureSourcesIndex(ctx, { actor: 'init' });
-    return { detail: `${stubs.length} entity stub(s) created; hot topics and sources index refreshed` };
+    const nav = await ensureNavigation(ctx, { actor: 'init' });
+    return { detail: `${stubs.length} entity stub(s) created; hot topics, indexes and the overview's holdings refreshed (${nav.written.length} written)` };
   });
   const survey = await step('survey', async () => {
     const s = await surveyKnowledgeBase(ctx);
