@@ -518,6 +518,27 @@ async function runFeedNow(ctx: SyncContext, feed: FeedDefinition, opts: FeedRunO
     }
     if (!dryRun) writeDocsIndex(ledger, docsIndex);
     result.removed = removed;
+    // what the run did is kept before it is indexed: the documents and the ledger are on disk, and indexing
+    // waits its turn behind every other sync in the process (a startup sync of a large workspace can take
+    // many minutes) — a crash in that wait leaves files the next sync indexes, never a lost cursor
+    if (!dryRun) {
+      const at = now.toISOString();
+      state.firstRunAt ??= at;
+      state.lastRunAt = at;
+      if (!result.error) {
+        if (pull) state.lastOkAt = at;
+        state.failures = 0;
+        state.lastError = null;
+      } else {
+        state.failures = (state.failures ?? 0) + 1;
+        state.lastError = result.error;
+      }
+      state.more = result.more;
+      const totals = state.totals ?? { items: 0, kept: 0, dropped: 0 };
+      state.totals = { items: ledger.size, kept: totals.kept + result.kept, dropped: totals.dropped + result.dropped };
+      ledger.saveState(state);
+      if (result.decided > 500) ledger.compactDecisions();
+    }
     const keys = [...written, ...removed];
     if (!dryRun && keys.length && opts.sync !== false) {
       result.sync = await sync(ctx, { only: keys, onProgress: log });
@@ -529,25 +550,6 @@ async function runFeedNow(ctx: SyncContext, feed: FeedDefinition, opts: FeedRunO
     release();
   }
 
-  /* 6. state */
-  if (!dryRun) {
-    const at = now.toISOString();
-    state.firstRunAt ??= at;
-    state.lastRunAt = at;
-    if (!result.error) {
-      if (pull) state.lastOkAt = at;
-      state.failures = 0;
-      state.lastError = null;
-    } else {
-      state.failures = (state.failures ?? 0) + 1;
-      state.lastError = result.error;
-    }
-    state.more = result.more;
-    const totals = state.totals ?? { items: 0, kept: 0, dropped: 0 };
-    state.totals = { items: ledger.size, kept: totals.kept + result.kept, dropped: totals.dropped + result.dropped };
-    ledger.saveState(state);
-    if (result.decided > 500) ledger.compactDecisions();
-  }
   if (result.decided || written.length || removed.length) {
     log(`feed ${feed.id}: ${result.changed} new or changed, ${result.kept} kept, ${result.dropped} dropped, ${result.pending} pending; ${written.length} document(s) written${removed.length ? `, ${removed.length} removed` : ''}`);
   }

@@ -57,8 +57,10 @@ export function unitTitle(unit: FeedUnit, output: TransformOutput): string {
   if (output.title?.trim()) return output.title.trim();
   const first = unit.items[0];
   if (first.title?.trim()) return first.title.trim();
-  if (unit.kind === 'window') return `${unit.items.length} messages`;
-  return firstLine(first.text ?? '') || first.id;
+  // a conversation is headed by how it began
+  const opener = unit.items.find((i) => i.text?.trim());
+  if (unit.kind === 'window') return opener ? `${firstLine(opener.text!, 30)} (${unit.items.length} messages)` : `${unit.items.length} messages`;
+  return firstLine(first.text ?? '') || (first.attachments?.length ? `[${first.attachments[0].kind}]` : first.id);
 }
 
 /** Where a document of `period` in `group` is written (part 1). */
@@ -96,7 +98,8 @@ function attachmentLines(item: FeedItem, docPath: string): string[] {
     } else if (a.url && /^https?:/i.test(a.url)) {
       out.push(`- ${a.kind}: [${label}](${a.url})`);
     } else {
-      out.push(`- ${a.kind}: ${label}`);
+      // kept at the source (not downloaded): say that something was there, once
+      out.push(`[${a.kind}${label !== a.kind ? `: ${label}` : ''}]`);
     }
     if (a.text?.trim()) out.push(`  ${a.text.trim().replace(/\n+/g, ' ')}`);
   }
