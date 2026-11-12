@@ -333,20 +333,21 @@ export class WorkspaceContextRegistry {
   }
 
   /**
-   * Write the root's shared settings into a workspace's files. A failure is
-   * said and the workspace opens on what it has: the next open, or the next
-   * change of a shared setting, tries again.
+   * Write the root's settings into a workspace's files (all but what it
+   * contains: src/global-settings.ts). A failure is said and the workspace
+   * opens on what it has: the next open, or the next settings change, tries
+   * again.
    */
   private shareSettings(dataDir: string): void {
     const template = this.template();
     if (!template) return;
     const label = path.relative(this.rootDataDir, dataDir);
     try {
-      if (syncWorkspaceSettings(this.rootDataDir, template, dataDir, (m) => this.log(`[${label}] ${m}`))) {
-        this.log(`[${label}] took the server's processing and stage settings`);
+      if (syncWorkspaceSettings(this.rootDataDir, template, dataDir)) {
+        this.log(`[${label}] took the server's settings`);
       }
     } catch (err) {
-      this.log(`[${label}] could not take the server's processing and stage settings: ${err instanceof Error ? err.message : err}`);
+      this.log(`[${label}] could not take the server's settings: ${err instanceof Error ? err.message : err}`);
     }
   }
 
@@ -377,7 +378,7 @@ export class WorkspaceContextRegistry {
   private async open(dataDir: string, scope: WorkspaceScope): Promise<AppContext> {
     const configFile = path.join(dataDir, CONFIG_FILE);
     if (!fs.existsSync(configFile)) this.initialize(dataDir, scope, new Date().toISOString());
-    // the server's processing and stage models, before anything reads the config
+    // the server's settings, before anything reads the config
     else this.shareSettings(dataDir);
     // a workspace's config is a copy of the root's: a plugin it names by a
     // relative path lives beside the root config, not in every workspace

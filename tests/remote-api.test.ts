@@ -123,10 +123,19 @@ describe('the remote API', () => {
     const base = defaultConfig();
     const route = { ...defaultRoutedLlmConfig(), use: 'connection-1' };
     fs.mkdirSync(root, { recursive: true });
+    // settings are the server's (src/global-settings.ts): every workspace embeds on a bge-m3 pool with one key,
+    // its vectors deferred — leased work for remote embed slots — and no embed slots here
+    const key: EmbeddingConnection = {
+      id: 'pool-a', label: 'pool a', provider: 'openai', baseUrl: poolEndpoint.url, apiKey: 'sk-pool', model: 'BAAI/bge-m3',
+      dimensions: 1024, batchSize: 16, sendDimensions: false, limits: { ...DEFAULT_EMBEDDING_LIMITS, requestsPerMinute: 10_000, concurrency: 8 },
+    };
     fs.writeFileSync(path.join(root, 'knode.config.json'), JSON.stringify({
       ...base, connections: [model], llmUse: 'connection-1',
       // one-line documents: no size threshold, or none would be due a summary
       extraction: { ...base.extraction, entityLlm: route, documentLlm: route, summaryLlm: route, judgeLlm: route, summaryMinChars: 0 },
+      embeddingProviders: [key], embeddingUse: 'pool-a',
+      embeddingPool: { enabled: true, model: 'bge-m3', dimensions: 1024, batchSize: 4 },
+      ingest: { ...base.ingest, watch: false, embedding: 'deferred', embedSlots: 0 },
     }));
     rootCtx = await createContext(root);
     registry = new WorkspaceContextRegistry(root, {
@@ -156,22 +165,9 @@ describe('the remote API', () => {
     });
     registry.createUserWorkspace('admin', 'finance');
     fin = await registry.get(resolveWorkspaceScope({ user: 'admin', kind: 'personal', id: 'finance', name: 'finance' }));
-    // a second workspace whose vectors are leased work: a bge-m3 pool with one key, deferred, no embed slots here
+    // a second workspace, whose vectors the embed tests count
     registry.createUserWorkspace('admin', 'vectors');
     const vecScope = resolveWorkspaceScope({ user: 'admin', kind: 'personal', id: 'vectors', name: 'vectors' });
-    {
-      const configFile = path.join(workspaceDataDir(root, vecScope), 'knode.config.json');
-      const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-      const key: EmbeddingConnection = {
-        id: 'pool-a', label: 'pool a', provider: 'openai', baseUrl: poolEndpoint.url, apiKey: 'sk-pool', model: 'BAAI/bge-m3',
-        dimensions: 1024, batchSize: 16, sendDimensions: false, limits: { ...DEFAULT_EMBEDDING_LIMITS, requestsPerMinute: 10_000, concurrency: 8 },
-      };
-      fs.writeFileSync(configFile, JSON.stringify({
-        ...config, embeddingProviders: [key], embeddingUse: 'pool-a',
-        embeddingPool: { enabled: true, model: 'bge-m3', dimensions: 1024, batchSize: 4 },
-        ingest: { ...config.ingest, watch: false, embedding: 'deferred', embedSlots: 0 },
-      }));
-    }
     vec = await registry.get(vecScope);
     for (let i = 1; i <= 9; i++) write(vec.dataDir, `raw/docs/v${i}.md`, `# 向量 ${i}\n\n第${i}份等待向量的文档：光伏组件与储能电池的价格走势。\n`);
     await sync(vec, {});
@@ -400,8 +396,8 @@ describe('the remote API', () => {
       // a worker that names no kinds is an LLM slot from before embed work: it gets no batch
       const unnamed = await req(`${vws}/work/lease`, { method: 'POST', token: tok.both, body: JSON.stringify({ worker: 'old', backend: 'codex' }) });
       expect(((await unnamed.json()) as { tasks: { kind: string }[] }).tasks.every((t) => t.kind !== 'embed')).toBe(true);
-      // the label token on an inline workspace: no embedding section
-      expect((await (await req(`${ws}/work/config`, { token: tok.both })).json() as EmbedConfig).embedding).toBeUndefined();
+      // a token without the embed scope: no embedding section
+      expect((await (await req(`${ws}/work/config`, { token: tok.labeler })).json() as EmbedConfig).embedding).toBeUndefined();
     });
 
     it('turns away an embed slot that has not passed calibration', async () => {
@@ -411,7 +407,6 @@ describe('the remote API', () => {
       expect(brokers.get(vec.dataDir)!.askedLately('embed', 60_000)).toBe(false);
       const bad = await req(`${vws}/work/calibrate`, { method: 'POST', token: tok.embedder, body: JSON.stringify({ worker: 'raw', model: 'BAAI/bge-m3', vectors: 'AAAA', dimensions: 1024 }) });
       expect(bad.status).toBe(400);
-      expect((await req(`${ws}/work/calibrate`, { method: 'POST', token: tok.both, body: JSON.stringify({ worker: 'x', model: 'BAAI/bge-m3', vectors: [] }) })).status).toBe(409);
       expect((await req(`${vws}/work/calibrate`, { method: 'POST', token: tok.labeler, body: '{}' })).status).toBe(403);
     });
   });
@@ -501,9 +496,6 @@ describe('the remote API', () => {
       expect(refused.status).toBe(400);
       expect(((await refused.json()) as { error: string }).error).toMatch(/did not pass calibration: probe \d+ reached cosine/);
       expect(vec.config.ingest.embedEndpoint).toBeUndefined();
-      // workspaces that embed with no pool take none
-      const finHeaders = { ...headers, 'x-knode-workspace-id': 'finance', 'x-knode-workspace-name': 'finance' };
-      expect((await req('/api/config', { method: 'PUT', headers: finHeaders, body: JSON.stringify({ ingest: { embedEndpoint: { baseUrl: ownEndpoint.url, model: 'BAAI/bge-m3' } } }) })).status).toBe(400);
 
       const saved = await req('/api/config', { method: 'PUT', headers, body: JSON.stringify({ ingest: { embedding: 'deferred', embedSlots: 2, embedEndpoint: { baseUrl: ownEndpoint.url, model: 'BAAI/bge-m3', apiKey: 'sk-local' } } }) });
       expect(saved.status).toBe(200);

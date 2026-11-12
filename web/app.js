@@ -8467,8 +8467,8 @@ $('#btn-cfg-save').addEventListener('click', async () => {
     let html = `<div class="cfg-line good"><b>Configuration saved for ${esc(selectedWorkspaceLabel)}</b> · routes applied</div>`;
     if (r.reembedded && r.reindex) html += `<div class="cfg-line">re-embedded: ${r.reindex.indexed} docs · ${r.reindex.chunks} chunks</div>`;
     else if (r.reconverted && r.reindex) html += `<div class="cfg-line">document conversion refreshed: ${r.reindex.indexed} docs · ${r.reindex.errors} errors</div>`;
-    // processing and the stage models are server-wide: the save went to every workspace
-    if (r.shared) html += `<div class="cfg-line">processing and stage settings applied to every workspace on this server${r.shared.written ? ` · ${r.shared.written} other workspace${r.shared.written === 1 ? '' : 's'} updated` : ''}${r.shared.failed ? ` · <span class="bad">${r.shared.failed} could not take them (see the service log)</span>` : ''}</div>`;
+    // settings are server-wide (all but a workspace's sources): the save went to every workspace
+    if (r.shared) html += `<div class="cfg-line">settings applied to every workspace on this server${r.shared.written ? ` · ${r.shared.written} other workspace${r.shared.written === 1 ? '' : 's'} updated` : ''}${r.shared.failed ? ` · <span class="bad">${r.shared.failed} could not take them (see the service log)</span>` : ''}</div>`;
     html += agentLine + profileLine;
     $('#cfg-status').innerHTML = html;
     toast(`configuration saved for ${selectedWorkspaceLabel}`);
