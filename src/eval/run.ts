@@ -463,11 +463,14 @@ export function reuseBuilds(store: RunStore, from: string, packDirs: string[], e
       builds++;
     }
   }
-  // the vectors the reused indexes were built with, so a reopened RAG index embeds nothing again
+  // the vectors the reused indexes were built with, so a reopened RAG index embeds nothing again — and
+  // also when no build is reused (`--rebuild knode` beside systems that build nothing): they are what
+  // an embedding endpoint is checked against, and without them the check falls to the workspace's
+  // embedder, which stopped a run cold on a day its pool was out of quota
   let vectors = 0;
   const from_ = path.join(from, 'cache', 'vectors.jsonl');
   const to = path.join(store.cacheDir(), 'vectors.jsonl');
-  if (builds && fs.existsSync(from_) && !fs.existsSync(to)) {
+  if (fs.existsSync(from_) && !fs.existsSync(to)) {
     fs.copyFileSync(from_, to);
     vectors = fileLineCount(to);
   }

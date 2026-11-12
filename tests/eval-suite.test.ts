@@ -627,6 +627,20 @@ describe('reusing builds', () => {
     expect(n.updated.sort()).toEqual(['fixture-life/knode', 'fixture-life/llm-wiki']);
     expect(into.allBuilds().map((b) => b.system).sort()).toEqual(['long-context', 'rag']);
   });
+
+  it('brings the earlier run\'s vectors along even when it reuses none of its builds', () => {
+    // --rebuild knode beside systems that build nothing: no build to reuse, but an embedding
+    // endpoint is still checked against these vectors rather than against the workspace's embedder
+    const packDir = path.join(tmp, 'packs', 'fixture-life');
+    const earlier = new RunStore(path.join(tmp, 'runs', 'r1'));
+    const meta = earlier.meta()!;
+    expect(fs.existsSync(path.join(earlier.dir, 'cache', 'vectors.jsonl'))).toBe(true);
+    const into = new RunStore(path.join(tmp, 'runs', 'reuse-vectors-only'));
+    const n = reuseBuilds(into, earlier.dir, [packDir], meta.embedding, meta.fraction, meta.seed, new Set(['no-such-group']));
+    expect(n.builds).toBe(0);
+    expect(n.vectors).toBeGreaterThan(0);
+    expect(fs.existsSync(path.join(into.cacheDir(), 'vectors.jsonl'))).toBe(true);
+  });
 });
 
 describe("an embedding endpoint of the run's own", () => {
