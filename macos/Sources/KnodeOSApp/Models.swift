@@ -518,6 +518,19 @@ struct TreeNode: Decodable, Identifiable, Hashable {
     var id: String { path.isEmpty ? "__root__" : path }
     var isWritable: Bool { path == "wiki" || path.hasPrefix("wiki/") || path == "raw/docs" || path.hasPrefix("raw/docs/") }
 
+    /// The code repository this row is the mirror, card or documentation copy
+    /// of (raw/codebase/<name>, raw/docs/codebase/<name>.md, raw/docs/codebase/<name>);
+    /// nil for anything else. The service owns those paths (docs/design/25).
+    var codebaseName: String? {
+        guard linked != nil else { return nil }
+        for prefix in ["raw/codebase/", "raw/docs/codebase/"] where path.hasPrefix(prefix) {
+            var rest = String(path.dropFirst(prefix.count))
+            if prefix == "raw/docs/codebase/", rest.hasSuffix(".md") { rest = String(rest.dropLast(3)) }
+            if !rest.isEmpty, !rest.contains("/") { return rest }
+        }
+        return nil
+    }
+
     /// Root files the file view may edit although nothing else may happen to
     /// them there — no move, rename or delete: what the workspace is for and
     /// the rules its wiki follows (OWNER_ROOT_FILES in the service).
@@ -2976,7 +2989,7 @@ struct TasksSnapshot: Decodable {
     /// Background work that is not leased model work (src/activity.ts).
     struct ActivityItem: Decodable, Identifiable {
         var id: String
-        /// sync, ingest, upload, folder, traces, datasources, dream or tier2.
+        /// sync, ingest, upload, folder, feishu, conversations, codebase, traces, datasources, dream or tier2.
         var kind: String
         /// In English, the service's own words: "Index new and changed files".
         var label: String
@@ -3014,7 +3027,7 @@ struct TasksSnapshot: Decodable {
         var everyMinutes: Int?
         /// The next start, when the clock says.
         var next: String?
-        /// When it last ran, for a task that keeps that across restarts (the Feishu check).
+        /// When it last ran, for a task that keeps that across restarts (the Feishu check, followed repositories).
         var last: String?
         var enabled: Bool
         var running: Bool
@@ -3241,6 +3254,134 @@ struct FeishuCheck: Decodable {
     }
 
     private enum CodingKeys: String, CodingKey { case started, links, results }
+}
+
+/// `GET /api/codebases`: the code repositories kept in the workspace
+/// (docs/design/25), whether a fetch is running, and the `codebase`
+/// activity — what is fetching now and how the last few ended.
+struct CodebaseListing: Decodable {
+    var codebases: [CodebaseEntry]
+    var running: Bool
+    var activity: [TasksSnapshot.ActivityItem]
+    var recent: [TasksSnapshot.ActivityItem]
+
+    init(codebases: [CodebaseEntry] = [], running: Bool = false, activity: [TasksSnapshot.ActivityItem] = [], recent: [TasksSnapshot.ActivityItem] = []) {
+        self.codebases = codebases
+        self.running = running
+        self.activity = activity
+        self.recent = recent
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        codebases = (try? c.decodeIfPresent([CodebaseEntry].self, forKey: .codebases)) ?? []
+        running = try c.decodeIfPresent(Bool.self, forKey: .running) ?? false
+        activity = (try? c.decodeIfPresent([TasksSnapshot.ActivityItem].self, forKey: .activity)) ?? []
+        recent = (try? c.decodeIfPresent([TasksSnapshot.ActivityItem].self, forKey: .recent)) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey { case codebases, running, activity, recent }
+}
+
+/// One repository kept under raw/codebase/<name>/ at one commit.
+struct CodebaseEntry: Decodable, Identifiable, Hashable {
+    var name: String
+    /// What git fetches from, and the repository's web page when it has one.
+    var url: String
+    var web: String?
+    /// Branch, tag or commit tracked; nil = the remote's default branch.
+    var ref: String?
+    var include: [String]
+    var exclude: [String]
+    /// Fetched again once a day by the service.
+    var follow: Bool
+    /// Its documentation is copied to raw/docs/codebase/<name>/.
+    var docs: Bool
+    var commit: String?
+    var committedAt: String?
+    var checkedAt: String?
+    /// raw/codebase/<name> and the card, raw/docs/codebase/<name>.md.
+    var dir: String
+    var card: String
+    var files: Int
+    var bytes: Int
+
+    var id: String { name }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        url = try c.decodeIfPresent(String.self, forKey: .url) ?? ""
+        web = try? c.decodeIfPresent(String.self, forKey: .web)
+        ref = try c.decodeIfPresent(String.self, forKey: .ref)
+        include = (try? c.decodeIfPresent([String].self, forKey: .include)) ?? []
+        exclude = (try? c.decodeIfPresent([String].self, forKey: .exclude)) ?? []
+        follow = try c.decodeIfPresent(Bool.self, forKey: .follow) ?? false
+        docs = try c.decodeIfPresent(Bool.self, forKey: .docs) ?? true
+        commit = try c.decodeIfPresent(String.self, forKey: .commit)
+        committedAt = try c.decodeIfPresent(String.self, forKey: .committedAt)
+        checkedAt = try c.decodeIfPresent(String.self, forKey: .checkedAt)
+        dir = try c.decodeIfPresent(String.self, forKey: .dir) ?? "raw/codebase/\(name)"
+        card = try c.decodeIfPresent(String.self, forKey: .card) ?? "raw/docs/codebase/\(name).md"
+        files = try c.decodeIfPresent(Int.self, forKey: .files) ?? 0
+        bytes = try c.decodeIfPresent(Int.self, forKey: .bytes) ?? 0
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, url, web, ref, include, exclude, follow, docs, commit, committedAt, checkedAt, dir, card, files, bytes
+    }
+}
+
+/// What adding a repository sends (`POST /api/codebases/add`).
+struct CodebaseDraft: Encodable {
+    var repository: String
+    var name: String?
+    var ref: String?
+    var include: [String]
+    var exclude: [String]
+    var follow: Bool
+    var docs: Bool
+}
+
+/// What editing one sends (`PATCH /api/codebases`); an empty ref goes back to the default branch.
+struct CodebasePatch: Encodable {
+    var name: String
+    var ref: String
+    var include: [String]
+    var exclude: [String]
+    var follow: Bool
+    var docs: Bool
+}
+
+/// `POST /api/codebases/add` or `/update` without waiting: the fetch started in the background
+/// (an update also says how many repositories it fetches, and whether it waits behind a fetch under way).
+struct CodebaseStarted: Decodable {
+    var started: Bool
+    var repositories: Int
+    var queued: Bool
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        started = try c.decodeIfPresent(Bool.self, forKey: .started) ?? false
+        repositories = try c.decodeIfPresent(Int.self, forKey: .repositories) ?? 0
+        queued = try c.decodeIfPresent(Bool.self, forKey: .queued) ?? false
+    }
+
+    private enum CodingKeys: String, CodingKey { case started, repositories, queued }
+}
+
+/// `DELETE /api/codebases`: whether the files went with the entry.
+struct CodebaseRemoval: Decodable {
+    var name: String
+    var removedFiles: Bool
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        removedFiles = try c.decodeIfPresent(Bool.self, forKey: .removedFiles) ?? false
+    }
+
+    private enum CodingKeys: String, CodingKey { case name, removedFiles }
 }
 
 /// Times the service sends (`toISOString`, with or without milliseconds).

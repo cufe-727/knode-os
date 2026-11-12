@@ -454,6 +454,43 @@ struct APIClient {
         return try await send("/api/feishu/sync", method: "POST", body: encoded(Body(dest: dest, force: force)))
     }
 
+    /* -------------------------- code repositories -------------------------- */
+
+    /// The repositories kept under raw/codebase, and what is fetching (docs/design/25).
+    func codebases() async throws -> CodebaseListing {
+        try await send("/api/codebases")
+    }
+
+    /// Fetch a repository onto the service's machine and index it, in the background.
+    func addCodebase(_ draft: CodebaseDraft) async throws -> CodebaseStarted {
+        try await send("/api/codebases/add", method: "POST", body: encoded(draft))
+    }
+
+    /// Fetch one repository's tracked ref again and index what changed, in the background.
+    func updateCodebase(name: String, reindex: Bool = false) async throws -> CodebaseStarted {
+        struct Body: Encodable { var name: String; var reindex: Bool; var wait: Bool }
+        return try await send("/api/codebases/update", method: "POST", body: encoded(Body(name: name, reindex: reindex, wait: false)))
+    }
+
+    /// Tasks → Code repositories → Check now: every followed repository, fetched again in the background.
+    func checkCodebases() async throws -> CodebaseStarted {
+        struct Body: Encodable { var followed: Bool; var wait: Bool }
+        return try await send("/api/codebases/update", method: "POST", body: encoded(Body(followed: true, wait: false)))
+    }
+
+    /// Change what a repository tracks; the next update applies it.
+    func editCodebase(_ patch: CodebasePatch) async throws -> ActionResponse {
+        try await send("/api/codebases", method: "PATCH", body: encoded(patch))
+    }
+
+    /// Forget a repository: its files, card and docs copy go too unless `keepFiles`.
+    func removeCodebase(name: String, keepFiles: Bool) async throws -> CodebaseRemoval {
+        try await send(path("/api/codebases", query: [
+            .init(name: "name", value: name),
+            .init(name: "keepFiles", value: keepFiles ? "1" : "0"),
+        ]), method: "DELETE")
+    }
+
     /// Add the new exchanges of every followed agent conversation now, in the
     /// background, without waiting for them to go quiet (docs/design/24).
     func checkConversations() async throws -> ConversationCheck {

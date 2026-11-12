@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { activityOf } from '../src/activity.js';
 import { AppContext, createContext } from '../src/context.js';
 import { grepFiles } from '../src/fs/files.js';
 import { chunkCode } from '../src/ingest/chunker.js';
@@ -13,8 +14,10 @@ import {
   checkRef,
   codebaseCheckOwed,
   codebaseLinks,
+  Codebases,
   describeCodebases,
   editCodebase,
+  nextCodebaseCheck,
   planCodebase,
   removeCodebase,
   updateCodebases,
@@ -27,6 +30,9 @@ import { sync } from '../src/ingest/sync.js';
 import { search } from '../src/search/search.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
 import { folderOf } from '../src/research/survey.js';
+import { createApp, WorkspaceServices } from '../src/server/app.js';
+import { tasksSnapshot } from '../src/server/tasks.js';
+import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 
 /**
  * Code repositories as a source (src/ingest/codebase, docs/design/25): which
@@ -275,6 +281,84 @@ describe('a repository from add to remove', () => {
     const now = new Date();
     expect(codebaseCheckOwed({ ...ctx.config, ingest: { ...ctx.config.ingest, codebases: [{ ...codebaseLinks(ctx.config)[0], checkedAt: new Date(now.getTime() - 3 * 86400_000).toISOString() }] } }, now)).toBe(true);
     expect(codebaseCheckOwed(ctx.config, now)).toBe(false);
+  });
+
+  it('shows what serve fetches as codebase activity, failed when nothing came through', async () => {
+    const codebases = new Codebases(ctx);
+    const progress: string[] = [];
+    const [r] = await codebases.update('agent-harness', { onProgress: (m) => progress.push(m) });
+    if ('error' in r) throw new Error(r.error);
+    expect(progress[0]).toMatch(/^fetching /);
+    const last = () => activityOf(ctx.dataDir).snapshot().recent.find((a) => a.kind === 'codebase');
+    expect(last()).toMatchObject({ label: 'agent-harness: fetching again from its repository', ok: true, detail: `unchanged at ${r.commit.slice(0, 12)}` });
+
+    // a ref the remote lacks: the result still says why, and the activity ends failed
+    editCodebase(ctx, 'agent-harness', { ref: 'no-such-branch' });
+    const [bad] = await codebases.update('agent-harness', { onProgress: () => {} });
+    expect('error' in bad).toBe(true);
+    expect(last()).toMatchObject({ ok: false });
+    expect(last()?.detail).toMatch(/^agent-harness: /);
+    expect(codebases.busy).toBe(false);
+    editCodebase(ctx, 'agent-harness', { ref: '' });
+    expect(codebaseLinks(ctx.config)[0].ref).toBeUndefined();
+  });
+
+  it('reports the daily check in Tasks → Schedule, and fetches the followed ones when asked', async () => {
+    const codebases = new Codebases(ctx);
+    const services = { codebases } as unknown as WorkspaceServices;
+    const row = async (s: WorkspaceServices | null = services) => (await tasksSnapshot(ctx, s)).scheduled.find((x) => x.id === 'codebases')!;
+    const link = codebaseLinks(ctx.config)[0];
+    expect(link.follow).toBe(true);
+    // looked at just now: the next run is the next 05:00, the last one the entry's
+    expect(await row()).toEqual({
+      id: 'codebases', at: '05:00', everyMinutes: null, next: nextCodebaseCheck(ctx.config, new Date())!.toISOString(),
+      last: link.checkedAt, enabled: true, running: false,
+    });
+    // outside serve nothing runs on a clock, though when it last looked still shows
+    expect(await row(null)).toMatchObject({ next: null, last: link.checkedAt, enabled: false });
+
+    const saved = ctx.config.ingest.codebases;
+    try {
+      // owed since a check was missed: due at once
+      ctx.config.ingest.codebases = [{ ...link, checkedAt: new Date(Date.now() - 3 * 86400_000).toISOString() }];
+      expect(Date.parse((await row()).next!)).toBeLessThanOrEqual(Date.now());
+      ctx.config.ingest.codebaseCheckAt = '7:30';
+      expect(await row()).toMatchObject({ at: '07:30', enabled: true });
+      ctx.config.ingest.codebaseCheckAt = 'off';
+      expect(await row()).toMatchObject({ at: null, next: null, enabled: false });
+      delete ctx.config.ingest.codebaseCheckAt;
+      // nothing followed: off, and no followed repository was looked at
+      ctx.config.ingest.codebases = [{ ...link, follow: false }];
+      expect(await row()).toMatchObject({ at: '05:00', next: null, last: null, enabled: false });
+    } finally {
+      ctx.config.ingest.codebases = saved;
+      delete ctx.config.ingest.codebaseCheckAt;
+    }
+
+    // Check now: every followed repository, in the background, running until it ends
+    const registry = { exists: () => true, get: async () => ctx } as unknown as WorkspaceContextRegistry;
+    const app = createApp(ctx, () => {}, registry, { services: () => services });
+    const check = () => app.request('/api/codebases/update', {
+      method: 'POST',
+      headers: { 'x-knode-user': 'admin', 'x-knode-workspace-kind': 'personal', 'x-knode-workspace-id': 'default', 'content-type': 'application/json' },
+      body: JSON.stringify({ followed: true, wait: false }),
+    });
+    const res = await check();
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({ started: true, repositories: 1, queued: false });
+    expect(await row()).toMatchObject({ running: true });
+    for (let i = 0; i < 200 && codebases.busy; i++) await new Promise((r) => setTimeout(r, 25));
+    expect(await row()).toMatchObject({ running: false });
+    expect(activityOf(ctx.dataDir).snapshot().recent.find((a) => a.kind === 'codebase')).toMatchObject({ label: 'Followed repositories: fetching again', ok: true });
+    expect(Date.parse((await row()).last!)).toBeGreaterThan(Date.parse(link.checkedAt!));
+
+    editCodebase(ctx, 'agent-harness', { follow: false });
+    const none = await check();
+    expect(none.status).toBe(200);
+    expect(await none.json()).toMatchObject({ started: false, repositories: 0 });
+    editCodebase(ctx, 'agent-harness', { follow: true });
+    await codebases.stop();
+    expect(codebases.nextCheck()).toBeNull();
   });
 
   it('removes it with its files, card, clone and documents', async () => {

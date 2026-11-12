@@ -76,7 +76,7 @@ import {
   resolveImportSource,
   unlinkFolder,
 } from '../ingest/folders.js';
-import { addCodebase, assertFetchable, checkRef, CodebaseConflict, Codebases, describeCodebases, editCodebase, removeCodebase, updateCodebases } from '../ingest/codebase/codebases.js';
+import { addCodebase, assertFetchable, checkRef, codebaseActivity, codebaseCard, CodebaseConflict, codebaseDir, codebaseDocsDir, codebaseLinks, Codebases, describeAdd, describeCodebases, editCodebase, removeCodebase, updateActivity, updateCodebases } from '../ingest/codebase/codebases.js';
 import { parseRepoSpec } from '../ingest/codebase/git.js';
 import { listConversations as listAgentConversations } from '../ingest/conversations/catalog.js';
 import { deleteFeed, feedConnectorCatalog, feedItems, checkFeed } from '../ingest/feeds/manage.js';
@@ -1263,6 +1263,8 @@ export function createApp(
       const links = mirrorLinks(ctx.config);
       const feishuDests = new Set(feishuLinks(ctx.config).map((l) => l.dest));
       const conversationDests = new Set(conversationLinks(ctx.config).map((l) => l.dest));
+      // a repository's mirror, card and docs copy name the entry they belong to (src/ingest/codebase)
+      const codebaseDests = new Map(codebaseLinks(ctx.config).flatMap((l) => [codebaseDir(l.name), codebaseCard(l.name), codebaseDocsDir(l.name)].map((d) => [d, l.name] as const)));
       const mark = (node: typeof tree): void => {
         const marked = node as typeof tree & { linked?: string; about?: string };
         const link = links.find((l) => l.dest === node.path);
@@ -1285,7 +1287,14 @@ export function createApp(
           }
         }
       }
-      return c.json({ ...tree, links: links.map((l) => ({ path: l.dest, source: l.source, kind: feishuDests.has(l.dest) ? 'feishu' : conversationDests.has(l.dest) ? 'conversation' : 'folder' })) });
+      return c.json({
+        ...tree,
+        links: links.map((l) => {
+          const codebase = codebaseDests.get(l.dest);
+          if (codebase) return { path: l.dest, source: l.source, kind: 'codebase', name: codebase };
+          return { path: l.dest, source: l.source, kind: feishuDests.has(l.dest) ? 'feishu' : conversationDests.has(l.dest) ? 'conversation' : 'folder' };
+        }),
+      });
     } catch (e) {
       return c.json(err(e), 400);
     }
@@ -1660,8 +1669,15 @@ export function createApp(
   // administrator's call (src/auth/apis.ts) and only remote URLs are taken.
   app.get('/api/codebases', (c) => {
     const ctx = requestCtx(c);
-    const running = servicesFor(ctx)?.codebases?.busy ?? false;
-    return c.json({ codebases: describeCodebases(ctx), running });
+    const activity = activityOf(ctx.dataDir);
+    const { running: active, recent } = activity.snapshot();
+    // what is fetching now, and how the last few ended — a background add says so here when it fails
+    return c.json({
+      codebases: describeCodebases(ctx),
+      running: (servicesFor(ctx)?.codebases?.busy ?? false) || activity.busy('codebase'),
+      activity: active.filter((a) => a.kind === 'codebase'),
+      recent: recent.filter((a) => a.kind === 'codebase').slice(0, 5),
+    });
   });
 
   app.post('/api/codebases/add', async (c) => {
@@ -1675,9 +1691,9 @@ export function createApp(
       assertFetchable(parseRepoSpec(spec).url, false);
       checkRef(opts.ref);
       const services = servicesFor(ctx);
-      const run = () => activityOf(ctx.dataDir).run('codebase', `Add repository ${spec}`,
-        () => (services?.codebases ? services.codebases.add(spec, opts) : addCodebase(ctx, spec, { ...opts, onProgress: log })),
-        (r) => `${r.dir} at ${r.commit.slice(0, 12)}: ${r.files} files`);
+      const run = () => (services?.codebases
+        ? services.codebases.add(spec, opts)
+        : codebaseActivity(ctx, `Add repository ${spec}`, log, (progress) => addCodebase(ctx, spec, { ...opts, onProgress: progress }), describeAdd));
       if (body.wait === true) return c.json({ ok: true, ...(await run()) });
       void run().catch((e) => log(`codebase ${spec}: ${e instanceof Error ? e.message : e}`));
       return c.json({ ok: true, started: true }, 202);
@@ -1686,15 +1702,30 @@ export function createApp(
     }
   });
 
+  // fetch one repository (or every one, or with `followed` every followed one — Tasks → Check now) again;
+  // `wait: false` answers 202 at once, saying how many it fetches and whether it waits behind a fetch
+  // under way, and the fetch shows as a `codebase` activity — a large repository takes minutes to index
   app.post('/api/codebases/update', async (c) => {
     const ctx = requestCtx(c);
     try {
-      const body = (await c.req.json().catch(() => ({}))) as { name?: string; reindex?: boolean };
+      const body = (await c.req.json().catch(() => ({}))) as { name?: string; reindex?: boolean; wait?: boolean; followed?: boolean };
       const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
+      if (name && !codebaseLinks(ctx.config).some((l) => l.name === name)) return c.json({ error: `no repository named ${name}` }, 404);
+      const force = Boolean(body.reindex);
+      const followedOnly = !name && body.followed === true;
+      const repositories = name ? 1 : codebaseLinks(ctx.config).filter((l) => !followedOnly || l.follow).length;
       const services = servicesFor(ctx);
-      const results = services?.codebases
-        ? await services.codebases.update(name, { force: Boolean(body.reindex) })
-        : await updateCodebases(ctx, name, { force: Boolean(body.reindex), onProgress: log });
+      const run = () => (services?.codebases
+        ? services.codebases.update(name, { force, followedOnly })
+        : updateActivity(ctx, name ? `${name}: fetching again from its repository` : followedOnly ? 'Followed repositories: fetching again' : 'Every repository: fetching again', log,
+          (progress) => updateCodebases(ctx, name, { force, followedOnly, onProgress: progress })));
+      if (body.wait === false) {
+        if (repositories === 0) return c.json({ ok: true, started: false, repositories });
+        const queued = services?.codebases?.busy ?? false;
+        void run().catch((e) => log(`codebase ${name ?? (followedOnly ? '(followed)' : '(all)')}: ${e instanceof Error ? e.message : e}`));
+        return c.json({ ok: true, started: true, repositories, queued }, 202);
+      }
+      const results = await run();
       return c.json({ ok: true, results: results.map((r) => ('error' in r ? r : { ...r, copied: r.copied.length, removed: r.removed.length })) });
     } catch (e) {
       return c.json(err(e), 400);
@@ -1724,7 +1755,9 @@ export function createApp(
       if (!name) return c.json({ error: 'name required' }, 400);
       const keepFiles = c.req.query('keepFiles') === '1' || c.req.query('keepFiles') === 'true';
       const services = servicesFor(ctx);
-      const result = services?.codebases ? await services.codebases.remove(name, { keepFiles }) : await removeCodebase(ctx, name, { keepFiles, onProgress: log });
+      const result = services?.codebases
+        ? await services.codebases.remove(name, { keepFiles })
+        : await codebaseActivity(ctx, `Remove repository ${name}${keepFiles ? ', keeping its files' : ''}`, log, (progress) => removeCodebase(ctx, name, { keepFiles, onProgress: progress }));
       return c.json({ ok: true, ...result });
     } catch (e) {
       return c.json(err(e), 400);

@@ -32,6 +32,8 @@ struct FileBrowserView: View {
         case linkPath
         /// Link a folder: what it would carry, and the path as it was given.
         case linkPlan(FolderImportPlan, String)
+        /// Code repositories, with one open for editing when its menu in the tree asked.
+        case codebases(String?)
 
         var id: String {
             switch self {
@@ -41,6 +43,7 @@ struct FileBrowserView: View {
             case .destination(let purpose): "destination-\(purpose.id)"
             case .linkPath: "linkPath"
             case .linkPlan(let plan, _): "linkPlan-\(plan.id)"
+            case .codebases(let name): "codebases-\(name ?? "")"
             }
         }
     }
@@ -223,6 +226,7 @@ struct FileBrowserView: View {
             case .destination(let purpose): destinationSheet(purpose)
             case .linkPath: linkPathSheet
             case .linkPlan(let plan, let source): linkPlanSheet(plan, source: source)
+            case .codebases(let name): codebasesSheet(editing: name)
             }
         }
         .alert(
@@ -299,6 +303,14 @@ struct FileBrowserView: View {
                 Text(L("Linking reads the service's own disk: an administrator's call"))
             }
             Divider()
+            Button { activeSheet = .codebases(nil) } label: { Label(L("Code repository from GitHub or a git URL…"), systemImage: "chevron.left.forwardslash.chevron.right") }
+                .disabled(!model.maySaveSettings)
+            Button { activeSheet = .codebases(nil) } label: { Label(L("Code repositories — update, edit or remove…"), systemImage: "arrow.triangle.2.circlepath") }
+                .disabled(!model.mayUseFiles)
+            if !model.maySaveSettings {
+                Text(L("Adding a repository fetches it onto the service's machine: an administrator's call"))
+            }
+            Divider()
             Button { confirmingTraceImport = true } label: { Label(L("Agent traces (Claude Code, Codex)"), systemImage: "terminal") }
         } label: {
             Label(L("Import"), systemImage: "square.and.arrow.down")
@@ -308,7 +320,7 @@ struct FileBrowserView: View {
         .tint(.knodeCyan)
         .fixedSize()
         .disabled(isWorking)
-        .help(L("Import — files or a folder from this Mac, a folder linked from the service's machine, or agent traces"))
+        .help(L("Import — files or a folder from this Mac, a folder linked from the service's machine, a code repository, or agent traces"))
     }
 
     /// A one-line reminder of where a create or an upload lands, so "new file"
@@ -1532,6 +1544,43 @@ struct FileBrowserView: View {
             Task { await checkFeishu(node.path, force: false) }
         case .fetchFeishu:
             Task { await checkFeishu(node.path, force: true) }
+        case .updateCodebase:
+            guard let name = node.codebaseName else { return }
+            Task { await updateCodebase(name) }
+        case .codebaseSettings:
+            activeSheet = .codebases(node.codebaseName)
+        }
+    }
+
+    /// Library → Import → Code repositories: the list, adding (administrators),
+    /// editing, updating and removing (src/ingest/codebase, docs/design/25).
+    private func codebasesSheet(editing name: String?) -> some View {
+        CodebasesSheet(
+            initialEdit: name,
+            changed: {
+                await loadTree()
+                await model.refreshStats()
+            },
+            openCard: { card in
+                activeSheet = nil
+                Task {
+                    await loadTree()
+                    expand((card as NSString).deletingLastPathComponent)
+                    await openFile(card)
+                }
+            },
+            close: { activeSheet = nil }
+        )
+        .environmentObject(model)
+    }
+
+    /// A repository's menu in the tree → update now: its tracked ref fetched again, in the background.
+    private func updateCodebase(_ name: String) async {
+        do {
+            _ = try await model.client().updateCodebase(name: name)
+            model.showToast(L("Fetching %@ again — it shows under Tasks → Background", name), duration: 5_000_000_000)
+        } catch {
+            model.showError(error, prefix: L("Update failed"))
         }
     }
 
@@ -2301,6 +2350,9 @@ private enum NodeAction {
     /// A linked Feishu document's or wiki's mirror: ask Feishu for edits now, or fetch it all again.
     case checkFeishu
     case fetchFeishu
+    /// A code repository's mirror, card or documentation copy: fetch it again now, or open its settings.
+    case updateCodebase
+    case codebaseSettings
 }
 
 /// One row of the file tree as it shows: an entry, or a note in a folder that
@@ -2361,7 +2413,9 @@ private struct FileTreeRow: View {
             Button(L("Upload folder here…")) { perform(.uploadFolder, node) }
             Divider()
         }
-        if let source = node.linked, source.hasPrefix("http") {
+        if node.codebaseName != nil {
+            codebaseMenu
+        } else if let source = node.linked, source.hasPrefix("http") {
             Button(L("Check Feishu for edits now")) { perform(.checkFeishu, node) }
             Button(L("Fetch again from Feishu")) { perform(.fetchFeishu, node) }
             if let url = URL(string: source) {
@@ -2380,8 +2434,20 @@ private struct FileTreeRow: View {
         }
     }
 
+    /// A repository's own actions, in place of a linked folder's (docs/design/25).
+    @ViewBuilder
+    private var codebaseMenu: some View {
+        Button(L("Update from the repository now")) { perform(.updateCodebase, node) }
+        if let source = node.linked, source.hasPrefix("https://"), let url = URL(string: source) {
+            Button(L("Open the repository page")) { NSWorkspace.shared.open(url) }
+        }
+        Button(L("Code repository settings…")) { perform(.codebaseSettings, node) }
+        Divider()
+    }
+
     @ViewBuilder
     private var fileMenu: some View {
+        if node.codebaseName != nil { codebaseMenu }
         Button(L("Open")) { openFile(node.path) }
         Button(L("Select this file")) { perform(.select, node) }
             .disabled(!node.isWritable || isChecked)
