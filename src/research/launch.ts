@@ -49,6 +49,8 @@ export interface LaunchInput {
   agents?: NativeAgentSpec[];
   /** MCP servers of the research sources a study selected, attached next to knode's own. */
   extraMcp?: ExtraMcpServer[];
+  /** Remote workers that may run the session (docs/design/27). */
+  sessions?: SessionDispatch;
 }
 
 export interface LaunchResult {
@@ -59,6 +61,8 @@ export interface LaunchResult {
   resultText: string;
   error: string | null;
   transcriptPath: string;
+  /** The remote worker that ran it; absent for a session run here. */
+  worker?: string;
 }
 
 /**
@@ -272,6 +276,10 @@ export interface SessionInput {
   extraMcp?: ExtraMcpServer[];
   /** Names the transcript file: transcript.jsonl for 'agent', transcript-<label>.jsonl otherwise. */
   label: string;
+  /** Other files a writing session must produce (an init job's guide): a remote session may write these and its output path, nothing else. */
+  companions?: string[];
+  /** Where a research session may run besides here: remote workers (src/research/remote.ts, docs/design/27). Absent, it runs here. */
+  sessions?: SessionDispatch;
 }
 
 export interface SessionResult {
@@ -282,6 +290,19 @@ export interface SessionResult {
   error: string | null;
   exitCode: number;
   transcriptPath: string;
+  /** The remote worker that ran it; absent for a session run here. */
+  worker?: string;
+}
+
+/**
+ * Places a research session (docs/design/27): on a remote worker that runs its
+ * CLI on its own account, or here through `here`, the ordinary launch. It
+ * throws JobCancelledError / JobInterruptedError as a session run here would.
+ */
+export interface SessionDispatch {
+  run(input: SessionInput, here: () => Promise<SessionResult>): Promise<SessionResult>;
+  /** Whether a remote worker could take this agent's sessions now: the claim then leaves the quota floor to each session (D4). */
+  covers(agent: ResearchAgent): boolean;
 }
 
 export function sessionEnv(input: { mcp: McpEndpoint; jobId: string; outputPath: string; worksetId: string; extraMcp?: ExtraMcpServer[] }): NodeJS.ProcessEnv {
@@ -612,13 +633,16 @@ export async function launchSession(input: SessionInput): Promise<SessionResult>
   if (cancelledJobs.has(input.jobId)) throw new JobCancelledError(input.jobId);
   if (interruptedJobs.has(input.jobId)) throw new JobInterruptedError(input.jobId);
   let result: SessionResult;
-  try {
-    if (input.agent.kind === 'builtin') {
+  const agent = input.agent;
+  const here = async (): Promise<SessionResult> => {
+    if (agent.kind === 'builtin') {
       const { runBuiltinSession } = await loadBuiltin();
-      result = await runBuiltinSession({ ...input, agent: input.agent });
-    } else {
-      result = await launchCliSession({ ...input, agent: input.agent });
+      return runBuiltinSession({ ...input, agent });
     }
+    return launchCliSession({ ...input, agent });
+  };
+  try {
+    result = input.sessions ? await input.sessions.run(input, here) : await here();
   } catch (err) {
     if (interruptedJobs.has(input.jobId) && !(err instanceof JobCancelledError)) throw new JobInterruptedError(input.jobId);
     throw err;
@@ -689,7 +713,21 @@ async function launchCliSession(input: CliSessionInput): Promise<SessionResult> 
   const res = provider === 'codex-cli' ? await runCodexSession(binary, input, run) : await run(null);
   // a killed session exits like any other; the flag says why
   if (cancelledJobs.has(input.jobId)) throw new JobCancelledError(input.jobId);
+  const lastMessage = outFile && fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8') : null;
+  return sessionResultFrom(provider, res, lastMessage, transcriptPath);
+}
 
+/**
+ * What a CLI session's output says: its final message, turns, cost and
+ * error. The same reading for a session run here and one a remote worker ran
+ * (src/research/remote.ts), whose stdout arrives in the transcript.
+ */
+export function sessionResultFrom(
+  provider: CliAgent['provider'],
+  res: { code: number; stdout: string; stderr: string },
+  lastMessage: string | null,
+  transcriptPath: string,
+): SessionResult {
   const result: SessionResult = { text: '', turns: null, costUsd: null, error: null, exitCode: res.code, transcriptPath };
   if (provider === 'claude-cli') {
     for (const line of res.stdout.split('\n')) {
@@ -710,7 +748,7 @@ async function launchCliSession(input: CliSessionInput): Promise<SessionResult> 
     }
     if (res.code !== 0 && !result.error) result.error = `claude exited with code ${res.code}: ${(res.stderr || res.stdout).trim().slice(0, 300)}`;
   } else if (provider === 'codex-cli') {
-    result.text = outFile && fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8').trim() : '';
+    result.text = lastMessage?.trim() ?? '';
     if (res.code !== 0) result.error = `codex exec exited with code ${res.code}: ${codexFailure(res.stderr, res.stdout)}`;
   } else if (provider === 'opencode-cli') {
     const parsed = readOpencodeStream(res.stdout);
@@ -790,11 +828,12 @@ function sessionFrom(input: LaunchInput): Omit<SessionInput, 'prompt'> {
     cwd: input.ws.dir, mcp: input.mcp, readDirs: input.readDirs, jobId: input.jobId, outputPath: input.ws.outputPath,
     worksetId: input.ws.worksetId, allowNetwork: input.allowNetwork, tools: 'write', label: 'agent',
     effort: input.effort, speed: input.speed, webFreshness: input.webFreshness, agents: input.agents, extraMcp: input.extraMcp,
+    companions: input.ws.companions.map((c) => c.path), sessions: input.sessions,
   };
 }
 
 /** Single-session mode: the brief is the whole prompt and the agent does everything itself. */
 export async function launchAgent(input: LaunchInput): Promise<LaunchResult> {
   const r = await launchSession({ ...sessionFrom(input), prompt: fs.readFileSync(input.ws.briefPath, 'utf8') });
-  return { exitCode: r.exitCode, turns: r.turns, costUsd: r.costUsd, resultText: r.text, error: r.error, transcriptPath: r.transcriptPath };
+  return { exitCode: r.exitCode, turns: r.turns, costUsd: r.costUsd, resultText: r.text, error: r.error, transcriptPath: r.transcriptPath, ...(r.worker ? { worker: r.worker } : {}) };
 }

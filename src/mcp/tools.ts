@@ -57,6 +57,27 @@ export interface KnodeToolOptions {
    * default): this machine's own MCP clients, a person at the keyboard.
    */
   caller?: 'owner' | 'agent';
+  /** Register only these tools (a remote research session's set, docs/design/27). */
+  only?: ReadonlySet<string>;
+  /** Checked before a tool runs, with its arguments: throws to refuse (a remote session's writes, bound to its job). */
+  guard?: (tool: string, args: Record<string, unknown>) => void;
+}
+
+/** The tool surface narrowed to `only`, each handler behind `guard`; the server itself when neither is given. */
+function narrowed(target: McpServer, opts: KnodeToolOptions): McpServer {
+  if (!opts.only && !opts.guard) return target;
+  const { only, guard } = opts;
+  const registerTool = (name: string, config: unknown, handler: (args: Record<string, unknown>, extra: unknown) => unknown) => {
+    if (only && !only.has(name)) return undefined;
+    const guarded = guard
+      ? (args: Record<string, unknown>, extra: unknown) => {
+        guard(name, args ?? {});
+        return handler(args, extra);
+      }
+      : handler;
+    return (target.registerTool as unknown as (n: string, c: unknown, h: unknown) => unknown)(name, config, guarded);
+  };
+  return { registerTool } as unknown as McpServer;
 }
 
 /**
@@ -65,7 +86,8 @@ export interface KnodeToolOptions {
  * both register exactly this set, so an agent sees the same tools whichever
  * way it connects.
  */
-export function registerKnodeTools(server: McpServer, ctx: AppContext, opts: KnodeToolOptions = {}): void {
+export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: KnodeToolOptions = {}): void {
+  const server = narrowed(target, opts);
   const agent = opts.caller === 'agent';
   const forPerson = (what: string) => new Error(`${what} is a person's review, not an agent's: ask them to do it in knode-os (the source's "adopt" in the UI, or \`knode-os trust\`)`);
   const json = (data: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] });

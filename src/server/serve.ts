@@ -31,6 +31,8 @@ import { WorkBroker } from '../work/broker.js';
 import { offeredRemotely } from '../work/config.js';
 import { BrokeredEmbedder, embedOffered, EmbedSource, LocalEmbedSlots, localEmbedSlots } from '../work/embed.js';
 import { JudgeSource } from '../work/judge.js';
+import { SessionSource } from '../work/session.js';
+import { classifySessionAnswer, RemoteSessions } from '../research/remote.js';
 import { SummarySource } from '../work/summarize.js';
 import { TranslateSource } from '../work/translate.js';
 import { flushUsageToSidecars } from '../stats/heat.js';
@@ -565,8 +567,12 @@ function startWorkspaceServices(
   // the audits' vectors: on the embed queue while someone can take them, else straight from the embedder
   const auditEmbedder = new BrokeredEmbedder(embedWork, () => ctx.embedder, () =>
     embeddingDeferred(ctx.config) && (localEmbedSlots(ctx.config) > 0 || (embedOffered(ctx.config) && remoteEmbed.askedLately())));
+  // research sessions a remote worker may run on its own account (docs/design/27): the research
+  // loop places each session, the work broker below leases it to a worker's session slot
+  const sessionWork = new SessionSource({ log, classify: classifySessionAnswer });
+  const sessions = new RemoteSessions({ source: sessionWork, config: () => ctx.config, hold: floor, log });
   // deep-research jobs: an external CLI writes wiki pages through the MCP endpoint serve hosts
-  const research = opts.mcp ? startResearchLoop(ctx, { mcp: opts.mcp, log, hold: floor }) : null;
+  const research = opts.mcp ? startResearchLoop(ctx, { mcp: opts.mcp, log, hold: floor, sessions }) : null;
   // a chat turn only lives in one process: whatever a previous serve left mid-answer is idle now
   void resetRunningConversations(ctx.store)
     .then((n) => n && log(`chat: ${n} conversation(s) left answering by a previous run are idle again`))
@@ -657,7 +663,7 @@ function startWorkspaceServices(
   void translations.backfill();
   // every answered call is measured, so the next estimate learns from it (docs/design/18)
   const calls = CallLedger.forWorkspace(ctx.dataDir, { log });
-  const work = new WorkBroker([labeling, summaries, judges, translations, embedWork], { shares: () => ctx.config.server.remote?.shares, ledger: calls });
+  const work = new WorkBroker([labeling, summaries, judges, translations, embedWork, sessionWork], { shares: () => ctx.config.server.remote?.shares, ledger: calls });
   remoteJudge.askedLately = () => work.askedLately('judge', 2 * 60_000);
   remoteEmbed.askedLately = () => work.askedLately('embed', 2 * 60_000);
   // this machine's embed slots run whether or not processing is started, as embedding always has

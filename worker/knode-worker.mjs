@@ -28,6 +28,17 @@
 //           startup and after every configuration change, and every vector must come within the
 //           server's cosine (0.98) of the server's own. Spot checks follow; a miss parks the slots.
 //
+// Research sessions (--sessions codex:1,claude:1; docs/design/27): whole agent sessions of the server's research jobs,
+// run on this machine's own Codex or Claude account. The token needs the "research" scope and the workspace must offer
+// them (server.remote.offer.session). The server sends the session's fields — CLI, model, effort, turn cap, tool set,
+// the schema and the prompt — and this script builds the command itself; it never runs a command line the server
+// wrote. Each session runs in a fresh temporary folder with knode's MCP server as its only tool server, reached at
+// <server>/remote/v1/w/<workspace>/sessions/<id>/mcp with a token of the session's own; it gets no file, shell or
+// edit tools (Codex: read-only sandbox, so it can still read this machine's files — run a session worker as a user
+// with nothing to hide). Its stdout goes to the server with each renewal (every 30 s); a renewal the server refuses
+// (the job was cancelled, the server restarted) kills the CLI. --session-timeout-ms caps a session (default: the
+// server's timeout, at most 6 h).
+//
 // Kinds of work (--kinds extract,summarize,judge,translate; default: every kind the server offers this token):
 //   extract    extraction segments, answered with a JSON object
 //   summarize  summary pages, answered in Markdown
@@ -82,7 +93,9 @@ const workspace = String(args.workspace ?? process.env.KNODE_WORKSPACE ?? '');
 const token = (args.tokenFile ? fs.readFileSync(String(args.tokenFile), 'utf8') : process.env.KNODE_TOKEN ?? '').trim();
 const workerName = String(args.name ?? process.env.KNODE_WORKER_NAME ?? os.hostname());
 const timeoutMs = Number(args.timeoutMs ?? 600_000);
-const backendSpec = String(args.backends ?? process.env.KNODE_BACKENDS ?? 'codex:1');
+const sessionSpec = String(args.sessions ?? process.env.KNODE_SESSIONS ?? '');
+// research sessions alone: no call slots unless asked for
+const backendSpec = String(args.backends ?? process.env.KNODE_BACKENDS ?? (sessionSpec ? '' : 'codex:1'));
 const idleMs = Math.max(100, Number(args.idleMs ?? 20_000));
 const KINDS = ['extract', 'summarize', 'judge', 'translate'];
 const kindSpec = args.kinds ?? process.env.KNODE_KINDS;
@@ -206,8 +219,12 @@ async function kindsForLease() {
 
 function describeKinds() {
   if (!work) return 'a server from before work/* — extraction only';
-  const offered = [...KINDS, 'embed'].filter((k) => work.kinds?.[k] === true);
-  const takes = [...kindsNow(), ...(hasEmbedSlots && work.kinds?.embed === true ? ['embed'] : [])];
+  const offered = [...KINDS, 'embed', 'session'].filter((k) => work.kinds?.[k] === true);
+  const takes = [
+    ...(backends.some((b) => b.name !== 'embed') ? kindsNow() : []),
+    ...(hasEmbedSlots && work.kinds?.embed === true ? ['embed'] : []),
+    ...(sessionSlots.length && work.kinds?.session === true ? ['session'] : []),
+  ];
   return `offers ${offered.join(', ') || 'nothing to this token'}; this worker takes ${takes.join(', ') || 'nothing'}`;
 }
 
@@ -703,14 +720,22 @@ const BACKENDS = {
   },
 };
 
-const backends = backendSpec.split(',').map((part) => {
+const backends = backendSpec.split(',').filter((part) => part.trim()).map((part) => {
   const [name, n] = part.trim().split(':');
   if (!BACKENDS[name]) throw new Error(`unknown backend "${name}" — use ${Object.keys(BACKENDS).join(', ')}`);
   const slots = Math.max(0, Math.min(16, Number(n ?? 1)));
   if (!Number.isFinite(slots)) throw new Error(`bad slot count in "${part}"`);
   return { name, slots, impl: BACKENDS[name], health: newHealth() };
 }).filter((b) => b.slots > 0);
-if (backends.length === 0) throw new Error('no backend has a slot');
+const SESSION_FAMILIES = { codex: () => String(args.codexBin ?? 'codex'), claude: () => String(args.claudeBin ?? 'claude') };
+const sessionSlots = sessionSpec.split(',').filter((part) => part.trim()).map((part) => {
+  const [family, n] = part.trim().split(':');
+  if (!SESSION_FAMILIES[family]) throw new Error(`research sessions run on ${Object.keys(SESSION_FAMILIES).join(' or ')}, not "${family}"`);
+  const slots = Math.max(0, Math.min(8, Number(n ?? 1)));
+  if (!Number.isFinite(slots)) throw new Error(`bad slot count in "${part}"`);
+  return { family, slots, bin: SESSION_FAMILIES[family], health: newHealth() };
+}).filter((s) => s.slots > 0);
+if (backends.length === 0 && sessionSlots.length === 0) throw new Error('no backend has a slot (--backends, --sessions)');
 const hasEmbedSlots = backends.some((b) => b.name === 'embed');
 if (hasEmbedSlots && !ownEndpoint) {
   throw new Error('embed slots need an endpoint of this machine\'s own: --embed-base-url http://…/v1 --embed-model <model> (lent keys are not taken yet)');
@@ -761,6 +786,10 @@ if (args.check) {
     }
     const runs = kindsNow().map((kind) => `${kind} on ${b.impl.label(hintFor(kind, b.name))}`);
     log(`backend ${b.name} × ${b.slots}: ${onPath(b.impl.bin()) ? 'installed' : 'NOT FOUND on PATH'} (${runs.join(', ') || b.impl.label(null)})`);
+  }
+  for (const s of sessionSlots) {
+    const offered = work?.kinds?.session === true;
+    log(`research sessions on ${s.family} × ${s.slots}: ${onPath(s.bin()) ? 'installed' : 'NOT FOUND on PATH'}; ${offered ? 'offered here' : 'not offered to this token here (it needs the "research" scope, and the workspace server.remote.offer.session)'}`);
   }
   process.exit(0);
 }
@@ -969,6 +998,253 @@ async function embedSlot(backend, n) {
   }
 }
 
+/* --------------------------- research sessions --------------------------- */
+// A session's fields are checked one by one and the command is built here (docs/design/27 D9): a server — or
+// anyone posing as one — can name a model or an effort, never a flag, a config layer or a command.
+
+const SESSION_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const SESSION_TIMEOUT_CAP_MS = 6 * 3_600_000;
+const sessionTimeoutMs = Math.min(SESSION_TIMEOUT_CAP_MS, Number(args.sessionTimeoutMs ?? SESSION_TIMEOUT_CAP_MS) || SESSION_TIMEOUT_CAP_MS);
+const SESSION_RENEW_MS = Math.max(1_000, Number(args.sessionRenewMs ?? 30_000));
+const STDERR_KEEP = 64 * 1024;
+
+/** The session as this worker will run it, or why it will not. */
+function checkSession(task, family) {
+  const fail = (why) => ({ error: `refused the session: ${why}` });
+  if (typeof task.id !== 'string' || !/^[0-9a-f-]{36}$/i.test(task.id)) return fail('its id is not a lease id');
+  const a = task.agent ?? {};
+  if (a.family !== family) return fail(`it is for ${a.family}, this slot runs ${family}`);
+  const model = String(a.model ?? '');
+  if (model && !/^[A-Za-z0-9][A-Za-z0-9._:/@\[\]=,-]{0,119}$/.test(model)) return fail('its model name is not one');
+  const effort = a.effort == null ? null : String(a.effort);
+  if (effort !== null && !SESSION_EFFORTS.has(effort)) return fail(`unknown effort "${effort}"`);
+  const speed = a.speed == null ? null : String(a.speed);
+  if (speed !== null && !/^[a-z][a-z0-9_-]{0,30}$/.test(speed)) return fail('its speed is not one');
+  const maxTurns = Math.trunc(Number(task.maxTurns));
+  if (!(maxTurns >= 1 && maxTurns <= 1000)) return fail('its turn cap is out of range');
+  const timeout = Math.trunc(Number(task.timeoutMs));
+  if (!(timeout >= 1_000)) return fail('its timeout is out of range');
+  if (task.tools !== 'read' && task.tools !== 'write') return fail('its tool set is neither read nor write');
+  const web = task.web === true;
+  const freshness = task.webFreshness === 'cached' ? 'cached' : 'live';
+  if (typeof task.prompt !== 'string' || !task.prompt.trim()) return fail('it has no prompt');
+  if (typeof task.schema !== 'string') return fail('it has no schema');
+  if (typeof task.mcpToken !== 'string' || !/^kms_[A-Za-z0-9_-]{20,200}$/.test(task.mcpToken)) return fail('it has no session token');
+  return {
+    session: {
+      id: task.id, family, model, effort, speed, maxTurns, timeoutMs: Math.min(timeout, sessionTimeoutMs), tools: task.tools, web, freshness,
+      prompt: task.prompt, schema: task.schema, token: task.mcpToken, url: `${base}/sessions/${encodeURIComponent(task.id)}/mcp`,
+    },
+  };
+}
+
+/** The folder a session runs in: the schema, and knode's MCP server as the only one (a 0600 file, it holds the token). */
+function sessionFolder(sess) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-session-'));
+  fs.writeFileSync(path.join(dir, 'AGENTS.md'), sess.schema);
+  fs.writeFileSync(path.join(dir, 'CLAUDE.md'), sess.schema);
+  if (sess.family === 'claude') {
+    const server = { type: 'http', url: sess.url, headers: { Authorization: `Bearer ${sess.token}` } };
+    fs.writeFileSync(path.join(dir, '.mcp.json'), JSON.stringify({ mcpServers: { 'knode-os': server } }, null, 2) + '\n', { mode: 0o600 });
+  }
+  return dir;
+}
+
+/** The command for a session, built from its checked fields. */
+function sessionCommand(sess, dir, pinned) {
+  if (sess.family === 'claude') {
+    const argv = [
+      '-p', '--output-format', 'stream-json', '--verbose', '--max-turns', String(sess.maxTurns),
+      '--mcp-config', '.mcp.json', '--strict-mcp-config',
+      '--allowedTools', 'mcp__knode-os__*', ...(sess.web ? ['WebSearch', 'WebFetch'] : []),
+      '--disallowedTools', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash', 'Read', 'Grep', 'Glob', ...(sess.web ? [] : ['WebFetch', 'WebSearch']),
+      '--permission-mode', 'dontAsk', '--no-session-persistence',
+      ...(sess.effort ? ['--effort', sess.effort] : []),
+      ...(sess.model ? ['--model', sess.model] : []),
+    ];
+    return { bin: SESSION_FAMILIES.claude(), argv, env: {}, lastMessage: null };
+  }
+  const lastMessage = path.join(dir, 'last-message.txt');
+  const argv = [
+    'exec', '-', '--skip-git-repo-check', '--ignore-user-config', '--ephemeral', '--sandbox', 'read-only', '--cd', dir,
+    '-c', 'features.plugins=false', '-c', 'features.apps=false', '-c', 'analytics.enabled=false',
+    ...(pinned ? ['-c', `model_catalog_json=${JSON.stringify(pinned)}`] : []),
+    '-c', `mcp_servers.knode-os.url=${JSON.stringify(sess.url)}`,
+    '-c', 'mcp_servers.knode-os.bearer_token_env_var="KNODE_SESSION_TOKEN"',
+    '-c', 'mcp_servers.knode-os.default_tools_approval_mode="approve"',
+    '-c', 'mcp_servers.knode-os.tool_timeout_sec=300',
+    '-c', `web_search=${JSON.stringify(sess.web ? sess.freshness : 'disabled')}`,
+    ...(sess.effort ? ['-c', `model_reasoning_effort=${JSON.stringify(sess.effort)}`] : []),
+    ...(sess.speed ? ['-c', `service_tier=${JSON.stringify(sess.speed)}`] : []),
+    '--output-last-message', lastMessage,
+    ...(sess.model ? ['-m', sess.model] : []),
+  ];
+  return { bin: SESSION_FAMILIES.codex(), argv, env: { KNODE_SESSION_TOKEN: sess.token }, lastMessage };
+}
+
+/** Run a session's CLI: stdout handed to `onStdout` as it comes, stderr's end kept; `kill()` stops it. */
+function runSessionProcess(cmd, argv, stdin, cwd, env, timeout, onStdout) {
+  let child;
+  const done = new Promise((resolve) => {
+    child = spawn(cmd, argv, { cwd, env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
+    children.add(child);
+    let stderr = '';
+    let settled = false;
+    const finish = (code, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      children.delete(child);
+      resolve({ code, stderr: error ? `${stderr}\n${error}` : stderr });
+    };
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      finish(-1, `${cmd} timed out after ${Math.round(timeout / 1000)}s`);
+    }, timeout);
+    child.stdout.on('data', (d) => onStdout(d.toString('utf8')));
+    child.stderr.on('data', (d) => {
+      stderr += d;
+      if (stderr.length > 2 * STDERR_KEEP) stderr = stderr.slice(-STDERR_KEEP);
+    });
+    child.on('error', (err) => finish(-1, err.code === 'ENOENT' ? `${cmd} CLI not found` : String(err.message ?? err)));
+    child.on('close', (code) => finish(code ?? -1, null));
+    child.stdin.on('error', () => {});
+    child.stdin.end(stdin);
+  });
+  return {
+    done,
+    kill() {
+      try {
+        child?.kill('SIGTERM');
+        setTimeout(() => child?.kill('SIGKILL'), 5_000).unref?.();
+      } catch {
+        // gone already
+      }
+    },
+  };
+}
+
+/** A session slot: lease a session for this CLI, run it, stream its output back, hand back how it ended. */
+async function sessionSlot(slot, n) {
+  const identity = { worker: `${workerName}/session-${slot.family}#${n}`, backend: slot.family };
+  let idleRounds = 0;
+  while (!stopping) {
+    const pause = slot.health.pausedUntil - Date.now();
+    if (pause > 0) {
+      await sleep(Math.min(pause, 15_000));
+      continue;
+    }
+    if (reading) await reading;
+    if (!work?.kinds?.session) {
+      if (args.once && ++idleRounds >= 2) break;
+      await sleep(idleMs * (0.75 + Math.random() * 0.5));
+      continue;
+    }
+    let task;
+    try {
+      const { data } = await call('POST', `${base}/work/lease`, { ...identity, kinds: ['session'], max: 1 });
+      if (data.configVersion && data.configVersion !== work.version) void rereadWorkConfig();
+      task = data.tasks?.[0];
+    } catch (err) {
+      log(`${identity.worker}: lease failed: ${err.message}`);
+      if (err.status === 401 || err.status === 403) {
+        stopping = true;
+        break;
+      }
+      await sleep(30_000);
+      continue;
+    }
+    if (!task) {
+      if (args.once && ++idleRounds >= 2) break;
+      await sleep(idleMs * (0.75 + Math.random() * 0.5));
+      continue;
+    }
+    idleRounds = 0;
+    held.set(task.id, { identity, route: 'work' });
+    const checked = checkSession(task, slot.family);
+    if (checked.error) {
+      log(`${identity.worker}: ${checked.error}`);
+      await call('POST', `${base}/work/complete`, { ...identity, id: task.id, ok: false, error: checked.error, kind: 'fatal' }).catch(() => {});
+      held.delete(task.id);
+      continue;
+    }
+    const sess = checked.session;
+    const started = Date.now();
+    log(`${identity.worker}: session ${task.label ?? task.id} on ${slot.family}${sess.model ? ` ${sess.model}` : ''} (≤${sess.maxTurns} turns, ${sess.tools} tools${sess.web ? ', web' : ''})`);
+    const dir = sessionFolder(sess);
+    let pendingOut = '';
+    let lost = false;
+    let proc = null;
+    // renewals one after another, so the transcript keeps its order
+    let renewing = Promise.resolve();
+    const renewOnce = () => {
+      renewing = renewing.then(async () => {
+        if (lost) return;
+        const output = pendingOut;
+        pendingOut = '';
+        try {
+          const { data } = await call('POST', `${base}/work/renew`, { ...identity, ids: [task.id], output: output ? { [task.id]: output } : undefined });
+          if (Array.isArray(data.lost) && data.lost.includes(task.id)) {
+            lost = true;
+            log(`${identity.worker}: the server no longer wants ${task.label ?? task.id} (cancelled, restarted or lapsed) — stopping it`);
+            proc?.kill();
+          }
+        } catch (err) {
+          // the output is kept for the next renewal; the lease lapses on the server if this goes on
+          pendingOut = output + pendingOut;
+          log(`${identity.worker}: renew failed: ${err.message}`);
+        }
+      });
+      return renewing;
+    };
+    const renewTimer = setInterval(() => void renewOnce(), SESSION_RENEW_MS);
+    let result;
+    try {
+      const catalog = sess.family === 'codex' ? codexCatalog(SESSION_FAMILIES.codex(), sess.model) : null;
+      const pinned = pinnedCatalog(catalog);
+      const cmd = sessionCommand(sess, dir, pinned);
+      proc = runSessionProcess(cmd.bin, cmd.argv, sess.prompt, dir, cmd.env, sess.timeoutMs, (text) => (pendingOut += text));
+      result = await proc.done;
+      if (sess.family === 'codex' && !pinned) await refreshCatalog(catalog);
+      result.lastMessage = cmd.lastMessage && fs.existsSync(cmd.lastMessage) ? fs.readFileSync(cmd.lastMessage, 'utf8') : null;
+    } finally {
+      clearInterval(renewTimer);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    await renewing;
+    if (lost || stopping) {
+      held.delete(task.id);
+      if (stopping) break;
+      continue;
+    }
+    const secs = Math.round((Date.now() - started) / 1000);
+    // a CLI that could not start at all is this machine's failure, not the session's
+    const notStarted = result.code === -1 && /CLI not found|ENOENT/.test(result.stderr) && !pendingOut;
+    const outcome = notStarted
+      ? { ok: false, error: result.stderr.trim().split('\n').pop(), kind: 'fatal' }
+      : { ok: true, text: '', session: { exitCode: result.code, output: pendingOut, stderr: result.stderr.slice(-STDERR_KEEP), lastMessage: result.lastMessage } };
+    slot.health.calls++;
+    try {
+      const { data } = await call('POST', `${base}/work/complete`, { ...identity, id: task.id, model: `${slot.family}:${sess.model || 'default'}`, ...outcome });
+      held.delete(task.id);
+      if (!data.accepted) log(`${identity.worker}: ${task.label ?? task.id} not taken back: ${data.reason}`);
+      else if (data.failure) log(`${identity.worker}: ${task.label ?? task.id} could not be served here (${data.failure}) after ${secs}s — it goes back to the server`);
+      else log(`${identity.worker}: ${task.label ?? task.id} done in ${secs}s (exit ${result.code})`);
+      const failure = !outcome.ok ? outcome.kind : data.failure;
+      if (failure) {
+        slot.health.failed++;
+        const ms = rest(slot.health, failure);
+        if (ms) log(`sessions on ${slot.family}: resting ${Math.ceil(ms / 60_000)} min after a ${failure} failure`);
+      } else {
+        slot.health.ok++;
+        Object.assign(slot.health, { transientStreak: 0, modelStreak: 0, fatalStreak: 0 });
+      }
+    } catch (err) {
+      log(`${identity.worker}: could not hand back ${task.label ?? task.id}: ${err.message}`);
+    }
+  }
+}
+
 async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
@@ -999,11 +1275,15 @@ for (;;) {
     if (stopping) process.exit(0);
   }
 }
-log(`knode worker ${workerName} → ${server} ${workspace}: ${backends.map((b) => `${b.name} × ${b.slots}`).join(', ')} (session ${crypto.randomUUID().slice(0, 8)})`);
+log(`knode worker ${workerName} → ${server} ${workspace}: ${[...backends.map((b) => `${b.name} × ${b.slots}`), ...sessionSlots.map((s) => `research sessions on ${s.family} × ${s.slots}`)].join(', ')} (run ${crypto.randomUUID().slice(0, 8)})`);
 log(`${workspace}: ${describeKinds()}`);
 if (args.extractFirst) log('extract-first enabled: summaries wait for the extraction queue and in-flight work to drain');
 const llmSlots = backends.some((b) => b.name !== 'embed');
 if (llmSlots && kindsNow().length === 0) log('nothing to take here — check --kinds, the token\'s kinds and what the server offers');
 if (hasEmbedSlots && !work?.kinds?.embed) log('embed: not offered to this token here — it needs the "embed" scope, and the workspace ingest.embedding "deferred"');
-await Promise.all(backends.flatMap((b) => Array.from({ length: b.slots }, (_, i) => (b.name === 'embed' ? embedSlot(b, i + 1) : slot(b, i + 1)))));
+if (sessionSlots.length && !work?.kinds?.session) log('research sessions: not offered to this token here — it needs the "research" scope, and the workspace server.remote.offer.session');
+await Promise.all([
+  ...backends.flatMap((b) => Array.from({ length: b.slots }, (_, i) => (b.name === 'embed' ? embedSlot(b, i + 1) : slot(b, i + 1)))),
+  ...sessionSlots.flatMap((s) => Array.from({ length: s.slots }, (_, i) => sessionSlot(s, i + 1))),
+]);
 log('no more work — exiting');

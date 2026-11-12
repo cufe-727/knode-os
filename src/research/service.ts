@@ -3,6 +3,7 @@ import type { BackgroundHold } from '../labeling/background-floor.js';
 import { claimNextJob, requeueStale, updateJob } from './jobs.js';
 import { killActiveAgents } from './launch.js';
 import { autoAcceptRecommendations } from './recommend.js';
+import type { SessionDispatch } from './launch.js';
 import { agentForJob, holdJobForQuota, resolveResearchAgent, ResearchAgent, runResearchJob } from './runner.js';
 import { continueStudies } from './study.js';
 import { McpEndpoint } from './workspace.js';
@@ -15,11 +16,13 @@ import { McpEndpoint } from './workspace.js';
  * `hold` is the quota floor over background work
  * (src/labeling/background-floor.ts): a job whose agent runs on a Codex or
  * Claude plan under it is put back, paused until the window resets, with
- * every job queued on the same account (`holdJobForQuota`).
+ * every job queued on the same account (`holdJobForQuota`) — unless a remote
+ * worker that takes the job's CLI is online (`sessions.covers`, docs/design/27
+ * D4): then each session checks the floor for itself, and may go to the worker.
  */
 export function startResearchLoop(
   ctx: AppContext,
-  opts: { mcp: () => McpEndpoint | null; log: (msg: string) => void; intervalMs?: number; hold?: BackgroundHold },
+  opts: { mcp: () => McpEndpoint | null; log: (msg: string) => void; intervalMs?: number; hold?: BackgroundHold; sessions?: SessionDispatch },
 ): { stop: () => Promise<void>; kick: () => void } {
   let disposed = false;
   let running = 0;
@@ -84,7 +87,8 @@ export function startResearchLoop(
         } catch {
           // the run says why it cannot start
         }
-        const held = runner?.kind === 'cli' ? await opts.hold(runner).catch(() => null) : null;
+        // a worker online for this CLI may run the sessions on its own account: the floor is then each session's to check
+        const held = runner?.kind === 'cli' && !opts.sessions?.covers(runner) ? await opts.hold(runner).catch(() => null) : null;
         if (held && runner) {
           const claimed = job;
           const paused = await holdJobForQuota(ctx, claimed, runner, held, opts.log).then(() => true, async (err) => {
@@ -99,7 +103,7 @@ export function startResearchLoop(
       }
       running++;
       inflightJobs.add(job.id);
-      const p = runResearchJob(ctx, job, { mcp, log: opts.log })
+      const p = runResearchJob(ctx, job, { mcp, log: opts.log, sessions: opts.sessions })
         .catch(async (err) => {
           opts.log(`research ${job.id} crashed: ${err instanceof Error ? err.message : err}`);
           await updateJob(ctx.store, job.id, { status: 'failed', error: String(err instanceof Error ? err.message : err), finishedAt: new Date().toISOString() }).catch(() => {});

@@ -60,6 +60,7 @@ enum TaskWords {
         case "translate": L("Translate")
         case "judge": L("Review")
         case "embed": L("Embed")
+        case "session": L("Research")
         default: kind
         }
     }
@@ -71,6 +72,7 @@ enum TaskWords {
         case "translate": .orange
         case "judge": .knodeViolet
         case "embed": .knodeCyan
+        case "session": .orange
         default: .secondary
         }
     }
@@ -429,7 +431,7 @@ struct TasksView: View {
                         GridRow {
                             KindPill(text: TaskWords.work(lease.kind), color: TaskWords.workColor(lease.kind))
                             Group {
-                                if lease.kind == "judge" {
+                                if lease.kind == "judge" || lease.kind == "session" {
                                     Text(lease.subject).lineLimit(2)
                                 } else {
                                     Button(lease.subject) { model.openFile(lease.subject) }

@@ -68,7 +68,31 @@ export interface EmbedWorkTask extends TaskBase {
   inputs: string[];
 }
 
-export type WorkTask = LlmWorkTask | EmbedWorkTask;
+/**
+ * A research agent session (src/work/session.ts, docs/design/27): what the
+ * worker needs to build the CLI's command itself — never argv, environment or
+ * a config layer — and the token the session reaches knode with, at
+ * `…/sessions/<id>/mcp` on the server the worker already talks to.
+ */
+export interface SessionWorkTask extends TaskBase {
+  kind: 'session';
+  /** The research job the session belongs to. */
+  job: string;
+  agent: { family: 'codex' | 'claude'; model: string; effort: string | null; speed: string | null };
+  maxTurns: number;
+  timeoutMs: number;
+  /** `read`: knode's read tools; `write`: also knode_write / knode_commit for the job's own page. */
+  tools: 'read' | 'write';
+  web: boolean;
+  webFreshness: string | null;
+  /** Written as AGENTS.md and CLAUDE.md in the session's folder. */
+  schema: string;
+  prompt: string;
+  /** The session's own token for its MCP route, valid while the lease lives. */
+  mcpToken: string;
+}
+
+export type WorkTask = LlmWorkTask | EmbedWorkTask | SessionWorkTask;
 
 /** What a slot says about itself beyond its identity, for the kinds that need it (embed: src/work/embed.ts). */
 export interface LeaseRequest {
@@ -284,8 +308,8 @@ export class WorkBroker {
     if (!this.opts.ledger) return tasks;
     const now = Date.now();
     for (const [id, i] of this.issued) if (now - i.at > ISSUED_TTL_MS) this.issued.delete(id);
-    // the ledger measures model calls; a batch of vectors is no call it estimates
-    for (const task of tasks) if (task.kind !== 'embed') this.issued.set(task.id, { kind: task.kind, at: now, promptTokens: estimateTokens(task.prompt) });
+    // the ledger measures model calls; a batch of vectors or an agent session is no call it estimates
+    for (const task of tasks) if (task.kind !== 'embed' && task.kind !== 'session') this.issued.set(task.id, { kind: task.kind, at: now, promptTokens: estimateTokens(task.prompt) });
     return tasks;
   }
 

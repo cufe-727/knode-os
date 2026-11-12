@@ -409,7 +409,7 @@ export interface RemoteApiConfig {
    * may take here (docs/design/12). Summaries default to on, the Judge
    * stage's review calls to off.
    */
-  offer?: { summarize?: boolean; judge?: boolean; translate?: boolean; embed?: boolean };
+  offer?: { summarize?: boolean; judge?: boolean; translate?: boolean; embed?: boolean; session?: boolean };
   /**
    * How a slot that takes several kinds of work shares them: tasks handed out
    * per kind, by weight (src/work/broker.ts). Default extraction 3, summaries 1.
@@ -418,6 +418,15 @@ export interface RemoteApiConfig {
   shares?: { extract?: number; summarize?: number; translate?: number };
   /** Longest a review waits for one judge call to be answered, here or remotely (default 20). */
   callDeadlineMinutes?: number;
+  /**
+   * Research sessions offered to remote workers (`offer.session`, docs/design/27):
+   * how long a session waits for an online worker that takes its CLI before it
+   * runs here (default 30 s), and how long one this machine may not run (its
+   * plan under the floor, `research.localSessions` 0) waits for a worker before
+   * its job waits as design 22 says (default 30 min).
+   */
+  sessionOfferSeconds?: number;
+  sessionWaitMinutes?: number;
   /**
    * The remote models whose verdicts may merge or reject without a person
    * (`review.llmJudge` / `review.claimMerge` set to auto): model labels as a
@@ -828,6 +837,12 @@ export interface ResearchConfig {
   timeoutMs: number;
   /** Concurrent CLI runs per workspace. */
   concurrency: number;
+  /**
+   * Research sessions this machine runs at once when sessions are offered to
+   * remote workers (`server.remote.offer.session`, docs/design/27): unset, no
+   * limit beyond the jobs' own; 0, sessions run only on remote workers.
+   */
+  localSessions?: number | null;
   /** Where run workspaces live, relative to the data dir. */
   runsDir: string;
   /** Finished run directories kept before the oldest are pruned. */
@@ -1228,7 +1243,8 @@ export function defaultConfig(): KnodeConfig {
       mcp: { enabled: true, path: '/mcp' },
       remote: {
         enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15,
-        offer: { summarize: true, judge: false, translate: true, embed: true }, shares: { extract: 3, summarize: 1, translate: 1 }, callDeadlineMinutes: 20, judgeModels: [],
+        offer: { summarize: true, judge: false, translate: true, embed: true, session: false }, shares: { extract: 3, summarize: 1, translate: 1 }, callDeadlineMinutes: 20, judgeModels: [],
+        sessionOfferSeconds: 30, sessionWaitMinutes: 30,
         embedProbeCosine: 0.98,
       },
       auth: { enabled: true, sessionDays: 30, allowInsecureRemote: false },

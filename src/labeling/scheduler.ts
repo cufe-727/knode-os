@@ -72,8 +72,19 @@ export interface WorkerIdentity {
  * them) and an empty `text`; `http` is what an embedding endpoint answered
  * when it refused (src/work/embed.ts).
  */
+/** What a worker hands back for a research session (docs/design/27): the CLI's raw output, parsed on the server. */
+export interface SessionAnswer {
+  exitCode: number;
+  /** stdout since the last renewal (the rest is in the transcript already). */
+  output: string;
+  /** The end of stderr. */
+  stderr: string;
+  /** Codex's --output-last-message, when it wrote one. */
+  lastMessage: string | null;
+}
+
 export type TaskOutcome =
-  | { ok: true; text: string; model?: string; usage?: CallUsage; vectors?: number[][]; endpointModel?: string }
+  | { ok: true; text: string; model?: string; usage?: CallUsage; vectors?: number[][]; endpointModel?: string; session?: SessionAnswer }
   | { ok: false; error: string; kind?: FailureKind; model?: string; usage?: CallUsage; http?: { status: number; retryAfterMs?: number } };
 
 export interface CompleteResult {

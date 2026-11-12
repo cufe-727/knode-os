@@ -229,6 +229,8 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
   const summaries = work?.kinds.summarize as import('../work/summarize.js').SummaryStatus | undefined;
   const translations = work?.kinds.translate as import('../work/translate.js').TranslateStatus | undefined;
   const judge = work?.kinds.judge as import('../work/judge.js').JudgeStatus | undefined;
+  // research sessions out on remote workers (docs/design/27)
+  const sessionWork = work?.kinds.session as import('../work/session.js').SessionStatus | undefined;
   const backfill = services?.embeddings?.status() ?? null;
   // deferred mode: vectors as leased work, made by this machine's embed slots and remote workers
   const embedWork = work?.kinds.embed as import('../work/embed.js').EmbedStatus | undefined;
@@ -294,6 +296,10 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
     })),
     ...(embedWork?.leases ?? []).map((l) => ({
       id: l.id, kind: 'embed' as const, subject: l.label, detail: null,
+      worker: l.worker, backend: l.backend, remote: l.remote, ageSeconds: l.ageSeconds, expiresInSeconds: l.expiresInSeconds,
+    })),
+    ...(sessionWork?.leases ?? []).map((l) => ({
+      id: l.id, kind: 'session' as const, subject: l.title, detail: `${l.job} · ${l.label}`,
       worker: l.worker, backend: l.backend, remote: l.remote, ageSeconds: l.ageSeconds, expiresInSeconds: l.expiresInSeconds,
     })),
   ].sort((a, b) => b.ageSeconds - a.ageSeconds);

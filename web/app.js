@@ -1544,7 +1544,7 @@ const STAGES = {
   review: { title: 'Review', icon: '⚖', about: 'judge calls: duplicate entities and claims' },
 };
 const UNIT_WORDS = { documents: ['document', 'documents'], chunks: ['chunk', 'chunks'], translations: ['translation', 'translations'], calls: ['call', 'calls'] };
-const WORK_KIND_WORDS = { extract: 'Extract', summarize: 'Summarize', translate: 'Translate', judge: 'Review', embed: 'Embed' };
+const WORK_KIND_WORDS = { extract: 'Extract', summarize: 'Summarize', translate: 'Translate', judge: 'Review', embed: 'Embed', session: 'Research' };
 const JOB_KIND_WORDS = { study: 'Study', research: 'Page', init: 'Initialize', ask: 'Ask' };
 const SCHEDULE_WORDS = {
   dream: ['Dream', 'reviews recent agent traces'],
@@ -1678,7 +1678,7 @@ function paintTasksInFlight(t) {
   el.innerHTML = `<table class="tasks-table"><thead><tr><th>stage</th><th>document</th><th>part</th><th>worker</th><th class="num">running</th><th class="num">lease ends</th></tr></thead><tbody>
     ${t.inFlight.map((x) => `<tr>
       <td><span class="kind-pill k-${esc(x.kind)}">${esc(WORK_KIND_WORDS[x.kind] ?? x.kind)}</span></td>
-      <td class="tasks-subject">${x.kind === 'judge' || x.kind === 'embed' ? esc(x.subject) : `<a href="#" class="mono" data-open="${esc(x.subject)}">${esc(x.subject)}</a>`}</td>
+      <td class="tasks-subject">${x.kind === 'judge' || x.kind === 'embed' || x.kind === 'session' ? esc(x.subject) : `<a href="#" class="mono" data-open="${esc(x.subject)}">${esc(x.subject)}</a>`}</td>
       <td class="hint">${esc(x.detail ?? '')}</td>
       <td><span class="mono">${esc(x.backend)}</span>${x.remote ? ' <span class="tag remote">remote</span>' : ''}<div class="hint mono tasks-worker-id">${esc(x.worker)}</div></td>
       <td class="num mono">${spanText(x.ageSeconds)}</td>
