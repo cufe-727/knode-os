@@ -676,27 +676,51 @@ export function createApp(
   });
 
   /**
-   * After a settings save in `ctx`: when it changed processing, a stage's model
-   * or slots, or an agent or row a stage runs on, the root and every other
-   * workspace take the change now (src/global-settings.ts), open ones reloaded.
+   * After a settings save in `ctx`: every setting but what a workspace
+   * contains is the server's (src/global-settings.ts), so the root and every
+   * other workspace take the change now, open ones reloaded. An open one moved
+   * onto another embedding model gets its vectors the way a save of its own
+   * would: the backlog refills (deferred), or every document is re-applied
+   * (inline) in the background.
    */
   const shareIfChanged = async (ctx: AppContext, before: string) => {
     if (sharedSnapshot(ctx.dataDir, ctx.config) === before) return null;
     const root = { dataDir: workspaceContexts.rootDataDir, config: workspaceContexts.template() ?? rootCtx.config };
-    const change = shareSettingsEverywhere({ root, from: ctx, open: await workspaceContexts.openContexts(), log: (m) => log(`settings: ${m}`) });
+    const open = await workspaceContexts.openContexts();
+    const change = shareSettingsEverywhere({ root, from: ctx, open, log: (m) => log(`settings: ${m}`) });
     const here = path.relative(root.dataDir, ctx.dataDir) || '.';
-    // a stage target renamed so it takes over no other workspace's own: this workspace's Judge client follows
-    if (Object.keys(change.renamed).length > 0) {
-      ctx.llm = judgeLlmClient(ctx.config);
-      log(`settings: ${Object.entries(change.renamed).map(([a, b]) => `"${a}" is shared as "${b}"`).join(', ')}, since another workspace uses its own "${Object.keys(change.renamed)[0]}" for itself`);
-    }
-    log(`settings: the processing and stage settings saved in ${here} apply to every workspace now (${change.written.length} written, ${change.reloaded.length} open reloaded)`);
+    log(`settings: the settings saved in ${here} apply to every workspace now (${change.written.length} written, ${change.reloaded.length} open reloaded)`);
     for (const f of change.failed) log(`settings: ${path.relative(root.dataDir, f.dataDir)} could not take them: ${f.error}`);
     for (const dataDir of change.reloaded) {
-      const open = (await workspaceContexts.openContexts()).find((o) => o.dataDir === dataDir);
-      if (open) servicesFor(open)?.translations?.wake();
+      const other = open.find((o) => o.dataDir === dataDir);
+      if (other) servicesFor(other)?.translations?.wake();
     }
-    return { written: change.written.length, reloaded: change.reloaded.length, failed: change.failed.length, renamed: change.renamed };
+    for (const dataDir of change.reembedded) {
+      const other = open.find((o) => o.dataDir === dataDir);
+      if (other) await followEmbeddingModel(other);
+    }
+    return { written: change.written.length, reloaded: change.reloaded.length, failed: change.failed.length, reembedded: change.reembedded.length };
+  };
+
+  /** A workspace whose embedder was just replaced from elsewhere: a new width, then its vectors for the new model. */
+  const followEmbeddingModel = async (other: AppContext) => {
+    const label = path.relative(workspaceContexts.rootDataDir, other.dataDir) || '.';
+    try {
+      await other.store.setEmbeddingDimension(other.config.embedding.dimensions);
+      if (embeddingDeferred(other.config) || ingestRunning.has(other.dataDir)) {
+        other.embeddings?.kick();
+        return;
+      }
+      ingestRunning.add(other.dataDir);
+      void activityOf(other.dataDir).run('sync', 'Re-embed every document for the new model', () => sync(other, { onProgress: log }), describeSync)
+        .catch((e) => log(`settings: ${label} could not re-embed: ${e instanceof Error ? e.message : e}`))
+        .finally(() => {
+          ingestRunning.delete(other.dataDir);
+          other.embeddings?.kick();
+        });
+    } catch (e) {
+      log(`settings: ${label} could not move to the new embedding model: ${e instanceof Error ? e.message : e}`);
+    }
   };
 
   app.get('/api/config', (c) => {
@@ -912,7 +936,7 @@ export function createApp(
     try {
       const incoming = (await c.req.json()) as ModelConfigDraft;
       const next: KnodeConfig = JSON.parse(JSON.stringify(ctx.config));
-      // processing and the stage models are the server's (src/global-settings.ts): what this save changes of them goes everywhere
+      // every setting but what a workspace contains is the server's (src/global-settings.ts): what this save changes goes everywhere
       const sharedBefore = sharedSnapshot(ctx.dataDir, ctx.config);
 
       // Unconditional: this is also what repairs a dangling embeddingUse, and

@@ -136,7 +136,7 @@ describe('workspace lifecycle and API isolation', () => {
     expect(fs.existsSync(path.join(root, 'teams', 'alpha-team', 'wiki', 'shared.md'))).toBe(true);
   });
 
-  it('persists and hot-applies config only in the selected user workspace', async () => {
+  it('persists and hot-applies a settings save in every workspace: settings are the server\'s', async () => {
     const save = await app.request('/api/config', {
       method: 'PUT',
       headers: headers('admin', 'personal', 'Product Research', 'product-research'),
@@ -159,7 +159,7 @@ describe('workspace lifecycle and API isolation', () => {
 
     expect(researchConfig.llm).toMatchObject({ provider: 'codex-cli', model: 'research-model', cliPath: 'codex-research' });
     expect(researchConfig.extraction.entityLlm).toMatchObject({ provider: 'claude-cli', model: 'entity-model' });
-    expect(personalConfig.llm.model).toBe('');
+    expect(personalConfig.llm).toMatchObject({ provider: 'codex-cli', model: 'research-model', cliPath: 'codex-research' });
   });
 
   it('clears the whole workspace and recreates only an empty skeleton', async () => {
@@ -177,7 +177,8 @@ describe('workspace lifecycle and API isolation', () => {
     const config = await (await app.request('/api/config', {
       headers: headers('admin', 'personal', 'Product Research', 'product-research'),
     })).json();
-    expect(config.llm.model).toBe('');
+    // the files went; the server's settings did not
+    expect(config.llm.model).toBe('research-model');
 
     const listed = await (await app.request('/api/workspaces', { headers: userHeaders('admin') })).json();
     expect(listed).toEqual(expect.arrayContaining([

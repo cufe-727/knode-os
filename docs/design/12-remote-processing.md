@@ -343,26 +343,36 @@ Since 2026‑11‑08 the switch is on from the start, in every workspace: `serve
 starts its processing, with no setting to say otherwise (`autoStart` is gone; an old file's is read past). The
 button stays as a pause: it stops one workspace's processing until someone starts it again or the service restarts.
 
-### 6.1 Server-wide processing and stage models (2026‑11‑08)
+### 6.1 Server-wide settings (2026‑11‑08; every setting since 2026‑11‑12)
 
 Every workspace on a machine spends the same plans, so what processing may spend is the machine's to say, not each
-workspace's. `processing`, the five stage routes (`extraction.{entityLlm,documentLlm,summaryLlm,judgeLlm,
-translateLlm}`, with `tier1Model`), `extraction.workers`, `extraction.concurrency`, `summaryConcurrency`,
-`translateConcurrency` and `review.concurrency` are one setting for the server (`src/global-settings.ts`):
+workspace's. On 2026‑11‑08 that was `processing`, the five stage routes, `extraction.workers` and the stage
+concurrencies. Since 2026‑11‑12 it is **every setting** in `knode.config.json`: the connections and default model,
+embedding (providers, pool, mode, embed slots and the endpoint on this machine), every stage, research, Ask,
+languages, retrieval, the graph, review, Dream and `server`. One administrator's change is everyone's, so a
+workspace no longer needs its own copy configured (finance needed its embedding switched by hand while two other
+workspaces already ran on the local bge‑m3). Only what a workspace *contains* stays its own (`OWN_PATHS` in
+`src/global-settings.ts`): `datasources`, `ingest.linkedFolders` and `ingest.codebases`. Those import content, and
+sharing them would pull one workspace's (or one account's) sources into all the others.
 
 - **Where they live.** The server root's `knode.config.json` is the source. Each workspace's file keeps a copy, so
   whatever reads a workspace's config — `serve`, the CLI, a test — reads the shared values. The copy is written when
   the workspace opens (`WorkspaceContextRegistry.open`, before `createContext`; a new workspace is made from the
-  root's config and takes it then too) and, when an administrator changes one of them through `PUT /api/config` or
-  edits an agent a stage runs on, in the root, in every workspace folder (`users/*/workspaces/*`, and a Team that
+  root's config and takes it then too) and, when an administrator changes a setting through `PUT /api/config` or
+  edits an agent a setting names, in the root, in every workspace folder (`users/*/workspaces/*`, and a Team that
   is a folder of its own; a shared Team is a symlink to its owner's) and in every open context, which reloads
-  (`ctx.config`, `ctx.llm`). The response says how many workspaces took it.
-- **What travels with them.** A stage names an agent file or a connection row by id. The agent file is copied and
-  the row merged, with the row an agent loops on, before the workspace's config is read: `loadConfig` pins a route
-  whose target it cannot find back to the workspace's default. A same-named agent or row of the workspace is
-  replaced, unless the workspace uses that id for itself (default model, research or Ask agent): ids such as
-  `openai-1` are minted per workspace. Publishing then shares a copy under a fresh id (`settleSharedIds`,
-  `<id>-server`), and a workspace opening with such a clash moves its own aside (`<id>-own`).
+  (`ctx.config`, `ctx.llm`, and `ctx.embedder` when the embedding model changed). The response says how many
+  workspaces took it.
+- **A new embedding model elsewhere.** An open workspace moved onto another embedding model by someone else's save
+  gets a new vector width if needed (`setEmbeddingDimension`), then its vectors as its own save would: the deferred
+  backlog refills, or (inline) every document is re-applied in the background. A closed one does the same when it
+  opens. An endpoint on this machine (`ingest.embedEndpoint`) is calibrated per workspace against that
+  workspace's pool reference (`.knode/embedding-probe.json`); until it passes, the slots embed on the pool.
+- **What travels with them.** Settings name agent files by id (the stages, the slots, the default model, research's
+  and Ask's agents, the study refiner). Those files are copied before the workspace's config is read: `loadConfig`
+  pins a route whose target it cannot find back to the default. Connection rows travel inside `connections`, which
+  is shared whole, so an id means the same row everywhere and the old clash handling (`<id>-server`, `<id>-own`) is
+  gone.
 - **One cap for the machine.** `serve` makes one `CallLimiter` and hands it to every workspace's slots, so
   `maxLocalCalls` counts every workspace's calls together. Its waiters belong to an owner (a workspace's slots), so
   a workspace that stops turns away only its own; judge calls stay first in line. `calls()` reports the machine's
@@ -373,8 +383,7 @@ translateLlm}`, with `tier1Model`), `extraction.workers`, `extraction.concurrenc
   account), and the nightly Dream (Judge route) and tier-2 pass (Judge and Summarize routes) skip the night with a
   log line. Ask is not held, and nor are an import's image conversions.
 
-Not counted under the cap: remote workers, research sessions, Dream, the tier-2 pass and Ask. Content settings stay
-per workspace: data sources, research, Ask, languages, embedding, the review modes and `summaryAfterExtraction`.
+Not counted under the cap: remote workers, research sessions, Dream, the tier-2 pass and Ask.
 
 ## 7. The worker (`worker/knode-worker.mjs`)
 

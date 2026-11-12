@@ -560,7 +560,7 @@
 
         <section class="settings-section" data-subtab="pipeline" aria-labelledby="pipeline-title">
           <div class="settings-section-head"><div><p class="section-index">02 · INGEST</p><h3 id="pipeline-title">How documents get processed</h3><p>A document moves down this list. The stages ask different things of a model, which is why each one can run somewhere else.</p></div><span class="section-badge accent2">Per stage</span></div>
-          <p class="cfg-callout" id="cfg-server-wide-stages"><b>Server-wide: every workspace on this server.</b> What each model stage runs with and its model, Extract's, Translate's and the review's parallel calls, the slots per agent (<span class="mono">extraction.workers</span>) and the processing limits below are one setting for the whole server: saving them here changes them in every workspace, new ones included. Which documents get processed, the languages, embedding and research stay this workspace's own.</p>
+          <p class="cfg-callout" id="cfg-server-wide-stages"><b>Server-wide: every workspace on this server.</b> Every setting here is one setting for the whole server: the models and connections, embedding, each stage's model and parallel calls, the slots per agent (<span class="mono">extraction.workers</span>), the processing limits, research, Ask, languages and retrieval. Saving changes them in every workspace, new ones included. Only what a workspace contains stays its own: its data sources, linked folders and code repositories.</p>
 
           <div class="stage-board">
             <div id="stage-flow" class="stage-flow"></div>
@@ -869,7 +869,7 @@
 
   <dialog id="create-workspace-dialog" class="team-dialog">
     <form id="create-workspace-form" novalidate>
-      <div class="dialog-head"><p class="eyebrow">NEW CONTEXT</p><h2>Create a workspace</h2><p>Each workspace has its own complete directory tree, index, graph, research and Ask settings. Processing and the stage models are the server's, the same in every workspace.</p></div>
+      <div class="dialog-head"><p class="eyebrow">NEW CONTEXT</p><h2>Create a workspace</h2><p>Each workspace has its own complete directory tree, index and graph, and its own sources. Settings are the server's, the same in every workspace.</p></div>
       <label for="create-workspace-name">Workspace name</label>
       <input id="create-workspace-name" maxlength="128" placeholder="e.g. Product research" required />
       <p id="create-workspace-error" class="form-error" role="alert"></p>
