@@ -127,12 +127,45 @@ one team and 8 of another, `tests/claim-state.test.ts`): **9 judge calls / 105 p
 Run by refine before the duplicate audit (`resolveEntityContext`), deterministic, each decision with its reason:
 
 - **Rename → merge.** A live fact whose statement reads as a rename — `X…更名为/改名为 Y`, `Y（原X）`, `Y, formerly X`,
-  `renamed to`, `now known as` — where both names are live entities of compatible types: the old merges into the new
-  (`applyMerge`, actor `entity-context`, reason `更名：「statement」（source）`; reversible with `entities unmerge`).
-  Skipped when a person undid such a merge or rejected the suggestion themselves.
+  `renamed to`, `now known as` — merges the old name into the new (`applyMerge`, actor `entity-context`, reason
+  `更名：「statement」（source）`; reversible with `entities unmerge`) when all of this holds:
+  - **The statement names the old name where the renamed thing stands**: at the head of the marker's own clause
+    (`万业企业后更名为先导基电`), after a reporting verb (`文中称Clawdbot现已更名为…`), a possessive
+    (`阿里巴巴的通义千问已经改名为千问`), or 将/把/由 (`将Sales Cloud更名为…` renames Sales Cloud, not whoever did it), or in
+    a "formerly" form (`Orion（原Atlas）`, `原项目名Atlas，自本周起改名为Orion`). Between the name and the marker only a
+    date or an adverb may stand (`自2025-02-05所在周起`, `于2019年`, `已`, `后来`, `正式`, `was`). A clause that names
+    nothing — `…，并于2017年更名为X`, `将其更名为X`, `该子公司于2024年更名为X`, `标的随后更名为X` — gives no merge; a name
+    that only occurs earlier in the sentence is never taken.
+  - **Each of the two spellings is the own name of one live, unmerged entity**, as written, with the noun that says
+    what it is taken off (`Atlas项目`), or with a corporate form taken off either side (`隆基股份` names 隆基). An alias
+    does not count: 华融国际信托 already lists 兴宝国际信托, and a parent may list a subsidiary's name. The new name is
+    read whole (`Oracle AI Database`, not `Oracle`).
+  - **Same specific type** (neither `concept` nor `other`), **and neither is a generic word or a weak spelling**: the
+    stop list's words, a few the rule adds (上市公司, 子公司, 标的, 品牌, 指数…), a two-letter Latin spelling; for the
+    old name also a corpus-frequent term.
+  - **The claim is filed under one of the two**, as its subject or its object.
+  - **The rename happened**: `拟更名为`, `计划更名为`, `将改名为`, `建议将…更名为`, `尚未更名为`, `will be renamed to`
+    merge nothing: until it happens the old name is the name, and the statement that it happened merges then.
+  - Nobody refused it: a person undid such a merge or rejected the suggestion themselves.
+
+  The first version took, when the statement gave no old name, the longest live entity name written anywhere before
+  the marker. On a copy of finance (2026‑11‑13, 110,309 entities, 142 such claims) that made 39 merges: 发展 (12,753
+  mentions) into 乐聚机器人, 公司 into Megaspeed, 国际, 上市公司, 手机, 公告 and 阳光 into one company each, and 大族激光,
+  赛力斯 and 东芝 into what a subsidiary or a brand of theirs was renamed to. Under the rule above the same claims
+  give 8: six of the 39 (隆基 → 隆基绿能, Clawdbot → OpenClaw, 通义千问 → 千问, 竞价打板承接模式 → 竞价抢筹盘口, 万业企业 →
+  先导基电, 花王股份 → 顺景科技) and two the old reading of the new name missed (阿里影业 → 大麦娱乐, Incitec Pivot →
+  Dyno Nobel). It gives up seven that named the right pair for a reason the rule no longer accepts: three planned
+  (龙净环保, 青松股份, 巴里克黄金), one whose new name is only an alias (海联讯 → 海联), one whose old name is written
+  with its owner (阿里通义 → Qwen), and two that were right by accident (甲骨文 → Oracle from a statement about its
+  database, 洲际交易所 → ICE from one about an index). `tests/rename-rule.test.ts` holds the statements.
 - **Alias list → suggestion only.** An entity whose alias list names another live entity of the same specific type is
-  filed as a merge suggestion with that reason, outside the audit's 50-a-run cap; an extraction can file 创业板 under
-  A股, so aliases alone never merge.
+  filed as a merge suggestion with that reason; an extraction can file 创业板 under A股, so aliases alone never merge.
+  A weak alias (two Latin letters, a short number, a stop word) proposes nothing, as in the duplicate audit. The rest
+  are ranked — pairs that list each other first, then the pair whose less-mentioned side is mentioned most — and a
+  run files 50 (`ALIAS_SUGGESTIONS_PER_RUN`), beside the audit's own 50: unbounded, the first run at finance size
+  would have filed 5,873 beside 2,940 already pending. Finance holds 9,084 such pairs, 5,672 not yet filed (1,067
+  listing each other), so the queue grows by 50 a night at most and the pairs a person is likeliest to accept come
+  first. Not ranked out: a pair whose surviving name is itself a generic entity (航天发展 → 发展).
 - **Namesakes → split.** For a person with 6–600 documents, documents join when their co-mentioned people, teams,
   projects and products mostly agree (Jaccard ≥ 0.3). It is two people only when all hold: two clusters cover ≥ 90%
   of the documents, the smaller ≥ 3 documents and ≥ 15%; the clusters' contexts barely meet (Jaccard < 0.25); each
@@ -207,10 +240,13 @@ audit findings. The claim review and the model-written views were not run.
 
 What the measurement showed and this branch does not change:
 
-- **Renames.** The first night merges 39 entities on finance and at least 20 of them look wrong: where a statement names no old
-  name, "the longest live name before the marker" picks 发展 (12,753 mentions, into 乐聚机器人), 公司 (into 银河航天 and
-  Megaspeed), 国际, 上市公司, 手机, and a parent for its renamed subsidiary or product (大族激光 into 大族聚维, 赛力斯
-  into 赛豆, 东芝 into 铠侠). The alias rule files 5,873 merge suggestions that night (2,940 pending before).
+- **Renames.** As measured, the first night merges 39 entities on finance and at least 20 of them look wrong: where a
+  statement names no old name, "the longest live name before the marker" picks 发展 (12,753 mentions, into 乐聚机器人),
+  公司 (into 银河航天 and Megaspeed), 国际, 上市公司, 手机, and a parent for its renamed subsidiary or product (大族激光
+  into 大族聚维, 赛力斯 into 赛豆, 东芝 into 铠侠). The alias rule files 5,873 merge suggestions that night (2,940 pending
+  before). Both changed after this measurement, on `claude/rename-rule-safety-499894`: §5 has the rule as it is now
+  and what it gives on the same claims (8 merges, 50 suggestions a run), from a dry run that read the live schema
+  through a read-only `psql` and wrote nothing; the build deployed on 2026‑11‑13 (`e5bf3d7`) still has the first rule.
 - **Namesakes** cost eight minutes a night (one query for each of 1,619 names) and split none.
 - **The duplicate-claim audit takes 50 minutes**, nearly all in Postgres: 2.1 billion vector comparisons a night, a
   third of them within A股's 27,041 claims, every claim against its whole subject again. 1.5 million pairs wait for
