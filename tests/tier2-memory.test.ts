@@ -145,6 +145,41 @@ describe('the duplicate-claim audit a batch of subjects at a time', () => {
     expect(rows.max()).toBeLessThanOrEqual(45);
   });
 
+  it('counts a pair left for the judge once, however many batches bring it up', async () => {
+    // three subjects whose claims all share one figure: over a thousand pairs each that only the judge can settle
+    // (more than a run keeps between batches), and one pair across two subjects, which both their batches bring up
+    const seedShared = async (dir: string): Promise<AppContext> => {
+      unique = 0;
+      const ctx = await createContext(path.join(tmp, dir));
+      contexts.push(ctx);
+      const names = [name(0), name(1), name(2)];
+      await ctx.store.query(`INSERT INTO entities (id, name, type, name_key) SELECT k, k, 'organization', k FROM unnest($1::text[]) AS k`, [names]);
+      const rows: { subject: string; object: string | null; statement: string }[] = [];
+      for (const s of names) for (let k = 0; k < 46; k++) rows.push({ subject: s, object: null, statement: `${own()}增长20%` });
+      rows.push({ subject: names[0], object: names[2], statement: `${own()}增长20%` }, { subject: names[2], object: names[0], statement: `${own()}增长20%` });
+      await ctx.store.query(
+        `INSERT INTO claims (id, subject_id, object_id, statement, evidence_count)
+         SELECT 'claim-' || lpad(i::text, 5, '0'), s, o, t, 1 FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS x(s, o, t, i)`,
+        [rows.map((r) => r.subject), rows.map((r) => r.object), rows.map((r) => r.statement)],
+      );
+      return ctx;
+    };
+    const pairsOf = (n: number) => (n * (n - 1)) / 2;
+    const all = pairsOf(47) + pairsOf(46) + pairsOf(47) + 1;
+    const limited = (ctx: AppContext) => ({ ...ctx.config, review: { ...ctx.config.review, claimMergeMaxJudgedPerRun: 7 } });
+    const run = async (dir: string, claimsPerBatch?: number) => {
+      const ctx = await seedShared(dir);
+      const shown: string[] = [];
+      const stats = await auditDuplicateClaims({ store: ctx.store, embedder: ctx.embedder, config: limited(ctx), llm: recordingJudge(shown, 'unrelated') }, { claimsPerBatch });
+      return { stats, shown: shown.sort() };
+    };
+    const whole = await run('shared-whole');
+    expect(whole.stats).toMatchObject({ candidates: all, judged: 7, deferred: all - 7 });
+    const batched = await run('shared-batched', 50);
+    expect(batched.stats).toEqual(whole.stats);
+    expect(batched.shown).toEqual(whole.shown);
+  });
+
   it('reads only the subjects of the claims in focus for a review after extraction', async () => {
     const ctx = await open('focus');
     const [{ id }] = await ctx.store.query<{ id: string }>(`SELECT id FROM claims WHERE subject_id = $1 AND statement LIKE '%收入增长20\\%'`, [name(5)]);

@@ -682,9 +682,10 @@ export async function auditDuplicateClaims(
   const reps = new Map<string, ClaimLite>();
   // at most maxJudged of them are sent, so no more than a few times that many are kept
   let waiting = new Map<string, Pair>();
-  let dropped = 0;
   // a pair of two subjects comes up in both their batches: counted once
   const mirrored = new Set<string>();
+  /** Pairs only the judge can settle, whether or not they were kept for it. */
+  let forJudge = 0;
   let embedding = true;
 
   /** A claim merged earlier in this run answers through its representative. */
@@ -824,9 +825,13 @@ export async function auditDuplicateClaims(
       }
       for (const p of numberOnly) if (p.cosine < numberThreshold) pairs.delete(p.id);
     }
+    const again = new Set<string>();
     for (const p of pairs.values()) {
       if (swapped.length > 0 && p.a.subject !== p.b.subject) {
-        if (mirrored.has(p.id)) continue;
+        if (mirrored.has(p.id)) {
+          again.add(p.id);
+          continue;
+        }
         mirrored.add(p.id);
       }
       stats.candidates++;
@@ -882,6 +887,7 @@ export async function auditDuplicateClaims(
       }
       // the judge's: kept only while there is a judge to show it to
       if (!judging) continue;
+      if (!again.has(pair.id)) forJudge++;
       const na = numbersIn(a);
       const nb = numbersIn(b);
       if (na.length > 0 && nb.length > 0 && !numbersWithin(na, nb) && !numbersWithin(nb, na)) pair.guards.push('数字不一致');
@@ -904,18 +910,16 @@ export async function auditDuplicateClaims(
 
     // judgeOrder is a total order: the first maxJudged of all pairs are among the first maxJudged so far
     if (waiting.size > Math.max(4 * maxJudged, 1000)) {
-      const kept = judgeOrder([...waiting.values()]).slice(0, maxJudged);
-      dropped += waiting.size - kept.length;
-      waiting = new Map(kept.map((p) => [p.id, p]));
+      waiting = new Map(judgeOrder([...waiting.values()]).slice(0, maxJudged).map((p) => [p.id, p]));
     }
   }
 
   /* the Judge stage, in batches, most promising first: at most claimMergeMaxJudgedPerRun pairs a run (the
      rule-settled ones above never wait), every batch offered at once (src/work/judge.ts) */
-  if (waiting.size > 0 && judge?.enabled) {
+  if (forJudge > 0 && judge?.enabled) {
     const per = Math.max(1, opts.pairsPerCall ?? 12);
     const sent = judgeOrder([...waiting.values()]).slice(0, maxJudged);
-    stats.deferred = dropped + waiting.size - sent.length;
+    stats.deferred = forJudge - sent.length;
     waiting = new Map();
     const calls: Pair[][] = [];
     for (let i = 0; i < sent.length; i += per) calls.push(sent.slice(i, i + per));

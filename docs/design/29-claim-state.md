@@ -172,3 +172,49 @@ Run by refine before the duplicate audit (`resolveEntityContext`), deterministic
   is under `extraction.summaryMinChars` (1,500 by default). Lowering it for such packs is the eval runner's choice;
   the entity pages now carry the state either way.
 - The Postgres migration test was skipped here (no server configured for tests); the migration is plain additive DDL.
+
+## 8. At finance size (2026‑11‑13, branch `claude/tier2-heap-bounds-fc4505`)
+
+The steps above ran for the first time at finance size (1,105,684 representative claims, 110,309 live entities) on a
+copy of the schema in a throwaway Postgres, a step a process, no model (the judge and the embedder stubbed). They were
+measured because the service had died at its 4,144 MB heap limit at 03:25 that morning, on the build before this one.
+
+**The crash.** `auditDuplicateClaims` read every representative claim into one array, at night and in the review after
+extraction alike, and kept it until the judge answered. A review waiting on its judge held 1 GB; the nightly audit,
+3.4 GB alone, started beside it. On the copy, under the same limit, that overlap dies after 53 s at 4,075 MB; with the
+audit reading a batch of subjects at a time (`CLAIMS_PER_BATCH`) it runs through at 401 MB.
+
+Peak heap is the largest `heapUsed` sampled every 50 ms; in brackets what a full collection left. Times are with two
+or three runs sharing the machine.
+
+| step | before | after |
+|---|---|---|
+| review after extraction: claim audit, 300 claims in focus | 20 s, 1,576 MB (984): 1,105,684 rows in one query | 8 s, 281 MB (125): 147,834 rows in 8 |
+| review after extraction: entity audit, 300 entities in focus | 21 s, 563 MB (437) | unchanged |
+| entity context: renames, alias suggestions, namesakes | 466 s, 417 MB (102); 20.2 million rows | 570 s, 74 MB (53); 3.2 million rows |
+| entity duplicate audit | 30 s, 577 MB (447) | unchanged |
+| claim-state backfill, 50,000 claims | 4 s, 98 MB | unchanged |
+| attribute keys | under 0.1 s; 3.6 s and 121 MB once every claim is read (175,095 keys) | unchanged |
+| duplicate-claim audit | 3,009 s, 3,704 MB (3,359) | 3,046 s, 479 MB (418) |
+| claim audit with supersession | 9 s, 911 MB; 12 s, 906 MB once every claim is read | 5 s, 40 MB; 13 s, 162 MB (76) |
+| of that, supersession by attribute once every claim is read (202,890 claims) | 8 s, 199 MB (183) | 9 s, 162 MB (55) |
+| hot topics, navigation, recommendations | 2 s, 16 s, 10 s at most; 113 MB at most | unchanged |
+| views (no model), wiki lint | 28 s, 62 MB; 26 s, 316 MB (259) | unchanged |
+
+The two audits give the same results: 2,186,638 candidate pairs against 2,186,644, the same 156 merges, 111,584 rule
+verdicts against 111,587 (the difference is pairs with a claim the same run had merged away), the same 70,302 claim
+audit findings. The claim review and the model-written views were not run.
+
+What the measurement showed and this branch does not change:
+
+- **Renames.** The first night merges 39 entities on finance and at least 20 of them look wrong: where a statement names no old
+  name, "the longest live name before the marker" picks 发展 (12,753 mentions, into 乐聚机器人), 公司 (into 银河航天 and
+  Megaspeed), 国际, 上市公司, 手机, and a parent for its renamed subsidiary or product (大族激光 into 大族聚维, 赛力斯
+  into 赛豆, 东芝 into 铠侠). The alias rule files 5,873 merge suggestions that night (2,940 pending before).
+- **Namesakes** cost eight minutes a night (one query for each of 1,619 names) and split none.
+- **The duplicate-claim audit takes 50 minutes**, nearly all in Postgres: 2.1 billion vector comparisons a night, a
+  third of them within A股's 27,041 claims, every claim against its whole subject again. 1.5 million pairs wait for
+  the judge at 1,200 a night.
+- The backfill needs 23 nights at 50,000 claims; after it 202,886 claims carry an attribute and 43,881 are superseded.
+- The entity audit reads every entity in each review (0.45 GB for a moment); the wiki lint holds the event loop for
+  4 to 15 s, the views for 2 to 4 s.
