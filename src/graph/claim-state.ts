@@ -57,7 +57,7 @@ const TEXT_KEYS = new Set(['负责人', 'lead', '状态', 'status', '阶段', 's
 const LINKS_ZH = ['更正为', '修正为', '调整为', '下降至', '提升至', '提高至', '增加至', '减少至', '维持在', '保持在', '仍然为', '约为', '应为', '可能为', '预计为', '达到了', '达到', '升至', '降至', '增至', '减至', '变为', '已达', '仍为', '依然为', '为', '是', '达', '约', '有', '：', ':', '='];
 const LINKS_EN = /\s*(?:is now|was revised to|was corrected to|stood at|rose to|fell to|increased to|decreased to|dropped to|grew to|reached|is|was|are|were|at|of|to|:|=)\s*$/i;
 /** Date and period words that say when, not what: left out of an attribute key. */
-const DATE_WORDS = /(?:\d{4}\s*年)?\s*(?:第?\s*\d{1,2}\s*(?:周|月份?|季度|日|号)|[一二三四五六七八九十]+月份?|[上下本今去明]+(?:周|月|季度|年)|本周末?|当前|目前|截至|截止|现阶段|最新|月报中|周报中|月报|周报|中的?|期间|同期|累计)\s*/g;
+const DATE_WORDS = /(?:(?:fy|FY)\s*\d{2,4}|\d{4}\s*(?:年度?|财年)?\s*(?:[qQ][1-4]|[hH][12]|[上下]半年|第?[一二三四1-4]季度)|[qQ][1-4]|[hH][12]\b|\d{4}\s*(?:年度?|财年)(?!\d)|[上下]半年|第?[一二三四]季度)\s*|(?:\d{4}\s*年)?\s*(?:第?\s*\d{1,2}\s*(?:周|月份?|季度|日|号)|[一二三四五六七八九十]+月份?|[上下本今去明]+(?:周|月|季度|年)|本周末?|当前|目前|截至|截止|现阶段|最新|月报中|周报中|月报|周报|中的?|期间|同期|累计)\s*/g;
 const HEDGES = /^(?:可能|大约|约|预计|估计|仍|已经|已|当前|目前|现)+/;
 const TRAILING_FUNCTION = /(?:的|之|其|共|总|合计|总计|达|为|是|在|于|将|已|仍|再|都|也|还|又|共计)+$/;
 const LEADING_FUNCTION = /^(?:的|其|该|此|这个|项目|系统|组|团队|整体|总体|本周|本月|本期|上期|初步|估计|评估|预估|报告|记录|显示|所列|统计|实际|最新)+/;
@@ -110,8 +110,9 @@ const UNITS: Record<string, string> = {
   '%': '%', '％': '%', 个百分点: 'pp', pct: 'pp', pp: 'pp', 人: '人', 名: '人', 位: '人', 个: '个', 项: '项', 件: '件', 次: '次', 天: '天', 小时: '小时',
   元: '元', 万元: '万元', 亿元: '亿元', 亿: '亿', 万: '万', 千: '千', 倍: '倍', 分: '分', 条: '条', 台: '台', 家: '家', 户: '户', 单: '单',
   ms: 'ms', s: 's', kg: 'kg', km: 'km', usd: 'usd', '$': 'usd', people: '人', persons: '人', person: '人', percent: '%',
+  billion: 'billion', bn: 'billion', million: 'million', trillion: 'trillion',
 };
-const UNIT_RE = '个百分点|万元|亿元|小时|percent|people|persons|person|pct|pp|ms|kg|km|usd|[%％人名位个项件次天元亿万千倍分条台家户单s]';
+const UNIT_RE = '个百分点|万元|亿元|小时|percent|people|persons|person|billion|million|trillion|bn|pct|pp|ms|kg|km|usd|[%％人名位个项件次天元亿万千倍分条台家户单s]';
 /** A number with its unit, not part of a date, a ticket or a code ("2025年", "第35周", "T2-1420", "R-05"). */
 const MEASURE = new RegExp(
   `(?<![A-Za-z\\d.\\-_/])([+-]?\\d+(?:,\\d{3})*(?:\\.\\d+)?)\\s*(${UNIT_RE})?(?![\\d\\-_/]|年|月|日|号|周|季|期|版|代|级|楼|点|:)`,
@@ -125,7 +126,7 @@ export function normalizeUnit(raw: unknown): string | null {
   return UNITS[u] ?? u.slice(0, 16);
 }
 
-const LATIN_UNIT_WORDS = /^(?:percent|people|persons|person|pct|pp|ms|kg|km|usd|s)$/i;
+const LATIN_UNIT_WORDS = /^(?:percent|people|persons|person|billion|million|trillion|bn|pct|pp|ms|kg|km|usd|s)$/i;
 
 /** Statements with these words correct an earlier report. */
 const CORRECTION = /更正|勘误|订正|纠正|有误|数字错误|应为|修正为|更正为|此前(?:报告|数据)?(?:有误|错误)|\bcorrect(?:ed|ion)\b|\berrat(?:um|a)\b|\bshould have been\b|\bmisreported\b/i;

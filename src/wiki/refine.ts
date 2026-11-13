@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import { KnodeConfig } from '../config.js';
 import { appendLog } from '../fs/datadir.js';
 import { auditDuplicateClaims } from '../graph/claim-dedupe.js';
+import { backfillClaimState, refreshAttributeKeys, supersedeByAttribute } from '../graph/claim-state-store.js';
+import { resolveEntityContext } from '../graph/entity-context.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { refreshRecommendations } from '../research/recommend.js';
 import { reviewClaims } from '../graph/claim-review.js';
@@ -39,6 +41,12 @@ export interface Tier2Stats {
   claimReviews: number;
   /** Duplicate claims merged into a representative (review.claimMerge). */
   claimsMerged: number;
+  /** Entities merged on rename or alias evidence (src/graph/entity-context.ts). */
+  entityMerges?: number;
+  /** Namesakes split off by context (src/graph/entity-context.ts). */
+  entitySplits?: number;
+  /** Claims whose state (attribute, value, effective date) was read this run (docs/design/29). */
+  claimStateRead?: number;
 }
 
 /**
@@ -102,9 +110,25 @@ export async function refineWiki(
   // entities first (claims are compared per canonical subject), then claims,
   // then the audit over what is left: one fact in several wordings is one claim by then
   try {
+    const resolved = await resolveEntityContext(store, { config, onProgress: progress });
+    stats.entityMerges = resolved.merged;
+    stats.entitySplits = resolved.split;
+  } catch (err) {
+    progress(`entity resolution failed: ${err instanceof Error ? err.message : err}`);
+  }
+  try {
     stats.mergeCandidates = (await auditDuplicateEntities({ store, embedder: ctx.embedder, config, llm }, { onProgress: progress })).suggested;
   } catch (err) {
     progress(`dedupe audit failed: ${err instanceof Error ? err.message : err}`);
+  }
+  // claim state before the claim audits: the duplicate audit settles a series by its attribute
+  try {
+    const state = await backfillClaimState(store);
+    const keys = await refreshAttributeKeys(store);
+    stats.claimStateRead = state;
+    if (state || keys.mapped || keys.dropped) progress(`claim state: ${state} claims read, ${keys.mapped} attribute keys unified, ${keys.dropped} dropped`);
+  } catch (err) {
+    progress(`claim state failed: ${err instanceof Error ? err.message : err}`);
   }
   try {
     const merged = await auditDuplicateClaims({ store, embedder: ctx.embedder, config, llm }, { onProgress: progress });
@@ -154,20 +178,27 @@ export async function refineWiki(
  * dangling.
  */
 /**
- * Supersession: among facts (kind = fact) of one subject, type and object, for
- * the measure-like types (CLAIM_TYPES.supersedes), an older one whose window
- * ended by the time a newer one began (or never closed) is marked superseded
- * by it. A forecast never supersedes the result it foresaw and is never
- * superseded; a management or event fact is never "replaced" by a later one.
+ * Supersession. A claim that gives the value of an attribute (docs/design/29)
+ * takes part in its attribute's series, in every domain: the newest by
+ * effective date is current, the rest are history, and a correction replaces
+ * the report it corrects (src/graph/claim-state-store.ts supersedeByAttribute).
+ *
+ * A claim no attribute was read from keeps the older rule: among facts
+ * (kind = fact) of one subject, type and object, for the measure-like types
+ * (CLAIM_TYPES.supersedes), an older one whose window ended by the time a
+ * newer one began (or never closed) is marked superseded by it. A forecast
+ * never supersedes the result it foresaw and is never superseded; a
+ * management or event fact is never "replaced" by a later one.
  * System-maintained, not evidence — the old fact stays for history and
  * timelines but stops being quoted as current. Marks whose superseder is gone
  * are cleared.
  */
 export async function markSupersededClaims(store: Store): Promise<number> {
+  const byAttribute = await supersedeByAttribute(store);
   const rows = await store.query<{ id: string; subject_id: string; type: string; object_id: string | null; valid_from: string | Date; valid_to: string | Date | null; superseded_by: string | null }>(
     `SELECT id, subject_id, type, object_id, valid_from, valid_to, superseded_by FROM claims
      WHERE tx_to IS NULL AND canonical_id IS NULL AND status = 'fact' AND kind = 'fact' AND valid_from IS NOT NULL
-       AND type = ANY($1::text[])
+       AND attribute IS NULL AND type = ANY($1::text[])
      ORDER BY subject_id, type, object_id, valid_from ASC, tx_from ASC`,
     [CLAIM_TYPES.filter((t) => t.supersedes).map((t) => t.id)],
   );
@@ -199,7 +230,7 @@ export async function markSupersededClaims(store: Store): Promise<number> {
      WHERE superseded_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM claims n WHERE n.id = c.superseded_by AND n.tx_to IS NULL)
      RETURNING id`,
   );
-  return changed + cleared.length;
+  return byAttribute + changed + cleared.length;
 }
 
 /**

@@ -128,9 +128,10 @@ claims:
     expect(by('guidance', '500GWh')).toMatchObject({ validFrom: '2026-01-01', validTo: '2026-12-31' });
     expect(all.claims.map((c) => c.type)).toEqual(['management', 'holding', 'holding', 'earnings', 'guidance', 'earnings']); // timeline order
 
-    // supersession: the 2024 stake replaces the 2019 one (same subject, type and object); the chairman's role, open-ended
-    // and older, is a management fact and is replaced by nothing
-    expect(await markSupersededClaims(ctx.store)).toBe(1);
+    // supersession (docs/design/29): the 2024 stake replaces the 2019 one (same subject, attribute and object), and this
+    // quarter's revenue the year-ago quarter's (one attribute, a later effective date); the chairman's role, open-ended
+    // and older, gives no value of an attribute and is replaced by nothing
+    expect(await markSupersededClaims(ctx.store)).toBe(2);
     const current = await queryClaims(ctx.store, { subject: '宁德时代', types: ['holding'] });
     expect(current.claims.map((c) => c.statement)).toEqual(['持有时代上汽 70% 股权']);
     const history = await queryClaims(ctx.store, { subject: '宁德时代', types: ['holding'], includeSuperseded: true, order: 'timeline' });
@@ -139,22 +140,28 @@ claims:
     expect(live).not.toContain('持有时代上汽 51% 股权');
     expect(live).toContain('曾毓群担任董事长');
     // a filter spelled with the old label still finds its claims
-    expect((await queryClaims(ctx.store, { subject: '宁德时代', types: ['revenue'] })).claims).toHaveLength(2);
+    expect((await queryClaims(ctx.store, { subject: '宁德时代', types: ['revenue'], includeSuperseded: true })).claims).toHaveLength(2);
+    expect((await queryClaims(ctx.store, { subject: '宁德时代', types: ['revenue'] })).claims.map((c) => c.statement)).toEqual(['2026Q2 营业收入 1000 亿元']);
     const q3 = await queryClaims(ctx.store, { subject: '宁德时代', eventRange: { from: '2026-07-01T00:00:00Z', to: '2026-09-30T23:59:59Z' } });
     expect(q3.claims.map((c) => c.statement)).toEqual(['2026Q2 营业收入 1000 亿元']);
     // running the audit again changes nothing
     expect(await markSupersededClaims(ctx.store)).toBe(0);
 
-    // the entity page splits current facts from the dated history
+    // the entity page compiles each attribute to its current value with its history, and splits the other
+    // current facts from the dated history
     await ensureEntityStubs(ctx, { minMentions: 1 });
     const page = fs.readFileSync(path.join(dataDir, 'wiki', 'entities', '宁德时代.md'), 'utf8');
-    expect(page).toContain('## Facts (current)');
+    const state = page.slice(page.indexOf('## Current state'), page.indexOf('## Facts (current)'));
+    expect(state).toContain('- **持有时代上汽**: 70% `2024-03-01` — raw/docs/reports/2024-03-01-chairman.md');
+    expect(state).toContain('  - history: 51% (2019-01-01)');
+    expect(state).toContain('- **营业收入**: 1000亿元 `2026-07-01` — raw/docs/reports/2026-08-10-q2.md');
+    expect(state).toContain('  - history: 800亿元 (2025-07-01)');
     expect(page).toContain('## Timeline');
-    expect(page).toMatch(/- 2019-01-01 · 持有时代上汽 51% 股权 `fact` _\(superseded\)_/);
-    expect(page.indexOf('2019-01-01 · 持有')).toBeLessThan(page.indexOf('2026-07-01 · 2026Q2'));
     const facts = page.slice(page.indexOf('## Facts (current)'), page.indexOf('## Timeline'));
-    expect(facts).not.toContain('持有时代上汽 51% 股权');
-    expect(facts).toContain('持有时代上汽 70% 股权');
-    expect(facts).toContain('曾毓群担任董事长');
+    expect(facts).not.toContain('持有时代上汽');
+    expect(facts).toContain('曾毓群担任董事长 `fact` `2011-01-01`');
+    // the timeline places what the sources date themselves by effective date
+    const timeline = page.slice(page.indexOf('## Timeline'));
+    expect(timeline.indexOf('2011-01-01 · 曾毓群')).toBeLessThan(timeline.indexOf('2026-01-01 · 全年出货指引'));
   });
 });

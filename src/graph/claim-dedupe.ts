@@ -8,6 +8,7 @@ import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
 import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
 import { applyClaimMerge, reanchorClaimGroups } from './claim-merge.js';
+import { sameValue } from './claim-state.js';
 import { alikeWording, Wording, wordingOf, wordingPrefixLength } from './wording.js';
 
 /**
@@ -43,6 +44,11 @@ export interface ClaimDedupeOptions {
   numberThreshold?: number;
   /** Pairs per judge call. */
   pairsPerCall?: number;
+  /**
+   * The claim-state rules that settle a series without the judge (docs/design/29):
+   * on unless false, which reproduces the audit before them — for measuring them.
+   */
+  stateRules?: boolean;
 }
 
 export interface ClaimDedupeStats {
@@ -51,6 +57,10 @@ export interface ClaimDedupeStats {
   identical: number;
   /** Settled as different periods without a model. */
   differentTime: number;
+  /** Of those, members of one attribute's series: same subject and attribute, other effective dates (docs/design/29). */
+  series: number;
+  /** One attribute, one date, one value: merged without a model. */
+  sameValue: number;
   judged: number;
   /** Pairs that needed the judge but did not fit under review.claimMergeMaxJudgedPerRun: left for a later run. */
   deferred: number;
@@ -86,6 +96,13 @@ interface ClaimLite {
   source_path: string | null;
   /** Its chunk, whose text the Judge stage shows as the excerpt (chunkTexts). */
   chunk_id: string | null;
+  /** Claim state (docs/design/29): the subject's canonical attribute key, the value and the effective date. */
+  date_source: string | null;
+  attribute: string | null;
+  value_num: number | null;
+  value_text: string | null;
+  unit: string | null;
+  eff: string | Date | null;
 }
 
 interface Pair {
@@ -483,6 +500,53 @@ function windowsDisjoint(a: ClaimLite, b: ClaimLite): boolean {
   return Boolean((at && at < bf) || (bt && bt < af));
 }
 
+/**
+ * A pair's relation by claim state alone, or null when the state does not
+ * settle it: same subject, attribute, object and kind on other effective
+ * days → different_time (a series); on one day with the same value → same.
+ * One day with two values is a real disagreement or a misreading: the judge's.
+ */
+export function seriesRelation(
+  a: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'>,
+  b: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'>,
+): 'different_time' | 'same' | null {
+  if (!a.attribute || a.attribute !== b.attribute || a.subject !== b.subject || (a.object ?? '') !== (b.object ?? '') || a.kind !== b.kind) return null;
+  const da = toDateString(a.eff);
+  const db = toDateString(b.eff);
+  if (!da || !db) return null;
+  if (da !== db) return 'different_time';
+  const va = { valueNum: a.value_num, valueText: a.value_text, unit: a.unit };
+  const vb = { valueNum: b.value_num, valueText: b.value_text, unit: b.unit };
+  return sameValue(va, vb) ? 'same' : null;
+}
+
+/** A bare figure: "第7批", "3 次", "7 人" — a number with a unit or a counter, or alone. */
+const FIGURE = /\d+(?:\.\d+)?/g;
+
+/**
+ * Two claims only their documents date (none states a date or names a
+ * period), from days apart, whose figures differ: a weekly report's "陈伟迁移
+ * 历史数据第7批" and "…第2批" are two weeks' work, not one claim twice.
+ * Exported for tests.
+ */
+export function reportedApart(
+  a: Pick<ClaimLite, 'statement' | 'date_source' | 'eff'>,
+  b: Pick<ClaimLite, 'statement' | 'date_source' | 'eff'>,
+  na: KeyNumber[] = numbersOf(a.statement),
+  nb: KeyNumber[] = numbersOf(b.statement),
+  pa: [number, number][] = periodsOf(a.statement),
+  pb: [number, number][] = periodsOf(b.statement),
+): boolean {
+  if (a.date_source !== 'document' || b.date_source !== 'document') return false;
+  const da = toDateString(a.eff);
+  const db = toDateString(b.eff);
+  if (!da || !db || da === db || pa.length > 0 || pb.length > 0) return false;
+  if (na.length > 0 && nb.length > 0) return !numbersWithin(na, nb) || !numbersWithin(nb, na);
+  const fa = a.statement.normalize('NFKC').match(FIGURE) ?? [];
+  const fb = b.statement.normalize('NFKC').match(FIGURE) ?? [];
+  return fa.length > 0 && fb.length > 0 && fa.join('|') !== fb.join('|');
+}
+
 /* --------------------------------- the audit -------------------------------- */
 
 export async function auditDuplicateClaims(
@@ -492,7 +556,7 @@ export async function auditDuplicateClaims(
 ): Promise<ClaimDedupeStats> {
   const { store, config } = ctx;
   const progress = opts.onProgress ?? (() => {});
-  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, judged: 0, deferred: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0, leftToPerson: 0 };
+  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, series: 0, sameValue: 0, judged: 0, deferred: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0, leftToPerson: 0 };
   const mode = config.review?.claimMerge ?? 'auto';
   if (mode === 'off') return stats;
   const minConfidence = config.review?.claimMergeMinConfidence ?? 0.9;
@@ -508,11 +572,15 @@ export async function auditDuplicateClaims(
     `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(oe.canonical_id, c.object_id) AS object,
             se.name AS subject_name, c.statement, c.status, c.kind, c.type, c.valid_from, c.valid_to, c.event_at,
             c.evidence_count, (SELECT count(*)::int FROM claims m WHERE m.canonical_id = c.id) AS members,
-            c.tx_from, s.key AS source_path, c.chunk_id
+            c.tx_from, s.key AS source_path, c.chunk_id,
+            COALESCE(ak.canonical, c.attribute) AS attribute, c.value_num, c.value_text, c.unit,
+            COALESCE(c.effective_at, c.event_at, c.valid_from, c.observed_at) AS eff,
+            COALESCE(c.date_source, CASE WHEN c.event_at IS NOT NULL OR c.valid_from IS NOT NULL THEN 'stated' WHEN c.observed_at IS NOT NULL THEN 'document' END) AS date_source
      FROM claims c
      JOIN entities se ON se.id = c.subject_id
      LEFT JOIN entities oe ON oe.id = c.object_id
      LEFT JOIN scopes s ON s.id = c.primary_scope_id
+     LEFT JOIN claim_attribute_keys ak ON ak.subject_id = c.subject_id AND ak.attribute = c.attribute
      WHERE c.tx_to IS NULL AND c.canonical_id IS NULL AND c.status <> 'absent'`,
   );
   const byId = new Map(claims.map((c) => [c.id, c]));
@@ -613,6 +681,27 @@ export async function auditDuplicateClaims(
     if (pair.why.includes('identical')) {
       outcomes.push({ pair, verdict: { relation: 'same', keep: null, confidence: 1, reason: '规范化后逐字相同', model: 'rule' } });
       stats.identical++;
+      continue;
+    }
+    // claim state settles a series without a model: one subject's attribute on other dates is
+    // its history, not a duplicate; on one date with one value it is the same claim reworded
+    const series = opts.stateRules === false ? null : seriesRelation(a, b);
+    if (series === 'different_time') {
+      outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '同一属性的不同时点', model: 'rule' } });
+      stats.differentTime++;
+      stats.series++;
+      continue;
+    }
+    if (series === 'same') {
+      outcomes.push({ pair, verdict: { relation: 'same', keep: null, confidence: 1, reason: '同一属性、同一日期、同一数值', model: 'rule' } });
+      stats.sameValue++;
+      continue;
+    }
+    // two reports of other days giving other figures, neither naming its period: readings at two times
+    if (opts.stateRules !== false && reportedApart(a, b, numbersIn(a), numbersIn(b), periodsIn(a), periodsIn(b))) {
+      outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '不同日期的报告、数字不同', model: 'rule' } });
+      stats.differentTime++;
+      stats.series++;
       continue;
     }
     if (windowsDisjoint(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b))) {

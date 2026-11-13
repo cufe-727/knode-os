@@ -13,6 +13,10 @@ import { toIso } from '../store/temporal.js';
 import { heldDocuments, claimDocument, releaseDocument } from '../labeling/claims.js';
 import {
   applyExtraction,
+  batchExtractReplies,
+  buildBatchExtractRequest,
+  EXTRACT_BATCH_DOC_CHARS,
+  EXTRACT_BATCH_DOCS,
   buildExtractRequest,
   ExtractRequest,
   ExtractResult,
@@ -655,23 +659,84 @@ async function runTier1PassUnlocked(
       if (followers) {
         waiting.delete(plan);
         // a first segment still to be retried holds its followers until a later pass
-        if (settled(plan.results[0])) for (const i of followers) ready.push({ plan, index: i });
+        if (settled(plan.results[0])) for (const i of followers) jobs.push([{ plan, index: i }]);
       }
     };
+
+    // several short single-segment documents, one call (buildBatchExtractRequest); each keeps its own sidecar result
+    const runBatch = async (tasks: Task[]): Promise<void> => {
+      progress(`tier1 extract ${tasks.length} documents: ${tasks.map((t) => t.plan.row.path).join(', ')}`);
+      try {
+        const items = await Promise.all(tasks.map(async ({ plan }) => ({
+          page: plan.page,
+          content: plan.segments[0].text,
+          docDate: plan.docDate,
+          knownEntities: await knownEntitiesIn(store, plan.segments[0].text),
+        })));
+        const request = buildBatchExtractRequest(items, { claims: config.extraction.claims, ontology, maxChars: extractionSegmentChars(config) });
+        const reply = await entityLlm.completeJson<unknown>(request.messages, { maxTokens: request.maxTokens });
+        const byDoc = batchExtractReplies(reply, tasks.length);
+        for (const [i, { plan }] of tasks.entries()) {
+          const raw = byDoc.get(i);
+          try {
+            if (!raw) throw new Error('the batched reply had no entry for this document');
+            const result = await checkExtractReply(raw, request, { dataDir: store.dataDir, plan, index: 0, model: entityLlm.label });
+            recordSegmentOutcome(plan, 0, { ok: true, result }, entityLlm.label);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            recordSegmentOutcome(plan, 0, { ok: false, error: msg }, entityLlm.label);
+            progress(`tier1 failed for ${plan.row.path}: ${msg}`);
+          }
+        }
+        stats.tokensUsed += items.reduce((n, item) => n + estimateTokens(item.content), 0) + OUTPUT_TOKEN_ESTIMATE * tasks.length;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        for (const { plan } of tasks) recordSegmentOutcome(plan, 0, { ok: false, error: msg }, entityLlm.label);
+        stats.callsFailed++;
+        progress(`tier1 failed for ${tasks.length} documents: ${msg}`);
+      }
+      stats.calls++;
+      for (const { plan } of tasks) persistPlan(store.dataDir, plan, entityLlm.label);
+    };
+
+    // a plugin that shapes extraction requests sees one document a request, as it always has
+    const batching = !pluginRegistry().hasHandlers('extract.request');
+    const perBatch = EXTRACT_BATCH_DOCS;
+    const budget = extractionSegmentChars(config);
+    const jobs: Task[][] = [];
+    let open: Task[] = [];
+    let openChars = 0;
+    for (const task of ready) {
+      const len = task.plan.segments[task.index].text.length;
+      // a document that failed before is retried on its own: one that breaks a batch must not take the others' attempts with it
+      const failedBefore = (task.plan.results[task.index]?.attempts ?? 0) > 0;
+      if (!batching || failedBefore || task.plan.segments.length > 1 || len > EXTRACT_BATCH_DOC_CHARS) {
+        jobs.push([task]);
+        continue;
+      }
+      if (open.length > 0 && (open.length >= perBatch || openChars + len > budget)) {
+        jobs.push(open);
+        open = [];
+        openChars = 0;
+      }
+      open.push(task);
+      openChars += len;
+    }
+    if (open.length > 0) jobs.push(open);
 
     // LLM calls run concurrently; scope transactions run afterwards, one at a time
     await new Promise<void>((resolve) => {
       let active = 0;
       const pump = () => {
-        while (active < concurrency && ready.length > 0) {
-          const task = ready.shift()!;
+        while (active < concurrency && jobs.length > 0) {
+          const job = jobs.shift()!;
           active++;
-          void runTask(task).finally(() => {
+          void (job.length === 1 ? runTask(job[0]) : runBatch(job)).finally(() => {
             active--;
             pump();
           });
         }
-        if (active === 0 && ready.length === 0) resolve();
+        if (active === 0 && jobs.length === 0) resolve();
       };
       pump();
     });

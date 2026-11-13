@@ -5,6 +5,7 @@ import { ScopeWriter } from '../lineage/writer.js';
 import { ChatMessage, LlmClient } from '../llm/client.js';
 import { claimMeasure, isCorrectionStatement } from './claim-state.js';
 import { findLinks, LinkCandidate, tier0Known } from './concepts.js';
+import { namesakeChoice, namesakeRules } from './entity-context.js';
 import { builtinOntology, Ontology } from './ontology.js';
 import {
   CLAIM_STATUS,
@@ -243,6 +244,78 @@ export function buildExtractRequest(page: { path: string; title: string }, conte
   };
 }
 
+/** One short document of a batched extraction call. */
+export interface BatchExtractItem {
+  page: { path: string; title: string };
+  content: string;
+  docDate?: string | null;
+  knownEntities?: KnownEntity[];
+}
+
+/** Documents one batched call reads at most. */
+export const EXTRACT_BATCH_DOCS = 8;
+/** A document longer than this is read by a call of its own. */
+export const EXTRACT_BATCH_DOC_CHARS = 4000;
+/** Known entities a batched call lists at most (the union of its documents'). */
+const BATCH_KNOWN_ENTITIES = 40;
+
+/**
+ * One extraction call over several short documents (a weekly report, a chat,
+ * an e-mail), each under its own header, answered as
+ * {"documents":[{"doc":1, …the single-document fields…}, …]}. The rules are
+ * the single-document ones and go out once: on the 2026-11 benchmark a
+ * 1,200-character report cost a call of its own, about 20k weighted tokens
+ * with a CLI model's preamble, and the life pack's 168 chats 168 calls.
+ * Reimplemented from the unmerged branch claude/knowledge-base-optimization-a84c37.
+ */
+export function buildBatchExtractRequest(items: BatchExtractItem[], opts: Pick<ExtractOptions, 'claims' | 'ontology' | 'maxChars'> = {}): ExtractRequest {
+  const withClaims = opts.claims ?? true;
+  const ontology = opts.ontology ?? builtinOntology();
+  const known: KnownEntity[] = [];
+  const seen = new Set<string>();
+  for (const k of items.flatMap((i) => i.knownEntities ?? [])) {
+    const key = k.name.toLowerCase();
+    if (seen.has(key) || known.length >= BATCH_KNOWN_ENTITIES) continue;
+    seen.add(key);
+    known.push(k);
+  }
+  const per = Math.max(500, Math.floor((opts.maxChars ?? LLM_EXTRACT_INPUT_CHARS) / Math.max(1, items.length)));
+  const docs = items.map((item, i) => [
+    `=== Document ${i + 1}: ${item.page.title} (${item.page.path}) ===`,
+    `Document date: ${item.docDate ? item.docDate.slice(0, 10) : 'unknown'}`,
+    '',
+    item.content.slice(0, Math.max(per, EXTRACT_BATCH_DOC_CHARS)),
+  ].join('\n'));
+  const system = `${extractRules(ontology, withClaims, false)}
+
+This request holds ${items.length} separate documents, each under a line "=== Document n: title (path) ===" with its own date. Extract from each on its own: an entity, relation or claim belongs to the document whose text states it, its dates resolve against that document's date, and the caps apply per document.
+Respond with JSON only: {"documents":[{"doc":1, ...${replyShape(withClaims, false).slice(1, -1)}}, {"doc":2, ...}]}: one entry per document, in order, with empty lists for a document that yields nothing.`;
+  return {
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: `${knownEntitiesBlock(known)}${docs.join('\n\n')}` },
+    ],
+    maxTokens: Math.min(32_000, (withClaims ? 4_000 : 3_000) * items.length + 4_000),
+    withClaims,
+    askSubject: false,
+  };
+}
+
+/** A batched reply's entry for each document (by its `doc` number, else its position); missing ones are absent. */
+export function batchExtractReplies(reply: unknown, count: number): Map<number, RawExtractReply> {
+  const out = new Map<number, RawExtractReply>();
+  const list = reply && typeof reply === 'object' && Array.isArray((reply as { documents?: unknown }).documents)
+    ? (reply as { documents: unknown[] }).documents
+    : count === 1 && reply && typeof reply === 'object' ? [reply] : [];
+  list.forEach((entry, i) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return;
+    const n = Number((entry as { doc?: unknown }).doc);
+    const at = Number.isInteger(n) && n >= 1 && n <= count ? n - 1 : i;
+    if (at < count && !out.has(at)) out.set(at, entry as RawExtractReply);
+  });
+  return out;
+}
+
 /**
  * Call the LLM and return the raw entity/relation/claim lists. Pure
  * extraction, no DB writes; the result is persisted to the document's sidecar
@@ -353,6 +426,9 @@ export async function applyExtraction(
     ? chunksBySegment(opts.segments.text, page.chunkIds, opts.segments.ranges)
     : null;
 
+  // a person name split by context (src/graph/entity-context.ts) resolves to the person this document's entities point at
+  const namesakes = await namesakeRules(w.q, entities.filter((e) => e.type === 'person').map((e) => e.name));
+
   for (const e of entities) {
     const needles = [e.name, ...(e.aliases ?? [])].map((s) => s.toLowerCase());
     const has = (c: ChunkRef) => {
@@ -367,7 +443,11 @@ export async function applyExtraction(
     } else {
       hits = page.chunkIds.filter(has).slice(0, 8);
     }
-    const id = await w.entity(e, { extractor, segmentId: hits[0]?.id ?? fallback?.id ?? null });
+    const rules = e.type === 'person' ? namesakes.get(e.name.trim().toLowerCase()) : undefined;
+    const variant = rules ? namesakeChoice(rules, entities) : null;
+    const id = variant
+      ? await w.entity({ ...e, name: `${variant.name}（${variant.label}）`, aliases: [...(e.aliases ?? []), e.name] }, { extractor, segmentId: hits[0]?.id ?? fallback?.id ?? null, id: variant.id })
+      : await w.entity(e, { extractor, segmentId: hits[0]?.id ?? fallback?.id ?? null });
     touched.add(id);
     idByName.set(e.name.toLowerCase(), id);
     for (const a of e.aliases ?? []) idByName.set(a.toLowerCase(), id);

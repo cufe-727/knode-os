@@ -7,6 +7,7 @@ import { DataSourceRegistry } from '../datasource/registry.js';
 import { QueryResult } from '../datasource/types.js';
 import { safePath } from '../fs/files.js';
 import { clearSourceSummaryFailure, readSourceSummary, readSourceSummaryFailure, recordSourceSummaryFailure, SourceSummaryCache, writeSourceSummary } from '../fs/sidecar.js';
+import { formatValue } from '../graph/claim-state.js';
 import { slugify } from '../graph/store.js';
 import { applyDocScope } from '../ingest/apply.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
@@ -116,7 +117,27 @@ const ENTITY_PAGE_LINKED = 60;
 interface PageClaim {
   id: string; statement: string; status: string; kind?: string; valid_from: string | null; valid_to: string | null;
   event_at?: string | null; superseded_by?: string | null; fold_sha?: string; path?: string | null;
+  /** Claim state (docs/design/29): the subject's canonical attribute key, the value, the effective date and where it came from. */
+  attribute?: string | null; value_num?: number | null; value_text?: string | null; unit?: string | null;
+  eff?: string | null; date_source?: string | null; correction?: boolean;
 }
+
+/** The columns of a claim a page shows: `path` is the source that dated it (its newest), and `eff` its effective date. */
+const PAGE_CLAIM_COLUMNS = `cl.id, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at, cl.superseded_by, cl.fold_sha,
+       COALESCE(es.key, s.key) AS path, COALESCE(ak.canonical, cl.attribute) AS attribute, cl.value_num, cl.value_text, cl.unit,
+       COALESCE(cl.effective_at, cl.event_at, cl.valid_from, cl.observed_at) AS eff,
+       COALESCE(cl.date_source, CASE WHEN cl.event_at IS NOT NULL OR cl.valid_from IS NOT NULL THEN 'stated' WHEN cl.observed_at IS NOT NULL THEN 'document' END) AS date_source,
+       cl.correction`;
+const PAGE_CLAIM_JOINS = `LEFT JOIN scopes s ON s.id = cl.primary_scope_id LEFT JOIN scopes es ON es.id = cl.effective_scope_id
+       LEFT JOIN claim_attribute_keys ak ON ak.subject_id = cl.subject_id AND ak.attribute = cl.attribute`;
+
+/** What changes a claim's line on a page. */
+function pageClaimSha(c: PageClaim): unknown[] {
+  return [c.fold_sha, c.superseded_by, c.path, c.attribute ?? null, c.value_num ?? null, c.value_text ?? null, toIso(c.eff ?? null), c.date_source ?? null];
+}
+
+/** History entries an attribute shows at most below its current value. */
+const STATE_HISTORY = 8;
 interface PageMention extends PageClaim { subject: string; subject_page: string | null }
 interface PageRelation { id: string; type: string; description: string; out: boolean; other: string; other_page: string | null; path: string | null }
 interface PageConflict { a: string; a_path: string | null; b: string; b_path: string | null; reason: string }
@@ -137,7 +158,7 @@ interface PageConflict { a: string; a_path: string | null; b: string; b_path: st
  */
 const entityStub: PageGenerator = {
   kind: 'entity_stub',
-  version: 5,
+  version: 6,
   llm: false,
   mode: 'file',
   async plan(ctx, pagePath) {
@@ -153,28 +174,29 @@ const entityStub: PageGenerator = {
       if (!c) return null;
       return {
         deps: [{ kind: 'entity', id, required: true, sha: e.fold_sha }, { kind: 'entity', id: c.id, sha: c.fold_sha }],
-        inputsSha: sha16(['entity_stub@5', 'redirect', e.fold_sha, c.id]),
+        inputsSha: sha16(['entity_stub@6', 'redirect', e.fold_sha, c.id]),
         data: { entity: e, claims: [], redirect: { id: c.id, name: c.name } },
       };
     }
+    // an entity that others were merged into (a rename, a duplicate) shows what was said of them too
+    const subjects = [id, ...(await ctx.store.query<{ id: string }>(`SELECT id FROM entities WHERE canonical_id = $1 AND tx_to IS NULL ORDER BY id`, [id])).map((m) => m.id)];
     const claims = await ctx.store.query<PageClaim>(
-      `SELECT cl.id, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at, cl.superseded_by, cl.fold_sha, s.key AS path
-       FROM claims cl LEFT JOIN scopes s ON s.id = cl.primary_scope_id
-       WHERE cl.subject_id = $1 AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
-       ORDER BY COALESCE(cl.event_at, cl.valid_from) DESC NULLS LAST, cl.tx_from DESC, cl.id LIMIT $2`,
-      [id, ENTITY_PAGE_CLAIMS],
+      `SELECT ${PAGE_CLAIM_COLUMNS}
+       FROM claims cl ${PAGE_CLAIM_JOINS}
+       WHERE cl.subject_id = ANY($1::text[]) AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
+       ORDER BY eff DESC NULLS LAST, cl.tx_from DESC, cl.id LIMIT $2`,
+      [subjects, ENTITY_PAGE_CLAIMS],
     );
     const [{ n: total }] = await ctx.store.query<{ n: number }>(
-      `SELECT count(*)::int AS n FROM claims WHERE subject_id = $1 AND tx_to IS NULL AND canonical_id IS NULL`,
-      [id],
+      `SELECT count(*)::int AS n FROM claims WHERE subject_id = ANY($1::text[]) AND tx_to IS NULL AND canonical_id IS NULL`,
+      [subjects],
     );
     const mentions = await ctx.store.query<PageMention>(
-      `SELECT cl.id, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to, cl.event_at, cl.superseded_by, cl.fold_sha, s.key AS path,
-              se.name AS subject, se.wiki_path AS subject_page
-       FROM claims cl JOIN entities se ON se.id = cl.subject_id LEFT JOIN scopes s ON s.id = cl.primary_scope_id
-       WHERE cl.object_id = $1 AND cl.subject_id <> $1 AND cl.tx_to IS NULL AND cl.canonical_id IS NULL AND cl.superseded_by IS NULL
-       ORDER BY COALESCE(cl.event_at, cl.valid_from) DESC NULLS LAST, cl.tx_from DESC, cl.id LIMIT $2`,
-      [id, ENTITY_PAGE_LINKED],
+      `SELECT ${PAGE_CLAIM_COLUMNS}, se.name AS subject, se.wiki_path AS subject_page
+       FROM claims cl JOIN entities se ON se.id = cl.subject_id ${PAGE_CLAIM_JOINS}
+       WHERE cl.object_id = ANY($1::text[]) AND NOT (cl.subject_id = ANY($1::text[])) AND cl.tx_to IS NULL AND cl.canonical_id IS NULL AND cl.superseded_by IS NULL
+       ORDER BY eff DESC NULLS LAST, cl.tx_from DESC, cl.id LIMIT $2`,
+      [subjects, ENTITY_PAGE_LINKED],
     );
     // a relation's source: its document, else the document its evidence came
     // from — tier 1 writes that evidence on a `tier1` scope keyed by the path
@@ -210,9 +232,9 @@ const entityStub: PageGenerator = {
         ...relations.map((r) => ({ kind: 'relation' as const, id: r.id, sha: r.fold_sha })),
       ],
       inputsSha: sha16([
-        'entity_stub@5', e.fold_sha, total,
-        claims.map((c) => [c.fold_sha, c.superseded_by, c.path]),
-        mentions.map((c) => [c.fold_sha, c.path, c.subject, c.subject_page]),
+        'entity_stub@6', e.fold_sha, total, subjects,
+        claims.map(pageClaimSha),
+        mentions.map((c) => [...pageClaimSha(c), c.subject, c.subject_page]),
         relations.map((r) => [r.fold_sha, r.other, r.other_page, r.path]),
         conflicts.map((c) => [c.a, c.b, c.reason]),
       ]),
@@ -232,10 +254,14 @@ const entityStub: PageGenerator = {
       : [`# ${e.name}`, '', e.description || '_No description yet — fill me in._'];
     const now = new Date().toISOString();
     const kindOf = (c: { kind?: string }) => c.kind ?? 'fact';
-    const periodOf = (c: { valid_from: string | null; valid_to: string | null }) => {
-      const from = toDateString(c.valid_from);
+    const day = (c: PageClaim) => toDateString(c.eff ?? null);
+    // every dated line says when: the date it states, or "as of" its document's date
+    const when = (c: PageClaim) => {
+      const d = day(c);
       const to = toDateString(c.valid_to);
-      return from || to ? ` \`${from ?? '?'} ~ ${to ?? ''}\`` : '';
+      if (to && toDateString(c.valid_from)) return ` \`${toDateString(c.valid_from)} ~ ${to}\``;
+      if (!d) return '';
+      return c.date_source === 'document' ? ` \`as of ${d}\`` : ` \`${d}\``;
     };
     const from = (p?: string | null) => (p ? ` — ${p}` : '');
     const linked = (name: string, page: string | null) => (page ? `[[${name}]]` : name);
@@ -247,29 +273,57 @@ const entityStub: PageGenerator = {
         ? `_${total} claims; the newest ${claims.length} are listed here from ${docs} ${docs === 1 ? 'document' : 'documents'} — \`knode_claims\` with subject "${e.name}" returns the rest._`
         : `_${total} ${total === 1 ? 'claim' : 'claims'} from ${docs} ${docs === 1 ? 'document' : 'documents'}._`);
     }
-    // gbrain's split: the compiled truth (what holds now) above, the dated history below;
-    // views, forecasts and rumours are not facts and get their own list, tagged by kind.
-    // Something that happened on a day is history: it stands in the timeline alone.
+    // gbrain's split: the compiled truth (what holds now) above, the dated history below.
+    // A measure is compiled per attribute: its current value, then the values it had
+    // (docs/design/29). Views, forecasts and rumours are not facts and get their own
+    // list; something that happened on a day stands in the timeline.
+    const stateful = (c: PageClaim) => Boolean(c.attribute) && (kindOf(c) === 'fact' || kindOf(c) === 'prediction') && (c.status === 'fact' || c.status === 'suspected');
+    const series = new Map<string, PageClaim[]>();
+    for (const c of claims.filter(stateful)) {
+      const key = `${kindOf(c) === 'prediction' ? 1 : 0}\u0000${c.attribute}`;
+      (series.get(key) ?? series.set(key, []).get(key)!).push(c);
+    }
+    if (series.size > 0) {
+      lines.push('', '## Current state', '');
+      const ordered = [...series.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+      for (const [key, list] of ordered) {
+        const forecast = key.startsWith('1');
+        const byDay = [...list].sort((a, b) => (toIso(b.eff ?? null) ?? '').localeCompare(toIso(a.eff ?? null) ?? ''));
+        const current = byDay.filter((c) => !c.superseded_by);
+        const shown = current.length ? current : byDay.slice(0, 1);
+        const label = `**${list[0].attribute}**${forecast ? ' _(plan / forecast)_' : ''}`;
+        for (const c of shown) {
+          const value = formatValue(c) || c.statement;
+          lines.push(`- ${label}: ${value}${when(c)}${c.status === 'fact' ? '' : ` \`${c.status}\``}${c.correction ? ' _(corrected)_' : ''}${from(c.path)}`);
+        }
+        const past = byDay.filter((c) => !shown.includes(c));
+        if (past.length > 0) {
+          const items = past.slice(0, STATE_HISTORY).map((c) => `${formatValue(c) || c.statement}${day(c) ? ` (${day(c)})` : ''}`);
+          lines.push(`  - history: ${items.join(', ')}${past.length > STATE_HISTORY ? `; ${past.length - STATE_HISTORY} earlier` : ''}`);
+        }
+      }
+    }
     const happened = (c: PageClaim) => Boolean(toIso(c.event_at ?? null));
-    const live = claims.filter((c) => !c.superseded_by && !(toIso(c.valid_to) && toIso(c.valid_to)! < now));
+    const live = claims.filter((c) => !stateful(c) && !c.superseded_by && !(toIso(c.valid_to) && toIso(c.valid_to)! < now));
     const current = live.filter((c) => kindOf(c) === 'fact' && !happened(c));
     if (current.length > 0) {
       lines.push('', '## Facts (current)', '');
-      for (const c of current) lines.push(`- ${c.statement} \`${c.status}\`${periodOf(c)}${from(c.path)}`);
+      for (const c of current) lines.push(`- ${c.statement} \`${c.status}\`${when(c)}${from(c.path)}`);
     }
     const views = live.filter((c) => kindOf(c) !== 'fact' && !happened(c));
     if (views.length > 0) {
       lines.push('', '## Views and forecasts', '');
-      for (const c of views) lines.push(`- ${c.statement} \`${kindOf(c)}\`${c.status === 'fact' ? '' : ` \`${c.status}\``}${periodOf(c)}${from(c.path)}`);
+      for (const c of views) lines.push(`- ${c.statement} \`${kindOf(c)}\`${c.status === 'fact' ? '' : ` \`${c.status}\``}${when(c)}${from(c.path)}`);
     }
+    // the timeline: what the sources date themselves (an event, a period), placed by effective date;
+    // a measure's values are its history above
     const dated = claims
-      .filter((c) => toIso(c.event_at ?? null) || toIso(c.valid_from))
-      .sort((a, b) => (toIso(a.event_at ?? null) ?? toIso(a.valid_from)!).localeCompare(toIso(b.event_at ?? null) ?? toIso(b.valid_from)!));
+      .filter((c) => !stateful(c) && c.date_source === 'stated' && day(c))
+      .sort((a, b) => (toIso(a.eff ?? null) ?? '').localeCompare(toIso(b.eff ?? null) ?? '') || a.id.localeCompare(b.id));
     if (dated.length > 0) {
       lines.push('', '## Timeline', '');
       for (const c of dated) {
-        const when = toDateString(c.event_at ?? null) ?? toDateString(c.valid_from);
-        lines.push(`- ${when} · ${c.statement} \`${c.status}\`${kindOf(c) === 'fact' ? '' : ` \`${kindOf(c)}\``}${c.superseded_by ? ' _(superseded)_' : ''}${from(c.path)}`);
+        lines.push(`- ${day(c)} · ${c.statement} \`${c.status}\`${kindOf(c) === 'fact' ? '' : ` \`${kindOf(c)}\``}${c.superseded_by ? ' _(superseded)_' : ''}${from(c.path)}`);
       }
     }
     const disputed = claims.filter((c) => c.status === 'disputed');
@@ -281,8 +335,8 @@ const entityStub: PageGenerator = {
     if (mentions.length > 0) {
       lines.push('', '## In claims about others', '');
       for (const c of mentions) {
-        const when = toDateString(c.event_at ?? null);
-        lines.push(`- ${when ? `${when} · ` : ''}${linked(c.subject, c.subject_page)}: ${c.statement} \`${kindOf(c) === 'fact' ? c.status : kindOf(c)}\`${from(c.path)}`);
+        const d = day(c);
+        lines.push(`- ${d ? `${d} · ` : ''}${linked(c.subject, c.subject_page)}: ${c.statement} \`${kindOf(c) === 'fact' ? c.status : kindOf(c)}\`${from(c.path)}`);
       }
     }
     if (relations.length > 0) {
