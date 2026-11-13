@@ -244,7 +244,9 @@ describe('this machine\'s slots under the processing limits', () => {
     fs.writeFileSync(stub, `#!/bin/sh\ncat > /dev/null\necho '{"type":"result","is_error":false,"result":"ok"}'\n`, { mode: 0o755 });
     const claude: LlmConnection = { id: 'claude', label: 'Claude', provider: 'claude-cli', baseUrl: '', apiKey: '', protocol: 'auto', model: '', cliPath: stub, effort: 'default', cliTimeoutMs: 30_000 };
     const config = configWith(claude, { slots: 1, processing: { maxLocalCalls: 2, minQuotaPercent: 20 } });
-    let reading: PlanQuota = { plan: 'Claude', windows: [{ name: 'weekly', leftPercent: 12, resetsAt: '2026-11-13T06:00:00.000Z' }], limitReached: null, readAt: new Date().toISOString() };
+    // a window still open whenever this runs: one whose reset has passed counts as reset, and holds nothing
+    const resets = new Date(Date.now() + 86_400_000).toISOString();
+    let reading: PlanQuota = { plan: 'Claude', windows: [{ name: 'weekly', leftPercent: 12, resetsAt: resets }], limitReached: null, readAt: new Date().toISOString() };
     const reads: string[] = [];
     const leaser = new FakeLeaser({ summarize: 2 });
     const logs: string[] = [];
@@ -263,13 +265,13 @@ describe('this machine\'s slots under the processing limits', () => {
       expect(reads[0]).toBe(`claude-cli ${stub}`);
       const [summary] = workers.status().filter((b) => b.id === 'summarize');
       // shown as a rest until the window resets, with the reason
-      expect(summary.pausedUntil).toBe('2026-11-13T06:00:00.000Z');
+      expect(summary.pausedUntil).toBe(resets);
       expect(summary.pauseReason).toBe('Claude weekly window has 12% left, under the 20% floor');
       expect(workers.heldForQuota('judge')).toBe(true);
       expect(logs.some((l) => l.includes('takes no new work: Claude weekly window has 12% left'))).toBe(true);
 
       // the window reset: work again
-      reading = { ...reading, windows: [{ name: 'weekly', leftPercent: 95, resetsAt: '2026-11-20T06:00:00.000Z' }] };
+      reading = { ...reading, windows: [{ name: 'weekly', leftPercent: 95, resetsAt: new Date(Date.now() + 7 * 86_400_000).toISOString() }] };
       await until(() => leaser.completed.length === 2, 5_000, 'the summaries after the reset');
       expect(workers.quotaHolds()).toEqual([]);
       expect(workers.heldForQuota('judge')).toBe(false);
@@ -289,7 +291,7 @@ describe('this machine\'s slots under the processing limits', () => {
       checkMs: 60_000,
       read: async () => {
         reads++;
-        return { plan: 'Claude', windows: [{ name: 'weekly', leftPercent: 8, resetsAt: '2026-11-13T06:00:00.000Z' }], limitReached: null, readAt: new Date().toISOString() };
+        return { plan: 'Claude', windows: [{ name: 'weekly', leftPercent: 8, resetsAt: new Date(Date.now() + 86_400_000).toISOString() }], limitReached: null, readAt: new Date().toISOString() };
       },
     });
     const a = new LocalLabelingWorkers(new FakeLeaser({ extract: 1 }), () => config, { idleMs: 20, plans });
