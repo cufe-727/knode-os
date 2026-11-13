@@ -101,6 +101,8 @@ export class RemoteEval {
   private unreachableSaid = false;
   /** Pieces placed, for the run's log. */
   readonly counts = { offered: 0, remote: 0, here: 0 };
+  /** Whether the run's model calls leave (the run sets it: its own Codex backend with a named model). */
+  callsLeave = false;
 
   private constructor(private readonly opts: RemoteEvalOptions) {
     this.log = opts.log ?? (() => {});
@@ -133,6 +135,11 @@ export class RemoteEval {
   online(kind: EvalKind, family: EvalFamily): number {
     if (!this.status?.offered || this.abort.signal.aborted) return 0;
     return this.status.online[kind]?.[family] ?? 0;
+  }
+
+  /** Worker slots a build's or a system's model calls can use beside this machine's: 0 while its calls stay here. */
+  callSlots(): number {
+    return this.callsLeave ? this.online('eval-call', 'codex') : 0;
   }
 
   /** Before a piece runs here: this machine's plan (the quota guard), read at most once a minute. */

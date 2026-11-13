@@ -244,6 +244,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   opts.signal?.addEventListener('abort', onAbort, { once: true });
   // a call leaves only on the run's own Codex backend with a named model: the worker runs exactly that one
   const callsLeave = Boolean(remote && !opts.overrides?.chat && !opts.chatChain && !opts.chatConnection && opts.model);
+  if (remote) remote.callsLeave = callsLeave;
   if (remote && !callsLeave) chainLog(`remote: model calls stay here (${opts.model ? 'the run answers on a chain, a connection or a stand-in' : 'no --model: a worker runs the model the run names'}); agent sessions${opts.model ? '' : ' too'}`);
   const state = shimState({ cacheDir: store.cacheDir(), slots: opts.slots ?? 6, embeddingTokenCap: opts.embeddingTokenCap });
   const placed = callsLeave ? new PlacedChatBackend(backend, state.slots, remote!, { model: opts.model! }) : null;
@@ -311,7 +312,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const concurrencyFor = (s: SystemUnderTest) => {
     const base = opts.answerConcurrency ?? 3;
     if (!remote) return base;
-    return base + (isAgent(s) ? remote.online('eval-session', 'codex') : callsLeave ? remote.online('eval-call', 'codex') : 0);
+    return base + (isAgent(s) ? remote.online('eval-session', 'codex') : remote.callSlots());
   };
   const repeat = Math.max(1, Math.trunc(opts.repeat ?? 1));
   const repeatsOf = (s: SystemUnderTest) => (repeat > 1 && (!opts.repeatSystems?.length || opts.repeatSystems.includes(s.id)) ? repeat : 1);

@@ -265,7 +265,9 @@ guard no longer holds a batch at its start, only what falls back here.
 
 **Parallelism** (F). Remote slots add to this machine's: `--slots` and `--answer-concurrency` bound local work, a
 remote call takes no local slot, and a system answers `--answer-concurrency` plus the online remote slots of its
-kind at once. A knode build's own concurrency (`KNODE_EVAL_KNODE_CONCURRENCY`, 6) is unchanged.
+kind at once. A knode build's document passes send `KNODE_EVAL_KNODE_CONCURRENCY` (6) calls at once plus the remote
+call slots online when the build starts, and a pass's batch grows in the same proportion (`evalPassSettings`); the
+build's notes record both. Sync, embedding, wiki generation and refine run here at their own pace.
 
 **Comparability** (D). A worker runs exactly the family and model a task names (its own `--codex-model` does not
 apply), so a piece's backend is `codex-cli:<model>` (`claude-cli:<model>` for the judge) wherever it ran — another
@@ -283,7 +285,7 @@ offer `stopped`; the run's request fails, and the piece runs here.
 **Repeats** (`eval run --repeat <n> [--repeat-systems …]`). Repeated answers to the same tasks, for run-to-run
 variance. Repeat 1 keeps today's keys; repeat r > 1 adds `r<r>` to the answer key and `repeat: r` to the record, is
 answered under the task id `<task>~r<r>` (its own meter tag and reply-cache key, so the model is asked again), and is
-scored as the system `<system>#r<r>`.
+scored under its own system with `repeat: r` on the score record and in its key (docs/design/28, src/eval/score/keys.ts).
 
 **Access** (G). Token scope `eval` (`knode-os remote token create --scope eval --workspace <user>/<ws>`): eval work is
 the server's, leased through whichever workspace the token names. Setting `server.remote.offer.eval` (default

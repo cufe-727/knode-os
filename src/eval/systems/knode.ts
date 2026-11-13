@@ -13,6 +13,7 @@ import { generateWiki } from '../../wiki/generate.js';
 import { refineWiki } from '../../wiki/refine.js';
 import { isolatedCopy, runAgent } from '../agent.js';
 import { formatTag } from '../meter.js';
+import { currentRemote } from '../placement.js';
 import { dirBytes, listFiles } from '../pack.js';
 import { citationsIn } from '../prompts.js';
 import type { Citation, KnowledgeUnit } from '../types.js';
@@ -87,6 +88,21 @@ const STAGES = ['extract', 'summary', 'kb-judge', 'document', 'translate'] as co
 export const KNODE_EVAL_CONCURRENCY = Number(process.env.KNODE_EVAL_KNODE_CONCURRENCY ?? 6);
 export const KNODE_EVAL_BATCH = Number(process.env.KNODE_EVAL_KNODE_BATCH ?? 16);
 
+/**
+ * A build's document-pass settings: this machine's, plus the remote slots for
+ * model calls that are online when the build starts (docs/design/27 §8).
+ * Without them a build sends `KNODE_EVAL_CONCURRENCY` calls at once however
+ * many workers wait; a pass's batch grows in the same proportion, so a pass
+ * has enough calls to fill them. A remote call takes none of this machine's
+ * slots, and a call that falls back here still waits for one.
+ */
+export function evalPassSettings(): { concurrency: number; batchSize: number } {
+  const extra = currentRemote<{ callSlots(): number }>()?.callSlots() ?? 0;
+  if (extra <= 0) return { concurrency: KNODE_EVAL_CONCURRENCY, batchSize: KNODE_EVAL_BATCH };
+  const concurrency = KNODE_EVAL_CONCURRENCY + extra;
+  return { concurrency, batchSize: Math.max(KNODE_EVAL_BATCH, Math.ceil((concurrency * KNODE_EVAL_BATCH) / Math.max(1, KNODE_EVAL_CONCURRENCY))) };
+}
+
 /** One state per working directory: a run's pack, never another run's of the same pack. */
 function stateFor(env: SystemEnv): KnodeState {
   let s = states.get(env.workDir);
@@ -131,9 +147,9 @@ export function evalWorkspaceConfig(env: Pick<SystemEnv, 'shim' | 'pack'>, syste
       judgeLlm: route('kb-judge'),
       translateLlm: route('translate'),
       workers: [],
-      // a benchmark build may use more of the shim's slots than the product default (3 calls, 8 documents a pass)
-      concurrency: KNODE_EVAL_CONCURRENCY,
-      batchSize: KNODE_EVAL_BATCH,
+      // a benchmark build may use more of the shim's slots than the product default (3 calls, 8 documents a pass),
+      // and the remote workers' beside them
+      ...evalPassSettings(),
     },
   } as KnodeConfig;
 }
@@ -235,7 +251,7 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
       );
       return {
         kbDir: s.ws,
-        notes: { ...counts, ...passes, passConcurrency: KNODE_EVAL_CONCURRENCY, passBatch: KNODE_EVAL_BATCH, wikiPages: pages.length, refined, indexed: synced.indexed, stageMs: { sync: tSync, documentPasses: tPasses, wiki: Date.now() - t0 - tSync - tPasses } },
+        notes: { ...counts, ...passes, passConcurrency: ctx.config.extraction.concurrency, passBatch: ctx.config.extraction.batchSize, wikiPages: pages.length, refined, indexed: synced.indexed, stageMs: { sync: tSync, documentPasses: tPasses, wiki: Date.now() - t0 - tSync - tPasses } },
       };
     },
     async reopen(env) {
