@@ -17,6 +17,7 @@ import { dirBytes, listFiles } from '../pack.js';
 import { citationsIn } from '../prompts.js';
 import type { Citation, KnowledgeUnit } from '../types.js';
 import { AGENT_BRIEF } from './agents.js';
+import { catalogGuide } from '../../mcp/catalog-guide.js';
 import { WIKI_SOURCES_BRIEF, wikiWithSources } from './llm-wiki.js';
 import { recordAgent, shimClient, SystemEnv, SystemUnderTest } from './types.js';
 import { evalTempDir } from '../tmp.js';
@@ -49,12 +50,36 @@ const states = new Map<string, KnodeState>();
 /**
  * Tools an agent may use against the knowledge base — retrieval and reading
  * only, nothing that calls a model or writes knowledge. `knode_resolve` is the
- * call the server's own instructions tell an agent to start with (entities,
- * ranked claims and passages for a question in one answer) and `knode_survey`
- * the one they name for orientation: an agent told to start with tools it was
- * not given searched and grepped instead, 11 calls a question against grep's 5.
+ * call the server's own instructions name for "who or what is X" and
+ * `knode_survey` the one they name for orientation: an agent told to start
+ * with tools it was not given searched and grepped instead, 11 calls a
+ * question against grep's 5. `knode_query` (read-only SQL; the agent gets the
+ * catalog source only, there being no live datasource in an eval workspace)
+ * answers lists, counts and date ranges in one call: without it, in the
+ * 2026-11 corpus run, the agent read raw documents one per call, 8.1 calls and
+ * 49.6k weighted tokens a question on the reports pack against grep's 3.7 and
+ * 30.5k (docs/design/30).
  */
-export const KNODE_AGENT_TOOLS = ['knode_resolve', 'knode_survey', 'knode_search', 'knode_graph_search', 'knode_read', 'knode_ls', 'knode_grep', 'knode_claims'];
+export const KNODE_AGENT_TOOLS = ['knode_resolve', 'knode_survey', 'knode_search', 'knode_graph_search', 'knode_read', 'knode_ls', 'knode_grep', 'knode_claims', 'knode_query'];
+
+/**
+ * The knode agent's brief: the grep baseline's (same opening, same budget)
+ * with the tools routed by the kind of question, and the catalog's schema,
+ * which an agent cannot guess. The shared brief's "search and read the files
+ * with shell commands" does not apply here: there are no files to run them on.
+ */
+export function knodeAgentBrief(): string {
+  return `You are answering a question about a document collection. The documents are not in the current directory: they are in a knowledge base you reach through the knode MCP tools (source documents under raw/docs/, generated pages under wiki/). Work read-only. You have a budget of about 20 tool calls; answer before you run out — most questions need 2 to 5. Do not use the network.
+
+Pick the tool by the kind of question:
+- Lists, counts, filters, time ranges ("which…", "how many…", "every…", "in 2025…", "in order"): knode_claims (every claim about an entity, each with its date and source; order="timeline", event_range="2025") or knode_query with source="catalog" (SQL, schema below). One call returns the whole set; then read only the documents you need to confirm or quote.
+- "Who or what is X": knode_resolve on the question (the entities it names, their claims and the best passages in one call), then the entity's page under wiki/.
+- A passage that says something: knode_search (mode="sag" when the answer crosses a relation: "the CEO of the company that acquired…").
+- An exact string, name or number: knode_grep with context=3 (the lines around each match, grouped by file) — often enough without reading the file.
+- Reading: knode_read with paths=[…] reads several documents, sections or line ranges in one call. Never read one document per call.
+
+${catalogGuide()}`;
+}
 
 const STAGES = ['extract', 'summary', 'kb-judge', 'document', 'translate'] as const;
 
@@ -245,7 +270,7 @@ export function knodeAsk(): SystemUnderTest {
     },
     async retrieve(query, k, env) {
       const ctx = await open(stateFor(env));
-      const hits = await search(ctx.store, ctx.embedder, query, { k: k * 3, mode: 'hybrid', track: false, heat: ctx.config.heat });
+      const hits = await search(ctx.store, ctx.embedder, query, { k: k * 3, mode: 'hybrid', track: false, heat: ctx.config.heat, rerank: ctx.config.retrieval.rerank, current: false });
       return [...new Set(hits.flatMap((h) => rankedDocument(stateFor(env), h.path)))].slice(0, k);
     },
     async exportKnowledge(env) {
@@ -267,7 +292,7 @@ export function knodeSag(): SystemUnderTest {
     async retrieve(query, k, env) {
       const s = stateFor(env);
       const ctx = await open(s);
-      const hits = await search(ctx.store, ctx.embedder, query, { k: k * 3, mode: 'sag', track: false, heat: ctx.config.heat, sag: ctx.config.retrieval.sag });
+      const hits = await search(ctx.store, ctx.embedder, query, { k: k * 3, mode: 'sag', track: false, heat: ctx.config.heat, sag: ctx.config.retrieval.sag, rerank: ctx.config.retrieval.rerank, current: false });
       return [...new Set(hits.flatMap((h) => rankedDocument(s, h.path)))].slice(0, k);
     },
   });
@@ -290,7 +315,7 @@ export function agentKnode(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
-          prompt: `${AGENT_BRIEF('The documents are not in the current directory: use the knode MCP tools. Start with knode_resolve on the question: one call returns the entities it names, the claims extracted about them across all documents (each with its source) and the best passages. Then fill what is missing with knode_claims (every claim about an entity, by date), knode_search, knode_graph_search, knode_read, knode_grep and knode_ls. Source documents live under raw/docs/; generated pages under wiki/.')}\n\n${prompt}`,
+          prompt: `${knodeAgentBrief()}\n\n${prompt}`,
           mcp: { name: 'knode', command: process.execPath, args: [CLI_JS, '--data', s.ws, 'mcp'], enabledTools: KNODE_AGENT_TOOLS },
         });
         recordAgent(env.meter, { system: 'agent-knode', stage: 'agent', task: task.id }, env.models.model, r);

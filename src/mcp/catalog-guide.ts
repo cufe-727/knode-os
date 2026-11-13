@@ -1,0 +1,42 @@
+/**
+ * What an agent needs to write SQL against the catalog without guessing the
+ * schema (docs/design/30 §5): the views a question about the knowledge base
+ * itself is answered from, their columns, and worked queries. Shown in the
+ * `knode_query` description and in the benchmark agent's brief; every example
+ * is run against a fixture by tests/answer-routing.test.ts, so a view change
+ * that breaks one fails there.
+ */
+
+export const CATALOG_VIEW_COLUMNS = [
+  'v_entities(id, name, type, description, aliases jsonb, wiki_path, mention_count, evidence_count, canonical_id) — canonical_id set: merged into that entity',
+  'v_claims(id, subject_id, object_id, type, statement, status [fact|suspected|disputed], kind [fact|opinion|prediction|rumor], valid_from, valid_to, event_at, observed_at, superseded_by, source_path, evidence_count) — superseded_by set: replaced by that newer claim',
+  'v_relations(id, source_id, target_id, type, description, weight, evidence_count, valid_from, valid_to)',
+  'v_evidence(kind [entity|relation|claim], target_id, source_path, weight, extractor, tx_from, tx_to) — every source behind a row; tx_to IS NULL: still live',
+  'v_mentions(entity_id, chunk_id, document_id, document_path)',
+  'v_documents(id, path, root, kind, title, doc_date, status)',
+];
+
+export const CATALOG_EXAMPLES: { question: string; sql: string }[] = [
+  {
+    question: 'every current claim about an entity dated in 2026, oldest first',
+    sql: `SELECT c.event_at, c.statement, c.source_path FROM v_claims c JOIN v_entities e ON e.id = c.subject_id WHERE e.name ILIKE 'Acme%' AND c.superseded_by IS NULL AND c.event_at >= '2026-01-01' AND c.event_at < '2027-01-01' ORDER BY c.event_at`,
+  },
+  {
+    question: 'how many documents mention each organization',
+    sql: `SELECT e.name, count(DISTINCT m.document_id) AS documents FROM v_entities e JOIN v_mentions m ON m.entity_id = e.id WHERE e.type = 'organization' AND e.canonical_id IS NULL GROUP BY e.name ORDER BY documents DESC LIMIT 20`,
+  },
+  {
+    question: 'which sources state the claims matching a word',
+    sql: `SELECT c.statement, v.source_path FROM v_claims c JOIN v_evidence v ON v.target_id = c.id AND v.kind = 'claim' AND v.tx_to IS NULL WHERE c.statement ILIKE '%outage%' ORDER BY c.statement`,
+  },
+];
+
+/** The guide as one block of text. */
+export function catalogGuide(): string {
+  return [
+    'Catalog views (source="catalog": Postgres SQL, one SELECT / WITH, read-only, row-capped; knode_datasources lists every view):',
+    ...CATALOG_VIEW_COLUMNS.map((v) => `- ${v}`),
+    'Join an entity to its claims by v_claims.subject_id (or object_id) = v_entities.id; match names with ILIKE. Examples:',
+    ...CATALOG_EXAMPLES.map((e, i) => `${i + 1}. ${e.question}: ${e.sql}`),
+  ].join('\n');
+}

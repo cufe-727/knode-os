@@ -13,7 +13,10 @@ import { GUIDE_FILE } from '../fs/datadir.js';
 const MAX_GUIDE_CHARS = 6_000;
 
 /**
- * The preamble. Its second line used to tell every agent to read the guide
+ * The preamble. Its first line routes by the kind of question (docs/design/30):
+ * in the 2026-11 benchmark an agent told only to start with knode_resolve
+ * called it once and then read raw documents one per call, 8.1 calls a
+ * question against a grep agent's 3.7. Its second line used to tell every agent to read the guide
  * first, whether or not one existed: in a benchmark run on a base nobody had
  * initialised, the agent spent a call on `knode_read "AGENTS.md"` in two
  * questions of four and got nothing. With a guide the text follows right
@@ -24,7 +27,7 @@ function preamble(guide: 'none' | 'whole' | 'cut'): string {
     ? `knode_survey says what this base holds, in numbers. It has no guide of its own yet (${GUIDE_FILE}, written by an initialization).`
     : `The base's own guide (${GUIDE_FILE}: what it holds, how things are named, which tool answers which question) follows${guide === 'cut' ? ', cut short' : ''}; knode_survey has the current numbers.`;
   return [
-    'knode-os is a local knowledge base: documents → entities / relations / claims → wiki pages. For a question start with knode_resolve; knode_search (mode=sag) finds passages, knode_claims dated facts, knode_graph_search relations; as_of / valid_at travel in time.',
+    'knode-os is a local knowledge base: documents → entities / relations / claims → wiki pages. Pick the tool by the kind of question. Lists, counts, filters and time ranges: knode_claims (every claim about an entity; order=timeline, event_range) or knode_query source="catalog" (SQL over v_claims / v_entities / v_evidence — its description has the columns and examples), one call for the whole set. "Who or what is X": start with knode_resolve (its entities, claims and passages in one call), then the entity page under wiki/. Passages: knode_search (mode=sag when the answer crosses a relation). Exact strings, names, numbers: knode_grep with `context`, which shows the lines around each match. Relations: knode_graph_search. Read documents several per call (`paths`), not one call each. as_of / valid_at travel in time.',
     second,
     'Writes go through knode_write (wiki/, raw/docs/, playbooks/packs/) and land quarantined until a person promotes them; a contradiction opens a dispute instead of overwriting.',
     'Web material you rely on goes in with knode_capture: knode fetches the URL itself, keeps the original under raw/docs/research/ (converted and indexed like any document) and returns the path to cite. knode_study shows multi-page research studies.',
