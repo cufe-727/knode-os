@@ -246,7 +246,7 @@ knode-os eval report ~/knode-eval/runs/<stamp>
   keyword bound; profiles are scored on recall for that reason. No human audit of it yet.
 - law-cn has few disagreements and no timelines inside one law: its corpus-level tasks are mostly aggregates.
 
-## 7. Corpus-level run (revised 2026‑11‑09; phases 0–2, the 3× point and the same-backend 1× done)
+## 7. Corpus-level run (revised 2026‑11‑13; phases 0–2, the 3× point, the same-backend 1× and phase 4 done)
 
 Approved 2026‑11‑07. Phases 0, 0b and 1 are done: bge-m3 serves on 127.0.0.1:12020; synthetic-life-zh v2 (41 corpus-level tasks),
 finance-cn (+31 corpus-level, 10 chains; padding stops at 1.3× because most same-workspace documents name a closed-world entity),
@@ -345,3 +345,103 @@ build swapped in, and law-cn's Codex answers dropped, so every pair compared was
 - So: up to 3× a wiki next to the sources is worth about what the sources alone are, and costs more per query; a wiki alone loses a
   little; long-context loses the most as the corpus grows (and costs 11× as much per query), and agent-knode drifts down too. The 10× point (≈ 56M knode, ≈ 40M LLM Wiki weighted
   tokens) would show whether that drift becomes a gap. Not run.
+
+### 7.1 Phase 4: the 1× rerun on main (2026‑11‑12)
+
+Phase 4 measured main at bdab966, after BM25 keyword ranking, ranked and sourced claims in ask, and entity pages that carry every
+claim with its source (ba9836d). It ran from `…/corpus-2026-11/phase4-ranking-1x.sh` into `…/run-1x-ranking`.
+
+- **Scope.** The 1× reports and synthetic-life-zh v2, for agent-grep and the four knode systems. knode was built again
+  (`--rebuild knode`). Builds and answers ran on Codex CLI; the judge was Anthropic, then Codex.
+- **Why agent-grep ran again.** The backend alone moves scores, so agent-grep answered again beside the knode systems.
+- **As run.** 02:06Z to 11:32Z: 760 answers, no errors, 10 builds. The judge made 53 calls on claude-sonnet-5-5, and one of them
+  failed. Codex's weekly window was at 48% partway through.
+
+**Codex drifted between runs.** Several things are the same as in phase 3b:
+
+- agent-grep's prompt and agent code
+- the Codex CLI (0.166.0, installed 2026‑11‑02)
+- the model and the answer effort
+
+Even so, agent-grep's median reports session changed sharply:
+
+| median per agent-grep session | phase 3b | phase 4 |
+| --- | --- | --- |
+| reasoning tokens | 546 | 25 |
+| output tokens | 1,893 | 684 |
+| input tokens | 107k | 70k |
+
+agent-grep also scored 0.06 higher (+0.064 [+0.009, +0.126], paired on 73), and every agent read less per query. The cause is on
+Codex's side and is not established. Read phase 4 within itself, or as a change in each system's gap to agent-grep. The table
+gives raw scores for context only.
+
+| reports, same-backend 1× → phase 4, all Codex | correctness | lists | tokens / query | Δ vs agent-grep in phase 4 |
+| --- | --- | --- | --- | --- |
+| agent-grep | 0.75 → 0.81 | 0.63 → 0.75 | 45.1k → 30.5k | — |
+| agent-knode | 0.75 → 0.85 | 0.66 → 0.81 | 65.7k → 49.6k | +0.04 [+0.01, +0.09] |
+| agent-knode-wiki-sources | 0.75 → 0.86 | 0.64 → 0.81 | 57.4k → 45.8k | +0.05 [+0.01, +0.09] |
+| agent-knode-wiki | 0.27 → 0.85 | 0.26 → 0.79 | 71.6k → 54.3k | +0.04 [+0.01, +0.07] |
+| knode-ask | 0.39 → 0.63 | 0.38 → 0.59 | 11.4k → 17.1k | −0.19 [−0.28, −0.09] |
+
+The life pack's earlier answers were all on the API, so it has no before/after. Phase 4 alone (Δ paired on 55 tasks):
+
+| life, phase 4, Codex | correctness | lists | tokens / query | false refusal | Δ vs agent-grep |
+| --- | --- | --- | --- | --- | --- |
+| agent-grep | 0.91 | 0.88 | 32.5k | 0.00 | — |
+| agent-knode | 0.91 | 0.88 | 42.8k | 0.00 | −0.00 [−0.03, +0.02] |
+| agent-knode-wiki-sources | 0.85 | 0.84 | 38.7k | 0.00 | −0.06 [−0.12, −0.01] |
+| agent-knode-wiki | 0.63 | 0.61 | 39.5k | 0.26 | −0.27 [−0.39, −0.16] |
+| knode-ask | 0.59 | 0.58 | 15.1k | 0.30 | −0.32 [−0.44, −0.21] |
+
+**Pooled.** Over the same 128 paired tasks as the same-backend phase 2 (Holm):
+
+| vs agent-grep | same-backend phase 2 | phase 4 | significant in phase 4 |
+| --- | --- | --- | --- |
+| agent-knode | −0.013 | +0.023 [−0.001, +0.051] | no |
+| agent-knode-wiki-sources | −0.004 | +0.001 | no |
+| agent-knode-wiki | −0.39 | −0.097 | yes |
+| knode-ask | −0.39 | −0.242 | yes |
+
+**Change in the gap to agent-grep on the reports**, paired on 70–73 tasks:
+
+| system | change in gap | interval |
+| --- | --- | --- |
+| agent-knode-wiki | +0.52 | [+0.42, +0.62] |
+| knode-ask | +0.17 | [+0.06, +0.28] |
+| agent-knode | +0.04 | crosses 0 |
+| agent-knode-wiki-sources | +0.04 | crosses 0 |
+
+On the reports, the knode agents lead agent-grep by 0.04–0.05. That lead clears 0 only before multiple-comparison correction,
+and the pooled test does not find it. At the same-backend 1×, the lead was +0.01.
+
+**knode's wiki is no longer thin on the reports.** Wiki pages are `*.md` under `wiki/` after the update batches:
+
+| pack | wiki pages, before → now | build tokens | build time | build calls |
+| --- | --- | --- | --- | --- |
+| reports | 38 → 154 | 7.20M (5.62M before) | 3.2 h | 141 extract, 358 kb-judge (290 before) |
+| life | 33 → 52 | 1.11M | 17.1 min | 168 extract, 11 kb-judge |
+
+- On the reports, agent-knode-wiki's false refusals went from 0.35 to 0.00 and its hallucinated share from 0.39 to 0.06.
+- The life pack's wiki stays thin. agent-knode-wiki refuses 26% there and loses 0.27. Within each run its gap to agent-grep
+  narrows from −0.61 to −0.27, though the two runs used different backends.
+
+**knode-ask gained on its answers, not its retrieval.**
+
+| knode-ask on the reports | same-backend 1× | phase 4 |
+| --- | --- | --- |
+| correctness | 0.39 | 0.63 |
+| hallucinated | 0.48 | 0.15 |
+| truthfulness | −0.27 | 0.33 |
+| document recall@5 | 0.24 | 0.23 |
+| MRR@10 | 0.47 | 0.56 |
+
+- Document recall@5 barely moved. Corpus-level gold spans many documents, so all@5 is 0.03 on the reports and 0.02 on life.
+- Across both packs, its weakest types are deep-hop (0.29) and aggregate (0.52).
+- It reads more per query (17.1k against 11.4k weighted tokens), because ask now carries ranked, sourced claims.
+- Its build breaks even with agent-grep after 534 queries on the reports and 64 on life.
+
+**Cost.**
+
+- The wiki agents still never break even with agent-grep.
+- agent-knode reads 19k more weighted tokens per query than agent-grep on the reports (20.6k more before).
+- Update batches cost 149–240k weighted tokens on the reports and 5–16k on life.
