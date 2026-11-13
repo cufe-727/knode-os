@@ -126,7 +126,7 @@ describe('entity pages', () => {
     expect(stats.regenerated).toBeGreaterThanOrEqual(1);
     expect(page('atlas-depot')).toContain('Atlas Depot has twelve loading bays');
     const [row] = await ctx.store.query<{ generator: string; status: string }>(`SELECT generator, status FROM pages WHERE path = 'wiki/entities/atlas-depot.md'`);
-    expect(row).toEqual({ generator: 'entity_stub@5', status: 'active' });
+    expect(row).toEqual({ generator: 'entity_stub@6', status: 'active' });
     // a page written before the entity it names had one links it once it is written again
     expect(page('harbor-freight-lines')).not.toContain('[[Atlas Depot]]');
     await ctx.store.query(`UPDATE pages SET generator = 'entity_stub@2' WHERE path = 'wiki/entities/harbor-freight-lines.md'`);

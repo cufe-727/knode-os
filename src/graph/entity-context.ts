@@ -126,13 +126,17 @@ async function mergeRenames(store: Store, stats: EntityContextStats, progress: (
  * duplicate audit's own cap does not hold it back), never merged on that alone.
  */
 async function suggestAliasMerges(store: Store, stats: EntityContextStats): Promise<void> {
-  const rows = await store.query<{ a: string; a_name: string; a_type: string; b: string; b_name: string; b_type: string; a_mentions: number; b_mentions: number; a_ev: number; b_ev: number; alias: string }>(
-    `SELECT ea.id AS a, ea.name AS a_name, ea.type AS a_type, eb.id AS b, eb.name AS b_name, eb.type AS b_type,
-            ea.mention_count AS a_mentions, eb.mention_count AS b_mentions, ea.evidence_count AS a_ev, eb.evidence_count AS b_ev, al.alias
-     FROM entities ea CROSS JOIN LATERAL jsonb_array_elements_text(ea.aliases) AS al(alias)
-     JOIN entities eb ON lower(eb.name) = lower(al.alias) AND eb.id <> ea.id AND eb.tx_to IS NULL AND eb.canonical_id IS NULL
-     WHERE ea.tx_to IS NULL AND ea.canonical_id IS NULL AND ea.type = eb.type AND ea.type NOT IN ('concept', 'other')
-       AND length(al.alias) >= 2`,
+  const rows = await store.query<{ a: string; a_name: string; a_type: string; b: string; b_name: string; b_type: string; alias: string }>(
+    // the aliases first, then the entities they name: joined the other way round, the planner
+    // paired every entity with every other of its type (20k organizations: 4.5 minutes)
+    `WITH al AS MATERIALIZED (
+       SELECT ea.id, ea.name, ea.type, lower(a.alias) AS alias
+       FROM entities ea CROSS JOIN LATERAL jsonb_array_elements_text(ea.aliases) AS a(alias)
+       WHERE ea.tx_to IS NULL AND ea.canonical_id IS NULL AND ea.type NOT IN ('concept', 'other') AND length(a.alias) >= 2
+     )
+     SELECT al.id AS a, al.name AS a_name, al.type AS a_type, eb.id AS b, eb.name AS b_name, eb.type AS b_type, al.alias
+     FROM al JOIN entities eb ON lower(eb.name) = al.alias
+     WHERE eb.id <> al.id AND eb.tx_to IS NULL AND eb.canonical_id IS NULL AND eb.type = al.type`,
   );
   for (const r of rows) {
     const id = mergeSuggestionId(r.a, r.b);
