@@ -1,5 +1,6 @@
-import type { GoldItem, ListSpec, Task } from '../types.js';
-import { CORPUS_TASK_MIN_DOCS, DEEP_HOP_MIN } from '../types.js';
+import type { GoldAlias, GoldItem, ListSpec, Task } from '../types.js';
+import { CORPUS_TASK_MIN_DOCS, DEEP_HOP_MIN, STRUCTURED_MIN_DOCS } from '../types.js';
+import { crossLingualOf, exactSetSpec, paraphraseOf } from './separation.js';
 
 /**
  * The ledger of a synthetic life (docs/design/23 §2.1): what the person does
@@ -93,7 +94,7 @@ export interface UpdateBatch {
   date: string;
   docs: UpdateDoc[];
   /** Questions about the latest state once this batch (and every one before it) is applied. */
-  tasks: { id: string; question: string; answer: string; doc: string; quote?: string; short?: boolean }[];
+  tasks: { id: string; question: string; answer: string; doc: string; quote?: string; short?: boolean; stale?: string[] }[];
 }
 
 export interface LedgerContext {
@@ -411,16 +412,16 @@ export function laterUpdates(c: LedgerContext, x: Extras, dates: UpdateDates, st
       batch: '02', date: b2,
       docs: [{ path: raceDoc, text: zh ? `# 邮件：${k.race}改期通知\n\n各位跑者：因场地调整，${k.race}改期到${fmt(raceDay2)}举行，报名信息保留。\n` : `# Email: ${k.race} rescheduled\n\nDear runners: because of a venue change, ${k.race} is rescheduled to ${fmt(raceDay2)}. Your registration stands.\n` }],
       tasks: [
-        { id: 'upd-race-date', question: zh ? `${k.race}现在定在哪天举行？` : `On what date is ${k.race} now held?`, answer: fmt(raceDay2), doc: raceDoc, quote: zh ? `改期到${fmt(raceDay2)}` : `rescheduled to ${fmt(raceDay2)}`, short: true },
-        { id: 'upd-start-02', question: startAgain, answer: startAnswer, doc: startDoc, short: true },
+        { id: 'upd-race-date', question: zh ? `${k.race}现在定在哪天举行？` : `On what date is ${k.race} now held?`, answer: fmt(raceDay2), doc: raceDoc, quote: zh ? `改期到${fmt(raceDay2)}` : `rescheduled to ${fmt(raceDay2)}`, short: true, stale: [fmt(dates.raceDay)] },
+        { id: 'upd-start-02', question: startAgain, answer: startAnswer, doc: startDoc, short: true, stale: [fmt(dates.startJob)] },
       ],
     },
     {
       batch: '03', date: b3,
       docs: [{ path: followDoc, text: zh ? `# 微信 · ${me} 与 ${k.sibling.name}\n\n${k.sibling.name}：医院来电话，妈妈的复查改到${fmt(follow2)}了。还有，医生把她的药换成了${x.med2}。\n${me}：好，那天我请假回去。\n` : `# Text · ${me} and ${k.sibling.name}\n\n${k.sibling.name}: The hospital called — Mom's follow-up is moved to ${fmt(follow2)}. And the doctor switched her to ${x.med2}.\n${me}: OK, I'll take the day off.\n` }],
       tasks: [
-        { id: 'upd-follow', question: zh ? `${me}妈妈的复查现在约在哪天？` : `When is ${me}'s mother's follow-up now?`, answer: fmt(follow2), doc: followDoc, quote: zh ? `复查改到${fmt(follow2)}` : `moved to ${fmt(follow2)}`, short: true },
-        { id: 'upd-med', question: zh ? `${me}妈妈现在吃的是哪种降压药？` : `Which blood-pressure drug does ${me}'s mother take now?`, answer: x.med2, doc: followDoc, quote: x.med2, short: true },
+        { id: 'upd-follow', question: zh ? `${me}妈妈的复查现在约在哪天？` : `When is ${me}'s mother's follow-up now?`, answer: fmt(follow2), doc: followDoc, quote: zh ? `复查改到${fmt(follow2)}` : `moved to ${fmt(follow2)}`, short: true, stale: [fmt(dates.follow)] },
+        { id: 'upd-med', question: zh ? `${me}妈妈现在吃的是哪种降压药？` : `Which blood-pressure drug does ${me}'s mother take now?`, answer: x.med2, doc: followDoc, quote: x.med2, short: true, stale: [x.med1] },
       ],
     },
     {
@@ -431,9 +432,9 @@ export function laterUpdates(c: LedgerContext, x: Extras, dates: UpdateDates, st
       ],
       tasks: [
         { id: 'upd-race-event', question: zh ? `${me}最后报的是比赛的哪个项目？` : `Which event did ${me} end up entering?`, answer: x.half, doc: halfDoc, quote: zh ? `改报了${x.half}` : `switched to ${x.half}`, short: true },
-        { id: 'upd-race-date-04', question: zh ? `${k.race}在哪天举行？` : `On what date is ${k.race} held?`, answer: fmt(raceDay2), doc: raceDoc, short: true },
+        { id: 'upd-race-date-04', question: zh ? `${k.race}在哪天举行？` : `On what date is ${k.race} held?`, answer: fmt(raceDay2), doc: raceDoc, short: true, stale: [fmt(dates.raceDay)] },
         { id: 'upd-lead', question: zh ? `${me}现在在团队里负责什么？` : `What does ${me} lead in the team now?`, answer: zh ? `负责${k.tech}` : `leads ${k.tech}`, doc: leadDoc },
-        { id: 'upd-start-04', question: startAgain, answer: startAnswer, doc: startDoc, short: true },
+        { id: 'upd-start-04', question: startAgain, answer: startAnswer, doc: startDoc, short: true, stale: [fmt(dates.startJob)] },
       ],
     },
   ];
@@ -525,6 +526,33 @@ export function ledgerTasks(script: LedgerScript, docOf: Map<string, string>, qu
   if (weekly.every(({ of }) => of.every((e) => docOf.has(e.id)))) {
     list('t-weekly-km', 'timeline', zh ? `${me}每周的总跑量是多少公里？按周列出（注明那一周的日期）。` : `What was ${me}'s total running distance each week? List the weeks in order, with a date in each week.`,
       runs, weekly.map(({ total, monday, of }) => ({ label: zh ? `${total}公里` : `${total} km`, aliases: [`${total}km`], weight: 1, date: monday.slice(0, 10), docs: of.map((e) => docOf.get(e.id)!) })), { ordered: true }, kmTerms);
+  }
+
+  // structured queries (docs/design/28 §c): group and sum over every run, the whole set or nothing
+  const monthForms = (m: number) => (zh ? [`${m}月`] : [MONTHS_EN[m], MONTHS_EN[m].slice(0, 3)]);
+  const structured = (id: string, question: string, events: ScriptEvent[], items: GoldItem[]) => {
+    if (!ready(id, events)) return;
+    if (new Set(events.map((e) => docOf.get(e.id))).size < STRUCTURED_MIN_DOCS) {
+      skipped.push(`${id}: evidence in fewer than ${STRUCTURED_MIN_DOCS} documents`);
+      return;
+    }
+    tasks.push({ id, suite: 'usage', type: 'structured', lang, question, scoring: 'set', items, list: exactSetSpec(items.length), closedWorld: { terms: [...castTerms, ...kmTerms], prefixes: [] }, evidence: evidence(events), meta: { family: 'structured' } });
+  };
+  const runMonths = [...new Set(runs.map(month))];
+  structured('sq-km-month', zh ? `${me}每个月的跑步总里程分别是多少公里？按月列出。` : `What was ${me}'s total running distance in each month? List every month.`, runs,
+    runMonths.map((m) => {
+      const of = runs.filter((e) => month(e) === m);
+      const total = of.reduce((sum, e) => sum + (e.value ?? 0), 0);
+      return { label: zh ? `${m}月：${total}公里` : `${MONTHS_EN[m]}: ${total} km`, aliases: [], weight: 1, docs: of.map((e) => docOf.get(e.id)!).filter(Boolean), fields: [monthForms(m), [String(total)]] };
+    }));
+  const alone = runs.filter((e) => !e.together);
+  structured('sq-runs-company', zh ? `${me}的跑步里，和${k.runner.name}一起跑的有几次、自己一个人跑的有几次？` : `Of ${me}'s runs, how many were with ${k.runner.name} and how many alone?`, runs, [
+    { label: zh ? `和${k.runner.name}一起：${together.length}次` : `with ${k.runner.name}: ${together.length}`, aliases: [], weight: 1, fields: [[personKey(k, 'runner', lang).label, ...personKey(k, 'runner', lang).aliases, zh ? '一起' : 'together'], [String(together.length)]] },
+    { label: zh ? `一个人：${alone.length}次` : `alone: ${alone.length}`, aliases: [], weight: 1, fields: [zh ? ['一个人', '独自', '自己'] : ['alone', 'solo', 'by herself', 'by himself', 'on their own'], [String(alone.length)]] },
+  ]);
+  if (ready('sq-km-total', runs) && new Set(runs.map((e) => docOf.get(e.id))).size >= STRUCTURED_MIN_DOCS) {
+    tasks.push({ id: 'sq-km-total', suite: 'usage', type: 'structured', lang, scoring: 'count', answer: String(runs.reduce((sum, e) => sum + (e.value ?? 0), 0)),
+      question: zh ? `这段时间${me}所有跑步加起来一共跑了多少公里？` : `How many kilometres did ${me} run in total over this period, all runs together?`, closedWorld: { terms: [...castTerms, ...kmTerms], prefixes: [] }, evidence: evidence(runs), meta: { family: 'structured', aggregate: 'sum' } });
   }
 
   // blood pressure
@@ -644,7 +672,38 @@ export function ledgerTasks(script: LedgerScript, docOf: Map<string, string>, qu
     }
     tasks.push({ id: `h-${chain}`, suite: 'usage', type: 'deep-hop', lang, question: q, answer: a, scoring: 'judge', evidence: hops.map(ev), meta: { hops: hops.length, bridges: hops.slice(0, -1).map((e) => e.phrase) }, primary: true });
   }
+
+  // the same counts in other words, and in the other language (docs/design/28 §f): gold unchanged
+  const other: Lang = zh ? 'en' : 'zh';
+  const variants: Record<string, [string, string]> = zh ? {
+    'n-trips': [`这三个月${me}一共回过几趟${k.hometown}？`, `How many trips home to ${k.hometown} did ${me} make over these three months?`],
+    'n-purchases': [`${me}这段时间有几笔单价超过${threshold}的消费？`, `How many purchases above ${threshold} did ${me} make?`],
+    'n-runs-runner': [`${me}跟${k.runner.name}结伴跑步一共几回？`, `How many times did ${me} go running with ${k.runner.name}?`],
+    'n-meals-friend': [`${me}和${k.friend.name}一起下馆子总共几次？`, `How many meals out did ${me} have with ${k.friend.name}?`],
+  } : {
+    'n-trips': [`Over these three months, how many trips home to ${k.hometown} did ${me} make in all?`, `这三个月里${me}回了几次${k.hometown}？`],
+    'n-purchases': [`How many separate purchases above ${threshold} did ${me} make?`, `${me}买了几件超过${threshold}的东西？`],
+    'n-runs-runner': [`How many runs did ${me} share with ${k.runner.name}?`, `${me}和${k.runner.name}一起跑过几次步？`],
+    'n-meals-friend': [`How often did ${me} and ${k.friend.name} eat out together?`, `${me}和${k.friend.name}一起在外面吃过几次饭？`],
+  };
+  for (const [id, [pp, xl]] of Object.entries(variants)) {
+    const b = tasks.find((t) => t.id === id);
+    if (!b) continue;
+    tasks.push(paraphraseOf(b, pp), crossLingualOf(b, xl, other));
+  }
   return { tasks, skipped };
+}
+
+/** Gold alias clusters of the cast: every way the sources name each person, and the new company. */
+export function ledgerAliases(k: Cast, lang: Lang): GoldAlias[] {
+  const roles: Role[] = ['mother', 'sibling', 'friend', 'runner', 'manager', 'partner'];
+  const out: GoldAlias[] = roles.map((role) => {
+    const key = personKey(k, role, lang);
+    return { canonical: key.label, aliases: [key.label, ...key.aliases], kind: 'person', context: [role] };
+  });
+  out.push({ canonical: k.me.name, aliases: [k.me.name], kind: 'person', context: ['me'] });
+  out.push({ canonical: k.newCo, aliases: [k.newCo, k.newCoShort], kind: 'organization' });
+  return out;
 }
 
 /* --------------------------- closed-world checks --------------------------- */
@@ -676,6 +735,6 @@ export function seriesViolations(lang: Lang, text: string, planted: ScriptEvent[
 
 /** Tasks that rest on a series: dropped when a document breaks it. */
 export const SERIES_TASKS: Record<'run' | 'bp', RegExp> = {
-  run: /^(l-runs|n-runs|t-long-runs|t-weekly-km|p-runner)/,
+  run: /^(l-runs|n-runs|t-long-runs|t-weekly-km|p-runner|sq-km|sq-runs)/,
   bp: /^(t-bp|l-bp|n-bp|p-mother)/,
 };

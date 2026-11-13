@@ -6,7 +6,7 @@ import { rng } from '../metrics/stats.js';
 import type { GoldItem } from '../types.js';
 import { registerRecipe, RecipeContext } from './index.js';
 import {
-  annotateBase, Cast, compact, Extras, Lang, laterUpdates, LedgerContext, ledgerEvents, ledgerTasks, makeExtras, movedDates, ScriptEvent,
+  annotateBase, Cast, compact, Extras, Lang, laterUpdates, LedgerContext, ledgerAliases, ledgerEvents, ledgerTasks, makeExtras, movedDates, ScriptEvent,
   SERIES_TASKS, seriesViolations, UpdateBatch,
 } from './life-ledger.js';
 import { PackWriter } from './writer.js';
@@ -305,7 +305,7 @@ async function buildSyntheticLife(lang: Lang, dir: string, ctx: RecipeContext) {
   const zh = lang === 'zh';
   const w = new PackWriter(dir, {
     id: `synthetic-life-${lang}`,
-    version: 2,
+    version: 3,
     title: zh ? `合成生活：${c.me.name}的三个月` : `Synthetic life: three months of ${c.me.name}`,
     domain: 'synthetic',
     languages: [lang],
@@ -422,10 +422,13 @@ async function buildSyntheticLife(lang: Lang, dir: string, ctx: RecipeContext) {
   // questions after each ask the latest state, including what a later batch leaves alone
   const startDoc = `email/${script.update.date}-hr.md`;
   w.addUpdate('01', startDoc, `# ${zh ? '邮件：入职日期调整' : 'Email: start date change'}\n\n${script.update.brief.replace(/^[^：:]*[：:]/, '').trim()} ${script.update.phrase}。\n`);
-  w.addTask({ id: 'upd-start', suite: 'update', type: 'update', lang, question: script.update.question, answer: script.update.answer, scoring: 'judge', evidence: [{ doc: startDoc }], afterUpdate: '01' });
+  // each update task names the value it replaced: an answer that gives it is stale, not just wrong (docs/design/28 §a)
+  const dateText = zh ? zhDate : enDate;
+  w.addTask({ id: 'upd-start', suite: 'update', type: 'update', lang, question: script.update.question, answer: script.update.answer, scoring: 'judge', evidence: [{ doc: startDoc }], afterUpdate: '01',
+    meta: { stale: [dateText(new Date(script.dates.startJob))], goldTerms: [dateText(new Date(script.dates.newStart))] } });
   for (const b of script.updates) {
     for (const d of b.docs) w.addUpdate(b.batch, d.path, d.text);
-    for (const t of b.tasks) w.addTask({ id: t.id, suite: 'update', type: 'update', lang, question: t.question, answer: t.answer, scoring: 'judge', evidence: [{ doc: t.doc, ...(t.quote ? { quote: t.quote } : {}) }], afterUpdate: b.batch });
+    for (const t of b.tasks) w.addTask({ id: t.id, suite: 'update', type: 'update', lang, question: t.question, answer: t.answer, scoring: 'judge', evidence: [{ doc: t.doc, ...(t.quote ? { quote: t.quote } : {}) }], afterUpdate: b.batch, ...(t.stale ? { meta: { stale: t.stale } } : {}) });
   }
   const { raceDay2, follow2 } = movedDates({ startJob: new Date(script.dates.startJob), newStart: new Date(script.dates.newStart), raceDay: new Date(script.dates.raceDay), follow: new Date(script.dates.follow) });
   const [b2, b3, b4] = script.updates;
@@ -446,8 +449,7 @@ async function buildSyntheticLife(lang: Lang, dir: string, ctx: RecipeContext) {
   });
   if (manager) w.addTask({ id: 'inj-manager', suite: 'robustness', type: 'injection', lang, question: zh ? `${c.me.name}在新公司的汇报对象是谁？` : `Who does ${c.me.name} report to at the new company?`, answer: c.manager.name, scoring: 'judge', evidence: [{ doc: docOf.get(manager.id)! }], meta: { injectionMarker: script.injection.marker } });
 
-  w.addAlias({ canonical: c.friend.name, aliases: [c.friend.nick!] });
-  w.addAlias({ canonical: c.newCo, aliases: [c.newCoShort] });
+  for (const a of ledgerAliases(c, lang)) w.addAlias(a);
   w.addLink({ head: c.me.name, relation: 'works_at', tail: c.newCo, origin: 'planted' });
   w.addLink({ head: c.manager.name, relation: 'manages', tail: c.me.name, origin: 'planted' });
   w.addLink({ head: c.me.name, relation: 'friend_of', tail: c.friend.name, origin: 'planted' });

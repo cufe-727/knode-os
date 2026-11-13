@@ -19,7 +19,7 @@ import { fileLines, recordKey, RunMeta, RunStore } from './runstore.js';
 import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
 import { scoreLists } from './score/lists.js';
-import { scoreUsage } from './score/usage.js';
+import { scoreKey, scoreUsage } from './score/usage.js';
 import { ChatBackend, ClientBackend, CodexBackend, startShim } from './shim.js';
 import { closeAdapters } from './systems/external.js';
 import { makeSystems } from './systems/index.js';
@@ -496,7 +496,7 @@ export async function scoreAnswers(
 ): Promise<number> {
   const answers = store.allAnswers().filter((a) => {
     if (!ctx.tasks.has(`${a.pack}|${a.taskId}`)) return false;
-    const scored = store.score(recordKey('score', a.pack, a.system, a.taskId, 'latency_ms'));
+    const scored = store.score(scoreKey(a, 'latency_ms'));
     return !scored || scored.at < a.at;
   });
   if (!answers.length) return 0;

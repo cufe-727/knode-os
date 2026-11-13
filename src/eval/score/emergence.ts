@@ -2,7 +2,7 @@ import type { Judge } from '../judge.js';
 import { termMatches } from '../metrics/stylometry.js';
 import { normalizeAnswer } from '../metrics/text.js';
 import { parseStructured } from '../prompts.js';
-import { recordKey } from '../runstore.js';
+import { judgeItemKey, repeatOf, scoreKey } from './keys.js';
 import type { AnswerRecord, GoldItem, ScoreRecord, Task } from '../types.js';
 
 /**
@@ -26,7 +26,7 @@ export async function scoreEmergence(input: EmergenceInput, judge: Judge): Promi
   const at = new Date().toISOString();
   const out: ScoreRecord[] = [];
   const put = (a: AnswerRecord, t: Task, metric: string, value: number | null, detail?: Record<string, unknown>) =>
-    out.push({ key: recordKey('score', a.pack, a.system, t.id, metric), pack: a.pack, system: a.system, suite: t.suite, taskId: t.id, taskType: t.type, metric, value, at, ...(detail ? { detail } : {}) });
+    out.push({ key: scoreKey(a, metric), pack: a.pack, system: a.system, suite: t.suite, taskId: t.id, taskType: t.type, metric, value, at, ...(repeatOf(a) !== undefined ? { repeat: repeatOf(a) } : {}), ...(detail ? { detail } : {}) });
 
   const toJudge: { id: string; predicted: string[]; gold: string[]; a: AnswerRecord; t: Task; items: ReturnType<typeof parseStructured>['items'] }[] = [];
   for (const a of input.answers) {
@@ -51,7 +51,7 @@ export async function scoreEmergence(input: EmergenceInput, judge: Judge): Promi
       scoreTerms(a, t, items.map((i) => i.label), put);
       continue;
     }
-    toJudge.push({ id: recordKey('match', a.pack, a.system, t.id), predicted: items.map((i) => i.label), gold: t.items.map((g) => [g.label, ...g.aliases].join(' / ')), a, t, items });
+    toJudge.push({ id: judgeItemKey('match', a), predicted: items.map((i) => i.label), gold: t.items.map((g) => [g.label, ...g.aliases].join(' / ')), a, t, items });
   }
 
   const verdicts = await judge.matchItems(toJudge.map(({ id, predicted, gold }) => ({ id, predicted, gold })));

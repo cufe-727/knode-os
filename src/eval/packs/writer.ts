@@ -11,6 +11,7 @@ import { CorpusDoc, GoldAlias, GoldFact, GoldLink, PackManifest, SourceRecord, T
  */
 export class PackWriter {
   private docs: CorpusDoc[] = [];
+  private docPaths = new Set<string>();
   private padding: CorpusDoc[] = [];
   private paddingChars = 0;
   private facts: GoldFact[] = [];
@@ -35,11 +36,12 @@ export class PackWriter {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, text);
     this.docs.push(doc);
+    this.docPaths.add(doc.path);
     this.chars += text.length;
   }
 
   hasDoc(p: string): boolean {
-    return this.docs.some((d) => d.path === p);
+    return this.docPaths.has(p);
   }
 
   addFact(f: Omit<GoldFact, 'entities'> & { entities?: string[] }): void {

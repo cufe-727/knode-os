@@ -1,9 +1,9 @@
 import type { Judge } from '../judge.js';
 import { hasCjk, normalizeAnswer } from '../metrics/text.js';
 import { parseStructured } from '../prompts.js';
-import { recordKey } from '../runstore.js';
 import type { AnswerRecord, GoldItem, ListSpec, ScoreRecord, Task } from '../types.js';
 import { ListSpecSchema } from '../types.js';
+import { judgeItemKey, repeatOf, scoreKey } from './keys.js';
 
 /**
  * Scoring corpus-level lists (docs/design/23 §4): an aggregate, a timeline,
@@ -13,7 +13,11 @@ import { ListSpecSchema } from '../types.js';
  * documents an item cites), by the judge otherwise. A timeline is also scored
  * on order and dates; a contradiction match needs one of the documents that
  * take that side. The task's correctness is set F1 (recall where the gold is
- * a sample), times order accuracy for a timeline.
+ * a sample), times order accuracy for a timeline. A structured query
+ * (docs/design/28) matches by fields — every field of the gold item (a team,
+ * a quarter, a count) named in one predicted label — and is right only when
+ * the whole set is. A look-alike task names its distractors: the share of
+ * predicted items that are the look-alike's is `distractor_rate`.
  */
 
 const CJK_CLASS = '㐀-䶿一-鿿぀-ヿ가-힯';
@@ -57,6 +61,22 @@ export function matchByAlias(predicted: string[], gold: GoldItem[]): [number, nu
     if (pi < 0) continue;
     usedP.add(pi);
     usedG.add(gi);
+    out.push([pi, gi]);
+  }
+  return out.sort((a, b) => a[0] - b[0]);
+}
+
+/** Pairs [predicted, gold] where the predicted label names every field of the gold item (one term of each group), each used once. */
+export function matchByFields(predicted: string[], gold: GoldItem[]): [number, number][] {
+  const usedP = new Set<number>();
+  const out: [number, number][] = [];
+  // the most specific items first, so a looser one does not take their label
+  const order = gold.map((g, gi) => ({ g, gi })).sort((a, b) => (b.g.fields?.length ?? 0) - (a.g.fields?.length ?? 0));
+  for (const { g, gi } of order) {
+    if (!g.fields?.length) continue;
+    const pi = predicted.findIndex((p, i) => !usedP.has(i) && g.fields!.every((group) => group.some((term) => containsTerm(p, term))));
+    if (pi < 0) continue;
+    usedP.add(pi);
     out.push([pi, gi]);
   }
   return out.sort((a, b) => a[0] - b[0]);
@@ -161,7 +181,7 @@ export async function scoreLists(input: ListInput, judge: Judge): Promise<ScoreR
   const at = new Date().toISOString();
   const out: ScoreRecord[] = [];
   const put: Put = (a, t, metric, value, detail) =>
-    out.push({ key: recordKey('score', a.pack, a.system, t.id, metric), pack: a.pack, system: a.system, suite: t.suite, taskId: t.id, taskType: t.type, metric, value, at, ...(detail ? { detail } : {}) });
+    out.push({ key: scoreKey(a, metric), pack: a.pack, system: a.system, suite: t.suite, taskId: t.id, taskType: t.type, metric, value, at, ...(repeatOf(a) !== undefined ? { repeat: repeatOf(a) } : {}), ...(detail ? { detail } : {}) });
 
   const toJudge: { id: string; a: AnswerRecord; t: Task; items: ReturnType<typeof parseStructured>['items'] }[] = [];
   for (const a of input.answers) {
@@ -171,13 +191,14 @@ export async function scoreLists(input: ListInput, judge: Judge): Promise<ScoreR
     const items = parseStructured(a.text).items.slice(0, spec.maxItems);
     put(a, t, 'items_returned', items.length);
     if (spec.match === 'judge' && items.length) {
-      toJudge.push({ id: recordKey('list', a.pack, a.system, t.id), a, t, items });
+      toJudge.push({ id: judgeItemKey('list', a), a, t, items });
       continue;
     }
     const docs = input.corpusDocs.get(a.pack) ?? new Set<string>();
     const pairs = !items.length ? [] : spec.match === 'docs'
       ? matchByDocs(items.map((i) => i.evidence), t.items, docs)
-      : matchByAlias(items.map((i) => i.label), t.items);
+      : spec.match === 'fields' ? matchByFields(items.map((i) => i.label), t.items)
+        : matchByAlias(items.map((i) => i.label), t.items);
     listScores(a, t, spec, pairs, items, docs, put);
   }
 
@@ -216,7 +237,8 @@ export function listScores(
   put(a, t, 'set_precision', precision);
   put(a, t, 'set_recall', recall, { matched: pairs.map(([p, g]) => [items[p].label, gold[g].label]) });
   put(a, t, 'set_f1', f1);
-  let correctness = spec.primary === 'recall' ? recall : f1;
+  // exact: the whole set, nothing missing and nothing extra
+  let correctness = spec.primary === 'recall' ? recall : spec.primary === 'exact' ? (pairs.length === gold.length && items.length === gold.length ? 1 : 0) : f1;
   if (spec.ordered) {
     const order = orderAccuracy(pairs, gold);
     put(a, t, 'order_accuracy', order);
@@ -228,7 +250,19 @@ export function listScores(
   if (attributed.length) {
     put(a, t, 'attribution_recall', attributed.reduce((s, [p, g]) => s + gold[g].docs!.filter((d) => cited(p).has(d)).length / gold[g].docs!.length, 0) / attributed.length);
   }
-  put(a, t, 'correctness', correctness, { metric: spec.primary === 'recall' ? 'set_recall' : 'set_f1', ...(spec.ordered ? { times: 'order_accuracy' } : {}) });
+  put(a, t, 'correctness', correctness, { metric: spec.primary === 'recall' ? 'set_recall' : spec.primary === 'exact' ? 'exact_set' : 'set_f1', ...(spec.ordered ? { times: 'order_accuracy' } : {}) });
+  // a look-alike's items given for the asked entity's
+  const distractors = Array.isArray(t.meta?.distractors) ? (t.meta!.distractors as unknown[]).map(String) : [];
+  if (distractors.length) {
+    const took = items.filter((it, i) => !pairs.some(([p]) => p === i) && distractors.some((d) => containsTerm(it.label, d))).length;
+    put(a, t, 'distractor_rate', items.length ? took / items.length : 0);
+    put(a, t, 'stale_answer', took > 0 ? 1 : 0);
+  }
+  // wrong, and said with confidence (no confidence given counts as confident)
+  if (items.length) {
+    const stated = items.map((it) => it.confidence ?? 1);
+    put(a, t, 'confident_wrong', correctness < 0.5 && stated.reduce((x, y) => x + y, 0) / stated.length >= 0.7 ? 1 : 0);
+  }
   const conf = items.map((it, i) => (it.confidence === null ? null : (it.confidence - (pairs.some(([p]) => p === i) ? 1 : 0)) ** 2)).filter((x): x is number => x !== null);
   if (conf.length) put(a, t, 'brier', conf.reduce((s, x) => s + x, 0) / conf.length);
 }

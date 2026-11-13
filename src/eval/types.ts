@@ -22,6 +22,19 @@ export const TASK_TYPES = [
   'deep-hop',
   // a name that means two things (two people, a renamed project, a redefined metric): the answer must say so
   'ambiguous',
+  // benchmark separation (docs/design/28):
+  // a value a later document corrected or retracted without repeating the entity's name: current or as-of value
+  'stale',
+  // namesakes, near-identical names and renames: the question names one real entity, the corpus holds look-alikes
+  'lookalike',
+  // filter + aggregate + group-by over more than STRUCTURED_MIN_DOCS documents, exact gold
+  'structured',
+  // a 3–4 hop chain whose question shares no words with the bridges' evidence
+  'nonlexical-hop',
+  // a planted connection between entities whose documents share no words for it
+  'connection',
+  // an existing question asked in other words (cross-lingual covers another language)
+  'paraphrase',
 ] as const;
 export type TaskType = (typeof TASK_TYPES)[number];
 
@@ -31,6 +44,10 @@ export const CORPUS_TASK_TYPES: readonly TaskType[] = ['aggregate', 'timeline', 
 export const CORPUS_TASK_MIN_DOCS = 5;
 /** The fewest hops (and distinct evidence documents) of a deep-hop task. */
 export const DEEP_HOP_MIN = 3;
+/** A structured query's evidence spans more than this many documents (docs/design/28 §c). */
+export const STRUCTURED_MIN_DOCS = 21;
+/** Task types of the separation families (docs/design/28), reported family by family. */
+export const SEPARATION_TASK_TYPES: readonly TaskType[] = ['stale', 'lookalike', 'structured', 'nonlexical-hop', 'connection', 'paraphrase', 'cross-lingual'];
 
 /**
  * How a task is scored:
@@ -42,8 +59,10 @@ export const DEEP_HOP_MIN = 3;
  * - label      one categorical label (an emotion, a valence) compared without a model
  * - choice     one of `choices` (authorship attribution), compared without a model
  * - abstain    the right answer is to say the sources do not tell
+ * - value      model-free: the `Final answer:` line names `answer` (or one of `answers`) as a whole
+ *              term and none of the stale values in `meta.stale` (numbers within `meta.tolerance`)
  */
-export const SCORINGS = ['judge', 'exact', 'count', 'keypoints', 'set', 'label', 'choice', 'abstain'] as const;
+export const SCORINGS = ['judge', 'exact', 'count', 'keypoints', 'set', 'label', 'choice', 'abstain', 'value'] as const;
 export type Scoring = (typeof SCORINGS)[number];
 
 export const DOMAINS = ['research', 'medicine', 'law', 'finance', 'literature', 'personal', 'synthetic', 'public', 'fixture'] as const;
@@ -113,7 +132,17 @@ export const GoldLinkSchema = z.object({
 });
 export type GoldLink = z.infer<typeof GoldLinkSchema>;
 
-export const GoldAliasSchema = z.object({ canonical: z.string(), aliases: z.array(z.string()).min(1) });
+/**
+ * One real entity and every name the sources give it. Namesakes share a name:
+ * their clusters carry `context` (a team, a role) that tells them apart, and
+ * `kind` says what the entity is (person, project, customer, item).
+ */
+export const GoldAliasSchema = z.object({
+  canonical: z.string(),
+  aliases: z.array(z.string()).min(1),
+  kind: z.string().optional(),
+  context: z.array(z.string()).optional(),
+});
 export type GoldAlias = z.infer<typeof GoldAliasSchema>;
 
 /** One expected item of a set-scored task: a theme, a need, a characteristic word, a listed fact or event. */
@@ -126,6 +155,11 @@ export const GoldItemSchema = z.object({
   date: z.string().optional(),
   /** Corpus (or update) documents that state the item. */
   docs: z.array(z.string()).optional(),
+  /**
+   * Structured matching (`list.match` fields): every group must have one of
+   * its terms in the predicted label — a team, a quarter and a count, say.
+   */
+  fields: z.array(z.array(z.string()).min(1)).optional(),
 });
 export type GoldItem = z.infer<typeof GoldItemSchema>;
 
@@ -139,14 +173,17 @@ export type GoldItem = z.infer<typeof GoldItemSchema>;
  * - requireDocs a match also needs one of the gold item's documents among the predicted
  *              item's evidence ("which sources disagree" is part of the answer)
  * - primary    which set metric is the task's correctness: f1, or recall where the gold
- *              is not exhaustive (a profile drafted from sampled statements)
+ *              is not exhaustive (a profile drafted from sampled statements), or exact
+ *              (structured queries: the whole set or nothing)
+ * - fields     (match) every item's `fields` groups must each have a term in the predicted label
  */
 export const ListSpecSchema = z.object({
-  match: z.enum(['judge', 'alias', 'docs']).default('judge'),
+  match: z.enum(['judge', 'alias', 'docs', 'fields']).default('judge'),
   ordered: z.boolean().default(false),
   maxItems: z.number().int().positive().max(60).default(10),
   requireDocs: z.boolean().default(false),
-  primary: z.enum(['f1', 'recall']).default('f1'),
+  /** exact: correctness is 1 only when the predicted set equals the gold set (structured queries). */
+  primary: z.enum(['f1', 'recall', 'exact']).default('f1'),
 });
 export type ListSpec = z.infer<typeof ListSpecSchema>;
 
@@ -257,6 +294,8 @@ export interface AnswerRecord extends Answer {
   taskId: string;
   /** The update batch applied (cumulatively) before this answer, for update tasks. */
   batch?: string;
+  /** `eval run --repeat`: which repeated answer this is (absent or 0: the first). */
+  repeat?: number;
   at: string;
 }
 
@@ -292,6 +331,8 @@ export interface ScoreRecord {
   n?: number;
   ci?: [number, number];
   detail?: Record<string, unknown>;
+  /** The answer's repeat index, when the run repeats answers (absent: the first). */
+  repeat?: number;
   at: string;
 }
 
