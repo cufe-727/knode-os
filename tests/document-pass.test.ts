@@ -44,10 +44,13 @@ function answer(request: ChatRequest): string {
   if (system.includes('denote the same real-world thing')) {
     return JSON.stringify({ same: true, confidence: 0.97, reason: '同一家公司的简称与全称' });
   }
-  const extracted = (name: string) => JSON.stringify({ entities: [{ name, type: 'organization', description: '动力电池厂商', aliases: [] }], relations: [], claims: [] });
-  if (user.includes('(raw/docs/a.md)')) return extracted('宁德时代新能源科技股份有限公司');
-  if (user.includes('(raw/docs/b.md)')) return extracted('宁德时代');
-  return JSON.stringify({ entities: [], relations: [], claims: [] });
+  const extracted = (name: string) => ({ entities: [{ name, type: 'organization', description: '动力电池厂商', aliases: [] }], relations: [], claims: [] });
+  const of = (text: string) =>
+    text.includes('(raw/docs/a.md)') ? extracted('宁德时代新能源科技股份有限公司') : text.includes('(raw/docs/b.md)') ? extracted('宁德时代') : { entities: [], relations: [], claims: [] };
+  // short documents go several to a call (docs/design/29 §6), each under its own header
+  const batch = user.split(/^(?==== Document \d+: )/m).filter((part) => part.startsWith('=== Document'));
+  if (batch.length > 0) return JSON.stringify({ documents: batch.map((part, i) => ({ doc: i + 1, ...of(part.split('\n')[0]) })) });
+  return JSON.stringify(of(user));
 }
 
 const kindOf = (request: ChatRequest) => {
@@ -122,7 +125,8 @@ describe('the background document pass', () => {
     expect(pass.summaries.find((p) => p !== 'wiki/sources/季度报告.md')).toMatch(/^wiki\/sources\/季度报告-[0-9a-f]{6}\.md$/);
 
     const kinds = fake.calls.slice(before).map(kindOf);
-    expect(kinds.filter((k) => k === 'extract')).toHaveLength(2);
+    // the two one-line documents are read in one batched call
+    expect(kinds.filter((k) => k === 'extract')).toHaveLength(1);
     expect(kinds.filter((k) => k === 'judge')).toHaveLength(1);
     expect(kinds.filter((k) => k === 'summary')).toHaveLength(2);
     // resolve runs on what extraction wrote, summaries come last

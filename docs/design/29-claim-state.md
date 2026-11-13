@@ -153,7 +153,9 @@ Run by refine before the duplicate audit (`resolveEntityContext`), deterministic
   instruction block for a 1,200-character report went from 7,621 to 6,166 characters while asking for more.
 - **Batching.** Up to 8 single-segment documents under 4,000 characters go in one call (`buildBatchExtractRequest`),
   each under its own header and date, answered as `{"documents":[{"doc":1,…}]}`; each keeps its own sidecar result, a
-  document that failed before is retried alone, and a plugin that shapes requests still sees one document a request.
+  document the reply leaves out (or every document, when the call fails or the model answers one document only) is
+  read on its own in the same pass, a document that failed before is retried alone, and a plugin that shapes requests
+  still sees one document a request.
   Reimplemented from the unmerged `claude/knowledge-base-optimization-a84c37` (3b5f536). On the fixture's 21 short
   reports: 3 calls instead of 21, and under a fifth of the characters (the test asserts < 20%). With a CLI model's
   ~14k-token preamble per call, the preamble alone falls by 7× on such a pack.

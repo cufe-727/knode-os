@@ -546,6 +546,13 @@ export async function finishPlan(store: Store, plan: DocPlan, fallbackModel: str
   return { kind: 'written', applied, segments: plan.segments.length, failedSegments, model };
 }
 
+/** A batched extraction reply with no entry for a document. */
+class MissingFromBatch extends Error {
+  constructor() {
+    super('the batched reply had no entry for this document');
+  }
+}
+
 /** Queue counts of a document still in progress. */
 export async function recordPlanProgress(store: Store, plan: DocPlan): Promise<void> {
   const doneCount = plan.results.filter(settled).length;
@@ -676,27 +683,28 @@ async function runTier1PassUnlocked(
         const request = buildBatchExtractRequest(items, { claims: config.extraction.claims, ontology, maxChars: extractionSegmentChars(config) });
         const reply = await entityLlm.completeJson<unknown>(request.messages, { maxTokens: request.maxTokens });
         const byDoc = batchExtractReplies(reply, tasks.length);
-        for (const [i, { plan }] of tasks.entries()) {
+        stats.tokensUsed += items.reduce((n, item) => n + estimateTokens(item.content), 0) + OUTPUT_TOKEN_ESTIMATE * tasks.length;
+        stats.calls++;
+        for (const [i, task] of tasks.entries()) {
           const raw = byDoc.get(i);
           try {
-            if (!raw) throw new Error('the batched reply had no entry for this document');
-            const result = await checkExtractReply(raw, request, { dataDir: store.dataDir, plan, index: 0, model: entityLlm.label });
-            recordSegmentOutcome(plan, 0, { ok: true, result }, entityLlm.label);
+            if (!raw) throw new MissingFromBatch();
+            const result = await checkExtractReply(raw, request, { dataDir: store.dataDir, plan: task.plan, index: 0, model: entityLlm.label });
+            recordSegmentOutcome(task.plan, 0, { ok: true, result }, entityLlm.label);
+            persistPlan(store.dataDir, task.plan, entityLlm.label);
           } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            recordSegmentOutcome(plan, 0, { ok: false, error: msg }, entityLlm.label);
-            progress(`tier1 failed for ${plan.row.path}: ${msg}`);
+            // a document the batched reply left out (or a model that answered one document only) is read on its own
+            progress(`tier1 ${task.plan.row.path}: ${err instanceof MissingFromBatch ? 'not in the batched reply' : err instanceof Error ? err.message : err}; read on its own`);
+            await runTask(task);
           }
         }
-        stats.tokensUsed += items.reduce((n, item) => n + estimateTokens(item.content), 0) + OUTPUT_TOKEN_ESTIMATE * tasks.length;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        for (const { plan } of tasks) recordSegmentOutcome(plan, 0, { ok: false, error: msg }, entityLlm.label);
+        // the batched call itself failed: each document on its own, so one bad document costs the others nothing
+        stats.calls++;
         stats.callsFailed++;
-        progress(`tier1 failed for ${tasks.length} documents: ${msg}`);
+        progress(`tier1 batch of ${tasks.length} failed (${err instanceof Error ? err.message : err}); reading them one by one`);
+        for (const task of tasks) await runTask(task);
       }
-      stats.calls++;
-      for (const { plan } of tasks) persistPlan(store.dataDir, plan, entityLlm.label);
     };
 
     // a plugin that shapes extraction requests sees one document a request, as it always has
