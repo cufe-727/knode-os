@@ -19,7 +19,7 @@ import { fileLines, recordKey, RunMeta, RunStore } from './runstore.js';
 import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
 import { scoreLists } from './score/lists.js';
-import { scoreUsage } from './score/usage.js';
+import { scoreKey, scoreUsage } from './score/usage.js';
 import { ChatBackend, ClientBackend, CodexBackend, shimState, startShim } from './shim.js';
 import { withRemote } from './placement.js';
 import { judgeAgent, packMayLeave, PlacedChatBackend, RemoteEval, remoteJudgeClient, RunCancelledError } from './remote.js';
@@ -560,15 +560,15 @@ export async function scoreAnswers(
   progress: (m: string) => void = () => {},
   meter?: Meter,
 ): Promise<number> {
-  // a repeated answer (`--repeat`) is scored as a system of its own, `<system>#r<n>`, so its scores keep their own keys
-  const answers = store.allAnswers().map((a) => (a.repeat && a.repeat > 1 ? { ...a, system: repeatSystem(a.system, a.repeat) } : a)).filter((a) => {
+  // a repeated answer (`--repeat`) keeps its system; its scores carry `repeat` and keys of their own (score/keys.ts)
+  const answers = store.allAnswers().filter((a) => {
     if (!ctx.tasks.has(`${a.pack}|${a.taskId}`)) return false;
-    const scored = store.score(recordKey('score', a.pack, a.system, a.taskId, 'latency_ms'));
+    const scored = store.score(scoreKey(a, 'latency_ms'));
     return !scored || scored.at < a.at;
   });
   if (!answers.length) return 0;
   progress(`scoring ${answers.length} answers`);
-  const citing = new Set([...ctx.citing, ...answers.filter((a) => ctx.citing.has(a.system.split('#')[0])).map((a) => a.system)]);
+  const citing = ctx.citing;
   // where the judge's calls ran, on every score of the pass (docs/design/27 §8)
   const mark = meter?.mark() ?? 0;
   const pending: ScoreRecord[] = [];
@@ -579,11 +579,6 @@ export async function scoreAnswers(
   const placed = where(meter?.placement((e) => e.system === JUDGE_SYSTEM, mark) ?? null);
   for (const r of pending) store.putScore({ ...r, ...placed });
   return answers.length;
-}
-
-/** The system a repeated answer is scored as. */
-export function repeatSystem(system: string, repeat: number): string {
-  return `${system}#r${repeat}`;
 }
 
 /** A record's `worker` and `backend` from where its model calls ran; nothing when it made none. */

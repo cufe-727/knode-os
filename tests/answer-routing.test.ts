@@ -271,11 +271,10 @@ describe('claim enumeration', () => {
     const typed = await Store.open(dir, 4);
     try {
       await typed.indexing;
-      expect(await typedColumns(store)).toEqual({});
-      await typed.exec(`ALTER TABLE claims ADD COLUMN IF NOT EXISTS attribute TEXT; ALTER TABLE claims ADD COLUMN IF NOT EXISTS value_num DOUBLE PRECISION; ALTER TABLE claims ADD COLUMN IF NOT EXISTS unit TEXT; ALTER TABLE claims ADD COLUMN IF NOT EXISTS effective_at TIMESTAMPTZ`);
       await typed.query(`INSERT INTO entities (id, name, type, mention_count, aliases, description) VALUES ('x', 'Xeno', 'organization', 1, '[]'::jsonb, '')`);
       await typed.query(`INSERT INTO claims (id, subject_id, type, statement, status, attribute, value_num, unit, effective_at, tx_from) VALUES ('v1', 'x', 'revenue', 'Xeno revenue was 12', 'fact', 'revenue', 12, 'million USD', '2026-05-10T00:00:00Z', now())`);
-      expect(await typedColumns(typed)).toEqual({ attribute: 'attribute', valueNum: 'value_num', unit: 'unit', effective: 'effective_at' });
+      // the claim-state migration (v19) adds them to every store
+      expect(await typedColumns(typed)).toEqual({ attribute: 'attribute', valueNum: 'value_num', valueText: 'value_text', unit: 'unit', effective: 'effective_at' });
       const e = await enumerateClaims(typed, { entities: ['x'], range: { from: '2026-05-01T00:00:00Z', to: '2026-05-31T00:00:00Z' } });
       expect(e.claims[0]).toMatchObject({ attribute: 'revenue', value: '12', unit: 'million USD', date: '2026-05-10' });
     } finally {
@@ -293,10 +292,17 @@ describe('claim enumeration', () => {
 
 describe('catalog guide', () => {
   it('runs every example query it shows the agent', async () => {
-    for (const ex of CATALOG_EXAMPLES) {
-      const sql = ex.sql.replace("'Acme%'", "'Nimbus%'");
-      const r = await catalogQuery(store, sql);
-      expect(r.rowCount, ex.question).toBeGreaterThan(0);
+    // one claim of the entity read as an attribute with a value, as refine leaves it (docs/design/29)
+    const [seed] = await store.query<{ id: string }>(`SELECT c.id FROM claims c JOIN entities e ON e.id = c.subject_id WHERE e.name ILIKE 'Nimbus%' ORDER BY c.id LIMIT 1`);
+    await store.query(`UPDATE claims SET attribute = 'revenue', value_num = 12, unit = 'million USD' WHERE id = $1`, [seed.id]);
+    try {
+      for (const ex of CATALOG_EXAMPLES) {
+        const sql = ex.sql.replace("'Acme%'", "'Nimbus%'");
+        const r = await catalogQuery(store, sql);
+        expect(r.rowCount, ex.question).toBeGreaterThan(0);
+      }
+    } finally {
+      await store.query(`UPDATE claims SET attribute = NULL, value_num = NULL, unit = NULL WHERE id = $1`, [seed.id]);
     }
     expect(catalogGuide()).toContain('v_claims(');
   });

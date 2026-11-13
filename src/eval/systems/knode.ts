@@ -428,7 +428,7 @@ async function exportUnits(s: KnodeState): Promise<KnowledgeUnit[]> {
     `SELECT id, name, type, description, aliases FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL`,
   )) {
     const aliases = Array.isArray(e.aliases) ? (e.aliases as string[]) : [];
-    units.push({ id: `entity:${e.id}`, kind: 'entity', title: e.name, text: `${e.name} (${e.type})${aliases.length ? ` — also ${aliases.join(', ')}` : ''}: ${e.description}`.trim(), sources: sourcesOf.get(e.id) ?? [], links: [] });
+    units.push({ id: `entity:${e.id}`, kind: 'entity', title: e.name, text: `${e.name} (${e.type}): ${e.description}`.trim() + (aliases.length ? `\naliases: ${aliases.join(', ')}` : ''), sources: sourcesOf.get(e.id) ?? [], links: [] });
   }
   for (const r of await ctx.store.query<{ id: string; head: string; tail: string; type: string; description: string; path: string | null; source_id: string; target_id: string }>(
     `SELECT r.id, s.name AS head, t.name AS tail, r.type, r.description, d.path, r.source_id, r.target_id

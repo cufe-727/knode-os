@@ -2,8 +2,11 @@ import type { Judge, GradeItem } from '../judge.js';
 import { citationScores } from '../metrics/retrieval.js';
 import { seededKey } from '../pack.js';
 import { exactMatch, extractFinalAnswer, stripMarkers, tokenF1 } from '../metrics/text.js';
-import { recordKey } from '../runstore.js';
 import type { AnswerRecord, ScoreRecord, Task } from '../types.js';
+import { judgeItemKey, repeatOf, scoreKey } from './keys.js';
+import { goldTerms, namesValue, readValue, staleTerms } from './values.js';
+
+export { scoreKey } from './keys.js';
 
 /**
  * Scoring answers (docs/design/23 §5, use): one blind judging pass over every
@@ -11,6 +14,10 @@ import type { AnswerRecord, ScoreRecord, Task } from '../types.js';
  * system are stripped, and the order is shuffled so a batch mixes systems —
  * then exact match and F1 on the `Final answer:` line, citation precision and
  * recall against the task's evidence, and abstention read from the judge.
+ * `value` tasks are scored without a model (docs/design/28): the final line
+ * names the gold value or it does not. Every answer also gets
+ * `confident_wrong` (wrong and not declining) and, where the task names the
+ * values the corpus once stated for the same thing, `stale_answer`.
  */
 
 const JUDGED = new Set(['judge', 'exact', 'count', 'keypoints', 'abstain']);
@@ -50,7 +57,7 @@ export async function scoreUsage(input: UsageScoringInput, judge: Judge): Promis
   const items: (GradeItem & { a: AnswerRecord; t: Task })[] = graded.map((a) => {
     const t = input.tasks.get(`${a.pack}|${a.taskId}`)!;
     return {
-      id: recordKey('grade', a.pack, a.system, a.taskId),
+      id: judgeItemKey('grade', a),
       question: t.question,
       reference: t.answer ?? t.answers?.join(' / '),
       keypoints: t.keypoints,
@@ -66,7 +73,7 @@ export async function scoreUsage(input: UsageScoringInput, judge: Judge): Promis
 
   const out: ScoreRecord[] = [];
   const put = (a: AnswerRecord, t: Task, metric: string, value: number | null, detail?: Record<string, unknown>) =>
-    out.push({ key: recordKey('score', a.pack, a.system, t.id, metric), pack: a.pack, system: a.system, suite: t.suite, taskId: t.id, taskType: t.type, metric, value, at, ...(detail ? { detail } : {}) });
+    out.push({ key: scoreKey(a, metric), pack: a.pack, system: a.system, suite: t.suite, taskId: t.id, taskType: t.type, metric, value, at, ...(repeatOf(a) !== undefined ? { repeat: repeatOf(a) } : {}), ...(detail ? { detail } : {}) });
 
   for (const it of items) {
     const v = verdicts.get(it.id);
@@ -82,6 +89,13 @@ export async function scoreUsage(input: UsageScoringInput, judge: Judge): Promis
       put(a, t, 'truthfulness', v.score === 2 ? 1 : v.abstained ? 0 : v.hallucinated || v.score === 0 ? -1 : 0);
     }
     put(a, t, 'hallucinated', v.hallucinated ? 1 : 0);
+    if (t.scoring !== 'abstain') put(a, t, 'confident_wrong', v.score === 0 && !v.abstained ? 1 : 0);
+    // the stale value instead of the current one: wrong in a way a compiled knowledge base should not be
+    const stale = staleTerms(t);
+    if (stale.length) {
+      const final = extractFinalAnswer(a.text);
+      put(a, t, 'stale_answer', v.score < 2 && namesValue(final, stale) && !namesValue(final, goldTerms(t)) ? 1 : 0);
+    }
   }
 
   for (const a of input.answers) {
@@ -100,6 +114,14 @@ export async function scoreUsage(input: UsageScoringInput, judge: Judge): Promis
     if (t.scoring === 'count') {
       const n = firstNumber(extractFinalAnswer(a.text));
       put(a, t, 'em', n !== null && n === Number(t.answer) ? 1 : 0, { predicted: n });
+    }
+    if (t.scoring === 'value') {
+      const r = readValue(t, a.text);
+      put(a, t, 'correctness', r.gold ? 1 : 0, { final: extractFinalAnswer(a.text).slice(0, 200) });
+      put(a, t, 'em', r.gold ? 1 : 0);
+      put(a, t, 'false_refusal', r.declined ? 1 : 0);
+      put(a, t, 'confident_wrong', !r.gold && !r.declined ? 1 : 0);
+      if (staleTerms(t).length) put(a, t, 'stale_answer', r.stale ? 1 : 0);
     }
     if (t.evidence.length && t.scoring !== 'abstain') {
       const c = input.citing.has(a.system) ? citationScores(a.citations.map((x) => x.doc), t.evidence.map((e) => e.doc)) : { precision: null, recall: null };

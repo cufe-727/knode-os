@@ -5,7 +5,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import {
   CORPUS_TASK_MIN_DOCS, CORPUS_TASK_TYPES, CorpusDoc, CorpusDocSchema, DEEP_HOP_MIN, GoldAlias, GoldAliasSchema, GoldFact, GoldFactSchema,
-  GoldLink, GoldLinkSchema, PackManifest, PackManifestSchema, Task, TaskSchema,
+  GoldLink, GoldLinkSchema, PackManifest, PackManifestSchema, STRUCTURED_MIN_DOCS, Task, TaskSchema,
 } from './types.js';
 import { evalTempDir } from './tmp.js';
 
@@ -176,7 +176,7 @@ export function validatePack(pack: LoadedPack): PackIssues {
       }
       if (e.quote && !text(e.doc).includes(foldSpace(e.quote))) errors.push(`task ${t.id}: quote not found in ${e.doc}: "${e.quote.slice(0, 60)}"`);
     }
-    if ((t.scoring === 'judge' || t.scoring === 'exact') && !t.answer && !t.answers?.length) errors.push(`task ${t.id}: ${t.scoring} scoring needs an answer`);
+    if ((t.scoring === 'judge' || t.scoring === 'exact' || t.scoring === 'value') && !t.answer && !t.answers?.length) errors.push(`task ${t.id}: ${t.scoring} scoring needs an answer`);
     if (t.scoring === 'count' && !/^\d+(\.\d+)?$/.test((t.answer ?? '').trim())) errors.push(`task ${t.id}: count scoring needs a number as the answer`);
     if (t.scoring === 'set' && !t.items?.length) errors.push(`task ${t.id}: set scoring needs items`);
     if (t.scoring === 'choice' && (!t.choices?.length || !t.answer || !t.choices.includes(t.answer))) errors.push(`task ${t.id}: choice scoring needs choices that include the answer`);
@@ -201,11 +201,24 @@ export function validatePack(pack: LoadedPack): PackIssues {
       if (t.items?.some((it) => !it.date)) errors.push(`task ${t.id}: every timeline item needs a date`);
     }
     if (t.type === 'contradiction' && t.scoring === 'set' && (t.items?.length ?? 0) < 2) errors.push(`task ${t.id}: a contradiction needs at least two sides`);
-    if (t.type === 'deep-hop') {
+    if (t.type === 'deep-hop' || t.type === 'nonlexical-hop') {
       const hops = Number(t.meta?.hops ?? 0);
-      if (hops < DEEP_HOP_MIN) errors.push(`task ${t.id}: a deep-hop task needs meta.hops ≥ ${DEEP_HOP_MIN}`);
-      if (evidenceDocs(t).length < DEEP_HOP_MIN) errors.push(`task ${t.id}: a deep-hop task's hops lie in at least ${DEEP_HOP_MIN} different documents`);
+      if (hops < DEEP_HOP_MIN) errors.push(`task ${t.id}: a ${t.type} task needs meta.hops ≥ ${DEEP_HOP_MIN}`);
+      if (evidenceDocs(t).length < DEEP_HOP_MIN) errors.push(`task ${t.id}: a ${t.type} task's hops lie in at least ${DEEP_HOP_MIN} different documents`);
     }
+    // the separation families (docs/design/28)
+    if (t.list?.match === 'fields' && t.items?.some((it) => !it.fields?.length)) errors.push(`task ${t.id}: matching by fields needs every item's fields`);
+    if (t.type === 'structured') {
+      const spread = evidenceDocs(t).length;
+      if (spread < STRUCTURED_MIN_DOCS) errors.push(`task ${t.id}: a structured query's evidence spans at least ${STRUCTURED_MIN_DOCS} documents (has ${spread})`);
+      if (t.scoring !== 'set' && t.scoring !== 'count' && t.scoring !== 'value') errors.push(`task ${t.id}: a structured query is scored as a set, a count or a value, not ${t.scoring}`);
+    }
+    if (t.type === 'stale') {
+      const stale = t.meta?.stale;
+      if (!Array.isArray(stale) || !stale.length) errors.push(`task ${t.id}: a stale task names its stale values (meta.stale)`);
+      else if (stale.some((v) => [t.answer, ...(t.answers ?? [])].includes(String(v)))) errors.push(`task ${t.id}: a stale value is also the answer`);
+    }
+    if (t.type === 'connection' && (t.scoring !== 'set' || !t.list)) errors.push(`task ${t.id}: a connection task is a set with a list spec`);
   }
 
   // padding (scale curves) must leave every closed-world task's gold as it is

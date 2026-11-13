@@ -9,7 +9,7 @@
 
 export const CATALOG_VIEW_COLUMNS = [
   'v_entities(id, name, type, description, aliases jsonb, wiki_path, mention_count, evidence_count, canonical_id) — canonical_id set: merged into that entity',
-  'v_claims(id, subject_id, object_id, type, statement, status [fact|suspected|disputed], kind [fact|opinion|prediction|rumor], valid_from, valid_to, event_at, observed_at, superseded_by, source_path, evidence_count) — superseded_by set: replaced by that newer claim',
+  'v_claims(id, subject_id, object_id, type, statement, status [fact|suspected|disputed], kind [fact|opinion|prediction|rumor], valid_from, valid_to, event_at, observed_at, superseded_by, source_path, evidence_count, attribute, value_num, value_text, unit, effective_at, date_source [stated|document], correction, effective_source_path) — attribute: what the claim measures about its subject (progress, headcount, price …), with its value; effective_at: the date it holds from (stated, else the date of its document); superseded_by set: replaced by that newer claim, so superseded_by IS NULL is the current value of an attribute',
   'v_relations(id, source_id, target_id, type, description, weight, evidence_count, valid_from, valid_to)',
   'v_evidence(kind [entity|relation|claim], target_id, source_path, weight, extractor, tx_from, tx_to) — every source behind a row; tx_to IS NULL: still live',
   'v_mentions(entity_id, chunk_id, document_id, document_path)',
@@ -20,6 +20,10 @@ export const CATALOG_EXAMPLES: { question: string; sql: string }[] = [
   {
     question: 'every current claim about an entity dated in 2026, oldest first',
     sql: `SELECT c.event_at, c.statement, c.source_path FROM v_claims c JOIN v_entities e ON e.id = c.subject_id WHERE e.name ILIKE 'Acme%' AND c.superseded_by IS NULL AND c.event_at >= '2026-01-01' AND c.event_at < '2027-01-01' ORDER BY c.event_at`,
+  },
+  {
+    question: 'the current value of every attribute of an entity, and one attribute\'s history',
+    sql: `SELECT c.attribute, c.value_num, c.value_text, c.unit, c.effective_at, c.superseded_by IS NULL AS current, c.effective_source_path FROM v_claims c JOIN v_entities e ON e.id = c.subject_id WHERE e.name ILIKE 'Acme%' AND c.attribute IS NOT NULL ORDER BY c.attribute, c.effective_at`,
   },
   {
     question: 'how many documents mention each organization',

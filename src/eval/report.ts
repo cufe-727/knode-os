@@ -2,11 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { mdTable } from '../bench/util.js';
 import { chartBlock } from '../research/chart.js';
-import { bootstrapMean, holm, mean, pairedBootstrap, round, wilson } from './metrics/stats.js';
+import { bootstrapMean, holm, mean, minimumDetectableEffect, pairedBootstrap, round, sd, wilson } from './metrics/stats.js';
 import { RunStore } from './runstore.js';
 import { SYSTEMS } from './systems/index.js';
 import { toolUse, type ToolUse } from './trace.js';
-import { CORPUS_TASK_TYPES, type BuildRecord, type ScoreRecord } from './types.js';
+import { CORPUS_TASK_TYPES, SEPARATION_TASK_TYPES, type BuildRecord, type ScoreRecord } from './types.js';
 
 /**
  * `knode-os eval report` (docs/design/23 §8): everything a run measured,
@@ -18,8 +18,11 @@ import { CORPUS_TASK_TYPES, type BuildRecord, type ScoreRecord } from './types.j
 const GROUP_ANSWERER: Record<string, string> = { knode: 'knode-ask', 'llm-wiki': 'agent-wiki', rag: 'rag-hybrid', graphrag: 'graphrag', lightrag: 'lightrag', hipporag: 'hipporag' };
 export const BASELINE = 'agent-grep';
 
-const USAGE_METRICS = ['correctness', 'em', 'f1', 'keypoint_recall', 'citation_precision', 'citation_recall', 'abstain_correct', 'false_refusal', 'truthfulness', 'hallucinated', 'injection_success'] as const;
+const USAGE_METRICS = ['correctness', 'em', 'f1', 'keypoint_recall', 'citation_precision', 'citation_recall', 'abstain_correct', 'false_refusal', 'truthfulness', 'hallucinated', 'confident_wrong', 'stale_answer', 'injection_success'] as const;
 const LIST_METRICS = ['correctness', 'set_precision', 'set_recall', 'set_f1', 'order_accuracy', 'date_accuracy', 'attribution_recall', 'items_returned', 'em'] as const;
+/** What separates a compiled knowledge base from a lookup (docs/design/28), per pack and system. */
+const SEPARATION_METRICS = ['correctness', 'stale_answer', 'confident_wrong', 'distractor_rate', 'citation_precision'] as const;
+const RATE_METRICS = ['correctness', 'em', 'abstain_correct', 'false_refusal', 'hallucinated', 'label_correct', 'all@5', 'injection_success', 'confident_wrong', 'stale_answer'];
 /** Queries a build is amortized over in the cost-normalized table. */
 export const AMORTIZE_AT = [100, 1000] as const;
 
@@ -33,7 +36,7 @@ export function groupOf(system: string): string | null {
 }
 const RETRIEVAL_METRICS = ['recall@2', 'recall@5', 'all@5', 'mrr@10', 'ndcg@10'] as const;
 const EMERGENCE_METRICS = ['label_correct', 'set_recall', 'set_precision', 'set_f1', 'set_recall_latent', 'terms_precision_at_10', 'grounded_share', 'brier'] as const;
-const GENERATION_METRICS = ['coverage', 'precision', 'attribution_precision', 'link_precision', 'link_recall', 'duplicate_rate', 'over_merge', 'contradiction_rate', 'contradicted_rate', 'compression', 'units', 'units_with_sources', 'links_per_page', 'orphan_page_rate'] as const;
+const GENERATION_METRICS = ['coverage', 'precision', 'attribution_precision', 'link_precision', 'link_recall', 'duplicate_rate', 'over_merge', 'er_bcubed_precision', 'er_bcubed_recall', 'er_bcubed_f1', 'er_found', 'contradiction_rate', 'contradicted_rate', 'compression', 'units', 'units_with_sources', 'links_per_page', 'orphan_page_rate'] as const;
 
 export interface Cell {
   value: number | null;
@@ -51,6 +54,29 @@ export interface Efficiency {
   breakEven: number | null;
   amortized: Record<string, number | null>;
   n: number;
+}
+
+export interface Paired {
+  system: string;
+  diff: number;
+  ci: [number, number];
+  p: number;
+  n: number;
+  /** The smallest delta this many paired tasks could detect (α 0.05, power 0.8). */
+  mde: number;
+}
+
+export interface Variance {
+  repeats: number;
+  /** Mean correctness of each repeat, in repeat order. */
+  perRepeat: number[];
+  /** Standard deviation of the repeats' mean correctness. */
+  sdAcrossRepeats: number;
+  /** Mean over tasks of the standard deviation of a task's correctness across repeats. */
+  withinTaskSd: number;
+  /** Share of tasks whose correctness differs between repeats. */
+  unstable: number;
+  tasks: number;
 }
 
 export interface ReportData {
@@ -81,8 +107,19 @@ export interface ReportData {
   efficiency: Record<string, Record<string, Efficiency>>;
   /** Update batches: what each group's incremental build cost, and how each system answered after it. */
   updates: Record<string, { batch: string; builds: { group: string; ok: boolean; ms: number; weightedTokens: number; embeddingTokens: number; calls: number }[]; correctness: Record<string, Cell> }[]>;
-  pooled: { system: string; diff: number; ci: [number, number]; p: number; n: number; significant: boolean }[];
+  pooled: (Paired & { significant: boolean })[];
+  /** Paired correctness against the baseline, per pack, with the minimum detectable effect. */
+  paired?: Record<string, Paired[]>;
   byType: Record<string, Record<string, Cell>>;
+  /** Correctness per task type, per pack and system (every type, the separation families among them), and each system's paired delta per type. */
+  typesByPack?: Record<string, Record<string, Record<string, Cell>>>;
+  typeDeltas?: Record<string, Record<string, Record<string, Paired>>>;
+  /** Stale answers, confident wrong answers, look-alike items and citation precision, per pack and system, over the separation families and over everything. */
+  separation?: Record<string, Record<string, Record<string, Cell>>>;
+  /** What one correct answer costs: weighted tokens and USD over the sum of correctness, per pack and system. */
+  costPerCorrect?: Record<string, Record<string, { tokens: number | null; usd: number | null; correct: number; n: number; toolCalls: number }>>;
+  /** Run-to-run variance where a system answered the same tasks more than once (`eval run --repeat`). */
+  variance?: Record<string, Record<string, Variance>>;
   judgeUsage: { calls: number; weightedTokens: number; costUsd: number };
 }
 
@@ -103,7 +140,7 @@ function grouped(scores: ScoreRecord[], metrics: readonly string[], filter: (s: 
   const out: Record<string, Record<string, Record<string, Cell>>> = {};
   for (const [k, vs] of acc) {
     const [pack, system, metric] = k.split('\u0000');
-    ((out[pack] ??= {})[system] ??= {})[metric] = cell(vs, ['correctness', 'em', 'abstain_correct', 'false_refusal', 'hallucinated', 'label_correct', 'all@5', 'injection_success'].includes(metric));
+    ((out[pack] ??= {})[system] ??= {})[metric] = cell(vs, RATE_METRICS.includes(metric));
   }
   return out;
 }
@@ -168,25 +205,47 @@ export function buildReportData(runDir: string): ReportData {
     (breakEven[b.pack] ??= {})[b.system] = grep > own ? b.usage.weightedTokens / (grep - own) : null;
   }
 
-  // pooled paired comparison of correctness against the baseline, over the tasks both answered
-  const correctness = new Map<string, number>();
-  for (const s of scores) if (s.metric === 'correctness' && s.value !== null) correctness.set(`${s.system}|${s.pack}|${s.taskId}`, s.value);
+  // pooled paired comparison of correctness against the baseline, over the tasks both answered (repeats averaged per task)
+  const perTask = new Map<string, number[]>();
+  const typeOf = new Map<string, string>();
+  for (const s of scores) {
+    if (s.metric !== 'correctness' || s.value === null || !Number.isFinite(s.value)) continue;
+    const k = `${s.system}\u0000${s.pack}\u0000${s.taskId}`;
+    (perTask.get(k) ?? perTask.set(k, []).get(k)!).push(s.value);
+    if (s.taskType) typeOf.set(`${s.pack}\u0000${s.taskId}`, s.taskType);
+  }
+  const correctness = new Map([...perTask].map(([k, vs]) => [k, mean(vs)]));
   const others = systems.filter((s) => s !== BASELINE);
-  const comparisons = others.map((system) => {
+  const compare = (system: string, keep: (pack: string, task: string) => boolean): Paired | null => {
     const a: number[] = [];
     const b: number[] = [];
     for (const [k, v] of correctness) {
-      const [sys, pack, task] = k.split('|');
-      if (sys !== system) continue;
-      const base = correctness.get(`${BASELINE}|${pack}|${task}`);
+      const [sys, pack, task] = k.split('\u0000');
+      if (sys !== system || !keep(pack, task)) continue;
+      const base = correctness.get(`${BASELINE}\u0000${pack}\u0000${task}`);
       if (base === undefined) continue;
       a.push(v);
       b.push(base);
     }
-    return { system, ...pairedBootstrap(a, b) };
-  }).filter((c) => c.n > 0);
+    if (!a.length) return null;
+    return { system, ...pairedBootstrap(a, b), mde: minimumDetectableEffect(a.map((x, i) => x - b[i])) };
+  };
+  const comparisons = others.map((system) => compare(system, () => true)).filter((c): c is Paired => c !== null && c.n > 0);
   const sig = holm(comparisons.map((c) => c.p));
   const pooled = comparisons.map((c, i) => ({ ...c, significant: sig[i] }));
+  const paired: NonNullable<ReportData['paired']> = {};
+  const typeDeltas: NonNullable<ReportData['typeDeltas']> = {};
+  for (const pack of packs) {
+    const rows = others.map((system) => compare(system, (p) => p === pack)).filter((c): c is Paired => c !== null);
+    if (rows.length) paired[pack] = rows;
+    const types = new Set([...typeOf].filter(([k]) => k.startsWith(`${pack}\u0000`)).map(([, t]) => t));
+    for (const type of types) {
+      for (const system of others) {
+        const c = compare(system, (p, task) => p === pack && typeOf.get(`${p}\u0000${task}`) === type);
+        if (c) ((typeDeltas[pack] ??= {})[type] ??= {})[system] = c;
+      }
+    }
+  }
 
   const corpusTypes = new Set<string>(CORPUS_TASK_TYPES);
   const lists = grouped(scores, LIST_METRICS, (s) => s.suite === 'usage' && Boolean(s.taskType && corpusTypes.has(s.taskType)));
@@ -204,11 +263,112 @@ export function buildReportData(runDir: string): ReportData {
     const [system, type] = k.split('\u0000');
     (byType[system] ??= {})[type] = cell(vs);
   }
+  const typesByPack: NonNullable<ReportData['typesByPack']> = {};
+  {
+    const acc = new Map<string, number[]>();
+    for (const [k, v] of correctness) {
+      const [system, pack, task] = k.split('\u0000');
+      const type = typeOf.get(`${pack}\u0000${task}`);
+      if (!type) continue;
+      const key = `${pack}\u0000${type}\u0000${system}`;
+      (acc.get(key) ?? acc.set(key, []).get(key)!).push(v);
+    }
+    for (const [key, vs] of acc) {
+      const [pack, type, system] = key.split('\u0000');
+      ((typesByPack[pack] ??= {})[type] ??= {})[system] = cell(vs);
+    }
+  }
+  const separation = separationOf(scores);
+  const costPerCorrect = costPerCorrectOf(answers, scores);
+  const variance = varianceOf(answers, scores);
 
   const judgeEvents = fs.existsSync(path.join(runDir, 'meter.jsonl'))
     ? fs.readFileSync(path.join(runDir, 'meter.jsonl'), 'utf8').split('\n').filter((l) => l.includes('"__judge__"')).length
     : 0;
-  return { run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, tools, builds, breakEven, lists, efficiency, updates, pooled, byType, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 } };
+  return {
+    run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, tools, builds, breakEven, lists, efficiency, updates, pooled, paired, byType, typesByPack, typeDeltas,
+    separation, costPerCorrect, variance, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 },
+  };
+}
+
+const SEPARATION_TYPES = new Set<string>(SEPARATION_TASK_TYPES);
+
+/**
+ * The separation metrics per pack and system: each over the separation
+ * families (`<metric>` ) and, for stale and confident-wrong answers, over all
+ * tasks too (`<metric>_all`).
+ */
+function separationOf(scores: ScoreRecord[]): NonNullable<ReportData['separation']> {
+  const acc = new Map<string, number[]>();
+  const push = (pack: string, system: string, metric: string, v: number) => {
+    const k = `${pack}\u0000${system}\u0000${metric}`;
+    (acc.get(k) ?? acc.set(k, []).get(k)!).push(v);
+  };
+  for (const s of scores) {
+    if (s.value === null || !Number.isFinite(s.value) || !(SEPARATION_METRICS as readonly string[]).includes(s.metric) || s.suite === 'generation') continue;
+    if (s.taskType && SEPARATION_TYPES.has(s.taskType)) push(s.pack, s.system, s.metric, s.value);
+    if (s.metric === 'stale_answer' || s.metric === 'confident_wrong') push(s.pack, s.system, `${s.metric}_all`, s.value);
+  }
+  const out: NonNullable<ReportData['separation']> = {};
+  for (const [k, vs] of acc) {
+    const [pack, system, metric] = k.split('\u0000');
+    ((out[pack] ??= {})[system] ??= {})[metric] = cell(vs, RATE_METRICS.includes(metric.replace(/_all$/, '')));
+  }
+  return out;
+}
+
+/** Weighted tokens and USD per unit of correctness (a half-right answer is half an answer), and tool calls per answer. */
+export function costPerCorrectOf(answers: ReturnType<RunStore['allAnswers']>, scores: ScoreRecord[]): NonNullable<ReportData['costPerCorrect']> {
+  const correct = new Map<string, number>();
+  for (const s of scores) if (s.metric === 'correctness' && s.value !== null && Number.isFinite(s.value)) correct.set(`${s.pack}|${s.system}|${s.taskId}|${s.repeat ?? 0}`, s.value);
+  const out: NonNullable<ReportData['costPerCorrect']> = {};
+  const acc = new Map<string, { tokens: number; usd: number; correct: number; n: number; toolCalls: number }>();
+  for (const a of answers) {
+    const c = correct.get(`${a.pack}|${a.system}|${a.taskId}|${a.repeat ?? 0}`);
+    if (c === undefined) continue;
+    const k = `${a.pack}\u0000${a.system}`;
+    const x = acc.get(k) ?? acc.set(k, { tokens: 0, usd: 0, correct: 0, n: 0, toolCalls: 0 }).get(k)!;
+    x.tokens += a.usage.weightedTokens;
+    x.usd += a.usage.costUsd;
+    x.correct += c;
+    x.n++;
+    x.toolCalls += a.toolCalls;
+  }
+  for (const [k, x] of acc) {
+    const [pack, system] = k.split('\u0000');
+    (out[pack] ??= {})[system] = { tokens: x.correct > 0 ? x.tokens / x.correct : null, usd: x.correct > 0 ? x.usd / x.correct : null, correct: x.correct, n: x.n, toolCalls: x.n ? x.toolCalls / x.n : 0 };
+  }
+  return out;
+}
+
+/** Spread between repeated answers of one system to the same tasks: across the repeats' means, and within each task. */
+export function varianceOf(answers: ReturnType<RunStore['allAnswers']>, scores: ScoreRecord[]): NonNullable<ReportData['variance']> {
+  const repeats = new Map<string, Set<number>>();
+  for (const a of answers) {
+    const k = `${a.pack}\u0000${a.system}`;
+    (repeats.get(k) ?? repeats.set(k, new Set()).get(k)!).add(a.repeat ?? 0);
+  }
+  const out: NonNullable<ReportData['variance']> = {};
+  for (const [k, rs] of repeats) {
+    if (rs.size < 2) continue;
+    const [pack, system] = k.split('\u0000');
+    const byTask = new Map<string, Map<number, number>>();
+    for (const s of scores) {
+      if (s.pack !== pack || s.system !== system || s.metric !== 'correctness' || s.value === null || !s.taskId) continue;
+      (byTask.get(s.taskId) ?? byTask.set(s.taskId, new Map()).get(s.taskId)!).set(s.repeat ?? 0, s.value);
+    }
+    const order = [...rs].sort((x, y) => x - y);
+    // the tasks every repeat answered, so the repeats' means are over the same tasks
+    const common = [...byTask.values()].filter((m) => order.every((r) => m.has(r)));
+    if (!common.length) continue;
+    const perRepeat = order.map((r) => mean(common.map((m) => m.get(r)!)));
+    const within = common.map((m) => sd(order.map((r) => m.get(r)!)));
+    (out[pack] ??= {})[system] = {
+      repeats: order.length, perRepeat, sdAcrossRepeats: sd(perRepeat), withinTaskSd: mean(within),
+      unstable: common.filter((m) => new Set(order.map((r) => m.get(r)!)).size > 1).length / common.length, tasks: common.length,
+    };
+  }
+  return out;
 }
 
 /** Correctness per 1k query tokens, and with the build counted: break-even against agent-grep and amortized over 100 / 1000 queries. */
@@ -277,6 +437,44 @@ function table(rows: Record<string, Record<string, Cell>>, metrics: readonly str
   return mdTable(['system', ...used, 'n'], systems.map((s) => [s, ...used.map((m) => fmt(rows[s][m], digits)), String(Math.max(...used.map((m) => rows[s][m]?.n ?? 0)))]));
 }
 
+const fmtMde = (x: number | null | undefined) => (x === null || x === undefined || !Number.isFinite(x) ? '—' : round(x, 3).toFixed(3));
+
+/**
+ * The separation table (docs/design/28): over the separation families,
+ * correctness, stale answers (the value the corpus once stated, or a
+ * look-alike's), confident wrong answers, look-alike items and citation
+ * precision; over all tasks, stale and confident-wrong rates; and what an
+ * answer costs — tool calls per answer, tokens and USD per correct answer.
+ */
+function separationTable(sep: Record<string, Record<string, Cell>>, cpc: NonNullable<ReportData['costPerCorrect']>[string]): string[] {
+  const systems = [...new Set([...Object.keys(sep), ...Object.keys(cpc)])].sort();
+  if (!systems.length) return [];
+  const cols: [string, string][] = [['correctness', 'correctness (families)'], ['stale_answer', 'stale answers'], ['confident_wrong', 'confident wrong'], ['distractor_rate', 'look-alike items'], ['citation_precision', 'citation precision'], ['stale_answer_all', 'stale answers (all)'], ['confident_wrong_all', 'confident wrong (all)']];
+  const used = cols.filter(([m]) => systems.some((s) => sep[s]?.[m]));
+  const out = ['### Separation: stale, confident-wrong, look-alike, citations, cost per correct answer', ''];
+  out.push('Over the separation families (stale, lookalike, structured, nonlexical-hop, connection, paraphrase, cross-lingual) unless marked "all". A stale answer gives a value the corpus stated earlier (or a look-alike entity\'s) instead of the current one; confident wrong is wrong without declining. Cost per correct answer divides all of a system\'s answer tokens (and USD) by its summed correctness.', '');
+  out.push(mdTable(['system', ...used.map(([, h]) => h), 'tool calls / answer', 'tokens / correct', 'USD / correct'], systems.map((s) => [
+    s, ...used.map(([m]) => fmt(sep[s]?.[m])), cpc[s] ? cpc[s].toolCalls.toFixed(1) : '—', fmtNum(cpc[s]?.tokens), cpc[s]?.usd === null || cpc[s]?.usd === undefined ? '—' : cpc[s].usd!.toFixed(4),
+  ])), '');
+  return out;
+}
+
+/** Correctness per task type for one pack, every system, and each system's paired Δ against the baseline with its MDE. */
+function typeTable(types: Record<string, Record<string, Cell>>, deltas: Record<string, Record<string, Paired>>): string[] {
+  const systems = [...new Set(Object.values(types).flatMap((t) => Object.keys(t)))].sort();
+  const others = systems.filter((s) => s !== BASELINE);
+  const rows = Object.keys(types).sort((a, b) => Number(SEPARATION_TYPES.has(b)) - Number(SEPARATION_TYPES.has(a)) || a.localeCompare(b));
+  const out = ['### Correctness by task type', '', `Separation families first. Δ is each system's paired difference from ${BASELINE} on that type, with its MDE in parentheses.`, ''];
+  out.push(mdTable(['type', 'n', ...systems, ...others.map((s) => `Δ ${s} (MDE)`)], rows.map((type) => [
+    type, String(Math.max(...systems.map((s) => types[type][s]?.n ?? 0))), ...systems.map((s) => fmt(types[type][s])),
+    ...others.map((s) => {
+      const c = deltas[type]?.[s];
+      return c ? `${c.diff >= 0 ? '+' : ''}${round(c.diff, 2).toFixed(2)} (${fmtMde(c.mde)})` : '—';
+    }),
+  ])), '');
+  return out;
+}
+
 /** Programs shown by name in the agent tool-use table, beside every knode tool used; the rest are summed as "other". */
 const TOOL_COLUMNS = 8;
 
@@ -319,15 +517,33 @@ export function renderReport(d: ReportData): string {
   if (d.pooled.length) {
     lines.push(`## Pooled correctness against ${BASELINE}`, '');
     lines.push('Paired over the tasks both systems answered, all packs pooled; significance after Holm correction across systems.', '');
-    lines.push(mdTable(['system', 'Δ correctness', '95% CI', 'p', 'paired tasks', 'significant'], d.pooled.sort((a, b) => b.diff - a.diff).map((c) => [c.system, round(c.diff, 3).toFixed(3), `[${round(c.ci[0], 3)}, ${round(c.ci[1], 3)}]`, round(c.p, 4).toString(), String(c.n), c.significant ? 'yes' : 'no'])), '');
+    lines.push('MDE is the minimum detectable effect of each comparison (α 0.05, power 0.8, from the spread of its paired differences): a |Δ| below it is not evidence the systems are the same — the benchmark could not have told.', '');
+    lines.push(mdTable(['system', 'Δ correctness', '95% CI', 'p', 'MDE', 'paired tasks', 'significant'], d.pooled.sort((a, b) => b.diff - a.diff).map((c) => [c.system, round(c.diff, 3).toFixed(3), `[${round(c.ci[0], 3)}, ${round(c.ci[1], 3)}]`, round(c.p, 4).toString(), fmtMde(c.mde), String(c.n), c.significant ? 'yes' : 'no'])), '');
     const sys = d.pooled.map((c) => c.system);
     lines.push(chartBlock({ type: 'hbar', title: `Correctness difference vs ${BASELINE}`, unit: 'Δ correctness (0–1)', x: sys, series: [{ name: 'Δ correctness', values: d.pooled.map((c) => round(c.diff, 3)) }], source: 'scores.jsonl' }), '');
   }
 
   for (const pack of d.packs) {
     lines.push(`## ${pack}`, '');
+    const pr = d.paired?.[pack];
+    if (pr?.length) {
+      lines.push(`### Paired against ${BASELINE}`, '');
+      lines.push(mdTable(['system', 'Δ correctness', '95% CI', 'p', 'MDE', 'paired tasks', '|Δ| ≥ MDE'], [...pr].sort((a, b) => b.diff - a.diff).map((c) => [c.system, round(c.diff, 3).toFixed(3), `[${round(c.ci[0], 3)}, ${round(c.ci[1], 3)}]`, round(c.p, 4).toString(), fmtMde(c.mde), String(c.n), Number.isFinite(c.mde) && Math.abs(c.diff) >= c.mde ? 'yes' : 'no'])), '');
+    }
     const u = d.usage[pack];
     if (u) lines.push('### Use: answering', '', table(u, USAGE_METRICS), '');
+    const sep = d.separation?.[pack];
+    const cpc = d.costPerCorrect?.[pack];
+    if (sep || cpc) lines.push(...separationTable(sep ?? {}, cpc ?? {}));
+    const tp = d.typesByPack?.[pack];
+    if (tp) lines.push(...typeTable(tp, d.typeDeltas?.[pack] ?? {}));
+    const vr = d.variance?.[pack];
+    if (vr && Object.keys(vr).length) {
+      lines.push('### Run-to-run variance', '', 'Systems that answered the same tasks more than once (`eval run --repeat`): mean correctness of each repeat over the tasks every repeat answered, the spread across repeats, the mean spread within a task, and the share of tasks whose score changed.', '');
+      lines.push(mdTable(['system', 'repeats', 'tasks', 'correctness per repeat', 'SD across repeats', 'mean within-task SD', 'unstable tasks'], Object.entries(vr).sort().map(([s, v]) => [
+        s, v.repeats, v.tasks, v.perRepeat.map((x) => round(x, 3).toFixed(3)).join(' / '), fmtMde(v.sdAcrossRepeats), fmtMde(v.withinTaskSd), `${(v.unstable * 100).toFixed(0)}%`,
+      ])), '');
+    }
     const r = d.retrieval[pack];
     if (r) lines.push('### Use: retrieval', '', table(r, RETRIEVAL_METRICS), '');
     const pq = d.perQuery[pack];

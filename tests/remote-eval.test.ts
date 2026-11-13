@@ -285,7 +285,7 @@ describe('an evaluation run with remote workers', () => {
     expect(seconds.every((a) => !firsts.some((f) => f.key === a.key))).toBe(true);
     // asked again, not replayed from the reply cache
     expect(seconds.every((a) => a.usage.calls > a.usage.replayedCalls)).toBe(true);
-    expect(store.allScores().some((s) => s.system === 'closed-book#r2')).toBe(true);
+    expect(store.allScores().some((s) => s.system === 'closed-book' && s.repeat === 2)).toBe(true);
     expect(store.allAnswers().filter((a) => a.system === 'agent-grep' && a.repeat)).toEqual([]);
   }, 120_000);
 

@@ -1,5 +1,6 @@
 import type { EmbeddingProvider } from '../../ingest/embeddings.js';
 import type { Judge } from '../judge.js';
+import { entityResolution } from '../metrics/entities.js';
 import { wilson } from '../metrics/stats.js';
 import { normalizeAnswer } from '../metrics/text.js';
 import { docText, LoadedPack, seededKey } from '../pack.js';
@@ -171,6 +172,16 @@ export async function scoreGeneration(
     if (groups) put('duplicate_rate', duplicated / groups, { n: groups, ci: wilson(duplicated, groups) });
     const overMerged = [...owner.values()].filter((s) => s.size > 1).length;
     put('over_merge', owner.size ? overMerged / owner.size : null, { n: owner.size });
+  }
+
+  /* -------------------- entity resolution: B-cubed (docs/design/28) -------------------- */
+  // every exported entity, against the gold alias clusters (namesakes, renames, aliases): no model
+  const er = entityResolution(pack.aliases, entities);
+  if (er && er.n) {
+    put('er_bcubed_precision', er.precision, { n: er.n, detail: { merged: er.merged } });
+    put('er_bcubed_recall', er.recall, { n: er.n, detail: { split: er.split } });
+    put('er_bcubed_f1', er.f1, { n: er.n });
+    put('er_found', er.found, { n: pack.aliases.length });
   }
 
   /* ------------------------------- consistency ------------------------------- */
