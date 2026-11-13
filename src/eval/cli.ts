@@ -17,8 +17,9 @@ import { RunStore } from './runstore.js';
 import { DEFAULT_SYSTEMS, SYSTEMS } from './systems/index.js';
 import { EXTERNAL_SYSTEMS, externalPacks, venvPython } from './systems/external.js';
 import { Suite, SUITES, TASK_TYPES, TaskType } from './types.js';
-import { loadConfig } from '../config.js';
+import { loadConfig, resolveDataDir } from '../config.js';
 import { ModelChain, parseChain, SpendLedger } from './chain.js';
+import { localServe } from './remote.js';
 
 /** The author model: a budgeted chain over a workspace's connections, or one CLI (docs/design/23 D18). */
 function authorClient(opts: { author: string | false; authorModel?: string; authorChain?: string; configFrom?: string }, guard: QuotaGuard): LlmClient | undefined {
@@ -43,6 +44,14 @@ function resolvePack(arg: string): string {
   const named = path.join(packsDir(), arg);
   if (fs.existsSync(path.join(named, 'pack.json'))) return named;
   throw new Error(`no pack at ${arg} or ${named}`);
+}
+
+/** `--remote`: serve on this machine (docs/design/27 §8), found through the data root's config and MCP token. */
+function remoteOption(program: Command, opts: { remote?: boolean; serveUrl?: string; offerSeconds?: string }) {
+  if (!opts.remote) return null;
+  const at = localServe(resolveDataDir(program.opts().data), opts.serveUrl);
+  if (!/^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(at.serveUrl)) throw new Error('--serve-url: the run reaches serve on this machine only (http://127.0.0.1:<port>)');
+  return { ...at, ...(opts.offerSeconds !== undefined ? { offerSeconds: Number(opts.offerSeconds) } : {}) };
 }
 
 export function registerEvalCommands(program: Command): void {
@@ -174,8 +183,17 @@ export function registerEvalCommands(program: Command): void {
     .option('--skip-scoring', 'answer only; score later with `eval run --run-dir`')
     .option('--reuse-builds-from <runDir>', "start from another run's builds of the same pack versions (and its embedding vectors), instead of building again")
     .option('--rebuild <groups>', 'with --reuse-builds-from: build these groups afresh (knode, llm-wiki, rag, …), e.g. after a change to how they build')
+    .option('--remote', 'offer model calls, agent sessions and judge calls to remote workers through `knode-os serve` on this machine (server.remote.offer.eval); needs --model (and --judge-model for the judge); a pack with private sources stays here')
+    .option('--serve-url <url>', 'with --remote: serve\'s origin on this machine (default: from the data root\'s config)')
+    .option('--offer-seconds <s>', 'with --remote: how long a piece waits for a worker before it runs here (default: the server\'s, 30)')
+    .option('--repeat <n>', 'answer each task n times, for run-to-run variance (repeat 1 keeps the usual record keys)', '1')
+    .option('--repeat-systems <list>', 'with --repeat: only these systems (default: every system that answers)')
     .action(async (opts) => {
+      const remote = remoteOption(program, opts);
       const res = await runEval({
+        remote,
+        repeat: Number(opts.repeat),
+        repeatSystems: csv(opts.repeatSystems),
         packs: csv(opts.pack)!.map(resolvePack),
         systems: csv(opts.systems) ?? DEFAULT_SYSTEMS,
         suites: (csv(opts.suites) as Suite[] | undefined) ?? [...SUITES],
@@ -224,8 +242,11 @@ export function registerEvalCommands(program: Command): void {
     .description('judge what a stopped run has answered so far (Claude), then render its report')
     .option('--judge <provider>', 'judge CLI provider', 'claude-cli')
     .option('--judge-model <model>', 'judge model', '')
+    .option('--remote', 'offer the judge\'s calls to remote workers through `knode-os serve` on this machine (needs --judge-model; not for a run with a private pack)')
+    .option('--serve-url <url>', 'with --remote: serve\'s origin on this machine')
+    .option('--offer-seconds <s>', 'with --remote: how long a call waits for a worker before it runs here')
     .action(async (runDir: string, opts) => {
-      const n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`) });
+      const n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts) });
       const r = writeReport(path.resolve(runDir));
       console.log(`\n${n} answers scored\nreport: ${r.md}`);
       process.exit(0);
@@ -239,22 +260,37 @@ export function registerEvalCommands(program: Command): void {
       const builds = store.allBuilds();
       const answers = store.allAnswers();
       const packs = [...new Set([...builds.map((b) => b.pack), ...answers.map((a) => a.pack)])].sort();
+      const placed = (worker: string | undefined) => (worker && worker !== 'local' ? (worker === 'mixed' ? 'mixed' : 'remote') : 'local');
       for (const pack of packs) {
-        const b = builds.filter((x) => x.pack === pack).map((x) => `${x.system}${x.ok ? '' : ' (failed)'}`);
-        const bySystem = new Map<string, { n: number; errors: number }>();
+        // where it ran (docs/design/27 §8): a build or answer by remote workers, or partly
+        const b = builds.filter((x) => x.pack === pack).map((x) => `${x.system}${x.ok ? '' : ' (failed)'}${placed(x.worker) !== 'local' ? ` [${x.worker}]` : ''}`);
+        const bySystem = new Map<string, { n: number; errors: number; remote: number; mixed: number; repeats: number; backends: Set<string> }>();
         for (const a of answers.filter((x) => x.pack === pack)) {
-          const c = bySystem.get(a.system) ?? { n: 0, errors: 0 };
+          const c = bySystem.get(a.system) ?? { n: 0, errors: 0, remote: 0, mixed: 0, repeats: 0, backends: new Set<string>() };
           c.n++;
           if (a.error) c.errors++;
+          if (placed(a.worker) === 'remote') c.remote++;
+          if (placed(a.worker) === 'mixed') c.mixed++;
+          if (a.repeat && a.repeat > 1) c.repeats++;
+          if (a.backend) c.backends.add(a.backend);
           bySystem.set(a.system, c);
         }
-        console.log(`${pack}\n  built: ${b.join(', ') || '—'}\n  answered: ${[...bySystem].map(([sys, c]) => `${sys} ${c.n}${c.errors ? ` (${c.errors} errors)` : ''}`).join(', ') || '—'}`);
+        const share = (c: { n: number; remote: number; mixed: number }) => (c.remote || c.mixed ? `, remote ${Math.round((100 * (c.remote + c.mixed / 2)) / c.n)}% (${c.remote} by workers${c.mixed ? `, ${c.mixed} mixed` : ''})` : '');
+        const answered = [...bySystem].map(([sys, c]) => `${sys} ${c.n}${c.repeats ? ` (${c.repeats} repeats)` : ''}${c.errors ? ` (${c.errors} errors)` : ''}${share(c)}${c.backends.size > 1 ? ` — BACKENDS MIXED: ${[...c.backends].join(', ')}` : ''}`);
+        console.log(`${pack}\n  built: ${b.join(', ') || '—'}\n  answered: ${answered.join('; ') || '—'}`);
       }
       const all = meter.all();
       const codex = sumEvents(all.filter((e) => e.system !== '__judge__'));
       const judge = sumEvents(all.filter((e) => e.system === '__judge__'));
       console.log(`\nmodel calls ${codex.calls} (${codex.failedCalls} failed, ${codex.replayedCalls} replayed), weighted tokens ${Math.round(codex.weightedTokens).toLocaleString()}, embedding tokens ${codex.embeddingTokens.toLocaleString()}`);
       console.log(`judge calls ${judge.calls}, weighted tokens ${Math.round(judge.weightedTokens).toLocaleString()}; scores ${store.allScores().length}`);
+      const calls = all.filter((e) => !e.embeddingCalls && !e.embeddingTokens);
+      const remoteCalls = calls.filter((e) => e.worker);
+      if (remoteCalls.length) {
+        const byWorker = new Map<string, number>();
+        for (const e of remoteCalls) byWorker.set(e.worker!, (byWorker.get(e.worker!) ?? 0) + 1);
+        console.log(`remote: ${remoteCalls.length} of ${calls.length} model calls and sessions ran on workers (${[...byWorker].map(([w, n]) => `${w} ${n}`).join(', ')}); backends ${[...new Set(calls.map((e) => e.backend ?? e.model))].join(', ')}`);
+      }
       if (all.length) console.log(`last activity ${all[all.length - 1].at}`);
     });
   evalCmd

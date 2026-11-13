@@ -30,6 +30,10 @@ export interface MeterEvent extends MeterTag {
   usage: CallUsage | null;
   embeddingTokens?: number;
   embeddingCalls?: number;
+  /** The remote worker that answered (docs/design/27 §8); absent = this machine. */
+  worker?: string;
+  /** The CLI and model the call ran on, `codex-cli:<model>`, wherever it ran. */
+  backend?: string;
 }
 
 /** Parse a shim tag carried as the bearer token: `sys=<system>;stage=<stage>;task=<task>`. */
@@ -103,6 +107,19 @@ export class Meter {
     return sumEvents(this.since(mark, filter));
   }
 
+  /**
+   * Where the model calls a filter selects since a mark ran (docs/design/27 §8):
+   * `worker` is "local" when all ran here, the worker's name when one remote
+   * worker answered them all, and "mixed" otherwise; `remoteCalls` counts the
+   * remote ones; `backend` lists the CLIs and models, more than one only when
+   * backends mixed (which a run never does on its own). Null with no calls.
+   */
+  placement(filter: (ev: MeterEvent) => boolean, mark = 0): Placed | null {
+    const calls = this.since(mark, (e) => filter(e) && !e.embeddingCalls && !e.embeddingTokens);
+    if (!calls.length) return null;
+    return placementOf(calls);
+  }
+
   /** Usage per stage of one system since a mark. */
   stages(system: string, mark = 0): Record<string, Usage> {
     const out: Record<string, Usage> = {};
@@ -111,6 +128,25 @@ export class Meter {
     }
     return out;
   }
+}
+
+/** Where a record's model calls ran: see `Meter.placement`. */
+export interface Placed {
+  worker: string;
+  backend: string;
+  calls: number;
+  remoteCalls: number;
+}
+
+export function placementOf(calls: Pick<MeterEvent, 'worker' | 'backend' | 'model'>[]): Placed {
+  const workers = new Set(calls.map((e) => e.worker ?? 'local'));
+  const backends = new Set(calls.map((e) => e.backend ?? e.model));
+  return {
+    worker: workers.size === 1 ? [...workers][0] : 'mixed',
+    backend: [...backends].sort().join(','),
+    calls: calls.length,
+    remoteCalls: calls.filter((e) => e.worker).length,
+  };
 }
 
 export function sumEvents(events: MeterEvent[], into: Usage = emptyUsage()): Usage {

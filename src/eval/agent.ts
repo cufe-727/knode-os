@@ -7,6 +7,8 @@ import { cliCommand, CODEX_SERVICES_OFF, effortFor, resolveExecutable, runProces
 import { catalogArgs, exitFailure, withCodexCatalog } from '../llm/codex-catalog.js';
 import { CallUsage, readCodexEvents } from '../llm/usage.js';
 import { EVAL_HOME } from './pack.js';
+import { currentRemote } from './placement.js';
+import { remoteAgent, RemoteEval } from './remote.js';
 import { evalTempDir } from './tmp.js';
 
 /**
@@ -73,6 +75,8 @@ export interface AgentRunOptions {
   mcp?: McpServerSpec;
   /** Extra roots a command may touch without voiding the answer. */
   allowRoots?: string[];
+  /** What the session is for, for a remote worker's log and Tasks (a system and task). */
+  label?: string;
 }
 
 export interface AgentRunResult {
@@ -88,6 +92,10 @@ export interface AgentRunResult {
   filesTouched: string[];
   ms: number;
   error?: string;
+  /** The remote worker that ran it (docs/design/27 §8); absent = this machine. */
+  worker?: string;
+  /** The CLI and model it ran on, `codex-cli:<model>` (or the API link's name). */
+  backend?: string;
 }
 
 const toml = (v: unknown) => JSON.stringify(v);
@@ -134,9 +142,8 @@ const SYSTEM_PREFIXES = ['/usr/', '/bin/', '/sbin/', '/opt/homebrew/', '/dev/', 
  * home (packs, runs, sources) or the person's home outside the folder.
  * System binaries and devices are fine; so is the folder itself.
  */
-export function leakedPaths(command: string, cwd: string, allowRoots: string[] = []): string[] {
+export function leakedPaths(command: string, cwd: string, allowRoots: string[] = [], home = os.homedir()): string[] {
   const root = path.resolve(cwd);
-  const home = os.homedir();
   const leaks: string[] = [];
   for (const tok of pathTokens(command)) {
     const expanded = tok.startsWith('~/') ? path.join(home, tok.slice(2)) : tok;
@@ -175,13 +182,66 @@ interface CodexItem {
   arguments?: unknown;
 }
 
+/**
+ * A session's `codex exec --json` events as they stream: its trace (command
+ * lines and MCP calls), the step cap, and the leak audit. One reader for a
+ * session run here and one a remote worker ran (src/eval/remote.ts), whose
+ * folder paths are read as this machine's copy (`rewrite`) and whose home is
+ * the worker's.
+ */
+export class AgentTrace {
+  readonly commands: string[] = [];
+  readonly leaked: string[] = [];
+  readonly touched = new Set<string>();
+  steps = 0;
+  capped = false;
+
+  constructor(private readonly opts: { cwd: string; maxSteps: number; allowRoots?: string[]; home?: string; rewrite?: (command: string) => string; onCap?: () => void }) {}
+
+  line(line: string): void {
+    if (!line.startsWith('{')) return;
+    let ev: { type?: string; item?: CodexItem };
+    try {
+      ev = JSON.parse(line) as { type?: string; item?: CodexItem };
+    } catch {
+      return;
+    }
+    if (ev.type !== 'item.started' || !ev.item) return;
+    const item = ev.item;
+    if (item.type === 'command_execution' && typeof item.command === 'string') {
+      this.steps++;
+      this.commands.push(item.command);
+      const command = this.opts.rewrite ? this.opts.rewrite(item.command) : item.command;
+      this.leaked.push(...leakedPaths(command, this.opts.cwd, this.opts.allowRoots, this.opts.home));
+      for (const f of touchedFiles(command, this.opts.cwd)) this.touched.add(f);
+    } else if (item.type === 'mcp_tool_call') {
+      this.steps++;
+      this.commands.push(`mcp:${item.server ?? ''}.${item.tool ?? ''} ${JSON.stringify(item.arguments ?? {}).slice(0, 300)}`);
+    }
+    if (this.steps > this.opts.maxSteps && !this.capped) {
+      this.capped = true;
+      this.opts.onCap?.();
+    }
+  }
+}
+
 export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
+  // on a remote worker when the run offers its sessions and one takes this one (docs/design/27 §8); a run
+  // routed over an agent chain stays here, since its links are this machine's keys and logins
+  const remote = routing ? null : currentRemote<RemoteEval>();
+  if (remote) {
+    const r = await remoteAgent(remote, opts);
+    if (r) return r;
+    remote.counts.here++;
+    await remote.localGate();
+  }
   // down the chain: an API link until its budget or credit is gone, then the next
   for (;;) {
     const link = routing?.pick() ?? null;
     if (routing && !link) throw new Error('agent sessions: every model in the chain is spent');
     const r = await runAgentOnce(opts, link?.api);
     const model = link?.api?.model ?? opts.model ?? '';
+    r.backend = link?.api ? `${link.name}:${model || 'default'}` : `codex-cli:${model || 'default'}`;
     if (link) routing!.charge(link.name, model, r.usage);
     if (link && r.error && /insufficient_quota|exceeded your current quota|credit balance is too low|billing|payment required|\b402\b/i.test(r.error)) {
       routing!.exhaust(link.name, r.error.slice(0, 120));
@@ -196,39 +256,11 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
   const outDir = out.root;
   const outFile = path.join(outDir, 'answer.txt');
   const maxSteps = opts.maxSteps ?? 25;
-  const commands: string[] = [];
-  const leaked: string[] = [];
-  const touched = new Set<string>();
-  let steps = 0;
-  let capped = false;
   let child: ChildProcess | null = null;
   let buffer = '';
   const t0 = Date.now();
-
-  const onLine = (line: string) => {
-    if (!line.startsWith('{')) return;
-    let ev: { type?: string; item?: CodexItem };
-    try {
-      ev = JSON.parse(line) as { type?: string; item?: CodexItem };
-    } catch {
-      return;
-    }
-    if (ev.type !== 'item.started' || !ev.item) return;
-    const item = ev.item;
-    if (item.type === 'command_execution' && typeof item.command === 'string') {
-      steps++;
-      commands.push(item.command);
-      leaked.push(...leakedPaths(item.command, opts.cwd, opts.allowRoots));
-      for (const f of touchedFiles(item.command, opts.cwd)) touched.add(f);
-    } else if (item.type === 'mcp_tool_call') {
-      steps++;
-      commands.push(`mcp:${item.server ?? ''}.${item.tool ?? ''} ${JSON.stringify(item.arguments ?? {}).slice(0, 300)}`);
-    }
-    if (steps > maxSteps && !capped) {
-      capped = true;
-      child?.kill('SIGTERM');
-    }
-  };
+  const newTrace = () => new AgentTrace({ cwd: opts.cwd, maxSteps, allowRoots: opts.allowRoots, onCap: () => child?.kill('SIGTERM') });
+  let trace = newTrace();
 
   try {
     let stdout = '';
@@ -237,11 +269,7 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
       const cmd = cliCommand('codex-cli', opts.command ?? '');
       const r = await withCodexCatalog(resolveExecutable(cmd), opts.model, (catalog) => {
         // a repeat (Codex could not read the catalog copy) starts from nothing, as the first try did
-        commands.length = 0;
-        leaked.length = 0;
-        touched.clear();
-        steps = 0;
-        capped = false;
+        trace = newTrace();
         buffer = '';
         const args = agentArgs(api ? { ...opts, model: api.model || opts.model } : opts, outFile, catalog);
         if (api) args.splice(args.length - 1, 0, ...apiProviderArgs(api.baseUrl));
@@ -253,14 +281,14 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
             buffer += chunk;
             let nl: number;
             while ((nl = buffer.indexOf('\n')) >= 0) {
-              onLine(buffer.slice(0, nl));
+              trace.line(buffer.slice(0, nl));
               buffer = buffer.slice(nl + 1);
             }
           },
         });
       }, exitFailure);
       stdout = r.stdout;
-      if (r.code !== 0 && !capped) error = `codex exec exited with ${r.code}: ${readCodexEvents(r.stdout).error ?? r.stderr.slice(-300)}`;
+      if (r.code !== 0 && !trace.capped) error = `codex exec exited with ${r.code}: ${readCodexEvents(r.stdout).error ?? r.stderr.slice(-300)}`;
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
     }
@@ -269,11 +297,11 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
     return {
       text,
       usage: events.usage,
-      commands,
-      toolCalls: steps,
-      capped,
-      leaked: [...new Set(leaked)],
-      filesTouched: [...touched],
+      commands: trace.commands,
+      toolCalls: trace.steps,
+      capped: trace.capped,
+      leaked: [...new Set(trace.leaked)],
+      filesTouched: [...trace.touched],
       ms: Date.now() - t0,
       ...(error && !text ? { error } : {}),
     };

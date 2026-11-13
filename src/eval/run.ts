@@ -7,7 +7,7 @@ import { isCliProvider, KnodeConfig, LlmEffort, loadConfig } from '../config.js'
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { createConfiguredEmbeddingProvider } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
-import { Judge } from './judge.js';
+import { Judge, JUDGE_SYSTEM } from './judge.js';
 import { ModelChain, parseChain, SpendLedger } from './chain.js';
 import { setAgentRouting } from './agent.js';
 import { Meter } from './meter.js';
@@ -20,14 +20,17 @@ import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
 import { scoreLists } from './score/lists.js';
 import { scoreUsage } from './score/usage.js';
-import { ChatBackend, ClientBackend, CodexBackend, startShim } from './shim.js';
+import { ChatBackend, ClientBackend, CodexBackend, shimState, startShim } from './shim.js';
+import { withRemote } from './placement.js';
+import { judgeAgent, packMayLeave, PlacedChatBackend, RemoteEval, remoteJudgeClient, RunCancelledError } from './remote.js';
+import type { Placed } from './meter.js';
 import { closeAdapters } from './systems/external.js';
 import { makeSystems } from './systems/index.js';
 import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
 import { boundedTrace } from './trace.js';
 import { SystemEnv, SystemUnderTest, taggedEmbedder } from './systems/types.js';
 import { extractFinalAnswer } from './metrics/text.js';
-import { AnswerRecord, BuildRecord, emptyUsage, Suite, SUITES, Task, TaskType } from './types.js';
+import { AnswerRecord, BuildRecord, emptyUsage, ScoreRecord, Suite, SUITES, Task, TaskType } from './types.js';
 
 /**
  * `knode-os eval run` (docs/design/23 §7). For each pack: stage the corpus,
@@ -112,6 +115,19 @@ export interface RunOptions {
   rebuild?: string[];
   /** Tests: stand-ins for Codex, the judge and the embedder. */
   overrides?: { chat?: ChatBackend; judge?: LlmClient; embedder?: EmbeddingProvider };
+  /**
+   * Offer the run's model work to remote workers through `serve` on this
+   * machine (docs/design/27 §8): its origin and the data root's MCP token.
+   * Only work whose CLI and model the run names leaves (`--model`, and
+   * `--judge-model` for the judge); a pack with a `private:` source never does.
+   */
+  remote?: { serveUrl: string; token: string; offerSeconds?: number; refreshMs?: number } | null;
+  /** Answer each task this many times, for run-to-run variance (default 1: today's keys). */
+  repeat?: number;
+  /** The systems answered `repeat` times (default: every system that answers). */
+  repeatSystems?: string[];
+  /** Cancels the run: what is out with workers is withdrawn and their session tokens revoked. */
+  signal?: AbortSignal;
   onProgress?: (msg: string) => void;
 }
 
@@ -218,9 +234,27 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const backend = opts.overrides?.chat
     ?? (opts.chatChain ? chain(opts.chatChain).asBackend()
       : opts.chatConnection ? connectionBackend(workspaceConfig, opts.chatConnection, opts.model) : new CodexBackend({ model: opts.model }));
-  const judgeClient = opts.overrides?.judge
+  const localJudge = opts.overrides?.judge
     ?? (opts.judgeChain ? chain(opts.judgeChain).asClient()
       : new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 }));
+  // remote workers beside this machine (docs/design/27 §8): only with `serve` running and offering eval work
+  const runId = path.basename(runDir);
+  const remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run: runId, quota, log: chainLog }) : null;
+  const onAbort = () => void remote?.cancel();
+  opts.signal?.addEventListener('abort', onAbort, { once: true });
+  // a call leaves only on the run's own Codex backend with a named model: the worker runs exactly that one
+  const callsLeave = Boolean(remote && !opts.overrides?.chat && !opts.chatChain && !opts.chatConnection && opts.model);
+  if (remote && !callsLeave) chainLog(`remote: model calls stay here (${opts.model ? 'the run answers on a chain, a connection or a stand-in' : 'no --model: a worker runs the model the run names'}); agent sessions${opts.model ? '' : ' too'}`);
+  const state = shimState({ cacheDir: store.cacheDir(), slots: opts.slots ?? 6, embeddingTokenCap: opts.embeddingTokenCap });
+  const placed = callsLeave ? new PlacedChatBackend(backend, state.slots, remote!, { model: opts.model! }) : null;
+  // a pack with a private source never leaves: its scoring neither, and the judge scores packs together
+  const anyPrivate = remote ? opts.packs.some((dir) => !packMayLeave(loadPack(dir))) : false;
+  const judgeRemote = remote && !opts.overrides?.judge && !opts.judgeChain ? judgeAgent(opts.judgeProvider ?? 'claude-cli', opts.judgeModel ?? '') : null;
+  if (remote && judgeRemote && anyPrivate) chainLog('remote: the judge stays here (a pack in this run has private sources)');
+  else if (remote && !judgeRemote) chainLog('remote: the judge stays here (no --judge-model, or a chain or stand-in judges)');
+  const judgeClient = judgeRemote && !anyPrivate ? remoteJudgeClient(localJudge, remote!, judgeRemote) : localJudge;
+  // this machine's plan holds only what runs here while workers take the rest
+  if (remote) quota.setBypass(() => remote.online('eval-call', 'codex') + remote.online('eval-session', 'codex') > 0);
   if (opts.agentChain) {
     const agents = chain(opts.agentChain);
     const bad = agents.links.find((l) => !l.api && l.name !== 'codex-cli');
@@ -242,17 +276,17 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     store.log('builds reused', { from: opts.reuseBuildsFrom, ...n });
   }
 
-  const shim = await startShim({
-    backend,
+  const shimOptions = {
     embedder,
     meter,
-    cacheDir: store.cacheDir(),
-    slots: opts.slots ?? 6,
+    state,
     buildEffort: models.buildEffort,
     answerEffort: models.answerEffort,
-    embeddingTokenCap: opts.embeddingTokenCap,
     embeddingBudget: budget,
-  });
+  };
+  const shim = await startShim({ ...shimOptions, backend: placed ?? backend });
+  // a private pack's calls go to a shim that never offers them (packs share the caches and this machine's slots)
+  const localShim = placed ? await startShim({ ...shimOptions, backend }) : shim;
 
   const meta: RunMeta = store.meta() ?? {
     id: path.basename(runDir),
@@ -273,6 +307,17 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   };
   store.writeMeta(meta);
 
+  // remote slots add to this machine's: a system answers that many more tasks at once while workers are online (F)
+  const concurrencyFor = (s: SystemUnderTest) => {
+    const base = opts.answerConcurrency ?? 3;
+    if (!remote) return base;
+    return base + (isAgent(s) ? remote.online('eval-session', 'codex') : callsLeave ? remote.online('eval-call', 'codex') : 0);
+  };
+  const repeat = Math.max(1, Math.trunc(opts.repeat ?? 1));
+  const repeatsOf = (s: SystemUnderTest) => (repeat > 1 && (!opts.repeatSystems?.length || opts.repeatSystems.includes(s.id)) ? repeat : 1);
+  if (repeat > 1) meta.repeat = { n: repeat, systems: opts.repeatSystems?.length ? opts.repeatSystems : opts.systems };
+  if (remote) meta.remote = { serve: opts.remote!.serveUrl, calls: callsLeave, judge: Boolean(judgeRemote && !anyPrivate) };
+  store.writeMeta(meta);
   const tasksByKey = new Map<string, Task>();
   const corpusDocs = new Map<string, Set<string>>();
   const citing = new Set<string>();
@@ -285,7 +330,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const onSignal = (signal: NodeJS.Signals) => {
     closeAdapters();
     removeHeldTempDirs();
-    process.exit(signal === 'SIGINT' ? 130 : 143);
+    // what is out with workers is withdrawn and its session tokens die before this process does
+    void (remote ? remote.cancel() : Promise.resolve()).finally(() => process.exit(signal === 'SIGINT' ? 130 : 143));
   };
   process.once('SIGINT', onSignal);
   process.once('SIGTERM', onSignal);
@@ -321,6 +367,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       corpusDocs.set(pack.manifest.id, new Set(staged.docs.map((d) => d.path)));
       for (const t of pack.tasks) tasksByKey.set(`${pack.manifest.id}|${t.id}`, t);
       progress(`pack ${pack.manifest.id}: ${staged.docs.length} documents${staged.padded ? ` (${staged.padded} of them padding)` : ''}, ${staged.tasks.length} tasks`);
+      const leaves = Boolean(remote) && packMayLeave(pack);
+      if (remote && !leaves) progress(`pack ${pack.manifest.id} has private sources: all its work stays on this machine`);
+      const packShim = leaves ? shim : localShim;
       const chars = staged.docs.reduce((n, d) => n + fs.readFileSync(path.join(staged.dir, d.path), 'utf8').length, 0);
       meta.staged = { ...meta.staged, [pack.manifest.id]: { documents: staged.docs.length, padded: staged.padded, chars, tasks: staged.tasks.length } };
       store.writeMeta(meta);
@@ -341,19 +390,20 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           pack,
           staged,
           workDir: store.workDir(pack.manifest.id, group),
-          shim,
+          shim: packShim,
           meter,
           quota,
           models,
           log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`),
         };
-        if (!(await buildGroup(store, meter, env, group, members, fraction, seed, progress))) {
+        if (!(await buildGroup(store, meter, env, group, members, fraction, seed, progress, opts.signal))) {
           failed.add(group);
           continue;
         }
         for (const s of members) {
           for (const other of members) if (other !== s) await other.release?.(env);
-          await answerAll(store, meter, env, s, isAgent(s) ? selectTasks(allTasks, suites, opts.agentLimit ?? 30, seed) : allTasks, fraction, seed, opts.answerConcurrency ?? 3, progress);
+          const tasks = isAgent(s) ? selectTasks(allTasks, suites, opts.agentLimit ?? 30, seed) : allTasks;
+          for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, tasks, fraction, seed, concurrencyFor(s), progress, undefined, r, opts.signal);
           await retrieveAll(store, env, s, allTasks, fraction, seed);
         }
         // generated knowledge, once per build
@@ -379,7 +429,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         const tasks = updateTasks.filter((t) => t.afterUpdate === batch);
         for (const [group, members] of groups) {
           if (failed.has(group)) continue;
-          const env: SystemEnv = { runId: meta.id, pack, staged, workDir: store.workDir(pack.manifest.id, group), shim, meter, quota, models, log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`) };
+          const env: SystemEnv = { runId: meta.id, pack, staged, workDir: store.workDir(pack.manifest.id, group), shim: packShim, meter, quota, models, log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`) };
           const updater = members.find((s) => s.update);
           const key = recordKey('update', pack.manifest.id, group, batch, fraction, seed);
           if (updater && !store.build(key)) {
@@ -393,12 +443,15 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
               ok = false;
               error = err instanceof Error ? err.message : String(err);
             }
-            store.putBuild({ key, pack: pack.manifest.id, system: `${group}@${batch}`, ok, error, ms: Date.now() - t0, usage: meter.usage((e) => e.system === group, mark), stages: meter.stages(group, mark), bytes: 0, notes: { batch, files: files.length, tasks: tasks.length }, at: new Date().toISOString() });
+            if (opts.signal?.aborted) throw new RunCancelledError();
+            store.putBuild({ key, pack: pack.manifest.id, system: `${group}@${batch}`, ok, error, ms: Date.now() - t0, usage: meter.usage((e) => e.system === group, mark), stages: meter.stages(group, mark), bytes: 0, notes: { batch, files: files.length, tasks: tasks.length }, at: new Date().toISOString(), ...where(meter.placement((e) => e.system === group, mark)) });
           } else {
             // nothing to update, or a resumed run that updated already: reopen on the staged corpus as it now is
             for (const s of members) await s.reopen?.(env).catch(() => {});
           }
-          for (const s of members) await answerAll(store, meter, env, s, tasks, fraction, seed, opts.answerConcurrency ?? 3, progress, batch);
+          for (const s of members) {
+            for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, tasks, fraction, seed, concurrencyFor(s), progress, batch, r, opts.signal);
+          }
           for (const s of members) await s.release?.(env);
         }
       }
@@ -408,7 +461,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       for (;;) {
         const before = budget.refusals;
         try {
-          await runPack(pack);
+          // a pack's agent sessions may leave unless a source of it is private (src/eval/placement.ts)
+          await withRemote(remote && packMayLeave(pack) ? remote : null, () => runPack(pack));
         } catch (err) {
           if (budget.refusals === before) throw err;
         }
@@ -422,13 +476,24 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       store.log('pack failed', { pack: pack.manifest.id, error: err instanceof Error ? err.message : String(err) });
     });
 
-    if (!opts.skipScoring) await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing }, progress);
+    if (opts.signal?.aborted) throw new RunCancelledError();
+    if (!opts.skipScoring) await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing }, progress, meter);
+    if (remote) {
+      const c = remote.counts;
+      progress(`remote: ${c.remote} of ${c.offered} pieces offered were answered by workers; ${c.here} ran here`);
+      store.log('remote', { ...c });
+    }
   } finally {
     setAgentRouting(null);
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);
+    opts.signal?.removeEventListener('abort', onAbort);
+    if (opts.signal?.aborted) await remote?.cancel();
+    remote?.close();
+    quota.setBypass(null);
     closeAdapters();
     await shim.close();
+    if (localShim !== shim) await localShim.close();
     for (const l of loaded) l.staged.cleanup();
   }
   return { runDir, builds: store.allBuilds().length, answers: store.allAnswers().length, scores: store.allScores().length };
@@ -493,18 +558,37 @@ export async function scoreAnswers(
   store: RunStore, judge: Judge,
   ctx: { tasks: Map<string, Task>; corpusDocs: Map<string, Set<string>>; citing: Set<string> },
   progress: (m: string) => void = () => {},
+  meter?: Meter,
 ): Promise<number> {
-  const answers = store.allAnswers().filter((a) => {
+  // a repeated answer (`--repeat`) is scored as a system of its own, `<system>#r<n>`, so its scores keep their own keys
+  const answers = store.allAnswers().map((a) => (a.repeat && a.repeat > 1 ? { ...a, system: repeatSystem(a.system, a.repeat) } : a)).filter((a) => {
     if (!ctx.tasks.has(`${a.pack}|${a.taskId}`)) return false;
     const scored = store.score(recordKey('score', a.pack, a.system, a.taskId, 'latency_ms'));
     return !scored || scored.at < a.at;
   });
   if (!answers.length) return 0;
   progress(`scoring ${answers.length} answers`);
-  for (const r of await scoreUsage({ answers, tasks: ctx.tasks, citing: ctx.citing }, judge)) store.putScore(r);
-  for (const r of await scoreLists({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge)) store.putScore(r);
-  for (const r of await scoreEmergence({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge)) store.putScore(r);
+  const citing = new Set([...ctx.citing, ...answers.filter((a) => ctx.citing.has(a.system.split('#')[0])).map((a) => a.system)]);
+  // where the judge's calls ran, on every score of the pass (docs/design/27 §8)
+  const mark = meter?.mark() ?? 0;
+  const pending: ScoreRecord[] = [];
+  const put = (r: ScoreRecord) => pending.push(r);
+  for (const r of await scoreUsage({ answers, tasks: ctx.tasks, citing }, judge)) put(r);
+  for (const r of await scoreLists({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge)) put(r);
+  for (const r of await scoreEmergence({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge)) put(r);
+  const placed = where(meter?.placement((e) => e.system === JUDGE_SYSTEM, mark) ?? null);
+  for (const r of pending) store.putScore({ ...r, ...placed });
   return answers.length;
+}
+
+/** The system a repeated answer is scored as. */
+export function repeatSystem(system: string, repeat: number): string {
+  return `${system}#r${repeat}`;
+}
+
+/** A record's `worker` and `backend` from where its model calls ran; nothing when it made none. */
+function where(p: Placed | null): { worker?: string; backend?: string } {
+  return p ? { worker: p.worker, backend: p.backend } : {};
 }
 
 /**
@@ -512,30 +596,42 @@ export async function scoreAnswers(
  * its records and the packs it names — with no model of its own running, so
  * only while the run itself is stopped.
  */
-export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; onProgress?: (m: string) => void } = {}): Promise<number> {
+export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; onProgress?: (m: string) => void; remote?: RunOptions['remote'] } = {}): Promise<number> {
   const store = new RunStore(runDir);
   const meta = store.meta();
   if (!meta) throw new Error(`not a run directory: ${runDir}`);
   const meter = new Meter(path.join(runDir, 'meter.jsonl'));
   const quota = new QuotaGuard({ enabled: false, log: (m, d) => opts.onProgress?.(`${m}${d ? ` ${JSON.stringify(d)}` : ''}`) });
-  const client = new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 });
-  const judge = new Judge({ client, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
+  const local = new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 });
   const tasks = new Map<string, Task>();
   const corpusDocs = new Map<string, Set<string>>();
+  const packs: LoadedPack[] = [];
   for (const name of meta.packs) {
     const dir = path.isAbsolute(name) ? name : path.join(packsDir(), name);
     if (!fs.existsSync(path.join(dir, 'pack.json'))) continue;
-    const pack = loadPack(dir);
+    packs.push(loadPack(dir));
+  }
+  // the judge's calls go to remote workers too (docs/design/27 §8) — never for a run with a private pack
+  const agent = judgeAgent(opts.judgeProvider ?? 'claude-cli', opts.judgeModel ?? '');
+  const remote = opts.remote && agent && packs.every(packMayLeave) ? await RemoteEval.connect({ ...opts.remote, run: `${meta.id}-score`, quota, log: (m) => opts.onProgress?.(m) }) : null;
+  const client = remote && agent ? remoteJudgeClient(local, remote, agent) : local;
+  const judge = new Judge({ client, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
+  for (const pack of packs) {
     for (const t of pack.tasks) tasks.set(`${pack.manifest.id}|${t.id}`, t);
     const docs = new Set(pack.docs.map((d) => d.path));
     for (const batch of pack.updates) for (const f of listFiles(path.join(pack.dir, 'updates', batch))) docs.add(f);
     corpusDocs.set(pack.manifest.id, docs);
   }
   const citing = new Set(makeSystems(meta.systems).filter((s) => s.answers && s.kind !== 'reference' && s.cites !== false).map((s) => s.id));
-  return scoreAnswers(store, judge, { tasks, corpusDocs, citing }, opts.onProgress);
+  try {
+    return await scoreAnswers(store, judge, { tasks, corpusDocs, citing }, opts.onProgress, meter);
+  } finally {
+    remote?.close();
+  }
 }
 
-async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: string, members: SystemUnderTest[], fraction: number, seed: string | number, progress: (m: string) => void): Promise<boolean> {
+async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: string, members: SystemUnderTest[], fraction: number, seed: string | number, progress: (m: string) => void, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) throw new RunCancelledError();
   const builder = members.find((s) => s.build);
   if (!builder) return true;
   const key = recordKey('build', env.pack.manifest.id, env.pack.manifest.version, group, fraction, seed);
@@ -557,16 +653,20 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
       key, pack: env.pack.manifest.id, system: group, ok: true, ms: Date.now() - t0,
       usage: meter.usage((e) => e.system === group && !e.task, mark), stages: meter.stages(group, mark),
       bytes: r.kbDir ? kbBytes(group, r.kbDir) : 0, peakRssBytes: peak, notes: r.notes, at: new Date().toISOString(),
+      ...where(meter.placement((e) => e.system === group && !e.task, mark)),
     };
   } catch (err) {
     rec = {
       key, pack: env.pack.manifest.id, system: group, ok: false, error: err instanceof Error ? err.message : String(err), ms: Date.now() - t0,
       usage: meter.usage((e) => e.system === group && !e.task, mark), stages: meter.stages(group, mark), bytes: 0, peakRssBytes: peak, at: new Date().toISOString(),
+      ...where(meter.placement((e) => e.system === group && !e.task, mark)),
     };
     progress(`[${env.pack.manifest.id}/${group}] build failed: ${rec.error}`);
   } finally {
     clearInterval(sampler);
   }
+  // a cancelled run writes no record of what it stopped: a resumed run builds it whole
+  if (signal?.aborted) throw new RunCancelledError();
   store.putBuild(rec);
   if (!rec.ok) {
     store.log('build failed', { pack: env.pack.manifest.id, group, error: rec.error });
@@ -580,44 +680,61 @@ function kbBytes(group: string, dir: string): number {
   return dirBytes(dir);
 }
 
+/**
+ * An answer's key. Repeat 1 keeps the key every run has used; a repeat
+ * (`--repeat`) adds its index, and its task id carries `~r<n>` while it is
+ * answered, so the shim asks the model again instead of replaying.
+ */
+export function answerKey(pack: string, system: string, taskId: string, fraction: number, seed: string | number, batch?: string, repeat = 1): string {
+  return repeat > 1 ? recordKey('answer', pack, system, taskId, fraction, seed, batch, `r${repeat}`) : recordKey('answer', pack, system, taskId, fraction, seed, batch);
+}
+
 async function answerAll(
   store: RunStore, meter: Meter, env: SystemEnv, s: SystemUnderTest, tasks: Task[], fraction: number, seed: string | number,
-  concurrency: number, progress: (m: string) => void, batch?: string,
+  concurrency: number, progress: (m: string) => void, batch?: string, repeat = 1, signal?: AbortSignal,
 ): Promise<void> {
   if (!s.answers || !s.answer) return;
   const docs = new Set(env.staged.docs.map((d) => d.path));
   // an answer that ended in an error is asked again on resume (a timeout, a backend that was down)
   const todo = tasks.filter((t) => {
-    const prev = store.answer(recordKey('answer', env.pack.manifest.id, s.id, t.id, fraction, seed, batch));
+    const prev = store.answer(answerKey(env.pack.manifest.id, s.id, t.id, fraction, seed, batch, repeat));
     return !prev || Boolean(prev.error);
   });
   if (!todo.length) return;
-  progress(`[${env.pack.manifest.id}/${s.id}] answering ${todo.length} tasks`);
+  progress(`[${env.pack.manifest.id}/${s.id}] answering ${todo.length} tasks${repeat > 1 ? ` (repeat ${repeat})` : ''}`);
   let done = 0;
-  await mapLimit(todo, s.serial ? 1 : concurrency, async (t) => {
-    const key = recordKey('answer', env.pack.manifest.id, s.id, t.id, fraction, seed, batch);
+  await mapLimit(todo, s.serial ? 1 : concurrency, async (task) => {
+    if (signal?.aborted) return;
+    const key = answerKey(env.pack.manifest.id, s.id, task.id, fraction, seed, batch, repeat);
+    // a repeat is asked under `<task>~r<n>`: its own meter tag and reply-cache key
+    const t = repeat > 1 ? { ...task, id: `${task.id}~r${repeat}` } : task;
     // every answer, not only agents': one-shot systems spend the same plan
     await env.quota.wait();
     const mark = meter.mark();
     const t0 = Date.now();
     let rec: AnswerRecord;
+    const placed = () => ({ ...(repeat > 1 ? { repeat } : {}), ...where(meter.placement((e) => e.system === s.id && e.task === t.id, mark)) });
     try {
-      const a = await s.answer!(t, taskPrompt(t), env);
+      const a = await s.answer!(t, taskPrompt(task), env);
       rec = {
-        key, pack: env.pack.manifest.id, system: s.id, taskId: t.id, ...(batch ? { batch } : {}), at: new Date().toISOString(),
+        key, pack: env.pack.manifest.id, system: s.id, taskId: task.id, ...(batch ? { batch } : {}), at: new Date().toISOString(),
         text: a.text, finalAnswer: extractFinalAnswer(a.text),
         citations: a.citations ?? citationsIn(a.text, docs), retrieved: a.retrieved ?? [], toolCalls: a.toolCalls ?? 0,
         ...(a.commands ? { commands: boundedTrace(a.commands) } : {}),
         ...(a.capped ? { capped: true } : {}), ...(a.leaked?.length ? { leaked: a.leaked } : {}), ...(a.error ? { error: a.error } : {}),
         usage: meter.usage((e) => e.system === s.id && e.task === t.id, mark), ms: Date.now() - t0,
+        ...placed(),
       };
     } catch (err) {
       rec = {
-        key, pack: env.pack.manifest.id, system: s.id, taskId: t.id, ...(batch ? { batch } : {}), at: new Date().toISOString(),
+        key, pack: env.pack.manifest.id, system: s.id, taskId: task.id, ...(batch ? { batch } : {}), at: new Date().toISOString(),
         text: '', finalAnswer: '', citations: [], retrieved: [], toolCalls: 0, error: err instanceof Error ? err.message : String(err),
         usage: meter.usage((e) => e.system === s.id && e.task === t.id, mark), ms: Date.now() - t0,
+        ...placed(),
       };
     }
+    // a cancelled run writes no record of what it stopped: a resumed run asks it whole
+    if (signal?.aborted) return;
     store.putAnswer(rec);
     if (++done % 10 === 0) progress(`[${env.pack.manifest.id}/${s.id}] ${done}/${todo.length}`);
   }, () => {});

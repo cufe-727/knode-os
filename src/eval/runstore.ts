@@ -60,6 +60,10 @@ export interface RunMeta {
   /** Task types the run was limited to (`--types`). */
   types?: string[];
   notes?: string;
+  /** `--repeat`: answers per task, and the systems repeated. */
+  repeat?: { n: number; systems: string[] };
+  /** `--remote`: the serve it offered work through, and whether its calls and its judge could leave. */
+  remote?: { serve: string; calls: boolean; judge: boolean };
 }
 
 export class RunStore {

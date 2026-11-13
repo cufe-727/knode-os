@@ -23,10 +23,11 @@ export const ARCHIVE_MAX_FILES = 200_000;
 
 export interface PackedFolder {
   sha256: string;
-  /** Compressed size. */
+  /** Size before compression. */
   bytes: number;
   files: number;
-  gzip: Buffer;
+  /** Compressed on first use: a folder the server holds already is never compressed. */
+  gzip(): Buffer;
 }
 
 function walk(root: string, rel = '', out: string[] = []): string[] {
@@ -52,8 +53,8 @@ export function packFolder(dir: string): PackedFolder {
   }
   const raw = Buffer.concat(parts);
   const sha256 = crypto.createHash('sha256').update(raw).digest('hex');
-  const gzip = zlib.gzipSync(raw, { level: 6 });
-  return { sha256, bytes: gzip.length, files: files.length, gzip };
+  let gzip: Buffer | null = null;
+  return { sha256, bytes: raw.length, files: files.length, gzip: () => (gzip ??= zlib.gzipSync(raw, { level: 6 })) };
 }
 
 /** A path inside the archive's folder, or an error: no absolute path, no climbing out, nothing hidden at the top that a CLI reads as its own. */

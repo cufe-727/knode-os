@@ -258,6 +258,12 @@ export interface AnswerRecord extends Answer {
   /** The update batch applied (cumulatively) before this answer, for update tasks. */
   batch?: string;
   at: string;
+  /** `eval run --repeat`: which answer to the same task this is (2, 3 …); absent on the first. */
+  repeat?: number;
+  /** Where its model calls ran (docs/design/27 §8): "local", a remote worker's name, or "mixed". */
+  worker?: string;
+  /** The CLI and model they ran on, e.g. `codex-cli:gpt-6.1-sol` — the same for every account. */
+  backend?: string;
 }
 
 export interface BuildRecord {
@@ -277,6 +283,10 @@ export interface BuildRecord {
   peakRssBytes?: number;
   notes?: Record<string, unknown>;
   at: string;
+  /** Where its model calls ran (docs/design/27 §8): "local", a remote worker's name, or "mixed". */
+  worker?: string;
+  /** The CLI and model they ran on. */
+  backend?: string;
 }
 
 export interface ScoreRecord {
@@ -293,6 +303,10 @@ export interface ScoreRecord {
   ci?: [number, number];
   detail?: Record<string, unknown>;
   at: string;
+  /** Where the judge calls of its scoring pass ran (docs/design/27 §8): "local", a remote worker's name, or "mixed". */
+  worker?: string;
+  /** The judge's CLI and model. */
+  backend?: string;
 }
 
 /** A unit of what a system generated — never a raw source passage (docs/design/23 §5). */
