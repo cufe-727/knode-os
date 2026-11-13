@@ -1667,7 +1667,7 @@ async function evalSlot(slot, n) {
       held.delete(task.id);
       const secs = Math.round((Date.now() - started) / 1000);
       if (!data.accepted) log(`${identity.worker}: ${label} not taken back: ${data.reason}`);
-      else if (data.failure) log(`${identity.worker}: ${label} could not be served here (${data.failure}) after ${secs}s — it goes back to the run`);
+      else if (data.failure) log(`${identity.worker}: ${label} could not be served here (${data.failure}) after ${secs}s — it goes back to the run${outcome.ok ? '' : `: ${outcome.error.slice(0, 200)}`}`);
       else if (outcome.ok) log(`${identity.worker}: ${label} done in ${secs}s`);
       else log(`${identity.worker}: ${label} failed (${outcome.kind}) in ${secs}s: ${outcome.error.slice(0, 200)}`);
       const failure = data.failure ?? (!outcome.ok && outcome.kind !== 'model' ? outcome.kind : null);

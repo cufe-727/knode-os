@@ -86,7 +86,7 @@ export interface EvalSessionAnswer {
 export type EvalOutcome =
   | { outcome: 'answered'; worker: string; backend: string; text: string; usage: CallUsage | null; model: string; session?: EvalSessionAnswer }
   | { outcome: 'error'; worker: string; backend: string; error: string; usage: CallUsage | null }
-  | { outcome: 'withdrawn'; reason: string }
+  | { outcome: 'withdrawn'; reason: string; strikes?: number; lastError?: string }
   | { outcome: 'failed'; strikes: number; lastError: string }
   | { outcome: 'cancelled' }
   | { outcome: 'stopped' };
@@ -467,7 +467,9 @@ export class EvalSource implements WorkSource {
     for (const p of [...this.pending]) {
       if (p.done || p.lease !== null || now - p.queuedAt < p.offerMs) continue;
       this.totals.withdrawn++;
-      p.settle({ outcome: 'withdrawn', reason: p.strikes ? `no worker took it again within ${Math.round(p.offerMs / 1000)} s` : `no worker took it within ${Math.round(p.offerMs / 1000)} s` });
+      p.settle(p.strikes
+        ? { outcome: 'withdrawn', reason: `no worker took it again within ${Math.round(p.offerMs / 1000)} s`, strikes: p.strikes, lastError: p.lastError }
+        : { outcome: 'withdrawn', reason: `no worker took it within ${Math.round(p.offerMs / 1000)} s` });
     }
     if (this.pending.length === 0 && this.sweeper) {
       clearInterval(this.sweeper);

@@ -88,6 +88,11 @@ export function localServe(dataRoot: string, serveUrl?: string): { serveUrl: str
   return { serveUrl: `http://${host}:${config.server.port}`, token };
 }
 
+/** A worker slot's identity as a record keeps it: the machine (`<token>/<worker>`), not its slot (`…/eval-codex#2`). */
+export function machineOf(worker: string): string {
+  return worker.replace(/\/[^/]*#\d+$/, '');
+}
+
 export class RemoteEval {
   private status: ProducerStatus | null = null;
   private timer: NodeJS.Timeout | null = null;
@@ -149,7 +154,11 @@ export class RemoteEval {
       const text = (await res.text()).trim();
       const body = text ? JSON.parse(text) as RemoteOutcome & { error?: string } : null;
       if (!res.ok || !body || !('outcome' in body)) throw new Error(`${res.status}: ${body?.error ?? text.slice(0, 200)}`);
-      if (body.outcome === 'answered' || body.outcome === 'error') this.counts.remote++;
+      if (body.outcome === 'answered' || body.outcome === 'error') {
+        this.counts.remote++;
+        // records name the machine, not the slot on it: `<token>/<worker>`
+        body.worker = machineOf(body.worker);
+      }
       return body;
     } catch (err) {
       if (this.abort.signal.aborted) return { outcome: 'cancelled' };
