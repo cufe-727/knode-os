@@ -7,7 +7,7 @@
  * document's date), and return null without one rather than guessing.
  */
 
-export type DatePrecision = 'instant' | 'day' | 'month' | 'quarter' | 'half' | 'year';
+export type DatePrecision = 'instant' | 'day' | 'week' | 'month' | 'quarter' | 'half' | 'year';
 
 export interface DateSpan {
   from: string | null;
@@ -46,9 +46,29 @@ function half(y: number, h: number): DateSpan | null {
   return { from: utc(y, m, 1), to: utc(y, m + 5, 0, true), precision: 'half' };
 }
 
+/** ISO week `w` of year `y`: Monday through Sunday. */
+function isoWeek(y: number, w: number): DateSpan | null {
+  if (w < 1 || w > 53) return null;
+  const jan4 = new Date(Date.UTC(y, 0, 4));
+  const monday = new Date(jan4.getTime() - ((jan4.getUTCDay() + 6) % 7) * 86_400_000 + (w - 1) * 7 * 86_400_000);
+  if (w === 53 && new Date(monday.getTime() + 3 * 86_400_000).getUTCFullYear() !== y) return null;
+  const sunday = new Date(monday.getTime() + 6 * 86_400_000);
+  return { from: monday.toISOString(), to: new Date(Date.UTC(sunday.getUTCFullYear(), sunday.getUTCMonth(), sunday.getUTCDate(), 23, 59, 59, 999)).toISOString(), precision: 'week' };
+}
+
+/** The ISO week an instant falls in. */
+function weekOf(d: Date): DateSpan {
+  const day = (d.getUTCDay() + 6) % 7;
+  const monday = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - day));
+  const sunday = new Date(monday.getTime() + 6 * 86_400_000);
+  return { from: monday.toISOString(), to: new Date(Date.UTC(sunday.getUTCFullYear(), sunday.getUTCMonth(), sunday.getUTCDate(), 23, 59, 59, 999)).toISOString(), precision: 'week' };
+}
+
 function absolute(raw: string): DateSpan | null {
   const t = raw.trim();
   let m: RegExpExecArray | null;
+  if ((m = /^(\d{4})\s*-?\s*[wW]\s*(\d{1,2})$/.exec(t))) return isoWeek(+m[1], +m[2]);
+  if ((m = /^(\d{4})\s*年\s*第\s*(\d{1,2})\s*周$/.exec(t))) return isoWeek(+m[1], +m[2]);
   if ((m = /^(\d{4})-(\d{2})-(\d{2})T[\d:.]+(?:Z|[+-]\d{2}:?\d{2})?$/.exec(t))) {
     const d = new Date(t);
     return Number.isNaN(d.getTime()) ? null : { from: d.toISOString(), to: d.toISOString(), precision: 'instant' };
@@ -91,6 +111,11 @@ function relative(raw: string, ref: string): DateSpan | null {
     return quarter(yy, qq);
   }
   if (t === '今天' || t === 'today') return day(y, mo, r.getUTCDate());
+  const weekOffset: Record<string, number> = { 本周: 0, 这周: 0, 'this week': 0, 上周: -1, 上一周: -1, 'last week': -1, 下周: 1, 下一周: 1, 'next week': 1 };
+  if (t in weekOffset) return weekOf(new Date(r.getTime() + weekOffset[t] * 7 * 86_400_000));
+  // a week number without its year is the document's year: "第35周", "W35"
+  const wk = /^(?:第\s*(\d{1,2})\s*周|[wW](\d{1,2}))$/.exec(t);
+  if (wk) return isoWeek(y, +(wk[1] ?? wk[2]));
   return null;
 }
 

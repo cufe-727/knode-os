@@ -116,8 +116,11 @@ describe('closed claim vocabulary', () => {
     expect(system).toContain('  - method: a trading or investment method');
     expect(system).not.toContain('- absence');
     expect(system).toContain('- kind: "fact"');
-    expect(system).toContain('without attribution phrases');
-    expect(system).toContain('"claims":[{"subject","object","type","kind","statement","status","eventDate","startDate","endDate"}]');
+    expect(system).toContain('without attribution');
+    // claim state (docs/design/29): the attribute, value and unit of a measure, and corrections
+    expect(system).toContain('"claims":[{"subject","object","type","kind","statement","status","eventDate","startDate","endDate","attribute","value","unit","corrects"}]');
+    expect(system).toContain('- attribute/value/unit:');
+    expect(system).toContain('- corrects:');
     // without claims the entity rules still carry the new description rule
     const noClaims = buildExtractRequest({ path: 'raw/docs/a.md', title: 'A' }, 'x', { ontology: FINANCE, claims: false });
     expect(noClaims.messages[0].content).toContain('not what this document says about it');

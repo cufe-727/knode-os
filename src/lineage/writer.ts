@@ -290,6 +290,15 @@ export class ScopeWriter {
       eventAt?: string | null;
       /** Reference date of the source that made the assertion. */
       observedAt?: string | null;
+      /** `stated` when the source dates the claim itself, `document` when only its document's date does (docs/design/29). */
+      dateSource?: 'stated' | 'document' | null;
+      /** The attribute of the subject the claim gives a value of, normalized (src/graph/claim-state.ts), and that value. */
+      attribute?: string | null;
+      valueNum?: number | null;
+      valueText?: string | null;
+      unit?: string | null;
+      /** The claim corrects an earlier report. */
+      correction?: boolean;
       extractor: string;
       segmentId?: string | null;
       weight?: number;
@@ -318,6 +327,10 @@ export class ScopeWriter {
       event_at: toIso(c.eventAt),
       observed_at: toIso(c.observedAt),
       object_id: c.objectId ?? null,
+      // the state fields only when there are any, so evidence of claims without them hashes as before
+      ...(c.dateSource ? { date_source: c.dateSource } : {}),
+      ...(c.attribute ? { attribute: c.attribute, value_num: c.valueNum ?? null, value_text: c.valueText ?? null, unit: c.unit ?? null } : {}),
+      ...(c.correction ? { correction: true } : {}),
     });
     if (added) this.stats.claims++;
     this.touched.claims.add(id);

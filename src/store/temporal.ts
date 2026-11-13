@@ -1,3 +1,4 @@
+import { isCorrectionStatement, normalizeAttribute, parseMeasure } from '../graph/claim-state.js';
 import { keyOf } from '../graph/normalize.js';
 import { normalizeClaimType } from '../graph/store.js';
 import { Queryable } from './migrations.js';
@@ -235,9 +236,47 @@ export interface ClaimAsOf {
   primary_scope_id: string | null;
   segment_id: string | null;
   evidence_count: number;
+  /**
+   * The state the claim gives (docs/design/29): the attribute of its subject
+   * and the value, from the extractor's reading, else the statement's
+   * (src/graph/claim-state.ts). Null for a claim that is no measure.
+   */
+  attribute: string | null;
+  value_num: number | null;
+  value_text: string | null;
+  unit: string | null;
+  /**
+   * The date the claim speaks of: of each supporter, the date it states
+   * (event, else start of window), else its document's; of all supporters,
+   * the newest — a value a later report repeats is dated by that report.
+   */
+  effective_at: string | null;
+  /** `stated` or `document`: where effective_at came from. */
+  date_source: string | null;
+  /** The scope of the supporter effective_at came from, so the date and the source shown agree. */
+  effective_scope_id: string | null;
+  correction: boolean;
 }
 
-export function foldClaimEvidence(row: { id: string; subject_id: string; statement: string }, rows: EvidenceAtRow[]): ClaimAsOf | null {
+/** One supporter's own date: the date it states, else its document's. */
+function supporterDate(r: EvidenceAtRow): { at: string | null; source: 'stated' | 'document' | null } {
+  const stated = toIso(str(r.attrs.event_at)) ?? toIso(str(r.attrs.valid_from));
+  if (stated) return { at: stated, source: 'stated' };
+  const observed = toIso(str(r.attrs.observed_at));
+  return observed ? { at: observed, source: 'document' } : { at: null, source: null };
+}
+
+function finiteOrNull(v: unknown): number | null {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * `subjectName` lets the statement be read for a measure when no supporter
+ * carries one (evidence written before claim state, frontmatter claims);
+ * without it only the supporters' own readings count.
+ */
+export function foldClaimEvidence(row: { id: string; subject_id: string; statement: string }, rows: EvidenceAtRow[], subjectName?: string | null): ClaimAsOf | null {
   if (rows.length === 0) return null;
   const byWeight = [...rows].sort((a, b) => b.weight - a.weight || new Date(a.tx_from).getTime() - new Date(b.tx_from).getTime());
   const earliest = [...rows].sort((a, b) => new Date(a.tx_from).getTime() - new Date(b.tx_from).getTime() || a.scope_id.localeCompare(b.scope_id))[0];
@@ -258,6 +297,23 @@ export function foldClaimEvidence(row: { id: string; subject_id: string; stateme
   const objectId = byWeight.map((r) => str(r.attrs.object_id)).find(Boolean) ?? null;
   const eventAt = byWeight.map((r) => toIso(str(r.attrs.event_at))).find(Boolean) ?? null;
   const observed = rows.map((r) => toIso(str(r.attrs.observed_at))).filter((x): x is string => Boolean(x)).sort();
+  // the newest supporter by its own date (ties: the later write, then the scope id)
+  const dated = rows.map((r) => ({ r, ...supporterDate(r) }));
+  const newest = dated
+    .filter((d) => d.at)
+    .sort((a, b) => b.at!.localeCompare(a.at!) || new Date(b.r.tx_from).getTime() - new Date(a.r.tx_from).getTime() || a.r.scope_id.localeCompare(b.r.scope_id))[0];
+  // the reading of the newest supporter that gives one, else the statement's
+  const measured = [...dated]
+    .filter((d) => str(d.r.attrs.attribute))
+    .sort((a, b) => (b.at ?? '').localeCompare(a.at ?? '') || b.r.weight - a.r.weight)[0]?.r;
+  let measure: { attribute: string; valueNum: number | null; valueText: string | null; unit: string | null } | null = null;
+  if (measured) {
+    const attribute = normalizeAttribute(measured.attrs.attribute) ?? str(measured.attrs.attribute)!;
+    measure = { attribute, valueNum: finiteOrNull(measured.attrs.value_num), valueText: str(measured.attrs.value_text) ?? null, unit: str(measured.attrs.unit) ?? null };
+  } else if (subjectName) {
+    measure = parseMeasure(row.statement, subjectName);
+  }
+  const correction = rows.some((r) => r.attrs.correction === true) || isCorrectionStatement(row.statement);
   return {
     id: row.id,
     subject_id: row.subject_id,
@@ -273,6 +329,14 @@ export function foldClaimEvidence(row: { id: string; subject_id: string; stateme
     primary_scope_id: earliest.scope_id,
     segment_id: earliest.segment_id,
     evidence_count: rows.length,
+    attribute: measure?.attribute ?? null,
+    value_num: measure?.valueNum ?? null,
+    value_text: measure?.valueText ?? null,
+    unit: measure?.unit ?? null,
+    effective_at: newest?.at ?? null,
+    date_source: newest?.source ?? null,
+    effective_scope_id: newest?.r.scope_id ?? null,
+    correction,
   };
 }
 

@@ -10,6 +10,7 @@ import {
   Params,
 } from '../store/temporal.js';
 import { EntityCorrection, EntityCorrections, refusedKeys, refuses } from '../graph/corrections.js';
+import { CLAIM_STATE_VERSION } from '../graph/claim-state.js';
 import { entityKeyKinds, KeyKind, nameKey } from '../graph/normalize.js';
 import { emptyTouched, TouchedSet } from './types.js';
 
@@ -266,7 +267,10 @@ async function foldClaims(q: Queryable, touchedIds: string[], txTime: string, re
   const memberRows = await selectIn<{ id: string; canonical_id: string }>(q, ids, (ph) => `SELECT id, canonical_id FROM claims WHERE canonical_id IN (${ph})`);
   const members = groupBy(memberRows, (m) => m.canonical_id);
   const evidence = await liveEvidence(q, 'claim', [...new Set([...ids, ...memberRows.map((m) => m.id)])]);
-  const alive = await entityLiveness(q, [...new Set(current.map((c) => c.subject_id))]);
+  const subjects = [...new Set(current.map((c) => c.subject_id))];
+  const alive = await entityLiveness(q, subjects);
+  // a statement is read for its measure against its subject's name (claim-state.ts)
+  const names = new Map((await selectIn<{ id: string; name: string }>(q, subjects, (ph) => `SELECT id, name FROM entities WHERE id IN (${ph})`)).map((e) => [e.id, e.name]));
 
   for (const cur of current) {
     const own = members.get(cur.id) ?? [];
@@ -274,7 +278,7 @@ async function foldClaims(q: Queryable, touchedIds: string[], txTime: string, re
       ? evidence.get(cur.id) ?? []
       : [...(evidence.get(cur.id) ?? []), ...own.flatMap((m) => evidence.get(m.id) ?? [])];
     const wasLive = cur.tx_to === null;
-    const folded = foldClaimEvidence(cur, rows);
+    const folded = foldClaimEvidence(cur, rows, names.get(cur.subject_id));
     const live = Boolean(folded) && alive.get(cur.subject_id) === true;
     if (!live) {
       if (wasLive) {
@@ -288,7 +292,12 @@ async function foldClaims(q: Queryable, touchedIds: string[], txTime: string, re
     // a representative's group size is part of what it shows (its source count);
     // the kind joins only when it is not the default, so rows folded before
     // claims had one keep their sha and nothing downstream re-renders for it
-    const foldSha = sha16([f.status, f.type, f.valid_from, f.valid_to, f.object_id, f.primary_scope_id, f.event_at, f.observed_at, ...(own.length ? [own.length] : []), ...(f.kind === 'fact' ? [] : [f.kind])]);
+    // the claim state joins only where it says something the old columns did not
+    // (a measure, a correction, a newer supporter than the first), for the same reason
+    const state = f.attribute || f.correction || (f.effective_scope_id && f.effective_scope_id !== f.primary_scope_id)
+      ? [f.attribute, f.value_num, f.value_text, f.unit, f.effective_at, f.effective_scope_id, f.correction]
+      : [];
+    const foldSha = sha16([f.status, f.type, f.valid_from, f.valid_to, f.object_id, f.primary_scope_id, f.event_at, f.observed_at, ...(own.length ? [own.length] : []), ...(f.kind === 'fact' ? [] : [f.kind]), ...state]);
     if (!wasLive) result.reopened.claims.add(cur.id);
     if (!wasLive || foldSha !== cur.fold_sha) result.changed.claims.add(cur.id);
     await q.query(
@@ -298,12 +307,15 @@ async function foldClaims(q: Queryable, touchedIds: string[], txTime: string, re
               chunk_id = (SELECT id FROM chunks WHERE id = $8),
               evidence_count = $9, fold_sha = $10,
               event_at = $12::timestamptz, observed_at = $13::timestamptz, kind = $14,
+              attribute = $15, value_num = $16::float8, value_text = $17, unit = $18,
+              effective_at = $19::timestamptz, date_source = $20, effective_scope_id = $21, correction = $22, state_v = $23,
               tx_from = CASE WHEN tx_to IS NOT NULL THEN $11::timestamptz ELSE tx_from END, tx_to = NULL
        WHERE id = $1`,
       [
         cur.id, f.status, f.type, f.valid_from, f.valid_to,
         f.primary_scope_id, f.object_id, f.segment_id, f.evidence_count, foldSha, txTime,
         f.event_at, f.observed_at, f.kind,
+        f.attribute, f.value_num, f.value_text, f.unit, f.effective_at, f.date_source, f.effective_scope_id, f.correction, CLAIM_STATE_VERSION,
       ],
     );
   }

@@ -50,6 +50,13 @@ export interface ExtractedClaim {
   eventDate?: string | null;
   /** Segment of a long document it was extracted from (docs/design/10); the claim is grounded there. */
   segment?: number;
+  /** The measure or state the claim gives a value of ("完成度", "headcount"); docs/design/29. */
+  attribute?: string | null;
+  /** Its value: a number, or a short text (a person, a stage). */
+  value?: number | string | null;
+  unit?: string | null;
+  /** The statement corrects or retracts an earlier report. */
+  corrects?: boolean | null;
 }
 
 /** A document being wired into the graph: identity plus its indexed chunks. */
