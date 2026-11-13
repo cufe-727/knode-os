@@ -61,6 +61,8 @@ enum TaskWords {
         case "judge": L("Review")
         case "embed": L("Embed")
         case "session": L("Research")
+        case "eval-call": L("Eval call")
+        case "eval-session": L("Eval agent")
         default: kind
         }
     }
@@ -434,7 +436,7 @@ struct TasksView: View {
                         GridRow {
                             KindPill(text: TaskWords.work(lease.kind), color: TaskWords.workColor(lease.kind))
                             Group {
-                                if lease.kind == "judge" || lease.kind == "session" {
+                                if lease.kind == "judge" || lease.kind == "session" || lease.kind.hasPrefix("eval-") {
                                     Text(lease.subject).lineLimit(2)
                                 } else {
                                     Button(lease.subject) { model.openFile(lease.subject) }

@@ -488,6 +488,8 @@ export class LocalLabelingWorkers {
     if (task.kind === 'embed') return { ok: false, error: 'an LLM slot cannot embed', kind: 'fatal', model: backend.client.label };
     // research sessions go to remote session slots (src/work/session.ts), which these never ask for either
     if (task.kind === 'session') return { ok: false, error: 'an LLM slot cannot run a research session', kind: 'fatal', model: backend.client.label };
+    // an evaluation run's work goes to remote workers only (src/work/eval.ts): the run itself is this machine's slot for it
+    if (task.kind === 'eval-call' || task.kind === 'eval-session') return { ok: false, error: 'an LLM slot does not take evaluation work', kind: 'fatal', model: backend.client.label };
     backend.busy++;
     // keep the lease while the call runs; a CLI call may take minutes
     const leaseMs = Date.parse(task.leaseExpiresAt) - Date.now();

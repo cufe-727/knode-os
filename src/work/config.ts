@@ -4,7 +4,7 @@ import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { contentLanguages } from '../lang/languages.js';
 import { cursorModel, effortFor, speedFor } from '../llm/cli.js';
 import { DEFAULT_PROBE_COSINE, embedBatchPlan, embedOffered, poolModelOf, postprocessFor, PROBE_TEXTS } from './embed.js';
-import { SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
+import { isEvalKind, SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
 
 /**
  * What a remote worker reads from the server instead of being told by hand
@@ -58,7 +58,7 @@ export interface WorkerEmbedding {
 export interface WorkerConfig {
   /** A hash of everything else here: every lease answer carries it, and a worker reads this again when it changes. */
   version: string;
-  leaseSeconds: { llm: number; embed?: number; session?: number };
+  leaseSeconds: { llm: number; embed?: number; session?: number; eval?: number };
   /** The kinds this token may take here and the workspace offers remote workers. */
   kinds: Record<WorkKind, boolean>;
   shares: Record<SharedKind, number>;
@@ -71,14 +71,16 @@ const FAMILY: Partial<Record<LlmProvider, CliFamily>> = { 'codex-cli': 'codex', 
 
 /**
  * Whether the workspace offers this kind of work to remote workers:
- * extraction always, summaries unless turned off, judge calls and research
- * sessions only when turned on, translations while content languages are on
+ * extraction always, summaries unless turned off, judge calls, research
+ * sessions and evaluation work only when turned on, translations while content languages are on
  * (docs/design/17) unless turned off.
  */
 export function offeredRemotely(config: KnodeConfig, kind: WorkKind): boolean {
   if (kind === 'summarize') return config.server.remote?.offer?.summarize !== false;
   if (kind === 'judge') return config.server.remote?.offer?.judge === true;
   if (kind === 'session') return config.server.remote?.offer?.session === true;
+  // an evaluation run's work is the server's, not the workspace's: settings are server-wide (docs/design/27 §8)
+  if (isEvalKind(kind)) return config.server.remote?.offer?.eval === true;
   if (kind === 'translate') return contentLanguages(config).on && config.server.remote?.offer?.translate !== false;
   // vectors are leased work only in deferred mode (docs/design/12 §3.3)
   if (kind === 'embed') return embedOffered(config);
@@ -156,15 +158,19 @@ export function workerConfig(config: KnodeConfig, opts: {
   embed?: { embedder: Pick<EmbeddingProvider, 'model' | 'dimensions'>; leaseMs: number } | null;
   /** How long a research session's lease lasts (renewed while it runs), where sessions are leased. */
   sessionLeaseMs?: number | null;
+  /** How long an evaluation lease lasts (renewed while it runs), where eval work is leased. */
+  evalLeaseMs?: number | null;
 }): WorkerConfig {
   const kinds = Object.fromEntries(WORK_KINDS.map((k) => [k, opts.allowed.includes(k) && offeredRemotely(config, k)])) as Record<WorkKind, boolean>;
   const embedding = kinds.embed && opts.embed ? workerEmbedding(config, opts.embed.embedder) : undefined;
   const session = kinds.session && opts.sessionLeaseMs ? Math.round(opts.sessionLeaseMs / 1000) : null;
+  const evalLease = (kinds['eval-call'] || kinds['eval-session']) && opts.evalLeaseMs ? Math.round(opts.evalLeaseMs / 1000) : null;
   const body = {
     leaseSeconds: {
       llm: Math.round(opts.leaseMs / 1000),
       ...(embedding && opts.embed ? { embed: Math.round(opts.embed.leaseMs / 1000) } : {}),
       ...(session ? { session } : {}),
+      ...(evalLease ? { eval: evalLease } : {}),
     },
     kinds,
     shares: opts.shares,

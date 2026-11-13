@@ -10,6 +10,8 @@ import { LabelingScheduler } from '../labeling/scheduler.js';
 import { LocalLabelingWorkers } from '../labeling/local.js';
 import { LabelingProcessing } from '../labeling/processing.js';
 import { mountRemoteApi } from '../remote/api.js';
+import { mountEvalProducer } from '../remote/eval-producer.js';
+import type { EvalWork } from '../work/eval.js';
 import { WorkBroker } from '../work/broker.js';
 import type { TranslateSource } from '../work/translate.js';
 import type { DocumentRow } from '../types.js';
@@ -537,6 +539,8 @@ export function createApp(
     auth?: AuthService | null;
     /** The MCP tokens `serve` mints for the agents it launches, one per workspace (src/server/mcp-http.ts). */
     mcpTokens?: McpWorkspaceTokens;
+    /** An evaluation run's work offered to remote workers (src/work/eval.ts); absent outside `serve`. */
+    evalWork?: EvalWork | null;
   } = {},
 ) {
   const app = new Hono<AppEnv>();
@@ -615,9 +619,12 @@ export function createApp(
       rootDataDir: rootCtx.dataDir,
       registry: workspaceContexts,
       work: (ctx) => servicesFor(ctx)?.work ?? null,
+      evalArchive: opts.evalWork ? (sha) => opts.evalWork!.archives.file(sha) : undefined,
       config: rootCtx.config.server.remote,
       log,
     });
+    // an evaluation run on this machine offers its model work here (docs/design/27 §8): loopback, the data root's MCP token
+    if (opts.evalWork) mountEvalProducer(app, { work: opts.evalWork, token: loadOrCreateMcpToken(rootCtx.dataDir), config: () => rootCtx.config, log });
   }
 
   // sign-in, sessions, users and the gateways to local services (src/auth)

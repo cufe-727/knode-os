@@ -232,6 +232,8 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
   const judge = work?.kinds.judge as import('../work/judge.js').JudgeStatus | undefined;
   // research sessions out on remote workers (docs/design/27)
   const sessionWork = work?.kinds.session as import('../work/session.js').SessionStatus | undefined;
+  // an evaluation run's calls and sessions out on remote workers (docs/design/27 §8): the server's, shown in every workspace
+  const evalWork = [work?.kinds['eval-call'], work?.kinds['eval-session']] as (import('../work/eval.js').EvalStatus | undefined)[];
   const backfill = services?.embeddings?.status() ?? null;
   // deferred mode: vectors as leased work, made by this machine's embed slots and remote workers
   const embedWork = work?.kinds.embed as import('../work/embed.js').EmbedStatus | undefined;
@@ -301,6 +303,10 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
     })),
     ...(sessionWork?.leases ?? []).map((l) => ({
       id: l.id, kind: 'session' as const, subject: l.title, detail: `${l.job} · ${l.label}`,
+      worker: l.worker, backend: l.backend, remote: l.remote, ageSeconds: l.ageSeconds, expiresInSeconds: l.expiresInSeconds,
+    })),
+    ...evalWork.flatMap((e) => e?.leases ?? []).map((l) => ({
+      id: l.id, kind: l.kind, subject: l.label, detail: `eval run ${l.run} · ${l.model}`,
       worker: l.worker, backend: l.backend, remote: l.remote, ageSeconds: l.ageSeconds, expiresInSeconds: l.expiresInSeconds,
     })),
   ].sort((a, b) => b.ageSeconds - a.ageSeconds);
