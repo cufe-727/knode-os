@@ -1,14 +1,14 @@
 import fs from 'node:fs';
 import { safePath } from '../fs/files.js';
 import { readTranslation, readTranslationParts, TranslationCache, TranslationPart, writeTranslation, writeTranslationPart } from '../fs/sidecar.js';
-import { Segment, segmentText } from '../graph/segment.js';
+import { Segment, segmentSha, segmentText } from '../graph/segment.js';
 import { isDerivedTextSource, loadSourceText } from '../ingest/source.js';
 import { ChatMessage, LlmClient } from '../llm/client.js';
 import { Queryable } from '../store/migrations.js';
 import { DocumentRow } from '../types.js';
-import { detectLanguage, detectTextLanguage, scriptCounts, wordCount } from './detect.js';
+import { detectLanguage, detectTextLanguage, functionWordCount, isCodeListing, scriptCounts, wordCount } from './detect.js';
 import { ContentLanguages, contentLanguages, languageInfo, promptLanguage, sameLanguage } from './languages.js';
-import { protectSpans, restoreSpans } from './protect.js';
+import { FENCED_CODE, protectSpans, restoreSpans } from './protect.js';
 import { parseFrontmatter } from '../markdown.js';
 
 /**
@@ -139,6 +139,30 @@ function readerFrontmatter(dataDir: string, doc: TranslationDoc, indexed: string
   return splitFrontmatter(indexed).frontmatter;
 }
 
+/**
+ * A fence is one protected span even when it is longer than a model-sized
+ * segment: only its token goes to the model. Keep cuts outside code so the
+ * next part cannot mistake a closing fence for an opener and hide prose.
+ * Unaffected cuts retain their existing hashes and paid translation parts.
+ */
+function translationSegments(body: string, maxChars: number): Segment[] {
+  const segments = segmentText(body, maxChars);
+  const fences = [...body.matchAll(FENCED_CODE)].map((m) => ({ start: m.index, end: m.index + m[0].length }));
+  if (segments.length < 2 || fences.length === 0) return segments;
+  const out: Segment[] = [];
+  let first = segments[0];
+  let fenceIndex = 0;
+  for (const segment of segments) {
+    while (fenceIndex < fences.length && fences[fenceIndex].end <= segment.end) fenceIndex++;
+    const fence = fences[fenceIndex];
+    if (fence && fence.start < segment.end && segment.end < fence.end) continue;
+    const text = body.slice(first.start, segment.end);
+    out.push({ ...first, index: out.length, end: segment.end, text, sha: segmentSha(text) });
+    first = segments[segment.index + 1];
+  }
+  return out;
+}
+
 /** What translating `doc` into `target` takes, from its current indexed text. */
 export function planTranslation(dataDir: string, doc: TranslationDoc, target: string): TranslationPlan {
   if (isDataFile(doc.path)) return { kind: 'none', reason: 'data', source: null };
@@ -150,7 +174,7 @@ export function planTranslation(dataDir: string, doc: TranslationDoc, target: st
   const { body } = splitFrontmatter(loaded.text);
   if (!body.trim()) return { kind: 'none', reason: 'empty', source };
   const frontmatter = readerFrontmatter(dataDir, doc, loaded.text);
-  const segments = segmentText(body, translationSegmentChars(source));
+  const segments = translationSegments(body, translationSegmentChars(source));
   const parts = readTranslationParts(dataDir, doc.path, target);
   const cached = new Map<string, TranslationPart>();
   for (const s of segments) {
@@ -230,16 +254,39 @@ export function finishSegment(work: TranslationWork, segment: Segment, spans: st
   if (missing.length > 0) {
     return { ok: false, error: `the translation lost ${missing.length} of the ${spans.length} links, anchors and code spans it was to keep` };
   }
-  const prose = (s: string) => wordCount(scriptCounts(protectSpans(s).text.replace(/⟦\d+⟧/g, ' ')));
-  const before = prose(segment.text);
-  const after = prose(text);
+  const prose = (s: string) => protectSpans(s).text.replace(/⟦\d+⟧/g, ' ');
+  const sourceProse = prose(segment.text);
+  const translatedProse = prose(text);
+  const nonNarrativeSource = detectTextLanguage(sourceProse) === null || isCodeListing(sourceProse);
+  if (nonNarrativeSource && sourceProse.trim() !== translatedProse.trim()) {
+    return { ok: false, error: 'code or non-language content must stay unchanged' };
+  }
+  const before = wordCount(scriptCounts(sourceProse));
+  const after = wordCount(scriptCounts(translatedProse));
   if (before >= 40 && after < before * 0.3) {
     return { ok: false, error: `the translation is much shorter than the text (about ${Math.round(after)} words for ${Math.round(before)})` };
   }
-  if (before >= 80) {
+  if (before >= 80 && !nonNarrativeSource) {
     const got = detectTextLanguage(text);
     if (got && !sameLanguage(got, work.target) && sameLanguage(got, work.source)) {
-      return { ok: false, error: `the answer is still in ${languageInfo(work.source)?.english ?? work.source}` };
+      // Bibliographies and model inventories retain Latin names even when
+      // their narrative is translated. Require real target-script content
+      // and the removal of source-language grammar; adding a translated
+      // heading to otherwise untranslated prose must still fail.
+      const counts = scriptCounts(translatedProse);
+      const grammarBefore = functionWordCount(sourceProse, work.source);
+      const grammarAfter = functionWordCount(translatedProse, work.source);
+      // A table of model IDs may have only a few translatable header
+      // characters, while prose and bibliographies have more narrative.
+      const minimum = grammarBefore === 0 ? 2 : 20;
+      const targetScript = work.target.startsWith('zh') ? counts.han >= minimum
+        : work.target === 'ja' ? counts.kana >= minimum
+          : work.target === 'ko' ? counts.hangul >= minimum : false;
+      const translatedNarrative = targetScript && grammarBefore !== null && grammarAfter !== null
+        && grammarAfter <= Math.max(5, grammarBefore * 0.15);
+      if (!translatedNarrative) {
+        return { ok: false, error: `the answer is still in ${languageInfo(work.source)?.english ?? work.source}` };
+      }
     }
   }
   const lead = /^\s*/.exec(segment.text)![0];

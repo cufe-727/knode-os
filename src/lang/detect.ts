@@ -1,4 +1,5 @@
 import { normalizeLanguage } from './languages.js';
+import { DOCUMENT_PATH, FENCED_CODE } from './protect.js';
 
 /**
  * The language a text is written in — from its script, and for Latin script
@@ -20,13 +21,14 @@ import { normalizeLanguage } from './languages.js';
 
 const FRONTMATTER = /^﻿?---\r?\n[\s\S]*?\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/;
 const NOISE: RegExp[] = [
-  /(^|\n)(```|~~~)[^\n]*\n[\s\S]*?(\n\2[^\n]*|$)/g, // fenced code
+  FENCED_CODE,
   /<!--[\s\S]*?-->/g,
   /`[^`\n]+`/g,
   /\]\([^)\n]*\)/g, // Markdown link and image targets
   /\[\[[^\]\n]*\/[^\]\n]*\]\]/g, // wikilinks to paths
   /(?:https?|ftp):\/\/[^\s<>()\]]+/gi,
   /\bwww\.[^\s<>()\]]+/gi,
+  DOCUMENT_PATH,
   /<[^>\n]{1,400}>/g, // HTML tags, anchors
   /[\w.+-]+@[\w-]+\.[\w.-]+/g, // e-mail addresses
   /\{#[^}\n]*\}/g, // heading ids
@@ -36,6 +38,10 @@ const NOISE: RegExp[] = [
 export function readableText(text: string): string {
   let t = text.replace(FRONTMATTER, '');
   for (const re of NOISE) t = t.replace(re, ' ');
+  t = t.replace(/^#[ \t]*%%(?![ \t]*\[markdown\])[^\n]*/gm, ' '); // notebook code-cell headings flattened into a line
+  // A copied minified block or a repeated Latin filler is not running
+  // prose. Long unbroken identifiers must not outvote Chinese paragraphs.
+  t = t.replace(/[A-Za-z][A-Za-z0-9_]{119,}/g, ' ');
   return t;
 }
 
@@ -80,6 +86,57 @@ const FUNCTION_WORDS: Record<string, string[]> = {
 const WORD_LANG = new Map<string, string[]>();
 for (const [lang, words] of Object.entries(FUNCTION_WORDS)) {
   for (const w of words) WORD_LANG.set(w, [...(WORD_LANG.get(w) ?? []), lang]);
+}
+
+/** Grammar words left in a translation, excluding names and other identifiers. */
+export function functionWordCount(text: string, language: string): number | null {
+  const words = FUNCTION_WORDS[normalizeLanguage(language) ?? language];
+  if (!words) return null;
+  const vocabulary = new Set(words);
+  let count = 0;
+  // Converted PDFs and fetched source files sometimes contain unfenced
+  // code. Its keywords ("for", "with", "is", "not", "from") are not
+  // untranslated grammar. Keep comments and docstring prose in the check.
+  const narrative = text.split('\n').filter((line) => {
+    const code = line.replace(/^\s*[+-]{1,3}\s*/, '').trim().replace(/^\d+\s+/, '');
+    if (/^,→/.test(code)) return false; // wrapped code lines in converted PDFs
+    if (/^(?:from\s+[\w.]+\s+import\b|import\s+[\w.,]+(?:\s+as\s+\w+)?\s*$)/.test(code)) return false;
+    if (/^(?:(?:async\s+)?def\s+\w+\s*\(|class\s+\w+\s*[:(])/.test(code)) return false;
+    if (/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*|\[[^\]\n]+\])*\s*[+*/|&-]?=(?!=)/.test(code)) return false;
+    if (/^[A-Za-z_][\w.]*\(/.test(code)) return false;
+    if (/^(?:if|elif|for|while|with|except|return|yield|raise|assert)\b/.test(code) && /[()[\]{}:=]/.test(code)) return false;
+    return true;
+  }).join('\n');
+  for (const m of narrative.toLowerCase().matchAll(/(?<![\p{L}\p{N}_.])[a-zàâäçéèêëîïôöùûüÿñãõáíóúœß]+(?![\p{L}\p{N}_])/gu)) {
+    if (vocabulary.has(m[0])) count++;
+  }
+  return count;
+}
+
+/** Whether a segment is a source-code listing with no foreign narrative. */
+export function isCodeListing(text: string): boolean {
+  const lines = readableText(text).split('\n').map((line) => line.trim()).filter(Boolean);
+  if (lines.length < 4) return false;
+  let code = 0;
+  for (const line of lines) {
+    if (/^\\?\/\//.test(line) || /^\\?#+/.test(line)) {
+      const comment = line.replace(/^\\?(?:\/\/|#+)\s*/, '');
+      if (!comment || /^[\d\s#*_=-]+$/.test(comment) || /^alpha\s*[_-]?\d*\b/i.test(comment)
+        || /[()[\]=<>+*/|&]/.test(comment) || scriptCounts(comment).han > 0) continue;
+      return false;
+    }
+    if (/^[{}()[\],.;]+$/.test(line)) continue;
+    if (/^(?:(?:async\s+)?def\s+\w+\s*\(|class\s+\w+\s*[:(]|module\s+\w+\s*$)/.test(line)
+      || /^(?:from\s+[\w.]+\s+import\b|import\s+[\w.,]+)/.test(line)
+      || /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*|\[[^\]\n]+\])*\s*[+*/|&-]?=(?!=)/.test(line)
+      || /^[A-Za-z_][\w.]*\(/.test(line)
+      || /^(?:if|elif|for|while|with|except|return|yield|raise|assert|break|continue|pass)\b/.test(line)) {
+      code++;
+      continue;
+    }
+    return false;
+  }
+  return code >= 4;
 }
 
 function latinLanguage(text: string): string {

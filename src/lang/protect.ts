@@ -14,10 +14,20 @@
 const OPEN = '⟦';
 const CLOSE = '⟧';
 
+// Fences inside list items may be indented, and a closing fence may be
+// longer than the opener. Keep this matcher shared with language detection
+// and translation segmentation, so each sees the same protected code.
+const BACKTICK_FENCE = /(?:^|(?<=\n))[ \t]*(?<translationBackticks>`{3,})[^\n]*\n[\s\S]*?(?:\n[ \t]*\k<translationBackticks>`*[ \t]*(?=\r?\n|$)|$)/;
+const TILDE_FENCE = /(?:^|(?<=\n))[ \t]*(?<translationTildes>~{3,})[^\n]*\n[\s\S]*?(?:\n[ \t]*\k<translationTildes>~*[ \t]*(?=\r?\n|$)|$)/;
+export const FENCED_CODE = new RegExp(`${BACKTICK_FENCE.source}|${TILDE_FENCE.source}`, 'g');
+
+/** Bare source citations and file paths are identifiers, like link targets. */
+export const DOCUMENT_PATH = /(?<![\w/])(?:(?:\.{1,2}\/|\/)(?:[\w.@+%~-]+\/)*[\w.@+%~-]+|(?:raw|wiki|playbooks)\/(?:[\w.@+%~-]+\/)*[\w.@+%~-]+|(?:[\w.@+%~-]+\/)+[\w.@+%~-]+\.(?:mdx?|txt|rst|pyc?|ipynb|tsx?|jsx?|[cm]js|json[lc]?|ya?ml|toml|ini|cfg|csv|tsv|xml|html?|pdf|png|jpe?g|svg|webp|gif|sql|sh|bash|zsh|go|rs|java|cpp|h|cs|swift|rb|php|vue|svelte|css|scss|lock|proto|thrift|graphql)(?=$|[^\w-]))(?:#[\w:.-]+)?/g;
+
 /** First match wins: the longer spans first, so a URL inside a code block goes out with the block. */
 const PROTECTED = new RegExp(
   [
-    /(?:^|(?<=\n))(```|~~~)[^\n]*\n[\s\S]*?(?:\n\1[^\n]*|$)/.source, // fenced code
+    FENCED_CODE.source,
     /<!--[\s\S]*?-->/.source,
     /`[^`\n]+`/.source, // inline code
     /\[\[[^\]\n]+\]\]/.source, // wikilinks: the target must stay, and so the label with it
@@ -27,6 +37,7 @@ const PROTECTED = new RegExp(
     /<[^>\n]{1,400}>/.source, // HTML tags
     /(?:https?|ftp):\/\/[^\s<>()\]]+/.source,
     /\bwww\.[^\s<>()\]]+/.source,
+    DOCUMENT_PATH.source,
     /\{#[^}\n]*\}/.source, // heading ids
     `${OPEN}[^${CLOSE}\\n]*${CLOSE}`, // a token-like text of the document's own
   ].join('|'),
