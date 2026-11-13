@@ -272,8 +272,11 @@ async function splitNamesakes(store: Store, config: KnodeConfig | undefined, sta
   for (const p of people) {
     await pause();
     const rows = await store.query<{ document_id: string; path: string; doc_date: string | Date | null; other: string | null; other_type: string | null }>(
+      // one row per document and co-mentioned entity: a mention is a row per chunk, and read as
+      // they are a name's documents came back up to 208,361 rows (finance, 2026-11-13: 20 million rows
+      // for 1,619 names, 34,513 at most once distinct)
       `WITH d AS (SELECT DISTINCT document_id FROM entity_mentions WHERE entity_id = $1)
-       SELECT d.document_id, doc.path, doc.doc_date, o.id AS other, o.type AS other_type
+       SELECT DISTINCT d.document_id, doc.path, doc.doc_date, o.id AS other, o.type AS other_type
        FROM d JOIN documents doc ON doc.id = d.document_id
        LEFT JOIN entity_mentions m ON m.document_id = d.document_id AND m.entity_id <> $1
        LEFT JOIN entities o ON o.id = m.entity_id AND o.tx_to IS NULL AND o.type = ANY($2::text[])`,
