@@ -34,7 +34,7 @@ export const CATALOG_VIEWS: { name: string; description: string }[] = [
   { name: 'v_documents', description: 'indexed sources: path, root (docs/skills/wiki), kind (source/view), sha, status' },
   { name: 'v_entities', description: 'currently believed entities with mention and evidence counts' },
   { name: 'v_relations', description: 'currently believed typed edges with folded weight' },
-  { name: 'v_claims', description: 'currently believed claims with their world-time window and source path (a merged group appears once, as its representative)' },
+  { name: 'v_claims', description: 'currently believed claims with their world-time window and source path (a merged group appears once, as its representative); state columns: attribute (the subject\'s normalized key, e.g. 进度 / 在岗人数), value_num / value_text, unit, effective_at (the date stated, else the document\'s), date_source (stated | document), correction, effective_source_path (the document that dated it); superseded_by IS NULL marks the current value of an attribute' },
   { name: 'v_scopes', description: 'every apply of a source, including disposed ones (applied_at / disposed_at)' },
   { name: 'v_evidence', description: 'per-source support behind each graph row, with its system-time window' },
   { name: 'v_pages', description: 'materialized wiki views and their input signatures' },

@@ -151,7 +151,16 @@ describe('v13: co-occurrence is derived, not stored', () => {
            ('relation', 'typed', 's1', 1, 'tier0.frontmatter', '{}', now()),
            ('entity', 'a', 's1', 1, 'tier0.wikilink', '{}', now())`,
       );
-      // a database that still has the rows is one that stopped at v12
+      // a database that still has the rows is one that stopped at v12, with the v11 view of claims
+      await store.query(`DROP VIEW v_claims`);
+      await store.query(
+        `CREATE VIEW v_claims AS
+           SELECT cl.id, cl.subject_id, cl.object_id, cl.type, cl.statement, cl.status,
+                  cl.valid_from, cl.valid_to, cl.evidence_count, cl.tx_from,
+                  s.key AS source_path, cl.event_at, cl.observed_at, cl.superseded_by
+           FROM claims cl LEFT JOIN scopes s ON s.id = cl.primary_scope_id
+           WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL`,
+      );
       await store.query(`UPDATE meta SET value = '{"v":12}'::jsonb WHERE key = 'schema_version'`);
     } finally {
       await store.close();
@@ -263,7 +272,9 @@ describe('v14: claims carry a kind', () => {
       const columns = await store.query<{ column_name: string }>(
         `SELECT column_name FROM information_schema.columns WHERE table_name = 'v_claims' ORDER BY ordinal_position`,
       );
-      expect(columns.at(-1)).toEqual({ column_name: 'kind' });
+      // v14 added it at the end; later versions append after it
+      const names = columns.map((c) => c.column_name);
+      expect(names[names.indexOf('superseded_by') + 1]).toBe('kind');
     } finally {
       await store.close();
     }

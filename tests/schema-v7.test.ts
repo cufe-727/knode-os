@@ -9,13 +9,13 @@ import { CATALOG_VIEWS } from '../src/store/catalog.js';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-schema-v7-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18 (wiki research + review + quick answers + claim merges + dispose indexes + derived co-occurrence + claim kind + document chars + citations + content languages + match grams)', () => {
+describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19 (wiki research + review + quick answers + claim merges + dispose indexes + derived co-occurrence + claim kind + document chars + citations + content languages + match grams + claim state)', () => {
   it('adds the temporal relation / claim columns, resolution tables and research jobs, and every catalog view resolves', async () => {
     fs.mkdirSync(path.join(tmp, 'ws', '.knode'), { recursive: true });
     const store = await Store.open(path.join(tmp, 'ws'), 3);
     try {
-      expect(SCHEMA_VERSION).toBe(18);
-      expect(store.migration.to).toBe(18);
+      expect(SCHEMA_VERSION).toBe(19);
+      expect(store.migration.to).toBe(19);
       // every foreign key a disposal fires, the merged-entity lookup of the fold, and the
       // document side of derived co-occurrence (v13) have an index to use
       const indexes = (await store.query<{ indexname: string }>(`SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()`)).map((r) => r.indexname);
@@ -51,6 +51,12 @@ describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18 (wiki research + revi
       expect(await columns('claim_pair_verdicts')).toEqual(expect.arrayContaining(['pair_id', 'relation', 'confidence', 'model']));
       expect(await columns('claim_embeddings')).toEqual(expect.arrayContaining(['claim_id', 'model', 'embedding']));
       expect(await columns('extraction_queue')).toEqual(expect.arrayContaining(['segments_total', 'segments_done']));
+      // v19: claim state (docs/design/29) — attribute, value, effective date — and the tables refine keeps beside it
+      expect(await columns('claims')).toEqual(expect.arrayContaining(['attribute', 'value_num', 'value_text', 'unit', 'effective_at', 'date_source', 'effective_scope_id', 'correction', 'state_v']));
+      expect(await columns('claim_attribute_keys')).toEqual(expect.arrayContaining(['subject_id', 'attribute', 'canonical', 'reason']));
+      expect(await columns('entity_namesakes')).toEqual(expect.arrayContaining(['id', 'base_id', 'name', 'label', 'anchors', 'documents', 'reason']));
+      expect(await columns('v_claims')).toEqual(expect.arrayContaining(['attribute', 'value_num', 'value_text', 'unit', 'effective_at', 'date_source', 'correction', 'effective_source_path']));
+      expect(indexes).toContain('claims_attribute_idx');
       for (const view of CATALOG_VIEWS) {
         await expect(store.query(`SELECT * FROM ${view.name} LIMIT 1`)).resolves.toBeDefined();
       }

@@ -955,6 +955,69 @@ CREATE OR REPLACE FUNCTION match_grams(t text) RETURNS tsvector
   $$;
 `;
 
+// Claim state (docs/design/29). A measure-like claim says subject + attribute +
+// value + date: `attribute` is the key its parser read ("进度", "在岗人数"),
+// the value is a number with its unit or a text, and `effective_at` is the
+// date the claim speaks of — the date it states, else its document's date
+// (`date_source` says which), taken from the newest evidence so a value
+// repeated in a later report is dated by that report. `effective_scope_id` is
+// the scope of that evidence, so a line's date and its source agree.
+// `correction` marks a claim that corrects an earlier report. `state_v` is the
+// parser version a row was read with: NULL rows are read lazily (the fold, or
+// refine's backfill), never inside this migration — every column is added
+// without a rewrite (no default, or a constant one) on finance's large table.
+// `claim_attribute_keys` maps a subject's near-synonym keys onto one
+// (完成度 / 进度), written by refine; `entity_namesakes` records a person
+// split from a namesake by context, which extraction then resolves to.
+// v_claims shows the subject's canonical key and falls back, for rows not yet
+// read, to the old date columns.
+const V19_CLAIM_STATE = `
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS attribute TEXT;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS value_num DOUBLE PRECISION;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS value_text TEXT;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS unit TEXT;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS effective_at TIMESTAMPTZ;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS date_source TEXT;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS effective_scope_id TEXT;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS correction BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS state_v SMALLINT;
+CREATE INDEX IF NOT EXISTS claims_attribute_idx ON claims (subject_id, attribute) WHERE tx_to IS NULL AND attribute IS NOT NULL;
+CREATE TABLE IF NOT EXISTS claim_attribute_keys (
+  subject_id  TEXT NOT NULL,
+  attribute   TEXT NOT NULL,
+  canonical   TEXT NOT NULL,
+  reason      TEXT NOT NULL DEFAULT '',
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (subject_id, attribute)
+);
+CREATE TABLE IF NOT EXISTS entity_namesakes (
+  id          TEXT PRIMARY KEY,
+  base_id     TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  label       TEXT NOT NULL,
+  anchors     JSONB NOT NULL DEFAULT '[]'::jsonb,
+  base_anchors JSONB NOT NULL DEFAULT '[]'::jsonb,
+  documents   JSONB NOT NULL DEFAULT '[]'::jsonb,
+  reason      TEXT NOT NULL DEFAULT '',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS entity_namesakes_base_idx ON entity_namesakes (base_id);
+CREATE OR REPLACE VIEW v_claims AS
+  SELECT cl.id, cl.subject_id, cl.object_id, cl.type, cl.statement, cl.status,
+         cl.valid_from, cl.valid_to, cl.evidence_count, cl.tx_from,
+         s.key AS source_path, cl.event_at, cl.observed_at, cl.superseded_by, cl.kind,
+         COALESCE(ak.canonical, cl.attribute) AS attribute, cl.value_num, cl.value_text, cl.unit,
+         COALESCE(cl.effective_at, cl.event_at, cl.valid_from, cl.observed_at) AS effective_at,
+         COALESCE(cl.date_source, CASE WHEN cl.event_at IS NOT NULL OR cl.valid_from IS NOT NULL THEN 'stated'
+                                       WHEN cl.observed_at IS NOT NULL THEN 'document' END) AS date_source,
+         cl.correction, COALESCE(es.key, s.key) AS effective_source_path
+  FROM claims cl
+  LEFT JOIN scopes s ON s.id = cl.primary_scope_id
+  LEFT JOIN scopes es ON es.id = cl.effective_scope_id
+  LEFT JOIN claim_attribute_keys ak ON ak.subject_id = cl.subject_id AND ak.attribute = cl.attribute
+  WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL;
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -991,6 +1054,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 16, name: 'citations', up: async (q) => execScript(q, V16_CITATIONS) },
   { version: 17, name: 'content-languages', up: async (q) => execScript(q, V17_CONTENT_LANGUAGES) },
   { version: 18, name: 'match-grams', up: async (q) => execScript(q, V18_MATCH_GRAMS) },
+  { version: 19, name: 'claim-state', up: async (q) => execScript(q, V19_CLAIM_STATE) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;
