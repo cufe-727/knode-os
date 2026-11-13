@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { isLlmKind, LLM_KINDS, WorkKind } from '../work/kinds.js';
+import { isEvalKind, isLlmKind, LLM_KINDS, WorkKind } from '../work/kinds.js';
 
 /**
  * Tokens for the remote API (src/remote/api.ts) — one per machine or
@@ -14,7 +14,7 @@ import { isLlmKind, LLM_KINDS, WorkKind } from '../work/kinds.js';
  * created or revoked with the CLI takes effect in a running `serve` at once.
  */
 
-export const REMOTE_SCOPES = ['label', 'read', 'write', 'sql', 'embed', 'embed-keys', 'research'] as const;
+export const REMOTE_SCOPES = ['label', 'read', 'write', 'sql', 'embed', 'embed-keys', 'research', 'eval'] as const;
 export type RemoteScope = (typeof REMOTE_SCOPES)[number];
 
 export const REMOTE_SCOPE_HELP: Record<RemoteScope, string> = {
@@ -25,6 +25,7 @@ export const REMOTE_SCOPE_HELP: Record<RemoteScope, string> = {
   embed: 'take embed batches and hand back vectors made on the worker\'s own endpoint, once it passes calibration (docs/design/12)',
   'embed-keys': 'also receive the embedding keys marked "Lend to remote workers", and embed on them under this machine\'s quota ledger',
   research: 'take research agent sessions and run them on the worker\'s own Codex or Claude account; each session reaches knode through a token of its own (docs/design/27)',
+  eval: 'take an evaluation run\'s model calls and agent sessions (eval-call, eval-session) and run them on the worker\'s own Codex or Claude account; a session reads a corpus archive or the run\'s knode tools through a token of its own (docs/design/27 §8)',
 };
 
 export interface RemoteTokenRecord {
@@ -91,6 +92,7 @@ export class RemoteTokenStore {
     for (const k of kinds) {
       if (k === 'embed') throw new Error('embed work has a scope of its own — give the token the "embed" scope instead of the kind');
       if (k === 'session') throw new Error('research sessions have a scope of their own — give the token the "research" scope instead of the kind');
+      if (isEvalKind(k)) throw new Error('evaluation work has a scope of its own — give the token the "eval" scope instead of the kind');
       if (!isLlmKind(k)) throw new Error(`unknown kind of work "${k}" — kinds are ${LLM_KINDS.join(', ')}`);
     }
     if (kinds.length > 0 && !scopes.includes('label')) throw new Error('kinds narrow the "label" scope — give the token that scope too');
@@ -180,10 +182,11 @@ export function tokenAllows(record: RemoteTokenRecord, scope: RemoteScope, works
 /**
  * May the token take this kind of work in this workspace? A model call needs
  * `label`, narrowed by its kinds when it names any; an embed batch needs
- * `embed`; a research session needs `research`.
+ * `embed`; a research session needs `research`; an evaluation run's work needs `eval`.
  */
 export function tokenAllowsKind(record: RemoteTokenRecord, kind: WorkKind, workspace: string): boolean {
   if (kind === 'embed') return tokenAllows(record, 'embed', workspace);
   if (kind === 'session') return tokenAllows(record, 'research', workspace);
+  if (isEvalKind(kind)) return tokenAllows(record, 'eval', workspace);
   return tokenAllows(record, 'label', workspace) && (!record.kinds?.length || record.kinds.includes(kind));
 }

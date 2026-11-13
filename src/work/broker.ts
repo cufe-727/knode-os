@@ -3,7 +3,7 @@ import { ChatMessage } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { FailureKind } from '../labeling/failures.js';
 import { CompleteResult, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
-import { isSharedKind, LlmKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
+import { isEvalKind, isSharedKind, LlmKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
 
 /**
  * The work broker — every kind of leased work behind one lease protocol
@@ -92,7 +92,47 @@ export interface SessionWorkTask extends TaskBase {
   mcpToken: string;
 }
 
-export type WorkTask = LlmWorkTask | EmbedWorkTask | SessionWorkTask;
+/** The agent an evaluation task names: the CLI family and model the run names, nothing the worker picks (docs/design/27 §8). */
+export interface EvalAgent {
+  family: 'codex' | 'claude';
+  /** Never empty: a run offers only work whose model it names. */
+  model: string;
+  /** In the CLI's own terms (effortFor / speedFor), null = the CLI's setting. */
+  effort: string | null;
+  speed: string | null;
+}
+
+/** One model call of an evaluation run (src/work/eval.ts): the prompt as the CLI takes it on stdin. */
+export interface EvalCallWorkTask extends TaskBase {
+  kind: 'eval-call';
+  run: string;
+  agent: EvalAgent;
+  prompt: string;
+  /** A strict JSON schema for the reply (Codex `--output-schema`), or null. */
+  schema: unknown;
+  timeoutMs: number;
+}
+
+/**
+ * One agent session of an evaluation run: the fields `runAgent` builds its
+ * `codex exec` from (src/eval/agent.ts), never argv or environment. A file
+ * agent's folder comes as a content-addressed archive (`eval-archives/<sha256>`);
+ * an MCP agent reaches the run's knode tools at `…/eval-sessions/<id>/mcp`
+ * with its own token, filtered to `mcp.tools`.
+ */
+export interface EvalSessionWorkTask extends TaskBase {
+  kind: 'eval-session';
+  run: string;
+  agent: EvalAgent;
+  sandbox: 'read-only';
+  maxSteps: number;
+  timeoutMs: number;
+  prompt: string;
+  archive: { sha256: string; bytes: number } | null;
+  mcp: { token: string; tools: string[] } | null;
+}
+
+export type WorkTask = LlmWorkTask | EmbedWorkTask | SessionWorkTask | EvalCallWorkTask | EvalSessionWorkTask;
 
 /** What a slot says about itself beyond its identity, for the kinds that need it (embed: src/work/embed.ts). */
 export interface LeaseRequest {
@@ -308,8 +348,8 @@ export class WorkBroker {
     if (!this.opts.ledger) return tasks;
     const now = Date.now();
     for (const [id, i] of this.issued) if (now - i.at > ISSUED_TTL_MS) this.issued.delete(id);
-    // the ledger measures model calls; a batch of vectors or an agent session is no call it estimates
-    for (const task of tasks) if (task.kind !== 'embed' && task.kind !== 'session') this.issued.set(task.id, { kind: task.kind, at: now, promptTokens: estimateTokens(task.prompt) });
+    // the ledger measures this workspace's model calls; a batch of vectors, an agent session or an evaluation run's work is none it estimates
+    for (const task of tasks) if (task.kind !== 'embed' && task.kind !== 'session' && !isEvalKind(task.kind)) this.issued.set(task.id, { kind: task.kind, at: now, promptTokens: estimateTokens(task.prompt) });
     return tasks;
   }
 

@@ -3,10 +3,13 @@
 > Status: **phase 1 implemented** (2026‑11‑10): Codex and Claude sessions of the `single` and `team` pipelines and
 > of a study's collectors go to remote workers — `src/work/session.ts` (the session source), `src/research/remote.ts`
 > (placement), `src/remote/session-mcp.ts` (the session's route), `worker/knode-worker.mjs --sessions`; tests in
-> `tests/remote-sessions.test.ts`. Phases 2 and 3 are not built. Extends [design 12](12-remote-processing.md)'s
-> lease protocol from one-shot model calls to the agent sessions research jobs and studies run
-> ([06](06-wiki-research-agent.md), [15](15-research-studies.md), [22](22-research-pauses-and-housekeeping.md)).
-> Evaluation ([23](23-knowledge-benchmarks.md)) gets pack transfer and a run merge, not leases.
+> `tests/remote-sessions.test.ts`. **Evaluation on remote workers implemented** (2026‑11‑13, §8): an evaluation run's
+> model calls, agent sessions and judge calls are leased like any other work while the run itself stays here —
+> `src/work/eval.ts` (the sources), `src/remote/eval-producer.ts` (the run's loopback channel), `src/eval/remote.ts`
+> (placement in the run), `worker/knode-worker.mjs --eval`; tests in `tests/remote-eval.test.ts`. Phase 2 is not
+> built. Extends [design 12](12-remote-processing.md)'s lease protocol from one-shot model calls to the agent sessions
+> research jobs and studies run ([06](06-wiki-research-agent.md), [15](15-research-studies.md),
+> [22](22-research-pauses-and-housekeeping.md)) and to the model work of an evaluation run ([23](23-knowledge-benchmarks.md)).
 
 ## 0. What was there
 
@@ -43,8 +46,8 @@ and at `/mcp`, and `reclaim` reads the folder back from the server's disk.
 
 Evaluation is a separate harness. `knode-os eval run` builds its own knode workspaces (PGlite) and other systems.
 It answers model calls through a shim on 127.0.0.1 that exists only during the run, and judges with Claude Code.
-Packs and runs live in `~/knode-eval`. It never touches `serve`, and a run resumes record by record from keyed JSONL
-(src/eval/runstore.ts).
+Packs and runs live in `~/knode-eval`. Until 2026‑11‑13 it never touched `serve`; a run resumes record by record
+from keyed JSONL (src/eval/runstore.ts).
 
 ## 1. Decisions
 
@@ -64,7 +67,7 @@ Packs and runs live in `~/knode-eval`. It never touches `serve`, and a run resum
 | D12 Short leases, for cancellation | A session lease lasts 120 s and is renewed every 30 s. A renewal answered `lost` (cancelled, restarted, lapsed) kills the CLI. Cancelling revokes the session token at once, so the agent's next tool call fails before the worker hears | A session runs for 20 minutes or more. A 15-minute lease would let a cancelled session go on writing for 15 minutes |
 | D13 Keep long tool calls alive | The session route answers a tool call as an event stream, with a comment every 20 s, as design 23's shim keeps its replies alive | A capture of a filing can take over a minute, and Cloudflare drops a response that sends nothing for 100 s (to verify in phase 1) |
 | D14 Where it ran is on record | Each phase record gets `worker` and `backend`. The lineage of what a session wrote names the worker's token, as the remote API's writes do. Tasks lists sessions out, with their worker. Trust is unchanged: an agent's page lands quarantined wherever the agent ran | So a page that went wrong can be traced to the machine and account that wrote it |
-| D15 Evaluation moves whole, by pack, and is merged | No leases for eval. A pack moves as an archive (`eval pack export` / `import`). The other machine runs `eval run` on it with the same settings, and `eval merge` adds its keyed records to one run once both runs' settings agree. `export` refuses a pack whose sources say `private:` (finance-cn) | An eval agent reads a staged corpus folder, and its calls go through a shim that lives only during the run, so neither fits a lease. A pack's build is shared by all its tasks, which makes a pack the natural piece to split. The same model on another Codex account is the same backend, so the results compare. A run on another backend, such as an API endpoint instead of Codex, does not, and `merge` refuses it |
+| D15 Evaluation's model work is leased; the run stays (2026‑11‑13, replacing "evaluation moves whole, by pack, and is merged") | `eval run` and `eval score` stay on this machine with the run directory, the keyed records, resume, the quota guard and the report. Only model work leaves, through `serve`: each model call of a build or a single-shot answer (`eval-call`), each judge call (`eval-call` on the judge's CLI), each read-only agent session (`eval-session`). The run offers a piece over a loopback channel of `serve` and awaits what became of it; workers lease it like any other kind, with the same tokens (scope `eval`), audit and Tasks. Pack export / import / merge stays a possible later phase | The run's records, resume and quota guard are where its results are compared, and splitting a run by pack would split them. A piece of model work is what a worker can do without the pack: a prompt, or a folder and a prompt. The same workers then raise a run's parallelism the way they raise processing's, with no second copy of the harness on each machine |
 
 ## 2. The flow
 
@@ -188,6 +191,8 @@ KNODE_TOKEN=knr_… node knode-worker.mjs --server https://knode-os.lemoncheese.
 | `server.remote.offer.session` | `false` | remote workers may take research sessions (D3) |
 | `server.remote.sessionOfferSeconds` | `30` | how long a session waits for an online worker before it runs here |
 | `server.remote.sessionWaitMinutes` | `30` | how long a session that may not run here waits for a worker (D5) |
+| `server.remote.offer.eval` | `false` | remote workers may take an evaluation run's calls and sessions (§8) |
+| `server.remote.evalOfferSeconds` | `30` | how long an eval piece waits for a worker before the run does it itself (`eval run --offer-seconds` wins) |
 | `research.localSessions` | unset | research sessions this machine runs at once while sessions are offered: unset, no limit beyond the jobs' own; `0`, workers only; `n`, at most n here |
 
 These live in `knode.config.json`; Settings has no field for them yet. New token scope `research`: lease
@@ -196,21 +201,108 @@ These live in `knode.config.json`; Settings has no field for them yet. New token
 the app. `knode-os remote token create --scope research` makes such a token. A job whose single session ran on a
 worker keeps `payload.worker`; a team's or a study's phases each keep their `worker`.
 
-## 8. Evaluation on another machine
+## 8. Evaluation on remote workers
 
-- `knode-os eval pack export <pack> --out <file>.tar.gz` writes the pack directory and a checksum list. It refuses
-  a pack with any source whose license starts with `private:`. `eval pack import <file>` checks the checksums and
-  validates the pack (`validatePack`).
-- The other machine runs `eval run --pack <its packs>` with the same `--model`, efforts, `--judge`,
-  `--judge-model`, `--seed`, `--limit` and `--fraction`. It needs Codex and Claude Code logged in, the external
-  systems installed (`eval systems install`) and an embedder that reproduces the run's vectors:
-  `--embedding-endpoint` with a bge-m3 of its own. `--config-from` names a workspace on this machine only.
-- `knode-os eval merge <into> <from>…` refuses runs whose `run.json` differs in model, efforts, judge, embedding,
-  fraction, seed, limit, suites or system versions. Otherwise it appends the records the target lacks, key by key,
-  and fails on a key both runs have with different content. `eval report <into>` then reports the merged run, and
-  `eval status` shows which packs came from where.
-- The quota guard (design 23 D12) reads the Codex account of the machine it runs on, so each machine pauses on
-  its own windows.
+```
+ eval run (this machine: run dir, records, quota guard, report)
+   │ shim ─ PlacedChatBackend ─┐  runAgent ─ remoteAgent ─┐  judge ─ remoteJudgeClient ─┐
+   │                           ▼                          ▼                              ▼
+   │        POST 127.0.0.1:<serve>/eval/v1/offer {spec}   (data root's MCP token; held open, whitespace every 10 s)
+   │        PUT  …/eval/v1/archives/<sha256>               (a file agent's folder, before its session)
+   │                                                       ▼
+ serve ── EvalSource eval-call / eval-session (src/work/eval.ts), behind every workspace's broker
+   │  worker ── POST /remote/v1/w/<ws>/work/lease { kinds: [eval-call, eval-session], backend: codex } (knr_, scope eval)
+   │            GET  …/eval-archives/<sha256>               once per archive, cached by id, unpacked fresh per session
+   │            POST …/eval-sessions/<id>/mcp  (kes_)  ──▶ serve ──▶ the run's MCP bridge on 127.0.0.1 ──▶ knode-os mcp (stdio)
+   │            POST …/work/renew { output } · …/work/complete { text | session: { exitCode, output, lastMessage, capped, cwd, home } }
+   ▼
+ the outcome goes back on the held request: answered | error | withdrawn | failed | cancelled
+```
+
+**What leaves.** Three kinds of model work, each only while the run names its CLI and model:
+
+- *Builds and single-shot answers* go through the shim's `ChatBackend`. With `--remote`, a run on the Codex CLI with
+  a named `--model` wraps its backend in `PlacedChatBackend` (src/eval/remote.ts): a `ChatRequest` (messages, json,
+  schema, effort, model) becomes an `eval-call` whose prompt is the stdin `codex exec` would get
+  (`renderCliPrompt`), with the effort in Codex's terms and the strict output schema. A chain (`--chat-chain`), a
+  connection (`--chat-connection`) or a run with no `--model` keeps its calls here: a CLI default may be another model
+  on another machine.
+- *Scoring*: the judge's client is wrapped (`remoteJudgeClient`) when the judge is a CLI with a named
+  `--judge-model`: each call is an `eval-call` on that family. `eval score --remote` does the same.
+- *Agent answers*: `runAgent` asks `remoteAgent` first. A read-only session with a named model leaves as an
+  `eval-session`: family, model, effort, sandbox, step cap, timeout and prompt, never argv or environment (D9).
+  - A *file agent* (agent-grep, the wiki agents) gets its staged folder as an archive (src/work/eval-archive.ts:
+    gzip over `KPA1\n` and, per file in path order, a JSON line `{p, n}` and the bytes; its id is the SHA-256 of the
+    stream before compression). The run uploads it unless `serve` holds it (`HEAD` first), so a corpus every question
+    reads is uploaded and downloaded once; the worker keeps it by id and unpacks a fresh read-only copy per session.
+    `serve` lets a worker download an archive only while a session that reads it is offered or out.
+  - An *MCP agent* (agent-knode) keeps its knode server here, on the copy of the workspace the run built: the run
+    starts an MCP bridge on 127.0.0.1 (`startMcpBridge`) that starts the same stdio server a local session would on
+    its first call and answers only the spec's `enabledTools`. The lease mints a `kes_` token, held in memory and
+    dropped when the lease ends; the worker's agent calls `/remote/v1/w/<ws>/eval-sessions/<id>/mcp` with it, and
+    `serve` proxies to the bridge with the bridge's own secret, refusing a `tools/call` outside the set (403) and
+    auditing each call (tool and path, never content). No workspace is copied, and query embeddings stay here, so
+    vectors match.
+  - Its renewals carry stdout (D10, every `--session-renew-ms`, default 30 s; leases last 120 s, D12); the worker
+    counts the step cap itself and stops the CLI past it. The run parses the whole stdout with `AgentTrace`, the code
+    `runAgentOnce` uses: the trace, the step cap, and the leak audit, with the worker's folder read as this run's copy
+    and its home as the home a path must not reach.
+  - A session that writes (the llm-wiki build and update, `workspace-write`) stays here.
+
+**What stays.** A pack with any source whose license starts with `private:` (finance-cn): its calls go to a second
+shim that never offers them (packs share the caches and this machine's slots), its sessions run here
+(`withRemote(null, …)`), and a run that holds one judges here. A run routed over an agent chain (`--agent-chain`)
+keeps its sessions here. Embeddings always stay (the run's own embedder and vector cache).
+
+**Placement** (D3, D11). A piece is offered only while a worker slot for its kind and CLI asked in the last two
+minutes (`GET /eval/v1/status`). It waits up to `--offer-seconds` (default `server.remote.evalOfferSeconds`, 30) for
+a lease, then is withdrawn and runs here. A worker's failure is the worker's: a usage limit, a lost login, a missing
+CLI, a refused task, a lapsed lease, a session that exited with such an error, or a worker that reports another
+model than the one named puts the piece back in line; the third in a row ends the offer `failed`, and it runs here.
+A model's own error on a call (`kind: model`) is the call's, thrown as the run's backend would throw it. Here means
+under `--slots` for calls, and after this machine's quota guard (`waitLocal`): while workers for Codex are online the
+guard no longer holds a batch at its start, only what falls back here.
+
+**Parallelism** (F). Remote slots add to this machine's: `--slots` and `--answer-concurrency` bound local work, a
+remote call takes no local slot, and a system answers `--answer-concurrency` plus the online remote slots of its
+kind at once. A knode build's own concurrency (`KNODE_EVAL_KNODE_CONCURRENCY`, 6) is unchanged.
+
+**Comparability** (D). A worker runs exactly the family and model a task names (its own `--codex-model` does not
+apply), so a piece's backend is `codex-cli:<model>` (`claude-cli:<model>` for the judge) wherever it ran — another
+account on the same model is the same backend. Every meter event carries `worker` (absent here) and `backend`; every
+answer, build and score record carries `worker` (`local`, the worker's machine `<token>/<name>`, or `mixed`) and
+`backend` (more than one, comma-joined, only if backends mixed). `eval status` shows per pack and system the share of
+answers made on workers and flags mixed backends, and the share of model calls per worker.
+
+**Cancelling and restarts.** The offer request is held open; closing it (the run stopped or was killed) cancels the
+piece. A run that is cancelled (`signal`, Ctrl-C) also posts `/eval/v1/runs/<run>/cancel`: offers end, `kes_` tokens
+die at once, and a worker's next renewal is answered `lost`, which kills its CLI. A cancelled run writes no record for
+what it stopped, so a restarted run resumes record by record, asking nothing twice. `serve` restarting ends every
+offer `stopped`; the run's request fails, and the piece runs here.
+
+**Repeats** (`eval run --repeat <n> [--repeat-systems …]`). Repeated answers to the same tasks, for run-to-run
+variance. Repeat 1 keeps today's keys; repeat r > 1 adds `r<r>` to the answer key and `repeat: r` to the record, is
+answered under the task id `<task>~r<r>` (its own meter tag and reply-cache key, so the model is asked again), and is
+scored as the system `<system>#r<r>`.
+
+**Access** (G). Token scope `eval` (`knode-os remote token create --scope eval --workspace <user>/<ws>`): eval work is
+the server's, leased through whichever workspace the token names. Setting `server.remote.offer.eval` (default
+`false`) and `server.remote.evalOfferSeconds` (30). The producer channel `/eval/v1` answers this machine only (a 404
+elsewhere) and the data root's `.knode/mcp-token`; it adds no listening port. `GET /api/tasks` lists eval work out
+(kind `eval-call` / `eval-session`, its run, model, worker and age) in every workspace.
+
+```bash
+# on the Mac mini: offer eval work (knode.config.json: server.remote.offer.eval = true), then mint a token
+knode-os remote token create --name laptop-eval --scope eval --workspace admin/finance
+# on the other machine
+KNODE_TOKEN=knr_… node knode-worker.mjs --server https://knode-os.lemoncheese.cc --workspace admin/finance --eval codex:3,claude:2
+# a run that offers its work (serve on this machine must be running)
+knode-os eval run --pack fixture-life --model gpt-6.1-sol --judge-model claude-opus-5-5 --remote
+```
+
+**Not built.** Leasing a writing session (the llm-wiki build) — its folder would have to come back; external
+systems' own processes (they call the shim, whose calls do leave); a worker-side quota floor; pack export / import /
+merge (the earlier plan) as a way to run a whole pack elsewhere.
 
 ## 9. Phases
 
@@ -222,7 +314,10 @@ worker keeps `payload.worker`; a team's or a study's phases each keep their `wor
 2. Cursor; the `native` pipeline (the worker builds sub-agents from `NativeAgentSpec`); a worker-side floor
    (`--min-quota-percent`: the worker reads its own Codex windows through `codex app-server`, as `serve` does,
    and leases no session under it).
-3. Evaluation: `eval pack export` / `import`, `eval merge`, the report over a merged run.
+3. **Built 2026‑11‑13**, as leases rather than pack transfer (D15, §8): an evaluation run's calls, read-only
+   agent sessions and judge calls on remote workers; tested end to end with a stand-in CLI through a worker on
+   loopback (`tests/remote-eval.test.ts`). Not yet checked: a real Codex or Claude session on another machine, and an
+   MCP agent's calls through Cloudflare. Pack export / import / merge remains a possible later phase.
 
 ## 10. Open items
 

@@ -32,6 +32,7 @@ import { offeredRemotely } from '../work/config.js';
 import { BrokeredEmbedder, embedOffered, EmbedSource, LocalEmbedSlots, localEmbedSlots } from '../work/embed.js';
 import { JudgeSource } from '../work/judge.js';
 import { SessionSource } from '../work/session.js';
+import { EvalWork } from '../work/eval.js';
 import { classifySessionAnswer, RemoteSessions } from '../research/remote.js';
 import { SummarySource } from '../work/summarize.js';
 import { TranslateSource } from '../work/translate.js';
@@ -139,6 +140,8 @@ export async function startServer(ctx: AppContext): Promise<void> {
     plans: new PlanReadings({ log: (msg) => log(`processing: ${msg}`) }),
   };
   machine.limiter.setCapacity(processingSettings(ctx.config).maxLocalCalls);
+  // an evaluation run's model work for remote workers (docs/design/27 §8): the server's, one source per kind behind every workspace's broker
+  const evalWork = new EvalWork(ctx.dataDir, { log: (msg) => log(`eval: ${msg}`) });
   const workspaceContexts = new WorkspaceContextRegistry(ctx.dataDir, {
     // read on every open: a shared setting an administrator changed reaches the root's copy first
     templateConfig: () => ctx.config,
@@ -155,7 +158,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
         : null;
       let started: StartedServices;
       try {
-        started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp, rootDataDir: ctx.dataDir, machine });
+        started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp, rootDataDir: ctx.dataDir, machine, evalWork });
       } catch (err) {
         mcpTokens.revoke(agentToken);
         throw err;
@@ -172,7 +175,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
       };
     },
   });
-  const app = createApp(ctx, log, workspaceContexts, { services: (workspaceCtx) => services.get(workspaceCtx.dataDir) ?? null, auth, mcpTokens });
+  const app = createApp(ctx, log, workspaceContexts, { services: (workspaceCtx) => services.get(workspaceCtx.dataDir) ?? null, auth, mcpTokens, evalWork });
   const { port, host } = ctx.config.server;
 
   const main = serve({ fetch: app.fetch, port, hostname: host }, (info) => {
@@ -206,6 +209,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.once(signal, () => {
       auth?.close();
+      evalWork.close();
       process.exit(0);
     });
   }
@@ -541,7 +545,7 @@ export interface MachineProcessing {
 function startWorkspaceServices(
   ctx: AppContext,
   log: (msg: string) => void,
-  opts: { mcp?: () => McpEndpoint | null; rootDataDir?: string; machine?: MachineProcessing } = {},
+  opts: { mcp?: () => McpEndpoint | null; rootDataDir?: string; machine?: MachineProcessing; evalWork?: EvalWork } = {},
 ): StartedServices {
   let disposed = false;
   const machine = opts.machine ?? { limiter: new CallLimiter(), plans: new PlanReadings({ log }) };
@@ -663,7 +667,7 @@ function startWorkspaceServices(
   void translations.backfill();
   // every answered call is measured, so the next estimate learns from it (docs/design/18)
   const calls = CallLedger.forWorkspace(ctx.dataDir, { log });
-  const work = new WorkBroker([labeling, summaries, judges, translations, embedWork, sessionWork], { shares: () => ctx.config.server.remote?.shares, ledger: calls });
+  const work = new WorkBroker([labeling, summaries, judges, translations, embedWork, sessionWork, ...(opts.evalWork?.sources ?? [])], { shares: () => ctx.config.server.remote?.shares, ledger: calls });
   remoteJudge.askedLately = () => work.askedLately('judge', 2 * 60_000);
   remoteEmbed.askedLately = () => work.askedLately('embed', 2 * 60_000);
   // this machine's embed slots run whether or not processing is started, as embedding always has

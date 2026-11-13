@@ -1,0 +1,103 @@
+#!/usr/bin/env node
+// A stand-in for both CLIs an evaluation run uses, wherever it runs (here or on a worker; docs/design/27 §8):
+//   codex exec …            a one-shot call (answers by what the prompt is for, as the eval suite's ScriptedBackend)
+//                           or, with web search off (agentArgs), an agent session: a trace, a file it reads,
+//                           and with CALL_MCP in the prompt real calls to the knode MCP server it was given
+//   claude -p …             the judge: every item agreed with, as the eval suite's scriptedJudge
+// FAKE_EVAL_SLOW_MS holds a session that long; FAKE_EVAL_TOKEN_FILE receives a session's MCP URL and token.
+import fs from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+const arg = (name) => {
+  const i = args.indexOf(name);
+  return i >= 0 ? args[i + 1] : undefined;
+};
+const emit = (e) => process.stdout.write(JSON.stringify(e) + '\n');
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let prompt = '';
+process.stdin.on('data', (d) => (prompt += d));
+process.stdin.on('end', () => void main().catch((err) => {
+  process.stderr.write(String(err?.stack ?? err));
+  process.exit(1);
+}));
+
+const USAGE = { input_tokens: 1200, cached_input_tokens: 800, output_tokens: 60, reasoning_output_tokens: 10 };
+
+function oneShot() {
+  if (prompt.includes('knowledge-graph extraction engine')) {
+    return JSON.stringify({
+      entities: [
+        { name: '林晓', type: 'person', description: '数据工程师', aliases: [] },
+        { name: '澜舟科技', type: 'organization', description: '林晓的新公司', aliases: ['澜舟'] },
+      ],
+      relations: [{ source: '林晓', target: '澜舟科技', type: 'works_at', description: '入职' }],
+      claims: prompt.includes('岗位为高级数据工程师') ? [{ subject: '林晓', statement: '林晓在澜舟科技的岗位是高级数据工程师', type: 'event', status: 'fact', kind: 'fact' }] : [],
+    });
+  }
+  if (prompt.includes('Summarize the document')) return '林晓的近况。\n\n## Key points\n\n- 林晓将入职澜舟科技';
+  if (prompt.includes('You answer questions from a personal knowledge base')) return '林晓的岗位是高级数据工程师 [1]。\nFinal answer: 高级数据工程师\n{"citations":[1],"gaps":[]}';
+  if (prompt.includes('"items":[{"label"')) return '三月的记录如下。\n{"items":[{"label":"5公里","confidence":0.9,"evidence":["diary/2026-03-04.md"]}]}';
+  if (prompt.includes('Respond with a single JSON object only')) return '{}';
+  return '林晓在澜舟科技担任高级数据工程师 [doc: email/2026-03-05.md]。\nFinal answer: 高级数据工程师';
+}
+
+async function session(cwd, out) {
+  emit({ type: 'thread.started', thread_id: 'fake-thread' });
+  const slow = Number(process.env.FAKE_EVAL_SLOW_MS ?? 0);
+  const url = /mcp_servers\.knode\.url="?([^"]+)"?/.exec(args.find((a) => a.startsWith('mcp_servers.knode.url=')) ?? '')?.[1];
+  const token = process.env.KNODE_EVAL_MCP_TOKEN;
+  if (url && process.env.FAKE_EVAL_TOKEN_FILE) fs.writeFileSync(process.env.FAKE_EVAL_TOKEN_FILE, JSON.stringify({ url, token }));
+  let answer = '林晓在澜舟科技担任高级数据工程师 [doc: email/2026-03-05.md]。\nFinal answer: 高级数据工程师';
+  if (url) {
+    emit({ type: 'item.started', item: { type: 'mcp_tool_call', server: 'knode', tool: 'knode_resolve', arguments: { query: '林晓的岗位' } } });
+    if (prompt.includes('CALL_MCP')) {
+      const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+      const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+      const client = new Client({ name: 'fake-eval-cli', version: '1.0.0' });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+      const tools = (await client.listTools()).tools.map((t) => t.name).sort();
+      const ls = await client.callTool({ name: tools[0], arguments: { path: 'raw/docs' } });
+      let secret = 'answered';
+      try {
+        const r = await client.callTool({ name: 'knode_secret', arguments: {} });
+        if (r.isError) secret = 'refused';
+      } catch {
+        secret = 'refused';
+      }
+      await client.close();
+      answer = `tools: ${tools.join(',')}; ${tools[0]}: ${ls.content?.[0]?.text}; knode_secret: ${secret}\nFinal answer: done`;
+    }
+  } else {
+    emit({ type: 'item.started', item: { type: 'command_execution', command: 'rg -n 林晓 .' } });
+    // a file named by its absolute path in the session's folder: the run reads it as its own copy's
+    emit({ type: 'item.started', item: { type: 'command_execution', command: `cat ${path.join(cwd, 'email', '2026-03-05.md')}` } });
+    if (prompt.includes('PEEK_HOME')) emit({ type: 'item.started', item: { type: 'command_execution', command: 'cat ~/notes/secret.md' } });
+  }
+  const steps = Number(/STEPS=(\d+)/.exec(prompt)?.[1] ?? 0);
+  for (let i = 0; i < steps; i++) emit({ type: 'item.started', item: { type: 'command_execution', command: `ls ${i}` } });
+  if (slow) await sleep(slow);
+  emit({ type: 'item.completed', item: { type: 'agent_message', text: answer } });
+  emit({ type: 'turn.completed', usage: USAGE });
+  if (out) fs.writeFileSync(out, answer);
+}
+
+function judge() {
+  const at = prompt.indexOf('{\n "items"');
+  const end = prompt.lastIndexOf('}', prompt.indexOf('Respond with a single JSON object only') >= 0 ? prompt.indexOf('Respond with a single JSON object only') : prompt.length);
+  const items = at >= 0 ? JSON.parse(prompt.slice(at, end + 1)).items : [];
+  const verdicts = items.map((i) => ({ id: i.id, score: 2, keypoints: [0], abstained: false, hallucinated: false, present: true, unit: 0, verdict: 'supported', claims: ['林晓将入职澜舟科技'], pairs: [[0, 0]], correct: true, same: false, contradict: false }));
+  process.stdout.write(JSON.stringify({ type: 'result', is_error: false, result: JSON.stringify({ verdicts }), usage: { input_tokens: 50, output_tokens: 10 } }) + '\n');
+}
+
+async function main() {
+  if (args[0] === '-p') return judge();
+  if (args[0] !== 'exec') throw new Error(`fake-eval-cli: unexpected ${args.join(' ')}`);
+  const out = arg('--output-last-message');
+  const cwd = arg('--cd') ?? process.cwd();
+  if (args.includes('web_search="disabled"')) return session(cwd, out);
+  const text = oneShot();
+  emit({ type: 'thread.started', thread_id: 'fake-thread' });
+  emit({ type: 'turn.completed', usage: USAGE });
+  if (out) fs.writeFileSync(out, text);
+}

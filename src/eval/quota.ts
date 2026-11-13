@@ -44,6 +44,14 @@ export class QuotaGuard {
   private readonly enabled: boolean;
   /** Total time spent paused, for the report. */
   pausedMs = 0;
+  /**
+   * While this says so, `wait()` lets a batch start whatever this machine's
+   * plan says: its work goes to remote workers on their own accounts
+   * (docs/design/27 §8), and a piece that falls back here waits in
+   * `waitLocal()` first.
+   */
+  private bypass: (() => boolean) | null = null;
+  private lastReading: { at: number; account: CodexAccount } | null = null;
 
   constructor(opts: QuotaGuardOptions = {}) {
     this.policy = { ...DEFAULT_QUOTA, ...opts.policy };
@@ -69,13 +77,25 @@ export class QuotaGuard {
     return resets.length ? Math.min(...resets) + 30_000 : this.policy.pollMs;
   }
 
+  setBypass(bypass: (() => boolean) | null): void {
+    this.bypass = bypass;
+  }
+
   async wait(): Promise<void> {
+    if (!this.enabled || this.bypass?.()) return;
+    return this.waitLocal();
+  }
+
+  /** Wait for this machine's plan, whatever remote workers there are; `cacheMs` reuses a reading that recent. */
+  async waitLocal(opts: { cacheMs?: number } = {}): Promise<void> {
     if (!this.enabled) return;
     const started = Date.now();
-    for (;;) {
+    for (let first = true; ; first = false) {
       let account: CodexAccount;
       try {
-        account = await this.read();
+        const cached = first && opts.cacheMs && this.lastReading && Date.now() - this.lastReading.at < opts.cacheMs ? this.lastReading.account : null;
+        account = cached ?? await this.read();
+        this.lastReading = { at: Date.now(), account };
       } catch (err) {
         // a failed reading must not stop the run; the next call will tell if the limit is real
         this.log('quota reading failed', { error: err instanceof Error ? err.message : String(err) });

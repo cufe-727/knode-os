@@ -25,7 +25,9 @@ import { offeredRemotely, workerConfig } from '../work/config.js';
 import { decodeVectors, EmbedSource } from '../work/embed.js';
 import { ASKED_ONLY_KINDS, isWorkKind, WORK_KINDS, WorkKind } from '../work/kinds.js';
 import { SessionSource } from '../work/session.js';
-import { answerSessionMcp, describeMcpRequest } from './session-mcp.js';
+import { EvalSource } from '../work/eval.js';
+import { isArchiveId } from '../work/eval-archive.js';
+import { answerSessionMcp, describeMcpRequest, withKeepalive } from './session-mcp.js';
 import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows, tokenAllowsKind } from './tokens.js';
 
 /**
@@ -40,6 +42,11 @@ import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows, tokenAll
  *                GET work/status — every kind of leased work (docs/design/12)       (scope label, embed or research)
  *     sessions   POST sessions/<id>/mcp — knode's tools for one research session
  *                a worker holds (docs/design/27): the session's own token, not a knr_ one
+ *     eval       POST eval-sessions/<id>/mcp — the run's knode tools for one evaluation
+ *                session a worker holds, proxied to the run's bridge on this machine
+ *                (docs/design/27 §8): the lease's own kes_ token, its tools only
+ *                GET eval-archives/<sha256> — a file agent's folder, while a session
+ *                that reads it is offered or out                                     (scope eval)
  *                POST work/calibrate — an own embedding endpoint's probe vectors    (scope embed)
  *     labeling   POST labeling/lease | complete | renew | release, GET labeling/status:
  *                the same for extraction only, as workers before work/* speak it    (scope label)
@@ -62,6 +69,8 @@ export interface RemoteApiDeps {
   registry: WorkspaceContextRegistry;
   /** The work broker `serve` runs for a workspace (src/work/broker.ts); null outside `serve`. */
   work: (ctx: AppContext) => WorkBroker | null;
+  /** Where evaluation archives live (src/work/eval.ts `EvalArchives`); absent outside `serve`. */
+  evalArchive?: (sha256: string) => string | null;
   config?: RemoteApiConfig;
   log?: (msg: string) => void;
 }
@@ -207,6 +216,54 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     return res;
   });
 
+  // the run's knode tools for one evaluation session a worker holds (docs/design/27 §8): the lease's own token,
+  // the session's tools only, proxied to the MCP bridge the run keeps on this machine — no workspace leaves it
+  api.all('/w/:owner/:workspace/eval-sessions/:id/mcp', async (c) => {
+    const client = clientOf(c);
+    if (blocked(client)) return c.json({ error: 'too many failed authentications — try again later' }, 429);
+    const { spec, ctx } = await openWorkspace(c.req.param('owner'), c.req.param('workspace'));
+    const source = deps.work(ctx)?.source('eval-session');
+    const id = text(c.req.param('id'), 64);
+    const binding = source instanceof EvalSource ? source.authorize(id, presentedToken(c)) : null;
+    const asked = await describeMcpRequest(c.req.raw);
+    if (!binding) {
+      refused(client);
+      audit({ client, workspace: spec, evalSession: id, method: c.req.method, ...asked, status: 401 });
+      return c.json({ error: 'no live evaluation session with this token' }, 401);
+    }
+    failures.delete(client);
+    if (c.req.method !== 'POST') return c.json({ error: 'POST only' }, 405);
+    if (asked.rpc === 'tools/call' && (!asked.tool || !binding.mcp.tools.includes(asked.tool))) {
+      audit({ client, workspace: spec, evalSession: id, run: binding.run, worker: binding.worker, ...asked, status: 403 });
+      return c.json({ jsonrpc: '2.0', id: null, error: { code: -32601, message: `this session may not call ${asked.tool ?? 'that'}` } }, 403);
+    }
+    const started = Date.now();
+    let res: Response;
+    try {
+      res = await fetch(binding.mcp.url, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${binding.mcp.secret}`,
+          'content-type': c.req.header('content-type') ?? 'application/json',
+          accept: c.req.header('accept') ?? 'application/json, text/event-stream',
+          ...(c.req.header('mcp-protocol-version') ? { 'mcp-protocol-version': c.req.header('mcp-protocol-version')! } : {}),
+        },
+        body: await c.req.arrayBuffer(),
+        signal: c.req.raw.signal,
+      });
+    } catch (err) {
+      audit({ client, workspace: spec, evalSession: id, run: binding.run, worker: binding.worker, ...asked, status: 502 });
+      return c.json({ error: `the run's MCP bridge did not answer: ${err instanceof Error ? err.message : err}` }, 502);
+    }
+    audit({ client, workspace: spec, evalSession: id, run: binding.run, worker: binding.worker, method: c.req.method, ...asked, status: res.status, ms: Date.now() - started });
+    const headers = new Headers();
+    for (const name of ['content-type', 'cache-control']) {
+      const v = res.headers.get(name);
+      if (v) headers.set(name, v);
+    }
+    return withKeepalive(new Response(res.body, { status: res.status, headers }), () => {});
+  });
+
   // authentication, rate-limited per client, and an audit line for every answer
   api.use('*', async (c, next) => {
     if (c.req.path.endsWith('/remote/v1/health')) return next();
@@ -260,11 +317,11 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     if (!tokenAllows(c.get('token'), scope, c.get('workspace'))) throw new HttpError(403, `this token lacks the "${scope}" scope here`);
     return c.get('ctx');
   };
-  /** Leased work: model calls under `label`, embed batches under `embed`, research sessions under `research`. */
+  /** Leased work: model calls under `label`, embed batches under `embed`, research sessions under `research`, evaluation work under `eval`. */
   const needWork = (c: Context<RemoteEnv>) => {
     const token = c.get('token');
-    if (!(['label', 'embed', 'research'] as const).some((scope) => tokenAllows(token, scope, c.get('workspace')))) {
-      throw new HttpError(403, 'this token lacks the "label", "embed" or "research" scope here');
+    if (!(['label', 'embed', 'research', 'eval'] as const).some((scope) => tokenAllows(token, scope, c.get('workspace')))) {
+      throw new HttpError(403, 'this token lacks the "label", "embed", "research" or "eval" scope here');
     }
     return c.get('ctx');
   };
@@ -281,11 +338,16 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     const allowed = allowedKinds(c);
     const embed = allowed.includes('embed') && b.source('embed') ? { embedder: ctx.embedder, leaseMs: b.leaseDurationMs('embed') } : null;
     const sessionLeaseMs = b.source('session') ? b.leaseDurationMs('session') : null;
-    return workerConfig(ctx.config, { allowed, leaseMs: b.leaseDurationMs(), shares: b.shares(), embed, sessionLeaseMs });
+    const evalLeaseMs = b.source('eval-session') ? b.leaseDurationMs('eval-session') : b.source('eval-call') ? b.leaseDurationMs('eval-call') : null;
+    return workerConfig(ctx.config, { allowed, leaseMs: b.leaseDurationMs(), shares: b.shares(), embed, sessionLeaseMs, evalLeaseMs });
   };
   const sessionSource = (b: WorkBroker): SessionSource | null => {
     const source = b.source('session');
     return source instanceof SessionSource ? source : null;
+  };
+  const evalSessionSource = (b: WorkBroker): EvalSource | null => {
+    const source = b.source('eval-session');
+    return source instanceof EvalSource ? source : null;
   };
   const embedSource = (b: WorkBroker): EmbedSource | null => {
     const source = b.source('embed');
@@ -326,6 +388,10 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
           output: text(v.output, 4 * 1024 * 1024),
           stderr: text(v.stderr, 64 * 1024),
           lastMessage: typeof v.lastMessage === 'string' ? text(v.lastMessage, 2 * 1024 * 1024) : null,
+          // an evaluation session's: stopped at its step cap, and where it ran (for the leak audit)
+          ...(v.capped === true ? { capped: true } : {}),
+          ...(typeof v.cwd === 'string' ? { cwd: text(v.cwd, 1024) } : {}),
+          ...(typeof v.home === 'string' ? { home: text(v.home, 1024) } : {}),
         };
       })()
       : undefined;
@@ -341,10 +407,13 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     const s = broker(ctx);
     const who = whoOf(c, b);
     // a research session's stdout since the last renewal, for its transcript (docs/design/27 D10)
+    // and an evaluation session's, kept for its answer
     const sessions = sessionSource(s);
-    if (sessions && b.output && typeof b.output === 'object' && !Array.isArray(b.output)) {
+    const evalSessions = evalSessionSource(s);
+    if ((sessions || evalSessions) && b.output && typeof b.output === 'object' && !Array.isArray(b.output)) {
       for (const [id, chunk] of Object.entries(b.output as Record<string, unknown>).slice(0, 64)) {
-        if (typeof chunk === 'string' && chunk) sessions.output(text(id, 64), who, chunk);
+        if (typeof chunk !== 'string' || !chunk) continue;
+        if (!sessions?.output(text(id, 64), who, chunk)) evalSessions?.output(text(id, 64), who, chunk);
       }
     }
     return c.json(s.renew(ids(b.ids), who));
@@ -356,8 +425,8 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
   };
   const watching = (c: Context<RemoteEnv>) => {
     const token = c.get('token');
-    if (!(['label', 'embed', 'research', 'read'] as const).some((scope) => tokenAllows(token, scope, c.get('workspace')))) {
-      throw new HttpError(403, 'this token lacks the "label", "embed", "research" or "read" scope here');
+    if (!(['label', 'embed', 'research', 'eval', 'read'] as const).some((scope) => tokenAllows(token, scope, c.get('workspace')))) {
+      throw new HttpError(403, 'this token lacks the "label", "embed", "research", "eval" or "read" scope here');
     }
     return broker(c.get('ctx'));
   };
@@ -403,6 +472,16 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
       endpointModel: b.endpointModel ? text(b.endpointModel, 120) : undefined,
       vectors: vectorsOf(b.vectors, b.dimensions),
     }));
+  });
+  // a file agent's folder for an evaluation session (docs/design/27 §8): only while a session that reads it is offered or out
+  api.get('/w/:owner/:workspace/eval-archives/:sha', (c) => {
+    const ctx = need(c, 'eval');
+    const sha = c.req.param('sha');
+    if (!isArchiveId(sha)) throw new HttpError(400, 'an archive id is a SHA-256 in hex');
+    const sessions = evalSessionSource(broker(ctx));
+    const file = deps.evalArchive?.(sha) ?? null;
+    if (!sessions?.wantsArchive(sha) || !file) throw new HttpError(404, `no archive ${sha.slice(0, 12)} for a live evaluation session`);
+    return c.body(fs.readFileSync(file), 200, { 'content-type': 'application/gzip', 'cache-control': 'no-store' });
   });
   api.post('/w/:owner/:workspace/work/complete', complete('work'));
   api.post('/w/:owner/:workspace/work/renew', renew('work'));

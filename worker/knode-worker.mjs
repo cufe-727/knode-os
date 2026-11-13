@@ -39,6 +39,16 @@
 // (the job was cancelled, the server restarted) kills the CLI. --session-timeout-ms caps a session (default: the
 // server's timeout, at most 6 h).
 //
+// Evaluation work (--eval codex:2,claude:1; docs/design/27 §8): an evaluation run's model calls (eval-call) and, on
+// codex, its agent sessions (eval-session), run on this machine's own account. The token needs the "eval" scope and
+// the server must offer them (server.remote.offer.eval). A task names the CLI family and model the run uses, and this
+// worker runs exactly that model, so the run's results stay on one backend. A call is the prompt on stdin, with an
+// output schema when the run gave one. A session is built here from its fields, as `knode-os eval run` builds it
+// (read-only sandbox, no web, the step cap counted here): a file agent's folder comes as an archive downloaded once,
+// kept by its SHA-256 (in KNODE_EVAL_CACHE_DIR, default the temp folder) and unpacked fresh for each session; an
+// agent with knode's tools reaches the run's tools at <server>/remote/v1/w/<workspace>/eval-sessions/<id>/mcp with a
+// token of the session's own. Its stdout goes back with each renewal (--session-renew-ms) and is parsed by the run.
+//
 // Kinds of work (--kinds extract,summarize,judge,translate; default: every kind the server offers this token):
 //   extract    extraction segments, answered with a JSON object
 //   summarize  summary pages, answered in Markdown
@@ -64,6 +74,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 /* ------------------------------- options -------------------------------- */
 
@@ -94,8 +105,9 @@ const token = (args.tokenFile ? fs.readFileSync(String(args.tokenFile), 'utf8') 
 const workerName = String(args.name ?? process.env.KNODE_WORKER_NAME ?? os.hostname());
 const timeoutMs = Number(args.timeoutMs ?? 600_000);
 const sessionSpec = String(args.sessions ?? process.env.KNODE_SESSIONS ?? '');
-// research sessions alone: no call slots unless asked for
-const backendSpec = String(args.backends ?? process.env.KNODE_BACKENDS ?? (sessionSpec ? '' : 'codex:1'));
+const evalSpec = String(args.eval ?? process.env.KNODE_EVAL ?? '');
+// research sessions or evaluation work alone: no call slots unless asked for
+const backendSpec = String(args.backends ?? process.env.KNODE_BACKENDS ?? (sessionSpec || evalSpec ? '' : 'codex:1'));
 const idleMs = Math.max(100, Number(args.idleMs ?? 20_000));
 const KINDS = ['extract', 'summarize', 'judge', 'translate'];
 const kindSpec = args.kinds ?? process.env.KNODE_KINDS;
@@ -219,11 +231,13 @@ async function kindsForLease() {
 
 function describeKinds() {
   if (!work) return 'a server from before work/* — extraction only';
-  const offered = [...KINDS, 'embed', 'session'].filter((k) => work.kinds?.[k] === true);
+  const offered = [...KINDS, 'embed', 'session', 'eval-call', 'eval-session'].filter((k) => work.kinds?.[k] === true);
   const takes = [
     ...(backends.some((b) => b.name !== 'embed') ? kindsNow() : []),
     ...(hasEmbedSlots && work.kinds?.embed === true ? ['embed'] : []),
     ...(sessionSlots.length && work.kinds?.session === true ? ['session'] : []),
+    ...(evalSlots.length && work.kinds?.['eval-call'] === true ? ['eval-call'] : []),
+    ...(evalSlots.some((s) => s.family === 'codex') && work.kinds?.['eval-session'] === true ? ['eval-session'] : []),
   ];
   return `offers ${offered.join(', ') || 'nothing to this token'}; this worker takes ${takes.join(', ') || 'nothing'}`;
 }
@@ -335,9 +349,9 @@ async function calibrate() {
 
 const children = new Set();
 
-function run(cmd, argv, stdin, cwd) {
+function run(cmd, argv, stdin, cwd, limitMs = timeoutMs, env = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, argv, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(cmd, argv, { cwd, env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
     children.add(child);
     let stdout = '';
     let stderr = '';
@@ -351,8 +365,8 @@ function run(cmd, argv, stdin, cwd) {
     };
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
-      finish(() => reject(new Error(`${cmd} timed out after ${Math.round(timeoutMs / 1000)}s`)));
-    }, timeoutMs);
+      finish(() => reject(new Error(`${cmd} timed out after ${Math.round(limitMs / 1000)}s`)));
+    }, limitMs);
     child.stdout.on('data', (d) => (stdout += d));
     child.stderr.on('data', (d) => (stderr += d));
     child.on('error', (err) => finish(() => reject(err.code === 'ENOENT' ? new Error(`${cmd} CLI not found`) : err)));
@@ -735,7 +749,18 @@ const sessionSlots = sessionSpec.split(',').filter((part) => part.trim()).map((p
   if (!Number.isFinite(slots)) throw new Error(`bad slot count in "${part}"`);
   return { family, slots, bin: SESSION_FAMILIES[family], health: newHealth() };
 }).filter((s) => s.slots > 0);
-if (backends.length === 0 && sessionSlots.length === 0) throw new Error('no backend has a slot (--backends, --sessions)');
+const EVAL_FAMILIES = { codex: () => String(args.codexBin ?? 'codex'), claude: () => String(args.claudeBin ?? 'claude') };
+const evalCacheDir = process.env.KNODE_EVAL_CACHE_DIR || path.join(os.tmpdir(), 'knode-worker-eval');
+// sessions are Codex's: the run's agents are `codex exec` sessions
+const evalKindsFor = (family) => (family === 'codex' ? ['eval-call', 'eval-session'] : ['eval-call']);
+const evalSlots = evalSpec.split(',').filter((part) => part.trim()).map((part) => {
+  const [family, n] = part.trim().split(':');
+  if (!EVAL_FAMILIES[family]) throw new Error(`evaluation work runs on ${Object.keys(EVAL_FAMILIES).join(' or ')}, not "${family}"`);
+  const slots = Math.max(0, Math.min(16, Number(n ?? 1)));
+  if (!Number.isFinite(slots)) throw new Error(`bad slot count in "${part}"`);
+  return { family, slots, bin: EVAL_FAMILIES[family], health: newHealth() };
+}).filter((s) => s.slots > 0);
+if (backends.length === 0 && sessionSlots.length === 0 && evalSlots.length === 0) throw new Error('no backend has a slot (--backends, --sessions, --eval)');
 const hasEmbedSlots = backends.some((b) => b.name === 'embed');
 if (hasEmbedSlots && !ownEndpoint) {
   throw new Error('embed slots need an endpoint of this machine\'s own: --embed-base-url http://…/v1 --embed-model <model> (lent keys are not taken yet)');
@@ -790,6 +815,11 @@ if (args.check) {
   for (const s of sessionSlots) {
     const offered = work?.kinds?.session === true;
     log(`research sessions on ${s.family} × ${s.slots}: ${onPath(s.bin()) ? 'installed' : 'NOT FOUND on PATH'}; ${offered ? 'offered here' : 'not offered to this token here (it needs the "research" scope, and the workspace server.remote.offer.session)'}`);
+  }
+  for (const s of evalSlots) {
+    const kinds = evalKindsFor(s.family).filter((k) => work?.kinds?.[k] === true);
+    log(`evaluation work on ${s.family} × ${s.slots}: ${onPath(s.bin()) ? 'installed' : 'NOT FOUND on PATH'}; ${kinds.length ? `takes ${kinds.join(', ')} here` : 'not offered to this token here (it needs the "eval" scope, and server.remote.offer.eval)'}`);
+    if (s.family === 'codex' && kinds.includes('eval-session')) log(`evaluation archives cached in ${evalCacheDir}`);
   }
   process.exit(0);
 }
@@ -1245,6 +1275,416 @@ async function sessionSlot(slot, n) {
   }
 }
 
+/* ---------------------------- evaluation work ---------------------------- */
+// An evaluation run's calls and agent sessions (docs/design/27 §8). Every field is checked and the command built here,
+// as for research sessions: the run names a family, a model and an effort, never a flag. A session's `codex exec`
+// mirrors the run's own (src/eval/agent.ts agentArgs): user config, plugins, apps, analytics and web search off,
+// read-only sandbox in the session's folder, the last message to a file outside it, events on stdout.
+
+const EVAL_EFFORTS = SESSION_EFFORTS;
+const EVAL_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@\[\]=,-]{0,119}$/;
+
+/** The agent a task names, checked: this slot's family, a model (never empty), a known effort. */
+function checkEvalAgent(task, family) {
+  if (typeof task.id !== 'string' || !/^[0-9a-f-]{36}$/i.test(task.id)) return { error: 'its id is not a lease id' };
+  const a = task.agent ?? {};
+  if (a.family !== family) return { error: `it is for ${a.family}, this slot runs ${family}` };
+  const model = String(a.model ?? '');
+  if (!EVAL_MODEL_RE.test(model)) return { error: 'it names no model, or its model name is not one' };
+  const effort = a.effort == null ? null : String(a.effort);
+  if (effort !== null && !EVAL_EFFORTS.has(effort)) return { error: `unknown effort "${effort}"` };
+  const speed = a.speed == null ? null : String(a.speed);
+  if (speed !== null && !/^[a-z][a-z0-9_-]{0,30}$/.test(speed)) return { error: 'its speed is not one' };
+  const timeout = Math.trunc(Number(task.timeoutMs));
+  if (!(timeout >= 1_000)) return { error: 'its timeout is out of range' };
+  if (typeof task.prompt !== 'string' || !task.prompt.trim()) return { error: 'it has no prompt' };
+  return { agent: { family, model, effort, speed }, timeoutMs: Math.min(timeout, sessionTimeoutMs) };
+}
+
+/** An eval call as this worker will run it, or why it will not. */
+function checkEvalCall(task, family) {
+  const fail = (why) => ({ error: `refused the eval call: ${why}` });
+  const a = checkEvalAgent(task, family);
+  if (a.error) return fail(a.error);
+  let schema = null;
+  if (task.schema != null) {
+    if (family !== 'codex') return fail('an output schema is for codex');
+    if (typeof task.schema !== 'object' || Array.isArray(task.schema)) return fail('its schema is not a JSON object');
+    schema = JSON.stringify(task.schema);
+    if (schema.length > 256 * 1024) return fail('its schema is too large');
+  }
+  return { call: { ...a, prompt: task.prompt, schema } };
+}
+
+/** An eval session as this worker will run it, or why it will not. */
+function checkEvalSession(task, family) {
+  const fail = (why) => ({ error: `refused the eval session: ${why}` });
+  if (family !== 'codex') return fail('evaluation sessions run on codex');
+  const a = checkEvalAgent(task, family);
+  if (a.error) return fail(a.error);
+  if (task.sandbox !== 'read-only') return fail('its sandbox is not read-only');
+  const maxSteps = Math.trunc(Number(task.maxSteps));
+  if (!(maxSteps >= 1 && maxSteps <= 1000)) return fail('its step cap is out of range');
+  let archive = null;
+  if (task.archive != null) {
+    if (typeof task.archive.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(task.archive.sha256)) return fail('its archive id is not a SHA-256');
+    archive = { sha256: task.archive.sha256, bytes: Math.max(0, Math.trunc(Number(task.archive.bytes) || 0)) };
+  }
+  let mcp = null;
+  if (task.mcp != null) {
+    if (typeof task.mcp.token !== 'string' || !/^kes_[A-Za-z0-9_-]{20,200}$/.test(task.mcp.token)) return fail('it has no session token');
+    const tools = Array.isArray(task.mcp.tools) ? task.mcp.tools.map(String) : [];
+    if (!tools.length || tools.length > 64 || !tools.every((t) => /^[a-z][a-z0-9_]{0,63}$/.test(t))) return fail('its tool list is not one');
+    mcp = { token: task.mcp.token, tools, url: `${base}/eval-sessions/${encodeURIComponent(task.id)}/mcp` };
+  }
+  return { session: { ...a, id: task.id, maxSteps, prompt: task.prompt, archive, mcp } };
+}
+
+/* An archive (a copy of src/work/eval-archive.ts): gzip over `KPA1\n`, then per file a JSON line {p, n} and its bytes. */
+const ARCHIVE_MAX_BYTES = 2 * 1024 ** 3;
+const downloads = new Map(); // sha → Promise<Buffer>
+
+function archiveEntries(gzip, sha256) {
+  const raw = zlib.gunzipSync(gzip, { maxOutputLength: ARCHIVE_MAX_BYTES + 64 * 1024 * 1024 });
+  if (crypto.createHash('sha256').update(raw).digest('hex') !== sha256) throw new Error(`archive ${sha256.slice(0, 12)} does not match its id`);
+  if (raw.subarray(0, 5).toString() !== 'KPA1\n') throw new Error('not a knode archive');
+  const out = [];
+  let at = 5;
+  while (at < raw.length) {
+    const nl = raw.indexOf(10, at);
+    if (nl < 0) throw new Error('a torn archive entry');
+    const head = JSON.parse(raw.subarray(at, nl).toString('utf8'));
+    const n = Number(head.n);
+    const p = head.p;
+    if (!Number.isSafeInteger(n) || n < 0 || nl + 1 + n > raw.length) throw new Error('a torn archive entry');
+    if (typeof p !== 'string' || !p || p.startsWith('/') || p.includes('\\') || p.includes('\0') || p.split('/').some((x) => x === '' || x === '.' || x === '..')) {
+      throw new Error(`an archive entry escapes its folder: ${String(p).slice(0, 200)}`);
+    }
+    out.push({ path: p, data: raw.subarray(nl + 1, nl + 1 + n) });
+    at = nl + 1 + n;
+  }
+  return out;
+}
+
+/** The archive, from the cache when it is there, else downloaded once (concurrent sessions share the download). */
+function evalArchive(sha256) {
+  const file = path.join(evalCacheDir, `${sha256}.kpa`);
+  if (fs.existsSync(file)) {
+    const now = new Date();
+    fs.utimesSync(file, now, now);
+    return Promise.resolve(fs.readFileSync(file));
+  }
+  if (!downloads.has(sha256)) {
+    downloads.set(sha256, (async () => {
+      const res = await fetch(`${base}/eval-archives/${sha256}`, { headers: { authorization: `Bearer ${token}`, ...extraHeaders }, signal: AbortSignal.timeout(30 * 60_000) });
+      if (!res.ok) throw new Error(`archive ${sha256.slice(0, 12)}: ${res.status} ${(await res.text()).slice(0, 200)}`);
+      const gzip = Buffer.from(await res.arrayBuffer());
+      archiveEntries(gzip, sha256); // checked before it is kept
+      fs.mkdirSync(evalCacheDir, { recursive: true, mode: 0o700 });
+      const partial = `${file}.${process.pid}.part`;
+      fs.writeFileSync(partial, gzip, { mode: 0o600 });
+      fs.renameSync(partial, file);
+      log(`eval: archive ${sha256.slice(0, 12)} downloaded (${Math.round(gzip.length / 1024)} KB)`);
+      return gzip;
+    })().finally(() => downloads.delete(sha256)));
+  }
+  return downloads.get(sha256);
+}
+
+/** Archives no session has read for a day go. */
+function pruneEvalCache() {
+  try {
+    for (const name of fs.readdirSync(evalCacheDir)) {
+      const f = path.join(evalCacheDir, name);
+      if (Date.now() - fs.statSync(f).mtimeMs > 24 * 3_600_000) fs.rmSync(f, { force: true });
+    }
+  } catch {
+    // no cache yet
+  }
+}
+
+/** One eval call: the run's prompt on stdin, its model and effort, its schema; the raw reply back. */
+async function runEvalCall(call, family, report) {
+  const dir = scratch();
+  try {
+    if (family === 'claude') {
+      const argv = ['-p', '--output-format', 'json', '--max-turns', '1', '--no-session-persistence', '--model', call.agent.model, ...(call.agent.effort ? ['--effort', call.agent.effort] : [])];
+      const r = await run(EVAL_FAMILIES.claude(), argv, call.prompt, dir, call.timeoutMs);
+      let wrapper = null;
+      try {
+        wrapper = JSON.parse(r.stdout);
+      } catch {
+        // fall through
+      }
+      if (wrapper && typeof wrapper === 'object' && 'result' in wrapper) {
+        const t = wrapper.usage ?? {};
+        const usage = cachedUsage(t.input_tokens, t.cache_read_input_tokens, t.cache_creation_input_tokens, t.output_tokens, wrapper.total_cost_usd);
+        if (usage) report(usage);
+        if (wrapper.is_error || r.code !== 0) throw new Error(`claude CLI error: ${String(wrapper.result ?? 'unknown').slice(0, 400)}`);
+        return String(wrapper.result ?? '').trim();
+      }
+      if (r.code !== 0) throw new Error(`claude exited with code ${r.code}: ${tail(r.stderr, r.stdout)}`);
+      return r.stdout.trim();
+    }
+    const out = path.join(dir, 'reply.txt');
+    const ws = path.join(dir, 'workspace');
+    fs.mkdirSync(ws);
+    const schemaFile = path.join(dir, 'schema.json');
+    if (call.schema) fs.writeFileSync(schemaFile, call.schema);
+    const catalog = codexCatalog(EVAL_FAMILIES.codex(), call.agent.model);
+    let pinned = pinnedCatalog(catalog);
+    const argv = () => [
+      'exec', '--ignore-user-config', '--ephemeral', '-c', 'features.plugins=false', '-c', 'features.apps=false',
+      '-c', 'analytics.enabled=false', ...(pinned ? ['-c', `model_catalog_json=${JSON.stringify(pinned)}`] : []),
+      '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', ws, '--output-last-message', out, '--json',
+      '--model', call.agent.model,
+      ...(call.agent.effort ? ['-c', `model_reasoning_effort="${call.agent.effort}"`] : []),
+      ...(call.agent.speed ? ['-c', `service_tier="${call.agent.speed}"`] : []),
+      ...(call.schema ? ['--output-schema', schemaFile] : []),
+      '-',
+    ];
+    let r;
+    for (;;) {
+      try {
+        r = await run(EVAL_FAMILIES.codex(), argv(), call.prompt, ws, call.timeoutMs);
+      } finally {
+        if (!pinned) await refreshCatalog(catalog);
+      }
+      if (!pinned || r.code === 0 || !catalogRejected(pinned, r.stderr)) break;
+      pinned = null;
+    }
+    const events = readCodexEvents(r.stdout);
+    if (events.usage) report(events.usage);
+    if (r.code !== 0) throw new Error(`codex exec exited with code ${r.code}: ${events.error ?? tail(r.stderr, r.stdout)}`);
+    const text = fs.existsSync(out) ? fs.readFileSync(out, 'utf8').trim() : '';
+    if (!text) throw new Error(`codex exec finished but produced no message${events.error ? `: ${events.error}` : ''}`);
+    return text;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** The `codex exec` of an eval session, built from its checked fields (src/eval/agent.ts agentArgs). */
+function evalSessionCommand(sess, cwd, out, pinned) {
+  const argv = [
+    'exec', '--ignore-user-config', '--ephemeral', '-c', 'features.plugins=false', '-c', 'features.apps=false', '-c', 'analytics.enabled=false',
+    ...(pinned ? ['-c', `model_catalog_json=${JSON.stringify(pinned)}`] : []),
+    '-c', 'web_search="disabled"', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', cwd,
+    '--output-last-message', out, '--json', '--model', sess.agent.model,
+    ...(sess.agent.effort ? ['-c', `model_reasoning_effort="${sess.agent.effort}"`] : []),
+  ];
+  if (sess.mcp) {
+    argv.push(
+      '-c', `mcp_servers.knode.url=${JSON.stringify(sess.mcp.url)}`,
+      '-c', 'mcp_servers.knode.bearer_token_env_var="KNODE_EVAL_MCP_TOKEN"',
+      '-c', `mcp_servers.knode.enabled_tools=${JSON.stringify(sess.mcp.tools)}`,
+      '-c', 'mcp_servers.knode.default_tools_approval_mode="approve"',
+      '-c', 'mcp_servers.knode.tool_timeout_sec=300',
+    );
+  }
+  argv.push('-');
+  return { bin: EVAL_FAMILIES.codex(), argv, env: sess.mcp ? { KNODE_EVAL_MCP_TOKEN: sess.mcp.token } : {} };
+}
+
+/** An eval slot: lease the run's calls (and, on codex, its sessions), run each, hand back the raw result. */
+async function evalSlot(slot, n) {
+  const identity = { worker: `${workerName}/eval-${slot.family}#${n}`, backend: slot.family };
+  const kindsHere = evalKindsFor(slot.family);
+  let idleRounds = 0;
+  while (!stopping) {
+    const pause = slot.health.pausedUntil - Date.now();
+    if (pause > 0) {
+      await sleep(Math.min(pause, 15_000));
+      continue;
+    }
+    if (reading) await reading;
+    const kinds = kindsHere.filter((k) => work?.kinds?.[k] === true);
+    if (!kinds.length) {
+      if (args.once && ++idleRounds >= 2) break;
+      await sleep(idleMs * (0.75 + Math.random() * 0.5));
+      continue;
+    }
+    let task;
+    let leaseSeconds = work?.leaseSeconds?.eval ?? 120;
+    try {
+      const { data } = await call('POST', `${base}/work/lease`, { ...identity, kinds, max: 1 });
+      if (data.configVersion && data.configVersion !== work.version) void rereadWorkConfig();
+      task = data.tasks?.[0];
+      leaseSeconds = data.leaseSeconds ?? leaseSeconds;
+    } catch (err) {
+      log(`${identity.worker}: lease failed: ${err.message}`);
+      if (err.status === 401 || err.status === 403) {
+        stopping = true;
+        break;
+      }
+      await sleep(30_000);
+      continue;
+    }
+    if (!task) {
+      if (args.once && ++idleRounds >= 2) break;
+      await sleep(idleMs * (0.75 + Math.random() * 0.5));
+      continue;
+    }
+    idleRounds = 0;
+    held.set(task.id, { identity, route: 'work' });
+    const isSession = task.kind === 'eval-session';
+    const checked = isSession ? checkEvalSession(task, slot.family) : task.kind === 'eval-call' ? checkEvalCall(task, slot.family) : { error: `refused: ${task.kind} is no evaluation work` };
+    if (checked.error) {
+      log(`${identity.worker}: ${checked.error}`);
+      await call('POST', `${base}/work/complete`, { ...identity, id: task.id, ok: false, error: checked.error, kind: 'fatal' }).catch(() => {});
+      held.delete(task.id);
+      const ms = rest(slot.health, 'fatal');
+      log(`eval on ${slot.family}: resting ${Math.ceil(ms / 60_000)} min after a refused task`);
+      continue;
+    }
+    const started = Date.now();
+    const label = task.label ?? task.id;
+    let outcome;
+    if (!isSession) {
+      const c = checked.call;
+      let usage = null;
+      let renewFailed = false;
+      const renew = setInterval(() => {
+        call('POST', `${base}/work/renew`, { ...identity, ids: [task.id] })
+          .then(({ data }) => {
+            if (Array.isArray(data.lost) && data.lost.includes(task.id) && !renewFailed) {
+              renewFailed = true;
+              log(`${identity.worker}: the run no longer wants ${label}`);
+            }
+          })
+          .catch((err) => log(`${identity.worker}: renew failed: ${err.message}`));
+      }, Math.max(1_000, (leaseSeconds * 1000) / 3));
+      try {
+        const text = await runEvalCall(c, slot.family, (u) => (usage = u));
+        outcome = { ok: true, text, model: `${slot.family}:${c.agent.model}` };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        outcome = { ok: false, error: message, kind: classify(message), model: `${slot.family}:${c.agent.model}` };
+      } finally {
+        clearInterval(renew);
+      }
+      if (usage) outcome.usage = usage;
+    } else {
+      const sess = checked.session;
+      log(`${identity.worker}: eval session ${label} on codex ${sess.agent.model} (≤${sess.maxSteps} steps${sess.archive ? ', a folder' : ''}${sess.mcp ? `, knode tools: ${sess.mcp.tools.length}` : ''})`);
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-eval-'));
+      const cwd = path.join(dir, 'kb');
+      fs.mkdirSync(cwd);
+      const out = path.join(dir, 'answer.txt');
+      let pendingOut = '';
+      let lost = false;
+      let proc = null;
+      let steps = 0;
+      let capped = false;
+      let lineBuf = '';
+      const onLine = (line) => {
+        if (!line.startsWith('{')) return;
+        let ev;
+        try {
+          ev = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (ev.type !== 'item.started' || !ev.item) return;
+        if (ev.item.type === 'command_execution' || ev.item.type === 'mcp_tool_call') steps++;
+        if (steps > sess.maxSteps && !capped) {
+          capped = true;
+          proc?.kill();
+        }
+      };
+      let renewing = Promise.resolve();
+      const renewOnce = () => {
+        renewing = renewing.then(async () => {
+          if (lost) return;
+          const output = pendingOut;
+          pendingOut = '';
+          try {
+            const { data } = await call('POST', `${base}/work/renew`, { ...identity, ids: [task.id], output: output ? { [task.id]: output } : undefined });
+            if (Array.isArray(data.lost) && data.lost.includes(task.id)) {
+              lost = true;
+              log(`${identity.worker}: the run no longer wants ${label} (cancelled, restarted or lapsed) — stopping it`);
+              proc?.kill();
+            }
+          } catch (err) {
+            pendingOut = output + pendingOut;
+            log(`${identity.worker}: renew failed: ${err.message}`);
+          }
+        });
+        return renewing;
+      };
+      const renewTimer = setInterval(() => void renewOnce(), SESSION_RENEW_MS);
+      let result = null;
+      let setupError = null;
+      try {
+        if (sess.archive) {
+          const gzip = await evalArchive(sess.archive.sha256);
+          // a fresh copy for this session, read-only: nothing one session leaves reaches the next
+          for (const e of archiveEntries(gzip, sess.archive.sha256)) {
+            const abs = path.join(cwd, e.path);
+            fs.mkdirSync(path.dirname(abs), { recursive: true });
+            fs.writeFileSync(abs, e.data, { mode: 0o444 });
+          }
+        }
+        const catalog = codexCatalog(EVAL_FAMILIES.codex(), sess.agent.model);
+        const pinned = pinnedCatalog(catalog);
+        const cmd = evalSessionCommand(sess, cwd, out, pinned);
+        proc = runSessionProcess(cmd.bin, cmd.argv, sess.prompt, cwd, cmd.env, sess.timeoutMs, (text) => {
+          pendingOut += text;
+          lineBuf += text;
+          let nl;
+          while ((nl = lineBuf.indexOf('\n')) >= 0) {
+            onLine(lineBuf.slice(0, nl));
+            lineBuf = lineBuf.slice(nl + 1);
+          }
+        });
+        result = await proc.done;
+        if (!pinned) await refreshCatalog(catalog);
+        result.lastMessage = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : null;
+      } catch (err) {
+        setupError = err instanceof Error ? err.message : String(err);
+      } finally {
+        clearInterval(renewTimer);
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+      await renewing;
+      if (lost || stopping) {
+        held.delete(task.id);
+        if (stopping) break;
+        continue;
+      }
+      const notStarted = setupError !== null || (result.code === -1 && /CLI not found|ENOENT/.test(result.stderr) && !pendingOut && !capped);
+      outcome = notStarted
+        ? { ok: false, error: setupError ?? result.stderr.trim().split('\n').pop(), kind: setupError ? classify(setupError) === 'transient' ? 'transient' : 'fatal' : 'fatal', model: `codex:${sess.agent.model}` }
+        : {
+          ok: true, text: '', model: `codex:${sess.agent.model}`,
+          session: { exitCode: result.code, output: pendingOut, stderr: result.stderr.slice(-STDERR_KEEP), lastMessage: result.lastMessage, capped, cwd, home: os.homedir() },
+        };
+    }
+    if (stopping && !outcome.ok) break;
+    slot.health.calls++;
+    try {
+      const { data } = await call('POST', `${base}/work/complete`, { ...identity, id: task.id, ...outcome });
+      held.delete(task.id);
+      const secs = Math.round((Date.now() - started) / 1000);
+      if (!data.accepted) log(`${identity.worker}: ${label} not taken back: ${data.reason}`);
+      else if (data.failure) log(`${identity.worker}: ${label} could not be served here (${data.failure}) after ${secs}s — it goes back to the run${outcome.ok ? '' : `: ${outcome.error.slice(0, 200)}`}`);
+      else if (outcome.ok) log(`${identity.worker}: ${label} done in ${secs}s`);
+      else log(`${identity.worker}: ${label} failed (${outcome.kind}) in ${secs}s: ${outcome.error.slice(0, 200)}`);
+      const failure = data.failure ?? (!outcome.ok && outcome.kind !== 'model' ? outcome.kind : null);
+      if (failure) {
+        slot.health.failed++;
+        const ms = rest(slot.health, failure);
+        if (ms) log(`eval on ${slot.family}: resting ${Math.ceil(ms / 60_000)} min after a ${failure} failure`);
+      } else {
+        slot.health.ok++;
+        Object.assign(slot.health, { transientStreak: 0, modelStreak: 0, fatalStreak: 0 });
+      }
+    } catch (err) {
+      log(`${identity.worker}: could not hand back ${label}: ${err.message}`);
+    }
+  }
+}
+
 async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
@@ -1275,15 +1715,18 @@ for (;;) {
     if (stopping) process.exit(0);
   }
 }
-log(`knode worker ${workerName} → ${server} ${workspace}: ${[...backends.map((b) => `${b.name} × ${b.slots}`), ...sessionSlots.map((s) => `research sessions on ${s.family} × ${s.slots}`)].join(', ')} (run ${crypto.randomUUID().slice(0, 8)})`);
+log(`knode worker ${workerName} → ${server} ${workspace}: ${[...backends.map((b) => `${b.name} × ${b.slots}`), ...sessionSlots.map((s) => `research sessions on ${s.family} × ${s.slots}`), ...evalSlots.map((s) => `evaluation work on ${s.family} × ${s.slots}`)].join(', ')} (run ${crypto.randomUUID().slice(0, 8)})`);
 log(`${workspace}: ${describeKinds()}`);
 if (args.extractFirst) log('extract-first enabled: summaries wait for the extraction queue and in-flight work to drain');
 const llmSlots = backends.some((b) => b.name !== 'embed');
 if (llmSlots && kindsNow().length === 0) log('nothing to take here — check --kinds, the token\'s kinds and what the server offers');
 if (hasEmbedSlots && !work?.kinds?.embed) log('embed: not offered to this token here — it needs the "embed" scope, and the workspace ingest.embedding "deferred"');
 if (sessionSlots.length && !work?.kinds?.session) log('research sessions: not offered to this token here — it needs the "research" scope, and the workspace server.remote.offer.session');
+if (evalSlots.length && !work?.kinds?.['eval-call']) log('evaluation work: not offered to this token here — it needs the "eval" scope, and server.remote.offer.eval');
+if (evalSlots.length) pruneEvalCache();
 await Promise.all([
   ...backends.flatMap((b) => Array.from({ length: b.slots }, (_, i) => (b.name === 'embed' ? embedSlot(b, i + 1) : slot(b, i + 1)))),
   ...sessionSlots.flatMap((s) => Array.from({ length: s.slots }, (_, i) => sessionSlot(s, i + 1))),
+  ...evalSlots.flatMap((s) => Array.from({ length: s.slots }, (_, i) => evalSlot(s, i + 1))),
 ]);
 log('no more work — exiting');

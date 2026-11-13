@@ -41,6 +41,8 @@ export interface ChatRequest {
   /** A strict JSON schema for the reply (Codex `--output-schema`). */
   schema?: unknown;
   effort?: LlmEffort;
+  /** Which system, stage and task the call is for (a remote worker's log, Tasks). */
+  tag?: MeterTag;
 }
 
 export interface ChatResult {
@@ -48,10 +50,16 @@ export interface ChatResult {
   usage: CallUsage | null;
   /** The model that answered, for pricing. */
   model: string;
+  /** The remote worker that answered (docs/design/27 §8); absent = this machine. */
+  worker?: string;
+  /** The CLI and model it ran on; absent = the backend's label. */
+  backend?: string;
 }
 
 export interface ChatBackend {
   readonly label: string;
+  /** It bounds its own work here (src/eval/remote.ts): the shim does not hold one of its slots for it. */
+  readonly selfLimiting?: boolean;
   complete(req: ChatRequest): Promise<ChatResult>;
 }
 
@@ -134,10 +142,12 @@ interface CachedReply {
   usage: CallUsage | null;
   model: string;
   ms: number;
+  worker?: string;
+  backend?: string;
 }
 
 /** Replies already paid for, keyed by what was asked. A resumed run replays them at their original cost. */
-class ReplyCache {
+export class ReplyCache {
   private map = new Map<string, CachedReply>();
 
   constructor(private readonly file: string | null) {
@@ -263,8 +273,36 @@ export class MeteredEmbedder implements EmbeddingProvider {
   }
 }
 
+/**
+ * What two shims of one run share (docs/design/27 §8): the reply and vector
+ * caches, this machine's slots and the embedding cap — one shim offers calls
+ * to remote workers, the other, for a private pack, never does.
+ */
+export interface ShimState {
+  replies: ReplyCache;
+  vectors: VectorCache;
+  slots: Slots;
+  cap: { tokens: number; used: number };
+}
+
+export function shimState(opts: { cacheDir?: string; slots?: number; embeddingTokenCap?: number }): ShimState {
+  return {
+    replies: new ReplyCache(opts.cacheDir ? path.join(opts.cacheDir, 'replies.jsonl') : null),
+    vectors: new VectorCache(opts.cacheDir ? path.join(opts.cacheDir, 'vectors.jsonl') : null),
+    slots: new Slots(opts.slots ?? 6),
+    cap: { tokens: opts.embeddingTokenCap ?? Infinity, used: 0 },
+  };
+}
+
+/** A task id's repeat marker (`<task>~r<n>`, `eval run --repeat`): part of a reply's cache key, so a repeat asks again. */
+export function repeatOf(task: string | undefined): string | null {
+  return task ? /~r\d+$/.exec(task)?.[0] ?? null : null;
+}
+
 export interface ShimOptions {
   backend: ChatBackend;
+  /** Caches, slots and cap shared with another shim of the run; absent, this shim's own. */
+  state?: ShimState;
   embedder?: EmbeddingProvider;
   meter: Meter;
   /** Where the reply and vector caches live (the run's cache/); none = no cache. */
@@ -326,10 +364,7 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 }
 
 export async function startShim(opts: ShimOptions): Promise<Shim> {
-  const slots = new Slots(opts.slots ?? 6);
-  const replies = new ReplyCache(opts.cacheDir ? path.join(opts.cacheDir, 'replies.jsonl') : null);
-  const vectors = new VectorCache(opts.cacheDir ? path.join(opts.cacheDir, 'vectors.jsonl') : null);
-  const cap = { tokens: opts.embeddingTokenCap ?? Infinity, used: 0 };
+  const { slots, replies, vectors, cap } = opts.state ?? shimState(opts);
   const keepAlive = opts.keepAliveMs ?? 20_000;
   const retryBase = opts.retryBaseMs ?? 30_000;
   const retries = opts.retries ?? 5;
@@ -356,9 +391,11 @@ export async function startShim(opts: ShimOptions): Promise<Shim> {
       json: format.type === 'json_object' || format.type === 'json_schema',
       schema: strictSchema,
       effort: ANSWER_STAGES.has(tag.stage) ? opts.answerEffort : opts.buildEffort,
+      tag,
     };
     const stream = body.stream === true;
-    const key = crypto.createHash('sha256').update(JSON.stringify([tag.system, messages, request.json, strictSchema ?? null, request.effort ?? null])).digest('hex');
+    const repeat = repeatOf(tag.task);
+    const key = crypto.createHash('sha256').update(JSON.stringify([tag.system, messages, request.json, strictSchema ?? null, request.effort ?? null, ...(repeat ? [repeat] : [])])).digest('hex');
 
     // headers now: a Codex call can outlast any client's header timeout
     res.writeHead(200, stream ? { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' } : { 'content-type': 'application/json' });
@@ -368,17 +405,18 @@ export async function startShim(opts: ShimOptions): Promise<Shim> {
     try {
       let reply = replies.get(key);
       if (reply) {
-        opts.meter.record({ ...tag, model: reply.model, ms: reply.ms, ok: true, replayed: true, usage: reply.usage });
+        opts.meter.record({ ...tag, model: reply.model, ms: reply.ms, ok: true, replayed: true, usage: reply.usage, ...(reply.worker ? { worker: reply.worker } : {}), backend: reply.backend ?? opts.backend.label });
       } else {
         for (let attempt = 0; !reply; attempt++) {
           const t0 = Date.now();
           try {
-            const r = await slots.run(() => opts.backend.complete(request));
-            reply = { k: key, text: r.text, usage: r.usage, model: r.model, ms: Date.now() - t0 };
+            const r = opts.backend.selfLimiting ? await opts.backend.complete(request) : await slots.run(() => opts.backend.complete(request));
+            const backend = r.backend ?? opts.backend.label;
+            reply = { k: key, text: r.text, usage: r.usage, model: r.model, ms: Date.now() - t0, ...(r.worker ? { worker: r.worker } : {}), backend };
             replies.put(reply);
-            opts.meter.record({ ...tag, model: r.model, ms: reply.ms, ok: true, replayed: false, usage: r.usage });
+            opts.meter.record({ ...tag, model: r.model, ms: reply.ms, ok: true, replayed: false, usage: r.usage, ...(r.worker ? { worker: r.worker } : {}), backend });
           } catch (err) {
-            opts.meter.record({ ...tag, model: opts.backend.label, ms: Date.now() - t0, ok: false, replayed: false, usage: (err as { usage?: CallUsage | null }).usage ?? null });
+            opts.meter.record({ ...tag, model: opts.backend.label, ms: Date.now() - t0, ok: false, replayed: false, usage: (err as { usage?: CallUsage | null }).usage ?? null, backend: opts.backend.label });
             if (attempt >= retries || !retryableFailure(err)) throw err;
             await new Promise((resolve) => setTimeout(resolve, Math.min(5 * 60_000, retryBase * 2 ** attempt)));
           }

@@ -105,7 +105,10 @@ export function taggedEmbedder(env: Pick<SystemEnv, 'shim'>, tag: MeterTag): Emb
   };
 }
 
-/** Record an agent session's usage (it ran Codex directly, not through the shim). */
-export function recordAgent(meter: Meter, tag: MeterTag, model: string, r: Pick<AgentRunResult, 'usage' | 'ms' | 'error'>): void {
-  meter.record({ ...tag, model: model || 'codex', ms: r.ms, ok: !r.error, replayed: false, usage: r.usage as CallUsage | null });
+/** Record an agent session's usage (it ran Codex directly, not through the shim), and where it ran. */
+export function recordAgent(meter: Meter, tag: MeterTag, model: string, r: Pick<AgentRunResult, 'usage' | 'ms' | 'error'> & Partial<Pick<AgentRunResult, 'worker' | 'backend'>>): void {
+  meter.record({
+    ...tag, model: model || 'codex', ms: r.ms, ok: !r.error, replayed: false, usage: r.usage as CallUsage | null,
+    ...(r.worker ? { worker: r.worker } : {}), backend: r.backend ?? `codex-cli:${model || 'default'}`,
+  });
 }

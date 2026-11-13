@@ -5,6 +5,7 @@ import type { LlmClient } from '../llm/client.js';
 import type { CallUsage } from '../llm/usage.js';
 import { mapLimit } from '../bench/util.js';
 import { Meter } from './meter.js';
+import { captureEither } from './placement.js';
 import { QuotaGuard } from './quota.js';
 
 /**
@@ -84,12 +85,17 @@ export class Judge {
         { maxTokens: 900 * group.length + 600, onUsage: (u) => (usage = u) },
       );
       let reply: { verdicts?: (V & { id?: string })[] };
+      // a plan's limit can last hours: wait it out (6 h at the guard's 5-minute poll) rather than lose the batch;
+      // who answered (a remote worker, src/eval/remote.ts) is noted on the way and kept with the meter event
+      const r = await captureEither(() => (this.opts.quota ? this.opts.quota.retryRefused(call, 72) : call()));
+      const placed = r.placements.at(-1);
+      const where = { ...(placed?.worker ? { worker: placed.worker } : {}), backend: placed?.backend ?? this.opts.client.label };
       try {
-        // a plan's limit can last hours: wait it out (6 h at the guard's 5-minute poll) rather than lose the batch
-        reply = this.opts.quota ? await this.opts.quota.retryRefused(call, 72) : await call();
-        this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: true, replayed: false, usage });
+        if ('error' in r && r.error !== undefined) throw r.error;
+        reply = r.value!;
+        this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: true, replayed: false, usage, ...where });
       } catch (err) {
-        this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: false, replayed: false, usage });
+        this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: false, replayed: false, usage, ...where });
         if (!(err instanceof SyntaxError) && !/json/i.test(err instanceof Error ? err.message : String(err))) throw err;
         if (group.length > 1) {
           const half = Math.ceil(group.length / 2);
