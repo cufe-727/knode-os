@@ -133,11 +133,17 @@ export interface SearchResult {
   /** The source's reference date (date-only), when one was found. */
   docDate?: string | null;
   score: number;
-  signals: { vector?: number; keyword?: number; graph?: number; structural?: number };
+  signals: { vector?: number; keyword?: number; graph?: number; structural?: number; /** The cross-encoder's score, when a rerank stage ran (src/search/rerank.ts). */ rerank?: number };
   /** Lines cut from the chunk because they hold what a list question names (search/excerpts.ts), not the whole chunk. */
   excerpt?: boolean;
   /** Its 1-based rank in each recall channel that found it; only when the search was asked to explain. */
   ranks?: { vector?: number; keyword?: number; graph?: number };
+  /**
+   * Claims read off this chunk that a newer claim has since replaced, each
+   * with the claim that holds now (src/search/current.ts): the passage says
+   * what was true, this says what is.
+   */
+  current?: CurrentClaim[];
   /** Retrieval provenance. Present for SAG results and omitted by legacy modes. */
   trace?: {
     route: 'direct' | 'sag' | 'both';
@@ -148,6 +154,14 @@ export interface SearchResult {
     /** Entity bridge chain followed to reach this chunk. */
     bridgeEntities?: string[];
   };
+}
+
+/** A superseded claim a passage rests on, and the claim at the end of its supersession chain. */
+export interface CurrentClaim {
+  /** The claim the passage states. */
+  was: { id: string; statement: string };
+  /** What replaced it, as believed now. */
+  now: { id: string; statement: string; date: string | null; path: string | null };
 }
 
 export interface GraphNode {

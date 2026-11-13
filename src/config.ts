@@ -694,6 +694,48 @@ export interface SagSearchConfig {
   directRatio: number;
 }
 
+/**
+ * An optional second ranking of hybrid search's fused candidates by a
+ * cross-encoder behind an HTTP `/rerank` endpoint (docs/design/30): a local
+ * bge-reranker under TEI, or any OpenAI-compatible server that speaks the
+ * Jina / Cohere shape. Off by default; knode-os never starts one. A failed
+ * call leaves the fused order as it was.
+ */
+export interface RerankConfig {
+  enabled: boolean;
+  /** Base URL of the server; `/rerank` is appended unless the URL already ends in it. */
+  url: string;
+  /** `tei`: {query, texts} → [{index, score}]; `openai`: {model, query, documents, top_n} → {results: [{index, relevance_score}]}. Either answer shape is read. */
+  style: 'tei' | 'openai';
+  /** Model name sent in the `openai` style. */
+  model: string;
+  /** Bearer token, when the server wants one. */
+  apiKey: string;
+  /** Fused candidates sent to the reranker at most; the rest keep their fused order behind them. */
+  candidates: number;
+  /** Characters of each candidate sent. */
+  maxChars: number;
+  timeoutMs: number;
+}
+
+/** How `ask` routes a question (src/search/route.ts). */
+export interface AskRouterConfig {
+  /** `rules`: cheap patterns only; `model`: one small call to the Judge stage when the rules are unsure. */
+  classifier: 'rules' | 'model';
+  /** Claims an enumerated (list / aggregate / timeline) answer lists at most. */
+  enumerateLimit: number;
+  /** Relation hops a multi-hop answer walks at most. */
+  maxHops: number;
+}
+
+export function defaultRerankConfig(): RerankConfig {
+  return { enabled: false, url: '', style: 'tei', model: '', apiKey: '', candidates: 30, maxChars: 2000, timeoutMs: 8000 };
+}
+
+export function defaultAskRouterConfig(): AskRouterConfig {
+  return { classifier: 'rules', enumerateLimit: 150, maxHops: 3 };
+}
+
 export type DataSourceKind = 'mysql' | 'timescale' | 'duckdb' | 'http-json' | 'prometheus' | 'object';
 
 /** How a request against a source is written. Only `sql` goes through the SQL guard. */
@@ -1116,7 +1158,7 @@ export interface KnodeConfig {
   server: { port: number; host: string; mcp: McpServerConfig; remote?: RemoteApiConfig; auth?: AuthConfig; tls?: TlsListenerConfig | null; embed?: EmbedConfig };
   ingest: IngestConfig;
   extraction: ExtractionConfig;
-  retrieval: { sag: SagSearchConfig };
+  retrieval: { sag: SagSearchConfig; /** Absent in a config written before it: off. */ rerank?: RerankConfig; /** Absent in a config written before it: `defaultAskRouterConfig()`. */ router?: AskRouterConfig };
   heat: HeatConfig;
   datasources: DataSourceConfig[];
   pack: PackConfig;
@@ -1278,6 +1320,8 @@ export function defaultConfig(): KnodeConfig {
         maxHops: 2,
         directRatio: 0.5,
       },
+      rerank: defaultRerankConfig(),
+      router: defaultAskRouterConfig(),
     },
     heat: {
       halfLifeDays: 14,

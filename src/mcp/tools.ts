@@ -41,6 +41,8 @@ import { callApiSource, loadResearchSource } from '../research/sources.js';
 import { createStudy, listStudies, startStudy, studyAgent, studyView, refineStudy } from '../research/study.js';
 import { webSearch, webSearchEnabled } from '../research/web.js';
 import { readSection } from '../research/read.js';
+import { grepWithContext, grepPaths, READ_BUDGET, READ_BUDGET_MAX, READ_PATHS_MAX, readMany } from './batch.js';
+import { catalogGuide } from './catalog-guide.js';
 import { loadFeed } from '../ingest/feeds/definitions.js';
 import { pushToFeed } from '../ingest/feeds/run.js';
 import { describeFeeds } from '../ingest/feeds/runner.js';
@@ -107,7 +109,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
     'knode_search',
     {
       title: 'Search the knowledge base',
-      description: 'Search docs, wiki and skills. Mode sag adds query-time chunk/entity multi-hop expansion with retrieval traces. as_of restricts to documents that were live at that system time; kinds/sources restrict which sources may answer (the sag expansion honours them too, so a scoped walk cannot escape through a shared entity).',
+      description: 'Passages: search docs, wiki and skills by meaning and words. Not for lists, counts or date ranges (knode_claims / knode_query enumerate those) nor exact strings (knode_grep). A hit whose claim was replaced carries `current`: the claim that holds now. Mode sag adds query-time chunk/entity multi-hop expansion with retrieval traces. as_of restricts to documents that were live at that system time; kinds/sources restrict which sources may answer (the sag expansion honours them too, so a scoped walk cannot escape through a shared entity).',
       inputSchema: {
         query: z.string().describe('Natural-language or keyword query'),
         k: z.number().int().min(1).max(50).optional().describe('Max results (default 8)'),
@@ -125,6 +127,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
         mode: mode ?? 'hybrid',
         heat: ctx.config.heat,
         sag: ctx.config.retrieval.sag,
+        rerank: ctx.config.retrieval.rerank,
         asOf: as_of,
         filter: resolveScopeFilter({ kinds, sources, trust, actor }),
       });
@@ -134,6 +137,8 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
         score: +r.score.toFixed(4),
         signals: r.signals,
         trace: r.trace,
+        // a claim this passage states was replaced: what holds now
+        current: r.current,
         content: r.content,
       })));
     },
@@ -169,7 +174,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
     'knode_ask',
     {
       title: 'Ask the knowledge base',
-      description: 'RAG answer with [n] citations and explicit gaps, written by the Judge pipeline stage (extraction.judgeLlm). When that stage has no model, returns the retrieved context instead.',
+      description: 'RAG answer with [n] citations and explicit gaps, written by the Judge pipeline stage (extraction.judgeLlm). Routed by the kind of question: a lookup answers from the best passages; a list, count or timeline from every claim about what it names (enumerated, with counts); a multi-hop question from a walk over relations. `route` says which. When that stage has no model, returns the retrieved context instead.',
       inputSchema: {
         question: z.string(),
         mode: z.enum(['hybrid', 'vector', 'keyword', 'sag']).optional().describe('Retrieval mode (default hybrid)'),
@@ -177,7 +182,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
     },
     async ({ question, mode }) => {
       const res = await ask(ctx.store, ctx.config, ctx.embedder, ctx.llm, question, { mode: mode ?? 'hybrid' });
-      return json({ answer: res.answer, citations: res.citations, gaps: res.gaps });
+      return json({ answer: res.answer, citations: res.citations, gaps: res.gaps, route: res.route });
     },
   );
 
@@ -191,20 +196,34 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
     async ({ path: p }) => json(listTree(ctx.dataDir, p ?? '.')),
   );
 
+  const sliceShape = {
+    section: z.string().optional().describe('A heading of the document: its section is returned, up to the next heading of the same or a higher level'),
+    offset: z.number().int().min(1).optional().describe('First line to return (1-based)'),
+    limit: z.number().int().min(1).max(5000).optional().describe('Lines to return (default 400 when offset is given)'),
+    outline: z.boolean().optional().describe('Return only the headings, with line numbers'),
+  };
   server.registerTool(
     'knode_read',
     {
-      title: 'Read a knowledge file',
-      description: 'Read a file by its path relative to the data directory, e.g. "wiki/index.md". A PDF, web page (HTML) or image under raw/docs returns the Markdown knode-os derived from it. A long document (a prospectus, an annual report) reads in parts: `section` returns one heading\'s section (a heading\'s text, as the capture outline or `outline: true` lists them), `offset` / `limit` a range of lines, `outline: true` only the headings with their line numbers. A path starting with "/" reads the virtual filesystem instead — /entities/<id>.md, /claims/<subject>.md, /capabilities/<source>/<name>.md, /live/<capability>?<param>=<value> — rendered on read, and every one of them accepts ?as_of=<iso>. Read "/" for the roots.',
+      title: 'Read knowledge files',
+      description: 'Read one file, or several in one call, by path relative to the data directory, e.g. "wiki/index.md". Several files: `paths` takes up to 20 entries, each a path or {path, section?, offset?, limit?, outline?}; they share one budget of `max_chars` characters (default 60000): short files come whole, long ones split the rest and say where to read on. Read every document you need in one call rather than one call each. A PDF, web page (HTML) or image under raw/docs returns the Markdown knode-os derived from it. A long document (a prospectus, an annual report) reads in parts: `section` returns one heading\'s section (a heading\'s text, as the capture outline or `outline: true` lists them), `offset` / `limit` a range of lines, `outline: true` only the headings with their line numbers. A path starting with "/" reads the virtual filesystem instead — /entities/<id>.md, /claims/<subject>.md, /capabilities/<source>/<name>.md, /live/<capability>?<param>=<value> — rendered on read, and every one of them accepts ?as_of=<iso>. Read "/" for the roots.',
       inputSchema: {
-        path: z.string(),
-        section: z.string().optional().describe('A heading of the document: its section is returned, up to the next heading of the same or a higher level'),
-        offset: z.number().int().min(1).optional().describe('First line to return (1-based)'),
-        limit: z.number().int().min(1).max(5000).optional().describe('Lines to return (default 400 when offset is given)'),
-        outline: z.boolean().optional().describe('Return only the headings, with line numbers'),
+        path: z.string().optional().describe('One file (or use `paths` for several)'),
+        ...sliceShape,
+        paths: z.array(z.union([z.string(), z.object({ path: z.string(), ...sliceShape })])).min(1).max(READ_PATHS_MAX).optional()
+          .describe('Several files in one call: each a path, or {path, section?, offset?, limit?, outline?}'),
+        max_chars: z.number().int().min(1000).max(READ_BUDGET_MAX).optional().describe(`Characters returned at most over all of \`paths\` (default ${READ_BUDGET})`),
       },
     },
-    async ({ path: p, section, offset, limit, outline }) => {
+    async ({ path: p, section, offset, limit, outline, paths, max_chars }) => {
+      if (paths?.length) {
+        const requests = [
+          ...(p ? [{ path: p, section, offset, limit, outline }] : []),
+          ...paths.map((x) => (typeof x === 'string' ? { path: x } : x)),
+        ].slice(0, READ_PATHS_MAX);
+        return { content: [{ type: 'text' as const, text: await readMany(ctx, requests, max_chars ?? READ_BUDGET) }] };
+      }
+      if (!p) throw new Error('knode_read needs `path` or `paths`');
       if (isVirtualPath(p)) return { content: [{ type: 'text' as const, text: await readVirtual(ctx, p) }] };
       const file = readSourceTextCapped(ctx.dataDir, p, MAX_FILE_BYTES);
       if (!file) throw new Error(`no derived text for ${p} yet — run knode_sync first (a capture is indexed within seconds)`);
@@ -926,7 +945,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
     'knode_query',
     {
       title: 'Native query against a live data source',
-      description: 'Run a read-only SQL statement (SELECT/SHOW/DESCRIBE/EXPLAIN) directly against a configured source in its native dialect. Returns rows plus an asOf timestamp; results are live, never from the index. source="catalog" queries the knowledge base itself through the v_* views (v_claims, v_entities, v_evidence, v_scopes, …; see knode_datasources) — Postgres dialect, SELECT/WITH only, with an enforced row cap.',
+      description: `Run a read-only SQL statement (SELECT/SHOW/DESCRIBE/EXPLAIN) directly against a configured source in its native dialect. Returns rows plus an asOf timestamp; results are live, never from the index. source="catalog" queries the knowledge base itself through the v_* views — the tool for lists, counts, filters and date ranges over what the knowledge base extracted (every claim about X in 2025, how many documents mention Y), in one call instead of reading documents one by one.\n${catalogGuide()}`,
       inputSchema: {
         source: z.string().describe('Datasource id, e.g. "market-mysql", or "catalog" for the knowledge base itself (see knode_datasources)'),
         sql: z.string().describe('A single read-only SQL statement in the source\'s dialect'),
@@ -943,13 +962,23 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
     'knode_grep',
     {
       title: 'Grep the knowledge files',
-      description: 'Regex search across wiki, raw/docs (including the Markdown derived from PDFs and images), raw/skills, playbooks/packs and raw/codebase (code repositories; pass path="raw/codebase/<repo>" to search one) (like grep -rn). Complements knode_search for exact strings, symbols and tickers.',
+      description: 'Regex search across wiki, raw/docs (including the Markdown derived from PDFs and images), raw/skills, playbooks/packs and raw/codebase (code repositories; pass path="raw/codebase/<repo>" to search one) (like grep -rn). For exact strings, symbols, tickers and numbers. `context: N` returns N lines around each match, grouped by file (like grep -n -C N), so one call can replace reading the files; `paths` searches several subtrees or files at once.',
       inputSchema: {
-        pattern: z.string().describe('JavaScript regular expression'),
-        path: z.string().optional().describe('Restrict to a subtree, e.g. "wiki/datasets"'),
+        pattern: z.string().describe('JavaScript regular expression (case-insensitive)'),
+        path: z.string().optional().describe('Restrict to a subtree or a file, e.g. "wiki/datasets"'),
+        paths: z.array(z.string()).max(20).optional().describe('Several subtrees or files to search in one call'),
+        context: z.number().int().min(0).max(20).optional().describe('Lines of context before and after each match; the answer is then text grouped by file ("12: match", "13- context")'),
         maxMatches: z.number().int().min(1).max(500).optional(),
+        max_per_file: z.number().int().min(1).max(500).optional().describe('Matches per file at most, so one long file does not take every match'),
       },
     },
-    async ({ pattern, path: p, maxMatches }) => json(grepFiles(ctx.dataDir, pattern, { path: p, maxMatches })),
+    async ({ pattern, path: p, paths, context, maxMatches, max_per_file }) => {
+      const roots = [...(p ? [p] : []), ...(paths ?? [])];
+      if (context !== undefined && context > 0) {
+        return { content: [{ type: 'text' as const, text: grepWithContext(ctx, { pattern, paths: roots, context, maxMatches, maxPerFile: max_per_file }) }] };
+      }
+      if (roots.length <= 1 && max_per_file === undefined) return json(grepFiles(ctx.dataDir, pattern, { path: roots[0], maxMatches }));
+      return json(grepPaths(ctx, { pattern, paths: roots, maxMatches, maxPerFile: max_per_file }));
+    },
   );
 }

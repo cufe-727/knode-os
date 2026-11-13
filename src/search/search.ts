@@ -1,4 +1,4 @@
-import { HeatConfig, SagSearchConfig, defaultConfig } from '../config.js';
+import { HeatConfig, RerankConfig, SagSearchConfig, defaultConfig } from '../config.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { gramQuery, MATCH_INDEXES, matchIndexReady, termGrams } from '../store/grams.js';
 import { NO_FILTER, ResolvedScopeFilter, documentFilterSql } from '../store/resolver.js';
@@ -8,6 +8,8 @@ import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { boostByHeat, recordChunkHits } from '../stats/heat.js';
 import { SearchResult } from '../types.js';
 import { longestSpans, spellingSpans, weakSpelling } from '../graph/normalize.js';
+import { attachCurrent } from './current.js';
+import { rerankEnabled, rerankResults } from './rerank.js';
 
 export type SearchMode = 'hybrid' | 'vector' | 'keyword' | 'sag';
 
@@ -30,6 +32,16 @@ export interface SearchOptions {
   explain?: boolean;
   /** Fusion weight per recall channel, over `FUSION_WEIGHTS`; 0 leaves a channel out of the ranking. For measuring a channel's worth. */
   weights?: Partial<Record<SearchChannelName, number>>;
+  /**
+   * The optional cross-encoder stage (`retrieval.rerank`, src/search/rerank.ts):
+   * reorders the fused head before the cut to `k`. Off unless `enabled` and a `url`.
+   */
+  rerank?: Partial<RerankConfig>;
+  /**
+   * Attach to each hit the claims that replaced claims read off it
+   * (`SearchResult.current`, src/search/current.ts). Default on; one query.
+   */
+  current?: boolean;
 }
 
 /** What one recall channel of a hybrid search found, and how long it took. */
@@ -45,8 +57,8 @@ export type SearchChannelName = 'vector' | 'keyword' | 'graph';
 
 export interface ExplainedSearch {
   results: SearchResult[];
-  /** The channels that ran: all three in hybrid mode, one in vector or keyword mode, none for SAG. */
-  channels: Partial<Record<SearchChannelName, SearchChannel>>;
+  /** The channels that ran: all three in hybrid mode, one in vector or keyword mode, none for SAG; `rerank` when that stage ran. */
+  channels: Partial<Record<SearchChannelName | 'rerank', SearchChannel>>;
 }
 
 interface RankedChunk {
@@ -687,7 +699,11 @@ export async function searchExplained(
   const mode = opts.mode ?? 'hybrid';
   if (mode === 'sag') {
     const { sagSearch } = await import('./sag.js');
-    return { results: await sagSearch(store, embedder, query, opts), channels: {} };
+    // the walk's own direct route is not reranked: its final order is, below
+    const walked = await sagSearch(store, embedder, query, { ...opts, rerank: undefined, current: false });
+    const channels: ExplainedSearch['channels'] = {};
+    const results = await finish(store, query, walked, k, opts, channels);
+    return { results, channels };
   }
   const fetchK = Math.max(k * 3, 24);
   const channels: ExplainedSearch['channels'] = {};
@@ -750,9 +766,38 @@ export async function searchExplained(
   const candidates = [...fused.values()];
   await boostByHeat(store, candidates, heatCfg);
 
-  const results = candidates.sort((a, b) => b.score - a.score).slice(0, k);
+  const ranked = candidates.sort((a, b) => b.score - a.score);
+  const results = await finish(store, query, ranked, k, opts, channels);
   if (opts.track !== false) {
     await recordChunkHits(store, results.map((r) => ({ chunkId: r.chunkId, documentId: r.documentId })), heatCfg);
   }
   return { results, channels };
+}
+
+/**
+ * The stages after fusion: the optional rerank of the fused head, the cut to
+ * `k`, and the current state of the claims each hit rests on.
+ */
+async function finish(
+  store: Store,
+  query: string,
+  ranked: SearchResult[],
+  k: number,
+  opts: SearchOptions,
+  channels: ExplainedSearch['channels'],
+): Promise<SearchResult[]> {
+  let ordered = ranked;
+  if (rerankEnabled(opts.rerank)) {
+    const r = await rerankResults(opts.rerank, query, ranked);
+    channels.rerank = { hits: r.sent, ms: r.ms, ...(r.error ? { error: r.error } : {}) };
+    ordered = r.results;
+  }
+  const results = ordered.slice(0, k);
+  if (opts.current === false || results.length === 0) return results;
+  try {
+    return await attachCurrent(store, results);
+  } catch {
+    // a store without the supersession column (an old schema) answers without it
+    return results;
+  }
 }
