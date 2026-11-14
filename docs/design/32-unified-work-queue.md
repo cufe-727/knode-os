@@ -1,6 +1,6 @@
 # 32 — One work queue: producers publish, work waits, workers decide where it runs
 
-Status: design (2026-11-14), approved for stage 1; stage 1 in progress on branch `claude/work-queue-stage-1-d8ecd2` (see §11).
+Status: stage 1 (D1–D5, §2–§4) built on 2026-11-14 on branch `claude/work-queue-stage-1-d8ecd2`, not merged or deployed; §11 says what was built and decided. Stages 2 and 3 are designs.
 
 ## Problem
 
@@ -101,7 +101,7 @@ The lease protocol, tokens and scopes (`eval` for evaluation kinds), the session
 
 ## 8. Behaviour changes to expect
 
-- A run started with no worker and no `--local` waits, then stops at the wait limit. Today it would run on this machine. This is the point, and it is the one change every existing script feels: scripts that relied on local execution add `--local`.
+- A run started with `--remote` and no worker and no `--local` waits, then stops at the wait limit. Before, it would run on this machine. This is the point, and it is the change every `--remote` script feels: scripts that relied on local execution add `--local`. A command line with neither `--remote` nor `--local` (every run before `--remote`, the test suite) still runs on this machine, on slots sized from `--slots` (§11).
 - Runs take longer when workers are scarce, instead of quietly finishing on another backend.
 - A benchmark and a workspace backlog on the same slots share them 1 : 3 instead of evaluation having slots to itself.
 
@@ -118,7 +118,77 @@ Two defects found on 2026-11-14 are fixed in stage 1, since they are placement b
 ## 10. Open items
 
 - Where `serve` keeps durable tasks: the root data folder, or a schema of its own in the server's database.
-- Whether a local slot started by a run is bound by `processing.maxLocalCalls`, which today covers `serve`'s slots only. A run and `serve` on one account otherwise exceed the limit the user set for the machine.
+- Whether a local slot started by a run is bound by `processing.maxLocalCalls`, which today covers `serve`'s slots only. A run and `serve` on one account otherwise exceed the limit the user set for the machine. Stage 1 leaves the run's slots outside it (the default this design proposed), so `--local codex:6` beside `serve`'s own six is twelve calls on this machine.
 - Whether `judge` calls of a review should carry `requires` too, so a review can be pinned to a pool as a run can.
-- How a pool is shown in the Tasks view, next to the worker and backend it already lists.
-- Whether `shares.eval` should default to 1 or to 0 (only when idle). The user asked for knowledge-base work first "when all other conditions are equal"; 1 reads that as a preference, 0 as a strict order.
+- How a pool is shown in the Tasks view, next to the worker and backend it already lists. Stage 1 tags a remote worker with its pool and evaluation work with `evaluation`, and puts a piece's required pool in its detail; a better place may come with use.
+- Whether `shares.eval` should default to 1 or to 0 (only when idle). The user asked for knowledge-base work first "when all other conditions are equal"; 1 reads that as a preference, 0 as a strict order. Stage 1 defaults to 1, and both work; no slot in the worker script or in `serve` takes both classes today (§11), so the weight matters only once one does.
+- Whether a run's own slots should take another run's pieces on the same `serve`. Stage 1 says no (§11).
+
+## 11. Stage 1 as built (2026-11-14)
+
+Commits on `claude/work-queue-stage-1-d8ecd2`, one per step: publish only (`bb88ba9`), waiting (`5fb115e`), failures
+(`0dbeb1d`), requirements (`f01fb59`), order (`4f9fe04`), records and report (`7036264`).
+
+**One path.** `eval run` and `eval score` publish every model call, judge call and agent session as a piece
+(`PublishedChatBackend`, `remoteJudgeClient`, `publishAgent` in src/eval/remote.ts) to a queue: `serve`'s broker with
+`--remote` (the loopback producer channel), or a broker the run starts in its own process (`RemoteEval.own`: the
+same `EvalSource`s behind a `WorkBroker`) when there is no `--remote` or `serve` does not answer. The run's own slots
+(`--local codex:6,claude:1`) lease from either like a worker — over new loopback routes `/eval/v1/slots/lease |
+complete | renew | release` on `serve`, or straight from the run's own broker — and only nothing else does model work.
+
+**Decided where the design left room.**
+
+- *A run's own slots run a piece with the run's own backends*, found by the piece's `key` in the run's process: its
+  stand-ins, chains, connections, replay-only backend and agent routing, which exist only inside the run. So they take
+  only their own run's pieces (`run` on the slot's identity), and a piece only the run's slots can do — a backend no
+  worker has, no `--model`, a session that writes, a stdio MCP server — is published `eligible: local` with nothing
+  executable in its spec (`serve` validates it as such and no worker can lease it).
+- *A run's own slot's failure is the run's backend's*, not a worker's: what its backend throws is the call's error,
+  as before (the shim still retries passing failures), so a local slot never rests and three local slots failing a
+  piece never make it stuck. A worker's failure is as §3 says.
+- *An old command line keeps working*: no `--remote` and no `--local` means `--local codex:<slots>,<judge CLI>:<slots>`
+  (default 6), said in the log and in run.json (`work.legacy`), with `--answer-concurrency` at 3. Its batches, reply
+  cache keys and records are what they were; the one difference is that Codex calls and agent sessions now share the
+  `<slots>` Codex slots (before, sessions ran beside them, bounded by `--answer-concurrency`), and the judge's calls
+  are bounded by its slots as well as by the judge's own concurrency.
+- *`--slots`* sizes only that case (a warning with `--local` or `--remote`). *`--answer-concurrency`* is now a bound on
+  how wide one system answers; without it a system answers as wide as the slots online for its pieces (at least one,
+  so a piece is published and can wait), re-read every second and whenever an answer ends. A knode build is as wide
+  as the call slots online when it starts, never narrower than six, so a build on six slots keeps its batches.
+- *A run's own slots are in the run's pool* (`--pool`), else in pool `local`; a worker that declares no pool is in its
+  token's name, filled in by the server. A piece that names a pool goes only to a slot of it, the run's own included.
+- *Waiting* counts a slot that holds a lease as online (a slot at work asks for nothing), and the run's own slots
+  always. A piece waits for a requirement (kind, CLI, model, pool, eligibility); the limit applies per requirement
+  that no slot online meets. The stop is the run's cancel path: pieces are withdrawn, its sessions are stopped,
+  nothing in flight is recorded, the report so far is written, and `eval run` exits 1 naming what it waited for.
+- *Stuck* counts machines (`<token>/<worker>`), not slots, and a machine that failed a piece gets it again only when
+  nothing else waits for it. An answer, build, update batch or generation score one of whose pieces is stuck is not
+  recorded (asked again on resume); a stuck judge call leaves the scoring pass for a resume (its verdicts are in the
+  judge cache).
+- *Cancelled sessions* are recorded with `error: "cancelled: …"` and `cancelled: true` (an answer with an error is
+  asked again on resume); when the run itself is stopping, nothing is recorded at all, as before.
+- *`server.remote.offer.eval` off* no longer refuses a run's pieces: remote workers see none, and a run's own slots
+  still take them through `serve`.
+
+**Behaviour an existing run script feels.**
+
+- `--remote` without `--local`: nothing runs on this machine; pieces wait for workers and the run stops at
+  `--wait-minutes` (30) when none meets them. Add `--local` to keep this machine's share.
+- `--remote` with no `--model` (or a chain, connection or stand-in), or a pack with private sources: those pieces are
+  `local`, so without `--local` they wait and the run stops at the limit (before, they ran here).
+- `--offer-seconds` warns and does nothing; `server.remote.evalOfferSeconds` is not read.
+- Widths: a `--remote` run answers as wide as the slots online (before, `--answer-concurrency` plus them), and a knode
+  build as wide as the call slots (before, six plus them).
+- An incomplete run (stuck pieces) or a run stopped at the wait limit exits 1.
+- An old command line without `--remote` behaves as before (above).
+
+**`serve` restarting while pieces wait.** Survivable within the wait limit, not lossless: the held offer requests fail,
+the run treats `serve` as unreachable (only its own slots count as online) and publishes each waiting piece again
+with backoff once `serve` answers; a piece one of its own slots had done keeps that result; a piece a worker had out
+is lost with `serve`'s memory, done again, and the worker's late answer is refused. An outage longer than
+`--wait-minutes` stops the run, which a resume continues. Durable pieces (§5) are stage 2.
+
+**Not verified.** No model-backed run, no real worker on another machine, no restart of a real `serve` with pieces
+waiting (the republish path is covered only by reading the code), and no run with both `serve`'s own slots and the
+run's competing for one account.
+
