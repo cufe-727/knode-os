@@ -174,8 +174,37 @@ Run by refine before the duplicate audit (`resolveEntityContext`), deterministic
   smaller cluster becomes `陈伟（平台组）` (id `陈伟平台组`): a row in `entity_namesakes` (anchors of both sides, the
   documents, the reason), its documents' tier‑1 extractions re-applied from their sidecars (no model call; a document
   without a whole sidecar is left as it is), and the pair recorded as a decided (rejected) merge so the duplicate audit
-  never proposes it. From then on `applyExtraction` resolves the name to the person whose anchors the document's own
-  entities name (`namesakeChoice`), else the original.
+  never proposes it. From then on resolution lands the name on the person the document means (below), else the
+  original. A document with no date of its own is dated, for this test only, by the median of the dates its claims
+  state: reports that give their week in the text had no `doc_date`, and no person was split on the 10× benchmark
+  (2026-11-14). `src/ingest/docdate.ts` now also reads a dateline at the top of a raw document.
+- **Same name, different thing (2026-11-15, `src/graph/identity.ts`).** On the 10× benchmark (ten divisions with the
+  same team structure) write-time resolution, which merges on slug or alias-key equality, made 9 entities of 90
+  settings and one of every person name two teams share: B-cubed precision 0.60 by the suite's score, 0.125 over the
+  settings' mentions. What an extraction records for a mention tells them apart — a *code* among its spellings
+  (`D7T1-C1`; one token of Latin letters and digits, compared by shape with digit runs aside, leading zeros dropped),
+  its *owner* (the target of a hierarchical relation stated for it) and the *anchors* of its document (the
+  organizations and projects it names; its *home* is the one most of its hierarchical relations point at).
+  - *Owners and anchors alone part nothing.* On finance (27,398 extractions) 1,848 names have two or more owners —
+    an index member, a supply chain, two boards — and 325 carry two codes of one shape, nearly all of them one thing
+    (`芯片` with H100 and H200 as aliases, `00700.HK` and `700.HK`). They choose among entities a name was already
+    parted into; they never part one.
+  - *Write time* (`resolve.ts`, `partByCode`): a mention whose code differs from the code of the entity its name
+    lands on — same shape and another value, or the other code with something in front (`T1-C1`, `D2T1-C1`) — gets
+    an entity `name（code）` when that entity is in ≥ 3 documents, ≥ 60% of them name one organization or project,
+    this document names none of those and has a home or owner of its own that none of them names. Otherwise it
+    merges as before.
+  - *Refine* (`splitCoded`): an entity whose documents carry two or more such codes, each in ≥ 2 documents with an
+    anchor of its own (≥ 60% of its documents, ≤ 5% of the other codes'), is parted into `name（code）` entities and
+    their documents are re-applied from the sidecars; a document that names it without a code goes with the one code
+    whose anchor it names. The roofs must account for ≥ 80% of the entity's documents — on finance ten hubs (DRAM
+    with DDR4 and DDR5, 国债期货 by contract) would have parted without that test, none with it. This is the only
+    split of anything but a person: disjoint contexts alone do not make a product, a technology or a sector two.
+  - *Following* (`namesakeFor`): a mention that lands on a parted name goes to the entity labelled with its code,
+    else the one whose anchors name its owner, else the one whose anchors its document names most (more than the
+    base entity's, and no other as many), else the base entity. This replaces the person-only lookup by name.
+  - `review.identity: "name"` turns the parting off (write time and refine); names already parted are still
+    followed. `knode-os eval resolution` measures all of it from a workspace's sidecars, no model.
 
 ## 6. Extraction
 
