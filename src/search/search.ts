@@ -412,9 +412,11 @@ async function sidesOfIndex(store: Store, sides: SideSql): Promise<{ sources: bo
 }
 
 /**
- * Pure vector recall: cosine distance over pgvector, the nearest `k` chunks of
- * sources or of generated pages. One side a query, each an ordered scan the
- * vector index can serve; a window over both sides would read every vector.
+ * Vector recall: cosine distance over pgvector, the nearest `k` chunks of
+ * sources and the nearest `k` of generated pages, as one list by similarity.
+ * A side is a branch of one statement, each an ordered scan with its own
+ * limit that the vector index can serve; a window over both sides would read
+ * every vector.
  *
  * The side, like any filter here, is tested after the index is walked, and
  * one walk of an HNSW index ends at `hnsw.ef_search` (40) rows: where pages
@@ -428,50 +430,25 @@ async function sidesOfIndex(store: Store, sides: SideSql): Promise<{ sources: bo
  *
  * and the replay found a gold document in the top 8 for 79 of 297 questions
  * where the same index in PGlite, which scans every vector, found 104. So the
- * query runs with `hnsw.iterative_scan = relaxed_order`: the index is walked
+ * scans run with `hnsw.iterative_scan = relaxed_order`: the index is walked
  * on until `k` rows pass the filter (or `hnsw.max_scan_tuples`, 20,000, are
  * read). That scan may hand rows over a little out of order, so they are
- * sorted here. The setting is local to a transaction of the one query; a
- * pgvector before 0.8.0 has no such scan and answers as before.
+ * sorted here.
+ *
+ * The setting is made by the statement itself, for the statement: a CTE
+ * calls `set_config(…, true)`, which lasts to the end of the transaction —
+ * here the statement's own — and each branch reads the CTE in a condition
+ * that holds no column, which the executor tests once, before it starts the
+ * branch's scan. It was a transaction a side at first (BEGIN, SET LOCAL,
+ * SELECT, COMMIT, on a pooled connection each): eight statements where main
+ * sends one, on every search. tests/search-generated-pages-postgres.test.ts
+ * holds that the one statement does walk on.
  */
-async function vectorSide(
-  store: Store,
-  embedder: EmbeddingProvider,
-  qv: number[],
-  k: number,
-  generated: boolean,
-  sides: SideSql,
-  asOf?: TimeInput,
-  filter?: ResolvedScopeFilter,
-): Promise<RankedChunk[]> {
-  const p = new Params([toVectorLiteral(qv)]);
-  // only vectors of the query's own space: while a new model's vectors are still coming in
-  // (a re-embed, or the deferred backlog) the table holds two (docs/design/12 §3.3)
-  const model = p.add(embedder.model);
-  const cond = searchable('d', p, sides, asOf, filter);
-  const lim = p.add(k);
-  const sql = `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
-            1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${generated} AS generated
-     FROM embeddings e
-     JOIN chunks c ON c.id = e.chunk_id
-     JOIN documents d ON d.id = c.document_id
-     WHERE e.model = ${model} AND ${cond} AND ${generated ? '' : 'NOT '}${sides.generated('d')}
-     ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
-     LIMIT ${lim}`;
-  if (!(await scansIteratively(store))) return store.query<RankedChunk>(sql, p.list);
-  const rows = await store.tx(async (q) => {
-    await q.query(`SET LOCAL hnsw.iterative_scan = relaxed_order`);
-    return q.query<RankedChunk>(sql, p.list);
-  });
-  return rows.sort((a, b) => b.raw - a.raw);
-}
-
-/** Vector recall: the nearest `k` chunks of sources and the nearest `k` of generated pages, as one list by similarity. */
 async function vectorSearch(
   store: Store,
   embedder: EmbeddingProvider,
   query: string,
-  k = 10,
+  k: number,
   queryVector: number[] | undefined,
   sides: SideSql,
   asOf?: TimeInput,
@@ -482,11 +459,32 @@ async function vectorSearch(
   // an iterative scan for rows that are not there walks the index to its limit
   const kinds = filter?.kinds;
   const held = await sidesOfIndex(store, sides);
-  const [sources, generated] = await Promise.all([
-    held.sources && (!kinds || kinds.some((kind) => kind !== 'view')) ? vectorSide(store, embedder, qv, k, false, sides, asOf, filter) : [],
-    held.generated && (!kinds || kinds.includes('view')) ? vectorSide(store, embedder, qv, k, true, sides, asOf, filter) : [],
-  ]);
-  return mergeSides(sources, generated);
+  const wanted = [false, true].filter((generated) => (generated
+    ? held.generated && (!kinds || kinds.includes('view'))
+    : held.sources && (!kinds || kinds.some((kind) => kind !== 'view'))));
+  if (wanted.length === 0) return [];
+  const iterative = await scansIteratively(store);
+
+  const p = new Params([toVectorLiteral(qv)]);
+  // only vectors of the query's own space: while a new model's vectors are still coming in
+  // (a re-embed, or the deferred backlog) the table holds two (docs/design/12 §3.3)
+  const model = p.add(embedder.model);
+  const cond = searchable('d', p, sides, asOf, filter);
+  const lim = p.add(k);
+  const side = (generated: boolean) => `(SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
+            1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${generated} AS generated
+     FROM embeddings e
+     JOIN chunks c ON c.id = e.chunk_id
+     JOIN documents d ON d.id = c.document_id
+     WHERE e.model = ${model} AND ${cond} AND ${generated ? '' : 'NOT '}${sides.generated('d')}${iterative ? ' AND (SELECT mode FROM scan) IS NOT NULL' : ''}
+     ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
+     LIMIT ${lim})`;
+  const rows = await store.query<RankedChunk>(
+    `${iterative ? `WITH scan AS MATERIALIZED (SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true) AS mode)\n     ` : ''}${wanted.map(side).join('\n     UNION ALL\n     ')}`,
+    p.list,
+  );
+  const of = (generated: boolean) => rows.filter((r) => Boolean(r.generated) === generated).sort((x, y) => y.raw - x.raw);
+  return mergeSides(of(false), of(true));
 }
 
 /**
@@ -1062,7 +1060,8 @@ export async function searchExplained(
     // the walk's own direct route is not reranked: its final order is, below
     const walked = await sagSearch(store, embedder, query, { ...opts, rerank: undefined, current: false });
     const channels: ExplainedSearch['channels'] = {};
-    const results = await finish(store, query, walked, k, opts, channels);
+    // a walk's results say which of them are pages (the direct route's hits and the expansion's rows both do)
+    const results = await finish(store, query, walked, k, opts, channels, new Set(walked.filter((r) => r.generated).map((r) => r.chunkId)));
     return { results, channels };
   }
   const fetchK = Math.max(k * 3, 24);
@@ -1114,6 +1113,7 @@ export async function searchExplained(
           docDate: toDateString(r.doc_date ?? null),
           score,
           signals: { [signal]: r.raw },
+          ...(r.generated ? { generated: true as const } : {}),
           ...(opts.explain ? { ranks: { [signal]: rank + 1 } } : {}),
         });
       }
@@ -1135,15 +1135,6 @@ export async function searchExplained(
     await recordChunkHits(store, results.map((r) => ({ chunkId: r.chunkId, documentId: r.documentId })), heatCfg);
   }
   return { results, channels };
-}
-
-/** The chunks among `results` that are of generated pages. */
-export async function generatedAmong(store: Store, results: SearchResult[]): Promise<Set<string>> {
-  if (results.length === 0) return new Set();
-  const sides = await sidesOf(store);
-  const rows = await store.query<{ id: string }>(`SELECT d.id FROM documents d WHERE d.id = ANY($1::text[]) AND ${sides.generated('d')}`, [[...new Set(results.map((r) => r.documentId))]]);
-  const docs = new Set(rows.map((r) => r.id));
-  return new Set(results.filter((r) => docs.has(r.documentId)).map((r) => r.chunkId));
 }
 
 /**
@@ -1169,8 +1160,7 @@ export function cutWithSources<T>(ordered: T[], k: number, places: number, isGen
 /**
  * The stages after fusion: the optional rerank, the cut to `k` that keeps
  * generated pages to their share, and the current state of the claims each
- * hit rests on. `generated` is the chunks of generated pages among `ranked`,
- * looked up when the caller does not know them.
+ * hit rests on. `generated` is the chunks of generated pages among `ranked`.
  *
  * The reranker reads the candidates the cut can take: its `candidates` are
  * chosen as the cut chooses, pages in their share of them and sources for the
@@ -1185,11 +1175,10 @@ async function finish(
   k: number,
   opts: SearchOptions,
   channels: ExplainedSearch['channels'],
-  generated?: Set<string>,
+  generated: Set<string>,
 ): Promise<SearchResult[]> {
   const share = opts.generatedShare ?? GENERATED_SHARE;
-  const known = generatedPlaces(k, share) >= k || ranked.length === 0 ? null : generated ?? (await generatedAmong(store, ranked).catch(() => null));
-  const pages = known && known.size > 0 ? known : null;
+  const pages = generatedPlaces(k, share) < k && generated.size > 0 ? generated : null;
   const isPage = (r: SearchResult) => pages!.has(r.chunkId);
   let ordered = ranked;
   if (rerankEnabled(opts.rerank)) {

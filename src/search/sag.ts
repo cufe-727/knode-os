@@ -5,7 +5,7 @@ import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { NO_FILTER, ResolvedScopeFilter, evidenceFilterSql } from '../store/resolver.js';
 import { Params, TimeInput, rowLiveAt, toIso } from '../store/temporal.js';
 import { SearchResult } from '../types.js';
-import { GENERATED_SHARE, SearchOptions, docLiveAt, entityMatchSql, generatedAmong, generatedPlaces, queryTerms, search } from './search.js';
+import { GENERATED_SHARE, SearchOptions, docLiveAt, entityMatchSql, generatedPlaces, queryTerms, search, sidesOf } from './search.js';
 
 interface EntityMentionRow {
   entity_id: string;
@@ -28,6 +28,7 @@ interface ExpandedChunkRow {
   path: string;
   title: string | null;
   content: string;
+  generated: boolean;
 }
 
 interface VectorRankRow {
@@ -138,6 +139,7 @@ async function expandEntities(
   const seen = p.add([...seenChunks]);
   const asOf = toIso(scope.asOf);
   const docCond = docLiveAt('d', p, asOf, scope.filter);
+  const sides = await sidesOf(store);
   const rank = p.add(maxEventsPerEntity);
   // An entity with more unseen chunks than the cap keeps those where the most
   // of this hop's entities meet — by the summed scores of the frontier
@@ -156,7 +158,7 @@ async function expandEntities(
        GROUP BY m.chunk_id
      ), ranked AS (
        SELECT m.entity_id, e.name AS entity_name,
-              c.id AS chunk_id, c.document_id, d.path, d.title, c.content,
+              c.id AS chunk_id, c.document_id, d.path, d.title, c.content, ${sides.generated('d')} AS generated,
               row_number() OVER (
                 PARTITION BY m.entity_id
                 ORDER BY r.reach DESC, d.doc_date DESC NULLS LAST, d.updated_at DESC, c.seq, c.id
@@ -168,7 +170,7 @@ async function expandEntities(
        JOIN documents d ON d.id = c.document_id
        WHERE ${rowLiveAt('e', 'entity', p, asOf)} AND ${docCond}
      )
-     SELECT entity_id, entity_name, chunk_id, document_id, path, title, content
+     SELECT entity_id, entity_name, chunk_id, document_id, path, title, content, generated
      FROM ranked
      WHERE event_rank <= ${rank}`,
     p.list,
@@ -425,6 +427,8 @@ export async function sagSearch(
             content: row.content,
             score: 0,
             signals: {},
+            // the cut counts pages (search.ts GENERATED_SHARE): a row says so itself, no lookup after
+            ...(row.generated ? { generated: true as const } : {}),
           },
           structuralScore: contribution,
           bestContribution: contribution,
@@ -449,7 +453,7 @@ export async function sagSearch(
   const vectorRows = await coarseVectorRank(store, queryVector, embedder.model, structuralPool.map((item) => item.result.chunkId));
   const structuralResults = fuseStructuralCandidates(structuralPool, vectorRows);
   const share = opts.generatedShare ?? GENERATED_SHARE;
-  const pages = generatedPlaces(k, share) >= k ? new Set<string>() : await generatedAmong(store, [...direct, ...structuralResults]);
+  const pages = new Set([...direct, ...structuralResults].filter((r) => r.generated).map((r) => r.chunkId));
   // the direct route's first result is the best candidate of all: a page there keeps a place
   const places = generatedPlaces(k, share, direct.length > 0 && pages.has(direct[0].chunkId));
   const results = mergeRoutes(direct, structuralResults, k, cfg.directRatio, pages, places);
