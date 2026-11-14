@@ -461,7 +461,8 @@ async function nearClaims(
 
   const near = new Map<ClaimLite, Near[]>();
   // a query compares each of its claims with the claims of its piece: a slice of a block
-  let batch = { claims: [] as ClaimLite[], pieces: [] as number[], ids: [] as string[], idPieces: [] as number[], next: 0 };
+  let batch = { claims: [] as ClaimLite[], pieces: [] as number[], keys: [] as string[], ids: [] as string[], idPieces: [] as number[], idKeys: [] as string[], next: 0 };
+  const keyOf = perStatement(statementKey);
   const flush = async () => {
     await opts.pause();
     const rows = await store.query<{ ord: number; claim_id: string; sim: number }>(
@@ -469,32 +470,37 @@ async function nearClaims(
       // kept out of line), OFFSET 0 keeps each distance a column computed once, and
       // only the nearest at the threshold come back (a NaN cosine never reaches it)
       `WITH focus AS MATERIALIZED (
-         SELECT f.ord, f.piece, f.id, subvector(e.embedding, 1, $5::int) AS v
-         FROM unnest($1::text[], $2::int[]) WITH ORDINALITY AS f(id, piece, ord)
+         SELECT f.ord, f.piece, f.id, f.k, subvector(e.embedding, 1, $5::int) AS v
+         FROM unnest($1::text[], $2::int[], $7::text[]) WITH ORDINALITY AS f(id, piece, k, ord)
          JOIN claim_embeddings e ON e.claim_id = f.id
        ), block AS MATERIALIZED (
-         SELECT x.piece, e.claim_id, subvector(e.embedding, 1, $5::int) AS v
-         FROM unnest($3::text[], $4::int[]) AS x(id, piece)
+         SELECT x.piece, x.k, e.claim_id, subvector(e.embedding, 1, $5::int) AS v
+         FROM unnest($3::text[], $4::int[], $8::text[]) AS x(id, piece, k)
          JOIN claim_embeddings e ON e.claim_id = x.id
        )
        SELECT a.ord::int AS ord, n.claim_id, n.sim
        FROM focus a CROSS JOIN LATERAL (
          SELECT s.claim_id, s.d, (1 - s.d)::float AS sim
-         FROM (SELECT b.claim_id, a.v <=> b.v AS d FROM block b WHERE b.piece = a.piece AND b.claim_id <> a.id OFFSET 0) s
+         FROM (SELECT b.claim_id, a.v <=> b.v AS d FROM block b WHERE b.piece = a.piece AND b.claim_id <> a.id AND b.k <> a.k OFFSET 0) s
          ORDER BY s.d, s.claim_id COLLATE "C" LIMIT 5
        ) n
        WHERE n.sim >= $6::float8 AND n.sim <> 'NaN'
        ORDER BY a.ord, n.d, n.claim_id COLLATE "C"`,
-      [batch.claims.map((c) => c.id), batch.pieces, batch.ids, batch.idPieces, store.embeddingDim, opts.threshold],
+      [batch.claims.map((c) => c.id), batch.pieces, batch.ids, batch.idPieces, store.embeddingDim, opts.threshold, batch.keys, batch.idKeys],
     );
     for (const r of rows) {
       const f = batch.claims[r.ord - 1];
       (near.get(f) ?? near.set(f, []).get(f)!).push({ claim_id: r.claim_id, sim: r.sim });
     }
-    batch = { claims: [], pieces: [], ids: [], idPieces: [], next: 0 };
+    batch = { claims: [], pieces: [], keys: [], ids: [], idPieces: [], idKeys: [], next: 0 };
   };
-  for (const [block, claims] of members) {
-    if (block.length === 1 && claims[0] === block[0]) continue;
+  for (const [whole, claims] of members) {
+    if (whole.length === 1 && claims[0] === whole[0]) continue;
+    // one claim per wording: a statement repeated k times (a reading's weekly twins, at cosine 1)
+    // would fill a claim's five places and keep its real neighbours away. A claim never meets its
+    // own wording here; the text candidates bring identical statements up.
+    const seen = new Set<string>();
+    const block = whole.filter((c) => !seen.has(keyOf(c)) && Boolean(seen.add(keyOf(c))));
     for (let j = 0; j < block.length; j += NEAR_ROWS_PER_QUERY) {
       const slice = block.slice(j, j + NEAR_ROWS_PER_QUERY);
       const per = Math.max(1, Math.floor(NEAR_PAIRS_PER_QUERY / slice.length));
@@ -506,10 +512,12 @@ async function nearClaims(
         for (const f of part) {
           batch.claims.push(f);
           batch.pieces.push(piece);
+          batch.keys.push(keyOf(f));
         }
         for (const c of slice) {
           batch.ids.push(c.id);
           batch.idPieces.push(piece);
+          batch.idKeys.push(keyOf(c));
         }
       }
     }

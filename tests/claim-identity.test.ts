@@ -346,3 +346,64 @@ describe('weekly readings worded alike, in every shape of date', () => {
     });
   }
 });
+
+describe('nearest claims by embedding', () => {
+  const opened: AppContext[] = [];
+  afterAll(async () => {
+    for (const ctx of opened) {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+  it('are other statements: a reading\'s weekly twins take one place among a claim\'s five, not all', async () => {
+    const dataDir = path.join(tmp, 'near');
+    initDataDir(dataDir);
+    const docs = new Map<string, { text: string; reply: RawExtractReply }>();
+    const twin = '己公司本周营收为3亿元。';
+    const near = ['己公司收入情况良好。', '己公司营收表现良好。'];
+    for (let k = 0; k < 6; k++) docs.set(`raw/docs/周报/己/t${k}.md`, {
+      text: `# 己公司周报 ${k}\n\n${twin}${k === 0 ? near.join('') : ''}\n`,
+      reply: {
+        entities: [{ name: '己公司', type: 'organization', aliases: [] }],
+        relations: [],
+        claims: [
+          { subject: '己公司', statement: twin, type: 'other', status: 'fact', kind: 'fact', attribute: '营收', value: 3, unit: '亿元', startDate: monday(k), endDate: friday(k) },
+          ...(k === 0 ? near.map((statement) => ({ subject: '己公司', statement, type: 'other', status: 'fact', kind: 'fact' })) : []),
+        ],
+      },
+    });
+    for (const [p, d] of docs) {
+      fs.mkdirSync(path.dirname(path.join(dataDir, p)), { recursive: true });
+      fs.writeFileSync(path.join(dataDir, p), d.text);
+    }
+    const ctx = await createContext(dataDir);
+    opened.push(ctx);
+    await sync(ctx, { llmGraph: false });
+    for (const d of await ctx.store.query<{ id: string }>(`SELECT id FROM documents WHERE root = 'docs'`)) await enqueueTier1(ctx.store, d.id);
+    (ctx.config.extraction as { entityLlm?: unknown }).entityLlm = undefined;
+    for (let i = 0; i < 10; i++) if ((await runTier1Pass(ctx.store, ctx.config, stubExtractor(docs), { batchSize: 64 })).queued === 0) break;
+    expect(await ctx.store.query(`SELECT 1 FROM claims WHERE statement = $1 AND tx_to IS NULL`, [twin])).toHaveLength(6);
+
+    // the twins one vector; the first near claim 0.99 from them, the second 0.95 from both
+    const dim = ctx.store.embeddingDim;
+    const unit = (parts: [number, number][]) => Array.from({ length: dim }, (_, i) => parts.find(([k]) => k === i)?.[1] ?? 0);
+    const vectors = new Map<string, number[]>([
+      [twin, unit([[0, 1]])],
+      [near[0], unit([[0, 0.99], [1, Math.sqrt(1 - 0.99 ** 2)]])],
+      [near[1], unit([[0, 0.95], [2, Math.sqrt(1 - 0.95 ** 2)]])],
+    ]);
+    const embedder = { model: 'test-vectors', dimensions: dim, embed: async (texts: string[]) => texts.map((t) => vectors.get(t.slice(t.indexOf('：') + 1))!) };
+    const config = { ...ctx.config, embedding: { ...ctx.config.embedding, provider: 'openai' as const } };
+    const shown: string[] = [];
+    const complete = async (messages: { role: string; content: string }[]) => {
+      const user = messages.find((m) => m.role === 'user')?.content ?? '';
+      shown.push(...[...user.matchAll(/\nA: "([^"]*)"[\s\S]*?\nB: "([^"]*)"/g)].map((m) => [m[1], m[2]].sort().join(' | ')));
+      return JSON.stringify({ verdicts: [] });
+    };
+    const llm = { enabled: true, label: 'stub', provider: 'openai', model: 'stub', complete } as unknown as LlmClient;
+    await auditDuplicateClaims({ store: ctx.store, embedder, config, llm });
+    // the two near claims meet, though six twins are nearer to the first
+    expect(shown).toContain([near[0], near[1]].sort().join(' | '));
+  });
+});
