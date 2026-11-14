@@ -88,6 +88,33 @@ export interface EvidenceAtRow {
   tx_from: string;
 }
 
+/** The document a scope read (its `meta.documentId`, when that document exists) and that document's date now. */
+export interface ScopeDocument {
+  documentId: string;
+  docDate: string | null;
+}
+
+/**
+ * The documents behind evidence scopes: a document's scope and its tier-1
+ * child name it in `meta.documentId`; other scopes (merges, research, a
+ * person's edits) read no document and are left out. The date is the
+ * document's `doc_date` as it is now, so a date found after the evidence was
+ * written (a dateline reader, a backfill) reaches the next fold.
+ */
+export async function scopeDocuments(q: Queryable, scopeIds: Iterable<string>): Promise<Map<string, ScopeDocument>> {
+  const ids = [...new Set(scopeIds)];
+  const out = new Map<string, ScopeDocument>();
+  if (ids.length === 0) return out;
+  const rows = await q.query<{ id: string; document_id: string; doc_date: string | Date | null }>(
+    `SELECT s.id, d.id AS document_id, d.doc_date
+     FROM scopes s JOIN documents d ON d.id = s.meta->>'documentId'
+     WHERE s.id = ANY($1::text[])`,
+    [ids],
+  );
+  for (const r of rows) out.set(r.id, { documentId: r.document_id, docDate: toIso(r.doc_date) });
+  return out;
+}
+
 /**
  * Evidence rows that were live at `asOf` for the given targets. The ids go to
  * the database as one array parameter: an `as_of` read folds every row it
@@ -258,12 +285,29 @@ export interface ClaimAsOf {
   correction: boolean;
 }
 
-/** One supporter's own date: the date it states, else its document's. */
-function supporterDate(r: EvidenceAtRow): { at: string | null; source: 'stated' | 'document' | null } {
+/**
+ * A supporter's document date: what its evidence recorded when it was written,
+ * else its document's `doc_date` now (`docs`, from scopeDocuments) — evidence
+ * written while the document had no date takes one found later.
+ */
+function supporterObserved(r: EvidenceAtRow, docs?: ReadonlyMap<string, ScopeDocument>): string | null {
+  return toIso(str(r.attrs.observed_at)) ?? docs?.get(r.scope_id)?.docDate ?? null;
+}
+
+/** One supporter's own date: the date it states, else its document's (marked `document`: inferred, not stated). */
+function supporterDate(r: EvidenceAtRow, docs?: ReadonlyMap<string, ScopeDocument>): { at: string | null; source: 'stated' | 'document' | null } {
   const stated = toIso(str(r.attrs.event_at)) ?? toIso(str(r.attrs.valid_from));
   if (stated) return { at: stated, source: 'stated' };
-  const observed = toIso(str(r.attrs.observed_at));
+  const observed = supporterObserved(r, docs);
   return observed ? { at: observed, source: 'document' } : { at: null, source: null };
+}
+
+/** MIN start, MAX end unless any supporter leaves the end open. */
+function unionWindow(rows: EvidenceAtRow[]): { from: string | null; to: string | null } {
+  const froms = rows.map((r) => toIso(str(r.attrs.valid_from))).filter((x): x is string => Boolean(x)).sort();
+  const openEnded = rows.some((r) => !toIso(str(r.attrs.valid_to)));
+  const tos = rows.map((r) => toIso(str(r.attrs.valid_to))).filter((x): x is string => Boolean(x)).sort();
+  return { from: froms[0] ?? null, to: openEnded ? null : tos[tos.length - 1] ?? null };
 }
 
 function finiteOrNull(v: unknown): number | null {
@@ -274,9 +318,16 @@ function finiteOrNull(v: unknown): number | null {
 /**
  * `subjectName` lets the statement be read for a measure when no supporter
  * carries one (evidence written before claim state, frontmatter claims);
- * without it only the supporters' own readings count.
+ * without it only the supporters' own readings count. `docs` (scopeDocuments
+ * of the supporters' scopes) dates a supporter whose evidence carries no date
+ * by its document's `doc_date`; without it only the evidence's own dates count.
  */
-export function foldClaimEvidence(row: { id: string; subject_id: string; statement: string }, rows: EvidenceAtRow[], subjectName?: string | null): ClaimAsOf | null {
+export function foldClaimEvidence(
+  row: { id: string; subject_id: string; statement: string },
+  rows: EvidenceAtRow[],
+  subjectName?: string | null,
+  docs?: ReadonlyMap<string, ScopeDocument>,
+): ClaimAsOf | null {
   if (rows.length === 0) return null;
   const byWeight = [...rows].sort((a, b) => b.weight - a.weight || new Date(a.tx_from).getTime() - new Date(b.tx_from).getTime());
   const earliest = [...rows].sort((a, b) => new Date(a.tx_from).getTime() - new Date(b.tx_from).getTime() || a.scope_id.localeCompare(b.scope_id))[0];
@@ -291,14 +342,12 @@ export function foldClaimEvidence(row: { id: string; subject_id: string; stateme
   // evidence written before the closed list carries the extractor's own label (市场表现, 盈利预测 …)
   const type = normalizeClaimType(byWeight.map((r) => str(r.attrs.type)).find(Boolean));
   const kind = byWeight.map((r) => str(r.attrs.kind)).find(Boolean) ?? 'fact';
-  const froms = rows.map((r) => toIso(str(r.attrs.valid_from))).filter((x): x is string => Boolean(x)).sort();
-  const openEnded = rows.some((r) => !toIso(str(r.attrs.valid_to)));
-  const tos = rows.map((r) => toIso(str(r.attrs.valid_to))).filter((x): x is string => Boolean(x)).sort();
+  const window = unionWindow(rows);
   const objectId = byWeight.map((r) => str(r.attrs.object_id)).find(Boolean) ?? null;
   const eventAt = byWeight.map((r) => toIso(str(r.attrs.event_at))).find(Boolean) ?? null;
-  const observed = rows.map((r) => toIso(str(r.attrs.observed_at))).filter((x): x is string => Boolean(x)).sort();
+  const observed = rows.map((r) => supporterObserved(r, docs)).filter((x): x is string => Boolean(x)).sort();
   // the newest supporter by its own date (ties: the later write, then the scope id)
-  const dated = rows.map((r) => ({ r, ...supporterDate(r) }));
+  const dated = rows.map((r) => ({ r, ...supporterDate(r, docs) }));
   const newest = dated
     .filter((d) => d.at)
     .sort((a, b) => b.at!.localeCompare(a.at!) || new Date(b.r.tx_from).getTime() - new Date(a.r.tx_from).getTime() || a.r.scope_id.localeCompare(b.r.scope_id))[0];
@@ -322,8 +371,8 @@ export function foldClaimEvidence(row: { id: string; subject_id: string; stateme
     statement: row.statement,
     status,
     kind,
-    valid_from: froms[0] ?? null,
-    valid_to: openEnded ? null : tos[tos.length - 1] ?? null,
+    valid_from: window.from,
+    valid_to: window.to,
     event_at: eventAt,
     observed_at: observed[0] ?? null,
     primary_scope_id: earliest.scope_id,
@@ -393,9 +442,10 @@ export async function claimsAsOf(q: Queryable, subjectIds: string[], asOf: strin
   if (candidates.length === 0) return [];
   const rows = await evidenceAsOf(q, 'claim', candidates.map((c) => c.id), asOf);
   const grouped = groupBy(rows, (r) => r.target_id);
+  const docs = await scopeDocuments(q, rows.map((r) => r.scope_id));
   const out: ClaimAsOf[] = [];
   for (const c of candidates) {
-    const folded = foldClaimEvidence(c, grouped.get(c.id) ?? []);
+    const folded = foldClaimEvidence(c, grouped.get(c.id) ?? [], undefined, docs);
     if (folded) out.push(folded);
   }
   return out;

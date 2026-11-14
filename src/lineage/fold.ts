@@ -8,6 +8,7 @@ import {
   foldRelationEvidence,
   groupBy,
   Params,
+  scopeDocuments,
 } from '../store/temporal.js';
 import { EntityCorrection, EntityCorrections, refusedKeys, refuses } from '../graph/corrections.js';
 import { CLAIM_STATE_VERSION } from '../graph/claim-state.js';
@@ -271,6 +272,8 @@ async function foldClaims(q: Queryable, touchedIds: string[], txTime: string, re
   const alive = await entityLiveness(q, subjects);
   // a statement is read for its measure against its subject's name (claim-state.ts)
   const names = new Map((await selectIn<{ id: string; name: string }>(q, subjects, (ph) => `SELECT id, name FROM entities WHERE id IN (${ph})`)).map((e) => [e.id, e.name]));
+  // a supporter whose evidence has no date is dated by its document's doc_date as it is now
+  const docs = await scopeDocuments(q, [...evidence.values()].flatMap((rows) => rows.map((r) => r.scope_id)));
 
   for (const cur of current) {
     const own = members.get(cur.id) ?? [];
@@ -278,7 +281,7 @@ async function foldClaims(q: Queryable, touchedIds: string[], txTime: string, re
       ? evidence.get(cur.id) ?? []
       : [...(evidence.get(cur.id) ?? []), ...own.flatMap((m) => evidence.get(m.id) ?? [])];
     const wasLive = cur.tx_to === null;
-    const folded = foldClaimEvidence(cur, rows, names.get(cur.subject_id));
+    const folded = foldClaimEvidence(cur, rows, names.get(cur.subject_id), docs);
     const live = Boolean(folded) && alive.get(cur.subject_id) === true;
     if (!live) {
       if (wasLive) {
