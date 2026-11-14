@@ -891,11 +891,11 @@ export async function relinkTier0(
   const docs = await store.query<{ id: string; path: string; scope_id: string }>(
     `SELECT d.id, d.path, d.scope_id FROM documents d JOIN scopes s ON s.id = d.scope_id
      WHERE d.root = 'docs' AND d.status = 'indexed' AND d.kind = 'source' AND s.status = 'active'
+       AND ($1::text[] IS NULL OR d.path = ANY($1::text[]))
      ORDER BY d.path`,
+    [opts.only ? [...opts.only] : null],
   );
-  const only = opts.only ? new Set(opts.only) : null;
-  const scoped = only ? docs.filter((d) => only.has(d.path)) : docs;
-  const work = opts.limit !== undefined ? scoped.slice(0, Math.max(0, opts.limit)) : scoped;
+  const work = opts.limit !== undefined ? docs.slice(0, Math.max(0, opts.limit)) : docs;
   const touched = new Set<string>();
   const stats: RelinkStats = { documents: 0, linksBefore: 0, linksAfter: 0, entities: 0 };
   for (const doc of work) {

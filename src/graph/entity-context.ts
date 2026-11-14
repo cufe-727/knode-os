@@ -589,6 +589,9 @@ async function replayDocuments(store: Store, config: KnodeConfig, docs: { id: st
   return replayed;
 }
 
+/** The scopes a document's own evidence is written under: the document, and its tier-1 extraction. Scopes are indexed by (kind, key). */
+const DOCUMENT_SCOPES = ['doc', 'tier1'];
+
 /** The middle one of some dates (ISO strings); null for none. */
 export function medianDate(dates: readonly string[]): string | null {
   const sorted = dates.filter(Boolean).sort();
@@ -631,11 +634,11 @@ async function contextDocs(
     const stated = await store.query<{ document_id: string; at: string | Date }>(
       // a claim is tied to a document by the evidence of that document's scope (its path is the scope's key)
       `SELECT d.id AS document_id, coalesce(c.event_at, c.valid_from) AS at
-       FROM documents d JOIN scopes s ON s.key = d.path
+       FROM documents d JOIN scopes s ON s.kind = ANY($2::text[]) AND s.key = d.path
        JOIN evidence ev ON ev.scope_id = s.id AND ev.kind = 'claim' AND ev.tx_to IS NULL
        JOIN claims c ON c.id = ev.target_id AND c.tx_to IS NULL
        WHERE d.id = ANY($1::text[]) AND c.date_source = 'stated' AND coalesce(c.event_at, c.valid_from) IS NOT NULL`,
-      [undated.map((d) => d.id)],
+      [undated.map((d) => d.id), DOCUMENT_SCOPES],
     );
     const byDoc = groupBy(stated, (r) => r.document_id);
     for (const d of undated) d.date = medianDate((byDoc.get(d.id) ?? []).map((r) => toIso(r.at)).filter((x): x is string => Boolean(x)));
@@ -657,6 +660,7 @@ async function partEntity(
   docs: { id: string; path: string }[],
   reason: string,
   progress: (msg: string) => void,
+  relink: string[],
 ): Promise<number> {
   await store.query(
     `INSERT INTO entity_namesakes (id, base_id, name, label, anchors, base_anchors, documents, reason)
@@ -665,11 +669,9 @@ async function partEntity(
     [rule.id, rule.base_id, rule.name, rule.label, JSON.stringify(rule.anchors), JSON.stringify(rule.base_anchors), JSON.stringify(docs.map((d) => d.path).sort()), reason],
   );
   if (!config) return 0;
-  const replayed = await replayDocuments(store, config, docs, progress);
-  // the documents' own links to the name (tier 0: the name found in the text) follow the split too
-  const { relinkTier0 } = await import('./concepts.js');
-  await relinkTier0(store, { only: docs.map((d) => d.path) });
-  return replayed;
+  // the documents' own links to the name (tier 0: the name found in the text) follow the split too: once, when every split of this run is made
+  relink.push(...docs.map((d) => d.path));
+  return replayDocuments(store, config, docs, progress);
 }
 
 /**
@@ -699,7 +701,7 @@ async function decidePartedPairs(store: Store): Promise<void> {
   }
 }
 
-async function splitNamesakes(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void): Promise<void> {
+async function splitNamesakes(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void, relink: string[]): Promise<void> {
   // what a workspace turns on with review.identity "context": documents dated by their claims, contexts compared by what they are about
   const wider = config?.review?.identity === 'context';
   const people = await store.query<{ id: string; name: string; docs: number }>(
@@ -726,7 +728,7 @@ async function splitNamesakes(store: Store, config: KnodeConfig | undefined, sta
     const reason = `同名不同人：${base.docs.length} 篇文档与 ${baseAnchors.join('、')} 同现，${other.docs.length} 篇与 ${otherAnchors.join('、')} 同现，同一时期内两组共现实体几乎不重合`;
     stats.split++;
     progress(`entities: ${p.name} split — ${reason}`);
-    stats.replayed += await partEntity(store, config, rule, other.docs, reason, progress);
+    stats.replayed += await partEntity(store, config, rule, other.docs, reason, progress, relink);
   }
 }
 
@@ -860,7 +862,7 @@ function commonName(spellings: string[]): string | null {
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || b[0].length - a[0].length || a[0].localeCompare(b[0]))[0]?.[0] ?? null;
 }
 
-async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void): Promise<void> {
+async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void, relink: string[]): Promise<void> {
   // every live entity of a type a code may part, one of whose spellings has a digit; the codes are read here
   const rows = await store.query<{ id: string; name: string; aliases: string[] | null }>(
     `SELECT e.id, e.name, e.aliases FROM entities e
@@ -873,11 +875,20 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
     return codes.some((a, i) => codes.slice(i + 1).some((b) => codesDiffer(a, b)));
   });
   if (candidates.length === 0) return;
+  // how many documents each is in, counted no further than the limit: an entity in more than MAX_DOCS
+  // is a hub, and its co-mentions (the join below) are never read
+  const counted = await store.query<{ id: string; n: number }>(
+    `SELECT c.id, (SELECT count(*) FROM (SELECT DISTINCT m.document_id FROM entity_mentions m WHERE m.entity_id = c.id LIMIT $2) x)::int AS n
+     FROM unnest($1::text[]) AS c(id)`,
+    [candidates.map((e) => e.id), MAX_DOCS + 1],
+  );
+  const documents = new Map(counted.map((r) => [r.id, r.n]));
   const pause = breather();
   for (const e of candidates) {
+    const n = documents.get(e.id) ?? 0;
+    if (n < 2 * CODE_MIN_DOCS || n > MAX_DOCS) continue;
     await pause();
     const { docs, types } = await contextDocs(store, e.id);
-    if (docs.length < 2 * CODE_MIN_DOCS || docs.length > MAX_DOCS) continue;
     // what each document's extraction called it: the entity evidence of that document's scope
     const said = await store.query<{ path: string; attrs: { name?: string; aliases?: string[]; resolved_from?: string } | null }>(
       `SELECT s.key AS path, ev.attrs FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
@@ -922,7 +933,7 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
       const reason = `同名不同物：${e.name} 的 ${docs.length} 篇文档带有 ${split.parts.length} 个不同编号；${carrying} 篇带 ${part.code.raw}${part.docs.length > carrying ? `、另 ${part.docs.length - carrying} 篇未带编号` : ''}，与 ${anchors.join('、')} 同现，其他编号的文档不与之同现`;
       stats.split++;
       progress(`entities: ${e.name} split — ${reason}`);
-      stats.replayed += await partEntity(store, config, rule, part.docs, reason, progress);
+      stats.replayed += await partEntity(store, config, rule, part.docs, reason, progress, relink);
     }
   }
 }
@@ -963,9 +974,14 @@ export async function resolveEntityContext(store: Store, opts: { config?: KnodeC
   const stats: EntityContextStats = { merged: 0, suggested: 0, split: 0, replayed: 0 };
   await mergeRenames(store, stats, progress);
   await suggestAliasMerges(store, stats);
-  await splitNamesakes(store, opts.config, stats, progress);
+  const relink: string[] = [];
+  await splitNamesakes(store, opts.config, stats, progress, relink);
   // parting an entity by its codes is something a workspace turns on (review.identity "context")
-  if (opts.config?.review?.identity === 'context') await splitCoded(store, opts.config, stats, progress);
+  if (opts.config?.review?.identity === 'context') await splitCoded(store, opts.config, stats, progress, relink);
+  if (relink.length > 0) {
+    const { relinkTier0 } = await import('./concepts.js');
+    await relinkTier0(store, { only: [...new Set(relink)] });
+  }
   await decidePartedPairs(store);
   return stats;
 }
