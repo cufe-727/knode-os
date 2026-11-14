@@ -129,9 +129,9 @@ async function redateScope(q: Queryable, scopeId: string, words: Words, extracto
       touched.claims.add(row.target_id);
       // the id the writer would give it now (a weekly reading carries its week): the re-key's to move, not this
       const statement = String(a.statement ?? '');
+      // (as src/graph/claim-rekey.ts newIdOf reads a piece of evidence)
       const id = row.subject_id ? claimId(row.subject_id, statement, readingWeek({
-        statement, attribute: str(a.attribute), valueNum: typeof a.value_num === 'number' ? a.value_num : null,
-        dateSource: date_source, eventAt: dates.event_at, validFrom: dates.valid_from, validTo: dates.valid_to,
+        statement, eventAt: dates.event_at, validFrom: dates.valid_from, validTo: dates.valid_to, observedAt: dates.observed_at,
       })) : row.target_id;
       if (id !== row.target_id) moved.push(row.target_id);
     } else {

@@ -6,12 +6,13 @@ import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { auditDuplicateClaims, claimPairId, datesApart, eventSpanEnd, monthsApart, yearlessMonthsOf } from '../src/graph/claim-dedupe.js';
 import { applyClaimMerge } from '../src/graph/claim-merge.js';
-import { rekeyState, rekeyWeeklyReadings } from '../src/graph/claim-rekey.js';
+import { drainCarry, rekeyState, rekeyWeeklyReadings } from '../src/graph/claim-rekey.js';
 import { refreshClaimState } from '../src/graph/claim-state-store.js';
 import { RawExtractReply } from '../src/graph/llm-extract.js';
 import { claimId, isoWeekOf, readingWeek } from '../src/graph/store.js';
 import { enqueueTier1, runTier1Pass } from '../src/graph/tier1.js';
 import { sync } from '../src/ingest/sync.js';
+import { dateStart } from '../src/store/dates.js';
 import { foldOptions } from '../src/lineage/scope.js';
 import { VECTOR_TYPE } from '../src/store/db.js';
 import { recountAll } from '../src/lineage/fold.js';
@@ -32,7 +33,9 @@ const WEEKS = [99.92, 99.91, 99.92, 99.93];
 const monday = (k: number) => new Date(Date.UTC(2025, 0, 6 + k * 7)).toISOString().slice(0, 10);
 const friday = (k: number) => new Date(Date.UTC(2025, 0, 10 + k * 7)).toISOString().slice(0, 10);
 
-function fixture(): Map<string, { text: string; reply: RawExtractReply }> {
+type Extra = (k: number) => NonNullable<RawExtractReply['claims']>;
+
+function fixture(extra?: Extra): Map<string, { text: string; reply: RawExtractReply }> {
   const out = new Map<string, { text: string; reply: RawExtractReply }>();
   WEEKS.forEach((v, k) => {
     out.set(`raw/docs/周报/平台组/w${k + 1}.md`, {
@@ -48,6 +51,7 @@ function fixture(): Map<string, { text: string; reply: RawExtractReply }> {
           // as the benchmark's extraction gave them: the week as the window, the same words every week
           { subject: '平台组', statement: `平台组本周服务可用性为${v}%。`, type: 'other', status: 'fact', kind: 'fact', attribute: '服务可用性', value: v, unit: '%', startDate: monday(k), endDate: friday(k) },
           { subject: 'R-70', object: '姜婷', statement: 'R-70负责人为姜婷。', type: 'risk', status: 'fact', kind: 'fact', attribute: '负责人', value: '姜婷', startDate: monday(k), endDate: friday(k) },
+          ...(extra?.(k) ?? []),
         ],
       },
     });
@@ -78,10 +82,10 @@ function countingJudge(count: { pairs: number }): LlmClient {
   return { enabled: true, label: 'stub@judge', provider: 'openai', model: 'stub', complete } as unknown as LlmClient;
 }
 
-async function build(name: string): Promise<AppContext> {
+async function build(name: string, extra?: Extra): Promise<AppContext> {
   const dataDir = path.join(tmp, name);
   initDataDir(dataDir);
-  const docs = fixture();
+  const docs = fixture(extra);
   for (const [p, d] of docs) {
     fs.mkdirSync(path.dirname(path.join(dataDir, p)), { recursive: true });
     fs.writeFileSync(path.join(dataDir, p), d.text);
@@ -118,9 +122,8 @@ describe('a claim identity', () => {
   });
 
   it('leaves every other claim the identity it had', () => {
-    expect(readingWeek({ ...reading, valueNum: null })).toBeNull();
-    expect(readingWeek({ ...reading, attribute: null })).toBeNull();
-    expect(readingWeek({ ...reading, dateSource: 'document' })).toBeNull();
+    // no figure, or no date at all: not a reading
+    expect(readingWeek({ ...reading, statement: '平台组本周R-70仍未解决' })).toBeNull();
     expect(readingWeek({ ...reading, validFrom: null, validTo: null })).toBeNull();
     // not relative to this week: a restated fact or another period's figure is one claim however many reports date it
     for (const statement of [
@@ -533,5 +536,154 @@ describe('a workspace written before weekly readings had ids', () => {
     const was = await ids();
     await sync(ctx, { llmGraph: false, reapply: true });
     expect(await ids()).toEqual(was);
+  });
+});
+
+describe('what a weekly reading is (review of df45ee5)', () => {
+  const week = { validFrom: '2025-06-16T00:00:00.000Z', validTo: '2025-06-20T23:59:59.999Z' };
+  const w = (statement: string, dates: Record<string, string | null> = week) => readingWeek({ statement, ...dates });
+
+  it('is a figure of this or an earlier week, named as a word, however the figure is compared', () => {
+    expect(w('平台组本周服务可用性为99.92%，较上周增长5%')).toBe('2025-W25');
+    expect(w('本周销售额同比去年增长12%')).toBe('2025-W25');
+    expect(w('本周成交额为2000亿元')).toBe('2025-W25');
+    expect(w('本周完成3项评审')).toBe('2025-W25');
+    expect(w('Revenue two weeks ago was 3.2m')).toBe('2025-W25');
+    expect(w('上上周完成度为46%')).toBe('2025-W25');
+  });
+
+  it('is not a cycle, a company report, or 本周 inside another word', () => {
+    for (const statement of ['本周期产能利用率为78%', 'LPR上周期报价为3.45%', '本周三季报披露净利润12亿元', '资本周转率为1.2', '日本周三公布CPI为2.1%', '本周R-70仍未解决']) {
+      expect(w(statement), statement).toBeNull();
+    }
+  });
+
+  it('takes its week from the source\'s own calendar day, the document\'s date when it states none, and none without either', () => {
+    // local midnight east of UTC is the day before in UTC
+    expect(w('本周可用性为99.92%', { validFrom: '2025-06-15T16:00:00.000Z', validTo: '2025-06-20T15:59:59.999Z' })).toBe('2025-W25');
+    expect(w('本周可用性为99.92%', { observedAt: '2025-06-18T00:00:00.000Z' })).toBe('2025-W25');
+    expect(w('两周前可用性为99.92%', { observedAt: '2025-06-18T00:00:00.000Z' })).toBe('2025-W23');
+    // a model that dated "两周前" with the report's own week: the statement says which week it is
+    expect(w('两周前可用性为99.92%', { ...week, observedAt: '2025-06-18T00:00:00.000Z' })).toBe('2025-W23');
+    expect(w('本周可用性为99.92%', {})).toBeNull();
+  });
+
+  it('resolves 两周前 and 上上周 against the document date', () => {
+    expect(dateStart('两周前', '2025-06-18T00:00:00.000Z')).toBe('2025-06-02T00:00:00.000Z');
+    expect(dateStart('上上周', '2025-06-18T00:00:00.000Z')).toBe('2025-06-02T00:00:00.000Z');
+    expect(dateStart('3周前', '2025-06-18T00:00:00.000Z')).toBe('2025-05-26T00:00:00.000Z');
+  });
+});
+
+describe('moving an older workspace (review of df45ee5)', () => {
+  const opened: AppContext[] = [];
+  afterAll(async () => {
+    for (const ctx of opened) {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+  const s9992 = '平台组本周服务可用性为99.92%。';
+  const s9993 = '平台组本周服务可用性为99.93%。';
+  const owner = 'd180122f0f46f32e748ebf1c';
+  const weekOf = (k: number) => isoWeekOf(monday(k));
+  const live = async (ctx: AppContext, statement: string) => (await ctx.store.query<{ id: string }>(
+    `SELECT id FROM claims WHERE statement = $1 AND tx_to IS NULL ORDER BY valid_from`, [statement],
+  )).map((r) => r.id);
+
+  /** The workspace as main wrote it: each claim's evidence on subject + statement, the claim state as of `format`. */
+  async function asWritten(ctx: AppContext, format: 'before-2026-11-13' | 'after'): Promise<void> {
+    for (const c of await ctx.store.query<{ id: string; subject_id: string; statement: string }>(`SELECT id, subject_id, statement FROM claims`)) {
+      const legacy = claimId(c.subject_id, c.statement);
+      if (legacy === c.id) continue;
+      await ctx.store.query(
+        `INSERT INTO claims (id, subject_id, object_id, type, statement, status, kind, valid_from, valid_to, tx_from)
+         SELECT $2, subject_id, object_id, type, statement, status, kind, valid_from, valid_to, '2026-10-01T00:00:00Z' FROM claims WHERE id = $1 ON CONFLICT (id) DO NOTHING`,
+        [c.id, legacy],
+      );
+      await ctx.store.query(`UPDATE evidence SET target_id = $2 WHERE kind = 'claim' AND target_id = $1`, [c.id, legacy]);
+      await ctx.store.query(`DELETE FROM claims WHERE id = $1`, [c.id]);
+    }
+    // evidence before 0f14a235 (2026-11-13) held no claim state
+    if (format === 'before-2026-11-13') await ctx.store.query(`UPDATE evidence SET attrs = attrs - 'attribute' - 'value_num' - 'value_text' - 'unit' - 'date_source' - 'correction' WHERE kind = 'claim'`);
+    await recountAll(ctx.store, new Date().toISOString(), foldOptions(ctx.dataDir));
+    await ctx.store.query(`UPDATE claims SET tx_from = '2026-10-01T00:00:00Z'`);
+    await ctx.store.query(`DELETE FROM meta WHERE key = 'claim_identity'`);
+  }
+  const untilDone = async (ctx: AppContext, limit = 2) => {
+    const total = { rekeyed: 0, unmoved: 0, listed: 0 };
+    for (;;) {
+      const st = await rekeyWeeklyReadings(ctx.store, { limit });
+      total.rekeyed += st.rekeyed;
+      total.unmoved += st.unmoved;
+      total.listed += st.listed;
+      if (st.done) return total;
+    }
+  };
+
+  it('A: moves evidence written before claim state was recorded, and leaves whole what it cannot tell', async () => {
+    const ctx = await build('old-format');
+    opened.push(ctx);
+    await asWritten(ctx, 'before-2026-11-13');
+    // and one claim whose evidence predates event dates (2026-09-16) and has no window
+    const old9993 = claimId('平台组', s9993);
+    await ctx.store.query(`UPDATE evidence SET attrs = (attrs - 'event_at' - 'observed_at') || '{"valid_from": null, "valid_to": null}'::jsonb WHERE kind = 'claim' AND target_id = $1`, [old9993]);
+    const total = await untilDone(ctx);
+    expect(total.rekeyed).toBeGreaterThan(0);
+    expect(await live(ctx, s9992)).toEqual([claimId('平台组', s9992, weekOf(0)), claimId('平台组', s9992, weekOf(2))]);
+    expect(await live(ctx, s9993)).toEqual([old9993]);
+    expect(total.unmoved).toBe(1);
+    expect((await rekeyState(ctx.store)).unmoved).toBe(1);
+    // the moved claims are as old as the claims they came from
+    expect(await ctx.store.query(`SELECT DISTINCT tx_from FROM claims WHERE statement = $1 AND tx_to IS NULL`, [s9992])).toEqual([{ tx_from: new Date('2026-10-01T00:00:00Z') }]);
+  });
+
+  it('B: two steps at once move each evidence row once', async () => {
+    const ctx = await build('two-steps');
+    opened.push(ctx);
+    await asWritten(ctx, 'after');
+    const [{ n: before }] = await ctx.store.query<{ n: number }>(`SELECT count(*)::int AS n FROM evidence WHERE kind = 'claim' AND tx_to IS NULL`);
+    await Promise.all([rekeyWeeklyReadings(ctx.store, { limit: 100 }), rekeyWeeklyReadings(ctx.store, { limit: 100 })]);
+    const [{ n: after }] = await ctx.store.query<{ n: number }>(`SELECT count(*)::int AS n FROM evidence WHERE kind = 'claim' AND tx_to IS NULL`);
+    expect(after).toBe(before);
+    expect(await ctx.store.query(`SELECT evidence_count FROM claims WHERE statement = $1 AND tx_to IS NULL`, [s9992])).toEqual([{ evidence_count: 1 }, { evidence_count: 1 }]);
+  });
+
+  it('C: a claim that splits carries a refusal to every week, and a person\'s merge week by week or to the person', async () => {
+    const release = '平台组本周发布2次。';
+    const duty = '平台组本周值班2人。';
+    const ctx = await build('split-carry', (k) => [
+      ...(k === 0 || k === 2 ? [{ subject: '平台组', statement: release, type: 'other', status: 'fact', kind: 'fact', attribute: '发布次数', value: 2, startDate: monday(k), endDate: friday(k) }] : []),
+      ...(k === 0 || k === 1 ? [{ subject: '平台组', statement: duty, type: 'other', status: 'fact', kind: 'fact', attribute: '值班人数', value: 2, startDate: monday(k), endDate: friday(k) }] : []),
+    ]);
+    opened.push(ctx);
+    await asWritten(ctx, 'after');
+    const L = claimId('平台组', s9992);
+    // a person refused merging the 99.92% claim with the owner claim, and merged two other claims into it
+    await ctx.store.query(
+      `INSERT INTO suggestions (id, kind, title, body, status, payload) VALUES ($1, 'claim-merge', '合并', '', 'rejected', $2::jsonb)`,
+      [claimPairId(L, owner), JSON.stringify({ claimId: L, canonicalId: owner, kind: 'same_as' })],
+    );
+    await applyClaimMerge(ctx.store, { claimId: claimId('平台组', release), canonicalId: L, reason: '同一件事', actor: 'user' });
+    await applyClaimMerge(ctx.store, { claimId: claimId('平台组', duty), canonicalId: L, reason: '同一件事', actor: 'user' });
+
+    // a step whose carrying was cut short: the moves are there, the decisions not yet
+    await rekeyWeeklyReadings(ctx.store, { limit: 100, carry: false });
+    const refused = async () => (await ctx.store.query<{ id: string }>(`SELECT id FROM suggestions WHERE status = 'rejected' ORDER BY id`)).map((r) => r.id);
+    const weeks = [claimId('平台组', s9992, weekOf(0)), claimId('平台组', s9992, weekOf(2))];
+    expect(await live(ctx, s9992)).toEqual(weeks);
+    expect(await refused()).toEqual([claimPairId(L, owner)]);
+    // the next run carries them
+    const resumed = await drainCarry(ctx.store);
+    expect(resumed.carried).toBeGreaterThan(0);
+    expect(await refused()).toEqual([claimPairId(L, owner), ...weeks.map((w) => claimPairId(w, owner))].sort());
+    // weeks 1 and 3 of the release figure join weeks 1 and 3; the duty figure's week 1 joins week 1, its week 2 has none to join
+    const canon = async (id: string) => (await ctx.store.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM claims WHERE id = $1`, [id]))[0]?.canonical_id;
+    expect(await canon(claimId('平台组', release, weekOf(0)))).toBe(weeks[0]);
+    expect(await canon(claimId('平台组', release, weekOf(2)))).toBe(weeks[1]);
+    expect(await canon(claimId('平台组', duty, weekOf(0)))).toBe(weeks[0]);
+    expect(await canon(claimId('平台组', duty, weekOf(1)))).toBeNull();
+    expect(resumed.listed).toBe(1);
+    expect(await ctx.store.query(`SELECT status FROM suggestions WHERE payload->>'claimId' = $1 AND status = 'pending'`, [claimId('平台组', duty, weekOf(1))])).toEqual([{ status: 'pending' }]);
   });
 });

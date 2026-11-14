@@ -2264,11 +2264,11 @@ claimCmd
     const ctx = await createContext(dataDir());
     try {
       const max = opts.steps ? Math.max(1, Number(opts.steps)) : Infinity;
-      const total = { scanned: 0, rekeyed: 0, created: 0, carried: 0, leftDecisions: 0, steps: 0, done: false };
+      const total = { scanned: 0, rekeyed: 0, created: 0, unmoved: 0, carried: 0, listed: 0, steps: 0, done: false };
       while (total.steps < max) {
         const st = await rekeyWeeklyReadings(ctx.store, { limit: Number(opts.limit) || 2000, onProgress: (m) => console.error(m) });
         total.steps++;
-        for (const k of ['scanned', 'rekeyed', 'created', 'carried', 'leftDecisions'] as const) total[k] += st[k];
+        for (const k of ['scanned', 'rekeyed', 'created', 'unmoved', 'carried', 'listed'] as const) total[k] += st[k];
         total.done = st.done;
         if (st.done) break;
       }
