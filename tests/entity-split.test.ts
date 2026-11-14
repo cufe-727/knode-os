@@ -264,12 +264,60 @@ describe('refine on reports that date themselves only in their claims', () => {
       expect(claims.every((c) => c.statement.startsWith(`${team}的`))).toBe(true);
     }
     // every parted pair is on record as decided, with its reason
-    const parted = await store.query<{ id: string; base_id: string; reason: string }>(`SELECT id, base_id, reason FROM entity_namesakes ORDER BY id`);
+    const parted = await store.query<{ id: string; base_id: string; reason: string }>(`SELECT id, base_id, reason FROM entity_namesakes WHERE id <> base_id ORDER BY id`);
     expect(parted).toHaveLength(3);
     const decided = await store.query<{ n: number }>(`SELECT count(*)::int AS n FROM suggestions WHERE status = 'rejected' AND payload->>'namesake' = 'true'`);
     expect(decided[0].n).toBe(3);
 
     // a second run decides nothing new
+    expect(await resolveEntityContext(store, { config: ctx.config })).toMatchObject({ merged: 0, split: 0, replayed: 0 });
+
+    // every document went with a code, so one code kept the entity itself: on record, with its roof
+    const [kept] = await store.query<{ id: string; label: string; anchors: string[] }>(`SELECT id, label, anchors FROM entity_namesakes WHERE id = base_id`);
+    expect(kept.id).toBe('日志保留天数');
+    const keptTeam = TEAMS.find((t) => t.code === kept.label)!.team;
+    expect(kept.anchors).toEqual([keptTeam]);
+    expect(await teamsOf('日志保留天数')).toEqual({ [keptTeam]: WEEKS });
+    const claimIds = async () => (await store.query<{ id: string }>(`SELECT id FROM claims WHERE subject_id = '日志保留天数' AND tx_to IS NULL ORDER BY id`)).map((c) => c.id);
+    const before = await claimIds();
+
+    // later: a fourth team with a code of its own, and a memo that is like no team's reports
+    const later = new Map<string, { text: string; reply: RawExtractReply }>();
+    for (let k = 0; k < WEEKS; k++) {
+      const aliases = k === 1 || k === 2 ? ['D4T1-C2'] : [];
+      later.set(`raw/docs/周报/四部平台组/w${k + 1}.md`, {
+        text: `# 四部平台组周报 第${k + 1}周\n\n日志保留天数${aliases[0] ? `（${aliases[0]}）` : ''}为120天。丁博、乔敏参加评审。\n`,
+        reply: {
+          entities: [{ name: '四部平台组', type: 'organization', aliases: [] }, { name: '日志保留天数', type: 'component', aliases }, { name: '丁博', type: 'person', aliases: [] }, { name: '乔敏', type: 'person', aliases: [] }],
+          relations: [{ source: '丁博', target: '四部平台组', type: 'member_of' }, { source: '乔敏', target: '四部平台组', type: 'member_of' }],
+          claims: [{ subject: '日志保留天数', statement: `四部平台组的日志保留天数为120天（第${k + 1}周）`, type: 'other', status: 'fact', kind: 'fact', startDate: week(k) }],
+        },
+      });
+    }
+    later.set('raw/docs/备忘/retention.md', {
+      text: '# 备忘\n\n日志保留天数需要审计组复核。\n',
+      reply: { entities: [{ name: '审计组', type: 'organization', aliases: [] }, { name: '日志保留天数', type: 'component', aliases: [] }], relations: [], claims: [] },
+    });
+    for (const [p, d] of later) {
+      fs.mkdirSync(path.dirname(path.join(dataDir, p)), { recursive: true });
+      fs.writeFileSync(path.join(dataDir, p), d.text);
+    }
+    await sync(ctx, { llmGraph: false });
+    for (const d of await store.query<{ id: string }>(`SELECT id FROM documents WHERE root = 'docs' AND (path LIKE '%四部平台组%' OR path LIKE '%备忘%')`)) await enqueueTier1(store, d.id);
+    const llm2 = stubExtractor(new Map([...docs, ...later]));
+    for (let i = 0; i < 10; i++) if ((await runTier1Pass(store, ctx.config, llm2, { batchSize: 64 })).queued === 0) break;
+    // written to the entity that keeps the name: nothing says yet that they are another thing
+    expect(await teamsOf('日志保留天数')).toEqual({ [keptTeam]: WEEKS, 四部平台组: WEEKS, 'retention.md': 1 });
+    const again = await resolveEntityContext(store, { config: ctx.config });
+    expect(again.split).toBe(1);
+    // the entity that kept the name keeps it, its id and its claims; only the new team's setting is parted from it
+    expect(await teamsOf('日志保留天数')).toEqual({ [keptTeam]: WEEKS, 'retention.md': 1 });
+    expect(await claimIds()).toEqual(before);
+    const four = await named('日志保留天数（四部平台组%');
+    expect(four.map((e) => e.name)).toEqual(['日志保留天数（四部平台组 · D4T1-C2）']);
+    expect(await teamsOf(four[0].id)).toEqual({ 四部平台组: WEEKS });
+    expect((await named('日志保留天数%')).length).toBe(4);
+    expect(await store.query(`SELECT count(*)::int AS n FROM entity_namesakes WHERE id = base_id`)).toEqual([{ n: 1 }]);
     expect(await resolveEntityContext(store, { config: ctx.config })).toMatchObject({ merged: 0, split: 0, replayed: 0 });
   });
 });

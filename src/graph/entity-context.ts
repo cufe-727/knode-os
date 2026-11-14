@@ -638,7 +638,12 @@ async function partEntity(
      ON CONFLICT (id) DO UPDATE SET anchors = EXCLUDED.anchors, base_anchors = EXCLUDED.base_anchors, documents = EXCLUDED.documents, reason = EXCLUDED.reason`,
     [rule.id, rule.base_id, rule.name, rule.label, JSON.stringify(rule.anchors), JSON.stringify(rule.base_anchors), JSON.stringify(docs.map((d) => d.path).sort()), reason],
   );
-  return config ? replayDocuments(store, config, docs, progress) : 0;
+  if (!config) return 0;
+  const replayed = await replayDocuments(store, config, docs, progress);
+  // the documents' own links to the name (tier 0: the name found in the text) follow the split too
+  const { relinkTier0 } = await import('./concepts.js');
+  await relinkTier0(store, { only: docs.map((d) => d.path) });
+  return replayed;
 }
 
 /**
@@ -649,7 +654,8 @@ async function partEntity(
 async function decidePartedPairs(store: Store): Promise<void> {
   const rules = await store.query<{ id: string; base_id: string; name: string; label: string; reason: string; variant: string; base_name: string }>(
     `SELECT n.id, n.base_id, n.name, n.label, n.reason, v.name AS variant, b.name AS base_name
-     FROM entity_namesakes n JOIN entities v ON v.id = n.id AND v.tx_to IS NULL JOIN entities b ON b.id = n.base_id AND b.tx_to IS NULL`,
+     FROM entity_namesakes n JOIN entities v ON v.id = n.id AND v.tx_to IS NULL JOIN entities b ON b.id = n.base_id AND b.tx_to IS NULL
+     WHERE n.id <> n.base_id`,
   );
   if (rules.length === 0) return;
   const decided = new Set(
@@ -860,14 +866,25 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
     const coded: CodedDoc[] = docs.map((d) => ({ ...d, codes: codesOf(own(d.path)) }));
     const split = codedClusters(coded, (id) => types.get(id));
     if (!split) continue;
-    const existing = new Set((await store.query<{ label: string }>(`SELECT label FROM entity_namesakes WHERE base_id = $1`, [e.id])).map((r) => codeOf(r.label)?.value));
-    // with nothing left for the entity itself, the code with the most documents keeps it
-    const parts = split.rest.length === 0 ? split.parts.slice(1) : split.parts;
-    const kept = split.rest.length === 0 ? split.parts[0] : null;
-    const baseAnchors = await namesOf(store, kept ? kept.anchors : split.restAnchors);
+    const rules = await store.query<{ id: string; label: string; anchors: string[] }>(`SELECT id, label, anchors FROM entity_namesakes WHERE base_id = $1`, [e.id]);
+    const existing = new Set(rules.map((r) => codeOf(r.label)?.value));
+    const self = rules.find((r) => r.id === e.id);
+    // With nothing left for the entity itself, the code with the most documents keeps it — and that is
+    // put on record (a row for the entity itself), so that it keeps the entity whatever later documents
+    // bring: an entity's id is what its claims, its page and a person's corrections are filed under.
+    const kept = !self && split.rest.length === 0 && !existing.has(split.parts[0].code.value) ? split.parts[0] : null;
     const display = codeOf(e.name) ? commonName(said.flatMap((r) => [r.attrs?.name ?? '', r.attrs?.resolved_from ?? '', ...(r.attrs?.aliases ?? [])])) ?? e.name : e.name;
+    const baseAnchors = self ? self.anchors : await namesOf(store, kept ? kept.anchors : split.restAnchors);
+    const parts = split.parts.filter((p) => p !== kept && !existing.has(p.code.value));
+    if (kept && parts.length > 0) {
+      const reason = `同名不同物：${e.name} 的 ${docs.length} 篇文档带有 ${split.parts.length} 个不同编号；${kept.docs.length} 篇属于 ${kept.code.raw}（与 ${baseAnchors.join('、')} 同现），文档最多，保留本实体`;
+      await store.query(
+        `INSERT INTO entity_namesakes (id, base_id, name, label, anchors, base_anchors, documents, reason)
+         VALUES ($1, $1, $2, $3, $4::jsonb, $4::jsonb, $5::jsonb, $6) ON CONFLICT (id) DO NOTHING`,
+        [e.id, display, kept.code.raw, JSON.stringify(baseAnchors), JSON.stringify(kept.docs.map((d) => d.path).sort()), reason],
+      );
+    }
     for (const part of parts) {
-      if (existing.has(part.code.value)) continue;
       const anchors = await namesOf(store, part.anchors);
       const rule: NamesakeRule = { id: '', base_id: e.id, name: display, label: part.code.raw, anchors, base_anchors: baseAnchors };
       rule.id = slugify(namesakeName(rule));

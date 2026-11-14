@@ -14,7 +14,7 @@ import {
 import type { PlannedCitation } from '../graph/citations.js';
 import { entityTypeIds, loadOntology, normalizePredicate, Ontology, relationSpec } from '../graph/ontology.js';
 import { codeOf, MentionContext } from '../graph/identity.js';
-import { NamesakeIndex, resolutionMode, resolveEntityId, ResolvedEntity } from '../graph/resolve.js';
+import { followNamesake, NamesakeIndex, resolutionMode, resolveEntityId, ResolvedEntity } from '../graph/resolve.js';
 import { EntityCorrections, readEntityCorrections, refusedKeys, refuses } from '../graph/corrections.js';
 import { entityKeyKinds, KeyKind, mentionKeys, typesCompatible } from '../graph/normalize.js';
 import { ReviewResolution } from '../config.js';
@@ -238,6 +238,16 @@ export class ScopeWriter {
     this.knownEntities.add(id);
     this.touched.entities.add(id);
     return id;
+  }
+
+  /**
+   * Which entity a link to `entity` means in this document, where that entity
+   * belongs to a name refine parted (graph/identity.ts): the one the
+   * document's own names point at, else `entity` itself.
+   */
+  async namesakeOf(entity: { id: string; name: string }, spellings: readonly string[], context: MentionContext): Promise<{ id: string; name: string }> {
+    const meant = await followNamesake(this.q, entity, { name: entity.name, spellings, context }, this.namesakes, this.corrections.size ? (id) => refuses(refusedKeys(this.corrections.get(id)), entity.name) : undefined);
+    return meant ?? entity;
   }
 
   /** An entity this body already wrote that answers to one of the mention's keys (same type, or an untyped placeholder on either side), and not one that refuses its name. */

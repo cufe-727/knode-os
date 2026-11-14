@@ -770,6 +770,9 @@ export async function wireLinks(w: ScopeWriter, page: PageContext, links: LinkPl
     (await w.q.query<{ id: string }>(`SELECT id FROM entities WHERE id IN (${ph}) AND tx_to IS NULL AND type <> 'concept'`, links.map((l) => l.id))).map((r) => r.id),
   );
   const ids: string[] = [];
+  // a name refine parted into several entities (identity.ts) links to the one this document means:
+  // what the text names — every spelling it links — says under which roof it stands
+  const context = { documentPath: page.path, documentNames: new Set(links.flatMap((l) => [l.name, ...l.surfaces]).map((n) => n.trim().toLowerCase())) };
   for (const l of links) {
     if (!live.has(l.id)) continue;
     const needles = l.surfaces.map((s) => s.toLowerCase());
@@ -777,7 +780,8 @@ export async function wireLinks(w: ScopeWriter, page: PageContext, links: LinkPl
       const lc = c.content.toLowerCase();
       return needles.some((n) => lc.includes(n));
     });
-    const id = await w.entity({ name: l.name, type: 'concept' }, { id: l.id, extractor: LINK_EXTRACTOR, weight: 0.5, segmentId: hits[0]?.id ?? page.chunkIds[0]?.id ?? null });
+    const meant = await w.namesakeOf({ id: l.id, name: l.name }, l.surfaces, context);
+    const id = await w.entity({ name: meant.name, type: 'concept' }, { id: meant.id, extractor: LINK_EXTRACTOR, weight: 0.5, segmentId: hits[0]?.id ?? page.chunkIds[0]?.id ?? null });
     ids.push(id);
     for (const h of hits.slice(0, MENTIONS_PER_ENTITY)) await w.mention(id, h.id, page.documentId);
     if (hits.length === 0 && page.chunkIds[0]) await w.mention(id, page.chunkIds[0].id, page.documentId);
@@ -875,7 +879,11 @@ const RELINK_FOLD_BATCH = 500;
  * touched; a history rebuild recomputes tier-0 from the text the same way.
  * `knode-os entities relink`.
  */
-export async function relinkTier0(store: Store, opts: { onProgress?: (msg: string) => void; limit?: number } = {}): Promise<RelinkStats> {
+export async function relinkTier0(
+  store: Store,
+  /** `only`: just these documents (paths) — the ones refine re-applied to an entity it parted from a name, whose links follow. */
+  opts: { onProgress?: (msg: string) => void; limit?: number; only?: readonly string[] } = {},
+): Promise<RelinkStats> {
   const progress = opts.onProgress ?? (() => {});
   await tier0Known(store, { force: true });
   const ontology = loadOntology(store.dataDir);
@@ -885,7 +893,9 @@ export async function relinkTier0(store: Store, opts: { onProgress?: (msg: strin
      WHERE d.root = 'docs' AND d.status = 'indexed' AND d.kind = 'source' AND s.status = 'active'
      ORDER BY d.path`,
   );
-  const work = opts.limit !== undefined ? docs.slice(0, Math.max(0, opts.limit)) : docs;
+  const only = opts.only ? new Set(opts.only) : null;
+  const scoped = only ? docs.filter((d) => only.has(d.path)) : docs;
+  const work = opts.limit !== undefined ? scoped.slice(0, Math.max(0, opts.limit)) : scoped;
   const touched = new Set<string>();
   const stats: RelinkStats = { documents: 0, linksBefore: 0, linksAfter: 0, entities: 0 };
   for (const doc of work) {

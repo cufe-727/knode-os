@@ -125,6 +125,38 @@ async function byKeys(q: Queryable, keys: Set<string>, type: string | undefined,
   return null;
 }
 
+/**
+ * Which entity a mention means once its name landed on `landed`, where that
+ * entity belongs to a name refine parted (identity.ts, namesakeFor): another
+ * entity of that name, or null when it stays where it landed. Reads only.
+ */
+export async function followNamesake(
+  q: Queryable,
+  landed: { id: string; name: string },
+  mention: { name: string; spellings: readonly string[]; context?: MentionContext },
+  namesakes: NamesakeIndex,
+  refusing?: (id: string) => boolean,
+): Promise<{ id: string; name: string; rule?: NamesakeRule } | null> {
+  const family = await namesakes.family(q, landed.id);
+  if (!family) return null;
+  // a mention that names a parted entity by its own name means that one
+  if (landed.id !== family.baseId && nameKey(landed.name).key === nameKey(mention.name).key) return null;
+  const rules = family.rules.filter((r) => !refusing?.(r.id));
+  const base = landed.id === family.baseId ? landed : (await rowById(q, family.baseId)) ?? landed;
+  const context = mention.context;
+  // which entity each roof is: an alias of a team, or a team merged into another, is that team
+  const roofs = [...new Set([...rules.flatMap((r) => [...r.anchors, ...r.base_anchors]), ...(context?.owners ?? []), ...(context?.documentNames ?? [])])];
+  const known = await entitiesNamed(q, roofs);
+  const same = (n: string) => known.get(n)?.id ?? `~${nameKey(n).key}`;
+  const chosen = namesakeFor(rules, { codes: codesOf(mention.spellings), baseCodes: codesOf([base.name]), context }, same);
+  if (!chosen) return base.id === landed.id ? null : { id: base.id, name: base.name };
+  // a parted entity a person merged back resolves to where it was merged
+  const row = await rowById(q, chosen.id);
+  const target = row ? await canonicalOf(q, row) : null;
+  if (target && target.id !== chosen.id) return target.id === landed.id ? null : { id: target.id, name: target.name };
+  return chosen.id === landed.id ? null : { id: chosen.id, name: namesakeName(chosen), rule: chosen };
+}
+
 export async function resolveEntityId(
   q: Queryable,
   input: ResolveInput,
@@ -153,24 +185,9 @@ export async function resolveEntityId(
   /** The entity the name stands for, once it landed on `landed`: one of those it was parted into, else `landed`. */
   const settle = async (landed: CandidateRow): Promise<ResolvedEntity> => {
     const asIs: ResolvedEntity = landed.id === slug ? { id: slug } : { id: landed.id, name: landed.name, resolvedFrom: name };
-    const family = await namesakes.family(q, landed.id);
-    if (!family) return asIs;
-    // a mention that names a parted entity by its own name means that one
-    if (landed.id !== family.baseId && nameKey(landed.name).key === nameKey(name).key) return asIs;
-    const rules = family.rules.filter((r) => !refusing?.(r.id));
-    const base = landed.id === family.baseId ? landed : (await rowById(q, family.baseId)) ?? landed;
-    const context = input.context;
-    // which entity each roof is: an alias of a team, or a team merged into another, is that team
-    const roofs = [...new Set([...rules.flatMap((r) => [...r.anchors, ...r.base_anchors]), ...(context?.owners ?? []), ...(context?.documentNames ?? [])])];
-    const known = await entitiesNamed(q, roofs);
-    const same = (n: string) => known.get(n)?.id ?? `~${nameKey(n).key}`;
-    const chosen = namesakeFor(rules, { codes, baseCodes: codesOf([base.name]), context }, same);
-    if (!chosen) return base.id === landed.id ? asIs : base.id === slug ? { id: slug } : { id: base.id, name: base.name, resolvedFrom: name };
-    // a parted entity a person merged back resolves to where it was merged
-    const row = await rowById(q, chosen.id);
-    const target = row ? await canonicalOf(q, row) : null;
-    if (target && target.id !== chosen.id) return target.id === slug ? { id: slug } : { id: target.id, name: target.name, resolvedFrom: name };
-    return { id: chosen.id, name: namesakeName(chosen), resolvedFrom: name, namesake: chosen };
+    const meant = await followNamesake(q, landed, { name, spellings: [name, ...(input.aliases ?? [])], context: input.context }, namesakes, refusing);
+    if (!meant) return asIs;
+    return meant.id === slug ? { id: slug } : { id: meant.id, name: meant.name, resolvedFrom: name, ...(meant.rule ? { namesake: meant.rule } : {}) };
   };
 
   // 1. the extractor named the canonical entity outright
