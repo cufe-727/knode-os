@@ -212,8 +212,9 @@ export class ServeQueue implements EvalQueue {
 
   async status(run: string, first = false): Promise<QueueStatus> {
     const res = await fetch(`${this.serveUrl}/eval/v1/status?run=${encodeURIComponent(run)}`, { headers: this.headers(false), signal: AbortSignal.timeout(first ? 5_000 : 10_000) });
-    if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
+    // a refusal first (a token serve does not know, a route it lacks): that is serve answering, not serve gone
     if (res.status >= 400 && res.status < 500) throw new ServeRefusedError('status', res.status, (await res.text()).slice(0, 200));
+    if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
     const body = await res.json() as Partial<QueueStatus>;
     // a serve from before docs/design/32 has no slots for a run's own and would withdraw pieces: refuse it plainly
     if (!body.slots) throw new ServeRefusedError('status', res.status, 'serve on this machine is older than this run (no slots in /eval/v1/status): restart it on this build, or run without --remote');
@@ -692,6 +693,11 @@ export class RemoteEval {
       this.reachable = true;
       this.unreachableSaid = false;
     } catch (err) {
+      // serve refusing the run is no outage: the run stops with its word
+      if (err instanceof ServeRefusedError) {
+        this.stop(err);
+        return;
+      }
       // serve is not answering: nothing is online, the run's own slots included (they lease from it)
       if (this.status) this.status = { ...this.status, slots: { 'eval-call': [], 'eval-session': [] } };
       this.unreachable(err instanceof Error ? err.message : String(err));

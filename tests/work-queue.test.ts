@@ -475,12 +475,12 @@ describe('a run\'s own slots', () => {
 
 describe('serve as the run sees it', () => {
   /** A stand-in serve: /status as `status` says, /offer answered with `offer`'s status and body. */
-  const standIn = async (opts: { status?: unknown; offer?: [number, unknown] }) => {
+  const standIn = async (opts: { status?: unknown; statusCode?: number; offer?: [number, unknown] }) => {
     const server = http.createServer((req, res) => {
       req.resume();
       req.on('end', () => {
         if (req.url?.startsWith('/eval/v1/status')) {
-          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(opts.status ?? { offered: true, slots: { 'eval-call': [], 'eval-session': [] }, run: { waiting: 0, leased: 0 } }));
+          res.writeHead(opts.statusCode ?? 200, { 'content-type': 'application/json' }).end(JSON.stringify(opts.status ?? { offered: true, slots: { 'eval-call': [], 'eval-session': [] }, run: { waiting: 0, leased: 0 } }));
         } else if (req.url === '/eval/v1/offer') {
           const [code, body] = opts.offer ?? [200, { outcome: 'cancelled' }];
           res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify(body));
@@ -501,6 +501,34 @@ describe('serve as the run sees it', () => {
     expect(remote.stopped).toBe(err);
     remote.close();
     await serve.close();
+  });
+
+  it('stops a run serve refuses (a 401) with serve\'s message, instead of falling back to a broker of its own', async () => {
+    const serve = await standIn({ statusCode: 401, status: { error: "eval: missing or invalid bearer token (the data root's .knode/mcp-token)" } });
+    await expect(RemoteEval.connect({ serveUrl: serve.url, token: 't', run: 'denied' })).rejects.toThrow(/serve refused status \(401\).*invalid bearer token/);
+    const lines: string[] = [];
+    const err = await runEval({ ...common(), runDir: path.join(tmp, 'runs', 'denied'), remote: { serveUrl: serve.url, token: 't' }, local: { codex: 1, claude: 1 }, onProgress: (m) => lines.push(m) }).catch((e) => e);
+    expect(err).toBeInstanceOf(ServeRefusedError);
+    expect(lines.some((l) => /broker of its own/.test(l))).toBe(false);
+    expect(fs.existsSync(path.join(tmp, 'runs', 'denied', 'answers.jsonl'))).toBe(false);
+    await serve.close();
+  });
+
+  it('stops a run when serve starts refusing it mid-run, instead of counting an outage', async () => {
+    let code = 200;
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify(code === 200 ? { offered: true, slots: { 'eval-call': [], 'eval-session': [] }, run: { waiting: 0, leased: 0 } } : { error: 'not found' })));
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const url = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
+    const remote = (await RemoteEval.connect({ serveUrl: url, token: 't', run: 'gone-404', refreshMs: 30 }))!;
+    code = 404;
+    await sleep(200);
+    expect(remote.stopped).toBeInstanceOf(ServeRefusedError);
+    expect(remote.stopped!.message).toMatch(/serve refused status \(404\)/);
+    remote.close();
+    await new Promise<void>((r) => server.close(() => r()));
   });
 
   it('refuses to publish to a serve older than this run', async () => {
