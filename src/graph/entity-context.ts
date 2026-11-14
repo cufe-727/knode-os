@@ -599,11 +599,49 @@ export function medianDate(dates: readonly string[]): string | null {
 }
 
 /** An entity's documents with the context-type entities each co-mentions, and the type of each of those. */
+/**
+ * Entities the duplicate audit has proposed to merge and nobody has decided
+ * on yet: id → one id for the pair (or the chain of pairs). Two such
+ * spellings of one organization (三星 / Samsung Electronics) are one roof for
+ * the splits below — a wrong split is worse than a missed one, so a pair that
+ * may be one thing is not what parts a name. A pair a person or the judge
+ * rejected is two things; one that was merged is one already. Where the
+ * audit has not looked at a pair yet, nothing says it is one: that is the
+ * limit of this, and why refine runs the splits after the audit. (On the 10×
+ * run's index the pending pairs are the 58 the judge called the same below
+ * its merge threshold — renamed projects mostly — and none pairs two teams.)
+ */
+async function pendingSame(store: Store): Promise<Map<string, string>> {
+  const pairs = await store.query<{ a: string | null; b: string | null }>(
+    `SELECT payload->>'entityId' AS a, payload->>'canonicalId' AS b FROM suggestions
+     WHERE kind = 'merge' AND status = 'pending' AND coalesce(payload->'llm'->>'same', 'true') <> 'false'`,
+  );
+  const parent = new Map<string, string>();
+  const find = (x: string): string => {
+    const p = parent.get(x);
+    if (p === undefined || p === x) return x;
+    const root = find(p);
+    parent.set(x, root);
+    return root;
+  };
+  for (const { a, b } of pairs) {
+    if (!a || !b) continue;
+    const [ra, rb] = [find(a), find(b)];
+    if (ra !== rb) parent.set(ra < rb ? rb : ra, ra < rb ? ra : rb);
+  }
+  const out = new Map<string, string>();
+  for (const id of parent.keys()) out.set(id, find(id));
+  return out;
+}
+
 async function contextDocs(
   store: Store,
   entityId: string,
-  /** `claimDates`: date a document that has no date of its own by the dates its claims state. */
-  opts: { claimDates?: boolean } = {},
+  /**
+   * `claimDates`: date a document that has no date of its own by the dates its claims state.
+   * `same`: co-mentions that may be one entity (pendingSame) count as one.
+   */
+  opts: { claimDates?: boolean; same?: Map<string, string> } = {},
 ): Promise<{ docs: NamesakeDoc[]; types: Map<string, string> }> {
   const rows = await store.query<{ document_id: string; path: string; doc_date: string | Date | null; language: string | null; other: string | null; other_type: string | null }>(
     // one row per document and co-mentioned entity: a mention is a row per chunk, and read as
@@ -622,8 +660,10 @@ async function contextDocs(
   const docs = [...groupBy(rows, (r) => r.document_id).values()].map((g) => {
     const context = new Set<string>();
     for (const r of g) if (r.other && r.other_type) {
-      context.add(r.other);
-      types.set(r.other, r.other_type);
+      const other = opts.same?.get(r.other) ?? r.other;
+      if (other === entityId) continue;
+      context.add(other);
+      if (!types.has(other) || other === r.other) types.set(other, r.other_type);
     }
     return { id: g[0].document_id, path: g[0].path, date: toIso(g[0].doc_date), language: g[0].language || null, context };
   });
@@ -701,7 +741,7 @@ async function decidePartedPairs(store: Store): Promise<void> {
   }
 }
 
-async function splitNamesakes(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void, relink: string[]): Promise<void> {
+async function splitNamesakes(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void, relink: string[], same: Map<string, string>): Promise<void> {
   // what a workspace turns on with review.identity "context": documents dated by their claims, contexts compared by what they are about
   const wider = config?.review?.identity === 'context';
   const people = await store.query<{ id: string; name: string; docs: number }>(
@@ -717,7 +757,7 @@ async function splitNamesakes(store: Store, config: KnodeConfig | undefined, sta
   const pause = breather();
   for (const p of people) {
     await pause();
-    const { docs, types } = await contextDocs(store, p.id, { claimDates: wider });
+    const { docs, types } = await contextDocs(store, p.id, { claimDates: wider, same });
     const split = namesakeClusters(docs, (id) => types.get(id), { characteristic: wider });
     if (!split) continue;
     const [base, other] = split;
@@ -862,7 +902,7 @@ function commonName(spellings: string[]): string | null {
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || b[0].length - a[0].length || a[0].localeCompare(b[0]))[0]?.[0] ?? null;
 }
 
-async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void, relink: string[]): Promise<void> {
+async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void, relink: string[], same: Map<string, string>): Promise<void> {
   // every live entity of a type a code may part, one of whose spellings has a digit; the codes are read here
   const rows = await store.query<{ id: string; name: string; aliases: string[] | null }>(
     `SELECT e.id, e.name, e.aliases FROM entities e
@@ -888,7 +928,7 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
     const n = documents.get(e.id) ?? 0;
     if (n < 2 * CODE_MIN_DOCS || n > MAX_DOCS) continue;
     await pause();
-    const { docs, types } = await contextDocs(store, e.id);
+    const { docs, types } = await contextDocs(store, e.id, { same });
     // what each document's extraction called it: the entity evidence of that document's scope
     const said = await store.query<{ path: string; attrs: { name?: string; aliases?: string[]; resolved_from?: string } | null }>(
       `SELECT s.key AS path, ev.attrs FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
@@ -968,20 +1008,42 @@ export function namesakeChoice(rules: NamesakeRule[], documentEntities: Extracte
   return best?.rule ?? null;
 }
 
-/** Refine's entity step: rename merges, alias suggestions, namesake and coded splits. */
-export async function resolveEntityContext(store: Store, opts: { config?: KnodeConfig; onProgress?: (msg: string) => void } = {}): Promise<EntityContextStats> {
+/**
+ * Refine's splits: people of one name, and (review.identity "context") an
+ * entity parted by its codes. Run after the duplicate audit, so that two
+ * spellings of one organization the audit has just proposed to merge are one
+ * roof here.
+ */
+export async function splitEntities(store: Store, opts: { config?: KnodeConfig; onProgress?: (msg: string) => void } = {}): Promise<Pick<EntityContextStats, 'split' | 'replayed'>> {
   const progress = opts.onProgress ?? (() => {});
   const stats: EntityContextStats = { merged: 0, suggested: 0, split: 0, replayed: 0 };
-  await mergeRenames(store, stats, progress);
-  await suggestAliasMerges(store, stats);
   const relink: string[] = [];
-  await splitNamesakes(store, opts.config, stats, progress, relink);
+  const same = await pendingSame(store);
+  await splitNamesakes(store, opts.config, stats, progress, relink, same);
   // parting an entity by its codes is something a workspace turns on (review.identity "context")
-  if (opts.config?.review?.identity === 'context') await splitCoded(store, opts.config, stats, progress, relink);
+  if (opts.config?.review?.identity === 'context') await splitCoded(store, opts.config, stats, progress, relink, same);
   if (relink.length > 0) {
     const { relinkTier0 } = await import('./concepts.js');
     await relinkTier0(store, { only: [...new Set(relink)] });
   }
   await decidePartedPairs(store);
+  return { split: stats.split, replayed: stats.replayed };
+}
+
+/**
+ * Refine's entity step: rename merges, alias suggestions, and — unless
+ * `splits` is false, as refine itself asks, to run them after the duplicate
+ * audit — the namesake and coded splits.
+ */
+export async function resolveEntityContext(store: Store, opts: { config?: KnodeConfig; onProgress?: (msg: string) => void; splits?: boolean } = {}): Promise<EntityContextStats> {
+  const progress = opts.onProgress ?? (() => {});
+  const stats: EntityContextStats = { merged: 0, suggested: 0, split: 0, replayed: 0 };
+  await mergeRenames(store, stats, progress);
+  await suggestAliasMerges(store, stats);
+  if (opts.splits !== false) {
+    const done = await splitEntities(store, opts);
+    stats.split = done.split;
+    stats.replayed = done.replayed;
+  }
   return stats;
 }

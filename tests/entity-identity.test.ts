@@ -7,6 +7,7 @@ import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { codeOf, codesConflict, codesOf, documentContext, namesakeFor, NamesakeRule } from '../src/graph/identity.js';
 import { builtinOntology } from '../src/graph/ontology.js';
+import { mergeSuggestionId } from '../src/graph/dedupe.js';
 import { resolveEntityContext } from '../src/graph/entity-context.js';
 import { resolveEntityId } from '../src/graph/resolve.js';
 import { sync } from '../src/ingest/sync.js';
@@ -239,6 +240,25 @@ describe('write-time resolution of a name that may be two things', () => {
     expect((await resolveEntityContext(ctx.store, { config: ctx.config })).split).toBe(0);
     expect(await ctx.store.query(`SELECT id FROM entity_namesakes`)).toEqual([]);
     expect((await docsOf(ctx, 'dram')).length).toBe(6);
+  });
+
+  it('takes two spellings of one roof the duplicate audit has proposed to merge as one roof', async () => {
+    // one maker under two names, not merged yet; its controller under two codes — a roof has one such thing, so no split
+    const unit = (code: string) => `  - { name: 控制器, type: component, aliases: [${code}] }`;
+    const files: [string, string][] = [
+      ...[1, 2, 3].map((k): [string, string] => [`raw/docs/a${k}.md`, report('三星', ['李在镕', '全永铉'], unit('K1-A'))]),
+      ...[1, 2, 3].map((k): [string, string] => [`raw/docs/b${k}.md`, report('Samsung Electronics', ['李在镕', '全永铉'], unit('K2-A'))]),
+    ];
+    const proposed = await build('roofs-proposed', files);
+    await proposed.store.query(
+      `INSERT INTO suggestions (id, kind, title, body, evidence, status, payload) VALUES ($1, 'merge', $2, '', '[]'::jsonb, 'pending', $3::jsonb)`,
+      [mergeSuggestionId('三星', 'samsung-electronics'), '合并重复实体: Samsung Electronics → 三星', JSON.stringify({ entityId: 'samsung-electronics', canonicalId: '三星', score: 0.9 })],
+    );
+    expect((await resolveEntityContext(proposed.store, { config: proposed.config })).split).toBe(0);
+    expect(await proposed.store.query(`SELECT id FROM entity_namesakes`)).toEqual([]);
+    // with nothing on record that the two are one, they are two roofs: the limit of this rule
+    const apart = await build('roofs-apart', files);
+    expect((await resolveEntityContext(apart.store, { config: apart.config })).split).toBe(1);
   });
 
   it('follows a name refine parted: by code, by the roof under any of its spellings, and to the base without context', async () => {
