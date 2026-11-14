@@ -96,6 +96,40 @@ describe('date expressions', () => {
     expect(d(read('2026-11-16\n正文'))).toBe('2026-11-16');
   });
 
+  it('reads the datelines real documents carry: a range in dots, a period still running, a byline, a month name, a time, a weekday', () => {
+    const now = '2026-11-14T10:00:00.000Z';
+    const read = (text: string) => dateFromContent(text, now);
+    // a range written with dots is no numbered list
+    expect(d(read('2025.08.25 至 2025.08.29\n正文'))).toBe('2025-08-29');
+    // a report indexed before its period is over: the day it is indexed — nothing in it is later — and its end once that has passed
+    expect(d(read('# 双周报\n\n2026-11-09 ~ 2026-11-20 · 龙杰\n\n进展'))).toBe('2026-11-14');
+    expect(d(dateFromContent('# 双周报\n\n2026-11-09 ~ 2026-11-20 · 龙杰\n\n进展', '2026-11-25T10:00:00.000Z'))).toBe('2026-11-20');
+    // a byline behind a comma
+    expect(d(read('Weekly notes\n\n**Date:** 2025/8/5, by Lin\n\nBody'))).toBe('2025-08-05');
+    // a month by its name, with a label or under the title
+    expect(d(read('Date: March 1, 2025\n\nBody'))).toBe('2025-03-01');
+    expect(d(read('Published: 1 March 2025\n\nBody'))).toBe('2025-03-01');
+    expect(d(read('# Minutes\n\nFriday, Aug. 29th, 2025\n\nBody'))).toBe('2025-08-29');
+    // a date with a time, a date with a weekday — anywhere among the first lines
+    expect(d(read('# 例会\n\n地点：三楼\n\n时间：2025-08-25 14:30\n\n议题'))).toBe('2025-08-25');
+    expect(d(read('# 例会\n\n参会：王芳\n\n2025年8月29日 星期五\n\n议题'))).toBe('2025-08-29');
+    expect(d(read('# Standup\n\nAttendees: Lin\n\n2025-08-29 09:30 UTC\n\nNotes'))).toBe('2025-08-29');
+  });
+
+  it('reads a bare date only directly under the title', () => {
+    const now = '2026-11-15T12:00:00.000Z';
+    // further down, a line that is only a date may be anything: a birth date in a biography
+    expect(dateFromContent('# 张三\n\n张三是一名工程师\n\n1985-03-01\n\n生于杭州', now)).toBeNull();
+    expect(dateFromContent('# Notes\n\nSome text\n\nMarch 1, 2025\n\nMore', now)).toBeNull();
+    // directly under the title it is read. That is also where a biography may give a birth date: a date decades
+    // before the others in the text cannot be told from a plan's horizon decades after, so this case stays.
+    expect(d(dateFromContent('# 张三\n\n1985-03-01\n\n张三是一名工程师', now))).toBe('1985-03-01');
+    expect(d(dateFromContent('2025-08-29\n\n正文', now))).toBe('2025-08-29');
+    // and what follows a date must still be a weekday, a time or a byline
+    expect(dateFromContent('2025-08-25 14:30 server started\n', now)).toBeNull();
+    expect(dateFromContent('2026-12-01 ~ 2026-12-07\n\n计划', now)).toBeNull();
+  });
+
   it('takes no date from a line that is something else than the document\'s date', () => {
     const now = '2026-11-15T12:00:00.000Z';
     const no = (text: string) => expect(dateFromContent(text, now), text).toBeNull();
