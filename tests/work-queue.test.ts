@@ -161,6 +161,41 @@ describe('failures', () => {
     source.close();
   });
 
+  it('marks a piece stuck when every machine online that takes it failed it three times, as two machines or one with many slots are', async () => {
+    const two = new EvalSource('eval-call', { retryMs: 0 });
+    const a = two.offer({ ...piece(), key: 'piece-two-00001' } as EvalSpec);
+    let n = 0;
+    for (; n < 40 && !(await Promise.race([a.result.then(() => true), sleep(5).then(() => false)])); n++) await fail(two, worker(n % 2 ? 'laptop/b' : 'laptop/a'));
+    expect(await a.result).toMatchObject({ outcome: 'stuck', workers: ['laptop/a', 'laptop/b'] });
+    expect(n).toBe(6);
+    two.close();
+    // one machine with ten slots
+    const one = new EvalSource('eval-call', { retryMs: 0 });
+    const b = one.offer({ ...piece(), key: 'piece-one-00001' } as EvalSpec);
+    for (n = 0; n < 40 && !(await Promise.race([b.result.then(() => true), sleep(5).then(() => false)])); n++) await fail(one, worker('box', (n % 10) + 1));
+    expect(await b.result).toMatchObject({ outcome: 'stuck', workers: ['box'] });
+    expect(n).toBe(3);
+    one.close();
+  });
+
+  it('keeps a piece waiting while a machine online that takes it has not failed it three times', async () => {
+    const source = new EvalSource('eval-call', { retryMs: 0 });
+    const offer = source.offer(piece());
+    // a second machine asks (and is online) but takes nothing yet
+    await source.lease(worker('laptop/b'), 0);
+    await source.lease({ ...worker('laptop/b'), worker: 'laptop/b/eval-claude#1', backend: 'claude' }, 1);
+    for (let i = 0; i < 3; i++) await fail(source, worker('laptop/a'));
+    // laptop/b's claude slot does not take it; there is no codex slot of laptop/b online: stuck
+    expect(await Promise.race([offer.result, sleep(50).then(() => 'waiting')])).toMatchObject({ outcome: 'stuck' });
+    const again = source.offer({ ...piece(), key: 'piece-again-0001' } as EvalSpec);
+    // now laptop/b's codex slot is online and has not failed it: it waits for that machine
+    await source.lease({ ...worker('laptop/c') }, 1).then(async ([t]) => t && source.release([t.id], worker('laptop/c')));
+    for (let i = 0; i < 3; i++) await fail(source, worker('laptop/a'));
+    expect(await Promise.race([again.result, sleep(50).then(() => 'waiting')])).toBe('waiting');
+    again.cancel();
+    source.close();
+  });
+
   it('gives a machine a piece it failed again only when nothing else waits for it', async () => {
     const source = new EvalSource('eval-call', { retryMs: 0 });
     const first = source.offer({ ...piece(), key: 'piece-first-0001' } as EvalSpec);

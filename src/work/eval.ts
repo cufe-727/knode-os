@@ -161,8 +161,8 @@ interface Pending {
   done: boolean;
   lease: string | null;
   strikes: number;
-  /** The machines that could not serve it (`<token>/<worker>`, not their slots). */
-  failedBy: Set<string>;
+  /** The machines that could not serve it (`<token>/<worker>`, not their slots), and how often each. */
+  failedBy: Map<string, number>;
   lastError: string;
   notBefore: number;
 }
@@ -182,7 +182,7 @@ interface EvalLease {
 export interface EvalSourceOptions {
   leaseMs?: number;
   retryMs?: number;
-  /** Different machines that could not serve a piece before it is `stuck` (default 3). */
+  /** Different machines that could not serve a piece before it is `stuck`, and failures by each machine online that make it so (default 3). */
   maxStrikes?: number;
   /** How long a slot that asked counts as online (default 2 min). */
   onlineMs?: number;
@@ -194,6 +194,8 @@ const RETRY_MS = 5_000;
 const DEADLINE_GRACE_MS = 5 * 60_000;
 const MAX_STDOUT_BYTES = 32 * 1024 * 1024;
 const ONLINE_MS = 2 * 60_000;
+/** Failures of one piece, on any machines, after which it is stuck whatever is online. */
+const MAX_ATTEMPTS = 10;
 
 /**
  * Whether a slot may take a piece (docs/design/32 §2): its CLI (the model,
@@ -298,7 +300,7 @@ export class EvalSource implements WorkSource {
     let resolve: (o: EvalOutcome) => void = () => {};
     const result = new Promise<EvalOutcome>((r) => (resolve = r));
     const p: Pending = {
-      id, spec, done: false, lease: null, strikes: 0, failedBy: new Set(), lastError: '', notBefore: 0,
+      id, spec, done: false, lease: null, strikes: 0, failedBy: new Map(), lastError: '', notBefore: 0,
       settle: () => {},
     };
     p.settle = (outcome) => {
@@ -512,15 +514,31 @@ export class EvalSource implements WorkSource {
     this.totals.failed[kind]++;
     p.strikes++;
     p.lastError = error;
-    p.failedBy.add(machineOf(worker));
-    this.log(`eval ${p.spec.run} ${p.spec.label}: ${worker} could not serve it (${kind}; ${p.failedBy.size} machine(s) so far): ${error.slice(0, 240)}`);
-    if (p.failedBy.size >= this.maxStrikes) {
-      // a piece three different workers could not serve is left for the run to report, never answered another way
+    const machine = machineOf(worker);
+    p.failedBy.set(machine, (p.failedBy.get(machine) ?? 0) + 1);
+    this.log(`eval ${p.spec.run} ${p.spec.label}: ${worker} could not serve it (${kind}; ${p.strikes} failure(s) on ${p.failedBy.size} machine(s)): ${error.slice(0, 240)}`);
+    if (this.isStuck(p)) {
+      // left for the run to report, never answered another way
       this.totals.stuck++;
-      p.settle({ outcome: 'stuck', workers: [...p.failedBy], lastError: error });
+      p.settle({ outcome: 'stuck', workers: [...p.failedBy.keys()], lastError: error });
       return;
     }
     p.notBefore = now + this.retryMs;
+  }
+
+  /**
+   * When a piece is stuck (docs/design/32 §3): three different machines could
+   * not serve it; or every machine online that takes it has failed it three
+   * times (two judge workers, one machine with ten slots); or it failed ten
+   * times in all, however the machines online came and went.
+   */
+  private isStuck(p: Pending): boolean {
+    if (p.failedBy.size >= this.maxStrikes) return true;
+    if (p.strikes >= MAX_ATTEMPTS) return true;
+    const able = new Set(this.slotsOnline()
+      .filter((s) => takes({ worker: s.worker, backend: s.family, remote: !s.local, run: s.run ?? undefined, pool: s.pool ?? undefined }, s.family, p.spec))
+      .map((s) => machineOf(s.worker)));
+    return able.size > 0 && [...able].every((m) => (p.failedBy.get(m) ?? 0) >= this.maxStrikes);
   }
 
   /** Lapsed leases go back in line with a strike. */
