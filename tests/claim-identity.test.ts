@@ -12,6 +12,7 @@ import { RawExtractReply } from '../src/graph/llm-extract.js';
 import { claimId, isoWeekOf, readingWeek } from '../src/graph/store.js';
 import { enqueueTier1, runTier1Pass } from '../src/graph/tier1.js';
 import { sync } from '../src/ingest/sync.js';
+import { dateStart } from '../src/store/dates.js';
 import { foldOptions } from '../src/lineage/scope.js';
 import { VECTOR_TYPE } from '../src/store/db.js';
 import { recountAll } from '../src/lineage/fold.js';
@@ -118,9 +119,8 @@ describe('a claim identity', () => {
   });
 
   it('leaves every other claim the identity it had', () => {
-    expect(readingWeek({ ...reading, valueNum: null })).toBeNull();
-    expect(readingWeek({ ...reading, attribute: null })).toBeNull();
-    expect(readingWeek({ ...reading, dateSource: 'document' })).toBeNull();
+    // no figure, or no date at all: not a reading
+    expect(readingWeek({ ...reading, statement: '平台组本周R-70仍未解决' })).toBeNull();
     expect(readingWeek({ ...reading, validFrom: null, validTo: null })).toBeNull();
     // not relative to this week: a restated fact or another period's figure is one claim however many reports date it
     for (const statement of [
@@ -533,5 +533,41 @@ describe('a workspace written before weekly readings had ids', () => {
     const was = await ids();
     await sync(ctx, { llmGraph: false, reapply: true });
     expect(await ids()).toEqual(was);
+  });
+});
+
+describe('what a weekly reading is (review of df45ee5)', () => {
+  const week = { validFrom: '2025-06-16T00:00:00.000Z', validTo: '2025-06-20T23:59:59.999Z' };
+  const w = (statement: string, dates: Record<string, string | null> = week) => readingWeek({ statement, ...dates });
+
+  it('is a figure of this or an earlier week, named as a word, however the figure is compared', () => {
+    expect(w('平台组本周服务可用性为99.92%，较上周增长5%')).toBe('2025-W25');
+    expect(w('本周销售额同比去年增长12%')).toBe('2025-W25');
+    expect(w('本周成交额为2000亿元')).toBe('2025-W25');
+    expect(w('本周完成3项评审')).toBe('2025-W25');
+    expect(w('Revenue two weeks ago was 3.2m')).toBe('2025-W25');
+    expect(w('上上周完成度为46%')).toBe('2025-W25');
+  });
+
+  it('is not a cycle, a company report, or 本周 inside another word', () => {
+    for (const statement of ['本周期产能利用率为78%', 'LPR上周期报价为3.45%', '本周三季报披露净利润12亿元', '资本周转率为1.2', '日本周三公布CPI为2.1%', '本周R-70仍未解决']) {
+      expect(w(statement), statement).toBeNull();
+    }
+  });
+
+  it('takes its week from the source\'s own calendar day, the document\'s date when it states none, and none without either', () => {
+    // local midnight east of UTC is the day before in UTC
+    expect(w('本周可用性为99.92%', { validFrom: '2025-06-15T16:00:00.000Z', validTo: '2025-06-20T15:59:59.999Z' })).toBe('2025-W25');
+    expect(w('本周可用性为99.92%', { observedAt: '2025-06-18T00:00:00.000Z' })).toBe('2025-W25');
+    expect(w('两周前可用性为99.92%', { observedAt: '2025-06-18T00:00:00.000Z' })).toBe('2025-W23');
+    // a model that dated "两周前" with the report's own week: the statement says which week it is
+    expect(w('两周前可用性为99.92%', { ...week, observedAt: '2025-06-18T00:00:00.000Z' })).toBe('2025-W23');
+    expect(w('本周可用性为99.92%', {})).toBeNull();
+  });
+
+  it('resolves 两周前 and 上上周 against the document date', () => {
+    expect(dateStart('两周前', '2025-06-18T00:00:00.000Z')).toBe('2025-06-02T00:00:00.000Z');
+    expect(dateStart('上上周', '2025-06-18T00:00:00.000Z')).toBe('2025-06-02T00:00:00.000Z');
+    expect(dateStart('3周前', '2025-06-18T00:00:00.000Z')).toBe('2025-05-26T00:00:00.000Z');
   });
 });

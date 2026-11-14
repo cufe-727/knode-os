@@ -106,6 +106,7 @@ interface ClaimLite {
   valid_from: string | Date | null;
   valid_to: string | Date | null;
   event_at: string | Date | null;
+  observed_at: string | Date | null;
   evidence_count: number;
   members: number;
   tx_from: string | Date;
@@ -165,13 +166,10 @@ export function statementKey(s: string): string {
  * costs no k(k−1)/2 verdicts, and no rule or judge can merge them.
  */
 const keyedWeeks = new WeakMap<object, string | null>();
-export function keyedWeek(c: Pick<ClaimLite, 'id' | 'subject_id' | 'statement' | 'attribute' | 'value_num' | 'date_source' | 'event_at' | 'valid_from' | 'valid_to'>): string | null {
+export function keyedWeek(c: Pick<ClaimLite, 'id' | 'subject_id' | 'statement' | 'event_at' | 'valid_from' | 'valid_to' | 'observed_at'>): string | null {
   const memo = keyedWeeks.get(c);
   if (memo !== undefined) return memo;
-  const week = readingWeek({
-    statement: c.statement, attribute: c.attribute, valueNum: c.value_num, dateSource: c.date_source,
-    eventAt: c.event_at, validFrom: c.valid_from, validTo: c.valid_to,
-  });
+  const week = readingWeek({ statement: c.statement, eventAt: c.event_at, validFrom: c.valid_from, validTo: c.valid_to, observedAt: c.observed_at });
   const keyed = week && claimId(c.subject_id, c.statement, week) === c.id ? week : null;
   keyedWeeks.set(c, keyed);
   return keyed;
@@ -731,7 +729,7 @@ export const CLAIMS_PER_BATCH = 40_000;
 
 /** Every representative claim that takes part, with its canonical subject / object; narrowed by the caller. */
 const CLAIM_SELECT = `SELECT c.id, c.subject_id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(oe.canonical_id, c.object_id) AS object,
-            se.name AS subject_name, c.statement, c.status, c.kind, c.type, c.valid_from, c.valid_to, c.event_at,
+            se.name AS subject_name, c.statement, c.status, c.kind, c.type, c.valid_from, c.valid_to, c.event_at, c.observed_at,
             c.evidence_count, (SELECT count(*)::int FROM claims m WHERE m.canonical_id = c.id) AS members,
             c.tx_from, s.key AS source_path, c.chunk_id,
             COALESCE(ak.canonical, c.attribute) AS attribute, c.value_num, c.value_text, c.unit,

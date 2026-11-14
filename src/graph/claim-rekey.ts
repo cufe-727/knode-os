@@ -6,7 +6,7 @@ import { Store } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
 import { claimPairId } from './claim-dedupe.js';
 import { applyClaimMerge, unmergeClaim } from './claim-merge.js';
-import { claimId, readingWeek, RELATIVE_WEEK, RELATIVE_WEEK_WORDS } from './store.js';
+import { claimId, readingWeek, speaksOfAWeek, WEEK_WORD_HINTS } from './store.js';
 
 /**
  * The move of a workspace's claims to weekly-reading identity (claimId's
@@ -58,7 +58,7 @@ export interface RekeyStats {
   done: boolean;
 }
 
-const RELATIVE_WEEK_SQL = `(${RELATIVE_WEEK_WORDS.map((w) => `lower(c.statement) LIKE '%${w}%'`).join(' OR ')})`;
+const RELATIVE_WEEK_SQL = `(${WEEK_WORD_HINTS.map((w) => `lower(c.statement) LIKE '%${w}%'`).join(' OR ')})`;
 
 export async function rekeyState(store: Store): Promise<RekeyState> {
   return (await store.getMeta<RekeyState>(META_KEY)) ?? { cursor: null, done: false };
@@ -72,7 +72,7 @@ export async function rekeyState(store: Store): Promise<RekeyState> {
 export function pendingRekey(state: RekeyState, c: { id: string; statement: string }, keyed: boolean): boolean {
   if (state.done || keyed) return false;
   if (state.cursor !== null && c.id <= state.cursor) return false;
-  return RELATIVE_WEEK.test(c.statement.normalize('NFKC'));
+  return speaksOfAWeek(c.statement);
 }
 
 interface EvidenceRow {
@@ -91,12 +91,10 @@ const str = (v: unknown): string | null => (typeof v === 'string' && v ? v : nul
 function newIdOf(c: { subject_id: string; statement: string }, attrs: Record<string, unknown>): string {
   const week = readingWeek({
     statement: c.statement,
-    attribute: str(attrs.attribute),
-    valueNum: typeof attrs.value_num === 'number' ? attrs.value_num : null,
-    dateSource: str(attrs.date_source),
     eventAt: str(attrs.event_at),
     validFrom: str(attrs.valid_from),
     validTo: str(attrs.valid_to),
+    observedAt: str(attrs.observed_at),
   });
   return claimId(c.subject_id, c.statement, week);
 }
