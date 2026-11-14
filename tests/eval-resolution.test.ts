@@ -76,4 +76,37 @@ describe('scanning sidecars for what refine would part', () => {
     expect(r.coded[0].follow).toEqual({ same: 8, elsewhere: 0, base: 0 });
     expect(r.follow).toEqual({ same: 8, elsewhere: 0, base: 0 });
   });
+
+  it('models the write-time path: where a document arriving after the split would be filed, against where refine put it', () => {
+    const ws = path.join(tmp, 'follow');
+    const sidecar = (key: string, entities: unknown[], relations: unknown[] = []) => {
+      const dir = path.join(ws, '.sidecar', key);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'tier1.json'), JSON.stringify({ status: 'done', entities, relations, claims: [] }));
+    };
+    const setting = (aliases: string[] = []) => ({ name: '日志保留天数', type: 'component', aliases });
+    const org = (name: string) => ({ name, type: 'organization' });
+    const person = (name: string) => ({ name, type: 'person' });
+    // two teams' reports: the first two of each carry the team's code, the rest name the setting without it
+    for (let k = 0; k < 5; k++) sidecar(`raw/docs/周报/平台组/w${k}.md`, [org('平台组'), person('罗芳'), setting(k < 2 ? ['T1-C2'] : [])]);
+    for (let k = 0; k < 4; k++) sidecar(`raw/docs/周报/二部平台组/w${k}.md`, [org('二部平台组'), person('廖欣'), setting(k < 2 ? ['D2T1-C2'] : [])]);
+    // a memo by 廖欣 that names no team: refine groups it with 二部平台组's reports, which it is like
+    sidecar('raw/docs/备忘/x.md', [person('廖欣'), setting()]);
+    // a memo that is as much like one team's reports as the other's: refine leaves it with the name
+    sidecar('raw/docs/备忘/y.md', [person('罗芳'), org('二部平台组'), setting()]);
+    // a memo that says whose setting it means: part_of the first team, in a document that names both
+    sidecar('raw/docs/备忘/z.md', [org('平台组'), org('二部平台组'), person('罗芳'), person('廖欣'), setting()], [{ source: '日志保留天数', target: '平台组', type: 'part_of' }]);
+
+    const r = scanSidecars(ws);
+    expect(r.coded).toHaveLength(1);
+    const [name] = r.coded;
+    expect(name.parts.map((p) => [p.code, p.documents, p.anchors]).sort()).toEqual([['D2T1-C2', 5, ['二部平台组']], ['T1-C2', 5, ['平台组']]]);
+    // Arriving after the split, with no list of the split's documents to go by:
+    //   same       the nine reports — four by their code, five by the team they name
+    //   base       x.md: nothing in it says which, so it stays with the name though refine gave it to 二部平台组's
+    //   elsewhere  y.md goes to 二部平台组's, the one roof it names, though refine left it with the name;
+    //              z.md goes to 平台组's by its owner, though refine left it with the name (it is like both)
+    expect(name.follow).toEqual({ same: 9, elsewhere: 2, base: 1 });
+    expect(r.follow).toEqual(name.follow);
+  });
 });
