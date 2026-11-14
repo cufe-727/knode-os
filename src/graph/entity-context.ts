@@ -8,7 +8,7 @@ import { groupBy, toIso } from '../store/temporal.js';
 import { mergeSuggestionId } from './dedupe.js';
 import { applyMerge } from './merge.js';
 import { tier0Known, weakLinkKey } from './concepts.js';
-import { NamesakeRule } from './identity.js';
+import { ANCHOR_TYPES as ANCHOR_TYPE_LIST, Code, codeOf, Codes, codesDiffer, codesOf, namesakeName, NamesakeRule } from './identity.js';
 import { keyOf, nameKey } from './normalize.js';
 import { ExtractedEntity, slugify } from './store.js';
 
@@ -56,7 +56,23 @@ import { ExtractedEntity, slugify } from './store.js';
  *            smaller context's documents are re-applied from their sidecars
  *            (no model call) with the name resolved to a new entity
  *            "陈伟（平台组）"; entity_namesakes keeps the rule that resolution
- *            follows from then on (namesakeChoice).
+ *            follows from then on (identity.ts, namesakeFor). A document
+ *            with no date of its own is dated by the dates its claims state
+ *            (their median), so reports that give their week only in the
+ *            text can still show two people active at once.
+ *   coded    one entity whose documents carry two or more codes of one kind
+ *            (T1-C1, D2T1-C1 … D10T1-C1), each code's documents under a roof of its
+ *            own, is as many things: every such code gets an entity
+ *            "name（code）" and its documents are re-applied to it, those that
+ *            name the thing without a code going by the roof they name. This
+ *            is the only split of anything but a person. Disjoint contexts
+ *            alone do not part a thing: a technology, a product or a sector
+ *            is used under many roofs and stays one (on finance 1,848 names
+ *            have two or more owners), so the namesake rule stays with
+ *            people, who are in one team at a time. A code is an identifier
+ *            the sources themselves give the thing — and even then only
+ *            where the roofs differ, because an extraction also lists kinds
+ *            as aliases (芯片: H100, H200).
  */
 
 export interface EntityContextStats {
@@ -427,7 +443,7 @@ async function suggestAliasMerges(store: Store, stats: EntityContextStats): Prom
 /** Entity types that tell one person's context from another's. */
 const CONTEXT_TYPES = ['person', 'organization', 'project', 'product', 'component'];
 /** Types that may anchor a context: the team, company or project a person belongs to. */
-const ANCHOR_TYPES = new Set(['organization', 'project']);
+const ANCHOR_TYPES = new Set(ANCHOR_TYPE_LIST);
 /** Documents a person name needs before its contexts are compared. */
 const MIN_DOCS = 6;
 /** The most documents of one name compared (a celebrity in a news corpus is one person in many contexts). */
@@ -519,6 +535,103 @@ async function replayDocuments(store: Store, config: KnodeConfig, docs: { id: st
   return replayed;
 }
 
+/** The middle one of some dates (ISO strings); null for none. */
+export function medianDate(dates: readonly string[]): string | null {
+  const sorted = dates.filter(Boolean).sort();
+  return sorted.length ? sorted[Math.floor((sorted.length - 1) / 2)] : null;
+}
+
+/** An entity's documents with the context-type entities each co-mentions, and the type of each of those. */
+async function contextDocs(store: Store, entityId: string): Promise<{ docs: NamesakeDoc[]; types: Map<string, string> }> {
+  const rows = await store.query<{ document_id: string; path: string; doc_date: string | Date | null; other: string | null; other_type: string | null }>(
+    // one row per document and co-mentioned entity: a mention is a row per chunk, and read as
+    // they are a name's documents came back up to 208,361 rows (finance, 2026-11-13: 20 million rows
+    // for 1,619 names, 34,513 at most once distinct)
+    `WITH d AS (SELECT DISTINCT document_id FROM entity_mentions WHERE entity_id = $1)
+     SELECT DISTINCT d.document_id, doc.path, doc.doc_date, o.id AS other, o.type AS other_type
+     FROM d JOIN documents doc ON doc.id = d.document_id
+     LEFT JOIN entity_mentions m ON m.document_id = d.document_id AND m.entity_id <> $1
+     LEFT JOIN entities o ON o.id = m.entity_id AND o.tx_to IS NULL AND o.type = ANY($2::text[])`,
+    [entityId, CONTEXT_TYPES],
+  );
+  const types = new Map<string, string>();
+  const docs = [...groupBy(rows, (r) => r.document_id).values()].map((g) => {
+    const context = new Set<string>();
+    for (const r of g) if (r.other && r.other_type) {
+      context.add(r.other);
+      types.set(r.other, r.other_type);
+    }
+    return { id: g[0].document_id, path: g[0].path, date: toIso(g[0].doc_date), context };
+  });
+  // a document with no date of its own: the middle of the dates its claims state (a weekly report
+  // states its week in every figure; a plan or a look back is the odd one out)
+  const undated = docs.filter((d) => !d.date);
+  if (undated.length > 0) {
+    const stated = await store.query<{ document_id: string; at: string | Date }>(
+      // a claim is tied to a document by the evidence of that document's scope (its path is the scope's key)
+      `SELECT d.id AS document_id, coalesce(c.event_at, c.valid_from) AS at
+       FROM documents d JOIN scopes s ON s.key = d.path
+       JOIN evidence ev ON ev.scope_id = s.id AND ev.kind = 'claim' AND ev.tx_to IS NULL
+       JOIN claims c ON c.id = ev.target_id AND c.tx_to IS NULL
+       WHERE d.id = ANY($1::text[]) AND c.date_source = 'stated' AND coalesce(c.event_at, c.valid_from) IS NOT NULL`,
+      [undated.map((d) => d.id)],
+    );
+    const byDoc = groupBy(stated, (r) => r.document_id);
+    for (const d of undated) d.date = medianDate((byDoc.get(d.id) ?? []).map((r) => toIso(r.at)).filter((x): x is string => Boolean(x)));
+  }
+  return { docs, types };
+}
+
+/** The entities named `ids`, in that order. */
+async function namesOf(store: Store, ids: string[]): Promise<string[]> {
+  return (await store.query<{ id: string; name: string }>(`SELECT id, name FROM entities WHERE id = ANY($1::text[])`, [ids]))
+    .sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id)).map((e) => e.name);
+}
+
+/** Keep the rule one name is parted by, re-apply the documents of the parted entity, and return how many were. */
+async function partEntity(
+  store: Store,
+  config: KnodeConfig | undefined,
+  rule: NamesakeRule,
+  docs: { id: string; path: string }[],
+  reason: string,
+  progress: (msg: string) => void,
+): Promise<number> {
+  await store.query(
+    `INSERT INTO entity_namesakes (id, base_id, name, label, anchors, base_anchors, documents, reason)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8)
+     ON CONFLICT (id) DO UPDATE SET anchors = EXCLUDED.anchors, base_anchors = EXCLUDED.base_anchors, documents = EXCLUDED.documents, reason = EXCLUDED.reason`,
+    [rule.id, rule.base_id, rule.name, rule.label, JSON.stringify(rule.anchors), JSON.stringify(rule.base_anchors), JSON.stringify(docs.map((d) => d.path).sort()), reason],
+  );
+  return config ? replayDocuments(store, config, docs, progress) : 0;
+}
+
+/**
+ * The two never come up as duplicates again: every parted entity that is
+ * live and its base are recorded as a decided pair — those refine parted and
+ * those write-time resolution did (resolve.ts, partByCode).
+ */
+async function decidePartedPairs(store: Store): Promise<void> {
+  const rules = await store.query<{ id: string; base_id: string; name: string; label: string; reason: string; variant: string; base_name: string }>(
+    `SELECT n.id, n.base_id, n.name, n.label, n.reason, v.name AS variant, b.name AS base_name
+     FROM entity_namesakes n JOIN entities v ON v.id = n.id AND v.tx_to IS NULL JOIN entities b ON b.id = n.base_id AND b.tx_to IS NULL`,
+  );
+  if (rules.length === 0) return;
+  const decided = new Set(
+    (await store.query<{ id: string }>(`SELECT id FROM suggestions WHERE id = ANY($1::text[]) AND payload->>'namesake' = 'true'`, [rules.map((r) => mergeSuggestionId(r.base_id, r.id))])).map((r) => r.id),
+  );
+  for (const r of rules) {
+    const id = mergeSuggestionId(r.base_id, r.id);
+    if (decided.has(id)) continue;
+    await store.query(
+      `INSERT INTO suggestions (id, kind, title, body, evidence, status, payload)
+       VALUES ($1, 'merge', $2, $3, $4::jsonb, 'rejected', $5::jsonb)
+       ON CONFLICT (id) DO UPDATE SET status = 'rejected', body = EXCLUDED.body, payload = EXCLUDED.payload`,
+      [id, `合并重复实体: ${r.variant} → ${r.base_name}`, r.reason, JSON.stringify([r.reason]), JSON.stringify({ entityId: r.id, canonicalId: r.base_id, reason: r.reason, namesake: true, llm: { same: false, confidence: 1, reason: r.reason, model: 'rule' } })],
+    );
+  }
+}
+
 async function splitNamesakes(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void): Promise<void> {
   const people = await store.query<{ id: string; name: string; docs: number }>(
     `SELECT e.id, e.name, count(DISTINCT m.document_id)::int AS docs
@@ -533,56 +646,156 @@ async function splitNamesakes(store: Store, config: KnodeConfig | undefined, sta
   const pause = breather();
   for (const p of people) {
     await pause();
-    const rows = await store.query<{ document_id: string; path: string; doc_date: string | Date | null; other: string | null; other_type: string | null }>(
-      // one row per document and co-mentioned entity: a mention is a row per chunk, and read as
-      // they are a name's documents came back up to 208,361 rows (finance, 2026-11-13: 20 million rows
-      // for 1,619 names, 34,513 at most once distinct)
-      `WITH d AS (SELECT DISTINCT document_id FROM entity_mentions WHERE entity_id = $1)
-       SELECT DISTINCT d.document_id, doc.path, doc.doc_date, o.id AS other, o.type AS other_type
-       FROM d JOIN documents doc ON doc.id = d.document_id
-       LEFT JOIN entity_mentions m ON m.document_id = d.document_id AND m.entity_id <> $1
-       LEFT JOIN entities o ON o.id = m.entity_id AND o.tx_to IS NULL AND o.type = ANY($2::text[])`,
-      [p.id, CONTEXT_TYPES],
-    );
-    const types = new Map<string, string>();
-    const docs = [...groupBy(rows, (r) => r.document_id).values()].map((g) => {
-      const context = new Set<string>();
-      for (const r of g) if (r.other && r.other_type) {
-        context.add(r.other);
-        types.set(r.other, r.other_type);
-      }
-      return { id: g[0].document_id, path: g[0].path, date: toIso(g[0].doc_date), context };
-    });
+    const { docs, types } = await contextDocs(store, p.id);
     const split = namesakeClusters(docs, (id) => types.get(id));
     if (!split) continue;
     const [base, other] = split;
-    const anchorNames = async (ids: string[]) => (await store.query<{ id: string; name: string }>(`SELECT id, name FROM entities WHERE id = ANY($1::text[])`, [ids]))
-      .sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id)).map((e) => e.name);
-    const otherAnchors = await anchorNames(other.anchors);
-    const baseAnchors = await anchorNames(base.anchors);
-    const label = otherAnchors[0];
-    const variantName = `${p.name}（${label}）`;
-    const variantId = slugify(variantName);
+    const otherAnchors = await namesOf(store, other.anchors);
+    const baseAnchors = await namesOf(store, base.anchors);
+    const rule: NamesakeRule = { id: '', base_id: p.id, name: p.name, label: otherAnchors[0], anchors: otherAnchors, base_anchors: baseAnchors };
+    rule.id = slugify(namesakeName(rule));
     const reason = `同名不同人：${base.docs.length} 篇文档与 ${baseAnchors.join('、')} 同现，${other.docs.length} 篇与 ${otherAnchors.join('、')} 同现，同一时期内两组共现实体几乎不重合`;
-    await store.query(
-      `INSERT INTO entity_namesakes (id, base_id, name, label, anchors, base_anchors, documents, reason)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8)
-       ON CONFLICT (id) DO UPDATE SET anchors = EXCLUDED.anchors, base_anchors = EXCLUDED.base_anchors, documents = EXCLUDED.documents, reason = EXCLUDED.reason`,
-      [variantId, p.id, p.name, label, JSON.stringify(otherAnchors), JSON.stringify(baseAnchors), JSON.stringify(other.docs.map((d) => d.path).sort()), reason],
-    );
     stats.split++;
     progress(`entities: ${p.name} split — ${reason}`);
-    if (config) stats.replayed += await replayDocuments(store, config, other.docs, progress);
-    // the two never come up as duplicates again: recorded as a decided pair
-    const [variant] = await store.query<{ id: string }>(`SELECT id FROM entities WHERE id = $1 AND tx_to IS NULL`, [variantId]);
-    if (variant) {
-      const id = mergeSuggestionId(p.id, variantId);
-      await store.query(
-        `INSERT INTO suggestions (id, kind, title, body, evidence, status, payload)
-         VALUES ($1, 'merge', $2, $3, $4::jsonb, 'rejected', $5::jsonb)
-         ON CONFLICT (id) DO UPDATE SET status = 'rejected', body = EXCLUDED.body, payload = EXCLUDED.payload`,
-        [id, `合并重复实体: ${variantName} → ${p.name}`, reason, JSON.stringify([reason]), JSON.stringify({ entityId: variantId, canonicalId: p.id, reason, namesake: true, llm: { same: false, confidence: 1, reason, model: 'rule' } })],
-      );
+    stats.replayed += await partEntity(store, config, rule, other.docs, reason, progress);
+  }
+}
+
+/* ----------------------------------- coded ----------------------------------- */
+
+/** Documents a code needs before it may part a name. */
+const CODE_MIN_DOCS = 2;
+
+export interface CodedDoc extends NamesakeDoc {
+  /** The codes the entity's mention in this document carries (identity.ts, codesOf). */
+  codes: Codes;
+}
+
+export interface CodedPart {
+  code: Code;
+  docs: CodedDoc[];
+  /** Organizations or projects in most of this code's documents and almost none of the other codes'. */
+  anchors: string[];
+}
+
+export interface CodedSplit {
+  /** The codes that are things of their own, the one with the most documents first. */
+  parts: CodedPart[];
+  /** What stays with the entity: documents of no part. */
+  rest: CodedDoc[];
+  restAnchors: string[];
+}
+
+/**
+ * One entity's documents parted by the codes its mentions carry, or null. A
+ * split needs two or more codes that differ as identifiers of one kind do
+ * (identity.ts, codesDiffer), each in CODE_MIN_DOCS documents or more and
+ * each with an anchor of its own (an organization or project in ≥ 60% of its
+ * documents and ≤ 5% of the other codes'). A code with no such anchor stays
+ * where it is: kinds listed as aliases (H100 and H200 under 芯片) and a code
+ * written short and long share their context. A document that carries none
+ * of the codes goes with the one code whose anchor it names, when it names
+ * no other's; every other document stays. No test of dates: a code is not a
+ * person, who may change teams. Exported for tests.
+ */
+export function codedClusters(docs: CodedDoc[], typeOf: (id: string) => string | undefined): CodedSplit | null {
+  const byValue = new Map<string, { code: Code; docs: CodedDoc[] }>();
+  for (const d of docs) for (const c of d.codes.values()) (byValue.get(c.value) ?? byValue.set(c.value, { code: c, docs: [] }).get(c.value)!).docs.push(d);
+  // codes that differ from one another, directly or through a third: one kind of identifier
+  const all = [...byValue.values()];
+  const kind = all.map((_, i) => i);
+  const find = (i: number): number => (kind[i] === i ? i : (kind[i] = find(kind[i])));
+  for (let i = 0; i < all.length; i++) for (let j = i + 1; j < all.length; j++) if (codesDiffer(all[i].code, all[j].code)) kind[find(i)] = find(j);
+  const share = (g: CodedDoc[], id: string) => (g.length ? g.filter((d) => d.context.has(id)).length / g.length : 0);
+  const ids = (g: CodedDoc[]) => new Set(g.flatMap((d) => [...d.context]));
+  const anchorsOf = (own: CodedDoc[], other: CodedDoc[]) =>
+    [...ids(own)]
+      .filter((id) => ANCHOR_TYPES.has(typeOf(id) ?? '') && share(own, id) >= 0.6 && share(other, id) <= 0.05)
+      .sort((x, y) => share(own, y) - share(own, x) || x.localeCompare(y));
+  let best: CodedSplit | null = null;
+  for (const members of groupBy(all.map((g, i) => ({ g, i })), (x) => String(find(x.i))).values()) {
+    const groups = members.map((x) => x.g).filter((g) => g.docs.length >= CODE_MIN_DOCS);
+    if (groups.length < 2) continue;
+    const parts: CodedPart[] = groups
+      .map((g) => ({ code: g.code, docs: [...g.docs], anchors: anchorsOf(g.docs, groups.filter((o) => o !== g).flatMap((o) => o.docs)) }))
+      .filter((p) => p.anchors.length > 0);
+    if (parts.length < 2) continue;
+    const values = new Set(members.map((x) => x.g.code.value));
+    const taken = new Set(parts.flatMap((p) => p.docs));
+    const rest: CodedDoc[] = [];
+    for (const d of docs) {
+      if (taken.has(d)) continue;
+      // a document that names the thing without one of these codes: the roof it names says which
+      const coded = [...d.codes.values()].some((c) => values.has(c.value));
+      const named = coded ? [] : parts.filter((p) => p.anchors.some((a) => d.context.has(a)));
+      if (named.length === 1) named[0].docs.push(d);
+      else rest.push(d);
+    }
+    parts.sort((a, b) => b.docs.length - a.docs.length || a.code.value.localeCompare(b.code.value));
+    const split: CodedSplit = { parts, rest, restAnchors: anchorsOf(rest, parts.flatMap((p) => p.docs)) };
+    if (!best || split.parts.length > best.parts.length) best = split;
+  }
+  return best;
+}
+
+/** The spelling most of these mentions use that is no code, or null. */
+function commonName(spellings: string[]): string | null {
+  const counts = new Map<string, number>();
+  for (const s of spellings) if (s.trim() && !codeOf(s)) counts.set(s.trim(), (counts.get(s.trim()) ?? 0) + 1);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || b[0].length - a[0].length || a[0].localeCompare(b[0]))[0]?.[0] ?? null;
+}
+
+async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void): Promise<void> {
+  // every live entity one of whose spellings has a digit; the codes are read here
+  const rows = await store.query<{ id: string; name: string; aliases: string[] | null }>(
+    `SELECT e.id, e.name, e.aliases FROM entities e
+     WHERE e.tx_to IS NULL AND e.canonical_id IS NULL AND (e.name ~ '[0-9]' OR e.aliases::text ~ '[0-9]')
+       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = e.id)`,
+  );
+  const candidates = rows.filter((e) => {
+    const codes = [e.name, ...(e.aliases ?? [])].map((x) => (typeof x === 'string' ? codeOf(x) : null)).filter((c): c is Code => c !== null);
+    return codes.some((a, i) => codes.slice(i + 1).some((b) => codesDiffer(a, b)));
+  });
+  if (candidates.length === 0) return;
+  const pause = breather();
+  for (const e of candidates) {
+    await pause();
+    const { docs, types } = await contextDocs(store, e.id);
+    if (docs.length < 2 * CODE_MIN_DOCS || docs.length > MAX_DOCS) continue;
+    // what each document's extraction called it: the entity evidence of that document's scope
+    const said = await store.query<{ path: string; attrs: { name?: string; aliases?: string[]; resolved_from?: string } | null }>(
+      `SELECT s.key AS path, ev.attrs FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
+       WHERE ev.kind = 'entity' AND ev.target_id = $1 AND ev.tx_to IS NULL`,
+      [e.id],
+    );
+    const spellings = new Map<string, string[]>();
+    for (const r of said) {
+      const list = spellings.get(r.path) ?? spellings.set(r.path, []).get(r.path)!;
+      for (const x of [r.attrs?.name, r.attrs?.resolved_from, ...(r.attrs?.aliases ?? [])]) if (typeof x === 'string') list.push(x);
+    }
+    // the entity's own name is in every evidence row once mentions were resolved onto it: only what the mention itself wrote counts
+    const own = (path: string) => (spellings.get(path) ?? []).filter((x) => x !== e.name || codeOf(e.name) === null);
+    const coded: CodedDoc[] = docs.map((d) => ({ ...d, codes: codesOf(own(d.path)) }));
+    const split = codedClusters(coded, (id) => types.get(id));
+    if (!split) continue;
+    const existing = new Set((await store.query<{ label: string }>(`SELECT label FROM entity_namesakes WHERE base_id = $1`, [e.id])).map((r) => codeOf(r.label)?.value));
+    // with nothing left for the entity itself, the code with the most documents keeps it
+    const parts = split.rest.length === 0 ? split.parts.slice(1) : split.parts;
+    const kept = split.rest.length === 0 ? split.parts[0] : null;
+    const baseAnchors = await namesOf(store, kept ? kept.anchors : split.restAnchors);
+    const display = codeOf(e.name) ? commonName(said.flatMap((r) => [r.attrs?.name ?? '', r.attrs?.resolved_from ?? '', ...(r.attrs?.aliases ?? [])])) ?? e.name : e.name;
+    for (const part of parts) {
+      if (existing.has(part.code.value)) continue;
+      const anchors = await namesOf(store, part.anchors);
+      const rule: NamesakeRule = { id: '', base_id: e.id, name: display, label: part.code.raw, anchors, base_anchors: baseAnchors };
+      rule.id = slugify(namesakeName(rule));
+      const [taken] = await store.query<{ id: string }>(`SELECT id FROM entities WHERE id = $1 AND tx_to IS NULL`, [rule.id]);
+      if (taken) continue;
+      const carrying = part.docs.filter((d) => [...d.codes.values()].some((c) => c.value === part.code.value)).length;
+      const reason = `同名不同物：${e.name} 的 ${docs.length} 篇文档带有 ${split.parts.length} 个不同编号；${carrying} 篇带 ${part.code.raw}${part.docs.length > carrying ? `、另 ${part.docs.length - carrying} 篇未带编号` : ''}，与 ${anchors.join('、')} 同现，其他编号的文档不与之同现`;
+      stats.split++;
+      progress(`entities: ${e.name} split — ${reason}`);
+      stats.replayed += await partEntity(store, config, rule, part.docs, reason, progress);
     }
   }
 }
@@ -617,12 +830,14 @@ export function namesakeChoice(rules: NamesakeRule[], documentEntities: Extracte
   return best?.rule ?? null;
 }
 
-/** Refine's entity step: rename merges, alias suggestions, namesake splits. */
+/** Refine's entity step: rename merges, alias suggestions, namesake and coded splits. */
 export async function resolveEntityContext(store: Store, opts: { config?: KnodeConfig; onProgress?: (msg: string) => void } = {}): Promise<EntityContextStats> {
   const progress = opts.onProgress ?? (() => {});
   const stats: EntityContextStats = { merged: 0, suggested: 0, split: 0, replayed: 0 };
   await mergeRenames(store, stats, progress);
   await suggestAliasMerges(store, stats);
   await splitNamesakes(store, opts.config, stats, progress);
+  await splitCoded(store, opts.config, stats, progress);
+  await decidePartedPairs(store);
   return stats;
 }
