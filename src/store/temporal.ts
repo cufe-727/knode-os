@@ -1,7 +1,6 @@
 import { isCorrectionStatement, normalizeAttribute, parseMeasure } from '../graph/claim-state.js';
 import { keyOf } from '../graph/normalize.js';
 import { normalizeClaimType } from '../graph/store.js';
-import { documentPeriod, DocumentPeriod, DocumentPeriodScale, normalizeDateExpr, PERIOD_MAX_DAYS } from './dates.js';
 import { Queryable } from './migrations.js';
 
 /**
@@ -89,32 +88,33 @@ export interface EvidenceAtRow {
   tx_from: string;
 }
 
-/** The document a scope read (its `meta.documentId`, when that document exists) and that document's date now. */
+/** The document a scope read, for the scopes that read one: a document's own scope and its tier-1 child. */
 export interface ScopeDocument {
   documentId: string;
-  docDate: string | null;
-  /** The scope's key (the document's path for a document's scopes), which orders supporters of one instant. */
+  /** The scope's key (the document's path), which orders supporters of one instant. */
   key: string;
 }
 
 /**
- * The documents behind evidence scopes: a document's scope and its tier-1
- * child name it in `meta.documentId`; other scopes (merges, research, a
- * person's edits) read no document and are left out. The date is the
- * document's `doc_date` as it is now, so a date found after the evidence was
- * written (a dateline reader, a backfill) reaches the next fold.
+ * The documents behind evidence scopes. A document's scope and its tier-1
+ * child name it in `meta.documentId`; the human-prose scope of a generated
+ * wiki page (`wiki-human`) names its page there too, but a page knode wrote is
+ * no source, so it is left out with merges, research and a person's edits —
+ * the scope kinds entity pages fall back to (src/wiki/pages.ts).
  */
+export const SOURCE_SCOPE_KINDS = ['doc', 'tier1'] as const;
+
 export async function scopeDocuments(q: Queryable, scopeIds: Iterable<string>): Promise<Map<string, ScopeDocument>> {
   const ids = [...new Set(scopeIds)];
   const out = new Map<string, ScopeDocument>();
   if (ids.length === 0) return out;
-  const rows = await q.query<{ id: string; key: string; document_id: string; doc_date: string | Date | null }>(
-    `SELECT s.id, s.key, d.id AS document_id, d.doc_date
+  const rows = await q.query<{ id: string; key: string; document_id: string }>(
+    `SELECT s.id, s.key, d.id AS document_id
      FROM scopes s JOIN documents d ON d.id = s.meta->>'documentId'
-     WHERE s.id = ANY($1::text[])`,
-    [ids],
+     WHERE s.id = ANY($1::text[]) AND s.kind = ANY($2::text[])`,
+    [ids, [...SOURCE_SCOPE_KINDS]],
   );
-  for (const r of rows) out.set(r.id, { documentId: r.document_id, docDate: toIso(r.doc_date), key: r.key });
+  for (const r of rows) out.set(r.id, { documentId: r.document_id, key: r.key });
   return out;
 }
 
@@ -309,61 +309,12 @@ export interface ClaimAsOf {
   correction: boolean;
 }
 
-/**
- * A supporter's document date: what its evidence recorded when it was written,
- * else its document's `doc_date` now (`docs`, from scopeDocuments) — evidence
- * written while the document had no date takes one found later.
- */
-function supporterObserved(r: EvidenceAtRow, docs?: ReadonlyMap<string, ScopeDocument>): string | null {
-  return toIso(str(r.attrs.observed_at)) ?? docs?.get(r.scope_id)?.docDate ?? null;
-}
-
-/**
- * One supporter's own date: the date it states (its event, else the start of
- * its window — `windowFrom` when the fold worked one out, see
- * supporterPeriodWindow), else its document's (marked `document`: inferred, not stated).
- */
-function supporterDate(
-  r: EvidenceAtRow,
-  docs?: ReadonlyMap<string, ScopeDocument>,
-  windowFrom: string | null = toIso(str(r.attrs.valid_from)),
-): { at: string | null; source: 'stated' | 'document' | null } {
-  const stated = toIso(str(r.attrs.event_at)) ?? windowFrom;
+/** One supporter's own date: the date it states, else its document's. */
+function supporterDate(r: EvidenceAtRow): { at: string | null; source: 'stated' | 'document' | null } {
+  const stated = toIso(str(r.attrs.event_at)) ?? toIso(str(r.attrs.valid_from));
   if (stated) return { at: stated, source: 'stated' };
-  const observed = supporterObserved(r, docs);
+  const observed = toIso(str(r.attrs.observed_at));
   return observed ? { at: observed, source: 'document' } : { at: null, source: null };
-}
-
-/** MIN start, MAX end unless any supporter leaves the end open. */
-function unionWindow(rows: EvidenceAtRow[]): { from: string | null; to: string | null } {
-  const froms = rows.map((r) => toIso(str(r.attrs.valid_from))).filter((x): x is string => Boolean(x)).sort();
-  const openEnded = rows.some((r) => !toIso(str(r.attrs.valid_to)));
-  const tos = rows.map((r) => toIso(str(r.attrs.valid_to))).filter((x): x is string => Boolean(x)).sort();
-  return { from: froms[0] ?? null, to: openEnded ? null : tos[tos.length - 1] ?? null };
-}
-
-/** Periods short enough that a statement naming one is read as its document's: a day, a week, a month. */
-const RESOLVED_SCALES: ReadonlySet<DocumentPeriodScale> = new Set(['day', 'week', 'month']);
-
-/**
- * One supporter's window for a statement naming its document's period: the
- * window it stated, unless it stated none or one longer than the period can
- * be — then, for a day, week or month, the period word resolved on the
- * supporter's document date ("本周" in a report dated 2025-09-05 is
- * 2025-09-01 … 09-07). A quarter or a year word is often a comparison
- * ("比去年同期") rather than the claim's own period, so only a stated window counts for it.
- * A period the statement names is a date it states, as a `startDate: 本周`
- * resolved on the document's date is (src/graph/llm-extract.ts).
- */
-function supporterPeriodWindow(r: EvidenceAtRow, period: DocumentPeriod, docs?: ReadonlyMap<string, ScopeDocument>): { from: string | null; to: string | null } {
-  const from = toIso(str(r.attrs.valid_from));
-  const to = toIso(str(r.attrs.valid_to));
-  const tooLong = Boolean(from && to && (Date.parse(to) - Date.parse(from)) / 86_400_000 > PERIOD_MAX_DAYS[period.scale]);
-  if ((from || to) && !tooLong) return { from, to };
-  if (!RESOLVED_SCALES.has(period.scale)) return { from, to };
-  const ref = supporterObserved(r, docs);
-  const span = ref ? normalizeDateExpr(period.word, ref) : null;
-  return span ? { from: span.from, to: span.to } : { from, to };
 }
 
 function finiteOrNull(v: unknown): number | null {
@@ -374,16 +325,9 @@ function finiteOrNull(v: unknown): number | null {
 /**
  * `subjectName` lets the statement be read for a measure when no supporter
  * carries one (evidence written before claim state, frontmatter claims);
- * without it only the supporters' own readings count. `docs` (scopeDocuments
- * of the supporters' scopes) dates a supporter whose evidence carries no date
- * by its document's `doc_date`; without it only the evidence's own dates count.
+ * without it only the supporters' own readings count.
  */
-export function foldClaimEvidence(
-  row: { id: string; subject_id: string; statement: string },
-  rows: EvidenceAtRow[],
-  subjectName?: string | null,
-  docs?: ReadonlyMap<string, ScopeDocument>,
-): ClaimAsOf | null {
+export function foldClaimEvidence(row: { id: string; subject_id: string; statement: string }, rows: EvidenceAtRow[], subjectName?: string | null): ClaimAsOf | null {
   if (rows.length === 0) return null;
   const byWeight = [...rows].sort((a, b) => b.weight - a.weight || new Date(a.tx_from).getTime() - new Date(b.tx_from).getTime());
   const earliest = [...rows].sort((a, b) => new Date(a.tx_from).getTime() - new Date(b.tx_from).getTime() || a.scope_id.localeCompare(b.scope_id))[0];
@@ -398,23 +342,17 @@ export function foldClaimEvidence(
   // evidence written before the closed list carries the extractor's own label (市场表现, 盈利预测 …)
   const type = normalizeClaimType(byWeight.map((r) => str(r.attrs.type)).find(Boolean));
   const kind = byWeight.map((r) => str(r.attrs.kind)).find(Boolean) ?? 'fact';
-  // each supporter's window: for a statement about its document's period (本周, 上月 …), that period
-  const period = documentPeriod(row.statement);
-  const own = new Map(rows.map((r) => [r, period
-    ? supporterPeriodWindow(r, period, docs)
-    : { from: toIso(str(r.attrs.valid_from)), to: toIso(str(r.attrs.valid_to)) }]));
+  const froms = rows.map((r) => toIso(str(r.attrs.valid_from))).filter((x): x is string => Boolean(x)).sort();
+  const openEnded = rows.some((r) => !toIso(str(r.attrs.valid_to)));
+  const tos = rows.map((r) => toIso(str(r.attrs.valid_to))).filter((x): x is string => Boolean(x)).sort();
   const objectId = byWeight.map((r) => str(r.attrs.object_id)).find(Boolean) ?? null;
   const eventAt = byWeight.map((r) => toIso(str(r.attrs.event_at))).find(Boolean) ?? null;
-  const observed = rows.map((r) => supporterObserved(r, docs)).filter((x): x is string => Boolean(x)).sort();
+  const observed = rows.map((r) => toIso(str(r.attrs.observed_at))).filter((x): x is string => Boolean(x)).sort();
   // the newest supporter by its own date (ties: the later write, then the scope id)
-  const dated = rows.map((r) => ({ r, ...supporterDate(r, docs, own.get(r)!.from) }));
+  const dated = rows.map((r) => ({ r, ...supporterDate(r) }));
   const newest = dated
     .filter((d) => d.at)
     .sort((a, b) => b.at!.localeCompare(a.at!) || new Date(b.r.tx_from).getTime() - new Date(a.r.tx_from).getTime() || a.r.scope_id.localeCompare(b.r.scope_id))[0];
-  // a statement about its document's period holds for the newest supporter's period: report after report
-  // repeating "支付组本周在岗7人" says so of one week each, not of the months between the first and the last
-  // (those weeks stay in the evidence); any other claim's window spans its supporters'
-  const window = !period ? unionWindow(rows) : newest ? own.get(newest.r)! : { from: null, to: null };
   // the reading of the newest supporter that gives one, else the statement's
   const measured = [...dated]
     .filter((d) => str(d.r.attrs.attribute))
@@ -435,8 +373,8 @@ export function foldClaimEvidence(
     statement: row.statement,
     status,
     kind,
-    valid_from: window.from,
-    valid_to: window.to,
+    valid_from: froms[0] ?? null,
+    valid_to: openEnded ? null : tos[tos.length - 1] ?? null,
     event_at: eventAt,
     observed_at: observed[0] ?? null,
     primary_scope_id: earliest.scope_id,
@@ -506,10 +444,9 @@ export async function claimsAsOf(q: Queryable, subjectIds: string[], asOf: strin
   if (candidates.length === 0) return [];
   const rows = await evidenceAsOf(q, 'claim', candidates.map((c) => c.id), asOf);
   const grouped = groupBy(rows, (r) => r.target_id);
-  const docs = await scopeDocuments(q, rows.map((r) => r.scope_id));
   const out: ClaimAsOf[] = [];
   for (const c of candidates) {
-    const folded = foldClaimEvidence(c, grouped.get(c.id) ?? [], undefined, docs);
+    const folded = foldClaimEvidence(c, grouped.get(c.id) ?? []);
     if (folded) out.push(folded);
   }
   return out;
