@@ -242,17 +242,15 @@ pitfalls:
     const config = loadConfig(dataDir);
     config.datasources = [];
     saveConfig(dataDir, config);
-    const reopened = await createContext(dataDir);
-    try {
-      await sync(reopened, { llmGraph: false });
-      expect(await listCapabilities(reopened.store, { excludeBuiltin: true })).toHaveLength(0);
-      expect(await locatorsForEntities(reopened.store, ['宁德时代'])).toHaveLength(0);
-      // the entity itself is still asserted by the document, so it survives
-      const [entity] = await reopened.store.query<{ id: string }>(`SELECT id FROM entities WHERE id = '宁德时代' AND tx_to IS NULL`);
-      expect(entity).toBeDefined();
-    } finally {
-      await reopened.datasources.closeAll();
-      await reopened.store.close();
-    }
+    // reopen with the new config: the first context lets go of the index first (one open per embedded database)
+    await ctx.datasources.closeAll();
+    await ctx.store.close();
+    ctx = await createContext(dataDir);
+    await sync(ctx, { llmGraph: false });
+    expect(await listCapabilities(ctx.store, { excludeBuiltin: true })).toHaveLength(0);
+    expect(await locatorsForEntities(ctx.store, ['宁德时代'])).toHaveLength(0);
+    // the entity itself is still asserted by the document, so it survives
+    const [entity] = await ctx.store.query<{ id: string }>(`SELECT id FROM entities WHERE id = '宁德时代' AND tx_to IS NULL`);
+    expect(entity).toBeDefined();
   });
 });

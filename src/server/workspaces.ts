@@ -175,6 +175,8 @@ export class WorkspaceContextRegistry {
   private readonly contexts = new Map<string, Promise<AppContext>>();
   private readonly cleanups = new Map<string, WorkspaceCleanup>();
   private readonly resetting = new Set<string>();
+  /** Workspaces whose context is closing: a reopen waits for it, so one directory never has two stores open. */
+  private readonly closing = new Map<string, Promise<void>>();
 
   constructor(
     public readonly rootDataDir: string,
@@ -237,7 +239,10 @@ export class WorkspaceContextRegistry {
     if (this.resetting.has(dataDir)) return Promise.reject(new Error('workspace is being cleared'));
     let pending = this.contexts.get(dataDir);
     if (!pending) {
-      pending = this.open(dataDir, scope).catch((error) => {
+      // still closing (a clear, a shutdown): open once the old store has let go of the index
+      const closing = this.closing.get(dataDir);
+      const opened = closing ? closing.then(() => this.open(dataDir, scope)) : this.open(dataDir, scope);
+      pending = opened.catch((error) => {
         this.contexts.delete(dataDir);
         throw error;
       });
@@ -365,13 +370,24 @@ export class WorkspaceContextRegistry {
     this.contexts.delete(dataDir);
     const cleanup = this.cleanups.get(dataDir);
     this.cleanups.delete(dataDir);
-    if (cleanup) await cleanup();
-    if (!pending) return;
+    const before = this.closing.get(dataDir);
+    const closed = (async () => {
+      await before;
+      if (cleanup) await cleanup();
+      if (!pending) return;
+      try {
+        const ctx = await pending;
+        await ctx.store.close();
+      } catch {
+        // Failed opens have already released or never acquired their store.
+      }
+    })();
+    const done = closed.catch(() => undefined);
+    this.closing.set(dataDir, done);
     try {
-      const ctx = await pending;
-      await ctx.store.close();
-    } catch {
-      // Failed opens have already released or never acquired their store.
+      await closed;
+    } finally {
+      if (this.closing.get(dataDir) === done) this.closing.delete(dataDir);
     }
   }
 
