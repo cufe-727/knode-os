@@ -576,7 +576,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           for (const other of members) if (other !== s) await other.release?.(env);
           const tasks = isAgent(s) ? selectTasks(allTasks, suites, opts.agentLimit ?? 30, seed) : allTasks;
           for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, tasks, fraction, seed, concurrencyFor(s, leaves), progress, undefined, r, stop.signal);
-          await retrieveAll(store, env, s, allTasks, fraction, seed);
+          await retrieveAll(store, env, s, allTasks, fraction, seed, stop.signal);
         }
         // generated knowledge, once per build
         const exporter = members.find((s) => s.exportKnowledge);
@@ -1022,20 +1022,28 @@ export function eachWithin<T>(items: T[], width: () => number, fn: (item: T) => 
   });
 }
 
-async function retrieveAll(store: RunStore, env: SystemEnv, s: SystemUnderTest, tasks: Task[], fraction: number, seed: string | number): Promise<void> {
+async function retrieveAll(store: RunStore, env: SystemEnv, s: SystemUnderTest, tasks: Task[], fraction: number, seed: string | number, signal?: AbortSignal): Promise<void> {
   if (!s.retrieve) return;
   const { retrievalScores } = await import('./metrics/retrieval.js');
+  const remote = currentRemote<PackScope>()?.remote;
   for (const t of tasks) {
+    // a stopping run scores nothing more: what it stopped is asked again on resume
+    if (signal?.aborted) return;
     if (!t.evidence.length || t.scoring === 'abstain' || t.suite !== 'usage') continue;
     const probe = recordKey('score', env.pack.manifest.id, s.id, t.id, 'recall@5');
     if (store.score(probe)) continue;
     let ranked: string[] = [];
+    const stuckMark = remote?.stuck.length ?? 0;
     try {
-      ranked = await s.retrieve(t.question, 10, env);
+      ranked = await withPieceTag({ system: s.id, task: t.id }, () => s.retrieve!(t.question, 10, env));
     } catch (err) {
+      if (signal?.aborted) return;
       store.log('retrieve failed', { system: s.id, task: t.id, error: err instanceof Error ? err.message : String(err) });
       continue;
     }
+    // a retrieval whose model call stuck, or that ended as the run stopped, is no ranking to score
+    if (signal?.aborted) return;
+    if (remote?.stuckFor(stuckMark, s.id).length) continue;
     const r = retrievalScores(ranked, [...new Set(t.evidence.map((e) => e.doc))]);
     const at = new Date().toISOString();
     const put = (metric: string, value: number) => store.putScore({ key: recordKey('score', env.pack.manifest.id, s.id, t.id, metric), pack: env.pack.manifest.id, system: s.id, suite: 'usage', taskId: t.id, taskType: t.type, metric, value, at, detail: metric === 'recall@5' ? { ranked } : undefined });
