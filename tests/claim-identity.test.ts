@@ -5,6 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { auditDuplicateClaims, claimPairId, datesApart, eventSpanEnd, monthsApart, yearlessMonthsOf } from '../src/graph/claim-dedupe.js';
+import { applyClaimMerge } from '../src/graph/claim-merge.js';
 import { rekeyState, rekeyWeeklyReadings } from '../src/graph/claim-rekey.js';
 import { refreshClaimState } from '../src/graph/claim-state-store.js';
 import { RawExtractReply } from '../src/graph/llm-extract.js';
@@ -471,6 +472,12 @@ describe('a workspace written before weekly readings had ids', () => {
     await ctx.store.query(`INSERT INTO claim_embeddings (claim_id, model, embedding) VALUES ($1, 'test', $2::${VECTOR_TYPE})`, [old9993, vec]);
     await ctx.store.query(`INSERT INTO claim_embeddings (claim_id, model, embedding) VALUES ($1, 'test', $2::${VECTOR_TYPE})`, [claimId('平台组', s9992), vec]);
 
+    // a merge group of two old claims, each one week: the representative comes first by id, so a step moves it
+    // before its member (and must not then relink the member to the old, gone representative)
+    const s9991 = '平台组本周服务可用性为99.91%。';
+    const [rep, member] = [old9993, claimId('平台组', s9991)].sort();
+    await applyClaimMerge(ctx.store, { claimId: member, canonicalId: rep, reason: '测试', actor: 'test' });
+
     // a second report of week 3 arrives, written as readings are now
     const p = 'raw/docs/周报/平台组/w3b.md';
     fs.writeFileSync(path.join(ctx.dataDir, p), `# 平台组周报 · 第4周（补）\n\n本周服务可用性为99.92%。\n`);
@@ -505,6 +512,9 @@ describe('a workspace written before weekly readings had ids', () => {
     expect(await live(s9993)).toMatchObject([{ id: new9993 }]);
     expect(await ctx.store.query(`SELECT status FROM suggestions WHERE id = $1`, [claimPairId(new9993, owner)])).toEqual([{ status: 'rejected' }]);
     expect(await ctx.store.query(`SELECT relation FROM claim_pair_verdicts WHERE pair_id = $1`, [claimPairId(new9993, owner)])).toEqual([{ relation: 'unrelated' }]);
+    // the group moved with its two claims
+    const successor = (id: string) => (id === old9993 ? new9993 : claimId('平台组', s9991, isoWeekOf(monday(1))));
+    expect(await ctx.store.query(`SELECT canonical_id FROM claims WHERE id = $1`, [successor(member)])).toEqual([{ canonical_id: successor(rep) }]);
     // the vectors went to every claim the old ones became
     expect(await ctx.store.query(`SELECT e.claim_id FROM claim_embeddings e JOIN claims c ON c.id = e.claim_id AND c.tx_to IS NULL WHERE e.model = 'test' ORDER BY e.claim_id`)).toEqual(
       [new9993, claimId('平台组', s9992, isoWeekOf(monday(0))), week3].sort().map((claim_id) => ({ claim_id })),
@@ -515,7 +525,8 @@ describe('a workspace written before weekly readings had ids', () => {
     // and the audit afterwards merges no reading
     const after = await auditDuplicateClaims({ store: ctx.store, embedder: ctx.embedder, config: ctx.config, llm: countingJudge({ pairs: 0 }) });
     expect(after.pendingRekey).toBe(0);
-    expect(await ctx.store.query(`SELECT 1 FROM claims WHERE statement LIKE '平台组本周服务可用性%' AND canonical_id IS NOT NULL AND tx_to IS NULL`)).toHaveLength(0);
+    // (but for the group carried over above)
+    expect(await ctx.store.query(`SELECT id FROM claims WHERE statement LIKE '平台组本周服务可用性%' AND canonical_id IS NOT NULL AND tx_to IS NULL`)).toEqual([{ id: successor(member) }]);
 
     // a re-apply now changes no claim id
     const ids = async () => (await ctx.store.query<{ id: string }>(`SELECT id FROM claims WHERE tx_to IS NULL ORDER BY id`)).map((r) => r.id);

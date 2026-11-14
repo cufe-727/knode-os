@@ -144,6 +144,24 @@ async function carry(q: Queryable, from: string, to: string): Promise<void> {
   await q.query(`UPDATE disputes SET against_id = $2 WHERE against_id = $1`, [from, to]);
 }
 
+/**
+ * The live claim `id` is now: itself, or — when a step moved it whole — the
+ * one claim its evidence went to (the open copies of its closed rows); null
+ * when it split or is gone.
+ */
+async function successorOf(store: Store, id: string): Promise<string | null> {
+  const [self] = await store.query<{ tx_to: string | null }>(`SELECT tx_to FROM claims WHERE id = $1`, [id]);
+  if (self && !self.tx_to) return id;
+  const next = await store.query<{ id: string }>(
+    `SELECT DISTINCT n.target_id AS id FROM evidence o
+     JOIN evidence n ON n.kind = 'claim' AND n.scope_id = o.scope_id AND n.attrs = o.attrs AND n.tx_to IS NULL AND n.target_id <> o.target_id
+     JOIN claims c ON c.id = n.target_id AND c.tx_to IS NULL
+     WHERE o.kind = 'claim' AND o.target_id = $1 AND o.tx_to IS NOT NULL`,
+    [id],
+  );
+  return next.length === 1 ? next[0].id : null;
+}
+
 /** One bounded step: at most `limit` claims, from the cursor on. */
 export async function rekeyWeeklyReadings(store: Store, opts: { limit?: number; actor?: string; onProgress?: (msg: string) => void } = {}): Promise<RekeyStats> {
   const limit = Math.max(1, opts.limit ?? 2000);
@@ -151,15 +169,20 @@ export async function rekeyWeeklyReadings(store: Store, opts: { limit?: number; 
   const state = await rekeyState(store);
   const stats: RekeyStats = { scanned: 0, rekeyed: 0, created: 0, carried: 0, leftDecisions: 0, done: state.done };
   if (state.done) return stats;
-  const candidates = await store.query<{ id: string; subject_id: string; statement: string; canonical_id: string | null }>(
-    `SELECT c.id, c.subject_id, c.statement, c.canonical_id FROM claims c
+  const candidates = await store.query<{ id: string; subject_id: string; statement: string }>(
+    `SELECT c.id, c.subject_id, c.statement FROM claims c
      WHERE c.tx_to IS NULL AND ${RELATIVE_WEEK_SQL} ${state.cursor !== null ? 'AND c.id > $2' : ''}
      ORDER BY c.id LIMIT $1`,
     state.cursor !== null ? [limit, state.cursor] : [limit],
   );
   stats.scanned = candidates.length;
   const fold = foldOptions(store.dataDir);
-  for (const c of candidates) {
+  for (const row of candidates) {
+    // read now: a claim moved earlier in this step may have moved this one's group
+    const [now] = await store.query<{ canonical_id: string | null; tx_to: string | null }>(`SELECT canonical_id, tx_to FROM claims WHERE id = $1`, [row.id]);
+    if (!now || now.tx_to) continue;
+    const linked = now.canonical_id !== null;
+    const c = { ...row, canonical_id: now.canonical_id ? await successorOf(store, now.canonical_id) : null };
     const evidence = await store.query<EvidenceRow>(
       `SELECT id, scope_id, segment_id, weight, extractor, attrs, trust FROM evidence WHERE kind = 'claim' AND target_id = $1 AND tx_to IS NULL`,
       [c.id],
@@ -211,10 +234,10 @@ export async function rekeyWeeklyReadings(store: Store, opts: { limit?: number; 
     if (emptied) {
       try {
         for (const m of members) await unmergeClaim(store, m, { actor });
-        if (c.canonical_id) await unmergeClaim(store, c.id, { actor });
+        if (linked) await unmergeClaim(store, c.id, { actor });
         if (oneToOne) {
           const to = targets[0];
-          if (c.canonical_id) await applyClaimMerge(store, { claimId: to, canonicalId: c.canonical_id, reason: `carried over from ${c.id} (weekly reading identity)`, actor });
+          if (c.canonical_id && c.canonical_id !== to) await applyClaimMerge(store, { claimId: to, canonicalId: c.canonical_id, reason: `carried over from ${c.id} (weekly reading identity)`, actor });
           for (const m of members) if (m !== to) await applyClaimMerge(store, { claimId: m, canonicalId: to, reason: `carried over from ${c.id} (weekly reading identity)`, actor });
           stats.carried++;
         }
