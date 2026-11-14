@@ -148,7 +148,18 @@ export async function followNamesake(
   const roofs = [...new Set([...rules.flatMap((r) => [...r.anchors, ...r.base_anchors]), ...(context?.owners ?? []), ...(context?.documentNames ?? [])])];
   const known = await entitiesNamed(q, roofs);
   const same = (n: string) => known.get(n)?.id ?? `~${nameKey(n).key}`;
-  const chosen = namesakeFor(rules, { codes: codesOf(mention.spellings), baseCodes: codesOf([base.name]), context }, same);
+  // a spelling only one of the name's entities answers to — and that one a parted entity — means it
+  const keys = [...mentionKeys(mention.name, mention.spellings, 'exact')];
+  const members = [family.baseId, ...rules.filter((r) => r.id !== r.base_id).map((r) => r.id)];
+  const carried = keys.length === 0 ? [] : await q.query<{ entity_id: string; alias_key: string }>(
+    `SELECT DISTINCT entity_id, alias_key FROM entity_alias_keys WHERE entity_id = ANY($1::text[]) AND alias_key = ANY($2::text[]) AND kind = 'exact'`,
+    [members, keys],
+  );
+  const carriers = new Map<string, Set<string>>();
+  for (const r of carried) (carriers.get(r.alias_key) ?? carriers.set(r.alias_key, new Set()).get(r.alias_key)!).add(r.entity_id);
+  const alone = new Set([...carriers.values()].filter((c) => c.size === 1).map((c) => [...c][0]).filter((id) => id !== family.baseId));
+  const only = alone.size === 1 ? [...alone][0] : null;
+  const chosen = namesakeFor(rules, { codes: codesOf(mention.spellings), baseCodes: codesOf([base.name]), only, context }, same);
   if (!chosen) return base.id === landed.id ? null : { id: base.id, name: base.name };
   // a parted entity a person merged back resolves to where it was merged
   const row = await rowById(q, chosen.id);

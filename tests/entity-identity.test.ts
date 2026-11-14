@@ -123,6 +123,15 @@ describe('the context of a mention', () => {
     expect(namesakeFor(dram, { codes: codesOf(['DRAM', 'REQ-2025']), context: { documentNames: names('美光') } })?.id).toBe('dram-ddr5');
   });
 
+  it('takes a spelling only one parted entity carries as that entity\'s, after its code and before everything else', () => {
+    const listed = [{ ...rules[0], documents: ['raw/docs/w9.md'] }, rules[1]];
+    expect(namesakeFor(rules, { codes: codesOf(['七部保留期']), only: 'd7' })?.id).toBe('d7');
+    expect(namesakeFor(listed, { codes: codesOf(['七部保留期']), only: 'd7', context: { documentPath: 'raw/docs/w9.md', documentNames: names('二部平台组') } })?.id).toBe('d7');
+    // its code still comes first; an id that is no parted entity of the name decides nothing
+    expect(namesakeFor(rules, { codes: codesOf(['七部保留期', 'D2T1-C2']), only: 'd7' })?.id).toBe('d2');
+    expect(namesakeFor(rules, { codes: codesOf(['保留期']), only: '日志保留天数', context: { documentNames: names('七部平台组') } })?.id).toBe('d7');
+  });
+
   it('follows the split\'s own list of documents, after the code and before anything the document names', () => {
     const listed = [{ ...rules[0], documents: ['raw/docs/w9.md'] }, rules[1]];
     expect(namesakeFor(listed, { codes: codesOf(['日志保留天数']), context: { documentPath: 'raw/docs/w9.md', documentNames: names('七部平台组') } })?.id).toBe('d2');
@@ -260,5 +269,35 @@ describe('write-time resolution of a name that may be two things', () => {
     expect(await to({ name: '池上限' })).toBe('连接池上限');
     // nothing was written by resolving
     expect(await store.query(`SELECT count(*)::int AS n FROM entity_namesakes`)).toEqual([{ n: 1 }]);
+  });
+
+  it('resolves a spelling only the parted entity carries to that entity, context or none', async () => {
+    const ctx = await build('only-one', [
+      ['raw/docs/a.md', `---\ntitle: 团队\nentities:\n  - { name: 二部平台组, type: organization }\n  - { name: 平台组, type: organization }\n  - { name: 连接池上限, type: component, aliases: ["P1-C1", "池上限"] }\n---\n平台组的连接池上限（P1-C1，池上限）。\n`],
+    ]);
+    const store = ctx.store;
+    const id = '连接池上限二部平台组-p2-c1';
+    await store.query(
+      `INSERT INTO entity_namesakes (id, base_id, name, label, anchors, base_anchors, documents, reason)
+       VALUES ($1, '连接池上限', '连接池上限', 'P2-C1', '["二部平台组"]'::jsonb, '["平台组"]'::jsonb, '[]'::jsonb, 'test')`, [id],
+    );
+    // the parted entity, written by a report that gives it a short name of its own
+    write(ctx.dataDir, 'raw/docs/b.md', report('二部平台组', ['廖欣', '赖艳'], '  - { name: 连接池上限, type: component, aliases: ["P2-C1", "二部池上限"] }'));
+    // a memo that uses only that short name: no code, no team
+    write(ctx.dataDir, 'raw/docs/c.md', `---\ntitle: 备忘\nentities:\n  - { name: 二部池上限, type: component }\n---\n二部池上限需要复核。\n`);
+    await sync(ctx, { llmGraph: false });
+    expect(await docsOf(ctx, id)).toEqual(['b.md', 'c.md']);
+    expect(await docsOf(ctx, '连接池上限')).toEqual(['a.md']);
+    const [base] = await store.query<{ aliases: string[] }>(`SELECT aliases FROM entities WHERE id = '连接池上限'`);
+    expect(base.aliases).not.toContain('二部池上限');
+    const to = async (input: Parameters<typeof resolveEntityId>[1]) => (await resolveEntityId(store, input)).id;
+    expect(await to({ name: '二部池上限' })).toBe(id);
+    // even in a document under the other roof: the spelling is that entity's alone
+    expect(await to({ name: '二部池上限', context: { documentNames: new Set(['平台组']) } })).toBe(id);
+    expect(await to({ name: '连接池上限', aliases: ['二部池上限'], context: { documentNames: new Set(['平台组']) } })).toBe(id);
+    // a spelling both carry is still decided by the document, and stays with the base without one
+    expect(await to({ name: '连接池上限' })).toBe('连接池上限');
+    expect(await to({ name: '池上限' })).toBe('连接池上限');
+    expect(await to({ name: '连接池上限', context: { documentNames: new Set(['二部平台组']) } })).toBe(id);
   });
 });

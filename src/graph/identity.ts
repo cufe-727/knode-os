@@ -155,26 +155,32 @@ export function namesakeName(rule: Pick<NamesakeRule, 'name' | 'label' | 'anchor
  * entity that keeps the name. In this order:
  *
  *   1. the one labelled with a code the mention carries;
- *   2. the one the split itself gave this document to — refine saw every
+ *   2. the one that alone carries a spelling of the mention (`only`): an
+ *      alias no other entity of the name has names that entity as a code
+ *      does. The base entity carrying a spelling alone decides nothing — it
+ *      is where every spelling lands until something says otherwise;
+ *   3. the one the split itself gave this document to — refine saw every
  *      document of the name when it decided;
- *   3. the base entity, when the mention carries the code the base entity is
+ *   4. the base entity, when the mention carries the code the base entity is
  *      named by;
- *   4. of those whose code does not differ from a code the mention carries
+ *   5. of those whose code does not differ from a code the mention carries
  *      (a mention with DDR4 is never the entity labelled DDR5, whatever its
  *      document names): the one whose anchors name the mention's own team or
  *      parent, when the base entity's do not;
- *   5. of the same: the one whose anchors the document names most, if it
+ *   6. of the same: the one whose anchors the document names most, if it
  *      names more of them than of the base entity's.
  *
- * In 4 and 5 two entities that score alike decide nothing — the mention
- * stays with the base entity, never with whichever was parted last. `same`
+ * In 5 and 6 two entities that score alike decide nothing — the mention
+ * stays with the base entity, never with whichever was parted last: that is
+ * for a spelling several of them carry. `same`
  * says which entity a name stands for, so that a roof named by an alias, or
  * one merged into another, is still the same roof (resolve.ts gives the
  * graph's answer; by default a name is itself, case aside).
  */
 export function namesakeFor(
   rules: readonly NamesakeRule[],
-  mention: { codes: Codes; baseCodes?: Codes; context?: MentionContext },
+  /** `only`: the id of the one parted entity that carries a spelling of the mention no other entity of the name carries. */
+  mention: { codes: Codes; baseCodes?: Codes; only?: string | null; context?: MentionContext },
   same: (name: string) => string = lower,
 ): NamesakeRule | null {
   if (rules.length === 0) return null;
@@ -185,6 +191,8 @@ export function namesakeFor(
     const label = codeOf(r.label);
     if (label && mention.codes.get(label.shape)?.value === label.value) return base(r);
   }
+  const alone = mention.only ? parted.find((r) => r.id === mention.only) : undefined;
+  if (alone) return alone;
   const here = mention.context?.documentPath;
   if (here) {
     const listed = rules.filter((r) => r.documents?.includes(here));
