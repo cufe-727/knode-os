@@ -9,6 +9,7 @@ import { toDateString, toIso } from '../store/temporal.js';
 import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
 import { applyClaimMerge, reanchorClaimGroups } from './claim-merge.js';
 import { sameValue } from './claim-state.js';
+import { claimId, readingWeek } from './store.js';
 import { packSubjectBatches, SubjectBatch } from './subject-batches.js';
 import { alikeWording, Wording, wordingOf, wordingPrefixLength } from './wording.js';
 
@@ -64,6 +65,8 @@ export interface ClaimDedupeStats {
   series: number;
   /** One attribute, one date, one value: merged without a model. */
   sameValue: number;
+  /** Pairs of weekly readings of other weeks (keyedWeek): two claims by their identity, never judged or stored. */
+  readingsApart: number;
   judged: number;
   /** Pairs that needed the judge but did not fit under review.claimMergeMaxJudgedPerRun: left for a later run. */
   deferred: number;
@@ -83,6 +86,8 @@ export type ClaimRelation = 'same' | 'contains' | 'conflict' | 'different_time' 
 
 interface ClaimLite {
   id: string;
+  /** Its own subject (claimId's), before entity merges; `subject` is the canonical one. */
+  subject_id: string;
   subject: string;
   object: string | null;
   subject_name: string;
@@ -142,6 +147,33 @@ export function claimPairId(a: string, b: string): string {
 /** Letters and digits only, NFKC-folded and lower-cased: "…增长 20%。" and "…增长20％" meet. */
 export function statementKey(s: string): string {
   return s.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+/**
+ * The ISO week a claim is a reading of (readingWeek in src/graph/store.ts),
+ * when its id carries it; null for every other claim, a claim written before
+ * readings were keyed included. Two readings of other weeks are two claims by
+ * construction: the audit never pairs them, so a statement repeated k weeks
+ * costs no k(k−1)/2 verdicts, and no rule or judge can merge them.
+ */
+const keyedWeeks = new WeakMap<object, string | null>();
+export function keyedWeek(c: Pick<ClaimLite, 'id' | 'subject_id' | 'statement' | 'attribute' | 'value_num' | 'date_source' | 'event_at' | 'valid_from' | 'valid_to'>): string | null {
+  const memo = keyedWeeks.get(c);
+  if (memo !== undefined) return memo;
+  const week = readingWeek({
+    statement: c.statement, attribute: c.attribute, valueNum: c.value_num, dateSource: c.date_source,
+    eventAt: c.event_at, validFrom: c.valid_from, validTo: c.valid_to,
+  });
+  const keyed = week && claimId(c.subject_id, c.statement, week) === c.id ? week : null;
+  keyedWeeks.set(c, keyed);
+  return keyed;
+}
+
+/** Two readings of other weeks: settled apart by their identity (keyedWeek). */
+function readingsApart(a: ClaimLite, b: ClaimLite): boolean {
+  const wa = keyedWeek(a);
+  const wb = keyedWeek(b);
+  return Boolean(wa && wb && wa !== wb);
 }
 
 const UNIT = '万亿|亿美元|亿港元|亿元|亿|万吨|万元|万|千万|百万|个百分点|pct|bp|%|倍|美元|港元|元|吨|gwh|gw|mwh|mw';
@@ -362,7 +394,7 @@ async function textCandidates(
       const sharing = indexes.get(block) ?? indexes.set(block, indexBlock(block, read, opts.words)).get(block)!;
       for (const i of sharing(f)) {
         const c = block[i];
-        if (c.id === f.id) continue;
+        if (c.id === f.id || readingsApart(f, c)) continue;
         if (read.key(c) === fKey) {
           propose(f, c, 'identical');
           continue;
@@ -660,7 +692,7 @@ export function reportedApart(
 export const CLAIMS_PER_BATCH = 40_000;
 
 /** Every representative claim that takes part, with its canonical subject / object; narrowed by the caller. */
-const CLAIM_SELECT = `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(oe.canonical_id, c.object_id) AS object,
+const CLAIM_SELECT = `SELECT c.id, c.subject_id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(oe.canonical_id, c.object_id) AS object,
             se.name AS subject_name, c.statement, c.status, c.kind, c.type, c.valid_from, c.valid_to, c.event_at,
             c.evidence_count, (SELECT count(*)::int FROM claims m WHERE m.canonical_id = c.id) AS members,
             c.tx_from, s.key AS source_path, c.chunk_id,
@@ -745,7 +777,7 @@ export async function auditDuplicateClaims(
 ): Promise<ClaimDedupeStats> {
   const { store, config } = ctx;
   const progress = opts.onProgress ?? (() => {});
-  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, series: 0, sameValue: 0, judged: 0, deferred: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0, leftToPerson: 0 };
+  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, series: 0, sameValue: 0, readingsApart: 0, judged: 0, deferred: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0, leftToPerson: 0 };
   const mode = config.review?.claimMerge ?? 'auto';
   if (mode === 'off') return stats;
   const minConfidence = config.review?.claimMergeMinConfidence ?? 0.9;
@@ -944,9 +976,14 @@ export async function auditDuplicateClaims(
       await pause();
       if (decided.has(pair.id)) continue;
       const { a, b } = pair;
-      if (pair.why.includes('identical')) {
-        // one wording of two times — a weekly report's "本周服务可用性为99.92%" in week 3
-        // and in week 17 (claimId's reading day) — is two readings, not one claim twice
+      // readings of other weeks are two claims by construction, however they came up (keyedWeek)
+      if (readingsApart(a, b)) {
+        stats.readingsApart++;
+        continue;
+      }
+      // one wording is one claim only where neither side is a weekly reading: a reading and an
+      // older claim of the same words (several weeks folded, or dated otherwise) go to the rules below
+      if (pair.why.includes('identical') && (opts.stateRules === false || (!keyedWeek(a) && !keyedWeek(b)))) {
         if (opts.stateRules !== false && datesApart(a, b)) {
           outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '同一说法、不同时点', model: 'rule' } });
           stats.differentTime++;

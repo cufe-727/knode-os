@@ -161,10 +161,10 @@ describe('weekly readings of one measure', () => {
     expect(judged.pairs).toBe(0);
     expect(stats.merged).toBe(0);
     expect(stats.identical).toBe(0);
-    const [{ reason }] = await ctx.store.query<{ reason: string }>(
-      `SELECT v.reason FROM claim_pair_verdicts v JOIN claims a ON a.id = v.a_id JOIN claims b ON b.id = v.b_id WHERE a.statement = b.statement`,
-    );
-    expect(reason).toBe('同一说法、不同时点');
+    // two readings of other weeks are never even a pair: no verdict is stored for them
+    expect(await ctx.store.query(
+      `SELECT 1 FROM claim_pair_verdicts v JOIN claims a ON a.id = v.a_id JOIN claims b ON b.id = v.b_id WHERE a.statement = b.statement`,
+    )).toHaveLength(0);
 
     // the history holds all four weeks, the last one current
     await refreshClaimState(ctx.store);
@@ -271,4 +271,63 @@ describe('the duplicate-claim audit before the judge', () => {
     expect(stats.differentTime).toBe(2);
     expect(judged.pairs).toBe(1);
   });
+});
+
+describe('weekly readings worded alike, in every shape of date', () => {
+  const opened: AppContext[] = [];
+  afterAll(async () => {
+    for (const ctx of opened) {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+  const VALUES = [99.92, 99.91, 99.92, 99.93, 99.92];
+  // the shapes an extraction may give "本周" in: a start without an end, a month, an ISO week
+  const shapes: Record<string, (k: number) => { startDate?: string; endDate?: string; eventDate?: string }> = {
+    'open windows': (k) => ({ startDate: monday(k) }),
+    'monthly event dates': (k) => ({ eventDate: `2025-0${k + 1}` }),
+    'week event dates': (k) => ({ eventDate: `2025-W${36 + k}` }),
+  };
+
+  for (const [shape, dates] of Object.entries(shapes)) {
+    it(`stay apart with ${shape}, whatever claimMerge says`, async () => {
+      const dataDir = path.join(tmp, `shape-${shape.replace(/\s+/g, '-')}`);
+      initDataDir(dataDir);
+      const docs = new Map<string, { text: string; reply: RawExtractReply }>();
+      VALUES.forEach((v, k) => docs.set(`raw/docs/周报/平台组/s${k + 1}.md`, {
+        text: `# 平台组周报 · 第${k + 2}周\n\n本周服务可用性为${v}%。\n`,
+        reply: {
+          entities: [{ name: '平台组', type: 'organization', aliases: [] }],
+          relations: [],
+          claims: [{ subject: '平台组', statement: `平台组本周服务可用性为${v}%。`, type: 'other', status: 'fact', kind: 'fact', attribute: '服务可用性', value: v, unit: '%', ...dates(k) }],
+        },
+      }));
+      for (const [p, d] of docs) {
+        fs.mkdirSync(path.dirname(path.join(dataDir, p)), { recursive: true });
+        fs.writeFileSync(path.join(dataDir, p), d.text);
+      }
+      const ctx = await createContext(dataDir);
+      opened.push(ctx);
+      await sync(ctx, { llmGraph: false });
+      for (const d of await ctx.store.query<{ id: string }>(`SELECT id FROM documents WHERE root = 'docs'`)) await enqueueTier1(ctx.store, d.id);
+      (ctx.config.extraction as { entityLlm?: unknown }).entityLlm = undefined;
+      for (let i = 0; i < 10; i++) if ((await runTier1Pass(ctx.store, ctx.config, stubExtractor(docs), { batchSize: 64 })).queued === 0) break;
+      const ids = async () => (await ctx.store.query<{ id: string }>(
+        `SELECT id FROM claims WHERE subject_id = '平台组' AND statement = '平台组本周服务可用性为99.92%。' AND tx_to IS NULL AND canonical_id IS NULL`,
+      )).map((r) => r.id);
+      expect(await ids()).toHaveLength(3);
+      for (const mode of ['suggest', 'auto'] as const) {
+        const judged = { pairs: 0 };
+        const config = { ...ctx.config, review: { ...ctx.config.review, claimMerge: mode } };
+        await auditDuplicateClaims({ store: ctx.store, embedder: ctx.embedder, config, llm: countingJudge(judged) });
+        expect(await ids(), mode).toHaveLength(3);
+        // nothing between the three is stored as the same claim, and no judge is asked about them
+        const same = await ctx.store.query(
+          `SELECT 1 FROM claim_pair_verdicts v JOIN claims a ON a.id = v.a_id JOIN claims b ON b.id = v.b_id
+           WHERE a.statement = b.statement AND v.relation IN ('same', 'contains')`,
+        );
+        expect(same, mode).toHaveLength(0);
+      }
+    });
+  }
 });
