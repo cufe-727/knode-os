@@ -14,7 +14,7 @@ import {
 import type { PlannedCitation } from '../graph/citations.js';
 import { entityTypeIds, loadOntology, normalizePredicate, Ontology, relationSpec } from '../graph/ontology.js';
 import { codeOf, Codes, codesConflict, codesOf, MentionContext } from '../graph/identity.js';
-import { NamesakeIndex, resolutionMode, resolveEntityId, ResolvedEntity } from '../graph/resolve.js';
+import { identityMode, NamesakeIndex, resolutionMode, resolveEntityId, ResolvedEntity } from '../graph/resolve.js';
 import { EntityCorrections, readEntityCorrections, refusedKeys, refuses } from '../graph/corrections.js';
 import { entityKeyKinds, KeyKind, mentionKeys, typesCompatible } from '../graph/normalize.js';
 import { ReviewResolution } from '../config.js';
@@ -202,7 +202,7 @@ export class ScopeWriter {
           this.q,
           { name, type: e.type, aliases: e.aliases, sameAs: o.sameAs ?? e.sameAs ?? null, context: o.context },
           this.resolveCache,
-          { mode: this.resolution, corrections: this.corrections, namesakes: this.namesakes },
+          { mode: this.resolution, corrections: this.corrections, namesakes: this.namesakes, identity: identityMode(this.dataDir) },
         );
       }
       id = resolved.id;

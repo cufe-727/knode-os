@@ -58,6 +58,24 @@ describe('one entity parted by the codes its documents carry', () => {
       ['T1-C2', ['平台组'], ['a1', 'a2', 'a3', 'a4']],
     ]);
     expect(split.rest.map((d) => d.id)).toEqual(['x1', 'x2']);
+    // the first division's documents carry no code at all: they stay, under the roof they share
+    const uncoded = [...team('a', '平台组', '罗芳', 'T1-C2').map((d) => ({ ...d, codes: codesOf([]) })), ...team('b', '二部平台组', '廖欣', 'D2T1-C2'), ...team('c', '三部平台组', '方杰', 'D3T1-C2')];
+    const kept = codedClusters(uncoded, typeOf)!;
+    expect(kept.parts.map((p) => p.code.value)).toEqual(['D2T1-C2', 'D3T1-C2']);
+    expect(kept.rest.map((d) => d.id)).toEqual(['a1', 'a2', 'a3', 'a4']);
+    expect(kept.restAnchors).toEqual(['平台组']);
+  });
+
+  it('parts nothing when the codes\' roofs account for a small part of the documents', () => {
+    // a hub: two kinds seen twice each beside organizations of their own, and twenty documents that name neither
+    const hub = [
+      doc('h1', ['DRAM', 'DDR4'], ['平台组']), doc('h2', ['DRAM', 'DDR4'], ['平台组']),
+      doc('h3', ['DRAM', 'DDR5'], ['二部平台组']), doc('h4', ['DRAM', 'DDR5'], ['二部平台组']),
+      ...Array.from({ length: 20 }, (_, i) => doc(`n${i}`, ['DRAM'], i % 2 ? ['英伟达'] : ['安全团队', '罗芳'])),
+    ];
+    expect(codedClusters(hub, typeOf)).toBeNull();
+    // the same four with nothing else: the codes are all there is to go by
+    expect(codedClusters(hub.slice(0, 4), typeOf)?.parts).toHaveLength(2);
   });
 
   it('leaves alone codes that share their context, a code in one document, and a single code', () => {

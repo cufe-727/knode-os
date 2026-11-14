@@ -441,13 +441,13 @@ async function suggestAliasMerges(store: Store, stats: EntityContextStats): Prom
 /* --------------------------------- namesakes --------------------------------- */
 
 /** Entity types that tell one person's context from another's. */
-const CONTEXT_TYPES = ['person', 'organization', 'project', 'product', 'component'];
+export const CONTEXT_TYPES = ['person', 'organization', 'project', 'product', 'component'];
 /** Types that may anchor a context: the team, company or project a person belongs to. */
 const ANCHOR_TYPES = new Set(ANCHOR_TYPE_LIST);
 /** Documents a person name needs before its contexts are compared. */
-const MIN_DOCS = 6;
+export const MIN_DOCS = 6;
 /** The most documents of one name compared (a celebrity in a news corpus is one person in many contexts). */
-const MAX_DOCS = 600;
+export const MAX_DOCS = 600;
 
 export interface NamesakeDoc {
   id: string;
@@ -665,6 +665,8 @@ async function splitNamesakes(store: Store, config: KnodeConfig | undefined, sta
 
 /** Documents a code needs before it may part a name. */
 const CODE_MIN_DOCS = 2;
+/** The share of an entity's documents the codes' roofs must account for before they part it. */
+const CODE_COVERAGE = 0.8;
 
 export interface CodedDoc extends NamesakeDoc {
   /** The codes the entity's mention in this document carries (identity.ts, codesOf). */
@@ -695,8 +697,14 @@ export interface CodedSplit {
  * where it is: kinds listed as aliases (H100 and H200 under 芯片) and a code
  * written short and long share their context. A document that carries none
  * of the codes goes with the one code whose anchor it names, when it names
- * no other's; every other document stays. No test of dates: a code is not a
- * person, who may change teams. Exported for tests.
+ * no other's; every other document stays. And the roofs must account for the
+ * entity: CODE_COVERAGE of its documents go with a code, or stay under a roof
+ * of their own that no code's documents name. Two codes seen twice each in a
+ * hub of hundreds of documents (DRAM: DDR4, DDR5) find organizations of their
+ * own by chance, but most of the hub's documents name neither side's or both
+ * (finance, 2026-11-15: without this test 10 names would have parted). No
+ * test of dates: a code is not a person, who may change teams. Exported for
+ * tests.
  */
 export function codedClusters(docs: CodedDoc[], typeOf: (id: string) => string | undefined): CodedSplit | null {
   const byValue = new Map<string, { code: Code; docs: CodedDoc[] }>();
@@ -732,7 +740,10 @@ export function codedClusters(docs: CodedDoc[], typeOf: (id: string) => string |
       else rest.push(d);
     }
     parts.sort((a, b) => b.docs.length - a.docs.length || a.code.value.localeCompare(b.code.value));
-    const split: CodedSplit = { parts, rest, restAnchors: anchorsOf(rest, parts.flatMap((p) => p.docs)) };
+    const restAnchors = anchorsOf(rest, parts.flatMap((p) => p.docs));
+    const accounted = docs.length - rest.filter((d) => !restAnchors.some((a) => d.context.has(a))).length;
+    if (accounted < CODE_COVERAGE * docs.length) continue;
+    const split: CodedSplit = { parts, rest, restAnchors };
     if (!best || split.parts.length > best.parts.length) best = split;
   }
   return best;
@@ -836,8 +847,11 @@ export async function resolveEntityContext(store: Store, opts: { config?: KnodeC
   const stats: EntityContextStats = { merged: 0, suggested: 0, split: 0, replayed: 0 };
   await mergeRenames(store, stats, progress);
   await suggestAliasMerges(store, stats);
-  await splitNamesakes(store, opts.config, stats, progress);
-  await splitCoded(store, opts.config, stats, progress);
+  // review.identity 'name': nothing new is parted; what was parted before stays, and stays decided
+  if (opts.config?.review?.identity !== 'name') {
+    await splitNamesakes(store, opts.config, stats, progress);
+    await splitCoded(store, opts.config, stats, progress);
+  }
   await decidePartedPairs(store);
   return stats;
 }

@@ -18,9 +18,12 @@ import { sync } from '../src/ingest/sync.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-identity-'));
 let ctx: AppContext | undefined;
+let byName: AppContext | undefined;
 afterAll(async () => {
-  await ctx?.datasources.closeAll();
-  await ctx?.store.close();
+  for (const c of [ctx, byName]) {
+    await c?.datasources.closeAll();
+    await c?.store.close();
+  }
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -209,5 +212,22 @@ relations:
     expect(await store.query(`SELECT id FROM entity_namesakes WHERE base_id = '芯片'`)).toEqual([]);
     expect(await docsOf('腾讯')).toEqual(['e1.md', 'e2.md']);
     expect(await store.query(`SELECT id FROM entities WHERE id LIKE '腾讯（%' OR id LIKE '芯片（%'`)).toEqual([]);
+  });
+
+  it('parts nothing where review.identity is "name"', async () => {
+    const dataDir = path.join(tmp, 'ws-name');
+    const pool = (code: string) => `  - { name: 连接池上限, type: component, aliases: [${code}] }`;
+    for (const k of [1, 2, 3]) write(dataDir, `raw/docs/a${k}.md`, report('平台组', ['罗芳', '方杰'], pool('P1-C1')));
+    write(dataDir, 'raw/docs/b1.md', report('二部平台组', ['廖欣', '赖艳'], pool('P2-C1')));
+    initDataDir(dataDir);
+    const config = loadConfig(dataDir);
+    config.ingest.concurrency = 1;
+    config.review.identity = 'name';
+    saveConfig(dataDir, config);
+    byName = await createContext(dataDir);
+    await sync(byName, { llmGraph: false });
+    expect(await byName.store.query(`SELECT id FROM entity_namesakes`)).toEqual([]);
+    const docs = await byName.store.query<{ n: number }>(`SELECT count(DISTINCT document_id)::int AS n FROM entity_mentions WHERE entity_id = '连接池上限'`);
+    expect(docs[0].n).toBe(4);
   });
 });

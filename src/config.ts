@@ -1014,6 +1014,7 @@ export interface GraphConfig {
 }
 
 export type ReviewResolution = 'exact' | 'suffix';
+export type ReviewIdentity = 'context' | 'name';
 export type ReviewLlmMode = 'off' | 'suggest' | 'auto';
 export type ReviewExternal = 'off' | 'verify' | 'research';
 
@@ -1072,6 +1073,16 @@ export interface ReviewConfig {
    * suggestion a person accepts.
    */
   resolution: ReviewResolution;
+  /**
+   * Whether one name may be several things. 'context' (the default): a
+   * mention whose code differs from the entity's under another roof gets an
+   * entity of its own, and refine parts people of one name and things of one
+   * name with different codes, re-applying their documents from the sidecars
+   * (src/graph/identity.ts, entity-context.ts). 'name': nothing new is
+   * parted, at write time or by refine; names already parted keep resolving
+   * to their entities.
+   */
+  identity?: ReviewIdentity;
   /** LLM judge over duplicate-entity candidates: off / annotate suggestions with a verdict / also merge above autoMergeMinConfidence. */
   llmJudge: ReviewLlmMode;
   /** Candidates the judge rejects with at least this confidence are dropped (and remembered) instead of filed. */

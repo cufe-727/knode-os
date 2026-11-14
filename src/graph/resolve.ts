@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { CONFIG_FILE, loadConfig, ReviewResolution } from '../config.js';
+import { CONFIG_FILE, loadConfig, ReviewIdentity, ReviewResolution } from '../config.js';
 import { Queryable } from '../store/migrations.js';
 import { EntityCorrections, refusedKeys, refuses } from './corrections.js';
 import { ANCHOR_TYPES, Code, codesKey, codesOf, conflictingCode, MentionContext, namesakeFor, namesakeName, NamesakeRule } from './identity.js';
@@ -201,8 +201,9 @@ export async function resolveEntityId(
   /**
    * `corrections`: a person's (src/graph/corrections.ts) — a spelling an entity refuses never resolves onto it.
    * `namesakes`: the parted names, read once by a caller that resolves many mentions.
+   * `identity`: 'name' parts no name here (review.identity); one already parted is still followed.
    */
-  opts: { mode?: ReviewResolution; corrections?: EntityCorrections; namesakes?: NamesakeIndex } = {},
+  opts: { mode?: ReviewResolution; corrections?: EntityCorrections; namesakes?: NamesakeIndex; identity?: ReviewIdentity } = {},
 ): Promise<ResolvedEntity> {
   const mode = opts.mode ?? 'exact';
   const name = input.name.trim();
@@ -234,7 +235,7 @@ export async function resolveEntityId(
     const chosen = namesakeFor(rules, { codes, context: input.context });
     if (chosen) return follow(chosen);
     const code = input.context ? conflictingCode(codes, codesOf([landed.name, ...(landed.aliases ?? [])])) : null;
-    if (code && input.context) {
+    if (code && input.context && opts.identity !== 'name') {
       const base = family && family.baseId !== landed.id ? (await rowById(q, family.baseId)) ?? landed : landed;
       const rule = await partByCode(q, base, landed, code, name, input.context, rules);
       if (rule) {
@@ -364,10 +365,9 @@ export async function entitiesNamed(q: Queryable, names: readonly string[]): Pro
   return out;
 }
 
-const modeCache = new Map<string, { stamp: string; mode: ReviewResolution }>();
+const modeCache = new Map<string, { stamp: string; mode: ReviewResolution; identity: ReviewIdentity }>();
 
-/** `review.resolution` for a data dir, re-read when knode.config.json changes. */
-export function resolutionMode(dataDir: string): ReviewResolution {
+function reviewModes(dataDir: string): { mode: ReviewResolution; identity: ReviewIdentity } {
   const file = path.join(dataDir, CONFIG_FILE);
   let stamp = 'none';
   try {
@@ -377,14 +377,27 @@ export function resolutionMode(dataDir: string): ReviewResolution {
     // no config file: defaults apply
   }
   const hit = modeCache.get(dataDir);
-  if (hit && hit.stamp === stamp) return hit.mode;
+  if (hit && hit.stamp === stamp) return hit;
   let mode: ReviewResolution = 'exact';
+  let identity: ReviewIdentity = 'context';
   try {
     const cfg = loadConfig(dataDir);
     mode = cfg.review?.resolution === 'suffix' ? 'suffix' : 'exact';
+    identity = cfg.review?.identity === 'name' ? 'name' : 'context';
   } catch {
     mode = 'exact';
   }
-  modeCache.set(dataDir, { stamp, mode });
-  return mode;
+  const entry = { stamp, mode, identity };
+  modeCache.set(dataDir, entry);
+  return entry;
+}
+
+/** `review.resolution` for a data dir, re-read when knode.config.json changes. */
+export function resolutionMode(dataDir: string): ReviewResolution {
+  return reviewModes(dataDir).mode;
+}
+
+/** `review.identity` for a data dir ('context' unless set to 'name'), re-read when knode.config.json changes. */
+export function identityMode(dataDir: string): ReviewIdentity {
+  return reviewModes(dataDir).identity;
 }
