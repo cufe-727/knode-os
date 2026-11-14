@@ -164,15 +164,18 @@ export async function scoreIndex(q: Queryable, gold: GoldAlias[]): Promise<Index
   const rules = await q.query<{ id: string; base_id: string; label: string; anchors: string[]; base_anchors: string[] }>(
     `SELECT n.id, n.base_id, n.label, n.anchors, n.base_anchors FROM entity_namesakes n JOIN entities e ON e.id = n.id AND e.tx_to IS NULL`,
   ).catch(() => []);
+  // a row for the base entity itself records what it kept; it is no parted entity
+  const partedRules = rules.filter((r) => r.id !== r.base_id);
   const roofs = new Map<string, string[]>();
-  for (const r of rules) {
+  for (const r of rules) if (r.id === r.base_id) roofs.set(`entity:${r.id}`, r.anchors);
+  for (const r of partedRules) {
     roofs.set(`entity:${r.id}`, r.anchors);
     if (!roofs.has(`entity:${r.base_id}`)) roofs.set(`entity:${r.base_id}`, r.base_anchors);
   }
   const roofed = units.map((u) => (roofs.get(u.id)?.length ? { ...u, text: `${u.text}\ncontext: ${roofs.get(u.id)!.join(', ')}` } : u));
   return {
     entities: entities.length,
-    parted: { coded: rules.filter((r) => codeOf(r.label)).length, people: rules.filter((r) => !codeOf(r.label)).length },
+    parted: { coded: partedRules.filter((r) => codeOf(r.label)).length, people: partedRules.filter((r) => !codeOf(r.label)).length },
     pack: entityResolution(gold, units),
     packWithRoofs: entityResolution(gold, roofed),
     mentions: bcubed(items),
