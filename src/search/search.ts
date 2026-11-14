@@ -988,10 +988,16 @@ export function cutWithSources<T>(ordered: T[], k: number, places: number, isGen
 }
 
 /**
- * The stages after fusion: the optional rerank of the fused head, the cut to
- * `k` that keeps generated pages to their share, and the current state of the
- * claims each hit rests on. `generated` is the chunks of generated pages among
- * `ranked`, looked up when the caller does not know them.
+ * The stages after fusion: the optional rerank, the cut to `k` that keeps
+ * generated pages to their share, and the current state of the claims each
+ * hit rests on. `generated` is the chunks of generated pages among `ranked`,
+ * looked up when the caller does not know them.
+ *
+ * The reranker reads the candidates the cut can take: its `candidates` are
+ * chosen as the cut chooses, pages in their share of them and sources for the
+ * rest. Sent the fused head as it stood, it read thirty pages where pages
+ * lead, and the cut then kept two of them and filled the places with sources
+ * no reranker had read.
  */
 async function finish(
   store: Store,
@@ -1002,15 +1008,24 @@ async function finish(
   channels: ExplainedSearch['channels'],
   generated?: Set<string>,
 ): Promise<SearchResult[]> {
+  const share = opts.generatedShare ?? GENERATED_SHARE;
+  const places = generatedPlaces(k, share);
+  const known = places >= k || ranked.length === 0 ? null : generated ?? (await generatedAmong(store, ranked).catch(() => null));
+  const pages = known && known.size > 0 ? known : null;
+  const isPage = (r: SearchResult) => pages!.has(r.chunkId);
   let ordered = ranked;
   if (rerankEnabled(opts.rerank)) {
-    const r = await rerankResults(opts.rerank, query, ranked);
+    let candidates = ranked;
+    if (pages) {
+      const n = Math.max(1, Math.floor(opts.rerank.candidates || 30));
+      const head = new Set(cutWithSources(ranked, n, generatedPlaces(n, share), isPage));
+      candidates = [...ranked.filter((r) => head.has(r)), ...ranked.filter((r) => !head.has(r))];
+    }
+    const r = await rerankResults(opts.rerank, query, candidates);
     channels.rerank = { hits: r.sent, ms: r.ms, ...(r.error ? { error: r.error } : {}) };
     ordered = r.results;
   }
-  const places = generatedPlaces(k, opts.generatedShare ?? GENERATED_SHARE);
-  const pages = places >= k || ordered.length === 0 ? null : generated ?? (await generatedAmong(store, ordered).catch(() => null));
-  const results = pages && pages.size > 0 ? cutWithSources(ordered, k, places, (r) => pages.has(r.chunkId)) : ordered.slice(0, k);
+  const results = pages ? cutWithSources(ordered, k, places, isPage) : ordered.slice(0, k);
   if (opts.current === false || results.length === 0) return results;
   try {
     return await attachCurrent(store, results);

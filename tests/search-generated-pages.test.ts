@@ -1,9 +1,12 @@
 import fs from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { defaultRerankConfig } from '../src/config.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { cutWithSources, GENERATED_SHARE, search, SearchMode } from '../src/search/search.js';
+import { cutWithSources, GENERATED_SHARE, search, searchExplained, SearchMode } from '../src/search/search.js';
 import { Store, toVectorLiteral } from '../src/store/db.js';
 import { MATCH_INDEXES } from '../src/store/grams.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
@@ -167,6 +170,45 @@ describe('generated pages in search results', () => {
   it('holds a search for one result to a source', async () => {
     expect(sidesOf(await ids('hybrid', { k: 1 })).sources).toHaveLength(1);
     expect(sidesOf(await ids('hybrid', { k: 4 })).pages).toHaveLength(1);
+  });
+});
+
+describe('the rerank stage with generated pages', () => {
+  let server: http.Server;
+  let base = '';
+  let sent: string[] = [];
+
+  beforeAll(async () => {
+    server = http.createServer((req, res) => {
+      let raw = '';
+      req.on('data', (c) => (raw += c));
+      req.on('end', () => {
+        sent = (JSON.parse(raw) as { texts: string[] }).texts;
+        // a page reads best of all, then the later week's report
+        const scored = sent.map((t, index) => ({ index, score: /Week (\d+) report/.test(t) ? Number(/Week (\d+) report/.exec(t)![1]) : t.includes('My review') ? 0 : 100 }));
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(scored));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+  afterAll(() => new Promise<void>((resolve) => server.close(() => resolve())));
+
+  it('sends the reranker the sources the cut will take, not a head of pages', async () => {
+    // the fused head is pages: thirty of them were reranked, and the cut then took two and six sources no reranker had read
+    const { results, channels } = await searchExplained(store, embedder, QUESTION, {
+      k: 8, track: false, current: false, rerank: { ...defaultRerankConfig(), enabled: true, url: base, candidates: 12 },
+    });
+    expect(channels.rerank).toMatchObject({ hits: 12 });
+    // twelve candidates: a quarter pages, the rest sources — every source that holds the words
+    expect(sent.filter((t) => t.includes('what the sources say') || t.includes('entity pages A to Z'))).toHaveLength(3);
+    expect(sent.filter((t) => / report of the platform team/.test(t))).toHaveLength(8);
+    // every result was read by the reranker, and the sources come in its order
+    expect(results.every((r) => typeof r.signals.rerank === 'number')).toBe(true);
+    // the reranker puts the three pages first: two keep their places, and the sources follow in its order
+    const found = results.map((r) => r.chunkId);
+    expect(sidesOf(found.slice(0, 2)).pages).toHaveLength(2);
+    expect(found.slice(2)).toEqual(['s8', 's7', 's6', 's5', 's4', 's3']);
   });
 });
 
