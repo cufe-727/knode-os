@@ -12,6 +12,7 @@ import { claimId, isoWeekOf, readingWeek } from '../src/graph/store.js';
 import { enqueueTier1, runTier1Pass } from '../src/graph/tier1.js';
 import { sync } from '../src/ingest/sync.js';
 import { foldOptions } from '../src/lineage/scope.js';
+import { VECTOR_TYPE } from '../src/store/db.js';
 import { recountAll } from '../src/lineage/fold.js';
 import { LlmClient } from '../src/llm/client.js';
 import { markSupersededClaims } from '../src/wiki/refine.js';
@@ -465,6 +466,10 @@ describe('a workspace written before weekly readings had ids', () => {
       `INSERT INTO claim_pair_verdicts (pair_id, a_id, b_id, relation, confidence, reason, model) VALUES ($1, $2, $3, 'unrelated', 0.9, '测试', 'judge')`,
       [claimPairId(old9993, owner), old9993, owner],
     );
+    // and its vector, paid once, embeds "subject：statement": the same for every week of it
+    const vec = `[${Array.from({ length: ctx.store.embeddingDim }, (_, i) => (i === 0 ? 1 : 0)).join(',')}]`;
+    await ctx.store.query(`INSERT INTO claim_embeddings (claim_id, model, embedding) VALUES ($1, 'test', $2::${VECTOR_TYPE})`, [old9993, vec]);
+    await ctx.store.query(`INSERT INTO claim_embeddings (claim_id, model, embedding) VALUES ($1, 'test', $2::${VECTOR_TYPE})`, [claimId('平台组', s9992), vec]);
 
     // a second report of week 3 arrives, written as readings are now
     const p = 'raw/docs/周报/平台组/w3b.md';
@@ -500,6 +505,10 @@ describe('a workspace written before weekly readings had ids', () => {
     expect(await live(s9993)).toMatchObject([{ id: new9993 }]);
     expect(await ctx.store.query(`SELECT status FROM suggestions WHERE id = $1`, [claimPairId(new9993, owner)])).toEqual([{ status: 'rejected' }]);
     expect(await ctx.store.query(`SELECT relation FROM claim_pair_verdicts WHERE pair_id = $1`, [claimPairId(new9993, owner)])).toEqual([{ relation: 'unrelated' }]);
+    // the vectors went to every claim the old ones became
+    expect(await ctx.store.query(`SELECT e.claim_id FROM claim_embeddings e JOIN claims c ON c.id = e.claim_id AND c.tx_to IS NULL WHERE e.model = 'test' ORDER BY e.claim_id`)).toEqual(
+      [new9993, claimId('平台组', s9992, isoWeekOf(monday(0))), week3].sort().map((claim_id) => ({ claim_id })),
+    );
     // the restated owner claim kept its id
     expect(await ctx.store.query(`SELECT id FROM claims WHERE id = $1 AND tx_to IS NULL`, [owner])).toHaveLength(1);
 
