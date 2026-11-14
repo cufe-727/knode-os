@@ -463,6 +463,11 @@ export interface NamesakeCluster {
   anchors: string[];
 }
 
+/** An organization before a project: the first anchor names the parted entity, and a team says whose it is better than one of the team's projects. */
+function roofFirst(typeOf: (id: string) => string | undefined, x: string, y: string): number {
+  return Number(typeOf(y) === 'organization') - Number(typeOf(x) === 'organization');
+}
+
 function jaccard(a: Set<string>, b: Set<string>): number {
   let shared = 0;
   for (const x of a) if (b.has(x)) shared++;
@@ -527,7 +532,7 @@ export function namesakeClusters(docs: NamesakeDoc[], typeOf: (id: string) => st
   const anchorsOf = (own: NamesakeDoc[], other: NamesakeDoc[]) =>
     [...union(own)]
       .filter((id) => ANCHOR_TYPES.has(typeOf(id) ?? '') && share(own, id) >= 0.6 && share(other, id) <= 0.05)
-      .sort((x, y) => share(own, y) - share(own, x) || x.localeCompare(y));
+      .sort((x, y) => roofFirst(typeOf, x, y) || share(own, y) - share(own, x) || x.localeCompare(y));
   const anchorsA = anchorsOf(a, b);
   const anchorsB = anchorsOf(b, a);
   if (anchorsA.length === 0 || anchorsB.length === 0) return null;
@@ -769,7 +774,7 @@ export function codedClusters(docs: CodedDoc[], typeOf: (id: string) => string |
   const anchorsOf = (own: CodedDoc[], other: CodedDoc[]) =>
     [...ids(own)]
       .filter((id) => ANCHOR_TYPES.has(typeOf(id) ?? '') && share(own, id) >= 0.6 && share(other, id) <= 0.05)
-      .sort((x, y) => share(own, y) - share(own, x) || x.localeCompare(y));
+      .sort((x, y) => roofFirst(typeOf, x, y) || share(own, y) - share(own, x) || x.localeCompare(y));
   let best: CodedSplit | null = null;
   for (const members of groupBy(all.map((g, i) => ({ g, i })), (x) => String(find(x.i))).values()) {
     if (members.length < 2) continue;
