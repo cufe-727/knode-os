@@ -267,10 +267,15 @@ export function relationId(sourceId: string, type: string, targetId: string): st
   return crypto.createHash('sha256').update(`${sourceId}|${type}|${targetId}`).digest('hex').slice(0, 24);
 }
 
-/** Claim identity: subject + normalized statement (NFKC, trimmed, whitespace-collapsed). */
-export function claimId(subjectId: string, statement: string): string {
+/**
+ * Claim identity: subject + normalized statement (NFKC, trimmed, whitespace-collapsed),
+ * and for a dated reading of a measure the day it is of (`at`, YYYY-MM-DD; see
+ * LineageWriter.claim): "平台组本周服务可用性为99.92%" in week 3 and in week 17 are two
+ * readings, not one claim reported twice. Without `at` the id is what it always was.
+ */
+export function claimId(subjectId: string, statement: string, at?: string | null): string {
   const normalized = statement.normalize('NFKC').trim().replace(/\s+/g, ' ');
-  return crypto.createHash('sha256').update(`${subjectId}|${normalized}`).digest('hex').slice(0, 24);
+  return crypto.createHash('sha256').update(`${subjectId}|${normalized}${at ? `|@${at}` : ''}`).digest('hex').slice(0, 24);
 }
 
 /**

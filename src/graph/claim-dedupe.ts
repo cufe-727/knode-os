@@ -855,6 +855,13 @@ export async function auditDuplicateClaims(
       if (decided.has(pair.id)) continue;
       const { a, b } = pair;
       if (pair.why.includes('identical')) {
+        // one wording of two times — a weekly report's "本周服务可用性为99.92%" in week 3
+        // and in week 17 (claimId's reading day) — is two readings, not one claim twice
+        if (opts.stateRules !== false && windowsDisjoint(a, b)) {
+          outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '同一说法、不同时点', model: 'rule' } });
+          stats.differentTime++;
+          continue;
+        }
         outcomes.push({ pair, verdict: { relation: 'same', keep: null, confidence: 1, reason: '规范化后逐字相同', model: 'rule' } });
         stats.identical++;
         continue;
