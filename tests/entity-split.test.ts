@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
-import { CodedDoc, codedClusters, medianDate, namesakeClusters, NamesakeDoc, resolveEntityContext } from '../src/graph/entity-context.js';
+import { CodedDoc, codedClusters, medianDate, namesakeClusters, NamesakeDoc, resolveEntityContext, sequentialShare } from '../src/graph/entity-context.js';
 import { codesOf } from '../src/graph/identity.js';
 import { RawExtractReply } from '../src/graph/llm-extract.js';
 import { enqueueTier1, runTier1Pass } from '../src/graph/tier1.js';
@@ -37,17 +37,17 @@ describe('one entity parted by the codes its documents carry', () => {
   const team = (prefix: string, org: string, person: string, code: string): CodedDoc[] => [
     doc(`${prefix}1`, ['日志保留天数', code], [org, person]),
     doc(`${prefix}2`, ['日志保留天数', code, '保留期'], [org, person, '安全团队']),
-    // named without its code, and by the first division's code an extraction repeated: the roof says whose it is
+    // named without its code: the documents it is like say whose it is
     doc(`${prefix}3`, ['保留期'], [org, person]),
     doc(`${prefix}4`, ['日志保留天数'], [org]),
   ];
 
-  it('gives every code with a roof of its own its documents, coded or not', () => {
+  it('gives every code with a roof of its own the documents like its own, coded or not', () => {
     const docs = [
       ...team('a', '平台组', '罗芳', 'T1-C2'),
       ...team('b', '二部平台组', '廖欣', 'D2T1-C2'),
       ...team('c', '三部平台组', '方杰', 'D3T1-C2'),
-      // names two of the roofs, and none: nobody's
+      // as much like one team's reports as another's, and like none: nobody's
       doc('x1', ['日志保留天数'], ['二部平台组', '三部平台组']),
       doc('x2', ['日志保留天数'], ['安全团队']),
     ];
@@ -115,6 +115,27 @@ describe('two people of one name', () => {
     expect(namesakeClusters(moved, typeOf)).toBeNull();
     // no date at all: not decided
     expect(namesakeClusters(both.map((d) => ({ ...d, date: null })), typeOf)).toBeNull();
+    // moved after week 7, and named twice more in the old team's reviews months later: the ranges overlap, the documents do not
+    const lookedBack = [
+      ...[0, 1, 2, 3, 4, 5, 6, 14, 22].map((k) => doc(`a${k}`, at(k), ['平台组', '罗芳'])),
+      ...[7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23].map((k) => doc(`b${k}`, at(k), ['二部平台组', '廖欣'])),
+    ];
+    expect(namesakeClusters(lookedBack, typeOf)).toBeNull();
+    expect(sequentialShare(['2025-01-06', '2025-01-13'], ['2025-01-20', '2025-01-27'])).toBe(1);
+    expect(sequentialShare(['2025-01-06', '2025-01-20'], ['2025-01-13', '2025-01-27'])).toBe(0.5);
+    expect(sequentialShare([], ['2025-01-13'])).toBe(0);
+  });
+
+  it('tells contexts apart by what each is about, not by a customer both name once', () => {
+    const at = (k: number) => new Date(Date.UTC(2025, 0, 6 + k * 7)).toISOString().slice(0, 10);
+    const weeks = Array.from({ length: 10 }, (_, k) => k);
+    // each team names the security team once and 英伟达 once: a third of all they ever name, a tenth of their reports
+    const a = weeks.map((k) => doc(`a${k}`, at(k), ['平台组', '罗芳', ...(k === 3 ? ['安全团队'] : []), ...(k === 6 ? ['英伟达'] : [])]));
+    const b = weeks.map((k) => doc(`b${k}`, at(k), ['二部平台组', '廖欣', ...(k === 2 ? ['安全团队'] : []), ...(k === 7 ? ['英伟达'] : [])]));
+    expect(namesakeClusters([...a, ...b], typeOf)?.map((c) => c.anchors)).toEqual([['平台组'], ['二部平台组']]);
+    // a colleague in every report of both: one person in two teams' reports
+    const shared = [...a, ...b].map((d) => ({ ...d, context: new Set([...d.context, '方杰']) }));
+    expect(namesakeClusters(shared, typeOf)).toBeNull();
   });
 });
 

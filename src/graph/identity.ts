@@ -130,6 +130,8 @@ export interface NamesakeRule {
   label: string;
   anchors: string[];
   base_anchors: string[];
+  /** The documents (paths) refine re-applied to it when it parted the name: their mentions of the name are its. */
+  documents?: string[];
 }
 
 const lower = (s: string) => s.trim().toLowerCase();
@@ -144,12 +146,13 @@ export function namesakeName(rule: Pick<NamesakeRule, 'name' | 'label'>): string
  * entity that keeps the name. In this order:
  *
  *   1. the one labelled with a code the mention carries;
- *   2. the one whose anchors name the mention's own team or parent, when the
+ *   2. the one the split itself gave this document to;
+ *   3. the one whose anchors name the mention's own team or parent, when the
  *      base entity's do not;
- *   3. the one whose anchors the document names most, if it names more of
+ *   4. the one whose anchors the document names most, if it names more of
  *      them than of the base entity's, and of no other as many.
  *
- * A code that is the base entity's own gives nothing over 2 and 3: an
+ * A code that is the base entity's own gives nothing over 2 to 4: an
  * extraction that was shown the base entity's name repeats it for whichever
  * of them the document means.
  */
@@ -158,6 +161,11 @@ export function namesakeFor(rules: readonly NamesakeRule[], mention: { codes: Co
   for (const r of rules) {
     const label = codeOf(r.label);
     if (label && mention.codes.get(label.shape)?.value === label.value) return r;
+  }
+  const here = mention.context?.documentPath;
+  if (here) {
+    const listed = rules.filter((r) => r.documents?.includes(here));
+    if (listed.length === 1) return listed[0];
   }
   const baseAnchors = new Set(rules[0].base_anchors.map(lower));
   const pick = (names: ReadonlySet<string>): NamesakeRule | null => {

@@ -109,6 +109,11 @@ describe('the context of a mention', () => {
     expect(namesakeFor(rules, { codes: codesOf(['日志保留天数']), context: { documentNames: names('日志保留天数') } })).toBeNull();
     expect(namesakeFor(rules, { codes: codesOf(['日志保留天数']) })).toBeNull();
     expect(namesakeFor([], { codes: codesOf(['D7T1-C2']) })).toBeNull();
+    // a document the split itself gave to one of them: that one, whatever it names — unless the mention's code says otherwise
+    const listed = [{ ...rules[0], documents: ['raw/docs/w9.md'] }, rules[1]];
+    expect(namesakeFor(listed, { codes: codesOf(['日志保留天数']), context: { documentPath: 'raw/docs/w9.md', documentNames: names('七部平台组') } })?.id).toBe('d2');
+    expect(namesakeFor(listed, { codes: codesOf(['D7T1-C2']), context: { documentPath: 'raw/docs/w9.md' } })?.id).toBe('d7');
+    expect(namesakeFor(listed, { codes: codesOf(['日志保留天数']), context: { documentPath: 'raw/docs/w1.md', documentNames: names('七部平台组') } })?.id).toBe('d7');
   });
 });
 

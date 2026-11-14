@@ -469,15 +469,42 @@ function jaccard(a: Set<string>, b: Set<string>): number {
   return shared / Math.max(1, a.size + b.size - shared);
 }
 
+/** The share of a cluster's documents an entity must be in to count as its context: one report that names a customer is not what the cluster is about. */
+const CHARACTERISTIC_SHARE = 0.2;
+/** One cluster's documents mostly before a date and the other's mostly after it: one person who moved. */
+const SEQUENTIAL_SHARE = 0.7;
+
+/**
+ * How far two sets of dates are one after the other: the largest share s such
+ * that s of one set lies on or before some date and s of the other after it.
+ * 1 for a clean hand-over, about 0.5 for two that run side by side all along.
+ */
+export function sequentialShare(a: readonly string[], b: readonly string[]): number {
+  if (a.length === 0 || b.length === 0) return 0;
+  let best = 0;
+  for (const cut of new Set([...a, ...b])) {
+    for (const [x, y] of [[a, b], [b, a]] as const) {
+      best = Math.max(best, Math.min(x.filter((d) => d <= cut).length / x.length, y.filter((d) => d > cut).length / y.length));
+    }
+  }
+  return best;
+}
+
 /**
  * The documents of one name split into contexts that are two people, or null.
  * Documents join when their co-mentions mostly agree (Jaccard ≥ 0.3), and a
  * split needs all of: two clusters holding ≥ 90% of the documents, each ≥ 3
- * documents and ≥ 15%; contexts that barely meet (Jaccard of their unions <
- * 0.25); an anchor of each side (≥ 60% of its documents, ≤ 5% of the other's);
- * and both active at the same time (their date ranges overlap by ≥ 30% of
- * the shorter) — a person who moved teams has one context before and another
- * after, which is no namesake. Exported for tests.
+ * documents and ≥ 15%; contexts that barely meet (Jaccard < 0.25 of what each
+ * cluster is about: the entities in CHARACTERISTIC_SHARE of its documents or
+ * more — two teams both name the security team or a customer now and then);
+ * an anchor of each side (≥ 60% of its documents, ≤ 5% of the other's); and
+ * both active at the same time — a person who moved teams has one context
+ * before and another after, which is no namesake. Two tests of that: the date
+ * ranges overlap by ≥ 30% of the shorter, and the documents are not one
+ * cluster's first and then the other's (sequentialShare < SEQUENTIAL_SHARE).
+ * The range alone is fooled by a look back: on the 10× benchmark 13 people
+ * who changed teams were named months later in their old team's incident
+ * reviews, and split (2026-11-15). Exported for tests.
  */
 export function namesakeClusters(docs: NamesakeDoc[], typeOf: (id: string) => string | undefined): [NamesakeCluster, NamesakeCluster] | null {
   if (docs.length < MIN_DOCS) return null;
@@ -494,8 +521,9 @@ export function namesakeClusters(docs: NamesakeDoc[], typeOf: (id: string) => st
   if (a.length + b.length < 0.9 * docs.length) return null;
   if (b.length < 3 || b.length < 0.15 * docs.length) return null;
   const union = (g: NamesakeDoc[]) => new Set(g.flatMap((d) => [...d.context]));
-  if (jaccard(union(a), union(b)) >= 0.25) return null;
   const share = (g: NamesakeDoc[], id: string) => g.filter((d) => d.context.has(id)).length / g.length;
+  const about = (g: NamesakeDoc[]) => new Set([...union(g)].filter((id) => share(g, id) >= CHARACTERISTIC_SHARE));
+  if (jaccard(about(a), about(b)) >= 0.25) return null;
   const anchorsOf = (own: NamesakeDoc[], other: NamesakeDoc[]) =>
     [...union(own)]
       .filter((id) => ANCHOR_TYPES.has(typeOf(id) ?? '') && share(own, id) >= 0.6 && share(other, id) <= 0.05)
@@ -503,16 +531,16 @@ export function namesakeClusters(docs: NamesakeDoc[], typeOf: (id: string) => st
   const anchorsA = anchorsOf(a, b);
   const anchorsB = anchorsOf(b, a);
   if (anchorsA.length === 0 || anchorsB.length === 0) return null;
-  const range = (g: NamesakeDoc[]) => {
-    const dates = g.map((d) => d.date).filter((x): x is string => Boolean(x)).sort();
-    return dates.length ? [Date.parse(dates[0]), Date.parse(dates[dates.length - 1])] as const : null;
-  };
-  const ra = range(a);
-  const rb = range(b);
-  if (!ra || !rb) return null;
+  const dates = (g: NamesakeDoc[]) => g.map((d) => d.date).filter((x): x is string => Boolean(x)).sort();
+  const da = dates(a);
+  const db = dates(b);
+  if (da.length === 0 || db.length === 0) return null;
+  const ra = [Date.parse(da[0]), Date.parse(da[da.length - 1])] as const;
+  const rb = [Date.parse(db[0]), Date.parse(db[db.length - 1])] as const;
   const overlap = Math.min(ra[1], rb[1]) - Math.max(ra[0], rb[0]);
   const shorter = Math.max(1, Math.min(ra[1] - ra[0], rb[1] - rb[0]));
   if (overlap < 0.3 * shorter) return null;
+  if (sequentialShare(da, db) >= SEQUENTIAL_SHARE) return null;
   return [{ docs: a, anchors: anchorsA }, { docs: b, anchors: anchorsB }];
 }
 
@@ -689,22 +717,32 @@ export interface CodedSplit {
 }
 
 /**
- * One entity's documents parted by the codes its mentions carry, or null. A
- * split needs two or more codes that differ as identifiers of one kind do
- * (identity.ts, codesDiffer), each in CODE_MIN_DOCS documents or more and
- * each with an anchor of its own (an organization or project in ≥ 60% of its
- * documents and ≤ 5% of the other codes'). A code with no such anchor stays
- * where it is: kinds listed as aliases (H100 and H200 under 芯片) and a code
- * written short and long share their context. A document that carries none
- * of the codes goes with the one code whose anchor it names, when it names
- * no other's; every other document stays. And the roofs must account for the
- * entity: CODE_COVERAGE of its documents go with a code, or stay under a roof
- * of their own that no code's documents name. Two codes seen twice each in a
- * hub of hundreds of documents (DRAM: DDR4, DDR5) find organizations of their
- * own by chance, but most of the hub's documents name neither side's or both
- * (finance, 2026-11-15: without this test 10 names would have parted). No
- * test of dates: a code is not a person, who may change teams. Exported for
- * tests.
+ * One entity's documents parted by the codes its mentions carry, or null.
+ *
+ * A code is written once or twice — where the thing is introduced — and the
+ * other documents name the thing without it. So the documents that carry a
+ * code are the seed of a group, and a document without one joins the group
+ * it is most like: its co-mentions agree with a document of that group
+ * (Jaccard ≥ 0.3) and with no other group's as well. That repeats while
+ * groups grow. A split then needs all of:
+ *
+ *   - two or more codes that differ as identifiers of one kind do
+ *     (identity.ts, codesDiffer), each of its group at least CODE_MIN_DOCS
+ *     documents;
+ *   - an anchor of each group: an organization or project in ≥ 60% of its
+ *     documents and ≤ 5% of the other groups'. Kinds listed as aliases (H100
+ *     and H200 under 芯片) and one code written short and long share their
+ *     context and find none;
+ *   - the roofs account for the entity: CODE_COVERAGE of its documents are
+ *     in a group, or stay under a roof of their own that no group's
+ *     documents name. Two codes seen twice each in a hub of hundreds of
+ *     documents (DRAM: DDR4, DDR5) find organizations of their own by
+ *     chance, but most of the hub's documents are like neither (finance,
+ *     2026-11-15: without this test 10 names would have parted).
+ *
+ * A document that carries two codes that differ, or is as much like one
+ * group as another (a monthly report over several teams), stays. No test of
+ * dates: a code is not a person, who may change teams. Exported for tests.
  */
 export function codedClusters(docs: CodedDoc[], typeOf: (id: string) => string | undefined): CodedSplit | null {
   const byValue = new Map<string, { code: Code; docs: CodedDoc[] }>();
@@ -722,23 +760,32 @@ export function codedClusters(docs: CodedDoc[], typeOf: (id: string) => string |
       .sort((x, y) => share(own, y) - share(own, x) || x.localeCompare(y));
   let best: CodedSplit | null = null;
   for (const members of groupBy(all.map((g, i) => ({ g, i })), (x) => String(find(x.i))).values()) {
-    const groups = members.map((x) => x.g).filter((g) => g.docs.length >= CODE_MIN_DOCS);
+    if (members.length < 2) continue;
+    const values = new Set(members.map((x) => x.g.code.value));
+    // the seeds: a document that carries one of these codes, and not two of them
+    const carried = (d: CodedDoc) => [...d.codes.values()].filter((c) => values.has(c.value));
+    const groups = members.map((x) => ({ code: x.g.code, docs: x.g.docs.filter((d) => carried(d).length === 1) })).filter((g) => g.docs.length > 0);
     if (groups.length < 2) continue;
+    const seeded = new Set(docs.filter((d) => carried(d).length > 0));
+    let open = docs.filter((d) => !seeded.has(d));
+    for (let round = 0; round < 6 && open.length > 0; round++) {
+      const joins: { d: CodedDoc; g: (typeof groups)[number] }[] = [];
+      for (const d of open) {
+        const like = groups.map((g) => ({ g, s: Math.max(...g.docs.map((o) => jaccard(d.context, o.context))) })).sort((a, b) => b.s - a.s);
+        if (like[0].s >= 0.3 && like[0].s > like[1].s) joins.push({ d, g: like[0].g });
+      }
+      if (joins.length === 0) break;
+      for (const j of joins) j.g.docs.push(j.d);
+      const joined = new Set(joins.map((j) => j.d));
+      open = open.filter((d) => !joined.has(d));
+    }
     const parts: CodedPart[] = groups
-      .map((g) => ({ code: g.code, docs: [...g.docs], anchors: anchorsOf(g.docs, groups.filter((o) => o !== g).flatMap((o) => o.docs)) }))
+      .filter((g) => g.docs.length >= CODE_MIN_DOCS)
+      .map((g) => ({ code: g.code, docs: g.docs, anchors: anchorsOf(g.docs, groups.filter((o) => o !== g).flatMap((o) => o.docs)) }))
       .filter((p) => p.anchors.length > 0);
     if (parts.length < 2) continue;
-    const values = new Set(members.map((x) => x.g.code.value));
     const taken = new Set(parts.flatMap((p) => p.docs));
-    const rest: CodedDoc[] = [];
-    for (const d of docs) {
-      if (taken.has(d)) continue;
-      // a document that names the thing without one of these codes: the roof it names says which
-      const coded = [...d.codes.values()].some((c) => values.has(c.value));
-      const named = coded ? [] : parts.filter((p) => p.anchors.some((a) => d.context.has(a)));
-      if (named.length === 1) named[0].docs.push(d);
-      else rest.push(d);
-    }
+    const rest = docs.filter((d) => !taken.has(d));
     parts.sort((a, b) => b.docs.length - a.docs.length || a.code.value.localeCompare(b.code.value));
     const restAnchors = anchorsOf(rest, parts.flatMap((p) => p.docs));
     const accounted = docs.length - rest.filter((d) => !restAnchors.some((a) => d.context.has(a))).length;

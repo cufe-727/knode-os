@@ -74,7 +74,7 @@ export class NamesakeIndex {
 
   private async load(q: Queryable): Promise<Map<string, NamesakeRule[]>> {
     if (this.byBase) return this.byBase;
-    const rows = await q.query<NamesakeRule>(`SELECT id, base_id, name, label, anchors, base_anchors FROM entity_namesakes ORDER BY created_at, id`);
+    const rows = await q.query<NamesakeRule>(`SELECT id, base_id, name, label, anchors, base_anchors, documents FROM entity_namesakes ORDER BY created_at, id`);
     const byBase = new Map<string, NamesakeRule[]>();
     for (const r of rows) this.put(byBase, r);
     this.byBase = byBase;
@@ -149,6 +149,7 @@ async function partByCode(
     label: code.raw,
     anchors: [roof],
     base_anchors: rules[0]?.base_anchors ?? anchors.map((r) => r.name),
+    documents: context.documentPath ? [context.documentPath] : [],
   };
   rule.id = slugify(namesakeName(rule));
   const taken = await rowById(q, rule.id);
