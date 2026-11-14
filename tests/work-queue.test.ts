@@ -390,3 +390,74 @@ describe('order (docs/design/32 §4)', () => {
     evals.close();
   });
 });
+
+describe('a run\'s own slots', () => {
+  it('never run one piece twice, even when its lease lapses while it runs', async () => {
+    const remote = RemoteEval.own({ run: 'twice', renewMs: 60_000, source: { leaseMs: 300, retryMs: 0 } });
+    remote.startLocal({ codex: 2 });
+    let execs = 0;
+    const r = await remote.publish(callSpec(), async () => {
+      execs++;
+      await sleep(1_200);
+      return 'once';
+    });
+    expect(r).toEqual({ local: true, value: 'once' });
+    expect(execs).toBe(1);
+    remote.close();
+  });
+
+  it('keep a piece one of them is running when serve goes away, and do not publish it again for a worker', async () => {
+    let key = '';
+    let published = 0;
+    let leased = false;
+    // serve, as the run sees it during a restart: it handed the piece to the run's slot, then stopped answering
+    const queue = {
+      where: 'serve', origin: 'http://127.0.0.1:9',
+      publish: async (spec: EvalSpec) => {
+        published++;
+        key = spec.key;
+        await sleep(30);
+        return { outcome: 'unreachable', error: 'fetch failed' };
+      },
+      status: async () => { throw new Error('fetch failed'); },
+      archive: async () => null,
+      lease: async () => (key && !leased ? ((leased = true), [{ id: 't1', kind: 'eval-call', key, label: 'x', leaseExpiresAt: '' }]) : []),
+      complete: async () => { throw new Error('fetch failed'); },
+      renew: async () => {}, release: async () => {}, cancelRun: async () => {}, close: () => {},
+    };
+    const Ctor = RemoteEval as unknown as new (q: unknown, o: unknown) => RemoteEval;
+    const remote = new Ctor(queue, { run: 'restart' });
+    remote.startLocal({ codex: 1 });
+    let execs = 0;
+    const r = await remote.publish(callSpec(), async () => {
+      execs++;
+      await sleep(400);
+      return 'kept';
+    });
+    expect(r).toEqual({ local: true, value: 'kept' });
+    expect(execs).toBe(1);
+    expect(published).toBeLessThanOrEqual(2);
+    remote.close();
+  });
+
+  it('wait for this machine\'s plan before they lease, never while they hold a piece', async () => {
+    let waiting = 0;
+    const quota = { waitLocal: async () => {
+      waiting++;
+      await sleep(100);
+      waiting--;
+    } } as unknown as import('../src/eval/quota.js').QuotaGuard;
+    const remote = RemoteEval.own({ run: 'plan', quota, source: { retryMs: 0 } });
+    remote.startLocal({ codex: 1 });
+    const queue = remote.queue as OwnQueue;
+    const leasedWhileWaiting: number[] = [];
+    const p = remote.publish(callSpec(), async () => 'ok');
+    const timer = setInterval(() => {
+      if (waiting && queue.calls.runStatus('plan').leased) leasedWhileWaiting.push(1);
+    }, 5);
+    expect(await p).toEqual({ local: true, value: 'ok' });
+    clearInterval(timer);
+    expect(leasedWhileWaiting).toEqual([]);
+    remote.close();
+  });
+});

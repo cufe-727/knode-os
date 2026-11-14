@@ -551,6 +551,8 @@ export class EvalSource implements WorkSource {
       const p = lease.pending;
       if (p.done || p.lease !== lease.id) continue;
       p.lease = null;
+      // a run's own slot is the run's backend, not a worker: its lapse is no strike against the piece
+      if (lease.who.run) continue;
       this.strike(p, 'transient', `${lease.who.worker} ${lease.deadline <= now ? 'outran its timeout' : 'stopped renewing its lease'}`, lease.who.worker, now);
     }
     if (this.pending.length === 0 && this.sweeper) {

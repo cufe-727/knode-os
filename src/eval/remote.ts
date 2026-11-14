@@ -342,7 +342,21 @@ export type Published<T> =
 
 interface Entry {
   exec: () => Promise<unknown>;
+  /** One of the run's own slots runs it now: another that leases the piece waits for this, never runs it again. */
+  running?: Promise<void>;
   done?: { value: unknown } | { error: unknown };
+}
+
+/** Run a piece's work once, whichever of the run's own slots gets to it first. */
+function runOnce(entry: Entry): Promise<void> {
+  entry.running ??= (async () => {
+    try {
+      entry.done = { value: await entry.exec() };
+    } catch (error) {
+      entry.done = { error };
+    }
+  })();
+  return entry.running;
 }
 
 const randomKey = () => crypto.randomBytes(9).toString('base64url');
@@ -505,6 +519,13 @@ export class RemoteEval {
         }
         if (o.outcome === 'cancelled' || o.outcome === 'stopped' || this.abort.signal.aborted) throw new RunCancelledError();
         if (o.outcome === 'unreachable') {
+          // one of the run's own slots is doing it: its result is the piece's, and it is not published again for a worker to run too
+          if (entry.running) {
+            await entry.running;
+            const done = entry.done as unknown as { value: unknown } | { error: unknown };
+            this.counts.local++;
+            return 'error' in done ? { local: true, error: done.error } : { local: true, value: done.value as T };
+          }
           // serve went away: the piece waits for it as it would for a slot, and is published again
           if (!this.unreachableSaid) this.log(`remote: publishing to serve failed (${o.error}): pieces wait and are published again when it answers`);
           this.unreachableSaid = true;
@@ -631,6 +652,9 @@ export class RemoteEval {
   private async slot(who: LocalSlotIdentity): Promise<void> {
     const kinds = LOCAL_KINDS[who.family];
     while (!this.closed) {
+      // this machine's plan, before the slot takes anything: a Codex slot never holds a lease while it waits for it
+      if (who.family === 'codex') await this.opts.quota?.waitLocal({ cacheMs: 60_000 });
+      if (this.closed || this.abort.signal.aborted) break;
       let task: WorkTask | undefined;
       try {
         task = (await this.queue.lease(who, kinds))[0];
@@ -652,17 +676,10 @@ export class RemoteEval {
       const renew = setInterval(() => void this.queue.renew(who, [task!.id]).catch(() => {}), Math.max(200, this.opts.renewMs ?? 20_000));
       renew.unref?.();
       try {
-        if (!entry.done) {
-          // this machine's plan: a Codex piece run here waits for it, as the run did before it ran anything here
-          if (who.family === 'codex') await this.opts.quota?.waitLocal({ cacheMs: 60_000 });
-          try {
-            entry.done = { value: await entry.exec() };
-          } catch (error) {
-            entry.done = { error };
-          }
-        }
+        // a piece whose lease lapsed while it ran (or that serve has again after a restart) is not run a second time
+        await runOnce(entry);
         if (this.abort.signal.aborted) continue;
-        const done = entry.done;
+        const done = entry.done!;
         const outcome: LocalOutcome = 'error' in done && task.kind === 'eval-call'
           ? { ok: false, error: done.error instanceof Error ? done.error.message : String(done.error) }
           : { ok: true };
