@@ -16,6 +16,7 @@ import { dropBackend, schemaNameFor } from '../src/store/backend.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 import { ensureMatchIndexes, MATCH_INDEXES } from '../src/store/grams.js';
 import { catalogQuery, catalogReaderRole } from '../src/store/catalog.js';
+import { FixedEmbedder, KEYWORD_CORPUS_DIM, rankAll, seedKeywordCorpus } from './helpers/keyword-corpus.js';
 
 /**
  * Exercises the external-Postgres backend against a real server. Skipped
@@ -486,6 +487,43 @@ describe.skipIf(!ready)('postgres backend', () => {
       expect((await third.indexing)?.built).toEqual([MATCH_INDEXES.chunks.name]);
     } finally {
       await third.close();
+    }
+  });
+
+  it('ranks a search alike before and after a store opened over a missing index has built it', async () => {
+    const dir = workspaceDir();
+    const schema = schemaNameFor(dir, dbConfig.schemaPrefix);
+    const seeded = await Store.open(dir, KEYWORD_CORPUS_DIM, dbConfig);
+    try {
+      await seeded.indexing;
+      await seedKeywordCorpus(seeded);
+      await seeded.query(`DROP INDEX ${MATCH_INDEXES.chunks.name}`);
+      await seeded.query(`DROP INDEX ${MATCH_INDEXES.entities.name}`);
+    } finally {
+      await seeded.close();
+    }
+
+    // another process holds the build lock, so the store answers before either index is there
+    const other = adminPool(dbConfig.database);
+    const client = await other.connect();
+    let store: Store | undefined;
+    try {
+      await client.query(`SET search_path = ${schema}, public`);
+      await client.query(`BEGIN`);
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext(current_schema() || '.match_grams'))`);
+      store = await Store.open(dir, KEYWORD_CORPUS_DIM, dbConfig);
+      const embedder = new FixedEmbedder();
+      const before = await rankAll(store, embedder);
+      expect(store.matchIndexes.size).toBe(0);
+      await client.query(`COMMIT`);
+      expect((await store.indexing)?.built).toEqual([MATCH_INDEXES.entities.name, MATCH_INDEXES.chunks.name]);
+      const after = await rankAll(store, embedder);
+      expect(after).toEqual(before);
+      for (const r of after.filter((x) => x.mode === 'keyword')) expect(r.results.length, r.query).toBeGreaterThan(0);
+    } finally {
+      client.release();
+      await other.end();
+      await store?.close();
     }
   });
 
