@@ -9,13 +9,13 @@ import { CATALOG_VIEWS } from '../src/store/catalog.js';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-schema-v7-'));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19 (wiki research + review + quick answers + claim merges + dispose indexes + derived co-occurrence + claim kind + document chars + citations + content languages + match grams + claim state)', () => {
+describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20 (wiki research + review + quick answers + claim merges + dispose indexes + derived co-occurrence + claim kind + document chars + citations + content languages + match grams + claim state + relation source)', () => {
   it('adds the temporal relation / claim columns, resolution tables and research jobs, and every catalog view resolves', async () => {
     fs.mkdirSync(path.join(tmp, 'ws', '.knode'), { recursive: true });
     const store = await Store.open(path.join(tmp, 'ws'), 3);
     try {
-      expect(SCHEMA_VERSION).toBe(19);
-      expect(store.migration.to).toBe(19);
+      expect(SCHEMA_VERSION).toBe(20);
+      expect(store.migration.to).toBe(20);
       // every foreign key a disposal fires, the merged-entity lookup of the fold, and the
       // document side of derived co-occurrence (v13) have an index to use
       const indexes = (await store.query<{ indexname: string }>(`SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()`)).map((r) => r.indexname);
@@ -26,6 +26,10 @@ describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19 (wiki research + 
           [table],
         )).map((r) => r.column_name);
       expect(await columns('relations')).toEqual(expect.arrayContaining(['valid_from', 'valid_to']));
+      // v20: the document and passage a relation was read from (lineage/fold.ts relationSource)
+      expect(await columns('relations')).toEqual(expect.arrayContaining(['document_id', 'chunk_id']));
+      expect(await columns('v_relations')).toEqual(expect.arrayContaining(['document_id', 'chunk_id', 'source_path']));
+      expect(indexes).toEqual(expect.arrayContaining(['relations_document_idx', 'relations_chunk_idx']));
       expect(await columns('claims')).toEqual(expect.arrayContaining(['event_at', 'observed_at', 'superseded_by']));
       expect(await columns('documents')).toContain('doc_date');
       // v15: the indexed text's length, read by the Summarize stage's size threshold (docs/design/14)

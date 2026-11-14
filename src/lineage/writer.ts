@@ -156,6 +156,8 @@ export class ScopeWriter {
   private readonly seenEvidence = new Set<string>();
   /** Entity ids known to exist in this transaction (created here or verified once). */
   private readonly knownEntities = new Set<string>();
+  /** The chunks this body mentioned each entity in, in order: where a relation between two of them is grounded. */
+  private readonly mentionedIn = new Map<string, string[]>();
 
   constructor(
     readonly q: Queryable,
@@ -250,6 +252,7 @@ export class ScopeWriter {
   ): Promise<string | null> {
     if (sourceId === targetId) return null;
     if (!(await this.entitiesExist([sourceId, targetId]))) return null;
+    const segmentId = r.segmentId ?? this.passageOf(sourceId, targetId);
     const norm = normalizePredicate(this.ontology, r.type);
     const type = norm.type;
     let [a, b] = norm.flip ? [targetId, sourceId] : [sourceId, targetId];
@@ -262,7 +265,7 @@ export class ScopeWriter {
        VALUES ($1, $2, $3, $4, $5, 0, $6::timestamptz) ON CONFLICT (id) DO NOTHING`,
       [id, a, b, type, r.description ?? '', this.txTime],
     );
-    const added = await this.addEvidence('relation', id, r.extractor, r.weight ?? 1, r.segmentId ?? null, {
+    const added = await this.addEvidence('relation', id, r.extractor, r.weight ?? 1, segmentId, {
       type,
       description: r.description ?? '',
       valid_from: toIso(r.validFrom),
@@ -349,7 +352,22 @@ export class ScopeWriter {
       [entityId, chunkId, documentId, this.scope.id],
     );
     if (rows.length) this.stats.mentions++;
+    const seen = this.mentionedIn.get(entityId);
+    if (!seen) this.mentionedIn.set(entityId, [chunkId]);
+    else if (!seen.includes(chunkId)) seen.push(chunkId);
     this.touched.entities.add(entityId);
+  }
+
+  /**
+   * The passage a relation between two entities of this body is grounded to
+   * when the extractor named none: the first chunk this body mentioned both
+   * in, else the first it mentioned either in (an endpoint named only in the
+   * relation has no mention), else none.
+   */
+  private passageOf(sourceId: string, targetId: string): string | null {
+    const a = this.mentionedIn.get(sourceId) ?? [];
+    const b = this.mentionedIn.get(targetId) ?? [];
+    return a.find((c) => b.includes(c)) ?? a[0] ?? b[0] ?? null;
   }
 
   private async addEvidence(kind: string, targetId: string, extractor: string, weight: number, segmentId: string | null, attrs: Record<string, unknown>): Promise<boolean> {

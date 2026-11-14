@@ -8,6 +8,7 @@ import {
   foldRelationEvidence,
   groupBy,
   Params,
+  relationSource,
   scopeDocuments,
 } from '../store/temporal.js';
 import { EntityCorrection, EntityCorrections, refusedKeys, refuses } from '../graph/corrections.js';
@@ -225,6 +226,8 @@ async function foldRelations(q: Queryable, ids: string[], txTime: string, result
   }>(q, ids, (ph) => `SELECT id, source_id, target_id, type, description, weight, evidence_count, fold_sha, tx_to FROM relations WHERE id IN (${ph})`);
   const endpoints = [...new Set(current.flatMap((r) => [r.source_id, r.target_id]))];
   const alive = await entityLiveness(q, endpoints);
+  // the document (and passage) each relation was read from; provenance, so no part of fold_sha
+  const docs = await scopeDocuments(q, [...evidence.values()].flatMap((rows) => rows.map((r) => r.scope_id)));
 
   for (const cur of current) {
     const rows = evidence.get(cur.id) ?? [];
@@ -242,12 +245,14 @@ async function foldRelations(q: Queryable, ids: string[], txTime: string, result
     const foldSha = sha16([Number(folded!.weight.toFixed(3)), folded!.description, folded!.valid_from, folded!.valid_to]);
     if (!wasLive) result.reopened.relations.add(cur.id);
     if (!wasLive || foldSha !== cur.fold_sha) result.changed.relations.add(cur.id);
+    const source = relationSource(rows, docs);
     await q.query(
       `UPDATE relations SET weight = $2, description = $3, evidence_count = $4, fold_sha = $5,
               valid_from = $7::timestamptz, valid_to = $8::timestamptz,
+              document_id = $9, chunk_id = (SELECT id FROM chunks WHERE id = $10),
               tx_from = CASE WHEN tx_to IS NOT NULL THEN $6::timestamptz ELSE tx_from END, tx_to = NULL
        WHERE id = $1`,
-      [cur.id, folded!.weight, folded!.description, folded!.evidence_count, foldSha, txTime, folded!.valid_from, folded!.valid_to],
+      [cur.id, folded!.weight, folded!.description, folded!.evidence_count, foldSha, txTime, folded!.valid_from, folded!.valid_to, source?.documentId ?? null, source?.chunkId ?? null],
     );
   }
 }

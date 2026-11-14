@@ -93,6 +93,8 @@ export interface EvidenceAtRow {
 export interface ScopeDocument {
   documentId: string;
   docDate: string | null;
+  /** The scope's key (the document's path for a document's scopes), which orders supporters of one instant. */
+  key: string;
 }
 
 /**
@@ -106,13 +108,13 @@ export async function scopeDocuments(q: Queryable, scopeIds: Iterable<string>): 
   const ids = [...new Set(scopeIds)];
   const out = new Map<string, ScopeDocument>();
   if (ids.length === 0) return out;
-  const rows = await q.query<{ id: string; document_id: string; doc_date: string | Date | null }>(
-    `SELECT s.id, d.id AS document_id, d.doc_date
+  const rows = await q.query<{ id: string; key: string; document_id: string; doc_date: string | Date | null }>(
+    `SELECT s.id, s.key, d.id AS document_id, d.doc_date
      FROM scopes s JOIN documents d ON d.id = s.meta->>'documentId'
      WHERE s.id = ANY($1::text[])`,
     [ids],
   );
-  for (const r of rows) out.set(r.id, { documentId: r.document_id, docDate: toIso(r.doc_date) });
+  for (const r of rows) out.set(r.id, { documentId: r.document_id, docDate: toIso(r.doc_date), key: r.key });
   return out;
 }
 
@@ -222,6 +224,27 @@ export interface RelationAsOf {
   valid_from: string | null;
   valid_to: string | null;
   evidence_count: number;
+}
+
+/**
+ * The document a relation was read from, and the passage when its evidence was
+ * grounded to one: of the live supporters whose scope read a document, the
+ * earliest (by tx_from, then scope key and id) — the order entity pages and the
+ * graph walk fall back to while `relations.document_id` is empty, and the one
+ * migrations.ts fillRelationSources fills it by.
+ */
+export function relationSource(rows: EvidenceAtRow[], docs: ReadonlyMap<string, ScopeDocument>): { documentId: string; chunkId: string | null } | null {
+  let best: { r: EvidenceAtRow; doc: ScopeDocument } | null = null;
+  for (const r of rows) {
+    const doc = docs.get(r.scope_id);
+    if (!doc) continue;
+    if (!best) { best = { r, doc }; continue; }
+    const d = new Date(r.tx_from).getTime() - new Date(best.r.tx_from).getTime()
+      || (doc.key < best.doc.key ? -1 : doc.key > best.doc.key ? 1 : 0)
+      || (r.scope_id < best.r.scope_id ? -1 : r.scope_id > best.r.scope_id ? 1 : 0);
+    if (d < 0) best = { r, doc };
+  }
+  return best ? { documentId: best.doc.documentId, chunkId: best.r.segment_id ?? null } : null;
 }
 
 export function foldRelationEvidence(row: { id: string; source_id: string; target_id: string; type: string }, rows: EvidenceAtRow[]): RelationAsOf | null {
