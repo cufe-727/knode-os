@@ -4,11 +4,13 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
-import { OwnQueue, RemoteEval, WaitLimitError } from '../src/eval/remote.js';
+import { runAgentHere, setAgentStopping } from '../src/eval/agent.js';
+import { OwnQueue, PieceStuckError, RemoteEval, WaitLimitError } from '../src/eval/remote.js';
 import { eachWithin, runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
 import type { WorkerIdentity } from '../src/labeling/scheduler.js';
-import type { EvalCallSpec } from '../src/work/eval.js';
+import { EvalSource } from '../src/work/eval.js';
+import type { EvalCallSpec, EvalSpec } from '../src/work/eval.js';
 import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
 
 /**
@@ -119,5 +121,101 @@ describe('width', () => {
     width = 4;
     await done;
     expect(Math.max(...seen)).toBe(4);
+  });
+});
+
+describe('failures', () => {
+  const piece = (run = 'f'): EvalSpec => ({ ...callSpec(), run, key: `piece-${run}-0001` }) as EvalSpec;
+  const worker = (name: string, n = 1): WorkerIdentity => ({ worker: `${name}/eval-codex#${n}`, backend: 'codex', remote: true });
+  const fail = async (source: EvalSource, who: WorkerIdentity) => {
+    const [task] = await source.lease(who, 1);
+    expect(task).toBeDefined();
+    return source.complete(task.id, who, { ok: false, error: 'usage limit reached, try again later', kind: 'transient' });
+  };
+
+  it('puts a piece a worker could not serve back in line, and marks it stuck when three different machines could not', async () => {
+    const source = new EvalSource('eval-call', { retryMs: 0 });
+    const offer = source.offer(piece());
+    let settled = false;
+    void offer.result.then(() => (settled = true));
+    // one machine failing it on two of its slots is one machine
+    await fail(source, worker('laptop/a', 1));
+    await fail(source, worker('laptop/a', 2));
+    await fail(source, worker('laptop/b'));
+    await sleep(20);
+    expect(settled).toBe(false);
+    expect(source.runStatus('f')).toEqual({ waiting: 1, leased: 0 });
+    await fail(source, worker('laptop/c'));
+    expect(await offer.result).toEqual({ outcome: 'stuck', workers: ['laptop/a', 'laptop/b', 'laptop/c'], lastError: 'usage limit reached, try again later' });
+    expect((await source.status()).totals.stuck).toBe(1);
+    source.close();
+  });
+
+  it('gives a machine a piece it failed again only when nothing else waits for it', async () => {
+    const source = new EvalSource('eval-call', { retryMs: 0 });
+    const first = source.offer({ ...piece(), key: 'piece-first-0001' } as EvalSpec);
+    const second = source.offer({ ...piece(), key: 'piece-second-01' } as EvalSpec);
+    await fail(source, worker('laptop/a'));
+    const [next] = await source.lease(worker('laptop/a'), 1);
+    expect('key' in next && next.key).toBe('piece-second-01');
+    first.cancel();
+    second.cancel();
+    source.close();
+  });
+
+  it('tells a stuck piece to the run, which reports it with the system and task it was for', async () => {
+    const stuck: unknown[] = [];
+    const remote = RemoteEval.own({ run: 'r-stuck', onStuck: (p) => stuck.push(p), source: { retryMs: 0 } });
+    const queue = remote.queue as OwnQueue;
+    const p = remote.publish(callSpec({ label: 'closed-book · answer · t1' }), async () => 'never', { system: 'closed-book', task: 't1' }).catch((e) => e);
+    for (const name of ['laptop/m1', 'laptop/m2', 'laptop/m3']) {
+      for (let i = 0; i < 50 && !(await queue.calls.lease(worker(name), 1).then(async ([t]) => (t ? (await queue.calls.complete(t.id, worker(name), { ok: false, error: 'not logged in', kind: 'fatal' }), true) : false))); i++) await sleep(10);
+    }
+    const err = await p;
+    expect(err).toBeInstanceOf(PieceStuckError);
+    expect(err.message).toMatch(/stuck: 3 workers could not serve closed-book · answer · t1 \(laptop\/m1, laptop\/m2, laptop\/m3\): not logged in/);
+    expect(remote.stuckFor(0, 'closed-book', 't1')).toHaveLength(1);
+    expect(remote.stuckFor(0, 'closed-book', 't2')).toHaveLength(0);
+    expect(stuck).toHaveLength(1);
+    remote.close();
+  });
+});
+
+describe('cancelled sessions', () => {
+  const script = (name: string, body: string) => {
+    const f = path.join(tmp, name);
+    fs.writeFileSync(f, `#!/bin/sh\ncat > /dev/null\n${body}\n`);
+    fs.chmodSync(f, 0o755);
+    return f;
+  };
+  const old = process.env.KNODE_CODEX_CATALOG_HOURS;
+  beforeAll(() => (process.env.KNODE_CODEX_CATALOG_HOURS = '0'));
+  afterAll(() => {
+    if (old === undefined) delete process.env.KNODE_CODEX_CATALOG_HOURS;
+    else process.env.KNODE_CODEX_CATALOG_HOURS = old;
+  });
+
+  it('records a session killed by a signal as cancelled, never as an empty answer', async () => {
+    const cwd = fs.mkdtempSync(path.join(tmp, 'agent-'));
+    const r = await runAgentHere({ cwd, prompt: 'p', sandbox: 'read-only', model: 'gpt-test', command: script('killed.sh', 'kill -TERM $$') });
+    expect(r.cancelled).toBe(true);
+    expect(r.error).toMatch(/^cancelled: codex was killed by SIGTERM/);
+    expect(r.text).toBe('');
+  });
+
+  it('records a session that ended with nothing while the run was stopping as cancelled, and one that did not as it was', async () => {
+    const cwd = fs.mkdtempSync(path.join(tmp, 'agent-'));
+    const nothing = script('nothing.sh', 'exit 0');
+    expect((await runAgentHere({ cwd, prompt: 'p', sandbox: 'read-only', model: 'gpt-test', command: nothing })).cancelled).toBeUndefined();
+    const ac = new AbortController();
+    ac.abort();
+    setAgentStopping(ac.signal);
+    try {
+      const r = await runAgentHere({ cwd, prompt: 'p', sandbox: 'read-only', model: 'gpt-test', command: nothing });
+      expect(r.cancelled).toBe(true);
+      expect(r.error).toMatch(/^cancelled: the session ended with nothing while the run was stopping/);
+    } finally {
+      setAgentStopping(null);
+    }
   });
 });

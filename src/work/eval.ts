@@ -96,7 +96,8 @@ export interface EvalSessionAnswer {
 export type EvalOutcome =
   | { outcome: 'answered'; worker: string; backend: string; text: string; usage: CallUsage | null; model: string; session?: EvalSessionAnswer }
   | { outcome: 'error'; worker: string; backend: string; error: string; usage: CallUsage | null }
-  | { outcome: 'failed'; strikes: number; lastError: string }
+  /** Three different machines could not serve it (docs/design/32 §3): it is left unanswered, never answered another way. */
+  | { outcome: 'stuck'; workers: string[]; lastError: string }
   | { outcome: 'cancelled' }
   | { outcome: 'stopped' };
 
@@ -141,7 +142,7 @@ export interface EvalStatus extends SourceStatus {
   /** Published and waiting for a slot. */
   waiting: number;
   leases: EvalLeaseStatus[];
-  totals: { offered: number; answered: number; failed: Record<FailureKind, number>; leasesExpired: number };
+  totals: { offered: number; answered: number; stuck: number; failed: Record<FailureKind, number>; leasesExpired: number };
 }
 
 interface Pending {
@@ -151,6 +152,8 @@ interface Pending {
   done: boolean;
   lease: string | null;
   strikes: number;
+  /** The machines that could not serve it (`<token>/<worker>`, not their slots). */
+  failedBy: Set<string>;
   lastError: string;
   notBefore: number;
 }
@@ -170,7 +173,7 @@ interface EvalLease {
 export interface EvalSourceOptions {
   leaseMs?: number;
   retryMs?: number;
-  /** Strikes before an offer ends `failed` (default 3). */
+  /** Different machines that could not serve a piece before it is `stuck` (default 3). */
   maxStrikes?: number;
   /** How long a slot that asked counts as online (default 2 min). */
   onlineMs?: number;
@@ -192,6 +195,11 @@ export function takes(who: WorkerIdentity, family: EvalFamily, spec: EvalSpec): 
   if (spec.eligible === 'local' && who.remote) return false;
   if (who.run && spec.run !== who.run) return false;
   return true;
+}
+
+/** A slot's identity as a record keeps it: the machine (`<token>/<worker>`), not its slot (`…/eval-codex#2`). */
+export function machineOf(worker: string): string {
+  return worker.replace(/\/[^/]*#\d+$/, '');
 }
 
 /** The CLI family a worker's backend names ("codex", "claude:…"). */
@@ -224,7 +232,7 @@ export class EvalSource implements WorkSource {
   private readonly leases = new Map<string, EvalLease>();
   /** Who asked for this kind lately: slot → what it is and when. */
   private readonly asked = new Map<string, EvalSlotSeen & { at: number }>();
-  private readonly totals: EvalStatus['totals'] = { offered: 0, answered: 0, failed: noFailures(), leasesExpired: 0 };
+  private readonly totals: EvalStatus['totals'] = { offered: 0, answered: 0, stuck: 0, failed: noFailures(), leasesExpired: 0 };
   private readonly leaseMs: number;
   private readonly retryMs: number;
   private readonly maxStrikes: number;
@@ -278,7 +286,7 @@ export class EvalSource implements WorkSource {
     let resolve: (o: EvalOutcome) => void = () => {};
     const result = new Promise<EvalOutcome>((r) => (resolve = r));
     const p: Pending = {
-      id, spec, done: false, lease: null, strikes: 0, lastError: '', notBefore: 0,
+      id, spec, done: false, lease: null, strikes: 0, failedBy: new Set(), lastError: '', notBefore: 0,
       settle: () => {},
     };
     p.settle = (outcome) => {
@@ -326,7 +334,10 @@ export class EvalSource implements WorkSource {
     this.asked.set(who.worker, { worker: who.worker, family, local: !who.remote, run: who.run ?? null, at: Date.now() });
     this.sweep();
     const now = Date.now();
-    const p = this.pending.find((x) => !x.done && x.lease === null && x.notBefore <= now && takes(who, family, x.spec));
+    // a machine that could not serve a piece gets it again only when nothing else waits for it
+    const open = this.pending.filter((x) => !x.done && x.lease === null && x.notBefore <= now && takes(who, family, x.spec));
+    const machine = machineOf(who.worker);
+    const p = open.find((x) => !x.failedBy.has(machine)) ?? open[0];
     if (!p) return [];
     const lease: EvalLease = {
       id: crypto.randomUUID(),
@@ -486,9 +497,12 @@ export class EvalSource implements WorkSource {
     this.totals.failed[kind]++;
     p.strikes++;
     p.lastError = error;
-    this.log(`eval ${p.spec.run} ${p.spec.label}: ${worker} could not serve it (${kind}, ${p.strikes} in a row): ${error.slice(0, 240)}`);
-    if (p.strikes >= this.maxStrikes) {
-      p.settle({ outcome: 'failed', strikes: p.strikes, lastError: error });
+    p.failedBy.add(machineOf(worker));
+    this.log(`eval ${p.spec.run} ${p.spec.label}: ${worker} could not serve it (${kind}; ${p.failedBy.size} machine(s) so far): ${error.slice(0, 240)}`);
+    if (p.failedBy.size >= this.maxStrikes) {
+      // a piece three different workers could not serve is left for the run to report, never answered another way
+      this.totals.stuck++;
+      p.settle({ outcome: 'stuck', workers: [...p.failedBy], lastError: error });
       return;
     }
     p.notBefore = now + this.retryMs;

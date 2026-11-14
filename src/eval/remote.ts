@@ -13,13 +13,14 @@ import type { WorkerIdentity } from '../labeling/scheduler.js';
 import { WorkBroker } from '../work/broker.js';
 import type { EvalAgent, WorkTask } from '../work/broker.js';
 import { packFolder } from '../work/eval-archive.js';
-import { EVAL_FAMILIES, EvalSource } from '../work/eval.js';
+import { EVAL_FAMILIES, EvalSource, machineOf } from '../work/eval.js';
 import type { EvalCallSpec, EvalEligible, EvalFamily, EvalOutcome, EvalRunStatus, EvalSessionAnswer, EvalSessionSpec, EvalSlotSeen, EvalSourceOptions, EvalSpec } from '../work/eval.js';
 import type { EvalKind } from '../work/kinds.js';
 import type { AgentRunOptions, AgentRunResult } from './agent.js';
 import { AgentTrace } from './agent.js';
 import type { LoadedPack } from './pack.js';
-import { notePlacement } from './placement.js';
+import { currentPieceTag, notePlacement } from './placement.js';
+import type { PieceTag } from './placement.js';
 import type { QuotaGuard } from './quota.js';
 import type { ChatBackend, ChatRequest, ChatResult } from './shim.js';
 
@@ -250,6 +251,8 @@ export interface RemoteEvalOptions {
   logEveryMs?: number;
   /** The wait limit passed: the run stops, cleanly. */
   onStop?: (why: WaitLimitError) => void;
+  /** A piece three different workers could not serve (for the run's events). */
+  onStuck?: (piece: StuckPiece) => void;
   log?: (msg: string) => void;
 }
 
@@ -267,6 +270,28 @@ const requirementKey = (r: Requirement) => `${r.kind}|${r.family}|${r.model}|${r
 export function describeRequirement(r: Pick<Requirement, 'family' | 'model' | 'eligible'> & { kind?: EvalKind }): string {
   const what = r.kind === 'eval-session' ? 'an agent session' : r.kind === 'eval-call' ? 'a model call' : 'work';
   return `${what} on ${r.family}${r.model ? ` ${r.model}` : ''} (${r.eligible === 'local' ? "this machine's slots only" : 'any slot'})`;
+}
+
+/** A piece three different workers could not serve, as the run reports it. */
+export interface StuckPiece {
+  kind: EvalKind;
+  label: string;
+  family: EvalFamily;
+  model: string;
+  eligible: EvalEligible;
+  /** The system and task it was for (a build's: no task; the judge's: `__judge__`). */
+  system: string | null;
+  task: string | null;
+  workers: string[];
+  lastError: string;
+  at: string;
+}
+
+/** A piece left unanswered because three different workers could not serve it: the answer or build it was for is not recorded. */
+export class PieceStuckError extends Error {
+  constructor(readonly piece: StuckPiece) {
+    super(`stuck: ${piece.workers.length} workers could not serve ${piece.label} (${piece.workers.join(', ')}): ${piece.lastError.slice(0, 300)}`);
+  }
 }
 
 /** The run waited `--wait-minutes` for a slot that meets a piece's requirements, and stopped. */
@@ -295,10 +320,7 @@ export function localServe(dataRoot: string, serveUrl?: string): { serveUrl: str
   return { serveUrl: `http://${host}:${config.server.port}`, token };
 }
 
-/** A worker slot's identity as a record keeps it: the machine (`<token>/<worker>`), not its slot (`…/eval-codex#2`). */
-export function machineOf(worker: string): string {
-  return worker.replace(/\/[^/]*#\d+$/, '');
-}
+export { machineOf };
 
 /** What a piece came back as: run by one of the run's own slots (its value or what it threw), or by a worker. */
 export type Published<T> =
@@ -342,6 +364,8 @@ export class RemoteEval {
   private lastWaitLog = 0;
   /** Set when the wait limit stopped the run. */
   stopped: WaitLimitError | null = null;
+  /** Pieces three different workers could not serve, in the order they stuck. */
+  readonly stuck: StuckPiece[] = [];
   /** Pieces published, and who served them, for the run's log. */
   readonly counts = { published: 0, workers: 0, local: 0 };
 
@@ -430,7 +454,7 @@ export class RemoteEval {
    * Publish one piece and wait for what becomes of it. `exec` is how the
    * run's own slot does it; a worker does it from the spec.
    */
-  async publish<T>(spec: Omit<EvalCallSpec, 'run' | 'key'> | Omit<EvalSessionSpec, 'run' | 'key'>, exec: () => Promise<T>): Promise<Published<T>> {
+  async publish<T>(spec: Omit<EvalCallSpec, 'run' | 'key'> | Omit<EvalSessionSpec, 'run' | 'key'>, exec: () => Promise<T>, tag: PieceTag | null = currentPieceTag()): Promise<Published<T>> {
     if (this.abort.signal.aborted) throw new RunCancelledError();
     const key = randomKey();
     const entry: Entry = { exec };
@@ -466,7 +490,16 @@ export class RemoteEval {
           continue;
         }
         this.unreachableSaid = false;
-        throw new Error(`no slot could serve it: ${o.lastError}`);
+        // three different workers could not serve it: reported, left unanswered, and the run goes on with the rest
+        const piece: StuckPiece = {
+          kind: spec.kind, label: spec.label, family: spec.agent.family, model: spec.agent.model, eligible: spec.eligible,
+          system: tag?.system ?? null, task: tag?.task ?? null, workers: o.workers, lastError: o.lastError, at: new Date().toISOString(),
+        };
+        this.stuck.push(piece);
+        const error = new PieceStuckError(piece);
+        this.log(error.message);
+        this.opts.onStuck?.(piece);
+        throw error;
       }
     } finally {
       this.entries.delete(key);
@@ -475,6 +508,16 @@ export class RemoteEval {
         this.unmetSince.delete(rk);
       }
     }
+  }
+
+  /** Pieces stuck since `since` (an index into `stuck`) for this system (and task, when given). */
+  stuckFor(since: number, system: string, task?: string): StuckPiece[] {
+    return this.stuck.slice(since).filter((p) => p.system === system && (task === undefined || p.task === task));
+  }
+
+  /** The run's own slots finish what they are doing (at most `ms`). */
+  async drained(ms = 10_000): Promise<void> {
+    await Promise.race([Promise.allSettled(this.loops), sleep(ms)]);
   }
 
   /** A folder a worker's session reads, as an archive `serve` holds; null on the run's own broker. */
@@ -660,7 +703,7 @@ export class PublishedChatBackend implements ChatBackend {
       prompt: leaves ? renderCliPrompt(req.messages, req.json) : '',
       schema: leaves ? req.schema ?? null : null,
       timeoutMs: 900_000,
-    }, () => this.local.complete(req));
+    }, () => this.local.complete(req), tag ? { system: tag.system, ...(tag.task ? { task: tag.task } : {}) } : null);
     if (p.local) {
       if ('error' in p) throw p.error;
       return p.value;
@@ -681,7 +724,7 @@ export function remoteJudgeClient(client: LlmClient, remote: RemoteEval, judge: 
     const p = await remote.publish({
       kind: 'eval-call', eligible: judge.eligible, label: 'judge', agent: { family: judge.family, model: judge.model, effort: judge.effort, speed: null },
       prompt: leaves ? renderCliPrompt(messages, Boolean(opts.json)) : '', schema: null, timeoutMs: 600_000,
-    }, here);
+    }, here, { system: '__judge__' });
     if (p.local) {
       if (judge.backend) notePlacement({ backend: judge.backend });
       if ('error' in p) throw p.error;
@@ -769,7 +812,10 @@ export function agentResultOf(s: EvalSessionAnswer, opts: AgentRunOptions, at: {
   for (const line of s.stdout.split('\n')) trace.line(line);
   const capped = trace.capped || s.capped;
   const text = (s.lastMessage ?? '').trim();
-  const error = s.exitCode !== 0 && !capped ? `codex exec exited with ${s.exitCode} on ${at.worker}: ${readCodexEvents(s.stdout).error ?? s.stderr.slice(-300)}` : undefined;
+  // a worker's session that ended on a signal (no exit code: -1; or 128 + the signal) with nothing to show: cancelled, asked again on resume
+  const killed = !capped && !text && (s.exitCode === -1 || s.exitCode === 130 || s.exitCode === 137 || s.exitCode === 143);
+  const error = killed ? `cancelled: the session on ${at.worker} was killed (exit ${s.exitCode})`
+    : s.exitCode !== 0 && !capped ? `codex exec exited with ${s.exitCode} on ${at.worker}: ${readCodexEvents(s.stdout).error ?? s.stderr.slice(-300)}` : undefined;
   return {
     text,
     usage: at.usage ?? readCodexEvents(s.stdout).usage,
@@ -782,6 +828,7 @@ export function agentResultOf(s: EvalSessionAnswer, opts: AgentRunOptions, at: {
     worker: at.worker,
     backend: at.backend,
     ...(error && !text ? { error } : {}),
+    ...(killed ? { cancelled: true } : {}),
   };
 }
 

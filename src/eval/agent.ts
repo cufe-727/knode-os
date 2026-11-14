@@ -107,6 +107,13 @@ export interface AgentRunResult {
   worker?: string;
   /** The CLI and model it ran on, `codex-cli:<model>` (or the API link's name). */
   backend?: string;
+  /** Killed by a signal, or stopped with the run: never an answer (its `error` says so). */
+  cancelled?: boolean;
+}
+
+/** Tokens a session's usage counts, 0 when it reported none. */
+export function usageTokens(u: CallUsage | null | undefined): number {
+  return u ? (u.inputTokens ?? 0) + (u.outputTokens ?? 0) + (u.reasoningTokens ?? 0) : 0;
 }
 
 const toml = (v: unknown) => JSON.stringify(v);
@@ -282,6 +289,10 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
   const t0 = Date.now();
   const newTrace = () => new AgentTrace({ cwd: opts.cwd, maxSteps, allowRoots: opts.allowRoots, onCap: () => child?.kill('SIGTERM') });
   let trace = newTrace();
+  // the run stopping stops its sessions: what they had is no answer (docs/design/32 §3)
+  const stopSignal = stopping;
+  const onStop = () => child?.kill('SIGTERM');
+  stopSignal?.addEventListener('abort', onStop, { once: true });
 
   try {
     let stdout = '';
@@ -321,6 +332,10 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
     }
     const events = readCodexEvents(stdout);
     const text = fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8').trim() : '';
+    // killed by a signal (not at its step cap), or ended with nothing at all while the run was stopping: cancelled, asked again on resume
+    const killed = (child as ChildProcess | null)?.signalCode ?? null;
+    const empty = !text && trace.steps === 0 && !usageTokens(events.usage);
+    const cancelled = !trace.capped && (killed ? `cancelled: codex was killed by ${killed}` : empty && stopSignal?.aborted ? 'cancelled: the session ended with nothing while the run was stopping' : null);
     return {
       text,
       usage: events.usage,
@@ -330,9 +345,10 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
       leaked: [...new Set(trace.leaked)],
       filesTouched: [...trace.touched],
       ms: Date.now() - t0,
-      ...(error && !text ? { error } : {}),
+      ...(cancelled ? { error: cancelled, cancelled: true } : error && !text ? { error } : {}),
     };
   } finally {
+    stopSignal?.removeEventListener('abort', onStop);
     out.cleanup();
   }
 }

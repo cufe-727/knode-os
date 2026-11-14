@@ -21,8 +21,8 @@ import { scoreGeneration } from './score/generation.js';
 import { scoreLists } from './score/lists.js';
 import { scoreKey, scoreUsage } from './score/usage.js';
 import { ChatBackend, ChatRequest, ClientBackend, CodexBackend, shimState, startShim } from './shim.js';
-import { withRemote } from './placement.js';
-import { judgeAgent, judgeFamily, PackScope, packMayLeave, PublishedChatBackend, RemoteEval, remoteJudgeClient, RunCancelledError } from './remote.js';
+import { currentRemote, withPieceTag, withRemote } from './placement.js';
+import { judgeAgent, judgeFamily, PackScope, packMayLeave, PieceStuckError, PublishedChatBackend, RemoteEval, remoteJudgeClient, RunCancelledError } from './remote.js';
 import type { EvalFamily } from '../work/eval.js';
 import type { Placed } from './meter.js';
 import { closeAdapters } from './systems/external.js';
@@ -178,6 +178,8 @@ export interface RunResult {
   builds: number;
   answers: number;
   scores: number;
+  /** Pieces three different workers could not serve (docs/design/32 §3): the run is incomplete. */
+  stuck: number;
 }
 
 /** `--replay-only`: what is not in the reply cache is not asked. */
@@ -357,7 +359,10 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   if (placement.legacy) queueLog(`work: no --remote and no --local: this run's model work runs on this machine, on --local ${describeLocal(placement.local!)} (sized from --slots)`);
   // the run stops on its caller's cancel, on a signal, or when it has waited its limit for a slot: whatever it stopped is not recorded
   const stop = new AbortController();
-  const waiting = { waitMinutes: opts.waitMinutes ?? 30, checkMs: opts.waitCheckMs, logEveryMs: opts.waitCheckMs ? opts.waitCheckMs * 12 : undefined, onStop: () => stop.abort() };
+  const waiting = {
+    waitMinutes: opts.waitMinutes ?? 30, checkMs: opts.waitCheckMs, logEveryMs: opts.waitCheckMs ? opts.waitCheckMs * 12 : undefined, onStop: () => stop.abort(),
+    onStuck: (piece: import('./remote.js').StuckPiece) => store.log('piece stuck', { ...piece }),
+  };
   let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run: runId, quota, log: queueLog, ...waiting }) : null;
   if (opts.remote && !remote) queueLog(`work: serve is not answering: the run publishes to a broker of its own${placement.local ? '' : ', and with no --local nothing takes its pieces'}`);
   remote ??= RemoteEval.own({ run: runId, quota, log: queueLog, refreshMs: opts.remote?.refreshMs, ...waiting });
@@ -561,7 +566,12 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           if (!done) {
             progress(`[${pack.manifest.id}/${group}] scoring generated knowledge`);
             const units = await exporter.exportKnowledge!(env);
-            for (const r of await scoreGeneration(pack, exporter.id, units, judge, taggedEmbedder(env, { system: '__score__', stage: 'embed' }), { seed })) store.putScore(r);
+            try {
+              for (const r of await scoreGeneration(pack, exporter.id, units, judge, taggedEmbedder(env, { system: '__score__', stage: 'embed' }), { seed })) store.putScore(r);
+            } catch (err) {
+              if (!(err instanceof PieceStuckError)) throw err;
+              progress(`[${pack.manifest.id}/${group}] generated knowledge left unscored for a resume: a judge call is stuck`);
+            }
           }
         }
         for (const s of members) await s.release?.(env);
@@ -585,13 +595,19 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
             const t0 = Date.now();
             let ok = true;
             let error: string | undefined;
+            const stuckMark = remote.stuck.length;
             try {
-              await updater.update!(files, env);
+              await withPieceTag({ system: group }, () => updater.update!(files, env));
             } catch (err) {
               ok = false;
               error = err instanceof Error ? err.message : String(err);
             }
             if (stop.signal.aborted) throw new RunCancelledError();
+            if (remote.stuckFor(stuckMark, group).length) {
+              progress(`[${pack.manifest.id}/${group}] update ${batch} left for a resume: a piece of it is stuck`);
+              failed.add(group);
+              continue;
+            }
             store.putBuild({ key, pack: pack.manifest.id, system: `${group}@${batch}`, ok, error, ms: Date.now() - t0, usage: meter.usage((e) => e.system === group, mark), stages: meter.stages(group, mark), bytes: 0, notes: { batch, files: files.length, tasks: tasks.length }, at: new Date().toISOString(), ...where(meter.placement((e) => e.system === group, mark)) });
           } else {
             // nothing to update, or a resumed run that updated already: reopen on the staged corpus as it now is
@@ -626,10 +642,19 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     });
 
     if (stop.signal.aborted) throw remote.stopped ?? new RunCancelledError();
-    if (!opts.skipScoring) await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing }, progress, meter);
+    if (!opts.skipScoring) {
+      try {
+        await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing }, progress, meter);
+      } catch (err) {
+        // the pass writes its scores at its end: a stuck judge call leaves the whole pass for a resume (its verdicts are cached)
+        if (!(err instanceof PieceStuckError)) throw err;
+        progress('scoring left for a resume: a judge call is stuck');
+      }
+    }
     const c = remote.counts;
-    progress(`work: ${c.published} pieces published; ${c.workers} served by workers, ${c.local} by this run's own slots`);
-    store.log('work', { ...c, broker: remote.where });
+    progress(`work: ${c.published} pieces published; ${c.workers} served by workers, ${c.local} by this run's own slots${remote.stuck.length ? `; ${remote.stuck.length} stuck` : ''}`);
+    store.log('work', { ...c, stuck: remote.stuck.length, broker: remote.where });
+    if (remote.stuck.length) progress(`incomplete: ${remote.stuck.length} piece(s) three different workers could not serve were left unanswered; resume with --run-dir ${runDir} once workers can`);
   } catch (err) {
     // a run the wait limit stopped says so, whatever stopped first on the way out
     if (remote.stopped) {
@@ -638,6 +663,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     }
     throw remote.stopped ?? err;
   } finally {
+    remote.close();
+    await remote.drained();
     setAgentRouting(null);
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);
@@ -653,7 +680,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     if (localShim !== shim) await localShim.close();
     for (const l of loaded) l.staged.cleanup();
   }
-  return { runDir, builds: store.allBuilds().length, answers: store.allAnswers().length, scores: store.allScores().length };
+  return { runDir, builds: store.allBuilds().length, answers: store.allAnswers().length, scores: store.allScores().length, stuck: remote.stuck.length };
 }
 
 /**
@@ -825,8 +852,10 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
   let peak = process.memoryUsage().rss;
   const sampler = setInterval(() => (peak = Math.max(peak, process.memoryUsage().rss)), 1000);
   let rec: BuildRecord;
+  const remote = currentRemote<PackScope>()?.remote;
+  const stuckMark = remote?.stuck.length ?? 0;
   try {
-    const r = await builder.build!(env);
+    const r = await withPieceTag({ system: group }, () => builder.build!(env));
     rec = {
       key, pack: env.pack.manifest.id, system: group, ok: true, ms: Date.now() - t0,
       usage: meter.usage((e) => e.system === group && !e.task, mark), stages: meter.stages(group, mark),
@@ -845,6 +874,12 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
   }
   // a cancelled run writes no record of what it stopped: a resumed run builds it whole
   if (signal?.aborted) throw new RunCancelledError();
+  // nor a build one of whose pieces is stuck: the group waits for a resume, and the run goes on without it
+  if (remote?.stuckFor(stuckMark, group).length) {
+    progress(`[${env.pack.manifest.id}/${group}] build left for a resume: a piece of it is stuck`);
+    for (const s of members) await s.release?.(env);
+    return false;
+  }
   store.putBuild(rec);
   if (!rec.ok) {
     store.log('build failed', { pack: env.pack.manifest.id, group, error: rec.error });
@@ -892,14 +927,17 @@ async function answerAll(
     const t0 = Date.now();
     let rec: AnswerRecord;
     const placed = () => ({ ...(repeat > 1 ? { repeat } : {}), ...where(meter.placement((e) => e.system === s.id && e.task === t.id, mark)) });
+    const remote = currentRemote<PackScope>()?.remote;
+    const stuckMark = remote?.stuck.length ?? 0;
     try {
-      const a = await s.answer!(t, taskPrompt(task), env);
+      const a = await withPieceTag({ system: s.id, task: t.id }, () => s.answer!(t, taskPrompt(task), env));
       rec = {
         key, pack: env.pack.manifest.id, system: s.id, taskId: task.id, ...(batch ? { batch } : {}), at: new Date().toISOString(),
         text: a.text, finalAnswer: extractFinalAnswer(a.text),
         citations: a.citations ?? citationsIn(a.text, docs), retrieved: a.retrieved ?? [], toolCalls: a.toolCalls ?? 0,
         ...(a.commands ? { commands: boundedTrace(a.commands) } : {}),
         ...(a.capped ? { capped: true } : {}), ...(a.leaked?.length ? { leaked: a.leaked } : {}), ...(a.error ? { error: a.error } : {}),
+        ...(a.error && /^cancelled:/.test(a.error) ? { cancelled: true } : {}),
         usage: meter.usage((e) => e.system === s.id && e.task === t.id, mark), ms: Date.now() - t0,
         ...placed(),
       };
@@ -913,6 +951,11 @@ async function answerAll(
     }
     // a cancelled run writes no record of what it stopped: a resumed run asks it whole
     if (signal?.aborted) return;
+    // nor does an answer one of whose pieces is stuck (docs/design/32 §3): it is left for a resume, never answered another way
+    if (remote?.stuckFor(stuckMark, s.id, t.id).length) {
+      progress(`[${env.pack.manifest.id}/${s.id}] ${task.id}: left unanswered, a piece of it is stuck`);
+      return;
+    }
     store.putAnswer(rec);
     if (++done % 10 === 0) progress(`[${env.pack.manifest.id}/${s.id}] ${done}/${todo.length}`);
   });

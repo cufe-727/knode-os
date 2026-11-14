@@ -49,3 +49,19 @@ export async function captureEither<T>(fn: () => Promise<T>): Promise<{ value?: 
     return { error, placements };
   }
 }
+
+/** The system and task a piece of work belongs to, carried along an answer or a build (a stuck piece names them). */
+export interface PieceTag {
+  system: string;
+  task?: string;
+}
+
+const pieceTag = new AsyncLocalStorage<PieceTag>();
+
+export function withPieceTag<T>(tag: PieceTag, fn: () => Promise<T>): Promise<T> {
+  return pieceTag.run(tag, fn);
+}
+
+export function currentPieceTag(): PieceTag | null {
+  return pieceTag.getStore() ?? null;
+}

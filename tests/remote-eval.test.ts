@@ -72,10 +72,10 @@ async function until(check: () => boolean | Promise<boolean>, ms = 30_000): Prom
 }
 
 /** A worker on loopback with evaluation slots, its CLIs the stand-in. */
-function startWorker(name: string, env: Record<string, string> = {}, slots = 'codex:4,claude:2'): ChildProcess {
+function startWorker(name: string, env: Record<string, string> = {}, slots = 'codex:4,claude:2', extra: string[] = []): ChildProcess {
   const child = spawn(process.execPath, [
     workerScript, '--server', base, '--workspace', 'admin/default', '--eval', slots, '--name', name,
-    '--codex-bin', path.join(tmp, 'bin', 'codex'), '--claude-bin', path.join(tmp, 'bin', 'claude'), '--idle-ms', '150', '--session-renew-ms', '300',
+    '--codex-bin', path.join(tmp, 'bin', 'codex'), '--claude-bin', path.join(tmp, 'bin', 'claude'), '--idle-ms', '150', '--session-renew-ms', '300', ...extra,
   ], {
     env: { ...process.env, KNODE_TOKEN: evalToken, KNODE_EVAL_CACHE_DIR: path.join(tmp, `cache-${name}`), KNODE_CODEX_CATALOG_HOURS: '0', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -404,10 +404,14 @@ describe('an evaluation run with remote workers', () => {
     };
     // offered straight to the source, past the producer's own checks: the worker checks every field again
     const offer = evalWork.sessions.offer(spec);
-    await until(() => logs.get('w2')!.some((l) => /refused the eval session/.test(l)), 20_000);
-    // the worker's refusal is its failure: the piece goes back in line (it never comes back to the run as an answer)
-    await until(() => sourceLog.some((l) => /eval bad bad: .* could not serve it \(fatal, .*refused the eval session: it names no model, or its model name is not one/.test(l)), 10_000);
-    offer.cancel();
+    try {
+      await until(() => logs.get('w2')!.some((l) => /refused the eval session/.test(l)), 20_000);
+      // the worker's refusal is its failure: the piece goes back in line (it never comes back to the run as an answer)
+      await until(() => sourceLog.some((l) => /eval bad bad: .* could not serve it \(fatal; .*refused the eval session: it names no model, or its model name is not one/.test(l)), 10_000);
+    } finally {
+      // a piece no worker will serve would wait for ever: the next test's workers must not find it
+      offer.cancel();
+    }
     expect(await offer.result).toEqual({ outcome: 'cancelled' });
   }, 30_000);
 });
@@ -469,5 +473,24 @@ describe('a run that waits for workers (docs/design/32 §3)', () => {
     expect(new Set(lines.map((l) => l.key)).size).toBe(3);
     expect(lines.filter((l) => l.error)).toEqual([]);
   }, 120_000);
-});
 
+  it('marks a piece three different workers could not serve as stuck, records nothing for it, and ends incomplete', async () => {
+    await stopAll();
+    // three machines whose Codex is missing: each one's failure is its own, never the piece's answer
+    for (const name of ['wa', 'wb', 'wc']) startWorker(name, {}, 'codex:1', ['--codex-bin', path.join(tmp, 'bin', 'no-codex')]);
+    const runDir = path.join(runs, 'stuck');
+    const res = await runEval({ ...common, limit: 1, packs: [packDir], systems: ['closed-book'], runDir, remote: remoteOpts(), skipScoring: true });
+    expect(res.stuck).toBe(1);
+    expect(new RunStore(runDir).allAnswers()).toEqual([]);
+    const events = fs.readFileSync(path.join(runDir, 'events.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { event: string; workers?: string[]; system?: string });
+    const stuck = events.find((e) => e.event === 'piece stuck')!;
+    expect(stuck.system).toBe('closed-book');
+    expect([...stuck.workers!].sort()).toEqual(['laptop/wa', 'laptop/wb', 'laptop/wc']);
+    // a resume with a worker that can answers it
+    await stopAll();
+    startWorker('wd', {}, 'codex:1');
+    const again = await runEval({ ...common, limit: 1, packs: [packDir], systems: ['closed-book'], runDir, remote: remoteOpts(), skipScoring: true });
+    expect(again.stuck).toBe(0);
+    expect(new RunStore(runDir).allAnswers().map((a) => a.worker)).toEqual(['laptop/wd']);
+  }, 120_000);
+});

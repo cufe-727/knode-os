@@ -278,6 +278,11 @@ export function registerEvalCommands(program: Command): void {
       if (!res) return;
       const report = writeReport(res.runDir);
       console.log(`\n${res.builds} builds, ${res.answers} answers, ${res.scores} scores\nreport: ${report.md}`);
+      // incomplete: pieces three different workers could not serve were left unanswered (docs/design/32 §3)
+      if (res.stuck) {
+        console.error(`incomplete: ${res.stuck} piece(s) stuck (listed in the report); resume with --run-dir ${res.runDir}`);
+        process.exitCode = 1;
+      }
       // child processes and embedder timers can keep the loop alive after a run: it is over
       process.exit(process.exitCode ?? 0);
     });
