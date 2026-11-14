@@ -17,8 +17,6 @@ import { PageContext } from '../graph/store.js';
 import { applyWirePlan, extractWikilinks, planWireFromMarkdown, WikiIndex } from '../graph/wire.js';
 import { isReservedWikiFile } from '../lineage/declared.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
-import { ScopeRow } from '../lineage/types.js';
-import { toIso } from '../store/temporal.js';
 import { ParsedMarkdown, parseFrontmatter, titleFromMarkdown } from '../markdown.js';
 import { isGeneratedConcept } from '../okf/index.js';
 import { pluginRegistry } from '../plugins/registry.js';
@@ -28,7 +26,7 @@ import { DocRoot } from '../types.js';
 import { hasProse, hasRegions, stripRegions } from '../wiki/regions.js';
 import { chunkCode, chunkText } from './chunker.js';
 import { splitCodebaseKey } from './codebase/files.js';
-import { docDateOf } from './docdate.js';
+import { DOC_DATE_RULES, documentDate, redateDocument } from './redate.js';
 import { detectLanguage } from '../lang/detect.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { MINDMAP_PLAN_VERSION, MindMapPlan, planDocumentMindMap, wireMindMap, withMindMapSubject } from '../mindmap/graph.js';
@@ -36,6 +34,8 @@ import { isMindMapFrontmatter, mindMapChunks, parseMindMap } from '../mindmap/ou
 import type { DeferredEmbeddings } from '../context.js';
 import { EmbeddingProvider } from './embeddings.js';
 import { loadSourceText, sha256 } from './source.js';
+
+export { DOC_DATE_RULES } from './redate.js';
 
 /**
  * Apply one file as a document scope: chunk → embed (reusing unchanged
@@ -169,17 +169,17 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     && !isReservedWikiFile(file) && raw.includes('raw/docs/');
   // a mind map applied by an older planner is read again once (docs/design/19)
   const mindMapStale = live !== null && live.sha === sha && sameModel && live.meta.mindmap !== MINDMAP_PLAN_VERSION && looksLikeMindMap(raw);
-  // a source dated by older rules is applied again
-  const stale = root === 'docs' && live !== null && live.sha === sha && sameModel && !opts.reapply
-    ? await staleApplication(store, live, file, raw, docId)
-    : null;
-  if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale && !mindMapStale && !stale?.redo) {
+  // a document applied under older date rules has its date read again, and is re-dated in place when it reads otherwise
+  const code = root === 'codebase';
+  const parse = (): ParsedMarkdown => (code ? { frontmatter: {}, body: raw } : parseFrontmatter(raw));
+  if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale && !mindMapStale) {
+    await redateDocument(store, live, { file, root, raw, sha, docId, at: opts.at }, parse, progress);
+  }
+  if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale && !mindMapStale) {
     // a sidecar may have gained a replayable tier-1 extraction since (copied
     // from another machine, or written by a bench run) — apply it as the
     // document's child scope without re-indexing the document itself
     if (root === 'docs') {
-      // nothing to redo: the scope says which rules it was checked against, so the next pass skips it
-      if (stale) await store.query(`UPDATE scopes SET meta = meta || $2::jsonb WHERE id = $1`, [live.id, JSON.stringify(APPLY_RULES)]);
       await ensureTier1Replay(store, file, raw, sha, docId, opts);
       // an extraction from before segmented extraction read only the start of
       // a long document: queue it again so the rest gets read (docs/design/10)
@@ -190,14 +190,13 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     return { outcome: 'unchanged', ...none, scopeId: live.id, sha };
   }
 
-  progress(stale?.redo ? `applying ${file} again: ${stale.reason}` : `indexing ${file}`);
+  progress(`indexing ${file}`);
   // source code has no frontmatter: a YAML file or a README's own header is its text, not knode metadata
-  const code = root === 'codebase';
-  const parsed: ParsedMarkdown = code ? { frontmatter: {}, body: raw } : parseFrontmatter(raw);
+  const parsed = parse();
   const title = code ? codebaseTitle(file) : titleFromMarkdown(file, parsed);
   const cls = await classify(store, file, root, parsed);
   // a raw document may date itself in its first lines; a wiki page, a trace or source code is dated by its metadata alone
-  const docDate = docDateOf(file, parsed.frontmatter, root === 'docs' ? parsed.body : null, opts.at);
+  const docDate = documentDate(file, root, parsed, opts.at);
   // what a reader would read it as: the Translate stage reads this (docs/design/17);
   // '' is "read, and in no language", which no backfill needs to read again — and code is never translated
   const language = code ? '' : detectLanguage(raw, parsed.frontmatter) ?? '';
@@ -313,12 +312,12 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     {
       actor,
       at: opts.at,
-      force: Boolean(live && (!sameModel || opts.reapply || citationsStale || mindMapStale || stale?.redo)),
+      force: Boolean(live && (!sameModel || opts.reapply || citationsStale || mindMapStale)),
       keepProjectionOnReplace: true,
       trust,
       acl: declaredAcl,
       meta: {
-        documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title, ...APPLY_RULES,
+        documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title, dateRules: DOC_DATE_RULES,
         ...(root === 'wiki' ? { citations: CITATIONS_VERSION } : {}),
         ...(mindMapPlan ? { mindmap: MINDMAP_PLAN_VERSION } : {}),
       },
@@ -467,33 +466,6 @@ async function ensureTier1Replay(store: Store, file: string, raw: string, sha: s
     extractedAt: tier1.segmenter ? tier1.extractedAt : undefined,
     segments: tier1Segments(raw, tier1),
   });
-}
-
-/**
- * The rules a document's scope was applied under, beside its bytes: how its
- * date is read (`dateRules`, bump DOC_DATE_RULES when docDateOf reads dates
- * differently — a dateline at the top, say). Claim identity is not here:
- * src/graph/claim-rekey.ts moves an existing workspace's claims itself.
- */
-export const DOC_DATE_RULES = 1;
-const APPLY_RULES = { dateRules: DOC_DATE_RULES };
-
-/**
- * Whether an unchanged source must be applied again because the rules it was
- * applied under changed (null: it was applied under these). Its date is read
- * again, and when it comes out other than the stored doc_date the document is
- * applied again — the stored extraction too, so every claim is dated from what
- * it stated ("去年" resolved on the new date) or, stating nothing, from the new
- * date; a corrected date is followed the same way. Each document is its own transaction in a sync
- * pass, and a document checked is marked, so a stopped pass resumes where it was.
- */
-async function staleApplication(store: Store, live: ScopeRow, file: string, raw: string, docId: string): Promise<{ redo: boolean; reason: string } | null> {
-  if (live.meta.dateRules === DOC_DATE_RULES) return null;
-  const now = docDateOf(file, parseFrontmatter(raw).frontmatter);
-  const [row] = await store.query<{ doc_date: string | Date | null }>(`SELECT doc_date FROM documents WHERE id = $1`, [docId]);
-  const was = toIso(row?.doc_date ?? null);
-  if (now !== was) return { redo: true, reason: `its date reads ${now?.slice(0, 10) ?? 'none'} now, was ${was?.slice(0, 10) ?? 'none'}` };
-  return { redo: false, reason: '' };
 }
 
 export function guessMime(file: string): string {
