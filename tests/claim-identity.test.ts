@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
-import { auditDuplicateClaims } from '../src/graph/claim-dedupe.js';
+import { auditDuplicateClaims, datesApart, eventSpanEnd } from '../src/graph/claim-dedupe.js';
 import { refreshClaimState } from '../src/graph/claim-state-store.js';
 import { RawExtractReply } from '../src/graph/llm-extract.js';
 import { claimId } from '../src/graph/store.js';
@@ -153,5 +153,72 @@ describe('weekly readings of one measure', () => {
     expect(series.map((r) => [r.value_num, r.effective_at.toISOString().slice(0, 10), r.superseded_by === null])).toEqual(
       WEEKS.map((v, k) => [v, monday(k), k === WEEKS.length - 1]),
     );
+  });
+});
+
+describe('the dates a claim states of itself', () => {
+  it('read an event as the widest period its start date allows', () => {
+    expect(eventSpanEnd('2025-09-08T00:00:00.000Z')).toBe('2025-09-14T23:59:59.999Z'); // a Monday: 2025-W37
+    expect(eventSpanEnd('2025-09-01T00:00:00.000Z')).toBe('2025-09-30T23:59:59.999Z'); // 2025-09
+    expect(eventSpanEnd('2025-04-01T00:00:00.000Z')).toBe('2025-06-30T23:59:59.999Z'); // 2025Q2
+    expect(eventSpanEnd('2025-07-01T00:00:00.000Z')).toBe('2025-12-31T23:59:59.999Z'); // 2025Q3 or 2025H2
+    expect(eventSpanEnd('2025-01-01T00:00:00.000Z')).toBe('2025-12-31T23:59:59.999Z'); // 2025
+    expect(eventSpanEnd('2025-06-18T00:00:00.000Z')).toBe('2025-06-18T23:59:59.999Z'); // a Wednesday
+    expect(eventSpanEnd('2025-06-16T02:00:00.000Z')).toBe('2025-06-16T23:59:59.999Z'); // a time of day, on a Monday
+  });
+
+  it('settle a pair apart only when both are known and miss each other', () => {
+    const none = { valid_from: null, valid_to: null, event_at: null };
+    const week = (from: string, to: string) => ({ ...none, valid_from: from, valid_to: to });
+    const event = (at: string) => ({ ...none, event_at: at });
+    expect(datesApart(week('2025-01-06', '2025-01-10T23:59:59Z'), week('2025-01-20', '2025-01-24T23:59:59Z'))).toBe(true);
+    expect(datesApart(week('2025-01-06', '2025-01-10T23:59:59Z'), week('2025-01-08', '2025-01-24T23:59:59Z'))).toBe(false);
+    // an open window holds from its start on
+    expect(datesApart({ ...none, valid_from: '2025-05-19' }, week('2025-05-05', '2025-05-09T23:59:59Z'))).toBe(true);
+    expect(datesApart({ ...none, valid_from: '2025-05-01' }, week('2025-05-05', '2025-05-09T23:59:59Z'))).toBe(false);
+    // events: two weeks apart; a week against a window; a quarter's event against a month inside it
+    expect(datesApart(event('2025-08-25T00:00:00Z'), event('2025-10-27T00:00:00Z'))).toBe(true);
+    expect(datesApart(event('2025-08-25T00:00:00Z'), week('2025-08-27', '2025-08-29T23:59:59Z'))).toBe(false);
+    expect(datesApart(event('2025-07-01T00:00:00Z'), week('2025-08-01', '2025-08-31T23:59:59Z'))).toBe(false);
+    expect(datesApart(event('2025-09-08T00:00:00Z'), week('2025-10-13', '2025-10-17T23:59:59Z'))).toBe(true);
+    // a date only the document gives is not the claim's own
+    expect(datesApart({ ...none }, week('2025-01-06', '2025-01-10T23:59:59Z'))).toBe(false);
+  });
+});
+
+describe('the duplicate-claim audit before the judge', () => {
+  const opened: AppContext[] = [];
+  afterAll(async () => {
+    for (const ctx of opened) {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+  it('settles worded-alike events of other weeks itself, and still asks about one week', async () => {
+    const dataDir = path.join(tmp, 'events');
+    initDataDir(dataDir);
+    const doc = (title: string, statement: string, eventDate: string) => [
+      '---', `title: ${title}`, 'entities:', '  - { name: 平台组, type: organization }',
+      'claims:', `  - { subject: 平台组, statement: ${JSON.stringify(statement)}, eventDate: "${eventDate}" }`, '---', `# ${title}`, '',
+    ].join('\n');
+    const files: [string, string][] = [
+      ['raw/docs/a.md', doc('第10周', '平台组发生缓存击穿事故，已由常博修复', '2025-W10')],
+      ['raw/docs/b.md', doc('第20周', '平台组发生缓存击穿事故，已由余涛修复', '2025-W20')],
+      ['raw/docs/c.md', doc('第20周补记', '平台组发生缓存击穿事故，已由余涛修复完毕', '2025-W20')],
+    ];
+    for (const [p, text] of files) {
+      fs.mkdirSync(path.dirname(path.join(dataDir, p)), { recursive: true });
+      fs.writeFileSync(path.join(dataDir, p), text);
+    }
+    const ctx = await createContext(dataDir);
+    opened.push(ctx);
+    await sync(ctx, { llmGraph: false });
+    expect(await ctx.store.query(`SELECT 1 FROM claims WHERE subject_id = '平台组' AND event_at IS NOT NULL AND tx_to IS NULL`)).toHaveLength(3);
+    const judged = { pairs: 0 };
+    const stats = await auditDuplicateClaims({ store: ctx.store, embedder: ctx.embedder, config: ctx.config, llm: countingJudge(judged) });
+    // week 10 against either of week 20 is settled by the dates; the two of week 20 are the judge's
+    expect(stats.differentTime).toBe(2);
+    expect(judged.pairs).toBe(1);
   });
 });
