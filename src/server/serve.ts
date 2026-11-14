@@ -777,6 +777,26 @@ function startWorkspaceServices(
 }
 
 /**
+ * The tier-2 passes of this server's workspaces take turns. Every workspace's
+ * timer fires in the same minute, and each pass walks its whole graph: run
+ * together their heaps add up with the number of workspaces (2026-11-13: six
+ * passes started at 03:10, finance's among them, and the server died at its
+ * heap limit at 03:25). A pass that fails gives the turn on.
+ */
+let tier2Line: Promise<void> = Promise.resolve();
+let tier2Busy = 0;
+
+function tier2InTurn(pass: () => Promise<void>, log: (msg: string) => void): Promise<void> {
+  if (tier2Busy > 0) log(`tier2 waits its turn: ${tier2Busy} other workspace${tier2Busy === 1 ? "'s pass is" : "s' passes are"} ahead of it`);
+  tier2Busy++;
+  const run = tier2Line.then(pass).finally(() => {
+    tier2Busy--;
+  });
+  tier2Line = run.catch(() => {});
+  return run;
+}
+
+/**
  * Run the tier-2 pass daily, a few minutes after the dream schedule
  * (`nightlySchedule`). Like Dream's, it reads the schedule on every tick, so the
  * pass keeps following Dream when the config changes. Exported for tests.
@@ -784,7 +804,8 @@ function startWorkspaceServices(
  * `hold` is the quota floor over background work
  * (src/labeling/background-floor.ts): while the plan the Judge or the
  * Summarize stage runs on is under it — the pass writes with both — that
- * night's pass is skipped, with a log line.
+ * night's pass is skipped, with a log line. The passes of several workspaces
+ * run one at a time (`tier2InTurn`).
  */
 export function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void, opts: { hold?: BackgroundHold } = {}): NodeJS.Timeout {
   let lastRun = '';
@@ -799,19 +820,21 @@ export function startTier2Scheduler(ctx: AppContext, log: (msg: string) => void,
         log(`tier2 skipped: ${held.reason} (processing.minQuotaPercent)${held.until ? `; the window resets ${held.until}` : ''}`);
         return;
       }
-      const end = activityOf(ctx.dataDir).begin('tier2', 'Nightly tier-2 pass: merges, claim reviews, views and the wiki check');
-      try {
-        const res = await refineWiki(ctx.store, ctx.config, ctx.llm, { onProgress: log, embedder: ctx.embedder });
-        log(`tier2 done: ${res.mergeCandidates} merge suggestions, ${res.claimReviews} claim reviews, ${res.recommendations} research recommendations${res.retiredPages ? `, ${res.retiredPages} cluster pages archived` : ''}`);
-        const views = await reconcileViews(ctx, { actor: 'tier2', llm: true, onProgress: log });
-        if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
-        const lint = await lintWiki(ctx, { onProgress: log });
-        log(`wiki lint: ${lint.issues.length} findings → ${lint.reportPath}`);
-        end({ detail: `${res.mergeCandidates} merge suggestions, ${res.claimReviews} claim reviews, ${lint.issues.length} wiki findings` });
-      } catch (err) {
-        log(`tier2 failed: ${err instanceof Error ? err.message : err}`);
-        end({ ok: false, detail: err instanceof Error ? err.message : String(err) });
-      }
+      await tier2InTurn(async () => {
+        const end = activityOf(ctx.dataDir).begin('tier2', 'Nightly tier-2 pass: merges, claim reviews, views and the wiki check');
+        try {
+          const res = await refineWiki(ctx.store, ctx.config, ctx.llm, { onProgress: log, embedder: ctx.embedder });
+          log(`tier2 done: ${res.mergeCandidates} merge suggestions, ${res.claimReviews} claim reviews, ${res.recommendations} research recommendations${res.retiredPages ? `, ${res.retiredPages} cluster pages archived` : ''}`);
+          const views = await reconcileViews(ctx, { actor: 'tier2', llm: true, onProgress: log });
+          if (views.regenerated || views.archived) log(`views: ${views.regenerated} regenerated, ${views.archived} archived`);
+          const lint = await lintWiki(ctx, { onProgress: log });
+          log(`wiki lint: ${lint.issues.length} findings → ${lint.reportPath}`);
+          end({ detail: `${res.mergeCandidates} merge suggestions, ${res.claimReviews} claim reviews, ${lint.issues.length} wiki findings` });
+        } catch (err) {
+          log(`tier2 failed: ${err instanceof Error ? err.message : err}`);
+          end({ ok: false, detail: err instanceof Error ? err.message : String(err) });
+        }
+      }, log);
     }
   }, 30 * 1000);
   timer.unref?.();

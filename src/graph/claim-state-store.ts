@@ -2,6 +2,7 @@ import { breather } from '../pool.js';
 import { Store } from '../store/db.js';
 import { EvidenceAtRow, foldClaimEvidence, groupBy, toDateString, toIso } from '../store/temporal.js';
 import { CLAIM_STATE_VERSION, sameValue, unifyAttributeKeys } from './claim-state.js';
+import { packSubjectBatches } from './subject-batches.js';
 
 /**
  * Claim state in the store (docs/design/29): the lazy backfill that reads
@@ -14,6 +15,12 @@ import { CLAIM_STATE_VERSION, sameValue, unifyAttributeKeys } from './claim-stat
 /** Claims read per refine run at most: on finance's 236k claims the backfill takes a few nights, a few seconds each. */
 export const CLAIM_STATE_BACKFILL_LIMIT = 50_000;
 const BATCH = 2000;
+/**
+ * Claims supersession reads at once: whole subjects (a series never leaves its subject). Every
+ * claim with an attribute used to be read in one query, which grows with the backfill: all of
+ * finance's claims once it has read them.
+ */
+export const SERIES_CLAIMS_PER_BATCH = 50_000;
 
 /**
  * Read the state of live claims folded before claim state existed, or by an
@@ -171,39 +178,56 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
  * Disputed, absent, opinion and rumour claims take no part. Returns the
  * claims whose mark changed.
  */
-export async function supersedeByAttribute(store: Store): Promise<number> {
-  const rows = await store.query<StateRow>(
-    `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(ak.canonical, c.attribute) AS attribute,
-            COALESCE(oe.canonical_id, c.object_id) AS object_id, c.kind, c.value_num, c.value_text, c.unit,
-            COALESCE(c.effective_at, c.event_at, c.valid_from, c.observed_at) AS eff, c.valid_to, c.correction, c.superseded_by, c.tx_from
-     FROM claims c
-     JOIN entities se ON se.id = c.subject_id
-     LEFT JOIN entities oe ON oe.id = c.object_id
-     LEFT JOIN claim_attribute_keys ak ON ak.subject_id = c.subject_id AND ak.attribute = c.attribute
-     WHERE c.tx_to IS NULL AND c.canonical_id IS NULL AND c.attribute IS NOT NULL
-       AND c.status IN ('fact', 'suspected') AND c.kind IN ('fact', 'prediction')`,
+export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?: number } = {}): Promise<number> {
+  const taking = `c.tx_to IS NULL AND c.canonical_id IS NULL AND c.attribute IS NOT NULL
+       AND c.status IN ('fact', 'suspected') AND c.kind IN ('fact', 'prediction')`;
+  // a series lies within one canonical subject: whole subjects, a batch at a time (SERIES_CLAIMS_PER_BATCH)
+  const batches = packSubjectBatches(
+    await store.query<{ subject_id: string; subject: string; n: number }>(
+      `SELECT c.subject_id, COALESCE(se.canonical_id, c.subject_id) AS subject, count(*)::int AS n
+       FROM claims c JOIN entities se ON se.id = c.subject_id
+       WHERE ${taking}
+       GROUP BY 1, 2`,
+    ),
+    opts.claimsPerBatch ?? SERIES_CLAIMS_PER_BATCH,
   );
   const pause = breather();
-  const ids: string[] = [];
-  const marks: (string | null)[] = [];
-  for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${r.object_id ?? ''}\u0000${r.kind}`).values()) {
+  let changed = 0;
+  for (const batch of batches) {
     await pause();
-    const want = seriesSupersession(series);
-    for (const r of series) {
-      const w = want.get(r.id) ?? null;
-      if (w !== r.superseded_by) {
-        ids.push(r.id);
-        marks.push(w);
+    const rows = await store.query<StateRow>(
+      `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(ak.canonical, c.attribute) AS attribute,
+              COALESCE(oe.canonical_id, c.object_id) AS object_id, c.kind, c.value_num, c.value_text, c.unit,
+              COALESCE(c.effective_at, c.event_at, c.valid_from, c.observed_at) AS eff, c.valid_to, c.correction, c.superseded_by, c.tx_from
+       FROM claims c
+       JOIN entities se ON se.id = c.subject_id
+       LEFT JOIN entities oe ON oe.id = c.object_id
+       LEFT JOIN claim_attribute_keys ak ON ak.subject_id = c.subject_id AND ak.attribute = c.attribute
+       WHERE ${taking} AND c.subject_id = ANY($1::text[])`,
+      [batch.subjectIds],
+    );
+    const ids: string[] = [];
+    const marks: (string | null)[] = [];
+    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${r.object_id ?? ''}\u0000${r.kind}`).values()) {
+      await pause();
+      const want = seriesSupersession(series);
+      for (const r of series) {
+        const w = want.get(r.id) ?? null;
+        if (w !== r.superseded_by) {
+          ids.push(r.id);
+          marks.push(w);
+        }
       }
     }
+    for (let i = 0; i < ids.length; i += 5000) {
+      await store.query(
+        `UPDATE claims c SET superseded_by = x.s FROM unnest($1::text[], $2::text[]) AS x(id, s) WHERE c.id = x.id`,
+        [ids.slice(i, i + 5000), marks.slice(i, i + 5000)],
+      );
+    }
+    changed += ids.length;
   }
-  for (let i = 0; i < ids.length; i += 5000) {
-    await store.query(
-      `UPDATE claims c SET superseded_by = x.s FROM unnest($1::text[], $2::text[]) AS x(id, s) WHERE c.id = x.id`,
-      [ids.slice(i, i + 5000), marks.slice(i, i + 5000)],
-    );
-  }
-  return ids.length;
+  return changed;
 }
 
 /** Refine's claim-state step: read what is unread, unify keys, then mark supersession. */

@@ -10,10 +10,11 @@ import { reviewClaims } from '../graph/claim-review.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { writeDeps } from '../lineage/deps.js';
 import { LlmClient } from '../llm/client.js';
+import { breather } from '../pool.js';
 import { CLAIM_TYPES } from '../graph/store.js';
 import { alikeWording, wordingOf } from '../graph/wording.js';
 import { Store } from '../store/db.js';
-import { toDateString, toIso } from '../store/temporal.js';
+import { groupBy, toDateString } from '../store/temporal.js';
 import { refreshNavigationIfChanged } from './navigation.js';
 import { ensureHotTopics, PagesContext, retireConceptClusterPages } from './pages.js';
 
@@ -169,15 +170,6 @@ export async function refineWiki(
 }
 
 /**
- * Zero-LLM claim audit over live facts (kind = fact; views, forecasts and
- * rumours are neither stale nor contradicted): flag contradictions (same
- * subject + type + object with clashing status, or near-duplicate statements
- * from different sources) and expired facts (valid_to in the past). Findings become
- * suggestions (kind 'knowledge') that declare the claims they depend on, so a
- * claim that disappears marks its suggestion stale instead of leaving it
- * dangling.
- */
-/**
  * Supersession. A claim that gives the value of an attribute (docs/design/29)
  * takes part in its attribute's series, in every domain: the newest by
  * effective date is current, the rest are history, and a correction replaces
@@ -195,75 +187,169 @@ export async function refineWiki(
  */
 export async function markSupersededClaims(store: Store): Promise<number> {
   const byAttribute = await supersedeByAttribute(store);
-  const rows = await store.query<{ id: string; subject_id: string; type: string; object_id: string | null; valid_from: string | Date; valid_to: string | Date | null; superseded_by: string | null }>(
-    `SELECT id, subject_id, type, object_id, valid_from, valid_to, superseded_by FROM claims
-     WHERE tx_to IS NULL AND canonical_id IS NULL AND status = 'fact' AND kind = 'fact' AND valid_from IS NOT NULL
-       AND attribute IS NULL AND type = ANY($1::text[])
-     ORDER BY subject_id, type, object_id, valid_from ASC, tx_from ASC`,
-    [CLAIM_TYPES.filter((t) => t.supersedes).map((t) => t.id)],
-  );
   // with a closed type list "same subject and type" is coarse, so only the
   // measure-like types take part (CLAIM_TYPES.supersedes: a later period of
   // earnings, a later holding of the same stock …) and the object is part of
-  // the key; views, forecasts and rumours are never current facts
-  const groups = new Map<string, typeof rows>();
-  for (const r of rows) {
-    const key = `${r.subject_id}|${r.type}|${r.object_id ?? ''}`;
-    (groups.get(key) ?? groups.set(key, []).get(key)!).push(r);
-  }
-  let changed = 0;
-  for (const group of groups.values()) {
-    for (let i = 0; i + 1 < group.length; i++) {
-      const older = group[i];
-      const newer = group[i + 1];
-      const olderFrom = toIso(older.valid_from)!;
-      const newerFrom = toIso(newer.valid_from)!;
-      const olderTo = toIso(older.valid_to);
-      if (olderFrom >= newerFrom || (olderTo && olderTo > newerFrom)) continue;
-      if (older.superseded_by === newer.id) continue;
-      await store.query(`UPDATE claims SET superseded_by = $2 WHERE id = $1`, [older.id, newer.id]);
-      changed++;
-    }
-  }
-  const cleared = await store.query<{ id: string }>(
-    `UPDATE claims c SET superseded_by = NULL
-     WHERE superseded_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM claims n WHERE n.id = c.superseded_by AND n.tx_to IS NULL)
-     RETURNING id`,
+  // the key; views, forecasts and rumours are never current facts.
+  // Worked out in the database, each claim against the next of its series: they
+  // used to be read into the server (finance, 2026-11-13: 53,007 claims) and
+  // marked with a statement each (1,290 that night).
+  const [marked] = await store.query<{ n: number }>(
+    `WITH series AS (
+       SELECT id, valid_from, valid_to,
+              lead(id) OVER w AS newer_id, lead(valid_from) OVER w AS newer_from
+       FROM claims
+       WHERE tx_to IS NULL AND canonical_id IS NULL AND status = 'fact' AND kind = 'fact' AND valid_from IS NOT NULL
+         AND attribute IS NULL AND type = ANY($1::text[])
+       WINDOW w AS (PARTITION BY subject_id, type, object_id ORDER BY valid_from ASC, tx_from ASC, id ASC)
+     ), marks AS (
+       UPDATE claims c SET superseded_by = s.newer_id
+       FROM series s
+       WHERE c.id = s.id AND s.newer_id IS NOT NULL
+         AND s.valid_from < s.newer_from AND (s.valid_to IS NULL OR s.valid_to <= s.newer_from)
+         AND c.superseded_by IS DISTINCT FROM s.newer_id
+       RETURNING 1
+     )
+     SELECT count(*)::int AS n FROM marks`,
+    [CLAIM_TYPES.filter((t) => t.supersedes).map((t) => t.id)],
   );
-  return byAttribute + changed + cleared.length;
+  const [cleared] = await store.query<{ n: number }>(
+    `WITH gone AS (
+       UPDATE claims c SET superseded_by = NULL
+       WHERE superseded_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM claims n WHERE n.id = c.superseded_by AND n.tx_to IS NULL)
+       RETURNING 1
+     )
+     SELECT count(*)::int AS n FROM gone`,
+  );
+  return byAttribute + marked.n + cleared.n;
+}
+
+/** Findings the claim audit files a night; the rest are only counted. */
+const AUDIT_FILED = 20;
+/** Claims the near-duplicate check reads at a time (and the subject the page ends in). */
+const AUDIT_PAGE = 20_000;
+
+interface AuditIssue {
+  title: string;
+  body: string;
+  evidence: string[];
+  claims: string[];
+}
+
+interface AuditClaim {
+  id: string;
+  subject_id: string;
+  subject: string;
+  type: string;
+  object_id: string | null;
+  statement: string;
+  status: string;
+  primary_scope_id: string | null;
+  path: string | null;
+}
+
+const AUDIT_FROM = `FROM claims cl
+     JOIN entities e ON e.id = cl.subject_id
+     LEFT JOIN scopes s ON s.id = cl.primary_scope_id
+     WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL AND e.tx_to IS NULL`;
+
+/**
+ * Similar statements of one (subject, type, object) group of facts from
+ * different sources: counted, and the first `room` of them kept. Read a page
+ * of claims at a time in subject order, a subject's claims held until the
+ * subject ends, so the heap holds a page and one subject however many claims
+ * there are. Groups whose statuses clash are the contradiction check's.
+ */
+async function nearDuplicateIssues(store: Store, room: number, pageSize: number): Promise<{ count: number; issues: AuditIssue[] }> {
+  const issues: AuditIssue[] = [];
+  let count = 0;
+  const pause = breather();
+  const compare = (claims: AuditClaim[]) => {
+    for (const group of groupBy(claims, (c) => `${c.type}|${c.object_id ?? ''}`).values()) {
+      if (group.length < 2) continue;
+      if (group.some((c) => c.status === 'fact') && group.some((c) => c.status === 'disputed')) continue;
+      const wordings = group.map((c) => wordingOf(c.statement));
+      for (let i = 0; i < group.length; i++) {
+        for (let j = i + 1; j < group.length; j++) {
+          const a = group[i], b = group[j];
+          if (!a.primary_scope_id || a.primary_scope_id === b.primary_scope_id || a.statement === b.statement) continue;
+          if (alikeWording(wordings[i], wordings[j]) === null) continue;
+          count++;
+          if (issues.length < room) {
+            issues.push({
+              title: `多来源相似断言待核对: ${a.subject}`,
+              body: `不同文档对 "${a.subject}" 有相似但不一致的表述：\n- ${a.statement} (${a.path ?? '?'})\n- ${b.statement} (${b.path ?? '?'})\n可能是同一事实的不同版本，建议在 wiki 中统一。`,
+              evidence: [a.statement, b.statement],
+              claims: [a.id, b.id],
+            });
+          }
+        }
+      }
+    }
+  };
+  let subject: AuditClaim[] = [];
+  let after: [string, string] = ['', ''];
+  for (;;) {
+    await pause();
+    const page = await store.query<AuditClaim>(
+      `SELECT cl.id, cl.subject_id, e.name AS subject, cl.type, cl.object_id, cl.statement, cl.status, cl.primary_scope_id, s.key AS path
+       ${AUDIT_FROM} AND cl.kind = 'fact' AND (cl.subject_id, cl.id) > ($1, $2)
+       ORDER BY cl.subject_id, cl.id LIMIT $3`,
+      [after[0], after[1], pageSize],
+    );
+    for (const c of page) {
+      if (subject.length > 0 && subject[0].subject_id !== c.subject_id) {
+        compare(subject);
+        subject = [];
+      }
+      subject.push(c);
+    }
+    if (page.length < pageSize) break;
+    after = [page[page.length - 1].subject_id, page[page.length - 1].id];
+  }
+  compare(subject);
+  return { count, issues };
 }
 
 /**
+ * Zero-LLM claim audit over live facts (kind = fact; views, forecasts and
+ * rumours are neither stale nor contradicted): flag contradictions (same
+ * subject + type + object with clashing status, or near-duplicate statements
+ * from different sources) and expired facts (valid_to in the past). Findings become
+ * suggestions (kind 'knowledge') that declare the claims they depend on, so a
+ * claim that disappears marks its suggestion stale instead of leaving it
+ * dangling.
+ *
  * `nearDuplicates`: also flag similar statements from different sources —
  * only while duplicate-claim merging is off; otherwise the Judge's verdicts
  * (merge, or a contradiction suggestion) already covered those pairs.
+ *
+ * The findings are counted in the database and only the AUDIT_FILED that are
+ * filed are read, oldest claims first. Every live claim used to be read for
+ * it, statement and source path included: on finance (2026-11-13: 1,105,684
+ * claims, 70,302 findings) 0.9 GB of heap, for twenty suggestions.
  */
-async function auditClaims(store: Store, progress: (msg: string) => void, opts: { nearDuplicates: boolean }): Promise<number> {
+export async function auditClaims(store: Store, progress: (msg: string) => void, opts: { nearDuplicates: boolean; pageSize?: number }): Promise<number> {
   const superseded = await markSupersededClaims(store);
   if (superseded) progress(`claim audit: ${superseded} supersession marks updated`);
-  const rows = await store.query<{
-    id: string; subject_id: string; subject: string; type: string; object_id: string | null; statement: string;
-    status: string; kind: string; valid_to: string | null; primary_scope_id: string | null; path: string | null;
-  }>(
-    `SELECT cl.id, cl.subject_id, e.name AS subject, cl.type, cl.object_id, cl.statement, cl.status, cl.kind,
-            cl.valid_to, cl.primary_scope_id, s.key AS path
-     FROM claims cl
-     JOIN entities e ON e.id = cl.subject_id
-     LEFT JOIN scopes s ON s.id = cl.primary_scope_id
-     WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL AND e.tx_to IS NULL`,
-  );
-  if (rows.length === 0) return 0;
 
-  const issues: { title: string; body: string; evidence: string[]; claims: string[] }[] = [];
+  const issues: AuditIssue[] = [];
+  // a claim's date is its UTC day: expired once that day is before today's
   const today = new Date().toISOString().slice(0, 10);
+  const startOfToday = `${today}T00:00:00.000Z`;
 
   // expired facts (a forecast whose window closed is not a stale fact)
-  for (const c of rows) {
-    const validTo = toDateString(c.valid_to);
-    if (c.status === 'fact' && c.kind === 'fact' && validTo && validTo < today) {
+  const expiredWhere = `${AUDIT_FROM} AND cl.status = 'fact' AND cl.kind = 'fact' AND cl.valid_to < $1::timestamptz`;
+  const [expired] = await store.query<{ n: number }>(`SELECT count(*)::int AS n ${expiredWhere}`, [startOfToday]);
+  if (expired.n > 0) {
+    const rows = await store.query<{ id: string; subject: string; statement: string; valid_to: string | Date; path: string | null }>(
+      `SELECT cl.id, e.name AS subject, cl.statement, cl.valid_to, s.key AS path ${expiredWhere} ORDER BY cl.tx_from, cl.id LIMIT $2`,
+      [startOfToday, AUDIT_FILED],
+    );
+    for (const c of rows) {
       issues.push({
         title: `断言可能已过期: ${c.subject}`,
-        body: `"${c.statement}" 的有效期至 ${validTo}，已过期。建议核实并更新相关文档/wiki 页。`,
+        body: `"${c.statement}" 的有效期至 ${toDateString(c.valid_to)}，已过期。建议核实并更新相关文档/wiki 页。`,
         evidence: [c.path ?? '', c.statement].filter(Boolean),
         claims: [c.id],
       });
@@ -271,48 +357,43 @@ async function auditClaims(store: Store, progress: (msg: string) => void, opts: 
   }
 
   // contradictions within (subject, type, object) groups of facts — views and forecasts contradict nothing
-  const groups = new Map<string, typeof rows>();
-  for (const c of rows) {
-    if (c.kind !== 'fact') continue;
-    const key = `${c.subject_id}|${c.type}|${c.object_id ?? ''}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(c);
-  }
-  for (const group of groups.values()) {
-    if (group.length < 2) continue;
-    const hasFact = group.some((c) => c.status === 'fact');
-    const hasDisputed = group.some((c) => c.status === 'disputed');
-    if (hasFact && hasDisputed) {
-      const fact = group.find((c) => c.status === 'fact')!;
-      const disputed = group.find((c) => c.status === 'disputed')!;
+  const clashing = `SELECT cl.subject_id, cl.type, cl.object_id ${AUDIT_FROM} AND cl.kind = 'fact' AND cl.status IN ('fact', 'disputed')
+     GROUP BY cl.subject_id, cl.type, cl.object_id
+     HAVING bool_or(cl.status = 'fact') AND bool_or(cl.status = 'disputed')`;
+  const [clashes] = await store.query<{ n: number }>(`SELECT count(*)::int AS n FROM (${clashing}) g`);
+  if (clashes.n > 0 && issues.length < AUDIT_FILED) {
+    const groups = await store.query<{ subject_id: string; type: string; object_id: string | null }>(
+      `${clashing} ORDER BY cl.subject_id, cl.type, cl.object_id LIMIT $1`,
+      [AUDIT_FILED - issues.length],
+    );
+    for (const g of groups) {
+      const side = async (status: string) => (await store.query<{ id: string; subject: string; statement: string; path: string | null }>(
+        `SELECT cl.id, e.name AS subject, cl.statement, s.key AS path ${AUDIT_FROM} AND cl.kind = 'fact' AND cl.status = $1
+           AND cl.subject_id = $2 AND cl.type = $3 AND cl.object_id IS NOT DISTINCT FROM $4
+         ORDER BY cl.tx_from, cl.id LIMIT 1`,
+        [status, g.subject_id, g.type, g.object_id],
+      ))[0];
+      const fact = await side('fact');
+      const disputed = await side('disputed');
+      if (!fact || !disputed) continue;
       issues.push({
         title: `检测到矛盾的断言: ${fact.subject}`,
-        body: `同一主体的 "${fact.type}" 类断言状态冲突。\n- [fact] ${fact.statement} (${fact.path ?? '?'})\n- [disputed] ${disputed.statement} (${disputed.path ?? '?'})\n建议人工核实哪条为准。`,
+        body: `同一主体的 "${g.type}" 类断言状态冲突。\n- [fact] ${fact.statement} (${fact.path ?? '?'})\n- [disputed] ${disputed.statement} (${disputed.path ?? '?'})\n建议人工核实哪条为准。`,
         evidence: [fact.statement, disputed.statement],
         claims: [fact.id, disputed.id],
       });
-      continue;
-    }
-    // near-duplicate statements from different sources — possible divergence
-    if (!opts.nearDuplicates) continue;
-    const wordings = group.map((c) => wordingOf(c.statement));
-    for (let i = 0; i < group.length; i++) {
-      for (let j = i + 1; j < group.length; j++) {
-        const a = group[i], b = group[j];
-        if (!a.primary_scope_id || a.primary_scope_id === b.primary_scope_id || a.statement === b.statement) continue;
-        if (alikeWording(wordings[i], wordings[j]) !== null) {
-          issues.push({
-            title: `多来源相似断言待核对: ${a.subject}`,
-            body: `不同文档对 "${a.subject}" 有相似但不一致的表述：\n- ${a.statement} (${a.path ?? '?'})\n- ${b.statement} (${b.path ?? '?'})\n可能是同一事实的不同版本，建议在 wiki 中统一。`,
-            evidence: [a.statement, b.statement],
-            claims: [a.id, b.id],
-          });
-        }
-      }
     }
   }
 
-  for (const issue of issues.slice(0, 20)) {
+  // near-duplicate statements from different sources — possible divergence
+  let alike = 0;
+  if (opts.nearDuplicates) {
+    const near = await nearDuplicateIssues(store, AUDIT_FILED - issues.length, Math.max(1, opts.pageSize ?? AUDIT_PAGE));
+    alike = near.count;
+    issues.push(...near.issues);
+  }
+
+  for (const issue of issues.slice(0, AUDIT_FILED)) {
     const id = crypto.createHash('sha256').update(`knowledge|${issue.title}|${issue.evidence.join('|')}`).digest('hex').slice(0, 16);
     await store.query(
       `INSERT INTO suggestions (id, kind, title, body, evidence, status)
@@ -322,6 +403,7 @@ async function auditClaims(store: Store, progress: (msg: string) => void, opts: 
     );
     await writeDeps(store, { kind: 'suggestion', id }, issue.claims.map((c) => ({ kind: 'claim' as const, id: c, required: true })));
   }
-  if (issues.length > 0) progress(`claim audit: ${issues.length} issues queued as suggestions`);
-  return issues.length;
+  const found = expired.n + clashes.n + alike;
+  if (found > 0) progress(`claim audit: ${found} issues queued as suggestions`);
+  return found;
 }

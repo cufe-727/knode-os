@@ -9,6 +9,7 @@ import { toDateString, toIso } from '../store/temporal.js';
 import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
 import { applyClaimMerge, reanchorClaimGroups } from './claim-merge.js';
 import { sameValue } from './claim-state.js';
+import { packSubjectBatches, SubjectBatch } from './subject-batches.js';
 import { alikeWording, Wording, wordingOf, wordingPrefixLength } from './wording.js';
 
 /**
@@ -49,6 +50,8 @@ export interface ClaimDedupeOptions {
    * on unless false, which reproduces the audit before them — for measuring them.
    */
   stateRules?: boolean;
+  /** Claims a batch holds at once (CLAIMS_PER_BATCH); smaller in tests. */
+  claimsPerBatch?: number;
 }
 
 export interface ClaimDedupeStats {
@@ -549,6 +552,102 @@ export function reportedApart(
 
 /* --------------------------------- the audit -------------------------------- */
 
+/**
+ * Claims one batch of the audit holds at once: whole subjects (a subject with
+ * more is a batch of its own) and the swapped groups their claims name.
+ *
+ * The audit used to read every representative claim into one array, in a
+ * nightly run and in a review after extraction alike — the review needs a few
+ * hundred claims' subjects — and keep it, with the readings and indexes over
+ * it, until the judge had answered (up to server.remote.callDeadlineMinutes a
+ * call). On finance (2026-11-13: 1,105,684 such claims) a review held 1 GB of
+ * heap that way and a nightly run 3.4 GB; the nightly run started beside a
+ * review that was waiting for its judge, and the server died at its 4 GB heap
+ * limit (03:25). Claims are only ever compared within a subject, so a batch of
+ * subjects is audited and let go before the next is read, and only the pairs
+ * the judge will be shown wait for it: 0.1 GB for that review, 0.4 GB at night.
+ */
+export const CLAIMS_PER_BATCH = 40_000;
+
+/** Every representative claim that takes part, with its canonical subject / object; narrowed by the caller. */
+const CLAIM_SELECT = `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(oe.canonical_id, c.object_id) AS object,
+            se.name AS subject_name, c.statement, c.status, c.kind, c.type, c.valid_from, c.valid_to, c.event_at,
+            c.evidence_count, (SELECT count(*)::int FROM claims m WHERE m.canonical_id = c.id) AS members,
+            c.tx_from, s.key AS source_path, c.chunk_id,
+            COALESCE(ak.canonical, c.attribute) AS attribute, c.value_num, c.value_text, c.unit,
+            COALESCE(c.effective_at, c.event_at, c.valid_from, c.observed_at) AS eff,
+            COALESCE(c.date_source, CASE WHEN c.event_at IS NOT NULL OR c.valid_from IS NOT NULL THEN 'stated' WHEN c.observed_at IS NOT NULL THEN 'document' END) AS date_source
+     FROM claims c
+     JOIN entities se ON se.id = c.subject_id
+     LEFT JOIN entities oe ON oe.id = c.object_id
+     LEFT JOIN scopes s ON s.id = c.primary_scope_id
+     LEFT JOIN claim_attribute_keys ak ON ak.subject_id = c.subject_id AND ak.attribute = c.attribute
+     WHERE c.tx_to IS NULL AND c.canonical_id IS NULL AND c.status <> 'absent'`;
+
+/**
+ * The canonical subjects of the representative claims — every one, or with
+ * `focus` those of the focus claims — packed in id order into batches of at
+ * most `size` claims; a subject with more claims than that is a batch alone.
+ * Read as one row per subject: ids and a count, never the claims.
+ */
+export async function claimSubjectBatches(store: Store, opts: { focus?: string[]; size?: number } = {}): Promise<SubjectBatch[]> {
+  const size = opts.size ?? CLAIMS_PER_BATCH;
+  const live = `c.tx_to IS NULL AND c.canonical_id IS NULL AND c.status <> 'absent'`;
+  let rows: { subject_id: string; subject: string; n: number }[];
+  if (opts.focus) {
+    const subjects = (await store.query<{ subject: string }>(
+      `SELECT DISTINCT COALESCE(se.canonical_id, c.subject_id) AS subject
+       FROM claims c JOIN entities se ON se.id = c.subject_id
+       WHERE c.id = ANY($1::text[]) AND ${live}`,
+      [[...new Set(opts.focus)]],
+    )).map((r) => r.subject);
+    if (subjects.length === 0) return [];
+    // through the entities that stand for those subjects, so the claims come by their subject index
+    const wanted = new Set(subjects);
+    rows = (await store.query<{ subject_id: string; subject: string; n: number }>(
+      `SELECT c.subject_id, COALESCE(se.canonical_id, se.id) AS subject, count(*)::int AS n
+       FROM entities se JOIN claims c ON c.subject_id = se.id
+       WHERE (se.id = ANY($1::text[]) OR se.canonical_id = ANY($1::text[])) AND ${live}
+       GROUP BY 1, 2`,
+      [subjects],
+    )).filter((r) => wanted.has(r.subject));
+  } else {
+    rows = await store.query<{ subject_id: string; subject: string; n: number }>(
+      `SELECT c.subject_id, COALESCE(se.canonical_id, c.subject_id) AS subject, count(*)::int AS n
+       FROM claims c JOIN entities se ON se.id = c.subject_id
+       WHERE ${live}
+       GROUP BY 1, 2`,
+    );
+  }
+  return packSubjectBatches(rows, size);
+}
+
+/**
+ * A batch's claims: `own`, every claim of its subjects, and `swapped`, the
+ * claims of other subjects that mirror one of its claims in focus (subject and
+ * object the other way round) — the second group such a claim is compared in.
+ */
+async function loadClaimBatch(store: Store, batch: SubjectBatch, focusIds: Set<string> | null): Promise<{ own: ClaimLite[]; swapped: ClaimLite[] }> {
+  const own = await store.query<ClaimLite>(`${CLAIM_SELECT} AND c.subject_id = ANY($1::text[])`, [batch.subjectIds]);
+  // a mirror inside the batch is among `own` already
+  const mirrors = new Map<string, [subject: string, object: string]>();
+  for (const c of own) {
+    if (!c.object || batch.subjects.has(c.object) || (focusIds && !focusIds.has(c.id))) continue;
+    mirrors.set(`${c.object}|${c.subject}`, [c.object, c.subject]);
+  }
+  if (mirrors.size === 0) return { own, swapped: [] };
+  const pairs = [...mirrors.values()];
+  const swapped = await store.query<ClaimLite>(
+    // by the entities that stand for either side, so the claims come by their object and subject indexes
+    `${CLAIM_SELECT}
+       AND c.object_id IN (SELECT id FROM entities WHERE id = ANY($1::text[]) OR canonical_id = ANY($1::text[]))
+       AND c.subject_id IN (SELECT id FROM entities WHERE id = ANY($2::text[]) OR canonical_id = ANY($2::text[]))
+       AND (COALESCE(se.canonical_id, c.subject_id), COALESCE(oe.canonical_id, c.object_id)) IN (SELECT m.s, m.o FROM unnest($3::text[], $4::text[]) AS m(s, o))`,
+    [[...batch.subjects], [...new Set(pairs.map(([s]) => s))], pairs.map(([s]) => s), pairs.map(([, o]) => o)],
+  );
+  return { own, swapped };
+}
+
 export async function auditDuplicateClaims(
   /** `judge`: where the judge calls go (src/work/judge.ts); absent, the Judge route `llm`, one call at a time. */
   ctx: { store: Store; embedder: EmbeddingProvider; config: KnodeConfig; llm?: LlmClient; judge?: JudgeRunner },
@@ -567,235 +666,281 @@ export async function auditDuplicateClaims(
 
   if (!opts.focus) stats.reanchored = await reanchorClaimGroups(store, { onProgress: progress });
 
-  // every representative claim, with its canonical subject / object
-  const claims = await store.query<ClaimLite>(
-    `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(oe.canonical_id, c.object_id) AS object,
-            se.name AS subject_name, c.statement, c.status, c.kind, c.type, c.valid_from, c.valid_to, c.event_at,
-            c.evidence_count, (SELECT count(*)::int FROM claims m WHERE m.canonical_id = c.id) AS members,
-            c.tx_from, s.key AS source_path, c.chunk_id,
-            COALESCE(ak.canonical, c.attribute) AS attribute, c.value_num, c.value_text, c.unit,
-            COALESCE(c.effective_at, c.event_at, c.valid_from, c.observed_at) AS eff,
-            COALESCE(c.date_source, CASE WHEN c.event_at IS NOT NULL OR c.valid_from IS NOT NULL THEN 'stated' WHEN c.observed_at IS NOT NULL THEN 'document' END) AS date_source
-     FROM claims c
-     JOIN entities se ON se.id = c.subject_id
-     LEFT JOIN entities oe ON oe.id = c.object_id
-     LEFT JOIN scopes s ON s.id = c.primary_scope_id
-     LEFT JOIN claim_attribute_keys ak ON ak.subject_id = c.subject_id AND ak.attribute = c.attribute
-     WHERE c.tx_to IS NULL AND c.canonical_id IS NULL AND c.status <> 'absent'`,
-  );
-  const byId = new Map(claims.map((c) => [c.id, c]));
-  const focus = opts.focus ? [...new Set(opts.focus)].map((id) => byId.get(id)).filter((c): c is ClaimLite => Boolean(c)) : claims;
-  if (focus.length === 0) return stats;
-  const bySubject = new Map<string, ClaimLite[]>();
-  const bySwapped = new Map<string, ClaimLite[]>();
-  for (const c of claims) {
-    (bySubject.get(c.subject) ?? bySubject.set(c.subject, []).get(c.subject)!).push(c);
-    if (c.object) {
-      const k = `${c.object}|${c.subject}`;
-      (bySwapped.get(k) ?? bySwapped.set(k, []).get(k)!).push(c);
-    }
-  }
-  /** The groups a claim is compared within: its subject's claims, and the claims with subject and object swapped. */
-  const blocksOf = (f: ClaimLite): ClaimLite[][] => {
-    const swapped = f.object ? bySwapped.get(`${f.subject}|${f.object}`) : undefined;
-    return swapped ? [bySubject.get(f.subject)!, swapped] : [bySubject.get(f.subject)!];
-  };
+  // the subjects to audit, a batch at a time (CLAIMS_PER_BATCH): every one at night, the focus claims' otherwise
+  const batches = await claimSubjectBatches(store, { focus: opts.focus, size: opts.claimsPerBatch });
+  if (batches.length === 0) return stats;
+  const focusIds = opts.focus ? new Set(opts.focus) : null;
   // the nightly run covers every claim: its long loops let the server answer in between (with
   // PGlite, which answers queries on the event loop, a run of queries holds it as well)
   const pause = breather();
-
-  /* candidates from text alone */
-  const pairs = new Map<string, Pair>();
-  const propose: Propose = (a, b, why, score = {}) => {
-    const id = claimPairId(a.id, b.id);
-    const pair = pairs.get(id) ?? pairs.set(id, { id, a, b, why: [], similarity: 0, cosine: 0, shared: 0, guards: [] }).get(id)!;
-    if (!pair.why.includes(why)) pair.why.push(why);
-    pair.similarity = Math.max(pair.similarity, score.similarity ?? 0);
-    pair.shared = Math.max(pair.shared, score.shared ?? 0);
-  };
   const realVectors = config.embedding.provider !== 'local' && ctx.embedder.model !== 'local-hash-v1';
-  await textCandidates(focus, blocksOf, propose, { words: !realVectors, pause });
+  const judge = ctx.judge ?? (ctx.llm ? directJudge(ctx.llm) : null);
+  const judging = Boolean(judge?.enabled);
 
-  /* candidates from embeddings: nearest claims of the same subject */
-  if (realVectors) {
-    // a block's claims once, however many of them are in focus
-    const needed = new Set<string>();
-    const listed = new Set<ClaimLite[]>();
-    for (const f of focus) {
-      const blocks = blocksOf(f);
-      if (!blocks.some((b) => b.some((c) => c.id !== f.id))) continue;
-      needed.add(f.id);
-      for (const b of blocks) {
-        if (listed.has(b)) continue;
-        listed.add(b);
-        for (const c of b) needed.add(c.id);
-      }
-    }
-    stats.embedded = await ensureClaimEmbeddings(store, ctx.embedder, [...needed].map((id) => byId.get(id)!).filter(Boolean), progress);
-    const near = await nearClaims(store, focus, blocksOf, { threshold, pause });
-    for (const f of focus) {
+  /* what outlives a batch: the merges made so far, and the pairs waiting for the judge */
+  const repOf = new Map<string, string>();
+  const reps = new Map<string, ClaimLite>();
+  // at most maxJudged of them are sent, so no more than a few times that many are kept
+  let waiting = new Map<string, Pair>();
+  // a pair of two subjects comes up in both their batches: counted once
+  const mirrored = new Set<string>();
+  /** Pairs only the judge can settle, whether or not they were kept for it. */
+  let forJudge = 0;
+  let embedding = true;
+
+  /** A claim merged earlier in this run answers through its representative. */
+  const current = (c: ClaimLite): ClaimLite => {
+    let id = c.id;
+    while (repOf.has(id)) id = repOf.get(id)!;
+    return id === c.id ? c : reps.get(id) ?? c;
+  };
+
+  /** Act on verdicts: remember each, merge, suggest or flag. */
+  const act = async (outcomes: { pair: Pair; verdict: Verdict }[]): Promise<void> => {
+    for (const { pair, verdict } of outcomes) {
       await pause();
-      for (const r of near.get(f) ?? []) {
-        const other = byId.get(r.claim_id);
-        if (other) propose(f, other, `语义相似度 ${r.sim.toFixed(2)}`, { similarity: r.sim });
+      await rememberVerdict(store, pair, verdict);
+      const { relation, confidence } = verdict;
+      if (relation === 'same' || relation === 'contains') {
+        const identical = verdict.model === 'rule';
+        const a = current(pair.a);
+        const b = current(pair.b);
+        if (a.id === b.id) continue;
+        const [keep, fold] = representative({ ...pair, a, b }, verdict);
+        // a remote model outside server.remote.judgeModels advises; a person decides
+        const confident = mode === 'auto' && confidence >= minConfidence && pair.guards.length === 0;
+        const decides = verdictMayDecide(config, verdict.model);
+        if (confident && !decides && !identical) stats.leftToPerson++;
+        const auto = identical || (confident && decides);
+        if (auto) {
+          try {
+            await applyClaimMerge(store, {
+              claimId: fold.id,
+              canonicalId: keep.id,
+              kind: relation === 'contains' ? 'contains' : 'same_as',
+              reason: identical ? '规范化后逐字相同' : `judge ${confidence.toFixed(2)}: ${verdict.reason}`,
+              confidence,
+              actor: identical ? 'claim-dedupe' : 'llm-judge',
+            });
+            repOf.set(fold.id, keep.id);
+            reps.set(keep.id, keep);
+            keep.members += fold.members + 1;
+            fold.members = 0;
+            stats.merged++;
+            continue;
+          } catch (err) {
+            progress(`claims: merge failed for ${fold.id}: ${err instanceof Error ? err.message : err}`);
+          }
+        }
+        if (confidence >= llmMin) {
+          await fileMergeSuggestion(store, pair, verdict, keep, fold);
+          stats.suggested++;
+        }
+      } else if (relation === 'conflict' && confidence >= llmMin) {
+        // filed between representatives: two wordings of one side are one contradiction
+        const a = current(pair.a);
+        const b = current(pair.b);
+        if (a.id !== b.id && (await fileConflict(store, { ...pair, a, b }, verdict))) stats.conflicts++;
       }
     }
+  };
 
-    // A shared number lowers the cosine bar instead of replacing it: on finance's judged
-    // pairs (2026-10-19), those it alone brought up gave 3 merges, suggestions or
-    // contradictions in 8,527 below cosine 0.70, and 137 in 7,304 from 0.70 to 0.85.
-    // A claim with no vector yet (its embedding failed) waits for one.
-    const numberOnly = [...pairs.values()].filter((p) => p.similarity === 0 && !p.why.includes('identical'));
-    for (let i = 0; i < numberOnly.length; i += 5000) {
-      const slice = numberOnly.slice(i, i + 5000);
-      const rows = await store.query<{ a: string; b: string; sim: number }>(
-        `SELECT x.a, x.b, (1 - (ea.embedding <=> eb.embedding))::float AS sim
-         FROM unnest($1::text[], $2::text[]) AS x(a, b)
-         JOIN claim_embeddings ea ON ea.claim_id = x.a JOIN claim_embeddings eb ON eb.claim_id = x.b`,
-        [slice.map((p) => p.a.id), slice.map((p) => p.b.id)],
-      );
-      for (const r of rows) pairs.get(claimPairId(r.a, r.b))!.cosine = r.sim;
-    }
-    for (const p of numberOnly) if (p.cosine < numberThreshold) pairs.delete(p.id);
-  }
-  stats.candidates = pairs.size;
-  if (pairs.size === 0) return stats;
-
-  /* pairs already decided: a remembered verdict, or a person's answer to a suggestion */
-  // one array parameter: a nightly run brings up more pairs than a statement can bind (65,535)
-  const ids = [...pairs.keys()];
-  const decided = new Set([
-    ...(await store.query<{ pair_id: string }>(`SELECT pair_id FROM claim_pair_verdicts WHERE pair_id = ANY($1::text[])`, [ids])).map((r) => r.pair_id),
-    ...(await store.query<{ id: string }>(`SELECT id FROM suggestions WHERE id = ANY($1::text[]) AND status IN ('accepted', 'rejected')`, [ids])).map((r) => r.id),
-  ]);
-
-  const toJudge: Pair[] = [];
-  const outcomes: { pair: Pair; verdict: Verdict }[] = [];
-  const numbersIn = perStatement(numbersOf);
-  const periodsIn = perStatement(periodsOf);
-  const negatedIn = perStatement(negated);
-  for (const pair of pairs.values()) {
+  for (const batch of batches) {
     await pause();
-    if (decided.has(pair.id)) continue;
-    const { a, b } = pair;
-    if (pair.why.includes('identical')) {
-      outcomes.push({ pair, verdict: { relation: 'same', keep: null, confidence: 1, reason: '规范化后逐字相同', model: 'rule' } });
-      stats.identical++;
-      continue;
+    const { own, swapped } = await loadClaimBatch(store, batch, focusIds);
+    const focus = focusIds ? own.filter((c) => focusIds.has(c.id)) : own;
+    if (focus.length === 0) continue;
+    const byId = new Map<string, ClaimLite>();
+    for (const c of swapped) byId.set(c.id, c);
+    for (const c of own) byId.set(c.id, c);
+    const bySubject = new Map<string, ClaimLite[]>();
+    const bySwapped = new Map<string, ClaimLite[]>();
+    for (const c of own) (bySubject.get(c.subject) ?? bySubject.set(c.subject, []).get(c.subject)!).push(c);
+    for (const c of byId.values()) {
+      if (!c.object) continue;
+      const k = `${c.object}|${c.subject}`;
+      (bySwapped.get(k) ?? bySwapped.set(k, []).get(k)!).push(c);
     }
-    // claim state settles a series without a model: one subject's attribute on other dates is
-    // its history, not a duplicate; on one date with one value it is the same claim reworded
-    const series = opts.stateRules === false ? null : seriesRelation(a, b);
-    if (series === 'different_time') {
-      outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '同一属性的不同时点', model: 'rule' } });
-      stats.differentTime++;
-      stats.series++;
-      continue;
+    /** The groups a claim is compared within: its subject's claims, and the claims with subject and object swapped. */
+    const blocksOf = (f: ClaimLite): ClaimLite[][] => {
+      const mirror = f.object ? bySwapped.get(`${f.subject}|${f.object}`) : undefined;
+      return mirror ? [bySubject.get(f.subject)!, mirror] : [bySubject.get(f.subject)!];
+    };
+
+    /* candidates from text alone */
+    const pairs = new Map<string, Pair>();
+    const propose: Propose = (a, b, why, score = {}) => {
+      const id = claimPairId(a.id, b.id);
+      const pair = pairs.get(id) ?? pairs.set(id, { id, a, b, why: [], similarity: 0, cosine: 0, shared: 0, guards: [] }).get(id)!;
+      if (!pair.why.includes(why)) pair.why.push(why);
+      pair.similarity = Math.max(pair.similarity, score.similarity ?? 0);
+      pair.shared = Math.max(pair.shared, score.shared ?? 0);
+    };
+    await textCandidates(focus, blocksOf, propose, { words: !realVectors, pause });
+
+    /* candidates from embeddings: nearest claims of the same subject */
+    if (realVectors) {
+      // a block's claims once, however many of them are in focus
+      const needed = new Set<string>();
+      const listed = new Set<ClaimLite[]>();
+      for (const f of focus) {
+        const blocks = blocksOf(f);
+        if (!blocks.some((b) => b.some((c) => c.id !== f.id))) continue;
+        needed.add(f.id);
+        for (const b of blocks) {
+          if (listed.has(b)) continue;
+          listed.add(b);
+          for (const c of b) needed.add(c.id);
+        }
+      }
+      // an embedder that failed is not asked again this run: the claims without a vector wait for the next
+      if (embedding) {
+        const made = await ensureClaimEmbeddings(store, ctx.embedder, [...needed].map((id) => byId.get(id)!).filter(Boolean), progress);
+        stats.embedded += made.embedded;
+        if (made.failed) embedding = false;
+      }
+      const near = await nearClaims(store, focus, blocksOf, { threshold, pause });
+      for (const f of focus) {
+        await pause();
+        for (const r of near.get(f) ?? []) {
+          const other = byId.get(r.claim_id);
+          if (other) propose(f, other, `语义相似度 ${r.sim.toFixed(2)}`, { similarity: r.sim });
+        }
+      }
+
+      // A shared number lowers the cosine bar instead of replacing it: on finance's judged
+      // pairs (2026-10-19), those it alone brought up gave 3 merges, suggestions or
+      // contradictions in 8,527 below cosine 0.70, and 137 in 7,304 from 0.70 to 0.85.
+      // A claim with no vector yet (its embedding failed) waits for one.
+      const numberOnly = [...pairs.values()].filter((p) => p.similarity === 0 && !p.why.includes('identical'));
+      for (let i = 0; i < numberOnly.length; i += 5000) {
+        const slice = numberOnly.slice(i, i + 5000);
+        const rows = await store.query<{ a: string; b: string; sim: number }>(
+          `SELECT x.a, x.b, (1 - (ea.embedding <=> eb.embedding))::float AS sim
+           FROM unnest($1::text[], $2::text[]) AS x(a, b)
+           JOIN claim_embeddings ea ON ea.claim_id = x.a JOIN claim_embeddings eb ON eb.claim_id = x.b`,
+          [slice.map((p) => p.a.id), slice.map((p) => p.b.id)],
+        );
+        for (const r of rows) pairs.get(claimPairId(r.a, r.b))!.cosine = r.sim;
+      }
+      for (const p of numberOnly) if (p.cosine < numberThreshold) pairs.delete(p.id);
     }
-    if (series === 'same') {
-      outcomes.push({ pair, verdict: { relation: 'same', keep: null, confidence: 1, reason: '同一属性、同一日期、同一数值', model: 'rule' } });
-      stats.sameValue++;
-      continue;
+    const again = new Set<string>();
+    for (const p of pairs.values()) {
+      if (swapped.length > 0 && p.a.subject !== p.b.subject) {
+        if (mirrored.has(p.id)) {
+          again.add(p.id);
+          continue;
+        }
+        mirrored.add(p.id);
+      }
+      stats.candidates++;
     }
-    // two reports of other days giving other figures, neither naming its period: readings at two times
-    if (opts.stateRules !== false && reportedApart(a, b, numbersIn(a), numbersIn(b), periodsIn(a), periodsIn(b))) {
-      outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '不同日期的报告、数字不同', model: 'rule' } });
-      stats.differentTime++;
-      stats.series++;
-      continue;
+    if (pairs.size === 0) continue;
+
+    /* pairs already decided: a remembered verdict, or a person's answer to a suggestion */
+    // one array parameter: a nightly run brings up more pairs than a statement can bind (65,535)
+    const ids = [...pairs.keys()];
+    const decided = new Set([
+      ...(await store.query<{ pair_id: string }>(`SELECT pair_id FROM claim_pair_verdicts WHERE pair_id = ANY($1::text[])`, [ids])).map((r) => r.pair_id),
+      ...(await store.query<{ id: string }>(`SELECT id FROM suggestions WHERE id = ANY($1::text[]) AND status IN ('accepted', 'rejected')`, [ids])).map((r) => r.id),
+    ]);
+
+    const outcomes: { pair: Pair; verdict: Verdict }[] = [];
+    const numbersIn = perStatement(numbersOf);
+    const periodsIn = perStatement(periodsOf);
+    const negatedIn = perStatement(negated);
+    for (const pair of pairs.values()) {
+      await pause();
+      if (decided.has(pair.id)) continue;
+      const { a, b } = pair;
+      if (pair.why.includes('identical')) {
+        outcomes.push({ pair, verdict: { relation: 'same', keep: null, confidence: 1, reason: '规范化后逐字相同', model: 'rule' } });
+        stats.identical++;
+        continue;
+      }
+      // claim state settles a series without a model: one subject's attribute on other dates is
+      // its history, not a duplicate; on one date with one value it is the same claim reworded
+      const series = opts.stateRules === false ? null : seriesRelation(a, b);
+      if (series === 'different_time') {
+        outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '同一属性的不同时点', model: 'rule' } });
+        stats.differentTime++;
+        stats.series++;
+        continue;
+      }
+      if (series === 'same') {
+        outcomes.push({ pair, verdict: { relation: 'same', keep: null, confidence: 1, reason: '同一属性、同一日期、同一数值', model: 'rule' } });
+        stats.sameValue++;
+        continue;
+      }
+      // two reports of other days giving other figures, neither naming its period: readings at two times
+      if (opts.stateRules !== false && reportedApart(a, b, numbersIn(a), numbersIn(b), periodsIn(a), periodsIn(b))) {
+        outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '不同日期的报告、数字不同', model: 'rule' } });
+        stats.differentTime++;
+        stats.series++;
+        continue;
+      }
+      if (windowsDisjoint(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b))) {
+        outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '时期不同', model: 'rule' } });
+        stats.differentTime++;
+        continue;
+      }
+      // the judge's: kept only while there is a judge to show it to
+      if (!judging) continue;
+      if (!again.has(pair.id)) forJudge++;
+      const na = numbersIn(a);
+      const nb = numbersIn(b);
+      if (na.length > 0 && nb.length > 0 && !numbersWithin(na, nb) && !numbersWithin(nb, na)) pair.guards.push('数字不一致');
+      if (negatedIn(a) !== negatedIn(b)) pair.guards.push('否定不一致');
+      if ((a.status === 'fact' && b.status === 'disputed') || (a.status === 'disputed' && b.status === 'fact')) pair.guards.push('状态冲突');
+      // a forecast and the result it foresaw, or a view and the fact it is about, are not one claim
+      if (a.kind !== b.kind) pair.guards.push('性质不同');
+      const seen = waiting.get(pair.id);
+      if (seen) {
+        // the same pair from its other subject's batch: what either side brought up counts
+        for (const w of pair.why) if (!seen.why.includes(w)) seen.why.push(w);
+        seen.similarity = Math.max(seen.similarity, pair.similarity);
+        seen.cosine = Math.max(seen.cosine, pair.cosine);
+        seen.shared = Math.max(seen.shared, pair.shared);
+      } else waiting.set(pair.id, pair);
     }
-    if (windowsDisjoint(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b))) {
-      outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '时期不同', model: 'rule' } });
-      stats.differentTime++;
-      continue;
+
+    /* what the rules settled is acted on before the batch is let go; a claim merged here answers through its representative later */
+    await act(outcomes);
+
+    // judgeOrder is a total order: the first maxJudged of all pairs are among the first maxJudged so far
+    if (waiting.size > Math.max(4 * maxJudged, 1000)) {
+      waiting = new Map(judgeOrder([...waiting.values()]).slice(0, maxJudged).map((p) => [p.id, p]));
     }
-    const na = numbersIn(a);
-    const nb = numbersIn(b);
-    if (na.length > 0 && nb.length > 0 && !numbersWithin(na, nb) && !numbersWithin(nb, na)) pair.guards.push('数字不一致');
-    if (negatedIn(a) !== negatedIn(b)) pair.guards.push('否定不一致');
-    if ((a.status === 'fact' && b.status === 'disputed') || (a.status === 'disputed' && b.status === 'fact')) pair.guards.push('状态冲突');
-    // a forecast and the result it foresaw, or a view and the fact it is about, are not one claim
-    if (a.kind !== b.kind) pair.guards.push('性质不同');
-    toJudge.push(pair);
   }
 
   /* the Judge stage, in batches, most promising first: at most claimMergeMaxJudgedPerRun pairs a run (the
      rule-settled ones above never wait), every batch offered at once (src/work/judge.ts) */
-  const judge = ctx.judge ?? (ctx.llm ? directJudge(ctx.llm) : null);
-  if (toJudge.length > 0 && judge?.enabled) {
+  if (forJudge > 0 && judge?.enabled) {
     const per = Math.max(1, opts.pairsPerCall ?? 12);
-    const sent = judgeOrder(toJudge).slice(0, maxJudged);
-    stats.deferred = toJudge.length - sent.length;
-    const batches: Pair[][] = [];
-    for (let i = 0; i < sent.length; i += per) batches.push(sent.slice(i, i + per));
+    const sent = judgeOrder([...waiting.values()]).slice(0, maxJudged);
+    stats.deferred = forJudge - sent.length;
+    waiting = new Map();
+    const calls: Pair[][] = [];
+    for (let i = 0; i < sent.length; i += per) calls.push(sent.slice(i, i + per));
     const excerpts = await chunkTexts(store, sent.flatMap((p) => [p.a.chunk_id, p.b.chunk_id]));
-    const answers = batches.length ? await judge.run(batches.map((batch) => judgeCall(batch, excerpts))) : [];
+    const answers = calls.length ? await judge.run(calls.map((call) => judgeCall(call, excerpts))) : [];
+    const outcomes: { pair: Pair; verdict: Verdict }[] = [];
     answers.forEach((answer, i) => {
-      const batch = batches[i];
+      const call = calls[i];
       try {
         if (!answer.ok) throw new Error(answer.error);
-        for (const [k, v] of verdictsOf(answer.text, answer.model, batch)) {
-          outcomes.push({ pair: batch[k], verdict: v });
+        for (const [k, v] of verdictsOf(answer.text, answer.model, call)) {
+          outcomes.push({ pair: call[k], verdict: v });
           stats.judged++;
         }
       } catch (err) {
-        progress(`claims: judge failed for a batch of ${batch.length}: ${err instanceof Error ? err.message : err}`);
+        progress(`claims: judge failed for a batch of ${call.length}: ${err instanceof Error ? err.message : err}`);
       }
     });
+    await act(outcomes);
   }
 
-  /* act on the verdicts; a claim merged earlier in this run answers through its representative */
-  const repOf = new Map<string, string>();
-  const current = (c: ClaimLite): ClaimLite => {
-    let id = c.id;
-    while (repOf.has(id)) id = repOf.get(id)!;
-    return byId.get(id) ?? c;
-  };
-  for (const { pair, verdict } of outcomes) {
-    await pause();
-    await rememberVerdict(store, pair, verdict);
-    const { relation, confidence } = verdict;
-    if (relation === 'same' || relation === 'contains') {
-      const identical = verdict.model === 'rule';
-      const a = current(pair.a);
-      const b = current(pair.b);
-      if (a.id === b.id) continue;
-      const [keep, fold] = representative({ ...pair, a, b }, verdict);
-      // a remote model outside server.remote.judgeModels advises; a person decides
-      const confident = mode === 'auto' && confidence >= minConfidence && pair.guards.length === 0;
-      const decides = verdictMayDecide(config, verdict.model);
-      if (confident && !decides && !identical) stats.leftToPerson++;
-      const auto = identical || (confident && decides);
-      if (auto) {
-        try {
-          await applyClaimMerge(store, {
-            claimId: fold.id,
-            canonicalId: keep.id,
-            kind: relation === 'contains' ? 'contains' : 'same_as',
-            reason: identical ? '规范化后逐字相同' : `judge ${confidence.toFixed(2)}: ${verdict.reason}`,
-            confidence,
-            actor: identical ? 'claim-dedupe' : 'llm-judge',
-          });
-          repOf.set(fold.id, keep.id);
-          keep.members += fold.members + 1;
-          fold.members = 0;
-          stats.merged++;
-          continue;
-        } catch (err) {
-          progress(`claims: merge failed for ${fold.id}: ${err instanceof Error ? err.message : err}`);
-        }
-      }
-      if (confidence >= llmMin) {
-        await fileMergeSuggestion(store, pair, verdict, keep, fold);
-        stats.suggested++;
-      }
-    } else if (relation === 'conflict' && confidence >= llmMin) {
-      // filed between representatives: two wordings of one side are one contradiction
-      const a = current(pair.a);
-      const b = current(pair.b);
-      if (a.id !== b.id && (await fileConflict(store, { ...pair, a, b }, verdict))) stats.conflicts++;
-    }
-  }
   if (stats.merged || stats.suggested || stats.conflicts || stats.deferred) {
     progress(`claims: ${stats.merged} merged, ${stats.suggested} merge suggestions, ${stats.conflicts} contradictions (${stats.candidates} pairs, ${stats.judged} judged${stats.deferred ? `, ${stats.deferred} left for later` : ''})`);
   }
@@ -844,8 +989,8 @@ function representative(pair: Pair, verdict: Verdict): [keep: ClaimLite, fold: C
   return ta <= tb ? [a, b] : [b, a];
 }
 
-async function ensureClaimEmbeddings(store: Store, embedder: EmbeddingProvider, claims: ClaimLite[], progress: (msg: string) => void): Promise<number> {
-  if (claims.length === 0) return 0;
+async function ensureClaimEmbeddings(store: Store, embedder: EmbeddingProvider, claims: ClaimLite[], progress: (msg: string) => void): Promise<{ embedded: number; failed: boolean }> {
+  if (claims.length === 0) return { embedded: 0, failed: false };
   const have = new Set<string>();
   for (let i = 0; i < claims.length; i += 500) {
     const slice = claims.slice(i, i + 500);
@@ -870,10 +1015,10 @@ async function ensureClaimEmbeddings(store: Store, embedder: EmbeddingProvider, 
       }
     } catch (err) {
       progress(`claims: embedding batch failed: ${err instanceof Error ? err.message : err}`);
-      break;
+      return { embedded, failed: true };
     }
   }
-  return embedded;
+  return { embedded, failed: false };
 }
 
 const JUDGE_SYSTEM = `You compare pairs of factual claims from a knowledge base. Both claims of a pair are about the same subject. For each pair, say how claim A relates to claim B:

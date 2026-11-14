@@ -111,6 +111,49 @@ describe('the nightly schedulers', () => {
     expect(refineWiki).toHaveBeenCalledTimes(1);
   });
 
+  it('run the tier-2 passes of several workspaces one at a time', async () => {
+    vi.useFakeTimers();
+    // each pass stays open until released: the passes of three workspaces, due in the same minute
+    const release: (() => void)[] = [];
+    const started: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      vi.mocked(refineWiki).mockImplementationOnce((store) => new Promise((_, reject) => {
+        started.push((store as unknown as { name: string }).name);
+        release.push(() => reject(new Error('tier-2 stub')));
+      }));
+    }
+    const logs: Record<string, string[]> = { a: [], b: [], c: [] };
+    const workspace = (name: string): AppContext => {
+      const ctx = stubContext('03:00');
+      (ctx.store as unknown as { name: string }).name = name;
+      return ctx;
+    };
+    vi.setSystemTime(at(3, 9));
+    const timers = ['a', 'b', 'c'].map((name) => startTier2Scheduler(workspace(name), (m) => logs[name].push(m)));
+    try {
+      vi.setSystemTime(at(3, 10));
+      await vi.advanceTimersByTimeAsync(30_000);
+      // all three were due; one runs, the others wait in line and say so
+      expect(started).toEqual(['a']);
+      expect(logs.a.some((m) => m.startsWith('tier2 waits'))).toBe(false);
+      expect(logs.b).toContain("tier2 waits its turn: 1 other workspace's pass is ahead of it");
+      expect(logs.c).toContain("tier2 waits its turn: 2 other workspaces' passes are ahead of it");
+      // a pass that fails gives the turn on
+      release[0]();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(logs.a).toContain('tier2 failed: tier-2 stub');
+      expect(started).toEqual(['a', 'b']);
+      release[1]();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(started).toEqual(['a', 'b', 'c']);
+      release[2]();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(logs.c).toContain('tier2 failed: tier-2 stub');
+    } finally {
+      for (const t of timers) clearInterval(t);
+    }
+  });
+
   it('run Dream at an unpadded schedule that never went through loadConfig', async () => {
     vi.useFakeTimers();
     const log: string[] = [];
