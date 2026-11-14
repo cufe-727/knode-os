@@ -590,3 +590,25 @@ describe('online, across kinds', () => {
     work.close();
   });
 });
+
+describe('a run that fails to start', () => {
+  it('leaves no slot, poll loop or stop signal of its own behind', async () => {
+    const before = process.listenerCount('SIGINT');
+    let leased = 0;
+    const leaseSpy = OwnQueue.prototype.lease;
+    OwnQueue.prototype.lease = function (...a: Parameters<typeof leaseSpy>) {
+      leased++;
+      return leaseSpy.apply(this, a);
+    };
+    try {
+      // a chain whose link is no API connection nor codex-cli is refused after the slots started
+      await expect(runEval({ ...common(), runDir: path.join(tmp, 'runs', 'bad-start'), local: { codex: 2 }, agentChain: 'claude-cli' })).rejects.toThrow(/--agent-chain/);
+      const after = leased;
+      await sleep(2_500);
+      expect(leased).toBe(after);
+      expect(process.listenerCount('SIGINT')).toBe(before);
+    } finally {
+      OwnQueue.prototype.lease = leaseSpy;
+    }
+  });
+});
