@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { defaultConfig, defaultRoutedLlmConfig, KnodeConfig, LlmConnection } from '../../config.js';
 import { AppContext, createContext } from '../../context.js';
 import { runDocumentPass } from '../../ingest/background.js';
@@ -22,6 +21,7 @@ import { catalogGuide } from '../../mcp/catalog-guide.js';
 import { WIKI_SOURCES_BRIEF, wikiWithSources } from './llm-wiki.js';
 import { recordAgent, shimClient, SystemEnv, SystemUnderTest } from './types.js';
 import { evalTempDir } from '../tmp.js';
+import { startToolHost, ToolHost } from '../toolhost.js';
 
 /**
  * knode-os as a system under test (docs/design/23 §3): a fresh workspace per
@@ -35,8 +35,10 @@ import { evalTempDir } from '../tmp.js';
  * same Codex agent as the grep baseline, given knode's MCP retrieval tools
  * instead of the files), `agent-knode-wiki` (that agent reading the
  * generated wiki) and `agent-knode-wiki-sources` (reading the wiki with the
- * sources beside it, the wiki as a navigation layer). PGlite admits one process at a time, so the in-process
- * context is closed before an MCP agent opens the index.
+ * sources beside it, the wiki as a navigation layer). The run opens the
+ * index once per build and everything shares it: answers, retrieval probes,
+ * and the agent sessions' tools, which the run serves itself
+ * (src/eval/toolhost.ts, docs/design/31 D4).
  */
 
 interface KnodeState {
@@ -49,6 +51,8 @@ interface KnodeState {
   ctx: Promise<AppContext> | null;
   /** A close in flight: the next open waits for it. */
   closing: Promise<void> | null;
+  /** The build's tool host for agent sessions, started once with the first session. */
+  host: Promise<ToolHost> | null;
   /** wiki page path → the corpus documents it was generated from. */
   pageSources: Map<string, string[]>;
 }
@@ -114,7 +118,7 @@ export function evalPassSettings(): { concurrency: number; batchSize: number } {
 function stateFor(env: SystemEnv): KnodeState {
   let s = states.get(env.workDir);
   if (!s) {
-    s = { ws: path.join(env.workDir, 'ws'), ctx: null, closing: null, pageSources: new Map() };
+    s = { ws: path.join(env.workDir, 'ws'), ctx: null, closing: null, host: null, pageSources: new Map() };
     states.set(env.workDir, s);
   }
   return s;
@@ -181,8 +185,22 @@ function open(s: KnodeState): Promise<AppContext> {
   return opening;
 }
 
-/** Close the context once an open still in flight has finished; an open after this waits for the close. */
+/** The build's tool host (single-flight): every agent session of the build calls its tools on the one open index. */
+function toolHost(s: KnodeState): Promise<ToolHost> {
+  if (s.host) return s.host;
+  const starting = startToolHost(() => open(s), KNODE_AGENT_TOOLS);
+  s.host = starting;
+  starting.catch(() => {
+    if (s.host === starting) s.host = null;
+  });
+  return starting;
+}
+
+/** Close the tool host, then the context once an open still in flight has finished; an open after this waits for the close. */
 async function close(s: KnodeState): Promise<void> {
+  const host = s.host;
+  s.host = null;
+  if (host) await (await host.catch(() => null))?.close();
   const opened = s.ctx;
   if (!opened) return s.closing ?? undefined;
   s.ctx = null;
@@ -348,14 +366,18 @@ export function knodeSag(): SystemUnderTest {
   });
 }
 
-const CLI_JS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'cli.js');
+/** Close every knode workspace a run holds open under `dir` (a run that ends, or is cancelled, mid-pack). */
+export async function closeKnodeStates(dir: string): Promise<void> {
+  const root = path.resolve(dir) + path.sep;
+  for (const [workDir, s] of states) if (path.resolve(workDir).startsWith(root)) await close(s).catch(() => {});
+}
 
 export function agentKnode(): SystemUnderTest {
+  // as wide as the run's session slots: every session calls the build's one tool host (docs/design/31 D4)
   return knodeSystem('agent-knode', 'Codex agent with knode MCP retrieval tools', 'agent', true, {
-    serial: true,
     async answer(task, prompt, env) {
       const s = stateFor(env);
-      await close(s);
+      const host = await toolHost(s);
       await env.quota.wait();
       const tmp = evalTempDir('mcp');
       const empty = tmp.root;
@@ -366,7 +388,7 @@ export function agentKnode(): SystemUnderTest {
           model: env.models.model,
           effort: env.models.answerEffort,
           prompt: `${knodeAgentBrief()}\n\n${prompt}`,
-          mcp: { name: 'knode', command: process.execPath, args: [CLI_JS, '--data', s.ws, 'mcp'], enabledTools: KNODE_AGENT_TOOLS },
+          mcp: { name: 'knode', url: host.url, token: host.secret, enabledTools: KNODE_AGENT_TOOLS },
         });
         recordAgent(env.meter, { system: 'agent-knode', stage: 'agent', task: task.id }, env.models.model, r);
         const docs = new Set(env.staged.docs.map((d) => d.path));

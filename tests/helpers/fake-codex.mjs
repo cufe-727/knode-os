@@ -14,13 +14,50 @@ const out = arg('--output-last-message');
 const cwd = arg('--cd') ?? process.cwd();
 let prompt = '';
 process.stdin.on('data', (d) => (prompt += d));
-process.stdin.on('end', () => {
+/**
+ * knode's tools over HTTP, as Codex reaches the run's tool host (`mcp_servers.knode.url`, the bearer token in the
+ * env var `bearer_token_env_var` names): the calls the trace shows are made for real, and one that fails fails the
+ * session. FAKE_CODEX_MCP_LOG, when set, receives a line per call.
+ */
+async function callTools(calls) {
+  const config = (key) => /^[^=]+=(.*)$/.exec(args.find((a) => a.startsWith(`mcp_servers.knode.${key}=`)) ?? '')?.[1];
+  const url = JSON.parse(config('url'));
+  const token = process.env[JSON.parse(config('bearer_token_env_var') ?? '""')];
+  if (!token) throw new Error('no bearer token in the environment');
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const client = new Client({ name: 'fake-codex', version: '1.0.0' });
+  await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+  try {
+    for (const [tool, input] of calls) {
+      const r = await client.callTool({ name: tool, arguments: input });
+      if (r.isError) throw new Error(`${tool} failed: ${r.content?.[0]?.text}`);
+      if (process.env.FAKE_CODEX_MCP_LOG) fs.appendFileSync(process.env.FAKE_CODEX_MCP_LOG, `${tool} ${String(r.content?.[0]?.text ?? '').length}\n`);
+    }
+  } finally {
+    await client.close();
+  }
+}
+
+process.stdin.on('end', async () => {
   const emit = (e) => process.stdout.write(JSON.stringify(e) + '\n');
   emit({ type: 'thread.started', thread_id: 'fake-thread' });
+  // FAKE_CODEX_SESSION_MS: a session takes this long, as an agent thinking would; FAKE_CODEX_SESSION_LOG gets its start and end
+  const sessionLog = process.env.FAKE_CODEX_SESSION_LOG;
+  if (sessionLog) fs.appendFileSync(sessionLog, `start ${Date.now()}\n`);
+  if (Number(process.env.FAKE_CODEX_SESSION_MS ?? 0) > 0) await new Promise((r) => setTimeout(r, Number(process.env.FAKE_CODEX_SESSION_MS)));
   // the session's trace: knode's tools when it has the MCP server, else a search and a wrapped pipeline
   if (args.some((a) => a.startsWith('mcp_servers.knode.'))) {
-    emit({ type: 'item.started', item: { type: 'mcp_tool_call', server: 'knode', tool: 'knode_resolve', arguments: { query: '林晓的岗位' } } });
-    emit({ type: 'item.started', item: { type: 'mcp_tool_call', server: 'knode', tool: 'knode_read', arguments: { path: 'raw/docs/email/2026-03-05.md' } } });
+    const calls = [['knode_resolve', { query: '林晓的岗位' }], ['knode_read', { path: 'raw/docs/email/2026-03-05.md' }]];
+    for (const [tool, input] of calls) emit({ type: "item.started", item: { type: "mcp_tool_call", server: "knode", tool, arguments: input } });
+    if (args.some((a) => a.startsWith('mcp_servers.knode.url='))) {
+      try {
+        await callTools(calls);
+      } catch (err) {
+        process.stderr.write(`knode tools: ${err instanceof Error ? err.message : err}\n`);
+        process.exit(1);
+      }
+    }
   } else {
     emit({ type: 'item.started', item: { type: 'command_execution', command: 'rg -n 林晓 .' } });
     emit({ type: 'item.started', item: { type: 'command_execution', command: `/bin/zsh -lc "rg -l '林晓' . | head -n 5"` } });
@@ -46,4 +83,5 @@ process.stdin.on('end', () => {
   emit({ type: 'item.completed', item: { type: 'agent_message', text: answer } });
   emit({ type: 'turn.completed', usage: { input_tokens: 1200, cached_input_tokens: 800, output_tokens: 60, reasoning_output_tokens: 10 } });
   if (out) fs.writeFileSync(out, answer);
+  if (sessionLog) fs.appendFileSync(sessionLog, `end ${Date.now()}\n`);
 });

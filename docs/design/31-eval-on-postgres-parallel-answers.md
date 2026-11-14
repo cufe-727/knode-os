@@ -1,6 +1,6 @@
 # 31 — Evaluation on PostgreSQL, and knode answers in parallel
 
-Status: being implemented (2026-11-14) on branch `claude/eval-postgres-parallel-a83957`, one commit per step: D2's harness half (single-flight open) and D3 done. The running 10× separation run is unaffected: it executes from its own checkout's build.
+Status: being implemented (2026-11-14) on branch `claude/eval-postgres-parallel-a83957`, one commit per step: D2's harness half (single-flight open), D3 and D4 done. The running 10× separation run is unaffected: it executes from its own checkout's build.
 
 ## Problem
 
@@ -77,8 +77,11 @@ Evaluation answers and tool calls run with hit tracking off (`track: false` thro
 The harness serves the build's knode tools itself: `registerKnodeTools(…, { caller: 'agent' })` over its open context, on a loopback Streamable-HTTP endpoint with a per-run secret, limited to `KNODE_AGENT_TOOLS`.
 
 - A local session gets it as an HTTP MCP server (`mcp_servers.knode.url`, bearer token from an environment variable; Codex 0.166 supports both). If that proves unusable in `codex exec`, a stdio command that forwards to the endpoint replaces it; the tools and their descriptions stay identical.
+  - *As built:* verified with the installed `codex exec` 0.166.0 on 2026-11-14 without model tokens — a fake Responses endpoint on loopback as the model provider and an isolated `CODEX_HOME`. Codex initialized the server with the bearer token from `bearer_token_env_var`, listed only the `enabled_tools`, offered them to the model as the namespace `mcp__knode`, called `knode_search` over HTTP when the model asked, and reported it as the same `mcp_tool_call` event (server `knode`) the trace audit reads. No forwarding command was needed. The env var is `KNODE_EVAL_MCP_TOKEN`, the one the remote worker already uses for the same server.
+  - *As built:* the host is `mountMcp` (src/server/mcp-http.ts) in single-context mode on a Hono app the run serves on 127.0.0.1 (src/eval/toolhost.ts), with two small additions: the context may be a function opened on the first request (the build's single-flight `open`), and single-context mode takes the tool options (`caller: 'agent'`, `only: KNODE_AGENT_TOOLS`, `track: false`). Its listing, server instructions and server info equal those of `knode-os mcp` narrowed to the same tools (tests/eval-parallel.test.ts).
 - A remote session reaches the same endpoint through `serve`'s existing lease-bound proxy, replacing the per-session bridge child.
-- `serial` and the `close(s)` hand-off go. Sessions run as wide as the session slots, on either backend: on PostgreSQL the queries run concurrently through the pool; on PGlite they queue inside the one process for milliseconds while the agents think.
+  - *As built:* `startMcpBridge` is gone; `remoteAgent` passes the host's URL and secret as the session's `mcp`. A session given a stdio command instead (nothing in the harness does that now) stays on this machine. `RemoteEval.cancel()` now returns the one withdrawal to every caller, so a cancelled run ends after `serve` has revoked the session tokens; before, the second call returned at once, which is what made "revokes a session's token … when the run is cancelled" flaky.
+- `serial` and the `close(s)` hand-off go (`serial` is gone from `SystemUnderTest` too: no system sets it). The host closes with the build's context, on `release` and when a run ends early (`closeKnodeStates`). Sessions run as wide as the session slots, on either backend: on PostgreSQL the queries run concurrently through the pool; on PGlite they queue inside the one process for milliseconds while the agents think.
 
 Why not a CLI the agent runs in its shell:
 

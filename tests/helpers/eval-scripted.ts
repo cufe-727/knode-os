@@ -7,8 +7,11 @@ import type { ChatBackend, ChatRequest } from '../../src/eval/shim.js';
 export class ScriptedBackend implements ChatBackend {
   readonly label = 'scripted';
   calls = 0;
+  /** `delayMs`: each answer-stage call takes this long, as a model's would (measuring answers per minute). */
+  constructor(private readonly delayMs = 0) {}
   async complete(req: ChatRequest) {
     this.calls++;
+    if (this.delayMs && req.tag?.stage === 'answer') await new Promise((r) => setTimeout(r, this.delayMs));
     const system = req.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
     const user = req.messages.filter((m) => m.role === 'user').map((m) => m.content).join('\n');
     let text: string;

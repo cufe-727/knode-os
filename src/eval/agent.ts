@@ -10,6 +10,7 @@ import { EVAL_HOME } from './pack.js';
 import { currentRemote } from './placement.js';
 import { remoteAgent, RemoteEval } from './remote.js';
 import { evalTempDir } from './tmp.js';
+import { AGENT_MCP_TOKEN_ENV } from './toolhost.js';
 
 /**
  * One Codex agent session over a folder (docs/design/23 §3): the grep
@@ -25,14 +26,17 @@ import { evalTempDir } from './tmp.js';
  * files (packs, runs — the gold) voids the answer.
  */
 
-export interface McpServerSpec {
+/**
+ * The MCP server a session gets: a stdio command Codex starts, or a running
+ * Streamable-HTTP endpoint (the run's tool host, src/eval/toolhost.ts) that
+ * Codex reaches with a bearer token it reads from its environment — never
+ * from its command line.
+ */
+export type McpServerSpec = {
   name: string;
-  command: string;
-  args: string[];
-  env?: Record<string, string>;
   /** Only these tools are offered (Codex `enabled_tools`). */
   enabledTools?: string[];
-}
+} & ({ command: string; args: string[]; env?: Record<string, string> } | { url: string; token: string });
 
 /**
  * Where agent sessions run (docs/design/23 D18): a model chain's API links
@@ -117,9 +121,14 @@ export function agentArgs(opts: AgentRunOptions, outFile: string, catalog: strin
   if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);
   if (opts.mcp) {
     const key = `mcp_servers.${opts.mcp.name}`;
-    args.push('-c', `${key}.command=${toml(opts.mcp.command)}`, '-c', `${key}.args=${toml(opts.mcp.args)}`);
-    if (opts.mcp.env && Object.keys(opts.mcp.env).length) {
-      args.push('-c', `${key}.env={${Object.entries(opts.mcp.env).map(([k, v]) => `${k}=${toml(v)}`).join(',')}}`);
+    if ('url' in opts.mcp) {
+      // as a remote worker gives a session the run's tools (worker/knode-worker.mjs): the token stays in the environment
+      args.push('-c', `${key}.url=${toml(opts.mcp.url)}`, '-c', `${key}.bearer_token_env_var="${AGENT_MCP_TOKEN_ENV}"`);
+    } else {
+      args.push('-c', `${key}.command=${toml(opts.mcp.command)}`, '-c', `${key}.args=${toml(opts.mcp.args)}`);
+      if (opts.mcp.env && Object.keys(opts.mcp.env).length) {
+        args.push('-c', `${key}.env={${Object.entries(opts.mcp.env).map(([k, v]) => `${k}=${toml(v)}`).join(',')}}`);
+      }
     }
     if (opts.mcp.enabledTools?.length) args.push('-c', `${key}.enabled_tools=${toml(opts.mcp.enabledTools)}`);
     args.push('-c', `${key}.default_tools_approval_mode="approve"`, '-c', `${key}.tool_timeout_sec=300`);
@@ -275,7 +284,13 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
         if (api) args.splice(args.length - 1, 0, ...apiProviderArgs(api.baseUrl));
         return runProcess(cmd, args, opts.prompt, opts.timeoutMs ?? 15 * 60_000, {
           cwd: opts.cwd,
-          ...(api ? { env: { ...process.env, [AGENT_KEY_ENV]: api.apiKey } } : {}),
+          ...(api || (opts.mcp && 'url' in opts.mcp) ? {
+            env: {
+              ...process.env,
+              ...(api ? { [AGENT_KEY_ENV]: api.apiKey } : {}),
+              ...(opts.mcp && 'url' in opts.mcp ? { [AGENT_MCP_TOKEN_ENV]: opts.mcp.token } : {}),
+            },
+          } : {}),
           onSpawn: (c) => (child = c),
           onStdout: (chunk) => {
             buffer += chunk;

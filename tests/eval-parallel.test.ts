@@ -5,6 +5,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { AppContext, createContext } from '../src/context.js';
 import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
 import { registerKnodeTools } from '../src/mcp/tools.js';
@@ -18,6 +20,7 @@ import { RunStore } from '../src/eval/runstore.js';
 import { startShim } from '../src/eval/shim.js';
 import { KNODE_AGENT_TOOLS, knodeAsk } from '../src/eval/systems/knode.js';
 import type { SystemEnv } from '../src/eval/systems/types.js';
+import { startToolHost } from '../src/eval/toolhost.js';
 import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
 
 /**
@@ -25,6 +28,7 @@ import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
  * Every open of a workspace is counted: the stall behind `serial` was several
  * PGlite instances opened on one directory by answers that started together.
  * D3: answering, and the agent's tools, leave the index as built.
+ * D4: agent-knode's sessions share one tool host per build.
  */
 
 const opens = vi.hoisted(() => ({ n: 0 }));
@@ -93,29 +97,57 @@ describe('knode answers in parallel', () => {
     }
   }, 120_000);
 
-  it(`answers with knode-ask at width ${WIDTH}, ${REPS} runs, without a stall or a second open`, async () => {
-    const lines: string[] = [];
-    let answered = 0;
-    let ms = 0;
-    for (let r = 1; r <= REPS; r++) {
-      const runDir = path.join(tmp, 'runs', `wide-${r}`);
-      const before = opens.n;
-      const t0 = Date.now();
-      await runEval({
-        packs: [packDir], systems: ['knode-ask'], runDir, quota: false, suites: ['usage'], skipScoring: true, answerConcurrency: WIDTH,
-        reuseBuildsFrom: base, overrides: { chat: new ScriptedBackend(), judge, embedder },
-      });
-      ms += Date.now() - t0;
-      const answers = new RunStore(runDir).allAnswers().filter((a) => a.system === 'knode-ask');
-      expect(answers.filter((a) => a.error).map((a) => `${a.taskId}: ${a.error}`)).toEqual([]);
-      expect(answers.length).toBeGreaterThan(8);
-      // answers, then the retrieval probes: one open in all
-      expect(opens.n - before, `run ${r}`).toBe(1);
-      answered += answers.length;
-      lines.push(`run ${r}: ${answers.length} answers in ${Date.now() - t0} ms`);
-    }
-    report(`knode-ask width ${WIDTH}: ${answered} answers in ${ms} ms (${((answered / ms) * 60_000).toFixed(0)} a minute, runs included)\n${lines.join('\n')}`);
-  }, 600_000);
+  for (const system of ['knode-ask', 'agent-knode']) {
+    it(`answers with ${system} at width ${WIDTH}, ${REPS} runs, without a stall or a second open`, async () => {
+      const lines: string[] = [];
+      let answered = 0;
+      let ms = 0;
+      let widest = 0;
+      // emulated model time (KNODE_EVAL_PARALLEL_DELAY_MS): a knode-ask answer's call, an agent's whole session
+      const delay = Number(process.env.KNODE_EVAL_PARALLEL_DELAY_MS ?? 0);
+      const sessions = path.join(tmp, `sessions-${system}.log`);
+      const calls = path.join(tmp, `calls-${system}.log`);
+      process.env.FAKE_CODEX_SESSION_LOG = sessions;
+      process.env.FAKE_CODEX_MCP_LOG = calls;
+      process.env.FAKE_CODEX_SESSION_MS = String(delay);
+      try {
+        for (let r = 1; r <= REPS; r++) {
+          const runDir = path.join(tmp, 'runs', `wide-${system}-${r}`);
+          fs.rmSync(sessions, { force: true });
+          fs.rmSync(calls, { force: true });
+          const before = opens.n;
+          const t0 = Date.now();
+          await runEval({
+            packs: [packDir], systems: [system], runDir, quota: false, suites: ['usage'], skipScoring: true, answerConcurrency: WIDTH,
+            reuseBuildsFrom: base, overrides: { chat: new ScriptedBackend(delay), judge, embedder },
+          });
+          const took = Date.now() - t0;
+          ms += took;
+          const answers = new RunStore(runDir).allAnswers().filter((a) => a.system === system);
+          expect(answers.filter((a) => a.error).map((a) => `${a.taskId}: ${a.error}`)).toEqual([]);
+          expect(answers.length).toBeGreaterThan(8);
+          // answers (and for knode-ask the retrieval probes, for agent-knode every session's tools): one open in all
+          expect(opens.n - before, `run ${r}`).toBe(1);
+          if (system === 'agent-knode') {
+            // each session's two tool calls reached the build's host
+            expect(fs.readFileSync(calls, 'utf8').trim().split('\n')).toHaveLength(answers.length * 2);
+            const events = fs.readFileSync(sessions, 'utf8').trim().split('\n').map((l) => l.split(' ')).map(([k, t]) => [Number(t), k === 'start' ? 1 : -1] as const).sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+            let open = 0;
+            for (const [, d] of events) widest = Math.max(widest, (open += d));
+          }
+          answered += answers.length;
+          lines.push(`run ${r}: ${answers.length} answers in ${took} ms`);
+        }
+      } finally {
+        delete process.env.FAKE_CODEX_SESSION_LOG;
+        delete process.env.FAKE_CODEX_MCP_LOG;
+        delete process.env.FAKE_CODEX_SESSION_MS;
+      }
+      // sessions ran side by side, not one at a time
+      if (system === 'agent-knode') expect(widest).toBeGreaterThan(1);
+      report(`${system} width ${WIDTH}${delay ? `, ${delay} ms a model turn` : ''} on ${process.env.KNODE_DATABASE_KIND}: ${answered} answers in ${ms} ms (${((answered / ms) * 60_000).toFixed(0)} a minute, runs included)${system === 'agent-knode' ? `, at most ${widest} sessions at once` : ''}\n${lines.join('\n')}`);
+    }, 600_000);
+  }
 });
 
 /** What reading may write: the hit counts behind heat, resolve receipts and context-pack events. */
@@ -192,6 +224,53 @@ describe('answering leaves the index as built', () => {
       await sys.release!(env);
       await shim.close();
       staged.cleanup();
+    }
+  }, 120_000);
+});
+
+describe("the build's tool host", () => {
+  it('lists exactly what the stdio server gives an agent, answers only its token, and leaves the index as built', async () => {
+    const ws = path.join(new RunStore(base).workDir('fixture-life', 'knode'), 'ws');
+    // `knode-os mcp` as a session used to start it, narrowed the way Codex's enabled_tools narrowed it
+    const stdio = new Client({ name: 'test', version: '0' });
+    await stdio.connect(new StdioClientTransport({
+      command: process.execPath, args: [path.resolve('node_modules/tsx/dist/cli.mjs'), path.resolve('src/cli.ts'), '--data', ws, 'mcp'],
+      env: { ...getDefaultEnvironment(), KNODE_DATABASE_KIND: process.env.KNODE_DATABASE_KIND ?? 'pglite', ...(process.env.KNODE_DATABASE_URL ? { KNODE_DATABASE_URL: process.env.KNODE_DATABASE_URL } : {}) },
+      stderr: 'ignore',
+    }));
+    const expected = {
+      tools: (await stdio.listTools()).tools.filter((t) => KNODE_AGENT_TOOLS.includes(t.name)),
+      instructions: stdio.getInstructions(),
+      server: stdio.getServerVersion(),
+    };
+    await stdio.close();
+    expect(expected.tools.map((t) => t.name).sort()).toEqual([...KNODE_AGENT_TOOLS].sort());
+
+    const ctx = await createContext(ws);
+    const host = await startToolHost(async () => ctx, KNODE_AGENT_TOOLS);
+    try {
+      const connect = async (token: string) => {
+        const c = new Client({ name: 'test', version: '0' });
+        await c.connect(new StreamableHTTPClientTransport(new URL(host.url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+        return c;
+      };
+      const client = await connect(host.secret);
+      expect({ tools: (await client.listTools()).tools, instructions: client.getInstructions(), server: client.getServerVersion() }).toEqual(expected);
+      const before = await traces(ctx);
+      const search = async () => JSON.stringify((await client.callTool({ name: 'knode_search', arguments: { query: '林晓的岗位' } })).content);
+      const first = await search();
+      expect(first).toContain('raw/docs/');
+      // overlapping calls on the one context, and the same ranking every time
+      expect(await Promise.all(Array.from({ length: 8 }, search))).toEqual(Array.from({ length: 8 }, () => first));
+      expect(await traces(ctx)).toEqual(before);
+      // a tool outside the agent's set is not there to call
+      const outside = await client.callTool({ name: 'knode_ask', arguments: { question: 'x' } }).catch((e: unknown) => ({ isError: true, content: [{ text: String(e) }] }));
+      expect(outside.isError).toBe(true);
+      await client.close();
+      await expect(connect('not-the-token')).rejects.toThrow();
+    } finally {
+      await host.close();
+      await ctx.store.close();
     }
   }, 120_000);
 });

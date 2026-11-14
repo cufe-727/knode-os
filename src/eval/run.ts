@@ -25,6 +25,7 @@ import { withRemote } from './placement.js';
 import { judgeAgent, packMayLeave, PlacedChatBackend, RemoteEval, remoteJudgeClient, RunCancelledError } from './remote.js';
 import type { Placed } from './meter.js';
 import { closeAdapters } from './systems/external.js';
+import { closeKnodeStates } from './systems/knode.js';
 import { makeSystems } from './systems/index.js';
 import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
 import { boundedTrace } from './trace.js';
@@ -493,6 +494,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     remote?.close();
     quota.setBypass(null);
     closeAdapters();
+    // what a pack still holds open — its index and tool host — when the run ends early
+    await closeKnodeStates(runDir);
     await shim.close();
     if (localShim !== shim) await localShim.close();
     for (const l of loaded) l.staged.cleanup();
@@ -699,7 +702,7 @@ async function answerAll(
   if (!todo.length) return;
   progress(`[${env.pack.manifest.id}/${s.id}] answering ${todo.length} tasks${repeat > 1 ? ` (repeat ${repeat})` : ''}`);
   let done = 0;
-  await mapLimit(todo, s.serial ? 1 : concurrency, async (task) => {
+  await mapLimit(todo, concurrency, async (task) => {
     if (signal?.aborted) return;
     const key = answerKey(env.pack.manifest.id, s.id, task.id, fraction, seed, batch, repeat);
     // a repeat is asked under `<task>~r<n>`: its own meter tag and reply-cache key
