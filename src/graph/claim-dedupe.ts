@@ -541,6 +541,58 @@ export function datesApart(a: Pick<ClaimLite, 'valid_from' | 'valid_to' | 'event
   return Boolean((sa[1] && sa[1] < sb[0]) || (sb[1] && sb[1] < sa[0]));
 }
 
+/** A year a statement names, which periodsOf reads instead. */
+const NAMED_YEAR = /(?<![\d.])(?:20\d{2}|\d{2}\s*年)|fy\s*\d{2}|\d[qh]\d{2}/i;
+const MONTH = /(?<![\d.])(\d{1,2})\s*月/g;
+
+/**
+ * The months of the year a statement names without a year ("10月月报列示…",
+ * "4月上线"); empty when it names a year, which periodsOf reads. A monthly
+ * report with no date of its own says "4月月报列示四部支付组在岗人数为7人".
+ * Exported for tests.
+ */
+export function yearlessMonthsOf(s: string): Set<number> {
+  const text = s.normalize('NFKC');
+  if (NAMED_YEAR.test(text)) return new Set();
+  const out = new Set<number>();
+  for (const m of text.matchAll(MONTH)) {
+    const n = Number(m[1]);
+    if (n >= 1 && n <= 12) out.add(n);
+  }
+  return out;
+}
+
+/** The month of the year a claim's own window lies in, when it lies in one. */
+function windowMonth(c: Pick<ClaimLite, 'valid_from' | 'valid_to'>): Set<number> {
+  const from = toIso(c.valid_from);
+  const to = toIso(c.valid_to);
+  return from && to && from.slice(0, 7) === to.slice(0, 7) ? new Set([Number(from.slice(5, 7))]) : new Set();
+}
+
+/**
+ * Two claims whose months of the year miss each other, at least one of them
+ * named in the statement without a year: an April and an October are two
+ * times whatever their years. The other side may give its month by a window
+ * inside one month. A forecast is left out — "6月月报预计Orion于第32周上线" and
+ * the May report's same words name the reports' months, not the forecast's:
+ * on the 1× benchmark copy the judge called four such pairs the same.
+ * Exported for tests.
+ */
+export function monthsApart(
+  a: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to'>,
+  b: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to'>,
+): boolean {
+  if (a.kind === 'prediction' || b.kind === 'prediction') return false;
+  const na = yearlessMonthsOf(a.statement);
+  const nb = yearlessMonthsOf(b.statement);
+  if (na.size === 0 && nb.size === 0) return false;
+  const ma = na.size ? na : windowMonth(a);
+  const mb = nb.size ? nb : windowMonth(b);
+  if (ma.size === 0 || mb.size === 0) return false;
+  for (const m of ma) if (mb.has(m)) return false;
+  return true;
+}
+
 /**
  * A pair's relation by claim state alone, or null when the state does not
  * settle it: same subject, attribute, object and kind on other effective
@@ -925,7 +977,7 @@ export async function auditDuplicateClaims(
         stats.series++;
         continue;
       }
-      if (datesApart(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b))) {
+      if (datesApart(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b)) || (opts.stateRules !== false && monthsApart(a, b))) {
         outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '时期不同', model: 'rule' } });
         stats.differentTime++;
         continue;
