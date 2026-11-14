@@ -1681,7 +1681,7 @@ function paintTasksInFlight(t) {
       <td><span class="kind-pill k-${esc(x.kind)}">${esc(WORK_KIND_WORDS[x.kind] ?? x.kind)}</span></td>
       <td class="tasks-subject">${x.kind === 'judge' || x.kind === 'embed' || x.kind === 'session' || x.kind.startsWith('eval-') ? esc(x.subject) : `<a href="#" class="mono" data-open="${esc(x.subject)}">${esc(x.subject)}</a>`}</td>
       <td class="hint">${esc(x.detail ?? '')}</td>
-      <td><span class="mono">${esc(x.backend)}</span>${x.remote ? ' <span class="tag remote">remote</span>' : ''}<div class="hint mono tasks-worker-id">${esc(x.worker)}</div></td>
+      <td><span class="mono">${esc(x.backend)}</span>${x.remote ? ' <span class="tag remote">remote</span>' : ''}${x.class === 'eval' ? ' <span class="tag">evaluation</span>' : ''}<div class="hint mono tasks-worker-id">${esc(x.worker)}</div></td>
       <td class="num mono">${spanText(x.ageSeconds)}</td>
       <td class="num mono">${x.expiresInSeconds > 0 ? spanText(x.expiresInSeconds) : 'lapsed'}</td>
     </tr>`).join('')}
@@ -1705,7 +1705,7 @@ function paintTasksWorkers(t) {
     return `<div class="worker-row">
       <span class="status-dot${w.online && !paused ? ' live' : ''}${paused ? ' warn' : ''}" title="${state}"></span>
       <div class="worker-main">
-        <div><b class="mono">${esc(w.label)}</b> <span class="tag${w.remote ? ' remote' : ''}">${w.remote ? 'remote' : 'this machine'}</span>${w.kinds.length ? ` <span class="hint">${esc(w.kinds.map((k) => WORK_KIND_WORDS[k] ?? k).join(' · '))}</span>` : ''}</div>
+        <div><b class="mono">${esc(w.label)}</b> <span class="tag${w.remote ? ' remote' : ''}">${w.remote ? 'remote' : 'this machine'}</span>${w.pool ? ` <span class="tag" title="the pool this worker declared (knode-worker --pool)">pool ${esc(w.pool)}</span>` : ''}${w.kinds.length ? ` <span class="hint">${esc(w.kinds.map((k) => WORK_KIND_WORDS[k] ?? k).join(' · '))}</span>` : ''}</div>
         <div class="hint">${state} · ${load} · ${w.ok.toLocaleString()} ok${w.failed ? ` · <span class="bad">${w.failed.toLocaleString()} failed</span>` : ''}${w.remote ? ` · seen ${agoText(w.lastSeen)}` : ''}</div>
         ${w.remote ? `<div class="hint mono tasks-worker-id">${esc(w.id)}</div>` : ''}
         ${paused ? `<div class="hint warn">resting until ${esc(restingUntil(w.pausedUntil))}${w.pauseReason ? `: ${esc(w.pauseReason)}` : ''}</div>` : ''}

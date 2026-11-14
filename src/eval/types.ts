@@ -283,6 +283,8 @@ export interface Answer {
   /** An agent touched a path outside its corpus copy: the answer is void. */
   leaked?: string[];
   error?: string;
+  /** The agent session behind it was killed or stopped with the run (docs/design/32 §3): asked again on resume, never an empty answer. */
+  cancelled?: boolean;
   usage: Usage;
   ms: number;
 }

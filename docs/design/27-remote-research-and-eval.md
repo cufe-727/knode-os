@@ -194,7 +194,8 @@ KNODE_TOKEN=knr_… node knode-worker.mjs --server https://knode-os.lemoncheese.
 | `server.remote.sessionOfferSeconds` | `30` | how long a session waits for an online worker before it runs here |
 | `server.remote.sessionWaitMinutes` | `30` | how long a session that may not run here waits for a worker (D5) |
 | `server.remote.offer.eval` | `false` | remote workers may take an evaluation run's calls and sessions (§8) |
-| `server.remote.evalOfferSeconds` | `30` | how long an eval piece waits for a worker before the run does it itself (`eval run --offer-seconds` wins) |
+| `server.remote.evalOfferSeconds` | — | no longer read (docs/design/32): a piece waits until a slot takes it, at most `eval run --wait-minutes` while none online does |
+| `server.remote.shares.eval` | `1` | evaluation work's weight beside extraction's 3 on a slot that takes both; `0`: only when no knowledge-base work waits (docs/design/32 §4) |
 | `research.localSessions` | unset | research sessions this machine runs at once while sessions are offered: unset, no limit beyond the jobs' own; `0`, workers only; `n`, at most n here |
 
 These live in `knode.config.json`; Settings has no field for them yet. New token scope `research`: lease
@@ -205,9 +206,13 @@ worker keeps `payload.worker`; a team's or a study's phases each keep their `wor
 
 ## 8. Evaluation on remote workers
 
+Since 2026-11-14 (docs/design/32, stage 1) a run only publishes: every piece below waits for a slot that leases it —
+a remote worker's, or one of the run's own (`--local`) — and never falls back to running in the run's process.
+"Placement", "Parallelism" and "What stays" say what is now the case; the rest of this section is unchanged.
+
 ```
  eval run (this machine: run dir, records, quota guard, report)
-   │ shim ─ PlacedChatBackend ─┐  runAgent ─ remoteAgent ─┐  judge ─ remoteJudgeClient ─┐
+   │ shim ─ PublishedChatBackend ─┐  runAgent ─ publishAgent ─┐  judge ─ remoteJudgeClient ─┐
    │                           ▼                          ▼                              ▼
    │        POST 127.0.0.1:<serve>/eval/v1/offer {spec}   (data root's MCP token; held open, whitespace every 10 s)
    │        PUT  …/eval/v1/archives/<sha256>               (a file agent's folder, before its session)
@@ -218,21 +223,22 @@ worker keeps `payload.worker`; a team's or a study's phases each keep their `wor
    │            POST …/eval-sessions/<id>/mcp  (kes_)  ──▶ serve ──▶ the build's tool host on 127.0.0.1 (in the run, design 31 D4)
    │            POST …/work/renew { output } · …/work/complete { text | session: { exitCode, output, lastMessage, capped, cwd, home } }
    ▼
- the outcome goes back on the held request: answered | error | withdrawn | failed | cancelled
+ the outcome goes back on the held request: answered | error | stuck | cancelled
+ the run's own slots (--local) lease the same pieces over POST …/eval/v1/slots/lease|complete|renew|release
 ```
 
 **What leaves.** Three kinds of model work, each only while the run names its CLI and model:
 
-- *Builds and single-shot answers* go through the shim's `ChatBackend`. With `--remote`, a run on the Codex CLI with
-  a named `--model` wraps its backend in `PlacedChatBackend` (src/eval/remote.ts): a `ChatRequest` (messages, json,
-  schema, effort, model) becomes an `eval-call` whose prompt is the stdin `codex exec` would get
-  (`renderCliPrompt`), with the effort in Codex's terms and the strict output schema. A chain (`--chat-chain`), a
-  connection (`--chat-connection`) or a run with no `--model` keeps its calls here: a CLI default may be another model
-  on another machine.
+- *Builds and single-shot answers* go through the shim's `ChatBackend`, which is always `PublishedChatBackend`
+  (src/eval/remote.ts): a `ChatRequest` (messages, json, schema, effort, model) becomes an `eval-call`. On a run on
+  the Codex CLI with a named `--model` its prompt is the stdin `codex exec` would get (`renderCliPrompt`), with the
+  effort in Codex's terms and the strict output schema, and any slot may take it. A chain (`--chat-chain`), a
+  connection (`--chat-connection`) or a run with no `--model` publishes its calls `local`: a CLI default may be
+  another model on another machine.
 - *Scoring*: the judge's client is wrapped (`remoteJudgeClient`) when the judge is a CLI with a named
   `--judge-model`: each call is an `eval-call` on that family. `eval score --remote` does the same.
-- *Agent answers*: `runAgent` asks `remoteAgent` first. A read-only session with a named model leaves as an
-  `eval-session`: family, model, effort, sandbox, step cap, timeout and prompt, never argv or environment (D9).
+- *Agent answers*: inside a run `runAgent` publishes the session (`publishAgent`); the run's own slot runs it with
+  `runAgentHere`. A read-only session with a named model may leave as an `eval-session`: family, model, effort, sandbox, step cap, timeout and prompt, never argv or environment (D9).
   - A *file agent* (agent-grep, the wiki agents) gets its staged folder as an archive (src/work/eval-archive.ts:
     gzip over `KPA1\n` and, per file in path order, a JSON line `{p, n}` and the bytes; its id is the SHA-256 of the
     stream before compression). The run uploads it unless `serve` holds it (`HEAD` first), so a corpus every question
@@ -252,29 +258,43 @@ worker keeps `payload.worker`; a team's or a study's phases each keep their `wor
     and its home as the home a path must not reach.
   - A session that writes (the llm-wiki build and update, `workspace-write`) stays here.
 
-**What stays.** A pack with any source whose license starts with `private:` (finance-cn): its calls go to a second
-shim that never offers them (packs share the caches and this machine's slots), its sessions run here
-(`withRemote(null, …)`), and a run that holds one judges here. A run routed over an agent chain (`--agent-chain`)
-keeps its sessions here. Embeddings always stay (the run's own embedder and vector cache).
+**What stays.** A piece that may not leave is published `eligible: local` (docs/design/32 §2): only a slot on this
+machine takes it — in practice the run's own `--local` slots — and with none it waits like any other. That is a pack
+with any source whose license starts with `private:` (finance-cn: its calls go through a second shim whose backend
+publishes them `local`, packs sharing the caches; its sessions are published `local`; a run that holds one judges on
+`local` pieces), a run routed over an agent chain (`--agent-chain`: its sessions), a session that writes, and every
+call of a run on a chain, a connection, a stand-in or with no `--model`. Embeddings always stay (the run's own
+embedder and vector cache): they are not leased work.
 
-**Placement** (D3, D11). A piece is offered only while a worker slot for its kind and CLI asked in the last two
-minutes (`GET /eval/v1/status`). It waits up to `--offer-seconds` (default `server.remote.evalOfferSeconds`, 30) for
-a lease, then is withdrawn and runs here. A worker's failure is the worker's: a usage limit, a lost login, a missing
-CLI, a refused task, a lapsed lease, a session that exited with such an error, or a worker that reports another
-model than the one named puts the piece back in line; the third in a row ends the offer `failed`, and it runs here.
-A model's own error on a call (`kind: model`) is the call's, thrown as the run's backend would throw it. Here means
-under `--slots` for calls, and after this machine's quota guard (`waitLocal`): while workers for Codex are online the
-guard no longer holds a batch at its start, only what falls back here.
+**Placement** (D3, D11; since docs/design/32). Every piece is published, to `serve`'s broker with `--remote` or to
+a broker in the run's own process otherwise, and done only by a slot that leases it: a remote worker's, or one of the
+run's own (`--local codex:6,claude:1`), which leases like a worker and runs the piece with the run's own backends. A
+slot takes a piece only if it runs its CLI, is in its pool when the run names one (`--pool`; a worker's pool is its
+`--pool`, default its token's name), is on this machine when the piece is `local`, and — a run's own slot — belongs to
+its run. A piece waits until such a slot takes it; there is no offer window and no withdrawal (`--offer-seconds` is
+accepted with a warning). When no slot online meets a waiting piece's requirements for `--wait-minutes` (30; 0 = no
+limit), the run stops cleanly, records nothing for what still waits, and exits non-zero naming the CLI, model and
+pool it waited for; a resume continues. While waiting it logs once a minute what waits and for what. A worker's
+failure is the worker's: a usage limit, a lost login, a missing CLI, a refused task, a lapsed lease, a session that
+exited with such an error, or a worker that reports another model than the one named puts the piece back in line and
+rests that worker; a machine that failed a piece gets it again only when nothing else waits. A piece three different
+machines could not serve is `stuck`: logged, kept in the run's events and run.json, listed in the report, left
+unanswered (its answer or build is not recorded), and the run ends incomplete. A model's own error on a call
+(`kind: model`) is the call's, thrown as the run's backend would throw it. The quota guard holds what this machine's
+plan pays for: a run's own Codex slot waits in `waitLocal` before it runs a piece, and with no Codex slot of its own a
+run's batches no longer wait on this machine's plan.
 
-**Parallelism** (F). Remote slots add to this machine's: `--slots` and `--answer-concurrency` bound local work, a
-remote call takes no local slot, and a system answers `--answer-concurrency` plus the online remote slots of its
-kind at once. A knode build's document passes send `KNODE_EVAL_KNODE_CONCURRENCY` (6) calls at once plus the remote
-call slots online when the build starts, and a pass's batch grows in the same proportion (`evalPassSettings`); the
-build's notes record both. The reviews inside a build (duplicate entities and claims, after every pass and in refine)
-send their judge calls as wide as a pass does (`review.directConcurrency`, recorded as `judgeConcurrency`): in the
-2026-11 10× run they went one at a time, 743 judge calls against 123 extraction calls, with 19 of 20 worker slots idle.
-The verdicts are applied after all of a review's calls return, so the width changes the time, not the result. Sync,
-embedding and wiki generation run here at their own pace.
+**Parallelism** (F; since docs/design/32). A system answers as wide as the slots online that could take its work —
+the run's own and the workers' that meet its pieces — re-read as they come and go; `--answer-concurrency`, when
+given, bounds it (an old command line has it at 3). `--slots` only sizes an old command line's own slots (no
+`--remote`, no `--local`: `--local codex:<slots>,claude:<slots>`). A knode build's document passes send as many calls
+at once as there are call slots online when the build starts, never fewer than `KNODE_EVAL_KNODE_CONCURRENCY` (6), and
+a pass's batch grows in the same proportion above that (`evalPassSettings`); the build's notes record both. The
+reviews inside a build (duplicate entities and claims, after every pass and in refine) send their judge calls as wide
+as a pass does (`review.directConcurrency`, recorded as `judgeConcurrency`): in the 2026-11 10× run they went one at a
+time, 743 judge calls against 123 extraction calls, with 19 of 20 worker slots idle. The verdicts are applied after
+all of a review's calls return, so the width changes the time, not the result. Sync, embedding and wiki generation
+run in the run's process at their own pace.
 
 **Comparability** (D). A worker runs exactly the family and model a task names (its own `--codex-model` does not
 apply), so a piece's backend is `codex-cli:<model>` (`claude-cli:<model>` for the judge) wherever it ran — another
@@ -286,8 +306,13 @@ answers made on workers and flags mixed backends, and the share of model calls p
 **Cancelling and restarts.** The offer request is held open; closing it (the run stopped or was killed) cancels the
 piece. A run that is cancelled (`signal`, Ctrl-C) also posts `/eval/v1/runs/<run>/cancel`: offers end, `kes_` tokens
 die at once, and a worker's next renewal is answered `lost`, which kills its CLI. A cancelled run writes no record for
-what it stopped, so a restarted run resumes record by record, asking nothing twice. `serve` restarting ends every
-offer `stopped`; the run's request fails, and the piece runs here.
+what it stopped, so a restarted run resumes record by record, asking nothing twice. An agent session killed by a
+signal, or one that ended with nothing while the run was stopping, is recorded as cancelled and asked again on resume,
+never as an empty answer. `serve` restarting loses what it held in memory (stage 2 of docs/design/32 makes it
+durable): the run's held requests fail, and the run publishes those pieces again once `serve` answers, as pieces that
+wait (a piece one of the run's own slots had already done keeps that result); a piece a worker had out is done again,
+and the worker's late answer is refused. While `serve` does not answer, only the run's own slots count as online, so
+the wait limit bounds an outage.
 
 **Repeats** (`eval run --repeat <n> [--repeat-systems …]`). Repeated answers to the same tasks, for run-to-run
 variance. Repeat 1 keeps today's keys; repeat r > 1 adds `r<r>` to the answer key and `repeat: r` to the record, is
@@ -295,18 +320,23 @@ answered under the task id `<task>~r<r>` (its own meter tag and reply-cache key,
 scored under its own system with `repeat: r` on the score record and in its key (docs/design/28, src/eval/score/keys.ts).
 
 **Access** (G). Token scope `eval` (`knode-os remote token create --scope eval --workspace <user>/<ws>`): eval work is
-the server's, leased through whichever workspace the token names. Setting `server.remote.offer.eval` (default
-`false`) and `server.remote.evalOfferSeconds` (30). The producer channel `/eval/v1` answers this machine only (a 404
+the server's, leased through whichever workspace the token names. Settings: `server.remote.offer.eval` (default
+`false`: remote workers see no eval work; a run's own slots still take its pieces through `serve`) and
+`server.remote.shares.eval` (1 against extraction's 3; 0 = only when no knowledge-base work waits for the slot);
+`server.remote.evalOfferSeconds` is no longer read. The producer channel `/eval/v1` answers this machine only (a 404
 elsewhere) and the data root's `.knode/mcp-token`; it adds no listening port. `GET /api/tasks` lists eval work out
-(kind `eval-call` / `eval-session`, its run, model, worker and age) in every workspace.
+(kind `eval-call` / `eval-session`, class `eval`, its run, model, pool, worker and age) in every workspace, and each
+remote worker's pool.
 
 ```bash
 # on the Mac mini: offer eval work (knode.config.json: server.remote.offer.eval = true), then mint a token
 knode-os remote token create --name laptop-eval --scope eval --workspace admin/finance
 # on the other machine
 KNODE_TOKEN=knr_… node knode-worker.mjs --server https://knode-os.lemoncheese.cc --workspace admin/finance --eval codex:3,claude:2
-# a run that offers its work (serve on this machine must be running)
+# a run that publishes its work to serve on this machine; with no --local, nothing of it runs here
 knode-os eval run --pack fixture-life --model gpt-6.1-sol --judge-model claude-opus-5-5 --remote
+# the same with slots of its own beside the workers, and only workers started with --pool gateway
+knode-os eval run --pack fixture-life --model gpt-6.1-sol --judge-model claude-opus-5-5 --remote --local codex:2,claude:1 --pool gateway
 ```
 
 **Not built.** Leasing a writing session (the llm-wiki build) — its folder would have to come back; external

@@ -4,7 +4,10 @@ import type { KnodeConfig } from '../config.js';
 import { clientInfo } from '../server/public-guard.js';
 import type { EvalAgent } from '../work/broker.js';
 import { readArchive } from '../work/eval-archive.js';
-import { EVAL_FAMILIES, EvalFamily, EvalSpec, EvalWork } from '../work/eval.js';
+import type { FailureKind } from '../labeling/failures.js';
+import type { TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
+import { EVAL_FAMILIES, EvalFamily, EvalRunStatus, EvalSpec, EvalWork } from '../work/eval.js';
+import { isEvalKind } from '../work/kinds.js';
 import { offeredRemotely } from '../work/config.js';
 
 /**
@@ -12,11 +15,16 @@ import { offeredRemotely } from '../work/config.js';
  * `knode-os eval run` on this machine offers its model work to remote workers
  * through `serve`, and gets the outcome back.
  *
- *   GET  /eval/v1/status                 whether eval work is offered, and the worker slots online per kind and CLI
- *   POST /eval/v1/offer                  {spec, offerSeconds}: held open (whitespace every 10 s) until the piece
- *                                        is answered, withdrawn, failed or cancelled; closing it cancels the piece
+ *   GET  /eval/v1/status[?run=<id>]      whether eval work is offered to remote workers, the slots online per kind
+ *                                        (each with its CLI, whether it is on this machine and whose run it serves),
+ *                                        and the run's pieces waiting and out
+ *   POST /eval/v1/offer                  {spec}: held open (whitespace every 10 s) until the piece is answered,
+ *                                        stuck or cancelled; closing it cancels the piece
  *   HEAD|PUT /eval/v1/archives/<sha256>  a file agent's folder (src/work/eval-archive.ts), before its session is offered
  *   POST /eval/v1/runs/<run>/cancel      every piece of a run: leases end at the next renewal, session tokens now
+ *   POST /eval/v1/slots/lease|complete|renew|release
+ *                                        a run's own slots on this machine (`eval run --local`, docs/design/32 §3):
+ *                                        the same lease protocol as a worker's, bound to their run
  *
  * This machine only, as `/mcp` is: a request from anywhere else gets a 404,
  * and every request carries the data root's MCP token (`.knode/mcp-token`),
@@ -57,17 +65,34 @@ function agentOf(v: unknown): EvalAgent {
   return { family, model, effort, speed };
 }
 
+const RUN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/;
+const KEY_RE = /^[A-Za-z0-9_-]{8,64}$/;
+/** A pool's name (docs/design/32 §2): a worker's `--pool`, a token's name, or `local`. */
+export const POOL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
 /** A spec as the run sent it, checked field by field. */
 export function evalSpecOf(body: Record<string, unknown>): EvalSpec {
   const s = (body.spec ?? {}) as Record<string, unknown>;
   const run = text(s.run, 120);
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(run)) throw new BadSpec('spec.run must be a run id');
+  if (!RUN_RE.test(run)) throw new BadSpec('spec.run must be a run id');
+  const key = text(s.key, 64);
+  if (!KEY_RE.test(key)) throw new BadSpec('spec.key must be the run\'s key for the piece');
+  const eligible = s.eligible === 'local' ? 'local' : 'any';
+  const pool = s.pool == null || s.pool === '' ? null : text(s.pool, 64);
+  if (pool !== null && !POOL_RE.test(pool)) throw new BadSpec('spec.pool must name a pool');
   const label = text(s.label, 300);
-  const agent = agentOf(s.agent);
   const timeoutMs = Math.min(MAX_TIMEOUT_MS, Math.max(1_000, Math.trunc(Number(s.timeoutMs) || 15 * 60_000)));
+  if (eligible === 'local') {
+    // only the run's own slots take it, and they run it from the run's own copy: nothing here is executed
+    const agent = agentOf({ ...(s.agent as object ?? {}), model: String((s.agent as Record<string, unknown> | undefined)?.model ?? '') || 'default' });
+    if (s.kind === 'eval-call') return { kind: 'eval-call', run, key, eligible, pool, label, agent, prompt: '', schema: null, timeoutMs };
+    if (s.kind !== 'eval-session') throw new BadSpec('spec.kind must be eval-call or eval-session');
+    return { kind: 'eval-session', run, key, eligible, pool, label, agent, sandbox: s.sandbox === 'workspace-write' ? 'workspace-write' : 'read-only', maxSteps: 1, timeoutMs, prompt: '', archive: null, mcp: null };
+  }
+  const agent = agentOf(s.agent);
   if (typeof s.prompt !== 'string' || !s.prompt.trim()) throw new BadSpec('spec.prompt required');
   if (s.kind === 'eval-call') {
-    return { kind: 'eval-call', run, label, agent, prompt: s.prompt, schema: s.schema ?? null, timeoutMs };
+    return { kind: 'eval-call', run, key, eligible, pool, label, agent, prompt: s.prompt, schema: s.schema ?? null, timeoutMs };
   }
   if (s.kind !== 'eval-session') throw new BadSpec('spec.kind must be eval-call or eval-session');
   if (agent.family !== 'codex') throw new BadSpec('eval sessions run on codex');
@@ -89,7 +114,14 @@ export function evalSpecOf(body: Record<string, unknown>): EvalSpec {
     if (secret.length < 16) throw new BadSpec('spec.mcp.secret required');
     mcp = { url, secret, tools };
   }
-  return { kind: 'eval-session', run, label, agent, sandbox: 'read-only', maxSteps, timeoutMs, prompt: s.prompt, archive, mcp };
+  return { kind: 'eval-session', run, key, eligible, pool, label, agent, sandbox: 'read-only', maxSteps, timeoutMs, prompt: s.prompt, archive, mcp };
+}
+
+/** A run's pieces in both sources. */
+export function runStatusOf(work: EvalWork, run: string): EvalRunStatus {
+  const a = work.calls.runStatus(run);
+  const b = work.sessions.runStatus(run);
+  return { waiting: a.waiting + b.waiting, leased: a.leased + b.leased };
 }
 
 function tokenMatches(presented: string | null, expected: string): boolean {
@@ -112,32 +144,96 @@ export function mountEvalProducer(app: Hono<any>, deps: EvalProducerDeps): void 
   api.onError((err, c) => c.json({ error: err instanceof Error ? err.message : String(err) }, err instanceof BadSpec ? 400 : 500));
 
   const offered = () => offeredRemotely(deps.config(), 'eval-call');
-  const offerSeconds = () => {
-    const n = Number(deps.config().server.remote?.evalOfferSeconds);
-    return Number.isFinite(n) && n >= 0 ? n : 30;
-  };
 
-  api.get('/status', (c) => c.json({
-    offered: offered(),
-    offerSeconds: offerSeconds(),
-    online: {
-      'eval-call': Object.fromEntries(EVAL_FAMILIES.map((f) => [f, deps.work.calls.online(f)])),
-      'eval-session': Object.fromEntries(EVAL_FAMILIES.map((f) => [f, deps.work.sessions.online(f)])),
-    },
-  }));
+  api.get('/status', (c) => {
+    const run = c.req.query('run');
+    return c.json({
+      offered: offered(),
+      online: {
+        'eval-call': Object.fromEntries(EVAL_FAMILIES.map((f) => [f, deps.work.calls.online(f)])),
+        'eval-session': Object.fromEntries(EVAL_FAMILIES.map((f) => [f, deps.work.sessions.online(f)])),
+      },
+      slots: { 'eval-call': deps.work.calls.slotsOnline(), 'eval-session': deps.work.sessions.slotsOnline() },
+      ...(run && RUN_RE.test(run) ? { run: runStatusOf(deps.work, run) } : {}),
+    });
+  });
+
+  // a run's own slots (`eval run --local`): they lease like a worker, on this machine, and only their run's pieces
+  const slotOf = (b: Record<string, unknown>): WorkerIdentity => {
+    const run = text(b.run, 120);
+    if (!RUN_RE.test(run)) throw new BadSpec('run must be a run id');
+    const family = String(b.family ?? '') as EvalFamily;
+    if (!EVAL_FAMILIES.includes(family)) throw new BadSpec(`family must be ${EVAL_FAMILIES.join(' or ')}`);
+    const name = text(b.worker, 80);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._#-]{0,79}$/.test(name)) throw new BadSpec('worker must name the slot');
+    const pool = b.pool == null || b.pool === '' ? 'local' : text(b.pool, 64);
+    if (!POOL_RE.test(pool)) throw new BadSpec('pool must name a pool');
+    return { worker: `local/${run}/${name}`, backend: family, remote: false, run, pool };
+  };
+  const json = async (c: Context) => {
+    const b = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!b || typeof b !== 'object' || Array.isArray(b)) throw new BadSpec('expected a JSON object');
+    return b;
+  };
+  const idsOf = (v: unknown) => (Array.isArray(v) ? v.map((x) => text(x, 64)).filter(Boolean).slice(0, 64) : []);
+  api.post('/slots/lease', async (c) => {
+    const b = await json(c);
+    const who = slotOf(b);
+    const kinds = Array.isArray(b.kinds) ? b.kinds.filter(isEvalKind) : [];
+    for (const kind of kinds) deps.work.source(kind).noteAsked(who, kinds);
+    for (const kind of kinds) {
+      const tasks = await deps.work.source(kind).lease(who, 1, { kinds });
+      if (tasks.length) return c.json({ tasks });
+    }
+    return c.json({ tasks: [] });
+  });
+  api.post('/slots/complete', async (c) => {
+    const b = await json(c);
+    const who = slotOf(b);
+    const id = text(b.id, 64);
+    const source = deps.work.sources.find((x) => x.holds(id));
+    if (!source) return c.json({ accepted: false, reason: 'unknown or expired lease' }, 409);
+    const kind = ['model', 'transient', 'fatal'].includes(String(b.kind)) ? (b.kind as FailureKind) : undefined;
+    const outcome: TaskOutcome = b.ok === true
+      ? { ok: true, text: text(b.text, 2 * 1024 * 1024) }
+      : { ok: false, error: text(b.error || 'failed without a message', 2000), kind };
+    const result = await source.complete(id, who, outcome);
+    return c.json(result, result.accepted ? 200 : 409);
+  });
+  api.post('/slots/renew', async (c) => {
+    const b = await json(c);
+    const who = slotOf(b);
+    const ids = idsOf(b.ids);
+    const renewed: string[] = [];
+    const lost: string[] = [];
+    for (const source of deps.work.sources) {
+      const r = source.renew(ids.filter((id) => source.holds(id)), who);
+      renewed.push(...r.renewed);
+      lost.push(...r.lost);
+    }
+    lost.push(...ids.filter((id) => !deps.work.sources.some((x) => x.holds(id))));
+    return c.json({ renewed, lost });
+  });
+  api.post('/slots/release', async (c) => {
+    const b = await json(c);
+    const who = slotOf(b);
+    const ids = idsOf(b.ids);
+    let released = 0;
+    for (const source of deps.work.sources) released += await source.release(ids.filter((id) => source.holds(id)), who);
+    return c.json({ released });
+  });
 
   api.post('/offer', async (c) => {
     const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
     if (!body || typeof body !== 'object') throw new BadSpec('expected a JSON object');
     const spec = evalSpecOf(body);
-    if (!offered()) return c.json({ outcome: 'withdrawn', reason: 'this server does not offer evaluation work (server.remote.offer.eval is off)' });
+    // with eval work not offered to remote workers (server.remote.offer.eval off) a piece still waits here for a run's own slots
     if (spec.kind === 'eval-session' && spec.archive && !deps.work.archives.file(spec.archive.sha256)) {
       throw new BadSpec(`archive ${spec.archive.sha256.slice(0, 12)} is not here: upload it first`);
     }
-    const asked = Number(body.offerSeconds);
-    const offerMs = (Number.isFinite(asked) && asked >= 0 ? asked : offerSeconds()) * 1000;
+    // a piece waits until a slot takes it (docs/design/32 D3): a run from before that sends `offerSeconds`, which no longer applies
     const abort = new AbortController();
-    const offer = deps.work.source(spec.kind).offer(spec, { offerMs, signal: abort.signal });
+    const offer = deps.work.source(spec.kind).offer(spec, { signal: abort.signal });
     // the answer can take as long as the piece: headers now, whitespace while it waits, the outcome last
     const enc = new TextEncoder();
     let timer: NodeJS.Timeout | null = null;

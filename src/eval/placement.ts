@@ -16,6 +16,8 @@ export interface Placement {
   worker?: string;
   /** The CLI and model it ran on, as records keep it: `codex-cli:<model>`. */
   backend: string;
+  /** The pool of the worker that answered (docs/design/32 §2). */
+  pool?: string;
 }
 
 const remoteScope = new AsyncLocalStorage<unknown>();
@@ -48,4 +50,20 @@ export async function captureEither<T>(fn: () => Promise<T>): Promise<{ value?: 
   } catch (error) {
     return { error, placements };
   }
+}
+
+/** The system and task a piece of work belongs to, carried along an answer or a build (a stuck piece names them). */
+export interface PieceTag {
+  system: string;
+  task?: string;
+}
+
+const pieceTag = new AsyncLocalStorage<PieceTag>();
+
+export function withPieceTag<T>(tag: PieceTag, fn: () => Promise<T>): Promise<T> {
+  return pieceTag.run(tag, fn);
+}
+
+export function currentPieceTag(): PieceTag | null {
+  return pieceTag.getStore() ?? null;
 }

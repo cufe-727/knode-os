@@ -5,9 +5,10 @@ import { classifyFailure, FailureKind } from '../labeling/failures.js';
 import { CompleteResult, SessionAnswer, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
 import type { CallUsage } from '../llm/usage.js';
 import { readCodexEvents } from '../llm/usage.js';
-import { EvalAgent, EvalCallWorkTask, EvalSessionWorkTask, noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
+import { EvalAgent, EvalCallWorkTask, EvalSessionWorkTask, LeaseRequest, noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
 import { isArchiveId } from './eval-archive.js';
-import type { EvalKind } from './kinds.js';
+import { isEvalKind } from './kinds.js';
+import type { EvalKind, WorkKind } from './kinds.js';
 
 /**
  * An evaluation run's model work as leased work (docs/design/27 §8).
@@ -32,22 +33,31 @@ import type { EvalKind } from './kinds.js';
  * every workspace's broker, and a worker leases it through whichever
  * workspace its token names (with the `eval` scope).
  *
- * Placement (D3) is the run's: it offers a piece only while a worker for its
- * kind and CLI asked lately, and runs it itself when nobody leases it within
- * `offerMs` (`withdrawn`). A worker's failure is the worker's (D11): a usage
- * limit, a lost login, a missing CLI, a lapsed lease puts the piece back in
- * line, and the third in a row ends the offer `failed`, so the run does it
- * itself. A model's own error on a call (an answer that is no answer) is the
- * call's, and goes back as `error`, as the run's own backend would throw it.
+ * The run only publishes (docs/design/32): a piece waits until a slot that
+ * takes it leases it — a remote worker's, or one of the run's own on this
+ * machine — and never comes back for the run to do itself. A worker's failure
+ * is the worker's (D11): a usage limit, a lost login, a missing CLI, a lapsed
+ * lease puts the piece back in line. A model's own error on a call (an answer
+ * that is no answer) is the call's, and goes back as `error`, as the run's own
+ * backend would throw it.
  */
 
 export type EvalFamily = 'codex' | 'claude';
 export const EVAL_FAMILIES: readonly EvalFamily[] = ['codex', 'claude'];
 
+/** Where a piece may run (docs/design/32 §2): any slot that meets it, or only a slot on this machine. */
+export type EvalEligible = 'any' | 'local';
+
 export interface EvalCallSpec {
   kind: 'eval-call';
   /** The run's id, for cancelling and for Tasks. */
   run: string;
+  /** The run's own key for the piece: its local slots find the piece's work by it. */
+  key: string;
+  /** `local`: leased only to a slot on this machine (a pack with private sources, a backend only the run has). */
+  eligible: EvalEligible;
+  /** Only a slot of this pool takes it (`eval run --pool`); null: any slot that meets `agent`. */
+  pool: string | null;
   label: string;
   agent: EvalAgent;
   prompt: string;
@@ -58,9 +68,13 @@ export interface EvalCallSpec {
 export interface EvalSessionSpec {
   kind: 'eval-session';
   run: string;
+  key: string;
+  eligible: EvalEligible;
+  pool: string | null;
   label: string;
   agent: EvalAgent;
-  sandbox: 'read-only';
+  /** Only a read-only session may go to another machine; a run's own slots also run the llm-wiki builder's. */
+  sandbox: 'read-only' | 'workspace-write';
   maxSteps: number;
   timeoutMs: number;
   prompt: string;
@@ -84,10 +98,10 @@ export interface EvalSessionAnswer {
 }
 
 export type EvalOutcome =
-  | { outcome: 'answered'; worker: string; backend: string; text: string; usage: CallUsage | null; model: string; session?: EvalSessionAnswer }
-  | { outcome: 'error'; worker: string; backend: string; error: string; usage: CallUsage | null }
-  | { outcome: 'withdrawn'; reason: string; strikes?: number; lastError?: string }
-  | { outcome: 'failed'; strikes: number; lastError: string }
+  | { outcome: 'answered'; worker: string; backend: string; pool?: string | null; text: string; usage: CallUsage | null; model: string; session?: EvalSessionAnswer }
+  | { outcome: 'error'; worker: string; backend: string; pool?: string | null; error: string; usage: CallUsage | null }
+  /** Three different machines could not serve it (docs/design/32 §3): it is left unanswered, never answered another way. */
+  | { outcome: 'stuck'; workers: string[]; lastError: string }
   | { outcome: 'cancelled' }
   | { outcome: 'stopped' };
 
@@ -102,6 +116,10 @@ export interface EvalSessionBinding {
 export interface EvalLeaseStatus {
   id: string;
   kind: EvalKind;
+  class: 'eval';
+  /** The pool the piece requires (null: any) and the one its slot is in. */
+  pool: string | null;
+  workerPool: string | null;
   worker: string;
   backend: string;
   remote: boolean;
@@ -112,11 +130,29 @@ export interface EvalLeaseStatus {
   expiresInSeconds: number;
 }
 
+/** A slot that asked for this kind lately, as a run reads it to know what could take its pieces. */
+export interface EvalSlotSeen {
+  worker: string;
+  family: EvalFamily;
+  /** On this machine: `serve`'s own or a run's (never a worker over /remote/v1). */
+  local: boolean;
+  /** A run's own slot takes only that run's pieces. */
+  run: string | null;
+  /** The pool its worker declared; null for a slot that declared none. */
+  pool: string | null;
+}
+
+/** One run's pieces as the source holds them. */
+export interface EvalRunStatus {
+  waiting: number;
+  leased: number;
+}
+
 export interface EvalStatus extends SourceStatus {
-  /** Offered and waiting for a worker. */
+  /** Published and waiting for a slot. */
   waiting: number;
   leases: EvalLeaseStatus[];
-  totals: { offered: number; answered: number; withdrawn: number; failed: Record<FailureKind, number>; leasesExpired: number };
+  totals: { offered: number; answered: number; stuck: number; failed: Record<FailureKind, number>; leasesExpired: number };
 }
 
 interface Pending {
@@ -126,11 +162,10 @@ interface Pending {
   done: boolean;
   lease: string | null;
   strikes: number;
+  /** The machines that could not serve it (`<token>/<worker>`, not their slots), and how often each. */
+  failedBy: Map<string, number>;
   lastError: string;
   notBefore: number;
-  /** Since when it has waited for a worker (reset when it goes back in line). */
-  queuedAt: number;
-  offerMs: number;
 }
 
 interface EvalLease {
@@ -148,8 +183,10 @@ interface EvalLease {
 export interface EvalSourceOptions {
   leaseMs?: number;
   retryMs?: number;
-  /** Strikes before an offer ends `failed` (default 3). */
+  /** Different machines that could not serve a piece before it is `stuck`, and failures by each machine online that make it so (default 3). */
   maxStrikes?: number;
+  /** How long a slot that asked counts as online (default 2 min). */
+  onlineMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -158,6 +195,27 @@ const RETRY_MS = 5_000;
 const DEADLINE_GRACE_MS = 5 * 60_000;
 const MAX_STDOUT_BYTES = 32 * 1024 * 1024;
 const ONLINE_MS = 2 * 60_000;
+/** Failures of one piece, on any machines, after which it is stuck whatever is online. */
+const MAX_ATTEMPTS = 10;
+
+/**
+ * Whether a slot may take a piece (docs/design/32 §2): its CLI (the model,
+ * effort and speed the slot runs as the piece says, and a reply from another
+ * model is the slot's failure), the piece's pool, a piece that must stay on
+ * this machine only to a slot here, and a run's own slot only its run's pieces.
+ */
+export function takes(who: WorkerIdentity, family: EvalFamily, spec: EvalSpec): boolean {
+  if (spec.agent.family !== family) return false;
+  if (spec.pool && spec.pool !== who.pool) return false;
+  if (spec.eligible === 'local' && who.remote) return false;
+  if (who.run && spec.run !== who.run) return false;
+  return true;
+}
+
+/** A slot's identity as a record keeps it: the machine (`<token>/<worker>`), not its slot (`…/eval-codex#2`). */
+export function machineOf(worker: string): string {
+  return worker.replace(/\/[^/]*#\d+$/, '');
+}
 
 /** The CLI family a worker's backend names ("codex", "claude:…"). */
 export function evalFamilyOf(backend: string): EvalFamily | null {
@@ -187,12 +245,20 @@ export function evalSessionFailure(answer: Pick<EvalSessionAnswer, 'exitCode' | 
 export class EvalSource implements WorkSource {
   private readonly pending: Pending[] = [];
   private readonly leases = new Map<string, EvalLease>();
-  /** Who asked for this kind lately, per CLI: worker → when. */
-  private readonly asked = new Map<EvalFamily, Map<string, number>>();
-  private readonly totals: EvalStatus['totals'] = { offered: 0, answered: 0, withdrawn: 0, failed: noFailures(), leasesExpired: 0 };
+  /** Who asked for this kind lately: slot → what it is, the evaluation kinds it takes, and when. */
+  private readonly asked = new Map<string, EvalSlotSeen & { kinds: EvalKind[]; at: number }>();
+  /** This source and the other evaluation kind's: a slot online for one is online for each kind it takes. */
+  private peers: EvalSource[] = [this];
+
+  /** Share who is online between the sources of the two evaluation kinds. */
+  static link(sources: EvalSource[]): void {
+    for (const s of sources) s.peers = sources;
+  }
+  private readonly totals: EvalStatus['totals'] = { offered: 0, answered: 0, stuck: 0, failed: noFailures(), leasesExpired: 0 };
   private readonly leaseMs: number;
   private readonly retryMs: number;
   private readonly maxStrikes: number;
+  private readonly onlineMs: number;
   private readonly log: (msg: string) => void;
   private sweeper: NodeJS.Timeout | null = null;
   private closed = false;
@@ -201,6 +267,7 @@ export class EvalSource implements WorkSource {
     this.leaseMs = Math.max(1_000, opts.leaseMs ?? DEFAULT_LEASE_MS);
     this.retryMs = opts.retryMs ?? RETRY_MS;
     this.maxStrikes = Math.max(1, opts.maxStrikes ?? 3);
+    this.onlineMs = Math.max(1, opts.onlineMs ?? ONLINE_MS);
     this.log = opts.log ?? (() => {});
   }
 
@@ -212,25 +279,52 @@ export class EvalSource implements WorkSource {
     return this.leases.has(taskId);
   }
 
-  /** Worker slots of this CLI that asked for this kind within `withinMs`. */
-  online(family: EvalFamily, withinMs = ONLINE_MS): number {
+  /** Slots of this CLI that asked for this kind within `withinMs`. */
+  online(family: EvalFamily, withinMs = this.onlineMs): number {
+    return this.slotsOnline(withinMs).filter((s) => s.family === family).length;
+  }
+
+  /** Every slot that asked for this kind within `withinMs`, or holds one of its leases now (a slot at work asks nothing). */
+  slotsOnline(withinMs = this.onlineMs): EvalSlotSeen[] {
     const since = Date.now() - withinMs;
-    let n = 0;
-    for (const at of this.asked.get(family)?.values() ?? []) if (at >= since) n++;
-    return n;
+    // a slot asked of either source, or holds a lease of either, for every evaluation kind it takes
+    const busy = new Set(this.peers.flatMap((p) => [...p.leases.values()].filter((l) => !l.pending.done).map((l) => l.who.worker)));
+    const seen = new Map<string, EvalSlotSeen & { kinds: EvalKind[]; at: number }>();
+    for (const p of this.peers) {
+      for (const s of p.asked.values()) {
+        const had = seen.get(s.worker);
+        seen.set(s.worker, had ? { ...(had.at >= s.at ? had : s), kinds: [...new Set([...had.kinds, ...s.kinds])], at: Math.max(had.at, s.at) } : s);
+      }
+    }
+    return [...seen.values()].filter((s) => s.kinds.includes(this.kind) && (s.at >= since || busy.has(s.worker))).map(({ at: _at, kinds: _kinds, ...s }) => s);
+  }
+
+  /** A slot asked for work it takes, `kinds` among it (the broker calls this for each kind a slot asks for). */
+  noteAsked(who: WorkerIdentity, kinds: readonly WorkKind[] = [this.kind]): void {
+    const family = evalFamilyOf(who.backend);
+    if (!family) return;
+    const evalKinds = kinds.filter(isEvalKind);
+    this.asked.set(who.worker, { worker: who.worker, family, local: !who.remote, run: who.run ?? null, pool: who.pool ?? null, kinds: evalKinds.length ? evalKinds : [this.kind], at: Date.now() });
+  }
+
+  /** A run's pieces here: waiting for a slot, or out with one. */
+  runStatus(run: string): EvalRunStatus {
+    const mine = this.pending.filter((p) => !p.done && p.spec.run === run);
+    return { waiting: mine.filter((p) => p.lease === null).length, leased: mine.filter((p) => p.lease !== null).length };
   }
 
   /**
-   * Offer a piece to the workers. The returned promise settles with what
-   * became of it; `signal` (the run went away) cancels it wherever it is.
+   * Publish a piece. It waits until a slot that takes it leases it (docs/design/32
+   * D3): there is no window after which it comes back unserved. The returned
+   * promise settles with what became of it; `signal` (the run went away)
+   * cancels it wherever it is.
    */
-  offer(spec: EvalSpec, opts: { offerMs: number; signal?: AbortSignal }): { id: string; result: Promise<EvalOutcome>; cancel: () => void } {
+  offer(spec: EvalSpec, opts: { signal?: AbortSignal } = {}): { id: string; result: Promise<EvalOutcome>; cancel: () => void } {
     const id = `e_${crypto.randomBytes(6).toString('hex')}`;
     let resolve: (o: EvalOutcome) => void = () => {};
     const result = new Promise<EvalOutcome>((r) => (resolve = r));
-    const now = Date.now();
     const p: Pending = {
-      id, spec, done: false, lease: null, strikes: 0, lastError: '', notBefore: 0, queuedAt: now, offerMs: Math.max(0, opts.offerMs),
+      id, spec, done: false, lease: null, strikes: 0, failedBy: new Map(), lastError: '', notBefore: 0,
       settle: () => {},
     };
     p.settle = (outcome) => {
@@ -271,16 +365,17 @@ export class EvalSource implements WorkSource {
     return this.pending.some((p) => !p.done && p.spec.kind === 'eval-session' && p.spec.archive?.sha256 === sha256);
   }
 
-  async lease(who: WorkerIdentity, max = 1): Promise<WorkTask[]> {
+  async lease(who: WorkerIdentity, max = 1, request?: LeaseRequest): Promise<WorkTask[]> {
     if (this.closed || max < 1) return [];
     const family = evalFamilyOf(who.backend);
     if (!family) return [];
-    const seen = this.asked.get(family) ?? new Map<string, number>();
-    seen.set(who.worker, Date.now());
-    this.asked.set(family, seen);
+    this.noteAsked(who, request?.kinds ?? this.asked.get(who.worker)?.kinds ?? [this.kind]);
     this.sweep();
     const now = Date.now();
-    const p = this.pending.find((x) => !x.done && x.lease === null && x.notBefore <= now && x.spec.agent.family === family);
+    // a machine that could not serve a piece gets it again only when nothing else waits for it
+    const open = this.pending.filter((x) => !x.done && x.lease === null && x.notBefore <= now && takes(who, family, x.spec));
+    const machine = machineOf(who.worker);
+    const p = open.find((x) => !x.failedBy.has(machine)) ?? open[0];
     if (!p) return [];
     const lease: EvalLease = {
       id: crypto.randomUUID(),
@@ -292,7 +387,10 @@ export class EvalSource implements WorkSource {
     this.leases.set(lease.id, lease);
     p.lease = lease.id;
     this.log(`eval ${p.spec.kind === 'eval-call' ? 'call' : 'session'} ${p.spec.run} ${p.spec.label} → ${who.worker} (${evalBackend(p.spec.agent)})`);
-    const base = { id: lease.id, label: `${p.spec.run} · ${p.spec.label}`.slice(0, 200), leaseExpiresAt: new Date(lease.expiresAt).toISOString(), run: p.spec.run, agent: { ...p.spec.agent } };
+    const base = {
+      id: lease.id, label: `${p.spec.run} · ${p.spec.label}`.slice(0, 200), leaseExpiresAt: new Date(lease.expiresAt).toISOString(), run: p.spec.run, key: p.spec.key,
+      agent: { ...p.spec.agent }, class: 'eval' as const, requires: { ...p.spec.agent }, pool: p.spec.pool, eligible: p.spec.eligible,
+    };
     if (p.spec.kind === 'eval-call') {
       const task: EvalCallWorkTask = { ...base, kind: 'eval-call', prompt: p.spec.prompt, schema: p.spec.schema ?? null, timeoutMs: p.spec.timeoutMs };
       return [task];
@@ -345,7 +443,7 @@ export class EvalSource implements WorkSource {
       }
       // the model's own failure on a call: the call's, as the run's own backend would throw it
       this.totals.answered++;
-      p.settle({ outcome: 'error', worker: who.worker, backend, error: outcome.error || 'failed without a message', usage: outcome.usage ?? null });
+      p.settle({ outcome: 'error', worker: who.worker, backend, pool: who.pool ?? null, error: outcome.error || 'failed without a message', usage: outcome.usage ?? null });
       return { accepted: true };
     }
     if (outcome.model && outcome.model !== `${p.spec.agent.family}:${p.spec.agent.model}`) {
@@ -355,7 +453,7 @@ export class EvalSource implements WorkSource {
     }
     if (p.spec.kind === 'eval-call') {
       this.totals.answered++;
-      p.settle({ outcome: 'answered', worker: who.worker, backend, text: outcome.text, usage: outcome.usage ?? null, model: p.spec.agent.model });
+      p.settle({ outcome: 'answered', worker: who.worker, backend, pool: who.pool ?? null, text: outcome.text, usage: outcome.usage ?? null, model: p.spec.agent.model });
       return { accepted: true };
     }
     const s: SessionAnswer = outcome.session ?? { exitCode: 0, output: outcome.text ?? '', stderr: '', lastMessage: null };
@@ -370,7 +468,7 @@ export class EvalSource implements WorkSource {
       return { accepted: true, failure: failure.kind };
     }
     this.totals.answered++;
-    p.settle({ outcome: 'answered', worker: who.worker, backend, text: answer.lastMessage ?? '', usage: outcome.usage ?? readCodexEvents(answer.stdout).usage, model: p.spec.agent.model, session: answer });
+    p.settle({ outcome: 'answered', worker: who.worker, backend, pool: who.pool ?? null, text: answer.lastMessage ?? '', usage: outcome.usage ?? readCodexEvents(answer.stdout).usage, model: p.spec.agent.model, session: answer });
     return { accepted: true };
   }
 
@@ -396,10 +494,7 @@ export class EvalSource implements WorkSource {
       const lease = this.leases.get(id);
       if (!lease || lease.who.worker !== who.worker) continue;
       this.leases.delete(id);
-      if (lease.pending.lease === id) {
-        lease.pending.lease = null;
-        lease.pending.queuedAt = Date.now();
-      }
+      if (lease.pending.lease === id) lease.pending.lease = null;
       n++;
     }
     return n;
@@ -411,7 +506,7 @@ export class EvalSource implements WorkSource {
     return {
       waiting: this.pending.filter((p) => p.lease === null).length,
       leases: [...this.leases.values()].map((l) => ({
-        id: l.id, kind: this.kind, worker: l.who.worker, backend: l.who.backend, remote: l.who.remote,
+        id: l.id, kind: this.kind, class: 'eval' as const, pool: l.pending.spec.pool, workerPool: l.who.pool ?? null, worker: l.who.worker, backend: l.who.backend, remote: l.who.remote,
         run: l.pending.spec.run, label: l.pending.spec.label, model: evalBackend(l.pending.spec.agent),
         ageSeconds: Math.round((now - l.issuedAt) / 1000), expiresInSeconds: Math.round((l.expiresAt - now) / 1000),
       })),
@@ -443,16 +538,34 @@ export class EvalSource implements WorkSource {
     this.totals.failed[kind]++;
     p.strikes++;
     p.lastError = error;
-    this.log(`eval ${p.spec.run} ${p.spec.label}: ${worker} could not serve it (${kind}, ${p.strikes} in a row): ${error.slice(0, 240)}`);
-    if (p.strikes >= this.maxStrikes) {
-      p.settle({ outcome: 'failed', strikes: p.strikes, lastError: error });
+    const machine = machineOf(worker);
+    p.failedBy.set(machine, (p.failedBy.get(machine) ?? 0) + 1);
+    this.log(`eval ${p.spec.run} ${p.spec.label}: ${worker} could not serve it (${kind}; ${p.strikes} failure(s) on ${p.failedBy.size} machine(s)): ${error.slice(0, 240)}`);
+    if (this.isStuck(p)) {
+      // left for the run to report, never answered another way
+      this.totals.stuck++;
+      p.settle({ outcome: 'stuck', workers: [...p.failedBy.keys()], lastError: error });
       return;
     }
     p.notBefore = now + this.retryMs;
-    p.queuedAt = p.notBefore;
   }
 
-  /** Lapsed leases go back in line with a strike; offers nobody leased in time are withdrawn. */
+  /**
+   * When a piece is stuck (docs/design/32 §3): three different machines could
+   * not serve it; or every machine online that takes it has failed it three
+   * times (two judge workers, one machine with ten slots); or it failed ten
+   * times in all, however the machines online came and went.
+   */
+  private isStuck(p: Pending): boolean {
+    if (p.failedBy.size >= this.maxStrikes) return true;
+    if (p.strikes >= MAX_ATTEMPTS) return true;
+    const able = new Set(this.slotsOnline()
+      .filter((s) => takes({ worker: s.worker, backend: s.family, remote: !s.local, run: s.run ?? undefined, pool: s.pool ?? undefined }, s.family, p.spec))
+      .map((s) => machineOf(s.worker)));
+    return able.size > 0 && [...able].every((m) => (p.failedBy.get(m) ?? 0) >= this.maxStrikes);
+  }
+
+  /** Lapsed leases go back in line with a strike. */
   private sweep(): void {
     const now = Date.now();
     for (const lease of [...this.leases.values()]) {
@@ -462,14 +575,9 @@ export class EvalSource implements WorkSource {
       const p = lease.pending;
       if (p.done || p.lease !== lease.id) continue;
       p.lease = null;
+      // a run's own slot is the run's backend, not a worker: its lapse is no strike against the piece
+      if (lease.who.run) continue;
       this.strike(p, 'transient', `${lease.who.worker} ${lease.deadline <= now ? 'outran its timeout' : 'stopped renewing its lease'}`, lease.who.worker, now);
-    }
-    for (const p of [...this.pending]) {
-      if (p.done || p.lease !== null || now - p.queuedAt < p.offerMs) continue;
-      this.totals.withdrawn++;
-      p.settle(p.strikes
-        ? { outcome: 'withdrawn', reason: `no worker took it again within ${Math.round(p.offerMs / 1000)} s`, strikes: p.strikes, lastError: p.lastError }
-        : { outcome: 'withdrawn', reason: `no worker took it within ${Math.round(p.offerMs / 1000)} s` });
     }
     if (this.pending.length === 0 && this.sweeper) {
       clearInterval(this.sweeper);
@@ -550,6 +658,7 @@ export class EvalWork {
   constructor(rootDataDir: string, opts: EvalSourceOptions & { sessionLeaseMs?: number } = {}) {
     this.calls = new EvalSource('eval-call', opts);
     this.sessions = new EvalSource('eval-session', { ...opts, leaseMs: opts.sessionLeaseMs ?? opts.leaseMs });
+    EvalSource.link([this.calls, this.sessions]);
     this.archives = new EvalArchives(rootDataDir);
   }
 

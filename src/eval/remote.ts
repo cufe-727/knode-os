@@ -1,68 +1,359 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadConfig } from '../config.js';
 import { effortFor, renderCliPrompt, speedFor } from '../llm/cli.js';
-import type { ChatMessage, LlmClient } from '../llm/client.js';
+import { jsonFromReply, LlmClient } from '../llm/client.js';
+import type { ChatMessage } from '../llm/client.js';
 import type { CallUsage } from '../llm/usage.js';
 import { readCodexEvents } from '../llm/usage.js';
 import { MCP_TOKEN_FILE } from '../server/mcp-http.js';
-import type { EvalAgent } from '../work/broker.js';
+import type { WorkerIdentity } from '../labeling/scheduler.js';
+import { WorkBroker } from '../work/broker.js';
+import type { EvalAgent, WorkTask } from '../work/broker.js';
 import { packFolder } from '../work/eval-archive.js';
-import type { EvalFamily, EvalOutcome, EvalSessionAnswer } from '../work/eval.js';
+import { EVAL_FAMILIES, EvalSource, machineOf } from '../work/eval.js';
+import type { EvalCallSpec, EvalEligible, EvalFamily, EvalOutcome, EvalRunStatus, EvalSessionAnswer, EvalSessionSpec, EvalSlotSeen, EvalSourceOptions, EvalSpec } from '../work/eval.js';
 import type { EvalKind } from '../work/kinds.js';
 import type { AgentRunOptions, AgentRunResult } from './agent.js';
 import { AgentTrace } from './agent.js';
 import type { LoadedPack } from './pack.js';
-import { notePlacement } from './placement.js';
+import { currentPieceTag, notePlacement } from './placement.js';
+import type { PieceTag } from './placement.js';
 import type { QuotaGuard } from './quota.js';
-import type { ChatBackend, ChatRequest, ChatResult, Slots } from './shim.js';
+import type { ChatBackend, ChatRequest, ChatResult } from './shim.js';
 
 /**
- * An evaluation run's side of remote work (docs/design/27 §8).
+ * An evaluation run's model work as published work (docs/design/32, on the
+ * lease protocol of docs/design/27 §8).
  *
- * The run stays here; it offers model work to `serve` over its loopback
- * producer channel (src/remote/eval-producer.ts), which leases it to remote
- * workers and hands back what became of it. Three kinds of work leave:
+ * The run only publishes. Every model call of a system (the shim's backend,
+ * `PublishedChatBackend`), every judge call (`remoteJudgeClient`) and every
+ * agent session (`runAgent`, src/eval/agent.ts) becomes a piece in a queue,
+ * and slots that lease from that queue do the work:
  *
- *   - every system's build and single-shot answers, through the shim's
- *     backend (`PlacedChatBackend`): an `eval-call` per model call;
- *   - the judge's calls (`remoteJudgeClient`): an `eval-call` on Claude;
- *   - agent answers (`runAgent`, src/eval/agent.ts): an `eval-session`, its
- *     folder as an archive, or its knode tools through the build's tool host,
- *     kept here on the run's own open index (src/eval/toolhost.ts) — the one
- *     every session of the build shares, local or remote (docs/design/31 D4).
+ *   - the queue is `serve`'s broker when the run reaches it on this machine
+ *     (`--remote`, over the loopback producer channel, src/remote/eval-producer.ts),
+ *     and otherwise one the run starts in its own process (`RemoteEval.own`);
+ *   - remote workers lease from `serve`'s like any other kind of work;
+ *   - the run's own slots (`--local codex:6,claude:1`) lease from either like a
+ *     worker, and run a piece with the run's own backends (its stand-ins,
+ *     chains, connections and agent routing), found by the piece's key.
  *
- * A piece is offered only while a worker for its kind and CLI asked lately,
- * and only when the run names its model (a CLI default may differ between
- * machines); it runs here when nobody takes it in time or after three worker
- * failures (D3, D11). A pack with a `private:` source never leaves
- * (`packMayLeave`). With `serve` not running, nothing changes: everything
- * runs here.
+ * A piece that may not leave this machine (a pack with a `private:` source,
+ * a model the run does not name, a backend only the run has, a session that
+ * writes) is published `eligible: local`: only a slot on this machine takes
+ * it. With no slot for a piece, it waits.
  */
 
-export type RemoteOutcome = EvalOutcome | { outcome: 'unreachable'; error: string };
+export type RemoteOutcome = EvalOutcome | { outcome: 'unreachable'; error: string } | { outcome: 'refused'; status: number; error: string };
 
-interface ProducerStatus {
+/** The outcomes this run knows; anything else comes from a `serve` of another version. */
+const KNOWN_OUTCOMES = new Set(['answered', 'error', 'stuck', 'cancelled', 'stopped']);
+
+/** A producer-channel run id (`[A-Za-z0-9][A-Za-z0-9._-]*`, at most 120) for a run directory of any name: itself when it is one. */
+export function queueRunId(name: string): string {
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(name)) return name;
+  const slug = name.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[^A-Za-z0-9]+/, '').slice(0, 100) || 'run';
+  return `${slug}-${crypto.createHash('sha256').update(name).digest('hex').slice(0, 8)}`;
+}
+
+/** A run's own slot as the queue knows it: its name, its CLI, its run, its pool. */
+export interface LocalSlotIdentity {
+  name: string;
+  family: EvalFamily;
+  run: string;
+  pool: string;
+}
+
+export type LocalOutcome = { ok: true } | { ok: false; error: string };
+
+interface QueueStatus {
+  /** Whether `serve` offers eval work to remote workers at all. */
   offered: boolean;
-  offerSeconds: number;
-  online: Record<EvalKind, Record<EvalFamily, number>>;
+  slots: Record<EvalKind, EvalSlotSeen[]>;
+  run: EvalRunStatus;
+}
+
+/** Where a run publishes: `serve`'s broker or its own. One code path either way. */
+export interface EvalQueue {
+  readonly where: 'serve' | 'own';
+  readonly origin: string | null;
+  publish(spec: EvalSpec, signal: AbortSignal): Promise<RemoteOutcome>;
+  status(run: string): Promise<QueueStatus>;
+  /** The slots online now, where the queue can say without a request (the run's own broker). */
+  slotsNow?(): Record<EvalKind, EvalSlotSeen[]>;
+  /** A folder a worker's session reads: only `serve` hands archives to workers. */
+  archive(dir: string, signal: AbortSignal): Promise<{ sha256: string; bytes: number } | null>;
+  lease(who: LocalSlotIdentity, kinds: EvalKind[]): Promise<WorkTask[]>;
+  complete(who: LocalSlotIdentity, id: string, outcome: LocalOutcome): Promise<void>;
+  renew(who: LocalSlotIdentity, ids: string[]): Promise<void>;
+  release(who: LocalSlotIdentity, ids: string[]): Promise<void>;
+  cancelRun(run: string): Promise<void>;
+  close(): void;
+}
+
+const localWho = (who: LocalSlotIdentity): WorkerIdentity => ({ worker: `local/${who.run}/${who.name}`, backend: who.family, remote: false, run: who.run, pool: who.pool });
+
+/** The run's own broker, in its own process: no remote worker can reach it, the run's own slots lease from it. */
+export class OwnQueue implements EvalQueue {
+  readonly where = 'own' as const;
+  readonly origin = null;
+  readonly calls: EvalSource;
+  readonly sessions: EvalSource;
+  private readonly broker: WorkBroker;
+
+  constructor(opts: EvalSourceOptions = {}) {
+    this.calls = new EvalSource('eval-call', opts);
+    this.sessions = new EvalSource('eval-session', opts);
+    EvalSource.link([this.calls, this.sessions]);
+    this.broker = new WorkBroker([this.calls, this.sessions]);
+  }
+
+  private source(kind: EvalKind): EvalSource {
+    return kind === 'eval-call' ? this.calls : this.sessions;
+  }
+
+  publish(spec: EvalSpec, signal: AbortSignal): Promise<RemoteOutcome> {
+    return this.source(spec.kind).offer(spec, { signal }).result;
+  }
+
+  slotsNow(): Record<EvalKind, EvalSlotSeen[]> {
+    return { 'eval-call': this.calls.slotsOnline(), 'eval-session': this.sessions.slotsOnline() };
+  }
+
+  async status(run: string): Promise<QueueStatus> {
+    const a = this.calls.runStatus(run);
+    const b = this.sessions.runStatus(run);
+    return {
+      offered: false,
+      slots: { 'eval-call': this.calls.slotsOnline(), 'eval-session': this.sessions.slotsOnline() },
+      run: { waiting: a.waiting + b.waiting, leased: a.leased + b.leased },
+    };
+  }
+
+  async archive(): Promise<null> {
+    return null;
+  }
+
+  lease(who: LocalSlotIdentity, kinds: EvalKind[]): Promise<WorkTask[]> {
+    return this.broker.lease(localWho(who), kinds, 1);
+  }
+
+  async complete(who: LocalSlotIdentity, id: string, outcome: LocalOutcome): Promise<void> {
+    await this.broker.complete(id, localWho(who), outcome.ok ? { ok: true, text: '' } : { ok: false, error: outcome.error, kind: 'model' });
+  }
+
+  async renew(who: LocalSlotIdentity, ids: string[]): Promise<void> {
+    this.broker.renew(ids, localWho(who));
+  }
+
+  async release(who: LocalSlotIdentity, ids: string[]): Promise<void> {
+    await this.broker.release(ids, localWho(who));
+  }
+
+  async cancelRun(run: string): Promise<void> {
+    this.calls.cancelRun(run);
+    this.sessions.cancelRun(run);
+  }
+
+  close(): void {
+    this.calls.close();
+    this.sessions.close();
+  }
+}
+
+/** `serve`'s broker, over the loopback producer channel and the data root's MCP token. */
+export class ServeQueue implements EvalQueue {
+  readonly where = 'serve' as const;
+
+  constructor(private readonly serveUrl: string, private readonly token: string) {}
+
+  get origin(): string {
+    return this.serveUrl;
+  }
+
+  private headers(json = true): Record<string, string> {
+    return { authorization: `Bearer ${this.token}`, ...(json ? { 'content-type': 'application/json' } : {}) };
+  }
+
+  private async post<T>(route: string, body: unknown, signal?: AbortSignal): Promise<T> {
+    const res = await fetch(`${this.serveUrl}/eval/v1/${route}`, { method: 'POST', headers: this.headers(), body: JSON.stringify(body), signal: signal ?? AbortSignal.timeout(30_000) });
+    const text = (await res.text()).trim();
+    const parsed = text ? JSON.parse(text) as T & { error?: string } : null;
+    if (res.status >= 400 && res.status < 500 && res.status !== 409) throw new ServeRefusedError(route, res.status, parsed?.error ?? text.slice(0, 200));
+    if (!parsed || (!res.ok && res.status !== 409)) throw new Error(`${route}: ${res.status} ${parsed?.error ?? text.slice(0, 200)}`);
+    return parsed;
+  }
+
+  async publish(spec: EvalSpec, signal: AbortSignal): Promise<RemoteOutcome> {
+    try {
+      const res = await fetch(`${this.serveUrl}/eval/v1/offer`, {
+        method: 'POST', headers: this.headers(), body: JSON.stringify({ spec }), signal,
+      });
+      const text = (await res.text()).trim();
+      let body: (RemoteOutcome & { error?: string }) | null = null;
+      try {
+        body = text ? JSON.parse(text) : null;
+      } catch {
+        // not JSON: a proxy's page, a server mid-restart
+      }
+      // a refusal is final (a spec serve will not take, a token it does not know); only a server error or no answer is waited out
+      if (res.status >= 400 && res.status < 500) return { outcome: 'refused', status: res.status, error: body?.error ?? text.slice(0, 300) };
+      if (!res.ok || !body || !('outcome' in body)) throw new Error(`${res.status}: ${body?.error ?? text.slice(0, 200)}`);
+      if (!KNOWN_OUTCOMES.has(body.outcome)) return { outcome: 'refused', status: res.status, error: `serve answered "${body.outcome}", which this run does not know: serve on this machine runs another version — restart it on this build` };
+      return body;
+    } catch (err) {
+      if (signal.aborted) return { outcome: 'cancelled' };
+      return { outcome: 'unreachable', error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  async status(run: string, first = false): Promise<QueueStatus> {
+    const res = await fetch(`${this.serveUrl}/eval/v1/status?run=${encodeURIComponent(run)}`, { headers: this.headers(false), signal: AbortSignal.timeout(first ? 5_000 : 10_000) });
+    // a refusal first (a token serve does not know, a route it lacks): that is serve answering, not serve gone
+    if (res.status >= 400 && res.status < 500) throw new ServeRefusedError('status', res.status, (await res.text()).slice(0, 200));
+    if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
+    const body = await res.json() as Partial<QueueStatus>;
+    // a serve from before docs/design/32 has no slots for a run's own and would withdraw pieces: refuse it plainly
+    if (!body.slots) throw new ServeRefusedError('status', res.status, 'serve on this machine is older than this run (no slots in /eval/v1/status): restart it on this build, or run without --remote');
+    return { offered: Boolean(body.offered), slots: { 'eval-call': body.slots?.['eval-call'] ?? [], 'eval-session': body.slots?.['eval-session'] ?? [] }, run: body.run ?? { waiting: 0, leased: 0 } };
+  }
+
+  /** Packed, and uploaded unless `serve` holds it already: a folder every question reads goes up once. */
+  async archive(dir: string, signal: AbortSignal): Promise<{ sha256: string; bytes: number }> {
+    const packed = packFolder(dir);
+    const head = await fetch(`${this.serveUrl}/eval/v1/archives/${packed.sha256}`, { method: 'HEAD', headers: this.headers(false), signal });
+    if (head.ok) return { sha256: packed.sha256, bytes: packed.bytes };
+    if (head.status !== 404 && head.status >= 400 && head.status < 500) throw new ServeRefusedError('archives', head.status, 'serve refused the archive check');
+    const res = await fetch(`${this.serveUrl}/eval/v1/archives/${packed.sha256}`, {
+      method: 'PUT', headers: { ...this.headers(false), 'content-type': 'application/gzip' }, body: packed.gzip(), signal,
+    });
+    if (res.status >= 400 && res.status < 500) throw new ServeRefusedError('archives', res.status, (await res.text()).slice(0, 200));
+    if (!res.ok) throw new Error(`archive upload failed: ${res.status} ${(await res.text()).slice(0, 200)}`);
+    return { sha256: packed.sha256, bytes: packed.bytes };
+  }
+
+  async lease(who: LocalSlotIdentity, kinds: EvalKind[]): Promise<WorkTask[]> {
+    const r = await this.post<{ tasks?: WorkTask[] }>('slots/lease', { worker: who.name, family: who.family, run: who.run, pool: who.pool, kinds });
+    return r.tasks ?? [];
+  }
+
+  async complete(who: LocalSlotIdentity, id: string, outcome: LocalOutcome): Promise<void> {
+    await this.post('slots/complete', { worker: who.name, family: who.family, run: who.run, pool: who.pool, id, ...(outcome.ok ? { ok: true, text: '' } : { ok: false, error: outcome.error, kind: 'model' }) });
+  }
+
+  async renew(who: LocalSlotIdentity, ids: string[]): Promise<void> {
+    await this.post('slots/renew', { worker: who.name, family: who.family, run: who.run, pool: who.pool, ids });
+  }
+
+  async release(who: LocalSlotIdentity, ids: string[]): Promise<void> {
+    await this.post('slots/release', { worker: who.name, family: who.family, run: who.run, pool: who.pool, ids });
+  }
+
+  async cancelRun(run: string): Promise<void> {
+    await fetch(`${this.serveUrl}/eval/v1/runs/${encodeURIComponent(run)}/cancel`, { method: 'POST', headers: this.headers(false), signal: AbortSignal.timeout(5_000) }).catch(() => {});
+  }
+
+  close(): void {}
 }
 
 export interface RemoteEvalOptions {
-  /** `serve`'s own origin on this machine, e.g. http://127.0.0.1:12000. */
-  serveUrl: string;
-  /** The data root's MCP token. */
-  token: string;
-  /** The run's id: offers carry it, and cancelling the run withdraws them. */
+  /** The run's id: pieces carry it, and cancelling the run withdraws them. */
   run: string;
-  /** How long a piece waits for a worker before it runs here (default: the server's, 30 s). */
-  offerSeconds?: number;
-  /** The run's quota guard: a piece that falls back here waits for this machine's plan. */
+  /** The run's quota guard: a run's own Codex slot waits for this machine's plan before it runs a piece. */
   quota?: QuotaGuard | null;
-  /** How often the worker slots online are read again (default 15 s). */
+  /** How often the slots online are read again from `serve` (default 15 s). */
   refreshMs?: number;
+  /** How often a run's own slot renews the lease of a piece it runs (default 20 s). */
+  renewMs?: number;
+  /**
+   * The pool every piece of the run requires (`eval run --pool`, docs/design/32
+   * §2); the run's own slots are in it too. Absent: pieces take any slot that
+   * meets them, and the run's own slots are pool `local`.
+   */
+  pool?: string | null;
+  /**
+   * How long a piece may wait while no slot online meets its requirements
+   * before the run stops (default 30; 0: no limit). Fractions are minutes too.
+   */
+  waitMinutes?: number;
+  /** How often waiting is checked (default 5 s) and logged (default once a minute). */
+  checkMs?: number;
+  logEveryMs?: number;
+  /** The wait limit passed, or serve refused the run: the run stops, cleanly. */
+  onStop?: (why: RunStoppedError) => void;
+  /** The first wait before a piece is published again while serve does not answer (default 1 s, doubling to 15 s). */
+  backoffMs?: number;
+  /** A piece three different workers could not serve (for the run's events). */
+  onStuck?: (piece: StuckPiece) => void;
   log?: (msg: string) => void;
+}
+
+/** What a waiting piece requires, as the run's wait and its log say it. */
+interface Requirement {
+  kind: EvalKind;
+  family: EvalFamily;
+  model: string;
+  eligible: EvalEligible;
+  pool: string | null;
+}
+
+const requirementKey = (r: Requirement) => `${r.kind}|${r.family}|${r.model}|${r.eligible}|${r.pool ?? ''}`;
+
+/** A requirement in words: what a run waits for. */
+export function describeRequirement(r: Pick<Requirement, 'family' | 'model' | 'eligible' | 'pool'> & { kind?: EvalKind }): string {
+  const what = r.kind === 'eval-session' ? 'an agent session' : r.kind === 'eval-call' ? 'a model call' : 'work';
+  return `${what} on ${r.family}${r.model ? ` ${r.model}` : ''} in ${r.pool ? `pool ${r.pool}` : 'any pool'}${r.eligible === 'local' ? ", on this machine's slots only" : ''}`;
+}
+
+/** A piece three different workers could not serve, as the run reports it. */
+export interface StuckPiece {
+  kind: EvalKind;
+  label: string;
+  family: EvalFamily;
+  model: string;
+  eligible: EvalEligible;
+  pool: string | null;
+  /** The system and task it was for (a build's: no task; the judge's: `__judge__`). */
+  system: string | null;
+  task: string | null;
+  workers: string[];
+  lastError: string;
+  at: string;
+}
+
+/** A piece left unanswered because three different workers could not serve it: the answer or build it was for is not recorded. */
+export class PieceStuckError extends Error {
+  /** Never tried again by the shim: the run reports it and leaves it for a resume. */
+  readonly final = true;
+
+  constructor(readonly piece: StuckPiece) {
+    super(`stuck: ${piece.workers.length} workers could not serve ${piece.label} (${piece.workers.join(', ')}): ${piece.lastError.slice(0, 300)}`);
+  }
+}
+
+/** Why a run stopped before its end, cleanly: nothing in flight is recorded, and a resume continues. */
+export abstract class RunStoppedError extends Error {
+  /** The run directory to resume (set by the run). */
+  runDir?: string;
+  /** Never tried again by the shim or the judge. */
+  readonly final = true;
+}
+
+/** `serve` refused what the run sent (a 4xx): asking again would get the same answer, so the run stops with serve's word. */
+export class ServeRefusedError extends RunStoppedError {
+  constructor(readonly route: string, readonly status: number, readonly reason: string) {
+    super(`serve refused ${route} (${status}): ${reason}`);
+  }
+}
+
+/** The run waited `--wait-minutes` for a slot that meets a piece's requirements, and stopped. */
+export class WaitLimitError extends RunStoppedError {
+  constructor(readonly requirement: Requirement, readonly minutes: number) {
+    super(`waited ${minutes} min for a slot that takes ${describeRequirement(requirement)}, and none came online: the run stopped, with nothing recorded for the pieces still waiting — start a worker (or pass --local) and resume with --run-dir`);
+  }
 }
 
 /** Whether a pack's work may leave this machine: none of its sources is private. */
@@ -81,39 +372,107 @@ export function localServe(dataRoot: string, serveUrl?: string): { serveUrl: str
   return { serveUrl: `http://${host}:${config.server.port}`, token };
 }
 
-/** A worker slot's identity as a record keeps it: the machine (`<token>/<worker>`), not its slot (`…/eval-codex#2`). */
-export function machineOf(worker: string): string {
-  return worker.replace(/\/[^/]*#\d+$/, '');
+export { machineOf };
+
+/** What a piece came back as: run by one of the run's own slots (its value or what it threw), or by a worker. */
+export type Published<T> =
+  | { local: true; value: T }
+  | { local: true; error: unknown }
+  | { local: false; outcome: Extract<EvalOutcome, { outcome: 'answered' | 'error' }> };
+
+interface Entry {
+  exec: () => Promise<unknown>;
+  /** One of the run's own slots runs it now: another that leases the piece waits for this, never runs it again. */
+  running?: Promise<void>;
+  done?: { value: unknown } | { error: unknown };
 }
 
+/** Run a piece's work once, whichever of the run's own slots gets to it first. */
+function runOnce(entry: Entry): Promise<void> {
+  entry.running ??= (async () => {
+    try {
+      entry.done = { value: await entry.exec() };
+    } catch (error) {
+      entry.done = { error };
+    }
+  })();
+  return entry.running;
+}
+
+const randomKey = () => crypto.randomBytes(9).toString('base64url');
+const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
+  const t = setTimeout(resolve, ms);
+  signal?.addEventListener('abort', () => {
+    clearTimeout(t);
+    resolve();
+  }, { once: true });
+});
+
+/** The kinds a run's own slot of a CLI takes: agent sessions run on Codex only. */
+const LOCAL_KINDS: Record<EvalFamily, EvalKind[]> = { codex: ['eval-call', 'eval-session'], claude: ['eval-call'] };
+
 export class RemoteEval {
-  private status: ProducerStatus | null = null;
+  private status: QueueStatus | null = null;
   private timer: NodeJS.Timeout | null = null;
   private readonly abort = new AbortController();
   private readonly log: (msg: string) => void;
-  private unreachableSaid = false;
   private cancelling: Promise<void> | null = null;
-  /** Pieces placed, for the run's log. */
-  readonly counts = { offered: 0, remote: 0, here: 0 };
-  /** Whether the run's model calls leave (the run sets it: its own Codex backend with a named model). */
-  callsLeave = false;
+  private closed = false;
+  private readonly entries = new Map<string, Entry>();
+  private readonly local: Record<EvalFamily, number> = { codex: 0, claude: 0 };
+  private readonly loops: Promise<void>[] = [];
+  private wake: (() => void) | null = null;
+  private wakeAt: Promise<void> | null = null;
+  private unreachableSaid = false;
+  private readonly outstanding = new Map<string, { requirement: Requirement; n: number }>();
+  private readonly unmetSince = new Map<string, number>();
+  private waitTimer: NodeJS.Timeout | null = null;
+  private lastWaitLog = 0;
+  /** Set when the run stopped: its wait limit passed, or serve refused it. */
+  stopped: RunStoppedError | null = null;
+  /** Whether the queue answered lately (the run's own broker always does). */
+  private reachable = true;
+  /** Pieces three different workers could not serve, in the order they stuck. */
+  readonly stuck: StuckPiece[] = [];
+  /** Pieces published, and who served them, for the run's log. */
+  readonly counts = { published: 0, workers: 0, local: 0 };
 
-  private constructor(private readonly opts: RemoteEvalOptions) {
+  private constructor(readonly queue: EvalQueue, private readonly opts: RemoteEvalOptions) {
     this.log = opts.log ?? (() => {});
+    this.waitTimer = setInterval(() => this.checkWaiting(), Math.max(50, opts.checkMs ?? 5_000));
+    this.waitTimer.unref?.();
+    const refreshMs = queue.where === 'own' ? Math.min(opts.refreshMs ?? 1_000, 1_000) : opts.refreshMs ?? 15_000;
+    this.timer = setInterval(() => void this.refresh(), Math.max(20, refreshMs));
+    this.timer.unref?.();
   }
 
-  /** Connect to `serve`; null (and a log line) when it is not running or offers no eval work: everything runs here. */
-  static async connect(opts: RemoteEvalOptions): Promise<RemoteEval | null> {
-    const r = new RemoteEval(opts);
+  /** The wait limit, in minutes (0: none). */
+  get waitMinutes(): number {
+    const n = Number(this.opts.waitMinutes ?? 30);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  /** `serve`'s broker on this machine; null (and a log line) when it is not answering; refused when it is another version. */
+  static async connect(opts: RemoteEvalOptions & { serveUrl: string; token: string }): Promise<RemoteEval | null> {
+    const queue = new ServeQueue(opts.serveUrl, opts.token);
+    let status: QueueStatus;
     try {
-      await r.refresh(true);
+      status = await queue.status(opts.run, true);
     } catch (err) {
-      r.log(`remote: ${opts.serveUrl} is not answering (${err instanceof Error ? err.message : err}) — this run does all its work here`);
+      if (err instanceof ServeRefusedError) throw err;
+      opts.log?.(`remote: ${opts.serveUrl} is not answering (${err instanceof Error ? err.message : err})`);
       return null;
     }
-    if (!r.status?.offered) r.log('remote: serve does not offer evaluation work (server.remote.offer.eval is off) — this run does all its work here until it does');
-    r.timer = setInterval(() => void r.refresh().catch(() => {}), Math.max(500, opts.refreshMs ?? 15_000));
-    r.timer.unref?.();
+    const r = new RemoteEval(queue, opts);
+    r.status = status;
+    if (!status.offered) r.log('remote: serve does not offer evaluation work to remote workers (server.remote.offer.eval is off): only this run\'s own slots will take its pieces');
+    return r;
+  }
+
+  /** A broker in the run's own process: only the run's own slots lease from it. */
+  static own(opts: RemoteEvalOptions & { source?: EvalSourceOptions }): RemoteEval {
+    const r = new RemoteEval(new OwnQueue({ retryMs: 1_000, ...opts.source }), opts);
+    void r.refresh();
     return r;
   }
 
@@ -125,118 +484,351 @@ export class RemoteEval {
     return this.abort.signal;
   }
 
-  /** Worker slots of this CLI that asked for this kind lately (0 while eval work is not offered). */
-  online(kind: EvalKind, family: EvalFamily): number {
-    if (!this.status?.offered || this.abort.signal.aborted) return 0;
-    return this.status.online[kind]?.[family] ?? 0;
+  get where(): 'serve' | 'own' {
+    return this.queue.where;
   }
 
-  /** Worker slots a build's or a system's model calls can use beside this machine's: 0 while its calls stay here. */
-  callSlots(): number {
-    return this.callsLeave ? this.online('eval-call', 'codex') : 0;
+  /** The run's own slots, by CLI. */
+  get localSlots(): Record<EvalFamily, number> {
+    return { ...this.local };
   }
 
-  /** Before a piece runs here: this machine's plan (the quota guard), read at most once a minute. */
-  async localGate(): Promise<void> {
-    await this.opts.quota?.waitLocal({ cacheMs: 60_000 });
-  }
-
-  /** Offer one piece and wait for what becomes of it. */
-  async offer(spec: Omit<import('../work/eval.js').EvalCallSpec, 'run'> | Omit<import('../work/eval.js').EvalSessionSpec, 'run'>): Promise<RemoteOutcome> {
-    if (this.abort.signal.aborted) return { outcome: 'cancelled' };
-    this.counts.offered++;
-    try {
-      const res = await fetch(`${this.opts.serveUrl}/eval/v1/offer`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${this.opts.token}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ spec: { ...spec, run: this.opts.run }, ...(this.opts.offerSeconds !== undefined ? { offerSeconds: this.opts.offerSeconds } : {}) }),
-        signal: this.abort.signal,
-      });
-      const text = (await res.text()).trim();
-      const body = text ? JSON.parse(text) as RemoteOutcome & { error?: string } : null;
-      if (!res.ok || !body || !('outcome' in body)) throw new Error(`${res.status}: ${body?.error ?? text.slice(0, 200)}`);
-      if (body.outcome === 'answered' || body.outcome === 'error') {
-        this.counts.remote++;
-        // records name the machine, not the slot on it: `<token>/<worker>`
-        body.worker = machineOf(body.worker);
-      }
-      return body;
-    } catch (err) {
-      if (this.abort.signal.aborted) return { outcome: 'cancelled' };
-      const error = err instanceof Error ? err.message : String(err);
-      if (!this.unreachableSaid) {
-        this.unreachableSaid = true;
-        this.log(`remote: offering to serve failed (${error}) — such pieces run here`);
-      }
-      return { outcome: 'unreachable', error };
-    }
-  }
-
-  /** A folder as an archive `serve` holds: packed, and uploaded unless it is there already. */
-  async archive(dir: string): Promise<{ sha256: string; bytes: number }> {
-    const packed = packFolder(dir);
-    // a folder every question reads (a corpus copy) is uploaded once: the server says whether it holds it
-    const head = await fetch(`${this.opts.serveUrl}/eval/v1/archives/${packed.sha256}`, { method: 'HEAD', headers: { authorization: `Bearer ${this.opts.token}` }, signal: this.abort.signal });
-    if (head.ok) return { sha256: packed.sha256, bytes: packed.bytes };
-    const res = await fetch(`${this.opts.serveUrl}/eval/v1/archives/${packed.sha256}`, {
-      method: 'PUT',
-      headers: { authorization: `Bearer ${this.opts.token}`, 'content-type': 'application/gzip' },
-      body: packed.gzip(),
-      signal: this.abort.signal,
-    });
-    if (!res.ok) throw new Error(`archive upload refused: ${res.status} ${(await res.text()).slice(0, 200)}`);
-    return { sha256: packed.sha256, bytes: packed.bytes };
+  hasLocal(family: EvalFamily): boolean {
+    return this.local[family] > 0;
   }
 
   /**
-   * The run is cancelled: what is offered or out is withdrawn, and session tokens die at once. Every call
+   * Slots online that could take a piece of this kind, CLI and eligibility
+   * from this run: the run's own (always), and the ones `serve` saw ask lately.
+   */
+  width(kind: EvalKind, family: EvalFamily, eligible: EvalEligible): number {
+    if (this.abort.signal.aborted) return 0;
+    // the run's own slots lease from the queue: while serve does not answer they can take nothing either
+    const own = LOCAL_KINDS[family].includes(kind) && this.reachable ? this.local[family] : 0;
+    const slots = this.queue.slotsNow?.() ?? this.status?.slots;
+    const pool = this.pool;
+    const others = (slots?.[kind] ?? []).filter((s) => s.family === family && !s.run && (!pool || s.pool === pool) && (eligible === 'any' || s.local));
+    return own + others.length;
+  }
+
+  /** The pool every piece of the run requires, or null. */
+  get pool(): string | null {
+    return this.opts.pool || null;
+  }
+
+  /** The pool the run's own slots are in. */
+  get localPool(): string {
+    return this.opts.pool || 'local';
+  }
+
+  /** Start the run's own slots: they lease from the queue like a worker's, and run a piece with the run's backends. */
+  startLocal(slots: Partial<Record<EvalFamily, number>>): void {
+    for (const family of EVAL_FAMILIES) {
+      const n = Math.max(0, Math.trunc(slots[family] ?? 0));
+      for (let i = 1; i <= n; i++) {
+        this.local[family]++;
+        this.loops.push(this.slot({ name: `eval-${family}#${this.local[family]}`, family, run: this.run, pool: this.localPool }));
+      }
+    }
+  }
+
+  /**
+   * Publish one piece and wait for what becomes of it. `exec` is how the
+   * run's own slot does it; a worker does it from the spec.
+   */
+  async publish<T>(spec: Omit<EvalCallSpec, 'run' | 'key' | 'pool'> | Omit<EvalSessionSpec, 'run' | 'key' | 'pool'>, exec: () => Promise<T>, tag: PieceTag | null = currentPieceTag()): Promise<Published<T>> {
+    if (this.abort.signal.aborted) throw new RunCancelledError();
+    const key = randomKey();
+    const entry: Entry = { exec };
+    this.entries.set(key, entry);
+    this.counts.published++;
+    const full = { ...spec, run: this.opts.run, key, pool: this.pool } as EvalSpec;
+    const requirement: Requirement = { kind: spec.kind, family: spec.agent.family, model: spec.agent.model, eligible: spec.eligible, pool: this.pool };
+    const release = this.hold(requirement);
+    try {
+      for (let backoff = this.opts.backoffMs ?? 1_000; ;) {
+        this.poke();
+        const o = await this.queue.publish(full, this.abort.signal);
+        if (o.outcome !== 'unreachable') this.reachable = true;
+        if (entry.done) {
+          // one of the run's own slots did it (perhaps before serve went away): its result is the piece's
+          this.counts.local++;
+          return 'error' in entry.done ? { local: true, error: entry.done.error } : { local: true, value: entry.done.value as T };
+        }
+        if (o.outcome === 'answered' || o.outcome === 'error') {
+          this.counts.workers++;
+          // records name the machine, not the slot on it: `<token>/<worker>`
+          return { local: false, outcome: { ...o, worker: machineOf(o.worker) } };
+        }
+        if (o.outcome === 'cancelled' || o.outcome === 'stopped' || this.abort.signal.aborted) throw this.stopped ?? new RunCancelledError();
+        if (o.outcome === 'refused') throw this.stop(new ServeRefusedError('the piece', o.status, o.error));
+        if (o.outcome === 'unreachable') {
+          // one of the run's own slots is doing it: its result is the piece's, and it is not published again for a worker to run too
+          if (entry.running) {
+            await entry.running;
+            const done = entry.done as unknown as { value: unknown } | { error: unknown };
+            this.counts.local++;
+            return 'error' in done ? { local: true, error: done.error } : { local: true, value: done.value as T };
+          }
+          // serve went away: the piece waits for it as it would for a slot, and is published again
+          this.unreachable(o.error);
+          await sleep(backoff, this.abort.signal);
+          backoff = Math.min(15_000, backoff * 2);
+          continue;
+        }
+        this.unreachableSaid = false;
+        // three different workers could not serve it: reported, left unanswered, and the run goes on with the rest
+        const piece: StuckPiece = {
+          kind: spec.kind, label: spec.label, family: spec.agent.family, model: spec.agent.model, eligible: spec.eligible, pool: this.pool,
+          system: tag?.system ?? null, task: tag?.task ?? null, workers: o.workers, lastError: o.lastError, at: new Date().toISOString(),
+        };
+        this.stuck.push(piece);
+        const error = new PieceStuckError(piece);
+        this.log(error.message);
+        this.opts.onStuck?.(piece);
+        throw error;
+      }
+    } finally {
+      this.entries.delete(key);
+      release();
+    }
+  }
+
+  /** Pieces stuck since `since` (an index into `stuck`) for this system (and task, when given). */
+  stuckFor(since: number, system: string, task?: string): StuckPiece[] {
+    return this.stuck.slice(since).filter((p) => p.system === system && (task === undefined || p.task === task));
+  }
+
+  /** The run's own slots finish what they are doing (at most `ms`). */
+  async drained(ms = 10_000): Promise<void> {
+    await Promise.race([Promise.allSettled(this.loops), sleep(ms)]);
+  }
+
+  /**
+   * A folder a worker's session reads, as an archive `serve` holds; null on
+   * the run's own broker. While serve does not answer the upload waits, as a
+   * piece does (and counts as one for the wait limit); a refusal stops the run.
+   */
+  async archive(dir: string, agent: { family: EvalFamily; model: string } = { family: 'codex', model: '' }): Promise<{ sha256: string; bytes: number } | null> {
+    const release = this.hold({ kind: 'eval-session', family: agent.family, model: agent.model, eligible: 'any', pool: this.pool });
+    try {
+      for (let backoff = this.opts.backoffMs ?? 1_000; ;) {
+        if (this.abort.signal.aborted) throw this.stopped ?? new RunCancelledError();
+        try {
+          const a = await this.queue.archive(dir, this.abort.signal);
+          this.reachable = true;
+          return a;
+        } catch (err) {
+          if (this.abort.signal.aborted) throw this.stopped ?? new RunCancelledError();
+          if (err instanceof ServeRefusedError) throw this.stop(err);
+          this.unreachable(err instanceof Error ? err.message : String(err));
+          await sleep(backoff, this.abort.signal);
+          backoff = Math.min(15_000, backoff * 2);
+        }
+      }
+    } finally {
+      release();
+    }
+  }
+
+  /** Stop the run cleanly (once): pieces are withdrawn, nothing in flight is recorded. Returns the error to throw. */
+  stop(why: RunStoppedError): RunStoppedError {
+    if (this.stopped) return this.stopped;
+    this.stopped = why;
+    this.log(why.message);
+    this.opts.onStop?.(why);
+    void this.cancel();
+    return why;
+  }
+
+  private unreachable(error: string): void {
+    if (this.queue.where !== 'serve') return;
+    this.reachable = false;
+    if (!this.unreachableSaid) this.log(`remote: serve is not answering (${error}): pieces wait and are published again when it answers`);
+    this.unreachableSaid = true;
+  }
+
+  /** Count a requirement as waiting, for the wait limit, until the returned function is called. */
+  private hold(requirement: Requirement): () => void {
+    const rk = requirementKey(requirement);
+    const held = this.outstanding.get(rk) ?? { requirement, n: 0 };
+    held.n++;
+    this.outstanding.set(rk, held);
+    return () => {
+      if (--held.n <= 0) {
+        this.outstanding.delete(rk);
+        this.unmetSince.delete(rk);
+      }
+    };
+  }
+
+  /**
+   * The run is cancelled: what is published or out is withdrawn, and session tokens die at once. Every call
    * waits for the one withdrawal, so a run that ends on its cancellation ends after the tokens are revoked.
    */
   cancel(): Promise<void> {
     this.cancelling ??= (async () => {
       this.abort.abort();
-      await fetch(`${this.opts.serveUrl}/eval/v1/runs/${encodeURIComponent(this.opts.run)}/cancel`, {
-        method: 'POST', headers: { authorization: `Bearer ${this.opts.token}` }, signal: AbortSignal.timeout(5_000),
-      }).catch(() => {});
+      await this.queue.cancelRun(this.opts.run).catch(() => {});
       this.close();
     })();
     return this.cancelling;
   }
 
   close(): void {
+    this.closed = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.waitTimer) clearInterval(this.waitTimer);
+    this.waitTimer = null;
+    this.poke();
+    this.queue.close();
   }
 
-  private async refresh(first = false): Promise<void> {
-    const res = await fetch(`${this.opts.serveUrl}/eval/v1/status`, { headers: { authorization: `Bearer ${this.opts.token}` }, signal: AbortSignal.timeout(first ? 5_000 : 10_000) });
-    if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
-    this.status = await res.json() as ProducerStatus;
+  /* ------------------------------ internals ------------------------------ */
+
+  private async refresh(): Promise<void> {
+    try {
+      this.status = await this.queue.status(this.opts.run);
+      this.reachable = true;
+      this.unreachableSaid = false;
+    } catch (err) {
+      // serve refusing the run is no outage: the run stops with its word
+      if (err instanceof ServeRefusedError) {
+        this.stop(err);
+        return;
+      }
+      // serve is not answering: nothing is online, the run's own slots included (they lease from it)
+      if (this.status) this.status = { ...this.status, slots: { 'eval-call': [], 'eval-session': [] } };
+      this.unreachable(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Waiting (docs/design/32 §3): a piece whose requirements no slot online
+   * meets is logged once a minute with what it waits for; past the wait limit
+   * the run stops cleanly. A piece some slot online could take waits for it
+   * however long, as any work behind a busy slot does.
+   */
+  private checkWaiting(): void {
+    if (this.abort.signal.aborted || !this.outstanding.size) return;
+    const now = Date.now();
+    const unmet: { requirement: Requirement; n: number; since: number }[] = [];
+    for (const [rk, { requirement, n }] of this.outstanding) {
+      if (this.width(requirement.kind, requirement.family, requirement.eligible) > 0) {
+        this.unmetSince.delete(rk);
+        continue;
+      }
+      const since = this.unmetSince.get(rk) ?? now;
+      this.unmetSince.set(rk, since);
+      unmet.push({ requirement, n, since });
+    }
+    if (unmet.length && now - this.lastWaitLog >= (this.opts.logEveryMs ?? 60_000)) {
+      this.lastWaitLog = now;
+      const limit = this.waitMinutes ? `; the run stops after ${this.waitMinutes} min` : '';
+      for (const u of unmet) this.log(`waiting: ${u.n} piece(s) for ${describeRequirement(u.requirement)} — no slot online takes them (for ${Math.round((now - u.since) / 60_000)} min${limit})`);
+    }
+    const limitMs = this.waitMinutes * 60_000;
+    const over = limitMs ? unmet.find((u) => now - u.since >= limitMs) : undefined;
+    if (!over) return;
+    this.stop(new WaitLimitError(over.requirement, this.waitMinutes));
+  }
+
+  /** Wake the run's own slots: a piece was published. */
+  private poke(): void {
+    this.wake?.();
+    this.wake = null;
+    this.wakeAt = null;
+  }
+
+  private idle(ms: number): Promise<void> {
+    this.wakeAt ??= new Promise<void>((resolve) => (this.wake = resolve));
+    return Promise.race([this.wakeAt, sleep(ms)]);
+  }
+
+  /** One of the run's own slots: lease, find the piece's work by its key, do it, hand back. */
+  private async slot(who: LocalSlotIdentity): Promise<void> {
+    const kinds = LOCAL_KINDS[who.family];
+    while (!this.closed) {
+      // this machine's plan, before the slot takes anything: a Codex slot never holds a lease while it waits for it
+      if (who.family === 'codex') await this.opts.quota?.waitLocal({ cacheMs: 60_000 });
+      if (this.closed || this.abort.signal.aborted) break;
+      let task: WorkTask | undefined;
+      try {
+        task = (await this.queue.lease(who, kinds))[0];
+      } catch (err) {
+        if (err instanceof ServeRefusedError) {
+          this.stop(err);
+          break;
+        }
+        await this.idle(2_000);
+        continue;
+      }
+      if (!task) {
+        await this.idle(this.queue.where === 'own' ? 1_000 : 500);
+        continue;
+      }
+      const key = 'key' in task ? task.key : '';
+      const entry = this.entries.get(key);
+      if (!entry) {
+        // not one of this run's pieces any more (it settled meanwhile)
+        await this.queue.release(who, [task.id]).catch(() => {});
+        continue;
+      }
+      const renew = setInterval(() => void this.queue.renew(who, [task!.id]).catch(() => {}), Math.max(200, this.opts.renewMs ?? 20_000));
+      renew.unref?.();
+      try {
+        // a piece whose lease lapsed while it ran (or that serve has again after a restart) is not run a second time
+        await runOnce(entry);
+        if (this.abort.signal.aborted) continue;
+        const done = entry.done!;
+        const outcome: LocalOutcome = 'error' in done && task.kind === 'eval-call'
+          ? { ok: false, error: done.error instanceof Error ? done.error.message : String(done.error) }
+          : { ok: true };
+        await this.queue.complete(who, task.id, outcome).catch(() => {});
+      } finally {
+        clearInterval(renew);
+      }
+    }
+  }
+}
+
+/** A pack's placement, carried along its async calls (src/eval/placement.ts): the queue, and whether its work may leave. */
+export class PackScope {
+  constructor(readonly remote: RemoteEval, readonly leaves: boolean, readonly calls: EvalEligible) {}
+
+  /** Slots online for a build's or a system's model calls: what a knode build's passes may fill. */
+  callSlots(): number {
+    return this.remote.width('eval-call', 'codex', this.calls);
+  }
+
+  sessionSlots(eligible: EvalEligible): number {
+    return this.remote.width('eval-session', 'codex', eligible);
   }
 }
 
 /** Every call of this piece of work stopped because the run was cancelled. */
 export class RunCancelledError extends Error {
+  readonly final = true;
+
   constructor() {
     super('the run was cancelled');
   }
 }
 
 /**
- * The shim's backend with remote workers beside it: a model call goes to a
- * worker while one that runs the run's CLI asked lately, and runs here — under
- * the run's `--slots` — when none takes it in time. Only a run on Codex with a
- * named model offers its calls: the worker runs exactly that model, so the
- * records stay on one backend (`codex-cli:<model>`) wherever a call ran.
+ * The shim's backend as published work: every model call is a piece, done by
+ * a slot that leases it — the run's own (with `local`, the run's backend) or,
+ * when the run names its model on its own Codex, a worker running exactly that
+ * model, so the records stay on one backend (`codex-cli:<model>`).
  */
-export class PlacedChatBackend implements ChatBackend {
+export class PublishedChatBackend implements ChatBackend {
   readonly selfLimiting = true;
 
   constructor(
     private readonly local: ChatBackend,
-    private readonly slots: Slots,
     private readonly remote: RemoteEval,
-    private readonly agent: { model: string; speed?: string | null },
+    private readonly agent: { model: string; speed?: string | null; eligible: EvalEligible },
   ) {}
 
   get label(): string {
@@ -244,61 +836,65 @@ export class PlacedChatBackend implements ChatBackend {
   }
 
   async complete(req: ChatRequest): Promise<ChatResult> {
-    // a cancelled run starts nothing more, here or anywhere
-    if (this.remote.signal.aborted) throw new RunCancelledError();
-    if (this.remote.online('eval-call', 'codex') > 0) {
-      const tag = req.tag;
-      const o = await this.remote.offer({
-        kind: 'eval-call',
-        label: tag ? [tag.system, tag.stage, tag.task].filter(Boolean).join(' · ') : 'call',
-        agent: { family: 'codex', model: this.agent.model, effort: effortFor('codex-cli', req.effort) ?? null, speed: this.agent.speed ?? null },
-        prompt: renderCliPrompt(req.messages, req.json),
-        schema: req.schema ?? null,
-        timeoutMs: 900_000,
-      });
-      if (o.outcome === 'answered') return { text: o.text.trim(), usage: o.usage, model: o.model, worker: o.worker, backend: o.backend };
-      if (o.outcome === 'error') throw Object.assign(new Error(`codex exec failed on ${o.worker}: ${o.error}`), { usage: o.usage });
-      if (o.outcome === 'cancelled' || o.outcome === 'stopped') throw new RunCancelledError();
+    const tag = req.tag;
+    const leaves = this.agent.eligible === 'any';
+    const p = await this.remote.publish({
+      kind: 'eval-call',
+      eligible: this.agent.eligible,
+      label: tag ? [tag.system, tag.stage, tag.task].filter(Boolean).join(' · ') : 'call',
+      agent: { family: 'codex', model: this.agent.model, effort: effortFor('codex-cli', req.effort) ?? null, speed: this.agent.speed ?? null },
+      // a piece only the run's own slots take carries nothing a worker would run
+      prompt: leaves ? renderCliPrompt(req.messages, req.json) : '',
+      schema: leaves ? req.schema ?? null : null,
+      timeoutMs: 900_000,
+    }, () => this.local.complete(req), tag ? { system: tag.system, ...(tag.task ? { task: tag.task } : {}) } : null);
+    if (p.local) {
+      if ('error' in p) throw p.error;
+      return p.value;
     }
-    this.remote.counts.here++;
-    await this.remote.localGate();
-    return this.slots.run(() => this.local.complete(req));
+    const o = p.outcome;
+    if (o.outcome === 'answered') return { text: o.text.trim(), usage: o.usage, model: o.model, worker: o.worker, backend: o.backend, ...(o.pool ? { pool: o.pool } : {}) };
+    throw Object.assign(new Error(`codex exec failed on ${o.worker}: ${o.error}`), { usage: o.usage });
   }
 }
 
 /**
- * The judge's client with remote workers beside it: its calls go to a worker
- * that runs the judge's CLI and model, and here otherwise. Who answered is
- * noted for the judge's meter (src/eval/placement.ts).
+ * The judge's client as published work: its calls go to a slot of the judge's
+ * CLI. Who answered is noted for the judge's meter (src/eval/placement.ts).
  */
-export function remoteJudgeClient(client: LlmClient, remote: RemoteEval, agent: { family: EvalFamily; model: string; effort: string | null }): LlmClient {
-  const local = client.complete.bind(client);
-  const backend = `${agent.family}-cli:${agent.model}`;
-  return Object.assign(Object.create(client) as LlmClient, {
-    complete: async (messages: ChatMessage[], opts: Parameters<LlmClient['complete']>[1] = {}) => {
-      if (remote.signal.aborted) throw new RunCancelledError();
-      if (remote.online('eval-call', agent.family) > 0) {
-        const o = await remote.offer({
-          kind: 'eval-call', label: 'judge', agent: { family: agent.family, model: agent.model, effort: agent.effort, speed: null },
-          prompt: renderCliPrompt(messages, Boolean(opts.json)), schema: null, timeoutMs: 600_000,
-        });
-        if (o.outcome === 'answered') {
-          if (o.usage) opts.onUsage?.(o.usage);
-          notePlacement({ worker: o.worker, backend: o.backend });
-          return o.text.trim();
-        }
-        if (o.outcome === 'error') {
-          if (o.usage) opts.onUsage?.(o.usage);
-          notePlacement({ worker: o.worker, backend: o.backend });
-          throw new Error(`${agent.family} CLI error on ${o.worker}: ${o.error}`);
-        }
-        if (o.outcome === 'cancelled' || o.outcome === 'stopped') throw new RunCancelledError();
-      }
-      remote.counts.here++;
-      notePlacement({ backend });
-      return local(messages, opts);
-    },
-  });
+export function remoteJudgeClient(client: LlmClient, remote: RemoteEval, judge: { family: EvalFamily; model: string; effort: string | null; eligible: EvalEligible; backend: string | null }): LlmClient {
+  const publish = async <T>(messages: ChatMessage[], opts: { json?: boolean; onUsage?: (u: CallUsage) => void }, here: () => Promise<T>, fromText: (text: string) => T): Promise<T> => {
+    const leaves = judge.eligible === 'any';
+    const p = await remote.publish({
+      kind: 'eval-call', eligible: judge.eligible, label: 'judge', agent: { family: judge.family, model: judge.model, effort: judge.effort, speed: null },
+      prompt: leaves ? renderCliPrompt(messages, Boolean(opts.json)) : '', schema: null, timeoutMs: 600_000,
+    }, here, { system: '__judge__' });
+    if (p.local) {
+      if (judge.backend) notePlacement({ backend: judge.backend });
+      if ('error' in p) throw p.error;
+      return p.value;
+    }
+    const o = p.outcome;
+    if (o.usage) opts.onUsage?.(o.usage);
+    notePlacement({ worker: o.worker, backend: o.backend, ...(o.pool ? { pool: o.pool } : {}) });
+    if (o.outcome === 'answered') return fromText(o.text);
+    throw new Error(`${judge.family} CLI error on ${o.worker}: ${o.error}`);
+  };
+  const wrapped = Object.create(client) as LlmClient;
+  // a real client's completeJson goes through complete; a stand-in that has only completeJson is published as it is
+  if (typeof client.complete === 'function') {
+    wrapped.complete = (messages, opts = {}) => publish(messages, opts, () => client.complete(messages, opts), (t) => t.trim());
+  }
+  if (typeof client.completeJson === 'function' && client.completeJson !== LlmClient.prototype.completeJson) {
+    wrapped.completeJson = (<T>(messages: ChatMessage[], opts: Parameters<LlmClient['completeJson']>[1] = {}) =>
+      publish<T>(messages, { ...opts, json: true }, () => client.completeJson<T>(messages, opts), (t) => jsonFromReply<T>(t))) as LlmClient['completeJson'];
+  }
+  return wrapped;
+}
+
+/** The CLI family a judge provider runs on, for its pieces' requirements: a chain or a stand-in is the run's own (Claude's slots). */
+export function judgeFamily(provider: string): EvalFamily {
+  return provider === 'codex-cli' ? 'codex' : 'claude';
 }
 
 /** The judge's family and model as a remote worker would run them, or null when its calls stay here. */
@@ -311,34 +907,45 @@ export function judgeAgent(provider: string, model: string, effort?: string): { 
 /* ------------------------------ agent sessions ----------------------------- */
 
 /**
- * One `runAgent` session on a remote worker, or null when it runs here: a
- * session that writes (the llm-wiki build) stays, as does one whose model the
- * run does not name, one with no worker online for Codex sessions, and one
- * nobody takes in time or that three workers failed.
+ * One `runAgent` session as a published piece. It may go to a worker only
+ * when its pack may leave, the run names its model, it reads (a session that
+ * writes, the llm-wiki build, stays), its knode tools are the build's tool
+ * host (a URL with its tools named) and it is not routed over an agent chain
+ * (`leaves` false: those links are this machine's keys and logins); otherwise
+ * it is published for this machine's slots only. `here` is how the run's own
+ * slot runs it.
  */
-export async function remoteAgent(remote: RemoteEval, opts: AgentRunOptions): Promise<AgentRunResult | null> {
-  if (remote.signal.aborted) throw new RunCancelledError();
-  if (opts.sandbox !== 'read-only' || !opts.model || remote.online('eval-session', 'codex') === 0) return null;
-  // knode's tools leave only as a running tool host (a URL the run serves) with its tools named: `serve` proxies the session's calls to it
-  if (opts.mcp && (!('url' in opts.mcp) || !opts.mcp.enabledTools?.length)) return null;
+export async function publishAgent(scope: PackScope, opts: AgentRunOptions, here: () => Promise<AgentRunResult>, leaves: boolean): Promise<AgentRunResult> {
+  const remote = scope.remote;
+  const toolsLeave = !opts.mcp || ('url' in opts.mcp && Boolean(opts.mcp.enabledTools?.length));
+  const eligible: EvalEligible = leaves && scope.leaves && opts.sandbox === 'read-only' && Boolean(opts.model) && toolsLeave ? 'any' : 'local';
   const t0 = Date.now();
-  const hasFiles = fs.existsSync(opts.cwd) && fs.readdirSync(opts.cwd).length > 0;
-  const archive = hasFiles ? await remote.archive(opts.cwd) : null;
-  const mcp = opts.mcp && 'url' in opts.mcp ? { url: opts.mcp.url, secret: opts.mcp.token, tools: [...(opts.mcp.enabledTools ?? [])] } : null;
-  const o: RemoteOutcome = await remote.offer({
+  let archive: { sha256: string; bytes: number } | null = null;
+  let mcp: EvalSessionSpec['mcp'] = null;
+  if (eligible === 'any') {
+    const hasFiles = fs.existsSync(opts.cwd) && fs.readdirSync(opts.cwd).length > 0;
+    archive = hasFiles ? await remote.archive(opts.cwd, { family: 'codex', model: opts.model ?? '' }) : null;
+    mcp = opts.mcp && 'url' in opts.mcp ? { url: opts.mcp.url, secret: opts.mcp.token, tools: [...(opts.mcp.enabledTools ?? [])] } : null;
+  }
+  const p = await remote.publish({
     kind: 'eval-session',
+    eligible,
     label: `agent${opts.label ? ` · ${opts.label}` : ''}`,
-    agent: { family: 'codex', model: opts.model, effort: effortFor('codex-cli', opts.effort) ?? null, speed: null },
-    sandbox: 'read-only',
+    agent: { family: 'codex', model: opts.model ?? '', effort: effortFor('codex-cli', opts.effort) ?? null, speed: null },
+    sandbox: opts.sandbox,
     maxSteps: opts.maxSteps ?? 25,
     timeoutMs: opts.timeoutMs ?? 15 * 60_000,
-    prompt: opts.prompt,
+    prompt: eligible === 'any' ? opts.prompt : '',
     archive,
     mcp,
-  });
-  if (o.outcome === 'cancelled' || o.outcome === 'stopped') throw new RunCancelledError();
-  if (o.outcome !== 'answered' || !o.session) return null;
-  return agentResultOf(o.session, opts, { worker: o.worker, backend: o.backend, usage: o.usage, ms: Date.now() - t0 });
+  }, here);
+  if (p.local) {
+    if ('error' in p) throw p.error;
+    return p.value;
+  }
+  const o = p.outcome;
+  if (o.outcome !== 'answered' || !o.session) throw new Error(`the session failed on ${o.worker}: ${o.outcome === 'error' ? o.error : 'no session came back'}`);
+  return { ...agentResultOf(o.session, opts, { worker: o.worker, backend: o.backend, usage: o.usage, ms: Date.now() - t0 }), ...(o.pool ? { pool: o.pool } : {}) };
 }
 
 /** A worker's session parsed as `runAgentOnce` parses its own: the trace, the step cap, the leak audit (with the worker's folder and home). */
@@ -349,7 +956,10 @@ export function agentResultOf(s: EvalSessionAnswer, opts: AgentRunOptions, at: {
   for (const line of s.stdout.split('\n')) trace.line(line);
   const capped = trace.capped || s.capped;
   const text = (s.lastMessage ?? '').trim();
-  const error = s.exitCode !== 0 && !capped ? `codex exec exited with ${s.exitCode} on ${at.worker}: ${readCodexEvents(s.stdout).error ?? s.stderr.slice(-300)}` : undefined;
+  // a worker's session that ended on a signal (no exit code: -1; or 128 + the signal) with nothing to show: cancelled, asked again on resume
+  const killed = !capped && !text && (s.exitCode === -1 || s.exitCode === 130 || s.exitCode === 137 || s.exitCode === 143);
+  const error = killed ? `cancelled: the session on ${at.worker} was killed (exit ${s.exitCode})`
+    : s.exitCode !== 0 && !capped ? `codex exec exited with ${s.exitCode} on ${at.worker}: ${readCodexEvents(s.stdout).error ?? s.stderr.slice(-300)}` : undefined;
   return {
     text,
     usage: at.usage ?? readCodexEvents(s.stdout).usage,
@@ -362,6 +972,7 @@ export function agentResultOf(s: EvalSessionAnswer, opts: AgentRunOptions, at: {
     worker: at.worker,
     backend: at.backend,
     ...(error && !text ? { error } : {}),
+    ...(killed ? { cancelled: true } : {}),
   };
 }
 

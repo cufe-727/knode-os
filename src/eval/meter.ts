@@ -34,6 +34,8 @@ export interface MeterEvent extends MeterTag {
   worker?: string;
   /** The CLI and model the call ran on, `codex-cli:<model>`, wherever it ran. */
   backend?: string;
+  /** The pool of the worker that answered (docs/design/32 §2); absent = this machine. */
+  pool?: string;
 }
 
 /** Parse a shim tag carried as the bearer token: `sys=<system>;stage=<stage>;task=<task>`. */

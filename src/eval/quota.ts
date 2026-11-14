@@ -122,6 +122,8 @@ export class QuotaGuard {
         return await fn();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        // a piece the run left stuck, or a run that stopped, is final whatever its message quotes (docs/design/32 §3)
+        if ((err as { final?: boolean } | null)?.final) throw err;
         if (!isRefusal(msg) || i + 1 >= tries) throw err;
         this.log('judge refused, pausing', { error: msg.slice(0, 200) });
         const t0 = Date.now();

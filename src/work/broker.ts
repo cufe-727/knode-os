@@ -3,7 +3,7 @@ import { ChatMessage } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { FailureKind } from '../labeling/failures.js';
 import { CompleteResult, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
-import { isEvalKind, isSharedKind, LlmKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
+import { classOf, isEvalKind, isSharedKind, LlmKind, SHARED_KINDS, SharedKind, WorkClass, WORK_KINDS, WorkKind } from './kinds.js';
 
 /**
  * The work broker — every kind of leased work behind one lease protocol
@@ -42,6 +42,14 @@ interface TaskBase {
   /** What the task is about, for a worker's log: a document's path, with the part for a segment. */
   label: string;
   leaseExpiresAt: string;
+  /** `kb` or `eval` (docs/design/32 §2); the broker sets it on every task it hands out. */
+  class?: WorkClass;
+  /** The CLI, model, effort and speed the task must run on; null for a kind that runs on a slot's own route. */
+  requires?: EvalAgent | null;
+  /** Only a slot of this pool may take it; absent or null: any slot that meets `requires`. */
+  pool?: string | null;
+  /** `local`: only a slot on this machine may take it. */
+  eligible?: 'any' | 'local';
 }
 
 /** A model call: extraction, a summary, a judge call, a translation. */
@@ -106,6 +114,8 @@ export interface EvalAgent {
 export interface EvalCallWorkTask extends TaskBase {
   kind: 'eval-call';
   run: string;
+  /** The run's own key for the piece (docs/design/32 §2): opaque to a worker. */
+  key: string;
   agent: EvalAgent;
   prompt: string;
   /** A strict JSON schema for the reply (Codex `--output-schema`), or null. */
@@ -123,8 +133,9 @@ export interface EvalCallWorkTask extends TaskBase {
 export interface EvalSessionWorkTask extends TaskBase {
   kind: 'eval-session';
   run: string;
+  key: string;
   agent: EvalAgent;
-  sandbox: 'read-only';
+  sandbox: 'read-only' | 'workspace-write';
   maxSteps: number;
   timeoutMs: number;
   prompt: string;
@@ -140,6 +151,8 @@ export interface LeaseRequest {
   calibration?: string;
   /** The slot embeds on lent keys, and its token may hold them (§4.2). */
   lentKeys?: boolean;
+  /** Every kind the slot asked for in this request (the broker fills it in): a slot online for one evaluation kind is for each it takes. */
+  kinds?: readonly WorkKind[];
 }
 
 /** What every source reports about its leases; the rest of its status is its own. */
@@ -157,15 +170,24 @@ export interface WorkSource {
   release(taskIds: string[], who: WorkerIdentity): Promise<number>;
   /** Whether a task id is one of this source's leases, live or lately expired. */
   holds(taskId: string): boolean;
+  /** A slot asked for this kind, among `kinds`, whichever source the broker serves it from. */
+  noteAsked?(who: WorkerIdentity, kinds: readonly WorkKind[]): void;
   status(): Promise<SourceStatus>;
   stop(): Promise<void>;
 }
 
-export const DEFAULT_SHARES: Record<SharedKind, number> = { extract: 3, summarize: 1, translate: 1 };
+/**
+ * The weights a slot that takes several kinds shares them by: the shared
+ * knowledge-base kinds, and evaluation work as one class (docs/design/32 §4).
+ * `eval` 0: evaluation gets a turn only when no knowledge-base work waits.
+ */
+export type Shares = Record<SharedKind | 'eval', number>;
+
+export const DEFAULT_SHARES: Shares = { extract: 3, summarize: 1, translate: 1, eval: 1 };
 
 export interface BrokerOptions {
   /** Read on every lease: a settings save may change them. */
-  shares?: () => Partial<Record<SharedKind, number>> | undefined;
+  shares?: () => Partial<Shares> | undefined;
   /** Where answered calls are measured (src/estimate/ledger.ts). */
   ledger?: CallLedger | null;
 }
@@ -177,6 +199,9 @@ interface Issued {
   promptTokens: number;
 }
 
+/** What the broker weighs: a shared knowledge-base kind, or evaluation work as one class. */
+type Entry = SharedKind | 'eval';
+
 /** A lease nobody answered or released is forgotten after this long (a lapsed one is re-issued under a new id). */
 const ISSUED_TTL_MS = 6 * 3_600_000;
 
@@ -184,6 +209,8 @@ export interface WorkerStatus {
   worker: string;
   backend: string;
   remote: boolean;
+  /** The pool its worker declared (docs/design/32 §2), null for `serve`'s own slots. */
+  pool: string | null;
   /** The kinds it asked for last. */
   kinds: WorkKind[];
   lastSeen: string;
@@ -194,7 +221,7 @@ export interface WorkerStatus {
 }
 
 export interface WorkStatus {
-  shares: Record<SharedKind, number>;
+  shares: Shares;
   kinds: Partial<Record<WorkKind, SourceStatus>>;
   workers: WorkerStatus[];
 }
@@ -202,6 +229,7 @@ export interface WorkStatus {
 interface WorkerRecord {
   backend: string;
   remote: boolean;
+  pool: string | null;
   kinds: WorkKind[];
   lastSeen: number;
   ok: number;
@@ -210,8 +238,8 @@ interface WorkerRecord {
 
 export class WorkBroker {
   private readonly sources = new Map<WorkKind, WorkSource>();
-  /** Tasks handed out per kind, each divided by its kind's weight: the lowest goes next. */
-  private readonly pass = new Map<WorkKind, number>();
+  /** Tasks handed out per kind (evaluation as one), each divided by its weight: the lowest goes next. */
+  private readonly pass = new Map<Entry, number>();
   private readonly workers = new Map<string, WorkerRecord>();
   private readonly issued = new Map<string, Issued>();
 
@@ -233,14 +261,17 @@ export class WorkBroker {
     return (this.sources.get(kind) ?? [...this.sources.values()][0])?.leaseDurationMs ?? 15 * 60_000;
   }
 
-  /** The weight of each shared kind, from the config, a missing or unusable one at its default. */
-  shares(): Record<SharedKind, number> {
+  /** The weight of each shared kind and of evaluation, from the config, a missing or unusable one at its default. */
+  shares(): Shares {
     const configured = this.opts.shares?.() ?? {};
     const out = { ...DEFAULT_SHARES };
     for (const kind of SHARED_KINDS) {
       const w = Number(configured[kind]);
       if (Number.isFinite(w) && w > 0) out[kind] = w;
     }
+    // evaluation may be 0: only when no knowledge-base work waits for the slot
+    const e = configured.eval === undefined ? NaN : Number(configured.eval);
+    if (Number.isFinite(e) && e >= 0) out.eval = e;
     return out;
   }
 
@@ -251,33 +282,57 @@ export class WorkBroker {
     return false;
   }
 
-  /** Up to `max` tasks of one of `kinds` for `who` — judge calls first, then a shared kind by share; empty when none has work. */
+  /**
+   * Up to `max` tasks of one of `kinds` for `who` — judge calls first (and
+   * the kinds only their own slots ask for), then the shared kinds and
+   * evaluation work by weight (docs/design/32 §4); empty when none has work.
+   */
   async lease(who: WorkerIdentity, kinds: readonly WorkKind[], max = 1, request?: LeaseRequest): Promise<WorkTask[]> {
     const wanted = WORK_KINDS.filter((k) => kinds.includes(k) && this.sources.has(k));
     this.seen(who, wanted);
     if (wanted.length === 0) return [];
-    for (const kind of wanted.filter((k) => !isSharedKind(k))) {
+    // a slot that asks for a kind is online for it, even when another kind it takes is what it gets
+    for (const k of wanted) this.sources.get(k)!.noteAsked?.(who, wanted);
+    request = { ...request, kinds: wanted };
+    for (const kind of wanted.filter((k) => !isSharedKind(k) && !isEvalKind(k))) {
       const tasks = await this.sources.get(kind)!.lease(who, max, request);
       if (tasks.length) return this.issue(tasks);
     }
     const shares = this.shares();
-    // passes are sums of 1/weight, so a tie may differ in the last bits: within a hair, WORK_KINDS order decides
-    const order = wanted.filter(isSharedKind).sort((a, b) => {
+    const evalKinds = wanted.filter(isEvalKind);
+    // evaluation is one entry among the shared kinds, its kinds tried in WORK_KINDS order
+    const entries: Entry[] = [...wanted.filter(isSharedKind), ...(evalKinds.length && shares.eval > 0 ? ['eval' as const] : [])];
+    const rank = (e: Entry) => (e === 'eval' ? WORK_KINDS.length : WORK_KINDS.indexOf(e));
+    // passes are sums of 1/weight, so a tie may differ in the last bits: within a hair, WORK_KINDS order decides (evaluation last)
+    const order = entries.sort((a, b) => {
       const d = (this.pass.get(a) ?? 0) - (this.pass.get(b) ?? 0);
-      return Math.abs(d) > 1e-9 ? d : WORK_KINDS.indexOf(a) - WORK_KINDS.indexOf(b);
+      return Math.abs(d) > 1e-9 ? d : rank(a) - rank(b);
     });
-    const idle: SharedKind[] = [];
-    for (const kind of order) {
-      const tasks = await this.sources.get(kind)!.lease(who, max, request);
+    const take = async (entry: Entry): Promise<WorkTask[]> => {
+      if (entry !== 'eval') return this.sources.get(entry)!.lease(who, max, request);
+      for (const kind of evalKinds) {
+        const tasks = await this.sources.get(kind)!.lease(who, max, request);
+        if (tasks.length) return tasks;
+      }
+      return [];
+    };
+    const idle: Entry[] = [];
+    for (const entry of order) {
+      const tasks = await take(entry);
       if (tasks.length === 0) {
-        idle.push(kind);
+        idle.push(entry);
         continue;
       }
-      const at = this.pass.get(kind) ?? 0;
+      const at = this.pass.get(entry) ?? 0;
       // a kind that had nothing to give starts level with the one served, never behind it
       for (const k of idle) this.pass.set(k, Math.max(this.pass.get(k) ?? 0, at));
-      this.pass.set(kind, at + tasks.length / shares[kind]);
+      this.pass.set(entry, at + tasks.length / shares[entry]);
       return this.issue(tasks);
+    }
+    // `shares.eval` 0: evaluation only when no knowledge-base work waited for this slot
+    if (evalKinds.length && shares.eval <= 0) {
+      const tasks = await take('eval');
+      if (tasks.length) return this.issue(tasks);
     }
     return [];
   }
@@ -330,7 +385,7 @@ export class WorkBroker {
       shares: this.shares(),
       kinds,
       workers: [...this.workers.entries()].map(([worker, w]) => ({
-        worker, backend: w.backend, remote: w.remote, kinds: [...w.kinds], lastSeen: new Date(w.lastSeen).toISOString(),
+        worker, backend: w.backend, remote: w.remote, pool: w.pool, kinds: [...w.kinds], lastSeen: new Date(w.lastSeen).toISOString(),
         leased: leased.get(worker) ?? 0, ok: w.ok, failed: w.failed,
       })),
     };
@@ -343,8 +398,9 @@ export class WorkBroker {
 
   /* ------------------------------ internals ------------------------------ */
 
-  /** Note when each task went out, and how big its prompt was, for the ledger. */
-  private issue(tasks: WorkTask[]): WorkTask[] {
+  /** Note when each task went out, and how big its prompt was, for the ledger; every task says its class, requirements and eligibility. */
+  private issue(issued: WorkTask[]): WorkTask[] {
+    const tasks = issued.map((t) => ({ class: classOf(t.kind), requires: null, eligible: 'any' as const, ...t }) as WorkTask);
     if (!this.opts.ledger) return tasks;
     const now = Date.now();
     for (const [id, i] of this.issued) if (now - i.at > ISSUED_TTL_MS) this.issued.delete(id);
@@ -392,7 +448,7 @@ export class WorkBroker {
   }
 
   private seen(who: WorkerIdentity, kinds: WorkKind[]): void {
-    const record = this.workers.get(who.worker) ?? { backend: who.backend, remote: who.remote, kinds, lastSeen: 0, ok: 0, failed: 0 };
+    const record = this.workers.get(who.worker) ?? { backend: who.backend, remote: who.remote, pool: who.pool ?? null, kinds, lastSeen: 0, ok: 0, failed: 0 };
     record.kinds = kinds;
     this.workers.set(who.worker, record);
     this.touch(who);
@@ -403,6 +459,7 @@ export class WorkBroker {
     if (!record) return;
     record.backend = who.backend;
     record.remote = who.remote;
+    record.pool = who.pool ?? null;
     record.lastSeen = Date.now();
   }
 }

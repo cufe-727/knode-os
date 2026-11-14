@@ -8,7 +8,7 @@ import { catalogArgs, exitFailure, withCodexCatalog } from '../llm/codex-catalog
 import { CallUsage, readCodexEvents } from '../llm/usage.js';
 import { EVAL_HOME } from './pack.js';
 import { currentRemote } from './placement.js';
-import { remoteAgent, RemoteEval } from './remote.js';
+import { PackScope, publishAgent } from './remote.js';
 import { evalTempDir } from './tmp.js';
 import { AGENT_MCP_TOKEN_ENV } from './toolhost.js';
 
@@ -53,6 +53,13 @@ let routing: AgentRouting | null = null;
 
 export function setAgentRouting(r: AgentRouting | null): void {
   routing = r;
+}
+
+let stopping: AbortSignal | null = null;
+
+/** The run's stop signal (set by `runEval`): a session that ends while it is up was stopped, not answered. */
+export function setAgentStopping(signal: AbortSignal | null): void {
+  stopping = signal;
 }
 
 /** The env var a session reads its API key from: never on the command line, where `ps` would show it. */
@@ -100,6 +107,15 @@ export interface AgentRunResult {
   worker?: string;
   /** The CLI and model it ran on, `codex-cli:<model>` (or the API link's name). */
   backend?: string;
+  /** Killed by a signal, or stopped with the run: never an answer (its `error` says so). */
+  cancelled?: boolean;
+  /** The pool of the worker that ran it (docs/design/32 §2). */
+  pool?: string;
+}
+
+/** Tokens a session's usage counts, 0 when it reported none. */
+export function usageTokens(u: CallUsage | null | undefined): number {
+  return u ? (u.inputTokens ?? 0) + (u.outputTokens ?? 0) + (u.reasoningTokens ?? 0) : 0;
 }
 
 const toml = (v: unknown) => JSON.stringify(v);
@@ -234,16 +250,21 @@ export class AgentTrace {
   }
 }
 
+/**
+ * One agent session. Inside an evaluation run's pack it is a published piece
+ * (docs/design/32): a slot that leases it runs it — the run's own, through
+ * `runAgentHere`, or a worker. A run routed over an agent chain publishes its
+ * sessions for this machine's slots only, since the chain's links are this
+ * machine's keys and logins. Outside a run (a test, a tool) it runs here.
+ */
 export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
-  // on a remote worker when the run offers its sessions and one takes this one (docs/design/27 §8); a run
-  // routed over an agent chain stays here, since its links are this machine's keys and logins
-  const remote = routing ? null : currentRemote<RemoteEval>();
-  if (remote) {
-    const r = await remoteAgent(remote, opts);
-    if (r) return r;
-    remote.counts.here++;
-    await remote.localGate();
-  }
+  const scope = currentRemote<PackScope>();
+  if (scope) return publishAgent(scope, opts, () => runAgentHere(opts), !routing);
+  return runAgentHere(opts);
+}
+
+/** A session on this machine: what a run's own slot does with an agent piece. */
+export async function runAgentHere(opts: AgentRunOptions): Promise<AgentRunResult> {
   // down the chain: an API link until its budget or credit is gone, then the next
   for (;;) {
     const link = routing?.pick() ?? null;
@@ -270,6 +291,10 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
   const t0 = Date.now();
   const newTrace = () => new AgentTrace({ cwd: opts.cwd, maxSteps, allowRoots: opts.allowRoots, onCap: () => child?.kill('SIGTERM') });
   let trace = newTrace();
+  // the run stopping stops its sessions: what they had is no answer (docs/design/32 §3)
+  const stopSignal = stopping;
+  const onStop = () => child?.kill('SIGTERM');
+  stopSignal?.addEventListener('abort', onStop, { once: true });
 
   try {
     let stdout = '';
@@ -309,6 +334,10 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
     }
     const events = readCodexEvents(stdout);
     const text = fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8').trim() : '';
+    // killed by a signal (not at its step cap), or ended with nothing at all while the run was stopping: cancelled, asked again on resume
+    const killed = (child as ChildProcess | null)?.signalCode ?? null;
+    const empty = !text && trace.steps === 0 && !usageTokens(events.usage);
+    const cancelled = !trace.capped && (killed ? `cancelled: codex was killed by ${killed}` : empty && stopSignal?.aborted ? 'cancelled: the session ended with nothing while the run was stopping' : null);
     return {
       text,
       usage: events.usage,
@@ -318,9 +347,10 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
       leaked: [...new Set(trace.leaked)],
       filesTouched: [...trace.touched],
       ms: Date.now() - t0,
-      ...(error && !text ? { error } : {}),
+      ...(cancelled ? { error: cancelled, cancelled: true } : error && !text ? { error } : {}),
     };
   } finally {
+    stopSignal?.removeEventListener('abort', onStop);
     out.cleanup();
   }
 }

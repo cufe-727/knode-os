@@ -64,6 +64,17 @@ export interface WorkerIdentity {
   /** What runs the call: codex, cursor, claude, api, or a route id. */
   backend: string;
   remote: boolean;
+  /**
+   * An evaluation run's own slot (docs/design/32 §3): it takes only that
+   * run's pieces, since it runs them with the run's own backends.
+   */
+  run?: string;
+  /**
+   * The pool the slot's worker declared (`knode-worker --pool`, default its
+   * token's name; a run's own slots: `local` or the run's `--pool`). A task
+   * that names a pool goes only to a slot of it (docs/design/32 §2).
+   */
+  pool?: string;
 }
 
 /**

@@ -10,7 +10,8 @@ import { describeFeeds } from '../ingest/feeds/runner.js';
 import { FailureKind } from '../labeling/failures.js';
 import { activePause } from '../research/failure.js';
 import { LIVE_STATUSES } from '../research/jobs.js';
-import { WorkKind } from '../work/kinds.js';
+import { WorkKind, classOf } from '../work/kinds.js';
+import type { WorkClass } from '../work/kinds.js';
 import type { WorkspaceServices } from './app.js';
 
 /**
@@ -57,12 +58,18 @@ export interface InFlightTask {
   remote: boolean;
   ageSeconds: number;
   expiresInSeconds: number;
+  /** `kb` or `eval` (docs/design/32 §2). */
+  class: WorkClass;
+  /** The pool the task requires (an evaluation run's `--pool`); null: any. */
+  pool: string | null;
 }
 
 export interface TaskWorker {
   id: string;
   label: string;
   remote: boolean;
+  /** The pool a remote worker declared (docs/design/32 §2); null for this machine's backends. */
+  pool: string | null;
   /** Kinds of work it takes; empty for a local backend until it has asked. */
   kinds: WorkKind[];
   /** Local backends only: parallel calls it may make. */
@@ -306,25 +313,25 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
       worker: l.worker, backend: l.backend, remote: l.remote, ageSeconds: l.ageSeconds, expiresInSeconds: l.expiresInSeconds,
     })),
     ...evalWork.flatMap((e) => e?.leases ?? []).map((l) => ({
-      id: l.id, kind: l.kind, subject: l.label, detail: `eval run ${l.run} · ${l.model}`,
+      id: l.id, kind: l.kind, subject: l.label, detail: `eval run ${l.run} · ${l.model}${l.pool ? ` · pool ${l.pool}` : ''}`,
       worker: l.worker, backend: l.backend, remote: l.remote, ageSeconds: l.ageSeconds, expiresInSeconds: l.expiresInSeconds,
     })),
-  ].sort((a, b) => b.ageSeconds - a.ageSeconds);
+  ].map((t) => ({ class: classOf(t.kind), pool: null, ...t }) as InFlightTask).sort((a, b) => b.ageSeconds - a.ageSeconds);
 
   // this machine's backends, one row each with its slots; remote workers as the broker last saw them
   const workers: TaskWorker[] = [
     ...(services?.localWorkers?.status() ?? []).map((b) => ({
-      id: b.id, label: b.label, remote: false, kinds: [] as WorkKind[], slots: b.slots, busy: b.busy, ok: b.ok, failed: sumFailed(b.failed),
+      id: b.id, label: b.label, remote: false, pool: null, kinds: [] as WorkKind[], slots: b.slots, busy: b.busy, ok: b.ok, failed: sumFailed(b.failed),
       lastSeen: null, online: running, pausedUntil: b.pausedUntil, pauseReason: b.pauseReason, lastError: b.lastError,
     })),
     // this machine's embed slots run whether or not processing does
     ...(embedSlots && embedSlots.slots > 0 ? [{
-      id: 'embed', label: embedSlots.endpoint?.calibrated ? `embed:${embedSlots.endpoint.model} at ${embedSlots.endpoint.baseUrl}` : `embed:${ctx.embedder.model}`, remote: false, kinds: ['embed'] as WorkKind[], slots: embedSlots.slots, busy: embedSlots.busy,
+      id: 'embed', pool: null, label: embedSlots.endpoint?.calibrated ? `embed:${embedSlots.endpoint.model} at ${embedSlots.endpoint.baseUrl}` : `embed:${ctx.embedder.model}`, remote: false, kinds: ['embed'] as WorkKind[], slots: embedSlots.slots, busy: embedSlots.busy,
       ok: embedSlots.batches, failed: embedSlots.failed, lastSeen: null, online: true, pausedUntil: embedSlots.pausedUntil,
       pauseReason: embedSlots.pausedUntil ? 'the embedder could not serve' : null, lastError: embedSlots.lastError,
     }] : []),
     ...(work?.workers ?? []).filter((w) => w.remote).map((w) => ({
-      id: w.worker, label: w.backend, remote: true, kinds: w.kinds, slots: null, busy: w.leased, ok: w.ok, failed: w.failed,
+      id: w.worker, label: w.backend, remote: true, pool: w.pool ?? null, kinds: w.kinds, slots: null, busy: w.leased, ok: w.ok, failed: w.failed,
       lastSeen: w.lastSeen, online: now - Date.parse(w.lastSeen) < ONLINE_MS, pausedUntil: null, pauseReason: null, lastError: null,
     })),
   ];

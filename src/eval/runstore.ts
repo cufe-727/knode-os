@@ -64,6 +64,16 @@ export interface RunMeta {
   repeat?: { n: number; systems: string[] };
   /** `--remote`: the serve it offered work through, and whether its calls and its judge could leave. */
   remote?: { serve: string; calls: boolean; judge: boolean };
+  /**
+   * Where the run's work was published and who could take it (docs/design/32),
+   * as the latest start of the run set it: `serve`'s broker or the run's own,
+   * the run's own slots by CLI (null: none), the pool every piece required,
+   * the wait limit in minutes (0: none), and whether an old command line
+   * (no `--remote`, no `--local`) sized the slots from `--slots`.
+   */
+  work?: { broker: 'serve' | 'own'; serve?: string; local: Partial<Record<'codex' | 'claude', number>> | null; pool: string | null; waitMinutes: number; legacy: boolean };
+  /** Pieces the latest start of the run left stuck: three different workers could not serve them (docs/design/32 §3). */
+  stuck?: { kind: string; label: string; family: string; model: string; eligible: string; pool: string | null; system: string | null; task: string | null; workers: string[]; lastError: string; at: string }[];
   /** Where knode's indexes lived (docs/design/31 D1): `pglite`, or `postgres` with its server and database (never credentials). Absent: a run from before, on PGlite. */
   database?: { kind: string; at: string; poolSize?: number };
 }

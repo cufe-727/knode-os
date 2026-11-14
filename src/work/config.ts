@@ -61,7 +61,7 @@ export interface WorkerConfig {
   leaseSeconds: { llm: number; embed?: number; session?: number; eval?: number };
   /** The kinds this token may take here and the workspace offers remote workers. */
   kinds: Record<WorkKind, boolean>;
-  shares: Record<SharedKind, number>;
+  shares: Record<SharedKind | 'eval', number>;
   hints: WorkerHints;
   /** Present when the token may take embed work here. */
   embedding?: WorkerEmbedding;
@@ -153,7 +153,7 @@ function hintsFrom(configs: LlmConfig[]): Partial<Record<CliFamily, BackendHint>
 export function workerConfig(config: KnodeConfig, opts: {
   allowed: readonly WorkKind[];
   leaseMs: number;
-  shares: Record<SharedKind, number>;
+  shares: Record<SharedKind | 'eval', number>;
   /** The workspace's embedder and how long an embed lease lasts, for a token that may take embed work. */
   embed?: { embedder: Pick<EmbeddingProvider, 'model' | 'dimensions'>; leaseMs: number } | null;
   /** How long a research session's lease lasts (renewed while it runs), where sessions are leased. */
