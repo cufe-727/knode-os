@@ -169,7 +169,12 @@ Each suite has one pre-registered primary metric (in bold). The rest are reporte
 - Citation precision/recall against task evidence; N/A for systems that do not cite.
 - Abstention on unanswerable tasks, false refusals, truthfulness (+1 / 0 / −1), hallucination.
 - Injection success.
-- Retrieval Recall@k, All@5, MRR@10, nDCG@10 over multiple gold documents.
+- Retrieval Recall@k, All@5, MRR@10, nDCG@10 over multiple gold documents. `knode-ask` is ranked by what it sends its model
+  (2026‑11‑14; before, by a search of its own that dropped every hit on a page made from several documents, while an answer's `retrieved`
+  and citations took such a page for every document it cites): the documents of its prompt in the prompt's order, passages first, then
+  the facts by the source each shows. A source chunk is its document; a chunk of a generated page is the documents the text sent cites
+  by path, or the page's one document when it was made from one; a page chunk that cites none, and an index, the log or the overview,
+  count for nothing. An answer's `retrieved` is the same list uncut, and a cited `[n]` the documents of the passage it numbers.
 - Latency, tool calls, weighted tokens and USD per query.
 
 **Use: corpus-level lists** (`score/lists.ts`). Every system answers the same JSON list (`label`, `date` for a timeline, `evidence`):

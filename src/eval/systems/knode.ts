@@ -5,7 +5,7 @@ import { AppContext, createContext } from '../../context.js';
 import { runDocumentPass } from '../../ingest/background.js';
 import { sync } from '../../ingest/sync.js';
 import { parseFrontmatter } from '../../markdown.js';
-import { ask } from '../../search/ask.js';
+import { ask, ASK_CONTEXT_CHARS, type AskResult } from '../../search/ask.js';
 import { search } from '../../search/search.js';
 import { toDateString } from '../../store/temporal.js';
 import type { ChatMessage, LlmClient } from '../../llm/client.js';
@@ -292,11 +292,73 @@ function toCorpus(s: KnodeState, p: string): string[] {
  * page as all of them put a dozen documents the search never ranked ahead of
  * the ones it did: on the pilot's MuSiQue questions knode's vector channel
  * scored 0.47 recall@5 that way and 0.60 by its source chunks, against 0.58
- * for the RAG baseline on the same vectors.
+ * for the RAG baseline on the same vectors. (`knode-sag`'s ranking; `knode-ask`
+ * is scored on what it sent its model, `sentDocuments`.)
  */
 function rankedDocument(s: KnodeState, p: string): string[] {
   const docs = toCorpus(s, p);
   return p.startsWith('raw/docs/') || docs.length === 1 ? docs : [];
+}
+
+const CITED_PATH = /raw\/docs\/[^\s)\]'"`，。]+/g;
+/** The generated indexes, the log and the overview: pages that list documents and pages without saying what they hold. */
+const NAVIGATION_PAGE = /(^|\/)(index|log|overview)\.md$/;
+
+/**
+ * The corpus documents one passage puts before a model, in the order it names
+ * them. A source chunk is its document. A chunk of a generated page is the
+ * documents the text sent cites by path (a page's lines end in the document
+ * each was read from; the text is cut where the prompt cuts it), and a page
+ * made from one document — a summary, an entity only one document mentions —
+ * is that document whatever its chunk cites. A page chunk that names no
+ * document counts for none: the model was shown nothing it could trace. Nor
+ * does a navigation page (an index, the log, the overview): it lists
+ * documents by title and path and says nothing of what they hold.
+ *
+ * Neither of the two rules this replaces held for `knode-ask` on the 2026-11
+ * 10× reports run: a page counted for no document left the ranking empty for
+ * 27 of 232 questions and shorter than five for 117, and a page counted for
+ * every document it cites anywhere put 606 documents in an answer's
+ * `retrieved` (and 72 in its citations) when the model had been shown a dozen
+ * passages. `known`, when given, is the corpus: a path cut by the prompt's
+ * limit, or followed by punctuation, is no document.
+ */
+export function passageDocuments(pagePath: string, content: string, pageSources: ReadonlyMap<string, string[]>, known?: ReadonlySet<string>): string[] {
+  if (pagePath.startsWith('raw/docs/')) return [pagePath.slice('raw/docs/'.length)];
+  if (NAVIGATION_PAGE.test(pagePath)) return [];
+  const made = pageSources.get(pagePath) ?? [];
+  const cited = [...content.slice(0, ASK_CONTEXT_CHARS).matchAll(CITED_PATH)].flatMap((m) => {
+    const doc = m[0].slice('raw/docs/'.length);
+    if (!known || known.has(doc)) return [doc];
+    const trimmed = doc.replace(/[.,;:!?。，；：、）)]+$/, '');
+    return known.has(trimmed) ? [trimmed] : [];
+  });
+  return [...new Set([...(made.length === 1 ? made : []), ...cited])];
+}
+
+/**
+ * The documents `ask` put before its model, in the prompt's order: its
+ * passages, then the facts it listed, each by the one source the prompt shows
+ * for it. What `knode-ask`'s ranking and an answer's `retrieved` are.
+ */
+function sentDocuments(s: KnodeState, res: Pick<AskResult, 'contexts' | 'facts'>, known: ReadonlySet<string>): string[] {
+  return [...new Set([
+    ...res.contexts.flatMap((c) => passageDocuments(c.path, c.content, s.pageSources, known)),
+    ...res.facts.flatMap((f) => (f.path ? passageDocuments(f.path, '', s.pageSources, known) : [])),
+  ])];
+}
+
+/** The documents an answer cited: each `[n]` by the passage or fact it numbers, as `sentDocuments` counts them. */
+function citedDocuments(s: KnodeState, res: AskResult, known: ReadonlySet<string>): string[] {
+  return res.citations.flatMap((c) => {
+    const passage = res.contexts[c.ref - 1];
+    return passage ? passageDocuments(passage.path, passage.content, s.pageSources, known) : passageDocuments(c.path, '', s.pageSources, known);
+  });
+}
+
+/** `client` with no model behind it: `ask` then stops at what it would have sent one (a retrieval probe). */
+function withoutModel(client: LlmClient): LlmClient {
+  return Object.defineProperty(Object.create(client) as LlmClient, 'enabled', { value: false });
 }
 
 function readPageSources(s: KnodeState): void {
@@ -398,15 +460,23 @@ export function knodeAsk(): SystemUnderTest {
       const llm = withAppendedRules(shimClient(env, { system: 'knode-ask', stage: 'answer', task: task.id }), rules);
       // against the index as built: an answer records no hits, so no question moves another's ranking (docs/design/31 D3)
       const res = await ask(ctx.store, ctx.config, ctx.embedder, llm, task.question, { mode: 'hybrid', track: false });
-      // ask's own [n] citations, and any [doc: path] the answer wrote under the shared output rules
+      // ask's own [n] citations, each the documents of the passage or fact it numbers, and any [doc: path] the
+      // answer wrote under the shared output rules
       const docs = new Set(env.staged.docs.map((d) => d.path));
-      const citations: Citation[] = [...new Set([...res.citations.flatMap((c) => toCorpus(s, c.path)), ...citationsIn(res.answer, docs).map((c) => c.doc)])].map((doc) => ({ doc }));
-      return { text: res.answer, citations, retrieved: [...new Set(res.contexts.flatMap((c) => toCorpus(s, c.path)))] };
+      const citations: Citation[] = [...new Set([...citedDocuments(s, res, docs), ...citationsIn(res.answer, docs).map((c) => c.doc)])].map((doc) => ({ doc }));
+      return { text: res.answer, citations, retrieved: sentDocuments(s, res, docs) };
     },
+    /**
+     * The ranking an answer is made from: the documents `ask` would send its model for the question, in the
+     * prompt's order — the same retrieval as `answer` (route, search, graph expansion, excerpts, facts) without
+     * the completion, not a search of its own. The same list as that answer's `retrieved`, cut to `k`, while the
+     * router classifies by rules (the default; a model classifier is not asked here).
+     */
     async retrieve(query, k, env) {
-      const ctx = await open(stateFor(env));
-      const hits = await search(ctx.store, ctx.embedder, query, { k: k * 3, mode: 'hybrid', track: false, heat: ctx.config.heat, rerank: ctx.config.retrieval.rerank, current: false });
-      return [...new Set(hits.flatMap((h) => rankedDocument(stateFor(env), h.path)))].slice(0, k);
+      const s = stateFor(env);
+      const ctx = await open(s);
+      const res = await ask(ctx.store, ctx.config, ctx.embedder, withoutModel(ctx.llm), query, { mode: 'hybrid', track: false });
+      return sentDocuments(s, res, new Set(env.staged.docs.map((d) => d.path))).slice(0, k);
     },
     async exportKnowledge(env) {
       return exportUnits(stateFor(env));
@@ -611,7 +681,7 @@ async function exportUnits(s: KnodeState): Promise<KnowledgeUnit[]> {
   const wiki = path.join(s.ws, 'wiki');
   for (const rel of listFiles(wiki).filter((f) => f.endsWith('.md'))) {
     // navigation pages (the generated indexes, the overview) are not knowledge units
-    if (rel.startsWith('.obsidian') || /(^|\/)(index|log|overview)\.md$/.test(rel)) continue;
+    if (rel.startsWith('.obsidian') || NAVIGATION_PAGE.test(rel)) continue;
     const kind: KnowledgeUnit['kind'] = rel.startsWith('sources/') ? 'summary' : rel.startsWith('concepts/') ? 'community' : 'page';
     const body = parseFrontmatter(fs.readFileSync(path.join(wiki, rel), 'utf8')).body.replace(/<!--[^>]*-->/g, '').trim();
     if (!body) continue;

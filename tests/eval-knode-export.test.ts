@@ -7,15 +7,17 @@ import { Judge, LINK_SYSTEM } from '../src/eval/judge.js';
 import { Meter } from '../src/eval/meter.js';
 import { docText, loadPack, stageCorpus } from '../src/eval/pack.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
+import { taskPrompt } from '../src/eval/prompts.js';
 import { QuotaGuard } from '../src/eval/quota.js';
 import { runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
 import { LINK_CITED_PASSAGES, scoreGeneration } from '../src/eval/score/generation.js';
 import { startShim, type ChatRequest } from '../src/eval/shim.js';
-import { claimWindow, knodeAsk } from '../src/eval/systems/knode.js';
+import { claimWindow, knodeAsk, passageDocuments } from '../src/eval/systems/knode.js';
 import type { SystemEnv } from '../src/eval/systems/types.js';
 import type { KnowledgeUnit } from '../src/eval/types.js';
 import type { ChatMessage, LlmClient } from '../src/llm/client.js';
+import { ASK_CONTEXT_CHARS } from '../src/search/ask.js';
 import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
 
 /**
@@ -26,9 +28,12 @@ import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
 
 /** The fixture's extraction, with a period on the claim read off the offer email. */
 class DatedBackend extends ScriptedBackend {
+  /** The prompts the answering model was sent. */
+  asked: string[] = [];
   async complete(req: ChatRequest) {
     const system = req.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
     const user = req.messages.filter((m) => m.role === 'user').map((m) => m.content).join('\n');
+    if (system.includes('You answer questions from a personal knowledge base')) this.asked.push(user);
     if (!system.includes('knowledge-graph extraction engine') || !user.includes('岗位为高级数据工程师')) return super.complete(req);
     this.calls++;
     const text = JSON.stringify({
@@ -50,6 +55,7 @@ const embedder = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKe
 // a zone ahead of UTC, where the end of a day in UTC is the next morning: a date cut in local time is a day late
 const zone = process.env.TZ;
 
+const backend = new DatedBackend();
 let env: SystemEnv;
 let closeEnv: () => Promise<void>;
 let units: KnowledgeUnit[];
@@ -62,7 +68,7 @@ beforeAll(async () => {
   const pack = loadPack(packDir);
   const staged = stageCorpus(pack);
   const meter = new Meter();
-  const shim = await startShim({ backend: new DatedBackend(), embedder, meter });
+  const shim = await startShim({ backend, embedder, meter });
   env = {
     runId: 'export', pack, staged, workDir: new RunStore(base).workDir(pack.manifest.id, 'knode'), shim, meter,
     quota: new QuotaGuard({ enabled: false }), models: { model: '', buildEffort: 'low', answerEffort: 'medium' }, log: () => {},
@@ -148,5 +154,73 @@ describe('exported relations', () => {
     expect(few.slice(0, 3).every(ofCited)).toBe(true);
     // every unit of the build says where it comes from, the relations too
     expect(units.filter((u) => u.kind === 'relation').every((u) => u.sources.length > 0)).toBe(true);
+  });
+});
+
+describe("knode-ask's retrieval", () => {
+  const pages = new Map([
+    ['wiki/entities/inc-001.md', ['weekly/a/1.md', 'weekly/a/2.md', 'monthly/pmo-01.md']],
+    ['wiki/sources/weekly/a/1.md', ['weekly/a/1.md']],
+    ['wiki/sources/index.md', ['weekly/a/1.md', 'weekly/a/2.md']],
+  ]);
+  const corpus = new Set(['weekly/a/1.md', 'weekly/a/2.md', 'monthly/pmo-01.md']);
+
+  it('counts a passage as the documents it puts before the model', () => {
+    // a source chunk: its document
+    expect(passageDocuments('raw/docs/weekly/a/1.md', 'text', pages, corpus)).toEqual(['weekly/a/1.md']);
+    // a chunk of a page made from several: the documents its lines cite, in order, once each — not every document of the page
+    const chunk = '## Current state\n- **级别**: P1 — raw/docs/weekly/a/2.md\n- **修复人**: 丁博 — raw/docs/weekly/a/1.md\n- **根因**: 配置 — raw/docs/weekly/a/2.md.';
+    expect(passageDocuments('wiki/entities/inc-001.md', chunk, pages, corpus)).toEqual(['weekly/a/2.md', 'weekly/a/1.md']);
+    // … and none when it cites none
+    expect(passageDocuments('wiki/entities/inc-001.md', '# INC-001\n\n平台组的事故。', pages, corpus)).toEqual([]);
+    // a page made from one document is that document
+    expect(passageDocuments('wiki/sources/weekly/a/1.md', 'A summary.', pages, corpus)).toEqual(['weekly/a/1.md']);
+    // a navigation page lists documents and holds nothing of them
+    expect(passageDocuments('wiki/sources/index.md', '* A - `raw/docs/weekly/a/1.md`', pages, corpus)).toEqual([]);
+    // only what the prompt keeps of the passage: a citation past the cut, or a path the cut broke, is not shown
+    const long = `${'x'.repeat(ASK_CONTEXT_CHARS - 'raw/docs/weekly/a/'.length - 1)} raw/docs/weekly/a/1.md — raw/docs/monthly/pmo-01.md`;
+    expect(passageDocuments('wiki/entities/inc-001.md', long, pages, corpus)).toEqual([]);
+    expect(passageDocuments('wiki/entities/inc-001.md', `raw/docs/weekly/a/1.md ${long}`, pages, corpus)).toEqual(['weekly/a/1.md']);
+  });
+
+  it('scores the ranking and `retrieved` from what the answer sent its model', async () => {
+    const docs = new Set(env.staged.docs.map((d) => d.path));
+    let viaPage = 0;
+    for (const id of ['q1', 'c-runs', 'c-chain']) {
+      const task = env.staged.tasks.find((t) => t.id === id)!;
+      backend.asked.length = 0;
+      const a = await sys.answer!(task, taskPrompt(task), env);
+      expect(backend.asked, id).toHaveLength(1);
+      const prompt = backend.asked[0];
+      // read back from the prompt itself: the passages as it numbers them (`[n] (path)` or `[n] (path, excerpt)`, then
+      // the text), then the facts, each with the one source it shows
+      const question = prompt.indexOf('\n\n# Question');
+      const factsAt = prompt.indexOf('\n\n# Known facts');
+      const context = prompt.slice(prompt.indexOf('# Context'), factsAt >= 0 ? factsAt : question);
+      const heads = [...context.matchAll(/^\[\d+\] \(([^),]+)(?:, excerpt)?\)$/gm)];
+      const sent: string[] = [];
+      const sources: string[] = [];
+      heads.forEach((h, i) => {
+        const text = context.slice(h.index! + h[0].length, heads[i + 1]?.index ?? context.length);
+        if (h[1].startsWith('raw/docs/')) sources.push(h[1].slice('raw/docs/'.length));
+        if (h[1].startsWith('raw/docs/')) sent.push(h[1].slice('raw/docs/'.length));
+        else if (!/(^|\/)(index|log|overview)\.md$/.test(h[1])) sent.push(...[...text.matchAll(/raw\/docs\/([a-z]+\/[\d-]+\.md)/g)].map((m) => m[1]));
+      });
+      if (factsAt >= 0) sent.push(...[...prompt.slice(factsAt, question).matchAll(/ — raw\/docs\/([a-z]+\/[\d-]+\.md)/g)].map((m) => m[1]));
+      expect(sources.length, id).toBeGreaterThan(0);
+      const retrieved = a.retrieved!;
+      // every document the prompt puts before the model, once, in the prompt's order — and no other
+      expect(retrieved, id).toEqual([...new Set(sent)]);
+      for (const d of retrieved) expect(docs.has(d), d).toBe(true);
+      viaPage += retrieved.filter((d) => !sources.includes(d)).length;
+      // what the answer cites is a passage's documents, among those sent
+      for (const c of a.citations ?? []) expect(retrieved, id).toContain(c.doc);
+      // the retrieval probe is the same retrieval without the completion
+      const ranked = await sys.retrieve!(task.question, 5, env);
+      expect(ranked, id).toEqual(retrieved.slice(0, 5));
+      expect(backend.asked, id).toHaveLength(1);
+    }
+    // some document reached the model only through a generated page that cites it
+    expect(viaPage).toBeGreaterThan(0);
   });
 });

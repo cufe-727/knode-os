@@ -11,6 +11,9 @@ import { EnumeratedClaim, Enumeration, enumerateClaims, typesInQuestion } from '
 import { QuestionKind, QuestionRoute, questionRange, routeQuestion } from './route.js';
 import { stepsAsFacts, walkRelations } from './walk.js';
 
+/** Characters of a retrieved passage the answering model is shown. */
+export const ASK_CONTEXT_CHARS = 1500;
+
 export interface AskResult {
   answer: string;
   /** What the answer cited: a retrieved chunk, or a known fact by its source (then `chunkId` is the chunk it was read from, '' when that is gone). */
@@ -313,7 +316,7 @@ async function compose(env: RouteEnv, contexts: SearchResult[], facts: PromptFac
   }
 
   const contextBlock = contexts
-    .map((c, i) => `[${i + 1}] (${c.path}${c.excerpt ? ', excerpt' : ''})\n${c.content.slice(0, 1500)}`)
+    .map((c, i) => `[${i + 1}] (${c.path}${c.excerpt ? ', excerpt' : ''})\n${c.content.slice(0, ASK_CONTEXT_CHARS)}`)
     .join('\n\n');
   const raw = await llm.complete([
     { role: 'system', content: route.enumerated ? `${ASK_SYSTEM}${ENUMERATED_RULE}` : ASK_SYSTEM },
