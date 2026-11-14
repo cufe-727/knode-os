@@ -249,7 +249,17 @@ describe("the build's tool host", () => {
       instructions: stdio.getInstructions(),
       server: stdio.getServerVersion(),
     };
+    const child = (stdio.transport as StdioClientTransport | undefined)?.pid ?? null;
     await stdio.close();
+    // the server process is gone before the workspace is opened here: one process at a time on a PGlite index
+    for (let i = 0; child && i < 100; i++) {
+      try {
+        process.kill(child, 0);
+        await new Promise((r) => setTimeout(r, 50));
+      } catch {
+        break;
+      }
+    }
     expect(expected.tools.map((t) => t.name).sort()).toEqual([...KNODE_AGENT_TOOLS].sort());
 
     const ctx = await ready(await createContext(ws));

@@ -596,7 +596,9 @@ export function reuseBuilds(store: RunStore, from: string, packDirs: string[], e
         continue;
       }
       const work = path.join(from, 'work', pack.manifest.id, b.system);
-      if (fs.existsSync(work)) fs.cpSync(work, store.workDir(pack.manifest.id, b.system), { recursive: true });
+      // not an index lock (src/store: `.knode/db.lock`, the pid that holds a PGlite directory open): it is the
+      // other run's process, and the copy is this run's to open
+      if (fs.existsSync(work)) fs.cpSync(work, store.workDir(pack.manifest.id, b.system), { recursive: true, filter: (src) => path.basename(src) !== 'db.lock' });
       store.putBuild({ ...b, notes: { ...b.notes, reusedFrom: meta.id, builtAt: b.at } });
       builds++;
     }
