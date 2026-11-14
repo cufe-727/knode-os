@@ -41,7 +41,14 @@ import { evalTempDir } from '../tmp.js';
 
 interface KnodeState {
   ws: string;
-  ctx: AppContext | null;
+  /**
+   * The open context, held as the promise of it: answers that start together
+   * share one open instead of each opening the index (docs/design/31 F2 — on
+   * PGlite several instances on one directory stalled the process).
+   */
+  ctx: Promise<AppContext> | null;
+  /** A close in flight: the next open waits for it. */
+  closing: Promise<void> | null;
   /** wiki page path → the corpus documents it was generated from. */
   pageSources: Map<string, string[]>;
 }
@@ -107,7 +114,7 @@ export function evalPassSettings(): { concurrency: number; batchSize: number } {
 function stateFor(env: SystemEnv): KnodeState {
   let s = states.get(env.workDir);
   if (!s) {
-    s = { ws: path.join(env.workDir, 'ws'), ctx: null, pageSources: new Map() };
+    s = { ws: path.join(env.workDir, 'ws'), ctx: null, closing: null, pageSources: new Map() };
     states.set(env.workDir, s);
   }
   return s;
@@ -158,16 +165,39 @@ export function evalWorkspaceConfig(env: Pick<SystemEnv, 'shim' | 'pack'>, syste
   } as KnodeConfig;
 }
 
-async function open(s: KnodeState): Promise<AppContext> {
-  if (!s.ctx) s.ctx = await createContext(s.ws);
-  return s.ctx;
+/** The workspace's context, opened once however many callers ask at the same time (single-flight). */
+function open(s: KnodeState): Promise<AppContext> {
+  if (s.ctx) return s.ctx;
+  const closing = s.closing;
+  const opening = (async () => {
+    if (closing) await closing;
+    return createContext(s.ws);
+  })();
+  s.ctx = opening;
+  // a failed open is not kept: the next caller tries again
+  opening.catch(() => {
+    if (s.ctx === opening) s.ctx = null;
+  });
+  return opening;
 }
 
+/** Close the context once an open still in flight has finished; an open after this waits for the close. */
 async function close(s: KnodeState): Promise<void> {
-  if (!s.ctx) return;
-  await s.ctx.datasources.closeAll();
-  await s.ctx.store.close();
+  const opened = s.ctx;
+  if (!opened) return s.closing ?? undefined;
   s.ctx = null;
+  const closing = (async () => {
+    const ctx = await opened.catch(() => null);
+    if (!ctx) return;
+    await ctx.datasources.closeAll();
+    await ctx.store.close();
+  })();
+  s.closing = closing;
+  try {
+    await closing;
+  } finally {
+    if (s.closing === closing) s.closing = null;
+  }
 }
 
 /** `raw/docs/<x>` → corpus path `<x>`; a generated page → the documents it was made from. */
@@ -273,9 +303,8 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
 }
 
 export function knodeAsk(): SystemUnderTest {
+  // as wide as the run's answer concurrency: every answer shares the one open context (docs/design/31 D2)
   return knodeSystem('knode-ask', 'knode-os ask (hybrid retrieval, cited answer)', 'kb', true, {
-    // the embedded PGlite index blocks the process under overlapping ask() queries now and then: one at a time
-    serial: true,
     async answer(task, prompt, env) {
       const s = stateFor(env);
       const ctx = await open(s);
