@@ -95,6 +95,43 @@ So finance keeps its behaviour where no attribute is read, and gains it where on
 share, a quarter's revenue — the latest period is current, the older ones history). The one finance test whose
 numbers moved (`tests/temporal-claims.test.ts`) now also supersedes the year-ago quarter's revenue by this quarter's.
 
+### 2.1 When it runs: refine, and the end of every document pass (2026‑11‑15)
+
+Both rules ran in refine alone, once a night over every claim. Between two refines each report added left its value
+current beside the earlier ones: on the 10× separation benchmark a team's weekly metric had five current values after
+four update batches, and an agent asked for the latest value had five to pick from.
+
+A document pass (`runDocumentPass`, src/ingest/background.ts) now ends its claim step with `supersedeForClaims`
+(src/wiki/refine.ts) for the claims it wrote: their subjects, with the entities merged into them, get their attribute
+keys unified again (`refreshAttributeKeys`, for those subjects) and both rules run over their series; marks whose
+superseder is gone are cleared within them. No model call. It reads the attributed claims of the subjects touched,
+not of the workspace: on the 10× index the four update batches' 1,757 claims touched 251 subjects and changed 524
+marks in 0.57 s, and refine's run over every claim then found nothing left to change. Run twice for the same claims
+it changes nothing (`tests/claim-state.test.ts`).
+
+**No setting, on purpose.** Refine has none either: supersession runs whenever refine runs, and the only switch is
+the nightly schedule (`dream.schedule`), which turns off the whole pass — the audits, the judge, the reviews — and is
+turned off for their cost, not to keep old values current. The step after a pass does not follow that schedule: a
+workspace whose nightly pass is off is the one where a value would otherwise stay stale until somebody turns it
+back on. It runs where extraction runs (a pass that writes no claim does not run it), and what it writes is derived
+state that refine recomputes whole: `claims.superseded_by` and `claim_attribute_keys`, never a claim, its evidence or
+its text.
+
+**What changes for an existing workspace** (the release note):
+
+- From its first document pass after the update that writes a claim, the subjects of that pass's claims have one
+  current value per attribute; their older values become history (`superseded_by` set), as refine would have marked
+  them at night. A workspace whose nightly pass is off — where nothing has been marked since it was turned off —
+  catches up subject by subject, as documents about each subject arrive; subjects no new document speaks of keep
+  their marks until refine runs.
+- Readers that hide superseded claims (`knode_claims` and `v_claims … WHERE superseded_by IS NULL`, the entity page's
+  "Current state", `SearchResult.current`) show the new value alone sooner: after the pass, not after the night.
+- Entity pages, timelines and summary pages of those subjects are regenerated when their marks change (their input
+  hash holds `superseded_by`), so a pass that marks claims rewrites those pages at the next sync.
+- Not covered: a document removed by sync. When the current claim goes with its document, the older claims stay
+  marked superseded until refine clears the marks. Refine's entity rules (renames, namesakes, §5) still run only
+  in refine, so a series split across a renamed entity is joined at night.
+
 ## 3. The page
 
 `entity_stub` (version 6):

@@ -54,7 +54,10 @@ const passChains = new Map<string, Promise<unknown>>();
  *    wrote, in `review.claimMerge`'s mode (docs/design/10). Then
  *    supersession over the series of the subjects those claims are about
  *    (src/wiki/refine.ts supersedeForClaims): a new report's value becomes
- *    the current one now, not at the next refine. No model.
+ *    the current one now, not at the next refine. No model, and no setting:
+ *    it is part of a pass that writes claims, whether or not the nightly
+ *    pass is scheduled (docs/design/29 §2.1 says what that changes for a
+ *    workspace that exists already).
  * 4. Summarize — a summary page for up to `batchSize` documents, the ones
  *    this pass extracted first, on the Summarize stage's route.
  * 5. Entity pages — a page for each entity this pass wrote that claims from
