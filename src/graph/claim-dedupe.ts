@@ -8,6 +8,7 @@ import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { toDateString, toIso } from '../store/temporal.js';
 import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
 import { applyClaimMerge, reanchorClaimGroups } from './claim-merge.js';
+import { pendingRekey, rekeyState, rekeyWeeklyReadings } from './claim-rekey.js';
 import { sameValue } from './claim-state.js';
 import { claimId, readingWeek } from './store.js';
 import { packSubjectBatches, SubjectBatch } from './subject-batches.js';
@@ -53,6 +54,11 @@ export interface ClaimDedupeOptions {
   stateRules?: boolean;
   /** Claims a batch holds at once (CLAIMS_PER_BATCH); smaller in tests. */
   claimsPerBatch?: number;
+  /**
+   * Claims a run moves to weekly-reading identity first (src/graph/claim-rekey.ts), a bounded step
+   * of a workspace written before it; 0 runs none. Default 2,000.
+   */
+  rekeyLimit?: number;
 }
 
 export interface ClaimDedupeStats {
@@ -67,6 +73,8 @@ export interface ClaimDedupeStats {
   sameValue: number;
   /** Pairs of weekly readings of other weeks (keyedWeek): two claims by their identity, never judged or stored. */
   readingsApart: number;
+  /** Pairs left alone because a claim of theirs may still change id (pendingRekey). */
+  pendingRekey: number;
   judged: number;
   /** Pairs that needed the judge but did not fit under review.claimMergeMaxJudgedPerRun: left for a later run. */
   deferred: number;
@@ -807,7 +815,7 @@ export async function auditDuplicateClaims(
 ): Promise<ClaimDedupeStats> {
   const { store, config } = ctx;
   const progress = opts.onProgress ?? (() => {});
-  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, series: 0, sameValue: 0, readingsApart: 0, judged: 0, deferred: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0, leftToPerson: 0 };
+  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, series: 0, sameValue: 0, readingsApart: 0, pendingRekey: 0, judged: 0, deferred: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0, leftToPerson: 0 };
   const mode = config.review?.claimMerge ?? 'auto';
   if (mode === 'off') return stats;
   const minConfidence = config.review?.claimMergeMinConfidence ?? 0.9;
@@ -816,6 +824,11 @@ export async function auditDuplicateClaims(
   const threshold = opts.threshold ?? 0.85;
   const numberThreshold = opts.numberThreshold ?? 0.7;
 
+  // a workspace written before weekly readings had ids of their own moves a step at a time, and
+  // until a claim has moved no rule or judge decides about it: a new week's reading must not be
+  // merged into an old claim that still holds that week
+  if ((opts.rekeyLimit ?? 2000) > 0) await rekeyWeeklyReadings(store, { limit: opts.rekeyLimit ?? 2000, onProgress: progress });
+  const rekey = await rekeyState(store);
   if (!opts.focus) stats.reanchored = await reanchorClaimGroups(store, { onProgress: progress });
 
   // the subjects to audit, a batch at a time (CLAIMS_PER_BATCH): every one at night, the focus claims' otherwise
@@ -1013,6 +1026,10 @@ export async function auditDuplicateClaims(
       await pause();
       if (decided.has(pair.id)) continue;
       const { a, b } = pair;
+      if (pendingRekey(rekey, a, Boolean(keyedWeek(a))) || pendingRekey(rekey, b, Boolean(keyedWeek(b)))) {
+        stats.pendingRekey++;
+        continue;
+      }
       // readings of other weeks are two claims by construction, however they came up (keyedWeek)
       if (readingsApart(a, b)) {
         stats.readingsApart++;
