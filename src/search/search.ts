@@ -114,7 +114,7 @@ interface RankedChunk {
 export const GENERATED_SHARE = 0.25;
 
 /** How many of `k` results generated pages may take at `share`. */
-function generatedPlaces(k: number, share: number): number {
+export function generatedPlaces(k: number, share: number): number {
   return Math.min(k, Math.max(0, Math.round(k * Math.min(1, Math.max(0, share)))));
 }
 
@@ -960,7 +960,7 @@ export async function searchExplained(
 }
 
 /** The chunks among `results` that are of generated pages. */
-async function generatedAmong(store: Store, results: SearchResult[]): Promise<Set<string>> {
+export async function generatedAmong(store: Store, results: SearchResult[]): Promise<Set<string>> {
   if (results.length === 0) return new Set();
   const rows = await store.query<{ id: string }>(`SELECT d.id FROM documents d WHERE d.id = ANY($1::text[]) AND ${isGeneratedSql('d')}`, [[...new Set(results.map((r) => r.documentId))]]);
   const docs = new Set(rows.map((r) => r.id));

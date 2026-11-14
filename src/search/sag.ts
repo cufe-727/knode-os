@@ -5,7 +5,7 @@ import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { NO_FILTER, ResolvedScopeFilter, evidenceFilterSql } from '../store/resolver.js';
 import { Params, TimeInput, rowLiveAt, toIso } from '../store/temporal.js';
 import { SearchResult } from '../types.js';
-import { SearchOptions, docLiveAt, entityMatchSql, queryTerms, search } from './search.js';
+import { GENERATED_SHARE, SearchOptions, docLiveAt, entityMatchSql, generatedAmong, generatedPlaces, queryTerms, search } from './search.js';
 
 interface EntityMentionRow {
   entity_id: string;
@@ -276,7 +276,17 @@ function fuseStructuralCandidates(
     .sort((a, b) => b.score - a.score);
 }
 
-function mergeRoutes(direct: SearchResult[], structural: SearchResult[], k: number, directRatio: number): SearchResult[] {
+/**
+ * The `k` results of a walk: the direct route's first `k · directRatio`, the
+ * structural route's best for the rest, then whatever the two rank highest
+ * together. Chunks of generated pages (`pages`) take `places` of the `k` at
+ * most, whichever route offers them — a page past its places is passed over
+ * for the route's next source — and more only when the routes run out of
+ * sources (search.ts GENERATED_SHARE). The direct route is itself cut to that
+ * share of its own, longer, list: three pages lead its twelve, and its first
+ * four were handed on as they stood.
+ */
+function mergeRoutes(direct: SearchResult[], structural: SearchResult[], k: number, directRatio: number, pages: Set<string>, places: number): SearchResult[] {
   const fused = new Map<string, SearchResult>();
   const fold = (items: SearchResult[], route: 'direct' | 'sag') => {
     items.forEach((item, rank) => {
@@ -302,19 +312,27 @@ function mergeRoutes(direct: SearchResult[], structural: SearchResult[], k: numb
   const structuralQuota = k - directQuota;
   const selected: SearchResult[] = [];
   const selectedIds = new Set<string>();
-  const add = (items: SearchResult[], quota: number) => {
+  let pagesTaken = 0;
+  const add = (items: SearchResult[], quota: number, pagesAtMost = places) => {
     let added = 0;
     for (const item of items) {
       if (added >= quota) break;
       if (selectedIds.has(item.chunkId)) continue;
+      if (pages.has(item.chunkId)) {
+        if (pagesTaken >= pagesAtMost) continue;
+        pagesTaken++;
+      }
       selected.push(fused.get(item.chunkId)!);
       selectedIds.add(item.chunkId);
       added++;
     }
   };
+  const together = [...fused.values()].sort((a, b) => b.score - a.score);
   add(direct, directQuota);
   add(structural, structuralQuota);
-  add([...fused.values()].sort((a, b) => b.score - a.score), k - selected.length);
+  add(together, k - selected.length);
+  // the routes hold no more sources: pages take the places left
+  add(together, k - selected.length, k);
   return selected.sort((a, b) => b.score - a.score).slice(0, k);
 }
 
@@ -430,7 +448,9 @@ export async function sagSearch(
     .slice(0, cfg.candidatePool);
   const vectorRows = await coarseVectorRank(store, queryVector, embedder.model, structuralPool.map((item) => item.result.chunkId));
   const structuralResults = fuseStructuralCandidates(structuralPool, vectorRows);
-  const results = mergeRoutes(direct, structuralResults, k, cfg.directRatio);
+  const places = generatedPlaces(k, opts.generatedShare ?? GENERATED_SHARE);
+  const pages = places >= k ? new Set<string>() : await generatedAmong(store, [...direct, ...structuralResults]);
+  const results = mergeRoutes(direct, structuralResults, k, cfg.directRatio, pages, places);
 
   await boostByHeat(store, results, heatCfg);
   results.sort((a, b) => b.score - a.score);

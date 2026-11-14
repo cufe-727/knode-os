@@ -154,6 +154,16 @@ describe('generated pages in search results', () => {
     }
   });
 
+  it('keeps pages to their places in sag mode too', async () => {
+    // the walk's direct route searches for 12 and handed its first four on: three of them pages
+    const found = await ids('sag');
+    expect(found).toHaveLength(8);
+    expect(sidesOf(found).pages).toHaveLength(2);
+    expect(sidesOf(await ids('sag', { k: 4 })).pages).toHaveLength(1);
+    // asked for pages, the walk returns pages
+    expect(sidesOf(await ids('sag', { kinds: ['view'] })).sources).toEqual([]);
+  });
+
   it('holds a search for one result to a source', async () => {
     expect(sidesOf(await ids('hybrid', { k: 1 })).sources).toHaveLength(1);
     expect(sidesOf(await ids('hybrid', { k: 4 })).pages).toHaveLength(1);
