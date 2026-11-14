@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { CONFIG_FILE, loadConfig, ReviewIdentity, ReviewResolution } from '../config.js';
+import { CONFIG_FILE, loadConfig, ReviewResolution } from '../config.js';
 import { Queryable } from '../store/migrations.js';
 import { EntityCorrections, refusedKeys, refuses } from './corrections.js';
 import { codesKey, codesOf, MentionContext, namesakeFor, namesakeName, NamesakeRule } from './identity.js';
@@ -309,9 +309,10 @@ export async function entitiesNamed(q: Queryable, names: readonly string[]): Pro
   return out;
 }
 
-const modeCache = new Map<string, { stamp: string; mode: ReviewResolution; identity: ReviewIdentity }>();
+const modeCache = new Map<string, { stamp: string; mode: ReviewResolution }>();
 
-function reviewModes(dataDir: string): { mode: ReviewResolution; identity: ReviewIdentity } {
+/** `review.resolution` for a data dir, re-read when knode.config.json changes. */
+export function resolutionMode(dataDir: string): ReviewResolution {
   const file = path.join(dataDir, CONFIG_FILE);
   let stamp = 'none';
   try {
@@ -321,27 +322,14 @@ function reviewModes(dataDir: string): { mode: ReviewResolution; identity: Revie
     // no config file: defaults apply
   }
   const hit = modeCache.get(dataDir);
-  if (hit && hit.stamp === stamp) return hit;
+  if (hit && hit.stamp === stamp) return hit.mode;
   let mode: ReviewResolution = 'exact';
-  let identity: ReviewIdentity = 'context';
   try {
     const cfg = loadConfig(dataDir);
     mode = cfg.review?.resolution === 'suffix' ? 'suffix' : 'exact';
-    identity = cfg.review?.identity === 'name' ? 'name' : 'context';
   } catch {
     mode = 'exact';
   }
-  const entry = { stamp, mode, identity };
-  modeCache.set(dataDir, entry);
-  return entry;
-}
-
-/** `review.resolution` for a data dir, re-read when knode.config.json changes. */
-export function resolutionMode(dataDir: string): ReviewResolution {
-  return reviewModes(dataDir).mode;
-}
-
-/** `review.identity` for a data dir ('context' unless set to 'name'), re-read when knode.config.json changes. */
-export function identityMode(dataDir: string): ReviewIdentity {
-  return reviewModes(dataDir).identity;
+  modeCache.set(dataDir, { stamp, mode });
+  return mode;
 }

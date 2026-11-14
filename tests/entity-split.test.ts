@@ -6,6 +6,8 @@ import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { CodedDoc, codedClusters, medianDate, namesakeClusters, NamesakeDoc, resolveEntityContext, sequentialShare } from '../src/graph/entity-context.js';
 import { codesOf } from '../src/graph/identity.js';
+import { applyMerge } from '../src/graph/merge.js';
+import { resolveEntityId } from '../src/graph/resolve.js';
 import { RawExtractReply } from '../src/graph/llm-extract.js';
 import { enqueueTier1, runTier1Pass } from '../src/graph/tier1.js';
 import { sync } from '../src/ingest/sync.js';
@@ -132,10 +134,28 @@ describe('two people of one name', () => {
     // each team names the security team once and 英伟达 once: a third of all they ever name, a tenth of their reports
     const a = weeks.map((k) => doc(`a${k}`, at(k), ['平台组', '罗芳', ...(k === 3 ? ['安全团队'] : []), ...(k === 6 ? ['英伟达'] : [])]));
     const b = weeks.map((k) => doc(`b${k}`, at(k), ['二部平台组', '廖欣', ...(k === 2 ? ['安全团队'] : []), ...(k === 7 ? ['英伟达'] : [])]));
-    expect(namesakeClusters([...a, ...b], typeOf)?.map((c) => c.anchors)).toEqual([['平台组'], ['二部平台组']]);
+    expect(namesakeClusters([...a, ...b], typeOf, { characteristic: true })?.map((c) => c.anchors)).toEqual([['平台组'], ['二部平台组']]);
+    // compared over everything each ever names, as by default, they meet: not decided
+    expect(namesakeClusters([...a, ...b], typeOf)).toBeNull();
     // a colleague in every report of both: one person in two teams' reports
     const shared = [...a, ...b].map((d) => ({ ...d, context: new Set([...d.context, '方杰']) }));
-    expect(namesakeClusters(shared, typeOf)).toBeNull();
+    expect(namesakeClusters(shared, typeOf, { characteristic: true })).toBeNull();
+  });
+
+  it('decides nothing from a few dated documents, or from two languages', () => {
+    const at = (k: number) => new Date(Date.UTC(2025, 0, 6 + k * 7)).toISOString().slice(0, 10);
+    const weeks = Array.from({ length: 10 }, (_, k) => k);
+    const a = weeks.map((k) => doc(`a${k}`, at(k), ['平台组', '罗芳']));
+    const b = weeks.map((k) => doc(`b${k}`, at(k), ['二部平台组', '廖欣']));
+    expect(namesakeClusters([...a, ...b], typeOf)).not.toBeNull();
+    // four of one cluster's ten documents are dated: what the other six would say is not known
+    expect(namesakeClusters([...a, ...b.map((d, k) => (k < 4 ? d : { ...d, date: null }))], typeOf)).toBeNull();
+    expect(namesakeClusters([...a, ...b.map((d, k) => (k < 5 ? d : { ...d, date: null }))], typeOf)).not.toBeNull();
+    // one cluster in Chinese, the other in English: the same organizations would be different entities
+    const zh = a.map((d) => ({ ...d, language: 'zh' }));
+    expect(namesakeClusters([...zh, ...b.map((d) => ({ ...d, language: 'en' }))], typeOf)).toBeNull();
+    expect(namesakeClusters([...zh, ...b.map((d) => ({ ...d, language: 'zh' }))], typeOf)).not.toBeNull();
+    expect(namesakeClusters([...zh, ...b], typeOf)).not.toBeNull();
   });
 });
 
@@ -222,6 +242,13 @@ describe('refine on reports that date themselves only in their claims', () => {
     for (let i = 0; i < 10; i++) if ((await runTier1Pass(store, ctx.config, llm, { batchSize: 64 })).queued === 0) break;
     expect(await store.query(`SELECT 1 FROM documents WHERE root = 'docs' AND doc_date IS NOT NULL`)).toEqual([]);
 
+    // as a workspace is by default: nothing is parted — no code parts an entity, and documents without a date split no one
+    expect(ctx.config.review.identity).toBeUndefined();
+    expect(await resolveEntityContext(store, { config: ctx.config })).toMatchObject({ merged: 0, split: 0, replayed: 0 });
+    expect(await store.query(`SELECT id FROM entity_namesakes`)).toEqual([]);
+
+    // turned on
+    ctx.config.review.identity = 'context';
     const messages: string[] = [];
     const first = await resolveEntityContext(store, { config: ctx.config, onProgress: (m) => messages.push(m) });
     expect(first.split).toBeGreaterThanOrEqual(1);
@@ -319,5 +346,11 @@ describe('refine on reports that date themselves only in their claims', () => {
     expect((await named('日志保留天数%')).length).toBe(4);
     expect(await store.query(`SELECT count(*)::int AS n FROM entity_namesakes WHERE id = base_id`)).toEqual([{ n: 1 }]);
     expect(await resolveEntityContext(store, { config: ctx.config })).toMatchObject({ merged: 0, split: 0, replayed: 0 });
+
+    // undoing a split: a person merges the parted entity back, and it stays merged
+    await applyMerge(store, { entityId: four[0].id, canonicalId: '日志保留天数', reason: '同一个设置', actor: 'user' });
+    expect(await resolveEntityContext(store, { config: ctx.config })).toMatchObject({ merged: 0, split: 0, replayed: 0 });
+    expect((await resolveEntityId(store, { name: '日志保留天数', aliases: ['D4T1-C2'], context: { documentNames: new Set(['四部平台组']) } })).id).toBe('日志保留天数');
+    expect((await store.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM entities WHERE id = $1`, [four[0].id]))[0].canonical_id).toBe('日志保留天数');
   });
 });

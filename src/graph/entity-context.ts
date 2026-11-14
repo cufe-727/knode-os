@@ -56,11 +56,12 @@ import { ExtractedEntity, slugify } from './store.js';
  *            smaller context's documents are re-applied from their sidecars
  *            (no model call) with the name resolved to a new entity
  *            "陈伟（平台组）"; entity_namesakes keeps the rule that resolution
- *            follows from then on (identity.ts, namesakeFor). A document
- *            with no date of its own is dated by the dates its claims state
- *            (their median), so reports that give their week only in the
- *            text can still show two people active at once.
- *   coded    one entity whose documents carry two or more codes of one kind
+ *            follows from then on (identity.ts, namesakeFor). With
+ *            review.identity "context" a document with no date of its own is
+ *            dated by the dates its claims state (their median), and the two
+ *            contexts are compared by what each is about.
+ *   coded    (only with review.identity "context") one entity of an instance
+ *            type whose documents carry two or more codes of one kind
  *            (T1-C1, D2T1-C1 … D10T1-C1), each code's documents under a roof of its
  *            own, is as many things: every such code gets an entity
  *            "name（roof · code）" and its documents are re-applied to it, those that
@@ -453,6 +454,8 @@ export interface NamesakeDoc {
   id: string;
   path: string;
   date: string | null;
+  /** The language the document is written in, when known. */
+  language?: string | null;
   /** Entity ids co-mentioned with the name in this document (context types only). */
   context: Set<string>;
 }
@@ -478,6 +481,8 @@ function jaccard(a: Set<string>, b: Set<string>): number {
 const CHARACTERISTIC_SHARE = 0.2;
 /** One cluster's documents mostly before a date and the other's mostly after it: one person who moved. */
 const SEQUENTIAL_SHARE = 0.7;
+/** The share of each cluster's documents that must carry a date before the dates say anything about the cluster. */
+const DATED_SHARE = 0.5;
 
 /**
  * How far two sets of dates are one after the other: the largest share s such
@@ -499,19 +504,28 @@ export function sequentialShare(a: readonly string[], b: readonly string[]): num
  * The documents of one name split into contexts that are two people, or null.
  * Documents join when their co-mentions mostly agree (Jaccard ≥ 0.3), and a
  * split needs all of: two clusters holding ≥ 90% of the documents, each ≥ 3
- * documents and ≥ 15%; contexts that barely meet (Jaccard < 0.25 of what each
- * cluster is about: the entities in CHARACTERISTIC_SHARE of its documents or
- * more — two teams both name the security team or a customer now and then);
- * an anchor of each side (≥ 60% of its documents, ≤ 5% of the other's); and
- * both active at the same time — a person who moved teams has one context
- * before and another after, which is no namesake. Two tests of that: the date
- * ranges overlap by ≥ 30% of the shorter, and the documents are not one
- * cluster's first and then the other's (sequentialShare < SEQUENTIAL_SHARE).
- * The range alone is fooled by a look back: on the 10× benchmark 13 people
- * who changed teams were named months later in their old team's incident
- * reviews, and split (2026-11-15). Exported for tests.
+ * documents and ≥ 15%; contexts that barely meet (Jaccard < 0.25 of
+ * everything each cluster names — or, with `characteristic`, of what each is
+ * about: the entities in CHARACTERISTIC_SHARE of its documents or more, since
+ * two teams both name the security team or a customer now and then); an
+ * anchor of each side (≥ 60% of its documents, ≤ 5% of the other's); both
+ * clusters mostly in one language (a Chinese and an English account of one
+ * person name the same organizations as different entities until those are
+ * merged); and both active at the same time — a person who moved teams has
+ * one context before and another after, which is no namesake. For that, at
+ * least DATED_SHARE of each cluster's documents carry a date (three dated
+ * reports say nothing of thirty undated ones), the date ranges overlap by
+ * ≥ 30% of the shorter, and the documents are not one cluster's first and
+ * then the other's (sequentialShare < SEQUENTIAL_SHARE). The range alone is
+ * fooled by a look back: on the 10× benchmark 13 people who changed teams
+ * were named months later in their old team's incident reviews, and split
+ * (2026-11-15). Exported for tests.
  */
-export function namesakeClusters(docs: NamesakeDoc[], typeOf: (id: string) => string | undefined): [NamesakeCluster, NamesakeCluster] | null {
+export function namesakeClusters(
+  docs: NamesakeDoc[],
+  typeOf: (id: string) => string | undefined,
+  opts: { characteristic?: boolean } = {},
+): [NamesakeCluster, NamesakeCluster] | null {
   if (docs.length < MIN_DOCS) return null;
   const parent = docs.map((_, i) => i);
   const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
@@ -528,7 +542,14 @@ export function namesakeClusters(docs: NamesakeDoc[], typeOf: (id: string) => st
   const union = (g: NamesakeDoc[]) => new Set(g.flatMap((d) => [...d.context]));
   const share = (g: NamesakeDoc[], id: string) => g.filter((d) => d.context.has(id)).length / g.length;
   const about = (g: NamesakeDoc[]) => new Set([...union(g)].filter((id) => share(g, id) >= CHARACTERISTIC_SHARE));
-  if (jaccard(about(a), about(b)) >= 0.25) return null;
+  if (jaccard(opts.characteristic ? about(a) : union(a), opts.characteristic ? about(b) : union(b)) >= 0.25) return null;
+  const language = (g: NamesakeDoc[]) => {
+    const counts = new Map<string, number>();
+    for (const d of g) if (d.language) counts.set(d.language, (counts.get(d.language) ?? 0) + 1);
+    return [...counts.entries()].sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))[0]?.[0];
+  };
+  const [la, lb] = [language(a), language(b)];
+  if (la && lb && la !== lb) return null;
   const anchorsOf = (own: NamesakeDoc[], other: NamesakeDoc[]) =>
     [...union(own)]
       .filter((id) => ANCHOR_TYPES.has(typeOf(id) ?? '') && share(own, id) >= 0.6 && share(other, id) <= 0.05)
@@ -539,7 +560,7 @@ export function namesakeClusters(docs: NamesakeDoc[], typeOf: (id: string) => st
   const dates = (g: NamesakeDoc[]) => g.map((d) => d.date).filter((x): x is string => Boolean(x)).sort();
   const da = dates(a);
   const db = dates(b);
-  if (da.length === 0 || db.length === 0) return null;
+  if (da.length === 0 || db.length === 0 || da.length < DATED_SHARE * a.length || db.length < DATED_SHARE * b.length) return null;
   const ra = [Date.parse(da[0]), Date.parse(da[da.length - 1])] as const;
   const rb = [Date.parse(db[0]), Date.parse(db[db.length - 1])] as const;
   const overlap = Math.min(ra[1], rb[1]) - Math.max(ra[0], rb[0]);
@@ -575,13 +596,18 @@ export function medianDate(dates: readonly string[]): string | null {
 }
 
 /** An entity's documents with the context-type entities each co-mentions, and the type of each of those. */
-async function contextDocs(store: Store, entityId: string): Promise<{ docs: NamesakeDoc[]; types: Map<string, string> }> {
-  const rows = await store.query<{ document_id: string; path: string; doc_date: string | Date | null; other: string | null; other_type: string | null }>(
+async function contextDocs(
+  store: Store,
+  entityId: string,
+  /** `claimDates`: date a document that has no date of its own by the dates its claims state. */
+  opts: { claimDates?: boolean } = {},
+): Promise<{ docs: NamesakeDoc[]; types: Map<string, string> }> {
+  const rows = await store.query<{ document_id: string; path: string; doc_date: string | Date | null; language: string | null; other: string | null; other_type: string | null }>(
     // one row per document and co-mentioned entity: a mention is a row per chunk, and read as
     // they are a name's documents came back up to 208,361 rows (finance, 2026-11-13: 20 million rows
     // for 1,619 names, 34,513 at most once distinct)
     `WITH d AS (SELECT DISTINCT document_id FROM entity_mentions WHERE entity_id = $1)
-     SELECT DISTINCT d.document_id, doc.path, doc.doc_date, o.id AS other, o.type AS other_type
+     SELECT DISTINCT d.document_id, doc.path, doc.doc_date, doc.language, o.id AS other, o.type AS other_type
      FROM d JOIN documents doc ON doc.id = d.document_id
      LEFT JOIN entity_mentions m ON m.document_id = d.document_id AND m.entity_id <> $1
      LEFT JOIN entities x ON x.id = m.entity_id AND x.tx_to IS NULL
@@ -596,11 +622,11 @@ async function contextDocs(store: Store, entityId: string): Promise<{ docs: Name
       context.add(r.other);
       types.set(r.other, r.other_type);
     }
-    return { id: g[0].document_id, path: g[0].path, date: toIso(g[0].doc_date), context };
+    return { id: g[0].document_id, path: g[0].path, date: toIso(g[0].doc_date), language: g[0].language || null, context };
   });
   // a document with no date of its own: the middle of the dates its claims state (a weekly report
   // states its week in every figure; a plan or a look back is the odd one out)
-  const undated = docs.filter((d) => !d.date);
+  const undated = opts.claimDates ? docs.filter((d) => !d.date) : [];
   if (undated.length > 0) {
     const stated = await store.query<{ document_id: string; at: string | Date }>(
       // a claim is tied to a document by the evidence of that document's scope (its path is the scope's key)
@@ -674,6 +700,8 @@ async function decidePartedPairs(store: Store): Promise<void> {
 }
 
 async function splitNamesakes(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void): Promise<void> {
+  // what a workspace turns on with review.identity "context": documents dated by their claims, contexts compared by what they are about
+  const wider = config?.review?.identity === 'context';
   const people = await store.query<{ id: string; name: string; docs: number }>(
     `SELECT e.id, e.name, count(DISTINCT m.document_id)::int AS docs
      FROM entities e JOIN entity_mentions m ON m.entity_id = e.id
@@ -687,8 +715,8 @@ async function splitNamesakes(store: Store, config: KnodeConfig | undefined, sta
   const pause = breather();
   for (const p of people) {
     await pause();
-    const { docs, types } = await contextDocs(store, p.id);
-    const split = namesakeClusters(docs, (id) => types.get(id));
+    const { docs, types } = await contextDocs(store, p.id, { claimDates: wider });
+    const split = namesakeClusters(docs, (id) => types.get(id), { characteristic: wider });
     if (!split) continue;
     const [base, other] = split;
     const otherAnchors = await namesOf(store, other.anchors);
@@ -935,11 +963,9 @@ export async function resolveEntityContext(store: Store, opts: { config?: KnodeC
   const stats: EntityContextStats = { merged: 0, suggested: 0, split: 0, replayed: 0 };
   await mergeRenames(store, stats, progress);
   await suggestAliasMerges(store, stats);
-  // review.identity 'name': nothing new is parted; what was parted before stays, and stays decided
-  if (opts.config?.review?.identity !== 'name') {
-    await splitNamesakes(store, opts.config, stats, progress);
-    await splitCoded(store, opts.config, stats, progress);
-  }
+  await splitNamesakes(store, opts.config, stats, progress);
+  // parting an entity by its codes is something a workspace turns on (review.identity "context")
+  if (opts.config?.review?.identity === 'context') await splitCoded(store, opts.config, stats, progress);
   await decidePartedPairs(store);
   return stats;
 }
