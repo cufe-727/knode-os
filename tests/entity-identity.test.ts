@@ -132,6 +132,19 @@ describe('the context of a mention', () => {
     expect(namesakeFor(listed, { codes: codesOf(['T1-C2']), baseCodes: codesOf(['T1-C2']), context: { documentPath: 'raw/docs/w9.md' } })?.id).toBe('d2');
   });
 
+  it('compares roofs as the entities they are, not as strings', () => {
+    // 二部平台组 is also written "Platform 2 team"; Samsung Electronics was merged into 三星
+    const ids: Record<string, string> = { '二部平台组': 'e2', 'platform 2 team': 'e2', '七部平台组': 'e7', '平台组': 'e1', '三星': 's', 'samsung electronics': 's' };
+    const same = (n: string) => ids[n.toLowerCase()] ?? `~${n.toLowerCase()}`;
+    expect(namesakeFor(rules, { codes: codesOf(['日志保留天数']), context: { documentNames: names('Platform 2 team') } })).toBeNull();
+    expect(namesakeFor(rules, { codes: codesOf(['日志保留天数']), context: { documentNames: names('Platform 2 team') } }, same)?.id).toBe('d2');
+    expect(namesakeFor(rules, { codes: codesOf(['日志保留天数']), context: { owners: ['Platform 2 team'], documentNames: names('七部平台组', 'Platform 2 team') } }, same)?.id).toBe('d2');
+    // the base entity's roof under its other spelling is still the base entity's
+    const dram: NamesakeRule[] = [{ id: 'dram-m', base_id: 'dram', name: 'DRAM', label: '美光', anchors: ['美光'], base_anchors: ['三星'] }];
+    expect(namesakeFor(dram, { codes: codesOf(['DRAM']), context: { documentNames: names('美光', 'Samsung Electronics') } })?.id).toBe('dram-m');
+    expect(namesakeFor(dram, { codes: codesOf(['DRAM']), context: { documentNames: names('美光', 'Samsung Electronics') } }, same)).toBeNull();
+  });
+
   it('keeps the base entity\'s own code and roof: a row for the base entity itself', () => {
     const self: NamesakeRule = { id: '日志保留天数', base_id: '日志保留天数', name: '日志保留天数', label: 'D2T1-C2', anchors: ['二部平台组'], base_anchors: ['二部平台组'] };
     const family = [self, rules[1]];
@@ -219,7 +232,7 @@ describe('write-time resolution of a name that may be two things', () => {
     expect((await docsOf(ctx, 'dram')).length).toBe(6);
   });
 
-  it('follows a name refine parted: by code, by its roof, and to the base without context', async () => {
+  it('follows a name refine parted: by code, by the roof under any of its spellings, and to the base without context', async () => {
     const ctx = await build('follow', [
       ['raw/docs/t.md', `---\ntitle: 团队\nentities:\n  - { name: 二部平台组, type: organization, aliases: ["Platform 2 team"] }\n  - { name: 平台组, type: organization }\n  - { name: 连接池上限, type: component, aliases: ["P1-C1", "池上限"] }\n---\n二部平台组（Platform 2 team）与平台组。\n`],
     ]);
@@ -233,8 +246,10 @@ describe('write-time resolution of a name that may be two things', () => {
     const to = async (input: Parameters<typeof resolveEntityId>[1]) => (await resolveEntityId(store, input)).id;
     // its code, wherever it is written
     expect(await to({ name: '连接池上限', aliases: ['P2-C1'], context: { documentNames: doc('平台组') } })).toBe(id);
-    // its roof
+    // its roof, by name and by alias (item: roofs are entities, not strings)
     expect(await to({ name: '连接池上限', context: { documentNames: doc('二部平台组', '连接池上限') } })).toBe(id);
+    expect(await to({ name: '连接池上限', context: { documentNames: doc('Platform 2 team', '连接池上限') } })).toBe(id);
+    expect(await to({ name: '池上限', context: { owners: ['Platform 2 team'], documentNames: doc('平台组', 'Platform 2 team') } })).toBe(id);
     // a document the split gave to it
     expect(await to({ name: '连接池上限', context: { documentPath: 'raw/docs/w7.md', documentNames: doc('连接池上限') } })).toBe(id);
     // the base: its own code, another code under the other roof, both roofs, or nothing to go by

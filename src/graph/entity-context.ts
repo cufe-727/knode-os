@@ -579,7 +579,9 @@ async function contextDocs(store: Store, entityId: string): Promise<{ docs: Name
      SELECT DISTINCT d.document_id, doc.path, doc.doc_date, o.id AS other, o.type AS other_type
      FROM d JOIN documents doc ON doc.id = d.document_id
      LEFT JOIN entity_mentions m ON m.document_id = d.document_id AND m.entity_id <> $1
-     LEFT JOIN entities o ON o.id = m.entity_id AND o.tx_to IS NULL AND o.type = ANY($2::text[])`,
+     LEFT JOIN entities x ON x.id = m.entity_id AND x.tx_to IS NULL
+     -- a co-mention merged into another entity counts as that entity: 三星 and Samsung Electronics are one roof
+     LEFT JOIN entities o ON o.id = coalesce(x.canonical_id, x.id) AND o.id <> $1 AND o.tx_to IS NULL AND o.type = ANY($2::text[])`,
     [entityId, CONTEXT_TYPES],
   );
   const types = new Map<string, string>();

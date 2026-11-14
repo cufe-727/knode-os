@@ -160,7 +160,11 @@ export async function resolveEntityId(
     const rules = family.rules.filter((r) => !refusing?.(r.id));
     const base = landed.id === family.baseId ? landed : (await rowById(q, family.baseId)) ?? landed;
     const context = input.context;
-    const chosen = namesakeFor(rules, { codes, baseCodes: codesOf([base.name]), context });
+    // which entity each roof is: an alias of a team, or a team merged into another, is that team
+    const roofs = [...new Set([...rules.flatMap((r) => [...r.anchors, ...r.base_anchors]), ...(context?.owners ?? []), ...(context?.documentNames ?? [])])];
+    const known = await entitiesNamed(q, roofs);
+    const same = (n: string) => known.get(n)?.id ?? `~${nameKey(n).key}`;
+    const chosen = namesakeFor(rules, { codes, baseCodes: codesOf([base.name]), context }, same);
     if (!chosen) return base.id === landed.id ? asIs : base.id === slug ? { id: slug } : { id: base.id, name: base.name, resolvedFrom: name };
     // a parted entity a person merged back resolves to where it was merged
     const row = await rowById(q, chosen.id);
