@@ -4,6 +4,7 @@ import { mdTable } from '../bench/util.js';
 import { chartBlock } from '../research/chart.js';
 import { bootstrapMean, holm, mean, minimumDetectableEffect, pairedBootstrap, round, sd, wilson } from './metrics/stats.js';
 import { RunStore } from './runstore.js';
+import { judgeItemKey } from './score/keys.js';
 import { SYSTEMS } from './systems/index.js';
 import { toolUse, type ToolUse } from './trace.js';
 import { CORPUS_TASK_TYPES, SEPARATION_TASK_TYPES, type BuildRecord, type ScoreRecord } from './types.js';
@@ -79,6 +80,78 @@ export interface Variance {
   tasks: number;
 }
 
+export interface JudgeAuditSummary {
+  /** Per kind of verdict (grade, list, match, …): verdicts judged twice, and how many of the pairs agreed. */
+  byKind: Record<string, { n: number; agree: number }>;
+  disagreements: {
+    kind: string;
+    id: string;
+    /** The answer it was about, for a grade, list or match of an answer. */
+    pack?: string;
+    system?: string;
+    taskId?: string;
+    repeat?: number;
+    /** The question (a grade) or what was matched, as the judge saw it. */
+    asked: string;
+    first: unknown;
+    second: unknown;
+    /** The judge's reason with each verdict, where its kind gives one. */
+    reasons: [string | null, string | null];
+  }[];
+}
+
+/** The run's judge audit: agreement per kind, and each disagreement with the answer it was about. */
+export function judgeAuditOf(store: RunStore): JudgeAuditSummary | undefined {
+  const recs = store.allJudgeAudits();
+  if (!recs.length) return undefined;
+  const about = new Map<string, ReturnType<RunStore['allAnswers']>[number]>();
+  for (const a of store.allAnswers()) for (const kind of ['grade', 'list', 'match']) about.set(judgeItemKey(kind, a), a);
+  const byKind: JudgeAuditSummary['byKind'] = {};
+  const disagreements: JudgeAuditSummary['disagreements'] = [];
+  const reason = (v: unknown) => (v && typeof v === 'object' && typeof (v as { reason?: unknown }).reason === 'string' ? (v as { reason: string }).reason : null);
+  for (const r of recs) {
+    const k = (byKind[r.kind] ??= { n: 0, agree: 0 });
+    k.n++;
+    if (r.agree) {
+      k.agree++;
+      continue;
+    }
+    const a = about.get(r.id);
+    const item = (r.item ?? {}) as Record<string, unknown>;
+    const asked = typeof item.question === 'string' ? item.question : JSON.stringify(item).slice(0, 300);
+    disagreements.push({
+      kind: r.kind, id: r.id, ...(a ? { pack: a.pack, system: a.system, taskId: a.taskId, ...(a.repeat ? { repeat: a.repeat } : {}) } : {}),
+      asked, first: r.first, second: r.second, reasons: [reason(r.first), reason(r.second)],
+    });
+  }
+  disagreements.sort((x, y) => x.kind.localeCompare(y.kind) || (x.system ?? '').localeCompare(y.system ?? '') || (x.taskId ?? x.id).localeCompare(y.taskId ?? y.id));
+  return { byKind, disagreements };
+}
+
+/** A verdict in a table cell: a grade's score, a match's pairs, else its fields. */
+function verdictText(v: unknown): string {
+  if (!v || typeof v !== 'object') return String(v);
+  const o = v as Record<string, unknown>;
+  if ('score' in o) return `score ${o.score}${o.abstained ? ', abstained' : ''}${o.hallucinated ? ', hallucinated' : ''}`;
+  if ('pairs' in o) return `pairs ${JSON.stringify(o.pairs)}`;
+  return JSON.stringify(Object.fromEntries(Object.entries(o).filter(([k]) => k !== 'id' && k !== 'reason')));
+}
+
+const cellText = (s: string, n = 160) => (s.length > n ? `${s.slice(0, n)}…` : s).replace(/\|/g, '/').replace(/\n/g, ' ');
+
+function judgeAuditLines(a: JudgeAuditSummary | undefined): string[] {
+  if (!a) return [];
+  const out = ['## Judge audit', '', 'A seeded share of the judge\'s verdicts (`--judge-audit`, default 5%, at least 20 a pass) judged a second time, in calls of their own with the items in another order. Scores use the first verdict; this is how often a second look agrees with it.', ''];
+  out.push(mdTable(['kind', 'judged twice', 'agreed', 'agreement'], Object.entries(a.byKind).sort().map(([k, v]) => [k, v.n, v.agree, `${((v.agree / v.n) * 100).toFixed(0)}%`])), '');
+  if (a.disagreements.length) {
+    out.push(`### Disagreements (${a.disagreements.length})`, '');
+    out.push(mdTable(['kind', 'system', 'task', 'asked', 'first verdict', 'reason', 'second verdict', 'reason'], a.disagreements.map((d) => [
+      d.kind, d.system ?? '—', d.taskId ? `${d.taskId}${d.repeat ? ` (repeat ${d.repeat})` : ''}` : d.id, cellText(d.asked), verdictText(d.first), cellText(d.reasons[0] ?? '—', 100), verdictText(d.second), cellText(d.reasons[1] ?? '—', 100),
+    ])), '');
+  }
+  return out;
+}
+
 export interface ReportData {
   run: ReturnType<RunStore['meta']>;
   packs: string[];
@@ -121,6 +194,8 @@ export interface ReportData {
   /** Run-to-run variance where a system answered the same tasks more than once (`eval run --repeat`). */
   variance?: Record<string, Record<string, Variance>>;
   judgeUsage: { calls: number; weightedTokens: number; costUsd: number };
+  /** The judge audit (`--judge-audit`): verdicts judged twice, how often the two agreed, and every disagreement. */
+  judgeAudit?: JudgeAuditSummary;
   /**
    * Where the run's model work ran (docs/design/32): per pool and worker, the
    * model calls and agent sessions it answered (replays from the reply cache
@@ -319,7 +394,7 @@ export function buildReportData(runDir: string): ReportData {
     : 0;
   return {
     run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, tools, builds, breakEven, lists, efficiency, updates, pooled, paired, byType, typesByPack, typeDeltas,
-    separation, costPerCorrect, variance, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 },
+    separation, costPerCorrect, variance, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 }, judgeAudit: judgeAuditOf(store),
     ranAt: ranAtOf(runDir, store.meta()?.work?.pool ?? 'local'),
   };
 }
@@ -580,6 +655,8 @@ export function renderReport(d: ReportData): string {
     const sys = d.pooled.map((c) => c.system);
     lines.push(chartBlock({ type: 'hbar', title: `Correctness difference vs ${BASELINE}`, unit: 'Δ correctness (0–1)', x: sys, series: [{ name: 'Δ correctness', values: d.pooled.map((c) => round(c.diff, 3)) }], source: 'scores.jsonl' }), '');
   }
+
+  lines.push(...judgeAuditLines(d.judgeAudit));
 
   for (const pack of d.packs) {
     lines.push(`## ${pack}`, '');

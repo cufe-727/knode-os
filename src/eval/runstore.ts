@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import type { JudgeAuditRecord } from './judge.js';
 import { AnswerRecord, BuildRecord, ScoreRecord } from './types.js';
 
 /**
@@ -83,6 +84,7 @@ export class RunStore {
   private builds = new Map<string, BuildRecord>();
   private answers = new Map<string, AnswerRecord>();
   private scores = new Map<string, ScoreRecord>();
+  private audits = new Map<string, JudgeAuditRecord>();
 
   constructor(dir: string) {
     this.dir = path.resolve(dir);
@@ -90,6 +92,7 @@ export class RunStore {
     for (const r of this.readAll<BuildRecord>('builds.jsonl')) this.builds.set(r.key, r);
     for (const r of this.readAll<AnswerRecord>('answers.jsonl')) this.answers.set(r.key, r);
     for (const r of this.readAll<ScoreRecord>('scores.jsonl')) this.scores.set(r.key, r);
+    for (const r of this.readAll<JudgeAuditRecord>('judge-audit.jsonl')) this.audits.set(r.key, r);
   }
 
   private readAll<T>(name: string): T[] {
@@ -146,6 +149,18 @@ export class RunStore {
   putScore(rec: ScoreRecord): void {
     this.scores.set(rec.key, rec);
     this.append('scores.jsonl', rec);
+  }
+
+  /** A verdict judged a second time (`--judge-audit`): written again only when it changed. */
+  putJudgeAudit(rec: JudgeAuditRecord): void {
+    const had = this.audits.get(rec.key);
+    if (had && JSON.stringify({ ...had, at: '' }) === JSON.stringify({ ...rec, at: '' })) return;
+    this.audits.set(rec.key, rec);
+    this.append('judge-audit.jsonl', rec);
+  }
+
+  allJudgeAudits(): JudgeAuditRecord[] {
+    return [...this.audits.values()];
   }
 
   allBuilds(): BuildRecord[] {

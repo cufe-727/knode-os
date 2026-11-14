@@ -7,7 +7,7 @@ import { defaultConfig, isCliProvider, KnodeConfig, LlmEffort, loadConfig } from
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { createConfiguredEmbeddingProvider } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
-import { Judge, JUDGE_SYSTEM } from './judge.js';
+import { AUDIT_DEFAULT_SHARE, Judge, JUDGE_SYSTEM, type JudgeAudit } from './judge.js';
 import { ModelChain, parseChain, SpendLedger } from './chain.js';
 import { setAgentRouting, setAgentStopping } from './agent.js';
 import { Meter } from './meter.js';
@@ -156,6 +156,12 @@ export interface RunOptions {
    * `--judge-model` for the judge); a pack with a `private:` source never does.
    */
   remote?: { serveUrl: string; token: string; refreshMs?: number } | null;
+  /**
+   * Share of judge verdicts judged a second time, in a call of their own, for
+   * how often the judge disagrees with itself (default 0.05, at least 20 a
+   * pass; 0: off). Recorded in the run's `judge-audit.jsonl`.
+   */
+  judgeAudit?: number;
   /** Answer each task this many times, for run-to-run variance (default 1: today's keys). */
   repeat?: number;
   /** The systems answered `repeat` times (default: every system that answers). */
@@ -418,6 +424,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     }
     const judge = new Judge({ client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
     const models = { model: opts.model ?? '', buildEffort: opts.buildEffort ?? 'low', answerEffort: opts.answerEffort ?? 'medium' };
+    judge.audit(judgeAuditFor(opts.judgeAudit, seed, store));
 
     if (opts.reuseBuildsFrom) {
       const groups = new Set(makeSystems(opts.systems).map((sys) => sys.group).filter((g) => !opts.rebuild?.includes(g)));
@@ -803,7 +810,7 @@ function where(p: Placed | null): { worker?: string; backend?: string } {
  * its records and the packs it names — with no model of its own running, so
  * only while the run itself is stopped.
  */
-export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
+export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; judgeAudit?: number; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
   const store = new RunStore(runDir);
   const meta = store.meta();
   if (!meta) throw new Error(`not a run directory: ${runDir}`);
@@ -850,11 +857,23 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
       for (const batch of pack.updates) for (const f of listFiles(path.join(pack.dir, 'updates', batch))) docs.add(f);
       corpusDocs.set(pack.manifest.id, docs);
     }
+    judge.audit(judgeAuditFor(opts.judgeAudit, meta!.seed, store));
     const citing = new Set(makeSystems(meta!.systems).filter((s) => s.answers && s.kind !== 'reference' && s.cites !== false).map((s) => s.id));
     // the scoring's own slots start last: anything above that throws leaves none behind
     if (placement.local) remote.startLocal(placement.local);
     return scoreAnswers(store, judge, { tasks, corpusDocs, citing }, opts.onProgress, meter);
   }
+}
+
+/**
+ * `--judge-audit`: the share of the judge's verdicts asked a second time
+ * (default 5%, at least 20 a pass), every pair written to the run's
+ * `judge-audit.jsonl`; 0 turns it off.
+ */
+export function judgeAuditFor(share: number | undefined, seed: string | number, store: RunStore): JudgeAudit | null {
+  const s = share ?? AUDIT_DEFAULT_SHARE;
+  if (!Number.isFinite(s) || s < 0 || s > 1) throw new Error('--judge-audit: a share between 0 and 1');
+  return s > 0 ? { share: s, seed, record: (r) => store.putJudgeAudit(r) } : null;
 }
 
 async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: string, members: SystemUnderTest[], fraction: number, seed: string | number, progress: (m: string) => void, signal?: AbortSignal): Promise<boolean> {

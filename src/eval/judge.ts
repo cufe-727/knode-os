@@ -29,6 +29,62 @@ export interface JudgeOptions {
 
 type Verdicts<T> = Map<string, T>;
 
+/**
+ * The judge audit (docs/design/33 §5): a seeded share of the verdicts of a
+ * pass is asked again, in a call of its own with the items in another order,
+ * and every second verdict is set beside the first. The first is the one
+ * scored; the audit measures how far a verdict can be trusted.
+ */
+export interface JudgeAudit {
+  /** Share of a pass's verdicts asked again (0 turns the audit off). */
+  share: number;
+  /** The run's seed: which verdicts are asked again, and in what order. */
+  seed: string | number;
+  /** At least this many of a pass's verdicts (default 20), or all of them when there are fewer. */
+  min?: number;
+  /** Every audited verdict, agreeing or not. */
+  record: (r: JudgeAuditRecord) => void;
+}
+
+export interface JudgeAuditRecord {
+  key: string;
+  /** grade, list, match, coverage, support, link, same, contradict. */
+  kind: string;
+  /** The item's id (score/keys.ts judgeItemKey for an answer's grade, list or match). */
+  id: string;
+  /** What the judge was shown, as it was shown, long texts cut. */
+  item: unknown;
+  first: unknown;
+  second: unknown;
+  agree: boolean;
+  at: string;
+}
+
+export const AUDIT_DEFAULT_SHARE = 0.05;
+export const AUDIT_MIN_ITEMS = 20;
+
+/** A stable fraction in [0, 1) from what is hashed. */
+function fraction(...parts: unknown[]): number {
+  return crypto.createHash('sha256').update(JSON.stringify(parts)).digest().readUInt32BE(0) / 2 ** 32;
+}
+
+/**
+ * The items of a pass that are judged a second time: each whose seeded hash
+ * falls under `share` — so an item is picked whatever else the pass holds —
+ * then, while fewer than `min` are, the next lowest hashes.
+ */
+export function auditSample<I>(items: I[], share: number, min: number, seed: string | number, keyOf: (item: I) => string): I[] {
+  if (!(share > 0) || !items.length) return [];
+  const ranked = items.map((item) => ({ item, h: fraction('audit', seed, keyOf(item)) })).sort((a, b) => a.h - b.h);
+  const under = ranked.filter((r) => r.h < share).length;
+  return ranked.slice(0, Math.min(items.length, Math.max(under, min))).map((r) => r.item);
+}
+
+/** Pairs as a set: the same pairs in any order are the same verdict. */
+const pairSet = (v: { pairs?: unknown }) => JSON.stringify((Array.isArray(v?.pairs) ? v.pairs : []).map((p) => JSON.stringify(p)).sort());
+/** A long text in an audit record, cut. */
+const cut = (v: unknown): unknown => (typeof v === 'string' ? (v.length > 800 ? `${v.slice(0, 800)}…` : v) : Array.isArray(v) ? v.slice(0, 20).map(cut) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, cut(x)])) : v);
+
 export class Judge {
   private readonly cache = new Map<string, unknown>();
   private readonly batchSize: number;
@@ -51,6 +107,44 @@ export class Judge {
 
   get label(): string {
     return this.opts.client.label;
+  }
+
+  private auditing: JudgeAudit | null = null;
+
+  /** Turn the audit on (a share above 0) or off for every pass after this. */
+  audit(audit: JudgeAudit | null): this {
+    this.auditing = audit && audit.share > 0 ? audit : null;
+    return this;
+  }
+
+  /**
+   * `batch`, then the audit: a sample of the items it gave a verdict is asked
+   * again under the kind `<kind>:audit` — its own cache key and meter stage,
+   * so the second verdict is never the first one replayed — in a seeded order
+   * of its own and under ids of its own, so no request repeats the first.
+   */
+  private async audited<I extends { id: string }, V>(
+    kind: string, system: string, items: I[], render: (item: I) => unknown, verdicts: Verdicts<V>, view: (v: V) => unknown,
+  ): Promise<Verdicts<V>> {
+    const a = this.auditing;
+    if (!a) return verdicts;
+    const judged = items.filter((i) => verdicts.has(i.id));
+    const content = (i: I) => JSON.stringify([kind, system, render(i)]);
+    const sample = auditSample(judged, a.share, a.min ?? AUDIT_MIN_ITEMS, a.seed, content);
+    if (!sample.length) return verdicts;
+    const order = [...sample].sort((x, y) => fraction('audit-order', a.seed, content(x)) - fraction('audit-order', a.seed, content(y)));
+    const again = await this.batch<I, V>(`${kind}:audit`, system, order.map((i) => ({ ...i, id: `${i.id}~audit` })), render);
+    const at = new Date().toISOString();
+    for (const item of sample) {
+      const second = again.get(`${item.id}~audit`);
+      if (second === undefined) continue;
+      const first = verdicts.get(item.id)!;
+      a.record({
+        key: crypto.createHash('sha1').update(JSON.stringify(['judge-audit', content(item)])).digest('hex').slice(0, 20),
+        kind, id: item.id, item: cut(render(item)), first, second, agree: JSON.stringify(view(first)) === JSON.stringify(view(second)), at,
+      });
+    }
+    return verdicts;
   }
 
   private remember(k: string, v: unknown): void {
@@ -125,22 +219,30 @@ export class Judge {
   /* --------------------------------- grading -------------------------------- */
 
   async gradeAnswers(items: GradeItem[]): Promise<Verdicts<GradeVerdict>> {
-    const raw = await this.batch<GradeItem, GradeVerdict>('grade', GRADE_SYSTEM, items, (i) => ({
+    const render = (i: GradeItem) => ({
       question: i.question,
       ...(i.expectAbstain ? { expectAbstain: true } : { reference: i.reference }),
       ...(i.keypoints?.length ? { keypoints: i.keypoints.map((k, n) => `${n}: ${k}`) } : {}),
       answer: i.answer.slice(0, 6000),
-    }));
-    for (const [id, v] of raw) raw.set(id, { ...v, score: clampScore(v.score), keypoints: Array.isArray(v.keypoints) ? v.keypoints.map(Number).filter(Number.isInteger) : [] });
+    });
+    const clamp = (raw: Verdicts<GradeVerdict>) => {
+      for (const [id, v] of raw) raw.set(id, { ...v, score: clampScore(v.score), keypoints: Array.isArray(v.keypoints) ? v.keypoints.map(Number).filter(Number.isInteger) : [] });
+      return raw;
+    };
+    const raw = clamp(await this.batch<GradeItem, GradeVerdict>('grade', GRADE_SYSTEM, items, render));
+    // two grades agree on the score; the second is clamped as the first was
+    await this.audited('grade', GRADE_SYSTEM, items, render, raw, (v) => clampScore(v.score));
     return raw;
   }
 
   async factPresent(items: { id: string; fact: string; units: string[] }[]): Promise<Verdicts<{ present: boolean; unit?: number }>> {
-    return this.batch('coverage', COVERAGE_SYSTEM, items, (i) => ({ fact: i.fact, knowledge: i.units.map((u, n) => `[${n}] ${u.slice(0, 1200)}`) }));
+    const render = (i: (typeof items)[number]) => ({ fact: i.fact, knowledge: i.units.map((u, n) => `[${n}] ${u.slice(0, 1200)}`) });
+    return this.audited('coverage', COVERAGE_SYSTEM, items, render, await this.batch<(typeof items)[number], { present: boolean; unit?: number }>('coverage', COVERAGE_SYSTEM, items, render), (v) => Boolean(v.present));
   }
 
   async claimSupport(items: { id: string; claim: string; sources: string[] }[]): Promise<Verdicts<{ verdict: SupportVerdict }>> {
-    return this.batch('support', SUPPORT_SYSTEM, items, (i) => ({ claim: i.claim, sources: i.sources.map((s, n) => `[${n}] ${s.slice(0, 1500)}`) }));
+    const render = (i: (typeof items)[number]) => ({ claim: i.claim, sources: i.sources.map((s, n) => `[${n}] ${s.slice(0, 1500)}`) });
+    return this.audited('support', SUPPORT_SYSTEM, items, render, await this.batch<(typeof items)[number], { verdict: SupportVerdict }>('support', SUPPORT_SYSTEM, items, render), (v) => v.verdict);
   }
 
   async decompose(items: { id: string; text: string }[]): Promise<Verdicts<{ claims: string[] }>> {
@@ -148,30 +250,35 @@ export class Judge {
   }
 
   async matchItems(items: { id: string; predicted: string[]; gold: string[] }[]): Promise<Verdicts<{ pairs: [number, number][] }>> {
-    return this.batch('match', MATCH_SYSTEM, items, (i) => ({
+    const render = (i: (typeof items)[number]) => ({
       predicted: i.predicted.map((p, n) => `${n}: ${p}`),
       gold: i.gold.map((g, n) => `${n}: ${g}`),
-    }));
+    });
+    return this.audited('match', MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('match', MATCH_SYSTEM, items, render), pairSet);
   }
 
   /** Corpus-level lists (aggregate, timeline, contradiction, profile): a stricter match than themes — same name, number and date. */
   async matchList(items: { id: string; predicted: string[]; gold: string[] }[]): Promise<Verdicts<{ pairs: [number, number][] }>> {
-    return this.batch('list', LIST_MATCH_SYSTEM, items, (i) => ({
+    const render = (i: (typeof items)[number]) => ({
       predicted: i.predicted.map((p, n) => `${n}: ${p.slice(0, 400)}`),
       gold: i.gold.map((g, n) => `${n}: ${g.slice(0, 400)}`),
-    }));
+    });
+    return this.audited('list', LIST_MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('list', LIST_MATCH_SYSTEM, items, render), pairSet);
   }
 
   async linkCorrect(items: { id: string; head: string; relation: string; tail: string; sources: string[] }[]): Promise<Verdicts<{ correct: boolean }>> {
-    return this.batch('link', LINK_SYSTEM, items, (i) => ({ link: `${i.head} —${i.relation}→ ${i.tail}`, sources: i.sources.map((s, n) => `[${n}] ${s.slice(0, 1200)}`) }));
+    const render = (i: (typeof items)[number]) => ({ link: `${i.head} —${i.relation}→ ${i.tail}`, sources: i.sources.map((s, n) => `[${n}] ${s.slice(0, 1200)}`) });
+    return this.audited('link', LINK_SYSTEM, items, render, await this.batch<(typeof items)[number], { correct: boolean }>('link', LINK_SYSTEM, items, render), (v) => Boolean(v.correct));
   }
 
   async samePair(items: { id: string; a: string; b: string }[]): Promise<Verdicts<{ same: boolean }>> {
-    return this.batch('same', SAME_SYSTEM, items, (i) => ({ a: i.a.slice(0, 600), b: i.b.slice(0, 600) }));
+    const render = (i: (typeof items)[number]) => ({ a: i.a.slice(0, 600), b: i.b.slice(0, 600) });
+    return this.audited('same', SAME_SYSTEM, items, render, await this.batch<(typeof items)[number], { same: boolean }>('same', SAME_SYSTEM, items, render), (v) => Boolean(v.same));
   }
 
   async contradicts(items: { id: string; a: string; b: string }[]): Promise<Verdicts<{ contradict: boolean }>> {
-    return this.batch('contradict', CONTRADICT_SYSTEM, items, (i) => ({ a: i.a.slice(0, 800), b: i.b.slice(0, 800) }));
+    const render = (i: (typeof items)[number]) => ({ a: i.a.slice(0, 800), b: i.b.slice(0, 800) });
+    return this.audited('contradict', CONTRADICT_SYSTEM, items, render, await this.batch<(typeof items)[number], { contradict: boolean }>('contradict', CONTRADICT_SYSTEM, items, render), (v) => Boolean(v.contradict));
   }
 }
 
