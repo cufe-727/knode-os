@@ -56,7 +56,7 @@ export interface DedupeStats {
   embedded: number;
   /** Candidates the LLM judge looked at (review.llmJudge). */
   judged: number;
-  /** Pairs of code-like names differing only in their numbers (codesApartByDigits): never candidates, never judged. */
+  /** Pairs of code-like names differing only in their numbers (codesApartByDigits), each once: never candidates, never judged. */
   codesApart: number;
   /** Judged "different" with enough confidence: recorded as rejected, never re-proposed. */
   llmRejected: number;
@@ -104,8 +104,9 @@ const CODE = /^[a-z0-9]+(?:[-_./#:][a-z0-9]+)*$/i;
  * risk or ticket code is its number. The judge was asked about 580 such pairs
  * on the 10× reports benchmark (2026-11-14), 482 of them incident or risk codes
  * of this shape, and merged none. Numbers equal once leading zeros are dropped
- * (INC-012 / INC-12) and names that list the other among their aliases are left
- * to the other signals. Exported for tests.
+ * (INC-012 / INC-12), one number written two ways (COVID-19 / COVID-2019: see
+ * `expanded`) and names that list the other among their aliases are left to the
+ * other signals. Exported for tests.
  */
 export function codesApartByDigits(a: { name: string; aliases?: string[] | null }, b: { name: string; aliases?: string[] | null }): boolean {
   const x = a.name.normalize('NFKC').trim();
@@ -117,8 +118,18 @@ export function codesApartByDigits(a: { name: string; aliases?: string[] | null 
   const nx = numbers(x);
   const ny = numbers(y);
   if (nx.every((n, i) => n === ny[i])) return false;
+  // one number written two ways — a year in two digits and four (COVID-19 / COVID-2019, FY25 /
+  // FY2025, 1H25 / 1H2025, WWDC23 / WWDC2023), or any run of two digits or more with digits put
+  // before it — may be one thing: the judge's
+  if (nx.some((n, i) => n !== ny[i] && expanded(n, ny[i]))) return false;
   const named = (e: { aliases?: string[] | null }, name: string) => (e.aliases ?? []).some((al) => al.normalize('NFKC').trim().toLowerCase() === name.toLowerCase());
   return !named(a, y) && !named(b, x);
+}
+
+/** `x` and `y` are one number with digits put before the shorter (19 → 2019): at least two digits are kept. */
+function expanded(x: string, y: string): boolean {
+  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
+  return short.length >= 2 && long.length > short.length && long.endsWith(short);
 }
 
 export function mergeSuggestionId(a: string, b: string): string {
@@ -150,11 +161,13 @@ export async function auditDuplicateEntities(
   if (focus && focus.size === 0) return stats;
   const inFocus = (a: EntityLite, b: EntityLite) => !focus || focus.has(a.id) || focus.has(b.id);
   const candidates = new Map<string, Candidate>();
+  // the pairs codesApartByDigits settled, once each however many signals brought them up
+  const codesApart = new Set<string>();
   const propose = (a: EntityLite, b: EntityLite, score: number, reason: string) => {
     if (a.id === b.id || !typesCompatible(a.type, b.type) || !inFocus(a, b)) return;
     // two numbers of one code are two things: settled without a candidate, so without a judge call
     if (codesApartByDigits(a, b)) {
-      stats.codesApart++;
+      codesApart.add(mergeSuggestionId(a.id, b.id));
       return;
     }
     const id = mergeSuggestionId(a.id, b.id);
@@ -279,6 +292,7 @@ export async function auditDuplicateEntities(
     }
   }
 
+  stats.codesApart = codesApart.size;
   stats.candidates = candidates.size;
   if (candidates.size === 0) return stats;
 
