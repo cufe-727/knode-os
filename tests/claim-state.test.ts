@@ -10,6 +10,7 @@ import { refreshClaimState, seriesSupersession, StateRow } from '../src/graph/cl
 import { namesakeChoice, namesakeClusters, NamesakeDoc, renameIn, resolveEntityContext } from '../src/graph/entity-context.js';
 import { buildBatchExtractRequest, buildExtractRequest, RawExtractReply } from '../src/graph/llm-extract.js';
 import { enqueueTier1, runTier1Pass } from '../src/graph/tier1.js';
+import { runDocumentPass } from '../src/ingest/background.js';
 import { sync } from '../src/ingest/sync.js';
 import { LlmClient } from '../src/llm/client.js';
 import { normalizeDateExpr } from '../src/store/dates.js';
@@ -369,5 +370,71 @@ describe('a fixture build of weekly reports', () => {
     // the namesakes have a page each
     expect(page('陈伟平台组')).toContain('迁移历史数据');
     expect(page('陈伟')).not.toContain('迁移历史数据');
+  });
+
+  it('leaves one current value per attribute after each update pass, without a refine', async () => {
+    // supersession ran in refine alone: on the 2026-11 separation benchmark a team's weekly metric had five
+    // current values after four update batches. Extraction alone still leaves them so:
+    const control = await build('update-control');
+    opened.push(control.ctx);
+    const currentOf = (ctx: AppContext, subject: string, attributes: string[]) => ctx.store.query<{ value_num: number }>(
+      `SELECT c.value_num FROM claims c JOIN entities e ON e.id = c.subject_id
+       WHERE e.name = $1 AND c.attribute = ANY($2::text[]) AND c.tx_to IS NULL AND c.canonical_id IS NULL AND c.superseded_by IS NULL
+       ORDER BY c.value_num`,
+      [subject, attributes],
+    );
+    expect((await currentOf(control.ctx, '风控引擎', ['完成度', '进度'])).length).toBeGreaterThan(5);
+
+    // the corpus: eight weeks of the payments team; then four update batches, a week each
+    const dataDir = path.join(tmp, 'update');
+    initDataDir(dataDir);
+    const docs = fixture();
+    const file = (k: number) => `raw/docs/周报/支付组/${week(k)}.md`;
+    const CORPUS_WEEKS = 8;
+    for (let k = 0; k < CORPUS_WEEKS; k++) write(dataDir, file(k), docs.get(file(k))!.text);
+    const ctx = await createContext(dataDir);
+    opened.push(ctx);
+    (ctx.config.extraction as { entityLlm?: unknown }).entityLlm = undefined;
+    const judged = { calls: 0, pairs: 0 };
+    (ctx as { llm: LlmClient }).llm = { ...stubExtractor(docs, { n: 0, chars: 0 }), complete: (countingJudge(judged) as unknown as { complete: unknown }).complete } as unknown as LlmClient;
+
+    /** Sync, queue what is new, and run document passes until the queue is empty: what serve does after documents are added. */
+    const ingest = async (): Promise<number> => {
+      await sync(ctx, { llmGraph: false });
+      for (const d of await ctx.store.query<{ id: string }>(`SELECT d.id FROM documents d WHERE d.root = 'docs' AND NOT EXISTS (SELECT 1 FROM claims c JOIN scopes s ON s.id = c.primary_scope_id WHERE s.key = d.path)`)) await enqueueTier1(ctx.store, d.id);
+      let superseded = 0;
+      for (let i = 0; i < 10; i++) {
+        const pass = await runDocumentPass(ctx, { batchSize: 64 });
+        superseded += pass.superseded;
+        if (pass.queued === 0) break;
+      }
+      return superseded;
+    };
+
+    expect(await ingest()).toBeGreaterThan(0);
+    // 完成度 and 进度 are one key of the subject, unified by the pass: one current value, the newest week's
+    expect(await currentOf(ctx, '风控引擎', ['完成度', '进度'])).toEqual([{ value_num: progressOf(CORPUS_WEEKS - 1) }]);
+    expect(await currentOf(ctx, '支付组', ['周活跃用户', '周活跃用户数'])).toEqual([{ value_num: wauOf(CORPUS_WEEKS - 1) }]);
+    expect(await currentOf(ctx, '支付组', ['在岗人数'])).toEqual([{ value_num: 8 }]);
+
+    for (let k = CORPUS_WEEKS; k < PAY_WEEKS; k++) {
+      write(dataDir, file(k), docs.get(file(k))!.text);
+      expect(await ingest(), `update ${k}`).toBeGreaterThan(0);
+      expect(await currentOf(ctx, '风控引擎', ['完成度', '进度']), `update ${k}`).toEqual([{ value_num: progressOf(k) }]);
+      expect(await currentOf(ctx, '支付组', ['周活跃用户', '周活跃用户数']), `update ${k}`).toEqual([{ value_num: wauOf(k) }]);
+      // back to 7 people from week 9 on: the value said again is the current one, 8 is history
+      expect(await currentOf(ctx, '支付组', ['在岗人数']), `update ${k}`).toEqual([{ value_num: headcountOf(k) }]);
+    }
+    // the history is kept: every week's value, all but the newest marked
+    const [series] = await ctx.store.query<{ n: number; superseded: number }>(
+      `SELECT count(*)::int AS n, count(c.superseded_by)::int AS superseded FROM claims c JOIN entities e ON e.id = c.subject_id
+       WHERE e.name = '风控引擎' AND c.attribute IS NOT NULL AND c.tx_to IS NULL AND c.canonical_id IS NULL`,
+    );
+    expect(series).toEqual({ n: PAY_WEEKS, superseded: PAY_WEEKS - 1 });
+    // a subject the updates wrote nothing of keeps its marks: nothing is cleared elsewhere
+    const [others] = await ctx.store.query<{ n: number }>(`SELECT count(*)::int AS n FROM claims c JOIN entities e ON e.id = c.subject_id WHERE e.name = '陈伟' AND c.superseded_by IS NOT NULL`);
+    expect(others.n).toBe(0);
+    // a pass that writes nothing marks nothing
+    expect((await runDocumentPass(ctx, { batchSize: 64 })).superseded).toBe(0);
   });
 });

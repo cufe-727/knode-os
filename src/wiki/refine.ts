@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { KnodeConfig } from '../config.js';
 import { appendLog } from '../fs/datadir.js';
 import { auditDuplicateClaims } from '../graph/claim-dedupe.js';
-import { backfillClaimState, refreshAttributeKeys, supersedeByAttribute } from '../graph/claim-state-store.js';
+import { backfillClaimState, refreshAttributeKeys, seriesSubjects, supersedeByAttribute } from '../graph/claim-state-store.js';
 import { resolveEntityContext } from '../graph/entity-context.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { refreshRecommendations } from '../research/recommend.js';
@@ -184,9 +184,15 @@ export async function refineWiki(
  * System-maintained, not evidence — the old fact stays for history and
  * timelines but stops being quoted as current. Marks whose superseder is gone
  * are cleared.
+ *
+ * With `subjects` (whole merged groups, `seriesSubjects`), only the series of
+ * those subjects: what a document pass runs for the subjects it wrote claims
+ * of (`supersedeForClaims`).
  */
-export async function markSupersededClaims(store: Store): Promise<number> {
-  const byAttribute = await supersedeByAttribute(store);
+export async function markSupersededClaims(store: Store, opts: { subjects?: string[] } = {}): Promise<number> {
+  const { subjects } = opts;
+  if (subjects && subjects.length === 0) return 0;
+  const byAttribute = await supersedeByAttribute(store, { subjects });
   // with a closed type list "same subject and type" is coarse, so only the
   // measure-like types take part (CLAIM_TYPES.supersedes: a later period of
   // earnings, a later holding of the same stock …) and the object is part of
@@ -200,7 +206,7 @@ export async function markSupersededClaims(store: Store): Promise<number> {
               lead(id) OVER w AS newer_id, lead(valid_from) OVER w AS newer_from
        FROM claims
        WHERE tx_to IS NULL AND canonical_id IS NULL AND status = 'fact' AND kind = 'fact' AND valid_from IS NOT NULL
-         AND attribute IS NULL AND type = ANY($1::text[])
+         AND attribute IS NULL AND type = ANY($1::text[])${subjects ? ' AND subject_id = ANY($2::text[])' : ''}
        WINDOW w AS (PARTITION BY subject_id, type, object_id ORDER BY valid_from ASC, tx_from ASC, id ASC)
      ), marks AS (
        UPDATE claims c SET superseded_by = s.newer_id
@@ -211,17 +217,35 @@ export async function markSupersededClaims(store: Store): Promise<number> {
        RETURNING 1
      )
      SELECT count(*)::int AS n FROM marks`,
-    [CLAIM_TYPES.filter((t) => t.supersedes).map((t) => t.id)],
+    [CLAIM_TYPES.filter((t) => t.supersedes).map((t) => t.id), ...(subjects ? [subjects] : [])],
   );
   const [cleared] = await store.query<{ n: number }>(
     `WITH gone AS (
        UPDATE claims c SET superseded_by = NULL
-       WHERE superseded_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM claims n WHERE n.id = c.superseded_by AND n.tx_to IS NULL)
+       WHERE superseded_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM claims n WHERE n.id = c.superseded_by AND n.tx_to IS NULL)${subjects ? ' AND c.subject_id = ANY($1::text[])' : ''}
        RETURNING 1
      )
      SELECT count(*)::int AS n FROM gone`,
+    subjects ? [subjects] : [],
   );
   return byAttribute + marked.n + cleared.n;
+}
+
+/**
+ * What is current among the subjects of `claims`, the claims a document pass
+ * just wrote: those subjects' attribute keys are unified again (a new report
+ * may word an attribute another way: 完成度, 进度), then supersession runs over
+ * their series. Refine did this alone, once a night over every claim, so
+ * between two refines each new report's value stood as current beside the
+ * ones before it: five current values of a team's weekly metric after four
+ * update batches on the 2026-11 separation benchmark.
+ */
+export async function supersedeForClaims(store: Store, claims: string[]): Promise<{ subjects: number; keys: number; superseded: number }> {
+  const subjects = await seriesSubjects(store, claims);
+  if (subjects.length === 0) return { subjects: 0, keys: 0, superseded: 0 };
+  const keys = await refreshAttributeKeys(store, { subjects });
+  const superseded = await markSupersededClaims(store, { subjects });
+  return { subjects: subjects.length, keys: keys.mapped + keys.dropped, superseded };
 }
 
 /** Findings the claim audit files a night; the rest are only counted. */

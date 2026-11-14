@@ -5,6 +5,7 @@ import { runTier1Pass, Tier1Stats } from '../graph/tier1.js';
 import { ensureCorpusPages } from '../wiki/corpus.js';
 import { refreshNavigationIfChanged } from '../wiki/navigation.js';
 import { ensureEntityStubs, ensureSourceSummaries, refreshSummaryClaims } from '../wiki/pages.js';
+import { supersedeForClaims } from '../wiki/refine.js';
 
 /** A tier-1 pass's stats, plus what the resolve and summary steps did. */
 export interface DocumentPassStats extends Tier1Stats {
@@ -12,6 +13,8 @@ export interface DocumentPassStats extends Tier1Stats {
   resolve: DedupeStats | null;
   /** The duplicate-claim audit over the claims this pass wrote; null when it wrote none or the audit failed. */
   claims: ClaimDedupeStats | null;
+  /** Supersession marks changed among the subjects this pass wrote claims of. */
+  superseded: number;
   /** Summary pages written. */
   summaries: string[];
   /** Entity pages created for the entities this pass wrote. */
@@ -48,7 +51,10 @@ const passChains = new Map<string, Promise<unknown>>();
  *    What it produces are merge suggestions, or reversible merges in `auto`;
  *    write-time resolution stays exact.
  * 3. Merge claims — the duplicate-claim audit over the claims that pass
- *    wrote, in `review.claimMerge`'s mode (docs/design/10).
+ *    wrote, in `review.claimMerge`'s mode (docs/design/10). Then
+ *    supersession over the series of the subjects those claims are about
+ *    (src/wiki/refine.ts supersedeForClaims): a new report's value becomes
+ *    the current one now, not at the next refine. No model.
  * 4. Summarize — a summary page for up to `batchSize` documents, the ones
  *    this pass extracted first, on the Summarize stage's route.
  * 5. Entity pages — a page for each entity this pass wrote that claims from
@@ -106,6 +112,18 @@ async function runDocumentPassUnlocked(ctx: AppContext, opts: DocumentPassOption
     }
   }
 
+  // after the merges: a claim merged into another takes no part in a series
+  let superseded = 0;
+  if (extracted.touchedClaims.length > 0) {
+    try {
+      const marks = await supersedeForClaims(ctx.store, extracted.touchedClaims);
+      superseded = marks.superseded;
+      if (superseded) progress(`supersession: ${superseded} marks updated over ${marks.subjects} subjects`);
+    } catch (err) {
+      progress(`supersession failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
   let summaries: string[] = [];
   try {
     summaries = await ensureSourceSummaries(
@@ -151,7 +169,7 @@ async function runDocumentPassUnlocked(ctx: AppContext, opts: DocumentPassOption
     }
   }
 
-  return { ...extracted, resolve, claims, summaries, entityPages, corpusPages };
+  return { ...extracted, resolve, claims, superseded, summaries, entityPages, corpusPages };
 }
 
 /** One log line for a pass, or null when it did nothing worth a line. */
@@ -166,6 +184,7 @@ export function describeDocumentPass(s: DocumentPassStats): string | null {
   if (s.claims && (s.claims.merged || s.claims.suggested || s.claims.conflicts)) {
     parts.push(`claims: ${s.claims.merged} merged, ${s.claims.suggested} suggestions, ${s.claims.conflicts} contradictions`);
   }
+  if (s.superseded) parts.push(`${s.superseded} supersession marks`);
   if (s.summaries.length) parts.push(`${s.summaries.length} summaries`);
   if (s.entityPages.length) parts.push(`${s.entityPages.length} entity pages`);
   if (s.corpusPages?.length) parts.push(`${s.corpusPages.length} cross-document pages`);

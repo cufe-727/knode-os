@@ -83,14 +83,17 @@ export async function backfillClaimState(store: Store, opts: { limit?: number } 
 /**
  * Unify each subject's near-synonym attribute keys (claim-state.ts
  * unifyAttributeKeys) into claim_attribute_keys, which v_claims, supersession,
- * the duplicate audit and the entity page read. Rewritten whole each run:
+ * the duplicate audit and the entity page read. Rewritten whole each run, or
+ * for `subjects` alone (a subject's keys depend on no other subject):
  * returns the mappings added or changed, and those dropped.
  */
-export async function refreshAttributeKeys(store: Store): Promise<{ mapped: number; dropped: number }> {
+export async function refreshAttributeKeys(store: Store, opts: { subjects?: string[] } = {}): Promise<{ mapped: number; dropped: number }> {
+  const only = opts.subjects ? [opts.subjects] : [];
   const uses = await store.query<{ subject_id: string; attribute: string; n: number; units: string[] }>(
     `SELECT subject_id, attribute, count(*)::int AS n, array_agg(DISTINCT COALESCE(unit, '')) AS units
-     FROM claims WHERE tx_to IS NULL AND attribute IS NOT NULL
+     FROM claims WHERE tx_to IS NULL AND attribute IS NOT NULL${opts.subjects ? ' AND subject_id = ANY($1::text[])' : ''}
      GROUP BY subject_id, attribute`,
+    only,
   );
   const desired = new Map<string, { subject: string; attribute: string; canonical: string; reason: string }>();
   for (const [subject, list] of groupBy(uses, (u) => u.subject_id)) {
@@ -99,7 +102,10 @@ export async function refreshAttributeKeys(store: Store): Promise<{ mapped: numb
       desired.set(`${subject}\u0000${attribute}`, { subject, attribute, ...m });
     }
   }
-  const current = await store.query<{ subject_id: string; attribute: string; canonical: string }>(`SELECT subject_id, attribute, canonical FROM claim_attribute_keys`);
+  const current = await store.query<{ subject_id: string; attribute: string; canonical: string }>(
+    `SELECT subject_id, attribute, canonical FROM claim_attribute_keys${opts.subjects ? ' WHERE subject_id = ANY($1::text[])' : ''}`,
+    only,
+  );
   const have = new Map(current.map((r) => [`${r.subject_id}\u0000${r.attribute}`, r.canonical]));
   const stale = current.filter((r) => !desired.has(`${r.subject_id}\u0000${r.attribute}`));
   if (stale.length > 0) {
@@ -177,8 +183,11 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
  * by effective date, and only the newest is current (seriesSupersession).
  * Disputed, absent, opinion and rumour claims take no part. Returns the
  * claims whose mark changed.
+ *
+ * With `subjects`, only their series: a series spans the entities merged
+ * into one, so the list must hold whole merged groups (`seriesSubjects`).
  */
-export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?: number } = {}): Promise<number> {
+export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?: number; subjects?: string[] } = {}): Promise<number> {
   const taking = `c.tx_to IS NULL AND c.canonical_id IS NULL AND c.attribute IS NOT NULL
        AND c.status IN ('fact', 'suspected') AND c.kind IN ('fact', 'prediction')`;
   // a series lies within one canonical subject: whole subjects, a batch at a time (SERIES_CLAIMS_PER_BATCH)
@@ -186,8 +195,9 @@ export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?
     await store.query<{ subject_id: string; subject: string; n: number }>(
       `SELECT c.subject_id, COALESCE(se.canonical_id, c.subject_id) AS subject, count(*)::int AS n
        FROM claims c JOIN entities se ON se.id = c.subject_id
-       WHERE ${taking}
+       WHERE ${taking}${opts.subjects ? ' AND c.subject_id = ANY($1::text[])' : ''}
        GROUP BY 1, 2`,
+      opts.subjects ? [opts.subjects] : [],
     ),
     opts.claimsPerBatch ?? SERIES_CLAIMS_PER_BATCH,
   );
@@ -228,6 +238,26 @@ export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?
     changed += ids.length;
   }
   return changed;
+}
+
+/**
+ * The subjects of `claims`, each with every entity merged with it: the
+ * subjects whose series those claims are part of.
+ */
+export async function seriesSubjects(store: Store, claims: string[]): Promise<string[]> {
+  if (claims.length === 0) return [];
+  const rows = await store.query<{ id: string }>(
+    `WITH canon AS MATERIALIZED (
+       SELECT DISTINCT COALESCE(se.canonical_id, c.subject_id) AS id
+       FROM claims c JOIN entities se ON se.id = c.subject_id
+       WHERE c.id = ANY($1::text[])
+     )
+     SELECT id FROM canon
+     UNION
+     SELECT e.id FROM entities e WHERE e.canonical_id IN (SELECT id FROM canon)`,
+    [claims],
+  );
+  return rows.map((r) => r.id);
 }
 
 /** Refine's claim-state step: read what is unread, unify keys, then mark supersession. */
