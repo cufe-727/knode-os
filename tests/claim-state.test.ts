@@ -15,7 +15,7 @@ import { sync } from '../src/ingest/sync.js';
 import { LlmClient } from '../src/llm/client.js';
 import { normalizeDateExpr } from '../src/store/dates.js';
 import { ensureEntityStubs } from '../src/wiki/pages.js';
-import { markSupersededClaims } from '../src/wiki/refine.js';
+import { markSupersededClaims, supersedeForClaims } from '../src/wiki/refine.js';
 
 /** docs/design/29: claims as current state plus history, the judge pre-filter, namesakes and renames. */
 
@@ -406,10 +406,13 @@ describe('a fixture build of weekly reports', () => {
       for (let i = 0; i < 10; i++) {
         const pass = await runDocumentPass(ctx, { batchSize: 64 });
         superseded += pass.superseded;
+        if (pass.touchedClaims.length > 0) lastWritten = pass.touchedClaims;
         if (pass.queued === 0) break;
       }
       return superseded;
     };
+    /** The claims the last pass that wrote any wrote. */
+    let lastWritten: string[] = [];
 
     expect(await ingest()).toBeGreaterThan(0);
     // 完成度 and 进度 are one key of the subject, unified by the pass: one current value, the newest week's
@@ -434,7 +437,24 @@ describe('a fixture build of weekly reports', () => {
     // a subject the updates wrote nothing of keeps its marks: nothing is cleared elsewhere
     const [others] = await ctx.store.query<{ n: number }>(`SELECT count(*)::int AS n FROM claims c JOIN entities e ON e.id = c.subject_id WHERE e.name = '陈伟' AND c.superseded_by IS NOT NULL`);
     expect(others.n).toBe(0);
-    // a pass that writes nothing marks nothing
-    expect((await runDocumentPass(ctx, { batchSize: 64 })).superseded).toBe(0);
+
+    // run again for the claims the last update wrote, the step changes nothing: no mark, no key — twice over
+    const state = () => ctx.store.query(
+      `SELECT c.id, c.superseded_by, k.canonical FROM claims c LEFT JOIN claim_attribute_keys k ON k.subject_id = c.subject_id AND k.attribute = c.attribute
+       WHERE c.tx_to IS NULL ORDER BY c.id`,
+    );
+    const settled = await state();
+    expect(lastWritten.length).toBeGreaterThan(0);
+    const again = await supersedeForClaims(ctx.store, lastWritten);
+    expect(again.subjects).toBeGreaterThan(0);
+    expect(again).toMatchObject({ keys: 0, superseded: 0 });
+    expect(await supersedeForClaims(ctx.store, lastWritten)).toMatchObject({ keys: 0, superseded: 0 });
+    expect(await state()).toEqual(settled);
+    // and it left nothing for refine's run over every claim to change
+    expect(await markSupersededClaims(ctx.store)).toBe(0);
+    expect(await state()).toEqual(settled);
+    // a pass with nothing in its queue writes no claim and does not run the step at all
+    const idle = await runDocumentPass(ctx, { batchSize: 64 });
+    expect(idle).toMatchObject({ touchedClaims: [], superseded: 0 });
   });
 });
