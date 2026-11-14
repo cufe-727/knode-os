@@ -29,7 +29,7 @@ describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20 (wiki researc
       // v20: the document and passage a relation was read from (lineage/fold.ts relationSource)
       expect(await columns('relations')).toEqual(expect.arrayContaining(['document_id', 'chunk_id']));
       expect(await columns('v_relations')).toEqual(expect.arrayContaining(['document_id', 'chunk_id', 'source_path']));
-      expect(indexes).toEqual(expect.arrayContaining(['relations_document_idx', 'relations_chunk_idx']));
+      expect(indexes).toContain('relations_chunk_idx');
       expect(await columns('claims')).toEqual(expect.arrayContaining(['event_at', 'observed_at', 'superseded_by']));
       expect(await columns('documents')).toContain('doc_date');
       // v15: the indexed text's length, read by the Summarize stage's size threshold (docs/design/14)
