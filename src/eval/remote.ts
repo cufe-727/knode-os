@@ -47,7 +47,17 @@ import type { ChatBackend, ChatRequest, ChatResult } from './shim.js';
  * it. With no slot for a piece, it waits.
  */
 
-export type RemoteOutcome = EvalOutcome | { outcome: 'unreachable'; error: string };
+export type RemoteOutcome = EvalOutcome | { outcome: 'unreachable'; error: string } | { outcome: 'refused'; status: number; error: string };
+
+/** The outcomes this run knows; anything else comes from a `serve` of another version. */
+const KNOWN_OUTCOMES = new Set(['answered', 'error', 'stuck', 'cancelled', 'stopped']);
+
+/** A producer-channel run id (`[A-Za-z0-9][A-Za-z0-9._-]*`, at most 120) for a run directory of any name: itself when it is one. */
+export function queueRunId(name: string): string {
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(name)) return name;
+  const slug = name.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[^A-Za-z0-9]+/, '').slice(0, 100) || 'run';
+  return `${slug}-${crypto.createHash('sha256').update(name).digest('hex').slice(0, 8)}`;
+}
 
 /** A run's own slot as the queue knows it: its name, its CLI, its run, its pool. */
 export interface LocalSlotIdentity {
@@ -171,6 +181,7 @@ export class ServeQueue implements EvalQueue {
     const res = await fetch(`${this.serveUrl}/eval/v1/${route}`, { method: 'POST', headers: this.headers(), body: JSON.stringify(body), signal: signal ?? AbortSignal.timeout(30_000) });
     const text = (await res.text()).trim();
     const parsed = text ? JSON.parse(text) as T & { error?: string } : null;
+    if (res.status >= 400 && res.status < 500 && res.status !== 409) throw new ServeRefusedError(route, res.status, parsed?.error ?? text.slice(0, 200));
     if (!parsed || (!res.ok && res.status !== 409)) throw new Error(`${route}: ${res.status} ${parsed?.error ?? text.slice(0, 200)}`);
     return parsed;
   }
@@ -181,8 +192,16 @@ export class ServeQueue implements EvalQueue {
         method: 'POST', headers: this.headers(), body: JSON.stringify({ spec }), signal,
       });
       const text = (await res.text()).trim();
-      const body = text ? JSON.parse(text) as RemoteOutcome & { error?: string } : null;
+      let body: (RemoteOutcome & { error?: string }) | null = null;
+      try {
+        body = text ? JSON.parse(text) : null;
+      } catch {
+        // not JSON: a proxy's page, a server mid-restart
+      }
+      // a refusal is final (a spec serve will not take, a token it does not know); only a server error or no answer is waited out
+      if (res.status >= 400 && res.status < 500) return { outcome: 'refused', status: res.status, error: body?.error ?? text.slice(0, 300) };
       if (!res.ok || !body || !('outcome' in body)) throw new Error(`${res.status}: ${body?.error ?? text.slice(0, 200)}`);
+      if (!KNOWN_OUTCOMES.has(body.outcome)) return { outcome: 'refused', status: res.status, error: `serve answered "${body.outcome}", which this run does not know: serve on this machine runs another version — restart it on this build` };
       return body;
     } catch (err) {
       if (signal.aborted) return { outcome: 'cancelled' };
@@ -193,7 +212,10 @@ export class ServeQueue implements EvalQueue {
   async status(run: string, first = false): Promise<QueueStatus> {
     const res = await fetch(`${this.serveUrl}/eval/v1/status?run=${encodeURIComponent(run)}`, { headers: this.headers(false), signal: AbortSignal.timeout(first ? 5_000 : 10_000) });
     if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
+    if (res.status >= 400 && res.status < 500) throw new ServeRefusedError('status', res.status, (await res.text()).slice(0, 200));
     const body = await res.json() as Partial<QueueStatus>;
+    // a serve from before docs/design/32 has no slots for a run's own and would withdraw pieces: refuse it plainly
+    if (!body.slots) throw new ServeRefusedError('status', res.status, 'serve on this machine is older than this run (no slots in /eval/v1/status): restart it on this build, or run without --remote');
     return { offered: Boolean(body.offered), slots: { 'eval-call': body.slots?.['eval-call'] ?? [], 'eval-session': body.slots?.['eval-session'] ?? [] }, run: body.run ?? { waiting: 0, leased: 0 } };
   }
 
@@ -202,10 +224,12 @@ export class ServeQueue implements EvalQueue {
     const packed = packFolder(dir);
     const head = await fetch(`${this.serveUrl}/eval/v1/archives/${packed.sha256}`, { method: 'HEAD', headers: this.headers(false), signal });
     if (head.ok) return { sha256: packed.sha256, bytes: packed.bytes };
+    if (head.status !== 404 && head.status >= 400 && head.status < 500) throw new ServeRefusedError('archives', head.status, 'serve refused the archive check');
     const res = await fetch(`${this.serveUrl}/eval/v1/archives/${packed.sha256}`, {
       method: 'PUT', headers: { ...this.headers(false), 'content-type': 'application/gzip' }, body: packed.gzip(), signal,
     });
-    if (!res.ok) throw new Error(`archive upload refused: ${res.status} ${(await res.text()).slice(0, 200)}`);
+    if (res.status >= 400 && res.status < 500) throw new ServeRefusedError('archives', res.status, (await res.text()).slice(0, 200));
+    if (!res.ok) throw new Error(`archive upload failed: ${res.status} ${(await res.text()).slice(0, 200)}`);
     return { sha256: packed.sha256, bytes: packed.bytes };
   }
 
@@ -256,8 +280,10 @@ export interface RemoteEvalOptions {
   /** How often waiting is checked (default 5 s) and logged (default once a minute). */
   checkMs?: number;
   logEveryMs?: number;
-  /** The wait limit passed: the run stops, cleanly. */
-  onStop?: (why: WaitLimitError) => void;
+  /** The wait limit passed, or serve refused the run: the run stops, cleanly. */
+  onStop?: (why: RunStoppedError) => void;
+  /** The first wait before a piece is published again while serve does not answer (default 1 s, doubling to 15 s). */
+  backoffMs?: number;
   /** A piece three different workers could not serve (for the run's events). */
   onStuck?: (piece: StuckPiece) => void;
   log?: (msg: string) => void;
@@ -306,11 +332,23 @@ export class PieceStuckError extends Error {
   }
 }
 
-/** The run waited `--wait-minutes` for a slot that meets a piece's requirements, and stopped. */
-export class WaitLimitError extends Error {
+/** Why a run stopped before its end, cleanly: nothing in flight is recorded, and a resume continues. */
+export abstract class RunStoppedError extends Error {
   /** The run directory to resume (set by the run). */
   runDir?: string;
+  /** Never tried again by the shim or the judge. */
+  readonly final = true;
+}
 
+/** `serve` refused what the run sent (a 4xx): asking again would get the same answer, so the run stops with serve's word. */
+export class ServeRefusedError extends RunStoppedError {
+  constructor(readonly route: string, readonly status: number, readonly reason: string) {
+    super(`serve refused ${route} (${status}): ${reason}`);
+  }
+}
+
+/** The run waited `--wait-minutes` for a slot that meets a piece's requirements, and stopped. */
+export class WaitLimitError extends RunStoppedError {
   constructor(readonly requirement: Requirement, readonly minutes: number) {
     super(`waited ${minutes} min for a slot that takes ${describeRequirement(requirement)}, and none came online: the run stopped, with nothing recorded for the pieces still waiting — start a worker (or pass --local) and resume with --run-dir`);
   }
@@ -388,8 +426,10 @@ export class RemoteEval {
   private readonly unmetSince = new Map<string, number>();
   private waitTimer: NodeJS.Timeout | null = null;
   private lastWaitLog = 0;
-  /** Set when the wait limit stopped the run. */
-  stopped: WaitLimitError | null = null;
+  /** Set when the run stopped: its wait limit passed, or serve refused it. */
+  stopped: RunStoppedError | null = null;
+  /** Whether the queue answered lately (the run's own broker always does). */
+  private reachable = true;
   /** Pieces three different workers could not serve, in the order they stuck. */
   readonly stuck: StuckPiece[] = [];
   /** Pieces published, and who served them, for the run's log. */
@@ -399,6 +439,9 @@ export class RemoteEval {
     this.log = opts.log ?? (() => {});
     this.waitTimer = setInterval(() => this.checkWaiting(), Math.max(50, opts.checkMs ?? 5_000));
     this.waitTimer.unref?.();
+    const refreshMs = queue.where === 'own' ? Math.min(opts.refreshMs ?? 1_000, 1_000) : opts.refreshMs ?? 15_000;
+    this.timer = setInterval(() => void this.refresh(), Math.max(20, refreshMs));
+    this.timer.unref?.();
   }
 
   /** The wait limit, in minutes (0: none). */
@@ -407,27 +450,26 @@ export class RemoteEval {
     return Number.isFinite(n) && n > 0 ? n : 0;
   }
 
-  /** `serve`'s broker on this machine; null (and a log line) when it is not answering. */
+  /** `serve`'s broker on this machine; null (and a log line) when it is not answering; refused when it is another version. */
   static async connect(opts: RemoteEvalOptions & { serveUrl: string; token: string }): Promise<RemoteEval | null> {
     const queue = new ServeQueue(opts.serveUrl, opts.token);
-    const r = new RemoteEval(queue, opts);
+    let status: QueueStatus;
     try {
-      r.status = await queue.status(opts.run, true);
+      status = await queue.status(opts.run, true);
     } catch (err) {
-      r.log(`remote: ${opts.serveUrl} is not answering (${err instanceof Error ? err.message : err})`);
+      if (err instanceof ServeRefusedError) throw err;
+      opts.log?.(`remote: ${opts.serveUrl} is not answering (${err instanceof Error ? err.message : err})`);
       return null;
     }
-    if (!r.status.offered) r.log('remote: serve does not offer evaluation work to remote workers (server.remote.offer.eval is off): only this run\'s own slots will take its pieces');
-    r.timer = setInterval(() => void r.refresh(), Math.max(200, opts.refreshMs ?? 15_000));
-    r.timer.unref?.();
+    const r = new RemoteEval(queue, opts);
+    r.status = status;
+    if (!status.offered) r.log('remote: serve does not offer evaluation work to remote workers (server.remote.offer.eval is off): only this run\'s own slots will take its pieces');
     return r;
   }
 
   /** A broker in the run's own process: only the run's own slots lease from it. */
   static own(opts: RemoteEvalOptions & { source?: EvalSourceOptions }): RemoteEval {
     const r = new RemoteEval(new OwnQueue({ retryMs: 1_000, ...opts.source }), opts);
-    r.timer = setInterval(() => void r.refresh(), Math.max(200, Math.min(opts.refreshMs ?? 1_000, 1_000)));
-    r.timer.unref?.();
     void r.refresh();
     return r;
   }
@@ -459,7 +501,8 @@ export class RemoteEval {
    */
   width(kind: EvalKind, family: EvalFamily, eligible: EvalEligible): number {
     if (this.abort.signal.aborted) return 0;
-    const own = LOCAL_KINDS[family].includes(kind) ? this.local[family] : 0;
+    // the run's own slots lease from the queue: while serve does not answer they can take nothing either
+    const own = LOCAL_KINDS[family].includes(kind) && this.reachable ? this.local[family] : 0;
     const slots = this.queue.slotsNow?.() ?? this.status?.slots;
     const pool = this.pool;
     const others = (slots?.[kind] ?? []).filter((s) => s.family === family && !s.run && (!pool || s.pool === pool) && (eligible === 'any' || s.local));
@@ -499,14 +542,12 @@ export class RemoteEval {
     this.counts.published++;
     const full = { ...spec, run: this.opts.run, key, pool: this.pool } as EvalSpec;
     const requirement: Requirement = { kind: spec.kind, family: spec.agent.family, model: spec.agent.model, eligible: spec.eligible, pool: this.pool };
-    const rk = requirementKey(requirement);
-    const held = this.outstanding.get(rk) ?? { requirement, n: 0 };
-    held.n++;
-    this.outstanding.set(rk, held);
+    const release = this.hold(requirement);
     try {
-      for (let backoff = 1_000; ;) {
+      for (let backoff = this.opts.backoffMs ?? 1_000; ;) {
         this.poke();
         const o = await this.queue.publish(full, this.abort.signal);
+        if (o.outcome !== 'unreachable') this.reachable = true;
         if (entry.done) {
           // one of the run's own slots did it (perhaps before serve went away): its result is the piece's
           this.counts.local++;
@@ -517,7 +558,8 @@ export class RemoteEval {
           // records name the machine, not the slot on it: `<token>/<worker>`
           return { local: false, outcome: { ...o, worker: machineOf(o.worker) } };
         }
-        if (o.outcome === 'cancelled' || o.outcome === 'stopped' || this.abort.signal.aborted) throw new RunCancelledError();
+        if (o.outcome === 'cancelled' || o.outcome === 'stopped' || this.abort.signal.aborted) throw this.stopped ?? new RunCancelledError();
+        if (o.outcome === 'refused') throw this.stop(new ServeRefusedError('the piece', o.status, o.error));
         if (o.outcome === 'unreachable') {
           // one of the run's own slots is doing it: its result is the piece's, and it is not published again for a worker to run too
           if (entry.running) {
@@ -527,8 +569,7 @@ export class RemoteEval {
             return 'error' in done ? { local: true, error: done.error } : { local: true, value: done.value as T };
           }
           // serve went away: the piece waits for it as it would for a slot, and is published again
-          if (!this.unreachableSaid) this.log(`remote: publishing to serve failed (${o.error}): pieces wait and are published again when it answers`);
-          this.unreachableSaid = true;
+          this.unreachable(o.error);
           await sleep(backoff, this.abort.signal);
           backoff = Math.min(15_000, backoff * 2);
           continue;
@@ -547,10 +588,7 @@ export class RemoteEval {
       }
     } finally {
       this.entries.delete(key);
-      if (--held.n <= 0) {
-        this.outstanding.delete(rk);
-        this.unmetSince.delete(rk);
-      }
+      release();
     }
   }
 
@@ -564,9 +602,62 @@ export class RemoteEval {
     await Promise.race([Promise.allSettled(this.loops), sleep(ms)]);
   }
 
-  /** A folder a worker's session reads, as an archive `serve` holds; null on the run's own broker. */
-  archive(dir: string): Promise<{ sha256: string; bytes: number } | null> {
-    return this.queue.archive(dir, this.abort.signal);
+  /**
+   * A folder a worker's session reads, as an archive `serve` holds; null on
+   * the run's own broker. While serve does not answer the upload waits, as a
+   * piece does (and counts as one for the wait limit); a refusal stops the run.
+   */
+  async archive(dir: string, agent: { family: EvalFamily; model: string } = { family: 'codex', model: '' }): Promise<{ sha256: string; bytes: number } | null> {
+    const release = this.hold({ kind: 'eval-session', family: agent.family, model: agent.model, eligible: 'any', pool: this.pool });
+    try {
+      for (let backoff = this.opts.backoffMs ?? 1_000; ;) {
+        if (this.abort.signal.aborted) throw this.stopped ?? new RunCancelledError();
+        try {
+          const a = await this.queue.archive(dir, this.abort.signal);
+          this.reachable = true;
+          return a;
+        } catch (err) {
+          if (this.abort.signal.aborted) throw this.stopped ?? new RunCancelledError();
+          if (err instanceof ServeRefusedError) throw this.stop(err);
+          this.unreachable(err instanceof Error ? err.message : String(err));
+          await sleep(backoff, this.abort.signal);
+          backoff = Math.min(15_000, backoff * 2);
+        }
+      }
+    } finally {
+      release();
+    }
+  }
+
+  /** Stop the run cleanly (once): pieces are withdrawn, nothing in flight is recorded. Returns the error to throw. */
+  stop(why: RunStoppedError): RunStoppedError {
+    if (this.stopped) return this.stopped;
+    this.stopped = why;
+    this.log(why.message);
+    this.opts.onStop?.(why);
+    void this.cancel();
+    return why;
+  }
+
+  private unreachable(error: string): void {
+    if (this.queue.where !== 'serve') return;
+    this.reachable = false;
+    if (!this.unreachableSaid) this.log(`remote: serve is not answering (${error}): pieces wait and are published again when it answers`);
+    this.unreachableSaid = true;
+  }
+
+  /** Count a requirement as waiting, for the wait limit, until the returned function is called. */
+  private hold(requirement: Requirement): () => void {
+    const rk = requirementKey(requirement);
+    const held = this.outstanding.get(rk) ?? { requirement, n: 0 };
+    held.n++;
+    this.outstanding.set(rk, held);
+    return () => {
+      if (--held.n <= 0) {
+        this.outstanding.delete(rk);
+        this.unmetSince.delete(rk);
+      }
+    };
   }
 
   /**
@@ -597,9 +688,12 @@ export class RemoteEval {
   private async refresh(): Promise<void> {
     try {
       this.status = await this.queue.status(this.opts.run);
-    } catch {
-      // serve is not answering: nothing is known to be online but the run's own slots
+      this.reachable = true;
+      this.unreachableSaid = false;
+    } catch (err) {
+      // serve is not answering: nothing is online, the run's own slots included (they lease from it)
       if (this.status) this.status = { ...this.status, slots: { 'eval-call': [], 'eval-session': [] } };
+      this.unreachable(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -630,10 +724,7 @@ export class RemoteEval {
     const limitMs = this.waitMinutes * 60_000;
     const over = limitMs ? unmet.find((u) => now - u.since >= limitMs) : undefined;
     if (!over) return;
-    this.stopped = new WaitLimitError(over.requirement, this.waitMinutes);
-    this.log(this.stopped.message);
-    this.opts.onStop?.(this.stopped);
-    void this.cancel();
+    this.stop(new WaitLimitError(over.requirement, this.waitMinutes));
   }
 
   /** Wake the run's own slots: a piece was published. */
@@ -658,7 +749,11 @@ export class RemoteEval {
       let task: WorkTask | undefined;
       try {
         task = (await this.queue.lease(who, kinds))[0];
-      } catch {
+      } catch (err) {
+        if (err instanceof ServeRefusedError) {
+          this.stop(err);
+          break;
+        }
         await this.idle(2_000);
         continue;
       }
@@ -822,7 +917,7 @@ export async function publishAgent(scope: PackScope, opts: AgentRunOptions, here
   let mcp: EvalSessionSpec['mcp'] = null;
   if (eligible === 'any') {
     const hasFiles = fs.existsSync(opts.cwd) && fs.readdirSync(opts.cwd).length > 0;
-    archive = hasFiles ? await remote.archive(opts.cwd) : null;
+    archive = hasFiles ? await remote.archive(opts.cwd, { family: 'codex', model: opts.model ?? '' }) : null;
     mcp = opts.mcp && 'url' in opts.mcp ? { url: opts.mcp.url, secret: opts.mcp.token, tools: [...(opts.mcp.enabledTools ?? [])] } : null;
   }
   const p = await remote.publish({

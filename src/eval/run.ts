@@ -22,7 +22,7 @@ import { scoreLists } from './score/lists.js';
 import { scoreKey, scoreUsage } from './score/usage.js';
 import { ChatBackend, ChatRequest, ClientBackend, CodexBackend, shimState, startShim } from './shim.js';
 import { currentRemote, withPieceTag, withRemote } from './placement.js';
-import { judgeAgent, judgeFamily, PackScope, packMayLeave, PieceStuckError, PublishedChatBackend, RemoteEval, remoteJudgeClient, RunCancelledError } from './remote.js';
+import { judgeAgent, judgeFamily, queueRunId, PackScope, packMayLeave, PieceStuckError, PublishedChatBackend, RemoteEval, remoteJudgeClient, RunCancelledError } from './remote.js';
 import type { EvalFamily } from '../work/eval.js';
 import type { Placed } from './meter.js';
 import { closeAdapters } from './systems/external.js';
@@ -359,7 +359,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     ?? (opts.judgeChain ? chain(opts.judgeChain).asClient()
       : new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 }));
   // the run only publishes (docs/design/32): to serve's broker on this machine, or one of its own
-  const runId = path.basename(runDir);
+  // the queue's id for the run: the directory's name, made one a queue carries when it is not
+  const runId = queueRunId(path.basename(runDir));
   const queueLog = chainLog;
   const placement = runPlacement(opts, judgeFamily(opts.judgeProvider ?? 'claude-cli'));
   if (placement.legacy) queueLog(`work: no --remote and no --local: this run's model work runs on this machine, on --local ${describeLocal(placement.local!)} (sized from --slots)`);
@@ -671,7 +672,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     // a run the wait limit stopped says so, whatever stopped first on the way out
     if (remote.stopped) {
       remote.stopped.runDir = runDir;
-      store.log('stopped: waited for a slot', { requirement: remote.stopped.requirement, minutes: remote.stopped.minutes });
+      store.log('stopped', { reason: remote.stopped.message.slice(0, 500) });
     }
     throw remote.stopped ?? err;
   } finally {
@@ -815,7 +816,7 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
   const log = (m: string) => opts.onProgress?.(m);
   const placement = runPlacement(opts, family);
   if (placement.legacy) log(`work: no --remote and no --local: the judge runs on this machine, on --local ${describeLocal(placement.local!)} (sized from --slots)`);
-  const run = `${meta.id}-score`;
+  const run = queueRunId(`${meta.id}-score`);
   const waiting = { pool: opts.pool, waitMinutes: opts.waitMinutes ?? 30, checkMs: opts.waitCheckMs, logEveryMs: opts.waitCheckMs ? opts.waitCheckMs * 12 : undefined };
   let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run, quota, log, ...waiting }) : null;
   if (opts.remote && !remote) log(`work: serve is not answering: scoring publishes to a broker of its own${placement.local ? '' : ', and with no --local nothing takes its calls'}`);

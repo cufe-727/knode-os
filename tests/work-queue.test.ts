@@ -1,11 +1,12 @@
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { runAgentHere, setAgentStopping } from '../src/eval/agent.js';
-import { OwnQueue, PieceStuckError, RemoteEval, RunCancelledError, WaitLimitError } from '../src/eval/remote.js';
+import { OwnQueue, PieceStuckError, queueRunId, RemoteEval, RunCancelledError, ServeRefusedError, WaitLimitError } from '../src/eval/remote.js';
 import { retryableFailure } from '../src/eval/shim.js';
 import { eachWithin, runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
@@ -458,6 +459,80 @@ describe('a run\'s own slots', () => {
     expect(await p).toEqual({ local: true, value: 'ok' });
     clearInterval(timer);
     expect(leasedWhileWaiting).toEqual([]);
+    remote.close();
+  });
+});
+
+describe('serve as the run sees it', () => {
+  /** A stand-in serve: /status as `status` says, /offer answered with `offer`'s status and body. */
+  const standIn = async (opts: { status?: unknown; offer?: [number, unknown] }) => {
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        if (req.url?.startsWith('/eval/v1/status')) {
+          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(opts.status ?? { offered: true, slots: { 'eval-call': [], 'eval-session': [] }, run: { waiting: 0, leased: 0 } }));
+        } else if (req.url === '/eval/v1/offer') {
+          const [code, body] = opts.offer ?? [200, { outcome: 'cancelled' }];
+          res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify(body));
+        } else res.writeHead(404).end('{}');
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const url = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
+    return { url, close: () => new Promise<void>((r) => server.close(() => r())) };
+  };
+
+  it('stops the run on a refusal from serve (a 4xx), with serve\'s message, instead of publishing again for ever', async () => {
+    const serve = await standIn({ offer: [400, { error: 'spec.run must be a run id' }] });
+    const remote = (await RemoteEval.connect({ serveUrl: serve.url, token: 't', run: 'refused' }))!;
+    const err = await Promise.race([remote.publish(callSpec(), async () => 'x').catch((e) => e), sleep(5_000).then(() => 'still publishing')]);
+    expect(err).toBeInstanceOf(ServeRefusedError);
+    expect(String(err.message)).toMatch(/serve refused .*400.*spec\.run must be a run id/);
+    expect(remote.stopped).toBe(err);
+    remote.close();
+    await serve.close();
+  });
+
+  it('refuses to publish to a serve older than this run', async () => {
+    const serve = await standIn({ status: { offered: true, offerSeconds: 30, online: { 'eval-call': { codex: 0, claude: 0 }, 'eval-session': { codex: 0, claude: 0 } } } });
+    await expect(RemoteEval.connect({ serveUrl: serve.url, token: 't', run: 'old' })).rejects.toThrow(/serve on this machine is older than this run/);
+    await serve.close();
+  });
+
+  it('gives a run directory any name a queue can carry', () => {
+    for (const name of ['2026-11-14-10-00-00', '我的 run', 'a b/c', '.hidden', '-x']) expect(queueRunId(name)).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/);
+    expect(queueRunId('2026-11-14-10-00-00')).toBe('2026-11-14-10-00-00');
+    expect(queueRunId('我的 run')).not.toBe(queueRunId('你的 run'));
+  });
+
+  /** A queue on a serve that has gone away. */
+  const deadServe = (archive?: () => Promise<{ sha256: string; bytes: number } | null>) => ({
+    where: 'serve', origin: 'http://127.0.0.1:9',
+    publish: async () => (await sleep(20), { outcome: 'unreachable', error: 'fetch failed' }),
+    status: async () => { throw new Error('fetch failed'); },
+    archive: archive ?? (async () => { throw new Error('fetch failed'); }),
+    lease: async () => { throw new Error('fetch failed'); },
+    complete: async () => {}, renew: async () => {}, release: async () => {}, cancelRun: async () => {}, close: () => {},
+  });
+  const Ctor = RemoteEval as unknown as new (q: unknown, o: unknown) => RemoteEval;
+
+  it('trips the wait limit while serve is gone, even with slots of its own that cannot lease from it', async () => {
+    const remote = new Ctor(deadServe(), { run: 'outage', waitMinutes: 0.01, checkMs: 20, refreshMs: 50, backoffMs: 20 });
+    remote.startLocal({ codex: 2 });
+    const err = await Promise.race([remote.publish(callSpec(), async () => 'x').catch((e) => e), sleep(5_000).then(() => 'still waiting')]);
+    expect(remote.stopped).toBeInstanceOf(WaitLimitError);
+    expect(err).toBe(remote.stopped);
+    remote.close();
+  });
+
+  it('waits to upload a session\'s folder while serve is gone, as a piece waits, instead of failing the answer', async () => {
+    let tries = 0;
+    const remote = new Ctor(deadServe(async () => {
+      if (++tries < 3) throw new Error('fetch failed');
+      return { sha256: 'a'.repeat(64), bytes: 1 };
+    }), { run: 'upload', backoffMs: 20 });
+    expect(await remote.archive(tmp)).toEqual({ sha256: 'a'.repeat(64), bytes: 1 });
+    expect(tries).toBe(3);
     remote.close();
   });
 });

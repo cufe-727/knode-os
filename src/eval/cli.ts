@@ -19,7 +19,7 @@ import { EXTERNAL_SYSTEMS, externalPacks, venvPython } from './systems/external.
 import { Suite, SUITES, TASK_TYPES, TaskType } from './types.js';
 import { loadConfig, resolveDataDir } from '../config.js';
 import { ModelChain, parseChain, SpendLedger } from './chain.js';
-import { localServe, WaitLimitError } from './remote.js';
+import { localServe, RunStoppedError } from './remote.js';
 
 /** The author model: a budgeted chain over a workspace's connections, or one CLI (docs/design/23 D18). */
 function authorClient(opts: { author: string | false; authorModel?: string; authorChain?: string; configFrom?: string }, guard: QuotaGuard): LlmClient | undefined {
@@ -88,7 +88,7 @@ async function waitedOut(run: typeof runEval, opts: Parameters<typeof runEval>[0
   try {
     return await run(opts);
   } catch (err) {
-    if (!(err instanceof WaitLimitError)) throw err;
+    if (!(err instanceof RunStoppedError)) throw err;
     const report = err.runDir ? writeReport(err.runDir) : null;
     console.error(`\n${err.message}${report ? `\nreport so far: ${report.md}` : ''}`);
     process.exit(1);
@@ -334,7 +334,7 @@ export function registerEvalCommands(program: Command): void {
       try {
         n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts), pool: poolOption(opts) });
       } catch (err) {
-        if (!(err instanceof WaitLimitError)) throw err;
+        if (!(err instanceof RunStoppedError)) throw err;
         console.error(`\n${err.message}`);
         process.exit(1);
       }
