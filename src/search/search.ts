@@ -82,40 +82,64 @@ interface RankedChunk {
  * The part of a search's results that chunks of generated pages may take:
  * a quarter, 2 of the 8 chunks an answer is written from.
  *
- * A generated page (`isGeneratedSql`: an entity page, a mentions page, a
- * timeline, a navigation list) restates what sources say, and a knowledge
+ * A generated page (`isGeneratedSql`: an entity page, a timeline, a
+ * disagreements page, a summary) restates what sources say, and a knowledge
  * base grows several chunks of them per source document. Ranked as one list
  * they take the places: on the 2026-11 separation benchmark's 10× index (8,016
- * chunks: 1,540 of source documents, 6,469 of wiki pages) the top 8 held 14%
+ * chunks: 1,540 of source documents, 6,476 of wiki pages) the top 8 held 14%
  * source chunks, none at all for 156 of 297 questions, and the keyword
- * channel's candidates were pages before any source. So every recall channel
- * lists its best chunks of sources and of generated pages separately, ranks
- * the two lists together by its own score, and the cut gives pages this
- * share. Replayed on a copy of that index (the 297 questions the run asked
- * that have gold documents; questions with a gold source document in the top
- * 5 / top 8 of a search for 8):
+ * channel's candidates were pages before any source. The rule, in three parts:
  *
- *   one list (before)       16 /  29
- *   separate lists, 1       48 /  63    sources reach the candidates, pages still take the places
- *   0.5                     67 /  96
- *   0.375                   77 / 102
- *   0.25                    87 / 104
- *   0.125                   94 / 106
- *   0                      101 / 108
+ * 1. Lists of where to look are not answers. A mentions page and a
+ *    navigation list (`isListingSql`) are not searched at all unless the
+ *    search asks for the wiki's pages (`wantsListings`): before, they took
+ *    263 of the 549 places pages had in those 297 searches.
+ * 2. Every recall channel lists its best chunks of sources and of generated
+ *    pages separately, ranks the two lists together by its own score, and
+ *    the cut gives pages this share of the places (`cutWithSources`); the
+ *    reranker's candidates and a walk's routes are chosen the same way.
+ * 3. A page that is the best candidate of all keeps one place where the
+ *    share rounds to none (`generatedPlaces`): a search for one result
+ *    returns the entity page of the name asked about, not the best source
+ *    behind it. Of the 297 questions' searches for one result, 181 return a
+ *    page (152 an entity page), 116 a source.
  *
- * A quarter reaches 104 of the 108 questions sources alone would, and keeps
+ * Replayed on a copy of that index (scripts/replay-retrieval.mts: the 297
+ * questions the run asked that have gold documents; questions with a gold
+ * source document in the top 5 / top 8 of a search for 8), with part 1 in
+ * place:
+ *
+ *   one list (main)         16 /  29
+ *   separate lists, 1       74 /  91    sources reach the candidates, pages still take places
+ *   0.5                     79 /  98
+ *   0.375                   84 /  99
+ *   0.25                    93 / 102
+ *   0.125                   95 / 108
+ *   0                       97 / 113
+ *
+ * A quarter reaches 102 of the 113 questions sources alone would, and keeps
  * the two best pages in an answer's context: an entity page is where the
  * claims about a name are gathered, and what an agent navigates by. Pages
- * rank where the channels put them, so the first results may be pages (top 5:
- * 87, against 101 without them). A search that asks for pages
- * (`kinds: ['view']`), or finds fewer sources than it has places, is filled
- * with pages as before; an index without generated pages ranks as before.
+ * rank where the channels put them, so the first results may be pages. A
+ * search that asks for pages (`kinds: ['view']`), or finds fewer sources than
+ * it has places, is filled with pages as before; an index without generated
+ * pages ranks as before.
+ *
+ * A constant, not a setting: the share is a property of how pages restate
+ * sources, measured here, not a taste a workspace has. `generatedShare` in
+ * `SearchOptions` exists to measure it.
  */
 export const GENERATED_SHARE = 0.25;
 
-/** How many of `k` results generated pages may take at `share`. */
-export function generatedPlaces(k: number, share: number): number {
-  return Math.min(k, Math.max(0, Math.round(k * Math.min(1, Math.max(0, share)))));
+/**
+ * How many of `k` results generated pages may take at `share`: the share of
+ * `k`, rounded, and one at least when the best candidate of all is a page
+ * (`topIsPage`) — the page a question about a name is answered from keeps its
+ * place in a search for one or two results, where the share rounds to none.
+ */
+export function generatedPlaces(k: number, share: number, topIsPage = false): number {
+  const places = Math.round(k * Math.min(1, Math.max(0, share)));
+  return Math.min(k, Math.max(0, places, topIsPage && share > 0 ? 1 : 0));
 }
 
 /**
@@ -126,6 +150,19 @@ export function generatedPlaces(k: number, share: number): number {
  * person or an agent wrote is a source.
  */
 const isGeneratedSql = (alias: string) => `(${alias}.kind = 'view' OR (${alias}.root = 'wiki' AND ${alias}.path ~ '(^|/)(index|log)[.]md$'))`;
+
+/**
+ * SQL: the document at `alias` is a list of where to look, not something to
+ * answer from — a mentions page (wiki/mentions/<entity>.md: the documents
+ * that name an entity, a line each) or a navigation list (index.md, log.md).
+ */
+const isListingSql = (alias: string) => `(${alias}.root = 'wiki' AND (${alias}.path LIKE 'wiki/mentions/%' OR ${alias}.path ~ '(^|/)(index|log)[.]md$'))`;
+
+/** True when a search asked for the wiki's own pages: kind `view` or `wiki`, or a source prefix inside wiki/. */
+export function wantsListings(filter: ResolvedScopeFilter): boolean {
+  if (filter.kinds?.some((kind) => kind === 'view' || kind === 'wiki')) return true;
+  return Boolean(filter.sources?.some((s) => s === 'wiki' || s.startsWith('wiki/')));
+}
 
 /** The best `k` of the sources and the best `k` of the generated pages in `ranked`, in its order. */
 function bestOfEachSide(ranked: RankedChunk[], k: number): RankedChunk[] {
@@ -266,6 +303,9 @@ export function docLiveAt(alias: string, p: Params, asOf?: TimeInput, filter: Re
   // a repository is thousands of chunks of code: it answers when asked for (kind
   // `code`, or a source under raw/codebase), never by outnumbering the prose
   if (!wantsCode(filter)) parts.push(`${alias}.root <> 'codebase'`);
+  // nor do the wiki's lists of where to look (mentions pages, navigation lists): they are found
+  // by a search that asks for the wiki's pages, and browsed otherwise
+  if (!wantsListings(filter)) parts.push(`NOT ${isListingSql(alias)}`);
   return parts.join(' AND ');
 }
 
@@ -1069,8 +1109,7 @@ async function finish(
   generated?: Set<string>,
 ): Promise<SearchResult[]> {
   const share = opts.generatedShare ?? GENERATED_SHARE;
-  const places = generatedPlaces(k, share);
-  const known = places >= k || ranked.length === 0 ? null : generated ?? (await generatedAmong(store, ranked).catch(() => null));
+  const known = generatedPlaces(k, share) >= k || ranked.length === 0 ? null : generated ?? (await generatedAmong(store, ranked).catch(() => null));
   const pages = known && known.size > 0 ? known : null;
   const isPage = (r: SearchResult) => pages!.has(r.chunkId);
   let ordered = ranked;
@@ -1085,7 +1124,7 @@ async function finish(
     channels.rerank = { hits: r.sent, ms: r.ms, ...(r.error ? { error: r.error } : {}) };
     ordered = r.results;
   }
-  const results = pages ? cutWithSources(ordered, k, places, isPage) : ordered.slice(0, k);
+  const results = pages ? cutWithSources(ordered, k, generatedPlaces(k, share, isPage(ordered[0])), isPage) : ordered.slice(0, k);
   if (opts.current === false || results.length === 0) return results;
   try {
     return await attachCurrent(store, results);

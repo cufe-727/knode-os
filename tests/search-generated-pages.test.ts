@@ -41,6 +41,8 @@ let store: Store;
 
 const SOURCES = Array.from({ length: 8 }, (_, i) => `s${i + 1}`);
 const PAGES = Array.from({ length: 30 }, (_, i) => `p${String(i + 1).padStart(2, '0')}`);
+/** Lists of where to look: a navigation list and a mentions page. */
+const LISTINGS = ['nav', 'mentions'];
 
 /** One document of one chunk; `lean` is how far its vector leans away from the question's. */
 async function addChunk(id: string, file: string, root: string, kind: 'source' | 'view', content: string, lean: number): Promise<void> {
@@ -59,14 +61,14 @@ async function addChunk(id: string, file: string, root: string, kind: 'source' |
 const QUESTION = 'Halcyon availability';
 
 const sidesOf = (ids: string[]) => ({
-  sources: ids.filter((id) => !PAGES.includes(id) && id !== 'nav'),
-  pages: ids.filter((id) => PAGES.includes(id) || id === 'nav'),
+  sources: ids.filter((id) => !PAGES.includes(id) && !LISTINGS.includes(id)),
+  pages: ids.filter((id) => PAGES.includes(id) || LISTINGS.includes(id)),
 });
 
-async function ids(mode: SearchMode, opts: { k?: number; generatedShare?: number; kinds?: string[]; query?: string } = {}): Promise<string[]> {
+async function ids(mode: SearchMode, opts: { k?: number; generatedShare?: number; kinds?: string[]; sources?: string[]; query?: string } = {}): Promise<string[]> {
   const results = await search(store, embedder, opts.query ?? QUESTION, {
     k: opts.k ?? 8, mode, track: false, current: false, generatedShare: opts.generatedShare,
-    filter: opts.kinds ? resolveScopeFilter({ kinds: opts.kinds }) : undefined,
+    filter: opts.kinds || opts.sources ? resolveScopeFilter({ kinds: opts.kinds, sources: opts.sources }) : undefined,
   });
   return results.map((r) => r.chunkId);
 }
@@ -81,12 +83,14 @@ beforeAll(async () => {
   for (const [i, id] of PAGES.entries()) {
     await addChunk(id, `wiki/entities/${id}.md`, 'wiki', 'view', `Halcyon availability. Halcyon availability, Halcyon availability: what the sources say of Halcyon, page ${i + 1}.`, 0.01 + i / 1000);
   }
-  // a navigation list: filed as a source the graph does not read, generated all the same
+  // lists of where to look, nearest the question and repeating its words: a navigation list (filed as a
+  // source the graph does not read, generated all the same) and the page of where Halcyon is mentioned
   await addChunk('nav', 'wiki/entities/index.md', 'wiki', 'source', 'Halcyon availability Halcyon availability Halcyon availability: entity pages A to Z.', 0.001);
+  await addChunk('mentions', 'wiki/mentions/halcyon.md', 'wiki', 'view', 'Halcyon availability Halcyon availability Halcyon availability: 8 documents name Halcyon.', 0.002);
   // a page a person wrote in the wiki is a source
   await addChunk('note', 'wiki/notes/halcyon-review.md', 'wiki', 'source', 'My review of the quarter: Halcyon availability held above target.', 0.6);
   // names only the pages hold
-  await addChunk('p-only', 'wiki/mentions/zephyr.md', 'wiki', 'view', 'Zephyrine is mentioned in two documents.', 0.9);
+  await addChunk('p-only', 'wiki/timelines/zephyr.md', 'wiki', 'view', 'Zephyrine: what happened, by month.', 0.9);
   PAGES.push('p-only');
 });
 
@@ -114,9 +118,23 @@ describe('generated pages in search results', () => {
       // the pages are the ones the channels rank best, where the channels rank them: first
       expect(found.slice(0, 2), mode).toEqual(pages);
     }
-    // the navigation list is nearest the question and repeats its words: it is a page, and takes a page's place
-    expect(await ids('vector')).toContain('nav');
-    expect((await ids('vector')).slice(0, 2)).toEqual(['nav', 'p01']);
+    // the two pages are entity pages: the lists nearer the question take no place
+    expect((await ids('vector')).slice(0, 2)).toEqual(['p01', 'p02']);
+  });
+
+  it('does not answer from lists of where to look, unless the search asks for the wiki\'s pages', async () => {
+    for (const mode of ['hybrid', 'vector', 'keyword', 'sag'] as const) {
+      const found = await ids(mode, { k: 20 });
+      expect(found.filter((id) => LISTINGS.includes(id)), mode).toEqual([]);
+      // not even to fill the places the sources leave
+      expect(sidesOf(found).sources, mode).toHaveLength(9);
+      expect(found, mode).toHaveLength(20);
+    }
+    // asked for generated pages, the mentions page is one; asked for a folder of the wiki, its lists are in it
+    expect((await ids('vector', { kinds: ['view'] })).slice(0, 2)).toEqual(['mentions', 'p01']);
+    expect(await ids('vector', { sources: ['wiki/mentions'] })).toEqual(['mentions']);
+    expect((await ids('vector', { sources: ['wiki/entities'] }))[0]).toBe('nav');
+    expect((await ids('keyword', { kinds: ['wiki'] }))).toContain('nav');
   });
 
   it('counts a page a person wrote in the wiki as a source', async () => {
@@ -167,9 +185,13 @@ describe('generated pages in search results', () => {
     expect(sidesOf(await ids('sag', { kinds: ['view'] })).sources).toEqual([]);
   });
 
-  it('holds a search for one result to a source', async () => {
-    expect(sidesOf(await ids('hybrid', { k: 1 })).sources).toHaveLength(1);
+  it('keeps a place for the page that is the best candidate of all, in a search for one result too', async () => {
+    // every channel puts the entity page first: a quarter of one place rounds to none, and the page keeps it
+    for (const mode of ['hybrid', 'vector', 'keyword', 'sag'] as const) expect(await ids(mode, { k: 1 }), mode).toEqual(['p01']);
     expect(sidesOf(await ids('hybrid', { k: 4 })).pages).toHaveLength(1);
+    // where a source is the best candidate, a search for one result is that source
+    expect(await ids('keyword', { k: 1, query: 'availability 99.92' })).toEqual(['s3']);
+    expect(await ids('hybrid', { k: 1, generatedShare: 0 })).toEqual(['s1']);
   });
 });
 
@@ -201,7 +223,7 @@ describe('the rerank stage with generated pages', () => {
     });
     expect(channels.rerank).toMatchObject({ hits: 12 });
     // twelve candidates: a quarter pages, the rest sources — every source that holds the words
-    expect(sent.filter((t) => t.includes('what the sources say') || t.includes('entity pages A to Z'))).toHaveLength(3);
+    expect(sent.filter((t) => t.includes('what the sources say'))).toHaveLength(3);
     expect(sent.filter((t) => / report of the platform team/.test(t))).toHaveLength(8);
     // every result was read by the reranker, and the sources come in its order
     expect(results.every((r) => typeof r.signals.rerank === 'number')).toBe(true);

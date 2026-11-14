@@ -448,8 +448,10 @@ export async function sagSearch(
     .slice(0, cfg.candidatePool);
   const vectorRows = await coarseVectorRank(store, queryVector, embedder.model, structuralPool.map((item) => item.result.chunkId));
   const structuralResults = fuseStructuralCandidates(structuralPool, vectorRows);
-  const places = generatedPlaces(k, opts.generatedShare ?? GENERATED_SHARE);
-  const pages = places >= k ? new Set<string>() : await generatedAmong(store, [...direct, ...structuralResults]);
+  const share = opts.generatedShare ?? GENERATED_SHARE;
+  const pages = generatedPlaces(k, share) >= k ? new Set<string>() : await generatedAmong(store, [...direct, ...structuralResults]);
+  // the direct route's first result is the best candidate of all: a page there keeps a place
+  const places = generatedPlaces(k, share, direct.length > 0 && pages.has(direct[0].chunkId));
   const results = mergeRoutes(direct, structuralResults, k, cfg.directRatio, pages, places);
 
   await boostByHeat(store, results, heatCfg);
