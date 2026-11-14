@@ -42,6 +42,11 @@ export interface SearchOptions {
    * (`SearchResult.current`, src/search/current.ts). Default on; one query.
    */
   current?: boolean;
+  /**
+   * The part of the results generated pages may take, over `GENERATED_SHARE`;
+   * 1 ranks them with the sources as one list. For measuring the share's worth.
+   */
+  generatedShare?: number;
 }
 
 /** What one recall channel of a hybrid search found, and how long it took. */
@@ -69,6 +74,75 @@ interface RankedChunk {
   title: string | null;
   content: string;
   raw: number;
+  /** Of a generated page (`isGeneratedSql`), not of a source. */
+  generated?: boolean;
+}
+
+/**
+ * The part of a search's results that chunks of generated pages may take:
+ * a quarter, 2 of the 8 chunks an answer is written from.
+ *
+ * A generated page (`isGeneratedSql`: an entity page, a mentions page, a
+ * timeline, a navigation list) restates what sources say, and a knowledge
+ * base grows several chunks of them per source document. Ranked as one list
+ * they take the places: on the 2026-11 separation benchmark's 10× index (8,016
+ * chunks: 1,540 of source documents, 6,469 of wiki pages) the top 8 held 14%
+ * source chunks, none at all for 156 of 297 questions, and the keyword
+ * channel's candidates were pages before any source. So every recall channel
+ * lists its best chunks of sources and of generated pages separately, ranks
+ * the two lists together by its own score, and the cut gives pages this
+ * share. Replayed on a copy of that index (the 297 questions the run asked
+ * that have gold documents; questions with a gold source document in the top
+ * 5 / top 8 of a search for 8):
+ *
+ *   one list (before)       16 /  29
+ *   separate lists, 1       48 /  63    sources reach the candidates, pages still take the places
+ *   0.5                     67 /  96
+ *   0.375                   77 / 102
+ *   0.25                    87 / 104
+ *   0.125                   94 / 106
+ *   0                      101 / 108
+ *
+ * A quarter reaches 104 of the 108 questions sources alone would, and keeps
+ * the two best pages in an answer's context: an entity page is where the
+ * claims about a name are gathered, and what an agent navigates by. Pages
+ * rank where the channels put them, so the first results may be pages (top 5:
+ * 87, against 101 without them). A search that asks for pages
+ * (`kinds: ['view']`), or finds fewer sources than it has places, is filled
+ * with pages as before; an index without generated pages ranks as before.
+ */
+export const GENERATED_SHARE = 0.25;
+
+/** How many of `k` results generated pages may take at `share`. */
+function generatedPlaces(k: number, share: number): number {
+  return Math.min(k, Math.max(0, Math.round(k * Math.min(1, Math.max(0, share)))));
+}
+
+/**
+ * SQL: the document at `alias` is a generated page — a view of the index
+ * (`kind = 'view'`: an entity page, a mentions page, a timeline) or one of the
+ * wiki's navigation lists (`isReservedWikiFile`: every folder's index.md),
+ * which ingest files as sources that the graph does not read. A wiki page a
+ * person or an agent wrote is a source.
+ */
+const isGeneratedSql = (alias: string) => `(${alias}.kind = 'view' OR (${alias}.root = 'wiki' AND ${alias}.path ~ '(^|/)(index|log)[.]md$'))`;
+
+/** The best `k` of the sources and the best `k` of the generated pages in `ranked`, in its order. */
+function bestOfEachSide(ranked: RankedChunk[], k: number): RankedChunk[] {
+  const taken = [0, 0];
+  return ranked.filter((r) => taken[r.generated ? 1 : 0]++ < k);
+}
+
+/** Two lists a channel ranked by the same score, as one: best first, a source before a page of equal score. */
+function mergeSides(sources: RankedChunk[], generated: RankedChunk[]): RankedChunk[] {
+  const out: RankedChunk[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < sources.length || j < generated.length) {
+    if (j >= generated.length || (i < sources.length && sources[i].raw >= generated[j].raw)) out.push(sources[i++]);
+    else out.push(generated[j++]);
+  }
+  return out;
 }
 
 const CJK_QUERY_STOP = new Set([
@@ -201,7 +275,40 @@ export function wantsCode(filter: ResolvedScopeFilter): boolean {
   return Boolean(filter.sources?.some((s) => s === RAW_CODEBASE || s.startsWith(`${RAW_CODEBASE}/`)));
 }
 
-/** Pure vector recall: cosine distance over pgvector. */
+/**
+ * Pure vector recall: cosine distance over pgvector, the nearest `k` chunks of
+ * sources or of generated pages. One side a query, each an ordered scan the
+ * vector index can serve; a window over both sides would read every vector.
+ */
+async function vectorSide(
+  store: Store,
+  embedder: EmbeddingProvider,
+  qv: number[],
+  k: number,
+  generated: boolean,
+  asOf?: TimeInput,
+  filter?: ResolvedScopeFilter,
+): Promise<RankedChunk[]> {
+  const p = new Params([toVectorLiteral(qv)]);
+  // only vectors of the query's own space: while a new model's vectors are still coming in
+  // (a re-embed, or the deferred backlog) the table holds two (docs/design/12 §3.3)
+  const model = p.add(embedder.model);
+  const cond = docLiveAt('d', p, asOf, filter);
+  const lim = p.add(k);
+  return store.query<RankedChunk>(
+    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
+            1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${generated} AS generated
+     FROM embeddings e
+     JOIN chunks c ON c.id = e.chunk_id
+     JOIN documents d ON d.id = c.document_id
+     WHERE e.model = ${model} AND ${cond} AND ${generated ? '' : 'NOT '}${isGeneratedSql('d')}
+     ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
+     LIMIT ${lim}`,
+    p.list,
+  );
+}
+
+/** Vector recall: the nearest `k` chunks of sources and the nearest `k` of generated pages, as one list by similarity. */
 async function vectorSearch(
   store: Store,
   embedder: EmbeddingProvider,
@@ -212,23 +319,13 @@ async function vectorSearch(
   filter?: ResolvedScopeFilter,
 ): Promise<RankedChunk[]> {
   const qv = queryVector ?? (await embedder.embed([query]))[0];
-  const p = new Params([toVectorLiteral(qv)]);
-  // only vectors of the query's own space: while a new model's vectors are still coming in
-  // (a re-embed, or the deferred backlog) the table holds two (docs/design/12 §3.3)
-  const model = p.add(embedder.model);
-  const cond = docLiveAt('d', p, asOf, filter);
-  const lim = p.add(k);
-  return store.query<RankedChunk>(
-    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
-            1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw
-     FROM embeddings e
-     JOIN chunks c ON c.id = e.chunk_id
-     JOIN documents d ON d.id = c.document_id
-     WHERE e.model = ${model} AND ${cond}
-     ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
-     LIMIT ${lim}`,
-    p.list,
-  );
+  // a search for certain kinds reads the sides they are on
+  const kinds = filter?.kinds;
+  const [sources, generated] = await Promise.all([
+    !kinds || kinds.some((kind) => kind !== 'view') ? vectorSide(store, embedder, qv, k, false, asOf, filter) : [],
+    !kinds || kinds.includes('view') ? vectorSide(store, embedder, qv, k, true, asOf, filter) : [],
+  ]);
+  return mergeSides(sources, generated);
 }
 
 /**
@@ -335,7 +432,11 @@ function rankBm25(rows: RankedChunk[], terms: { term: string; idf: number }[]): 
 const hasSearchOperators = (query: string) => /"[^"]+"|(^|\s)-[\p{L}\p{N}]/u.test(query);
 
 /**
- * Keyword recall: BM25 over the chunks that hold the query's terms.
+ * Keyword recall: BM25 over the chunks that hold the query's terms, the best
+ * `k` of sources and the best `k` of generated pages as one list. Candidates
+ * are listed for each side on its own: a name is on its entity page, its
+ * mentions page and every page that links it, and one list of candidates
+ * held little else.
  *
  * The terms are the query's words and CJK bigrams without stopwords
  * (`keywordTerms`), each weighted by how rare it is in the corpus. Candidates
@@ -360,13 +461,15 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
   const cond = docLiveAt('d', p, asOf, filter);
   const lim = p.add(k);
   const fts = await store.query<RankedChunk>(
-    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
-            ts_rank(c.tsv, websearch_to_tsquery('simple', $1)) AS raw
-     FROM chunks c
-     JOIN documents d ON d.id = c.document_id
-     WHERE c.tsv @@ websearch_to_tsquery('simple', $1) AND ${cond}
-     ORDER BY raw DESC
-     LIMIT ${lim}`,
+    `SELECT chunk_id, document_id, path, title, doc_date, content, raw, generated FROM (
+       SELECT ${CANDIDATE_COLUMNS}, ts_rank(c.tsv, websearch_to_tsquery('simple', $1)) AS raw,
+              row_number() OVER (PARTITION BY ${isGeneratedSql('d')} ORDER BY ts_rank(c.tsv, websearch_to_tsquery('simple', $1)) DESC) AS place
+       FROM chunks c
+       JOIN documents d ON d.id = c.document_id
+       WHERE c.tsv @@ websearch_to_tsquery('simple', $1) AND ${cond}
+     ) matched
+     WHERE place <= ${lim}
+     ORDER BY raw DESC`,
     p.list,
   );
 
@@ -386,17 +489,17 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
   // a term no chunk holds finds nothing and weighs nothing
   const scoredTerms = terms.map((term, i) => ({ term, idf: idf[i] })).filter((t) => t.idf > 0);
   const ranked = rankBm25(pool, scoredTerms);
-  if (!hasSearchOperators(query)) return ranked.slice(0, k);
-  return [...fts, ...ranked.filter((r) => !seen.has(r.chunk_id))].slice(0, k);
+  if (!hasSearchOperators(query)) return bestOfEachSide(ranked, k);
+  return bestOfEachSide([...fts, ...ranked.filter((r) => !seen.has(r.chunk_id))], k);
 }
 
-const CANDIDATE_COLUMNS = `c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content`;
+const CANDIDATE_COLUMNS = `c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, ${isGeneratedSql('d')} AS generated`;
 
 interface TermLists {
   /** Chunks holding each term, counted up to `KEYWORD_DF_CAP`. */
   df: number[];
-  /** The live chunks of the `KEYWORD_FETCH_TERMS` rarest terms: term index, chunk id. */
-  listed: { i: number; id: string }[];
+  /** The live chunks of the `KEYWORD_FETCH_TERMS` rarest terms: term index, chunk id, whether a generated page's. */
+  listed: { i: number; id: string; generated: boolean }[];
   /** The terms whose chunks are in `listed`. */
   picked: number[];
 }
@@ -422,32 +525,33 @@ async function termLists(store: Store, terms: string[], asOf?: TimeInput, filter
   const lists = terms.map((t, i) => `(SELECT ${i} AS i, c.id, c.document_id FROM chunks c WHERE ${expr} @@ ${p.add(gramQuery([termGrams(t)], 1))}::tsquery LIMIT ${cap})`);
   const fetch = p.add(KEYWORD_FETCH_TERMS);
   const cond = docLiveAt('d', p, asOf, filter);
-  const rows = await store.query<{ i: number; id: string | null; df: number | null }>(
+  const rows = await store.query<{ i: number; id: string | null; df: number | null; generated: boolean | null }>(
     `WITH hit AS MATERIALIZED (${lists.join(' UNION ALL ')}),
           n AS MATERIALIZED (SELECT i, count(*)::int AS df FROM hit GROUP BY i),
           pick AS MATERIALIZED (SELECT i FROM n ORDER BY df, i LIMIT ${fetch})
-     SELECT n.i, NULL::text AS id, n.df FROM n
+     SELECT n.i, NULL::text AS id, n.df, NULL::boolean AS generated FROM n
      UNION ALL
-     SELECT h.i, h.id, NULL::int AS df
+     SELECT h.i, h.id, NULL::int AS df, ${isGeneratedSql('d')} AS generated
      FROM hit h JOIN pick ON pick.i = h.i JOIN documents d ON d.id = h.document_id
      WHERE ${cond}`,
     p.list,
   );
   const df = terms.map(() => 0);
-  const listed: { i: number; id: string }[] = [];
+  const listed: TermLists['listed'] = [];
   for (const r of rows) {
     if (r.id === null) df[r.i] = r.df ?? 0;
-    else listed.push({ i: r.i, id: r.id });
+    else listed.push({ i: r.i, id: r.id, generated: r.generated === true });
   }
   return { df, listed, picked: rarestTerms(df) };
 }
 
 /**
- * About `pool` chunks worth scoring: the ones the listed terms weigh the most
- * in together. A chunk is put forward by the summed weight of the terms whose
+ * About `pool` chunks of sources and `pool` of generated pages worth scoring:
+ * on each side, the ones the listed terms weigh the most in together. A chunk
+ * is put forward by the summed weight of the terms whose
  * lists hold it — BM25 with every count taken as one, which is what an
- * inverted index can say before any text is read — and the text of the best
- * `pool` is fetched for the caller to score exactly.
+ * inverted index can say before any text is read — and the text of each
+ * side's best `pool` is fetched for the caller to score exactly.
  *
  * A list cut at the cap holds some of its term's chunks, so two such terms
  * would meet in a chunk only by chance: when one of the picked terms is that
@@ -464,26 +568,31 @@ async function listedCandidates(
 ): Promise<RankedChunk[]> {
   const { picked } = lists;
   const held = new Map<string, number>();
+  const generated = new Set<string>();
   for (const r of lists.listed) {
     const j = picked.indexOf(r.i);
-    if (j >= 0) held.set(r.id, (held.get(r.id) ?? 0) | (1 << j));
+    if (j < 0) continue;
+    held.set(r.id, (held.get(r.id) ?? 0) | (1 << j));
+    if (r.generated) generated.add(r.id);
   }
   if (picked.length > 1 && picked.some((i) => lists.df[i] >= KEYWORD_DF_CAP)) {
     const p = new Params([gramQuery(picked.map((i) => termGrams(terms[i])), picked.length)]);
     const lim = p.add(pool);
     const cond = docLiveAt('d', p, asOf, filter);
-    const rows = await store.query<{ id: string }>(
+    const rows = await store.query<{ id: string; generated: boolean }>(
       `WITH hit AS MATERIALIZED (SELECT c.id, c.document_id FROM chunks c WHERE ${MATCH_INDEXES.chunks.expr('c')} @@ $1::tsquery LIMIT ${lim})
-       SELECT h.id FROM hit h JOIN documents d ON d.id = h.document_id WHERE ${cond}`,
+       SELECT h.id, ${isGeneratedSql('d')} AS generated FROM hit h JOIN documents d ON d.id = h.document_id WHERE ${cond}`,
       p.list,
     );
-    for (const r of rows) held.set(r.id, (1 << picked.length) - 1);
+    for (const r of rows) {
+      held.set(r.id, (1 << picked.length) - 1);
+      if (r.generated) generated.add(r.id);
+    }
   }
-  const ids = [...held.entries()]
+  const weighed = [...held.entries()]
     .map(([id, mask]) => [id, pickedWeight(mask, picked, idf)] as const)
-    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
-    .slice(0, pool)
-    .map(([id]) => id);
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+  const ids = [false, true].flatMap((side) => weighed.filter(([id]) => generated.has(id) === side).slice(0, pool).map(([id]) => id));
   if (ids.length === 0) return [];
   return store.query<RankedChunk>(
     `SELECT ${CANDIDATE_COLUMNS}, 0::float AS raw
@@ -518,8 +627,9 @@ async function scannedFrequencies(store: Store, terms: string[]): Promise<number
 }
 
 /**
- * The `pool` live chunks the `picked` terms weigh the most in together, by one
- * scan, ordered as `listedCandidates` orders the chunks of its lists: by the
+ * On each side (sources, generated pages) the `pool` live chunks the `picked`
+ * terms weigh the most in together, by one scan, ordered as
+ * `listedCandidates` orders the chunks of its lists: by the
  * summed weight of the picked terms each holds, then by id. The weights of
  * the possible sets of picked terms are ranked here, so the database sorts by
  * a set's rank and the sums are the ones the lookup makes. Where a picked term
@@ -545,15 +655,17 @@ async function scannedCandidates(
   const lim = p.add(pool);
   // lower() once per chunk, then strpos per gram
   return store.query<RankedChunk>(
-    `SELECT chunk_id, document_id, path, title, doc_date, content, 0::float AS raw FROM (
-       SELECT ${CANDIDATE_COLUMNS}, ${mask} AS mask
-       FROM chunks c JOIN documents d ON d.id = c.document_id, LATERAL (SELECT lower(c.content) AS l OFFSET 0) x
-       WHERE ${cond}
-       OFFSET 0
-     ) held
-     WHERE mask > 0
-     ORDER BY ($1::int[])[mask], chunk_id COLLATE "C"
-     LIMIT ${lim}`,
+    `SELECT chunk_id, document_id, path, title, doc_date, content, 0::float AS raw, generated FROM (
+       SELECT held.*, row_number() OVER (PARTITION BY generated ORDER BY ($1::int[])[mask], chunk_id COLLATE "C") AS place FROM (
+         SELECT ${CANDIDATE_COLUMNS}, ${mask} AS mask
+         FROM chunks c JOIN documents d ON d.id = c.document_id, LATERAL (SELECT lower(c.content) AS l OFFSET 0) x
+         WHERE ${cond}
+         OFFSET 0
+       ) held
+       WHERE mask > 0
+     ) placed
+     WHERE place <= ${lim}
+     ORDER BY generated, place`,
     p.list,
   );
 }
@@ -632,8 +744,9 @@ async function entitiesHoldingTerms(store: Store, query: string, asOf?: TimeInpu
 }
 
 /**
- * Chunks mentioning the entities the query names (graph signal): one row per
- * chunk, ranked by the summed rarity of the named entities it mentions — each
+ * Chunks mentioning the entities the query names (graph signal), the best `k`
+ * of sources and the best `k` of generated pages: one row per chunk, ranked
+ * by the summed rarity of the named entities it mentions — each
  * weighted by the BM25 IDF of the chunks it is mentioned in, as the keyword
  * channel weighs a term — then by how many it mentions, then by id: RRF reads
  * the rank, so the order must not be the planner's. A query that names no
@@ -677,7 +790,7 @@ async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput
     `WITH seeds AS MATERIALIZED (
        SELECT DISTINCT unnest($1::text[]) AS id
      ), docs AS MATERIALIZED (
-       SELECT d.id FROM documents d WHERE ${cond}
+       SELECT d.id, ${isGeneratedSql('d')} AS generated FROM documents d WHERE ${cond}
      ), hits AS MATERIALIZED (
        SELECT s.id AS entity_id, x.chunk_id, x.document_id, count(*) OVER (PARTITION BY s.id)::float AS df
        FROM seeds s
@@ -692,15 +805,15 @@ async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput
        FROM hits h
        GROUP BY h.chunk_id
      ), ranked AS (
-       SELECT pc.chunk_id, pc.matches, pc.weight
+       SELECT pc.chunk_id, pc.matches, pc.weight, docs.generated,
+              row_number() OVER (PARTITION BY docs.generated ORDER BY pc.weight DESC, pc.matches DESC, pc.chunk_id) AS place
        FROM per_chunk pc JOIN docs ON docs.id = pc.document_id
-       ORDER BY pc.weight DESC, pc.matches DESC, pc.chunk_id
-       LIMIT ${lim}
      )
-     SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, r.weight AS raw
+     SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, r.weight AS raw, r.generated
      FROM ranked r
      JOIN chunks c ON c.id = r.chunk_id
      JOIN documents d ON d.id = c.document_id
+     WHERE r.place <= ${lim}
      ORDER BY r.weight DESC, r.matches DESC, c.id`,
     p.list,
   );
@@ -738,7 +851,9 @@ export const FUSION_WEIGHTS: Record<SearchChannelName, number> = { vector: 1.0, 
 /**
  * Hybrid search: reciprocal-rank fusion of vector + keyword + graph-mention
  * signals (RRF, k=60 — the same shape gbrain and most hybrid retrievers use),
- * each weighted by `FUSION_WEIGHTS`.
+ * each weighted by `FUSION_WEIGHTS`. Each channel lists its best chunks of
+ * sources and of generated pages, ranked together by its own score, and the
+ * results give generated pages at most `GENERATED_SHARE` of the places.
  * Fused scores get a bounded heat boost (at most `heat.searchWeight`, a
  * tie-break, never dominant), and returned hits are recorded into the usage
  * ledger.
@@ -800,9 +915,11 @@ export async function searchExplained(
   const RRF_K = 60;
   const weights = { ...FUSION_WEIGHTS, ...opts.weights };
   const fused = new Map<string, SearchResult>();
+  const generated = new Set<string>();
 
   const fold = (list: RankedChunk[], signal: SearchChannelName) => {
     list.forEach((r, rank) => {
+      if (r.generated) generated.add(r.chunk_id);
       const score = weights[signal] / (RRF_K + rank + 1);
       const prev = fused.get(r.chunk_id);
       if (prev) {
@@ -835,16 +952,46 @@ export async function searchExplained(
   await boostByHeat(store, candidates, heatCfg);
 
   const ranked = candidates.sort((a, b) => b.score - a.score);
-  const results = await finish(store, query, ranked, k, opts, channels);
+  const results = await finish(store, query, ranked, k, opts, channels, generated);
   if (opts.track !== false) {
     await recordChunkHits(store, results.map((r) => ({ chunkId: r.chunkId, documentId: r.documentId })), heatCfg);
   }
   return { results, channels };
 }
 
+/** The chunks among `results` that are of generated pages. */
+async function generatedAmong(store: Store, results: SearchResult[]): Promise<Set<string>> {
+  if (results.length === 0) return new Set();
+  const rows = await store.query<{ id: string }>(`SELECT d.id FROM documents d WHERE d.id = ANY($1::text[]) AND ${isGeneratedSql('d')}`, [[...new Set(results.map((r) => r.documentId))]]);
+  const docs = new Set(rows.map((r) => r.id));
+  return new Set(results.filter((r) => docs.has(r.documentId)).map((r) => r.chunkId));
+}
+
+/**
+ * The first `k` of `ordered`, with chunks of generated pages in at most
+ * `places` of them: a page past its places is passed over for the next
+ * source, and taken after all when the sources run out before `k`.
+ */
+export function cutWithSources<T>(ordered: T[], k: number, places: number, isGenerated: (item: T) => boolean): T[] {
+  const taken: number[] = [];
+  const passed: number[] = [];
+  let pages = 0;
+  for (let i = 0; i < ordered.length && taken.length < k; i++) {
+    if (!isGenerated(ordered[i])) taken.push(i);
+    else if (pages < places) {
+      taken.push(i);
+      pages++;
+    } else passed.push(i);
+  }
+  const all = [...taken, ...passed.slice(0, k - taken.length)].sort((a, b) => a - b);
+  return all.map((i) => ordered[i]);
+}
+
 /**
  * The stages after fusion: the optional rerank of the fused head, the cut to
- * `k`, and the current state of the claims each hit rests on.
+ * `k` that keeps generated pages to their share, and the current state of the
+ * claims each hit rests on. `generated` is the chunks of generated pages among
+ * `ranked`, looked up when the caller does not know them.
  */
 async function finish(
   store: Store,
@@ -853,6 +1000,7 @@ async function finish(
   k: number,
   opts: SearchOptions,
   channels: ExplainedSearch['channels'],
+  generated?: Set<string>,
 ): Promise<SearchResult[]> {
   let ordered = ranked;
   if (rerankEnabled(opts.rerank)) {
@@ -860,7 +1008,9 @@ async function finish(
     channels.rerank = { hits: r.sent, ms: r.ms, ...(r.error ? { error: r.error } : {}) };
     ordered = r.results;
   }
-  const results = ordered.slice(0, k);
+  const places = generatedPlaces(k, opts.generatedShare ?? GENERATED_SHARE);
+  const pages = places >= k || ordered.length === 0 ? null : generated ?? (await generatedAmong(store, ordered).catch(() => null));
+  const results = pages && pages.size > 0 ? cutWithSources(ordered, k, places, (r) => pages.has(r.chunkId)) : ordered.slice(0, k);
   if (opts.current === false || results.length === 0) return results;
   try {
     return await attachCurrent(store, results);
