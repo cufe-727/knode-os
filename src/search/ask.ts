@@ -282,7 +282,11 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
     walkRelations(store, question, named, { maxHops: router.maxHops }),
   ]);
   const seen = new Set(retrieved.map((r) => r.chunkId));
-  const found = [...retrieved, ...walk.bridges.filter((c) => !seen.has(c.chunkId))].slice(0, k + 4);
+  // the passages that state the hops share the top of the context with the search: a chain's later hops are
+  // rarely what a search of the whole question finds
+  const bridges = walk.bridges.filter((c) => !seen.has(c.chunkId));
+  const half = Math.ceil(k / 2);
+  const found = [...retrieved.slice(0, half), ...bridges.slice(0, k - half), ...retrieved.slice(half), ...bridges.slice(k - half)].slice(0, k + 4);
   const ranked = await factsForQuestion(store, question, found, { limit: opts.facts, queryVector, model: embedder.model, named: [...named, ...walk.reached] });
   const steps = stepsAsFacts(walk.steps);
   const stepIds = new Set(steps.map((s) => s.id));
