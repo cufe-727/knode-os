@@ -22,8 +22,9 @@ The 2026-11-13 diagnosis of the corpus benchmark (`run-1x-ranking`, design 23) f
 | aggregate | how many / much / often, total, average, most, 多少, 几次, 一共, 排名… | enumerate claims, counts over the whole match |
 | timeline | timeline, history of, in order, over time, 时间线, 按时间顺序, 演变… | enumerate claims oldest first, replaced ones included |
 | multihop | a noun qualified by a clause ("the company that acquired X"), "of the … of", possessive chains, 的…的 chains, 母公司/创始人…的 | SAG search + relation walk |
+| multihop (`rule:chain`) | a chain across clauses: one part asks for or describes something unnamed (谁, 哪个项目, 提出R-03的人, 一起事故, who, an engineer) and a later clause refers back to it (此人, 那个项目, 同一个客户, 新负责人, that person, they) | SAG search + relation walk |
 
-The order of the tests is the order of the table from the bottom up: timeline beats aggregate beats list beats multihop, since "how many companies that…" is a count first. The question's time window (`in 2025`, `March 2026`, `since 2024`, `between 2024 and 2025`, `2026Q2`, `2026年3月`, `2026年上半年`) is read by `questionRange` into ISO instants through the same parser `valid_range` uses.
+The order of the tests is the order of the table from the bottom up: timeline beats aggregate beats list beats multihop, since "how many companies that…" is a count first. The chain rule is the exception: it comes after timeline and before the counts and lists, because what those would enumerate ("他今年修复过哪些事故") is the thing the question has yet to find. Added 2026-11-15: in the 10× reports benchmark every deep-hop and nonlexical-hop question (184) had reached `lookup`, and the chain rule moves those and no other question of the pack (1,896 questions) to the walk. The question's time window (`in 2025`, `March 2026`, `since 2024`, `between 2024 and 2025`, `2026Q2`, `2026年3月`, `2026年上半年`) is read by `questionRange` into ISO instants through the same parser `valid_range` uses.
 
 `retrieval.router.classifier: "model"` adds one small call to the Judge stage's model, only for a question the rules called a lookup for want of any cue; the rules' answer stands if that call fails. Default `rules`: no model call.
 

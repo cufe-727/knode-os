@@ -61,6 +61,54 @@ const MULTIHOP = [
   /(所在|隶属|母公司|子公司|创始人|投资方|收购方|前任|继任)[^，。？?]{0,8}的/,
 ];
 
+/**
+ * A chain of questions: one part introduces something it does not name, by
+ * asking for it ("是谁处理好的？", "哪个项目？", "who fixed INC-7?") or by
+ * describing it ("提出风险R-03的人", "修复它的工程师", "一起由客户升级的事故",
+ * "an engineer"), and a later clause asks about it by a back-reference ("此人",
+ * "那个项目", "同一个客户", "新负责人", "that person", "their project"). The
+ * benchmark's deep-hop and nonlexical-hop questions are all of this shape, and
+ * none of them matched MULTIHOP, which wants the hops inside one noun phrase.
+ *
+ * A back-reference to something the question names ("What is Atlas? When did
+ * it launch?") is not a chain: "it", "its" and a bare "其" are not read as
+ * back-references, and an introducer must come before the back-reference.
+ * Which-questions over a plural ("which incidents … ? Which were they") are
+ * lists, not chains.
+ */
+const CHAIN_INTRO = [
+  // an interrogative that asks for a person or a thing, not a time or an amount
+  /谁|哪(?:一)?[个位家起项名组件条]|哪些人/,
+  // an indefinite one, or a description of one: "一起由客户升级的事故", "提出R-03的人", "升级的那起事故", "换了负责人"
+  /[一另]\s*[起个位名家项件条](?![月日年周])|的(?:人|工程师|同事|员工|那位|那个|那起|那一起)|换了?\S{0,3}(?:负责人|owner)/,
+  /\bwho(?:m|se)?\b|\bwhich\s+(?!\w+s\b)(?!(?:is|are|was|were|has|have|had|does|do|did|will|would|can|could|this|these|those|of)\b)\w+|\b(?:a|an|another|some|one)\s+(?:[\w-]+\s+)?(?:person|engineer|employee|colleague|project|team|customer|client|incident|risk|company|owner|manager)\b/i,
+];
+
+/** A reference back to something an earlier clause introduced. */
+const CHAIN_BACK = [
+  /此人|该人|这个人|那个人|这位|那位|(?<![其吉])[他她]|(?<!其)它|对方|同一(?![周天日月年时期次类种样]|[个位家起名项件]?(?:问题|事))|那(?:一)?[个位家起项名件条组]|该(?:项目|组|客户|事故|风险|员工|工程师|同事)|新(?:的)?负责人|前者|后者/,
+  /\b(?:that|this|the same)\s+(?:person|engineer|employee|colleague|project|team|customer|client|incident|risk|company|owner|manager|one)\b|\b(?:he|she|him|her|his|hers|they|them|their|theirs)\b|\bthe new (?:owner|lead|manager|assignee)\b|\bthe (?:former|latter)\b/i,
+];
+
+/** Where a clause ends: a sentence or a comma, a dash, a semicolon, a line. */
+const CLAUSE_END = /[。？?！!；;，,—\n]|\.\s/g;
+
+/** True when a later clause refers back to something an earlier part introduced without naming it. */
+export function isChainQuestion(question: string): boolean {
+  const ends = [...question.matchAll(CLAUSE_END)].map((m) => (m.index ?? 0) + m[0].length);
+  if (ends.length === 0) return false;
+  for (const start of ends) {
+    const rest = question.slice(start);
+    for (const re of CHAIN_BACK) {
+      const m = re.exec(rest);
+      if (!m) continue;
+      const before = question.slice(0, start + (m.index ?? 0));
+      if (CHAIN_INTRO.some((intro) => intro.test(before))) return true;
+    }
+  }
+  return false;
+}
+
 const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
 
 /**
@@ -124,6 +172,8 @@ function parse(token: string, text: string): QuestionRoute['range'] {
 export function classifyQuestion(question: string): QuestionRoute {
   const range = questionRange(question);
   if (TIMELINE.some((re) => re.test(question))) return { kind: 'timeline', range, by: 'rule:timeline' };
+  // before the counts and lists: what those would enumerate is the thing the question has yet to find
+  if (isChainQuestion(question)) return { kind: 'multihop', range, by: 'rule:chain' };
   if (AGGREGATE.some((re) => re.test(question))) return { kind: 'aggregate', range, by: 'rule:aggregate' };
   if (isListQuestion(question)) return { kind: 'list', range, by: 'rule:list' };
   if (MULTIHOP.some((re) => re.test(question))) return { kind: 'multihop', range, by: 'rule:multihop' };
