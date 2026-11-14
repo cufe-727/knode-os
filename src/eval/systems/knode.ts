@@ -7,6 +7,7 @@ import { sync } from '../../ingest/sync.js';
 import { parseFrontmatter } from '../../markdown.js';
 import { ask } from '../../search/ask.js';
 import { search } from '../../search/search.js';
+import { toDateString } from '../../store/temporal.js';
 import type { ChatMessage, LlmClient } from '../../llm/client.js';
 import { generateWiki } from '../../wiki/generate.js';
 import { refineWiki } from '../../wiki/refine.js';
@@ -551,6 +552,19 @@ function withAppendedRules(client: LlmClient, rules: string): LlmClient {
   });
 }
 
+/**
+ * The period a claim holds for, as its unit's text says it: ` (2025-11-03 – 2025-11-07)`, the two days as
+ * stored (UTC, the end day being the day the stored instant falls in), '' for a claim with no period. The
+ * columns come back as Dates: cut from `String(date)` they read "Mon Nov 03", with no year and in local time
+ * (an end of day in UTC is the next morning in UTC+8), and a judge that assumed the year marked true claims
+ * contradicted — 25 of the 28 failing claims of the 2026-11 10× reports run.
+ */
+export function claimWindow(validFrom: string | Date | null, validTo: string | Date | null): string {
+  const from = toDateString(validFrom);
+  const to = toDateString(validTo);
+  return from || to ? ` (${from ?? '?'} – ${to ?? ''})` : '';
+}
+
 /** Everything the build generated, as units: entities, relations, claims and pages — never the source chunks. */
 async function exportUnits(s: KnodeState): Promise<KnowledgeUnit[]> {
   const ctx = await open(s);
@@ -575,14 +589,13 @@ async function exportUnits(s: KnodeState): Promise<KnowledgeUnit[]> {
   )) {
     units.push({ id: `relation:${r.id}`, kind: 'relation', head: r.head, tail: r.tail, relation: r.type, text: `${r.head} —${r.type}→ ${r.tail}${r.description ? `: ${r.description}` : ''}`, sources: strip(r.path), links: [`entity:${r.source_id}`, `entity:${r.target_id}`] });
   }
-  for (const c of await ctx.store.query<{ id: string; subject: string; statement: string; kind: string; valid_from: string | null; valid_to: string | null; path: string | null; subject_id: string }>(
+  for (const c of await ctx.store.query<{ id: string; subject: string; statement: string; kind: string; valid_from: string | Date | null; valid_to: string | Date | null; path: string | null; subject_id: string }>(
     `SELECT c.id, e.name AS subject, c.statement, c.kind, c.valid_from, c.valid_to, d.path, c.subject_id
      FROM claims c JOIN entities e ON e.id = c.subject_id
      LEFT JOIN chunks ch ON ch.id = c.chunk_id LEFT JOIN documents d ON d.id = ch.document_id
      WHERE c.tx_to IS NULL AND c.canonical_id IS NULL`,
   )) {
-    const when = c.valid_from || c.valid_to ? ` (${c.valid_from ? String(c.valid_from).slice(0, 10) : '?'} – ${c.valid_to ? String(c.valid_to).slice(0, 10) : ''})` : '';
-    units.push({ id: `claim:${c.id}`, kind: 'claim', title: c.subject, text: `${c.statement}${when}${c.kind && c.kind !== 'fact' ? ` [${c.kind}]` : ''}`, sources: strip(c.path), links: [`entity:${c.subject_id}`] });
+    units.push({ id: `claim:${c.id}`, kind: 'claim', title: c.subject, text: `${c.statement}${claimWindow(c.valid_from, c.valid_to)}${c.kind && c.kind !== 'fact' ? ` [${c.kind}]` : ''}`, sources: strip(c.path), links: [`entity:${c.subject_id}`] });
   }
   const wiki = path.join(s.ws, 'wiki');
   for (const rel of listFiles(wiki).filter((f) => f.endsWith('.md'))) {
