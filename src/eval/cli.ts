@@ -11,7 +11,7 @@ import { listRecipes, recipe } from './packs/index.js';
 import { extendPack } from './packs/extend.js';
 import './packs/recipes.js';
 import { buildScaleData, renderScale, writeReport } from './report.js';
-import { runEval, scoreRun } from './run.js';
+import { parseLocal, runEval, scoreRun } from './run.js';
 import { Meter, sumEvents } from './meter.js';
 import { RunStore } from './runstore.js';
 import { DEFAULT_SYSTEMS, SYSTEMS } from './systems/index.js';
@@ -51,7 +51,21 @@ function remoteOption(program: Command, opts: { remote?: boolean; serveUrl?: str
   if (!opts.remote) return null;
   const at = localServe(resolveDataDir(program.opts().data), opts.serveUrl);
   if (!/^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(at.serveUrl)) throw new Error('--serve-url: the run reaches serve on this machine only (http://127.0.0.1:<port>)');
-  return { ...at, ...(opts.offerSeconds !== undefined ? { offerSeconds: Number(opts.offerSeconds) } : {}) };
+  return at;
+}
+
+/**
+ * `--local`, `--slots` (docs/design/32 §3): the run's own slots. Without
+ * `--local` and `--remote` an old command line runs here on slots sized from
+ * `--slots`; with either, `--slots` no longer says anything.
+ */
+function localOption(opts: { local?: string; slots?: string; remote?: boolean }): { local?: ReturnType<typeof parseLocal> | null; slots?: number } {
+  if (opts.local !== undefined) {
+    if (opts.slots !== undefined) console.log('  warning: --slots is ignored with --local, which says how many slots this run has');
+    return { local: parseLocal(opts.local) };
+  }
+  if (opts.remote && opts.slots !== undefined) console.log('  warning: --slots is ignored with --remote: only --local starts slots on this machine (none now: the run\'s work waits for workers)');
+  return opts.slots !== undefined ? { slots: Number(opts.slots) } : {};
 }
 
 export function registerEvalCommands(program: Command): void {
@@ -177,16 +191,17 @@ export function registerEvalCommands(program: Command): void {
     .option('--agent-limit <n>', 'tasks per pack for agent systems', '30')
     .option('--fraction <f>', 'share of the corpus to use; above 1, that many times its size with the pack\'s padding (scale curves)', '1')
     .option('--seed <seed>', 'sampling seed', '0')
-    .option('--slots <n>', 'concurrent model calls', '6')
+    .option('--local <slots>', "slots in this run's process that take its work like a worker, e.g. codex:6,claude:1 (Codex: model calls and agent sessions; claude: the judge). Without --local and without a worker nothing runs: the run waits")
+    .option('--slots <n>', 'old command lines: with neither --remote nor --local, the run runs here as if given --local codex:<n>,claude:<n> (default 6)')
     .option('--pack-concurrency <n>', 'packs worked on at once', '1')
-    .option('--answer-concurrency <n>', 'tasks one system answers at once in each pack (update batches too)', '3')
+    .option('--answer-concurrency <n>', 'at most this many tasks one system answers at once in each pack (update batches too); otherwise as many as the slots online take (3 for an old command line)')
     .option('--embedding-cap <tokens>', 'stop embedding after this many tokens in the run')
     .option('--embedding-daily-cap <tokens>', 'embed at most this many tokens per UTC day; past it, packs wait for the next day')
     .option('--no-quota', 'do not pause for Codex plan windows')
     .option('--skip-scoring', 'answer only; score later with `eval run --run-dir`')
     .option('--reuse-builds-from <runDir>', "start from another run's builds of the same pack versions (and its embedding vectors), instead of building again")
     .option('--rebuild <groups>', 'with --reuse-builds-from: build these groups afresh (knode, llm-wiki, rag, …), e.g. after a change to how they build')
-    .option('--remote', 'offer model calls, agent sessions and judge calls to remote workers through `knode-os serve` on this machine (server.remote.offer.eval); needs --model (and --judge-model for the judge); a pack with private sources stays here')
+    .option('--remote', 'publish the run\'s work to `knode-os serve` on this machine, where remote workers take it (server.remote.offer.eval): model calls and agent sessions need --model, the judge --judge-model, and a pack with private sources goes to this machine\'s slots only; without --local nothing runs here')
     .option('--serve-url <url>', 'with --remote: serve\'s origin on this machine (default: from the data root\'s config)')
     .option('--offer-seconds <s>', 'with --remote: how long a piece waits for a worker before it runs here (default: the server\'s, 30)')
     .option('--repeat <n>', 'answer each task n times, for run-to-run variance (repeat 1 keeps the usual record keys)', '1')
@@ -195,6 +210,7 @@ export function registerEvalCommands(program: Command): void {
       const remote = remoteOption(program, opts);
       const res = await runEval({
         remote,
+        ...localOption(opts),
         repeat: Number(opts.repeat),
         repeatSystems: csv(opts.repeatSystems),
         packs: csv(opts.pack)!.map(resolvePack),
@@ -227,9 +243,8 @@ export function registerEvalCommands(program: Command): void {
         agentLimit: Number(opts.agentLimit),
         fraction: Number(opts.fraction),
         seed: opts.seed,
-        slots: Number(opts.slots),
         packConcurrency: Number(opts.packConcurrency),
-        answerConcurrency: Number(opts.answerConcurrency),
+        answerConcurrency: opts.answerConcurrency !== undefined ? Number(opts.answerConcurrency) : undefined,
         embeddingTokenCap: opts.embeddingCap ? Number(opts.embeddingCap) : undefined,
         embeddingDailyCap: opts.embeddingDailyCap ? Number(opts.embeddingDailyCap) : undefined,
         quota: opts.quota,
@@ -270,11 +285,13 @@ export function registerEvalCommands(program: Command): void {
     .description('judge what a stopped run has answered so far (Claude), then render its report')
     .option('--judge <provider>', 'judge CLI provider', 'claude-cli')
     .option('--judge-model <model>', 'judge model', '')
-    .option('--remote', 'offer the judge\'s calls to remote workers through `knode-os serve` on this machine (needs --judge-model; not for a run with a private pack)')
+    .option('--remote', 'publish the judge\'s calls to `knode-os serve` on this machine, where remote workers take them (needs --judge-model; not for a run with a private pack)')
     .option('--serve-url <url>', 'with --remote: serve\'s origin on this machine')
+    .option('--local <slots>', "slots in this process that take the judge's calls, e.g. claude:2; without it and --remote the judge runs here on --slots")
+    .option('--slots <n>', 'old command lines: with neither --remote nor --local, the judge runs here on that many slots (default 6)')
     .option('--offer-seconds <s>', 'with --remote: how long a call waits for a worker before it runs here')
     .action(async (runDir: string, opts) => {
-      const n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts) });
+      const n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts) });
       const r = writeReport(path.resolve(runDir));
       console.log(`\n${n} answers scored\nreport: ${r.md}`);
       process.exit(0);

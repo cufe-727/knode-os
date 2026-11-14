@@ -106,6 +106,8 @@ export interface EvalAgent {
 export interface EvalCallWorkTask extends TaskBase {
   kind: 'eval-call';
   run: string;
+  /** The run's own key for the piece (docs/design/32 §2): opaque to a worker. */
+  key: string;
   agent: EvalAgent;
   prompt: string;
   /** A strict JSON schema for the reply (Codex `--output-schema`), or null. */
@@ -123,8 +125,9 @@ export interface EvalCallWorkTask extends TaskBase {
 export interface EvalSessionWorkTask extends TaskBase {
   kind: 'eval-session';
   run: string;
+  key: string;
   agent: EvalAgent;
-  sandbox: 'read-only';
+  sandbox: 'read-only' | 'workspace-write';
   maxSteps: number;
   timeoutMs: number;
   prompt: string;

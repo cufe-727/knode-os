@@ -103,17 +103,17 @@ export const KNODE_EVAL_CONCURRENCY = Number(process.env.KNODE_EVAL_KNODE_CONCUR
 export const KNODE_EVAL_BATCH = Number(process.env.KNODE_EVAL_KNODE_BATCH ?? 16);
 
 /**
- * A build's document-pass settings: this machine's, plus the remote slots for
- * model calls that are online when the build starts (docs/design/27 §8).
- * Without them a build sends `KNODE_EVAL_CONCURRENCY` calls at once however
- * many workers wait; a pass's batch grows in the same proportion, so a pass
- * has enough calls to fill them. A remote call takes none of this machine's
- * slots, and a call that falls back here still waits for one.
+ * A build's document-pass settings: as wide as the slots online for its model
+ * calls when the build starts (docs/design/32 §3), and never narrower than
+ * `KNODE_EVAL_CONCURRENCY` — calls beyond the slots wait in the queue, and a
+ * build on the six slots an old command line has keeps the batches it always
+ * had, so its reply cache still answers it. A pass's batch grows in proportion
+ * to the width, so a pass has enough calls to fill the slots.
  */
 export function evalPassSettings(): { concurrency: number; batchSize: number } {
-  const extra = currentRemote<{ callSlots(): number }>()?.callSlots() ?? 0;
-  if (extra <= 0) return { concurrency: KNODE_EVAL_CONCURRENCY, batchSize: KNODE_EVAL_BATCH };
-  const concurrency = KNODE_EVAL_CONCURRENCY + extra;
+  const slots = currentRemote<{ callSlots(): number }>()?.callSlots() ?? 0;
+  if (slots <= KNODE_EVAL_CONCURRENCY) return { concurrency: KNODE_EVAL_CONCURRENCY, batchSize: KNODE_EVAL_BATCH };
+  const concurrency = slots;
   return { concurrency, batchSize: Math.max(KNODE_EVAL_BATCH, Math.ceil((concurrency * KNODE_EVAL_BATCH) / Math.max(1, KNODE_EVAL_CONCURRENCY))) };
 }
 

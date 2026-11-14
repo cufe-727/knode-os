@@ -13,7 +13,7 @@ import { runAgent } from '../src/eval/agent.js';
 import { Meter } from '../src/eval/meter.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { withRemote } from '../src/eval/placement.js';
-import { packMayLeave, RemoteEval } from '../src/eval/remote.js';
+import { PackScope, packMayLeave, RemoteEval } from '../src/eval/remote.js';
 import { runEval, scoreRun } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
 import { evalPassSettings, evalWorkspaceConfig, KNODE_EVAL_BATCH, KNODE_EVAL_CONCURRENCY } from '../src/eval/systems/knode.js';
@@ -54,7 +54,9 @@ let httpServer: Server;
 let base = '';
 let producerToken = '';
 let evalToken = '';
-const evalWork = new EvalWork(root, { retryMs: 0 });
+/** Who the sources leased each piece to (`eval call <run> <label> → <worker>`). */
+const sourceLog: string[] = [];
+const evalWork = new EvalWork(root, { retryMs: 0, log: (m) => sourceLog.push(m) });
 const workers: ChildProcess[] = [];
 const logs = new Map<string, string[]>();
 const oldEnv = { PATH: process.env.PATH, KNODE_CODEX_CATALOG_HOURS: process.env.KNODE_CODEX_CATALOG_HOURS, CODEX_HOME: process.env.CODEX_HOME };
@@ -95,7 +97,7 @@ async function stopWorker(child: ChildProcess): Promise<void> {
   await exited;
 }
 
-const remoteOpts = (over: Record<string, unknown> = {}) => ({ serveUrl: base, token: producerToken, offerSeconds: 60, refreshMs: 200, ...over });
+const remoteOpts = (over: Record<string, unknown> = {}) => ({ serveUrl: base, token: producerToken, refreshMs: 200, ...over });
 const status = async () => (await (await fetch(`${base}/eval/v1/status`, { headers: { authorization: `Bearer ${producerToken}` } })).json()) as { offered: boolean; online: Record<string, Record<string, number>> };
 const common = { onProgress: (m: string) => process.env.DEBUG_REMOTE_EVAL && process.stderr.write(`  run: ${m}\n`), model: 'gpt-test', judgeProvider: 'claude-cli', judgeModel: 'claude-test', quota: false, suites: ['usage' as const], limit: 3, agentLimit: 2, overrides: { embedder } };
 
@@ -228,8 +230,9 @@ describe('an evaluation run with remote workers', () => {
   let w1: ChildProcess;
   const e2eDir = path.join(runs, 'remote');
 
-  it('runs everything here when no worker is online, or serve is not running', async () => {
-    const res = await runEval({ ...common, packs: [packDir], systems: ['closed-book', 'agent-grep'], runDir: path.join(runs, 'alone'), remote: remoteOpts({ offerSeconds: 1 }) });
+  it('runs on its own slots through serve with --local while no worker is online', async () => {
+    const before = (await evalWork.calls.status()).totals.offered;
+    const res = await runEval({ ...common, packs: [packDir], systems: ['closed-book', 'agent-grep'], runDir: path.join(runs, 'alone'), remote: remoteOpts(), local: { codex: 2, claude: 1 } });
     const store = new RunStore(res.runDir);
     const answers = store.allAnswers();
     expect(answers.length).toBeGreaterThan(0);
@@ -238,8 +241,9 @@ describe('an evaluation run with remote workers', () => {
     expect(new Set(answers.map((a) => a.backend))).toEqual(new Set(['codex-cli:gpt-test']));
     expect(store.meta()!.remote).toEqual({ serve: base, calls: true, judge: true });
     expect(store.allScores().some((s) => s.worker === 'local' && s.backend === 'claude-cli:claude-test')).toBe(true);
-    expect((await evalWork.calls.status()).totals.offered).toBe(0);
-    // with serve gone, a run goes on as before
+    // published to serve and taken there by the run's own slots: one path either way
+    expect((await evalWork.calls.status()).totals.offered).toBeGreaterThan(before);
+    // with serve gone, the run publishes to a broker of its own
     expect(await RemoteEval.connect({ serveUrl: 'http://127.0.0.1:9', token: producerToken, run: 'x' })).toBeNull();
   }, 120_000);
 
@@ -252,11 +256,11 @@ describe('an evaluation run with remote workers', () => {
     expect(knode.ok).toBe(true);
     expect(knode.usage.calls).toBeGreaterThan(0);
     expect([knode.worker, knode.backend]).toEqual(['laptop/w1', 'codex-cli:gpt-test']);
-    // the build sent this machine's calls at once plus the worker's slots, with a pass's batch grown to fill them
+    // the build sent as many calls at once as the slots online, never fewer than an old command line's six
     const callSlots = (await status()).online['eval-call'].codex;
     const notes = knode.notes as Record<string, number>;
-    expect(notes.passConcurrency).toBe(KNODE_EVAL_CONCURRENCY + callSlots);
-    expect(notes.passBatch).toBeGreaterThan(KNODE_EVAL_BATCH);
+    expect(notes.passConcurrency).toBe(Math.max(KNODE_EVAL_CONCURRENCY, callSlots));
+    expect(notes.passBatch).toBeGreaterThanOrEqual(KNODE_EVAL_BATCH);
     // and its reviews' judge calls as wide as a pass
     expect(notes.judgeConcurrency).toBe(notes.passConcurrency);
     const answers = store.allAnswers();
@@ -297,14 +301,15 @@ describe('an evaluation run with remote workers', () => {
     expect(store.allAnswers().filter((a) => a.system === 'agent-grep' && a.repeat)).toEqual([]);
   }, 120_000);
 
-  it('adds the workers\' call slots to a knode build\'s own, and only while its calls leave', async () => {
+  it('makes a knode build as wide as the call slots online, never narrower than an old command line\'s', async () => {
     const here = { concurrency: KNODE_EVAL_CONCURRENCY, batchSize: KNODE_EVAL_BATCH };
     expect(evalPassSettings()).toEqual(here);
     expect(await withRemote(null, async () => evalPassSettings())).toEqual(here);
     expect(await withRemote({ callSlots: () => 0 }, async () => evalPassSettings())).toEqual(here);
-    const twelve = await withRemote({ callSlots: () => 12 }, async () => evalPassSettings());
-    expect(twelve.concurrency).toBe(KNODE_EVAL_CONCURRENCY + 12);
-    expect(twelve.batchSize).toBe(Math.ceil(((KNODE_EVAL_CONCURRENCY + 12) * KNODE_EVAL_BATCH) / KNODE_EVAL_CONCURRENCY));
+    expect(await withRemote({ callSlots: () => KNODE_EVAL_CONCURRENCY }, async () => evalPassSettings())).toEqual(here);
+    const twenty = await withRemote({ callSlots: () => 20 }, async () => evalPassSettings());
+    expect(twenty.concurrency).toBe(20);
+    expect(twenty.batchSize).toBe(Math.ceil((20 * KNODE_EVAL_BATCH) / KNODE_EVAL_CONCURRENCY));
   });
 
   it('lets a build\'s reviews send judge calls as wide as its passes', async () => {
@@ -312,19 +317,20 @@ describe('an evaluation run with remote workers', () => {
     const here = evalWorkspaceConfig(env);
     expect(here.review?.directConcurrency).toBe(KNODE_EVAL_CONCURRENCY);
     const wide = await withRemote({ callSlots: () => 20 }, async () => evalWorkspaceConfig(env));
-    expect(wide.review?.directConcurrency).toBe(KNODE_EVAL_CONCURRENCY + 20);
-    expect(wide.extraction.concurrency).toBe(KNODE_EVAL_CONCURRENCY + 20);
+    expect(wide.review?.directConcurrency).toBe(20);
+    expect(wide.extraction.concurrency).toBe(20);
   });
 
-  it('keeps a private pack on this machine while a worker is online', async () => {
-    const before = (await evalWork.calls.status()).totals.offered + (await evalWork.sessions.status()).totals.offered;
-    const res = await runEval({ ...common, packs: [privateDir], systems: ['closed-book', 'agent-grep'], runDir: path.join(runs, 'private'), remote: remoteOpts() });
+  it('keeps a private pack on this machine\'s slots while a worker is online', async () => {
+    const res = await runEval({ ...common, packs: [privateDir], systems: ['closed-book', 'agent-grep'], runDir: path.join(runs, 'private'), remote: remoteOpts(), local: { codex: 2, claude: 1 } });
     const store = new RunStore(res.runDir);
     expect(store.allAnswers().length).toBeGreaterThan(0);
     expect(new Set(store.allAnswers().map((a) => a.worker))).toEqual(new Set(['local']));
     expect(store.allScores().filter((s) => s.worker && s.worker !== 'local')).toEqual([]);
-    const after = (await evalWork.calls.status()).totals.offered + (await evalWork.sessions.status()).totals.offered;
-    expect(after).toBe(before);
+    // published to serve, and the worker online took none of it
+    const mine = sourceLog.filter((l) => / private /.test(l) && / → /.test(l));
+    expect(mine.length).toBeGreaterThan(0);
+    expect(mine.filter((l) => !/→ local\/private\//.test(l))).toEqual([]);
   }, 120_000);
 
   it('resumes after the run is stopped, without a record twice', async () => {
@@ -354,7 +360,7 @@ describe('an evaluation run with remote workers', () => {
     fs.writeFileSync(path.join(root, 'raw', 'docs', 'email', '2026-03-05.md'), '# 入职\n');
     const host = await startToolHost(async () => rootCtx, ['knode_ls']);
     try {
-      const r = await withRemote(remote, () => runAgent({
+      const r = await withRemote(new PackScope(remote, true, 'any'), () => runAgent({
         cwd: empty, sandbox: 'read-only', model: 'gpt-test', prompt: 'CALL_MCP',
         mcp: { name: 'knode', url: host.url, token: host.secret, enabledTools: ['knode_ls'] },
       }));

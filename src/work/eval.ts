@@ -44,10 +44,17 @@ import type { EvalKind } from './kinds.js';
 export type EvalFamily = 'codex' | 'claude';
 export const EVAL_FAMILIES: readonly EvalFamily[] = ['codex', 'claude'];
 
+/** Where a piece may run (docs/design/32 §2): any slot that meets it, or only a slot on this machine. */
+export type EvalEligible = 'any' | 'local';
+
 export interface EvalCallSpec {
   kind: 'eval-call';
   /** The run's id, for cancelling and for Tasks. */
   run: string;
+  /** The run's own key for the piece: its local slots find the piece's work by it. */
+  key: string;
+  /** `local`: leased only to a slot on this machine (a pack with private sources, a backend only the run has). */
+  eligible: EvalEligible;
   label: string;
   agent: EvalAgent;
   prompt: string;
@@ -58,9 +65,12 @@ export interface EvalCallSpec {
 export interface EvalSessionSpec {
   kind: 'eval-session';
   run: string;
+  key: string;
+  eligible: EvalEligible;
   label: string;
   agent: EvalAgent;
-  sandbox: 'read-only';
+  /** Only a read-only session may go to another machine; a run's own slots also run the llm-wiki builder's. */
+  sandbox: 'read-only' | 'workspace-write';
   maxSteps: number;
   timeoutMs: number;
   prompt: string;
@@ -112,6 +122,22 @@ export interface EvalLeaseStatus {
   expiresInSeconds: number;
 }
 
+/** A slot that asked for this kind lately, as a run reads it to know what could take its pieces. */
+export interface EvalSlotSeen {
+  worker: string;
+  family: EvalFamily;
+  /** On this machine: `serve`'s own or a run's (never a worker over /remote/v1). */
+  local: boolean;
+  /** A run's own slot takes only that run's pieces. */
+  run: string | null;
+}
+
+/** One run's pieces as the source holds them. */
+export interface EvalRunStatus {
+  waiting: number;
+  leased: number;
+}
+
 export interface EvalStatus extends SourceStatus {
   /** Offered and waiting for a worker. */
   waiting: number;
@@ -150,6 +176,8 @@ export interface EvalSourceOptions {
   retryMs?: number;
   /** Strikes before an offer ends `failed` (default 3). */
   maxStrikes?: number;
+  /** How long a slot that asked counts as online (default 2 min). */
+  onlineMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -158,6 +186,17 @@ const RETRY_MS = 5_000;
 const DEADLINE_GRACE_MS = 5 * 60_000;
 const MAX_STDOUT_BYTES = 32 * 1024 * 1024;
 const ONLINE_MS = 2 * 60_000;
+
+/**
+ * Whether a slot may take a piece: its CLI, a piece that must stay on this
+ * machine only to a slot here, and a run's own slot only its run's pieces.
+ */
+export function takes(who: WorkerIdentity, family: EvalFamily, spec: EvalSpec): boolean {
+  if (spec.agent.family !== family) return false;
+  if (spec.eligible === 'local' && who.remote) return false;
+  if (who.run && spec.run !== who.run) return false;
+  return true;
+}
 
 /** The CLI family a worker's backend names ("codex", "claude:…"). */
 export function evalFamilyOf(backend: string): EvalFamily | null {
@@ -187,12 +226,13 @@ export function evalSessionFailure(answer: Pick<EvalSessionAnswer, 'exitCode' | 
 export class EvalSource implements WorkSource {
   private readonly pending: Pending[] = [];
   private readonly leases = new Map<string, EvalLease>();
-  /** Who asked for this kind lately, per CLI: worker → when. */
-  private readonly asked = new Map<EvalFamily, Map<string, number>>();
+  /** Who asked for this kind lately: slot → what it is and when. */
+  private readonly asked = new Map<string, EvalSlotSeen & { at: number }>();
   private readonly totals: EvalStatus['totals'] = { offered: 0, answered: 0, withdrawn: 0, failed: noFailures(), leasesExpired: 0 };
   private readonly leaseMs: number;
   private readonly retryMs: number;
   private readonly maxStrikes: number;
+  private readonly onlineMs: number;
   private readonly log: (msg: string) => void;
   private sweeper: NodeJS.Timeout | null = null;
   private closed = false;
@@ -201,6 +241,7 @@ export class EvalSource implements WorkSource {
     this.leaseMs = Math.max(1_000, opts.leaseMs ?? DEFAULT_LEASE_MS);
     this.retryMs = opts.retryMs ?? RETRY_MS;
     this.maxStrikes = Math.max(1, opts.maxStrikes ?? 3);
+    this.onlineMs = Math.max(1, opts.onlineMs ?? ONLINE_MS);
     this.log = opts.log ?? (() => {});
   }
 
@@ -212,12 +253,21 @@ export class EvalSource implements WorkSource {
     return this.leases.has(taskId);
   }
 
-  /** Worker slots of this CLI that asked for this kind within `withinMs`. */
-  online(family: EvalFamily, withinMs = ONLINE_MS): number {
+  /** Slots of this CLI that asked for this kind within `withinMs`. */
+  online(family: EvalFamily, withinMs = this.onlineMs): number {
+    return this.slotsOnline(withinMs).filter((s) => s.family === family).length;
+  }
+
+  /** Every slot that asked for this kind within `withinMs`. */
+  slotsOnline(withinMs = this.onlineMs): EvalSlotSeen[] {
     const since = Date.now() - withinMs;
-    let n = 0;
-    for (const at of this.asked.get(family)?.values() ?? []) if (at >= since) n++;
-    return n;
+    return [...this.asked.values()].filter((s) => s.at >= since).map(({ at: _at, ...s }) => s);
+  }
+
+  /** A run's pieces here: waiting for a slot, or out with one. */
+  runStatus(run: string): EvalRunStatus {
+    const mine = this.pending.filter((p) => !p.done && p.spec.run === run);
+    return { waiting: mine.filter((p) => p.lease === null).length, leased: mine.filter((p) => p.lease !== null).length };
   }
 
   /**
@@ -275,12 +325,10 @@ export class EvalSource implements WorkSource {
     if (this.closed || max < 1) return [];
     const family = evalFamilyOf(who.backend);
     if (!family) return [];
-    const seen = this.asked.get(family) ?? new Map<string, number>();
-    seen.set(who.worker, Date.now());
-    this.asked.set(family, seen);
+    this.asked.set(who.worker, { worker: who.worker, family, local: !who.remote, run: who.run ?? null, at: Date.now() });
     this.sweep();
     const now = Date.now();
-    const p = this.pending.find((x) => !x.done && x.lease === null && x.notBefore <= now && x.spec.agent.family === family);
+    const p = this.pending.find((x) => !x.done && x.lease === null && x.notBefore <= now && takes(who, family, x.spec));
     if (!p) return [];
     const lease: EvalLease = {
       id: crypto.randomUUID(),
@@ -292,7 +340,7 @@ export class EvalSource implements WorkSource {
     this.leases.set(lease.id, lease);
     p.lease = lease.id;
     this.log(`eval ${p.spec.kind === 'eval-call' ? 'call' : 'session'} ${p.spec.run} ${p.spec.label} → ${who.worker} (${evalBackend(p.spec.agent)})`);
-    const base = { id: lease.id, label: `${p.spec.run} · ${p.spec.label}`.slice(0, 200), leaseExpiresAt: new Date(lease.expiresAt).toISOString(), run: p.spec.run, agent: { ...p.spec.agent } };
+    const base = { id: lease.id, label: `${p.spec.run} · ${p.spec.label}`.slice(0, 200), leaseExpiresAt: new Date(lease.expiresAt).toISOString(), run: p.spec.run, key: p.spec.key, agent: { ...p.spec.agent } };
     if (p.spec.kind === 'eval-call') {
       const task: EvalCallWorkTask = { ...base, kind: 'eval-call', prompt: p.spec.prompt, schema: p.spec.schema ?? null, timeoutMs: p.spec.timeoutMs };
       return [task];

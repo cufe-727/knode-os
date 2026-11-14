@@ -8,7 +8,7 @@ import { catalogArgs, exitFailure, withCodexCatalog } from '../llm/codex-catalog
 import { CallUsage, readCodexEvents } from '../llm/usage.js';
 import { EVAL_HOME } from './pack.js';
 import { currentRemote } from './placement.js';
-import { remoteAgent, RemoteEval } from './remote.js';
+import { PackScope, publishAgent } from './remote.js';
 import { evalTempDir } from './tmp.js';
 import { AGENT_MCP_TOKEN_ENV } from './toolhost.js';
 
@@ -234,16 +234,21 @@ export class AgentTrace {
   }
 }
 
+/**
+ * One agent session. Inside an evaluation run's pack it is a published piece
+ * (docs/design/32): a slot that leases it runs it — the run's own, through
+ * `runAgentHere`, or a worker. A run routed over an agent chain publishes its
+ * sessions for this machine's slots only, since the chain's links are this
+ * machine's keys and logins. Outside a run (a test, a tool) it runs here.
+ */
 export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
-  // on a remote worker when the run offers its sessions and one takes this one (docs/design/27 §8); a run
-  // routed over an agent chain stays here, since its links are this machine's keys and logins
-  const remote = routing ? null : currentRemote<RemoteEval>();
-  if (remote) {
-    const r = await remoteAgent(remote, opts);
-    if (r) return r;
-    remote.counts.here++;
-    await remote.localGate();
-  }
+  const scope = currentRemote<PackScope>();
+  if (scope) return publishAgent(scope, opts, () => runAgentHere(opts), !routing);
+  return runAgentHere(opts);
+}
+
+/** A session on this machine: what a run's own slot does with an agent piece. */
+export async function runAgentHere(opts: AgentRunOptions): Promise<AgentRunResult> {
   // down the chain: an API link until its budget or credit is gone, then the next
   for (;;) {
     const link = routing?.pick() ?? null;

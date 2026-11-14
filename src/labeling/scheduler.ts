@@ -64,6 +64,11 @@ export interface WorkerIdentity {
   /** What runs the call: codex, cursor, claude, api, or a route id. */
   backend: string;
   remote: boolean;
+  /**
+   * An evaluation run's own slot (docs/design/32 §3): it takes only that
+   * run's pieces, since it runs them with the run's own backends.
+   */
+  run?: string;
 }
 
 /**
