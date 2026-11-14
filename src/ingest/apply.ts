@@ -17,6 +17,9 @@ import { PageContext } from '../graph/store.js';
 import { applyWirePlan, extractWikilinks, planWireFromMarkdown, WikiIndex } from '../graph/wire.js';
 import { isReservedWikiFile } from '../lineage/declared.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
+import { ScopeRow } from '../lineage/types.js';
+import { CLAIM_IDENTITY } from '../lineage/writer.js';
+import { toIso } from '../store/temporal.js';
 import { ParsedMarkdown, parseFrontmatter, titleFromMarkdown } from '../markdown.js';
 import { isGeneratedConcept } from '../okf/index.js';
 import { pluginRegistry } from '../plugins/registry.js';
@@ -167,11 +170,17 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     && !isReservedWikiFile(file) && raw.includes('raw/docs/');
   // a mind map applied by an older planner is read again once (docs/design/19)
   const mindMapStale = live !== null && live.sha === sha && sameModel && live.meta.mindmap !== MINDMAP_PLAN_VERSION && looksLikeMindMap(raw);
-  if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale && !mindMapStale) {
+  // a source dated by older rules, or whose claims were keyed by an older identity, is applied again
+  const stale = root === 'docs' && live !== null && live.sha === sha && sameModel && !opts.reapply
+    ? await staleApplication(store, live, file, raw, docId)
+    : null;
+  if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale && !mindMapStale && !stale?.redo) {
     // a sidecar may have gained a replayable tier-1 extraction since (copied
     // from another machine, or written by a bench run) — apply it as the
     // document's child scope without re-indexing the document itself
     if (root === 'docs') {
+      // nothing to redo: the scope says which rules it was checked against, so the next pass skips it
+      if (stale) await store.query(`UPDATE scopes SET meta = meta || $2::jsonb WHERE id = $1`, [live.id, JSON.stringify(APPLY_RULES)]);
       await ensureTier1Replay(store, file, raw, sha, docId, opts);
       // an extraction from before segmented extraction read only the start of
       // a long document: queue it again so the rest gets read (docs/design/10)
@@ -182,7 +191,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     return { outcome: 'unchanged', ...none, scopeId: live.id, sha };
   }
 
-  progress(`indexing ${file}`);
+  progress(stale?.redo ? `applying ${file} again: ${stale.reason}` : `indexing ${file}`);
   // source code has no frontmatter: a YAML file or a README's own header is its text, not knode metadata
   const code = root === 'codebase';
   const parsed: ParsedMarkdown = code ? { frontmatter: {}, body: raw } : parseFrontmatter(raw);
@@ -304,12 +313,12 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     {
       actor,
       at: opts.at,
-      force: Boolean(live && (!sameModel || opts.reapply || citationsStale || mindMapStale)),
+      force: Boolean(live && (!sameModel || opts.reapply || citationsStale || mindMapStale || stale?.redo)),
       keepProjectionOnReplace: true,
       trust,
       acl: declaredAcl,
       meta: {
-        documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title,
+        documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title, ...APPLY_RULES,
         ...(root === 'wiki' ? { citations: CITATIONS_VERSION } : {}),
         ...(mindMapPlan ? { mindmap: MINDMAP_PLAN_VERSION } : {}),
       },
@@ -444,8 +453,8 @@ async function ensureTier1Replay(store: Store, file: string, raw: string, sha: s
   const tier1 = replayableTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha, raw.length);
   if (!tier1) return;
   const child = await findLiveScope(store, 'tier1', file);
-  // the live scope already carries this result (a segmented one names its extractedAt)
-  if (child && child.sha === sha && (!tier1.segmenter || child.meta.extractedAt === tier1.extractedAt)) return;
+  // the live scope already carries this result (a segmented one names its extractedAt), keyed as claims are keyed now
+  if (child && child.sha === sha && (!tier1.segmenter || child.meta.extractedAt === tier1.extractedAt) && child.meta.claimIdentity === CLAIM_IDENTITY) return;
   const chunks = await store.query<{ id: string; content: string }>(`SELECT id, content FROM chunks WHERE document_id = $1 ORDER BY seq`, [docId]);
   const [docRow] = await store.query<{ doc_date: string | Date | null }>(`SELECT doc_date FROM documents WHERE id = $1`, [docId]);
   const docDate = docRow?.doc_date ? new Date(docRow.doc_date).toISOString() : null;
@@ -458,6 +467,44 @@ async function ensureTier1Replay(store: Store, file: string, raw: string, sha: s
     extractedAt: tier1.segmenter ? tier1.extractedAt : undefined,
     segments: tier1Segments(raw, tier1),
   });
+}
+
+/**
+ * The rules a document's scope was applied under, beside its bytes: how its
+ * date is read (`dateRules`, bump DOC_DATE_RULES when docDateOf reads dates
+ * differently — a dateline at the top, say) and how its claims are keyed
+ * (`claimIdentity`, src/lineage/writer.ts CLAIM_IDENTITY).
+ */
+export const DOC_DATE_RULES = 1;
+const APPLY_RULES = { dateRules: DOC_DATE_RULES, claimIdentity: CLAIM_IDENTITY };
+
+/**
+ * Whether an unchanged source must be applied again because the rules it was
+ * applied under changed (null: it was applied under these). Its date is read
+ * again, and when it comes out other than the stored doc_date the document is
+ * applied again — the stored extraction too, so every claim is dated from what
+ * it stated ("去年" resolved on the new date) or, stating nothing, from the new
+ * date; a corrected date is followed the same way. A document whose own
+ * frontmatter declares claims is applied again when those were keyed by an
+ * older claim identity; one that declares none just has its tier-1 extraction
+ * replayed (ensureTier1Replay). Each document is its own transaction in a sync
+ * pass, and a document checked is marked, so a stopped pass resumes where it was.
+ */
+async function staleApplication(store: Store, live: ScopeRow, file: string, raw: string, docId: string): Promise<{ redo: boolean; reason: string } | null> {
+  const dates = live.meta.dateRules !== DOC_DATE_RULES;
+  const identity = live.meta.claimIdentity !== CLAIM_IDENTITY;
+  if (!dates && !identity) return null;
+  if (dates) {
+    const now = docDateOf(file, parseFrontmatter(raw).frontmatter);
+    const [row] = await store.query<{ doc_date: string | Date | null }>(`SELECT doc_date FROM documents WHERE id = $1`, [docId]);
+    const was = toIso(row?.doc_date ?? null);
+    if (now !== was) return { redo: true, reason: `its date reads ${now?.slice(0, 10) ?? 'none'} now, was ${was?.slice(0, 10) ?? 'none'}` };
+  }
+  if (identity) {
+    const [declared] = await store.query<{ n: number }>(`SELECT 1 AS n FROM evidence WHERE scope_id = $1 AND kind = 'claim' AND tx_to IS NULL LIMIT 1`, [live.id]);
+    if (declared) return { redo: true, reason: 'its claims were keyed by an older claim identity' };
+  }
+  return { redo: false, reason: '' };
 }
 
 export function guessMime(file: string): string {

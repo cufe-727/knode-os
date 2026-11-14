@@ -76,6 +76,16 @@ const CITATION_BATCH = 500;
  * week after week stays one claim there. Existing claims keep their ids until
  * their document is applied again.
  */
+/**
+ * The version of claim identity (claimId + readingDay) a scope's claims were
+ * keyed by, kept in the scope's meta as `claimIdentity`: 1 (absent) subject +
+ * statement; 2 a dated reading of a number, or a statement relative to its
+ * document, carries its day. A document applied under an older one is applied
+ * again from what is stored (src/ingest/apply.ts), so a workspace does not keep
+ * old-identity claims beside new ones.
+ */
+export const CLAIM_IDENTITY = 2;
+
 export function readingDay(c: {
   statement: string;
   attribute?: string | null;

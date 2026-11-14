@@ -4,6 +4,7 @@ import { LLM_EXTRACT_INPUT_CHARS, SEGMENTER_VERSION } from '../constants.js';
 import { readSidecarPart, replayableTier1, SidecarSegment, SidecarTier1, updateSidecarPart } from '../fs/sidecar.js';
 import { loadSourceText } from '../ingest/source.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
+import { CLAIM_IDENTITY } from '../lineage/writer.js';
 import { detectDisputes } from '../lineage/trust.js';
 import { LlmClient } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
@@ -165,7 +166,7 @@ export async function applyTier1Scope(
         actor: opts.actor ?? 'tier1',
         at: opts.at,
         force: opts.force,
-        meta: { documentId: page.documentId, model: opts.model, ...(opts.extractedAt ? { extractedAt: opts.extractedAt } : {}) },
+        meta: { documentId: page.documentId, model: opts.model, claimIdentity: CLAIM_IDENTITY, ...(opts.extractedAt ? { extractedAt: opts.extractedAt } : {}) },
       },
       async (w) => {
         // a re-index that committed since the caller looked replaced the
