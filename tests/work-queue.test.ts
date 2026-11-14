@@ -5,7 +5,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { runAgentHere, setAgentStopping } from '../src/eval/agent.js';
-import { OwnQueue, PieceStuckError, RemoteEval, WaitLimitError } from '../src/eval/remote.js';
+import { OwnQueue, PieceStuckError, RemoteEval, RunCancelledError, WaitLimitError } from '../src/eval/remote.js';
+import { retryableFailure } from '../src/eval/shim.js';
 import { eachWithin, runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
 import { writeReport } from '../src/eval/report.js';
@@ -170,6 +171,13 @@ describe('failures', () => {
     first.cancel();
     second.cancel();
     source.close();
+  });
+
+  it('never has the shim ask a stuck or cancelled piece again, whatever its last error said', () => {
+    const piece = { kind: 'eval-call' as const, label: 'x', family: 'codex' as const, model: 'gpt-test', eligible: 'any' as const, pool: null, system: 's', task: 't', workers: ['a', 'b', 'c'], lastError: 'fetch failed: socket hang up (503)', at: '' };
+    expect(retryableFailure(new Error('fetch failed: socket hang up (503)'))).toBe(true);
+    expect(retryableFailure(new PieceStuckError(piece))).toBe(false);
+    expect(retryableFailure(new RunCancelledError())).toBe(false);
   });
 
   it('tells a stuck piece to the run, which reports it with the system and task it was for', async () => {

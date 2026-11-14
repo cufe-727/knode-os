@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,7 +9,6 @@ import type { ChatMessage } from '../llm/client.js';
 import type { CallUsage } from '../llm/usage.js';
 import { readCodexEvents } from '../llm/usage.js';
 import { MCP_TOKEN_FILE } from '../server/mcp-http.js';
-import crypto from 'node:crypto';
 import type { WorkerIdentity } from '../labeling/scheduler.js';
 import { WorkBroker } from '../work/broker.js';
 import type { EvalAgent, WorkTask } from '../work/broker.js';
@@ -298,6 +298,9 @@ export interface StuckPiece {
 
 /** A piece left unanswered because three different workers could not serve it: the answer or build it was for is not recorded. */
 export class PieceStuckError extends Error {
+  /** Never tried again by the shim: the run reports it and leaves it for a resume. */
+  readonly final = true;
+
   constructor(readonly piece: StuckPiece) {
     super(`stuck: ${piece.workers.length} workers could not serve ${piece.label} (${piece.workers.join(', ')}): ${piece.lastError.slice(0, 300)}`);
   }
@@ -687,6 +690,8 @@ export class PackScope {
 
 /** Every call of this piece of work stopped because the run was cancelled. */
 export class RunCancelledError extends Error {
+  readonly final = true;
+
   constructor() {
     super('the run was cancelled');
   }

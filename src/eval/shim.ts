@@ -339,6 +339,8 @@ const ANSWER_STAGES = new Set(['answer', 'agent', 'query', 'emergence']);
  */
 export function retryableFailure(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
+  // a piece the run left stuck, or stopped, is not asked again by the shim (docs/design/32 §3)
+  if ((err as { final?: boolean } | null)?.final) return false;
   if ((err as { usage?: CallUsage | null }).usage || isRefusal(msg)) return false;
   return /at capacity/i.test(msg) || classifyFailure(msg) === 'transient';
 }
