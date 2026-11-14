@@ -14,6 +14,8 @@ import { CORPUS_WEEKS, makeReportWorld, monthOf } from '../src/eval/packs/report
 import { makeScript } from '../src/eval/packs/synthetic.js';
 import { ledgerTasks } from '../src/eval/packs/life-ledger.js';
 import { buildReportData, renderReport } from '../src/eval/report.js';
+import { Bm25, chunkDocs } from '../src/eval/retrieval.js';
+import { selectTasks } from '../src/eval/run.js';
 import { recordKey, RunStore } from '../src/eval/runstore.js';
 import { matchByFields, scoreLists } from '../src/eval/score/lists.js';
 import { scoreKey, scoreUsage } from '../src/eval/score/usage.js';
@@ -69,7 +71,7 @@ describe('weekly reports: building', () => {
   it('passes validatePack with the new options, and names no week or date in file names', async () => {
     const p = packs.zh;
     expect(validatePack(p).errors).toEqual([]);
-    expect(p.manifest.version).toBe(2);
+    expect(p.manifest.version).toBe(3);
     for (const d of p.docs.filter((x) => x.kind === 'weekly-report')) {
       expect(d.path).not.toMatch(/\d{4}-\d{2}-\d{2}|\/\d{2}-/);
       expect(docText(p, d.path)).toMatch(/\d{4}-\d{2}-\d{2} ~ \d{4}-\d{2}-\d{2}/);
@@ -92,8 +94,117 @@ describe('weekly reports: building', () => {
     const p1 = big.tasks.find((t) => t.id === 'sq-company-p1')!;
     const world = makeReportWorld('en', 0, { size: 10 });
     expect(Number(p1.answer)).toBe(world.divisions.flatMap((s) => s.incidents.filter((i) => i.sev === 'P1' && i.week <= CORPUS_WEEKS)).length);
-    // division questions say which division they ask about
-    expect(big.tasks.filter((t) => t.id.startsWith('d2-')).every((t) => t.question.includes(t.type === 'cross-lingual' ? '第二事业部' : 'Division 2'))).toBe(true);
+    // division questions say which division they ask about, by a team of it or by all three
+    const second = world.divisions[1].teams.map((t) => t.name);
+    expect(second).toEqual(['Platform 2', 'Payments 2', 'Growth 2']);
+    for (const t of big.tasks.filter((x) => x.id.startsWith('d2-'))) expect(t.type === 'cross-lingual' ? t.question.includes('二部') : second.some((n) => t.question.includes(n)), t.question).toBe(true);
+    expect(big.tasks.some((t) => t.question.startsWith('(Platform 2, Payments 2 and Growth 2) '))).toBe(true);
+    expect(big.tasks.filter((t) => /Division \d|事业部/.test(t.question))).toEqual([]);
+  });
+
+  it('names a division in its weekly reports\' words, so a keyword search is not sent to the monthly summaries', async () => {
+    // four divisions: the smallest company whose company-wide structured query spans its 21 documents
+    const p = await build('x4', 'synthetic-reports-zh', { size: 4 });
+    const weekly = p.docs.filter((d) => d.kind === 'weekly-report');
+    const monthly = new Set(p.docs.filter((d) => d.kind === 'pmo-summary').map((d) => d.path));
+    const world = makeReportWorld('zh', 0, { size: 4 });
+    expect(world.divisions.map((s) => s.division.scope)).toEqual(['一部', '二部', '三部', '四部']);
+    // what the PMO calls a division is in its summaries and in no weekly report; the scope is the prefix of its teams' names
+    // (the first division's teams carry none: "一部" is in no document at all)
+    expect(weekly.some((d) => docText(p, d.path).includes('事业部'))).toBe(false);
+    expect([...monthly].every((d) => docText(p, d).includes('事业部'))).toBe(true);
+    expect(p.docs.some((d) => docText(p, d.path).includes('一部'))).toBe(false);
+    for (const s of world.divisions.slice(1)) {
+      const mine = weekly.filter((d) => s.teams.some((t) => d.path.startsWith(`周报/${t.name}/`)));
+      expect(mine).toHaveLength(3 * CORPUS_WEEKS);
+      expect(mine.every((d) => docText(p, d.path).includes(s.division.scope))).toBe(true);
+    }
+    // no question of a division opens with the PMO's name; it names a team of the division, or the division by its scope
+    const company = new Set(['sq-company-p1', 'sq-company-q2-divisions']);
+    for (const t of p.tasks.filter((x) => !company.has(x.id) && x.type !== 'attribution' && !x.afterUpdate)) {
+      const s = world.divisions[Number(/^d(\d+)-/.exec(t.id)?.[1] ?? 1) - 1];
+      expect(t.question, t.id).not.toMatch(/事业部|Division/);
+      const names = t.type === 'cross-lingual' ? s.teams.map((x) => x.alt) : [s.division.scope, ...s.teams.map((x) => x.name)];
+      expect(names.some((n) => t.question.includes(n)), `${t.id}: ${t.question}`).toBe(true);
+      // the qualifier in front only where no team is named
+      if (t.question.startsWith(`（${s.division.scope}）`)) expect(s.teams.some((x) => t.question.includes(x.name)), t.question).toBe(false);
+    }
+    expect(p.tasks.find((t) => t.id === 'd2-r-n-p1')!.question).toBe(`截至第${CORPUS_WEEKS}周，二部的三个组一共出过几起P1事故？`);
+    expect(p.tasks.find((t) => t.id === 'd2-r-p1-D2T1')!.question).toBe(`二部平台组今年（截至第${CORPUS_WEEKS}周）出过哪些P1事故？列出事故编号和名称。`);
+    expect(p.tasks.find((t) => t.id === 'sq-company-p1')!.question).not.toContain('事业部');
+    // one division alone is asked as before: no scope anywhere
+    expect(packs.zh.tasks.some((t) => /[一二]部/.test(t.question))).toBe(false);
+    expect(packs.zh.tasks.find((t) => t.id === 'r-n-p1')!.question).toBe(`截至第${CORPUS_WEEKS}周，三个组一共出过几起P1事故？`);
+
+    // by keyword (the harness's own BM25) the second division's questions reach its weekly reports; with the PMO's
+    // name in front, as the pack was built before, the top five were monthly summaries for nearly every one
+    const bm25 = new Bm25(chunkDocs(p.docs.map((d) => ({ path: d.path, text: docText(p, d.path) }))), (c) => c.text);
+    const top5 = (q: string) => [...new Set(bm25.search(q, 20).map((h) => h.item.doc))].slice(0, 5);
+    const asked = p.tasks.filter((t) => t.id.startsWith('d2-') && t.suite === 'usage' && t.evidence.length && t.type !== 'cross-lingual');
+    const share = (question: (t: Task) => string) => {
+      const tops = asked.map((t) => ({ top: top5(question(t)), gold: new Set(t.evidence.map((e) => e.doc)) }));
+      return { summaries: tops.filter((x) => x.top.every((d) => monthly.has(d))).length / tops.length, hit: tops.filter((x) => x.top.some((d) => x.gold.has(d))).length / tops.length };
+    };
+    const now = share((t) => t.question);
+    const before = share((t) => `（第二事业部）${t.question.replace(/^（二部）/, '')}`);
+    expect(asked.length).toBeGreaterThan(100);
+    expect(before.summaries).toBeGreaterThan(0.8);
+    expect(before.hit).toBeLessThan(0.1);
+    expect(now.summaries).toBeLessThan(0.2);
+    expect(now.hit).toBeGreaterThan(0.4);
+  });
+
+  it('samples deep hops in proportion to their chains at any size and limit', async () => {
+    const chain = (t: Task) => t.id.replace(/^d\d+-/, '').split('-')[0];
+    const mix = (ts: Task[]) => {
+      const deep = ts.filter((t) => t.type === 'deep-hop');
+      return Object.fromEntries(['h4', 'h5', 'h5r'].map((k) => [k, deep.filter((t) => chain(t) === k).length]));
+    };
+    const x4 = packs.x4 ?? (await build('x4', 'synthetic-reports-zh', { size: 4 }));
+    for (const p of [packs.zh, packs.en, x4]) for (const t of p.tasks.filter((x) => x.type === 'deep-hop')) expect(t.meta?.stratum, t.id).toBe(chain(t));
+    const suites = new Set(['usage', 'emergence']);
+    const all = mix(packs.zh.tasks);
+    expect(all).toEqual({ h4: 3, h5: 2, h5r: 2 });
+    const scaled = mix(x4.tasks);
+    expect(scaled.h4 + scaled.h5 + scaled.h5r).toBeGreaterThan(3 * 7);
+    // the 1× pack whole, and 4× under limits: the same shares, to within a task
+    const total = all.h4 + all.h5 + all.h5r;
+    for (const limit of [60, 120, 200, 300]) {
+      const picked = mix(selectTasks(x4.tasks.filter((t) => !t.afterUpdate), suites, limit, 0));
+      const n = picked.h4 + picked.h5 + picked.h5r;
+      expect(n, `limit ${limit}`).toBeGreaterThan(2);
+      for (const k of ['h4', 'h5', 'h5r'] as const) expect(Math.abs(picked[k] - (n * all[k]) / total), `limit ${limit}: ${JSON.stringify(picked)}`).toBeLessThanOrEqual(1);
+    }
+    // a pack built before the chains were named samples as it did: primaries first, so no four-hop chain at all
+    const unnamed = x4.tasks.map((t) => (t.type === 'deep-hop' ? { ...t, meta: { ...t.meta, stratum: undefined } } : t));
+    expect(mix(selectTasks(unnamed.filter((t) => !t.afterUpdate), suites, 120, 0)).h4).toBe(0);
+  });
+
+  it('interleaves the strata of a type in proportion, primaries first within each, and leaves other types as they were', () => {
+    const task = (id: string, type: string, stratum?: string, primary = false): Task => ({ id, suite: 'usage', type: type as Task['type'], question: id, scoring: 'judge', evidence: [], ...(stratum ? { meta: { stratum } } : {}), ...(primary ? { primary } : {}) });
+    const tasks = [
+      ...Array.from({ length: 12 }, (_, i) => task(`a${i}`, 'deep-hop', 'a')),
+      ...Array.from({ length: 6 }, (_, i) => task(`b${i}`, 'deep-hop', 'b', i < 2)),
+      ...Array.from({ length: 6 }, (_, i) => task(`c${i}`, 'deep-hop', 'c', true)),
+      ...Array.from({ length: 24 }, (_, i) => task(`t${i}`, 'temporal', undefined, i % 5 === 0)),
+    ];
+    const suites = new Set(['usage']);
+    for (const limit of [4, 8, 16, 24, 40]) {
+      const picked = selectTasks(tasks, suites, limit, 7);
+      const deep = picked.filter((t) => t.type === 'deep-hop');
+      expect(deep).toHaveLength(limit / 2);
+      const of = (k: string) => deep.filter((t) => t.meta?.stratum === k);
+      expect(Math.abs(of('a').length - deep.length / 2), `limit ${limit}`).toBeLessThanOrEqual(1);
+      expect(Math.abs(of('b').length - deep.length / 4), `limit ${limit}`).toBeLessThanOrEqual(1);
+      expect(Math.abs(of('c').length - deep.length / 4), `limit ${limit}`).toBeLessThanOrEqual(1);
+      // b's two primaries are the first two of b taken
+      expect(of('b').slice(0, 2).every((t) => t.primary) || of('b').length < 2 ? true : false, `limit ${limit}`).toBe(true);
+      // a type with no stratum: primaries first, as before
+      const plain = picked.filter((t) => t.type === 'temporal');
+      const firstOther = plain.findIndex((t) => !t.primary);
+      expect(firstOther < 0 || plain.slice(firstOther).every((t) => !t.primary), `limit ${limit}`).toBe(true);
+      expect(plain.filter((t) => t.primary)).toHaveLength(Math.min(5, plain.length));
+    }
   });
 
   it('phrases each kind of fact several ways, so one pattern does not find them all', () => {

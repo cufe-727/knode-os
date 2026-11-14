@@ -225,7 +225,15 @@ function knodeVersion(): string {
   }
 }
 
-/** Tasks a system answers on a pack: the suites asked for, stratified by type, at most `limit`. */
+/**
+ * Tasks a system answers on a pack: the suites asked for, stratified by type, at most `limit`.
+ *
+ * Within a type the primary tasks come first. A type whose tasks name a `meta.stratum` (the reports' deep hops:
+ * h4, h5, h5r) is taken in proportion to its strata, whatever the number taken: primaries first within each
+ * stratum, the strata interleaved by how far through each one a task is. Without that a limited run sampled a
+ * different mix from an unlimited one — of the 10× reports pack's 69 deep hops (20 h5, 29 h4, 20 h5r) the 18
+ * a run took at a limit of 300 were 8 h5 and 10 h5r and no h4, h4 having no primary, against 2 / 3 / 2 at 1×.
+ */
 export function selectTasks(tasks: Task[], suites: Set<string>, limit: number | undefined, seed: string | number): Task[] {
   const pool = tasks.filter((t) => suites.has(t.suite));
   if (!limit || pool.length <= limit) return pool;
@@ -233,8 +241,11 @@ export function selectTasks(tasks: Task[], suites: Set<string>, limit: number | 
   for (const t of [...pool].sort((a, b) => seededKey(seed, a.id).localeCompare(seededKey(seed, b.id)))) {
     (byType.get(t.type) ?? byType.set(t.type, []).get(t.type)!).push(t);
   }
-  // primary tasks first within each type, then round-robin across types
-  for (const list of byType.values()) list.sort((a, b) => Number(Boolean(b.primary)) - Number(Boolean(a.primary)));
+  // primary tasks first within each type (within each stratum of it), then round-robin across types
+  for (const [type, list] of byType) {
+    list.sort((a, b) => Number(Boolean(b.primary)) - Number(Boolean(a.primary)));
+    byType.set(type, interleaveStrata(list));
+  }
   const out: Task[] = [];
   const lists = [...byType.values()];
   for (let i = 0; out.length < limit; i++) {
@@ -1052,6 +1063,22 @@ async function retrieveAll(store: RunStore, env: SystemEnv, s: SystemUnderTest, 
     put('mrr@10', r.mrr10);
     put('ndcg@10', r.ndcg10);
   }
+}
+
+/**
+ * `list` reordered so that every prefix of it holds its strata (`meta.stratum`) in proportion to their sizes, to
+ * within one task: the j-th of a stratum of m tasks sits at (j + ½) / m of the way through, each stratum in the
+ * order it came. A list with one stratum, or none named, is returned as it is.
+ */
+function interleaveStrata(list: Task[]): Task[] {
+  const stratumOf = (t: Task) => (typeof t.meta?.stratum === 'string' ? t.meta.stratum : '');
+  const strata = new Map<string, Task[]>();
+  for (const t of list) (strata.get(stratumOf(t)) ?? strata.set(stratumOf(t), []).get(stratumOf(t))!).push(t);
+  if (strata.size < 2) return list;
+  return [...strata.entries()]
+    .flatMap(([name, of]) => of.map((task, j) => ({ task, name, at: (j + 0.5) / of.length })))
+    .sort((a, b) => a.at - b.at || a.name.localeCompare(b.name))
+    .map((x) => x.task);
 }
 
 export { emptyUsage };

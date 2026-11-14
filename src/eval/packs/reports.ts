@@ -41,7 +41,8 @@ import { PackWriter } from './writer.js';
 
 type Lang = 'zh' | 'en';
 
-export const REPORTS_VERSION = 2;
+/** 3 (2026-11-14): a division's questions name it in its weekly reports' words; deep hops carry their chain as `meta.stratum`. */
+export const REPORTS_VERSION = 3;
 export const REPORT_WEEKS = 52;
 export const CORPUS_WEEKS = 44;
 const START = Date.UTC(2025, 0, 6); // a Monday
@@ -113,8 +114,17 @@ export interface RTeam { id: string; name: string; alt: string; def: number; lea
 export interface ReportScript {
   lang: Lang;
   seed: string;
-  /** The division: its index, and how questions name it ('' when the company is one division). */
-  division: { index: number; label: string; alt: string };
+  /**
+   * The division: its index, what the PMO calls it (`label`, `alt` in the other language) and how questions say
+   * which division they ask about (`scope`, `altScope`) — all '' when the company is one division. The PMO's
+   * name ("第二事业部", "Division 2") is in the monthly summaries and in no weekly report: a question that
+   * opened with it sent a keyword search to the summaries (hit@5 0.07 with the prefix, 0.39 without, on the
+   * 2026-11 10× run). `scope` is in the words the weekly reports use: in Chinese "二部", as in "二部平台组"
+   * — and "一部" for the first division, whose teams carry no prefix: a word of the same kind that no document
+   * holds, so it sends a search nowhere (naming its three teams sent it to every summary, which name all three)
+   * — and in English the division's three team names ("Platform 2, Payments 2 and Growth 2").
+   */
+  division: { index: number; label: string; alt: string; scope: string; altScope: string };
   teams: RTeam[];
   people: RPerson[];
   projects: RProject[];
@@ -346,6 +356,13 @@ function divisionLabel(lang: Lang, index: number, size: number): { label: string
   return lang === 'zh' ? { label: `第${cnNum(index + 1)}事业部`, alt: `Division ${index + 1}` } : { label: `Division ${index + 1}`, alt: `第${cnNum(index + 1)}事业部` };
 }
 
+/** How a question says which division it asks about, in the words the weekly reports name teams with (see `ReportScript.division`). */
+function divisionScope(lang: Lang, index: number, size: number, teams: string[]): string {
+  if (size <= 1) return '';
+  if (lang === 'zh') return `${cnNum(index + 1)}部`;
+  return `${teams.slice(0, -1).join(', ')} and ${teams.at(-1)}`;
+}
+
 function teamNames(lang: Lang, defIndex: number, d: number): { name: string; alt: string } {
   const other: Lang = lang === 'zh' ? 'en' : 'zh';
   const named = (l: Lang) => (d === 0 ? TEAM_DEFS[l][defIndex].name : l === 'zh' ? `${cnNum(d + 1)}部${TEAM_DEFS.zh[defIndex].name}` : `${TEAM_DEFS.en[defIndex].name} ${d + 1}`);
@@ -516,7 +533,8 @@ function buildDivision(
     if (d === 0) projects.find((p) => p.id === `${teams[0].id}-p1`)!.lookalikeOf = `${teams[1].id}-p0`;
   }
   const label = focal ? divisionLabel(lang, d, at.size) : { label: '', alt: '' };
-  return { lang, seed, division: { index: d, ...label }, teams, people, projects, incidents, risks, customers, tracked, twins: focal ? twins : [], chains, overtime, pmo, styles };
+  const scope = focal ? { scope: divisionScope(lang, d, at.size, teams.map((t) => t.name)), altScope: divisionScope(lang === 'zh' ? 'en' : 'zh', d, at.size, teams.map((t) => t.alt)) } : { scope: '', altScope: '' };
+  return { lang, seed, division: { index: d, ...label, ...scope }, teams, people, projects, incidents, risks, customers, tracked, twins: focal ? twins : [], chains, overtime, pmo, styles };
 }
 
 /* ---------------------------------- rendering ---------------------------------- */
@@ -847,7 +865,7 @@ export function reportTasks(s: ReportScript, docOf: (team: string, week: number)
   const ev = (docs: string[]) => [...new Set(docs)].map((doc) => ({ doc }));
   const inCorpus = (w: number) => w >= 1 && w <= CORPUS_WEEKS;
   const q = scoped(s);
-  const three = s.division.label ? (zh ? `${s.division.label}的三个组` : `the three teams of ${s.division.label}`) : zh ? '三个组' : 'the three teams';
+  const three = threeTeams(s, zh ? '三个组' : 'the three teams');
   const list = (id: string, type: Task['type'], question: string, items: GoldItem[], docs: string[], x: Partial<ListSpec> = {}, primary = false) => {
     if (new Set(docs).size < CORPUS_TASK_MIN_DOCS || !items.length) return;
     out.push({ id, suite: 'usage', type, lang: L, question: q(question), scoring: 'set', items, list: spec({ maxItems: Math.min(60, Math.max(10, items.length + 5)), ...x }), closedWorld: closed, evidence: ev(docs), ...(primary ? { primary } : {}) });
@@ -1003,7 +1021,7 @@ export function reportTasks(s: ReportScript, docOf: (team: string, week: number)
     out.push({ id: `h5-${i.id}`, suite: 'usage', type: 'deep-hop', lang: L,
       question: q(zh ? `${monthName(monthOf(i.week))}${cn}升级的那起P1事故，修复它的工程师后来调到了另一个组，并在那里接手了一个项目。那个项目最终是在第几周上线的？` : `The P1 incident ${cn} escalated in ${monthName(monthOf(i.week))} was fixed by an engineer who later moved to another team and took over a project there. In which week did that project finally launch?`),
       answer: zh ? `第${p.launch}周（${projectName(p, p.launch)}）` : `week ${p.launch} (${projectName(p, p.launch)})`, keypoints: [String(p.launch)], scoring: 'judge', evidence: ev(docs), primary: true,
-      meta: { hops: 5, bridges: [i.id, mover.name, team(mover.movedTo!.team).name, projectName(p, p.ownerChange!.week)] } });
+      meta: { hops: 5, stratum: 'h5', bridges: [i.id, mover.name, team(mover.movedTo!.team).name, projectName(p, p.ownerChange!.week)] } });
   }
   // four hops: risk → who raised it → they left → who owns the risk after → that person's project
   for (const rk of s.risks.filter((r) => r.ownerChange && inCorpus(r.ownerChange.week))) {
@@ -1016,7 +1034,7 @@ export function reportTasks(s: ReportScript, docOf: (team: string, week: number)
     const status = p.launch <= CORPUS_WEEKS ? (zh ? `第${p.launch}周上线` : `launched in week ${p.launch}`) : (zh ? `到第${CORPUS_WEEKS}周完成度${p.progress[CORPUS_WEEKS - 1]}%` : `${p.progress[CORPUS_WEEKS - 1]}% done by week ${CORPUS_WEEKS}`);
     out.push({ id: `h4-${rk.id}`, suite: 'usage', type: 'deep-hop', lang: L,
       question: q(zh ? `风险${rk.id}后来换了负责人。新负责人自己负责的是哪个项目？那个项目到第${CORPUS_WEEKS}周为止情况如何？` : `Risk ${rk.id} later changed owner. Which project does the new owner run, and where did it stand by week ${CORPUS_WEEKS}?`),
-      answer: `${projectName(p, CORPUS_WEEKS)}：${status}`, keypoints: [projectName(p, CORPUS_WEEKS), status], scoring: 'judge', evidence: ev(docs), meta: { hops: 4, bridges: [owner] } });
+      answer: `${projectName(p, CORPUS_WEEKS)}：${status}`, keypoints: [projectName(p, CORPUS_WEEKS), status], scoring: 'judge', evidence: ev(docs), meta: { hops: 4, stratum: 'h4', bridges: [owner] } });
   }
   // five hops the other way: a risk → who raised it → the escalated P1 they fixed → the same customer's incident in another team → who fixed that
   for (const rk of s.risks.filter((r) => inCorpus(r.opened))) {
@@ -1028,7 +1046,7 @@ export function reportTasks(s: ReportScript, docOf: (team: string, week: number)
     out.push({ id: `h5r-${fixed.customer}`, suite: 'usage', type: 'deep-hop', lang: L,
       question: q(zh ? `提出风险${rk.id}的人修复过一起由客户升级的事故。同一个客户还在另一个组升级过事故——那一起是谁修复的？` : `Whoever raised risk ${rk.id} fixed an incident a customer had escalated. The same customer escalated an incident in another team as well: who fixed that one?`),
       answer: zh ? `${other.fixer}（${team(other.team).name}，${other.id}）` : `${other.fixer} (${team(other.team).name}, ${other.id})`, keypoints: [other.fixer], scoring: 'judge', evidence: ev(docs), primary: true,
-      meta: { hops: 5, bridges: [rk.raisedBy, fixed.id, fixed.customer!, other.id] } });
+      meta: { hops: 5, stratum: 'h5r', bridges: [rk.raisedBy, fixed.id, fixed.customer!, other.id] } });
   }
 
   // ambiguity: people with one name; a renamed project; a metric whose definition changed
@@ -1091,11 +1109,24 @@ export function reportTasks(s: ReportScript, docOf: (team: string, week: number)
   return out;
 }
 
-/** Questions of a division name it when the company has more than one. */
-function scoped(s: ReportScript): (question: string) => string {
-  const label = s.division.label;
-  if (!label) return (x) => x;
-  return s.lang === 'zh' ? (x) => `（${label}）${x}` : (x) => `(${label}) ${x}`;
+/**
+ * Questions of a division say which one when the company has more than one: by the team they name ("二部平台组"
+ * is of the second division), else by the division's `scope` in front. `alt`: a question in the other language.
+ */
+function scoped(s: ReportScript, alt = false): (question: string) => string {
+  const scope = alt ? s.division.altScope : s.division.scope;
+  if (!scope) return (x) => x;
+  const names = s.teams.map((t) => (alt ? t.alt : t.name));
+  const zh = (s.lang === 'zh') !== alt;
+  return (x) => (x.includes(scope) || names.some((n) => x.includes(n)) ? x : zh ? `（${scope}）${x}` : `(${scope}) ${x}`);
+}
+
+/** "The three teams" of a division, said so that it names the division: `bare` when the company is one division. */
+function threeTeams(s: ReportScript, bare: string): string {
+  const { scope } = s.division;
+  if (!scope) return bare;
+  if (s.lang === 'zh') return `${scope}的三个组`;
+  return `the three teams ${scope}`;
 }
 
 /* --------------------------- the separation families --------------------------- */
@@ -1129,7 +1160,7 @@ export function separationTasks(s: ReportScript, docOf: (team: string, week: num
     const f = facts(s, team(teamId), week);
     return SECTIONS.flatMap((k) => f[k]).filter((l) => l.key === key || l.key.startsWith(`${key}:`)).map((l) => l.text);
   };
-  const scope = s.division.label ? (zh ? `${s.division.label}的三个组` : `the three teams of ${s.division.label}`) : zh ? '这三个组' : 'the three teams';
+  const scope = threeTeams(s, zh ? '这三个组' : 'the three teams');
   const idSpec = (n: number): ListSpec => ({ match: 'alias', ordered: false, maxItems: Math.min(60, Math.max(10, n + 5)), requireDocs: false, primary: 'f1' });
 
   /* a. stale traps: the setting's name only ever carries its first value */
@@ -1281,11 +1312,13 @@ export function separationTasks(s: ReportScript, docOf: (team: string, week: num
     const p1s = s.incidents.filter((i) => i.team === t.id && i.sev === 'P1' && inCorpus(i.week + 1)).sort((a, b) => a.week - b.week);
     p1s.forEach((i, n) => {
       const fixer = s.people.find((p) => p.name === i.fixer && (p.team === t.id || p.movedTo?.team === t.id))!;
-      const anchor = zh ? `${s.division.label}${desc}今年第${ord(n + 1)}起最严重一档的故障` : `the ${ord(n + 1)} top-severity outage of the year in ${desc}${s.division.label ? ` of ${s.division.label}` : ''}`;
+      // the team by what it does, among the division's: its scope names the division, never the team
+      const within = !s.division.scope ? '' : zh ? s.division.scope : ` among ${s.division.scope}`;
+      const anchor = zh ? `${within}${desc}今年第${ord(n + 1)}起最严重一档的故障` : `the ${ord(n + 1)} top-severity outage of the year in ${desc}${within}`;
       const base = [docOf(t.id, i.week), docOf(t.id, i.week + 1)];
       const baseLines = [...lineOf(t.id, i.week, `inc:${i.id}`), ...lineOf(t.id, i.week + 1, `fix:${i.id}`)];
       const push = (kind: string, question: string, answer: string, answers: string[], docs: string[], lines: string[], hops: number, bridges: string[], scoring: Task['scoring']) => {
-        const overlap = lexicalOverlap(L, question, lines, [s.division.label]);
+        const overlap = lexicalOverlap(L, question, lines, [s.division.scope, ...s.teams.map((x) => x.name)]);
         if (overlap.length || new Set(docs).size < 3 || bridges.some((b) => question.includes(b))) return;
         out.push({ id: `nh-${kind}-${i.id}`, suite: 'usage', type: 'nonlexical-hop', lang: L, question, answer, ...(answers.length ? { answers } : {}), scoring, evidence: ev(docs), meta: { family: 'nonlexical-hop', hops, bridges, overlap } });
       };
@@ -1330,7 +1363,7 @@ export function separationTasks(s: ReportScript, docOf: (team: string, week: num
 
   /* f. the same questions in other words, and in the other language */
   const alt = (t: RTeam) => t.alt;
-  const altScope = (x: string) => (s.division.alt ? (other === 'zh' ? `（${s.division.alt}）${x}` : `(${s.division.alt}) ${x}`) : x);
+  const altScope = scoped(s, true);
   const find = (id: string) => base.find((t) => t.id === id) ?? out.find((t) => t.id === id);
   const variant = (key: string, n: number) => parseInt(seededKey(s.seed, `pp|${key}`).slice(0, 8), 16) % n;
   for (const t of s.teams) {
@@ -1457,7 +1490,8 @@ async function buildReports(lang: Lang, dir: string, ctx: RecipeContext) {
   if (size > 1) {
     const all = world.divisions.flatMap((s) => s.incidents.filter((i) => i.week <= CORPUS_WEEKS && i.sev === 'P1'));
     w.addTask({ id: 'sq-company-p1', suite: 'usage', type: 'structured', lang, scoring: 'count', answer: String(all.length),
-      question: zh ? `截至第${CORPUS_WEEKS}周，全公司所有事业部一共出过几起P1事故？` : `Through week ${CORPUS_WEEKS}, how many P1 incidents did the whole company have, across all divisions?`, evidence: [...new Set(all.map((i) => docOf(i.team, i.week)))].map((doc) => ({ doc })), meta: { family: 'structured', aggregate: 'count', scope: 'company' } });
+      // "every team", not "every division": a division is named in the monthly summaries only
+      question: zh ? `截至第${CORPUS_WEEKS}周，全公司所有组一共出过几起P1事故？` : `Through week ${CORPUS_WEEKS}, how many P1 incidents did the whole company have, across all its teams?`, evidence: [...new Set(all.map((i) => docOf(i.team, i.week)))].map((doc) => ({ doc })), meta: { family: 'structured', aggregate: 'count', scope: 'company' } });
     if (size <= 50) {
       const per = world.divisions.map((s) => ({ s, n: s.incidents.filter((i) => i.week <= CORPUS_WEEKS && quarterOf(i.week) === 2).length }));
       w.addTask({ id: 'sq-company-q2-divisions', suite: 'usage', type: 'structured', lang, scoring: 'set', list: exactSetSpec(per.length),
