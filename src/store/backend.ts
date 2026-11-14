@@ -1,6 +1,8 @@
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { threadId } from 'node:worker_threads';
 import { PGlite } from '@electric-sql/pglite';
 import { vector } from '@electric-sql/pglite-pgvector';
 import pg from 'pg';
@@ -292,14 +294,347 @@ export function pgliteDir(dataDir: string, cfg?: Pick<DatabaseConfig, 'path'>): 
   return path.isAbsolute(configured) ? configured : path.join(dataDir, configured);
 }
 
-/** The built-in `pglite` backend: Postgres + pgvector embedded in the process, nothing to install or run. */
-export async function openPglite(dataDir: string, cfg?: Pick<DatabaseConfig, 'path'>): Promise<Backend> {
-  return (await PGlite.create(pgliteDir(dataDir, cfg), { extensions: { vector } })) as unknown as Backend;
+/*
+ * One open per embedded database.
+ *
+ * PGlite takes no lock on its data directory: every `PGlite.create` on one
+ * directory is an independent single-user Postgres with its own buffers over
+ * the same files, and nothing reports the second. Once one of them writes, the
+ * others read pages it has not flushed and rows of transactions only it can
+ * finish; an instance that meets such a row waits for that transaction in a
+ * busy sleep on the main thread (inside WASM), forever (docs/design/31, F2:
+ * three instances opened on one directory in 0.5 s without an error, and the
+ * evaluation harness stalled at 97 % CPU in `PostgresMainLoopOnce → … →
+ * pg_usleep`). So the backend enforces what the docs always said:
+ *
+ * - In this process, a registry of open directories by real path (on
+ *   `globalThis`, so two copies of this module — a test runner's isolation, a
+ *   plugin's own import — still share it). A second open throws at once.
+ * - Across processes, a lock file beside the database directory
+ *   (`<dir>.lock`, never inside PGlite's own files), holding the pid, when that
+ *   process started and what it is. It is created atomically (hard link of a
+ *   complete file, else `wx`), removed on close and on a normal exit. A lock
+ *   whose process is gone is reclaimed silently; one whose process is alive
+ *   makes the open throw, naming the pid and command. The lock names the
+ *   directory it locks, so one copied along with a workspace (a backup, a
+ *   reused evaluation build) is ignored at its new place.
+ *
+ * A process killed outright (SIGKILL, or a signal nothing handles) leaves its
+ * lock behind; the next open finds the pid gone and reclaims it. Against pid
+ * reuse the lock records when it was taken: a live process at that pid that
+ * started after that moment cannot be the holder, and its lock is reclaimed
+ * too (`ps -o lstart`, one-second resolution; on a system without `ps` a live
+ * pid is taken at its word). Worker threads of one process have registries of
+ * their own; a lock held by another thread of this process is refused, and
+ * stays until that thread closes the store or the process exits.
+ */
+
+interface PgliteLockHolder {
+  pid: number;
+  /** The database directory (real path) it locks: a lock copied along with a workspace locks nothing. */
+  dir: string;
+  /** Worker thread id, 0 for the main thread. */
+  thread: number;
+  /** When the holding process started (epoch ms, from its uptime). */
+  started: number;
+  /** When the lock was taken (epoch ms). */
+  at: number;
+  /** What opened it: the program and its subcommand words, never flag values. */
+  command: string;
+  /** Unique per open, so a close removes its own lock and nobody else's. */
+  token: string;
 }
 
-/** Delete a workspace's embedded database directory; the next `openPglite` creates an empty one. */
+interface OpenPglite {
+  lock: string;
+  token: string;
+}
+
+const OPEN_PGLITE = Symbol.for('knode-os.pglite.open-dirs');
+
+/** Directories open in this process (this thread), by real path. */
+function openPgliteDirs(): Map<string, OpenPglite> {
+  const g = globalThis as unknown as Record<symbol, Map<string, OpenPglite> | undefined>;
+  let dirs = g[OPEN_PGLITE];
+  if (!dirs) {
+    dirs = new Map();
+    g[OPEN_PGLITE] = dirs;
+    // a normal exit takes its locks with it; one killed outright leaves them for the next open to reclaim
+    process.once('exit', () => {
+      for (const open of dirs!.values()) removeOwnLock(open);
+      dirs!.clear();
+    });
+  }
+  return dirs;
+}
+
+/** The directory's real path, resolving through the part that exists: two spellings of one directory are one key. */
+function canonicalDir(dir: string): string {
+  const resolved = path.resolve(dir);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    const parent = path.dirname(resolved);
+    return parent === resolved ? resolved : path.join(canonicalDir(parent), path.basename(resolved));
+  }
+}
+
+/** Where the lock of an embedded database lives: beside its directory, outside PGlite's own files. */
+export function pgliteLockPath(dataDir: string, cfg?: Pick<DatabaseConfig, 'path'>): string {
+  return `${canonicalDir(pgliteDir(dataDir, cfg))}.lock`;
+}
+
+const processStarted = (): number => Math.round(Date.now() - process.uptime() * 1000);
+
+/**
+ * What this process is, short: the script's name (`knode-os` for the CLI) and
+ * the bare words after it that look like subcommands. A word that follows a
+ * flag may be its value — a path, a URL, a token — and is left out.
+ */
+function processCommand(): string {
+  const [, script, ...args] = process.argv;
+  let name = script ? path.basename(script).replace(/\.[cm]?[jt]s$/, '') : process.title;
+  if (name === 'cli') name = 'knode-os';
+  const words: string[] = [];
+  let prev = '';
+  for (const arg of args) {
+    if (words.length >= 4) break;
+    if (!arg.startsWith('-') && !prev.startsWith('-') && /^[a-z][a-z0-9-]{0,23}$/.test(arg)) words.push(arg);
+    prev = arg;
+  }
+  return [name || 'node', ...words].join(' ');
+}
+
+function readLock(lock: string): { raw: string; holder: PgliteLockHolder | null } | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(lock, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+  try {
+    const h = JSON.parse(raw) as PgliteLockHolder;
+    return { raw, holder: Number.isInteger(h?.pid) && h.pid > 0 ? h : null };
+  } catch {
+    return { raw, holder: null };
+  }
+}
+
+/** When a live process started (epoch ms), or undefined when that cannot be told. */
+function processStartTime(pid: number): number | undefined {
+  if (process.platform === 'win32') return undefined;
+  try {
+    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      env: { ...process.env, LC_ALL: 'C' },
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    }).trim();
+    const t = Date.parse(out);
+    return Number.isFinite(t) ? t : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether the process a lock names still holds it: alive, and the same process that took it. */
+function lockHeld(h: PgliteLockHolder, dir: string): boolean {
+  // copied with the workspace (a backup, a reused evaluation build): its holder has the original open, not this one
+  if (typeof h.dir === 'string' && h.dir !== dir) return false;
+  // `ps` and the uptime clock truncate to the second; a process that started this much after the lock cannot hold it
+  const SLACK_MS = 1500;
+  if (h.pid === process.pid) {
+    // this pid: an earlier process's lock, or another thread of this one (this thread's own opens are in the registry)
+    return !(typeof h.at === 'number' && processStarted() > h.at + SLACK_MS);
+  }
+  try {
+    process.kill(h.pid, 0);
+  } catch (err) {
+    // EPERM: alive, someone else's
+    if ((err as NodeJS.ErrnoException).code === 'ESRCH') return false;
+  }
+  if (typeof h.at === 'number') {
+    const started = processStartTime(h.pid);
+    if (started !== undefined && started > h.at + SLACK_MS) return false; // the pid was reused
+  }
+  return true;
+}
+
+function describeHolder(h: PgliteLockHolder): string {
+  const thread = h.thread ? ` (worker thread ${h.thread})` : '';
+  const since = typeof h.at === 'number' ? `, since ${new Date(h.at).toISOString()}` : '';
+  return `process ${h.pid}${thread}: ${h.command || 'unknown command'}${since}`;
+}
+
+function lockedError(message: string, holder?: PgliteLockHolder): Error {
+  return Object.assign(new Error(message), { code: 'KNODE_PGLITE_OPEN', ...(holder ? { holder } : {}) });
+}
+
+/** Create the lock file whole, or fail with EEXIST: a hard link of a complete file is atomic; `wx` where links are not supported. */
+function createLock(lock: string, content: string): void {
+  const tmp = `${lock}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  fs.writeFileSync(tmp, content, { flag: 'wx' });
+  try {
+    fs.linkSync(tmp, lock);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') throw err;
+    // a filesystem without hard links: an exclusive create, written straight after
+    fs.writeFileSync(lock, content, { flag: 'wx' });
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+/**
+ * Take the cross-process lock of one database directory, reclaiming a stale
+ * one; throw, naming the holder, while a live process has it.
+ */
+function acquireLock(dir: string, lock: string): OpenPglite {
+  const holder: PgliteLockHolder = {
+    pid: process.pid,
+    dir,
+    thread: threadId,
+    started: processStarted(),
+    at: Date.now(),
+    command: processCommand(),
+    token: crypto.randomBytes(8).toString('hex'),
+  };
+  const content = JSON.stringify(holder) + '\n';
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      createLock(lock, content);
+      return { lock, token: holder.token };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    const found = readLock(lock);
+    if (!found) continue; // released meanwhile
+    if (found.holder && lockHeld(found.holder, dir)) {
+      const h = found.holder;
+      const where = h.pid === process.pid ? 'another thread of this process' : 'another process';
+      throw lockedError(
+        `the embedded PGlite index ${dir} is open in ${describeHolder(h)} — PGlite allows one process at a time on a database (${where} holds ${lock}). ` +
+          `Stop it, or reach the workspace through it (a running \`knode-os serve\` answers the CLI and serves MCP over HTTP). Remove the lock by hand only if that process is not using this index.`,
+        h,
+      );
+    }
+    // stale: move it aside, and delete it only if it is still the lock just judged — another opener may have reclaimed it meanwhile
+    const aside = `${lock}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.stale`;
+    try {
+      fs.renameSync(lock, aside);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw err;
+    }
+    let moved = '';
+    try {
+      moved = fs.readFileSync(aside, 'utf8');
+    } catch {
+      // gone; nothing to put back
+    }
+    if (moved && moved !== found.raw) {
+      // a fresh lock taken between the read and the rename: put it back, and judge it on the next pass
+      try {
+        fs.linkSync(aside, lock);
+      } catch {
+        // yet another opener has created one; the next pass judges that
+      }
+    }
+    fs.rmSync(aside, { force: true });
+  }
+  throw lockedError(`could not take the lock ${lock} of the embedded PGlite index ${dir}: other processes kept replacing it`);
+}
+
+/** Remove a lock this open took, and only if it is still that one. */
+function removeOwnLock(open: OpenPglite): void {
+  try {
+    const found = readLock(open.lock);
+    if (found?.holder?.token === open.token) fs.rmSync(open.lock, { force: true });
+  } catch {
+    // unreadable: leave it; a dead pid's lock is reclaimed by the next open
+  }
+}
+
+/** Claim a database directory for this open: the in-process registry, then the lock file. */
+function claimPgliteDir(dir: string): { key: string; release: () => void } {
+  const key = canonicalDir(dir);
+  const dirs = openPgliteDirs();
+  if (dirs.has(key)) {
+    throw lockedError(
+      `the embedded PGlite index ${key} is already open in this process (pid ${process.pid}) — PGlite allows one open at a time on a database; share the open store, or close it before opening the directory again`,
+    );
+  }
+  const open = acquireLock(key, `${key}.lock`);
+  dirs.set(key, open);
+  let released = false;
+  return {
+    key,
+    release: () => {
+      if (released) return;
+      released = true;
+      if (dirs.get(key) === open) dirs.delete(key);
+      removeOwnLock(open);
+    },
+  };
+}
+
+/** Whether this process has the embedded database of a workspace open (for tests and diagnostics). */
+export function pgliteOpenInProcess(dataDir: string, cfg?: Pick<DatabaseConfig, 'path'>): boolean {
+  return openPgliteDirs().has(canonicalDir(pgliteDir(dataDir, cfg)));
+}
+
+/**
+ * The built-in `pglite` backend: Postgres + pgvector embedded in the process,
+ * nothing to install or run. One open per database directory, across
+ * processes (see above): a second open throws, naming who has it.
+ */
+export async function openPglite(dataDir: string, cfg?: Pick<DatabaseConfig, 'path'>): Promise<Backend> {
+  const dir = pgliteDir(dataDir, cfg);
+  const claim = claimPgliteDir(dir);
+  let db: PGlite;
+  try {
+    db = await PGlite.create(dir, { extensions: { vector } });
+  } catch (err) {
+    claim.release();
+    throw err;
+  }
+  const close = db.close.bind(db);
+  // the claim goes with the instance, even when closing it fails part-way
+  Object.defineProperty(db, 'close', {
+    configurable: true,
+    writable: true,
+    value: async (): Promise<void> => {
+      try {
+        await close();
+      } finally {
+        claim.release();
+      }
+    },
+  });
+  return db as unknown as Backend;
+}
+
+/**
+ * Delete a workspace's embedded database directory; the next `openPglite`
+ * creates an empty one. Refused while the database is open — in this process,
+ * or in a live one holding its lock — rather than deleting files under a
+ * running instance; the lock is held for the deletion itself.
+ */
 export async function dropPglite(dataDir: string, cfg?: Pick<DatabaseConfig, 'path'>): Promise<void> {
-  fs.rmSync(pgliteDir(dataDir, cfg), { recursive: true, force: true });
+  const dir = pgliteDir(dataDir, cfg);
+  const key = canonicalDir(dir);
+  if (openPgliteDirs().has(key)) {
+    throw lockedError(`cannot drop the embedded PGlite index ${key}: it is open in this process (pid ${process.pid}); close its store first`);
+  }
+  const claim = claimPgliteDir(dir);
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } finally {
+    claim.release();
+  }
 }
 
 /* -------------------------------- entry --------------------------------- */

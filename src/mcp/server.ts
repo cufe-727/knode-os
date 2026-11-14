@@ -14,7 +14,7 @@ export const MCP_SERVER_INFO = { name: 'knode-os', version: '0.2.0' } as const;
  * This process opens the data directory itself, so it should not run beside a
  * `knode-os serve` on the same workspace: on PostgreSQL it would bypass serve's
  * watchers, locks and sign-in, and with the opt-in PGlite index, which is
- * single-process, it must not. Connect to the HTTP endpoint serve mounts
+ * single-process, it cannot: the open is refused while serve holds the index. Connect to the HTTP endpoint serve mounts
  * instead (`knode-os connect <client> --http`).
  */
 export async function startMcpServer(ctx: AppContext): Promise<void> {

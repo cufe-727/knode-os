@@ -56,7 +56,7 @@ export function registerBuiltins(registry: PluginRegistry): void {
       {
         id: 'pglite',
         label: 'Embedded PGlite',
-        note: 'Postgres + pgvector embedded in the process, one database per workspace under .knode/db (database.path moves it). Zero setup; one process at a time.',
+        note: 'Postgres + pgvector embedded in the process, one database per workspace under .knode/db (database.path moves it). Zero setup; one open at a time, enforced: a second open, here or in another process (lock file .knode/db.lock), is refused with the holder named.',
         open: (dataDir, cfg) => openPglite(dataDir, cfg),
         drop: (dataDir, cfg) => dropPglite(dataDir, cfg),
       },

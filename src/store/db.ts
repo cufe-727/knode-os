@@ -114,6 +114,18 @@ export class Store implements Queryable {
    */
   static async open(dataDir: string, embeddingDim: number, dbConfig?: DatabaseConfig): Promise<Store> {
     const db = await openBackend(dataDir, dbConfig);
+    const store = new Store(db, dataDir, embeddingDim, (dbConfig?.kind || 'pglite') === 'pglite');
+    try {
+      return await store.prepare(embeddingDim);
+    } catch (err) {
+      // a failed open hands its backend back: the pool's connections, an embedded database's claim on its directory
+      await store.close().catch(() => undefined);
+      throw err;
+    }
+  }
+
+  private async prepare(embeddingDim: number): Promise<Store> {
+    const db = this.db;
     await db.exec(`
       CREATE EXTENSION IF NOT EXISTS vector;
       CREATE TABLE IF NOT EXISTS meta (
@@ -121,8 +133,7 @@ export class Store implements Queryable {
         value JSONB NOT NULL
       );
     `);
-    const store = new Store(db, dataDir, embeddingDim, (dbConfig?.kind || 'pglite') === 'pglite');
-    store.migration = await migrate(store, (fn) => store.tx(fn));
+    this.migration = await migrate(this, (fn) => this.tx(fn));
 
     const prev = await db.query<{ value: { dim: number; type?: string } }>(
       `SELECT value FROM meta WHERE key = 'embedding'`,
@@ -149,19 +160,19 @@ export class Store implements Queryable {
       console.warn(`[knode-os] embedding column converted ${prevType} -> ${VECTOR_TYPE} (${embeddingDim}d); vectors preserved.`);
     }
     await db.exec(embeddingsDdl(embeddingDim));
-    await store.setMeta('embedding', { dim: embeddingDim, type: VECTOR_TYPE });
+    await this.setMeta('embedding', { dim: embeddingDim, type: VECTOR_TYPE });
     // v13 leaves the stored co_occurs rows for here: short autocommitted batches
     // in the background, not one delete inside the migration's transaction, so
     // the open returns at once; close() stops them and the next open resumes
-    store.cleanup = dropStoredCoOccurrence(store, { stop: () => store.stopCleanup }).catch((err: unknown) => {
+    this.cleanup = dropStoredCoOccurrence(this, { stop: () => this.stopCleanup }).catch((err: unknown) => {
       console.warn(`[knode-os] co_occurs cleanup stopped: ${err instanceof Error ? err.message : String(err)}; the next open resumes it`);
       return null;
     });
     // claims folded under an older claim type mapping follow the same way; a
     // store without claims records the mapping here and starts nothing
-    if (await claimTypesStale(store)) {
-      store.retype = store.cleanup
-        .then(() => refoldClaimTypes(store, { stop: () => store.stopCleanup }))
+    if (await claimTypesStale(this)) {
+      this.retype = this.cleanup
+        .then(() => refoldClaimTypes(this, { stop: () => this.stopCleanup }))
         .catch((err: unknown) => {
           console.warn(`[knode-os] claim type refold stopped: ${err instanceof Error ? err.message : String(err)}; the next open resumes it`);
           return null;
@@ -169,13 +180,13 @@ export class Store implements Queryable {
     }
     // building the chunk index takes minutes on a large workspace; searches
     // scan without it until it is ready, and a stopped build starts over
-    store.indexing = store.cleanup
-      .then(() => ensureMatchIndexes(store, { stop: () => store.stopCleanup, building: (pid) => { store.buildPid = pid; } }))
+    this.indexing = this.cleanup
+      .then(() => ensureMatchIndexes(this, { stop: () => this.stopCleanup, building: (pid) => { this.buildPid = pid; } }))
       .catch((err: unknown) => {
         console.warn(`[knode-os] search index build stopped: ${err instanceof Error ? err.message : String(err)}; the next open builds it`);
         return null;
       });
-    return store;
+    return this;
   }
 
   async query<T>(sql: string, params?: unknown[]): Promise<T[]> {
