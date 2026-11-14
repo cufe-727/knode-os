@@ -318,6 +318,51 @@ export function registerEvalCommands(program: Command): void {
       if (!runDir && !opts.orphaned) throw new Error('name a run directory, or pass --orphaned');
     });
   evalCmd
+    .command('resolution <workspace>')
+    .description('entity resolution without a model: re-apply a workspace\'s stored extractions under this build\'s rules and score the entities (src/eval/resolution.ts)')
+    .option('--gold <file>', 'gold alias clusters (a pack\'s gold/aliases.jsonl) to score against')
+    .option('--index', 'score the index in <workspace> as it stands; <workspace> must be a COPY of the .knode folder\'s parent, never a live workspace')
+    .option('--scan', 'read the sidecars alone and list the names refine would part (no index is opened; an estimate)')
+    .option('--identity <mode>', 'replay under these rules: context, name, or both', 'both')
+    .option('--keep', 'keep the temporary replay folder')
+    .option('--json', 'print the report as JSON')
+    .action(async (workspace: string, opts) => {
+      const { formatIndexScore, readGoldAliases, replayResolution, scanSidecars, scoreIndexCopy } = await import('./resolution.js');
+      const dir = path.resolve(workspace);
+      if (opts.scan) {
+        const r = scanSidecars(dir);
+        if (opts.json) console.log(JSON.stringify(r, null, 2));
+        else {
+          console.log(`${r.sidecars} extractions, ${r.names} names`);
+          console.log(`coded: ${r.codedCandidates} names carry two or more codes of one kind; ${r.coded.length} would be parted into ${r.coded.reduce((n, c) => n + c.parts.length, 0)} more entities`);
+          for (const c of r.coded.slice(0, 40)) console.log(`  ${c.name} (${c.documents} documents): ${c.parts.map((p) => `${p.code} ×${p.documents} [${p.anchors.join(', ')}]`).join('; ')}`);
+          console.log(`people: ${r.peopleCandidates} names in ${6}+ documents; ${r.people.length} would be split (${r.people.filter((p) => p.byClaimDates).length} of them only because their claims date the documents)`);
+          for (const p of r.people.slice(0, 40)) console.log(`  ${p.name} (${p.documents} documents): [${p.anchors[0].join(', ')}] / [${p.anchors[1].join(', ')}]${p.byClaimDates ? '  (by claim dates)' : ''}`);
+        }
+        return;
+      }
+      if (!opts.gold) throw new Error('--gold <aliases.jsonl> is required to score');
+      const gold = readGoldAliases(path.resolve(opts.gold));
+      if (opts.index) {
+        const s = await scoreIndexCopy(dir, gold);
+        console.log(opts.json ? JSON.stringify(s, null, 2) : formatIndexScore('index as it stands', s));
+        return;
+      }
+      const modes = opts.identity === 'both' ? (['name', 'context'] as const) : [opts.identity === 'name' ? ('name' as const) : ('context' as const)];
+      const reports = [];
+      for (const identity of modes) {
+        const r = await replayResolution(dir, gold, { identity, keep: Boolean(opts.keep), onProgress: (m) => (opts.json ? undefined : console.log(`  ${m}`)) });
+        reports.push(r);
+        if (!opts.json) {
+          console.log(`\nreview.identity: ${identity} — ${r.documents} documents, ${r.seconds}s`);
+          console.log(formatIndexScore('after indexing (write-time resolution)', r.written));
+          console.log(formatIndexScore(`after refine's entity step (${r.refine.passes} passes: ${r.refine.merged} merged, ${r.refine.split} parted, ${r.refine.replayed} documents re-applied)`, r.refined));
+        }
+      }
+      if (opts.json) console.log(JSON.stringify(reports, null, 2));
+      process.exit(0);
+    });
+  evalCmd
     .command('score <runDir>')
     .description('judge what a stopped run has answered so far (Claude), then render its report')
     .option('--judge <provider>', 'judge CLI provider', 'claude-cli')
