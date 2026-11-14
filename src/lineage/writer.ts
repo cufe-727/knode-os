@@ -53,6 +53,41 @@ import {
 /** Citation rows per INSERT: ten parameters each, well under PostgreSQL's 65,535. */
 const CITATION_BATCH = 500;
 
+/**
+ * The day a claim's identity carries (claimId's `at`): a number read off an
+ * attribute that the source dates itself (event date, else the start of its
+ * window). A weekly report says "本周服务可用性为99.92%" in its own words every
+ * week; keyed by subject and statement alone, week 3's 99.92% and week 17's
+ * were one claim spanning both weeks (MIN/MAX of their windows), dated by the
+ * newer, and the weeks between overlapped it: on the 10× reports benchmark
+ * (2026-11-14) 603 of 1,440 weekly metric values had folded into another
+ * week's claim that way. Texts (负责人, 状态), undated claims and statements
+ * that name their own time (NAMED_TIME: "2026Q2 净利润 120 亿元", reported by two
+ * sources on two days, is one fact) keep the old identity, so a value restated
+ * week after week stays one claim there.
+ */
+export function readingDay(c: {
+  statement: string;
+  attribute?: string | null;
+  valueNum?: number | null;
+  dateSource?: string | null;
+  eventAt?: string | null;
+  validFrom?: string | null;
+}): string | null {
+  if (!c.attribute || c.valueNum === null || c.valueNum === undefined || !Number.isFinite(c.valueNum) || c.dateSource !== 'stated') return null;
+  if (NAMED_TIME.test(c.statement.normalize('NFKC'))) return null;
+  return toIso(c.eventAt ?? c.validFrom)?.slice(0, 10) ?? null;
+}
+
+/**
+ * A time a statement names in its own words, whoever reads it when: a year
+ * (2025年, FY25, 2026Q2, 1H25), a date or ISO week (2025-06-16, 2025-W37), a
+ * numbered week, month or day (第24周, 10月, 3日), a quarter or half
+ * (四季度, 上半年). Relative words (本周, 上周, 目前, 两周前) are not one: they
+ * mean another time in every report.
+ */
+const NAMED_TIME = /\d{4}\s*(?:年|财年|-\d{1,2}|-?w\d{1,2}|[qh][1-4])|(?:fy|[qh][1-4])\s*'?\d{2,4}|(?<![\d.])[1-4][qh]\d{2}(?!\d)|第\s*\d{1,2}\s*周|\d{1,2}\s*(?:月|日|号)|[一二三四1-4]\s*季度|[上下]半年/i;
+
 export interface DocumentProjection {
   id: string;
   path: string;
@@ -309,7 +344,7 @@ export class ScopeWriter {
   ): Promise<string | null> {
     const statement = c.statement.trim();
     if (!statement) return null;
-    const id = claimId(subjectId, statement);
+    const id = claimId(subjectId, statement, readingDay(c));
     const status = (CLAIM_STATUS as readonly string[]).includes(c.status) ? c.status : 'fact';
     const kind = (CLAIM_KINDS as readonly string[]).includes(c.kind ?? '') ? c.kind! : 'fact';
     const type = normalizeClaimType(c.type);

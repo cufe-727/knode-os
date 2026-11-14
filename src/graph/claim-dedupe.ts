@@ -493,14 +493,104 @@ async function nearClaims(
   return near;
 }
 
-/** The claims' own validity windows are both known and do not meet. */
-function windowsDisjoint(a: ClaimLite, b: ClaimLite): boolean {
-  const af = toIso(a.valid_from);
-  const bf = toIso(b.valid_from);
-  if (!af || !bf) return false;
-  const at = toIso(a.valid_to);
-  const bt = toIso(b.valid_to);
-  return Boolean((at && at < bf) || (bt && bt < af));
+const DAY_MS = 86_400_000;
+
+/**
+ * The last instant an event date may stand for. Only an event's start is
+ * stored (dateStart: "2025-W37" → Monday 8 September, "2025-09" → the 1st,
+ * "2025Q3" → 1 July, "2025" → 1 January), so it is read as the coarsest period
+ * that starts there: 1 January or 1 July a year (or its second half), 1 April
+ * or 1 October a quarter, another 1st a month, a Monday its week, else its day.
+ * Wider than the source meant at worst — two such spans that miss each other
+ * missed whatever precision the source wrote.
+ */
+export function eventSpanEnd(start: string): string {
+  const d = new Date(start);
+  const y = d.getUTCFullYear();
+  const m = d.getUTCMonth();
+  const midnight = d.getUTCHours() === 0 && d.getUTCMinutes() === 0 && d.getUTCSeconds() === 0 && d.getUTCMilliseconds() === 0;
+  const endOf = (next: number) => new Date(next - 1).toISOString();
+  if (midnight && d.getUTCDate() === 1) {
+    if (m === 0 || m === 6) return endOf(Date.UTC(y + 1, 0, 1));
+    if (m === 3 || m === 9) return endOf(Date.UTC(y, m + 3, 1));
+    return endOf(Date.UTC(y, m + 1, 1));
+  }
+  const day = Date.UTC(y, m, d.getUTCDate());
+  if (midnight && d.getUTCDay() === 1) return endOf(day + 7 * DAY_MS);
+  return endOf(day + DAY_MS);
+}
+
+/** What a claim says of its own time: its validity window (open-ended without an end), else its event's span (eventSpanEnd), else nothing. */
+export function ownSpan(c: Pick<ClaimLite, 'valid_from' | 'valid_to' | 'event_at'>): [string, string | null] | null {
+  const from = toIso(c.valid_from);
+  if (from) return [from, toIso(c.valid_to)];
+  const event = toIso(c.event_at);
+  return event ? [event, eventSpanEnd(event)] : null;
+}
+
+/**
+ * The times the two claims state of themselves are both known and do not
+ * meet: a validity window, or an event read as wide as its date allows
+ * (ownSpan). A date only the document gives is not the claim's own and
+ * settles nothing here (reportedApart reads those). Exported for tests.
+ */
+export function datesApart(a: Pick<ClaimLite, 'valid_from' | 'valid_to' | 'event_at'>, b: Pick<ClaimLite, 'valid_from' | 'valid_to' | 'event_at'>): boolean {
+  const sa = ownSpan(a);
+  const sb = ownSpan(b);
+  if (!sa || !sb) return false;
+  return Boolean((sa[1] && sa[1] < sb[0]) || (sb[1] && sb[1] < sa[0]));
+}
+
+/** A year a statement names, which periodsOf reads instead. */
+const NAMED_YEAR = /(?<![\d.])(?:20\d{2}|\d{2}\s*年)|fy\s*\d{2}|\d[qh]\d{2}/i;
+const MONTH = /(?<![\d.])(\d{1,2})\s*月/g;
+
+/**
+ * The months of the year a statement names without a year ("10月月报列示…",
+ * "4月上线"); empty when it names a year, which periodsOf reads. A monthly
+ * report with no date of its own says "4月月报列示四部支付组在岗人数为7人".
+ * Exported for tests.
+ */
+export function yearlessMonthsOf(s: string): Set<number> {
+  const text = s.normalize('NFKC');
+  if (NAMED_YEAR.test(text)) return new Set();
+  const out = new Set<number>();
+  for (const m of text.matchAll(MONTH)) {
+    const n = Number(m[1]);
+    if (n >= 1 && n <= 12) out.add(n);
+  }
+  return out;
+}
+
+/** The month of the year a claim's own window lies in, when it lies in one. */
+function windowMonth(c: Pick<ClaimLite, 'valid_from' | 'valid_to'>): Set<number> {
+  const from = toIso(c.valid_from);
+  const to = toIso(c.valid_to);
+  return from && to && from.slice(0, 7) === to.slice(0, 7) ? new Set([Number(from.slice(5, 7))]) : new Set();
+}
+
+/**
+ * Two claims whose months of the year miss each other, at least one of them
+ * named in the statement without a year: an April and an October are two
+ * times whatever their years. The other side may give its month by a window
+ * inside one month. A forecast is left out — "6月月报预计Orion于第32周上线" and
+ * the May report's same words name the reports' months, not the forecast's:
+ * on the 1× benchmark copy the judge called four such pairs the same.
+ * Exported for tests.
+ */
+export function monthsApart(
+  a: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to'>,
+  b: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to'>,
+): boolean {
+  if (a.kind === 'prediction' || b.kind === 'prediction') return false;
+  const na = yearlessMonthsOf(a.statement);
+  const nb = yearlessMonthsOf(b.statement);
+  if (na.size === 0 && nb.size === 0) return false;
+  const ma = na.size ? na : windowMonth(a);
+  const mb = nb.size ? nb : windowMonth(b);
+  if (ma.size === 0 || mb.size === 0) return false;
+  for (const m of ma) if (mb.has(m)) return false;
+  return true;
 }
 
 /**
@@ -855,6 +945,13 @@ export async function auditDuplicateClaims(
       if (decided.has(pair.id)) continue;
       const { a, b } = pair;
       if (pair.why.includes('identical')) {
+        // one wording of two times — a weekly report's "本周服务可用性为99.92%" in week 3
+        // and in week 17 (claimId's reading day) — is two readings, not one claim twice
+        if (opts.stateRules !== false && datesApart(a, b)) {
+          outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '同一说法、不同时点', model: 'rule' } });
+          stats.differentTime++;
+          continue;
+        }
         outcomes.push({ pair, verdict: { relation: 'same', keep: null, confidence: 1, reason: '规范化后逐字相同', model: 'rule' } });
         stats.identical++;
         continue;
@@ -880,7 +977,7 @@ export async function auditDuplicateClaims(
         stats.series++;
         continue;
       }
-      if (windowsDisjoint(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b))) {
+      if (datesApart(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b)) || (opts.stateRules !== false && monthsApart(a, b))) {
         outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '时期不同', model: 'rule' } });
         stats.differentTime++;
         continue;
