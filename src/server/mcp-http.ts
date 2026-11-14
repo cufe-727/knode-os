@@ -6,7 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { MCP_SERVER_INFO } from '../mcp/server.js';
 import { mcpInstructions } from '../mcp/instructions.js';
-import { registerKnodeTools } from '../mcp/tools.js';
+import { KnodeToolOptions, registerKnodeTools } from '../mcp/tools.js';
 import { AppContext } from '../context.js';
 import { resolveWorkspaceScope, WorkspaceContextRegistry, WorkspaceScope } from './workspaces.js';
 
@@ -97,8 +97,14 @@ export interface MountMcpOptions {
   workspaceTokens?: McpWorkspaceTokens;
   /** For a request on the data root's token: why the workspace it names is not open to it, or null when it is. */
   authorize?: (scope: WorkspaceScope) => string | null;
-  /** Single-context mode (a CLI run hosting the endpoint for itself): every request hits this context. */
-  context?: AppContext;
+  /**
+   * Single-context mode (a CLI run hosting the endpoint for itself): every
+   * request hits this context — or the one this function opens, once, when
+   * the first request comes (an evaluation's tool host, src/eval/toolhost.ts).
+   */
+  context?: AppContext | (() => Promise<AppContext>);
+  /** Single-context mode: the tool surface its requests get (default: the owner's, every tool). */
+  tools?: KnodeToolOptions;
 }
 
 function presentedToken(req: Request): string | null {
@@ -144,7 +150,13 @@ export function mountMcp(app: Hono<any>, opts: MountMcpOptions): void {
       return c.json({ error: 'mcp: missing or invalid bearer token' }, 401);
     }
     let ctx: AppContext;
-    if (opts.context) ctx = opts.context;
+    if (opts.context) {
+      try {
+        ctx = typeof opts.context === 'function' ? await opts.context() : opts.context;
+      } catch (e) {
+        return c.json({ error: `mcp: the workspace did not open: ${e instanceof Error ? e.message : String(e)}` }, 503);
+      }
+    }
     else if (opts.registry) {
       try {
         let scope: WorkspaceScope;
@@ -172,7 +184,7 @@ export function mountMcp(app: Hono<any>, opts: MountMcpOptions): void {
 
     // the base's own guide rides along as server instructions (cached by the file's mtime)
     const server = new McpServer(MCP_SERVER_INFO, { instructions: mcpInstructions(ctx.dataDir) });
-    registerKnodeTools(server, ctx, { caller: bound ? 'agent' : 'owner' });
+    registerKnodeTools(server, ctx, opts.context && opts.tools ? opts.tools : { caller: bound ? 'agent' : 'owner' });
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

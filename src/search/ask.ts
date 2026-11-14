@@ -128,6 +128,8 @@ export async function ask(
     excerpts?: number;
     /** Route the question this way instead of classifying it; `auto` (default) classifies. */
     route?: QuestionKind | 'auto';
+    /** false: its searches record no hits (an evaluation answering against the index as built, docs/design/31 D3). */
+    track?: boolean;
   } = {},
 ): Promise<AskResult> {
   const router = { ...defaultAskRouterConfig(), ...config.retrieval.router };
@@ -161,7 +163,7 @@ interface RouteEnv {
   embedder: EmbeddingProvider;
   llm: LlmClient;
   question: string;
-  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number };
+  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number; track?: boolean };
   queryVector: number[] | undefined;
   router: ReturnType<typeof defaultAskRouterConfig>;
   routed: QuestionRoute;
@@ -175,8 +177,8 @@ async function lookupAnswer(env: RouteEnv): Promise<AskResult> {
   const k = opts.k ?? 8;
   const mode = opts.mode ?? 'hybrid';
   const [retrieved, graph, named] = await Promise.all([
-    search(store, embedder, question, { k, mode, heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector }),
-    graphSearch(store, question, { depth: 2, chunkLimit: 4, heat: config.heat }),
+    search(store, embedder, question, { k, mode, heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track }),
+    graphSearch(store, question, { depth: 2, chunkLimit: 4, heat: config.heat, track: opts.track }),
     namedEntities(store, question),
   ]);
   const seen = new Set(retrieved.map((r) => r.chunkId));
@@ -220,7 +222,7 @@ async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
 
   // the passages: a short search, not the top eight, and the lines of the named entities' other documents
   const k = Math.min(opts.k ?? 8, 4);
-  const retrieved = await search(store, embedder, question, { k, mode: opts.mode ?? 'hybrid', heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector });
+  const retrieved = await search(store, embedder, question, { k, mode: opts.mode ?? 'hybrid', heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track });
   const excerptBudget = opts.excerpts ?? EXCERPT_CHARS;
   const [ranked, excerpts]: [QuestionFact[], SearchResult[]] = await Promise.all([
     factsForQuestion(store, question, retrieved, { limit, queryVector, model: embedder.model, named, list: true }),
@@ -276,7 +278,7 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
   const k = opts.k ?? 8;
   const named = await namedEntities(store, question);
   const [retrieved, walk] = await Promise.all([
-    search(store, embedder, question, { k, mode: 'sag', heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector }),
+    search(store, embedder, question, { k, mode: 'sag', heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track }),
     walkRelations(store, question, named, { maxHops: router.maxHops }),
   ]);
   const seen = new Set(retrieved.map((r) => r.chunkId));

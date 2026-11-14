@@ -455,7 +455,9 @@ export async function startShim(opts: ShimOptions): Promise<Shim> {
         usage: { prompt_tokens: tokens, total_tokens: tokens },
       });
     } catch (err) {
-      sendJson(res, 429, { error: { message: err instanceof Error ? err.message : String(err), type: 'embedding_error' } });
+      const message = err instanceof Error ? err.message : String(err);
+      // a refusal of a run that spends nothing (--replay-only) is final: a 429 would have the workspace's client try again
+      sendJson(res, /\(--replay-only\)/.test(message) ? 422 : 429, { error: { message, type: 'embedding_error' } });
     }
   };
 

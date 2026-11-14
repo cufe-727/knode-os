@@ -22,6 +22,7 @@ import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
 import { RemoteTokenStore } from '../src/remote/tokens.js';
 import { createApp } from '../src/server/app.js';
 import { MCP_TOKEN_FILE } from '../src/server/mcp-http.js';
+import { startToolHost } from '../src/eval/toolhost.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 import { WorkBroker } from '../src/work/broker.js';
 import { packFolder, readArchive, unpackArchive } from '../src/work/eval-archive.js';
@@ -37,7 +38,6 @@ import { EvalSessionSpec, EvalWork } from '../src/work/eval.js';
 
 const helpers = path.join(path.dirname(fileURLToPath(import.meta.url)), 'helpers');
 const fakeCli = path.join(helpers, 'fake-eval-cli.mjs');
-const fakeMcp = path.join(helpers, 'fake-mcp-server.mjs');
 const workerScript = path.resolve(helpers, '..', '..', 'worker', 'knode-worker.mjs');
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-remote-eval-'));
@@ -349,16 +349,21 @@ describe('an evaluation run with remote workers', () => {
   it('gives an MCP agent the run\'s tools through serve, filtered to its own', async () => {
     const remote = (await RemoteEval.connect({ ...remoteOpts(), run: 'mcp-test' }))!;
     const empty = fs.mkdtempSync(path.join(tmp, 'mcp-'));
+    // the run's tool host on a workspace it holds open (docs/design/31 D4); serve proxies the session's calls to it
+    fs.mkdirSync(path.join(root, 'raw', 'docs', 'email'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'raw', 'docs', 'email', '2026-03-05.md'), '# 入职\n');
+    const host = await startToolHost(async () => rootCtx, ['knode_ls']);
     try {
       const r = await withRemote(remote, () => runAgent({
         cwd: empty, sandbox: 'read-only', model: 'gpt-test', prompt: 'CALL_MCP',
-        mcp: { name: 'knode', command: process.execPath, args: [fakeMcp], enabledTools: ['knode_ls'] },
+        mcp: { name: 'knode', url: host.url, token: host.secret, enabledTools: ['knode_ls'] },
       }));
       expect(r.worker).toBe('laptop/w1');
       expect(r.error).toBeUndefined();
-      expect(r.text).toMatch(/^tools: knode_ls; knode_ls: raw\/docs: email\/2026-03-05.md \(pid \d+\); knode_secret: refused/);
+      expect(r.text).toMatch(/^tools: knode_ls; knode_ls: .*email.*; knode_secret: refused/s);
     } finally {
       remote.close();
+      await host.close();
     }
     // every call through the route is audited, never its content
     const audit = fs.readFileSync(path.join(root, '.knode', 'remote-audit.jsonl'), 'utf8');

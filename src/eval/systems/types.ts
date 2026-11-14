@@ -1,4 +1,4 @@
-import type { LlmEffort } from '../../config.js';
+import type { DatabaseConfig, LlmEffort } from '../../config.js';
 import type { EmbeddingProvider } from '../../ingest/embeddings.js';
 import { ChatMessage, LlmClient } from '../../llm/client.js';
 import type { CallUsage } from '../../llm/usage.js';
@@ -36,6 +36,8 @@ export interface SystemEnv {
   quota: QuotaGuard;
   models: ModelSettings;
   log: (msg: string) => void;
+  /** Where knode's indexes live for this run (src/eval/database.ts); absent, the default's evaluation database. */
+  database?: DatabaseConfig;
 }
 
 export interface SystemAnswer {
@@ -71,10 +73,8 @@ export interface SystemUnderTest {
   exportKnowledge?(env: SystemEnv): Promise<KnowledgeUnit[]>;
   /** Apply an update batch already copied into the staged corpus. */
   update?(files: string[], env: SystemEnv): Promise<void>;
-  /** Close what it holds open for this pack before another system of its group needs exclusive access (packs run concurrently). */
+  /** Close what it holds open for this pack once its group is done with it (packs run concurrently). */
   release?(env: SystemEnv): Promise<void>;
-  /** Agents answer one task at a time per pack (an exclusive index). */
-  serial?: boolean;
 }
 
 /** A client that reaches the run's model through the shim, tagged so the meter can attribute the call. */

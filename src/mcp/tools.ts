@@ -63,6 +63,13 @@ export interface KnodeToolOptions {
   only?: ReadonlySet<string>;
   /** Checked before a tool runs, with its arguments: throws to refuse (a remote session's writes, bound to its job). */
   guard?: (tool: string, args: Record<string, unknown>) => void;
+  /**
+   * false: reading leaves no trace — searches record no hits (the heat that
+   * feeds ranking) and resolve, plan and context calls write no receipt or
+   * pack event. An evaluation's agent sets it, so every question sees the
+   * index as built (docs/design/31 D3). Default true.
+   */
+  track?: boolean;
 }
 
 /** The tool surface narrowed to `only`, each handler behind `guard`; the server itself when neither is given. */
@@ -91,6 +98,9 @@ function narrowed(target: McpServer, opts: KnodeToolOptions): McpServer {
 export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: KnodeToolOptions = {}): void {
   const server = narrowed(target, opts);
   const agent = opts.caller === 'agent';
+  const track = opts.track !== false;
+  // what a read writes beside its answer when reads are not tracked: nothing
+  const quiet = track ? {} : ({ track: false, record: false } as const);
   const forPerson = (what: string) => new Error(`${what} is a person's review, not an agent's: ask them to do it in knode-os (the source's "adopt" in the UI, or \`knode-os trust\`)`);
   const json = (data: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] });
   const asOfSchema = z.string().optional().describe('System time (ISO 8601): answer from what the knowledge base contained at that instant');
@@ -130,6 +140,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
         rerank: ctx.config.retrieval.rerank,
         asOf: as_of,
         filter: resolveScopeFilter({ kinds, sources, trust, actor }),
+        track,
       });
       return json(results.map((r) => ({
         path: r.path,
@@ -167,6 +178,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
         heat: ctx.config.heat,
         temporal: resolveTemporal({ asOf: as_of, validAt: valid_at, validRange: valid_range }),
         filter: resolveScopeFilter({ kinds, sources, trust, actor }),
+        track,
       })),
   );
 
@@ -181,7 +193,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
       },
     },
     async ({ question, mode }) => {
-      const res = await ask(ctx.store, ctx.config, ctx.embedder, ctx.llm, question, { mode: mode ?? 'hybrid' });
+      const res = await ask(ctx.store, ctx.config, ctx.embedder, ctx.llm, question, { mode: mode ?? 'hybrid', track });
       return json({ answer: res.answer, citations: res.citations, gaps: res.gaps, route: res.route });
     },
   );
@@ -407,6 +419,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
     async ({ utterance, as_of, valid_at, valid_range, freshness, kinds, sources }) => json(await buildContextPack(ctx, utterance, {
       temporal: resolveTemporal({ asOf: as_of, validAt: valid_at, validRange: valid_range, freshness }),
       filter: resolveScopeFilter({ kinds, sources }),
+      ...quiet,
     })),
   );
 
@@ -475,6 +488,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
         actor,
         render,
         budget: max_tool_calls ? { maxToolCalls: max_tool_calls } : undefined,
+        ...quiet,
         temporal: await envelopeFor(ctx.store, { workset, asOf: as_of, validAt: valid_at, validRange: valid_range, freshness }),
         filter: resolveScopeFilter({ kinds, sources, trust, actor }),
       })),
@@ -498,6 +512,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
       json(await planOnly(ctx, query, {
         render,
         budget: max_tool_calls ? { maxToolCalls: max_tool_calls } : undefined,
+        ...quiet,
         temporal: resolveTemporal({ asOf: as_of, freshness }),
       })),
   );

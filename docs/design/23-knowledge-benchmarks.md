@@ -142,8 +142,13 @@ notes, customer feedback, next week's plan — that is gold for nothing: the hay
 | `graphrag`, `lightrag`, `hipporag` | each | Their own query through `eval/adapters/<id>.py` (JSON lines), in a uv venv, by default on 3 packs (`KNODE_EVAL_EXTERNAL_PACKS`) |
 
 The knode build is the one `serve` runs: `sync`, document passes until the queue and summaries are done (tier-1,
-dedupe audits, summaries), `generateWiki`, `refineWiki`, then `sync` again so generated pages are searchable. PGlite
-admits one process, so the in-process context closes before an MCP agent opens the index.
+dedupe audits, summaries), `generateWiki`, `refineWiki`, then `sync` again so generated pages are searchable. The
+index is on the product's backend (design 31 D1): a schema of its own per build in the evaluation database
+(`knode_eval`, or `--database-url`) on PostgreSQL, an embedded database in the workspace on PGlite
+(`KNODE_DATABASE_KIND=pglite`, the test suite). The run opens it once per build and everything shares that context:
+answers run in parallel, and agent-knode's sessions call the build's tools on a host the run serves itself (31 D4).
+Answers record no hits, so no question moves another's ranking (31 D3). Runs before 2026-11-14 were on PGlite with
+knode-ask and agent-knode answering one task at a time.
 
 ## 4. Metrics (`src/eval/score/`, `src/eval/metrics/`)
 

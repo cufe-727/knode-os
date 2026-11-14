@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mapLimit } from '../bench/util.js';
-import { isCliProvider, KnodeConfig, LlmEffort, loadConfig } from '../config.js';
+import { defaultConfig, isCliProvider, KnodeConfig, LlmEffort, loadConfig } from '../config.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { createConfiguredEmbeddingProvider } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
@@ -20,11 +20,13 @@ import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
 import { scoreLists } from './score/lists.js';
 import { scoreKey, scoreUsage } from './score/usage.js';
-import { ChatBackend, ClientBackend, CodexBackend, shimState, startShim } from './shim.js';
+import { ChatBackend, ChatRequest, ClientBackend, CodexBackend, shimState, startShim } from './shim.js';
 import { withRemote } from './placement.js';
 import { judgeAgent, packMayLeave, PlacedChatBackend, RemoteEval, remoteJudgeClient, RunCancelledError } from './remote.js';
 import type { Placed } from './meter.js';
 import { closeAdapters } from './systems/external.js';
+import { closeKnodeStates } from './systems/knode.js';
+import { describeDatabase, EVAL_POOL_MAX, evalDatabase, orphanedEvalSchemas, sameDatabase } from './database.js';
 import { makeSystems } from './systems/index.js';
 import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
 import { boundedTrace } from './trace.js';
@@ -48,6 +50,23 @@ export interface RunOptions {
   runDir?: string;
   /** A knode workspace whose config supplies the embedder and, with `chatConnection`, the chat endpoint (read-only). */
   configFrom?: string;
+  /**
+   * Where knode's indexes live (docs/design/31 D1): a PostgreSQL connection
+   * string (default `KNODE_EVAL_DATABASE_URL`). Absent, the run follows its
+   * config's `database.kind`: PGlite in each workspace, or the database
+   * `knode_eval` on the server `configFrom` (or the default config) names. A
+   * run refuses to start on that config's own database.
+   */
+  databaseUrl?: string;
+  /** Keep knode's indexes in embedded PGlite whatever the config names (a comparison with earlier runs, design 31 D5). */
+  pglite?: boolean;
+  /**
+   * Spend nothing: a model call or an embedding not in the run's caches fails
+   * instead of reaching a model or the embedder (a rebuild from another run's
+   * copied caches, design 31 D5). Agent sessions and the judge are not cached:
+   * leave them out (`--systems`, `--skip-scoring`).
+   */
+  replayOnly?: boolean;
   /**
    * A connection of that workspace — an API endpoint — that answers the shim's
    * chat calls instead of `codex exec`. Agents stay Codex sessions.
@@ -138,6 +157,26 @@ export interface RunResult {
   scores: number;
 }
 
+/** `--replay-only`: what is not in the reply cache is not asked. */
+class ReplayOnlyBackend implements ChatBackend {
+  readonly label = 'replay-only';
+  async complete(req: ChatRequest): Promise<never> {
+    const tag = req.tag ? [req.tag.system, req.tag.stage, req.tag.task].filter(Boolean).join('/') : 'a call';
+    throw new Error(`not in the reply cache (--replay-only): ${tag}`);
+  }
+}
+
+/** `--replay-only`: the embedder's identity, so cached vectors are found, and nothing behind it. */
+function refusingEmbedder(identity: EmbeddingProvider): EmbeddingProvider {
+  return {
+    model: identity.model,
+    dimensions: identity.dimensions,
+    embed: async (texts) => {
+      throw new Error(`not in the vector cache (--replay-only): ${texts.length} texts`);
+    },
+  };
+}
+
 function gitSha(): string | null {
   try {
     return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: path.dirname(fileURLToPath(import.meta.url)), encoding: 'utf8' }).trim();
@@ -200,7 +239,12 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const fraction = opts.fraction ?? 1;
   const seed = opts.seed ?? 0;
   const meter = new Meter(path.join(runDir, 'meter.jsonl'));
-  const quota = new QuotaGuard({ enabled: opts.quota ?? !opts.overrides?.chat, log: (m, d) => {
+  if (opts.replayOnly) {
+    const agents = makeSystems(opts.systems).filter(isAgent).map((sys) => sys.id);
+    if (agents.length) throw new Error(`--replay-only: agent sessions are not cached, leave out ${agents.join(', ')}`);
+    if (!opts.skipScoring) throw new Error('--replay-only: the judge is not served from the reply cache, add --skip-scoring');
+  }
+  const quota = new QuotaGuard({ enabled: opts.quota ?? (!opts.overrides?.chat && !opts.replayOnly), log: (m, d) => {
     progress(`${m}${d ? ` ${JSON.stringify(d)}` : ''}`);
     store.log(m, d);
   } });
@@ -215,12 +259,24 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   });
 
   const workspaceConfig = opts.configFrom ? loadConfig(opts.configFrom) : null;
+  // the indexes on the product's backend, in a database of their own (docs/design/31 D1): checked before anything is spent
+  if (opts.pglite && opts.databaseUrl) throw new Error('--pglite and --database-url name two places for the indexes: pick one');
+  const sourceDatabase = opts.pglite ? { ...defaultConfig().database, kind: 'pglite' } : workspaceConfig?.database ?? defaultConfig().database;
+  const database = evalDatabase(sourceDatabase, { url: opts.databaseUrl, poolSize: opts.answerConcurrency ?? 3 });
+  if (sameDatabase(database, sourceDatabase)) {
+    throw new Error(`the evaluation's indexes would go into ${describeDatabase(database)}, the database ${opts.configFrom ? `the --config-from workspace (${opts.configFrom})` : 'the default config'} uses — name another with --database-url (or KNODE_EVAL_DATABASE_URL)`);
+  }
+  // a run from before this field kept its indexes on PGlite
+  const previous = store.meta() ? store.meta()!.database ?? { kind: 'pglite', at: 'pglite' } : null;
+  if (previous && previous.kind !== database.kind) {
+    throw new Error(`run ${path.basename(runDir)} keeps its indexes on ${previous.at}; this run would keep them on ${describeDatabase(database)} — results on two backends are not pooled: resume it on ${previous.kind}, or start a new run`);
+  }
   const configured = opts.overrides?.embedder
     ?? (opts.embedding === 'local' || !workspaceConfig
       ? createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false })
       : createConfiguredEmbeddingProvider(workspaceConfig));
   const onEndpoint = opts.embeddingEndpoint ? endpointUnder(configured, opts.embeddingEndpoint) : null;
-  const embedder = !onEndpoint ? configured
+  const embedder = opts.replayOnly ? refusingEmbedder(configured) : !onEndpoint ? configured
     : opts.embeddingFallback ? preferEndpoint(onEndpoint, configured, (m) => {
       progress(m);
       store.log(m);
@@ -231,7 +287,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     store.log(m);
   };
   const chain = (spec: string) => new ModelChain(parseChain(spec, workspaceConfig, { ledger, model: opts.model }), ledger, chainLog);
-  const backend = opts.overrides?.chat
+  const backend = opts.replayOnly ? new ReplayOnlyBackend()
+    : opts.overrides?.chat
     ?? (opts.chatChain ? chain(opts.chatChain).asBackend()
       : opts.chatConnection ? connectionBackend(workspaceConfig, opts.chatConnection, opts.model) : new CodexBackend({ model: opts.model }));
   const localJudge = opts.overrides?.judge
@@ -243,8 +300,10 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const onAbort = () => void remote?.cancel();
   opts.signal?.addEventListener('abort', onAbort, { once: true });
   // a call leaves only on the run's own Codex backend with a named model: the worker runs exactly that one
-  const callsLeave = Boolean(remote && !opts.overrides?.chat && !opts.chatChain && !opts.chatConnection && opts.model);
+  const callsLeave = Boolean(remote && !opts.replayOnly && !opts.overrides?.chat && !opts.chatChain && !opts.chatConnection && opts.model);
   if (remote) remote.callsLeave = callsLeave;
+  // one pool per open workspace, as wide as a system answers here and on the workers, at most 16
+  if (remote && database.kind === 'postgres') database.poolSize = Math.min(EVAL_POOL_MAX, (opts.answerConcurrency ?? 3) + Math.max(remote.online('eval-session', 'codex'), remote.callSlots()));
   if (remote && !callsLeave) chainLog(`remote: model calls stay here (${opts.model ? 'the run answers on a chain, a connection or a stand-in' : 'no --model: a worker runs the model the run names'}); agent sessions${opts.model ? '' : ' too'}`);
   const state = shimState({ cacheDir: store.cacheDir(), slots: opts.slots ?? 6, embeddingTokenCap: opts.embeddingTokenCap });
   const placed = callsLeave ? new PlacedChatBackend(backend, state.slots, remote!, { model: opts.model! }) : null;
@@ -297,15 +356,17 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     packs: opts.packs.map((p) => path.basename(p)),
     systems: opts.systems,
     suites: [...suites],
-    model: { connection: opts.chatChain ?? opts.chatConnection ?? 'codex-cli', label: backend.label, buildEffort: models.buildEffort, answerEffort: models.answerEffort, ...(opts.agentChain ? { agents: opts.agentChain } : {}) },
+    model: { connection: opts.replayOnly ? 'replay-only' : opts.chatChain ?? opts.chatConnection ?? 'codex-cli', label: backend.label, buildEffort: models.buildEffort, answerEffort: models.answerEffort, ...(opts.agentChain ? { agents: opts.agentChain } : {}) },
     judge: { connection: opts.judgeChain ?? opts.judgeProvider ?? 'claude-cli', label: judgeClient.label },
     embedding: `${embedder.model} (${embedder.dimensions})`,
+    database: { kind: database.kind, at: describeDatabase(database), ...(database.kind === 'postgres' ? { poolSize: database.poolSize } : {}) },
     fraction,
     seed,
     limit: opts.limit ?? null,
     versions: {},
     ...(opts.types?.length ? { types: opts.types } : {}),
   };
+  meta.database ??= { kind: database.kind, at: describeDatabase(database) };
   store.writeMeta(meta);
 
   // remote slots add to this machine's: a system answers that many more tasks at once while workers are online (F)
@@ -328,6 +389,14 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   // one killed outright leaves them for the next run's sweep
   const swept = sweepStaleTempDirs();
   if (swept) progress(`removed ${swept} temp directories of runs that are gone`);
+  // and the evaluation schemas whose run directory is gone: listed, never dropped here (`eval drop --orphaned` does)
+  if (database.kind === 'postgres') {
+    const orphans = await orphanedEvalSchemas(database).catch(() => []);
+    if (orphans.length) {
+      progress(`${orphans.length} evaluation schemas in ${describeDatabase(database)} belong to workspaces that are gone (${orphans.slice(0, 3).map((o) => o.schema).join(', ')}${orphans.length > 3 ? ', …' : ''}): \`knode-os eval drop --orphaned\` drops them`);
+      store.log('orphaned evaluation schemas', { database: describeDatabase(database), schemas: orphans.map((o) => o.schema) });
+    }
+  }
   const onSignal = (signal: NodeJS.Signals) => {
     closeAdapters();
     removeHeldTempDirs();
@@ -396,6 +465,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           quota,
           models,
           log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`),
+          database,
         };
         if (!(await buildGroup(store, meter, env, group, members, fraction, seed, progress, opts.signal))) {
           failed.add(group);
@@ -430,7 +500,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         const tasks = updateTasks.filter((t) => t.afterUpdate === batch);
         for (const [group, members] of groups) {
           if (failed.has(group)) continue;
-          const env: SystemEnv = { runId: meta.id, pack, staged, workDir: store.workDir(pack.manifest.id, group), shim: packShim, meter, quota, models, log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`) };
+          const env: SystemEnv = { runId: meta.id, pack, staged, workDir: store.workDir(pack.manifest.id, group), shim: packShim, meter, quota, models, log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`), database };
           const updater = members.find((s) => s.update);
           const key = recordKey('update', pack.manifest.id, group, batch, fraction, seed);
           if (updater && !store.build(key)) {
@@ -493,6 +563,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     remote?.close();
     quota.setBypass(null);
     closeAdapters();
+    // what a pack still holds open — its index and tool host — when the run ends early
+    await closeKnodeStates(runDir);
     await shim.close();
     if (localShim !== shim) await localShim.close();
     for (const l of loaded) l.staged.cleanup();
@@ -524,7 +596,9 @@ export function reuseBuilds(store: RunStore, from: string, packDirs: string[], e
         continue;
       }
       const work = path.join(from, 'work', pack.manifest.id, b.system);
-      if (fs.existsSync(work)) fs.cpSync(work, store.workDir(pack.manifest.id, b.system), { recursive: true });
+      // not an index lock (src/store: `.knode/db.lock`, the pid that holds a PGlite directory open): it is the
+      // other run's process, and the copy is this run's to open
+      if (fs.existsSync(work)) fs.cpSync(work, store.workDir(pack.manifest.id, b.system), { recursive: true, filter: (src) => path.basename(src) !== 'db.lock' });
       store.putBuild({ ...b, notes: { ...b.notes, reusedFrom: meta.id, builtAt: b.at } });
       builds++;
     }
@@ -634,8 +708,17 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
   const done = store.build(key);
   if (done?.ok) {
     progress(`[${env.pack.manifest.id}/${group}] reusing build from ${done.at}`);
-    await builder.reopen?.(env);
-    return true;
+    try {
+      await builder.reopen?.(env);
+      return true;
+    } catch (err) {
+      // another run's build that cannot be made this run's own (its schema gone, another backend): built afresh
+      const from = (done.notes as { reusedFrom?: string } | undefined)?.reusedFrom;
+      if (!from) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      progress(`[${env.pack.manifest.id}/${group}] cannot reuse the build of ${from} (${reason}): building afresh`);
+      store.log('reused build rebuilt', { pack: env.pack.manifest.id, group, from, reason });
+    }
   }
   progress(`[${env.pack.manifest.id}/${group}] building`);
   const mark = meter.mark();
@@ -699,7 +782,7 @@ async function answerAll(
   if (!todo.length) return;
   progress(`[${env.pack.manifest.id}/${s.id}] answering ${todo.length} tasks${repeat > 1 ? ` (repeat ${repeat})` : ''}`);
   let done = 0;
-  await mapLimit(todo, s.serial ? 1 : concurrency, async (task) => {
+  await mapLimit(todo, concurrency, async (task) => {
     if (signal?.aborted) return;
     const key = answerKey(env.pack.manifest.id, s.id, task.id, fraction, seed, batch, repeat);
     // a repeat is asked under `<task>~r<n>`: its own meter tag and reply-cache key

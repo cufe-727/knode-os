@@ -1,14 +1,6 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
-import http from 'node:http';
-import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { loadConfig } from '../config.js';
 import { effortFor, renderCliPrompt, speedFor } from '../llm/cli.js';
 import type { ChatMessage, LlmClient } from '../llm/client.js';
@@ -19,7 +11,7 @@ import type { EvalAgent } from '../work/broker.js';
 import { packFolder } from '../work/eval-archive.js';
 import type { EvalFamily, EvalOutcome, EvalSessionAnswer } from '../work/eval.js';
 import type { EvalKind } from '../work/kinds.js';
-import type { AgentRunOptions, AgentRunResult, McpServerSpec } from './agent.js';
+import type { AgentRunOptions, AgentRunResult } from './agent.js';
 import { AgentTrace } from './agent.js';
 import type { LoadedPack } from './pack.js';
 import { notePlacement } from './placement.js';
@@ -37,8 +29,9 @@ import type { ChatBackend, ChatRequest, ChatResult, Slots } from './shim.js';
  *     backend (`PlacedChatBackend`): an `eval-call` per model call;
  *   - the judge's calls (`remoteJudgeClient`): an `eval-call` on Claude;
  *   - agent answers (`runAgent`, src/eval/agent.ts): an `eval-session`, its
- *     folder as an archive, or its knode tools through an MCP bridge kept here
- *     on the run's own copy of the workspace (`startMcpBridge`).
+ *     folder as an archive, or its knode tools through the build's tool host,
+ *     kept here on the run's own open index (src/eval/toolhost.ts) — the one
+ *     every session of the build shares, local or remote (docs/design/31 D4).
  *
  * A piece is offered only while a worker for its kind and CLI asked lately,
  * and only when the run names its model (a CLI default may differ between
@@ -99,6 +92,7 @@ export class RemoteEval {
   private readonly abort = new AbortController();
   private readonly log: (msg: string) => void;
   private unreachableSaid = false;
+  private cancelling: Promise<void> | null = null;
   /** Pieces placed, for the run's log. */
   readonly counts = { offered: 0, remote: 0, here: 0 };
   /** Whether the run's model calls leave (the run sets it: its own Codex backend with a named model). */
@@ -194,14 +188,19 @@ export class RemoteEval {
     return { sha256: packed.sha256, bytes: packed.bytes };
   }
 
-  /** The run is cancelled: what is offered or out is withdrawn, and session tokens die at once. */
-  async cancel(): Promise<void> {
-    if (this.abort.signal.aborted) return;
-    this.abort.abort();
-    await fetch(`${this.opts.serveUrl}/eval/v1/runs/${encodeURIComponent(this.opts.run)}/cancel`, {
-      method: 'POST', headers: { authorization: `Bearer ${this.opts.token}` }, signal: AbortSignal.timeout(5_000),
-    }).catch(() => {});
-    this.close();
+  /**
+   * The run is cancelled: what is offered or out is withdrawn, and session tokens die at once. Every call
+   * waits for the one withdrawal, so a run that ends on its cancellation ends after the tokens are revoked.
+   */
+  cancel(): Promise<void> {
+    this.cancelling ??= (async () => {
+      this.abort.abort();
+      await fetch(`${this.opts.serveUrl}/eval/v1/runs/${encodeURIComponent(this.opts.run)}/cancel`, {
+        method: 'POST', headers: { authorization: `Bearer ${this.opts.token}` }, signal: AbortSignal.timeout(5_000),
+      }).catch(() => {});
+      this.close();
+    })();
+    return this.cancelling;
   }
 
   close(): void {
@@ -309,88 +308,6 @@ export function judgeAgent(provider: string, model: string, effort?: string): { 
   return { family, model: model.trim(), effort: effortFor(provider, effort as never) ?? null };
 }
 
-/* ------------------------------- MCP bridge ------------------------------- */
-
-export interface McpBridge {
-  /** http://127.0.0.1:<port>/mcp — `serve` proxies a session's calls here. */
-  url: string;
-  secret: string;
-  tools: string[];
-  close(): Promise<void>;
-}
-
-/**
- * knode's MCP server for an agent session, kept on this machine and reached
- * over loopback HTTP (docs/design/27 §8): the same stdio server a local
- * session would start (`McpServerSpec`), started on the first call — the
- * workspace's index stays here, and so do the query embeddings, so vectors
- * match — and filtered to the spec's enabled tools. `serve` proxies a worker's
- * calls to it with the bridge's own secret.
- */
-export async function startMcpBridge(spec: McpServerSpec): Promise<McpBridge> {
-  const tools = [...(spec.enabledTools ?? [])];
-  if (!tools.length) throw new Error('an MCP agent leaves this machine only with its tools named (enabledTools)');
-  const allowed = new Set(tools);
-  const secret = crypto.randomBytes(24).toString('base64url');
-  let connecting: Promise<Client> | null = null;
-  let client: Client | null = null;
-  const connect = () => (connecting ??= (async () => {
-    const c = new Client({ name: 'knode-eval-bridge', version: '1.0.0' });
-    await c.connect(new StdioClientTransport({ command: spec.command, args: spec.args, env: { ...getDefaultEnvironment(), ...(spec.env ?? {}) }, stderr: 'ignore' }));
-    client = c;
-    return c;
-  })());
-  const server = http.createServer((req, res) => {
-    const presented = /^bearer\s+(\S+)$/i.exec(req.headers.authorization ?? '')?.[1] ?? '';
-    const ok = presented.length === secret.length && crypto.timingSafeEqual(Buffer.from(presented), Buffer.from(secret));
-    if (!ok || req.method !== 'POST') {
-      res.writeHead(ok ? 405 : 401, { 'content-type': 'application/json' }).end(JSON.stringify({ error: ok ? 'POST only' : 'unauthorized' }));
-      return;
-    }
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => void (async () => {
-      let body: unknown;
-      try {
-        body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      } catch {
-        res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'expected JSON' }));
-        return;
-      }
-      const mcp = new Server({ name: 'knode-os', version: '1.0.0' }, { capabilities: { tools: {} } });
-      mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: (await (await connect()).listTools()).tools.filter((t) => allowed.has(t.name)) }));
-      mcp.setRequestHandler(CallToolRequestSchema, async (r) => {
-        if (!allowed.has(r.params.name)) throw new McpError(ErrorCode.InvalidParams, `this session may not call ${r.params.name}`);
-        return (await connect()).callTool(r.params) as never;
-      });
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-      res.on('close', () => {
-        void transport.close().catch(() => {});
-        void mcp.close().catch(() => {});
-      });
-      try {
-        await mcp.connect(transport);
-        await transport.handleRequest(req, res, body);
-      } catch (err) {
-        if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
-      }
-    })());
-  });
-  server.requestTimeout = 0;
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = (server.address() as AddressInfo).port;
-  return {
-    url: `http://127.0.0.1:${port}/mcp`,
-    secret,
-    tools,
-    async close() {
-      server.closeAllConnections?.();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await (client as Client | null)?.close().catch(() => {});
-    },
-  };
-}
-
 /* ------------------------------ agent sessions ----------------------------- */
 
 /**
@@ -402,27 +319,23 @@ export async function startMcpBridge(spec: McpServerSpec): Promise<McpBridge> {
 export async function remoteAgent(remote: RemoteEval, opts: AgentRunOptions): Promise<AgentRunResult | null> {
   if (remote.signal.aborted) throw new RunCancelledError();
   if (opts.sandbox !== 'read-only' || !opts.model || remote.online('eval-session', 'codex') === 0) return null;
-  if (opts.mcp && !opts.mcp.enabledTools?.length) return null;
+  // knode's tools leave only as a running tool host (a URL the run serves) with its tools named: `serve` proxies the session's calls to it
+  if (opts.mcp && (!('url' in opts.mcp) || !opts.mcp.enabledTools?.length)) return null;
   const t0 = Date.now();
   const hasFiles = fs.existsSync(opts.cwd) && fs.readdirSync(opts.cwd).length > 0;
   const archive = hasFiles ? await remote.archive(opts.cwd) : null;
-  const bridge = opts.mcp ? await startMcpBridge(opts.mcp) : null;
-  let o: RemoteOutcome;
-  try {
-    o = await remote.offer({
-      kind: 'eval-session',
-      label: `agent${opts.label ? ` · ${opts.label}` : ''}`,
-      agent: { family: 'codex', model: opts.model, effort: effortFor('codex-cli', opts.effort) ?? null, speed: null },
-      sandbox: 'read-only',
-      maxSteps: opts.maxSteps ?? 25,
-      timeoutMs: opts.timeoutMs ?? 15 * 60_000,
-      prompt: opts.prompt,
-      archive,
-      mcp: bridge ? { url: bridge.url, secret: bridge.secret, tools: bridge.tools } : null,
-    });
-  } finally {
-    await bridge?.close();
-  }
+  const mcp = opts.mcp && 'url' in opts.mcp ? { url: opts.mcp.url, secret: opts.mcp.token, tools: [...(opts.mcp.enabledTools ?? [])] } : null;
+  const o: RemoteOutcome = await remote.offer({
+    kind: 'eval-session',
+    label: `agent${opts.label ? ` · ${opts.label}` : ''}`,
+    agent: { family: 'codex', model: opts.model, effort: effortFor('codex-cli', opts.effort) ?? null, speed: null },
+    sandbox: 'read-only',
+    maxSteps: opts.maxSteps ?? 25,
+    timeoutMs: opts.timeoutMs ?? 15 * 60_000,
+    prompt: opts.prompt,
+    archive,
+    mcp,
+  });
   if (o.outcome === 'cancelled' || o.outcome === 'stopped') throw new RunCancelledError();
   if (o.outcome !== 'answered' || !o.session) return null;
   return agentResultOf(o.session, opts, { worker: o.worker, backend: o.backend, usage: o.usage, ms: Date.now() - t0 });
