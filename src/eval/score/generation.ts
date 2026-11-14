@@ -28,7 +28,12 @@ export interface GenerationOptions {
   links?: number;
   contradictionPairs?: number;
   seed?: string | number;
+  /** Passages of a relation's own documents shown to the link judge, at most (default `LINK_CITED_PASSAGES`). */
+  linkPassages?: number;
 }
+
+/** Passages of a relation's own documents its link is judged against, at most (beside the corpus search's five). */
+export const LINK_CITED_PASSAGES = 8;
 
 type Put = (metric: string, value: number | null, extra?: { n?: number; ci?: [number, number]; detail?: Record<string, unknown> }) => void;
 
@@ -100,8 +105,13 @@ export async function scoreGeneration(
   const corpusIndex = new Bm25<Chunk>(chunks, (c) => c.text);
   const chunksOf = new Map<string, Chunk[]>();
   for (const c of chunks) (chunksOf.get(c.doc) ?? chunksOf.set(c.doc, []).get(c.doc)!).push(c);
-  const passagesFor = (claim: string, cited: string[]): { cited: string[]; all: string[] } => {
-    const fromCited = cited.flatMap((d) => new Bm25(chunksOf.get(d) ?? [], (c) => c.text).search(claim, 2).map((h) => h.item.text));
+  // `maxCited`: at most that many passages of the cited documents, the best matches across them — a relation
+  // cites every document its evidence came from, dozens for a common pair, and two passages of each is too
+  // much to read for one verdict
+  const passagesFor = (claim: string, cited: string[], maxCited?: number): { cited: string[]; all: string[] } => {
+    const fromCited = maxCited !== undefined && cited.length * 2 > maxCited
+      ? new Bm25(cited.flatMap((d) => chunksOf.get(d) ?? []), (c) => c.text).search(claim, maxCited).map((h) => h.item.text)
+      : cited.flatMap((d) => new Bm25(chunksOf.get(d) ?? [], (c) => c.text).search(claim, 2).map((h) => h.item.text));
     const top = corpusIndex.search(claim, 5).map((h) => h.item.text);
     return { cited: fromCited, all: [...new Set([...fromCited, ...top])] };
   };
@@ -134,7 +144,7 @@ export async function scoreGeneration(
   const relations = units.filter((u) => u.kind === 'relation' && u.head && u.tail);
   const linkSample = sample(relations, opts.links ?? 30, seed, (u) => u.id);
   if (linkSample.length) {
-    const items = linkSample.map((u) => ({ id: recordKey('link', system, u.id), head: u.head!, relation: u.relation ?? 'related to', tail: u.tail!, sources: passagesFor(`${u.head} ${u.tail}`, u.sources).all }));
+    const items = linkSample.map((u) => ({ id: recordKey('link', system, u.id), head: u.head!, relation: u.relation ?? 'related to', tail: u.tail!, sources: passagesFor(`${u.head} ${u.tail}`, u.sources, opts.linkPassages ?? LINK_CITED_PASSAGES).all }));
     const v = await judge.linkCorrect(items);
     const judged = items.filter((i) => v.has(i.id));
     const ok = judged.filter((i) => v.get(i.id)!.correct).length;

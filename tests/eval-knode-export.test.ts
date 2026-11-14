@@ -3,21 +3,25 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
+import { Judge, LINK_SYSTEM } from '../src/eval/judge.js';
 import { Meter } from '../src/eval/meter.js';
-import { loadPack, stageCorpus } from '../src/eval/pack.js';
+import { docText, loadPack, stageCorpus } from '../src/eval/pack.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { QuotaGuard } from '../src/eval/quota.js';
 import { runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
+import { LINK_CITED_PASSAGES, scoreGeneration } from '../src/eval/score/generation.js';
 import { startShim, type ChatRequest } from '../src/eval/shim.js';
 import { claimWindow, knodeAsk } from '../src/eval/systems/knode.js';
 import type { SystemEnv } from '../src/eval/systems/types.js';
 import type { KnowledgeUnit } from '../src/eval/types.js';
+import type { ChatMessage, LlmClient } from '../src/llm/client.js';
 import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
 
 /**
  * What the knode adapter hands the scorers (src/eval/systems/knode.ts), on one
- * small build: the units it exports for the generation suite.
+ * small build: the units it exports for the generation suite, and what the
+ * generation scorer shows its judge of them.
  */
 
 /** The fixture's extraction, with a period on the claim read off the offer email. */
@@ -95,5 +99,54 @@ describe('exported claims', () => {
     expect(claimWindow(new Date('2025-11-03T00:00:00.000Z'), null)).toBe(' (2025-11-03 – )');
     expect(claimWindow(null, new Date('2025-11-07T23:59:59.999Z'))).toBe(' (? – 2025-11-07)');
     expect(claimWindow(null, null)).toBe('');
+  });
+});
+
+describe('exported relations', () => {
+  it('name the documents their evidence came from', () => {
+    const docs = new Set(env.staged.docs.map((d) => d.path));
+    const relations = units.filter((u) => u.kind === 'relation');
+    const works = relations.find((u) => u.head === '林晓' && u.tail === '澜舟科技' && u.relation === 'works_at')!;
+    // the scripted extraction reads the relation off every document it is shown
+    expect(works.sources.length).toBeGreaterThan(1);
+    expect(works.sources).toContain('email/2026-03-05.md');
+    expect(new Set(works.sources).size).toBe(works.sources.length);
+    for (const u of relations) for (const d of u.sources) expect(docs.has(d), d).toBe(true);
+    // as its ends do: an entity's documents are the ones that mention it
+    const person = units.find((u) => u.id === 'entity:林晓')!;
+    for (const d of works.sources) expect(person.sources).toContain(d);
+  });
+
+  it('are judged against passages of those documents, a bounded number of them', async () => {
+    const asked: { link: string; sources: string[] }[] = [];
+    const scripted = scriptedJudge();
+    const client = Object.assign(Object.create(scripted) as LlmClient, {
+      completeJson: <T>(messages: ChatMessage[], opts?: Parameters<LlmClient['completeJson']>[1]) => {
+        if (messages.some((m) => m.role === 'system' && m.content === LINK_SYSTEM)) asked.push(...(JSON.parse(messages.find((m) => m.role === 'user')!.content) as { items: { link: string; sources: string[] }[] }).items);
+        return scripted.completeJson<T>(messages, opts);
+      },
+    });
+    const works = units.find((u) => u.kind === 'relation' && u.relation === 'works_at')!;
+    const passages = (item: { sources: string[] }) => item.sources.map((p) => p.replace(/^\[\d+\] /, ''));
+    const texts = works.sources.map((d) => docText(env.pack, d));
+    const ofCited = (p: string) => texts.some((text) => text.includes(p.slice(0, 40)));
+    const judged = async (linkPassages?: number) => {
+      asked.length = 0;
+      const scores = await scoreGeneration(env.pack, 'knode-ask', units, new Judge({ client, meter: new Meter() }), null, { linkPassages });
+      expect(scores.find((r) => r.metric === 'link_precision')?.value).toBe(1);
+      return passages(asked.find((i) => i.link === '林晓 —works_at→ 澜舟科技')!);
+    };
+    // by default: passages of the relation's own documents, more than the corpus search's five alone
+    const shown = await judged();
+    expect(shown.filter(ofCited).length).toBeGreaterThan(5);
+    expect(shown.length).toBeLessThanOrEqual(LINK_CITED_PASSAGES + 5);
+    // a relation with more documents than the judge is to read: the best passages across them, then the search's
+    expect(works.sources.length * 2).toBeGreaterThan(3);
+    const few = await judged(3);
+    expect(few.length).toBeLessThan(shown.length);
+    expect(few.length).toBeLessThanOrEqual(3 + 5);
+    expect(few.slice(0, 3).every(ofCited)).toBe(true);
+    // every unit of the build says where it comes from, the relations too
+    expect(units.filter((u) => u.kind === 'relation').every((u) => u.sources.length > 0)).toBe(true);
   });
 });

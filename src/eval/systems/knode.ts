@@ -582,12 +582,23 @@ async function exportUnits(s: KnodeState): Promise<KnowledgeUnit[]> {
     const aliases = Array.isArray(e.aliases) ? (e.aliases as string[]) : [];
     units.push({ id: `entity:${e.id}`, kind: 'entity', title: e.name, text: `${e.name} (${e.type}): ${e.description}`.trim() + (aliases.length ? `\naliases: ${aliases.join(', ')}` : ''), sources: sourcesOf.get(e.id) ?? [], links: [] });
   }
+  // a relation's documents are the ones its evidence came from, oldest first: the row's own document_id is unset
+  // for an extracted relation, whose evidence is written on the scope of the document read (`doc`, or `tier1`
+  // keyed by the same path — as an entity page names a relation's source, src/wiki/pages.ts). Without them every
+  // relation unit had no source, and its link was judged against passages a keyword search of the corpus found.
+  const evidenceOf = new Map<string, string[]>();
+  for (const r of await ctx.store.query<{ target_id: string; path: string }>(
+    `SELECT ev.target_id, s.key AS path FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
+     WHERE ev.kind = 'relation' AND ev.tx_to IS NULL AND s.kind IN ('doc', 'tier1')
+     GROUP BY ev.target_id, s.key ORDER BY min(ev.tx_from), s.key`,
+  )) (evidenceOf.get(r.target_id) ?? evidenceOf.set(r.target_id, []).get(r.target_id)!).push(...strip(r.path));
   for (const r of await ctx.store.query<{ id: string; head: string; tail: string; type: string; description: string; path: string | null; source_id: string; target_id: string }>(
     `SELECT r.id, s.name AS head, t.name AS tail, r.type, r.description, d.path, r.source_id, r.target_id
      FROM relations r JOIN entities s ON s.id = r.source_id JOIN entities t ON t.id = r.target_id
      LEFT JOIN documents d ON d.id = r.document_id WHERE r.tx_to IS NULL`,
   )) {
-    units.push({ id: `relation:${r.id}`, kind: 'relation', head: r.head, tail: r.tail, relation: r.type, text: `${r.head} —${r.type}→ ${r.tail}${r.description ? `: ${r.description}` : ''}`, sources: strip(r.path), links: [`entity:${r.source_id}`, `entity:${r.target_id}`] });
+    const sources = [...new Set([...strip(r.path), ...(evidenceOf.get(r.id) ?? [])])];
+    units.push({ id: `relation:${r.id}`, kind: 'relation', head: r.head, tail: r.tail, relation: r.type, text: `${r.head} —${r.type}→ ${r.tail}${r.description ? `: ${r.description}` : ''}`, sources, links: [`entity:${r.source_id}`, `entity:${r.target_id}`] });
   }
   for (const c of await ctx.store.query<{ id: string; subject: string; statement: string; kind: string; valid_from: string | Date | null; valid_to: string | Date | null; path: string | null; subject_id: string }>(
     `SELECT c.id, e.name AS subject, c.statement, c.kind, c.valid_from, c.valid_to, d.path, c.subject_id
