@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -22,6 +23,10 @@ import type { WorkSource, WorkTask } from '../src/work/broker.js';
 import { EvalSource, EvalWork } from '../src/work/eval.js';
 import type { EvalCallSpec, EvalSpec } from '../src/work/eval.js';
 import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
+import { llmWikiBuild } from '../src/eval/systems/llm-wiki.js';
+import { loadPack, stageCorpus } from '../src/eval/pack.js';
+import { Meter as RunMeter } from '../src/eval/meter.js';
+import type { SystemEnv } from '../src/eval/systems/types.js';
 
 /**
  * docs/design/32 stage 1: an evaluation run only publishes its model work;
@@ -609,6 +614,36 @@ describe('a run that fails to start', () => {
       expect(process.listenerCount('SIGINT')).toBe(before);
     } finally {
       OwnQueue.prototype.lease = leaseSpy;
+    }
+  });
+});
+
+describe('a cancelled session in the llm-wiki build', () => {
+  it('stops the build where it was, never counting the batch as ingested', async () => {
+    const bin = fs.mkdtempSync(path.join(tmp, 'killed-bin-'));
+    fs.writeFileSync(path.join(bin, 'codex'), '#!/bin/sh\ncat > /dev/null\nkill -TERM $$\n');
+    fs.chmodSync(path.join(bin, 'codex'), 0o755);
+    const oldPath = process.env.PATH;
+    const oldHours = process.env.KNODE_CODEX_CATALOG_HOURS;
+    process.env.PATH = `${bin}:${oldPath}`;
+    process.env.KNODE_CODEX_CATALOG_HOURS = '0';
+    const pack = loadPack(packDir);
+    const staged = stageCorpus(pack);
+    const workDir = fs.mkdtempSync(path.join(tmp, 'wiki-cancel-'));
+    const env = { runId: 'cancel', pack, staged, workDir, meter: new RunMeter(), quota: new QuotaGuard({ enabled: false }), models: { model: '', buildEffort: 'low' }, log: () => {} } as unknown as SystemEnv;
+    try {
+      await expect(llmWikiBuild(env, 2)).rejects.toThrow(/^cancelled: codex was killed by SIGTERM/);
+      const root = path.join(os.tmpdir(), `knode-eval-wiki-${crypto.createHash('sha256').update(workDir).digest('hex').slice(0, 16)}`);
+      // no session finished: nothing recorded as ingested (the progress file is written after a session that counts)
+      const progress = fs.existsSync(`${root}.progress.json`) ? (JSON.parse(fs.readFileSync(`${root}.progress.json`, 'utf8')) as { done: number }) : { done: 0 };
+      expect(progress.done).toBe(0);
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(`${root}.progress.json`, { force: true });
+    } finally {
+      process.env.PATH = oldPath;
+      if (oldHours === undefined) delete process.env.KNODE_CODEX_CATALOG_HOURS;
+      else process.env.KNODE_CODEX_CATALOG_HOURS = oldHours;
+      staged.cleanup();
     }
   });
 });

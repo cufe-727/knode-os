@@ -622,8 +622,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
               error = err instanceof Error ? err.message : String(err);
             }
             if (stop.signal.aborted) throw new RunCancelledError();
-            if (remote.stuckFor(stuckMark, group).length) {
-              progress(`[${pack.manifest.id}/${group}] update ${batch} left for a resume: a piece of it is stuck`);
+            if (remote.stuckFor(stuckMark, group).length || (error && /^cancelled:/.test(error))) {
+              progress(`[${pack.manifest.id}/${group}] update ${batch} left for a resume: ${error && /^cancelled:/.test(error) ? 'its session was cancelled' : 'a piece of it is stuck'}`);
               failed.add(group);
               continue;
             }
@@ -906,8 +906,8 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
   // a cancelled run writes no record of what it stopped: a resumed run builds it whole
   if (signal?.aborted) throw new RunCancelledError();
   // nor a build one of whose pieces is stuck: the group waits for a resume, and the run goes on without it
-  if (remote?.stuckFor(stuckMark, group).length) {
-    progress(`[${env.pack.manifest.id}/${group}] build left for a resume: a piece of it is stuck`);
+  if (remote?.stuckFor(stuckMark, group).length || (!rec.ok && rec.error && /^cancelled:/.test(rec.error))) {
+    progress(`[${env.pack.manifest.id}/${group}] build left for a resume: ${!rec.ok && rec.error && /^cancelled:/.test(rec.error) ? 'a session of it was cancelled' : 'a piece of it is stuck'}`);
     for (const s of members) await s.release?.(env);
     return false;
   }

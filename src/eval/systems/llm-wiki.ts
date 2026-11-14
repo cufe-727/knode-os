@@ -108,6 +108,8 @@ async function buildWiki(env: SystemEnv, perSession: number): Promise<{ notes: R
       prompt: INGEST_PROMPT(files),
     });
     recordAgent(env.meter, { system: 'llm-wiki', stage: 'build' }, env.models.model, r);
+    // a session killed or stopped with the run ingested nothing to count on: the build stops here and resumes at this batch
+    if (r.cancelled) throw new Error(`${r.error} (llm-wiki ingest of sources ${i + 1}–${i + files.length}; the build resumes there)`);
     progress.done = i + files.length;
     if (r.error) progress.failed++;
     if (r.capped) progress.capped++;
@@ -194,6 +196,8 @@ export function llmWiki(): SystemUnderTest {
         await env.quota.wait();
         const r = await runAgent({ cwd: root, sandbox: 'workspace-write', model: env.models.model, effort: env.models.buildEffort, maxSteps: 80, timeoutMs: 30 * 60_000, prompt: INGEST_PROMPT(files) });
         recordAgent(env.meter, { system: 'llm-wiki', stage: 'update' }, env.models.model, r);
+        // a cancelled session leaves the wiki as it was, and the update for a resume
+        if (r.cancelled) throw new Error(r.error ?? 'cancelled: the update session');
         fs.rmSync(wikiDir(env), { recursive: true, force: true });
         fs.cpSync(path.join(root, 'wiki'), wikiDir(env), { recursive: true });
       } finally {
