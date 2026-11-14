@@ -97,17 +97,10 @@ describe('a claim identity', () => {
     expect(readingDay(reading)).toBe('2025-01-06');
     expect(readingDay({ ...reading, statement: '七部增长组两周前的周活跃用户为136万。' })).toBe('2025-01-06');
     expect(readingDay({ ...reading, eventAt: '2025-03-03T00:00:00.000Z' })).toBe('2025-03-03');
-    // a statement that places itself by no relative time carries a day only as a dated reading of a number
-    const fixed = { ...reading, statement: '平台组服务可用性为99.92%。' };
-    expect(readingDay({ ...fixed, valueNum: null })).toBeNull();
-    expect(readingDay({ ...fixed, attribute: null })).toBeNull();
-    expect(readingDay({ ...fixed, dateSource: 'document' })).toBeNull();
-    expect(readingDay({ ...fixed, validFrom: null })).toBeNull();
-    // one whose time is relative to its document carries its day whatever it is: the day it states, else its document's
-    expect(readingDay({ ...reading, valueNum: null, attribute: null })).toBe('2025-01-06');
-    expect(readingDay({ statement: '支付组本周评审了结算中台的接口设计。', observedAt: '2025-03-07T00:00:00.000Z' })).toBe('2025-03-07');
-    expect(readingDay({ statement: 'R-83较上周仍未关闭。', dateSource: 'document', observedAt: '2025-03-07T00:00:00.000Z' })).toBe('2025-03-07');
-    expect(readingDay({ statement: '支付组本周评审了结算中台的接口设计。' })).toBeNull();
+    expect(readingDay({ ...reading, valueNum: null })).toBeNull();
+    expect(readingDay({ ...reading, attribute: null })).toBeNull();
+    expect(readingDay({ ...reading, dateSource: 'document' })).toBeNull();
+    expect(readingDay({ ...reading, validFrom: null })).toBeNull();
     // a statement that names its own time is one fact however many sources report it on other days
     for (const statement of ['2026Q2 净利润 120 亿元', '平台组2025年第24周服务可用性为99.92%', '10月月报列示四部平台组在岗人数为6人', '2025-06-16当周可用性99.92%', 'FY25 revenue was 3.2bn', '上半年营收12亿元']) {
       expect(readingDay({ ...reading, statement })).toBeNull();

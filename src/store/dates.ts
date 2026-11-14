@@ -146,31 +146,6 @@ export function normalizeDateExpr(expr: unknown, ref?: string | null): DateSpan 
   return span;
 }
 
-// 本/上/下 closing another word: 资本周转率, 日本周三, 成本月环比, 线上月活, 旗下周边, 以下周期
-const RELATIVE_NOT_AFTER = '资日成根基版样剧账文课脚书读标范副原血赌线旗以私地';
-// 周/月 opening another word: 周线, 月线, 周边, 周转, 周期, 周刊
-const RELATIVE_NOT_BEFORE = '线边转期刊';
-const RELATIVE_CJK = new RegExp(
-  `(?<![${RELATIVE_NOT_AFTER}])(本周|这周|上一?周|下一?周|本月|这个?月|上个?月|下个?月|本季度?|上一?季度|下季度|今年|本年|去年|上年|明年|今天|昨天)(?![${RELATIVE_NOT_BEFORE}])`,
-);
-// "the last week of March" names a week of March, not one before the document
-// "两周前", "3个月前": counted back from the document's date
-const RELATIVE_AGO = /(?:[两二三四五六七八九十]|\d{1,2})\s*(?:周|星期|天|日|个月|年)前/;
-const RELATIVE_EN = /(?<!\bthe\s)\b(?:this|last|next)\s+(?:week|month|quarter|year)\b(?!\s+of\b)|\b(?:today|yesterday)\b/i;
-
-/**
- * The word that places a statement in time relative to its document's date —
- * its own period ("支付组本周在岗7人") or the base it compares with ("较上周增加2人",
- * "环比上月") — or null. Either way the same words in two reports are two
- * assertions about two times, which is what claim identity reads it for
- * (src/lineage/writer.ts readingDay); it dates nothing itself. A word that only
- * contains one (资本周转率, 日本周三, 站上周线, 旗下周边, 成本月环比) is none.
- */
-export function relativeTimeWord(statement: string): string | null {
-  const t = statement.normalize('NFKC');
-  return RELATIVE_CJK.exec(t)?.[1] ?? RELATIVE_AGO.exec(t)?.[0] ?? RELATIVE_EN.exec(t)?.[0].toLowerCase() ?? null;
-}
-
 /** The instant a date expression starts at (for single-valued fields such as an event date). */
 export function dateStart(expr: unknown, ref?: string | null): string | null {
   return normalizeDateExpr(expr, ref)?.from ?? null;
