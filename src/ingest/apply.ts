@@ -18,7 +18,6 @@ import { applyWirePlan, extractWikilinks, planWireFromMarkdown, WikiIndex } from
 import { isReservedWikiFile } from '../lineage/declared.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
 import { ScopeRow } from '../lineage/types.js';
-import { CLAIM_IDENTITY } from '../lineage/writer.js';
 import { toIso } from '../store/temporal.js';
 import { ParsedMarkdown, parseFrontmatter, titleFromMarkdown } from '../markdown.js';
 import { isGeneratedConcept } from '../okf/index.js';
@@ -170,7 +169,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     && !isReservedWikiFile(file) && raw.includes('raw/docs/');
   // a mind map applied by an older planner is read again once (docs/design/19)
   const mindMapStale = live !== null && live.sha === sha && sameModel && live.meta.mindmap !== MINDMAP_PLAN_VERSION && looksLikeMindMap(raw);
-  // a source dated by older rules, or whose claims were keyed by an older identity, is applied again
+  // a source dated by older rules is applied again
   const stale = root === 'docs' && live !== null && live.sha === sha && sameModel && !opts.reapply
     ? await staleApplication(store, live, file, raw, docId)
     : null;
@@ -453,8 +452,8 @@ async function ensureTier1Replay(store: Store, file: string, raw: string, sha: s
   const tier1 = replayableTier1(readSidecarPart(store.dataDir, file, 'tier1'), sha, raw.length);
   if (!tier1) return;
   const child = await findLiveScope(store, 'tier1', file);
-  // the live scope already carries this result (a segmented one names its extractedAt), keyed as claims are keyed now
-  if (child && child.sha === sha && (!tier1.segmenter || child.meta.extractedAt === tier1.extractedAt) && child.meta.claimIdentity === CLAIM_IDENTITY) return;
+  // the live scope already carries this result (a segmented one names its extractedAt)
+  if (child && child.sha === sha && (!tier1.segmenter || child.meta.extractedAt === tier1.extractedAt)) return;
   const chunks = await store.query<{ id: string; content: string }>(`SELECT id, content FROM chunks WHERE document_id = $1 ORDER BY seq`, [docId]);
   const [docRow] = await store.query<{ doc_date: string | Date | null }>(`SELECT doc_date FROM documents WHERE id = $1`, [docId]);
   const docDate = docRow?.doc_date ? new Date(docRow.doc_date).toISOString() : null;
@@ -472,11 +471,11 @@ async function ensureTier1Replay(store: Store, file: string, raw: string, sha: s
 /**
  * The rules a document's scope was applied under, beside its bytes: how its
  * date is read (`dateRules`, bump DOC_DATE_RULES when docDateOf reads dates
- * differently — a dateline at the top, say) and how its claims are keyed
- * (`claimIdentity`, src/lineage/writer.ts CLAIM_IDENTITY).
+ * differently — a dateline at the top, say). Claim identity is not here:
+ * src/graph/claim-rekey.ts moves an existing workspace's claims itself.
  */
 export const DOC_DATE_RULES = 1;
-const APPLY_RULES = { dateRules: DOC_DATE_RULES, claimIdentity: CLAIM_IDENTITY };
+const APPLY_RULES = { dateRules: DOC_DATE_RULES };
 
 /**
  * Whether an unchanged source must be applied again because the rules it was
@@ -484,26 +483,15 @@ const APPLY_RULES = { dateRules: DOC_DATE_RULES, claimIdentity: CLAIM_IDENTITY }
  * again, and when it comes out other than the stored doc_date the document is
  * applied again — the stored extraction too, so every claim is dated from what
  * it stated ("去年" resolved on the new date) or, stating nothing, from the new
- * date; a corrected date is followed the same way. A document whose own
- * frontmatter declares claims is applied again when those were keyed by an
- * older claim identity; one that declares none just has its tier-1 extraction
- * replayed (ensureTier1Replay). Each document is its own transaction in a sync
+ * date; a corrected date is followed the same way. Each document is its own transaction in a sync
  * pass, and a document checked is marked, so a stopped pass resumes where it was.
  */
 async function staleApplication(store: Store, live: ScopeRow, file: string, raw: string, docId: string): Promise<{ redo: boolean; reason: string } | null> {
-  const dates = live.meta.dateRules !== DOC_DATE_RULES;
-  const identity = live.meta.claimIdentity !== CLAIM_IDENTITY;
-  if (!dates && !identity) return null;
-  if (dates) {
-    const now = docDateOf(file, parseFrontmatter(raw).frontmatter);
-    const [row] = await store.query<{ doc_date: string | Date | null }>(`SELECT doc_date FROM documents WHERE id = $1`, [docId]);
-    const was = toIso(row?.doc_date ?? null);
-    if (now !== was) return { redo: true, reason: `its date reads ${now?.slice(0, 10) ?? 'none'} now, was ${was?.slice(0, 10) ?? 'none'}` };
-  }
-  if (identity) {
-    const [declared] = await store.query<{ n: number }>(`SELECT 1 AS n FROM evidence WHERE scope_id = $1 AND kind = 'claim' AND tx_to IS NULL LIMIT 1`, [live.id]);
-    if (declared) return { redo: true, reason: 'its claims were keyed by an older claim identity' };
-  }
+  if (live.meta.dateRules === DOC_DATE_RULES) return null;
+  const now = docDateOf(file, parseFrontmatter(raw).frontmatter);
+  const [row] = await store.query<{ doc_date: string | Date | null }>(`SELECT doc_date FROM documents WHERE id = $1`, [docId]);
+  const was = toIso(row?.doc_date ?? null);
+  if (now !== was) return { redo: true, reason: `its date reads ${now?.slice(0, 10) ?? 'none'} now, was ${was?.slice(0, 10) ?? 'none'}` };
   return { redo: false, reason: '' };
 }
 

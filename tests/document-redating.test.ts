@@ -8,8 +8,6 @@ import { writeSidecarPart } from '../src/fs/sidecar.js';
 import { supersedeByAttribute } from '../src/graph/claim-state-store.js';
 import { documentIdFor } from '../src/ingest/apply.js';
 import { sync } from '../src/ingest/sync.js';
-import { findLiveScope } from '../src/lineage/scope.js';
-import { CLAIM_IDENTITY } from '../src/lineage/writer.js';
 import { toDateString } from '../src/store/temporal.js';
 
 /**
@@ -19,8 +17,7 @@ import { toDateString } from '../src/store/temporal.js';
  * change (a dateline reader, a fixed rule) a sync pass applies every document
  * whose date reads otherwise now again, its stored extraction included — no
  * model — so a claim takes the date it stated, a corrected date is followed,
- * and nothing is left half re-dated. A tier-1 extraction applied under an
- * older claim identity is replayed the same way.
+ * and nothing is left half re-dated.
  */
 
 // how documents are dated: as built (`off`: no date found), or per path
@@ -134,20 +131,5 @@ claims:
     expect((await sync(ctx, { llmGraph: false })).indexed).toBe(1);
     rows = await claims(ctx);
     expect(day(by('支付组在岗7人。').effective_at)).toBe('2025-09-12');
-  });
-
-  it('replays a tier-1 extraction applied under an older claim identity, and only once', async () => {
-    const c = ctx!;
-    const before = await findLiveScope(c.store, 'tier1', C);
-    expect(before?.meta.claimIdentity).toBe(CLAIM_IDENTITY);
-    // as a workspace applied before the identity changed has it
-    await c.store.query(`UPDATE scopes SET meta = meta - 'claimIdentity' WHERE id = $1`, [before!.id]);
-    expect((await sync(c, { llmGraph: false })).indexed).toBe(0);
-    const after = await findLiveScope(c.store, 'tier1', C);
-    expect(after!.id).not.toBe(before!.id);
-    expect(after!.meta.claimIdentity).toBe(CLAIM_IDENTITY);
-    expect((await claims(c)).filter((r) => r.statement === '支付组在岗7人。')).toHaveLength(1);
-    await sync(c, { llmGraph: false });
-    expect((await findLiveScope(c.store, 'tier1', C))!.id).toBe(after!.id);
   });
 });

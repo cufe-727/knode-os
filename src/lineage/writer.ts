@@ -54,18 +54,6 @@ import {
 /** Citation rows per INSERT: ten parameters each, well under PostgreSQL's 65,535. */
 const CITATION_BATCH = 500;
 
-/**
- * The version of claim identity (claimId + readingWeek in src/graph/store.ts)
- * a scope's claims were keyed by, kept in the scope's meta as `claimIdentity`:
- * 1 (absent) subject + statement; 2 a weekly reading of a number also carries
- * its ISO week. A document applied under an older one is applied again from
- * what is stored (src/ingest/apply.ts), so a workspace does not keep
- * old-identity claims beside new ones. Bump it with any change to claimId or
- * readingWeek.
- */
-export const CLAIM_IDENTITY = 2;
-
-
 export interface DocumentProjection {
   id: string;
   path: string;
