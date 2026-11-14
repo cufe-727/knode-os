@@ -175,45 +175,54 @@ Run by refine before the duplicate audit (`resolveEntityContext`), deterministic
   documents, the reason), its documents' tier‑1 extractions re-applied from their sidecars (no model call; a document
   without a whole sidecar is left as it is), and the pair recorded as a decided (rejected) merge so the duplicate audit
   never proposes it. From then on resolution lands the name on the person the document means (below), else the
-  original. A document with no date of its own is dated, for this test only, by the median of the dates its claims
-  state: reports that give their week in the text had no `doc_date`, and no person was split on the 10× benchmark
-  (2026-11-14). `src/ingest/docdate.ts` now also reads a dateline at the top of a raw document.
+  original. Since 2026-11-15 the rule also needs at least half of each cluster's documents dated, both clusters
+  mostly in one language, and documents that are not one cluster's first and then the other's (`sequentialShare`
+  < 0.7): once documents had dates, the range test alone split 13 people on the 10× benchmark who had changed teams
+  and were named months later in their old team's incident reviews.
 - **Same name, different thing (2026-11-15, `src/graph/identity.ts`).** On the 10× benchmark (ten divisions with the
   same team structure) write-time resolution, which merges on slug or alias-key equality, made 9 entities of 90
   settings and one of every person name two teams share: B-cubed precision 0.60 by the suite's score, 0.125 over the
   settings' mentions. What an extraction records for a mention tells them apart — a *code* among its spellings
-  (`D7T1-C1`; one token of Latin letters and digits, compared by shape with digit runs aside, leading zeros dropped),
-  its *owner* (the target of a hierarchical relation stated for it) and the *anchors* of its document (the
-  organizations and projects it names; its *home* is the one most of its hierarchical relations point at).
-  - *Owners and anchors alone part nothing.* On finance (27,398 extractions) 1,848 names have two or more owners —
-    an index member, a supply chain, two boards — and 325 carry two codes of one shape, nearly all of them one thing
-    (`芯片` with H100 and H200 as aliases, `00700.HK` and `700.HK`). They choose among entities a name was already
-    parted into; they never part one.
-  - *Write time* (`resolve.ts`, `partByCode`): a mention whose code differs from the code of the entity its name
-    lands on — same shape and another value, or the other code with something in front (`T1-C1`, `D2T1-C1`) — gets
-    an entity `name（roof · code）` when that entity is in ≥ 3 documents, ≥ 60% of them name one organization or project,
-    this document names none of those and has a home or owner of its own that none of them names. Otherwise it
-    merges as before.
-  - *Refine* (`splitCoded`): a code is written once or twice, where the thing is introduced, so the documents that
-    carry a code seed a group and a document without one joins the group it is most like (Jaccard ≥ 0.3 with one of
-    its documents, and with no other group's as much). An entity is parted when two or more such codes each have a
-    group of ≥ 2 documents with an anchor of its own (≥ 60% of its documents, ≤ 5% of the other groups') and the
-    roofs account for ≥ 80% of the entity's documents. Each becomes `name（roof · code）` — `日志保留天数（七部平台组 ·
-    D7T1-C2）` — and its documents are re-applied from the sidecars. On finance ten hubs (DRAM with DDR4 and DDR5,
-    国债期货 by contract) would have parted without the 80% test, none with it. This is the only split of anything
-    but a person: disjoint contexts alone do not make a product, a technology or a sector two.
-  - *People.* The namesake rule above gained two tests once documents had dates: what the two clusters are about
-    is compared over the entities in ≥ 20% of each one's documents (two teams that each name a customer once are
-    still two contexts), and the documents must not be one cluster's first and then the other's (`sequentialShare`
-    < 0.7) — a person who changed teams is named months later in the old team's incident reviews, which made the two
-    date ranges overlap.
-  - *Following* (`namesakeFor`): a mention that lands on a parted name goes to the entity labelled with its code,
-    else the one the split gave its document to, else the one whose anchors name its owner, else the one whose anchors its document names most (more than the
-    base entity's, and no other as many), else the base entity. This replaces the person-only lookup by name.
-  - `review.identity: "name"` turns the parting off (write time and refine); names already parted are still
-    followed. `knode-os eval resolution` measures all of it from a workspace's sidecars, no model. On a replay of the
-    10× sidecars (1,540 documents): B-cubed precision over mentions 0.865 → 0.998 at recall 0.978 (settings 0.128 →
-    0.994, people 0.871 → 0.998); 81 settings and 29 of the 30 shared person names parted, none wrongly.
+  (`D7T1-C1`; one token of Latin letters and digits, leading zeros dropped), its *owner* (the target of a
+  hierarchical relation stated for it) and the *anchors* of its document (the organizations and projects it names).
+  - *Nothing is parted when a document is written.* One document cannot tell ten divisions' settings from kinds
+    listed as aliases: on finance (27,398 extractions) 1,848 names have two or more owners and 325 carry two codes
+    of one shape, nearly all of them one thing (`DRAM` with DDR4 and DDR5, `00700.HK` and `700.HK`). A first
+    version parted at write time; a review reproduced a second `DRAM` from three notes of one maker and one of
+    another, and one `DRAM` from the same notes in the other order. A name is parted only by refine, which sees all
+    of its documents, so the outcome does not depend on the order they arrive in.
+  - *`review.identity`.* `"name"` (the default): refine does what it did before — people only, documents dated.
+    `"context"`, which a workspace turns on, adds what follows.
+  - *Coded split* (`splitCoded`, `"context"` only, types `component` and `other`: an instance, not a category). A
+    code is written once or twice, where the thing is introduced, so the documents that carry a code seed a group
+    and a document without one joins the group it is most like (Jaccard ≥ 0.3 with one of its documents, and with
+    no other group's as much). An entity is parted when two or more codes that differ as identifiers of one kind do
+    each have a group of ≥ 2 documents with an anchor of its own — in ≥ 60% of its documents, ≤ 5% of the other
+    groups', and in no document that carries another of the codes — and the roofs account for ≥ 80% of the entity's
+    documents. Each becomes `name（roof · code）` — `日志保留天数（七部平台组 · D7T1-C2）` — and its documents are
+    re-applied from the sidecars, their tier-0 links re-made. When every document goes with a code, the one with the
+    most documents keeps the entity, on record as a row whose `id` is its `base_id`: later runs never move it, so
+    the entity keeps its id, its claim ids, its page and a person's corrections.
+  - *People* (`"context"` only): a document with no date is dated by the median of the dates its claims state, and
+    the two contexts are compared over the entities in ≥ 20% of each cluster's documents (two teams that each name
+    a customer once are still two contexts).
+  - *Following* (`namesakeFor`, always on): a mention that lands on a parted name goes to the entity labelled with
+    its code; else the one the split gave its document to; else the base entity if it carries the code the base is
+    named by; else, among entities whose code does not differ from one it carries, the one whose anchors name its
+    owner, then the one whose anchors its document names most (more than the base entity's, and no other as many);
+    else the base entity. Roofs are compared as the live entities their names stand for (an alias, a merged
+    spelling), not as strings. Tier-0 links follow the same way.
+  - *What a person sees, and undoing it.* A split logs `entities: X split — reason`, writes `entity_namesakes`
+    (reason, documents) and a rejected merge suggestion for the pair; the parted entity appears as `X（roof · code）`
+    or `X（team）` with the mentions, relations and claims of its documents, which leave X. `knode-os entities merge
+    <parted> <X>` undoes it and stays undone: later mentions resolve to X and refine does not part it again.
+  - *Measured* (`knode-os eval resolution`, sidecars only, no model): see the numbers in the branch's hand-over
+    note. `--scan` on finance, agent-atlas, lifelong-library and default finds nothing to part under either setting.
+- **Document dates** (`src/ingest/docdate.ts`). Frontmatter, then the path, then — raw documents only — a dateline:
+  a line among the first eight that is a date and nothing else (an optional label, a full date, an optional second
+  date, an optional weekday or short byline), not a list item, heading, quote or table row; a dotted date only
+  behind a label or in a range; never later than the day of indexing; of a range the end, when the range is a
+  report's own period (≤ 31 days), and nothing when it is longer or ends in the future.
 
 ## 6. Extraction
 
