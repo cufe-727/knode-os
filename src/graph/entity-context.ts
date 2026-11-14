@@ -691,6 +691,14 @@ async function splitNamesakes(store: Store, config: KnodeConfig | undefined, sta
 
 /* ----------------------------------- coded ----------------------------------- */
 
+/**
+ * The entity types a code may part: a thing that is one instance — a setting,
+ * a part of a system — and what extraction could not type. A product, a
+ * technology, a sector, a concept is a category: several makers' kinds of it
+ * (DRAM: DDR4, DDR5) are one entity however the makers divide, and the only
+ * evidence for the split, the 10× benchmark's settings, is of these types.
+ */
+export const CODED_TYPES: readonly string[] = ['component', 'other'];
 /** Documents a code needs before it may part a name. */
 const CODE_MIN_DOCS = 2;
 /** The share of an entity's documents the codes' roofs must account for before they part it. */
@@ -730,9 +738,11 @@ export interface CodedSplit {
  *     (identity.ts, codesDiffer), each of its group at least CODE_MIN_DOCS
  *     documents;
  *   - an anchor of each group: an organization or project in ≥ 60% of its
- *     documents and ≤ 5% of the other groups'. Kinds listed as aliases (H100
- *     and H200 under 芯片) and one code written short and long share their
- *     context and find none;
+ *     documents, ≤ 5% of the other groups', and in no document that carries
+ *     another of the codes — a roof has one such thing, and its code names
+ *     it. Kinds listed as aliases (H100 and H200 under 芯片), one code
+ *     written short and long, and a maker whose notes carry DDR4 here and
+ *     DDR5 there share their context and find none;
  *   - the roofs account for the entity: CODE_COVERAGE of its documents are
  *     in a group, or stay under a roof of their own that no group's
  *     documents name. Two codes seen twice each in a hub of hundreds of
@@ -768,6 +778,8 @@ export function codedClusters(docs: CodedDoc[], typeOf: (id: string) => string |
     if (groups.length < 2) continue;
     const seeded = new Set(docs.filter((d) => carried(d).length > 0));
     let open = docs.filter((d) => !seeded.has(d));
+    // the documents that carry each code, before any other joined: where a roof must not show under two codes
+    const seeds = new Map(groups.map((g) => [g, [...g.docs]]));
     for (let round = 0; round < 6 && open.length > 0; round++) {
       const joins: { d: CodedDoc; g: (typeof groups)[number] }[] = [];
       for (const d of open) {
@@ -781,7 +793,11 @@ export function codedClusters(docs: CodedDoc[], typeOf: (id: string) => string |
     }
     const parts: CodedPart[] = groups
       .filter((g) => g.docs.length >= CODE_MIN_DOCS)
-      .map((g) => ({ code: g.code, docs: g.docs, anchors: anchorsOf(g.docs, groups.filter((o) => o !== g).flatMap((o) => o.docs)) }))
+      .map((g) => {
+        const others = groups.filter((o) => o !== g);
+        const underAnother = new Set(others.flatMap((o) => seeds.get(o)!).flatMap((d) => [...d.context]));
+        return { code: g.code, docs: g.docs, anchors: anchorsOf(g.docs, others.flatMap((o) => o.docs)).filter((id) => !underAnother.has(id)) };
+      })
       .filter((p) => p.anchors.length > 0);
     if (parts.length < 2) continue;
     const taken = new Set(parts.flatMap((p) => p.docs));
@@ -804,11 +820,12 @@ function commonName(spellings: string[]): string | null {
 }
 
 async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: EntityContextStats, progress: (msg: string) => void): Promise<void> {
-  // every live entity one of whose spellings has a digit; the codes are read here
+  // every live entity of a type a code may part, one of whose spellings has a digit; the codes are read here
   const rows = await store.query<{ id: string; name: string; aliases: string[] | null }>(
     `SELECT e.id, e.name, e.aliases FROM entities e
-     WHERE e.tx_to IS NULL AND e.canonical_id IS NULL AND (e.name ~ '[0-9]' OR e.aliases::text ~ '[0-9]')
-       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = e.id)`,
+     WHERE e.tx_to IS NULL AND e.canonical_id IS NULL AND e.type = ANY($1::text[]) AND (e.name ~ '[0-9]' OR e.aliases::text ~ '[0-9]')
+       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = e.id AND n.id <> n.base_id)`,
+    [[...CODED_TYPES]],
   );
   const candidates = rows.filter((e) => {
     const codes = [e.name, ...(e.aliases ?? [])].map((x) => (typeof x === 'string' ? codeOf(x) : null)).filter((c): c is Code => c !== null);

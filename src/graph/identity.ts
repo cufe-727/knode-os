@@ -5,22 +5,24 @@
  * first:
  *
  *   code     an identifier among the mention's spellings (D7T1-C1, R-71,
- *            600519.SH): letters and digits in one token. Two mentions whose
- *            codes have the same shape (digit runs aside) and differ are two
- *            things — when the context agrees (see below).
+ *            600519.SH): letters and digits in one token.
  *   owner    the target of a hierarchical relation the mention's document
  *            states for it (member_of, part_of, subsidiary_of …): its team or
  *            parent.
  *   anchors  the organizations and projects its document names.
  *
- * Owners and anchors alone never part a name: on finance (27,398 extractions,
- * 2026-11-14) 1,848 names have two or more owners — a company is a member of
- * several indices, a product part of several chains, a person on two boards —
- * and 325 names carry two codes of one shape, most of them an extraction
- * listing kinds as aliases (芯片: H100, H200 …) or one ticker padded two ways
- * (00700.HK, 700.HK). So a code parts a name only where its documents stand
- * under another roof than the other code's (entity-context.ts), and owners
- * and anchors choose among the entities a name was already parted into.
+ * None of them parts a name when a document is written. On finance (27,398
+ * extractions, 2026-11-14) 1,848 names have two or more owners — a company is
+ * a member of several indices, a product part of several chains, a person on
+ * two boards — and 325 names carry two codes of one shape, most of them an
+ * extraction listing kinds as aliases (DRAM: DDR4, DDR5) or one ticker padded
+ * two ways (00700.HK, 700.HK). One document cannot tell those from ten
+ * divisions' settings of one name, and whichever document came first would
+ * decide (review, 2026-11-15: three notes of one maker with DDR4, then one of
+ * another with DDR5, made a second DRAM; the other order made one). A name is
+ * parted only by refine, which sees all of its documents
+ * (entity-context.ts), and what is written here only says, for a name
+ * already parted, which of its entities a mention means (`namesakeFor`).
  */
 
 import { normalizePredicate, Ontology, relationSpec } from './ontology.js';
@@ -115,14 +117,16 @@ export interface MentionContext {
   owners?: readonly string[];
   /** Every name and alias the document's extraction lists. */
   documentNames?: ReadonlySet<string>;
-  /** The organization or project the document's own hierarchical relations mostly point at, if any: whose report it is. */
-  home?: string | null;
-  /** The document being written (its path), for the record of a split. */
+  /** The document being written (its path): a split keeps the documents it gave each entity. */
   documentPath?: string | null;
-  documentId?: string | null;
 }
 
-/** One of the entities a name was parted into, beside the base entity that keeps the name (entity_namesakes). */
+/**
+ * One of the entities a name was parted into (entity_namesakes). A row whose
+ * `id` is its `base_id` is the base entity itself: the code and the roof it
+ * kept when the others were parted from it, so that it keeps them (and its
+ * id) whatever later documents bring.
+ */
 export interface NamesakeRule {
   id: string;
   base_id: string;
@@ -151,45 +155,65 @@ export function namesakeName(rule: Pick<NamesakeRule, 'name' | 'label' | 'anchor
  * entity that keeps the name. In this order:
  *
  *   1. the one labelled with a code the mention carries;
- *   2. the one the split itself gave this document to;
- *   3. the one whose anchors name the mention's own team or parent, when the
- *      base entity's do not;
- *   4. the one whose anchors the document names most, if it names more of
- *      them than of the base entity's, and of no other as many.
+ *   2. the one the split itself gave this document to — refine saw every
+ *      document of the name when it decided;
+ *   3. the base entity, when the mention carries the code the base entity is
+ *      named by;
+ *   4. of those whose code does not differ from a code the mention carries
+ *      (a mention with DDR4 is never the entity labelled DDR5, whatever its
+ *      document names): the one whose anchors name the mention's own team or
+ *      parent, when the base entity's do not;
+ *   5. of the same: the one whose anchors the document names most, if it
+ *      names more of them than of the base entity's.
  *
- * A code that is the base entity's own gives nothing over 2 to 4: an
- * extraction that was shown the base entity's name repeats it for whichever
- * of them the document means.
+ * In 4 and 5 two entities that score alike decide nothing — the mention
+ * stays with the base entity, never with whichever was parted last. `same`
+ * says which entity a name stands for, so that a roof named by an alias, or
+ * one merged into another, is still the same roof (resolve.ts gives the
+ * graph's answer; by default a name is itself, case aside).
  */
-export function namesakeFor(rules: readonly NamesakeRule[], mention: { codes: Codes; context?: MentionContext }): NamesakeRule | null {
+export function namesakeFor(
+  rules: readonly NamesakeRule[],
+  mention: { codes: Codes; baseCodes?: Codes; context?: MentionContext },
+  same: (name: string) => string = lower,
+): NamesakeRule | null {
   if (rules.length === 0) return null;
+  const self = rules.find((r) => r.id === r.base_id);
+  const parted = rules.filter((r) => r !== self);
+  const base = (r: NamesakeRule | null | undefined) => (r && r !== self ? r : null);
   for (const r of rules) {
     const label = codeOf(r.label);
-    if (label && mention.codes.get(label.shape)?.value === label.value) return r;
+    if (label && mention.codes.get(label.shape)?.value === label.value) return base(r);
   }
   const here = mention.context?.documentPath;
   if (here) {
     const listed = rules.filter((r) => r.documents?.includes(here));
-    if (listed.length === 1) return listed[0];
+    if (listed.length === 1) return base(listed[0]);
   }
-  const baseAnchors = new Set(rules[0].base_anchors.map(lower));
+  if (mention.baseCodes && sharesCode(mention.codes, mention.baseCodes)) return null;
+  const mine = [...mention.codes.values()];
+  const open = parted.filter((r) => {
+    const label = codeOf(r.label);
+    return !label || !mine.some((c) => codesDiffer(c, label));
+  });
+  const baseAnchors = new Set((self?.anchors ?? rules[0].base_anchors).map(same));
   const pick = (names: ReadonlySet<string>): NamesakeRule | null => {
     const score = (anchors: Iterable<string>) => {
       let n = 0;
-      for (const a of anchors) if (names.has(lower(a))) n++;
+      for (const a of anchors) if (names.has(a)) n++;
       return n;
     };
-    const base = score(baseAnchors);
-    const scored = rules.map((rule) => ({ rule, s: score(rule.anchors) })).filter((x) => x.s > 0 && x.s > base).sort((x, y) => y.s - x.s);
+    const own = score(baseAnchors);
+    const scored = open.map((rule) => ({ rule, s: score(new Set(rule.anchors.map(same))) })).filter((x) => x.s > 0 && x.s > own).sort((x, y) => y.s - x.s);
     if (scored.length === 0 || (scored.length > 1 && scored[1].s === scored[0].s)) return null;
     return scored[0].rule;
   };
-  const owners = new Set((mention.context?.owners ?? []).map(lower));
+  const owners = new Set((mention.context?.owners ?? []).map(same));
   if (owners.size > 0) {
     const byOwner = pick(owners);
     if (byOwner) return byOwner;
   }
-  return mention.context?.documentNames ? pick(mention.context.documentNames) : null;
+  return mention.context?.documentNames ? pick(new Set([...mention.context.documentNames].map(same))) : null;
 }
 
 /** Organizations and projects: the roofs a thing stands under. */
@@ -198,7 +222,6 @@ export const ANCHOR_TYPES: readonly string[] = ['organization', 'project'];
 /** What one document's extraction says about each of its mentions. */
 export interface DocumentContext {
   documentNames: ReadonlySet<string>;
-  home: string | null;
   /** The context of the mention of `name` in this document. */
   of(name: string): MentionContext;
 }
@@ -207,21 +230,17 @@ export interface DocumentContext {
  * The context one extraction gives its mentions. A mention's owners are the
  * targets of the hierarchical relations stated for it (the ontology's
  * `hierarchical` predicates, an inverse spelling read the right way round).
- * The document's home is the organization or project most of its
- * hierarchical relations point at — a team's report states its members —
- * when two or more do and no other gets as many.
  */
 export function documentContext(
   entities: readonly { name: string; type: string; aliases?: string[] }[],
   relations: readonly { source: string; target: string; type: string }[],
   ontology: Ontology,
-  doc: { path?: string | null; id?: string | null } = {},
+  doc: { path?: string | null } = {},
 ): DocumentContext {
   const documentNames = new Set(entities.flatMap((e) => [e.name, ...(e.aliases ?? [])]).filter((n) => typeof n === 'string').map(lower));
   const named = new Map<string, { name: string; type: string; aliases?: string[] }>();
   for (const e of entities) for (const n of [e.name, ...(e.aliases ?? [])]) if (typeof n === 'string' && !named.has(lower(n))) named.set(lower(n), e);
   const owners = new Map<string, string[]>();
-  const pointedAt = new Map<string, number>();
   for (const r of relations) {
     if (typeof r.source !== 'string' || typeof r.target !== 'string' || typeof r.type !== 'string') continue;
     const norm = normalizePredicate(ontology, r.type);
@@ -230,18 +249,14 @@ export function documentContext(
     const ownerName = named.get(lower(owner))?.name ?? owner.trim();
     const list = owners.get(lower(child)) ?? owners.set(lower(child), []).get(lower(child))!;
     if (!list.includes(ownerName)) list.push(ownerName);
-    if (ANCHOR_TYPES.includes(named.get(lower(owner))?.type ?? '')) pointedAt.set(ownerName, (pointedAt.get(ownerName) ?? 0) + 1);
   }
-  const ranked = [...pointedAt.entries()].sort((a, b) => b[1] - a[1]);
-  const home = ranked.length > 0 && ranked[0][1] >= 2 && (ranked.length === 1 || ranked[1][1] < ranked[0][1]) ? ranked[0][0] : null;
   return {
     documentNames,
-    home,
     of: (name) => {
       const e = named.get(lower(name));
       const own = new Set<string>();
       for (const n of e ? [e.name, ...(e.aliases ?? [])] : [name]) for (const o of owners.get(lower(n)) ?? []) own.add(o);
-      return { owners: [...own], documentNames, home, documentPath: doc.path ?? null, documentId: doc.id ?? null };
+      return { owners: [...own], documentNames, documentPath: doc.path ?? null };
     },
   };
 }

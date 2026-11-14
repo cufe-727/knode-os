@@ -4,7 +4,7 @@ import path from 'node:path';
 import { loadConfig, ReviewIdentity, saveConfig } from '../config.js';
 import { createContext } from '../context.js';
 import { initDataDir } from '../fs/datadir.js';
-import { CodedDoc, codedClusters, CONTEXT_TYPES, MAX_DOCS, medianDate, MIN_DOCS, namesakeClusters, NamesakeDoc, resolveEntityContext } from '../graph/entity-context.js';
+import { CODED_TYPES, CodedDoc, codedClusters, CONTEXT_TYPES, MAX_DOCS, medianDate, MIN_DOCS, namesakeClusters, NamesakeDoc, resolveEntityContext } from '../graph/entity-context.js';
 import { codeOf, codesDiffer, codesOf } from '../graph/identity.js';
 import { slugify } from '../graph/store.js';
 import { sync } from '../ingest/sync.js';
@@ -341,7 +341,7 @@ export function scanSidecars(source: string): ScanReport {
     if (perDoc.size > MAX_DOCS) continue;
     const codes = [...new Set(g.mentions.flatMap((m) => m.spellings))].map(codeOf).filter((c) => c !== null);
     // (the candidate test keeps the name: refine looks at every entity whose spellings differ)
-    if (perDoc.size >= 4 && codes.some((a, i) => codes.slice(i + 1).some((b) => codesDiffer(a, b)))) {
+    if (perDoc.size >= 4 && CODED_TYPES.includes(types.get(id) ?? '') && codes.some((a, i) => codes.slice(i + 1).some((b) => codesDiffer(a, b)))) {
       report.codedCandidates++;
       const coded: CodedDoc[] = [...perDoc.entries()].map(([doc, spellings]) => ({ id: doc, path: doc, date: null, context: contextOf(doc, id), codes: codesOf(spellings) }));
       const split = codedClusters(coded, typeOf);

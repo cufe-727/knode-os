@@ -428,7 +428,7 @@ export async function applyExtraction(
 
   // what this document says about each mention — its team or parent, the organizations it names — tells
   // which of the entities a parted name stands for is meant (src/graph/identity.ts)
-  const context = documentContext(entities, relations, w.ontology, { path: page.path, id: page.documentId });
+  const context = documentContext(entities, relations, w.ontology, { path: page.path });
 
   for (const e of entities) {
     const needles = [e.name, ...(e.aliases ?? [])].map((s) => s.toLowerCase());

@@ -7,6 +7,7 @@ import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { codeOf, codesConflict, codesOf, documentContext, namesakeFor, NamesakeRule } from '../src/graph/identity.js';
 import { builtinOntology } from '../src/graph/ontology.js';
+import { resolveEntityContext } from '../src/graph/entity-context.js';
 import { resolveEntityId } from '../src/graph/resolve.js';
 import { sync } from '../src/ingest/sync.js';
 
@@ -17,12 +18,11 @@ import { sync } from '../src/ingest/sync.js';
  */
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-identity-'));
-let ctx: AppContext | undefined;
-let byName: AppContext | undefined;
+const opened: AppContext[] = [];
 afterAll(async () => {
-  for (const c of [ctx, byName]) {
-    await c?.datasources.closeAll();
-    await c?.store.close();
+  for (const c of opened) {
+    await c.datasources.closeAll();
+    await c.store.close();
   }
   fs.rmSync(tmp, { recursive: true, force: true });
 });
@@ -80,40 +80,64 @@ describe('the context of a mention', () => {
     { source: '二部平台组', target: '安全团队', type: 'related_to' },
   ];
 
-  it('reads owners from hierarchical relations and the home the document reports for', () => {
+  it('reads a mention\'s owners from the hierarchical relations of its document', () => {
     const context = documentContext(entities, relations, ontology, { path: 'raw/docs/w.md' });
-    expect(context.home).toBe('二部平台组');
     expect(context.of('陈伟').owners).toEqual(['二部平台组']);
     expect(context.of('日志保留天数').owners).toEqual([]);
     expect(context.of('保留期').documentNames?.has('d2t1-c2')).toBe(true);
-    // a related_to edge is nobody's owner, and one member_of gives no home
-    expect(documentContext(entities, relations.slice(1), ontology).home).toBeNull();
+    expect(context.of('保留期').documentPath).toBe('raw/docs/w.md');
+    // a related_to edge is nobody's owner
+    expect(context.of('二部平台组').owners).toEqual([]);
   });
 
   const rule = (id: string, label: string, anchors: string[], base_anchors = ['平台组']): NamesakeRule => ({ id, base_id: '日志保留天数', name: '日志保留天数', label, anchors, base_anchors });
   const rules = [rule('d2', 'D2T1-C2', ['二部平台组']), rule('d7', 'D7T1-C2', ['七部平台组'])];
   const names = (...n: string[]) => new Set(n.map((x) => x.toLowerCase()));
 
-  it('chooses among parted entities by code, then owner, then the document, and the base without evidence', () => {
+  it('follows a parted name by the mention\'s own code, then owner, then the document — and the base without evidence', () => {
     // the code decides, whatever the document names
     expect(namesakeFor(rules, { codes: codesOf(['日志保留天数', 'D7T1-C2']), context: { documentNames: names('二部平台组') } })?.id).toBe('d7');
     // the mention's own team, in a document that names several
     expect(namesakeFor(rules, { codes: codesOf(['日志保留天数']), context: { owners: ['七部平台组'], documentNames: names('二部平台组', '七部平台组') } })?.id).toBe('d7');
     // the document's organizations
     expect(namesakeFor(rules, { codes: codesOf(['保留期']), context: { documentNames: names('二部平台组', '安全团队') } })?.id).toBe('d2');
-    // the base entity's own code gives nothing over the document: an extraction repeats a known name
-    expect(namesakeFor(rules, { codes: codesOf(['T1-C2']), context: { documentNames: names('七部平台组') } })?.id).toBe('d7');
     // the base: its own anchor named too, two candidates alike, or nothing to go by
     expect(namesakeFor(rules, { codes: codesOf(['日志保留天数']), context: { documentNames: names('平台组', '二部平台组') } })).toBeNull();
     expect(namesakeFor(rules, { codes: codesOf(['日志保留天数']), context: { documentNames: names('二部平台组', '七部平台组') } })).toBeNull();
     expect(namesakeFor(rules, { codes: codesOf(['日志保留天数']), context: { documentNames: names('日志保留天数') } })).toBeNull();
     expect(namesakeFor(rules, { codes: codesOf(['日志保留天数']) })).toBeNull();
     expect(namesakeFor([], { codes: codesOf(['D7T1-C2']) })).toBeNull();
-    // a document the split itself gave to one of them: that one, whatever it names — unless the mention's code says otherwise
+  });
+
+  it('never files a mention under an entity whose code differs from its own', () => {
+    // a third code, in a document that names one of the roofs: not that roof's entity
+    expect(namesakeFor(rules, { codes: codesOf(['日志保留天数', 'D9T1-C2']), context: { documentNames: names('七部平台组') } })).toBeNull();
+    expect(namesakeFor(rules, { codes: codesOf(['日志保留天数', 'D9T1-C2']), context: { owners: ['七部平台组'], documentNames: names('七部平台组') } })).toBeNull();
+    // the code the base entity is named by: the base entity, whatever the document names
+    expect(namesakeFor(rules, { codes: codesOf(['T1-C2']), baseCodes: codesOf(['T1-C2']), context: { documentNames: names('七部平台组') } })).toBeNull();
+    // DDR4 is never the entity labelled DDR5
+    const dram: NamesakeRule[] = [{ id: 'dram-ddr5', base_id: 'dram', name: 'DRAM', label: 'DDR5', anchors: ['美光'], base_anchors: ['三星'] }];
+    expect(namesakeFor(dram, { codes: codesOf(['DRAM', 'DDR4']), context: { documentNames: names('美光') } })).toBeNull();
+    expect(namesakeFor(dram, { codes: codesOf(['DRAM']), context: { documentNames: names('美光') } })?.id).toBe('dram-ddr5');
+    // a code of another kind says nothing against it
+    expect(namesakeFor(dram, { codes: codesOf(['DRAM', 'REQ-2025']), context: { documentNames: names('美光') } })?.id).toBe('dram-ddr5');
+  });
+
+  it('follows the split\'s own list of documents, after the code and before anything the document names', () => {
     const listed = [{ ...rules[0], documents: ['raw/docs/w9.md'] }, rules[1]];
     expect(namesakeFor(listed, { codes: codesOf(['日志保留天数']), context: { documentPath: 'raw/docs/w9.md', documentNames: names('七部平台组') } })?.id).toBe('d2');
     expect(namesakeFor(listed, { codes: codesOf(['D7T1-C2']), context: { documentPath: 'raw/docs/w9.md' } })?.id).toBe('d7');
     expect(namesakeFor(listed, { codes: codesOf(['日志保留天数']), context: { documentPath: 'raw/docs/w1.md', documentNames: names('七部平台组') } })?.id).toBe('d7');
+    // the first division's code, repeated by an extraction in a document the split gave to another: the split saw it
+    expect(namesakeFor(listed, { codes: codesOf(['T1-C2']), baseCodes: codesOf(['T1-C2']), context: { documentPath: 'raw/docs/w9.md' } })?.id).toBe('d2');
+  });
+
+  it('keeps the base entity\'s own code and roof: a row for the base entity itself', () => {
+    const self: NamesakeRule = { id: '日志保留天数', base_id: '日志保留天数', name: '日志保留天数', label: 'D2T1-C2', anchors: ['二部平台组'], base_anchors: ['二部平台组'] };
+    const family = [self, rules[1]];
+    expect(namesakeFor(family, { codes: codesOf(['日志保留天数', 'D2T1-C2']), context: { documentNames: names('七部平台组') } })).toBeNull();
+    expect(namesakeFor(family, { codes: codesOf(['日志保留天数']), context: { documentNames: names('二部平台组', '七部平台组') } })).toBeNull();
+    expect(namesakeFor(family, { codes: codesOf(['日志保留天数']), context: { documentNames: names('七部平台组') } })?.id).toBe('d7');
   });
 });
 
@@ -134,105 +158,92 @@ ${team}周报。
 `;
 }
 
-describe('write-time resolution of a name that is two things', () => {
-  it('parts a mention whose code differs under another roof, and merges what has no such context', async () => {
-    const dataDir = path.join(tmp, 'ws');
-    const pool = (code?: string, more = '') => `  - { name: 连接池上限, type: component, aliases: [${[code, more].filter(Boolean).join(', ')}] }`;
-    // three reports of 平台组 make the setting and its roof
-    write(dataDir, 'raw/docs/a1.md', report('平台组', ['罗芳', '方杰'], pool('P1-C1', '池上限')));
-    write(dataDir, 'raw/docs/a2.md', report('平台组', ['罗芳', '方杰'], pool()));
-    write(dataDir, 'raw/docs/a3.md', report('平台组', ['罗芳', '方杰'], pool('P1-C1')));
-    // 二部平台组 has a setting of the same name, with a code of its own
-    write(dataDir, 'raw/docs/b1.md', report('二部平台组', ['廖欣', '赖艳'], pool('P2-C1')));
-    // later mentions: without the code in 二部平台组's report, by its short name in 平台组's, and with no context at all
-    write(dataDir, 'raw/docs/b2.md', report('二部平台组', ['廖欣', '赖艳'], pool()));
-    write(dataDir, 'raw/docs/c1.md', report('平台组', ['罗芳', '方杰'], '  - { name: 池上限, type: component }'));
-    write(dataDir, 'raw/docs/c2.md', `---
-title: 备忘
-entities:
-  - { name: 连接池上限, type: component }
----
-连接池上限需要复核。
-`);
-    // a hub: kinds listed as aliases, no roof of its own — a differing code merges as it always did
-    const chip = (alias: string, org: string) => `---
-title: 芯片 ${alias}
-entities:
-  - { name: 芯片, type: product, aliases: [${alias}] }
-  - { name: ${org}, type: organization }
-  - { name: 黄仁勋, type: person }
-  - { name: 苏姿丰, type: person }
-relations:
-  - { source: 黄仁勋, target: ${org}, type: member_of }
-  - { source: 苏姿丰, target: ${org}, type: member_of }
----
-芯片 ${alias}。
-`;
-    write(dataDir, 'raw/docs/d1.md', chip('H100', '英伟达'));
-    write(dataDir, 'raw/docs/d2.md', chip('H100', '台积电'));
-    write(dataDir, 'raw/docs/d3.md', chip('H100', '超微'));
-    write(dataDir, 'raw/docs/d4.md', chip('H200', '博通'));
-    // one ticker written two ways is one company
-    write(dataDir, 'raw/docs/e1.md', `---\ntitle: 腾讯\nentities:\n  - { name: 腾讯, type: organization, aliases: ["00700.HK"] }\n---\n腾讯。\n`);
-    write(dataDir, 'raw/docs/e2.md', `---\ntitle: 腾讯控股\nentities:\n  - { name: 腾讯, type: organization, aliases: ["700.HK", "腾讯控股"] }\n---\n腾讯控股。\n`);
+async function build(name: string, files: [string, string][]): Promise<AppContext> {
+  const dataDir = path.join(tmp, name);
+  for (const [p, text] of files) write(dataDir, p, text);
+  initDataDir(dataDir);
+  const config = loadConfig(dataDir);
+  config.ingest.concurrency = 1; // in path order: an entity is whoever was written first
+  config.review.identity = 'context';
+  saveConfig(dataDir, config);
+  const ctx = await createContext(dataDir);
+  opened.push(ctx);
+  await sync(ctx, { llmGraph: false });
+  return ctx;
+}
 
-    initDataDir(dataDir);
-    const config = loadConfig(dataDir);
-    config.ingest.concurrency = 1; // in path order: an entity is whoever was written first
-    saveConfig(dataDir, config);
-    ctx = await createContext(dataDir);
-    await sync(ctx, { llmGraph: false });
-    const store = ctx.store;
-    const docsOf = async (id: string) => (await store.query<{ path: string }>(
-      `SELECT DISTINCT d.path FROM entity_mentions m JOIN documents d ON d.id = m.document_id WHERE m.entity_id = $1 ORDER BY d.path`, [id],
-    )).map((r) => r.path.replace('raw/docs/', ''));
+const docsOf = async (ctx: AppContext, id: string) => (await ctx.store.query<{ path: string }>(
+  `SELECT DISTINCT d.path FROM entity_mentions m JOIN documents d ON d.id = m.document_id WHERE m.entity_id = $1 ORDER BY d.path`, [id],
+)).map((r) => r.path.replace('raw/docs/', ''));
 
-    // the setting of 二部平台组 is an entity of its own, and the rule is on record with its reason
-    const [ns] = await store.query<{ id: string; base_id: string; label: string; anchors: string[]; base_anchors: string[]; documents: string[]; reason: string }>(
-      `SELECT id, base_id, label, anchors, base_anchors, documents, reason FROM entity_namesakes`,
-    );
-    expect(ns).toMatchObject({ base_id: '连接池上限', label: 'P2-C1', anchors: ['二部平台组'], base_anchors: ['平台组'], documents: ['raw/docs/b1.md'] });
-    expect(ns.reason).toContain('P2-C1');
-    const [variant] = await store.query<{ name: string; aliases: string[] }>(`SELECT name, aliases FROM entities WHERE id = $1`, [ns.id]);
-    expect(variant.name).toBe('连接池上限（二部平台组 · P2-C1）');
-    expect(variant.aliases).toEqual(expect.arrayContaining(['P2-C1', '连接池上限']));
-    expect(variant.aliases).not.toContain('P1-C1');
-    // each report's mention is with its own team's setting; the note with no context stays with the name
-    expect(await docsOf(ns.id)).toEqual(['b1.md', 'b2.md']);
-    expect(await docsOf('连接池上限')).toEqual(['a1.md', 'a2.md', 'a3.md', 'c1.md', 'c2.md']);
-    const [base] = await store.query<{ aliases: string[] }>(`SELECT aliases FROM entities WHERE id = '连接池上限'`);
-    expect(base.aliases).toEqual(expect.arrayContaining(['P1-C1', '池上限']));
-    expect(base.aliases).not.toContain('P2-C1');
-
-    // an alias still resolves, and so does the code, to the entity that carries it
-    expect((await resolveEntityId(store, { name: '池上限' })).id).toBe('连接池上限');
-    expect((await resolveEntityId(store, { name: 'P1-C1' })).id).toBe('连接池上限');
-    expect((await resolveEntityId(store, { name: 'P2-C1' })).id).toBe(ns.id);
-    expect((await resolveEntityId(store, { name: '连接池上限', aliases: ['P2-C1'] })).id).toBe(ns.id);
-    // no context: the name, as before
-    expect((await resolveEntityId(store, { name: '连接池上限' })).id).toBe('连接池上限');
-
-    // the hub stays one entity and no rule was written for it; the ticker is one company
-    expect(await docsOf('芯片')).toEqual(['d1.md', 'd2.md', 'd3.md', 'd4.md']);
-    expect(await store.query(`SELECT id FROM entity_namesakes WHERE base_id = '芯片'`)).toEqual([]);
-    expect(await docsOf('腾讯')).toEqual(['e1.md', 'e2.md']);
-    expect(await store.query(`SELECT id FROM entities WHERE id LIKE '腾讯（%' OR id LIKE '芯片（%'`)).toEqual([]);
+describe('write-time resolution of a name that may be two things', () => {
+  it('parts nothing when a document is written, in whatever order the documents arrive', async () => {
+    // a product kind three notes of one maker call DDR4 and another maker's notes call DDR5, DDR4 or nothing
+    const dram = (code: string, type = 'component') => `  - { name: DRAM, type: ${type}, aliases: [${code}] }`;
+    const samsung = (code: string) => report('三星', ['李在镕', '全永铉'], dram(code));
+    const micron = (code: string) => report('美光', ['梅赫罗特拉', '墨菲'], dram(code));
+    const first: [string, string][] = [
+      ['raw/docs/a1.md', samsung('DDR4')], ['raw/docs/a2.md', samsung('DDR4')], ['raw/docs/a3.md', samsung('DDR4')],
+      ['raw/docs/b1.md', micron('DDR5')], ['raw/docs/b2.md', micron('DDR5')], ['raw/docs/b3.md', micron('')], ['raw/docs/b4.md', micron('DDR4')],
+    ];
+    // the same documents, the other maker's first
+    const second: [string, string][] = [
+      ['raw/docs/a1.md', micron('DDR5')], ['raw/docs/a2.md', micron('DDR5')],
+      ['raw/docs/b1.md', samsung('DDR4')], ['raw/docs/b2.md', samsung('DDR4')], ['raw/docs/b3.md', samsung('DDR4')],
+      ['raw/docs/c1.md', micron('')], ['raw/docs/c2.md', micron('DDR4')],
+    ];
+    for (const [name, files] of [['order-a', first], ['order-b', second]] as const) {
+      const ctx = await build(name, files);
+      // one entity each, every document, every code among its aliases, no rule written
+      expect((await docsOf(ctx, 'dram')).length, name).toBe(7);
+      expect(await ctx.store.query(`SELECT id FROM entity_namesakes`), name).toEqual([]);
+      expect(await ctx.store.query(`SELECT id FROM entities WHERE id LIKE 'dram%' AND tx_to IS NULL ORDER BY id`), name).toEqual([{ id: 'dram' }]);
+      const [e] = await ctx.store.query<{ aliases: string[] }>(`SELECT aliases FROM entities WHERE id = 'dram'`);
+      expect(e.aliases, name).toEqual(expect.arrayContaining(['DDR4', 'DDR5']));
+      // and refine, which sees all of them, leaves the kind whole in either order: one maker's notes carry both codes
+      const refined = await resolveEntityContext(ctx.store, { config: ctx.config });
+      expect(refined.split, name).toBe(0);
+      expect((await docsOf(ctx, 'dram')).length, name).toBe(7);
+    }
   });
 
-  it('parts nothing where review.identity is "name"', async () => {
-    const dataDir = path.join(tmp, 'ws-name');
-    const pool = (code: string) => `  - { name: 连接池上限, type: component, aliases: [${code}] }`;
-    for (const k of [1, 2, 3]) write(dataDir, `raw/docs/a${k}.md`, report('平台组', ['罗芳', '方杰'], pool('P1-C1')));
-    write(dataDir, 'raw/docs/b1.md', report('二部平台组', ['廖欣', '赖艳'], pool('P2-C1')));
-    initDataDir(dataDir);
-    const config = loadConfig(dataDir);
-    config.ingest.concurrency = 1;
-    config.review.identity = 'name';
-    saveConfig(dataDir, config);
-    byName = await createContext(dataDir);
-    await sync(byName, { llmGraph: false });
-    expect(await byName.store.query(`SELECT id FROM entity_namesakes`)).toEqual([]);
-    const docs = await byName.store.query<{ n: number }>(`SELECT count(DISTINCT document_id)::int AS n FROM entity_mentions WHERE entity_id = '连接池上限'`);
-    expect(docs[0].n).toBe(4);
+  it('leaves a category whole even where each code has a maker of its own', async () => {
+    // typed as a product: no code parts it, however cleanly the makers divide
+    const dram = (code: string) => `  - { name: DRAM, type: product, aliases: [${code}] }`;
+    const ctx = await build('category', [
+      ...[1, 2, 3].map((k): [string, string] => [`raw/docs/a${k}.md`, report('三星', ['李在镕', '全永铉'], dram('DDR4'))]),
+      ...[1, 2, 3].map((k): [string, string] => [`raw/docs/b${k}.md`, report('美光', ['梅赫罗特拉', '墨菲'], dram('DDR5'))]),
+    ]);
+    expect((await resolveEntityContext(ctx.store, { config: ctx.config })).split).toBe(0);
+    expect(await ctx.store.query(`SELECT id FROM entity_namesakes`)).toEqual([]);
+    expect((await docsOf(ctx, 'dram')).length).toBe(6);
+  });
+
+  it('follows a name refine parted: by code, by its roof, and to the base without context', async () => {
+    const ctx = await build('follow', [
+      ['raw/docs/t.md', `---\ntitle: 团队\nentities:\n  - { name: 二部平台组, type: organization, aliases: ["Platform 2 team"] }\n  - { name: 平台组, type: organization }\n  - { name: 连接池上限, type: component, aliases: ["P1-C1", "池上限"] }\n---\n二部平台组（Platform 2 team）与平台组。\n`],
+    ]);
+    const store = ctx.store;
+    const id = '连接池上限二部平台组-p2-c1';
+    await store.query(
+      `INSERT INTO entity_namesakes (id, base_id, name, label, anchors, base_anchors, documents, reason)
+       VALUES ($1, '连接池上限', '连接池上限', 'P2-C1', '["二部平台组"]'::jsonb, '["平台组"]'::jsonb, '["raw/docs/w7.md"]'::jsonb, 'test')`, [id],
+    );
+    const doc = (...n: string[]) => new Set(n.map((x) => x.toLowerCase()));
+    const to = async (input: Parameters<typeof resolveEntityId>[1]) => (await resolveEntityId(store, input)).id;
+    // its code, wherever it is written
+    expect(await to({ name: '连接池上限', aliases: ['P2-C1'], context: { documentNames: doc('平台组') } })).toBe(id);
+    // its roof
+    expect(await to({ name: '连接池上限', context: { documentNames: doc('二部平台组', '连接池上限') } })).toBe(id);
+    // a document the split gave to it
+    expect(await to({ name: '连接池上限', context: { documentPath: 'raw/docs/w7.md', documentNames: doc('连接池上限') } })).toBe(id);
+    // the base: its own code, another code under the other roof, both roofs, or nothing to go by
+    expect(await to({ name: '连接池上限', aliases: ['P1-C1'], context: { documentNames: doc('二部平台组') } })).toBe('连接池上限');
+    expect(await to({ name: '连接池上限', aliases: ['P9-C1'], context: { documentNames: doc('二部平台组') } })).toBe('连接池上限');
+    expect(await to({ name: '连接池上限', context: { documentNames: doc('二部平台组', '平台组') } })).toBe('连接池上限');
+    expect(await to({ name: '连接池上限' })).toBe('连接池上限');
+    expect(await to({ name: '池上限' })).toBe('连接池上限');
+    // nothing was written by resolving
+    expect(await store.query(`SELECT count(*)::int AS n FROM entity_namesakes`)).toEqual([{ n: 1 }]);
   });
 });
