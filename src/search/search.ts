@@ -283,6 +283,32 @@ export function termCount(text: string, term: string): number {
 const idfOf = (df: number, total: number) => Math.log(1 + (Math.max(total, df) - df + 0.5) / (df + 0.5));
 
 /**
+ * Each term's weight from how many chunks hold it, out of `total`: zero for a
+ * term none holds, and a count stopped at `KEYWORD_DF_CAP` (all a lookup reads
+ * of a common term) taken as the geometric mean of the cap and the corpus.
+ */
+function termIdf(df: number[], total: number): number[] {
+  const common = Math.max(KEYWORD_DF_CAP, Math.round(Math.sqrt(KEYWORD_DF_CAP * Math.max(total, KEYWORD_DF_CAP))));
+  return df.map((n) => (n > 0 ? idfOf(n >= KEYWORD_DF_CAP ? common : n, total) : 0));
+}
+
+/** The terms whose chunks are candidates: the `KEYWORD_FETCH_TERMS` rarest that some chunk holds, ties in query order. */
+function rarestTerms(df: number[]): number[] {
+  return df.map((n, i) => ({ n, i })).filter((x) => x.n > 0).sort((a, b) => a.n - b.n || a.i - b.i).slice(0, KEYWORD_FETCH_TERMS).map((x) => x.i);
+}
+
+/**
+ * What a candidate holding the picked terms in `mask` (bit j for `picked[j]`)
+ * is put forward by: their summed weight, added in one order, so the lookup
+ * and the scan weigh a chunk to the same last bit.
+ */
+function pickedWeight(mask: number, picked: number[], idf: number[]): number {
+  let w = 0;
+  for (let j = 0; j < picked.length; j++) if (mask & (1 << j)) w += idf[picked[j]];
+  return w;
+}
+
+/**
  * BM25 over `rows` for weighted `terms`, best first, ties by id; rows holding
  * none of the terms are left out. Length is in characters against the rows'
  * own average: the chunker keeps chunks near one size, so what this corrects
@@ -323,9 +349,11 @@ const hasSearchOperators = (query: string) => /"[^"]+"|(^|\s)-[\p{L}\p{N}]/u.tes
  * same text finds 36%; it now finds 39%.
  *
  * A query with a quoted phrase or an excluded word keeps what full-text
- * search matched in front, in its order. Until the gram index is ready, one
- * scan finds the candidates and the terms are weighted by how rare they are
- * among those.
+ * search matched in front, in its order. Until the gram index is ready (and
+ * for a term no gram index serves), scans stand in for the two lookups and
+ * reproduce them: each term counted over every chunk, the candidates weighed
+ * by the same terms, so a search ranks alike before and after the index is
+ * there (`scannedFrequencies`, `scannedCandidates`).
  */
 async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
   const p = new Params([websearchText(query)]);
@@ -345,28 +373,18 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
   const terms = keywordTerms(query);
   if (terms.length === 0) return fts;
   const size = Math.max(k * 4, 120);
-  let weighted: { term: string; idf: number | null }[];
-  let like: RankedChunk[];
-  if (matchIndexReady(store, 'chunks') && terms.every((t) => termGrams(t).length > 0)) {
-    const total = await chunkTotal(store);
-    const lists = await termLists(store, terms, asOf, filter);
-    // a term no chunk holds finds nothing and weighs nothing
-    weighted = terms.map((term, i) => ({ term, idf: lists.df[i] > 0 ? idfOf(lists.df[i] >= KEYWORD_DF_CAP ? Math.max(KEYWORD_DF_CAP, Math.round(Math.sqrt(KEYWORD_DF_CAP * Math.max(total, KEYWORD_DF_CAP)))) : lists.df[i], total) : 0 }));
-    like = await listedCandidates(store, terms, weighted.map((t) => t.idf ?? 0), lists, size, asOf, filter);
-    weighted = weighted.filter((t) => t.idf !== 0);
-  } else {
-    weighted = terms.map((term) => ({ term, idf: null }));
-    like = await scannedCandidates(store, terms.slice(0, KEYWORD_FETCH_TERMS), size, asOf, filter);
-  }
+  const total = await chunkTotal(store);
+  const lists = matchIndexReady(store, 'chunks') && terms.every((t) => termGrams(t).length > 0) ? await termLists(store, terms, asOf, filter) : null;
+  const df = lists?.df ?? (await scannedFrequencies(store, terms));
+  const idf = termIdf(df, total);
+  const like = lists
+    ? await listedCandidates(store, terms, idf, lists, size, asOf, filter)
+    : await scannedCandidates(store, terms, idf, rarestTerms(df), size, asOf, filter);
 
   const seen = new Set(fts.map((r) => r.chunk_id));
   const pool = [...fts, ...like.filter((r) => !seen.has(r.chunk_id))];
-  // uncounted terms take their weight from the candidates themselves: rare among them, rare enough
-  const lowered = weighted.some((t) => t.idf === null) ? pool.map((r) => r.content.toLowerCase()) : [];
-  const scoredTerms = weighted.map((t) => ({
-    term: t.term,
-    idf: t.idf ?? idfOf(lowered.filter((text) => termCount(text, t.term) > 0).length, pool.length),
-  }));
+  // a term no chunk holds finds nothing and weighs nothing
+  const scoredTerms = terms.map((term, i) => ({ term, idf: idf[i] })).filter((t) => t.idf > 0);
   const ranked = rankBm25(pool, scoredTerms);
   if (!hasSearchOperators(query)) return ranked.slice(0, k);
   return [...fts, ...ranked.filter((r) => !seen.has(r.chunk_id))].slice(0, k);
@@ -421,8 +439,7 @@ async function termLists(store: Store, terms: string[], asOf?: TimeInput, filter
     if (r.id === null) df[r.i] = r.df ?? 0;
     else listed.push({ i: r.i, id: r.id });
   }
-  const picked = df.map((n, i) => ({ n, i })).filter((x) => x.n > 0).sort((a, b) => a.n - b.n || a.i - b.i).slice(0, KEYWORD_FETCH_TERMS).map((x) => x.i);
-  return { df, listed, picked };
+  return { df, listed, picked: rarestTerms(df) };
 }
 
 /**
@@ -445,21 +462,28 @@ async function listedCandidates(
   asOf?: TimeInput,
   filter?: ResolvedScopeFilter,
 ): Promise<RankedChunk[]> {
-  const weight = new Map<string, number>();
-  for (const r of lists.listed) weight.set(r.id, (weight.get(r.id) ?? 0) + idf[r.i]);
-  if (lists.picked.length > 1 && lists.picked.some((i) => lists.df[i] >= KEYWORD_DF_CAP)) {
-    const p = new Params([gramQuery(lists.picked.map((i) => termGrams(terms[i])), lists.picked.length)]);
+  const { picked } = lists;
+  const held = new Map<string, number>();
+  for (const r of lists.listed) {
+    const j = picked.indexOf(r.i);
+    if (j >= 0) held.set(r.id, (held.get(r.id) ?? 0) | (1 << j));
+  }
+  if (picked.length > 1 && picked.some((i) => lists.df[i] >= KEYWORD_DF_CAP)) {
+    const p = new Params([gramQuery(picked.map((i) => termGrams(terms[i])), picked.length)]);
     const lim = p.add(pool);
     const cond = docLiveAt('d', p, asOf, filter);
-    const all = lists.picked.reduce((sum, i) => sum + idf[i], 0);
     const rows = await store.query<{ id: string }>(
       `WITH hit AS MATERIALIZED (SELECT c.id, c.document_id FROM chunks c WHERE ${MATCH_INDEXES.chunks.expr('c')} @@ $1::tsquery LIMIT ${lim})
        SELECT h.id FROM hit h JOIN documents d ON d.id = h.document_id WHERE ${cond}`,
       p.list,
     );
-    for (const r of rows) weight.set(r.id, all);
+    for (const r of rows) held.set(r.id, (1 << picked.length) - 1);
   }
-  const ids = [...weight.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, pool).map(([id]) => id);
+  const ids = [...held.entries()]
+    .map(([id, mask]) => [id, pickedWeight(mask, picked, idf)] as const)
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+    .slice(0, pool)
+    .map(([id]) => id);
   if (ids.length === 0) return [];
   return store.query<RankedChunk>(
     `SELECT ${CANDIDATE_COLUMNS}, 0::float AS raw
@@ -469,22 +493,66 @@ async function listedCandidates(
   );
 }
 
-/** The `pool` chunks holding the most of `terms` as substrings, by one scan: what answers while the gram index is being built. */
-async function scannedCandidates(store: Store, terms: string[], pool: number, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
-  const p = new Params([terms.map((t) => t.toLowerCase())]);
-  // lower() once per chunk, then one strpos per term
-  const hits = `(SELECT count(*) FROM (SELECT lower(c.content) AS l OFFSET 0) x, unnest($1::text[]) t WHERE strpos(x.l, t) > 0)`;
+/**
+ * SQL holding when lowercased text `l` holds every gram of `term` that the
+ * gram index would look up (`termGrams`; the term itself when it has none):
+ * a gram's characters are all of one class `match_grams` takes runs of, so
+ * the text holds it as a substring exactly when `match_grams` lists it.
+ */
+function holdsGramsSql(l: string, term: string, p: Params): string {
+  const grams = termGrams(term);
+  return (grams.length > 0 ? grams : [term]).map((g) => `strpos(${l}, ${p.add(g)}) > 0`).join(' AND ');
+}
+
+/**
+ * How many chunks hold each term, by one scan of every chunk, counted as
+ * `termLists` counts them off the gram index: what answers while that index
+ * is being built.
+ */
+async function scannedFrequencies(store: Store, terms: string[]): Promise<number[]> {
+  const p = new Params();
+  // lower() once per chunk, then strpos per gram
+  const counts = terms.map((t, i) => `count(*) FILTER (WHERE ${holdsGramsSql('x.l', t, p)})::int AS d${i}`);
+  const [row] = await store.query<Record<string, number>>(`SELECT ${counts.join(', ')} FROM (SELECT lower(c.content) AS l FROM chunks c OFFSET 0) x`, p.list);
+  return terms.map((_, i) => Math.min(row?.[`d${i}`] ?? 0, KEYWORD_DF_CAP));
+}
+
+/**
+ * The `pool` live chunks the `picked` terms weigh the most in together, by one
+ * scan, ordered as `listedCandidates` orders the chunks of its lists: by the
+ * summed weight of the picked terms each holds, then by id. The weights of
+ * the possible sets of picked terms are ranked here, so the database sorts by
+ * a set's rank and the sums are the ones the lookup makes. Where a picked term
+ * is in more chunks than a lookup lists (`KEYWORD_DF_CAP`), the lookup reads
+ * some of them and this all of them, and the two can put forward different
+ * chunks; below the cap they put forward the same.
+ */
+async function scannedCandidates(
+  store: Store,
+  terms: string[],
+  idf: number[],
+  picked: number[],
+  pool: number,
+  asOf?: TimeInput,
+  filter?: ResolvedScopeFilter,
+): Promise<RankedChunk[]> {
+  if (picked.length === 0) return [];
+  const weights = Array.from({ length: (1 << picked.length) - 1 }, (_, m) => pickedWeight(m + 1, picked, idf));
+  const distinct = [...new Set(weights)].sort((a, b) => b - a);
+  const p = new Params([weights.map((w) => distinct.indexOf(w))]);
+  const mask = picked.map((i, j) => `CASE WHEN ${holdsGramsSql('x.l', terms[i], p)} THEN ${1 << j} ELSE 0 END`).join(' + ');
   const cond = docLiveAt('d', p, asOf, filter);
   const lim = p.add(pool);
+  // lower() once per chunk, then strpos per gram
   return store.query<RankedChunk>(
-    `SELECT * FROM (
-       SELECT ${CANDIDATE_COLUMNS}, ${hits}::float AS raw
-       FROM chunks c JOIN documents d ON d.id = c.document_id
+    `SELECT chunk_id, document_id, path, title, doc_date, content, 0::float AS raw FROM (
+       SELECT ${CANDIDATE_COLUMNS}, ${mask} AS mask
+       FROM chunks c JOIN documents d ON d.id = c.document_id, LATERAL (SELECT lower(c.content) AS l OFFSET 0) x
        WHERE ${cond}
        OFFSET 0
-     ) scored
-     WHERE raw > 0
-     ORDER BY raw DESC, chunk_id
+     ) held
+     WHERE mask > 0
+     ORDER BY ($1::int[])[mask], chunk_id COLLATE "C"
      LIMIT ${lim}`,
     p.list,
   );
