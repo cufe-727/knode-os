@@ -8,6 +8,7 @@ import { groupBy, toIso } from '../store/temporal.js';
 import { mergeSuggestionId } from './dedupe.js';
 import { applyMerge } from './merge.js';
 import { tier0Known, weakLinkKey } from './concepts.js';
+import { NamesakeRule } from './identity.js';
 import { keyOf, nameKey } from './normalize.js';
 import { ExtractedEntity, slugify } from './store.js';
 
@@ -586,16 +587,9 @@ async function splitNamesakes(store: Store, config: KnodeConfig | undefined, sta
   }
 }
 
-/** The namesake rules for these names: name (lower case) → its variants. */
-export interface NamesakeRule {
-  id: string;
-  base_id: string;
-  name: string;
-  label: string;
-  anchors: string[];
-  base_anchors: string[];
-}
+export type { NamesakeRule } from './identity.js';
 
+/** The namesake rules for these names: name (lower case) → its variants. */
 export async function namesakeRules(q: Queryable, names: string[]): Promise<Map<string, NamesakeRule[]>> {
   const lower = [...new Set(names.map((n) => n.trim().toLowerCase()).filter(Boolean))];
   if (lower.length === 0) return new Map();

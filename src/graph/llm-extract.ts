@@ -5,7 +5,7 @@ import { ScopeWriter } from '../lineage/writer.js';
 import { ChatMessage, LlmClient } from '../llm/client.js';
 import { claimMeasure, isCorrectionStatement } from './claim-state.js';
 import { findLinks, LinkCandidate, tier0Known } from './concepts.js';
-import { namesakeChoice, namesakeRules } from './entity-context.js';
+import { documentContext } from './identity.js';
 import { builtinOntology, Ontology } from './ontology.js';
 import {
   CLAIM_STATUS,
@@ -426,8 +426,9 @@ export async function applyExtraction(
     ? chunksBySegment(opts.segments.text, page.chunkIds, opts.segments.ranges)
     : null;
 
-  // a person name split by context (src/graph/entity-context.ts) resolves to the person this document's entities point at
-  const namesakes = await namesakeRules(w.q, entities.filter((e) => e.type === 'person').map((e) => e.name));
+  // what this document says about each mention — its team or parent, the organizations it names — tells
+  // which of the entities a parted name stands for is meant (src/graph/identity.ts)
+  const context = documentContext(entities, relations, w.ontology, { path: page.path, id: page.documentId });
 
   for (const e of entities) {
     const needles = [e.name, ...(e.aliases ?? [])].map((s) => s.toLowerCase());
@@ -443,11 +444,7 @@ export async function applyExtraction(
     } else {
       hits = page.chunkIds.filter(has).slice(0, 8);
     }
-    const rules = e.type === 'person' ? namesakes.get(e.name.trim().toLowerCase()) : undefined;
-    const variant = rules ? namesakeChoice(rules, entities) : null;
-    const id = variant
-      ? await w.entity({ ...e, name: `${variant.name}（${variant.label}）`, aliases: [...(e.aliases ?? []), e.name] }, { extractor, segmentId: hits[0]?.id ?? fallback?.id ?? null, id: variant.id })
-      : await w.entity(e, { extractor, segmentId: hits[0]?.id ?? fallback?.id ?? null });
+    const id = await w.entity(e, { extractor, segmentId: hits[0]?.id ?? fallback?.id ?? null, context: context.of(e.name) });
     touched.add(id);
     idByName.set(e.name.toLowerCase(), id);
     for (const a of e.aliases ?? []) idByName.set(a.toLowerCase(), id);
