@@ -583,21 +583,36 @@ export function datesApart(a: Pick<ClaimLite, 'valid_from' | 'valid_to' | 'event
 /** A year a statement names, which periodsOf reads instead. */
 const NAMED_YEAR = /(?<![\d.])(?:20\d{2}|\d{2}\s*年)|fy\s*\d{2}|\d[qh]\d{2}/i;
 const MONTH = /(?<![\d.])(\d{1,2})\s*月/g;
+/** A tenor or a span of months, which is no time at all: 3月期 Shibor, 6个月期, 3个月内. */
+const MONTH_SPAN = /(?<![\d.])\d{1,2}\s*个?\s*月\s*期|(?<![\d.])\d{1,2}\s*个\s*月/g;
+/** The month of the document that reports the fact: 5月月报, 4月份周报, 10月报告. */
+const REPORT_MONTH = /(?<![\d.])(\d{1,2})\s*月份?\s*(?:月报|周报|报告|简报|报)/g;
+/** A time besides months: a quarter, a half, a numbered or relative week, a relative year. */
+const OTHER_TIME = /[一二三四1-4]\s*季度|[上下本]季度|\bq[1-4]|[1-4]\s*q\b|\bh[12]\b|[上下]半年|第\s*\d{1,3}\s*周|\bw\d{1,2}\b|[上下本]周|周[前后]|[去今明前]年/i;
 
 /**
- * The months of the year a statement names without a year ("10月月报列示…",
- * "4月上线"); empty when it names a year, which periodsOf reads. A monthly
- * report with no date of its own says "4月月报列示四部支付组在岗人数为7人".
+ * The months of the year a statement names as the time of its fact, without a
+ * year ("8月五部平台组在岗人数为6人", "4月上线"); empty when it names a year (periodsOf
+ * reads those). A tenor (3月期) is no time. The month of the report that states
+ * the fact (5月月报) is the fact's time only for a measured state (`measure`: the
+ * claim gives an attribute's value) whose statement names no other time:
+ * "4月月报列示在岗人数为7人" is April's headcount, but "5月月报列示Orion已于第18周上线"
+ * and "4月月报列示一季度营收为3亿元" speak of week 18 and of Q1, whichever report says so.
  * Exported for tests.
  */
-export function yearlessMonthsOf(s: string): Set<number> {
-  const text = s.normalize('NFKC');
+export function yearlessMonthsOf(s: string, measure = false): Set<number> {
+  const text = s.normalize('NFKC').replace(MONTH_SPAN, ' ');
   if (NAMED_YEAR.test(text)) return new Set();
   const out = new Set<number>();
-  for (const m of text.matchAll(MONTH)) {
-    const n = Number(m[1]);
+  const add = (m: string) => {
+    const n = Number(m);
     if (n >= 1 && n <= 12) out.add(n);
-  }
+  };
+  const reports = [...text.matchAll(REPORT_MONTH)].map((m) => m[1]);
+  const rest = text.replace(REPORT_MONTH, ' ');
+  if (OTHER_TIME.test(rest)) return new Set();
+  for (const m of rest.matchAll(MONTH)) add(m[1]);
+  if (out.size === 0 && measure) for (const m of reports) add(m);
   return out;
 }
 
@@ -610,20 +625,20 @@ function windowMonth(c: Pick<ClaimLite, 'valid_from' | 'valid_to'>): Set<number>
 
 /**
  * Two claims whose months of the year miss each other, at least one of them
- * named in the statement without a year: an April and an October are two
- * times whatever their years. The other side may give its month by a window
- * inside one month. A forecast is left out — "6月月报预计Orion于第32周上线" and
- * the May report's same words name the reports' months, not the forecast's:
- * on the 1× benchmark copy the judge called four such pairs the same.
- * Exported for tests.
+ * named in the statement without a year (yearlessMonthsOf): an April and an
+ * October are two times whatever their years. The other side may give its
+ * month by a window inside one month. A forecast is left out: its time is the
+ * one it foresees, which its statement's month need not be. `monthsOf` reads a
+ * statement once per audit (a memo of yearlessMonthsOf). Exported for tests.
  */
 export function monthsApart(
-  a: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to'>,
-  b: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to'>,
+  a: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to' | 'attribute'>,
+  b: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to' | 'attribute'>,
+  monthsOf: (statement: string, measure: boolean) => Set<number> = yearlessMonthsOf,
 ): boolean {
   if (a.kind === 'prediction' || b.kind === 'prediction') return false;
-  const na = yearlessMonthsOf(a.statement);
-  const nb = yearlessMonthsOf(b.statement);
+  const na = monthsOf(a.statement, Boolean(a.attribute));
+  const nb = monthsOf(b.statement, Boolean(b.attribute));
   if (na.size === 0 && nb.size === 0) return false;
   const ma = na.size ? na : windowMonth(a);
   const mb = nb.size ? nb : windowMonth(b);
@@ -979,6 +994,13 @@ export async function auditDuplicateClaims(
     const numbersIn = perStatement(numbersOf);
     const periodsIn = perStatement(periodsOf);
     const negatedIn = perStatement(negated);
+    const monthMemo = new Map<string, Set<number>>();
+    const monthsIn = (statement: string, measure: boolean): Set<number> => {
+      const k = `${measure ? 1 : 0}${statement}`;
+      let v = monthMemo.get(k);
+      if (!v) monthMemo.set(k, (v = yearlessMonthsOf(statement, measure)));
+      return v;
+    };
     for (const pair of pairs.values()) {
       await pause();
       if (decided.has(pair.id)) continue;
@@ -1021,7 +1043,7 @@ export async function auditDuplicateClaims(
         stats.series++;
         continue;
       }
-      if (datesApart(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b)) || (opts.stateRules !== false && monthsApart(a, b))) {
+      if (datesApart(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b)) || (opts.stateRules !== false && monthsApart(a, b, monthsIn))) {
         outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '时期不同', model: 'rule' } });
         stats.differentTime++;
         continue;

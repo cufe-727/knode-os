@@ -214,16 +214,20 @@ describe('the dates a claim states of itself', () => {
 });
 
 describe('months a statement names without a year', () => {
-  const claim = (statement: string, kind = 'fact', window: [string, string] | null = null) => ({
-    statement, kind, valid_from: window?.[0] ?? null, valid_to: window?.[1] ?? null,
+  const claim = (statement: string, kind = 'fact', window: [string, string] | null = null, attribute: string | null = '在岗人数') => ({
+    statement, kind, attribute, valid_from: window?.[0] ?? null, valid_to: window?.[1] ?? null,
   });
 
-  it('are read only where no year is named', () => {
-    expect([...yearlessMonthsOf('4月月报列示四部支付组在岗人数为7人。')]).toEqual([4]);
-    expect([...yearlessMonthsOf('10月月报列示X计划于12月31日前完成')].sort((x, y) => x - y)).toEqual([10, 12]);
+  it('are the fact\'s months, and a report\'s month only for a measured state that names no other time', () => {
+    expect([...yearlessMonthsOf('8月五部平台组在岗人数为6人')]).toEqual([8]);
+    expect([...yearlessMonthsOf('4月月报列示四部支付组在岗人数为7人。', true)]).toEqual([4]);
+    expect(yearlessMonthsOf('4月月报列示四部支付组在岗人数为7人。', false).size).toBe(0);
+    expect(yearlessMonthsOf('5月月报列示Orion已于第18周上线', true).size).toBe(0);
+    expect(yearlessMonthsOf('4月月报列示一季度营收为3亿元', true).size).toBe(0);
+    expect(yearlessMonthsOf('3月期Shibor为1.8%', true).size).toBe(0);
+    expect(yearlessMonthsOf('6个月期存款利率为1.5%').size).toBe(0);
     expect(yearlessMonthsOf('2025年8月结算平台完成度为69%').size).toBe(0);
     expect(yearlessMonthsOf('预计3个月内完成').size).toBe(0);
-    expect(yearlessMonthsOf('支付组本周支付成功率为97.4%').size).toBe(0);
   });
 
   it('settle two other months of the year apart, a forecast never', () => {
@@ -234,8 +238,14 @@ describe('months a statement names without a year', () => {
     expect(monthsApart(claim('4月月报列示在岗人数为7人。'), claim('本周在岗7人', 'fact', ['2025-06-16T00:00:00Z', '2025-06-20T23:59:59Z']))).toBe(true);
     expect(monthsApart(claim('4月月报列示在岗人数为7人。'), claim('本周在岗7人', 'fact', ['2025-04-14T00:00:00Z', '2025-04-18T23:59:59Z']))).toBe(false);
     expect(monthsApart(claim('4月月报列示在岗人数为7人。'), claim('本周在岗7人', 'fact', ['2025-04-28T00:00:00Z', '2025-05-02T23:59:59Z']))).toBe(false);
+    // the report's month is not the time of what the report says
+    expect(monthsApart(claim('5月月报列示Orion已于第18周上线', 'fact', null, null), claim('6月月报列示Orion已于第18周上线', 'fact', null, null))).toBe(false);
+    expect(monthsApart(claim('4月月报列示一季度营收为3亿元', 'fact', null, '营收'), claim('5月月报列示一季度营收为3.2亿元', 'fact', null, '营收'))).toBe(false);
+    expect(monthsApart(claim('3月期Shibor为1.8%', 'fact', null, 'Shibor'), claim('6月期Shibor为1.9%', 'fact', null, 'Shibor'))).toBe(false);
     // the same forecast in two monthly reports is one forecast
     expect(monthsApart(claim('6月月报预计Orion于第32周上线。', 'prediction'), claim('5月月报预计Orion于第32周上线。', 'prediction'))).toBe(false);
+    // and not by its kind alone: it names week 32, the report's month is not its time
+    expect(monthsApart(claim('6月月报预计Orion于第32周上线。'), claim('5月月报预计Orion于第32周上线。'))).toBe(false);
     // nothing to read
     expect(monthsApart(claim('在岗7人'), claim('在岗8人'))).toBe(false);
   });
