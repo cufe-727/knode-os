@@ -13,6 +13,7 @@ import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { ChatMessage, LlmClient } from '../src/llm/client.js';
 import { grepWithContext, readMany, shareBudget } from '../src/mcp/batch.js';
 import { CATALOG_EXAMPLES, catalogGuide } from '../src/mcp/catalog-guide.js';
+import { questionKindGuide } from '../src/mcp/question-kinds.js';
 import { registerKnodeTools } from '../src/mcp/tools.js';
 import { KNODE_AGENT_TOOLS, knodeAgentBrief } from '../src/eval/systems/knode.js';
 import { ask } from '../src/search/ask.js';
@@ -313,6 +314,19 @@ describe('catalog guide', () => {
     expect(brief).toContain('knode_query with source="catalog"');
     expect(brief).toContain(CATALOG_EXAMPLES[0].sql);
     expect(brief).not.toContain('shell commands');
+  });
+
+  it('routes the brief by the kinds of question the reports run showed to matter, with grep named by the arm', () => {
+    const brief = knodeAgentBrief();
+    expect(brief).toContain('order="timeline"');
+    expect(brief).toContain('v_relations');
+    expect(brief).toContain('company-wide');
+    expect(brief).toContain('as of a date');
+    expect(brief).toContain(CATALOG_EXAMPLES.find((e) => e.sql.includes('FROM v_relations'))!.sql);
+    // an arm with a shell over the files and only the structured tools gets the same kinds, with its own grep
+    const shell = questionKindGuide({ grep: 'rg -n -C3 in the shell', read: 'cat or sed -n in the shell' });
+    expect(shell).not.toMatch(/knode_grep|knode_read|knode_ls/);
+    expect(shell).toContain('rg -n -C3 in the shell');
   });
 });
 
