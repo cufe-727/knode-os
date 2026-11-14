@@ -194,7 +194,7 @@ relations:
     expect(ns).toMatchObject({ base_id: '连接池上限', label: 'P2-C1', anchors: ['二部平台组'], base_anchors: ['平台组'], documents: ['raw/docs/b1.md'] });
     expect(ns.reason).toContain('P2-C1');
     const [variant] = await store.query<{ name: string; aliases: string[] }>(`SELECT name, aliases FROM entities WHERE id = $1`, [ns.id]);
-    expect(variant.name).toBe('连接池上限（P2-C1）');
+    expect(variant.name).toBe('连接池上限（二部平台组 · P2-C1）');
     expect(variant.aliases).toEqual(expect.arrayContaining(['P2-C1', '连接池上限']));
     expect(variant.aliases).not.toContain('P1-C1');
     // each report's mention is with its own team's setting; the note with no context stays with the name

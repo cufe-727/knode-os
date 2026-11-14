@@ -110,7 +110,7 @@ export const ANCHOR_SHARE = 0.6;
  * ANCHOR_SHARE of them name one organization or project, this document names
  * none of those, and it has a roof of its own (the mention's team or parent,
  * else whose report it is) that none of the entity's documents names. Then
- * the mention gets an entity of its own, "name（code）", and entity_namesakes
+ * the mention gets an entity of its own, "name（roof · code）", and entity_namesakes
  * keeps the rule later mentions follow. Without that agreement the codes are
  * an extraction listing kinds as aliases, and the mention merges as before.
  */

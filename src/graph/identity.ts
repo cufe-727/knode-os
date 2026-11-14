@@ -136,9 +136,14 @@ export interface NamesakeRule {
 
 const lower = (s: string) => s.trim().toLowerCase();
 
-/** The name a parted entity is written under. */
-export function namesakeName(rule: Pick<NamesakeRule, 'name' | 'label'>): string {
-  return `${rule.name}（${rule.label}）`;
+/**
+ * The name a parted entity is written under: "陈伟（平台组）" for a person, by
+ * the roof; "日志保留天数（七部平台组 · D7T1-C2）" for a coded thing, by its roof
+ * and its code — the code alone does not tell a reader whose it is.
+ */
+export function namesakeName(rule: Pick<NamesakeRule, 'name' | 'label' | 'anchors'>): string {
+  const roof = codeOf(rule.label) ? rule.anchors[0] : undefined;
+  return roof ? `${rule.name}（${roof} · ${rule.label}）` : `${rule.name}（${rule.label}）`;
 }
 
 /**

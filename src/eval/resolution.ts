@@ -118,6 +118,13 @@ export interface IndexScore {
   /** Names parted into several entities: by a code at write time or by refine, and people by context. */
   parted: { coded: number; people: number };
   pack: EntityResolution | null;
+  /**
+   * The suite's score if an exported entity also said under which roof it
+   * stands (its rule's anchors): the scorer gives a name several real
+   * entities share to the claimant whose text names the context, and an
+   * entity "日志保留天数（D7T1-C2）" does not name its team. Equal to `pack` when nothing was parted.
+   */
+  packWithRoofs: EntityResolution | null;
   mentions: BcubedScore;
   /** The same over the mentions of each kind of real entity. */
   byKind: Record<string, BcubedScore>;
@@ -149,11 +156,20 @@ export async function scoreIndex(q: Queryable, gold: GoldAlias[]): Promise<Index
   }
   const byKind: Record<string, BcubedScore> = {};
   for (const kind of new Set(items.map((i) => i.kind))) byKind[kind] = bcubed(items.filter((i) => i.kind === kind));
-  const rules = await q.query<{ label: string }>(`SELECT n.label FROM entity_namesakes n JOIN entities e ON e.id = n.id AND e.tx_to IS NULL`).catch(() => []);
+  const rules = await q.query<{ id: string; base_id: string; label: string; anchors: string[]; base_anchors: string[] }>(
+    `SELECT n.id, n.base_id, n.label, n.anchors, n.base_anchors FROM entity_namesakes n JOIN entities e ON e.id = n.id AND e.tx_to IS NULL`,
+  ).catch(() => []);
+  const roofs = new Map<string, string[]>();
+  for (const r of rules) {
+    roofs.set(`entity:${r.id}`, r.anchors);
+    if (!roofs.has(`entity:${r.base_id}`)) roofs.set(`entity:${r.base_id}`, r.base_anchors);
+  }
+  const roofed = units.map((u) => (roofs.get(u.id)?.length ? { ...u, text: `${u.text}\ncontext: ${roofs.get(u.id)!.join(', ')}` } : u));
   return {
     entities: entities.length,
     parted: { coded: rules.filter((r) => codeOf(r.label)).length, people: rules.filter((r) => !codeOf(r.label)).length },
     pack: entityResolution(gold, units),
+    packWithRoofs: entityResolution(gold, roofed),
     mentions: bcubed(items),
     byKind,
   };
@@ -356,5 +372,6 @@ export function formatIndexScore(label: string, s: IndexScore): string {
   ];
   for (const [kind, k] of Object.entries(s.byKind).sort()) lines.push(`    ${kind.padEnd(9)} P ${pct(k.precision)}  R ${pct(k.recall)}  (${k.n}; merged ${k.merged}, split ${k.split})`);
   if (s.pack) lines.push(`  pack      P ${pct(s.pack.precision)}  R ${pct(s.pack.recall)}  F1 ${pct(s.pack.f1)}  (${s.pack.n} real entities found; merged ${s.pack.merged}, split ${s.pack.split})`);
+  if (s.packWithRoofs && s.parted.coded + s.parted.people > 0) lines.push(`  pack, roofs named  P ${pct(s.packWithRoofs.precision)}  R ${pct(s.packWithRoofs.recall)}  F1 ${pct(s.packWithRoofs.f1)}  (merged ${s.packWithRoofs.merged}, split ${s.packWithRoofs.split})`);
   return lines.join('\n');
 }

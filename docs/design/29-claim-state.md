@@ -191,20 +191,29 @@ Run by refine before the duplicate audit (`resolveEntityContext`), deterministic
     parted into; they never part one.
   - *Write time* (`resolve.ts`, `partByCode`): a mention whose code differs from the code of the entity its name
     lands on — same shape and another value, or the other code with something in front (`T1-C1`, `D2T1-C1`) — gets
-    an entity `name（code）` when that entity is in ≥ 3 documents, ≥ 60% of them name one organization or project,
+    an entity `name（roof · code）` when that entity is in ≥ 3 documents, ≥ 60% of them name one organization or project,
     this document names none of those and has a home or owner of its own that none of them names. Otherwise it
     merges as before.
-  - *Refine* (`splitCoded`): an entity whose documents carry two or more such codes, each in ≥ 2 documents with an
-    anchor of its own (≥ 60% of its documents, ≤ 5% of the other codes'), is parted into `name（code）` entities and
-    their documents are re-applied from the sidecars; a document that names it without a code goes with the one code
-    whose anchor it names. The roofs must account for ≥ 80% of the entity's documents — on finance ten hubs (DRAM
-    with DDR4 and DDR5, 国债期货 by contract) would have parted without that test, none with it. This is the only
-    split of anything but a person: disjoint contexts alone do not make a product, a technology or a sector two.
+  - *Refine* (`splitCoded`): a code is written once or twice, where the thing is introduced, so the documents that
+    carry a code seed a group and a document without one joins the group it is most like (Jaccard ≥ 0.3 with one of
+    its documents, and with no other group's as much). An entity is parted when two or more such codes each have a
+    group of ≥ 2 documents with an anchor of its own (≥ 60% of its documents, ≤ 5% of the other groups') and the
+    roofs account for ≥ 80% of the entity's documents. Each becomes `name（roof · code）` — `日志保留天数（七部平台组 ·
+    D7T1-C2）` — and its documents are re-applied from the sidecars. On finance ten hubs (DRAM with DDR4 and DDR5,
+    国债期货 by contract) would have parted without the 80% test, none with it. This is the only split of anything
+    but a person: disjoint contexts alone do not make a product, a technology or a sector two.
+  - *People.* The namesake rule above gained two tests once documents had dates: what the two clusters are about
+    is compared over the entities in ≥ 20% of each one's documents (two teams that each name a customer once are
+    still two contexts), and the documents must not be one cluster's first and then the other's (`sequentialShare`
+    < 0.7) — a person who changed teams is named months later in the old team's incident reviews, which made the two
+    date ranges overlap.
   - *Following* (`namesakeFor`): a mention that lands on a parted name goes to the entity labelled with its code,
-    else the one whose anchors name its owner, else the one whose anchors its document names most (more than the
+    else the one the split gave its document to, else the one whose anchors name its owner, else the one whose anchors its document names most (more than the
     base entity's, and no other as many), else the base entity. This replaces the person-only lookup by name.
   - `review.identity: "name"` turns the parting off (write time and refine); names already parted are still
-    followed. `knode-os eval resolution` measures all of it from a workspace's sidecars, no model.
+    followed. `knode-os eval resolution` measures all of it from a workspace's sidecars, no model. On a replay of the
+    10× sidecars (1,540 documents): B-cubed precision over mentions 0.865 → 0.998 at recall 0.978 (settings 0.128 →
+    0.994, people 0.871 → 0.998); 81 settings and 29 of the 30 shared person names parted, none wrongly.
 
 ## 6. Extraction
 

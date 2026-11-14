@@ -249,12 +249,13 @@ describe('refine on reports that date themselves only in their claims', () => {
     const settings = await named('日志保留天数%');
     expect(settings).toHaveLength(3);
     expect((await Promise.all(settings.map((s) => teamsOf(s.id)))).map((t) => JSON.stringify(t)).sort()).toEqual(TEAMS.map((t) => JSON.stringify({ [t.team]: WEEKS })).sort());
-    // each keeps its own team's code and none of the others'
+    // each keeps its own team's code and none of the others'; a parted one is named by its roof and its code
     for (const s of settings) {
       const [team] = Object.keys(await teamsOf(s.id));
-      const carried = TEAMS.filter((t) => s.aliases.includes(t.code) || s.name.endsWith(`（${t.code}）`)).map((t) => t.team);
+      const carried = TEAMS.filter((t) => s.aliases.includes(t.code) || s.name.endsWith(` ${t.code}）`)).map((t) => t.team);
       expect(carried, `${s.name} ${JSON.stringify(s.aliases)}`).toEqual([team]);
     }
+    for (const s of settings.filter((x) => x.name !== '日志保留天数')) expect(s.name).toMatch(/^日志保留天数（(平台组|二部平台组|三部平台组) · (T1-C2|D2T1-C2|D3T1-C2)）$/);
     // the claims went with their subject
     for (const s of settings) {
       const [team] = Object.keys(await teamsOf(s.id));

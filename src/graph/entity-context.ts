@@ -63,7 +63,7 @@ import { ExtractedEntity, slugify } from './store.js';
  *   coded    one entity whose documents carry two or more codes of one kind
  *            (T1-C1, D2T1-C1 … D10T1-C1), each code's documents under a roof of its
  *            own, is as many things: every such code gets an entity
- *            "name（code）" and its documents are re-applied to it, those that
+ *            "name（roof · code）" and its documents are re-applied to it, those that
  *            name the thing without a code going by the roof they name. This
  *            is the only split of anything but a person. Disjoint contexts
  *            alone do not part a thing: a technology, a product or a sector
