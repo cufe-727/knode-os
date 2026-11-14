@@ -55,6 +55,13 @@ export function setAgentRouting(r: AgentRouting | null): void {
   routing = r;
 }
 
+let stopping: AbortSignal | null = null;
+
+/** The run's stop signal (set by `runEval`): a session that ends while it is up was stopped, not answered. */
+export function setAgentStopping(signal: AbortSignal | null): void {
+  stopping = signal;
+}
+
 /** The env var a session reads its API key from: never on the command line, where `ps` would show it. */
 export const AGENT_KEY_ENV = 'KNODE_EVAL_AGENT_API_KEY';
 

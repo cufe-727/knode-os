@@ -140,16 +140,11 @@ export function mountEvalProducer(app: Hono<any>, deps: EvalProducerDeps): void 
   api.onError((err, c) => c.json({ error: err instanceof Error ? err.message : String(err) }, err instanceof BadSpec ? 400 : 500));
 
   const offered = () => offeredRemotely(deps.config(), 'eval-call');
-  const offerSeconds = () => {
-    const n = Number(deps.config().server.remote?.evalOfferSeconds);
-    return Number.isFinite(n) && n >= 0 ? n : 30;
-  };
 
   api.get('/status', (c) => {
     const run = c.req.query('run');
     return c.json({
       offered: offered(),
-      offerSeconds: offerSeconds(),
       online: {
         'eval-call': Object.fromEntries(EVAL_FAMILIES.map((f) => [f, deps.work.calls.online(f)])),
         'eval-session': Object.fromEntries(EVAL_FAMILIES.map((f) => [f, deps.work.sessions.online(f)])),
@@ -229,10 +224,9 @@ export function mountEvalProducer(app: Hono<any>, deps: EvalProducerDeps): void 
     if (spec.kind === 'eval-session' && spec.archive && !deps.work.archives.file(spec.archive.sha256)) {
       throw new BadSpec(`archive ${spec.archive.sha256.slice(0, 12)} is not here: upload it first`);
     }
-    const asked = Number(body.offerSeconds);
-    const offerMs = (Number.isFinite(asked) && asked >= 0 ? asked : offerSeconds()) * 1000;
+    // a piece waits until a slot takes it (docs/design/32 D3): a run from before that sends `offerSeconds`, which no longer applies
     const abort = new AbortController();
-    const offer = deps.work.source(spec.kind).offer(spec, { offerMs, signal: abort.signal });
+    const offer = deps.work.source(spec.kind).offer(spec, { signal: abort.signal });
     // the answer can take as long as the piece: headers now, whitespace while it waits, the outcome last
     const enc = new TextEncoder();
     let timer: NodeJS.Timeout | null = null;

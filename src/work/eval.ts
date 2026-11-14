@@ -32,13 +32,13 @@ import type { EvalKind } from './kinds.js';
  * every workspace's broker, and a worker leases it through whichever
  * workspace its token names (with the `eval` scope).
  *
- * Placement (D3) is the run's: it offers a piece only while a worker for its
- * kind and CLI asked lately, and runs it itself when nobody leases it within
- * `offerMs` (`withdrawn`). A worker's failure is the worker's (D11): a usage
- * limit, a lost login, a missing CLI, a lapsed lease puts the piece back in
- * line, and the third in a row ends the offer `failed`, so the run does it
- * itself. A model's own error on a call (an answer that is no answer) is the
- * call's, and goes back as `error`, as the run's own backend would throw it.
+ * The run only publishes (docs/design/32): a piece waits until a slot that
+ * takes it leases it — a remote worker's, or one of the run's own on this
+ * machine — and never comes back for the run to do itself. A worker's failure
+ * is the worker's (D11): a usage limit, a lost login, a missing CLI, a lapsed
+ * lease puts the piece back in line. A model's own error on a call (an answer
+ * that is no answer) is the call's, and goes back as `error`, as the run's own
+ * backend would throw it.
  */
 
 export type EvalFamily = 'codex' | 'claude';
@@ -96,7 +96,6 @@ export interface EvalSessionAnswer {
 export type EvalOutcome =
   | { outcome: 'answered'; worker: string; backend: string; text: string; usage: CallUsage | null; model: string; session?: EvalSessionAnswer }
   | { outcome: 'error'; worker: string; backend: string; error: string; usage: CallUsage | null }
-  | { outcome: 'withdrawn'; reason: string; strikes?: number; lastError?: string }
   | { outcome: 'failed'; strikes: number; lastError: string }
   | { outcome: 'cancelled' }
   | { outcome: 'stopped' };
@@ -139,10 +138,10 @@ export interface EvalRunStatus {
 }
 
 export interface EvalStatus extends SourceStatus {
-  /** Offered and waiting for a worker. */
+  /** Published and waiting for a slot. */
   waiting: number;
   leases: EvalLeaseStatus[];
-  totals: { offered: number; answered: number; withdrawn: number; failed: Record<FailureKind, number>; leasesExpired: number };
+  totals: { offered: number; answered: number; failed: Record<FailureKind, number>; leasesExpired: number };
 }
 
 interface Pending {
@@ -154,9 +153,6 @@ interface Pending {
   strikes: number;
   lastError: string;
   notBefore: number;
-  /** Since when it has waited for a worker (reset when it goes back in line). */
-  queuedAt: number;
-  offerMs: number;
 }
 
 interface EvalLease {
@@ -228,7 +224,7 @@ export class EvalSource implements WorkSource {
   private readonly leases = new Map<string, EvalLease>();
   /** Who asked for this kind lately: slot → what it is and when. */
   private readonly asked = new Map<string, EvalSlotSeen & { at: number }>();
-  private readonly totals: EvalStatus['totals'] = { offered: 0, answered: 0, withdrawn: 0, failed: noFailures(), leasesExpired: 0 };
+  private readonly totals: EvalStatus['totals'] = { offered: 0, answered: 0, failed: noFailures(), leasesExpired: 0 };
   private readonly leaseMs: number;
   private readonly retryMs: number;
   private readonly maxStrikes: number;
@@ -258,10 +254,11 @@ export class EvalSource implements WorkSource {
     return this.slotsOnline(withinMs).filter((s) => s.family === family).length;
   }
 
-  /** Every slot that asked for this kind within `withinMs`. */
+  /** Every slot that asked for this kind within `withinMs`, or holds one of its leases now (a slot at work asks nothing). */
   slotsOnline(withinMs = this.onlineMs): EvalSlotSeen[] {
     const since = Date.now() - withinMs;
-    return [...this.asked.values()].filter((s) => s.at >= since).map(({ at: _at, ...s }) => s);
+    const busy = new Set([...this.leases.values()].filter((l) => !l.pending.done).map((l) => l.who.worker));
+    return [...this.asked.values()].filter((s) => s.at >= since || busy.has(s.worker)).map(({ at: _at, ...s }) => s);
   }
 
   /** A run's pieces here: waiting for a slot, or out with one. */
@@ -271,16 +268,17 @@ export class EvalSource implements WorkSource {
   }
 
   /**
-   * Offer a piece to the workers. The returned promise settles with what
-   * became of it; `signal` (the run went away) cancels it wherever it is.
+   * Publish a piece. It waits until a slot that takes it leases it (docs/design/32
+   * D3): there is no window after which it comes back unserved. The returned
+   * promise settles with what became of it; `signal` (the run went away)
+   * cancels it wherever it is.
    */
-  offer(spec: EvalSpec, opts: { offerMs: number; signal?: AbortSignal }): { id: string; result: Promise<EvalOutcome>; cancel: () => void } {
+  offer(spec: EvalSpec, opts: { signal?: AbortSignal } = {}): { id: string; result: Promise<EvalOutcome>; cancel: () => void } {
     const id = `e_${crypto.randomBytes(6).toString('hex')}`;
     let resolve: (o: EvalOutcome) => void = () => {};
     const result = new Promise<EvalOutcome>((r) => (resolve = r));
-    const now = Date.now();
     const p: Pending = {
-      id, spec, done: false, lease: null, strikes: 0, lastError: '', notBefore: 0, queuedAt: now, offerMs: Math.max(0, opts.offerMs),
+      id, spec, done: false, lease: null, strikes: 0, lastError: '', notBefore: 0,
       settle: () => {},
     };
     p.settle = (outcome) => {
@@ -444,10 +442,7 @@ export class EvalSource implements WorkSource {
       const lease = this.leases.get(id);
       if (!lease || lease.who.worker !== who.worker) continue;
       this.leases.delete(id);
-      if (lease.pending.lease === id) {
-        lease.pending.lease = null;
-        lease.pending.queuedAt = Date.now();
-      }
+      if (lease.pending.lease === id) lease.pending.lease = null;
       n++;
     }
     return n;
@@ -497,10 +492,9 @@ export class EvalSource implements WorkSource {
       return;
     }
     p.notBefore = now + this.retryMs;
-    p.queuedAt = p.notBefore;
   }
 
-  /** Lapsed leases go back in line with a strike; offers nobody leased in time are withdrawn. */
+  /** Lapsed leases go back in line with a strike. */
   private sweep(): void {
     const now = Date.now();
     for (const lease of [...this.leases.values()]) {
@@ -511,13 +505,6 @@ export class EvalSource implements WorkSource {
       if (p.done || p.lease !== lease.id) continue;
       p.lease = null;
       this.strike(p, 'transient', `${lease.who.worker} ${lease.deadline <= now ? 'outran its timeout' : 'stopped renewing its lease'}`, lease.who.worker, now);
-    }
-    for (const p of [...this.pending]) {
-      if (p.done || p.lease !== null || now - p.queuedAt < p.offerMs) continue;
-      this.totals.withdrawn++;
-      p.settle(p.strikes
-        ? { outcome: 'withdrawn', reason: `no worker took it again within ${Math.round(p.offerMs / 1000)} s`, strikes: p.strikes, lastError: p.lastError }
-        : { outcome: 'withdrawn', reason: `no worker took it within ${Math.round(p.offerMs / 1000)} s` });
     }
     if (this.pending.length === 0 && this.sweeper) {
       clearInterval(this.sweeper);

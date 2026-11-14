@@ -428,11 +428,9 @@ export interface RemoteApiConfig {
   sessionOfferSeconds?: number;
   sessionWaitMinutes?: number;
   /**
-   * An evaluation run's model calls and agent sessions offered to remote
-   * workers (`offer.eval`, off by default; docs/design/27 §8): a run that asks
-   * (`eval run --remote`) offers a piece while a worker for its kind and CLI
-   * asked lately, and runs it itself when none takes it within this long
-   * (default 30 s) — the run's own `--offer-seconds` wins.
+   * No longer read (docs/design/32): an evaluation run's piece waits until a
+   * slot takes it, bounded by the run's own `--wait-minutes`. Kept so a
+   * settings file that names it still loads.
    */
   evalOfferSeconds?: number;
   /**
@@ -1301,7 +1299,7 @@ export function defaultConfig(): KnodeConfig {
       remote: {
         enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15,
         offer: { summarize: true, judge: false, translate: true, embed: true, session: false, eval: false }, shares: { extract: 3, summarize: 1, translate: 1 }, callDeadlineMinutes: 20, judgeModels: [],
-        sessionOfferSeconds: 30, sessionWaitMinutes: 30, evalOfferSeconds: 30,
+        sessionOfferSeconds: 30, sessionWaitMinutes: 30,
         embedProbeCosine: 0.98,
       },
       auth: { enabled: true, sessionDays: 30, allowInsecureRemote: false },

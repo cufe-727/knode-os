@@ -19,7 +19,7 @@ import { EXTERNAL_SYSTEMS, externalPacks, venvPython } from './systems/external.
 import { Suite, SUITES, TASK_TYPES, TaskType } from './types.js';
 import { loadConfig, resolveDataDir } from '../config.js';
 import { ModelChain, parseChain, SpendLedger } from './chain.js';
-import { localServe } from './remote.js';
+import { localServe, WaitLimitError } from './remote.js';
 
 /** The author model: a budgeted chain over a workspace's connections, or one CLI (docs/design/23 D18). */
 function authorClient(opts: { author: string | false; authorModel?: string; authorChain?: string; configFrom?: string }, guard: QuotaGuard): LlmClient | undefined {
@@ -66,6 +66,26 @@ function localOption(opts: { local?: string; slots?: string; remote?: boolean })
   }
   if (opts.remote && opts.slots !== undefined) console.log('  warning: --slots is ignored with --remote: only --local starts slots on this machine (none now: the run\'s work waits for workers)');
   return opts.slots !== undefined ? { slots: Number(opts.slots) } : {};
+}
+
+/** `--wait-minutes` (docs/design/32 §3), and `--offer-seconds` said to be gone. */
+function waitMinutesOption(opts: { waitMinutes?: string; offerSeconds?: string }): number {
+  if (opts.offerSeconds !== undefined) console.log('  warning: --offer-seconds no longer applies: a piece waits until a slot takes it, at most --wait-minutes while none online does');
+  const n = Number(opts.waitMinutes ?? 30);
+  if (!Number.isFinite(n) || n < 0) throw new Error('--wait-minutes: a number of minutes, 0 for no limit');
+  return n;
+}
+
+/** A run the wait limit stopped: its report so far, the message, and a non-zero exit. */
+async function waitedOut(run: typeof runEval, opts: Parameters<typeof runEval>[0]): Promise<Awaited<ReturnType<typeof runEval>> | null> {
+  try {
+    return await run(opts);
+  } catch (err) {
+    if (!(err instanceof WaitLimitError)) throw err;
+    const report = err.runDir ? writeReport(err.runDir) : null;
+    console.error(`\n${err.message}${report ? `\nreport so far: ${report.md}` : ''}`);
+    process.exit(1);
+  }
 }
 
 export function registerEvalCommands(program: Command): void {
@@ -203,14 +223,16 @@ export function registerEvalCommands(program: Command): void {
     .option('--rebuild <groups>', 'with --reuse-builds-from: build these groups afresh (knode, llm-wiki, rag, …), e.g. after a change to how they build')
     .option('--remote', 'publish the run\'s work to `knode-os serve` on this machine, where remote workers take it (server.remote.offer.eval): model calls and agent sessions need --model, the judge --judge-model, and a pack with private sources goes to this machine\'s slots only; without --local nothing runs here')
     .option('--serve-url <url>', 'with --remote: serve\'s origin on this machine (default: from the data root\'s config)')
-    .option('--offer-seconds <s>', 'with --remote: how long a piece waits for a worker before it runs here (default: the server\'s, 30)')
+    .option('--offer-seconds <s>', 'no longer applies: a piece waits until a slot takes it (see --wait-minutes)')
+    .option('--wait-minutes <n>', 'stop the run cleanly (non-zero, resumable) when a piece has waited this long while no slot online takes it; 0 = no limit', '30')
     .option('--repeat <n>', 'answer each task n times, for run-to-run variance (repeat 1 keeps the usual record keys)', '1')
     .option('--repeat-systems <list>', 'with --repeat: only these systems (default: every system that answers)')
     .action(async (opts) => {
       const remote = remoteOption(program, opts);
-      const res = await runEval({
+      const res = await waitedOut(runEval, {
         remote,
         ...localOption(opts),
+        waitMinutes: waitMinutesOption(opts),
         repeat: Number(opts.repeat),
         repeatSystems: csv(opts.repeatSystems),
         packs: csv(opts.pack)!.map(resolvePack),
@@ -253,6 +275,7 @@ export function registerEvalCommands(program: Command): void {
         rebuild: csv(opts.rebuild),
         onProgress: (m) => console.log(`  ${m}`),
       });
+      if (!res) return;
       const report = writeReport(res.runDir);
       console.log(`\n${res.builds} builds, ${res.answers} answers, ${res.scores} scores\nreport: ${report.md}`);
       // child processes and embedder timers can keep the loop alive after a run: it is over
@@ -289,9 +312,17 @@ export function registerEvalCommands(program: Command): void {
     .option('--serve-url <url>', 'with --remote: serve\'s origin on this machine')
     .option('--local <slots>', "slots in this process that take the judge's calls, e.g. claude:2; without it and --remote the judge runs here on --slots")
     .option('--slots <n>', 'old command lines: with neither --remote nor --local, the judge runs here on that many slots (default 6)')
-    .option('--offer-seconds <s>', 'with --remote: how long a call waits for a worker before it runs here')
+    .option('--offer-seconds <s>', 'no longer applies: a call waits until a slot takes it (see --wait-minutes)')
+    .option('--wait-minutes <n>', 'stop cleanly (non-zero) when a call has waited this long while no slot online takes it; 0 = no limit', '30')
     .action(async (runDir: string, opts) => {
-      const n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts) });
+      let n: number;
+      try {
+        n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts) });
+      } catch (err) {
+        if (!(err instanceof WaitLimitError)) throw err;
+        console.error(`\n${err.message}`);
+        process.exit(1);
+      }
       const r = writeReport(path.resolve(runDir));
       console.log(`\n${n} answers scored\nreport: ${r.md}`);
       process.exit(0);

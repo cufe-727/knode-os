@@ -9,7 +9,7 @@ import { createConfiguredEmbeddingProvider } from '../ingest/embedding-router.js
 import { LlmClient } from '../llm/client.js';
 import { Judge, JUDGE_SYSTEM } from './judge.js';
 import { ModelChain, parseChain, SpendLedger } from './chain.js';
-import { setAgentRouting } from './agent.js';
+import { setAgentRouting, setAgentStopping } from './agent.js';
 import { Meter } from './meter.js';
 import { dirBytes, listFiles, loadPack, LoadedPack, packsDir, runsDir, seededKey, stageCorpus, StagedCorpus, stageUpdate, validatePack } from './pack.js';
 import { calibrateEndpoint, checkEndpoint, endpointUnder, preferEndpoint } from './endpoint.js';
@@ -162,6 +162,14 @@ export interface RunOptions {
   repeatSystems?: string[];
   /** Cancels the run: what is out with workers is withdrawn and their session tokens revoked. */
   signal?: AbortSignal;
+  /**
+   * How long a piece may wait while no slot online meets its requirements
+   * (default 30 min; 0: no limit). Past it the run stops cleanly and throws
+   * `WaitLimitError`; a resume continues.
+   */
+  waitMinutes?: number;
+  /** Tests: how often waiting is checked (the log comes every twelve checks). */
+  waitCheckMs?: number;
   onProgress?: (msg: string) => void;
 }
 
@@ -347,12 +355,21 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const queueLog = chainLog;
   const placement = runPlacement(opts, judgeFamily(opts.judgeProvider ?? 'claude-cli'));
   if (placement.legacy) queueLog(`work: no --remote and no --local: this run's model work runs on this machine, on --local ${describeLocal(placement.local!)} (sized from --slots)`);
-  let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run: runId, quota, log: queueLog }) : null;
+  // the run stops on its caller's cancel, on a signal, or when it has waited its limit for a slot: whatever it stopped is not recorded
+  const stop = new AbortController();
+  const waiting = { waitMinutes: opts.waitMinutes ?? 30, checkMs: opts.waitCheckMs, logEveryMs: opts.waitCheckMs ? opts.waitCheckMs * 12 : undefined, onStop: () => stop.abort() };
+  let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run: runId, quota, log: queueLog, ...waiting }) : null;
   if (opts.remote && !remote) queueLog(`work: serve is not answering: the run publishes to a broker of its own${placement.local ? '' : ', and with no --local nothing takes its pieces'}`);
-  remote ??= RemoteEval.own({ run: runId, quota, log: queueLog, refreshMs: opts.remote?.refreshMs });
+  remote ??= RemoteEval.own({ run: runId, quota, log: queueLog, refreshMs: opts.remote?.refreshMs, ...waiting });
   if (placement.local) remote.startLocal(placement.local);
-  const onAbort = () => void remote.cancel();
+  else queueLog(`work: no slot on this machine: the run's pieces wait for workers${remote.waitMinutes ? ` (at most ${remote.waitMinutes} min while none online takes them)` : ''}`);
+  const onAbort = () => {
+    stop.abort();
+    void remote.cancel();
+  };
+  if (opts.signal?.aborted) onAbort();
   opts.signal?.addEventListener('abort', onAbort, { once: true });
+  setAgentStopping(stop.signal);
   // a call may leave only on the run's own Codex backend with a named model: the worker runs exactly that one
   const callsLeave = !opts.replayOnly && !opts.overrides?.chat && !opts.chatChain && !opts.chatConnection && Boolean(opts.model);
   if (remote.where === 'serve' && !callsLeave) chainLog(`remote: model calls are for this machine's slots only (${opts.model ? 'the run answers on a chain, a connection or a stand-in' : 'no --model: a worker runs the model the run names'}); agent sessions${opts.model ? '' : ' too'}`);
@@ -460,6 +477,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     closeAdapters();
     removeHeldTempDirs();
     // what is out with workers is withdrawn and its session tokens die before this process does
+    stop.abort();
     void remote.cancel().finally(() => process.exit(signal === 'SIGINT' ? 130 : 143));
   };
   process.once('SIGINT', onSignal);
@@ -526,14 +544,14 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`),
           database,
         };
-        if (!(await buildGroup(store, meter, env, group, members, fraction, seed, progress, opts.signal))) {
+        if (!(await buildGroup(store, meter, env, group, members, fraction, seed, progress, stop.signal))) {
           failed.add(group);
           continue;
         }
         for (const s of members) {
           for (const other of members) if (other !== s) await other.release?.(env);
           const tasks = isAgent(s) ? selectTasks(allTasks, suites, opts.agentLimit ?? 30, seed) : allTasks;
-          for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, tasks, fraction, seed, concurrencyFor(s, leaves), progress, undefined, r, opts.signal);
+          for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, tasks, fraction, seed, concurrencyFor(s, leaves), progress, undefined, r, stop.signal);
           await retrieveAll(store, env, s, allTasks, fraction, seed);
         }
         // generated knowledge, once per build
@@ -573,14 +591,14 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
               ok = false;
               error = err instanceof Error ? err.message : String(err);
             }
-            if (opts.signal?.aborted) throw new RunCancelledError();
+            if (stop.signal.aborted) throw new RunCancelledError();
             store.putBuild({ key, pack: pack.manifest.id, system: `${group}@${batch}`, ok, error, ms: Date.now() - t0, usage: meter.usage((e) => e.system === group, mark), stages: meter.stages(group, mark), bytes: 0, notes: { batch, files: files.length, tasks: tasks.length }, at: new Date().toISOString(), ...where(meter.placement((e) => e.system === group, mark)) });
           } else {
             // nothing to update, or a resumed run that updated already: reopen on the staged corpus as it now is
             for (const s of members) await s.reopen?.(env).catch(() => {});
           }
           for (const s of members) {
-            for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, tasks, fraction, seed, concurrencyFor(s, leaves), progress, batch, r, opts.signal);
+            for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, tasks, fraction, seed, concurrencyFor(s, leaves), progress, batch, r, stop.signal);
           }
           for (const s of members) await s.release?.(env);
         }
@@ -607,17 +625,25 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       store.log('pack failed', { pack: pack.manifest.id, error: err instanceof Error ? err.message : String(err) });
     });
 
-    if (opts.signal?.aborted) throw new RunCancelledError();
+    if (stop.signal.aborted) throw remote.stopped ?? new RunCancelledError();
     if (!opts.skipScoring) await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing }, progress, meter);
     const c = remote.counts;
     progress(`work: ${c.published} pieces published; ${c.workers} served by workers, ${c.local} by this run's own slots`);
     store.log('work', { ...c, broker: remote.where });
+  } catch (err) {
+    // a run the wait limit stopped says so, whatever stopped first on the way out
+    if (remote.stopped) {
+      remote.stopped.runDir = runDir;
+      store.log('stopped: waited for a slot', { requirement: remote.stopped.requirement, minutes: remote.stopped.minutes });
+    }
+    throw remote.stopped ?? err;
   } finally {
     setAgentRouting(null);
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);
     opts.signal?.removeEventListener('abort', onAbort);
-    if (opts.signal?.aborted) await remote.cancel();
+    setAgentStopping(null);
+    if (stop.signal.aborted) await remote.cancel();
     remote.close();
     quota.setBypass(null);
     closeAdapters();
@@ -724,7 +750,7 @@ function where(p: Placed | null): { worker?: string; backend?: string } {
  * its records and the packs it names — with no model of its own running, so
  * only while the run itself is stopped.
  */
-export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number } = {}): Promise<number> {
+export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number } = {}): Promise<number> {
   const store = new RunStore(runDir);
   const meta = store.meta();
   if (!meta) throw new Error(`not a run directory: ${runDir}`);
@@ -746,9 +772,10 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
   const placement = runPlacement(opts, family);
   if (placement.legacy) log(`work: no --remote and no --local: the judge runs on this machine, on --local ${describeLocal(placement.local!)} (sized from --slots)`);
   const run = `${meta.id}-score`;
-  let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run, quota, log }) : null;
+  const waiting = { waitMinutes: opts.waitMinutes ?? 30, checkMs: opts.waitCheckMs, logEveryMs: opts.waitCheckMs ? opts.waitCheckMs * 12 : undefined };
+  let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run, quota, log, ...waiting }) : null;
   if (opts.remote && !remote) log(`work: serve is not answering: scoring publishes to a broker of its own${placement.local ? '' : ', and with no --local nothing takes its calls'}`);
-  remote ??= RemoteEval.own({ run, quota, log });
+  remote ??= RemoteEval.own({ run, quota, log, ...waiting });
   if (placement.local) remote.startLocal(placement.local);
   const client = remoteJudgeClient(local, remote, {
     family, model: opts.judgeModel ?? '', effort: agent?.effort ?? null,
@@ -765,6 +792,8 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
   const citing = new Set(makeSystems(meta.systems).filter((s) => s.answers && s.kind !== 'reference' && s.cites !== false).map((s) => s.id));
   try {
     return await scoreAnswers(store, judge, { tasks, corpusDocs, citing }, opts.onProgress, meter);
+  } catch (err) {
+    throw remote.stopped ?? err;
   } finally {
     remote.close();
   }

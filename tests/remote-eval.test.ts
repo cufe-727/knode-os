@@ -13,7 +13,7 @@ import { runAgent } from '../src/eval/agent.js';
 import { Meter } from '../src/eval/meter.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { withRemote } from '../src/eval/placement.js';
-import { PackScope, packMayLeave, RemoteEval } from '../src/eval/remote.js';
+import { PackScope, packMayLeave, RemoteEval, WaitLimitError } from '../src/eval/remote.js';
 import { runEval, scoreRun } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
 import { evalPassSettings, evalWorkspaceConfig, KNODE_EVAL_BATCH, KNODE_EVAL_CONCURRENCY } from '../src/eval/systems/knode.js';
@@ -56,7 +56,8 @@ let producerToken = '';
 let evalToken = '';
 /** Who the sources leased each piece to (`eval call <run> <label> → <worker>`). */
 const sourceLog: string[] = [];
-const evalWork = new EvalWork(root, { retryMs: 0, log: (m) => sourceLog.push(m) });
+// a slot that stops asking is offline after 1.5 s, so a worker that goes away is gone soon
+const evalWork = new EvalWork(root, { retryMs: 0, onlineMs: 1_500, log: (m) => sourceLog.push(m) });
 const workers: ChildProcess[] = [];
 const logs = new Map<string, string[]>();
 const oldEnv = { PATH: process.env.PATH, KNODE_CODEX_CATALOG_HOURS: process.env.KNODE_CODEX_CATALOG_HOURS, CODEX_HOME: process.env.CODEX_HOME };
@@ -398,13 +399,75 @@ describe('an evaluation run with remote workers', () => {
 
   it('has a worker refuse a malformed task before anything runs', async () => {
     const spec: EvalSessionSpec = {
-      kind: 'eval-session', run: 'bad', label: 'bad', agent: { family: 'codex', model: '--config=evil', effort: null, speed: null },
+      kind: 'eval-session', run: 'bad', key: 'bad-piece-1', eligible: 'any', label: 'bad', agent: { family: 'codex', model: '--config=evil', effort: null, speed: null },
       sandbox: 'read-only', maxSteps: 5, timeoutMs: 60_000, prompt: 'p', archive: null, mcp: null,
     };
     // offered straight to the source, past the producer's own checks: the worker checks every field again
-    const outcome = await evalWork.sessions.offer(spec, { offerMs: 3_000 }).result;
-    expect(outcome).toMatchObject({ outcome: 'withdrawn', strikes: 1 });
-    expect((outcome as { lastError?: string }).lastError).toMatch(/refused the eval session: it names no model, or its model name is not one/);
-    expect(logs.get('w2')!.some((l) => /refused the eval session/.test(l))).toBe(true);
+    const offer = evalWork.sessions.offer(spec);
+    await until(() => logs.get('w2')!.some((l) => /refused the eval session/.test(l)), 20_000);
+    // the worker's refusal is its failure: the piece goes back in line (it never comes back to the run as an answer)
+    await until(() => sourceLog.some((l) => /eval bad bad: .* could not serve it \(fatal, .*refused the eval session: it names no model, or its model name is not one/.test(l)), 10_000);
+    offer.cancel();
+    expect(await offer.result).toEqual({ outcome: 'cancelled' });
   }, 30_000);
 });
+
+describe('a run that waits for workers (docs/design/32 §3)', () => {
+  const runStatus = async (run: string) => (await (await fetch(`${base}/eval/v1/status?run=${run}`, { headers: { authorization: `Bearer ${producerToken}` } })).json()) as { run: { waiting: number; leased: number } };
+  const stopAll = async () => {
+    for (const w of workers) await stopWorker(w);
+  };
+
+  it('waits with no worker and no --local, and goes on when a worker appears', async () => {
+    await stopAll();
+    const runDir = path.join(runs, 'waits');
+    const run = runEval({ ...common, packs: [packDir], systems: ['closed-book'], runDir, remote: remoteOpts() });
+    await until(async () => (await runStatus('waits')).run.waiting > 0, 30_000);
+    await sleep(500);
+    // nothing ran in the run's process meanwhile
+    expect(fs.existsSync(path.join(runDir, 'answers.jsonl'))).toBe(false);
+    startWorker('w4', {}, 'codex:2,claude:1');
+    await run;
+    const answers = new RunStore(runDir).allAnswers();
+    expect(answers.length).toBe(3);
+    expect(new Set(answers.map((a) => a.worker))).toEqual(new Set(['laptop/w4']));
+    expect(new Meter(path.join(runDir, 'meter.jsonl')).all((e) => !e.embeddingCalls && !e.worker)).toEqual([]);
+  }, 120_000);
+
+  it('leaves a piece waiting when its worker goes away, and runs nothing in the run process', async () => {
+    await stopAll();
+    const runDir = path.join(runs, 'gone');
+    const w5 = startWorker('w5', { FAKE_EVAL_SLOW_MS: '60000' }, 'codex:1,claude:1');
+    const run = runEval({ ...common, packs: [packDir], systems: ['agent-grep'], runDir, remote: remoteOpts() });
+    // the worker took a session, then goes away holding it
+    await until(() => logs.get('w5')!.some((l) => /eval session/.test(l)), 60_000);
+    await stopWorker(w5);
+    await until(async () => (await runStatus('gone')).run.waiting > 0 && (await status()).online['eval-session'].codex === 0, 30_000);
+    await sleep(1_000);
+    expect(fs.existsSync(path.join(runDir, 'answers.jsonl'))).toBe(false);
+    startWorker('w6', {}, 'codex:1,claude:1');
+    await run;
+    const answers = new RunStore(runDir).allAnswers();
+    expect(answers.length).toBe(2);
+    expect(answers.filter((a) => a.error)).toEqual([]);
+    expect(new Set(answers.map((a) => a.worker))).toEqual(new Set(['laptop/w6']));
+    expect(new Meter(path.join(runDir, 'meter.jsonl')).all((e) => !e.embeddingCalls && !e.worker)).toEqual([]);
+  }, 180_000);
+
+  it('stops at the wait limit when the workers it needs are gone, and a resume finishes it', async () => {
+    await stopAll();
+    const runDir = path.join(runs, 'limit');
+    const err = await runEval({ ...common, packs: [packDir], systems: ['closed-book'], runDir, remote: remoteOpts(), waitMinutes: 0.03, waitCheckMs: 50 }).catch((e) => e);
+    expect(err).toBeInstanceOf(WaitLimitError);
+    expect(new RunStore(runDir).allAnswers()).toEqual([]);
+    // its pieces are withdrawn from serve
+    expect((await runStatus('limit')).run).toEqual({ waiting: 0, leased: 0 });
+    startWorker('w7', {}, 'codex:2,claude:1');
+    await runEval({ ...common, packs: [packDir], systems: ['closed-book'], runDir, remote: remoteOpts() });
+    const lines = fs.readFileSync(path.join(runDir, 'answers.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { key: string; error?: string });
+    expect(lines.length).toBe(3);
+    expect(new Set(lines.map((l) => l.key)).size).toBe(3);
+    expect(lines.filter((l) => l.error)).toEqual([]);
+  }, 120_000);
+});
+

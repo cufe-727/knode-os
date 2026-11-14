@@ -70,6 +70,8 @@ export interface EvalQueue {
   readonly origin: string | null;
   publish(spec: EvalSpec, signal: AbortSignal): Promise<RemoteOutcome>;
   status(run: string): Promise<QueueStatus>;
+  /** The slots online now, where the queue can say without a request (the run's own broker). */
+  slotsNow?(): Record<EvalKind, EvalSlotSeen[]>;
   /** A folder a worker's session reads: only `serve` hands archives to workers. */
   archive(dir: string, signal: AbortSignal): Promise<{ sha256: string; bytes: number } | null>;
   lease(who: LocalSlotIdentity, kinds: EvalKind[]): Promise<WorkTask[]>;
@@ -79,9 +81,6 @@ export interface EvalQueue {
   cancelRun(run: string): Promise<void>;
   close(): void;
 }
-
-/** A piece's window for a lease, while stage 1 still has the source's: as good as forever. */
-const FOREVER_MS = 10 * 365 * 24 * 3_600_000;
 
 const localWho = (who: LocalSlotIdentity): WorkerIdentity => ({ worker: `local/${who.run}/${who.name}`, backend: who.family, remote: false, run: who.run });
 
@@ -104,7 +103,11 @@ export class OwnQueue implements EvalQueue {
   }
 
   publish(spec: EvalSpec, signal: AbortSignal): Promise<RemoteOutcome> {
-    return this.source(spec.kind).offer(spec, { offerMs: FOREVER_MS, signal }).result;
+    return this.source(spec.kind).offer(spec, { signal }).result;
+  }
+
+  slotsNow(): Record<EvalKind, EvalSlotSeen[]> {
+    return { 'eval-call': this.calls.slotsOnline(), 'eval-session': this.sessions.slotsOnline() };
   }
 
   async status(run: string): Promise<QueueStatus> {
@@ -173,7 +176,7 @@ export class ServeQueue implements EvalQueue {
   async publish(spec: EvalSpec, signal: AbortSignal): Promise<RemoteOutcome> {
     try {
       const res = await fetch(`${this.serveUrl}/eval/v1/offer`, {
-        method: 'POST', headers: this.headers(), body: JSON.stringify({ spec, offerSeconds: FOREVER_MS / 1000 }), signal,
+        method: 'POST', headers: this.headers(), body: JSON.stringify({ spec }), signal,
       });
       const text = (await res.text()).trim();
       const body = text ? JSON.parse(text) as RemoteOutcome & { error?: string } : null;
@@ -237,7 +240,43 @@ export interface RemoteEvalOptions {
   refreshMs?: number;
   /** How often a run's own slot renews the lease of a piece it runs (default 20 s). */
   renewMs?: number;
+  /**
+   * How long a piece may wait while no slot online meets its requirements
+   * before the run stops (default 30; 0: no limit). Fractions are minutes too.
+   */
+  waitMinutes?: number;
+  /** How often waiting is checked (default 5 s) and logged (default once a minute). */
+  checkMs?: number;
+  logEveryMs?: number;
+  /** The wait limit passed: the run stops, cleanly. */
+  onStop?: (why: WaitLimitError) => void;
   log?: (msg: string) => void;
+}
+
+/** What a waiting piece requires, as the run's wait and its log say it. */
+interface Requirement {
+  kind: EvalKind;
+  family: EvalFamily;
+  model: string;
+  eligible: EvalEligible;
+}
+
+const requirementKey = (r: Requirement) => `${r.kind}|${r.family}|${r.model}|${r.eligible}`;
+
+/** A requirement in words: what a run waits for. */
+export function describeRequirement(r: Pick<Requirement, 'family' | 'model' | 'eligible'> & { kind?: EvalKind }): string {
+  const what = r.kind === 'eval-session' ? 'an agent session' : r.kind === 'eval-call' ? 'a model call' : 'work';
+  return `${what} on ${r.family}${r.model ? ` ${r.model}` : ''} (${r.eligible === 'local' ? "this machine's slots only" : 'any slot'})`;
+}
+
+/** The run waited `--wait-minutes` for a slot that meets a piece's requirements, and stopped. */
+export class WaitLimitError extends Error {
+  /** The run directory to resume (set by the run). */
+  runDir?: string;
+
+  constructor(readonly requirement: Requirement, readonly minutes: number) {
+    super(`waited ${minutes} min for a slot that takes ${describeRequirement(requirement)}, and none came online: the run stopped, with nothing recorded for the pieces still waiting — start a worker (or pass --local) and resume with --run-dir`);
+  }
 }
 
 /** Whether a pack's work may leave this machine: none of its sources is private. */
@@ -297,11 +336,25 @@ export class RemoteEval {
   private wake: (() => void) | null = null;
   private wakeAt: Promise<void> | null = null;
   private unreachableSaid = false;
+  private readonly outstanding = new Map<string, { requirement: Requirement; n: number }>();
+  private readonly unmetSince = new Map<string, number>();
+  private waitTimer: NodeJS.Timeout | null = null;
+  private lastWaitLog = 0;
+  /** Set when the wait limit stopped the run. */
+  stopped: WaitLimitError | null = null;
   /** Pieces published, and who served them, for the run's log. */
   readonly counts = { published: 0, workers: 0, local: 0 };
 
   private constructor(readonly queue: EvalQueue, private readonly opts: RemoteEvalOptions) {
     this.log = opts.log ?? (() => {});
+    this.waitTimer = setInterval(() => this.checkWaiting(), Math.max(50, opts.checkMs ?? 5_000));
+    this.waitTimer.unref?.();
+  }
+
+  /** The wait limit, in minutes (0: none). */
+  get waitMinutes(): number {
+    const n = Number(this.opts.waitMinutes ?? 30);
+    return Number.isFinite(n) && n > 0 ? n : 0;
   }
 
   /** `serve`'s broker on this machine; null (and a log line) when it is not answering. */
@@ -357,7 +410,8 @@ export class RemoteEval {
   width(kind: EvalKind, family: EvalFamily, eligible: EvalEligible): number {
     if (this.abort.signal.aborted) return 0;
     const own = LOCAL_KINDS[family].includes(kind) ? this.local[family] : 0;
-    const others = (this.status?.slots[kind] ?? []).filter((s) => s.family === family && !s.run && (eligible === 'any' || s.local));
+    const slots = this.queue.slotsNow?.() ?? this.status?.slots;
+    const others = (slots?.[kind] ?? []).filter((s) => s.family === family && !s.run && (eligible === 'any' || s.local));
     return own + others.length;
   }
 
@@ -383,6 +437,11 @@ export class RemoteEval {
     this.entries.set(key, entry);
     this.counts.published++;
     const full = { ...spec, run: this.opts.run, key } as EvalSpec;
+    const requirement: Requirement = { kind: spec.kind, family: spec.agent.family, model: spec.agent.model, eligible: spec.eligible };
+    const rk = requirementKey(requirement);
+    const held = this.outstanding.get(rk) ?? { requirement, n: 0 };
+    held.n++;
+    this.outstanding.set(rk, held);
     try {
       for (let backoff = 1_000; ;) {
         this.poke();
@@ -407,10 +466,14 @@ export class RemoteEval {
           continue;
         }
         this.unreachableSaid = false;
-        throw new Error(`no slot could serve it: ${'lastError' in o && o.lastError ? o.lastError : 'reason' in o ? o.reason : o.outcome}`);
+        throw new Error(`no slot could serve it: ${o.lastError}`);
       }
     } finally {
       this.entries.delete(key);
+      if (--held.n <= 0) {
+        this.outstanding.delete(rk);
+        this.unmetSince.delete(rk);
+      }
     }
   }
 
@@ -436,6 +499,8 @@ export class RemoteEval {
     this.closed = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.waitTimer) clearInterval(this.waitTimer);
+    this.waitTimer = null;
     this.poke();
     this.queue.close();
   }
@@ -449,6 +514,39 @@ export class RemoteEval {
       // serve is not answering: nothing is known to be online but the run's own slots
       if (this.status) this.status = { ...this.status, slots: { 'eval-call': [], 'eval-session': [] } };
     }
+  }
+
+  /**
+   * Waiting (docs/design/32 §3): a piece whose requirements no slot online
+   * meets is logged once a minute with what it waits for; past the wait limit
+   * the run stops cleanly. A piece some slot online could take waits for it
+   * however long, as any work behind a busy slot does.
+   */
+  private checkWaiting(): void {
+    if (this.abort.signal.aborted || !this.outstanding.size) return;
+    const now = Date.now();
+    const unmet: { requirement: Requirement; n: number; since: number }[] = [];
+    for (const [rk, { requirement, n }] of this.outstanding) {
+      if (this.width(requirement.kind, requirement.family, requirement.eligible) > 0) {
+        this.unmetSince.delete(rk);
+        continue;
+      }
+      const since = this.unmetSince.get(rk) ?? now;
+      this.unmetSince.set(rk, since);
+      unmet.push({ requirement, n, since });
+    }
+    if (unmet.length && now - this.lastWaitLog >= (this.opts.logEveryMs ?? 60_000)) {
+      this.lastWaitLog = now;
+      const limit = this.waitMinutes ? `; the run stops after ${this.waitMinutes} min` : '';
+      for (const u of unmet) this.log(`waiting: ${u.n} piece(s) for ${describeRequirement(u.requirement)} — no slot online takes them (for ${Math.round((now - u.since) / 60_000)} min${limit})`);
+    }
+    const limitMs = this.waitMinutes * 60_000;
+    const over = limitMs ? unmet.find((u) => now - u.since >= limitMs) : undefined;
+    if (!over) return;
+    this.stopped = new WaitLimitError(over.requirement, this.waitMinutes);
+    this.log(this.stopped.message);
+    this.opts.onStop?.(this.stopped);
+    void this.cancel();
   }
 
   /** Wake the run's own slots: a piece was published. */
