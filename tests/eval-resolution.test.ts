@@ -63,12 +63,17 @@ describe('scanning sidecars for what refine would part', () => {
     sidecar('raw/docs/pending.md', { status: 'partial', entities: [{ name: '日志保留天数', type: 'component', aliases: ['D9T1-C2'] }] });
     const r = scanSidecars(path.join(tmp, 'ws'));
     expect(r.sidecars).toBe(8);
-    expect(r.codedCandidates).toBe(2);
+    // DRAM is a product: a category, which no code parts
+    expect(r.codedCandidates).toBe(1);
     expect(r.coded).toHaveLength(1);
     expect(r.coded[0]).toMatchObject({ name: '日志保留天数', documents: 8 });
     // nothing is left for the name itself: the code with the most documents keeps it, the other is the entity added
     expect(r.coded[0].parts).toHaveLength(1);
     expect(r.coded[0].parts[0].documents).toBe(4);
     expect(r.people).toEqual([]);
+    // the write-time path: a document of either team arriving after the split is filed where refine put it —
+    // the coded ones by their code, the others by the team they name
+    expect(r.coded[0].follow).toEqual({ same: 8, elsewhere: 0, base: 0 });
+    expect(r.follow).toEqual({ same: 8, elsewhere: 0, base: 0 });
   });
 });

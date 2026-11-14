@@ -334,10 +334,13 @@ export function registerEvalCommands(program: Command): void {
         if (opts.json) console.log(JSON.stringify(r, null, 2));
         else {
           console.log(`${r.sidecars} extractions, ${r.names} names`);
-          console.log(`coded: ${r.codedCandidates} names carry two or more codes of one kind; ${r.coded.length} would be parted into ${r.coded.reduce((n, c) => n + c.parts.length, 0)} more entities`);
+          console.log(`coded (review.identity "context" only): ${r.codedCandidates} names of a type a code may part carry two or more codes of one kind; ${r.coded.length} would be parted into ${r.coded.reduce((n, c) => n + c.parts.length, 0)} more entities`);
           for (const c of r.coded.slice(0, 40)) console.log(`  ${c.name} (${c.documents} documents): ${c.parts.map((p) => `${p.code} ×${p.documents} [${p.anchors.join(', ')}]`).join('; ')}`);
-          console.log(`people: ${r.peopleCandidates} names in ${6}+ documents; ${r.people.length} would be split (${r.people.filter((p) => p.byClaimDates).length} of them only because their claims date the documents)`);
-          for (const p of r.people.slice(0, 40)) console.log(`  ${p.name} (${p.documents} documents): [${p.anchors[0].join(', ')}] / [${p.anchors[1].join(', ')}]${p.byClaimDates ? '  (by claim dates)' : ''}`);
+          const by = (rules: string) => r.people.filter((p) => p.rules === rules).length;
+          console.log(`people: ${r.peopleCandidates} names in 6+ documents; would be split — ${by('indexed')} by default as the index is now, ${by('reindexed')} more by default once documents are indexed again (datelines), ${by('context')} more only with review.identity "context"`);
+          for (const p of r.people.slice(0, 40)) console.log(`  ${p.name} (${p.documents} documents): [${p.anchors[0].join(', ')}] / [${p.anchors[1].join(', ')}]  (${p.rules})`);
+          const f = r.follow;
+          console.log(`write time: nothing is parted when a document is written; of ${f.same + f.elsewhere + f.base} documents of the names above, arriving after the split ${f.same} would be filed where refine put them, ${f.base} with the entity that keeps the name, ${f.elsewhere} with another of its entities`);
         }
         return;
       }

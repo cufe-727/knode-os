@@ -5,10 +5,13 @@ import { loadConfig, ReviewIdentity, saveConfig } from '../config.js';
 import { createContext } from '../context.js';
 import { initDataDir } from '../fs/datadir.js';
 import { CODED_TYPES, CodedDoc, codedClusters, CONTEXT_TYPES, MAX_DOCS, medianDate, MIN_DOCS, namesakeClusters, NamesakeDoc, resolveEntityContext } from '../graph/entity-context.js';
-import { codeOf, codesDiffer, codesOf } from '../graph/identity.js';
+import { codeOf, codesDiffer, codesOf, documentContext, namesakeFor, NamesakeRule } from '../graph/identity.js';
+import { builtinOntology } from '../graph/ontology.js';
+import { dateFromContent } from '../ingest/docdate.js';
 import { slugify } from '../graph/store.js';
 import { sync } from '../ingest/sync.js';
 import { openPglite } from '../store/backend.js';
+import { parseFrontmatter } from '../markdown.js';
 import { dateStart } from '../store/dates.js';
 import { Queryable } from '../store/migrations.js';
 import { EntityResolution, entityResolution } from './metrics/entities.js';
@@ -31,9 +34,11 @@ import { GoldAlias, GoldAliasSchema } from './types.js';
  *           decides nothing more. `identity` says under which rules ('name':
  *           a name is one entity, as before; 'context': identity.ts).
  *   scan    read the sidecars alone and say which names refine would part,
- *           for a workspace too large or too live to replay: mentions are
- *           grouped by the id their name gives, which leaves out what alias
- *           keys and merges join, so it is an estimate.
+ *           under the default rules and under review.identity "context",
+ *           and where write-time resolution would file later documents of
+ *           those names — for a workspace too large or too live to replay:
+ *           mentions are grouped by the id their name gives, which leaves
+ *           out what alias keys and merges join, so it is an estimate.
  *
  * Two scores. `pack` is the suite's own (metrics/entities.ts): B-cubed over
  * the names each exported entity claims — comparable with a run's report, but
@@ -258,31 +263,57 @@ export async function replayResolution(
   }
 }
 
+/** Where write-time resolution would file the documents of the names a scan parts, if each arrived after the split. */
+export interface FollowCount {
+  /** With the entity refine gave the document to. */
+  same: number;
+  /** With another of the name's entities. */
+  elsewhere: number;
+  /** With the entity that keeps the name, though refine gave the document to a parted one (nothing in it said which). */
+  base: number;
+}
+
 export interface ScanReport {
   sidecars: number;
   names: number;
-  /** Names whose mentions carry two or more codes of one kind. */
+  /** Names of a type a code may part whose mentions carry two or more codes of one kind. */
   codedCandidates: number;
-  /** Of those, the names refine's coded split would part, with the entities it would add. */
-  coded: { name: string; documents: number; parts: { code: string; documents: number; anchors: string[] }[] }[];
+  /** Of those, the names refine's coded split would part (review.identity "context"), with the entities it would add. */
+  coded: { name: string; documents: number; parts: { code: string; documents: number; anchors: string[] }[]; follow: FollowCount }[];
   /** People of 6–600 documents the namesake rule would look at. */
   peopleCandidates: number;
-  /** Of those, the names it would split; `byClaimDates` when only the dates their claims state made the test possible. */
-  people: { name: string; documents: number; anchors: [string[], string[]]; byClaimDates: boolean }[];
+  /**
+   * Of those, the names it would split, and under which rules at the least:
+   * 'indexed' — the default rules with the dates the index has now;
+   * 'reindexed' — the default rules once documents are indexed again and those with a dateline get a date;
+   * 'context' — only with review.identity "context" (documents dated by their claims, contexts compared by what they are about).
+   */
+  people: { name: string; documents: number; anchors: [string[], string[]]; rules: 'indexed' | 'reindexed' | 'context'; follow: FollowCount }[];
+  /** The write-time path: `follow` over every name above. */
+  follow: FollowCount;
 }
 
 /**
- * What refine would part in a workspace, read from its sidecars alone (no
- * index is opened). An estimate: mentions are grouped by the id their name
- * gives, context is the other names of the same document, and nothing the
- * index knows beyond that — merges, alias keys, names already parted — is
- * taken into account.
+ * What refine would part in a workspace, and where write-time resolution
+ * would then file later documents, read from its sidecars and raw texts
+ * alone (no index is opened). An estimate: mentions are grouped by the id
+ * their name gives, context is the other names of the same document, and
+ * nothing the index knows beyond that — merges, alias keys, names already
+ * parted — is taken into account.
+ *
+ * Nothing is parted when a document is written (resolve.ts), so the
+ * write-time path is the following of a name refine parted. `follow` asks it
+ * of every document of every such name: were this document to arrive after
+ * the split, with no list of the split's documents to go by, would its
+ * mention be filed where refine put it — by its code, its owner, the roofs
+ * its document names?
  */
 export function scanSidecars(source: string): ScanReport {
   const root = path.join(source, '.sidecar');
+  const ontology = builtinOntology();
   type Mention = { doc: string; spellings: string[]; type: string };
   const groups = new Map<string, { name: string; mentions: Mention[] }>();
-  const docs = new Map<string, { context: Map<string, string>; date: string | null; claimDate: string | null }>();
+  const docs = new Map<string, { context: Map<string, string>; names: Set<string>; owners: Map<string, string[]>; date: string | null; dateline: string | null; claimDate: string | null }>();
   let sidecars = 0;
   const walk = (dir: string) => {
     let names: string[];
@@ -292,7 +323,7 @@ export function scanSidecars(source: string): ScanReport {
       return;
     }
     if (names.includes('tier1.json')) {
-      let t1: { status?: string; entities?: { name?: unknown; type?: unknown; aliases?: unknown }[]; claims?: { startDate?: unknown; eventDate?: unknown }[] };
+      let t1: { status?: string; entities?: { name?: unknown; type?: unknown; aliases?: unknown }[]; relations?: { source?: unknown; target?: unknown; type?: unknown }[]; claims?: { startDate?: unknown; eventDate?: unknown }[] };
       try {
         t1 = JSON.parse(fs.readFileSync(path.join(dir, 'tier1.json'), 'utf8'));
       } catch {
@@ -300,24 +331,44 @@ export function scanSidecars(source: string): ScanReport {
       }
       if (t1.status !== 'done') return;
       sidecars++;
+      const doc = path.relative(root, dir);
       let date: string | null = null;
       try {
         date = dateStart((JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8')) as { docDate?: unknown }).docDate);
       } catch {
         // no meta: undated
       }
+      // the date an index made now would give it: what the index has, else a dateline in the raw text
+      let dateline: string | null = null;
+      if (!date && /\.(?:md|markdown|txt)$/i.test(doc)) {
+        try {
+          dateline = dateFromContent(parseFrontmatter(fs.readFileSync(path.join(source, doc), 'utf8')).body);
+        } catch {
+          // no raw text beside the sidecar
+        }
+      }
       const stated = (t1.claims ?? []).map((c) => dateStart(c.eventDate) ?? dateStart(c.startDate)).filter((x): x is string => Boolean(x));
-      const doc = path.relative(root, dir);
       const context = new Map<string, string>();
+      const all = new Set<string>();
+      const entities: { name: string; type: string; aliases: string[] }[] = [];
       for (const e of t1.entities ?? []) {
         if (typeof e.name !== 'string' || !e.name.trim()) continue;
         const id = slugify(e.name);
         const type = typeof e.type === 'string' ? e.type : 'concept';
         if (CONTEXT_TYPES.includes(type)) context.set(id, type);
         const aliases = Array.isArray(e.aliases) ? e.aliases.filter((a): a is string => typeof a === 'string') : [];
+        for (const n of [e.name, ...aliases]) all.add(slugify(n));
+        entities.push({ name: e.name, type, aliases });
         (groups.get(id) ?? groups.set(id, { name: e.name.trim(), mentions: [] }).get(id)!).mentions.push({ doc, spellings: [e.name, ...aliases], type });
       }
-      docs.set(doc, { context, date, claimDate: medianDate(stated) });
+      const relations = (t1.relations ?? []).filter((r): r is { source: string; target: string; type: string } => typeof r.source === 'string' && typeof r.target === 'string' && typeof r.type === 'string');
+      const stated_ = documentContext(entities, relations, ontology);
+      const owners = new Map<string, string[]>();
+      for (const e of entities) {
+        const own = stated_.of(e.name).owners ?? [];
+        if (own.length > 0) owners.set(slugify(e.name), own.map(slugify));
+      }
+      docs.set(doc, { context, names: all, owners, date, dateline, claimDate: medianDate(stated) });
       return;
     }
     for (const n of names) if (!n.includes('.json')) walk(path.join(dir, n));
@@ -332,7 +383,26 @@ export function scanSidecars(source: string): ScanReport {
   }
   const typeOf = (id: string) => types.get(id);
   const contextOf = (doc: string, self: string) => new Set([...docs.get(doc)!.context.keys()].filter((id) => id !== self));
-  const report: ScanReport = { sidecars, names: groups.size, codedCandidates: 0, coded: [], peopleCandidates: 0, people: [] };
+  const zero = (): FollowCount => ({ same: 0, elsewhere: 0, base: 0 });
+  /** Where each document would be filed if it arrived after the split: `rules` without their document lists, ids standing for names. */
+  const followOf = (id: string, name: string, rules: NamesakeRule[], placed: Map<string, string>, spellings: Map<string, string[]>): FollowCount => {
+    const count = zero();
+    for (const [doc, to] of placed) {
+      const d = docs.get(doc)!;
+      const chosen = namesakeFor(rules, { codes: codesOf(spellings.get(doc) ?? []), baseCodes: codesOf([name]), context: { owners: d.owners.get(id) ?? [], documentNames: d.names } }, (x) => x);
+      const filed = chosen?.id ?? id;
+      if (filed === to) count.same++;
+      else if (filed === id) count.base++;
+      else count.elsewhere++;
+    }
+    return count;
+  };
+  const report: ScanReport = { sidecars, names: groups.size, codedCandidates: 0, coded: [], peopleCandidates: 0, people: [], follow: zero() };
+  const add = (f: FollowCount) => {
+    report.follow.same += f.same;
+    report.follow.elsewhere += f.elsewhere;
+    report.follow.base += f.base;
+  };
   for (const [id, g] of groups) {
     const perDoc = new Map<string, string[]>();
     // as refine reads it: a name that is itself a code is on every mention, and says nothing of which thing a document means
@@ -343,18 +413,45 @@ export function scanSidecars(source: string): ScanReport {
     // (the candidate test keeps the name: refine looks at every entity whose spellings differ)
     if (perDoc.size >= 4 && CODED_TYPES.includes(types.get(id) ?? '') && codes.some((a, i) => codes.slice(i + 1).some((b) => codesDiffer(a, b)))) {
       report.codedCandidates++;
-      const coded: CodedDoc[] = [...perDoc.entries()].map(([doc, spellings]) => ({ id: doc, path: doc, date: null, context: contextOf(doc, id), codes: codesOf(spellings) }));
+      const coded: CodedDoc[] = [...perDoc.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([doc, spellings]) => ({ id: doc, path: doc, date: null, context: contextOf(doc, id), codes: codesOf(spellings) }));
       const split = codedClusters(coded, typeOf);
       if (split) {
-        const parts = split.rest.length === 0 ? split.parts.slice(1) : split.parts;
-        report.coded.push({ name: g.name, documents: perDoc.size, parts: parts.map((p) => ({ code: p.code.raw, documents: p.docs.length, anchors: p.anchors })) });
+        const kept = split.rest.length === 0 ? split.parts[0] : null;
+        const parts = split.parts.filter((p) => p !== kept);
+        const baseAnchors = kept ? kept.anchors : split.restAnchors;
+        const rules: NamesakeRule[] = [
+          ...(kept ? [{ id, base_id: id, name: g.name, label: kept.code.raw, anchors: kept.anchors, base_anchors: baseAnchors }] : []),
+          ...parts.map((p) => ({ id: `${id}/${p.code.value}`, base_id: id, name: g.name, label: p.code.raw, anchors: p.anchors, base_anchors: baseAnchors })),
+        ];
+        const placed = new Map<string, string>();
+        for (const d of [...split.rest, ...(kept?.docs ?? [])]) placed.set(d.id, id);
+        for (const p of parts) for (const d of p.docs) placed.set(d.id, `${id}/${p.code.value}`);
+        const follow = followOf(id, g.name, rules, placed, perDoc);
+        add(follow);
+        report.coded.push({ name: g.name, documents: perDoc.size, parts: parts.map((p) => ({ code: p.code.raw, documents: p.docs.length, anchors: p.anchors })), follow });
       }
     }
     if (types.get(id) === 'person' && perDoc.size >= MIN_DOCS) {
       report.peopleCandidates++;
-      const of = (dated: boolean): NamesakeDoc[] => [...perDoc.keys()].map((doc) => ({ id: doc, path: doc, date: docs.get(doc)!.date ?? (dated ? docs.get(doc)!.claimDate : null), context: contextOf(doc, id) }));
-      const split = namesakeClusters(of(true), typeOf);
-      if (split) report.people.push({ name: g.name, documents: perDoc.size, anchors: [split[0].anchors, split[1].anchors], byClaimDates: namesakeClusters(of(false), typeOf) === null });
+      const of = (date: (d: { date: string | null; dateline: string | null; claimDate: string | null }) => string | null): NamesakeDoc[] =>
+        [...perDoc.keys()].sort().map((doc) => ({ id: doc, path: doc, date: date(docs.get(doc)!), context: contextOf(doc, id) }));
+      const tries: [ScanReport['people'][number]['rules'], NamesakeDoc[], boolean][] = [
+        ['indexed', of((d) => d.date), false],
+        ['reindexed', of((d) => d.date ?? d.dateline), false],
+        ['context', of((d) => d.date ?? d.dateline ?? d.claimDate), true],
+      ];
+      for (const [rules, list, characteristic] of tries) {
+        const split = namesakeClusters(list, typeOf, { characteristic });
+        if (!split) continue;
+        const variant = `${id}/${split[1].anchors[0]}`;
+        const rule: NamesakeRule = { id: variant, base_id: id, name: g.name, label: split[1].anchors[0], anchors: split[1].anchors, base_anchors: split[0].anchors };
+        const placed = new Map<string, string>();
+        for (const d of list) placed.set(d.id, split[1].docs.some((x) => x.id === d.id) ? variant : id);
+        const follow = followOf(id, g.name, [rule], placed, perDoc);
+        add(follow);
+        report.people.push({ name: g.name, documents: perDoc.size, anchors: [split[0].anchors, split[1].anchors], rules, follow });
+        break;
+      }
     }
   }
   report.coded.sort((a, b) => b.documents - a.documents);
