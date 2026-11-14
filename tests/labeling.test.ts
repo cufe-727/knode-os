@@ -448,7 +448,7 @@ describe('the work broker', () => {
     expect(await kindsOf(broker, 3, ['summarize'])).toEqual(['summarize', 'summarize', 'summarize']);
     expect(await kindsOf(broker, 1, [])).toEqual(['none']);
     // an unusable weight falls back to its default
-    expect(new WorkBroker([], { shares: () => ({ extract: 0, summarize: -2 }) }).shares()).toEqual({ extract: 3, summarize: 1, translate: 1 });
+    expect(new WorkBroker([], { shares: () => ({ extract: 0, summarize: -2 }) }).shares()).toEqual({ extract: 3, summarize: 1, translate: 1, eval: 1 });
   });
 
   it('puts the judge calls a review waits on before both, and leaves their shares as they were', async () => {

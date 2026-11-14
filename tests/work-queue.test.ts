@@ -9,6 +9,8 @@ import { OwnQueue, PieceStuckError, RemoteEval, WaitLimitError } from '../src/ev
 import { eachWithin, runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
 import type { WorkerIdentity } from '../src/labeling/scheduler.js';
+import { WorkBroker } from '../src/work/broker.js';
+import type { WorkSource, WorkTask } from '../src/work/broker.js';
 import { EvalSource } from '../src/work/eval.js';
 import type { EvalCallSpec, EvalSpec } from '../src/work/eval.js';
 import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
@@ -264,4 +266,76 @@ describe('what a task requires', () => {
     const res = await runEval({ ...common(), runDir: path.join(tmp, 'runs', 'pool-wait'), local: { codex: 1, claude: 1 }, pool: 'gateway' });
     expect(new RunStore(res.runDir).allAnswers()).toHaveLength(3);
   }, 60_000);
+});
+
+describe('order (docs/design/32 §4)', () => {
+  /** An extraction backlog that never runs out (or runs out when `left` does). */
+  const backlog = (left = Infinity): WorkSource & { left: number } => {
+    let n = 0;
+    const source = {
+      kind: 'extract' as const, leaseDurationMs: 60_000, left,
+      async lease(): Promise<WorkTask[]> {
+        if (source.left <= 0) return [];
+        source.left--;
+        return [{ id: `x${++n}`, kind: 'extract', label: 'doc', leaseExpiresAt: '', messages: [], prompt: 'p', json: true, maxTokens: 1 }];
+      },
+      complete: async () => ({ accepted: true }), renew: () => ({ renewed: [], lost: [] }), release: async () => 0, holds: () => false,
+      status: async () => ({ leases: [] }), stop: async () => {},
+    };
+    return source;
+  };
+  const evalBacklog = (n: number) => {
+    const source = new EvalSource('eval-call');
+    for (let i = 0; i < n; i++) source.offer({ ...callSpec(), run: 'order', key: `piece-order-${String(i).padStart(4, '0')}`, pool: null } as EvalSpec);
+    return source;
+  };
+  const slot: WorkerIdentity = { worker: 'box/codex#1', backend: 'codex', remote: false };
+  const serve = async (broker: WorkBroker, times: number) => {
+    const got: string[] = [];
+    for (let i = 0; i < times; i++) {
+      const [t] = await broker.lease(slot, ['extract', 'eval-call'], 1);
+      got.push(t ? `${t.class}` : 'none');
+    }
+    return got;
+  };
+
+  it('serves a slot that takes both by the weights: extraction 3 to evaluation 1 by default', async () => {
+    const evals = evalBacklog(100);
+    const broker = new WorkBroker([backlog(), evals]);
+    const got = await serve(broker, 40);
+    expect(got.filter((c) => c === 'kb')).toHaveLength(30);
+    expect(got.filter((c) => c === 'eval')).toHaveLength(10);
+    expect(broker.shares().eval).toBe(1);
+    evals.close();
+  });
+
+  it('follows server.remote.shares.eval', async () => {
+    const evals = evalBacklog(100);
+    const broker = new WorkBroker([backlog(), evals], { shares: () => ({ eval: 3 }) });
+    const got = await serve(broker, 40);
+    expect(got.filter((c) => c === 'eval')).toHaveLength(20);
+    evals.close();
+  });
+
+  it('with shares.eval 0, serves evaluation only when no knowledge-base work waits for the slot', async () => {
+    const evals = evalBacklog(100);
+    const kb = backlog(25);
+    const broker = new WorkBroker([kb, evals], { shares: () => ({ eval: 0 }) });
+    const got = await serve(broker, 40);
+    expect(got.slice(0, 25)).toEqual(Array(25).fill('kb'));
+    expect(got.slice(25)).toEqual(Array(15).fill('eval'));
+    expect(broker.shares().eval).toBe(0);
+    evals.close();
+  });
+
+  it('serves a slot that names only evaluation kinds as before', async () => {
+    const evals = evalBacklog(3);
+    const broker = new WorkBroker([backlog(), evals], { shares: () => ({ eval: 0 }) });
+    const tasks = await Promise.all([1, 2, 3].map(() => broker.lease(slot, ['eval-call'], 1)));
+    expect(tasks.map((t) => t[0]?.class)).toEqual(['eval', 'eval', 'eval']);
+    const status = await broker.status();
+    expect(status.workers[0]).toMatchObject({ worker: 'box/codex#1', pool: null });
+    expect((status.kinds['eval-call'] as { leases: { class: string; pool: string | null }[] }).leases[0]).toMatchObject({ class: 'eval', pool: null });
+    evals.close();
+  });
 });

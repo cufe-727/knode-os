@@ -412,10 +412,12 @@ export interface RemoteApiConfig {
   offer?: { summarize?: boolean; judge?: boolean; translate?: boolean; embed?: boolean; session?: boolean; eval?: boolean };
   /**
    * How a slot that takes several kinds of work shares them: tasks handed out
-   * per kind, by weight (src/work/broker.ts). Default extraction 3, summaries 1.
-   * Judge calls go before either.
+   * per kind, by weight (src/work/broker.ts). Default extraction 3, summaries 1,
+   * translation 1, and an evaluation run's work 1 as one entry (docs/design/32
+   * §4; 0: only when no knowledge-base work waits for the slot). Judge calls
+   * go before all of them.
    */
-  shares?: { extract?: number; summarize?: number; translate?: number };
+  shares?: { extract?: number; summarize?: number; translate?: number; eval?: number };
   /** Longest a review waits for one judge call to be answered, here or remotely (default 20). */
   callDeadlineMinutes?: number;
   /**
@@ -1298,7 +1300,7 @@ export function defaultConfig(): KnodeConfig {
       mcp: { enabled: true, path: '/mcp' },
       remote: {
         enabled: true, maxBodyBytes: 8 * 1024 * 1024, leaseMinutes: 15,
-        offer: { summarize: true, judge: false, translate: true, embed: true, session: false, eval: false }, shares: { extract: 3, summarize: 1, translate: 1 }, callDeadlineMinutes: 20, judgeModels: [],
+        offer: { summarize: true, judge: false, translate: true, embed: true, session: false, eval: false }, shares: { extract: 3, summarize: 1, translate: 1, eval: 1 }, callDeadlineMinutes: 20, judgeModels: [],
         sessionOfferSeconds: 30, sessionWaitMinutes: 30,
         embedProbeCosine: 0.98,
       },

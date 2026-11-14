@@ -20,10 +20,11 @@ export const LLM_KINDS = ['extract', 'summarize', 'judge', 'translate'] as const
 export type LlmKind = (typeof LLM_KINDS)[number];
 
 /**
- * The kinds that share a slot by weight (`server.remote.shares`). The others
- * go first: a review is waiting on its judge calls, and a round has only a
- * bounded number of them; embed batches and sessions go only to slots that
- * take nothing else.
+ * The kinds that share a slot by weight (`server.remote.shares`), with
+ * evaluation work as one more entry (`shares.eval`, docs/design/32 §4). The
+ * others go first: a review is waiting on its judge calls, and a round has
+ * only a bounded number of them; embed batches and sessions go only to slots
+ * that take nothing else.
  */
 export const SHARED_KINDS = ['extract', 'summarize', 'translate'] as const;
 export type SharedKind = (typeof SHARED_KINDS)[number];

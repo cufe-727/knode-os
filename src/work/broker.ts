@@ -172,11 +172,18 @@ export interface WorkSource {
   stop(): Promise<void>;
 }
 
-export const DEFAULT_SHARES: Record<SharedKind, number> = { extract: 3, summarize: 1, translate: 1 };
+/**
+ * The weights a slot that takes several kinds shares them by: the shared
+ * knowledge-base kinds, and evaluation work as one class (docs/design/32 §4).
+ * `eval` 0: evaluation gets a turn only when no knowledge-base work waits.
+ */
+export type Shares = Record<SharedKind | 'eval', number>;
+
+export const DEFAULT_SHARES: Shares = { extract: 3, summarize: 1, translate: 1, eval: 1 };
 
 export interface BrokerOptions {
   /** Read on every lease: a settings save may change them. */
-  shares?: () => Partial<Record<SharedKind, number>> | undefined;
+  shares?: () => Partial<Shares> | undefined;
   /** Where answered calls are measured (src/estimate/ledger.ts). */
   ledger?: CallLedger | null;
 }
@@ -187,6 +194,9 @@ interface Issued {
   at: number;
   promptTokens: number;
 }
+
+/** What the broker weighs: a shared knowledge-base kind, or evaluation work as one class. */
+type Entry = SharedKind | 'eval';
 
 /** A lease nobody answered or released is forgotten after this long (a lapsed one is re-issued under a new id). */
 const ISSUED_TTL_MS = 6 * 3_600_000;
@@ -207,7 +217,7 @@ export interface WorkerStatus {
 }
 
 export interface WorkStatus {
-  shares: Record<SharedKind, number>;
+  shares: Shares;
   kinds: Partial<Record<WorkKind, SourceStatus>>;
   workers: WorkerStatus[];
 }
@@ -224,8 +234,8 @@ interface WorkerRecord {
 
 export class WorkBroker {
   private readonly sources = new Map<WorkKind, WorkSource>();
-  /** Tasks handed out per kind, each divided by its kind's weight: the lowest goes next. */
-  private readonly pass = new Map<WorkKind, number>();
+  /** Tasks handed out per kind (evaluation as one), each divided by its weight: the lowest goes next. */
+  private readonly pass = new Map<Entry, number>();
   private readonly workers = new Map<string, WorkerRecord>();
   private readonly issued = new Map<string, Issued>();
 
@@ -247,14 +257,17 @@ export class WorkBroker {
     return (this.sources.get(kind) ?? [...this.sources.values()][0])?.leaseDurationMs ?? 15 * 60_000;
   }
 
-  /** The weight of each shared kind, from the config, a missing or unusable one at its default. */
-  shares(): Record<SharedKind, number> {
+  /** The weight of each shared kind and of evaluation, from the config, a missing or unusable one at its default. */
+  shares(): Shares {
     const configured = this.opts.shares?.() ?? {};
     const out = { ...DEFAULT_SHARES };
     for (const kind of SHARED_KINDS) {
       const w = Number(configured[kind]);
       if (Number.isFinite(w) && w > 0) out[kind] = w;
     }
+    // evaluation may be 0: only when no knowledge-base work waits for the slot
+    const e = configured.eval === undefined ? NaN : Number(configured.eval);
+    if (Number.isFinite(e) && e >= 0) out.eval = e;
     return out;
   }
 
@@ -265,33 +278,54 @@ export class WorkBroker {
     return false;
   }
 
-  /** Up to `max` tasks of one of `kinds` for `who` — judge calls first, then a shared kind by share; empty when none has work. */
+  /**
+   * Up to `max` tasks of one of `kinds` for `who` — judge calls first (and
+   * the kinds only their own slots ask for), then the shared kinds and
+   * evaluation work by weight (docs/design/32 §4); empty when none has work.
+   */
   async lease(who: WorkerIdentity, kinds: readonly WorkKind[], max = 1, request?: LeaseRequest): Promise<WorkTask[]> {
     const wanted = WORK_KINDS.filter((k) => kinds.includes(k) && this.sources.has(k));
     this.seen(who, wanted);
     if (wanted.length === 0) return [];
-    for (const kind of wanted.filter((k) => !isSharedKind(k))) {
+    for (const kind of wanted.filter((k) => !isSharedKind(k) && !isEvalKind(k))) {
       const tasks = await this.sources.get(kind)!.lease(who, max, request);
       if (tasks.length) return this.issue(tasks);
     }
     const shares = this.shares();
-    // passes are sums of 1/weight, so a tie may differ in the last bits: within a hair, WORK_KINDS order decides
-    const order = wanted.filter(isSharedKind).sort((a, b) => {
+    const evalKinds = wanted.filter(isEvalKind);
+    // evaluation is one entry among the shared kinds, its kinds tried in WORK_KINDS order
+    const entries: Entry[] = [...wanted.filter(isSharedKind), ...(evalKinds.length && shares.eval > 0 ? ['eval' as const] : [])];
+    const rank = (e: Entry) => (e === 'eval' ? WORK_KINDS.length : WORK_KINDS.indexOf(e));
+    // passes are sums of 1/weight, so a tie may differ in the last bits: within a hair, WORK_KINDS order decides (evaluation last)
+    const order = entries.sort((a, b) => {
       const d = (this.pass.get(a) ?? 0) - (this.pass.get(b) ?? 0);
-      return Math.abs(d) > 1e-9 ? d : WORK_KINDS.indexOf(a) - WORK_KINDS.indexOf(b);
+      return Math.abs(d) > 1e-9 ? d : rank(a) - rank(b);
     });
-    const idle: SharedKind[] = [];
-    for (const kind of order) {
-      const tasks = await this.sources.get(kind)!.lease(who, max, request);
+    const take = async (entry: Entry): Promise<WorkTask[]> => {
+      if (entry !== 'eval') return this.sources.get(entry)!.lease(who, max, request);
+      for (const kind of evalKinds) {
+        const tasks = await this.sources.get(kind)!.lease(who, max, request);
+        if (tasks.length) return tasks;
+      }
+      return [];
+    };
+    const idle: Entry[] = [];
+    for (const entry of order) {
+      const tasks = await take(entry);
       if (tasks.length === 0) {
-        idle.push(kind);
+        idle.push(entry);
         continue;
       }
-      const at = this.pass.get(kind) ?? 0;
+      const at = this.pass.get(entry) ?? 0;
       // a kind that had nothing to give starts level with the one served, never behind it
       for (const k of idle) this.pass.set(k, Math.max(this.pass.get(k) ?? 0, at));
-      this.pass.set(kind, at + tasks.length / shares[kind]);
+      this.pass.set(entry, at + tasks.length / shares[entry]);
       return this.issue(tasks);
+    }
+    // `shares.eval` 0: evaluation only when no knowledge-base work waited for this slot
+    if (evalKinds.length && shares.eval <= 0) {
+      const tasks = await take('eval');
+      if (tasks.length) return this.issue(tasks);
     }
     return [];
   }
