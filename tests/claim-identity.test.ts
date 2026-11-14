@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { auditDuplicateClaims, claimPairId, datesApart, eventSpanEnd, monthsApart, yearlessMonthsOf } from '../src/graph/claim-dedupe.js';
-import { rekeyWeeklyReadings } from '../src/graph/claim-rekey.js';
+import { rekeyState, rekeyWeeklyReadings } from '../src/graph/claim-rekey.js';
 import { refreshClaimState } from '../src/graph/claim-state-store.js';
 import { RawExtractReply } from '../src/graph/llm-extract.js';
 import { claimId, isoWeekOf, readingWeek } from '../src/graph/store.js';
@@ -441,6 +441,8 @@ describe('a workspace written before weekly readings had ids', () => {
   it('never merges a new reading into an old claim of its week, and moves in bounded steps carrying decisions', async () => {
     const ctx = await build('legacy');
     opened.push(ctx);
+    // a database made by this code has nothing to move
+    expect(await rekeyState(ctx.store)).toEqual({ cursor: null, done: true });
     await asMainWroteIt(ctx);
     const live = async (statement: string) => ctx.store.query<{ id: string; evidence_count: number; canonical_id: string | null }>(
       `SELECT id, evidence_count, canonical_id FROM claims WHERE statement = $1 AND tx_to IS NULL ORDER BY valid_from`, [statement],
