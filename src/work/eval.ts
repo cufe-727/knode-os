@@ -5,9 +5,10 @@ import { classifyFailure, FailureKind } from '../labeling/failures.js';
 import { CompleteResult, SessionAnswer, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
 import type { CallUsage } from '../llm/usage.js';
 import { readCodexEvents } from '../llm/usage.js';
-import { EvalAgent, EvalCallWorkTask, EvalSessionWorkTask, noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
+import { EvalAgent, EvalCallWorkTask, EvalSessionWorkTask, LeaseRequest, noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
 import { isArchiveId } from './eval-archive.js';
-import type { EvalKind } from './kinds.js';
+import { isEvalKind } from './kinds.js';
+import type { EvalKind, WorkKind } from './kinds.js';
 
 /**
  * An evaluation run's model work as leased work (docs/design/27 §8).
@@ -244,8 +245,15 @@ export function evalSessionFailure(answer: Pick<EvalSessionAnswer, 'exitCode' | 
 export class EvalSource implements WorkSource {
   private readonly pending: Pending[] = [];
   private readonly leases = new Map<string, EvalLease>();
-  /** Who asked for this kind lately: slot → what it is and when. */
-  private readonly asked = new Map<string, EvalSlotSeen & { at: number }>();
+  /** Who asked for this kind lately: slot → what it is, the evaluation kinds it takes, and when. */
+  private readonly asked = new Map<string, EvalSlotSeen & { kinds: EvalKind[]; at: number }>();
+  /** This source and the other evaluation kind's: a slot online for one is online for each kind it takes. */
+  private peers: EvalSource[] = [this];
+
+  /** Share who is online between the sources of the two evaluation kinds. */
+  static link(sources: EvalSource[]): void {
+    for (const s of sources) s.peers = sources;
+  }
   private readonly totals: EvalStatus['totals'] = { offered: 0, answered: 0, stuck: 0, failed: noFailures(), leasesExpired: 0 };
   private readonly leaseMs: number;
   private readonly retryMs: number;
@@ -279,8 +287,24 @@ export class EvalSource implements WorkSource {
   /** Every slot that asked for this kind within `withinMs`, or holds one of its leases now (a slot at work asks nothing). */
   slotsOnline(withinMs = this.onlineMs): EvalSlotSeen[] {
     const since = Date.now() - withinMs;
-    const busy = new Set([...this.leases.values()].filter((l) => !l.pending.done).map((l) => l.who.worker));
-    return [...this.asked.values()].filter((s) => s.at >= since || busy.has(s.worker)).map(({ at: _at, ...s }) => s);
+    // a slot asked of either source, or holds a lease of either, for every evaluation kind it takes
+    const busy = new Set(this.peers.flatMap((p) => [...p.leases.values()].filter((l) => !l.pending.done).map((l) => l.who.worker)));
+    const seen = new Map<string, EvalSlotSeen & { kinds: EvalKind[]; at: number }>();
+    for (const p of this.peers) {
+      for (const s of p.asked.values()) {
+        const had = seen.get(s.worker);
+        seen.set(s.worker, had ? { ...(had.at >= s.at ? had : s), kinds: [...new Set([...had.kinds, ...s.kinds])], at: Math.max(had.at, s.at) } : s);
+      }
+    }
+    return [...seen.values()].filter((s) => s.kinds.includes(this.kind) && (s.at >= since || busy.has(s.worker))).map(({ at: _at, kinds: _kinds, ...s }) => s);
+  }
+
+  /** A slot asked for work it takes, `kinds` among it (the broker calls this for each kind a slot asks for). */
+  noteAsked(who: WorkerIdentity, kinds: readonly WorkKind[] = [this.kind]): void {
+    const family = evalFamilyOf(who.backend);
+    if (!family) return;
+    const evalKinds = kinds.filter(isEvalKind);
+    this.asked.set(who.worker, { worker: who.worker, family, local: !who.remote, run: who.run ?? null, pool: who.pool ?? null, kinds: evalKinds.length ? evalKinds : [this.kind], at: Date.now() });
   }
 
   /** A run's pieces here: waiting for a slot, or out with one. */
@@ -341,11 +365,11 @@ export class EvalSource implements WorkSource {
     return this.pending.some((p) => !p.done && p.spec.kind === 'eval-session' && p.spec.archive?.sha256 === sha256);
   }
 
-  async lease(who: WorkerIdentity, max = 1): Promise<WorkTask[]> {
+  async lease(who: WorkerIdentity, max = 1, request?: LeaseRequest): Promise<WorkTask[]> {
     if (this.closed || max < 1) return [];
     const family = evalFamilyOf(who.backend);
     if (!family) return [];
-    this.asked.set(who.worker, { worker: who.worker, family, local: !who.remote, run: who.run ?? null, pool: who.pool ?? null, at: Date.now() });
+    this.noteAsked(who, request?.kinds ?? this.asked.get(who.worker)?.kinds ?? [this.kind]);
     this.sweep();
     const now = Date.now();
     // a machine that could not serve a piece gets it again only when nothing else waits for it
@@ -634,6 +658,7 @@ export class EvalWork {
   constructor(rootDataDir: string, opts: EvalSourceOptions & { sessionLeaseMs?: number } = {}) {
     this.calls = new EvalSource('eval-call', opts);
     this.sessions = new EvalSource('eval-session', { ...opts, leaseMs: opts.sessionLeaseMs ?? opts.leaseMs });
+    EvalSource.link([this.calls, this.sessions]);
     this.archives = new EvalArchives(rootDataDir);
   }
 

@@ -107,6 +107,7 @@ export class OwnQueue implements EvalQueue {
   constructor(opts: EvalSourceOptions = {}) {
     this.calls = new EvalSource('eval-call', opts);
     this.sessions = new EvalSource('eval-session', opts);
+    EvalSource.link([this.calls, this.sessions]);
     this.broker = new WorkBroker([this.calls, this.sessions]);
   }
 

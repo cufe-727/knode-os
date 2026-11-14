@@ -151,6 +151,8 @@ export interface LeaseRequest {
   calibration?: string;
   /** The slot embeds on lent keys, and its token may hold them (§4.2). */
   lentKeys?: boolean;
+  /** Every kind the slot asked for in this request (the broker fills it in): a slot online for one evaluation kind is for each it takes. */
+  kinds?: readonly WorkKind[];
 }
 
 /** What every source reports about its leases; the rest of its status is its own. */
@@ -168,6 +170,8 @@ export interface WorkSource {
   release(taskIds: string[], who: WorkerIdentity): Promise<number>;
   /** Whether a task id is one of this source's leases, live or lately expired. */
   holds(taskId: string): boolean;
+  /** A slot asked for this kind, among `kinds`, whichever source the broker serves it from. */
+  noteAsked?(who: WorkerIdentity, kinds: readonly WorkKind[]): void;
   status(): Promise<SourceStatus>;
   stop(): Promise<void>;
 }
@@ -287,6 +291,9 @@ export class WorkBroker {
     const wanted = WORK_KINDS.filter((k) => kinds.includes(k) && this.sources.has(k));
     this.seen(who, wanted);
     if (wanted.length === 0) return [];
+    // a slot that asks for a kind is online for it, even when another kind it takes is what it gets
+    for (const k of wanted) this.sources.get(k)!.noteAsked?.(who, wanted);
+    request = { ...request, kinds: wanted };
     for (const kind of wanted.filter((k) => !isSharedKind(k) && !isEvalKind(k))) {
       const tasks = await this.sources.get(kind)!.lease(who, max, request);
       if (tasks.length) return this.issue(tasks);

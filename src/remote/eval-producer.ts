@@ -180,8 +180,9 @@ export function mountEvalProducer(app: Hono<any>, deps: EvalProducerDeps): void 
     const b = await json(c);
     const who = slotOf(b);
     const kinds = Array.isArray(b.kinds) ? b.kinds.filter(isEvalKind) : [];
+    for (const kind of kinds) deps.work.source(kind).noteAsked(who, kinds);
     for (const kind of kinds) {
-      const tasks = await deps.work.source(kind).lease(who, 1);
+      const tasks = await deps.work.source(kind).lease(who, 1, { kinds });
       if (tasks.length) return c.json({ tasks });
     }
     return c.json({ tasks: [] });

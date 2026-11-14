@@ -19,7 +19,7 @@ import { writeReport } from '../src/eval/report.js';
 import type { WorkerIdentity } from '../src/labeling/scheduler.js';
 import { WorkBroker } from '../src/work/broker.js';
 import type { WorkSource, WorkTask } from '../src/work/broker.js';
-import { EvalSource } from '../src/work/eval.js';
+import { EvalSource, EvalWork } from '../src/work/eval.js';
 import type { EvalCallSpec, EvalSpec } from '../src/work/eval.js';
 import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
 
@@ -564,5 +564,29 @@ describe('the judge and a stuck piece', () => {
     const items = Array.from({ length: 4 }, (_, i) => ({ id: `i${i}`, question: 'q', reference: 'r', answer: 'a' }));
     await expect(judge.gradeAnswers(items)).rejects.toBeInstanceOf(PieceStuckError);
     expect(calls).toBe(1);
+  });
+});
+
+describe('online, across kinds', () => {
+  it('counts a slot busy with calls as online for the sessions it also takes, and a Claude slot for calls only', async () => {
+    const work = new EvalWork(tmp, { onlineMs: 150, retryMs: 0 });
+    const broker = new WorkBroker(work.sources);
+    for (let i = 0; i < 20; i++) work.calls.offer({ ...callSpec(), run: 'online', key: `piece-online-${String(i).padStart(3, '0')}`, pool: null } as EvalSpec);
+    const codex: WorkerIdentity = { worker: 'laptop/w/eval-codex#1', backend: 'codex', remote: true };
+    const claude: WorkerIdentity = { worker: 'laptop/w/eval-claude#1', backend: 'claude', remote: true };
+    // the Codex slot asks for both kinds, and calls keep it busy: it never reaches the session source
+    for (let i = 0; i < 3; i++) {
+      const [t] = await broker.lease(codex, ['eval-call', 'eval-session'], 1);
+      expect(t.kind).toBe('eval-call');
+      await broker.complete(t.id, codex, { ok: true, text: 'x' });
+    }
+    await broker.lease(claude, ['eval-call'], 1);
+    expect(work.sessions.slotsOnline().map((x) => x.worker)).toEqual([codex.worker]);
+    expect(work.calls.slotsOnline().map((x) => x.worker).sort()).toEqual([claude.worker, codex.worker].sort());
+    // holding a call past the online window, it still counts for sessions
+    await broker.lease(codex, ['eval-call', 'eval-session'], 1);
+    await sleep(250);
+    expect(work.sessions.slotsOnline().map((x) => x.worker)).toEqual([codex.worker]);
+    work.close();
   });
 });
