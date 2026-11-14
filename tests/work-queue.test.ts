@@ -8,6 +8,11 @@ import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { runAgentHere, setAgentStopping } from '../src/eval/agent.js';
 import { OwnQueue, PieceStuckError, queueRunId, RemoteEval, RunCancelledError, ServeRefusedError, WaitLimitError } from '../src/eval/remote.js';
 import { retryableFailure } from '../src/eval/shim.js';
+import { QuotaGuard } from '../src/eval/quota.js';
+import { Judge } from '../src/eval/judge.js';
+import { Meter } from '../src/eval/meter.js';
+import { isRefusal } from '../src/estimate/ledger.js';
+import type { LlmClient } from '../src/llm/client.js';
 import { eachWithin, runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
 import { writeReport } from '../src/eval/report.js';
@@ -534,5 +539,30 @@ describe('serve as the run sees it', () => {
     expect(await remote.archive(tmp)).toEqual({ sha256: 'a'.repeat(64), bytes: 1 });
     expect(tries).toBe(3);
     remote.close();
+  });
+});
+
+describe('the judge and a stuck piece', () => {
+  const stuckPiece = (lastError: string) => new PieceStuckError({ kind: 'eval-call', label: 'judge', family: 'claude', model: 'm', eligible: 'any', pool: null, system: '__judge__', task: null, workers: ['a', 'b', 'c'], lastError, at: '' });
+
+  it('does not wait out a stuck piece whose last error reads as a usage limit', async () => {
+    let slept = 0;
+    const guard = new QuotaGuard({ enabled: false, sleep: async () => void slept++ });
+    const err = stuckPiece("You've hit your usage limit. Try again later.");
+    expect(isRefusal(err.message)).toBe(true);
+    await expect(guard.retryRefused(async () => { throw err; }, 72)).rejects.toBe(err);
+    expect(slept).toBe(0);
+  });
+
+  it('does not take a stuck or cancelled piece for an unparsable reply', async () => {
+    let calls = 0;
+    const client = { label: 'j', model: 'j', completeJson: async () => {
+      calls++;
+      throw stuckPiece('the reply was not json');
+    } } as unknown as LlmClient;
+    const judge = new Judge({ client, meter: new Meter(), quota: new QuotaGuard({ enabled: false, sleep: async () => {} }) });
+    const items = Array.from({ length: 4 }, (_, i) => ({ id: `i${i}`, question: 'q', reference: 'r', answer: 'a' }));
+    await expect(judge.gradeAnswers(items)).rejects.toBeInstanceOf(PieceStuckError);
+    expect(calls).toBe(1);
   });
 });

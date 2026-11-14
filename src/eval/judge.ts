@@ -96,6 +96,8 @@ export class Judge {
         this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: true, replayed: false, usage, ...where });
       } catch (err) {
         this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: false, replayed: false, usage, ...where });
+        // a stuck or cancelled piece is no reply at all, whatever its message says
+        if ((err as { final?: boolean } | null)?.final) throw err;
         if (!(err instanceof SyntaxError) && !/json/i.test(err instanceof Error ? err.message : String(err))) throw err;
         if (group.length > 1) {
           const half = Math.ceil(group.length / 2);
