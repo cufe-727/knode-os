@@ -203,6 +203,11 @@ describe('the dates a claim states of itself', () => {
     expect(datesApart(event('2025-08-25T00:00:00Z'), week('2025-08-27', '2025-08-29T23:59:59Z'))).toBe(false);
     expect(datesApart(event('2025-07-01T00:00:00Z'), week('2025-08-01', '2025-08-31T23:59:59Z'))).toBe(false);
     expect(datesApart(event('2025-09-08T00:00:00Z'), week('2025-10-13', '2025-10-17T23:59:59Z'))).toBe(true);
+    // two sources dating one figure a day apart: the judge's, not two times
+    const day = (d: string) => week(`${d}T00:00:00Z`, `${d}T23:59:59.999Z`);
+    expect(datesApart(day('2025-04-08'), day('2025-04-09'))).toBe(false);
+    expect(datesApart(event('2025-04-08T00:00:00Z'), event('2025-04-09T00:00:00Z'))).toBe(false);
+    expect(datesApart(day('2025-04-08'), day('2025-04-10'))).toBe(true);
     // a date only the document gives is not the claim's own
     expect(datesApart({ ...none }, week('2025-01-06', '2025-01-10T23:59:59Z'))).toBe(false);
   });

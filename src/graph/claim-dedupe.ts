@@ -564,13 +564,20 @@ export function ownSpan(c: Pick<ClaimLite, 'valid_from' | 'valid_to' | 'event_at
  * The times the two claims state of themselves are both known and do not
  * meet: a validity window, or an event read as wide as its date allows
  * (ownSpan). A date only the document gives is not the claim's own and
- * settles nothing here (reportedApart reads those). Exported for tests.
+ * settles nothing here (reportedApart reads those), and two single days side
+ * by side are left to the judge. Exported for tests.
  */
 export function datesApart(a: Pick<ClaimLite, 'valid_from' | 'valid_to' | 'event_at'>, b: Pick<ClaimLite, 'valid_from' | 'valid_to' | 'event_at'>): boolean {
   const sa = ownSpan(a);
   const sb = ownSpan(b);
   if (!sa || !sb) return false;
-  return Boolean((sa[1] && sa[1] < sb[0]) || (sb[1] && sb[1] < sa[0]));
+  const [first, second] = sa[0] <= sb[0] ? [sa, sb] : [sb, sa];
+  if (!first[1] || first[1] >= second[0]) return false;
+  // two single days side by side are how two sources date one figure (published on the 8th,
+  // reported on the 9th): too near to call two times without the judge
+  const days = (x: [string, string | null]) => (Date.parse(x[1] ?? x[0]) - Date.parse(x[0])) / DAY_MS;
+  const gap = (Date.parse(second[0]) - Date.parse(first[1])) / DAY_MS;
+  return !(gap < 1 && days(first) < 1 && days(second) < 1);
 }
 
 /** A year a statement names, which periodsOf reads instead. */
