@@ -213,6 +213,59 @@ describe('generated pages in search results', () => {
   });
 });
 
+describe('the graph channel with generated pages', () => {
+  // No chunk text holds the query and no chunk has a vector: only the graph channel answers. Thirty
+  // pages mention both entities the question names, six reports mention one — every page outweighs
+  // every report, and the channel's 24 candidates were pages.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-generated-graph-'));
+  let graph: Store;
+  const pages = Array.from({ length: 30 }, (_, i) => `g${String(i + 1).padStart(2, '0')}`);
+  const reports = ['r1', 'r2', 'r3', 'r4', 'r5', 'r6'];
+
+  beforeAll(async () => {
+    fs.mkdirSync(path.join(dir, '.knode'), { recursive: true });
+    graph = await Store.open(dir, embedder.dimensions);
+    await graph.indexing;
+    const add = async (id: string, file: string, root: string, kind: string) => {
+      await graph.query(`INSERT INTO documents (id, path, root, kind, title, sha256, bytes, status) VALUES ($1, $2, $3, $4, $1, $5, 10, 'indexed')`, [`d-${id}`, file, root, kind, `sha-${id}`]);
+      await graph.query(`INSERT INTO chunks (id, document_id, seq, content, token_count, tsv) VALUES ($1, $2, 0, $3, 3, to_tsvector('simple', $3))`, [id, `d-${id}`, `Field notes ${id}.`]);
+    };
+    for (const id of pages) await add(id, `wiki/entities/${id}.md`, 'wiki', 'view');
+    for (const id of reports) await add(id, `raw/docs/${id}.md`, 'docs', 'source');
+    const entity = async (id: string, name: string, chunks: string[]) => {
+      await graph.query(`INSERT INTO entities (id, name, type, mention_count) VALUES ($1, $2, 'concept', $3)`, [id, name, chunks.length]);
+      await graph.query(`INSERT INTO entity_alias_keys (entity_id, alias_key) VALUES ($1, $2)`, [id, name.toLowerCase()]);
+      for (const c of chunks) await graph.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id) VALUES ($1, $2, $3)`, [id, c, `d-${c}`]);
+    };
+    await entity('e-kestrel', 'Kestrel', [...pages, ...reports]);
+    await entity('e-borealis', 'Borealis', pages);
+  });
+
+  afterAll(async () => {
+    if (graph) await graph.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('lists the chunks of sources that mention the named entities beside the pages that do', async () => {
+    const results = await search(graph, embedder, 'Kestrel and Borealis', { k: 8, track: false, current: false, explain: true });
+    const found = results.map((r) => r.chunkId);
+    // the two best pages by id, where the channel ranks them, then the six reports by id
+    expect(found).toEqual(['g01', 'g02', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6']);
+    // one list by the channel's own weight: a report ranks behind all 24 pages listed, not behind the two shown
+    expect(results.map((r) => r.ranks?.graph)).toEqual([1, 2, 25, 26, 27, 28, 29, 30]);
+    expect(results[0].signals.graph!).toBeGreaterThan(results[2].signals.graph!);
+    expect(new Set(results.slice(2).map((r) => r.signals.graph)).size).toBe(1);
+  });
+
+  it('lists 24 of each side at most, and the pages alone when pages are asked for', async () => {
+    const wide = await search(graph, embedder, 'Kestrel and Borealis', { k: 40, track: false, current: false, generatedShare: 1 });
+    // a search for 40 asks each side for 120: all thirty pages and the six reports
+    expect(wide).toHaveLength(36);
+    const views = await search(graph, embedder, 'Kestrel and Borealis', { k: 8, track: false, current: false, filter: resolveScopeFilter({ kinds: ['view'] }) });
+    expect(views.map((r) => r.chunkId)).toEqual(pages.slice(0, 8));
+  });
+});
+
 describe('the rerank stage with generated pages', () => {
   let server: http.Server;
   let base = '';
