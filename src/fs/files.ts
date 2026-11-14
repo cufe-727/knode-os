@@ -288,6 +288,44 @@ export interface GrepMatch {
 const GREP_ROOTS = ['wiki', RAW_DOCS, RAW_SKILLS, PACKS_DIR, RAW_CODEBASE];
 const MAX_GREP_FILE_BYTES = 2 * 1024 * 1024;
 
+/** A folder holding matches, when a grep answer leaves some of them out. */
+export interface GrepFolder {
+  path: string;
+  /** Matching lines in the folder's own files. */
+  matches: number;
+  /** Its files that hold a match. */
+  files: number;
+  /** How many of its matching lines the answer shows. */
+  shown: number;
+}
+
+export interface GrepResult {
+  matches: GrepMatch[];
+  /** Matching lines in all, shown or not. */
+  total: number;
+  /** When matches were left out: every folder holding matches, in the order searched. */
+  folders?: GrepFolder[];
+}
+
+/**
+ * Each amount's share of `budget`: water-filling, so every amount under an
+ * even share is met whole and the larger ones split what is left evenly.
+ */
+export function shareEvenly(amounts: number[], budget: number): number[] {
+  const out = new Array<number>(amounts.length).fill(0);
+  let remaining = budget;
+  let left = amounts.length;
+  for (const i of amounts.map((_, i) => i).sort((a, b) => amounts[a] - amounts[b] || a - b)) {
+    const share = Math.floor(remaining / left);
+    out[i] = Math.min(amounts[i], share);
+    remaining -= out[i];
+    left--;
+  }
+  return out;
+}
+
+const folderOf = (file: string) => (file.includes('/') ? file.slice(0, file.lastIndexOf('/')) : '');
+
 /**
  * grep-style regex search over the knowledge files (agents get grep/ls/read
  * alongside native SQL — the "filesystem view" of the logical database).
@@ -295,19 +333,47 @@ const MAX_GREP_FILE_BYTES = 2 * 1024 * 1024;
  * Originals whose text knode-os derived (PDFs, images) are searched through
  * the Markdown in their sidecar and reported under the original's path; the
  * rest of the sidecar tree (extraction JSON, usage stats) is never a target.
+ *
+ * Every file is counted before any match is taken. When there are more
+ * matches than `maxMatches`, the places are shared evenly over the folders
+ * that hold matches, and in a folder over its files (a folder or file with
+ * fewer matches than its share is shown whole), and `folders` says how many
+ * each folder holds. Taking matches as the walk met them filled the answer
+ * from the first folder: /平台组/ over the ten divisions' reports returned 39
+ * of 40 matches from 七部平台组, and an agent answered for that division.
  */
-export function grepFiles(
+export function grepSearch(
   dataDir: string,
   pattern: string,
-  opts: { path?: string; maxMatches?: number; ignoreCase?: boolean } = {},
-): GrepMatch[] {
-  const maxMatches = Math.min(opts.maxMatches ?? 100, 500);
+  opts: { paths?: string[]; maxMatches?: number; maxPerFile?: number; ignoreCase?: boolean } = {},
+): GrepResult {
+  const maxMatches = Math.max(1, Math.min(opts.maxMatches ?? 100, 500));
+  const perFile = Math.max(1, opts.maxPerFile ?? maxMatches);
   const re = new RegExp(pattern, opts.ignoreCase === false ? '' : 'i');
-  const explicit = opts.path ? opts.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') : undefined;
-  if (explicit !== undefined && (hasSidecarSegment(explicit) || isPrivatePath(explicit))) return [];
-  const roots = explicit !== undefined ? [explicit] : GREP_ROOTS;
-  const out: GrepMatch[] = [];
+  const roots: string[] = [];
+  for (const raw of opts.paths?.length ? opts.paths : [undefined]) {
+    if (raw === undefined) roots.push(...GREP_ROOTS);
+    else {
+      const explicit = raw.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+      if (!hasSidecarSegment(explicit) && !isPrivatePath(explicit)) roots.push(explicit);
+    }
+  }
 
+  /** The lines of `read` that match, as far as `stop` of them; all of them counted. */
+  const scan = (read: string, stop: number): { count: number; lines: { line: number; text: string }[] } => {
+    const lines = fs.readFileSync(safePath(dataDir, read), 'utf8').split('\n');
+    const found: { line: number; text: string }[] = [];
+    let count = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (!re.test(lines[i])) continue;
+      if (count++ < stop) found.push({ line: i + 1, text: lines[i].trim().slice(0, 300) });
+    }
+    return { count, lines: found };
+  };
+
+  // every file holding a match, in the order searched, with how many lines match
+  const files: { read: string; report: string; count: number }[] = [];
+  const seen = new Set<string>();
   for (const root of roots) {
     const rootAbs = safePath(dataDir, root);
     if (!fs.existsSync(rootAbs)) continue;
@@ -321,20 +387,52 @@ export function grepFiles(
       if (!isTextFile(key) && fs.existsSync(safePath(dataDir, derived))) targets.push({ read: derived, report: key });
     }
     for (const target of targets) {
-      // a walk from the root passes the config too
-      if (isPrivatePath(target.read)) continue;
-      const abs = safePath(dataDir, target.read);
-      if (fs.statSync(abs).size > MAX_GREP_FILE_BYTES) continue;
-      const lines = fs.readFileSync(abs, 'utf8').split('\n');
-      for (let i = 0; i < lines.length; i++) {
-        if (re.test(lines[i])) {
-          out.push({ path: target.report, line: i + 1, text: lines[i].trim().slice(0, 300) });
-          if (out.length >= maxMatches) return out;
-        }
-      }
+      // a walk from the root passes the config too; two subtrees asked for may overlap
+      if (isPrivatePath(target.read) || seen.has(target.report)) continue;
+      seen.add(target.report);
+      if (fs.statSync(safePath(dataDir, target.read)).size > MAX_GREP_FILE_BYTES) continue;
+      const { count } = scan(target.read, 0);
+      if (count > 0) files.push({ ...target, count });
     }
   }
-  return out;
+
+  const total = files.reduce((n, f) => n + f.count, 0);
+  const byFolder = new Map<string, number[]>();
+  files.forEach((f, i) => (byFolder.get(folderOf(f.report)) ?? byFolder.set(folderOf(f.report), []).get(folderOf(f.report))!).push(i));
+  const folders = [...byFolder.entries()];
+  const offered = files.map((f) => Math.min(f.count, perFile));
+  const take = new Array<number>(files.length).fill(0);
+  const folderShares = shareEvenly(folders.map(([, members]) => members.reduce((n, i) => n + offered[i], 0)), maxMatches);
+  folders.forEach(([, members], at) => {
+    const shares = shareEvenly(members.map((i) => offered[i]), folderShares[at]);
+    members.forEach((i, j) => (take[i] = shares[j]));
+  });
+
+  const matches: GrepMatch[] = [];
+  files.forEach((f, i) => {
+    if (take[i] === 0) return;
+    for (const m of scan(f.read, take[i]).lines) matches.push({ path: f.report, line: m.line, text: m.text });
+  });
+  if (matches.length >= total) return { matches, total };
+  return {
+    matches,
+    total,
+    folders: folders.map(([folder, members]) => ({
+      path: folder,
+      matches: members.reduce((n, i) => n + files[i].count, 0),
+      files: members.length,
+      shown: members.reduce((n, i) => n + take[i], 0),
+    })),
+  };
+}
+
+/** `grepSearch` under one path, its matches alone. */
+export function grepFiles(
+  dataDir: string,
+  pattern: string,
+  opts: { path?: string; maxMatches?: number; ignoreCase?: boolean } = {},
+): GrepMatch[] {
+  return grepSearch(dataDir, pattern, { paths: opts.path ? [opts.path] : undefined, maxMatches: opts.maxMatches, ignoreCase: opts.ignoreCase }).matches;
 }
 
 /** Recursively list files (relative posix paths) under a directory inside dataDir. */
