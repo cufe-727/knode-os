@@ -26,6 +26,7 @@ import { decodeVectors, EmbedSource } from '../work/embed.js';
 import { ASKED_ONLY_KINDS, isWorkKind, WORK_KINDS, WorkKind } from '../work/kinds.js';
 import { SessionSource } from '../work/session.js';
 import { EvalSource } from '../work/eval.js';
+import { POOL_RE } from './eval-producer.js';
 import { isArchiveId } from '../work/eval-archive.js';
 import { answerSessionMcp, describeMcpRequest, withKeepalive } from './session-mcp.js';
 import { RemoteScope, RemoteTokenRecord, RemoteTokenStore, tokenAllows, tokenAllowsKind } from './tokens.js';
@@ -353,11 +354,17 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
     const source = b.source('embed');
     return source instanceof EmbedSource ? source : null;
   };
-  const whoOf = (c: Context<RemoteEnv>, body: Record<string, unknown>): WorkerIdentity => ({
-    worker: `${c.get('token').name}/${text(body.worker || 'worker', 80)}`,
-    backend: text(body.backend || 'unknown', 80),
-    remote: true,
-  });
+  // a worker's pool (docs/design/32 §2): the one it declares (`--pool`), else its token's name
+  const whoOf = (c: Context<RemoteEnv>, body: Record<string, unknown>): WorkerIdentity => {
+    const declared = typeof body.pool === 'string' ? body.pool.trim() : '';
+    if (declared && !POOL_RE.test(declared)) throw new HttpError(400, 'pool must be a name: letters, digits, ".", "_" and "-", at most 64');
+    return {
+      worker: `${c.get('token').name}/${text(body.worker || 'worker', 80)}`,
+      backend: text(body.backend || 'unknown', 80),
+      remote: true,
+      pool: declared || c.get('token').name,
+    };
+  };
   const body = async (c: Context<RemoteEnv>): Promise<Record<string, unknown>> => {
     const parsed = await c.req.json().catch(() => null);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new HttpError(400, 'expected a JSON object');

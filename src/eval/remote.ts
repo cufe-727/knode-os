@@ -49,11 +49,12 @@ import type { ChatBackend, ChatRequest, ChatResult } from './shim.js';
 
 export type RemoteOutcome = EvalOutcome | { outcome: 'unreachable'; error: string };
 
-/** A run's own slot as the queue knows it: its name, its CLI, its run. */
+/** A run's own slot as the queue knows it: its name, its CLI, its run, its pool. */
 export interface LocalSlotIdentity {
   name: string;
   family: EvalFamily;
   run: string;
+  pool: string;
 }
 
 export type LocalOutcome = { ok: true } | { ok: false; error: string };
@@ -83,7 +84,7 @@ export interface EvalQueue {
   close(): void;
 }
 
-const localWho = (who: LocalSlotIdentity): WorkerIdentity => ({ worker: `local/${who.run}/${who.name}`, backend: who.family, remote: false, run: who.run });
+const localWho = (who: LocalSlotIdentity): WorkerIdentity => ({ worker: `local/${who.run}/${who.name}`, backend: who.family, remote: false, run: who.run, pool: who.pool });
 
 /** The run's own broker, in its own process: no remote worker can reach it, the run's own slots lease from it. */
 export class OwnQueue implements EvalQueue {
@@ -209,20 +210,20 @@ export class ServeQueue implements EvalQueue {
   }
 
   async lease(who: LocalSlotIdentity, kinds: EvalKind[]): Promise<WorkTask[]> {
-    const r = await this.post<{ tasks?: WorkTask[] }>('slots/lease', { worker: who.name, family: who.family, run: who.run, kinds });
+    const r = await this.post<{ tasks?: WorkTask[] }>('slots/lease', { worker: who.name, family: who.family, run: who.run, pool: who.pool, kinds });
     return r.tasks ?? [];
   }
 
   async complete(who: LocalSlotIdentity, id: string, outcome: LocalOutcome): Promise<void> {
-    await this.post('slots/complete', { worker: who.name, family: who.family, run: who.run, id, ...(outcome.ok ? { ok: true, text: '' } : { ok: false, error: outcome.error, kind: 'model' }) });
+    await this.post('slots/complete', { worker: who.name, family: who.family, run: who.run, pool: who.pool, id, ...(outcome.ok ? { ok: true, text: '' } : { ok: false, error: outcome.error, kind: 'model' }) });
   }
 
   async renew(who: LocalSlotIdentity, ids: string[]): Promise<void> {
-    await this.post('slots/renew', { worker: who.name, family: who.family, run: who.run, ids });
+    await this.post('slots/renew', { worker: who.name, family: who.family, run: who.run, pool: who.pool, ids });
   }
 
   async release(who: LocalSlotIdentity, ids: string[]): Promise<void> {
-    await this.post('slots/release', { worker: who.name, family: who.family, run: who.run, ids });
+    await this.post('slots/release', { worker: who.name, family: who.family, run: who.run, pool: who.pool, ids });
   }
 
   async cancelRun(run: string): Promise<void> {
@@ -241,6 +242,12 @@ export interface RemoteEvalOptions {
   refreshMs?: number;
   /** How often a run's own slot renews the lease of a piece it runs (default 20 s). */
   renewMs?: number;
+  /**
+   * The pool every piece of the run requires (`eval run --pool`, docs/design/32
+   * §2); the run's own slots are in it too. Absent: pieces take any slot that
+   * meets them, and the run's own slots are pool `local`.
+   */
+  pool?: string | null;
   /**
    * How long a piece may wait while no slot online meets its requirements
    * before the run stops (default 30; 0: no limit). Fractions are minutes too.
@@ -262,14 +269,15 @@ interface Requirement {
   family: EvalFamily;
   model: string;
   eligible: EvalEligible;
+  pool: string | null;
 }
 
-const requirementKey = (r: Requirement) => `${r.kind}|${r.family}|${r.model}|${r.eligible}`;
+const requirementKey = (r: Requirement) => `${r.kind}|${r.family}|${r.model}|${r.eligible}|${r.pool ?? ''}`;
 
 /** A requirement in words: what a run waits for. */
-export function describeRequirement(r: Pick<Requirement, 'family' | 'model' | 'eligible'> & { kind?: EvalKind }): string {
+export function describeRequirement(r: Pick<Requirement, 'family' | 'model' | 'eligible' | 'pool'> & { kind?: EvalKind }): string {
   const what = r.kind === 'eval-session' ? 'an agent session' : r.kind === 'eval-call' ? 'a model call' : 'work';
-  return `${what} on ${r.family}${r.model ? ` ${r.model}` : ''} (${r.eligible === 'local' ? "this machine's slots only" : 'any slot'})`;
+  return `${what} on ${r.family}${r.model ? ` ${r.model}` : ''} in ${r.pool ? `pool ${r.pool}` : 'any pool'}${r.eligible === 'local' ? ", on this machine's slots only" : ''}`;
 }
 
 /** A piece three different workers could not serve, as the run reports it. */
@@ -279,6 +287,7 @@ export interface StuckPiece {
   family: EvalFamily;
   model: string;
   eligible: EvalEligible;
+  pool: string | null;
   /** The system and task it was for (a build's: no task; the judge's: `__judge__`). */
   system: string | null;
   task: string | null;
@@ -435,8 +444,19 @@ export class RemoteEval {
     if (this.abort.signal.aborted) return 0;
     const own = LOCAL_KINDS[family].includes(kind) ? this.local[family] : 0;
     const slots = this.queue.slotsNow?.() ?? this.status?.slots;
-    const others = (slots?.[kind] ?? []).filter((s) => s.family === family && !s.run && (eligible === 'any' || s.local));
+    const pool = this.pool;
+    const others = (slots?.[kind] ?? []).filter((s) => s.family === family && !s.run && (!pool || s.pool === pool) && (eligible === 'any' || s.local));
     return own + others.length;
+  }
+
+  /** The pool every piece of the run requires, or null. */
+  get pool(): string | null {
+    return this.opts.pool || null;
+  }
+
+  /** The pool the run's own slots are in. */
+  get localPool(): string {
+    return this.opts.pool || 'local';
   }
 
   /** Start the run's own slots: they lease from the queue like a worker's, and run a piece with the run's backends. */
@@ -445,7 +465,7 @@ export class RemoteEval {
       const n = Math.max(0, Math.trunc(slots[family] ?? 0));
       for (let i = 1; i <= n; i++) {
         this.local[family]++;
-        this.loops.push(this.slot({ name: `eval-${family}#${this.local[family]}`, family, run: this.run }));
+        this.loops.push(this.slot({ name: `eval-${family}#${this.local[family]}`, family, run: this.run, pool: this.localPool }));
       }
     }
   }
@@ -454,14 +474,14 @@ export class RemoteEval {
    * Publish one piece and wait for what becomes of it. `exec` is how the
    * run's own slot does it; a worker does it from the spec.
    */
-  async publish<T>(spec: Omit<EvalCallSpec, 'run' | 'key'> | Omit<EvalSessionSpec, 'run' | 'key'>, exec: () => Promise<T>, tag: PieceTag | null = currentPieceTag()): Promise<Published<T>> {
+  async publish<T>(spec: Omit<EvalCallSpec, 'run' | 'key' | 'pool'> | Omit<EvalSessionSpec, 'run' | 'key' | 'pool'>, exec: () => Promise<T>, tag: PieceTag | null = currentPieceTag()): Promise<Published<T>> {
     if (this.abort.signal.aborted) throw new RunCancelledError();
     const key = randomKey();
     const entry: Entry = { exec };
     this.entries.set(key, entry);
     this.counts.published++;
-    const full = { ...spec, run: this.opts.run, key } as EvalSpec;
-    const requirement: Requirement = { kind: spec.kind, family: spec.agent.family, model: spec.agent.model, eligible: spec.eligible };
+    const full = { ...spec, run: this.opts.run, key, pool: this.pool } as EvalSpec;
+    const requirement: Requirement = { kind: spec.kind, family: spec.agent.family, model: spec.agent.model, eligible: spec.eligible, pool: this.pool };
     const rk = requirementKey(requirement);
     const held = this.outstanding.get(rk) ?? { requirement, n: 0 };
     held.n++;
@@ -492,7 +512,7 @@ export class RemoteEval {
         this.unreachableSaid = false;
         // three different workers could not serve it: reported, left unanswered, and the run goes on with the rest
         const piece: StuckPiece = {
-          kind: spec.kind, label: spec.label, family: spec.agent.family, model: spec.agent.model, eligible: spec.eligible,
+          kind: spec.kind, label: spec.label, family: spec.agent.family, model: spec.agent.model, eligible: spec.eligible, pool: this.pool,
           system: tag?.system ?? null, task: tag?.task ?? null, workers: o.workers, lastError: o.lastError, at: new Date().toISOString(),
         };
         this.stuck.push(piece);

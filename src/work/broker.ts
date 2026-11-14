@@ -3,7 +3,7 @@ import { ChatMessage } from '../llm/client.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { FailureKind } from '../labeling/failures.js';
 import { CompleteResult, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
-import { isEvalKind, isSharedKind, LlmKind, SHARED_KINDS, SharedKind, WORK_KINDS, WorkKind } from './kinds.js';
+import { classOf, isEvalKind, isSharedKind, LlmKind, SHARED_KINDS, SharedKind, WorkClass, WORK_KINDS, WorkKind } from './kinds.js';
 
 /**
  * The work broker — every kind of leased work behind one lease protocol
@@ -42,6 +42,14 @@ interface TaskBase {
   /** What the task is about, for a worker's log: a document's path, with the part for a segment. */
   label: string;
   leaseExpiresAt: string;
+  /** `kb` or `eval` (docs/design/32 §2); the broker sets it on every task it hands out. */
+  class?: WorkClass;
+  /** The CLI, model, effort and speed the task must run on; null for a kind that runs on a slot's own route. */
+  requires?: EvalAgent | null;
+  /** Only a slot of this pool may take it; absent or null: any slot that meets `requires`. */
+  pool?: string | null;
+  /** `local`: only a slot on this machine may take it. */
+  eligible?: 'any' | 'local';
 }
 
 /** A model call: extraction, a summary, a judge call, a translation. */
@@ -187,6 +195,8 @@ export interface WorkerStatus {
   worker: string;
   backend: string;
   remote: boolean;
+  /** The pool its worker declared (docs/design/32 §2), null for `serve`'s own slots. */
+  pool: string | null;
   /** The kinds it asked for last. */
   kinds: WorkKind[];
   lastSeen: string;
@@ -205,6 +215,7 @@ export interface WorkStatus {
 interface WorkerRecord {
   backend: string;
   remote: boolean;
+  pool: string | null;
   kinds: WorkKind[];
   lastSeen: number;
   ok: number;
@@ -333,7 +344,7 @@ export class WorkBroker {
       shares: this.shares(),
       kinds,
       workers: [...this.workers.entries()].map(([worker, w]) => ({
-        worker, backend: w.backend, remote: w.remote, kinds: [...w.kinds], lastSeen: new Date(w.lastSeen).toISOString(),
+        worker, backend: w.backend, remote: w.remote, pool: w.pool, kinds: [...w.kinds], lastSeen: new Date(w.lastSeen).toISOString(),
         leased: leased.get(worker) ?? 0, ok: w.ok, failed: w.failed,
       })),
     };
@@ -346,8 +357,9 @@ export class WorkBroker {
 
   /* ------------------------------ internals ------------------------------ */
 
-  /** Note when each task went out, and how big its prompt was, for the ledger. */
-  private issue(tasks: WorkTask[]): WorkTask[] {
+  /** Note when each task went out, and how big its prompt was, for the ledger; every task says its class, requirements and eligibility. */
+  private issue(issued: WorkTask[]): WorkTask[] {
+    const tasks = issued.map((t) => ({ class: classOf(t.kind), requires: null, eligible: 'any' as const, ...t }) as WorkTask);
     if (!this.opts.ledger) return tasks;
     const now = Date.now();
     for (const [id, i] of this.issued) if (now - i.at > ISSUED_TTL_MS) this.issued.delete(id);
@@ -395,7 +407,7 @@ export class WorkBroker {
   }
 
   private seen(who: WorkerIdentity, kinds: WorkKind[]): void {
-    const record = this.workers.get(who.worker) ?? { backend: who.backend, remote: who.remote, kinds, lastSeen: 0, ok: 0, failed: 0 };
+    const record = this.workers.get(who.worker) ?? { backend: who.backend, remote: who.remote, pool: who.pool ?? null, kinds, lastSeen: 0, ok: 0, failed: 0 };
     record.kinds = kinds;
     this.workers.set(who.worker, record);
     this.touch(who);
@@ -406,6 +418,7 @@ export class WorkBroker {
     if (!record) return;
     record.backend = who.backend;
     record.remote = who.remote;
+    record.pool = who.pool ?? null;
     record.lastSeen = Date.now();
   }
 }

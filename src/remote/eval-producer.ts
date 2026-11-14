@@ -67,6 +67,8 @@ function agentOf(v: unknown): EvalAgent {
 
 const RUN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/;
 const KEY_RE = /^[A-Za-z0-9_-]{8,64}$/;
+/** A pool's name (docs/design/32 §2): a worker's `--pool`, a token's name, or `local`. */
+export const POOL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 /** A spec as the run sent it, checked field by field. */
 export function evalSpecOf(body: Record<string, unknown>): EvalSpec {
@@ -76,19 +78,21 @@ export function evalSpecOf(body: Record<string, unknown>): EvalSpec {
   const key = text(s.key, 64);
   if (!KEY_RE.test(key)) throw new BadSpec('spec.key must be the run\'s key for the piece');
   const eligible = s.eligible === 'local' ? 'local' : 'any';
+  const pool = s.pool == null || s.pool === '' ? null : text(s.pool, 64);
+  if (pool !== null && !POOL_RE.test(pool)) throw new BadSpec('spec.pool must name a pool');
   const label = text(s.label, 300);
   const timeoutMs = Math.min(MAX_TIMEOUT_MS, Math.max(1_000, Math.trunc(Number(s.timeoutMs) || 15 * 60_000)));
   if (eligible === 'local') {
     // only the run's own slots take it, and they run it from the run's own copy: nothing here is executed
     const agent = agentOf({ ...(s.agent as object ?? {}), model: String((s.agent as Record<string, unknown> | undefined)?.model ?? '') || 'default' });
-    if (s.kind === 'eval-call') return { kind: 'eval-call', run, key, eligible, label, agent, prompt: '', schema: null, timeoutMs };
+    if (s.kind === 'eval-call') return { kind: 'eval-call', run, key, eligible, pool, label, agent, prompt: '', schema: null, timeoutMs };
     if (s.kind !== 'eval-session') throw new BadSpec('spec.kind must be eval-call or eval-session');
-    return { kind: 'eval-session', run, key, eligible, label, agent, sandbox: s.sandbox === 'workspace-write' ? 'workspace-write' : 'read-only', maxSteps: 1, timeoutMs, prompt: '', archive: null, mcp: null };
+    return { kind: 'eval-session', run, key, eligible, pool, label, agent, sandbox: s.sandbox === 'workspace-write' ? 'workspace-write' : 'read-only', maxSteps: 1, timeoutMs, prompt: '', archive: null, mcp: null };
   }
   const agent = agentOf(s.agent);
   if (typeof s.prompt !== 'string' || !s.prompt.trim()) throw new BadSpec('spec.prompt required');
   if (s.kind === 'eval-call') {
-    return { kind: 'eval-call', run, key, eligible, label, agent, prompt: s.prompt, schema: s.schema ?? null, timeoutMs };
+    return { kind: 'eval-call', run, key, eligible, pool, label, agent, prompt: s.prompt, schema: s.schema ?? null, timeoutMs };
   }
   if (s.kind !== 'eval-session') throw new BadSpec('spec.kind must be eval-call or eval-session');
   if (agent.family !== 'codex') throw new BadSpec('eval sessions run on codex');
@@ -110,7 +114,7 @@ export function evalSpecOf(body: Record<string, unknown>): EvalSpec {
     if (secret.length < 16) throw new BadSpec('spec.mcp.secret required');
     mcp = { url, secret, tools };
   }
-  return { kind: 'eval-session', run, key, eligible, label, agent, sandbox: 'read-only', maxSteps, timeoutMs, prompt: s.prompt, archive, mcp };
+  return { kind: 'eval-session', run, key, eligible, pool, label, agent, sandbox: 'read-only', maxSteps, timeoutMs, prompt: s.prompt, archive, mcp };
 }
 
 /** A run's pieces in both sources. */
@@ -162,7 +166,9 @@ export function mountEvalProducer(app: Hono<any>, deps: EvalProducerDeps): void 
     if (!EVAL_FAMILIES.includes(family)) throw new BadSpec(`family must be ${EVAL_FAMILIES.join(' or ')}`);
     const name = text(b.worker, 80);
     if (!/^[A-Za-z0-9][A-Za-z0-9._#-]{0,79}$/.test(name)) throw new BadSpec('worker must name the slot');
-    return { worker: `local/${run}/${name}`, backend: family, remote: false, run };
+    const pool = b.pool == null || b.pool === '' ? 'local' : text(b.pool, 64);
+    if (!POOL_RE.test(pool)) throw new BadSpec('pool must name a pool');
+    return { worker: `local/${run}/${name}`, backend: family, remote: false, run, pool };
   };
   const json = async (c: Context) => {
     const b = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;

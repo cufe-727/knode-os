@@ -493,4 +493,23 @@ describe('a run that waits for workers (docs/design/32 §3)', () => {
     expect(again.stuck).toBe(0);
     expect(new RunStore(runDir).allAnswers().map((a) => a.worker)).toEqual(['laptop/wd']);
   }, 120_000);
+
+  it('gives a run that names a pool only to workers of that pool', async () => {
+    await stopAll();
+    startWorker('wp', {}, 'codex:2,claude:1', ['--pool', 'gateway']);
+    startWorker('wq', {}, 'codex:2,claude:1');
+    await until(async () => (await status()).online['eval-call'].codex >= 4);
+    const res = await runEval({ ...common, packs: [packDir], systems: ['closed-book'], runDir: path.join(runs, 'pooled'), remote: remoteOpts(), pool: 'gateway' });
+    const store = new RunStore(res.runDir);
+    expect(new Set(store.allAnswers().map((a) => a.worker))).toEqual(new Set(['laptop/wp']));
+    expect(new Set(store.allScores().filter((x) => x.worker).map((x) => x.worker))).toEqual(new Set(['laptop/wp']));
+    // a worker that declares no pool is in its token's
+    const byToken = await runEval({ ...common, packs: [packDir], systems: ['closed-book'], runDir: path.join(runs, 'pooled-token'), remote: remoteOpts(), pool: 'laptop', skipScoring: true });
+    expect(new Set(new RunStore(byToken.runDir).allAnswers().map((a) => a.worker))).toEqual(new Set(['laptop/wq']));
+    // and a pool nobody is in waits, then stops naming it
+    const err = await runEval({ ...common, packs: [packDir], systems: ['closed-book'], runDir: path.join(runs, 'pooled-none'), remote: remoteOpts(), pool: 'nowhere', waitMinutes: 0.03, waitCheckMs: 50 }).catch((e) => e);
+    expect(err).toBeInstanceOf(WaitLimitError);
+    expect(err.message).toMatch(/a model call on codex gpt-test in pool nowhere/);
+  }, 120_000);
 });
+

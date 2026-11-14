@@ -219,3 +219,49 @@ describe('cancelled sessions', () => {
     }
   });
 });
+
+describe('what a task requires', () => {
+  const spec = (over: Partial<EvalSpec> = {}): EvalSpec => ({ ...callSpec(), run: 'req', key: 'piece-req-00001', pool: null, ...over }) as EvalSpec;
+  const who = (over: Partial<WorkerIdentity> = {}): WorkerIdentity => ({ worker: 'laptop/w/eval-codex#1', backend: 'codex', remote: true, ...over });
+
+  it('hands a task out with its class, requirements, pool and eligibility', async () => {
+    const source = new EvalSource('eval-call');
+    const offer = source.offer(spec({ pool: 'gateway' }));
+    const [task] = await source.lease(who({ pool: 'gateway' }), 1);
+    expect(task).toMatchObject({ kind: 'eval-call', class: 'eval', requires: { family: 'codex', model: 'gpt-test' }, pool: 'gateway', eligible: 'any', key: 'piece-req-00001' });
+    offer.cancel();
+    source.close();
+  });
+
+  it('never gives a piece that requires pool A to a slot of pool B, or of none', async () => {
+    const source = new EvalSource('eval-call');
+    const offer = source.offer(spec({ pool: 'A' }));
+    expect(await source.lease(who({ pool: 'B' }), 1)).toEqual([]);
+    expect(await source.lease(who({ pool: undefined }), 1)).toEqual([]);
+    expect(await source.lease(who({ worker: 'box/eval-codex#1', remote: false, pool: 'B' }), 1)).toEqual([]);
+    expect(await source.lease(who({ backend: 'claude', pool: 'A' }), 1)).toEqual([]);
+    expect(await source.lease(who({ pool: 'A' }), 1)).toHaveLength(1);
+    offer.cancel();
+    source.close();
+  });
+
+  it('never lets eligible: local work leave this machine', async () => {
+    const source = new EvalSource('eval-call');
+    const offer = source.offer(spec({ eligible: 'local' }));
+    expect(await source.lease(who(), 1)).toEqual([]);
+    // nor to another run's own slots: they run their run's backends
+    expect(await source.lease(who({ worker: 'local/other/eval-codex#1', remote: false, run: 'other' }), 1)).toEqual([]);
+    expect(await source.lease(who({ worker: 'local/req/eval-codex#1', remote: false, run: 'req' }), 1)).toHaveLength(1);
+    offer.cancel();
+    source.close();
+  });
+
+  it('puts a run\'s own slots in its pool, and names the pool it waited for', async () => {
+    const err = await runEval({ ...common(), runDir: path.join(tmp, 'runs', 'pool-wait'), local: {}, pool: 'gateway', waitMinutes: 0.02 }).catch((e) => e);
+    expect(err).toBeInstanceOf(WaitLimitError);
+    expect(err.message).toMatch(/a model call on codex in pool gateway, on this machine's slots only/);
+    // the run's own slots join its pool, so they take its pieces
+    const res = await runEval({ ...common(), runDir: path.join(tmp, 'runs', 'pool-wait'), local: { codex: 1, claude: 1 }, pool: 'gateway' });
+    expect(new RunStore(res.runDir).allAnswers()).toHaveLength(3);
+  }, 60_000);
+});

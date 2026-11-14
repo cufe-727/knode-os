@@ -48,5 +48,16 @@ export function isEvalKind(value: unknown): value is EvalKind {
   return typeof value === 'string' && (EVAL_KINDS as readonly string[]).includes(value);
 }
 
+/**
+ * What a task is for (docs/design/32 D5): the knowledge base's own work, or
+ * an evaluation run's. It decides order (`server.remote.shares.eval`),
+ * reporting, and which settings bound it.
+ */
+export type WorkClass = 'kb' | 'eval';
+
+export function classOf(kind: WorkKind): WorkClass {
+  return isEvalKind(kind) ? 'eval' : 'kb';
+}
+
 /** Kinds a slot gets only when it names them: an LLM slot that names no kinds takes none of these. */
 export const ASKED_ONLY_KINDS: readonly WorkKind[] = ['embed', 'session', 'eval-call', 'eval-session'];

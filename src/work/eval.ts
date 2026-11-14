@@ -55,6 +55,8 @@ export interface EvalCallSpec {
   key: string;
   /** `local`: leased only to a slot on this machine (a pack with private sources, a backend only the run has). */
   eligible: EvalEligible;
+  /** Only a slot of this pool takes it (`eval run --pool`); null: any slot that meets `agent`. */
+  pool: string | null;
   label: string;
   agent: EvalAgent;
   prompt: string;
@@ -67,6 +69,7 @@ export interface EvalSessionSpec {
   run: string;
   key: string;
   eligible: EvalEligible;
+  pool: string | null;
   label: string;
   agent: EvalAgent;
   /** Only a read-only session may go to another machine; a run's own slots also run the llm-wiki builder's. */
@@ -112,6 +115,10 @@ export interface EvalSessionBinding {
 export interface EvalLeaseStatus {
   id: string;
   kind: EvalKind;
+  class: 'eval';
+  /** The pool the piece requires (null: any) and the one its slot is in. */
+  pool: string | null;
+  workerPool: string | null;
   worker: string;
   backend: string;
   remote: boolean;
@@ -130,6 +137,8 @@ export interface EvalSlotSeen {
   local: boolean;
   /** A run's own slot takes only that run's pieces. */
   run: string | null;
+  /** The pool its worker declared; null for a slot that declared none. */
+  pool: string | null;
 }
 
 /** One run's pieces as the source holds them. */
@@ -187,11 +196,14 @@ const MAX_STDOUT_BYTES = 32 * 1024 * 1024;
 const ONLINE_MS = 2 * 60_000;
 
 /**
- * Whether a slot may take a piece: its CLI, a piece that must stay on this
- * machine only to a slot here, and a run's own slot only its run's pieces.
+ * Whether a slot may take a piece (docs/design/32 §2): its CLI (the model,
+ * effort and speed the slot runs as the piece says, and a reply from another
+ * model is the slot's failure), the piece's pool, a piece that must stay on
+ * this machine only to a slot here, and a run's own slot only its run's pieces.
  */
 export function takes(who: WorkerIdentity, family: EvalFamily, spec: EvalSpec): boolean {
   if (spec.agent.family !== family) return false;
+  if (spec.pool && spec.pool !== who.pool) return false;
   if (spec.eligible === 'local' && who.remote) return false;
   if (who.run && spec.run !== who.run) return false;
   return true;
@@ -331,7 +343,7 @@ export class EvalSource implements WorkSource {
     if (this.closed || max < 1) return [];
     const family = evalFamilyOf(who.backend);
     if (!family) return [];
-    this.asked.set(who.worker, { worker: who.worker, family, local: !who.remote, run: who.run ?? null, at: Date.now() });
+    this.asked.set(who.worker, { worker: who.worker, family, local: !who.remote, run: who.run ?? null, pool: who.pool ?? null, at: Date.now() });
     this.sweep();
     const now = Date.now();
     // a machine that could not serve a piece gets it again only when nothing else waits for it
@@ -349,7 +361,10 @@ export class EvalSource implements WorkSource {
     this.leases.set(lease.id, lease);
     p.lease = lease.id;
     this.log(`eval ${p.spec.kind === 'eval-call' ? 'call' : 'session'} ${p.spec.run} ${p.spec.label} → ${who.worker} (${evalBackend(p.spec.agent)})`);
-    const base = { id: lease.id, label: `${p.spec.run} · ${p.spec.label}`.slice(0, 200), leaseExpiresAt: new Date(lease.expiresAt).toISOString(), run: p.spec.run, key: p.spec.key, agent: { ...p.spec.agent } };
+    const base = {
+      id: lease.id, label: `${p.spec.run} · ${p.spec.label}`.slice(0, 200), leaseExpiresAt: new Date(lease.expiresAt).toISOString(), run: p.spec.run, key: p.spec.key,
+      agent: { ...p.spec.agent }, class: 'eval' as const, requires: { ...p.spec.agent }, pool: p.spec.pool, eligible: p.spec.eligible,
+    };
     if (p.spec.kind === 'eval-call') {
       const task: EvalCallWorkTask = { ...base, kind: 'eval-call', prompt: p.spec.prompt, schema: p.spec.schema ?? null, timeoutMs: p.spec.timeoutMs };
       return [task];
@@ -465,7 +480,7 @@ export class EvalSource implements WorkSource {
     return {
       waiting: this.pending.filter((p) => p.lease === null).length,
       leases: [...this.leases.values()].map((l) => ({
-        id: l.id, kind: this.kind, worker: l.who.worker, backend: l.who.backend, remote: l.who.remote,
+        id: l.id, kind: this.kind, class: 'eval' as const, pool: l.pending.spec.pool, workerPool: l.who.pool ?? null, worker: l.who.worker, backend: l.who.backend, remote: l.who.remote,
         run: l.pending.spec.run, label: l.pending.spec.label, model: evalBackend(l.pending.spec.agent),
         ageSeconds: Math.round((now - l.issuedAt) / 1000), expiresInSeconds: Math.round((l.expiresAt - now) / 1000),
       })),

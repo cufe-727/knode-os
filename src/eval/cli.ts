@@ -76,6 +76,13 @@ function waitMinutesOption(opts: { waitMinutes?: string; offerSeconds?: string }
   return n;
 }
 
+/** `--pool` (docs/design/32 §2): a name a worker can declare. */
+function poolOption(opts: { pool?: string }): string | undefined {
+  if (opts.pool === undefined) return undefined;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(opts.pool)) throw new Error('--pool: a name of letters, digits, ".", "_" and "-" (at most 64)');
+  return opts.pool;
+}
+
 /** A run the wait limit stopped: its report so far, the message, and a non-zero exit. */
 async function waitedOut(run: typeof runEval, opts: Parameters<typeof runEval>[0]): Promise<Awaited<ReturnType<typeof runEval>> | null> {
   try {
@@ -225,6 +232,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--serve-url <url>', 'with --remote: serve\'s origin on this machine (default: from the data root\'s config)')
     .option('--offer-seconds <s>', 'no longer applies: a piece waits until a slot takes it (see --wait-minutes)')
     .option('--wait-minutes <n>', 'stop the run cleanly (non-zero, resumable) when a piece has waited this long while no slot online takes it; 0 = no limit', '30')
+    .option('--pool <name>', "every piece of the run requires this pool: only workers started with --pool <name> (default: their token's name) take it, and this run's --local slots, which join it")
     .option('--repeat <n>', 'answer each task n times, for run-to-run variance (repeat 1 keeps the usual record keys)', '1')
     .option('--repeat-systems <list>', 'with --repeat: only these systems (default: every system that answers)')
     .action(async (opts) => {
@@ -233,6 +241,7 @@ export function registerEvalCommands(program: Command): void {
         remote,
         ...localOption(opts),
         waitMinutes: waitMinutesOption(opts),
+        pool: poolOption(opts),
         repeat: Number(opts.repeat),
         repeatSystems: csv(opts.repeatSystems),
         packs: csv(opts.pack)!.map(resolvePack),
@@ -319,10 +328,11 @@ export function registerEvalCommands(program: Command): void {
     .option('--slots <n>', 'old command lines: with neither --remote nor --local, the judge runs here on that many slots (default 6)')
     .option('--offer-seconds <s>', 'no longer applies: a call waits until a slot takes it (see --wait-minutes)')
     .option('--wait-minutes <n>', 'stop cleanly (non-zero) when a call has waited this long while no slot online takes it; 0 = no limit', '30')
+    .option('--pool <name>', 'the judge\'s calls require this pool (workers started with --pool <name>, and --local slots)')
     .action(async (runDir: string, opts) => {
       let n: number;
       try {
-        n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts) });
+        n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts), pool: poolOption(opts) });
       } catch (err) {
         if (!(err instanceof WaitLimitError)) throw err;
         console.error(`\n${err.message}`);

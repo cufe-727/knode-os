@@ -170,6 +170,12 @@ export interface RunOptions {
   waitMinutes?: number;
   /** Tests: how often waiting is checked (the log comes every twelve checks). */
   waitCheckMs?: number;
+  /**
+   * The pool every piece of the run requires (docs/design/32 §2): only a slot
+   * of it takes them, the run's own slots included (they are in it). Absent:
+   * any slot that meets a piece; the run's own slots are pool `local`.
+   */
+  pool?: string;
   onProgress?: (msg: string) => void;
 }
 
@@ -360,7 +366,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   // the run stops on its caller's cancel, on a signal, or when it has waited its limit for a slot: whatever it stopped is not recorded
   const stop = new AbortController();
   const waiting = {
-    waitMinutes: opts.waitMinutes ?? 30, checkMs: opts.waitCheckMs, logEveryMs: opts.waitCheckMs ? opts.waitCheckMs * 12 : undefined, onStop: () => stop.abort(),
+    pool: opts.pool, waitMinutes: opts.waitMinutes ?? 30, checkMs: opts.waitCheckMs, logEveryMs: opts.waitCheckMs ? opts.waitCheckMs * 12 : undefined, onStop: () => stop.abort(),
     onStuck: (piece: import('./remote.js').StuckPiece) => store.log('piece stuck', { ...piece }),
   };
   let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run: runId, quota, log: queueLog, ...waiting }) : null;
@@ -777,7 +783,7 @@ function where(p: Placed | null): { worker?: string; backend?: string } {
  * its records and the packs it names — with no model of its own running, so
  * only while the run itself is stopped.
  */
-export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number } = {}): Promise<number> {
+export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
   const store = new RunStore(runDir);
   const meta = store.meta();
   if (!meta) throw new Error(`not a run directory: ${runDir}`);
@@ -799,7 +805,7 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
   const placement = runPlacement(opts, family);
   if (placement.legacy) log(`work: no --remote and no --local: the judge runs on this machine, on --local ${describeLocal(placement.local!)} (sized from --slots)`);
   const run = `${meta.id}-score`;
-  const waiting = { waitMinutes: opts.waitMinutes ?? 30, checkMs: opts.waitCheckMs, logEveryMs: opts.waitCheckMs ? opts.waitCheckMs * 12 : undefined };
+  const waiting = { pool: opts.pool, waitMinutes: opts.waitMinutes ?? 30, checkMs: opts.waitCheckMs, logEveryMs: opts.waitCheckMs ? opts.waitCheckMs * 12 : undefined };
   let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run, quota, log, ...waiting }) : null;
   if (opts.remote && !remote) log(`work: serve is not answering: scoring publishes to a broker of its own${placement.local ? '' : ', and with no --local nothing takes its calls'}`);
   remote ??= RemoteEval.own({ run, quota, log, ...waiting });

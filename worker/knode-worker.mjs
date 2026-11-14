@@ -48,6 +48,9 @@
 // kept by its SHA-256 (in KNODE_EVAL_CACHE_DIR, default the temp folder) and unpacked fresh for each session; an
 // agent with knode's tools reaches the run's tools at <server>/remote/v1/w/<workspace>/eval-sessions/<id>/mcp with a
 // token of the session's own. Its stdout goes back with each renewal (--session-renew-ms) and is parsed by the run.
+// --pool <name> (default: the token's name; docs/design/32 §2) is the pool this worker's slots are in: a run started
+// with `eval run --pool <name>` publishes work only slots of that pool take, so a benchmark that must stay on one
+// backend names it once instead of a wrapper on each worker.
 //
 // Kinds of work (--kinds extract,summarize,judge,translate; default: every kind the server offers this token):
 //   extract    extraction segments, answered with a JSON object
@@ -103,6 +106,10 @@ const server = String(args.server ?? process.env.KNODE_SERVER ?? '').replace(/\/
 const workspace = String(args.workspace ?? process.env.KNODE_WORKSPACE ?? '');
 const token = (args.tokenFile ? fs.readFileSync(String(args.tokenFile), 'utf8') : process.env.KNODE_TOKEN ?? '').trim();
 const workerName = String(args.name ?? process.env.KNODE_WORKER_NAME ?? os.hostname());
+// the pool every slot of this worker declares; none given, the server takes the token's name
+const poolName = String(args.pool ?? process.env.KNODE_POOL ?? '').trim();
+if (poolName && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(poolName)) throw new Error('--pool: a name of letters, digits, ".", "_" and "-" (at most 64)');
+const poolField = poolName ? { pool: poolName } : {};
 const timeoutMs = Number(args.timeoutMs ?? 600_000);
 const sessionSpec = String(args.sessions ?? process.env.KNODE_SESSIONS ?? '');
 const evalSpec = String(args.eval ?? process.env.KNODE_EVAL ?? '');
@@ -777,6 +784,7 @@ function onPath(bin) {
 if (args.check) {
   const { data } = await call('GET', `${server}/remote/v1/whoami`);
   log(`token ${data.name} (${data.id}): scopes ${data.scopes?.join(', ')}${data.kinds ? ` (work: ${data.kinds.join(', ')})` : ''}; workspaces ${data.workspaces?.join(', ')}`);
+  log(`pool ${poolName || data.name}${poolName ? '' : ' (the token\'s name; --pool names another)'}: work a run publishes for another pool is not leased here`);
   await readWorkConfig();
   log(`${workspace}: ${describeKinds()}`);
   if (work) {
@@ -849,7 +857,7 @@ function describeTask(task) {
 }
 
 async function slot(backend, n) {
-  const identity = { worker: `${workerName}/${backend.name}#${n}`, backend: backend.impl.label(null) };
+  const identity = { worker: `${workerName}/${backend.name}#${n}`, backend: backend.impl.label(null), ...poolField };
   let idleRounds = 0;
   while (!stopping) {
     const pause = backend.health.pausedUntil - Date.now();
@@ -930,7 +938,7 @@ async function slot(backend, n) {
 
 /** An embed slot: lease a batch, embed it on the own endpoint, hand back the raw vectors. */
 async function embedSlot(backend, n) {
-  const identity = { worker: `${workerName}/embed#${n}`, backend: backend.impl.label() };
+  const identity = { worker: `${workerName}/embed#${n}`, backend: backend.impl.label(), ...poolField };
   let idleRounds = 0;
   while (!stopping) {
     const pause = Math.max(backend.health.pausedUntil, embedParkedUntil) - Date.now();
@@ -1156,7 +1164,7 @@ function runSessionProcess(cmd, argv, stdin, cwd, env, timeout, onStdout) {
 
 /** A session slot: lease a session for this CLI, run it, stream its output back, hand back how it ended. */
 async function sessionSlot(slot, n) {
-  const identity = { worker: `${workerName}/session-${slot.family}#${n}`, backend: slot.family };
+  const identity = { worker: `${workerName}/session-${slot.family}#${n}`, backend: slot.family, ...poolField };
   let idleRounds = 0;
   while (!stopping) {
     const pause = slot.health.pausedUntil - Date.now();
@@ -1488,7 +1496,7 @@ function evalSessionCommand(sess, cwd, out, pinned) {
 
 /** An eval slot: lease the run's calls (and, on codex, its sessions), run each, hand back the raw result. */
 async function evalSlot(slot, n) {
-  const identity = { worker: `${workerName}/eval-${slot.family}#${n}`, backend: slot.family };
+  const identity = { worker: `${workerName}/eval-${slot.family}#${n}`, backend: slot.family, ...poolField };
   const kindsHere = evalKindsFor(slot.family);
   let idleRounds = 0;
   while (!stopping) {
@@ -1715,7 +1723,7 @@ for (;;) {
     if (stopping) process.exit(0);
   }
 }
-log(`knode worker ${workerName} → ${server} ${workspace}: ${[...backends.map((b) => `${b.name} × ${b.slots}`), ...sessionSlots.map((s) => `research sessions on ${s.family} × ${s.slots}`), ...evalSlots.map((s) => `evaluation work on ${s.family} × ${s.slots}`)].join(', ')} (run ${crypto.randomUUID().slice(0, 8)})`);
+log(`knode worker ${workerName} → ${server} ${workspace}: ${[...backends.map((b) => `${b.name} × ${b.slots}`), ...sessionSlots.map((s) => `research sessions on ${s.family} × ${s.slots}`), ...evalSlots.map((s) => `evaluation work on ${s.family} × ${s.slots}`)].join(', ')}${poolName ? `, pool ${poolName}` : ''} (run ${crypto.randomUUID().slice(0, 8)})`);
 log(`${workspace}: ${describeKinds()}`);
 if (args.extractFirst) log('extract-first enabled: summaries wait for the extraction queue and in-flight work to drain');
 const llmSlots = backends.some((b) => b.name !== 'embed');
