@@ -278,12 +278,19 @@ export function claimId(subjectId: string, statement: string, at?: string | null
   return crypto.createHash('sha256').update(`${subjectId}|${normalized}${at ? `|@${at}` : ''}`).digest('hex').slice(0, 24);
 }
 
-/** "This week", the one period a weekly report's statements are relative to. */
-const THIS_WEEK = /本周|当周|\bthis week\b/i;
+/**
+ * A week relative to the report's own: this week (本周, 当周), last week (上周,
+ * 上上周) or N weeks ago (两周前, 3周前) — what a weekly report says its figures
+ * are of, and what its 回顾 section restates ("两周前周活跃用户为131万"). The
+ * source's own date for the claim then says which week that is.
+ */
+export const RELATIVE_WEEK = /本周|当周|上上?周|[一两二三四五六七八九十\d]{1,2}\s*(?:个)?周前|\b(?:this|last) week\b|\b\d{1,2} weeks ago\b/i;
+/** The words of RELATIVE_WEEK, for a LIKE filter in SQL: every claim RELATIVE_WEEK takes contains one. */
+export const RELATIVE_WEEK_WORDS = ['本周', '当周', '上周', '周前', 'this week', 'last week', 'weeks ago'];
 
 /**
  * Any other time a statement names: a year (2025年, 2025, FY25, 去年), a quarter
- * or half (Q3, 3Q25, 三季度, H1, 上半年), a week (W37, 第24周, 上周, 两周前), a month
+ * or half (Q3, 3Q25, 三季度, H1, 上半年), a week (W37, 第24周, 下周, 两周后), a month
  * (6月, 六月, March, 本月 — not a tenor: 3月期), a date (18日, 18号 — not 7日年化,
  * 3号线, 5日均线) or a day word (今日, 昨天). A statement that names one is not a
  * reading of this week, whatever else it says.
@@ -291,7 +298,7 @@ const THIS_WEEK = /本周|当周|\bthis week\b/i;
 const OTHER_TIME = new RegExp([
   String.raw`\d{4}\s*年|(?<![\d.])(?:19|20)\d{2}(?![\d.%])|\bfy\s*'?\d{2,4}|[去今明前]年|年[初中底末]`,
   String.raw`\bq[1-4]\b|q[1-4](?=\s*\d|[^a-z]|$)|(?<![\d.])[1-4]\s*q|[一二三四1-4]\s*季度|[上下本]季度|\bh[12]\b|h[12](?=[^a-z]|$)|(?<![\d.])[12]\s*h(?=\d|[^a-z]|$)|[上下]半年`,
-  String.raw`\bw\d{1,2}\b|w\d{1,2}(?=[^\d]|$)|第\s*\d{1,3}\s*周|[上下]{1,2}周|[两三四\d]+\s*周[前后]`,
+  String.raw`\bw\d{1,2}\b|w\d{1,2}(?=[^\d]|$)|第\s*\d{1,3}\s*周|下下?周|[一两二三四五六七八九十\d]{1,2}\s*(?:个)?周后`,
   String.raw`\d{1,2}\s*月(?!期)|[一二三四五六七八九十]{1,2}月(?!期)|[上下本]月|月[初中底末]|\b(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec)\b`,
   String.raw`(?<![\d.])\d{1,2}\s*[日号](?![均年线])|[今昨明前]日|[今昨明前]天`,
 ].join('|'), 'i');
@@ -311,8 +318,9 @@ export function isoWeekOf(iso: string): string {
  *
  * A reading is what the weekly reports of the 10× benchmark (2026-11-14) showed
  * folding together — 603 of 1,440 weekly metric values had become one claim with
- * another week's: a number on an attribute, in a statement relative to this week
- * (本周, 当周, "this week") and naming no other time (OTHER_TIME), dated by the
+ * another week's: a number on an attribute, in a statement relative to the
+ * report's week (RELATIVE_WEEK: 本周, 上周, 两周前, "this week") and naming no
+ * other time (OTHER_TIME), dated by the
  * source itself — a window inside one ISO week, an open window from a day of it,
  * or an event in it. It is keyed by the week, not the day, so two sources dating
  * one week's figure on other days of it give one claim. Everything else keeps
@@ -330,7 +338,9 @@ export function readingWeek(c: {
 }): string | null {
   if (!c.attribute || c.valueNum === null || c.valueNum === undefined || !Number.isFinite(c.valueNum) || c.dateSource !== 'stated') return null;
   const text = c.statement.normalize('NFKC');
-  if (!THIS_WEEK.test(text) || OTHER_TIME.test(text)) return null;
+  if (!RELATIVE_WEEK.test(text) || OTHER_TIME.test(text)) return null;
+  // two relative weeks in one statement (上周及本周) are no one week's reading
+  if (new Set([...text.matchAll(new RegExp(RELATIVE_WEEK.source, 'gi'))].map((m) => m[0].toLowerCase().replace(/\s+/g, ''))).size > 1) return null;
   const iso = (t: string | Date | null | undefined) => {
     if (t === null || t === undefined || t === '') return null;
     const d = t instanceof Date ? t : new Date(t);

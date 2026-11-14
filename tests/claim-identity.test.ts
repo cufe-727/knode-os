@@ -4,12 +4,17 @@ import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
-import { auditDuplicateClaims, datesApart, eventSpanEnd, monthsApart, yearlessMonthsOf } from '../src/graph/claim-dedupe.js';
+import { auditDuplicateClaims, claimPairId, datesApart, eventSpanEnd, monthsApart, yearlessMonthsOf } from '../src/graph/claim-dedupe.js';
+import { applyClaimMerge } from '../src/graph/claim-merge.js';
+import { rekeyState, rekeyWeeklyReadings } from '../src/graph/claim-rekey.js';
 import { refreshClaimState } from '../src/graph/claim-state-store.js';
 import { RawExtractReply } from '../src/graph/llm-extract.js';
-import { claimId, readingWeek } from '../src/graph/store.js';
+import { claimId, isoWeekOf, readingWeek } from '../src/graph/store.js';
 import { enqueueTier1, runTier1Pass } from '../src/graph/tier1.js';
 import { sync } from '../src/ingest/sync.js';
+import { foldOptions } from '../src/lineage/scope.js';
+import { VECTOR_TYPE } from '../src/store/db.js';
+import { recountAll } from '../src/lineage/fold.js';
 import { LlmClient } from '../src/llm/client.js';
 import { markSupersededClaims } from '../src/wiki/refine.js';
 
@@ -105,6 +110,9 @@ describe('a claim identity', () => {
     expect(readingWeek({ ...reading, statement: '本周7日年化收益率为2.1%' })).toBe('2025-W25');
     expect(readingWeek({ ...reading, statement: '3号线本周客流为120万人次' })).toBe('2025-W25');
     expect(readingWeek({ ...reading, statement: 'Revenue this week was 3.2m' })).toBe('2025-W25');
+    // a later report's restatement of a week, dated by the source with that week
+    expect(readingWeek({ ...reading, statement: '七部增长组两周前的周活跃用户为136万。' })).toBe('2025-W25');
+    expect(readingWeek({ ...reading, statement: '上周支付成功率为97.4%' })).toBe('2025-W25');
     // a window across two weeks is no week's reading
     expect(readingWeek({ ...reading, validTo: '2025-06-24T23:59:59.999Z' })).toBeNull();
   });
@@ -116,7 +124,7 @@ describe('a claim identity', () => {
     expect(readingWeek({ ...reading, validFrom: null, validTo: null })).toBeNull();
     // not relative to this week: a restated fact or another period's figure is one claim however many reports date it
     for (const statement of [
-      '宁德时代净利润120亿元', '六部增长组目前有8人。', '七部增长组两周前的周活跃用户为136万。', '2026Q2 净利润 120 亿元',
+      '宁德时代净利润120亿元', '六部增长组目前有8人。', '2026Q2 净利润 120 亿元', '下周可用性预计为99.9%',
       '本周公布Q3净利润同比增长20%', '本周披露H1营收12亿元', 'March revenue this week was 3bn', '本周W37完成度46%', '本周确认去年营收12亿元',
       '平台组2025年第24周服务可用性为99.92%', '10月月报列示本周在岗人数为6人', '本周6月18日可用性99.92%', '上周及本周可用性99.92%',
     ]) expect(readingWeek({ ...reading, statement }), statement).toBeNull();
@@ -345,4 +353,185 @@ describe('weekly readings worded alike, in every shape of date', () => {
       }
     });
   }
+});
+
+describe('nearest claims by embedding', () => {
+  const opened: AppContext[] = [];
+  afterAll(async () => {
+    for (const ctx of opened) {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+  it('are other statements: a reading\'s weekly twins take one place among a claim\'s five, not all', async () => {
+    const dataDir = path.join(tmp, 'near');
+    initDataDir(dataDir);
+    const docs = new Map<string, { text: string; reply: RawExtractReply }>();
+    const twin = '己公司本周营收为3亿元。';
+    const near = ['己公司收入情况良好。', '己公司营收表现良好。'];
+    for (let k = 0; k < 6; k++) docs.set(`raw/docs/周报/己/t${k}.md`, {
+      text: `# 己公司周报 ${k}\n\n${twin}${k === 0 ? near.join('') : ''}\n`,
+      reply: {
+        entities: [{ name: '己公司', type: 'organization', aliases: [] }],
+        relations: [],
+        claims: [
+          { subject: '己公司', statement: twin, type: 'other', status: 'fact', kind: 'fact', attribute: '营收', value: 3, unit: '亿元', startDate: monday(k), endDate: friday(k) },
+          ...(k === 0 ? near.map((statement) => ({ subject: '己公司', statement, type: 'other', status: 'fact', kind: 'fact' })) : []),
+        ],
+      },
+    });
+    for (const [p, d] of docs) {
+      fs.mkdirSync(path.dirname(path.join(dataDir, p)), { recursive: true });
+      fs.writeFileSync(path.join(dataDir, p), d.text);
+    }
+    const ctx = await createContext(dataDir);
+    opened.push(ctx);
+    await sync(ctx, { llmGraph: false });
+    for (const d of await ctx.store.query<{ id: string }>(`SELECT id FROM documents WHERE root = 'docs'`)) await enqueueTier1(ctx.store, d.id);
+    (ctx.config.extraction as { entityLlm?: unknown }).entityLlm = undefined;
+    for (let i = 0; i < 10; i++) if ((await runTier1Pass(ctx.store, ctx.config, stubExtractor(docs), { batchSize: 64 })).queued === 0) break;
+    expect(await ctx.store.query(`SELECT 1 FROM claims WHERE statement = $1 AND tx_to IS NULL`, [twin])).toHaveLength(6);
+
+    // the twins one vector; the first near claim 0.99 from them, the second 0.95 from both
+    const dim = ctx.store.embeddingDim;
+    const unit = (parts: [number, number][]) => Array.from({ length: dim }, (_, i) => parts.find(([k]) => k === i)?.[1] ?? 0);
+    const vectors = new Map<string, number[]>([
+      [twin, unit([[0, 1]])],
+      [near[0], unit([[0, 0.99], [1, Math.sqrt(1 - 0.99 ** 2)]])],
+      [near[1], unit([[0, 0.95], [2, Math.sqrt(1 - 0.95 ** 2)]])],
+    ]);
+    const embedder = { model: 'test-vectors', dimensions: dim, embed: async (texts: string[]) => texts.map((t) => vectors.get(t.slice(t.indexOf('：') + 1))!) };
+    const config = { ...ctx.config, embedding: { ...ctx.config.embedding, provider: 'openai' as const } };
+    const shown: string[] = [];
+    const complete = async (messages: { role: string; content: string }[]) => {
+      const user = messages.find((m) => m.role === 'user')?.content ?? '';
+      shown.push(...[...user.matchAll(/\nA: "([^"]*)"[\s\S]*?\nB: "([^"]*)"/g)].map((m) => [m[1], m[2]].sort().join(' | ')));
+      return JSON.stringify({ verdicts: [] });
+    };
+    const llm = { enabled: true, label: 'stub', provider: 'openai', model: 'stub', complete } as unknown as LlmClient;
+    await auditDuplicateClaims({ store: ctx.store, embedder, config, llm });
+    // the two near claims meet, though six twins are nearer to the first
+    expect(shown).toContain([near[0], near[1]].sort().join(' | '));
+  });
+});
+
+describe('a workspace written before weekly readings had ids', () => {
+  const opened: AppContext[] = [];
+  afterAll(async () => {
+    for (const ctx of opened) {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+  /** Put every claim's evidence back on the id main gave it (subject + statement), as main wrote it. */
+  async function asMainWroteIt(ctx: AppContext): Promise<void> {
+    const rows = await ctx.store.query<{ id: string; subject_id: string; statement: string }>(`SELECT id, subject_id, statement FROM claims`);
+    for (const c of rows) {
+      const legacy = claimId(c.subject_id, c.statement);
+      if (legacy === c.id) continue;
+      await ctx.store.query(
+        `INSERT INTO claims (id, subject_id, object_id, type, statement, status, kind, valid_from, valid_to, tx_from)
+         SELECT $2, subject_id, object_id, type, statement, status, kind, valid_from, valid_to, tx_from FROM claims WHERE id = $1 ON CONFLICT (id) DO NOTHING`,
+        [c.id, legacy],
+      );
+      await ctx.store.query(`UPDATE evidence SET target_id = $2 WHERE kind = 'claim' AND target_id = $1`, [c.id, legacy]);
+      await ctx.store.query(`DELETE FROM claims WHERE id = $1`, [c.id]);
+    }
+    await recountAll(ctx.store, new Date().toISOString(), foldOptions(ctx.dataDir));
+    await ctx.store.query(`DELETE FROM meta WHERE key = 'claim_identity'`);
+  }
+
+  it('never merges a new reading into an old claim of its week, and moves in bounded steps carrying decisions', async () => {
+    const ctx = await build('legacy');
+    opened.push(ctx);
+    // a database made by this code has nothing to move
+    expect(await rekeyState(ctx.store)).toEqual({ cursor: null, done: true });
+    await asMainWroteIt(ctx);
+    const live = async (statement: string) => ctx.store.query<{ id: string; evidence_count: number; canonical_id: string | null }>(
+      `SELECT id, evidence_count, canonical_id FROM claims WHERE statement = $1 AND tx_to IS NULL ORDER BY valid_from`, [statement],
+    );
+    const s9992 = '平台组本周服务可用性为99.92%。';
+    const s9993 = '平台组本周服务可用性为99.93%。';
+    // as main left it: weeks 1 and 3 one claim
+    expect(await live(s9992)).toMatchObject([{ id: claimId('平台组', s9992), evidence_count: 2 }]);
+    const old9993 = claimId('平台组', s9993);
+    const owner = 'd180122f0f46f32e748ebf1c';
+    // a person rejected merging the 99.93% claim with the owner claim, and a judge once looked at the pair
+    await ctx.store.query(
+      `INSERT INTO suggestions (id, kind, title, body, status, payload) VALUES ($1, 'claim-merge', '合并', '', 'rejected', $2::jsonb)`,
+      [claimPairId(old9993, owner), JSON.stringify({ claimId: old9993, canonicalId: owner, kind: 'same_as' })],
+    );
+    await ctx.store.query(
+      `INSERT INTO claim_pair_verdicts (pair_id, a_id, b_id, relation, confidence, reason, model) VALUES ($1, $2, $3, 'unrelated', 0.9, '测试', 'judge')`,
+      [claimPairId(old9993, owner), old9993, owner],
+    );
+    // and its vector, paid once, embeds "subject：statement": the same for every week of it
+    const vec = `[${Array.from({ length: ctx.store.embeddingDim }, (_, i) => (i === 0 ? 1 : 0)).join(',')}]`;
+    await ctx.store.query(`INSERT INTO claim_embeddings (claim_id, model, embedding) VALUES ($1, 'test', $2::${VECTOR_TYPE})`, [old9993, vec]);
+    await ctx.store.query(`INSERT INTO claim_embeddings (claim_id, model, embedding) VALUES ($1, 'test', $2::${VECTOR_TYPE})`, [claimId('平台组', s9992), vec]);
+
+    // a merge group of two old claims, each one week: the representative comes first by id, so a step moves it
+    // before its member (and must not then relink the member to the old, gone representative)
+    const s9991 = '平台组本周服务可用性为99.91%。';
+    const [rep, member] = [old9993, claimId('平台组', s9991)].sort();
+    await applyClaimMerge(ctx.store, { claimId: member, canonicalId: rep, reason: '测试', actor: 'test' });
+
+    // a second report of week 3 arrives, written as readings are now
+    const p = 'raw/docs/周报/平台组/w3b.md';
+    fs.writeFileSync(path.join(ctx.dataDir, p), `# 平台组周报 · 第4周（补）\n\n本周服务可用性为99.92%。\n`);
+    await sync(ctx, { llmGraph: false });
+    const [doc] = await ctx.store.query<{ id: string }>(`SELECT id FROM documents WHERE path = $1`, [p]);
+    await enqueueTier1(ctx.store, doc.id);
+    const docs = new Map([[p, { reply: { entities: [{ name: '平台组', type: 'organization', aliases: [] }], relations: [], claims: [
+      { subject: '平台组', statement: s9992, type: 'other', status: 'fact', kind: 'fact', attribute: '服务可用性', value: 99.92, unit: '%', startDate: monday(2), endDate: friday(2) },
+    ] } as RawExtractReply }]]);
+    for (let i = 0; i < 5; i++) if ((await runTier1Pass(ctx.store, ctx.config, stubExtractor(docs), { batchSize: 8 })).queued === 0) break;
+    const week3 = claimId('平台组', s9992, isoWeekOf(monday(2)));
+    expect((await live(s9992)).map((c) => c.id).sort()).toEqual([claimId('平台组', s9992), week3].sort());
+
+    // before the old claims have moved, the audit decides nothing about them: the old claim holds week 3 too
+    const judged = { pairs: 0 };
+    const before = await auditDuplicateClaims({ store: ctx.store, embedder: ctx.embedder, config: ctx.config, llm: countingJudge(judged) }, { rekeyLimit: 0 });
+    expect(before.pendingRekey).toBeGreaterThan(0);
+    expect(before.merged).toBe(0);
+    expect(judged.pairs).toBe(0);
+
+    // then, two claims a step
+    let steps = 0;
+    for (let st = await rekeyWeeklyReadings(ctx.store, { limit: 2 }); ; st = await rekeyWeeklyReadings(ctx.store, { limit: 2 })) {
+      steps++;
+      if (st.done) break;
+    }
+    expect(steps).toBeGreaterThan(1);
+    // weeks 1 and 3 are claims of their own; the old claim's week-3 evidence and the new report's are one claim
+    expect((await live(s9992)).map((c) => [c.id, c.evidence_count])).toEqual([[claimId('平台组', s9992, isoWeekOf(monday(0))), 1], [week3, 2]]);
+    // the 99.93% claim moved whole: the person's rejection and the judged pair moved with it
+    const new9993 = claimId('平台组', s9993, isoWeekOf(monday(3)));
+    expect(await live(s9993)).toMatchObject([{ id: new9993 }]);
+    expect(await ctx.store.query(`SELECT status FROM suggestions WHERE id = $1`, [claimPairId(new9993, owner)])).toEqual([{ status: 'rejected' }]);
+    expect(await ctx.store.query(`SELECT relation FROM claim_pair_verdicts WHERE pair_id = $1`, [claimPairId(new9993, owner)])).toEqual([{ relation: 'unrelated' }]);
+    // the group moved with its two claims
+    const successor = (id: string) => (id === old9993 ? new9993 : claimId('平台组', s9991, isoWeekOf(monday(1))));
+    expect(await ctx.store.query(`SELECT canonical_id FROM claims WHERE id = $1`, [successor(member)])).toEqual([{ canonical_id: successor(rep) }]);
+    // the vectors went to every claim the old ones became
+    expect(await ctx.store.query(`SELECT e.claim_id FROM claim_embeddings e JOIN claims c ON c.id = e.claim_id AND c.tx_to IS NULL WHERE e.model = 'test' ORDER BY e.claim_id`)).toEqual(
+      [new9993, claimId('平台组', s9992, isoWeekOf(monday(0))), week3].sort().map((claim_id) => ({ claim_id })),
+    );
+    // the restated owner claim kept its id
+    expect(await ctx.store.query(`SELECT id FROM claims WHERE id = $1 AND tx_to IS NULL`, [owner])).toHaveLength(1);
+
+    // and the audit afterwards merges no reading
+    const after = await auditDuplicateClaims({ store: ctx.store, embedder: ctx.embedder, config: ctx.config, llm: countingJudge({ pairs: 0 }) });
+    expect(after.pendingRekey).toBe(0);
+    // (but for the group carried over above)
+    expect(await ctx.store.query(`SELECT id FROM claims WHERE statement LIKE '平台组本周服务可用性%' AND canonical_id IS NOT NULL AND tx_to IS NULL`)).toEqual([{ id: successor(member) }]);
+
+    // a re-apply now changes no claim id
+    const ids = async () => (await ctx.store.query<{ id: string }>(`SELECT id FROM claims WHERE tx_to IS NULL ORDER BY id`)).map((r) => r.id);
+    const was = await ids();
+    await sync(ctx, { llmGraph: false, reapply: true });
+    expect(await ids()).toEqual(was);
+  });
 });

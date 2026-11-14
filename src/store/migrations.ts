@@ -1224,6 +1224,11 @@ export async function migrate(
     });
     current = m.version;
   }
+  // a database made here holds no claim written before weekly readings had ids of their own:
+  // nothing for src/graph/claim-rekey.ts to move, and nothing for the audit to wait on
+  if (from === 0) {
+    await q.query(`INSERT INTO meta (key, value) VALUES ('claim_identity', '{"cursor": null, "done": true}'::jsonb) ON CONFLICT (key) DO NOTHING`);
+  }
   return { from, to: current };
 }
 
