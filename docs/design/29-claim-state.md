@@ -193,6 +193,13 @@ Run by refine before the duplicate audit (`resolveEntityContext`), deterministic
     of its documents, so the outcome does not depend on the order they arrive in.
   - *`review.identity`.* `"name"` (the default): refine does what it did before — people only, documents dated.
     `"context"`, which a workspace turns on, adds what follows.
+  - *What a workspace on the default sees after upgrading.* Nothing changes when it opens, and no entity is parted
+    by a code. A raw document that is new, changed or indexed again gets a date from a dateline at its top when
+    frontmatter and path give none; documents already indexed keep theirs. As documents gain dates that way, refine
+    may split a person name whose reports fall into two teams at the same time — it logs `entities: X split —
+    reason`, the second person appears as `X（team）`, and `knode-os entities merge <X（team）> <X>` puts them back
+    for good. A name already parted (by an earlier split) keeps resolving to its entities, in mentions and in the
+    links a document's text makes to it.
   - *Coded split* (`splitCoded`, `"context"` only, types `component` and `other`: an instance, not a category). A
     code is written once or twice, where the thing is introduced, so the documents that carry a code seed a group
     and a document without one joins the group it is most like (Jaccard ≥ 0.3 with one of its documents, and with
@@ -203,6 +210,10 @@ Run by refine before the duplicate audit (`resolveEntityContext`), deterministic
     re-applied from the sidecars, their tier-0 links re-made. When every document goes with a code, the one with the
     most documents keeps the entity, on record as a row whose `id` is its `base_id`: later runs never move it, so
     the entity keeps its id, its claim ids, its page and a person's corrections.
+  - *One roof under two names.* Co-mentions are read as the entities they were merged into, and two entities the
+    duplicate audit has a pending pair for (三星 / Samsung Electronics: the judge called them the same below its
+    merge threshold, or nobody has judged yet) count as one roof in both splits, which refine runs after the audit.
+    Where the audit has not paired them, nothing says they are one.
   - *People* (`"context"` only): a document with no date is dated by the median of the dates its claims state, and
     the two contexts are compared over the entities in ≥ 20% of each cluster's documents (two teams that each name
     a customer once are still two contexts).
@@ -210,7 +221,8 @@ Run by refine before the duplicate audit (`resolveEntityContext`), deterministic
     its code; else the one the split gave its document to; else the base entity if it carries the code the base is
     named by; else, among entities whose code does not differ from one it carries, the one whose anchors name its
     owner, then the one whose anchors its document names most (more than the base entity's, and no other as many);
-    else the base entity. Roofs are compared as the live entities their names stand for (an alias, a merged
+    else the base entity. Right after the code comes a spelling that, among the name's entities, only one parted
+    entity carries: that alias means that entity. Roofs are compared as the live entities their names stand for (an alias, a merged
     spelling), not as strings. Tier-0 links follow the same way.
   - *What a person sees, and undoing it.* A split logs `entities: X split — reason`, writes `entity_namesakes`
     (reason, documents) and a rejected merge suggestion for the pair; the parted entity appears as `X（roof · code）`
@@ -222,7 +234,9 @@ Run by refine before the duplicate audit (`resolveEntityContext`), deterministic
   a line among the first eight that is a date and nothing else (an optional label, a full date, an optional second
   date, an optional weekday or short byline), not a list item, heading, quote or table row; a dotted date only
   behind a label or in a range; never later than the day of indexing; of a range the end, when the range is a
-  report's own period (≤ 31 days), and nothing when it is longer or ends in the future.
+  report's own period (≤ 31 days) — or, while that period is still running, the day of indexing — and nothing when
+  it is longer or starts in the future. The date may be in digits or with the month by name, and may carry a time
+  of day. A bare date (no label, range, weekday, time or byline) counts only on the first or second line.
 
 ## 6. Extraction
 
