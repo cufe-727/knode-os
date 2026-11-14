@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { readSidecarPart } from '../src/fs/sidecar.js';
 import { claimsForEntities } from '../src/graph/query.js';
-import { dateFromPath, docDateOf } from '../src/ingest/docdate.js';
+import { dateFromContent, dateFromPath, docDateOf } from '../src/ingest/docdate.js';
 import { sync } from '../src/ingest/sync.js';
 import { queryClaims } from '../src/store/claims.js';
 import { normalizeDateExpr } from '../src/store/dates.js';
@@ -77,6 +77,25 @@ describe('date expressions', () => {
     expect(d(dateFromPath('raw/docs/20260510.pdf'))).toBe('2026-05-10');
     expect(d(dateFromPath('raw/docs/2026Q2-review.md'))).toBe('2026-04-01');
     expect(dateFromPath('raw/docs/notes.md')).toBeNull();
+  });
+
+  it('reads a dateline at the top of a document when frontmatter and path give none', () => {
+    // a weekly report: its week on the second line, dated by the day the week ends
+    expect(d(dateFromContent('# 六部增长组周报 · 第30周\n\n2025-07-28 ~ 2025-08-01 · 龙杰\n\n## 一、进展\n天枢系统完成度76%。'))).toBe('2025-08-01');
+    expect(d(dateFromContent('# 月报\n\n日期：2025年8月29日\n\n正文'))).toBe('2025-08-29');
+    expect(d(dateFromContent('Weekly notes\n\n**Date:** 2025/8/5, by Lin\n\nBody'))).toBe('2025-08-05');
+    expect(d(dateFromContent('> 2025.08.25 至 2025.08.29\n正文'))).toBe('2025-08-29');
+    // a date inside a sentence, a month alone, a date far down the text: no dateline
+    expect(dateFromContent('# 公司简介\n\n成立于2019年3月1日的公司，主营储能。')).toBeNull();
+    expect(dateFromContent('# 纪要\n\n2025年8月\n\n正文')).toBeNull();
+    expect(dateFromContent('2025-08-25上线的版本修复了三个问题。')).toBeNull();
+    expect(dateFromContent(`# 标题\n\n${'一行正文。\n'.repeat(12)}2025-08-25\n`)).toBeNull();
+    expect(dateFromContent('# 标题\n\n2025-13-45 · 作者')).toBeNull();
+    // frontmatter and the path still come first; without a text nothing is read
+    expect(d(docDateOf('raw/docs/x.md', { date: '2026-08-10' }, '2025-08-25 · 作者'))).toBe('2026-08-10');
+    expect(d(docDateOf('raw/docs/2026-05-10-x.md', {}, '2025-08-25 · 作者'))).toBe('2026-05-10');
+    expect(d(docDateOf('raw/docs/x.md', {}, '# 周报\n2025-08-25 ~ 2025-08-29 · 作者'))).toBe('2025-08-29');
+    expect(docDateOf('raw/docs/x.md', {})).toBeNull();
   });
 });
 
