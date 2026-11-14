@@ -560,18 +560,22 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
   const p = new Params([websearchText(query)]);
   const cond = docLiveAt('d', p, asOf, filter);
   const lim = p.add(k);
-  const fts = await store.query<RankedChunk>(
-    `SELECT chunk_id, document_id, path, title, doc_date, content, raw, generated FROM (
-       SELECT ${CANDIDATE_COLUMNS}, ts_rank(c.tsv, websearch_to_tsquery('simple', $1)) AS raw,
-              row_number() OVER (PARTITION BY ${isGeneratedSql('d')} ORDER BY ts_rank(c.tsv, websearch_to_tsquery('simple', $1)) DESC) AS place
+  // The chunks holding every word, best first. A query with a quoted phrase or an excluded word is the
+  // asker's own filter and its matches lead the answer, so each side gets its best `k` of them, a branch
+  // and a top-k sort each. Any other query adds them to the candidates as one list, as it always did: the
+  // lists below already put forward each side's chunks, and one common word matches a third of a large
+  // index — measured on 200,400 chunks (PostgreSQL 17, "进展", 25,850 matches): one list 112 ms, a branch
+  // per side 189 ms (the matches are read twice), a window over the sides 126 ms with every match and
+  // its text sorted on disk.
+  const matching = (side: string) => `SELECT ${CANDIDATE_COLUMNS}, ts_rank(c.tsv, websearch_to_tsquery('simple', $1)) AS raw
        FROM chunks c
        JOIN documents d ON d.id = c.document_id
-       WHERE c.tsv @@ websearch_to_tsquery('simple', $1) AND ${cond}
-     ) matched
-     WHERE place <= ${lim}
-     ORDER BY raw DESC`,
-    p.list,
-  );
+       WHERE c.tsv @@ websearch_to_tsquery('simple', $1) AND ${cond}${side}
+       ORDER BY raw DESC
+       LIMIT ${lim}`;
+  const fts = hasSearchOperators(query)
+    ? (await store.query<RankedChunk>(`(${matching(` AND NOT ${isGeneratedSql('d')}`)}) UNION ALL (${matching(` AND ${isGeneratedSql('d')}`)})`, p.list)).sort((x, y) => y.raw - x.raw)
+    : await store.query<RankedChunk>(matching(''), p.list);
 
   const terms = keywordTerms(query);
   if (terms.length === 0) return fts;
@@ -736,6 +740,10 @@ async function scannedFrequencies(store: Store, terms: string[]): Promise<number
  * is in more chunks than a lookup lists (`KEYWORD_DF_CAP`), the lookup reads
  * some of them and this all of them, and the two can put forward different
  * chunks; below the cap they put forward the same.
+ *
+ * The scan keeps a chunk's id and the terms it holds, each side takes its
+ * `pool` by a top-k sort of those, and only the chunks picked are read again
+ * for their text.
  */
 async function scannedCandidates(
   store: Store,
@@ -755,17 +763,21 @@ async function scannedCandidates(
   const lim = p.add(pool);
   // lower() once per chunk, then strpos per gram
   return store.query<RankedChunk>(
-    `SELECT chunk_id, document_id, path, title, doc_date, content, 0::float AS raw, generated FROM (
-       SELECT held.*, row_number() OVER (PARTITION BY generated ORDER BY ($1::int[])[mask], chunk_id COLLATE "C") AS place FROM (
-         SELECT ${CANDIDATE_COLUMNS}, ${mask} AS mask
+    `WITH held AS MATERIALIZED (
+       SELECT chunk_id, mask, generated FROM (
+         SELECT c.id AS chunk_id, ${isGeneratedSql('d')} AS generated, ${mask} AS mask
          FROM chunks c JOIN documents d ON d.id = c.document_id, LATERAL (SELECT lower(c.content) AS l OFFSET 0) x
          WHERE ${cond}
          OFFSET 0
-       ) held
+       ) scanned
        WHERE mask > 0
-     ) placed
-     WHERE place <= ${lim}
-     ORDER BY generated, place`,
+     ), picked AS (
+       (SELECT chunk_id FROM held WHERE NOT generated ORDER BY ($1::int[])[mask], chunk_id COLLATE "C" LIMIT ${lim})
+       UNION ALL
+       (SELECT chunk_id FROM held WHERE generated ORDER BY ($1::int[])[mask], chunk_id COLLATE "C" LIMIT ${lim})
+     )
+     SELECT ${CANDIDATE_COLUMNS}, 0::float AS raw
+     FROM picked JOIN chunks c ON c.id = picked.chunk_id JOIN documents d ON d.id = c.document_id`,
     p.list,
   );
 }
@@ -904,16 +916,18 @@ async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput
               sum(ln(1 + (greatest(${total}::float, h.df) - h.df + 0.5) / (h.df + 0.5))) AS weight
        FROM hits h
        GROUP BY h.chunk_id
-     ), ranked AS (
-       SELECT pc.chunk_id, pc.matches, pc.weight, docs.generated,
-              row_number() OVER (PARTITION BY docs.generated ORDER BY pc.weight DESC, pc.matches DESC, pc.chunk_id) AS place
+     ), live AS MATERIALIZED (
+       SELECT pc.chunk_id, pc.matches, pc.weight, docs.generated
        FROM per_chunk pc JOIN docs ON docs.id = pc.document_id
+     ), ranked AS (
+       (SELECT * FROM live WHERE NOT generated ORDER BY weight DESC, matches DESC, chunk_id LIMIT ${lim})
+       UNION ALL
+       (SELECT * FROM live WHERE generated ORDER BY weight DESC, matches DESC, chunk_id LIMIT ${lim})
      )
      SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, r.weight AS raw, r.generated
      FROM ranked r
      JOIN chunks c ON c.id = r.chunk_id
      JOIN documents d ON d.id = c.document_id
-     WHERE r.place <= ${lim}
      ORDER BY r.weight DESC, r.matches DESC, c.id`,
     p.list,
   );

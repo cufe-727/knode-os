@@ -146,6 +146,24 @@ describe('generated pages in search results', () => {
     expect(new Set(sources)).toEqual(new Set([...SOURCES, 'note']));
   });
 
+  it('gives each side its matches of a quoted phrase', async () => {
+    // words of their own, and no vectors: 26 pages and 6 reports hold the phrase, 6 notes hold its words apart
+    // and oftener. A phrase is the asker's filter and its matches lead — with one list of matches the 24
+    // best were pages, and the sources that followed were the notes
+    const add = async (id: string, file: string, root: string, kind: string, content: string) => {
+      await store.query(`INSERT INTO documents (id, path, root, kind, title, sha256, bytes, status) VALUES ($1, $2, $3, $4, $1, $5, 10, 'indexed')`, [`d-${id}`, file, root, kind, `sha-${id}`]);
+      await store.query(`INSERT INTO chunks (id, document_id, seq, content, token_count, tsv) VALUES ($1, $2, 0, $3, 3, to_tsvector('simple', $3))`, [id, `d-${id}`, content]);
+    };
+    for (let i = 1; i <= 26; i++) await add(`qp${i}`, `wiki/entities/quasar-${i}.md`, 'wiki', 'view', `Quasar uptime. Quasar uptime, Quasar uptime: page ${i}.`);
+    for (let i = 1; i <= 6; i++) await add(`qs${i}`, `raw/docs/quasar/report-${i}.md`, 'docs', 'source', `Report ${i}: Quasar uptime was 99.${i}%.`);
+    for (let i = 1; i <= 6; i++) await add(`qn${i}`, `raw/docs/quasar/note-${i}.md`, 'docs', 'source', `Uptime, uptime, uptime of the Quasar, Quasar, Quasar cluster: note ${i}.`);
+    const found = await ids('keyword', { query: '"Quasar uptime"' });
+    expect(found.filter((id) => id.startsWith('qp'))).toHaveLength(2);
+    expect(found.filter((id) => id.startsWith('qs')).sort()).toEqual(['qs1', 'qs2', 'qs3', 'qs4', 'qs5', 'qs6']);
+    // without the phrase the words decide, and the notes hold them oftener
+    expect((await ids('keyword', { query: 'Quasar uptime' })).filter((id) => id.startsWith('qn')).length).toBeGreaterThan(0);
+  });
+
   it('lists sources as candidates while the substring index is being built, too', async () => {
     const ready = await ids('keyword');
     store.matchIndexes.clear();
