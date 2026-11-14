@@ -146,6 +146,42 @@ export function normalizeDateExpr(expr: unknown, ref?: string | null): DateSpan 
   return span;
 }
 
+export type DocumentPeriodScale = 'day' | 'week' | 'month' | 'quarter' | 'year';
+
+export interface DocumentPeriod {
+  /** The word as written, which `normalizeDateExpr(word, docDate)` resolves. */
+  word: string;
+  scale: DocumentPeriodScale;
+}
+
+// longest spellings first, so 上一季度 is not read as 上季度 … and 本周期 ("this cycle") is no week
+const PERIOD_WORDS: [RegExp, DocumentPeriodScale][] = [
+  [/今天|\btoday\b/i, 'day'],
+  [/(上一周|下一周|本周|这周|上周|下周)(?!期)|\b(?:this|last|next) week\b/i, 'week'],
+  [/上个月|本月|上月|下月|\b(?:this|last|next) month\b/i, 'month'],
+  [/上一季度|本季度|上季度|下季度|本季|\b(?:this|last|next) quarter\b/i, 'quarter'],
+  [/今年|本年|去年|上年|明年|\b(?:this|last|next) year\b/i, 'year'],
+];
+
+/**
+ * The period a statement names relative to its document's date — "支付组本周在岗7人"
+ * speaks of the week of the report it is in, "去年营收…" of the year before it.
+ * The same words in two documents are two assertions about two periods, so a
+ * claim that several documents repeat word for word is dated by each
+ * document's period, not by the span over all of them. The finest scale wins
+ * ("今年本月…" is a month). Null when the statement names no such period.
+ */
+export function documentPeriod(statement: string): DocumentPeriod | null {
+  for (const [re, scale] of PERIOD_WORDS) {
+    const m = re.exec(statement);
+    if (m) return { word: (m[1] ?? m[0]).toLowerCase(), scale };
+  }
+  return null;
+}
+
+/** The longest window, in days, a stated period of each scale can have (a week stated Monday–Monday is 8). */
+export const PERIOD_MAX_DAYS: Record<DocumentPeriodScale, number> = { day: 1, week: 8, month: 32, quarter: 93, year: 367 };
+
 /** The instant a date expression starts at (for single-valued fields such as an event date). */
 export function dateStart(expr: unknown, ref?: string | null): string | null {
   return normalizeDateExpr(expr, ref)?.from ?? null;

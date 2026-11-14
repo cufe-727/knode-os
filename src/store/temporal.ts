@@ -1,6 +1,7 @@
 import { isCorrectionStatement, normalizeAttribute, parseMeasure } from '../graph/claim-state.js';
 import { keyOf } from '../graph/normalize.js';
 import { normalizeClaimType } from '../graph/store.js';
+import { documentPeriod, DocumentPeriod, DocumentPeriodScale, normalizeDateExpr, PERIOD_MAX_DAYS } from './dates.js';
 import { Queryable } from './migrations.js';
 
 /**
@@ -294,9 +295,17 @@ function supporterObserved(r: EvidenceAtRow, docs?: ReadonlyMap<string, ScopeDoc
   return toIso(str(r.attrs.observed_at)) ?? docs?.get(r.scope_id)?.docDate ?? null;
 }
 
-/** One supporter's own date: the date it states, else its document's (marked `document`: inferred, not stated). */
-function supporterDate(r: EvidenceAtRow, docs?: ReadonlyMap<string, ScopeDocument>): { at: string | null; source: 'stated' | 'document' | null } {
-  const stated = toIso(str(r.attrs.event_at)) ?? toIso(str(r.attrs.valid_from));
+/**
+ * One supporter's own date: the date it states (its event, else the start of
+ * its window — `windowFrom` when the fold worked one out, see
+ * supporterPeriodWindow), else its document's (marked `document`: inferred, not stated).
+ */
+function supporterDate(
+  r: EvidenceAtRow,
+  docs?: ReadonlyMap<string, ScopeDocument>,
+  windowFrom: string | null = toIso(str(r.attrs.valid_from)),
+): { at: string | null; source: 'stated' | 'document' | null } {
+  const stated = toIso(str(r.attrs.event_at)) ?? windowFrom;
   if (stated) return { at: stated, source: 'stated' };
   const observed = supporterObserved(r, docs);
   return observed ? { at: observed, source: 'document' } : { at: null, source: null };
@@ -308,6 +317,30 @@ function unionWindow(rows: EvidenceAtRow[]): { from: string | null; to: string |
   const openEnded = rows.some((r) => !toIso(str(r.attrs.valid_to)));
   const tos = rows.map((r) => toIso(str(r.attrs.valid_to))).filter((x): x is string => Boolean(x)).sort();
   return { from: froms[0] ?? null, to: openEnded ? null : tos[tos.length - 1] ?? null };
+}
+
+/** Periods short enough that a statement naming one is read as its document's: a day, a week, a month. */
+const RESOLVED_SCALES: ReadonlySet<DocumentPeriodScale> = new Set(['day', 'week', 'month']);
+
+/**
+ * One supporter's window for a statement naming its document's period: the
+ * window it stated, unless it stated none or one longer than the period can
+ * be — then, for a day, week or month, the period word resolved on the
+ * supporter's document date ("本周" in a report dated 2025-09-05 is
+ * 2025-09-01 … 09-07). A quarter or a year word is often a comparison
+ * ("比去年同期") rather than the claim's own period, so only a stated window counts for it.
+ * A period the statement names is a date it states, as a `startDate: 本周`
+ * resolved on the document's date is (src/graph/llm-extract.ts).
+ */
+function supporterPeriodWindow(r: EvidenceAtRow, period: DocumentPeriod, docs?: ReadonlyMap<string, ScopeDocument>): { from: string | null; to: string | null } {
+  const from = toIso(str(r.attrs.valid_from));
+  const to = toIso(str(r.attrs.valid_to));
+  const tooLong = Boolean(from && to && (Date.parse(to) - Date.parse(from)) / 86_400_000 > PERIOD_MAX_DAYS[period.scale]);
+  if ((from || to) && !tooLong) return { from, to };
+  if (!RESOLVED_SCALES.has(period.scale)) return { from, to };
+  const ref = supporterObserved(r, docs);
+  const span = ref ? normalizeDateExpr(period.word, ref) : null;
+  return span ? { from: span.from, to: span.to } : { from, to };
 }
 
 function finiteOrNull(v: unknown): number | null {
@@ -342,15 +375,23 @@ export function foldClaimEvidence(
   // evidence written before the closed list carries the extractor's own label (市场表现, 盈利预测 …)
   const type = normalizeClaimType(byWeight.map((r) => str(r.attrs.type)).find(Boolean));
   const kind = byWeight.map((r) => str(r.attrs.kind)).find(Boolean) ?? 'fact';
-  const window = unionWindow(rows);
+  // each supporter's window: for a statement about its document's period (本周, 上月 …), that period
+  const period = documentPeriod(row.statement);
+  const own = new Map(rows.map((r) => [r, period
+    ? supporterPeriodWindow(r, period, docs)
+    : { from: toIso(str(r.attrs.valid_from)), to: toIso(str(r.attrs.valid_to)) }]));
   const objectId = byWeight.map((r) => str(r.attrs.object_id)).find(Boolean) ?? null;
   const eventAt = byWeight.map((r) => toIso(str(r.attrs.event_at))).find(Boolean) ?? null;
   const observed = rows.map((r) => supporterObserved(r, docs)).filter((x): x is string => Boolean(x)).sort();
   // the newest supporter by its own date (ties: the later write, then the scope id)
-  const dated = rows.map((r) => ({ r, ...supporterDate(r, docs) }));
+  const dated = rows.map((r) => ({ r, ...supporterDate(r, docs, own.get(r)!.from) }));
   const newest = dated
     .filter((d) => d.at)
     .sort((a, b) => b.at!.localeCompare(a.at!) || new Date(b.r.tx_from).getTime() - new Date(a.r.tx_from).getTime() || a.r.scope_id.localeCompare(b.r.scope_id))[0];
+  // a statement about its document's period holds for the newest supporter's period: report after report
+  // repeating "支付组本周在岗7人" says so of one week each, not of the months between the first and the last
+  // (those weeks stay in the evidence); any other claim's window spans its supporters'
+  const window = !period ? unionWindow(rows) : newest ? own.get(newest.r)! : { from: null, to: null };
   // the reading of the newest supporter that gives one, else the statement's
   const measured = [...dated]
     .filter((d) => str(d.r.attrs.attribute))
