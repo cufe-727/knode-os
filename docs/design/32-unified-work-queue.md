@@ -121,7 +121,8 @@ Two defects found on 2026-11-14 are fixed in stage 1, since they are placement b
 - Whether a local slot started by a run is bound by `processing.maxLocalCalls`, which today covers `serve`'s slots only. A run and `serve` on one account otherwise exceed the limit the user set for the machine. Stage 1 leaves the run's slots outside it (the default this design proposed), so `--local codex:6` beside `serve`'s own six is twelve calls on this machine.
 - Whether `judge` calls of a review should carry `requires` too, so a review can be pinned to a pool as a run can.
 - How a pool is shown in the Tasks view, next to the worker and backend it already lists. Stage 1 tags a remote worker with its pool and evaluation work with `evaluation`, and puts a piece's required pool in its detail; a better place may come with use.
-- Whether `shares.eval` should default to 1 or to 0 (only when idle). The user asked for knowledge-base work first "when all other conditions are equal"; 1 reads that as a preference, 0 as a strict order. Stage 1 defaults to 1, and both work; no slot in the worker script or in `serve` takes both classes today (§11), so the weight matters only once one does.
+- Whether `shares.eval` should default to 1 or to 0 (only when idle). The user asked for knowledge-base work first "when all other conditions are equal"; 1 reads that as a preference, 0 as a strict order. Stage 1 defaults to 1, and both work in the broker.
+- **`shares.eval` has no effect with today's worker.** It orders work only for a slot that asks for both knowledge-base and evaluation kinds. The worker script's evaluation slots (`--eval`) ask only for evaluation kinds and its model slots (`--backends`) only for knowledge-base kinds, and `serve`'s own slots take no evaluation work; so nothing today makes a benchmark and a workspace backlog share a slot by weight, and §8's "1 : 3" does not happen yet. Whether a slot should take both (and which: the worker's model slots, its evaluation slots, `serve`'s) is undecided; stage 1 does not make evaluation slots take knowledge-base work.
 - Whether a run's own slots should take another run's pieces on the same `serve`. Stage 1 says no (§11).
 
 ## 11. Stage 1 as built (2026-11-14)
@@ -157,18 +158,30 @@ complete | renew | release` on `serve`, or straight from the run's own broker �
   as the call slots online when it starts, never narrower than six, so a build on six slots keeps its batches.
 - *A run's own slots are in the run's pool* (`--pool`), else in pool `local`; a worker that declares no pool is in its
   token's name, filled in by the server. A piece that names a pool goes only to a slot of it, the run's own included.
-- *Waiting* counts a slot that holds a lease as online (a slot at work asks for nothing), and the run's own slots
-  always. A piece waits for a requirement (kind, CLI, model, pool, eligibility); the limit applies per requirement
+- *Waiting* counts a slot that holds a lease as online (a slot at work asks for nothing), for every evaluation kind it
+  asked for (a Codex slot busy with calls is online for sessions too), and the run's own slots while the queue
+  answers (they lease from it: with `serve` gone they count for nothing, so an outage trips the wait limit). A Codex
+  slot of the run waits for this machine's plan before it leases, never while it holds a piece. A piece waits for a requirement (kind, CLI, model, pool, eligibility); the limit applies per requirement
   that no slot online meets. The stop is the run's cancel path: pieces are withdrawn, its sessions are stopped,
   nothing in flight is recorded, the report so far is written, and `eval run` exits 1 naming what it waited for.
 - *Stuck* counts machines (`<token>/<worker>`), not slots, and a machine that failed a piece gets it again only when
-  nothing else waits for it. An answer, build, update batch or generation score one of whose pieces is stuck is not
+  nothing else waits for it. A piece is stuck when three different machines could not serve it; when every machine
+  online that takes it (its CLI, pool, eligibility, run) has failed it three times — two judge workers, or one machine
+  with ten slots, would otherwise pass it between them for ever; or after ten failures in all, however machines came
+  and went. A lapse of a run's own slot's lease is no strike (its slots are the run's backend), and a piece runs once
+  on the run's own slots: a slot that leases a piece another of them is running waits for that result. An answer, build, update batch or generation score one of whose pieces is stuck is not
   recorded (asked again on resume); a stuck judge call leaves the scoring pass for a resume (its verdicts are in the
   judge cache).
 - *Cancelled sessions* are recorded with `error: "cancelled: …"` and `cancelled: true` (an answer with an error is
   asked again on resume); when the run itself is stopping, nothing is recorded at all, as before.
 - *`server.remote.offer.eval` off* no longer refuses a run's pieces: remote workers see none, and a run's own slots
   still take them through `serve`.
+- *What `serve` says*: no answer or a 5xx is waited out (the piece is published again, an archive uploaded again); a
+  4xx is final and stops the run with `serve`'s message (`ServeRefusedError`); a `serve` older than the run (no
+  `slots` in `/eval/v1/status`, or an outcome the run does not know) is refused at the start. A run directory whose
+  name is no producer-channel run id (spaces, CJK) is given one (`queueRunId`: a slug and a hash).
+- *Cancelled sessions in the llm-wiki build* stop the build at that batch (resumed there) and leave an update for a
+  resume; neither is recorded.
 
 **Behaviour an existing run script feels.**
 
@@ -179,14 +192,21 @@ complete | renew | release` on `serve`, or straight from the run's own broker �
 - `--offer-seconds` warns and does nothing; `server.remote.evalOfferSeconds` is not read.
 - Widths: a `--remote` run answers as wide as the slots online (before, `--answer-concurrency` plus them), and a knode
   build as wide as the call slots (before, six plus them).
-- An incomplete run (stuck pieces) or a run stopped at the wait limit exits 1.
+- An incomplete run (stuck pieces), a run stopped at the wait limit, or one `serve` refused exits 1.
+- `eval run --remote` against a `serve` older than this build refuses to start.
 - An old command line without `--remote` behaves as before (above).
 
 **`serve` restarting while pieces wait.** Survivable within the wait limit, not lossless: the held offer requests fail,
-the run treats `serve` as unreachable (only its own slots count as online) and publishes each waiting piece again
-with backoff once `serve` answers; a piece one of its own slots had done keeps that result; a piece a worker had out
-is lost with `serve`'s memory, done again, and the worker's late answer is refused. An outage longer than
-`--wait-minutes` stops the run, which a resume continues. Durable pieces (§5) are stage 2.
+the run treats `serve` as unreachable (nothing counts as online, its own slots included) and publishes each waiting
+piece again with backoff once `serve` answers; archive uploads wait the same way; a piece one of its own slots had
+done or is running keeps that result and is not published again; a piece a worker had out is lost with `serve`'s
+memory, done again, and the worker's late answer is refused. An outage longer than `--wait-minutes` stops the run,
+which a resume continues. Durable pieces (§5) are stage 2.
+
+**Review fixes (2026-11-14).** After a review of the first eight commits: the stuck rule above (`0337600`); a piece run
+twice on the run's own slots (`073d3de`); refusals, outages and archive uploads (`4b31fc9`); the judge re-asking a stuck
+piece (`5a05b36`); online across kinds (`1e8c75a`); a run that fails to start leaving its slots running (`ff95008`);
+cancelled llm-wiki sessions (`a6c6786`); retrieval scored after a stop or a stuck call (`705760e`).
 
 **Not verified.** No model-backed run, no real worker on another machine, no restart of a real `serve` with pieces
 waiting (the republish path is covered only by reading the code), and no run with both `serve`'s own slots and the
