@@ -44,7 +44,9 @@ Claude account could run sessions, but nothing can send them there. `research ex
 run folder for a hand-run session. They assume the same machine: the export points the agent at local folders
 and at `/mcp`, and `reclaim` reads the folder back from the server's disk.
 
-Evaluation is a separate harness. `knode-os eval run` builds its own knode workspaces (PGlite) and other systems.
+Evaluation is a separate harness. `knode-os eval run` builds its own knode workspaces and other systems; their indexes
+are on the product's backend, in a database of their own (`knode_eval` on PostgreSQL, PGlite when the run's config is
+on it — design 31 D1).
 It answers model calls through a shim on 127.0.0.1 that exists only during the run, and judges with Claude Code.
 Packs and runs live in `~/knode-eval`. Until 2026‑11‑13 it never touched `serve`; a run resumes record by record
 from keyed JSONL (src/eval/runstore.ts).
@@ -213,7 +215,7 @@ worker keeps `payload.worker`; a team's or a study's phases each keep their `wor
  serve ── EvalSource eval-call / eval-session (src/work/eval.ts), behind every workspace's broker
    │  worker ── POST /remote/v1/w/<ws>/work/lease { kinds: [eval-call, eval-session], backend: codex } (knr_, scope eval)
    │            GET  …/eval-archives/<sha256>               once per archive, cached by id, unpacked fresh per session
-   │            POST …/eval-sessions/<id>/mcp  (kes_)  ──▶ serve ──▶ the run's MCP bridge on 127.0.0.1 ──▶ knode-os mcp (stdio)
+   │            POST …/eval-sessions/<id>/mcp  (kes_)  ──▶ serve ──▶ the build's tool host on 127.0.0.1 (in the run, design 31 D4)
    │            POST …/work/renew { output } · …/work/complete { text | session: { exitCode, output, lastMessage, capped, cwd, home } }
    ▼
  the outcome goes back on the held request: answered | error | withdrawn | failed | cancelled
@@ -236,11 +238,12 @@ worker keeps `payload.worker`; a team's or a study's phases each keep their `wor
     stream before compression). The run uploads it unless `serve` holds it (`HEAD` first), so a corpus every question
     reads is uploaded and downloaded once; the worker keeps it by id and unpacks a fresh read-only copy per session.
     `serve` lets a worker download an archive only while a session that reads it is offered or out.
-  - An *MCP agent* (agent-knode) keeps its knode server here, on the copy of the workspace the run built: the run
-    starts an MCP bridge on 127.0.0.1 (`startMcpBridge`) that starts the same stdio server a local session would on
-    its first call and answers only the spec's `enabledTools`. The lease mints a `kes_` token, held in memory and
+  - An *MCP agent* (agent-knode) keeps its knode tools here, on the index the run built: since 2026-11-14 (design 31
+    D4) the run serves each build's tools itself on 127.0.0.1 (src/eval/toolhost.ts), one host for every session of
+    the build, local or remote, answering only `KNODE_AGENT_TOOLS` (before, a bridge per session started a
+    `knode-os mcp` child). The lease mints a `kes_` token, held in memory and
     dropped when the lease ends; the worker's agent calls `/remote/v1/w/<ws>/eval-sessions/<id>/mcp` with it, and
-    `serve` proxies to the bridge with the bridge's own secret, refusing a `tools/call` outside the set (403) and
+    `serve` proxies to the host with the host's own secret, refusing a `tools/call` outside the set (403) and
     auditing each call (tool and path, never content). No workspace is copied, and query embeddings stay here, so
     vectors match.
   - Its renewals carry stdout (D10, every `--session-renew-ms`, default 30 s; leases last 120 s, D12); the worker

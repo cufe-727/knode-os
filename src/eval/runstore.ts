@@ -64,6 +64,8 @@ export interface RunMeta {
   repeat?: { n: number; systems: string[] };
   /** `--remote`: the serve it offered work through, and whether its calls and its judge could leave. */
   remote?: { serve: string; calls: boolean; judge: boolean };
+  /** Where knode's indexes lived (docs/design/31 D1): `pglite`, or `postgres` with its server and database (never credentials). Absent: a run from before, on PGlite. */
+  database?: { kind: string; at: string; poolSize?: number };
 }
 
 export class RunStore {

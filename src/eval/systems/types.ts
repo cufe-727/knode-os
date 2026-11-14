@@ -1,4 +1,4 @@
-import type { LlmEffort } from '../../config.js';
+import type { DatabaseConfig, LlmEffort } from '../../config.js';
 import type { EmbeddingProvider } from '../../ingest/embeddings.js';
 import { ChatMessage, LlmClient } from '../../llm/client.js';
 import type { CallUsage } from '../../llm/usage.js';
@@ -36,6 +36,8 @@ export interface SystemEnv {
   quota: QuotaGuard;
   models: ModelSettings;
   log: (msg: string) => void;
+  /** Where knode's indexes live for this run (src/eval/database.ts); absent, the default's evaluation database. */
+  database?: DatabaseConfig;
 }
 
 export interface SystemAnswer {

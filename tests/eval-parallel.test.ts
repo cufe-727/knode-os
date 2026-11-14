@@ -145,10 +145,16 @@ describe('knode answers in parallel', () => {
       }
       // sessions ran side by side, not one at a time
       if (system === 'agent-knode') expect(widest).toBeGreaterThan(1);
-      report(`${system} width ${WIDTH}${delay ? `, ${delay} ms a model turn` : ''} on ${process.env.KNODE_DATABASE_KIND}: ${answered} answers in ${ms} ms (${((answered / ms) * 60_000).toFixed(0)} a minute, runs included)${system === 'agent-knode' ? `, at most ${widest} sessions at once` : ''}\n${lines.join('\n')}`);
+      report(`${system} width ${WIDTH}${delay ? `, ${delay} ms a model turn` : ''} on ${new RunStore(path.join(tmp, 'runs', `wide-${system}-1`)).meta()?.database?.at}: ${answered} answers in ${ms} ms (${((answered / ms) * 60_000).toFixed(0)} a minute, runs included)${system === 'agent-knode' ? `, at most ${widest} sessions at once` : ''}\n${lines.join('\n')}`);
     }, 600_000);
   }
 });
+
+/** A context once the store's own upkeep after opening is done, as the harness hands it out. */
+async function ready(ctx: AppContext): Promise<AppContext> {
+  await Promise.all([ctx.store.indexing, ctx.store.retype]);
+  return ctx;
+}
 
 /** What reading may write: the hit counts behind heat, resolve receipts and context-pack events. */
 async function traces(ctx: AppContext): Promise<Record<string, unknown>> {
@@ -176,7 +182,7 @@ describe('answering leaves the index as built', () => {
     try {
       await sys.reopen!(env);
       // one context at a time on the workspace: the system's, then this test's
-      let ctx = await createContext(ws);
+      let ctx = await ready(await createContext(ws));
       const before = await traces(ctx);
       await ctx.store.close();
 
@@ -188,7 +194,7 @@ describe('answering leaves the index as built', () => {
       expect(second.citations).toEqual(first.citations);
       await sys.release!(env);
 
-      ctx = await createContext(ws);
+      ctx = await ready(await createContext(ws));
       try {
         expect(await traces(ctx)).toEqual(before);
         // the agent's tools as the evaluation hosts them
@@ -246,7 +252,7 @@ describe("the build's tool host", () => {
     await stdio.close();
     expect(expected.tools.map((t) => t.name).sort()).toEqual([...KNODE_AGENT_TOOLS].sort());
 
-    const ctx = await createContext(ws);
+    const ctx = await ready(await createContext(ws));
     const host = await startToolHost(async () => ctx, KNODE_AGENT_TOOLS);
     try {
       const connect = async (token: string) => {

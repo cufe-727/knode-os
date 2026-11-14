@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mapLimit } from '../bench/util.js';
-import { isCliProvider, KnodeConfig, LlmEffort, loadConfig } from '../config.js';
+import { defaultConfig, isCliProvider, KnodeConfig, LlmEffort, loadConfig } from '../config.js';
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { createConfiguredEmbeddingProvider } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
@@ -26,6 +26,7 @@ import { judgeAgent, packMayLeave, PlacedChatBackend, RemoteEval, remoteJudgeCli
 import type { Placed } from './meter.js';
 import { closeAdapters } from './systems/external.js';
 import { closeKnodeStates } from './systems/knode.js';
+import { describeDatabase, EVAL_POOL_MAX, evalDatabase, orphanedEvalSchemas, sameDatabase } from './database.js';
 import { makeSystems } from './systems/index.js';
 import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
 import { boundedTrace } from './trace.js';
@@ -49,6 +50,14 @@ export interface RunOptions {
   runDir?: string;
   /** A knode workspace whose config supplies the embedder and, with `chatConnection`, the chat endpoint (read-only). */
   configFrom?: string;
+  /**
+   * Where knode's indexes live (docs/design/31 D1): a PostgreSQL connection
+   * string (default `KNODE_EVAL_DATABASE_URL`). Absent, the run follows its
+   * config's `database.kind`: PGlite in each workspace, or the database
+   * `knode_eval` on the server `configFrom` (or the default config) names. A
+   * run refuses to start on that config's own database.
+   */
+  databaseUrl?: string;
   /**
    * A connection of that workspace — an API endpoint — that answers the shim's
    * chat calls instead of `codex exec`. Agents stay Codex sessions.
@@ -216,6 +225,17 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   });
 
   const workspaceConfig = opts.configFrom ? loadConfig(opts.configFrom) : null;
+  // the indexes on the product's backend, in a database of their own (docs/design/31 D1): checked before anything is spent
+  const sourceDatabase = workspaceConfig?.database ?? defaultConfig().database;
+  const database = evalDatabase(sourceDatabase, { url: opts.databaseUrl, poolSize: opts.answerConcurrency ?? 3 });
+  if (sameDatabase(database, sourceDatabase)) {
+    throw new Error(`the evaluation's indexes would go into ${describeDatabase(database)}, the database ${opts.configFrom ? `the --config-from workspace (${opts.configFrom})` : 'the default config'} uses — name another with --database-url (or KNODE_EVAL_DATABASE_URL)`);
+  }
+  // a run from before this field kept its indexes on PGlite
+  const previous = store.meta() ? store.meta()!.database ?? { kind: 'pglite', at: 'pglite' } : null;
+  if (previous && previous.kind !== database.kind) {
+    throw new Error(`run ${path.basename(runDir)} keeps its indexes on ${previous.at}; this run would keep them on ${describeDatabase(database)} — results on two backends are not pooled: resume it on ${previous.kind}, or start a new run`);
+  }
   const configured = opts.overrides?.embedder
     ?? (opts.embedding === 'local' || !workspaceConfig
       ? createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false })
@@ -246,6 +266,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   // a call leaves only on the run's own Codex backend with a named model: the worker runs exactly that one
   const callsLeave = Boolean(remote && !opts.overrides?.chat && !opts.chatChain && !opts.chatConnection && opts.model);
   if (remote) remote.callsLeave = callsLeave;
+  // one pool per open workspace, as wide as a system answers here and on the workers, at most 16
+  if (remote && database.kind === 'postgres') database.poolSize = Math.min(EVAL_POOL_MAX, (opts.answerConcurrency ?? 3) + Math.max(remote.online('eval-session', 'codex'), remote.callSlots()));
   if (remote && !callsLeave) chainLog(`remote: model calls stay here (${opts.model ? 'the run answers on a chain, a connection or a stand-in' : 'no --model: a worker runs the model the run names'}); agent sessions${opts.model ? '' : ' too'}`);
   const state = shimState({ cacheDir: store.cacheDir(), slots: opts.slots ?? 6, embeddingTokenCap: opts.embeddingTokenCap });
   const placed = callsLeave ? new PlacedChatBackend(backend, state.slots, remote!, { model: opts.model! }) : null;
@@ -301,12 +323,14 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     model: { connection: opts.chatChain ?? opts.chatConnection ?? 'codex-cli', label: backend.label, buildEffort: models.buildEffort, answerEffort: models.answerEffort, ...(opts.agentChain ? { agents: opts.agentChain } : {}) },
     judge: { connection: opts.judgeChain ?? opts.judgeProvider ?? 'claude-cli', label: judgeClient.label },
     embedding: `${embedder.model} (${embedder.dimensions})`,
+    database: { kind: database.kind, at: describeDatabase(database), ...(database.kind === 'postgres' ? { poolSize: database.poolSize } : {}) },
     fraction,
     seed,
     limit: opts.limit ?? null,
     versions: {},
     ...(opts.types?.length ? { types: opts.types } : {}),
   };
+  meta.database ??= { kind: database.kind, at: describeDatabase(database) };
   store.writeMeta(meta);
 
   // remote slots add to this machine's: a system answers that many more tasks at once while workers are online (F)
@@ -329,6 +353,14 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   // one killed outright leaves them for the next run's sweep
   const swept = sweepStaleTempDirs();
   if (swept) progress(`removed ${swept} temp directories of runs that are gone`);
+  // and the evaluation schemas whose run directory is gone: listed, never dropped here (`eval drop --orphaned` does)
+  if (database.kind === 'postgres') {
+    const orphans = await orphanedEvalSchemas(database).catch(() => []);
+    if (orphans.length) {
+      progress(`${orphans.length} evaluation schemas in ${describeDatabase(database)} belong to workspaces that are gone (${orphans.slice(0, 3).map((o) => o.schema).join(', ')}${orphans.length > 3 ? ', …' : ''}): \`knode-os eval drop --orphaned\` drops them`);
+      store.log('orphaned evaluation schemas', { database: describeDatabase(database), schemas: orphans.map((o) => o.schema) });
+    }
+  }
   const onSignal = (signal: NodeJS.Signals) => {
     closeAdapters();
     removeHeldTempDirs();
@@ -397,6 +429,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           quota,
           models,
           log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`),
+          database,
         };
         if (!(await buildGroup(store, meter, env, group, members, fraction, seed, progress, opts.signal))) {
           failed.add(group);
@@ -431,7 +464,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         const tasks = updateTasks.filter((t) => t.afterUpdate === batch);
         for (const [group, members] of groups) {
           if (failed.has(group)) continue;
-          const env: SystemEnv = { runId: meta.id, pack, staged, workDir: store.workDir(pack.manifest.id, group), shim: packShim, meter, quota, models, log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`) };
+          const env: SystemEnv = { runId: meta.id, pack, staged, workDir: store.workDir(pack.manifest.id, group), shim: packShim, meter, quota, models, log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`), database };
           const updater = members.find((s) => s.update);
           const key = recordKey('update', pack.manifest.id, group, batch, fraction, seed);
           if (updater && !store.build(key)) {
@@ -637,8 +670,17 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
   const done = store.build(key);
   if (done?.ok) {
     progress(`[${env.pack.manifest.id}/${group}] reusing build from ${done.at}`);
-    await builder.reopen?.(env);
-    return true;
+    try {
+      await builder.reopen?.(env);
+      return true;
+    } catch (err) {
+      // another run's build that cannot be made this run's own (its schema gone, another backend): built afresh
+      const from = (done.notes as { reusedFrom?: string } | undefined)?.reusedFrom;
+      if (!from) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      progress(`[${env.pack.manifest.id}/${group}] cannot reuse the build of ${from} (${reason}): building afresh`);
+      store.log('reused build rebuilt', { pack: env.pack.manifest.id, group, from, reason });
+    }
   }
   progress(`[${env.pack.manifest.id}/${group}] building`);
   const mark = meter.mark();

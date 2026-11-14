@@ -509,6 +509,8 @@ export function renderReport(d: ReportData): string {
   lines.push(`# Knowledge benchmark — ${meta?.id ?? ''}`, '');
   if (meta) {
     lines.push(`- Model: ${meta.model.label} (build effort ${meta.model.buildEffort}, answer effort ${meta.model.answerEffort}); judge: ${meta.judge.label}; embedder: ${meta.embedding}`);
+    // knode's index backend (docs/design/31 D1): runs on PGlite and on PostgreSQL are compared, not pooled
+    lines.push(`- knode index: ${meta.database?.at ?? 'pglite'}${meta.database?.poolSize ? ` (pool of ${meta.database.poolSize})` : ''}`);
     lines.push(`- Packs: ${d.packs.join(', ')}; systems: ${d.systems.join(', ')}; corpus fraction ${meta.fraction}, seed ${meta.seed}; git ${meta.gitSha?.slice(0, 10) ?? '?'}`);
     lines.push(`- Judge calls: ${d.judgeUsage.calls}`, '');
   }

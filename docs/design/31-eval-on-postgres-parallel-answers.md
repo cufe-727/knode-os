@@ -1,6 +1,6 @@
 # 31 — Evaluation on PostgreSQL, and knode answers in parallel
 
-Status: being implemented (2026-11-14) on branch `claude/eval-postgres-parallel-a83957`, one commit per step: D2's harness half (single-flight open), D3 and D4 done. The running 10× separation run is unaffected: it executes from its own checkout's build.
+Status: being implemented (2026-11-14) on branch `claude/eval-postgres-parallel-a83957`, one commit per step: D1, D2's harness half (single-flight open), D3 and D4 done. The running 10× separation run is unaffected: it executes from its own checkout's build.
 
 ## Problem
 
@@ -55,6 +55,21 @@ Each session starts `knode-os --data <ws> mcp` as a stdio child (for a remote se
 - One pool per open workspace, sized for the run (`poolSize` ≈ answer concurrency, capped at 16). The live server on this machine allows 100 connections and holds about 20; with D4 only the harness process opens the index, so a run adds one pool.
 - `run.json` records the backend (`database: postgres|pglite`), and the report prints it. Results on the two backends are not pooled.
 
+*As built (src/eval/database.ts):*
+
+- `evalDatabase` turns the run's database config into the evaluation's: PGlite stays PGlite with the default's fields (a live workspace's `database.path` or password never reaches a run's workspace); PostgreSQL keeps the server and moves to `knode_eval` with the schema prefix `eval`, so a build's schema is `eval_ws_<hash of its workspace path>` and can never be a live workspace's (`ws_…`); a URL (`--database-url`, else `KNODE_EVAL_DATABASE_URL`) means PostgreSQL on that server, in the database it names or `knode_eval`. Any other `database.kind` (a storage plugin) is refused.
+- The refusal compares host (loopback names folded), port and database of the evaluation's config and the `--config-from` workspace's (or the default config's when there is none), before anything is spent.
+- No credential is written into a run's workspace config: a password, or a URL carrying one, goes into the run process's environment and the file names the variable. A resumed run sets it again from its own options; `eval drop` takes `--database-url` for the same reason.
+- Pool: `answerConcurrency` (default 3), plus the online worker slots with `--remote`, at most 16. A build's passes share the same pool (they queue in it).
+- A resumed run refuses to continue on another backend than its `run.json` names; a run from before has none and counts as PGlite.
+- The harness hands a context out only after the store's background upkeep after opening (`store.indexing`, `store.retype`) has settled. Found while testing on PostgreSQL: until the substring indexes are marked ready the keyword channel takes a scanning path whose keyword scores differ from the indexed one (1.97 vs 4.02 for the same chunk, same matches), so the first answers after an open were ranked differently from later ones. On PGlite the upkeep ran before the first query anyway. That the two paths score differently is a product question left open here (src/search/search.ts, `matchIndexReady`).
+
+*Lifecycle as built:*
+
+- Each build writes `.knode/eval-index.json` beside its workspace (`kind`, `schema`, the workspace it belongs to) and labels its schema with a comment naming the workspace directory; the schema is in the build's notes (`schema`, `database`). A build drops its workspace's schema first, so a rebuild in the same run never inherits an old one.
+- Reuse: `reuseBuilds` still copies the work directory; the clone happens when the knode system reopens the copy (`adoptIndex`), since that is where the database config and the store are at hand. `cloneSchema` creates the target with the store's own migrations, empties it, copies every table parents first (no triggers or generated columns in the schema today; identity columns overridden; sequences set after) in one transaction, and labels it. It refuses when the source schema is gone, or the tables differ from what this version creates; a build whose index is on another backend is refused too. `buildGroup` then builds afresh and logs why (`reused build rebuilt`) — only for a reused build: a resumed run's own build that fails to reopen still fails its pack.
+- `knode-os eval drop <run-dir>` drops each build workspace's index through `dropBackend` (on PostgreSQL only a schema with the `eval` prefix: one this run's workspace names). The schema name's hash cannot be read back, so the stale sweep goes by the schema comments: at the start of a run on PostgreSQL the evaluation schemas whose workspace directory is gone are *listed* (progress line and the run's log), and `knode-os eval drop --orphaned` drops them. Listing rather than dropping at a run's start, because a run directory that was moved, not deleted, would lose its indexes. Schemas without the comment (none are made so) are left alone.
+
 Lifecycle, which the directory copy no longer covers:
 
 - **Reusing builds** (`--reuse-builds-from`): `reuseBuilds` copies the work directory; on PostgreSQL it also clones the schema into the new run's schema, since update batches change an index in place. A build that cannot be cloned is built afresh, with the reason logged.
@@ -95,6 +110,7 @@ Why not a CLI the agent runs in its shell:
 Before any model-backed run:
 
 1. Suite on PGlite as today, plus the Postgres-backed evaluation tests on a throwaway cluster (as `tests/backend-postgres*.test.ts`).
+   - *As run:* `tests/eval-postgres.test.ts` is switched on as the backend tests are (`KNODE_TEST_PG_HOST/_PORT/_USER/_PASSWORD`, skipped when no PostgreSQL with pgvector answers) and uses a database of its own per run, dropped after. It runs the fixture pack end to end (every native knode system, both update batches, scoring and the report), a reuse with the schema cloned and the update landing in the clone only, a reuse whose source schema is gone (built afresh), the refusal to resume on another backend, `eval drop`, and the orphan listing.
 2. Retrieval equivalence, no model calls: build the 1× reports pack once per backend with the reply cache of `run-1x` and compare `knode-ask` retrieval metrics (recall@k, MRR, nDCG). Differences beyond tie order are investigated before the backend is switched.
 3. A parallel smoke test: knode-ask and agent-knode at width 8 with the scripted backend, on both backends, 20 repetitions, no stall.
 

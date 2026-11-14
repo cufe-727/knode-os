@@ -22,10 +22,13 @@ import { WIKI_SOURCES_BRIEF, wikiWithSources } from './llm-wiki.js';
 import { recordAgent, shimClient, SystemEnv, SystemUnderTest } from './types.js';
 import { evalTempDir } from '../tmp.js';
 import { startToolHost, ToolHost } from '../toolhost.js';
+import { cloneSchema, describeDatabase, dropEvalWorkspace, evalDatabase, markSchema, storableDatabase } from '../database.js';
 
 /**
  * knode-os as a system under test (docs/design/23 §3): a fresh workspace per
- * pack with the embedded PGlite index, every model route and the embedder
+ * pack with its index on the product's backend — a schema of its own in the
+ * evaluation database on PostgreSQL, an embedded database on PGlite
+ * (src/eval/database.ts, docs/design/31 D1) — every model route and the embedder
  * pointed at the run's shim (so its build is metered like everyone else's),
  * built the way `serve` builds — sync, then document passes until the queue
  * and the summaries are done, then wiki generation and refinement.
@@ -124,8 +127,12 @@ function stateFor(env: SystemEnv): KnodeState {
   return s;
 }
 
-/** The workspace config: PGlite, the shim for every stage and for embeddings, nothing that reaches out on its own. */
-export function evalWorkspaceConfig(env: Pick<SystemEnv, 'shim' | 'pack'>, system = 'knode'): KnodeConfig {
+/**
+ * The workspace config: the run's evaluation database (PGlite in the workspace, or a schema of its own on
+ * PostgreSQL — never a live workspace's database), the shim for every stage and for embeddings, nothing that
+ * reaches out on its own.
+ */
+export function evalWorkspaceConfig(env: Pick<SystemEnv, 'shim' | 'pack'> & Partial<Pick<SystemEnv, 'database'>>, system = 'knode'): KnodeConfig {
   const base = defaultConfig();
   const connection = (stage: string): LlmConnection => ({
     id: `eval-${stage}`,
@@ -144,7 +151,7 @@ export function evalWorkspaceConfig(env: Pick<SystemEnv, 'shim' | 'pack'>, syste
   const pass = evalPassSettings();
   return {
     ...base,
-    database: { ...base.database, kind: 'pglite' },
+    database: storableDatabase(env.database ?? evalDatabase(base.database)),
     embedding: embedder
       ? { provider: 'openai', baseUrl: env.shim.baseUrl, apiKey: formatTag({ system, stage: 'embed' }), model: embedder.model, dimensions: embedder.dimensions, batchSize: 16, sendDimensions: false }
       : base.embedding,
@@ -175,7 +182,12 @@ function open(s: KnodeState): Promise<AppContext> {
   const closing = s.closing;
   const opening = (async () => {
     if (closing) await closing;
-    return createContext(s.ws);
+    const ctx = await createContext(s.ws);
+    // the index as built, for every answer: the store finishes its own upkeep in the background after it opens, and
+    // until the substring indexes are marked ready the keyword channel takes another path that scores differently
+    // (on PostgreSQL the first answers after an open did; on PGlite the upkeep ran first anyway)
+    await Promise.all([ctx.store.indexing, ctx.store.retype]);
+    return ctx;
   })();
   s.ctx = opening;
   // a failed open is not kept: the next caller tries again
@@ -216,6 +228,54 @@ async function close(s: KnodeState): Promise<void> {
   } finally {
     if (s.closing === closing) s.closing = null;
   }
+}
+
+/** What a build's index is and where, beside its workspace: what a reused copy of the workspace is reopened by. */
+interface IndexRecord {
+  kind: string;
+  /** PostgreSQL: the build's schema in the evaluation database. */
+  schema?: string;
+  /** The workspace the index belongs to: a copy elsewhere (a reused build) does not own it. */
+  workspace: string;
+}
+
+const indexRecordFile = (s: KnodeState) => path.join(s.ws, '.knode', 'eval-index.json');
+
+function readIndexRecord(s: KnodeState): IndexRecord | null {
+  try {
+    return JSON.parse(fs.readFileSync(indexRecordFile(s), 'utf8')) as IndexRecord;
+  } catch {
+    return null;
+  }
+}
+
+/** Note the build's index (and on PostgreSQL label its schema with the workspace, for `eval drop --orphaned`). */
+async function recordIndex(s: KnodeState, ctx: AppContext): Promise<IndexRecord> {
+  const cfg = ctx.config.database;
+  const rec: IndexRecord = { kind: cfg.kind, workspace: path.resolve(s.ws), ...(cfg.kind === 'postgres' ? { schema: await markSchema(cfg, s.ws) } : {}) };
+  fs.writeFileSync(indexRecordFile(s), JSON.stringify(rec, null, 2));
+  return rec;
+}
+
+/**
+ * A reused build's index, made this workspace's own: its work directory was copied, and with it an
+ * embedded PGlite index; a PostgreSQL schema stays where it is, so it is cloned into this workspace's
+ * (update batches change an index in place — two runs must not share one). Throws when it cannot be,
+ * and the run builds afresh.
+ */
+async function adoptIndex(s: KnodeState, env: SystemEnv, cfg: KnodeConfig): Promise<void> {
+  const rec = readIndexRecord(s);
+  const kind = cfg.database.kind;
+  if (kind !== 'postgres') {
+    if (rec && rec.kind !== kind) throw new Error(`the build's index is on ${rec.kind}; this run keeps its indexes on ${kind}`);
+    return;
+  }
+  if (!rec?.schema || rec.kind !== 'postgres') throw new Error(`the build's index is on ${rec?.kind ?? 'pglite (it has no index record)'}; this run keeps its indexes on ${describeDatabase(cfg.database)}`);
+  if (rec.workspace === path.resolve(s.ws)) return;
+  const t0 = Date.now();
+  const cloned = await cloneSchema(cfg.database, rec.schema, s.ws, cfg.embedding.dimensions);
+  fs.writeFileSync(indexRecordFile(s), JSON.stringify({ kind, schema: cloned.schema, workspace: path.resolve(s.ws) } satisfies IndexRecord, null, 2));
+  env.log(`knode: cloned schema ${rec.schema} into ${cloned.schema} (${cloned.tables} tables, ${cloned.rows} rows, ${Date.now() - t0} ms)`);
 }
 
 /** `raw/docs/<x>` → corpus path `<x>`; a generated page → the documents it was made from. */
@@ -281,9 +341,13 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
       await close(s);
       fs.rmSync(s.ws, { recursive: true, force: true });
       fs.mkdirSync(s.ws, { recursive: true });
-      fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(evalWorkspaceConfig(env), null, 2));
+      const config = evalWorkspaceConfig(env);
+      fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(config, null, 2));
+      // a build starts empty: on PostgreSQL the workspace's schema outlives its directory (an earlier, failed build)
+      if (config.database.kind === 'postgres') await dropEvalWorkspace(s.ws, config.database);
       fs.cpSync(env.staged.dir, path.join(s.ws, 'raw', 'docs'), { recursive: true });
       const ctx = await open(s);
+      const index = await recordIndex(s, ctx);
       const t0 = Date.now();
       const synced = await sync(ctx, { datasources: false, onProgress: (m) => env.log(`knode sync: ${m}`) });
       const tSync = Date.now() - t0;
@@ -303,14 +367,16 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
       );
       return {
         kbDir: s.ws,
-        notes: { ...counts, ...passes, passConcurrency: ctx.config.extraction.concurrency, judgeConcurrency: ctx.config.review?.directConcurrency ?? 1, passBatch: ctx.config.extraction.batchSize, wikiPages: pages.length, refined, indexed: synced.indexed, stageMs: { sync: tSync, documentPasses: tPasses, wiki: Date.now() - t0 - tSync - tPasses } },
+        notes: { ...counts, database: describeDatabase(ctx.config.database), ...(index.schema ? { schema: index.schema } : {}), ...passes, passConcurrency: ctx.config.extraction.concurrency, judgeConcurrency: ctx.config.review?.directConcurrency ?? 1, passBatch: ctx.config.extraction.batchSize, wikiPages: pages.length, refined, indexed: synced.indexed, stageMs: { sync: tSync, documentPasses: tPasses, wiki: Date.now() - t0 - tSync - tPasses } },
       };
     },
     async reopen(env) {
       const s = stateFor(env);
       if (!fs.existsSync(path.join(s.ws, 'knode.config.json'))) throw new Error(`no knode workspace to reopen at ${s.ws}`);
-      // the shim's port changed since the build: repoint the workspace at this run's shim
-      fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(evalWorkspaceConfig(env), null, 2));
+      // the shim's port changed since the build: repoint the workspace at this run's shim (and its database)
+      const config = evalWorkspaceConfig(env);
+      fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(config, null, 2));
+      await adoptIndex(s, env, config);
       readPageSources(s);
     },
     async release(env) {

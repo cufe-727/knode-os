@@ -157,6 +157,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--suites <list>', `comma-separated: ${SUITES.join(',')}`)
     .option('--run-dir <dir>', 'resume this run directory')
     .option('--config-from <workspace>', 'knode workspace whose embedder the run uses (read-only)')
+    .option('--database-url <url>', `PostgreSQL for knode's indexes, one schema per build (default: $KNODE_EVAL_DATABASE_URL, else the database knode_eval on the server the run's config names; PGlite when that config is on PGlite). Never the --config-from workspace's own database`)
     .option('--embedding <kind>', 'workspace | local', 'workspace')
     .option('--embedding-endpoint <url>', "embed on this OpenAI-compatible endpoint (a local bge-m3, say) under the workspace embedder's identity, once it reproduces the vectors the run holds")
     .option('--embedding-fallback', "with --embedding-endpoint: use the workspace's embedder while the endpoint is unreachable")
@@ -199,6 +200,7 @@ export function registerEvalCommands(program: Command): void {
         suites: (csv(opts.suites) as Suite[] | undefined) ?? [...SUITES],
         runDir: opts.runDir,
         configFrom: opts.configFrom,
+        databaseUrl: opts.databaseUrl,
         chatConnection: opts.chatConnection,
         embedding: opts.embedding,
         embeddingEndpoint: opts.embeddingEndpoint,
@@ -236,6 +238,28 @@ export function registerEvalCommands(program: Command): void {
       console.log(`\n${res.builds} builds, ${res.answers} answers, ${res.scores} scores\nreport: ${report.md}`);
       // child processes and embedder timers can keep the loop alive after a run: it is over
       process.exit(process.exitCode ?? 0);
+    });
+  evalCmd
+    .command('drop [runDir]')
+    .description("drop a run's knode indexes (its schemas in the evaluation database, or its embedded databases); its records stay. --orphaned: drop the evaluation schemas whose run directory is gone")
+    .option('--database-url <url>', 'the evaluation database (default: what the run\'s workspaces name, or $KNODE_EVAL_DATABASE_URL)')
+    .option('--config-from <workspace>', 'with --orphaned: the workspace whose server holds the evaluation database knode_eval')
+    .option('--orphaned', 'drop evaluation schemas whose workspace directory no longer exists')
+    .action(async (runDir: string | undefined, opts: { databaseUrl?: string; configFrom?: string; orphaned?: boolean }) => {
+      const { defaultConfig, loadConfig } = await import('../config.js');
+      const { describeDatabase, dropEvalSchema, dropRun, evalDatabase, orphanedEvalSchemas } = await import('./database.js');
+      if (runDir) await dropRun(runDir, { url: opts.databaseUrl, log: (m) => console.log(`  ${m}`) });
+      if (opts.orphaned) {
+        const cfg = evalDatabase(opts.configFrom ? loadConfig(opts.configFrom).database : defaultConfig().database, { url: opts.databaseUrl });
+        if (cfg.kind !== 'postgres') throw new Error('--orphaned: the evaluation database is PGlite here; its indexes live in the run directories');
+        const orphans = await orphanedEvalSchemas(cfg);
+        for (const o of orphans) {
+          await dropEvalSchema(cfg, o.schema);
+          console.log(`  dropped ${o.schema} (${o.workspace} is gone)`);
+        }
+        console.log(`${orphans.length} orphaned evaluation schemas dropped in ${describeDatabase(cfg)}`);
+      }
+      if (!runDir && !opts.orphaned) throw new Error('name a run directory, or pass --orphaned');
     });
   evalCmd
     .command('score <runDir>')
