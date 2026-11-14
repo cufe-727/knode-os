@@ -358,6 +358,58 @@ describe('Chinese restatements without real vectors', () => {
   });
 });
 
+describe('a review that calls the Judge route itself', () => {
+  const restated = ['甲公司计划扩大海外产能，重点布局东南亚市场', '甲公司计划在东南亚市场扩大海外产能'];
+  const figures = ['甲公司在隔夜交易中收跌2.15%', '甲公司在隔夜交易中收涨0.45%'];
+  const open: AppContext[] = [];
+
+  /** The same two judged pairs in a workspace of its own, one pair a call, with a judge that takes a moment. */
+  async function audit(name: string, directConcurrency?: number) {
+    const dataDir = path.join(tmp, name);
+    initDataDir(dataDir);
+    write(dataDir, 'raw/docs/one.md', claimsDoc('甲公司', [restated[0], figures[0]]));
+    write(dataDir, 'raw/docs/two.md', claimsDoc('甲公司', [restated[1], figures[1]]));
+    const ctx = await createContext(dataDir);
+    open.push(ctx);
+    await sync(ctx, { llmGraph: false });
+    const shown: string[] = [];
+    const inner = sameJudge(shown);
+    let active = 0;
+    let widest = 0;
+    const llm = {
+      ...inner,
+      complete: async (...args: Parameters<LlmClient['complete']>) => {
+        widest = Math.max(widest, ++active);
+        await new Promise((r) => setTimeout(r, 40));
+        try {
+          return await inner.complete(...args);
+        } finally {
+          active--;
+        }
+      },
+    } as unknown as LlmClient;
+    const config = directConcurrency === undefined ? ctx.config : { ...ctx.config, review: { ...ctx.config.review, directConcurrency } };
+    const stats = await auditDuplicateClaims({ store: ctx.store, embedder: ctx.embedder, config, llm }, { pairsPerCall: 1 });
+    return { stats, widest, shown };
+  }
+  afterAll(async () => {
+    for (const ctx of open) {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+  it('sends its calls one at a time by default, at once under review.directConcurrency, to the same result', async () => {
+    const one = await audit('direct-judge-one');
+    const wide = await audit('direct-judge-wide', 4);
+    expect(one.widest).toBe(1);
+    expect(wide.widest).toBe(2);
+    expect(one.stats).toMatchObject({ judged: 2, merged: 1, suggested: 1 });
+    expect(wide.stats).toEqual(one.stats);
+    expect(wide.shown.slice().sort()).toEqual(one.shown.slice().sort());
+  });
+});
+
 describe('near-duplicate statements while claim merging is off', () => {
   const dataDir = path.join(tmp, 'cjk-near-duplicates');
   let ctx: AppContext;

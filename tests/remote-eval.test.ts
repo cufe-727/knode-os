@@ -16,7 +16,7 @@ import { withRemote } from '../src/eval/placement.js';
 import { packMayLeave, RemoteEval } from '../src/eval/remote.js';
 import { runEval, scoreRun } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
-import { evalPassSettings, KNODE_EVAL_BATCH, KNODE_EVAL_CONCURRENCY } from '../src/eval/systems/knode.js';
+import { evalPassSettings, evalWorkspaceConfig, KNODE_EVAL_BATCH, KNODE_EVAL_CONCURRENCY } from '../src/eval/systems/knode.js';
 import { loadPack } from '../src/eval/pack.js';
 import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
 import { RemoteTokenStore } from '../src/remote/tokens.js';
@@ -257,6 +257,8 @@ describe('an evaluation run with remote workers', () => {
     const notes = knode.notes as Record<string, number>;
     expect(notes.passConcurrency).toBe(KNODE_EVAL_CONCURRENCY + callSlots);
     expect(notes.passBatch).toBeGreaterThan(KNODE_EVAL_BATCH);
+    // and its reviews' judge calls as wide as a pass
+    expect(notes.judgeConcurrency).toBe(notes.passConcurrency);
     const answers = store.allAnswers();
     for (const s of ['knode-ask', 'closed-book', 'agent-grep', 'agent-knode']) expect(answers.filter((a) => a.system === s).length, s).toBeGreaterThan(0);
     expect(answers.filter((a) => a.error).map((a) => `${a.system}: ${a.error}`)).toEqual([]);
@@ -303,6 +305,15 @@ describe('an evaluation run with remote workers', () => {
     const twelve = await withRemote({ callSlots: () => 12 }, async () => evalPassSettings());
     expect(twelve.concurrency).toBe(KNODE_EVAL_CONCURRENCY + 12);
     expect(twelve.batchSize).toBe(Math.ceil(((KNODE_EVAL_CONCURRENCY + 12) * KNODE_EVAL_BATCH) / KNODE_EVAL_CONCURRENCY));
+  });
+
+  it('lets a build\'s reviews send judge calls as wide as its passes', async () => {
+    const env = { shim: { baseUrl: 'http://127.0.0.1:9', embedder: null }, pack: {} } as unknown as Parameters<typeof evalWorkspaceConfig>[0];
+    const here = evalWorkspaceConfig(env);
+    expect(here.review?.directConcurrency).toBe(KNODE_EVAL_CONCURRENCY);
+    const wide = await withRemote({ callSlots: () => 20 }, async () => evalWorkspaceConfig(env));
+    expect(wide.review?.directConcurrency).toBe(KNODE_EVAL_CONCURRENCY + 20);
+    expect(wide.extraction.concurrency).toBe(KNODE_EVAL_CONCURRENCY + 20);
   });
 
   it('keeps a private pack on this machine while a worker is online', async () => {

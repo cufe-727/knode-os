@@ -267,7 +267,11 @@ guard no longer holds a batch at its start, only what falls back here.
 remote call takes no local slot, and a system answers `--answer-concurrency` plus the online remote slots of its
 kind at once. A knode build's document passes send `KNODE_EVAL_KNODE_CONCURRENCY` (6) calls at once plus the remote
 call slots online when the build starts, and a pass's batch grows in the same proportion (`evalPassSettings`); the
-build's notes record both. Sync, embedding, wiki generation and refine run here at their own pace.
+build's notes record both. The reviews inside a build (duplicate entities and claims, after every pass and in refine)
+send their judge calls as wide as a pass does (`review.directConcurrency`, recorded as `judgeConcurrency`): in the
+2026-11 10× run they went one at a time, 743 judge calls against 123 extraction calls, with 19 of 20 worker slots idle.
+The verdicts are applied after all of a review's calls return, so the width changes the time, not the result. Sync,
+embedding and wiki generation run here at their own pace.
 
 **Comparability** (D). A worker runs exactly the family and model a task names (its own `--codex-model` does not
 apply), so a piece's backend is `codex-cli:<model>` (`claude-cli:<model>` for the judge) wherever it ran — another

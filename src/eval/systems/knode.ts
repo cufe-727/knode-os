@@ -130,6 +130,7 @@ export function evalWorkspaceConfig(env: Pick<SystemEnv, 'shim' | 'pack'>, syste
   });
   const route = (stage: string) => ({ ...defaultRoutedLlmConfig(), use: `eval-${stage}` });
   const embedder = env.shim.embedder;
+  const pass = evalPassSettings();
   return {
     ...base,
     database: { ...base.database, kind: 'pglite' },
@@ -149,8 +150,11 @@ export function evalWorkspaceConfig(env: Pick<SystemEnv, 'shim' | 'pack'>, syste
       workers: [],
       // a benchmark build may use more of the shim's slots than the product default (3 calls, 8 documents a pass),
       // and the remote workers' beside them
-      ...evalPassSettings(),
+      ...pass,
     },
+    // the reviews inside a build call the Judge route themselves, one call at a time by default; a build's
+    // calls go through the shim (and to the workers), so they go out as wide as its extraction does
+    review: { ...base.review, directConcurrency: pass.concurrency },
   } as KnodeConfig;
 }
 
@@ -251,7 +255,7 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
       );
       return {
         kbDir: s.ws,
-        notes: { ...counts, ...passes, passConcurrency: ctx.config.extraction.concurrency, passBatch: ctx.config.extraction.batchSize, wikiPages: pages.length, refined, indexed: synced.indexed, stageMs: { sync: tSync, documentPasses: tPasses, wiki: Date.now() - t0 - tSync - tPasses } },
+        notes: { ...counts, ...passes, passConcurrency: ctx.config.extraction.concurrency, judgeConcurrency: ctx.config.review?.directConcurrency ?? 1, passBatch: ctx.config.extraction.batchSize, wikiPages: pages.length, refined, indexed: synced.indexed, stageMs: { sync: tSync, documentPasses: tPasses, wiki: Date.now() - t0 - tSync - tPasses } },
       };
     },
     async reopen(env) {

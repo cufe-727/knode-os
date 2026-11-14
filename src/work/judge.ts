@@ -13,7 +13,8 @@ import { noFailures, SourceStatus, WorkSource, WorkTask } from './broker.js';
  * judge prompts first and hands them to a `JudgeRunner` at once, then reads
  * the verdicts. Two runners:
  *
- *   - `directJudge` calls the Judge route itself, one call at a time: the
+ *   - `directJudge` calls the Judge route itself, one call at a time unless
+ *     `review.directConcurrency` says more (an evaluation build's does): the
  *     nightly pass, the CLI and an initialization, which run whether or not
  *     `serve`'s slots do;
  *   - `JudgeSource` offers the calls as leased work through the work broker

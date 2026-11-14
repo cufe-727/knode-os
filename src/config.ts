@@ -1086,6 +1086,13 @@ export interface ReviewConfig {
    * to remote workers (`server.remote.offer.judge`).
    */
   concurrency?: number;
+  /**
+   * Judge calls a review sends at once when it calls the Judge route itself
+   * (`directJudge`: the nightly pass, the CLI, a document pass outside
+   * `serve`'s slots). Default 1. An evaluation build sets it to its pass
+   * concurrency, since its calls go to remote workers (docs/design/27 §8).
+   */
+  directConcurrency?: number;
   /** LLM review of disputed / suspected claims, filed as knowledge suggestions with a verdict. */
   claims: 'off' | 'suggest';
   /**

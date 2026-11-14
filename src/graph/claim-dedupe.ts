@@ -674,7 +674,7 @@ export async function auditDuplicateClaims(
   // PGlite, which answers queries on the event loop, a run of queries holds it as well)
   const pause = breather();
   const realVectors = config.embedding.provider !== 'local' && ctx.embedder.model !== 'local-hash-v1';
-  const judge = ctx.judge ?? (ctx.llm ? directJudge(ctx.llm) : null);
+  const judge = ctx.judge ?? (ctx.llm ? directJudge(ctx.llm, config.review?.directConcurrency ?? 1) : null);
   const judging = Boolean(judge?.enabled);
 
   /* what outlives a batch: the merges made so far, and the pairs waiting for the judge */

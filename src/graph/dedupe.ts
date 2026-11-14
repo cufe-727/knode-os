@@ -262,7 +262,7 @@ export async function auditDuplicateEntities(
   const review = ctx.config.review;
   const judgeMode = review?.llmJudge ?? 'off';
   const verdicts = new Map<string, MergeVerdict>();
-  const judge = ctx.judge ?? (ctx.llm ? directJudge(ctx.llm) : null);
+  const judge = ctx.judge ?? (ctx.llm ? directJudge(ctx.llm, review?.directConcurrency ?? 1) : null);
   if (judgeMode !== 'off' && judge?.enabled) {
     const judged = ranked.slice(0, review?.maxJudgedPerRun ?? 30);
     const calls: JudgeCall[] = [];
