@@ -34,7 +34,7 @@ Everything but evaluation already follows the proposal: `serve`'s local executio
 | D2 | Local capacity is a worker started on this machine | Where work runs follows from where workers run and how many, as the user asked; the run no longer needs this machine's CLI to be the right backend |
 | D3 | A task waits until a slot takes it; a producer may bound the wait and then pauses, never substitutes | A worker that is offline is a reason to wait, not to change backend |
 | D4 | A task names what it requires: CLI family, model, effort, and optionally a pool | The same model name on two backends must not be interchangeable inside one benchmark |
-| D5 | Tasks carry a class, `kb` or `eval`; a slot that takes both serves `kb` first by weight | Knowledge-base work is the product; a benchmark should not slow it, and should not be starved by it forever |
+| D5 | Tasks carry a class, `kb` or `eval`; a slot that takes both serves `kb` first by weight (decided 2026-11-14: no slot takes both, §4) | Knowledge-base work is the product; a benchmark should not slow it, and should not be starved by it forever |
 | D6 | Tasks and their results become durable in `serve` for the kinds whose pieces are independent | A run or `serve` can restart without losing or repeating work |
 | D7 | Evaluation becomes a job in `serve`, with `serve` hosting a build's tools, once its indexes are on PostgreSQL | The last reason the run process must stay alive is the index it holds (design 31) |
 
@@ -68,6 +68,8 @@ A worker never receives argv, environment or a config layer (design 27 D9); that
 ## 4. Order
 
 Within one slot's request, in this order: judge calls (a review is waiting); then the kinds the slot named, by weight. Evaluation joins the weights with its own entry, `server.remote.shares.eval`, default 1 against extraction's 3: a slot that takes both gives knowledge-base work most of its turns, and evaluation is not starved by a long backlog. `shares.eval: 0` means evaluation gets a turn only when no knowledge-base work is waiting. A slot that names only evaluation kinds (as `--eval` slots do today) is unaffected.
+
+**Decided 2026-11-14: slots stay separate.** `server.remote.shares.eval` orders work only for a slot that asks for both classes, and no slot the worker starts does: its evaluation slots (`--eval`) take only evaluation work, its model slots (`--backends`) only knowledge-base work, and `serve`'s own slots take no evaluation work. So a benchmark and the knowledge base do not share slots. They still share an account's quota when their slots run on one account, with no ordering between them. The broker keeps the weight and its tests, for a slot that would ask for both; none is to.
 
 Weights order work inside a slot. They do not ration an account: two slots on one plan still spend the same quota. The quota floor (`processing.minQuotaPercent`) keeps applying per backend, wherever the slot runs.
 
@@ -103,7 +105,7 @@ The lease protocol, tokens and scopes (`eval` for evaluation kinds), the session
 
 - A run started with `--remote` and no worker and no `--local` waits, then stops at the wait limit. Before, it would run on this machine. This is the point, and it is the change every `--remote` script feels: scripts that relied on local execution add `--local`. A command line with neither `--remote` nor `--local` (every run before `--remote`, the test suite) still runs on this machine, on slots sized from `--slots` (§11).
 - Runs take longer when workers are scarce, instead of quietly finishing on another backend.
-- A benchmark and a workspace backlog on the same slots share them 1 : 3 instead of evaluation having slots to itself.
+- A benchmark and a workspace backlog do not share slots (decided 2026-11-14, §4): evaluation slots take only evaluation work and model slots only knowledge-base work, so `server.remote.shares.eval` orders nothing a worker starts. They still share an account's quota, with no ordering between them.
 
 ## 9. Stages
 
@@ -121,8 +123,6 @@ Two defects found on 2026-11-14 are fixed in stage 1, since they are placement b
 - Whether a local slot started by a run is bound by `processing.maxLocalCalls`, which today covers `serve`'s slots only. A run and `serve` on one account otherwise exceed the limit the user set for the machine. Stage 1 leaves the run's slots outside it (the default this design proposed), so `--local codex:6` beside `serve`'s own six is twelve calls on this machine.
 - Whether `judge` calls of a review should carry `requires` too, so a review can be pinned to a pool as a run can.
 - How a pool is shown in the Tasks view, next to the worker and backend it already lists. Stage 1 tags a remote worker with its pool and evaluation work with `evaluation`, and puts a piece's required pool in its detail; a better place may come with use.
-- Whether `shares.eval` should default to 1 or to 0 (only when idle). The user asked for knowledge-base work first "when all other conditions are equal"; 1 reads that as a preference, 0 as a strict order. Stage 1 defaults to 1, and both work in the broker.
-- **`shares.eval` has no effect with today's worker.** It orders work only for a slot that asks for both knowledge-base and evaluation kinds. The worker script's evaluation slots (`--eval`) ask only for evaluation kinds and its model slots (`--backends`) only for knowledge-base kinds, and `serve`'s own slots take no evaluation work; so nothing today makes a benchmark and a workspace backlog share a slot by weight, and §8's "1 : 3" does not happen yet. Whether a slot should take both (and which: the worker's model slots, its evaluation slots, `serve`'s) is undecided; stage 1 does not make evaluation slots take knowledge-base work.
 - Whether a run's own slots should take another run's pieces on the same `serve`. Stage 1 says no (§11).
 
 ## 11. Stage 1 as built (2026-11-14)
