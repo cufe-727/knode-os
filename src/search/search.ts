@@ -275,10 +275,65 @@ export function wantsCode(filter: ResolvedScopeFilter): boolean {
   return Boolean(filter.sources?.some((s) => s === RAW_CODEBASE || s.startsWith(`${RAW_CODEBASE}/`)));
 }
 
+const iterativeScans = new WeakMap<object, Promise<boolean>>();
+
+/**
+ * Whether the store's pgvector scans its index iteratively (0.8.0 on): asked
+ * once per store. Without it a filtered search is left to what one walk of
+ * the index finds.
+ */
+function scansIteratively(store: Store): Promise<boolean> {
+  let known = iterativeScans.get(store);
+  if (!known) {
+    known = store
+      .query<{ v: string }>(`SELECT extversion AS v FROM pg_extension WHERE extname = 'vector'`)
+      .then(([row]) => {
+        const [major, minor] = (row?.v ?? '0.0').split('.').map(Number);
+        return major > 0 || minor >= 8;
+      })
+      .catch(() => false);
+    iterativeScans.set(store, known);
+  }
+  return known;
+}
+
+const sidesHeld = new WeakMap<object, { sources: boolean; generated: boolean; at: number }>();
+
+/** Which sides the index holds documents of, asked at most once a minute per store: a side without any is not searched. */
+async function sidesOfIndex(store: Store): Promise<{ sources: boolean; generated: boolean }> {
+  const hit = sidesHeld.get(store);
+  if (hit && Date.now() - hit.at < 60_000) return hit;
+  const [row] = await store.query<{ sources: boolean; generated: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM documents d WHERE NOT ${isGeneratedSql('d')}) AS sources,
+            EXISTS (SELECT 1 FROM documents d WHERE ${isGeneratedSql('d')}) AS generated`,
+  );
+  const held = { sources: row?.sources !== false, generated: row?.generated !== false, at: Date.now() };
+  sidesHeld.set(store, held);
+  return held;
+}
+
 /**
  * Pure vector recall: cosine distance over pgvector, the nearest `k` chunks of
  * sources or of generated pages. One side a query, each an ordered scan the
  * vector index can serve; a window over both sides would read every vector.
+ *
+ * The side, like any filter here, is tested after the index is walked, and
+ * one walk of an HNSW index ends at `hnsw.ef_search` (40) rows: where pages
+ * are the nearest, the nearest 40 hold a handful of sources, and both sides
+ * read the same 40. On a copy of the 10× separation index in PostgreSQL 17
+ * (pgvector 0.8.7), over 200 question vectors asked for 24 sources:
+ *
+ *   one walk                   3.9 rows, 197 queries short, 0.16 of the exact 24, 1.8 ms
+ *   iterative, strict_order   24 rows,     0 short,          0.90,                 6.2 ms
+ *   iterative, relaxed_order  24 rows,     0 short,          0.96,                 6.2 ms
+ *
+ * and the replay found a gold document in the top 8 for 79 of 297 questions
+ * where the same index in PGlite, which scans every vector, found 104. So the
+ * query runs with `hnsw.iterative_scan = relaxed_order`: the index is walked
+ * on until `k` rows pass the filter (or `hnsw.max_scan_tuples`, 20,000, are
+ * read). That scan may hand rows over a little out of order, so they are
+ * sorted here. The setting is local to a transaction of the one query; a
+ * pgvector before 0.8.0 has no such scan and answers as before.
  */
 async function vectorSide(
   store: Store,
@@ -295,17 +350,20 @@ async function vectorSide(
   const model = p.add(embedder.model);
   const cond = docLiveAt('d', p, asOf, filter);
   const lim = p.add(k);
-  return store.query<RankedChunk>(
-    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
+  const sql = `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
             1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${generated} AS generated
      FROM embeddings e
      JOIN chunks c ON c.id = e.chunk_id
      JOIN documents d ON d.id = c.document_id
      WHERE e.model = ${model} AND ${cond} AND ${generated ? '' : 'NOT '}${isGeneratedSql('d')}
      ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
-     LIMIT ${lim}`,
-    p.list,
-  );
+     LIMIT ${lim}`;
+  if (!(await scansIteratively(store))) return store.query<RankedChunk>(sql, p.list);
+  const rows = await store.tx(async (q) => {
+    await q.query(`SET LOCAL hnsw.iterative_scan = relaxed_order`);
+    return q.query<RankedChunk>(sql, p.list);
+  });
+  return rows.sort((a, b) => b.raw - a.raw);
 }
 
 /** Vector recall: the nearest `k` chunks of sources and the nearest `k` of generated pages, as one list by similarity. */
@@ -319,11 +377,13 @@ async function vectorSearch(
   filter?: ResolvedScopeFilter,
 ): Promise<RankedChunk[]> {
   const qv = queryVector ?? (await embedder.embed([query]))[0];
-  // a search for certain kinds reads the sides they are on
+  // a search for certain kinds reads the sides they are on, and no side the index holds nothing of:
+  // an iterative scan for rows that are not there walks the index to its limit
   const kinds = filter?.kinds;
+  const held = await sidesOfIndex(store);
   const [sources, generated] = await Promise.all([
-    !kinds || kinds.some((kind) => kind !== 'view') ? vectorSide(store, embedder, qv, k, false, asOf, filter) : [],
-    !kinds || kinds.includes('view') ? vectorSide(store, embedder, qv, k, true, asOf, filter) : [],
+    held.sources && (!kinds || kinds.some((kind) => kind !== 'view')) ? vectorSide(store, embedder, qv, k, false, asOf, filter) : [],
+    held.generated && (!kinds || kinds.includes('view')) ? vectorSide(store, embedder, qv, k, true, asOf, filter) : [],
   ]);
   return mergeSides(sources, generated);
 }
