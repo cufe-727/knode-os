@@ -641,7 +641,9 @@ function windowMonth(c: Pick<ClaimLite, 'valid_from' | 'valid_to'>): Set<number>
  * Two claims whose months of the year miss each other, at least one of them
  * named in the statement without a year (yearlessMonthsOf): an April and an
  * October are two times whatever their years. The other side may give its
- * month by a window inside one month. A forecast is left out: its time is the
+ * month by a window inside one month. Where a month is only a report's, the
+ * two must give other figures (the same figure in two monthly reports may be
+ * one fact restated). A forecast is left out: its time is the
  * one it foresees, which its statement's month need not be. `monthsOf` reads a
  * statement once per audit (a memo of yearlessMonthsOf). Exported for tests.
  */
@@ -654,6 +656,11 @@ export function monthsApart(
   const na = monthsOf(a.statement, Boolean(a.attribute));
   const nb = monthsOf(b.statement, Boolean(b.attribute));
   if (na.size === 0 && nb.size === 0) return false;
+  // a month that only a report gives ("4月月报列示注册资本为5000万元") says when the report was, not when
+  // the figure held: with the same figures on both sides, the two reports may well state one fact
+  const fromReport = (s: string) => monthsOf(s, false).size === 0;
+  const figures = (s: string) => (s.normalize('NFKC').replace(REPORT_MONTH, ' ').match(/\d+(?:\.\d+)?/g) ?? []).join('|');
+  if ((fromReport(a.statement) || fromReport(b.statement)) && figures(a.statement) === figures(b.statement)) return false;
   const ma = na.size ? na : windowMonth(a);
   const mb = nb.size ? nb : windowMonth(b);
   if (ma.size === 0 || mb.size === 0) return false;
