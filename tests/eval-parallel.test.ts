@@ -144,7 +144,7 @@ describe('knode answers in parallel', () => {
         delete process.env.FAKE_CODEX_SESSION_MS;
       }
       // sessions ran side by side, not one at a time
-      if (system === 'agent-knode') expect(widest).toBeGreaterThan(1);
+      if (system === 'agent-knode' && WIDTH > 1) expect(widest).toBeGreaterThan(1);
       report(`${system} width ${WIDTH}${delay ? `, ${delay} ms a model turn` : ''} on ${new RunStore(path.join(tmp, 'runs', `wide-${system}-1`)).meta()?.database?.at}: ${answered} answers in ${ms} ms (${((answered / ms) * 60_000).toFixed(0)} a minute, runs included)${system === 'agent-knode' ? `, at most ${widest} sessions at once` : ''}\n${lines.join('\n')}`);
     }, 600_000);
   }

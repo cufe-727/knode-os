@@ -81,6 +81,55 @@ describe('the evaluation database', () => {
   });
 });
 
+describe('rebuilding from a copied cache (design 31 D5 step 2)', () => {
+  // a build does not replay exactly: extraction prompts carry what earlier passes found, which depends on their order
+  // under concurrency (2 of 14 calls missed in one replay with the same code), so this checks what --replay-only
+  // promises — nothing asked, misses failed, the rest replayed — not that the rebuilt index equals the first
+  it('spends nothing with --replay-only and fails a miss instead of asking', async () => {
+    const packDir = path.join(tmp, 'packs', 'replay-life');
+    buildFixturePack(packDir);
+    const embedder = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false });
+    let embedded = 0;
+    const counting = { model: embedder.model, dimensions: embedder.dimensions, embed: (t: string[]) => (embedded += t.length, embedder.embed(t)) };
+    const common = { packs: [packDir], systems: ['knode-ask', 'knode-sag'], quota: false, suites: ['usage' as const], skipScoring: true };
+    const paid = path.join(tmp, 'runs', 'replay-paid');
+    await runEval({ ...common, runDir: paid, overrides: { chat: new ScriptedBackend(), judge: scriptedJudge(), embedder: counting } });
+    const retrieval = (dir: string) => new RunStore(dir).allScores().filter((x) => x.metric === 'recall@5' || x.metric === 'mrr@10').map((x) => `${x.system} ${x.taskId} ${x.metric} ${x.value}`).sort();
+    expect(retrieval(paid).length).toBeGreaterThan(0);
+    const paidCalls = new RunStore(paid).allBuilds().find((b) => b.system === 'knode')!.usage.calls;
+
+    // the same build from the paid run's caches, with indexes kept in PGlite although the config names a server
+    const ws = path.join(tmp, 'pg-config-ws');
+    fs.mkdirSync(ws, { recursive: true });
+    fs.writeFileSync(path.join(ws, 'knode.config.json'), JSON.stringify({ database: { ...pgBase, port: 1, password: '' } }));
+    const replayed = path.join(tmp, 'runs', 'replay-free');
+    fs.cpSync(path.join(paid, 'cache'), path.join(replayed, 'cache'), { recursive: true });
+    const before = embedded;
+    const backend = new ScriptedBackend();
+    await runEval({ ...common, runDir: replayed, replayOnly: true, pglite: true, configFrom: ws, overrides: { chat: backend, embedder: counting } });
+    expect(backend.calls).toBe(0);
+    expect(embedded).toBe(before);
+    const store = new RunStore(replayed);
+    expect(store.meta()!.database).toEqual({ kind: 'pglite', at: 'pglite' });
+    // what the cache held was replayed (most of the build), and every miss failed
+    const build = store.allBuilds().find((b) => b.system === 'knode')!;
+    expect(build.usage.replayedCalls).toBeGreaterThan(paidCalls / 2);
+    if (!build.ok) expect(build.error).toMatch(/not in the (reply|vector) cache \(--replay-only\)/);
+
+    // nothing cached: every miss is an error, and still nothing is asked
+    const empty = path.join(tmp, 'runs', 'replay-empty');
+    await runEval({ ...common, runDir: empty, replayOnly: true, overrides: { chat: backend, embedder: counting } });
+    expect(backend.calls).toBe(0);
+    expect(embedded).toBe(before);
+    const knode = new RunStore(empty).allBuilds().find((b) => b.system === 'knode')!;
+    // its documents' embeddings refused, it indexed nothing (or failed outright)
+    if (knode.ok) expect((knode.notes as { documents: number }).documents).toBe(0);
+    // agents and the judge are not cached: refused up front
+    await expect(runEval({ ...common, systems: ['agent-knode'], runDir: path.join(tmp, 'runs', 'replay-agent'), replayOnly: true })).rejects.toThrow(/agent sessions are not cached/);
+    await expect(runEval({ ...common, skipScoring: false, runDir: path.join(tmp, 'runs', 'replay-judge'), replayOnly: true })).rejects.toThrow(/--skip-scoring/);
+  }, 300_000);
+});
+
 /* -------------------------- on a PostgreSQL server -------------------------- */
 
 const DB_PREFIX = 'knode_eval_test_';

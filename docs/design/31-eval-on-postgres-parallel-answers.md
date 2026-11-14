@@ -1,6 +1,6 @@
 # 31 — Evaluation on PostgreSQL, and knode answers in parallel
 
-Status: being implemented (2026-11-14) on branch `claude/eval-postgres-parallel-a83957`, one commit per step: D1, D2's harness half (single-flight open), D3 and D4 done. The running 10× separation run is unaffected: it executes from its own checkout's build.
+Status: implemented (2026-11-14) on branch `claude/eval-postgres-parallel-a83957`, one commit per step: D1, D2's harness half (single-flight open; the PGlite guard is a sibling change in `src/store`), D3, D4, and D5 steps 1 and 3. D5 step 2 is not run: its commands are below, for approval. Nothing here has run against a real model or a real worker. The running 10× separation run is unaffected: it executes from its own checkout's build.
 
 ## Problem
 
@@ -112,7 +112,37 @@ Before any model-backed run:
 1. Suite on PGlite as today, plus the Postgres-backed evaluation tests on a throwaway cluster (as `tests/backend-postgres*.test.ts`).
    - *As run:* `tests/eval-postgres.test.ts` is switched on as the backend tests are (`KNODE_TEST_PG_HOST/_PORT/_USER/_PASSWORD`, skipped when no PostgreSQL with pgvector answers) and uses a database of its own per run, dropped after. It runs the fixture pack end to end (every native knode system, both update batches, scoring and the report), a reuse with the schema cloned and the update landing in the clone only, a reuse whose source schema is gone (built afresh), the refusal to resume on another backend, `eval drop`, and the orphan listing.
 2. Retrieval equivalence, no model calls: build the 1× reports pack once per backend with the reply cache of `run-1x` and compare `knode-ask` retrieval metrics (recall@k, MRR, nDCG). Differences beyond tie order are investigated before the backend is switched.
+   - *Not run* (it needs the user's approval: it reads `~/knode-eval` and the run-1x workspace). Two things found while preparing it change what it can show:
+     - A build does not replay exactly. Rebuilding the fixture pack from a cache the same code had just filled, two of fourteen extraction calls missed (an extraction prompt carries what earlier passes found, which depends on their order under concurrency), and some wiki-page texts were not in the vector cache. Against run-1x's cache, built by older code, more will miss. Two replays therefore differ in their builds, not only in their backends: compare the builds' counts (documents, chunks, entities, claims, `callsFailed`) first; only where they match is a metric difference the backend's.
+     - So that the check really spends nothing, `eval run` has two new options: `--replay-only` (a model call or embedding not in the run's caches fails at once instead of reaching Codex or the embedding pool; agent systems and scoring are refused, as nothing caches them) and `--pglite` (PGlite indexes whatever the config names). A miss shows as a failed call in the build's notes and the run's log.
+   - The commands, run from a checkout of this branch built with `npm run build` (not the live service's `dist`), with `CONFIG` the workspace run-1x took its embedder from (the same `--config-from`; `run.json`'s `embedding` must match):
+
+     ```bash
+     RUN1X=~/knode-eval/runs/run-1x
+     PACK=$(jq -r '.packs[] | select(test("report"))' $RUN1X/run.json)
+     ARGS=(--pack "$PACK" --systems knode-ask,knode-sag --suites usage --skip-scoring --replay-only --config-from "$CONFIG"
+           --fraction "$(jq -r .fraction $RUN1X/run.json)" --seed "$(jq -r .seed $RUN1X/run.json)")
+     for b in pglite postgres; do mkdir -p ~/knode-eval/runs/eq-$b && cp -R $RUN1X/cache ~/knode-eval/runs/eq-$b/; done
+     node dist/cli.js eval run "${ARGS[@]}" --pglite --run-dir ~/knode-eval/runs/eq-pglite
+     node dist/cli.js eval run "${ARGS[@]}" --run-dir ~/knode-eval/runs/eq-postgres   # knode_eval on CONFIG's server; --database-url for another
+     for b in pglite postgres; do
+       jq -c 'select(.system=="knode") | {ok, notes: (.notes | {documents, chunks, entities, claims, callsFailed, database, schema})}' ~/knode-eval/runs/eq-$b/builds.jsonl
+       jq -s 'map(select(.metric|test("^(recall@(2|5|10)|mrr@10|ndcg@10)$"))) | group_by(.system+" "+.metric) | map({k: (.[0].system+" "+.[0].metric), mean: (map(.value)|add/length), n: length})' ~/knode-eval/runs/eq-$b/scores.jsonl
+     done
+     ```
+
+     It makes no model call and no call to the embedding pool. It writes two run directories under `~/knode-eval/runs` and, for the second, schemas in `knode_eval` on CONFIG's server (`node dist/cli.js eval drop ~/knode-eval/runs/eq-postgres` removes them). If the builds' counts differ, the replay is the cause and the comparison says little about the backends. Comparing the backends on *one* index needs one build's index copied from PGlite to PostgreSQL. No tool does that today: it would be a follow-up, and it would also answer the question exactly.
 3. A parallel smoke test: knode-ask and agent-knode at width 8 with the scripted backend, on both backends, 20 repetitions, no stall.
+   - *As run (2026-11-14, this machine under the benchmark's load):* `tests/eval-parallel.test.ts` with `KNODE_EVAL_PARALLEL_REPS=20`, on PGlite and with `KNODE_EVAL_DATABASE_URL` on a throwaway PostgreSQL 17 cluster. Each repetition is a run reusing one fixture build (on PostgreSQL its schema cloned), 11 knode-ask or 11 agent-knode answers at width 8. All 80 runs finished, with no error, no stall and one open of the index per run; every agent session's two tool calls reached the build's host; up to 8 sessions ran at once. The suite file also ran whole on PostgreSQL (`eval-suite.test.ts`, 44 tests, `KNODE_EVAL_DATABASE_URL` set).
+   - Before the fix the same test fails on PGlite: the old `open()` opened the index 8 times for 8 answers that started together (the count, not a stall, is what it asserts).
+   - Answers per minute, scripted backend with 500 ms of model time per answer (a knode-ask answer's call, an agent's whole session), 2 runs of 11 answers each, run set-up included. Width 1 is what `serial` did.
+
+     | | PGlite, width 1 | PGlite, width 8 | PostgreSQL, width 1 | PostgreSQL, width 8 |
+     | --- | --- | --- | --- | --- |
+     | knode-ask | 100 | 427 | 109 | 501 |
+     | agent-knode | 77 | 283 | 83 | 303 |
+
+     With no model time the index is the limit: knode-ask 1,051 a minute on PGlite against 1,748 on PostgreSQL at width 8 (20 runs each). PGlite runs one statement at a time; PostgreSQL's pool runs them side by side. With real model calls (16 s for knode-ask, about 42 s for an agent session) the gain is close to the width, while the index's share is small.
 
 ## Decisions
 

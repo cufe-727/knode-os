@@ -20,7 +20,7 @@ import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
 import { scoreLists } from './score/lists.js';
 import { scoreKey, scoreUsage } from './score/usage.js';
-import { ChatBackend, ClientBackend, CodexBackend, shimState, startShim } from './shim.js';
+import { ChatBackend, ChatRequest, ClientBackend, CodexBackend, shimState, startShim } from './shim.js';
 import { withRemote } from './placement.js';
 import { judgeAgent, packMayLeave, PlacedChatBackend, RemoteEval, remoteJudgeClient, RunCancelledError } from './remote.js';
 import type { Placed } from './meter.js';
@@ -58,6 +58,15 @@ export interface RunOptions {
    * run refuses to start on that config's own database.
    */
   databaseUrl?: string;
+  /** Keep knode's indexes in embedded PGlite whatever the config names (a comparison with earlier runs, design 31 D5). */
+  pglite?: boolean;
+  /**
+   * Spend nothing: a model call or an embedding not in the run's caches fails
+   * instead of reaching a model or the embedder (a rebuild from another run's
+   * copied caches, design 31 D5). Agent sessions and the judge are not cached:
+   * leave them out (`--systems`, `--skip-scoring`).
+   */
+  replayOnly?: boolean;
   /**
    * A connection of that workspace — an API endpoint — that answers the shim's
    * chat calls instead of `codex exec`. Agents stay Codex sessions.
@@ -148,6 +157,26 @@ export interface RunResult {
   scores: number;
 }
 
+/** `--replay-only`: what is not in the reply cache is not asked. */
+class ReplayOnlyBackend implements ChatBackend {
+  readonly label = 'replay-only';
+  async complete(req: ChatRequest): Promise<never> {
+    const tag = req.tag ? [req.tag.system, req.tag.stage, req.tag.task].filter(Boolean).join('/') : 'a call';
+    throw new Error(`not in the reply cache (--replay-only): ${tag}`);
+  }
+}
+
+/** `--replay-only`: the embedder's identity, so cached vectors are found, and nothing behind it. */
+function refusingEmbedder(identity: EmbeddingProvider): EmbeddingProvider {
+  return {
+    model: identity.model,
+    dimensions: identity.dimensions,
+    embed: async (texts) => {
+      throw new Error(`not in the vector cache (--replay-only): ${texts.length} texts`);
+    },
+  };
+}
+
 function gitSha(): string | null {
   try {
     return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: path.dirname(fileURLToPath(import.meta.url)), encoding: 'utf8' }).trim();
@@ -210,7 +239,12 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const fraction = opts.fraction ?? 1;
   const seed = opts.seed ?? 0;
   const meter = new Meter(path.join(runDir, 'meter.jsonl'));
-  const quota = new QuotaGuard({ enabled: opts.quota ?? !opts.overrides?.chat, log: (m, d) => {
+  if (opts.replayOnly) {
+    const agents = makeSystems(opts.systems).filter(isAgent).map((sys) => sys.id);
+    if (agents.length) throw new Error(`--replay-only: agent sessions are not cached, leave out ${agents.join(', ')}`);
+    if (!opts.skipScoring) throw new Error('--replay-only: the judge is not served from the reply cache, add --skip-scoring');
+  }
+  const quota = new QuotaGuard({ enabled: opts.quota ?? (!opts.overrides?.chat && !opts.replayOnly), log: (m, d) => {
     progress(`${m}${d ? ` ${JSON.stringify(d)}` : ''}`);
     store.log(m, d);
   } });
@@ -226,7 +260,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
 
   const workspaceConfig = opts.configFrom ? loadConfig(opts.configFrom) : null;
   // the indexes on the product's backend, in a database of their own (docs/design/31 D1): checked before anything is spent
-  const sourceDatabase = workspaceConfig?.database ?? defaultConfig().database;
+  if (opts.pglite && opts.databaseUrl) throw new Error('--pglite and --database-url name two places for the indexes: pick one');
+  const sourceDatabase = opts.pglite ? { ...defaultConfig().database, kind: 'pglite' } : workspaceConfig?.database ?? defaultConfig().database;
   const database = evalDatabase(sourceDatabase, { url: opts.databaseUrl, poolSize: opts.answerConcurrency ?? 3 });
   if (sameDatabase(database, sourceDatabase)) {
     throw new Error(`the evaluation's indexes would go into ${describeDatabase(database)}, the database ${opts.configFrom ? `the --config-from workspace (${opts.configFrom})` : 'the default config'} uses — name another with --database-url (or KNODE_EVAL_DATABASE_URL)`);
@@ -241,7 +276,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       ? createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false })
       : createConfiguredEmbeddingProvider(workspaceConfig));
   const onEndpoint = opts.embeddingEndpoint ? endpointUnder(configured, opts.embeddingEndpoint) : null;
-  const embedder = !onEndpoint ? configured
+  const embedder = opts.replayOnly ? refusingEmbedder(configured) : !onEndpoint ? configured
     : opts.embeddingFallback ? preferEndpoint(onEndpoint, configured, (m) => {
       progress(m);
       store.log(m);
@@ -252,7 +287,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     store.log(m);
   };
   const chain = (spec: string) => new ModelChain(parseChain(spec, workspaceConfig, { ledger, model: opts.model }), ledger, chainLog);
-  const backend = opts.overrides?.chat
+  const backend = opts.replayOnly ? new ReplayOnlyBackend()
+    : opts.overrides?.chat
     ?? (opts.chatChain ? chain(opts.chatChain).asBackend()
       : opts.chatConnection ? connectionBackend(workspaceConfig, opts.chatConnection, opts.model) : new CodexBackend({ model: opts.model }));
   const localJudge = opts.overrides?.judge
@@ -264,7 +300,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const onAbort = () => void remote?.cancel();
   opts.signal?.addEventListener('abort', onAbort, { once: true });
   // a call leaves only on the run's own Codex backend with a named model: the worker runs exactly that one
-  const callsLeave = Boolean(remote && !opts.overrides?.chat && !opts.chatChain && !opts.chatConnection && opts.model);
+  const callsLeave = Boolean(remote && !opts.replayOnly && !opts.overrides?.chat && !opts.chatChain && !opts.chatConnection && opts.model);
   if (remote) remote.callsLeave = callsLeave;
   // one pool per open workspace, as wide as a system answers here and on the workers, at most 16
   if (remote && database.kind === 'postgres') database.poolSize = Math.min(EVAL_POOL_MAX, (opts.answerConcurrency ?? 3) + Math.max(remote.online('eval-session', 'codex'), remote.callSlots()));
@@ -320,7 +356,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     packs: opts.packs.map((p) => path.basename(p)),
     systems: opts.systems,
     suites: [...suites],
-    model: { connection: opts.chatChain ?? opts.chatConnection ?? 'codex-cli', label: backend.label, buildEffort: models.buildEffort, answerEffort: models.answerEffort, ...(opts.agentChain ? { agents: opts.agentChain } : {}) },
+    model: { connection: opts.replayOnly ? 'replay-only' : opts.chatChain ?? opts.chatConnection ?? 'codex-cli', label: backend.label, buildEffort: models.buildEffort, answerEffort: models.answerEffort, ...(opts.agentChain ? { agents: opts.agentChain } : {}) },
     judge: { connection: opts.judgeChain ?? opts.judgeProvider ?? 'claude-cli', label: judgeClient.label },
     embedding: `${embedder.model} (${embedder.dimensions})`,
     database: { kind: database.kind, at: describeDatabase(database), ...(database.kind === 'postgres' ? { poolSize: database.poolSize } : {}) },

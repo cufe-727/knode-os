@@ -158,6 +158,8 @@ export function registerEvalCommands(program: Command): void {
     .option('--run-dir <dir>', 'resume this run directory')
     .option('--config-from <workspace>', 'knode workspace whose embedder the run uses (read-only)')
     .option('--database-url <url>', `PostgreSQL for knode's indexes, one schema per build (default: $KNODE_EVAL_DATABASE_URL, else the database knode_eval on the server the run's config names; PGlite when that config is on PGlite). Never the --config-from workspace's own database`)
+    .option('--pglite', "keep knode's indexes in embedded PGlite whatever the config names (comparing with runs before 2026-11-14)")
+    .option('--replay-only', "spend nothing: a model call or embedding not in the run's caches fails instead (rebuilding from another run's copied cache/; leave agents and scoring out)")
     .option('--embedding <kind>', 'workspace | local', 'workspace')
     .option('--embedding-endpoint <url>', "embed on this OpenAI-compatible endpoint (a local bge-m3, say) under the workspace embedder's identity, once it reproduces the vectors the run holds")
     .option('--embedding-fallback', "with --embedding-endpoint: use the workspace's embedder while the endpoint is unreachable")
@@ -201,6 +203,8 @@ export function registerEvalCommands(program: Command): void {
         runDir: opts.runDir,
         configFrom: opts.configFrom,
         databaseUrl: opts.databaseUrl,
+        pglite: opts.pglite,
+        replayOnly: opts.replayOnly,
         chatConnection: opts.chatConnection,
         embedding: opts.embedding,
         embeddingEndpoint: opts.embeddingEndpoint,
