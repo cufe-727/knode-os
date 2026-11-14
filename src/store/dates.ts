@@ -111,13 +111,19 @@ function relative(raw: string, ref: string): DateSpan | null {
     return quarter(yy, qq);
   }
   if (t === '今天' || t === 'today') return day(y, mo, r.getUTCDate());
-  const weekOffset: Record<string, number> = { 本周: 0, 这周: 0, 'this week': 0, 上周: -1, 上一周: -1, 'last week': -1, 下周: 1, 下一周: 1, 'next week': 1 };
+  const weekOffset: Record<string, number> = {
+    本周: 0, 这周: 0, 'this week': 0, 上周: -1, 上一周: -1, 'last week': -1, 上上周: -2, 'the week before last': -2, 下周: 1, 下一周: 1, 'next week': 1, 下下周: 2,
+  };
   if (t in weekOffset) return weekOf(new Date(r.getTime() + weekOffset[t] * 7 * 86_400_000));
+  const back = /^(\d{1,2})周前$/.exec(t);
+  if (back) return weekOf(new Date(r.getTime() - Number(back[1]) * 7 * 86_400_000));
   // a week number without its year is the document's year: "第35周", "W35"
   const wk = /^(?:第\s*(\d{1,2})\s*周|[wW](\d{1,2}))$/.exec(t);
   if (wk) return isoWeek(y, +(wk[1] ?? wk[2]));
   return null;
 }
+
+const WEEKS_AGO: Record<string, number> = { 一: 1, 两: 2, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
 
 /**
  * Parse one date expression. `ref` (ISO) anchors relative forms; without it
@@ -130,6 +136,13 @@ export function normalizeDateExpr(expr: unknown, ref?: string | null): DateSpan 
   if (typeof expr !== 'string') return null;
   let t = expr.trim();
   if (!t) return null;
+  // "两周前", "3周前", "two weeks ago": a week N before the reference's (not "until two weeks")
+  const ago = /^([一两二三四五六七八九十]|\d{1,2})\s*个?\s*(?:周|星期|礼拜)前$/.exec(t) ?? /^(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\s+weeks?\s+ago$/i.exec(t);
+  if (ago) {
+    if (!ref) return null;
+    const n = WEEKS_AGO[ago[1].toLowerCase()] ?? Number(ago[1]);
+    return relative(`${n}周前`, ref);
+  }
   let side: 'from' | 'to' | null = null;
   let m: RegExpExecArray | null;
   if ((m = /^(?:since|from|自|从)\s*(.+?)\s*(?:起|以来)?$/i.exec(t)) || (m = /^(.+?)\s*(?:以来|起|之后|以后)$/.exec(t))) {
