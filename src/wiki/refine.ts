@@ -3,7 +3,7 @@ import { KnodeConfig } from '../config.js';
 import { appendLog } from '../fs/datadir.js';
 import { auditDuplicateClaims } from '../graph/claim-dedupe.js';
 import { backfillClaimState, refreshAttributeKeys, supersedeByAttribute } from '../graph/claim-state-store.js';
-import { resolveEntityContext } from '../graph/entity-context.js';
+import { resolveEntityContext, splitEntities } from '../graph/entity-context.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { refreshRecommendations } from '../research/recommend.js';
 import { reviewClaims } from '../graph/claim-review.js';
@@ -111,9 +111,8 @@ export async function refineWiki(
   // entities first (claims are compared per canonical subject), then claims,
   // then the audit over what is left: one fact in several wordings is one claim by then
   try {
-    const resolved = await resolveEntityContext(store, { config, onProgress: progress });
+    const resolved = await resolveEntityContext(store, { config, onProgress: progress, splits: false });
     stats.entityMerges = resolved.merged;
-    stats.entitySplits = resolved.split;
   } catch (err) {
     progress(`entity resolution failed: ${err instanceof Error ? err.message : err}`);
   }
@@ -121,6 +120,12 @@ export async function refineWiki(
     stats.mergeCandidates = (await auditDuplicateEntities({ store, embedder: ctx.embedder, config, llm }, { onProgress: progress })).suggested;
   } catch (err) {
     progress(`dedupe audit failed: ${err instanceof Error ? err.message : err}`);
+  }
+  // splits after the audit: two spellings of one organization it has just proposed to merge are one roof (entity-context.ts)
+  try {
+    stats.entitySplits = (await splitEntities(store, { config, onProgress: progress })).split;
+  } catch (err) {
+    progress(`entity splits failed: ${err instanceof Error ? err.message : err}`);
   }
   // claim state before the claim audits: the duplicate audit settles a series by its attribute
   try {
