@@ -1,6 +1,6 @@
 import { AppContext } from '../context.js';
 import { MAX_FILE_BYTES } from '../constants.js';
-import { GrepFolder, GrepMatch, GrepResult, grepSearch, shareEvenly } from '../fs/files.js';
+import { GrepAnswer, GrepMatch, GrepResult, grepAnswer, grepSearch, shareEvenly } from '../fs/files.js';
 import { readSourceTextCapped } from '../ingest/source.js';
 import { isVirtualPath, readVirtual } from '../compiler/vfs.js';
 import { readSection, ReadSlice } from '../research/read.js';
@@ -109,35 +109,31 @@ export function grepPaths(ctx: AppContext, req: GrepRequest): GrepMatch[] {
   return grepAcross(ctx, req).matches;
 }
 
-/** Folders a cut answer names at most. */
-const GREP_FOLDERS_MAX = 40;
-
 const count = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString('en-US')} ${n === 1 ? one : many}`;
 
-/** The folders of a cut answer that hold matches it does not show, the ones holding the most first, `GREP_FOLDERS_MAX` at most. */
-export function foldersWithMore(result: GrepResult): { listed: (GrepFolder & { more: number })[]; unlisted: { folders: number; more: number } } {
-  const more = (result.folders ?? []).map((f) => ({ ...f, more: f.matches - f.shown })).filter((f) => f.more > 0);
-  const listed = [...more].sort((a, b) => b.more - a.more).slice(0, GREP_FOLDERS_MAX);
-  const rest = more.filter((f) => !listed.includes(f));
-  return { listed, unlisted: { folders: rest.length, more: rest.reduce((n, f) => n + f.more, 0) } };
-}
-
 /**
- * What a cut answer says of what it left out: how many lines match in all,
- * and per folder how many more there are, so the caller can ask for the one
- * folder it means. Empty when every match is shown.
+ * What a text answer says when it is a sample: how many lines match in all,
+ * and every folder that matches with its count and how many of its lines
+ * are shown, so the caller can ask for the one folder it means. Empty when
+ * every match is shown.
  */
-export function grepCutNote(result: GrepResult): string {
-  if (!result.folders) return '';
-  const { listed, unlisted } = foldersWithMore(result);
-  const lines = listed.map((f) => `  ${f.path || '.'}: ${f.more.toLocaleString('en-US')} more (${count(f.matches, 'match', 'matches')} in ${count(f.files, 'file')})`);
-  if (unlisted.folders > 0) lines.push(`  … and ${count(unlisted.folders, 'more folder')} with ${unlisted.more.toLocaleString('en-US')} more`);
+export function grepCutNote(answer: GrepAnswer): string {
+  const cut = answer.cut;
+  if (!cut) return '';
+  const lower = cut.partial ? ` (at least: the scan stopped after ${cut.partial.filesRead.toLocaleString('en-US')} of ${count(cut.partial.files, 'file')}, a folder in turn)` : '';
+  const lines = cut.folders.map((f) => {
+    const below = f.folders ? ` and ${count(f.folders, 'folder')} below it` : '';
+    const unread = f.unread ? `, ${count(f.unread, 'file')} not read` : '';
+    return `  ${f.path || '.'}${below}: ${count(f.matches, 'match', 'matches')} in ${count(f.files, 'file')}, ${f.shown.toLocaleString('en-US')} shown${unread}`;
+  });
   return [
-    `(showing ${result.matches.length.toLocaleString('en-US')} of ${count(result.total, 'matching line')}, shared over the ${count(result.folders.length, 'folder')} that hold them. Not shown:`,
+    `(showing ${cut.shown.toLocaleString('en-US')} of ${count(answer.total, 'matching line')}${lower}, shared over the folders and files that hold them:`,
     ...lines,
     'To see a folder\'s matches, search it alone (`path`), or narrow the pattern.)',
   ].join('\n');
 }
+
+const folderOf = (file: string) => (file.includes('/') ? file.slice(0, file.lastIndexOf('/')) : '');
 
 /**
  * The matches with `context` lines around them, grouped by file:
@@ -148,6 +144,11 @@ export function grepCutNote(result: GrepResult): string {
  *   13- line after
  *   --
  *   40: another match
+ *
+ * An answer past `GREP_CHARS_MAX` leaves files out a folder in turn, as the
+ * matches were chosen: the first file of every folder is in before any
+ * folder's second. Cut in the order searched, the last folders fell out
+ * whole, and the note still counted their lines as shown.
  */
 export function grepWithContext(ctx: AppContext, req: GrepRequest): string {
   const result = grepAcross(ctx, req);
@@ -156,14 +157,8 @@ export function grepWithContext(ctx: AppContext, req: GrepRequest): string {
   const context = Math.min(Math.max(req.context ?? 0, 0), 20);
   const byFile = new Map<string, number[]>();
   for (const m of matches) (byFile.get(m.path) ?? byFile.set(m.path, []).get(m.path)!).push(m.line);
-  const blocks: string[] = [];
-  let size = 0;
-  const skipped: string[] = [];
+  const blocks: { file: string; text: string; hits: number }[] = [];
   for (const [file, hits] of byFile) {
-    if (size >= GREP_CHARS_MAX) {
-      skipped.push(file);
-      continue;
-    }
     let lines: string[];
     try {
       lines = context > 0 ? (readSourceTextCapped(ctx.dataDir, file, MAX_FILE_BYTES)?.content ?? '').split('\n') : [];
@@ -185,13 +180,47 @@ export function grepWithContext(ctx: AppContext, req: GrepRequest): string {
       }
       last = Math.max(last, to);
     }
-    const block = out.join('\n');
-    size += block.length;
-    blocks.push(block);
+    blocks.push({ file, text: out.join('\n'), hits: sorted.length });
+  }
+
+  // what fits, a folder in turn
+  const inFolder = new Map<string, number[]>();
+  blocks.forEach((b, i) => (inFolder.get(folderOf(b.file)) ?? inFolder.set(folderOf(b.file), []).get(folderOf(b.file))!).push(i));
+  const kept = new Set<number>();
+  let size = 0;
+  for (let round = 0; kept.size < blocks.length && size < GREP_CHARS_MAX; round++) {
+    let any = false;
+    for (const members of inFolder.values()) {
+      const i = members[round];
+      if (i === undefined) continue;
+      any = true;
+      if (size >= GREP_CHARS_MAX) break;
+      kept.add(i);
+      size += blocks[i].text.length;
+    }
+    if (!any) break;
+  }
+  const dropped = blocks.filter((_, i) => !kept.has(i));
+  let shownResult = result;
+  if (dropped.length > 0) {
+    // the answer shows less than the search picked: its matches, and each folder's count of shown lines, say so
+    const gone = new Set(dropped.map((b) => b.file));
+    const lost = new Map<string, number>();
+    for (const b of dropped) lost.set(folderOf(b.file), (lost.get(folderOf(b.file)) ?? 0) + b.hits);
+    const folders = result.folders
+      ?? [...inFolder.keys()].map((folder) => {
+        const mine = blocks.filter((b) => folderOf(b.file) === folder);
+        return { path: folder, matches: mine.reduce((n, b) => n + b.hits, 0), files: mine.length, shown: mine.reduce((n, b) => n + b.hits, 0) };
+      });
+    shownResult = {
+      ...result,
+      matches: matches.filter((m) => !gone.has(m.path)),
+      folders: folders.map((f) => ({ ...f, shown: f.shown - (lost.get(f.path) ?? 0) })),
+    };
   }
   const notes = [
-    grepCutNote(result),
-    skipped.length ? `(not shown, past the answer's size: ${skipped.join(', ')})` : '',
+    grepCutNote(grepAnswer(shownResult)),
+    dropped.length ? `(${count(dropped.length, 'file')} with ${count(dropped.reduce((n, b) => n + b.hits, 0), 'match', 'matches')} left out by the answer's size, a folder in turn: ask for fewer matches or less context, or search a folder alone)` : '',
   ].filter(Boolean);
-  return [...blocks, ...notes].join('\n\n');
+  return [...blocks.filter((_, i) => kept.has(i)).map((b) => b.text), ...notes].join('\n\n');
 }

@@ -57,7 +57,7 @@ import {
   saveConfig, ResearchConfig, ChatConfig, ReviewConfig, LLM_EFFORTS, LLM_PROTOCOLS, LLM_SPEEDS, ExtractionWorkerConfig, embeddingDeferred, ProcessingConfig, processingSettings } from '../config.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
-import { assertNotPrivate, assertSourcePath, assertWritablePath, capText, cleanRelPath, grepFiles, isOwnerRootFile, isPrivatePath, isRootWritableFile, listTree, makeDir, movePath, pathExists, readFileTextCapped, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
+import { assertNotPrivate, assertSourcePath, assertWritablePath, capText, cleanRelPath, grepAnswer, grepSearch, isOwnerRootFile, isPrivatePath, isRootWritableFile, listTree, makeDir, movePath, pathExists, readFileTextCapped, removePath, safePath, sanitizeRelativePath, writeFileBytes, writeFileText } from '../fs/files.js';
 import { MarkdownMeta, markdownMeta } from '../markdown.js';
 import { FOLDER_ABOUT, hasSidecarSegment, SIDECAR_ROOT, TREE_HIDDEN } from '../fs/layout.js';
 import { listPlaybooks, readPlaybook, resetPlaybook, savePlaybook } from '../fs/playbooks.js';
@@ -2569,10 +2569,9 @@ export function createApp(
     try {
       const pattern = c.req.query('pattern');
       if (!pattern) return c.json({ error: 'pattern required' }, 400);
-      return c.json(grepFiles(ctx.dataDir, pattern, {
-        path: c.req.query('path') || undefined,
-        maxMatches: Number(c.req.query('maxMatches') ?? 100),
-      }));
+      // {matches, total}, and `cut` when the matches are a sample of what matches (src/fs/files.ts grepAnswer)
+      const at = c.req.query('path') || undefined;
+      return c.json(grepAnswer(grepSearch(ctx.dataDir, pattern, { paths: at ? [at] : undefined, maxMatches: Number(c.req.query('maxMatches') ?? 100) })));
     } catch (e) {
       return c.json(err(e), 400);
     }

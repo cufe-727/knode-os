@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Command } from 'commander';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
-import { GrepMatch, grepFiles, isPrivatePath, listTree, TreeNode } from '../fs/files.js';
+import { GrepAnswer, grepAnswer, grepSearch, isPrivatePath, listTree, TreeNode } from '../fs/files.js';
 import { TREE_HIDDEN } from '../fs/layout.js';
 import { readSourceTextCapped } from '../ingest/source.js';
 import { originalType } from '../server/originals.js';
@@ -85,8 +85,14 @@ export function formatListing(nodes: TreeNode[]): string {
   }).join('\n');
 }
 
-export function formatGrep(matches: GrepMatch[]): string {
-  return matches.length ? matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join('\n') : '(no matches)';
+/** The matches as `path:line: text`, and under a cut answer where the rest are: every folder that matches, with its count. */
+export function formatGrep(answer: GrepAnswer): string {
+  if (answer.matches.length === 0) return '(no matches)';
+  const lines = answer.matches.map((m) => `${m.path}:${m.line}: ${m.text}`);
+  if (!answer.cut) return lines.join('\n');
+  const lower = answer.cut.partial ? ` (at least: the scan stopped after ${answer.cut.partial.filesRead} of ${answer.cut.partial.files} files)` : '';
+  const folders = answer.cut.folders.map((f) => `  ${f.path || '.'}${f.folders ? ` (+${f.folders} folders below)` : ''}: ${f.matches} in ${f.files} files, ${f.shown} shown`);
+  return [...lines, '', `-- ${answer.cut.shown} of ${answer.total} matching lines shown${lower}, shared over the folders that hold them:`, ...folders, '-- search one folder to see its matches: knode grep <pattern> <folder>'].join('\n');
 }
 
 async function tree(deps: FileDeps, p: string, depth: number | undefined): Promise<TreeNode> {
@@ -227,10 +233,10 @@ export function registerFileCommands(program: Command, deps: FileDeps): void {
     .action(async (pattern: string, p: string | undefined, opts: { max: string; json?: boolean }) => {
       const srv = deps.server();
       const at = p ? clean(p) : undefined;
-      const matches = srv
-        ? await srv.get<GrepMatch[]>('/api/grep', { pattern, path: at, maxMatches: Number(opts.max) })
-        : grepFiles(deps.dataDir(), pattern, { path: at, maxMatches: Number(opts.max) });
-      console.log(opts.json ? JSON.stringify(matches, null, 2) : formatGrep(matches));
+      const answer = srv
+        ? await srv.get<GrepAnswer>('/api/grep', { pattern, path: at, maxMatches: Number(opts.max) })
+        : grepAnswer(grepSearch(deps.dataDir(), pattern, { paths: at ? [at] : undefined, maxMatches: Number(opts.max) }));
+      console.log(opts.json ? JSON.stringify(answer, null, 2) : formatGrep(answer));
     });
 
   program

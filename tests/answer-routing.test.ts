@@ -446,10 +446,13 @@ describe('batched agent tools', () => {
     expect(await call('knode_read', { path: 'raw/docs/ops/a.md', offset: 3, limit: 1 })).toContain('Nimbus outage at site 1');
     expect(await call('knode_read', { path: 'raw/docs/ops/a.md' })).toBe('# A\nline two\nNimbus outage at site 1\nline four\nline five\n');
     expect(await call('knode_grep', { pattern: 'site 2', path: 'raw/docs', context: 2 })).toContain('7: Nimbus outage at site 2');
-    expect(JSON.parse(await call('knode_grep', { pattern: 'site \\d', path: 'raw/docs' }))).toEqual([
-      { path: 'raw/docs/ops/a.md', line: 3, text: 'Nimbus outage at site 1' },
-      { path: 'raw/docs/ops/b.md', line: 7, text: 'Nimbus outage at site 2 hit the night shift.' },
-    ]);
+    expect(JSON.parse(await call('knode_grep', { pattern: 'site \\d', path: 'raw/docs' }))).toEqual({
+      matches: [
+        { path: 'raw/docs/ops/a.md', line: 3, text: 'Nimbus outage at site 1' },
+        { path: 'raw/docs/ops/b.md', line: 7, text: 'Nimbus outage at site 2 hit the night shift.' },
+      ],
+      total: 2,
+    });
     expect(tools.get('knode_query')!.schema.source).toBeDefined();
   });
 });

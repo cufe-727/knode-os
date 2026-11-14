@@ -209,11 +209,12 @@ describe('derived text of converted originals', () => {
     expect(JSON.stringify(tree)).not.toContain('.sidecar');
     expect(JSON.stringify(tree)).not.toContain('cooked');
 
+    // /api/grep answers {matches, total}, and `cut` when the matches are a sample
     const hits = await (await get('/api/grep?pattern=Quarterly')).json();
-    expect(hits.map((h: { path: string }) => h.path)).toEqual(['raw/docs/hello.pdf']);
-    expect(await (await get('/api/grep?pattern=contentSha256')).json()).toEqual([]);
-    expect(await (await get('/api/grep?pattern=Quarterly&path=.sidecar')).json()).toEqual([]);
-    expect((await (await get('/api/grep?pattern=Quarterly&path=raw/docs/hello.pdf')).json()).length).toBe(1);
+    expect(hits.matches.map((h: { path: string }) => h.path)).toEqual(['raw/docs/hello.pdf']);
+    expect(await (await get('/api/grep?pattern=contentSha256')).json()).toEqual({ matches: [], total: 0 });
+    expect(await (await get('/api/grep?pattern=Quarterly&path=.sidecar')).json()).toEqual({ matches: [], total: 0 });
+    expect((await (await get('/api/grep?pattern=Quarterly&path=raw/docs/hello.pdf')).json()).matches.length).toBe(1);
   });
 
   it('refuses to write derived text back over the original, whatever the caller', async () => {

@@ -2,11 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import { formatGrep } from '../src/client/files.js';
 import { defaultConfig } from '../src/config.js';
 import type { AppContext } from '../src/context.js';
-import { grepFiles, grepSearch, shareEvenly } from '../src/fs/files.js';
+import { foldGrepFolders, GREP_FOLDERS_MAX, grepAnswer, grepFiles, GrepFolder, grepSearch, shareEvenly } from '../src/fs/files.js';
 import { grepCutNote, grepPaths, grepWithContext } from '../src/mcp/batch.js';
 import { registerKnodeTools } from '../src/mcp/tools.js';
 
@@ -16,7 +17,7 @@ import { registerKnodeTools } from '../src/mcp/tools.js';
  * separation benchmark /平台组/ over ten divisions' reports returned 39 of 40
  * matches from 七部平台组, and the agent answered for that division. The
  * matches are now shared over the folders and files that hold them, and the
- * answer says how many more each folder holds.
+ * answer names every folder that matches with its count.
  *
  * The fixture: ten divisions' platform teams, twelve weekly reports each that
  * name the team once (the first division's twice a report), one monthly
@@ -56,11 +57,12 @@ afterAll(() => {
 });
 
 describe('a grep with more matches than it returns', () => {
-  it('shares the matches over the folders that hold them, and says how many each holds', () => {
+  it('shares the matches over the folders that hold them, and names each with its count', () => {
     const r = grepSearch(tmp, '平台组', { paths: ['raw/docs'], maxMatches: 40 });
     expect(r.matches).toHaveLength(40);
     // 9 divisions × 12 reports × 1 line, the first division's 12 × 2, and the monthly report's line
     expect(r.total).toBe(9 * 12 + 24 + 1);
+    expect(r.partial).toBeUndefined();
     const shown = perFolder(r.matches);
     // every folder that matches is in the answer: ten divisions and the monthly reports
     expect(shown.size).toBe(11);
@@ -76,11 +78,21 @@ describe('a grep with more matches than it returns', () => {
     expect(r.folders!.reduce((n, f) => n + f.matches, 0)).toBe(r.total);
   });
 
-  it('shares a folder\'s places over its files before taking a file\'s second line', () => {
+  it('shares a folder\'s places over its files, the earliest first, before taking a file\'s second line', () => {
     const r = grepSearch(tmp, '平台组', { paths: ['raw/docs/周报/一部平台组'], maxMatches: 8 });
     expect(r.total).toBe(24);
-    expect(r.matches.map((m) => `${path.basename(m.path)}:${m.line}`)).toEqual(['w05.md:1', 'w06.md:1', 'w07.md:1', 'w08.md:1', 'w09.md:1', 'w10.md:1', 'w11.md:1', 'w12.md:1']);
+    expect(r.matches.map((m) => `${path.basename(m.path)}:${m.line}`)).toEqual(['w01.md:1', 'w02.md:1', 'w03.md:1', 'w04.md:1', 'w05.md:1', 'w06.md:1', 'w07.md:1', 'w08.md:1']);
     expect(r.folders).toEqual([{ path: 'raw/docs/周报/一部平台组', matches: 24, files: 12, shown: 8 }]);
+  });
+
+  it('with more folders than places gives the first searched one each, and still names every folder', () => {
+    const r = grepSearch(tmp, '平台组', { paths: ['raw/docs'], maxMatches: 5 });
+    expect(r.matches).toHaveLength(5);
+    // one line each of the five folders searched first — not none for the folders that hold fewest
+    expect([...perFolder(r.matches).entries()]).toEqual(DIVISIONS.slice(0, 5).map((d) => [`raw/docs/周报/${d}平台组`, 1]));
+    // and all eleven are named with what they hold, the monthly reports' single line among them
+    expect(r.folders!.map((f) => f.path)).toEqual([...DIVISIONS.map((d) => `raw/docs/周报/${d}平台组`), 'raw/docs/月报']);
+    expect(r.folders!.filter((f) => f.shown === 0).map((f) => f.matches)).toEqual([12, 12, 12, 12, 12, 1]);
   });
 
   it('returns every match in the order searched when they fit, with nothing to add', () => {
@@ -110,30 +122,116 @@ describe('a grep with more matches than it returns', () => {
     // the lines a per-file cap leaves out are counted too
     expect(grepSearch(tmp, '平台组', { paths: ['raw/docs/周报/一部平台组'], maxPerFile: 1 }).folders).toEqual([{ path: 'raw/docs/周报/一部平台组', matches: 24, files: 12, shown: 12 }]);
   });
+});
 
-  it('gives a share to as many folders as there are places when there are more folders', () => {
-    const r = grepSearch(tmp, '平台组', { paths: ['raw/docs'], maxMatches: 5 });
+describe('how much a grep reads', () => {
+  it('reads each file once', () => {
+    const reads = new Map<string, number>();
+    const real = fs.readFileSync;
+    const spy = vi.spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (typeof file === 'string' && file.startsWith(tmp)) reads.set(file, (reads.get(file) ?? 0) + 1);
+      return (real as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.readFileSync);
+    try {
+      const r = grepSearch(tmp, '平台组', { paths: ['raw/docs'], maxMatches: 40 });
+      expect(r.matches).toHaveLength(40);
+    } finally {
+      spy.mockRestore();
+    }
+    // 121 report files and the growth team's: each read once, the 40 files shown not a second time
+    expect(reads.size).toBe(122);
+    expect(Math.max(...reads.values())).toBe(1);
+  });
+
+  it('stops with its answer full once it has read its fill, a folder in turn, and says the counts are lower bounds', () => {
+    // a scan allowed no bytes past a full answer: it stops as soon as five lines match
+    const r = grepSearch(tmp, '平台组', { paths: ['raw/docs'], maxMatches: 5, scanBytes: 0 });
     expect(r.matches).toHaveLength(5);
-    expect(perFolder(r.matches).size).toBe(5);
-    expect(r.folders).toHaveLength(11);
+    // the first round: one file of each of four divisions (the first's holds two lines), not five lines of one folder
+    // (and the growth team's first, which holds none)
+    expect(r.partial).toEqual({ filesRead: 5, files: 122 });
+    expect(perFolder(r.matches).size).toBe(4);
+    expect(r.total).toBe(5);
+    expect(r.folders!.map((f) => f.unread)).toEqual([11, 11, 11, 11]);
+    const answer = grepAnswer(r);
+    expect(answer.cut!.partial).toEqual({ filesRead: 5, files: 122 });
+    expect(answer.cut!.note).toContain('at least: the scan stopped after 5 of 122 files');
+    expect(grepCutNote(answer)).toContain('11 files not read');
+
+    // a pattern in one file is looked for in every file, however small the fill
+    const rare = grepSearch(tmp, '拉新', { paths: ['raw/docs'], maxMatches: 5, scanBytes: 0 });
+    expect(rare).toEqual({ matches: [{ path: 'raw/docs/周报/一部增长组/w01.md', line: 2, text: '拉新 1200 人。' }], total: 1 });
+    // and with the default fill this tree is read whole
+    expect(grepSearch(tmp, '平台组', { paths: ['raw/docs'], maxMatches: 5 }).partial).toBeUndefined();
+  });
+});
+
+describe('the folders a cut answer names', () => {
+  it('folds a long list into parent folders, every match still counted', () => {
+    const many: GrepFolder[] = [
+      { path: 'wiki/entities', matches: 3, files: 2, shown: 1 },
+      ...Array.from({ length: 70 }, (_, i) => ({ path: `raw/docs/feishu/person-${i}`, matches: 2, files: 1, shown: i < 30 ? 1 : 0 })),
+      { path: 'raw/docs/feishu', matches: 1, files: 1, shown: 1 },
+      { path: 'raw/docs/notes', matches: 4, files: 4, shown: 1, unread: 2 },
+    ];
+    expect(foldGrepFolders(many.slice(0, 5), GREP_FOLDERS_MAX)).toEqual(many.slice(0, 5));
+    const folded = foldGrepFolders(many, GREP_FOLDERS_MAX);
+    expect(folded).toEqual([
+      { path: 'wiki/entities', matches: 3, files: 2, shown: 1 },
+      { path: 'raw/docs/feishu', matches: 141, files: 71, shown: 31, folders: 70 },
+      { path: 'raw/docs/notes', matches: 4, files: 4, shown: 1, unread: 2 },
+    ]);
+    expect(folded.reduce((n, f) => n + f.matches, 0)).toBe(many.reduce((n, f) => n + f.matches, 0));
   });
 
-  it('names the folders with more in the text answer', () => {
-    const text = grepWithContext(ctx, { pattern: '平台组', paths: ['raw/docs'], context: 1, maxMatches: 40 });
-    expect(text).toContain('(showing 40 of 133 matching lines, shared over the 11 folders that hold them. Not shown:');
-    // the folder holding the most unshown lines first
-    const note = text.slice(text.indexOf('(showing 40'));
-    expect(note.split('\n')[1]).toMatch(/^ {2}raw\/docs\/周报\/一部平台组: 2[01] more \(24 matches in 12 files\)$/);
-    for (const d of DIVISIONS.slice(1)) expect(note).toMatch(new RegExp(`raw/docs/周报/${d}平台组: [89] more \\(12 matches in 12 files\\)`));
-    // the monthly reports' one line is shown: nothing more to say of that folder
-    expect(note).not.toContain('raw/docs/月报');
+  it('names more folders than it has places for, in the text answer and the JSON one', () => {
+    const answer = grepAnswer(grepSearch(tmp, '平台组', { paths: ['raw/docs'], maxMatches: 5 }));
+    expect(answer.cut!.folders).toHaveLength(11);
+    const note = grepCutNote(answer);
+    expect(note.split('\n')[0]).toBe('(showing 5 of 133 matching lines, shared over the folders and files that hold them:');
+    expect(note).toContain('  raw/docs/周报/一部平台组: 24 matches in 12 files, 1 shown');
+    for (const d of DIVISIONS.slice(5)) expect(note).toContain(`  raw/docs/周报/${d}平台组: 12 matches in 12 files, 0 shown`);
+    expect(note).toContain('  raw/docs/月报: 1 match in 1 file, 0 shown');
     expect(note).toContain('search it alone (`path`)');
-    // a complete answer carries no note
+    expect(grepCutNote(grepAnswer(grepSearch(tmp, '拉新', { paths: ['raw/docs'] })))).toBe('');
+  });
+});
+
+describe('grep with context', () => {
+  it('names the folders in a closing note, and none when the answer is complete', () => {
+    const text = grepWithContext(ctx, { pattern: '平台组', paths: ['raw/docs'], context: 1, maxMatches: 40 });
+    const note = text.slice(text.indexOf('(showing 40'));
+    expect(note.split('\n')[0]).toBe('(showing 40 of 133 matching lines, shared over the folders and files that hold them:');
+    expect(note.split('\n').filter((l) => l.startsWith('  raw/docs/'))).toHaveLength(11);
     expect(grepWithContext(ctx, { pattern: '拉新', paths: ['raw/docs'], context: 1 })).not.toContain('showing');
-    expect(grepCutNote(grepSearch(tmp, '拉新', { paths: ['raw/docs'] }))).toBe('');
   });
 
-  it('answers the MCP tool with the matches alone when complete, and with where the rest are when cut', async () => {
+  it('leaves files out a folder in turn when the answer is too long, and counts what it shows', () => {
+    // six folders of four long files: a match with 20 lines of context is about 12,000 characters, and an answer holds 60,000
+    const long = path.join(tmp, 'raw', 'docs', 'long');
+    const filler = 'x'.repeat(280);
+    for (let f = 1; f <= 6; f++) {
+      fs.mkdirSync(path.join(long, `team-${f}`), { recursive: true });
+      for (let n = 1; n <= 4; n++) {
+        const lines = Array.from({ length: 41 }, (_, i) => (i === 20 ? `Zenith outage ${filler}` : `line ${i} ${filler}`));
+        fs.writeFileSync(path.join(long, `team-${f}`, `r${n}.md`), lines.join('\n'));
+      }
+    }
+    const text = grepWithContext(ctx, { pattern: 'Zenith outage', paths: ['raw/docs/long'], context: 20 });
+    const shown = [...text.matchAll(/^== (raw\/docs\/long\/team-\d)\/r(\d)\.md \(1 match\)$/gm)].map((m) => `${m[1]}/r${m[2]}`);
+    // cut in the order searched, the first folder's four files and one of the second filled the answer
+    expect(shown).toEqual(['raw/docs/long/team-1/r1', 'raw/docs/long/team-2/r1', 'raw/docs/long/team-3/r1', 'raw/docs/long/team-4/r1', 'raw/docs/long/team-5/r1']);
+    // and the note counts what the answer shows, not what the search picked
+    expect(text).toContain('(showing 5 of 24 matching lines, shared over the folders and files that hold them:');
+    for (let f = 1; f <= 5; f++) expect(text).toContain(`  raw/docs/long/team-${f}: 4 matches in 4 files, 1 shown`);
+    expect(text).toContain('  raw/docs/long/team-6: 4 matches in 4 files, 0 shown');
+    expect(text).toContain('(19 files with 19 matches left out by the answer\'s size, a folder in turn');
+    fs.rmSync(long, { recursive: true, force: true });
+  });
+});
+
+describe('the shape of a grep answer', () => {
+  const call = async (args: Record<string, unknown>) => {
     const tools = new Map<string, { schema: Record<string, z.ZodTypeAny>; handler: (args: Record<string, unknown>) => Promise<{ content: { text: string }[] }> }>();
     const fake = {
       registerTool: (name: string, config: { inputSchema: Record<string, z.ZodTypeAny> }, handler: (args: Record<string, unknown>) => Promise<{ content: { text: string }[] }>) => {
@@ -141,29 +239,50 @@ describe('a grep with more matches than it returns', () => {
       },
     } as unknown as McpServer;
     registerKnodeTools(fake, ctx);
-    const call = async (args: Record<string, unknown>) => {
-      const t = tools.get('knode_grep')!;
-      return JSON.parse((await t.handler(z.object(t.schema).parse(args))).content[0].text);
-    };
-    expect(await call({ pattern: '拉新', path: 'raw/docs' })).toEqual([{ path: 'raw/docs/周报/一部增长组/w01.md', line: 2, text: '拉新 1200 人。' }]);
+    const t = tools.get('knode_grep')!;
+    return JSON.parse((await t.handler(z.object(t.schema).parse(args))).content[0].text);
+  };
+
+  it('is one object from the MCP tool, with `cut` when the matches are a sample', async () => {
+    expect(await call({ pattern: '拉新', path: 'raw/docs' })).toEqual({ matches: [{ path: 'raw/docs/周报/一部增长组/w01.md', line: 2, text: '拉新 1200 人。' }], total: 1 });
+    expect(await call({ pattern: '没有这个词', path: 'raw/docs' })).toEqual({ matches: [], total: 0 });
 
     const cut = await call({ pattern: '平台组', path: 'raw/docs', maxMatches: 40 });
-    expect(cut.shown).toBe(40);
+    expect(Object.keys(cut)).toEqual(['matches', 'total', 'cut']);
     expect(cut.total).toBe(133);
     expect(cut.matches).toHaveLength(40);
-    expect(perFolder(cut.matches).size).toBe(11);
-    expect(cut.more).toHaveLength(10);
-    expect(cut.more[0]).toMatchObject({ folder: 'raw/docs/周报/一部平台组', matches: 24, files: 12 });
-    expect(cut.more.reduce((n: number, f: { more: number }) => n + f.more, 0)).toBe(133 - 40);
-    expect(cut.note).toContain('Search one folder alone');
+    expect(cut.cut.shown).toBe(40);
+    expect(cut.cut.folders).toHaveLength(11);
+    expect(cut.cut.folders.at(-1)).toEqual({ path: 'raw/docs/月报', matches: 1, files: 1, shown: 1 });
+    expect(cut.cut.note).toContain('Showing 40 of 133 matching lines');
+
+    // cut by the per-file cap alone: the same shape
+    const perFile = await call({ pattern: '平台组', path: 'raw/docs/周报/一部平台组', max_per_file: 1 });
+    expect(Object.keys(perFile)).toEqual(['matches', 'total', 'cut']);
+    expect(perFile.cut).toMatchObject({ shown: 12, folders: [{ path: 'raw/docs/周报/一部平台组', matches: 24, files: 12, shown: 12 }] });
+    // and several paths
+    expect(Object.keys(await call({ pattern: '拉新', paths: ['raw/docs/周报', 'raw/docs/月报'] }))).toEqual(['matches', 'total']);
+  });
+
+  it('is said by the command line too', () => {
+    const complete = grepAnswer(grepSearch(tmp, '拉新', { paths: ['raw/docs'] }));
+    expect(formatGrep(complete)).toBe('raw/docs/周报/一部增长组/w01.md:2: 拉新 1200 人。');
+    expect(formatGrep(grepAnswer(grepSearch(tmp, '没有这个词')))).toBe('(no matches)');
+    const text = formatGrep(grepAnswer(grepSearch(tmp, '平台组', { paths: ['raw/docs'], maxMatches: 5 })));
+    expect(text.split('\n').slice(0, 5).every((l) => /^raw\/docs\/.+:\d+: /.test(l))).toBe(true);
+    expect(text).toContain('-- 5 of 133 matching lines shown, shared over the folders that hold them:');
+    expect(text).toContain('  raw/docs/周报/十部平台组: 12 in 12 files, 0 shown');
+    expect(text).toContain('knode grep <pattern> <folder>');
   });
 });
 
 describe('shareEvenly', () => {
-  it('meets the small amounts whole and splits the rest', () => {
+  it('meets the small amounts whole, splits the rest, and gives what is left over to the earliest', () => {
     expect(shareEvenly([10, 1000, 1000], 1000)).toEqual([10, 495, 495]);
     expect(shareEvenly([3, 3, 3], 100)).toEqual([3, 3, 3]);
-    expect(shareEvenly([5, 5, 5, 5], 2)).toEqual([0, 0, 1, 1]);
+    expect(shareEvenly([5, 5, 5, 5], 2)).toEqual([1, 1, 0, 0]);
+    expect(shareEvenly([1, 9, 9], 8)).toEqual([1, 4, 3]);
+    expect(shareEvenly([9, 1, 9], 2)).toEqual([1, 1, 0]);
     expect(shareEvenly([], 10)).toEqual([]);
   });
 });

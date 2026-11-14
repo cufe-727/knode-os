@@ -127,7 +127,7 @@ describe('the REST file API', () => {
     for (const q of ['', '&path=.', '&path=knode.config.json', '&path=.runs']) {
       const res = await app.request(`/api/grep?pattern=${encodeURIComponent(SECRET)}${q}`, { headers });
       expect(res.status).toBe(200);
-      expect(await res.json(), q).toEqual([]);
+      expect(await res.json(), q).toEqual({ matches: [], total: 0 });
     }
   });
 
