@@ -61,8 +61,8 @@ export interface RunMeta {
   /** Task types the run was limited to (`--types`). */
   types?: string[];
   notes?: string;
-  /** `--repeat`: answers per task, and the systems repeated. */
-  repeat?: { n: number; systems: string[] };
+  /** `--repeat`: answers per task, the systems repeated, and the tasks per pack repeats after the first ask (`--repeat-sample`; absent: all). */
+  repeat?: { n: number; systems: string[]; sample?: number };
   /** `--remote`: the serve it offered work through, and whether its calls and its judge could leave. */
   remote?: { serve: string; calls: boolean; judge: boolean };
   /**

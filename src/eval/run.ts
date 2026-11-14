@@ -166,6 +166,13 @@ export interface RunOptions {
   repeat?: number;
   /** The systems answered `repeat` times (default: every system that answers). */
   repeatSystems?: string[];
+  /**
+   * With `repeat`: repeats after the first answer only a seeded sample of
+   * this many tasks per pack (and per update batch), stratified by task type
+   * and the same for every repeated system — run-to-run spread for a part of
+   * the cost. Unset: every task is repeated.
+   */
+  repeatSample?: number;
   /** Cancels the run: what is out with workers is withdrawn and their session tokens revoked. */
   signal?: AbortSignal;
   /**
@@ -254,6 +261,17 @@ export function selectTasks(tasks: Task[], suites: Set<string>, limit: number | 
     if (!added) break;
   }
   return out;
+}
+
+/**
+ * The tasks repeats after the first ask (`--repeat-sample`): `n` of `pool`,
+ * stratified by task type as `selectTasks` samples (round-robin across types,
+ * primary tasks first), under a seed of its own so the sample is not simply
+ * the first tasks of the run's own order. Null: no sample, every task repeats.
+ */
+export function repeatSampleOf(pool: Task[], n: number | undefined, seed: string | number): Set<string> | null {
+  if (!n || n <= 0) return null;
+  return new Set(selectTasks(pool, new Set(pool.map((t) => t.suite)), Math.trunc(n), `${seed}|repeat`).map((t) => t.id));
 }
 
 const isAgent = (s: SystemUnderTest) => s.kind === 'agent' || s.id.startsWith('agent-');
@@ -479,7 +497,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     };
     const repeat = Math.max(1, Math.trunc(opts.repeat ?? 1));
     const repeatsOf = (s: SystemUnderTest) => (repeat > 1 && (!opts.repeatSystems?.length || opts.repeatSystems.includes(s.id)) ? repeat : 1);
-    if (repeat > 1) meta.repeat = { n: repeat, systems: opts.repeatSystems?.length ? opts.repeatSystems : opts.systems };
+    if (repeat > 1) meta.repeat = { n: repeat, systems: opts.repeatSystems?.length ? opts.repeatSystems : opts.systems, ...(opts.repeatSample ? { sample: opts.repeatSample } : {}) };
+    // the tasks a repeat after the first asks: all of them, or the seeded sample (`--repeat-sample`)
+    const repeatedTasks = (tasks: Task[], r: number, sample: Set<string> | null) => (r === 1 || !sample ? tasks : tasks.filter((t) => sample.has(t.id)));
     if (remote.where === 'serve') meta.remote = { serve: opts.remote!.serveUrl, calls: callsLeave, judge: Boolean(judgeLeaves && !anyPrivate) };
     // where its work goes, as this start of the run has it (docs/design/32): a resume with other slots says so here
     meta.work = {
@@ -561,6 +581,11 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       const typed = opts.types?.length ? staged.tasks.filter((t) => opts.types!.includes(t.type)) : staged.tasks;
       const allTasks = selectTasks(typed.filter((t) => !t.afterUpdate), suites, opts.limit, seed);
       const updateTasks = suites.has('update') ? typed.filter((t) => t.afterUpdate) : [];
+      // the repeat sample: drawn from the tasks every repeated system answers (an agent answers its own subset), so pairs compare
+      const agentTasks = selectTasks(allTasks, suites, opts.agentLimit ?? 30, seed);
+      const repeated = systems.filter((s) => s.answers && repeatsOf(s) > 1);
+      const repeatPool = repeated.some(isAgent) ? agentTasks : allTasks;
+      const repeatSample = repeatSampleOf(repeatPool, opts.repeatSample, seed);
 
       for (const [group, members] of groups) {
         const env: SystemEnv = {
@@ -581,8 +606,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         }
         for (const s of members) {
           for (const other of members) if (other !== s) await other.release?.(env);
-          const tasks = isAgent(s) ? selectTasks(allTasks, suites, opts.agentLimit ?? 30, seed) : allTasks;
-          for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, tasks, fraction, seed, concurrencyFor(s, leaves), progress, undefined, r, stop.signal);
+          const tasks = isAgent(s) ? agentTasks : allTasks;
+          for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, repeatedTasks(tasks, r, repeatSample), fraction, seed, concurrencyFor(s, leaves), progress, undefined, r, stop.signal);
           await retrieveAll(store, env, s, allTasks, fraction, seed, stop.signal);
         }
         // generated knowledge, once per build
@@ -639,8 +664,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
             // nothing to update, or a resumed run that updated already: reopen on the staged corpus as it now is
             for (const s of members) await s.reopen?.(env).catch(() => {});
           }
+          const batchSample = repeatSampleOf(tasks, opts.repeatSample, seed);
           for (const s of members) {
-            for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, tasks, fraction, seed, concurrencyFor(s, leaves), progress, batch, r, stop.signal);
+            for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, repeatedTasks(tasks, r, batchSample), fraction, seed, concurrencyFor(s, leaves), progress, batch, r, stop.signal);
           }
           for (const s of members) await s.release?.(env);
         }

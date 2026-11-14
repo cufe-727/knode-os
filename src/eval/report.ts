@@ -80,6 +80,24 @@ export interface Variance {
   tasks: number;
 }
 
+/** Two repeated systems on the tasks both answered in every repeat (`--repeat`, `--repeat-sample`). */
+export interface RepeatPair {
+  a: string;
+  b: string;
+  tasks: number;
+  /** Mean correctness of a minus b, per repeat. */
+  perRepeat: number[];
+  /** The mean of those: the paired difference on the sample. */
+  diff: number;
+  /** Each system's run-to-run spread on these tasks: the SD across repeats of its mean correctness. */
+  spreadA: number;
+  spreadB: number;
+  /** The spread of a single run's difference that rerunning both alone gives: √(spreadA² + spreadB²). */
+  noise: number;
+  /** The difference is within the run-to-run spread: the per-repeat differences change sign, or |diff| ≤ 2 × noise. */
+  withinSpread: boolean;
+}
+
 export interface JudgeAuditSummary {
   /** Per kind of verdict (grade, list, match, …): verdicts judged twice, and how many of the pairs agreed. */
   byKind: Record<string, { n: number; agree: number }>;
@@ -193,6 +211,8 @@ export interface ReportData {
   costPerCorrect?: Record<string, Record<string, { tokens: number | null; usd: number | null; correct: number; n: number; toolCalls: number }>>;
   /** Run-to-run variance where a system answered the same tasks more than once (`eval run --repeat`). */
   variance?: Record<string, Record<string, Variance>>;
+  /** Per pack, every two repeated systems: their paired difference on the repeated tasks against their run-to-run spread. */
+  repeatPairs?: Record<string, RepeatPair[]>;
   judgeUsage: { calls: number; weightedTokens: number; costUsd: number };
   /** The judge audit (`--judge-audit`): verdicts judged twice, how often the two agreed, and every disagreement. */
   judgeAudit?: JudgeAuditSummary;
@@ -388,13 +408,14 @@ export function buildReportData(runDir: string): ReportData {
   const separation = separationOf(scores);
   const costPerCorrect = costPerCorrectOf(answers, scores);
   const variance = varianceOf(answers, scores);
+  const repeatPairs = repeatPairsOf(answers, scores);
 
   const judgeEvents = fs.existsSync(path.join(runDir, 'meter.jsonl'))
     ? fs.readFileSync(path.join(runDir, 'meter.jsonl'), 'utf8').split('\n').filter((l) => l.includes('"__judge__"')).length
     : 0;
   return {
     run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, tools, builds, breakEven, lists, efficiency, updates, pooled, paired, byType, typesByPack, typeDeltas,
-    separation, costPerCorrect, variance, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 }, judgeAudit: judgeAuditOf(store),
+    separation, costPerCorrect, variance, repeatPairs, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 }, judgeAudit: judgeAuditOf(store),
     ranAt: ranAtOf(runDir, store.meta()?.work?.pool ?? 'local'),
   };
 }
@@ -445,6 +466,56 @@ export function costPerCorrectOf(answers: ReturnType<RunStore['allAnswers']>, sc
   for (const [k, x] of acc) {
     const [pack, system] = k.split('\u0000');
     (out[pack] ??= {})[system] = { tokens: x.correct > 0 ? x.tokens / x.correct : null, usd: x.correct > 0 ? x.usd / x.correct : null, correct: x.correct, n: x.n, toolCalls: x.n ? x.toolCalls / x.n : 0 };
+  }
+  return out;
+}
+
+/**
+ * Paired differences between repeated systems (docs/design/33 §6.4): on the
+ * tasks both answered in every repeat they share, the difference of their
+ * mean correctness in each repeat, and whether it is within what rerunning
+ * alone moves it. A difference counts as within the spread when the repeats
+ * disagree on its sign, or when it is at most twice √(sA² + sB²), the SD a
+ * single run's difference would have from the two systems' own run-to-run
+ * spreads (estimated from as few as two or three repeats, so a rough bound).
+ */
+export function repeatPairsOf(answers: ReturnType<RunStore['allAnswers']>, scores: ScoreRecord[]): NonNullable<ReportData['repeatPairs']> {
+  const repeats = new Map<string, Set<number>>();
+  for (const a of answers) {
+    const k = `${a.pack}\u0000${a.system}`;
+    (repeats.get(k) ?? repeats.set(k, new Set()).get(k)!).add(a.repeat ?? 0);
+  }
+  // pack → system → task → repeat → correctness, for systems answered more than once
+  const byPack = new Map<string, Map<string, Map<string, Map<number, number>>>>();
+  for (const s of scores) {
+    if (s.metric !== 'correctness' || s.value === null || !Number.isFinite(s.value) || !s.taskId) continue;
+    if ((repeats.get(`${s.pack}\u0000${s.system}`)?.size ?? 0) < 2) continue;
+    const sys = byPack.get(s.pack) ?? byPack.set(s.pack, new Map()).get(s.pack)!;
+    const tasks = sys.get(s.system) ?? sys.set(s.system, new Map()).get(s.system)!;
+    (tasks.get(s.taskId) ?? tasks.set(s.taskId, new Map()).get(s.taskId)!).set(s.repeat ?? 0, s.value);
+  }
+  const out: NonNullable<ReportData['repeatPairs']> = {};
+  for (const [pack, systems] of byPack) {
+    const names = [...systems.keys()].sort((x, y) => (x === BASELINE ? -1 : y === BASELINE ? 1 : x.localeCompare(y)));
+    for (let i = 0; i < names.length; i++) {
+      for (let j = i + 1; j < names.length; j++) {
+        const [a, b] = [names[i], names[j]];
+        const order = [...repeats.get(`${pack}\u0000${a}`)!].filter((r) => repeats.get(`${pack}\u0000${b}`)!.has(r)).sort((x, y) => x - y);
+        if (order.length < 2) continue;
+        const ta = systems.get(a)!;
+        const tb = systems.get(b)!;
+        const common = [...ta.keys()].filter((t) => tb.has(t) && order.every((r) => ta.get(t)!.has(r) && tb.get(t)!.has(r)));
+        if (!common.length) continue;
+        const meanOf = (m: Map<string, Map<number, number>>, r: number) => mean(common.map((t) => m.get(t)!.get(r)!));
+        const perRepeat = order.map((r) => meanOf(ta, r) - meanOf(tb, r));
+        const spreadA = sd(order.map((r) => meanOf(ta, r)));
+        const spreadB = sd(order.map((r) => meanOf(tb, r)));
+        const noise = Math.sqrt(spreadA ** 2 + spreadB ** 2);
+        const diff = mean(perRepeat);
+        const flips = perRepeat.some((d) => d > 0) && perRepeat.some((d) => d < 0);
+        (out[pack] ??= []).push({ a, b, tasks: common.length, perRepeat, diff, spreadA, spreadB, noise, withinSpread: flips || Math.abs(diff) <= 2 * noise });
+      }
+    }
   }
   return out;
 }
@@ -678,6 +749,14 @@ export function renderReport(d: ReportData): string {
       lines.push(mdTable(['system', 'repeats', 'tasks', 'correctness per repeat', 'SD across repeats', 'mean within-task SD', 'unstable tasks'], Object.entries(vr).sort().map(([s, v]) => [
         s, v.repeats, v.tasks, v.perRepeat.map((x) => round(x, 3).toFixed(3)).join(' / '), fmtMde(v.sdAcrossRepeats), fmtMde(v.withinTaskSd), `${(v.unstable * 100).toFixed(0)}%`,
       ])), '');
+      const rp = d.repeatPairs?.[pack];
+      if (d.run?.repeat?.sample) lines.push(`Repeats after the first answered a seeded sample of ${d.run.repeat.sample} tasks, stratified by task type (\`--repeat-sample\`); the spread above is on that sample.`, '');
+      if (rp?.length) {
+        lines.push('#### Paired differences against the run-to-run spread', '', 'On the tasks both systems answered in every repeat: the difference of their mean correctness in each repeat, its mean, and the spread a single run\'s difference has from rerunning alone (√(SD a² + SD b²), from the repeats). Within the spread: the repeats disagree on the sign, or |Δ| ≤ 2 × that spread — the difference is not one rerunning could not produce.', '');
+        lines.push(mdTable(['a', 'b', 'tasks', 'Δ per repeat', 'mean Δ', 'run-to-run spread of Δ', 'within the spread'], rp.map((p) => [
+          p.a, p.b, p.tasks, p.perRepeat.map((x) => round(x, 3).toFixed(3)).join(' / '), round(p.diff, 3).toFixed(3), fmtMde(p.noise), p.withinSpread ? 'yes' : 'no',
+        ])), '');
+      }
     }
     const r = d.retrieval[pack];
     if (r) lines.push('### Use: retrieval', '', table(r, RETRIEVAL_METRICS), '');

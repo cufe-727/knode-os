@@ -83,6 +83,15 @@ function poolOption(opts: { pool?: string }): string | undefined {
   return opts.pool;
 }
 
+/** `--repeat-sample`: how many tasks per pack repeats after the first ask; needs --repeat 2 or more. */
+function repeatSampleOption(opts: { repeatSample?: string; repeat?: string }): number | undefined {
+  if (opts.repeatSample === undefined) return undefined;
+  const n = Number(opts.repeatSample);
+  if (!Number.isInteger(n) || n < 1) throw new Error('--repeat-sample: a whole number of tasks, 1 or more');
+  if (!(Number(opts.repeat) > 1)) throw new Error('--repeat-sample: needs --repeat 2 or more');
+  return n;
+}
+
 /** `--judge-audit`: the share of judge verdicts judged a second time (none given: 5%; 0: off). */
 function judgeAuditOption(opts: { judgeAudit?: string }): number | undefined {
   if (opts.judgeAudit === undefined) return undefined;
@@ -244,6 +253,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--repeat <n>', 'answer each task n times, for run-to-run variance (repeat 1 keeps the usual record keys)', '1')
     .option('--repeat-systems <list>', 'with --repeat: only these systems (default: every system that answers)')
     .option('--judge-audit <share>', 'judge this share of the verdicts a second time, in calls of their own with the items in another order, and list where the two disagree (default 0.05, at least 20 a pass; 0 = off)')
+    .option('--repeat-sample <n>', 'with --repeat: repeat only a seeded sample of n tasks per pack, stratified by task type and the same for every repeated system (the first answer still covers every task)')
     .action(async (opts) => {
       const remote = remoteOption(program, opts);
       const res = await waitedOut(runEval, {
@@ -253,6 +263,7 @@ export function registerEvalCommands(program: Command): void {
         pool: poolOption(opts),
         repeat: Number(opts.repeat),
         repeatSystems: csv(opts.repeatSystems),
+        repeatSample: repeatSampleOption(opts),
         judgeAudit: judgeAuditOption(opts),
         packs: csv(opts.pack)!.map(resolvePack),
         systems: csv(opts.systems) ?? DEFAULT_SYSTEMS,
