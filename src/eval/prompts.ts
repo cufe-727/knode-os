@@ -1,4 +1,4 @@
-import { extractFinalAnswer, jsonIn } from './metrics/text.js';
+import { extractFinalAnswer, jsonIn, jsonObjects } from './metrics/text.js';
 import { Citation, Task } from './types.js';
 
 /**
@@ -79,11 +79,59 @@ export interface ParsedItems {
   confidence: number | null;
 }
 
-/** The JSON a set / label / choice task asks for, read leniently. */
+/**
+ * The `{"items": [...]` a reply opens and never closes — the model stopped
+ * before its last bracket or brace, or wrote one too few — closed after its
+ * last complete value, so the items it did write count. The last such opening
+ * in the text; null when there is none or nothing in it parses.
+ */
+export function unclosedItems(text: string): Record<string, unknown> | null {
+  const s = text.replace(/```(?:json)?/gi, '');
+  const opens = [...s.matchAll(/\{\s*"items"\s*:\s*\[/g)];
+  const at = opens.at(-1)?.index;
+  if (at === undefined) return null;
+  // after each value that closes, where it ended and what was still open
+  const cuts: { end: number; open: string[] }[] = [];
+  const stack: string[] = [];
+  let inString = false;
+  for (let j = at; j < s.length; j++) {
+    const c = s[j];
+    if (inString) {
+      if (c === '\\') j++;
+      else if (c === '"') inString = false;
+    } else if (c === '"') inString = true;
+    else if (c === '{' || c === '[') stack.push(c);
+    else if (c === '}' || c === ']') {
+      stack.pop();
+      if (!stack.length) return null; // it closes: a balanced object, which jsonObjects reads when it parses
+      cuts.push({ end: j + 1, open: [...stack] });
+    }
+  }
+  // the opening itself, with no complete item yet
+  cuts.unshift({ end: opens.at(-1)!.index! + opens.at(-1)![0].length, open: ['{', '['] });
+  for (const cut of cuts.reverse()) {
+    const closers = cut.open.reverse().map((c) => (c === '{' ? '}' : ']')).join('');
+    try {
+      const v = JSON.parse(s.slice(at, cut.end) + closers);
+      if (v && typeof v === 'object' && !Array.isArray(v) && Array.isArray((v as { items?: unknown }).items)) return v as Record<string, unknown>;
+    } catch {
+      /* cut earlier */
+    }
+  }
+  return null;
+}
+
+/**
+ * The JSON a set / label / choice task asks for, read leniently: the label
+ * from the reply's object as `jsonIn` finds it; the items from the last
+ * balanced object holding them, else from an `{"items": [...]` left unclosed
+ * (its complete items).
+ */
 export function parseStructured(text: string): ParsedItems {
   const json = jsonIn(text) ?? {};
+  const listed = 'items' in json ? json : [...jsonObjects(text)].reverse().find((o) => 'items' in o) ?? unclosedItems(text) ?? json;
   const conf = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : null);
-  const rawItems = Array.isArray(json.items) ? (json.items as unknown[]) : [];
+  const rawItems = Array.isArray(listed.items) ? (listed.items as unknown[]) : [];
   return {
     items: rawItems
       .map((it) => (typeof it === 'string' ? { label: it } : (it as Record<string, unknown>)))
