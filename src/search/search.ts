@@ -74,7 +74,7 @@ interface RankedChunk {
   title: string | null;
   content: string;
   raw: number;
-  /** Of a generated page (`isGeneratedSql`), not of a source. */
+  /** Of a generated page (`SideSql.generated`), not of a source. */
   generated?: boolean;
 }
 
@@ -82,7 +82,7 @@ interface RankedChunk {
  * The part of a search's results that chunks of generated pages may take:
  * a quarter, 2 of the 8 chunks an answer is written from.
  *
- * A generated page (`isGeneratedSql`: an entity page, a timeline, a
+ * A generated page (`SideSql.generated`: an entity page, a timeline, a
  * disagreements page, a summary) restates what sources say, and a knowledge
  * base grows several chunks of them per source document. Ranked as one list
  * they take the places: on the 2026-11 separation benchmark's 10× index (8,016
@@ -91,7 +91,7 @@ interface RankedChunk {
  * channel's candidates were pages before any source. The rule, in three parts:
  *
  * 1. Lists of where to look are not answers. A mentions page and a
- *    navigation list (`isListingSql`) are not searched at all unless the
+ *    navigation list (`SideSql.listing`) are not searched at all unless the
  *    search asks for the wiki's pages (`wantsListings`): before, they took
  *    263 of the 549 places pages had in those 297 searches.
  * 2. Every recall channel lists its best chunks of sources and of generated
@@ -143,20 +143,69 @@ export function generatedPlaces(k: number, share: number, topIsPage = false): nu
 }
 
 /**
- * SQL: the document at `alias` is a generated page — a view of the index
- * (`kind = 'view'`: an entity page, a mentions page, a timeline) or one of the
- * wiki's navigation lists (`isReservedWikiFile`: every folder's index.md),
- * which ingest files as sources that the graph does not read. A wiki page a
- * person or an agent wrote is a source.
+ * How a search tells the documents of one index apart, as SQL over a
+ * `documents` alias:
+ *
+ * `generated`  a generated page — a view of the index (`kind = 'view'`: an
+ *              entity page, a mentions page, a timeline) or a navigation
+ *              list the generator keeps (below). A wiki page a person or an
+ *              agent wrote is a source.
+ * `listing`    a generated list of where to look, not something to answer
+ *              from: a mentions page (a view under wiki/mentions/: the
+ *              documents that name an entity, a line each) or a navigation
+ *              list.
+ *
+ * A navigation list is an index.md or log.md of the wiki in which the
+ * generator keeps a region (`pages` holds `<file>#<region>` with a kind ending
+ * in _index or _shelf, or wiki_contents). Ingest files every index.md as a
+ * source the graph does not read, whoever wrote it, so the name alone does
+ * not say: an index.md a person wrote, with no such region, is a source like
+ * any page of theirs. Those are few, and are what is looked up (`sidesOf`).
  */
-const isGeneratedSql = (alias: string) => `(${alias}.kind = 'view' OR (${alias}.root = 'wiki' AND ${alias}.path ~ '(^|/)(index|log)[.]md$'))`;
+export interface SideSql {
+  generated(alias: string): string;
+  listing(alias: string): string;
+}
+
+const NAMED_AS_LIST = `~ '(^|/)(index|log)[.]md$'`;
+
+function sideSql(authoredLists: string[]): SideSql {
+  const authored = authoredLists.length ? `ARRAY[${authoredLists.map((x) => `'${x.replace(/'/g, "''")}'`).join(', ')}]::text[]` : null;
+  const list = (a: string) => `(${a}.root = 'wiki' AND ${a}.path ${NAMED_AS_LIST}${authored ? ` AND NOT (${a}.path = ANY(${authored}))` : ''})`;
+  return {
+    generated: (a) => `(${a}.kind = 'view' OR ${list(a)})`,
+    listing: (a) => `((${a}.kind = 'view' AND ${a}.path LIKE 'wiki/mentions/%') OR ${list(a)})`,
+  };
+}
+
+const sideSqls = new WeakMap<object, { sql: SideSql; at: number }>();
 
 /**
- * SQL: the document at `alias` is a list of where to look, not something to
- * answer from — a mentions page (wiki/mentions/<entity>.md: the documents
- * that name an entity, a line each) or a navigation list (index.md, log.md).
+ * The side SQL of a store, with the index.md and log.md files of its wiki
+ * that no generator keeps a region in — a person's — looked up at most once
+ * a minute.
  */
-const isListingSql = (alias: string) => `(${alias}.root = 'wiki' AND (${alias}.path LIKE 'wiki/mentions/%' OR ${alias}.path ~ '(^|/)(index|log)[.]md$'))`;
+export async function sidesOf(store: Store): Promise<SideSql> {
+  const hit = sideSqls.get(store);
+  if (hit && Date.now() - hit.at < 60_000) return hit.sql;
+  let authored: string[] = [];
+  try {
+    authored = (await store.query<{ path: string }>(
+      `SELECT d.path FROM documents d
+       WHERE d.root = 'wiki' AND d.path ${NAMED_AS_LIST}
+         AND NOT EXISTS (
+           SELECT 1 FROM pages g
+           WHERE g.tx_to IS NULL AND g.status <> 'archived' AND split_part(g.path, '#', 1) = d.path
+             AND (g.kind ~ '(_index|_shelf)$' OR g.kind = 'wiki_contents'))
+       LIMIT 500`,
+    )).map((r) => r.path);
+  } catch {
+    // a store without the pages table (an old schema): every index.md is taken for a list
+  }
+  const sql = sideSql(authored);
+  sideSqls.set(store, { sql, at: Date.now() });
+  return sql;
+}
 
 /** True when a search asked for the wiki's own pages: kind `view` or `wiki`, or a source prefix inside wiki/. */
 export function wantsListings(filter: ResolvedScopeFilter): boolean {
@@ -303,10 +352,20 @@ export function docLiveAt(alias: string, p: Params, asOf?: TimeInput, filter: Re
   // a repository is thousands of chunks of code: it answers when asked for (kind
   // `code`, or a source under raw/codebase), never by outnumbering the prose
   if (!wantsCode(filter)) parts.push(`${alias}.root <> 'codebase'`);
-  // nor do the wiki's lists of where to look (mentions pages, navigation lists): they are found
-  // by a search that asks for the wiki's pages, and browsed otherwise
-  if (!wantsListings(filter)) parts.push(`NOT ${isListingSql(alias)}`);
   return parts.join(' AND ');
+}
+
+/**
+ * `docLiveAt` for the recall channels of a search: as well, not a list of
+ * where to look (`SideSql.listing`: a mentions page, a navigation list)
+ * unless the search asks for the wiki's pages. Those are browsed, and found
+ * by a search that names them, as code is. Only the three channels here use
+ * it: the graph routes, the walk's expansion, context packs and excerpts go
+ * through `docLiveAt` and read what they read before.
+ */
+function searchable(alias: string, p: Params, sides: SideSql, asOf?: TimeInput, filter: ResolvedScopeFilter = NO_FILTER): string {
+  const live = docLiveAt(alias, p, asOf, filter);
+  return wantsListings(filter) ? live : `${live} AND NOT ${sides.listing(alias)}`;
 }
 
 /** True when a search asked for code: kind `code`, or a source prefix inside raw/codebase. */
@@ -340,12 +399,12 @@ function scansIteratively(store: Store): Promise<boolean> {
 const sidesHeld = new WeakMap<object, { sources: boolean; generated: boolean; at: number }>();
 
 /** Which sides the index holds documents of, asked at most once a minute per store: a side without any is not searched. */
-async function sidesOfIndex(store: Store): Promise<{ sources: boolean; generated: boolean }> {
+async function sidesOfIndex(store: Store, sides: SideSql): Promise<{ sources: boolean; generated: boolean }> {
   const hit = sidesHeld.get(store);
   if (hit && Date.now() - hit.at < 60_000) return hit;
   const [row] = await store.query<{ sources: boolean; generated: boolean }>(
-    `SELECT EXISTS (SELECT 1 FROM documents d WHERE NOT ${isGeneratedSql('d')}) AS sources,
-            EXISTS (SELECT 1 FROM documents d WHERE ${isGeneratedSql('d')}) AS generated`,
+    `SELECT EXISTS (SELECT 1 FROM documents d WHERE NOT ${sides.generated('d')}) AS sources,
+            EXISTS (SELECT 1 FROM documents d WHERE ${sides.generated('d')} AND NOT ${sides.listing('d')}) AS generated`,
   );
   const held = { sources: row?.sources !== false, generated: row?.generated !== false, at: Date.now() };
   sidesHeld.set(store, held);
@@ -381,6 +440,7 @@ async function vectorSide(
   qv: number[],
   k: number,
   generated: boolean,
+  sides: SideSql,
   asOf?: TimeInput,
   filter?: ResolvedScopeFilter,
 ): Promise<RankedChunk[]> {
@@ -388,14 +448,14 @@ async function vectorSide(
   // only vectors of the query's own space: while a new model's vectors are still coming in
   // (a re-embed, or the deferred backlog) the table holds two (docs/design/12 §3.3)
   const model = p.add(embedder.model);
-  const cond = docLiveAt('d', p, asOf, filter);
+  const cond = searchable('d', p, sides, asOf, filter);
   const lim = p.add(k);
   const sql = `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
             1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${generated} AS generated
      FROM embeddings e
      JOIN chunks c ON c.id = e.chunk_id
      JOIN documents d ON d.id = c.document_id
-     WHERE e.model = ${model} AND ${cond} AND ${generated ? '' : 'NOT '}${isGeneratedSql('d')}
+     WHERE e.model = ${model} AND ${cond} AND ${generated ? '' : 'NOT '}${sides.generated('d')}
      ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
      LIMIT ${lim}`;
   if (!(await scansIteratively(store))) return store.query<RankedChunk>(sql, p.list);
@@ -412,7 +472,8 @@ async function vectorSearch(
   embedder: EmbeddingProvider,
   query: string,
   k = 10,
-  queryVector?: number[],
+  queryVector: number[] | undefined,
+  sides: SideSql,
   asOf?: TimeInput,
   filter?: ResolvedScopeFilter,
 ): Promise<RankedChunk[]> {
@@ -420,10 +481,10 @@ async function vectorSearch(
   // a search for certain kinds reads the sides they are on, and no side the index holds nothing of:
   // an iterative scan for rows that are not there walks the index to its limit
   const kinds = filter?.kinds;
-  const held = await sidesOfIndex(store);
+  const held = await sidesOfIndex(store, sides);
   const [sources, generated] = await Promise.all([
-    held.sources && (!kinds || kinds.some((kind) => kind !== 'view')) ? vectorSide(store, embedder, qv, k, false, asOf, filter) : [],
-    held.generated && (!kinds || kinds.includes('view')) ? vectorSide(store, embedder, qv, k, true, asOf, filter) : [],
+    held.sources && (!kinds || kinds.some((kind) => kind !== 'view')) ? vectorSide(store, embedder, qv, k, false, sides, asOf, filter) : [],
+    held.generated && (!kinds || kinds.includes('view')) ? vectorSide(store, embedder, qv, k, true, sides, asOf, filter) : [],
   ]);
   return mergeSides(sources, generated);
 }
@@ -556,9 +617,9 @@ const hasSearchOperators = (query: string) => /"[^"]+"|(^|\s)-[\p{L}\p{N}]/u.tes
  * by the same terms, so a search ranks alike before and after the index is
  * there (`scannedFrequencies`, `scannedCandidates`).
  */
-async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
+async function keywordSearch(store: Store, query: string, k: number, sides: SideSql, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
   const p = new Params([websearchText(query)]);
-  const cond = docLiveAt('d', p, asOf, filter);
+  const cond = searchable('d', p, sides, asOf, filter);
   const lim = p.add(k);
   // The chunks holding every word, best first. A query with a quoted phrase or an excluded word is the
   // asker's own filter and its matches lead the answer, so each side gets its best `k` of them, a branch
@@ -567,26 +628,26 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
   // index — measured on 200,400 chunks (PostgreSQL 17, "进展", 25,850 matches): one list 112 ms, a branch
   // per side 189 ms (the matches are read twice), a window over the sides 126 ms with every match and
   // its text sorted on disk.
-  const matching = (side: string) => `SELECT ${CANDIDATE_COLUMNS}, ts_rank(c.tsv, websearch_to_tsquery('simple', $1)) AS raw
+  const matching = (side: string) => `SELECT ${candidateColumns(sides)}, ts_rank(c.tsv, websearch_to_tsquery('simple', $1)) AS raw
        FROM chunks c
        JOIN documents d ON d.id = c.document_id
        WHERE c.tsv @@ websearch_to_tsquery('simple', $1) AND ${cond}${side}
        ORDER BY raw DESC
        LIMIT ${lim}`;
   const fts = hasSearchOperators(query)
-    ? (await store.query<RankedChunk>(`(${matching(` AND NOT ${isGeneratedSql('d')}`)}) UNION ALL (${matching(` AND ${isGeneratedSql('d')}`)})`, p.list)).sort((x, y) => y.raw - x.raw)
+    ? (await store.query<RankedChunk>(`(${matching(` AND NOT ${sides.generated('d')}`)}) UNION ALL (${matching(` AND ${sides.generated('d')}`)})`, p.list)).sort((x, y) => y.raw - x.raw)
     : await store.query<RankedChunk>(matching(''), p.list);
 
   const terms = keywordTerms(query);
   if (terms.length === 0) return fts;
   const size = Math.max(k * 4, 120);
   const total = await chunkTotal(store);
-  const lists = matchIndexReady(store, 'chunks') && terms.every((t) => termGrams(t).length > 0) ? await termLists(store, terms, asOf, filter) : null;
+  const lists = matchIndexReady(store, 'chunks') && terms.every((t) => termGrams(t).length > 0) ? await termLists(store, terms, sides, asOf, filter) : null;
   const df = lists?.df ?? (await scannedFrequencies(store, terms));
   const idf = termIdf(df, total);
   const like = lists
-    ? await listedCandidates(store, terms, idf, lists, size, asOf, filter)
-    : await scannedCandidates(store, terms, idf, rarestTerms(df), size, asOf, filter);
+    ? await listedCandidates(store, terms, idf, lists, size, sides, asOf, filter)
+    : await scannedCandidates(store, terms, idf, rarestTerms(df), size, sides, asOf, filter);
 
   const seen = new Set(fts.map((r) => r.chunk_id));
   const pool = [...fts, ...like.filter((r) => !seen.has(r.chunk_id))];
@@ -597,7 +658,7 @@ async function keywordSearch(store: Store, query: string, k = 10, asOf?: TimeInp
   return bestOfEachSide([...fts, ...ranked.filter((r) => !seen.has(r.chunk_id))], k);
 }
 
-const CANDIDATE_COLUMNS = `c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, ${isGeneratedSql('d')} AS generated`;
+const candidateColumns = (sides: SideSql) => `c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, ${sides.generated('d')} AS generated`;
 
 interface TermLists {
   /** Chunks holding each term, counted up to `KEYWORD_DF_CAP`. */
@@ -622,20 +683,20 @@ interface TermLists {
  * chunk as a filter: 1,050 ms for a lookup the index answers in 3 ms on 1,759
  * chunks.
  */
-async function termLists(store: Store, terms: string[], asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<TermLists> {
+async function termLists(store: Store, terms: string[], sides: SideSql, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<TermLists> {
   const p = new Params();
   const expr = MATCH_INDEXES.chunks.expr('c');
   const cap = p.add(KEYWORD_DF_CAP);
   const lists = terms.map((t, i) => `(SELECT ${i} AS i, c.id, c.document_id FROM chunks c WHERE ${expr} @@ ${p.add(gramQuery([termGrams(t)], 1))}::tsquery LIMIT ${cap})`);
   const fetch = p.add(KEYWORD_FETCH_TERMS);
-  const cond = docLiveAt('d', p, asOf, filter);
+  const cond = searchable('d', p, sides, asOf, filter);
   const rows = await store.query<{ i: number; id: string | null; df: number | null; generated: boolean | null }>(
     `WITH hit AS MATERIALIZED (${lists.join(' UNION ALL ')}),
           n AS MATERIALIZED (SELECT i, count(*)::int AS df FROM hit GROUP BY i),
           pick AS MATERIALIZED (SELECT i FROM n ORDER BY df, i LIMIT ${fetch})
      SELECT n.i, NULL::text AS id, n.df, NULL::boolean AS generated FROM n
      UNION ALL
-     SELECT h.i, h.id, NULL::int AS df, ${isGeneratedSql('d')} AS generated
+     SELECT h.i, h.id, NULL::int AS df, ${sides.generated('d')} AS generated
      FROM hit h JOIN pick ON pick.i = h.i JOIN documents d ON d.id = h.document_id
      WHERE ${cond}`,
     p.list,
@@ -667,6 +728,7 @@ async function listedCandidates(
   idf: number[],
   lists: TermLists,
   pool: number,
+  sides: SideSql,
   asOf?: TimeInput,
   filter?: ResolvedScopeFilter,
 ): Promise<RankedChunk[]> {
@@ -682,10 +744,10 @@ async function listedCandidates(
   if (picked.length > 1 && picked.some((i) => lists.df[i] >= KEYWORD_DF_CAP)) {
     const p = new Params([gramQuery(picked.map((i) => termGrams(terms[i])), picked.length)]);
     const lim = p.add(pool);
-    const cond = docLiveAt('d', p, asOf, filter);
+    const cond = searchable('d', p, sides, asOf, filter);
     const rows = await store.query<{ id: string; generated: boolean }>(
       `WITH hit AS MATERIALIZED (SELECT c.id, c.document_id FROM chunks c WHERE ${MATCH_INDEXES.chunks.expr('c')} @@ $1::tsquery LIMIT ${lim})
-       SELECT h.id, ${isGeneratedSql('d')} AS generated FROM hit h JOIN documents d ON d.id = h.document_id WHERE ${cond}`,
+       SELECT h.id, ${sides.generated('d')} AS generated FROM hit h JOIN documents d ON d.id = h.document_id WHERE ${cond}`,
       p.list,
     );
     for (const r of rows) {
@@ -699,7 +761,7 @@ async function listedCandidates(
   const ids = [false, true].flatMap((side) => weighed.filter(([id]) => generated.has(id) === side).slice(0, pool).map(([id]) => id));
   if (ids.length === 0) return [];
   return store.query<RankedChunk>(
-    `SELECT ${CANDIDATE_COLUMNS}, 0::float AS raw
+    `SELECT ${candidateColumns(sides)}, 0::float AS raw
      FROM chunks c JOIN documents d ON d.id = c.document_id
      WHERE c.id = ANY($1::text[])`,
     [ids],
@@ -751,6 +813,7 @@ async function scannedCandidates(
   idf: number[],
   picked: number[],
   pool: number,
+  sides: SideSql,
   asOf?: TimeInput,
   filter?: ResolvedScopeFilter,
 ): Promise<RankedChunk[]> {
@@ -759,13 +822,13 @@ async function scannedCandidates(
   const distinct = [...new Set(weights)].sort((a, b) => b - a);
   const p = new Params([weights.map((w) => distinct.indexOf(w))]);
   const mask = picked.map((i, j) => `CASE WHEN ${holdsGramsSql('x.l', terms[i], p)} THEN ${1 << j} ELSE 0 END`).join(' + ');
-  const cond = docLiveAt('d', p, asOf, filter);
+  const cond = searchable('d', p, sides, asOf, filter);
   const lim = p.add(pool);
   // lower() once per chunk, then strpos per gram
   return store.query<RankedChunk>(
     `WITH held AS MATERIALIZED (
        SELECT chunk_id, mask, generated FROM (
-         SELECT c.id AS chunk_id, ${isGeneratedSql('d')} AS generated, ${mask} AS mask
+         SELECT c.id AS chunk_id, ${sides.generated('d')} AS generated, ${mask} AS mask
          FROM chunks c JOIN documents d ON d.id = c.document_id, LATERAL (SELECT lower(c.content) AS l OFFSET 0) x
          WHERE ${cond}
          OFFSET 0
@@ -776,7 +839,7 @@ async function scannedCandidates(
        UNION ALL
        (SELECT chunk_id FROM held WHERE generated ORDER BY ($1::int[])[mask], chunk_id COLLATE "C" LIMIT ${lim})
      )
-     SELECT ${CANDIDATE_COLUMNS}, 0::float AS raw
+     SELECT ${candidateColumns(sides)}, 0::float AS raw
      FROM picked JOIN chunks c ON c.id = picked.chunk_id JOIN documents d ON d.id = c.document_id`,
     p.list,
   );
@@ -890,19 +953,19 @@ async function entitiesHoldingTerms(store: Store, query: string, asOf?: TimeInpu
  * copy of finance, that shape took the old query from 832 ms to 186 ms at the
  * median). The same rows give each entity's chunk count for its IDF.
  */
-async function graphSignal(store: Store, query: string, k = 20, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
+async function graphSignal(store: Store, query: string, k: number, sides: SideSql, asOf?: TimeInput, filter?: ResolvedScopeFilter): Promise<RankedChunk[]> {
   let seeds = await namedInQuery(store, query, asOf);
   if (seeds.length === 0) seeds = await entitiesHoldingTerms(store, query, asOf);
   if (seeds.length === 0) return [];
   const p = new Params([seeds]);
-  const cond = docLiveAt('d', p, asOf, filter);
+  const cond = searchable('d', p, sides, asOf, filter);
   const total = p.add(await chunkTotal(store));
   const lim = p.add(k);
   return store.query<RankedChunk>(
     `WITH seeds AS MATERIALIZED (
        SELECT DISTINCT unnest($1::text[]) AS id
      ), docs AS MATERIALIZED (
-       SELECT d.id, ${isGeneratedSql('d')} AS generated FROM documents d WHERE ${cond}
+       SELECT d.id, ${sides.generated('d')} AS generated FROM documents d WHERE ${cond}
      ), hits AS MATERIALIZED (
        SELECT s.id AS entity_id, x.chunk_id, x.document_id, count(*) OVER (PARTITION BY s.id)::float AS df
        FROM seeds s
@@ -1019,11 +1082,12 @@ export async function searchExplained(
 
   // hybrid recall outlives an embedding provider that cannot serve the query
   // (a spent daily quota): keyword and graph still answer; vector mode says so
-  const vectorRecall = () => vectorSearch(store, embedder, query, fetchK, opts.queryVector, opts.asOf, opts.filter);
+  const sides = await sidesOf(store);
+  const vectorRecall = () => vectorSearch(store, embedder, query, fetchK, opts.queryVector, sides, opts.asOf, opts.filter);
   const [vec, kw, gr] = await Promise.all([
     mode === 'hybrid' || mode === 'vector' ? timed('vector', vectorRecall, mode === 'hybrid') : Promise.resolve([]),
-    mode !== 'vector' ? timed('keyword', () => keywordSearch(store, query, fetchK, opts.asOf, opts.filter)) : Promise.resolve([]),
-    mode === 'hybrid' ? timed('graph', () => graphSignal(store, query, fetchK, opts.asOf, opts.filter)) : Promise.resolve([]),
+    mode !== 'vector' ? timed('keyword', () => keywordSearch(store, query, fetchK, sides, opts.asOf, opts.filter)) : Promise.resolve([]),
+    mode === 'hybrid' ? timed('graph', () => graphSignal(store, query, fetchK, sides, opts.asOf, opts.filter)) : Promise.resolve([]),
   ]);
 
   const RRF_K = 60;
@@ -1076,7 +1140,8 @@ export async function searchExplained(
 /** The chunks among `results` that are of generated pages. */
 export async function generatedAmong(store: Store, results: SearchResult[]): Promise<Set<string>> {
   if (results.length === 0) return new Set();
-  const rows = await store.query<{ id: string }>(`SELECT d.id FROM documents d WHERE d.id = ANY($1::text[]) AND ${isGeneratedSql('d')}`, [[...new Set(results.map((r) => r.documentId))]]);
+  const sides = await sidesOf(store);
+  const rows = await store.query<{ id: string }>(`SELECT d.id FROM documents d WHERE d.id = ANY($1::text[]) AND ${sides.generated('d')}`, [[...new Set(results.map((r) => r.documentId))]]);
   const docs = new Set(rows.map((r) => r.id));
   return new Set(results.filter((r) => docs.has(r.documentId)).map((r) => r.chunkId));
 }

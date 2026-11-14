@@ -6,10 +6,11 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultRerankConfig } from '../src/config.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { cutWithSources, GENERATED_SHARE, search, searchExplained, SearchMode } from '../src/search/search.js';
+import { cutWithSources, docLiveAt, GENERATED_SHARE, search, searchExplained, SearchMode } from '../src/search/search.js';
 import { Store, toVectorLiteral } from '../src/store/db.js';
 import { MATCH_INDEXES } from '../src/store/grams.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
+import { Params } from '../src/store/temporal.js';
 
 /**
  * Generated pages (entity pages, mentions pages, navigation lists) restate
@@ -87,6 +88,8 @@ beforeAll(async () => {
   // source the graph does not read, generated all the same) and the page of where Halcyon is mentioned
   await addChunk('nav', 'wiki/entities/index.md', 'wiki', 'source', 'Halcyon availability Halcyon availability Halcyon availability: entity pages A to Z.', 0.001);
   await addChunk('mentions', 'wiki/mentions/halcyon.md', 'wiki', 'view', 'Halcyon availability Halcyon availability Halcyon availability: 8 documents name Halcyon.', 0.002);
+  // what makes the navigation list the generator's: a region it keeps in the file
+  await store.query(`INSERT INTO pages (path, kind, generator, inputs_sha, tx_from) VALUES ('wiki/entities/index.md#entities', 'entities_index', 'entities_index@1', 'sha', now())`);
   // a page a person wrote in the wiki is a source
   await addChunk('note', 'wiki/notes/halcyon-review.md', 'wiki', 'source', 'My review of the quarter: Halcyon availability held above target.', 0.6);
   // names only the pages hold
@@ -210,6 +213,59 @@ describe('generated pages in search results', () => {
     // where a source is the best candidate, a search for one result is that source
     expect(await ids('keyword', { k: 1, query: 'availability 99.92' })).toEqual(['s3']);
     expect(await ids('hybrid', { k: 1, generatedShare: 0 })).toEqual(['s1']);
+  });
+});
+
+describe('lists the generator keeps, and pages a person wrote under the same names', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-generated-lists-'));
+  let lists: Store;
+
+  beforeAll(async () => {
+    fs.mkdirSync(path.join(dir, '.knode'), { recursive: true });
+    lists = await Store.open(dir, embedder.dimensions);
+    await lists.indexing;
+    const add = async (id: string, file: string, kind: string, content: string) => {
+      await lists.query(`INSERT INTO documents (id, path, root, kind, title, sha256, bytes, status) VALUES ($1, $2, 'wiki', $3, $1, $4, 10, 'indexed')`, [`d-${id}`, file, kind, `sha-${id}`]);
+      await lists.query(`INSERT INTO chunks (id, document_id, seq, content, token_count, tsv) VALUES ($1, $2, 0, $3, 3, to_tsvector('simple', $3))`, [id, `d-${id}`, content]);
+    };
+    // ingest files every index.md of the wiki as a source the graph does not read, whoever wrote it
+    await add('hub', 'wiki/projects/index.md', 'source', 'Quillon roadmap: my own index of the projects, written by hand.');
+    await add('shelf', 'wiki/sources/by-folder/reports/index.md', 'source', 'Quillon roadmap, Quillon roadmap: documents 1 to 200.');
+    // what makes the shelf the generator's: a region it keeps in the file
+    await lists.query(`INSERT INTO pages (path, kind, generator, inputs_sha, tx_from) VALUES ('wiki/sources/by-folder/reports/index.md#shelf', 'sources_shelf', 'sources_shelf@1', 'sha', now())`);
+    // a page a person keeps under wiki/mentions is theirs: only a view there is a mentions page
+    await add('my-mentions', 'wiki/mentions/quillon-notes.md', 'source', 'Quillon roadmap: where I have seen it mentioned.');
+    await add('mentions-view', 'wiki/mentions/quillon.md', 'view', 'Quillon roadmap. Quillon roadmap: 3 documents name Quillon.');
+    await add('entity', 'wiki/entities/quillon.md', 'view', 'Quillon roadmap: what the sources say of Quillon.');
+  });
+
+  afterAll(async () => {
+    if (lists) await lists.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const found = (opts: { kinds?: string[]; generatedShare?: number; k?: number } = {}) =>
+    search(lists, embedder, 'Quillon roadmap', { k: opts.k ?? 8, mode: 'keyword', track: false, current: false, generatedShare: opts.generatedShare, filter: opts.kinds ? resolveScopeFilter({ kinds: opts.kinds }) : undefined })
+      .then((rs) => rs.map((r) => r.chunkId));
+
+  it('answers from a person\'s index.md and notes, not from the generator\'s shelf or mentions page', async () => {
+    expect((await found()).sort()).toEqual(['entity', 'hub', 'my-mentions']);
+    // asked for the wiki's pages, the lists are among them
+    expect((await found({ kinds: ['wiki'] })).sort()).toEqual(['hub', 'my-mentions', 'shelf']);
+    expect((await found({ kinds: ['view'] })).sort()).toEqual(['entity', 'mentions-view']);
+  });
+
+  it('counts the person\'s pages as sources and the generator\'s as pages', async () => {
+    // no place for pages: the person's two pages are what is left
+    expect((await found({ generatedShare: 0, k: 2 })).sort()).toEqual(['hub', 'my-mentions']);
+    // among the wiki's pages the shelf is a generated one: it gets a page's share, the person's pages the rest
+    expect((await found({ kinds: ['wiki'], generatedShare: 0, k: 2 })).sort()).toEqual(['hub', 'my-mentions']);
+  });
+
+  it('leaves every other reader of live documents as it was', () => {
+    // the graph routes, the walk, context packs and excerpts go through docLiveAt: it says nothing of lists
+    const sql = docLiveAt('d', new Params());
+    expect(sql).toBe("d.status = 'indexed' AND d.root <> 'codebase'");
   });
 });
 
