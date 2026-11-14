@@ -19,6 +19,7 @@ import { entityKeyKinds, KeyKind, mentionKeys, typesCompatible } from '../graph/
 import { ReviewResolution } from '../config.js';
 import { toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
+import { relativeTimeWord } from '../store/dates.js';
 import { toIso } from '../store/temporal.js';
 import { DocRoot, SuggestionRow } from '../types.js';
 import { storeBlob } from './attic.js';
@@ -54,17 +55,26 @@ import {
 const CITATION_BATCH = 500;
 
 /**
- * The day a claim's identity carries (claimId's `at`): a number read off an
- * attribute that the source dates itself (event date, else the start of its
- * window). A weekly report says "本周服务可用性为99.92%" in its own words every
- * week; keyed by subject and statement alone, week 3's 99.92% and week 17's
- * were one claim spanning both weeks (MIN/MAX of their windows), dated by the
- * newer, and the weeks between overlapped it: on the 10× reports benchmark
- * (2026-11-14) 603 of 1,440 weekly metric values had folded into another
- * week's claim that way. Texts (负责人, 状态), undated claims and statements
+ * The day a claim's identity carries (claimId's `at`), or null for the old
+ * identity (subject + statement). Two kinds of claim carry one:
+ *
+ * - a number read off an attribute that the source dates itself (event date,
+ *   else the start of its window). A weekly report says "本周服务可用性为99.92%"
+ *   in its own words every week; keyed by subject and statement alone, week 3's
+ *   99.92% and week 17's were one claim spanning both weeks (MIN/MAX of their
+ *   windows), dated by the newer, and the weeks between overlapped it: on the
+ *   10× reports benchmark (2026-11-14) 603 of 1,440 weekly metric values had
+ *   folded into another week's claim that way.
+ * - any statement whose time is relative to its document (relativeTimeWord:
+ *   "支付组本周评审了接口设计", "R-83本周仍未关闭"): the same words in two reports
+ *   are two assertions about two times. Its day is the one it states, else its
+ *   document's date; with neither it keeps the old identity.
+ *
+ * Texts (负责人, 状态) with no relative time, undated claims and statements
  * that name their own time (NAMED_TIME: "2026Q2 净利润 120 亿元", reported by two
  * sources on two days, is one fact) keep the old identity, so a value restated
- * week after week stays one claim there.
+ * week after week stays one claim there. Existing claims keep their ids until
+ * their document is applied again.
  */
 export function readingDay(c: {
   statement: string;
@@ -73,10 +83,14 @@ export function readingDay(c: {
   dateSource?: string | null;
   eventAt?: string | null;
   validFrom?: string | null;
+  observedAt?: string | null;
 }): string | null {
-  if (!c.attribute || c.valueNum === null || c.valueNum === undefined || !Number.isFinite(c.valueNum) || c.dateSource !== 'stated') return null;
-  if (NAMED_TIME.test(c.statement.normalize('NFKC'))) return null;
-  return toIso(c.eventAt ?? c.validFrom)?.slice(0, 10) ?? null;
+  const statement = c.statement.normalize('NFKC');
+  if (NAMED_TIME.test(statement)) return null;
+  const stated = toIso(c.eventAt ?? c.validFrom)?.slice(0, 10) ?? null;
+  if (c.attribute && c.valueNum !== null && c.valueNum !== undefined && Number.isFinite(c.valueNum) && c.dateSource === 'stated') return stated;
+  if (relativeTimeWord(statement)) return stated ?? toIso(c.observedAt)?.slice(0, 10) ?? null;
+  return null;
 }
 
 /**
