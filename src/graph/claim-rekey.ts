@@ -6,7 +6,7 @@ import { Store } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
 import { claimPairId } from './claim-dedupe.js';
 import { applyClaimMerge, unmergeClaim } from './claim-merge.js';
-import { claimId, readingWeek } from './store.js';
+import { claimId, readingWeek, RELATIVE_WEEK, RELATIVE_WEEK_WORDS } from './store.js';
 
 /**
  * The move of a workspace's claims to weekly-reading identity (claimId's
@@ -14,7 +14,7 @@ import { claimId, readingWeek } from './store.js';
  *
  * Claims written before it hold every week a statement was repeated in: one
  * claim, MIN..MAX of the weeks. A step takes the next claims by id whose
- * statement speaks of this week and moves each piece of their live evidence
+ * statement speaks of a week relative to its report's and moves each piece of their live evidence
  * onto the id the writer gives it now — the old evidence row is closed and an
  * equal one opened under the same scope, so history keeps both — and refolds
  * old and new. Nothing is read again from a sidecar and no model is called.
@@ -58,22 +58,21 @@ export interface RekeyStats {
   done: boolean;
 }
 
-const THIS_WEEK_SQL = `(c.statement LIKE '%本周%' OR c.statement LIKE '%当周%' OR lower(c.statement) LIKE '%this week%')`;
-const THIS_WEEK = /本周|当周|\bthis week\b/i;
+const RELATIVE_WEEK_SQL = `(${RELATIVE_WEEK_WORDS.map((w) => `lower(c.statement) LIKE '%${w}%'`).join(' OR ')})`;
 
 export async function rekeyState(store: Store): Promise<RekeyState> {
   return (await store.getMeta<RekeyState>(META_KEY)) ?? { cursor: null, done: false };
 }
 
 /**
- * The claim may still change id: its statement speaks of this week, the
+ * The claim may still change id: its statement speaks of a week relative to its report's, the
  * cursor has not passed it and it is not a weekly reading already. The
  * duplicate-claim audit leaves such a claim alone.
  */
 export function pendingRekey(state: RekeyState, c: { id: string; statement: string }, keyed: boolean): boolean {
   if (state.done || keyed) return false;
   if (state.cursor !== null && c.id <= state.cursor) return false;
-  return THIS_WEEK.test(c.statement.normalize('NFKC'));
+  return RELATIVE_WEEK.test(c.statement.normalize('NFKC'));
 }
 
 interface EvidenceRow {
@@ -154,7 +153,7 @@ export async function rekeyWeeklyReadings(store: Store, opts: { limit?: number; 
   if (state.done) return stats;
   const candidates = await store.query<{ id: string; subject_id: string; statement: string; canonical_id: string | null }>(
     `SELECT c.id, c.subject_id, c.statement, c.canonical_id FROM claims c
-     WHERE c.tx_to IS NULL AND ${THIS_WEEK_SQL} ${state.cursor !== null ? 'AND c.id > $2' : ''}
+     WHERE c.tx_to IS NULL AND ${RELATIVE_WEEK_SQL} ${state.cursor !== null ? 'AND c.id > $2' : ''}
      ORDER BY c.id LIMIT $1`,
     state.cursor !== null ? [limit, state.cursor] : [limit],
   );

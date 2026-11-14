@@ -108,6 +108,9 @@ describe('a claim identity', () => {
     expect(readingWeek({ ...reading, statement: '本周7日年化收益率为2.1%' })).toBe('2025-W25');
     expect(readingWeek({ ...reading, statement: '3号线本周客流为120万人次' })).toBe('2025-W25');
     expect(readingWeek({ ...reading, statement: 'Revenue this week was 3.2m' })).toBe('2025-W25');
+    // a later report's restatement of a week, dated by the source with that week
+    expect(readingWeek({ ...reading, statement: '七部增长组两周前的周活跃用户为136万。' })).toBe('2025-W25');
+    expect(readingWeek({ ...reading, statement: '上周支付成功率为97.4%' })).toBe('2025-W25');
     // a window across two weeks is no week's reading
     expect(readingWeek({ ...reading, validTo: '2025-06-24T23:59:59.999Z' })).toBeNull();
   });
@@ -119,7 +122,7 @@ describe('a claim identity', () => {
     expect(readingWeek({ ...reading, validFrom: null, validTo: null })).toBeNull();
     // not relative to this week: a restated fact or another period's figure is one claim however many reports date it
     for (const statement of [
-      '宁德时代净利润120亿元', '六部增长组目前有8人。', '七部增长组两周前的周活跃用户为136万。', '2026Q2 净利润 120 亿元',
+      '宁德时代净利润120亿元', '六部增长组目前有8人。', '2026Q2 净利润 120 亿元', '下周可用性预计为99.9%',
       '本周公布Q3净利润同比增长20%', '本周披露H1营收12亿元', 'March revenue this week was 3bn', '本周W37完成度46%', '本周确认去年营收12亿元',
       '平台组2025年第24周服务可用性为99.92%', '10月月报列示本周在岗人数为6人', '本周6月18日可用性99.92%', '上周及本周可用性99.92%',
     ]) expect(readingWeek({ ...reading, statement }), statement).toBeNull();
